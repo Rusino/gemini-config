@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""Stop hook for Jetski to prevent reporting completion after unverified code edits.
+
+Checks the current turn in transcript.jsonl:
+- If the agent modified a source code file (`write_to_file`, `replace_file_content`,
+  or `multi_replace_file_content`) and did NOT run any verification command
+  (`run_command`) after the last code edit (or the last command after the edit
+  failed with a non-zero exit code), blocks the stop once (`decision: "continue"`)
+  and instructs the agent to verify the change first.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+SOURCE_EXTENSIONS = {
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cxx",
+    ".h",
+    ".hh",
+    ".hpp",
+    ".hxx",
+    ".py",
+    ".rs",
+    ".go",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".dart",
+    ".java",
+    ".kt",
+    ".gn",
+    ".gni",
+    ".sh",
+    ".cmake",
+}
+SOURCE_FILENAMES = {
+    "CMakeLists.txt",
+    "Makefile",
+    "BUILD",
+    "BUILD.bazel",
+    "Cargo.toml",
+    "package.json",
+    "pubspec.yaml",
+}
+
+EDIT_TOOLS = {
+    "write_to_file",
+    "replace_file_content",
+    "multi_replace_file_content",
+}
+
+EXIT_CODE_RE = re.compile(r"^The command exited with code (\d+)\.", re.MULTILINE)
+
+
+def is_tracked_source_file(file_path: str) -> bool:
+  if not file_path:
+    return False
+  clean = os.path.abspath(
+      os.path.expanduser(file_path.strip().strip('"').strip("'"))
+  )
+  # Ignore agent customization/artifact files under ~/.gemini/config and ~/.gemini/jetski/brain
+  # (but DO NOT ignore user project workspaces under ~/.gemini/jetski/scratch!)
+  config_dir = os.path.abspath(os.path.expanduser("~/.gemini/config"))
+  brain_dir = os.path.abspath(os.path.expanduser("~/.gemini/jetski/brain"))
+  if (
+      clean == config_dir
+      or clean.startswith(config_dir + "/")
+      or clean == brain_dir
+      or clean.startswith(brain_dir + "/")
+      or clean.startswith("/tmp/")
+  ):
+    return False
+  basename = os.path.basename(clean)
+  if basename in SOURCE_FILENAMES:
+    return True
+  _, ext = os.path.splitext(basename)
+  return ext.lower() in SOURCE_EXTENSIONS
+
+
+def load_state(state_path: str) -> dict:
+  try:
+    if os.path.exists(state_path):
+      with open(state_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+  except Exception:
+    pass
+  return {}
+
+
+def save_state(state_path: str, state: dict) -> None:
+  try:
+    os.makedirs(os.path.dirname(state_path), exist_ok=True)
+    with open(state_path, "w", encoding="utf-8") as f:
+      json.dump(state, f, indent=2)
+  except Exception:
+    pass
+
+
+def play_stop_sound(is_handoff: bool) -> None:
+  """Controls browser completion chime via config.json (no CRD required)."""
+  import time
+  config_path = os.path.expanduser("~/.gemini/config/config.json")
+  try:
+    if os.path.exists(config_path):
+      with open(config_path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+    else:
+      config = {}
+
+    config.pop("enableSoundsForSpecialEvents", None)
+    user_settings = config.setdefault("userSettings", {})
+
+    if is_handoff:
+      user_settings["enableSoundsForSpecialEvents"] = False
+      with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+      # Restore to true after 2 seconds via detached background process
+      subprocess.Popen([
+          sys.executable, "-c",
+          "import json, time, os; "
+          "time.sleep(2); "
+          "p = os.path.expanduser('~/.gemini/config/config.json'); "
+          "c = json.load(open(p)) if os.path.exists(p) else {}; "
+          "c.pop('enableSoundsForSpecialEvents', None); "
+          "c.setdefault('userSettings', {})['enableSoundsForSpecialEvents'] = True; "
+          "json.dump(c, open(p, 'w'), indent=2)"
+      ], start_new_session=True)
+      # Give fsnotify time to propagate config change to browser before Idle
+      time.sleep(0.3)
+    else:
+      if user_settings.get("enableSoundsForSpecialEvents") is False:
+        user_settings["enableSoundsForSpecialEvents"] = True
+        with open(config_path, "w", encoding="utf-8") as f:
+          json.dump(config, f, indent=2)
+        time.sleep(0.3)
+  except Exception:
+    pass
+
+
+def analyze_current_turn(transcript_path: str) -> dict:
+  if not transcript_path or not os.path.exists(transcript_path):
+    return {}
+
+  steps_by_idx = {}
+  try:
+    with open(transcript_path, "r", encoding="utf-8") as f:
+      for line in f:
+        line = line.strip()
+        if not line:
+          continue
+        try:
+          obj = json.loads(line)
+          idx = obj.get("step_index")
+          if idx is not None:
+            steps_by_idx[int(idx)] = obj
+        except Exception:
+          continue
+  except Exception:
+    return {}
+
+  if not steps_by_idx:
+    return {}
+
+  ordered_indices = sorted(steps_by_idx.keys())
+  # Find the last USER_INPUT step to scope analysis to the current turn
+  last_user_idx = -1
+  for idx in ordered_indices:
+    if steps_by_idx[idx].get("type") == "USER_INPUT":
+      last_user_idx = idx
+
+  last_code_edit_idx = -1
+  last_edited_file = ""
+  last_cmd_idx = -1
+  last_cmd_exit_code = None
+  pending_cmd_check = False
+  pending_new_conv_cmd = False
+  launched_new_conv = False
+
+  for idx in ordered_indices:
+    if idx <= last_user_idx:
+      continue
+    step = steps_by_idx[idx]
+    stype = step.get("type", "")
+    tool_calls = step.get("tool_calls") or []
+
+    if stype == "PLANNER_RESPONSE" and tool_calls:
+      pending_new_conv_cmd = False
+      for tc in tool_calls:
+        tname = tc.get("name", "")
+        targs = tc.get("args") or {}
+        if tname in EDIT_TOOLS:
+          target = targs.get("TargetFile", "")
+          if is_tracked_source_file(target):
+            last_code_edit_idx = idx
+            last_edited_file = target.strip().strip('"').strip("'")
+        elif tname == "run_command":
+          cmd = str(targs.get("CommandLine", ""))
+          if "agentapi" in cmd and "new-conversation" in cmd:
+            pending_new_conv_cmd = True
+          last_cmd_idx = idx
+          pending_cmd_check = True
+
+    elif stype == "GENERIC" and pending_cmd_check:
+      content = str(step.get("content", ""))
+      if "\nFile Path: " in content[:200]:
+        continue
+      m = EXIT_CODE_RE.search(content)
+      if m:
+        last_cmd_exit_code = int(m.group(1))
+        if (
+            pending_new_conv_cmd
+            and last_cmd_exit_code == 0
+            and step.get("status") == "DONE"
+        ):
+          launched_new_conv = True
+          pending_new_conv_cmd = False
+        pending_cmd_check = False
+
+  return {
+      "last_code_edit_idx": last_code_edit_idx,
+      "last_edited_file": last_edited_file,
+      "last_cmd_idx": last_cmd_idx,
+      "last_cmd_exit_code": last_cmd_exit_code,
+      "launched_new_conv": launched_new_conv,
+  }
+
+
+def main() -> None:
+  try:
+    raw_input = sys.stdin.read().strip()
+    if not raw_input:
+      print("{}")
+      return
+    data = json.loads(raw_input)
+  except Exception:
+    print("{}")
+    return
+
+  if data.get("isBattleMode") or data.get("parentConversationId"):
+    print("{}")
+    return
+
+  term_reason = str(data.get("terminationReason", "")).upper()
+  if term_reason and term_reason != "MODEL_STOP":
+    print("{}")
+    return
+
+  if not data.get("fullyIdle", True):
+    print("{}")
+    return
+
+  conv_id = data.get("conversationId", "")
+  transcript_path = data.get("transcriptPath", "")
+  artifact_dir = data.get("artifactDirectoryPath", "")
+
+  info = analyze_current_turn(transcript_path)
+
+  state_path = (
+      os.path.join(artifact_dir, "scratch", ".context_guard_state.json")
+      if artifact_dir
+      else f"/tmp/jetski_context_guard_{conv_id}.json"
+  )
+  state = load_state(state_path)
+
+  if info.get("launched_new_conv"):
+    if state.get("pending_handoff_launch") or not state.get(
+        "handoff_completed"
+    ):
+      state["pending_handoff_launch"] = False
+      state["handoff_completed"] = True
+      save_state(state_path, state)
+    play_stop_sound(is_handoff=True)
+    print("{}")
+    return
+
+  # If a handoff was triggered in this turn and the agent tries to stop without
+  # having called agentapi new-conversation, block once and force the launch!
+  if state.get("pending_handoff_launch") and not state.get(
+      "stop_blocked_handoff"
+  ):
+    state["stop_blocked_handoff"] = True
+    save_state(state_path, state)
+    new_title = state.get("pending_title") or "[продолжение]"
+    cmd_prefix = (
+        state.get("pending_cmd_prefix")
+        or "env -u ANTIGRAVITY_SOURCE_METADATA agentapi new-conversation"
+    )
+    short_id = conv_id[:8] if conv_id else "unknown"
+    default_handoff = (
+        os.path.join(artifact_dir, f"handoff_summary_{short_id}.md")
+        if artifact_dir
+        else f"/tmp/handoff_summary_{short_id}.md"
+    )
+    handoff_file = state.get("pending_handoff_file") or default_handoff
+    reason = (
+        f"[HANDOFF GUARD] Ты подготовила резюме `{handoff_file}`, но попыталась завершить ход, "
+        f"НЕ запустив новый чат-продолжение! Вызови `run_command`:\n"
+        f'`{cmd_prefix} --model=pro --title="{new_title}" '
+        f'"Продолжаем незаконченную задачу из предыдущего чата (conversation://{conv_id}), прерванную из-за переполнения контекста. '
+        f"Прочитай файл {handoff_file} через view_file, изучи сделанные шаги и отброшенные гипотезы, и продолжи выполнение со следующего шага.\"`\n"
+        f"и дай пользователю ссылку `[👉 {new_title}](conversation://<new_conversation_id>)`."
+    )
+    print(
+        json.dumps(
+            {"decision": "continue", "reason": reason}, ensure_ascii=False
+        )
+    )
+    return
+
+  last_edit_idx = info.get("last_code_edit_idx", -1)
+  if last_edit_idx < 0:
+    play_stop_sound(is_handoff=False)
+    print("{}")
+    return
+
+  # Only block once per code edit step index to prevent infinite loops
+  if state.get("last_blocked_edit_idx") == last_edit_idx:
+    play_stop_sound(is_handoff=False)
+    print("{}")
+    return
+
+  last_cmd_idx = info.get("last_cmd_idx", -1)
+  last_cmd_exit = info.get("last_cmd_exit_code")
+  edited_file = os.path.basename(info.get("last_edited_file", "файл"))
+
+  if last_cmd_idx < last_edit_idx:
+    state["last_blocked_edit_idx"] = last_edit_idx
+    save_state(state_path, state)
+    reason = (
+        f"[VERIFICATION GUARD] Ты изменила исходный код (`{edited_file}`), но после последней правки "
+        f"не запустила сборку, тесты или проверку синтаксиса (`run_command`). "
+        f"Запусти проверку перед тем, как завершать ответ (или явно напиши, почему автоматическая проверка здесь неприменима)."
+    )
+    print(
+        json.dumps(
+            {"decision": "continue", "reason": reason}, ensure_ascii=False
+        )
+    )
+    return
+
+  if last_cmd_exit is not None and last_cmd_exit != 0:
+    state["last_blocked_edit_idx"] = last_edit_idx
+    save_state(state_path, state)
+    reason = (
+        f"[VERIFICATION GUARD] После правки файла `{edited_file}` последняя запущенная команда "
+        f"завершилась с ошибкой (код возврата {last_cmd_exit}). Не завершай ход с нерабочим кодом: "
+        f"исправь ошибку и перепроверь, либо откати сломанное изменение и объясни причину."
+    )
+    print(
+        json.dumps(
+            {"decision": "continue", "reason": reason}, ensure_ascii=False
+        )
+    )
+    return
+
+  play_stop_sound(is_handoff=False)
+  print("{}")
+
+
+if __name__ == "__main__":
+  main()

@@ -1,0 +1,31 @@
+{
+  "context-guard": {
+    "enabled": true,
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "~/.gemini/config/hooks/context_guard.py",
+        "timeout": 5
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "run_command|replace_file_content|multi_replace_file_content|write_to_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.gemini/config/hooks/pre_tool_guard.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "~/.gemini/config/hooks/stop_guard.py",
+        "timeout": 5
+      }
+    ]
+  }
+}

@@ -1,0 +1,12 @@
+# Machine-specific runtime settings & state
+config.json
+projects/
+.migrated
+
+# Dependencies & caches
+node_modules/
+__pycache__/
+*.py[cod]
+
+# OS files
+.DS_Store

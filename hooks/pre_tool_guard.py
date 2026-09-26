@@ -1,0 +1,521 @@
+#!/usr/bin/env python3
+"""PreToolUse hook for Jetski to prevent hallucinations, blind edits, and broken handoffs.
+
+Implements four mechanical guards:
+1. Handoff Command & Post-Handoff Guard:
+   - Blocks any file edits or duplicate `new-conversation` calls in a conversation
+     that has already handed off in the current turn.
+   - Blocks invalid `agentapi` subcommands (`start`, `create`, etc.) with the exact
+     valid command.
+   - Auto-rewrites (`overwrite`) `agentapi new-conversation` commands if they are
+     missing `env -u ANTIGRAVITY_SOURCE_METADATA`, `ANTIGRAVITY_PROJECT_ID`, or
+     `--title="[HH:MM продолжение] ..."`.
+2. Automatic Handoff Summary Enrichment:
+   - Right before `agentapi new-conversation` executes, automatically appends an
+     objective machine-generated section (`git status -s`, `git diff --stat`,
+     modified files, and recent commands with exit codes) to the conversation's
+     `handoff_summary*.md` so the new chat never needs to grep old transcripts.
+3. Read-Before-Edit Guard:
+   - Blocks `replace_file_content` / `multi_replace_file_content` on existing
+     source files if the file was never viewed (`view_file`) or written earlier
+     in the current conversation.
+4. Generated / Gitignored File Guard:
+   - Blocks editing source files inside build caches or `.gitignore`d directories
+     (e.g., `bin/cache/`, `out/`, `build/`) inside a Git repository.
+"""
+
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+
+from context_guard import (
+    build_agentapi_prefix,
+    build_continuation_title,
+    get_handoff_launch_step_in_turn,
+    load_state,
+    parse_current_turn_steps,
+)
+
+EDIT_TOOLS = {
+    "write_to_file",
+    "replace_file_content",
+    "multi_replace_file_content",
+}
+
+MODIFY_TOOLS = {
+    "replace_file_content",
+    "multi_replace_file_content",
+}
+
+SOURCE_EXTENSIONS = {
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cxx",
+    ".h",
+    ".hh",
+    ".hpp",
+    ".hxx",
+    ".py",
+    ".rs",
+    ".go",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".dart",
+    ".java",
+    ".kt",
+    ".gn",
+    ".gni",
+    ".sh",
+    ".cmake",
+}
+
+SOURCE_FILENAMES = {
+    "CMakeLists.txt",
+    "Makefile",
+    "BUILD",
+    "BUILD.bazel",
+    "Cargo.toml",
+    "package.json",
+    "pubspec.yaml",
+}
+
+EXIT_CODE_RE = re.compile(r"The command exited with code (\d+)\.")
+AUTO_SNAPSHOT_HEADER = "## Автоматический срез состояния (Git & Последние команды)"
+
+
+def is_agent_internal_file(file_path: str) -> bool:
+  """Returns True if the file is an agent artifact or customization file (not project code)."""
+  if not file_path:
+    return True
+  clean = os.path.abspath(os.path.expanduser(file_path.strip().strip('"').strip("'")))
+  config_dir = os.path.abspath(os.path.expanduser("~/.gemini/config"))
+  brain_dir = os.path.abspath(os.path.expanduser("~/.gemini/jetski/brain"))
+  if (
+      clean == config_dir
+      or clean.startswith(config_dir + "/")
+      or clean == brain_dir
+      or clean.startswith(brain_dir + "/")
+      or clean.startswith("/tmp/")
+  ):
+    return True
+  return False
+
+
+def is_tracked_source_file(file_path: str) -> bool:
+  if not file_path or is_agent_internal_file(file_path):
+    return False
+  clean = file_path.strip().strip('"').strip("'")
+  basename = os.path.basename(clean)
+  if basename in SOURCE_FILENAMES:
+    return True
+  _, ext = os.path.splitext(basename)
+  return ext.lower() in SOURCE_EXTENSIONS
+
+
+def was_file_read_or_written_in_chat(
+    transcript_path: str, target_file: str, current_step_idx: int = -1
+) -> bool:
+  """Checks if target_file was ever viewed or written in prior steps of the current conversation."""
+  if not transcript_path or not os.path.exists(transcript_path):
+    return True  # Fail-open if transcript is unavailable
+  target_real = os.path.realpath(
+      os.path.expanduser(target_file.strip().strip('"').strip("'"))
+  )
+  try:
+    with open(transcript_path, "r", encoding="utf-8") as f:
+      for line in f:
+        line = line.strip()
+        if not line or "PLANNER_RESPONSE" not in line:
+          continue
+        try:
+          obj = json.loads(line)
+        except Exception:
+          continue
+        if obj.get("type") != "PLANNER_RESPONSE":
+          continue
+        idx = obj.get("step_index")
+        if (
+            current_step_idx >= 0
+            and idx is not None
+            and int(idx) >= current_step_idx
+        ):
+          continue
+        for tc in obj.get("tool_calls") or []:
+          tname = tc.get("name", "")
+          targs = tc.get("args") or {}
+          if tname == "view_file":
+            p = targs.get("AbsolutePath", "")
+          elif tname == "write_to_file":
+            p = targs.get("TargetFile", "")
+          else:
+            continue
+          if p:
+            p_real = os.path.realpath(
+                os.path.expanduser(str(p).strip().strip('"').strip("'"))
+            )
+            if p_real == target_real:
+              return True
+  except Exception:
+    return True
+  return False
+
+
+def is_gitignored_or_build_cache(target_file: str) -> tuple[bool, str]:
+  """Checks if target_file is inside a Git repo and is ignored by Git or in a known build cache."""
+  clean = os.path.abspath(
+      os.path.expanduser(target_file.strip().strip('"').strip("'"))
+  )
+  # Check explicit build cache directory patterns
+  norm_parts = clean.replace("\\", "/")
+  for cache_marker in ("/bin/cache/", "/.dart_tool/", "/CMakeFiles/"):
+    if cache_marker in norm_parts:
+      return True, f"путь находится в кеше сборки (`{cache_marker}`)"
+
+  parent_dir = os.path.dirname(clean)
+  if not os.path.isdir(parent_dir):
+    return False, ""
+
+  try:
+    # Check if inside a git work tree
+    res_wt = subprocess.run(
+        ["git", "-C", parent_dir, "rev-parse", "--is-inside-work-tree"],
+        capture_output=True,
+        text=True,
+        timeout=1.5,
+        check=False,
+    )
+    if res_wt.returncode != 0:
+      return False, ""
+
+    # Check if git check-ignore matches this file
+    res_ig = subprocess.run(
+        ["git", "-C", parent_dir, "check-ignore", "-q", clean],
+        capture_output=True,
+        text=True,
+        timeout=1.5,
+        check=False,
+    )
+    if res_ig.returncode == 0:
+      return True, "файл находится в `.gitignore` репозитория"
+  except Exception:
+    pass
+  return False, ""
+
+
+def enrich_handoff_summary_files(
+    artifact_dir: str, transcript_path: str, workspace_paths: list[str]
+) -> None:
+  """Appends an objective Git & command snapshot to handoff_summary*.md if not already present."""
+  if not artifact_dir or not os.path.isdir(artifact_dir):
+    return
+  summary_files = sorted(
+      glob.glob(os.path.join(artifact_dir, "handoff_summary*.md")),
+      key=lambda p: os.path.getmtime(p),
+      reverse=True,
+  )
+  if not summary_files:
+    return
+  target_summary = summary_files[0]
+  try:
+    with open(target_summary, "r", encoding="utf-8") as f:
+      existing = f.read()
+    if AUTO_SNAPSHOT_HEADER in existing:
+      return
+  except Exception:
+    return
+
+  sections = ["", "---", "", AUTO_SNAPSHOT_HEADER, ""]
+
+  # 1. Collect edited files & last 5 commands from transcript.jsonl
+  edited_files: list[str] = []
+  recent_cmds: list[str] = []
+  if transcript_path and os.path.exists(transcript_path):
+    try:
+      steps_by_idx = {}
+      with open(transcript_path, "r", encoding="utf-8") as f:
+        for line in f:
+          if not line.strip():
+            continue
+          try:
+            obj = json.loads(line)
+            idx = obj.get("step_index")
+            if idx is not None:
+              steps_by_idx[int(idx)] = obj
+          except Exception:
+            continue
+      pending_cmd = None
+      for idx in sorted(steps_by_idx.keys()):
+        step = steps_by_idx[idx]
+        stype = step.get("type", "")
+        if stype == "PLANNER_RESPONSE":
+          for tc in step.get("tool_calls") or []:
+            tname = tc.get("name", "")
+            targs = tc.get("args") or {}
+            if tname in EDIT_TOOLS:
+              tf = str(targs.get("TargetFile", "")).strip()
+              if tf and not is_agent_internal_file(tf) and tf not in edited_files:
+                edited_files.append(tf)
+            elif tname == "run_command":
+              cmd_str = str(targs.get("CommandLine", "")).strip().replace("\n", " ")
+              if "new-conversation" not in cmd_str:
+                pending_cmd = cmd_str[:140]
+        elif stype == "GENERIC" and pending_cmd:
+          m = EXIT_CODE_RE.search(str(step.get("content", "")))
+          code_str = f"exit {m.group(1)}" if m else "async/running"
+          recent_cmds.append(f"- `[{code_str}]` `{pending_cmd}`")
+          pending_cmd = None
+    except Exception:
+      pass
+
+  if edited_files:
+    sections.append("### Файлы, изменённые инструментами в этом чате")
+    for ef in edited_files[-15:]:
+      sections.append(f"- [`{os.path.basename(ef)}`](file://{ef}) (`{ef}`)")
+    sections.append("")
+
+  if recent_cmds:
+    sections.append("### Последние выполненные команды")
+    sections.extend(recent_cmds[-6:])
+    sections.append("")
+
+  # 2. Collect git status -s and git diff --stat for workspace_paths
+  for wp in workspace_paths[:3]:
+    if not os.path.isdir(wp):
+      continue
+    try:
+      st = subprocess.run(
+          ["git", "-C", wp, "status", "-s", "-uno"],
+          capture_output=True,
+          text=True,
+          timeout=1.5,
+          check=False,
+      )
+      df = subprocess.run(
+          ["git", "-C", wp, "diff", "--stat"],
+          capture_output=True,
+          text=True,
+          timeout=1.5,
+          check=False,
+      )
+      st_out = (st.stdout or "").strip()
+      df_out = (df.stdout or "").strip()
+      if st_out or df_out:
+        sections.append(f"### Состояние Git в `{wp}`")
+        sections.append("```text")
+        if st_out:
+          sections.append(st_out[:1500])
+        if df_out:
+          sections.append(df_out[:1500])
+        sections.append("```")
+        sections.append("")
+    except Exception:
+      pass
+
+  try:
+    with open(target_summary, "a", encoding="utf-8") as f:
+      f.write("\n".join(sections) + "\n")
+  except Exception:
+    pass
+
+
+def main() -> None:
+  try:
+    raw_input = sys.stdin.read().strip()
+    if not raw_input:
+      print('{"decision": "allow"}')
+      return
+    data = json.loads(raw_input)
+  except Exception:
+    print('{"decision": "allow"}')
+    return
+
+  if data.get("isBattleMode"):
+    print('{"decision": "allow"}')
+    return
+
+  tool_call = data.get("toolCall") or {}
+  tool_name = tool_call.get("name", "")
+  tool_args = tool_call.get("args") or {}
+
+  conv_id = data.get("conversationId", "")
+  parent_conv_id = data.get("parentConversationId", "")
+  transcript_path = data.get("transcriptPath", "")
+  artifact_dir = data.get("artifactDirectoryPath", "")
+  workspace_paths = data.get("workspacePaths") or []
+
+  # 1. Top-level conversation handoff guards
+  if not parent_conv_id:
+    state_path = (
+        os.path.join(artifact_dir, "scratch", ".context_guard_state.json")
+        if artifact_dir
+        else f"/tmp/jetski_context_guard_{conv_id}.json"
+    )
+    state = load_state(state_path)
+    launch_step = get_handoff_launch_step_in_turn(transcript_path)
+
+    # 1a. If this conversation has ALREADY launched a continuation in the current turn,
+    # hard-block any further file edits or duplicate new-conversation launches!
+    if launch_step >= 0 or state.get("handoff_completed"):
+      if tool_name in EDIT_TOOLS:
+        print(
+            json.dumps(
+                {
+                    "decision": "deny",
+                    "reason": (
+                        f"[PRE-TOOL GUARD] Этот чат уже запустил чат-продолжение (на шаге #{launch_step})! "
+                        "Редактирование файлов в старом чате заблокировано, чтобы избежать гонок с новым чатом. "
+                        "Немедленно заверши ход."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
+      if tool_name == "run_command":
+        cmd = str(tool_args.get("CommandLine", ""))
+        print(
+            json.dumps(
+                {
+                    "decision": "deny",
+                    "reason": (
+                        f"[PRE-TOOL GUARD] Этот чат уже создал чат-продолжение (на шаге #{launch_step})! "
+                        "Запуск новых команд и повторное создание чата в старом окне заблокированы. "
+                        "Если есть фоновые задачи — останови их через manage_task (kill) и заверши ход."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
+
+    # 1b. Inspect `agentapi` commands in run_command
+    if tool_name == "run_command":
+      cmd = str(tool_args.get("CommandLine", "")).strip()
+      if "agentapi" in cmd:
+        new_title = state.get("pending_title") or build_continuation_title(
+            conv_id, ""
+        )
+        cmd_prefix = state.get("pending_cmd_prefix") or build_agentapi_prefix(
+            conv_id, transcript_path, workspace_paths
+        )
+        # Catch hallucinated agentapi subcommands (e.g. `agentapi start`, `agentapi create`)
+        bad_subcmd = re.search(
+            r"\bagentapi\s+(start(?:-conversation)?|create(?:-conversation)?|conversation)\b",
+            cmd,
+        )
+        if bad_subcmd:
+          print(
+              json.dumps(
+                  {
+                      "decision": "deny",
+                      "reason": (
+                          f"[PRE-TOOL GUARD] Подкоманды `agentapi {bad_subcmd.group(1)}` не существует! "
+                          f"Используй ТОЧНО:\n`{cmd_prefix} --model=pro --title=\"{new_title}\" \"<промпт>\"`"
+                      ),
+                  },
+                  ensure_ascii=False,
+              )
+          )
+          return
+
+        # If calling `agentapi new-conversation`, enrich handoff_summary*.md on disk
+        # and auto-inject missing env / --title if the agent forgot them!
+        if "new-conversation" in cmd:
+          enrich_handoff_summary_files(
+              artifact_dir, transcript_path, workspace_paths
+          )
+          needs_rewrite = False
+          rewritten = cmd
+
+          # Replace bare `/.../agentapi new-conversation` or `agentapi new-conversation`
+          # with `cmd_prefix` if `ANTIGRAVITY_SOURCE_METADATA` is missing
+          if "ANTIGRAVITY_SOURCE_METADATA" not in rewritten:
+            rewritten = re.sub(
+                r"(?:\S*/)?agentapi\s+new-conversation\b",
+                cmd_prefix,
+                rewritten,
+                count=1,
+            )
+            needs_rewrite = True
+
+          if "--title" not in rewritten:
+            rewritten = rewritten.replace(
+                "new-conversation",
+                f'new-conversation --title="{new_title}"',
+                1,
+            )
+            needs_rewrite = True
+
+          if "--model" not in rewritten:
+            rewritten = rewritten.replace(
+                "new-conversation",
+                "new-conversation --model=pro",
+                1,
+            )
+            needs_rewrite = True
+
+          if needs_rewrite and rewritten != cmd:
+            print(
+                json.dumps(
+                    {"decision": "allow", "decision": "allow", "overwrite": {"CommandLine": rewritten}},
+                    ensure_ascii=False,
+                )
+            )
+            return
+
+  # 2. Guards for source file edits (apply to both main agent and subagents)
+  if tool_name in EDIT_TOOLS:
+    target_file = str(tool_args.get("TargetFile", "")).strip()
+    if is_tracked_source_file(target_file):
+      # Guard 3: Block editing gitignored / build-cache files
+      ignored, reason_detail = is_gitignored_or_build_cache(target_file)
+      if ignored:
+        print(
+            json.dumps(
+                {
+                    "decision": "deny",
+                    "reason": (
+                        f"[GENERATED-FILE GUARD] Редактирование `{target_file}` заблокировано: {reason_detail}. "
+                        "Не редактируй сгенерированные артефакты или кеш сборки напрямую — "
+                        "вopредактируй исходный отслеживаемый файл в репозитории и пересобери проект."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
+
+      # Guard 2: Read-Before-Edit on existing files for replace_file_content / multi_replace_file_content
+      if tool_name in MODIFY_TOOLS:
+        clean_path = os.path.expanduser(target_file.strip('"').strip("'"))
+        if os.path.exists(clean_path) and not was_file_read_or_written_in_chat(
+            transcript_path, clean_path, int(data.get("stepIdx", -1))
+        ):
+          print(
+              json.dumps(
+                  {
+                      "decision": "deny",
+                      "reason": (
+                          f"[READ-BEFORE-EDIT GUARD] Ты пытаешься изменить существующий файл `{os.path.basename(clean_path)}`, "
+                          "ни разу не прочитав его через `view_file` в текущем чате! "
+                          "Не редактируй код вслепую по памяти или по пересказу из `handoff_summary`: "
+                          "сначала прочитай целевой участок файла через `view_file`, проверь точные сигнатуры и контекст, "
+                          "и только после этого вызывай `replace_file_content`."
+                      ),
+                  },
+                  ensure_ascii=False,
+              )
+          )
+          return
+
+  print('{"decision": "allow"}')
+
+
+if __name__ == "__main__":
+  main()
