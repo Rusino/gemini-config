@@ -217,6 +217,7 @@ def analyze_current_turn(transcript_path: str) -> dict:
             pending_new_conv_cmd
             and last_cmd_exit_code == 0
             and step.get("status") == "DONE"
+            and '"newConversation"' in content
         ):
           launched_new_conv = True
           pending_new_conv_cmd = False

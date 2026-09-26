@@ -394,10 +394,31 @@ def main() -> None:
         )
         return
 
-    # 1b. Inspect `agentapi` commands in run_command
+    # 1b. Inspect `agentapi` and daemon commands in run_command
     if tool_name == "run_command":
       cmd = str(tool_args.get("CommandLine", "")).strip()
-      if "agentapi" in cmd:
+      is_daemon = str(tool_args.get("IsDaemon", "")).lower() == "true"
+      if re.search(r"\btail\s+-f\b", cmd) and (
+          is_daemon or ".system_generated/tasks/" in cmd
+      ):
+        print(
+            json.dumps(
+                {
+                    "decision": "deny",
+                    "reason": (
+                        "[PRE-TOOL GUARD] Do not run `tail -f` as a background daemon or on `.system_generated/tasks/` logs — "
+                        "it never terminates on its own and leaves zombie tasks spinning in the conversation! "
+                        "Wait for the task completion message, or read a snapshot via `view_file` or `tail -n 50`."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
+
+      if "agentapi" in cmd and not re.match(
+          r"^\s*(?:python3?|grep|egrep|fgrep|rg|git\s+grep|echo|cat)\b", cmd
+      ):
         new_title = state.get("pending_title") or build_continuation_title(
             conv_id, ""
         )
@@ -424,9 +445,46 @@ def main() -> None:
           )
           return
 
-        # If calling `agentapi new-conversation`, enrich handoff_summary*.md on disk
-        # and auto-inject missing env / --title if the agent forgot them!
-        if "new-conversation" in cmd:
+        # If calling `agentapi new-conversation`, verify handoff_summary exists,
+        # enrich handoff_summary*.md on disk, and auto-inject missing env / --title!
+        if "new-conversation" in cmd and not re.search(
+            r"\bnew-conversation\s+(?:--help|-h|help)\b", cmd
+        ):
+          ref_match = re.search(r"(/\S*handoff_summary[^\s\"']*\.md)", cmd)
+          missing_summary = None
+          if ref_match and not os.path.exists(ref_match.group(1)):
+            missing_summary = ref_match.group(1)
+          elif (
+              state.get("pending_handoff_launch")
+              and artifact_dir
+              and not glob.glob(os.path.join(artifact_dir, "handoff_summary*.md"))
+          ):
+            missing_summary = state.get("pending_handoff_file") or os.path.join(
+                artifact_dir, "handoff_summary.md"
+            )
+          if missing_summary:
+            print(
+                json.dumps(
+                    {
+                        "decision": "deny",
+                        "reason": (
+                            f"[PRE-TOOL GUARD] Cannot launch continuation conversation yet: the summary file `{missing_summary}` "
+                            "does not exist on disk! First create the summary file using `write_to_file` (`UserFacing: true`), "
+                            "and only then call `agentapi new-conversation`."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return
+
+          if artifact_dir:
+            tasks_dir = os.path.join(artifact_dir, ".system_generated", "tasks")
+            try:
+              subprocess.run(["pkill", "-f", tasks_dir], check=False, timeout=1.0)
+            except Exception:
+              pass
+
           enrich_handoff_summary_files(
               artifact_dir, transcript_path, workspace_paths
           )

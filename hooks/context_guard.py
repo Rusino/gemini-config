@@ -19,6 +19,9 @@ import os
 import re
 import sqlite3
 import sys
+from zoneinfo import ZoneInfo
+
+DEFAULT_TIMEZONE = os.environ.get("JETSKI_TIMEZONE", "America/New_York")
 
 # Thresholds for triggering context handoff:
 # ~600 KB of full transcript (~150k tokens) or 160 trajectory steps.
@@ -242,6 +245,7 @@ def get_handoff_launch_step_in_turn(transcript_path: str) -> int:
       if (
           step.get("status") == "DONE"
           and "The command exited with code 0." in content[:300]
+          and '"newConversation"' in content
       ):
         launch_idx = pending_launch_idx
         pending_launch_idx = None
@@ -256,7 +260,17 @@ def build_continuation_title(conv_id: str, fallback_text: str = "") -> str:
   probe_text = base_title or fallback_text
   has_cyrillic = bool(re.search(r"[а-яА-ЯёЁ]", probe_text))
   cont_word = "продолжение" if has_cyrillic else "continue"
-  time_str = datetime.now().strftime("%H:%M")
+  try:
+    tz = ZoneInfo(DEFAULT_TIMEZONE)
+    now_tz = datetime.now(tz)
+    cutoff = datetime(2026, 9, 28, 6, 0, tzinfo=tz)
+    time_str = (
+        now_tz.strftime("%H:%M")
+        if now_tz >= cutoff
+        else datetime.now(ZoneInfo("UTC")).strftime("%H:%M")
+    )
+  except Exception:
+    time_str = datetime.now().strftime("%H:%M")
 
   if base_title:
     return f"[{time_str} {cont_word}] {base_title}"
@@ -408,9 +422,19 @@ def main() -> None:
     cmd_prefix = state.get("pending_cmd_prefix") or build_agentapi_prefix(
         conv_id, transcript_path, workspace_paths
     )
+    summary_exists = os.path.exists(handoff_file)
+    step1_text = (
+        ""
+        if summary_exists
+        else (
+            f"1. FIRST create the summary artifact `{handoff_file}` via `write_to_file` (`UserFacing: true`) "
+            f"(it does NOT exist on disk yet — do not launch the continuation chat without creating it!).\n2. THEN "
+        )
+    )
     reminder_msg = (
-        f"[CONTEXT GUARD REMINDER] You have NOT launched the continuation chat yet! "
-        f"IMMEDIATELY stop all other actions and call `run_command` with this EXACT command (including `env -u` and `--title`):\n"
+        f"[CONTEXT GUARD REMINDER] You have NOT completed the handoff yet! "
+        f"IMMEDIATELY stop all other investigation/debugging actions:\n"
+        f"{step1_text}call `run_command` with this EXACT command (including `env -u` and `--title`):\n"
         f'   `{cmd_prefix} --model=pro --title="{new_title}" '
         f'"Continuing unfinished task from previous conversation (conversation://{conv_id}), interrupted due to context limits. '
         f"Read {handoff_file} via view_file, review completed steps and discarded hypotheses, and continue from the next step.\"`\n"

@@ -52,8 +52,9 @@ flowchart TD
    - **Turn-Start Handoff (`invocationNum == 0`)**: When the full transcript reaches `600 KB` (~150k tokens) or `160 steps` (`MAX_STEPS`) at the beginning of a user turn, the hook allows the agent to answer the current request, then instructs it to write a structured handoff summary (`handoff_summary_<Topic>_<short_id>.md`) and launch a continuation conversation.
    - **Mid-Turn Circuit Breaker (`invocationNum > 0`)**: If the context crosses the threshold mid-turn OR a single turn exceeds `80` consecutive tool-call iterations (`MAX_TURN_INVOCATIONS`), the hook triggers an immediate safe-checkpoint stop. The agent must leave edited files in a valid state, terminate any background tasks/subagents, record both completed steps and **discarded/failed hypotheses** (so the next chat does not repeat dead-end loops), and immediately transition to a fresh conversation.
 2. **Automatic Project & Title Continuity**:
-   - The new conversation automatically inherits the active project binding (`ANTIGRAVITY_PROJECT_ID`), is named `[HH:MM continue] <Original Title>`, and receives an initial prompt instructing it to read the handoff summary artifact and continue from the exact next step.
+   - The new conversation automatically inherits the active project binding (`ANTIGRAVITY_PROJECT_ID`), is named `[HH:MM continue] <Original Title>` (using the configured local timezone via `JETSKI_TIMEZONE`, defaulting to `America/New_York`), and receives an initial prompt instructing it to read the handoff summary artifact and continue from the exact next step.
    - Once a conversation hands off, the old chat is mechanically locked against further edits or duplicate launches, and completion is blocked if the agent writes a summary but forgets to launch the continuation chat.
+   - If the agent spends a step terminating background tasks before writing the summary, follow-up reminders check `os.path.exists(handoff_file)` and require creating `handoff_summary_*.md` first before launching the continuation chat.
 
 ---
 
@@ -80,12 +81,18 @@ flowchart TD
 - **Problem**: In large builds (e.g., Flutter Engine / CMake), copies of source files or generated headers exist inside build caches (`bin/cache/`, `.dart_tool/`, `CMakeFiles/`). An agent can accidentally edit the cached copy instead of the tracked repository file.
 - **Solution**: Every edit to a source file is checked against known build-cache paths and `git check-ignore`. If the file is ignored by Git or resides in a build cache, the edit is **denied** with instructions to modify the tracked source file instead.
 
-### 4.3. Objective Handoff Summary Enrichment
-- **Problem**: An LLM-written handoff summary might omit a modified file or misreport the status of the last build command, forcing the new conversation to waste context inspecting old logs.
-- **Solution**: Right as `agentapi new-conversation` is invoked, `pre_tool_guard.py` automatically appends a machine-generated snapshot section to `handoff_summary_*.md` containing:
-  - The exact list of project files modified by edit tools in the conversation;
-  - The last 6 executed commands along with their exit codes;
-  - The output of `git status -s -uno` and `git diff --stat` across active workspaces.
+### 4.3. Handoff Verification, Summary Enrichment & Zombie Task Cleanup
+- **Problem**:
+  1. An agent under a mid-turn circuit breaker might call `agentapi new-conversation` before creating `handoff_summary_*.md` on disk, leaving the continuation chat without context.
+  2. An LLM-written handoff summary might omit a modified file or misreport the status of the last build command, forcing the new conversation to waste context inspecting old logs.
+  3. An agent might spawn `tail -f` with `IsDaemon: true` on a task log, which never terminates on its own and leaves the old conversation spinning after handoff.
+- **Solution**:
+  - **Mandatory Summary Existence Check**: If `agentapi new-conversation` references a `handoff_summary_*.md` file that does not exist on disk yet, the command is **denied** until the agent writes the summary via `write_to_file`.
+  - **Zombie Daemon Prevention & Cleanup**: Running `tail -f` as a background daemon (`IsDaemon: true`) or on `.system_generated/tasks/` logs is **denied**. Additionally, when `agentapi new-conversation` executes, any lingering processes referencing the old conversation's `.system_generated/tasks/` directory are automatically terminated (`pkill -f`).
+  - **Objective Snapshot Enrichment**: Right as `agentapi new-conversation` is invoked, `pre_tool_guard.py` automatically appends a machine-generated snapshot section to `handoff_summary_*.md` containing:
+    - The exact list of project files modified by edit tools in the conversation;
+    - The last 6 executed commands along with their exit codes;
+    - The output of `git status -s -uno` and `git diff --stat` across active workspaces.
 
 ---
 
