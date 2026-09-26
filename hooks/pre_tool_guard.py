@@ -86,7 +86,7 @@ SOURCE_FILENAMES = {
 }
 
 EXIT_CODE_RE = re.compile(r"The command exited with code (\d+)\.")
-AUTO_SNAPSHOT_HEADER = "## Автоматический срез состояния (Git & Последние команды)"
+AUTO_SNAPSHOT_HEADER = "## Automatic State Snapshot (Git & Recent Commands)"
 
 
 def is_agent_internal_file(file_path: str) -> bool:
@@ -175,7 +175,7 @@ def is_gitignored_or_build_cache(target_file: str) -> tuple[bool, str]:
   norm_parts = clean.replace("\\", "/")
   for cache_marker in ("/bin/cache/", "/.dart_tool/", "/CMakeFiles/"):
     if cache_marker in norm_parts:
-      return True, f"путь находится в кеше сборки (`{cache_marker}`)"
+      return True, f"path is inside a build cache (`{cache_marker}`)"
 
   parent_dir = os.path.dirname(clean)
   if not os.path.isdir(parent_dir):
@@ -202,7 +202,7 @@ def is_gitignored_or_build_cache(target_file: str) -> tuple[bool, str]:
         check=False,
     )
     if res_ig.returncode == 0:
-      return True, "файл находится в `.gitignore` репозитория"
+      return True, "file is matched by the repository's `.gitignore`"
   except Exception:
     pass
   return False, ""
@@ -274,13 +274,13 @@ def enrich_handoff_summary_files(
       pass
 
   if edited_files:
-    sections.append("### Файлы, изменённые инструментами в этом чате")
+    sections.append("### Files Modified by Tools in This Conversation")
     for ef in edited_files[-15:]:
       sections.append(f"- [`{os.path.basename(ef)}`](file://{ef}) (`{ef}`)")
     sections.append("")
 
   if recent_cmds:
-    sections.append("### Последние выполненные команды")
+    sections.append("### Recent Commands Executed")
     sections.extend(recent_cmds[-6:])
     sections.append("")
 
@@ -306,7 +306,7 @@ def enrich_handoff_summary_files(
       st_out = (st.stdout or "").strip()
       df_out = (df.stdout or "").strip()
       if st_out or df_out:
-        sections.append(f"### Состояние Git в `{wp}`")
+        sections.append(f"### Git Status in `{wp}`")
         sections.append("```text")
         if st_out:
           sections.append(st_out[:1500])
@@ -368,9 +368,9 @@ def main() -> None:
                 {
                     "decision": "deny",
                     "reason": (
-                        f"[PRE-TOOL GUARD] Этот чат уже запустил чат-продолжение (на шаге #{launch_step})! "
-                        "Редактирование файлов в старом чате заблокировано, чтобы избежать гонок с новым чатом. "
-                        "Немедленно заверши ход."
+                        f"[PRE-TOOL GUARD] This conversation has already launched a continuation chat (at step #{launch_step})! "
+                        "Editing files in the old conversation is blocked to prevent race conditions with the new conversation. "
+                        "End your turn immediately."
                     ),
                 },
                 ensure_ascii=False,
@@ -384,9 +384,9 @@ def main() -> None:
                 {
                     "decision": "deny",
                     "reason": (
-                        f"[PRE-TOOL GUARD] Этот чат уже создал чат-продолжение (на шаге #{launch_step})! "
-                        "Запуск новых команд и повторное создание чата в старом окне заблокированы. "
-                        "Если есть фоновые задачи — останови их через manage_task (kill) и заверши ход."
+                        f"[PRE-TOOL GUARD] This conversation has already launched a continuation chat (at step #{launch_step})! "
+                        "Running new commands or launching duplicate continuation chats in the old conversation is blocked. "
+                        "If background tasks are running, terminate them via manage_task (kill) and end your turn."
                     ),
                 },
                 ensure_ascii=False,
@@ -415,8 +415,8 @@ def main() -> None:
                   {
                       "decision": "deny",
                       "reason": (
-                          f"[PRE-TOOL GUARD] Подкоманды `agentapi {bad_subcmd.group(1)}` не существует! "
-                          f"Используй ТОЧНО:\n`{cmd_prefix} --model=pro --title=\"{new_title}\" \"<промпт>\"`"
+                          f"[PRE-TOOL GUARD] Subcommand `agentapi {bad_subcmd.group(1)}` does not exist! "
+                          f"Use this EXACT command:\n`{cmd_prefix} --model=pro --title=\"{new_title}\" \"<prompt>\"`"
                       ),
                   },
                   ensure_ascii=False,
@@ -463,7 +463,7 @@ def main() -> None:
           if needs_rewrite and rewritten != cmd:
             print(
                 json.dumps(
-                    {"decision": "allow", "decision": "allow", "overwrite": {"CommandLine": rewritten}},
+                    {"decision": "allow", "overwrite": {"CommandLine": rewritten}},
                     ensure_ascii=False,
                 )
             )
@@ -481,9 +481,9 @@ def main() -> None:
                 {
                     "decision": "deny",
                     "reason": (
-                        f"[GENERATED-FILE GUARD] Редактирование `{target_file}` заблокировано: {reason_detail}. "
-                        "Не редактируй сгенерированные артефакты или кеш сборки напрямую — "
-                        "вopредактируй исходный отслеживаемый файл в репозитории и пересобери проект."
+                        f"[GENERATED-FILE GUARD] Editing `{target_file}` is blocked: {reason_detail}. "
+                        "Do not edit generated artifacts or build caches directly — "
+                        "edit the tracked source file in the repository and rebuild the project."
                     ),
                 },
                 ensure_ascii=False,
@@ -502,11 +502,11 @@ def main() -> None:
                   {
                       "decision": "deny",
                       "reason": (
-                          f"[READ-BEFORE-EDIT GUARD] Ты пытаешься изменить существующий файл `{os.path.basename(clean_path)}`, "
-                          "ни разу не прочитав его через `view_file` в текущем чате! "
-                          "Не редактируй код вслепую по памяти или по пересказу из `handoff_summary`: "
-                          "сначала прочитай целевой участок файла через `view_file`, проверь точные сигнатуры и контекст, "
-                          "и только после этого вызывай `replace_file_content`."
+                          f"[READ-BEFORE-EDIT GUARD] You are attempting to modify an existing file `{os.path.basename(clean_path)}` "
+                          "without reading it via `view_file` in the current conversation! "
+                          "Do not edit code blindly from memory or from a `handoff_summary`: "
+                          "first read the target section of the file via `view_file`, verify exact signatures and context, "
+                          "and only then call `replace_file_content`."
                       ),
                   },
                   ensure_ascii=False,

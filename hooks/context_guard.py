@@ -260,7 +260,7 @@ def build_continuation_title(conv_id: str, fallback_text: str = "") -> str:
 
   if base_title:
     return f"[{time_str} {cont_word}] {base_title}"
-  return f"[{time_str} {cont_word}] <Название чата>"
+  return f"[{time_str} {cont_word}] <Chat Title>"
 
 
 def load_state(state_path: str) -> dict:
@@ -383,10 +383,10 @@ def main() -> None:
       ]
       if steps_after_launch:
         stop_msg = (
-            f"[CONTEXT GUARD: ЧАТ УЖЕ ПЕРЕНЕСЁН] Внимание: этот чат УЖЕ создал чат-продолжение "
-            f"(на шаге #{launch_step}), но продолжил выполнение (например, проснулся от фоновой задачи `task` или субагента). "
-            f"КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО продолжать здесь отладку, менять файлы или запускать второй чат-продолжение! "
-            f"Если остались активные фоновые задачи — останови их через `manage_task` (`kill`) и немедленно заверши ход."
+            f"[CONTEXT GUARD: CHAT ALREADY HANDED OFF] Warning: this conversation ALREADY launched a continuation chat "
+            f"(at step #{launch_step}), but resumed execution (e.g., woken up by a background `task` or subagent). "
+            f"It is STRICTLY FORBIDDEN to continue debugging, editing files, or launching a second continuation chat here! "
+            f"If any background tasks remain active, terminate them via `manage_task` (`kill`) and end your turn immediately."
         )
         print(
             json.dumps(
@@ -409,12 +409,12 @@ def main() -> None:
         conv_id, transcript_path, workspace_paths
     )
     reminder_msg = (
-        f"[CONTEXT GUARD REMINDER] Ты ещё НЕ запустила чат-продолжение! "
-        f"НЕМЕДЛЕННО прекрати любые другие действия и вызови `run_command` ТОЧНО с этой командой (включая `env -u` и `--title`):\n"
+        f"[CONTEXT GUARD REMINDER] You have NOT launched the continuation chat yet! "
+        f"IMMEDIATELY stop all other actions and call `run_command` with this EXACT command (including `env -u` and `--title`):\n"
         f'   `{cmd_prefix} --model=pro --title="{new_title}" '
-        f'"Продолжаем незаконченную задачу из предыдущего чата (conversation://{conv_id}), прерванную из-за переполнения контекста. '
-        f"Прочитай файл {handoff_file} через view_file, изучи сделанные шаги и отброшенные гипотезы, и продолжи выполнение со следующего шага.\"`\n"
-        f"После получения `conversationId` сразу заверши ход и дай пользователю кликабельную ссылку: "
+        f'"Continuing unfinished task from previous conversation (conversation://{conv_id}), interrupted due to context limits. '
+        f"Read {handoff_file} via view_file, review completed steps and discarded hypotheses, and continue from the next step.\"`\n"
+        f"After receiving `conversationId`, immediately finish your turn and provide a clickable link to the user: "
         f"`[👉 {new_title}](conversation://<new_conversation_id>)`."
     )
     print(
@@ -448,9 +448,9 @@ def main() -> None:
         state["last_warned_fail_step"] = last_cmd_idx
         save_state(state_path, state)
         fail_msg = (
-            f"[TWO-STRIKE DEBUG GUARD] Внимание: {streak} команды подряд в текущем ходе завершились с ошибкой. "
-            f"НЕ ДЕЛАЙ третью правку наугад! Остановись, прочитай точный текст ошибки и исходные объявления (`.h` / документацию), "
-            f"при необходимости откати неудачные правки (`git diff` / `git checkout`), и смени гипотезу перед следующим действием."
+            f"[TWO-STRIKE DEBUG GUARD] Warning: {streak} consecutive commands in the current turn failed. "
+            f"DO NOT make a third blind guess! Stop, read the exact error output and source declarations (`.h` / docs), "
+            f"revert broken edits if needed (`git diff` / `git checkout`), and revise your hypothesis before proceeding."
         )
         print(
             json.dumps(
@@ -497,44 +497,44 @@ def main() -> None:
 
   if invocation_num > 0:
     reason = (
-        f"превышен лимит итераций внутри одного хода ({invocation_num} шагов подряд)"
+        f"single-turn iteration limit exceeded ({invocation_num} consecutive steps)"
         if turn_loop_exceeded and not size_or_steps_exceeded
-        else f"размер контекста переполнился прямо посреди выполнения хода ({size_kb:.0f} КБ / {steps} шагов, итерация хода #{invocation_num})"
+        else f"context threshold exceeded mid-turn ({size_kb:.0f} KB / {steps} steps, turn iteration #{invocation_num})"
     )
     msg = (
-        f"[CONTEXT GUARD: MID-TURN CIRCUIT BREAKER] Внимание: {reason}. "
-        f"Продолжение сложной отладки или генерации в текущем раздутом контексте приведёт к деградации качества и ошибкам.\n"
-        f"Действуй по протоколу экстренной остановки (Вариант Б — mid-turn):\n"
-        f"1. НЕ ПЫТАЙСЯ доделать всю задачу до конца в этом чате. Если прямо сейчас какой-то файл остался в невалидном/полуотредактированном состоянии — только доведи его до консистентного состояния и прекрати дальнейшие попытки. "
-        f"Если в этом чате запущены фоновые задачи (background tasks) или субагенты — обязательно останови их через `manage_task` (`kill`) / `manage_subagents` (`kill_all`), чтобы они не разбудили этот чат после переезда!\n"
-        f"2. Создай или обнови артефакт `{handoff_file}` (через write_to_file, UserFacing: true), обязательно указав:\n"
-        f"   - Изначальную цель задачи;\n"
-        f"   - Что уже сделано и какие файлы изменены;\n"
-        f"   - Какие гипотезы/подходы были проверены и НЕ сработали (чтобы не повторять их в новом чате);\n"
-        f"   - Точный следующий шаг, с которого нужно продолжить;\n"
-        f"   - Ссылку `[Предыдущий чат](conversation://{conv_id})`.\n"
-        f"3. ОДНОВРЕМЕННО (в этом же шаге или сразу следующим вызовом) запусти новый чат через run_command (используй ТОЧНО указанную команду и `--title`):\n"
+        f"[CONTEXT GUARD: MID-TURN CIRCUIT BREAKER] Warning: {reason}. "
+        f"Continuing complex debugging or code generation in an oversized context will degrade quality and cause errors.\n"
+        f"Follow the mid-turn emergency handoff protocol:\n"
+        f"1. DO NOT try to finish the entire task in this conversation. If any file is currently left in a broken/half-edited state, bring it to a clean checkpoint and stop further attempts. "
+        f"If any background tasks or subagents are running in this conversation, terminate them first via `manage_task` (`kill`) / `manage_subagents` (`kill_all`) so they do not wake this chat up after handoff!\n"
+        f"2. Create or update the artifact `{handoff_file}` (via write_to_file, UserFacing: true), documenting:\n"
+        f"   - Original goal of the task;\n"
+        f"   - What has been completed and which files were modified;\n"
+        f"   - Which hypotheses/approaches were tested and DID NOT work (to avoid repeating them in the new chat);\n"
+        f"   - Exact next step to resume from;\n"
+        f"   - Link `[Previous Conversation](conversation://{conv_id})`.\n"
+        f"3. SIMULTANEOUSLY (in the same step or immediately next) launch the new conversation via run_command (use this EXACT command and `--title`):\n"
         f'   `{cmd_prefix} --model=pro --title="{new_title}" '
-        f'"Продолжаем незаконченную задачу из предыдущего чата (conversation://{conv_id}), прерванную из-за переполнения контекста. '
-        f"Прочитай файл {handoff_file} через view_file, изучи сделанные шаги и отброшенные гипотезы, и продолжи выполнение со следующего шага.\"`\n"
-        f"4. Сразу заверши ход, объяснив пользователю, на каком безопасном чекпоинте ты остановилась, и дай ссылку: "
+        f'"Continuing unfinished task from previous conversation (conversation://{conv_id}), interrupted due to context limits. '
+        f"Read {handoff_file} via view_file, review completed steps and discarded hypotheses, and continue from the next step.\"`\n"
+        f"4. Immediately finish your turn, explain to the user which safe checkpoint you stopped at, and provide the link: "
         f"`[👉 {new_title}](conversation://<new_conversation_id>)`."
     )
   else:
     msg = (
-        f"[CONTEXT GUARD ALERT] Размер текущего чата достиг порога "
-        f"({size_kb:.0f} КБ / {steps} шагов). Чтобы избежать деградации контекста и галлюцинаций, "
-        f"выполни автоматическую подготовку нового чата (Вариант Б):\n"
-        f"1. Сначала полностью ответь на текущий запрос пользователя.\n"
-        f"2. Создай или обнови файл резюме `{handoff_file}` (через write_to_file, UserFacing: true), "
-        f"записав туда: цель задачи, ключевые принятые решения, список затронутых файлов, "
-        f"текущий статус, следующие шаги и ссылку `[Предыдущий чат](conversation://{conv_id})`.\n"
-        f"3. Вызови через run_command команду создания нового чата (используй ТОЧНО указанную команду и `--title`):\n"
+        f"[CONTEXT GUARD ALERT] Current conversation size has reached the threshold "
+        f"({size_kb:.0f} KB / {steps} steps). To prevent context degradation and hallucinations, "
+        f"perform an automatic handoff to a new conversation:\n"
+        f"1. First, completely answer the user's current request.\n"
+        f"2. Create or update the summary file `{handoff_file}` (via write_to_file, UserFacing: true), "
+        f"recording: task goal, key decisions made, modified files, "
+        f"current status, next steps, and a link `[Previous Conversation](conversation://{conv_id})`.\n"
+        f"3. Call `run_command` to launch the new conversation (use this EXACT command and `--title`):\n"
         f'   `{cmd_prefix} --model=pro --title="{new_title}" '
-        f'"Продолжаем работу из предыдущего чата (conversation://{conv_id}). '
-        f"Прочитай файл с контекстом {handoff_file} через view_file и кратко подтверди готовность продолжать.\"`\n"
-        f"4. В самом конце своего ответа пользователю добавь заметный блок с кликабельной ссылкой "
-        f"на созданный чат: `[👉 {new_title}](conversation://<new_conversation_id>)`."
+        f'"Continuing work from previous conversation (conversation://{conv_id}). '
+        f"Read the context file {handoff_file} via view_file and briefly confirm readiness to continue.\"`\n"
+        f"4. At the very end of your response to the user, include a prominent clickable link "
+        f"to the new conversation: `[👉 {new_title}](conversation://<new_conversation_id>)`."
     )
 
   result = {"injectSteps": [{"ephemeralMessage": msg}]}

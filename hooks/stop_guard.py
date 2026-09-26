@@ -286,7 +286,7 @@ def main() -> None:
   ):
     state["stop_blocked_handoff"] = True
     save_state(state_path, state)
-    new_title = state.get("pending_title") or "[продолжение]"
+    new_title = state.get("pending_title") or "[continue]"
     cmd_prefix = (
         state.get("pending_cmd_prefix")
         or "env -u ANTIGRAVITY_SOURCE_METADATA agentapi new-conversation"
@@ -299,12 +299,12 @@ def main() -> None:
     )
     handoff_file = state.get("pending_handoff_file") or default_handoff
     reason = (
-        f"[HANDOFF GUARD] Ты подготовила резюме `{handoff_file}`, но попыталась завершить ход, "
-        f"НЕ запустив новый чат-продолжение! Вызови `run_command`:\n"
+        f"[HANDOFF GUARD] You prepared the summary `{handoff_file}`, but attempted to finish your turn "
+        f"WITHOUT launching the continuation conversation! Call `run_command`:\n"
         f'`{cmd_prefix} --model=pro --title="{new_title}" '
-        f'"Продолжаем незаконченную задачу из предыдущего чата (conversation://{conv_id}), прерванную из-за переполнения контекста. '
-        f"Прочитай файл {handoff_file} через view_file, изучи сделанные шаги и отброшенные гипотезы, и продолжи выполнение со следующего шага.\"`\n"
-        f"и дай пользователю ссылку `[👉 {new_title}](conversation://<new_conversation_id>)`."
+        f'"Continuing unfinished task from previous conversation (conversation://{conv_id}), interrupted due to context limits. '
+        f"Read {handoff_file} via view_file, review completed steps and discarded hypotheses, and continue from the next step.\"`\n"
+        f"and provide the link `[👉 {new_title}](conversation://<new_conversation_id>)` to the user."
     )
     print(
         json.dumps(
@@ -327,15 +327,15 @@ def main() -> None:
 
   last_cmd_idx = info.get("last_cmd_idx", -1)
   last_cmd_exit = info.get("last_cmd_exit_code")
-  edited_file = os.path.basename(info.get("last_edited_file", "файл"))
+  edited_file = os.path.basename(info.get("last_edited_file", "file"))
 
   if last_cmd_idx < last_edit_idx:
     state["last_blocked_edit_idx"] = last_edit_idx
     save_state(state_path, state)
     reason = (
-        f"[VERIFICATION GUARD] Ты изменила исходный код (`{edited_file}`), но после последней правки "
-        f"не запустила сборку, тесты или проверку синтаксиса (`run_command`). "
-        f"Запусти проверку перед тем, как завершать ответ (или явно напиши, почему автоматическая проверка здесь неприменима)."
+        f"[VERIFICATION GUARD] You modified source code (`{edited_file}`), but did not run a build, test, "
+        f"or syntax verification command (`run_command`) after the last edit. "
+        f"Run verification before finishing your response (or explicitly state why automated verification does not apply here)."
     )
     print(
         json.dumps(
@@ -348,9 +348,9 @@ def main() -> None:
     state["last_blocked_edit_idx"] = last_edit_idx
     save_state(state_path, state)
     reason = (
-        f"[VERIFICATION GUARD] После правки файла `{edited_file}` последняя запущенная команда "
-        f"завершилась с ошибкой (код возврата {last_cmd_exit}). Не завершай ход с нерабочим кодом: "
-        f"исправь ошибку и перепроверь, либо откати сломанное изменение и объясни причину."
+        f"[VERIFICATION GUARD] After editing `{edited_file}`, the last executed command "
+        f"failed with exit code {last_cmd_exit}. Do not finish your turn with broken code: "
+        f"fix the error and re-verify, or revert the broken change and explain why."
     )
     print(
         json.dumps(

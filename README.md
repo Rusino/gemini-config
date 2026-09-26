@@ -1,29 +1,29 @@
 # Gemini / Jetski Global Config (`~/.gemini/config`)
 
-Персональные правила, хуки и настройки для Jetski (`~/.gemini/config`), совместимые с Linux и macOS.
+Personal global rules, lifecycle hooks, and configuration for Jetski (`~/.gemini/config`), compatible with both Linux and macOS.
 
-## Что внутри
+## Contents
 
-- `rules/` — глобальные правила:
-  - `communication_style.md` — стиль общения («ты», женский род, критическая оценка без лести, Open Source / Git).
-  - `subagent_exploration.md` — делегирование широкого поиска субагентам и проверка сигнатур API перед вызовом.
-- `hooks.json` и `hooks/` — защитные хуки жизненного цикла:
-  - `context_guard.py` — контроль размера контекста и автоматический перенос (handoff) в новый чат + защита от циклов ошибок (Two-Strike Debug Guard).
-  - `pre_tool_guard.py` — защита от слепого редактирования без чтения (`view_file`), редактирования сгенерированных/игнорируемых файлов и сломанных команд `agentapi`.
-  - `stop_guard.py` — проверка запуска сборки/тестов после редактирования исходного кода перед завершением хода.
+- `rules/` — Global agent rules:
+  - `communication_style.md` — Communication and collaboration preferences (informal address, grammatical gender, critical & objective evaluation without sycophancy, Open Source / Git workflow).
+  - `subagent_exploration.md` — Context hygiene (delegating broad codebase exploration to subagents) and reading API definitions before writing calls.
+- `hooks.json` and `hooks/` — Lifecycle guard hooks:
+  - `context_guard.py` — Monitors conversation context size and turn iteration limits, triggers automatic continuation handoffs, and enforces the Two-Strike Debug Guard on consecutive command failures.
+  - `pre_tool_guard.py` — Prevents blind edits without reading (`view_file`), blocks edits to generated/gitignored build caches, enriches `handoff_summary*.md` snapshots, and validates `agentapi` commands.
+  - `stop_guard.py` — Ensures source code modifications are verified by a build/test command before the agent finishes its turn.
 
-> **Примечание:** `config.json` и `projects/` добавлены в `.gitignore`, так как они содержат привязанные к конкретной машине пути (`/usr/local/...` vs `/Users/...`), имя хоста удалённого доступа и изменяются во время работы.
+> **Note:** `config.json` and `projects/` are excluded via `.gitignore` because they contain machine-specific paths (`/usr/local/...` vs `/Users/...`), remote-control hostnames, and runtime state mutated during execution.
 
-## Как развернуть на Mac (или другом компьютере)
+## Setup on macOS (or Another Machine)
 
-Если папка `~/.gemini/config` на Маке ещё не существует:
+If `~/.gemini/config` does not exist yet:
 
 ```bash
 mkdir -p ~/.gemini
 git clone git@github.com:Rusino/gemini-config.git ~/.gemini/config
 ```
 
-Если папка `~/.gemini/config` уже создана при первом запуске Jetski (там уже лежит локальный `config.json`):
+If `~/.gemini/config` was already created by Jetski on first launch (e.g., it already contains a local `config.json`):
 
 ```bash
 cd ~/.gemini/config
@@ -33,9 +33,9 @@ git fetch origin
 git checkout -f main
 ```
 
-## Обновление настроек
+## Syncing Changes
 
-После изменений на любой из машин:
+Push updates from any machine:
 
 ```bash
 git -C ~/.gemini/config add -A
@@ -43,7 +43,7 @@ git -C ~/.gemini/config commit -m "Update config"
 git -C ~/.gemini/config push
 ```
 
-На другой машине:
+Pull updates on another machine:
 
 ```bash
 git -C ~/.gemini/config pull --rebase
