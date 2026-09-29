@@ -116,7 +116,9 @@ def infer_project_id_from_workspaces(workspace_paths: list[str]) -> str:
   return ""
 
 
-EXIT_CODE_RE = re.compile(r"^The command exited with code (\d+)\.", re.MULTILINE)
+# Tool results may indent this line (e.g. "\n\n\t\t\t\tThe command exited ..." on
+# macOS Jetski), so allow leading whitespace; otherwise the guard never fires.
+EXIT_CODE_RE = re.compile(r"^\s*The command exited with code (\d+)\.", re.MULTILINE)
 FAILURE_STREAK_THRESHOLD = int(os.environ.get("JETSKI_FAIL_STREAK", "2"))
 BENIGN_EXIT1_CMD_RE = re.compile(
     r"^\s*(?:git\s+(?:grep|diff|check-ignore)|grep|egrep|fgrep|rg)\b"

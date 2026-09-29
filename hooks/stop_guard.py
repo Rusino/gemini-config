@@ -55,7 +55,27 @@ EDIT_TOOLS = {
     "multi_replace_file_content",
 }
 
-EXIT_CODE_RE = re.compile(r"^The command exited with code (\d+)\.", re.MULTILINE)
+# Tool results may indent this line (e.g. "\n\n\t\t\t\tThe command exited ..." on
+# macOS Jetski), so allow leading whitespace.
+EXIT_CODE_RE = re.compile(r"^\s*The command exited with code (\d+)\.", re.MULTILINE)
+
+# Read-only inspection commands neither verify an edit (a `git diff` exiting 0 is
+# not a build/test) nor indicate a broken build (`grep`/`rg`/`git grep` exit 1
+# just means "no matches"), so they must not update verification tracking.
+INSPECTION_SEGMENT_RE = re.compile(
+    r"^(?:timeout\s+\S+\s+)?(?:"
+    r"git(?:\s+-C\s+\S+)?\s+(?:status|diff|log|show|grep|check-ignore|branch"
+    r"|rev-parse|ls-files|blame|remote)"
+    r"|grep|egrep|fgrep|rg|ls|cat|head|tail|wc|find|fd|pwd|echo|which|file"
+    r"|stat|tree|cd"
+    r")\b"
+)
+
+
+def is_inspection_command(cmd: str) -> bool:
+  """True if every segment of a (possibly chained/piped) command is read-only."""
+  segments = [s.strip() for s in re.split(r"&&|\|\||;|\|", cmd) if s.strip()]
+  return bool(segments) and all(INSPECTION_SEGMENT_RE.match(s) for s in segments)
 
 
 def is_tracked_source_file(file_path: str) -> bool:
@@ -203,6 +223,8 @@ def analyze_current_turn(transcript_path: str) -> dict:
           cmd = str(targs.get("CommandLine", ""))
           if "agentapi" in cmd and "new-conversation" in cmd:
             pending_new_conv_cmd = True
+          elif is_inspection_command(cmd):
+            continue
           last_cmd_idx = idx
           pending_cmd_check = True
 
