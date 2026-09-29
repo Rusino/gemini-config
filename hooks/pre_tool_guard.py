@@ -32,6 +32,7 @@ import subprocess
 import sys
 
 from context_guard import (
+    APP_DATA_DIR_CANDIDATES,
     build_agentapi_prefix,
     build_continuation_title,
     get_handoff_launch_step_in_turn,
@@ -95,13 +96,12 @@ def is_agent_internal_file(file_path: str) -> bool:
     return True
   clean = os.path.abspath(os.path.expanduser(file_path.strip().strip('"').strip("'")))
   config_dir = os.path.abspath(os.path.expanduser("~/.gemini/config"))
-  brain_dir = os.path.abspath(os.path.expanduser("~/.gemini/jetski/brain"))
-  if (
-      clean == config_dir
-      or clean.startswith(config_dir + "/")
-      or clean == brain_dir
-      or clean.startswith(brain_dir + "/")
-      or clean.startswith("/tmp/")
+  internal_dirs = [config_dir] + [
+      os.path.abspath(os.path.expanduser(d + "/brain"))
+      for d in APP_DATA_DIR_CANDIDATES
+  ]
+  if clean.startswith("/tmp/") or any(
+      clean == d or clean.startswith(d + "/") for d in internal_dirs
   ):
     return True
   return False

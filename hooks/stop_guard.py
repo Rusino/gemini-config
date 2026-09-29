@@ -84,16 +84,17 @@ def is_tracked_source_file(file_path: str) -> bool:
   clean = os.path.abspath(
       os.path.expanduser(file_path.strip().strip('"').strip("'"))
   )
-  # Ignore agent customization/artifact files under ~/.gemini/config and ~/.gemini/jetski/brain
-  # (but DO NOT ignore user project workspaces under ~/.gemini/jetski/scratch!)
+  # Ignore agent customization/artifact files under ~/.gemini/config and
+  # ~/.gemini/{antigravity,jetski}/brain (keep in sync with
+  # context_guard.APP_DATA_DIR_CANDIDATES), but DO NOT ignore user project
+  # workspaces under ~/.gemini/<client>/scratch!
   config_dir = os.path.abspath(os.path.expanduser("~/.gemini/config"))
-  brain_dir = os.path.abspath(os.path.expanduser("~/.gemini/jetski/brain"))
-  if (
-      clean == config_dir
-      or clean.startswith(config_dir + "/")
-      or clean == brain_dir
-      or clean.startswith(brain_dir + "/")
-      or clean.startswith("/tmp/")
+  internal_dirs = [config_dir] + [
+      os.path.abspath(os.path.expanduser(f"~/.gemini/{client}/brain"))
+      for client in ("antigravity", "jetski")
+  ]
+  if clean.startswith("/tmp/") or any(
+      clean == d or clean.startswith(d + "/") for d in internal_dirs
   ):
     return False
   basename = os.path.basename(clean)

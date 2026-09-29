@@ -19,6 +19,7 @@ import os
 import re
 import sqlite3
 import sys
+from urllib.parse import unquote
 from zoneinfo import ZoneInfo
 
 DEFAULT_TIMEZONE = os.environ.get("JETSKI_TIMEZONE", "America/New_York")
@@ -37,9 +38,11 @@ SNOOZE_KB = 300
 SNOOZE_STEPS = 80
 SNOOZE_TURN_INVOCATIONS = 40
 
-SUMMARY_DB_PATH = os.path.expanduser(
-    "~/.gemini/jetski/conversation_summaries.db"
-)
+# App data dirs of the supported clients, in lookup order. Antigravity keeps
+# conversation_summaries.db (with project ids) in ~/.gemini/antigravity; some
+# Jetski builds use ~/.gemini/jetski (standalone macOS Jetski has no DB at all).
+APP_DATA_DIR_CANDIDATES = ("~/.gemini/antigravity", "~/.gemini/jetski")
+SUMMARY_DB_NAME = "conversation_summaries.db"
 PROJECTS_DIR = os.path.expanduser("~/.gemini/config/projects")
 
 # Regexes to strip previous continuation prefixes/suffixes on chained handoffs:
@@ -67,53 +70,117 @@ def get_transcript_size_kb(transcript_path: str) -> float:
   return 0.0
 
 
-def get_conversation_db_info(conv_id: str) -> tuple[str, str]:
-  """Returns (title, project_id) from conversation_summaries.db."""
-  if not conv_id or not os.path.exists(SUMMARY_DB_PATH):
+def app_data_dir_from_path(path: str) -> str:
+  """Returns <appDataDir> for a path like <appDataDir>/brain/<conv-id>/..., or ""."""
+  if not path:
+    return ""
+  parts = os.path.abspath(os.path.expanduser(path)).split(os.sep)
+  for i in range(len(parts) - 2, 0, -1):
+    if parts[i] == "brain":
+      return os.sep.join(parts[:i]) or os.sep
+  return ""
+
+
+def summary_db_paths(hint_path: str = "") -> list[str]:
+  """Existing conversation_summaries.db paths, most likely first (deduplicated)."""
+  dirs = [app_data_dir_from_path(hint_path)] + [
+      os.path.expanduser(d) for d in APP_DATA_DIR_CANDIDATES
+  ]
+  paths: list[str] = []
+  for d in dirs:
+    if not d:
+      continue
+    p = os.path.join(os.path.abspath(d), SUMMARY_DB_NAME)
+    if p not in paths and os.path.isfile(p):
+      paths.append(p)
+  return paths
+
+
+def _query_summary_db(db_path: str, conv_id: str):
+  """Returns the (title, project_id) row or None.
+
+  `mode=ro` cannot open a WAL database whose -shm file is absent (e.g. while
+  the client is not holding it open), so fall back to `immutable=1`, which may
+  miss the newest un-checkpointed rows but never writes.
+  """
+  query = (
+      "SELECT title, project_id FROM conversation_summaries WHERE"
+      " conversation_id = ?"
+  )
+  for flags in ("mode=ro", "mode=ro&immutable=1"):
+    try:
+      conn = sqlite3.connect(f"file:{db_path}?{flags}", uri=True, timeout=1.0)
+      try:
+        return conn.execute(query, (conv_id,)).fetchone()
+      finally:
+        conn.close()
+    except Exception:
+      continue
+  return None
+
+
+def get_conversation_db_info(
+    conv_id: str, hint_path: str = ""
+) -> tuple[str, str]:
+  """Returns (title, project_id) from conversation_summaries.db.
+
+  `hint_path` (transcript or artifact path) selects the current client's app
+  data dir first; otherwise the known client dirs are searched in order.
+  """
+  if not conv_id:
     return ("", "")
-  try:
-    uri = f"file:{SUMMARY_DB_PATH}?mode=ro"
-    with sqlite3.connect(uri, uri=True, timeout=1.0) as conn:
-      row = conn.execute(
-          "SELECT title, project_id FROM conversation_summaries WHERE"
-          " conversation_id = ?",
-          (conv_id,),
-      ).fetchone()
-      if row:
-        title = str(row[0]).strip() if row[0] else ""
-        project_id = str(row[1]).strip() if row[1] else ""
-        return (title, project_id)
-  except Exception:
-    pass
+  for db_path in summary_db_paths(hint_path):
+    row = _query_summary_db(db_path, conv_id)
+    if row:
+      title = str(row[0]).strip() if row[0] else ""
+      project_id = str(row[1]).strip() if row[1] else ""
+      return (title, project_id)
   return ("", "")
 
 
+def _file_uri_to_path(uri: str) -> str:
+  if not uri.startswith("file://"):
+    return ""
+  return unquote(uri[len("file://") :]).rstrip("/")
+
+
 def infer_project_id_from_workspaces(workspace_paths: list[str]) -> str:
-  """Infers a project_id strictly from the conversation's active workspace_paths."""
+  """Infers a project_id strictly from the conversation's active workspace_paths.
+
+  Considers both `gitFolder.folderUri` and plain `folderUri` resources; the
+  most specific (longest) matching folder wins, so a workspace inside
+  ~/Sources/skia maps to the skia project rather than a ~/Sources project.
+  """
   if not workspace_paths or not os.path.isdir(PROJECTS_DIR):
     return ""
   folder_to_project: list[tuple[str, str]] = []
-  for pfile in glob.glob(os.path.join(PROJECTS_DIR, "*.json")):
+  for pfile in sorted(glob.glob(os.path.join(PROJECTS_DIR, "*.json"))):
     try:
       with open(pfile, "r", encoding="utf-8") as f:
         pdata = json.load(f)
       pid = pdata.get("id", "")
+      if not pid:
+        continue
       resources = pdata.get("projectResources", {}).get("resources", [])
       for r in resources:
-        uri = r.get("gitFolder", {}).get("folderUri", "")
-        if uri.startswith("file://") and pid:
-          folder_path = uri[len("file://") :].rstrip("/")
+        for uri in (
+            (r.get("gitFolder") or {}).get("folderUri", ""),
+            r.get("folderUri", ""),
+        ):
+          folder_path = _file_uri_to_path(uri)
           if folder_path:
             folder_to_project.append((folder_path, pid))
     except Exception:
       pass
 
+  best_len, best_pid = -1, ""
   for wp in workspace_paths:
+    wp = wp.rstrip("/")
     for folder_path, pid in folder_to_project:
       if wp == folder_path or wp.startswith(folder_path + "/"):
-        return pid
-
-  return ""
+        if len(folder_path) > best_len:
+          best_len, best_pid = len(folder_path), pid
+  return best_pid
 
 
 # Tool results may indent this line (e.g. "\n\n\t\t\t\tThe command exited ..." on
@@ -197,7 +264,7 @@ def get_consecutive_cmd_failures(transcript_path: str) -> tuple[int, int]:
 
 
 def build_agentapi_prefix(
-    conv_id: str, _transcript_path: str, workspace_paths: list[str]
+    conv_id: str, transcript_path: str, workspace_paths: list[str]
 ) -> str:
   """Builds the command prefix for agentapi new-conversation with project_id.
 
@@ -206,7 +273,7 @@ def build_agentapi_prefix(
   Preserves the conversation's project_id if it belongs to a project, or
   explicitly unsets ANTIGRAVITY_PROJECT_ID if the conversation is outside-of-project.
   """
-  _, current_project_id = get_conversation_db_info(conv_id)
+  _, current_project_id = get_conversation_db_info(conv_id, transcript_path)
   if current_project_id and current_project_id != "outside-of-project":
     return (
         "env -u ANTIGRAVITY_SOURCE_METADATA"
@@ -331,7 +398,7 @@ def main() -> None:
   )
   state = load_state(state_path)
 
-  raw_title, _ = get_conversation_db_info(conv_id)
+  raw_title, _ = get_conversation_db_info(conv_id, transcript_path)
   base_title = CONT_SUFFIX_RE.sub("", raw_title).strip()
   base_title = CONT_PREFIX_RE.sub("", base_title).strip()
   slug = re.sub(r"[^\w\-]+", "_", base_title, flags=re.UNICODE).strip("_")[:40]
