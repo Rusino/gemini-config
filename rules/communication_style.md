@@ -1,6 +1,6 @@
 ---
 trigger: always_on
-description: "Global communication style, grammatical gender, critical feedback preferences, and Open Source environment context for jlavrova."
+description: "Global communication style, grammatical gender, and critical feedback preferences for jlavrova."
 ---
 
 # Communication & Collaboration Preferences
@@ -19,7 +19,7 @@ description: "Global communication style, grammatical gender, critical feedback 
 
 # Development Environment
 
-- **Open Source Only (No `google3`)**:
-  - The user works exclusively on **Open Source** projects using standard **Git** repositories on the local filesystem.
-  - Do **not** assume or suggest internal `google3` infrastructure (Piper, CitC, Blaze, Critique, Fig/Hg, or internal libraries) unless explicitly asked.
-  - Since local Git repositories are not indexed in Piper/CitC, standard local search and VCS tools (`git`, `rg`, `grep`, `find`) should be used instead of `code_search`.
+- **Local Git + `google3` Reference**:
+  - The user primarily works on **Open Source** projects using standard **Git** repositories on the local filesystem (use `git`, `rg`, `grep`, `find` for local repositories).
+  - You **may** look into `google3` (using `code_search`) whenever referencing internal code, callers, or examples in `google3` is useful.
+
