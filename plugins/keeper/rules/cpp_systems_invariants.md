@@ -12,3 +12,4 @@ globs: "**/*.h,**/*.hpp,**/*.cc,**/*.cpp"
 5. **No Compiler Warnings Suppression:** Do not suppress compiler warnings (e.g. via `#pragma GCC diagnostic ignored`). Warnings are errors and must be fixed at the source.
 6. **KEEPER-DEBT Markers:** Use explicit `// KEEPER-DEBT:` comments when introducing intentional temporary technical debt, specifying why and a condition for removal.
 7. **Frozen ABI Stability:** For exposed APIs and structures, the Application Binary Interface (ABI) is frozen. Changes must not alter existing structure layouts, virtual table orders, or exported symbols in ways that break backwards compatibility.
+8. **Contract Honesty:** Never invert, negate, or loosen test assertions to make tests pass against unfixed code. Tests must assert required contract behavior, never character-pin accidental failures.
