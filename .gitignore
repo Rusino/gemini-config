@@ -10,3 +10,6 @@ __pycache__/
 
 # OS files
 .DS_Store
+
+# Ignore flutter plugin
+plugins/flutter/
