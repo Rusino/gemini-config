@@ -310,7 +310,7 @@ def main() -> None:
   ):
     state["stop_blocked_handoff"] = True
     save_state(state_path, state)
-    new_title = state.get("pending_title") or "[continue]"
+    new_title = state.get("pending_title") or "[handoff]"
     cmd_prefix = (
         state.get("pending_cmd_prefix")
         or "env -u ANTIGRAVITY_SOURCE_METADATA agentapi new-conversation"

@@ -8,7 +8,7 @@ Personal global rules, lifecycle hooks, and configuration for Jetski (`~/.gemini
   - `communication_style.md` — Communication and collaboration preferences (informal address, grammatical gender, critical & objective evaluation without sycophancy, Open Source / Git workflow).
   - `subagent_exploration.md` — Context hygiene (delegating broad codebase exploration to subagents) and reading API definitions before writing calls.
 - `hooks.json` and `hooks/` — Lifecycle guard hooks:
-  - `context_guard.py` — Monitors conversation context size and turn iteration limits, triggers automatic continuation handoffs (with timezone-aware `[HH:MM continue]` prefixes via `JETSKI_TIMEZONE`), and enforces the Two-Strike Debug Guard on consecutive command failures.
+  - `context_guard.py` — Monitors conversation context size and turn iteration limits, triggers automatic continuation handoffs (with timezone-aware `[HH:MM]` prefixes via `JETSKI_TIMEZONE`), and enforces the Two-Strike Debug Guard on consecutive command failures.
   - `pre_tool_guard.py` — Prevents blind edits without reading (`view_file`), blocks edits to generated/gitignored build caches, blocks infinite `tail -f` background daemons, verifies that `handoff_summary*.md` exists on disk before allowing `agentapi new-conversation`, auto-enriches `handoff_summary*.md` snapshots, and cleans up orphaned task log processes on handoff.
   - `stop_guard.py` — Ensures source code modifications are verified by a build/test command before the agent finishes its turn, and silences browser completion chimes on automated handoffs.
 - `documentation/` — Detailed architecture and design docs:

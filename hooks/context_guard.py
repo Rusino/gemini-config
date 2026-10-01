@@ -47,7 +47,7 @@ PROJECTS_DIR = os.path.expanduser("~/.gemini/config/projects")
 
 # Regexes to strip previous continuation prefixes/suffixes on chained handoffs:
 CONT_PREFIX_RE = re.compile(
-    r"^(?:\[\d{2}:\d{2}\s+(?:продолжение|continue)\]\s*|(?:продолжение|continue)(?:\s+\d{2}:\d{2})?\s*:\s*)+",
+    r"^(?:\[\d{2}:\d{2}(?:\s+(?:продолжение|continue))?\]\s*|(?:продолжение|continue)(?:\s+\d{2}:\d{2})?\s*:\s*)+",
     re.IGNORECASE,
 )
 CONT_SUFFIX_RE = re.compile(
@@ -326,9 +326,6 @@ def build_continuation_title(conv_id: str, fallback_text: str = "") -> str:
   base_title = CONT_SUFFIX_RE.sub("", raw_title).strip()
   base_title = CONT_PREFIX_RE.sub("", base_title).strip()
 
-  probe_text = base_title or fallback_text
-  has_cyrillic = bool(re.search(r"[а-яА-ЯёЁ]", probe_text))
-  cont_word = "продолжение" if has_cyrillic else "continue"
   try:
     tz = ZoneInfo(DEFAULT_TIMEZONE)
     now_tz = datetime.now(tz)
@@ -342,8 +339,8 @@ def build_continuation_title(conv_id: str, fallback_text: str = "") -> str:
     time_str = datetime.now().strftime("%H:%M")
 
   if base_title:
-    return f"[{time_str} {cont_word}] {base_title}"
-  return f"[{time_str} {cont_word}] <Chat Title>"
+    return f"[{time_str}] {base_title}"
+  return f"[{time_str}] <Chat Title>"
 
 
 def load_state(state_path: str) -> dict:
