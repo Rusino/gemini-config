@@ -445,6 +445,21 @@ def main() -> None:
           )
           return
 
+        if len(re.findall(r"\bagentapi\s+new-conversation\b", cmd)) > 1:
+          print(
+              json.dumps(
+                  {
+                      "decision": "deny",
+                      "reason": (
+                          "[PRE-TOOL GUARD] Do not run `agentapi new-conversation` multiple times or inside `$()` in a single command! "
+                          "Launch exactly ONE chat, verify it in the SAME command, and wait for its completion."
+                      ),
+                  },
+                  ensure_ascii=False,
+              )
+          )
+          return
+
         # If calling `agentapi new-conversation`, verify handoff_summary exists,
         # enrich handoff_summary*.md on disk, and auto-inject missing env / --title!
         if "new-conversation" in cmd and not re.search(

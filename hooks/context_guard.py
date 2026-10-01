@@ -501,9 +501,11 @@ def main() -> None:
         f"[CONTEXT GUARD REMINDER] You have NOT completed the handoff yet! "
         f"IMMEDIATELY stop all other investigation/debugging actions:\n"
         f"{step1_text}call `run_command` with this EXACT command (including `env -u` and `--title`):\n"
-        f'   `{cmd_prefix} --model=pro --title="{new_title}" '
+        f'   `OUT=$({cmd_prefix} --model=pro --title="{new_title}" '
         f'"Continuing unfinished task from previous conversation (conversation://{conv_id}), interrupted due to context limits. '
-        f"Read {handoff_file} via view_file, review completed steps and discarded hypotheses, and continue from the next step.\"`\n"
+        f"Read {handoff_file} via view_file, review completed steps and discarded hypotheses, and continue from the next step.\") && "
+        f'ID=$(printf \'%s\' "$OUT" | grep -o \'"conversationId": *"[^"]*"\' | cut -d\'"\' -f4) && '
+        f'echo "ID=$ID" && agentapi get-conversation-metadata "$ID" | grep -E \'"sourceMetadata"\'`\n'
         f"After receiving `conversationId`, immediately finish your turn and provide a clickable link to the user: "
         f"`[👉 {new_title}](conversation://<new_conversation_id>)`."
     )
@@ -604,9 +606,11 @@ def main() -> None:
         f"   - Exact next step to resume from;\n"
         f"   - Link `[Previous Conversation](conversation://{conv_id})`.\n"
         f"3. SIMULTANEOUSLY (in the same step or immediately next) launch the new conversation via run_command (use this EXACT command and `--title`):\n"
-        f'   `{cmd_prefix} --model=pro --title="{new_title}" '
+        f'   `OUT=$({cmd_prefix} --model=pro --title="{new_title}" '
         f'"Continuing unfinished task from previous conversation (conversation://{conv_id}), interrupted due to context limits. '
-        f"Read {handoff_file} via view_file, review completed steps and discarded hypotheses, and continue from the next step.\"`\n"
+        f"Read {handoff_file} via view_file, review completed steps and discarded hypotheses, and continue from the next step.\") && "
+        f'ID=$(printf \'%s\' "$OUT" | grep -o \'"conversationId": *"[^"]*"\' | cut -d\'"\' -f4) && '
+        f'echo "ID=$ID" && agentapi get-conversation-metadata "$ID" | grep -E \'"sourceMetadata"\'`\n'
         f"4. Immediately finish your turn, explain to the user which safe checkpoint you stopped at, and provide the link: "
         f"`[👉 {new_title}](conversation://<new_conversation_id>)`."
     )
@@ -620,9 +624,11 @@ def main() -> None:
         f"recording: task goal, key decisions made, modified files, "
         f"current status, next steps, and a link `[Previous Conversation](conversation://{conv_id})`.\n"
         f"3. Call `run_command` to launch the new conversation (use this EXACT command and `--title`):\n"
-        f'   `{cmd_prefix} --model=pro --title="{new_title}" '
+        f'   `OUT=$({cmd_prefix} --model=pro --title="{new_title}" '
         f'"Continuing work from previous conversation (conversation://{conv_id}). '
-        f"Read the context file {handoff_file} via view_file and briefly confirm readiness to continue.\"`\n"
+        f"Read the context file {handoff_file} via view_file and briefly confirm readiness to continue.\") && "
+        f'ID=$(printf \'%s\' "$OUT" | grep -o \'"conversationId": *"[^"]*"\' | cut -d\'"\' -f4) && '
+        f'echo "ID=$ID" && agentapi get-conversation-metadata "$ID" | grep -E \'"sourceMetadata"\'`\n'
         f"4. At the very end of your response to the user, include a prominent clickable link "
         f"to the new conversation: `[👉 {new_title}](conversation://<new_conversation_id>)`."
     )

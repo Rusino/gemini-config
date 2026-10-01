@@ -11,7 +11,7 @@ Background: when `agentapi new-conversation` is run from an agent's `run_command
   - Shell: `env -u ANTIGRAVITY_SOURCE_METADATA agentapi new-conversation --title="..." "..."`
   - Python: pass `env={k: v for k, v in os.environ.items() if k != "ANTIGRAVITY_SOURCE_METADATA"}` to `subprocess.run`.
   - Do **not** strip `ANTIGRAVITY_PROJECT_ID` or other `ANTIGRAVITY_*` variables.
-  - **Never set `ANTIGRAVITY_*` variables to literal values** (e.g. `ANTIGRAVITY_PROJECT_ID=...`). The only allowed change is `env -u ANTIGRAVITY_SOURCE_METADATA`; everything else is inherited as-is.
+  - **Never hardcode `ANTIGRAVITY_*` variables to literal values** yourself. However, you MUST preserve any `ANTIGRAVITY_PROJECT_ID="..."` injections provided by system hooks (e.g. `context_guard.py`), and ALWAYS include `env -u ANTIGRAVITY_SOURCE_METADATA`.
 - **Verify every created chat immediately**:
   - Run `agentapi get-conversation-metadata <id>` and check that `"sourceMetadata": null`.
   - Pre-tool hooks may silently rewrite commands, so never assume the unset was applied — check the metadata.
@@ -22,6 +22,7 @@ Background: when `agentapi new-conversation` is run from an agent's `run_command
     echo "ID=$ID" && agentapi get-conversation-metadata "$ID" | grep -E '"sourceMetadata"'
     ```
     The output must show `"sourceMetadata": null`; otherwise report `$ID` to the user.
+  - **ANTI-PATTERN WARNING**: Never call `agentapi new-conversation` inside `$()` *to extract the ID directly*, as you might accidentally re-execute the command (e.g. `cmd && verify $(cmd | grep)` creates TWO chats). Always capture the full JSON output into a variable (`OUT=$(cmd)`) exactly once, and extract the ID from the variable (`$OUT`).
 - **On failed verification**:
   - Stop. Do **not** blindly re-create chats (this produces hidden duplicates that cannot be deleted via `agentapi`).
   - Report the problem and the affected conversation IDs to the user, then fix the creation method first.

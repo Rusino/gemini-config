@@ -325,9 +325,11 @@ def main() -> None:
     reason = (
         f"[HANDOFF GUARD] You prepared the summary `{handoff_file}`, but attempted to finish your turn "
         f"WITHOUT launching the continuation conversation! Call `run_command`:\n"
-        f'`{cmd_prefix} --model=pro --title="{new_title}" '
+        f'`OUT=$({cmd_prefix} --model=pro --title="{new_title}" '
         f'"Continuing unfinished task from previous conversation (conversation://{conv_id}), interrupted due to context limits. '
-        f"Read {handoff_file} via view_file, review completed steps and discarded hypotheses, and continue from the next step.\"`\n"
+        f"Read {handoff_file} via view_file, review completed steps and discarded hypotheses, and continue from the next step.\") && "
+        f'ID=$(printf \'%s\' "$OUT" | grep -o \'"conversationId": *"[^"]*"\' | cut -d\'"\' -f4) && '
+        f'echo "ID=$ID" && agentapi get-conversation-metadata "$ID" | grep -E \'"sourceMetadata"\'`\n'
         f"and provide the link `[👉 {new_title}](conversation://<new_conversation_id>)` to the user."
     )
     print(
