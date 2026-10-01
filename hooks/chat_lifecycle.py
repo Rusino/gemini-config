@@ -13,6 +13,8 @@ import os
 import re
 import sqlite3
 import sys
+import urllib.error
+import urllib.request
 from zoneinfo import ZoneInfo
 
 DEFAULT_TIMEZONE = os.environ.get("JETSKI_TIMEZONE", "America/New_York")
@@ -71,14 +73,74 @@ def find_app_data_dirs() -> list[str]:
   return res
 
 
+def get_ls_csrf_token(ls_address: str) -> str:
+  """Gets the CSRF token from environment or extracts it from the running Hub server."""
+  token = os.environ.get("ANTIGRAVITY_CSRF_TOKEN")
+  if token:
+    return token
+  try:
+    url = f"http://{ls_address}/" if not ls_address.startswith(("http://", "https://")) else ls_address
+    req = urllib.request.Request(url, headers={"User-Agent": "chat_lifecycle"})
+    with urllib.request.urlopen(req, timeout=1.0) as resp:
+      html = resp.read().decode("utf-8", errors="ignore")
+      m = re.search(r'"csrfToken":\s*"([^"]+)"', html)
+      if m:
+        return m.group(1)
+  except Exception:
+    pass
+  return ""
+
+
+def update_conversation_title_rpc(conv_id: str, new_title: str) -> bool:
+  """Notifies running Language Server daemon via Connect RPC to update annotations.
+
+  This pushes updates immediately to active Web UI streaming subscribers (sidebar),
+  avoiding stale in-memory cache until manual chat selection.
+  """
+  ls_address = os.environ.get("ANTIGRAVITY_LS_ADDRESS", "localhost:5387")
+  csrf_token = get_ls_csrf_token(ls_address)
+  if not csrf_token:
+    return False
+
+  if not ls_address.startswith(("http://", "https://")):
+    url = f"http://{ls_address}/exa.language_server_pb.LanguageServerService/UpdateConversationAnnotations"
+  else:
+    url = f"{ls_address}/exa.language_server_pb.LanguageServerService/UpdateConversationAnnotations"
+
+  payload = json.dumps({
+      "cascade_id": conv_id,
+      "annotations": {"title": new_title},
+      "merge_annotations": True,
+  }).encode("utf-8")
+
+  req = urllib.request.Request(
+      url,
+      data=payload,
+      headers={
+          "Content-Type": "application/json",
+          "x-codeium-csrf-token": csrf_token,
+      },
+      method="POST",
+  )
+  try:
+    with urllib.request.urlopen(req, timeout=2.0) as resp:
+      return resp.status == 200
+  except Exception:
+    return False
+
+
 def update_conversation_title(conv_id: str, new_title: str) -> bool:
-  """Updates conversation title in both annotations pbtxt and SQLite db."""
+  """Updates conversation title via Language Server RPC and persists to disk."""
   if not conv_id or not new_title:
     return False
 
-  updated_any = False
+  # 1. Update running Language Server via RPC (pushes live update to UI stream)
+  rpc_ok = update_conversation_title_rpc(conv_id, new_title)
+
+  # 2. Synchronize on-disk files & DB as fallback / durability guarantee
+  disk_ok = False
   for app_dir in find_app_data_dirs():
-    # 1. Update annotations .pbtxt
+    # 2a. Update annotations .pbtxt
     ann_dir = os.path.join(app_dir, ANNOTATIONS_DIR_NAME)
     ann_file = os.path.join(ann_dir, f"{conv_id}.pbtxt")
     try:
@@ -94,11 +156,11 @@ def update_conversation_title(conv_id: str, new_title: str) -> bool:
         new_content = f'title:"{new_title}"\n'
       with open(ann_file, "w", encoding="utf-8") as f:
         f.write(new_content)
-      updated_any = True
+      disk_ok = True
     except Exception:
       pass
 
-    # 2. Update conversation_summaries.db
+    # 2b. Update conversation_summaries.db
     db_file = os.path.join(app_dir, SUMMARY_DB_NAME)
     if os.path.isfile(db_file):
       try:
@@ -109,11 +171,11 @@ def update_conversation_title(conv_id: str, new_title: str) -> bool:
               (new_title, conv_id),
           )
         conn.close()
-        updated_any = True
+        disk_ok = True
       except Exception:
         pass
 
-  return updated_any
+  return rpc_ok or disk_ok
 
 
 def get_conversation_title(conv_id: str) -> str:
