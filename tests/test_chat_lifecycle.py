@@ -309,6 +309,49 @@ class TestChatLifecycle(unittest.TestCase):
         self.assertEqual(status["chain"][1]["conversation_id"], "c2")
         self.assertTrue(status["chain"][1]["is_current"])
 
+  def test_get_handoff_summary_path(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]):
+        p = chat_lifecycle.get_handoff_summary_path("c12345678", "Тест № 3")
+        self.assertIn("handoff_summary_Тест_3_c1234567.md", p)
+
+  def test_create_handoff_with_notes(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      db_path = os.path.join(tmp_dir, chat_lifecycle.SUMMARY_DB_NAME)
+      conn = sqlite3.connect(db_path)
+      with conn:
+        conn.execute(
+            "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, project_id TEXT)"
+        )
+        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?, ?)", ("parent-notes", "[10:00] ⦿ Parent Task", "proj-1"))
+      conn.close()
+
+      mock_run_res = unittest.mock.MagicMock(returncode=0, stdout='{"conversationId": "child-notes"}')
+      mock_meta_res = unittest.mock.MagicMock(returncode=0, stdout='{"sourceMetadata": null}')
+
+      def fake_run(cmd, **kwargs):
+        if "new-conversation" in cmd:
+          return mock_run_res
+        if "get-conversation-metadata" in cmd:
+          return mock_meta_res
+        return unittest.mock.MagicMock(returncode=0, stdout="")
+
+      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
+           patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=False), \
+           patch.object(chat_lifecycle, "get_current_time_str", return_value="15:55"), \
+           patch("subprocess.run", side_effect=fake_run):
+
+        res = chat_lifecycle.create_handoff(
+            current_conv_id="parent-notes",
+            notes="Completed part 1, now starting part 2",
+        )
+        self.assertEqual(res["new_conversation_id"], "child-notes")
+        summary_file = res["summary_file"]
+        self.assertTrue(os.path.isfile(summary_file))
+        with open(summary_file, "r") as f:
+          content = f.read()
+        self.assertIn("Completed part 1, now starting part 2", content)
+
 
 if __name__ == "__main__":
   unittest.main()

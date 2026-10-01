@@ -395,16 +395,39 @@ def set_conversation_topic(conv_id: str, topic: str, marker: str = MARKER_ACTIVE
   return new_title if ok else ""
 
 
+def get_handoff_summary_path(conv_id: str, topic: str = "") -> str:
+  """Returns the canonical summary artifact path for conv_id, creating the dir if needed."""
+  if not conv_id:
+    return ""
+  if not topic:
+    cur_title = get_conversation_title(conv_id)
+    topic = clean_base_title(cur_title) or "Investigation"
+  slug = re.sub(r"[^\w\-]+", "_", topic, flags=re.UNICODE).strip("_")[:40]
+  filename = f"handoff_summary_{slug}_{conv_id[:8]}.md"
+
+  app_dirs = find_app_data_dirs()
+  for d in app_dirs:
+    candidate = os.path.join(d, "brain", conv_id, filename)
+    if os.path.isfile(candidate):
+      return candidate
+  # Fallback to first existing app data dir
+  base_dir = app_dirs[0] if app_dirs else os.path.expanduser("~/.gemini/jetski")
+  target = os.path.join(base_dir, "brain", conv_id, filename)
+  os.makedirs(os.path.dirname(target), exist_ok=True)
+  return target
+
+
 def create_handoff(
     current_conv_id: str,
     summary_file: str = "",
+    notes: str = "",
     next_step_prompt: str = "",
     new_topic: str = "",
     model: str = "pro",
 ) -> dict:
   """Executes a clean handoff to a new conversation via agentapi.
 
-  1. Resolves/verifies summary artifact file.
+  1. Resolves/verifies summary artifact file. If notes are provided, writes/enriches summary.
   2. Builds title based on existing topic or new_topic.
   3. Launches agentapi new-conversation with unstripped ANTIGRAVITY_PROJECT_ID and unset ANTIGRAVITY_SOURCE_METADATA.
   4. Advances lifecycle chain markers (advances old chat to ✓ and new to ⦿).
@@ -421,26 +444,18 @@ def create_handoff(
   cont_title = f"[{time_str}] {MARKER_ACTIVE} {new_topic}"
 
   # 2. Resolve summary artifact file
-  app_dirs = find_app_data_dirs()
   if not summary_file:
-    slug = re.sub(r"[^\w\-]+", "_", new_topic, flags=re.UNICODE).strip("_")[:40]
-    filename = f"handoff_summary_{slug}_{current_conv_id[:8]}.md"
-    for d in app_dirs:
-      candidate = os.path.join(d, "brain", current_conv_id, filename)
-      if os.path.isfile(candidate):
-        summary_file = candidate
-        break
-    if not summary_file and app_dirs:
-      summary_file = os.path.join(app_dirs[0], "brain", current_conv_id, filename)
+    summary_file = get_handoff_summary_path(current_conv_id, new_topic)
 
-  # Check if summary file exists; if not, create minimal template
-  if not os.path.isfile(summary_file):
+  # Check if summary file exists; if not or if notes provided, create/update it
+  if not os.path.isfile(summary_file) or notes:
     os.makedirs(os.path.dirname(summary_file), exist_ok=True)
+    body_notes = f"\n\n## Status and Notes\n{notes.strip()}\n" if notes else ""
     with open(summary_file, "w", encoding="utf-8") as f:
       f.write(
           f"# Handoff Summary: {new_topic}\n\n"
-          f"Continuation of conversation://{current_conv_id}.\n\n"
-          f"## Next Steps\n- Continue investigation/tasks from previous conversation.\n"
+          f"Continuation of conversation://{current_conv_id}.{body_notes}\n"
+          f"## Next Steps\n- {next_step_prompt.strip() if next_step_prompt else 'Continue investigation/tasks from previous conversation.'}\n"
       )
 
   # 3. Build agentapi prompt
@@ -563,14 +578,41 @@ if __name__ == "__main__":
     marker = sys.argv[4] if len(sys.argv) > 4 else MARKER_ACTIVE
     new_t = set_conversation_topic(cid, topic, marker)
     print(f"Updated title for {cid}: {new_t}")
+  elif len(sys.argv) > 1 and sys.argv[1] == "summary-path":
+    cid = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("CONVERSATION_ID", "")
+    topic = sys.argv[3] if len(sys.argv) > 3 else ""
+    p = get_handoff_summary_path(cid, topic)
+    print(p)
   elif len(sys.argv) > 1 and sys.argv[1] == "status":
     cid = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("CONVERSATION_ID", "")
     info = get_chain_status(cid)
     print(json.dumps(info, ensure_ascii=False, indent=2))
   elif len(sys.argv) > 1 and sys.argv[1] == "handoff":
-    cid = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("CONVERSATION_ID", "")
-    summary = sys.argv[3] if len(sys.argv) > 3 else ""
-    result = create_handoff(cid, summary_file=summary)
+    # Usage: chat_lifecycle.py handoff [cid] [summary_file] [--notes "..."] [--next "..."]
+    args = sys.argv[2:]
+    cid = ""
+    summary = ""
+    notes = ""
+    next_step = ""
+    i = 0
+    while i < len(args):
+      if args[i] == "--notes" and i + 1 < len(args):
+        notes = args[i + 1]
+        i += 2
+      elif args[i] == "--next" and i + 1 < len(args):
+        next_step = args[i + 1]
+        i += 2
+      elif not cid:
+        cid = args[i]
+        i += 1
+      elif not summary:
+        summary = args[i]
+        i += 1
+      else:
+        i += 1
+    if not cid:
+      cid = os.environ.get("CONVERSATION_ID", "")
+    result = create_handoff(cid, summary_file=summary, notes=notes, next_step_prompt=next_step)
     print(json.dumps(result, ensure_ascii=False, indent=2))
   elif len(sys.argv) > 2 and sys.argv[1] == "reopen":
     cid = sys.argv[2]
