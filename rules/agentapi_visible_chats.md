@@ -27,8 +27,25 @@ Background: when `agentapi new-conversation` is run from an agent's `run_command
   - Report the problem and the affected conversation IDs to the user, then fix the creation method first.
 - **Before bulk creation**, create one chat, verify it, and only then create the rest.
 
-## Conversation Titles (`--title`)
+## Conversation Titles (`--title`) & Lifecycle Markers
 
 - **No Project Prefix**: Never include the project name.
-- **Continuations**: Prefix only with time: `[HH:MM] <Original Topic>`. Do not add words like "continuation" or part numbers.
-- **Style**: Direct and specific (under 50 chars), no filler prefixes (`Task:`, `Fix:`).
+- **Style**: Direct and specific (strictly under 50 chars), plain text only (no markdown `**` or HTML tags, no Unicode math fonts).
+- **Time Prefix**: Every continuation or tracked step starts with local time: `[HH:MM]`.
+
+### Lifecycle Markers (Scheme Γ)
+
+1. **In-Progress Investigation (active branch)**:
+   - **First chat (start of branch)**: `[HH:MM] ▸ <Topic>` (or starts simply as topic/timestamped).
+   - **Closed intermediate step**: `[HH:MM] ✓ <Topic>` (completed previous turn/step while work continues).
+   - **Current active chat (in progress)**: `[HH:MM] ⦿ <Topic>` (attracts attention, bold focal point).
+
+2. **Finalized / Closed Investigation (when completed / user says "финал")**:
+   - **First chat (closed start)**: `[HH:MM] « <Topic>` (symmetric start bracket).
+   - **Intermediate chats (archived steps)**: `[HH:MM] ‹✓› <Topic>` (completed intermediate archive steps).
+   - **Last chat (closed final)**: `[HH:MM] » <Topic>` (symmetric end bracket).
+   - **Single chat task (closed without continuations)**: `[HH:MM] «» <Topic>`.
+
+3. **Heuristics & Triggering Finalization**:
+   - If the task is heuristically complete (all tests pass, bug investigated, final summary provided), ask the user: *"Пометить разбор как финальный?"*.
+   - When the user confirms or explicitly says *"финал"*, *"готово"* or similar, update the titles across the chain or current conversation in the DB/title metadata.
