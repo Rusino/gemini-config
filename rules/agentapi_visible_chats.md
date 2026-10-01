@@ -26,3 +26,9 @@ Background: when `agentapi new-conversation` is run from an agent's `run_command
   - Stop. Do **not** blindly re-create chats (this produces hidden duplicates that cannot be deleted via `agentapi`).
   - Report the problem and the affected conversation IDs to the user, then fix the creation method first.
 - **Before bulk creation**, create one chat, verify it, and only then create the rest.
+
+## Conversation Titles (`--title`)
+
+- **No Project Prefix**: Never include the project name.
+- **Continuations**: Prefix only with time: `[HH:MM] <Original Topic>`. Do not add words like "continuation" or part numbers.
+- **Style**: Direct and specific (under 50 chars), no filler prefixes (`Task:`, `Fix:`).
