@@ -31,9 +31,8 @@ MARKER_SINGLE_CLOSED = "«»" # Finalized single-chat task
 
 # Regex matching any existing lifecycle prefix: [HH:MM] [marker] Topic
 TITLE_CLEANUP_RE = re.compile(
-    r"^(?:\[\d{2}:\d{2}(?:\s+(?:продолжение|continue))?\]\s*)"
-    r"|(?:\[\d{2}:\d{2}\]\s*(?:[▸✓⦿«»]|‹✓›|«»)\s*)"
-    r"|(?:(?:продолжение|continue)(?:\s+\d{2}:\d{2})?\s*:\s*)+",
+    r"^(?:\[\d{2}:\d{2}(?:\s+(?:продолжение|continue))?\]\s*(?:[▸✓⦿«»]|‹✓›|«»|\s*)*)"
+    r"|^(?:(?:продолжение|continue)(?:\s+\d{2}:\d{2})?\s*:\s*)+",
     re.IGNORECASE,
 )
 TRAILING_CLEANUP_RE = re.compile(
