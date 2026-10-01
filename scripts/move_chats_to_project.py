@@ -153,7 +153,7 @@ def update_conversation_db(
 def update_summaries_db(
     app_data_dir: str, conv_ids: list[str], new_project_id: str
 ) -> int:
-  """Updates project_id in conversation_summaries.db."""
+  """Updates project_id and raw_summary in conversation_summaries.db."""
   sum_db = os.path.join(app_data_dir, "conversation_summaries.db")
   if not os.path.isfile(sum_db):
     return 0
@@ -164,10 +164,24 @@ def update_summaries_db(
     updated = 0
     for cid in conv_ids:
       cur.execute(
-          "UPDATE conversation_summaries SET project_id = ? WHERE"
+          "SELECT raw_summary FROM conversation_summaries WHERE"
           " conversation_id = ?",
-          (new_project_id, cid),
+          (cid,),
       )
+      row = cur.fetchone()
+      if row and row[0]:
+        new_raw = update_summary_project(row[0], new_project_id)
+        cur.execute(
+            "UPDATE conversation_summaries SET project_id = ?, raw_summary = ?"
+            " WHERE conversation_id = ?",
+            (new_project_id, new_raw, cid),
+        )
+      else:
+        cur.execute(
+            "UPDATE conversation_summaries SET project_id = ? WHERE"
+            " conversation_id = ?",
+            (new_project_id, cid),
+        )
       updated += cur.rowcount
     conn.commit()
     conn.close()
@@ -227,11 +241,25 @@ def update_summaries_proto(
   return updated_count
 
 
-def schedule_daemon_restart(delay_sec: int = 2):
-  """Schedules a restart of jetski-hub.service in a separate systemd unit."""
+def schedule_offline_migration(
+    script_path: str,
+    project_id: str,
+    conv_ids: list[str],
+    delay_sec: int = 2,
+):
+  """Schedules stopping jetski-hub, applying migrations offline, and restarting it."""
+  quoted_cids = " ".join(f"'{cid}'" for cid in conv_ids)
+  abs_script = os.path.abspath(script_path)
+  script_cmd = (
+      f"/usr/bin/python3 '{abs_script}' --project-id '{project_id}'"
+      f" {quoted_cids}"
+  )
+  log_file = "/tmp/move_chats_offline.log"
   cmd = (
-      f"/bin/bash -c 'sleep {delay_sec} && systemctl --user restart"
-      " jetski-hub.service'"
+      f"/bin/bash -c 'sleep {delay_sec} && "
+      f"systemctl --user stop jetski-hub.service && "
+      f"{script_cmd} > {log_file} 2>&1 && "
+      f"systemctl --user start jetski-hub.service'"
   )
   try:
     subprocess.run(
@@ -241,11 +269,12 @@ def schedule_daemon_restart(delay_sec: int = 2):
         text=True,
     )
     print(
-        f"[INFO] Scheduled jetski-hub daemon restart in {delay_sec}s via"
+        f"[INFO] Scheduled offline migration & restart in {delay_sec}s via"
         " systemd-run."
     )
+    print(f"[INFO] Log will be written to {log_file}")
   except Exception as e:
-    print(f"[WARN] Failed to schedule systemd restart: {e}", file=sys.stderr)
+    print(f"[WARN] Failed to schedule offline migration: {e}", file=sys.stderr)
 
 
 def main():
@@ -267,6 +296,17 @@ def main():
   )
   args = parser.parse_args()
 
+  target_project = args.project_id
+  conv_ids = list(dict.fromkeys(args.conversations))
+
+  # If restart requested, run everything offline while hub daemon is stopped
+  # so that in-memory cache flush on shutdown does not overwrite disk changes.
+  if args.restart:
+    schedule_offline_migration(
+        sys.argv[0], target_project, conv_ids, delay_sec=2
+    )
+    return
+
   app_data_dir = os.path.expanduser(
       os.environ.get("ANTIGRAVITY_APP_DATA_DIR", "~/.gemini/jetski")
   )
@@ -274,8 +314,6 @@ def main():
     print(f"[ERROR] App data dir not found: {app_data_dir}", file=sys.stderr)
     sys.exit(1)
 
-  target_project = args.project_id
-  conv_ids = list(dict.fromkeys(args.conversations))
   print(
       f"Moving {len(conv_ids)} conversation(s) to project '{target_project}'..."
   )
@@ -296,10 +334,6 @@ def main():
       app_data_dir, set(conv_ids), target_project
   )
   print(f"[3/3] Updated {pb_count} entry/entries in jetbox_summaries_proto.pb.")
-
-  # 4. Optional daemon restart
-  if args.restart:
-    schedule_daemon_restart(delay_sec=2)
 
   print("Done!")
 
