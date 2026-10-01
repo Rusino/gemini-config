@@ -364,6 +364,33 @@ class TestChatLifecycle(unittest.TestCase):
           content = f.read()
         self.assertIn("Completed part 1, now starting part 2", content)
 
+  # --- CLI usage -------------------------------------------------------------
+
+  SCRIPT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "hooks", "chat_lifecycle.py"))
+  PUBLIC_COMMANDS = ("status", "set-title", "summary-path", "handoff", "finalize", "reopen")
+
+  def _run_cli(self, *args):
+    import subprocess
+    return subprocess.run(
+        [sys.executable, self.SCRIPT, *args], capture_output=True, text=True, check=False
+    )
+
+  def test_cli_help_lists_public_commands(self):
+    for argv in (["--help"], ["-h"], ["help"], []):
+      with self.subTest(argv=argv):
+        res = self._run_cli(*argv)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        for cmd in self.PUBLIC_COMMANDS:
+          self.assertIn(cmd, res.stdout)
+        # The user-only commands must be flagged as such.
+        self.assertRegex(res.stdout, r"(?i)finalize.*user-only")
+
+  def test_cli_unknown_command_fails_with_usage(self):
+    res = self._run_cli("frobnicate", "c1")
+    self.assertEqual(res.returncode, 2)
+    self.assertIn("frobnicate", res.stderr)
+    self.assertIn("status", res.stderr)
+
 
 if __name__ == "__main__":
   unittest.main()

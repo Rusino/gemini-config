@@ -562,7 +562,59 @@ def get_chain_status(conv_id: str) -> dict:
   }
 
 
+USAGE = """\
+chat_lifecycle.py — deterministic chat lifecycle CLI (titles, handoffs, chains).
+
+Usage:
+  python3 ~/.gemini/config/hooks/chat_lifecycle.py <command> [args]
+
+Commands:
+  status [id]                         Show the chain for <id>: titles, markers,
+                                      is_finalized, summary file paths. Read-only.
+  set-title <id> "<Topic>"            Rename the chat. Time prefix [HH:MM] and the
+                                      marker are added automatically.
+  summary-path <id>                   Print the canonical handoff summary path
+                                      (brain/<id>/handoff_summary_<slug>_<id8>.md).
+  handoff <id> [summary_file]         Create a visible continuation chat in the same
+          [--notes "..."]             project, verify sourceMetadata is null and
+          [--next "..."]              update chain markers. Writes/updates the
+                                      summary if --notes is given.
+  finalize <id>                       Close the whole chain. USER-ONLY: run it
+                                      only on the user's explicit word ("финал").
+                                      Timestamps are preserved.
+  reopen <id>                         Re-activate a finalized chain. USER-ONLY.
+
+Internal (used by hooks; do not run manually):
+  set <id> "<raw title>"              Write a title verbatim, no marker handling.
+  advance <id> [<id>...]              Recompute in-progress markers for a chain.
+
+Notes:
+  * <id> may be any conversation of the chain for finalize/reopen/status.
+  * When <id> is omitted, $CONVERSATION_ID is used (set inside the agent's
+    run_command only).
+  * Markers (▸ ✓ ⦿ « ‹✓› » «») are derived mechanically from the chain; never
+    choose or edit them by hand.
+"""
+
+
+def print_usage(stream=None) -> None:
+  print(USAGE, file=stream or sys.stdout, end="")
+
+
+KNOWN_COMMANDS = (
+    "set", "set-title", "summary-path", "status", "handoff", "reopen", "advance", "finalize",
+)
+
+
 if __name__ == "__main__":
+  if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+    print_usage()
+    sys.exit(0)
+  if sys.argv[1] not in KNOWN_COMMANDS:
+    print(f"chat_lifecycle.py: unknown command '{sys.argv[1]}'\n", file=sys.stderr)
+    print_usage(sys.stderr)
+    sys.exit(2)
+
   if len(sys.argv) > 2 and sys.argv[1] == "set":
     cid = sys.argv[2]
     title = sys.argv[3] if len(sys.argv) > 3 else ""
