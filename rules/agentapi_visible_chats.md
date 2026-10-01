@@ -40,13 +40,22 @@ Background: when `agentapi new-conversation` is run from an agent's `run_command
    - **First chat (start of branch)**: `[HH:MM] ▸ <Topic>` (or starts simply as topic/timestamped).
    - **Closed intermediate step**: `[HH:MM] ✓ <Topic>` (completed previous turn/step while work continues).
    - **Current active chat (in progress)**: `[HH:MM] ⦿ <Topic>` (attracts attention, bold focal point).
+   - **Helper**: `python3 ~/.gemini/config/hooks/chat_lifecycle.py advance <new_conversation_id>` (automatically discovers parent chats via transcripts, setting root to `▸`, intermediates to `✓`, and active to `⦿`).
 
 2. **Finalized / Closed Investigation (when completed / user says "финал")**:
    - **First chat (closed start)**: `[HH:MM] « <Topic>` (symmetric start bracket).
    - **Intermediate chats (archived steps)**: `[HH:MM] ‹✓› <Topic>` (completed intermediate archive steps).
    - **Last chat (closed final)**: `[HH:MM] » <Topic>` (symmetric end bracket).
    - **Single chat task (closed without continuations)**: `[HH:MM] «» <Topic>`.
+   - **Helper**: `python3 ~/.gemini/config/hooks/chat_lifecycle.py finalize <conversation_id>` (automatically discovers chain ancestors and updates markers).
 
-3. **Heuristics & Triggering Finalization**:
+3. **Reopening Finalized Chats (возобновление работы)**:
+   - Если работа возобновляется в ранее закрытом чате (`«»` или `»`), **по умолчанию откатывать статус в активный рабочий (`⦿`)**:
+     - Одиночный чат: `[HH:MM] «» <Topic>` → `[HH:MM] ⦿ <Topic>`.
+     - Последний или промежуточный шаг в цепочке: вернуть в `[HH:MM] ⦿ <Topic>`.
+   - **Исключение**: не менять статус только если пользователь явно указал, что это просто вопрос/справка и менять статус не нужно (например, *"это просто вопрос"*, *"не меняй статус"*).
+   - При повторном завершении работы процедура стандартная: спросить пользователя или закрыть по слову *"финал"*.
+
+4. **Heuristics & Triggering Finalization**:
    - If the task is heuristically complete (all tests pass, bug investigated, final summary provided), ask the user: *"Пометить разбор как финальный?"*.
    - When the user confirms or explicitly says *"финал"*, *"готово"* or similar, update the titles across the chain or current conversation in the DB/title metadata.

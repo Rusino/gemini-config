@@ -424,6 +424,22 @@ def main() -> None:
       state["handoff_completed"] = False
       save_state(state_path, state)
 
+    # Reopen finalized chats to active marker [HH:MM] ⦿ by default
+    try:
+      from chat_lifecycle import is_finalized_title, reopen_conversation
+      no_reopen_pattern = re.compile(
+          r"\b(?:не\s+меняй\s+статус|не\s+открывай|просто\s+вопрос|только\s+справка)\b",
+          re.IGNORECASE,
+      )
+      if (
+          raw_title
+          and is_finalized_title(raw_title)
+          and not no_reopen_pattern.search(last_user_input or "")
+      ):
+        reopen_conversation(conv_id)
+    except Exception:
+      pass
+
     # Safety net: ensure browser sounds are re-enabled when new turn/chat starts
     try:
       config_path = os.path.expanduser("~/.gemini/config/config.json")
