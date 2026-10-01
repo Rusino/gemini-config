@@ -539,14 +539,16 @@ def get_chain_status(conv_id: str) -> dict:
         "is_current": (cid == conv_id),
     })
 
-  # Find summary files in artifact directory if any
+  # Summary files live in the brain dir of the chat that *produced* the handoff,
+  # i.e. the predecessor — so walk the whole chain, not just conv_id.
   summaries = []
-  for app_dir in find_app_data_dirs():
-    brain_dir = os.path.join(app_dir, "brain", conv_id)
-    if os.path.isdir(brain_dir):
-      for f in os.listdir(brain_dir):
-        if "handoff_summary" in f and f.endswith(".md"):
-          summaries.append(os.path.join(brain_dir, f))
+  for cid in chain:
+    for app_dir in find_app_data_dirs():
+      brain_dir = os.path.join(app_dir, "brain", cid)
+      if os.path.isdir(brain_dir):
+        for f in sorted(os.listdir(brain_dir)):
+          if "handoff_summary" in f and f.endswith(".md"):
+            summaries.append(os.path.join(brain_dir, f))
 
   cur_title = get_conversation_title(conv_id)
   return {

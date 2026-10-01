@@ -299,6 +299,17 @@ class TestChatLifecycle(unittest.TestCase):
         conn.execute("INSERT INTO conversation_summaries VALUES (?, ?)", ("c2", "[10:15] ⦿ Step 2"))
       conn.close()
 
+      # Summary is always written into the *predecessor's* brain dir (c1),
+      # so status for the continuation (c2) must look across the whole chain.
+      c1_brain = os.path.join(tmp_dir, "brain", "c1")
+      os.makedirs(c1_brain)
+      summary_path = os.path.join(c1_brain, "handoff_summary_Step_1_c1.md")
+      with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("# summary\n")
+      # Sidecar metadata must not be reported as a summary.
+      with open(summary_path + ".metadata.json", "w", encoding="utf-8") as f:
+        f.write("{}")
+
       with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
            patch.object(chat_lifecycle, "discover_conversation_chain", return_value=["c1", "c2"]):
         status = chat_lifecycle.get_chain_status("c2")
@@ -308,6 +319,7 @@ class TestChatLifecycle(unittest.TestCase):
         self.assertEqual(status["chain"][0]["conversation_id"], "c1")
         self.assertEqual(status["chain"][1]["conversation_id"], "c2")
         self.assertTrue(status["chain"][1]["is_current"])
+        self.assertEqual(status["summary_files"], [summary_path])
 
   def test_get_handoff_summary_path(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
