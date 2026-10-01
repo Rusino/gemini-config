@@ -424,21 +424,9 @@ def main() -> None:
       state["handoff_completed"] = False
       save_state(state_path, state)
 
-    # Reopen finalized chats to active marker [HH:MM] ⦿ by default
-    try:
-      from chat_lifecycle import is_finalized_title, reopen_conversation
-      no_reopen_pattern = re.compile(
-          r"\b(?:не\s+меняй\s+статус|не\s+открывай|просто\s+вопрос|только\s+справка)\b",
-          re.IGNORECASE,
-      )
-      if (
-          raw_title
-          and is_finalized_title(raw_title)
-          and not no_reopen_pattern.search(last_user_input or "")
-      ):
-        reopen_conversation(conv_id)
-    except Exception:
-      pass
+    # NOTE: No automatic reopening of finalized chats. Lifecycle markers are
+    # applied mechanically only by `chat_lifecycle.py` (set-title / handoff /
+    # finalize / reopen), never inferred from user wording.
 
     # Safety net: ensure browser sounds are re-enabled when new turn/chat starts
     try:
@@ -515,14 +503,9 @@ def main() -> None:
     )
     reminder_msg = (
         f"[CONTEXT GUARD REMINDER] You have NOT completed the handoff yet! "
-        f"IMMEDIATELY stop all other investigation/debugging actions:\n"
-        f"{step1_text}call `run_command` with this EXACT command (including `env -u` and `--title`):\n"
-        f'   `OUT=$({cmd_prefix} --model=pro --title="{new_title}" '
-        f'"Continuing unfinished task from previous conversation (conversation://{conv_id}), interrupted due to context limits. '
-        f"Read {handoff_file} via view_file, review completed steps and discarded hypotheses, and continue from the next step.\") && "
-        f'ID=$(printf \'%s\' "$OUT" | grep -o \'"conversationId": *"[^"]*"\' | cut -d\'"\' -f4) && '
-        f'echo "ID=$ID" && agentapi get-conversation-metadata "$ID" | grep -E \'"sourceMetadata"\'`\n'
-        f"After receiving `conversationId`, immediately finish your turn and provide a clickable link to the user: "
+        f"IMMEDIATELY stop all other investigation/debugging actions and launch the continuation chat:\n"
+        f'   `python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff {conv_id} "{handoff_file}"`\n'
+        f"After receiving `new_conversation_id`, immediately finish your turn and provide a clickable link to the user: "
         f"`[👉 {new_title}](conversation://<new_conversation_id>)`."
     )
     print(

@@ -28,46 +28,28 @@ Background: when `agentapi new-conversation` is run from an agent's `run_command
   - Report the problem and the affected conversation IDs to the user, then fix the creation method first.
 - **Before bulk creation**, create one chat, verify it, and only then create the rest.
 
-## Conversation Titles (`--title`) & Lifecycle Markers
+## Conversation Titles (`--title`) & Lifecycle
 
-- **No Project Prefix**: Never include the project name.
+- **One project = one task.** Every non-trivial task lives in its own project; all its chats (including handoff continuations) stay inside that project (`ANTIGRAVITY_PROJECT_ID` is inherited automatically by `handoff`). A project is only a grouping — it may point at the same existing checkout as other projects; do not clone or re-sync repositories per task.
+- **No Project Prefix**: Never include the project name in a chat title.
 - **Style**: Direct and specific (strictly under 50 chars), plain text only (no markdown `**` or HTML tags, no Unicode math fonts).
-- **Time Prefix**: Every continuation or tracked step starts with local time: `[HH:MM]`.
+- **Format**: `[HH:MM] <marker> <Topic>`. The time prefix and the marker are produced **only** by the CLI below — never type them yourself.
 
-### Lifecycle Markers (Scheme Γ)
+### Lifecycle CLI (markers are mechanical)
 
-1. **In-Progress Investigation (active branch)**:
-   - **First chat (start of branch)**: `[HH:MM] ▸ <Topic>` (or starts simply as topic/timestamped).
-   - **Closed intermediate step**: `[HH:MM] ✓ <Topic>` (completed previous turn/step while work continues).
-   - **Current active chat (in progress)**: `[HH:MM] ⦿ <Topic>` (attracts attention, bold focal point).
-   - **Helper (Chain Advance)**: `python3 ~/.gemini/config/hooks/chat_lifecycle.py advance <new_conversation_id>` (automatically discovers parent chats via transcripts, setting root to `▸`, intermediates to `✓`, and active to `⦿`).
-   - **Helper (Setting / Renaming Title)**: `python3 ~/.gemini/config/hooks/chat_lifecycle.py set-title <conversation_id> "<Topic>"` (formats local timestamp `[HH:MM]` and marker `⦿` automatically; NEVER query SQLite or inspect other chats to rename).
-   - **Helper (Handoff / Continuation)**: `python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff [conversation_id] [summary_file]` (executes single-command handoff: creates/checks summary, launches visible continuation chat, verifies `sourceMetadata: null`, and advances chain markers).
+Markers (`▸ ✓ ⦿ « ‹✓› » «»`) are a side effect of the commands below. They are derived purely from chain structure (who continues whom) plus one "closed" bit. **You must never reason about, choose, or interpret markers** — not when naming, not when continuing, not when closing.
 
-2. **Finalized / Closed Investigation (when completed / user says "финал")**:
-   - **First chat (closed start)**: `[HH:MM] « <Topic>` (symmetric start bracket).
-   - **Intermediate chats (archived steps)**: `[HH:MM] ‹✓› <Topic>` (completed intermediate archive steps).
-   - **Last chat (closed final)**: `[HH:MM] » <Topic>` (symmetric end bracket).
-   - **Single chat task (closed without continuations)**: `[HH:MM] «» <Topic>`.
-   - **Helper**: `python3 ~/.gemini/config/hooks/chat_lifecycle.py finalize <conversation_id>` (automatically discovers chain ancestors and updates markers).
+Use only these commands (`python3 ~/.gemini/config/hooks/chat_lifecycle.py ...`):
 
-3. **Strict Lifecycle CLI Rules (Anti-Pattern Ban)**:
-   - **NEVER** write manual SQLite queries or Python `sqlite3` snippets to look up or set titles.
-   - **NEVER** read transcripts or source code of hooks to remember how to create continuation chats.
-   - **Use only the 5 canonical CLI commands**:
-     - `chat_lifecycle.py status [id]` — check chain status, markers, and summaries.
-     - `chat_lifecycle.py set-title <id> "<Topic>"` — rename/set topic.
-     - `chat_lifecycle.py handoff <id>` — hand off / continue in new chat.
-     - `chat_lifecycle.py advance <id>` — advance chain.
-     - `chat_lifecycle.py finalize <id>` — finalize chain on "финал".
+| Command | When you call it |
+|---|---|
+| `set-title <id> "<Topic>"` | User asks to name/rename the chat. Pass the bare topic; time and marker are added for you. |
+| `handoff <id> [summary_file] [--notes "..."] [--next "..."]` | Context guard alert, or user asks to continue in a new chat. One call: writes/updates the summary, launches a visible continuation in the same project, verifies `sourceMetadata: null`, updates chain markers. |
+| `summary-path <id>` | You want to write a detailed summary with `write_to_file` before `handoff` — this returns the canonical path. |
+| `finalize <id>` | **Only** when the user explicitly says *"финал"* (or an unambiguous equivalent). Preserves original timestamps, swaps markers. |
+| `status [id]` | User asks about the chain / which chats belong to the task / where summaries are. |
 
-4. **Reopening Finalized Chats (возобновление работы)**:
-   - Если работа возобновляется в ранее закрытом чате (`«»` или `»`), **по умолчанию откатывать статус в активный рабочий (`⦿`)**:
-     - Одиночный чат: `[HH:MM] «» <Topic>` → `[HH:MM] ⦿ <Topic>`.
-     - Последний или промежуточный шаг в цепочке: вернуть в `[HH:MM] ⦿ <Topic>`.
-   - **Исключение**: не менять статус только если пользователь явно указал, что это просто вопрос/справка и менять статус не нужно (например, *"это просто вопрос"*, *"не меняй статус"*).
-   - При повторном завершении работы процедура стандартная: спросить пользователя или закрыть по слову *"финал"*.
-
-5. **Heuristics & Triggering Finalization**:
-   - If the task is heuristically complete (all tests pass, bug investigated, final summary provided), ask the user: *"Пометить разбор как финальный?"*.
-   - When the user confirms or explicitly says *"финал"*, *"готово"* or similar, update the titles across the chain or current conversation in the DB/title metadata.
+Strict rules:
+- **Never** ask the user whether to finalize. No "Пометить разбор как финальный?" prompts. Finalization happens only on the user's explicit word.
+- **Never** reopen finalized chats automatically or infer status from the user's wording. If the user continues working in a closed chat, do nothing with the title; the chain is reactivated mechanically by the next `handoff`, or on explicit request (`reopen <id>`).
+- **Never** write SQLite queries or Python `sqlite3` snippets to look up or set titles, and **never** read transcripts or hook source code to recall how handoff works — the five commands above are the entire interface.

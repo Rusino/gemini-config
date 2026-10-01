@@ -99,13 +99,13 @@ class TestChatLifecycle(unittest.TestCase):
            patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=False), \
            patch.object(chat_lifecycle, "get_current_time_str", return_value="12:00"):
 
-        # Finalize chain [c1, c2, c3]
+        # Finalize chain [c1, c2, c3]: markers change, original timestamps stay
         updated = chat_lifecycle.finalize_conversation_chain("c3", ["c1", "c2", "c3"])
         self.assertEqual(updated, ["c1", "c2", "c3"])
 
-        self.assertEqual(chat_lifecycle.get_conversation_title("c1"), "[12:00] « First")
-        self.assertEqual(chat_lifecycle.get_conversation_title("c2"), "[12:00] ‹✓› Second")
-        self.assertEqual(chat_lifecycle.get_conversation_title("c3"), "[12:00] » Third")
+        self.assertEqual(chat_lifecycle.get_conversation_title("c1"), "[10:00] « First")
+        self.assertEqual(chat_lifecycle.get_conversation_title("c2"), "[10:30] ‹✓› Second")
+        self.assertEqual(chat_lifecycle.get_conversation_title("c3"), "[11:00] » Third")
 
   def test_finalize_single_conversation(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -124,7 +124,7 @@ class TestChatLifecycle(unittest.TestCase):
 
         updated = chat_lifecycle.finalize_conversation_chain("c1")
         self.assertEqual(updated, ["c1"])
-        self.assertEqual(chat_lifecycle.get_conversation_title("c1"), "[12:00] «» Solo Task")
+        self.assertEqual(chat_lifecycle.get_conversation_title("c1"), "[10:00] «» Solo Task")
 
   def test_reopen_conversation(self):
     with tempfile.TemporaryDirectory() as tmp_dir:

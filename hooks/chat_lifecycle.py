@@ -322,42 +322,35 @@ def advance_in_progress_chain(chain_ids: list[str] = None, current_conv_id: str 
 
 
 def finalize_conversation_chain(current_conv_id: str, chain_ids: list[str] = None) -> list[str]:
-  """Finalizes the whole chain or single conversation to closed lifecycle markers."""
+  """Finalizes the whole chain or single conversation to closed lifecycle markers.
+
+  Original [HH:MM] timestamps are preserved; only the marker changes.
+  """
   if not chain_ids:
     chain_ids = [current_conv_id] if current_conv_id else []
   chain_ids = expand_chain_with_ancestors(chain_ids)
 
-  time_str = get_current_time_str()
+  now_time = get_current_time_str()
   updated = []
+
+  def _finalize_one(cid: str, marker: str) -> None:
+    cur_title = get_conversation_title(cid)
+    t = extract_time_prefix(cur_title, now_time)
+    base = clean_base_title(cur_title) or "Investigation"
+    update_conversation_title(cid, f"[{t}] {marker} {base}")
+    updated.append(cid)
 
   if len(chain_ids) <= 1:
     cid = chain_ids[0] if chain_ids else current_conv_id
     if cid:
-      cur_title = get_conversation_title(cid)
-      base = clean_base_title(cur_title) or "Investigation"
-      final_title = f"[{time_str}] {MARKER_SINGLE_CLOSED} {base}"
-      update_conversation_title(cid, final_title)
-      updated.append(cid)
+      _finalize_one(cid, MARKER_SINGLE_CLOSED)
     return updated
 
-  # Multiple conversations in chain
-  # 1. First chat -> «
-  start_id = chain_ids[0]
-  base_start = clean_base_title(get_conversation_title(start_id)) or "Investigation"
-  update_conversation_title(start_id, f"[{time_str}] {MARKER_CLOSED_START} {base_start}")
-  updated.append(start_id)
-
-  # 2. Intermediates -> ‹✓›
+  # Multiple conversations in chain: « ... ‹✓› ... »
+  _finalize_one(chain_ids[0], MARKER_CLOSED_START)
   for mid_id in chain_ids[1:-1]:
-    base_mid = clean_base_title(get_conversation_title(mid_id)) or "Investigation"
-    update_conversation_title(mid_id, f"[{time_str}] {MARKER_CLOSED_STEP} {base_mid}")
-    updated.append(mid_id)
-
-  # 3. Last chat -> »
-  end_id = chain_ids[-1]
-  base_end = clean_base_title(get_conversation_title(end_id)) or "Investigation"
-  update_conversation_title(end_id, f"[{time_str}] {MARKER_CLOSED_END} {base_end}")
-  updated.append(end_id)
+    _finalize_one(mid_id, MARKER_CLOSED_STEP)
+  _finalize_one(chain_ids[-1], MARKER_CLOSED_END)
 
   return updated
 

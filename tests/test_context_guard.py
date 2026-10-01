@@ -41,8 +41,9 @@ class TestContextGuard(unittest.TestCase):
       self.assertIn('ANTIGRAVITY_PROJECT_ID="outside-of-project"', prefix)
       self.assertIn("agentapi new-conversation", prefix)
 
-  def test_reopen_on_new_turn(self):
-    # Simulates a user starting a new turn in a finalized conversation
+  def test_no_auto_reopen_on_new_turn(self):
+    # A new user turn in a finalized conversation must NOT touch its title:
+    # markers are applied only mechanically by chat_lifecycle.py commands.
     data = {
         "conversationId": "c1",
         "invocationNum": 0,
@@ -53,25 +54,11 @@ class TestContextGuard(unittest.TestCase):
          patch("sys.stdout", new_callable=io.StringIO) as mock_out, \
          patch.object(context_guard, "get_conversation_db_info", return_value=("[10:00] «» Some Task", "proj")), \
          patch("chat_lifecycle.reopen_conversation") as mock_reopen, \
-         patch.object(context_guard, "get_transcript_size_kb", return_value=10.0):
-      context_guard.main()
-      mock_reopen.assert_called_once_with("c1")
-
-  def test_no_reopen_when_user_asks_question_only(self):
-    # User explicitly states it's just a question / do not change status
-    data = {
-        "conversationId": "c1",
-        "invocationNum": 0,
-        "initialNumSteps": 10,
-        "lastUserInput": "Это просто вопрос, не меняй статус: где лежит конфиг?",
-    }
-    with patch("sys.stdin", io.StringIO(json.dumps(data))), \
-         patch("sys.stdout", new_callable=io.StringIO) as mock_out, \
-         patch.object(context_guard, "get_conversation_db_info", return_value=("[10:00] «» Some Task", "proj")), \
-         patch("chat_lifecycle.reopen_conversation") as mock_reopen, \
+         patch("chat_lifecycle.update_conversation_title") as mock_update, \
          patch.object(context_guard, "get_transcript_size_kb", return_value=10.0):
       context_guard.main()
       mock_reopen.assert_not_called()
+      mock_update.assert_not_called()
 
 
 if __name__ == "__main__":
