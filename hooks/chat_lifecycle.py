@@ -514,6 +514,44 @@ def create_handoff(
   }
 
 
+def get_chain_status(conv_id: str) -> dict:
+  """Inspects and returns the full chain status for conv_id without guessing or querying SQL manually."""
+  if not conv_id:
+    return {"error": "conv_id is required"}
+
+  chain = discover_conversation_chain(conv_id)
+  items = []
+  for cid in chain:
+    raw_title = get_conversation_title(cid)
+    items.append({
+        "conversation_id": cid,
+        "title": raw_title,
+        "base_topic": clean_base_title(raw_title),
+        "is_finalized": is_finalized_title(raw_title),
+        "is_current": (cid == conv_id),
+    })
+
+  # Find summary files in artifact directory if any
+  summaries = []
+  for app_dir in find_app_data_dirs():
+    brain_dir = os.path.join(app_dir, "brain", conv_id)
+    if os.path.isdir(brain_dir):
+      for f in os.listdir(brain_dir):
+        if "handoff_summary" in f and f.endswith(".md"):
+          summaries.append(os.path.join(brain_dir, f))
+
+  cur_title = get_conversation_title(conv_id)
+  return {
+      "current_conversation_id": conv_id,
+      "current_title": cur_title,
+      "base_topic": clean_base_title(cur_title),
+      "is_finalized": is_finalized_title(cur_title),
+      "chain_length": len(chain),
+      "chain": items,
+      "summary_files": summaries,
+  }
+
+
 if __name__ == "__main__":
   if len(sys.argv) > 2 and sys.argv[1] == "set":
     cid = sys.argv[2]
@@ -525,6 +563,10 @@ if __name__ == "__main__":
     marker = sys.argv[4] if len(sys.argv) > 4 else MARKER_ACTIVE
     new_t = set_conversation_topic(cid, topic, marker)
     print(f"Updated title for {cid}: {new_t}")
+  elif len(sys.argv) > 1 and sys.argv[1] == "status":
+    cid = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("CONVERSATION_ID", "")
+    info = get_chain_status(cid)
+    print(json.dumps(info, ensure_ascii=False, indent=2))
   elif len(sys.argv) > 1 and sys.argv[1] == "handoff":
     cid = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("CONVERSATION_ID", "")
     summary = sys.argv[3] if len(sys.argv) > 3 else ""

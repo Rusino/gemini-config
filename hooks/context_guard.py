@@ -621,12 +621,8 @@ def main() -> None:
         f"   - Which hypotheses/approaches were tested and DID NOT work (to avoid repeating them in the new chat);\n"
         f"   - Exact next step to resume from;\n"
         f"   - Link `[Previous Conversation](conversation://{conv_id})`.\n"
-        f"3. SIMULTANEOUSLY (in the same step or immediately next) launch the new conversation via run_command (use this EXACT command and `--title`):\n"
-        f'   `OUT=$({cmd_prefix} --model=pro --title="{new_title}" '
-        f'"Continuing unfinished task from previous conversation (conversation://{conv_id}), interrupted due to context limits. '
-        f"Read {handoff_file} via view_file, review completed steps and discarded hypotheses, and continue from the next step.\") && "
-        f'ID=$(printf \'%s\' "$OUT" | grep -o \'"conversationId": *"[^"]*"\' | cut -d\'"\' -f4) && '
-        f'echo "ID=$ID" && agentapi get-conversation-metadata "$ID" | grep -E \'"sourceMetadata"\'`\n'
+        f"3. SIMULTANEOUSLY (in the same step or immediately next) launch the new conversation via run_command:\n"
+        f'   `python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff {conv_id} "{handoff_file}"`\n'
         f"4. Immediately finish your turn, explain to the user which safe checkpoint you stopped at, and provide the link: "
         f"`[👉 {new_title}](conversation://<new_conversation_id>)`."
     )
@@ -639,12 +635,8 @@ def main() -> None:
         f"2. Create or update the summary file `{handoff_file}` (via write_to_file, UserFacing: true), "
         f"recording: task goal, key decisions made, modified files, "
         f"current status, next steps, and a link `[Previous Conversation](conversation://{conv_id})`.\n"
-        f"3. Call `run_command` to launch the new conversation (use this EXACT command and `--title`):\n"
-        f'   `OUT=$({cmd_prefix} --model=pro --title="{new_title}" '
-        f'"Continuing work from previous conversation (conversation://{conv_id}). '
-        f"Read the context file {handoff_file} via view_file and briefly confirm readiness to continue.\") && "
-        f'ID=$(printf \'%s\' "$OUT" | grep -o \'"conversationId": *"[^"]*"\' | cut -d\'"\' -f4) && '
-        f'echo "ID=$ID" && agentapi get-conversation-metadata "$ID" | grep -E \'"sourceMetadata"\'`\n'
+        f"3. Call `run_command` to launch the new conversation:\n"
+        f'   `python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff {conv_id} "{handoff_file}"`\n'
         f"4. At the very end of your response to the user, include a prominent clickable link "
         f"to the new conversation: `[👉 {new_title}](conversation://<new_conversation_id>)`."
     )

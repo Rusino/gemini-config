@@ -54,7 +54,8 @@ Background: when `agentapi new-conversation` is run from an agent's `run_command
 3. **Strict Lifecycle CLI Rules (Anti-Pattern Ban)**:
    - **NEVER** write manual SQLite queries or Python `sqlite3` snippets to look up or set titles.
    - **NEVER** read transcripts or source code of hooks to remember how to create continuation chats.
-   - **Use only the 4 canonical CLI commands**:
+   - **Use only the 5 canonical CLI commands**:
+     - `chat_lifecycle.py status [id]` — check chain status, markers, and summaries.
      - `chat_lifecycle.py set-title <id> "<Topic>"` — rename/set topic.
      - `chat_lifecycle.py handoff <id>` — hand off / continue in new chat.
      - `chat_lifecycle.py advance <id>` — advance chain.

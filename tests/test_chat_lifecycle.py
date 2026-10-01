@@ -287,6 +287,28 @@ class TestChatLifecycle(unittest.TestCase):
         self.assertTrue(res["verified_visible"])
         self.assertTrue(os.path.isfile(summary_file))
 
+  def test_get_chain_status(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      db_path = os.path.join(tmp_dir, chat_lifecycle.SUMMARY_DB_NAME)
+      conn = sqlite3.connect(db_path)
+      with conn:
+        conn.execute(
+            "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT)"
+        )
+        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?)", ("c1", "[10:00] ▸ Step 1"))
+        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?)", ("c2", "[10:15] ⦿ Step 2"))
+      conn.close()
+
+      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
+           patch.object(chat_lifecycle, "discover_conversation_chain", return_value=["c1", "c2"]):
+        status = chat_lifecycle.get_chain_status("c2")
+        self.assertEqual(status["current_conversation_id"], "c2")
+        self.assertEqual(status["chain_length"], 2)
+        self.assertFalse(status["is_finalized"])
+        self.assertEqual(status["chain"][0]["conversation_id"], "c1")
+        self.assertEqual(status["chain"][1]["conversation_id"], "c2")
+        self.assertTrue(status["chain"][1]["is_current"])
+
 
 if __name__ == "__main__":
   unittest.main()
