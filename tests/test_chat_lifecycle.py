@@ -221,5 +221,73 @@ class TestChatLifecycle(unittest.TestCase):
         self.assertEqual(expanded, ["c1", "c2", "c3"])
 
 
+  def test_set_conversation_topic(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      db_path = os.path.join(tmp_dir, chat_lifecycle.SUMMARY_DB_NAME)
+      conn = sqlite3.connect(db_path)
+      with conn:
+        conn.execute(
+            "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT)"
+        )
+        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?)", ("c1", "Old Title"))
+      conn.close()
+
+      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
+           patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=False), \
+           patch.object(chat_lifecycle, "get_current_time_str", return_value="15:30"):
+
+        # 1. Clean topic with active marker
+        new_title = chat_lifecycle.set_conversation_topic("c1", "Тест № 2")
+        self.assertEqual(new_title, "[15:30] ⦿ Тест № 2")
+        self.assertEqual(chat_lifecycle.get_conversation_title("c1"), "[15:30] ⦿ Тест № 2")
+
+        # 2. Strips old markers if provided in input
+        new_title2 = chat_lifecycle.set_conversation_topic("c1", "[10:00] » Тест № 2")
+        self.assertEqual(new_title2, "[15:30] ⦿ Тест № 2")
+
+  def test_create_handoff(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      db_path = os.path.join(tmp_dir, chat_lifecycle.SUMMARY_DB_NAME)
+      conn = sqlite3.connect(db_path)
+      with conn:
+        conn.execute(
+            "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, project_id TEXT)"
+        )
+        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?, ?)", ("parent-1", "[10:00] ⦿ My Feature", "proj-abc"))
+      conn.close()
+
+      mock_run_res = unittest.mock.MagicMock()
+      mock_run_res.returncode = 0
+      mock_run_res.stdout = '{"conversationId": "child-2"}'
+
+      mock_meta_res = unittest.mock.MagicMock()
+      mock_meta_res.returncode = 0
+      mock_meta_res.stdout = '{"sourceMetadata": null}'
+
+      def fake_run(cmd, **kwargs):
+        if "new-conversation" in cmd:
+          return mock_run_res
+        if "get-conversation-metadata" in cmd:
+          return mock_meta_res
+        return unittest.mock.MagicMock(returncode=0, stdout="")
+
+      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
+           patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=False), \
+           patch.object(chat_lifecycle, "get_current_time_str", return_value="15:45"), \
+           patch("subprocess.run", side_effect=fake_run) as mock_subproc:
+
+        summary_file = os.path.join(tmp_dir, "brain", "parent-1", "handoff_summary.md")
+        res = chat_lifecycle.create_handoff(
+            current_conv_id="parent-1",
+            summary_file=summary_file,
+            next_step_prompt="Do the next check",
+        )
+
+        self.assertEqual(res["new_conversation_id"], "child-2")
+        self.assertTrue(res["verified_visible"])
+        self.assertTrue(os.path.isfile(summary_file))
+
+
 if __name__ == "__main__":
   unittest.main()
+

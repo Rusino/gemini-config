@@ -40,7 +40,9 @@ Background: when `agentapi new-conversation` is run from an agent's `run_command
    - **First chat (start of branch)**: `[HH:MM] ▸ <Topic>` (or starts simply as topic/timestamped).
    - **Closed intermediate step**: `[HH:MM] ✓ <Topic>` (completed previous turn/step while work continues).
    - **Current active chat (in progress)**: `[HH:MM] ⦿ <Topic>` (attracts attention, bold focal point).
-   - **Helper**: `python3 ~/.gemini/config/hooks/chat_lifecycle.py advance <new_conversation_id>` (automatically discovers parent chats via transcripts, setting root to `▸`, intermediates to `✓`, and active to `⦿`).
+   - **Helper (Chain Advance)**: `python3 ~/.gemini/config/hooks/chat_lifecycle.py advance <new_conversation_id>` (automatically discovers parent chats via transcripts, setting root to `▸`, intermediates to `✓`, and active to `⦿`).
+   - **Helper (Setting / Renaming Title)**: `python3 ~/.gemini/config/hooks/chat_lifecycle.py set-title <conversation_id> "<Topic>"` (formats local timestamp `[HH:MM]` and marker `⦿` automatically; NEVER query SQLite or inspect other chats to rename).
+   - **Helper (Handoff / Continuation)**: `python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff [conversation_id] [summary_file]` (executes single-command handoff: creates/checks summary, launches visible continuation chat, verifies `sourceMetadata: null`, and advances chain markers).
 
 2. **Finalized / Closed Investigation (when completed / user says "финал")**:
    - **First chat (closed start)**: `[HH:MM] « <Topic>` (symmetric start bracket).
@@ -49,13 +51,22 @@ Background: when `agentapi new-conversation` is run from an agent's `run_command
    - **Single chat task (closed without continuations)**: `[HH:MM] «» <Topic>`.
    - **Helper**: `python3 ~/.gemini/config/hooks/chat_lifecycle.py finalize <conversation_id>` (automatically discovers chain ancestors and updates markers).
 
-3. **Reopening Finalized Chats (возобновление работы)**:
+3. **Strict Lifecycle CLI Rules (Anti-Pattern Ban)**:
+   - **NEVER** write manual SQLite queries or Python `sqlite3` snippets to look up or set titles.
+   - **NEVER** read transcripts or source code of hooks to remember how to create continuation chats.
+   - **Use only the 4 canonical CLI commands**:
+     - `chat_lifecycle.py set-title <id> "<Topic>"` — rename/set topic.
+     - `chat_lifecycle.py handoff <id>` — hand off / continue in new chat.
+     - `chat_lifecycle.py advance <id>` — advance chain.
+     - `chat_lifecycle.py finalize <id>` — finalize chain on "финал".
+
+4. **Reopening Finalized Chats (возобновление работы)**:
    - Если работа возобновляется в ранее закрытом чате (`«»` или `»`), **по умолчанию откатывать статус в активный рабочий (`⦿`)**:
      - Одиночный чат: `[HH:MM] «» <Topic>` → `[HH:MM] ⦿ <Topic>`.
      - Последний или промежуточный шаг в цепочке: вернуть в `[HH:MM] ⦿ <Topic>`.
    - **Исключение**: не менять статус только если пользователь явно указал, что это просто вопрос/справка и менять статус не нужно (например, *"это просто вопрос"*, *"не меняй статус"*).
    - При повторном завершении работы процедура стандартная: спросить пользователя или закрыть по слову *"финал"*.
 
-4. **Heuristics & Triggering Finalization**:
+5. **Heuristics & Triggering Finalization**:
    - If the task is heuristically complete (all tests pass, bug investigated, final summary provided), ask the user: *"Пометить разбор как финальный?"*.
    - When the user confirms or explicitly says *"финал"*, *"готово"* or similar, update the titles across the chain or current conversation in the DB/title metadata.

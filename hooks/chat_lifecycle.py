@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -383,11 +384,152 @@ def reopen_conversation(conv_id: str, force: bool = False) -> bool:
   return bool(updated)
 
 
+def set_conversation_topic(conv_id: str, topic: str, marker: str = MARKER_ACTIVE) -> str:
+  """Sets the topic for a conversation, formatting as `[HH:MM] <marker> <clean_topic>`."""
+  clean = clean_base_title(topic)
+  if not clean:
+    clean = "Investigation"
+  time_str = get_current_time_str()
+  new_title = f"[{time_str}] {marker} {clean}" if marker else f"[{time_str}] {clean}"
+  ok = update_conversation_title(conv_id, new_title)
+  return new_title if ok else ""
+
+
+def create_handoff(
+    current_conv_id: str,
+    summary_file: str = "",
+    next_step_prompt: str = "",
+    new_topic: str = "",
+    model: str = "pro",
+) -> dict:
+  """Executes a clean handoff to a new conversation via agentapi.
+
+  1. Resolves/verifies summary artifact file.
+  2. Builds title based on existing topic or new_topic.
+  3. Launches agentapi new-conversation with unstripped ANTIGRAVITY_PROJECT_ID and unset ANTIGRAVITY_SOURCE_METADATA.
+  4. Advances lifecycle chain markers (advances old chat to ✓ and new to ⦿).
+  5. Verifies sourceMetadata: null.
+  """
+  if not current_conv_id:
+    raise ValueError("current_conv_id must not be empty")
+
+  # 1. Determine base topic and new continuation title
+  if not new_topic:
+    cur_title = get_conversation_title(current_conv_id)
+    new_topic = clean_base_title(cur_title) or "Investigation"
+  time_str = get_current_time_str()
+  cont_title = f"[{time_str}] {MARKER_ACTIVE} {new_topic}"
+
+  # 2. Resolve summary artifact file
+  app_dirs = find_app_data_dirs()
+  if not summary_file:
+    slug = re.sub(r"[^\w\-]+", "_", new_topic, flags=re.UNICODE).strip("_")[:40]
+    filename = f"handoff_summary_{slug}_{current_conv_id[:8]}.md"
+    for d in app_dirs:
+      candidate = os.path.join(d, "brain", current_conv_id, filename)
+      if os.path.isfile(candidate):
+        summary_file = candidate
+        break
+    if not summary_file and app_dirs:
+      summary_file = os.path.join(app_dirs[0], "brain", current_conv_id, filename)
+
+  # Check if summary file exists; if not, create minimal template
+  if not os.path.isfile(summary_file):
+    os.makedirs(os.path.dirname(summary_file), exist_ok=True)
+    with open(summary_file, "w", encoding="utf-8") as f:
+      f.write(
+          f"# Handoff Summary: {new_topic}\n\n"
+          f"Continuation of conversation://{current_conv_id}.\n\n"
+          f"## Next Steps\n- Continue investigation/tasks from previous conversation.\n"
+      )
+
+  # 3. Build agentapi prompt
+  prompt = (
+      f"Continuing work from previous conversation (conversation://{current_conv_id}). "
+      f"Read {summary_file} via view_file and briefly confirm readiness to continue."
+  )
+  if next_step_prompt:
+    prompt = f"{prompt}\n\nNext immediate task: {next_step_prompt}"
+
+  # 4. Determine project ID to preserve
+  project_id = os.environ.get("ANTIGRAVITY_PROJECT_ID", "")
+  if not project_id:
+    for d in app_dirs:
+      db_file = os.path.join(d, SUMMARY_DB_NAME)
+      if os.path.isfile(db_file):
+        try:
+          conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=1.0)
+          cur = conn.cursor()
+          cur.execute("SELECT project_id FROM conversation_summaries WHERE conversation_id = ?", (current_conv_id,))
+          row = cur.fetchone()
+          conn.close()
+          if row and row[0]:
+            project_id = str(row[0]).strip()
+            break
+        except Exception:
+          pass
+
+  # 5. Launch agentapi new-conversation
+  env = {k: v for k, v in os.environ.items() if k != "ANTIGRAVITY_SOURCE_METADATA"}
+  if project_id and project_id != "outside-of-project":
+    env["ANTIGRAVITY_PROJECT_ID"] = project_id
+  else:
+    env["ANTIGRAVITY_PROJECT_ID"] = "outside-of-project"
+
+  cmd = [
+      "agentapi",
+      "new-conversation",
+      f"--model={model}",
+      f"--title={cont_title}",
+      prompt,
+  ]
+  res = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+  if res.returncode != 0:
+    raise RuntimeError(f"agentapi new-conversation failed (code {res.returncode}): {res.stderr or res.stdout}")
+
+  raw_out = res.stdout
+  m = re.search(r'"conversationId":\s*"([^"]+)"', raw_out)
+  if not m:
+    raise RuntimeError(f"Failed to parse conversationId from agentapi output: {raw_out}")
+  new_cid = m.group(1)
+
+  # 6. Verify sourceMetadata
+  meta_res = subprocess.run(["agentapi", "get-conversation-metadata", new_cid], capture_output=True, text=True, check=False)
+  meta_json = {}
+  try:
+    meta_json = json.loads(meta_res.stdout)
+  except Exception:
+    pass
+  source_meta = meta_json.get("sourceMetadata")
+
+  # 7. Advance lifecycle markers across the chain
+  advance_in_progress_chain(current_conv_id=new_cid)
+
+  return {
+      "new_conversation_id": new_cid,
+      "title": cont_title,
+      "summary_file": summary_file,
+      "source_metadata": source_meta,
+      "verified_visible": source_meta is None,
+  }
+
+
 if __name__ == "__main__":
   if len(sys.argv) > 2 and sys.argv[1] == "set":
     cid = sys.argv[2]
     title = sys.argv[3] if len(sys.argv) > 3 else ""
     update_conversation_title(cid, title)
+  elif len(sys.argv) > 2 and sys.argv[1] == "set-title":
+    cid = sys.argv[2]
+    topic = sys.argv[3] if len(sys.argv) > 3 else ""
+    marker = sys.argv[4] if len(sys.argv) > 4 else MARKER_ACTIVE
+    new_t = set_conversation_topic(cid, topic, marker)
+    print(f"Updated title for {cid}: {new_t}")
+  elif len(sys.argv) > 1 and sys.argv[1] == "handoff":
+    cid = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("CONVERSATION_ID", "")
+    summary = sys.argv[3] if len(sys.argv) > 3 else ""
+    result = create_handoff(cid, summary_file=summary)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
   elif len(sys.argv) > 2 and sys.argv[1] == "reopen":
     cid = sys.argv[2]
     reopen_conversation(cid, force=True)
