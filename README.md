@@ -11,6 +11,7 @@ Personal global rules, lifecycle hooks, and configuration for Jetski (`~/.gemini
   - `context_guard.py` — Monitors conversation context size and turn iteration limits, triggers automatic continuation handoffs (with timezone-aware `[HH:MM]` prefixes via `JETSKI_TIMEZONE`), and enforces the Two-Strike Debug Guard on consecutive command failures.
   - `pre_tool_guard.py` — Prevents blind edits without reading (`view_file`), blocks edits to generated/gitignored build caches, blocks infinite `tail -f` background daemons, verifies that `handoff_summary*.md` exists on disk before allowing `agentapi new-conversation`, auto-enriches `handoff_summary*.md` snapshots, and cleans up orphaned task log processes on handoff.
   - `stop_guard.py` — Ensures source code modifications are verified by a build/test command before the agent finishes its turn, and silences browser completion chimes on automated handoffs.
+  - `project_activity_badge.py` — Syncs live active (` · ⟳ N`) and blocked (` · ⚠ M`) conversation counts into `~/.gemini/config/projects/<id>.json` so collapsed project folders in the sidebar show running chat activity in real time via `ProjectUpdatesStream`.
 - `documentation/` — Detailed architecture and design docs:
   - [`long_context_guards_guide.md`](./documentation/long_context_guards_guide.md) — *Long-Context Error & Hallucination Prevention System for Jetski* (including Mermaid architecture diagram).
 
