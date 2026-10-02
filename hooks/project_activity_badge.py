@@ -30,6 +30,8 @@ import glob
 import json
 import os
 import re
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -260,13 +262,89 @@ def _discover_from_ps() -> tuple[str, str]:
   return ls_addr, csrf
 
 
+def _read_exact(stream: Any, n: int) -> bytes:
+  """Reads exactly `n` bytes from `stream` or returns fewer on EOF."""
+  buf = bytearray()
+  while len(buf) < n:
+    chunk = stream.read(n - len(buf))
+    if not chunk:
+      break
+    buf.extend(chunk)
+  return bytes(buf)
+
+
+def _fetch_jetbox_summaries_burst(
+    clean_addr: str, token: str
+) -> dict[str, Any] | None:
+  """Reads the initial snapshot burst from `JetboxSubscribeToSummaries`.
+
+  `GetAllCascadeTrajectories` builds summaries without `WithNotFullyIdle`, so
+  conversations whose main turn is `CASCADE_RUN_STATUS_IDLE` while waiting on a
+  subagent, background `run_command` task, or `schedule` timer omit
+  `notFullyIdle`. `JetboxSubscribeToSummaries` streams from
+  `jetboxSummariesStore`, which includes `notFullyIdle: true` for all such
+  conversations (matching the Jetski sidebar spinner).
+  """
+  url = (
+      f"http://{clean_addr}"
+      "/exa.language_server_pb.LanguageServerService/JetboxSubscribeToSummaries"
+  )
+  body = b"{}"
+  envelope = struct.pack(">BI", 0, len(body)) + body
+  req = urllib.request.Request(
+      url,
+      data=envelope,
+      headers={
+          "Content-Type": "application/connect+json",
+          "x-codeium-csrf-token": token,
+      },
+      method="POST",
+  )
+  merged: dict[str, Any] = {}
+  packets = 0
+  with urllib.request.urlopen(req, timeout=2.0) as resp:
+    raw_sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
+    while True:
+      try:
+        header = _read_exact(resp, 5)
+      except (TimeoutError, socket.timeout):
+        break
+      if len(header) < 5:
+        break
+      flags, length = struct.unpack(">BI", header)
+      if flags & 0x02:
+        # End-of-stream trailer frame
+        break
+      if raw_sock is not None:
+        raw_sock.settimeout(1.0)
+      raw_payload = _read_exact(resp, length)
+      if len(raw_payload) < length:
+        break
+      payload = json.loads(raw_payload.decode("utf-8"))
+      if isinstance(payload, dict):
+        updates = payload.get("updates")
+        if isinstance(updates, dict):
+          merged.update(updates)
+      packets += 1
+      if raw_sock is not None:
+        # Use a short idle timeout to drain any remaining initial snapshot
+        # packets (sent in batches of 100) without waiting for future events.
+        raw_sock.settimeout(0.04)
+      elif len(merged) < 100:
+        break
+  return merged if packets > 0 else None
+
+
 def fetch_trajectories(
     ls_address: str = "", csrf_token: str = ""
 ) -> dict[str, Any] | None:
-  """Calls `GetAllCascadeTrajectories` and returns `trajectorySummaries`.
+  """Fetches `trajectorySummaries` from the local Language Server.
 
-  Automatically resolves and caches `(ls_address, csrf_token)` if not provided
-  or if a cached token became stale after a server restart.
+  Prefers `JetboxSubscribeToSummaries` (which includes `notFullyIdle` for
+  conversations waiting on subagents, timers, or background tasks) and falls
+  back to `GetAllCascadeTrajectories`. Automatically resolves and caches
+  `(ls_address, csrf_token)` if not provided or if a cached token became stale
+  after a server restart.
   """
   candidates: list[tuple[str, str]] = []
   env_addr = os.environ.get("ANTIGRAVITY_LS_ADDRESS", "")
@@ -281,6 +359,13 @@ def fetch_trajectories(
 
   def _try_call(addr: str, token: str) -> dict[str, Any] | None:
     clean_addr = addr.removeprefix("http://").removeprefix("https://")
+    try:
+      stream_summaries = _fetch_jetbox_summaries_burst(clean_addr, token)
+      if stream_summaries is not None:
+        return stream_summaries
+    except Exception:
+      pass
+
     url = (
         f"http://{clean_addr}"
         "/exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories"

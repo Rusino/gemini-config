@@ -4,6 +4,7 @@
 import io
 import json
 import os
+import struct
 import sys
 import tempfile
 import unittest
@@ -212,6 +213,38 @@ class TestProjectActivityBadge(unittest.TestCase):
           project_id=mock.ANY,
           workspace_paths=["/ws/a"],
           projects_dir="/tmp/projects",
+      )
+
+  def test_fetch_jetbox_summaries_burst_parses_connect_frames(self):
+    pkt = json.dumps({
+        "updates": {
+            "ae64a06d": {
+                "status": "CASCADE_RUN_STATUS_IDLE",
+                "notFullyIdle": True,
+                "trajectoryMetadata": {"projectId": "webparagraph"},
+            }
+        }
+    }).encode("utf-8")
+    stream_bytes = struct.pack(">BI", 0, len(pkt)) + pkt + struct.pack(">BI", 2, 2) + b"{}"
+
+    class FakeResp(io.BytesIO):
+      def __enter__(self):
+        return self
+
+      def __exit__(self, *args):
+        self.close()
+
+    with mock.patch("urllib.request.urlopen", return_value=FakeResp(stream_bytes)):
+      res = badge._fetch_jetbox_summaries_burst("localhost:5387", "tok")
+      self.assertEqual(
+          res,
+          {
+              "ae64a06d": {
+                  "status": "CASCADE_RUN_STATUS_IDLE",
+                  "notFullyIdle": True,
+                  "trajectoryMetadata": {"projectId": "webparagraph"},
+              }
+          },
       )
 
 
