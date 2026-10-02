@@ -44,12 +44,13 @@ Use only these commands (`python3 ~/.gemini/config/hooks/chat_lifecycle.py ...`)
 | Command | When you call it |
 |---|---|
 | `set-title <id> "<Topic>"` | User asks to name/rename the chat. Pass the bare topic; time and marker are added for you. |
-| `handoff <id> [summary_file] [--notes "..."] [--next "..."]` | Context guard alert, or user asks to continue in a new chat. One call: writes/updates the summary, launches a visible continuation in the same project, verifies `sourceMetadata: null`, updates chain markers. |
+| `handoff <id> [summary_file] [--notes "..."] [--next "..."]` | Context guard alert, or user asks to continue in a new chat. One call: writes/updates the summary, launches a visible continuation in the same project **with the same model as `<id>`'s last turn**, verifies `sourceMetadata: null`, updates chain markers. `--model <id\|name>` only if the user explicitly asks for a different model. |
 | `summary-path <id>` | You want to write a detailed summary with `write_to_file` before `handoff` — this returns the canonical path. |
 | `finalize <id>` | **Only** when the user explicitly says *"финал"* (or an unambiguous equivalent). Preserves original timestamps, swaps markers. |
 | `status [id]` | User asks about the chain / which chats belong to the task / where summaries are. |
+| `model [id]` | User asks which model a chat runs on or which model a continuation would get. Read-only. |
 
 Strict rules:
 - **Never** ask the user whether to finalize. No "Пометить разбор как финальный?" prompts. Finalization happens only on the user's explicit word.
 - **Never** reopen finalized chats automatically or infer status from the user's wording. If the user continues working in a closed chat, do nothing with the title; the chain is reactivated mechanically by the next `handoff`, or on explicit request (`reopen <id>`).
-- **Never** write SQLite queries or Python `sqlite3` snippets to look up or set titles, and **never** read transcripts or hook source code to recall how handoff works — the five commands above are the entire interface.
+- **Never** write SQLite queries or Python `sqlite3` snippets to look up or set titles, and **never** read transcripts or hook source code to recall how handoff works — the commands above are the entire interface.

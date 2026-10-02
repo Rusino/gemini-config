@@ -139,6 +139,176 @@ def update_conversation_title_rpc(conv_id: str, new_title: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Language Server RPC (Connect/JSON over HTTP, stdlib only) and model selection
+# ---------------------------------------------------------------------------
+LS_SERVICE_PATH = "exa.language_server_pb.LanguageServerService"
+# Per-machine preference used when the model cannot be inherited:
+#   $HANDOFF_MODEL, else first non-comment line of <app_data_dir>/handoff_model
+# (model id like `gemini-3.8-flash-high`, display name, or enum name).
+HANDOFF_MODEL_FILE_NAME = "handoff_model"
+AGENTAPI_TIERS = ("flash_lite", "flash", "pro")
+
+
+def ls_rpc(method: str, body: dict, timeout: float = 20.0) -> dict:
+  """Calls a Language Server RPC via Connect/JSON (same channel the IDE uses)."""
+  ls_address = os.environ.get("ANTIGRAVITY_LS_ADDRESS", "localhost:5387")
+  csrf_token = get_ls_csrf_token(ls_address)
+  if not csrf_token:
+    raise RuntimeError("no CSRF token for the Language Server")
+  base = ls_address if ls_address.startswith(("http://", "https://")) else f"http://{ls_address}"
+  req = urllib.request.Request(
+      f"{base}/{LS_SERVICE_PATH}/{method}",
+      data=json.dumps(body).encode("utf-8"),
+      headers={"Content-Type": "application/json", "x-codeium-csrf-token": csrf_token},
+      method="POST",
+  )
+  try:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+      raw = resp.read()
+  except urllib.error.HTTPError as e:
+    detail = e.read().decode("utf-8", errors="replace")[:300]
+    raise RuntimeError(f"{method}: HTTP {e.code} {detail}") from e
+  return json.loads(raw or b"{}")
+
+
+def get_available_models() -> dict:
+  """Returns the live model catalog: {"models": {id: details}, "tieredModelIds": {...}, ...}."""
+  return ls_rpc("GetAvailableModels", {}).get("response") or {}
+
+
+def get_last_used_model(conv_id: str) -> str:
+  """Model enum of the conversation's last turn (what the IDE picker shows), or ""."""
+  try:
+    r = ls_rpc(
+        "GetCascadeTrajectoryGeneratorMetadata",
+        {"cascadeId": conv_id, "generatorMetadataOffset": 0, "includeMessages": False},
+    )
+    gm = r.get("generatorMetadata") or []
+    if gm:
+      enum = (gm[-1].get("plannerConfig") or {}).get("planModel") or ""
+      if enum:
+        return enum
+  except Exception:
+    pass
+  try:  # created with a static config (agentapi / this script) but no turn yet
+    meta = ls_rpc("GetConversationMetadata", {"conversationId": conv_id}).get("metadata") or {}
+    static = (meta.get("staticConfig") or {}).get("cascadeConfig") or {}
+    return (static.get("plannerConfig") or {}).get("planModel") or ""
+  except Exception:
+    return ""
+
+
+def read_handoff_model_override() -> str:
+  val = os.environ.get("HANDOFF_MODEL", "").strip()
+  if val:
+    return val
+  for d in find_app_data_dirs():
+    p = os.path.join(d, HANDOFF_MODEL_FILE_NAME)
+    if os.path.isfile(p):
+      try:
+        with open(p, "r", encoding="utf-8") as f:
+          for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+              return line
+      except Exception:
+        pass
+  return ""
+
+
+def lookup_model(models: dict, wanted: str) -> dict:
+  """Resolves a model id / display name / enum name among enabled catalog entries."""
+  w = (wanted or "").strip().lower()
+  if not w:
+    return {}
+  for mid, det in models.items():
+    if det.get("disabled"):
+      continue
+    enum = det.get("model", "")
+    label = det.get("displayName", "")
+    if w in (mid.lower(), enum.lower(), label.lower()):
+      return {"enum": enum, "id": mid, "label": label or mid}
+  return {}
+
+
+def resolve_handoff_model(current_conv_id: str, tier: str = "pro", explicit: str = "") -> dict:
+  """Chooses the plan model for the continuation chat.
+
+  Order: explicit (--model) -> inherited from the current conversation's last turn ->
+  $HANDOFF_MODEL / <app_data_dir>/handoff_model -> first model of the agentapi tier.
+  Every candidate is validated against the live catalog: an enum that is not in it
+  fails at the first turn ("unknown model key MODEL_PLACEHOLDER_*").
+  """
+  resp = get_available_models()
+  models = resp.get("models") or {}
+  tiers = resp.get("tieredModelIds") or {}
+
+  def from_tier(t: str) -> dict:
+    key = {"flash_lite": "flashLite", "flash": "flash", "pro": "pro"}.get(t, "pro")
+    for mid in tiers.get(key) or []:
+      hit = lookup_model(models, mid)
+      if hit:
+        return {**hit, "source": f"tier:{t}"}
+    return {}
+
+  if explicit:
+    if explicit in AGENTAPI_TIERS:
+      hit = from_tier(explicit)
+    else:
+      hit = lookup_model(models, explicit)
+      hit = {**hit, "source": "explicit"} if hit else {}
+    if not hit:
+      raise RuntimeError(f"--model '{explicit}' is not available in GetAvailableModels")
+    return hit
+
+  inherited = get_last_used_model(current_conv_id) if current_conv_id else ""
+  hit = lookup_model(models, inherited)
+  if hit:
+    return {**hit, "source": "inherited"}
+
+  hit = lookup_model(models, read_handoff_model_override())
+  if hit:
+    return {**hit, "source": "override"}
+
+  hit = from_tier(tier)
+  if hit:
+    return hit
+  raise RuntimeError("no usable model found in GetAvailableModels")
+
+
+def start_conversation_exact(model_enum: str, title: str, prompt: str, project_id: str) -> str:
+  """Creates a visible conversation pinned to an exact plan model.
+
+  Mirrors `agentapi new-conversation` (StartCascade -> title -> first message), which
+  can only express Gemini tiers. No sourceMetadata is sent, so the chat is listed in
+  the sidebar (the equivalent of `env -u ANTIGRAVITY_SOURCE_METADATA`).
+  """
+  body = {
+      "source": "CORTEX_TRAJECTORY_SOURCE_AGENT_API",
+      "trajectoryType": "CORTEX_TRAJECTORY_TYPE_CASCADE",
+      "customAgentSpec": {
+          "codingAgent": {"googleMode": True},
+          "commandExecutionPolicy": "eager",
+          "enforcedWorkspaceValidation": False,
+          "cascadeConfig": {"plannerConfig": {"planModel": model_enum}},
+      },
+      "projectEnvConfig": {"projectId": project_id, "defaultProjectEnvironment": {}},
+  }
+  new_cid = ls_rpc("StartCascade", body).get("cascadeId", "")
+  if not new_cid:
+    raise RuntimeError("StartCascade returned no cascadeId")
+  ls_rpc(
+      "UpdateConversationAnnotations",
+      {"cascadeIds": [new_cid], "annotations": {"title": title}, "mergeAnnotations": True},
+  )
+  ls_rpc(
+      "SendUserCascadeMessage",
+      {"cascadeId": new_cid, "items": [{"text": prompt}], "blocking": False},
+  )
+  return new_cid
+
+
 def update_conversation_title(conv_id: str, new_title: str) -> bool:
   """Updates conversation title via Language Server RPC and persists to disk."""
   if not conv_id or not new_title:
@@ -417,12 +587,17 @@ def create_handoff(
     next_step_prompt: str = "",
     new_topic: str = "",
     model: str = "pro",
+    exact_model: str = "",
 ) -> dict:
-  """Executes a clean handoff to a new conversation via agentapi.
+  """Executes a clean handoff to a new conversation.
 
   1. Resolves/verifies summary artifact file. If notes are provided, writes/enriches summary.
   2. Builds title based on existing topic or new_topic.
-  3. Launches agentapi new-conversation with unstripped ANTIGRAVITY_PROJECT_ID and unset ANTIGRAVITY_SOURCE_METADATA.
+  3. Launches the continuation directly via Language Server RPC with an exact plan model
+     (explicit --model -> inherited from the current chat's last turn -> $HANDOFF_MODEL /
+     <app_data_dir>/handoff_model -> agentapi tier `model`), preserving ANTIGRAVITY_PROJECT_ID
+     and sending no sourceMetadata (chat stays visible). Falls back to
+     `agentapi new-conversation --model=<tier>` if the RPC path is unavailable.
   4. Advances lifecycle chain markers (advances old chat to ✓ and new to ⦿).
   5. Verifies sourceMetadata: null.
   """
@@ -477,38 +652,34 @@ def create_handoff(
         except Exception:
           pass
 
-  # 5. Launch agentapi new-conversation
-  env = {k: v for k, v in os.environ.items() if k != "ANTIGRAVITY_SOURCE_METADATA"}
-  if project_id and project_id != "outside-of-project":
-    env["ANTIGRAVITY_PROJECT_ID"] = project_id
-  else:
-    env["ANTIGRAVITY_PROJECT_ID"] = "outside-of-project"
-
-  cmd = [
-      "agentapi",
-      "new-conversation",
-      f"--model={model}",
-      f"--title={cont_title}",
-      prompt,
-  ]
-  res = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
-  if res.returncode != 0:
-    raise RuntimeError(f"agentapi new-conversation failed (code {res.returncode}): {res.stderr or res.stdout}")
-
-  raw_out = res.stdout
-  m = re.search(r'"conversationId":\s*"([^"]+)"', raw_out)
-  if not m:
-    raise RuntimeError(f"Failed to parse conversationId from agentapi output: {raw_out}")
-  new_cid = m.group(1)
-
-  # 6. Verify sourceMetadata
-  meta_res = subprocess.run(["agentapi", "get-conversation-metadata", new_cid], capture_output=True, text=True, check=False)
-  meta_json = {}
+  # 5. Launch the continuation: exact plan model via LS RPC, else agentapi tier.
+  project_id_final = project_id if project_id and project_id != "outside-of-project" else "outside-of-project"
+  model_info: dict = {}
+  new_cid = ""
   try:
-    meta_json = json.loads(meta_res.stdout)
-  except Exception:
-    pass
-  source_meta = meta_json.get("sourceMetadata")
+    model_info = resolve_handoff_model(current_conv_id, tier=model, explicit=exact_model)
+    new_cid = start_conversation_exact(model_info["enum"], cont_title, prompt, project_id_final)
+  except Exception as exc:
+    model_info = {"source": f"agentapi tier:{model}", "fallback_reason": str(exc)[:300]}
+    env = {k: v for k, v in os.environ.items() if k != "ANTIGRAVITY_SOURCE_METADATA"}
+    env["ANTIGRAVITY_PROJECT_ID"] = project_id_final
+    cmd = [
+        "agentapi",
+        "new-conversation",
+        f"--model={model}",
+        f"--title={cont_title}",
+        prompt,
+    ]
+    res = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+    if res.returncode != 0:
+      raise RuntimeError(f"agentapi new-conversation failed (code {res.returncode}): {res.stderr or res.stdout}")
+    m = re.search(r'"conversationId":\s*"([^"]+)"', res.stdout)
+    if not m:
+      raise RuntimeError(f"Failed to parse conversationId from agentapi output: {res.stdout}")
+    new_cid = m.group(1)
+
+  # 6. Verify sourceMetadata (lives under metadata.sourceMetadata; null => visible in the sidebar)
+  fetched, source_meta = get_conversation_source_metadata(new_cid)
 
   # 7. Advance lifecycle markers across the chain
   advance_in_progress_chain(current_conv_id=new_cid)
@@ -517,9 +688,29 @@ def create_handoff(
       "new_conversation_id": new_cid,
       "title": cont_title,
       "summary_file": summary_file,
+      "model": model_info,
       "source_metadata": source_meta,
-      "verified_visible": source_meta is None,
+      "verified_visible": bool(fetched and source_meta is None),
   }
+
+
+def get_conversation_source_metadata(conv_id: str) -> tuple[bool, object]:
+  """Returns (fetched, metadata.sourceMetadata) via LS RPC, else via agentapi."""
+  try:
+    meta = ls_rpc("GetConversationMetadata", {"conversationId": conv_id}).get("metadata")
+    if isinstance(meta, dict):
+      return True, meta.get("sourceMetadata")
+  except Exception:
+    pass
+  try:
+    res = subprocess.run(["agentapi", "get-conversation-metadata", conv_id], capture_output=True, text=True, check=False)
+    data = json.loads(res.stdout)
+    meta = ((data.get("response") or {}).get("conversationMetadata") or {}).get("metadata")
+    if isinstance(meta, dict):
+      return True, meta.get("sourceMetadata")
+  except Exception:
+    pass
+  return False, None
 
 
 def get_chain_status(conv_id: str) -> dict:
@@ -578,7 +769,11 @@ Commands:
   handoff <id> [summary_file]         Create a visible continuation chat in the same
           [--notes "..."]             project, verify sourceMetadata is null and
           [--next "..."]              update chain markers. Writes/updates the
-                                      summary if --notes is given.
+          [--model <m>]               summary if --notes is given. The continuation
+                                      keeps the model of <id>'s last turn (see Notes);
+                                      --model pins one explicitly.
+  model [id]                          Read-only: show the model <id> last used and the
+                                      model a handoff would pick now.
   finalize <id>                       Close the whole chain. USER-ONLY: run it
                                       only on the user's explicit word ("финал").
                                       Timestamps are preserved.
@@ -594,6 +789,12 @@ Notes:
     run_command only).
   * Markers (▸ ✓ ⦿ « ‹✓› » «») are derived mechanically from the chain; never
     choose or edit them by hand.
+  * Model of a continuation: --model <id|display name|enum|flash_lite|flash|pro>
+    -> model of <id>'s last turn (inherit) -> $HANDOFF_MODEL or the first
+    non-comment line of <app_data_dir>/handoff_model -> agentapi tier "pro".
+    Candidates are validated against GetAvailableModels. `agentapi
+    new-conversation` itself knows only Gemini tiers (pro = "Gemini 3.1 Pro
+    (Low)" in Antigravity), which is why the launch goes through the LS RPC.
 """
 
 
@@ -602,7 +803,7 @@ def print_usage(stream=None) -> None:
 
 
 KNOWN_COMMANDS = (
-    "set", "set-title", "summary-path", "status", "handoff", "reopen", "advance", "finalize",
+    "set", "set-title", "summary-path", "status", "model", "handoff", "reopen", "advance", "finalize",
 )
 
 
@@ -634,13 +835,26 @@ if __name__ == "__main__":
     cid = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("CONVERSATION_ID", "")
     info = get_chain_status(cid)
     print(json.dumps(info, ensure_ascii=False, indent=2))
+  elif len(sys.argv) > 1 and sys.argv[1] == "model":
+    # Read-only diagnostic: what <id> last used and what a handoff would pick now.
+    cid = sys.argv[2] if len(sys.argv) > 2 else (
+        os.environ.get("CONVERSATION_ID", "") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID", "")
+    )
+    out = {"conversation_id": cid, "last_used_enum": get_last_used_model(cid) if cid else ""}
+    try:
+      out["handoff_would_use"] = resolve_handoff_model(cid)
+    except Exception as exc:
+      out["handoff_would_use"] = {"error": str(exc)[:300], "fallback": "agentapi tier:pro"}
+    out["override_setting"] = read_handoff_model_override()
+    print(json.dumps(out, ensure_ascii=False, indent=2))
   elif len(sys.argv) > 1 and sys.argv[1] == "handoff":
-    # Usage: chat_lifecycle.py handoff [cid] [summary_file] [--notes "..."] [--next "..."]
+    # Usage: chat_lifecycle.py handoff [cid] [summary_file] [--notes "..."] [--next "..."] [--model <m>]
     args = sys.argv[2:]
     cid = ""
     summary = ""
     notes = ""
     next_step = ""
+    exact_model = ""
     i = 0
     while i < len(args):
       if args[i] == "--notes" and i + 1 < len(args):
@@ -649,6 +863,12 @@ if __name__ == "__main__":
       elif args[i] == "--next" and i + 1 < len(args):
         next_step = args[i + 1]
         i += 2
+      elif args[i] == "--model" and i + 1 < len(args):
+        exact_model = args[i + 1]
+        i += 2
+      elif args[i].startswith("--model="):
+        exact_model = args[i].split("=", 1)[1]
+        i += 1
       elif not cid:
         cid = args[i]
         i += 1
@@ -659,7 +879,7 @@ if __name__ == "__main__":
         i += 1
     if not cid:
       cid = os.environ.get("CONVERSATION_ID", "")
-    result = create_handoff(cid, summary_file=summary, notes=notes, next_step_prompt=next_step)
+    result = create_handoff(cid, summary_file=summary, notes=notes, next_step_prompt=next_step, exact_model=exact_model)
     print(json.dumps(result, ensure_ascii=False, indent=2))
   elif len(sys.argv) > 2 and sys.argv[1] == "reopen":
     cid = sys.argv[2]
