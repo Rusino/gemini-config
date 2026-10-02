@@ -28,6 +28,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 
@@ -88,6 +89,31 @@ SOURCE_FILENAMES = {
 
 EXIT_CODE_RE = re.compile(r"The command exited with code (\d+)\.")
 AUTO_SNAPSHOT_HEADER = "## Automatic State Snapshot (Git & Recent Commands)"
+
+# A *real* `agentapi new-conversation` invocation: the `agentapi` token must be
+# at the start of the line or follow a shell separator / whitespace (not a quote),
+# so `grep "…new-conversation…"`, `echo '…agentapi new-conversation…'` and similar
+# mentions inside string literals do not trigger the launch rewrite.
+AGENTAPI_NEW_CONV_RE = re.compile(
+    r"(?:^|(?<=[\s;&|(`]))(?:\S*/)?agentapi\s+new-conversation\b"
+)
+
+
+def is_agentapi_new_conversation_launch(cmd: str) -> bool:
+  """True only if the command really *invokes* `agentapi new-conversation`.
+
+  Tokenizes with shlex so that quoted mentions (grep patterns, --notes text,
+  echo strings) are single tokens and never count as a launch. Falls back to
+  AGENTAPI_NEW_CONV_RE when the command line has unbalanced quotes.
+  """
+  try:
+    tokens = shlex.split(cmd, posix=True)
+  except ValueError:
+    return bool(AGENTAPI_NEW_CONV_RE.search(cmd))
+  for tok, nxt in zip(tokens, tokens[1:]):
+    if os.path.basename(tok.lstrip("$(`")) == "agentapi" and nxt == "new-conversation":
+      return True
+  return False
 
 
 def is_agent_internal_file(file_path: str) -> bool:
@@ -462,7 +488,8 @@ def main() -> None:
 
         # If calling `agentapi new-conversation`, verify handoff_summary exists,
         # enrich handoff_summary*.md on disk, and auto-inject missing env / --title!
-        if "new-conversation" in cmd and not re.search(
+        # Only a *real* invocation counts — not `grep`/`echo` mentioning the string.
+        if is_agentapi_new_conversation_launch(cmd) and not re.search(
             r"\bnew-conversation\s+(?:--help|-h|help)\b", cmd
         ):
           ref_match = re.search(r"(/\S*handoff_summary[^\s\"']*\.md)", cmd)
@@ -509,27 +536,22 @@ def main() -> None:
           # Replace bare `/.../agentapi new-conversation` or `agentapi new-conversation`
           # with `cmd_prefix` if `ANTIGRAVITY_SOURCE_METADATA` is missing
           if "ANTIGRAVITY_SOURCE_METADATA" not in rewritten:
-            rewritten = re.sub(
-                r"(?:\S*/)?agentapi\s+new-conversation\b",
-                cmd_prefix,
-                rewritten,
-                count=1,
+            rewritten = AGENTAPI_NEW_CONV_RE.sub(
+                lambda _m: cmd_prefix, rewritten, count=1
             )
             needs_rewrite = True
 
+          # Inject missing flags right after the real `agentapi new-conversation`
+          # token (never into a quoted mention or the prompt text).
           if "--title" not in rewritten:
-            rewritten = rewritten.replace(
-                "new-conversation",
-                f'new-conversation --title="{new_title}"',
-                1,
+            rewritten = AGENTAPI_NEW_CONV_RE.sub(
+                lambda m: f'{m.group(0)} --title="{new_title}"', rewritten, count=1
             )
             needs_rewrite = True
 
           if "--model" not in rewritten:
-            rewritten = rewritten.replace(
-                "new-conversation",
-                "new-conversation --model=pro",
-                1,
+            rewritten = AGENTAPI_NEW_CONV_RE.sub(
+                lambda m: f"{m.group(0)} --model=pro", rewritten, count=1
             )
             needs_rewrite = True
 
