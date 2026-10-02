@@ -97,23 +97,41 @@ AUTO_SNAPSHOT_HEADER = "## Automatic State Snapshot (Git & Recent Commands)"
 AGENTAPI_NEW_CONV_RE = re.compile(
     r"(?:^|(?<=[\s;&|(`]))(?:\S*/)?agentapi\s+new-conversation\b"
 )
+# `<<EOF` / `<<'EOF'` / `<<-"EOF"` ... body ... `EOF` — the body is data (commit
+# messages, scripts), never a command. With `<<-` the terminator may be
+# tab-indented.
+HEREDOC_RE = re.compile(
+    r"<<(-)?\s*(['\"]?)(\w+)\2[^\n]*\n.*?^(?(1)\t*)\3[ \t]*$",
+    re.DOTALL | re.MULTILINE,
+)
 
 
-def is_agentapi_new_conversation_launch(cmd: str) -> bool:
-  """True only if the command really *invokes* `agentapi new-conversation`.
+def strip_heredocs(cmd: str) -> str:
+  return HEREDOC_RE.sub(r"<<\3 [heredoc body stripped]", cmd)
 
-  Tokenizes with shlex so that quoted mentions (grep patterns, --notes text,
-  echo strings) are single tokens and never count as a launch. Falls back to
-  AGENTAPI_NEW_CONV_RE when the command line has unbalanced quotes.
+
+def count_agentapi_new_conversation_launches(cmd: str) -> int:
+  """Number of real `agentapi new-conversation` invocations in the command line.
+
+  Heredoc bodies are ignored and the rest is tokenized with shlex, so quoted
+  mentions (grep patterns, --notes text, echo strings) are single tokens and
+  never count. Falls back to AGENTAPI_NEW_CONV_RE when quoting is unbalanced.
   """
+  cmd = strip_heredocs(cmd)
   try:
     tokens = shlex.split(cmd, posix=True)
   except ValueError:
-    return bool(AGENTAPI_NEW_CONV_RE.search(cmd))
+    return len(AGENTAPI_NEW_CONV_RE.findall(cmd))
+  n = 0
   for tok, nxt in zip(tokens, tokens[1:]):
     if os.path.basename(tok.lstrip("$(`")) == "agentapi" and nxt == "new-conversation":
-      return True
-  return False
+      n += 1
+  return n
+
+
+def is_agentapi_new_conversation_launch(cmd: str) -> bool:
+  """True only if the command really *invokes* `agentapi new-conversation`."""
+  return count_agentapi_new_conversation_launches(cmd) > 0
 
 
 def is_agent_internal_file(file_path: str) -> bool:
@@ -452,9 +470,10 @@ def main() -> None:
             conv_id, transcript_path, workspace_paths
         )
         # Catch hallucinated agentapi subcommands (e.g. `agentapi start`, `agentapi create`)
+        cmd_code = strip_heredocs(cmd)
         bad_subcmd = re.search(
             r"\bagentapi\s+(start(?:-conversation)?|create(?:-conversation)?|conversation)\b",
-            cmd,
+            cmd_code,
         )
         if bad_subcmd:
           print(
@@ -471,7 +490,7 @@ def main() -> None:
           )
           return
 
-        if len(re.findall(r"\bagentapi\s+new-conversation\b", cmd)) > 1:
+        if count_agentapi_new_conversation_launches(cmd) > 1:
           print(
               json.dumps(
                   {
