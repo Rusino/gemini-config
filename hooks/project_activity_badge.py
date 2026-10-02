@@ -7,7 +7,8 @@ running-chat indicator. Meanwhile, the Language Server runs an `fsnotify`
 watcher on `~/.gemini/config/projects/*.json` and streams changes to the UI
 via `ProjectUpdatesStream`.
 
-This script queries the local Connect-RPC `GetAllCascadeTrajectories` endpoint,
+This script reads the initial snapshot from the local Connect-RPC
+`JetboxSubscribeToSummaries` stream (with fallback to `GetAllCascadeTrajectories`),
 counts active (`CASCADE_RUN_STATUS_RUNNING` / `notFullyIdle`) and blocked
 (`waitingSteps`) top-level conversations per project, and atomically updates
 the `"name"` field in `~/.gemini/config/projects/<project_id>.json` with a
