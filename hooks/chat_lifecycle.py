@@ -626,10 +626,12 @@ def create_handoff(
           f"## Next Steps\n- {next_step_prompt.strip() if next_step_prompt else 'Continue investigation/tasks from previous conversation.'}\n"
       )
 
-  # 3. Build agentapi prompt
+  # 3. Build continuation prompt
   prompt = (
-      f"Continuing work from previous conversation (conversation://{current_conv_id}). "
-      f"Read {summary_file} via view_file and briefly confirm readiness to continue."
+      f"Continuing unfinished work from previous conversation (conversation://{current_conv_id}). "
+      f"Read {summary_file} via view_file, review completed steps and discarded hypotheses, "
+      f"and immediately continue executing from the next step recorded in the summary without asking "
+      f"for confirmation (unless the summary explicitly states it is waiting for user input)."
   )
   if next_step_prompt:
     prompt = f"{prompt}\n\nNext immediate task: {next_step_prompt}"
@@ -637,7 +639,7 @@ def create_handoff(
   # 4. Determine project ID to preserve
   project_id = os.environ.get("ANTIGRAVITY_PROJECT_ID", "")
   if not project_id:
-    for d in app_dirs:
+    for d in find_app_data_dirs():
       db_file = os.path.join(d, SUMMARY_DB_NAME)
       if os.path.isfile(db_file):
         try:

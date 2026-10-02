@@ -134,6 +134,30 @@ def is_agentapi_new_conversation_launch(cmd: str) -> bool:
   return count_agentapi_new_conversation_launches(cmd) > 0
 
 
+CHAT_LIFECYCLE_HANDOFF_RE = re.compile(
+    r"(?:^|(?<=[\s;&|(`]))(?:\S*/)?chat_lifecycle\.py\s+handoff\b"
+)
+
+
+def count_chat_lifecycle_handoff_launches(cmd: str) -> int:
+  """Number of real `chat_lifecycle.py handoff` invocations in the command line."""
+  cmd = strip_heredocs(cmd)
+  try:
+    tokens = shlex.split(cmd, posix=True)
+  except ValueError:
+    return len(CHAT_LIFECYCLE_HANDOFF_RE.findall(cmd))
+  n = 0
+  for tok, nxt in zip(tokens, tokens[1:]):
+    if os.path.basename(tok.lstrip("$(`")) == "chat_lifecycle.py" and nxt == "handoff":
+      n += 1
+  return n
+
+
+def is_chat_lifecycle_handoff_launch(cmd: str) -> bool:
+  """True only if the command really *invokes* `chat_lifecycle.py handoff`."""
+  return count_chat_lifecycle_handoff_launches(cmd) > 0
+
+
 def is_agent_internal_file(file_path: str) -> bool:
   """Returns True if the file is an agent artifact or customization file (not project code)."""
   if not file_path:
@@ -459,6 +483,65 @@ def main() -> None:
             )
         )
         return
+
+      if is_chat_lifecycle_handoff_launch(cmd) and not re.search(
+          r"\bhandoff\s+(?:--help|-h|help)\b", cmd
+      ):
+        if count_chat_lifecycle_handoff_launches(cmd) > 1:
+          print(
+              json.dumps(
+                  {
+                      "decision": "deny",
+                      "reason": (
+                          "[PRE-TOOL GUARD] Do not run `chat_lifecycle.py handoff` multiple times in a single command! "
+                          "Launch exactly ONE continuation chat."
+                      ),
+                  },
+                  ensure_ascii=False,
+              )
+          )
+          return
+
+        has_notes_flag = "--notes" in strip_heredocs(cmd)
+        ref_match = re.search(r"(/\S*handoff_summary[^\s\"']*\.md)", cmd)
+        missing_summary = None
+        if not has_notes_flag:
+          if ref_match and not os.path.exists(ref_match.group(1)):
+            missing_summary = ref_match.group(1)
+          elif (
+              state.get("pending_handoff_launch")
+              and artifact_dir
+              and not glob.glob(os.path.join(artifact_dir, "handoff_summary*.md"))
+          ):
+            missing_summary = state.get("pending_handoff_file") or os.path.join(
+                artifact_dir, "handoff_summary.md"
+            )
+        if missing_summary:
+          print(
+              json.dumps(
+                  {
+                      "decision": "deny",
+                      "reason": (
+                          f"[PRE-TOOL GUARD] Cannot launch continuation conversation yet: the summary file `{missing_summary}` "
+                          "does not exist on disk! First create the summary file using `write_to_file` (`UserFacing: true`), "
+                          "and only then call `chat_lifecycle.py handoff`."
+                      ),
+                  },
+                  ensure_ascii=False,
+              )
+          )
+          return
+
+        if artifact_dir:
+          tasks_dir = os.path.join(artifact_dir, ".system_generated", "tasks")
+          try:
+            subprocess.run(["pkill", "-f", tasks_dir], check=False, timeout=1.0)
+          except Exception:
+            pass
+
+        enrich_handoff_summary_files(
+            artifact_dir, transcript_path, workspace_paths
+        )
 
       if "agentapi" in cmd and not re.match(
           r"^\s*(?:python3?|grep|egrep|fgrep|rg|git\s+grep|echo|cat)\b", cmd

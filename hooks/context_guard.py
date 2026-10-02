@@ -293,8 +293,17 @@ def build_agentapi_prefix(
   )
 
 
+def is_handoff_launch_command(cmd: str) -> bool:
+  """Returns True if cmd invokes `agentapi new-conversation` or `chat_lifecycle.py handoff`."""
+  if "agentapi" in cmd and "new-conversation" in cmd:
+    return True
+  if re.search(r"\bchat_lifecycle\.py\s+handoff\b", cmd):
+    return True
+  return False
+
+
 def get_handoff_launch_step_in_turn(transcript_path: str) -> int:
-  """Returns step_index where PLANNER_RESPONSE actually succeeded running agentapi new-conversation in this turn, or -1."""
+  """Returns step_index where PLANNER_RESPONSE actually succeeded launching a handoff chat in this turn, or -1."""
   turn_steps = parse_current_turn_steps(transcript_path)
   launch_idx = -1
   pending_launch_idx = None
@@ -305,16 +314,18 @@ def get_handoff_launch_step_in_turn(transcript_path: str) -> int:
       for tc in step.get("tool_calls") or []:
         if tc.get("name") == "run_command":
           cmd = str((tc.get("args") or {}).get("CommandLine", ""))
-          if "agentapi" in cmd and "new-conversation" in cmd:
+          if is_handoff_launch_command(cmd):
             pending_launch_idx = idx
     elif stype == "GENERIC" and pending_launch_idx is not None:
       content = str(step.get("content", ""))
       if "\nFile Path: " in content[:200]:
         continue
+      m = EXIT_CODE_RE.search(content[:300])
       if (
           step.get("status") == "DONE"
-          and "The command exited with code 0." in content[:300]
-          and '"newConversation"' in content
+          and m
+          and int(m.group(1)) == 0
+          and ('"newConversation"' in content or '"new_conversation_id"' in content)
       ):
         launch_idx = pending_launch_idx
         pending_launch_idx = None
@@ -504,7 +515,8 @@ def main() -> None:
     reminder_msg = (
         f"[CONTEXT GUARD REMINDER] You have NOT completed the handoff yet! "
         f"IMMEDIATELY stop all other investigation/debugging actions and launch the continuation chat:\n"
-        f'   `python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff {conv_id} "{handoff_file}"`\n'
+        f"{step1_text}"
+        f'   `python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff {conv_id} "{handoff_file}" --next "<1-line summary of next immediate action>"`\n'
         f"After receiving `new_conversation_id`, immediately finish your turn and provide a clickable link to the user: "
         f"`[👉 {new_title}](conversation://<new_conversation_id>)`."
     )
@@ -605,7 +617,7 @@ def main() -> None:
         f"   - Exact next step to resume from;\n"
         f"   - Link `[Previous Conversation](conversation://{conv_id})`.\n"
         f"3. SIMULTANEOUSLY (in the same step or immediately next) launch the new conversation via run_command:\n"
-        f'   `python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff {conv_id} "{handoff_file}"`\n'
+        f'   `python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff {conv_id} "{handoff_file}" --next "<1-line summary of next immediate action>"`\n'
         f"4. Immediately finish your turn, explain to the user which safe checkpoint you stopped at, and provide the link: "
         f"`[👉 {new_title}](conversation://<new_conversation_id>)`."
     )
@@ -619,7 +631,7 @@ def main() -> None:
         f"recording: task goal, key decisions made, modified files, "
         f"current status, next steps, and a link `[Previous Conversation](conversation://{conv_id})`.\n"
         f"3. Call `run_command` to launch the new conversation:\n"
-        f'   `python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff {conv_id} "{handoff_file}"`\n'
+        f'   `python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff {conv_id} "{handoff_file}" --next "<1-line summary of next immediate action>"`\n'
         f"4. At the very end of your response to the user, include a prominent clickable link "
         f"to the new conversation: `[👉 {new_title}](conversation://<new_conversation_id>)`."
     )

@@ -222,7 +222,9 @@ def analyze_current_turn(transcript_path: str) -> dict:
             last_edited_file = target.strip().strip('"').strip("'")
         elif tname == "run_command":
           cmd = str(targs.get("CommandLine", ""))
-          if "agentapi" in cmd and "new-conversation" in cmd:
+          if ("agentapi" in cmd and "new-conversation" in cmd) or re.search(
+              r"\bchat_lifecycle\.py\s+handoff\b", cmd
+          ):
             pending_new_conv_cmd = True
           elif is_inspection_command(cmd):
             continue
@@ -240,7 +242,7 @@ def analyze_current_turn(transcript_path: str) -> dict:
             pending_new_conv_cmd
             and last_cmd_exit_code == 0
             and step.get("status") == "DONE"
-            and '"newConversation"' in content
+            and ('"newConversation"' in content or '"new_conversation_id"' in content)
         ):
           launched_new_conv = True
           pending_new_conv_cmd = False
@@ -304,17 +306,13 @@ def main() -> None:
     return
 
   # If a handoff was triggered in this turn and the agent tries to stop without
-  # having called agentapi new-conversation, block once and force the launch!
+  # having launched the continuation conversation, block once and force the launch!
   if state.get("pending_handoff_launch") and not state.get(
       "stop_blocked_handoff"
   ):
     state["stop_blocked_handoff"] = True
     save_state(state_path, state)
     new_title = state.get("pending_title") or "[handoff]"
-    cmd_prefix = (
-        state.get("pending_cmd_prefix")
-        or "env -u ANTIGRAVITY_SOURCE_METADATA agentapi new-conversation"
-    )
     short_id = conv_id[:8] if conv_id else "unknown"
     default_handoff = (
         os.path.join(artifact_dir, f"handoff_summary_{short_id}.md")
@@ -325,11 +323,7 @@ def main() -> None:
     reason = (
         f"[HANDOFF GUARD] You prepared the summary `{handoff_file}`, but attempted to finish your turn "
         f"WITHOUT launching the continuation conversation! Call `run_command`:\n"
-        f'`OUT=$({cmd_prefix} --model=pro --title="{new_title}" '
-        f'"Continuing unfinished task from previous conversation (conversation://{conv_id}), interrupted due to context limits. '
-        f"Read {handoff_file} via view_file, review completed steps and discarded hypotheses, and continue from the next step.\") && "
-        f'ID=$(printf \'%s\' "$OUT" | grep -o \'"conversationId": *"[^"]*"\' | cut -d\'"\' -f4) && '
-        f'echo "ID=$ID" && agentapi get-conversation-metadata "$ID" | grep -E \'"sourceMetadata"\'`\n'
+        f'   `python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff {conv_id} "{handoff_file}" --next "<1-line summary of next immediate action>"`\n'
         f"and provide the link `[👉 {new_title}](conversation://<new_conversation_id>)` to the user."
     )
     print(
