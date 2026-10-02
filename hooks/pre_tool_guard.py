@@ -110,6 +110,11 @@ def strip_heredocs(cmd: str) -> str:
   return HEREDOC_RE.sub(r"<<\3 [heredoc body stripped]", cmd)
 
 
+def _clean_cmd_token(tok: str) -> str:
+  cleaned = re.sub(r"^(?:[A-Za-z_][A-Za-z0-9_]*=)?[\$\(`]+", "", tok)
+  return os.path.basename(cleaned)
+
+
 def count_agentapi_new_conversation_launches(cmd: str) -> int:
   """Number of real `agentapi new-conversation` invocations in the command line.
 
@@ -124,7 +129,7 @@ def count_agentapi_new_conversation_launches(cmd: str) -> int:
     return len(AGENTAPI_NEW_CONV_RE.findall(cmd))
   n = 0
   for tok, nxt in zip(tokens, tokens[1:]):
-    if os.path.basename(tok.lstrip("$(`")) == "agentapi" and nxt == "new-conversation":
+    if _clean_cmd_token(tok) == "agentapi" and nxt == "new-conversation":
       n += 1
   return n
 
@@ -148,7 +153,7 @@ def count_chat_lifecycle_handoff_launches(cmd: str) -> int:
     return len(CHAT_LIFECYCLE_HANDOFF_RE.findall(cmd))
   n = 0
   for tok, nxt in zip(tokens, tokens[1:]):
-    if os.path.basename(tok.lstrip("$(`")) == "chat_lifecycle.py" and nxt == "handoff":
+    if _clean_cmd_token(tok) == "chat_lifecycle.py" and nxt == "handoff":
       n += 1
   return n
 

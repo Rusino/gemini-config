@@ -484,8 +484,9 @@ def advance_in_progress_chain(chain_ids: list[str] = None, current_conv_id: str 
   # 3. Last chat (current active step) -> ⦿
   active_id = chain_ids[-1]
   cur_active = get_conversation_title(active_id)
+  t_active = extract_time_prefix(cur_active, now_time)
   base_active = clean_base_title(cur_active) or base_topic
-  update_conversation_title(active_id, f"[{now_time}] {MARKER_ACTIVE} {base_active}")
+  update_conversation_title(active_id, f"[{t_active}] {MARKER_ACTIVE} {base_active}")
   updated.append(active_id)
 
   return updated
@@ -683,8 +684,10 @@ def create_handoff(
   # 6. Verify sourceMetadata (lives under metadata.sourceMetadata; null => visible in the sidebar)
   fetched, source_meta = get_conversation_source_metadata(new_cid)
 
-  # 7. Advance lifecycle markers across the chain
-  advance_in_progress_chain(current_conv_id=new_cid)
+  # 7. Advance lifecycle markers across the chain.
+  # Pass [current_conv_id, new_cid] explicitly because SendUserCascadeMessage is
+  # non-blocking and brain/<new_cid>/.../transcript.jsonl may not exist on disk yet.
+  advance_in_progress_chain(chain_ids=[current_conv_id, new_cid])
 
   return {
       "new_conversation_id": new_cid,
@@ -829,12 +832,16 @@ if __name__ == "__main__":
     new_t = set_conversation_topic(cid, topic, marker)
     print(f"Updated title for {cid}: {new_t}")
   elif len(sys.argv) > 1 and sys.argv[1] == "summary-path":
-    cid = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("CONVERSATION_ID", "")
+    cid = sys.argv[2] if len(sys.argv) > 2 else (
+        os.environ.get("CONVERSATION_ID", "") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID", "")
+    )
     topic = sys.argv[3] if len(sys.argv) > 3 else ""
     p = get_handoff_summary_path(cid, topic)
     print(p)
   elif len(sys.argv) > 1 and sys.argv[1] == "status":
-    cid = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("CONVERSATION_ID", "")
+    cid = sys.argv[2] if len(sys.argv) > 2 else (
+        os.environ.get("CONVERSATION_ID", "") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID", "")
+    )
     info = get_chain_status(cid)
     print(json.dumps(info, ensure_ascii=False, indent=2))
   elif len(sys.argv) > 1 and sys.argv[1] == "model":
@@ -880,7 +887,7 @@ if __name__ == "__main__":
       else:
         i += 1
     if not cid:
-      cid = os.environ.get("CONVERSATION_ID", "")
+      cid = os.environ.get("CONVERSATION_ID", "") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID", "")
     result = create_handoff(cid, summary_file=summary, notes=notes, next_step_prompt=next_step, exact_model=exact_model)
     print(json.dumps(result, ensure_ascii=False, indent=2))
   elif len(sys.argv) > 2 and sys.argv[1] == "reopen":

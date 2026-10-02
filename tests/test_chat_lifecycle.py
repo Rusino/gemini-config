@@ -262,7 +262,7 @@ class TestChatLifecycle(unittest.TestCase):
 
       mock_meta_res = unittest.mock.MagicMock()
       mock_meta_res.returncode = 0
-      mock_meta_res.stdout = '{"sourceMetadata": null}'
+      mock_meta_res.stdout = '{"response": {"conversationMetadata": {"metadata": {"sourceMetadata": null}}}}'
 
       def fake_run(cmd, **kwargs):
         if "new-conversation" in cmd:
@@ -273,8 +273,9 @@ class TestChatLifecycle(unittest.TestCase):
 
       with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
            patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=False), \
+           patch.object(chat_lifecycle, "ls_rpc", side_effect=RuntimeError("offline in test")), \
            patch.object(chat_lifecycle, "get_current_time_str", return_value="15:45"), \
-           patch("subprocess.run", side_effect=fake_run) as mock_subproc:
+           patch("subprocess.run", side_effect=fake_run):
 
         summary_file = os.path.join(tmp_dir, "brain", "parent-1", "handoff_summary.md")
         res = chat_lifecycle.create_handoff(
@@ -286,6 +287,51 @@ class TestChatLifecycle(unittest.TestCase):
         self.assertEqual(res["new_conversation_id"], "child-2")
         self.assertTrue(res["verified_visible"])
         self.assertTrue(os.path.isfile(summary_file))
+        # Parent must advance from ⦿ to ▸ even though child-2 has no transcript.jsonl yet
+        self.assertEqual(chat_lifecycle.get_conversation_title("parent-1"), "[10:00] ▸ My Feature")
+        self.assertEqual(chat_lifecycle.get_conversation_title("child-2"), "[15:45] ⦿ My Feature")
+
+  def test_create_handoff_multi_step_chain(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      db_path = os.path.join(tmp_dir, chat_lifecycle.SUMMARY_DB_NAME)
+      conn = sqlite3.connect(db_path)
+      with conn:
+        conn.execute(
+            "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, project_id TEXT)"
+        )
+        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?, ?)", ("root-0", "[09:30] ▸ My Feature", "proj-abc"))
+        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?, ?)", ("parent-1", "[10:00] ⦿ My Feature", "proj-abc"))
+      conn.close()
+
+      # Only root-0 and parent-1 have transcripts on disk; child-2 will not have one at handoff time
+      for cid, parent in [("root-0", None), ("parent-1", "root-0")]:
+        log_dir = os.path.join(tmp_dir, "brain", cid, ".system_generated", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        tr_file = os.path.join(log_dir, "transcript.jsonl")
+        content = (
+            f'{{"type": "USER_INPUT", "content": "Continuing work (conversation://{parent})"}}\n'
+            if parent else '{"type": "USER_INPUT", "content": "Initial prompt"}\n'
+        )
+        with open(tr_file, "w", encoding="utf-8") as f:
+          f.write(content)
+
+      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
+           patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=False), \
+           patch.object(chat_lifecycle, "resolve_handoff_model", return_value={"enum": "M1", "id": "m1", "label": "M1", "source": "inherited"}), \
+           patch.object(chat_lifecycle, "start_conversation_exact", return_value="child-2"), \
+           patch.object(chat_lifecycle, "get_conversation_source_metadata", return_value=(True, None)), \
+           patch.object(chat_lifecycle, "get_current_time_str", return_value="15:45"):
+
+        res = chat_lifecycle.create_handoff(
+            current_conv_id="parent-1",
+            notes="Step 1 done",
+            next_step_prompt="Run step 2",
+        )
+        self.assertEqual(res["new_conversation_id"], "child-2")
+        self.assertTrue(res["verified_visible"])
+        self.assertEqual(chat_lifecycle.get_conversation_title("root-0"), "[09:30] ▸ My Feature")
+        self.assertEqual(chat_lifecycle.get_conversation_title("parent-1"), "[10:00] ✓ My Feature")
+        self.assertEqual(chat_lifecycle.get_conversation_title("child-2"), "[15:45] ⦿ My Feature")
 
   def test_get_chain_status(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -339,7 +385,7 @@ class TestChatLifecycle(unittest.TestCase):
       conn.close()
 
       mock_run_res = unittest.mock.MagicMock(returncode=0, stdout='{"conversationId": "child-notes"}')
-      mock_meta_res = unittest.mock.MagicMock(returncode=0, stdout='{"sourceMetadata": null}')
+      mock_meta_res = unittest.mock.MagicMock(returncode=0, stdout='{"response": {"conversationMetadata": {"metadata": {"sourceMetadata": null}}}}')
 
       def fake_run(cmd, **kwargs):
         if "new-conversation" in cmd:
@@ -350,6 +396,7 @@ class TestChatLifecycle(unittest.TestCase):
 
       with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
            patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=False), \
+           patch.object(chat_lifecycle, "ls_rpc", side_effect=RuntimeError("offline in test")), \
            patch.object(chat_lifecycle, "get_current_time_str", return_value="15:55"), \
            patch("subprocess.run", side_effect=fake_run):
 
@@ -363,6 +410,8 @@ class TestChatLifecycle(unittest.TestCase):
         with open(summary_file, "r") as f:
           content = f.read()
         self.assertIn("Completed part 1, now starting part 2", content)
+        self.assertEqual(chat_lifecycle.get_conversation_title("parent-notes"), "[10:00] ▸ Parent Task")
+        self.assertEqual(chat_lifecycle.get_conversation_title("child-notes"), "[15:55] ⦿ Parent Task")
 
   # --- CLI usage -------------------------------------------------------------
 
