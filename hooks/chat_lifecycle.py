@@ -101,6 +101,73 @@ def get_ls_csrf_token(ls_address: str) -> str:
   return ""
 
 
+DEFAULT_PROJECTS_DIR = os.path.expanduser("~/.gemini/config/projects")
+BADGE_RE = re.compile(
+    r"(?:\s*·\s*(?:⟳\s*\d+|⚠\s*\d+)(?:\s+(?:⟳\s*\d+|⚠\s*\d+))*)+$"
+)
+UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+HANDOFF_PARENT_RE = re.compile(
+    r"(?:continu(?:ing|e)\b|продолж(?:аем|и)\b)"
+    r"(?:(?!(?:split out of|separated from|coordinated from))[^\"\n]){0,200}?"
+    r"(?:conversation://|Conversation ID:\s*|/brain/)([a-zA-Z0-9_\-]+)",
+    re.IGNORECASE,
+)
+
+
+def strip_activity_badge(name: str) -> str:
+  if not name:
+    return ""
+  return BADGE_RE.sub("", name).rstrip()
+
+
+def resolve_project_id(
+    project_arg: str, projects_dir: str = ""
+) -> str:
+  """Resolves a project name or UUID against ~/.gemini/config/projects/*.json.
+
+  Matches case-insensitively and ignores live activity badges (e.g. ' · ⟳ 1').
+  """
+  raw = (project_arg or "").strip()
+  if not raw:
+    raise ValueError("Project name or ID must not be empty")
+  if raw.lower() in ("outside-of-project", "unassigned", "none"):
+    return "outside-of-project"
+
+  clean_target = strip_activity_badge(raw).lower()
+  pdir = projects_dir or os.path.expanduser(
+      os.environ.get("ANTIGRAVITY_PROJECTS_DIR", DEFAULT_PROJECTS_DIR)
+  )
+  available_names: list[str] = []
+  if os.path.isdir(pdir):
+    for pfile in sorted(glob.glob(os.path.join(pdir, "*.json"))):
+      try:
+        with open(pfile, "r", encoding="utf-8") as f:
+          pdata = json.load(f)
+        if not isinstance(pdata, dict):
+          continue
+        pid = str(pdata.get("id") or "").strip()
+        pname = strip_activity_badge(str(pdata.get("name") or "").strip())
+        if pname:
+          available_names.append(f"{pname} ({pid})")
+        if pid and pid.lower() == raw.lower():
+          return pid
+        if pid and pname and pname.lower() == clean_target:
+          return pid
+      except (OSError, ValueError):
+        continue
+
+  # Allow raw UUIDs (or any identifier when projects_dir does not exist, e.g. in unit tests)
+  if UUID_RE.match(raw) or not os.path.isdir(pdir):
+    return raw
+
+  avail_str = ", ".join(available_names) if available_names else "none found"
+  raise ValueError(
+      f"Unknown project '{project_arg}'. Available projects: {avail_str}"
+  )
+
+
 def update_conversation_title_rpc(conv_id: str, new_title: str) -> bool:
   """Notifies running Language Server daemon via Connect RPC to update annotations.
 
@@ -118,9 +185,9 @@ def update_conversation_title_rpc(conv_id: str, new_title: str) -> bool:
     url = f"{ls_address}/exa.language_server_pb.LanguageServerService/UpdateConversationAnnotations"
 
   payload = json.dumps({
-      "cascade_id": conv_id,
+      "cascadeIds": [conv_id],
       "annotations": {"title": new_title},
-      "merge_annotations": True,
+      "mergeAnnotations": True,
   }).encode("utf-8")
 
   req = urllib.request.Request(
@@ -393,37 +460,209 @@ def get_parent_conversation_id(conv_id: str) -> str:
     if os.path.isfile(tr_path):
       try:
         with open(tr_path, "r", encoding="utf-8") as f:
-          for line in f:
-            if "USER_INPUT" in line:
-              m = re.search(r"conversation://([a-zA-Z0-9_\-]+)", line)
+          first_line = f.readline()
+          if not first_line:
+            continue
+          try:
+            obj = json.loads(first_line)
+          except ValueError:
+            obj = None
+          if isinstance(obj, dict):
+            if obj.get("type") != "USER_INPUT" or obj.get("step_index", 0) != 0:
+              continue
+            content = str(obj.get("content") or "")
+            m = HANDOFF_PARENT_RE.search(content)
+            if m:
+              return m.group(1)
+          else:
+            if "USER_INPUT" in first_line:
+              m = HANDOFF_PARENT_RE.search(first_line)
               if m:
                 return m.group(1)
-              break
       except Exception:
         pass
   return ""
 
 
-def discover_conversation_chain(conv_id: str) -> list[str]:
-  """Traces backwards through transcripts to the root, returning [root_id, ..., conv_id]."""
+def _is_task_boundary(parent_id: str, child_id: str) -> bool:
+  """Returns True when parent -> child crosses into a distinct named task chain."""
+  title_p = get_conversation_title(parent_id)
+  title_c = get_conversation_title(child_id)
+  base_p = clean_base_title(title_p)
+  base_c = clean_base_title(title_c)
+  if (
+      not base_p
+      or not base_c
+      or base_p == "Investigation"
+      or base_c == "Investigation"
+      or base_p == base_c
+  ):
+    return False
+  parent_closed_end = (
+      MARKER_SINGLE_CLOSED in title_p or MARKER_CLOSED_END in title_p
+  )
+  child_new_root = (
+      MARKER_CLOSED_START in title_c
+      or MARKER_START in title_c
+      or MARKER_SINGLE_CLOSED in title_c
+  )
+  return parent_closed_end or child_new_root
+
+
+def _scan_transcript_graph() -> tuple[dict[str, str], dict[str, list[str]], dict[str, str]]:
+  """Scans brain/*/transcript.jsonl to build (parent_of, children_of, created_at_of)."""
+  parent_of: dict[str, str] = {}
+  children_of: dict[str, list[str]] = {}
+  created_at_of: dict[str, str] = {}
+  for app_dir in find_app_data_dirs():
+    brain_dir = os.path.join(app_dir, "brain")
+    if not os.path.isdir(brain_dir):
+      continue
+    for cid in sorted(os.listdir(brain_dir)):
+      if cid in created_at_of and cid in parent_of:
+        continue
+      tr_path = os.path.join(
+          brain_dir, cid, ".system_generated", "logs", "transcript.jsonl"
+      )
+      if not os.path.isfile(tr_path):
+        continue
+      try:
+        with open(tr_path, "r", encoding="utf-8") as f:
+          first_line = f.readline()
+        if not first_line:
+          continue
+        obj = json.loads(first_line)
+        if not isinstance(obj, dict):
+          continue
+        if obj.get("type") != "USER_INPUT" or obj.get("step_index", 0) != 0:
+          continue
+        ts = str(obj.get("created_at") or "")
+        if ts and cid not in created_at_of:
+          created_at_of[cid] = ts
+        content = str(obj.get("content") or "")
+        m = HANDOFF_PARENT_RE.search(content)
+        if m and cid not in parent_of:
+          pid = m.group(1)
+          parent_of[cid] = pid
+          children_of.setdefault(pid, []).append(cid)
+      except Exception:
+        continue
+  return parent_of, children_of, created_at_of
+
+
+def _order_chain_from_root(
+    root_id: str,
+    children_of: dict[str, list[str]],
+    created_at_of: dict[str, str],
+    respect_boundaries: bool = True,
+) -> list[str]:
+  """Orders a tree rooted at root_id into a linear chain with the active/latest branch last."""
+  memo_max_ts: dict[str, str] = {}
+  memo_has_children: dict[str, bool] = {}
+
+  def _FilteredChildren(nid: str, visited: set[str]) -> list[str]:
+    res = []
+    for ch in children_of.get(nid, []):
+      if ch in visited:
+        continue
+      if respect_boundaries and _is_task_boundary(nid, ch):
+        continue
+      res.append(ch)
+    return res
+
+  def _SubtreeInfo(nid: str, visited: set[str]) -> tuple[str, bool]:
+    if nid in memo_max_ts:
+      return memo_max_ts[nid], memo_has_children[nid]
+    ch_list = _FilteredChildren(nid, visited | {nid})
+    max_ts = created_at_of.get(nid, "")
+    for ch in ch_list:
+      ch_ts, _ = _SubtreeInfo(ch, visited | {nid})
+      if ch_ts > max_ts:
+        max_ts = ch_ts
+    memo_max_ts[nid] = max_ts
+    memo_has_children[nid] = bool(ch_list)
+    return max_ts, bool(ch_list)
+
+  _SubtreeInfo(root_id, set())
+
+  ordered: list[str] = []
+  seen: set[str] = set()
+
+  def _Dfs(nid: str) -> None:
+    if nid in seen:
+      return
+    seen.add(nid)
+    ordered.append(nid)
+    ch_list = _FilteredChildren(nid, seen)
+    ch_list.sort(
+        key=lambda c: (
+            memo_max_ts.get(c, ""),
+            memo_has_children.get(c, False),
+            created_at_of.get(c, ""),
+            c,
+        )
+    )
+    for ch in ch_list:
+      _Dfs(ch)
+
+  _Dfs(root_id)
+  return ordered
+
+
+def discover_conversation_chain(
+    conv_id: str,
+    include_descendants: bool = True,
+    respect_boundaries: bool = True,
+) -> list[str]:
+  """Traces through transcripts to return the full chain [root_id, ..., leaf_id]."""
+  if not conv_id:
+    return []
   chain = []
   curr = conv_id
   seen = set()
   while curr and curr not in seen:
     seen.add(curr)
     chain.append(curr)
-    curr = get_parent_conversation_id(curr)
-  return list(reversed(chain))
+    parent = get_parent_conversation_id(curr)
+    if not parent or (respect_boundaries and _is_task_boundary(parent, curr)):
+      break
+    curr = parent
+  ancestors = list(reversed(chain))
+  if not include_descendants or not ancestors:
+    return ancestors
+
+  _, children_of, created_at_of = _scan_transcript_graph()
+  if not children_of:
+    return ancestors
+
+  root_id = ancestors[0]
+  ordered = _order_chain_from_root(
+      root_id,
+      children_of,
+      created_at_of,
+      respect_boundaries=respect_boundaries,
+  )
+  # Ensure all ancestors are preserved in case any lacked a transcript on disk
+  full_chain: list[str] = []
+  seen_out: set[str] = set()
+  for cid in ancestors + ordered:
+    if cid and cid not in seen_out:
+      seen_out.add(cid)
+      full_chain.append(cid)
+  return full_chain
 
 
 def expand_chain_with_ancestors(chain_ids: list[str]) -> list[str]:
-  """Ensures chain includes any prior ancestors leading up to chain_ids[0]."""
+  """Ensures chain includes any prior ancestors (and descendants if a single ID is passed)."""
   if not chain_ids:
     return []
-  ancestors = discover_conversation_chain(chain_ids[0])
+  include_desc = len(chain_ids) == 1
+  discovered = discover_conversation_chain(
+      chain_ids[0], include_descendants=include_desc
+  )
   full_chain = []
   seen = set()
-  for cid in ancestors + chain_ids:
+  for cid in discovered + chain_ids:
     if cid and cid not in seen:
       seen.add(cid)
       full_chain.append(cid)
@@ -758,6 +997,356 @@ def get_chain_status(conv_id: str) -> dict:
   }
 
 
+def archive_conversations(
+    conv_ids: list[str], include_chain: bool = False
+) -> dict:
+  """Archives conversations via Language Server RPC and updates annotations/<id>.pbtxt."""
+  target_ids: list[str] = []
+  seen: set[str] = set()
+  for cid in conv_ids:
+    if not cid:
+      continue
+    expanded = (
+        discover_conversation_chain(
+            cid, include_descendants=True, respect_boundaries=True
+        )
+        if include_chain
+        else [cid]
+    )
+    for item in expanded:
+      if item and item not in seen:
+        seen.add(item)
+        target_ids.append(item)
+
+  if not target_ids:
+    return {"archived_ids": [], "count": 0, "rpc_ok": False, "disk_ok": False}
+
+  rpc_ok = False
+  try:
+    ls_rpc(
+        "UpdateConversationAnnotations",
+        {
+            "cascadeIds": target_ids,
+            "annotations": {"archived": True},
+            "mergeAnnotations": True,
+        },
+    )
+    rpc_ok = True
+  except Exception:
+    pass
+
+  disk_ok = False
+  for app_dir in find_app_data_dirs():
+    ann_dir = os.path.join(app_dir, ANNOTATIONS_DIR_NAME)
+    try:
+      os.makedirs(ann_dir, exist_ok=True)
+    except OSError:
+      continue
+    for cid in target_ids:
+      ann_file = os.path.join(ann_dir, f"{cid}.pbtxt")
+      try:
+        if os.path.isfile(ann_file):
+          with open(ann_file, "r", encoding="utf-8") as f:
+            content = f.read()
+          if re.search(r"\barchived\s*:\s*(?:true|false)", content):
+            new_content = re.sub(
+                r"\barchived\s*:\s*(?:true|false)", "archived:true", content
+            )
+          else:
+            new_content = f"{content.rstrip()}  archived:true\n"
+        else:
+          new_content = "archived:true\n"
+        with open(ann_file, "w", encoding="utf-8") as f:
+          f.write(new_content)
+        disk_ok = True
+      except OSError:
+        pass
+
+  return {
+      "archived_ids": target_ids,
+      "count": len(target_ids),
+      "rpc_ok": rpc_ok,
+      "disk_ok": disk_ok,
+  }
+
+
+def _fetch_ls_summaries_for_audit() -> dict | None:
+  """Fetches trajectory summaries from the Language Server if reachable."""
+  try:
+    import project_activity_badge as pab  # pylint: disable=g-import-not-at-top
+    res = pab.fetch_trajectories()
+    if res is not None:
+      return res
+  except Exception:
+    pass
+  try:
+    resp = ls_rpc("GetAllCascadeTrajectories", {"excludeSubtrajectories": True})
+    if isinstance(resp, dict) and "trajectorySummaries" in resp:
+      return resp.get("trajectorySummaries") or {}
+  except Exception:
+    pass
+  return None
+
+
+def _iso_to_hhmm(iso_str: str) -> str:
+  if not iso_str:
+    return ""
+  try:
+    clean = iso_str.strip()
+    if clean.endswith("Z"):
+      clean = clean[:-1] + "+00:00"
+    # Trim nanoseconds to microseconds if present
+    clean = re.sub(r"\.(\d{6})\d+", r".\1", clean)
+    dt = datetime.fromisoformat(clean)
+    tz = ZoneInfo(DEFAULT_TIMEZONE)
+    return dt.astimezone(tz).strftime("%H:%M")
+  except Exception:
+    return ""
+
+
+def audit_conversations(
+    fix: bool = False,
+    project_filter: str = "",
+    projects_dir: str = "",
+) -> dict:
+  """Scans top-level conversations and chains for marker/format errors and storage desync.
+
+  Checks synchronization across:
+  1. Language Server RPC (live in-memory store / sidebar stream)
+  2. ~/.gemini/{jetski,antigravity}/annotations/<id>.pbtxt
+  3. conversation_summaries.db
+  And verifies Scheme Γ lifecycle markers across all visible handoff chains.
+  """
+  target_project_id = ""
+  if project_filter:
+    target_project_id = resolve_project_id(
+        project_filter, projects_dir=projects_dir
+    )
+
+  ls_summaries = _fetch_ls_summaries_for_audit()
+  ls_online = ls_summaries is not None
+
+  pbtxt_titles: dict[str, str] = {}
+  archived_on_disk: set[str] = set()
+  db_titles: dict[str, str] = {}
+  db_projects: dict[str, str] = {}
+
+  for app_dir in find_app_data_dirs():
+    ann_dir = os.path.join(app_dir, ANNOTATIONS_DIR_NAME)
+    if os.path.isdir(ann_dir):
+      for fn in sorted(os.listdir(ann_dir)):
+        if not fn.endswith(".pbtxt"):
+          continue
+        cid = fn[:-6]
+        try:
+          with open(os.path.join(ann_dir, fn), "r", encoding="utf-8") as f:
+            txt = f.read()
+          if re.search(r"\barchived\s*:\s*true\b", txt):
+            archived_on_disk.add(cid)
+          m = re.search(r'title:\s*"([^"]*)"', txt)
+          if m and cid not in pbtxt_titles:
+            pbtxt_titles[cid] = m.group(1).strip()
+        except OSError:
+          pass
+
+    db_file = os.path.join(app_dir, SUMMARY_DB_NAME)
+    if os.path.isfile(db_file):
+      try:
+        conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=2.0)
+        cur = conn.cursor()
+        try:
+          cur.execute(
+              "SELECT conversation_id, title, project_id FROM conversation_summaries"
+          )
+          for cid, title, pid in cur.fetchall():
+            if cid not in db_titles and title:
+              db_titles[cid] = str(title).strip()
+            if cid not in db_projects and pid:
+              db_projects[cid] = str(pid).strip()
+        except sqlite3.OperationalError:
+          cur.execute("SELECT conversation_id, title FROM conversation_summaries")
+          for cid, title in cur.fetchall():
+            if cid not in db_titles and title:
+              db_titles[cid] = str(title).strip()
+        conn.close()
+      except Exception:
+        pass
+
+  raw_parent, _, created_at_of = _scan_transcript_graph()
+
+  # Determine visible top-level conversations
+  visible_ids: set[str] = set()
+  ls_titles: dict[str, str] = {}
+  ls_projects: dict[str, str] = {}
+  if ls_online and ls_summaries is not None:
+    for cid, s in ls_summaries.items():
+      if not isinstance(s, dict):
+        continue
+      ann = s.get("annotations") or {}
+      if ann.get("archived") or cid in archived_on_disk:
+        continue
+      meta = s.get("trajectoryMetadata") or {}
+      if meta.get("parentConversationId") or meta.get("isBattleModeFork"):
+        continue
+      if (meta.get("sourceMetadata") or {}).get("tool"):
+        continue
+      visible_ids.add(cid)
+      ls_t = str(ann.get("title") or s.get("summary") or "").strip()
+      ls_titles[cid] = ls_t
+      pid = str(meta.get("projectId") or "").strip()
+      if pid:
+        ls_projects[cid] = pid
+      cat = str(meta.get("createdAt") or "").strip()
+      if cat:
+        created_at_of[cid] = cat
+  else:
+    for cid in set(pbtxt_titles.keys()) | set(db_titles.keys()):
+      if cid not in archived_on_disk:
+        visible_ids.add(cid)
+
+  def _BestTitle(cid: str) -> str:
+    return (
+        pbtxt_titles.get(cid)
+        or db_titles.get(cid)
+        or ls_titles.get(cid)
+        or get_conversation_title(cid)
+        or ""
+    )
+
+  def _ProjectOf(cid: str) -> str:
+    pid = ls_projects.get(cid) or db_projects.get(cid) or "outside-of-project"
+    return pid if pid else "outside-of-project"
+
+  # Build visible handoff chains (linking each visible chat to its nearest visible ancestor
+  # in the same task chain).
+  vis_parent: dict[str, str] = {}
+  vis_children: dict[str, list[str]] = {}
+  for cid in sorted(visible_ids):
+    curr = raw_parent.get(cid)
+    my_topic = clean_base_title(_BestTitle(cid))
+    seen_anc = {cid}
+    while curr and curr not in seen_anc:
+      seen_anc.add(curr)
+      if curr in visible_ids:
+        if _is_task_boundary(curr, cid):
+          break
+        p_topic = clean_base_title(_BestTitle(curr))
+        if (
+            p_topic == my_topic
+            or not my_topic
+            or not p_topic
+            or my_topic == "Investigation"
+            or p_topic == "Investigation"
+        ):
+          vis_parent[cid] = curr
+          vis_children.setdefault(curr, []).append(cid)
+          break
+      curr = raw_parent.get(curr)
+
+  roots = sorted(c for c in visible_ids if c not in vis_parent)
+  discrepancies: list[dict] = []
+  fixed_count = 0
+  audited_chains = 0
+  audited_chats = 0
+
+  # Regex for a strictly valid Scheme Γ title: [HH:MM] <single_marker> <non-marker topic>
+  valid_gamma_re = re.compile(
+      r"^\[\d{2}:\d{2}\] (?:▸|✓|⦿|«|‹✓›|»|«») (?!(?:[▸✓⦿«»]|‹✓›|«»)(?:\s|$))\S"
+  )
+
+  for root_id in roots:
+    chain = _order_chain_from_root(
+        root_id, vis_children, created_at_of, respect_boundaries=False
+    )
+    if target_project_id:
+      if not any(_ProjectOf(c) == target_project_id for c in chain):
+        continue
+
+    audited_chains += 1
+    audited_chats += len(chain)
+
+    # Determine chain base topic (for fallback if a node has empty title)
+    chain_topic = "Investigation"
+    for cid in reversed(chain):
+      t = clean_base_title(_BestTitle(cid))
+      if t and t != "Investigation":
+        chain_topic = t
+        break
+
+    tail_title = _BestTitle(chain[-1])
+    finalized = is_finalized_title(tail_title)
+
+    for idx, cid in enumerate(chain):
+      cur_title = _BestTitle(cid)
+      if len(chain) == 1:
+        exp_marker = MARKER_SINGLE_CLOSED if finalized else MARKER_ACTIVE
+      elif idx == 0:
+        exp_marker = MARKER_CLOSED_START if finalized else MARKER_START
+      elif idx == len(chain) - 1:
+        exp_marker = MARKER_CLOSED_END if finalized else MARKER_ACTIVE
+      else:
+        exp_marker = MARKER_CLOSED_STEP if finalized else MARKER_STEP
+
+      fallback_hhmm = _iso_to_hhmm(created_at_of.get(cid, "")) or get_current_time_str()
+      ts = extract_time_prefix(cur_title, fallback_hhmm)
+      base = clean_base_title(cur_title) or chain_topic
+      expected_title = f"[{ts}] {exp_marker} {base}"
+
+      pb_t = pbtxt_titles.get(cid, "")
+      db_t = db_titles.get(cid, "")
+      ls_t = ls_titles.get(cid, "") if ls_online else ""
+
+      issues: list[str] = []
+      if cur_title != expected_title or not valid_gamma_re.match(cur_title):
+        issues.append("marker_mismatch")
+
+      if ls_online and ls_t != expected_title and not valid_gamma_re.match(ls_t):
+        if "marker_mismatch" not in issues:
+          issues.append("ls_marker_mismatch")
+
+      present_stores = [t for t in (pb_t, db_t) if t]
+      if ls_online:
+        present_stores.append(ls_t)
+      if (
+          len(set(present_stores)) > 1
+          or (pb_t and pb_t != expected_title)
+          or (db_t and db_t != expected_title)
+          or (ls_online and ls_t != expected_title)
+      ):
+        if (pb_t != db_t) or (ls_online and ls_t != pb_t):
+          issues.append("storage_desync")
+        elif not issues:
+          issues.append("storage_desync")
+
+      if issues:
+        is_fixed = False
+        if fix:
+          is_fixed = update_conversation_title(cid, expected_title)
+          if is_fixed:
+            fixed_count += 1
+        discrepancies.append({
+            "conversation_id": cid,
+            "project_id": _ProjectOf(cid),
+            "chain_position": f"{idx + 1}/{len(chain)}",
+            "issues": issues,
+            "ls_title": ls_t if ls_online else None,
+            "pbtxt_title": pb_t or None,
+            "db_title": db_t or None,
+            "expected_title": expected_title,
+            "fixed": is_fixed,
+        })
+
+  return {
+      "ls_online": ls_online,
+      "project_filter": target_project_id or None,
+      "total_visible_chats": audited_chats,
+      "total_chains": audited_chains,
+      "issues_count": len(discrepancies),
+      "fixed_count": fixed_count,
+      "discrepancies": discrepancies,
+  }
+
+
 USAGE = """\
 chat_lifecycle.py — deterministic chat lifecycle CLI (titles, handoffs, chains).
 
@@ -779,6 +1368,13 @@ Commands:
                                       --model pins one explicitly.
   model [id]                          Read-only: show the model <id> last used and the
                                       model a handoff would pick now.
+  audit [--fix] [--project <p>]       Scan visible top-level chats and handoff chains
+                                      for storage desync (LS RPC vs .pbtxt vs SQLite)
+                                      and broken/double Scheme Γ markers. With --fix,
+                                      repairs all discrepancies via update_conversation_title.
+  archive <id...> [--chain]           Archive the specified conversation(s) (or their
+                                      entire handoff chain with --chain) via LS RPC
+                                      and annotations/<id>.pbtxt.
   finalize <id>                       Close the whole chain. USER-ONLY: run it
                                       only on the user's explicit word ("финал").
                                       Timestamps are preserved.
@@ -789,7 +1385,7 @@ Internal (used by hooks; do not run manually):
   advance <id> [<id>...]              Recompute in-progress markers for a chain.
 
 Notes:
-  * <id> may be any conversation of the chain for finalize/reopen/status.
+  * <id> may be any conversation of the chain for finalize/reopen/status/archive --chain.
   * When <id> is omitted, $CONVERSATION_ID is used (set inside the agent's
     run_command only).
   * Markers (▸ ✓ ⦿ « ‹✓› » «») are derived mechanically from the chain; never
@@ -808,7 +1404,17 @@ def print_usage(stream=None) -> None:
 
 
 KNOWN_COMMANDS = (
-    "set", "set-title", "summary-path", "status", "model", "handoff", "reopen", "advance", "finalize",
+    "set",
+    "set-title",
+    "summary-path",
+    "status",
+    "model",
+    "handoff",
+    "reopen",
+    "advance",
+    "finalize",
+    "audit",
+    "archive",
 )
 
 
@@ -890,6 +1496,39 @@ if __name__ == "__main__":
       cid = os.environ.get("CONVERSATION_ID", "") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID", "")
     result = create_handoff(cid, summary_file=summary, notes=notes, next_step_prompt=next_step, exact_model=exact_model)
     print(json.dumps(result, ensure_ascii=False, indent=2))
+  elif len(sys.argv) > 1 and sys.argv[1] == "audit":
+    args = sys.argv[2:]
+    do_fix = False
+    proj_filter = ""
+    i = 0
+    while i < len(args):
+      if args[i] == "--fix":
+        do_fix = True
+        i += 1
+      elif args[i] in ("--project", "--project-id") and i + 1 < len(args):
+        proj_filter = args[i + 1]
+        i += 2
+      elif args[i].startswith("--project=") or args[i].startswith("--project-id="):
+        proj_filter = args[i].split("=", 1)[1]
+        i += 1
+      else:
+        i += 1
+    report = audit_conversations(fix=do_fix, project_filter=proj_filter)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+  elif len(sys.argv) > 1 and sys.argv[1] == "archive":
+    args = sys.argv[2:]
+    inc_chain = False
+    cids_to_archive: list[str] = []
+    for a in args:
+      if a == "--chain":
+        inc_chain = True
+      elif not a.startswith("-"):
+        cids_to_archive.append(a)
+    if not cids_to_archive:
+      print("chat_lifecycle.py archive: at least one conversation ID is required", file=sys.stderr)
+      sys.exit(2)
+    res = archive_conversations(cids_to_archive, include_chain=inc_chain)
+    print(json.dumps(res, ensure_ascii=False, indent=2))
   elif len(sys.argv) > 2 and sys.argv[1] == "reopen":
     cid = sys.argv[2]
     reopen_conversation(cid, force=True)
@@ -905,3 +1544,4 @@ if __name__ == "__main__":
       finalize_conversation_chain(cids[0])
     else:
       finalize_conversation_chain(cids[0] if cids else "", cids)
+

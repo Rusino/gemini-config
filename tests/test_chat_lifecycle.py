@@ -413,10 +413,138 @@ class TestChatLifecycle(unittest.TestCase):
         self.assertEqual(chat_lifecycle.get_conversation_title("parent-notes"), "[10:00] ▸ Parent Task")
         self.assertEqual(chat_lifecycle.get_conversation_title("child-notes"), "[15:55] ⦿ Parent Task")
 
+  def test_discover_chain_descendants_and_ignore_split_outs(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      # c1 -> c2 -> c3 (handoffs), plus split-1 ("split out of conversation://c1") and sub-1 (SYSTEM_MESSAGE)
+      entries = [
+          ("c1", '{"type": "USER_INPUT", "step_index": 0, "content": "Initial prompt"}\n'),
+          ("c2", '{"type": "USER_INPUT", "step_index": 0, "content": "Continuing work from previous conversation (conversation://c1)"}\n'),
+          ("c3", '{"type": "USER_INPUT", "step_index": 0, "content": "Продолжаем работу из предыдущего чата (conversation://c2)"}\n'),
+          ("split-1", '{"type": "USER_INPUT", "step_index": 0, "content": "Assigned bug category, split out of conversation://c1"}\n'),
+          ("sub-1", '{"type": "SYSTEM_MESSAGE", "step_index": 0, "content": "Subagent"}\n{"type": "GENERIC", "step_index": 2, "content": "USER_INPUT conversation://c1"}\n'),
+      ]
+      for cid, content in entries:
+        log_dir = os.path.join(tmp_dir, "brain", cid, ".system_generated", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "transcript.jsonl"), "w", encoding="utf-8") as f:
+          f.write(content)
+
+      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]):
+        self.assertEqual(chat_lifecycle.discover_conversation_chain("c1"), ["c1", "c2", "c3"])
+        self.assertEqual(chat_lifecycle.discover_conversation_chain("c2"), ["c1", "c2", "c3"])
+        self.assertEqual(chat_lifecycle.discover_conversation_chain("c3"), ["c1", "c2", "c3"])
+        self.assertEqual(chat_lifecycle.discover_conversation_chain("split-1"), ["split-1"])
+
+  def test_archive_conversations_with_chain(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      ann_dir = os.path.join(tmp_dir, "annotations")
+      os.makedirs(ann_dir, exist_ok=True)
+      with open(os.path.join(ann_dir, "c1.pbtxt"), "w", encoding="utf-8") as f:
+        f.write('title:"[10:00] « тест"\n')
+
+      for cid, parent in [("c1", None), ("c2", "c1")]:
+        log_dir = os.path.join(tmp_dir, "brain", cid, ".system_generated", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "transcript.jsonl"), "w", encoding="utf-8") as f:
+          if parent:
+            f.write(f'{{"type": "USER_INPUT", "step_index": 0, "content": "Continuing work (conversation://{parent})"}}\n')
+          else:
+            f.write('{"type": "USER_INPUT", "step_index": 0, "content": "Start"}\n')
+
+      rpc_calls = []
+
+      def fake_ls_rpc(method, body, timeout=20.0):
+        rpc_calls.append((method, body))
+        return {}
+
+      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
+           patch.object(chat_lifecycle, "ls_rpc", side_effect=fake_ls_rpc):
+        res = chat_lifecycle.archive_conversations(["c1"], include_chain=True)
+        self.assertEqual(res["archived_ids"], ["c1", "c2"])
+        self.assertEqual(res["count"], 2)
+        self.assertTrue(res["rpc_ok"])
+        self.assertTrue(res["disk_ok"])
+        self.assertEqual(len(rpc_calls), 1)
+        self.assertEqual(rpc_calls[0][0], "UpdateConversationAnnotations")
+        self.assertEqual(rpc_calls[0][1]["cascadeIds"], ["c1", "c2"])
+        self.assertEqual(rpc_calls[0][1]["annotations"], {"archived": True})
+
+        with open(os.path.join(ann_dir, "c1.pbtxt"), "r", encoding="utf-8") as f:
+          self.assertIn("archived:true", f.read())
+        with open(os.path.join(ann_dir, "c2.pbtxt"), "r", encoding="utf-8") as f:
+          self.assertIn("archived:true", f.read())
+
+  def test_audit_conversations_detects_and_fixes_issues(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      ann_dir = os.path.join(tmp_dir, "annotations")
+      os.makedirs(ann_dir, exist_ok=True)
+
+      # Chain c1 -> c2:
+      # c1 has wrong intermediate marker ‹✓› instead of «
+      # c2 has correct disk title "[13:14] » Moving Chats", but LS RPC has double marker "[13:08] » ⦿ Moving Chats"
+      with open(os.path.join(ann_dir, "c1.pbtxt"), "w", encoding="utf-8") as f:
+        f.write('title:"[13:00] ‹✓› Moving Chats"\n')
+      with open(os.path.join(ann_dir, "c2.pbtxt"), "w", encoding="utf-8") as f:
+        f.write('title:"[13:14] » Moving Chats"\n')
+
+      db_path = os.path.join(tmp_dir, chat_lifecycle.SUMMARY_DB_NAME)
+      conn = sqlite3.connect(db_path)
+      with conn:
+        conn.execute(
+            "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, project_id TEXT)"
+        )
+        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?, ?)", ("c1", "[13:00] ‹✓› Moving Chats", "proj-1"))
+        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?, ?)", ("c2", "[13:14] » Moving Chats", "proj-1"))
+      conn.close()
+
+      for cid, parent in [("c1", None), ("c2", "c1")]:
+        log_dir = os.path.join(tmp_dir, "brain", cid, ".system_generated", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "transcript.jsonl"), "w", encoding="utf-8") as f:
+          if parent:
+            f.write(f'{{"type": "USER_INPUT", "step_index": 0, "content": "Continuing work (conversation://{parent})"}}\n')
+          else:
+            f.write('{"type": "USER_INPUT", "step_index": 0, "content": "Start"}\n')
+
+      fake_ls_summaries = {
+          "c1": {
+              "summary": "[13:00] ‹✓› Moving Chats",
+              "annotations": {"title": "[13:00] ‹✓› Moving Chats"},
+              "trajectoryMetadata": {"projectId": "proj-1", "createdAt": "2026-10-01T17:00:00Z"},
+          },
+          "c2": {
+              "summary": "[13:08] » ⦿ Moving Chats",
+              "annotations": {"title": "[13:08] » ⦿ Moving Chats"},
+              "trajectoryMetadata": {"projectId": "proj-1", "createdAt": "2026-10-01T17:14:00Z"},
+          },
+      }
+
+      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
+           patch.object(chat_lifecycle, "_fetch_ls_summaries_for_audit", return_value=fake_ls_summaries), \
+           patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=True):
+        # 1. Dry-run audit (fix=False)
+        report = chat_lifecycle.audit_conversations(fix=False)
+        self.assertEqual(report["total_visible_chats"], 2)
+        self.assertEqual(report["total_chains"], 1)
+        self.assertEqual(report["issues_count"], 2)
+        self.assertEqual(report["fixed_count"], 0)
+
+        by_cid = {d["conversation_id"]: d for d in report["discrepancies"]}
+        self.assertIn("marker_mismatch", by_cid["c1"]["issues"])
+        self.assertEqual(by_cid["c1"]["expected_title"], "[13:00] « Moving Chats")
+        self.assertIn("storage_desync", by_cid["c2"]["issues"])
+        self.assertEqual(by_cid["c2"]["expected_title"], "[13:14] » Moving Chats")
+
+        # 2. Fix mode (fix=True)
+        fix_report = chat_lifecycle.audit_conversations(fix=True)
+        self.assertEqual(fix_report["fixed_count"], 2)
+        self.assertEqual(chat_lifecycle.get_conversation_title("c1"), "[13:00] « Moving Chats")
+        self.assertEqual(chat_lifecycle.get_conversation_title("c2"), "[13:14] » Moving Chats")
+
   # --- CLI usage -------------------------------------------------------------
 
   SCRIPT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "hooks", "chat_lifecycle.py"))
-  PUBLIC_COMMANDS = ("status", "set-title", "summary-path", "handoff", "finalize", "reopen")
+  PUBLIC_COMMANDS = ("status", "set-title", "summary-path", "handoff", "audit", "archive", "finalize", "reopen")
 
   def _run_cli(self, *args):
     import subprocess

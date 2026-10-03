@@ -49,6 +49,10 @@ Use only these commands (`python3 ~/.gemini/config/hooks/chat_lifecycle.py ...`)
 | `finalize <id>` | **Only** when the user explicitly says *"финал"* (or an unambiguous equivalent). Preserves original timestamps, swaps markers. |
 | `status [id]` | User asks about the chain / which chats belong to the task / where summaries are. |
 | `model [id]` | User asks which model a chat runs on or which model a continuation would get. Read-only. |
+| `audit [--fix] [--project <id\|name>]` | Scan top-level chats and chains for title desync (LS RPC vs `.pbtxt` vs SQLite) or broken Scheme Γ markers; `--fix` repairs them. |
+| `archive <id...> [--chain]` | Archive specified chats (or their full handoff chain with `--chain`) via LS RPC and `.pbtxt`. |
+
+For moving chats or whole chains between projects (or listing unassigned chats), use `python3 ~/.gemini/config/scripts/move_chats_to_project.py --project "<name_or_id>" [--chain] <id...>` or `--list-unassigned`.
 
 Strict rules:
 - **Never** ask the user whether to finalize. No "Пометить разбор как финальный?" prompts. Finalization happens only on the user's explicit word.
