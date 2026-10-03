@@ -1,7 +1,6 @@
 ---
 description: C++ systems programming invariants (RAII, zero-allocation hot paths, type bifurcation, loop guards, ABI stability).
-trigger: glob
-globs: "**/*.h,**/*.hpp,**/*.cc,**/*.cpp"
+trigger: always_on
 ---
 # C++ Systems Invariants
 
