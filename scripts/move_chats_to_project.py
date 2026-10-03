@@ -491,15 +491,61 @@ def format_unassigned_report(items: list[dict]) -> str:
   return "\n".join(lines)
 
 
+def get_running_conversations() -> list[tuple[str, str]]:
+  """Returns (cid, title) for conversations currently in RUNNING status in LS."""
+  summaries = chat_lifecycle._fetch_ls_summaries_for_audit()
+  if not summaries:
+    return []
+  running: list[tuple[str, str]] = []
+  for cid, info in summaries.items():
+    if not isinstance(info, dict):
+      continue
+    status = str(info.get("status") or "")
+    if "RUNNING" in status:
+      ann = info.get("annotations") or {}
+      title = str(ann.get("title") or info.get("summary") or "").strip()
+      running.append((cid, title))
+  return sorted(running)
+
+
+def wait_for_idle_ls(
+    poll_sec: float = 3.0,
+    required_quiet_checks: int = 2,
+    max_wait_sec: float = 3600.0,
+) -> bool:
+  """Blocks until no conversation is RUNNING in LS for required_quiet_checks polls."""
+  import time  # pylint: disable=g-import-not-at-top
+
+  deadline = time.monotonic() + max_wait_sec
+  quiet = 0
+  while time.monotonic() < deadline:
+    running = get_running_conversations()
+    if not running:
+      quiet += 1
+      if quiet >= required_quiet_checks:
+        print("[INFO] All conversations are idle; proceeding with hub restart.")
+        sys.stdout.flush()
+        return True
+    else:
+      quiet = 0
+      desc = ", ".join(f"{cid[:8]} ({t or 'untitled'})" for cid, t in running)
+      print(f"[WAIT] Waiting for {len(running)} running chat(s) to finish: {desc}")
+      sys.stdout.flush()
+    time.sleep(poll_sec)
+  print("[WARN] Timed out waiting for running chats to finish.", file=sys.stderr)
+  return False
+
+
 def schedule_offline_migration(
     script_path: str,
     project_id: str,
     conv_ids: list[str],
-    delay_sec: int = 2,
+    delay_sec: int = 3,
 ):
-  """Schedules stopping jetski-hub, applying migrations offline, and restarting it."""
+  """Schedules waiting for idle chats, stopping jetski-hub, migrating offline, and restarting."""
   quoted_cids = " ".join(f"'{cid}'" for cid in conv_ids)
   abs_script = os.path.abspath(script_path)
+  wait_cmd = f"/usr/bin/python3 '{abs_script}' --wait-idle"
   script_cmd = (
       f"/usr/bin/python3 '{abs_script}' --project-id '{project_id}'"
       f" {quoted_cids}"
@@ -507,9 +553,10 @@ def schedule_offline_migration(
   log_file = "/tmp/move_chats_offline.log"
   cmd = (
       f"/bin/bash -c 'sleep {delay_sec} && "
-      f"systemctl --user stop jetski-hub.service && "
-      f"{script_cmd} > {log_file} 2>&1 && "
-      f"systemctl --user start jetski-hub.service'"
+      f"{wait_cmd} > {log_file} 2>&1 && "
+      f"systemctl --user stop jetski-hub.service >> {log_file} 2>&1 && "
+      f"{script_cmd} >> {log_file} 2>&1 && "
+      f"systemctl --user start jetski-hub.service >> {log_file} 2>&1'"
   )
   try:
     subprocess.run(
@@ -519,8 +566,8 @@ def schedule_offline_migration(
         text=True,
     )
     print(
-        f"[INFO] Scheduled offline migration & restart in {delay_sec}s via"
-        " systemd-run."
+        "[INFO] Scheduled offline migration via systemd-run (will wait until all"
+        " running chats are idle before restarting jetski-hub)."
     )
     print(f"[INFO] Log will be written to {log_file}")
   except Exception as e:
@@ -570,7 +617,12 @@ def main():
   parser.add_argument(
       "--restart",
       action="store_true",
-      help="Schedule jetski-hub daemon restart to apply immediately to UI",
+      help="Schedule jetski-hub daemon restart once all chats are idle to apply to UI",
+  )
+  parser.add_argument(
+      "--wait-idle",
+      action="store_true",
+      help="Internal helper: block until no conversation is RUNNING in LS",
   )
   parser.add_argument(
       "conversations",
@@ -578,6 +630,9 @@ def main():
       help="One or more conversation IDs to move",
   )
   args = parser.parse_args()
+
+  if args.wait_idle:
+    sys.exit(0 if wait_for_idle_ls() else 1)
 
   app_data_dir = os.path.expanduser(
       os.environ.get("ANTIGRAVITY_APP_DATA_DIR", "~/.gemini/jetski")
@@ -612,10 +667,10 @@ def main():
     conv_ids = expand_conversations_with_chains(conv_ids)
 
   # If restart requested, run everything offline while hub daemon is stopped
-  # so that in-memory cache flush on shutdown does not overwrite disk changes.
+  # so that in-memory cache flush on shutdown does not overwrite disk changes
   if args.restart:
     schedule_offline_migration(
-        sys.argv[0], target_project, conv_ids, delay_sec=2
+        sys.argv[0], target_project, conv_ids, delay_sec=3
     )
     return
 

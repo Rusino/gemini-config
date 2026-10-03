@@ -216,6 +216,20 @@ class TestMoveChatsToProject(unittest.TestCase):
         self.assertIn("Unassigned conversations: 2 across 1 chain(s)/task(s):", report)
         self.assertIn("Unassigned Chain", report)
 
+  def test_wait_for_idle_ls(self):
+    polls = [
+        {"c1": {"status": "CASCADE_RUN_STATUS_RUNNING", "summary": "Busy"}},
+        {"c1": {"status": "CASCADE_RUN_STATUS_IDLE", "summary": "Busy"}},
+        {"c1": {"status": "CASCADE_RUN_STATUS_IDLE", "summary": "Busy"}},
+    ]
+    with patch.object(
+        chat_lifecycle, "_fetch_ls_summaries_for_audit", side_effect=polls
+    ):
+      ok = move_chats_to_project.wait_for_idle_ls(
+          poll_sec=0.01, required_quiet_checks=2, max_wait_sec=1.0
+      )
+      self.assertTrue(ok)
+
 
 if __name__ == "__main__":
   unittest.main()

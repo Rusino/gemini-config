@@ -52,7 +52,7 @@ Use only these commands (`python3 ~/.gemini/config/hooks/chat_lifecycle.py ...`)
 | `audit [--fix] [--project <id\|name>]` | Scan top-level chats and chains for title desync (LS RPC vs `.pbtxt` vs SQLite) or broken Scheme Γ markers; `--fix` repairs them. |
 | `archive <id...> [--chain]` | Archive specified chats (or their full handoff chain with `--chain`) via LS RPC and `.pbtxt`. |
 
-For moving chats or whole chains between projects (or listing unassigned chats), use `python3 ~/.gemini/config/scripts/move_chats_to_project.py --project "<name_or_id>" [--chain] <id...>` or `--list-unassigned`.
+For moving chats or whole chains between projects (or listing unassigned chats), use `python3 ~/.gemini/config/scripts/move_chats_to_project.py --project "<name_or_id>" [--chain] --restart <id...>` (which waits in the background until all running chats finish their turns before restarting `jetski-hub`) or `--list-unassigned`.
 
 Strict rules:
 - **Never** ask the user whether to finalize. No "Пометить разбор как финальный?" prompts. Finalization happens only on the user's explicit word.
