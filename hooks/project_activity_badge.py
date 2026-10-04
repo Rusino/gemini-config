@@ -9,23 +9,25 @@ via `ProjectUpdatesStream`.
 
 This script reads the initial snapshot from the local Connect-RPC
 `JetboxSubscribeToSummaries` stream (with fallback to `GetAllCascadeTrajectories`),
-counts active (`CASCADE_RUN_STATUS_RUNNING` / `notFullyIdle`) and blocked
-(`waitingSteps`) top-level conversations per project, and atomically updates
-the `"name"` field in `~/.gemini/config/projects/<project_id>.json` with a
-compact suffix badge (e.g. ` · ⟳ 1` or ` · ⚠ 1`).
+counts active (`CASCADE_RUN_STATUS_RUNNING` / `notFullyIdle`), blocked
+(`waitingSteps`), and unread finished (`lastModifiedTime > lastUserViewTime`)
+top-level conversations per project, and atomically updates the `"name"` field
+in `~/.gemini/config/projects/<project_id>.json` with a compact suffix badge
+(e.g. ` · ⟳ 1`, ` · ⚠ 1`, ` · ● 1`, or ` · ⟳ 1 ● 2`).
 
 Modes of operation:
 - Hook mode (`--event PreInvocation` / `--event Stop`):
   Reads the hook stdin payload, immediately outputs `{}` on stdout so the LLM
   turn is never delayed, and spawns a detached background process (`--bg-trigger`)
   that updates badges immediately and maintains a single `flock`-guarded polling
-  watcher (`--watch`) until all conversations across all projects become idle.
+  watcher (`--watch`) until all conversations across all projects are idle and read.
 - CLI mode (`--sync-once`, `--watch`, `--clear`, `--status`):
   Can be invoked manually or from tests to inspect or reset project badges.
 """
 
 import argparse
 from collections import defaultdict
+from datetime import datetime
 import fcntl
 import glob
 import json
@@ -41,18 +43,19 @@ from urllib.parse import unquote
 import urllib.request
 
 DEFAULT_PROJECTS_DIR = os.path.expanduser("~/.gemini/config/projects")
+DEFAULT_ANNOTATIONS_DIR = os.path.expanduser("~/.gemini/jetski/annotations")
 DEFAULT_LS_ADDRESS = "localhost:5387"
 
 # Matches one or more trailing activity badges such as:
-#   " · ⟳ 1", " · ⚠ 2", " · ⟳ 1 ⚠ 1"
+#   " · ⟳ 1", " · ⚠ 2", " · ● 1", " · ⟳ 1 ⚠ 1 ● 2"
 BADGE_RE = re.compile(
-    r"(?:\s*·\s*(?:⟳\s*\d+|⚠\s*\d+)(?:\s+(?:⟳\s*\d+|⚠\s*\d+))*)+$"
+    r"(?:\s*·\s*(?:[⟳⚠●]\s*\d+)(?:\s+(?:[⟳⚠●]\s*\d+))*)+$"
 )
 
 WATCH_POLL_INTERVAL_SEC = 1.5
 STOP_SETTLE_DELAY_SEC = 0.4
 IDLE_POLLS_BEFORE_EXIT = 3
-MAX_WATCH_DURATION_SEC = 7200
+MAX_WATCH_DURATION_SEC = 86400
 
 
 def _uid_suffix() -> str:
@@ -74,6 +77,10 @@ def _watcher_lock_path() -> str:
   return f"/tmp/jetski_project_badge_watcher_{_uid_suffix()}.lock"
 
 
+def _view_state_path() -> str:
+  return f"/tmp/jetski_project_badge_view_{_uid_suffix()}.json"
+
+
 def strip_activity_badge(name: str) -> str:
   """Removes any trailing activity badge from a project name."""
   if not name:
@@ -82,7 +89,10 @@ def strip_activity_badge(name: str) -> str:
 
 
 def format_project_name(
-    base_name: str, running_count: int = 0, blocked_count: int = 0
+    base_name: str,
+    running_count: int = 0,
+    blocked_count: int = 0,
+    unread_count: int = 0,
 ) -> str:
   """Formats a project name with an optional activity badge suffix."""
   clean_base = strip_activity_badge(base_name)
@@ -93,6 +103,8 @@ def format_project_name(
     parts.append(f"⟳ {running_count}")
   if blocked_count > 0:
     parts.append(f"⚠ {blocked_count}")
+  if unread_count > 0:
+    parts.append(f"● {unread_count}")
   if not parts:
     return clean_base
   return f"{clean_base} · {' '.join(parts)}"
@@ -433,6 +445,157 @@ def fetch_trajectories(
   return None
 
 
+def _parse_iso_timestamp(ts: str) -> float:
+  if not ts or not isinstance(ts, str):
+    return 0.0
+  try:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+  except ValueError:
+    return 0.0
+
+
+def _is_visible_top_level(summary: dict[str, Any]) -> bool:
+  annotations = summary.get("annotations") or {}
+  if annotations.get("archived"):
+    return False
+  meta = summary.get("trajectoryMetadata") or {}
+  if meta.get("parentConversationId") or meta.get("isBattleModeFork"):
+    return False
+  source_meta = meta.get("sourceMetadata") or {}
+  if source_meta.get("tool"):
+    return False
+  return True
+
+
+def resolve_currently_viewing_cid(
+    summaries: dict[str, Any],
+    annotations_dir: str = DEFAULT_ANNOTATIONS_DIR,
+    state_file: str = "",
+) -> tuple[str, dict[str, float]]:
+  """Identifies the currently open conversation and tracks its viewed step time.
+
+  When the user switches from `prev` to `curr`, `conversationViewingMiddleware`
+  updates `lastUserViewTime` on `[prev, curr]` in a single RPC and the server
+  writes `prev.pbtxt` before `curr.pbtxt`. Breaking `lastUserViewTime` ties via
+  `.pbtxt` `st_mtime_ns` and caching the winner for that `max_luvt` timestamp
+  deterministically identifies `curr` even if `prev.pbtxt` is later touched by
+  background title updates.
+  """
+  max_luvt = 0.0
+  for summary in summaries.values():
+    if not isinstance(summary, dict) or not _is_visible_top_level(summary):
+      continue
+    luvt = _parse_iso_timestamp(
+        (summary.get("annotations") or {}).get("lastUserViewTime", "")
+    )
+    if luvt > max_luvt:
+      max_luvt = luvt
+
+  if max_luvt <= 0.0:
+    return "", {}
+
+  cache_path = state_file or _view_state_path()
+  cached_max_luvt = 0.0
+  cached_cid = ""
+  viewed_lmt: dict[str, float] = {}
+  try:
+    with open(cache_path, "r", encoding="utf-8") as f:
+      cached = json.load(f)
+    if isinstance(cached, dict):
+      cached_max_luvt = float(cached.get("max_luvt") or 0.0)
+      cached_cid = str(cached.get("current_cid") or "")
+      raw_viewed = cached.get("viewed_lmt")
+      if isinstance(raw_viewed, dict):
+        viewed_lmt = {
+            str(k): float(v)
+            for k, v in raw_viewed.items()
+            if isinstance(v, (int, float))
+        }
+  except (OSError, ValueError, TypeError):
+    pass
+
+  if (
+      abs(max_luvt - cached_max_luvt) <= 1e-6
+      and cached_cid
+      and cached_cid in summaries
+  ):
+    current_cid = cached_cid
+  else:
+    best_key = (-1.0, -1)
+    current_cid = ""
+    for cid, summary in summaries.items():
+      if not isinstance(summary, dict) or not _is_visible_top_level(summary):
+        continue
+      luvt = _parse_iso_timestamp(
+          (summary.get("annotations") or {}).get("lastUserViewTime", "")
+      )
+      if max_luvt - luvt <= 0.005:
+        pbtxt = os.path.join(annotations_dir, f"{cid}.pbtxt")
+        try:
+          mtime_ns = os.stat(pbtxt).st_mtime_ns
+        except OSError:
+          mtime_ns = 0
+        key = (luvt, mtime_ns)
+        if key > best_key:
+          best_key = key
+          current_cid = cid
+
+  dirty = (
+      abs(max_luvt - cached_max_luvt) > 1e-6 or current_cid != cached_cid
+  )
+  if current_cid and isinstance(summaries.get(current_cid), dict):
+    cur_lmt = _parse_iso_timestamp(
+        summaries[current_cid].get("lastModifiedTime", "")
+    )
+    if cur_lmt > viewed_lmt.get(current_cid, 0.0):
+      viewed_lmt[current_cid] = cur_lmt
+      dirty = True
+
+  if dirty:
+    if len(viewed_lmt) > 64:
+      sorted_items = sorted(viewed_lmt.items(), key=lambda x: x[1], reverse=True)
+      viewed_lmt = dict(sorted_items[:64])
+    tmp_path = f"{cache_path}.tmp.{os.getpid()}"
+    try:
+      with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "max_luvt": max_luvt,
+                "current_cid": current_cid,
+                "viewed_lmt": viewed_lmt,
+            },
+            f,
+        )
+      os.replace(tmp_path, cache_path)
+    except OSError:
+      try:
+        os.unlink(tmp_path)
+      except OSError:
+        pass
+
+  return current_cid, viewed_lmt
+
+
+def is_conversation_unread(
+    cid: str,
+    summary: dict[str, Any],
+    currently_viewing_cid: str = "",
+    viewed_lmt: dict[str, float] | None = None,
+) -> bool:
+  """Returns True if an idle conversation has unread updates."""
+  annotations = summary.get("annotations") or {}
+  if annotations.get("markedAsUnread"):
+    return True
+  if currently_viewing_cid and cid == currently_viewing_cid:
+    return False
+  lmt = _parse_iso_timestamp(summary.get("lastModifiedTime", ""))
+  if lmt <= 0.0:
+    return False
+  luvt = _parse_iso_timestamp(annotations.get("lastUserViewTime", ""))
+  effective_view = max(luvt, (viewed_lmt or {}).get(cid, 0.0))
+  return lmt > effective_view
+
+
 def compute_project_activity(
     summaries: dict[str, Any],
     known_projects: dict[str, tuple[str, dict[str, Any]]],
@@ -440,25 +603,20 @@ def compute_project_activity(
     force_running_cid: str = "",
     force_running_project_id: str = "",
     force_running_workspaces: list[str] | None = None,
-) -> tuple[dict[str, int], dict[str, int]]:
-  """Computes `(running_counts, blocked_counts)` per project ID."""
+    currently_viewing_cid: str = "",
+    viewed_lmt: dict[str, float] | None = None,
+) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+  """Computes `(running_counts, blocked_counts, unread_counts)` per project ID."""
   running_counts: dict[str, int] = defaultdict(int)
   blocked_counts: dict[str, int] = defaultdict(int)
+  unread_counts: dict[str, int] = defaultdict(int)
   seen_forced = False
 
   for cid, summary in summaries.items():
-    if not isinstance(summary, dict):
-      continue
-    annotations = summary.get("annotations") or {}
-    if annotations.get("archived"):
-      continue
-    meta = summary.get("trajectoryMetadata") or {}
-    if meta.get("parentConversationId") or meta.get("isBattleModeFork"):
-      continue
-    source_meta = meta.get("sourceMetadata") or {}
-    if source_meta.get("tool"):
+    if not isinstance(summary, dict) or not _is_visible_top_level(summary):
       continue
 
+    meta = summary.get("trajectoryMetadata") or {}
     pid = meta.get("projectId") or ""
     if not pid or pid not in known_projects:
       ws_uris: list[str] = []
@@ -486,6 +644,13 @@ def compute_project_activity(
       blocked_counts[pid] += 1
     elif is_running:
       running_counts[pid] += 1
+    elif is_conversation_unread(
+        cid,
+        summary,
+        currently_viewing_cid=currently_viewing_cid,
+        viewed_lmt=viewed_lmt,
+    ):
+      unread_counts[pid] += 1
 
   # If PreInvocation fired for a brand-new conversation before its summary or
   # project assignment appeared in GetAllCascadeTrajectories:
@@ -498,13 +663,14 @@ def compute_project_activity(
     if pid and pid in known_projects:
       running_counts[pid] += 1
 
-  return dict(running_counts), dict(blocked_counts)
+  return dict(running_counts), dict(blocked_counts), dict(unread_counts)
 
 
 def apply_project_badges(
     projects_dir: str,
     running_counts: dict[str, int],
     blocked_counts: dict[str, int],
+    unread_counts: dict[str, int] | None = None,
 ) -> list[tuple[str, str, str]]:
   """Atomically updates project JSON files whose badge changed.
 
@@ -512,6 +678,7 @@ def apply_project_badges(
   """
   known_projects, _ = load_projects(projects_dir)
   changes: list[tuple[str, str, str]] = []
+  unreads = unread_counts or {}
 
   for pid, (pfile, _) in known_projects.items():
     try:
@@ -526,6 +693,7 @@ def apply_project_badges(
           old_name,
           running_count=running_counts.get(pid, 0),
           blocked_count=blocked_counts.get(pid, 0),
+          unread_count=unreads.get(pid, 0),
       )
       if new_name == old_name:
         continue
@@ -551,7 +719,7 @@ def sync_once(
   """Performs a single locked synchronization of project activity badges.
 
   Returns:
-    `(rpc_ok, total_active_chats, modified_projects)`
+    `(rpc_ok, total_tracked_chats, modified_projects)`
   """
   os.makedirs(os.path.dirname(_sync_lock_path()), exist_ok=True)
   with open(_sync_lock_path(), "w", encoding="utf-8") as lock_f:
@@ -561,19 +729,28 @@ def sync_once(
       if summaries is None:
         return False, 0, []
       known_projects, folder_to_project = load_projects(projects_dir)
-      running_counts, blocked_counts = compute_project_activity(
+      currently_viewing_cid, viewed_lmt = resolve_currently_viewing_cid(
+          summaries
+      )
+      running_counts, blocked_counts, unread_counts = compute_project_activity(
           summaries,
           known_projects,
           folder_to_project,
           force_running_cid=force_running_cid,
           force_running_project_id=force_running_project_id,
           force_running_workspaces=force_running_workspaces,
+          currently_viewing_cid=currently_viewing_cid,
+          viewed_lmt=viewed_lmt,
       )
       changes = apply_project_badges(
-          projects_dir, running_counts, blocked_counts
+          projects_dir, running_counts, blocked_counts, unread_counts
       )
-      total_active = sum(running_counts.values()) + sum(blocked_counts.values())
-      return True, total_active, changes
+      total_tracked = (
+          sum(running_counts.values())
+          + sum(blocked_counts.values())
+          + sum(unread_counts.values())
+      )
+      return True, total_tracked, changes
     finally:
       fcntl.flock(lock_f, fcntl.LOCK_UN)
 
@@ -585,13 +762,13 @@ def clear_all_badges(
   with open(_sync_lock_path(), "w", encoding="utf-8") as lock_f:
     fcntl.flock(lock_f, fcntl.LOCK_EX)
     try:
-      return apply_project_badges(projects_dir, {}, {})
+      return apply_project_badges(projects_dir, {}, {}, {})
     finally:
       fcntl.flock(lock_f, fcntl.LOCK_UN)
 
 
 def run_watcher_loop(projects_dir: str = DEFAULT_PROJECTS_DIR) -> None:
-  """Runs a singleton background polling loop until all projects are idle."""
+  """Runs a singleton background polling loop until all projects are idle and read."""
   lock_f = open(_watcher_lock_path(), "w", encoding="utf-8")
   try:
     fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -608,17 +785,17 @@ def run_watcher_loop(projects_dir: str = DEFAULT_PROJECTS_DIR) -> None:
 
     while (time.monotonic() - start_ts) < MAX_WATCH_DURATION_SEC:
       time.sleep(WATCH_POLL_INTERVAL_SEC)
-      rpc_ok, total_active, _ = sync_once(projects_dir=projects_dir)
+      rpc_ok, total_tracked, _ = sync_once(projects_dir=projects_dir)
       if not rpc_ok:
         rpc_fail_streak += 1
         if rpc_fail_streak >= 2:
-          # Language Server stopped or became unreachable; leave clean names.
+          # Language Server stopped or became unreachable; leave clean names
           clear_all_badges(projects_dir=projects_dir)
           break
         continue
 
       rpc_fail_streak = 0
-      if total_active == 0:
+      if total_tracked == 0:
         idle_streak += 1
         if idle_streak >= IDLE_POLLS_BEFORE_EXIT:
           break
@@ -697,7 +874,7 @@ def handle_hook_invocation(event: str, projects_dir: str) -> None:
   if not isinstance(workspace_paths, list):
     workspace_paths = []
 
-  # Immediately emit `{}` and flush so the hook never blocks the agent turn.
+  # Immediately emit `{}` and flush so the hook never blocks the agent turn
   sys.stdout.write("{}\n")
   sys.stdout.flush()
 
@@ -728,10 +905,10 @@ def handle_bg_trigger(
     run_watcher_loop(projects_dir=projects_dir)
   elif event == "Stop":
     # Wait briefly for the Language Server to transition the stopping
-    # conversation from CASCADE_RUN_STATUS_RUNNING to CASCADE_RUN_STATUS_IDLE.
+    # conversation from CASCADE_RUN_STATUS_RUNNING to CASCADE_RUN_STATUS_IDLE
     time.sleep(STOP_SETTLE_DELAY_SEC)
-    _, total_active, _ = sync_once(projects_dir=projects_dir)
-    if total_active > 0:
+    _, total_tracked, _ = sync_once(projects_dir=projects_dir)
+    if total_tracked > 0:
       run_watcher_loop(projects_dir=projects_dir)
 
 
@@ -767,7 +944,7 @@ def main() -> None:
   parser.add_argument(
       "--status",
       action="store_true",
-      help="Print current running/blocked conversation counts per project.",
+      help="Print current running/blocked/unread conversation counts per project.",
   )
   parser.add_argument("--cid", default="", help="Conversation ID context.")
   parser.add_argument("--project-id", default="", help="Project ID hint.")
@@ -816,18 +993,24 @@ def main() -> None:
       print("ERROR: Could not connect to Language Server.", file=sys.stderr)
       sys.exit(1)
     known_projects, folder_to_project = load_projects(args.projects_dir)
-    running_counts, blocked_counts = compute_project_activity(
-        summaries, known_projects, folder_to_project
+    currently_viewing_cid, viewed_lmt = resolve_currently_viewing_cid(summaries)
+    running_counts, blocked_counts, unread_counts = compute_project_activity(
+        summaries,
+        known_projects,
+        folder_to_project,
+        currently_viewing_cid=currently_viewing_cid,
+        viewed_lmt=viewed_lmt,
     )
     for pid, (_, pdata) in known_projects.items():
       base = strip_activity_badge(pdata.get("name", ""))
       r = running_counts.get(pid, 0)
       b = blocked_counts.get(pid, 0)
-      print(f"{pid}  {base:<24}  running={r}  blocked={b}")
+      u = unread_counts.get(pid, 0)
+      print(f"{pid}  {base:<24}  running={r}  blocked={b}  unread={u}")
     return
 
   if args.sync_once:
-    rpc_ok, total_active, changes = sync_once(
+    rpc_ok, total_tracked, changes = sync_once(
         projects_dir=args.projects_dir,
         force_running_cid=args.cid,
         force_running_project_id=args.project_id,
@@ -838,14 +1021,14 @@ def main() -> None:
       sys.exit(1)
     for pid, old_name, new_name in changes:
       print(f"{pid}: {old_name!r} -> {new_name!r}")
-    print(f"Total active conversations: {total_active}")
+    print(f"Total tracked conversations: {total_tracked}")
     return
 
   if args.watch:
     run_watcher_loop(projects_dir=args.projects_dir)
     return
 
-  # Default when invoked without flags as a hook: treat as PreInvocation.
+  # Default when invoked without flags as a hook: treat as PreInvocation
   handle_hook_invocation(event="PreInvocation", projects_dir=args.projects_dir)
 
 

@@ -21,17 +21,22 @@ class TestProjectActivityBadge(unittest.TestCase):
 
   def test_strip_and_format_idempotence(self):
     cases = [
-        ("Breaking Chats", 0, 0, "Breaking Chats"),
-        ("Breaking Chats", 1, 0, "Breaking Chats · ⟳ 1"),
-        ("Breaking Chats · ⟳ 2", 1, 0, "Breaking Chats · ⟳ 1"),
-        ("Breaking Chats · ⟳ 1", 0, 0, "Breaking Chats"),
-        ("WebParagraph", 0, 2, "WebParagraph · ⚠ 2"),
-        ("WebParagraph · ⚠ 1", 2, 1, "WebParagraph · ⟳ 2 ⚠ 1"),
-        ("Skia Gardener · ⟳ 1 · ⟳ 3", 0, 0, "Skia Gardener"),
+        ("Breaking Chats", 0, 0, 0, "Breaking Chats"),
+        ("Breaking Chats", 1, 0, 0, "Breaking Chats · ⟳ 1"),
+        ("Breaking Chats · ⟳ 2", 1, 0, 0, "Breaking Chats · ⟳ 1"),
+        ("Breaking Chats · ⟳ 1", 0, 0, 1, "Breaking Chats · ● 1"),
+        ("Breaking Chats · ● 1", 0, 0, 0, "Breaking Chats"),
+        ("WebParagraph", 0, 2, 0, "WebParagraph · ⚠ 2"),
+        ("WebParagraph · ⚠ 1", 2, 1, 3, "WebParagraph · ⟳ 2 ⚠ 1 ● 3"),
+        ("Skia Gardener · ⟳ 1 · ● 2", 0, 0, 0, "Skia Gardener"),
     ]
-    for raw_name, running, blocked, expected in cases:
-      with self.subTest(raw_name=raw_name, running=running, blocked=blocked):
-        formatted = badge.format_project_name(raw_name, running, blocked)
+    for raw_name, running, blocked, unread, expected in cases:
+      with self.subTest(
+          raw_name=raw_name, running=running, blocked=blocked, unread=unread
+      ):
+        formatted = badge.format_project_name(
+            raw_name, running, blocked, unread
+        )
         self.assertEqual(formatted, expected)
         self.assertEqual(
             badge.strip_activity_badge(formatted),
@@ -74,20 +79,40 @@ class TestProjectActivityBadge(unittest.TestCase):
               "waitingSteps": [{"stepIndex": 3}],
               "trajectoryMetadata": {"projectId": "proj-1"},
           },
+          "c-unread-newer-lmt": {
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "lastModifiedTime": "2026-10-04T00:42:09.100Z",
+              "annotations": {"lastUserViewTime": "2026-10-04T00:42:09Z"},
+              "trajectoryMetadata": {"projectId": "proj-1"},
+          },
+          "c-unread-never-viewed": {
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "lastModifiedTime": "2026-10-04T00:40:00Z",
+              "trajectoryMetadata": {"projectId": "proj-2"},
+          },
+          "c-read": {
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "lastModifiedTime": "2026-10-04T00:42:09Z",
+              "annotations": {"lastUserViewTime": "2026-10-04T00:42:09.100Z"},
+              "trajectoryMetadata": {"projectId": "proj-1"},
+          },
           "c-archived": {
-              "status": "CASCADE_RUN_STATUS_RUNNING",
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "lastModifiedTime": "2026-10-04T00:50:00Z",
               "annotations": {"archived": True},
               "trajectoryMetadata": {"projectId": "proj-1"},
           },
           "c-subagent": {
-              "status": "CASCADE_RUN_STATUS_RUNNING",
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "lastModifiedTime": "2026-10-04T00:50:00Z",
               "trajectoryMetadata": {
                   "projectId": "proj-1",
                   "parentConversationId": "c-running",
               },
           },
           "c-hidden-tool": {
-              "status": "CASCADE_RUN_STATUS_RUNNING",
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "lastModifiedTime": "2026-10-04T00:50:00Z",
               "trajectoryMetadata": {
                   "projectId": "proj-1",
                   "sourceMetadata": {"tool": "agentapi"},
@@ -104,11 +129,89 @@ class TestProjectActivityBadge(unittest.TestCase):
           },
       }
 
-      running, blocked = badge.compute_project_activity(
+      running, blocked, unread = badge.compute_project_activity(
           summaries, known_projects, folder_to_project
       )
       self.assertEqual(running, {"proj-1": 1, "proj-2": 1})
       self.assertEqual(blocked, {"proj-1": 1})
+      self.assertEqual(unread, {"proj-1": 1, "proj-2": 1})
+
+  def test_resolve_currently_viewing_cid_and_suppress_unread(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      state_file = os.path.join(tmp_dir, "view_state.json")
+      p1 = {
+          "id": "proj-1",
+          "name": "Project One",
+          "projectResources": {"resources": []},
+      }
+      with open(os.path.join(tmp_dir, "proj-1.json"), "w") as f:
+        json.dump(p1, f)
+      known_projects, folder_to_project = badge.load_projects(tmp_dir)
+
+      prev_pb = os.path.join(tmp_dir, "c-prev.pbtxt")
+      curr_pb = os.path.join(tmp_dir, "c-curr.pbtxt")
+      with open(prev_pb, "w") as f:
+        f.write("prev")
+      with open(curr_pb, "w") as f:
+        f.write("curr")
+      os.utime(prev_pb, ns=(1000, 1000))
+      os.utime(curr_pb, ns=(1000, 2000))
+
+      summaries = {
+          "c-prev": {
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "lastModifiedTime": "2026-10-04T00:45:00Z",
+              "annotations": {"lastUserViewTime": "2026-10-04T00:40:00Z"},
+              "trajectoryMetadata": {"projectId": "proj-1"},
+          },
+          "c-curr": {
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "lastModifiedTime": "2026-10-04T00:46:00Z",
+              "annotations": {"lastUserViewTime": "2026-10-04T00:40:00Z"},
+              "trajectoryMetadata": {"projectId": "proj-1"},
+          },
+      }
+
+      current_cid, viewed_lmt = badge.resolve_currently_viewing_cid(
+          summaries, annotations_dir=tmp_dir, state_file=state_file
+      )
+      self.assertEqual(current_cid, "c-curr")
+
+      # Even if c-prev.pbtxt is later touched by a background title update,
+      # the cached winner for max_luvt remains c-curr
+      os.utime(prev_pb, ns=(1000, 9000))
+      current_cid2, viewed_lmt2 = badge.resolve_currently_viewing_cid(
+          summaries, annotations_dir=tmp_dir, state_file=state_file
+      )
+      self.assertEqual(current_cid2, "c-curr")
+
+      # c-curr is open on screen so it is not unread; c-prev finished in the
+      # background after the switch so it is unread
+      _, _, unread = badge.compute_project_activity(
+          summaries,
+          known_projects,
+          folder_to_project,
+          currently_viewing_cid=current_cid2,
+          viewed_lmt=viewed_lmt2,
+      )
+      self.assertEqual(unread, {"proj-1": 1})
+
+      # Once the user clicks back onto c-prev, its lastUserViewTime advances
+      summaries["c-prev"]["annotations"]["lastUserViewTime"] = (
+          "2026-10-04T00:47:00Z"
+      )
+      current_cid3, viewed_lmt3 = badge.resolve_currently_viewing_cid(
+          summaries, annotations_dir=tmp_dir, state_file=state_file
+      )
+      self.assertEqual(current_cid3, "c-prev")
+      _, _, unread_after = badge.compute_project_activity(
+          summaries,
+          known_projects,
+          folder_to_project,
+          currently_viewing_cid=current_cid3,
+          viewed_lmt=viewed_lmt3,
+      )
+      self.assertEqual(unread_after, {})
 
   def test_force_running_cid_for_new_or_starting_chat(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -124,14 +227,14 @@ class TestProjectActivityBadge(unittest.TestCase):
 
       known_projects, folder_to_project = badge.load_projects(tmp_dir)
 
-      # Case 1: Chat is in summaries as IDLE during PreInvocation
       summaries_idle = {
           "cid-1": {
               "status": "CASCADE_RUN_STATUS_IDLE",
+              "lastModifiedTime": "2026-10-04T00:50:00Z",
               "trajectoryMetadata": {"projectId": "proj-1"},
           }
       }
-      running, blocked = badge.compute_project_activity(
+      running, blocked, unread = badge.compute_project_activity(
           summaries_idle,
           known_projects,
           folder_to_project,
@@ -139,9 +242,9 @@ class TestProjectActivityBadge(unittest.TestCase):
       )
       self.assertEqual(running, {"proj-1": 1})
       self.assertEqual(blocked, {})
+      self.assertEqual(unread, {})
 
-      # Case 2: Brand-new chat not in summaries yet, matched via workspace
-      running2, _ = badge.compute_project_activity(
+      running2, _, _ = badge.compute_project_activity(
           {},
           known_projects,
           folder_to_project,
@@ -164,29 +267,27 @@ class TestProjectActivityBadge(unittest.TestCase):
         json.dump(original, f)
 
       changes = badge.apply_project_badges(
-          tmp_dir, {"proj-1": 2}, {"proj-1": 1}
+          tmp_dir, {"proj-1": 2}, {"proj-1": 1}, {"proj-1": 3}
       )
       self.assertEqual(
           changes,
-          [("proj-1", "Breaking Chats", "Breaking Chats · ⟳ 2 ⚠ 1")],
+          [("proj-1", "Breaking Chats", "Breaking Chats · ⟳ 2 ⚠ 1 ● 3")],
       )
 
       with open(pfile, "r") as f:
         updated = json.load(f)
-      self.assertEqual(updated["name"], "Breaking Chats · ⟳ 2 ⚠ 1")
+      self.assertEqual(updated["name"], "Breaking Chats · ⟳ 2 ⚠ 1 ● 3")
       self.assertEqual(updated["settings"], {"custom": True})
 
-      # Second call with same counts should be a no-op (zero writes)
       changes_noop = badge.apply_project_badges(
-          tmp_dir, {"proj-1": 2}, {"proj-1": 1}
+          tmp_dir, {"proj-1": 2}, {"proj-1": 1}, {"proj-1": 3}
       )
       self.assertEqual(changes_noop, [])
 
-      # Clearing restores exact original name
       cleared = badge.clear_all_badges(tmp_dir)
       self.assertEqual(
           cleared,
-          [("proj-1", "Breaking Chats · ⟳ 2 ⚠ 1", "Breaking Chats")],
+          [("proj-1", "Breaking Chats · ⟳ 2 ⚠ 1 ● 3", "Breaking Chats")],
       )
       with open(pfile, "r") as f:
         final = json.load(f)

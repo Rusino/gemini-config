@@ -103,7 +103,7 @@ def get_ls_csrf_token(ls_address: str) -> str:
 
 DEFAULT_PROJECTS_DIR = os.path.expanduser("~/.gemini/config/projects")
 BADGE_RE = re.compile(
-    r"(?:\s*·\s*(?:⟳\s*\d+|⚠\s*\d+)(?:\s+(?:⟳\s*\d+|⚠\s*\d+))*)+$"
+    r"(?:\s*·\s*(?:[⟳⚠●]\s*\d+)(?:\s+(?:[⟳⚠●]\s*\d+))*)+$"
 )
 UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
