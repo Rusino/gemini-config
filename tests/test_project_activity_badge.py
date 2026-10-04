@@ -136,6 +136,60 @@ class TestProjectActivityBadge(unittest.TestCase):
       self.assertEqual(blocked, {"proj-1": 1})
       self.assertEqual(unread, {"proj-1": 1, "proj-2": 1})
 
+  def test_handed_off_predecessors_excluded_from_unread(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      p1 = {
+          "id": "proj-1",
+          "name": "Project One",
+          "projectResources": {"resources": []},
+      }
+      with open(os.path.join(tmp_dir, "proj-1.json"), "w") as f:
+        json.dump(p1, f)
+      known_projects, folder_to_project = badge.load_projects(tmp_dir)
+
+      summaries = {
+          "c-start": {
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "lastModifiedTime": "2026-10-04T01:08:00Z",
+              "annotations": {"title": "[21:07] ▸ Task Chain"},
+              "trajectoryMetadata": {"projectId": "proj-1"},
+          },
+          "c-step": {
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "lastModifiedTime": "2026-10-04T01:09:00Z",
+              "annotations": {"title": "[21:07] ✓ Task Chain"},
+              "trajectoryMetadata": {"projectId": "proj-1"},
+          },
+          "c-closed-start": {
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "lastModifiedTime": "2026-10-04T01:09:00Z",
+              "annotations": {"title": "[21:07] « Closed Chain"},
+              "trajectoryMetadata": {"projectId": "proj-1"},
+          },
+          "c-closed-step": {
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "lastModifiedTime": "2026-10-04T01:09:00Z",
+              "annotations": {"title": "[21:07] ‹✓› Closed Chain"},
+              "trajectoryMetadata": {"projectId": "proj-1"},
+          },
+          "c-leaf-active": {
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "lastModifiedTime": "2026-10-04T01:10:00Z",
+              "annotations": {"title": "[21:07] ⦿ Task Chain"},
+              "trajectoryMetadata": {"projectId": "proj-1"},
+          },
+          "c-single-closed": {
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "lastModifiedTime": "2026-10-04T01:10:00Z",
+              "annotations": {"title": "[21:07] «» Standalone Closed"},
+              "trajectoryMetadata": {"projectId": "proj-1"},
+          },
+      }
+      _, _, unread = badge.compute_project_activity(
+          summaries, known_projects, folder_to_project
+      )
+      self.assertEqual(unread, {"proj-1": 2})
+
   def test_resolve_currently_viewing_cid_and_suppress_unread(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
       state_file = os.path.join(tmp_dir, "view_state.json")

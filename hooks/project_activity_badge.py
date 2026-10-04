@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 import fcntl
 import glob
 import json
@@ -52,6 +52,12 @@ DEFAULT_LS_ADDRESS = "localhost:5387"
 #   " · ⟳ 1", " · ⚠ 2", " · ● 1", " · ⟳ 1 ⚠ 1 ● 2"
 BADGE_RE = re.compile(
     r"(?:\s*·\s*(?:[⟳⚠●]\s*\d+)(?:\s+(?:[⟳⚠●]\s*\d+))*)+$"
+)
+
+# Non-leaf conversations in a handoff chain (▸, ✓, «, ‹✓›) have already been
+# continued in a successor conversation and should not be counted as unread
+PREDECESSOR_TITLE_RE = re.compile(
+    r"^\s*(?:\[\d{1,2}:\d{2}\]\s*)?(?:▸|✓|«(?!»)|‹✓›)(?:\s|$)"
 )
 
 WATCH_POLL_INTERVAL_SEC = 1.5
@@ -469,6 +475,77 @@ def _is_visible_top_level(summary: dict[str, Any]) -> bool:
   return True
 
 
+def _is_handed_off_predecessor(summary: dict[str, Any]) -> bool:
+  annotations = summary.get("annotations") or {}
+  for candidate in (annotations.get("title"), summary.get("summary")):
+    if isinstance(candidate, str) and PREDECESSOR_TITLE_RE.match(candidate):
+      return True
+  return False
+
+
+def _mark_predecessors_read(summaries: dict[str, Any]) -> None:
+  """Stamps `lastUserViewTime` on idle handed-off predecessor conversations.
+
+  When a conversation splits via `handoff`, its final turn finishes a few
+  seconds after the continuation is spawned, leaving `lastModifiedTime` newer
+  than `lastUserViewTime`. Updating `lastUserViewTime` to `lastModifiedTime + 1ms`
+  clears Jetski's sidebar unread dot on intermediate chats without disturbing
+  `max_luvt` of the user's active conversation.
+  """
+  addr, token = _read_cached_conn()
+  if not addr or not token:
+    return
+  clean_addr = addr.removeprefix("http://").removeprefix("https://")
+  url = (
+      f"http://{clean_addr}"
+      "/exa.language_server_pb.LanguageServerService/UpdateConversationAnnotations"
+  )
+
+  for cid, summary in summaries.items():
+    if not isinstance(summary, dict) or not _is_visible_top_level(summary):
+      continue
+    if not _is_handed_off_predecessor(summary):
+      continue
+    if (
+        summary.get("status") == "CASCADE_RUN_STATUS_RUNNING"
+        or summary.get("notFullyIdle")
+        or summary.get("waitingSteps")
+    ):
+      continue
+    annotations = summary.get("annotations") or {}
+    lmt = _parse_iso_timestamp(summary.get("lastModifiedTime", ""))
+    luvt = _parse_iso_timestamp(annotations.get("lastUserViewTime", ""))
+    if lmt <= 0.0 or (lmt <= luvt and not annotations.get("markedAsUnread")):
+      continue
+    stamp_iso = (
+        datetime.fromtimestamp(lmt + 0.001, tz=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    payload = json.dumps({
+        "cascadeIds": [cid],
+        "annotations": {
+            "lastUserViewTime": stamp_iso,
+            "markedAsUnread": False,
+        },
+        "mergeAnnotations": True,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "x-codeium-csrf-token": token,
+        },
+        method="POST",
+    )
+    try:
+      with urllib.request.urlopen(req, timeout=1.5):
+        pass
+    except Exception:
+      pass
+
+
 def resolve_currently_viewing_cid(
     summaries: dict[str, Any],
     annotations_dir: str = DEFAULT_ANNOTATIONS_DIR,
@@ -485,7 +562,11 @@ def resolve_currently_viewing_cid(
   """
   max_luvt = 0.0
   for summary in summaries.values():
-    if not isinstance(summary, dict) or not _is_visible_top_level(summary):
+    if (
+        not isinstance(summary, dict)
+        or not _is_visible_top_level(summary)
+        or _is_handed_off_predecessor(summary)
+    ):
       continue
     luvt = _parse_iso_timestamp(
         (summary.get("annotations") or {}).get("lastUserViewTime", "")
@@ -520,13 +601,18 @@ def resolve_currently_viewing_cid(
       abs(max_luvt - cached_max_luvt) <= 1e-6
       and cached_cid
       and cached_cid in summaries
+      and not _is_handed_off_predecessor(summaries[cached_cid])
   ):
     current_cid = cached_cid
   else:
     best_key = (-1.0, -1)
     current_cid = ""
     for cid, summary in summaries.items():
-      if not isinstance(summary, dict) or not _is_visible_top_level(summary):
+      if (
+          not isinstance(summary, dict)
+          or not _is_visible_top_level(summary)
+          or _is_handed_off_predecessor(summary)
+      ):
         continue
       luvt = _parse_iso_timestamp(
           (summary.get("annotations") or {}).get("lastUserViewTime", "")
@@ -585,6 +671,8 @@ def is_conversation_unread(
     viewed_lmt: dict[str, float] | None = None,
 ) -> bool:
   """Returns True if an idle conversation has unread updates."""
+  if _is_handed_off_predecessor(summary):
+    return False
   annotations = summary.get("annotations") or {}
   if annotations.get("markedAsUnread"):
     return True
@@ -730,6 +818,7 @@ def sync_once(
       summaries = fetch_trajectories()
       if summaries is None:
         return False, 0, []
+      _mark_predecessors_read(summaries)
       known_projects, folder_to_project = load_projects(projects_dir)
       currently_viewing_cid, viewed_lmt = resolve_currently_viewing_cid(
           summaries
