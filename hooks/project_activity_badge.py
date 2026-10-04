@@ -25,6 +25,8 @@ Modes of operation:
   Can be invoked manually or from tests to inspect or reset project badges.
 """
 
+from __future__ import annotations
+
 import argparse
 from collections import defaultdict
 from datetime import datetime

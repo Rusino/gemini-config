@@ -6,6 +6,8 @@ Synchronizes both `~/.gemini/{jetski,antigravity}/annotations/<id>.pbtxt` (the U
 and `conversation_summaries.db` (the SQLite metadata cache).
 """
 
+from __future__ import annotations
+
 from datetime import datetime
 import glob
 import json
