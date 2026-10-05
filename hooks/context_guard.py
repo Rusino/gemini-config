@@ -612,9 +612,10 @@ def main() -> None:
         f"If any background tasks or subagents are running in this conversation, terminate them first via `manage_task` (`kill`) / `manage_subagents` (`kill_all`) so they do not wake this chat up after handoff!\n"
         f"2. Create or update the artifact `{handoff_file}` (via write_to_file, UserFacing: true), documenting:\n"
         f"   - Original goal of the task;\n"
-        f"   - What has been completed and which files were modified;\n"
+        f"   - Full Epic Roadmap / Backlog: checklist of ALL macro-stages (`[x]` completed, `[ ]` pending). NEVER drop or silently prune pending stages from previous handoffs;\n"
+        f"   - What has been completed in this session and which files were modified;\n"
         f"   - Which hypotheses/approaches were tested and DID NOT work (to avoid repeating them in the new chat);\n"
-        f"   - Exact next step to resume from;\n"
+        f"   - Exact immediate next step to resume from;\n"
         f"   - Link `[Previous Conversation](conversation://{conv_id})`.\n"
         f"3. SIMULTANEOUSLY (in the same step or immediately next) launch the new conversation via run_command:\n"
         f'   `python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff {conv_id} "{handoff_file}" --next "<1-line summary of next immediate action>"`\n'
@@ -628,8 +629,8 @@ def main() -> None:
         f"perform an automatic handoff to a new conversation:\n"
         f"1. First, completely answer the user's current request.\n"
         f"2. Create or update the summary file `{handoff_file}` (via write_to_file, UserFacing: true), "
-        f"recording: task goal, key decisions made, modified files, "
-        f"current status, next steps, and a link `[Previous Conversation](conversation://{conv_id})`.\n"
+        f"recording: task goal, full Epic Roadmap checklist ([x] / [ ], NEVER drop pending stages), "
+        f"modified files, current status, exact immediate next step, and a link `[Previous Conversation](conversation://{conv_id})`.\n"
         f"3. Call `run_command` to launch the new conversation:\n"
         f'   `python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff {conv_id} "{handoff_file}" --next "<1-line summary of next immediate action>"`\n'
         f"4. At the very end of your response to the user, include a prominent clickable link "

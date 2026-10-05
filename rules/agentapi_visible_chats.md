@@ -54,7 +54,16 @@ Use only these commands (`python3 ~/.gemini/config/hooks/chat_lifecycle.py ...`)
 
 For moving chats or whole chains between projects (or listing unassigned chats), use `python3 ~/.gemini/config/scripts/move_chats_to_project.py --project "<name_or_id>" [--chain] --restart <id...>` (which waits in the background until all running chats finish their turns before restarting `jetski-hub`) or `--list-unassigned`.
 
+## Backlog & Scope Invariants across Handoff Chains
+
+- **Never Shrink Epic Scope**: Handoff summaries must maintain the complete multi-stage roadmap (`Epic Roadmap`) with explicit checkbox states (`[x]` for completed, `[ ]` for pending, `[-]` for abandoned/out-of-scope). An agent is **strictly forbidden** from deleting or dropping uncompleted backlog items from `Next Steps` or `Roadmap` during handoff.
+- **Two-Level Plan Bifurcation**: Always separate:
+  1. `Epic Roadmap`: Complete checklist of all macro-deliverables across the entire task lifetime. When completing a handoff, copy the previous roadmap forward, updating only the status (`[ ]` -> `[x]`).
+  2. `Immediate Next Step`: The concrete, isolated first action for the continuation chat to resume immediately.
+- **Continuation Inception Check**: When waking up in a continuation chat, the incoming agent must review the full `Epic Roadmap` from the summary, acknowledge the overall task progress, and ensure broader objectives are not abandoned after local deep-dives.
+
 Strict rules:
+- **Never** silently prune or drop pending stages from a handoff summary. If an epic had 5 steps and the current chat only addressed step 2, all steps 3–5 MUST remain in the summary as pending `[ ]`.
 - **Never** ask the user whether to finalize. No "Пометить разбор как финальный?" prompts. Finalization happens only on the user's explicit word.
 - **Never** reopen finalized chats automatically or infer status from the user's wording. If the user continues working in a closed chat, do nothing with the title; the chain is reactivated mechanically by the next `handoff`, or on explicit request (`reopen <id>`).
 - **Never** write SQLite queries or Python `sqlite3` snippets to look up or set titles, and **never** read transcripts or hook source code to recall how handoff works — the commands above are the entire interface.

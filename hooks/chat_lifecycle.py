@@ -865,13 +865,14 @@ def create_handoff(
       f.write(
           f"# Handoff Summary: {new_topic}\n\n"
           f"Continuation of conversation://{current_conv_id}.{body_notes}\n"
+          f"## Epic Roadmap\n- [ ] {next_step_prompt.strip() if next_step_prompt else 'Continue investigation/tasks from previous conversation.'}\n\n"
           f"## Next Steps\n- {next_step_prompt.strip() if next_step_prompt else 'Continue investigation/tasks from previous conversation.'}\n"
       )
 
   # 3. Build continuation prompt
   prompt = (
       f"Continuing unfinished work from previous conversation (conversation://{current_conv_id}). "
-      f"Read {summary_file} via view_file, review completed steps and discarded hypotheses, "
+      f"Read {summary_file} via view_file, review completed steps, remaining Epic Roadmap backlog, and discarded hypotheses, "
       f"and immediately continue executing from the next step recorded in the summary without asking "
       f"for confirmation (unless the summary explicitly states it is waiting for user input)."
   )
