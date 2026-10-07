@@ -14,8 +14,15 @@
   const STYLE_ID = 'jetski-closed-chats-filter-style';
 
   // Lifecycle titles follow "[HH:MM] <marker> <Topic>" where marker encodes chain state
-  const TITLE_MARKER_RE = /^\s*(?:\[\d{1,2}:\d{2}\]\s*)?(‹✓›|«»|[✓⦿▸«»])\s*(.*)$/u;
-  const CHAIN_LINK_MARKERS = new Set(['«', '«»', '»']);
+  // The time prefix and the space after the marker are mandatory so a plain title opening
+  // with a guillemet quote is never read as the finalized « marker
+  const TITLE_MARKER_RE = /^\s*\[\d{1,2}:\d{2}\]\s*(‹✓›|«»|[✓⦿▸«»])(?:\s|$)/u;
+  // chat_lifecycle.py finalize rewrites every chat of a chain to «, ‹✓›, » (or «» for a
+  // single-chat task), so each title alone tells whether its task is closed
+  const FINALIZED_MARKERS = new Set(['«', '‹✓›', '»', '«»']);
+  // Open chains read ▸ root, ✓ handed-off steps, ⦿ current chat
+  const OPEN_CHAIN_ROOT_MARKER = '▸';
+  const OPEN_CHAIN_STEP_MARKER = '✓';
 
   function safeGetStorage(key) {
     try {
@@ -44,29 +51,35 @@
   const managedHiddenIds = new Map();
   let hiddenCountsByProject = new Map();
   let totalClosedCount = 0;
-  let breakdownStats = {
-    totalEligible: 0,
-    visibleActive: 0,
-    closedHeads: 0,
-    hiddenChains: 0,
-  };
+  let breakdownStats = emptyBreakdown();
   let reduxStore = null;
   let isInternalDispatch = false;
   let rafScheduled = false;
   let activeHoverBtn = null;
 
   function parseTitleMarker(title) {
-    if (typeof title !== 'string' || !title) {
-      return { marker: null, topic: '' };
-    }
+    if (typeof title !== 'string') return null;
     const match = TITLE_MARKER_RE.exec(title);
-    if (!match) {
-      return { marker: null, topic: title.trim().toLowerCase() };
-    }
-    return {
-      marker: match[1],
-      topic: (match[2] || '').trim().toLowerCase(),
-    };
+    return match ? match[1] : null;
+  }
+
+  // A ✓ step is already handed off, so it goes with closed chats; the ▸ root stays as the
+  // entry point of a running task until 'active-only' leaves only ⦿ and unmarked chats
+  function isHiddenMarker(marker, scope) {
+    if (FINALIZED_MARKERS.has(marker) || marker === OPEN_CHAIN_STEP_MARKER) return true;
+    return scope === 'active-only' && marker === OPEN_CHAIN_ROOT_MARKER;
+  }
+
+  function emptyBreakdown() {
+    return { totalEligible: 0, active: 0, openRoots: 0, steps: 0, finalized: 0 };
+  }
+
+  function countMarker(stats, marker) {
+    stats.totalEligible++;
+    if (FINALIZED_MARKERS.has(marker)) stats.finalized++;
+    else if (marker === OPEN_CHAIN_STEP_MARKER) stats.steps++;
+    else if (marker === OPEN_CHAIN_ROOT_MARKER) stats.openRoots++;
+    else stats.active++;
   }
 
   function isEligibleTopLevelSummary(cascadeId, summary) {
@@ -81,77 +94,19 @@
   }
 
   function classifySummaries(summariesMap, scope) {
-    const projectStats = new Map();
-    const parsedEntries = [];
+    const closedIds = new Set();
+    const perProjectHidden = new Map();
+    const statsSummary = emptyBreakdown();
 
     for (const [cascadeId, summary] of Object.entries(summariesMap || {})) {
       if (!isEligibleTopLevelSummary(cascadeId, summary)) continue;
+      const marker = parseTitleMarker(summary.summary);
+      countMarker(statsSummary, marker);
+      if (!isHiddenMarker(marker, scope)) continue;
+      closedIds.add(cascadeId);
       const projectId = summary.trajectoryMetadata?.projectId || '__standalone__';
-      const { marker, topic } = parseTitleMarker(summary.summary || '');
-      parsedEntries.push({ cascadeId, summary, projectId, marker, topic });
-
-      let stats = projectStats.get(projectId);
-      if (!stats) {
-        stats = {
-          openTopics: new Set(),
-          closedTopics: new Set(),
-          openHeads: 0,
-          closedHeads: 0,
-        };
-        projectStats.set(projectId, stats);
-      }
-      if (marker === '▸') {
-        stats.openHeads++;
-        if (topic) stats.openTopics.add(topic);
-      } else if (marker === '‹✓›') {
-        stats.closedHeads++;
-        if (topic) stats.closedTopics.add(topic);
-      }
+      perProjectHidden.set(projectId, (perProjectHidden.get(projectId) || 0) + 1);
     }
-
-    const closedIds = new Set();
-    const perProjectHidden = new Map();
-    let closedHeadsCount = 0;
-    let hiddenChainsCount = 0;
-
-    for (const entry of parsedEntries) {
-      const { cascadeId, projectId, marker, topic } = entry;
-      if (!marker) continue;
-
-      let isClosed = false;
-      if (marker === '✓' || marker === '‹✓›') {
-        isClosed = true;
-        closedHeadsCount++;
-      } else if (CHAIN_LINK_MARKERS.has(marker)) {
-        if (scope === 'active-only') {
-          isClosed = true;
-          hiddenChainsCount++;
-        } else {
-          const stats = projectStats.get(projectId);
-          if (stats) {
-            if (topic && stats.closedTopics.has(topic) && !stats.openTopics.has(topic)) {
-              isClosed = true;
-              hiddenChainsCount++;
-            } else if (stats.openHeads === 0 && stats.closedHeads > 0) {
-              isClosed = true;
-              hiddenChainsCount++;
-            }
-          }
-        }
-      }
-
-      if (isClosed) {
-        closedIds.add(cascadeId);
-        perProjectHidden.set(projectId, (perProjectHidden.get(projectId) || 0) + 1);
-      }
-    }
-
-    const statsSummary = {
-      totalEligible: parsedEntries.length,
-      visibleActive: Math.max(0, parsedEntries.length - closedIds.size),
-      closedHeads: closedHeadsCount,
-      hiddenChains: hiddenChainsCount,
-    };
 
     return { closedIds, perProjectHidden, statsSummary };
   }
@@ -544,22 +499,17 @@
 
     // Fallback DOM row tagging for rows rendered before Redux hook or outside standard slices
     const rowEls = document.querySelectorAll('div[data-sidebar-row-id]');
+    const domStats = emptyBreakdown();
     let domClosedCount = 0;
-    let domClosedHeads = 0;
-    let domHiddenChains = 0;
     for (const rowEl of rowEls) {
       const linkEl = rowEl.querySelector('a[aria-label]');
       const spanEl = rowEl.querySelector('span.truncate');
       const title = linkEl?.getAttribute('aria-label') || spanEl?.textContent || '';
-      const { marker } = parseTitleMarker(title);
-      const isHeadClosed = marker === '✓' || marker === '‹✓›';
-      const isChainClosed = filterScope === 'active-only' && CHAIN_LINK_MARKERS.has(marker);
-      const isClosedRow = isHeadClosed || isChainClosed;
+      const marker = parseTitleMarker(title);
+      countMarker(domStats, marker);
 
-      if (isClosedRow) {
+      if (isHiddenMarker(marker, filterScope)) {
         domClosedCount++;
-        if (isHeadClosed) domClosedHeads++;
-        if (isChainClosed) domHiddenChains++;
         if (rowEl.getAttribute('data-jetski-closed-row') !== 'true') {
           rowEl.setAttribute('data-jetski-closed-row', 'true');
         }
@@ -570,12 +520,7 @@
 
     if (!reduxActive) {
       totalClosedCount = domClosedCount;
-      breakdownStats = {
-        totalEligible: rowEls.length,
-        visibleActive: Math.max(0, rowEls.length - domClosedCount),
-        closedHeads: domClosedHeads,
-        hiddenChains: domHiddenChains,
-      };
+      breakdownStats = domStats;
     }
 
     // Clarify empty project placeholders when all chats in an expanded project were filtered out
@@ -631,11 +576,6 @@
       headerTitle = 'Filter OFF: showing all chats';
     }
 
-    const chainExplain =
-      filterScope === 'active-only'
-        ? 'Handoff chain links («, «», ») — all'
-        : 'Closed chain links («, «», »)';
-
     const totalActionLabel = filterEnabled
       ? 'Hidden by filter (count on button):'
       : 'Would be hidden (count on button):';
@@ -654,16 +594,20 @@
       </div>
       <div class="jcfb-section-title">Chat count breakdown (all projects)</div>
       <div class="jcfb-row">
-        <span>Active / open chats (▸, ⦿):</span>
-        <span class="jcfb-val">${breakdownStats.visibleActive}</span>
+        <span>Active (⦿, no marker):</span>
+        <span class="jcfb-val">${breakdownStats.active}</span>
       </div>
       <div class="jcfb-row">
-        <span>Closed final chats (✓, ‹✓›):</span>
-        <span class="jcfb-val">${breakdownStats.closedHeads}</span>
+        <span>Open chain roots (▸):</span>
+        <span class="jcfb-val">${breakdownStats.openRoots}</span>
       </div>
       <div class="jcfb-row">
-        <span>${chainExplain}:</span>
-        <span class="jcfb-val">${breakdownStats.hiddenChains}</span>
+        <span>Handed-off steps (✓):</span>
+        <span class="jcfb-val">${breakdownStats.steps}</span>
+      </div>
+      <div class="jcfb-row">
+        <span>Finalized chains («, ‹✓›, », «»):</span>
+        <span class="jcfb-val">${breakdownStats.finalized}</span>
       </div>
       <div class="jcfb-row jcfb-total-row">
         <span>${totalActionLabel}</span>
@@ -673,8 +617,8 @@
         <div><kbd>Left-click</kbd> — ${leftClickAction}</div>
         <div><kbd>Right-click</kbd> / <kbd>Shift+click</kbd> — switch mode:</div>
         <div style="padding-left:6px;margin-top:2px;">
-          ${mode1Mark} <b>Closed hidden</b> (hide ✓, ‹✓› and closed chains)<br/>
-          ${mode2Mark} <b>Active only</b> (also hide all handoff history «, «», »)
+          ${mode1Mark} <b>Closed hidden</b> (hide ✓ and finalized «, ‹✓›, », «»)<br/>
+          ${mode2Mark} <b>Active only</b> (also hide open chain roots ▸)
         </div>
       </div>
     `;

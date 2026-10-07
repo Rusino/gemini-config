@@ -229,14 +229,19 @@ function makeSummary(title, projectId, extraMeta = {}, archived = false) {
   };
 }
 
+// Scheme Γ: open chains read ▸ root, ✓ steps, ⦿ current; finalize rewrites them to «, ‹✓›, » or «» solo
 const initialSummaries = {
-  'open-solo': makeSummary('[10:00] ⦿ Active solo task', 'proj-1'),
-  'open-head': makeSummary('[10:05] ▸ Open chain topic', 'proj-1'),
-  'open-link': makeSummary('[09:50] « Open chain topic', 'proj-1'),
-  'closed-solo': makeSummary('[08:00] ✓ Finished bugfix', 'proj-1'),
-  'closed-head': makeSummary('[11:00] ‹✓› Closed chain topic', 'proj-closed-only'),
-  'closed-mid': makeSummary('[10:30] «» Closed chain topic', 'proj-closed-only'),
-  'closed-root': makeSummary('[10:15] » Closed chain topic', 'proj-closed-only'),
+  'solo-active': makeSummary('[10:00] ⦿ Active solo task', 'proj-1'),
+  'open-root': makeSummary('[09:00] ▸ Open chain topic', 'proj-1'),
+  'open-step': makeSummary('[09:30] ✓ Open chain topic', 'proj-1'),
+  'open-current': makeSummary('[10:05] ⦿ Open chain topic', 'proj-1'),
+  'closed-solo': makeSummary('[08:00] «» Finished bugfix', 'proj-1'),
+  'closed-pair-root': makeSummary('[07:00] « Short closed chain', 'proj-1'),
+  'closed-pair-tail': makeSummary('[07:30] » Short closed chain', 'proj-1'),
+  'quoted-title': makeSummary('«Quoted» topic without lifecycle prefix', 'proj-1'),
+  'closed-root': makeSummary('[10:15] « Closed chain topic', 'proj-closed-only'),
+  'closed-step': makeSummary('[10:30] ‹✓› Closed chain topic', 'proj-closed-only'),
+  'closed-tail': makeSummary('[11:00] » Closed chain topic', 'proj-closed-only'),
   'native-hidden': makeSummary('[12:00] ✓ Background subagent', 'proj-1', {
     sourceMetadata: { hideFromConversationList: true },
   }),
@@ -320,21 +325,28 @@ const btn = actionRow.querySelector('.jetski-closed-chats-filter-btn');
 assert(btn, 'Filter toggle button must be injected before Display Options');
 assert.strictEqual(actionRow.children[0], btn);
 
+const isHidden = (id) => Boolean(
+  storeState.trajectorySummaries.summaries[id].trajectoryMetadata?.sourceMetadata?.hideFromConversationList
+);
+const assertHidden = (ids, expected) => {
+  for (const id of ids) assert.strictEqual(isHidden(id), expected, id);
+};
+const CLOSED_SCOPE_HIDDEN = [
+  'closed-solo', 'closed-pair-root', 'closed-pair-tail',
+  'closed-root', 'closed-step', 'closed-tail', 'open-step',
+];
+
 // Initial state: filterEnabled=true, filterScope='closed'
-// Closed chats in 'closed' scope: closed-solo (✓), closed-head (‹✓›), closed-mid («»), closed-root (») => 4
-// Open chats: open-solo (⦿), open-head (▸), open-link («) => 3
-// Total eligible: 7 (native-hidden is excluded)
-assert.strictEqual(btn.getAttribute('aria-label'), 'Closed hidden: 4');
+// Hidden: closed-solo («»), closed-pair-* (« »), closed-root/step/tail (« ‹✓› »), open-step (✓) => 7
+// Visible: solo-active (⦿), open-root (▸), open-current (⦿), quoted-title (no marker) => 4
+// Total eligible: 11 (native-hidden is excluded)
+assert.strictEqual(btn.getAttribute('aria-label'), 'Closed hidden: 7');
 assert.strictEqual(btn.getAttribute('data-active'), 'true');
 assert.strictEqual(emptyProjSpan.textContent, 'No active chats (3 hidden)');
 
-const s1 = storeState.trajectorySummaries.summaries;
-assert.strictEqual(s1['closed-solo'].trajectoryMetadata.sourceMetadata.hideFromConversationList, true);
-assert.strictEqual(s1['closed-head'].trajectoryMetadata.sourceMetadata.hideFromConversationList, true);
-assert.strictEqual(s1['closed-mid'].trajectoryMetadata.sourceMetadata.hideFromConversationList, true);
-assert.strictEqual(s1['closed-root'].trajectoryMetadata.sourceMetadata.hideFromConversationList, true);
-assert.strictEqual(Boolean(s1['open-link'].trajectoryMetadata?.sourceMetadata?.hideFromConversationList), false);
-assert.strictEqual(s1['closed-solo'].annotations.archived, false);
+assertHidden(CLOSED_SCOPE_HIDDEN, true);
+assertHidden(['solo-active', 'open-root', 'open-current', 'quoted-title'], false);
+assert.strictEqual(storeState.trajectorySummaries.summaries['closed-solo'].annotations.archived, false);
 
 // Hover bubble in Filter ON (closed) state
 btn.dispatchEvent('mouseenter');
@@ -342,10 +354,11 @@ const bubble = global.document.getElementById('jetski-closed-chats-filter-bubble
 assert(bubble, 'Hover bubble must be created');
 assert.strictEqual(bubble.getAttribute('data-visible'), 'true');
 assert(bubble.innerHTML.includes('Filter ON: closed chats hidden'));
-assert(bubble.innerHTML.includes('Active / open chats (▸, ⦿):'));
-assert(bubble.innerHTML.includes('Closed final chats (✓, ‹✓›):'));
-assert(bubble.innerHTML.includes('Closed chain links («, «», »):'));
-assert(bubble.innerHTML.includes('4 of 7'));
+assert(bubble.innerHTML.includes('Active (⦿, no marker):'));
+assert(bubble.innerHTML.includes('Open chain roots (▸):'));
+assert(bubble.innerHTML.includes('Handed-off steps (✓):'));
+assert(bubble.innerHTML.includes('Finalized chains («, ‹✓›, », «»):'));
+assert(bubble.innerHTML.includes('7 of 11'));
 assert(!/[А-Яа-яЁё]/.test(bubble.innerHTML), 'Bubble HTML must not contain Cyrillic');
 
 // Verify MutationObserver ignores mutations inside bubble and button
@@ -361,43 +374,41 @@ btn.dispatchEvent('mousedown', { button: 0 });
 btn.dispatchEvent('click', { button: 0 });
 
 assert.strictEqual(btn.getAttribute('data-active'), 'false');
-assert.strictEqual(btn.getAttribute('aria-label'), 'All chats (4 closed)');
+assert.strictEqual(btn.getAttribute('aria-label'), 'All chats (7 closed)');
 assert.strictEqual(emptyProjSpan.textContent, 'No conversations yet');
 assert(bubble.innerHTML.includes('Filter OFF: showing all chats'));
 assert(bubble.innerHTML.includes('Would be hidden (count on button):'));
 
-const s2 = storeState.trajectorySummaries.summaries;
-assert.strictEqual(s2['closed-solo'].trajectoryMetadata.sourceMetadata.hideFromConversationList, false);
+assertHidden(CLOSED_SCOPE_HIDDEN, false);
 // Natively hidden conversation must remain hidden even when filter is turned OFF
-assert.strictEqual(s2['native-hidden'].trajectoryMetadata.sourceMetadata.hideFromConversationList, true);
+assertHidden(['native-hidden'], true);
 
 // Right-click (contextmenu) switches scope to 'active-only' and enables filter
 btn.dispatchEvent('contextmenu', { button: 2 });
 assert.strictEqual(btn.getAttribute('data-active'), 'true');
-// In 'active-only' scope, open-link («) is also hidden => 5 hidden of 7
-assert.strictEqual(btn.getAttribute('aria-label'), 'Active only · 5 hidden');
+// In 'active-only' scope, open-root (▸) is also hidden => 8 hidden of 11
+assert.strictEqual(btn.getAttribute('aria-label'), 'Active only · 8 hidden');
 assert(bubble.innerHTML.includes('Filter ON: active chats only'));
-assert(bubble.innerHTML.includes('Handoff chain links («, «», ») — all:'));
-assert(bubble.innerHTML.includes('5 of 7'));
-assert.strictEqual(
-  storeState.trajectorySummaries.summaries['open-link'].trajectoryMetadata.sourceMetadata.hideFromConversationList,
-  true
-);
+assert(bubble.innerHTML.includes('● <b>Active only</b>'));
+assert(bubble.innerHTML.includes('8 of 11'));
+assertHidden([...CLOSED_SCOPE_HIDDEN, 'open-root'], true);
+assertHidden(['solo-active', 'open-current', 'quoted-title'], false);
+
+btn.dispatchEvent('contextmenu', { button: 2 });
+assert.strictEqual(btn.getAttribute('aria-label'), 'Closed hidden: 7');
+assertHidden(['open-root'], false);
 
 // Incoming stream batch while filter is ON automatically hides newly arrived closed chat
 reduxStore.dispatch({
   type: 'trajectorySummaries/applyStreamBatch',
   payload: {
     updates: [
-      ['streamed-closed', makeSummary('[12:30] ✓ Newly finalized chat', 'proj-1')],
+      ['streamed-closed', makeSummary('[12:30] «» Newly finalized chat', 'proj-1')],
     ],
     deletes: [],
   },
 });
-assert.strictEqual(
-  storeState.trajectorySummaries.summaries['streamed-closed'].trajectoryMetadata.sourceMetadata.hideFromConversationList,
-  true
-);
+assertHidden(['streamed-closed'], true);
 
 // Re-evaluating the script cleanly replaces the button via __jetskiClosedChatsFilterCleanup
 eval(code);
