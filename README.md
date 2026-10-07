@@ -12,6 +12,10 @@ Personal global rules, lifecycle hooks, and configuration for Jetski (`~/.gemini
   - `pre_tool_guard.py` — Prevents blind edits without reading (`view_file`), blocks edits to generated/gitignored build caches, blocks infinite `tail -f` background daemons, verifies that `handoff_summary*.md` exists on disk before allowing `agentapi new-conversation`, auto-enriches `handoff_summary*.md` snapshots, and cleans up orphaned task log processes on handoff.
   - `stop_guard.py` — Ensures source code modifications are verified by a build/test command before the agent finishes its turn, and silences browser completion chimes on automated handoffs.
   - `project_activity_badge.py` — Syncs live active (` · ⟳ N`), blocked (` · ⚠ M`), and unread finished (` · ● K`) conversation counts into `~/.gemini/config/projects/<id>.json` so collapsed project folders in the sidebar show running and newly completed chat activity in real time via `ProjectUpdatesStream`.
+- `scripts/` — Helper utilities and Jetski Hub sidebar customizations:
+  - `move_chats_to_project.py` — Moves conversations (or entire handoff chains) between projects and lists unassigned top-level conversations.
+  - `jetski_closed_filter.js` — Client-side sidebar filter toggle injected next to `Display Options` to hide finalized (`✓`, `‹✓›`, and closed handoff chain links) or non-active conversations in Redux without archiving them.
+  - `patch_jetski_hub_binary.py` — `ExecStartPre` helper for `jetski-hub.service` that syncs `jetski_closed_filter.js` into `/static/artifacts/jetski-closed-filter.js` and patches the extracted `jetski-hub-server` binary so `index.html` loads the filter script automatically.
 - `documentation/` — Detailed architecture and design docs:
   - [`long_context_guards_guide.md`](./documentation/long_context_guards_guide.md) — *Long-Context Error & Hallucination Prevention System for Jetski* (including Mermaid architecture diagram).
 
