@@ -38,37 +38,60 @@ def summarize_felt(path):
     bundles = {}
     order = []
     current_bundle = None
+    current_suite = None
     pending_failures = []
     last_progress = None
     pipeline_failures = []
     in_pipeline_failures = False
     timed_out = False
+    webparagraph_active = False
 
     for ln in lines:
-        if not ln.strip():
+        s_ln = ln.strip()
+        if not s_ln:
             continue
-        m = BUNDLE_START_RE.match(ln)
+        if "CanvasKit (Web Paragraph)" in s_ln or "WebParagraph: true" in s_ln:
+            webparagraph_active = True
+        m = BUNDLE_START_RE.match(s_ln)
         if m:
             current_bundle = m.group("bundle")
-            bundles.setdefault(current_bundle, {"compile_errors": [], "failed": False})
+            bundles.setdefault(
+                current_bundle,
+                {"compile_errors": [], "compiled_files": [], "failed": False},
+            )
             continue
-        m = COMPILE_ERR_RE.match(ln)
+        if s_ln.startswith("Completed compilation of "):
+            current_bundle = None
+            continue
+        m = COMPILE_ERR_RE.match(s_ln)
         if m and current_bundle:
             bundles[current_bundle]["compile_errors"].append(m.group("file"))
             continue
-        m = BUNDLE_FAIL_RE.match(ln)
+        m = BUNDLE_FAIL_RE.match(s_ln)
         if m:
-            bundles.setdefault(m.group("bundle"), {"compile_errors": [], "failed": False})
-            bundles[m.group("bundle")]["failed"] = True
+            bname = m.group("bundle")
+            bundles.setdefault(
+                bname,
+                {"compile_errors": [], "compiled_files": [], "failed": False},
+            )
+            bundles[bname]["failed"] = True
+            current_bundle = None
             continue
-        m = SUITE_START_RE.match(ln)
+        if current_bundle and s_ln.endswith("_test.dart") and " " not in s_ln:
+            if s_ln not in bundles[current_bundle]["compiled_files"]:
+                bundles[current_bundle]["compiled_files"].append(s_ln)
+            continue
+        m = SUITE_START_RE.match(s_ln)
         if m:
+            current_bundle = None
             suite_name = m.group("suite")
+            current_suite = suite_name
             if suite_name not in suites:
                 order.append(suite_name)
             suites[suite_name] = {
                 "status": "unfinished",
                 "failures": [],
+                "executed_files": [],
                 "passed": None,
                 "skipped": None,
                 "failed": None,
@@ -76,12 +99,19 @@ def summarize_felt(path):
             pending_failures = []
             last_progress = None
             continue
-        m = SUITE_END_RE.match(ln)
+        m = SUITE_END_RE.match(s_ln)
         if m:
             name = m.group("suite")
             s = suites.setdefault(
                 name,
-                {"status": "unfinished", "failures": [], "passed": None, "skipped": None, "failed": None},
+                {
+                    "status": "unfinished",
+                    "failures": [],
+                    "executed_files": [],
+                    "passed": None,
+                    "skipped": None,
+                    "failed": None,
+                },
             )
             if name not in order:
                 order.append(name)
@@ -94,21 +124,28 @@ def summarize_felt(path):
                 s["failed"] = int(last_progress["failed"] or 0)
             pending_failures = []
             last_progress = None
+            current_suite = None
             continue
-        m = PROGRESS_RE.match(ln)
+        m = PROGRESS_RE.match(s_ln)
         if m:
             last_progress = m.groupdict()
             rest = m.group("rest").strip()
+            if current_suite and current_suite in suites:
+                fm = re.match(r"^(?:loading\s+)?(?:\S+/)?([A-Za-z0-9_]+_test\.dart)(?::|\s|$)", rest)
+                if fm:
+                    fname = fm.group(1)
+                    if fname not in suites[current_suite]["executed_files"]:
+                        suites[current_suite]["executed_files"].append(fname)
             if rest.endswith("[E]"):
                 pending_failures.append(rest[: -len("[E]")].strip())
             continue
-        if ln.startswith("Pipeline experienced the following failures:"):
+        if s_ln.startswith("Pipeline experienced the following failures:"):
             in_pipeline_failures = True
             continue
         if in_pipeline_failures and ln.startswith('  "'):
-            pipeline_failures.append(ln.strip())
+            pipeline_failures.append(s_ln)
             continue
-        if ln.startswith("Test pipeline failed."):
+        if s_ln.startswith("Test pipeline failed."):
             in_pipeline_failures = False
             continue
 
@@ -125,6 +162,7 @@ def summarize_felt(path):
         "bundles": bundles,
         "pipeline_failures": pipeline_failures,
         "unfinished": timed_out,
+        "webparagraph_active": webparagraph_active,
     }
 
 
@@ -145,6 +183,7 @@ def summarize_flutter_json_shards(shards_dir, log_paths=None):
     failed = 0
     failures = []
     seen_failures = set()
+    all_suites = set()
     canvaskit_served = []
     compile_errors = []
     unfinished_shards = []
@@ -164,7 +203,10 @@ def summarize_flutter_json_shards(shards_dir, log_paths=None):
             etype = ev.get("type")
             if etype == "suite":
                 s = ev.get("suite", {})
-                suites[s.get("id")] = _normalize_suite_path(s.get("path", ""))
+                norm_p = _normalize_suite_path(s.get("path", ""))
+                suites[s.get("id")] = norm_p
+                if norm_p:
+                    all_suites.add(norm_p)
             elif etype == "testStart":
                 t = ev.get("test", {})
                 tests[t.get("id")] = {
@@ -235,6 +277,8 @@ def summarize_flutter_json_shards(shards_dir, log_paths=None):
         "passed": passed,
         "skipped": skipped,
         "failed": failed,
+        "suites_executed": len(all_suites),
+        "shards_total": len(json_files),
         "failures": failures,
         "compile_errors": compile_errors,
         "unfinished_shards": unfinished_shards,
@@ -255,6 +299,7 @@ def summarize_flutter(path):
     canvaskit_served = []
     failures = []
     seen_failures = set()
+    executed_suites = set()
     last_progress = None
     final_status = "unfinished"
     compile_errors = []
@@ -275,6 +320,9 @@ def summarize_flutter(path):
         if m:
             last_progress = m.groupdict()
             rest = m.group("rest").strip()
+            fm = re.search(r"(test/[A-Za-z0-9_./-]+_test\.dart)(?::|\s|$)", rest)
+            if fm:
+                executed_suites.add(fm.group(1))
             if rest in ("All tests passed!", "Some tests failed."):
                 final_status = "pass" if rest.startswith("All") else "fail"
                 continue
@@ -296,6 +344,9 @@ def summarize_flutter(path):
         "passed": passed,
         "skipped": skipped,
         "failed": failed,
+        "suites_executed": len(executed_suites),
+        "shards_total": 1,
+        "unfinished_shards": [] if final_status in ("pass", "fail") else ["flutter.log"],
         "failures": failures,
         "compile_errors": compile_errors,
         "canvaskit_served": canvaskit_served,
@@ -321,7 +372,9 @@ def print_felt_summary(summary):
         counts = ""
         if s["passed"] is not None:
             counts = f" (+{s['passed']} ~{s['skipped']} -{s['failed']})"
-        print(f"  [{s['status'].upper():10s}] {name}{counts}")
+        n_files = len(s.get("executed_files") or [])
+        files_str = f" [{n_files} files]" if n_files else ""
+        print(f"  [{s['status'].upper():10s}] {name}{counts}{files_str}")
         for f in s["failures"]:
             print(f"      [E] {f}")
 
@@ -332,40 +385,94 @@ def print_flutter_summary(summary):
     if summary["passed"] is not None:
         counts = f" (+{summary['passed']} ~{summary['skipped']} -{summary['failed']})"
     wp = "YES" if summary["webparagraph_active"] else "NO"
-    print(f"  [{summary['status'].upper():10s}] packages/flutter{counts} (webparagraph_served={wp})")
+    n_suites = summary.get("suites_executed")
+    suites_str = f", suites={n_suites}" if n_suites is not None else ""
+    print(
+        f"  [{summary['status'].upper():10s}] packages/flutter{counts} "
+        f"(webparagraph_served={wp}{suites_str})"
+    )
     for err in summary.get("compile_errors", []):
         print(f"      [COMPILE] {err}")
     for f in summary["failures"]:
         print(f"      [E] {f}")
 
 
+def _parse_ninja_log(ninja_log_path):
+    if not ninja_log_path.exists():
+        return None
+    text = ninja_log_path.read_text(errors="replace")
+    if "no work to do" in text:
+        return "0/0 (no-op)"
+    steps = re.findall(r"\[(\d+)/(\d+)\]", text)
+    if steps:
+        last_done, total = steps[-1]
+        return f"{last_done}/{total}"
+    return "ran"
+
+
 def collect_run_data(path_str):
     p = pathlib.Path(path_str)
     data = {
+        "ref_spec": None,
         "analyze_rc": None,
+        "felt_rc": None,
+        "flutter_rc": None,
+        "ninja_actions": None,
+        "attestation": {},
         "felt": None,
         "flutter": None,
     }
     if p.is_dir():
+        att_file = p / "attestation.json"
+        if att_file.exists():
+            try:
+                data["attestation"] = json.loads(att_file.read_text())
+            except Exception:
+                data["attestation"] = {}
+
         status_file = p / "status.txt"
         if status_file.exists():
             for ln in status_file.read_text().splitlines():
-                if ln.startswith("analyze="):
+                if ln.startswith("ref="):
+                    data["ref_spec"] = ln.split("=", 1)[1].strip()
+                elif ln.startswith("analyze="):
                     try:
                         data["analyze_rc"] = int(ln.split("=", 1)[1])
                     except ValueError:
                         data["analyze_rc"] = ln.split("=", 1)[1]
+                elif ln.startswith("felt="):
+                    try:
+                        data["felt_rc"] = int(ln.split("=", 1)[1])
+                    except ValueError:
+                        pass
+                elif ln.startswith("flutter="):
+                    try:
+                        data["flutter_rc"] = int(ln.split("=", 1)[1])
+                    except ValueError:
+                        pass
+
+        data["ninja_actions"] = _parse_ninja_log(p / "ninja_web_sdk.log")
+
+        felt_log = p / "felt.log"
         felt_json = p / "felt_summary.json"
         if not felt_json.exists():
             felt_json = p / "summary.json"
         if felt_json.exists():
             data["felt"] = json.loads(felt_json.read_text())
-        elif (p / "felt.log").exists():
-            data["felt"] = summarize_felt(p / "felt.log")
+            # Backfill file-level attestation fields when reading summaries produced by older runs
+            if felt_log.exists() and "webparagraph_active" not in data["felt"]:
+                data["felt"] = summarize_felt(felt_log)
+        elif felt_log.exists():
+            data["felt"] = summarize_felt(felt_log)
 
         flutter_json = p / "flutter_summary.json"
         if flutter_json.exists():
             data["flutter"] = json.loads(flutter_json.read_text())
+            if "suites_executed" not in data["flutter"]:
+                if (p / "flutter_shards").is_dir():
+                    data["flutter"] = summarize_flutter_json_shards(p / "flutter_shards")
+                elif (p / "flutter.log").exists():
+                    data["flutter"] = summarize_flutter(p / "flutter.log")
         elif (p / "flutter_shards").is_dir():
             data["flutter"] = summarize_flutter_json_shards(p / "flutter_shards")
         elif (p / "flutter.log").exists():
@@ -440,6 +547,148 @@ def format_counts(s):
     return f"`+{s['passed']} ~{s['skipped']} -{s['failed']}`"
 
 
+def _evaluate_attestation(runs):
+    issues = []
+    rows = []
+    seen_tree_hashes = {}
+    seen_dill_hashes = {}
+
+    for label, run in runs:
+        att = run.get("attestation") or {}
+        felt = run.get("felt") or {}
+        fl = run.get("flutter") or {}
+
+        ref_spec = att.get("ref") or run.get("ref_spec") or "—"
+        git_sha = att.get("git_sha")
+        dirty_files = att.get("dirty_files") or []
+        if git_sha:
+            git_col = f"`{ref_spec}` (`{git_sha}`"
+            if dirty_files:
+                git_col += f" + `{len(dirty_files)} dirty`"
+            git_col += ")"
+        else:
+            git_col = f"`{ref_spec}`"
+
+        tree_sha = att.get("web_ui_tree_sha256")
+        tree_col = f"`{tree_sha}`" if tree_sha else "—"
+        if tree_sha:
+            if tree_sha in seen_tree_hashes:
+                prev_label = seen_tree_hashes[tree_sha]
+                issues.append(
+                    f"`{label}` and `{prev_label}` have identical `web_ui` source tree hash (`{tree_sha}`)"
+                )
+            else:
+                seen_tree_hashes[tree_sha] = label
+
+        if felt:
+            suites = felt.get("suites") or {}
+            s_wp = suites.get("chrome-dart2js-webparagraph-ui") or {}
+            s_ui = suites.get("chrome-dart2js-webparagraph-ui-text") or {}
+            wp_exec = len(s_wp.get("executed_files") or [])
+            ui_exec = len(s_ui.get("executed_files") or [])
+            wp_exp = att.get("part1_expected_wp_files") or len(
+                (felt.get("bundles") or {}).get("dart2js-canvaskit-webparagraph", {}).get("compiled_files")
+                or []
+            )
+            ui_exp = att.get("part1_expected_ui_files") or len(
+                (felt.get("bundles") or {}).get("dart2js-canvaskit-ui", {}).get("compiled_files") or []
+            )
+            n_suites_done = sum(1 for s in suites.values() if s.get("status") in ("pass", "fail"))
+            n_suites_unf = sum(1 for s in suites.values() if s.get("status") == "unfinished")
+            p1_compile_errs = sum(
+                len(b.get("compile_errors") or []) + (1 if b.get("failed") else 0)
+                for b in (felt.get("bundles") or {}).values()
+            )
+            p1_col = f"`{wp_exec}/{wp_exp}` wp + `{ui_exec}/{ui_exp}` ui (`{n_suites_done}/{len(suites)}` suites)"
+            if n_suites_unf > 0 or felt.get("unfinished"):
+                issues.append(f"`{label}` Part 1 has `{n_suites_unf}` unfinished suite(s)")
+            if p1_compile_errs > 0:
+                issues.append(f"`{label}` Part 1 has `{p1_compile_errs}` bundle compile error(s)")
+            if wp_exp and wp_exec < wp_exp:
+                issues.append(f"`{label}` Part 1a executed `{wp_exec}/{wp_exp}` files")
+            if ui_exp and ui_exec < ui_exp:
+                issues.append(f"`{label}` Part 1b executed `{ui_exec}/{ui_exp}` files")
+            if not felt.get("webparagraph_active", True):
+                issues.append(f"`{label}` Part 1 log missing `CanvasKit (Web Paragraph)` marker")
+        else:
+            p1_col = "—"
+            p1_compile_errs = 0
+            n_suites_unf = 0
+
+        ninja_act = att.get("part2_ninja_actions") or run.get("ninja_actions") or "—"
+        dill_sha = att.get("part2_ddc_outline_sha256")
+        if dill_sha:
+            build_col = f"`{ninja_act}` (`{dill_sha}`)"
+            if tree_sha and dill_sha in seen_dill_hashes:
+                prev_label, prev_tree = seen_dill_hashes[dill_sha]
+                if prev_tree and prev_tree != tree_sha:
+                    issues.append(
+                        f"`{label}` has a different `web_ui` tree than `{prev_label}` "
+                        f"but identical `ddc_outline.dill` hash (`{dill_sha}`)"
+                    )
+            seen_dill_hashes[dill_sha] = (label, tree_sha)
+        else:
+            build_col = f"`{ninja_act}`"
+
+        if fl:
+            fl_exec = fl.get("suites_executed")
+            fl_exp = att.get("part2_expected_chrome_suites")
+            shards_total = fl.get("shards_total") or 1
+            unf_shards = fl.get("unfinished_shards") or []
+            shards_done = shards_total - len(unf_shards)
+            fl_compile_errs = len(fl.get("compile_errors") or [])
+            if fl_exp:
+                p2_col = f"`{fl_exec}/{fl_exp}` suites (`{shards_done}/{shards_total}` shards)"
+            else:
+                p2_col = f"`{fl_exec}` suites (`{shards_done}/{shards_total}` shards)"
+            if unf_shards or fl.get("status") == "unfinished":
+                issues.append(f"`{label}` Part 2 has `{len(unf_shards)}` unfinished shard(s)")
+            if fl_compile_errs > 0:
+                issues.append(f"`{label}` Part 2 has `{fl_compile_errs}` compile/load error(s)")
+            if fl_exp and fl_exec is not None and fl_exec < fl_exp:
+                issues.append(f"`{label}` Part 2 executed `{fl_exec}/{fl_exp}` expected Chrome suites")
+            if not fl.get("webparagraph_active"):
+                issues.append(
+                    f"`{label}` Part 2 did NOT serve `webparagraph/canvaskit.js` (`webparagraph_active=False`)"
+                )
+        else:
+            p2_col = "—"
+            fl_compile_errs = 0
+            unf_shards = []
+
+        mode = att.get("corpus_mode")
+        if not mode:
+            if (fl and (fl.get("suites_executed") or 0) > 50) or (
+                felt
+                and len(
+                    (felt.get("bundles") or {})
+                    .get("dart2js-canvaskit-ui", {})
+                    .get("compiled_files")
+                    or []
+                )
+                > 10
+            ):
+                mode = "full"
+            else:
+                mode = "targeted"
+        ftf = att.get("force_test_fonts")
+        mode_col = f"`{mode.upper()}`" + ("" if ftf is None else (f" (`testFonts={'on' if ftf else 'off'}`)"))
+
+        wp_p1 = "YES" if (felt and felt.get("webparagraph_active")) else ("—" if not felt else "**NO**")
+        wp_p2 = "YES" if (fl and fl.get("webparagraph_active")) else ("—" if not fl else "**NO**")
+        wp_col = f"P1:{wp_p1} / P2:{wp_p2}"
+
+        total_compile_errs = p1_compile_errs + fl_compile_errs
+        total_unf = n_suites_unf + len(unf_shards)
+        err_col = f"`{total_compile_errs}` compile / `{total_unf}` unfinished"
+
+        rows.append(
+            f"| `{label}` | {git_col} | {tree_col} | {mode_col} | {p1_col} | {build_col} | {p2_col} | {wp_col} | {err_col} |"
+        )
+
+    return issues, rows
+
+
 def compare_runs(args):
     runs = []
     for a in args:
@@ -473,6 +722,24 @@ def compare_runs(args):
         print(
             f"| `{label}` | {an} | {format_counts(s_wp)} | {format_counts(s_ui)} | {format_counts(fl)} | {reg_str} | {fix_str} |"
         )
+    print()
+
+    issues, att_rows = _evaluate_attestation(runs)
+    print("## Паспорт прогона (Run Attestation)\n")
+    if issues:
+        print(f"**Вердикт целостности (Integrity Check):** `WARNING / INVALID` ({len(issues)} issue(s))\n")
+        for iss in issues:
+            print(f"- **WARNING:** {iss}")
+        print()
+    else:
+        print("**Вердикт целостности (Integrity Check):** `VALID (все сьюты завершены, WebParagraph активен, обрывов и ошибок компиляции нет)`\n")
+
+    print(
+        "| Ref | Git Spec / Commit | `web_ui` Tree SHA | Режим | Part 1 (`felt`) файлы/сьюты | Part 2 Build (`ninja` / `ddc_outline`) | Part 2 (`flutter`) сьюты/шарды | `WebParagraph` | Компиляция / обрывы |"
+    )
+    print("| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+    for r in att_rows:
+        print(r)
     print()
 
     for label, run in runs[1:]:

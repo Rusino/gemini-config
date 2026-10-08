@@ -76,11 +76,16 @@ python3 ~/.gemini/config/skills/webparagraph-corpus/scripts/run_webparagraph_cor
 - `--skip-analyze` — Skip `dart analyze --fatal-infos` in Part 1.
 - `--repo <path>` — Path to the Flutter checkout (defaults to `/usr/local/google/home/jlavrova/.gemini/jetski/scratch/flutter`).
 
-## Inspecting Results
+## Inspecting Results & Run Attestation
 
 After the run finishes:
-1. Read `<out>/compare.md` (also printed to stdout at the end of the run) for the summary table, **Regressions vs baseline**, and **Fixed vs baseline**.
-2. Individual logs for each `<label>` are stored in `<out>/<label>/`:
+1. Read `<out>/compare.md` (also printed to stdout at the end of the run) for:
+   - The main summary table
+   - **Паспорт прогона (Run Attestation)** and **Вердикт целостности (Integrity Check)**: verifies git SHA, `web_ui` source tree SHA-256 (`web_ui_tree_sha256`), compiled `ddc_outline.dill` SHA-256 (`part2_ddc_outline_sha256`), corpus mode (`FULL` vs `TARGETED`), executed vs expected test files/suites/shards, `WebParagraph` active markers (`CanvasKit (Web Paragraph)` and `webparagraph/canvaskit.js`), and zero compile errors or unfinished suites/shards.
+   - **Regressions vs baseline** and **Fixed vs baseline**.
+2. **Mandatory Reporting Rule**: Whenever reporting corpus results to the user, always include both the main summary table and the **Паспорт прогона (Run Attestation)** table + **Вердикт целостности** verbatim from `<out>/compare.md`. Never report a run as clean if the Integrity Check is `WARNING / INVALID`.
+3. Individual logs and attestation metadata for each `<label>` are stored in `<out>/<label>/`:
+   - `attestation.json` — git commit/dirty state, `web_ui` source tree SHA-256, `ninja` action count, `ddc_outline.dill` SHA-256, and expected file counts
    - `analyze.log` — `dart analyze --fatal-infos` output
    - `felt.log`, `felt_summary.txt`, `felt_summary.json` — Part 1 (`web_ui`) raw log and parsed results
-   - `flutter.log`, `flutter_summary.txt`, `flutter_summary.json` — Part 2 (`packages/flutter`) raw log and parsed results
+   - `flutter.log` (or `flutter_shards/`), `flutter_summary.txt`, `flutter_summary.json` — Part 2 (`packages/flutter`) raw log and parsed results

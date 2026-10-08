@@ -18,10 +18,12 @@ Part 2 (`packages/flutter`):
 """
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
 import random
+import re
 import shutil
 import signal
 import subprocess
@@ -604,6 +606,100 @@ def checkout_web_ui_ref(repo, ref, worktree_patch_path):
         )
 
 
+def file_sha256_short(path):
+    p = pathlib.Path(path)
+    if not p.exists():
+        return None
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()[:12]
+
+
+def compute_web_ui_attestation(repo, ref):
+    web_ui = repo / "engine/src/flutter/lib/web_ui"
+    commit_target = "HEAD" if ref == "WORKTREE" else ref
+    git_sha = (
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--short=12", commit_target],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    )
+    git_subject = (
+        subprocess.run(
+            ["git", "-C", str(repo), "log", "-1", "--format=%s", commit_target],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    )
+    dirty_files = []
+    if ref == "WORKTREE":
+        diff_names = subprocess.run(
+            ["git", "-C", str(repo), "diff", "--name-only", "HEAD", "--", "engine/src/flutter/lib/web_ui"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.splitlines()
+        dirty_files = [ln.strip() for ln in diff_names if ln.strip()]
+
+    # Hash actual disk contents of web_ui/{lib,test} before temporary harness patches are injected
+    h = hashlib.sha256()
+    source_files = 0
+    for subdir in ("lib", "test"):
+        root = web_ui / subdir
+        if not root.exists():
+            continue
+        for p in sorted(root.rglob("*")):
+            if p.is_file() and p.suffix in (".dart", ".yaml"):
+                rel = str(p.relative_to(web_ui))
+                h.update(rel.encode("utf-8") + b"\0")
+                h.update(p.read_bytes())
+                h.update(b"\0")
+                source_files += 1
+
+    return {
+        "ref": ref,
+        "git_sha": git_sha,
+        "git_subject": git_subject,
+        "dirty_files": dirty_files,
+        "web_ui_tree_sha256": h.hexdigest()[:12],
+        "web_ui_source_files": source_files,
+    }
+
+
+def count_chrome_eligible_tests(repo, test_files):
+    fw_root = repo / "packages/flutter"
+    eligible = 0
+    for rel in test_files:
+        p = fw_root / rel
+        if not p.exists():
+            continue
+        head = p.read_text(errors="replace")[:1500]
+        if "@TestOn('!chrome')" not in head and '@TestOn("!chrome")' not in head:
+            eligible += 1
+    return eligible
+
+
+def parse_ninja_actions(ninja_log_path):
+    if not ninja_log_path.exists():
+        return None
+    text = ninja_log_path.read_text(errors="replace")
+    if "no work to do" in text:
+        return "0/0 (no-op)"
+    steps = re.findall(r"\[(\d+)/(\d+)\]", text)
+    if steps:
+        last_done, total = steps[-1]
+        return f"{last_done}/{total}"
+    return "ran"
+
+
 def collect_all_framework_web_tests(repo, custom_dirs=None):
     fw_root = repo / "packages/flutter"
     if custom_dirs:
@@ -913,6 +1009,22 @@ def main():
             log(f"=== [{label}] Switching web_ui to {ref} ===", driver_log)
             checkout_web_ui_ref(repo, ref, worktree_patch)
 
+            att_path = ref_dir / "attestation.json"
+            attestation = {}
+            if args.resume and att_path.exists():
+                try:
+                    attestation = json.loads(att_path.read_text())
+                except Exception:
+                    attestation = {}
+            attestation.update(compute_web_ui_attestation(repo, ref))
+            attestation["label"] = label
+            attestation["corpus_mode"] = (
+                "full" if args.full else ("custom" if args.flutter_tests else "targeted")
+            )
+            attestation["part"] = args.part
+            attestation["force_test_fonts"] = not args.no_force_test_fonts
+            att_path.write_text(json.dumps(attestation, indent=2))
+
             felt_sum_json = ref_dir / "felt_summary.json"
             if run_part1 and args.resume and felt_sum_json.exists():
                 log(f"[{label}] Skipping Part 1 (--resume: {felt_sum_json} exists)", driver_log)
@@ -939,6 +1051,7 @@ def main():
                     log(f"[{label}] dart analyze exit={res.returncode} ({dt}s)", driver_log)
                     with open(status_file, "a") as sf:
                         sf.write(f"analyze={res.returncode}\n")
+                    attestation["analyze_rc"] = res.returncode
 
                 if not args.no_force_test_fonts:
                     ftf_applied = ensure_force_test_fonts(repo)
@@ -955,6 +1068,10 @@ def main():
                     )
                 else:
                     ui_tests = UI_TEXT_TESTS
+                attestation["part1_expected_wp_files"] = len(wp_tests)
+                attestation["part1_expected_ui_files"] = len(ui_tests)
+                att_path.write_text(json.dumps(attestation, indent=2))
+
                 felt_cmd = [
                     "./dev/felt",
                     "test",
@@ -984,6 +1101,9 @@ def main():
                 log(f"[{label}] Part 1 (felt test) exit={rc} ({dt}s)", driver_log)
                 with open(status_file, "a") as sf:
                     sf.write(f"felt={rc}\n")
+                attestation["part1_rc"] = rc
+                attestation["part1_duration_s"] = dt
+                att_path.write_text(json.dumps(attestation, indent=2))
 
                 felt_sum_txt = ref_dir / "felt_summary.txt"
                 with open(felt_sum_txt, "w") as sf:
@@ -1014,10 +1134,19 @@ def main():
                         stderr=subprocess.STDOUT,
                         check=True,
                     )
-                log(f"[{label}] Built flutter/web_sdk ({int(time.time() - t0)}s)", driver_log)
+                ninja_dt = int(time.time() - t0)
+                log(f"[{label}] Built flutter/web_sdk ({ninja_dt}s)", driver_log)
+
+                dill_path = repo / "engine/src/out/wasm_release/flutter_web_sdk/kernel/ddc_outline.dill"
+                attestation["part2_ninja_duration_s"] = ninja_dt
+                attestation["part2_ninja_actions"] = parse_ninja_actions(ninja_log)
+                attestation["part2_ddc_outline_sha256"] = file_sha256_short(dill_path)
 
                 if args.full or args.flutter_tests:
                     fw_tests = collect_all_framework_web_tests(repo, args.flutter_tests)
+                    attestation["part2_expected_files"] = len(fw_tests)
+                    attestation["part2_expected_chrome_suites"] = count_chrome_eligible_tests(repo, fw_tests)
+                    att_path.write_text(json.dumps(attestation, indent=2))
                     rc, shards_target = run_sharded_framework_tests(
                         repo=repo,
                         env=env,
@@ -1031,6 +1160,11 @@ def main():
                     )
                     summary_input = shards_target
                 else:
+                    attestation["part2_expected_files"] = len(FRAMEWORK_TEXT_TESTS)
+                    attestation["part2_expected_chrome_suites"] = count_chrome_eligible_tests(
+                        repo, FRAMEWORK_TEXT_TESTS
+                    )
+                    att_path.write_text(json.dumps(attestation, indent=2))
                     flutter_log = ref_dir / "flutter.log"
                     flutter_cmd = [
                         str(repo / "bin/flutter"),
@@ -1060,6 +1194,9 @@ def main():
 
                 with open(status_file, "a") as sf:
                     sf.write(f"flutter={rc}\n")
+                attestation["part2_rc"] = rc
+                attestation["timestamp_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                att_path.write_text(json.dumps(attestation, indent=2))
 
                 fl_sum_txt = ref_dir / "flutter_summary.txt"
                 fl_sum_json = ref_dir / "flutter_summary.json"
