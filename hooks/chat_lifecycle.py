@@ -13,6 +13,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -85,11 +86,18 @@ def find_app_data_dirs() -> list[str]:
   return res
 
 
+_csrf_cache: dict[str, str] = {}
+
+
 def get_ls_csrf_token(ls_address: str) -> str:
   """Gets the CSRF token from environment or extracts it from the running Hub server."""
   token = os.environ.get("ANTIGRAVITY_CSRF_TOKEN")
   if token:
     return token
+  # Scraping the Hub page costs up to 1 s and hooks issue several RPCs within
+  # a 5 s budget, so a found token is reused for the life of the process
+  if ls_address in _csrf_cache:
+    return _csrf_cache[ls_address]
   try:
     url = f"http://{ls_address}/" if not ls_address.startswith(("http://", "https://")) else ls_address
     req = urllib.request.Request(url, headers={"User-Agent": "chat_lifecycle"})
@@ -97,6 +105,7 @@ def get_ls_csrf_token(ls_address: str) -> str:
       html = resp.read().decode("utf-8", errors="ignore")
       m = re.search(r'"csrfToken":\s*"([^"]+)"', html)
       if m:
+        _csrf_cache[ls_address] = m.group(1)
         return m.group(1)
   except Exception:
     pass
@@ -346,12 +355,24 @@ def resolve_handoff_model(current_conv_id: str, tier: str = "pro", explicit: str
   raise RuntimeError("no usable model found in GetAvailableModels")
 
 
-def start_conversation_exact(model_enum: str, title: str, prompt: str, project_id: str) -> str:
+class BeforeSendError(RuntimeError):
+  """before_send failed; the chat exists (`cascade_id`) but got no message."""
+
+  def __init__(self, cascade_id: str, cause: Exception):
+    super().__init__(f"{cause} (empty chat {cascade_id} was not started)")
+    self.cascade_id = cascade_id
+
+
+def start_conversation_exact(
+    model_enum: str, title: str, prompt: str, project_id: str, before_send=None
+) -> str:
   """Creates a visible conversation pinned to an exact plan model.
 
   Mirrors `agentapi new-conversation` (StartCascade -> title -> first message), which
   can only express Gemini tiers. No sourceMetadata is sent, so the chat is listed in
   the sidebar (the equivalent of `env -u ANTIGRAVITY_SOURCE_METADATA`).
+  before_send(cascade_id) runs before the first message; if it raises, the
+  message is not sent and BeforeSendError is raised.
   """
   body = {
       "source": "CORTEX_TRAJECTORY_SOURCE_AGENT_API",
@@ -371,6 +392,11 @@ def start_conversation_exact(model_enum: str, title: str, prompt: str, project_i
       "UpdateConversationAnnotations",
       {"cascadeIds": [new_cid], "annotations": {"title": title}, "mergeAnnotations": True},
   )
+  if before_send:
+    try:
+      before_send(new_cid)
+    except Exception as exc:
+      raise BeforeSendError(new_cid, exc) from exc
   ls_rpc(
       "SendUserCascadeMessage",
       {"cascadeId": new_cid, "items": [{"text": prompt}], "blocking": False},
@@ -833,13 +859,18 @@ def create_handoff(
 ) -> dict:
   """Executes a clean handoff to a new conversation.
 
-  1. Resolves/verifies summary artifact file. If notes are provided, writes/enriches summary.
-  2. Builds title based on existing topic or new_topic.
+  1. Builds title based on existing topic or new_topic.
+  2. Resolves the summary. In a project it is the chain state file (seeded from
+     summary_file if only that exists, never from a template; fails before
+     launching if neither exists). Outside a project it is the handoff_summary
+     artifact, written/enriched from notes if needed.
   3. Launches the continuation directly via Language Server RPC with an exact plan model
      (explicit --model -> inherited from the current chat's last turn -> $HANDOFF_MODEL /
      <app_data_dir>/handoff_model -> agentapi tier `model`), preserving ANTIGRAVITY_PROJECT_ID
      and sending no sourceMetadata (chat stays visible). Falls back to
      `agentapi new-conversation --model=<tier>` if the RPC path is unavailable.
+     In a project the state file and owned `doing` items move to the new chat
+     before its first message (RPC path) or right after launch (agentapi path).
   4. Advances lifecycle chain markers (advances old chat to ✓ and new to ⦿).
   5. Verifies sourceMetadata: null.
   """
@@ -853,57 +884,115 @@ def create_handoff(
   time_str = get_current_time_str()
   cont_title = f"[{time_str}] {MARKER_ACTIVE} {new_topic}"
 
-  # 2. Resolve summary artifact file
-  if not summary_file:
-    summary_file = get_handoff_summary_path(current_conv_id, new_topic)
-
-  # Check if summary file exists; if not or if notes provided, create/update it
-  if not os.path.isfile(summary_file) or notes:
-    os.makedirs(os.path.dirname(summary_file), exist_ok=True)
-    body_notes = f"\n\n## Status and Notes\n{notes.strip()}\n" if notes else ""
-    with open(summary_file, "w", encoding="utf-8") as f:
-      f.write(
-          f"# Handoff Summary: {new_topic}\n\n"
-          f"Continuation of conversation://{current_conv_id}.{body_notes}\n"
-          f"## Epic Roadmap\n- [ ] {next_step_prompt.strip() if next_step_prompt else 'Continue investigation/tasks from previous conversation.'}\n\n"
-          f"## Next Steps\n- {next_step_prompt.strip() if next_step_prompt else 'Continue investigation/tasks from previous conversation.'}\n"
-      )
-
-  # 3. Build continuation prompt
-  prompt = (
-      f"Continuing unfinished work from previous conversation (conversation://{current_conv_id}). "
-      f"Read {summary_file} via view_file, review completed steps, remaining Epic Roadmap backlog, and discarded hypotheses, "
-      f"and immediately continue executing from the next step recorded in the summary without asking "
-      f"for confirmation (unless the summary explicitly states it is waiting for user input)."
-  )
-  if next_step_prompt:
-    prompt = f"{prompt}\n\nNext immediate task: {next_step_prompt}"
-
-  # 4. Determine project ID to preserve
+  # 2. Determine project ID to preserve
   project_id = os.environ.get("ANTIGRAVITY_PROJECT_ID", "")
   if not project_id:
+    # Same reader as context_guard (incl. its immutable=1 fallback), so a WAL
+    # database without its -shm file cannot make the two disagree
+    from context_guard import _query_summary_db
+
     for d in find_app_data_dirs():
       db_file = os.path.join(d, SUMMARY_DB_NAME)
-      if os.path.isfile(db_file):
-        try:
-          conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=1.0)
-          cur = conn.cursor()
-          cur.execute("SELECT project_id FROM conversation_summaries WHERE conversation_id = ?", (current_conv_id,))
-          row = cur.fetchone()
-          conn.close()
-          if row and row[0]:
-            project_id = str(row[0]).strip()
-            break
-        except Exception:
-          pass
+      row = _query_summary_db(db_file, current_conv_id) if os.path.isfile(db_file) else None
+      if row and row[1]:
+        project_id = str(row[1]).strip()
+        break
+  in_project = bool(project_id) and project_id != "outside-of-project"
+
+  ignored_summary = ""
+  if in_project:
+    import roadmap
+
+    # The chain state file is the summary; it is never synthesized from a
+    # template, because a stub would hide that the agent recorded nothing
+    state_file = roadmap.state_path(project_id, current_conv_id)
+    os.makedirs(os.path.dirname(state_file), exist_ok=True)
+    if summary_file and os.path.abspath(summary_file) != state_file:
+      if os.path.isfile(state_file):
+        ignored_summary = summary_file
+      elif os.path.isfile(summary_file):
+        # The guard may have resolved the chat as outside-project from a
+        # stale DB row and asked for a handoff_summary; carry it over
+        shutil.copyfile(summary_file, state_file)
+      else:
+        raise RuntimeError(f"summary file {summary_file} does not exist")
+    if notes:
+      block = f"\n## Handoff notes\n{notes.strip()}\n"
+      existing = ""
+      if os.path.isfile(state_file):
+        with open(state_file, "r", encoding="utf-8") as f:
+          existing = f.read()
+      # A failed launch is retried with the same arguments
+      if block not in existing:
+        with open(state_file, "a", encoding="utf-8") as f:
+          f.write(block)
+    if not os.path.isfile(state_file):
+      raise RuntimeError(
+          f"chain state file {state_file} does not exist: write it first (goal, current"
+          " state with evidence, failed hypotheses, running tasks, exact next step) or pass --notes"
+      )
+    summary_file = state_file
+    prompt = (
+        f"Continuing unfinished work from previous conversation (conversation://{current_conv_id}). "
+        f"First run `python3 ~/.gemini/config/hooks/roadmap.py show`, then read your chain state file "
+        f"{os.path.dirname(state_file)}/<this conversation's id>.md via view_file (`python3 "
+        f"~/.gemini/config/hooks/roadmap.py state-path $ANTIGRAVITY_CONVERSATION_ID` prints the path; "
+        f"if the file does not exist yet, run `python3 ~/.gemini/config/hooks/roadmap.py state-move "
+        f"{current_conv_id} $ANTIGRAVITY_CONVERSATION_ID` first). "
+        f"Verify the recorded state before building on it (e.g. reproduce the failing test, check git status), "
+        f"then continue from the recorded next step without asking for confirmation (unless the state file "
+        f"says it is waiting for user input). Keep the state file and roadmap statuses current as you work."
+    )
+  else:
+    # 3. Resolve summary artifact file
+    if not summary_file:
+      summary_file = get_handoff_summary_path(current_conv_id, new_topic)
+
+    # Check if summary file exists; if not or if notes provided, create/update it
+    if not os.path.isfile(summary_file) or notes:
+      os.makedirs(os.path.dirname(summary_file), exist_ok=True)
+      body_notes = f"\n\n## Status and Notes\n{notes.strip()}\n" if notes else ""
+      with open(summary_file, "w", encoding="utf-8") as f:
+        f.write(
+            f"# Handoff Summary: {new_topic}\n\n"
+            f"Continuation of conversation://{current_conv_id}.{body_notes}\n"
+            f"## Epic Roadmap\n- [ ] {next_step_prompt.strip() if next_step_prompt else 'Continue investigation/tasks from previous conversation.'}\n\n"
+            f"## Next Steps\n- {next_step_prompt.strip() if next_step_prompt else 'Continue investigation/tasks from previous conversation.'}\n"
+        )
+
+    # 4. Build continuation prompt
+    prompt = (
+        f"Continuing unfinished work from previous conversation (conversation://{current_conv_id}). "
+        f"Read {summary_file} via view_file, review completed steps, remaining Epic Roadmap backlog, and discarded hypotheses, "
+        f"and immediately continue executing from the next step recorded in the summary without asking "
+        f"for confirmation (unless the summary explicitly states it is waiting for user input)."
+    )
+  if next_step_prompt:
+    prompt = f"{prompt}\n\nNext immediate task: {next_step_prompt}"
 
   # 5. Launch the continuation: exact plan model via LS RPC, else agentapi tier.
   project_id_final = project_id if project_id and project_id != "outside-of-project" else "outside-of-project"
   model_info: dict = {}
   new_cid = ""
+  moved_to = ""
+
+  def move_state(cid: str) -> None:
+    nonlocal moved_to
+    roadmap.state_move(project_id, moved_to or current_conv_id, cid)
+    moved_to = cid
+
   try:
     model_info = resolve_handoff_model(current_conv_id, tier=model, explicit=exact_model)
-    new_cid = start_conversation_exact(model_info["enum"], cont_title, prompt, project_id_final)
+    new_cid = start_conversation_exact(
+        model_info["enum"], cont_title, prompt, project_id_final,
+        before_send=move_state if in_project else None,
+    )
+  except BeforeSendError as exc:
+    try:
+      archive_conversations([exc.cascade_id])
+    except Exception:
+      pass
+    raise RuntimeError(f"state file handover failed, no continuation was started: {exc}") from exc
   except Exception as exc:
     model_info = {"source": f"agentapi tier:{model}", "fallback_reason": str(exc)[:300]}
     env = {k: v for k, v in os.environ.items() if k != "ANTIGRAVITY_SOURCE_METADATA"}
@@ -923,6 +1012,25 @@ def create_handoff(
       raise RuntimeError(f"Failed to parse conversationId from agentapi output: {res.stdout}")
     new_cid = m.group(1)
 
+  extra: dict = {}
+  if in_project:
+    # agentapi sends the first message itself, so here the move can only
+    # follow; the prompt tells the continuation to run it if it gets there first
+    if moved_to != new_cid:
+      try:
+        move_state(new_cid)
+      except Exception as exc:
+        extra["state_move_error"] = (
+            f"{exc}; the continuation is told to run `roadmap.py state-move` itself"
+        )
+    summary_file = roadmap.state_path(project_id, new_cid)
+    try:
+      extra["roadmap"] = roadmap.show(project_id)
+    except Exception as exc:
+      extra["roadmap"] = f"(roadmap unavailable: {exc})"
+    if ignored_summary:
+      extra["ignored_summary_file"] = ignored_summary
+
   # 6. Verify sourceMetadata (lives under metadata.sourceMetadata; null => visible in the sidebar)
   fetched, source_meta = get_conversation_source_metadata(new_cid)
 
@@ -938,7 +1046,19 @@ def create_handoff(
       "model": model_info,
       "source_metadata": source_meta,
       "verified_visible": bool(fetched and source_meta is None),
+      **extra,
   }
+
+
+def print_handoff_result(result: dict) -> None:
+  # The roadmap is plain text after the JSON so the old chat can paste it
+  # verbatim into its final message; escaped inside JSON it would be unreadable
+  out = dict(result)
+  roadmap_text = out.pop("roadmap", "")
+  print(json.dumps(out, ensure_ascii=False, indent=2))
+  if roadmap_text:
+    print("\n--- Roadmap (paste this block into your final message) ---")
+    print(roadmap_text)
 
 
 def get_conversation_source_metadata(conv_id: str) -> tuple[bool, object]:
@@ -1365,10 +1485,13 @@ Commands:
                                       (brain/<id>/handoff_summary_<slug>_<id8>.md).
   handoff <id> [summary_file]         Create a visible continuation chat in the same
           [--notes "..."]             project, verify sourceMetadata is null and
-          [--next "..."]              update chain markers. Writes/updates the
-          [--model <m>]               summary if --notes is given. The continuation
-                                      keeps the model of <id>'s last turn (see Notes);
-                                      --model pins one explicitly.
+          [--next "..."]              update chain markers. In a project the summary
+          [--model <m>]               is the chain state file (roadmap.py state-path);
+                                      it moves to the new chat and the roadmap is
+                                      printed after the JSON. Outside projects it
+                                      writes/updates the summary if --notes is given.
+                                      The continuation keeps the model of <id>'s last
+                                      turn (see Notes); --model pins one explicitly.
   model [id]                          Read-only: show the model <id> last used and the
                                       model a handoff would pick now.
   audit [--fix] [--project <p>]       Scan visible top-level chats and handoff chains
@@ -1498,7 +1621,7 @@ if __name__ == "__main__":
     if not cid:
       cid = os.environ.get("CONVERSATION_ID", "") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID", "")
     result = create_handoff(cid, summary_file=summary, notes=notes, next_step_prompt=next_step, exact_model=exact_model)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    print_handoff_result(result)
   elif len(sys.argv) > 1 and sys.argv[1] == "audit":
     args = sys.argv[2:]
     do_fix = False

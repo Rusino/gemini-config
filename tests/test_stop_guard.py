@@ -46,6 +46,53 @@ class TestStopGuard(unittest.TestCase):
       with self.subTest(cmd=cmd):
         self.assertFalse(stop_guard.is_inspection_command(cmd))
 
+  def run_pending_stop(self, tmp_dir: str, state: dict) -> dict:
+    transcript = os.path.join(tmp_dir, "transcript.jsonl")
+    with open(transcript, "w") as f:
+      f.write(json.dumps({"step_index": 1, "type": "USER_INPUT", "content": "hi"}) + "\n")
+    stop_guard.save_state(os.path.join(tmp_dir, "scratch", ".context_guard_state.json"), state)
+    data = {
+        "conversationId": "c1",
+        "transcriptPath": transcript,
+        "artifactDirectoryPath": tmp_dir,
+        "fullyIdle": True,
+        "terminationReason": "MODEL_STOP",
+    }
+    with patch("sys.stdin", io.StringIO(json.dumps(data))), \
+         patch("sys.stdout", new_callable=io.StringIO) as mock_out, \
+         patch.object(stop_guard, "play_stop_sound"):
+      stop_guard.main()
+    return json.loads(mock_out.getvalue())
+
+  def test_pending_in_project_handoff_blocks_stop_once(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      state = {
+          "pending_handoff_launch": True,
+          "pending_turn_start": True,
+          "pending_in_project": True,
+          "pending_handoff_file": "/r/proj/state/c1.md",
+          "pending_title": "[10:00] Task",
+      }
+      out = self.run_pending_stop(tmp_dir, state)
+      self.assertEqual(out.get("decision"), "continue")
+      reason = out["reason"]
+      self.assertIn("roadmap.py set c1", reason)
+      self.assertIn("/r/proj/state/c1.md", reason)
+      self.assertIn("handoff c1 --next", reason)
+      self.assertNotIn("handoff_summary", reason)
+      state["stop_blocked_handoff"] = True
+      self.assertEqual(self.run_pending_stop(tmp_dir, state), {})
+
+  def test_pending_outside_project_handoff_names_summary(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      out = self.run_pending_stop(tmp_dir, {
+          "pending_handoff_launch": True,
+          "pending_handoff_file": "/b/c1/handoff_summary_c1.md",
+      })
+      self.assertEqual(out.get("decision"), "continue")
+      self.assertIn('handoff c1 "/b/c1/handoff_summary_c1.md"', out["reason"])
+      self.assertNotIn("roadmap.py", out["reason"])
+
   def test_unverified_code_edit_blocks_stop(self):
     fake_src = "/workspace/project/feature.py"
     with tempfile.NamedTemporaryFile("w", suffix=".jsonl") as f_trans, \

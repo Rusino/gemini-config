@@ -11,3 +11,6 @@ __pycache__/
 # OS files
 .DS_Store
 
+# Runtime data written by hooks (per-machine project ids)
+logs/
+roadmaps/

@@ -320,11 +320,23 @@ def main() -> None:
         else f"/tmp/handoff_summary_{short_id}.md"
     )
     handoff_file = state.get("pending_handoff_file") or default_handoff
+    if state.get("pending_in_project"):
+      steps = (
+          f"1. Update roadmap statuses: `python3 ~/.gemini/config/hooks/roadmap.py set {conv_id} <ID> done|doing|todo`.\n"
+          f"2. Overwrite the chain state file `{handoff_file}` (goal, current state with evidence, failed hypotheses, "
+          f"running tasks and how to restart them, exact next step).\n"
+          f'3. Run `python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff {conv_id} --next "<1-line summary of next immediate action>"`.\n'
+          f"4. Paste the roadmap block from its output and the link `[👉 {new_title}](conversation://<new_conversation_id>)` into your final message."
+      )
+    else:
+      steps = (
+          f"1. Make sure the summary `{handoff_file}` is written and current.\n"
+          f'2. Run `python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff {conv_id} "{handoff_file}" --next "<1-line summary of next immediate action>"`.\n'
+          f"3. Give the user the link `[👉 {new_title}](conversation://<new_conversation_id>)`."
+      )
     reason = (
-        f"[HANDOFF GUARD] You prepared the summary `{handoff_file}`, but attempted to finish your turn "
-        f"WITHOUT launching the continuation conversation! Call `run_command`:\n"
-        f'   `python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff {conv_id} "{handoff_file}" --next "<1-line summary of next immediate action>"`\n'
-        f"and provide the link `[👉 {new_title}](conversation://<new_conversation_id>)` to the user."
+        "[HANDOFF GUARD] A context handoff is pending, but you attempted to finish your turn "
+        f"WITHOUT launching the continuation conversation. Do it now:\n{steps}"
     )
     print(
         json.dumps(

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Tests for chat_lifecycle.py."""
 
+import contextlib
+import io
+import json
 import os
 import sqlite3
 import sys
@@ -14,6 +17,18 @@ import chat_lifecycle
 
 
 class TestChatLifecycle(unittest.TestCase):
+
+  def setUp(self):
+    # Handoffs read the project from the environment first and write state
+    # files under the roadmaps dir, so neither may leak from the real session
+    self.roadmaps_tmp = tempfile.TemporaryDirectory()
+    self.env = patch.dict(os.environ, {"JETSKI_ROADMAPS_DIR": self.roadmaps_tmp.name})
+    self.env.start()
+    os.environ.pop("ANTIGRAVITY_PROJECT_ID", None)
+
+  def tearDown(self):
+    self.env.stop()
+    self.roadmaps_tmp.cleanup()
 
   def test_clean_base_title_markers(self):
     cases = [
@@ -253,7 +268,7 @@ class TestChatLifecycle(unittest.TestCase):
         conn.execute(
             "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, project_id TEXT)"
         )
-        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?, ?)", ("parent-1", "[10:00] ⦿ My Feature", "proj-abc"))
+        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?, ?)", ("parent-1", "[10:00] ⦿ My Feature", "outside-of-project"))
       conn.close()
 
       mock_run_res = unittest.mock.MagicMock()
@@ -381,7 +396,7 @@ class TestChatLifecycle(unittest.TestCase):
         conn.execute(
             "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, project_id TEXT)"
         )
-        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?, ?)", ("parent-notes", "[10:00] ⦿ Parent Task", "proj-1"))
+        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?, ?)", ("parent-notes", "[10:00] ⦿ Parent Task", "outside-of-project"))
       conn.close()
 
       mock_run_res = unittest.mock.MagicMock(returncode=0, stdout='{"conversationId": "child-notes"}')
@@ -412,6 +427,161 @@ class TestChatLifecycle(unittest.TestCase):
         self.assertIn("Completed part 1, now starting part 2", content)
         self.assertEqual(chat_lifecycle.get_conversation_title("parent-notes"), "[10:00] ▸ Parent Task")
         self.assertEqual(chat_lifecycle.get_conversation_title("child-notes"), "[15:55] ⦿ Parent Task")
+
+  def make_project_db(self, tmp_dir: str, cid: str = "parent-1") -> None:
+    conn = sqlite3.connect(os.path.join(tmp_dir, chat_lifecycle.SUMMARY_DB_NAME))
+    with conn:
+      conn.execute(
+          "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, project_id TEXT)"
+      )
+      conn.execute("INSERT INTO conversation_summaries VALUES (?, ?, ?)", (cid, "[10:00] ⦿ My Feature", "proj-abc"))
+    conn.close()
+
+  def handoff_patches(self, tmp_dir: str, start_mock):
+    return (
+        patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]),
+        patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=False),
+        patch.object(chat_lifecycle, "resolve_handoff_model", return_value={"enum": "M1", "id": "m1", "label": "M1", "source": "inherited"}),
+        patch.object(chat_lifecycle, "start_conversation_exact", start_mock),
+        patch.object(chat_lifecycle, "get_conversation_source_metadata", return_value=(True, None)),
+        patch.object(chat_lifecycle, "get_current_time_str", return_value="15:45"),
+    )
+
+  def test_in_project_handoff_moves_state_file_and_returns_roadmap(self):
+    import roadmap
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.make_project_db(tmp_dir)
+      roadmap.add_item("proj-abc", "parent-1", "Ship it")
+      roadmap.set_status("proj-abc", "parent-1", "R1", "doing")
+      old_state = roadmap.state_path("proj-abc", "parent-1")
+      os.makedirs(os.path.dirname(old_state))
+      with open(old_state, "w", encoding="utf-8") as f:
+        f.write("# State\nnext: rerun test_foo\n")
+      start = unittest.mock.MagicMock(return_value="child-2")
+      p = self.handoff_patches(tmp_dir, start)
+      with p[0], p[1], p[2], p[3], p[4], p[5]:
+        res = chat_lifecycle.create_handoff(current_conv_id="parent-1", next_step_prompt="rerun test_foo")
+
+      new_state = roadmap.state_path("proj-abc", "child-2")
+      self.assertEqual(res["summary_file"], new_state)
+      self.assertFalse(os.path.exists(old_state))
+      with open(new_state, encoding="utf-8") as f:
+        self.assertEqual(f.read(), "# State\nnext: rerun test_foo\n")
+      self.assertNotIn("state_move_error", res)
+      self.assertIn("▸ R1 Ship it [child-2]", res["roadmap"])
+      prompt = start.call_args[0][2]
+      self.assertIn("roadmap.py show", prompt)
+      self.assertIn(os.path.dirname(new_state), prompt)
+      self.assertIn("Verify the recorded state", prompt)
+      self.assertIn("conversation://parent-1", prompt)
+      self.assertEqual(chat_lifecycle.HANDOFF_PARENT_RE.search(prompt).group(1), "parent-1")
+      self.assertFalse(os.path.exists(os.path.join(tmp_dir, "brain", "parent-1")))
+
+      with patch("sys.stdout", new_callable=io.StringIO) as out:
+        chat_lifecycle.print_handoff_result(res)
+      printed = out.getvalue()
+      head, _, tail = printed.partition("\n--- Roadmap")
+      self.assertEqual(json.loads(head)["new_conversation_id"], "child-2")
+      self.assertIn("▸ R1 Ship it", tail)
+
+  def test_in_project_handoff_without_state_file_fails_and_writes_no_stub(self):
+    import roadmap
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.make_project_db(tmp_dir)
+      start = unittest.mock.MagicMock(return_value="child-2")
+      p = self.handoff_patches(tmp_dir, start)
+      with p[0], p[1], p[2], p[3], p[4], p[5]:
+        with self.assertRaisesRegex(RuntimeError, "state file"):
+          chat_lifecycle.create_handoff(current_conv_id="parent-1", next_step_prompt="x")
+      start.assert_not_called()
+      self.assertFalse(os.path.exists(roadmap.state_path("proj-abc", "parent-1")))
+      self.assertFalse(os.path.exists(os.path.join(self.roadmaps_tmp.name, "proj-abc", "roadmap.json")))
+      self.assertFalse(os.path.exists(os.path.join(tmp_dir, "brain", "parent-1")))
+
+  def test_in_project_handoff_seeds_state_from_given_summary(self):
+    import roadmap
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.make_project_db(tmp_dir)
+      summary = os.path.join(tmp_dir, "handoff_summary_x.md")
+      with open(summary, "w", encoding="utf-8") as f:
+        f.write("# Summary written under the outside flow\n")
+      p = self.handoff_patches(tmp_dir, unittest.mock.MagicMock(return_value="child-2"))
+      with p[0], p[1], p[2], p[3], p[4], p[5]:
+        res = chat_lifecycle.create_handoff(current_conv_id="parent-1", summary_file=summary)
+      with open(roadmap.state_path("proj-abc", "child-2"), encoding="utf-8") as f:
+        self.assertEqual(f.read(), "# Summary written under the outside flow\n")
+      self.assertEqual(res["roadmap"], "Roadmap: empty")
+
+  def run_rpc_handoff(self, tmp_dir: str, extra_patches=()):
+    import roadmap
+
+    sent = []
+
+    def fake_rpc(method, body, timeout=20.0):
+      if method == "StartCascade":
+        return {"cascadeId": "child-2"}
+      if method == "SendUserCascadeMessage":
+        sent.append(os.path.isfile(roadmap.state_path("proj-abc", "child-2")))
+      return {}
+
+    p = self.handoff_patches(tmp_dir, chat_lifecycle.start_conversation_exact)
+    with contextlib.ExitStack() as stack:
+      for cm in (*p, patch.object(chat_lifecycle, "ls_rpc", side_effect=fake_rpc), *extra_patches):
+        stack.enter_context(cm)
+      return sent, chat_lifecycle.create_handoff(current_conv_id="parent-1")
+
+  def write_old_state(self) -> str:
+    import roadmap
+
+    old_state = roadmap.state_path("proj-abc", "parent-1")
+    os.makedirs(os.path.dirname(old_state), exist_ok=True)
+    with open(old_state, "w", encoding="utf-8") as f:
+      f.write("# State\n")
+    return old_state
+
+  def test_rpc_handoff_moves_state_before_first_message(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.make_project_db(tmp_dir)
+      self.write_old_state()
+      sent, res = self.run_rpc_handoff(tmp_dir)
+      self.assertEqual(sent, [True])
+      self.assertEqual(res["new_conversation_id"], "child-2")
+      self.assertNotIn("state_move_error", res)
+
+  def test_rpc_handoff_aborts_without_message_when_state_move_fails(self):
+    import roadmap
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.make_project_db(tmp_dir)
+      old_state = self.write_old_state()
+      with open(roadmap.state_path("proj-abc", "child-2"), "w", encoding="utf-8") as f:
+        f.write("foreign\n")
+      archive = unittest.mock.MagicMock()
+      run = unittest.mock.MagicMock()
+      with self.assertRaisesRegex(RuntimeError, "no continuation was started"):
+        self.run_rpc_handoff(tmp_dir, (
+            patch.object(chat_lifecycle, "archive_conversations", archive),
+            patch("subprocess.run", run),
+        ))
+      archive.assert_called_once_with(["child-2"])
+      self.assertFalse(any("new-conversation" in c.args[0] for c in run.call_args_list))
+      self.assertTrue(os.path.isfile(old_state))
+
+  def test_handoff_notes_are_not_duplicated_on_retry(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.make_project_db(tmp_dir)
+      old_state = self.write_old_state()
+      p = self.handoff_patches(tmp_dir, unittest.mock.MagicMock(side_effect=RuntimeError("down")))
+      with p[0], p[1], p[2], p[3], p[4], p[5], \
+           patch("subprocess.run", return_value=unittest.mock.MagicMock(returncode=1, stdout="", stderr="x")):
+        for _ in range(2):
+          with self.assertRaises(RuntimeError):
+            chat_lifecycle.create_handoff(current_conv_id="parent-1", notes="tests green")
+      with open(old_state, encoding="utf-8") as f:
+        self.assertEqual(f.read().count("tests green"), 1)
 
   def test_discover_chain_descendants_and_ignore_split_outs(self):
     with tempfile.TemporaryDirectory() as tmp_dir:

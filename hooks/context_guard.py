@@ -1,42 +1,54 @@
 #!/usr/bin/env python3
 """PreInvocation hook for Jetski to monitor conversation context size.
 
-Supports two modes:
-1. Turn-start handoff (`invocationNum == 0`): when total transcript size or step
-   count exceeds the threshold at the start of a user turn, instructs the agent
-   to answer the current request and then hand off to a new conversation.
-2. Mid-turn circuit breaker (`invocationNum > 0`): when context crosses the
-   threshold during a turn OR a single turn drags on for too many tool-call
-   iterations (`MAX_TURN_INVOCATIONS`), instructs the agent to stop immediately
-   at a safe checkpoint, record failed hypotheses to avoid repeating loops, and
-   hand off to a new conversation.
+The metric is the Language Server's own estimate of the context window usage
+(estimatedTokensUsed / maxContextTokens of the last model call). Levels:
+1. Soft (SOFT_PCT): a throttled reminder to hand off at the nearest
+   micro-boundary (test finished, hypothesis settled, commit, subagent back).
+2. Hard (HARD_PCT, or history already compacted): hand off now. At turn start
+   (`invocationNum == 0`) the agent first answers the user and stop_guard blocks
+   a stop without handoff; mid-turn it is reminded on every step until the
+   continuation is launched. Nothing is snoozed across turns.
+3. Mid-turn circuit breaker: a single turn with too many tool-call iterations
+   (`MAX_TURN_INVOCATIONS`) hands off as well.
+Every invocation appends one JSONL record to the guard log so silent misses
+are visible afterwards.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 import glob
 import json
 import os
 import re
 import sqlite3
 import sys
+import time
 from urllib.parse import unquote
 from zoneinfo import ZoneInfo
 
 DEFAULT_TIMEZONE = os.environ.get("JETSKI_TIMEZONE", "America/New_York")
 
-# Thresholds for triggering context handoff:
-# ~600 KB of full transcript (~150k tokens) or 160 trajectory steps.
-MAX_FULL_TRANSCRIPT_KB = int(os.environ.get("JETSKI_MAX_TRANSCRIPT_KB", "600"))
-MAX_STEPS = int(os.environ.get("JETSKI_MAX_STEPS", "160"))
+# Percent of the model's context window
+SOFT_PCT = float(os.environ.get("JETSKI_CONTEXT_SOFT_PCT", "60"))
+HARD_PCT = float(os.environ.get("JETSKI_CONTEXT_HARD_PCT", "80"))
+RPC_TIMEOUT_S = 1.5
+# Fallback when the RPC fails: real transcripts average ~2 bytes per token
+# (a 360 KB transcript_full.jsonl was 176k tokens), not the ~4 often assumed
+FALLBACK_BYTES_PER_TOKEN = 2.0
+FALLBACK_MAX_TOKENS = 256000
+# initialNumSteps grows by ~2 per invocation, so this re-reminds about every
+# 10 invocations without persisting a counter on every call
+SOFT_REMIND_EVERY_STEPS = 20
 # Maximum tool-call iterations within a single turn before circuit-breaking
 # (set high so normal 25-step debugging turns in fresh chats do not hand off early):
 MAX_TURN_INVOCATIONS = int(os.environ.get("JETSKI_MAX_TURN_INVOCATIONS", "80"))
-
-# Snooze increments so the hook does not spam while the agent performs the handoff
-# or if the user chooses to continue in the same chat:
-SNOOZE_KB = 300
-SNOOZE_STEPS = 80
+# Lets the agent finish the handoff tool calls without re-tripping the breaker
 SNOOZE_TURN_INVOCATIONS = 40
+
+DEFAULT_LOG_PATH = "~/.gemini/config/logs/context_guard.jsonl"
+LOG_MAX_BYTES = 1_000_000
+LIFECYCLE_CLI = "~/.gemini/config/hooks/chat_lifecycle.py"
+ROADMAP_CLI = "~/.gemini/config/hooks/roadmap.py"
 
 # App data dirs of the supported clients, in lookup order. Antigravity keeps
 # conversation_summaries.db (with project ids) in ~/.gemini/antigravity; some
@@ -332,6 +344,19 @@ def get_handoff_launch_step_in_turn(transcript_path: str) -> int:
   return launch_idx
 
 
+CONTINUATION_ID_RE = re.compile(r'"(?:new_conversation_id|conversationId)":\s*"([A-Za-z0-9_\-]+)"')
+
+
+def get_continuation_id(transcript_path: str, launch_step: int) -> str:
+  """Id of the chat launched at launch_step, from its command output, or ""."""
+  for idx, step in parse_current_turn_steps(transcript_path):
+    if idx > launch_step and step.get("type") == "GENERIC":
+      m = CONTINUATION_ID_RE.search(str(step.get("content", "")))
+      if m:
+        return m.group(1)
+  return ""
+
+
 def build_continuation_title(conv_id: str, fallback_text: str = "") -> str:
   raw_title, _ = get_conversation_db_info(conv_id)
   base_title = CONT_SUFFIX_RE.sub("", raw_title).strip()
@@ -373,40 +398,87 @@ def save_state(state_path: str, state: dict) -> None:
     pass
 
 
-def main() -> None:
+def measure_context(conv_id: str, transcript_path: str, gm_count_hint: int) -> dict:
+  """Context usage of the last model call via the LS RPC, else a KB estimate.
+
+  Returns pct/tokens/max/ckpt plus `fallback`, `err` and `gm_count` (number of
+  generator metadata entries). The count is reused as the next offset because
+  every entry embeds the full system prompt, so an unpaged response grows by
+  ~8 KB per model call.
+  """
+  m = {"fallback": False, "err": "", "gm_count": gm_count_hint}
+  t0 = time.monotonic()
   try:
-    raw_input = sys.stdin.read().strip()
-    if not raw_input:
-      print("{}")
-      return
-    data = json.loads(raw_input)
-  except Exception:
-    print("{}")
-    return
+    import chat_lifecycle
 
-  # Skip battle mode forks and subagents
-  if data.get("isBattleMode") or data.get("parentConversationId"):
-    print("{}")
-    return
-
-  conv_id = data.get("conversationId", "")
-  transcript_path = data.get("transcriptPath", "")
-  artifact_dir = data.get("artifactDirectoryPath", "")
-  workspace_paths = data.get("workspacePaths", [])
-  steps = int(data.get("initialNumSteps", 0))
-  invocation_num = int(data.get("invocationNum", 0))
-  last_user_input = data.get("lastUserInput", "")
-
-  size_kb = get_transcript_size_kb(transcript_path)
-
-  state_path = (
-      os.path.join(artifact_dir, "scratch", ".context_guard_state.json")
-      if artifact_dir
-      else f"/tmp/jetski_context_guard_{conv_id}.json"
+    gm = []
+    for off in (gm_count_hint - 1, 0) if gm_count_hint > 1 else (0,):
+      # Retry from 0 only on a quick empty answer, never after a slow one,
+      # so two RPC timeouts cannot add up past the hook's 5 s budget
+      if off == 0 and gm_count_hint > 1 and time.monotonic() - t0 > RPC_TIMEOUT_S:
+        break
+      resp = chat_lifecycle.ls_rpc(
+          "GetCascadeTrajectoryGeneratorMetadata",
+          {
+              "cascadeId": conv_id,
+              "generatorMetadataOffset": off,
+              "includeMessages": False,
+          },
+          timeout=RPC_TIMEOUT_S,
+      )
+      gm = resp.get("generatorMetadata") or []
+      if gm:
+        m["gm_count"] = off + len(gm)
+        break
+    for entry in reversed(gm):
+      csm = (entry.get("chatModel") or {}).get("chatStartMetadata") or {}
+      cwm = csm.get("contextWindowMetadata") or {}
+      if "estimatedTokensUsed" in cwm and int(cwm.get("maxContextTokens") or 0) > 0:
+        used = int(cwm["estimatedTokensUsed"])
+        cap = int(cwm["maxContextTokens"])
+        m.update(
+            pct=100.0 * used / cap,
+            tokens=used,
+            max=cap,
+            # The LS sends -1 until the first compaction and then omits the
+            # field, because proto3 JSON drops the zero value of checkpoint #0
+            ckpt=int(csm.get("checkpointIndex", 0)),
+        )
+        return m
+    m["err"] = "no contextWindowMetadata"
+  except Exception as e:
+    m["err"] = f"{type(e).__name__}: {e}"[:200]
+  tokens = int(
+      get_transcript_size_kb(transcript_path) * 1024 / FALLBACK_BYTES_PER_TOKEN
   )
-  state = load_state(state_path)
+  m.update(
+      pct=100.0 * tokens / FALLBACK_MAX_TOKENS,
+      tokens=tokens,
+      max=FALLBACK_MAX_TOKENS,
+      ckpt=-1,
+      fallback=True,
+  )
+  return m
 
-  raw_title, _ = get_conversation_db_info(conv_id, transcript_path)
+
+def resolve_handoff_target(
+    conv_id: str, transcript_path: str, artifact_dir: str
+) -> dict:
+  """Where the agent records its state for the handoff (reads SQLite, so trigger paths only).
+
+  In-project chats use the chain state file next to the project roadmap;
+  outside-project chats keep the handoff_summary artifact.
+  """
+  raw_title, project_id = get_conversation_db_info(conv_id, transcript_path)
+  if project_id and project_id != "outside-of-project":
+    try:
+      import roadmap
+
+      return {"in_project": True, "file": roadmap.state_path(project_id, conv_id)}
+    except Exception:
+      # An id that cannot be a path component (or a broken roadmap module)
+      # must not take the guard down; the summary flow still works
+      pass
   base_title = CONT_SUFFIX_RE.sub("", raw_title).strip()
   base_title = CONT_PREFIX_RE.sub("", base_title).strip()
   slug = re.sub(r"[^\w\-]+", "_", base_title, flags=re.UNICODE).strip("_")[:40]
@@ -416,13 +488,103 @@ def main() -> None:
       if slug
       else f"handoff_summary_{short_id}.md"
   )
-  handoff_file = (
-      os.path.join(artifact_dir, handoff_filename)
-      if artifact_dir
-      else f"/tmp/{handoff_filename}"
+  return {
+      "in_project": False,
+      "file": (
+          os.path.join(artifact_dir, handoff_filename)
+          if artifact_dir
+          else f"/tmp/{handoff_filename}"
+      ),
+  }
+
+
+TASKS_NOTE = (
+    "Running subagents/background tasks: wait for them if they finish within a"
+    " couple of minutes; background tasks are killed when the handoff runs, so"
+    " record what was running and the exact command to restart it."
+)
+
+
+def handoff_steps(conv_id: str, target: dict, new_title: str) -> str:
+  if target["in_project"]:
+    return (
+        f"1. Roadmap: `python3 {ROADMAP_CLI} set {conv_id} <ID> done|doing|todo`"
+        " (`add` for new work); never edit roadmap files directly.\n"
+        f"2. Overwrite the chain state file `{target['file']}` (write_to_file):"
+        " goal, current state with evidence (modified files, last build/test"
+        " result), failed hypotheses, running subagents/background tasks and how"
+        " to restart them, exact next step. It moves to the continuation as is.\n"
+        f'3. Run `python3 {LIFECYCLE_CLI} handoff {conv_id} --next "<1-line next'
+        ' action>"`.\n'
+        "4. In your final message paste the roadmap block from the handoff output"
+        f" and the link `[👉 {new_title}](conversation://<new_conversation_id>)`,"
+        " then end the turn."
+    )
+  return (
+      f"1. Write `{target['file']}` (write_to_file, UserFacing: true): goal, Epic"
+      " Roadmap checklist ([x] done / [ ] pending, never drop pending items from"
+      " earlier handoffs), modified files, failed hypotheses, running"
+      " subagents/background tasks and how to restart them, exact next step,"
+      f" link `[Previous Conversation](conversation://{conv_id})`.\n"
+      f'2. Run `python3 {LIFECYCLE_CLI} handoff {conv_id} "{target["file"]}"'
+      ' --next "<1-line next action>"`.\n'
+      f"3. End the turn with the link `[👉 {new_title}](conversation://<new_conversation_id>)`."
   )
 
-  # Reset per-turn invocation threshold at the start of each new user turn
+
+def _usage_str(m: dict) -> str:
+  est = ", estimated from transcript size" if m["fallback"] else ""
+  return (
+      f"{m['pct']:.0f}% of the context window"
+      f" ({m['tokens'] // 1000}k/{m['max'] // 1000}k tokens{est})"
+  )
+
+
+def _inject(*messages: str) -> dict:
+  return {"injectSteps": [{"ephemeralMessage": msg} for msg in messages]}
+
+
+def append_log(record: dict) -> None:
+  path = os.path.expanduser(
+      os.environ.get("JETSKI_CONTEXT_GUARD_LOG") or DEFAULT_LOG_PATH
+  )
+  try:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # One-step rotation bounds the log at ~2x LOG_MAX_BYTES; a rotation race
+    # between concurrent chats can only drop a few records
+    if os.path.exists(path) and os.path.getsize(path) > LOG_MAX_BYTES:
+      os.replace(path, path + ".1")
+    with open(path, "a", encoding="utf-8") as f:
+      f.write(json.dumps(record, ensure_ascii=False) + "\n")
+  except Exception:
+    pass
+
+
+def run(data: dict, log: dict) -> dict:
+  """Decides the hook output for one PreInvocation event and fills `log`."""
+  # Skip battle mode forks and subagents
+  if data.get("isBattleMode") or data.get("parentConversationId"):
+    log["level"] = "skip"
+    return {}
+
+  conv_id = data.get("conversationId", "")
+  transcript_path = data.get("transcriptPath", "")
+  artifact_dir = data.get("artifactDirectoryPath", "")
+  workspace_paths = data.get("workspacePaths", [])
+  steps = int(data.get("initialNumSteps", 0))
+  invocation_num = int(data.get("invocationNum", 0))
+  last_user_input = data.get("lastUserInput", "")
+  log.update(conv=conv_id, inv=invocation_num, steps=steps)
+
+  state_path = (
+      os.path.join(artifact_dir, "scratch", ".context_guard_state.json")
+      if artifact_dir
+      else f"/tmp/jetski_context_guard_{conv_id}.json"
+  )
+  state = load_state(state_path)
+
+  # Reset per-turn state at the start of each new user turn; a hard trigger
+  # that was ignored last turn is re-evaluated below rather than snoozed
   if invocation_num == 0:
     next_turn_inv_threshold = MAX_TURN_INVOCATIONS
     if (
@@ -432,6 +594,7 @@ def main() -> None:
     ):
       state["next_turn_inv_threshold"] = MAX_TURN_INVOCATIONS
       state["pending_handoff_launch"] = False
+      state["pending_turn_start"] = False
       state["handoff_completed"] = False
       save_state(state_path, state)
 
@@ -464,11 +627,15 @@ def main() -> None:
   if invocation_num > 0:
     launch_step = get_handoff_launch_step_in_turn(transcript_path)
     if launch_step >= 0:
-      if state.get("pending_handoff_launch") or not state.get(
-          "handoff_completed"
+      log["level"] = "post_handoff"
+      if (
+          state.get("pending_handoff_launch")
+          or not state.get("handoff_completed")
+          or "handed_off_to" not in state
       ):
         state["pending_handoff_launch"] = False
         state["handoff_completed"] = True
+        state["handed_off_to"] = get_continuation_id(transcript_path, launch_step)
         save_state(state_path, state)
       # Check if a background task / subagent woke the conversation up after handoff
       # or if the agent is still calling tools after launching the continuation:
@@ -477,70 +644,102 @@ def main() -> None:
           s for idx, s in turn_steps if idx > launch_step and s.get("type") != "GENERIC"
       ]
       if steps_after_launch:
-        stop_msg = (
+        return _inject(
             f"[CONTEXT GUARD: CHAT ALREADY HANDED OFF] Warning: this conversation ALREADY launched a continuation chat "
             f"(at step #{launch_step}), but resumed execution (e.g., woken up by a background `task` or subagent). "
             f"It is STRICTLY FORBIDDEN to continue debugging, editing files, or launching a second continuation chat here! "
             f"If any background tasks remain active, terminate them via `manage_task` (`kill`) and end your turn immediately."
         )
-        print(
-            json.dumps(
-                {"injectSteps": [{"ephemeralMessage": stop_msg}]},
-                ensure_ascii=False,
-            )
-        )
-        return
-      print("{}")
-      return
+      return {}
 
-  # Follow-up check: if handoff was triggered in a previous step of this turn,
-  # and the agent wrote handoff_summary.md in a separate step without calling
-  # agentapi new-conversation yet, remind it on EVERY step until it launches the chat!
-  if invocation_num > 0 and state.get("pending_handoff_launch"):
-    new_title = state.get("pending_title") or build_continuation_title(
-        conv_id, last_user_input
+  # The chat is closed for good once it handed off: work done here would
+  # split the task across two chats, so the user is sent to the continuation
+  # once per turn and the context triggers no longer apply
+  if "handed_off_to" in state:
+    log["level"] = "closed"
+    if invocation_num > 0:
+      return {}
+    cont = state["handed_off_to"]
+    where = (
+        f"conversation://{cont}"
+        if cont
+        else f"its continuation (`python3 {LIFECYCLE_CLI} status {conv_id}` shows it)"
     )
-    cmd_prefix = state.get("pending_cmd_prefix") or build_agentapi_prefix(
-        conv_id, transcript_path, workspace_paths
+    forward = (
+        f"`agentapi send-message {cont} \"<the user's message verbatim>\"`"
+        if cont
+        else "`agentapi send-message <continuation id> \"<the user's message verbatim>\"`"
     )
-    summary_exists = os.path.exists(handoff_file)
-    step1_text = (
+    return _inject(
+        f"[CONTEXT GUARD: CLOSED CHAT] This conversation was already handed off to {where}."
+        " If this turn was started by a background task or subagent, end it without a reply."
+        " Otherwise open your reply by telling the user that this is an old, closed chat and"
+        " that continuing here splits the work across chats and causes confusion. Do not work"
+        " on the request here; offer to forward the user's message to the continuation and,"
+        f" once the user agrees, run {forward} and end the turn."
+    )
+
+  m = measure_context(conv_id, transcript_path, int(state.get("gm_count", 0)))
+  log.update(
+      pct=round(m["pct"], 1),
+      tokens=m["tokens"],
+      max=m["max"],
+      ckpt=m["ckpt"],
+      fallback=m["fallback"],
+  )
+  if m["err"]:
+    log["err"] = m["err"]
+  if m["gm_count"] != state.get("gm_count", 0):
+    state["gm_count"] = m["gm_count"]
+    save_state(state_path, state)
+
+  pending = bool(state.get("pending_handoff_launch"))
+  # A turn-start trigger lets the agent answer the user first; stop_guard
+  # enforces the handoff at the end of the turn, so no mid-turn nagging
+  turn_start_pending = pending and bool(state.get("pending_turn_start"))
+  if invocation_num > 0 and pending and not turn_start_pending:
+    log["level"] = "pending"
+    handoff_file = state.get("pending_handoff_file", "")
+    missing = (
         ""
-        if summary_exists
-        else (
-            f"1. FIRST create the summary artifact `{handoff_file}` via `write_to_file` (`UserFacing: true`) "
-            f"(it does NOT exist on disk yet — do not launch the continuation chat without creating it!).\n2. THEN "
+        if os.path.exists(handoff_file)
+        else f" (`{handoff_file}` does not exist yet: write it first)"
+    )
+    return _inject(
+        "[CONTEXT GUARD REMINDER] The handoff is still pending. Stop all other"
+        f" investigation now and hand off{missing}:\n{TASKS_NOTE}\n"
+        + handoff_steps(
+            conv_id,
+            {"in_project": bool(state.get("pending_in_project")), "file": handoff_file},
+            state.get("pending_title") or "<title>",
         )
     )
-    reminder_msg = (
-        f"[CONTEXT GUARD REMINDER] You have NOT completed the handoff yet! "
-        f"IMMEDIATELY stop all other investigation/debugging actions and launch the continuation chat:\n"
-        f"{step1_text}"
-        f'   `python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff {conv_id} "{handoff_file}" --next "<1-line summary of next immediate action>"`\n'
-        f"After receiving `new_conversation_id`, immediately finish your turn and provide a clickable link to the user: "
-        f"`[👉 {new_title}](conversation://<new_conversation_id>)`."
-    )
-    print(
-        json.dumps(
-            {"injectSteps": [{"ephemeralMessage": reminder_msg}]},
-            ensure_ascii=False,
-        )
-    )
-    return
 
-  next_kb_threshold = float(
-      state.get("next_kb_threshold", MAX_FULL_TRANSCRIPT_KB)
-  )
-  next_steps_threshold = int(state.get("next_steps_threshold", MAX_STEPS))
-
-  size_or_steps_exceeded = (
-      size_kb >= next_kb_threshold or steps >= next_steps_threshold
-  )
+  late = m["ckpt"] >= 0
+  # The transcript-size estimate overcounts (untruncated tool output, history
+  # kept past compaction), so it may only nag; stop_guard enforces hard ones
+  hard = not pending and ((m["pct"] >= HARD_PCT and not m["fallback"]) or late)
   turn_loop_exceeded = (
       invocation_num > 0 and invocation_num >= next_turn_inv_threshold
   )
 
-  if not (size_or_steps_exceeded or turn_loop_exceeded):
+  if not (hard or turn_loop_exceeded):
+    messages = []
+    soft_due = steps - int(
+        state.get("soft_last_steps", -SOFT_REMIND_EVERY_STEPS)
+    ) >= SOFT_REMIND_EVERY_STEPS
+    if not pending and m["pct"] >= SOFT_PCT and soft_due:
+      log["level"] = "soft"
+      state["soft_last_steps"] = steps
+      save_state(state_path, state)
+      target = resolve_handoff_target(conv_id, transcript_path, artifact_dir)
+      messages.append(
+          f"[CONTEXT GUARD: SOFT LIMIT] Context is at {_usage_str(m)}. Keep"
+          " working, but at the nearest micro-boundary (test run finished,"
+          " hypothesis confirmed or rejected, commit made, subagent returned)"
+          f" hand off:\n{TASKS_NOTE}\n"
+          + handoff_steps(conv_id, target, build_continuation_title(conv_id))
+      )
     if invocation_num > 0:
       streak, last_cmd_idx = get_consecutive_cmd_failures(transcript_path)
       if (
@@ -548,97 +747,93 @@ def main() -> None:
           and streak % FAILURE_STREAK_THRESHOLD == 0
           and last_cmd_idx != state.get("last_warned_fail_step")
       ):
+        log["fail_streak"] = streak
         state["last_warned_fail_step"] = last_cmd_idx
         save_state(state_path, state)
-        fail_msg = (
+        messages.append(
             f"[TWO-STRIKE DEBUG GUARD] Warning: {streak} consecutive commands in the current turn failed. "
             f"DO NOT make a third blind guess! Stop, read the exact error output and source declarations (`.h` / docs), "
             f"revert broken edits if needed (`git diff` / `git checkout`), and revise your hypothesis before proceeding."
         )
-        print(
-            json.dumps(
-                {"injectSteps": [{"ephemeralMessage": fail_msg}]},
-                ensure_ascii=False,
-            )
-        )
-        return
-    print("{}")
-    return
+    return _inject(*messages) if messages else {}
 
+  level = ("late" if late else "hard") if hard else "loop"
+  log["level"] = level
+  target = resolve_handoff_target(conv_id, transcript_path, artifact_dir)
   new_title = build_continuation_title(conv_id, last_user_input)
   cmd_prefix = build_agentapi_prefix(conv_id, transcript_path, workspace_paths)
 
-  # Update state with snoozed thresholds so tool calls needed for the handoff
-  # itself (write_to_file + run_command) do not re-trigger the main alert,
-  # while setting pending_handoff_launch=True to catch split tool calls.
-  new_state = {
-      "last_triggered_kb": round(size_kb, 1),
-      "last_triggered_steps": steps,
+  # The state is replaced wholesale so per-trigger flags (stop_guard's
+  # stop_blocked_handoff, the fail-streak marker) start fresh
+  save_state(state_path, {
+      "gm_count": state.get("gm_count", 0),
+      "soft_last_steps": state.get("soft_last_steps", -SOFT_REMIND_EVERY_STEPS),
+      "last_triggered_level": level,
+      "last_triggered_pct": round(m["pct"], 1),
       "last_triggered_invocation_num": invocation_num,
       "pending_handoff_launch": True,
+      "pending_turn_start": invocation_num == 0,
       "handoff_completed": False,
       "pending_title": new_title,
       "pending_cmd_prefix": cmd_prefix,
-      "pending_handoff_file": handoff_file,
-      "next_kb_threshold": (
-          round(max(size_kb, next_kb_threshold) + SNOOZE_KB, 1)
-          if size_or_steps_exceeded
-          else next_kb_threshold
-      ),
-      "next_steps_threshold": (
-          max(steps, next_steps_threshold) + SNOOZE_STEPS
-          if size_or_steps_exceeded
-          else next_steps_threshold
-      ),
+      "pending_handoff_file": target["file"],
+      "pending_in_project": target["in_project"],
       "next_turn_inv_threshold": (
           max(invocation_num, next_turn_inv_threshold) + SNOOZE_TURN_INVOCATIONS
           if invocation_num > 0
           else MAX_TURN_INVOCATIONS
       ),
-  }
-  save_state(state_path, new_state)
+  })
 
-  if invocation_num > 0:
-    reason = (
-        f"single-turn iteration limit exceeded ({invocation_num} consecutive steps)"
-        if turn_loop_exceeded and not size_or_steps_exceeded
-        else f"context threshold exceeded mid-turn ({size_kb:.0f} KB / {steps} steps, turn iteration #{invocation_num})"
+  late_note = (
+      " History was already compacted, so earlier details may be gone: take"
+      " facts from files, git and test output, not from memory."
+      if late
+      else ""
+  )
+  if level == "loop":
+    head = (
+        "[CONTEXT GUARD: MID-TURN CIRCUIT BREAKER] Single-turn iteration limit"
+        f" exceeded ({invocation_num} consecutive steps; context at"
+        f" {_usage_str(m)}). Do not try to finish the whole task here: bring any"
+        " half-edited file to a clean checkpoint and hand off."
     )
-    msg = (
-        f"[CONTEXT GUARD: MID-TURN CIRCUIT BREAKER] Warning: {reason}. "
-        f"Continuing complex debugging or code generation in an oversized context will degrade quality and cause errors.\n"
-        f"Follow the mid-turn emergency handoff protocol:\n"
-        f"1. DO NOT try to finish the entire task in this conversation. If any file is currently left in a broken/half-edited state, bring it to a clean checkpoint and stop further attempts. "
-        f"If any background tasks or subagents are running in this conversation, terminate them first via `manage_task` (`kill`) / `manage_subagents` (`kill_all`) so they do not wake this chat up after handoff!\n"
-        f"2. Create or update the artifact `{handoff_file}` (via write_to_file, UserFacing: true), documenting:\n"
-        f"   - Original goal of the task;\n"
-        f"   - Full Epic Roadmap / Backlog: checklist of ALL macro-stages (`[x]` completed, `[ ]` pending). NEVER drop or silently prune pending stages from previous handoffs;\n"
-        f"   - What has been completed in this session and which files were modified;\n"
-        f"   - Which hypotheses/approaches were tested and DID NOT work (to avoid repeating them in the new chat);\n"
-        f"   - Exact immediate next step to resume from;\n"
-        f"   - Link `[Previous Conversation](conversation://{conv_id})`.\n"
-        f"3. SIMULTANEOUSLY (in the same step or immediately next) launch the new conversation via run_command:\n"
-        f'   `python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff {conv_id} "{handoff_file}" --next "<1-line summary of next immediate action>"`\n'
-        f"4. Immediately finish your turn, explain to the user which safe checkpoint you stopped at, and provide the link: "
-        f"`[👉 {new_title}](conversation://<new_conversation_id>)`."
+  elif invocation_num > 0:
+    head = (
+        f"[CONTEXT GUARD: MID-TURN HANDOFF] Context is at {_usage_str(m)}.{late_note}"
+        " Stop at the nearest safe checkpoint (no half-edited files, no new"
+        " investigations) and hand off now."
     )
   else:
-    msg = (
-        f"[CONTEXT GUARD ALERT] Current conversation size has reached the threshold "
-        f"({size_kb:.0f} KB / {steps} steps). To prevent context degradation and hallucinations, "
-        f"perform an automatic handoff to a new conversation:\n"
-        f"1. First, completely answer the user's current request.\n"
-        f"2. Create or update the summary file `{handoff_file}` (via write_to_file, UserFacing: true), "
-        f"recording: task goal, full Epic Roadmap checklist ([x] / [ ], NEVER drop pending stages), "
-        f"modified files, current status, exact immediate next step, and a link `[Previous Conversation](conversation://{conv_id})`.\n"
-        f"3. Call `run_command` to launch the new conversation:\n"
-        f'   `python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff {conv_id} "{handoff_file}" --next "<1-line summary of next immediate action>"`\n'
-        f"4. At the very end of your response to the user, include a prominent clickable link "
-        f"to the new conversation: `[👉 {new_title}](conversation://<new_conversation_id>)`."
+    head = (
+        f"[CONTEXT GUARD: HANDOFF REQUIRED] Context is at {_usage_str(m)}.{late_note}"
+        " First answer the user's current request completely, then hand off in"
+        " this same turn."
     )
+  return _inject(f"{head}\n{TASKS_NOTE}\n{handoff_steps(conv_id, target, new_title)}")
 
-  result = {"injectSteps": [{"ephemeralMessage": msg}]}
-  print(json.dumps(result, ensure_ascii=False))
+
+def main() -> None:
+  t0 = time.monotonic()
+  log = {
+      "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+      "level": "none",
+  }
+  out: dict = {}
+  try:
+    raw_input = sys.stdin.read().strip()
+    if raw_input:
+      out = run(json.loads(raw_input), log)
+  except Exception as e:
+    # This hook runs before every model call of every chat: a crash would
+    # break them all, so degrade to a no-op and leave a trace in the log
+    out = {}
+    log["level"] = "error"
+    log["err"] = f"{type(e).__name__}: {e}"[:300]
+  print(json.dumps(out, ensure_ascii=False))
+  log["ms"] = round((time.monotonic() - t0) * 1000)
+  if log["level"] != "skip":
+    append_log(log)
 
 
 if __name__ == "__main__":

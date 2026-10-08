@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PreToolUse hook for Jetski to prevent hallucinations, blind edits, and broken handoffs.
 
-Implements four mechanical guards:
+Implements five mechanical guards:
 1. Handoff Command & Post-Handoff Guard:
    - Blocks any file edits or duplicate `new-conversation` calls in a conversation
      that has already handed off in the current turn.
@@ -11,10 +11,12 @@ Implements four mechanical guards:
      missing `env -u ANTIGRAVITY_SOURCE_METADATA`, `ANTIGRAVITY_PROJECT_ID`, or
      `--title="[HH:MM продолжение] ..."`.
 2. Automatic Handoff Summary Enrichment:
-   - Right before `agentapi new-conversation` executes, automatically appends an
-     objective machine-generated section (`git status -s`, `git diff --stat`,
-     modified files, and recent commands with exit codes) to the conversation's
-     `handoff_summary*.md` so the new chat never needs to grep old transcripts.
+   - Right before a handoff executes, automatically appends an objective
+     machine-generated section (`git status -s`, `git diff --stat`, modified
+     files, and recent commands with exit codes) to the conversation's
+     `handoff_summary*.md` (outside-project chats) or refreshes it in the chain
+     state file (in-project chats), so the new chat never needs to grep old
+     transcripts.
 3. Read-Before-Edit Guard:
    - Blocks `replace_file_content` / `multi_replace_file_content` on existing
      source files if the file was never viewed (`view_file`) or written earlier
@@ -22,6 +24,9 @@ Implements four mechanical guards:
 4. Generated / Gitignored File Guard:
    - Blocks editing source files inside build caches or `.gitignore`d directories
      (e.g., `bin/cache/`, `out/`, `build/`) inside a Git repository.
+5. Roadmap Guard:
+   - Blocks direct file edits under the roadmaps dir except the conversation's
+     own `state/<conversationId>.md`; roadmap changes go through `roadmap.py`.
 """
 
 import glob
@@ -39,7 +44,9 @@ from context_guard import (
     get_handoff_launch_step_in_turn,
     load_state,
     parse_current_turn_steps,
+    resolve_handoff_target,
 )
+from roadmap import roadmaps_root
 
 EDIT_TOOLS = {
     "write_to_file",
@@ -282,24 +289,38 @@ def is_gitignored_or_build_cache(target_file: str) -> tuple[bool, str]:
 
 
 def enrich_handoff_summary_files(
-    artifact_dir: str, transcript_path: str, workspace_paths: list[str]
+    artifact_dir: str,
+    transcript_path: str,
+    workspace_paths: list[str],
+    state_file: str = "",
 ) -> None:
-  """Appends an objective Git & command snapshot to handoff_summary*.md if not already present."""
-  if not artifact_dir or not os.path.isdir(artifact_dir):
-    return
-  summary_files = sorted(
-      glob.glob(os.path.join(artifact_dir, "handoff_summary*.md")),
-      key=lambda p: os.path.getmtime(p),
-      reverse=True,
-  )
-  if not summary_files:
-    return
-  target_summary = summary_files[0]
+  """Appends an objective Git & command snapshot to the handoff summary.
+
+  Outside projects the target is the newest handoff_summary*.md, enriched once.
+  In projects it is the chain state file, which travels along the whole chain,
+  so a stale snapshot from an earlier chat is replaced instead of kept.
+  """
+  if state_file:
+    target_summary = state_file
+  else:
+    if not artifact_dir or not os.path.isdir(artifact_dir):
+      return
+    summary_files = sorted(
+        glob.glob(os.path.join(artifact_dir, "handoff_summary*.md")),
+        key=lambda p: os.path.getmtime(p),
+        reverse=True,
+    )
+    if not summary_files:
+      return
+    target_summary = summary_files[0]
   try:
     with open(target_summary, "r", encoding="utf-8") as f:
       existing = f.read()
     if AUTO_SNAPSHOT_HEADER in existing:
-      return
+      if not state_file:
+        return
+      cut = existing.find("\n---\n\n" + AUTO_SNAPSHOT_HEADER)
+      existing = existing[: cut if cut >= 0 else existing.find(AUTO_SNAPSHOT_HEADER)]
   except Exception:
     return
 
@@ -391,10 +412,43 @@ def enrich_handoff_summary_files(
       pass
 
   try:
-    with open(target_summary, "a", encoding="utf-8") as f:
-      f.write("\n".join(sections) + "\n")
+    if state_file:
+      # Rewritten right before the handoff moves it, so a hook killed at its
+      # timeout must leave the old content rather than a truncated file
+      tmp = f"{target_summary}.tmp.{os.getpid()}"
+      with open(tmp, "w", encoding="utf-8") as f:
+        f.write(existing.rstrip("\n") + "\n" + "\n".join(sections) + "\n")
+      os.replace(tmp, target_summary)
+    else:
+      with open(target_summary, "a", encoding="utf-8") as f:
+        f.write("\n".join(sections) + "\n")
   except Exception:
     pass
+
+
+def roadmap_edit_denial(target_file: str, conv_id: str) -> str:
+  """Deny reason for a direct edit under the roadmaps dir, or "" if allowed.
+
+  Concurrent chats share roadmap.json and only roadmap.py serializes their
+  writes; a chat may edit its own chain state file and nothing else there.
+  """
+  if not target_file:
+    return ""
+  root = os.path.realpath(roadmaps_root())
+  path = os.path.realpath(
+      os.path.expanduser(target_file.strip().strip('"').strip("'"))
+  )
+  if not path.startswith(root + os.sep):
+    return ""
+  rel = os.path.relpath(path, root).split(os.sep)
+  if conv_id and len(rel) == 3 and rel[1] == "state" and rel[2] == f"{conv_id}.md":
+    return ""
+  return (
+      f"[ROADMAP GUARD] Direct edits of `{target_file}` are blocked: roadmap files are shared by "
+      "concurrent chats of the project. Use `python3 ~/.gemini/config/hooks/roadmap.py add|set|link ...`; "
+      "the only file you may edit there is your own chain state file "
+      f"(`python3 ~/.gemini/config/hooks/roadmap.py state-path {conv_id or '<conversation id>'}`)."
+  )
 
 
 def main() -> None:
@@ -421,6 +475,12 @@ def main() -> None:
   transcript_path = data.get("transcriptPath", "")
   artifact_dir = data.get("artifactDirectoryPath", "")
   workspace_paths = data.get("workspacePaths") or []
+
+  if tool_name in EDIT_TOOLS:
+    denial = roadmap_edit_denial(str(tool_args.get("TargetFile", "")), conv_id)
+    if denial:
+      print(json.dumps({"decision": "deny", "reason": denial}, ensure_ascii=False))
+      return
 
   # 1. Top-level conversation handoff guards
   if not parent_conv_id:
@@ -509,10 +569,22 @@ def main() -> None:
 
         has_notes_flag = "--notes" in strip_heredocs(cmd)
         ref_match = re.search(r"(/\S*handoff_summary[^\s\"']*\.md)", cmd)
+        if state.get("pending_handoff_launch") and state.get("pending_handoff_file"):
+          target = {
+              "in_project": bool(state.get("pending_in_project")),
+              "file": state["pending_handoff_file"],
+          }
+        else:
+          target = resolve_handoff_target(conv_id, transcript_path, artifact_dir)
         missing_summary = None
         if not has_notes_flag:
           if ref_match and not os.path.exists(ref_match.group(1)):
             missing_summary = ref_match.group(1)
+          elif target["in_project"]:
+            # chat_lifecycle seeds the state file from an existing summary
+            # argument, so only a chat with neither must be stopped here
+            if not os.path.exists(target["file"]) and not ref_match:
+              missing_summary = target["file"]
           elif (
               state.get("pending_handoff_launch")
               and artifact_dir
@@ -545,7 +617,10 @@ def main() -> None:
             pass
 
         enrich_handoff_summary_files(
-            artifact_dir, transcript_path, workspace_paths
+            artifact_dir,
+            transcript_path,
+            workspace_paths,
+            state_file=target["file"] if target["in_project"] else "",
         )
 
       if "agentapi" in cmd and not re.match(
@@ -605,6 +680,7 @@ def main() -> None:
             missing_summary = ref_match.group(1)
           elif (
               state.get("pending_handoff_launch")
+              and not state.get("pending_in_project")
               and artifact_dir
               and not glob.glob(os.path.join(artifact_dir, "handoff_summary*.md"))
           ):
@@ -719,5 +795,14 @@ def main() -> None:
   print('{"decision": "allow"}')
 
 
+def _guarded_main() -> None:
+  # Gates every tool call of every chat: a bug in one guard must fail open
+  # with a valid decision rather than print a traceback
+  try:
+    _main()
+  except Exception:
+    print('{"decision": "allow"}')
+
+
 if __name__ == "__main__":
-  main()
+  _guarded_main()

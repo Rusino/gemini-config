@@ -56,11 +56,15 @@ For moving chats or whole chains between projects (or listing unassigned chats),
 
 ## Backlog & Scope Invariants across Handoff Chains
 
+- **In-project chats: Epic Roadmap via `roadmap.py` only**: A chat inside a Jetski project keeps the Epic Roadmap in the project's shared roadmap through `python3 ~/.gemini/config/hooks/roadmap.py add|set|link|show ...` and **never** edits files under `~/.gemini/config/roadmaps/` directly. The only exception is the chain state file (`roadmap.py state-path <id>`), which is the handoff summary in projects and carries the immediate next step. The checkbox rules below apply to the handoff summaries of outside-project chats.
+  - **Backlog requests**: when the user says something like "в бэклог: X" / "add to backlog: X", run `roadmap.py add <id> "X"`, confirm in exactly one line (e.g. `R7 added: X`), then continue the current work.
+  - **Spin-offs**: when an item is handed to its own chat, run `roadmap.py link <id> <item ID> <new_chat_id>`.
+  - **At handoff**: paste the roadmap block printed by `chat_lifecycle.py handoff` into the final message to the user.
 - **Never Shrink Epic Scope**: Handoff summaries must maintain the complete multi-stage roadmap (`Epic Roadmap`) with explicit checkbox states (`[x]` for completed, `[ ]` for pending, `[-]` for abandoned/out-of-scope). An agent is **strictly forbidden** from deleting or dropping uncompleted backlog items from `Next Steps` or `Roadmap` during handoff.
 - **Two-Level Plan Bifurcation**: Always separate:
   1. `Epic Roadmap`: Complete checklist of all macro-deliverables across the entire task lifetime. When completing a handoff, copy the previous roadmap forward, updating only the status (`[ ]` -> `[x]`).
   2. `Immediate Next Step`: The concrete, isolated first action for the continuation chat to resume immediately.
-- **Continuation Inception Check**: When waking up in a continuation chat, the incoming agent must review the full `Epic Roadmap` from the summary, acknowledge the overall task progress, and ensure broader objectives are not abandoned after local deep-dives.
+- **Continuation Inception Check**: When waking up in a continuation chat, the incoming agent must review the full `Epic Roadmap` from the summary (in projects: `roadmap.py show`), acknowledge the overall task progress, and ensure broader objectives are not abandoned after local deep-dives.
 
 Strict rules:
 - **Never** silently prune or drop pending stages from a handoff summary. If an epic had 5 steps and the current chat only addressed step 2, all steps 3–5 MUST remain in the summary as pending `[ ]`.
