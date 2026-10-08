@@ -54,10 +54,10 @@ BADGE_RE = re.compile(
     r"(?:\s*·\s*(?:[⟳⚠●]\s*\d+)(?:\s+(?:[⟳⚠●]\s*\d+))*)+$"
 )
 
-# Non-leaf conversations in a handoff chain (▸, ✓, «, ‹✓›) have already been
-# continued in a successor conversation and should not be counted as unread
+# Handed-off predecessors (▸, ✓) and finalized chats («, ‹✓›, », «») are no
+# longer active and should not be counted as unread once their turn finishes
 PREDECESSOR_TITLE_RE = re.compile(
-    r"^\s*(?:\[\d{1,2}:\d{2}\]\s*)?(?:▸|✓|«(?!»)|‹✓›)(?:\s|$)"
+    r"^\s*\[\d{1,2}:\d{2}\]\s*(?:‹✓›|«»|[▸✓«»])(?:\s|$)"
 )
 
 WATCH_POLL_INTERVAL_SEC = 1.5

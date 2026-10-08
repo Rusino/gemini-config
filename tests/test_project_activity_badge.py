@@ -172,16 +172,28 @@ class TestProjectActivityBadge(unittest.TestCase):
               "annotations": {"title": "[21:07] ‹✓› Closed Chain"},
               "trajectoryMetadata": {"projectId": "proj-1"},
           },
-          "c-leaf-active": {
+          "c-closed-end": {
               "status": "CASCADE_RUN_STATUS_IDLE",
-              "lastModifiedTime": "2026-10-04T01:10:00Z",
-              "annotations": {"title": "[21:07] ⦿ Task Chain"},
+              "lastModifiedTime": "2026-10-04T01:09:00Z",
+              "annotations": {"title": "[21:07] » Closed Chain"},
               "trajectoryMetadata": {"projectId": "proj-1"},
           },
           "c-single-closed": {
               "status": "CASCADE_RUN_STATUS_IDLE",
               "lastModifiedTime": "2026-10-04T01:10:00Z",
               "annotations": {"title": "[21:07] «» Standalone Closed"},
+              "trajectoryMetadata": {"projectId": "proj-1"},
+          },
+          "c-leaf-active": {
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "lastModifiedTime": "2026-10-04T01:10:00Z",
+              "annotations": {"title": "[21:07] ⦿ Task Chain"},
+              "trajectoryMetadata": {"projectId": "proj-1"},
+          },
+          "c-unmarked-quoted": {
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "lastModifiedTime": "2026-10-04T01:10:00Z",
+              "annotations": {"title": "«Quoted» topic without time prefix"},
               "trajectoryMetadata": {"projectId": "proj-1"},
           },
       }
