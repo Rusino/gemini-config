@@ -7,15 +7,15 @@ description: >-
 
 # Testing Custom Skia / SkParagraph in Flutter Engine
 
-This skill provides the end-to-end workflow for compiling custom Skia/SkParagraph changes within the local Flutter engine and running all relevant Flutter framework text tests.
+This skill provides the automated and end-to-end workflow for compiling custom Skia/SkParagraph changes within the local Flutter engine and running all relevant Flutter framework text tests with a tamper-evident **Паспорт прогона (Run Attestation)** and automated **Integrity Check (Вердикт целостности)**.
 
 ## Contents
 - [Repository Paths & Structure](#repository-paths--structure)
-- [Workflow Checklist](#workflow-checklist)
-- [1. Building the Local Engine](#1-building-the-local-engine)
-- [2. Engine Smoke Tests (C++)](#2-engine-smoke-tests-c)
-- [3. Verifying the Build Artifacts](#3-verifying-the-build-artifacts)
-- [4. Running the Canonical Flutter Text Suite](#4-running-the-canonical-flutter-text-suite)
+- [Automated Scripts](#automated-scripts)
+- [How to Run](#how-to-run)
+- [Inspecting Results & Run Attestation](#inspecting-results--run-attestation)
+- [Mandatory Reporting Rule](#mandatory-reporting-rule)
+- [Manual Step-by-Step Workflow](#manual-step-by-step-workflow)
 - [Common Pitfalls & Gotchas](#common-pitfalls--gotchas)
 
 ---
@@ -29,34 +29,83 @@ This skill provides the end-to-end workflow for compiling custom Skia/SkParagrap
 
 ---
 
-## Workflow Checklist
+## Automated Scripts
 
-- [ ] **Step 1**: Checkout or apply Skia changes in `flutter/third_party/skia`.
-- [ ] **Step 2**: Build `flutter_tester`, `sky_engine`, and C++ test binaries with ninja.
-- [ ] **Step 3**: Run C++ smoke tests (`txt_unittests`, `ui_unittests`).
-- [ ] **Step 4**: Verify that `flutter_tester` was rebuilt after the Skia commit and contains the new code.
-- [ ] **Step 5**: Run the Flutter framework Dart text tests in 3 batches (~2100 tests total).
-- [ ] **Step 6**: Report results and verify absence of regressions.
+- Orchestrator: [`run_flutter_paragraph_tests.py`](file:///Users/jlavrova/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py)
+- Log parser & comparator: [`parse_flutter_paragraph_tests.py`](file:///Users/jlavrova/.gemini/config/skills/flutter-test-paragraph-engine/scripts/parse_flutter_paragraph_tests.py)
 
 ---
 
-## 1. Building the Local Engine
+## How to Run
 
-When modifying `skparagraph` or Skia, build `flutter_tester` together with `sky_engine` and unit tests:
+### 1. Compare current Skia submodule changes against baseline
+```bash
+python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py \
+  --out /tmp/flutter_paragraph_tests \
+  baseline=origin/main \
+  current=WORKTREE
+```
+
+### 2. Compare two branches or commits in the Skia submodule
+```bash
+python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py \
+  --out /tmp/flutter_paragraph_tests \
+  baseline=origin/main \
+  fix=my_skia_branch
+```
+
+### 3. Run on current working tree only
+```bash
+python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py \
+  --out /tmp/flutter_paragraph_tests
+```
+
+### Useful Flags
+- `--batches <all|1,2,3>` — Choose specific test batches (default: `all`).
+- `--skip-build` — Skip running ninja if the engine is already built.
+- `--skip-cpp` — Skip C++ smoke tests (`txt_unittests`, `ui_unittests`).
+- `--resume` — Skip re-running refs whose `attestation.json` and `summary.json` already exist.
+
+---
+
+## Inspecting Results & Run Attestation
+
+After the run finishes:
+1. View `<out>/compare.md` (also printed to stdout) for:
+   - Primary test outcome table across C++ smoke tests and Batches 1–3.
+   - **Паспорт прогона (Run Attestation)** and **Вердикт целостности (Integrity Check)**: verifies git SHA, Skia source tree SHA-256 (`source_tree_sha256`), rebuilt `flutter_tester` binary SHA-256 (`binary_sha256`) and mtime, ninja build action counter, executed batches, and test completeness (`finished_cleanly`).
+   - **Regressions vs baseline** and **Fixed vs baseline**.
+2. Individual logs and metadata are stored in `<out>/<label>/`:
+   - `attestation.json` — objective run metadata, SHA-256 hashes, ninja actions, exact test commands, exit codes, and signals.
+   - `summary.json` — parsed test counts per batch and failure lists.
+   - `ninja.log` — raw compilation output.
+   - `txt_unittests.log`, `ui_unittests.log` — C++ smoke test logs.
+   - `batch1.log`, `batch2.log`, `batch3.log` — Dart framework test logs.
+
+---
+
+## Mandatory Reporting Rule
+
+Whenever presenting test results to the user, the agent **must** include both:
+1. The primary test outcome table.
+2. The complete **Паспорт прогона (Run Attestation)** section including the **Вердикт целостности (Integrity Check)** banner and all table columns without truncation.
+
+If the integrity check verdict is `WARNING / INVALID`, never report the run as clean; report the exact invariant violations prominently.
+
+---
+
+## Manual Step-by-Step Workflow
+
+If running steps manually without the orchestrator:
+
+### 1. Building the Local Engine
 
 ```bash
 # Working directory: /Users/jlavrova/Sources/flutter/engine/src
 ninja -C out/host_debug_unopt_arm64 flutter_tester sky_engine txt_unittests ui_unittests
 ```
 
-> **Why `sky_engine` is required:**
-> `flutter test` relies on Dart bindings (`dart:ui`) from `sky_engine`. If `sky_engine` is omitted from the build, `flutter test` might run with mismatched SDK artifacts or fail during kernel snapshot generation.
-
----
-
-## 2. Engine Smoke Tests (C++)
-
-Before running Dart tests, run engine unittests to quickly catch low-level assertion failures or regressions:
+### 2. Engine Smoke Tests (C++)
 
 ```bash
 # Working directory: /Users/jlavrova/Sources/flutter/engine/src
@@ -64,42 +113,18 @@ Before running Dart tests, run engine unittests to quickly catch low-level asser
 ./out/host_debug_unopt_arm64/ui_unittests
 ```
 
----
+### 3. Verifying Build Artifacts
 
-## 3. Verifying the Build Artifacts
+Ensure the `.o` files and `flutter_tester` timestamps are newer than modified source files:
+```bash
+ls -la /Users/jlavrova/Sources/flutter/engine/src/out/host_debug_unopt_arm64/flutter_tester
+```
 
-To guarantee that the tests run against the newly built code (and not an old cached binary):
+### 4. Running the Flutter Text Suite in 3 Batches
 
-1. **Check Timestamps:**
-   ```bash
-   ls -la /Users/jlavrova/Sources/flutter/engine/src/out/host_debug_unopt_arm64/flutter_tester
-   ls -la /Users/jlavrova/Sources/flutter/engine/src/out/host_debug_unopt_arm64/obj/flutter/third_party/skia/modules/skparagraph/src/skparagraph.*.o
-   ```
-   Ensure the `.o` files and `flutter_tester` timestamps are newer than the modified source files.
+From `/Users/jlavrova/Sources/flutter`:
 
-2. **Verify Process Invocation:**
-   Run one quick test with `-v` to ensure `flutter_tester` is executed from the local engine directory:
-   ```bash
-   # Working directory: /Users/jlavrova/Sources/flutter
-   ./bin/flutter test \
-     --local-engine=host_debug_unopt_arm64 \
-     --local-engine-host=host_debug_unopt_arm64 \
-     --local-engine-src-path=/Users/jlavrova/Sources/flutter/engine/src \
-     -v packages/flutter/test/services/text_boundary_test.dart 2>&1 | grep "Starting flutter_tester process"
-   ```
-   Expected output contains:
-   `Starting flutter_tester process with command=[/Users/jlavrova/Sources/flutter/engine/src/out/host_debug_unopt_arm64/flutter_tester, ...]`
-
----
-
-## 4. Running the Canonical Flutter Text Suite
-
-Running the full Flutter framework test suite (30,000+ tests) is impractical for iterative SkParagraph work. Instead, run the targeted **2100-test text suite** divided into three logical batches.
-
-All commands run from `/Users/jlavrova/Sources/flutter`.
-
-### Batch 1: Text Layout & Rendering (~210 tests)
-Verifies low-level paragraph layout, intrinsics, text painter, spans, and rich text:
+#### Batch 1: Text Layout & Rendering (~210 tests)
 ```bash
 ./bin/flutter test \
   --local-engine=host_debug_unopt_arm64 \
@@ -115,8 +140,7 @@ Verifies low-level paragraph layout, intrinsics, text painter, spans, and rich t
   packages/flutter/test/widgets/text_test.dart
 ```
 
-### Batch 2: Editing & Selection (~792 tests)
-Verifies text selection, caret geometry, selection handles, and editable text:
+#### Batch 2: Editing & Selection (~792 tests)
 ```bash
 ./bin/flutter test \
   --local-engine=host_debug_unopt_arm64 \
@@ -128,8 +152,7 @@ Verifies text selection, caret geometry, selection handles, and editable text:
   packages/flutter/test/widgets/text_selection_test.dart
 ```
 
-### Batch 3: Input Fields, Boundaries & Deltas (~1098 tests)
-Verifies Cupertino & Material text fields, delta text editing, and text boundaries:
+#### Batch 3: Input Fields, Boundaries & Deltas (~1098 tests)
 ```bash
 ./bin/flutter test \
   --local-engine=host_debug_unopt_arm64 \
