@@ -101,6 +101,10 @@ class TestContextGuard(unittest.TestCase):
     self.assertEqual(self.last_log()["level"], "closed")
     self.assertEqual(self.run_guard(inv=1), {})
     self.assertFalse(self.state().get("pending_handoff_launch"))
+    self.write_transcript({"type": "USER_INPUT", "content": "no, thanks"})
+    msg = self.message(self.run_guard(inv=0))
+    self.assertIn("old, closed chat", msg)
+    self.assertIn("agentapi send-message child-9", msg)
 
   def test_build_agentapi_prefix_with_project_id(self):
     with patch.object(
