@@ -41,6 +41,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 import traceback
 
 from context_guard import (
@@ -801,16 +802,45 @@ def main() -> None:
   print('{"decision": "allow"}')
 
 
+# pre_tool_guard_notice.py shows this marker to the agent on its next model
+# call: the stderr trace reaches only Jetski's log, where a dead entry point
+# went unnoticed for 22 hours
+FAILURE_MARKER_DEFAULT = "~/.gemini/config/logs/pre_tool_guard_failure.json"
+
+
+def _record_failure(error: Exception) -> None:
+  frame = traceback.extract_tb(error.__traceback__)[-1]
+  marker = {
+      "ts": time.time(),
+      "conv": os.environ.get("ANTIGRAVITY_CONVERSATION_ID", ""),
+      "error": f"{type(error).__name__}: {error}"[:300],
+      "where": f"{os.path.basename(frame.filename)}:{frame.lineno} in {frame.name}",
+  }
+  path = os.path.expanduser(
+      os.environ.get("JETSKI_PRE_TOOL_GUARD_MARKER") or FAILURE_MARKER_DEFAULT)
+  os.makedirs(os.path.dirname(path), exist_ok=True)
+  tmp = f"{path}.{os.getpid()}.tmp"
+  with open(tmp, "w") as f:
+    json.dump(marker, f)
+  os.replace(tmp, path)
+
+
 def _guarded_main() -> None:
   # Gates every tool call of every chat: a bug in one guard must fail open
   # with a valid decision rather than print a traceback
   try:
     main()
-  except Exception:
+  except Exception as error:
     print('{"decision": "allow"}')
     # Exit code 0 keeps the decision valid; without the stderr trace a broken
     # entry point is indistinguishable from guards that allowed the call
     traceback.print_exc()
+    # The allow is already printed; an exception here would exit non-zero and
+    # turn the fail-open into a failed tool call
+    try:
+      _record_failure(error)
+    except Exception:
+      traceback.print_exc()
 
 
 if __name__ == "__main__":

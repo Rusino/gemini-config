@@ -160,12 +160,27 @@ class TestPreToolGuard(unittest.TestCase):
     return json.loads(mock_out.getvalue())
 
   def test_internal_error_fails_open_with_valid_json(self):
-    with patch.object(pre_tool_guard, "roadmap_edit_denial", side_effect=OSError("boom")) as guard, \
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      marker = os.path.join(tmp_dir, "marker.json")
+      with patch.object(pre_tool_guard, "roadmap_edit_denial", side_effect=OSError("boom")) as guard, \
+           patch.dict(os.environ, {"JETSKI_PRE_TOOL_GUARD_MARKER": marker}), \
+           patch("sys.stdin", io.StringIO(json.dumps({"toolCall": {"name": "write_to_file", "args": {}}}))), \
+           patch("sys.stdout", new_callable=io.StringIO) as mock_out, \
+           patch("sys.stderr", new_callable=io.StringIO) as mock_err:
+        pre_tool_guard._guarded_main()
+      guard.assert_called_once()
+      self.assertEqual(json.loads(mock_out.getvalue()), {"decision": "allow"})
+      self.assertIn("OSError: boom", mock_err.getvalue())
+      with open(marker) as f:
+        self.assertEqual(json.load(f)["error"], "OSError: boom")
+
+  def test_unwritable_marker_still_fails_open(self):
+    with patch.object(pre_tool_guard, "roadmap_edit_denial", side_effect=OSError("boom")), \
+         patch.dict(os.environ, {"JETSKI_PRE_TOOL_GUARD_MARKER": "/dev/null/logs/marker.json"}), \
          patch("sys.stdin", io.StringIO(json.dumps({"toolCall": {"name": "write_to_file", "args": {}}}))), \
          patch("sys.stdout", new_callable=io.StringIO) as mock_out, \
          patch("sys.stderr", new_callable=io.StringIO) as mock_err:
       pre_tool_guard._guarded_main()
-    guard.assert_called_once()
     self.assertEqual(json.loads(mock_out.getvalue()), {"decision": "allow"})
     self.assertIn("OSError: boom", mock_err.getvalue())
 
@@ -175,6 +190,7 @@ class TestPreToolGuard(unittest.TestCase):
     # still prints a valid allow
     conv = f"smoke-{uuid.uuid4().hex}"
     with tempfile.TemporaryDirectory() as tmp_dir:
+      marker = os.path.join(tmp_dir, "marker.json")
       cases = [
           (os.path.join(tmp_dir, "p1", "roadmap.json"), "deny"),
           (os.path.join(tmp_dir, "p1", "state", f"{conv}.md"), "allow"),
@@ -191,10 +207,11 @@ class TestPreToolGuard(unittest.TestCase):
               text=True,
               timeout=10,
               cwd=os.path.dirname(os.path.dirname(HOOK)),
-              env={**os.environ, "JETSKI_ROADMAPS_DIR": tmp_dir},
+              env={**os.environ, "JETSKI_ROADMAPS_DIR": tmp_dir, "JETSKI_PRE_TOOL_GUARD_MARKER": marker},
           )
           self.assertEqual((proc.returncode, proc.stderr), (0, ""))
           self.assertEqual(json.loads(proc.stdout).get("decision"), expected)
+      self.assertFalse(os.path.exists(marker))
 
   def test_roadmap_files_are_edited_only_via_cli(self):
     with tempfile.TemporaryDirectory() as tmp_dir, \

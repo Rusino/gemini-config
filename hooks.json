@@ -11,6 +11,11 @@
         "type": "command",
         "command": "~/.gemini/config/hooks/context_guard.py",
         "timeout": 5
+      },
+      {
+        "type": "command",
+        "command": "~/.gemini/config/hooks/pre_tool_guard_notice.py",
+        "timeout": 5
       }
     ],
     "PreToolUse": [
