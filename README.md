@@ -16,6 +16,7 @@ Personal global rules, lifecycle hooks, and configuration for Jetski (`~/.gemini
   - `move_chats_to_project.py` — Moves conversations (or entire handoff chains) between projects and lists unassigned top-level conversations.
   - `jetski_closed_filter.js` — Client-side sidebar filter toggle injected next to `Display Options` that hides conversations in Redux without archiving them: *Closed hidden* hides finalized chains (`«`, `‹✓›`, `»`, `«»`) and handed-off steps of open chains (`✓`); *Active only* also hides open chain roots (`▸`), leaving only `⦿` and unmarked chats.
   - `patch_jetski_hub_binary.py` — `ExecStartPre` helper for `jetski-hub.service` that syncs `jetski_closed_filter.js` into `/static/artifacts/jetski-closed-filter.js` and patches the extracted `jetski-hub-server` binary so `index.html` loads the filter script automatically.
+- `githooks/pre-commit` — Runs `tests/run_all_tests.py` on the staged snapshot and aborts the commit if it fails. Git does not version `core.hooksPath`, so enable it once per clone (see Setup).
 - `documentation/` — Detailed architecture and design docs:
   - [`long_context_guards_guide.md`](./documentation/long_context_guards_guide.md) — *Long-Context Error & Hallucination Prevention System for Jetski* (including Mermaid architecture diagram).
 
@@ -38,6 +39,12 @@ git init
 git remote add origin git@github.com:Rusino/gemini-config.git
 git fetch origin
 git checkout -f main
+```
+
+In both cases enable the versioned pre-commit hook:
+
+```bash
+git -C ~/.gemini/config config core.hooksPath githooks
 ```
 
 ## Syncing Changes

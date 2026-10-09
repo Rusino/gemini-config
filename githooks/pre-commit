@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""Runs tests/run_all_tests.py on the staged snapshot and aborts the commit if it fails
+
+Enable once per clone: git config core.hooksPath githooks
+"""
+
+import os
+import subprocess
+import sys
+import tempfile
+
+
+def main() -> int:
+  local_vars = set(subprocess.run(
+      ["git", "rev-parse", "--local-env-vars"],
+      capture_output=True, text=True, check=True).stdout.split())
+  with tempfile.TemporaryDirectory(prefix="gemini-config-pre-commit-") as snapshot:
+    # checkout-index honors GIT_INDEX_FILE, so `git commit -a` and
+    # `git commit <paths>` are checked against the index they will commit
+    subprocess.run(
+        ["git", "checkout-index", "--all", f"--prefix={snapshot}/"], check=True)
+    # Git exports repo-local variables such as GIT_INDEX_FILE to hooks; left in
+    # place they would point git calls made by the tests at this repository
+    env = {k: v for k, v in os.environ.items() if k not in local_vars}
+    result = subprocess.run(
+        [sys.executable, os.path.join(snapshot, "tests", "run_all_tests.py")],
+        cwd=snapshot, env=env, capture_output=True, text=True)
+  if result.returncode != 0:
+    sys.stderr.write(result.stdout + result.stderr)
+    sys.stderr.write(
+        "pre-commit: tests/run_all_tests.py failed on the staged snapshot,"
+        " commit aborted\n")
+    return 1
+  sys.stderr.write(
+      "pre-commit: tests/run_all_tests.py passed on the staged snapshot\n")
+  return 0
+
+
+if __name__ == "__main__":
+  sys.exit(main())
