@@ -67,25 +67,43 @@ class TestPreToolGuardNotice(unittest.TestCase):
         self.write_marker(1001)
         self.assertEqual(pre_tool_guard_notice.notice(chat, 1002), {})
 
-  def test_guard_failure_reaches_the_next_model_call(self):
+  def run_chain(self, sibling, edit):
     # A copy keeps the injected fault away from the live hooks; both hooks run
     # by path, the way hooks.json runs them
+    root = tempfile.mkdtemp(dir=self.tmp)
     hooks = shutil.copytree(
-        HOOKS_DIR, os.path.join(self.tmp, "hooks"), ignore=shutil.ignore_patterns("__pycache__"))
-    with open(os.path.join(hooks, "roadmap.py"), "a") as f:
-      f.write("\n\ndef roadmaps_root():\n  raise OSError('injected')\n")
+        HOOKS_DIR, os.path.join(root, "hooks"), ignore=shutil.ignore_patterns("__pycache__"))
+    path = os.path.join(hooks, sibling)
+    with open(path) as f:
+      src = f.read()
+    with open(path, "w") as f:
+      f.write(edit(src))
+    chat = {**self.chat, "artifactDirectoryPath": os.path.join(root, "brain")}
     notice = os.path.join(hooks, "pre_tool_guard_notice.py")
-    first = self.run_hook(notice, self.chat)
+    first = self.run_hook(notice, chat)
     self.assertEqual((first.returncode, first.stderr, json.loads(first.stdout)), (0, "", {}))
     guard = self.run_hook(os.path.join(hooks, "pre_tool_guard.py"), {
-        **self.chat, "toolCall": {"name": "write_to_file", "args": {"TargetFile": "/tmp/x"}}})
+        **chat, "toolCall": {"name": "write_to_file", "args": {"TargetFile": "/tmp/x"}}})
+    second = self.run_hook(notice, chat)
+    self.assertEqual((second.returncode, second.stderr), (0, ""))
+    return guard, self.notices(json.loads(second.stdout))
+
+  def test_guard_failure_reaches_the_next_model_call(self):
+    guard, notices = self.run_chain(
+        "roadmap.py", lambda src: src + "\n\ndef roadmaps_root():\n  raise OSError('injected')\n")
     self.assertEqual((guard.returncode, json.loads(guard.stdout)), (0, {"decision": "allow"}))
     self.assertIn("OSError: injected", guard.stderr)
-    second = self.run_hook(notice, self.chat)
-    self.assertEqual((second.returncode, second.stderr), (0, ""))
-    [msg] = self.notices(json.loads(second.stdout))
+    [msg] = notices
     self.assertIn("OSError: injected (roadmap.py:", msg)
     self.assertIn("in this chat", msg)
+
+  def test_broken_sibling_import_fails_open_and_is_noticed(self):
+    for sibling in ("roadmap.py", "context_guard.py"):
+      with self.subTest(sibling=sibling):
+        guard, notices = self.run_chain(sibling, lambda src: src + "\nraise ImportError('injected')\n")
+        self.assertEqual((guard.returncode, json.loads(guard.stdout)), (0, {"decision": "allow"}))
+        [msg] = notices
+        self.assertIn(f"ImportError: injected ({sibling}:", msg)
 
   def test_hooks_json_runs_the_notice_before_every_model_call(self):
     with open(os.path.join(HOOKS_DIR, "..", "hooks.json")) as f:

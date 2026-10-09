@@ -29,10 +29,10 @@ Implements five mechanical guards:
      own `state/<conversationId>.md`; roadmap changes go through `roadmap.py`.
 """
 
-# Every gated tool call of every chat runs this file and the hooks it imports,
-# including the calls that edit them, so a half-applied change locks out all
-# agents: make each edit self-contained or mv a finished copy into place (it
-# must stay executable), then run tests/test_pre_tool_guard.py
+# Every gated tool call of every chat runs this file, including the calls that
+# edit it, so a half-applied change locks out all agents (a broken sibling hook
+# only fails open): make each edit self-contained or mv a finished copy into
+# place (it must stay executable), then run tests/run_all_tests.py
 
 import glob
 import json
@@ -44,16 +44,10 @@ import sys
 import time
 import traceback
 
-from context_guard import (
-    APP_DATA_DIR_CANDIDATES,
-    build_agentapi_prefix,
-    build_continuation_title,
-    get_handoff_launch_step_in_turn,
-    load_state,
-    parse_current_turn_steps,
-    resolve_handoff_target,
-)
-from roadmap import roadmaps_root
+# Sibling hooks are imported where they are used: a broken one then raises
+# inside _guarded_main, which fails open and leaves a marker for the notice
+# hook, instead of exiting non-zero at import and failing every gated call of
+# every chat
 
 EDIT_TOOLS = {
     "write_to_file",
@@ -181,6 +175,7 @@ def is_agent_internal_file(file_path: str) -> bool:
   """Returns True if the file is an agent artifact or customization file (not project code)."""
   if not file_path:
     return True
+  from context_guard import APP_DATA_DIR_CANDIDATES
   clean = os.path.abspath(os.path.expanduser(file_path.strip().strip('"').strip("'")))
   config_dir = os.path.abspath(os.path.expanduser("~/.gemini/config"))
   internal_dirs = [config_dir] + [
@@ -441,6 +436,7 @@ def roadmap_edit_denial(target_file: str, conv_id: str) -> str:
   """
   if not target_file:
     return ""
+  from roadmap import roadmaps_root
   root = os.path.realpath(roadmaps_root())
   path = os.path.realpath(
       os.path.expanduser(target_file.strip().strip('"').strip("'"))
@@ -491,6 +487,13 @@ def main() -> None:
 
   # 1. Top-level conversation handoff guards
   if not parent_conv_id:
+    from context_guard import (
+        build_agentapi_prefix,
+        build_continuation_title,
+        get_handoff_launch_step_in_turn,
+        load_state,
+        resolve_handoff_target,
+    )
     state_path = (
         os.path.join(artifact_dir, "scratch", ".context_guard_state.json")
         if artifact_dir
