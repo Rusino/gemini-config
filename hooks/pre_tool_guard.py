@@ -29,6 +29,11 @@ Implements five mechanical guards:
      own `state/<conversationId>.md`; roadmap changes go through `roadmap.py`.
 """
 
+# Every gated tool call of every chat runs this file and the hooks it imports,
+# including the calls that edit them, so a half-applied change locks out all
+# agents: make each edit self-contained or mv a finished copy into place (it
+# must stay executable), then run tests/test_pre_tool_guard.py
+
 import glob
 import json
 import os
@@ -36,6 +41,7 @@ import re
 import shlex
 import subprocess
 import sys
+import traceback
 
 from context_guard import (
     APP_DATA_DIR_CANDIDATES,
@@ -799,9 +805,12 @@ def _guarded_main() -> None:
   # Gates every tool call of every chat: a bug in one guard must fail open
   # with a valid decision rather than print a traceback
   try:
-    _main()
+    main()
   except Exception:
     print('{"decision": "allow"}')
+    # Exit code 0 keeps the decision valid; without the stderr trace a broken
+    # entry point is indistinguishable from guards that allowed the call
+    traceback.print_exc()
 
 
 if __name__ == "__main__":

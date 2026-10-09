@@ -4,14 +4,18 @@
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "hooks")))
 
 import pre_tool_guard
+
+HOOK = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "hooks", "pre_tool_guard.py"))
 
 
 class TestPreToolGuard(unittest.TestCase):
@@ -156,11 +160,41 @@ class TestPreToolGuard(unittest.TestCase):
     return json.loads(mock_out.getvalue())
 
   def test_internal_error_fails_open_with_valid_json(self):
-    with patch.object(pre_tool_guard, "roadmap_edit_denial", side_effect=OSError("boom")), \
+    with patch.object(pre_tool_guard, "roadmap_edit_denial", side_effect=OSError("boom")) as guard, \
          patch("sys.stdin", io.StringIO(json.dumps({"toolCall": {"name": "write_to_file", "args": {}}}))), \
-         patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+         patch("sys.stdout", new_callable=io.StringIO) as mock_out, \
+         patch("sys.stderr", new_callable=io.StringIO) as mock_err:
       pre_tool_guard._guarded_main()
+    guard.assert_called_once()
     self.assertEqual(json.loads(mock_out.getvalue()), {"decision": "allow"})
+    self.assertIn("OSError: boom", mock_err.getvalue())
+
+  def test_entry_point_runs_the_guards(self):
+    # Runs the file the way hooks.json does (path + shebang, cwd = config root):
+    # tests that call main() cannot see a dead entry point, which fails open and
+    # still prints a valid allow
+    conv = f"smoke-{uuid.uuid4().hex}"
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      cases = [
+          (os.path.join(tmp_dir, "p1", "roadmap.json"), "deny"),
+          (os.path.join(tmp_dir, "p1", "state", f"{conv}.md"), "allow"),
+      ]
+      for target, expected in cases:
+        with self.subTest(expected=expected):
+          proc = subprocess.run(
+              [HOOK],
+              input=json.dumps({
+                  "conversationId": conv,
+                  "toolCall": {"name": "write_to_file", "args": {"TargetFile": target}},
+              }),
+              capture_output=True,
+              text=True,
+              timeout=10,
+              cwd=os.path.dirname(os.path.dirname(HOOK)),
+              env={**os.environ, "JETSKI_ROADMAPS_DIR": tmp_dir},
+          )
+          self.assertEqual((proc.returncode, proc.stderr), (0, ""))
+          self.assertEqual(json.loads(proc.stdout).get("decision"), expected)
 
   def test_roadmap_files_are_edited_only_via_cli(self):
     with tempfile.TemporaryDirectory() as tmp_dir, \
