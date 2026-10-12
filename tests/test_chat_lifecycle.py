@@ -738,6 +738,39 @@ class TestChatLifecycle(unittest.TestCase):
     self.assertIn("frobnicate", res.stderr)
     self.assertIn("status", res.stderr)
 
+  ALL_COMMANDS = PUBLIC_COMMANDS + ("model", "set", "advance")
+
+  def test_cli_subcommand_help_prints_usage(self):
+    for cmd in self.ALL_COMMANDS:
+      for flag in ("--help", "-h"):
+        with self.subTest(cmd=cmd, flag=flag):
+          res = self._run_cli(cmd, flag)
+          self.assertEqual(res.returncode, 0, res.stderr)
+          self.assertIn("Usage:", res.stdout)
+          self.assertNotIn("Traceback", res.stderr)
+
+  def test_cli_rejects_invalid_conversation_id_before_roadmap(self):
+    id_commands = tuple(c for c in self.ALL_COMMANDS if c != "audit")
+    for cmd in id_commands:
+      for bad in ("not-a-uuid", "--bogus"):
+        with self.subTest(cmd=cmd, bad=bad):
+          res = self._run_cli(cmd, bad)
+          self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+          self.assertIn(bad, res.stderr)
+          self.assertNotIn("Traceback", res.stderr)
+          self.assertNotIn("RoadmapError", res.stderr)
+
+  def test_cli_requires_conversation_id_without_env(self):
+    import subprocess
+    env = {k: v for k, v in os.environ.items() if k not in ("CONVERSATION_ID", "ANTIGRAVITY_CONVERSATION_ID")}
+    for cmd in ("status", "handoff", "summary-path", "finalize", "reopen", "archive"):
+      with self.subTest(cmd=cmd):
+        res = subprocess.run(
+            [sys.executable, self.SCRIPT, cmd], capture_output=True, text=True, check=False, env=env
+        )
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+
 
 if __name__ == "__main__":
   unittest.main()

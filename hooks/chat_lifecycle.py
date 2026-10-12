@@ -1544,6 +1544,27 @@ KNOWN_COMMANDS = (
 )
 
 
+def _cli_fail(command: str, message: str) -> None:
+  print(f"chat_lifecycle.py {command}: {message}", file=sys.stderr)
+  sys.exit(2)
+
+
+def _require_conversation_id(command: str, cid: str) -> str:
+  """Rejects a missing, flag-like or non-UUID conversation id before any
+  roadmap/LS access, so a stray option is never treated as a chat id."""
+  if not cid:
+    _cli_fail(command, "conversation id is required (or set $CONVERSATION_ID)")
+  if cid.startswith("-"):
+    _cli_fail(command, f"unknown option '{cid}'")
+  if not UUID_RE.match(cid):
+    _cli_fail(command, f"invalid conversation id '{cid}' (expected a UUID)")
+  return cid
+
+
+def _env_conversation_id() -> str:
+  return os.environ.get("CONVERSATION_ID", "") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID", "")
+
+
 if __name__ == "__main__":
   if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
     print_usage()
@@ -1552,35 +1573,35 @@ if __name__ == "__main__":
     print(f"chat_lifecycle.py: unknown command '{sys.argv[1]}'\n", file=sys.stderr)
     print_usage(sys.stderr)
     sys.exit(2)
+  if any(a in ("-h", "--help") for a in sys.argv[2:]):
+    print_usage()
+    sys.exit(0)
 
-  if len(sys.argv) > 2 and sys.argv[1] == "set":
-    cid = sys.argv[2]
+  if sys.argv[1] == "set":
+    cid = _require_conversation_id("set", sys.argv[2] if len(sys.argv) > 2 else "")
     title = sys.argv[3] if len(sys.argv) > 3 else ""
     update_conversation_title(cid, title)
-  elif len(sys.argv) > 2 and sys.argv[1] == "set-title":
-    cid = sys.argv[2]
+  elif sys.argv[1] == "set-title":
+    cid = _require_conversation_id("set-title", sys.argv[2] if len(sys.argv) > 2 else "")
     topic = sys.argv[3] if len(sys.argv) > 3 else ""
     marker = sys.argv[4] if len(sys.argv) > 4 else MARKER_ACTIVE
     new_t = set_conversation_topic(cid, topic, marker)
     print(f"Updated title for {cid}: {new_t}")
-  elif len(sys.argv) > 1 and sys.argv[1] == "summary-path":
-    cid = sys.argv[2] if len(sys.argv) > 2 else (
-        os.environ.get("CONVERSATION_ID", "") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID", "")
-    )
+  elif sys.argv[1] == "summary-path":
+    cid = _require_conversation_id(
+        "summary-path", sys.argv[2] if len(sys.argv) > 2 else _env_conversation_id())
     topic = sys.argv[3] if len(sys.argv) > 3 else ""
     p = get_handoff_summary_path(cid, topic)
     print(p)
-  elif len(sys.argv) > 1 and sys.argv[1] == "status":
-    cid = sys.argv[2] if len(sys.argv) > 2 else (
-        os.environ.get("CONVERSATION_ID", "") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID", "")
-    )
+  elif sys.argv[1] == "status":
+    cid = _require_conversation_id(
+        "status", sys.argv[2] if len(sys.argv) > 2 else _env_conversation_id())
     info = get_chain_status(cid)
     print(json.dumps(info, ensure_ascii=False, indent=2))
-  elif len(sys.argv) > 1 and sys.argv[1] == "model":
+  elif sys.argv[1] == "model":
     # Read-only diagnostic: what <id> last used and what a handoff would pick now.
-    cid = sys.argv[2] if len(sys.argv) > 2 else (
-        os.environ.get("CONVERSATION_ID", "") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID", "")
-    )
+    cid = _require_conversation_id(
+        "model", sys.argv[2] if len(sys.argv) > 2 else _env_conversation_id())
     out = {"conversation_id": cid, "last_used_enum": get_last_used_model(cid) if cid else ""}
     try:
       out["handoff_would_use"] = resolve_handoff_model(cid)
@@ -1588,7 +1609,7 @@ if __name__ == "__main__":
       out["handoff_would_use"] = {"error": str(exc)[:300], "fallback": "agentapi tier:pro"}
     out["override_setting"] = read_handoff_model_override()
     print(json.dumps(out, ensure_ascii=False, indent=2))
-  elif len(sys.argv) > 1 and sys.argv[1] == "handoff":
+  elif sys.argv[1] == "handoff":
     # Usage: chat_lifecycle.py handoff [cid] [summary_file] [--notes "..."] [--next "..."] [--model <m>]
     args = sys.argv[2:]
     cid = ""
@@ -1610,6 +1631,8 @@ if __name__ == "__main__":
       elif args[i].startswith("--model="):
         exact_model = args[i].split("=", 1)[1]
         i += 1
+      elif args[i].startswith("-"):
+        _cli_fail("handoff", f"unknown option '{args[i]}'")
       elif not cid:
         cid = args[i]
         i += 1
@@ -1617,12 +1640,11 @@ if __name__ == "__main__":
         summary = args[i]
         i += 1
       else:
-        i += 1
-    if not cid:
-      cid = os.environ.get("CONVERSATION_ID", "") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID", "")
+        _cli_fail("handoff", f"unexpected argument '{args[i]}'")
+    cid = _require_conversation_id("handoff", cid or _env_conversation_id())
     result = create_handoff(cid, summary_file=summary, notes=notes, next_step_prompt=next_step, exact_model=exact_model)
     print_handoff_result(result)
-  elif len(sys.argv) > 1 and sys.argv[1] == "audit":
+  elif sys.argv[1] == "audit":
     args = sys.argv[2:]
     do_fix = False
     proj_filter = ""
@@ -1641,33 +1663,36 @@ if __name__ == "__main__":
         i += 1
     report = audit_conversations(fix=do_fix, project_filter=proj_filter)
     print(json.dumps(report, ensure_ascii=False, indent=2))
-  elif len(sys.argv) > 1 and sys.argv[1] == "archive":
+  elif sys.argv[1] == "archive":
     args = sys.argv[2:]
     inc_chain = False
     cids_to_archive: list[str] = []
     for a in args:
       if a == "--chain":
         inc_chain = True
-      elif not a.startswith("-"):
-        cids_to_archive.append(a)
+      else:
+        cids_to_archive.append(_require_conversation_id("archive", a))
     if not cids_to_archive:
-      print("chat_lifecycle.py archive: at least one conversation ID is required", file=sys.stderr)
-      sys.exit(2)
+      _cli_fail("archive", "at least one conversation ID is required")
     res = archive_conversations(cids_to_archive, include_chain=inc_chain)
     print(json.dumps(res, ensure_ascii=False, indent=2))
-  elif len(sys.argv) > 2 and sys.argv[1] == "reopen":
-    cid = sys.argv[2]
+  elif sys.argv[1] == "reopen":
+    cid = _require_conversation_id("reopen", sys.argv[2] if len(sys.argv) > 2 else "")
     reopen_conversation(cid, force=True)
-  elif len(sys.argv) > 1 and sys.argv[1] == "advance":
-    cids = sys.argv[2:]
+  elif sys.argv[1] == "advance":
+    cids = [_require_conversation_id("advance", a) for a in sys.argv[2:]]
+    if not cids:
+      _cli_fail("advance", "at least one conversation ID is required")
     if len(cids) == 1:
       advance_in_progress_chain(current_conv_id=cids[0])
     else:
       advance_in_progress_chain(chain_ids=cids)
-  elif len(sys.argv) > 1 and sys.argv[1] == "finalize":
-    cids = sys.argv[2:]
+  elif sys.argv[1] == "finalize":
+    cids = [_require_conversation_id("finalize", a) for a in sys.argv[2:]]
+    if not cids:
+      _cli_fail("finalize", "at least one conversation ID is required")
     if len(cids) == 1:
       finalize_conversation_chain(cids[0])
     else:
-      finalize_conversation_chain(cids[0] if cids else "", cids)
+      finalize_conversation_chain(cids[0], cids)
 
