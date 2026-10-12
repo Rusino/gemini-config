@@ -1540,6 +1540,8 @@ def parse_handoff_args(args: list[str]) -> dict:
     elif a in valued and i + 1 < len(args):
       opts[valued[a]] = args[i + 1]
       i += 2
+    elif a in valued:
+      _cli_fail("handoff", f"option '{a}' requires a value")
     elif a.startswith("-"):
       _cli_fail("handoff", f"unknown option '{a}'")
     elif not opts["cid"]:

@@ -679,6 +679,21 @@ class TestChatLifecycle(unittest.TestCase):
     parsed = chat_lifecycle.parse_handoff_args([cid, "--topic=Other"])
     self.assertEqual(parsed["new_topic"], "Other")
 
+  def test_parse_handoff_args_inline_values_and_positionals(self):
+    cid = "12345678-1234-1234-1234-123456789abc"
+    parsed = chat_lifecycle.parse_handoff_args([
+        cid, "/tmp/sum.md", "--notes=a=b", "--next=step 2", "--model=gemini-x", "--topic=T",
+    ])
+    self.assertEqual(parsed, {
+        "cid": cid, "summary": "/tmp/sum.md", "notes": "a=b", "next_step": "step 2",
+        "new_topic": "T", "exact_model": "gemini-x",
+    })
+    for bad in ([cid, "--bogus", "x"], [cid, "/tmp/sum.md", "extra"], [cid, "--topic"]):
+      with self.subTest(args=bad), contextlib.redirect_stderr(io.StringIO()):
+        with self.assertRaises(SystemExit) as ctx:
+          chat_lifecycle.parse_handoff_args(bad)
+        self.assertEqual(ctx.exception.code, 2)
+
   def test_create_handoff_with_topic_retitles_child_and_keeps_summary(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
       self.write_titles(tmp_dir, {"parent-1": "[10:00] ⦿ Topic A"}, project="outside-of-project")

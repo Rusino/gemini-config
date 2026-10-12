@@ -216,6 +216,47 @@ class TestMoveChatsToProject(unittest.TestCase):
         self.assertIn("Unassigned conversations: 2 across 1 chain(s)/task(s):", report)
         self.assertIn("Unassigned Chain", report)
 
+  def test_list_unassigned_groups_mixed_topic_chain(self):
+    with tempfile.TemporaryDirectory() as tmp_dir, tempfile.TemporaryDirectory() as pdir:
+      pid_wp = "2f999b18-d1cd-4eb5-9bdd-1c8fe328762e"
+      with open(os.path.join(pdir, f"{pid_wp}.json"), "w", encoding="utf-8") as f:
+        json.dump({"id": pid_wp, "name": "WebParagraph"}, f)
+
+      conn = sqlite3.connect(os.path.join(tmp_dir, "conversation_summaries.db"))
+      with conn:
+        conn.execute(
+            "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, project_id TEXT)"
+        )
+        for cid, title, pid in [
+            ("u1", "[10:00] « Topic A", "outside-of-project"),
+            ("u2", "[10:30] » Topic B", "outside-of-project"),
+            ("u3", "[11:00] ⦿ Topic C", pid_wp),
+        ]:
+          conn.execute("INSERT INTO conversation_summaries VALUES (?, ?, ?)", (cid, title, pid))
+      conn.close()
+
+      for cid, parent in [("u1", None), ("u2", "u1"), ("u3", "u2")]:
+        log_dir = os.path.join(tmp_dir, "brain", cid, ".system_generated", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "transcript.jsonl"), "w", encoding="utf-8") as f:
+          if parent:
+            f.write(
+                f'{{"type": "USER_INPUT", "step_index": 0, "content": "Continuing work (conversation://{parent})"}}\n'
+            )
+          else:
+            f.write('{"type": "USER_INPUT", "step_index": 0, "content": "Start"}\n')
+
+      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
+           patch.object(chat_lifecycle, "_fetch_ls_summaries_for_audit", return_value=None):
+        items = move_chats_to_project.list_unassigned_conversations(
+            app_data_dir=tmp_dir, projects_dir=pdir
+        )
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["chain_ids"], ["u1", "u2", "u3"])
+        self.assertEqual(items[0]["unassigned_ids"], ["u1", "u2"])
+        self.assertEqual(items[0]["assigned_projects_in_chain"], ["WebParagraph"])
+        self.assertEqual(items[0]["base_topic"], "Topic C")
+
   def test_wait_for_idle_ls(self):
     polls = [
         {"c1": {"status": "CASCADE_RUN_STATUS_RUNNING", "summary": "Busy"}},
