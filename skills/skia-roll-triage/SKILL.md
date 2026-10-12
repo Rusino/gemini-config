@@ -15,12 +15,13 @@ description: >-
 
 ## Run
 
-From inside any google3 CitC workspace (g4 needs the cwd):
+From inside the `skia_gardener` workspace:
 
 ```bash
-python3 ~/.gemini/config/skills/skia-roll-triage/scripts/triage.py            # newest pending roll
-python3 ~/.gemini/config/skills/skia-roll-triage/scripts/triage.py --cl N     # a specific roll CL
-python3 ~/.gemini/config/skills/skia-roll-triage/scripts/triage.py --json     # for automation
+cd /usr/local/google/home/jlavrova/.gemini/jetski/scratch/skia_gardener
+go run . -triage-google3            # newest pending roll
+go run . -triage-google3 -cl N      # a specific roll CL
+go run . -triage-google3 -json      # for automation
 ```
 
 Takes 10–30 s (one `autorepair investigate` plus one `target-status` per
@@ -33,11 +34,11 @@ file or package.
 
 | Verdict | Meaning | What to do |
 |---|---|---|
-| `SKIA REGRESSION` | A `//third_party/skia/...` or `//chrome/skia/...` target fails | Our problem: bisect the roll range (`https://skia.googlesource.com/skia/+log/A..B`) |
-| `DEPENDENT FAILURE NOT BROKEN AT HEAD` | A dependent target fails in the latest run but passes at HEAD and is not an infra abort | Open its Sponge log; if the error names Skia symbols it is a real regression, otherwise likely a flake |
-| `BLOCKED BY DEPENDENTS BROKEN AT HEAD` | Every blocking target is already red at postsubmit | Not Skia's fault. Nudge the listed fix CLs, or re-roll with `SKIA_DEPENDENTS_ALREADY_FAILING=true` (sanctioned by METADATA) |
-| `INFRA ONLY` | Only `ABORTED_BY_TOOL` / distributor timeouts, HEAD green | Wait for the next attempt |
-| `IN PROGRESS` / `GREEN` | Nothing to do yet | — |
+| `SKIA_REGRESSION` | A `//third_party/skia/...` or `//chrome/skia/...` target fails | Our problem: bisect the roll range (`https://skia.googlesource.com/skia/+log/A..B`) |
+| `DEPENDENT_NOT_BROKEN_AT_HEAD` | A dependent target fails in the latest run but passes at HEAD and is not an infra abort | Open its Sponge log; if the error names Skia symbols it is a real regression, otherwise likely a flake |
+| `BLOCKED_BY_HEAD` | Every blocking target is already red at postsubmit | Not Skia's fault. Nudge the listed fix CLs, or re-roll with `SKIA_DEPENDENTS_ALREADY_FAILING=true` (sanctioned by METADATA) |
+| `INFRA_ONLY` | Only `ABORTED_BY_TOOL` / distributor timeouts, HEAD green | Wait for the next attempt |
+| `IN_PROGRESS` | Nothing to do yet | — |
 
 `Pending identical attempts: N` is the number of pending twin CLs the roller
 has created for the same range; it grows by one every ~20 minutes while stuck.
