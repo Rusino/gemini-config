@@ -266,9 +266,7 @@ def expand_conversations_with_chains(conv_ids: list[str]) -> list[str]:
   for cid in conv_ids:
     if not cid:
       continue
-    chain = chat_lifecycle.discover_conversation_chain(
-        cid, include_descendants=True, respect_boundaries=True
-    )
+    chain = chat_lifecycle.discover_conversation_chain(cid, include_descendants=True)
     for item in chain or [cid]:
       if item and item not in seen:
         seen.add(item)
@@ -408,29 +406,7 @@ def list_unassigned_conversations(
       return True
     return False
 
-  vis_parent: dict[str, str] = {}
-  vis_children: dict[str, list[str]] = {}
-  for cid in sorted(visible_ids):
-    curr = raw_parent.get(cid)
-    my_topic = chat_lifecycle.clean_base_title(_TitleOf(cid))
-    seen_anc = {cid}
-    while curr and curr not in seen_anc:
-      seen_anc.add(curr)
-      if curr in visible_ids:
-        if chat_lifecycle._is_task_boundary(curr, cid):
-          break
-        p_topic = chat_lifecycle.clean_base_title(_TitleOf(curr))
-        if (
-            p_topic == my_topic
-            or not my_topic
-            or not p_topic
-            or my_topic == "Investigation"
-            or p_topic == "Investigation"
-        ):
-          vis_parent[cid] = curr
-          vis_children.setdefault(curr, []).append(cid)
-          break
-      curr = raw_parent.get(curr)
+  vis_parent, vis_children = chat_lifecycle.link_visible_chains(visible_ids, raw_parent)
 
   roots = sorted(
       (c for c in visible_ids if c not in vis_parent),
@@ -439,9 +415,7 @@ def list_unassigned_conversations(
 
   results: list[dict] = []
   for root_id in roots:
-    chain = chat_lifecycle._order_chain_from_root(
-        root_id, vis_children, created_at_of, respect_boundaries=False
-    )
+    chain = chat_lifecycle._order_chain_from_root(root_id, vis_children, created_at_of)
     unassigned_ids = [c for c in chain if _IsUnassigned(c)]
     if not unassigned_ids:
       continue

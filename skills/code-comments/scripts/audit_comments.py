@@ -40,7 +40,7 @@ def extract_comment_blocks(lines, line_filter=None):
   return blocks
 
 
-def audit_blocks(blocks, max_lines=4):
+def audit_blocks(blocks, max_lines=4, require_period=False):
   issues = []
   for block in blocks:
     start_ln = block[0][0]
@@ -51,7 +51,10 @@ def audit_blocks(blocks, max_lines=4):
     if len(block) > max_lines:
       issues.append((span, f"block is {len(block)} lines (max {max_lines})"))
 
-    if last_text.endswith(".") and not last_text.endswith("..."):
+    # Effective Dart demands a terminal period (an ellipsis counts); every other language forbids it
+    if require_period and last_text and not last_text.endswith("."):
+      issues.append((span, f"missing trailing period (Effective Dart): '{last_text}'"))
+    elif not require_period and last_text.endswith(".") and not last_text.endswith("..."):
       issues.append((span, f"trailing period at end of comment block: '{last_text}'"))
 
     for ln, _, text in block:
@@ -138,7 +141,7 @@ def main():
       except UnicodeDecodeError:
         continue
       blocks = extract_comment_blocks(lines, line_filter=added_lines)
-      issues = audit_blocks(blocks, max_lines=args.max_lines)
+      issues = audit_blocks(blocks, max_lines=args.max_lines, require_period=full_path.suffix == ".dart")
       for span, msg in issues:
         print(f"[ISSUE] {rel_path}:{span}: {msg}")
         total_issues += 1
@@ -165,7 +168,7 @@ def main():
       continue
     lines = p.read_text(encoding="utf-8").splitlines()
     blocks = extract_comment_blocks(lines)
-    issues = audit_blocks(blocks, max_lines=args.max_lines)
+    issues = audit_blocks(blocks, max_lines=args.max_lines, require_period=p.suffix == ".dart")
     for span, msg in issues:
       print(f"[ISSUE] {p}:{span}: {msg}")
       total_issues += 1

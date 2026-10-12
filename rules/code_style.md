@@ -5,8 +5,9 @@ description: "Skia-style C++ minimalism and suppression of LLM coding reflexes."
 
 # Code Style & Anti-Slop Rules
 
-## 1. Comments (No Trailing Periods, No Noise)
+## 1. Comments (No Trailing Periods outside Dart, No Noise)
 - **Punctuation & length**: Keep comments to 1–4 lines in English; periods (`.`) are allowed between sentences inside a multi-line block, but **never** at the end of a single-line comment or the end of a comment block
+- **Dart exception**: In `.dart` files (Flutter framework, engine `web_ui`, tooling, tests) every `//` and `///` comment **must** end with a period (Effective Dart, enforced by flutter/flutter review bots). This overrides the no-trailing-period rule above for Dart only; all other comment rules still apply
 - **Never restate syntax**: Do not write comments that describe *what* the next line of code does (e.g., `// Populate the cache`, `// Check for null`, `// Increment counter`)
 - **No tutorial markers**: Never use numbered step comments (`// 1. Setup`, `// 2. Execute`) or markdown emphasis (`*word*`, `--`) in code comments
 - **Why over What (Timeless Invariants)**: Write comments only to state non-obvious domain invariants, contracts, hardware/API quirks, or why a check/call must not happen here (never diff-style `// Removed...` or `// Fixed...`). Even a 1-line non-trivial addition, modification, or deletion must get a comment explaining why

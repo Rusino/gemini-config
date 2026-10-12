@@ -605,6 +605,101 @@ class TestChatLifecycle(unittest.TestCase):
         self.assertEqual(chat_lifecycle.discover_conversation_chain("c3"), ["c1", "c2", "c3"])
         self.assertEqual(chat_lifecycle.discover_conversation_chain("split-1"), ["split-1"])
 
+  def write_chain(self, tmp_dir: str, links: list[tuple[str, str | None]]) -> None:
+    for cid, parent in links:
+      log_dir = os.path.join(tmp_dir, "brain", cid, ".system_generated", "logs")
+      os.makedirs(log_dir, exist_ok=True)
+      with open(os.path.join(log_dir, "transcript.jsonl"), "w", encoding="utf-8") as f:
+        if parent:
+          f.write(f'{{"type": "USER_INPUT", "step_index": 0, "content": "Continuing work (conversation://{parent})"}}\n')
+        else:
+          f.write('{"type": "USER_INPUT", "step_index": 0, "content": "Start"}\n')
+
+  def write_titles(self, tmp_dir: str, titles: dict[str, str], project: str = "proj-1") -> None:
+    ann_dir = os.path.join(tmp_dir, "annotations")
+    os.makedirs(ann_dir, exist_ok=True)
+    conn = sqlite3.connect(os.path.join(tmp_dir, chat_lifecycle.SUMMARY_DB_NAME))
+    with conn:
+      conn.execute(
+          "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, project_id TEXT)"
+      )
+      for cid, title in titles.items():
+        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?, ?)", (cid, title, project))
+        with open(os.path.join(ann_dir, f"{cid}.pbtxt"), "w", encoding="utf-8") as f:
+          f.write(f'title:"{title}"\n')
+    conn.close()
+
+  def test_discover_chain_follows_links_across_topics(self):
+    # A handoff after finalization reactivates the chain under a new topic;
+    # the finalized tail and the topic change must not split it
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.write_chain(tmp_dir, [("c1", None), ("c2", "c1"), ("c3", "c2")])
+      self.write_titles(tmp_dir, {
+          "c1": "[10:00] « Topic A",
+          "c2": "[10:30] » Topic A",
+          "c3": "[11:00] ▸ Topic B",
+      })
+      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]):
+        for cid in ("c1", "c2", "c3"):
+          self.assertEqual(chat_lifecycle.discover_conversation_chain(cid), ["c1", "c2", "c3"])
+        status = chat_lifecycle.get_chain_status("c3")
+        self.assertEqual([i["conversation_id"] for i in status["chain"]], ["c1", "c2", "c3"])
+        self.assertEqual([i["base_topic"] for i in status["chain"]], ["Topic A", "Topic A", "Topic B"])
+
+  def test_audit_is_clean_on_mixed_topic_chain(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.write_chain(tmp_dir, [("c1", None), ("c2", "c1"), ("c3", "c2")])
+      titles = {
+          "c1": "[10:00] ▸ Topic A",
+          "c2": "[10:30] ✓ Topic B",
+          "c3": "[11:00] ⦿ Topic C",
+      }
+      self.write_titles(tmp_dir, titles)
+      fake_ls = {
+          cid: {
+              "summary": t,
+              "annotations": {"title": t},
+              "trajectoryMetadata": {"projectId": "proj-1", "createdAt": f"2026-10-01T1{i}:00:00Z"},
+          }
+          for i, (cid, t) in enumerate(titles.items())
+      }
+      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
+           patch.object(chat_lifecycle, "_fetch_ls_summaries_for_audit", return_value=fake_ls):
+        report = chat_lifecycle.audit_conversations(fix=False)
+        self.assertEqual(report["total_chains"], 1)
+        self.assertEqual(report["total_visible_chats"], 3)
+        self.assertEqual(report["discrepancies"], [])
+
+  def test_parse_handoff_args_topic(self):
+    cid = "12345678-1234-1234-1234-123456789abc"
+    parsed = chat_lifecycle.parse_handoff_args([cid, "--topic", "Next Item", "--next", "go"])
+    self.assertEqual(parsed["cid"], cid)
+    self.assertEqual(parsed["new_topic"], "Next Item")
+    self.assertEqual(parsed["next_step"], "go")
+    parsed = chat_lifecycle.parse_handoff_args([cid, "--topic=Other"])
+    self.assertEqual(parsed["new_topic"], "Other")
+
+  def test_create_handoff_with_topic_retitles_child_and_keeps_summary(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.write_titles(tmp_dir, {"parent-1": "[10:00] ⦿ Topic A"}, project="outside-of-project")
+      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]):
+        # Written by the old chat via `summary-path <id>`, i.e. under its own topic
+        summary_path = chat_lifecycle.get_handoff_summary_path("parent-1")
+      with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("# real summary\n")
+
+      start_mock = unittest.mock.MagicMock(return_value="child-2")
+      with contextlib.ExitStack() as stack:
+        for p in self.handoff_patches(tmp_dir, start_mock):
+          stack.enter_context(p)
+        res = chat_lifecycle.create_handoff(current_conv_id="parent-1", new_topic="Topic B")
+        self.assertEqual(res["summary_file"], summary_path)
+        with open(summary_path, "r", encoding="utf-8") as f:
+          self.assertEqual(f.read(), "# real summary\n")
+        self.assertEqual(start_mock.call_args.args[1], "[15:45] ⦿ Topic B")
+        self.assertEqual(chat_lifecycle.get_conversation_title("parent-1"), "[10:00] ▸ Topic A")
+        self.assertEqual(chat_lifecycle.get_conversation_title("child-2"), "[15:45] ⦿ Topic B")
+
   def test_archive_conversations_with_chain(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
       ann_dir = os.path.join(tmp_dir, "annotations")

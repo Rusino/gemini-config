@@ -20,6 +20,7 @@ Curate code comments so that every remaining or newly added comment earns its pl
    - Prefer **1 line** (`// ...`) for straightforward invariants.
    - Allow **2–4 lines** for nuanced domain mechanics or multi-part invariants.
    - **Periods (`.`)**: Allowed *between* sentences inside a multi-line comment block, **strictly forbidden at the very end** of a single-line comment or at the end of the last line of a comment block.
+   - **Dart exception**: In `.dart` files the rule is inverted — every `//` and `///` comment **must** end with a period (Effective Dart, enforced by flutter/flutter review bots). `audit_comments.py` switches modes automatically by file extension.
 3. **No Slop / No Formatting Noise**:
    - No numbered tutorial steps (`// 1. Setup`, `// 2. Run`).
    - No markdown emphasis (`*word*`, `**word**`) or ASCII dividers (`// ---`, `// ===`).

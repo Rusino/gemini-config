@@ -512,31 +512,6 @@ def get_parent_conversation_id(conv_id: str) -> str:
   return ""
 
 
-def _is_task_boundary(parent_id: str, child_id: str) -> bool:
-  """Returns True when parent -> child crosses into a distinct named task chain."""
-  title_p = get_conversation_title(parent_id)
-  title_c = get_conversation_title(child_id)
-  base_p = clean_base_title(title_p)
-  base_c = clean_base_title(title_c)
-  if (
-      not base_p
-      or not base_c
-      or base_p == "Investigation"
-      or base_c == "Investigation"
-      or base_p == base_c
-  ):
-    return False
-  parent_closed_end = (
-      MARKER_SINGLE_CLOSED in title_p or MARKER_CLOSED_END in title_p
-  )
-  child_new_root = (
-      MARKER_CLOSED_START in title_c
-      or MARKER_START in title_c
-      or MARKER_SINGLE_CLOSED in title_c
-  )
-  return parent_closed_end or child_new_root
-
-
 def _scan_transcript_graph() -> tuple[dict[str, str], dict[str, list[str]], dict[str, str]]:
   """Scans brain/*/transcript.jsonl to build (parent_of, children_of, created_at_of)."""
   parent_of: dict[str, str] = {}
@@ -582,26 +557,18 @@ def _order_chain_from_root(
     root_id: str,
     children_of: dict[str, list[str]],
     created_at_of: dict[str, str],
-    respect_boundaries: bool = True,
 ) -> list[str]:
   """Orders a tree rooted at root_id into a linear chain with the active/latest branch last."""
   memo_max_ts: dict[str, str] = {}
   memo_has_children: dict[str, bool] = {}
 
-  def _FilteredChildren(nid: str, visited: set[str]) -> list[str]:
-    res = []
-    for ch in children_of.get(nid, []):
-      if ch in visited:
-        continue
-      if respect_boundaries and _is_task_boundary(nid, ch):
-        continue
-      res.append(ch)
-    return res
+  def _Children(nid: str, visited: set[str]) -> list[str]:
+    return [ch for ch in children_of.get(nid, []) if ch not in visited]
 
   def _SubtreeInfo(nid: str, visited: set[str]) -> tuple[str, bool]:
     if nid in memo_max_ts:
       return memo_max_ts[nid], memo_has_children[nid]
-    ch_list = _FilteredChildren(nid, visited | {nid})
+    ch_list = _Children(nid, visited | {nid})
     max_ts = created_at_of.get(nid, "")
     for ch in ch_list:
       ch_ts, _ = _SubtreeInfo(ch, visited | {nid})
@@ -621,7 +588,7 @@ def _order_chain_from_root(
       return
     seen.add(nid)
     ordered.append(nid)
-    ch_list = _FilteredChildren(nid, seen)
+    ch_list = _Children(nid, seen)
     ch_list.sort(
         key=lambda c: (
             memo_max_ts.get(c, ""),
@@ -637,10 +604,33 @@ def _order_chain_from_root(
   return ordered
 
 
+def link_visible_chains(
+    visible_ids: set[str], raw_parent: dict[str, str]
+) -> tuple[dict[str, str], dict[str, list[str]]]:
+  """Links each visible chat to its nearest visible handoff ancestor.
+
+  A chain is defined by handoff links alone: each step may carry its own
+  topic, so titles never decide membership. Hidden intermediates (archived,
+  tool-created) are skipped over, not treated as chain ends.
+  """
+  vis_parent: dict[str, str] = {}
+  vis_children: dict[str, list[str]] = {}
+  for cid in sorted(visible_ids):
+    curr = raw_parent.get(cid)
+    seen_anc = {cid}
+    while curr and curr not in seen_anc:
+      seen_anc.add(curr)
+      if curr in visible_ids:
+        vis_parent[cid] = curr
+        vis_children.setdefault(curr, []).append(cid)
+        break
+      curr = raw_parent.get(curr)
+  return vis_parent, vis_children
+
+
 def discover_conversation_chain(
     conv_id: str,
     include_descendants: bool = True,
-    respect_boundaries: bool = True,
 ) -> list[str]:
   """Traces through transcripts to return the full chain [root_id, ..., leaf_id]."""
   if not conv_id:
@@ -651,10 +641,7 @@ def discover_conversation_chain(
   while curr and curr not in seen:
     seen.add(curr)
     chain.append(curr)
-    parent = get_parent_conversation_id(curr)
-    if not parent or (respect_boundaries and _is_task_boundary(parent, curr)):
-      break
-    curr = parent
+    curr = get_parent_conversation_id(curr)
   ancestors = list(reversed(chain))
   if not include_descendants or not ancestors:
     return ancestors
@@ -664,12 +651,7 @@ def discover_conversation_chain(
     return ancestors
 
   root_id = ancestors[0]
-  ordered = _order_chain_from_root(
-      root_id,
-      children_of,
-      created_at_of,
-      respect_boundaries=respect_boundaries,
-  )
+  ordered = _order_chain_from_root(root_id, children_of, created_at_of)
   # Ensure all ancestors are preserved in case any lacked a transcript on disk
   full_chain: list[str] = []
   seen_out: set[str] = set()
@@ -944,9 +926,10 @@ def create_handoff(
         f"says it is waiting for user input). Keep the state file and roadmap statuses current as you work."
     )
   else:
-    # 3. Resolve summary artifact file
+    # 3. Resolve summary artifact file. `summary-path <id>` named it after the
+    # old chat's own topic, so a new topic must not redirect the lookup
     if not summary_file:
-      summary_file = get_handoff_summary_path(current_conv_id, new_topic)
+      summary_file = get_handoff_summary_path(current_conv_id)
 
     # Check if summary file exists; if not or if notes provided, create/update it
     if not os.path.isfile(summary_file) or notes:
@@ -1037,6 +1020,9 @@ def create_handoff(
   # 7. Advance lifecycle markers across the chain.
   # Pass [current_conv_id, new_cid] explicitly because SendUserCascadeMessage is
   # non-blocking and brain/<new_cid>/.../transcript.jsonl may not exist on disk yet.
+  # The new chat has no local title yet either, and advance falls back to the
+  # predecessor's topic for empty titles, so its own title is recorded first
+  update_conversation_title(new_cid, cont_title)
   advance_in_progress_chain(chain_ids=[current_conv_id, new_cid])
 
   return {
@@ -1130,9 +1116,7 @@ def archive_conversations(
     if not cid:
       continue
     expanded = (
-        discover_conversation_chain(
-            cid, include_descendants=True, respect_boundaries=True
-        )
+        discover_conversation_chain(cid, include_descendants=True)
         if include_chain
         else [cid]
     )
@@ -1340,31 +1324,7 @@ def audit_conversations(
     pid = ls_projects.get(cid) or db_projects.get(cid) or "outside-of-project"
     return pid if pid else "outside-of-project"
 
-  # Build visible handoff chains (linking each visible chat to its nearest visible ancestor
-  # in the same task chain).
-  vis_parent: dict[str, str] = {}
-  vis_children: dict[str, list[str]] = {}
-  for cid in sorted(visible_ids):
-    curr = raw_parent.get(cid)
-    my_topic = clean_base_title(_BestTitle(cid))
-    seen_anc = {cid}
-    while curr and curr not in seen_anc:
-      seen_anc.add(curr)
-      if curr in visible_ids:
-        if _is_task_boundary(curr, cid):
-          break
-        p_topic = clean_base_title(_BestTitle(curr))
-        if (
-            p_topic == my_topic
-            or not my_topic
-            or not p_topic
-            or my_topic == "Investigation"
-            or p_topic == "Investigation"
-        ):
-          vis_parent[cid] = curr
-          vis_children.setdefault(curr, []).append(cid)
-          break
-      curr = raw_parent.get(curr)
+  vis_parent, vis_children = link_visible_chains(visible_ids, raw_parent)
 
   roots = sorted(c for c in visible_ids if c not in vis_parent)
   discrepancies: list[dict] = []
@@ -1378,9 +1338,7 @@ def audit_conversations(
   )
 
   for root_id in roots:
-    chain = _order_chain_from_root(
-        root_id, vis_children, created_at_of, respect_boundaries=False
-    )
+    chain = _order_chain_from_root(root_id, vis_children, created_at_of)
     if target_project_id:
       if not any(_ProjectOf(c) == target_project_id for c in chain):
         continue
@@ -1486,10 +1444,12 @@ Commands:
   handoff <id> [summary_file]         Create a visible continuation chat in the same
           [--notes "..."]             project, verify sourceMetadata is null and
           [--next "..."]              update chain markers. In a project the summary
-          [--model <m>]               is the chain state file (roadmap.py state-path);
-                                      it moves to the new chat and the roadmap is
+          [--topic "<Topic>"]         is the chain state file (roadmap.py state-path);
+          [--model <m>]               it moves to the new chat and the roadmap is
                                       printed after the JSON. Outside projects it
                                       writes/updates the summary if --notes is given.
+                                      --topic titles the continuation with the next
+                                      item's topic; without it the topic is inherited.
                                       The continuation keeps the model of <id>'s last
                                       turn (see Notes); --model pins one explicitly.
   model [id]                          Read-only: show the model <id> last used and the
@@ -1515,7 +1475,8 @@ Notes:
   * When <id> is omitted, $CONVERSATION_ID is used (set inside the agent's
     run_command only).
   * Markers (▸ ✓ ⦿ « ‹✓› » «») are derived mechanically from the chain; never
-    choose or edit them by hand.
+    choose or edit them by hand. A chain is the set of chats joined by handoff
+    links (who continues whom); topics may differ from step to step.
   * Model of a continuation: --model <id|display name|enum|flash_lite|flash|pro>
     -> model of <id>'s last turn (inherit) -> $HANDOFF_MODEL or the first
     non-comment line of <app_data_dir>/handoff_model -> agentapi tier "pro".
@@ -1565,6 +1526,33 @@ def _env_conversation_id() -> str:
   return os.environ.get("CONVERSATION_ID", "") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID", "")
 
 
+def parse_handoff_args(args: list[str]) -> dict:
+  """Parses `handoff [cid] [summary_file] [--notes ..] [--next ..] [--topic ..] [--model ..]`."""
+  opts = {"cid": "", "summary": "", "notes": "", "next_step": "", "new_topic": "", "exact_model": ""}
+  valued = {"--notes": "notes", "--next": "next_step", "--topic": "new_topic", "--model": "exact_model"}
+  i = 0
+  while i < len(args):
+    a = args[i]
+    key, eq, inline = a.partition("=")
+    if eq and key in valued:
+      opts[valued[key]] = inline
+      i += 1
+    elif a in valued and i + 1 < len(args):
+      opts[valued[a]] = args[i + 1]
+      i += 2
+    elif a.startswith("-"):
+      _cli_fail("handoff", f"unknown option '{a}'")
+    elif not opts["cid"]:
+      opts["cid"] = a
+      i += 1
+    elif not opts["summary"]:
+      opts["summary"] = a
+      i += 1
+    else:
+      _cli_fail("handoff", f"unexpected argument '{a}'")
+  return opts
+
+
 if __name__ == "__main__":
   if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
     print_usage()
@@ -1610,39 +1598,16 @@ if __name__ == "__main__":
     out["override_setting"] = read_handoff_model_override()
     print(json.dumps(out, ensure_ascii=False, indent=2))
   elif sys.argv[1] == "handoff":
-    # Usage: chat_lifecycle.py handoff [cid] [summary_file] [--notes "..."] [--next "..."] [--model <m>]
-    args = sys.argv[2:]
-    cid = ""
-    summary = ""
-    notes = ""
-    next_step = ""
-    exact_model = ""
-    i = 0
-    while i < len(args):
-      if args[i] == "--notes" and i + 1 < len(args):
-        notes = args[i + 1]
-        i += 2
-      elif args[i] == "--next" and i + 1 < len(args):
-        next_step = args[i + 1]
-        i += 2
-      elif args[i] == "--model" and i + 1 < len(args):
-        exact_model = args[i + 1]
-        i += 2
-      elif args[i].startswith("--model="):
-        exact_model = args[i].split("=", 1)[1]
-        i += 1
-      elif args[i].startswith("-"):
-        _cli_fail("handoff", f"unknown option '{args[i]}'")
-      elif not cid:
-        cid = args[i]
-        i += 1
-      elif not summary:
-        summary = args[i]
-        i += 1
-      else:
-        _cli_fail("handoff", f"unexpected argument '{args[i]}'")
-    cid = _require_conversation_id("handoff", cid or _env_conversation_id())
-    result = create_handoff(cid, summary_file=summary, notes=notes, next_step_prompt=next_step, exact_model=exact_model)
+    opts = parse_handoff_args(sys.argv[2:])
+    cid = _require_conversation_id("handoff", opts["cid"] or _env_conversation_id())
+    result = create_handoff(
+        cid,
+        summary_file=opts["summary"],
+        notes=opts["notes"],
+        next_step_prompt=opts["next_step"],
+        new_topic=opts["new_topic"],
+        exact_model=opts["exact_model"],
+    )
     print_handoff_result(result)
   elif sys.argv[1] == "audit":
     args = sys.argv[2:]

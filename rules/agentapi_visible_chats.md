@@ -44,7 +44,7 @@ Use only these commands (`python3 ~/.gemini/config/hooks/chat_lifecycle.py ...`)
 | Command | When you call it |
 |---|---|
 | `set-title <id> "<Topic>"` | User asks to name/rename the chat. Pass the bare topic; time and marker are added for you. |
-| `handoff <id> [summary_file] [--notes "..."] [--next "..."]` | Context guard alert, or user asks to continue in a new chat. One call: writes/updates the summary, launches a visible continuation in the same project **with the same model as `<id>`'s last turn**, verifies `sourceMetadata: null`, updates chain markers. `--model <id\|name>` only if the user explicitly asks for a different model. |
+| `handoff <id> [summary_file] [--notes "..."] [--next "..."] [--topic "<Topic>"]` | Context guard alert, or user asks to continue in a new chat. One call: writes/updates the summary, launches a visible continuation in the same project **with the same model as `<id>`'s last turn**, verifies `sourceMetadata: null`, updates chain markers. `--topic` titles the continuation with the next item's topic (the chain is defined by handoff links, so topics may differ per step); without it the topic is inherited. `--model <id\|name>` only if the user explicitly asks for a different model. |
 | `summary-path <id>` | You want to write a detailed summary with `write_to_file` before `handoff` — this returns the canonical path. |
 | `finalize <id>` | **Only** when the user explicitly says *"финал"* (or an unambiguous equivalent). Preserves original timestamps, swaps markers. |
 | `status [id]` | User asks about the chain / which chats belong to the task / where summaries are. |
