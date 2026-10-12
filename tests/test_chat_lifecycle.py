@@ -476,14 +476,17 @@ class TestChatLifecycle(unittest.TestCase):
       self.assertIn("Verify the recorded state", prompt)
       self.assertIn("conversation://parent-1", prompt)
       self.assertEqual(chat_lifecycle.HANDOFF_PARENT_RE.search(prompt).group(1), "parent-1")
-      self.assertFalse(os.path.exists(os.path.join(tmp_dir, "brain", "parent-1")))
+      parent_dir = os.path.join(tmp_dir, "brain", "parent-1")
+      self.assertEqual(os.listdir(parent_dir), ["scratch"])
+      with open(os.path.join(parent_dir, "scratch", ".context_guard_state.json"), encoding="utf-8") as f:
+        self.assertEqual(json.load(f)["handed_off_to"], "child-2")
 
       with patch("sys.stdout", new_callable=io.StringIO) as out:
         chat_lifecycle.print_handoff_result(res)
       printed = out.getvalue()
-      head, _, tail = printed.partition("\n--- Roadmap")
-      self.assertEqual(json.loads(head)["new_conversation_id"], "child-2")
-      self.assertIn("▸ R1 Ship it", tail)
+      head, _, tail = printed.partition("\n{")
+      self.assertIn("▸ R1 Ship it", head)
+      self.assertEqual(json.loads("{" + tail)["new_conversation_id"], "child-2")
 
   def test_in_project_handoff_without_state_file_fails_and_writes_no_stub(self):
     import roadmap
@@ -686,7 +689,7 @@ class TestChatLifecycle(unittest.TestCase):
     ])
     self.assertEqual(parsed, {
         "cid": cid, "summary": "/tmp/sum.md", "notes": "a=b", "next_step": "step 2",
-        "new_topic": "T", "exact_model": "gemini-x",
+        "new_topic": "T", "exact_model": "gemini-x", "force": False,
     })
     for bad in ([cid, "--bogus", "x"], [cid, "/tmp/sum.md", "extra"], [cid, "--topic"]):
       with self.subTest(args=bad), contextlib.redirect_stderr(io.StringIO()):
@@ -880,6 +883,75 @@ class TestChatLifecycle(unittest.TestCase):
         )
         self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
         self.assertNotIn("Traceback", res.stderr)
+
+  def _outside_project_handoff_env(self, tmp_dir: str):
+    db_path = os.path.join(tmp_dir, chat_lifecycle.SUMMARY_DB_NAME)
+    conn = sqlite3.connect(db_path)
+    with conn:
+      conn.execute(
+          "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, project_id TEXT)"
+      )
+      conn.execute("INSERT INTO conversation_summaries VALUES (?, ?, ?)", ("parent-1", "[10:00] ⦿ My Feature", "outside-of-project"))
+    conn.close()
+    launched = []
+
+    def fake_run(cmd, **kwargs):
+      if "new-conversation" in cmd:
+        launched.append(cmd)
+        return unittest.mock.MagicMock(returncode=0, stdout='{"conversationId": "child-%d"}' % len(launched))
+      if "get-conversation-metadata" in cmd:
+        return unittest.mock.MagicMock(
+            returncode=0,
+            stdout='{"response": {"conversationMetadata": {"metadata": {"sourceMetadata": null}}}}',
+        )
+      return unittest.mock.MagicMock(returncode=0, stdout="")
+
+    ctx = contextlib.ExitStack()
+    ctx.enter_context(patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]))
+    ctx.enter_context(patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=False))
+    ctx.enter_context(patch.object(chat_lifecycle, "ls_rpc", side_effect=RuntimeError("offline in test")))
+    ctx.enter_context(patch.object(chat_lifecycle, "get_current_time_str", return_value="15:45"))
+    ctx.enter_context(patch("subprocess.run", side_effect=fake_run))
+    return ctx, launched
+
+  def test_handoff_records_continuation_and_refuses_a_second_one(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      ctx, launched = self._outside_project_handoff_env(tmp_dir)
+      with ctx:
+        res = chat_lifecycle.create_handoff("parent-1", next_step_prompt="go")
+        self.assertEqual(res["new_conversation_id"], "child-1")
+        state = chat_lifecycle.load_guard_state("parent-1")
+        self.assertEqual(state["handed_off_to"], "child-1")
+        self.assertTrue(state["handoff_completed"])
+        self.assertFalse(state.get("pending_handoff_launch"))
+
+        with self.assertRaises(RuntimeError) as cm:
+          chat_lifecycle.create_handoff("parent-1", next_step_prompt="go")
+        self.assertIn("child-1", str(cm.exception))
+        self.assertEqual(len(launched), 1)
+        self.assertEqual(chat_lifecycle.load_guard_state("parent-1")["handed_off_to"], "child-1")
+
+        res2 = chat_lifecycle.create_handoff("parent-1", next_step_prompt="go", force=True)
+        self.assertEqual(res2["new_conversation_id"], "child-2")
+        self.assertEqual(len(launched), 2)
+        self.assertEqual(chat_lifecycle.load_guard_state("parent-1")["handed_off_to"], "child-2")
+
+  def test_cli_handoff_force_flag_is_accepted(self):
+    opts = chat_lifecycle.parse_handoff_args(["c1", "--force", "--next", "go"])
+    self.assertTrue(opts["force"])
+    self.assertEqual(opts["next_step"], "go")
+    self.assertFalse(chat_lifecycle.parse_handoff_args(["c1"])["force"])
+
+  def test_print_handoff_result_keeps_json_after_roadmap(self):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+      chat_lifecycle.print_handoff_result({
+          "new_conversation_id": "child-1",
+          "roadmap": "\n".join(f"R{i} item" for i in range(80)),
+      })
+    out = buf.getvalue()
+    self.assertLess(out.index("R79 item"), out.index('"new_conversation_id": "child-1"'))
+    self.assertIn('"new_conversation_id": "child-1"', out[-200:])
 
 
 if __name__ == "__main__":

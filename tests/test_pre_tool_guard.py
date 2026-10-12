@@ -271,6 +271,40 @@ class TestPreToolGuard(unittest.TestCase):
       self.assertEqual(content.count(pre_tool_guard.AUTO_SNAPSHOT_HEADER), 1)
       self.assertFalse(os.path.exists(os.path.join(artifact_dir, "handoff_summary.md")))
 
+  def test_repeated_handoff_is_denied_once_state_records_the_continuation(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      artifact_dir = os.path.join(tmp_dir, "brain", "c1")
+      transcript = os.path.join(artifact_dir, ".system_generated", "logs", "transcript.jsonl")
+      os.makedirs(os.path.dirname(transcript))
+      with open(transcript, "w") as f:
+        for i, step in enumerate((
+            {"type": "USER_INPUT", "content": "go"},
+            {"type": "PLANNER_RESPONSE", "tool_calls": [{"name": "run_command", "args": {
+                "CommandLine": "python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff c1 --next 'x'"}}]},
+            {"type": "GENERIC", "status": "DONE",
+             "content": "The command exited with code 0.\nOutput:\n<truncated 53 lines>\n▸ R18 tail"},
+        )):
+          f.write(json.dumps({"step_index": i, **step}) + "\n")
+      os.makedirs(os.path.join(artifact_dir, "scratch"))
+      with open(os.path.join(artifact_dir, "scratch", ".context_guard_state.json"), "w") as f:
+        json.dump({"pending_handoff_launch": False, "handoff_completed": True, "handed_off_to": "child-9"}, f)
+      data = {
+          "conversationId": "c1",
+          "artifactDirectoryPath": artifact_dir,
+          "transcriptPath": transcript,
+          "toolCall": {
+              "name": "run_command",
+              "args": {"CommandLine": 'python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff c1 --next "go"'},
+          },
+      }
+      out = self.run_guard(data)
+      self.assertEqual(out.get("decision"), "deny")
+      self.assertIn("child-9", out["reason"])
+      data["toolCall"] = {"name": "write_to_file", "args": {"TargetFile": os.path.join(tmp_dir, "state.md")}}
+      out = self.run_guard(data)
+      self.assertEqual(out.get("decision"), "deny")
+      self.assertIn("child-9", out["reason"])
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -505,13 +505,18 @@ def main() -> None:
     # 1a. If this conversation has ALREADY launched a continuation in the current turn,
     # hard-block any further file edits or duplicate new-conversation launches!
     if launch_step >= 0 or state.get("handoff_completed"):
+      launched = (
+          f"at step #{launch_step}" if launch_step >= 0 else "recorded by chat_lifecycle.py"
+      )
+      if state.get("handed_off_to"):
+        launched += f", continuation {state['handed_off_to']}"
       if tool_name in EDIT_TOOLS:
         print(
             json.dumps(
                 {
                     "decision": "deny",
                     "reason": (
-                        f"[PRE-TOOL GUARD] This conversation has already launched a continuation chat (at step #{launch_step})! "
+                        f"[PRE-TOOL GUARD] This conversation has already launched a continuation chat ({launched})! "
                         "Editing files in the old conversation is blocked to prevent race conditions with the new conversation. "
                         "End your turn immediately."
                     ),
@@ -527,7 +532,7 @@ def main() -> None:
                 {
                     "decision": "deny",
                     "reason": (
-                        f"[PRE-TOOL GUARD] This conversation has already launched a continuation chat (at step #{launch_step})! "
+                        f"[PRE-TOOL GUARD] This conversation has already launched a continuation chat ({launched})! "
                         "Running new commands or launching duplicate continuation chats in the old conversation is blocked. "
                         "If background tasks are running, terminate them via manage_task (kill) and end your turn."
                     ),

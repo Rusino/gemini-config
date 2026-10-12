@@ -195,12 +195,18 @@ def analyze_current_turn(transcript_path: str) -> dict:
     if steps_by_idx[idx].get("type") == "USER_INPUT":
       last_user_idx = idx
 
+  from context_guard import (
+      is_chat_lifecycle_handoff_command,
+      is_handoff_launch_command,
+  )
+
   last_code_edit_idx = -1
   last_edited_file = ""
   last_cmd_idx = -1
   last_cmd_exit_code = None
   pending_cmd_check = False
   pending_new_conv_cmd = False
+  pending_is_cli = False
   launched_new_conv = False
 
   for idx in ordered_indices:
@@ -212,6 +218,7 @@ def analyze_current_turn(transcript_path: str) -> dict:
 
     if stype == "PLANNER_RESPONSE" and tool_calls:
       pending_new_conv_cmd = False
+      pending_is_cli = False
       for tc in tool_calls:
         tname = tc.get("name", "")
         targs = tc.get("args") or {}
@@ -222,10 +229,9 @@ def analyze_current_turn(transcript_path: str) -> dict:
             last_edited_file = target.strip().strip('"').strip("'")
         elif tname == "run_command":
           cmd = str(targs.get("CommandLine", ""))
-          if ("agentapi" in cmd and "new-conversation" in cmd) or re.search(
-              r"\bchat_lifecycle\.py\s+handoff\b", cmd
-          ):
+          if is_handoff_launch_command(cmd):
             pending_new_conv_cmd = True
+            pending_is_cli = is_chat_lifecycle_handoff_command(cmd)
           elif is_inspection_command(cmd):
             continue
           last_cmd_idx = idx
@@ -238,11 +244,18 @@ def analyze_current_turn(transcript_path: str) -> dict:
       m = EXIT_CODE_RE.search(content)
       if m:
         last_cmd_exit_code = int(m.group(1))
+        # Tool output truncation keeps only the tail, so a real CLI handoff is
+        # proven by exit code 0 alone whereas raw agentapi still needs its JSON
+        launched_marker = (
+            '"newConversation"' in content
+            or '"new_conversation_id"' in content
+            or pending_is_cli
+        )
         if (
             pending_new_conv_cmd
             and last_cmd_exit_code == 0
             and step.get("status") == "DONE"
-            and ('"newConversation"' in content or '"new_conversation_id"' in content)
+            and launched_marker
         ):
           launched_new_conv = True
           pending_new_conv_cmd = False
@@ -294,7 +307,11 @@ def main() -> None:
   )
   state = load_state(state_path)
 
-  if info.get("launched_new_conv"):
+  if (
+      info.get("launched_new_conv")
+      or state.get("handoff_completed")
+      or state.get("handed_off_to")
+  ):
     if state.get("pending_handoff_launch") or not state.get(
         "handoff_completed"
     ):

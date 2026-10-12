@@ -830,6 +830,39 @@ def get_handoff_summary_path(conv_id: str, topic: str = "") -> str:
   return target
 
 
+def guard_state_path(conv_id: str) -> str:
+  """The context_guard state file of conv_id (artifact_dir/scratch/.context_guard_state.json)."""
+  app_dirs = find_app_data_dirs()
+  base_dir = app_dirs[0] if app_dirs else os.path.expanduser("~/.gemini/jetski")
+  for d in app_dirs:
+    if os.path.isdir(os.path.join(d, "brain", conv_id)):
+      base_dir = d
+      break
+  return os.path.join(base_dir, "brain", conv_id, "scratch", ".context_guard_state.json")
+
+
+def load_guard_state(conv_id: str) -> dict:
+  from context_guard import load_state
+
+  return load_state(guard_state_path(conv_id))
+
+
+def record_handoff(conv_id: str, new_cid: str) -> None:
+  """Marks conv_id as handed off to new_cid in its guard state.
+
+  The CLI itself is the durable record of the launch: the hooks only see the
+  tail of a long tool output, so the JSON with the id may never reach them
+  """
+  from context_guard import save_state
+
+  state = load_guard_state(conv_id)
+  state["handed_off_to"] = new_cid
+  state["handoff_completed"] = True
+  state["pending_handoff_launch"] = False
+  state["handed_off_at"] = datetime.now(ZoneInfo("UTC")).isoformat()
+  save_state(guard_state_path(conv_id), state)
+
+
 def create_handoff(
     current_conv_id: str,
     summary_file: str = "",
@@ -838,6 +871,7 @@ def create_handoff(
     new_topic: str = "",
     model: str = "pro",
     exact_model: str = "",
+    force: bool = False,
 ) -> dict:
   """Executes a clean handoff to a new conversation.
 
@@ -855,9 +889,21 @@ def create_handoff(
      before its first message (RPC path) or right after launch (agentapi path).
   4. Advances lifecycle chain markers (advances old chat to ✓ and new to ⦿).
   5. Verifies sourceMetadata: null.
+
+  A chat that already recorded a continuation refuses a second one unless
+  force is set, because the old chat may re-run handoff after it lost the
+  first result to tool-output truncation.
   """
   if not current_conv_id:
     raise ValueError("current_conv_id must not be empty")
+
+  prior = load_guard_state(current_conv_id).get("handed_off_to", "")
+  if prior and not force:
+    raise RuntimeError(
+        f"{current_conv_id} was already handed off to {prior}; no second continuation was"
+        " started. If this turn launched it, end the turn now; pass --force only when the"
+        " user explicitly asked for another continuation"
+    )
 
   # 1. Determine base topic and new continuation title
   if not new_topic:
@@ -996,6 +1042,12 @@ def create_handoff(
     new_cid = m.group(1)
 
   extra: dict = {}
+  # Recorded before anything that can still fail: the launch already happened
+  # and the hooks must learn it from this file, not from the tool output
+  try:
+    record_handoff(current_conv_id, new_cid)
+  except Exception as exc:
+    extra["guard_state_error"] = str(exc)[:300]
   if in_project:
     # agentapi sends the first message itself, so here the move can only
     # follow; the prompt tells the continuation to run it if it gets there first
@@ -1037,14 +1089,17 @@ def create_handoff(
 
 
 def print_handoff_result(result: dict) -> None:
-  # The roadmap is plain text after the JSON so the old chat can paste it
-  # verbatim into its final message; escaped inside JSON it would be unreadable
+  # The roadmap is plain text so the old chat can paste it verbatim into its
+  # final message; escaped inside JSON it would be unreadable. The JSON goes
+  # last because tool-output truncation keeps only the tail of a long result
+  # and the continuation id must survive it
   out = dict(result)
   roadmap_text = out.pop("roadmap", "")
-  print(json.dumps(out, ensure_ascii=False, indent=2))
   if roadmap_text:
-    print("\n--- Roadmap (paste this block into your final message) ---")
+    print("--- Roadmap (paste this block into your final message) ---")
     print(roadmap_text)
+    print()
+  print(json.dumps(out, ensure_ascii=False, indent=2))
 
 
 def get_conversation_source_metadata(conv_id: str) -> tuple[bool, object]:
@@ -1445,13 +1500,15 @@ Commands:
           [--notes "..."]             project, verify sourceMetadata is null and
           [--next "..."]              update chain markers. In a project the summary
           [--topic "<Topic>"]         is the chain state file (roadmap.py state-path);
-          [--model <m>]               it moves to the new chat and the roadmap is
-                                      printed after the JSON. Outside projects it
+          [--model <m>] [--force]     it moves to the new chat and the roadmap is
+                                      printed before the JSON. Outside projects it
                                       writes/updates the summary if --notes is given.
                                       --topic titles the continuation with the next
                                       item's topic; without it the topic is inherited.
                                       The continuation keeps the model of <id>'s last
                                       turn (see Notes); --model pins one explicitly.
+                                      A chat that already handed off refuses a second
+                                      continuation unless --force is passed.
   model [id]                          Read-only: show the model <id> last used and the
                                       model a handoff would pick now.
   audit [--fix] [--project <p>]       Scan visible top-level chats and handoff chains
@@ -1527,14 +1584,20 @@ def _env_conversation_id() -> str:
 
 
 def parse_handoff_args(args: list[str]) -> dict:
-  """Parses `handoff [cid] [summary_file] [--notes ..] [--next ..] [--topic ..] [--model ..]`."""
-  opts = {"cid": "", "summary": "", "notes": "", "next_step": "", "new_topic": "", "exact_model": ""}
+  """Parses `handoff [cid] [summary_file] [--notes ..] [--next ..] [--topic ..] [--model ..] [--force]`."""
+  opts = {
+      "cid": "", "summary": "", "notes": "", "next_step": "", "new_topic": "", "exact_model": "",
+      "force": False,
+  }
   valued = {"--notes": "notes", "--next": "next_step", "--topic": "new_topic", "--model": "exact_model"}
   i = 0
   while i < len(args):
     a = args[i]
     key, eq, inline = a.partition("=")
-    if eq and key in valued:
+    if a == "--force":
+      opts["force"] = True
+      i += 1
+    elif eq and key in valued:
       opts[valued[key]] = inline
       i += 1
     elif a in valued and i + 1 < len(args):
@@ -1609,6 +1672,7 @@ if __name__ == "__main__":
         next_step_prompt=opts["next_step"],
         new_topic=opts["new_topic"],
         exact_model=opts["exact_model"],
+        force=opts["force"],
     )
     print_handoff_result(result)
   elif sys.argv[1] == "audit":

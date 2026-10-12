@@ -305,13 +305,25 @@ def build_agentapi_prefix(
   )
 
 
+def is_chat_lifecycle_handoff_command(cmd: str) -> bool:
+  """True only for a real `chat_lifecycle.py handoff` invocation, never a quoted mention.
+
+  A quoted mention (e.g. in an `agentapi send-message` text) exits 0 as well,
+  and since the CLI rule trusts the exit code alone a loose match would close
+  the chat. `handoff --help` exits 0 without launching anything either.
+  """
+  from pre_tool_guard import is_chat_lifecycle_handoff_launch
+
+  if not is_chat_lifecycle_handoff_launch(cmd):
+    return False
+  return not re.search(r"\bhandoff\s+(?:--help|-h|help)\b", cmd)
+
+
 def is_handoff_launch_command(cmd: str) -> bool:
   """Returns True if cmd invokes `agentapi new-conversation` or `chat_lifecycle.py handoff`."""
   if "agentapi" in cmd and "new-conversation" in cmd:
     return True
-  if re.search(r"\bchat_lifecycle\.py\s+handoff\b", cmd):
-    return True
-  return False
+  return is_chat_lifecycle_handoff_command(cmd)
 
 
 def get_handoff_launch_step_in_turn(transcript_path: str) -> int:
@@ -319,6 +331,7 @@ def get_handoff_launch_step_in_turn(transcript_path: str) -> int:
   turn_steps = parse_current_turn_steps(transcript_path)
   launch_idx = -1
   pending_launch_idx = None
+  pending_is_cli = False
   for idx, step in turn_steps:
     stype = step.get("type", "")
     if stype == "PLANNER_RESPONSE":
@@ -328,17 +341,22 @@ def get_handoff_launch_step_in_turn(transcript_path: str) -> int:
           cmd = str((tc.get("args") or {}).get("CommandLine", ""))
           if is_handoff_launch_command(cmd):
             pending_launch_idx = idx
+            pending_is_cli = is_chat_lifecycle_handoff_command(cmd)
     elif stype == "GENERIC" and pending_launch_idx is not None:
       content = str(step.get("content", ""))
       if "\nFile Path: " in content[:200]:
         continue
       m = EXIT_CODE_RE.search(content[:300])
-      if (
-          step.get("status") == "DONE"
-          and m
-          and int(m.group(1)) == 0
-          and ('"newConversation"' in content or '"new_conversation_id"' in content)
-      ):
+      # The stored tool output keeps only the tail of a long result, so the
+      # JSON printed by the CLI may be gone; the CLI exits non-zero whenever
+      # no chat was started, which makes its exit code proof enough. A raw
+      # agentapi call has no such contract and must still show the JSON
+      launched_marker = (
+          '"newConversation"' in content
+          or '"new_conversation_id"' in content
+          or pending_is_cli
+      )
+      if step.get("status") == "DONE" and m and int(m.group(1)) == 0 and launched_marker:
         launch_idx = pending_launch_idx
         pending_launch_idx = None
   return launch_idx
@@ -635,7 +653,11 @@ def run(data: dict, log: dict) -> dict:
       ):
         state["pending_handoff_launch"] = False
         state["handoff_completed"] = True
-        state["handed_off_to"] = get_continuation_id(transcript_path, launch_step)
+        # The CLI records the id itself; the truncated tool output may yield ""
+        state["handed_off_to"] = (
+            get_continuation_id(transcript_path, launch_step)
+            or state.get("handed_off_to", "")
+        )
         save_state(state_path, state)
       # Check if a background task / subagent woke the conversation up after handoff
       # or if the agent is still calling tools after launching the continuation:

@@ -93,6 +93,54 @@ class TestStopGuard(unittest.TestCase):
       self.assertIn('handoff c1 "/b/c1/handoff_summary_c1.md"', out["reason"])
       self.assertNotIn("roadmap.py", out["reason"])
 
+  def test_truncated_handoff_output_clears_pending_stop(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      transcript = os.path.join(tmp_dir, "transcript.jsonl")
+      steps = [
+          {"step_index": 1, "type": "USER_INPUT", "content": "hi"},
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": "python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff c1 --next 'go'"
+                  },
+              }],
+          },
+          {
+              "step_index": 3,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": "The command exited with code 0.\nOutput:\n<truncated 53 lines>\n▸ R18 roll stuck",
+          },
+      ]
+      with open(transcript, "w") as f:
+        for s in steps:
+          f.write(json.dumps(s) + "\n")
+      state_path = os.path.join(tmp_dir, "scratch", ".context_guard_state.json")
+      stop_guard.save_state(state_path, {
+          "pending_handoff_launch": True,
+          "pending_in_project": True,
+          "pending_handoff_file": "/r/proj/state/c1.md",
+      })
+      data = {
+          "conversationId": "c1",
+          "transcriptPath": transcript,
+          "artifactDirectoryPath": tmp_dir,
+          "fullyIdle": True,
+          "terminationReason": "MODEL_STOP",
+      }
+      with patch("sys.stdin", io.StringIO(json.dumps(data))), \
+           patch("sys.stdout", new_callable=io.StringIO) as mock_out, \
+           patch.object(stop_guard, "play_stop_sound") as mock_sound:
+        stop_guard.main()
+      self.assertEqual(json.loads(mock_out.getvalue()), {})
+      mock_sound.assert_called_once_with(is_handoff=True)
+      saved = stop_guard.load_state(state_path)
+      self.assertFalse(saved.get("pending_handoff_launch"))
+      self.assertTrue(saved.get("handoff_completed"))
+
   def test_unverified_code_edit_blocks_stop(self):
     fake_src = "/workspace/project/feature.py"
     with tempfile.NamedTemporaryFile("w", suffix=".jsonl") as f_trans, \

@@ -106,6 +106,34 @@ class TestContextGuard(unittest.TestCase):
     self.assertIn("old, closed chat", msg)
     self.assertIn("agentapi send-message child-9", msg)
 
+  def test_truncated_handoff_output_still_closes_the_chat(self):
+    context_guard.save_state(
+        os.path.join(self.artifact_dir, "scratch", ".context_guard_state.json"),
+        {"pending_handoff_launch": False, "handoff_completed": True, "handed_off_to": "child-9"},
+    )
+    self.write_transcript(
+        {"type": "USER_INPUT", "content": "go"},
+        {"type": "PLANNER_RESPONSE", "tool_calls": [{"name": "run_command", "args": {
+            "CommandLine": "env -u ANTIGRAVITY_SOURCE_METADATA python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff c1 --next 'x'"}}]},
+        {"type": "GENERIC", "status": "DONE", "content":
+            "The command exited with code 0.\nOutput:\n<truncated 53 lines>\n▸ R18 roll stuck\n  ✓ R18.2 skill"},
+        {"type": "PLANNER_RESPONSE", "tool_calls": [{"name": "run_command", "args": {
+            "CommandLine": "ls -la /tmp/state.md"}}]},
+    )
+    msg = self.message(self.run_guard(inv=3))
+    self.assertIn("ALREADY HANDED OFF", msg)
+    self.assertNotIn("does not exist yet", msg)
+    self.assertEqual(self.state()["handed_off_to"], "child-9")
+    self.assertEqual(context_guard.get_handoff_launch_step_in_turn(self.transcript), 1)
+    self.write_transcript(
+        {"type": "USER_INPUT", "content": "go"},
+        {"type": "PLANNER_RESPONSE", "tool_calls": [{"name": "run_command", "args": {
+            "CommandLine": "env -u ANTIGRAVITY_SOURCE_METADATA agentapi new-conversation --title=t 'p'"}}]},
+        {"type": "GENERIC", "status": "DONE", "content":
+            "The command exited with code 0.\nOutput:\n<truncated 53 lines>\nsome tail"},
+    )
+    self.assertEqual(context_guard.get_handoff_launch_step_in_turn(self.transcript), -1)
+
   def test_build_agentapi_prefix_with_project_id(self):
     with patch.object(
         context_guard,
