@@ -1,0 +1,19 @@
+{
+  "builtin": "schedule",
+  "args": [
+    "CRON_TZ=Etc/UTC 0 */4 * * *",
+    "agentapi",
+    "new-conversation",
+    "--",
+    "Scheduled check of the Skia -> google3 autoroll. Run exactly this command: python3 /usr/local/google/home/jlavrova/.gemini/config/skills/skia-roll-triage/scripts/triage.py --workspace /google/src/cloud/jlavrova/debug_skia_roll_issue/google3 (if that workspace no longer exists, pass any other google3 CitC workspace under /google/src/cloud/jlavrova/<name>/google3 as --workspace). Read /usr/local/google/home/jlavrova/.gemini/config/skills/skia-roll-triage/SKILL.md only if the output is unclear. Reply in Russian, informal (ты), at most 3 lines: the verdict, the roll CL with the number of pending attempts, and for BROKEN_AT_HEAD targets the pending fix CLs. If the verdict is GREEN or there is no pending roll, say so explicitly in one line. Do not submit, tag, or comment on any CL, and do not edit any files."
+  ],
+  "restart_policy": "always",
+  "display_name": "Skia g3 roll check",
+  "description": "Every 4 hours: triages the newest pending google3 Skia roll CL and reports whether it is blocked by Skia, by dependents broken at HEAD, by infra, or is green.",
+  "agent_permissions": {
+    "access_grants": [
+      "command(python3 /usr/local/google/home/jlavrova/.gemini/config/skills/skia-roll-triage/scripts/triage.py)",
+      "read_file(/usr/local/google/home/jlavrova/.gemini/config/skills/skia-roll-triage)"
+    ]
+  }
+}
