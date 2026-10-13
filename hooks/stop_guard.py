@@ -12,8 +12,12 @@ Checks the current turn in transcript.jsonl:
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
+
+NOTIFY_SELF_BIN = "/google/bin/releases/g3n-team/notify_self"
+_CURRENT_CONV_ID = ""
 
 SOURCE_EXTENSIONS = {
     ".c",
@@ -123,8 +127,48 @@ def save_state(state_path: str, state: dict) -> None:
     pass
 
 
+def send_stop_notification(conv_id: str) -> None:
+  """Dispatches a detached G3N desktop notification for a completed turn."""
+  if not os.path.isfile(NOTIFY_SELF_BIN):
+    return
+  title = ""
+  if conv_id:
+    try:
+      from chat_lifecycle import get_conversation_title
+
+      title = get_conversation_title(conv_id)
+    except Exception:
+      pass
+  summary = f"Jetski: {title}" if title else "Jetski"
+  short_host = socket.gethostname().split(".")[0]
+  uri = (
+      f"https://jetski.corp.google.com/box/{short_host}/c/{conv_id}"
+      if conv_id and short_host
+      else ""
+  )
+  cmd = [
+      NOTIFY_SELF_BIN,
+      f"--summary={summary}",
+      "--message=Ответ в чате готов",
+      "--severity=green",
+  ]
+  if uri:
+    cmd.append(f"--uri={uri}")
+  try:
+    # notify_self cold-starts a SAR archive that can exceed the 5s Stop hook timeout
+    subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+  except Exception:
+    pass
+
+
 def play_stop_sound(is_handoff: bool) -> None:
-  """Controls browser completion chime via config.json (no CRD required)."""
+  """Controls browser completion chime and notifications via config.json (no CRD required)."""
   import time
   config_path = os.path.expanduser("~/.gemini/config/config.json")
   try:
@@ -139,6 +183,7 @@ def play_stop_sound(is_handoff: bool) -> None:
 
     if is_handoff:
       user_settings["enableSoundsForSpecialEvents"] = False
+      user_settings["enableNotificationsForSpecialEvents"] = False
       with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
       # Restore to true after 2 seconds via detached background process
@@ -149,17 +194,24 @@ def play_stop_sound(is_handoff: bool) -> None:
           "p = os.path.expanduser('~/.gemini/config/config.json'); "
           "c = json.load(open(p)) if os.path.exists(p) else {}; "
           "c.pop('enableSoundsForSpecialEvents', None); "
-          "c.setdefault('userSettings', {})['enableSoundsForSpecialEvents'] = True; "
+          "u = c.setdefault('userSettings', {}); "
+          "u['enableSoundsForSpecialEvents'] = True; "
+          "u['enableNotificationsForSpecialEvents'] = True; "
           "json.dump(c, open(p, 'w'), indent=2)"
       ], start_new_session=True)
       # Give fsnotify time to propagate config change to browser before Idle
       time.sleep(0.3)
     else:
-      if user_settings.get("enableSoundsForSpecialEvents") is False:
+      if (
+          user_settings.get("enableSoundsForSpecialEvents") is False
+          or user_settings.get("enableNotificationsForSpecialEvents") is False
+      ):
         user_settings["enableSoundsForSpecialEvents"] = True
+        user_settings["enableNotificationsForSpecialEvents"] = True
         with open(config_path, "w", encoding="utf-8") as f:
           json.dump(config, f, indent=2)
         time.sleep(0.3)
+      send_stop_notification(_CURRENT_CONV_ID)
   except Exception:
     pass
 
@@ -294,7 +346,9 @@ def main() -> None:
     print("{}")
     return
 
+  global _CURRENT_CONV_ID
   conv_id = data.get("conversationId", "")
+  _CURRENT_CONV_ID = conv_id
   transcript_path = data.get("transcriptPath", "")
   artifact_dir = data.get("artifactDirectoryPath", "")
 

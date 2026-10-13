@@ -309,6 +309,19 @@ class TestStopGuard(unittest.TestCase):
         self.assertEqual(out.get("decision"), "continue")
         self.assertIn("VERIFICATION GUARD", out.get("reason", ""))
 
+  def test_send_stop_notification_spawns_detached_notify_self(self):
+    with patch("os.path.isfile", return_value=True), \
+         patch("socket.gethostname", return_value="myhost.c.googlers.com"), \
+         patch("chat_lifecycle.get_conversation_title", return_value="[14:00] ⦿ Fix bug"), \
+         patch("subprocess.Popen") as mock_popen:
+      stop_guard.send_stop_notification("conv-123")
+      mock_popen.assert_called_once()
+      cmd = mock_popen.call_args[0][0]
+      self.assertEqual(cmd[0], stop_guard.NOTIFY_SELF_BIN)
+      self.assertIn("--summary=Jetski: [14:00] ⦿ Fix bug", cmd)
+      self.assertIn("--uri=https://jetski.corp.google.com/box/myhost/c/conv-123", cmd)
+      self.assertTrue(mock_popen.call_args[1].get("start_new_session"))
+
 
 if __name__ == "__main__":
   unittest.main()
