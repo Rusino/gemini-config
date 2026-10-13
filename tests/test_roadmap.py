@@ -137,6 +137,57 @@ class TestRoadmap(unittest.TestCase):
         ],
     )
 
+  def test_render_collapses_old_closed_items_above_threshold(self):
+    for i in range(1, 9):
+      roadmap.add_item("p1", "c1", f"Task {i}")
+    roadmap.add_item("p1", "c1", "Dropped child", parent="R7")
+    roadmap.set_status("p1", "c1", "R7.1", "dropped")
+    for rid in ("R1", "R3", "R4", "R5", "R6"):
+      roadmap.set_status("p1", "c1", rid, "done")
+    # 5 closed top-level items: at threshold, nothing is hidden yet
+    self.assertNotIn("closed items hidden", roadmap.show("p1"))
+
+    roadmap.set_status("p1", "c1", "R7", "dropped")
+    # Close R2 last with a newer timestamp so out-of-order completion stays in the tail
+    with patch.object(roadmap, "_now", return_value="2099-01-01T00:00:00Z"):
+      roadmap.set_status("p1", "c1", "R2", "done")
+
+    self.assertEqual(
+        roadmap.show("p1").splitlines(),
+        [
+            "Roadmap (9): 6 done · 0 doing · 1 todo · 2 dropped",
+            "… 4 closed items hidden (R1, R3–R5; run `roadmap.py show --all`)",
+            "✓ R2 Task 2",
+            "✓ R6 Task 6",
+            "✗ R7 Task 7 (+1)",
+            "☐ R8 Task 8",
+        ],
+    )
+    full = roadmap.show("p1", show_all=True).splitlines()
+    self.assertNotIn("closed items hidden", "\n".join(full))
+    self.assertIn("✓ R1 Task 1", full)
+    self.assertIn("✓ R4 Task 4", full)
+    self.assertIn("  ✗ R7.1 Dropped child", full)
+
+  def test_render_collapses_old_closed_subitems_under_open_epic(self):
+    roadmap.add_item("p1", "c1", "Open epic")
+    for i in range(1, 8):
+      roadmap.add_item("p1", "c1", f"Sub {i}", parent="R1")
+    for i in range(1, 7):
+      roadmap.set_status("p1", "c1", f"R1.{i}", "done")
+    self.assertEqual(
+        roadmap.show("p1").splitlines(),
+        [
+            "Roadmap (8): 6 done · 0 doing · 2 todo · 0 dropped",
+            "☐ R1 Open epic",
+            "  … 3 closed items hidden (R1.1–R1.3)",
+            "  ✓ R1.4 Sub 4",
+            "  ✓ R1.5 Sub 5",
+            "  ✓ R1.6 Sub 6",
+            "  ☐ R1.7 Sub 7",
+        ],
+    )
+
   def test_empty_render(self):
     self.assertEqual(roadmap.show("p1"), "Roadmap: empty")
 
@@ -252,7 +303,16 @@ class TestRoadmap(unittest.TestCase):
     self.assertTrue(os.path.isdir(os.path.join(self.tmp.name, "p1", "state")))
     self.assertEqual(cli("show").stdout.splitlines()[1], "☐ R1 Via CLI")
     self.assertEqual(cli("show", "c1").stdout.splitlines()[1], "☐ R1 Via CLI")
+    for i in range(2, 8):
+      roadmap.add_item("p1", "c1", f"Done {i}")
+      roadmap.set_status("p1", "c1", f"R{i}", "done")
+    self.assertIn("closed items hidden", cli("show").stdout)
+    self.assertNotIn("closed items hidden", cli("show", "--all").stdout)
+    self.assertNotIn("closed items hidden", cli("show", "c1", "--all").stdout)
+    self.assertNotIn("closed items hidden", cli("show", "--all", "c1").stdout)
     self.assertEqual(cli("show", "../bad").returncode, 1)
+    self.assertEqual(cli("show", "c1", "c2").returncode, 2)
+    self.assertEqual(cli("show", "--all", "--all").returncode, 2)
     self.assertEqual(cli("frobnicate").returncode, 2)
 
   def test_concurrent_adds_lose_nothing(self):

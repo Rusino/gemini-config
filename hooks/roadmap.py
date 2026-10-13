@@ -28,6 +28,8 @@ SCHEMA_VERSION = 1
 STATUSES = ("todo", "doing", "done", "dropped")
 CLOSED_STATUSES = ("done", "dropped")
 GLYPHS = {"done": "✓", "doing": "▸", "todo": "☐", "dropped": "✗"}
+CLOSED_COLLAPSE_THRESHOLD = 5
+CLOSED_KEEP_RECENT = 3
 
 LOCK_TIMEOUT_ENV = "JETSKI_ROADMAP_LOCK_TIMEOUT"
 DEFAULT_LOCK_TIMEOUT_S = 5.0
@@ -46,7 +48,7 @@ Usage:
   roadmap.py set <conv_id> <ID> todo|doing|done|dropped
                                                   Change status; `doing` claims it
   roadmap.py link <conv_id> <ID> <chat_id>        Item is handled in its own chat
-  roadmap.py show [conv_id]                       Compact render
+  roadmap.py show [conv_id] [--all]               Compact render (--all shows all closed items)
   roadmap.py state-path <conv_id>                 Path of the chain state file
   roadmap.py state-move <old_conv_id> <new_conv_id>
                                                   Hand the state file (and owned
@@ -354,7 +356,22 @@ def state_move(project_id: str, old_conv: str, new_conv: str) -> str:
   return f"state moved to {dst}{owned}"
 
 
-def render(doc: dict) -> str:
+def _format_id_ranges(ids: list[str]) -> str:
+  runs: list[tuple[str, int, int]] = []
+  for iid in ids:
+    head, sep, tail = iid.rpartition(".")
+    prefix = f"{head}." if sep else "R"
+    num = int(tail if sep else iid[1:])
+    if runs and runs[-1][0] == prefix and runs[-1][2] + 1 == num:
+      runs[-1] = (prefix, runs[-1][1], num)
+    else:
+      runs.append((prefix, num, num))
+  return ", ".join(
+      f"{p}{s}" if s == e else f"{p}{s}–{p}{e}" for p, s, e in runs
+  )
+
+
+def render(doc: dict, show_all: bool = False) -> str:
   items = doc["items"]
   if not items:
     return "Roadmap: empty"
@@ -371,10 +388,45 @@ def render(doc: dict) -> str:
       out.extend(descendants(ch["id"]))
     return out
 
+  def is_closed_subtree(it: dict) -> bool:
+    return it["status"] in CLOSED_STATUSES and all(
+        d["status"] in CLOSED_STATUSES for d in descendants(it["id"])
+    )
+
+  def subtree_updated_at(it: dict) -> str:
+    return max(
+        [it.get("updated_at") or ""]
+        + [d.get("updated_at") or "" for d in descendants(it["id"])]
+    )
+
   lines = [
       f"Roadmap ({len(items)}): {counts['done']} done · {counts['doing']} doing"
       f" · {counts['todo']} todo · {counts['dropped']} dropped"
   ]
+
+  def emit_list(parent_id: str, depth: int) -> None:
+    siblings = children.get(parent_id, [])
+    closed = [(idx, it) for idx, it in enumerate(siblings) if is_closed_subtree(it)]
+    hidden_ids: set[str] = set()
+    hidden_order: list[str] = []
+    # Keep the most recently updated closed items visible so the handoff summary
+    # still shows what just finished even if an early item was closed out of order
+    if not show_all and len(closed) > CLOSED_COLLAPSE_THRESHOLD:
+      ranked = sorted(closed, key=lambda pair: (subtree_updated_at(pair[1]), pair[0]))
+      hidden_ids = {it["id"] for _, it in ranked[:-CLOSED_KEEP_RECENT]}
+      hidden_order = [it["id"] for _, it in closed if it["id"] in hidden_ids]
+    emitted_summary = False
+    for it in siblings:
+      if it["id"] in hidden_ids:
+        if not emitted_summary:
+          emitted_summary = True
+          ranges = _format_id_ranges(hidden_order)
+          hint = "; run `roadmap.py show --all`" if depth == 0 else ""
+          lines.append(
+              f"{'  ' * depth}… {len(hidden_order)} closed items hidden ({ranges}{hint})"
+          )
+        continue
+      emit(it, depth)
 
   def emit(it: dict, depth: int) -> None:
     line = f"{'  ' * depth}{GLYPHS[it['status']]} {it['id']} {it['text']}"
@@ -384,22 +436,20 @@ def render(doc: dict) -> str:
       line += f" → {it['link'][:8]}"
     desc = descendants(it["id"])
     # A finished epic with no open sub-items carries no actionable detail
-    if depth == 0 and it["status"] == "done" and desc and all(
+    if not show_all and depth == 0 and it["status"] in CLOSED_STATUSES and desc and all(
         d["status"] in CLOSED_STATUSES for d in desc
     ):
       lines.append(f"{line} (+{len(desc)})")
       return
     lines.append(line)
-    for ch in children.get(it["id"], []):
-      emit(ch, depth + 1)
+    emit_list(it["id"], depth + 1)
 
-  for top in children.get("", []):
-    emit(top, 0)
+  emit_list("", 0)
   return "\n".join(lines)
 
 
-def show(project_id: str) -> str:
-  return render(load(project_id))
+def show(project_id: str, show_all: bool = False) -> str:
+  return render(load(project_id), show_all=show_all)
 
 
 def _cli(argv: list[str]) -> int:
@@ -419,14 +469,20 @@ def _cli(argv: list[str]) -> int:
   elif cmd == "link" and len(args) == 3:
     pid = require_project_id(args[0])
     print(link_item(pid, args[0], args[1], args[2]))
-  elif cmd == "show" and len(args) in (0, 1):
+  elif cmd == "show":
+    show_all = "--all" in args
+    rest = [a for a in args if a != "--all"]
+    if len(rest) > 1 or len(args) - len(rest) > 1:
+      print(f"roadmap.py: bad arguments for '{cmd}'\n", file=sys.stderr)
+      print(USAGE, file=sys.stderr, end="")
+      return 2
     cid = (
-        _check_safe_id("conversation id", args[0])
-        if args
+        _check_safe_id("conversation id", rest[0])
+        if rest
         else os.environ.get("ANTIGRAVITY_CONVERSATION_ID", "")
     )
     pid = require_project_id(cid)
-    print(show(pid))
+    print(show(pid, show_all=show_all))
   elif cmd == "state-path" and len(args) == 1:
     pid = require_project_id(args[0])
     path = state_path(pid, args[0])
