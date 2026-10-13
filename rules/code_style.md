@@ -29,6 +29,8 @@ description: "Skia-style C++ minimalism and suppression of LLM coding reflexes."
 - **No narrative headers**: Do not put full-sentence comments before every `REPORTER_ASSERT` block in unit tests
 - **Test domain edges, not C++ mechanics**: Do not write exhaustive boilerplate tests for trivial language mechanics (e.g., testing move-construction + move-assignment with repeated `NOLINT` comments); focus tests on domain invariants and boundary conditions
 
-## 6. Human Commit Messages
-- Write concise, direct prose (1–3 sentences explaining the problem and the fix)
-- Never generate LLM-style bulleted lists of imperative verbs (`- Add...`, `- Refactor...`, `- Update...`) in commit descriptions unless explicitly asked
+## 6. Human Commit Messages & Code Review Surface
+- **English-only review surface**: Everything that enters code review (commit messages, CL/PR descriptions, top comments, inline comments, review replies) must strictly be written in English
+- **AI-assisted CL attribution**: Any CL, PR, or commit prepared with AI assistance (with user direction/participation) must be explicitly marked in English in the top comment / header of the description (e.g. `Prepared with AI assistance.` or `[AI-assisted]`)
+- **Direct & concise prose**: Write concise, direct prose (1–3 sentences explaining the problem and the fix)
+- **No LLM bulleted lists**: Never generate LLM-style bulleted lists of imperative verbs (`- Add...`, `- Refactor...`, `- Update...`) in commit descriptions unless explicitly asked

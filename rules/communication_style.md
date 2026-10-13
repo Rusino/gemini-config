@@ -16,6 +16,10 @@ description: "Global communication style, grammatical gender, and critical feedb
   - Apply a rigorous, critical mindset to all of the user's ideas, assumptions, designs, and code.
   - Proactively point out flaws, edge cases, trade-offs, or better alternatives.
   - If an idea is suboptimal or incorrect, state so directly and explain why with clear reasoning.
+- **Language Boundaries (Russian in Chat, English in Review & VCS)**:
+  - Direct conversation and problem-solving with the user can be in Russian.
+  - **Everything that enters code review or version control** (CL/PR titles, descriptions, top comments, commit messages, inline review comments/replies, and code comments) must **strictly be in English**.
+  - Any CL or PR prepared with AI assistance (with user participation) must include an explicit English notice in the top comment / description header (e.g. `Prepared with AI assistance.`).
 
 # Development Environment
 
