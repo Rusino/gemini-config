@@ -139,6 +139,32 @@ def checkout_ref(repo: pathlib.Path, ref: str, worktree_patch: Optional[pathlib.
         )
 
 
+def find_ninja() -> str:
+    candidates = [
+        shutil.which("ninja"),
+        pathlib.Path.home() / ".gemini/jetski/scratch/depot_tools/ninja",
+        pathlib.Path.home() / ".gemini/jetski/scratch/flutter/engine/src/flutter/third_party/ninja/ninja",
+    ]
+    for c in candidates:
+        if c and pathlib.Path(c).exists():
+            return str(c)
+    return "ninja"
+
+
+def default_skia_repo() -> str:
+    candidates = [
+        pathlib.Path.home() / "Sources/skia",
+        pathlib.Path.home() / ".gemini/jetski/scratch/skia",
+        pathlib.Path("/usr/local/google/home/jlavrova/.gemini/jetski/scratch/skia"),
+        pathlib.Path("/usr/local/google/home/jlavrova/skia"),
+        pathlib.Path("/Users/jlavrova/Sources/skia"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return str(candidates[0])
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run and attest SkParagraph tests across refs.")
     ap.add_argument(
@@ -149,8 +175,8 @@ def main() -> int:
     )
     ap.add_argument(
         "--repo",
-        default="/Users/jlavrova/Sources/skia",
-        help="Path to Skia repository root",
+        default=default_skia_repo(),
+        help="Path to Skia repository root (auto-detected across macOS and Jetski Cloud)",
     )
     ap.add_argument(
         "--out",
@@ -214,6 +240,7 @@ def main() -> int:
     build_dir = (repo / args.build_dir).resolve()
     dm_bin = build_dir / "dm"
     gn_args_file = build_dir / "args.gn"
+    ninja_bin = find_ninja()
 
     # Save initial working tree diff for restoration
     worktree_patch = out_dir / "worktree.patch"
@@ -281,7 +308,7 @@ def main() -> int:
                 t_ninja0 = time.time()
                 with open(ninja_log, "w") as lf:
                     res = subprocess.run(
-                        ["ninja", "-C", str(build_dir), "dm"],
+                        [ninja_bin, "-C", str(build_dir), "dm"],
                         cwd=str(repo),
                         stdout=lf,
                         stderr=subprocess.STDOUT,

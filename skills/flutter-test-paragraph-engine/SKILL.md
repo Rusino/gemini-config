@@ -1,8 +1,8 @@
 ---
 name: flutter-test-paragraph-engine
 description: >-
-  Build the Flutter engine with custom Skia or SkParagraph modifications and run the canonical ~2100 test suite covering text layout, rendering, selection, editable text, and input fields.
-  Trigger this skill when the user asks to "протестируй параграф во Флаттере", "протестируй параграф", "прогони тесты параграфа", "test paragraph in Flutter", or when verifying custom SkParagraph/Skia changes against the Flutter framework.
+  Build the Flutter engine with custom Skia or SkParagraph modifications and run the canonical ~2100 test suite covering text layout, rendering, selection, editable text, and input fields (using standard ICU by default, or opt-in full Apple Unicode replacement via --unicode apple / @apple).
+  Trigger this skill when the user asks to "протестируй параграф во Флаттере", "протестируй параграф", "прогони тесты параграфа", "проверь во Флаттере с подменой на Apple Unicode", "протестируй во Флаттере с Аппл юникодом", "test paragraph in Flutter", or when verifying custom SkParagraph/SkUnicode/Skia changes against the Flutter framework.
 ---
 
 # Testing Custom Skia / SkParagraph in Flutter Engine
@@ -20,12 +20,12 @@ This skill provides the automated and end-to-end workflow for compiling custom S
 
 ---
 
-## Repository Paths & Structure
+## Repository Paths & Structure (Auto-Detected on macOS & Jetski Cloud)
 
-* **Flutter Framework**: `/Users/jlavrova/Sources/flutter`
-* **Flutter Engine Source**: `/Users/jlavrova/Sources/flutter/engine/src`
-* **Skia Submodule**: `/Users/jlavrova/Sources/flutter/engine/src/flutter/third_party/skia`
-* **Engine Build Output**: `/Users/jlavrova/Sources/flutter/engine/src/out/host_debug_unopt_arm64`
+* **Flutter Framework**: `/Users/jlavrova/Sources/flutter` (macOS) or `~/.gemini/jetski/scratch/flutter` (Jetski Cloud)
+* **Flutter Engine Source**: `<repo>/engine/src`
+* **Skia Submodule**: `<repo>/engine/src/flutter/third_party/skia`
+* **Engine Build Output**: `<repo>/engine/src/out/host_debug_unopt_arm64` (macOS) or `<repo>/engine/src/out/host_debug_unopt` (Linux / Jetski Cloud)
 
 ---
 
@@ -38,7 +38,9 @@ This skill provides the automated and end-to-end workflow for compiling custom S
 
 ## How to Run
 
-### 1. Compare current Skia submodule changes against baseline
+By default, `--unicode` is `icu` (standard Flutter ICU backend). Apple Unicode replacement (`skia_use_apple_unicode = true`, `skia_use_icu = false`) is **opt-in** via `--unicode apple` or the per-target `@apple` suffix, and `args.gn` is automatically restored on exit.
+
+### 1. Compare current Skia submodule changes against baseline (default ICU)
 ```bash
 python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py \
   --out /tmp/flutter_paragraph_tests \
@@ -46,12 +48,20 @@ python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutte
   current=WORKTREE
 ```
 
-### 2. Compare two branches or commits in the Skia submodule
+### 2. Run or compare with opt-in Apple Unicode replacement (`@apple` / `--unicode apple`)
+Compare baseline on standard ICU against a branch from `/Users/jlavrova/Sources/skia` (`ext:<ref>`) with full Apple Unicode replacement:
 ```bash
 python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py \
   --out /tmp/flutter_paragraph_tests \
-  baseline=origin/main \
-  fix=my_skia_branch
+  baseline=origin/main@icu \
+  apple_cand=ext:HEAD@apple
+```
+Or run a single target with `--unicode apple`:
+```bash
+python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py \
+  --out /tmp/flutter_paragraph_tests \
+  --unicode apple \
+  apple_cand=ext:HEAD
 ```
 
 ### 3. Run on current working tree only
@@ -61,6 +71,8 @@ python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutte
 ```
 
 ### Useful Flags
+- `--unicode <icu|apple|keep>` — Default `SkUnicode` backend when target does not specify `@icu` or `@apple` (default: `icu`; use `apple` only when explicitly testing Apple Unicode replacement, or `keep` to leave `args.gn` untouched).
+- `ext:<ref>` target prefix — Fetches `<ref>` from `--external-skia` (`/Users/jlavrova/Sources/skia`) and checks out `modules/skunicode`, `modules/skparagraph`, `modules/skshaper` onto the Flutter Skia submodule.
 - `--batches <all|1,2,3>` — Choose specific test batches (default: `all`).
 - `--skip-build` — Skip running ninja if the engine is already built.
 - `--skip-cpp` — Skip C++ smoke tests (`txt_unittests`, `ui_unittests`).
@@ -73,10 +85,10 @@ python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutte
 After the run finishes:
 1. View `<out>/compare.md` (also printed to stdout) for:
    - Primary test outcome table across C++ smoke tests and Batches 1–3.
-   - **Паспорт прогона (Run Attestation)** and **Вердикт целостности (Integrity Check)**: verifies git SHA, Skia source tree SHA-256 (`source_tree_sha256`), rebuilt `flutter_tester` binary SHA-256 (`binary_sha256`) and mtime, ninja build action counter, executed batches, and test completeness (`finished_cleanly`).
+   - **Паспорт прогона (Run Attestation)** and **Вердикт целостности (Integrity Check)**: verifies git SHA, active `SkUnicode` backend (`Apple (CFString/CoreText)` vs `ICU` via `args.gn` and `nm` binary symbol inspection on `txt_unittests`/`flutter_tester`), Skia source tree SHA-256 (`source_tree_sha256`), rebuilt `flutter_tester` binary SHA-256 (`binary_sha256`) and mtime, ninja build action counter, executed batches, and test completeness (`finished_cleanly`).
    - **Regressions vs baseline** and **Fixed vs baseline**.
 2. Individual logs and metadata are stored in `<out>/<label>/`:
-   - `attestation.json` — objective run metadata, SHA-256 hashes, ninja actions, exact test commands, exit codes, and signals.
+   - `attestation.json` — objective run metadata, active Unicode backend (`unicode_backend`, `sym_apple_make`, `sym_icu_make`), SHA-256 hashes, ninja actions, exact test commands, exit codes, and signals.
    - `summary.json` — parsed test counts per batch and failure lists.
    - `ninja.log` — raw compilation output.
    - `txt_unittests.log`, `ui_unittests.log` — C++ smoke test logs.

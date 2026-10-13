@@ -30,6 +30,9 @@ def find_node_binary() -> str:
   )
   if candidates:
     return candidates[0]
+  mac_electron = "/Applications/Antigravity.app/Contents/MacOS/Antigravity"
+  if os.path.exists(mac_electron):
+    return mac_electron
   raise RuntimeError("No node or node_basic binary found for JS filter tests")
 
 
@@ -417,8 +420,11 @@ assert.strictEqual(btnsAfterReload.length, 1, 'Reloading script must not duplica
 
 console.log('ALL_JS_ASSERTIONS_PASSED');
 """
+    env = os.environ.copy()
+    env["ELECTRON_RUN_AS_NODE"] = "1"
     res = subprocess.run(
         [node_bin, "-e", harness, js_path],
+        env=env,
         capture_output=True,
         text=True,
         check=False,

@@ -122,8 +122,8 @@ def summarize_gtest_log(path: pathlib.Path | str) -> dict[str, Any]:
 def _evaluate_attestation(runs: list[tuple[str, dict[str, Any]]]) -> tuple[list[str], list[str]]:
     issues: list[str] = []
     rows: list[str] = []
-    seen_tree_hashes: dict[str, str] = {}
-    seen_binary_hashes: dict[str, tuple[str, Optional[str]]] = {}
+    seen_tree_and_backend: dict[tuple[str, str], str] = {}
+    seen_binary_hashes: dict[str, tuple[str, Optional[str], str]] = {}
     base_batches: Optional[str] = None
     base_executed: Optional[int] = None
 
@@ -142,16 +142,34 @@ def _evaluate_attestation(runs: list[tuple[str, dict[str, Any]]]) -> tuple[list[
         else:
             git_col = f"`{ref_spec}`"
 
+        unicode_backend = att.get("unicode_backend") or "—"
+        requested_unicode = att.get("requested_unicode") or "keep"
+        missing_glue = att.get("missing_apple_glue") or []
+        if missing_glue:
+            issues.append(f"`{label}` missing Flutter Apple Unicode glue in: {', '.join(missing_glue)}")
+        if unicode_backend.startswith("MISMATCH"):
+            issues.append(f"`{label}` Unicode backend symbol mismatch: `{unicode_backend}`")
+        elif requested_unicode == "apple" and unicode_backend != "Apple (CFString/CoreText)":
+            issues.append(
+                f"`{label}` requested `apple` Unicode backend, but binary built with `{unicode_backend}`"
+            )
+        elif requested_unicode == "icu" and unicode_backend != "ICU":
+            issues.append(
+                f"`{label}` requested `icu` Unicode backend, but binary built with `{unicode_backend}`"
+            )
+        unicode_col = f"`{unicode_backend}`" if unicode_backend != "—" else "—"
+
         tree_sha = att.get("source_tree_sha256")
         tree_col = f"`{tree_sha}`" if tree_sha else "—"
         if tree_sha:
-            if tree_sha in seen_tree_hashes:
-                prev_label = seen_tree_hashes[tree_sha]
+            key = (tree_sha, unicode_backend)
+            if key in seen_tree_and_backend:
+                prev_label = seen_tree_and_backend[key]
                 issues.append(
-                    f"`{label}` and `{prev_label}` have identical source tree hash (`{tree_sha}`)"
+                    f"`{label}` and `{prev_label}` have identical source tree hash (`{tree_sha}`) and Unicode backend (`{unicode_backend}`)"
                 )
             else:
-                seen_tree_hashes[tree_sha] = label
+                seen_tree_and_backend[key] = label
 
         # Ninja actions and duration
         ninja_rc = att.get("ninja_rc")
@@ -170,14 +188,14 @@ def _evaluate_attestation(runs: list[tuple[str, dict[str, Any]]]) -> tuple[list[
             bin_col = f"`{bin_sha}`"
             if bin_mtime:
                 bin_col += f" ({bin_mtime})"
-            if tree_sha and bin_sha in seen_binary_hashes:
-                prev_label, prev_tree = seen_binary_hashes[bin_sha]
-                if prev_tree and prev_tree != tree_sha:
+            if bin_sha in seen_binary_hashes:
+                prev_label, prev_tree, prev_backend = seen_binary_hashes[bin_sha]
+                if (tree_sha and prev_tree and prev_tree != tree_sha) or (prev_backend != unicode_backend):
                     issues.append(
-                        f"`{label}` has a different source tree than `{prev_label}` "
-                        f"but identical `flutter_tester` hash (`{bin_sha}`)"
+                        f"`{label}` differs in source tree or Unicode backend from `{prev_label}` "
+                        f"but has identical `flutter_tester` hash (`{bin_sha}`)"
                     )
-            seen_binary_hashes[bin_sha] = (label, tree_sha)
+            seen_binary_hashes[bin_sha] = (label, tree_sha, unicode_backend)
         else:
             bin_col = "—"
 
@@ -238,7 +256,7 @@ def _evaluate_attestation(runs: list[tuple[str, dict[str, Any]]]) -> tuple[list[
         status_col = f"`{' / '.join(status_parts)}`"
 
         rows.append(
-            f"| `{label}` | {git_col} | {tree_col} | {bin_col} | {ninja_part} | {batch_col} | {tests_col} | {status_col} |"
+            f"| `{label}` | {git_col} | {unicode_col} | {tree_col} | {bin_col} | {ninja_part} | {batch_col} | {tests_col} | {status_col} |"
         )
 
     return issues, rows
@@ -311,9 +329,9 @@ def compare_runs(args: list[str]) -> None:
         print("**Вердикт целостности (Integrity Check):** `VALID (все пакеты тестов завершены штатно, бинарники проверены, подмены исходников нет)`\n")
 
     print(
-        "| Ref | Git Spec / Commit | Source Tree SHA | Binary (`flutter_tester`) SHA / mtime | Ninja Build | Батчи | Тесты (+pass -fail) | Status / Signal |"
+        "| Ref | Git Spec / Commit | Unicode Backend | Source Tree SHA | Binary (`flutter_tester`) SHA / mtime | Ninja Build | Батчи | Тесты (+pass -fail) | Status / Signal |"
     )
-    print("| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |")
+    print("| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
     for r in att_rows:
         print(r)
     print()

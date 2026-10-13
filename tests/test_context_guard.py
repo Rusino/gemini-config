@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Tests for context_guard.py."""
+from __future__ import annotations
 
 import io
 import json

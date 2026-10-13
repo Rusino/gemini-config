@@ -139,7 +139,171 @@ def parse_ninja_actions(ninja_log_path: pathlib.Path) -> str:
     return "ran"
 
 
-def checkout_skia_ref(skia_repo: pathlib.Path, ref: str, worktree_patch: Optional[pathlib.Path]) -> None:
+def set_gn_unicode_backend(gn_args_file: pathlib.Path, mode: str) -> None:
+    if mode == "keep" or not gn_args_file.exists():
+        return
+    text = gn_args_file.read_text(errors="replace")
+    lines = text.splitlines()
+    out_lines: list[str] = []
+    saw_icu = False
+    saw_apple = False
+    want_apple = mode == "apple"
+    want_icu = mode == "icu"
+
+    for ln in lines:
+        if re.match(r"^\s*skia_use_icu\s*=", ln):
+            out_lines.append(f"skia_use_icu = {'true' if want_icu else 'false'}")
+            saw_icu = True
+        elif re.match(r"^\s*skia_use_apple_unicode\s*=", ln):
+            if want_apple:
+                out_lines.append("skia_use_apple_unicode = true")
+            saw_apple = True
+        else:
+            out_lines.append(ln)
+
+    if not saw_icu:
+        out_lines.append(f"skia_use_icu = {'true' if want_icu else 'false'}")
+    if want_apple and not saw_apple:
+        out_lines.append("skia_use_apple_unicode = true")
+
+    new_text = "\n".join(out_lines) + "\n"
+    if new_text != text:
+        gn_args_file.write_text(new_text)
+
+
+def verify_flutter_apple_glue(engine_src: pathlib.Path) -> list[str]:
+    missing: list[str] = []
+    checks = [
+        (
+            engine_src / "flutter/skia/modules/skunicode/BUILD.gn",
+            "skia_use_apple_unicode",
+        ),
+        (
+            engine_src / "flutter/txt/BUILD.gn",
+            "skia_use_apple_unicode",
+        ),
+        (
+            engine_src / "flutter/txt/src/skia/paragraph_builder_skia.cc",
+            "SK_UNICODE_APPLE_IMPLEMENTATION",
+        ),
+    ]
+    for path, needle in checks:
+        if not path.exists() or needle not in path.read_text(errors="replace"):
+            missing.append(str(path))
+    return missing
+
+
+def find_ninja(engine_src: pathlib.Path) -> str:
+    candidates = [
+        shutil.which("ninja"),
+        engine_src / "flutter/third_party/ninja/ninja",
+        pathlib.Path.home() / ".gemini/jetski/scratch/depot_tools/ninja",
+    ]
+    for c in candidates:
+        if c and pathlib.Path(c).exists():
+            return str(c)
+    return "ninja"
+
+
+def default_flutter_repo() -> str:
+    candidates = [
+        pathlib.Path.home() / "Sources/flutter",
+        pathlib.Path.home() / ".gemini/jetski/scratch/flutter",
+        pathlib.Path("/usr/local/google/home/jlavrova/.gemini/jetski/scratch/flutter"),
+        pathlib.Path("/Users/jlavrova/Sources/flutter"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return str(candidates[0])
+
+
+def default_external_skia_repo() -> str:
+    candidates = [
+        pathlib.Path.home() / "Sources/skia",
+        pathlib.Path.home() / ".gemini/jetski/scratch/skia",
+        pathlib.Path("/usr/local/google/home/jlavrova/.gemini/jetski/scratch/skia"),
+        pathlib.Path("/usr/local/google/home/jlavrova/skia"),
+        pathlib.Path("/Users/jlavrova/Sources/skia"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return str(candidates[0])
+
+
+def resolve_build_dir(engine_src: pathlib.Path, requested: Optional[str]) -> pathlib.Path:
+    if requested:
+        return (engine_src / requested).resolve()
+    if sys.platform == "darwin":
+        candidates = ["out/host_debug_unopt_arm64", "out/host_debug_unopt"]
+    else:
+        candidates = ["out/host_debug_unopt", "out/host_debug_unopt_x64", "out/host_debug_unopt_arm64"]
+    for rel in candidates:
+        p = engine_src / rel
+        if p.exists():
+            return p.resolve()
+    return (engine_src / candidates[0]).resolve()
+
+
+def detect_unicode_backend(build_dir: pathlib.Path, requested_mode: str = "keep") -> dict[str, Any]:
+    gn_args_file = build_dir / "args.gn"
+    gn_apple = False
+    gn_icu = True
+    if gn_args_file.exists():
+        gn_text = gn_args_file.read_text(errors="replace")
+        if re.search(r"^\s*skia_use_apple_unicode\s*=\s*true\b", gn_text, re.M):
+            gn_apple = True
+        if re.search(r"^\s*skia_use_icu\s*=\s*false\b", gn_text, re.M):
+            gn_icu = False
+
+    txt_bin = build_dir / "txt_unittests"
+    tester_bin = build_dir / "flutter_tester"
+    has_apple_sym = False
+    has_icu_sym = False
+    if txt_bin.exists():
+        nm_res = subprocess.run(
+            ["nm", str(txt_bin)], capture_output=True, text=True, check=False
+        )
+        has_apple_sym = "_ZN10SkUnicodes5Apple4MakeEv" in nm_res.stdout
+        has_icu_sym = "_ZN10SkUnicodes3ICU4MakeEv" in nm_res.stdout
+    elif tester_bin.exists():
+        nm_res = subprocess.run(
+            ["nm", "-u", str(tester_bin)], capture_output=True, text=True, check=False
+        )
+        has_apple_sym = "CFStringTokenizerCreate" in nm_res.stdout
+        has_icu_sym = bool(re.search(r"\b_?ubrk_open\b|\b_?u_strToUTF8\b", nm_res.stdout))
+
+    if gn_apple and has_apple_sym and not has_icu_sym:
+        backend = "Apple (CFString/CoreText)"
+    elif not gn_apple and has_icu_sym and not has_apple_sym:
+        backend = "ICU"
+    else:
+        backend = f"MISMATCH(gn_apple={gn_apple},gn_icu={gn_icu},sym_apple={has_apple_sym},sym_icu={has_icu_sym})"
+
+    return {
+        "requested_unicode": requested_mode,
+        "unicode_backend": backend,
+        "gn_skia_use_apple_unicode": gn_apple,
+        "gn_skia_use_icu": gn_icu,
+        "sym_apple_make": has_apple_sym,
+        "sym_icu_make": has_icu_sym,
+    }
+
+
+def checkout_skia_ref(
+    skia_repo: pathlib.Path,
+    ref: str,
+    worktree_patch: Optional[pathlib.Path],
+    external_skia_repo: Optional[pathlib.Path] = None,
+    base_head: Optional[str] = None,
+) -> dict[str, Any]:
+    if base_head:
+        subprocess.run(
+            ["git", "-C", str(skia_repo), "checkout", base_head],
+            capture_output=True,
+            check=False,
+        )
     for subdir in SKIA_MONITORED_DIRS:
         if (skia_repo / subdir).exists():
             subprocess.run(
@@ -154,11 +318,28 @@ def checkout_skia_ref(skia_repo: pathlib.Path, ref: str, worktree_patch: Optiona
                 ["git", "-C", str(skia_repo), "apply", str(worktree_patch)],
                 check=True,
             )
-    else:
+        return compute_git_metadata(skia_repo, ref)
+
+    if ref.startswith("ext:") and external_skia_repo and external_skia_repo.exists():
+        ext_ref = ref[len("ext:") :]
         subprocess.run(
-            ["git", "-C", str(skia_repo), "checkout", ref],
+            ["git", "-C", str(skia_repo), "fetch", str(external_skia_repo), ext_ref],
+            capture_output=True,
             check=True,
         )
+        subprocess.run(
+            ["git", "-C", str(skia_repo), "checkout", "FETCH_HEAD", "--", *SKIA_MONITORED_DIRS],
+            check=True,
+        )
+        meta = compute_git_metadata(external_skia_repo, ext_ref)
+        meta["ref"] = ref
+        return meta
+
+    subprocess.run(
+        ["git", "-C", str(skia_repo), "checkout", ref],
+        check=True,
+    )
+    return compute_git_metadata(skia_repo, ref)
 
 
 def main() -> int:
@@ -167,12 +348,23 @@ def main() -> int:
         "targets",
         nargs="*",
         default=["current=WORKTREE"],
-        help="List of label=ref pairs for Skia submodule (default: current=WORKTREE)",
+        help="List of label=ref[@icu|@apple] pairs for Skia submodule (default: current=WORKTREE). Use ext:<ref> to sync modules from --external-skia.",
+    )
+    ap.add_argument(
+        "--unicode",
+        choices=["icu", "apple", "keep"],
+        default="icu",
+        help="Default SkUnicode backend when target does not specify @icu or @apple (default: icu; use 'apple' for opt-in Apple Unicode replacement on macOS, or 'keep' to leave args.gn untouched)",
+    )
+    ap.add_argument(
+        "--external-skia",
+        default=default_external_skia_repo(),
+        help="Path to standalone Skia repository for ext:<ref> targets (auto-detected across macOS and Jetski Cloud)",
     )
     ap.add_argument(
         "--repo",
-        default="/Users/jlavrova/Sources/flutter",
-        help="Path to Flutter framework repository root",
+        default=default_flutter_repo(),
+        help="Path to Flutter framework repository root (auto-detected across macOS and Jetski Cloud)",
     )
     ap.add_argument(
         "--engine-src",
@@ -181,8 +373,8 @@ def main() -> int:
     )
     ap.add_argument(
         "--build-dir",
-        default="out/host_debug_unopt_arm64",
-        help="Engine build output directory relative to engine src",
+        default=None,
+        help="Engine build output directory relative to engine src (auto-detected: out/host_debug_unopt_arm64 on macOS, out/host_debug_unopt on Linux)",
     )
     ap.add_argument(
         "--out",
@@ -220,9 +412,23 @@ def main() -> int:
     repo = pathlib.Path(args.repo).resolve()
     engine_src = pathlib.Path(args.engine_src or (repo / "engine/src")).resolve()
     skia_repo = (engine_src / "flutter/third_party/skia").resolve()
-    build_dir = (engine_src / args.build_dir).resolve()
+    ext_skia_repo = pathlib.Path(args.external_skia).resolve() if args.external_skia else None
+    build_dir = resolve_build_dir(engine_src, args.build_dir)
+    ninja_bin = find_ninja(engine_src)
     flutter_tester_bin = build_dir / "flutter_tester"
     gn_args_file = build_dir / "args.gn"
+    orig_gn_args = gn_args_file.read_text(errors="replace") if gn_args_file.exists() else None
+    orig_branch_or_sha = subprocess.run(
+        ["git", "-C", str(skia_repo), "symbolic-ref", "--short", "-q", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip() or subprocess.run(
+        ["git", "-C", str(skia_repo), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
 
     out_dir = pathlib.Path(args.out).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -237,20 +443,39 @@ def main() -> int:
     worktree_patch.write_bytes(diff_res.stdout)
 
     def cleanup() -> None:
-        log("=== Cleaning up Skia submodule state ===", driver_log)
+        log("=== Cleaning up Skia submodule and args.gn state ===", driver_log)
         try:
-            checkout_skia_ref(skia_repo, "WORKTREE", worktree_patch)
+            checkout_skia_ref(skia_repo, "WORKTREE", worktree_patch, ext_skia_repo, orig_branch_or_sha)
         except Exception as e:
             log(f"WARNING: restoring Skia submodule failed: {e}", driver_log)
+        try:
+            if orig_gn_args is not None and gn_args_file.exists():
+                if gn_args_file.read_text(errors="replace") != orig_gn_args:
+                    gn_args_file.write_text(orig_gn_args)
+        except Exception as e:
+            log(f"WARNING: restoring args.gn failed: {e}", driver_log)
 
     compare_args: list[str] = []
 
     try:
         for pair in args.targets:
             if "=" in pair:
-                label, ref = pair.split("=", 1)
+                label, raw_ref = pair.split("=", 1)
             else:
-                label, ref = pair, pair
+                label, raw_ref = pair, pair
+
+            target_unicode = args.unicode
+            ref = raw_ref
+            if "@" in raw_ref:
+                maybe_ref, maybe_uni = raw_ref.rsplit("@", 1)
+                if maybe_uni in ("icu", "apple", "keep"):
+                    ref = maybe_ref
+                    target_unicode = maybe_uni
+
+            if target_unicode == "apple" and sys.platform != "darwin":
+                raise RuntimeError(
+                    f"[{label}] Apple Unicode backend (--unicode apple / @apple) is only supported on macOS."
+                )
 
             ref_dir = out_dir / label
             ref_dir.mkdir(parents=True, exist_ok=True)
@@ -262,14 +487,31 @@ def main() -> int:
                 compare_args.append(f"{label}={ref_dir}")
                 continue
 
-            log(f"=== [{label}] Switching Skia submodule to {ref} ===", driver_log)
-            checkout_skia_ref(skia_repo, ref, worktree_patch)
+            log(
+                f"=== [{label}] Switching Skia submodule to {ref} (unicode={target_unicode}) ===",
+                driver_log,
+            )
+            git_meta = checkout_skia_ref(
+                skia_repo, ref, worktree_patch, ext_skia_repo, orig_branch_or_sha
+            )
+            set_gn_unicode_backend(gn_args_file, target_unicode)
+
+            missing_glue: list[str] = []
+            if target_unicode == "apple":
+                missing_glue = verify_flutter_apple_glue(engine_src)
+                if missing_glue:
+                    log(
+                        f"WARNING: [{label}] Missing Apple Unicode glue in Flutter engine: {missing_glue}",
+                        driver_log,
+                    )
 
             attestation: dict[str, Any] = {
                 "label": label,
-                "ref": ref,
+                "ref": raw_ref,
+                "missing_apple_glue": missing_glue,
             }
-            attestation.update(compute_git_metadata(skia_repo, ref))
+            attestation.update(git_meta)
+            attestation["ref"] = raw_ref
             source_tree_sha, source_count = compute_skia_source_tree_sha256(skia_repo)
             attestation["source_tree_sha256"] = source_tree_sha
             attestation["source_files_count"] = source_count
@@ -287,7 +529,7 @@ def main() -> int:
                 with open(ninja_log, "w") as lf:
                     res = subprocess.run(
                         [
-                            "ninja",
+                            ninja_bin,
                             "-C",
                             str(build_dir),
                             "flutter_tester",
@@ -317,6 +559,8 @@ def main() -> int:
                 ).strftime("%Y-%m-%dT%H:%M:%SZ")
             else:
                 attestation["binary_mtime"] = None
+
+            attestation.update(detect_unicode_backend(build_dir, target_unicode))
 
             # Execution state
             summary: dict[str, Any] = {
