@@ -257,8 +257,12 @@ def detect_unicode_backend(build_dir: pathlib.Path, requested_mode: str = "keep"
         if re.search(r"^\s*skia_use_icu\s*=\s*false\b", gn_text, re.M):
             gn_icu = False
 
-    txt_bin = build_dir / "txt_unittests"
-    tester_bin = build_dir / "flutter_tester"
+    txt_bin = build_dir / "exe.unstripped/txt_unittests"
+    if not txt_bin.exists():
+        txt_bin = build_dir / "txt_unittests"
+    tester_bin = build_dir / "exe.unstripped/flutter_tester"
+    if not tester_bin.exists():
+        tester_bin = build_dir / "flutter_tester"
     has_apple_sym = False
     has_icu_sym = False
     if txt_bin.exists():
@@ -298,19 +302,25 @@ def checkout_skia_ref(
     external_skia_repo: Optional[pathlib.Path] = None,
     base_head: Optional[str] = None,
 ) -> dict[str, Any]:
+    target_head = base_head or "HEAD"
     if base_head:
         subprocess.run(
-            ["git", "-C", str(skia_repo), "checkout", base_head],
+            ["git", "-C", str(skia_repo), "checkout", "-f", base_head],
             capture_output=True,
             check=False,
         )
-    for subdir in SKIA_MONITORED_DIRS:
-        if (skia_repo / subdir).exists():
-            subprocess.run(
-                ["git", "-C", str(skia_repo), "checkout", "--", subdir],
-                capture_output=True,
-                check=False,
-            )
+    existing_dirs = [d for d in SKIA_MONITORED_DIRS if (skia_repo / d).exists()]
+    if existing_dirs:
+        subprocess.run(
+            ["git", "-C", str(skia_repo), "checkout", target_head, "--", *existing_dirs],
+            capture_output=True,
+            check=False,
+        )
+        subprocess.run(
+            ["git", "-C", str(skia_repo), "clean", "-fd", "--", *existing_dirs],
+            capture_output=True,
+            check=False,
+        )
 
     if ref == "WORKTREE":
         if worktree_patch and worktree_patch.exists() and worktree_patch.stat().st_size > 0:
@@ -626,6 +636,12 @@ def main() -> int:
                 f"--local-engine-host={build_dir.name}",
                 f"--local-engine-src-path={engine_src}",
             ]
+            flutter_env = os.environ.copy()
+            dart_sdk_stamp = repo / "bin/cache/engine-dart-sdk.stamp"
+            if "FLUTTER_PREBUILT_ENGINE_VERSION" not in flutter_env and dart_sdk_stamp.exists():
+                stamp_val = dart_sdk_stamp.read_text(errors="replace").strip()
+                if stamp_val:
+                    flutter_env["FLUTTER_PREBUILT_ENGINE_VERSION"] = stamp_val
 
             for b_name, b_files, should_run in batch_configs:
                 if not should_run:
@@ -638,6 +654,7 @@ def main() -> int:
                     res = subprocess.run(
                         cmd,
                         cwd=str(repo),
+                        env=flutter_env,
                         stdout=lf,
                         stderr=subprocess.STDOUT,
                         timeout=args.timeout,
