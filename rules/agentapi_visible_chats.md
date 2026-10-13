@@ -33,6 +33,7 @@ Background: when `agentapi new-conversation` is run from an agent's `run_command
 - **One project = one task.** Every non-trivial task lives in its own project; all its chats (including handoff continuations) stay inside that project (`ANTIGRAVITY_PROJECT_ID` is inherited automatically by `handoff`). A project is only a grouping — it may point at the same existing checkout as other projects; do not clone or re-sync repositories per task.
 - **No Project Prefix**: Never include the project name in a chat title.
 - **Style**: Direct and specific (strictly under 50 chars), plain text only (no markdown `**` or HTML tags, no Unicode math fonts).
+- **Identifiers**: When a chat targets a specific PR, CL, bug, issue, or commit, include its short ID in `<Topic>` (e.g. `PR #12345`, `cl/123456`, `b/123456`, 7-char SHA).
 - **Format**: `[HH:MM] <marker> <Topic>`. The time prefix and the marker are produced **only** by the CLI below — never type them yourself.
 
 ### Lifecycle CLI (markers are mechanical)
@@ -43,7 +44,7 @@ Use only these commands (`python3 ~/.gemini/config/hooks/chat_lifecycle.py ...`)
 
 | Command | When you call it |
 |---|---|
-| `set-title <id> "<Topic>"` | User asks to name/rename the chat. Pass the bare topic; time and marker are added for you. |
+| `set-title <id> "<Topic>"` | User asks to name/rename the chat, or a new untitled chat (no `[HH:MM]` prefix yet) starts with a specific PR/CL/bug/commit ID. Pass the bare topic; time and marker are added for you. |
 | `handoff <id> [summary_file] [--notes "..."] [--next "..."] [--topic "<Topic>"] [--force]` | Context guard alert, or user asks to continue in a new chat. One call: writes/updates the summary, launches a visible continuation in the same project **with the same model as `<id>`'s last turn**, verifies `sourceMetadata: null`, updates chain markers. `--topic` titles the continuation with the next item's topic (the chain is defined by handoff links, so topics may differ per step); without it the topic is inherited. `--model <id\|name>` only if the user explicitly asks for a different model. A second handoff from the same chat is refused unless `--force` (only when the user explicitly asked for another continuation). |
 | `summary-path <id>` | You want to write a detailed summary with `write_to_file` before `handoff` — this returns the canonical path. |
 | `finalize <id>` | **Only** when the user explicitly says *"финал"* (or an unambiguous equivalent). Preserves original timestamps, swaps markers. |
