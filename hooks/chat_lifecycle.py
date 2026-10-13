@@ -355,6 +355,18 @@ def resolve_handoff_model(current_conv_id: str, tier: str = "pro", explicit: str
   raise RuntimeError("no usable model found in GetAvailableModels")
 
 
+def get_model_trailer(conv_id: str = "") -> str:
+  """Returns git trailer e.g. 'Assisted-by: Gemini 3.8 Flash (High)' or fallback 'Assisted-by: AI'."""
+  try:
+    info = resolve_handoff_model(conv_id) if conv_id else {}
+    label = info.get("label") or info.get("id") or ""
+    if label:
+      return f"Assisted-by: {label}"
+  except Exception:
+    pass
+  return "Assisted-by: AI"
+
+
 class BeforeSendError(RuntimeError):
   """before_send failed; the chat exists (`cascade_id`) but got no message."""
 
@@ -1512,8 +1524,9 @@ Commands:
                                       turn (see Notes); --model pins one explicitly.
                                       A chat that already handed off refuses a second
                                       continuation unless --force is passed.
-  model [id]                          Read-only: show the model <id> last used and the
-                                      model a handoff would pick now.
+  model [id] [--trailer]              Read-only: show the model <id> last used and the
+                                      model a handoff would pick now (or output
+                                      git `Assisted-by: <Model>` trailer with --trailer).
   audit [--fix] [--project <p>]       Scan visible top-level chats and handoff chains
                                       for storage desync (LS RPC vs .pbtxt vs SQLite)
                                       and broken/double Scheme Γ markers. With --fix,
@@ -1656,15 +1669,20 @@ if __name__ == "__main__":
     print(json.dumps(info, ensure_ascii=False, indent=2))
   elif sys.argv[1] == "model":
     # Read-only diagnostic: what <id> last used and what a handoff would pick now.
+    trailer_mode = "--trailer" in sys.argv
+    args = [a for a in sys.argv[2:] if a != "--trailer"]
     cid = _require_conversation_id(
-        "model", sys.argv[2] if len(sys.argv) > 2 else _env_conversation_id())
+        "model", args[0] if args else _env_conversation_id())
     out = {"conversation_id": cid, "last_used_enum": get_last_used_model(cid) if cid else ""}
     try:
       out["handoff_would_use"] = resolve_handoff_model(cid)
     except Exception as exc:
       out["handoff_would_use"] = {"error": str(exc)[:300], "fallback": "agentapi tier:pro"}
     out["override_setting"] = read_handoff_model_override()
-    print(json.dumps(out, ensure_ascii=False, indent=2))
+    if trailer_mode:
+      print(get_model_trailer(cid))
+    else:
+      print(json.dumps(out, ensure_ascii=False, indent=2))
   elif sys.argv[1] == "handoff":
     opts = parse_handoff_args(sys.argv[2:])
     cid = _require_conversation_id("handoff", opts["cid"] or _env_conversation_id())

@@ -31,6 +31,11 @@ description: "Skia-style C++ minimalism and suppression of LLM coding reflexes."
 
 ## 6. Human Commit Messages & Code Review Surface
 - **English-only review surface**: Everything that enters code review (commit messages, CL/PR descriptions, top comments, inline comments, review replies) must strictly be written in English
-- **AI-assisted CL attribution**: Any CL, PR, or commit prepared with AI assistance (with user direction/participation) must be explicitly marked in English in the top comment / header of the description (e.g. `Prepared with AI assistance.` or `[AI-assisted]`)
+- **AI-assisted CL attribution**: Any CL, PR, or commit prepared with AI assistance (with user direction/participation) must include an `Assisted-by:` trailer in the commit summary footer, placed right before `Change-Id:`:
+  ```gitcommit
+  Assisted-by: <Model Name>
+  Change-Id: I...
+  ```
+  Run `python3 ~/.gemini/config/hooks/chat_lifecycle.py model --trailer` to obtain the trailer (e.g. `Assisted-by: Gemini 3.8 Flash (High)` or `Assisted-by: Gemini 3.8 Pro`). If the model cannot be determined, use `Assisted-by: AI`
 - **Direct & concise prose**: Write concise, direct prose (1–3 sentences explaining the problem and the fix)
 - **No LLM bulleted lists**: Never generate LLM-style bulleted lists of imperative verbs (`- Add...`, `- Refactor...`, `- Update...`) in commit descriptions unless explicitly asked

@@ -9,7 +9,8 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import mock_open, patch
+from unittest import mock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "hooks")))
 
@@ -969,6 +970,17 @@ class TestChatLifecycle(unittest.TestCase):
     out = buf.getvalue()
     self.assertLess(out.index("R79 item"), out.index('"new_conversation_id": "child-1"'))
     self.assertIn('"new_conversation_id": "child-1"', out[-200:])
+
+  def test_get_model_trailer(self):
+    with patch.object(
+        chat_lifecycle,
+        "resolve_handoff_model",
+        return_value={"id": "gemini-3.8-flash-high", "label": "Gemini 3.8 Flash (High)"},
+    ):
+      self.assertEqual(chat_lifecycle.get_model_trailer("cid-1"), "Assisted-by: Gemini 3.8 Flash (High)")
+
+    with patch.object(chat_lifecycle, "resolve_handoff_model", side_effect=RuntimeError("no model")):
+      self.assertEqual(chat_lifecycle.get_model_trailer("cid-1"), "Assisted-by: AI")
 
 
 if __name__ == "__main__":

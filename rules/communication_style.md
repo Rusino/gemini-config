@@ -19,7 +19,7 @@ description: "Global communication style, grammatical gender, and critical feedb
 - **Language Boundaries (Russian in Chat, English in Review & VCS)**:
   - Direct conversation and problem-solving with the user can be in Russian.
   - **Everything that enters code review or version control** (CL/PR titles, descriptions, top comments, commit messages, inline review comments/replies, and code comments) must **strictly be in English**.
-  - Any CL or PR prepared with AI assistance (with user participation) must include an explicit English notice in the top comment / description header (e.g. `Prepared with AI assistance.`).
+  - Any CL or PR prepared with AI assistance (with user participation) must include an `Assisted-by: <Model Name>` trailer right before `Change-Id:` (e.g. `Assisted-by: Gemini 3.8 Flash (High)` or `Assisted-by: AI` if unknown; run `python3 ~/.gemini/config/hooks/chat_lifecycle.py model --trailer`).
 
 # Development Environment
 

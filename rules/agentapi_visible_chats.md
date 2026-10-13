@@ -49,7 +49,7 @@ Use only these commands (`python3 ~/.gemini/config/hooks/chat_lifecycle.py ...`)
 | `summary-path <id>` | You want to write a detailed summary with `write_to_file` before `handoff` — this returns the canonical path. |
 | `finalize <id>` | **Only** when the user explicitly says *"финал"* (or an unambiguous equivalent). Preserves original timestamps, swaps markers. |
 | `status [id]` | User asks about the chain / which chats belong to the task / where summaries are. |
-| `model [id]` | User asks which model a chat runs on or which model a continuation would get. Read-only. |
+| `model [id] [--trailer]` | User asks which model a chat runs on or which model a continuation would get (or outputs git `Assisted-by: ...` trailer with `--trailer`). Read-only. |
 | `audit [--fix] [--project <id\|name>]` | Scan top-level chats and chains for title desync (LS RPC vs `.pbtxt` vs SQLite) or broken Scheme Γ markers; `--fix` repairs them. |
 | `archive <id...> [--chain]` | Archive specified chats (or their full handoff chain with `--chain`) via LS RPC and `.pbtxt`. |
 
