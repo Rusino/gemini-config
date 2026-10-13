@@ -31,8 +31,10 @@ description: "Skia-style C++ minimalism and suppression of LLM coding reflexes."
 
 ## 6. Human Commit Messages & Code Review Surface
 - **English-only review surface**: Everything that enters code review (commit messages, CL/PR descriptions, top comments, inline comments, review replies) must strictly be written in English
-- **AI-assisted CL attribution**: Any CL, PR, or commit prepared with AI assistance (with user direction/participation) must include an `Assisted-by:` trailer in the commit summary footer, placed right before `Change-Id:`:
+- **AI-assisted CL attribution**: Any CL, PR, or commit prepared with AI assistance (with user direction/participation) must include an `Assisted-by:` trailer in the commit summary footer, separated from the body by an empty line and placed right before `Change-Id:`:
   ```gitcommit
+  Problem description and fix explanation.
+
   Assisted-by: <Model Name>
   Change-Id: I...
   ```
