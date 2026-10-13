@@ -271,6 +271,143 @@ class TestMoveChatsToProject(unittest.TestCase):
       )
       self.assertTrue(ok)
 
+  def test_update_ls_summaries_project_and_wait_idle_target_flush(self):
+    summaries = {
+        "moved-chat": {
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "summary": "Moved",
+            "trajectoryMetadata": {"projectId": "old-proj"},
+        },
+        "other-chat": {
+            "status": "CASCADE_RUN_STATUS_RUNNING",
+            "summary": "Other",
+            "trajectoryMetadata": {"projectId": "other-proj"},
+        },
+    }
+    polls = [
+        summaries,
+        summaries,
+        {
+            **summaries,
+            "other-chat": {
+                "status": "CASCADE_RUN_STATUS_IDLE",
+                "summary": "Other",
+                "trajectoryMetadata": {"projectId": "other-proj"},
+            },
+        },
+        {
+            **summaries,
+            "other-chat": {
+                "status": "CASCADE_RUN_STATUS_IDLE",
+                "summary": "Other",
+                "trajectoryMetadata": {"projectId": "other-proj"},
+            },
+        },
+        {
+            **summaries,
+            "other-chat": {
+                "status": "CASCADE_RUN_STATUS_IDLE",
+                "summary": "Other",
+                "trajectoryMetadata": {"projectId": "other-proj"},
+            },
+        },
+    ]
+    rpc_calls = []
+
+    def fake_rpc(method, body, timeout=20.0):
+      rpc_calls.append((method, body))
+      return {}
+
+    with patch.object(chat_lifecycle, "_fetch_ls_summaries_for_audit", side_effect=polls), \
+         patch.object(chat_lifecycle, "ls_rpc", side_effect=fake_rpc):
+      ok = move_chats_to_project.wait_for_idle_ls(
+          poll_sec=0.01,
+          required_quiet_checks=2,
+          max_wait_sec=1.0,
+          target_project="new-proj",
+          target_conv_ids=["moved-chat"],
+      )
+      self.assertTrue(ok)
+      self.assertEqual(len(rpc_calls), 1)
+      self.assertEqual(rpc_calls[0][0], "JetboxWriteSummary")
+      self.assertEqual(rpc_calls[0][1]["cascadeId"], "moved-chat")
+      self.assertEqual(
+          rpc_calls[0][1]["summary"]["trajectoryMetadata"]["projectId"],
+          "new-proj",
+      )
+
+  def test_move_chain_state_files_and_restart_applies_immediate_updates(self):
+    import roadmap
+
+    with tempfile.TemporaryDirectory() as tmp_dir, \
+         tempfile.TemporaryDirectory() as pdir, \
+         tempfile.TemporaryDirectory() as rdir:
+      pid_old = "a29f214d-9fb4-46fd-a8f6-7d60a7e2aaa3"
+      pid_new = "eb394750-7b65-4e2b-9f16-a169a3caab9f"
+      with open(os.path.join(pdir, f"{pid_new}.json"), "w", encoding="utf-8") as f:
+        json.dump({"id": pid_new, "name": "Skia Gardener"}, f)
+
+      conv_dir = os.path.join(tmp_dir, "conversations")
+      os.makedirs(conv_dir, exist_ok=True)
+      cid = "ce0d3216-09d4-40d2-b849-329e5e6351e4"
+      conn = sqlite3.connect(os.path.join(conv_dir, f"{cid}.db"))
+      with conn:
+        conn.execute("CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB)")
+      conn.close()
+
+      sum_db = os.path.join(tmp_dir, "conversation_summaries.db")
+      conn = sqlite3.connect(sum_db)
+      with conn:
+        conn.execute(
+            "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, project_id TEXT, raw_summary BLOB)"
+        )
+        conn.execute(
+            "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?)",
+            (cid, "[12:36] ⦿ Skia Gardener", pid_old, b""),
+        )
+      conn.close()
+
+      with patch.dict(
+          os.environ,
+          {
+              "ANTIGRAVITY_APP_DATA_DIR": tmp_dir,
+              roadmap.ROADMAPS_DIR_ENV: rdir,
+          },
+      ):
+        old_state = roadmap.state_path(pid_old, cid)
+        os.makedirs(os.path.dirname(old_state), exist_ok=True)
+        with open(old_state, "w", encoding="utf-8") as f:
+          f.write("# State\n")
+
+        with patch.object(move_chats_to_project, "schedule_offline_migration") as sched_mock, \
+             patch.object(move_chats_to_project, "update_ls_summaries_project", return_value=1) as ls_mock, \
+             patch.object(
+                 sys,
+                 "argv",
+                 [
+                     "move_chats_to_project.py",
+                     "--project",
+                     "Skia Gardener",
+                     "--projects-dir",
+                     pdir,
+                     "--restart",
+                     cid,
+                 ],
+             ):
+          move_chats_to_project.main()
+
+        sched_mock.assert_called_once()
+        ls_mock.assert_called_once_with([cid], pid_new)
+        conn = sqlite3.connect(sum_db)
+        row = conn.execute(
+            "SELECT project_id FROM conversation_summaries WHERE conversation_id = ?",
+            (cid,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(row[0], pid_new)
+        self.assertFalse(os.path.exists(old_state))
+        self.assertTrue(os.path.isfile(roadmap.state_path(pid_new, cid)))
+
 
 if __name__ == "__main__":
   unittest.main()

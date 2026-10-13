@@ -913,18 +913,21 @@ def create_handoff(
   cont_title = f"[{time_str}] {MARKER_ACTIVE} {new_topic}"
 
   # 2. Determine project ID to preserve
-  project_id = os.environ.get("ANTIGRAVITY_PROJECT_ID", "")
-  if not project_id:
-    # Same reader as context_guard (incl. its immutable=1 fallback), so a WAL
-    # database without its -shm file cannot make the two disagree
-    from context_guard import _query_summary_db
+  # Same reader as context_guard (incl. its immutable=1 fallback), so a WAL
+  # database without its -shm file cannot make the two disagree
+  from context_guard import _query_summary_db
 
-    for d in find_app_data_dirs():
-      db_file = os.path.join(d, SUMMARY_DB_NAME)
-      row = _query_summary_db(db_file, current_conv_id) if os.path.isfile(db_file) else None
-      if row and row[1]:
-        project_id = str(row[1]).strip()
-        break
+  project_id = ""
+  for d in find_app_data_dirs():
+    db_file = os.path.join(d, SUMMARY_DB_NAME)
+    row = _query_summary_db(db_file, current_conv_id) if os.path.isfile(db_file) else None
+    if row and row[1]:
+      project_id = str(row[1]).strip()
+      break
+  # Fall back to $ANTIGRAVITY_PROJECT_ID only when the DB has no project row,
+  # because the env var is fixed at turn start and stale after a mid-turn move
+  if not project_id:
+    project_id = os.environ.get("ANTIGRAVITY_PROJECT_ID", "")
   in_project = bool(project_id) and project_id != "outside-of-project"
 
   ignored_summary = ""

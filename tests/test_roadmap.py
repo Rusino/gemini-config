@@ -24,7 +24,11 @@ class TestRoadmap(unittest.TestCase):
     self.tmp = tempfile.TemporaryDirectory()
     self.env = patch.dict(
         os.environ,
-        {roadmap.ROADMAPS_DIR_ENV: self.tmp.name, "ANTIGRAVITY_PROJECT_ID": "p1"},
+        {
+            roadmap.ROADMAPS_DIR_ENV: self.tmp.name,
+            "ANTIGRAVITY_PROJECT_ID": "p1",
+            "ANTIGRAVITY_CONVERSATION_ID": "c1",
+        },
     )
     self.env.start()
 
@@ -213,7 +217,7 @@ class TestRoadmap(unittest.TestCase):
     self.assertTrue(all(r["ts"] for r in recs))
 
   def test_outside_project_has_no_roadmap(self):
-    for env_pid, db_pid in (("outside-of-project", "proj"), ("", ""), ("", "outside-of-project")):
+    for env_pid, db_pid in (("proj", "outside-of-project"), ("", ""), ("outside-of-project", "")):
       with self.subTest(env=env_pid, db=db_pid):
         with patch.dict(os.environ, {"ANTIGRAVITY_PROJECT_ID": env_pid}), \
              patch("context_guard.get_conversation_db_info", return_value=("t", db_pid)), \
@@ -223,6 +227,14 @@ class TestRoadmap(unittest.TestCase):
           self.assertIn("outside any Jetski project", err.getvalue())
           self.assertEqual(err.getvalue().count("\n"), 1)
     self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "outside-of-project")))
+
+  def test_project_id_for_prefers_db_over_stale_env(self):
+    with patch.dict(os.environ, {"ANTIGRAVITY_PROJECT_ID": "stale-proj"}), \
+         patch("context_guard.get_conversation_db_info", return_value=("t", "new-proj")):
+      self.assertEqual(roadmap.project_id_for("c1"), "new-proj")
+    with patch.dict(os.environ, {"ANTIGRAVITY_PROJECT_ID": "fallback-proj"}), \
+         patch("context_guard.get_conversation_db_info", return_value=("", "")):
+      self.assertEqual(roadmap.project_id_for("c1"), "fallback-proj")
 
   def test_cli_round_trip(self):
     def cli(*args):
@@ -239,6 +251,8 @@ class TestRoadmap(unittest.TestCase):
     self.assertEqual(res.stdout.strip(), os.path.join(self.tmp.name, "p1", "state", "c1.md"))
     self.assertTrue(os.path.isdir(os.path.join(self.tmp.name, "p1", "state")))
     self.assertEqual(cli("show").stdout.splitlines()[1], "☐ R1 Via CLI")
+    self.assertEqual(cli("show", "c1").stdout.splitlines()[1], "☐ R1 Via CLI")
+    self.assertEqual(cli("show", "../bad").returncode, 1)
     self.assertEqual(cli("frobnicate").returncode, 2)
 
   def test_concurrent_adds_lose_nothing(self):

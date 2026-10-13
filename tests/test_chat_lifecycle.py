@@ -518,6 +518,23 @@ class TestChatLifecycle(unittest.TestCase):
         self.assertEqual(f.read(), "# Summary written under the outside flow\n")
       self.assertEqual(res["roadmap"], "Roadmap: empty")
 
+  def test_in_project_handoff_prefers_db_project_over_stale_env(self):
+    import roadmap
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.make_project_db(tmp_dir)
+      old_state = roadmap.state_path("proj-abc", "parent-1")
+      os.makedirs(os.path.dirname(old_state))
+      with open(old_state, "w", encoding="utf-8") as f:
+        f.write("# State after mid-turn move\n")
+      start = unittest.mock.MagicMock(return_value="child-2")
+      p = self.handoff_patches(tmp_dir, start)
+      with patch.dict(os.environ, {"ANTIGRAVITY_PROJECT_ID": "stale-old-project"}), \
+           p[0], p[1], p[2], p[3], p[4], p[5]:
+        res = chat_lifecycle.create_handoff(current_conv_id="parent-1", next_step_prompt="go")
+      self.assertEqual(res["summary_file"], roadmap.state_path("proj-abc", "child-2"))
+      self.assertEqual(start.call_args.args[3], "proj-abc")
+
   def run_rpc_handoff(self, tmp_dir: str, extra_patches=()):
     import roadmap
 

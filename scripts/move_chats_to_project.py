@@ -465,6 +465,71 @@ def format_unassigned_report(items: list[dict]) -> str:
   return "\n".join(lines)
 
 
+def move_chain_state_files(
+    conv_ids: list[str], new_project_id: str
+) -> int:
+  """Moves any existing per-chain state files into the target project."""
+  if not new_project_id or new_project_id == "outside-of-project":
+    return 0
+  try:
+    import roadmap  # pylint: disable=g-import-not-at-top
+  except Exception:
+    return 0
+
+  root = roadmap.roadmaps_root()
+  if not os.path.isdir(root):
+    return 0
+  moved = 0
+  for cid in conv_ids:
+    try:
+      dst = roadmap.state_path(new_project_id, cid)
+    except Exception:
+      continue
+    if os.path.exists(dst):
+      continue
+    for entry in sorted(os.listdir(root)):
+      if entry == new_project_id:
+        continue
+      src = os.path.join(root, entry, "state", f"{cid}.md")
+      if os.path.isfile(src):
+        try:
+          os.makedirs(os.path.dirname(dst), exist_ok=True)
+          os.replace(src, dst)
+          moved += 1
+          break
+        except OSError:
+          pass
+  return moved
+
+
+def update_ls_summaries_project(
+    conv_ids: list[str], new_project_id: str
+) -> int:
+  """Updates projectId in the running Language Server via JetboxWriteSummary."""
+  summaries = chat_lifecycle._fetch_ls_summaries_for_audit()
+  if not summaries:
+    return 0
+  updated = 0
+  for cid in conv_ids:
+    info = summaries.get(cid)
+    if not isinstance(info, dict):
+      continue
+    summary = json.loads(json.dumps(info))
+    meta = summary.get("trajectoryMetadata")
+    if not isinstance(meta, dict):
+      meta = {}
+      summary["trajectoryMetadata"] = meta
+    meta["projectId"] = new_project_id
+    try:
+      chat_lifecycle.ls_rpc(
+          "JetboxWriteSummary", {"cascadeId": cid, "summary": summary}
+      )
+      updated += 1
+    except Exception:
+      pass
+  return updated
+
+
 def get_running_conversations() -> list[tuple[str, str]]:
   """Returns (cid, title) for conversations currently in RUNNING status in LS."""
   summaries = chat_lifecycle._fetch_ls_summaries_for_audit()
@@ -486,14 +551,35 @@ def wait_for_idle_ls(
     poll_sec: float = 3.0,
     required_quiet_checks: int = 2,
     max_wait_sec: float = 3600.0,
+    target_project: str = "",
+    target_conv_ids: list[str] | None = None,
+    app_data_dir: str = "",
 ) -> bool:
   """Blocks until no conversation is RUNNING in LS for required_quiet_checks polls."""
   import time  # pylint: disable=g-import-not-at-top
 
   deadline = time.monotonic() + max_wait_sec
   quiet = 0
+  pending_targets = set(target_conv_ids or [])
   while time.monotonic() < deadline:
     running = get_running_conversations()
+    # A moved chat that just finished its own turn would otherwise stay in the
+    # old sidebar bucket until every unrelated running chat also finishes
+    if target_project and pending_targets:
+      running_ids = {cid for cid, _ in running}
+      newly_idle = [
+          cid
+          for cid in (target_conv_ids or [])
+          if cid in pending_targets and cid not in running_ids
+      ]
+      if newly_idle:
+        if app_data_dir and os.path.isdir(app_data_dir):
+          for cid in newly_idle:
+            update_conversation_db(app_data_dir, cid, target_project)
+          update_summaries_db(app_data_dir, newly_idle, target_project)
+          update_summaries_proto(app_data_dir, set(newly_idle), target_project)
+        update_ls_summaries_project(newly_idle, target_project)
+        pending_targets.difference_update(newly_idle)
     if not running:
       quiet += 1
       if quiet >= required_quiet_checks:
@@ -519,7 +605,10 @@ def schedule_offline_migration(
   """Schedules waiting for idle chats, stopping jetski-hub, migrating offline, and restarting."""
   quoted_cids = " ".join(f"'{cid}'" for cid in conv_ids)
   abs_script = os.path.abspath(script_path)
-  wait_cmd = f"/usr/bin/python3 '{abs_script}' --wait-idle"
+  wait_cmd = (
+      f"/usr/bin/python3 '{abs_script}' --wait-idle --project-id '{project_id}'"
+      f" {quoted_cids}"
+  )
   script_cmd = (
       f"/usr/bin/python3 '{abs_script}' --project-id '{project_id}'"
       f" {quoted_cids}"
@@ -605,12 +694,20 @@ def main():
   )
   args = parser.parse_args()
 
-  if args.wait_idle:
-    sys.exit(0 if wait_for_idle_ls() else 1)
-
   app_data_dir = os.path.expanduser(
       os.environ.get("ANTIGRAVITY_APP_DATA_DIR", "~/.gemini/jetski")
   )
+
+  if args.wait_idle:
+    sys.exit(
+        0
+        if wait_for_idle_ls(
+            target_project=args.project,
+            target_conv_ids=list(dict.fromkeys(args.conversations)),
+            app_data_dir=app_data_dir,
+        )
+        else 1
+    )
 
   if args.list_unassigned:
     items = list_unassigned_conversations(
@@ -640,14 +737,6 @@ def main():
   if args.chain:
     conv_ids = expand_conversations_with_chains(conv_ids)
 
-  # If restart requested, run everything offline while hub daemon is stopped
-  # so that in-memory cache flush on shutdown does not overwrite disk changes
-  if args.restart:
-    schedule_offline_migration(
-        sys.argv[0], target_project, conv_ids, delay_sec=3
-    )
-    return
-
   if not os.path.isdir(app_data_dir):
     print(f"[ERROR] App data dir not found: {app_data_dir}", file=sys.stderr)
     sys.exit(1)
@@ -661,19 +750,33 @@ def main():
   for cid in conv_ids:
     if update_conversation_db(app_data_dir, cid, target_project):
       db_count += 1
-  print(f"[1/3] Updated {db_count}/{len(conv_ids)} conversation SQLite files.")
+  print(f"[1/4] Updated {db_count}/{len(conv_ids)} conversation SQLite files.")
 
   # 2. Update conversation_summaries.db
   sum_count = update_summaries_db(app_data_dir, conv_ids, target_project)
-  print(f"[2/3] Updated {sum_count} row(s) in conversation_summaries.db.")
+  print(f"[2/4] Updated {sum_count} row(s) in conversation_summaries.db.")
 
   # 3. Update jetbox_summaries_proto.pb
   pb_count = update_summaries_proto(
       app_data_dir, set(conv_ids), target_project
   )
-  print(f"[3/3] Updated {pb_count} entry/entries in jetbox_summaries_proto.pb.")
+  print(f"[3/4] Updated {pb_count} entry/entries in jetbox_summaries_proto.pb.")
+
+  state_count = move_chain_state_files(conv_ids, target_project)
+  if state_count:
+    print(f"[state] Moved {state_count} chain state file(s) to '{target_project}'.")
+
+  ls_count = update_ls_summaries_project(conv_ids, target_project)
+  print(f"[4/4] Updated {ls_count}/{len(conv_ids)} live summary/summaries in Language Server.")
 
   print("Done!")
+
+  # If restart requested, run everything offline while hub daemon is stopped
+  # so that in-memory cache flush on shutdown does not overwrite disk changes
+  if args.restart:
+    schedule_offline_migration(
+        sys.argv[0], target_project, conv_ids, delay_sec=3
+    )
 
 
 if __name__ == "__main__":

@@ -46,13 +46,13 @@ Usage:
   roadmap.py set <conv_id> <ID> todo|doing|done|dropped
                                                   Change status; `doing` claims it
   roadmap.py link <conv_id> <ID> <chat_id>        Item is handled in its own chat
-  roadmap.py show                                 Compact render
+  roadmap.py show [conv_id]                       Compact render
   roadmap.py state-path <conv_id>                 Path of the chain state file
   roadmap.py state-move <old_conv_id> <new_conv_id>
                                                   Hand the state file (and owned
                                                   `doing` items) to a continuation
 
-The project comes from $ANTIGRAVITY_PROJECT_ID, else conversation_summaries.db.
+The project comes from conversation_summaries.db, else $ANTIGRAVITY_PROJECT_ID.
 Chats outside a project have no roadmap. Never edit roadmap files directly.
 """
 
@@ -87,13 +87,17 @@ def state_path(project_id: str, conv_id: str) -> str:
 
 def project_id_for(conv_id: str) -> str:
   """Project of conv_id, or "" when the chat is outside any project."""
-  pid = os.environ.get("ANTIGRAVITY_PROJECT_ID", "").strip()
-  if not pid and conv_id:
+  pid = ""
+  if conv_id:
     # Lazy import: context_guard is a hook module and pulls in sqlite3 only
     # when the env var is missing (hooks, tests)
+    # Query the DB before $ANTIGRAVITY_PROJECT_ID because the env var is fixed
+    # at turn start and stays stale after a mid-turn move_chats_to_project call
     from context_guard import get_conversation_db_info
 
     _, pid = get_conversation_db_info(conv_id)
+  if not pid:
+    pid = os.environ.get("ANTIGRAVITY_PROJECT_ID", "").strip()
   return "" if pid in ("", OUTSIDE_PROJECT) else pid
 
 
@@ -415,8 +419,13 @@ def _cli(argv: list[str]) -> int:
   elif cmd == "link" and len(args) == 3:
     pid = require_project_id(args[0])
     print(link_item(pid, args[0], args[1], args[2]))
-  elif cmd == "show" and not args:
-    pid = require_project_id(os.environ.get("ANTIGRAVITY_CONVERSATION_ID", ""))
+  elif cmd == "show" and len(args) in (0, 1):
+    cid = (
+        _check_safe_id("conversation id", args[0])
+        if args
+        else os.environ.get("ANTIGRAVITY_CONVERSATION_ID", "")
+    )
+    pid = require_project_id(cid)
     print(show(pid))
   elif cmd == "state-path" and len(args) == 1:
     pid = require_project_id(args[0])
