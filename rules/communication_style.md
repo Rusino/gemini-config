@@ -19,6 +19,8 @@ description: "Global communication style, grammatical gender, and critical feedb
 - **Language Boundaries (Russian in Chat, English in Review & VCS)**:
   - Direct conversation and problem-solving with the user can be in Russian.
   - **Everything that enters code review or version control** (CL/PR titles, descriptions, top comments, commit messages, inline review comments/replies, and code comments) must **strictly be in English**.
+  - **Never publish review replies**: Never publish replies on Gerrit or GitHub yourself — only
+    prepare / draft them for the user to review and publish.
   - Any CL or PR prepared with AI assistance (with user participation) must include an `Assisted-by: <Model Name>` trailer (separated by an empty line from the description body, placed right before `Change-Id:`; run `python3 ~/.gemini/config/hooks/chat_lifecycle.py model --trailer`). If the model is unknown, use `Assisted-by: AI`.
 
 # Development Environment

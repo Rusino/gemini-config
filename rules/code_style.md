@@ -41,7 +41,12 @@ description: "Skia-style C++ minimalism and suppression of LLM coding reflexes."
   Run `python3 ~/.gemini/config/hooks/chat_lifecycle.py model --trailer` to obtain the trailer (e.g. `Assisted-by: Gemini 3.8 Flash (High)` or `Assisted-by: Gemini 3.8 Pro`). If the model cannot be determined, use `Assisted-by: AI`
 - **Direct & concise prose**: Write concise, direct prose (1–3 sentences explaining the problem and the fix)
 - **No LLM bulleted lists**: Never generate LLM-style bulleted lists of imperative verbs (`- Add...`, `- Refactor...`, `- Update...`) in commit descriptions unless explicitly asked
-- **No Auto-Submit or Automated CQ Votes**: Never vote `Auto-Submit+1`, `Commit-Queue+1` (dry run), or `Commit-Queue+2` on Gerrit CLs, and never auto-merge GitHub PRs, unless the user explicitly asks for it. Do not publish review replies or trigger CI submission automatically
+- **Never publish review replies (draft only)**: Never publish review replies or comments to
+  Gerrit or GitHub yourself. Only prepare / draft replies (either save as drafts on Gerrit or
+  present them in chat for review); only the user publishes review submissions
+- **No Auto-Submit or Automated CQ Votes**: Never vote `Auto-Submit+1`, `Commit-Queue+1` (dry run),
+  or `Commit-Queue+2` on Gerrit CLs, and never auto-merge GitHub PRs, unless the user explicitly
+  asks for it. Do not trigger CI submission automatically
 
 ## 7. Strict Line Length (<= 100 Columns)
 - **Hard 100-character limit**: Every source line, test line, and code comment must strictly stay
