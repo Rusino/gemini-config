@@ -253,19 +253,7 @@ def patch_flutter_tools_for_web_corpus(repo):
     if (_logger.isVerbose) {
       _logger.printTrace('Running test suite $relativePath.');
     }
-
-    final RunnerSuite suite = await _browserManager!.load(
-      relativePath,
-      suiteUrl,
-      suiteConfig,
-      message,
-      onDone: () async {
-        lockResource.release();
-        if (_logger.isVerbose) {
-          _logger.printTrace('Test suite $relativePath finished.');
-        }
-      },
-    );"""
+"""
         repl_load = """    final PoolResource lockResource = await _suiteLock.request();
 
     final Runtime browser = platform.runtime;
@@ -318,8 +306,24 @@ def patch_flutter_tools_for_web_corpus(repo):
         lockResource.release();
       }
     }
+"""
 
-    final RunnerSuite suite;
+        # The suite load tail exists in two upstream shapes: the plain one (before #191004) and
+        # the one wrapped in hang watchdogs (3m ToolExit). Both must hand the browser back to
+        # the pool, so each shape gets its own replacement and the one present in the file wins
+        anchor_load_tail_plain = """    final RunnerSuite suite = await _browserManager!.load(
+      relativePath,
+      suiteUrl,
+      suiteConfig,
+      message,
+      onDone: () async {
+        lockResource.release();
+        if (_logger.isVerbose) {
+          _logger.printTrace('Test suite $relativePath finished.');
+        }
+      },
+    );"""
+        repl_load_tail_plain = """    final RunnerSuite suite;
     try {
       suite = await browserManager.load(
         relativePath,
@@ -337,6 +341,71 @@ def patch_flutter_tools_for_web_corpus(repo):
       releaseBrowser();
       rethrow;
     }"""
+
+        anchor_load_tail_watchdog = """    final RunnerSuite suite;
+    try {
+      final Future<RunnerSuite> loadFuture = _browserManager!.load(
+        relativePath,
+        suiteUrl,
+        suiteConfig,
+        message,
+        onDone: () async {
+          lockResource.release();
+          if (_logger.isVerbose) {
+            _logger.printTrace('Test suite $relativePath finished.');
+          }
+        },
+      );
+
+      if (!_config.pauseAfterLoad && timeoutCompleter != null) {
+        suite = await Future.any<RunnerSuite>(<Future<RunnerSuite>>[
+          loadFuture,
+          timeoutCompleter.future,
+        ]);
+      } else {
+        suite = await loadFuture;
+      }
+    } finally {
+      cancelWatchdogs();
+    }"""
+        repl_load_tail_watchdog = """    final RunnerSuite suite;
+    try {
+      final Future<RunnerSuite> loadFuture = browserManager.load(
+        relativePath,
+        suiteUrl,
+        suiteConfig,
+        message,
+        onDone: () async {
+          releaseBrowser();
+          if (_logger.isVerbose) {
+            _logger.printTrace('Test suite $relativePath finished.');
+          }
+        },
+      );
+
+      if (!_config.pauseAfterLoad && timeoutCompleter != null) {
+        suite = await Future.any<RunnerSuite>(<Future<RunnerSuite>>[
+          loadFuture,
+          timeoutCompleter.future,
+        ]);
+      } else {
+        suite = await loadFuture;
+      }
+    } catch (_) {
+      releaseBrowser();
+      rethrow;
+    } finally {
+      cancelWatchdogs();
+    }"""
+        # Both watchdog callbacks poke the single `_browserManager`, which the pool removes
+        anchor_watchdog_probe = """          if (_browserManager != null) {
+            final String diagnostic = await _browserManager!.diagnoseHang();"""
+        repl_watchdog_probe = """          {
+            final String diagnostic = await browserManager.diagnoseHang();"""
+        if anchor_load_tail_watchdog in text:
+            anchor_load_tail, repl_load_tail = anchor_load_tail_watchdog, repl_load_tail_watchdog
+        else:
+            anchor_load_tail, repl_load_tail = anchor_load_tail_plain, repl_load_tail_plain
 
         anchor_close = """  Future<BrowserManager> _launchBrowser(Runtime browser) {
     if (_browserManager != null) {
@@ -374,6 +443,9 @@ def patch_flutter_tools_for_web_corpus(repo):
       _testGoldenComparator.close(),
     ]);
   });"""
+        # #193926 changed the close() list type from `Future<dynamic>` to `Future<void>`
+        if anchor_close2 not in text:
+            anchor_close2 = anchor_close2.replace("<Future<dynamic>>", "<Future<void>>")
 
         for name, a in (
             ("canvasKitFile", anchor1),
@@ -384,6 +456,7 @@ def patch_flutter_tools_for_web_corpus(repo):
             ("pool", anchor_pool),
             ("golden", anchor_golden),
             ("load", anchor_load),
+            ("load_tail", anchor_load_tail),
             ("close", anchor_close),
             ("close2", anchor_close2),
         ):
@@ -399,6 +472,8 @@ def patch_flutter_tools_for_web_corpus(repo):
             .replace(anchor_pool, repl_pool, 1)
             .replace(anchor_golden, repl_golden, 1)
             .replace(anchor_load, repl_load, 1)
+            .replace(anchor_load_tail, repl_load_tail, 1)
+            .replace(anchor_watchdog_probe, repl_watchdog_probe)
             .replace(anchor_close, repl_close, 1)
             .replace(anchor_close2, repl_close2, 1)
         )
