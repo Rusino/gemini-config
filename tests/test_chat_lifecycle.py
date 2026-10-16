@@ -982,6 +982,36 @@ class TestChatLifecycle(unittest.TestCase):
     with patch.object(chat_lifecycle, "resolve_handoff_model", side_effect=RuntimeError("no model")):
       self.assertEqual(chat_lifecycle.get_model_trailer("cid-1"), "Assisted-by: AI")
 
+  def test_pbtxt_escapes_backslashes_quotes_and_heals_broken_file(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      ann_dir = os.path.join(tmp_dir, chat_lifecycle.ANNOTATIONS_DIR_NAME)
+      os.makedirs(ann_dir, exist_ok=True)
+      ann_file = os.path.join(ann_dir, "cid-nl.pbtxt")
+      with open(ann_file, "w", encoding="utf-8") as f:
+        f.write('title:"old"  last_user_view_time:{seconds:123}\n')
+
+      title = r'[17:34] ⦿ Эксперимент: метрики пустых строк (\n) "test"'
+      rpc_calls = []
+
+      def fake_rpc(cid, t):
+        rpc_calls.append((cid, t))
+        return len(rpc_calls) > 1
+
+      with (
+          patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]),
+          patch.object(chat_lifecycle, "update_conversation_title_rpc", side_effect=fake_rpc),
+      ):
+        ok = chat_lifecycle.update_conversation_title("cid-nl", title)
+        self.assertTrue(ok)
+        self.assertEqual(len(rpc_calls), 2)
+        with open(ann_file, "r", encoding="utf-8") as f:
+          raw_pbtxt = f.read()
+        self.assertEqual(len(raw_pbtxt.splitlines()), 1)
+        self.assertIn(r'(\\n)', raw_pbtxt)
+        self.assertIn(r'\"test\"', raw_pbtxt)
+        self.assertIn("last_user_view_time:{seconds:123}", raw_pbtxt)
+        self.assertEqual(chat_lifecycle.get_conversation_title("cid-nl"), title)
+
 
 if __name__ == "__main__":
   unittest.main()

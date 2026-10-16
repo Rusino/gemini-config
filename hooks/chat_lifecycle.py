@@ -416,8 +416,22 @@ def start_conversation_exact(
   return new_cid
 
 
+_PBTXT_TITLE_RE = re.compile(r'title:\s*"((?:\\.|[^"\\])*)"')
+
+
+def _escape_pbtxt_str(val: str) -> str:
+  # prototext requires escaped backslashes and quotes, and rejects literal newlines
+  clean = " ".join(val.splitlines())
+  return clean.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _unescape_pbtxt_str(raw: str) -> str:
+  return re.sub(r"\\(.)", r"\1", raw)
+
+
 def update_conversation_title(conv_id: str, new_title: str) -> bool:
   """Updates conversation title via Language Server RPC and persists to disk."""
+  new_title = " ".join((new_title or "").splitlines()).strip()
   if not conv_id or not new_title:
     return False
 
@@ -425,6 +439,7 @@ def update_conversation_title(conv_id: str, new_title: str) -> bool:
   rpc_ok = update_conversation_title_rpc(conv_id, new_title)
 
   # 2. Synchronize on-disk files & DB as fallback / durability guarantee
+  escaped_title = _escape_pbtxt_str(new_title)
   disk_ok = False
   for app_dir in find_app_data_dirs():
     # 2a. Update annotations .pbtxt
@@ -435,12 +450,15 @@ def update_conversation_title(conv_id: str, new_title: str) -> bool:
       if os.path.isfile(ann_file):
         with open(ann_file, "r", encoding="utf-8") as f:
           content = f.read()
-        if 'title:"' in content or "title: \"" in content:
-          new_content = re.sub(r'title:\s*"[^"]*"', f'title:"{new_title}"', content)
+        if _PBTXT_TITLE_RE.search(content):
+          # Use a lambda replacement so re.sub never expands \n escapes in titles
+          new_content = _PBTXT_TITLE_RE.sub(
+              lambda _: f'title:"{escaped_title}"', content
+          )
         else:
-          new_content = f'title:"{new_title}" {content}'.strip()
+          new_content = f'title:"{escaped_title}" {content}'.strip()
       else:
-        new_content = f'title:"{new_title}"\n'
+        new_content = f'title:"{escaped_title}"\n'
       with open(ann_file, "w", encoding="utf-8") as f:
         f.write(new_content)
       disk_ok = True
@@ -462,6 +480,10 @@ def update_conversation_title(conv_id: str, new_title: str) -> bool:
       except Exception:
         pass
 
+  # If the initial RPC failed because an on-disk .pbtxt was malformed, retry after fixing disk
+  if not rpc_ok and disk_ok:
+    rpc_ok = update_conversation_title_rpc(conv_id, new_title)
+
   return rpc_ok or disk_ok
 
 
@@ -471,9 +493,9 @@ def get_conversation_title(conv_id: str) -> str:
     if os.path.isfile(ann_file):
       try:
         with open(ann_file, "r", encoding="utf-8") as f:
-          m = re.search(r'title:\s*"([^"]*)"', f.read())
+          m = _PBTXT_TITLE_RE.search(f.read())
           if m:
-            return m.group(1).strip()
+            return _unescape_pbtxt_str(m.group(1)).strip()
       except Exception:
         pass
     db_file = os.path.join(app_dir, SUMMARY_DB_NAME)
@@ -1320,9 +1342,9 @@ def audit_conversations(
             txt = f.read()
           if re.search(r"\barchived\s*:\s*true\b", txt):
             archived_on_disk.add(cid)
-          m = re.search(r'title:\s*"([^"]*)"', txt)
+          m = _PBTXT_TITLE_RE.search(txt)
           if m and cid not in pbtxt_titles:
-            pbtxt_titles[cid] = m.group(1).strip()
+            pbtxt_titles[cid] = _unescape_pbtxt_str(m.group(1)).strip()
         except OSError:
           pass
 
