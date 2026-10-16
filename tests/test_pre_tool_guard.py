@@ -263,12 +263,27 @@ class TestPreToolGuard(unittest.TestCase):
       os.makedirs(os.path.dirname(state_file))
       with open(state_file, "w") as f:
         f.write("# State\nnext: go\n")
+      transcript = os.path.join(artifact_dir, ".system_generated", "logs", "transcript.jsonl")
+      os.makedirs(os.path.dirname(transcript), exist_ok=True)
+      with open(transcript, "w") as f:
+        for i, step in enumerate((
+            {"type": "PLANNER_RESPONSE", "content": "Option 1 or Option 2?"},
+            {
+                "type": "USER_INPUT",
+                "content": "<USER_REQUEST>\nLet us use Option 2.\n</USER_REQUEST>",
+            },
+        )):
+          f.write(json.dumps({"step_index": i, **step}) + "\n")
+      data["transcriptPath"] = transcript
       for _ in range(2):
         self.assertEqual(self.run_guard(data).get("decision"), "allow")
       with open(state_file) as f:
         content = f.read()
       self.assertTrue(content.startswith("# State\nnext: go\n"))
       self.assertEqual(content.count(pre_tool_guard.AUTO_SNAPSHOT_HEADER), 1)
+      self.assertIn("Option 1 or Option 2?", content)
+      self.assertIn("Let us use Option 2.", content)
+      self.assertNotIn("<USER_REQUEST>", content)
       self.assertFalse(os.path.exists(os.path.join(artifact_dir, "handoff_summary.md")))
 
   def test_repeated_handoff_is_denied_once_state_records_the_continuation(self):

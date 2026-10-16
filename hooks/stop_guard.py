@@ -376,10 +376,19 @@ def main() -> None:
     print("{}")
     return
 
-  # If a handoff was triggered in this turn and the agent tries to stop without
+  # A mid-turn handoff trigger applies only while continuing autonomous work;
+  # once the agent answers the user and stops to wait for their reply, keep
+  # this chat open (⦿) so the answer stays visible and replyable here
+  if state.get("pending_handoff_launch") and not state.get("pending_turn_start"):
+    state["pending_handoff_launch"] = False
+    save_state(state_path, state)
+
+  # If a turn-start handoff was required and the agent tries to stop without
   # having launched the continuation conversation, block once and force the launch!
-  if state.get("pending_handoff_launch") and not state.get(
-      "stop_blocked_handoff"
+  if (
+      state.get("pending_handoff_launch")
+      and state.get("pending_turn_start")
+      and not state.get("stop_blocked_handoff")
   ):
     state["stop_blocked_handoff"] = True
     save_state(state_path, state)

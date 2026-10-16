@@ -210,14 +210,50 @@ class TestContextGuard(unittest.TestCase):
     self.assertIn("does not exist yet", reminder)
     self.assertEqual(self.last_log()["level"], "pending")
 
-  def test_turn_start_hard_answers_first_without_immediate_reminder(self):
+  def test_turn_start_hard_hands_off_immediately_without_answering_in_old_chat(self):
     self.mock_rpc.return_value = gm_response(210000)
     msg = self.message(self.run_guard(inv=0))
     self.assertIn("HANDOFF REQUIRED", msg)
-    self.assertIn("First answer the user's current request", msg)
+    self.assertIn("Do NOT investigate or write the answer", msg)
     self.assertTrue(self.state()["pending_turn_start"])
     for inv in (1, 2, 3):
       self.assertEqual(self.run_guard(inv=inv), {})
+
+  def test_turn_start_triggers_at_lower_threshold_than_mid_turn(self):
+    # 170k / 256k = 66.4%: >= TURN_START_PCT (65%) at inv=0, but only soft (< 80%) at inv=2
+    self.mock_rpc.return_value = gm_response(170000)
+    msg_mid = self.message(self.run_guard(inv=2, steps=100))
+    self.assertIn("SOFT LIMIT", msg_mid)
+    self.assertIn("DO NOT hand off in this turn", msg_mid)
+    self.assertEqual(self.last_log()["level"], "soft")
+    self.assertFalse(self.state().get("pending_handoff_launch"))
+
+    msg_start = self.message(self.run_guard(inv=0, steps=110))
+    self.assertIn("HANDOFF REQUIRED", msg_start)
+    self.assertEqual(self.last_log()["level"], "hard")
+    self.assertTrue(self.state()["pending_handoff_launch"])
+    self.assertTrue(self.state()["pending_turn_start"])
+
+  def test_async_task_wakeup_at_inv_zero_is_treated_as_mid_turn(self):
+    self.mock_rpc.return_value = gm_response(170000)
+    self.write_transcript(
+        {"type": "USER_INPUT", "content": "run tests"},
+        {
+            "type": "PLANNER_RESPONSE",
+            "tool_calls": [{"name": "run_command", "args": {"CommandLine": "pytest"}}],
+        },
+        {
+            "type": "GENERIC",
+            "status": "RUNNING",
+            "content": "Tool is running as a background task with task id: c1/task-1",
+        },
+        {"type": "PLANNER_RESPONSE", "content": "Waiting for tests."},
+    )
+    msg = self.message(self.run_guard(inv=0, steps=100))
+    self.assertIn("SOFT LIMIT", msg)
+    self.assertNotIn("HANDOFF REQUIRED", msg)
+    self.assertFalse(self.state().get("pending_handoff_launch"))
+    self.assertFalse(self.state().get("pending_turn_start"))
 
   def test_hard_is_not_snoozed_across_turns(self):
     self.mock_rpc.return_value = gm_response(210000)

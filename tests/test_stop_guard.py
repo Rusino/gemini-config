@@ -87,11 +87,25 @@ class TestStopGuard(unittest.TestCase):
     with tempfile.TemporaryDirectory() as tmp_dir:
       out = self.run_pending_stop(tmp_dir, {
           "pending_handoff_launch": True,
+          "pending_turn_start": True,
           "pending_handoff_file": "/b/c1/handoff_summary_c1.md",
       })
       self.assertEqual(out.get("decision"), "continue")
       self.assertIn('handoff c1 "/b/c1/handoff_summary_c1.md"', out["reason"])
       self.assertNotIn("roadmap.py", out["reason"])
+
+  def test_mid_turn_pending_handoff_allows_stop_when_answering_user(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      state_path = os.path.join(tmp_dir, "scratch", ".context_guard_state.json")
+      out = self.run_pending_stop(tmp_dir, {
+          "pending_handoff_launch": True,
+          "pending_turn_start": False,
+          "pending_in_project": True,
+          "pending_handoff_file": "/r/proj/state/c1.md",
+      })
+      self.assertEqual(out, {})
+      saved = stop_guard.load_state(state_path)
+      self.assertFalse(saved.get("pending_handoff_launch"))
 
   def test_truncated_handoff_output_clears_pending_stop(self):
     with tempfile.TemporaryDirectory() as tmp_dir:

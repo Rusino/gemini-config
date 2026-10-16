@@ -336,19 +336,19 @@ const assertHidden = (ids, expected) => {
 };
 const CLOSED_SCOPE_HIDDEN = [
   'closed-solo', 'closed-pair-root', 'closed-pair-tail',
-  'closed-root', 'closed-step', 'closed-tail', 'open-step',
+  'closed-root', 'closed-step', 'closed-tail',
 ];
 
 // Initial state: filterEnabled=true, filterScope='closed'
-// Hidden: closed-solo («»), closed-pair-* (« »), closed-root/step/tail (« ‹✓› »), open-step (✓) => 7
-// Visible: solo-active (⦿), open-root (▸), open-current (⦿), quoted-title (no marker) => 4
+// Hidden: closed-solo («»), closed-pair-* (« »), closed-root/step/tail (« ‹✓› ») => 6
+// Visible: solo-active (⦿), open-root (▸), open-step (✓), open-current (⦿), quoted-title => 5
 // Total eligible: 11 (native-hidden is excluded)
-assert.strictEqual(btn.getAttribute('aria-label'), 'Closed hidden: 7');
+assert.strictEqual(btn.getAttribute('aria-label'), 'Closed hidden: 6');
 assert.strictEqual(btn.getAttribute('data-active'), 'true');
 assert.strictEqual(emptyProjSpan.textContent, 'No active chats (3 hidden)');
 
 assertHidden(CLOSED_SCOPE_HIDDEN, true);
-assertHidden(['solo-active', 'open-root', 'open-current', 'quoted-title'], false);
+assertHidden(['solo-active', 'open-root', 'open-step', 'open-current', 'quoted-title'], false);
 assert.strictEqual(storeState.trajectorySummaries.summaries['closed-solo'].annotations.archived, false);
 
 // Hover bubble in Filter ON (closed) state
@@ -361,7 +361,7 @@ assert(bubble.innerHTML.includes('Active (⦿, no marker):'));
 assert(bubble.innerHTML.includes('Open chain roots (▸):'));
 assert(bubble.innerHTML.includes('Handed-off steps (✓):'));
 assert(bubble.innerHTML.includes('Finalized chains («, ‹✓›, », «»):'));
-assert(bubble.innerHTML.includes('7 of 11'));
+assert(bubble.innerHTML.includes('6 of 11'));
 assert(!/[А-Яа-яЁё]/.test(bubble.innerHTML), 'Bubble HTML must not contain Cyrillic');
 
 // Verify MutationObserver ignores mutations inside bubble and button
@@ -377,7 +377,7 @@ btn.dispatchEvent('mousedown', { button: 0 });
 btn.dispatchEvent('click', { button: 0 });
 
 assert.strictEqual(btn.getAttribute('data-active'), 'false');
-assert.strictEqual(btn.getAttribute('aria-label'), 'All chats (7 closed)');
+assert.strictEqual(btn.getAttribute('aria-label'), 'All chats (6 closed)');
 assert.strictEqual(emptyProjSpan.textContent, 'No conversations yet');
 assert(bubble.innerHTML.includes('Filter OFF: showing all chats'));
 assert(bubble.innerHTML.includes('Would be hidden (count on button):'));
@@ -389,17 +389,17 @@ assertHidden(['native-hidden'], true);
 // Right-click (contextmenu) switches scope to 'active-only' and enables filter
 btn.dispatchEvent('contextmenu', { button: 2 });
 assert.strictEqual(btn.getAttribute('data-active'), 'true');
-// In 'active-only' scope, open-root (▸) is also hidden => 8 hidden of 11
+// In 'active-only' scope, open-root (▸) and open-step (✓) are also hidden => 8 hidden of 11
 assert.strictEqual(btn.getAttribute('aria-label'), 'Active only · 8 hidden');
 assert(bubble.innerHTML.includes('Filter ON: active chats only'));
 assert(bubble.innerHTML.includes('● <b>Active only</b>'));
 assert(bubble.innerHTML.includes('8 of 11'));
-assertHidden([...CLOSED_SCOPE_HIDDEN, 'open-root'], true);
+assertHidden([...CLOSED_SCOPE_HIDDEN, 'open-root', 'open-step'], true);
 assertHidden(['solo-active', 'open-current', 'quoted-title'], false);
 
 btn.dispatchEvent('contextmenu', { button: 2 });
-assert.strictEqual(btn.getAttribute('aria-label'), 'Closed hidden: 7');
-assertHidden(['open-root'], false);
+assert.strictEqual(btn.getAttribute('aria-label'), 'Closed hidden: 6');
+assertHidden(['open-root', 'open-step'], false);
 
 // Incoming stream batch while filter is ON automatically hides newly arrived closed chat
 reduxStore.dispatch({

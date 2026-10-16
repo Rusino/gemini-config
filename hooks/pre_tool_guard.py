@@ -328,9 +328,11 @@ def enrich_handoff_summary_files(
 
   sections = ["", "---", "", AUTO_SNAPSHOT_HEADER, ""]
 
-  # 1. Collect edited files & last 5 commands from transcript.jsonl
+  # 1. Collect edited files, recent commands, and dialogue tail from transcript.jsonl
   edited_files: list[str] = []
   recent_cmds: list[str] = []
+  last_user_msg = ""
+  last_assistant_msg = ""
   if transcript_path and os.path.exists(transcript_path):
     try:
       steps_by_idx = {}
@@ -349,7 +351,18 @@ def enrich_handoff_summary_files(
       for idx in sorted(steps_by_idx.keys()):
         step = steps_by_idx[idx]
         stype = step.get("type", "")
-        if stype == "PLANNER_RESPONSE":
+        if stype == "USER_INPUT":
+          raw_u = str(step.get("content", "")).strip()
+          m_req = re.search(
+              r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", raw_u, re.DOTALL
+          )
+          clean_u = m_req.group(1).strip() if m_req else raw_u
+          if clean_u:
+            last_user_msg = clean_u
+        elif stype == "PLANNER_RESPONSE":
+          raw_a = str(step.get("content", "")).strip()
+          if raw_a:
+            last_assistant_msg = raw_a
           for tc in step.get("tool_calls") or []:
             tname = tc.get("name", "")
             targs = tc.get("args") or {}
@@ -368,6 +381,22 @@ def enrich_handoff_summary_files(
           pending_cmd = None
     except Exception:
       pass
+
+  if last_assistant_msg or last_user_msg:
+    sections.append("### Recent Dialogue Context")
+    if last_assistant_msg:
+      tail_a = (
+          last_assistant_msg[-2500:]
+          if len(last_assistant_msg) > 2500
+          else last_assistant_msg
+      )
+      sections.append("**Last Assistant Response in Previous Chat:**")
+      sections.append(tail_a)
+      sections.append("")
+    if last_user_msg:
+      sections.append("**Latest User Message:**")
+      sections.append(last_user_msg[:1500])
+      sections.append("")
 
   if edited_files:
     sections.append("### Files Modified by Tools in This Conversation")

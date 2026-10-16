@@ -63,11 +63,14 @@
     return match ? match[1] : null;
   }
 
-  // A ✓ step is already handed off, so it goes with closed chats; the ▸ root stays as the
-  // entry point of a running task until 'active-only' leaves only ⦿ and unmarked chats
+  // 'closed' hides only finalized chains («, ‹✓›, », «») while keeping all steps (▸, ✓, ⦿)
+  // of open chains visible; 'active-only' also hides open chain roots (▸) and steps (✓)
   function isHiddenMarker(marker, scope) {
-    if (FINALIZED_MARKERS.has(marker) || marker === OPEN_CHAIN_STEP_MARKER) return true;
-    return scope === 'active-only' && marker === OPEN_CHAIN_ROOT_MARKER;
+    if (FINALIZED_MARKERS.has(marker)) return true;
+    return (
+      scope === 'active-only' &&
+      (marker === OPEN_CHAIN_ROOT_MARKER || marker === OPEN_CHAIN_STEP_MARKER)
+    );
   }
 
   function emptyBreakdown() {
@@ -617,8 +620,8 @@
         <div><kbd>Left-click</kbd> — ${leftClickAction}</div>
         <div><kbd>Right-click</kbd> / <kbd>Shift+click</kbd> — switch mode:</div>
         <div style="padding-left:6px;margin-top:2px;">
-          ${mode1Mark} <b>Closed hidden</b> (hide ✓ and finalized «, ‹✓›, », «»)<br/>
-          ${mode2Mark} <b>Active only</b> (also hide open chain roots ▸)
+          ${mode1Mark} <b>Closed hidden</b> (hide finalized «, ‹✓›, », «»)<br/>
+          ${mode2Mark} <b>Active only</b> (also hide open chain ▸ and ✓)
         </div>
       </div>
     `;

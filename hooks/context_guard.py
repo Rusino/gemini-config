@@ -4,11 +4,13 @@
 The metric is the Language Server's own estimate of the context window usage
 (estimatedTokensUsed / maxContextTokens of the last model call). Levels:
 1. Soft (SOFT_PCT): a throttled reminder to hand off at the nearest
-   micro-boundary (test finished, hypothesis settled, commit, subagent back).
-2. Hard (HARD_PCT, or history already compacted): hand off now. At turn start
-   (`invocationNum == 0`) the agent first answers the user and stop_guard blocks
-   a stop without handoff; mid-turn it is reminded on every step until the
-   continuation is launched. Nothing is snoozed across turns.
+   micro-boundary when further autonomous work remains, or finish the answer
+   in-place if returning control to the user.
+2. Turn-start / Hard (TURN_START_PCT at invocationNum == 0, HARD_PCT mid-turn,
+   or history already compacted): at turn start the agent immediately hands off
+   the user's new request before answering so the response lands in the new
+   chat (enforced by stop_guard); mid-turn it hands off only if continuing
+   autonomous work, never after answering the user.
 3. Mid-turn circuit breaker: a single turn with too many tool-call iterations
    (`MAX_TURN_INVOCATIONS`) hands off as well.
 Every invocation appends one JSONL record to the guard log so silent misses
@@ -30,6 +32,7 @@ DEFAULT_TIMEZONE = os.environ.get("JETSKI_TIMEZONE", "America/New_York")
 
 # Percent of the model's context window
 SOFT_PCT = float(os.environ.get("JETSKI_CONTEXT_SOFT_PCT", "60"))
+TURN_START_PCT = float(os.environ.get("JETSKI_CONTEXT_TURN_START_PCT", "65"))
 HARD_PCT = float(os.environ.get("JETSKI_CONTEXT_HARD_PCT", "80"))
 RPC_TIMEOUT_S = 1.5
 # Fallback when the RPC fails: real transcripts average ~2 bytes per token
@@ -234,6 +237,39 @@ def parse_current_turn_steps(transcript_path: str) -> list[tuple[int, dict]]:
   return [
       (idx, steps_by_idx[idx]) for idx in ordered_indices if idx > last_user_idx
   ]
+
+
+def is_async_wakeup(transcript_path: str, last_user_input: str = "") -> bool:
+  """True when invocationNum == 0 is a background-task or subagent wakeup, not a user turn.
+
+  Jetski resets invocationNum to 0 when a background task or subagent wakes the
+  conversation after the model paused to wait for it. At PreInvocation time the
+  SYSTEM_MESSAGE step is not in transcript.jsonl yet, so the turn since the last
+  USER_INPUT has more async launches than SYSTEM_MESSAGE completions.
+  """
+  if "<SYSTEM_MESSAGE>" in (last_user_input or ""):
+    return True
+  turn_steps = parse_current_turn_steps(transcript_path)
+  if not turn_steps:
+    return False
+  async_launches = 0
+  sys_messages = 0
+  for _, step in turn_steps:
+    stype = step.get("type", "")
+    if stype == "PLANNER_RESPONSE":
+      for tc in step.get("tool_calls") or []:
+        if tc.get("name") == "invoke_subagent":
+          async_launches += 1
+    elif stype == "GENERIC":
+      content = str(step.get("content", ""))
+      if (
+          step.get("status") == "RUNNING"
+          or "Tool is running as a background task with task id:" in content
+      ):
+        async_launches += 1
+    elif stype == "SYSTEM_MESSAGE":
+      sys_messages += 1
+  return async_launches > sys_messages
 
 
 def get_consecutive_cmd_failures(transcript_path: str) -> tuple[int, int]:
@@ -600,10 +636,14 @@ def run(data: dict, log: dict) -> dict:
       else f"/tmp/jetski_context_guard_{conv_id}.json"
   )
   state = load_state(state_path)
+  async_wakeup = invocation_num == 0 and is_async_wakeup(
+      transcript_path, last_user_input
+  )
+  is_turn_start = invocation_num == 0 and not async_wakeup
 
   # Reset per-turn state at the start of each new user turn; a hard trigger
   # that was ignored last turn is re-evaluated below rather than snoozed
-  if invocation_num == 0:
+  if is_turn_start:
     next_turn_inv_threshold = MAX_TURN_INVOCATIONS
     if (
         state.get("next_turn_inv_threshold") != MAX_TURN_INVOCATIONS
@@ -642,7 +682,7 @@ def run(data: dict, log: dict) -> dict:
         state.get("next_turn_inv_threshold", MAX_TURN_INVOCATIONS)
     )
 
-  if invocation_num > 0:
+  if not is_turn_start:
     launch_step = get_handoff_launch_step_in_turn(transcript_path)
     if launch_step >= 0:
       log["level"] = "post_handoff"
@@ -679,7 +719,7 @@ def run(data: dict, log: dict) -> dict:
   # once per turn and the context triggers no longer apply
   if "handed_off_to" in state:
     log["level"] = "closed"
-    if invocation_num > 0:
+    if not is_turn_start:
       return {}
     cont = state["handed_off_to"]
     where = (
@@ -716,10 +756,10 @@ def run(data: dict, log: dict) -> dict:
     save_state(state_path, state)
 
   pending = bool(state.get("pending_handoff_launch"))
-  # A turn-start trigger lets the agent answer the user first; stop_guard
-  # enforces the handoff at the end of the turn, so no mid-turn nagging
+  # A turn-start trigger already gave the 3-step handoff instructions at inv 0
+  # and stop_guard enforces the launch on stop, so skip repeating it on inv 1..N
   turn_start_pending = pending and bool(state.get("pending_turn_start"))
-  if invocation_num > 0 and pending and not turn_start_pending:
+  if not is_turn_start and pending and not turn_start_pending:
     log["level"] = "pending"
     handoff_file = state.get("pending_handoff_file", "")
     missing = (
@@ -728,8 +768,11 @@ def run(data: dict, log: dict) -> dict:
         else f" (`{handoff_file}` does not exist yet: write it first)"
     )
     return _inject(
-        "[CONTEXT GUARD REMINDER] The handoff is still pending. Stop all other"
-        f" investigation now and hand off{missing}:\n{TASKS_NOTE}\n"
+        "[CONTEXT GUARD REMINDER] The handoff is still pending. If you are"
+        " ready to deliver your final answer to the user and wait for their"
+        " reply, write the complete answer right here and end the turn WITHOUT"
+        " handing off; otherwise stop all other investigation now and hand"
+        f" off{missing}:\n{TASKS_NOTE}\n"
         + handoff_steps(
             conv_id,
             {"in_project": bool(state.get("pending_in_project")), "file": handoff_file},
@@ -738,11 +781,12 @@ def run(data: dict, log: dict) -> dict:
     )
 
   late = m["ckpt"] >= 0
+  hard_pct = TURN_START_PCT if is_turn_start else HARD_PCT
   # The transcript-size estimate overcounts (untruncated tool output, history
-  # kept past compaction), so it may only nag; stop_guard enforces hard ones
-  hard = not pending and ((m["pct"] >= HARD_PCT and not m["fallback"]) or late)
+  # kept past compaction), so it may only nag; stop_guard enforces turn-start ones
+  hard = not pending and ((m["pct"] >= hard_pct and not m["fallback"]) or late)
   turn_loop_exceeded = (
-      invocation_num > 0 and invocation_num >= next_turn_inv_threshold
+      not is_turn_start and invocation_num >= next_turn_inv_threshold
   )
 
   if not (hard or turn_loop_exceeded):
@@ -757,12 +801,16 @@ def run(data: dict, log: dict) -> dict:
       target = resolve_handoff_target(conv_id, transcript_path, artifact_dir)
       messages.append(
           f"[CONTEXT GUARD: SOFT LIMIT] Context is at {_usage_str(m)}. Keep"
-          " working, but at the nearest micro-boundary (test run finished,"
-          " hypothesis confirmed or rejected, commit made, subagent returned)"
-          f" hand off:\n{TASKS_NOTE}\n"
+          " working, and if further autonomous work remains after the nearest"
+          " micro-boundary (test run finished, hypothesis confirmed or"
+          " rejected, commit made, subagent returned), hand off so the"
+          " continuation chat keeps working. However, if you are ready to"
+          " answer the user and wait for their reply, DO NOT hand off in this"
+          " turn — write your complete response right here and end the turn"
+          f" (the next turn will hand off automatically):\n{TASKS_NOTE}\n"
           + handoff_steps(conv_id, target, build_continuation_title(conv_id))
       )
-    if invocation_num > 0:
+    if not is_turn_start:
       streak, last_cmd_idx = get_consecutive_cmd_failures(transcript_path)
       if (
           streak >= FAILURE_STREAK_THRESHOLD
@@ -794,7 +842,7 @@ def run(data: dict, log: dict) -> dict:
       "last_triggered_pct": round(m["pct"], 1),
       "last_triggered_invocation_num": invocation_num,
       "pending_handoff_launch": True,
-      "pending_turn_start": invocation_num == 0,
+      "pending_turn_start": is_turn_start,
       "handoff_completed": False,
       "pending_title": new_title,
       "pending_cmd_prefix": cmd_prefix,
@@ -802,7 +850,7 @@ def run(data: dict, log: dict) -> dict:
       "pending_in_project": target["in_project"],
       "next_turn_inv_threshold": (
           max(invocation_num, next_turn_inv_threshold) + SNOOZE_TURN_INVOCATIONS
-          if invocation_num > 0
+          if not is_turn_start
           else MAX_TURN_INVOCATIONS
       ),
   })
@@ -817,20 +865,29 @@ def run(data: dict, log: dict) -> dict:
     head = (
         "[CONTEXT GUARD: MID-TURN CIRCUIT BREAKER] Single-turn iteration limit"
         f" exceeded ({invocation_num} consecutive steps; context at"
-        f" {_usage_str(m)}). Do not try to finish the whole task here: bring any"
+        f" {_usage_str(m)}). If you are ready to deliver your answer to the"
+        " user and wait for their reply, write the complete answer right here"
+        " and end the turn WITHOUT handing off; otherwise bring any"
         " half-edited file to a clean checkpoint and hand off."
     )
-  elif invocation_num > 0:
+  elif not is_turn_start:
     head = (
         f"[CONTEXT GUARD: MID-TURN HANDOFF] Context is at {_usage_str(m)}.{late_note}"
-        " Stop at the nearest safe checkpoint (no half-edited files, no new"
-        " investigations) and hand off now."
+        " If you are ready to answer the user's request right now and wait for"
+        " their reply, DO NOT hand off in this turn — write your complete"
+        " response right here and end the turn (the next turn will hand off"
+        " automatically). Otherwise, if further autonomous investigation,"
+        " edits, or tests are needed, stop at the nearest safe checkpoint (no"
+        " half-edited files, no new investigations) and hand off now."
     )
   else:
     head = (
         f"[CONTEXT GUARD: HANDOFF REQUIRED] Context is at {_usage_str(m)}.{late_note}"
-        " First answer the user's current request completely, then hand off in"
-        " this same turn."
+        " Do NOT investigate or write the answer to the user's new request in"
+        " this chat (an answer written before handoff stays buried in a closed"
+        " chat while the continuation opens empty). Immediately hand off the"
+        " user's request to a new chat in this turn so the full answer is"
+        " delivered there, and reply here only with the continuation link."
     )
   return _inject(f"{head}\n{TASKS_NOTE}\n{handoff_steps(conv_id, target, new_title)}")
 
