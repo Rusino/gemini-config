@@ -1,0 +1,2 @@
+# List of Gerrit CL IDs to ignore in daily review triage
+580176

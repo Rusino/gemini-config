@@ -14,3 +14,11 @@ __pycache__/
 # Runtime data written by hooks (per-machine project ids)
 logs/
 roadmaps/
+conversation_summaries.db
+.workspace_mcp_backup.json
+
+# Local Google3 plugin symlinks
+plugins/browser
+plugins/cloudtop-use
+plugins/google_chat
+plugins/google_docs
