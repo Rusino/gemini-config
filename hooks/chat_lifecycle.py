@@ -25,6 +25,12 @@ DEFAULT_TIMEZONE = os.environ.get("JETSKI_TIMEZONE", "America/New_York")
 APP_DATA_DIR_CANDIDATES = ("~/.gemini/jetski", "~/.gemini/antigravity")
 SUMMARY_DB_NAME = "conversation_summaries.db"
 ANNOTATIONS_DIR_NAME = "annotations"
+DEFAULT_PROJECT_RETENTION_FILE = os.path.expanduser(
+    "~/.gemini/config/projects_retention.json"
+)
+DEFAULT_AUTO_ARCHIVE_RETENTION: dict[str, int] = {
+    "skia-g3-roll-check": 1,
+}
 
 # Lifecycle marker tokens
 MARKER_START = "▸"       # In-progress branch root
@@ -1269,6 +1275,154 @@ def archive_conversations(
   }
 
 
+def load_retention_rules() -> dict[str, int]:
+  """Returns a mapping of project identifier to keep count."""
+  rules = dict(DEFAULT_AUTO_ARCHIVE_RETENTION)
+  if os.path.isfile(DEFAULT_PROJECT_RETENTION_FILE):
+    try:
+      with open(DEFAULT_PROJECT_RETENTION_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+      if isinstance(data, dict):
+        for k, v in data.items():
+          if isinstance(v, int):
+            rules[k] = v
+    except Exception:
+      pass
+  return rules
+
+
+def archive_project_conversations(
+    project_filter: str,
+    keep: int = 1,
+    projects_dir: str = "",
+) -> dict:
+  """Archives older active conversations in a project, keeping the `keep` newest."""
+  target_project_id = resolve_project_id(
+      project_filter, projects_dir=projects_dir
+  )
+  summaries = _fetch_ls_summaries_for_audit()
+  if summaries is None:
+    return {
+        "project_id": target_project_id,
+        "archived_ids": [],
+        "count": 0,
+        "kept_ids": [],
+        "error": "LS unreachable",
+    }
+
+  archived_on_disk: set[str] = set()
+  for app_dir in find_app_data_dirs():
+    ann_dir = os.path.join(app_dir, ANNOTATIONS_DIR_NAME)
+    if os.path.isdir(ann_dir):
+      for fn in sorted(os.listdir(ann_dir)):
+        if fn.endswith(".pbtxt"):
+          cid = fn[:-6]
+          try:
+            with open(os.path.join(ann_dir, fn), "r", encoding="utf-8") as f:
+              txt = f.read()
+            if re.search(r"\barchived\s*:\s*true\b", txt):
+              archived_on_disk.add(cid)
+          except OSError:
+            pass
+
+  # Collect active top-level conversations belonging to this project
+  active_chats: list[tuple[str, str]] = []
+  for cid, s in summaries.items():
+    if not isinstance(s, dict):
+      continue
+    ann = s.get("annotations") or {}
+    if ann.get("archived") or cid in archived_on_disk:
+      continue
+    meta = s.get("trajectoryMetadata") or {}
+    if meta.get("parentConversationId") or meta.get("isBattleModeFork"):
+      continue
+    if (meta.get("sourceMetadata") or {}).get("tool"):
+      continue
+    pid = str(meta.get("projectId") or "").strip()
+    if pid == target_project_id:
+      created_at = str(meta.get("createdAt") or "")
+      active_chats.append((created_at, cid))
+
+  active_chats.sort(key=lambda x: x[0])
+  if keep > 0:
+    to_keep = [cid for _, cid in active_chats[-keep:]]
+    to_archive = [cid for _, cid in active_chats[:-keep]]
+  else:
+    to_keep = []
+    to_archive = [cid for _, cid in active_chats]
+
+  if not to_archive:
+    return {
+        "project_id": target_project_id,
+        "archived_ids": [],
+        "count": 0,
+        "kept_ids": to_keep,
+        "rpc_ok": True,
+        "disk_ok": True,
+    }
+
+  res = archive_conversations(to_archive, include_chain=False)
+  res["project_id"] = target_project_id
+  res["kept_ids"] = to_keep
+  return res
+
+
+def auto_archive_projects(target_cid: str = "") -> dict:
+  """Archives older conversations for projects configured with a retention policy."""
+  rules = load_retention_rules()
+  results: dict[str, dict] = {}
+  target_project_id = ""
+
+  if target_cid:
+    env_pid = os.environ.get("ANTIGRAVITY_PROJECT_ID", "").strip()
+    if env_pid:
+      target_project_id = env_pid
+    else:
+      for app_dir in find_app_data_dirs():
+        db_file = os.path.join(app_dir, SUMMARY_DB_NAME)
+        if os.path.isfile(db_file):
+          try:
+            conn = sqlite3.connect(
+                f"file:{db_file}?mode=ro", uri=True, timeout=1.0
+            )
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT project_id FROM conversation_summaries WHERE conversation_id = ?",
+                (target_cid,),
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+              target_project_id = str(row[0]).strip()
+            conn.close()
+          except Exception:
+            pass
+        if target_project_id:
+          break
+
+  # Map project names/UUIDs to canonical project IDs
+  resolved_rules: dict[str, tuple[str, int]] = {}
+  for proj_key, keep in rules.items():
+    try:
+      pid = resolve_project_id(proj_key)
+      resolved_rules[pid] = (proj_key, keep)
+    except Exception:
+      pass
+
+  # If triggered by a specific chat whose project is not under retention, exit early
+  if target_project_id and target_project_id not in resolved_rules:
+    return results
+
+  for pid, (proj_key, keep) in resolved_rules.items():
+    if target_project_id and pid != target_project_id:
+      continue
+    try:
+      results[proj_key] = archive_project_conversations(pid, keep=keep)
+    except Exception as e:
+      results[proj_key] = {"error": str(e)}
+
+  return results
+
+
 def _fetch_ls_summaries_for_audit() -> dict | None:
   """Fetches trajectory summaries from the Language Server if reachable."""
   try:
@@ -1553,9 +1707,14 @@ Commands:
                                       for storage desync (LS RPC vs .pbtxt vs SQLite)
                                       and broken/double Scheme Γ markers. With --fix,
                                       repairs all discrepancies via update_conversation_title.
-  archive <id...> [--chain]           Archive the specified conversation(s) (or their
-                                      entire handoff chain with --chain) via LS RPC
-                                      and annotations/<id>.pbtxt.
+  archive [<id...>] [--chain]         Archive the specified conversation(s) (or their
+          [--project <p>] [--keep <N>] entire handoff chain with --chain) via LS RPC
+                                      and annotations/<id>.pbtxt. With --project,
+                                      archives older active chats in project <p>,
+                                      keeping the newest <N> (default: 1).
+  auto-archive [<id>] [--hook]        Prune older chats across projects configured with
+                                      a retention policy (default: keep 1 newest for
+                                      skia-g3-roll-check). Use --hook for lifecycle hooks.
   finalize <id>                       Close the whole chain. USER-ONLY: run it
                                       only on the user's explicit word ("финал").
                                       Timestamps are preserved.
@@ -1597,6 +1756,7 @@ KNOWN_COMMANDS = (
     "finalize",
     "audit",
     "archive",
+    "auto-archive",
 )
 
 
@@ -1740,16 +1900,62 @@ if __name__ == "__main__":
   elif sys.argv[1] == "archive":
     args = sys.argv[2:]
     inc_chain = False
+    proj_filter = ""
+    keep_count = 1
     cids_to_archive: list[str] = []
-    for a in args:
-      if a == "--chain":
+    i = 0
+    while i < len(args):
+      arg = args[i]
+      if arg == "--chain":
         inc_chain = True
+        i += 1
+      elif arg in ("--project", "--project-id") and i + 1 < len(args):
+        proj_filter = args[i + 1]
+        i += 2
+      elif arg.startswith("--project=") or arg.startswith("--project-id="):
+        proj_filter = arg.split("=", 1)[1]
+        i += 1
+      elif arg in ("--keep", "-k") and i + 1 < len(args):
+        keep_count = int(args[i + 1])
+        i += 2
+      elif arg.startswith("--keep="):
+        keep_count = int(arg.split("=", 1)[1])
+        i += 1
       else:
-        cids_to_archive.append(_require_conversation_id("archive", a))
-    if not cids_to_archive:
-      _cli_fail("archive", "at least one conversation ID is required")
-    res = archive_conversations(cids_to_archive, include_chain=inc_chain)
-    print(json.dumps(res, ensure_ascii=False, indent=2))
+        cids_to_archive.append(_require_conversation_id("archive", arg))
+        i += 1
+
+    if proj_filter:
+      res = archive_project_conversations(proj_filter, keep=keep_count)
+      print(json.dumps(res, ensure_ascii=False, indent=2))
+    elif cids_to_archive:
+      res = archive_conversations(cids_to_archive, include_chain=inc_chain)
+      print(json.dumps(res, ensure_ascii=False, indent=2))
+    else:
+      _cli_fail(
+          "archive",
+          "either --project <p> or at least one conversation ID is required",
+      )
+  elif sys.argv[1] == "auto-archive":
+    is_hook = "--hook" in sys.argv[2:]
+    target_cid = ""
+    if is_hook:
+      try:
+        if not sys.stdin.isatty():
+          payload = json.loads(sys.stdin.read() or "{}")
+          target_cid = str(payload.get("conversationId") or "").strip()
+      except Exception:
+        pass
+    else:
+      for a in sys.argv[2:]:
+        if a != "--hook" and not a.startswith("-"):
+          target_cid = _require_conversation_id("auto-archive", a)
+          break
+    res = auto_archive_projects(target_cid=target_cid)
+    if is_hook:
+      print("{}")
+    else:
+      print(json.dumps(res, ensure_ascii=False, indent=2))
   elif sys.argv[1] == "reopen":
     cid = _require_conversation_id("reopen", sys.argv[2] if len(sys.argv) > 2 else "")
     reopen_conversation(cid, force=True)

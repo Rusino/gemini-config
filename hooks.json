@@ -1,6 +1,13 @@
 {
   "context-guard": {
     "enabled": true,
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python3 ~/.gemini/config/hooks/chat_lifecycle.py auto-archive --hook",
+        "timeout": 5
+      }
+    ],
     "PreInvocation": [
       {
         "type": "command",
@@ -39,6 +46,11 @@
       {
         "type": "command",
         "command": "~/.gemini/config/hooks/project_activity_badge.py --event Stop",
+        "timeout": 5
+      },
+      {
+        "type": "command",
+        "command": "python3 ~/.gemini/config/hooks/chat_lifecycle.py auto-archive --hook",
         "timeout": 5
       }
     ]

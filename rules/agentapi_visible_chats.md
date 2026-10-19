@@ -51,7 +51,8 @@ Use only these commands (`python3 ~/.gemini/config/hooks/chat_lifecycle.py ...`)
 | `status [id]` | User asks about the chain / which chats belong to the task / where summaries are. |
 | `model [id] [--trailer]` | User asks which model a chat runs on or which model a continuation would get (or outputs git `Assisted-by: ...` trailer with `--trailer`). Read-only. |
 | `audit [--fix] [--project <id\|name>]` | Scan top-level chats and chains for title desync (LS RPC vs `.pbtxt` vs SQLite) or broken Scheme Γ markers; `--fix` repairs them. |
-| `archive <id...> [--chain]` | Archive specified chats (or their full handoff chain with `--chain`) via LS RPC and `.pbtxt`. |
+| `archive [<id...>] [--chain] [--project <p>] [--keep <N>]` | Archive specified chats (or their full handoff chain with `--chain`) via LS RPC and `.pbtxt`. With `--project`, archives older active chats in project `<p>`, keeping the `<N>` newest (default 1). |
+| `auto-archive [--hook]` | Prune older chats across projects configured with a retention policy (default: keep 1 newest for `skia-g3-roll-check`). Runs automatically via `Stop` and `SessionStart` hooks. |
 
 For moving chats or whole chains between projects (or listing unassigned chats), use `python3 ~/.gemini/config/scripts/move_chats_to_project.py --project "<name_or_id>" [--chain] --restart <id...>` (which waits in the background until all running chats finish their turns before restarting `jetski-hub`) or `--list-unassigned`.
 
