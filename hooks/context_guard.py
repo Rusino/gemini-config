@@ -660,6 +660,22 @@ def run(data: dict, log: dict) -> dict:
     # applied mechanically only by `chat_lifecycle.py` (set-title / handoff /
     # finalize / reopen), never inferred from user wording.
 
+    # Auto-title untitled chat when prompt mentions a PR, CL, bug, or commit
+    if last_user_input and conv_id:
+      try:
+        import chat_lifecycle
+        auto_title = chat_lifecycle.auto_title_conversation(conv_id, last_user_input)
+        if auto_title:
+          log["auto_title"] = auto_title
+          state["auto_title_notice"] = (
+              f"[TITLE GUARD] Conversation title automatically set to '{auto_title}' "
+              f"based on the entity in your prompt. You may refine the topic description via "
+              f"'python3 {LIFECYCLE_CLI} set-title {conv_id} \"<Topic>\"' if needed."
+          )
+          save_state(state_path, state)
+      except Exception as e:
+        log["auto_title_err"] = str(e)[:200]
+
     # Safety net: ensure browser sounds are re-enabled when new turn/chat starts
     try:
       config_path = os.path.expanduser("~/.gemini/config/config.json")
@@ -791,6 +807,9 @@ def run(data: dict, log: dict) -> dict:
 
   if not (hard or turn_loop_exceeded):
     messages = []
+    if state.get("auto_title_notice"):
+      messages.append(state.pop("auto_title_notice"))
+      save_state(state_path, state)
     soft_due = steps - int(
         state.get("soft_last_steps", -SOFT_REMIND_EVERY_STEPS)
     ) >= SOFT_REMIND_EVERY_STEPS

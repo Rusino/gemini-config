@@ -848,6 +848,87 @@ def set_conversation_topic(conv_id: str, topic: str, marker: str = MARKER_ACTIVE
   return new_title if ok else ""
 
 
+# Regexes to extract entity identifiers from prompts for automatic chat titling:
+_ENTITY_GERRIT_URL_RE = re.compile(
+    r"https?://[a-zA-Z0-9_.-]*-review\.(?:googlesource\.com|git\.corp\.google\.com)/\S*?(\d{5,8})\b"
+)
+_ENTITY_GITHUB_PR_URL_RE = re.compile(r"https?://github\.com/[^/\s]+/[^/\s]+/pull/(\d+)")
+_ENTITY_GITHUB_ISSUE_URL_RE = re.compile(r"https?://github\.com/[^/\s]+/[^/\s]+/issues/(\d+)")
+_ENTITY_BUG_URL_RE = re.compile(
+    r"https?://(?:issues\.chromium\.org|b\.corp\.google\.com)/issues/(\d+)"
+)
+_ENTITY_COMMIT_URL_RE = re.compile(
+    r"https?://(?:github\.com/[^/\s]+/[^/\s]+/commit|"
+    r"[a-zA-Z0-9_.-]+\.googlesource\.com/[^/\s]+/\+)/([0-9a-f]{7,40})"
+)
+_ENTITY_CL_SHORT_RE = re.compile(r"(?:^|[\s(])cl/(\d+)\b", re.IGNORECASE)
+_ENTITY_BUG_SHORT_RE = re.compile(r"(?:^|[\s(])b/(\d+)\b", re.IGNORECASE)
+_ENTITY_CRBUG_SHORT_RE = re.compile(r"(?:^|[\s(])crbug(?:\.com)?/(\d+)\b", re.IGNORECASE)
+_ENTITY_PR_TEXT_RE = re.compile(r"\bPR\s*[:#\s]*(\d+)\b", re.IGNORECASE)
+_ENTITY_CL_TEXT_RE = re.compile(r"(?:\bCL|(?:\b|\s)(?:СЛ|сл))\s*[:#\s]*(\d{5,8})\b")
+_ENTITY_BUG_TEXT_RE = re.compile(r"(?:\b(?:bug|баг))\s*[:#\s]*(\d{6,10})\b", re.IGNORECASE)
+_ENTITY_COMMIT_TEXT_RE = re.compile(
+    r"(?:\b(?:commit|коммит|sha|rev|revision))\s*[:#\s]*([0-9a-f]{7,40})\b", re.IGNORECASE
+)
+
+
+def extract_entity_topic(text: str) -> str | None:
+  """Extracts a canonical entity topic (e.g. 'cl/12345', 'PR #123') from prompt text."""
+  if not text:
+    return None
+  m = _ENTITY_GERRIT_URL_RE.search(text)
+  if m:
+    return f"cl/{m.group(1)}"
+  m = _ENTITY_GITHUB_PR_URL_RE.search(text)
+  if m:
+    return f"PR #{m.group(1)}"
+  m = _ENTITY_GITHUB_ISSUE_URL_RE.search(text)
+  if m:
+    return f"Issue #{m.group(1)}"
+  m = _ENTITY_BUG_URL_RE.search(text)
+  if m:
+    return f"b/{m.group(1)}"
+  m = _ENTITY_COMMIT_URL_RE.search(text)
+  if m:
+    return f"commit {m.group(1)[:8]}"
+  m = _ENTITY_CL_SHORT_RE.search(text)
+  if m:
+    return f"cl/{m.group(1)}"
+  m = _ENTITY_BUG_SHORT_RE.search(text)
+  if m:
+    return f"b/{m.group(1)}"
+  m = _ENTITY_CRBUG_SHORT_RE.search(text)
+  if m:
+    return f"crbug/{m.group(1)}"
+  m = _ENTITY_PR_TEXT_RE.search(text)
+  if m:
+    return f"PR #{m.group(1)}"
+  m = _ENTITY_CL_TEXT_RE.search(text)
+  if m:
+    return f"cl/{m.group(1)}"
+  m = _ENTITY_BUG_TEXT_RE.search(text)
+  if m:
+    return f"b/{m.group(1)}"
+  m = _ENTITY_COMMIT_TEXT_RE.search(text)
+  if m:
+    return f"commit {m.group(1)[:8]}"
+  return None
+
+
+def auto_title_conversation(conv_id: str, prompt: str) -> str:
+  """Titles an untitled conversation if prompt mentions a PR, CL, bug, or commit."""
+  if not conv_id or not prompt:
+    return ""
+  cur_title = get_conversation_title(conv_id)
+  # Respect existing time prefix: never overwrite a chat that is already titled
+  if cur_title and TIME_PREFIX_RE.match(cur_title.strip()):
+    return ""
+  topic = extract_entity_topic(prompt)
+  if not topic:
+    return ""
+  return set_conversation_topic(conv_id, topic)
+
+
 def get_handoff_summary_path(conv_id: str, topic: str = "") -> str:
   """Returns the canonical summary artifact path for conv_id, creating the dir if needed."""
   if not conv_id:
@@ -1685,6 +1766,8 @@ Commands:
                                       is_finalized, summary file paths. Read-only.
   set-title <id> "<Topic>"            Rename the chat. Time prefix [HH:MM] and the
                                       marker are added automatically.
+  auto-title <id> "<prompt>"          Detect PR/CL/bug/commit in prompt and set title
+                                      if the chat is currently untitled.
   summary-path <id>                   Print the canonical handoff summary path
                                       (brain/<id>/handoff_summary_<slug>_<id8>.md).
   handoff <id> [summary_file]         Create a visible continuation chat in the same
@@ -1747,6 +1830,7 @@ def print_usage(stream=None) -> None:
 KNOWN_COMMANDS = (
     "set",
     "set-title",
+    "auto-title",
     "summary-path",
     "status",
     "model",
@@ -1838,6 +1922,12 @@ if __name__ == "__main__":
     marker = sys.argv[4] if len(sys.argv) > 4 else MARKER_ACTIVE
     new_t = set_conversation_topic(cid, topic, marker)
     print(f"Updated title for {cid}: {new_t}")
+  elif sys.argv[1] == "auto-title":
+    cid = _require_conversation_id("auto-title", sys.argv[2] if len(sys.argv) > 2 else "")
+    prompt = sys.argv[3] if len(sys.argv) > 3 else ""
+    new_t = auto_title_conversation(cid, prompt)
+    if new_t:
+      print(f"Updated title for {cid}: {new_t}")
   elif sys.argv[1] == "summary-path":
     cid = _require_conversation_id(
         "summary-path", sys.argv[2] if len(sys.argv) > 2 else _env_conversation_id())

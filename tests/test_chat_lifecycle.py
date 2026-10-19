@@ -261,6 +261,56 @@ class TestChatLifecycle(unittest.TestCase):
         new_title2 = chat_lifecycle.set_conversation_topic("c1", "[10:00] » Тест № 2")
         self.assertEqual(new_title2, "[15:30] ⦿ Тест № 2")
 
+  def test_extract_entity_topic(self):
+    cases = [
+        ("Посмотри на СЛ https://skia-review.git.corp.google.com/c/skia/+/1397896", "cl/1397896"),
+        ("Check https://chromium-review.googlesource.com/c/chromium/src/+/5901234", "cl/5901234"),
+        ("Look at https://github.com/flutter/engine/pull/55123 please", "PR #55123"),
+        ("Issue https://github.com/flutter/flutter/issues/99887", "Issue #99887"),
+        ("Fix bug b/345678901 in layout", "b/345678901"),
+        ("Inspect crbug.com/1234567", "crbug/1234567"),
+        ("Broken in commit a1b2c3d4e5f678", "commit a1b2c3d4"),
+        ("Check cl/1397896", "cl/1397896"),
+        ("СЛ 1397896 что там происходит", "cl/1397896"),
+        ("PR #45678 review", "PR #45678"),
+        ("Just a normal conversation without entities", None),
+    ]
+    for prompt, expected in cases:
+      with self.subTest(prompt=prompt):
+        self.assertEqual(chat_lifecycle.extract_entity_topic(prompt), expected)
+
+  def test_auto_title_conversation(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      db_path = os.path.join(tmp_dir, chat_lifecycle.SUMMARY_DB_NAME)
+      conn = sqlite3.connect(db_path)
+      with conn:
+        conn.execute(
+            "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT)"
+        )
+        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?)", ("c1", "Untitled"))
+        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?)", ("c2", "[10:00] ⦿ Custom"))
+      conn.close()
+
+      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
+           patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=False), \
+           patch.object(chat_lifecycle, "get_current_time_str", return_value="14:15"):
+
+        # 1. Untitled chat with entity prompt gets auto-titled
+        res = chat_lifecycle.auto_title_conversation(
+            "c1", "Посмотри на СЛ https://skia-review.git.corp.google.com/c/skia/+/1397896"
+        )
+        self.assertEqual(res, "[14:15] ⦿ cl/1397896")
+        self.assertEqual(chat_lifecycle.get_conversation_title("c1"), "[14:15] ⦿ cl/1397896")
+
+        # 2. Already titled chat (with [HH:MM]) is never overwritten
+        res2 = chat_lifecycle.auto_title_conversation("c2", "Look at PR #12345")
+        self.assertEqual(res2, "")
+        self.assertEqual(chat_lifecycle.get_conversation_title("c2"), "[10:00] ⦿ Custom")
+
+        # 3. Prompt without entity does not change title
+        res3 = chat_lifecycle.auto_title_conversation("c1", "Just some random question")
+        self.assertEqual(res3, "")
+
   def test_create_handoff(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
       db_path = os.path.join(tmp_dir, chat_lifecycle.SUMMARY_DB_NAME)
@@ -845,7 +895,17 @@ class TestChatLifecycle(unittest.TestCase):
   # --- CLI usage -------------------------------------------------------------
 
   SCRIPT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "hooks", "chat_lifecycle.py"))
-  PUBLIC_COMMANDS = ("status", "set-title", "summary-path", "handoff", "audit", "archive", "finalize", "reopen")
+  PUBLIC_COMMANDS = (
+      "status",
+      "set-title",
+      "auto-title",
+      "summary-path",
+      "handoff",
+      "audit",
+      "archive",
+      "finalize",
+      "reopen",
+  )
 
   def _run_cli(self, *args):
     import subprocess

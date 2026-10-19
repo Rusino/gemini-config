@@ -324,6 +324,23 @@ class TestContextGuard(unittest.TestCase):
     self.run_guard(inv=2)
     self.assertEqual(self.mock_rpc.call_args[0][1]["generatorMetadataOffset"], 4)
 
+  def test_auto_title_on_turn_start_with_entity_prompt(self):
+    self.mock_db.return_value = ("Untitled", "proj-1")
+    with patch.object(
+        chat_lifecycle, "auto_title_conversation", return_value="[14:15] ⦿ cl/1397896"
+    ) as mock_auto:
+      out = self.run_guard(
+          inv=0,
+          lastUserInput="Посмотри на СЛ https://skia-review.git.corp.google.com/c/skia/+/1397896",
+      )
+      mock_auto.assert_called_once_with(
+          "c1", "Посмотри на СЛ https://skia-review.git.corp.google.com/c/skia/+/1397896"
+      )
+      msg = self.message(out)
+      self.assertIn("TITLE GUARD", msg)
+      self.assertIn("[14:15] ⦿ cl/1397896", msg)
+      self.assertEqual(self.last_log().get("auto_title"), "[14:15] ⦿ cl/1397896")
+
 
 if __name__ == "__main__":
   unittest.main()
