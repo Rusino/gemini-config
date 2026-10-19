@@ -214,6 +214,15 @@ def main() -> int:
         default=[],
         help="Extra command-line flags forwarded to dm",
     )
+    # Without --paragraph_fonts every ResourceFontCollection test hits SKIP_IF_FONTS_NOT_FOUND
+    # and silently returns, so most of SkParagraphTest passes vacuously
+    ap.add_argument(
+        "--ci-fonts",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Pass the NativeFonts CI bot flags (--nativeFonts --paragraph_fonts extra_fonts "
+        "--norun_paragraph_tests_needing_system_fonts) to dm (default: on)",
+    )
     ap.add_argument(
         "--skip-build",
         action="store_true",
@@ -338,6 +347,9 @@ def main() -> int:
                 test_cmd.extend(["--config", args.config])
             if args.nogpu:
                 test_cmd.append("--nogpu")
+            if args.ci_fonts:
+                test_cmd.extend(["--nativeFonts", "--paragraph_fonts", "extra_fonts",
+                                 "--norun_paragraph_tests_needing_system_fonts"])
             test_cmd.extend(args.extra_dm_flags)
             attestation["test_cmd"] = test_cmd
 

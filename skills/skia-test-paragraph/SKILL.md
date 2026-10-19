@@ -73,6 +73,7 @@ python3 ~/.gemini/config/skills/skia-test-paragraph/scripts/run_skparagraph_test
 - `--match <pattern>` — Substring filter passed to `dm` (default: `SkParagraph`).
 - `--config <config>` — Rendering config passed to `dm` (e.g. `8888`, `gl`).
 - `--nogpu` — Pass `--nogpu` to `dm`.
+- `--ci-fonts` / `--no-ci-fonts` — On by default: pass the NativeFonts CI bot flags (`--nativeFonts --paragraph_fonts extra_fonts --norun_paragraph_tests_needing_system_fonts`). Without `--paragraph_fonts` every `ResourceFontCollection` test silently returns via `SKIP_IF_FONTS_NOT_FOUND` and is still counted as passed.
 - `--extra-dm-flags ...` — Forward additional flags directly to `dm`.
 - `--skip-build` — Skip running `ninja` prior to test execution.
 - `--resume` — Skip execution for any ref whose `attestation.json` and `dm_summary.json` already exist.
