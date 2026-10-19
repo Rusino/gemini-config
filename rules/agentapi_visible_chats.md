@@ -51,6 +51,7 @@ Use only these commands (`python3 ~/.gemini/config/hooks/chat_lifecycle.py ...`)
 | `finalize <id>` | **Only** when the user explicitly says *"финал"* (or an unambiguous equivalent). Preserves original timestamps, swaps markers. |
 | `status [id]` | User asks about the chain / which chats belong to the task / where summaries are. |
 | `model [id] [--trailer]` | User asks which model a chat runs on or which model a continuation would get (or outputs git `Assisted-by: ...` trailer with `--trailer`). Read-only. |
+| `project-model [<p>] [<m>]` | View or configure project-specific preferred model (saved to `~/.gemini/config/projects_models.json`, e.g. `skia-g3-roll-check` -> `flash`). |
 | `audit [--fix] [--project <id\|name>]` | Scan top-level chats and chains for title desync (LS RPC vs `.pbtxt` vs SQLite) or broken Scheme Γ markers; `--fix` repairs them. |
 | `archive [<id...>] [--chain] [--project <p>] [--keep <N>]` | Archive specified chats (or their full handoff chain with `--chain`) via LS RPC and `.pbtxt`. With `--project`, archives older active chats in project `<p>`, keeping the `<N>` newest (default 1). |
 | `auto-archive [--hook]` | Prune older chats across projects configured with a retention policy (default: keep 1 newest for `skia-g3-roll-check`). Runs automatically via `Stop` and `SessionStart` hooks. |

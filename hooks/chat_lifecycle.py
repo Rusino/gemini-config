@@ -31,6 +31,12 @@ DEFAULT_PROJECT_RETENTION_FILE = os.path.expanduser(
 DEFAULT_AUTO_ARCHIVE_RETENTION: dict[str, int] = {
     "skia-g3-roll-check": 1,
 }
+DEFAULT_PROJECT_MODELS_FILE = os.path.expanduser(
+    "~/.gemini/config/projects_models.json"
+)
+DEFAULT_PROJECT_MODELS: dict[str, str] = {
+    "skia-g3-roll-check": "flash",
+}
 
 # Lifecycle marker tokens
 MARKER_START = "▸"       # In-progress branch root
@@ -316,10 +322,115 @@ def lookup_model(models: dict, wanted: str) -> dict:
   return {}
 
 
-def resolve_handoff_model(current_conv_id: str, tier: str = "pro", explicit: str = "") -> dict:
+def load_project_models() -> dict[str, str]:
+  """Returns mapping of project identifier or name to preferred model string."""
+  rules = dict(DEFAULT_PROJECT_MODELS)
+  if os.path.isfile(DEFAULT_PROJECT_MODELS_FILE):
+    try:
+      with open(DEFAULT_PROJECT_MODELS_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+      if isinstance(data, dict):
+        for k, v in data.items():
+          if isinstance(v, str) and v.strip():
+            rules[k.strip()] = v.strip()
+    except Exception:
+      pass
+  return rules
+
+
+def save_project_models(rules: dict[str, str]) -> None:
+  """Saves mapping of project identifier or name to preferred model string."""
+  os.makedirs(os.path.dirname(DEFAULT_PROJECT_MODELS_FILE), exist_ok=True)
+  with open(DEFAULT_PROJECT_MODELS_FILE, "w", encoding="utf-8") as f:
+    json.dump(rules, f, ensure_ascii=False, indent=2)
+
+
+def get_conversation_project_id(conv_id: str) -> str:
+  """Finds project id for conversation from database or environment."""
+  if not conv_id:
+    return os.environ.get("ANTIGRAVITY_PROJECT_ID", "").strip()
+  try:
+    from context_guard import _query_summary_db
+  except ImportError:
+    _query_summary_db = None
+
+  for d in find_app_data_dirs():
+    db_file = os.path.join(d, SUMMARY_DB_NAME)
+    if _query_summary_db and os.path.isfile(db_file):
+      row = _query_summary_db(db_file, conv_id)
+      if row and row[1]:
+        return str(row[1]).strip()
+  return os.environ.get("ANTIGRAVITY_PROJECT_ID", "").strip()
+
+
+def get_project_model_preference(project_id_or_name: str, projects_dir: str = "") -> str:
+  """Looks up preferred model for a project by ID or clean name.
+
+  Checks projects_models.json (and built-in defaults) first, then falls back to
+  inspecting the project's JSON definition file in ~/.gemini/config/projects/
+  for an inline model setting or to resolve project name <-> ID
+  """
+  raw = (project_id_or_name or "").strip()
+  if not raw or raw in ("outside-of-project", "unassigned", "none"):
+    return ""
+
+  rules = load_project_models()
+  if raw in rules:
+    return rules[raw]
+
+  clean_raw = strip_activity_badge(raw).lower()
+  for k, v in rules.items():
+    if strip_activity_badge(k).lower() == clean_raw:
+      return v
+
+  pdir = projects_dir or os.path.expanduser(
+      os.environ.get("ANTIGRAVITY_PROJECTS_DIR", DEFAULT_PROJECTS_DIR)
+  )
+  if os.path.isdir(pdir):
+    for pfile in sorted(glob.glob(os.path.join(pdir, "*.json"))):
+      try:
+        with open(pfile, "r", encoding="utf-8") as f:
+          pdata = json.load(f)
+        if not isinstance(pdata, dict):
+          continue
+        pid = str(pdata.get("id") or "").strip()
+        pname = strip_activity_badge(str(pdata.get("name") or "").strip())
+        is_match = (
+            (pid and pid.lower() == raw.lower())
+            or (pname and pname.lower() == clean_raw)
+        )
+        if is_match:
+          inline = (
+              pdata.get("defaultModel")
+              or pdata.get("model")
+              or (pdata.get("settings") or {}).get("defaultModel")
+              or (pdata.get("settings") or {}).get("model")
+              or ""
+          )
+          if inline and isinstance(inline, str):
+            return inline.strip()
+
+          if pid in rules:
+            return rules[pid]
+          if pname:
+            for k, v in rules.items():
+              if strip_activity_badge(k).lower() == pname.lower():
+                return v
+      except (OSError, ValueError):
+        continue
+  return ""
+
+
+def resolve_handoff_model(
+    current_conv_id: str,
+    tier: str = "pro",
+    explicit: str = "",
+    project_id: str = "",
+) -> dict:
   """Chooses the plan model for the continuation chat.
 
-  Order: explicit (--model) -> inherited from the current conversation's last turn ->
+  Order: explicit (--model) -> project default (if set) ->
+  inherited from the current conversation's last turn ->
   $HANDOFF_MODEL / <app_data_dir>/handoff_model -> first model of the agentapi tier.
   Every candidate is validated against the live catalog: an enum that is not in it
   fails at the first turn ("unknown model key MODEL_PLACEHOLDER_*").
@@ -345,6 +456,17 @@ def resolve_handoff_model(current_conv_id: str, tier: str = "pro", explicit: str
     if not hit:
       raise RuntimeError(f"--model '{explicit}' is not available in GetAvailableModels")
     return hit
+
+  pid = project_id or (get_conversation_project_id(current_conv_id) if current_conv_id else "")
+  if pid and pid != "outside-of-project":
+    proj_pref = get_project_model_preference(pid)
+    if proj_pref:
+      if proj_pref in AGENTAPI_TIERS:
+        hit = from_tier(proj_pref)
+      else:
+        hit = lookup_model(models, proj_pref)
+      if hit:
+        return {**hit, "source": f"project:{pid}"}
 
   inherited = get_last_used_model(current_conv_id) if current_conv_id else ""
   hit = lookup_model(models, inherited)
@@ -1034,21 +1156,7 @@ def create_handoff(
   cont_title = f"[{time_str}] {MARKER_ACTIVE} {new_topic}"
 
   # 2. Determine project ID to preserve
-  # Same reader as context_guard (incl. its immutable=1 fallback), so a WAL
-  # database without its -shm file cannot make the two disagree
-  from context_guard import _query_summary_db
-
-  project_id = ""
-  for d in find_app_data_dirs():
-    db_file = os.path.join(d, SUMMARY_DB_NAME)
-    row = _query_summary_db(db_file, current_conv_id) if os.path.isfile(db_file) else None
-    if row and row[1]:
-      project_id = str(row[1]).strip()
-      break
-  # Fall back to $ANTIGRAVITY_PROJECT_ID only when the DB has no project row,
-  # because the env var is fixed at turn start and stale after a mid-turn move
-  if not project_id:
-    project_id = os.environ.get("ANTIGRAVITY_PROJECT_ID", "")
+  project_id = get_conversation_project_id(current_conv_id)
   in_project = bool(project_id) and project_id != "outside-of-project"
 
   ignored_summary = ""
@@ -1135,7 +1243,12 @@ def create_handoff(
     moved_to = cid
 
   try:
-    model_info = resolve_handoff_model(current_conv_id, tier=model, explicit=exact_model)
+    model_info = resolve_handoff_model(
+        current_conv_id,
+        tier=model,
+        explicit=exact_model,
+        project_id=project_id_final,
+    )
     new_cid = start_conversation_exact(
         model_info["enum"], cont_title, prompt, project_id_final,
         before_send=move_state if in_project else None,
@@ -1786,6 +1899,9 @@ Commands:
   model [id] [--trailer]              Read-only: show the model <id> last used and the
                                       model a handoff would pick now (or output
                                       git `Assisted-by: <Model>` trailer with --trailer).
+  project-model [<p>] [<m>]           View or configure preferred model for project <p>
+                                      (e.g. `skia-g3-roll-check` -> `flash`). With no
+                                      arguments, lists all configured project models.
   audit [--fix] [--project <p>]       Scan visible top-level chats and handoff chains
                                       for storage desync (LS RPC vs .pbtxt vs SQLite)
                                       and broken/double Scheme Γ markers. With --fix,
@@ -1815,6 +1931,7 @@ Notes:
     choose or edit them by hand. A chain is the set of chats joined by handoff
     links (who continues whom); topics may differ from step to step.
   * Model of a continuation: --model <id|display name|enum|flash_lite|flash|pro>
+    -> project default (projects_models.json / DEFAULT_PROJECT_MODELS / project.json)
     -> model of <id>'s last turn (inherit) -> $HANDOFF_MODEL or the first
     non-comment line of <app_data_dir>/handoff_model -> agentapi tier "pro".
     Candidates are validated against GetAvailableModels. `agentapi
@@ -1834,6 +1951,7 @@ KNOWN_COMMANDS = (
     "summary-path",
     "status",
     "model",
+    "project-model",
     "handoff",
     "reopen",
     "advance",
@@ -1945,9 +2063,16 @@ if __name__ == "__main__":
     args = [a for a in sys.argv[2:] if a != "--trailer"]
     cid = _require_conversation_id(
         "model", args[0] if args else _env_conversation_id())
-    out = {"conversation_id": cid, "last_used_enum": get_last_used_model(cid) if cid else ""}
+    pid = get_conversation_project_id(cid) if cid else ""
+    pref = get_project_model_preference(pid) if pid else ""
+    out = {
+        "conversation_id": cid,
+        "project_id": pid or "outside-of-project",
+        "project_model_preference": pref or "(none, using inherited/global default)",
+        "last_used_enum": get_last_used_model(cid) if cid else "",
+    }
     try:
-      out["handoff_would_use"] = resolve_handoff_model(cid)
+      out["handoff_would_use"] = resolve_handoff_model(cid, project_id=pid)
     except Exception as exc:
       out["handoff_would_use"] = {"error": str(exc)[:300], "fallback": "agentapi tier:pro"}
     out["override_setting"] = read_handoff_model_override()
@@ -1955,6 +2080,41 @@ if __name__ == "__main__":
       print(get_model_trailer(cid))
     else:
       print(json.dumps(out, ensure_ascii=False, indent=2))
+  elif sys.argv[1] == "project-model":
+    args = sys.argv[2:]
+    if not args:
+      print(json.dumps(load_project_models(), ensure_ascii=False, indent=2))
+    elif len(args) == 1:
+      target = args[0]
+      resolved_pid = resolve_project_id(target)
+      pref = get_project_model_preference(target)
+      print(json.dumps({
+          "project_query": target,
+          "resolved_project_id": resolved_pid,
+          "preferred_model": pref or "(none, using inherited/global default)",
+      }, ensure_ascii=False, indent=2))
+    else:
+      target, new_model = args[0], args[1]
+      resolved_pid = resolve_project_id(target)
+      try:
+        resp = get_available_models()
+        models = resp.get("models") or {}
+        if new_model not in AGENTAPI_TIERS and not lookup_model(models, new_model):
+          print(
+              f"[WARN] Model '{new_model}' not found in live GetAvailableModels catalog",
+              file=sys.stderr,
+          )
+      except Exception:
+        pass
+      rules = load_project_models()
+      rules[target] = new_model
+      save_project_models(rules)
+      print(json.dumps({
+          "project": target,
+          "resolved_project_id": resolved_pid,
+          "preferred_model": new_model,
+          "saved_to": DEFAULT_PROJECT_MODELS_FILE,
+      }, ensure_ascii=False, indent=2))
   elif sys.argv[1] == "handoff":
     opts = parse_handoff_args(sys.argv[2:])
     cid = _require_conversation_id("handoff", opts["cid"] or _env_conversation_id())

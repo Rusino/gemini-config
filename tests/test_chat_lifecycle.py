@@ -1072,6 +1072,93 @@ class TestChatLifecycle(unittest.TestCase):
         self.assertIn("last_user_view_time:{seconds:123}", raw_pbtxt)
         self.assertEqual(chat_lifecycle.get_conversation_title("cid-nl"), title)
 
+  def test_project_model_loading_and_saving(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      cfg_file = os.path.join(tmp_dir, "projects_models.json")
+      with (
+          patch.object(chat_lifecycle, "DEFAULT_PROJECT_MODELS_FILE", cfg_file),
+          patch.dict(chat_lifecycle.DEFAULT_PROJECT_MODELS, {"proj-default": "flash"}),
+      ):
+        rules = chat_lifecycle.load_project_models()
+        self.assertEqual(rules.get("proj-default"), "flash")
+
+        chat_lifecycle.save_project_models({"proj-custom": "pro", "proj-default": "flash_lite"})
+        rules2 = chat_lifecycle.load_project_models()
+        self.assertEqual(rules2.get("proj-custom"), "pro")
+        self.assertEqual(rules2.get("proj-default"), "flash_lite")
+
+  def test_get_project_model_preference(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      pdir = os.path.join(tmp_dir, "projects")
+      os.makedirs(pdir, exist_ok=True)
+      pfile = os.path.join(pdir, "p1.json")
+      with open(pfile, "w", encoding="utf-8") as f:
+        json.dump({
+            "id": "p1-uuid",
+            "name": "Roll Check · ⟳ 1",
+            "settings": {"model": "flash"},
+        }, f)
+
+      pfile2 = os.path.join(pdir, "p2.json")
+      with open(pfile2, "w", encoding="utf-8") as f:
+        json.dump({"id": "p2-uuid", "name": "Heavy Engine"}, f)
+
+      with (
+          patch.dict(chat_lifecycle.DEFAULT_PROJECT_MODELS, {"Heavy Engine": "pro"}),
+          patch.object(chat_lifecycle, "DEFAULT_PROJECT_MODELS_FILE", "/nonexistent"),
+      ):
+        self.assertEqual(
+            chat_lifecycle.get_project_model_preference("p1-uuid", projects_dir=pdir),
+            "flash",
+        )
+        self.assertEqual(
+            chat_lifecycle.get_project_model_preference("Roll Check", projects_dir=pdir),
+            "flash",
+        )
+        self.assertEqual(
+            chat_lifecycle.get_project_model_preference("p2-uuid", projects_dir=pdir),
+            "pro",
+        )
+        self.assertEqual(
+            chat_lifecycle.get_project_model_preference("outside-of-project", projects_dir=pdir),
+            "",
+        )
+
+  def test_resolve_handoff_model_project_override(self):
+    fake_catalog = {
+        "models": {
+            "m-flash": {"model": "M_FLASH", "displayName": "Flash"},
+            "m-pro": {"model": "M_PRO", "displayName": "Pro"},
+        },
+        "tieredModelIds": {
+            "flash": ["m-flash"],
+            "pro": ["m-pro"],
+        },
+    }
+    with (
+        patch.object(chat_lifecycle, "get_available_models", return_value=fake_catalog),
+        patch.object(chat_lifecycle, "get_last_used_model", return_value="M_PRO"),
+        patch.object(chat_lifecycle, "get_project_model_preference", return_value="flash"),
+    ):
+      res = chat_lifecycle.resolve_handoff_model("cid-1", project_id="p-flash")
+      self.assertEqual(res["enum"], "M_FLASH")
+      self.assertEqual(res["source"], "project:p-flash")
+
+      res_exp = chat_lifecycle.resolve_handoff_model(
+          "cid-1", explicit="pro", project_id="p-flash"
+      )
+      self.assertEqual(res_exp["enum"], "M_PRO")
+      self.assertEqual(res_exp["source"], "tier:pro")
+
+    with (
+        patch.object(chat_lifecycle, "get_available_models", return_value=fake_catalog),
+        patch.object(chat_lifecycle, "get_last_used_model", return_value="M_PRO"),
+        patch.object(chat_lifecycle, "get_project_model_preference", return_value=""),
+    ):
+      res_inh = chat_lifecycle.resolve_handoff_model("cid-1", project_id="p-none")
+      self.assertEqual(res_inh["enum"], "M_PRO")
+      self.assertEqual(res_inh["source"], "inherited")
+
 
 if __name__ == "__main__":
   unittest.main()
