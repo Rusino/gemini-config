@@ -64,6 +64,10 @@ For moving chats or whole chains between projects (or listing unassigned chats),
   - **Backlog requests**: when the user says something like "в бэклог: X" / "add to backlog: X", run `roadmap.py add <id> "X"`, confirm in exactly one line (e.g. `R7 added: X`), then continue the current work.
   - **Spin-offs**: when an item is handed to its own chat, run `roadmap.py link <id> <item ID> <new_chat_id>`.
   - **At handoff**: paste the roadmap block printed by `chat_lifecycle.py handoff` into the final message to the user.
+- **Parallel chats in one project share resources, so claim before touching**:
+  - **Claim before touching.** Before editing a deliverable or running build/test in a working copy, run `roadmap.py show`. If the item you need is `doing` in another live chat, do not start: tell the user which chat owns it and wait. Otherwise claim it first with `roadmap.py set <id> <item> doing`.
+  - **One working copy, one writer.** Before `go test` / `go build` / commit, check `git status`; if there are modified files you did not touch, do not build, test, or commit in that tree. Use `git worktree add` on a committed revision instead, and never stash or commit foreign files.
+  - **One deliverable, one home.** A document under a roadmap item lives at exactly one path, recorded in the item text; other chats read it, they do not copy or fork it.
 - **Never Shrink Epic Scope**: Handoff summaries must maintain the complete multi-stage roadmap (`Epic Roadmap`) with explicit checkbox states (`[x]` for completed, `[ ]` for pending, `[-]` for abandoned/out-of-scope). An agent is **strictly forbidden** from deleting or dropping uncompleted backlog items from `Next Steps` or `Roadmap` during handoff.
 - **Two-Level Plan Bifurcation**: Always separate:
   1. `Epic Roadmap`: Complete checklist of all macro-deliverables across the entire task lifetime. When completing a handoff, copy the previous roadmap forward, updating only the status (`[ ]` -> `[x]`).
