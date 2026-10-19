@@ -481,12 +481,20 @@ def patch_flutter_tools_for_web_corpus(repo):
 
     # 2. commands/test.dart
     cmd_text = cmd_test_path.read_text()
-    cmd_anchor = """    if (_isIntegrationTest || isWeb) {
-      if (argResults!.wasParsed('concurrency')) {"""
-    cmd_repl = """    if (_isIntegrationTest) {
-      if (argResults!.wasParsed('concurrency')) {"""
-    if cmd_anchor in cmd_text:
-        cmd_test_path.write_text(cmd_text.replace(cmd_anchor, cmd_repl, 1))
+    for cmd_anchor, cmd_repl in (
+        (
+            "    if (_isIntegrationTest || isWeb) {\n      if (argResults!.wasParsed('concurrency')) {",
+            "    if (_isIntegrationTest) {\n      if (argResults!.wasParsed('concurrency')) {",
+        ),
+        (
+            "    if (_isIntegrationTest || isWeb) {\n      if (wasParsed(_concurrency)) {",
+            "    if (_isIntegrationTest) {\n      if (wasParsed(_concurrency)) {",
+        ),
+    ):
+        if cmd_anchor in cmd_text:
+            cmd_text = cmd_text.replace(cmd_anchor, cmd_repl, 1)
+            cmd_test_path.write_text(cmd_text)
+            break
 
     # 3. web/chrome.dart
     ch_text = chrome_path.read_text()

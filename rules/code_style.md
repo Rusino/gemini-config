@@ -11,6 +11,7 @@ description: "Skia-style C++ minimalism and suppression of LLM coding reflexes."
 - **Never restate syntax**: Do not write comments that describe *what* the next line of code does (e.g., `// Populate the cache`, `// Check for null`, `// Increment counter`)
 - **No tutorial markers**: Never use numbered step comments (`// 1. Setup`, `// 2. Execute`) or markdown emphasis (`*word*`, `--`) in code comments
 - **Why over What (Timeless Invariants)**: Write comments only to state non-obvious domain invariants, contracts, hardware/API quirks, or why a check/call must not happen here (never diff-style `// Removed...` or `// Fixed...`). Even a 1-line non-trivial addition, modification, or deletion must get a comment explaining why
+- **Targeted placement (No Umbrella Blocks)**: Place short, focused comments directly above each specific branch, condition, field, or expression they explain. Never dump a multi-sentence summary block at the top of a hunk, method, or `switch` that leaves individual branches or lines below uncommented
 - **Comment ownership**: Only rewrite or delete comments that you (the AI) added and explicitly remember adding; always ask before modifying or removing any pre-existing or user-written comment
 
 ## 2. Zero Speculative API Surface (Strict YAGNI)
@@ -41,9 +42,10 @@ description: "Skia-style C++ minimalism and suppression of LLM coding reflexes."
   Run `python3 ~/.gemini/config/hooks/chat_lifecycle.py model --trailer` to obtain the trailer (e.g. `Assisted-by: Gemini 3.8 Flash (High)` or `Assisted-by: Gemini 3.8 Pro`). If the model cannot be determined, use `Assisted-by: AI`
 - **Direct & concise prose**: Write concise, direct prose (1–3 sentences explaining the problem and the fix)
 - **No LLM bulleted lists**: Never generate LLM-style bulleted lists of imperative verbs (`- Add...`, `- Refactor...`, `- Update...`) in commit descriptions unless explicitly asked
-- **Never publish review replies (draft only)**: Never publish review replies or comments to
-  Gerrit or GitHub yourself. Only prepare / draft replies (either save as drafts on Gerrit or
-  present them in chat for review); only the user publishes review submissions
+- **Never publish review replies or resolve threads without asking**: Never publish review replies
+  or comments to Gerrit or GitHub yourself, and never resolve/unresolve review threads (`resolveReviewThread`)
+  unless the user explicitly asks you to. Only prepare / draft replies (either save as drafts on Gerrit or
+  present them in chat for review); only the user publishes review submissions or resolves threads
 - **No Auto-Submit or Automated CQ Votes**: Never vote `Auto-Submit+1`, `Commit-Queue+1` (dry run),
   or `Commit-Queue+2` on Gerrit CLs, and never auto-merge GitHub PRs, unless the user explicitly
   asks for it. Do not trigger CI submission automatically
