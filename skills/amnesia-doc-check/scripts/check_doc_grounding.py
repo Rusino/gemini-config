@@ -196,7 +196,12 @@ def looks_like_path(token: str) -> bool:
         if not stripped:
             return False
         segments = [s for s in stripped.split("/") if s and s != "..."]
-        if not segments:
+        if not segments or all(s.isdigit() for s in segments):
+            return False
+        # Skip shortlinks (cl/123, b/123, go/foo) and bare domain/org/repo references
+        if segments[0].lower() in ("cl", "b", "go", "crbug.com", "skbug.com"):
+            return False
+        if segments[0].lower() == "github.com" and len(segments) <= 3:
             return False
         # Single-segment trailing-slash directory like `agents/` or `.agents/`
         if len(segments) == 1 and token.endswith("/"):
@@ -222,6 +227,7 @@ def looks_like_path(token: str) -> bool:
 
 def normalize_candidate_path(token: str) -> str:
     cleaned = token.strip().rstrip(".,:;)")
+    cleaned = re.sub(r"^github\.com/[^/]+/[^/]+/(?:blob|tree)/[^/]+/", "", cleaned)
     cleaned = re.sub(r"(?::\d+(?:-\d+)?|#L\d+(?:-L?\d+)?)$", "", cleaned)
     cleaned = re.sub(r"/\.\.\.$", "", cleaned)
     cleaned = re.sub(r"/\*[^/]*$", "", cleaned)
