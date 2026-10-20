@@ -43,7 +43,8 @@ def probe_gerrit(cl_id, host_hint=None):
         if not host:
             continue
         try:
-            url = f"https://{host}/changes/{cl_id}/detail"
+            # CURRENT_REVISION gives the patchset number that Gerrit file links require
+            url = f"https://{host}/changes/{cl_id}/detail?o=CURRENT_REVISION"
             req = urllib.request.Request(url, headers={"User-Agent": "ReviewTriageAgent"})
             with urllib.request.urlopen(req, timeout=8) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
@@ -67,6 +68,8 @@ def probe_gerrit(cl_id, host_hint=None):
                 "owner_email": detail.get("owner", {}).get("email", ""),
                 "description": detail.get("messages", [{}])[-1].get("message", "") if detail.get("messages") else detail.get("subject", ""),
                 "patch": patch_text,
+                "patchset": detail.get("revisions", {})
+                                  .get(detail.get("current_revision"), {}).get("_number"),
                 "detail": detail
             }
         except Exception:
@@ -178,6 +181,26 @@ class ChangedFile:
         self.is_header = bool(re.search(r'\.(h|hpp|hxx)$', path))
         self.is_impl = bool(re.search(r'\.(c|cc|cpp|cxx|dart|py|java|ts|js|go)$', path)) and not self.is_test
         self.domain_affinity = any(k in path.lower() for k in USER_DOMAIN_KEYWORDS)
+
+def changed_line_range(hunk):
+    # Hunk headers include context lines, so anchor on the first and last new-side changed lines
+    line_no = hunk.new_start
+    first = last = None
+    for line in hunk.lines:
+        if line.startswith("+"):
+            first = first or line_no
+            last = line_no
+            line_no += 1
+        elif line.startswith("-"):
+            # A pure deletion sits between new-side lines; point at the line that follows it
+            first = first or line_no
+            last = last or line_no
+        elif not line.startswith("\\"):
+            line_no += 1
+    if first is None:
+        return hunk.new_start, hunk.new_start + hunk.new_len
+    return first, max(first, last)
+
 
 def parse_patch(patch_text):
     """Parse unified git diff into ChangedFile objects with hunks."""
@@ -478,11 +501,12 @@ def generate_report(cl_data, analysis, files):
             cl_id = cl_data.get("id")
             project = cl_data.get("detail", {}).get("project", "skia") if isinstance(cl_data.get("detail"), dict) else "skia"
             for idx, (score, f, h) in enumerate(analysis["top_hunks"], 1):
-                start_line = h.new_start
-                end_line = h.new_start + h.new_len
+                start_line, end_line = changed_line_range(h)
                 func_hint = f" in `{h.header}`" if h.header else ""
                 if host and cl_id:
-                    code_url = f"https://{host}/c/{project}/+/{cl_id}/{f.path}#{start_line}"
+                    # Without the patchset segment Gerrit treats the first path component as one
+                    ps = cl_data.get("patchset") or "current"
+                    code_url = f"https://{host}/c/{project}/+/{cl_id}/{ps}/{f.path}#{start_line}"
                 elif cl_data.get("repo_url") and cl_data.get("pr_number"):
                     code_url = f"{cl_data['repo_url']}/pull/{cl_data['pr_number']}/files"
                 else:
