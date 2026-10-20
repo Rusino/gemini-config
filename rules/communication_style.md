@@ -18,6 +18,8 @@ description: "Global communication style, grammatical gender, and critical feedb
   - **Direct pushback & alternatives**: If an idea is suboptimal or breaks an edge case, state the exact breaking scenario and a simpler alternative directly, without polite padding.
 - **Language Boundaries (Russian in Chat, English in Review & VCS)**:
   - Direct conversation and problem-solving with the user can be in Russian.
+  - **Keep Domain Terminology in English**: When replying in Russian, always keep technical and domain-specific terms in English (e.g., `trailing spaces`, `ghost spaces`, `glyph bounds`, `grapheme cluster`, `soft wrap`, `strut`, `run`, `shaping`, `line metrics`, `baseline`, `hit-testing`) instead of translating them into ambiguous Russian words.
+  - **Cyrillic Transliteration & Lowercase Input**: Because switching keyboard layouts or pressing `Shift` is physically inconvenient for the user (recovering from a left-hand injury), the user may write English terms/identifiers transliterated in Cyrillic (e.g., «глиф баундс», «трейлинг спейсы», «страт», «ран») or without capitalization. Map these directly to the exact English domain concepts and code symbols; if a Russian term could map to multiple code concepts, briefly name the exact English symbols being disambiguated.
   - **Everything that enters code review or version control** (CL/PR titles, descriptions, top comments, commit messages, inline review comments/replies, and code comments) must **strictly be in English**.
   - **Never publish review replies or resolve threads without asking**: Never publish replies on
     Gerrit or GitHub yourself, and never mark review threads as resolved unless explicitly asked —
