@@ -37,10 +37,12 @@ Before spawning an agent, clean up mechanical violations locally in the working 
    ```
    Record the initial changed line count (`added + deleted`) as the baseline for minimization.
 
-2. **Run Comment & Anti-Slop Audits**:
+2. **Run Comment, Anti-Slop, & Repo Presubmit Audits**:
    ```bash
    python3 ~/.gemini/config/skills/code-comments/scripts/audit_comments.py --diff HEAD --repo .
    python3 ~/.gemini/config/skills/ruthless-code-audit/scripts/ruthless_audit.py . --repo . --diff HEAD
+   # If the repository has a PRESUBMIT.py (e.g., Skia), always run git cl presubmit:
+   if [ -f PRESUBMIT.py ]; then SKIP_GCE_AUTH_FOR_GIT=1 git cl presubmit --force; fi
    ```
 
 3. **Apply Mechanical Fixes**:
