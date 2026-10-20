@@ -14,6 +14,8 @@ PROGRESS_RE = re.compile(
 )
 GTEST_PASSED_RE = re.compile(r"\[\s*PASSED\s*\]\s+(\d+)\s+tests?")
 GTEST_FAILED_RE = re.compile(r"\[\s*FAILED\s*\]\s+(\d+)\s+tests?")
+# GoogleTest prints [  FAILED  ] Suite.Test (N ms) inline and [  FAILED  ] Suite.Test in the footer
+GTEST_TIMING_SUFFIX_RE = re.compile(r"\s+\(\d+\s*ms\)$")
 
 
 def read_lines(path: pathlib.Path | str) -> list[str]:
@@ -77,6 +79,7 @@ def summarize_gtest_log(path: pathlib.Path | str) -> dict[str, Any]:
     passed = 0
     failed = 0
     failures: list[str] = []
+    seen_failures: Set[str] = set()
     abort_or_crash = False
     crash_reason: Optional[str] = None
     saw_passed_line = False
@@ -101,8 +104,9 @@ def summarize_gtest_log(path: pathlib.Path | str) -> dict[str, Any]:
             continue
 
         if s.startswith("[  FAILED  ] ") and not s.endswith("test.") and not s.endswith("tests."):
-            name = s[len("[  FAILED  ] ") :].strip()
-            if name:
+            name = GTEST_TIMING_SUFFIX_RE.sub("", s[len("[  FAILED  ] ") :].strip()).strip()
+            if name and name not in seen_failures:
+                seen_failures.add(name)
                 failures.append(name)
 
     finished_cleanly = (not abort_or_crash) and saw_passed_line
@@ -279,7 +283,17 @@ def collect_run_data(path_str: str) -> dict[str, Any]:
         sum_path = p / "summary.json"
         if sum_path.exists():
             try:
-                data["summary"] = json.loads(sum_path.read_text())
+                summary_obj = json.loads(sum_path.read_text())
+                if isinstance(summary_obj.get("failures"), list):
+                    deduped: list[str] = []
+                    seen: Set[str] = set()
+                    for item in summary_obj["failures"]:
+                        clean = GTEST_TIMING_SUFFIX_RE.sub("", str(item)).strip()
+                        if clean and clean not in seen:
+                            seen.add(clean)
+                            deduped.append(clean)
+                    summary_obj["failures"] = deduped
+                data["summary"] = summary_obj
             except Exception:
                 pass
     return data
