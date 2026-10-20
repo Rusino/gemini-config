@@ -105,6 +105,22 @@ python3 ~/.gemini/config/skills/review-triage/scripts/triage_cl.py --diff-file /
 
 ---
 
+## Mandatory Ruthless Audit for Every Surviving CL
+
+Triage output alone is never the final word. Every CL that stays in the queue after triage (any
+category except a clear 🟡 REASSIGN) must also go through the
+[`ruthless-code-audit`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/ruthless-code-audit/SKILL.md)
+skill before drafts are presented:
+1. Fetch the current patchset into a separate worktree (never switch branches in an existing
+   checkout): `git fetch https://skia.googlesource.com/skia refs/changes/<NN>/<CL>/<PS>`. If the
+   stored credentials are rejected, fetch anonymously with
+   `git -c credential.helper= -c http.cookiefile=/dev/null fetch ...`.
+2. Run Stage 1 (`ruthless_audit.py ... --diff <parent>`) and Stage 2 (semantic review of the
+   pinpointed hunks against the full file, not just the diff).
+3. Fold the confirmed findings into the review drafts; drop LGTM drafts that the audit contradicts.
+
+---
+
 ## Review & VCS Guidelines (Strict Rules)
 1. **English-Only Review Surface**: All generated review comments, reassignment notes, and pushback messages must be strictly in English. Direct discussion with the user remains in Russian.
 2. **Never Auto-Publish or Resolve**: The agent must NEVER publish review comments to Gerrit/GitHub or resolve threads automatically. Drafts are presented in chat for the user to review and post.

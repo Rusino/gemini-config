@@ -208,5 +208,14 @@ def main():
             print(f"Ошибка получения деталей для CL {cl_num}: {e}")
         print("\n---\n")
 
+    # The scheduled run only invokes this script, so the agent must see the audit requirement here
+    audit_cls = [r["cl"] for r in triage_results if r["category"] != "REASSIGN"]
+    if audit_cls:
+        print("### ⚠️ AGENT: mandatory next step before presenting drafts")
+        print("Run the ruthless-code-audit skill "
+              "(~/.gemini/config/skills/ruthless-code-audit/SKILL.md) on CLs: "
+              + ", ".join(audit_cls)
+              + ". See 'Mandatory Ruthless Audit' in review-triage/SKILL.md for the fetch recipe.")
+
 if __name__ == "__main__":
     main()
