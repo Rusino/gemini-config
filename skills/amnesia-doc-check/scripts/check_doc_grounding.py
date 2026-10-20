@@ -69,7 +69,7 @@ FILE_EXT_RE = re.compile(rf"^[\w./~-]+?\.(?:{KNOWN_EXTS})$")
 PATH_TOKEN_RE = re.compile(r"`([^`\n]{2,120})`")
 FILE_LINK_RE = re.compile(r"file://(/[^\s)#`\"']+)")
 BARE_PATH_RE = re.compile(
-    rf"(?<![\w:/])((?:~|\.\.?/)?[\w.-]+(?:/[\w.*<>-]+)+/?|[\w.-]+\.(?:{KNOWN_EXTS}))(?![\w/])"
+    rf"(?<![\w:/.])((?:/|~|\.\.?/)?[\w.-]+(?:/[\w.*<>-]+)+/?|[\w.-]+\.(?:{KNOWN_EXTS}))(?![\w/])"
 )
 SKILL_BULLET_RE = re.compile(
     r"^\s*[-*]\s+(?:\*\*|`)+([a-z0-9]+(?:-[a-z0-9]+)+)(?:\*\*|`)+"
