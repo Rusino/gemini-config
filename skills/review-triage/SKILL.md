@@ -53,8 +53,9 @@ Instead of generating passive summaries that numb critical thinking, this skill 
 - **Criteria**: Changes belong entirely to other subsystems (e.g., Vulkan/Metal GPU backends, Graphite core, build/infra, shell embeddings).
 - **Agent Action**:
   1. Identifies touched subsystems and scans file history or ownership hints.
-  2. Recommends the specific team or primary owner.
-  3. Prepares a polite, professional reassignment note in English.
+  2. Verifies that any candidate `@google.com` owner/reviewer is currently an active Googler (`id -u <ldap> >/dev/null 2>&1` on Linux) and is **not** a departed Skia team member (`bungeman`, `kjlubick`, `brianosman`, `jvanverth`, `jsimmons`, `gregdaniel`, `nifong`).
+  3. Recommends the specific team or active primary owner.
+  4. Prepares a polite, professional reassignment note in English.
 - **User Action**: Copy message, reassign in Gerrit/GitHub, remove self from reviewers.
 
 ### 3. 🔴 `[SURGICAL AUDIT / CORE DOMAIN]` (User time: 3–5 minutes)

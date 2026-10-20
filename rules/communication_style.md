@@ -32,4 +32,9 @@ description: "Global communication style, grammatical gender, and critical feedb
 - **Local Git + `google3` Reference**:
   - The user primarily works on **Open Source** projects using standard **Git** repositories on the local filesystem (use `git`, `rg`, `grep`, `find` for local repositories).
   - You **may** look into `google3` (using `code_search`) whenever referencing internal code, callers, or examples in `google3` is useful.
+- **Verify Active Googlers Before Suggesting Assignees/Reviewers**:
+  - Never blindly suggest an author from `git log` / `git blame` as a bug assignee or CL reviewer without checking that they still work at Google.
+  - Known former Skia/graphics team members who appear in historical commits/blame but are **no longer at Google** (never suggest reassigning to them): `bungeman@google.com` (Ben Wagner), `kjlubick@google.com` (Kaylee Lubick), `brianosman@google.com` (Brian Osman), `jvanverth@google.com` (Jim Van Verth), `jsimmons@google.com` (Jason Simmons), `gregdaniel@google.com` (Greg Daniel), `nifong@google.com` (Cary Clark / Nifong).
+  - Before recommending any `@google.com` LDAP as an owner, reviewer, or assignee, verify they are currently active on Linux via `id -u <ldap> >/dev/null 2>&1` (exit code `0` = active; `no such user` = former employee).
+
 

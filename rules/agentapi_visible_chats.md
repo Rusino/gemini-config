@@ -44,7 +44,7 @@ Use only these commands (`python3 ~/.gemini/config/hooks/chat_lifecycle.py ...`)
 
 | Command | When you call it |
 |---|---|
-| `set-title <id> "<Topic>"` | User asks to name/rename the chat, or to refine an auto-detected entity title. Pass the bare topic; time and marker are added for you. (New untitled chats starting with a PR/CL/bug/commit ID are automatically titled on turn start). |
+| `set-title <id> "<Topic>"` | User asks to name/rename the chat, or on the first turn once you know the bug/CL/PR/commit topic to refine the auto-detected ID (or replace Jetski's generic auto-generated title like `"Bug Report Analysis"`). Pass the bare topic (e.g. `"b/575506671 SkFontDescriptor serialize"`); time and marker are added for you. |
 | `auto-title <id> "<prompt>"` | Detect PR/CL/bug/commit in prompt and set title if the chat is currently untitled (invoked automatically by `context_guard.py` on turn start). |
 | `handoff <id> [summary_file] [--notes "..."] [--next "..."] [--topic "<Topic>"] [--force]` | Context guard alert, or user asks to continue in a new chat. One call: writes/updates the summary, launches a visible continuation in the same project **with the same model as `<id>`'s last turn**, verifies `sourceMetadata: null`, updates chain markers. `--topic` titles the continuation with the next item's topic (the chain is defined by handoff links, so topics may differ per step); without it the topic is inherited. `--model <id\|name>` only if the user explicitly asks for a different model. A second handoff from the same chat is refused unless `--force` (only when the user explicitly asked for another continuation). |
 | `summary-path <id>` | You want to write a detailed summary with `write_to_file` before `handoff` — this returns the canonical path. |
