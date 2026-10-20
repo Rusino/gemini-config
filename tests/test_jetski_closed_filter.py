@@ -23,13 +23,14 @@ def find_node_binary() -> str:
   path_node = shutil.which("node")
   if path_node:
     return path_node
-  candidates = sorted(
-      glob.glob(
-          "/tmp/sar.server.*/server_impl.runfiles/google3/third_party/jetski/cmd/hub/server/node_basic"
-      )
-  )
-  if candidates:
-    return candidates[0]
+  for root in ("/var/tmp", "/tmp"):
+    pattern = (
+        f"{root}/sar.server.*/server_impl.runfiles/"
+        "google3/third_party/jetski/cmd/hub/server/node_basic"
+    )
+    candidates = sorted(glob.glob(pattern))
+    if candidates:
+      return candidates[0]
   mac_electron = "/Applications/Antigravity.app/Contents/MacOS/Antigravity"
   if os.path.exists(mac_electron):
     return mac_electron
@@ -481,6 +482,42 @@ console.log('ALL_JS_ASSERTIONS_PASSED');
       with open(bin_path, "rb") as f:
         patched_again = f.read()
       self.assertEqual(patched_data, patched_again)
+
+  def test_extract_sar_supports_var_tmp(self) -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+      fake_sar_dir = os.path.join(tmpdir, "var", "tmp", "sar.server.123.abc")
+      rel_bin = (
+          "server_impl.runfiles/google3/third_party/jetski/"
+          "cmd/hub/server/jetski-hub-server"
+      )
+      fake_bin = os.path.join(fake_sar_dir, rel_bin)
+      os.makedirs(os.path.dirname(fake_bin), exist_ok=True)
+      with open(fake_bin, "wb") as f:
+        f.write(b"ELF")
+
+      launcher = os.path.join(tmpdir, "fake_launcher.sh")
+      with open(launcher, "w", encoding="utf-8") as f:
+        f.write(
+            "#!/bin/sh\n"
+            'echo "Extraction directory [random_tmpdir=0]:'
+            ' /var/tmp/sar.server.123.abc."\n'
+        )
+      os.chmod(launcher, 0o755)
+
+      orig_launcher = patcher.SAR_LAUNCHER
+      orig_isfile = patcher.os.path.isfile
+      try:
+        patcher.SAR_LAUNCHER = launcher
+        patcher.os.path.isfile = lambda p: (
+            True
+            if p == "/var/tmp/sar.server.123.abc/" + rel_bin
+            else orig_isfile(p)
+        )
+        found = patcher.extract_sar_and_find_binaries()
+        self.assertIn("/var/tmp/sar.server.123.abc/" + rel_bin, found)
+      finally:
+        patcher.SAR_LAUNCHER = orig_launcher
+        patcher.os.path.isfile = orig_isfile
 
 
 if __name__ == "__main__":

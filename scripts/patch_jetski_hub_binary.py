@@ -69,6 +69,8 @@ def extract_sar_and_find_binaries() -> List[str]:
   if os.path.isfile(SAR_LAUNCHER):
     env = dict(os.environ)
     env["SAR_EXTRACT_ONLY"] = "1"
+    # Match jetski-hub.service Environment=SAR_EXTRACT_DIR=/var/tmp when run manually
+    env.setdefault("SAR_EXTRACT_DIR", "/var/tmp")
     res = subprocess.run(
         [SAR_LAUNCHER],
         env=env,
@@ -77,7 +79,7 @@ def extract_sar_and_find_binaries() -> List[str]:
         check=False,
     )
     out = (res.stdout or "") + "\n" + (res.stderr or "")
-    for m in re.finditer(r"(/tmp/sar\.server\.[^\s]+)", out):
+    for m in re.finditer(r"((?:/var)?/tmp/sar\.server\.[^\s]+)", out):
       shardir = m.group(1).rstrip(".")
       candidate = os.path.join(
           shardir,
@@ -86,13 +88,14 @@ def extract_sar_and_find_binaries() -> List[str]:
       if os.path.isfile(candidate) and candidate not in binaries:
         binaries.append(candidate)
 
-  for candidate in sorted(
-      glob.glob(
-          "/tmp/sar.server.*/server_impl.runfiles/google3/third_party/jetski/cmd/hub/server/jetski-hub-server"
-      )
-  ):
-    if candidate not in binaries:
-      binaries.append(candidate)
+  for root in ("/var/tmp", "/tmp"):
+    pattern = (
+        f"{root}/sar.server.*/server_impl.runfiles/"
+        "google3/third_party/jetski/cmd/hub/server/jetski-hub-server"
+    )
+    for candidate in sorted(glob.glob(pattern)):
+      if candidate not in binaries:
+        binaries.append(candidate)
   return binaries
 
 
