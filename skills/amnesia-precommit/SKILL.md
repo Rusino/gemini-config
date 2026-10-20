@@ -73,6 +73,7 @@ Instructions:
    - **Scope (Drive-By Pruning)**: Identify any hunk, file, formatting change, or refactor that is not strictly required to achieve the Intended Task Goal.
    - **Size (Diff Golfing)**: Identify overly verbose logic, redundant local variables, speculative helpers (YAGNI), or duplicate branches that can be expressed in fewer lines while preserving exact behavior and ABI.
    - **Correctness & KEEPER Invariants**: Check against C++ Systems Invariants (`cpp_systems_invariants.md`), Text Domain Invariants (`text_domain_invariants.md`), and Code Style (`code_style.md`) — specifically zero-allocation hot paths, loop guards, fail-fast `SkASSERT` over defensive `if (!ptr) return;`, and cross-layer consistency.
+   - **Pre-Review Grill (Skeptical Reviewer's First Question)**: Identify if any hunk introduces an non-obvious contract change, subtle tradeoff, or "Why didn't you do X instead?" question that a skeptical Gerrit/PR reviewer will immediately ask.
 
 Output Format (Strict):
 ### 1. Scope & Size Reductions (Safe to Apply Immediately)
@@ -85,6 +86,9 @@ For each suspected bug:
 - `Defect`: <exact breaking input or state>
 - `Proposed Reproducer Test`: <exact test input and assertion that should fail if this bug is real>
 
+### 3. Pre-Review Grill (Unanswered Reviewer / Contract Questions)
+At most 1–2 sharp questions a skeptical reviewer will ask about this diff (either missing rationale for a non-obvious choice or an unconfirmed behavioral/contract change). Write `None` if the diff is self-evident.
+
 If nothing is found in a section, write `None`.
 """
 )
@@ -94,7 +98,7 @@ If nothing is found in a section, write `None`.
 
 ### Phase 3: Pruning & The Trapsmith TDD Filter
 
-When the subagent returns its report, process the two sections differently:
+When the subagent returns its report, process the sections as follows:
 
 #### 1. Apply Scope & Size Reductions
 - Immediately revert flagged drive-by changes and apply safe code simplifications that preserve behavior.
@@ -109,6 +113,10 @@ For each candidate defect:
 3. **Compile & Run Once**:
    - **Test FAILS / CRASHES**: Finding is `[VALIDATED]`. Implement the root-cause fix (no symptomatic `if` branches) and keep the test.
    - **Test PASSES**: Finding is `[FALSE POSITIVE]`. Revert the test (unless it adds genuine boundary value) and do **not** touch production code.
+
+#### 3. Resolve Pre-Review Grill Questions
+- If a question in Section 3 has a known technical answer from the codebase or debugging session (e.g., why approach A was chosen over B), **silently address it** in a 1-line "why" code comment or in the commit message.
+- Surface a question to the user in the final summary **only** if it represents a genuine contract/product ambiguity (e.g., an unintended behavior change on an edge case) that requires the user's decision.
 
 ---
 
