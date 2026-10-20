@@ -27,7 +27,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "run_command|replace_file_content|multi_replace_file_content|write_to_file",
+        "matcher": "run_command|replace_file_content|multi_replace_file_content|write_to_file|run_workflow",
         "hooks": [
           {
             "type": "command",

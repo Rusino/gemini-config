@@ -7,11 +7,12 @@ description: >-
   (`check_doc_grounding.py`) for leftover LLM placeholders, intra-document path drift,
   nonexistent paths, and wrong skill/symbol names, with (2) a single amnesiac subagent pass
   (zero chat history bias) that checks internal logical/numeric/terminological consistency
-  across sections AND verifies every path, symbol, CLI flag, and `file:line` mechanism claim
-  against actual source code. Trigger before sharing any document or substantive technical
-  writeup externally, or when the user asks to "проверь документ", "проверь док на лажу",
-  "проверь на непротиворечивость", "проверь текст перед отправкой", "сделай амнезия-проверку
-  дока", or "run amnesia doc check".
+  across sections, verifies every path, symbol, CLI flag, and `file:line` mechanism claim
+  against actual source code, audits dropped caveats via `git diff`/`git log`, and checks
+  pattern completeness across enumerations and paired docs. Trigger before sharing any document
+  or substantive technical writeup externally, or when the user asks to "проверь документ",
+  "проверь док на лажу", "проверь на непротиворечивость", "проверь текст перед отправкой",
+  "сделай амнезия-проверку дока", or "run amnesia doc check".
 ---
 
 # Amnesia Document & Outgoing Text Fact-Checker (`amnesia-doc-check`)
@@ -85,15 +86,18 @@ Deterministic Pre-Check Output:
 <paste output of check_doc_grounding.py>
 
 Instructions:
-Verify the document across four strict axes using actual tool calls (`read_file`, `code_search`, or read-only `git`/`ls` commands):
+Verify the document across six strict axes using actual tool calls (`read_file` / `view_file`, `code_search`, or read-only `git`/`ls` commands):
 
-1. **Referential Grounding (Paths, Names, Flags, SHAs, Bugs/CLs)**:
+1. **Referential Grounding & Pattern Completeness (Paths, Names, Flags, Enumerations & Paired Docs)**:
    - Verify every file path, directory, skill name, class/function/method name, CLI flag, build target, and commit/CL/bug ID mentioned in the text.
    - Distinguish between paths explicitly proposed as *new* vs. paths claimed to exist *today*. Every path or identifier claimed to exist today must match the repository character-for-character.
+   - **Exhaustive Enumeration Check ("What is Missing?")**: When a table, list, or section claims to enumerate all items in a directory, CLI, or category (e.g., skills, rules, subcommands, flags, pipeline phases, or mapped files), run `ls` or read the parser/definition to verify no actual item in the codebase was omitted.
+   - **Paired Doc & Metadata Sync**: Verify that changes to a skill, rule, CLI, or watermark SHA are symmetrically updated in paired locations (e.g., YAML frontmatter `description` vs. body, `README.md` indexes, or `.agents/skills/` mirrors).
 
-2. **Mechanism & Contract Claims (`file:line` Verification)**:
+2. **Mechanism, Contract & Dropped-Caveat Audit (`file:line` & `git diff`)**:
    - Extract every technical claim about how a tool, parser, build system, or runtime behaves (e.g., "X only discovers Y", "entries[].path must point to a parent directory", "all tests live in tests/").
    - Locate the actual implementation (`file:line`) in the codebase. Flag any claim that contradicts the implementation or omits a critical branch/exception.
+   - **Dropped Caveats & Historical Regressions (`-` Lines)**: When auditing an edit or rewrite of an existing tracked document/skill/rule, run `git diff HEAD -- <doc>` (and `git log -p -n 3 -- <doc>` on removed sections) to verify that no load-bearing invariant, exception, watermark SHA, or safety constraint was silently deleted during editing or summarization.
 
 3. **Internal Content Self-Consistency (Logic, Terminology, & Numbers)**:
    - **Proposals vs. Caveats**: Check whether the architecture, defaults, or action items proposed in one section rely on components, paths, or assumptions that another section of the same document admits are broken, missing, external, or unsupported.

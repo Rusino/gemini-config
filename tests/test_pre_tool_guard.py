@@ -320,6 +320,96 @@ class TestPreToolGuard(unittest.TestCase):
       self.assertEqual(out.get("decision"), "deny")
       self.assertIn("child-9", out["reason"])
 
+  def test_batch_workflow_requires_advanced_verify(self):
+    unverified_script = (
+        'res = await parallel(\n'
+        '    items, lambda x: agent(f"Port {x}", {"type": "string"})\n'
+        ')\n'
+        "print(res)\n"
+    )
+    out = self.run_guard({
+        "conversationId": "c1",
+        "toolCall": {
+            "name": "run_workflow",
+            "args": {"Script": unverified_script},
+        },
+    })
+    self.assertEqual(out.get("decision"), "deny")
+    self.assertIn("BATCH-VERIFY GUARD", out.get("reason", ""))
+
+    verified_script = (
+        "from advanced import parallel, verify\n"
+        'res = await parallel(\n'
+        '    items, lambda x: agent(f"Port {x}", {"type": "string"})\n'
+        ')\n'
+        'verdict = await verify(res, "All items ported and tested")\n'
+    )
+    out_ok = self.run_guard({
+        "conversationId": "c1",
+        "toolCall": {
+            "name": "run_workflow",
+            "args": {"Script": verified_script},
+        },
+    })
+    self.assertEqual(out_ok.get("decision"), "allow")
+
+    opt_out_script = "# no-verify\n" + unverified_script
+    out_opt = self.run_guard({
+        "conversationId": "c1",
+        "toolCall": {
+            "name": "run_workflow",
+            "args": {"Script": opt_out_script},
+        },
+    })
+    self.assertEqual(out_opt.get("decision"), "allow")
+
+    tool_only_script = (
+        'res = await parallel(\n'
+        '    files, lambda f: call_tool("read_file", Path=f)\n'
+        ')\n'
+    )
+    out_tool = self.run_guard({
+        "conversationId": "c1",
+        "toolCall": {
+            "name": "run_workflow",
+            "args": {"Script": tool_only_script},
+        },
+    })
+    self.assertEqual(out_tool.get("decision"), "allow")
+
+    # Prompt string literals mentioning `parallel(` or `verify(` must not
+    # trigger false positives or mask missing `verify()` calls
+    single_agent_mentioning_parallel = (
+        'res = await agent("Check parallel(items, fn) usage", {"type": "string"})\n'
+    )
+    self.assertEqual(
+        self.run_guard({
+            "conversationId": "c1",
+            "toolCall": {
+                "name": "run_workflow",
+                "args": {"Script": single_agent_mentioning_parallel},
+            },
+        }).get("decision"),
+        "allow",
+    )
+
+    batch_mentioning_verify_in_prompt = (
+        'res = await parallel(\n'
+        '    items, lambda x: agent("Run verify(x) #1", {"type": "string"})\n'
+        ')\n'
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".py") as f_script:
+      f_script.write(batch_mentioning_verify_in_prompt)
+      f_script.flush()
+      out_path = self.run_guard({
+          "conversationId": "c1",
+          "toolCall": {
+              "name": "run_workflow",
+              "args": {"ScriptPath": f_script.name},
+          },
+      })
+      self.assertEqual(out_path.get("decision"), "deny")
+
 
 if __name__ == "__main__":
   unittest.main()

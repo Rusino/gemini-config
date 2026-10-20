@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PreToolUse hook for Jetski to prevent hallucinations, blind edits, and broken handoffs.
 
-Implements five mechanical guards:
+Implements six mechanical guards:
 1. Handoff Command & Post-Handoff Guard:
    - Blocks any file edits or duplicate `new-conversation` calls in a conversation
      that has already handed off in the current turn.
@@ -27,6 +27,10 @@ Implements five mechanical guards:
 5. Roadmap Guard:
    - Blocks direct file edits under the roadmaps dir except the conversation's
      own `state/<conversationId>.md`; roadmap changes go through `roadmap.py`.
+6. Batch Workflow Verification Guard:
+   - Blocks `run_workflow` scripts that fan out over multiple agents (`parallel` or
+     `pipeline` with `agent(...)`) without gating results via `advanced.verify`
+     (unless explicitly marked `# no-verify` for read-only discovery).
 """
 
 # Every gated tool call of every chat runs this file, including the calls that
@@ -34,6 +38,7 @@ Implements five mechanical guards:
 # only fails open): make each edit self-contained or mv a finished copy into
 # place (it must stay executable), then run tests/run_all_tests.py
 
+import ast
 import glob
 import json
 import os
@@ -835,6 +840,53 @@ def main() -> None:
               )
           )
           return
+
+  # Batch agent workflows (`parallel`/`pipeline` + `agent`) must gate outputs via
+  # `advanced.verify` unless explicitly marked `# no-verify` for read-only discovery
+  if tool_name == "run_workflow":
+    script = str(tool_args.get("Script", "") or "")
+    script_path = os.path.expanduser(str(tool_args.get("ScriptPath", "") or "").strip())
+    if not script and script_path and os.path.isfile(script_path):
+      try:
+        with open(script_path, "r", encoding="utf-8", errors="ignore") as f:
+          script = f.read()
+      except OSError:
+        script = ""
+    if script and not re.search(r"#\s*no-verify\b", script, re.IGNORECASE):
+      try:
+        tree = ast.parse(script)
+        called = {
+            node.func.id
+            if isinstance(node.func, ast.Name)
+            else node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, (ast.Name, ast.Attribute))
+        }
+        has_batch = bool(called & {"parallel", "pipeline"})
+        has_agent = "agent" in called
+        has_verify = "verify" in called
+      except SyntaxError:
+        code_only = re.sub(r"#[^\n]*", "", script)
+        has_batch = bool(re.search(r"\b(?:parallel|pipeline)\s*\(", code_only))
+        has_agent = bool(re.search(r"\bagent\s*\(", code_only))
+        has_verify = bool(re.search(r"\bverify\s*\(", code_only))
+      if has_batch and has_agent and not has_verify:
+        print(
+            json.dumps(
+                {
+                    "decision": "deny",
+                    "reason": (
+                        "[BATCH-VERIFY GUARD] Batch agent workflows (`parallel`/`pipeline` "
+                        "with `agent(...)`) must gate worker or batch output with "
+                        "`from advanced import verify` (`await verify(result, criteria)`), "
+                        "or include `# no-verify` for pure read-only discovery fan-outs."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
 
   print('{"decision": "allow"}')
 

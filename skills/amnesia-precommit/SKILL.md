@@ -3,10 +3,11 @@ name: amnesia-precommit
 description: >-
   Token-efficient pre-commit pipeline for Skia, SkParagraph, WebParagraph, and Flutter changes.
   Combines (1) deterministic mechanical pruning (comment & anti-slop rules), (2) a single
-  clean-context subagent pass to minimize diff size (revert drive-bys, golf logic) and check
-  KEEPER invariants without chat history bias, and (3) a hostile TDD filter to validate
-  reported bugs before rebuilding. Trigger when the user asks to "подготовь к коммиту",
-  "минимизируй дифф", "проверь перед пушем", "сделай амнезия-ревью", or "run amnesia precommit".
+  clean-context subagent pass to minimize diff size (revert drive-bys, golf logic), verify dropped
+  guards via git log/blame, check pattern completeness across callers/backends, and enforce KEEPER
+  invariants without chat history bias, and (3) a hostile TDD filter to validate reported bugs
+  before rebuilding. Trigger when the user asks to "подготовь к коммиту", "минимизируй дифф",
+  "проверь перед пушем", "сделай амнезия-ревью", or "run amnesia precommit".
 ---
 
 # Amnesia Pre-Commit & Diff Minimizer (`amnesia-precommit`)
@@ -69,17 +70,19 @@ Intended Task Goal:
 
 Instructions:
 1. Run `git diff HEAD` (or inspect the target commit) in `<repo_path>`.
-2. Evaluate the diff across three strict axes:
+2. Evaluate the diff across six strict axes:
    - **Scope (Drive-By Pruning)**: Identify any hunk, file, formatting change, or refactor that is not strictly required to achieve the Intended Task Goal.
    - **Size (Diff Golfing)**: Identify overly verbose logic, redundant local variables, speculative helpers (YAGNI), or duplicate branches that can be expressed in fewer lines while preserving exact behavior and ABI.
+   - **Dropped Guards & Historical Regressions (`-` Lines)**: For every deleted or simplified condition, branch, early return, or fallback (`-` lines in `git diff`, or any reduction you propose under Diff Golfing), run `git log -S "<symbol_or_expr>" -p -n 3` or `git log -L <start>,<end>:<file>` to verify the removed guard was not previously introduced to fix a specific bug or edge case.
+   - **Pattern Completeness ("What is Missing from the Diff?")**: Inspect full modified files and run `git grep` or `code_search` on modified functions, structs, enums, and flags to check all callers, paired backends, and symmetrical code paths (e.g., `SkParagraph` vs. `WebParagraph`, ICU vs. Apple/Client `SkUnicode`, `layout` vs. `paint` / `getRectsForRange`, serialization read vs. write, header declarations vs. all implementations). Flag any sibling site that was forgotten.
    - **Correctness & KEEPER Invariants**: Check against C++ Systems Invariants (`cpp_systems_invariants.md`), Text Domain Invariants (`text_domain_invariants.md`), and Code Style (`code_style.md`) — specifically zero-allocation hot paths, loop guards, fail-fast `SkASSERT` over defensive `if (!ptr) return;`, and cross-layer consistency.
-   - **Pre-Review Grill (Skeptical Reviewer's First Question)**: Identify if any hunk introduces an non-obvious contract change, subtle tradeoff, or "Why didn't you do X instead?" question that a skeptical Gerrit/PR reviewer will immediately ask.
+   - **Pre-Review Grill (Skeptical Reviewer's First Question)**: Identify if any hunk introduces a non-obvious contract change, subtle tradeoff, or "Why didn't you do X instead?" question that a skeptical Gerrit/PR reviewer will immediately ask.
 
 Output Format (Strict):
 ### 1. Scope & Size Reductions (Safe to Apply Immediately)
 For each reduction, provide `File:Lines`, why it is unnecessary/verbose, and the exact replacement or `git checkout` action.
 
-### 2. Behavioral / Invariant Defects (Requires Test Validation)
+### 2. Behavioral, Dropped-Guard & Pattern-Completeness Defects (Requires Test Validation)
 For each suspected bug:
 - `ID`: B1, B2...
 - `File:Lines`: <path and range>
