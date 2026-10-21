@@ -519,6 +519,53 @@ console.log('ALL_JS_ASSERTIONS_PASSED');
         patcher.SAR_LAUNCHER = orig_launcher
         patcher.os.path.isfile = orig_isfile
 
+  def test_extract_sar_retries_when_binfs_swaps_launcher_hash(self) -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+      uid = os.getuid()
+      old_dir = os.path.join(tmpdir, f"sar.server.{uid}.a16e06")
+      new_dir = os.path.join(tmpdir, f"sar.server.{uid}.5368aa")
+      old_bin = os.path.join(old_dir, patcher.SAR_BIN_RELPATH)
+      new_bin = os.path.join(new_dir, patcher.SAR_BIN_RELPATH)
+      for p in (old_bin, new_bin):
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+          f.write(b"ELF")
+
+      launcher = os.path.join(tmpdir, "server")
+      state_file = os.path.join(tmpdir, "called_once")
+      # First run outputs old_dir and rewrites its own header to point to 5368aa
+      with open(launcher, "w", encoding="utf-8") as f:
+        f.write(
+            "#!/bin/sh\n"
+            '# SHARDIR="${SAR_EXTRACT_DIR}/${STUB}.a16e06"\n'
+            f'if [ ! -f "{state_file}" ]; then\n'
+            f'  touch "{state_file}"\n'
+            f'  echo "Extraction directory: /var/tmp/sar.server.{uid}.a16e06"\n'
+            f'  sed -i "s/a16e06/5368aa/" "{launcher}"\n'
+            "else\n"
+            f'  echo "Extraction directory: /var/tmp/sar.server.{uid}.5368aa"\n'
+            "fi\n"
+        )
+      os.chmod(launcher, 0o755)
+
+      orig_launcher = patcher.SAR_LAUNCHER
+      orig_isfile = patcher.os.path.isfile
+      try:
+        patcher.SAR_LAUNCHER = launcher
+        valid_bins = {
+            f"/var/tmp/sar.server.{uid}.a16e06/{patcher.SAR_BIN_RELPATH}",
+            f"/var/tmp/sar.server.{uid}.5368aa/{patcher.SAR_BIN_RELPATH}",
+        }
+        patcher.os.path.isfile = lambda p: (
+            True if p in valid_bins else orig_isfile(p)
+        )
+        found = patcher.extract_sar_and_find_binaries()
+        for expected in valid_bins:
+          self.assertIn(expected, found)
+      finally:
+        patcher.SAR_LAUNCHER = orig_launcher
+        patcher.os.path.isfile = orig_isfile
+
 
 if __name__ == "__main__":
   unittest.main()

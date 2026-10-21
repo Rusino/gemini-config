@@ -64,35 +64,64 @@ def sync_artifact_js(
   print(f"[OK] Synced {src} -> {dst}")
 
 
+SAR_BIN_RELPATH = (
+    "server_impl.runfiles/google3/third_party/jetski/"
+    "cmd/hub/server/jetski-hub-server"
+)
+
+
+def read_launcher_shardir(
+    launcher_path: str, extract_dir: str
+) -> Optional[str]:
+  # Read the SAR bash header to see which hash binfs currently points to
+  try:
+    with open(launcher_path, "rb") as f:
+      header = f.read(8192).decode("utf-8", errors="ignore")
+  except OSError:
+    return None
+  m = re.search(
+      r'SHARDIR="\$\{SAR_EXTRACT_DIR\}/\$\{STUB\}\.([0-9a-fA-F]+)"', header
+  )
+  if not m:
+    return None
+  stub = f"sar.{os.path.basename(launcher_path)}.{os.getuid()}"
+  return os.path.join(extract_dir, f"{stub}.{m.group(1)}")
+
+
 def extract_sar_and_find_binaries() -> List[str]:
   binaries: List[str] = []
   if os.path.isfile(SAR_LAUNCHER):
     env = dict(os.environ)
     env["SAR_EXTRACT_ONLY"] = "1"
     # Match jetski-hub.service Environment=SAR_EXTRACT_DIR=/var/tmp when run manually
-    env.setdefault("SAR_EXTRACT_DIR", "/var/tmp")
-    res = subprocess.run(
-        [SAR_LAUNCHER],
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    out = (res.stdout or "") + "\n" + (res.stderr or "")
-    for m in re.finditer(r"((?:/var)?/tmp/sar\.server\.[^\s]+)", out):
-      shardir = m.group(1).rstrip(".")
-      candidate = os.path.join(
-          shardir,
-          "server_impl.runfiles/google3/third_party/jetski/cmd/hub/server/jetski-hub-server",
+    extract_dir = env.setdefault("SAR_EXTRACT_DIR", "/var/tmp")
+
+    # binfs refreshes stale release symlinks asynchronously on first open, so
+    # re-check the launcher header after extraction and repeat if the hash changed
+    for _ in range(3):
+      res = subprocess.run(
+          [SAR_LAUNCHER],
+          env=env,
+          capture_output=True,
+          text=True,
+          check=False,
       )
-      if os.path.isfile(candidate) and candidate not in binaries:
-        binaries.append(candidate)
+      out = (res.stdout or "") + "\n" + (res.stderr or "")
+      for m in re.finditer(r"((?:/var)?/tmp/sar\.server\.[^\s]+)", out):
+        shardir = m.group(1).rstrip(".")
+        candidate = os.path.join(shardir, SAR_BIN_RELPATH)
+        if os.path.isfile(candidate) and candidate not in binaries:
+          binaries.append(candidate)
+
+      current_shardir = read_launcher_shardir(SAR_LAUNCHER, extract_dir)
+      if not current_shardir:
+        break
+      expected_bin = os.path.join(current_shardir, SAR_BIN_RELPATH)
+      if expected_bin in binaries:
+        break
 
   for root in ("/var/tmp", "/tmp"):
-    pattern = (
-        f"{root}/sar.server.*/server_impl.runfiles/"
-        "google3/third_party/jetski/cmd/hub/server/jetski-hub-server"
-    )
+    pattern = f"{root}/sar.server.*/{SAR_BIN_RELPATH}"
     for candidate in sorted(glob.glob(pattern)):
       if candidate not in binaries:
         binaries.append(candidate)
