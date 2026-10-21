@@ -38,9 +38,9 @@ Before spawning an agent, clean up mechanical violations locally in the working 
    ```
    Record the initial changed line count (`added + deleted`) as the baseline for minimization.
 
-2. **Run Comment, Anti-Slop, & Repo Presubmit Audits**:
+2. **Run Comment, Anti-Slop, Public CL Hygiene, & Repo Presubmit Audits**:
    ```bash
-   python3 ~/.gemini/config/skills/code-comments/scripts/audit_comments.py --diff HEAD --repo .
+   python3 ~/.gemini/config/skills/code-comments/scripts/audit_comments.py --diff HEAD --repo . --check-cl-hygiene
    python3 ~/.gemini/config/skills/ruthless-code-audit/scripts/ruthless_audit.py . --repo . --diff HEAD
    # If the repository has a PRESUBMIT.py (e.g., Skia), always run git cl presubmit:
    if [ -f PRESUBMIT.py ]; then SKIP_GCE_AUTH_FOR_GIT=1 git cl presubmit --force; fi
@@ -48,6 +48,7 @@ Before spawning an agent, clean up mechanical violations locally in the working 
 
 3. **Apply Mechanical Fixes**:
    - Fix trailing periods, missing "why" comments on non-trivial 1-line changes, and line length violations (`<= 100` cols).
+   - Strip leaked internal corporate markers (`go/`, `goto.google.com`, `cl/`, `cr/`, depot/CitC paths, machine-local home paths, `sponge`, `critique`), code-comment `b/<id>` references (replace with public tracker IDs such as `crbug.com/` or `skia:`), and malformed Gerrit `Change-Id` lines (must be `I` + 40 lowercase hex chars).
    - Strip leftover debug prints, anonymous `TODO`s without `KEEPER-DEBT`, and uncalled helpers.
    - Format modified lines only: `git clang-format` (or `dart format` for Dart files).
 
@@ -123,13 +124,18 @@ For each candidate defect:
 
 ---
 
-### Phase 4: Single Verification Pass & Summary
+### Phase 4: Single Verification Pass, Tree-Pinned Rebase & Summary
 
 1. **Run the Relevant Test Suite Once**:
    - **Skia (`SkParagraph`)**: Build and run `dm --match Paragraph` (or use `skia-test-paragraph`).
    - **Flutter Engine / WebParagraph**: Run the targeted `felt` or `flutter test` target (or use `flutter-test-paragraph-engine` / `webparagraph-corpus`).
 
-2. **Report Minimization & Audit Telemetry in Chat**:
+2. **Tree-Pinned 3-Way Rebase & Attestation Invalidation (Pre-Upload Gate)**:
+   - **Commit at the Verified Base SHA**: Never move changes across branches, worktrees, or checkouts via raw `git diff | git apply`, `--recount`, or `git stash pop` onto a drifted `HEAD`. Always commit the verified diff at the exact `base_commit_sha` where tests passed, then transfer or update using true 3-way Git mechanics (`git rebase` or `git cherry-pick`).
+   - **Invalidate Attestation on Upstream Overlap**: If the branch is rebased onto a newer `origin/main` after verification, check `git diff --name-only ORIG_HEAD..HEAD`. If any upstream change overlaps the modified subsystem or its dependencies, treat the prior test run as invalidated and re-run the test target once on the rebased tree before `git cl upload`.
+   - **Final Commit Message Audit**: Before uploading, verify the commit message with `audit_comments.py --commit-msg <(git log -1 --format=%B HEAD)` to confirm zero internal leaks, a valid 40-hex `Change-Id`, and the `Assisted-by:` trailer.
+
+3. **Report Minimization & Audit Telemetry in Chat**:
    Output a concise summary directly in chat (no extra artifact files):
    - **Diff Size**: `Before: <N> lines (+A / -D) -> After: <M> lines (+A' / -D') (<X>% of original)`
    - **Pruned Scope/Bloat**: Brief list of reverted drive-bys or simplified blocks.

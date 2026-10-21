@@ -88,10 +88,13 @@ Even if a change touches **only a single line** (1 line added, modified, or dele
 - **File mode** (when the user specifies files/directories):
   Inspect the target files directly.
 
-Run [`audit_comments.py`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/code-comments/scripts/audit_comments.py) to list mechanical violations and all uncommented diff hunks (including 1-line additions, modifications, and deletions):
+Run [`audit_comments.py`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/code-comments/scripts/audit_comments.py) to list mechanical violations, public CL hygiene leaks (`go/`, `b/`, `cl/`, `//depot/`, local paths, malformed 40-hex `Change-Id`), and all uncommented diff hunks (including 1-line additions, modifications, and deletions):
 ```bash
-# Audit uncommitted diff against HEAD (or pass --diff origin/master)
-python3 ~/.gemini/config/skills/code-comments/scripts/audit_comments.py --diff HEAD --repo <repo_path>
+# Audit uncommitted diff against HEAD (public CL hygiene is auto-enabled outside ~/.gemini)
+python3 ~/.gemini/config/skills/code-comments/scripts/audit_comments.py --diff HEAD --repo <repo_path> --check-cl-hygiene
+
+# Audit a commit message file for public Gerrit/PR hygiene
+python3 ~/.gemini/config/skills/code-comments/scripts/audit_comments.py --commit-msg <commit_msg_file>
 
 # Audit specific files
 python3 ~/.gemini/config/skills/code-comments/scripts/audit_comments.py <file1> <file2>

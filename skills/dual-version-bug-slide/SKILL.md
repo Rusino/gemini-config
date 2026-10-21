@@ -48,6 +48,10 @@ Transform bug reports into verifiable regression tests and interactive dual-engi
      2. `Candidate Version (New Engine):` architectural mechanism resolving the issue.
      3. `Architectural Invariant:` fundamental property preserved by the contract.
 
+7. **Public Artifact & Visual Proof Hygiene:**
+   - Rendered slide titles, subtitles, cards, code comments, and catalog artifacts (`slides_gallery.html`, `DualEngine_Typography_Bugs_Carousel.md`) must be safe to attach to public Gerrit CLs, GitHub PRs, and external issue trackers.
+   - Never embed internal corporate shortlinks (`go/`, `goto.google.com`, `cl/`, `cr/`, `sponge`, `critique`), non-public `b/<id>` bug numbers, internal depot/CitC paths, or machine-local home paths in visible slide text or metadata. Always use public issue identifiers (`FLUTTER ISSUE <id>`, `crbug.com/<id>`, `skia:<id>`) or short commit SHAs.
+
 ---
 
 ## 2. Phased Workflow
