@@ -193,6 +193,10 @@ function matches(el, selector) {
   if (selector === '[data-testid="titlebar-more-actions"]') {
     return el.getAttribute('data-testid') === 'titlebar-more-actions';
   }
+  // Match OverviewPanelHost containers when resolving active pane conversation IDs
+  if (selector === '[data-testid="overview-panel-host"]') {
+    return el.getAttribute('data-testid') === 'overview-panel-host';
+  }
   if (selector === '[data-testid="conversation-pin-button"]') {
     return el.getAttribute('data-testid') === 'conversation-pin-button';
   }
@@ -300,6 +304,12 @@ const storeState = {
   trajectorySummaries: {
     summaries: { ...initialSummaries },
   },
+  // Seed an open Overview Panel entry to verify syncOverviewPanelClosed flips it to false
+  auxPaneV2: {
+    overviewPanelOpen: {
+      'open-root': true,
+    },
+  },
 };
 
 const subscribers = [];
@@ -308,6 +318,29 @@ const reduxStore = {
     return storeState;
   },
   dispatch(action) {
+    // Mirror auxPaneV2Slice.setOverviewPanelOpen reducer in the test harness
+    if (action?.type === 'auxPaneV2/setOverviewPanelOpen') {
+      const { cascadeId, open } = action.payload || {};
+      // Record per-conversation open state when cascadeId is present
+      if (cascadeId) {
+        storeState.auxPaneV2.overviewPanelOpen = {
+          ...(storeState.auxPaneV2.overviewPanelOpen || {}),
+          [cascadeId]: open,
+        };
+      }
+      return action;
+    }
+    // Mirror auxPaneV2Slice.restorePersistedPanes reducer in the test harness
+    if (action?.type === 'auxPaneV2/restorePersistedPanes') {
+      // Merge persisted overviewPanelOpen map under existing in-memory choices
+      if (action.payload?.overviewPanelOpen) {
+        storeState.auxPaneV2.overviewPanelOpen = {
+          ...(action.payload.overviewPanelOpen || {}),
+          ...(storeState.auxPaneV2.overviewPanelOpen || {}),
+        };
+      }
+      return action;
+    }
     if (action?.type === 'trajectorySummaries/applyStreamBatch') {
       const next = { ...storeState.trajectorySummaries.summaries };
       for (const [id, s] of (action.payload?.updates || [])) {
@@ -425,6 +458,23 @@ assert.strictEqual(emptyProjSpan.textContent, 'No active chats (3 hidden)');
 assertHidden(CLOSED_SCOPE_HIDDEN, true);
 assertHidden(['solo-active', 'open-root', 'open-step', 'open-current', 'quoted-title'], false);
 assert.strictEqual(storeState.trajectorySummaries.summaries['closed-solo'].annotations.archived, false);
+
+// Overview Panel stays closed in Redux for active chats and resists open/restore actions
+assert.strictEqual(storeState.auxPaneV2.overviewPanelOpen['open-root'], false);
+assert.strictEqual(storeState.auxPaneV2.overviewPanelOpen['open-current'], false);
+reduxStore.dispatch({
+  type: 'auxPaneV2/setOverviewPanelOpen',
+  payload: { cascadeId: 'solo-active', open: true },
+});
+assert.strictEqual(storeState.auxPaneV2.overviewPanelOpen['solo-active'], false);
+reduxStore.dispatch({
+  type: 'auxPaneV2/restorePersistedPanes',
+  payload: { overviewPanelOpen: { 'restored-chat': true } },
+});
+assert.strictEqual(storeState.auxPaneV2.overviewPanelOpen['restored-chat'], false);
+const injectedStyle = global.document.getElementById('jetski-closed-chats-filter-style');
+assert(injectedStyle.textContent.includes('[data-testid="overview-panel-host-gutter"]'));
+assert(injectedStyle.textContent.includes('--overview-panel-reserve: 0px !important;'));
 
 // Hover bubble in Filter ON (closed) state
 btn.dispatchEvent('mouseenter');

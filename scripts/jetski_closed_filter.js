@@ -66,6 +66,9 @@
   // Tracks conversations whose hideFromConversationList flag we flipped in Redux
   // so we never unhide conversations that were natively hidden by their source
   const managedHiddenIds = new Map();
+  // Tracks cascadeIds where auxPaneV2/setOverviewPanelOpen was dispatched so stores
+  // without the auxPaneV2 reducer never re-dispatch in a loop
+  const overviewCloseDispatchedIds = new Set();
   let hiddenCountsByProject = new Map();
   let totalClosedCount = 0;
   let breakdownStats = emptyBreakdown();
@@ -536,6 +539,38 @@
     // without flickering into the sidebar index on server stream ticks
     const origDispatch = store.dispatch;
     store.dispatch = function patchedDispatch(action) {
+      // Rewrite any open request so keyboard shortcuts or UI triggers cannot open the panel
+      if (
+        action?.type === 'auxPaneV2/setOverviewPanelOpen' &&
+        action.payload?.open !== false
+      ) {
+        return origDispatch.call(this, {
+          ...action,
+          payload: {
+            ...action.payload,
+            open: false,
+          },
+        });
+      }
+      // Sanitize hydrated session storage so persisted open flags never restore the panel
+      if (
+        action?.type === 'auxPaneV2/restorePersistedPanes' &&
+        action.payload?.overviewPanelOpen &&
+        typeof action.payload.overviewPanelOpen === 'object'
+      ) {
+        const closedMap = {};
+        // Force every persisted conversation entry to false before the reducer merges it
+        for (const k of Object.keys(action.payload.overviewPanelOpen)) {
+          closedMap[k] = false;
+        }
+        return origDispatch.call(this, {
+          ...action,
+          payload: {
+            ...action.payload,
+            overviewPanelOpen: closedMap,
+          },
+        });
+      }
       if (
         !isInternalDispatch &&
         action?.type === 'trajectorySummaries/applyStreamBatch' &&
@@ -585,9 +620,78 @@
     });
   }
 
+  // Forces the floating Overview Panel closed in Redux for all active conversations
+  function syncOverviewPanelClosed(store) {
+    const state = store?.getState();
+    // Skip stores that have not initialized the auxPaneV2 slice
+    if (!state?.auxPaneV2) return;
+
+    const openMap = state.auxPaneV2.overviewPanelOpen || {};
+    const targetIds = new Set();
+
+    // Queue any conversation that already has an explicit open flag in Redux
+    for (const [cid, isOpen] of Object.entries(openMap)) {
+      // Unset or true entries default to open in useOverviewPanelOpen
+      if (isOpen !== false) {
+        targetIds.add(cid);
+      }
+    }
+
+    const activeCandidates = [
+      state.conversation?.cascadeId,
+      state.conversation?.convoState?.cascadeId,
+      state.multiConvoLayout?.focusedPaneId,
+    ];
+    const path = window.location?.pathname || '';
+    const m = /\/(?:c|cascade|conversation)\/([a-zA-Z0-9_-]+)/.exec(path);
+    // Include the routed conversation ID before Redux conversation state settles
+    if (m && m[1]) {
+      activeCandidates.push(m[1]);
+    }
+    // Include split-pane conversations discovered from mounted host or titlebar nodes
+    for (const el of document.querySelectorAll(
+      '[data-testid="overview-panel-host"], [data-testid="titlebar-more-actions"]'
+    )) {
+      const cid = findCascadeIdFromElement(el);
+      // Only add resolved non-empty conversation IDs
+      if (cid) activeCandidates.push(cid);
+    }
+
+    // useOverviewPanelOpen defaults missing map keys to true, so explicitly write false
+    for (const cid of activeCandidates) {
+      // Skip conversations already recorded as false in overviewPanelOpen
+      if (typeof cid === 'string' && cid.length > 0 && openMap[cid] !== false) {
+        // Avoid infinite dispatch loops on mock stores without an auxPaneV2 reducer
+        if (!overviewCloseDispatchedIds.has(cid) || openMap[cid] === true) {
+          targetIds.add(cid);
+        }
+      }
+    }
+
+    // Nothing to dispatch when all active conversations are already marked closed
+    if (targetIds.size === 0) return;
+
+    isInternalDispatch = true;
+    try {
+      // Dispatch explicit false per conversation so OverviewPanelHost unmounts the panel
+      for (const cid of targetIds) {
+        overviewCloseDispatchedIds.add(cid);
+        store.dispatch({
+          type: 'auxPaneV2/setOverviewPanelOpen',
+          payload: { cascadeId: cid, open: false },
+        });
+      }
+    } finally {
+      isInternalDispatch = false;
+    }
+  }
+
   function syncReduxFilter() {
     const store = findReduxStore();
     if (!store) return false;
+
+    // Keep the floating Overview Panel closed whenever Redux state syncs
+    syncOverviewPanelClosed(store);
 
     const summariesMap = store.getState()?.trajectorySummaries?.summaries;
     if (!summariesMap) return false;
@@ -669,6 +773,20 @@
         overflow: hidden !important;
         pointer-events: none !important;
         visibility: hidden !important;
+      }
+      /* Hide the floating Overview Panel and zero its chat width reserve on first paint */
+      [data-testid="overview-panel-host-sibling"],
+      [data-testid="overview-panel-host-gutter"],
+      [data-testid="overview-panel-host-overlay"],
+      [data-testid="overview-panel-overlay-backdrop"],
+      [data-testid="overview-panel-dropdown-popover"],
+      [data-testid="battle-overview-dropdown"],
+      [data-testid="toggle-overview-panel"] {
+        display: none !important;
+      }
+      [data-testid="overview-panel-host"] {
+        --overview-panel-reserve: 0px !important;
+        --overview-panel-gutter-reserve: 0px !important;
       }
       .${BUTTON_CLASS} {
         display: inline-flex;
