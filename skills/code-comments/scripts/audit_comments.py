@@ -182,6 +182,9 @@ def parse_git_diff(repo_path, diff_ref):
   hunk_added = []
   hunk_deleted = []
 
+  branch_re = re.compile(r"^\s*(?:if|else\s+if|while|for|switch|case)\b")
+  test_file_re = re.compile(r"(?:^|/)(?:test|tests|testing)/|(?:\.|_)(?:test|unittest|tests)\.")
+
   def flush_hunk():
     nonlocal hunk_added, hunk_deleted
     if not cur_file or (not hunk_added and not hunk_deleted):
@@ -191,6 +194,27 @@ def parse_git_diff(repo_path, diff_ref):
     deleted_code = [l.strip() for l in hunk_deleted if l.strip() and not COMMENT_RE.match(l)]
     if (added_code or deleted_code) and not has_new_comment:
       uncommented_hunks.append((cur_file, hunk_start, added_code, deleted_code))
+    elif has_new_comment and not test_file_re.search(cur_file):
+      # A method-header comment describes only the method contract and does not substitute for
+      # targeted comments on internal control-flow branches inside the body
+      first_brace_idx = next(
+          (i for i, l in enumerate(hunk_added) if not COMMENT_RE.match(l) and "{" in l),
+          None,
+      )
+      if first_brace_idx is not None:
+        body_lines = hunk_added[first_brace_idx + 1 :]
+        body_branches = [
+            l.strip() for l in body_lines if not COMMENT_RE.match(l) and branch_re.match(l)
+        ]
+        has_body_comment = any(COMMENT_RE.match(l) for l in body_lines)
+        if len(body_branches) >= 2 and not has_body_comment:
+          tag = f"[HEADER_ONLY: {len(body_branches)} uncommented branches inside body]"
+          uncommented_hunks.append((
+              cur_file,
+              hunk_start + first_brace_idx + 1,
+              [tag] + body_branches,
+              [],
+          ))
     hunk_added = []
     hunk_deleted = []
 

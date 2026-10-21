@@ -21,9 +21,10 @@ Curate code comments so that every remaining or newly added comment earns its pl
    - Allow **2–4 lines** for nuanced domain mechanics or multi-part invariants.
    - **Periods (`.`)**: Allowed *between* sentences inside a multi-line comment block, **strictly forbidden at the very end** of a single-line comment or at the end of the last line of a comment block.
    - **Dart exception**: In `.dart` files the rule is inverted — every `//` and `///` comment **must** end with a period (Effective Dart, enforced by flutter/flutter review bots). `audit_comments.py` switches modes automatically by file extension.
-3. **Targeted Placement (No Umbrella Comment Blocks)**:
-   - Place short, focused comments **immediately above the specific line, branch, `switch` arm, or field** they explain.
-   - **Never** dump a single multi-sentence "umbrella" block at the top of a method, diff hunk, or `switch` statement to summarize multiple changes below while leaving the individual branches, conditions, or fields uncommented.
+3. **Method Header vs. Targeted Branch Placement (No Umbrella Substitutes)**:
+   - **Above a method/function header**: Place a concise comment (1–2 lines) describing the method's role or contract as a whole — **without** narrating internal implementation details, loops, or branches.
+   - **Inside the method body**: Place short, focused comments **immediately above each specific non-trivial branch, condition, `switch` arm, or loop** explaining why that branch/invariant exists.
+   - **Never** use a header comment above a method, diff hunk, or `switch` statement as an "umbrella" substitute that leaves internal branches uncommented (`audit_comments.py` flags `[HEADER_ONLY]` when a multi-branch method body has a comment only above its signature).
 4. **No Slop / No Formatting Noise**:
    - No numbered tutorial steps (`// 1. Setup`, `// 2. Run`).
    - No markdown emphasis (`*word*`, `**word**`) or ASCII dividers (`// ---`, `// ===`).

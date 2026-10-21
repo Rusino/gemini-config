@@ -11,7 +11,7 @@ description: "Skia-style C++ minimalism and suppression of LLM coding reflexes."
 - **Never restate syntax**: Do not write comments that describe *what* the next line of code does (e.g., `// Populate the cache`, `// Check for null`, `// Increment counter`)
 - **No tutorial markers**: Never use numbered step comments (`// 1. Setup`, `// 2. Execute`) or markdown emphasis (`*word*`, `--`) in code comments
 - **Why over What (Timeless Invariants)**: Write comments only to state non-obvious domain invariants, contracts, hardware/API quirks, or why a check/call must not happen here (never diff-style `// Removed...` or `// Fixed...`). Even a 1-line non-trivial addition, modification, or deletion must get a comment explaining why
-- **Targeted placement (No Umbrella Blocks)**: Place short, focused comments directly above each specific branch, condition, field, or expression they explain. Never dump a multi-sentence summary block at the top of a hunk, method, or `switch` that leaves individual branches or lines below uncommented
+- **Method Header vs. Targeted Branch Placement (No Umbrella Blocks)**: Above a method signature, write a concise comment describing the method's contract/purpose without implementation details; inside the body, place short, focused comments directly above each non-trivial branch, condition, loop, or field. Never use a multi-sentence summary block at the top of a method, hunk, or `switch` as a substitute for commenting the branches inside
 - **Comment ownership**: Only rewrite or delete comments that you (the AI) added and explicitly remember adding; always ask before modifying or removing any pre-existing or user-written comment
 
 ## 2. Zero Speculative API Surface (Strict YAGNI)
