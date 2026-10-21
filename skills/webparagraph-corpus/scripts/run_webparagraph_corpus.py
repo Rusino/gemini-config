@@ -84,6 +84,8 @@ def log(msg, driver_log=None):
 
 def find_ninja(repo):
     candidates = [
+        # Flutter monorepo places the standalone binary under the repo root, not engine/src/flutter
+        repo / "third_party/ninja/ninja",
         repo / "engine/src/flutter/third_party/ninja/ninja",
         pathlib.Path.home() / ".gemini/jetski/scratch/depot_tools/ninja",
         shutil.which("ninja"),
