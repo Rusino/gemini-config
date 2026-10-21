@@ -23,3 +23,6 @@ plugins/browser
 plugins/cloudtop-use
 plugins/google_chat
 plugins/google_docs
+
+# Machine-local rules (personal aliases)
+rules/local_aliases.md
