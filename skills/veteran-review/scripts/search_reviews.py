@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Fast, zero-dependency search tool for Ben Wagner's (bungeman@google.com) code review corpus.
-Searches data/bungeman_reviews.jsonl and returns relevant historical review precedents.
+Fast, zero-dependency search tool for the veteran reviewer's code review corpus.
+Searches data/reviews.jsonl and returns relevant historical review precedents.
 """
 
 import argparse
@@ -14,7 +14,7 @@ import sys
 DEFAULT_DB_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "data",
-    "bungeman_reviews.jsonl"
+    "reviews.jsonl"
 )
 
 
@@ -133,7 +133,7 @@ def search(records, files=None, keywords=None, subsystem="all", reviews_only=Tru
 
 def format_markdown(results):
     if not results:
-        return "No matching Bungeman comments found."
+        return "No matching veteran comments found."
 
     lines = []
     for r in results:
@@ -160,7 +160,7 @@ def format_markdown(results):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Search Ben Wagner's (bungeman@google.com) code review corpus from Skia Gerrit."
+        description="Search the veteran reviewer's code review corpus from Skia Gerrit."
     )
     parser.add_argument(
         "--files", "-f",
@@ -181,7 +181,7 @@ def main():
     parser.add_argument(
         "--include-self",
         action="store_true",
-        help="Include comments Ben made on his own CLs (default searches reviews on others' CLs only)."
+        help="Include comments the reviewer made on their own CLs (default searches reviews on others' CLs only)."
     )
     parser.add_argument(
         "--reviews-only",
@@ -203,7 +203,7 @@ def main():
     parser.add_argument(
         "--db",
         default=DEFAULT_DB_PATH,
-        help=f"Path to bungeman_reviews.jsonl (default: {DEFAULT_DB_PATH})."
+        help=f"Path to reviews.jsonl (default: {DEFAULT_DB_PATH})."
     )
 
     args = parser.parse_args()

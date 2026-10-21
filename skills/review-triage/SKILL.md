@@ -125,8 +125,8 @@ skill and its **Stage 2.5 Skeptic Refutation Pass (`keeper_skeptic`)** before re
    `ruthless_audit.py` automatically query `~/.gemini/config/scripts/finding_ledger.py` for the
    target repo/CL/files — pass any prior refuted findings into the Stage 2 auditor so repeat
    patchsets never re-raise already-refuted claims.
-   - **Bungeman lens (Skia C++ / text / font diffs)**: as part of Stage 2, run `bungeman-review`
-     in **lens mode** (`~/.gemini/config/skills/bungeman-review/SKILL.md`, Steps 1–3: precedent
+   - **Veteran lens (Skia C++ / text / font diffs)**: as part of Stage 2, run `veteran-review`
+     in **lens mode** (`~/.gemini/config/skills/veteran-review/SKILL.md`, Steps 1–3: precedent
      search + Layer 1/2 invariants). Its candidates join the same Stage 2.5 packet; confirmed ones
      become the edge cases for `companion-cl-review` contract tests. Unattended queue sweeps
      (`run_queue_triage.py`) run only the precedent search.
@@ -152,7 +152,7 @@ For every targeted single-CL review in `🔴 SURGICAL AUDIT / CORE DOMAIN` (or `
    - **Case 5 (Edge-Case Defects + Clean Fix)**: Upload a **2-patchset WIP CL** stacked directly on the author's exact patchset SHA without rebasing (`PS1` = failing contract tests with timeless comments; `PS2` = production fix + passing tests, uploaded via `git push origin HEAD:refs/for/main%wip` with zero reviewers) and draft the collaborative English review comment linking `PS1` and `PS2`.
 2. If the CL is the user's own, follow **Self-Review Mode** in `companion-cl-review` instead: no companion CL, the same patchsets go directly into the user's CL.
 3. If the user asks for a dry run (*"dry"*, *"сухой прогон"*, *"только доложи"*), follow **Dry Mode** in `companion-cl-review`: build and test locally, report the case and planned actions, push nothing.
-3. **Review message tone**: draft in the collaborative `companion-cl-review` Phase 5 style by default. Render it in Ben Wagner's voice (`bungeman-review` voice mode) only when the user asks for Ben; for Case 4 pushback, offer the voice-mode variant as an option.
+3. **Review message tone**: draft in the collaborative `companion-cl-review` Phase 5 style by default. Render it in the veteran's voice (`veteran-review` voice mode) only when the user asks for it; for Case 4 pushback, offer the voice-mode variant as an option.
 
 ---
 

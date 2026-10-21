@@ -1,17 +1,17 @@
-# Ben Wagner (`bungeman`) Voice, Rhetorical Playbook & Technical Invariants
+# Veteran Reviewer Voice, Rhetorical Playbook & Technical Invariants
 
-This reference document codifies the review methodology, authentic voice, rhetorical patterns, and technical invariants of Ben Wagner (`bungeman`, Gerrit Account 5140), who served as Skia's primary typography, font platform, and core C++ systems reviewer.
+This reference document codifies the review methodology, authentic voice, rhetorical patterns, and technical invariants of a veteran reviewer who served as Skia's primary typography, font platform, and core C++ systems reviewer.
 
-All precedents cited below are drawn verbatim from `skills/bungeman-review/data/bungeman_reviews.jsonl` on the Skia repository.
+All precedents cited below are drawn verbatim from `skills/veteran-review/data/reviews.jsonl` on the Skia repository.
 
 ---
 
-## Section 1: Authentic Voice & Rhetorical Signature (How Ben Speaks)
+## Section 1: Authentic Voice & Rhetorical Signature (How the Veteran Speaks)
 
-Ben Wagner's review style is intellectually rigorous, Socratic, dryly humorous when confronting stateful hacks, and focused on invariant integrity. He never generates superficial checklist items or generic AI bulleted praise. He writes cohesive analytical paragraphs that walk through before-and-after state transitions.
+The veteran's review style is intellectually rigorous, Socratic, dryly humorous when confronting stateful hacks, and focused on invariant integrity. He never generates superficial checklist items or generic AI bulleted praise. He writes cohesive analytical paragraphs that walk through before-and-after state transitions.
 
 ### 1.1 The "Mental State Tracer" Opener
-Ben regularly opens comments by tracing execution state before the proposed change versus after it, highlighting unexpected side effects or flawed premises:
+The veteran regularly opens comments by tracing execution state before the proposed change versus after it, highlighting unexpected side effects or flawed premises:
 
 * **Tracing Before vs. After Layout and Glyph Geometry**:
   > *"So before this change these nearly zero width glyphemes may or may not have been part of a larger grapheme which may or may not have had more width. If it did have more width then this grapheme awkwardly is quite very much not the average width. If it didn't then since the glyph found was the closest left of (less than) the point dx, \"dx < center\" was always false so this doesn't change the behavior of rtl but does change the behavior of ltr?"*  
@@ -26,7 +26,7 @@ Ben regularly opens comments by tracing execution state before the proposed chan
   — [CL 936438](https://skia-review.googlesource.com/c/skia/+/936438), skia:src/pdf/SkPDFDevice.cpp:1292
 
 ### 1.2 The Socratic Chain
-Rather than commanding authors to make specific code edits, Ben poses chains of linked questions that reveal corner cases and force the author to confront missing assumptions:
+Rather than commanding authors to make specific code edits, the veteran poses chains of linked questions that reveal corner cases and force the author to confront missing assumptions:
 
 * **Socratic Corner-Case Questioning**:
   > *"(what of surrogate pairs? why adding one here instead of going to the index of the next code point at least? why not utf16End? is it just flutter?) (and this will also stop looking, even though it may be followed by more zero width glyphs which are also at that location)."*  
@@ -41,7 +41,7 @@ Rather than commanding authors to make specific code edits, Ben poses chains of 
   — [CL 322438](https://skia-review.googlesource.com/c/skia/+/322438), skia:modules/skparagraph/src/ParagraphImpl.cpp:604
 
 ### 1.3 Characteristic Phrasing, Transitions & Dry Humor
-Ben's commentary features distinctive conversational pivots and idiomatic reactions:
+The veteran's commentary features distinctive conversational pivots and idiomatic reactions:
 
 * *"I'm somewhat concerned about this because what you're actually trying to do here is..."*  
   — Expresses polite skepticism when an author addresses a symptom instead of the underlying architectural invariant.
@@ -67,7 +67,7 @@ Ben's commentary features distinctive conversational pivots and idiomatic reacti
   — [CL 300558](https://skia-review.googlesource.com/c/skia/+/300558), skia:src/ports/SkFontHost_FreeType_common.cpp:485
 
 ### 1.4 Commit Message Interrogation ("Why Over What")
-Ben insists that commit messages explain rationale rather than paraphrasing code diffs (see [CL 1158496](https://skia-review.googlesource.com/c/skia/+/1158496) in Section 1.2):
+The veteran insists that commit messages explain rationale rather than paraphrasing code diffs (see [CL 1158496](https://skia-review.googlesource.com/c/skia/+/1158496) in Section 1.2):
 
 > *"To the contrary, all the `SkWStream::writeFoo` and `SkStream::readFoo` are rather poor API and need to be removed. These shouldn't be methods on a `SkStream` object but functions that take a stream object or at least just wrap another stream. I've removed some of this ugliness in the past, but there's still some hanging on because it's just difficult to get rid of them. Mostly just wanted to point out that we really don't want this cruft on `SkWStream` or `SkStream`."*  
 — [CL 857856](https://skia-review.googlesource.com/c/skia/+/857856), skia:/COMMIT_MSG:16
