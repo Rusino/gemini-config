@@ -118,8 +118,8 @@ category except a clear 🟡 REASSIGN) must also go through the
 skill and its **Stage 2.5 Skeptic Refutation Pass (`keeper_skeptic`)** before review drafts are presented:
 1. Fetch the current patchset into a separate worktree (never switch branches in an existing
    checkout): `git fetch https://skia.googlesource.com/skia refs/changes/<NN>/<CL>/<PS>`. If the
-   stored credentials are rejected, fetch anonymously with
-   `git -c credential.helper= -c http.cookiefile=/dev/null fetch ...`.
+   stored credentials are rejected (HTTP 400 "Invalid authentication credentials"), retry with
+   `git -c http.extraheader= -c http.cookiefile= fetch ...`.
 2. Run Stage 1 (`ruthless_audit.py ... --diff <parent>`) and Stage 2 (semantic review of the
    pinpointed hunks against the full file, not just the diff). Both `triage_cl.py` and
    `ruthless_audit.py` automatically query `~/.gemini/config/scripts/finding_ledger.py` for the

@@ -57,7 +57,7 @@ Never upload a companion WIP CL blindly. After auditing the patchset and testing
    git fetch https://skia.googlesource.com/skia refs/changes/<NN>/<CL>/<PS>
    git worktree add -B companion-<CL>-ps<PS> ../companion-<CL>-ps<PS> FETCH_HEAD
    ```
-   *(If stored credentials fail on public Gerrit repos, use `git -c credential.helper= -c http.cookiefile=/dev/null fetch ...`. For GitHub PRs, fetch `pull/<PR>/head`.)*
+   *(If Gerrit rejects the stored credentials with HTTP 400 "Invalid authentication credentials", retry the same fetch or push with `git -c http.extraheader= -c http.cookiefile= fetch|push ...`. For GitHub PRs, fetch `pull/<PR>/head`.)*
 2. **NEVER rebase onto `main`**:
    - The companion CL's parent commit (`parents[0]`) **must** be the exact SHA of the author's current patchset (`FETCH_HEAD`).
    - Rebasing onto `origin/main` before pushing a child CL either rewrites the author's parent CL in Gerrit or breaks the clean single-parent diff between the author's patchset and your companion CL.
@@ -92,6 +92,7 @@ For **Case 3**, **Case 4**, and **Case 5**, commit **only the test file changes*
    Verify with `git diff --cached --name-only` that zero production files are staged in `PS1`.
 2. **Commit with a fresh `Change-Id` and a clear test-only title**:
    - Title format: `[<module>] Add failing <topic> tests` (for Cases 4 & 5) or `[<module>] Add <topic> edge-case tests` (for Case 3).
+   - Keep every companion commit subject within 50 characters; Gerrit warns on longer subjects.
    - Include the `Assisted-by:` trailer (`python3 ~/.gemini/config/hooks/chat_lifecycle.py model --trailer` if available, else `Assisted-by: AI`).
 3. **Upload `PS1` strictly as `WIP` with ZERO reviewers**:
    ```bash
@@ -110,15 +111,20 @@ When **Case 5** applies:
    - Ensure all code comments follow project conventions (concise English rationale explaining *why*, 1–4 lines, no trailing periods in C++, `<= 100` columns).
 2. **Verify all tests pass**:
    - Recompile and run both the new contract tests from `PS1` and the full module test suite to prove zero regressions.
-3. **Run pre-commit verification (`amnesia-precommit` / Clean-Context Audit)**:
-   - Run comment and code audits on `HEAD` (including `keeper_inquisitor` + `keeper_skeptic` if available in the environment) so the proposed fix is guaranteed free of secondary edge-case bugs before the author sees it.
-4. **Amend into `PS2` and push with `%wip`**:
+3. **Mandatory clean-context audit of our own fix (non-skippable)**:
+   - `PS2` is code we ask someone else to adopt, so it gets the full `amnesia-precommit` pipeline (or the environment's equivalent): comment and code audits on `HEAD`, the clean-context Hunter (`keeper_inquisitor`), and the batched Skeptic (`keeper_skeptic`, `pro` for line-breaking, BiDi, or index math) on every candidate defect.
+   - Fix every `CONFIRMED` defect, then rerun the **full** module test suite once more, not just the new tests: a fix for a skeptic finding can break a different edge case that only one of the `PS1` reproducers covers.
+   - Never upload `PS2` with this step skipped, not even in a hurry; a buggy fix handed to the author costs more trust than a late one.
+4. **Enumerate side effects of `PS2` beyond the targeted bug**:
+   - For every predicate, branch, or loop the fix touches, check its full scope, not only the case being fixed (e.g., `Cluster::isSoftBreak()` is true at any line-break opportunity, including between CJK ideographs, not only at `U+00AD`, which is `isSoftHyphen()`).
+   - Record each behavior change for inputs outside the targeted bug; it must appear in the review message (Phase 5), so the author does not have to discover it.
+5. **Amend into `PS2` and push with `%wip`**:
    ```bash
    git add -u
    git commit --amend
    git push origin HEAD:refs/for/main%wip
    ```
-   - Update the commit subject and body in `PS2` to describe the complete fix + tests cleanly (so if the author copies the commit message or folds `PS2` directly into their CL, it is already review-ready).
+   - Rewrite the commit message in `PS2`: the `PS1` "Add failing ... tests" subject and body must not carry over. Describe the complete fix + tests (subject within 50 characters), so if the author copies the message or folds `PS2` into their CL, it is already review-ready.
    - Now Gerrit's patchset selector on the companion CL cleanly separates:
      - `Base -> PS1`: Reproducer unit tests only (fails on the parent CL).
      - `PS1 -> PS2`: Pure production fix delta (turns the tests green).
@@ -140,7 +146,9 @@ Structure the English review comment using this proven template:
    - Cite the exact `File.cpp:line` and symbol in the author's patchset.
    - Explain the concrete input scenario and why the current logic miscomputes or crashes.
    - Explain the invariant fix in 1–2 sentences (or with a 3-line inline snippet if helpful).
-3. **Companion WIP CL Link & Patchset Guide**:
+3. **Side Effects & Predicate Scope**:
+   State every behavior change of `PS2` outside the targeted bugs found in Phase 4 (e.g., "the post-`maxLines` scan now also splits CJK text into per-ideograph words, because `isSoftBreak()` covers every break opportunity"), or state explicitly that there are none.
+4. **Companion WIP CL Link & Patchset Guide**:
    Provide the direct link to the stacked companion WIP CL, explicitly explaining the patchset layout and giving the author complete autonomy:
    > I uploaded a companion WIP CL stacked on top of PS`<N>` so you can inspect the isolated diffs:
    > `<https://...-review.googlesource.com/c/.../+/<COMPANION_CL>>`
@@ -178,7 +186,7 @@ When the user asks for a dry run (e.g., *"dry"*, *"сухой прогон"*, *"
    - The selected case (1–5) with its justification.
    - The planned external action: no CL, a 1-patchset or 2-patchset companion WIP CL, or patchsets into the user's own CL (Self-Review Mode).
    - The test names, how many fail on the reviewed patchset, and the failing assertion count.
-   - The proposed fix diff (Case 5).
+   - The proposed fix diff (Case 5) and its side effects outside the targeted bugs.
    - The draft review message for the author.
    - The local branch / worktree holding the prepared commits.
 4. **Promotion**: when the user approves (e.g., *"давай"*, *"пушь"*), push the prepared local commits exactly as reported (`PS1`, then `PS2`) without redoing the work; if the reviewed CL received a new patchset in the meantime, report this and ask before re-basing the work onto it.
@@ -187,4 +195,7 @@ When the user asks for a dry run (e.g., *"dry"*, *"сухой прогон"*, *"
 
 ## Post-Adoption Cleanup
 
-Once the author folds the tests/fix into a new patchset of their parent CL (or lands an alternative fix), verify the parent CL's new patchset and **abandon** the temporary companion WIP CL so no stale WIP changes remain open in Gerrit.
+Once the author responds with a new patchset of their parent CL:
+
+1. **Verify the fold-in mechanically**: fetch the new patchset and check that `git diff <companion_PS2_sha> <author_new_PS_sha>` is empty and that both commits share the same parent. If the diff is not empty, review only that delta (the author may have adjusted the fix) before going further.
+2. **Recommend, do not act**: when the check passes (or the author landed an alternative fix that you reviewed), recommend `Code-Review+1` on the parent CL and abandoning the companion WIP CL. Voting and abandoning are left to the user.
