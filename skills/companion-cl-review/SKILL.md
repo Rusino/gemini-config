@@ -68,6 +68,7 @@ Never upload a companion WIP CL blindly. After auditing the patchset and testing
 
 1. **Design targeted edge-case tests**:
    - Based on static audit of the changed hunks, write unit tests targeting the exact boundary conditions the CL touches (e.g., `BiDi` / RTL transitions, fallback fonts, `letterSpacing != 0`, `maxLines` remainder loops, `layout(0)`, empty/whitespace-only inputs, cache eviction/concurrency).
+   - If the host pipeline supplies confirmed findings from a domain review lens (subsystem checklists, historical reviewer precedents), turn each confirmed finding into at least one contract test first.
 2. **Timeless Test Comments Invariant (No `"Fails on cl/..."` Annotations)**:
    - Write comments inside the test file as **timeless domain invariants** (describing *why* the contract must hold in `main`, without trailing periods in C++).
    - **Never** write `"// Fails on cl/123456 because..."` or `"// Reproducer for PS3 bug"` in test comments — when the author folds your patchset into their CL, temporary review-time phrasing pollutes their commit and requires another round of review cleanup.
