@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PreToolUse hook for Jetski to prevent hallucinations, blind edits, and broken handoffs.
 
-Implements eight mechanical guards:
+Implements nine mechanical guards:
 1. Handoff Command & Post-Handoff Guard:
    - Blocks any file edits or duplicate `new-conversation` calls in a conversation
      that has already handed off in the current turn.
@@ -38,6 +38,11 @@ Implements eight mechanical guards:
 8. Google Docs Grounding Guard (`DOC-CHECK GUARD`):
    - Blocks `call_mcp_tool` (`update_doc`) unless `check_doc_grounding.py` has
      run since the last consumed `update_doc` turn.
+9. Cross-Project Scope Guard (`CROSS-PROJECT SCOPE GUARD`):
+   - Blocks editing files or running `git commit` / `git cl upload` / `gh pr create`
+     inside a workspace directory that belongs exclusively to another Jetski project,
+     unless the user confirmed cross-project execution in a subsequent turn and
+     `.cross_project_override.json` was written.
 """
 
 # Every gated tool call of every chat runs this file, including the calls that
@@ -655,6 +660,162 @@ def roadmap_edit_denial(target_file: str, conv_id: str) -> str:
   )
 
 
+# Track the latest USER_INPUT step so self-overrides in the same turn are rejected
+def _last_user_step_index(transcript_path: str) -> int:
+  steps = _load_transcript_steps(transcript_path)
+  for step in reversed(steps):
+    if step.get("type") == "USER_INPUT":
+      return int(step.get("step_index", 0))
+  return 0
+
+
+def _cross_project_paths(artifact_dir: str, conv_id: str) -> tuple[str, str]:
+  base = os.path.join(artifact_dir, "scratch") if artifact_dir else "/tmp"
+  suffix = "" if artifact_dir else f"_{conv_id}"
+  return (
+      os.path.join(base, f".cross_project_override{suffix}.json"),
+      os.path.join(base, f".cross_project_guard_state{suffix}.json"),
+  )
+
+
+def _extract_cmd_target_dirs(cmd: str, workspace_paths: list[str]) -> list[str]:
+  """Candidate directories targeted by a git commit / upload command."""
+  cmd_code = strip_heredocs(cmd)
+  dirs: list[str] = []
+  for m in re.finditer(r"(?:^|[\s;&|(`])cd\s+([^\s;&|)`\"']+)", cmd_code):
+    dirs.append(os.path.abspath(os.path.expanduser(m.group(1))))
+  for m in re.finditer(r"\bgit\s+-C\s+([^\s;&|)`\"']+)", cmd_code):
+    dirs.append(os.path.abspath(os.path.expanduser(m.group(1))))
+  from context_guard import WORKSPACE_ROOT_RE
+
+  for m in WORKSPACE_ROOT_RE.findall(cmd_code):
+    dirs.append(os.path.abspath(os.path.expanduser(m)))
+  if not dirs:
+    for wp in workspace_paths:
+      if wp:
+        dirs.append(os.path.abspath(os.path.expanduser(wp)))
+  return dirs
+
+
+def cross_project_write_denial(
+    tool_name: str,
+    tool_args: dict,
+    conv_id: str,
+    parent_conv_id: str,
+    transcript_path: str,
+    artifact_dir: str,
+    workspace_paths: list[str],
+) -> str:
+  """Deny reason when a chat in project A edits or commits inside project B's exclusive root."""
+  effective_cid = parent_conv_id or conv_id
+  override_path, guard_state_path = _cross_project_paths(
+      artifact_dir, effective_cid
+  )
+
+  if tool_name in EDIT_TOOLS:
+    raw_target = get_tool_target_file(tool_args)
+    if not raw_target:
+      return ""
+    clean_target = os.path.abspath(
+        os.path.expanduser(raw_target.strip().strip('"').strip("'"))
+    )
+    if clean_target == os.path.abspath(override_path) or os.path.basename(
+        clean_target
+    ).startswith(".cross_project_override"):
+      if os.path.exists(guard_state_path):
+        try:
+          with open(guard_state_path, "r", encoding="utf-8") as f:
+            gstate = json.load(f)
+          blocked_step = int(gstate.get("blocked_at_user_step", -1))
+          if (
+              blocked_step >= 0
+              and _last_user_step_index(transcript_path) <= blocked_step
+          ):
+            return (
+                "[CROSS-PROJECT SCOPE GUARD] You cannot create `.cross_project_override.json` "
+                "in the same turn that a cross-project edit was blocked! Stop immediately, "
+                "ask the user whether to forward the request via `agentapi send-message` or "
+                "execute it here, and wait for the user's reply in the next turn."
+            )
+        except Exception:
+          pass
+      return ""
+    candidate_paths = [clean_target]
+  elif tool_name == "run_command":
+    cmd_str = str(tool_args.get("CommandLine", "")).strip()
+    if not is_git_commit_or_upload_command(cmd_str):
+      return ""
+    candidate_paths = _extract_cmd_target_dirs(cmd_str, workspace_paths)
+    if not candidate_paths:
+      return ""
+  else:
+    return ""
+
+  if os.path.exists(override_path):
+    return ""
+
+  from context_guard import collect_project_directory, get_conversation_db_info
+
+  _, current_pid = get_conversation_db_info(effective_cid, transcript_path)
+  if not current_pid or current_pid == "outside-of-project":
+    return ""
+
+  directory = collect_project_directory(
+      transcript_path, include_active_chats=True, exclude_conv_id=effective_cid
+  )
+  excl = directory["exclusive_roots"]
+  if not excl:
+    return ""
+
+  matched_root, owner_pid = "", ""
+  for cand in candidate_paths:
+    best_len = -1
+    for root_path, pid in excl.items():
+      if cand == root_path or cand.startswith(root_path + os.sep):
+        if len(root_path) > best_len:
+          best_len = len(root_path)
+          matched_root = root_path
+          owner_pid = pid
+    if owner_pid and owner_pid != current_pid:
+      break
+  else:
+    return ""
+
+  try:
+    os.makedirs(os.path.dirname(guard_state_path), exist_ok=True)
+    with open(guard_state_path, "w", encoding="utf-8") as f:
+      json.dump(
+          {"blocked_at_user_step": _last_user_step_index(transcript_path)}, f
+      )
+  except Exception:
+    pass
+
+  projects = directory["projects"]
+  cur_proj_name = (projects.get(current_pid) or {}).get("name") or current_pid
+  owner_proj = projects.get(owner_pid) or {}
+  owner_name = owner_proj.get("name") or owner_pid
+  active_chat = owner_proj.get("active_chat")
+  active_hint = (
+      f" (active chat: `{active_chat[1]}` -> `conversation://{active_chat[0]}`)"
+      if active_chat
+      else ""
+  )
+  forward_cmd = (
+      f'`agentapi send-message {active_chat[0]} "<user message verbatim>"`'
+      if active_chat
+      else '`agentapi send-message <target_conv_id> "<user message verbatim>"`'
+  )
+  return (
+      f"[CROSS-PROJECT SCOPE GUARD] You are in project `{cur_proj_name}`, but attempting to "
+      f"modify or commit files in `{matched_root}`, which belongs exclusively to project "
+      f"`{owner_name}`{active_hint}. Do NOT modify foreign project files silently! "
+      f"Stop immediately, warn the user that this request targets `{owner_name}`, and ask "
+      f"whether to forward the message there via {forward_cmd} or execute it here. "
+      f"Only after the user explicitly confirms executing it in this chat in a subsequent turn "
+      f"may you write `{override_path}` to unlock cross-project edits."
+  )
+
+
 def main() -> None:
   try:
     raw_input = sys.stdin.read().strip()
@@ -684,6 +845,25 @@ def main() -> None:
     denial = roadmap_edit_denial(get_tool_target_file(tool_args), conv_id)
     if denial:
       print(json.dumps({"decision": "deny", "reason": denial}, ensure_ascii=False))
+      return
+
+  # Block edits or git commits inside another project's exclusive workspace root
+  if tool_name in EDIT_TOOLS or tool_name == "run_command":
+    xp_denial = cross_project_write_denial(
+        tool_name,
+        tool_args,
+        conv_id,
+        parent_conv_id,
+        transcript_path,
+        artifact_dir,
+        workspace_paths,
+    )
+    if xp_denial:
+      print(
+          json.dumps(
+              {"decision": "deny", "reason": xp_denial}, ensure_ascii=False
+          )
+      )
       return
 
   # 1. Top-level conversation handoff guards

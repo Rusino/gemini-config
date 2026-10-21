@@ -58,7 +58,16 @@ ROADMAP_CLI = "~/.gemini/config/hooks/roadmap.py"
 # Jetski builds use ~/.gemini/jetski (standalone macOS Jetski has no DB at all).
 APP_DATA_DIR_CANDIDATES = ("~/.gemini/antigravity", "~/.gemini/jetski")
 SUMMARY_DB_NAME = "conversation_summaries.db"
+# Allow tests to isolate project metadata without touching ~/.gemini/config/projects
+PROJECTS_DIR_ENV = "JETSKI_PROJECTS_DIR"
 PROJECTS_DIR = os.path.expanduser("~/.gemini/config/projects")
+
+
+def projects_root() -> str:
+  # Read JETSKI_PROJECTS_DIR dynamically so unittest.mock.patch.dict works per test
+  return os.path.abspath(
+      os.path.expanduser(os.environ.get(PROJECTS_DIR_ENV) or PROJECTS_DIR)
+  )
 
 # Regexes to strip previous continuation prefixes/suffixes on chained handoffs:
 CONT_PREFIX_RE = re.compile(
@@ -166,10 +175,13 @@ def infer_project_id_from_workspaces(workspace_paths: list[str]) -> str:
   most specific (longest) matching folder wins, so a workspace inside
   ~/Sources/skia maps to the skia project rather than a ~/Sources project.
   """
-  if not workspace_paths or not os.path.isdir(PROJECTS_DIR):
+  # Resolve project directory via projects_root() to honor test overrides
+  pdir = projects_root()
+  if not workspace_paths or not os.path.isdir(pdir):
     return ""
   folder_to_project: list[tuple[str, str]] = []
-  for pfile in sorted(glob.glob(os.path.join(PROJECTS_DIR, "*.json"))):
+  # Scan project JSON files in deterministic order
+  for pfile in sorted(glob.glob(os.path.join(pdir, "*.json"))):
     try:
       with open(pfile, "r", encoding="utf-8") as f:
         pdata = json.load(f)
@@ -196,6 +208,276 @@ def infer_project_id_from_workspaces(workspace_paths: list[str]) -> str:
         if len(folder_path) > best_len:
           best_len, best_pid = len(folder_path), pid
   return best_pid
+
+
+# Match canonical workspace roots in scratch, ~/Sources, or CitC to detect project ownership
+WORKSPACE_ROOT_RE = re.compile(
+    r"(/usr/local/google/home/[^/\s`\"'),;]+/(?:\.gemini/jetski/scratch|Sources)/[A-Za-z0-9_.\-]+"
+    r"|/google/src/cloud/[^/\s`\"'),;]+/[A-Za-z0-9_.\-]+)"
+)
+WORKING_DIR_LINE_RE = re.compile(
+    r"(?:Working directory|Repository|Repo|Workspace):\s*`?(/[^\s`\"'),;]+)[\`\"'),;]*",
+    re.IGNORECASE,
+)
+
+
+def _normalize_workspace_root(path: str, allow_any_dir: bool = False) -> str:
+  if not path:
+    return ""
+  clean = os.path.abspath(os.path.expanduser(path.strip())).rstrip("/")
+  m = WORKSPACE_ROOT_RE.match(clean)
+  if m:
+    return m.group(1).rstrip("/")
+  return clean if allow_any_dir else ""
+
+
+def get_active_chats_by_project(
+    hint_path: str = "", exclude_conv_id: str = ""
+) -> dict[str, tuple[str, str]]:
+  """Returns {project_id: (conv_id, title)} for the newest active chat per project."""
+  import roadmap
+
+  r_root = roadmap.roadmaps_root()
+  candidates: dict[str, list[tuple[float, int, str, str]]] = {}
+  query = (
+      "SELECT conversation_id, title, project_id, last_modified_time "
+      "FROM conversation_summaries "
+      "WHERE parent_conversation_id = '' AND (title LIKE '%⦿%' OR title LIKE '%▸%')"
+  )
+  for db_path in summary_db_paths(hint_path):
+    for flags in ("mode=ro", "mode=ro&immutable=1"):
+      try:
+        conn = sqlite3.connect(
+            f"file:{db_path}?{flags}", uri=True, timeout=1.0
+        )
+        try:
+          rows = conn.execute(query).fetchall()
+        finally:
+          conn.close()
+        for cid, title, pid, lmt in rows:
+          cid_s = str(cid or "").strip()
+          title_s = str(title or "").strip()
+          pid_s = str(pid or "").strip()
+          if (
+              not cid_s
+              or not pid_s
+              or pid_s == "outside-of-project"
+              or cid_s == exclude_conv_id
+          ):
+            continue
+          is_tip = 1 if "⦿" in title_s else 0
+          ts = 0.0
+          if lmt and not str(lmt).startswith("0001-"):
+            try:
+              ts = datetime.fromisoformat(
+                  str(lmt).replace("Z", "+00:00")
+              ).timestamp()
+            except Exception:
+              ts = 0.0
+          st_file = os.path.join(r_root, pid_s, "state", f"{cid_s}.md")
+          try:
+            if os.path.isfile(st_file):
+              ts = max(ts, os.path.getmtime(st_file))
+          except OSError:
+            pass
+          candidates.setdefault(pid_s, []).append((is_tip, ts, cid_s, title_s))
+        break
+      except Exception:
+        continue
+
+  result: dict[str, tuple[str, str]] = {}
+  for pid_s, items in candidates.items():
+    items.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    result[pid_s] = (items[0][2], items[0][3])
+
+  # Fall back to roadmaps/<pid>/state/*.md when SQLite has no row (e.g. in tests)
+  if os.path.isdir(r_root):
+    for entry in sorted(os.listdir(r_root)):
+      if entry in result:
+        continue
+      sdir = os.path.join(r_root, entry, "state")
+      if not os.path.isdir(sdir):
+        continue
+      best_mtime, best_cid, best_title = -1.0, "", ""
+      for sf in glob.glob(os.path.join(sdir, "*.md")):
+        cid_s = os.path.splitext(os.path.basename(sf))[0]
+        if cid_s == exclude_conv_id:
+          continue
+        try:
+          mt = os.path.getmtime(sf)
+          if mt > best_mtime:
+            with open(sf, "r", encoding="utf-8", errors="ignore") as f:
+              first_line = f.readline().strip().lstrip("#").strip()
+            best_mtime = mt
+            best_cid = cid_s
+            best_title = first_line or f"⦿ {cid_s[:8]}"
+        except OSError:
+          continue
+      if best_cid:
+        result[entry] = (best_cid, best_title)
+  return result
+
+
+def collect_project_directory(
+    hint_path: str = "",
+    include_active_chats: bool = False,
+    exclude_conv_id: str = "",
+) -> dict:
+  """Maps projects to their workspace roots, active chat, and exclusive roots."""
+  import roadmap
+
+  pdir = projects_root()
+  r_root = roadmap.roadmaps_root()
+  active_by_proj = (
+      get_active_chats_by_project(hint_path, exclude_conv_id=exclude_conv_id)
+      if include_active_chats
+      else {}
+  )
+  projects: dict[str, dict] = {}
+  root_owners: dict[str, list[str]] = {}
+
+  if os.path.isdir(pdir):
+    for pfile in sorted(glob.glob(os.path.join(pdir, "*.json"))):
+      try:
+        with open(pfile, "r", encoding="utf-8") as f:
+          pdata = json.load(f)
+      except Exception:
+        continue
+      pid = str(pdata.get("id") or "").strip()
+      if not pid:
+        continue
+      name = str(pdata.get("name") or pid).strip()
+      roots: set[str] = set()
+      resources = pdata.get("projectResources", {}).get("resources", [])
+      for r in resources:
+        for uri in (
+            (r.get("gitFolder") or {}).get("folderUri", ""),
+            r.get("folderUri", ""),
+        ):
+          fp = _file_uri_to_path(uri)
+          norm = _normalize_workspace_root(fp, allow_any_dir=True)
+          if norm:
+            roots.add(norm)
+
+      sdir = os.path.join(r_root, pid, "state")
+      if os.path.isdir(sdir):
+        for sf in glob.glob(os.path.join(sdir, "*.md")):
+          try:
+            with open(sf, "r", encoding="utf-8", errors="ignore") as f:
+              txt = f.read()
+          except OSError:
+            continue
+          snap_idx = txt.find("## Automatic State Snapshot")
+          body = txt[:snap_idx] if snap_idx >= 0 else txt
+          for m in WORKING_DIR_LINE_RE.findall(body):
+            norm = _normalize_workspace_root(m, allow_any_dir=True)
+            if norm:
+              roots.add(norm)
+          for m in re.findall(r"file://(/[^\s`\"')#]+)", body):
+            norm = _normalize_workspace_root(m, allow_any_dir=False)
+            if norm:
+              roots.add(norm)
+          if snap_idx >= 0:
+            snap = txt[snap_idx:]
+            for sec_hdr in (
+                "### Files Modified by Tools",
+                "### Git Status in",
+                "### Recent Commands Executed",
+            ):
+              sec_i = snap.find(sec_hdr)
+              if sec_i >= 0:
+                sec_end = snap.find("\n### ", sec_i + 4)
+                sec_txt = snap[sec_i : sec_end if sec_end >= 0 else len(snap)]
+                if sec_hdr == "### Git Status in":
+                  for gm in re.findall(r"### Git Status in `([^`]+)`", sec_txt):
+                    norm = _normalize_workspace_root(gm, allow_any_dir=True)
+                    if norm:
+                      roots.add(norm)
+                for wm in WORKSPACE_ROOT_RE.findall(sec_txt):
+                  roots.add(wm.rstrip("/"))
+
+      sorted_roots = sorted(roots)
+      for rt in sorted_roots:
+        root_owners.setdefault(rt, []).append(pid)
+      projects[pid] = {
+          "id": pid,
+          "name": name,
+          "roots": sorted_roots,
+          "active_chat": active_by_proj.get(pid),
+      }
+
+  exclusive_roots = {
+      rt: owners[0] for rt, owners in root_owners.items() if len(owners) == 1
+  }
+  return {"projects": projects, "exclusive_roots": exclusive_roots}
+
+
+def build_scope_radar_notice(
+    conv_id: str,
+    transcript_path: str,
+    workspace_paths: list[str],
+    last_user_input: str,
+) -> str:
+  """Turn-start scope notice listing current and sibling projects/workspaces."""
+  if not last_user_input or re.search(
+      r"Continuing unfinished work from previous conversation", last_user_input
+  ):
+    return ""
+  directory = collect_project_directory(
+      transcript_path, include_active_chats=True, exclude_conv_id=conv_id
+  )
+  projects = directory["projects"]
+  if len(projects) < 2:
+    return ""
+
+  cur_title, cur_pid = get_conversation_db_info(conv_id, transcript_path)
+  if not cur_pid or cur_pid == "outside-of-project":
+    cur_pid = infer_project_id_from_workspaces(workspace_paths)
+  cur_proj = projects.get(cur_pid) if cur_pid else None
+  cur_proj_name = cur_proj["name"] if cur_proj else (cur_pid or "outside-of-project")
+  cur_roots = (
+      ", ".join(f"`{r}`" for r in cur_proj["roots"])
+      if cur_proj and cur_proj["roots"]
+      else (
+          ", ".join(f"`{w}`" for w in workspace_paths)
+          if workspace_paths
+          else "none"
+      )
+  )
+
+  other_lines: list[str] = []
+  for pid, pinfo in sorted(projects.items(), key=lambda kv: kv[1]["name"]):
+    if pid == cur_pid:
+      continue
+    roots_str = ", ".join(f"`{r}`" for r in pinfo["roots"])
+    ac = pinfo.get("active_chat")
+    if not roots_str and not ac:
+      continue
+    parts = [f"- `{pinfo['name']}`"]
+    if roots_str:
+      parts.append(f"workspace {roots_str}")
+    if ac:
+      ac_title = ac[1] if len(ac[1]) <= 60 else ac[1][:57] + "..."
+      parts.append(f"active chat: `{ac_title}` (`conversation://{ac[0]}`)")
+    other_lines.append(" — ".join(parts))
+
+  if not other_lines:
+    return ""
+
+  return (
+      "[SCOPE GUARD: WRONG-CHAT / WRONG-PROJECT RADAR]\n"
+      f"Current chat: `{cur_title or conv_id}` | Project: `{cur_proj_name}` | "
+      f"Workspace(s): {cur_roots}\n"
+      "Other active projects & workspaces:\n"
+      + "\n".join(other_lines)
+      + "\nIf the user's new request clearly targets another project, workspace, or "
+      f"chat topic listed above rather than `{cur_proj_name}`, DO NOT start "
+      "investigating, reading foreign project files, or running commands! "
+      "Reply immediately warning the user which project/chat the request belongs to "
+      "(`[👉 <Target Chat Title>](conversation://<target_conv_id>)`), and ask whether "
+      'to forward the message via `agentapi send-message <target_conv_id> "<user '
+      'message>"` or execute it in this chat.'
+  )
 
 
 # Tool results may indent this line (e.g. "\n\n\t\t\t\tThe command exited ..." on
@@ -810,6 +1092,13 @@ def run(data: dict, log: dict) -> dict:
     if state.get("auto_title_notice"):
       messages.append(state.pop("auto_title_notice"))
       save_state(state_path, state)
+    # Inject cross-project scope radar only at turn start when a user prompt is present
+    if is_turn_start and last_user_input:
+      radar_notice = build_scope_radar_notice(
+          conv_id, transcript_path, workspace_paths, last_user_input
+      )
+      if radar_notice:
+        messages.append(radar_notice)
     soft_due = steps - int(
         state.get("soft_last_steps", -SOFT_REMIND_EVERY_STEPS)
     ) >= SOFT_REMIND_EVERY_STEPS

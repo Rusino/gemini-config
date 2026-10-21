@@ -606,6 +606,145 @@ class TestPreToolGuard(unittest.TestCase):
       f_trans.flush()
       self.assertEqual(self.run_guard(update_call).get("decision"), "deny")
 
+  # Verify cross-project scope guard blocks foreign exclusive roots until user confirms override
+  def test_cross_project_scope_guard_blocks_foreign_edits_and_commits(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      pdir = os.path.join(tmp_dir, "projects")
+      rdir = os.path.join(tmp_dir, "roadmaps")
+      artifact_dir = os.path.join(tmp_dir, "brain", "c1")
+      os.makedirs(pdir)
+      os.makedirs(os.path.join(artifact_dir, "scratch"))
+
+      ws_hack = os.path.join(tmp_dir, "hackathon_submission_2026")
+      ws_ts = os.path.join(tmp_dir, "webparagraph-ts")
+      ws_shared = os.path.join(tmp_dir, "skia")
+
+      with open(os.path.join(pdir, "proj-a.json"), "w") as f:
+        json.dump({
+            "id": "proj-a",
+            "name": "Chrome AI Week H2 2026",
+            "projectResources": {"resources": [
+                {"folderUri": f"file://{ws_hack}"},
+                {"folderUri": f"file://{ws_shared}"},
+            ]},
+        }, f)
+      with open(os.path.join(pdir, "proj-b.json"), "w") as f:
+        json.dump({
+            "id": "proj-b",
+            "name": "Typescript WebParagraph",
+            "projectResources": {"resources": [{"folderUri": f"file://{ws_shared}"}]},
+        }, f)
+      sdir_b = os.path.join(rdir, "proj-b", "state")
+      os.makedirs(sdir_b)
+      with open(os.path.join(sdir_b, "aa88014c.md"), "w") as f:
+        f.write(f"# [12:04] ⦿ TS Paragraph Editor\nWorking directory: `{ws_ts}`\n")
+
+      transcript = os.path.join(artifact_dir, "transcript.jsonl")
+      with open(transcript, "w") as f:
+        f.write(json.dumps({"step_index": 1, "type": "USER_INPUT", "content": "Fix editor border"}) + "\n")
+
+      import context_guard
+      with patch.dict(os.environ, {"JETSKI_PROJECTS_DIR": pdir, "JETSKI_ROADMAPS_DIR": rdir}), \
+           patch.object(context_guard, "get_conversation_db_info", return_value=("[11:00] ⦿ Hackathon", "proj-a")), \
+           patch.object(context_guard, "summary_db_paths", return_value=[]):
+        # Editing a file inside proj-b's exclusive root is denied
+        out_edit = self.run_guard({
+            "conversationId": "c1",
+            "transcriptPath": transcript,
+            "artifactDirectoryPath": artifact_dir,
+            "toolCall": {
+                "name": "write_file",
+                "args": {"Path": os.path.join(ws_ts, "demo", "index.html")},
+            },
+        })
+        self.assertEqual(out_edit.get("decision"), "deny")
+        self.assertIn("CROSS-PROJECT SCOPE GUARD", out_edit.get("reason", ""))
+        self.assertIn("Typescript WebParagraph", out_edit.get("reason", ""))
+        self.assertIn("conversation://aa88014c", out_edit.get("reason", ""))
+
+        # Committing inside proj-b's exclusive root is also denied
+        out_commit = self.run_guard({
+            "conversationId": "c1",
+            "transcriptPath": transcript,
+            "artifactDirectoryPath": artifact_dir,
+            "toolCall": {
+                "name": "run_command",
+                "args": {"CommandLine": f"cd {ws_ts} && git commit -m 'fix'"},
+            },
+        })
+        self.assertEqual(out_commit.get("decision"), "deny")
+        self.assertIn("CROSS-PROJECT SCOPE GUARD", out_commit.get("reason", ""))
+
+        # Editing own workspace or a shared multi-project repo is allowed
+        self.assertEqual(
+            self.run_guard({
+                "conversationId": "c1",
+                "transcriptPath": transcript,
+                "artifactDirectoryPath": artifact_dir,
+                "toolCall": {
+                    "name": "write_file",
+                    "args": {"Path": os.path.join(ws_hack, "one_pager.md")},
+                },
+            }).get("decision"),
+            "allow",
+        )
+        self.assertEqual(
+            self.run_guard({
+                "conversationId": "c1",
+                "transcriptPath": transcript,
+                "artifactDirectoryPath": artifact_dir,
+                "toolCall": {
+                    "name": "write_file",
+                    "args": {"Path": os.path.join(ws_shared, "README.md")},
+                },
+            }).get("decision"),
+            "allow",
+        )
+
+        # Self-override in the same turn (before a new USER_INPUT) is blocked
+        override_file = os.path.join(artifact_dir, "scratch", ".cross_project_override.json")
+        out_cheat = self.run_guard({
+            "conversationId": "c1",
+            "transcriptPath": transcript,
+            "artifactDirectoryPath": artifact_dir,
+            "toolCall": {
+                "name": "write_file",
+                "args": {"Path": override_file},
+            },
+        })
+        self.assertEqual(out_cheat.get("decision"), "deny")
+        self.assertIn("same turn", out_cheat.get("reason", ""))
+
+        # After user confirms in a new turn, creating the override and editing is allowed
+        with open(transcript, "a") as f:
+          f.write(json.dumps({"step_index": 2, "type": "USER_INPUT", "content": "Execute it here"}) + "\n")
+        self.assertEqual(
+            self.run_guard({
+                "conversationId": "c1",
+                "transcriptPath": transcript,
+                "artifactDirectoryPath": artifact_dir,
+                "toolCall": {
+                    "name": "write_file",
+                    "args": {"Path": override_file},
+                },
+            }).get("decision"),
+            "allow",
+        )
+        with open(override_file, "w") as f:
+          f.write("{}")
+        self.assertEqual(
+            self.run_guard({
+                "conversationId": "c1",
+                "transcriptPath": transcript,
+                "artifactDirectoryPath": artifact_dir,
+                "toolCall": {
+                    "name": "write_file",
+                    "args": {"Path": os.path.join(ws_ts, "demo", "index.html")},
+                },
+            }).get("decision"),
+            "allow",
+        )
+
 
 if __name__ == "__main__":
   unittest.main()

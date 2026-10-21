@@ -37,6 +37,8 @@ class TestContextGuard(unittest.TestCase):
     self.env = patch.dict(os.environ, {
         "JETSKI_CONTEXT_GUARD_LOG": self.log_path,
         "JETSKI_ROADMAPS_DIR": os.path.join(self.tmp.name, "roadmaps"),
+        # Isolate project metadata so existing tests do not read live projects/*.json
+        "JETSKI_PROJECTS_DIR": os.path.join(self.tmp.name, "projects"),
     })
     self.env.start()
     self.db_info = patch.object(
@@ -340,6 +342,50 @@ class TestContextGuard(unittest.TestCase):
       self.assertIn("TITLE GUARD", msg)
       self.assertIn("[14:15] ⦿ cl/1397896", msg)
       self.assertEqual(self.last_log().get("auto_title"), "[14:15] ⦿ cl/1397896")
+
+  # Verify turn-start scope radar lists sibling projects and skips handoffs/mid-turn
+  def test_scope_radar_on_turn_start_injects_project_directory(self):
+    pdir = os.path.join(self.tmp.name, "projects")
+    rdir = os.path.join(self.tmp.name, "roadmaps")
+    os.makedirs(pdir, exist_ok=True)
+    with open(os.path.join(pdir, "proj-1.json"), "w") as f:
+      json.dump({
+          "id": "proj-1",
+          "name": "Chrome AI Week H2 2026",
+          "projectResources": {"resources": [{"folderUri": "file:///workspace/hackathon"}]},
+      }, f)
+    with open(os.path.join(pdir, "proj-2.json"), "w") as f:
+      json.dump({"id": "proj-2", "name": "Typescript WebParagraph"}, f)
+    sdir2 = os.path.join(rdir, "proj-2", "state")
+    os.makedirs(sdir2, exist_ok=True)
+    with open(os.path.join(sdir2, "aa88014c.md"), "w") as f:
+      f.write("# [12:04] ⦿ TS Paragraph: R4 Canvas Text Editor\nWorking directory: `/workspace/webparagraph-ts`\n")
+
+    with patch.object(chat_lifecycle, "auto_title_conversation", return_value=""), \
+         patch.object(context_guard, "summary_db_paths", return_value=[]):
+      out = self.run_guard(
+          inv=0,
+          lastUserInput="Look at the red rectangle in the text editor",
+      )
+      msg = self.message(out)
+      self.assertIn("SCOPE GUARD: WRONG-CHAT / WRONG-PROJECT RADAR", msg)
+      self.assertIn("Chrome AI Week H2 2026", msg)
+      self.assertIn("Typescript WebParagraph", msg)
+      self.assertIn("/workspace/webparagraph-ts", msg)
+      self.assertIn("conversation://aa88014c", msg)
+      self.assertIn("agentapi send-message", msg)
+
+      # Continuation prompts and mid-turn invocations do not inject the scope radar
+      out_cont = self.run_guard(
+          inv=0,
+          lastUserInput="Continuing unfinished work from previous conversation (conversation://old)",
+      )
+      self.assertEqual(out_cont, {})
+      out_mid = self.run_guard(
+          inv=1,
+          lastUserInput="Look at the red rectangle in the text editor",
+      )
+      self.assertEqual(out_mid, {})
 
 
 if __name__ == "__main__":
