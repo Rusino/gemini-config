@@ -42,7 +42,7 @@ Code has a compiler; prose documents do not, and incoming specs or code snippets
 3. **Incoming Code (CLs, PRs, Commits, Patches, or User-Pasted Snippets >5 Lines) -> Zero-Trust Audit on Read**:
    - **Applies to**: Any external CL/PR, commit, branch, diff, or code snippet (>5 lines) the user asks you to read, explain, review, or integrate.
    - **Required Action**:
-     1. For incoming CLs/PRs or local diffs, run `audit_comments.py` and `ruthless_audit.py --diff` (and use `review-triage` (`~/.gemini/config/skills/review-triage/SKILL.md`) for full CL/PR reviews).
+     1. For incoming CLs/PRs or local diffs, run `audit_comments.py` and `ruthless_audit.py --diff` (and use `review-triage` (`~/.gemini/config/skills/review-triage/SKILL.md`) + `companion-cl-review` (`~/.gemini/config/skills/companion-cl-review/SKILL.md`) by default for full CL/PR reviews, unless the user explicitly asks for a prose-only review without a companion CL).
      2. Audit the incoming code against `cpp_systems_invariants.md`, `text_domain_invariants.md`, and `code_style.md` (checking for hot-path allocations, missing loop guards, UTF-8/UTF-16/BiDi index mismatches, dropped guards, or missing sibling backend updates), and highlight any defects immediately alongside your explanation or review.
 
 ## 3. Hard Prohibitions

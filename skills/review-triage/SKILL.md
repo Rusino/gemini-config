@@ -7,8 +7,10 @@ description: >-
   Automatically isolates the core 5% logic hunks, verifies mechanical churn, runs a two-stage
   Hunt then Refute pass (keeper_skeptic with XFAMILY_REFUTE auto-routing) backed by the Persistent
   Finding Ledger (`finding_ledger.py`) to eliminate and cache false-positive review comments across
-  patchsets, drafts professional reassignment or pushback messages in English, and pinpoints exact
-  files and line ranges so the reviewer maintains their analytical edge without drowning in diffs. Trigger when user asks to triage, review, or analyze an incoming CL/PR ("разбери СЛ",
+  patchsets, and by default executes the `companion-cl-review` protocol (checking out the author's
+  exact patchset without rebasing, running adversarial contract tests, classifying into the 5-Case
+  Decision Matrix, and uploading a silent stacked WIP companion CL with PS1=tests and PS2=fix when
+  warranted, unless the user explicitly opts out with "без компаньона" / "только текстом"). Trigger when user asks to triage, review, or analyze an incoming CL/PR ("разбери СЛ",
   "сделай триаж ревью", "оцени СЛ", "посмотри этот ревью", "triage this CL/PR",
   "что делать с этим ревью").
 ---
@@ -112,7 +114,7 @@ python3 ~/.gemini/config/skills/review-triage/scripts/triage_cl.py --diff-file /
 
 Triage output alone is never the final word. Every CL that stays in the queue after triage (any
 category except a clear 🟡 REASSIGN) must also go through the
-[`ruthless-code-audit`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/ruthless-code-audit/SKILL.md)
+`ruthless-code-audit` (`~/.gemini/config/skills/ruthless-code-audit/SKILL.md`)
 skill and its **Stage 2.5 Skeptic Refutation Pass (`keeper_skeptic`)** before review drafts are presented:
 1. Fetch the current patchset into a separate worktree (never switch branches in an existing
    checkout): `git fetch https://skia.googlesource.com/skia refs/changes/<NN>/<CL>/<PS>`. If the
@@ -129,8 +131,20 @@ skill and its **Stage 2.5 Skeptic Refutation Pass (`keeper_skeptic`)** before re
    - **Quota Fallback**: On `pro` quota exhaustion, auto-downgrade to `Model="flash"` (`[Verified via Flash fallback (Pro quota exhausted)]`); if all models fail, mark the draft `[UNVERIFIED: Quota Exhausted]` and alert the user.
    - **Apply the Three Skeptic Verdicts to Review Drafts & Persist Refutations**:
      - **`REFUTED` (`path:line` guard, caller `SkASSERT`, or documented intent)**: Drop silently—never embarrass the human reviewer with a false positive on Gerrit/GitHub. Record every `REFUTED` item (and any review comment the user later dismisses in chat) in the Persistent Finding Ledger via `python3 ~/.gemini/config/scripts/finding_ledger.py add --repo <repo_or_project> --file <path> --symbol "<sym>" --claim "<claim>" --reason "<evidence>" [--scope repo|cl --cl <cl_id>]`.
-     - **`CONFIRMED` (`entry -> path:line -> bad outcome`)**: Fold into the actionable English review draft; drop any LGTM draft that a confirmed defect contradicts.
+     - **`CONFIRMED` (`entry -> path:line -> bad outcome`)**: Proceed to the **Default Companion WIP CL Execution (`companion-cl-review`)** stage below; drop any LGTM draft that a confirmed defect contradicts.
      - **`UNPROVEN` (trace hits an external contract or unverified product intent)**: Convert into a polite, specific **Question for the CL Author** in English (stating what was traced and what remains open) rather than asserting a bug.
+
+---
+
+## Default Companion WIP CL Execution (`companion-cl-review`)
+
+For every targeted single-CL review in `🔴 SURGICAL AUDIT / CORE DOMAIN` (or `🟠 PUSHBACK`) that remains after triage and audit, **always follow the `companion-cl-review` (`~/.gemini/config/skills/companion-cl-review/SKILL.md`) skill by default** (unless the user explicitly opts out with *"без компаньона"*, *"только текстом"*, *"without companion CL"*, or when running an unattended batch queue sweep via `run_queue_triage.py`, which stops at triage + static audit until the user selects a specific CL):
+
+1. Evaluate the CL against the **5-Case Decision Matrix** in `~/.gemini/config/skills/companion-cl-review/SKILL.md`:
+   - **Case 1 (Ideal CL)** or **Case 2 (Near-Ideal / Minor Nits)**: Do **not** create a companion WIP CL; prepare a concise `LGTM` or inline nit comments directly.
+   - **Case 3 (No Failing Tests / Coverage or Cleanup Only)**: Upload a **1-patchset WIP CL (`PS1` only)** if the extra edge-case tests or structural cleanup exceed 15–20 lines (otherwise use inline comments).
+   - **Case 4 (Fundamental Flaw / Unfixable Without Rewrite)**: Upload a **1-patchset WIP CL (`PS1` = Failing Reproducer Tests ONLY)** and draft a constructive pushback message.
+   - **Case 5 (Edge-Case Defects + Clean Fix)**: Upload a **2-patchset WIP CL** stacked directly on the author's exact patchset SHA without rebasing (`PS1` = failing contract tests with timeless comments; `PS2` = production fix + passing tests, uploaded via `git push origin HEAD:refs/for/main%wip` with zero reviewers) and draft the collaborative English review comment linking `PS1` and `PS2`.
 
 ---
 
