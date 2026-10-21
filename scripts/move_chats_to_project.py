@@ -547,6 +547,84 @@ def get_running_conversations() -> list[tuple[str, str]]:
   return sorted(running)
 
 
+PENDING_MOVES_FILENAME = ".pending_project_moves.json"
+
+
+def _pending_moves_path(app_data_dir: str) -> str:
+  if not app_data_dir or not os.path.isdir(app_data_dir):
+    return ""
+  return os.path.join(app_data_dir, PENDING_MOVES_FILENAME)
+
+
+def record_pending_moves(
+    app_data_dir: str, conv_ids: list[str], project_id: str
+) -> dict[str, str]:
+  """Merges (conv_id -> project_id) into the shared pending moves file."""
+  pfile = _pending_moves_path(app_data_dir)
+  pending: dict[str, str] = {}
+  if pfile and os.path.isfile(pfile):
+    try:
+      with open(pfile, "r", encoding="utf-8") as f:
+        data = json.load(f)
+      if isinstance(data, dict):
+        pending.update({str(k): str(v) for k, v in data.items() if k and v})
+    except (OSError, ValueError):
+      pass
+  for cid in conv_ids:
+    if cid and project_id:
+      pending[cid] = project_id
+  if pfile:
+    tmp_path = f"{pfile}.{os.getpid()}.tmp"
+    try:
+      with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(pending, f, indent=2)
+      os.replace(tmp_path, pfile)
+    except OSError:
+      pass
+  return pending
+
+
+def load_pending_moves(
+    app_data_dir: str = "",
+    fallback_project: str = "",
+    fallback_cids: list[str] | None = None,
+) -> dict[str, str]:
+  """Loads all pending (conv_id -> project_id) moves across invocations."""
+  pending: dict[str, str] = {}
+  if fallback_project and fallback_cids:
+    for cid in fallback_cids:
+      pending[cid] = fallback_project
+  pfile = _pending_moves_path(app_data_dir)
+  if pfile and os.path.isfile(pfile):
+    try:
+      with open(pfile, "r", encoding="utf-8") as f:
+        data = json.load(f)
+      if isinstance(data, dict):
+        pending.update({str(k): str(v) for k, v in data.items() if k and v})
+    except (OSError, ValueError):
+      pass
+  return pending
+
+
+def apply_moves_by_project(
+    app_data_dir: str, moves: dict[str, str], include_ls: bool = True
+) -> None:
+  """Applies a batch of {conv_id: project_id} moves grouped by target project."""
+  by_proj: dict[str, list[str]] = {}
+  for cid, pid in moves.items():
+    if cid and pid:
+      by_proj.setdefault(pid, []).append(cid)
+  for pid, cids in by_proj.items():
+    if app_data_dir and os.path.isdir(app_data_dir):
+      for cid in cids:
+        update_conversation_db(app_data_dir, cid, pid)
+      update_summaries_db(app_data_dir, cids, pid)
+      update_summaries_proto(app_data_dir, set(cids), pid)
+    move_chain_state_files(cids, pid)
+    if include_ls:
+      update_ls_summaries_project(cids, pid)
+
+
 def wait_for_idle_ls(
     poll_sec: float = 3.0,
     required_quiet_checks: int = 2,
@@ -560,26 +638,28 @@ def wait_for_idle_ls(
 
   deadline = time.monotonic() + max_wait_sec
   quiet = 0
-  pending_targets = set(target_conv_ids or [])
+  # Track which moved chats need re-syncing whenever they finish a turn before
+  # jetski-hub restarts (since LS flushes its stale in-memory projectId at turn end)
+  needs_sync: set[str] = set(
+      load_pending_moves(app_data_dir, target_project, target_conv_ids).keys()
+  )
   while time.monotonic() < deadline:
     running = get_running_conversations()
-    # A moved chat that just finished its own turn would otherwise stay in the
-    # old sidebar bucket until every unrelated running chat also finishes
-    if target_project and pending_targets:
-      running_ids = {cid for cid, _ in running}
-      newly_idle = [
-          cid
-          for cid in (target_conv_ids or [])
-          if cid in pending_targets and cid not in running_ids
-      ]
-      if newly_idle:
-        if app_data_dir and os.path.isdir(app_data_dir):
-          for cid in newly_idle:
-            update_conversation_db(app_data_dir, cid, target_project)
-          update_summaries_db(app_data_dir, newly_idle, target_project)
-          update_summaries_proto(app_data_dir, set(newly_idle), target_project)
-        update_ls_summaries_project(newly_idle, target_project)
-        pending_targets.difference_update(newly_idle)
+    running_ids = {cid for cid, _ in running}
+    pending_map = load_pending_moves(app_data_dir, target_project, target_conv_ids)
+    # Any tracked conversation seen RUNNING will flush its stale in-memory
+    # trajectory on turn end, so mark it for re-sync as soon as it becomes idle
+    for cid in pending_map:
+      if cid in running_ids:
+        needs_sync.add(cid)
+    newly_idle = {
+        cid: pid
+        for cid, pid in pending_map.items()
+        if cid in needs_sync and cid not in running_ids
+    }
+    if newly_idle:
+      apply_moves_by_project(app_data_dir, newly_idle, include_ls=True)
+      needs_sync.difference_update(newly_idle.keys())
     if not running:
       quiet += 1
       if quiet >= required_quiet_checks:
@@ -603,16 +683,31 @@ def schedule_offline_migration(
     delay_sec: int = 3,
 ):
   """Schedules waiting for idle chats, stopping jetski-hub, migrating offline, and restarting."""
+  app_data_dir = os.path.expanduser(
+      os.environ.get("ANTIGRAVITY_APP_DATA_DIR", "~/.gemini/jetski")
+  )
+  record_pending_moves(app_data_dir, conv_ids, project_id)
+  # Check if a wait-idle migration worker is already running; it will pick up
+  # the pending moves file automatically without spawning competing systemd jobs
+  res = subprocess.run(
+      ["pgrep", "-f", "[m]ove_chats_to_project.py --wait-idle"],
+      capture_output=True,
+      text=True,
+      check=False,
+  )
+  if res.returncode == 0 and res.stdout.strip():
+    print(
+        "[INFO] Added to existing offline migration queue;"
+        " will apply when all running chats finish."
+    )
+    return
   quoted_cids = " ".join(f"'{cid}'" for cid in conv_ids)
   abs_script = os.path.abspath(script_path)
   wait_cmd = (
       f"/usr/bin/python3 '{abs_script}' --wait-idle --project-id '{project_id}'"
       f" {quoted_cids}"
   )
-  script_cmd = (
-      f"/usr/bin/python3 '{abs_script}' --project-id '{project_id}'"
-      f" {quoted_cids}"
-  )
+  script_cmd = f"/usr/bin/python3 '{abs_script}' --apply-pending"
   log_file = "/tmp/move_chats_offline.log"
   cmd = (
       f"/bin/bash -c 'sleep {delay_sec} && "
@@ -688,6 +783,11 @@ def main():
       help="Internal helper: block until no conversation is RUNNING in LS",
   )
   parser.add_argument(
+      "--apply-pending",
+      action="store_true",
+      help="Internal helper: apply all moves in PENDING_MOVES_FILE while LS is offline",
+  )
+  parser.add_argument(
       "conversations",
       nargs="*",
       help="One or more conversation IDs to move",
@@ -697,6 +797,20 @@ def main():
   app_data_dir = os.path.expanduser(
       os.environ.get("ANTIGRAVITY_APP_DATA_DIR", "~/.gemini/jetski")
   )
+
+  if args.apply_pending:
+    pending_map = load_pending_moves(
+        app_data_dir, args.project, list(dict.fromkeys(args.conversations))
+    )
+    if pending_map:
+      apply_moves_by_project(app_data_dir, pending_map, include_ls=False)
+      pfile = _pending_moves_path(app_data_dir)
+      if pfile:
+        try:
+          os.remove(pfile)
+        except OSError:
+          pass
+    return
 
   if args.wait_idle:
     sys.exit(
@@ -769,6 +883,7 @@ def main():
   ls_count = update_ls_summaries_project(conv_ids, target_project)
   print(f"[4/4] Updated {ls_count}/{len(conv_ids)} live summary/summaries in Language Server.")
 
+  record_pending_moves(app_data_dir, conv_ids, target_project)
   print("Done!")
 
   # If restart requested, run everything offline while hub daemon is stopped
