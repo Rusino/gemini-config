@@ -7,7 +7,9 @@ description: >-
   test-suite passes with automatic cross-platform fallback), dead-code/uncalled-symbol detection,
   and KEEPER/anti-slop/comment invariant scanning, (2) deep architectural & code-taste review
   (brain-split layers, data races, cache poisoning, shallow wrappers, symptomatic branching),
-  and (3) a Feature & Test Utility Matrix (DELETE / SIMPLIFY / KEEP) with a phased pruning plan.
+  (2.5) a clean-context Skeptic Refutation pass (keeper_skeptic, Hunt then Refute with XFAMILY_REFUTE
+  auto-routing) to refute false-positive bugs and unsafe DELETE/SIMPLIFY proposals, and
+  (3) a Feature & Test Utility Matrix (DELETE / SIMPLIFY / KEEP) with a phased pruning plan.
   Trigger when the user asks to "проведи аудит кода", "беспощадный аудит", "проверь на дублирование
   и ужасы", "код ревью с поиском дублей", "оцени полезность функционала", "найди мёртвый код",
   or "ruthless code review / audit".
@@ -15,7 +17,7 @@ description: >-
 
 # Ruthless Code & Feature Auditor (`ruthless-code-audit`)
 
-Execute a zero-sycophancy, three-stage audit (`1 + 2 + 3`) that exposes code duplication, architectural brain-split, dead/placebo features, invariant breaches, and real bugs, then produces a concrete pruning plan with exact line-count savings.
+Execute a zero-sycophancy audit (`Stage 1 + Stage 2 + Stage 2.5 Skeptic Refutation + Stage 3`) that exposes code duplication, architectural brain-split, dead/placebo features, invariant breaches, and real bugs—filtering out false positives via a clean-context Verification Skeptic before producing a concrete pruning plan with exact line-count savings.
 
 ---
 
@@ -85,6 +87,53 @@ Do not stop at the script output. Inspect the flagged hotspots and read the core
    - **Cache Poisoning & Memory Leaks**: Caching empty/error results when an RPC/subprocess times out; unbounded global caches (`diffCache`, font registries) holding megabytes of dead blobs forever.
    - **Control-Flow Shadowing**: Missing early `return`/`continue` that causes a specific triage branch to fall through and get overwritten by generic scoring at the bottom of a monolithic function; parameters that are always `false` in production because an upstream filter already excluded those items.
    - **Naive Substring / Regex Traps**: Short tags like `"gl"` matching `"glyph"`/`"google"`, or `"gn"` matching `"align"`/`"diagnostic"`.
+
+---
+
+## Stage 2.5: Skeptic Refutation Pass (`Hunt then Refute` + `XFAMILY_REFUTE`)
+
+Before compiling the final report in Stage 3, pass all candidate **`HIGH` / `CRITICAL` production bugs** AND all candidate **`DELETE` / non-trivial `SIMPLIFY` removals** through a single batched clean-context Verification Skeptic (`keeper_skeptic`).
+
+### Why This Pass Is Mandatory
+Aggressive auditors routinely flag functions or endpoints as "dead (`DELETE`)" when they are invoked dynamically (via reflection, CLI subcommands, HTML templates, or external packages), or flag "missing null/bounds checks" that are already guaranteed by upstream `SkASSERT` contracts.
+
+### Automatic Model Routing (`XFAMILY_REFUTE`) & Quota Fallback
+- **`Model="flash"` (Default Fast Skeptic)**: Use when verifying `DELETE` / dead-code candidates, duplicate consolidation (`SIMPLIFY`), and local single-function `HIGH` findings.
+- **`Model="pro"` (Auto-Escalation for Deep Invariants)**: Automatically select `Model="pro"` if **any** candidate in the batch involves:
+  1. Concurrency, locks, data races, or asynchronous lifetimes;
+  2. BiDi, UTF-8 / UTF-16 / grapheme cluster index math, or `SkParagraph` line/run metrics;
+  3. Dropped historical guards (`git log -S` / `git blame`);
+  4. Cross-backend symmetry (`SkParagraph` ↔ `WebParagraph`, ICU ↔ Apple/Client `SkUnicode`);
+  5. Re-verification of a blocking finding marked `UNPROVEN` by `flash`.
+- **Quota Exhaustion Fallback Ladder**:
+  1. **Step 1 — Auto-Downgrade (`pro` → `flash` → `flash_lite`)**: If `Model="pro"` fails due to quota exhaustion or timeout, retry the same Skeptic packet on `Model="flash"` and tag verdicts `[Verified via Flash fallback (Pro quota exhausted)]`.
+  2. **Step 2 — Direct Tool Trace / User Escalation**: If all subagent models hit quota limits, run deterministic caller searches (`git grep`, `grep -rn`, `code_search`) directly for `DELETE` candidates, mark any remaining unverified complex bugs as `[UNVERIFIED: Quota Exhausted]`, and ask the user whether to switch the chat model (`python3 ~/.gemini/config/hooks/chat_lifecycle.py model`) or pause.
+
+### Batched Skeptic Invocation (1 Subagent Packet Per Audit)
+```python
+invoke_subagent(
+    TypeName="keeper_skeptic",
+    Role="Batched Audit Verification Skeptic",
+    Model="<flash or pro per routing rules above>",
+    Workspace="inherit",
+    Prompt="""
+You are the Verification Skeptic (`keeper_skeptic`) auditing candidate findings in `<repo_root>`.
+Your sole job is to REFUTE each candidate below using real code, callers (`git grep`, `grep -rn`, `code_search`), templates, build files, comments, and unit tests.
+
+Candidates Under Test (Batch V001):
+<paste all candidate HIGH/CRITICAL bugs (B1, B2...) and all candidate DELETE / non-trivial SIMPLIFY items (D1, D2...)>
+
+Instructions:
+1. Apply the Three Iron Verification Principles:
+   - **Refute with Code (`file:line`), Never Memory**: Every `REFUTED` verdict must cite the exact `path:line` guard, caller `SkASSERT`, dynamic call site, or exact search command (`git grep` / `code_search`) proving the claim is false.
+   - **Documented Intent Overrides Syntactic Omissions**: Explicit inline comments, header contracts, and tests codifying the behavior refute claims of accidental omission.
+   - **Burden of Proof Requires Reachable Harm**: Missing defensive `if (!ptr)` checks where callers guarantee non-null via `SkASSERT` are REFUTED. A `DELETE` candidate is REFUTED if any production caller, CLI wiring, HTML/JS frontend reference, reflection hook, or cross-repo consumer exists.
+2. Output one verdict (`REFUTED`, `CONFIRMED`, or `UNPROVEN`) per candidate ID with mandatory `path:line` evidence.
+"""
+)
+```
+
+Drop all `REFUTED` items before writing Stage 3. Convert any `UNPROVEN` item into an explicit verification question rather than presenting it as a confirmed defect or safe deletion.
 
 ---
 

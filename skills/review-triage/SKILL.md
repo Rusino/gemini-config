@@ -4,11 +4,13 @@ description: >-
   Automated Code Review Triage and Action Engine for Gerrit CLs, Git PRs, and Piper diffs.
   Classifies incoming reviews into 4 actionable categories: (1) Mechanical/Routine (15s),
   (2) Non-domain/Reassign (30s), (3) Core Domain/Surgical Audit (3–5 min), (4) Low Hygiene/Pushback (1 min).
-  Automatically isolates the core 5% logic hunks, verifies mechanical churn, drafts professional
-  reassignment or pushback messages in English, and pinpoints exact files and line ranges so the reviewer
-  maintains their analytical edge without drowning in diffs. Trigger when user asks to triage, review, or
-  analyze an incoming CL/PR ("разбери СЛ", "сделай триаж ревью", "оцени СЛ", "посмотри этот ревью",
-  "triage this CL/PR", "что делать с этим ревью").
+  Automatically isolates the core 5% logic hunks, verifies mechanical churn, runs a two-stage
+  Hunt then Refute pass (keeper_skeptic with XFAMILY_REFUTE auto-routing) to eliminate false-positive
+  review comments, drafts professional reassignment or pushback messages in English, and pinpoints
+  exact files and line ranges so the reviewer maintains their analytical edge without drowning in
+  diffs. Trigger when user asks to triage, review, or analyze an incoming CL/PR ("разбери СЛ",
+  "сделай триаж ревью", "оцени СЛ", "посмотри этот ревью", "triage this CL/PR",
+  "что делать с этим ревью").
 ---
 
 # Code Review Triage & Action Engine (`review-triage`)
@@ -106,19 +108,26 @@ python3 ~/.gemini/config/skills/review-triage/scripts/triage_cl.py --diff-file /
 
 ---
 
-## Mandatory Ruthless Audit for Every Surviving CL
+## Mandatory Ruthless Audit & Skeptic Refutation Gate for Every Surviving CL
 
 Triage output alone is never the final word. Every CL that stays in the queue after triage (any
 category except a clear 🟡 REASSIGN) must also go through the
 [`ruthless-code-audit`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/ruthless-code-audit/SKILL.md)
-skill before drafts are presented:
+skill and its **Stage 2.5 Skeptic Refutation Pass (`keeper_skeptic`)** before review drafts are presented:
 1. Fetch the current patchset into a separate worktree (never switch branches in an existing
    checkout): `git fetch https://skia.googlesource.com/skia refs/changes/<NN>/<CL>/<PS>`. If the
    stored credentials are rejected, fetch anonymously with
    `git -c credential.helper= -c http.cookiefile=/dev/null fetch ...`.
 2. Run Stage 1 (`ruthless_audit.py ... --diff <parent>`) and Stage 2 (semantic review of the
    pinpointed hunks against the full file, not just the diff).
-3. Fold the confirmed findings into the review drafts; drop LGTM drafts that the audit contradicts.
+3. **Run Stage 2.5 (`keeper_skeptic` Batched Refutation Pass)**:
+   - Whenever Stage 2 raises any `HIGH` / `CRITICAL` candidate defect or architectural pushback, spawn **one batched `keeper_skeptic` subagent** in a clean context to **REFUTE** the candidates using actual callers (`git grep`, `grep -rn`, `code_search`), comments, and tests.
+   - **Automatic Model Routing (`XFAMILY_REFUTE`)**: Use `Model="flash"` for routine local checks; automatically escalate to `Model="pro"` if any candidate involves concurrency/lifetimes, BiDi/UTF-8/UTF-16/grapheme index math, `SkParagraph` line metrics, dropped historical guards (`git log -S`), or cross-backend `SkParagraph` ↔ `WebParagraph` symmetry.
+   - **Quota Fallback**: On `pro` quota exhaustion, auto-downgrade to `Model="flash"` (`[Verified via Flash fallback (Pro quota exhausted)]`); if all models fail, mark the draft `[UNVERIFIED: Quota Exhausted]` and alert the user.
+   - **Apply the Three Skeptic Verdicts to Review Drafts**:
+     - **`REFUTED` (`path:line` guard, caller `SkASSERT`, or documented intent)**: Drop silently—never embarrass the human reviewer with a false positive on Gerrit/GitHub.
+     - **`CONFIRMED` (`entry -> path:line -> bad outcome`)**: Fold into the actionable English review draft; drop any LGTM draft that a confirmed defect contradicts.
+     - **`UNPROVEN` (trace hits an external contract or unverified product intent)**: Convert into a polite, specific **Question for the CL Author** in English (stating what was traced and what remains open) rather than asserting a bug.
 
 ---
 

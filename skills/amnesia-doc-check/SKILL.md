@@ -5,11 +5,14 @@ description: >-
   for incoming and outgoing documents, design docs, slide decks, and substantive technical texts
   (CL/PR descriptions, bug reports, specs, review summaries). Combines (1) a zero-token deterministic
   pass (`check_doc_grounding.py`) for leftover LLM placeholders, intra-document path drift,
-  nonexistent paths, and wrong skill/symbol names, with (2) a single amnesiac subagent pass
+  nonexistent paths, and wrong skill/symbol names, (2) a clean-context Hunter subagent pass
   (zero chat history bias) that checks internal logical/numeric/terminological consistency
   across sections, verifies every path, symbol, CLI flag, and `file:line` mechanism claim
   against actual source code, audits dropped caveats via `git diff`/`git log`, and checks
-  pattern completeness across enumerations and paired docs. Trigger before sharing any document
+  pattern completeness across enumerations and paired docs, and (2.5) a clean-context Skeptic
+  Refutation pass (`keeper_skeptic`, `Hunt then Refute` with `XFAMILY_REFUTE` auto-routing)
+  to filter out false-positive contradiction or mechanism claims before rewriting prose or
+  reporting issues. Trigger before sharing any document
   or substantive technical writeup externally, when reading/implementing from an incoming spec or
   Google Doc, or when the user asks to "проверь документ", "проверь док на лажу",
   "проверь на непротиворечивость", "проверь текст перед отправкой", "сделай амнезия-проверку дока",
@@ -26,7 +29,7 @@ This skill acts as a **compiler + clean-room auditor for technical prose** both 
 
 ## Scope Calibration (When to Run Full vs. Inline)
 
-1. **Full Pipeline (Phase 1 Script + Phase 2 Amnesiac Subagent)**:
+1. **Full Pipeline (Phase 1 Script + Phase 2 Amnesiac Hunter + Phase 2.5 Skeptic Refutation)**:
    - Any standalone outgoing or incoming document/presentation: Google Docs, design docs, specs, architecture proposals, postmortems, audit/benchmark reports, slide decks, `README.md`, `SKILL.md`, or rules files (even if the document is pure prose/strategy with no code links — internal self-consistency still applies).
    - Any multi-paragraph external technical message (detailed CL/PR description, Buganizer / GitHub issue analysis, design review comment, or team chat post) that makes multi-step arguments, presents numbers/tables, or cites file paths, code symbols, CLI flags, commit SHAs, or subsystem mechanics.
 2. **Lightweight Inline Check (Phase 1 + Direct Tool Check, 0 Subagents)**:
@@ -37,7 +40,9 @@ This skill acts as a **compiler + clean-room auditor for technical prose** both 
 ## Core Invariants
 
 1. **Zero-Token First Pass**: Always run [`check_doc_grounding.py`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/amnesia-doc-check/scripts/check_doc_grounding.py) first to catch leftover placeholders, intra-document path conflicts, nonexistent repo paths, and wrong directory prefixes before spawning a subagent.
-2. **Single Amnesiac Subagent**: Spawn **at most one** clean-context subagent (`research-google` or `self`). Pass **only** the raw text of the document, the target repository path(s) (if any), and the Phase 1 script output—never pass the main conversation's reasoning or compromises.
+2. **Two-Stage "Hunt then Refute" Clean-Context Pipeline**:
+   - **Stage A (Hunter)**: Spawn one clean-context subagent (`research-google` or `self`). Pass **only** the raw text of the document, the target repository path(s) (if any), and the Phase 1 script output—never pass the main conversation's reasoning or compromises.
+   - **Stage B (Batched Verification Skeptic)**: Whenever the Hunter flags non-trivial `[Must Fix]` mechanism errors (Section 2) or `Internal Contradictions / Architectural Flaws` (Section 3), spawn **one batched `keeper_skeptic` subagent** (`Model="flash"` by default, auto-escalating to `Model="pro"` for contested multi-layer architecture or subtle code-contract claims) to **REFUTE** false-positive nitpicks before altering the document.
 3. **Internal Self-Consistency First**: A document must not contradict itself across sections, tables, or bullet lists—whether in logic (recommending X in Section 2 while admitting X is broken in Section 5), terminology (calling the same entity by different names in different sections), or arithmetic (summary numbers disagreeing with tables).
 4. **`file:line` Proof Over Plausibility**: Any claim that *"System X works by doing Y"* or *"Config A requires format B"* is treated as false unless backed by an exact `file:line` in actual source code.
 5. **No Silent Approximations**: Paraphrased identifiers (e.g., writing `skia-code-style-audit` when the directory is `skia-style-check`, or `_agents/core_skills.json` when the file is `agents/core_skills.json`) are treated as hard compilation errors.
@@ -64,7 +69,7 @@ Immediately fix any deterministic failures that are obvious typos before or alon
 
 ---
 
-### Phase 2: The Amnesiac Fact-Check Inquisitor (1 Subagent)
+### Phase 2: The Amnesiac Fact-Check Inquisitor (Stage A Hunter Subagent)
 
 Invoke a single clean-context subagent with zero prior conversation history:
 
@@ -129,11 +134,11 @@ For each error:
 - `Actual Reality (`file:line` or repo state)`: <exact path, symbol, or code behavior>
 - `Fix`: <exact replacement text>
 
-### 2. Unverified / Overstated Mechanism Claims
-Claims that lack source-code evidence or overgeneralize (with the exact `file:line` showing the real behavior).
+### 2. Unverified / Overstated Mechanism Claims (M1, M2...)
+For each candidate mechanism error (`M1`, `M2`...), provide the exact quote, section/line, and the `file:line` showing the real behavior.
 
-### 3. Internal Contradictions, Common-Sense & Architectural Flaws
-Conflicts between sections, over-engineered proposals where a trivial fix exists, naked numbers without baselines, or proposals that will break on Day 2.
+### 3. Internal Contradictions, Common-Sense & Architectural Flaws (C1, C2...)
+For each candidate contradiction or flaw (`C1`, `C2`...), cite the conflicting sections/lines, over-engineered proposals where a trivial fix exists, naked numbers without baselines, or proposals that will break on Day 2.
 
 ### 4. Pre-Review Grill (Unanswered Reviewer Questions)
 At most 1–2 tough questions a skeptical reviewer will immediately ask that the document fails to address. Write `None` if the document already anticipates and answers them.
@@ -146,16 +151,54 @@ Brief count of verified paths, symbols, and mechanism claims.
 
 ---
 
+### Phase 2.5: The Skeptic Refutation Pass (Stage B Skeptic Subagent, `Hunt then Refute` + `XFAMILY_REFUTE`)
+
+Hostile document fact-checkers sometimes misread conditional caveats in the prose or over-interpret a simplified architectural diagram as a "contradiction".
+
+Whenever Phase 2 flags non-trivial **Mechanism Claims (`M1, M2...`)** or **Internal Contradictions / Architectural Flaws (`C1, C2...`)** (skip if Phase 2 only found deterministic path/typo fixes or returned `None`), spawn **one batched `keeper_skeptic` subagent** in a clean context to challenge those findings before rewriting the document:
+
+1. **Automatic Model Routing (`XFAMILY_REFUTE`) & Quota Fallback**:
+   - **`Model="flash"` (Default Fast Skeptic)**: Use for routine prose self-consistency, arithmetic, and straightforward `file:line` mechanism checks.
+   - **`Model="pro"` (Auto-Escalation)**: Escalate to `Model="pro"` when a candidate disputes deep subsystem contracts (concurrency, BiDi/UTF-8/UTF-16/grapheme math, `SkParagraph` ↔ `WebParagraph` architecture) or when `flash` returns `UNPROVEN`.
+   - **Quota Fallback**: On `pro` quota exhaustion, auto-downgrade to `Model="flash"` (`[Verified via Flash fallback (Pro quota exhausted)]`); if all subagent models are exhausted, verify the cited `file:line` and prose section directly via `read_file` or mark `[UNVERIFIED: Quota Exhausted]` and alert the user.
+
+2. **Batched Skeptic Invocation**:
+```python
+invoke_subagent(
+    TypeName="keeper_skeptic",
+    Role="Batched Document Verification Skeptic",
+    Model="<flash or pro per routing rules above>",
+    Workspace="inherit",
+    Prompt="""
+You are the Verification Skeptic (`keeper_skeptic`) for a technical document audit of `<path_to_draft>`.
+Your sole job is to REFUTE each candidate finding below using the actual document text and source files in `<repo_paths>`. A refutation you cannot prove with an exact `section:line` quote or `path:line` code citation is a confirmation, not a dismissal.
+
+Candidates Under Test (Batch V001):
+<paste all candidate Mechanism Claims (M1, M2...) and Internal Contradictions / Architectural Flaws (C1, C2...)>
+
+Instructions:
+1. Apply the Three Iron Verification Principles:
+   - **Refute with Text & Code (`section:line` or `path:line`), Never Memory**: Quote the exact sentence/table in the document or the exact `path:line` in the codebase that resolves the alleged error.
+   - **Documented Scope & Caveats Override Pedantic Nitpicks**: If the document explicitly scopes a claim or states the caveat in an adjacent section/footnote, a claim that it "ignores edge case X" is `REFUTED`.
+   - **Burden of Proof Requires Material Inaccuracy**: Stylistic phrasing preferences that do not alter factual accuracy or operational behavior are `REFUTED`.
+2. Output one verdict (`REFUTED`, `CONFIRMED`, or `UNPROVEN`) per candidate ID (`M1...`, `C1...`) with mandatory evidence citations.
+"""
+)
+```
+
+---
+
 ### Phase 3: Remediation & Verification Summary
 
-1. **Apply All Fact-Check Fixes & Resolve Pre-Review Grill**:
+1. **Apply Confirmed Fact-Check Fixes & Resolve Pre-Review Grill**:
+   - Discard any Phase 2 finding that `keeper_skeptic` marked **`REFUTED`**.
    - If the user owns/authors the draft:
-     - Apply every `[Must Fix]` correction and resolve internal contradictions before presenting or publishing the text.
-     - For any **Pre-Review Grill** question: if the answer is already determinable from the codebase or conversation context, **silently add a concise 1-sentence explanation** to the document to preempt the reviewer's question. Ask the user **only** if it exposes a genuine unresolved product/design decision that cannot be answered from code.
+     - Apply every surviving **`CONFIRMED`** `[Must Fix]` correction and resolve confirmed internal contradictions before presenting or publishing the text.
+     - For any **Pre-Review Grill** question or **`UNPROVEN`** skeptic item: if the answer is already determinable from the codebase or conversation context, **silently add a concise 1-sentence explanation** to the document to preempt the reviewer's question. Ask the user **only** if it exposes a genuine unresolved product/design decision that cannot be answered from code.
      - Re-run `check_doc_grounding.py` to confirm `0` unresolved placeholders or accidental broken paths.
-   - If the user asked to review someone else's document: present the categorized findings directly in chat with clickable `[filename](file:///path#L123)` links to the proving source lines.
+   - If the user asked to review someone else's document: present only the `CONFIRMED` findings (and any `UNPROVEN` open questions) directly in chat with clickable `[filename](file:///path#L123)` links to the proving source lines.
 
 2. **Report Concise Audit Telemetry in Chat**:
    - **Grounding Status**: `<N> paths/names verified, <M> factual/referential errors caught`
-   - **Mechanism Claims**: `<K> verified against file:line, <J> refuted/corrected`
-   - **Contradictions / Placeholders**: Summary of any cross-section conflicts or stripped LLM scaffolding.
+   - **Mechanism & Logic Claims**: `<K> confirmed, <R> false-positive claims refuted by Skeptic`
+   - **Contradictions / Placeholders**: Summary of any confirmed cross-section conflicts or stripped LLM scaffolding.

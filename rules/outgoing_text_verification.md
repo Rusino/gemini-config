@@ -9,18 +9,18 @@ Code has a compiler; prose documents do not, and incoming specs or code snippets
 
 ## 1. Documents & Technical Prose (`amnesia-doc-check`)
 
-1. **Outgoing Documents & Substantive Technical Writeups -> Full `amnesia-doc-check` (Script + Clean-Context Subagent)**:
+1. **Outgoing Documents & Substantive Technical Writeups -> Full `amnesia-doc-check` (Script + Two-Stage Clean-Context Pipeline)**:
    - **Applies to**:
      - Any standalone document or presentation: Google Docs (`update_doc`, `create_file`), design docs, architecture proposals, postmortems, audit/benchmark reports, slide decks, `README.md`, `SKILL.md`, or agent rule files.
      - Any multi-paragraph outgoing technical text (detailed CL/PR descriptions, Buganizer / GitHub issue writeups, design review comments, or team chat posts) that presents multi-step arguments/tables or cites file paths, skill/target names, code symbols, CLI flags, commit SHAs, or subsystem mechanics.
    - **Required Action**: Before updating a Google Doc, creating a shareable deliverable, or presenting the final draft to the user to send externally, execute the `amnesia-doc-check` skill (`~/.gemini/config/skills/amnesia-doc-check/SKILL.md`):
      1. Run `python3 ~/.gemini/config/skills/amnesia-doc-check/scripts/check_doc_grounding.py --repo <repo> <draft>` to catch leftover placeholders (`[find link]`, `TBD`), intra-document path drift, missing paths, and paraphrased skill/directory names.
-     2. Spawn a single clean-context subagent (with zero chat history bias) to verify both **external grounding** (every path, symbol, CLI flag, and `file:line` mechanism claim) and **internal content self-consistency** (cross-section contradictions between proposals and caveats, terminology/naming drift across sections, summary-vs-table arithmetic, and problem-to-solution alignment).
+     2. Spawn a clean-context Hunter subagent (with zero chat history bias) to verify both **external grounding** (every path, symbol, CLI flag, and `file:line` mechanism claim) and **internal content self-consistency** (cross-section contradictions between proposals and caveats, terminology/naming drift across sections, summary-vs-table arithmetic, and problem-to-solution alignment), followed by a batched `keeper_skeptic` refutation pass (`Hunt then Refute` with `XFAMILY_REFUTE` auto-routing) whenever non-trivial mechanism or contradiction findings are raised.
 
 2. **Incoming Documents & Specs -> Verify Before Trusting (`amnesia-doc-check` on Read)**:
    - **Applies to**: Any Google Doc (`read_file_content`, `read_doc`), local `.md` design doc/spec, bug report, or multi-paragraph technical text that the user asks you to read, review, analyze, or implement from.
    - **Required Action**: Never trust an incoming document's technical claims or paths at face value:
-     1. Run `check_doc_grounding.py` against the document text (when a target repository applies) and verify its cited paths, symbols, CLI flags, `file:line` mechanism claims, and internal self-consistency against actual source files (using a clean-context subagent for substantive docs/specs).
+     1. Run `check_doc_grounding.py` against the document text (when a target repository applies) and verify its cited paths, symbols, CLI flags, `file:line` mechanism claims, and internal self-consistency against actual source files (using the clean-context Hunter + Skeptic pipeline for substantive docs/specs).
      2. Surface a concise grounding verdict at the top of your response (`Grounding OK` or the exact factual/logical discrepancies against the codebase) before answering or implementing from the document.
 
 3. **Short Replies & Trivial Commit Messages -> Inline Grounding (0 Subagents)**:
@@ -33,7 +33,7 @@ Code has a compiler; prose documents do not, and incoming specs or code snippets
    - **Applies to**: Any source code modifications in a repository before committing (`git commit`), uploading (`git cl upload`, `gh pr create`), or reporting the implementation as complete.
    - **Required Action**: Execute the `amnesia-precommit` workflow (`~/.gemini/config/skills/amnesia-precommit/SKILL.md`):
      1. Run `python3 ~/.gemini/config/skills/code-comments/scripts/audit_comments.py --diff HEAD --repo <repo>` and `python3 ~/.gemini/config/skills/ruthless-code-audit/scripts/ruthless_audit.py <repo> --repo <repo> --diff HEAD` (plus `SKIP_GCE_AUTH_FOR_GIT=1 git cl presubmit --force` if `PRESUBMIT.py` exists).
-     2. For non-trivial diffs, spawn a single clean-context subagent (`keeper_inquisitor` or `self`) to shrink drive-by changes, verify dropped guards via `git log -S`, check pattern completeness across all callers/backends, and enforce KEEPER invariants (`cpp_systems_invariants.md`, `text_domain_invariants.md`, `code_style.md`).
+     2. For non-trivial diffs, run the two-stage **Hunt then Refute** clean-context pipeline: spawn a Hunter subagent (`keeper_inquisitor` or `self`) to shrink drive-by changes, verify dropped guards via `git log -S`, check pattern completeness across all callers/backends, and enforce KEEPER invariants (`cpp_systems_invariants.md`, `text_domain_invariants.md`, `code_style.md`), then challenge any candidate `HIGH`/`CRITICAL` defects or non-trivial code removals with a single batched `keeper_skeptic` refutation pass (`Model="flash"` by default, escalating to `Model="pro"` for deep invariants, with automatic `pro` → `flash` → Trapsmith TDD fallback on quota exhaustion).
 
 2. **Outgoing Code Snippets in Chat (>5 Lines) -> Inline Invariant Check (0 Subagents)**:
    - **Applies to**: Any non-trivial code block or patch (>5 lines) proposed in chat.
