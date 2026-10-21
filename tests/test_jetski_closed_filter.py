@@ -178,11 +178,32 @@ class FakeElement {
 }
 
 function matches(el, selector) {
+  if (selector.includes(',')) {
+    return selector.split(',').some((part) => matches(el, part.trim()));
+  }
   if (selector === 'span') return el.tagName === 'SPAN';
   if (selector === 'span.truncate') return el.tagName === 'SPAN' && el.className === 'truncate';
   if (selector === 'a[aria-label]') return el.tagName === 'A' && el.hasAttribute('aria-label');
   if (selector === 'button[aria-label="Display Options"]') {
     return el.tagName === 'BUTTON' && el.getAttribute('aria-label') === 'Display Options';
+  }
+  if (selector === 'script[src*="jetski-closed-filter.js"]') {
+    return el.tagName === 'SCRIPT' && (el.getAttribute('src') || '').includes('jetski-closed-filter.js');
+  }
+  if (selector === '[data-testid="titlebar-more-actions"]') {
+    return el.getAttribute('data-testid') === 'titlebar-more-actions';
+  }
+  if (selector === '[data-testid="conversation-pin-button"]') {
+    return el.getAttribute('data-testid') === 'conversation-pin-button';
+  }
+  if (selector === '[data-testid="conversation-archive-button"]') {
+    return el.getAttribute('data-testid') === 'conversation-archive-button';
+  }
+  if (selector === '[data-testid="conversation-row-sidebar"][data-cascade-id]') {
+    return (
+      el.getAttribute('data-testid') === 'conversation-row-sidebar' &&
+      el.hasAttribute('data-cascade-id')
+    );
   }
   if (selector === 'div[data-sidebar-row-id]') {
     return el.tagName === 'DIV' && el.hasAttribute('data-sidebar-row-id');
@@ -221,6 +242,30 @@ const emptyProjSpan = new FakeElement('span');
 emptyProjSpan.textContent = 'No conversations yet';
 emptyProjContainer.appendChild(emptyProjSpan);
 bodyEl.appendChild(emptyProjContainer);
+
+// Titlebar with more-actions button for an open chain chat ('open-current')
+const titlebarToolbar = new FakeElement('div');
+const moreActionsBtn = new FakeElement('button');
+moreActionsBtn.setAttribute('data-testid', 'titlebar-more-actions');
+moreActionsBtn.__reactFiber$titlebar = {
+  memoizedProps: {},
+  return: {
+    memoizedProps: { cascadeId: 'open-current' },
+  },
+};
+titlebarToolbar.appendChild(moreActionsBtn);
+bodyEl.appendChild(titlebarToolbar);
+
+// Sidebar row with hover action bar for 'solo-active'
+const sidebarRow = new FakeElement('div');
+sidebarRow.setAttribute('data-testid', 'conversation-row-sidebar');
+sidebarRow.setAttribute('data-cascade-id', 'solo-active');
+const rowHoverBar = new FakeElement('div');
+const pinBtn = new FakeElement('button');
+pinBtn.setAttribute('data-testid', 'conversation-pin-button');
+rowHoverBar.appendChild(pinBtn);
+sidebarRow.appendChild(rowHoverBar);
+bodyEl.appendChild(sidebarRow);
 
 function makeSummary(title, projectId, extraMeta = {}, archived = false) {
   return {
@@ -286,12 +331,41 @@ displayOptionsBtn.__reactFiber$test = {
 const storage = new Map();
 let observerCallback = null;
 let rafCallbacks = [];
+const rpcRequests = [];
 
 global.window = {
   innerWidth: 1280,
+  __APP_CONFIG__: { csrfToken: 'test-csrf-token' },
   localStorage: {
     getItem: (k) => (storage.has(k) ? storage.get(k) : null),
     setItem: (k, v) => storage.set(k, String(v)),
+  },
+  fetch: async (url, opts) => {
+    if (String(url).includes('jetski-chains.json')) {
+      return {
+        ok: true,
+        json: async () => ({
+          parentOf: {
+            'open-step': 'open-root',
+            'open-current': 'open-step',
+          },
+          createdAt: {
+            'open-root': '2026-10-21T09:00:00Z',
+            'open-step': '2026-10-21T09:30:00Z',
+            'open-current': '2026-10-21T10:05:00Z',
+          },
+        }),
+      };
+    }
+    if (String(url).includes('UpdateConversationAnnotations')) {
+      rpcRequests.push({
+        url,
+        headers: opts?.headers || {},
+        body: JSON.parse(opts?.body || '{}'),
+      });
+      return { ok: true, status: 200 };
+    }
+    return { ok: false, status: 404 };
   },
 };
 global.document = {
@@ -419,7 +493,89 @@ eval(code);
 const btnsAfterReload = actionRow.querySelectorAll('.jetski-closed-chats-filter-btn');
 assert.strictEqual(btnsAfterReload.length, 1, 'Reloading script must not duplicate button');
 
-console.log('ALL_JS_ASSERTIONS_PASSED');
+(async () => {
+  const titlebarBtn = titlebarToolbar.querySelector('.jetski-titlebar-close-reopen-btn');
+  assert(titlebarBtn, 'Titlebar Close/Reopen button must be injected before titlebar-more-actions');
+  assert.strictEqual(titlebarToolbar.children[0], titlebarBtn);
+  assert.strictEqual(titlebarBtn.getAttribute('aria-label'), 'Close chat');
+  assert.strictEqual(titlebarBtn.getAttribute('data-finalized'), 'false');
+
+  const rowBtn = rowHoverBar.querySelector('.jetski-row-close-reopen-btn');
+  assert(rowBtn, 'Sidebar row Close/Reopen button must be injected before pin button');
+  assert.strictEqual(rowHoverBar.children[0], rowBtn);
+  assert.strictEqual(rowBtn.getAttribute('aria-label'), 'Close chat');
+  assert.strictEqual(rowBtn.getAttribute('data-finalized'), 'false');
+
+  // Clicking the sidebar row Close button on a solo chat swaps its marker to «»
+  rpcRequests.length = 0;
+  rowBtn.dispatchEvent('pointerdown', { button: 0 });
+  await new Promise((r) => setTimeout(r, 10));
+
+  assert.strictEqual(
+    storeState.trajectorySummaries.summaries['solo-active'].summary,
+    '[10:00] «» Active solo task'
+  );
+  assert.strictEqual(rowBtn.getAttribute('aria-label'), 'Reopen chat');
+  assert.strictEqual(rowBtn.getAttribute('data-finalized'), 'true');
+  assert.strictEqual(rpcRequests.length, 1);
+  assert.deepStrictEqual(rpcRequests[0].body, {
+    cascadeIds: ['solo-active'],
+    annotations: { title: '[10:00] «» Active solo task' },
+    mergeAnnotations: true,
+  });
+  assert.strictEqual(rpcRequests[0].headers['x-codeium-csrf-token'], 'test-csrf-token');
+
+  // Clicking the titlebar Close button on a chain member closes the entire chain [open-root, open-step, open-current]
+  rpcRequests.length = 0;
+  titlebarBtn.dispatchEvent('pointerdown', { button: 0 });
+  await new Promise((r) => setTimeout(r, 10));
+
+  assert.strictEqual(
+    storeState.trajectorySummaries.summaries['open-root'].summary,
+    '[09:00] « Open chain topic'
+  );
+  assert.strictEqual(
+    storeState.trajectorySummaries.summaries['open-step'].summary,
+    '[09:30] ‹✓› Open chain topic'
+  );
+  assert.strictEqual(
+    storeState.trajectorySummaries.summaries['open-current'].summary,
+    '[10:05] » Open chain topic'
+  );
+  assert.strictEqual(titlebarBtn.getAttribute('aria-label'), 'Reopen chat');
+  assert.strictEqual(titlebarBtn.getAttribute('data-finalized'), 'true');
+  assert.strictEqual(rpcRequests.length, 3);
+
+  // Clicking the titlebar Reopen button reopens the entire chain back to [▸, ✓, ⦿]
+  rpcRequests.length = 0;
+  // Wait > 300ms debounce or trigger via fresh click after advancing Date.now
+  const origNow = Date.now;
+  Date.now = () => origNow() + 500;
+  titlebarBtn.dispatchEvent('pointerdown', { button: 0 });
+  await new Promise((r) => setTimeout(r, 10));
+  Date.now = origNow;
+
+  assert.strictEqual(
+    storeState.trajectorySummaries.summaries['open-root'].summary,
+    '[09:00] ▸ Open chain topic'
+  );
+  assert.strictEqual(
+    storeState.trajectorySummaries.summaries['open-step'].summary,
+    '[09:30] ✓ Open chain topic'
+  );
+  assert.strictEqual(
+    storeState.trajectorySummaries.summaries['open-current'].summary,
+    '[10:05] ⦿ Open chain topic'
+  );
+  assert.strictEqual(titlebarBtn.getAttribute('aria-label'), 'Close chat');
+  assert.strictEqual(titlebarBtn.getAttribute('data-finalized'), 'false');
+  assert.strictEqual(rpcRequests.length, 3);
+
+  console.log('ALL_JS_ASSERTIONS_PASSED');
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
 """
     env = os.environ.copy()
     env["ELECTRON_RUN_AS_NODE"] = "1"

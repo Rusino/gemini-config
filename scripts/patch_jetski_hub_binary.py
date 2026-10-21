@@ -62,6 +62,16 @@ def sync_artifact_js(
   os.makedirs(os.path.dirname(dst), exist_ok=True)
   shutil.copyfile(src, dst)
   print(f"[OK] Synced {src} -> {dst}")
+  # Export the initial handoff chain index so UI Close/Reopen buttons resolve chains immediately
+  hooks_dir = os.path.join(os.path.dirname(SCRIPT_DIR), "hooks")
+  if hooks_dir not in sys.path:
+    sys.path.insert(0, hooks_dir)
+  try:
+    import chat_lifecycle  # pylint: disable=g-import-not-at-top
+
+    chat_lifecycle.export_chain_index()
+  except Exception:
+    pass
 
 
 SAR_BIN_RELPATH = (

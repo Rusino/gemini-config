@@ -1159,6 +1159,23 @@ class TestChatLifecycle(unittest.TestCase):
       self.assertEqual(res_inh["enum"], "M_PRO")
       self.assertEqual(res_inh["source"], "inherited")
 
+  def test_export_chain_index_writes_jetski_chains_json(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.write_chain(tmp_dir, [("c1", None), ("c2", "c1"), ("c3", "c2")])
+      self.write_titles(tmp_dir, {
+          "c1": "[10:00] ▸ First",
+          "c2": "[10:30] ✓ Second",
+          "c3": "[11:00] ⦿ Third",
+      })
+      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
+           patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=False):
+        chat_lifecycle.finalize_conversation_chain("c3")
+        idx_path = os.path.join(tmp_dir, "brain", chat_lifecycle.CHAIN_INDEX_FILE_NAME)
+        self.assertTrue(os.path.isfile(idx_path))
+        with open(idx_path, "r", encoding="utf-8") as f:
+          data = json.load(f)
+        self.assertEqual(data["parentOf"], {"c2": "c1", "c3": "c2"})
+
 
 if __name__ == "__main__":
   unittest.main()

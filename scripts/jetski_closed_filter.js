@@ -11,18 +11,35 @@
   const STORAGE_ENABLED_KEY = 'jetski_closed_filter_enabled';
   const STORAGE_SCOPE_KEY = 'jetski_closed_filter_scope';
   const BUTTON_CLASS = 'jetski-closed-chats-filter-btn';
+  const TITLEBAR_BTN_CLASS = 'jetski-titlebar-close-reopen-btn';
+  const ROW_BTN_CLASS = 'jetski-row-close-reopen-btn';
   const STYLE_ID = 'jetski-closed-chats-filter-style';
 
   // Lifecycle titles follow "[HH:MM] <marker> <Topic>" where marker encodes chain state
   // The time prefix and the space after the marker are mandatory so a plain title opening
   // with a guillemet quote is never read as the finalized « marker
   const TITLE_MARKER_RE = /^\s*\[\d{1,2}:\d{2}\]\s*(‹✓›|«»|[✓⦿▸«»])(?:\s|$)/u;
+  const TIME_PREFIX_EXTRACT_RE = /^\s*\[(\d{1,2}:\d{2})\]/;
+  const CONT_WORD = '(?:\\u043f\\u0440\\u043e\\u0434\\u043e\\u043b\\u0436\\u0435\\u043d\\u0438\\u0435|continue)';
+  const TITLE_CLEANUP_RE = new RegExp(
+    `^(?:\\s*\\[\\d{1,2}:\\d{2}(?:\\s+${CONT_WORD})?\\]\\s*(?:‹✓›|«»|[▸✓⦿«»]|\\s*)*)|^(?:${CONT_WORD}(?:\\s+\\d{1,2}:\\d{2})?\\s*:\\s*)+`,
+    'iu'
+  );
+  const TRAILING_CLEANUP_RE = new RegExp(
+    `\\s*\\(${CONT_WORD}\\s+(?:\\d{4}-\\d{2}-\\d{2}\\s+)?\\d{1,2}:\\d{2}\\)\\s*$`,
+    'iu'
+  );
   // chat_lifecycle.py finalize rewrites every chat of a chain to «, ‹✓›, » (or «» for a
   // single-chat task), so each title alone tells whether its task is closed
   const FINALIZED_MARKERS = new Set(['«', '‹✓›', '»', '«»']);
   // Open chains read ▸ root, ✓ handed-off steps, ⦿ current chat
   const OPEN_CHAIN_ROOT_MARKER = '▸';
   const OPEN_CHAIN_STEP_MARKER = '✓';
+  const OPEN_ACTIVE_MARKER = '⦿';
+  const CLOSED_START_MARKER = '«';
+  const CLOSED_STEP_MARKER = '‹✓›';
+  const CLOSED_END_MARKER = '»';
+  const CLOSED_SINGLE_MARKER = '«»';
 
   function safeGetStorage(key) {
     try {
@@ -56,11 +73,313 @@
   let isInternalDispatch = false;
   let rafScheduled = false;
   let activeHoverBtn = null;
+  let chainIndexCache = null;
+  let chainIndexFetchedAt = 0;
 
   function parseTitleMarker(title) {
     if (typeof title !== 'string') return null;
     const match = TITLE_MARKER_RE.exec(title);
     return match ? match[1] : null;
+  }
+
+  function isFinalizedTitle(title) {
+    const marker = parseTitleMarker(title);
+    return Boolean(marker && FINALIZED_MARKERS.has(marker));
+  }
+
+  function getCurrentTimeStr() {
+    try {
+      const fmt = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'America/New_York',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      });
+      const parts = fmt.formatToParts(new Date());
+      let hh = '00';
+      let mm = '00';
+      for (const p of parts) {
+        if (p.type === 'hour') hh = p.value === '24' ? '00' : p.value.padStart(2, '0');
+        if (p.type === 'minute') mm = p.value.padStart(2, '0');
+      }
+      return `${hh}:${mm}`;
+    } catch {
+      const d = new Date();
+      return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    }
+  }
+
+  function extractTimePrefix(title, fallbackTime) {
+    if (typeof title === 'string') {
+      const m = TIME_PREFIX_EXTRACT_RE.exec(title);
+      if (m) {
+        const [h, min] = m[1].split(':');
+        return `${h.padStart(2, '0')}:${min}`;
+      }
+    }
+    return fallbackTime || getCurrentTimeStr();
+  }
+
+  function cleanBaseTitle(title) {
+    if (typeof title !== 'string' || !title) return '';
+    let s = title.replace(TITLE_CLEANUP_RE, '').trim();
+    s = s.replace(TRAILING_CLEANUP_RE, '').trim();
+    return s;
+  }
+
+  function getCsrfToken() {
+    if (window.__APP_CONFIG__?.csrfToken) {
+      return window.__APP_CONFIG__.csrfToken;
+    }
+    const scripts = document.querySelectorAll('script[src*="jetski-closed-filter.js"]');
+    for (const s of scripts) {
+      const src = s.getAttribute('src') || '';
+      const m = /[?&]csrf=([^&]+)/.exec(src);
+      if (m) {
+        try {
+          return decodeURIComponent(m[1]);
+        } catch {
+          return m[1];
+        }
+      }
+    }
+    return '';
+  }
+
+  async function fetchChainIndex() {
+    const now = Date.now();
+    if (chainIndexCache && now - chainIndexFetchedAt < 5000) {
+      return chainIndexCache;
+    }
+    if (typeof window.fetch !== 'function') {
+      return chainIndexCache || { parentOf: {}, createdAt: {} };
+    }
+    try {
+      const csrf = encodeURIComponent(getCsrfToken());
+      const resp = await window.fetch(
+        `/static/artifacts/jetski-chains.json?v=${now}&csrf=${csrf}`
+      );
+      if (resp && resp.ok) {
+        const data = await resp.json();
+        if (data && typeof data === 'object') {
+          chainIndexCache = {
+            parentOf: data.parentOf || {},
+            createdAt: data.createdAt || {},
+          };
+          chainIndexFetchedAt = now;
+          return chainIndexCache;
+        }
+      }
+    } catch {
+      // Ignore network errors and fall back to cached or single-chat resolution
+    }
+    return chainIndexCache || { parentOf: {}, createdAt: {} };
+  }
+
+  function resolveChainIds(cascadeId, chainIndex, summariesMap) {
+    if (!cascadeId) return [];
+    const parentOf = chainIndex?.parentOf || {};
+    const createdAt = { ...(chainIndex?.createdAt || {}) };
+    if (summariesMap) {
+      for (const [cid, s] of Object.entries(summariesMap)) {
+        const ts = s?.trajectoryMetadata?.createdAt;
+        if (ts && !createdAt[cid]) {
+          createdAt[cid] = String(ts);
+        }
+      }
+    }
+
+    const childrenOf = {};
+    for (const [child, parent] of Object.entries(parentOf)) {
+      if (!parent) continue;
+      if (!childrenOf[parent]) childrenOf[parent] = [];
+      childrenOf[parent].push(child);
+    }
+
+    const ancReversed = [];
+    const seenAnc = new Set();
+    let cur = cascadeId;
+    while (cur && !seenAnc.has(cur)) {
+      seenAnc.add(cur);
+      ancReversed.push(cur);
+      cur = parentOf[cur];
+    }
+    const ancestors = ancReversed.reverse();
+    const rootId = ancestors[0] || cascadeId;
+    if (!childrenOf[rootId] && ancestors.length <= 1) {
+      return [cascadeId];
+    }
+
+    const memoMaxTs = {};
+    const memoHasChildren = {};
+    function getSubtreeInfo(nid, visited) {
+      if (nid in memoMaxTs) {
+        return [memoMaxTs[nid], memoHasChildren[nid]];
+      }
+      const nextVisited = new Set(visited);
+      nextVisited.add(nid);
+      const chList = (childrenOf[nid] || []).filter((ch) => !nextVisited.has(ch));
+      let maxTs = createdAt[nid] || '';
+      for (const ch of chList) {
+        const [chTs] = getSubtreeInfo(ch, nextVisited);
+        if (chTs > maxTs) maxTs = chTs;
+      }
+      memoMaxTs[nid] = maxTs;
+      memoHasChildren[nid] = chList.length > 0;
+      return [maxTs, chList.length > 0];
+    }
+    getSubtreeInfo(rootId, new Set());
+
+    const ordered = [];
+    const seen = new Set();
+    function dfs(nid) {
+      if (seen.has(nid)) return;
+      seen.add(nid);
+      ordered.push(nid);
+      const chList = (childrenOf[nid] || []).filter((ch) => !seen.has(ch));
+      chList.sort((a, b) => {
+        const maxA = memoMaxTs[a] || '';
+        const maxB = memoMaxTs[b] || '';
+        if (maxA !== maxB) return maxA < maxB ? -1 : 1;
+        const hasA = memoHasChildren[a] ? 1 : 0;
+        const hasB = memoHasChildren[b] ? 1 : 0;
+        if (hasA !== hasB) return hasA - hasB;
+        const tsA = createdAt[a] || '';
+        const tsB = createdAt[b] || '';
+        if (tsA !== tsB) return tsA < tsB ? -1 : 1;
+        return a < b ? -1 : a > b ? 1 : 0;
+      });
+      for (const ch of chList) dfs(ch);
+    }
+    dfs(rootId);
+
+    const fullChain = [];
+    const seenOut = new Set();
+    for (const cid of [...ancestors, ...ordered]) {
+      if (cid && !seenOut.has(cid)) {
+        seenOut.add(cid);
+        fullChain.push(cid);
+      }
+    }
+    return fullChain.length > 0 ? fullChain : [cascadeId];
+  }
+
+  function cloneSummaryWithTitle(summary, newTitle) {
+    if (!summary) return summary;
+    const summaryProto = Object.getPrototypeOf(summary);
+    const nextSummary = Object.assign(Object.create(summaryProto), summary);
+    nextSummary.summary = newTitle;
+    const prevAnn = summary.annotations;
+    const nextAnn = prevAnn
+      ? Object.assign(Object.create(Object.getPrototypeOf(prevAnn)), prevAnn)
+      : {};
+    nextAnn.title = newTitle;
+    nextSummary.annotations = nextAnn;
+    return nextSummary;
+  }
+
+  function getTitleForCascadeId(cascadeId, fallbackDomTitle) {
+    const store = findReduxStore();
+    const s = store?.getState()?.trajectorySummaries?.summaries?.[cascadeId];
+    const fromStore = s?.annotations?.title || s?.summary || '';
+    return fromStore || fallbackDomTitle || '';
+  }
+
+  async function postUpdateTitleRpc(cascadeId, newTitle) {
+    if (typeof window.fetch !== 'function') return false;
+    try {
+      const resp = await window.fetch(
+        '/exa.language_server_pb.LanguageServerService/UpdateConversationAnnotations',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-codeium-csrf-token': getCsrfToken(),
+          },
+          body: JSON.stringify({
+            cascadeIds: [cascadeId],
+            annotations: { title: newTitle },
+            mergeAnnotations: true,
+          }),
+        }
+      );
+      return Boolean(resp && resp.ok);
+    } catch {
+      return false;
+    }
+  }
+
+  async function toggleConversationLifecycle(cascadeId, fallbackDomTitle) {
+    if (!cascadeId) return;
+    const store = findReduxStore();
+    const summariesMap = store?.getState()?.trajectorySummaries?.summaries || {};
+    const curTitle = getTitleForCascadeId(cascadeId, fallbackDomTitle);
+    const closing = !isFinalizedTitle(curTitle);
+    const nowTime = getCurrentTimeStr();
+
+    const chainIndex = await fetchChainIndex();
+    const chainIds = resolveChainIds(cascadeId, chainIndex, summariesMap);
+
+    let chainTopic = 'Investigation';
+    for (let i = chainIds.length - 1; i >= 0; i--) {
+      const t = cleanBaseTitle(
+        getTitleForCascadeId(chainIds[i], chainIds[i] === cascadeId ? fallbackDomTitle : '')
+      );
+      if (t && t !== 'Investigation') {
+        chainTopic = t;
+        break;
+      }
+    }
+
+    const titleUpdates = [];
+    for (let idx = 0; idx < chainIds.length; idx++) {
+      const cid = chainIds[idx];
+      const existingTitle = getTitleForCascadeId(
+        cid,
+        cid === cascadeId ? fallbackDomTitle : ''
+      );
+      let marker = OPEN_ACTIVE_MARKER;
+      if (chainIds.length === 1) {
+        marker = closing ? CLOSED_SINGLE_MARKER : OPEN_ACTIVE_MARKER;
+      } else if (idx === 0) {
+        marker = closing ? CLOSED_START_MARKER : OPEN_CHAIN_ROOT_MARKER;
+      } else if (idx === chainIds.length - 1) {
+        marker = closing ? CLOSED_END_MARKER : OPEN_ACTIVE_MARKER;
+      } else {
+        marker = closing ? CLOSED_STEP_MARKER : OPEN_CHAIN_STEP_MARKER;
+      }
+
+      const ts =
+        chainIds.length === 1 && !closing
+          ? nowTime
+          : extractTimePrefix(existingTitle, nowTime);
+      const base = cleanBaseTitle(existingTitle) || chainTopic;
+      const newTitle = `[${ts}] ${marker} ${base}`;
+      titleUpdates.push([cid, newTitle]);
+    }
+
+    if (store && store.getState()?.trajectorySummaries?.summaries) {
+      const currentSummaries = store.getState().trajectorySummaries.summaries;
+      const batchUpdates = [];
+      for (const [cid, newTitle] of titleUpdates) {
+        const s = currentSummaries[cid];
+        if (s) {
+          batchUpdates.push([cid, cloneSummaryWithTitle(s, newTitle)]);
+        }
+      }
+      if (batchUpdates.length > 0) {
+        store.dispatch({
+          type: 'trajectorySummaries/applyStreamBatch',
+          payload: { updates: batchUpdates, deletes: [] },
+        });
+      }
+    }
+
+    runFullSync();
+
+    await Promise.all(
+      titleUpdates.map(([cid, newTitle]) => postUpdateTitleRpc(cid, newTitle))
+    );
   }
 
   // 'closed' hides only finalized chains («, ‹✓›, », «») while keeping all steps (▸, ✓, ⦿)
@@ -400,6 +719,76 @@
       .${BUTTON_CLASS} .jetski-filter-badge {
         font-variant-numeric: tabular-nums;
         font-weight: 600;
+      }
+      .${TITLEBAR_BTN_CLASS} {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 4px;
+        height: 24px;
+        padding: 0 8px;
+        border-radius: 6px;
+        border: 1px solid rgba(128, 134, 139, 0.25);
+        background: rgba(128, 134, 139, 0.10);
+        color: var(--secondary-foreground, #c4c7c5);
+        font-family: inherit;
+        font-size: 11.5px;
+        font-weight: 500;
+        line-height: 1;
+        white-space: nowrap;
+        cursor: pointer;
+        user-select: none;
+        flex-shrink: 0;
+        transition: background-color 120ms ease, color 120ms ease, border-color 120ms ease;
+      }
+      .${TITLEBAR_BTN_CLASS} > * {
+        pointer-events: none;
+      }
+      .${TITLEBAR_BTN_CLASS}:hover {
+        background: var(--secondary, rgba(128, 134, 139, 0.22));
+        color: var(--foreground, #e8eaed);
+        border-color: rgba(128, 134, 139, 0.40);
+      }
+      .${TITLEBAR_BTN_CLASS}[data-finalized="true"] {
+        background: color-mix(in srgb, var(--primary, #8ab4f8) 16%, transparent);
+        border-color: color-mix(in srgb, var(--primary, #8ab4f8) 36%, transparent);
+        color: var(--primary, #8ab4f8);
+      }
+      .${TITLEBAR_BTN_CLASS}[data-finalized="true"]:hover {
+        background: color-mix(in srgb, var(--primary, #8ab4f8) 24%, transparent);
+      }
+      .${ROW_BTN_CLASS} {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 24px;
+        height: 24px;
+        padding: 0;
+        border-radius: 6px;
+        border: none;
+        background: transparent;
+        color: var(--muted-foreground, #9aa0a6);
+        font-family: inherit;
+        font-size: 11px;
+        font-weight: 600;
+        line-height: 1;
+        cursor: pointer;
+        user-select: none;
+        flex-shrink: 0;
+        transition: background-color 120ms ease, color 120ms ease;
+      }
+      .${ROW_BTN_CLASS} > * {
+        pointer-events: none;
+      }
+      .${ROW_BTN_CLASS}:hover {
+        background: var(--sidebar-secondary, rgba(128, 134, 139, 0.22));
+        color: var(--foreground, #e8eaed);
+      }
+      .${ROW_BTN_CLASS}[data-finalized="true"] {
+        color: var(--primary, #8ab4f8);
+      }
+      .${ROW_BTN_CLASS}[data-finalized="true"]:hover {
+        background: color-mix(in srgb, var(--primary, #8ab4f8) 20%, transparent);
       }
       #jetski-closed-chats-filter-bubble {
         position: fixed;
@@ -799,6 +1188,203 @@
     }
   }
 
+  // Resolves the conversation ID owning a DOM element via data attributes, React Fiber, or URL
+  function findCascadeIdFromElement(el) {
+    let cur = el;
+    let depth = 0;
+    // Walk up the DOM and inspect React Fiber props so split-view panes get their own cascadeId
+    while (cur && depth < 12) {
+      depth++;
+      if (typeof cur.getAttribute === 'function') {
+        const attrId =
+          cur.getAttribute('data-cascade-id') || cur.getAttribute('data-sidebar-row-id');
+        if (attrId) return attrId;
+      }
+      const fiberKey = Object.keys(cur).find(
+        (k) => k.startsWith('__reactFiber$') || k.startsWith('__reactContainer$')
+      );
+      if (fiberKey) {
+        let fiber = cur[fiberKey];
+        let fSteps = 0;
+        while (fiber && fSteps < 40) {
+          fSteps++;
+          const cid =
+            fiber.memoizedProps?.cascadeId ||
+            fiber.memoizedProps?.conversationId;
+          if (typeof cid === 'string' && cid.length > 0) {
+            return cid;
+          }
+          fiber = fiber.return;
+        }
+      }
+      cur = cur.parentElement;
+    }
+    const store = findReduxStore();
+    const state = store?.getState();
+    const stateCid =
+      state?.conversation?.cascadeId ||
+      state?.multiConvoLayout?.focusedPaneId ||
+      '';
+    if (typeof stateCid === 'string' && stateCid) {
+      return stateCid;
+    }
+    const path = window.location?.pathname || '';
+    const m = /\/(?:c|cascade|conversation)\/([a-zA-Z0-9_-]+)/.exec(path);
+    return m ? m[1] : '';
+  }
+
+  // Intercepts pointerdown/mousedown/click with a 300ms debounce so parent row links do not navigate
+  function bindActionBtnHandlers(btn, onTrigger) {
+    let lastPressTs = 0;
+    const triggerOnce = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (Date.now() - lastPressTs > 300) {
+        lastPressTs = Date.now();
+        onTrigger();
+      }
+    };
+    btn.addEventListener('pointerdown', (e) => {
+      e.stopPropagation();
+      if (e.button === 0 && !e.ctrlKey && !e.metaKey) {
+        triggerOnce(e);
+      }
+    });
+    btn.addEventListener('mousedown', (e) => {
+      e.stopPropagation();
+      if (e.button === 0 && !e.ctrlKey && !e.metaKey) {
+        triggerOnce(e);
+      }
+    });
+    btn.addEventListener('click', (e) => {
+      if (!e.ctrlKey && !e.metaKey) {
+        triggerOnce(e);
+      }
+    });
+  }
+
+  // Syncs the titlebar pill button label and finalized attribute with the current chat title
+  function updateTitlebarCloseButtonUI(btn, cascadeId) {
+    if (!btn || !cascadeId) return;
+    btn.setAttribute('data-cascade-id', cascadeId);
+    const curTitle = getTitleForCascadeId(cascadeId, '');
+    const finalized = isFinalizedTitle(curTitle);
+    const finStr = finalized ? 'true' : 'false';
+    if (btn.getAttribute('data-finalized') !== finStr) {
+      btn.setAttribute('data-finalized', finStr);
+    }
+    const label = finalized ? 'Reopen chat' : 'Close chat';
+    if (btn.getAttribute('aria-label') !== label) {
+      btn.setAttribute('aria-label', label);
+    }
+    if (btn.getAttribute('title') !== label) {
+      btn.setAttribute('title', label);
+    }
+    const nextHtml = finalized
+      ? '<span>⦿</span><span>Reopen</span>'
+      : '<span>«»</span><span>Close</span>';
+    if (btn.innerHTML !== nextHtml) {
+      btn.innerHTML = nextHtml;
+    }
+  }
+
+  // Injects or updates the Close/Reopen pill button before the ⋮ button in each conversation titlebar
+  function ensureTitlebarCloseButtons() {
+    const moreActionsBtns = document.querySelectorAll(
+      '[data-testid="titlebar-more-actions"]'
+    );
+    for (const moreBtn of moreActionsBtns) {
+      const container = moreBtn.parentElement;
+      if (!container) continue;
+      const cascadeId = findCascadeIdFromElement(moreBtn);
+      if (!cascadeId) continue;
+
+      let btn = container.querySelector(`.${TITLEBAR_BTN_CLASS}`);
+      if (!btn) {
+        btn = document.createElement('button');
+        btn.className = TITLEBAR_BTN_CLASS;
+        btn.type = 'button';
+        btn.setAttribute('data-testid', 'jetski-titlebar-close-reopen-btn');
+        bindActionBtnHandlers(btn, () => {
+          const cid =
+            btn.getAttribute('data-cascade-id') || findCascadeIdFromElement(moreBtn);
+          if (cid) {
+            void toggleConversationLifecycle(cid, '');
+          }
+        });
+        container.insertBefore(btn, moreBtn);
+      }
+      updateTitlebarCloseButtonUI(btn, cascadeId);
+    }
+  }
+
+  // Syncs the compact sidebar row action button icon and tooltip with the row's current title
+  function updateRowCloseButtonUI(btn, cascadeId, fallbackDomTitle) {
+    if (!btn || !cascadeId) return;
+    btn.setAttribute('data-cascade-id', cascadeId);
+    const curTitle = getTitleForCascadeId(cascadeId, fallbackDomTitle);
+    const finalized = isFinalizedTitle(curTitle);
+    const finStr = finalized ? 'true' : 'false';
+    if (btn.getAttribute('data-finalized') !== finStr) {
+      btn.setAttribute('data-finalized', finStr);
+    }
+    const label = finalized ? 'Reopen chat' : 'Close chat';
+    if (btn.getAttribute('aria-label') !== label) {
+      btn.setAttribute('aria-label', label);
+    }
+    if (btn.getAttribute('title') !== label) {
+      btn.setAttribute('title', label);
+    }
+    const nextHtml = finalized ? '<span>⦿</span>' : '<span>«»</span>';
+    if (btn.innerHTML !== nextHtml) {
+      btn.innerHTML = nextHtml;
+    }
+  }
+
+  // Injects or updates the compact Close/Reopen button inside each sidebar row's hover action bar
+  function ensureSidebarRowCloseButtons() {
+    const rowEls = document.querySelectorAll(
+      '[data-testid="conversation-row-sidebar"][data-cascade-id], div[data-sidebar-row-id]'
+    );
+    for (const rowEl of rowEls) {
+      const cascadeId =
+        rowEl.getAttribute('data-cascade-id') ||
+        rowEl.getAttribute('data-sidebar-row-id');
+      if (!cascadeId) continue;
+
+      const anchorBtn =
+        rowEl.querySelector('[data-testid="conversation-pin-button"]') ||
+        rowEl.querySelector('[data-testid="conversation-archive-button"]');
+      if (!anchorBtn || !anchorBtn.parentElement) continue;
+      const hoverBar = anchorBtn.parentElement;
+
+      const linkEl = rowEl.querySelector('a[aria-label]');
+      const spanEl = rowEl.querySelector('span.truncate');
+      const fallbackDomTitle =
+        linkEl?.getAttribute('aria-label') || spanEl?.textContent || '';
+
+      let btn = hoverBar.querySelector(`.${ROW_BTN_CLASS}`);
+      if (!btn) {
+        btn = document.createElement('button');
+        btn.className = ROW_BTN_CLASS;
+        btn.type = 'button';
+        btn.setAttribute('data-testid', 'jetski-row-close-reopen-btn');
+        bindActionBtnHandlers(btn, () => {
+          const cid = btn.getAttribute('data-cascade-id') || cascadeId;
+          const curLink = rowEl.querySelector('a[aria-label]');
+          const curSpan = rowEl.querySelector('span.truncate');
+          const domTitle =
+            curLink?.getAttribute('aria-label') || curSpan?.textContent || '';
+          if (cid) {
+            void toggleConversationLifecycle(cid, domTitle);
+          }
+        });
+        hoverBar.insertBefore(btn, anchorBtn);
+      }
+      updateRowCloseButtonUI(btn, cascadeId, fallbackDomTitle);
+    }
+  }
+
   function toggleFilterScope() {
     filterScope = filterScope === 'closed' ? 'active-only' : 'closed';
     safeSetStorage(STORAGE_SCOPE_KEY, filterScope);
@@ -814,6 +1400,8 @@
     const reduxActive = syncReduxFilter();
     syncDomRowsAndPlaceholders(reduxActive);
     ensureToggleButton();
+    ensureTitlebarCloseButtons();
+    ensureSidebarRowCloseButtons();
   }
 
   function scheduleSync() {
@@ -833,9 +1421,13 @@
         target.id === 'jetski-closed-chats-filter-bubble' ||
         target.id === STYLE_ID ||
         target.id === BUTTON_CLASS ||
+        target.className === TITLEBAR_BTN_CLASS ||
+        target.className === ROW_BTN_CLASS ||
         (typeof target.closest === 'function' &&
           (target.closest('#jetski-closed-chats-filter-bubble') ||
-            target.closest(`.${BUTTON_CLASS}`)))
+            target.closest(`.${BUTTON_CLASS}`) ||
+            target.closest(`.${TITLEBAR_BTN_CLASS}`) ||
+            target.closest(`.${ROW_BTN_CLASS}`)))
       ) {
         return false;
       }
@@ -855,7 +1447,9 @@
 
   window.__jetskiClosedChatsFilterCleanup = () => {
     observer.disconnect();
-    for (const el of document.querySelectorAll(`.${BUTTON_CLASS}`)) {
+    for (const el of document.querySelectorAll(
+      `.${BUTTON_CLASS}, .${TITLEBAR_BTN_CLASS}, .${ROW_BTN_CLASS}`
+    )) {
       el.remove();
     }
     const bubble = document.getElementById('jetski-closed-chats-filter-bubble');

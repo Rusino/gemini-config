@@ -25,6 +25,7 @@ DEFAULT_TIMEZONE = os.environ.get("JETSKI_TIMEZONE", "America/New_York")
 APP_DATA_DIR_CANDIDATES = ("~/.gemini/jetski", "~/.gemini/antigravity")
 SUMMARY_DB_NAME = "conversation_summaries.db"
 ANNOTATIONS_DIR_NAME = "annotations"
+CHAIN_INDEX_FILE_NAME = "jetski-chains.json"
 DEFAULT_PROJECT_RETENTION_FILE = os.path.expanduser(
     "~/.gemini/config/projects_retention.json"
 )
@@ -790,6 +791,31 @@ def link_visible_chains(
   return vis_parent, vis_children
 
 
+def export_chain_index() -> dict:
+  """Exports handoff parent links and creation timestamps to brain/jetski-chains.json."""
+  parent_of, _, created_at_of = _scan_transcript_graph()
+  payload = {"parentOf": parent_of, "createdAt": created_at_of}
+  raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+  # Mirror the chain index into every active brain directory so /static/artifacts/ can serve it
+  for app_dir in find_app_data_dirs():
+    brain_dir = os.path.join(app_dir, "brain")
+    if not os.path.isdir(brain_dir):
+      try:
+        os.makedirs(brain_dir, exist_ok=True)
+      except OSError:
+        continue
+    dst = os.path.join(brain_dir, CHAIN_INDEX_FILE_NAME)
+    tmp = dst + ".tmp"
+    # Write to a temp file and atomically replace so browser fetches never observe partial JSON
+    try:
+      with open(tmp, "w", encoding="utf-8") as f:
+        f.write(raw)
+      os.replace(tmp, dst)
+    except OSError:
+      pass
+  return payload
+
+
 def discover_conversation_chain(
     conv_id: str,
     include_descendants: bool = True,
@@ -874,6 +900,7 @@ def advance_in_progress_chain(chain_ids: list[str] = None, current_conv_id: str 
     new_title = f"[{now_time}] {MARKER_ACTIVE} {base}"
     update_conversation_title(cid, new_title)
     updated.append(cid)
+    export_chain_index()
     return updated
 
   # 1. First chat (root of branch) -> ▸
@@ -900,6 +927,7 @@ def advance_in_progress_chain(chain_ids: list[str] = None, current_conv_id: str 
   update_conversation_title(active_id, f"[{t_active}] {MARKER_ACTIVE} {base_active}")
   updated.append(active_id)
 
+  export_chain_index()
   return updated
 
 
@@ -926,6 +954,7 @@ def finalize_conversation_chain(current_conv_id: str, chain_ids: list[str] = Non
     cid = chain_ids[0] if chain_ids else current_conv_id
     if cid:
       _finalize_one(cid, MARKER_SINGLE_CLOSED)
+    export_chain_index()
     return updated
 
   # Multiple conversations in chain: « ... ‹✓› ... »
@@ -934,6 +963,7 @@ def finalize_conversation_chain(current_conv_id: str, chain_ids: list[str] = Non
     _finalize_one(mid_id, MARKER_CLOSED_STEP)
   _finalize_one(chain_ids[-1], MARKER_CLOSED_END)
 
+  export_chain_index()
   return updated
 
 
@@ -1857,6 +1887,7 @@ def audit_conversations(
             "fixed": is_fixed,
         })
 
+  export_chain_index()
   return {
       "ls_online": ls_online,
       "project_filter": target_project_id or None,
