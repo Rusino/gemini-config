@@ -148,6 +148,23 @@ Structure the English review comment using this proven template:
 
 ---
 
+## Self-Review Mode (Reviewing Your Own CL)
+
+When the CL under review is owned by the user (Gerrit `owner`, not merely the uploader, matches the user's account; on GitHub, the PR author), there is nothing to fork: **skip the companion CL and upload the same patchset sequence directly into the user's own CL**.
+
+1. **Same parent invariant**: work on top of the CL's current patchset without rebasing, so patchset-to-patchset diffs stay clean.
+2. **Same patchset structure, in the CL itself**:
+   - **Case 5**: `PS N+1` = failing contract tests only; `PS N+2` = fix + passing tests. The failing-tests patchset is intentional: the patchset history documents what broke and how it was fixed.
+   - **Case 4**: `PS N+1` = failing reproducer tests only, then report the design problem to the user in chat before any redesign.
+   - **Case 3**: one patchset with the extra tests or cleanup.
+   - **Cases 1–2**: apply nits directly in one patchset.
+3. **Before reviewers are involved** (no reviewers on the CL yet, the usual case for self-review): upload freely without asking; there are no votes to reset and nobody to notify.
+4. **After reviewers are added**: prepare the patchsets locally and **ask the user before pushing**, because every upload resets copied `Code-Review` votes and notifies reviewers. Upload the intermediate failing-tests patchset with `%notify=NONE` to avoid an extra notification.
+5. **Not uploaded yet** (local branch only): use two local commits (tests, then fix) instead of patchsets; squashing before upload is the user's choice.
+6. **Never trigger CQ** on any patchset unless the user explicitly asks.
+
+---
+
 ## Post-Adoption Cleanup
 
 Once the author folds the tests/fix into a new patchset of their parent CL (or lands an alternative fix), verify the parent CL's new patchset and **abandon** the temporary companion WIP CL so no stale WIP changes remain open in Gerrit.
