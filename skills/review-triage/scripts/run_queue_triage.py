@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
 """
-run_queue_triage.py — Daily Morning Review Queue Triage for jlavrova@google.com.
+run_queue_triage.py — Daily Morning Review Queue Triage for jlavrova.
 
-Queries Gerrit (and other VCS where configured) for pending, non-WIP reviews,
-runs review_triage.py on each CL, and generates a structured morning digest.
+Queries Gerrit (jlavrova@google.com + jlavrova@gmail.com) and GitHub (@Rusino) for:
+  1. Pending incoming code reviews (Gerrit CLs and GitHub PRs)
+  2. Actionable updates on authored open GitHub PRs (external reviews, comments, CI failures)
+  3. Recently updated open GitHub issues assigned to or mentioning @Rusino
 """
 
 import argparse
 from datetime import datetime, timezone
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.request
+from zoneinfo import ZoneInfo
 
 TRIAGE_SCRIPT = os.path.expanduser("~/.gemini/config/skills/review-triage/scripts/triage_cl.py")
-REVIEWER_EMAIL = "jlavrova@google.com"
-GERRIT_HOST = "skia-review.googlesource.com"
+REVIEWER_EMAILS = ["jlavrova@google.com", "jlavrova@gmail.com"]
+GERRIT_HOSTS = ["skia-review.googlesource.com", "chromium-review.googlesource.com"]
+GITHUB_USER = "Rusino"
 IGNORED_CLS_FILE = os.path.expanduser("~/.gemini/config/skills/review-triage/ignored_cls.txt")
+NY_TZ = ZoneInfo("America/New_York")
 
 
 def load_ignored_cls():
-    # Load user-specified CL numbers to exclude from triage
+    # Load user-specified CL or PR numbers to exclude from triage
     ignored = set()
     if os.path.isfile(IGNORED_CLS_FILE):
         with open(IGNORED_CLS_FILE, "r", encoding="utf-8") as f:
@@ -42,37 +48,66 @@ def parse_gerrit_time(ts_str):
         return datetime.min.replace(tzinfo=timezone.utc)
 
 
-def fetch_pending_gerrit_reviews():
-    """Fetch open reviews where reviewer is jlavrova, excluding self and WIP."""
-    # Exclude changes authored by the reviewer to prevent self-review noise
-    query = f"is:open+reviewer:{REVIEWER_EMAIL}+-owner:{REVIEWER_EMAIL}+-is:wip"
-    url = f"https://{GERRIT_HOST}/changes/?q={query}&n=25&o=DETAILED_ACCOUNTS&o=MESSAGES"
-    req = urllib.request.Request(url, headers={"User-Agent": "ReviewTriageQueue"})
+def parse_iso_time(ts_str):
+    if not ts_str:
+        return datetime.min.replace(tzinfo=timezone.utc)
     try:
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            if raw.startswith(")]}'"):
-                raw = raw[4:]
-            changes = json.loads(raw)
-            # Filter out any self-owned CLs defensively
-            return [c for c in changes if c.get("owner", {}).get("email") != REVIEWER_EMAIL]
-    except Exception as e:
-        print(f"Warning: Failed to fetch Gerrit reviews: {e}", file=sys.stderr)
-        return []
+        clean = ts_str.replace("Z", "+00:00")
+        return datetime.fromisoformat(clean)
+    except Exception:
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def format_et(dt_utc):
+    if not dt_utc or dt_utc == datetime.min.replace(tzinfo=timezone.utc):
+        return "—"
+    et = dt_utc.astimezone(NY_TZ)
+    return et.strftime("%Y-%m-%d %H:%M ET")
+
+
+def fetch_pending_gerrit_reviews():
+    """Fetch open Gerrit reviews across hosts and reviewer emails, excluding self and WIP."""
+    rev_clause = "+OR+".join(f"reviewer:{e}" for e in REVIEWER_EMAILS)
+    own_clause = "+".join(f"-owner:{e}" for e in REVIEWER_EMAILS)
+    query = f"is:open+({rev_clause})+{own_clause}+-is:wip"
+
+    all_changes = []
+    seen = set()
+    for host in GERRIT_HOSTS:
+        url = f"https://{host}/changes/?q={query}&n=25&o=DETAILED_ACCOUNTS&o=MESSAGES"
+        req = urllib.request.Request(url, headers={"User-Agent": "ReviewTriageQueue"})
+        try:
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                if raw.startswith(")]}'"):
+                    raw = raw[4:]
+                changes = json.loads(raw)
+                for c in changes:
+                    owner_email = (c.get("owner") or {}).get("email", "")
+                    if owner_email in REVIEWER_EMAILS:
+                        continue
+                    key = (host, c.get("_number"))
+                    if key not in seen:
+                        seen.add(key)
+                        c["_gerrit_host"] = host
+                        all_changes.append(c)
+        except Exception as e:
+            print(f"Warning: Failed to fetch Gerrit reviews from {host}: {e}", file=sys.stderr)
+    return all_changes
 
 
 def is_awaiting_reviewer(change):
     # The ball is in my court unless my last reply is newer than every author reply or upload
-    owner_email = change.get("owner", {}).get("email")
+    owner_email = (change.get("owner") or {}).get("email")
     my_last = None
     author_last = None
     for m in change.get("messages", []):
         tag = m.get("tag") or ""
-        email = m.get("author", {}).get("email")
+        email = (m.get("author") or {}).get("email")
         when = parse_gerrit_time(m.get("date"))
         # Untagged messages are human replies, votes and comments; autogenerated ones
         # (reviewer adds, hashtags, CQ bots) are not a response from either side
-        if email == REVIEWER_EMAIL and not tag:
+        if email in REVIEWER_EMAILS and not tag:
             my_last = when
         elif email == owner_email and (
             not tag
@@ -87,23 +122,288 @@ def is_awaiting_reviewer(change):
     return author_last is not None and author_last > my_last
 
 
+def gh_search_issues(query, per_page=20):
+    try:
+        out = subprocess.check_output(
+            [
+                "gh", "api", "-X", "GET", "search/issues",
+                "-f", f"q={query}",
+                "-f", "sort=updated",
+                "-f", f"per_page={per_page}",
+            ],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=12,
+        )
+        return json.loads(out).get("items", [])
+    except Exception:
+        return []
+
+
+def fetch_github_pr_detail(repo_slug, pr_number):
+    try:
+        out = subprocess.check_output(
+            [
+                "gh", "pr", "view", str(pr_number),
+                "--repo", repo_slug,
+                "--json",
+                "number,title,url,author,createdAt,updatedAt,mergeable,reviewDecision,"
+                "reviewRequests,reviews,comments,statusCheckRollup",
+            ],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=12,
+        )
+        return json.loads(out)
+    except Exception:
+        return None
+
+
+def extract_repo_slug(html_url):
+    m = re.search(r"github\.com/([^/]+/[^/]+)/", html_url or "")
+    return m.group(1) if m else ""
+
+
+def is_github_pr_awaiting_reviewer(detail):
+    if not detail:
+        return False
+    req_logins = {
+        r.get("login") for r in (detail.get("reviewRequests") or []) if isinstance(r, dict)
+    }
+    if GITHUB_USER in req_logins:
+        return True
+
+    owner_login = (detail.get("author") or {}).get("login")
+    my_last = None
+    author_last = None
+
+    for r in detail.get("reviews") or []:
+        login = (r.get("author") or {}).get("login")
+        when = parse_iso_time(r.get("submittedAt"))
+        if login == GITHUB_USER:
+            my_last = max(my_last, when) if my_last else when
+        elif login == owner_login:
+            author_last = max(author_last, when) if author_last else when
+
+    for c in detail.get("comments") or []:
+        login = (c.get("author") or {}).get("login")
+        when = parse_iso_time(c.get("createdAt"))
+        if login == GITHUB_USER:
+            my_last = max(my_last, when) if my_last else when
+        elif login == owner_login:
+            author_last = max(author_last, when) if author_last else when
+
+    if my_last is None:
+        return True
+    return author_last is not None and author_last > my_last
+
+
+def fetch_pending_github_reviews(max_days, include_all, include_answered, ignored_cls):
+    """Fetch open GitHub PRs where @Rusino is requested/mentioned as reviewer."""
+    q = f"is:open is:pr involves:{GITHUB_USER} -author:{GITHUB_USER}"
+    items = gh_search_issues(q, per_page=20)
+    now = datetime.now(timezone.utc)
+    results = []
+
+    for it in items:
+        pr_num = str(it.get("number"))
+        html_url = it.get("html_url", "")
+        repo_slug = extract_repo_slug(html_url)
+        if not repo_slug or pr_num in ignored_cls or f"{repo_slug}#{pr_num}" in ignored_cls:
+            continue
+
+        updated_dt = parse_iso_time(it.get("updated_at"))
+        age_days = (now - updated_dt).total_seconds() / 86400.0
+        if not include_all and age_days > max_days:
+            continue
+
+        detail = fetch_github_pr_detail(repo_slug, pr_num)
+        if not include_answered and not is_github_pr_awaiting_reviewer(detail):
+            continue
+
+        results.append((updated_dt, {
+            "source": "github",
+            "repo_slug": repo_slug,
+            "number": pr_num,
+            "url": html_url,
+            "subject": it.get("title", f"PR #{pr_num}"),
+            "owner": (it.get("user") or {}).get("login", "Unknown"),
+        }))
+
+    results.sort(key=lambda x: x[0], reverse=True)
+    return [x[1] for x in results]
+
+
+def fetch_authored_github_pr_alerts(max_days, include_all, ignored_cls):
+    """Fetch open PRs authored by @Rusino that have new reviews, comments, or failing checks."""
+    q = f"is:open is:pr author:{GITHUB_USER}"
+    items = gh_search_issues(q, per_page=15)
+    now = datetime.now(timezone.utc)
+    alerts = []
+
+    for it in items:
+        pr_num = str(it.get("number"))
+        html_url = it.get("html_url", "")
+        repo_slug = extract_repo_slug(html_url)
+        if not repo_slug or pr_num in ignored_cls or f"{repo_slug}#{pr_num}" in ignored_cls:
+            continue
+
+        updated_dt = parse_iso_time(it.get("updated_at"))
+        age_days = (now - updated_dt).total_seconds() / 86400.0
+        if not include_all and age_days > max_days:
+            continue
+
+        detail = fetch_github_pr_detail(repo_slug, pr_num)
+        if not detail:
+            continue
+
+        ext_reviews = [
+            r for r in (detail.get("reviews") or [])
+            if (r.get("author") or {}).get("login") != GITHUB_USER
+        ]
+        ext_comments = [
+            c for c in (detail.get("comments") or [])
+            if (c.get("author") or {}).get("login") not in (GITHUB_USER, "fluttergithubbot")
+        ]
+        failed_checks = [
+            c.get("name") or c.get("context") or "check"
+            for c in (detail.get("statusCheckRollup") or [])
+            if c.get("conclusion") in ("FAILURE", "TIMED_OUT", "ACTION_REQUIRED")
+            or c.get("state") in ("FAILURE", "ERROR")
+        ]
+        pending_checks = [
+            c.get("name") or c.get("context") or "check"
+            for c in (detail.get("statusCheckRollup") or [])
+            if c.get("status") in ("IN_PROGRESS", "QUEUED", "PENDING")
+            or c.get("state") == "PENDING"
+        ]
+        mergeable = detail.get("mergeable") or ""
+        decision = detail.get("reviewDecision") or "PENDING"
+
+        latest_note = ""
+        latest_ts = updated_dt
+        events = []
+        for r in ext_reviews:
+            ts = parse_iso_time(r.get("submittedAt"))
+            who = (r.get("author") or {}).get("login", "reviewer")
+            state = r.get("state", "")
+            body = (r.get("body") or "").strip().replace("\n", " ")[:90]
+            events.append((ts, f"Review `{state}` от `{who}`" + (f": {body}" if body else "")))
+        for c in ext_comments:
+            ts = parse_iso_time(c.get("createdAt"))
+            who = (c.get("author") or {}).get("login", "bot")
+            body = (c.get("body") or "").strip().replace("\n", " ")[:90]
+            events.append((ts, f"Комментарий `{who}`: {body}"))
+
+        if events:
+            events.sort(key=lambda x: x[0], reverse=True)
+            latest_ts, latest_note = events[0]
+
+        if failed_checks or mergeable == "CONFLICTING" or events:
+            alerts.append({
+                "repo_slug": repo_slug,
+                "number": pr_num,
+                "url": html_url,
+                "title": detail.get("title", f"PR #{pr_num}"),
+                "decision": decision,
+                "mergeable": mergeable,
+                "failed_checks": failed_checks,
+                "pending_checks_count": len(pending_checks),
+                "latest_note": latest_note,
+                "updated_et": format_et(latest_ts),
+            })
+
+    return alerts
+
+
+def fetch_github_issue_updates(max_days, include_all):
+    """Fetch GitHub issues assigned to or mentioning @Rusino updated within max_days."""
+    q = f"is:open is:issue involves:{GITHUB_USER}"
+    items = gh_search_issues(q, per_page=15)
+    now = datetime.now(timezone.utc)
+    issues = []
+    seen_urls = set()
+
+    for it in items:
+        updated_dt = parse_iso_time(it.get("updated_at"))
+        age_days = (now - updated_dt).total_seconds() / 86400.0
+        if not include_all and age_days > max_days:
+            continue
+
+        assignees = {
+            a.get("login") for a in (it.get("assignees") or []) if isinstance(a, dict)
+        }
+        role = "Assigned" if GITHUB_USER in assignees else "Mentioned"
+        html_url = it.get("html_url", "")
+        repo_slug = extract_repo_slug(html_url)
+        seen_urls.add(html_url)
+        issues.append((updated_dt, {
+            "repo_slug": repo_slug,
+            "number": str(it.get("number")),
+            "url": html_url,
+            "title": it.get("title", ""),
+            "role": role,
+            "updated_et": format_et(updated_dt),
+        }))
+
+    # Also include recent issue notifications (e.g. mentions/state_change on closed issues)
+    try:
+        notif_raw = subprocess.check_output(
+            ["gh", "api", "notifications?all=true&per_page=30"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+        )
+        for n in json.loads(notif_raw):
+            subj = n.get("subject") or {}
+            if subj.get("type") != "Issue":
+                continue
+            updated_dt = parse_iso_time(n.get("updated_at"))
+            age_days = (now - updated_dt).total_seconds() / 86400.0
+            if not include_all and age_days > max_days:
+                continue
+            api_url = subj.get("url") or ""
+            m_num = re.search(r"/issues/(\d+)$", api_url)
+            repo_slug = (n.get("repository") or {}).get("full_name", "")
+            if not m_num or not repo_slug:
+                continue
+            num = m_num.group(1)
+            html_url = f"https://github.com/{repo_slug}/issues/{num}"
+            if html_url in seen_urls:
+                continue
+            seen_urls.add(html_url)
+            issues.append((updated_dt, {
+                "repo_slug": repo_slug,
+                "number": num,
+                "url": html_url,
+                "title": subj.get("title", ""),
+                "role": f"Notif ({n.get('reason', 'update')})",
+                "updated_et": format_et(updated_dt),
+            }))
+    except Exception:
+        pass
+
+    issues.sort(key=lambda x: x[0], reverse=True)
+    return [x[1] for x in issues]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Daily Morning Review Queue Triage")
     parser.add_argument(
         "--max-days",
         type=int,
         default=7,
-        help="Only include CLs created within N days (default: 7)"
+        help="Only include items active within N days (default: 7)"
     )
     parser.add_argument(
         "--all",
         action="store_true",
-        help="Include all pending CLs regardless of creation age"
+        help="Include all pending items regardless of age"
     )
     parser.add_argument(
         "--include-answered",
         action="store_true",
-        help="Also include CLs I already replied to with no new author activity since"
+        help="Also include CLs/PRs already replied to with no new author activity since"
     )
     args = parser.parse_args()
 
@@ -126,26 +426,55 @@ def main():
 
     # Sort newest first by creation timestamp
     dated_changes.sort(key=lambda x: x[0], reverse=True)
-    changes = [x[1] for x in dated_changes]
-    if not changes:
+    gerrit_changes = [x[1] for x in dated_changes]
+
+    github_reviews = fetch_pending_github_reviews(
+        args.max_days, args.all, args.include_answered, ignored_cls
+    )
+    authored_pr_alerts = fetch_authored_github_pr_alerts(
+        args.max_days, args.all, ignored_cls
+    )
+    github_issues = fetch_github_issue_updates(args.max_days, args.all)
+
+    total_reviews = len(gerrit_changes) + len(github_reviews)
+    if total_reviews == 0 and not authored_pr_alerts and not github_issues:
         print("## 🌅 Morning Review Queue: Empty 🎉\n")
-        print("В очереди нет открытых СЛ, ожидающих твоего ревью. Отличное утро для спокойного кодинга!")
+        print(
+            "В очереди нет открытых СЛ или GitHub PR, ожидающих твоего ревью. "
+            "Отличное утро для спокойного кодинга!"
+        )
         return
 
-    print(f"## 🌅 Morning Review Queue ({len(changes)} pending CLs)\n")
-    print(f"*Очередь собрана на основе Gerrit ({GERRIT_HOST}) для `{REVIEWER_EMAIL}`.*\n")
+    print(
+        f"## 🌅 Morning Review Queue "
+        f"({total_reviews} pending reviews, {len(authored_pr_alerts)} PR alerts, "
+        f"{len(github_issues)} active issues)\n"
+    )
+    emails_str = "`, `".join(REVIEWER_EMAILS)
+    print(
+        f"*Очередь собрана из Gerrit (`{emails_str}`) и GitHub (`@{GITHUB_USER}`).*\n"
+    )
 
     triage_results = []
     total_est_minutes = 0
+    time_map = {
+        "MECHANICAL": 0.5,
+        "REASSIGN": 0.5,
+        "PUSHBACK": 1.0,
+        "SURGICAL_AUDIT": 3.0
+    }
 
-    # 1. Quick pass across all CLs
-    for c in changes:
+    # 1. Triage incoming Gerrit CLs
+    for c in gerrit_changes:
         cl_num = str(c["_number"])
+        host = c.get("_gerrit_host", GERRIT_HOSTS[0])
+        project = c.get("project", "skia")
         subj = c.get("subject", "")
-        owner = c.get("owner", {}).get("name", "Unknown")
+        owner = (c.get("owner") or {}).get("name", "Unknown")
+        cl_url = f"https://{host}/c/{project}/+/{cl_num}"
 
         try:
-            cmd = ["python3", TRIAGE_SCRIPT, cl_num, "--json"]
+            cmd = ["python3", TRIAGE_SCRIPT, cl_url, "--json"]
             out = subprocess.check_output(cmd, text=True, timeout=30)
             data = json.loads(out)
             cat = data["analysis"]["category"]
@@ -156,26 +485,54 @@ def main():
             churn = 0
             reason = f"Automated triage error: {e}"
 
-        time_map = {
-            "MECHANICAL": 0.5,
-            "REASSIGN": 0.5,
-            "PUSHBACK": 1.0,
-            "SURGICAL_AUDIT": 3.0
-        }
         est_min = time_map.get(cat, 3.0)
         total_est_minutes += est_min
-
         triage_results.append({
-            "cl": cl_num,
+            "label": cl_num,
+            "target": cl_url,
+            "link": f"[{cl_num}]({cl_url})",
             "subject": subj,
             "owner": owner,
             "category": cat,
             "churn": churn,
             "est_min": est_min,
-            "reason": reason
+            "reason": reason,
+            "is_gerrit_skia": host == "skia-review.googlesource.com",
         })
 
-    # Summary Table
+    # 2. Triage incoming GitHub PRs
+    for pr in github_reviews:
+        pr_num = pr["number"]
+        repo_slug = pr["repo_slug"]
+        pr_url = pr["url"]
+        label = f"{repo_slug}#{pr_num}"
+        try:
+            cmd = ["python3", TRIAGE_SCRIPT, pr_url, "--json"]
+            out = subprocess.check_output(cmd, text=True, timeout=30)
+            data = json.loads(out)
+            cat = data["analysis"]["category"]
+            churn = data["analysis"]["impl_churn"]
+            reason = data["analysis"]["reason"]
+        except Exception as e:
+            cat = "SURGICAL_AUDIT"
+            churn = 0
+            reason = f"Automated triage error: {e}"
+
+        est_min = time_map.get(cat, 3.0)
+        total_est_minutes += est_min
+        triage_results.append({
+            "label": label,
+            "target": pr_url,
+            "link": f"[#{pr_num}]({pr_url})",
+            "subject": pr["subject"],
+            "owner": pr["owner"],
+            "category": cat,
+            "churn": churn,
+            "est_min": est_min,
+            "reason": reason,
+            "is_gerrit_skia": False,
+        })
+
     cat_icons = {
         "MECHANICAL": "🟢 `[MECHANICAL]`",
         "REASSIGN": "🟡 `[REASSIGN]`",
@@ -183,39 +540,80 @@ def main():
         "PUSHBACK": "🟠 `[PUSHBACK]`"
     }
 
-    print("### 📋 Сводка очереди")
-    print(f"**Оценочное общее время на ревью всей очереди:** `~{int(total_est_minutes + 0.9)} мин.`\n")
-    print("| СЛ | Категория | Логика ядра | Автор | Тема |")
-    print("|---|---|---|---|---|")
-    for r in triage_results:
-        badge = cat_icons.get(r["category"], r["category"])
-        cl_link = f"[{r['cl']}](https://{GERRIT_HOST}/c/skia/+/{r['cl']})"
-        churn_str = f"`{r['churn']} строк`" if r['churn'] > 0 else "—"
-        subj_trunc = r['subject'][:45] + ("..." if len(r['subject']) > 45 else "")
-        print(f"| {cl_link} | {badge} | {churn_str} | `{r['owner']}` | {subj_trunc} |")
+    if triage_results:
+        print("### 📋 Сводка входящей очереди на ревью")
+        print(
+            f"**Оценочное общее время на ревью входящей очереди:** "
+            f"`~{int(total_est_minutes + 0.9)} мин.`\n"
+        )
+        print("| СЛ / PR | Категория | Логика ядра | Автор | Тема |")
+        print("|---|---|---|---|---|")
+        for r in triage_results:
+            badge = cat_icons.get(r["category"], r["category"])
+            churn_str = f"`{r['churn']} строк`" if r["churn"] > 0 else "—"
+            subj_trunc = r["subject"][:45] + ("..." if len(r["subject"]) > 45 else "")
+            print(f"| {r['link']} | {badge} | {churn_str} | `{r['owner']}` | {subj_trunc} |")
+        print("\n---\n")
+    else:
+        print("### 📋 Входящая очередь на чужие ревью пуста (0 CL / PR)\n")
 
-    print("\n---\n")
+    if authored_pr_alerts:
+        print(f"### 🐙 Твои открытые PR на GitHub (`@{GITHUB_USER}`) — комментарии и CI")
+        print("| PR | Ревью / Мерж | Упавшие чеки | Обновлено | Последнее событие |")
+        print("|---|---|---|---|---|")
+        for a in authored_pr_alerts:
+            pr_link = f"[#{a['number']}]({a['url']}) {a['title'][:36]}"
+            status_bits = [f"`{a['decision']}`"]
+            if a["mergeable"] == "CONFLICTING":
+                status_bits.append("⚠️ `CONFLICT`")
+            if a["failed_checks"]:
+                checks_str = ", ".join(f"`{c}`" for c in a["failed_checks"][:3])
+            elif a.get("pending_checks_count"):
+                checks_str = f"⏳ ({a['pending_checks_count']})"
+            else:
+                checks_str = "✅"
+            note_str = a["latest_note"] or "—"
+            print(
+                f"| {pr_link} | {' '.join(status_bits)} | {checks_str} | "
+                f"`{a['updated_et']}` | {note_str} |"
+            )
+        print("\n---\n")
 
-    # Detailed cards for each CL
+    if github_issues:
+        print(
+            f"### 🐛 Свежие баги и упоминания на GitHub "
+            f"(`@{GITHUB_USER}`, за {args.max_days} дн.)"
+        )
+        print("| Issue | Роль | Обновлено | Тема |")
+        print("|---|---|---|---|")
+        for iss in github_issues:
+            iss_link = f"[{iss['repo_slug']}#{iss['number']}]({iss['url']})"
+            print(f"| {iss_link} | `{iss['role']}` | `{iss['updated_et']}` | {iss['title']} |")
+        print("\n---\n")
+
+    # Detailed cards for each incoming CL/PR
     for r in triage_results:
-        cl_num = r["cl"]
-        print(f"### Детали по CL {cl_num}")
+        print(f"### Детали по {r['label']}")
         try:
-            cmd = ["python3", TRIAGE_SCRIPT, cl_num]
+            cmd = ["python3", TRIAGE_SCRIPT, r["target"]]
             out = subprocess.check_output(cmd, text=True, timeout=30)
             print(out)
         except Exception as e:
-            print(f"Ошибка получения деталей для CL {cl_num}: {e}")
+            print(f"Ошибка получения деталей для {r['label']}: {e}")
         print("\n---\n")
 
     # The scheduled run only invokes this script, so the agent must see the audit requirement here
-    audit_cls = [r["cl"] for r in triage_results if r["category"] != "REASSIGN"]
+    audit_cls = [
+        r["label"] for r in triage_results
+        if r["category"] != "REASSIGN" and r["is_gerrit_skia"]
+    ]
     if audit_cls:
         print("### ⚠️ AGENT: mandatory next step before presenting drafts")
         print("Run the ruthless-code-audit skill "
               "(~/.gemini/config/skills/ruthless-code-audit/SKILL.md) on CLs: "
               + ", ".join(audit_cls)
               + ". See 'Mandatory Ruthless Audit' in review-triage/SKILL.md for the fetch recipe.")
+
 
 if __name__ == "__main__":
     main()

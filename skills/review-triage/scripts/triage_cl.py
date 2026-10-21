@@ -136,7 +136,7 @@ def fetch_google3_cl(cl_number):
     }
 
 def fetch_github_pr(repo_url, pr_number):
-    """Fetch GitHub PR patch via .diff URL."""
+    """Fetch GitHub PR metadata and patch via gh CLI or .diff URL."""
     clean_repo = repo_url.rstrip("/")
     diff_url = f"{clean_repo}/pull/{pr_number}.diff"
     req = urllib.request.Request(diff_url, headers={"User-Agent": "ReviewTriageAgent"})
@@ -148,11 +148,31 @@ def fetch_github_pr(repo_url, pr_number):
 
     subject = f"PR #{pr_number}"
     owner = "Unknown"
-    for line in patch_text.splitlines()[:30]:
-        if line.startswith("Subject:"):
-            subject = line.replace("Subject:", "").strip()
-        elif line.startswith("From:"):
-            owner = line.replace("From:", "").strip()
+    description = subject
+    m_repo = re.search(r"github\.com/([^/]+/[^/]+)$", clean_repo)
+    if m_repo:
+        repo_slug = m_repo.group(1)
+        try:
+            meta_raw = subprocess.check_output(
+                ["gh", "api", f"repos/{repo_slug}/pulls/{pr_number}"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=10,
+            )
+            meta = json.loads(meta_raw)
+            subject = meta.get("title") or subject
+            owner = (meta.get("user") or {}).get("login") or owner
+            body = (meta.get("body") or "").strip()
+            description = f"{subject}\n\n{body}".strip() if body else subject
+        except Exception:
+            pass
+
+    if owner == "Unknown":
+        for line in patch_text.splitlines()[:30]:
+            if line.startswith("Subject:"):
+                subject = line.replace("Subject:", "").strip()
+            elif line.startswith("From:"):
+                owner = line.replace("From:", "").strip()
 
     return {
         "source": f"GitHub ({clean_repo})",
@@ -162,7 +182,7 @@ def fetch_github_pr(repo_url, pr_number):
         "subject": subject,
         "owner": owner,
         "owner_email": "",
-        "description": subject,
+        "description": description,
         "patch": patch_text
     }
 
