@@ -6,7 +6,8 @@ description: >-
   Hunter subagent pass (keeper_inquisitor) to minimize diff size, verify dropped guards, and check
   pattern completeness, (3) a clean-context Skeptic Refutation pass (keeper_skeptic, Hunt then Refute
   with XFAMILY_REFUTE auto-routing) to eliminate false-positive defects and unsafe code removals,
-  and (4) a hostile TDD filter to validate surviving bugs before a single rebuild. Trigger when the
+  (4) a Persistent Finding Ledger (`finding_ledger.py`) that caches refuted findings across runs,
+  and (5) a hostile TDD filter to validate surviving bugs before a single rebuild. Trigger when the
   user asks to "подготовь к коммиту", "минимизируй дифф", "проверь перед пушем",
   "сделай амнезия-ревью", or "run amnesia precommit".
 ---
@@ -25,6 +26,7 @@ Execute a strict pre-commit audit and diff minimization workflow before uploadin
    - **Stage B (Batched Verification Skeptic)**: Whenever the Hunter proposes `HIGH`/`CRITICAL` behavioral defects or non-trivial code/branch removals (`Scope & Size Reductions`), spawn **one batched Skeptic subagent** (`keeper_skeptic`) in a fresh context whose sole goal is to **REFUTE** each candidate using real code, callers (`git grep`, `code_search`), and tests.
 3. **Hostile TDD Validation (`Trapsmith` Filter)**: Never alter production logic based solely on an LLM critique. A behavioral bug that survives the Skeptic (`CONFIRMED`) is fixed **only** if a newly written reproducer unit test fails against the current code.
 4. **Single Rebuild Budget**: Batch all confirmed diff-shrinking edits and validated bug fixes into a single compilation and test pass (`dm`, `felt`, or `flutter test`). Do not enter multi-iteration review-compile loops.
+5. **Persistent Finding Ledger (`finding_ledger.py`)**: Before spawning the Stage A Hunter, query `~/.gemini/config/scripts/finding_ledger.py` (automatically included in `ruthless_audit.py` output or via `finding_ledger.py query --repo . --diff HEAD`) and pass prior refuted findings for the touched files into the Hunter prompt so it does not re-raise them. After Stage B (`keeper_skeptic`), Phase 3 execution refutation, or user pushback in chat, record every newly refuted finding into `finding_ledger.py` (`--scope repo` for code invariants, `--scope cl` for CL-specific deferrals).
 
 ---
 
@@ -71,6 +73,9 @@ You are evaluating an uncommitted/pending diff in a clean context with zero prio
 
 Intended Task Goal:
 <1-2 sentence summary of what the change is supposed to achieve>
+
+Prior Refuted Findings (Persistent Finding Ledger — Do NOT Re-Raise):
+<paste matching entries from `finding_ledger.py query --repo <repo_path> --diff HEAD` (or from `ruthless_audit.py` output); do not re-raise these unless the underlying guard/contract at the cited location was modified>
 
 Instructions:
 1. Run `git diff HEAD` (or inspect the target commit) in `<repo_path>`.
@@ -159,12 +164,22 @@ When the Skeptic pass completes, process the surviving items as follows:
 - Apply only those Section 1 reductions whose safety was **not** refuted by `keeper_skeptic`. Drop any reduction marked `REFUTED (removal unsafe: guard needed at path:line)`.
 - Ensure all remaining comments strictly obey `code-comments` rules (explain timeless *why*, no final period in C++).
 
-#### 2. Filter Surviving Behavioral Defects (`CONFIRMED` / `UNPROVEN`) via Reproducer Test
-Discard any Section 2 defect (`B1, B2...`) that `keeper_skeptic` marked **`REFUTED`** with a verified `file:line` guard or contract citation. For each surviving **`CONFIRMED`** or **`UNPROVEN`** defect:
-1. **Write the Trap Test**: Add the minimal reproducer unit test (e.g., in `SkParagraphTest.cpp` or `web_paragraph_test.dart`).
-2. **Compile & Run Once**:
-   - **Test FAILS / CRASHES**: Finding is `[VALIDATED]`. Implement the root-cause fix (no symptomatic `if` branches) and keep the test.
-   - **Test PASSES**: Finding is `[FALSE POSITIVE: Refuted by Execution]`. Revert the test (unless it adds genuine boundary value) and do **not** touch production code.
+#### 2. Filter Surviving Behavioral Defects (`CONFIRMED` / `UNPROVEN`) & Persist Refutations
+1. **Record Skeptic Refutations in the Persistent Finding Ledger**:
+   For every candidate (`B1...`, `S1...`) that `keeper_skeptic` marked **`REFUTED`** (and whenever the user in chat dismisses a finding as intentional design or out-of-scope for this CL), persist it immediately so future review passes skip it:
+   ```bash
+   python3 ~/.gemini/config/scripts/finding_ledger.py add \
+     --repo . --file <path> --symbol "<func_or_class>" \
+     --claim "<concise summary of suspected defect or unsafe removal>" \
+     --reason "<exact path:line guard, caller SkASSERT, or user rationale>" \
+     --scope repo  # use --scope cl for trade-offs specific to the current CL/branch
+   ```
+2. **Validate Surviving `CONFIRMED` / `UNPROVEN` Defects via Reproducer Test**:
+   Discard any Section 2 defect (`B1, B2...`) that `keeper_skeptic` marked **`REFUTED`** with a verified `file:line` guard or contract citation. For each surviving **`CONFIRMED`** or **`UNPROVEN`** defect:
+   - **Write the Trap Test**: Add the minimal reproducer unit test (e.g., in `SkParagraphTest.cpp` or `web_paragraph_test.dart`).
+   - **Compile & Run Once**:
+     - **Test FAILS / CRASHES**: Finding is `[VALIDATED]`. Implement the root-cause fix (no symptomatic `if` branches) and keep the test.
+     - **Test PASSES**: Finding is `[FALSE POSITIVE: Refuted by Execution]`. Revert the test (unless it adds genuine boundary value), do **not** touch production code, and record the execution refutation via `finding_ledger.py add --category false-positive-exec ...`.
 
 #### 3. Resolve Pre-Review Grill Questions
 - If a question in Section 3 has a known technical answer from the codebase or debugging session (e.g., why approach A was chosen over B), **silently address it** in a 1-line "why" code comment or in the commit message.

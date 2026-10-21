@@ -18,6 +18,10 @@ AUDIT_COMMENTS_SCRIPT = (
     / "scripts"
     / "audit_comments.py"
 )
+SHARED_SCRIPTS_DIR = pathlib.Path(__file__).resolve().parents[3] / "scripts"
+if str(SHARED_SCRIPTS_DIR) not in sys.path:
+  sys.path.insert(0, str(SHARED_SCRIPTS_DIR))
+import finding_ledger
 
 EXCLUDE_DIRS = {
     ".git",
@@ -763,6 +767,11 @@ def format_markdown_report(report):
   if not any_horror:
     out.append("- Zero mechanical invariant or comment violations found.\n")
 
+  ledger_md = report.get("refuted_ledger_markdown", "")
+  if ledger_md:
+    out.append(ledger_md.rstrip())
+    out.append("")
+
   return "\n".join(out)
 
 
@@ -826,6 +835,13 @@ def main():
   comment_Targets = [r[0] for r in file_records] if not args.diff else args.paths
   comment_issues = run_comment_audit(comment_Targets, repo_root, diff_ref=args.diff)
 
+  ledger_files = None if args.paths == ["."] else [r[1] for r in file_records]
+  ledger_path, ledger_entries = finding_ledger.query_entries(
+      repo=str(repo_root),
+      files=ledger_files,
+      diff_ref=args.diff,
+  )
+
   report = {
       "summary": {
           "total_files": len(file_records),
@@ -839,6 +855,10 @@ def main():
       "structure": structure,
       "horrors": dict(horrors),
       "comment_issues": comment_issues,
+      "refuted_ledger": ledger_entries,
+      "refuted_ledger_markdown": finding_ledger.format_query_markdown(
+          ledger_entries, ledger_path=ledger_path, include_empty_header=True
+      ),
   }
 
   if args.format == "json":

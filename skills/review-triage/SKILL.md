@@ -5,10 +5,10 @@ description: >-
   Classifies incoming reviews into 4 actionable categories: (1) Mechanical/Routine (15s),
   (2) Non-domain/Reassign (30s), (3) Core Domain/Surgical Audit (3–5 min), (4) Low Hygiene/Pushback (1 min).
   Automatically isolates the core 5% logic hunks, verifies mechanical churn, runs a two-stage
-  Hunt then Refute pass (keeper_skeptic with XFAMILY_REFUTE auto-routing) to eliminate false-positive
-  review comments, drafts professional reassignment or pushback messages in English, and pinpoints
-  exact files and line ranges so the reviewer maintains their analytical edge without drowning in
-  diffs. Trigger when user asks to triage, review, or analyze an incoming CL/PR ("разбери СЛ",
+  Hunt then Refute pass (keeper_skeptic with XFAMILY_REFUTE auto-routing) backed by the Persistent
+  Finding Ledger (`finding_ledger.py`) to eliminate and cache false-positive review comments across
+  patchsets, drafts professional reassignment or pushback messages in English, and pinpoints exact
+  files and line ranges so the reviewer maintains their analytical edge without drowning in diffs. Trigger when user asks to triage, review, or analyze an incoming CL/PR ("разбери СЛ",
   "сделай триаж ревью", "оцени СЛ", "посмотри этот ревью", "triage this CL/PR",
   "что делать с этим ревью").
 ---
@@ -119,13 +119,16 @@ skill and its **Stage 2.5 Skeptic Refutation Pass (`keeper_skeptic`)** before re
    stored credentials are rejected, fetch anonymously with
    `git -c credential.helper= -c http.cookiefile=/dev/null fetch ...`.
 2. Run Stage 1 (`ruthless_audit.py ... --diff <parent>`) and Stage 2 (semantic review of the
-   pinpointed hunks against the full file, not just the diff).
+   pinpointed hunks against the full file, not just the diff). Both `triage_cl.py` and
+   `ruthless_audit.py` automatically query `~/.gemini/config/scripts/finding_ledger.py` for the
+   target repo/CL/files — pass any prior refuted findings into the Stage 2 auditor so repeat
+   patchsets never re-raise already-refuted claims.
 3. **Run Stage 2.5 (`keeper_skeptic` Batched Refutation Pass)**:
    - Whenever Stage 2 raises any `HIGH` / `CRITICAL` candidate defect or architectural pushback, spawn **one batched `keeper_skeptic` subagent** in a clean context to **REFUTE** the candidates using actual callers (`git grep`, `grep -rn`, `code_search`), comments, and tests.
    - **Automatic Model Routing (`XFAMILY_REFUTE`)**: Use `Model="flash"` for routine local checks; automatically escalate to `Model="pro"` if any candidate involves concurrency/lifetimes, BiDi/UTF-8/UTF-16/grapheme index math, `SkParagraph` line metrics, dropped historical guards (`git log -S`), or cross-backend `SkParagraph` ↔ `WebParagraph` symmetry.
    - **Quota Fallback**: On `pro` quota exhaustion, auto-downgrade to `Model="flash"` (`[Verified via Flash fallback (Pro quota exhausted)]`); if all models fail, mark the draft `[UNVERIFIED: Quota Exhausted]` and alert the user.
-   - **Apply the Three Skeptic Verdicts to Review Drafts**:
-     - **`REFUTED` (`path:line` guard, caller `SkASSERT`, or documented intent)**: Drop silently—never embarrass the human reviewer with a false positive on Gerrit/GitHub.
+   - **Apply the Three Skeptic Verdicts to Review Drafts & Persist Refutations**:
+     - **`REFUTED` (`path:line` guard, caller `SkASSERT`, or documented intent)**: Drop silently—never embarrass the human reviewer with a false positive on Gerrit/GitHub. Record every `REFUTED` item (and any review comment the user later dismisses in chat) in the Persistent Finding Ledger via `python3 ~/.gemini/config/scripts/finding_ledger.py add --repo <repo_or_project> --file <path> --symbol "<sym>" --claim "<claim>" --reason "<evidence>" [--scope repo|cl --cl <cl_id>]`.
      - **`CONFIRMED` (`entry -> path:line -> bad outcome`)**: Fold into the actionable English review draft; drop any LGTM draft that a confirmed defect contradicts.
      - **`UNPROVEN` (trace hits an external contract or unverified product intent)**: Convert into a polite, specific **Question for the CL Author** in English (stating what was traced and what remains open) rather than asserting a bug.
 

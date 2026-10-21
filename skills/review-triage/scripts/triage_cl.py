@@ -19,8 +19,14 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 import urllib.request
 import urllib.error
+
+SHARED_SCRIPTS_DIR = Path(__file__).resolve().parents[3] / "scripts"
+if str(SHARED_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SHARED_SCRIPTS_DIR))
+import finding_ledger
 
 USER_DOMAIN_KEYWORDS = [
     "text", "paragraph", "skparagraph", "webparagraph", "unicode",
@@ -120,6 +126,7 @@ def fetch_google3_cl(cl_number):
 
     return {
         "source": "Google3 Piper",
+        "project": "google3",
         "id": cl_str,
         "subject": subject,
         "owner": owner,
@@ -149,6 +156,8 @@ def fetch_github_pr(repo_url, pr_number):
 
     return {
         "source": f"GitHub ({clean_repo})",
+        "repo_url": clean_repo,
+        "pr_number": str(pr_number),
         "id": str(pr_number),
         "subject": subject,
         "owner": owner,
@@ -555,6 +564,11 @@ def generate_report(cl_data, analysis, files):
             md.append("Hi! Could you please split this change into two separate CLs? One for the preparatory refactoring/cleanup, and a second focused CL with the actual behavioral change and unit tests. Right now the semantic changes are obscured by the diff size, making safe review difficult.")
         md.append("```")
 
+    ledger_md = analysis.get("refuted_ledger_markdown", "")
+    if ledger_md:
+        md.append("\n---\n")
+        md.append(ledger_md.rstrip())
+
     return "\n".join(md)
 
 def main():
@@ -660,6 +674,24 @@ def main():
 
     files = parse_patch(patch_text)
     analysis = analyze_review(cl_data, files)
+
+    detail_dict = cl_data.get("detail") if isinstance(cl_data.get("detail"), dict) else {}
+    repo_hint = (
+        detail_dict.get("project")
+        or cl_data.get("project")
+        or cl_data.get("repo_url")
+        or "."
+    )
+    touched_paths = [f.path for f in files if getattr(f, "path", "")]
+    ledger_path, ledger_entries = finding_ledger.query_entries(
+        repo=repo_hint,
+        files=touched_paths or None,
+        cl=str(cl_data.get("id", "")),
+    )
+    analysis["refuted_ledger"] = ledger_entries
+    analysis["refuted_ledger_markdown"] = finding_ledger.format_query_markdown(
+        ledger_entries, ledger_path=ledger_path, include_empty_header=True
+    )
 
     if args.json:
         out = {

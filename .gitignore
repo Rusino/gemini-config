@@ -14,6 +14,7 @@ __pycache__/
 # Runtime data written by hooks (per-machine project ids)
 logs/
 roadmaps/
+ledgers/
 conversation_summaries.db
 .workspace_mcp_backup.json
 

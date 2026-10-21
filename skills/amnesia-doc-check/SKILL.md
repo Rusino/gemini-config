@@ -11,7 +11,8 @@ description: >-
   against actual source code, audits dropped caveats via `git diff`/`git log`, and checks
   pattern completeness across enumerations and paired docs, and (2.5) a clean-context Skeptic
   Refutation pass (`keeper_skeptic`, `Hunt then Refute` with `XFAMILY_REFUTE` auto-routing)
-  to filter out false-positive contradiction or mechanism claims before rewriting prose or
+  backed by the Persistent Finding Ledger (`finding_ledger.py`) to filter out and cache
+  false-positive contradiction or mechanism claims across passes before rewriting prose or
   reporting issues. Trigger before sharing any document
   or substantive technical writeup externally, when reading/implementing from an incoming spec or
   Google Doc, or when the user asks to "проверь документ", "проверь док на лажу",
@@ -88,8 +89,8 @@ Target Document / Text:
 Target Repositories / Codebases:
 <explicit paths to local git repos and/or google3 depot paths>
 
-Deterministic Pre-Check Output:
-<paste output of check_doc_grounding.py>
+Deterministic Pre-Check Output (includes Section [7] Persistent Finding Ledger):
+<paste output of check_doc_grounding.py; do NOT re-raise any claim listed in [7] Persistent Finding Ledger unless the cited section or underlying source code changed>
 
 Instructions:
 Verify the document across six strict axes using actual tool calls (`read_file` / `view_file`, `code_search`, or read-only `git`/`ls` commands):
@@ -190,8 +191,14 @@ Instructions:
 
 ### Phase 3: Remediation & Verification Summary
 
-1. **Apply Confirmed Fact-Check Fixes & Resolve Pre-Review Grill**:
-   - Discard any Phase 2 finding that `keeper_skeptic` marked **`REFUTED`**.
+1. **Apply Confirmed Fact-Check Fixes, Persist Refutations, & Resolve Pre-Review Grill**:
+   - Discard any Phase 2 finding that `keeper_skeptic` marked **`REFUTED`**, and immediately record every `REFUTED` claim (or any finding dismissed by the user in chat as intentional framing) into the Persistent Finding Ledger so future document checks skip it:
+     ```bash
+     python3 ~/.gemini/config/scripts/finding_ledger.py add \
+       --repo <repo_path> --doc <doc_path_or_id> --file <doc_path_or_id> \
+       --symbol "<Section / Line>" --claim "<concise summary of refuted claim>" \
+       --reason "<exact section:line or path:line proof>" --category doc-check
+     ```
    - If the user owns/authors the draft:
      - Apply every surviving **`CONFIRMED`** `[Must Fix]` correction and resolve confirmed internal contradictions before presenting or publishing the text.
      - For any **Pre-Review Grill** question or **`UNPROVEN`** skeptic item: if the answer is already determinable from the codebase or conversation context, **silently add a concise 1-sentence explanation** to the document to preempt the reviewer's question. Ask the user **only** if it exposes a genuine unresolved product/design decision that cannot be answered from code.

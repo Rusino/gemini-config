@@ -8,8 +8,9 @@ description: >-
   and KEEPER/anti-slop/comment invariant scanning, (2) deep architectural & code-taste review
   (brain-split layers, data races, cache poisoning, shallow wrappers, symptomatic branching),
   (2.5) a clean-context Skeptic Refutation pass (keeper_skeptic, Hunt then Refute with XFAMILY_REFUTE
-  auto-routing) to refute false-positive bugs and unsafe DELETE/SIMPLIFY proposals, and
-  (3) a Feature & Test Utility Matrix (DELETE / SIMPLIFY / KEEP) with a phased pruning plan.
+  auto-routing) and Persistent Finding Ledger (`finding_ledger.py`) to refute and cache false-positive
+  bugs and unsafe DELETE/SIMPLIFY proposals across runs, and (3) a Feature & Test Utility Matrix
+  (DELETE / SIMPLIFY / KEEP) with a phased pruning plan.
   Trigger when the user asks to "проведи аудит кода", "беспощадный аудит", "проверь на дублирование
   и ужасы", "код ревью с поиском дублей", "оцени полезность функционала", "найди мёртвый код",
   or "ruthless code review / audit".
@@ -68,6 +69,7 @@ python3 ~/.gemini/config/skills/ruthless-code-audit/scripts/ruthless_audit.py \
 Do not stop at the script output. Inspect the flagged hotspots and read the core domain files to evaluate architecture, correctness, and code taste.
 
 ### Orchestration in Jetski / Antigravity
+- **Persistent Finding Ledger (`finding_ledger.py`)**: Stage 1 (`ruthless_audit.py`) automatically queries `~/.gemini/config/scripts/finding_ledger.py` and outputs any prior refuted findings for the target repo/diff/files. Always include those entries in the prompt of every Stage 2 Hunter subagent so they do not waste tokens re-raising already-refuted issues.
 - **For large repositories (> 3,000 lines or > 5 files)**: spawn parallel read-only subagents (`invoke_subagent` with `TypeName="self"` or `TypeName="keeper_inquisitor"`) partitioned by subsystem (e.g., Subagent 1: Backend & Concurrency; Subagent 2: Frontend/UI & Duplication; Subagent 3: Tests & Mutation Harness) so the main context stays clean.
 - **Built-in Google3 reference skills** (when `/google/src/files/head/...` is mounted):
   - Consult [`copy-paste-detection`](file:///google/src/files/head/depot/google3/learning/gemini/agents/skills/copy_paste_detection/SKILL.md) for DRY vs. DAMP judgment and `--query-snippet` bug propagation.
@@ -133,7 +135,15 @@ Instructions:
 )
 ```
 
-Drop all `REFUTED` items before writing Stage 3. Convert any `UNPROVEN` item into an explicit verification question rather than presenting it as a confirmed defect or safe deletion.
+Drop all `REFUTED` items before writing Stage 3, and immediately persist every `REFUTED` item (as well as any finding the user later dismisses in chat as intentional design) into the Persistent Finding Ledger so subsequent audits skip it:
+```bash
+python3 ~/.gemini/config/scripts/finding_ledger.py add \
+  --repo <repo_root> --file <path> --symbol "<func_or_class>" \
+  --claim "<concise summary of refuted bug or unsafe DELETE/SIMPLIFY>" \
+  --reason "<exact path:line guard, caller search proof, or user rationale>" \
+  --scope repo  # or --scope cl --cl <cl_id> for CL-specific deferrals
+```
+Convert any `UNPROVEN` item into an explicit verification question rather than presenting it as a confirmed defect or safe deletion.
 
 ---
 

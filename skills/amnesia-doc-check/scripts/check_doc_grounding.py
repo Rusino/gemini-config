@@ -21,6 +21,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+SHARED_SCRIPTS_DIR = Path(__file__).resolve().parents[3] / "scripts"
+if str(SHARED_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SHARED_SCRIPTS_DIR))
+import finding_ledger
+
 
 PLACEHOLDER_PATTERNS = [
     (
@@ -69,7 +74,7 @@ FILE_EXT_RE = re.compile(rf"^[\w./~-]+?\.(?:{KNOWN_EXTS})$")
 PATH_TOKEN_RE = re.compile(r"`([^`\n]{2,120})`")
 FILE_LINK_RE = re.compile(r"file://(/[^\s)#`\"']+)")
 BARE_PATH_RE = re.compile(
-    rf"(?<![\w:/.])((?:/|~|\.\.?/)?[\w.-]+(?:/[\w.*<>-]+)+/?|[\w.-]+\.(?:{KNOWN_EXTS}))(?![\w/])"
+    rf"(?<![\w:/.~])((?:/|~|\.\.?/)?[\w.-]+(?:/[\w.*<>-]+)+/?|[\w.-]+\.(?:{KNOWN_EXTS}))(?![\w/])"
 )
 SKILL_BULLET_RE = re.compile(
     r"^\s*[-*]\s+(?:\*\*|`)+([a-z0-9]+(?:-[a-z0-9]+)+)(?:\*\*|`)+"
@@ -480,6 +485,26 @@ def main() -> int:
             for line_no, ldap in invalid_ldaps:
                 print(f"  - Line {line_no}: `{ldap}@google.com` (no active user found via `id -u`)")
             total_issues += len(invalid_ldaps)
+        else:
+            print("  None")
+
+        primary_repo = str(repos[0]) if repos else None
+        doc_target = file_arg if file_arg != "-" else None
+        ledger_path, ledger_entries = finding_ledger.query_entries(
+            repo=primary_repo,
+            doc=doc_target,
+        )
+        print(
+            f"\n[7] Persistent Finding Ledger ({len(ledger_entries)} prior refuted claim(s) "
+            f"in `{ledger_path.stem}`):"
+        )
+        if ledger_entries:
+            for e in ledger_entries:
+                sym = f" ({e['symbol']})" if e.get("symbol") else ""
+                print(
+                    f"  - [{e.get('id', 'L???')}] `{e.get('file', '*')}`{sym}: "
+                    f"{e.get('claim', '')} -> Refuted: {e.get('reason', '')}"
+                )
         else:
             print("  None")
 
