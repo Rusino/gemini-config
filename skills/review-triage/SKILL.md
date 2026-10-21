@@ -151,6 +151,7 @@ For every targeted single-CL review in `🔴 SURGICAL AUDIT / CORE DOMAIN` (or `
    - **Case 4 (Fundamental Flaw / Unfixable Without Rewrite)**: Upload a **1-patchset WIP CL (`PS1` = Failing Reproducer Tests ONLY)** and draft a constructive pushback message.
    - **Case 5 (Edge-Case Defects + Clean Fix)**: Upload a **2-patchset WIP CL** stacked directly on the author's exact patchset SHA without rebasing (`PS1` = failing contract tests with timeless comments; `PS2` = production fix + passing tests, uploaded via `git push origin HEAD:refs/for/main%wip` with zero reviewers) and draft the collaborative English review comment linking `PS1` and `PS2`.
 2. If the CL is the user's own, follow **Self-Review Mode** in `companion-cl-review` instead: no companion CL, the same patchsets go directly into the user's CL.
+3. If the user asks for a dry run (*"dry"*, *"сухой прогон"*, *"только доложи"*), follow **Dry Mode** in `companion-cl-review`: build and test locally, report the case and planned actions, push nothing.
 3. **Review message tone**: draft in the collaborative `companion-cl-review` Phase 5 style by default. Render it in Ben Wagner's voice (`bungeman-review` voice mode) only when the user asks for Ben; for Case 4 pushback, offer the voice-mode variant as an option.
 
 ---

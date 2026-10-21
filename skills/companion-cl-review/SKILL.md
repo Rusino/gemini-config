@@ -11,7 +11,9 @@ description: >-
   to cherry-pick tests, fold in the fix, or split the CL. Trigger by default on code reviews (via
   `review-triage` or directly) or when the user asks for "ревью с компаньоном", "сделай WIP СЛ для
   ревью", "повесь дочерний СЛ с тестами и фиксом", "companion cl review", unless the user explicitly
-  opts out ("без компаньона", "только текстом", "without companion CL").
+  opts out ("без компаньона", "только текстом", "without companion CL"). Supports a dry mode
+  ("dry", "сухой прогон", "только доложи", "без действий") that builds and tests locally but only
+  reports the planned actions without pushing anything.
 ---
 
 # Proof-by-WIP-CL Code Review (`companion-cl-review`)
@@ -163,6 +165,23 @@ When the CL under review is owned by the user (Gerrit `owner`, not merely the up
 4. **After reviewers are added**: prepare the patchsets locally and **ask the user before pushing**, because every upload resets copied `Code-Review` votes and notifies reviewers. Upload the intermediate failing-tests patchset with `%notify=NONE` to avoid an extra notification.
 5. **Not uploaded yet** (local branch only): use two local commits (tests, then fix) instead of patchsets; squashing before upload is the user's choice.
 6. **Never trigger CQ** on any patchset unless the user explicitly asks.
+
+---
+
+## Dry Mode (Report Only, No External Actions)
+
+When the user asks for a dry run (e.g., *"dry"*, *"сухой прогон"*, *"только доложи"*, *"без действий"*, *"dry run"*), execute the full protocol locally but **stop before anything becomes visible outside the machine**:
+
+1. **Forbidden**: `git push` of any kind (companion CL, patchsets into the user's own CL, GitHub branches or Draft PRs), creating or abandoning CLs, posting or drafting comments in Gerrit/GitHub, votes, and CQ.
+2. **Allowed and required**: fetching the patchset into a separate worktree, writing the contract tests, building, running the tests, implementing and verifying the fix, and committing locally. Without the local run, Case 3 (tests pass) cannot be told apart from Case 5 (tests fail), so a dry run never skips compilation; a review without building is the prose-only opt-out instead.
+3. **Report to the user in chat**:
+   - The selected case (1–5) with its justification.
+   - The planned external action: no CL, a 1-patchset or 2-patchset companion WIP CL, or patchsets into the user's own CL (Self-Review Mode).
+   - The test names, how many fail on the reviewed patchset, and the failing assertion count.
+   - The proposed fix diff (Case 5).
+   - The draft review message for the author.
+   - The local branch / worktree holding the prepared commits.
+4. **Promotion**: when the user approves (e.g., *"давай"*, *"пушь"*), push the prepared local commits exactly as reported (`PS1`, then `PS2`) without redoing the work; if the reviewed CL received a new patchset in the meantime, report this and ask before re-basing the work onto it.
 
 ---
 
