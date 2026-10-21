@@ -336,6 +336,37 @@ class TestStopGuard(unittest.TestCase):
       self.assertIn("--uri=https://jetski.corp.google.com/box/myhost/c/conv-123", cmd)
       self.assertTrue(mock_popen.call_args[1].get("start_new_session"))
 
+  def test_jetski_web_edit_file_blocks_stop_when_unverified(self):
+    fake_src = "/workspace/project/Paragraph.cpp"
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl") as f_trans, \
+         tempfile.TemporaryDirectory() as tmp_dir:
+      steps = [
+          {"step_index": 1, "type": "USER_INPUT", "content": "Fix paragraph"},
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{"name": "edit_file", "args": {"Path": fake_src}}],
+          },
+      ]
+      for s in steps:
+        f_trans.write(json.dumps(s) + "\n")
+      f_trans.flush()
+
+      data = {
+          "conversationId": "c1",
+          "transcriptPath": f_trans.name,
+          "artifactDirectoryPath": tmp_dir,
+          "fullyIdle": True,
+          "terminationReason": "MODEL_STOP",
+      }
+      with patch("sys.stdin", io.StringIO(json.dumps(data))), \
+           patch("sys.stdout", new_callable=io.StringIO) as mock_out, \
+           patch.object(stop_guard, "play_stop_sound"):
+        stop_guard.main()
+        out = json.loads(mock_out.getvalue())
+        self.assertEqual(out.get("decision"), "continue")
+        self.assertIn("VERIFICATION GUARD", out.get("reason", ""))
+
 
 if __name__ == "__main__":
   unittest.main()

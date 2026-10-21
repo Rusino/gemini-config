@@ -410,6 +410,202 @@ class TestPreToolGuard(unittest.TestCase):
       })
       self.assertEqual(out_path.get("decision"), "deny")
 
+  def test_jetski_web_tool_names_read_before_edit(self):
+    fake_src = "/workspace/dummy_project/Paragraph.cpp"
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl") as f_trans:
+      f_trans.write("")
+      f_trans.flush()
+      data = {
+          "conversationId": "c1",
+          "transcriptPath": f_trans.name,
+          "toolCall": {
+              "name": "edit_file",
+              "args": {"Path": fake_src},
+          },
+      }
+      with patch("os.path.exists", side_effect=lambda p: p in (fake_src, f_trans.name)):
+        out = self.run_guard(data)
+        self.assertEqual(out.get("decision"), "deny")
+        self.assertIn("READ-BEFORE-EDIT", out.get("reason", ""))
+
+      read_step = {
+          "step_index": 1,
+          "type": "PLANNER_RESPONSE",
+          "tool_calls": [{"name": "read_file", "args": {"Path": fake_src}}],
+      }
+      f_trans.write(json.dumps(read_step) + "\n")
+      f_trans.flush()
+      with patch("os.path.exists", side_effect=lambda p: p in (fake_src, f_trans.name)):
+        out_ok = self.run_guard(data)
+        self.assertEqual(out_ok.get("decision"), "allow")
+
+  def test_code_check_guard_requires_precommit_audits_after_source_edit(self):
+    fake_src = "/workspace/skia/modules/skparagraph/src/ParagraphImpl.cpp"
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl") as f_trans:
+      steps = [
+          {
+              "step_index": 1,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{"name": "edit_file", "args": {"Path": fake_src}}],
+          },
+      ]
+      for s in steps:
+        f_trans.write(json.dumps(s) + "\n")
+      f_trans.flush()
+
+      for cmd in (
+          "git commit -m 'fix'",
+          "git -c commit.gpgsign=false commit -m 'fix'",
+          "git cl upload",
+          "gh pr create --fill",
+      ):
+        out = self.run_guard({
+            "conversationId": "c1",
+            "transcriptPath": f_trans.name,
+            "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}},
+        })
+        self.assertEqual(out.get("decision"), "deny")
+        self.assertIn("CODE-CHECK GUARD", out.get("reason", ""))
+
+      # Inspection commands mentioning the script names do not unlock commit
+      f_trans.write(
+          json.dumps({
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {"CommandLine": "git grep audit_comments.py && ls ruthless_audit.py"},
+              }],
+          })
+          + "\n"
+      )
+      f_trans.flush()
+      self.assertEqual(
+          self.run_guard({
+              "conversationId": "c1",
+              "transcriptPath": f_trans.name,
+              "toolCall": {"name": "run_command", "args": {"CommandLine": "git commit -m 'fix'"}},
+          }).get("decision"),
+          "deny",
+      )
+
+      # Running only audit_comments.py is not enough without ruthless_audit.py
+      f_trans.write(
+          json.dumps({
+              "step_index": 3,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {"CommandLine": "python3 audit_comments.py --diff HEAD --repo ."},
+              }],
+          })
+          + "\n"
+      )
+      f_trans.flush()
+      self.assertEqual(
+          self.run_guard({
+              "conversationId": "c1",
+              "transcriptPath": f_trans.name,
+              "toolCall": {"name": "run_command", "args": {"CommandLine": "git commit -m 'fix'"}},
+          }).get("decision"),
+          "deny",
+      )
+
+      # Running ruthless_audit.py completes the Phase 1 check and allows commit
+      f_trans.write(
+          json.dumps({
+              "step_index": 4,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {"CommandLine": "python3 ruthless_audit.py . --repo . --diff HEAD"},
+              }],
+          })
+          + "\n"
+      )
+      f_trans.flush()
+      self.assertEqual(
+          self.run_guard({
+              "conversationId": "c1",
+              "transcriptPath": f_trans.name,
+              "toolCall": {"name": "run_command", "args": {"CommandLine": "git commit -m 'fix'"}},
+          }).get("decision"),
+          "allow",
+      )
+
+      # Subsequent source edit resets the audit state
+      f_trans.write(
+          json.dumps({
+              "step_index": 5,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{"name": "edit_file", "args": {"Path": fake_src}}],
+          })
+          + "\n"
+      )
+      f_trans.flush()
+      self.assertEqual(
+          self.run_guard({
+              "conversationId": "c1",
+              "transcriptPath": f_trans.name,
+              "toolCall": {"name": "run_command", "args": {"CommandLine": "git commit -m 'fix'"}},
+          }).get("decision"),
+          "deny",
+      )
+
+  def test_doc_check_guard_requires_grounding_before_update_doc(self):
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl") as f_trans:
+      f_trans.write(
+          json.dumps({"step_index": 1, "type": "USER_INPUT", "content": "Update the doc"})
+          + "\n"
+      )
+      f_trans.flush()
+
+      update_call = {
+          "conversationId": "c1",
+          "transcriptPath": f_trans.name,
+          "toolCall": {
+              "name": "call_mcp_tool",
+              "args": {"ServerName": "google_docs", "ToolName": "update_doc", "Arguments": {}},
+          },
+      }
+      out = self.run_guard(update_call)
+      self.assertEqual(out.get("decision"), "deny")
+      self.assertIn("DOC-CHECK GUARD", out.get("reason", ""))
+
+      # Running check_doc_grounding.py unlocks update_doc across confirmation turns
+      f_trans.write(
+          json.dumps({
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {"CommandLine": "python3 check_doc_grounding.py draft.md"},
+              }],
+          })
+          + "\n"
+          + json.dumps({"step_index": 3, "type": "USER_INPUT", "content": "Looks good, publish it"})
+          + "\n"
+      )
+      f_trans.flush()
+      self.assertEqual(self.run_guard(update_call).get("decision"), "allow")
+
+      # After update_doc executes and a new turn starts, a fresh grounding check is required
+      f_trans.write(
+          json.dumps({
+              "step_index": 4,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "call_mcp_tool",
+                  "args": {"ServerName": "google_docs", "ToolName": "update_doc", "Arguments": {}},
+              }],
+          })
+          + "\n"
+          + json.dumps({"step_index": 5, "type": "USER_INPUT", "content": "Now edit section 4"})
+          + "\n"
+      )
+      f_trans.flush()
+      self.assertEqual(self.run_guard(update_call).get("decision"), "deny")
+
 
 if __name__ == "__main__":
   unittest.main()

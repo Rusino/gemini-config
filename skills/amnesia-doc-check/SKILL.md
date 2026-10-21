@@ -2,31 +2,32 @@
 name: amnesia-doc-check
 description: >-
   Clean-context fact-checking, internal self-consistency, and referential grounding pipeline
-  for outgoing documents, design docs, slide decks, and substantive technical texts (CL/PR
-  descriptions, bug reports, review summaries). Combines (1) a zero-token deterministic pass
-  (`check_doc_grounding.py`) for leftover LLM placeholders, intra-document path drift,
+  for incoming and outgoing documents, design docs, slide decks, and substantive technical texts
+  (CL/PR descriptions, bug reports, specs, review summaries). Combines (1) a zero-token deterministic
+  pass (`check_doc_grounding.py`) for leftover LLM placeholders, intra-document path drift,
   nonexistent paths, and wrong skill/symbol names, with (2) a single amnesiac subagent pass
   (zero chat history bias) that checks internal logical/numeric/terminological consistency
   across sections, verifies every path, symbol, CLI flag, and `file:line` mechanism claim
   against actual source code, audits dropped caveats via `git diff`/`git log`, and checks
   pattern completeness across enumerations and paired docs. Trigger before sharing any document
-  or substantive technical writeup externally, or when the user asks to "проверь документ",
-  "проверь док на лажу", "проверь на непротиворечивость", "проверь текст перед отправкой",
-  "сделай амнезия-проверку дока", or "run amnesia doc check".
+  or substantive technical writeup externally, when reading/implementing from an incoming spec or
+  Google Doc, or when the user asks to "проверь документ", "проверь док на лажу",
+  "проверь на непротиворечивость", "проверь текст перед отправкой", "сделай амнезия-проверку дока",
+  or "run amnesia doc check".
 ---
 
-# Amnesia Document & Outgoing Text Fact-Checker (`amnesia-doc-check`)
+# Amnesia Document & Technical Text Fact-Checker (`amnesia-doc-check`)
 
-Code has a compiler and test suite; prose documents do not. When an agent drafts or edits a document at the end of a long conversation, it routinely carries over paraphrased file/skill names, unverified assumptions about how an external subsystem works, internal contradictions between early proposals and late caveats, or leftover generation scaffolding (`[find link]`, `TBD`).
+Code has a compiler and test suite; prose documents do not. When an agent drafts or edits a document at the end of a long conversation — or reads an incoming design doc/spec written by someone else — it routinely encounters paraphrased file/skill names, unverified assumptions about how an external subsystem works, internal contradictions between early proposals and late caveats, or leftover generation scaffolding (`[find link]`, `TBD`).
 
-This skill acts as a **compiler + clean-room auditor for technical prose** before any document or substantive technical text leaves the session.
+This skill acts as a **compiler + clean-room auditor for technical prose** both before any outgoing document/text leaves the session and when auditing incoming documents/specs before trusting their claims.
 
 ---
 
 ## Scope Calibration (When to Run Full vs. Inline)
 
 1. **Full Pipeline (Phase 1 Script + Phase 2 Amnesiac Subagent)**:
-   - Any standalone document or presentation: Google Docs, design docs, architecture proposals, postmortems, audit/benchmark reports, slide decks, `README.md`, `SKILL.md`, or rules files (even if the document is pure prose/strategy with no code links — internal self-consistency still applies).
+   - Any standalone outgoing or incoming document/presentation: Google Docs, design docs, specs, architecture proposals, postmortems, audit/benchmark reports, slide decks, `README.md`, `SKILL.md`, or rules files (even if the document is pure prose/strategy with no code links — internal self-consistency still applies).
    - Any multi-paragraph external technical message (detailed CL/PR description, Buganizer / GitHub issue analysis, design review comment, or team chat post) that makes multi-step arguments, presents numbers/tables, or cites file paths, code symbols, CLI flags, commit SHAs, or subsystem mechanics.
 2. **Lightweight Inline Check (Phase 1 + Direct Tool Check, 0 Subagents)**:
    - Short chat or review replies (1–3 sentences) and trivial 1-hunk commit messages where every referenced file and line is already open in the current turn's context.

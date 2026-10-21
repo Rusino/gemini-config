@@ -3,10 +3,10 @@
 
 Checks the current turn in transcript.jsonl:
 - If the agent modified a source code file (`write_to_file`, `replace_file_content`,
-  or `multi_replace_file_content`) and did NOT run any verification command
-  (`run_command`) after the last code edit (or the last command after the edit
-  failed with a non-zero exit code), blocks the stop once (`decision: "continue"`)
-  and instructs the agent to verify the change first.
+  `multi_replace_file_content`, `write_file`, or `edit_file`) and did NOT run any
+  verification command (`run_command`) after the last code edit (or the last command
+  after the edit failed with a non-zero exit code), blocks the stop once
+  (`decision: "continue"`) and instructs the agent to verify the change first.
 """
 
 import json
@@ -57,7 +57,17 @@ EDIT_TOOLS = {
     "write_to_file",
     "replace_file_content",
     "multi_replace_file_content",
+    "write_file",
+    "edit_file",
 }
+
+
+def get_tool_target_file(tool_args: dict) -> str:
+  for key in ("TargetFile", "Path", "AbsolutePath"):
+    val = tool_args.get(key)
+    if val:
+      return str(val).strip()
+  return ""
 
 # Tool results may indent this line (e.g. "\n\n\t\t\t\tThe command exited ..." on
 # macOS Jetski), so allow leading whitespace.
@@ -275,7 +285,7 @@ def analyze_current_turn(transcript_path: str) -> dict:
         tname = tc.get("name", "")
         targs = tc.get("args") or {}
         if tname in EDIT_TOOLS:
-          target = targs.get("TargetFile", "")
+          target = get_tool_target_file(targs)
           if is_tracked_source_file(target):
             last_code_edit_idx = idx
             last_edited_file = target.strip().strip('"').strip("'")

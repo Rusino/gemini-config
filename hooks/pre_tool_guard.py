@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PreToolUse hook for Jetski to prevent hallucinations, blind edits, and broken handoffs.
 
-Implements six mechanical guards:
+Implements eight mechanical guards:
 1. Handoff Command & Post-Handoff Guard:
    - Blocks any file edits or duplicate `new-conversation` calls in a conversation
      that has already handed off in the current turn.
@@ -18,9 +18,9 @@ Implements six mechanical guards:
      state file (in-project chats), so the new chat never needs to grep old
      transcripts.
 3. Read-Before-Edit Guard:
-   - Blocks `replace_file_content` / `multi_replace_file_content` on existing
-     source files if the file was never viewed (`view_file`) or written earlier
-     in the current conversation.
+   - Blocks `replace_file_content` / `multi_replace_file_content` / `edit_file`
+     on existing source files if the file was never viewed (`view_file` /
+     `read_file`) or written earlier in the current conversation.
 4. Generated / Gitignored File Guard:
    - Blocks editing source files inside build caches or `.gitignore`d directories
      (e.g., `bin/cache/`, `out/`, `build/`) inside a Git repository.
@@ -31,6 +31,13 @@ Implements six mechanical guards:
    - Blocks `run_workflow` scripts that fan out over multiple agents (`parallel` or
      `pipeline` with `agent(...)`) without gating results via `advanced.verify`
      (unless explicitly marked `# no-verify` for read-only discovery).
+7. Code Pre-Commit Audit Guard (`CODE-CHECK GUARD`):
+   - Blocks `git commit`, `git cl upload`, and `gh pr create` after modifying a
+     tracked source file unless both `audit_comments.py` and `ruthless_audit.py`
+     have been executed since the last source edit.
+8. Google Docs Grounding Guard (`DOC-CHECK GUARD`):
+   - Blocks `call_mcp_tool` (`update_doc`) unless `check_doc_grounding.py` has
+     run since the last consumed `update_doc` turn.
 """
 
 # Every gated tool call of every chat runs this file, including the calls that
@@ -58,12 +65,34 @@ EDIT_TOOLS = {
     "write_to_file",
     "replace_file_content",
     "multi_replace_file_content",
+    "write_file",
+    "edit_file",
 }
 
 MODIFY_TOOLS = {
     "replace_file_content",
     "multi_replace_file_content",
+    "edit_file",
 }
+
+READ_TOOLS = {
+    "view_file",
+    "read_file",
+}
+
+WRITE_NEW_TOOLS = {
+    "write_to_file",
+    "write_file",
+}
+
+
+def get_tool_target_file(tool_args: dict) -> str:
+  """Extracts the target file path across Antigravity and Jetski Web tool schemas."""
+  for key in ("TargetFile", "Path", "AbsolutePath"):
+    val = tool_args.get(key)
+    if val:
+      return str(val).strip()
+  return ""
 
 SOURCE_EXTENSIONS = {
     ".c",
@@ -236,10 +265,8 @@ def was_file_read_or_written_in_chat(
         for tc in obj.get("tool_calls") or []:
           tname = tc.get("name", "")
           targs = tc.get("args") or {}
-          if tname == "view_file":
-            p = targs.get("AbsolutePath", "")
-          elif tname == "write_to_file":
-            p = targs.get("TargetFile", "")
+          if tname in READ_TOOLS or tname in WRITE_NEW_TOOLS:
+            p = get_tool_target_file(targs)
           else:
             continue
           if p:
@@ -251,6 +278,146 @@ def was_file_read_or_written_in_chat(
   except Exception:
     return True
   return False
+
+
+GIT_COMMIT_OR_UPLOAD_RE = re.compile(
+    r"(?:^|(?<=[\s;&|(`]))(?:"
+    r"git(?:\s+(?:-[Cc]\s+\S+|--[a-z-]+(?:=\S+)?))*\s+(?:commit|cl\s+upload)"
+    r"|gh\s+pr\s+create"
+    r")\b"
+)
+
+
+def is_git_commit_or_upload_command(cmd: str) -> bool:
+  """True if cmd invokes git commit, git cl upload, or gh pr create outside heredocs/grep."""
+  cmd_code = strip_heredocs(cmd)
+  if re.match(r"^\s*(?:grep|egrep|fgrep|rg|git\s+grep|echo|cat)\b", cmd_code):
+    return False
+  if re.search(r"\b(?:commit|upload|create)\s+(?:--help|-h|help)\b", cmd_code):
+    return False
+  return bool(GIT_COMMIT_OR_UPLOAD_RE.search(cmd_code))
+
+
+def _load_transcript_steps(
+    transcript_path: str, current_step_idx: int = -1
+) -> list[dict]:
+  """Loads ordered JSONL transcript steps prior to current_step_idx."""
+  if not transcript_path or not os.path.exists(transcript_path):
+    return []
+  steps_by_idx = {}
+  try:
+    with open(transcript_path, "r", encoding="utf-8") as f:
+      for line in f:
+        line = line.strip()
+        if not line:
+          continue
+        try:
+          obj = json.loads(line)
+          idx = obj.get("step_index")
+          if idx is not None:
+            steps_by_idx[int(idx)] = obj
+        except Exception:
+          continue
+  except Exception:
+    return []
+  return [
+      steps_by_idx[idx]
+      for idx in sorted(steps_by_idx.keys())
+      if current_step_idx < 0 or idx < current_step_idx
+  ]
+
+
+def _invokes_script(cmd: str, script_name: str) -> bool:
+  """True if any non-inspection command segment in cmd executes script_name."""
+  cmd_code = strip_heredocs(cmd)
+  if script_name not in cmd_code:
+    return False
+  for seg in re.split(r"&&|\|\||;|\||\n", cmd_code):
+    seg = seg.strip()
+    if not seg or script_name not in seg:
+      continue
+    if re.match(
+        r"^(?:grep|egrep|fgrep|rg|git|ls|cat|head|tail|echo|find|wc|stat)\b",
+        seg,
+    ):
+      continue
+    return True
+  return False
+
+
+def unverified_source_edit_before_commit(
+    transcript_path: str, current_cmd: str = "", current_step_idx: int = -1
+) -> str:
+  """Basename of last edited source file if both pre-commit audits have not run since."""
+  steps = _load_transcript_steps(transcript_path, current_step_idx)
+  if not steps:
+    return ""
+  last_edited_source = ""
+  has_audit_comments = False
+  has_ruthless_audit = False
+  for step in steps:
+    if step.get("type") != "PLANNER_RESPONSE":
+      continue
+    for tc in step.get("tool_calls") or []:
+      tname = tc.get("name", "")
+      targs = tc.get("args") or {}
+      if tname in EDIT_TOOLS:
+        tf = get_tool_target_file(targs)
+        if is_tracked_source_file(tf):
+          last_edited_source = os.path.basename(
+              tf.strip().strip('"').strip("'")
+          )
+          has_audit_comments = False
+          has_ruthless_audit = False
+      elif tname == "run_command":
+        c = str(targs.get("CommandLine", ""))
+        if _invokes_script(c, "audit_comments.py"):
+          has_audit_comments = True
+        if _invokes_script(c, "ruthless_audit.py"):
+          has_ruthless_audit = True
+
+  if _invokes_script(current_cmd, "audit_comments.py"):
+    has_audit_comments = True
+  if _invokes_script(current_cmd, "ruthless_audit.py"):
+    has_ruthless_audit = True
+
+  if last_edited_source and not (has_audit_comments and has_ruthless_audit):
+    return last_edited_source
+  return ""
+
+
+def was_doc_grounding_run_in_chat(
+    transcript_path: str, current_step_idx: int = -1
+) -> bool:
+  """True if check_doc_grounding.py ran since the last consumed update_doc turn."""
+  if not transcript_path or not os.path.exists(transcript_path):
+    return True
+  steps = _load_transcript_steps(transcript_path, current_step_idx)
+  if not steps:
+    return True
+  grounding_available = False
+  consumed_by_update_doc = False
+  for step in steps:
+    stype = step.get("type", "")
+    if stype == "USER_INPUT":
+      if consumed_by_update_doc:
+        grounding_available = False
+        consumed_by_update_doc = False
+    elif stype == "PLANNER_RESPONSE":
+      for tc in step.get("tool_calls") or []:
+        tname = tc.get("name", "")
+        targs = tc.get("args") or {}
+        if tname == "run_command":
+          c = str(targs.get("CommandLine", ""))
+          if _invokes_script(c, "check_doc_grounding.py"):
+            grounding_available = True
+            consumed_by_update_doc = False
+        elif (
+            tname == "call_mcp_tool"
+            and str(targs.get("ToolName", "")) == "update_doc"
+        ) or tname.endswith("_update_doc"):
+          consumed_by_update_doc = True
+  return grounding_available
 
 
 def is_gitignored_or_build_cache(target_file: str) -> tuple[bool, str]:
@@ -372,7 +539,7 @@ def enrich_handoff_summary_files(
             tname = tc.get("name", "")
             targs = tc.get("args") or {}
             if tname in EDIT_TOOLS:
-              tf = str(targs.get("TargetFile", "")).strip()
+              tf = get_tool_target_file(targs)
               if tf and not is_agent_internal_file(tf) and tf not in edited_files:
                 edited_files.append(tf)
             elif tname == "run_command":
@@ -514,7 +681,7 @@ def main() -> None:
   workspace_paths = data.get("workspacePaths") or []
 
   if tool_name in EDIT_TOOLS:
-    denial = roadmap_edit_denial(str(tool_args.get("TargetFile", "")), conv_id)
+    denial = roadmap_edit_denial(get_tool_target_file(tool_args), conv_id)
     if denial:
       print(json.dumps({"decision": "deny", "reason": denial}, ensure_ascii=False))
       return
@@ -798,7 +965,7 @@ def main() -> None:
 
   # 2. Guards for source file edits (apply to both main agent and subagents)
   if tool_name in EDIT_TOOLS:
-    target_file = str(tool_args.get("TargetFile", "")).strip()
+    target_file = get_tool_target_file(tool_args)
     if is_tracked_source_file(target_file):
       # Guard 3: Block editing gitignored / build-cache files
       ignored, reason_detail = is_gitignored_or_build_cache(target_file)
@@ -808,9 +975,10 @@ def main() -> None:
                 {
                     "decision": "deny",
                     "reason": (
-                        f"[GENERATED-FILE GUARD] Editing `{target_file}` is blocked: {reason_detail}. "
-                        "Do not edit generated artifacts or build caches directly — "
-                        "edit the tracked source file in the repository and rebuild the project."
+                        f"[GENERATED-FILE GUARD] Editing `{target_file}` is blocked: "
+                        f"{reason_detail}. Do not edit generated artifacts or build caches "
+                        "directly — edit the tracked source file in the repository and "
+                        "rebuild the project."
                     ),
                 },
                 ensure_ascii=False,
@@ -818,7 +986,7 @@ def main() -> None:
         )
         return
 
-      # Guard 2: Read-Before-Edit on existing files for replace_file_content / multi_replace_file_content
+      # Guard 2: Read-Before-Edit on existing files for replace/edit tools
       if tool_name in MODIFY_TOOLS:
         clean_path = os.path.expanduser(target_file.strip('"').strip("'"))
         if os.path.exists(clean_path) and not was_file_read_or_written_in_chat(
@@ -829,17 +997,72 @@ def main() -> None:
                   {
                       "decision": "deny",
                       "reason": (
-                          f"[READ-BEFORE-EDIT GUARD] You are attempting to modify an existing file `{os.path.basename(clean_path)}` "
-                          "without reading it via `view_file` in the current conversation! "
-                          "Do not edit code blindly from memory or from a `handoff_summary`: "
-                          "first read the target section of the file via `view_file`, verify exact signatures and context, "
-                          "and only then call `replace_file_content`."
+                          "[READ-BEFORE-EDIT GUARD] You are attempting to modify an existing "
+                          f"file `{os.path.basename(clean_path)}` without reading it via "
+                          "`read_file` / `view_file` in the current conversation! Do not edit "
+                          "code blindly from memory or from a `handoff_summary`: first read the "
+                          "target section of the file, verify exact signatures and context, and "
+                          f"only then call `{tool_name}`."
                       ),
                   },
                   ensure_ascii=False,
               )
           )
           return
+
+  # Guard 7: Pre-commit / pre-upload code audit check (amnesia-precommit Phase 1)
+  if tool_name == "run_command":
+    cmd_str = str(tool_args.get("CommandLine", "")).strip()
+    if is_git_commit_or_upload_command(cmd_str):
+      unverified_src = unverified_source_edit_before_commit(
+          transcript_path, cmd_str, int(data.get("stepIdx", -1))
+      )
+      if unverified_src:
+        print(
+            json.dumps(
+                {
+                    "decision": "deny",
+                    "reason": (
+                        f"[CODE-CHECK GUARD] You modified tracked source code (`{unverified_src}`) "
+                        "in this conversation without running both `amnesia-precommit` Phase 1 "
+                        "audit scripts since the last code edit! Before `git commit` / "
+                        "`git cl upload` / `gh pr create`, run:\n"
+                        "`python3 ~/.gemini/config/skills/code-comments/scripts/audit_comments.py "
+                        "--diff HEAD --repo <repo>`\n"
+                        "`python3 ~/.gemini/config/skills/ruthless-code-audit/scripts/"
+                        "ruthless_audit.py <repo> --repo <repo> --diff HEAD`"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
+
+  # Guard 8: Google Docs update_doc grounding check (amnesia-doc-check Phase 1)
+  if (
+      tool_name == "call_mcp_tool"
+      and str(tool_args.get("ToolName", "")) == "update_doc"
+  ) or tool_name.endswith("_update_doc"):
+    if not was_doc_grounding_run_in_chat(
+        transcript_path, int(data.get("stepIdx", -1))
+    ):
+      print(
+          json.dumps(
+              {
+                  "decision": "deny",
+                  "reason": (
+                      "[DOC-CHECK GUARD] Updating a Google Doc (`update_doc`) requires running "
+                      "`check_doc_grounding.py` (and the `amnesia-doc-check` workflow for "
+                      "substantive edits) before publishing changes. Save the draft to "
+                      "`<artifact_dir>/scratch/draft.md`, run "
+                      "`python3 ~/.gemini/config/skills/amnesia-doc-check/scripts/"
+                      "check_doc_grounding.py --repo <repo> <draft>`, and then call `update_doc`."
+                  ),
+              },
+              ensure_ascii=False,
+          )
+      )
+      return
 
   # Batch agent workflows (`parallel`/`pipeline` + `agent`) must gate outputs via
   # `advanced.verify` unless explicitly marked `# no-verify` for read-only discovery
