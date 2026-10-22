@@ -190,6 +190,11 @@ When the user asks for a dry run (e.g., *"dry"*, *"сухой прогон"*, *"
    - The draft review message for the author.
    - The local branch / worktree holding the prepared commits.
 4. **Promotion**: when the user approves (e.g., *"давай"*, *"пушь"*), push the prepared local commits exactly as reported (`PS1`, then `PS2`) without redoing the work; if the reviewed CL received a new patchset in the meantime, report this and ask before re-basing the work onto it.
+5. **No build available** (e.g., the user forbids a checkout or no local tree exists): Gate A
+   cannot run, so the review degrades to prose-only. Say so at the top of the report, mark the
+   case as `provisional` (Case 3 vs. Case 5 is undecidable without a run), label every drafted
+   test `not executed`, and list Phase 1–2 as `skipped` in the `Execution Ledger` required by
+   `review-triage` (`~/.gemini/config/skills/review-triage/SKILL.md`).
 
 ---
 

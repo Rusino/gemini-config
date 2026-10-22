@@ -179,6 +179,28 @@ For every targeted single-CL review in `🔴 SURGICAL AUDIT / CORE DOMAIN` (or `
 
 ---
 
+## Report Contract: Execution Ledger & Finding Statuses
+
+Every review report (chat summary or artifact) must make skipped work visible. The Stop hook
+(`~/.gemini/config/hooks/stop_guard.py`, `[REVIEW DISCIPLINE GUARD]`) blocks finishing when a
+named skill's `SKILL.md` was not read, when a report with a `Case 1-5` verdict lacks an
+`Execution Ledger` heading, or when a drafted testharness test has no `assert_*` call.
+
+1. **`## Execution Ledger` comes first**: one row per step of this skill and of
+   `companion-cl-review` (Phase 0 threads, triage script, Stage 1/2 audit, Stage 2.5 skeptic,
+   checkout, Gate A build/run, classification, draft) with `done` / `skipped` and the reason.
+   A skipped step is never described as done anywhere else in the report or the chat reply.
+2. **Every finding carries exactly one status**: `CONFIRMED` (entry -> `path:line` -> bad
+   outcome, plus the `keeper_skeptic` verdict), `REFUTED` (dropped from drafts, recorded in the
+   ledger), `UNPROVEN` (becomes a question for the author), or `UNVERIFIED` (no refutation pass
+   ran). Hypotheses handed over by the user or a parent chat start as `UNVERIFIED`; the word
+   "confirmed" without a skeptic verdict is forbidden.
+3. **Drafted tests must be able to fail**: each test asserts the contract (pixel/`getImageData`
+   comparison or reftest for drawing behavior, `assert_*` for return values). A test that only
+   calls the API is not a reproducer.
+
+---
+
 ## Review & VCS Guidelines (Strict Rules)
 1. **English-Only Review Surface**: All generated review comments, reassignment notes, and pushback messages must be strictly in English. Direct discussion with the user remains in Russian.
 2. **Never Auto-Publish or Resolve**: The agent must NEVER publish review comments to Gerrit/GitHub or resolve threads automatically. Drafts are presented in chat for the user to review and post.

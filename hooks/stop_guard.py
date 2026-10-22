@@ -7,6 +7,10 @@ Checks the current turn in transcript.jsonl:
   verification command (`run_command`) after the last code edit (or the last command
   after the edit failed with a non-zero exit code), blocks the stop once
   (`decision: "continue"`) and instructs the agent to verify the change first.
+- If the current user request names a skill whose SKILL.md was never read in the
+  conversation, or an artifact written this turn is a Case 1-5 review report
+  without an `Execution Ledger` section or a testharness test without `assert_*`,
+  blocks the stop once per user turn with a `[REVIEW DISCIPLINE GUARD]` reason.
 """
 
 import json
@@ -226,6 +230,140 @@ def play_stop_sound(is_handoff: bool) -> None:
     pass
 
 
+SKILL_GLOBS = (
+    "~/.gemini/config/skills/*/SKILL.md",
+    "~/.gemini/config/plugins/*/skills/*/SKILL.md",
+)
+READ_TOOLS = {"read_file", "view_file"}
+USER_REQUEST_RE = re.compile(r"<USER_REQUEST>(.*?)</USER_REQUEST>", re.DOTALL)
+CASE_CLASSIFICATION_RE = re.compile(r"\bCase [1-5]\b")
+LEDGER_HEADING_RE = re.compile(r"^#+\s.*Execution Ledger", re.MULTILINE | re.IGNORECASE)
+WPT_ASSERT_RE = re.compile(r"\bassert_\w+\s*\(")
+
+
+def discover_skills() -> dict:
+  """Maps skill directory names to their SKILL.md paths.
+
+  Only hyphenated or underscored names qualify, so plain words in a request
+  (e.g. "browser") never count as naming a skill.
+  """
+  import glob
+
+  skills = {}
+  for pattern in SKILL_GLOBS:
+    for path in glob.glob(os.path.expanduser(pattern)):
+      name = os.path.basename(os.path.dirname(path))
+      if "-" in name or "_" in name:
+        skills[name] = path
+  return skills
+
+
+def _unquote_path(value) -> str:
+  return str(value or "").strip().strip('"').strip("'")
+
+
+def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
+  """Collects skill-reading and review-report violations for the current turn.
+
+  A skill counts as named when its directory name appears in the current
+  turn's user request; it counts as read when any step of the conversation
+  read its SKILL.md. Artifacts written in this turn are checked on disk.
+  """
+  result = {"last_user_idx": -1, "unread_skills": [], "artifact_issues": []}
+  if not transcript_path or not os.path.exists(transcript_path):
+    return result
+  steps = []
+  try:
+    with open(transcript_path, "r", encoding="utf-8") as f:
+      for line in f:
+        line = line.strip()
+        if not line:
+          continue
+        try:
+          obj = json.loads(line)
+        except Exception:
+          continue
+        if obj.get("step_index") is not None:
+          steps.append(obj)
+  except Exception:
+    return result
+  steps.sort(key=lambda s: int(s["step_index"]))
+
+  request_text = ""
+  for step in steps:
+    if step.get("type") == "USER_INPUT":
+      result["last_user_idx"] = int(step["step_index"])
+      content = str(step.get("content", ""))
+      match = USER_REQUEST_RE.search(content)
+      request_text = match.group(1) if match else content
+
+  read_blobs = []
+  written_artifacts = []
+  for step in steps:
+    if step.get("type") != "PLANNER_RESPONSE":
+      continue
+    in_turn = int(step["step_index"]) > result["last_user_idx"]
+    for tc in step.get("tool_calls") or []:
+      tname = tc.get("name", "")
+      targs = tc.get("args") or {}
+      if tname in READ_TOOLS:
+        read_blobs.append(_unquote_path(get_tool_target_file(targs)))
+      elif tname == "run_command":
+        read_blobs.append(str(targs.get("CommandLine", "")))
+      elif tname in EDIT_TOOLS and in_turn and artifact_dir:
+        target = os.path.abspath(_unquote_path(get_tool_target_file(targs)))
+        if target.startswith(os.path.abspath(artifact_dir) + "/"):
+          written_artifacts.append(target)
+
+  for name in sorted(discover_skills()):
+    if not re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", request_text):
+      continue
+    suffix = f"{name}/SKILL.md"
+    if not any(suffix in blob for blob in read_blobs):
+      result["unread_skills"].append(name)
+
+  for path in dict.fromkeys(written_artifacts):
+    try:
+      with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    except Exception:
+      continue
+    base = os.path.basename(path)
+    # A 5-case review verdict without a step ledger hides skipped steps
+    if path.endswith(".md") and CASE_CLASSIFICATION_RE.search(text):
+      if not LEDGER_HEADING_RE.search(text):
+        result["artifact_issues"].append(
+            f"`{base}` classifies a review (Case 1-5) but has no `Execution Ledger` "
+            "section listing every skill step as done / skipped (with reason)"
+        )
+    # A testharness test without assertions passes on any behavior
+    if path.endswith(".html") and "testharness.js" in text:
+      if not WPT_ASSERT_RE.search(text):
+        result["artifact_issues"].append(
+            f"`{base}` is a testharness test with no `assert_*` call, so it cannot fail"
+        )
+  return result
+
+
+def review_discipline_reason(info: dict) -> str:
+  parts = []
+  for name in info.get("unread_skills", []):
+    parts.append(
+        f"- The request names skill `{name}`, but its SKILL.md was never read in this "
+        "conversation. Read it now and redo any step it requires that you skipped."
+    )
+  for issue in info.get("artifact_issues", []):
+    parts.append(f"- {issue}.")
+  if not parts:
+    return ""
+  return (
+      "[REVIEW DISCIPLINE GUARD] Do not finish yet:\n"
+      + "\n".join(parts)
+      + "\nAny step you cannot perform must be reported to the user as skipped or "
+      "UNVERIFIED, never as done."
+  )
+
+
 def analyze_current_turn(transcript_path: str) -> dict:
   if not transcript_path or not os.path.exists(transcript_path):
     return {}
@@ -431,6 +569,23 @@ def main() -> None:
     print(
         json.dumps(
             {"decision": "continue", "reason": reason}, ensure_ascii=False
+        )
+    )
+    return
+
+  discipline = analyze_review_discipline(transcript_path, artifact_dir)
+  discipline_reason = review_discipline_reason(discipline)
+  # Blocking once per user turn keeps a stubborn violation from looping forever
+  if (
+      discipline_reason
+      and state.get("discipline_blocked_turn") != discipline["last_user_idx"]
+  ):
+    state["discipline_blocked_turn"] = discipline["last_user_idx"]
+    save_state(state_path, state)
+    print(
+        json.dumps(
+            {"decision": "continue", "reason": discipline_reason},
+            ensure_ascii=False,
         )
     )
     return

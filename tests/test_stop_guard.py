@@ -367,6 +367,134 @@ class TestStopGuard(unittest.TestCase):
         self.assertEqual(out.get("decision"), "continue")
         self.assertIn("VERIFICATION GUARD", out.get("reason", ""))
 
+  def run_discipline_stop(self, tmp_dir, steps, state=None, files=None):
+    transcript = os.path.join(tmp_dir, "transcript.jsonl")
+    with open(transcript, "w") as f:
+      for s in steps:
+        f.write(json.dumps(s) + "\n")
+    for path, text in (files or {}).items():
+      with open(path, "w") as f:
+        f.write(text)
+    if state is not None:
+      stop_guard.save_state(os.path.join(tmp_dir, "scratch", ".context_guard_state.json"), state)
+    data = {
+        "conversationId": "c1",
+        "transcriptPath": transcript,
+        "artifactDirectoryPath": tmp_dir,
+        "fullyIdle": True,
+        "terminationReason": "MODEL_STOP",
+    }
+    skills = {
+        "review-triage": "/s/review-triage/SKILL.md",
+        "companion-cl-review": "/s/companion-cl-review/SKILL.md",
+    }
+    with patch("sys.stdin", io.StringIO(json.dumps(data))), \
+         patch("sys.stdout", new_callable=io.StringIO) as mock_out, \
+         patch.object(stop_guard, "discover_skills", return_value=skills), \
+         patch.object(stop_guard, "play_stop_sound"):
+      stop_guard.main()
+    return json.loads(mock_out.getvalue())
+
+  def review_request(self, idx=1):
+    return {
+        "step_index": idx,
+        "type": "USER_INPUT",
+        "content": "<USER_REQUEST>Follow `review-triage` + companion-cl-review</USER_REQUEST>",
+    }
+
+  def test_unread_named_skill_blocks_stop_once_per_turn(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      steps = [
+          self.review_request(),
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "read_file",
+                  "args": {"Path": '"/s/review-triage/SKILL.md"'},
+              }],
+          },
+      ]
+      out = self.run_discipline_stop(tmp_dir, steps)
+      self.assertEqual(out.get("decision"), "continue")
+      self.assertIn("`companion-cl-review`", out["reason"])
+      self.assertNotIn("`review-triage`", out["reason"])
+      self.assertEqual(self.run_discipline_stop(tmp_dir, steps), {})
+
+  def test_skill_read_via_command_or_earlier_turn_allows_stop(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      steps = [
+          {"step_index": 1, "type": "USER_INPUT", "content": "warmup"},
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [
+                  {"name": "read_file", "args": {"Path": "/s/review-triage/SKILL.md"}},
+                  {
+                      "name": "run_command",
+                      "args": {"CommandLine": "cat /s/companion-cl-review/SKILL.md"},
+                  },
+              ],
+          },
+          self.review_request(3),
+      ]
+      self.assertEqual(self.run_discipline_stop(tmp_dir, steps), {})
+
+  def test_skill_name_outside_user_request_is_ignored(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      steps = [{
+          "step_index": 1,
+          "type": "USER_INPUT",
+          "content": "<USER_REQUEST>hi</USER_REQUEST>\n[radar] review-triage chat open",
+      }]
+      self.assertEqual(self.run_discipline_stop(tmp_dir, steps), {})
+
+  def test_review_report_without_ledger_and_assertless_wpt_block_stop(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      report = os.path.join(tmp_dir, "review_report.md")
+      wpt = os.path.join(tmp_dir, "repro.html")
+      steps = [
+          {"step_index": 1, "type": "USER_INPUT", "content": "<USER_REQUEST>go</USER_REQUEST>"},
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [
+                  {"name": "write_file", "args": {"Path": report}},
+                  {"name": "write_file", "args": {"Path": wpt}},
+              ],
+          },
+      ]
+      files = {
+          report: "# Report\n**Case 4: Fundamental Flaw**\n",
+          wpt: '<script src="/resources/testharness.js"></script><script>test(() => {});</script>',
+      }
+      out = self.run_discipline_stop(tmp_dir, steps, files=files)
+      self.assertEqual(out.get("decision"), "continue")
+      self.assertIn("Execution Ledger", out["reason"])
+      self.assertIn("repro.html", out["reason"])
+
+  def test_review_report_with_ledger_and_asserting_wpt_allows_stop(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      report = os.path.join(tmp_dir, "review_report.md")
+      wpt = os.path.join(tmp_dir, "repro.html")
+      steps = [
+          {"step_index": 1, "type": "USER_INPUT", "content": "<USER_REQUEST>go</USER_REQUEST>"},
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [
+                  {"name": "write_file", "args": {"Path": report}},
+                  {"name": "edit_file", "args": {"Path": wpt}},
+              ],
+          },
+      ]
+      files = {
+          report: "# Report\n## Execution Ledger\n| step | done |\n**Case 4**\n",
+          wpt: '<script src="/resources/testharness.js"></script>'
+               "<script>test(() => { assert_equals(1, 1); });</script>",
+      }
+      self.assertEqual(self.run_discipline_stop(tmp_dir, steps, files=files), {})
+
 
 if __name__ == "__main__":
   unittest.main()
