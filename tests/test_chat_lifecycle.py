@@ -273,6 +273,9 @@ class TestChatLifecycle(unittest.TestCase):
         ("Check cl/1397896", "cl/1397896"),
         ("СЛ 1397896 что там происходит", "cl/1397896"),
         ("PR #45678 review", "PR #45678"),
+        ('Проведи ревью: @[skia | 1402416:Reland "[SkContext] Forwarding"]', "cl/1402416"),
+        ("глянь @[flutter/flutter | 150000:Fix text]", None),
+        ("сделай 1402416 тестов", None),
         ("Just a normal conversation without entities", None),
     ]
     for prompt, expected in cases:

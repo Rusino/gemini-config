@@ -343,6 +343,24 @@ class TestContextGuard(unittest.TestCase):
       self.assertIn("[14:15] ⦿ cl/1397896", msg)
       self.assertEqual(self.last_log().get("auto_title"), "[14:15] ⦿ cl/1397896")
 
+  # The typed prompt carries only the mention label; the CL link lives in the transcript metadata
+  def test_auto_title_uses_mention_url_from_transcript(self):
+    self.mock_db.return_value = ("Untitled", "proj-1")
+    content = (
+        "<USER_REQUEST>\nReview @[skia | 1402416:Reland]\n</USER_REQUEST>\n"
+        "<ADDITIONAL_METADATA>\nURL: https://skia-review.git.corp.google.com/c/skia/+/1402416\n"
+        "> Reviewed-on: https://skia-review.googlesource.com/c/skia/+/1395176\n"
+        "</ADDITIONAL_METADATA>"
+    )
+    with open(self.transcript, "w") as f:
+      f.write(json.dumps({"step_index": 0, "type": "USER_INPUT", "content": content}) + "\n")
+    with patch.object(chat_lifecycle, "auto_title_conversation", return_value="") as mock_auto:
+      self.run_guard(inv=0, lastUserInput="Review @[skia | 1402416:Reland]")
+      mock_auto.assert_called_once_with(
+          "c1",
+          "Review @[skia | 1402416:Reland]\n"
+          "https://skia-review.git.corp.google.com/c/skia/+/1402416",
+      )
   # Verify turn-start scope radar lists sibling projects and skips handoffs/mid-turn
   def test_scope_radar_on_turn_start_injects_project_directory(self):
     pdir = os.path.join(self.tmp.name, "projects")

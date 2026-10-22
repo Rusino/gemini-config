@@ -521,6 +521,36 @@ def parse_current_turn_steps(transcript_path: str) -> list[tuple[int, dict]]:
   ]
 
 
+MENTION_URL_RE = re.compile(r"^URL: (\S+)", re.MULTILINE)
+
+
+def last_user_input_mention_urls(transcript_path: str) -> str:
+  """Returns the "URL:" lines of @-mentions in the latest USER_INPUT step, one per line.
+
+  lastUserInput carries only the typed text, so a mentioned CL/PR/bug shows up there as a bare
+  "@[repo | 123:subject]" label; its link lives in the ADDITIONAL_METADATA block of the
+  transcript. Only "URL:" lines are taken because mention descriptions may quote other links
+  (e.g. "Reviewed-on:" of a reverted CL).
+  """
+  if not transcript_path or not os.path.exists(transcript_path):
+    return ""
+  last_input = ""
+  try:
+    with open(transcript_path, "r", encoding="utf-8") as f:
+      for line in f:
+        if '"USER_INPUT"' not in line:
+          continue
+        try:
+          obj = json.loads(line)
+        except Exception:
+          continue
+        if obj.get("type") == "USER_INPUT":
+          last_input = str(obj.get("content", ""))
+  except Exception:
+    return ""
+  return "\n".join(MENTION_URL_RE.findall(last_input))
+
+
 def is_async_wakeup(transcript_path: str, last_user_input: str = "") -> bool:
   """True when invocationNum == 0 is a background-task or subagent wakeup, not a user turn.
 
@@ -946,7 +976,11 @@ def run(data: dict, log: dict) -> dict:
     if last_user_input and conv_id:
       try:
         import chat_lifecycle
-        auto_title = chat_lifecycle.auto_title_conversation(conv_id, last_user_input)
+        title_source = last_user_input
+        mention_urls = last_user_input_mention_urls(transcript_path)
+        if mention_urls:
+          title_source = f"{last_user_input}\n{mention_urls}"
+        auto_title = chat_lifecycle.auto_title_conversation(conv_id, title_source)
         if auto_title:
           log["auto_title"] = auto_title
           state["auto_title_notice"] = (

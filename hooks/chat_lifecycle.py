@@ -1013,6 +1013,9 @@ _ENTITY_COMMIT_URL_RE = re.compile(
     r"https?://(?:github\.com/[^/\s]+/[^/\s]+/commit|"
     r"[a-zA-Z0-9_.-]+\.googlesource\.com/[^/\s]+/\+)/([0-9a-f]{7,40})"
 )
+# Jetski renders a mentioned Gerrit change as "@[<repo> | <number>:<subject>]"; a "/" in the
+# label would mean an owner/repo GitHub mention, whose number is not a CL
+_ENTITY_GERRIT_MENTION_RE = re.compile(r"@\[[^|/\]]+\|\s*(\d{5,8}):")
 _ENTITY_CL_SHORT_RE = re.compile(r"(?:^|[\s(])cl/(\d+)\b", re.IGNORECASE)
 _ENTITY_BUG_SHORT_RE = re.compile(r"(?:^|[\s(])b/(\d+)\b", re.IGNORECASE)
 _ENTITY_CRBUG_SHORT_RE = re.compile(r"(?:^|[\s(])crbug(?:\.com)?/(\d+)\b", re.IGNORECASE)
@@ -1043,6 +1046,9 @@ def extract_entity_topic(text: str) -> str | None:
   m = _ENTITY_COMMIT_URL_RE.search(text)
   if m:
     return f"commit {m.group(1)[:8]}"
+  m = _ENTITY_GERRIT_MENTION_RE.search(text)
+  if m:
+    return f"cl/{m.group(1)}"
   m = _ENTITY_CL_SHORT_RE.search(text)
   if m:
     return f"cl/{m.group(1)}"
