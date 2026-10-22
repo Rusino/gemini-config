@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import pathlib
+import random
 import re
 import shutil
 import signal
@@ -39,6 +40,7 @@ BATCH_2_FILES = [
 BATCH_3_FILES = [
     "packages/flutter/test/material/text_field_test.dart",
     "packages/flutter/test/cupertino/text_field_test.dart",
+    "packages/flutter/test/material/dropdown_menu_test.dart",
     "packages/flutter/test/services/text_boundary_test.dart",
     "packages/flutter/test/services/text_editing_delta_test.dart",
 ]
@@ -352,6 +354,134 @@ def checkout_skia_ref(
     return compute_git_metadata(skia_repo, ref)
 
 
+# Collect and deterministically shuffle all framework *_test.dart files for load-balanced sharding
+def collect_all_framework_tests(repo: pathlib.Path) -> list[str]:
+    test_dir = repo / "packages/flutter/test"
+    # Exclude root-level helper files directly under packages/flutter/test
+    all_tests = sorted(
+        str(p.relative_to(repo))
+        for p in test_dir.rglob("*_test.dart")
+        if p.parent != test_dir
+    )
+    rng = random.Random(0)
+    rng.shuffle(all_tests)
+    return all_tests
+
+
+# Run all framework test files across parallel flutter test shards with isolated kernel caches
+def run_sharded_framework_tests(
+    repo: pathlib.Path,
+    flutter_bin: pathlib.Path,
+    engine_flags: list[str],
+    flutter_env: dict[str, str],
+    ref_dir: pathlib.Path,
+    label: str,
+    test_files: list[str],
+    num_shards: int,
+    concurrency: int,
+    timeout: int,
+    driver_log: pathlib.Path,
+) -> tuple[int, pathlib.Path, list[str]]:
+    shards_dir = ref_dir / "flutter_shards"
+    if shards_dir.exists():
+        shutil.rmtree(shards_dir)
+    shards_dir.mkdir(parents=True, exist_ok=True)
+
+    # Warm up unit_test_assets once before spawning parallel shards with --no-test-assets
+    t_warm = time.time()
+    warmup_log = shards_dir / "warmup.log"
+    warmup_cmd = [
+        str(flutter_bin),
+        "test",
+        *engine_flags,
+        "packages/flutter/test/rendering/paragraph_intrinsics_test.dart",
+    ]
+    with open(warmup_log, "w") as wf:
+        subprocess.run(
+            warmup_cmd,
+            cwd=str(repo),
+            env=flutter_env,
+            stdout=wf,
+            stderr=subprocess.STDOUT,
+            timeout=300,
+        )
+    log(f"[{label}] Warmed up unit_test_assets ({int(time.time() - t_warm)}s)", driver_log)
+
+    actual_shards = min(num_shards, len(test_files))
+    shards = [test_files[i::actual_shards] for i in range(actual_shards)]
+    log(
+        f"[{label}] Launching {actual_shards} shards x -j {concurrency} "
+        f"({len(test_files)} test files total)...",
+        driver_log,
+    )
+
+    t0 = time.time()
+    procs = []
+    cmds: list[str] = []
+    for idx, shard_files in enumerate(shards):
+        s_json = shards_dir / f"shard_{idx:02d}.json"
+        s_log = shards_dir / f"shard_{idx:02d}.log"
+        # Distinct --dart-define per shard isolates each shard's kernel path in build/test_cache
+        cmd = [
+            str(flutter_bin),
+            "test",
+            "--no-pub",
+            "--no-test-assets",
+            f"--dart-define=FLUTTER_TEST_SHARD={idx}",
+            "-j",
+            str(concurrency),
+            f"--file-reporter=json:{s_json}",
+            *engine_flags,
+            *shard_files,
+        ]
+        cmds.append(" ".join(cmd[:10]) + f" ... ({len(shard_files)} files)")
+        lf = open(s_log, "w")
+        p = subprocess.Popen(
+            cmd,
+            cwd=str(repo),
+            env=flutter_env,
+            stdout=lf,
+            stderr=subprocess.STDOUT,
+        )
+        procs.append((idx, p, lf, time.time()))
+
+    deadline = t0 + timeout
+    worst_rc = 0
+    remaining = list(procs)
+    # Poll active shard processes until completion or overall wall-clock deadline
+    while remaining:
+        now = time.time()
+        if now >= deadline:
+            for idx, p, lf, _ in remaining:
+                p.kill()
+                lf.close()
+                log(f"[{label}] Shard {idx:02d} TIMED OUT after {timeout}s", driver_log)
+            worst_rc = 124
+            break
+        still_running = []
+        for item in remaining:
+            idx, p, lf, st = item
+            rc = p.poll()
+            if rc is None:
+                still_running.append(item)
+            else:
+                lf.close()
+                if rc != 0 and worst_rc == 0:
+                    worst_rc = rc
+                elapsed = int(time.time() - st)
+                log(
+                    f"[{label}] Shard {idx:02d}/{actual_shards} finished exit={rc} ({elapsed}s)",
+                    driver_log,
+                )
+        remaining = still_running
+        if remaining:
+            time.sleep(1.0)
+
+    dt = int(time.time() - t0)
+    log(f"[{label}] Full sharded flutter test exit={worst_rc} ({dt}s)", driver_log)
+    return worst_rc, shards_dir, cmds
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build and run Flutter engine text tests with Run Attestation.")
     ap.add_argument(
@@ -397,6 +527,29 @@ def main() -> int:
         help="Batches to run: 'all', or comma-separated numbers '1,2,3' (default: all)",
     )
     ap.add_argument(
+        "--full",
+        action="store_true",
+        help=(
+            "Run all packages/flutter/test/**/*_test.dart files sharded across parallel workers "
+            "via local flutter_tester"
+        ),
+    )
+    ap.add_argument(
+        "--flutter-shards",
+        type=int,
+        default=8,
+        help="Number of parallel `flutter test` shard processes in `--full` mode (default: 8)",
+    )
+    ap.add_argument(
+        "--flutter-concurrency",
+        type=int,
+        default=4,
+        help=(
+            "Number of concurrent flutter_tester processes (`-j`) per shard in `--full` mode "
+            "(default: 4)"
+        ),
+    )
+    ap.add_argument(
         "--skip-build",
         action="store_true",
         help="Skip ninja compilation step",
@@ -410,7 +563,7 @@ def main() -> int:
         "--timeout",
         type=int,
         default=1200,
-        help="Timeout in seconds per test batch (default: 1200)",
+        help="Timeout in seconds per test batch or full sharded run (default: 1200)",
     )
     ap.add_argument(
         "--resume",
@@ -452,6 +605,11 @@ def main() -> int:
     )
     worktree_patch.write_bytes(diff_res.stdout)
 
+    test_cache_dir = repo / "build/test_cache/build"
+    orig_cache_dills = (
+        set(test_cache_dir.glob("*.cache.dill*")) if test_cache_dir.exists() else set()
+    )
+
     def cleanup() -> None:
         log("=== Cleaning up Skia submodule and args.gn state ===", driver_log)
         try:
@@ -464,6 +622,13 @@ def main() -> int:
                     gn_args_file.write_text(orig_gn_args)
         except Exception as e:
             log(f"WARNING: restoring args.gn failed: {e}", driver_log)
+        if args.full and test_cache_dir.exists():
+            for p in test_cache_dir.glob("*.cache.dill*"):
+                if p not in orig_cache_dills:
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
 
     compare_args: list[str] = []
 
@@ -527,7 +692,7 @@ def main() -> int:
             attestation["source_files_count"] = source_count
             attestation["build_dir"] = str(build_dir)
             attestation["gn_args_sha256"] = file_sha256_short(gn_args_file)
-            attestation["batches_run"] = args.batches
+            attestation["batches_run"] = "full" if args.full else args.batches
 
             # Compilation with ninja
             ninja_log = ref_dir / "ninja.log"
@@ -584,6 +749,11 @@ def main() -> int:
                 "batch2_failed": 0,
                 "batch3_passed": 0,
                 "batch3_failed": 0,
+                "full_passed": 0,
+                "full_failed": 0,
+                "full_suites_executed": 0,
+                "full_shards_total": 0,
+                "unfinished_shards": [],
                 "failures": [],
                 "finished_cleanly": True,
                 "abort_detected": False,
@@ -621,14 +791,8 @@ def main() -> int:
                         summary["abort_detected"] = True
                         summary["crash_reason"] = cpp_res["crash_reason"]
 
-            # 2. Dart framework test batches
-            from parse_flutter_paragraph_tests import summarize_dart_log
-
-            batch_configs = [
-                ("batch1", BATCH_1_FILES, args.batches in ("all", "1") or "1" in args.batches.split(",")),
-                ("batch2", BATCH_2_FILES, args.batches in ("all", "2") or "2" in args.batches.split(",")),
-                ("batch3", BATCH_3_FILES, args.batches in ("all", "3") or "3" in args.batches.split(",")),
-            ]
+            # 2. Dart framework test batches or full sharded suite
+            from parse_flutter_paragraph_tests import summarize_dart_json_shards, summarize_dart_log
 
             flutter_bin = repo / "bin/flutter"
             engine_flags = [
@@ -643,45 +807,86 @@ def main() -> int:
                 if stamp_val:
                     flutter_env["FLUTTER_PREBUILT_ENGINE_VERSION"] = stamp_val
 
-            for b_name, b_files, should_run in batch_configs:
-                if not should_run:
-                    continue
-                b_log = ref_dir / f"{b_name}.log"
-                cmd = [str(flutter_bin), "test", *engine_flags, *b_files]
-                test_commands.append(" ".join(cmd))
-                log(f"[{label}] Running Dart {b_name} ({len(b_files)} files)...", driver_log)
-                with open(b_log, "w") as lf:
-                    res = subprocess.run(
-                        cmd,
-                        cwd=str(repo),
-                        env=flutter_env,
-                        stdout=lf,
-                        stderr=subprocess.STDOUT,
-                        timeout=args.timeout,
-                    )
-                    if res.returncode != 0 and worst_test_rc == 0:
-                        worst_test_rc = res.returncode
-                b_res = summarize_dart_log(b_log)
-                summary[f"{b_name}_passed"] = b_res["passed"]
-                summary[f"{b_name}_failed"] = b_res["failed"]
-                summary["failures"].extend(b_res["failures"])
-                if not b_res["finished_cleanly"]:
+            if args.full:
+                all_fw_tests = collect_all_framework_tests(repo)
+                attestation["full_expected_files"] = len(all_fw_tests)
+                rc, shards_dir, shard_cmds = run_sharded_framework_tests(
+                    repo=repo,
+                    flutter_bin=flutter_bin,
+                    engine_flags=engine_flags,
+                    flutter_env=flutter_env,
+                    ref_dir=ref_dir,
+                    label=label,
+                    test_files=all_fw_tests,
+                    num_shards=args.flutter_shards,
+                    concurrency=args.flutter_concurrency,
+                    timeout=args.timeout,
+                    driver_log=driver_log,
+                )
+                test_commands.extend(shard_cmds)
+                if rc != 0 and worst_test_rc == 0:
+                    worst_test_rc = rc
+                f_res = summarize_dart_json_shards(shards_dir)
+                summary["full_passed"] = f_res["passed"]
+                summary["full_failed"] = f_res["failed"]
+                summary["full_suites_executed"] = f_res["suites_executed"]
+                summary["full_shards_total"] = f_res["shards_total"]
+                summary["unfinished_shards"] = f_res["unfinished_shards"]
+                summary["failures"].extend(f_res["failures"])
+                if not f_res["finished_cleanly"]:
                     summary["finished_cleanly"] = False
-                if b_res["abort_detected"]:
+                if f_res["abort_detected"]:
                     summary["abort_detected"] = True
-                    summary["crash_reason"] = b_res["crash_reason"]
+                    summary["crash_reason"] = f_res["crash_reason"]
+            else:
+                batch_parts = args.batches.split(",")
+                batch_configs = [
+                    ("batch1", BATCH_1_FILES, args.batches in ("all", "1") or "1" in batch_parts),
+                    ("batch2", BATCH_2_FILES, args.batches in ("all", "2") or "2" in batch_parts),
+                    ("batch3", BATCH_3_FILES, args.batches in ("all", "3") or "3" in batch_parts),
+                ]
+
+                for b_name, b_files, should_run in batch_configs:
+                    if not should_run:
+                        continue
+                    b_log = ref_dir / f"{b_name}.log"
+                    cmd = [str(flutter_bin), "test", *engine_flags, *b_files]
+                    test_commands.append(" ".join(cmd))
+                    log(f"[{label}] Running Dart {b_name} ({len(b_files)} files)...", driver_log)
+                    with open(b_log, "w") as lf:
+                        res = subprocess.run(
+                            cmd,
+                            cwd=str(repo),
+                            env=flutter_env,
+                            stdout=lf,
+                            stderr=subprocess.STDOUT,
+                            timeout=args.timeout,
+                        )
+                        if res.returncode != 0 and worst_test_rc == 0:
+                            worst_test_rc = res.returncode
+                    b_res = summarize_dart_log(b_log)
+                    summary[f"{b_name}_passed"] = b_res["passed"]
+                    summary[f"{b_name}_failed"] = b_res["failed"]
+                    summary["failures"].extend(b_res["failures"])
+                    if not b_res["finished_cleanly"]:
+                        summary["finished_cleanly"] = False
+                    if b_res["abort_detected"]:
+                        summary["abort_detected"] = True
+                        summary["crash_reason"] = b_res["crash_reason"]
 
             summary["total_passed"] = (
                 summary["cpp_passed"]
                 + summary["batch1_passed"]
                 + summary["batch2_passed"]
                 + summary["batch3_passed"]
+                + summary["full_passed"]
             )
             summary["total_failed"] = (
                 summary["cpp_failed"]
                 + summary["batch1_failed"]
                 + summary["batch2_failed"]
                 + summary["batch3_failed"]
+                + summary["full_failed"]
             )
 
             attestation["test_cmd"] = test_commands

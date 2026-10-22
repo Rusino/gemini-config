@@ -74,7 +74,8 @@ Never upload a companion WIP CL blindly. After auditing the patchset and testing
 2. **Timeless Test Comments Invariant (No `"Fails on cl/..."` Annotations)**:
    - Write comments inside the test file as **timeless domain invariants** (describing *why* the contract must hold in `main`, without trailing periods in C++).
    - **Never** write `"// Fails on cl/123456 because..."` or `"// Reproducer for PS3 bug"` in test comments — when the author folds your patchset into their CL, temporary review-time phrasing pollutes their commit and requires another round of review cleanup.
-3. **Compile and run the test binary**:
+3. **Compile and run the test binary (plus `flutter-test-paragraph-engine` for `SkParagraph` changes)**:
+   - For any Skia CL that modifies `modules/skparagraph/src/`, `modules/skunicode/src/`, or `modules/skshaper/src/`, running native Skia `dm --match SkParagraph` (`skia-test-paragraph`) alone is **not sufficient**: you **must** also run `flutter-test-paragraph-engine` (`~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py`) to verify that Flutter framework layout, intrinsic width, editing, and widget consumers (including `dropdown_menu_test.dart`) pass with zero regressions before classifying the CL as **Case 1** or **Case 2**.
    - If no defects exist and no new tests are needed → **Case 1** or **Case 2** (stop here and draft prose review).
    - If the new tests **pass** on the author's unmodified code → **Case 3**.
    - If the new tests **fail** (`Gate A` confirmed), record the exact failing test names and assertion count (`N failing assertions across K tests`), then decide between **Case 4** (reproducer tests only) and **Case 5** (tests in `PS1` + fix in `PS2`).
@@ -109,8 +110,9 @@ When **Case 5** applies:
 1. **Implement the minimal root-cause fix**:
    - Prefer structural invariant fixes (e.g., eliminating redundant state or handling the boundary at its source) over symptomatic special-case branches.
    - Ensure all code comments follow project conventions (concise English rationale explaining *why*, 1–4 lines, no trailing periods in C++, `<= 100` columns).
-2. **Verify all tests pass**:
+2. **Verify all tests pass (including `flutter-test-paragraph-engine` for `SkParagraph` changes)**:
    - Recompile and run both the new contract tests from `PS1` and the full module test suite to prove zero regressions.
+   - Whenever the CL modifies `modules/skparagraph/src/`, `modules/skunicode/src/`, or `modules/skshaper/src/`, you **must** also run `flutter-test-paragraph-engine` (`~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py`) against the `PS2` tree before uploading `PS2`. Never upload a `PS2` fix verified only with native Skia `dm`.
 3. **Mandatory clean-context audit of our own fix (non-skippable)**:
    - `PS2` is code we ask someone else to adopt, so it gets the full `amnesia-precommit` pipeline (or the environment's equivalent): comment and code audits on `HEAD`, the clean-context Hunter (`keeper_inquisitor`), and the batched Skeptic (`keeper_skeptic`, `pro` for line-breaking, BiDi, or index math) on every candidate defect.
    - Fix every `CONFIRMED` defect, then rerun the **full** module test suite once more, not just the new tests: a fix for a skeptic finding can break a different edge case that only one of the `PS1` reproducers covers.

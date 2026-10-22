@@ -190,7 +190,7 @@ When the Skeptic pass completes, process the surviving items as follows:
 ### Phase 4: Single Verification Pass, Tree-Pinned Rebase & Summary
 
 1. **Run the Relevant Test Suite Once**:
-   - **Skia (`SkParagraph`)**: Build and run `dm --match Paragraph` (or use `skia-test-paragraph`).
+   - **Skia (`SkParagraph` / `SkUnicode` / `SkShaper`)**: Build and run native Skia `dm --match SkParagraph` (`skia-test-paragraph`). In addition, whenever production files under `modules/skparagraph/src/`, `modules/skunicode/src/`, or `modules/skshaper/src/` are modified, you **must** also run `flutter-test-paragraph-engine` (`~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py`) before committing or uploading so Flutter framework layout, intrinsic width, and widget consumers (including `dropdown_menu_test.dart`) are verified with zero regressions.
    - **Flutter Engine / WebParagraph**: Run the targeted `felt` or `flutter test` target (or use `flutter-test-paragraph-engine` / `webparagraph-corpus`).
 
 2. **Tree-Pinned 3-Way Rebase & Attestation Invalidation (Pre-Upload Gate)**:

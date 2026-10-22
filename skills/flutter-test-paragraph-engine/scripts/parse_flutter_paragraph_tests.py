@@ -74,6 +74,126 @@ def summarize_dart_log(path: pathlib.Path | str) -> dict[str, Any]:
     }
 
 
+# Strip absolute checkout prefix from suite path so test identifiers remain repo-relative
+def _normalize_suite_path(raw_path: str) -> str:
+    if not raw_path:
+        return ""
+    idx = raw_path.find("packages/flutter/test/")
+    if idx != -1:
+        return raw_path[idx:]
+    idx2 = raw_path.find("test/")
+    if idx2 != -1:
+        return raw_path[idx2:]
+    return raw_path
+
+
+# Aggregate JSON file-reporter events and crash logs across all parallel flutter test shards
+def summarize_dart_json_shards(shards_dir: pathlib.Path | str) -> dict[str, Any]:
+    sdir = pathlib.Path(shards_dir)
+    json_files = sorted(sdir.glob("shard_*.json"))
+    passed = 0
+    skipped = 0
+    failed = 0
+    failures: list[str] = []
+    seen_failures: Set[str] = set()
+    all_suites: Set[str] = set()
+    unfinished_shards: list[str] = []
+    abort_or_crash = False
+    crash_reason: Optional[str] = None
+
+    for jf in json_files:
+        suites: dict[Any, str] = {}
+        tests: dict[Any, dict[str, Any]] = {}
+        shard_done = False
+        for raw_line in jf.read_text(errors="replace").splitlines():
+            raw_line = raw_line.strip()
+            if not raw_line.startswith("{"):
+                continue
+            try:
+                ev = json.loads(raw_line)
+            except Exception:
+                continue
+            etype = ev.get("type")
+            if etype == "suite":
+                s = ev.get("suite", {})
+                norm_p = _normalize_suite_path(s.get("path", ""))
+                suites[s.get("id")] = norm_p
+                if norm_p:
+                    all_suites.add(norm_p)
+            elif etype == "testStart":
+                t = ev.get("test", {})
+                tests[t.get("id")] = {
+                    "name": t.get("name", ""),
+                    "suiteID": t.get("suiteID"),
+                }
+            elif etype == "testDone":
+                tid = ev.get("testID")
+                tinfo = tests.get(tid, {})
+                tname = tinfo.get("name", "")
+                spath = suites.get(tinfo.get("suiteID"), "")
+                hidden = ev.get("hidden", False)
+                is_skipped = ev.get("skipped", False)
+                result = ev.get("result", "")
+
+                # Hidden synthetic suite-loading tests only count when compilation/loading fails
+                if hidden:
+                    if result in ("failure", "error"):
+                        failed += 1
+                        key = f"{spath}: {tname}" if spath else tname
+                        if key not in seen_failures:
+                            seen_failures.add(key)
+                            failures.append(key)
+                    continue
+
+                if is_skipped:
+                    skipped += 1
+                elif result == "success":
+                    passed += 1
+                else:
+                    failed += 1
+                    key = f"{spath}: {tname}" if spath else tname
+                    if key not in seen_failures:
+                        seen_failures.add(key)
+                        failures.append(key)
+            elif etype == "done":
+                shard_done = True
+
+        if not shard_done:
+            unfinished_shards.append(jf.name)
+
+    # Scan shard stdout/stderr logs for native C++ assertion aborts
+    for lp in sorted(sdir.glob("shard_*.log")):
+        if not lp.exists():
+            continue
+        for ln in read_lines(lp):
+            s = ln.strip()
+            if "SkASSERT" in s or "Fatal error" in s or "Assertion failed:" in s:
+                abort_or_crash = True
+                crash_reason = s
+
+    finished_cleanly = (not abort_or_crash) and bool(json_files) and (not unfinished_shards)
+    if failed == 0 and finished_cleanly:
+        status = "pass"
+    elif not finished_cleanly:
+        status = "unfinished"
+    else:
+        status = "fail"
+    return {
+        "log": str(sdir),
+        "status": status,
+        "passed": passed,
+        "skipped": skipped,
+        "failed": failed,
+        "suites_executed": len(all_suites),
+        "shards_total": len(json_files),
+        "unfinished_shards": unfinished_shards,
+        "failures": failures,
+        "finished_cleanly": finished_cleanly,
+        "crash_reason": crash_reason,
+        "abort_detected": abort_or_crash,
+    }
+
+
 def summarize_gtest_log(path: pathlib.Path | str) -> dict[str, Any]:
     lines = read_lines(path)
     passed = 0
@@ -212,7 +332,15 @@ def _evaluate_attestation(runs: list[tuple[str, dict[str, Any]]]) -> tuple[list[
                     f"`{label}` ran batches (`{batches_run}`) differing from baseline (`{base_batches}`)"
                 )
 
-        batch_col = f"`{batches_run}`"
+        if batches_run == "full":
+            suites_exec = summary.get("full_suites_executed", 0)
+            expected_files = att.get("full_expected_files", 0)
+            unfinished = summary.get("unfinished_shards") or []
+            batch_col = f"`full ({suites_exec}/{expected_files} files)`"
+            if unfinished:
+                issues.append(f"`{label}` had unfinished shards: {', '.join(unfinished)}")
+        else:
+            batch_col = f"`{batches_run}`"
 
         # Overall execution counts and proof of completeness
         total_passed = summary.get("total_passed", 0)
@@ -307,17 +435,25 @@ def compare_runs(args: list[str]) -> None:
 
     base_label, base = runs[0]
     base_fails: Set[str] = set((base.get("summary") or {}).get("failures") or [])
+    is_full = any((r.get("attestation") or {}).get("batches_run") == "full" for _, r in runs)
 
     print(f"# Flutter Paragraph Engine Test Comparison (baseline = `{base_label}`)\n")
-    print("| Ref | C++ Smoke Tests | Batch 1 (Layout) | Batch 2 (Editing) | Batch 3 (Fields) | Regressions | Fixed vs baseline |")
-    print("| :--- | :---: | :---: | :---: | :---: | :---: | :---: |")
+    if is_full:
+        print(
+            "| Ref | C++ Smoke Tests | Full Framework Corpus (Sharded) | Regressions | "
+            "Fixed vs baseline |"
+        )
+        print("| :--- | :---: | :---: | :---: | :---: |")
+    else:
+        print(
+            "| Ref | C++ Smoke Tests | Batch 1 (Layout) | Batch 2 (Editing) | "
+            "Batch 3 (Fields & Menus) | Regressions | Fixed vs baseline |"
+        )
+        print("| :--- | :---: | :---: | :---: | :---: | :---: | :---: |")
 
     for idx, (label, run) in enumerate(runs):
         sm = run.get("summary") or {}
         cpp_cnt = f"`+{sm.get('cpp_passed', 0)} -{sm.get('cpp_failed', 0)}`"
-        b1_cnt = f"`+{sm.get('batch1_passed', 0)} -{sm.get('batch1_failed', 0)}`"
-        b2_cnt = f"`+{sm.get('batch2_passed', 0)} -{sm.get('batch2_failed', 0)}`"
-        b3_cnt = f"`+{sm.get('batch3_passed', 0)} -{sm.get('batch3_failed', 0)}`"
 
         fails: Set[str] = set(sm.get("failures") or [])
         if idx == 0:
@@ -329,7 +465,18 @@ def compare_runs(args: list[str]) -> None:
             reg_str = f"**{len(regs)}**" if regs else "0"
             fix_str = f"**+{len(fixes)}**" if fixes else "0"
 
-        print(f"| `{label}` | {cpp_cnt} | {b1_cnt} | {b2_cnt} | {b3_cnt} | {reg_str} | {fix_str} |")
+        if is_full:
+            f_pass = sm.get("full_passed", 0)
+            f_fail = sm.get("full_failed", 0)
+            f_suites = sm.get("full_suites_executed", 0)
+            full_cnt = f"`+{f_pass} -{f_fail}` ({f_suites} files)"
+            print(f"| `{label}` | {cpp_cnt} | {full_cnt} | {reg_str} | {fix_str} |")
+        else:
+            b1_cnt = f"`+{sm.get('batch1_passed', 0)} -{sm.get('batch1_failed', 0)}`"
+            b2_cnt = f"`+{sm.get('batch2_passed', 0)} -{sm.get('batch2_failed', 0)}`"
+            b3_cnt = f"`+{sm.get('batch3_passed', 0)} -{sm.get('batch3_failed', 0)}`"
+            row = f"| `{label}` | {cpp_cnt} | {b1_cnt} | {b2_cnt} | {b3_cnt} |"
+            print(f"{row} {reg_str} | {fix_str} |")
     print()
 
     issues, att_rows = _evaluate_attestation(runs)

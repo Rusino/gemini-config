@@ -1,7 +1,7 @@
 ---
 name: flutter-test-paragraph-engine
 description: >-
-  Build the Flutter engine with custom Skia or SkParagraph modifications and run the canonical ~2100 test suite covering text layout, rendering, selection, editable text, and input fields (using standard ICU by default, or opt-in full Apple Unicode replacement via --unicode apple / @apple).
+  Build the Flutter engine with custom Skia or SkParagraph modifications and run the canonical ~2400 test suite covering text layout, rendering, selection, editable text, input fields, and dropdown menus (or all ~925 framework test files via --full sharded mode, using standard ICU by default or opt-in full Apple Unicode replacement via --unicode apple / @apple).
   Trigger this skill when the user asks to "протестируй параграф во Флаттере", "протестируй параграф", "прогони тесты параграфа", "проверь во Флаттере с подменой на Apple Unicode", "протестируй во Флаттере с Аппл юникодом", "test paragraph in Flutter", or when verifying custom SkParagraph/SkUnicode/Skia changes against the Flutter framework.
 ---
 
@@ -70,10 +70,23 @@ python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutte
   --out /tmp/flutter_paragraph_tests
 ```
 
+### 4. Run the full sharded Flutter framework corpus (`--full`)
+Run all ~925 `packages/flutter/test/**/*_test.dart` files sharded across parallel workers via local `flutter_tester`:
+```bash
+python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py \
+  --out /tmp/flutter_paragraph_tests_full \
+  --full \
+  baseline=origin/main \
+  current=WORKTREE
+```
+
 ### Useful Flags
 - `--unicode <icu|apple|keep>` — Default `SkUnicode` backend when target does not specify `@icu` or `@apple` (default: `icu`; use `apple` only when explicitly testing Apple Unicode replacement, or `keep` to leave `args.gn` untouched).
-- `ext:<ref>` target prefix — Fetches `<ref>` from `--external-skia` (`/Users/jlavrova/Sources/skia`) and checks out `modules/skunicode`, `modules/skparagraph`, `modules/skshaper` onto the Flutter Skia submodule.
+- `ext:<ref>` target prefix — Fetches `<ref>` from `--external-skia` (`/Users/jlavrova/Sources/skia` or `~/.gemini/jetski/scratch/skia`) and checks out `modules/skunicode`, `modules/skparagraph`, `modules/skshaper` onto the Flutter Skia submodule.
 - `--batches <all|1,2,3>` — Choose specific test batches (default: `all`).
+- `--full` — Run all `packages/flutter/test/**/*_test.dart` files sharded across parallel workers via local `flutter_tester` instead of only Batches 1–3.
+- `--flutter-shards <N>` — Number of parallel `flutter test` shard processes in `--full` mode (default: `8`).
+- `--flutter-concurrency <N>` — Number of concurrent `flutter_tester` processes (`-j`) per shard in `--full` mode (default: `4`).
 - `--skip-build` — Skip running ninja if the engine is already built.
 - `--skip-cpp` — Skip C++ smoke tests (`txt_unittests`, `ui_unittests`).
 - `--resume` — Skip re-running refs whose `attestation.json` and `summary.json` already exist.
@@ -164,7 +177,7 @@ From `/Users/jlavrova/Sources/flutter`:
   packages/flutter/test/widgets/text_selection_test.dart
 ```
 
-#### Batch 3: Input Fields, Boundaries & Deltas (~1098 tests)
+#### Batch 3: Input Fields, Dropdown Menus, Boundaries & Deltas (~1294 tests)
 ```bash
 ./bin/flutter test \
   --local-engine=host_debug_unopt_arm64 \
@@ -172,6 +185,7 @@ From `/Users/jlavrova/Sources/flutter`:
   --local-engine-src-path=/Users/jlavrova/Sources/flutter/engine/src \
   packages/flutter/test/material/text_field_test.dart \
   packages/flutter/test/cupertino/text_field_test.dart \
+  packages/flutter/test/material/dropdown_menu_test.dart \
   packages/flutter/test/services/text_boundary_test.dart \
   packages/flutter/test/services/text_editing_delta_test.dart
 ```
