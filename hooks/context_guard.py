@@ -875,7 +875,8 @@ def handoff_steps(conv_id: str, target: dict, new_title: str) -> str:
   if target["in_project"]:
     return (
         f"1. Roadmap: `python3 {ROADMAP_CLI} set {conv_id} <ID> done|doing|todo`"
-        " (`add` for new work); never edit roadmap files directly.\n"
+        " (`add` for new work, `edit`/`move`/`reorder` to reword or reprioritize);"
+        " never edit roadmap files directly.\n"
         f"2. Overwrite the chain state file `{target['file']}` (write_to_file):"
         " goal, current state with evidence (modified files, last build/test"
         " result), failed hypotheses, running subagents/background tasks and how"

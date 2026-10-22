@@ -48,11 +48,14 @@ Usage:
   roadmap.py set <conv_id> <ID> todo|doing|done|dropped
                                                   Change status; `doing` claims it
   roadmap.py link <conv_id> <ID> <chat_id>        Item is handled in its own chat
-  roadmap.py edit <conv_id> <ID> "<new text>"     Edit item text
-  roadmap.py reorder <conv_id> <ID> [<ID> ...]    Reorder siblings (listed items go first)
+  roadmap.py edit <conv_id> <ID> "<new text>"     Reword an item (ID/status/link kept)
+  roadmap.py reorder <conv_id> <ID> [<ID> ...]    Listed siblings go first in this
+                                                  order, the rest keep their order
   roadmap.py move <conv_id> <ID> --before <ID> | --after <ID> | --top | --bottom
-                                                  Move an item relative to siblings
-  roadmap.py show [conv_id] [--all]               Compact render (--all shows all closed items)
+                                                  Move an item among its siblings;
+                                                  sub-items move with their parent
+  roadmap.py show [conv_id] [--all]               Compact render in stored order
+                                                  (--all shows all closed items)
   roadmap.py state-path <conv_id>                 Path of the chain state file
   roadmap.py state-move <old_conv_id> <new_conv_id>
                                                   Hand the state file (and owned
@@ -325,93 +328,98 @@ def link_item(project_id: str, conv_id: str, item_id: str, chat_id: str) -> str:
 
 
 def edit_item(project_id: str, conv_id: str, item_id: str, text: str) -> str:
+  """Rewords an item; ID, status, owner, link and position stay as they are."""
   clean = " ".join((text or "").split())
   if not clean:
     raise RoadmapError("item text must not be empty")
 
   def apply(doc: dict):
     it = _find(doc, item_id)
-    old_text = it["text"]
+    old = it["text"]
     it["text"] = clean
     _touch(it, conv_id)
-    return f"{item_id} edited", "edit", {"id": item_id, "old": old_text, "new": clean}
+    return f"{item_id} edited: {clean}", "edit", {"id": item_id, "old": old, "text": clean}
 
   return _mutate(project_id, conv_id, apply)
+
+
+def _place_siblings(doc: dict, parent: str, order: list[str]) -> None:
+  """Rewrites the slots of parent's children in doc["items"] to follow order.
+
+  The tree is rendered by grouping items per parent in list order, so only the
+  relative order of siblings matters: descendants follow their ancestor
+  wherever they sit in the list, and IDs never change.
+  """
+  items = doc["items"]
+  slots = [i for i, it in enumerate(items) if (it.get("parent") or "") == parent]
+  assert sorted(items[i]["id"] for i in slots) == sorted(order), "order must permute siblings"
+  by_id = {items[i]["id"]: items[i] for i in slots}
+  for slot, iid in zip(slots, order):
+    items[slot] = by_id[iid]
+
+
+def _siblings_of(doc: dict, item_id: str) -> tuple[str, list[str]]:
+  parent = _find(doc, item_id).get("parent") or ""
+  return parent, [it["id"] for it in doc["items"] if (it.get("parent") or "") == parent]
 
 
 def reorder_items(project_id: str, conv_id: str, item_ids: list[str]) -> str:
+  """Puts item_ids first among their siblings in the given order; the rest keep
+  their relative order after them. All item_ids must share one parent."""
   if not item_ids:
-    raise RoadmapError("no items provided to reorder")
+    raise RoadmapError("reorder needs at least one item ID")
+  if len(set(item_ids)) != len(item_ids):
+    raise RoadmapError("reorder: an item ID is listed twice")
 
   def apply(doc: dict):
-    items = doc["items"]
-    by_id = {it["id"]: it for it in items}
-    for iid in item_ids:
-      if iid not in by_id:
-        raise RoadmapError(f"unknown item {iid}")
-        
-    parent = by_id[item_ids[0]].get("parent", "")
-    for iid in item_ids:
-      if by_id[iid].get("parent", "") != parent:
-        raise RoadmapError("all reordered items must have the same parent")
+    parent, siblings = _siblings_of(doc, item_ids[0])
+    for iid in item_ids[1:]:
+      if _siblings_of(doc, iid)[0] != parent:
+        raise RoadmapError(f"reorder: {iid} and {item_ids[0]} have different parents")
+    listed = set(item_ids)
+    _place_siblings(doc, parent, item_ids + [s for s in siblings if s not in listed])
+    # Order changes deliberately leave updated_at alone: it ranks which closed
+    # items stay visible in the collapsed render, and a move is not progress
+    scope = parent or "top level"
+    return f"reordered {scope}: {' '.join(item_ids)} first", "reorder", {"ids": item_ids}
 
-    unique_ids = []
-    seen = set()
-    for iid in item_ids:
-      if iid not in seen:
-        seen.add(iid)
-        unique_ids.append(iid)
-        _touch(by_id[iid], conv_id)
-
-    siblings = [it["id"] for it in items if it.get("parent", "") == parent]
-    new_order = unique_ids + [sid for sid in siblings if sid not in seen]
-    
-    indices = [i for i, it in enumerate(items) if it.get("parent", "") == parent]
-    for idx, sid in zip(indices, new_order):
-      items[idx] = by_id[sid]
-      
-    return f"reordered siblings under '{parent or 'root'}'", "reorder", {"ids": unique_ids}
-    
   return _mutate(project_id, conv_id, apply)
 
 
-def move_item(project_id: str, conv_id: str, item_id: str, target: str, position: str) -> str:
+MOVE_POSITIONS = ("before", "after", "top", "bottom")
+
+
+def move_item(
+    project_id: str, conv_id: str, item_id: str, position: str, target: str = ""
+) -> str:
+  """Moves one item (with its subtree) within its siblings."""
+  if position not in MOVE_POSITIONS:
+    raise RoadmapError(f"bad move position '{position}'")
+  if (position in ("before", "after")) != bool(target):
+    raise RoadmapError(f"move --{position} {'needs' if not target else 'takes no'} target ID")
+  if target == item_id:
+    raise RoadmapError(f"cannot move {item_id} relative to itself")
+
   def apply(doc: dict):
-    items = doc["items"]
-    by_id = {it["id"]: it for it in items}
-    if item_id not in by_id:
-      raise RoadmapError(f"unknown item {item_id}")
-    
-    parent = by_id[item_id].get("parent", "")
-    siblings = [it["id"] for it in items if it.get("parent", "") == parent]
-    
+    parent, siblings = _siblings_of(doc, item_id)
     siblings.remove(item_id)
     if position == "top":
-      siblings.insert(0, item_id)
+      at = 0
     elif position == "bottom":
-      siblings.append(item_id)
+      at = len(siblings)
     else:
-      if target not in by_id:
-        raise RoadmapError(f"unknown target item {target}")
-      if by_id[target].get("parent", "") != parent:
-        raise RoadmapError("item and target must have the same parent")
-      target_idx = siblings.index(target)
-      if position == "before":
-        siblings.insert(target_idx, item_id)
-      elif position == "after":
-        siblings.insert(target_idx + 1, item_id)
-      else:
-        raise RoadmapError(f"unknown position {position}")
-        
-    _touch(by_id[item_id], conv_id)
-    
-    indices = [i for i, it in enumerate(items) if it.get("parent", "") == parent]
-    for idx, sid in zip(indices, siblings):
-      items[idx] = by_id[sid]
-      
-    pos_desc = f"{position} {target}" if target else position
-    return f"{item_id} moved {pos_desc}", "move", {"id": item_id, "pos": position, "target": target}
-    
+      if _siblings_of(doc, target)[0] != parent:
+        raise RoadmapError(f"move: {target} is not a sibling of {item_id}")
+      at = siblings.index(target) + (position == "after")
+    siblings.insert(at, item_id)
+    _place_siblings(doc, parent, siblings)
+    where = f"{position} {target}" if target else f"to {position}"
+    return (
+        f"{item_id} moved {where}",
+        "move",
+        {"id": item_id, "position": position, "target": target},
+    )
+
   return _mutate(project_id, conv_id, apply)
 
 
@@ -570,17 +578,16 @@ def _cli(argv: list[str]) -> int:
   elif cmd == "reorder" and len(args) >= 2:
     pid = require_project_id(args[0])
     print(reorder_items(pid, args[0], args[1:]))
-  elif cmd == "move" and len(args) in (3, 4):
+  # --before/--after take a target ID and --top/--bottom take none; anything else is
+  # a usage error (exit 2), while an unknown --flag reaches move_item and fails as bad input
+  elif (
+      cmd == "move"
+      and len(args) in (3, 4)
+      and args[2].startswith("--")
+      and (len(args) == 4) == (args[2] in ("--before", "--after"))
+  ):
     pid = require_project_id(args[0])
-    item_id = args[1]
-    if len(args) == 3 and args[2] in ("--top", "--bottom"):
-      print(move_item(pid, args[0], item_id, "", args[2][2:]))
-    elif len(args) == 4 and args[2] in ("--before", "--after"):
-      print(move_item(pid, args[0], item_id, args[3], args[2][2:]))
-    else:
-      print(f"roadmap.py: bad arguments for 'move'\n", file=sys.stderr)
-      print(USAGE, file=sys.stderr, end="")
-      return 2
+    print(move_item(pid, args[0], args[1], args[2][2:], args[3] if len(args) == 4 else ""))
   elif cmd == "show":
     show_all = "--all" in args
     rest = [a for a in args if a != "--all"]

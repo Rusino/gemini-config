@@ -315,6 +315,104 @@ class TestRoadmap(unittest.TestCase):
     self.assertEqual(cli("show", "--all", "--all").returncode, 2)
     self.assertEqual(cli("frobnicate").returncode, 2)
 
+  def order(self, show_all=True):
+    return [ln.split()[1] for ln in roadmap.show("p1", show_all=show_all).splitlines()[1:]]
+
+  def test_edit_keeps_id_status_owner_link_and_position(self):
+    for t in ("A", "B"):
+      roadmap.add_item("p1", "c1", t)
+    roadmap.set_status("p1", "c1", "R1", "doing")
+    roadmap.link_item("p1", "c1", "R1", "chat-9")
+    self.assertEqual(roadmap.edit_item("p1", "c2", "R1", " new\n text "), "R1 edited: new text")
+    it = self.items()["R1"]
+    self.assertEqual(
+        (it["text"], it["status"], it["owner"], it["link"], it["updated_by"]),
+        ("new text", "doing", "c1", "chat-9", "c2"),
+    )
+    self.assertEqual(self.order(), ["R1", "R2"])
+    with self.assertRaises(roadmap.RoadmapError):
+      roadmap.edit_item("p1", "c1", "R1", "  ")
+    with self.assertRaises(roadmap.RoadmapError):
+      roadmap.edit_item("p1", "c1", "R9", "x")
+
+  def test_reorder_moves_subtrees_and_keeps_ids(self):
+    for t in ("A", "B", "C", "D"):
+      roadmap.add_item("p1", "c1", t)
+    roadmap.add_item("p1", "c1", "B1", parent="R2")
+    roadmap.add_item("p1", "c1", "B2", parent="R2")
+    roadmap.add_item("p1", "c1", "A1", parent="R1")
+    before = {iid: dict(it) for iid, it in self.items().items()}
+    roadmap.reorder_items("p1", "c2", ["R3", "R2"])
+    self.assertEqual(self.order(), ["R3", "R2", "R2.1", "R2.2", "R1", "R1.1", "R4"])
+    self.assertEqual(self.items(), before)
+    roadmap.add_item("p1", "c1", "E")
+    self.assertEqual(self.order()[-1], "R5")
+    roadmap.reorder_items("p1", "c1", ["R2.2"])
+    self.assertEqual(self.order()[:4], ["R3", "R2", "R2.2", "R2.1"])
+    for bad in (["R1", "R2.1"], ["R1", "R1"], ["R9"], []):
+      with self.assertRaises(roadmap.RoadmapError):
+        roadmap.reorder_items("p1", "c1", bad)
+
+  def test_move_positions_and_sibling_scope(self):
+    for t in ("A", "B", "C"):
+      roadmap.add_item("p1", "c1", t)
+    roadmap.add_item("p1", "c1", "C1", parent="R3")
+    roadmap.add_item("p1", "c1", "C2", parent="R3")
+    self.assertEqual(roadmap.move_item("p1", "c1", "R3", "top"), "R3 moved to top")
+    self.assertEqual(self.order(), ["R3", "R3.1", "R3.2", "R1", "R2"])
+    roadmap.move_item("p1", "c1", "R3", "after", "R1")
+    self.assertEqual(self.order(), ["R1", "R3", "R3.1", "R3.2", "R2"])
+    roadmap.move_item("p1", "c1", "R2", "before", "R1")
+    roadmap.move_item("p1", "c1", "R3.1", "bottom")
+    self.assertEqual(self.order(), ["R2", "R1", "R3", "R3.2", "R3.1"])
+    roadmap.move_item("p1", "c1", "R2", "bottom")
+    self.assertEqual(self.order(), ["R1", "R3", "R3.2", "R3.1", "R2"])
+    for args in (
+        ("R3.1", "before", "R1"),
+        ("R1", "before", "R1"),
+        ("R1", "before", ""),
+        ("R1", "top", "R2"),
+        ("R1", "sideways", ""),
+        ("R9", "top", ""),
+    ):
+      with self.assertRaises(roadmap.RoadmapError):
+        roadmap.move_item("p1", "c1", *args)
+    self.assertEqual(self.order(), ["R1", "R3", "R3.2", "R3.1", "R2"])
+
+  def test_reorder_keeps_closed_item_collapse_ranking(self):
+    for i in range(1, 8):
+      roadmap.add_item("p1", "c1", f"Done {i}")
+      roadmap.set_status("p1", "c1", f"R{i}", "done")
+    stamps = {iid: it["updated_at"] for iid, it in self.items().items()}
+    roadmap.reorder_items("p1", "c1", ["R7", "R1"])
+    roadmap.move_item("p1", "c1", "R2", "top")
+    self.assertEqual({iid: it["updated_at"] for iid, it in self.items().items()}, stamps)
+    self.assertEqual(self.order(), ["R2", "R7", "R1", "R3", "R4", "R5", "R6"])
+
+  def test_cli_edit_reorder_move(self):
+    def cli(*args):
+      return subprocess.run(
+          [sys.executable, ROADMAP_CLI, *args], capture_output=True, text=True, check=False
+      )
+
+    for t in ("A", "B", "C"):
+      roadmap.add_item("p1", "c1", t)
+    self.assertEqual(cli("edit", "c1", "R2", "B2").returncode, 0)
+    self.assertEqual(cli("reorder", "c1", "R3").returncode, 0)
+    self.assertEqual(cli("move", "c1", "R1", "--before", "R3").returncode, 0)
+    self.assertEqual(cli("move", "c1", "R2", "--top").returncode, 0)
+    lines = cli("show", "c1").stdout.splitlines()[1:]
+    self.assertEqual(lines, ["☐ R2 B2", "☐ R1 A", "☐ R3 C"])
+    self.assertEqual(cli("move", "c1", "R1", "--top", "R2").returncode, 2)
+    self.assertEqual(cli("move", "c1", "R1", "--before").returncode, 2)
+    self.assertEqual(cli("move", "c1", "R1", "R2").returncode, 2)
+    self.assertEqual(cli("move", "c1", "R1", "--sideways").returncode, 1)
+    self.assertEqual(cli("reorder", "c1").returncode, 2)
+    self.assertEqual(cli("edit", "c1", "R1").returncode, 2)
+    with open(os.path.join(self.tmp.name, "p1", "journal.jsonl"), encoding="utf-8") as f:
+      ops = [json.loads(ln)["op"] for ln in f]
+    self.assertEqual(ops[-4:], ["edit", "reorder", "move", "move"])
+
   def test_concurrent_adds_lose_nothing(self):
     workers, per_worker = 6, 15
     script = (

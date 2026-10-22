@@ -654,7 +654,8 @@ def roadmap_edit_denial(target_file: str, conv_id: str) -> str:
     return ""
   return (
       f"[ROADMAP GUARD] Direct edits of `{target_file}` are blocked: roadmap files are shared by "
-      "concurrent chats of the project. Use `python3 ~/.gemini/config/hooks/roadmap.py add|set|link ...`; "
+      "concurrent chats of the project. Use "
+      "`python3 ~/.gemini/config/hooks/roadmap.py add|set|link|edit|reorder|move ...`; "
       "the only file you may edit there is your own chain state file "
       f"(`python3 ~/.gemini/config/hooks/roadmap.py state-path {conv_id or '<conversation id>'}`)."
   )
