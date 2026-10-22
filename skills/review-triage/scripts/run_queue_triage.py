@@ -316,6 +316,52 @@ def fetch_authored_github_pr_alerts(max_days, include_all, ignored_cls):
     return alerts
 
 
+def describe_closed_issue(api_url, entry, now, max_days, include_all):
+    """Fills entry["closed"] / entry["after_close"] for a notified issue.
+
+    Returns False when the issue should be hidden: closed before the window and touched
+    since only by bots (e.g. the github-actions lock after inactivity).
+    """
+    try:
+        issue = json.loads(subprocess.check_output(
+            ["gh", "api", api_url], stderr=subprocess.DEVNULL, text=True, timeout=10
+        ))
+    except Exception:
+        return True
+    if issue.get("state") != "closed":
+        return True
+
+    closed_dt = parse_iso_time(issue.get("closed_at"))
+    closer = (issue.get("closed_by") or {}).get("login", "?")
+    reason = issue.get("state_reason") or "closed"
+    entry["closed"] = f"{format_et(closed_dt)}, `{reason}`, `{closer}`"
+
+    # The closing comment shares the close timestamp, so only strictly later human
+    # comments count as activity after closure
+    human_after = []
+    try:
+        comments = json.loads(subprocess.check_output(
+            ["gh", "api", f"{api_url}/comments?since={issue.get('closed_at')}&per_page=100"],
+            stderr=subprocess.DEVNULL, text=True, timeout=10,
+        ))
+        for c in comments:
+            user = c.get("user") or {}
+            if user.get("type") == "Bot" or user.get("login", "").endswith("[bot]"):
+                continue
+            if parse_iso_time(c.get("created_at")) <= closed_dt:
+                continue
+            human_after.append(c)
+    except Exception:
+        pass
+
+    if human_after:
+        last = human_after[-1]
+        body = " ".join((last.get("body") or "").split())[:120].replace("|", "\\|")
+        entry["after_close"] = f"`{last['user']['login']}`: {body}"
+    closed_age_days = (now - closed_dt).total_seconds() / 86400.0
+    return include_all or bool(human_after) or closed_age_days <= max_days
+
+
 def fetch_github_issue_updates(max_days, include_all):
     """Fetch GitHub issues assigned to or mentioning @Rusino updated within max_days."""
     q = f"is:open is:issue involves:{GITHUB_USER}"
@@ -372,14 +418,19 @@ def fetch_github_issue_updates(max_days, include_all):
             if html_url in seen_urls:
                 continue
             seen_urls.add(html_url)
-            issues.append((updated_dt, {
+            entry = {
                 "repo_slug": repo_slug,
                 "number": num,
                 "url": html_url,
                 "title": subj.get("title", ""),
                 "role": f"Notif ({n.get('reason', 'update')})",
                 "updated_et": format_et(updated_dt),
-            }))
+            }
+            # A notification alone says nothing about the issue state; a closed crash
+            # listed as "updated" reads like a regression, so resolve the real state
+            if not describe_closed_issue(api_url, entry, now, max_days, include_all):
+                continue
+            issues.append((updated_dt, entry))
     except Exception:
         pass
 
@@ -448,7 +499,7 @@ def main():
     print(
         f"## 🌅 Morning Review Queue "
         f"({total_reviews} pending reviews, {len(authored_pr_alerts)} PR alerts, "
-        f"{len(github_issues)} active issues)\n"
+        f"{sum('closed' not in i for i in github_issues)} open issues)\n"
     )
     emails_str = "`, `".join(REVIEWER_EMAILS)
     print(
@@ -580,16 +631,35 @@ def main():
         print("\n---\n")
 
     if github_issues:
-        print(
-            f"### 🐛 Свежие баги и упоминания на GitHub "
-            f"(`@{GITHUB_USER}`, за {args.max_days} дн.)"
-        )
-        print("| Issue | Роль | Обновлено | Тема |")
-        print("|---|---|---|---|")
-        for iss in github_issues:
-            iss_link = f"[{iss['repo_slug']}#{iss['number']}]({iss['url']})"
-            print(f"| {iss_link} | `{iss['role']}` | `{iss['updated_et']}` | {iss['title']} |")
-        print("\n---\n")
+        open_issues = [i for i in github_issues if "closed" not in i]
+        closed_issues = [i for i in github_issues if "closed" in i]
+        if open_issues:
+            print(
+                f"### 🐛 Открытые баги и упоминания на GitHub "
+                f"(`@{GITHUB_USER}`, за {args.max_days} дн.)"
+            )
+            print("| Issue | Роль | Обновлено | Тема |")
+            print("|---|---|---|---|")
+            for iss in open_issues:
+                iss_link = f"[{iss['repo_slug']}#{iss['number']}]({iss['url']})"
+                print(
+                    f"| {iss_link} | `{iss['role']}` | `{iss['updated_et']}` | {iss['title']} |"
+                )
+            print()
+        if closed_issues:
+            print("### ✅ Закрытые issues с активностью за период")
+            print(
+                "*Уже закрыты. Реагировать стоит только на человеческий комментарий "
+                "после закрытия (колонка справа).*"
+            )
+            print("| Issue | Закрыт (когда, причина, кем) | После закрытия | Тема |")
+            print("|---|---|---|---|")
+            for iss in closed_issues:
+                iss_link = f"[{iss['repo_slug']}#{iss['number']}]({iss['url']})"
+                after = iss.get("after_close", "—")
+                print(f"| {iss_link} | {iss['closed']} | {after} | {iss['title']} |")
+            print()
+        print("---\n")
 
     # Detailed cards for each incoming CL/PR
     for r in triage_results:
