@@ -238,6 +238,33 @@ class RedlineTest(unittest.TestCase):
       self.assertEqual(base_dirty, "# Note\n\nVersion 2.\n")
       self.assertIn("HEAD:", lbl_dirty)
 
+  def test_table_diff_under_unchanged_heading_aligns_deleted_and_inserted_rows(self):
+    old = (
+        "### Matrix\n\n"
+        "| Issue | Description |\n"
+        "| --- | --- |\n"
+        "| #10 | First row unchanged |\n"
+        "| #20 | Removed middle row |\n"
+        "| #30 | Third row with old metric 0.5 px |\n"
+    )
+    new = (
+        "### Matrix\n\n"
+        "| Issue | Description |\n"
+        "| --- | --- |\n"
+        "| #10 | First row unchanged |\n"
+        "| #30 | Third row with new metric 0.15 px |\n"
+        "| #40 | Newly added row at end |\n"
+    )
+    page, stats = redline.render_redline_html(old, new)
+    self.assertEqual(stats["changed_blocks"], 1)
+    self.assertIn('<tr class="row-del"><td><del>#20</del></td>', page)
+    self.assertIn('<tr class="row-ins"><td><ins>#40</ins></td>', page)
+    self.assertIn(
+        "<td>#30</td><td>Third row with <del>old metric 0.5</del>"
+        " <ins>new metric 0.15</ins> px</td>",
+        page,
+    )
+
 
 if __name__ == "__main__":
   unittest.main()

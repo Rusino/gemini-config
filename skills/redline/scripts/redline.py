@@ -1185,55 +1185,120 @@ def _render_single_block(
   )
 
 
+def _row_similarity(r_old: list[str], r_new: list[str]) -> float:
+  if not r_old or not r_new:
+    return 0.0
+  # Rows sharing the same non-empty first column (e.g. issue ID or key) belong to the same entry
+  k_old = r_old[0].strip()
+  k_new = r_new[0].strip()
+  if k_old and k_old == k_new:
+    return 0.95
+  w_old = [w.lower() for c in r_old for w in re.findall(r"\w+", c)]
+  w_new = [w.lower() for c in r_new for w in re.findall(r"\w+", c)]
+  if not w_old or not w_new:
+    return 0.0
+  return difflib.SequenceMatcher(None, w_old, w_new, autojunk=False).ratio()
+
+
 def _render_paired_block(
     old_blk: DocBlock, new_blk: DocBlock, max_equal_words: int = 4
 ) -> RenderedBlock:
   """Render a modified pair of blocks with inline coalesced word diff."""
   if old_blk.kind == "table" and new_blk.kind == "table":
-    # Diff table row by row
     del_w = 0
     ins_w = 0
     any_chg = False
-    max_rows = max(len(old_blk.rows), len(new_blk.rows))
     rows_html: list[str] = []
-    for r_idx in range(max_rows):
-      cell_tag = "th" if r_idx == 0 else "td"
-      if r_idx < len(old_blk.rows) and r_idx < len(new_blk.rows):
-        r_old = old_blk.rows[r_idx]
-        r_new = new_blk.rows[r_idx]
-        max_cols = max(len(r_old), len(r_new))
-        cells_h: list[str] = []
-        for c_idx in range(max_cols):
-          c_o = r_old[c_idx] if c_idx < len(r_old) else ""
-          c_n = r_new[c_idx] if c_idx < len(r_new) else ""
-          ch, dw, iw, chg = diff_inline_markdown(c_o, c_n, max_equal_words)
-          del_w += dw
-          ins_w += iw
-          any_chg = any_chg or chg
-          cells_h.append(f"<{cell_tag}>{ch}</{cell_tag}>")
-        rows_html.append(f"<tr>{''.join(cells_h)}</tr>")
-      elif r_idx < len(old_blk.rows):
-        any_chg = True
-        r_old = old_blk.rows[r_idx]
-        del_w += sum(len(c.split()) for c in r_old)
-        cells_h = [
-            f"<{cell_tag}><del>"
-            f"{render_inline_tokens(tokenize_inline_markdown(c))}"
-            f"</del></{cell_tag}>"
-            for c in r_old
-        ]
-        rows_html.append(f'<tr class="row-del">{"".join(cells_h)}</tr>')
+
+    def render_row_pair(
+        r_old: list[str], r_new: list[str], cell_tag: str
+    ) -> None:
+      nonlocal del_w, ins_w, any_chg
+      max_cols = max(len(r_old), len(r_new))
+      cells_h: list[str] = []
+      for c_idx in range(max_cols):
+        c_o = r_old[c_idx] if c_idx < len(r_old) else ""
+        c_n = r_new[c_idx] if c_idx < len(r_new) else ""
+        ch, dw, iw, chg = diff_inline_markdown(c_o, c_n, max_equal_words)
+        del_w += dw
+        ins_w += iw
+        any_chg = any_chg or chg
+        cells_h.append(f"<{cell_tag}>{ch}</{cell_tag}>")
+      rows_html.append(f"<tr>{''.join(cells_h)}</tr>")
+
+    def render_del_row(r_old: list[str], cell_tag: str) -> None:
+      nonlocal del_w, any_chg
+      any_chg = True
+      del_w += sum(len(c.split()) for c in r_old)
+      cells_h = [
+          f"<{cell_tag}><del>"
+          f"{render_inline_tokens(tokenize_inline_markdown(c))}"
+          f"</del></{cell_tag}>"
+          for c in r_old
+      ]
+      rows_html.append(f'<tr class="row-del">{"".join(cells_h)}</tr>')
+
+    def render_ins_row(r_new: list[str], cell_tag: str) -> None:
+      nonlocal ins_w, any_chg
+      any_chg = True
+      ins_w += sum(len(c.split()) for c in r_new)
+      cells_h = [
+          f"<{cell_tag}><ins>"
+          f"{render_inline_tokens(tokenize_inline_markdown(c))}"
+          f"</ins></{cell_tag}>"
+          for c in r_new
+      ]
+      rows_html.append(f'<tr class="row-ins">{"".join(cells_h)}</tr>')
+
+    if old_blk.rows and new_blk.rows:
+      render_row_pair(old_blk.rows[0], new_blk.rows[0], "th")
+    elif old_blk.rows:
+      render_del_row(old_blk.rows[0], "th")
+    elif new_blk.rows:
+      render_ins_row(new_blk.rows[0], "th")
+
+    # Align data rows by similarity so deleted/inserted rows do not shift adjacent rows
+    data_o = old_blk.rows[1:]
+    data_n = new_blk.rows[1:]
+    m_len, n_len = len(data_o), len(data_n)
+    dp = [[0.0] * (n_len + 1) for _ in range(m_len + 1)]
+    choice = [[""] * (n_len + 1) for _ in range(m_len + 1)]
+    for oi in range(m_len - 1, -1, -1):
+      for nj in range(n_len - 1, -1, -1):
+        best = dp[oi + 1][nj]
+        best_c = "skip_o"
+        if dp[oi][nj + 1] > best:
+          best = dp[oi][nj + 1]
+          best_c = "skip_n"
+        sim = _row_similarity(data_o[oi], data_n[nj])
+        if sim >= 0.35:
+          cand = sim + dp[oi + 1][nj + 1]
+          if cand >= best:
+            best = cand
+            best_c = "pair"
+        dp[oi][nj] = best
+        choice[oi][nj] = best_c
+
+    oi, nj = 0, 0
+    while oi < m_len and nj < n_len:
+      c = choice[oi][nj]
+      if c == "pair":
+        render_row_pair(data_o[oi], data_n[nj], "td")
+        oi += 1
+        nj += 1
+      elif c == "skip_o":
+        render_del_row(data_o[oi], "td")
+        oi += 1
       else:
-        any_chg = True
-        r_new = new_blk.rows[r_idx]
-        ins_w += sum(len(c.split()) for c in r_new)
-        cells_h = [
-            f"<{cell_tag}><ins>"
-            f"{render_inline_tokens(tokenize_inline_markdown(c))}"
-            f"</ins></{cell_tag}>"
-            for c in r_new
-        ]
-        rows_html.append(f'<tr class="row-ins">{"".join(cells_h)}</tr>')
+        render_ins_row(data_n[nj], "td")
+        nj += 1
+    while oi < m_len:
+      render_del_row(data_o[oi], "td")
+      oi += 1
+    while nj < n_len:
+      render_ins_row(data_n[nj], "td")
+      nj += 1
+
     cls_suffix = " block-mod" if any_chg else " block-eq"
     return RenderedBlock(
         kind="table",
@@ -1304,9 +1369,19 @@ def _render_paired_block(
     h = f'<li class="doc-block{cls_suffix}{indent_cls}"{val_attr}>{inner}</li>'
   elif new_blk.kind == "alert":
     ak = new_blk.alert_type.lower() or "note"
+    if old_blk.kind == "alert" and old_blk.alert_type != new_blk.alert_type:
+      chg = True
+      cls_suffix = " block-mod"
+      state = "modified"
+      alert_hdr = (
+          f"<del>{html.escape(old_blk.alert_type or 'NOTE')}</del> "
+          f"<ins>{html.escape(new_blk.alert_type or 'NOTE')}</ins>"
+      )
+    else:
+      alert_hdr = html.escape(new_blk.alert_type or "NOTE")
     h = (
         f'<div class="doc-block alert alert-{ak}{cls_suffix}">'
-        f'<div class="alert-title">{html.escape(new_blk.alert_type or "NOTE")}</div>'
+        f'<div class="alert-title">{alert_hdr}</div>'
         f"<div>{inner}</div></div>"
     )
   elif new_blk.kind == "blockquote":
@@ -1333,8 +1408,14 @@ def diff_document_blocks(
     max_equal_words: int = 4,
 ) -> list[RenderedBlock]:
   """Align document blocks between old and new and diff paired blocks in place."""
-  old_keys = [(b.kind, b.level, b.text) for b in old_blocks]
-  new_keys = [(b.kind, b.level, b.text) for b in new_blocks]
+  old_keys = [
+      (b.kind, b.level, b.alert_type, b.text, tuple(tuple(r) for r in b.rows))
+      for b in old_blocks
+  ]
+  new_keys = [
+      (b.kind, b.level, b.alert_type, b.text, tuple(tuple(r) for r in b.rows))
+      for b in new_blocks
+  ]
   sm = difflib.SequenceMatcher(None, old_keys, new_keys, autojunk=False)
 
   rendered: list[RenderedBlock] = []
