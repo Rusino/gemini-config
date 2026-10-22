@@ -116,6 +116,18 @@ Triage output alone is never the final word. Every CL that stays in the queue af
 category except a clear 🟡 REASSIGN) must also go through the
 `ruthless-code-audit` (`~/.gemini/config/skills/ruthless-code-audit/SKILL.md`)
 skill and its **Stage 2.5 Skeptic Refutation Pass (`keeper_skeptic`)** before review drafts are presented:
+0. **Load Follow-Up Patchset Context & Commit Message (Pass to Any Auditor Subagent)**:
+   - Always inspect the `### 🔄 Follow-Up Patchset & Prior Review Thread` and
+     `### 📜 Commit Message` sections emitted by `triage_cl.py` (and include them verbatim in
+     the prompt of any subagent auditing the CL).
+   - **Follow-up mode (`PS > 1` with prior comments from `YOU`)**: Fetch both
+     `last_reviewed_ref` and `current_ref`, inspect `git diff <last_reviewed_sha> <current_sha>`,
+     and verify whether the author addressed the user's prior comments. **Never** contradict the
+     user's earlier requests—in particular, never ask the author to split out, revert, or rework
+     code that the user asked them to fold in from a companion WIP CL.
+   - **Commit message grounding**: Read the full commit message of the current patchset before
+     drafting comments. **Never** ask the author to "call out X in the description" when X is
+     already explained in the commit message.
 1. Fetch the current patchset into a separate worktree (never switch branches in an existing
    checkout): `git fetch https://skia.googlesource.com/skia refs/changes/<NN>/<CL>/<PS>`. If the
    stored credentials are rejected (HTTP 400 "Invalid authentication credentials"), retry with
@@ -135,9 +147,20 @@ skill and its **Stage 2.5 Skeptic Refutation Pass (`keeper_skeptic`)** before re
    - **Automatic Model Routing (`XFAMILY_REFUTE`)**: Use `Model="flash"` for routine local checks; automatically escalate to `Model="pro"` if any candidate involves concurrency/lifetimes, BiDi/UTF-8/UTF-16/grapheme index math, `SkParagraph` line metrics, dropped historical guards (`git log -S`), or cross-backend `SkParagraph` ↔ `WebParagraph` symmetry.
    - **Quota Fallback**: On `pro` quota exhaustion, auto-downgrade to `Model="flash"` (`[Verified via Flash fallback (Pro quota exhausted)]`); if all models fail, mark the draft `[UNVERIFIED: Quota Exhausted]` and alert the user.
    - **Apply the Three Skeptic Verdicts to Review Drafts & Persist Refutations**:
-     - **`REFUTED` (`path:line` guard, caller `SkASSERT`, or documented intent)**: Drop silently—never embarrass the human reviewer with a false positive on Gerrit/GitHub. Record every `REFUTED` item (and any review comment the user later dismisses in chat) in the Persistent Finding Ledger via `python3 ~/.gemini/config/scripts/finding_ledger.py add --repo <repo_or_project> --file <path> --symbol "<sym>" --claim "<claim>" --reason "<evidence>" [--scope repo|cl --cl <cl_id>]`.
+     - **`REFUTED` (`path:line` guard, caller `SkASSERT`, or documented intent)**: Drop
+       **completely**—never embarrass the human reviewer with a false positive on Gerrit/GitHub,
+       and **never** resurrect a `REFUTED` candidate in the review draft as a "polite question
+       before +1", "worth documenting in `.h`?", or "would you consider splitting this into a
+       separate CL?". If all candidates are `REFUTED`, the review draft is a clean `LGTM`. Record
+       every `REFUTED` item (and any review comment the user later dismisses in chat) in the
+       Persistent Finding Ledger via `python3 ~/.gemini/config/scripts/finding_ledger.py add`
+       `--repo <repo_or_project> --file <path> --symbol "<sym>" --claim "<claim>"`
+       `--reason "<evidence>" [--scope repo|cl --cl <cl_id>]`.
      - **`CONFIRMED` (`entry -> path:line -> bad outcome`)**: Proceed to the **Default Companion WIP CL Execution (`companion-cl-review`)** stage below; drop any LGTM draft that a confirmed defect contradicts.
-     - **`UNPROVEN` (trace hits an external contract or unverified product intent)**: Convert into a polite, specific **Question for the CL Author** in English (stating what was traced and what remains open) rather than asserting a bug.
+     - **`UNPROVEN` (trace hits an external contract or unverified product intent that**
+       **`keeper_skeptic` did NOT refute)**:
+       Convert into a polite, specific **Question for the CL Author** in English (stating what was
+       traced and what remains open) rather than asserting a bug.
 
 ---
 
@@ -160,3 +183,14 @@ For every targeted single-CL review in `🔴 SURGICAL AUDIT / CORE DOMAIN` (or `
 1. **English-Only Review Surface**: All generated review comments, reassignment notes, and pushback messages must be strictly in English. Direct discussion with the user remains in Russian.
 2. **Never Auto-Publish or Resolve**: The agent must NEVER publish review comments to Gerrit/GitHub or resolve threads automatically. Drafts are presented in chat for the user to review and post.
 3. **No Auto-Submit or CQ Votes**: Never trigger CQ votes (`Commit-Queue+1`/`+2`) or merge actions.
+4. **Respect `PRESUBMIT.py` Include & Forward-Declaration Sorting**: In Skia, `PRESUBMIT.py` runs
+   `python3 tools/rewrite_includes.py --dry-run` on all modified files and fails CQ
+   (`Housekeeper-OnDemand-Presubmit`) if existing `#include` lines or forward declarations
+   (`class Foo;`) in a touched header/source file are not sorted alphabetically. Never flag
+   alphabetical `#include` or forward-declaration reordering in a modified file as "unrelated
+   churn".
+5. **No Unmeasured Test-Runtime or Header Doc-Comment Bikeshedding**: Never question unit-test
+   loop counts (e.g., `65536` iterations) as slow on Debug bots without inspecting the mock/helper
+   implementation and measuring actual `dm` runtime, and never hold up approval asking to add doc
+   comments to headers whose existing methods have no doc comments when the contract is already
+   stated in the commit message.
