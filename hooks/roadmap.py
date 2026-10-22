@@ -48,6 +48,10 @@ Usage:
   roadmap.py set <conv_id> <ID> todo|doing|done|dropped
                                                   Change status; `doing` claims it
   roadmap.py link <conv_id> <ID> <chat_id>        Item is handled in its own chat
+  roadmap.py edit <conv_id> <ID> "<new text>"     Edit item text
+  roadmap.py reorder <conv_id> <ID> [<ID> ...]    Reorder siblings (listed items go first)
+  roadmap.py move <conv_id> <ID> --before <ID> | --after <ID> | --top | --bottom
+                                                  Move an item relative to siblings
   roadmap.py show [conv_id] [--all]               Compact render (--all shows all closed items)
   roadmap.py state-path <conv_id>                 Path of the chain state file
   roadmap.py state-move <old_conv_id> <new_conv_id>
@@ -320,6 +324,97 @@ def link_item(project_id: str, conv_id: str, item_id: str, chat_id: str) -> str:
   return _mutate(project_id, conv_id, apply)
 
 
+def edit_item(project_id: str, conv_id: str, item_id: str, text: str) -> str:
+  clean = " ".join((text or "").split())
+  if not clean:
+    raise RoadmapError("item text must not be empty")
+
+  def apply(doc: dict):
+    it = _find(doc, item_id)
+    old_text = it["text"]
+    it["text"] = clean
+    _touch(it, conv_id)
+    return f"{item_id} edited", "edit", {"id": item_id, "old": old_text, "new": clean}
+
+  return _mutate(project_id, conv_id, apply)
+
+
+def reorder_items(project_id: str, conv_id: str, item_ids: list[str]) -> str:
+  if not item_ids:
+    raise RoadmapError("no items provided to reorder")
+
+  def apply(doc: dict):
+    items = doc["items"]
+    by_id = {it["id"]: it for it in items}
+    for iid in item_ids:
+      if iid not in by_id:
+        raise RoadmapError(f"unknown item {iid}")
+        
+    parent = by_id[item_ids[0]].get("parent", "")
+    for iid in item_ids:
+      if by_id[iid].get("parent", "") != parent:
+        raise RoadmapError("all reordered items must have the same parent")
+
+    unique_ids = []
+    seen = set()
+    for iid in item_ids:
+      if iid not in seen:
+        seen.add(iid)
+        unique_ids.append(iid)
+        _touch(by_id[iid], conv_id)
+
+    siblings = [it["id"] for it in items if it.get("parent", "") == parent]
+    new_order = unique_ids + [sid for sid in siblings if sid not in seen]
+    
+    indices = [i for i, it in enumerate(items) if it.get("parent", "") == parent]
+    for idx, sid in zip(indices, new_order):
+      items[idx] = by_id[sid]
+      
+    return f"reordered siblings under '{parent or 'root'}'", "reorder", {"ids": unique_ids}
+    
+  return _mutate(project_id, conv_id, apply)
+
+
+def move_item(project_id: str, conv_id: str, item_id: str, target: str, position: str) -> str:
+  def apply(doc: dict):
+    items = doc["items"]
+    by_id = {it["id"]: it for it in items}
+    if item_id not in by_id:
+      raise RoadmapError(f"unknown item {item_id}")
+    
+    parent = by_id[item_id].get("parent", "")
+    siblings = [it["id"] for it in items if it.get("parent", "") == parent]
+    
+    siblings.remove(item_id)
+    if position == "top":
+      siblings.insert(0, item_id)
+    elif position == "bottom":
+      siblings.append(item_id)
+    else:
+      if target not in by_id:
+        raise RoadmapError(f"unknown target item {target}")
+      if by_id[target].get("parent", "") != parent:
+        raise RoadmapError("item and target must have the same parent")
+      target_idx = siblings.index(target)
+      if position == "before":
+        siblings.insert(target_idx, item_id)
+      elif position == "after":
+        siblings.insert(target_idx + 1, item_id)
+      else:
+        raise RoadmapError(f"unknown position {position}")
+        
+    _touch(by_id[item_id], conv_id)
+    
+    indices = [i for i, it in enumerate(items) if it.get("parent", "") == parent]
+    for idx, sid in zip(indices, siblings):
+      items[idx] = by_id[sid]
+      
+    pos_desc = f"{position} {target}" if target else position
+    return f"{item_id} moved {pos_desc}", "move", {"id": item_id, "pos": position, "target": target}
+    
+  return _mutate(project_id, conv_id, apply)
+
+
 def state_move(project_id: str, old_conv: str, new_conv: str) -> str:
   """Moves state/<old>.md to state/<new>.md and hands over old's `doing` items.
 
@@ -469,6 +564,23 @@ def _cli(argv: list[str]) -> int:
   elif cmd == "link" and len(args) == 3:
     pid = require_project_id(args[0])
     print(link_item(pid, args[0], args[1], args[2]))
+  elif cmd == "edit" and len(args) == 3:
+    pid = require_project_id(args[0])
+    print(edit_item(pid, args[0], args[1], args[2]))
+  elif cmd == "reorder" and len(args) >= 2:
+    pid = require_project_id(args[0])
+    print(reorder_items(pid, args[0], args[1:]))
+  elif cmd == "move" and len(args) in (3, 4):
+    pid = require_project_id(args[0])
+    item_id = args[1]
+    if len(args) == 3 and args[2] in ("--top", "--bottom"):
+      print(move_item(pid, args[0], item_id, "", args[2][2:]))
+    elif len(args) == 4 and args[2] in ("--before", "--after"):
+      print(move_item(pid, args[0], item_id, args[3], args[2][2:]))
+    else:
+      print(f"roadmap.py: bad arguments for 'move'\n", file=sys.stderr)
+      print(USAGE, file=sys.stderr, end="")
+      return 2
   elif cmd == "show":
     show_all = "--all" in args
     rest = [a for a in args if a != "--all"]

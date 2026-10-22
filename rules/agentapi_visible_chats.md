@@ -60,7 +60,7 @@ For moving chats or whole chains between projects (or listing unassigned chats),
 
 ## Backlog & Scope Invariants across Handoff Chains
 
-- **In-project chats: Epic Roadmap via `roadmap.py` only**: A chat inside a Jetski project keeps the Epic Roadmap in the project's shared roadmap through `python3 ~/.gemini/config/hooks/roadmap.py add|set|link|show ...` and **never** edits files under `~/.gemini/config/roadmaps/` directly. The only exception is the chain state file (`roadmap.py state-path <id>`), which is the handoff summary in projects and carries the immediate next step. The checkbox rules below apply to the handoff summaries of outside-project chats.
+- **In-project chats: Epic Roadmap via `roadmap.py` only**: A chat inside a Jetski project keeps the Epic Roadmap in the project's shared roadmap through `python3 ~/.gemini/config/hooks/roadmap.py add|set|link|show|edit|reorder|move ...` and **never** edits files under `~/.gemini/config/roadmaps/` directly. The only exception is the chain state file (`roadmap.py state-path <id>`), which is the handoff summary in projects and carries the immediate next step. The checkbox rules below apply to the handoff summaries of outside-project chats.
   - **Backlog requests**: when the user says something like "в бэклог: X" / "add to backlog: X", run `roadmap.py add <id> "X"`, confirm in exactly one line (e.g. `R7 added: X`), then continue the current work.
   - **Spin-offs**: when an item is handed to its own chat, run `roadmap.py link <id> <item ID> <new_chat_id>`.
   - **At handoff**: paste the roadmap block printed by `chat_lifecycle.py handoff` into the final message to the user.
