@@ -897,6 +897,7 @@ class DocBlock:
   alert_type: str = ""  # NOTE, TIP, IMPORTANT, WARNING, CAUTION
   lang: str = ""
   rows: list[list[str]] = field(default_factory=list)
+  section: str = "Начало документа"
 
   def norm_words(self) -> list[str]:
     if self.kind == "table":
@@ -917,6 +918,7 @@ def parse_markdown_blocks(md_text: str) -> list[DocBlock]:
   """Parse a Markdown document into structural blocks, unwrapping soft line wraps."""
   lines = md_text.splitlines()
   blocks: list[DocBlock] = []
+  current_sec = "Начало документа"
   i = 0
   n = len(lines)
 
@@ -938,20 +940,34 @@ def parse_markdown_blocks(md_text: str) -> list[DocBlock]:
         i += 1
       if i < n:
         i += 1
-      blocks.append(DocBlock(kind="code", text="\n".join(code_lines), lang=lang))
+      blocks.append(
+          DocBlock(
+              kind="code",
+              text="\n".join(code_lines),
+              lang=lang,
+              section=current_sec,
+          )
+      )
       continue
 
     # 2. Horizontal rule
     if _HR_RE.match(ln):
-      blocks.append(DocBlock(kind="hr"))
+      blocks.append(DocBlock(kind="hr", section=current_sec))
       i += 1
       continue
 
     # 3. Heading
     m_h = _HEADING_RE.match(ln)
     if m_h:
+      h_text = m_h.group(2).strip()
+      current_sec = re.sub(r"[`*_]", "", h_text).strip() or current_sec
       blocks.append(
-          DocBlock(kind="h", level=len(m_h.group(1)), text=m_h.group(2).strip())
+          DocBlock(
+              kind="h",
+              level=len(m_h.group(1)),
+              text=h_text,
+              section=current_sec,
+          )
       )
       i += 1
       continue
@@ -974,6 +990,7 @@ def parse_markdown_blocks(md_text: str) -> list[DocBlock]:
               kind="alert" if alert_kind else "blockquote",
               alert_type=alert_kind,
               text=" ".join(bq_lines),
+              section=current_sec,
           )
       )
       continue
@@ -989,7 +1006,9 @@ def parse_markdown_blocks(md_text: str) -> list[DocBlock]:
           table_rows.append(cells)
         i += 1
       if table_rows:
-        blocks.append(DocBlock(kind="table", rows=table_rows))
+        blocks.append(
+            DocBlock(kind="table", rows=table_rows, section=current_sec)
+        )
       continue
 
     # 6. List item (unordered or ordered)
@@ -1038,6 +1057,7 @@ def parse_markdown_blocks(md_text: str) -> list[DocBlock]:
               list_type=ltype,
               list_num=lnum,
               text=" ".join(item_parts),
+              section=current_sec,
           )
       )
       continue
@@ -1067,7 +1087,7 @@ def parse_markdown_blocks(md_text: str) -> list[DocBlock]:
         break
       p_parts.append(nxt.strip())
       i += 1
-    blocks.append(DocBlock(kind="p", text=" ".join(p_parts)))
+    blocks.append(DocBlock(kind="p", text=" ".join(p_parts), section=current_sec))
 
   return blocks
 
@@ -1107,18 +1127,49 @@ class RenderedBlock:
   kind: str
   html: str
   changed: bool
-  state: str  # 'equal', 'modified', 'deleted', 'inserted'
+  state: str  # 'equal', 'modified', 'deleted', 'inserted', 'moved', 'moved_stub'
   level: int = 0
   list_type: str = ""
   list_num: Optional[int] = None
   del_words: int = 0
   ins_words: int = 0
+  raw_old: Optional[DocBlock] = None
+  raw_new: Optional[DocBlock] = None
+  sbs_old_html: str = ""
+  sbs_new_html: str = ""
+
+
+def _wrap_block_shell(blk: DocBlock, inner_html: str, cls_suffix: str, dom_id: str = "") -> str:
+  """Wrap inner_html in the structural HTML tag corresponding to blk."""
+  id_attr = f' id="{html.escape(dom_id, quote=True)}"' if dom_id else ""
+  if blk.kind == "h":
+    lvl = max(1, min(6, blk.level))
+    return f'<h{lvl}{id_attr} class="doc-block{cls_suffix}">{inner_html}</h{lvl}>'
+  if blk.kind == "p":
+    return f'<p{id_attr} class="doc-block{cls_suffix}">{inner_html}</p>'
+  if blk.kind == "li":
+    val_attr = f' value="{blk.list_num}"' if blk.list_type == "ol" and blk.list_num else ""
+    indent_cls = f" indent-{blk.level}" if blk.level > 0 else ""
+    return f'<li{id_attr} class="doc-block{cls_suffix}{indent_cls}"{val_attr}>{inner_html}</li>'
+  if blk.kind == "alert":
+    ak = blk.alert_type.lower() or "note"
+    return (
+        f'<div{id_attr} class="doc-block alert alert-{ak}{cls_suffix}">'
+        f'<div class="alert-title">{html.escape(blk.alert_type or "NOTE")}</div>'
+        f"<div>{inner_html}</div></div>"
+    )
+  if blk.kind == "blockquote":
+    return f'<blockquote{id_attr} class="doc-block{cls_suffix}">{inner_html}</blockquote>'
+  if blk.kind == "code":
+    return f'<pre{id_attr} class="doc-block{cls_suffix}"><code>{inner_html}</code></pre>'
+  return f'<hr{id_attr} class="doc-block{cls_suffix}">'
 
 
 def _render_single_block(
     blk: DocBlock, state: str, max_equal_words: int = 4
 ) -> RenderedBlock:
   """Render an unchanged, purely deleted, or purely inserted block."""
+  del max_equal_words
   changed = state != "equal"
   wrap_tag = "del" if state == "deleted" else ("ins" if state == "inserted" else "")
   cls_suffix = (
@@ -1136,27 +1187,9 @@ def _render_single_block(
   ins_w = word_cnt if state == "inserted" else 0
   inner_html = wrap(render_inline_tokens(tokens))
 
-  if blk.kind == "h":
-    lvl = max(1, min(6, blk.level))
-    h = f'<h{lvl} class="doc-block{cls_suffix}">{inner_html}</h{lvl}>'
-  elif blk.kind == "p":
-    h = f'<p class="doc-block{cls_suffix}">{inner_html}</p>'
-  elif blk.kind == "li":
-    val_attr = f' value="{blk.list_num}"' if blk.list_type == "ol" and blk.list_num else ""
-    indent_cls = f" indent-{blk.level}" if blk.level > 0 else ""
-    h = f'<li class="doc-block{cls_suffix}{indent_cls}"{val_attr}>{inner_html}</li>'
-  elif blk.kind == "alert":
-    ak = blk.alert_type.lower() or "note"
-    h = (
-        f'<div class="doc-block alert alert-{ak}{cls_suffix}">'
-        f'<div class="alert-title">{html.escape(blk.alert_type or "NOTE")}</div>'
-        f"<div>{inner_html}</div></div>"
-    )
-  elif blk.kind == "blockquote":
-    h = f'<blockquote class="doc-block{cls_suffix}">{inner_html}</blockquote>'
-  elif blk.kind == "code":
+  if blk.kind == "code":
     code_escaped = wrap(html.escape(blk.text))
-    h = f'<pre class="doc-block{cls_suffix}"><code>{code_escaped}</code></pre>'
+    h = _wrap_block_shell(blk, code_escaped, cls_suffix)
   elif blk.kind == "table":
     del_w = sum(len(c.split()) for r in blk.rows for c in r) if state == "deleted" else 0
     ins_w = sum(len(c.split()) for r in blk.rows for c in r) if state == "inserted" else 0
@@ -1170,7 +1203,10 @@ def _render_single_block(
       rows_html.append(f"<tr>{cells_h}</tr>")
     h = f'<table class="doc-block{cls_suffix}">{"".join(rows_html)}</table>'
   else:
-    h = f'<hr class="doc-block{cls_suffix}">'
+    h = _wrap_block_shell(blk, inner_html, cls_suffix)
+
+  sbs_old = h if state in ("equal", "deleted") else '<div class="sbs-empty">— добавлено —</div>'
+  sbs_new = h if state in ("equal", "inserted") else '<div class="sbs-empty">— удалено —</div>'
 
   return RenderedBlock(
       kind=blk.kind,
@@ -1182,6 +1218,10 @@ def _render_single_block(
       list_num=blk.list_num,
       del_words=del_w,
       ins_words=ins_w,
+      raw_old=blk if state in ("equal", "deleted") else None,
+      raw_new=blk if state in ("equal", "inserted") else None,
+      sbs_old_html=sbs_old,
+      sbs_new_html=sbs_new,
   )
 
 
@@ -1201,9 +1241,12 @@ def _row_similarity(r_old: list[str], r_new: list[str]) -> float:
 
 
 def _render_paired_block(
-    old_blk: DocBlock, new_blk: DocBlock, max_equal_words: int = 4
+    old_blk: DocBlock,
+    new_blk: DocBlock,
+    max_equal_words: int = 4,
+    move_info: Optional[tuple[str, str, str]] = None,
 ) -> RenderedBlock:
-  """Render a modified pair of blocks with inline coalesced word diff."""
+  """Render a modified (or moved) pair of blocks with inline or whole-block diff."""
   if old_blk.kind == "table" and new_blk.kind == "table":
     del_w = 0
     ins_w = 0
@@ -1300,13 +1343,19 @@ def _render_paired_block(
       nj += 1
 
     cls_suffix = " block-mod" if any_chg else " block-eq"
+    tbl_html = f'<table class="doc-block{cls_suffix}">{"".join(rows_html)}</table>'
+    old_tbl = _render_single_block(old_blk, "equal").html
     return RenderedBlock(
         kind="table",
-        html=f'<table class="doc-block{cls_suffix}">{"".join(rows_html)}</table>',
+        html=tbl_html,
         changed=any_chg,
         state="modified" if any_chg else "equal",
         del_words=del_w,
         ins_words=ins_w,
+        raw_old=old_blk,
+        raw_new=new_blk,
+        sbs_old_html=old_tbl,
+        sbs_new_html=tbl_html,
     )
 
   if old_blk.kind == "code" and new_blk.kind == "code":
@@ -1315,34 +1364,73 @@ def _render_paired_block(
     new_lines = new_blk.text.splitlines()
     sm = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
     code_parts: list[str] = []
+    old_parts: list[str] = []
+    new_parts: list[str] = []
     del_w = 0
     ins_w = 0
     any_chg = False
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
       if tag == "equal":
         for ln in old_lines[i1:i2]:
-          code_parts.append(html.escape(ln))
+          esc = html.escape(ln)
+          code_parts.append(esc)
+          old_parts.append(esc)
+          new_parts.append(esc)
       else:
         any_chg = True
         for ln in old_lines[i1:i2]:
           del_w += len(ln.split())
-          code_parts.append(f"<del>{html.escape(ln)}</del>")
+          d_ln = f"<del>{html.escape(ln)}</del>"
+          code_parts.append(d_ln)
+          old_parts.append(d_ln)
         for ln in new_lines[j1:j2]:
           ins_w += len(ln.split())
-          code_parts.append(f"<ins>{html.escape(ln)}</ins>")
+          i_ln = f"<ins>{html.escape(ln)}</ins>"
+          code_parts.append(i_ln)
+          new_parts.append(i_ln)
     cls_suffix = " block-mod" if any_chg else " block-eq"
+    h = f'<pre class="doc-block{cls_suffix}"><code>' + "\n".join(code_parts) + "</code></pre>"
+    sbs_o = f'<pre class="doc-block{cls_suffix}"><code>' + "\n".join(old_parts) + "</code></pre>"
+    sbs_n = f'<pre class="doc-block{cls_suffix}"><code>' + "\n".join(new_parts) + "</code></pre>"
     return RenderedBlock(
         kind="code",
-        html=f'<pre class="doc-block{cls_suffix}"><code>' + "\n".join(code_parts) + "</code></pre>",
+        html=h,
         changed=any_chg,
         state="modified" if any_chg else "equal",
         del_words=del_w,
         ins_words=ins_w,
+        raw_old=old_blk,
+        raw_new=new_blk,
+        sbs_old_html=sbs_o,
+        sbs_new_html=sbs_n,
     )
 
   diff_html, del_w, ins_w, chg = diff_inline_markdown(
       old_blk.text, new_blk.text, max_equal_words=max_equal_words
   )
+  old_rendered = render_inline_tokens(tokenize_inline_markdown(old_blk.text))
+  new_rendered = render_inline_tokens(tokenize_inline_markdown(new_blk.text))
+
+  # When >55% of a prose block's words are replaced (and it has >=6 words),
+  # avoid an unreadable alternating word-salad zebra by stacking clean Was / Now blocks
+  old_wc = len(old_blk.norm_words())
+  new_wc = len(new_blk.norm_words())
+  if (
+      chg
+      and old_blk.kind in ("p", "li", "alert", "blockquote")
+      and new_blk.kind in ("p", "li", "alert", "blockquote")
+      and max(old_wc, new_wc) >= 6
+      and (del_w + ins_w) / max(1, old_wc + new_wc) > 0.55
+  ):
+    diff_html = (
+        '<span class="rewrite-stack">'
+        f'<span class="rewrite-was"><span class="rewrite-tag">Было</span> '
+        f"<del>{old_rendered}</del></span>"
+        f'<span class="rewrite-now"><span class="rewrite-tag">Стало</span> '
+        f"<ins>{new_rendered}</ins></span>"
+        "</span>"
+    )
+
   # Check if structural marker changed (e.g. bullet became paragraph or vice versa)
   struct_note = ""
   if old_blk.kind != new_blk.kind:
@@ -1352,42 +1440,58 @@ def _render_paired_block(
     elif old_blk.kind == "p" and new_blk.kind == "li":
       struct_note = '<span class="struct-badge" title="Was paragraph">was ¶</span> '
 
-  cls_suffix = " block-mod" if chg else " block-eq"
-  state = "modified" if chg else "equal"
-  inner = struct_note + diff_html
-
-  if new_blk.kind == "h":
-    lvl = max(1, min(6, new_blk.level))
-    h = f'<h{lvl} class="doc-block{cls_suffix}">{inner}</h{lvl}>'
-  elif new_blk.kind == "li":
-    val_attr = (
-        f' value="{new_blk.list_num}"'
-        if new_blk.list_type == "ol" and new_blk.list_num
-        else ""
+  move_badge = ""
+  dom_id = ""
+  if move_info is not None:
+    src_id, dst_id, old_sec = move_info
+    dom_id = dst_id
+    chg = True
+    move_badge = (
+        f'<a class="move-badge" href="#{html.escape(src_id, quote=True)}">'
+        f"↕ Перенесено из «{html.escape(old_sec)}»</a> "
     )
-    indent_cls = f" indent-{new_blk.level}" if new_blk.level > 0 else ""
-    h = f'<li class="doc-block{cls_suffix}{indent_cls}"{val_attr}>{inner}</li>'
-  elif new_blk.kind == "alert":
+
+  if move_info is not None:
+    cls_suffix = " block-moved"
+    state = "moved"
+  else:
+    cls_suffix = " block-mod" if chg else " block-eq"
+    state = "modified" if chg else "equal"
+
+  inner = move_badge + struct_note + diff_html
+
+  if new_blk.kind == "alert":
     ak = new_blk.alert_type.lower() or "note"
     if old_blk.kind == "alert" and old_blk.alert_type != new_blk.alert_type:
       chg = True
-      cls_suffix = " block-mod"
-      state = "modified"
+      if move_info is None:
+        cls_suffix = " block-mod"
+        state = "modified"
       alert_hdr = (
           f"<del>{html.escape(old_blk.alert_type or 'NOTE')}</del> "
           f"<ins>{html.escape(new_blk.alert_type or 'NOTE')}</ins>"
       )
     else:
       alert_hdr = html.escape(new_blk.alert_type or "NOTE")
+    id_attr = f' id="{html.escape(dom_id, quote=True)}"' if dom_id else ""
     h = (
-        f'<div class="doc-block alert alert-{ak}{cls_suffix}">'
+        f'<div{id_attr} class="doc-block alert alert-{ak}{cls_suffix}">'
         f'<div class="alert-title">{alert_hdr}</div>'
         f"<div>{inner}</div></div>"
     )
-  elif new_blk.kind == "blockquote":
-    h = f'<blockquote class="doc-block{cls_suffix}">{inner}</blockquote>'
   else:
-    h = f'<p class="doc-block{cls_suffix}">{inner}</p>'
+    h = _wrap_block_shell(new_blk, inner, cls_suffix, dom_id=dom_id)
+
+  sbs_old = _wrap_block_shell(
+      old_blk,
+      f"<del>{old_rendered}</del>" if chg else old_rendered,
+      " block-del" if chg else " block-eq",
+  )
+  sbs_new = _wrap_block_shell(
+      new_blk,
+      move_badge + (f"<ins>{new_rendered}</ins>" if chg else new_rendered),
+      cls_suffix,
+  )
 
   return RenderedBlock(
       kind=new_blk.kind,
@@ -1399,6 +1503,10 @@ def _render_paired_block(
       list_num=new_blk.list_num,
       del_words=del_w,
       ins_words=ins_w,
+      raw_old=old_blk,
+      raw_new=new_blk,
+      sbs_old_html=sbs_old,
+      sbs_new_html=sbs_new,
   )
 
 
@@ -1484,6 +1592,76 @@ def diff_document_blocks(
       for k in range(prev_n, n_len):
         rendered.append(_render_single_block(slice_n[k], "inserted", max_equal_words))
 
+  # Second pass: pair relocated (moved) blocks across different positions
+  del_idxs = [
+      idx
+      for idx, rb in enumerate(rendered)
+      if rb.state == "deleted"
+      and rb.raw_old is not None
+      and len(rb.raw_old.norm_words()) >= 4
+  ]
+  ins_idxs = [
+      idx
+      for idx, rb in enumerate(rendered)
+      if rb.state == "inserted"
+      and rb.raw_new is not None
+      and len(rb.raw_new.norm_words()) >= 4
+  ]
+  move_candidates: list[tuple[float, int, int]] = []
+  for di in del_idxs:
+    for ij in ins_idxs:
+      ro = rendered[di].raw_old
+      rn = rendered[ij].raw_new
+      assert ro is not None and rn is not None
+      sim = _block_similarity(ro, rn)
+      if sim >= 0.50:
+        move_candidates.append((sim, di, ij))
+  move_candidates.sort(key=lambda x: x[0], reverse=True)
+  used_del: set[int] = set()
+  used_ins: set[int] = set()
+  move_seq = 0
+  for _, di, ij in move_candidates:
+    if di in used_del or ij in used_ins:
+      continue
+    used_del.add(di)
+    used_ins.add(ij)
+    move_seq += 1
+    ro = rendered[di].raw_old
+    rn = rendered[ij].raw_new
+    assert ro is not None and rn is not None
+    src_id = f"move-src-{move_seq}"
+    dst_id = f"move-dst-{move_seq}"
+
+    # Render moved block at destination with inline word diff and origin badge
+    rendered[ij] = _render_paired_block(
+        ro, rn, max_equal_words=max_equal_words, move_info=(src_id, dst_id, ro.section)
+    )
+
+    # Replace old position with a compact 1-line stub (zero word delta to avoid double counting)
+    preview_words = re.sub(r"[`*_]", "", ro.text).split()
+    preview = " ".join(preview_words[:8]) + ("…" if len(preview_words) > 8 else "")
+    stub_inner = (
+        f'<a class="move-stub-link" href="#{html.escape(dst_id, quote=True)}">'
+        f"↪ Перенесено в «{html.escape(rn.section)}»</a>: "
+        f'<span class="move-stub-preview">{html.escape(preview)}</span>'
+    )
+    stub_html = _wrap_block_shell(ro, stub_inner, " move-stub", dom_id=src_id)
+    old_full = _render_single_block(ro, "equal").html
+    rendered[di] = RenderedBlock(
+        kind=ro.kind,
+        html=stub_html,
+        changed=True,
+        state="moved_stub",
+        level=ro.level,
+        list_type=ro.list_type,
+        list_num=ro.list_num,
+        del_words=0,
+        ins_words=0,
+        raw_old=ro,
+        sbs_old_html=old_full,
+        sbs_new_html=stub_html,
+    )
+
   return rendered
 
 
@@ -1518,6 +1696,33 @@ def assemble_html_blocks(blocks: list[RenderedBlock]) -> str:
   return "\n".join(out)
 
 
+def assemble_sbs_blocks(blocks: list[RenderedBlock]) -> str:
+  """Render aligned 2-column side-by-side rows for 'Две колонки' mode."""
+  rows: list[str] = [
+      '<div class="sbs-header">'
+      '<div class="sbs-col-title">Было (база)</div>'
+      '<div class="sbs-col-title">Стало (текущая версия)</div>'
+      "</div>"
+  ]
+  for b in blocks:
+    row_cls = "sbs-row sbs-eq" if not b.changed else f"sbs-row sbs-{b.state}"
+    left = b.sbs_old_html or '<div class="sbs-empty">—</div>'
+    right = b.sbs_new_html or '<div class="sbs-empty">—</div>'
+    if b.kind == "li":
+      tag = b.list_type or "ul"
+      if left.startswith("<li"):
+        left = f'<{tag} class="doc-list">{left}</{tag}>'
+      if right.startswith("<li"):
+        right = f'<{tag} class="doc-list">{right}</{tag}>'
+    rows.append(
+        f'<div class="{row_cls}">'
+        f'<div class="sbs-cell sbs-left">{left}</div>'
+        f'<div class="sbs-cell sbs-right">{right}</div>'
+        "</div>"
+    )
+  return "\n".join(rows)
+
+
 # ---------------------------------------------------------------------------
 # 5. Full HTML Document Generation
 # ---------------------------------------------------------------------------
@@ -1537,6 +1742,7 @@ def render_redline_html(
       old_blocks, new_blocks, max_equal_words=max_equal_words
   )
   body_html = assemble_html_blocks(rendered_blocks)
+  sbs_html = assemble_sbs_blocks(rendered_blocks)
 
   old_words = len(old_text.split())
   new_words = len(new_text.split())
@@ -1544,8 +1750,15 @@ def render_redline_html(
   pct = (delta_words / old_words * 100.0) if old_words else 0.0
   del_words = sum(b.del_words for b in rendered_blocks)
   ins_words = sum(b.ins_words for b in rendered_blocks)
-  changed_blocks = sum(1 for b in rendered_blocks if b.changed)
-  total_blocks = len(rendered_blocks)
+  moved_blocks = sum(1 for b in rendered_blocks if b.state == "moved")
+  changed_blocks = sum(1 for b in rendered_blocks if b.changed and b.state != "moved_stub")
+  total_blocks = sum(1 for b in rendered_blocks if b.state != "moved_stub")
+
+  churn_ratio = (del_words + ins_words) / max(1, old_words + new_words)
+  default_mode = "sbs" if (churn_ratio > 0.50 and (old_words + new_words) >= 20) else "redline"
+  redline_active = " active" if default_mode == "redline" else ""
+  sbs_active = " active" if default_mode == "sbs" else ""
+  moved_pill = f" · перенесено: {moved_blocks}" if moved_blocks else ""
 
   delta_sign = "+" if delta_words > 0 else ""
   stats = {
@@ -1554,6 +1767,7 @@ def render_redline_html(
       "delta_words": delta_words,
       "del_words": del_words,
       "ins_words": ins_words,
+      "moved_blocks": moved_blocks,
       "changed_blocks": changed_blocks,
       "total_blocks": total_blocks,
   }
@@ -1730,14 +1944,132 @@ def render_redline_html(
     padding: 0 0.35rem;
     margin-right: 0.25rem;
   }}
+  /* Moved blocks and stubs */
+  .block-moved {{
+    border-left: 3px solid #8250df;
+    padding-left: 0.65rem;
+    background: rgba(130, 80, 223, 0.04);
+    border-radius: 0 4px 4px 0;
+  }}
+  .move-badge {{
+    display: inline-block;
+    font-size: 0.76rem;
+    font-weight: 600;
+    color: #6639ba;
+    background: #fbefff;
+    border: 1px solid #d8b9ff;
+    border-radius: 4px;
+    padding: 0.05rem 0.42rem;
+    margin-right: 0.35rem;
+    text-decoration: none;
+  }}
+  .move-badge:hover {{ text-decoration: underline; }}
+  .move-stub {{
+    font-size: 0.85rem;
+    color: var(--muted-fg);
+    background: var(--surface-bg);
+    border: 1px dashed var(--border-col);
+    border-radius: 5px;
+    padding: 0.28rem 0.65rem;
+    margin: 0.4em 0;
+  }}
+  .move-stub-link {{
+    color: #6639ba;
+    font-weight: 600;
+    text-decoration: none;
+  }}
+  .move-stub-link:hover {{ text-decoration: underline; }}
+  .move-stub-preview {{
+    font-style: italic;
+    color: var(--muted-fg);
+  }}
+  /* Whole-block Was / Now stack for heavy paragraph rewrites (>55% churn) */
+  .rewrite-stack {{
+    display: block;
+    border: 1px solid var(--border-col);
+    border-radius: 6px;
+    overflow: hidden;
+    margin: 0.25em 0;
+  }}
+  .rewrite-was, .rewrite-now {{
+    display: block;
+    padding: 0.45rem 0.7rem;
+  }}
+  .rewrite-was {{
+    background: #fff5f5;
+    border-bottom: 1px dashed var(--del-border);
+  }}
+  .rewrite-now {{
+    background: #f3fbf5;
+  }}
+  .rewrite-tag {{
+    display: inline-block;
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 0.05rem 0.38rem;
+    border-radius: 3px;
+    margin-right: 0.4rem;
+    background: rgba(0, 0, 0, 0.06);
+    color: var(--muted-fg);
+  }}
+  /* Side-by-side 2-column mode */
+  #redline-sbs {{ display: none; }}
+  body[data-mode="sbs"] {{ max-width: 1380px; }}
+  body[data-mode="sbs"] #redline-flow {{ display: none; }}
+  body[data-mode="sbs"] #redline-sbs {{ display: block; }}
+  .sbs-header {{
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    font-weight: 600;
+    font-size: 0.88rem;
+    color: var(--muted-fg);
+    padding: 0.4rem 0.75rem;
+    border-bottom: 2px solid var(--border-col);
+    margin-bottom: 0.5rem;
+  }}
+  .sbs-row {{
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    padding: 0.35rem 0;
+    border-bottom: 1px solid #eef1f4;
+    align-items: start;
+  }}
+  .sbs-cell {{ min-width: 0; overflow-x: auto; }}
+  .sbs-empty {{
+    color: var(--muted-fg);
+    font-size: 0.84rem;
+    font-style: italic;
+    padding: 0.4rem 0.6rem;
+    background: var(--surface-bg);
+    border-radius: 4px;
+  }}
   /* View modes */
   body[data-mode="new"] del,
   body[data-mode="new"] .block-del,
-  body[data-mode="new"] .row-del {{ display: none !important; }}
+  body[data-mode="new"] .row-del,
+  body[data-mode="new"] .move-stub,
+  body[data-mode="new"] .move-badge,
+  body[data-mode="new"] .rewrite-was,
+  body[data-mode="new"] .rewrite-tag {{ display: none !important; }}
+  body[data-mode="new"] .rewrite-stack {{ border: none; margin: 0; }}
+  body[data-mode="new"] .rewrite-now {{ background: transparent; padding: 0; }}
+  body[data-mode="new"] .block-moved {{
+    border-left: none;
+    padding-left: 0;
+    background: transparent;
+  }}
   body[data-mode="new"] ins {{ background: transparent; color: inherit; padding: 0; }}
   body[data-mode="old"] ins,
   body[data-mode="old"] .block-ins,
-  body[data-mode="old"] .row-ins {{ display: none !important; }}
+  body[data-mode="old"] .row-ins,
+  body[data-mode="old"] .rewrite-now,
+  body[data-mode="old"] .rewrite-tag {{ display: none !important; }}
+  body[data-mode="old"] .rewrite-stack {{ border: none; margin: 0; }}
+  body[data-mode="old"] .rewrite-was {{ background: transparent; border: none; padding: 0; }}
   body[data-mode="old"] del {{
     background: transparent;
     color: inherit;
@@ -1751,7 +2083,7 @@ def render_redline_html(
   body[data-mode="changes"] .block-eq:hover {{ opacity: 1; }}
 </style>
 </head>
-<body data-mode="redline">
+<body data-mode="{default_mode}">
 <div class="legend">
   <div class="legend-meta">
     <span>
@@ -1761,19 +2093,26 @@ def render_redline_html(
     <span class="stats-pill"
           title="Base: {html.escape(base_label)} → New: {html.escape(new_label)}">
       {old_words} → {new_words} слов ({delta_sign}{delta_words}, {delta_sign}{pct:.1f}%)
-      · изменено блоков: {changed_blocks}/{total_blocks}
+      · изменено блоков: {changed_blocks}/{total_blocks}{moved_pill}
     </span>
     <span class="stats-pill">База: {html.escape(base_label)}</span>
   </div>
   <div class="mode-bar" role="group" aria-label="View mode">
-    <button class="mode-btn active" onclick="setMode('redline', this)">Было → Стало</button>
+    <button class="mode-btn{redline_active}"
+            onclick="setMode('redline', this)">Было → Стало</button>
+    <button class="mode-btn{sbs_active}" onclick="setMode('sbs', this)">Две колонки</button>
     <button class="mode-btn" onclick="setMode('changes', this)">Фокус на правках</button>
     <button class="mode-btn" onclick="setMode('new', this)">Чистый итог</button>
     <button class="mode-btn" onclick="setMode('old', this)">База</button>
   </div>
 </div>
 <main id="redline-root">
+<div id="redline-flow">
 {body_html}
+</div>
+<div id="redline-sbs">
+{sbs_html}
+</div>
 </main>
 <script>
 function setMode(mode, btn) {{

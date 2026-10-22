@@ -265,6 +265,41 @@ class RedlineTest(unittest.TestCase):
         page,
     )
 
+  def test_move_detection_pairs_relocated_paragraph_with_inline_diff_and_stub(self):
+    old = (
+        "## Раздел А\n\n"
+        "Первый абзац остаётся на месте без изменений.\n\n"
+        "## Раздел Б\n\n"
+        "Этот важный абзац про кэширование глифов в CoreText переедет наверх с правкой 10 мс.\n"
+    )
+    new = (
+        "## Раздел А\n\n"
+        "Этот важный абзац про кэширование глифов в CoreText переедет наверх с правкой 25 мс.\n\n"
+        "Первый абзац остаётся на месте без изменений.\n\n"
+        "## Раздел Б\n"
+    )
+    page, stats = redline.render_redline_html(old, new)
+    self.assertEqual(stats["moved_blocks"], 1)
+    self.assertIn("↕ Перенесено из «Раздел Б»", page)
+    self.assertIn("↪ Перенесено в «Раздел А»", page)
+    self.assertIn("<del>10</del> <ins>25</ins> мс.", page)
+
+  def test_heavy_rewrite_uses_stacked_was_now_and_sbs_auto_mode(self):
+    old = (
+        "Старая архитектура использовала синхронный вызов парсера таблиц шрифтов "
+        "при каждом создании процесса приложения на старте системы.\n"
+    )
+    new = (
+        "В новой схеме потоки рендеринга запрашивают дескрипторы шрифтов лениво "
+        "через системный кэш без блокировки главного цикла.\n"
+    )
+    # Pair as 1-to-1 paragraph replacement where >55% of words changed
+    page, _ = redline.render_redline_html(old, new)
+    self.assertIn('class="rewrite-stack"', page)
+    self.assertIn('<span class="rewrite-tag">Было</span>', page)
+    self.assertIn('<span class="rewrite-tag">Стало</span>', page)
+    self.assertIn('<body data-mode="sbs">', page)
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -27,6 +27,10 @@ Code has a compiler; prose documents do not, and incoming specs or code snippets
    - **Applies to**: Short 1–3 sentence chat replies, brief inline review comments, or small single-hunk commit messages where all referenced lines are already open in the current turn's context.
    - **Required Action**: Do not spawn a subagent for trivial replies, but **never** type a file path, directory name, skill/target name, class/function identifier, CLI flag, or commit SHA from memory or by paraphrasing section headings. Every identifier must match the repository character-for-character.
 
+4. **Automatic Redline on Document Updates (`redline`)**:
+   - **Applies to**: Any edit, shortening, translation, or restructuring of an existing document (Markdown file, artifact, design doc, specification, or Google Doc) that the user has already seen in earlier turns of the conversation, whenever the change touches more than 1 line or 15 words.
+   - **Required Action**: Automatically run `python3 ~/.gemini/config/skills/redline/scripts/redline.py` against the last version the user saw, verify the generated `<stem>_diff.html` via headless browser screenshot (`browser_navigate`, `browser_get_console_logs`, `browser_capture_screenshot`), and link `<stem>_diff.html` alongside the updated document without waiting for the user to ask `"покажи изменения"`.
+
 ## 2. Incoming & Outgoing Code (`amnesia-precommit` & KEEPER Invariants)
 
 1. **Outgoing Repository Code Changes -> Run `amnesia-precommit`**:

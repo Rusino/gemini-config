@@ -26,13 +26,19 @@ This skill produces a standalone, browser-ready HTML document (`<stem>_diff.html
    granularity while keeping inline code spans (`` `symbol` ``) atomic.
 3. **Coalesces small edits** separated by at most 4 unchanged words (configurable via
    `--coalesce-words`) into a single `<del>было</del> <ins>стало</ins>` phrase block so sentences
-   never turn into alternating word salad.
-4. **Defaults the comparison base to the last version the user saw** (`turn_boundary` in
+   never turn into alternating word salad, while falling back to a clean stacked `Было / Стало`
+   block whenever more than 55% of a paragraph's words are rewritten.
+4. **Detects moved blocks (`Move Detection`)** across sections in a second pass, pairing relocated
+   paragraphs or list items (`similarity >= 0.50`) so only the actual word changes inside the moved
+   block are highlighted at the new position (`↕ Перенесено из «...»`) while leaving a compact
+   1-line link stub (`↪ Перенесено в «...»`) at the old position.
+5. **Defaults the comparison base to the last version the user saw** (`turn_boundary` in
    `transcript_full.jsonl` or `transcript.jsonl`, falling back to `git show HEAD:<path>` or
    `HEAD~1:<path>`).
-5. **Includes a sticky top bar** with word-count delta (`was -> now`), changed-block count, base
-   version label, and one-click view modes (`Было → Стало`, `Фокус на правках`, `Чистый итог`,
-   `База`).
+6. **Includes a sticky top bar** with word-count delta (`was -> now`), changed-block count, base
+   version label, and one-click view modes (`Было → Стало`, `Две колонки (Было | Стало)`,
+   `Фокус на правках`, `Чистый итог`, `База`), automatically opening in `Две колонки` mode when
+   more than 50% of the document's words changed.
 
 > [!NOTE]
 > For external collaboration directly inside Google Docs where reviewers use native Google Docs
