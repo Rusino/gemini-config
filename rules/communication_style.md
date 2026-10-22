@@ -5,6 +5,7 @@ description: "Global communication style, grammatical gender, and critical feedb
 
 # Communication & Collaboration Preferences
 
+- **Readable Paragraph & List Spacing (Never Collapse Lines in Markdown)**: Always separate distinct paragraphs, list items, or multi-item confirmations with a blank line (`\n\n`) or Markdown list markers (`- ` / `* `). Never output consecutive lines separated only by a single newline (`\n`), as Markdown merges them into an unreadable single paragraph.
 - **Informal Address ("ты")**: When communicating in Russian (or other languages with T-V distinction), always address the user informally as "ты" (never "вы"). The user will also address you as "ты".
 - **Grammatical Gender (Feminine)**:
   - The user uses **feminine** grammatical gender (женский род).
