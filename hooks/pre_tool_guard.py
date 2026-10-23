@@ -1051,20 +1051,34 @@ def _cross_project_paths(artifact_dir: str, conv_id: str) -> tuple[str, str]:
 def _extract_cmd_target_dirs(cmd: str, workspace_paths: list[str]) -> list[str]:
   """Candidate directories targeted by a git or build command."""
   cmd_code = strip_heredocs(cmd)
-  dirs: list[str] = []
-  # Match explicit directory switches and build output directories
-  for m in re.finditer(r"(?:^|[\s;&|(`])cd\s+[\"']?([^\"'\s;&|)`]+)[\"']?", cmd_code):
-    dirs.append(os.path.abspath(os.path.expanduser(m.group(1))))
-  for m in re.finditer(r"\bgit\s+-C\s+[\"']?([^\"'\s;&|)`]+)[\"']?", cmd_code):
-    dirs.append(os.path.abspath(os.path.expanduser(m.group(1))))
-  for m in re.finditer(
-      r"\b(?:auto)?(?:ninja|siso)\s+-C\s+[\"']?([^\"'\s;&|)`]+)[\"']?", cmd_code
-  ):
-    dirs.append(os.path.abspath(os.path.expanduser(m.group(1))))
   from context_guard import WORKSPACE_ROOT_RE
 
-  for m in WORKSPACE_ROOT_RE.findall(cmd_code):
-    dirs.append(os.path.abspath(os.path.expanduser(m)))
+  path_arg = r"[\"']?([^\"'\s;&|)`]+)[\"']?"
+  patterns = [
+      ("cd", re.compile(r"(?:^|[\s;&|(`])cd\s+" + path_arg)),
+      ("arg", re.compile(r"\bgit\s+-C\s+" + path_arg)),
+      ("arg", re.compile(r"\b(?:auto)?(?:ninja|siso)\s+-C\s+" + path_arg)),
+      ("arg", WORKSPACE_ROOT_RE),
+  ]
+  matches = sorted(
+      (m.start(), kind, m.group(1))
+      for kind, rx in patterns
+      for m in rx.finditer(cmd_code)
+  )
+  # Relative paths (`ninja -C out/Static`) are relative to the shell's cwd after the last
+  # `cd`, never to the hook process's cwd, which may be a foreign project's root
+  base = next((os.path.expanduser(wp) for wp in workspace_paths if wp), "")
+  dirs: list[str] = []
+  for _, kind, raw in matches:
+    path = os.path.expanduser(raw)
+    if not os.path.isabs(path):
+      if not base:
+        continue
+      path = os.path.join(base, path)
+    path = os.path.normpath(path)
+    dirs.append(path)
+    if kind == "cd":
+      base = path
   if not dirs:
     for wp in workspace_paths:
       if wp:

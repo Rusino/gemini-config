@@ -723,6 +723,41 @@ class TestPreToolGuard(unittest.TestCase):
         self.assertEqual(out_commit.get("decision"), "deny")
         self.assertIn("CROSS-PROJECT SCOPE GUARD", out_commit.get("reason", ""))
 
+        # Relative build dirs resolve against the preceding `cd`, not the hook's own cwd,
+        # even when that cwd is the foreign root and the command runs a script from it
+        prev_cwd = os.getcwd()
+        os.makedirs(ws_ts, exist_ok=True)
+        os.chdir(ws_ts)
+        try:
+          for tail in ("", f"; python3 {ws_ts}/skills/audit.py --repo . --diff HEAD~1"):
+            out_rel = self.run_guard({
+                "conversationId": "c1",
+                "transcriptPath": transcript,
+                "artifactDirectoryPath": artifact_dir,
+                "workspacePaths": [ws_ts],
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": (
+                        f"cd {ws_hack} && python3 - <<'EOF'\nprint(1)\nEOF\n"
+                        "third_party/ninja/ninja -C out/Static dm && git add -- a.cpp && "
+                        "git commit --amend --no-edit -q" + tail
+                    )},
+                },
+            })
+            self.assertNotIn("CROSS-PROJECT", out_rel.get("reason", ""))
+          out_rel_cd = self.run_guard({
+              "conversationId": "c1",
+              "transcriptPath": transcript,
+              "artifactDirectoryPath": artifact_dir,
+              "toolCall": {
+                  "name": "run_command",
+                  "args": {"CommandLine": f"cd {ws_hack} && cd ../webparagraph-ts && git commit -m x"},
+              },
+          })
+          self.assertEqual(out_rel_cd.get("decision"), "deny")
+        finally:
+          os.chdir(prev_cwd)
+
         # Editing own workspace or a shared multi-project repo is allowed
         self.assertEqual(
             self.run_guard({
