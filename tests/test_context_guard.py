@@ -435,6 +435,38 @@ class TestContextGuard(unittest.TestCase):
       self.assertIn("doing: R1", msg)
       self.assertIn("flutter_perf_r16", msg)
 
+  # Verify Russian and English challenge phrases inject the pre-mortem & alternatives directive
+  def test_critical_challenge_trigger_injects_on_russian_and_english_phrases(self):
+    with patch.object(chat_lifecycle, "auto_title_conversation", return_value=""), \
+         patch.object(context_guard, "summary_db_paths", return_value=[]):
+      for phrase in (
+          "Давай уберем проверку тут. Что думаешь?",
+          "Может просто кэшировать? Поспорь, если не согласна",
+          "We could skip layout here. What do you think?",
+          "Let's add a flag here, WDYT?",
+          "Push back if you disagree with this approach",
+          "Can you poke holes in this design?",
+      ):
+        out = self.run_guard(inv=0, lastUserInput=phrase)
+        msg = self.message(out)
+        self.assertIn(
+            "CRITICAL CHALLENGE TRIGGER: PRE-MORTEM & ALTERNATIVES",
+            msg,
+            f"Missing trigger for: {phrase}",
+        )
+        self.assertIn("Mandatory alternative", msg)
+        self.assertIn("No forced contrarianism", msg)
+
+      # Mid-turn invocations and neutral prompts must not inject the trigger
+      self.assertEqual(
+          self.run_guard(inv=1, lastUserInput="Что думаешь?"),
+          {},
+      )
+      self.assertEqual(
+          self.run_guard(inv=0, lastUserInput="Запусти тесты, пожалуйста"),
+          {},
+      )
+
 
 if __name__ == "__main__":
   unittest.main()

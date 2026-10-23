@@ -748,6 +748,65 @@ def build_scope_radar_notice(
   return "\n".join(blocks)
 
 
+# Match Russian and English evaluation phrases so recency bias does not cause rubber-stamping
+CRITICAL_CHALLENGE_RE = re.compile(
+    r"(?:"
+    r"что(?:\s+ты(?:\s+об\s+этом)?)?\s+думаешь"
+    r"|что\s+скажешь"
+    r"|как\s+(?:ты\s+)?(?:думаешь|считаешь)"
+    r"|поспорь(?:\s*,?\s*если\s+не\s+согласна)?"
+    r"|возрази(?:\s*,?\s*если\s+не\s+согласна)?"
+    r"|если\s+не\s+согласна"
+    r"|покритикуй"
+    r"|найди\s+(?:дыры|ошибки|подводные\s+камни|слабые\s+места)"
+    r"|проверь\s+альтернативы"
+    r"|так\s+ведь\s*\?"
+    r"|согласна\s*\?"
+    r"|what\s+do\s+you\s+think"
+    r"|\bwdyt\b"
+    r"|any\s+thoughts\s*\?"
+    r"|\bthoughts\s*\?"
+    r"|what\s+say\s+you"
+    r"|push\s+back(?:\s+if\s+you\s+disagree)?"
+    r"|argue\s+if\s+you\s+disagree"
+    r"|disagree\s+with\s+me"
+    r"|poke\s+holes"
+    r"|play\s+devil'?s\s+advocate"
+    r"|stress[- ]test\s+(?:this|it)"
+    r"|challenge\s+(?:this|me|it)"
+    r"|am\s+i\s+missing\s+anything"
+    r"|does\s+(?:this|that)\s+make\s+sense\s*\?"
+    r")",
+    re.IGNORECASE,
+)
+
+
+# Inject a pre-mortem and alternatives directive when the user asks to challenge or evaluate
+def build_critical_challenge_notice(last_user_input: str) -> str:
+  if not last_user_input or re.search(
+      r"Continuing unfinished work from previous conversation", last_user_input
+  ):
+    return ""
+  m = CRITICAL_CHALLENGE_RE.search(last_user_input)
+  if not m:
+    return ""
+  matched = re.sub(r"\s+", " ", m.group(0).strip())
+  return (
+      "[CRITICAL CHALLENGE TRIGGER: PRE-MORTEM & ALTERNATIVES]\n"
+      f'The user explicitly asked for critical evaluation ("{matched}"). '
+      "Treat this as a command to run an adversarial pre-mortem, NOT a social cue for approval:\n"
+      "1. Falsify first: assume the proposed idea or diagnosis has a flaw or breaks an invariant "
+      "(`glyph bounds`, `grapheme cluster`, `trailing spaces`, `strut`, BiDi, selection, caching, "
+      "hot-path allocations) and check the actual source code.\n"
+      "2. Mandatory alternative: formulate at least one concrete orthogonal or simpler "
+      "alternative (including fixing the invariant higher up or deleting code instead of adding a "
+      "branch) and compare trade-offs.\n"
+      "3. No forced contrarianism: if the proposal genuinely holds up after checking code and "
+      "alternatives, do NOT invent cosmetic nitpicks — state the exact failure modes and "
+      "alternatives you tested and why the proposal wins."
+  )
+
+
 # Tool results may indent this line (e.g. "\n\n\t\t\t\tThe command exited ..." on
 # macOS Jetski), so allow leading whitespace; otherwise the guard never fires.
 EXIT_CODE_RE = re.compile(r"^\s*The command exited with code (\d+)\.", re.MULTILINE)
@@ -1405,6 +1464,10 @@ def run(data: dict, log: dict) -> dict:
       sync_notice = build_git_sync_notice(conv_id, workspace_paths)
       if sync_notice:
         messages.append(sync_notice)
+      # Inject critical challenge directive at turn start when prompt contains evaluation triggers
+      challenge_notice = build_critical_challenge_notice(last_user_input)
+      if challenge_notice:
+        messages.append(challenge_notice)
     soft_due = steps - int(
         state.get("soft_last_steps", -SOFT_REMIND_EVERY_STEPS)
     ) >= SOFT_REMIND_EVERY_STEPS
