@@ -1406,6 +1406,9 @@ class TestPreToolGuard(unittest.TestCase):
 
   # Verify runaway source-file reading sprees in the main chat are blocked until a subagent is used
   def test_exploration_circuit_breaker_blocks_runaway_source_reads(self):
+    # Read targets are never opened, but they must sit outside /tmp/: Linux temp dirs
+    # live there and is_agent_internal_file exempts it, while macOS uses /var/folders
+    src_root = os.path.join(os.sep, "breaker_test_src")
     with tempfile.TemporaryDirectory() as tmp_dir:
       trans = os.path.join(tmp_dir, "transcript.jsonl")
       steps = [{"step_index": 0, "type": "USER_INPUT", "content": "explain bug"}]
@@ -1415,7 +1418,7 @@ class TestPreToolGuard(unittest.TestCase):
             "type": "PLANNER_RESPONSE",
             "tool_calls": [{
                 "name": "read_file",
-                "args": {"Path": os.path.join(tmp_dir, f"src_{i % 5}.cpp")},
+                "args": {"Path": os.path.join(src_root, f"src_{i % 5}.cpp")},
             }],
         })
       with open(trans, "w", encoding="utf-8") as f:
@@ -1428,7 +1431,7 @@ class TestPreToolGuard(unittest.TestCase):
           "transcriptPath": trans,
           "toolCall": {
               "name": "read_file",
-              "args": {"Path": os.path.join(tmp_dir, "src_0.cpp")},
+              "args": {"Path": os.path.join(src_root, "src_0.cpp")},
           },
       })
       self.assertEqual(out.get("decision"), "deny")
@@ -1441,7 +1444,7 @@ class TestPreToolGuard(unittest.TestCase):
           "transcriptPath": trans,
           "toolCall": {
               "name": "read_file",
-              "args": {"Path": os.path.join(tmp_dir, "src_0.cpp")},
+              "args": {"Path": os.path.join(src_root, "src_0.cpp")},
           },
       })
       self.assertEqual(out_sub.get("decision"), "allow")
