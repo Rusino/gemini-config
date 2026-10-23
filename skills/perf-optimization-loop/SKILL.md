@@ -55,11 +55,19 @@ For each hypothesis:
 2. **Profile first**: pick the hypothesis from a profile (perf, Chrome DevTools, `--trace`),
    not from intuition. Prefer ideas that delete work (a pass, a copy, an allocation, a
    re-shape) over ideas that add machinery (caches, tables, new state).
-3. **Measure** baseline and candidate with the same binary config, interleaved when possible
-   (A B A B), then run `bench_compare.py before.json after.json --unit us`.
+3. **Measure** baseline and candidate with the same binary config in at least 2 rounds,
+   interleaved (A B A B), and pass the round files comma-separated in the same order:
+   `bench_compare.py old.r1.json,old.r2.json new.r1.json,new.r2.json --unit us`.
+   - **Preflight every run**: `uptime` load average well below `nproc` and no parallel
+     `ninja` / `clang` / `felt` / `flutter test` (`ps aux`); re-check after the last round.
+     Concurrent builds shift whole runs by 2–3x and produce fake −60% / +180% "results".
+   - A single round can show a confident `REGRESSION` that other rounds do not reproduce;
+     that is why a pooled `WIN` / `REGRESSION` becomes `INCONSISTENT` unless every round
+     agrees, and `UNREPLICATED` with one round.
 4. **Decide** from the verdict:
    - `WIN` on the target metric and no `REGRESSION` elsewhere: commit (step 5)
    - `NOISE`: revert, `add --status NOISE --reason "<delta, CI>"`
+   - `INCONSISTENT` / `UNREPLICATED`: not a result yet; check machine load and re-measure
    - `REGRESSION` or test failures: revert, `add --status REJECTED --reason "<why>"`
 5. **Commit** exactly one optimization per commit. Paste all `Perf:` trailers from
    `bench_compare.py` (they end with the verdict) into the message above `Assisted-by:` /

@@ -19,8 +19,8 @@ import sys
 # Resolved via the script's own directory, which Python puts first on sys.path
 import opt_ledger
 
-PERF_RE = re.compile(
-    r"^Perf:\s+(\S+)\s.*?\(([+-]?[\d.]+)%.*\)\s*(WIN|NOISE|REGRESSION)?\s*$", re.M)
+PERF_RE = re.compile(r"^Perf:\s+(\S+)\s.*?\(([+-]?[\d.]+)%.*\)\s*"
+                     r"(WIN|NOISE|REGRESSION|INCONSISTENT|UNREPLICATED)?\s*$", re.M)
 TEST_RE = re.compile(r"(^|/)(tests?|testing|benchmarks?|bench)/|_test\.|Test\.|_tests?\.|"
                      r"\.(md|txt|json|yaml|png)$")
 MACHINERY_RE = re.compile(
