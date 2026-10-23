@@ -50,6 +50,7 @@ Implements nine mechanical guards:
 # only fails open): make each edit self-contained or mv a finished copy into
 # place (it must stay executable), then run tests/run_all_tests.py
 
+from __future__ import annotations
 import ast
 import glob
 import json
@@ -712,6 +713,81 @@ def was_doc_grounding_run_in_chat(
         ) or tname.endswith("_update_doc"):
           consumed_by_update_doc = True
   return grounding_available
+
+
+# Cap consecutive source-file reads in a single main-chat turn without a subagent
+MAX_TURN_SOURCE_READ_CALLS = int(
+    os.environ.get("JETSKI_MAX_TURN_SOURCE_READS", "15")
+)
+MAX_TURN_SOURCE_READ_FILES = int(
+    os.environ.get("JETSKI_MAX_TURN_SOURCE_FILES", "4")
+)
+_NON_SOURCE_READ_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf")
+
+
+def exploration_circuit_breaker_denial(
+    tool_name: str,
+    tool_args: dict,
+    parent_conv_id: str,
+    transcript_path: str,
+    current_step_idx: int = -1,
+) -> str:
+  """Blocks runaway source-file reading sprees in the main chat without a subagent"""
+  if parent_conv_id or tool_name not in READ_TOOLS:
+    return ""
+  target_file = get_tool_target_file(tool_args)
+  if not target_file or is_agent_internal_file(target_file):
+    return ""
+  if target_file.lower().endswith(_NON_SOURCE_READ_EXTS):
+    return ""
+
+  steps = _load_transcript_steps(transcript_path, current_step_idx)
+  read_calls = 0
+  distinct_files: set[str] = set()
+  for step in reversed(steps):
+    stype = step.get("type", "")
+    if stype == "USER_INPUT":
+      break
+    if stype != "PLANNER_RESPONSE":
+      continue
+    tcalls = step.get("tool_calls") or []
+    reset_streak = False
+    # Reset the read streak whenever the main chat delegates to a subagent or edits code
+    for tc in tcalls:
+      tname = tc.get("name", "")
+      if tname == "invoke_subagent" or tname in EDIT_TOOLS:
+        reset_streak = True
+        break
+    if reset_streak:
+      break
+    for tc in tcalls:
+      tname = tc.get("name", "")
+      if tname in READ_TOOLS:
+        f = get_tool_target_file(tc.get("args") or {})
+        if (
+            f
+            and not is_agent_internal_file(f)
+            and not f.lower().endswith(_NON_SOURCE_READ_EXTS)
+        ):
+          read_calls += 1
+          distinct_files.add(
+              os.path.abspath(os.path.expanduser(f.strip('"').strip("'")))
+          )
+
+  # Deny further main-chat reads once both call and file-breadth caps are reached
+  if (
+      read_calls >= MAX_TURN_SOURCE_READ_CALLS
+      and len(distinct_files) >= MAX_TURN_SOURCE_READ_FILES
+  ):
+    return (
+        f"[EXPLORATION CIRCUIT BREAKER] You have already made {read_calls} file-read "
+        f"calls across {len(distinct_files)} source files in this turn without delegating "
+        "to a subagent or editing code. Reading dozens of file chunks in the main chat "
+        "bloats the context window and causes generation collapse. Either answer the "
+        "user now with the facts already gathered, or delegate any further multi-file "
+        "exploration to `invoke_subagent` (`TypeName=\"research\"` or `\"self\"`)."
+    )
+  return ""
 
 
 def is_gitignored_or_build_cache(target_file: str) -> tuple[bool, str]:
@@ -2647,6 +2723,23 @@ def main() -> None:
       print(
           json.dumps(
               {"decision": "deny", "reason": pc_denial}, ensure_ascii=False
+          )
+      )
+      return
+
+  # Require subagent delegation when main-chat source-file reads exceed the turn cap
+  if tool_name in READ_TOOLS:
+    exp_denial = exploration_circuit_breaker_denial(
+        tool_name,
+        tool_args,
+        parent_conv_id,
+        transcript_path,
+        int(data.get("stepIdx", -1)),
+    )
+    if exp_denial:
+      print(
+          json.dumps(
+              {"decision": "deny", "reason": exp_denial}, ensure_ascii=False
           )
       )
       return

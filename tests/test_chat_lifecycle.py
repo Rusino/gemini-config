@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Tests for chat_lifecycle.py."""
 
+from __future__ import annotations
+
 import contextlib
 import io
 import json

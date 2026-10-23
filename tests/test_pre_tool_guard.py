@@ -1356,6 +1356,48 @@ class TestPreToolGuard(unittest.TestCase):
         # Second call does not repeat the already-notified commit
         self.assertEqual(context_guard.build_git_sync_notice("c1", [repo]), "")
 
+  # Verify runaway source-file reading sprees in the main chat are blocked until a subagent is used
+  def test_exploration_circuit_breaker_blocks_runaway_source_reads(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      trans = os.path.join(tmp_dir, "transcript.jsonl")
+      steps = [{"step_index": 0, "type": "USER_INPUT", "content": "explain bug"}]
+      for i in range(15):
+        steps.append({
+            "step_index": i + 1,
+            "type": "PLANNER_RESPONSE",
+            "tool_calls": [{
+                "name": "read_file",
+                "args": {"Path": os.path.join(tmp_dir, f"src_{i % 5}.cpp")},
+            }],
+        })
+      with open(trans, "w", encoding="utf-8") as f:
+        for s in steps:
+          f.write(json.dumps(s) + "\n")
+
+      # 16th source read in the main chat across 5 files is denied
+      out = self.run_guard({
+          "conversationId": "c1",
+          "transcriptPath": trans,
+          "toolCall": {
+              "name": "read_file",
+              "args": {"Path": os.path.join(tmp_dir, "src_0.cpp")},
+          },
+      })
+      self.assertEqual(out.get("decision"), "deny")
+      self.assertIn("EXPLORATION CIRCUIT BREAKER", out.get("reason", ""))
+
+      # Subagent conversations are allowed to read freely
+      out_sub = self.run_guard({
+          "conversationId": "sub1",
+          "parentConversationId": "c1",
+          "transcriptPath": trans,
+          "toolCall": {
+              "name": "read_file",
+              "args": {"Path": os.path.join(tmp_dir, "src_0.cpp")},
+          },
+      })
+      self.assertEqual(out_sub.get("decision"), "allow")
+
 
 if __name__ == "__main__":
   unittest.main()

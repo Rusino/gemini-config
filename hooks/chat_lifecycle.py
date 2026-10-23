@@ -100,6 +100,102 @@ def find_app_data_dirs() -> list[str]:
 
 
 _csrf_cache: dict[str, str] = {}
+# Cache the discovered desktop language_server endpoint across hook invocations
+LS_ENDPOINT_CACHE_FILE = "/tmp/jetski_ls_endpoint.json"
+
+
+def _pid_is_alive(pid: int) -> bool:
+  if pid <= 0:
+    return False
+  try:
+    os.kill(pid, 0)
+    return True
+  except OSError:
+    return False
+
+
+def discover_local_ls_endpoint() -> tuple[str, str]:
+  """Discovers the local desktop language_server HTTPS address and CSRF token"""
+  # Avoid probing the live desktop daemon during hermetic unit test runs
+  if "unittest" in sys.modules and not os.environ.get("JETSKI_TEST_ALLOW_LS_DISCOVERY"):
+    return "", ""
+  try:
+    if os.path.isfile(LS_ENDPOINT_CACHE_FILE):
+      with open(LS_ENDPOINT_CACHE_FILE, "r", encoding="utf-8") as f:
+        cached = json.load(f)
+      if (
+          isinstance(cached, dict)
+          and _pid_is_alive(int(cached.get("pid") or 0))
+          and cached.get("ls_address")
+          and cached.get("csrf_token")
+      ):
+        return str(cached["ls_address"]), str(cached["csrf_token"])
+  except Exception:
+    pass
+
+  try:
+    ps_out = subprocess.check_output(
+        ["ps", "-axo", "pid=,command="], text=True, timeout=1.0
+    )
+    candidates: list[tuple[int, int, str]] = []
+    for line in ps_out.splitlines():
+      if "language_server" not in line or "--csrf_token" not in line:
+        continue
+      m_pid = re.match(r"^\s*(\d+)\s+", line)
+      m_tok = re.search(r"--csrf_token\s+([0-9a-fA-F\-]+)", line)
+      if not (m_pid and m_tok):
+        continue
+      pid = int(m_pid.group(1))
+      # Prefer the standalone Antigravity hub daemon over background IDE extensions
+      prio = 0 if "--app_data_dir antigravity" in line else 1
+      candidates.append((prio, pid, m_tok.group(1)))
+
+    candidates.sort()
+    for _, pid, tok in candidates:
+      lsof_out = subprocess.check_output(
+          ["lsof", "-Pan", "-p", str(pid), "-iTCP", "-sTCP:LISTEN"],
+          text=True,
+          timeout=1.0,
+      )
+      m_port = re.search(r"127\.0\.0\.1:(\d+)\s+\(LISTEN\)", lsof_out)
+      if m_port:
+        addr = f"https://127.0.0.1:{m_port.group(1)}"
+        try:
+          with open(LS_ENDPOINT_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"pid": pid, "ls_address": addr, "csrf_token": tok}, f)
+        except OSError:
+          pass
+        return addr, tok
+  except Exception:
+    pass
+  return "", ""
+
+
+def get_ls_endpoint() -> tuple[str, str]:
+  """Resolves (ls_address, csrf_token) from env, web hub, or local desktop process"""
+  env_addr = os.environ.get("ANTIGRAVITY_LS_ADDRESS", "")
+  env_tok = os.environ.get("ANTIGRAVITY_CSRF_TOKEN", "")
+  if env_addr and env_tok:
+    return env_addr, env_tok
+  ls_address = env_addr or "localhost:5387"
+  tok = get_ls_csrf_token(ls_address)
+  if tok:
+    return ls_address, tok
+  if not env_addr:
+    disc_addr, disc_tok = discover_local_ls_endpoint()
+    if disc_addr and disc_tok:
+      return disc_addr, disc_tok
+  return ls_address, ""
+
+
+def _urlopen_ls(req: urllib.request.Request, timeout: float):
+  # Local desktop language_server uses an ephemeral self-signed localhost cert
+  if req.full_url.startswith(("https://127.0.0.1", "https://localhost")):
+    import ssl
+    return urllib.request.urlopen(
+        req, timeout=timeout, context=ssl._create_unverified_context()
+    )
+  return urllib.request.urlopen(req, timeout=timeout)
 
 
 def get_ls_csrf_token(ls_address: str) -> str:
@@ -114,7 +210,7 @@ def get_ls_csrf_token(ls_address: str) -> str:
   try:
     url = f"http://{ls_address}/" if not ls_address.startswith(("http://", "https://")) else ls_address
     req = urllib.request.Request(url, headers={"User-Agent": "chat_lifecycle"})
-    with urllib.request.urlopen(req, timeout=1.0) as resp:
+    with _urlopen_ls(req, timeout=1.0) as resp:
       html = resp.read().decode("utf-8", errors="ignore")
       m = re.search(r'"csrfToken":\s*"([^"]+)"', html)
       if m:
@@ -222,8 +318,7 @@ AGENTAPI_TIERS = ("flash_lite", "flash", "pro")
 
 def ls_rpc(method: str, body: dict, timeout: float = 20.0) -> dict:
   """Calls a Language Server RPC via Connect/JSON (same channel the IDE uses)."""
-  ls_address = os.environ.get("ANTIGRAVITY_LS_ADDRESS", "localhost:5387")
-  csrf_token = get_ls_csrf_token(ls_address)
+  ls_address, csrf_token = get_ls_endpoint()
   if not csrf_token:
     raise RuntimeError("no CSRF token for the Language Server")
   base = ls_address if ls_address.startswith(("http://", "https://")) else f"http://{ls_address}"
@@ -234,7 +329,7 @@ def ls_rpc(method: str, body: dict, timeout: float = 20.0) -> dict:
       method="POST",
   )
   try:
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _urlopen_ls(req, timeout=timeout) as resp:
       raw = resp.read()
   except urllib.error.HTTPError as e:
     detail = e.read().decode("utf-8", errors="replace")[:300]

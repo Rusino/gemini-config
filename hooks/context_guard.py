@@ -17,6 +17,8 @@ Every invocation appends one JSONL record to the guard log so silent misses
 are visible afterwards.
 """
 
+from __future__ import annotations
+
 from datetime import datetime, timezone
 import glob
 import json
@@ -43,10 +45,10 @@ FALLBACK_MAX_TOKENS = 256000
 # 10 invocations without persisting a counter on every call
 SOFT_REMIND_EVERY_STEPS = 20
 # Maximum tool-call iterations within a single turn before circuit-breaking
-# (set high so normal 25-step debugging turns in fresh chats do not hand off early):
-MAX_TURN_INVOCATIONS = int(os.environ.get("JETSKI_MAX_TURN_INVOCATIONS", "80"))
+# (set so runaway exploration sprees break before exhausting context):
+MAX_TURN_INVOCATIONS = int(os.environ.get("JETSKI_MAX_TURN_INVOCATIONS", "40"))
 # Lets the agent finish the handoff tool calls without re-tripping the breaker
-SNOOZE_TURN_INVOCATIONS = 40
+SNOOZE_TURN_INVOCATIONS = 25
 
 DEFAULT_LOG_PATH = "~/.gemini/config/logs/context_guard.jsonl"
 LOG_MAX_BYTES = 1_000_000
@@ -1537,7 +1539,9 @@ def run(data: dict, log: dict) -> dict:
           " continuation chat keeps working. However, if you are ready to"
           " answer the user and wait for their reply, DO NOT hand off in this"
           " turn — write your complete response right here and end the turn"
-          f" (the next turn will hand off automatically):\n{TASKS_NOTE}\n"
+          " (never do live multi-hypothesis debugging or self-contradiction"
+          " loops inside your visible response text; finish all verification"
+          f" before writing the answer, and the next turn will hand off automatically):\n{TASKS_NOTE}\n"
           + handoff_steps(conv_id, target, build_continuation_title(conv_id))
       )
     if not is_turn_start:
@@ -1600,18 +1604,22 @@ def run(data: dict, log: dict) -> dict:
         f" exceeded ({invocation_num} consecutive steps; context at"
         f" {_usage_str(m)}). If you are ready to deliver your answer to the"
         " user and wait for their reply, write the complete answer right here"
-        " and end the turn WITHOUT handing off; otherwise bring any"
-        " half-edited file to a clean checkpoint and hand off."
+        " and end the turn WITHOUT handing off (do not start live"
+        " multi-hypothesis debugging inside your visible response text);"
+        " otherwise bring any half-edited file to a clean checkpoint and hand"
+        " off."
     )
   elif not is_turn_start:
     head = (
         f"[CONTEXT GUARD: MID-TURN HANDOFF] Context is at {_usage_str(m)}.{late_note}"
         " If you are ready to answer the user's request right now and wait for"
         " their reply, DO NOT hand off in this turn — write your complete"
-        " response right here and end the turn (the next turn will hand off"
-        " automatically). Otherwise, if further autonomous investigation,"
-        " edits, or tests are needed, stop at the nearest safe checkpoint (no"
-        " half-edited files, no new investigations) and hand off now."
+        " response right here and end the turn (do not start live"
+        " multi-hypothesis debugging inside your visible response text; the"
+        " next turn will hand off automatically). Otherwise, if further"
+        " autonomous investigation, edits, or tests are needed, stop at the"
+        " nearest safe checkpoint (no half-edited files, no new investigations)"
+        " and hand off now."
     )
   else:
     head = (
