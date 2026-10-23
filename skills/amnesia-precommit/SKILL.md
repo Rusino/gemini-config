@@ -161,20 +161,21 @@ When the Skeptic pass completes, process the surviving items as follows:
 
 0. **Test Liveness Gate (Mandatory Before Any "Tests Pass" Claim)**:
    Run for every new or modified test in the diff, including ones a previous chat or state file reports as done; read the test body yourself. This gates the run itself; `outgoing_text_verification.md` §2.2 (failing-then-passing bug tests) and `cpp_systems_invariants.md` #8 (Contract Honesty) still govern what the test asserts.
-   - **Built, run by name, non-vacuous, no host-empty environment**:
-     ```bash
-     <runner> --verbose > /tmp/run.log 2>&1   # Skia: out/<cfg>/dm --src tests --match <Name> --verbose
-     python3 ~/.gemini/config/skills/amnesia-precommit/scripts/verify_test_liveness.py \
-       --repo . --test-file tests/<File>.cpp --test-name <Name> --log /tmp/run.log
-     ```
-     It fails when the file is in no build list (`gn/*.gni`, `BUILD*`, CMake), the log does not name the test (`N tests done` is no proof), a loop over a runtime collection has no preceding non-empty assert (e.g. `REPORTER_ASSERT(r, mgr->countFamilies() > 0)`), the body reads device paths (`/system/...`, `SkFontMgr_New_Android(nullptr, ...)`) that are absent on host, or the log has warnings such as `could not be opened`. Root-cause each warning first; only then pass `--explained-warning REGEX`, never `grep -v` it away.
-   - **Fails under one mutation of the covered production code**:
+   - **Fails under one mutation of the covered production code**: choosing the mutation is your judgement (break the exact behavior the test claims to check); executing it is mechanical and must go through the script, never by hand:
      ```bash
      python3 ~/.gemini/config/skills/amnesia-precommit/scripts/mutation_check.py \
        --file <prod file> --find '<exact line>' --replace '<broken line>' \
-       --build '<build cmd>' --test '<runner cmd for <Name>>'
+       --build '<build cmd>' --test '<runner cmd for <Name>>' \
+       --test-file tests/<File>.cpp --test-name <Name>
      ```
-     `PASS` requires: green before, red with the mutation, source restored byte-for-byte with an unchanged `git diff`, green again after a rebuild. A mutation that does not compile, or a test that stays green, is a gate `FAIL`; there is no manual substitute.
+     `PASS` requires: green before, red with the mutation, source restored byte-for-byte with an unchanged `git diff` (restore runs in `finally`, also on Ctrl-C/SIGTERM), green again after a rebuild. A mutation that does not compile, or a test that stays green, is `FAIL`. Each run writes an attestation (mutation diff, both log tails, file SHA-256s) to `$(git rev-parse --git-path jetski/mutation_attestations)/<Name>.json`.
+   - **Gate over the whole diff (built, run by name, non-vacuous, attested)**:
+     ```bash
+     <runner> --verbose > /tmp/run.log 2>&1   # Skia: out/<cfg>/dm --src tests --match <Names> --verbose
+     python3 ~/.gemini/config/skills/amnesia-precommit/scripts/verify_test_liveness.py \
+       --repo . --diff <base rev> --log /tmp/run.log
+     ```
+     `--diff` finds every test definition added or touched since the base. It fails when the file is in no build list (`gn/*.gni`, `BUILD*`, CMake), the log does not name the test (`N tests done` is no proof), a loop over a runtime collection has no preceding non-empty assert (e.g. `REPORTER_ASSERT(r, mgr->countFamilies() > 0)`), the body reads device paths (`/system/...`, `SkFontMgr_New_Android(nullptr, ...)`) absent on host, the log has warnings such as `could not be opened`, or the test has no `PASS` mutation attestation for its current contents. Root-cause each warning first; only then pass `--explained-warning REGEX`, never `grep -v` it away.
    - **Benchmarks**: before quoting numbers, prove the benchmark loads real data (assert or log a non-zero input count); a timing of an empty environment is not a result.
 
 1. **Run the Relevant Test Suite Once (Executable Code Only, Enforced by `CORPUS-CHECK GUARD` Before Upload/Push)**:

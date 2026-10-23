@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for amnesia-precommit/scripts/mutation_check.py on a toy repo."""
 
+import json
 import os
 import subprocess
 import sys
@@ -33,9 +34,17 @@ class TestMutationCheck(unittest.TestCase):
     return subprocess.run(
         [sys.executable, SCRIPT, "--repo", tmp, "--file", "prod.py",
          "--find", "return xml_style or scanned", "--replace", replace,
-         "--build", build, "--test", f"{sys.executable} test_prod.py"],
+         "--build", build, "--test", f"{sys.executable} test_prod.py",
+         "--test-file", "test_prod.py", "--test-name", "test_prod"],
         capture_output=True, text=True, check=False,
     )
+
+  def attestation(self, tmp):
+    rel = subprocess.run(["git", "-C", tmp, "rev-parse", "--git-path",
+                          "jetski/mutation_attestations/test_prod.json"],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    with open(os.path.join(tmp, rel)) as f:
+      return json.load(f)
 
   def assert_clean(self, tmp):
     status = subprocess.run(["git", "-C", tmp, "status", "--porcelain", "--", "prod.py"],
@@ -49,6 +58,12 @@ class TestMutationCheck(unittest.TestCase):
       self.assertEqual(res.returncode, 0, res.stdout)
       self.assertIn("PASS", res.stdout)
       self.assert_clean(tmp)
+      att = self.attestation(tmp)
+      self.assertEqual(att["result"], "PASS")
+      self.assertIn("+    return 'BoldItalic'", att["mutation_diff"])
+      self.assertEqual(att["prod_sha256_before"], att["prod_sha256_after"])
+      self.assertNotEqual(att["mutated_rc"], 0)
+      self.assertEqual(att["restored_rc"], 0)
 
   def test_vacuous_test_fails_gate(self):
     with tempfile.TemporaryDirectory() as tmp:
@@ -57,6 +72,7 @@ class TestMutationCheck(unittest.TestCase):
       self.assertEqual(res.returncode, 1, res.stdout)
       self.assertIn("passed with the mutation", res.stdout)
       self.assert_clean(tmp)
+      self.assertEqual(self.attestation(tmp)["result"], "FAIL")
 
   def test_mutated_build_failure_still_restores_source(self):
     with tempfile.TemporaryDirectory() as tmp:

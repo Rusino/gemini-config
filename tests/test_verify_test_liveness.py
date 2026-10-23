@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for amnesia-precommit/scripts/verify_test_liveness.py on the CL 1404316 incident."""
 
+import json
 import os
 import subprocess
 import sys
@@ -63,15 +64,26 @@ class TestVerifyTestLiveness(unittest.TestCase):
       f.write("DEF_TEST(FontScanner_FreeType_ScanStyleMatchesMakeFromStream, r) {\n"
               "    REPORTER_ASSERT(r, true);\n}\n")
     subprocess.run(["git", "init", "-q", tmp], check=True)
+    subprocess.run(["git", "-C", tmp, "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-q", "--allow-empty", "-m", "base"], check=True)
     subprocess.run(["git", "-C", tmp, "add", "-A"], check=True)
 
-  def run_script(self, tmp, test_file, name, log_text):
-    log = os.path.join(tmp, "dm.log")
+  def attest(self, tmp, test_file, name, result="PASS"):
+    sys.path.insert(0, os.path.dirname(SCRIPT))
+    import mutation_check
+    path = mutation_check.attestation_path(tmp, name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+      json.dump({"result": result, "test_file": test_file,
+                 "test_file_sha256": mutation_check.sha256_file(os.path.join(tmp, test_file))}, f)
+
+  def run_script(self, tmp, test_file, name, log_text, diff=None):
+    log = os.path.join(tmp, ".git", "dm.log")
     with open(log, "w") as f:
       f.write(log_text)
+    target = ["--diff", diff] if diff else ["--test-file", test_file, "--test-name", name]
     return subprocess.run(
-        [sys.executable, SCRIPT, "--repo", tmp, "--test-file", test_file,
-         "--test-name", name, "--log", log],
+        [sys.executable, SCRIPT, "--repo", tmp, *target, "--log", log],
         capture_output=True, text=True, check=False,
     )
 
@@ -84,7 +96,7 @@ class TestVerifyTestLiveness(unittest.TestCase):
       )
       self.assertEqual(parity.returncode, 1)
       for tag in ("[NOT RUN]", "[UNEXPLAINED LOG WARNINGS]", "[MAYBE VACUOUS]",
-                  "[HOST-EMPTY ENV]"):
+                  "[HOST-EMPTY ENV]", "[NO MUTATION ATTESTATION]"):
         self.assertIn(tag, parity.stdout)
       scanner = self.run_script(
           tmp, "tests/FontScannerStyleTest.cpp",
@@ -93,18 +105,39 @@ class TestVerifyTestLiveness(unittest.TestCase):
       self.assertEqual(scanner.returncode, 1)
       self.assertIn("[NOT BUILT]", scanner.stdout)
       self.assertIn("[NOT RUN]", scanner.stdout)
+      # Diff mode finds both new tests without being told their names
+      by_diff = self.run_script(tmp, None, None, INCIDENT_LOG, diff="HEAD")
+      self.assertEqual(by_diff.returncode, 1)
+      self.assertIn("FontMgrAndroid_LazyParity_FreeType", by_diff.stdout)
+      self.assertIn("FontScanner_FreeType_ScanStyleMatchesMakeFromStream", by_diff.stdout)
+      self.assertIn("[NOT BUILT]", by_diff.stdout)
 
   def test_fixed_version_passes(self):
     with tempfile.TemporaryDirectory() as tmp:
       self.make_repo(tmp, LIVE_PARITY, register_scanner_test=True)
-      for test_file, name in (
+      tests = (
           ("tests/FontMgrAndroidParserTest.cpp", "FontMgrAndroid_LazyParity_FreeType"),
           ("tests/FontScannerStyleTest.cpp",
            "FontScanner_FreeType_ScanStyleMatchesMakeFromStream"),
-      ):
+      )
+      for test_file, name in tests:
+        self.attest(tmp, test_file, name)
         res = self.run_script(tmp, test_file, name, LIVE_LOG)
         self.assertEqual(res.returncode, 0, res.stdout)
-        self.assertIn("mutation", res.stdout)
+        self.assertIn("mutation-attested", res.stdout)
+      self.assertEqual(self.run_script(tmp, None, None, LIVE_LOG, diff="HEAD").returncode, 0)
+
+  def test_failed_or_stale_attestation_fails_gate(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      self.make_repo(tmp, LIVE_PARITY, register_scanner_test=True)
+      test_file, name = "tests/FontMgrAndroidParserTest.cpp", "FontMgrAndroid_LazyParity_FreeType"
+      self.attest(tmp, test_file, name, result="FAIL")
+      self.assertIn("[MUTATION FAIL]", self.run_script(tmp, test_file, name, LIVE_LOG).stdout)
+      self.attest(tmp, test_file, name)
+      with open(os.path.join(tmp, test_file), "a") as f:
+        f.write("// edited after the mutation run\n")
+      self.assertIn("[STALE MUTATION ATTESTATION]",
+                    self.run_script(tmp, test_file, name, LIVE_LOG).stdout)
 
 
 if __name__ == "__main__":
