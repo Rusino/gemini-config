@@ -31,19 +31,26 @@ Code has a compiler; prose documents do not, and incoming specs or code snippets
    - **Applies to**: Any edit, shortening, translation, or restructuring of an existing document (Markdown file, artifact, design doc, specification, or Google Doc) that the user has already seen in earlier turns of the conversation, whenever the change touches more than 1 line or 15 words.
    - **Required Action**: Automatically run `python3 ~/.gemini/config/skills/redline/scripts/redline.py` against the last version the user saw, verify the generated `<stem>_diff.html` via headless browser screenshot (`browser_navigate`, `browser_get_console_logs`, `browser_capture_screenshot`), and link `<stem>_diff.html` alongside the updated document without waiting for the user to ask `"покажи изменения"`.
 
-## 2. Incoming & Outgoing Code (`amnesia-precommit` & KEEPER Invariants)
+## 2. Incoming & Outgoing Code (`amnesia-precommit`, Corpus Gate & KEEPER Invariants)
 
-1. **Outgoing Repository Code Changes -> Run `amnesia-precommit`**:
-   - **Applies to**: Any source code modifications in a repository before committing (`git commit`), uploading (`git cl upload`, `gh pr create`), or reporting the implementation as complete.
+1. **Outgoing Repository Code Changes -> Run `amnesia-precommit` & Pre-Upload Flutter Corpus**:
+   - **Applies to**: Any source code modifications in a repository before committing (`git commit`), uploading/pushing (`git cl upload`, `gh pr create`, `git push`), or reporting the implementation as complete.
    - **Required Action**: Execute the `amnesia-precommit` workflow (`~/.gemini/config/skills/amnesia-precommit/SKILL.md`):
      1. Run `python3 ~/.gemini/config/skills/code-comments/scripts/audit_comments.py --diff HEAD --repo <repo>` and `python3 ~/.gemini/config/skills/ruthless-code-audit/scripts/ruthless_audit.py <repo> --repo <repo> --diff HEAD` (plus `SKIP_GCE_AUTH_FOR_GIT=1 git cl presubmit --force` if `PRESUBMIT.py` exists).
      2. For non-trivial diffs, run the two-stage **Hunt then Refute** clean-context pipeline: spawn a Hunter subagent (`keeper_inquisitor` or `self`, passing prior refuted findings from `finding_ledger.py`) to shrink drive-by changes, verify dropped guards via `git log -S`, check pattern completeness across all callers/backends, and enforce KEEPER invariants (`cpp_systems_invariants.md`, `text_domain_invariants.md`, `code_style.md`), then challenge any candidate `HIGH`/`CRITICAL` defects or non-trivial code removals with a single batched `keeper_skeptic` refutation pass (`Model="flash"` by default, escalating to `Model="pro"` for deep invariants, with automatic `pro` → `flash` → Trapsmith TDD fallback on quota exhaustion). Persist all newly `REFUTED` findings and user design overrides in `~/.gemini/config/scripts/finding_ledger.py` (`--scope repo` for code invariants, `--scope cl` for CL-specific deferrals).
+     3. **Pre-Upload / Pre-Push Flutter Corpus Gate (`CORPUS-CHECK GUARD` in `pre_tool_guard.py`)**: Before running `git cl upload`, `gh pr create`, or `git push`, if the diff contains **executable production code changes** (excluding comment-only edits, `.md` docs, summaries, or commit messages):
+        - Touching `modules/{skparagraph,skunicode,skshaper}/{src,include}/` -> must run `flutter-test-paragraph-engine` (`python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py`).
+        - Touching `lib/web_ui/lib/` (WebParagraph / text layout) -> must run `webparagraph-corpus` (`python3 ~/.gemini/config/skills/webparagraph-corpus/scripts/run_webparagraph_corpus.py`, both Part 1 `felt` and Part 2 `packages/flutter`).
 
-2. **Outgoing Code Snippets in Chat (>5 Lines) -> Inline Invariant Check (0 Subagents)**:
+2. **Bug Triage & Fixes -> Automatic Before/After Visual Slide (`dual-version-bug-slide`) by Default**:
+   - **Applies to**: Any bug report (GitHub issue, Buganizer `b/...`, or regression) in `SkParagraph`, `SkUnicode`, `SkShaper`, `WebParagraph`, or `Skia` that has a visual, geometric, metric, glyph, caret/selection, or layout-crash manifestation.
+   - **Required Action**: In addition to authoring a failing-then-passing contract unit test, automatically generate the before/after visual comparison slide (`~/.gemini/config/skills/dual-version-bug-slide/SKILL.md`) without waiting for the user to ask for a slide (skip only when the issue is purely non-visual, such as build/CI config or memory/ASan bookkeeping).
+
+3. **Outgoing Code Snippets in Chat (>5 Lines) -> Inline Invariant Check (0 Subagents)**:
    - **Applies to**: Any non-trivial code block or patch (>5 lines) proposed in chat.
    - **Required Action**: Read the actual header/definition before calling any API, and verify the snippet against `cpp_systems_invariants.md`, `text_domain_invariants.md`, and `code_style.md` (no trailing periods in non-Dart comments, `<= 100` cols, zero-allocation hot paths, loop guards, `SkASSERT` over defensive `if (!ptr) return;`).
 
-3. **Incoming Code (CLs, PRs, Commits, Patches, or User-Pasted Snippets >5 Lines) -> Zero-Trust Audit on Read**:
+4. **Incoming Code (CLs, PRs, Commits, Patches, or User-Pasted Snippets >5 Lines) -> Zero-Trust Audit on Read**:
    - **Applies to**: Any external CL/PR, commit, branch, diff, or code snippet (>5 lines) the user asks you to read, explain, review, or integrate.
    - **Required Action**:
      1. For incoming CLs/PRs or local diffs, run `audit_comments.py` and `ruthless_audit.py --diff` (and use `review-triage` (`~/.gemini/config/skills/review-triage/SKILL.md`) + `companion-cl-review` (`~/.gemini/config/skills/companion-cl-review/SKILL.md`) by default for full CL/PR reviews, unless the user explicitly asks for a prose-only review without a companion CL).

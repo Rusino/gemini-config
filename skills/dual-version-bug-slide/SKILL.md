@@ -4,15 +4,17 @@ description: >-
   Transform a reported bug (GitHub issue, Buganizer ID, or regression report) into
   a rigorous contract unit test and an interactive dual-engine comparison slide ("how
   it was" vs "how it is / how it should be"). Enforces hostile mutation testing,
-  loop guards, English-only UI/code, and strict code comment invariants. Trigger
-  when the user provides a bug link/ID and asks to reproduce, test, or visualize it
-  across two versions ("создай слайд по багу", "проверь ошибку на двух версиях",
-  "сделай слайд сравнения", "сделай визуализацию до/после").
+  loop guards, English-only UI/code, and strict code comment invariants. Runs by
+  default whenever investigating or fixing a bug in SkParagraph, SkUnicode, SkShaper,
+  WebParagraph, or Skia that has a visual, geometric, metric, glyph, caret/selection,
+  or layout-crash manifestation, or when explicitly triggered ("создай слайд по багу",
+  "проверь ошибку на двух версиях", "сделай слайд сравнения", "сделай визуализацию до/после",
+  "слайд").
 ---
 
 # Dual-Version Bug Slide Curator (`dual-version-bug-slide`)
 
-Transform bug reports into verifiable regression tests and interactive dual-engine comparison slides that visually contrast legacy baseline behavior with candidate or target implementations.
+Transform bug reports into verifiable regression tests and interactive dual-engine comparison slides that visually contrast legacy baseline behavior with candidate or target implementations. This workflow runs **automatically by default** when investigating or fixing any bug in `SkParagraph`, `SkUnicode`, `SkShaper`, `WebParagraph`, or `Skia` that can be visually or structurally rendered (skipping only purely non-visual issues such as build/CI configuration or memory/ASan bookkeeping).
 
 ---
 

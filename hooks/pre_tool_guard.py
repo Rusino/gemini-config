@@ -292,6 +292,36 @@ GIT_COMMIT_OR_UPLOAD_RE = re.compile(
     r")\b"
 )
 
+# Match upload and push commands separately from local commits so the heavy
+# Flutter corpus gate triggers only when publishing changes externally
+GIT_UPLOAD_OR_PUSH_RE = re.compile(
+    r"(?:^|(?<=[\s;&|(`]))(?:"
+    r"git(?:\s+(?:-[Cc]\s+\S+|--[a-z-]+(?:=\S+)?))*\s+(?:cl\s+upload|push)"
+    r"|gh\s+pr\s+create"
+    r")\b"
+)
+
+# Restrict corpus gating to production C++/Dart/TS directories (excluding tests/slides)
+SKIA_CORPUS_PATH_RE = re.compile(
+    r"(?:^|/)modules/(?:skparagraph|skunicode|skshaper)/(?:src|include)/"
+)
+WEBPARAGRAPH_CORPUS_PATH_RE = re.compile(
+    r"(?:^|/)(?:engine/src/flutter/)?lib/web_ui/lib/"
+)
+CODE_CORPUS_EXTENSIONS = {
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cxx",
+    ".h",
+    ".hh",
+    ".hpp",
+    ".hxx",
+    ".mm",
+    ".dart",
+    ".ts",
+}
+
 
 def is_git_commit_or_upload_command(cmd: str) -> bool:
   """True if cmd invokes git commit, git cl upload, or gh pr create outside heredocs/grep."""
@@ -301,6 +331,18 @@ def is_git_commit_or_upload_command(cmd: str) -> bool:
   if re.search(r"\b(?:commit|upload|create)\s+(?:--help|-h|help)\b", cmd_code):
     return False
   return bool(GIT_COMMIT_OR_UPLOAD_RE.search(cmd_code))
+
+
+# Detect external publishing commands (upload, push, PR creation) outside grep/help calls
+def is_git_upload_or_push_command(cmd: str) -> bool:
+  cmd_code = strip_heredocs(cmd)
+  if re.match(r"^\s*(?:grep|egrep|fgrep|rg|git\s+grep|echo|cat)\b", cmd_code):
+    return False
+  if re.search(
+      r"\b(?:upload|push|create)\s+(?:--help|-h|help)\b", cmd_code
+  ):
+    return False
+  return bool(GIT_UPLOAD_OR_PUSH_RE.search(cmd_code))
 
 
 def _load_transcript_steps(
@@ -389,6 +431,237 @@ def unverified_source_edit_before_commit(
   if last_edited_source and not (has_audit_comments and has_ruthless_audit):
     return last_edited_source
   return ""
+
+
+# Strip C/C++/Dart/TS comments while keeping string literals intact so comment-only edits
+# do not trigger the heavy Flutter corpus requirement
+def _strip_c_style_comments(text: str) -> str:
+  pattern = re.compile(
+      r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|/\*[\s\S]*?\*/|//[^\n]*'
+  )
+
+  def _repl(m: re.Match) -> str:
+    s = m.group(0)
+    if s.startswith("//") or s.startswith("/*"):
+      return ""
+    return s
+
+  return pattern.sub(_repl, text)
+
+
+# Distinguish executable code changes from comment or whitespace edits in tool arguments
+def is_executable_code_edit(tool_name: str, tool_args: dict) -> bool:
+  tf = get_tool_target_file(tool_args)
+  if not is_tracked_source_file(tf):
+    return False
+  clean = tf.strip().strip('"').strip("'").replace("\\", "/")
+  _, ext = os.path.splitext(clean)
+  if ext.lower() not in CODE_CORPUS_EXTENSIONS:
+    return False
+  if tool_name in WRITE_NEW_TOOLS:
+    content = str(
+        tool_args.get("Content") or tool_args.get("CodeContent") or ""
+    )
+    return bool(_strip_c_style_comments(content).strip())
+
+  chunks = tool_args.get("ReplacementChunks")
+  if isinstance(chunks, list) and chunks:
+    pairs = [
+        (
+            str(c.get("TargetContent") or ""),
+            str(c.get("ReplacementContent") or ""),
+        )
+        for c in chunks
+        if isinstance(c, dict)
+    ]
+  else:
+    pairs = [(
+        str(tool_args.get("Target") or tool_args.get("TargetContent") or ""),
+        str(
+            tool_args.get("Replacement")
+            or tool_args.get("ReplacementContent")
+            or ""
+        ),
+    )]
+  for target, replacement in pairs:
+    t_code = [
+        ln.strip()
+        for ln in _strip_c_style_comments(target).splitlines()
+        if ln.strip()
+    ]
+    r_code = [
+        ln.strip()
+        for ln in _strip_c_style_comments(replacement).splitlines()
+        if ln.strip()
+    ]
+    if t_code != r_code:
+      return True
+  return False
+
+
+# Scan unified git diff lines to detect whether any non-comment executable code changed
+def diff_text_has_executable_code_changes(diff_text: str) -> bool:
+  in_block_comment = False
+  for raw_line in diff_text.splitlines():
+    if raw_line.startswith(("+++", "---", "@@", "diff --git", "index ")):
+      in_block_comment = False
+      continue
+    if not raw_line or raw_line[0] not in ("+", "-"):
+      continue
+    line = raw_line[1:].strip()
+    if not line:
+      continue
+    while line:
+      if in_block_comment:
+        end_idx = line.find("*/")
+        if end_idx < 0:
+          line = ""
+          break
+        in_block_comment = False
+        line = line[end_idx + 2 :].strip()
+      else:
+        if line.startswith("//"):
+          line = ""
+          break
+        start_idx = line.find("/*")
+        line_comment_idx = line.find("//")
+        if 0 <= line_comment_idx < (start_idx if start_idx >= 0 else len(line)):
+          code_prefix = line[:line_comment_idx].strip()
+          if code_prefix:
+            return True
+          line = ""
+          break
+        if start_idx == 0:
+          end_idx = line.find("*/", 2)
+          if end_idx < 0:
+            in_block_comment = True
+            line = ""
+            break
+          line = line[end_idx + 2 :].strip()
+        elif start_idx > 0:
+          return True
+        else:
+          return True
+  return False
+
+
+# Verify against the actual git repository diff when on disk so reverted edits do not block upload
+def _git_branch_has_executable_code_changes(
+    file_path: str, pathspec: str
+) -> bool | None:
+  clean = os.path.abspath(
+      os.path.expanduser(file_path.strip().strip('"').strip("'"))
+  )
+  parent_dir = os.path.dirname(clean)
+  if not os.path.isdir(parent_dir):
+    return None
+  try:
+    top = subprocess.run(
+        ["git", "-C", parent_dir, "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        timeout=1.5,
+        check=False,
+    )
+    if top.returncode != 0:
+      return None
+    repo_root = top.stdout.strip()
+    base_ref = "HEAD~1"
+    for cand in ("@{u}", "origin/main", "origin/master"):
+      mb = subprocess.run(
+          ["git", "-C", repo_root, "merge-base", "HEAD", cand],
+          capture_output=True,
+          text=True,
+          timeout=1.5,
+          check=False,
+      )
+      if mb.returncode == 0 and mb.stdout.strip():
+        base_ref = mb.stdout.strip()
+        break
+    diff_res = subprocess.run(
+        ["git", "-C", repo_root, "diff", "-U0", base_ref, "--", pathspec],
+        capture_output=True,
+        text=True,
+        timeout=2.0,
+        check=False,
+    )
+    if diff_res.returncode != 0:
+      return None
+    return diff_text_has_executable_code_changes(diff_res.stdout or "")
+  except Exception:
+    return None
+
+
+# Track whether executable production code in SkParagraph or WebParagraph changed since the last corpus run
+def unverified_corpus_before_upload_or_push(
+    transcript_path: str, current_cmd: str = "", current_step_idx: int = -1
+) -> tuple[str, str, str]:
+  steps = _load_transcript_steps(transcript_path, current_step_idx)
+  if not steps:
+    return ("", "", "")
+  last_skia_file = ""
+  last_skia_full_path = ""
+  has_skia_corpus = False
+  last_wp_file = ""
+  last_wp_full_path = ""
+  has_wp_corpus = False
+
+  for step in steps:
+    if step.get("type") != "PLANNER_RESPONSE":
+      continue
+    for tc in step.get("tool_calls") or []:
+      tname = tc.get("name", "")
+      targs = tc.get("args") or {}
+      if tname in EDIT_TOOLS:
+        tf = get_tool_target_file(targs)
+        norm_tf = tf.strip().strip('"').strip("'").replace("\\", "/")
+        if SKIA_CORPUS_PATH_RE.search(norm_tf) and is_executable_code_edit(
+            tname, targs
+        ):
+          last_skia_file = os.path.basename(norm_tf)
+          last_skia_full_path = norm_tf
+          has_skia_corpus = False
+        elif WEBPARAGRAPH_CORPUS_PATH_RE.search(
+            norm_tf
+        ) and is_executable_code_edit(tname, targs):
+          last_wp_file = os.path.basename(norm_tf)
+          last_wp_full_path = norm_tf
+          has_wp_corpus = False
+      elif tname == "run_command":
+        c = str(targs.get("CommandLine", ""))
+        if _invokes_script(c, "run_flutter_paragraph_tests.py"):
+          has_skia_corpus = True
+        if _invokes_script(c, "run_webparagraph_corpus.py"):
+          has_wp_corpus = True
+
+  if _invokes_script(current_cmd, "run_flutter_paragraph_tests.py"):
+    has_skia_corpus = True
+  if _invokes_script(current_cmd, "run_webparagraph_corpus.py"):
+    has_wp_corpus = True
+
+  if last_skia_file and not has_skia_corpus:
+    git_has_code = _git_branch_has_executable_code_changes(
+        last_skia_full_path, "modules/"
+    )
+    if git_has_code is not False:
+      return (
+          "SkParagraph/SkUnicode/SkShaper",
+          last_skia_file,
+          "~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py",
+      )
+
+  if last_wp_file and not has_wp_corpus:
+    git_has_code = _git_branch_has_executable_code_changes(
+        last_wp_full_path, "engine/src/flutter/lib/web_ui/lib/"
+    )
+    if git_has_code is not False:
+      return (
+          "WebParagraph (web_ui)",
+          last_wp_file,
+          "~/.gemini/config/skills/webparagraph-corpus/scripts/run_webparagraph_corpus.py",
+      )
+
+  return ("", "", "")
 
 
 def was_doc_grounding_run_in_chat(
@@ -1194,9 +1467,13 @@ def main() -> None:
   # Guard 7: Pre-commit / pre-upload code audit check (amnesia-precommit Phase 1)
   if tool_name == "run_command":
     cmd_str = str(tool_args.get("CommandLine", "")).strip()
-    if is_git_commit_or_upload_command(cmd_str):
+    step_idx = int(data.get("stepIdx", -1))
+    # Require fast Phase 1 lint/audit scripts on every commit, upload, PR creation, or push
+    if is_git_commit_or_upload_command(cmd_str) or is_git_upload_or_push_command(
+        cmd_str
+    ):
       unverified_src = unverified_source_edit_before_commit(
-          transcript_path, cmd_str, int(data.get("stepIdx", -1))
+          transcript_path, cmd_str, step_idx
       )
       if unverified_src:
         print(
@@ -1207,11 +1484,38 @@ def main() -> None:
                         f"[CODE-CHECK GUARD] You modified tracked source code (`{unverified_src}`) "
                         "in this conversation without running both `amnesia-precommit` Phase 1 "
                         "audit scripts since the last code edit! Before `git commit` / "
-                        "`git cl upload` / `gh pr create`, run:\n"
+                        "`git cl upload` / `gh pr create` / `git push`, run:\n"
                         "`python3 ~/.gemini/config/skills/code-comments/scripts/audit_comments.py "
                         "--diff HEAD --repo <repo>`\n"
                         "`python3 ~/.gemini/config/skills/ruthless-code-audit/scripts/"
                         "ruthless_audit.py <repo> --repo <repo> --diff HEAD`"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
+
+    # Require the full Flutter test corpus only on upload/push/PR when executable code changed
+    if is_git_upload_or_push_command(cmd_str):
+      subsys, edited_code_file, req_script = (
+          unverified_corpus_before_upload_or_push(
+              transcript_path, cmd_str, step_idx
+          )
+      )
+      if edited_code_file:
+        print(
+            json.dumps(
+                {
+                    "decision": "deny",
+                    "reason": (
+                        f"[CORPUS-CHECK GUARD] You modified executable production code in "
+                        f"`{edited_code_file}` ({subsys}), but have not run the Flutter test "
+                        "corpus since the last code edit! Before `git cl upload`, `gh pr create`, "
+                        "or `git push`, run:\n"
+                        f"`python3 {req_script} --out /tmp/corpus_check`\n"
+                        "(Note: comment-only, summary, or commit-message edits do not trigger "
+                        "this requirement.)"
                     ),
                 },
                 ensure_ascii=False,

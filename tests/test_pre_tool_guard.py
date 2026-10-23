@@ -745,6 +745,230 @@ class TestPreToolGuard(unittest.TestCase):
             "allow",
         )
 
+  def test_corpus_check_guard_requires_flutter_corpus_only_for_executable_code_edits(self):
+    skia_src = "/workspace/skia/modules/skparagraph/src/ParagraphImpl.cpp"
+    wp_src = "/workspace/flutter/engine/src/flutter/lib/web_ui/lib/src/engine/text_fragmenter.dart"
+
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl") as f_trans:
+      # 1. Comment-only edit in SkParagraph + Phase 1 audits -> git cl upload & git push allowed without corpus
+      steps = [
+          {
+              "step_index": 1,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "edit_file",
+                  "args": {
+                      "Path": skia_src,
+                      "Target": "// Old comment\nfRuns.reset();",
+                      "Replacement": "// Updated timeless comment explaining why\nfRuns.reset();",
+                  },
+              }],
+          },
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": (
+                          "python3 audit_comments.py --diff HEAD --repo . && "
+                          "python3 ruthless_audit.py . --repo . --diff HEAD"
+                      )
+                  },
+              }],
+          },
+      ]
+      for s in steps:
+        f_trans.write(json.dumps(s) + "\n")
+      f_trans.flush()
+
+      for cmd in ("git cl upload", "git push origin main", "gh pr create --fill"):
+        out = self.run_guard({
+            "conversationId": "c1",
+            "transcriptPath": f_trans.name,
+            "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}},
+        })
+        self.assertEqual(out.get("decision"), "allow", msg=f"Failed for {cmd}: {out}")
+
+      # 2. Executable code edit in SkParagraph -> git commit is allowed after Phase 1 audits,
+      #    but git cl upload / git push / gh pr create are blocked by CORPUS-CHECK GUARD
+      f_trans.write(
+          json.dumps({
+              "step_index": 3,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "edit_file",
+                  "args": {
+                      "Path": skia_src,
+                      "Target": "fRuns.reset();",
+                      "Replacement": "fRuns.reset();\nfMaxIntrinsicWidth = 0;",
+                  },
+              }],
+          })
+          + "\n"
+          + json.dumps({
+              "step_index": 4,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": (
+                          "python3 audit_comments.py --diff HEAD --repo . && "
+                          "python3 ruthless_audit.py . --repo . --diff HEAD"
+                      )
+                  },
+              }],
+          })
+          + "\n"
+      )
+      f_trans.flush()
+
+      self.assertEqual(
+          self.run_guard({
+              "conversationId": "c1",
+              "transcriptPath": f_trans.name,
+              "toolCall": {"name": "run_command", "args": {"CommandLine": "git commit -m 'fix'"}},
+          }).get("decision"),
+          "allow",
+      )
+
+      for cmd in ("git cl upload", "git push origin head", "gh pr create --fill"):
+        out_deny = self.run_guard({
+            "conversationId": "c1",
+            "transcriptPath": f_trans.name,
+            "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}},
+        })
+        self.assertEqual(out_deny.get("decision"), "deny")
+        self.assertIn("CORPUS-CHECK GUARD", out_deny.get("reason", ""))
+        self.assertIn("run_flutter_paragraph_tests.py", out_deny.get("reason", ""))
+
+      # 3. Running run_flutter_paragraph_tests.py unlocks git cl upload / git push
+      f_trans.write(
+          json.dumps({
+              "step_index": 5,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": "python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py --out /tmp/out"
+                  },
+              }],
+          })
+          + "\n"
+      )
+      f_trans.flush()
+      self.assertEqual(
+          self.run_guard({
+              "conversationId": "c1",
+              "transcriptPath": f_trans.name,
+              "toolCall": {"name": "run_command", "args": {"CommandLine": "git cl upload"}},
+          }).get("decision"),
+          "allow",
+      )
+
+      # 4. Subsequent comment-only edit after corpus run only requires Phase 1 audits, NOT re-running corpus
+      f_trans.write(
+          json.dumps({
+              "step_index": 6,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "edit_file",
+                  "args": {
+                      "Path": skia_src,
+                      "Target": "// Updated timeless comment explaining why",
+                      "Replacement": "// Polished comment before upload",
+                  },
+              }],
+          })
+          + "\n"
+          + json.dumps({
+              "step_index": 7,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": (
+                          "python3 audit_comments.py --diff HEAD --repo . && "
+                          "python3 ruthless_audit.py . --repo . --diff HEAD"
+                      )
+                  },
+              }],
+          })
+          + "\n"
+      )
+      f_trans.flush()
+      self.assertEqual(
+          self.run_guard({
+              "conversationId": "c1",
+              "transcriptPath": f_trans.name,
+              "toolCall": {"name": "run_command", "args": {"CommandLine": "git cl upload"}},
+          }).get("decision"),
+          "allow",
+      )
+
+      # 5. Executable code edit in WebParagraph requires run_webparagraph_corpus.py before git push / gh pr create
+      f_trans.write(
+          json.dumps({
+              "step_index": 8,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "edit_file",
+                  "args": {
+                      "Path": wp_src,
+                      "Target": "return start;",
+                      "Replacement": "return start + 1;",
+                  },
+              }],
+          })
+          + "\n"
+          + json.dumps({
+              "step_index": 9,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": (
+                          "python3 audit_comments.py --diff HEAD --repo . && "
+                          "python3 ruthless_audit.py . --repo . --diff HEAD"
+                      )
+                  },
+              }],
+          })
+          + "\n"
+      )
+      f_trans.flush()
+      out_wp = self.run_guard({
+          "conversationId": "c1",
+          "transcriptPath": f_trans.name,
+          "toolCall": {"name": "run_command", "args": {"CommandLine": "git push origin my-branch"}},
+      })
+      self.assertEqual(out_wp.get("decision"), "deny")
+      self.assertIn("CORPUS-CHECK GUARD", out_wp.get("reason", ""))
+      self.assertIn("run_webparagraph_corpus.py", out_wp.get("reason", ""))
+
+      f_trans.write(
+          json.dumps({
+              "step_index": 10,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": "python3 ~/.gemini/config/skills/webparagraph-corpus/scripts/run_webparagraph_corpus.py --out /tmp/wp"
+                  },
+              }],
+          })
+          + "\n"
+      )
+      f_trans.flush()
+      self.assertEqual(
+          self.run_guard({
+              "conversationId": "c1",
+              "transcriptPath": f_trans.name,
+              "toolCall": {"name": "run_command", "args": {"CommandLine": "git push origin my-branch"}},
+          }).get("decision"),
+          "allow",
+      )
+
 
 if __name__ == "__main__":
   unittest.main()
