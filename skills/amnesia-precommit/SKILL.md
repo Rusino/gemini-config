@@ -159,6 +159,24 @@ When the Skeptic pass completes, process the surviving items as follows:
 
 ### Phase 4: Single Verification Pass, Tree-Pinned Rebase & Summary
 
+0. **Test Liveness Gate (Mandatory Before Any "Tests Pass" Claim)**:
+   Run for every new or modified test in the diff, including ones a previous chat or state file reports as done; read the test body yourself. This gates the run itself; `outgoing_text_verification.md` §2.2 (failing-then-passing bug tests) and `cpp_systems_invariants.md` #8 (Contract Honesty) still govern what the test asserts.
+   - **Built, run by name, non-vacuous, no host-empty environment**:
+     ```bash
+     <runner> --verbose > /tmp/run.log 2>&1   # Skia: out/<cfg>/dm --src tests --match <Name> --verbose
+     python3 ~/.gemini/config/skills/amnesia-precommit/scripts/verify_test_liveness.py \
+       --repo . --test-file tests/<File>.cpp --test-name <Name> --log /tmp/run.log
+     ```
+     It fails when the file is in no build list (`gn/*.gni`, `BUILD*`, CMake), the log does not name the test (`N tests done` is no proof), a loop over a runtime collection has no preceding non-empty assert (e.g. `REPORTER_ASSERT(r, mgr->countFamilies() > 0)`), the body reads device paths (`/system/...`, `SkFontMgr_New_Android(nullptr, ...)`) that are absent on host, or the log has warnings such as `could not be opened`. Root-cause each warning first; only then pass `--explained-warning REGEX`, never `grep -v` it away.
+   - **Fails under one mutation of the covered production code**:
+     ```bash
+     python3 ~/.gemini/config/skills/amnesia-precommit/scripts/mutation_check.py \
+       --file <prod file> --find '<exact line>' --replace '<broken line>' \
+       --build '<build cmd>' --test '<runner cmd for <Name>>'
+     ```
+     `PASS` requires: green before, red with the mutation, source restored byte-for-byte with an unchanged `git diff`, green again after a rebuild. A mutation that does not compile, or a test that stays green, is a gate `FAIL`; there is no manual substitute.
+   - **Benchmarks**: before quoting numbers, prove the benchmark loads real data (assert or log a non-zero input count); a timing of an empty environment is not a result.
+
 1. **Run the Relevant Test Suite Once (Executable Code Only, Enforced by `CORPUS-CHECK GUARD` Before Upload/Push)**:
    - **Skia (`SkParagraph` / `SkUnicode` / `SkShaper`)**: Build and run native Skia `dm --match SkParagraph` (`skia-test-paragraph`). In addition, whenever **executable production code** (excluding comment-only edits, `.md` docs, summaries, or commit messages) under `modules/skparagraph/{src,include}/`, `modules/skunicode/{src,include}/`, or `modules/skshaper/{src,include}/` is modified, you **must** also run `flutter-test-paragraph-engine` (`~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py`) before `git cl upload`, `gh pr create`, or `git push` so Flutter framework layout, intrinsic width, and widget consumers (including `dropdown_menu_test.dart`) are verified with zero regressions.
    - **Flutter Engine / WebParagraph**: Whenever **executable production code** under `lib/web_ui/lib/` is modified, you **must** run `webparagraph-corpus` (`~/.gemini/config/skills/webparagraph-corpus/scripts/run_webparagraph_corpus.py`, both Part 1 `felt` and Part 2 `packages/flutter`) before `git cl upload`, `gh pr create`, or `git push`.
