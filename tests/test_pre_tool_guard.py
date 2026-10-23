@@ -606,6 +606,54 @@ class TestPreToolGuard(unittest.TestCase):
       f_trans.flush()
       self.assertEqual(self.run_guard(update_call).get("decision"), "deny")
 
+  # A chat of any project may write its own chain state file even though the
+  # roadmaps dir sits inside another project's exclusive config root
+  def test_cross_project_guard_allows_own_chain_state_file_in_foreign_config_root(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      pdir = os.path.join(tmp_dir, "projects")
+      cfg = os.path.join(tmp_dir, "config")
+      rdir = os.path.join(cfg, "roadmaps")
+      artifact_dir = os.path.join(tmp_dir, "brain", "c1")
+      os.makedirs(pdir)
+      os.makedirs(os.path.join(artifact_dir, "scratch"))
+      os.makedirs(os.path.join(rdir, "proj-a", "state"))
+      os.makedirs(os.path.join(rdir, "proj-b", "state"))
+      with open(os.path.join(pdir, "proj-a.json"), "w") as f:
+        json.dump({"id": "proj-a", "name": "Chrome AI Week H2 2026"}, f)
+      with open(os.path.join(pdir, "proj-b.json"), "w") as f:
+        json.dump({
+            "id": "proj-b",
+            "name": "Improving Experience",
+            "projectResources": {"resources": [{"folderUri": f"file://{cfg}"}]},
+        }, f)
+      transcript = os.path.join(artifact_dir, "transcript.jsonl")
+      with open(transcript, "w") as f:
+        f.write(json.dumps({"step_index": 1, "type": "USER_INPUT", "content": "x"}) + "\n")
+
+      import context_guard
+      with patch.dict(os.environ, {"JETSKI_PROJECTS_DIR": pdir, "JETSKI_ROADMAPS_DIR": rdir}), \
+           patch.object(context_guard, "get_conversation_db_info",
+                        return_value=("[11:00] ⦿ AI Week", "proj-a")), \
+           patch.object(context_guard, "summary_db_paths", return_value=[]):
+        def decide(path):
+          return self.run_guard({
+              "conversationId": "c1",
+              "transcriptPath": transcript,
+              "artifactDirectoryPath": artifact_dir,
+              "toolCall": {"name": "write_file", "args": {"Path": path}},
+          })
+
+        self.assertEqual(
+            decide(os.path.join(rdir, "proj-a", "state", "c1.md")).get("decision"), "allow"
+        )
+        for path in (
+            os.path.join(rdir, "proj-b", "state", "c1.md"),
+            os.path.join(cfg, "rules", "x.md"),
+        ):
+          out = decide(path)
+          self.assertEqual(out.get("decision"), "deny", msg=path)
+          self.assertIn("CROSS-PROJECT SCOPE GUARD", out.get("reason", ""))
+
   # Verify cross-project scope guard blocks foreign exclusive roots until user confirms override
   def test_cross_project_scope_guard_blocks_foreign_edits_and_commits(self):
     with tempfile.TemporaryDirectory() as tmp_dir:

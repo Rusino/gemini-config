@@ -2143,6 +2143,20 @@ def cross_project_write_denial(
   if not current_pid or current_pid == "outside-of-project":
     return ""
 
+  # The roadmaps dir lives inside ~/.gemini/config, which one project owns, yet every
+  # project keeps its chains' state files there; a chat may always write its own one
+  if tool_name in EDIT_TOOLS:
+    import roadmap
+
+    real_target = os.path.realpath(candidate_paths[0])
+    for cid in {conv_id, effective_cid} - {""}:
+      try:
+        own_state = os.path.realpath(roadmap.state_path(current_pid, cid))
+      except Exception:
+        continue
+      if real_target == own_state:
+        return ""
+
   directory = collect_project_directory(
       transcript_path, include_active_chats=True, exclude_conv_id=effective_cid
   )
