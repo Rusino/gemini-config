@@ -781,30 +781,61 @@ CRITICAL_CHALLENGE_RE = re.compile(
 )
 
 
-# Inject a pre-mortem and alternatives directive when the user asks to challenge or evaluate
+# Inject a pre-mortem or self-audit directive when the user challenges an idea or doubts a claim
+SELF_DOUBT_RE = re.compile(
+    r"(?:"
+    r"(?:меня\s+)?терзают\s+смутные\s+сомнения"
+    r"|смутные\s+сомнения"
+    r"|ты\s+уверена\s*\?"
+    r"|точно\s+ли\b"
+    r"|перепроверь"
+    r"|are\s+you\s+sure\s*\?"
+    r"|something\s+feels\s+off"
+    r"|i\s+have\s+(?:my\s+)?doubts"
+    r"|double[- ]check\s+(?:that|this|it)"
+    r"|re-?verify\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
 def build_critical_challenge_notice(last_user_input: str) -> str:
   if not last_user_input or re.search(
       r"Continuing unfinished work from previous conversation", last_user_input
   ):
     return ""
+  notices: list[str] = []
+  m_doubt = SELF_DOUBT_RE.search(last_user_input)
+  if m_doubt:
+    matched_d = re.sub(r"\s+", " ", m_doubt.group(0).strip())
+    notices.append(
+        "[SELF-AUDIT TRIGGER: RE-VERIFY AGENT CLAIM]\n"
+        f'The user expressed doubt in your statement ("{matched_d}"). '
+        "This means she believes YOU made an error in a claim, assumption, or code change:\n"
+        "1. Distrust your own prior claim: do NOT defend your previous answer from memory, and do "
+        "NOT blindly apologize or flip-flop to the opposite claim without checking first.\n"
+        "2. Re-verify against primary evidence: read the exact `file:line`, header contract, "
+        "`git log`, or test output from scratch. State either the exact mistake you found in your "
+        "prior claim or the primary proof (`file:line` / command output) that confirms it."
+    )
   m = CRITICAL_CHALLENGE_RE.search(last_user_input)
-  if not m:
-    return ""
-  matched = re.sub(r"\s+", " ", m.group(0).strip())
-  return (
-      "[CRITICAL CHALLENGE TRIGGER: PRE-MORTEM & ALTERNATIVES]\n"
-      f'The user explicitly asked for critical evaluation ("{matched}"). '
-      "Treat this as a command to run an adversarial pre-mortem, NOT a social cue for approval:\n"
-      "1. Falsify first: assume the proposed idea or diagnosis has a flaw or breaks an invariant "
-      "(`glyph bounds`, `grapheme cluster`, `trailing spaces`, `strut`, BiDi, selection, caching, "
-      "hot-path allocations) and check the actual source code.\n"
-      "2. Mandatory alternative: formulate at least one concrete orthogonal or simpler "
-      "alternative (including fixing the invariant higher up or deleting code instead of adding a "
-      "branch) and compare trade-offs.\n"
-      "3. No forced contrarianism: if the proposal genuinely holds up after checking code and "
-      "alternatives, do NOT invent cosmetic nitpicks — state the exact failure modes and "
-      "alternatives you tested and why the proposal wins."
-  )
+  if m:
+    matched = re.sub(r"\s+", " ", m.group(0).strip())
+    notices.append(
+        "[CRITICAL CHALLENGE TRIGGER: PRE-MORTEM & ALTERNATIVES]\n"
+        f'The user explicitly asked for critical evaluation ("{matched}"). '
+        "Treat this as a command to run an adversarial pre-mortem, NOT a social cue for approval:\n"
+        "1. Falsify first: assume the proposed idea or diagnosis has a flaw or breaks an invariant "
+        "(`glyph bounds`, `grapheme cluster`, `trailing spaces`, `strut`, BiDi, selection, "
+        "caching, hot-path allocations) and check the actual source code.\n"
+        "2. Mandatory alternative: formulate at least one concrete orthogonal or simpler "
+        "alternative (including fixing the invariant higher up or deleting code instead of adding "
+        "a branch) and compare trade-offs.\n"
+        "3. No forced contrarianism: if the proposal genuinely holds up after checking code and "
+        "alternatives, do NOT invent cosmetic nitpicks — state the exact failure modes and "
+        "alternatives you tested and why the proposal wins."
+    )
+  return "\n\n".join(notices)
 
 
 # Tool results may indent this line (e.g. "\n\n\t\t\t\tThe command exited ..." on

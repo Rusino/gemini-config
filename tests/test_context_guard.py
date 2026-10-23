@@ -457,6 +457,21 @@ class TestContextGuard(unittest.TestCase):
         self.assertIn("Mandatory alternative", msg)
         self.assertIn("No forced contrarianism", msg)
 
+      for doubt_phrase in (
+          "Меня терзают смутные сомнения насчет этого условия",
+          "Ты уверена?",
+          "Are you sure? Something feels off here",
+      ):
+        out_d = self.run_guard(inv=0, lastUserInput=doubt_phrase)
+        msg_d = self.message(out_d)
+        self.assertIn(
+            "SELF-AUDIT TRIGGER: RE-VERIFY AGENT CLAIM",
+            msg_d,
+            f"Missing self-audit trigger for: {doubt_phrase}",
+        )
+        self.assertIn("Distrust your own prior claim", msg_d)
+        self.assertIn("Re-verify against primary evidence", msg_d)
+
       # Mid-turn invocations and neutral prompts must not inject the trigger
       self.assertEqual(
           self.run_guard(inv=1, lastUserInput="Что думаешь?"),
