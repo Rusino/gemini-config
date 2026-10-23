@@ -969,6 +969,335 @@ class TestPreToolGuard(unittest.TestCase):
           "allow",
       )
 
+  # Verify per-worktree lease blocks a second active chat on the same worktree
+  def test_worktree_lease_guard_blocks_concurrent_chat_on_same_code_worktree(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      repo = os.path.join(tmp_dir, "flutter_perf")
+      wt2 = os.path.join(tmp_dir, "flutter_wt2")
+      subprocess.run(["git", "init", "-b", "main", repo], check=True, capture_output=True)
+      subprocess.run(["git", "-C", repo, "config", "user.email", "t@example.com"], check=True)
+      subprocess.run(["git", "-C", repo, "config", "user.name", "Test"], check=True)
+      with open(os.path.join(repo, "README.md"), "w") as f:
+        f.write("init\n")
+      subprocess.run(["git", "-C", repo, "add", "README.md"], check=True)
+      subprocess.run(["git", "-C", repo, "commit", "-m", "init"], check=True, capture_output=True)
+      subprocess.run(
+          ["git", "-C", repo, "worktree", "add", "-b", "wt2-branch", wt2],
+          check=True,
+          capture_output=True,
+      )
+
+      import context_guard
+      titles = {
+          "c1": ("[11:04] ⦿ R16 C++ perf loop", "proj-1"),
+          "c2": ("[20:00] ⦿ PR #195122 WebParagraph", "proj-1"),
+      }
+      with patch.object(
+          context_guard,
+          "get_conversation_db_info",
+          side_effect=lambda cid, _h="": titles.get(cid, ("", "proj-1")),
+      ):
+        # Chat c1 claims `repo` via ninja build command
+        self.assertEqual(
+            self.run_guard({
+                "conversationId": "c1",
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": f"ninja -C {repo}/out/Release"},
+                },
+            }).get("decision"),
+            "allow",
+        )
+
+        # Chat c2 attempting to build or edit in `repo` is blocked by WORKTREE LEASE GUARD
+        out_build = self.run_guard({
+            "conversationId": "c2",
+            "toolCall": {
+                "name": "run_command",
+                "args": {"CommandLine": f"cd {repo} && felt test"},
+            },
+        })
+        self.assertEqual(out_build.get("decision"), "deny")
+        self.assertIn("WORKTREE LEASE GUARD", out_build.get("reason", ""))
+        self.assertIn("conversation://c1", out_build.get("reason", ""))
+
+        out_edit = self.run_guard({
+            "conversationId": "c2",
+            "toolCall": {
+                "name": "write_file",
+                "args": {"Path": os.path.join(repo, "notes.md")},
+            },
+        })
+        self.assertEqual(out_edit.get("decision"), "deny")
+        self.assertIn("WORKTREE LEASE GUARD", out_edit.get("reason", ""))
+
+        # Chat c2 can freely work inside its separate linked worktree `wt2`
+        self.assertEqual(
+            self.run_guard({
+                "conversationId": "c2",
+                "toolCall": {
+                    "name": "write_file",
+                    "args": {"Path": os.path.join(wt2, "notes.md")},
+                },
+            }).get("decision"),
+            "allow",
+        )
+
+        # Once c1 is finalized (`✓`), c2 automatically takes over `repo` without needing override
+        titles["c1"] = ("[11:04] ✓ R16 C++ perf loop", "proj-1")
+        self.assertEqual(
+            self.run_guard({
+                "conversationId": "c2",
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": f"cd {repo} && felt test"},
+                },
+            }).get("decision"),
+            "allow",
+        )
+
+  # Verify shared-config repo allows editing distinct files but blocks colliding edits
+  def test_shared_config_repo_per_file_lease_and_commit_guard(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      repo = os.path.join(tmp_dir, "shared_cfg")
+      subprocess.run(["git", "init", "-b", "main", repo], check=True, capture_output=True)
+      subprocess.run(["git", "-C", repo, "config", "user.email", "t@example.com"], check=True)
+      subprocess.run(["git", "-C", repo, "config", "user.name", "Test"], check=True)
+      file_a = os.path.join(repo, "skill_a.md")
+      file_b = os.path.join(repo, "skill_b.md")
+      with open(file_a, "w") as f:
+        f.write("a1\n")
+      with open(file_b, "w") as f:
+        f.write("b1\n")
+      subprocess.run(["git", "-C", repo, "add", "skill_a.md", "skill_b.md"], check=True)
+      subprocess.run(["git", "-C", repo, "commit", "-m", "init"], check=True, capture_output=True)
+
+      trans_c1 = os.path.join(tmp_dir, "c1.jsonl")
+      trans_c2 = os.path.join(tmp_dir, "c2.jsonl")
+      with open(trans_c1, "w") as f:
+        f.write(
+            json.dumps({
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "tool_calls": [{"name": "write_file", "args": {"Path": file_a}}],
+            })
+            + "\n"
+        )
+      with open(trans_c2, "w") as f:
+        f.write(
+            json.dumps({
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "tool_calls": [{"name": "write_file", "args": {"Path": file_b}}],
+            })
+            + "\n"
+        )
+
+      import context_guard
+      titles = {
+          "c1": ("[10:00] ⦿ Skill A", "proj-1"),
+          "c2": ("[10:05] ⦿ Skill B", "proj-1"),
+      }
+      with patch.dict(os.environ, {"JETSKI_SHARED_CONFIG_REPO": repo}), \
+           patch.object(
+               context_guard,
+               "get_conversation_db_info",
+               side_effect=lambda cid, _h="": titles.get(cid, ("", "proj-1")),
+           ):
+        # c1 edits skill_a.md and c2 edits skill_b.md in the same tree -> both allowed
+        self.assertEqual(
+            self.run_guard({
+                "conversationId": "c1",
+                "transcriptPath": trans_c1,
+                "toolCall": {"name": "write_file", "args": {"Path": file_a}},
+            }).get("decision"),
+            "allow",
+        )
+        self.assertEqual(
+            self.run_guard({
+                "conversationId": "c2",
+                "transcriptPath": trans_c2,
+                "toolCall": {"name": "write_file", "args": {"Path": file_b}},
+            }).get("decision"),
+            "allow",
+        )
+
+        # c2 cannot overwrite c1's leased skill_a.md
+        out_collide = self.run_guard({
+            "conversationId": "c2",
+            "transcriptPath": trans_c2,
+            "toolCall": {"name": "write_file", "args": {"Path": file_a}},
+        })
+        self.assertEqual(out_collide.get("decision"), "deny")
+        self.assertIn("SHARED-FILE LEASE GUARD", out_collide.get("reason", ""))
+
+        # Modify both files on disk so git status shows both dirty
+        with open(file_a, "w") as f:
+          f.write("a2\n")
+        with open(file_b, "w") as f:
+          f.write("b2\n")
+
+        # c2 running `git add .` or `git commit -a` is blocked because skill_a.md is dirty
+        for bad_cmd in (
+            f"git -C {repo} add .",
+            f"git -C {repo} add -A",
+            f"git -C {repo} commit -a -m 'sweep'",
+        ):
+          out_broad = self.run_guard({
+              "conversationId": "c2",
+              "transcriptPath": trans_c2,
+              "toolCall": {"name": "run_command", "args": {"CommandLine": bad_cmd}},
+          })
+          self.assertEqual(out_broad.get("decision"), "deny", msg=bad_cmd)
+          self.assertIn("SHARED-WORKTREE COMMIT GUARD", out_broad.get("reason", ""))
+          self.assertIn("skill_a.md", out_broad.get("reason", ""))
+
+        # If c1 stages skill_a.md in .git/index, c2 cannot run pathspec-less `git commit -m ...`
+        subprocess.run(["git", "-C", repo, "add", "skill_a.md"], check=True)
+        out_index = self.run_guard({
+            "conversationId": "c2",
+            "transcriptPath": trans_c2,
+            "toolCall": {
+                "name": "run_command",
+                "args": {
+                    "CommandLine": (
+                        f"git -C {repo} add skill_b.md && git -C {repo} commit -m 'b'"
+                    )
+                },
+            },
+        })
+        self.assertEqual(out_index.get("decision"), "deny")
+        self.assertIn("SHARED-WORKTREE COMMIT GUARD", out_index.get("reason", ""))
+
+        # Explicit pathspec `git commit -m 'b' -- skill_b.md` is allowed
+        out_explicit = self.run_guard({
+            "conversationId": "c2",
+            "transcriptPath": trans_c2,
+            "toolCall": {
+                "name": "run_command",
+                "args": {
+                    "CommandLine": (
+                        f"git -C {repo} add skill_b.md && "
+                        f"git -C {repo} commit -m 'b' -- skill_b.md"
+                    )
+                },
+            },
+        })
+        self.assertEqual(out_explicit.get("decision"), "allow")
+
+  # Verify foreign-commit push guard blocks pushing another chat's unpushed commit
+  def test_foreign_commit_push_guard_blocks_unpushed_sibling_commit(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      origin = os.path.join(tmp_dir, "origin.git")
+      repo = os.path.join(tmp_dir, "shared_cfg")
+      subprocess.run(
+          ["git", "init", "--bare", "-b", "main", origin],
+          check=True,
+          capture_output=True,
+      )
+      subprocess.run(["git", "init", "-b", "main", repo], check=True, capture_output=True)
+      subprocess.run(["git", "-C", repo, "config", "user.email", "t@example.com"], check=True)
+      subprocess.run(["git", "-C", repo, "config", "user.name", "Test"], check=True)
+      subprocess.run(["git", "-C", repo, "remote", "add", "origin", origin], check=True)
+
+      file_a = os.path.join(repo, "a.md")
+      file_b = os.path.join(repo, "b.md")
+      with open(file_a, "w") as f:
+        f.write("init\n")
+      with open(file_b, "w") as f:
+        f.write("init\n")
+      subprocess.run(["git", "-C", repo, "add", "a.md", "b.md"], check=True)
+      subprocess.run(["git", "-C", repo, "commit", "-m", "init"], check=True, capture_output=True)
+      subprocess.run(
+          ["git", "-C", repo, "push", "-u", "origin", "main"],
+          check=True,
+          capture_output=True,
+      )
+
+      trans_c1 = os.path.join(tmp_dir, "c1.jsonl")
+      trans_c2 = os.path.join(tmp_dir, "c2.jsonl")
+      art_c2 = os.path.join(tmp_dir, "brain", "c2")
+      os.makedirs(os.path.join(art_c2, "scratch"))
+      with open(trans_c1, "w") as f:
+        f.write(
+            json.dumps({"step_index": 1, "type": "USER_INPUT", "content": "commit a"})
+            + "\n"
+        )
+      with open(trans_c2, "w") as f:
+        f.write(
+            json.dumps({
+                "step_index": 1,
+                "type": "USER_INPUT",
+                "content": "commit and push b",
+            })
+            + "\n"
+        )
+
+      import context_guard
+      titles = {
+          "c1": ("[11:04] ⦿ R16 perf skill", "proj-1"),
+          "c2": ("[10:08] ⦿ Skills inventory", "proj-1"),
+      }
+      with patch.dict(os.environ, {"JETSKI_SHARED_CONFIG_REPO": repo}), \
+           patch.object(
+               context_guard,
+               "get_conversation_db_info",
+               side_effect=lambda cid, _h="": titles.get(cid, ("", "proj-1")),
+           ):
+        # c1 edits and commits a.md locally without pushing
+        self.assertEqual(
+            self.run_guard({
+                "conversationId": "c1",
+                "transcriptPath": trans_c1,
+                "toolCall": {"name": "write_file", "args": {"Path": file_a}},
+            }).get("decision"),
+            "allow",
+        )
+        with open(file_a, "w") as f:
+          f.write("c1 change\n")
+        self.assertEqual(
+            self.run_guard({
+                "conversationId": "c1",
+                "transcriptPath": trans_c1,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": f"git -C {repo} commit -m 'Add perf skill' -- a.md"},
+                },
+            }).get("decision"),
+            "allow",
+        )
+        subprocess.run(
+            ["git", "-C", repo, "commit", "-m", "Add perf skill", "--", "a.md"],
+            check=True,
+            capture_output=True,
+        )
+
+        # c2 attempts `git push origin main` -> denied because c1's commit is on main..origin/main
+        out_push = self.run_guard({
+            "conversationId": "c2",
+            "transcriptPath": trans_c2,
+            "artifactDirectoryPath": art_c2,
+            "toolCall": {
+                "name": "run_command",
+                "args": {"CommandLine": f"git -C {repo} push origin main"},
+            },
+        })
+        self.assertEqual(out_push.get("decision"), "deny")
+        self.assertIn("FOREIGN-COMMIT PUSH GUARD", out_push.get("reason", ""))
+        self.assertIn("Add perf skill", out_push.get("reason", ""))
+        self.assertIn("conversation://c1", out_push.get("reason", ""))
+        # c1 receives a turn-start GIT SYNC NOTICE once its commit lands on origin/main
+        subprocess.run(
+            ["git", "-C", repo, "push", "origin", "main"],
+            check=True,
+            capture_output=True,
+        )
+        notice = context_guard.build_git_sync_notice("c1", [repo])
+        self.assertIn("GIT SYNC NOTICE", notice)
+        self.assertIn("Add perf skill", notice)
+        # Second call does not repeat the already-notified commit
+        self.assertEqual(context_guard.build_git_sync_notice("c1", [repo]), "")
+
 
 if __name__ == "__main__":
   unittest.main()

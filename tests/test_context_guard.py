@@ -405,6 +405,36 @@ class TestContextGuard(unittest.TestCase):
       )
       self.assertEqual(out_mid, {})
 
+  # Verify turn-start scope radar lists active sibling chats in the same project
+  def test_scope_radar_lists_active_sibling_chats_in_same_project(self):
+    pdir = os.path.join(self.tmp.name, "projects")
+    rdir = os.path.join(self.tmp.name, "roadmaps")
+    os.makedirs(pdir, exist_ok=True)
+    with open(os.path.join(pdir, "proj-1.json"), "w") as f:
+      json.dump({"id": "proj-1", "name": "Improving Experience"}, f)
+    sdir1 = os.path.join(rdir, "proj-1", "state")
+    os.makedirs(sdir1, exist_ok=True)
+    with open(os.path.join(sdir1, "ea2b5a0f.md"), "w") as f:
+      wt_path = os.path.expanduser("~/Sources/flutter_perf_r16")
+      f.write(
+          f"# [11:04] ⦿ R16 C++ perf loop\nWorking directory: `{wt_path}`\n"
+      )
+    import roadmap
+    roadmap.add_item("proj-1", "ea2b5a0f", "C++ perf loop optimizations.txt")
+    roadmap.set_status("proj-1", "ea2b5a0f", "R1", "doing")
+
+    with patch.object(chat_lifecycle, "auto_title_conversation", return_value=""), \
+         patch.object(context_guard, "summary_db_paths", return_value=[]):
+      out = self.run_guard(
+          inv=0,
+          lastUserInput="Run tests in flutter_perf_r16",
+      )
+      msg = self.message(out)
+      self.assertIn("Active sibling chats in `Improving Experience`", msg)
+      self.assertIn("conversation://ea2b5a0f", msg)
+      self.assertIn("doing: R1", msg)
+      self.assertIn("flutter_perf_r16", msg)
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -412,6 +412,248 @@ def collect_project_directory(
   return {"projects": projects, "exclusive_roots": exclusive_roots}
 
 
+# Limit intra-project sibling radar to chats active within the last 2 hours or holding doing items
+SIBLING_ACTIVE_WINDOW_S = int(
+    os.environ.get("JETSKI_SIBLING_ACTIVE_WINDOW_S", "7200")
+)
+
+
+def get_active_sibling_chats_in_project(
+    project_id: str, exclude_conv_id: str = "", hint_path: str = ""
+) -> list[dict]:
+  """Returns active sibling chats in project_id (owning `doing` items or active within 2h)."""
+  if not project_id or project_id == "outside-of-project":
+    return []
+  import roadmap
+
+  r_root = roadmap.roadmaps_root()
+  now = time.time()
+  doing_by_owner: dict[str, list[str]] = {}
+  try:
+    doc = roadmap.load(project_id)
+    for it in doc.get("items", []):
+      if it.get("status") == "doing" and it.get("owner"):
+        doing_by_owner.setdefault(it["owner"], []).append(it["id"])
+  except Exception:
+    pass
+
+  by_cid: dict[str, dict] = {}
+  query = (
+      "SELECT conversation_id, title, last_modified_time "
+      "FROM conversation_summaries "
+      "WHERE project_id = ? AND parent_conversation_id = '' "
+      "AND (title LIKE '%⦿%' OR title LIKE '%▸%')"
+  )
+  for db_path in summary_db_paths(hint_path):
+    for flags in ("mode=ro", "mode=ro&immutable=1"):
+      try:
+        conn = sqlite3.connect(
+            f"file:{db_path}?{flags}", uri=True, timeout=1.0
+        )
+        try:
+          rows = conn.execute(query, (project_id,)).fetchall()
+        finally:
+          conn.close()
+        for cid, title, lmt in rows:
+          cid_s = str(cid or "").strip()
+          title_s = str(title or "").strip()
+          if not cid_s or cid_s == exclude_conv_id:
+            continue
+          ts = 0.0
+          if lmt and not str(lmt).startswith("0001-"):
+            try:
+              ts = datetime.fromisoformat(
+                  str(lmt).replace("Z", "+00:00")
+              ).timestamp()
+            except Exception:
+              ts = 0.0
+          by_cid[cid_s] = {"cid": cid_s, "title": title_s, "ts": ts, "files": []}
+        break
+      except Exception:
+        continue
+
+  sdir = os.path.join(r_root, project_id, "state")
+  if os.path.isdir(sdir):
+    for sf in sorted(glob.glob(os.path.join(sdir, "*.md"))):
+      cid_s = os.path.splitext(os.path.basename(sf))[0]
+      if not cid_s or cid_s == exclude_conv_id:
+        continue
+      try:
+        mt = os.path.getmtime(sf)
+        with open(sf, "r", encoding="utf-8", errors="ignore") as f:
+          txt = f.read()
+      except OSError:
+        continue
+      first_line = txt.splitlines()[0].lstrip("#").strip() if txt else ""
+      rec = by_cid.setdefault(
+          cid_s,
+          {
+              "cid": cid_s,
+              "title": first_line or f"⦿ {cid_s[:8]}",
+              "ts": mt,
+              "files": [],
+          },
+      )
+      rec["ts"] = max(rec["ts"], mt)
+      if not rec["title"] and first_line:
+        rec["title"] = first_line
+      for m in WORKING_DIR_LINE_RE.findall(txt):
+        norm = _normalize_workspace_root(m, allow_any_dir=True)
+        if norm and norm not in rec["files"]:
+          rec["files"].append(norm)
+      for m in re.findall(r"file://(/[^\s`\"')#]+)", txt):
+        base_f = os.path.basename(m.rstrip("/"))
+        if base_f and base_f not in rec["files"]:
+          rec["files"].append(base_f)
+
+  for owner_cid in doing_by_owner:
+    if owner_cid != exclude_conv_id and owner_cid not in by_cid:
+      t_db, _ = get_conversation_db_info(owner_cid, hint_path)
+      by_cid[owner_cid] = {
+          "cid": owner_cid,
+          "title": t_db or f"⦿ {owner_cid[:8]}",
+          "ts": now,
+          "files": [],
+      }
+
+  active_list: list[dict] = []
+  for cid_s, rec in by_cid.items():
+    doing_items = doing_by_owner.get(cid_s, [])
+    age_s = max(0.0, now - rec["ts"]) if rec["ts"] > 0 else float("inf")
+    if doing_items or age_s <= SIBLING_ACTIVE_WINDOW_S:
+      rec["doing"] = doing_items
+      rec["age_min"] = int(age_s // 60) if rec["ts"] > 0 else -1
+      active_list.append(rec)
+
+  active_list.sort(
+      key=lambda r: (1 if r["doing"] else 0, r["ts"]), reverse=True
+  )
+  return active_list[:6]
+
+
+def build_git_sync_notice(conv_id: str, workspace_paths: list[str]) -> str:
+  """Notifies the chat if its earlier local commits were pushed/cherry-picked by a sibling chat."""
+  if not conv_id:
+    return ""
+  import subprocess
+
+  cand_dirs = [
+      os.path.abspath(os.path.expanduser(w)) for w in (workspace_paths or []) if w
+  ]
+  if not os.environ.get(PROJECTS_DIR_ENV):
+    cfg_dir = os.path.abspath(os.path.expanduser("~/.gemini/config"))
+    if cfg_dir not in cand_dirs and os.path.isdir(cfg_dir):
+      cand_dirs.append(cfg_dir)
+
+  seen_common: set[str] = set()
+  notices: list[str] = []
+  for d in cand_dirs:
+    if not os.path.isdir(d):
+      continue
+    try:
+      res = subprocess.run(
+          ["git", "-C", d, "rev-parse", "--show-toplevel", "--git-common-dir"],
+          capture_output=True,
+          text=True,
+          timeout=1.5,
+          check=False,
+      )
+      if res.returncode != 0:
+        continue
+      lines = [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
+      if len(lines) < 2:
+        continue
+      top_level = os.path.realpath(lines[0])
+      common_dir = os.path.realpath(
+          lines[1] if os.path.isabs(lines[1]) else os.path.join(d, lines[1])
+      )
+      if common_dir in seen_common:
+        continue
+      seen_common.add(common_dir)
+      reg_path = os.path.join(common_dir, "jetski_commits.json")
+      if not os.path.isfile(reg_path):
+        continue
+      with open(reg_path, "r", encoding="utf-8") as f:
+        reg = json.load(f)
+      commits = reg.get("commits") or {}
+      mine = [
+          (sha, info)
+          for sha, info in commits.items()
+          if isinstance(info, dict)
+          and info.get("conv_id") == conv_id
+          and not info.get("pushed_by_owner")
+          and not info.get("notified_pushed")
+      ]
+      if not mine:
+        continue
+      upstream = "@{u}"
+      up_res = subprocess.run(
+          ["git", "-C", top_level, "rev-parse", "--verify", "@{u}"],
+          capture_output=True,
+          text=True,
+          timeout=1.0,
+          check=False,
+      )
+      if up_res.returncode != 0:
+        upstream = "origin/main"
+      log_res = subprocess.run(
+          ["git", "-C", top_level, "log", upstream, "-n", "30", "--format=%H%x00%s"],
+          capture_output=True,
+          text=True,
+          timeout=1.5,
+          check=False,
+      )
+      if log_res.returncode != 0:
+        continue
+      upstream_by_sha: dict[str, str] = {}
+      upstream_by_subj: dict[str, str] = {}
+      for ln in log_res.stdout.splitlines():
+        if "\x00" in ln:
+          h, s = ln.split("\x00", 1)
+          upstream_by_sha[h.strip()] = s.strip()
+          if s.strip():
+            upstream_by_subj.setdefault(s.strip(), h.strip())
+      changed = False
+      for sha, info in mine:
+        subj = str(info.get("subject") or "").strip()
+        remote_sha = ""
+        if sha in upstream_by_sha:
+          remote_sha = sha
+        elif subj and subj in upstream_by_subj:
+          remote_sha = upstream_by_subj[subj]
+        if remote_sha:
+          info["notified_pushed"] = True
+          info["remote_sha"] = remote_sha
+          changed = True
+          via = (
+              f"as `{remote_sha[:7]}` (rebased/cherry-picked)"
+              if remote_sha != sha
+              else f"(`{sha[:7]}`)"
+          )
+          notices.append(
+              f'- Commit `{sha[:7]}` ("{subj}") in `{top_level}` was already '
+              f"pushed to `{upstream}` {via} by another conversation."
+          )
+      if changed:
+        tmp = f"{reg_path}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+          json.dump(reg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, reg_path)
+    except Exception:
+      continue
+
+  if not notices:
+    return ""
+  return (
+      "[GIT SYNC NOTICE]\n"
+      "While this conversation was waiting, another conversation pushed your "
+      "earlier local commit(s):\n"
+      + "\n".join(notices)
+      + "\nDo not re-push or re-cherry-pick them; check `git status` and "
+      "`git log origin/main -n 5` before running further git commands."
+  )
+
+
 def build_scope_radar_notice(
     conv_id: str,
     transcript_path: str,
@@ -426,9 +668,8 @@ def build_scope_radar_notice(
   directory = collect_project_directory(
       transcript_path, include_active_chats=True, exclude_conv_id=conv_id
   )
+  # Emit radar when either sibling chats exist in this project or multiple projects exist
   projects = directory["projects"]
-  if len(projects) < 2:
-    return ""
 
   cur_title, cur_pid = get_conversation_db_info(conv_id, transcript_path)
   if not cur_pid or cur_pid == "outside-of-project":
@@ -445,39 +686,66 @@ def build_scope_radar_notice(
       )
   )
 
-  other_lines: list[str] = []
-  for pid, pinfo in sorted(projects.items(), key=lambda kv: kv[1]["name"]):
-    if pid == cur_pid:
-      continue
-    roots_str = ", ".join(f"`{r}`" for r in pinfo["roots"])
-    ac = pinfo.get("active_chat")
-    if not roots_str and not ac:
-      continue
-    parts = [f"- `{pinfo['name']}`"]
-    if roots_str:
-      parts.append(f"workspace {roots_str}")
-    if ac:
-      ac_title = ac[1] if len(ac[1]) <= 60 else ac[1][:57] + "..."
-      parts.append(f"active chat: `{ac_title}` (`conversation://{ac[0]}`)")
-    other_lines.append(" — ".join(parts))
+  # Collect active sibling chats within the current project to prevent intra-project collisions
+  sibling_lines: list[str] = []
+  if cur_pid and cur_pid != "outside-of-project":
+    for sib in get_active_sibling_chats_in_project(
+        cur_pid, exclude_conv_id=conv_id, hint_path=transcript_path
+    ):
+      stitle = sib["title"] if len(sib["title"]) <= 60 else sib["title"][:57] + "..."
+      meta = [f"`{stitle}` (`conversation://{sib['cid']}`)"]
+      if sib.get("doing"):
+        meta.append(f"doing: {', '.join(sib['doing'])}")
+      if sib.get("files"):
+        meta.append("touched: " + ", ".join(f"`{x}`" for x in sib["files"][:3]))
+      sibling_lines.append("- " + " — ".join(meta))
 
-  if not other_lines:
+  # Collect other active projects only when multiple projects are configured
+  other_lines: list[str] = []
+  if len(projects) >= 2:
+    for pid, pinfo in sorted(projects.items(), key=lambda kv: kv[1]["name"]):
+      if pid == cur_pid:
+        continue
+      roots_str = ", ".join(f"`{r}`" for r in pinfo["roots"])
+      ac = pinfo.get("active_chat")
+      if not roots_str and not ac:
+        continue
+      parts = [f"- `{pinfo['name']}`"]
+      if roots_str:
+        parts.append(f"workspace {roots_str}")
+      if ac:
+        ac_title = ac[1] if len(ac[1]) <= 60 else ac[1][:57] + "..."
+        parts.append(f"active chat: `{ac_title}` (`conversation://{ac[0]}`)")
+      other_lines.append(" — ".join(parts))
+
+  if not other_lines and not sibling_lines:
     return ""
 
-  return (
-      "[SCOPE GUARD: WRONG-CHAT / WRONG-PROJECT RADAR]\n"
+  # Format combined intra-project sibling and cross-project radar blocks
+  blocks = [
+      "[SCOPE GUARD: WRONG-CHAT / WRONG-PROJECT RADAR]",
       f"Current chat: `{cur_title or conv_id}` | Project: `{cur_proj_name}` | "
-      f"Workspace(s): {cur_roots}\n"
-      "Other active projects & workspaces:\n"
-      + "\n".join(other_lines)
-      + "\nIf the user's new request clearly targets another project, workspace, or "
-      f"chat topic listed above rather than `{cur_proj_name}`, DO NOT start "
+      f"Workspace(s): {cur_roots}",
+  ]
+  if sibling_lines:
+    blocks.append(
+        f"Active sibling chats in `{cur_proj_name}` "
+        "(avoid colliding on their files/worktrees):"
+    )
+    blocks.extend(sibling_lines)
+  if other_lines:
+    blocks.append("Other active projects & workspaces:")
+    blocks.extend(other_lines)
+  blocks.append(
+      "If the user's new request clearly targets another project, workspace, or "
+      f"sibling chat topic listed above rather than `{cur_title or cur_proj_name}`, DO NOT start "
       "investigating, reading foreign project files, or running commands! "
       "Reply immediately warning the user which project/chat the request belongs to "
       "(`[👉 <Target Chat Title>](conversation://<target_conv_id>)`), and ask whether "
       'to forward the message via `agentapi send-message <target_conv_id> "<user '
       'message>"` or execute it in this chat.'
   )
+  return "\n".join(blocks)
 
 
 # Tool results may indent this line (e.g. "\n\n\t\t\t\tThe command exited ..." on
@@ -1127,13 +1395,16 @@ def run(data: dict, log: dict) -> dict:
     if state.get("auto_title_notice"):
       messages.append(state.pop("auto_title_notice"))
       save_state(state_path, state)
-    # Inject cross-project scope radar only at turn start when a user prompt is present
+    # Inject cross-project / sibling scope radar and git sync notice at turn start
     if is_turn_start and last_user_input:
       radar_notice = build_scope_radar_notice(
           conv_id, transcript_path, workspace_paths, last_user_input
       )
       if radar_notice:
         messages.append(radar_notice)
+      sync_notice = build_git_sync_notice(conv_id, workspace_paths)
+      if sync_notice:
+        messages.append(sync_notice)
     soft_due = steps - int(
         state.get("soft_last_steps", -SOFT_REMIND_EVERY_STEPS)
     ) >= SOFT_REMIND_EVERY_STEPS

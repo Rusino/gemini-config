@@ -952,13 +952,19 @@ def _cross_project_paths(artifact_dir: str, conv_id: str) -> tuple[str, str]:
   )
 
 
+# Return candidate directories targeted by a git or build command
 def _extract_cmd_target_dirs(cmd: str, workspace_paths: list[str]) -> list[str]:
-  """Candidate directories targeted by a git commit / upload command."""
+  """Candidate directories targeted by a git or build command."""
   cmd_code = strip_heredocs(cmd)
   dirs: list[str] = []
-  for m in re.finditer(r"(?:^|[\s;&|(`])cd\s+([^\s;&|)`\"']+)", cmd_code):
+  # Match explicit directory switches and build output directories
+  for m in re.finditer(r"(?:^|[\s;&|(`])cd\s+[\"']?([^\"'\s;&|)`]+)[\"']?", cmd_code):
     dirs.append(os.path.abspath(os.path.expanduser(m.group(1))))
-  for m in re.finditer(r"\bgit\s+-C\s+([^\s;&|)`\"']+)", cmd_code):
+  for m in re.finditer(r"\bgit\s+-C\s+[\"']?([^\"'\s;&|)`]+)[\"']?", cmd_code):
+    dirs.append(os.path.abspath(os.path.expanduser(m.group(1))))
+  for m in re.finditer(
+      r"\b(?:auto)?(?:ninja|siso)\s+-C\s+[\"']?([^\"'\s;&|)`]+)[\"']?", cmd_code
+  ):
     dirs.append(os.path.abspath(os.path.expanduser(m.group(1))))
   from context_guard import WORKSPACE_ROOT_RE
 
@@ -969,6 +975,874 @@ def _extract_cmd_target_dirs(cmd: str, workspace_paths: list[str]) -> list[str]:
       if wp:
         dirs.append(os.path.abspath(os.path.expanduser(wp)))
   return dirs
+
+
+# Expire worktree and file leases after 30 minutes of inactivity
+WORKTREE_LEASE_TTL_S = int(os.environ.get("JETSKI_WORKTREE_LEASE_TTL_S", "1800"))
+
+WORKTREE_CLAIMING_CMD_RE = re.compile(
+    r"(?:^|(?<=[\s;&|(`]))(?:"
+    r"git(?:\s+(?:-[Cc]\s+\S+|--[a-z-]+(?:=\S+)?))*\s+"
+    r"(?:checkout|switch|reset|rebase|cherry-pick|merge|commit|stash|clean|am|apply)\b"
+    r"|(?:auto)?ninja\b|siso\b|felt\s+test\b|flutter\s+test\b|gn\s+gen\b"
+    r")"
+)
+
+
+def _parallel_guard_paths(artifact_dir: str, conv_id: str) -> tuple[str, str]:
+  base = os.path.join(artifact_dir, "scratch") if artifact_dir else "/tmp"
+  suffix = "" if artifact_dir else f"_{conv_id}"
+  return (
+      os.path.join(base, f".parallel_chat_override{suffix}.json"),
+      os.path.join(base, f".parallel_chat_guard_state{suffix}.json"),
+  )
+
+
+def _record_parallel_guard_block(guard_state_path: str, transcript_path: str) -> None:
+  try:
+    os.makedirs(os.path.dirname(guard_state_path), exist_ok=True)
+    with open(guard_state_path, "w", encoding="utf-8") as f:
+      json.dump(
+          {"blocked_at_user_step": _last_user_step_index(transcript_path)}, f
+      )
+  except Exception:
+    pass
+
+
+def _resolve_git_dirs(path: str) -> tuple[str, str, str] | None:
+  """Returns (top_level, git_dir, git_common_dir) as realpaths, or None."""
+  if not path:
+    return None
+  d = os.path.abspath(os.path.expanduser(path.strip().strip('"').strip("'")))
+  for _ in range(5):
+    if os.path.isdir(d):
+      break
+    parent = os.path.dirname(d)
+    if not parent or parent == d:
+      return None
+    d = parent
+  else:
+    return None
+  try:
+    res = subprocess.run(
+        ["git", "-C", d, "rev-parse", "--show-toplevel", "--git-dir", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+        timeout=1.5,
+        check=False,
+    )
+    if res.returncode != 0:
+      return None
+    lines = [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
+    if len(lines) < 3:
+      return None
+    top_level = os.path.realpath(lines[0])
+    git_dir = os.path.realpath(
+        lines[1] if os.path.isabs(lines[1]) else os.path.join(d, lines[1])
+    )
+    common_dir = os.path.realpath(
+        lines[2] if os.path.isabs(lines[2]) else os.path.join(d, lines[2])
+    )
+    return top_level, git_dir, common_dir
+  except Exception:
+    return None
+
+
+def _is_shared_config_repo(top_level: str) -> bool:
+  """True when top_level is ~/.gemini/config (or a test shared-config repo)."""
+  real_top = os.path.realpath(top_level)
+  cfg = os.path.realpath(os.path.expanduser("~/.gemini/config"))
+  if real_top == cfg:
+    return True
+  env_shared = os.environ.get("JETSKI_SHARED_CONFIG_REPO", "").strip()
+  if env_shared and real_top == os.path.realpath(os.path.expanduser(env_shared)):
+    return True
+  return False
+
+
+def _is_conv_still_active_tip(
+    owner_cid: str, current_cid: str, transcript_path: str
+) -> tuple[bool, str]:
+  """True if owner_cid is another conversation that has not closed or handed off."""
+  if not owner_cid or owner_cid == current_cid:
+    return False, ""
+  from context_guard import (
+      APP_DATA_DIR_CANDIDATES,
+      app_data_dir_from_path,
+      get_conversation_db_info,
+  )
+
+  title, _ = get_conversation_db_info(owner_cid, transcript_path)
+  if title and any(m in title for m in ("✓", "«", "»", "‹✓›", "«»")):
+    return False, title
+
+  cand_dirs = [app_data_dir_from_path(transcript_path)] + [
+      os.path.expanduser(d) for d in APP_DATA_DIR_CANDIDATES
+  ]
+  for ad in cand_dirs:
+    if not ad:
+      continue
+    st_file = os.path.join(ad, "brain", owner_cid, "scratch", ".context_guard_state.json")
+    if os.path.isfile(st_file):
+      try:
+        with open(st_file, "r", encoding="utf-8") as f:
+          st = json.load(f)
+        if st.get("handoff_completed") or st.get("handed_off_to"):
+          return False, title
+      except Exception:
+        pass
+  return True, title
+
+
+def _read_json_file(path: str) -> dict:
+  try:
+    if os.path.isfile(path):
+      with open(path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+      if isinstance(obj, dict):
+        return obj
+  except Exception:
+    pass
+  return {}
+
+
+def _write_json_atomic(path: str, data: dict) -> None:
+  try:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+      json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+  except Exception:
+    pass
+
+
+def _files_touched_in_chat(
+    transcript_path: str, conv_id: str, current_step_idx: int = -1
+) -> set[str]:
+  """Realpaths of files modified via EDIT_TOOLS in this chat or its project chain state file."""
+  touched: set[str] = set()
+  for step in _load_transcript_steps(transcript_path, current_step_idx):
+    if step.get("type") != "PLANNER_RESPONSE":
+      continue
+    for tc in step.get("tool_calls") or []:
+      if tc.get("name", "") in EDIT_TOOLS:
+        tf = get_tool_target_file(tc.get("args") or {})
+        if tf:
+          touched.add(
+              os.path.realpath(os.path.expanduser(tf.strip().strip('"').strip("'")))
+          )
+  if conv_id:
+    try:
+      from context_guard import get_conversation_db_info
+      import roadmap
+
+      _, pid = get_conversation_db_info(conv_id, transcript_path)
+      if pid and pid != "outside-of-project":
+        sf = roadmap.state_path(pid, conv_id)
+        if os.path.isfile(sf):
+          with open(sf, "r", encoding="utf-8", errors="ignore") as f:
+            txt = f.read()
+          for m in re.findall(r"file://(/[^\s`\"')#]+)", txt):
+            touched.add(os.path.realpath(m))
+    except Exception:
+      pass
+  return touched
+
+
+def _parse_git_subcommand_invocations(cmd: str, target_subcmd: str) -> list[list[str]]:
+  """Returns argument lists for each real `git <target_subcmd>` invocation in cmd."""
+  cmd_code = strip_heredocs(cmd)
+  results: list[list[str]] = []
+  for seg in re.split(r"&&|\|\||;|\n", cmd_code):
+    seg = seg.strip()
+    if not seg or "git" not in seg:
+      continue
+    if re.match(r"^(?:grep|egrep|fgrep|rg|echo|cat)\b", seg):
+      continue
+    try:
+      tokens = shlex.split(seg, posix=True)
+    except ValueError:
+      continue
+    i = 0
+    while i < len(tokens):
+      if _clean_cmd_token(tokens[i]) == "git":
+        j = i + 1
+        while j < len(tokens):
+          tok = tokens[j]
+          if tok in ("-C", "-c", "--git-dir", "--work-tree", "--namespace"):
+            j += 2
+          elif tok.startswith("-"):
+            j += 1
+          else:
+            break
+        if j < len(tokens) and tokens[j] == target_subcmd:
+          results.append(tokens[j + 1 :])
+        break
+      i += 1
+  return results
+
+
+def _analyze_git_add_args(args_list: list[str]) -> tuple[bool, list[str]]:
+  """Returns (is_broad, explicit_paths) for `git add <args>`."""
+  is_broad = False
+  paths: list[str] = []
+  after_dd = False
+  for a in args_list:
+    if after_dd:
+      paths.append(a)
+      continue
+    if a == "--":
+      after_dd = True
+      continue
+    if a in ("-A", "--all", "-u", "--update"):
+      is_broad = True
+    elif a.startswith("-") and not a.startswith("--") and ("A" in a or "u" in a):
+      is_broad = True
+    elif not a.startswith("-"):
+      if a in (".", "./", "*"):
+        is_broad = True
+      else:
+        paths.append(a)
+  return is_broad, paths
+
+
+def _analyze_git_commit_args(args_list: list[str]) -> tuple[bool, list[str]]:
+  """Returns (is_broad_all, explicit_paths) for `git commit <args>`."""
+  is_broad = False
+  paths: list[str] = []
+  after_dd = False
+  i = 0
+  opts_with_val = {
+      "-m",
+      "--message",
+      "-F",
+      "--file",
+      "-c",
+      "--reedit-message",
+      "-C",
+      "--reuse-message",
+      "--author",
+      "--date",
+      "--cleanup",
+      "-u",
+      "--untracked-files",
+      "-S",
+      "--gpg-sign",
+  }
+  while i < len(args_list):
+    a = args_list[i]
+    if after_dd:
+      paths.append(a)
+      i += 1
+      continue
+    if a == "--":
+      after_dd = True
+      i += 1
+      continue
+    if a in opts_with_val:
+      i += 2
+      continue
+    if a in ("-a", "--all"):
+      is_broad = True
+    elif a.startswith("-") and not a.startswith("--"):
+      # Combined short flags such as `-am "msg"` or `-ma "msg"`
+      flag_chars = a[1:]
+      if "m" in flag_chars or "F" in flag_chars or "c" in flag_chars or "C" in flag_chars:
+        idx_val = min(
+            idx for idx, ch in enumerate(flag_chars) if ch in ("m", "F", "c", "C")
+        )
+        if "a" in flag_chars[:idx_val]:
+          is_broad = True
+        if idx_val == len(flag_chars) - 1:
+          i += 2
+          continue
+      elif "a" in flag_chars:
+        is_broad = True
+    elif not a.startswith("-"):
+      if a in (".", "./"):
+        is_broad = True
+      else:
+        paths.append(a)
+    i += 1
+  return is_broad, paths
+
+
+def _git_head_sha(repo_root: str) -> str:
+  try:
+    res = subprocess.run(
+        ["git", "-C", repo_root, "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        timeout=1.0,
+        check=False,
+    )
+    if res.returncode == 0:
+      return res.stdout.strip()
+  except Exception:
+    pass
+  return ""
+
+
+def _sync_repo_commits(top_level: str, git_common_dir: str) -> dict:
+  """Attributes any newly created commits since the last pending git commit call."""
+  reg_path = os.path.join(git_common_dir, "jetski_commits.json")
+  reg = _read_json_file(reg_path)
+  pending_map = reg.get("pending")
+  if not isinstance(pending_map, dict) or top_level not in pending_map:
+    return reg
+  pend = pending_map.get(top_level) or {}
+  head_before = str(pend.get("head_before") or "").strip()
+  cur_head = _git_head_sha(top_level)
+  if not cur_head or not head_before or cur_head == head_before:
+    return reg
+  try:
+    res = subprocess.run(
+        ["git", "-C", top_level, "log", "--format=%H%x00%s", f"{head_before}..{cur_head}"],
+        capture_output=True,
+        text=True,
+        timeout=1.5,
+        check=False,
+    )
+    if res.returncode == 0:
+      commits = reg.setdefault("commits", {})
+      now = time.time()
+      for ln in res.stdout.splitlines():
+        if "\x00" in ln:
+          sha, subj = ln.split("\x00", 1)
+          sha = sha.strip()
+          if sha and sha not in commits:
+            commits[sha] = {
+                "conv_id": pend.get("conv_id", ""),
+                "title": pend.get("title", ""),
+                "subject": subj.strip(),
+                "repo": top_level,
+                "ts": now,
+                "pushed_by_owner": bool(pend.get("pushed_by_owner")),
+            }
+      pending_map.pop(top_level, None)
+      _write_json_atomic(reg_path, reg)
+  except Exception:
+    pass
+  return reg
+
+
+def _active_foreign_file_leases(
+    git_dir: str, effective_cid: str, transcript_path: str
+) -> dict[str, dict]:
+  """Returns {rel_path: lease_info} for files actively leased by other conversations."""
+  now = time.time()
+  data = _read_json_file(os.path.join(git_dir, "jetski_file_leases.json"))
+  files = data.get("files") or {}
+  out: dict[str, dict] = {}
+  for rel, info in files.items():
+    if not isinstance(info, dict):
+      continue
+    owner_cid = str(info.get("conv_id") or "")
+    ts = float(info.get("ts") or 0.0)
+    if (
+        owner_cid
+        and owner_cid != effective_cid
+        and now - ts < WORKTREE_LEASE_TTL_S
+    ):
+      still_active, db_title = _is_conv_still_active_tip(
+          owner_cid, effective_cid, transcript_path
+      )
+      if still_active:
+        out[rel] = {
+            **info,
+            "title": db_title or info.get("title") or owner_cid[:8],
+        }
+  return out
+
+
+def parallel_chat_isolation_denial(
+    tool_name: str,
+    tool_args: dict,
+    conv_id: str,
+    parent_conv_id: str,
+    transcript_path: str,
+    artifact_dir: str,
+    workspace_paths: list[str],
+    step_idx: int = -1,
+) -> str:
+  """Enforces per-worktree leases, shared-repo staging, and commit-ownership push guards."""
+  effective_cid = parent_conv_id or conv_id
+  if not effective_cid:
+    return ""
+
+  override_path, guard_state_path = _parallel_guard_paths(
+      artifact_dir, effective_cid
+  )
+
+  if tool_name in EDIT_TOOLS:
+    raw_target = get_tool_target_file(tool_args)
+    if not raw_target:
+      return ""
+    clean_target = os.path.abspath(
+        os.path.expanduser(raw_target.strip().strip('"').strip("'"))
+    )
+    if clean_target == os.path.abspath(override_path) or os.path.basename(
+        clean_target
+    ).startswith(".parallel_chat_override"):
+      if os.path.exists(guard_state_path):
+        gstate = _read_json_file(guard_state_path)
+        blocked_step = int(gstate.get("blocked_at_user_step", -1))
+        if (
+            blocked_step >= 0
+            and _last_user_step_index(transcript_path) <= blocked_step
+        ):
+          return (
+              "[PARALLEL-CHAT GUARD] You cannot create `.parallel_chat_override.json` "
+              "in the same turn that a parallel-chat guard blocked your action! "
+              "Stop immediately, explain the collision to the user, and wait for "
+              "the user's confirmation in the next turn."
+          )
+      return ""
+
+    # Skip agent scratch/brain/roadmap/project/log files
+    from context_guard import app_data_dir_from_path, get_conversation_db_info
+
+    if (
+        clean_target.startswith("/tmp/jetski_")
+        or app_data_dir_from_path(clean_target)
+        or any(
+            seg in clean_target.replace("\\", "/")
+            for seg in (
+                "/.gemini/config/logs/",
+                "/.gemini/config/roadmaps/",
+                "/.gemini/config/projects/",
+            )
+        )
+    ):
+      return ""
+
+    git_info = _resolve_git_dirs(clean_target)
+    if not git_info:
+      return ""
+    top_level, git_dir, git_common_dir = git_info
+    _sync_repo_commits(top_level, git_common_dir)
+    now = time.time()
+    cur_title, _ = get_conversation_db_info(effective_cid, transcript_path)
+
+    if _is_shared_config_repo(top_level):
+      rel_path = os.path.relpath(os.path.realpath(clean_target), top_level)
+      lease_file = os.path.join(git_dir, "jetski_file_leases.json")
+      data = _read_json_file(lease_file)
+      files_map = data.get("files") if isinstance(data.get("files"), dict) else {}
+      existing = files_map.get(rel_path)
+      if isinstance(existing, dict):
+        owner_cid = str(existing.get("conv_id") or "")
+        ts = float(existing.get("ts") or 0.0)
+        if (
+            owner_cid
+            and owner_cid != effective_cid
+            and now - ts < WORKTREE_LEASE_TTL_S
+            and not os.path.exists(override_path)
+        ):
+          still_active, db_title = _is_conv_still_active_tip(
+              owner_cid, effective_cid, transcript_path
+          )
+          if still_active:
+            _record_parallel_guard_block(guard_state_path, transcript_path)
+            owner_label = db_title or existing.get("title") or owner_cid[:8]
+            age_m = int(max(1, (now - ts) // 60))
+            return (
+                f"[SHARED-FILE LEASE GUARD] File `{rel_path}` in `{top_level}` is currently "
+                f"leased by another active conversation (`{owner_label}` -> "
+                f"`conversation://{owner_cid}`, edited {age_m}m ago). Do NOT overwrite "
+                f"another active chat's file concurrently! Ask the user first; only after "
+                f"the user explicitly confirms in a subsequent turn may you write "
+                f"`{override_path}`."
+            )
+      pruned = {
+          k: v
+          for k, v in files_map.items()
+          if isinstance(v, dict) and now - float(v.get("ts") or 0.0) < WORKTREE_LEASE_TTL_S
+      }
+      pruned[rel_path] = {
+          "conv_id": effective_cid,
+          "title": cur_title,
+          "ts": now,
+      }
+      _write_json_atomic(lease_file, {"files": pruned})
+      return ""
+
+    # Code repository / worktree: enforce exclusive per-worktree lease
+    lease_file = os.path.join(git_dir, "jetski_lease.json")
+    existing = _read_json_file(lease_file)
+    owner_cid = str(existing.get("conv_id") or "")
+    ts = float(existing.get("ts") or 0.0)
+    if (
+        owner_cid
+        and owner_cid != effective_cid
+        and now - ts < WORKTREE_LEASE_TTL_S
+        and not os.path.exists(override_path)
+    ):
+      still_active, db_title = _is_conv_still_active_tip(
+          owner_cid, effective_cid, transcript_path
+      )
+      if still_active:
+        _record_parallel_guard_block(guard_state_path, transcript_path)
+        owner_label = db_title or existing.get("title") or owner_cid[:8]
+        age_m = int(max(1, (now - ts) // 60))
+        return (
+            f"[WORKTREE LEASE GUARD] Worktree `{top_level}` is currently leased by "
+            f"another active conversation (`{owner_label}` -> `conversation://{owner_cid}`, "
+            f"active {age_m}m ago). Sharing a single code worktree or `out/` build directory "
+            f"between concurrent chats causes branch, build, and test collisions! "
+            f"Create and use a separate git worktree (e.g. "
+            f"`git -C {top_level} worktree add {top_level}_wt_{effective_cid[:6]} -b <branch>`) "
+            f"or ask the user whether to take over `{top_level}`. Only after the user "
+            f"explicitly confirms in a subsequent turn may you write `{override_path}`."
+        )
+    _write_json_atomic(
+        lease_file,
+        {
+            "conv_id": effective_cid,
+            "title": cur_title,
+            "ts": now,
+            "worktree": top_level,
+        },
+    )
+    return ""
+
+  if tool_name != "run_command":
+    return ""
+
+  cmd_str = str(tool_args.get("CommandLine", "")).strip()
+  if not cmd_str:
+    return ""
+  cmd_code = strip_heredocs(cmd_str)
+  if re.match(r"^\s*(?:grep|egrep|fgrep|rg|git\s+grep|echo|cat)\b", cmd_code):
+    return ""
+
+  cand_dirs = _extract_cmd_target_dirs(cmd_str, workspace_paths)
+  if not cand_dirs:
+    return ""
+
+  resolved_repos: list[tuple[str, str, str]] = []
+  seen_tops: set[str] = set()
+  for d in cand_dirs:
+    info = _resolve_git_dirs(d)
+    if info and info[0] not in seen_tops:
+      seen_tops.add(info[0])
+      resolved_repos.append(info)
+  if not resolved_repos:
+    return ""
+
+  from context_guard import get_conversation_db_info
+
+  now = time.time()
+  cur_title, _ = get_conversation_db_info(effective_cid, transcript_path)
+  add_invocations = _parse_git_subcommand_invocations(cmd_str, "add")
+  commit_invocations = _parse_git_subcommand_invocations(cmd_str, "commit")
+  push_invocations = [
+      args
+      for args in _parse_git_subcommand_invocations(cmd_str, "push")
+      if not any(a in ("-h", "--help", "help", "--delete", "-d") for a in args)
+  ]
+  is_claiming_cmd = bool(WORKTREE_CLAIMING_CMD_RE.search(cmd_code))
+
+  for top_level, git_dir, git_common_dir in resolved_repos:
+    reg = _sync_repo_commits(top_level, git_common_dir)
+
+    # Code worktree lease check on mutating git / build / test commands
+    if not _is_shared_config_repo(top_level) and is_claiming_cmd:
+      lease_file = os.path.join(git_dir, "jetski_lease.json")
+      existing = _read_json_file(lease_file)
+      owner_cid = str(existing.get("conv_id") or "")
+      ts = float(existing.get("ts") or 0.0)
+      if (
+          owner_cid
+          and owner_cid != effective_cid
+          and now - ts < WORKTREE_LEASE_TTL_S
+          and not os.path.exists(override_path)
+      ):
+        still_active, db_title = _is_conv_still_active_tip(
+            owner_cid, effective_cid, transcript_path
+        )
+        if still_active:
+          _record_parallel_guard_block(guard_state_path, transcript_path)
+          owner_label = db_title or existing.get("title") or owner_cid[:8]
+          age_m = int(max(1, (now - ts) // 60))
+          return (
+              f"[WORKTREE LEASE GUARD] Worktree `{top_level}` is currently leased by "
+              f"another active conversation (`{owner_label}` -> `conversation://{owner_cid}`, "
+              f"active {age_m}m ago). Do NOT run mutating git commands or builds (`ninja`/`felt`) "
+              f"inside another active chat's worktree! Create a separate git worktree "
+              f"(`git -C {top_level} worktree add {top_level}_wt_{effective_cid[:6]} -b <branch>`) "
+              f"or ask the user whether to take over `{top_level}`. Only after the user "
+              f"explicitly confirms in a subsequent turn may you write `{override_path}`."
+          )
+      _write_json_atomic(
+          lease_file,
+          {
+              "conv_id": effective_cid,
+              "title": cur_title,
+              "ts": now,
+              "worktree": top_level,
+          },
+      )
+
+    # Shared-worktree per-file stage and commit guard
+    if (add_invocations or commit_invocations) and not os.path.exists(override_path):
+      touched_abs = _files_touched_in_chat(transcript_path, effective_cid, step_idx)
+      lease_data = _read_json_file(os.path.join(git_dir, "jetski_file_leases.json"))
+      for rel, linfo in (lease_data.get("files") or {}).items():
+        if isinstance(linfo, dict) and linfo.get("conv_id") == effective_cid:
+          touched_abs.add(os.path.realpath(os.path.join(top_level, rel)))
+      touched_in_repo = {
+          os.path.relpath(p, top_level)
+          for p in touched_abs
+          if p.startswith(top_level + os.sep)
+      }
+      foreign_leased = _active_foreign_file_leases(
+          git_dir, effective_cid, transcript_path
+      )
+
+      broad_add = False
+      explicit_add_rels: set[str] = set()
+      for a_args in add_invocations:
+        b, paths = _analyze_git_add_args(a_args)
+        if b:
+          broad_add = True
+        for p in paths:
+          abs_p = os.path.realpath(
+              p if os.path.isabs(p) else os.path.join(top_level, p)
+          )
+          if abs_p == top_level:
+            broad_add = True
+          elif abs_p.startswith(top_level + os.sep):
+            explicit_add_rels.add(os.path.relpath(abs_p, top_level))
+
+      broad_commit = False
+      pathspec_less_commit = False
+      explicit_commit_rels: set[str] = set()
+      for c_args in commit_invocations:
+        if any(a in ("--amend", "-h", "--help", "help") for a in c_args):
+          continue
+        b, paths = _analyze_git_commit_args(c_args)
+        if b:
+          broad_commit = True
+        elif not paths:
+          pathspec_less_commit = True
+        else:
+          for p in paths:
+            abs_p = os.path.realpath(
+                p if os.path.isabs(p) else os.path.join(top_level, p)
+            )
+            if abs_p == top_level:
+              broad_commit = True
+            elif abs_p.startswith(top_level + os.sep):
+              explicit_commit_rels.add(os.path.relpath(abs_p, top_level))
+
+      # Block explicitly staging or committing a file actively leased by another chat
+      for rel in sorted(explicit_add_rels | explicit_commit_rels):
+        if rel in foreign_leased and rel not in touched_in_repo:
+          finfo = foreign_leased[rel]
+          _record_parallel_guard_block(guard_state_path, transcript_path)
+          own_list = (
+              ", ".join(f"`{x}`" for x in sorted(touched_in_repo)) or "none"
+          )
+          return (
+              f"[SHARED-WORKTREE COMMIT GUARD] Cannot stage or commit `{rel}` in `{top_level}`: "
+              f"that file is actively leased by another conversation (`{finfo['title']}` -> "
+              f"`conversation://{finfo['conv_id']}`). Stage and commit only the files you "
+              f"modified in this conversation ({own_list})."
+          )
+
+      # Block broad git add/commit when foreign dirty files exist in the working tree
+      if broad_add or broad_commit:
+        try:
+          st_res = subprocess.run(
+              ["git", "-C", top_level, "status", "--porcelain", "-uall"],
+              capture_output=True,
+              text=True,
+              timeout=1.5,
+              check=False,
+          )
+          dirty_rels: list[str] = []
+          if st_res.returncode == 0:
+            for ln in st_res.stdout.splitlines():
+              if len(ln) > 3:
+                raw_p = ln[3:].strip().split(" -> ")[-1].strip('"')
+                if raw_p:
+                  dirty_rels.append(raw_p)
+          foreign_dirty = [
+              r
+              for r in dirty_rels
+              if r in foreign_leased
+              or (touched_in_repo and r not in touched_in_repo)
+          ]
+          if foreign_dirty:
+            _record_parallel_guard_block(guard_state_path, transcript_path)
+            own_hint = (
+                " ".join(sorted(touched_in_repo))
+                if touched_in_repo
+                else "<your_file1> <your_file2>"
+            )
+            foreign_list = ", ".join(f"`{x}`" for x in foreign_dirty[:5])
+            return (
+                f"[SHARED-WORKTREE COMMIT GUARD] Working tree `{top_level}` contains modified "
+                f"or untracked files from other conversations ({foreign_list}). "
+                f"Never run `git add .`, `git add -A`, or `git commit -a` in a shared working "
+                f"tree! Stage and commit ONLY your own files explicitly:\n"
+                f"`git -C {top_level} add -- {own_hint} && "
+                f"git -C {top_level} commit -m \"...\" -- {own_hint}`"
+            )
+        except Exception:
+          pass
+
+      # Block pathspec-less git commit when .git/index already has foreign staged files
+      if pathspec_less_commit:
+        try:
+          cached_res = subprocess.run(
+              ["git", "-C", top_level, "diff", "--cached", "--name-only"],
+              capture_output=True,
+              text=True,
+              timeout=1.5,
+              check=False,
+          )
+          if cached_res.returncode == 0:
+            staged_rels = [
+                ln.strip() for ln in cached_res.stdout.splitlines() if ln.strip()
+            ]
+            allowed_rels = touched_in_repo | explicit_add_rels
+            foreign_staged = [
+                r
+                for r in staged_rels
+                if r in foreign_leased
+                or (allowed_rels and r not in allowed_rels)
+            ]
+            if foreign_staged:
+              _record_parallel_guard_block(guard_state_path, transcript_path)
+              own_hint = (
+                  " ".join(sorted(allowed_rels))
+                  if allowed_rels
+                  else "<your_file1> <your_file2>"
+              )
+              foreign_list = ", ".join(f"`{x}`" for x in foreign_staged[:5])
+              return (
+                  f"[SHARED-WORKTREE COMMIT GUARD] The Git index in `{top_level}` currently has "
+                  f"staged file(s) from another conversation ({foreign_list}). "
+                  f"Running `git commit` without file pathspecs would sweep them into your commit! "
+                  f"Pass explicit file pathspecs to `git commit`:\n"
+                  f"`git -C {top_level} commit -m \"...\" -- {own_hint}`"
+              )
+        except Exception:
+          pass
+
+    # Foreign-commit push guard before git push
+    if push_invocations and not os.path.exists(override_path):
+      try:
+        upstream = "@{u}"
+        up_res = subprocess.run(
+            ["git", "-C", top_level, "rev-parse", "--verify", "@{u}"],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            check=False,
+        )
+        if up_res.returncode != 0:
+          upstream = "origin/main"
+        rev_res = subprocess.run(
+            ["git", "-C", top_level, "log", "--format=%H%x00%s", f"{upstream}..HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+            check=False,
+        )
+        commits_map = reg.get("commits") if isinstance(reg.get("commits"), dict) else {}
+        foreign_leased = _active_foreign_file_leases(
+            git_dir, effective_cid, transcript_path
+        )
+        touched_abs = _files_touched_in_chat(transcript_path, effective_cid, step_idx)
+        touched_in_repo = {
+            os.path.relpath(p, top_level)
+            for p in touched_abs
+            if p.startswith(top_level + os.sep)
+        }
+        foreign_commits: list[str] = []
+        own_unpushed_shas: list[str] = []
+        if rev_res.returncode == 0:
+          for ln in rev_res.stdout.splitlines():
+            if "\x00" not in ln:
+              continue
+            sha, subj = [x.strip() for x in ln.split("\x00", 1)]
+            if not sha:
+              continue
+            cinfo = commits_map.get(sha)
+            if isinstance(cinfo, dict):
+              owner_cid = str(cinfo.get("conv_id") or "")
+              if owner_cid == effective_cid:
+                own_unpushed_shas.append(sha)
+              elif owner_cid:
+                still_active, db_title = _is_conv_still_active_tip(
+                    owner_cid, effective_cid, transcript_path
+                )
+                if still_active:
+                  owner_label = db_title or cinfo.get("title") or owner_cid[:8]
+                  foreign_commits.append(
+                      f"`{sha[:7]}` (\"{subj}\", by `{owner_label}` -> "
+                      f"`conversation://{owner_cid}`)"
+                  )
+            elif foreign_leased:
+              dt_res = subprocess.run(
+                  ["git", "-C", top_level, "diff-tree", "--no-commit-id", "--name-only", "-r", sha],
+                  capture_output=True,
+                  text=True,
+                  timeout=1.0,
+                  check=False,
+              )
+              if dt_res.returncode == 0:
+                c_files = [x.strip() for x in dt_res.stdout.splitlines() if x.strip()]
+                if (
+                    c_files
+                    and all(f in foreign_leased for f in c_files)
+                    and not any(f in touched_in_repo for f in c_files)
+                ):
+                  finfo = foreign_leased[c_files[0]]
+                  foreign_commits.append(
+                      f"`{sha[:7]}` (\"{subj}\", by `{finfo['title']}` -> "
+                      f"`conversation://{finfo['conv_id']}`)"
+                  )
+        if foreign_commits:
+          _record_parallel_guard_block(guard_state_path, transcript_path)
+          return (
+              f"[FOREIGN-COMMIT PUSH GUARD] Branch in `{top_level}` has unpushed commit(s) "
+              f"created by another active conversation: {', '.join(foreign_commits)}. "
+              f"Do NOT push another chat's local commits without explicit user permission! "
+              f"Ask the user whether to push them together with yours; only after the user "
+              f"explicitly confirms in a subsequent turn may you write `{override_path}`."
+          )
+        if own_unpushed_shas:
+          for sha in own_unpushed_shas:
+            if isinstance(commits_map.get(sha), dict):
+              commits_map[sha]["pushed_by_owner"] = True
+          _write_json_atomic(
+              os.path.join(git_common_dir, "jetski_commits.json"), reg
+          )
+      except Exception:
+        pass
+
+    # Record pending commit ownership when git commit is about to run
+    if commit_invocations:
+      cur_head = _git_head_sha(top_level)
+      if cur_head:
+        reg.setdefault("pending", {})[top_level] = {
+            "conv_id": effective_cid,
+            "title": cur_title,
+            "head_before": cur_head,
+            "ts": now,
+        }
+        if push_invocations:
+          reg["pending"][top_level]["pushed_by_owner"] = True
+        _write_json_atomic(
+            os.path.join(git_common_dir, "jetski_commits.json"), reg
+        )
+
+  return ""
 
 
 def cross_project_write_denial(
@@ -1595,6 +2469,27 @@ def main() -> None:
             )
         )
         return
+
+  # Enforce intra-project parallel-chat isolation (worktree leases, shared-repo
+  # per-file staging/commits, and unpushed commit ownership before git push)
+  if tool_name in EDIT_TOOLS or tool_name == "run_command":
+    pc_denial = parallel_chat_isolation_denial(
+        tool_name,
+        tool_args,
+        conv_id,
+        parent_conv_id,
+        transcript_path,
+        artifact_dir,
+        workspace_paths,
+        int(data.get("stepIdx", -1)),
+    )
+    if pc_denial:
+      print(
+          json.dumps(
+              {"decision": "deny", "reason": pc_denial}, ensure_ascii=False
+          )
+      )
+      return
 
   print('{"decision": "allow"}')
 
