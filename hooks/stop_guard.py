@@ -237,8 +237,52 @@ SKILL_GLOBS = (
 READ_TOOLS = {"read_file", "view_file"}
 USER_REQUEST_RE = re.compile(r"<USER_REQUEST>(.*?)</USER_REQUEST>", re.DOTALL)
 CASE_CLASSIFICATION_RE = re.compile(r"\bCase [1-5]\b")
+# Patterns detecting review approval verdicts and user or environment corpus exemptions
+REVIEW_APPROVAL_RE = re.compile(
+    r"\b(?:Case\s*[123]|LGTM|Code-Review\+1|safe\s+to\s+approve)\b",
+    re.IGNORECASE,
+)
+UNVERIFIED_FLUTTER_RE = re.compile(
+    r"\bUNVERIFIED[_\s]+IN[_\s]+FLUTTER\b", re.IGNORECASE
+)
+USER_CORPUS_OPTOUT_RE = re.compile(
+    r"(?:без\s+(?:прогона\s+)?(?:корпуса|флаттера|flutter)|"
+    r"только\s+текстом|без\s+компаньона|быстрый\s+взгляд|"
+    r"without\s+(?:flutter\s+)?corpus|skip\s+(?:flutter\s+)?corpus|prose[\s-]+only)",
+    re.IGNORECASE,
+)
 LEDGER_HEADING_RE = re.compile(r"^#+\s.*Execution Ledger", re.MULTILINE | re.IGNORECASE)
 WPT_ASSERT_RE = re.compile(r"\bassert_\w+\s*\(")
+# Match triage_cl.py corpus gate markers and fallback file paths in triage output
+SKIA_CORPUS_PATH_RE = re.compile(
+    r"(?:^|[\s`'\"(])modules/(?:skparagraph|skunicode|skshaper)/(?:src|include)/[^\s`'\"#)]+"
+    r"\.(?:c|cc|cpp|cxx|h|hh|hpp|hxx|mm)\b"
+)
+WEBPARAGRAPH_CORPUS_PATH_RE = re.compile(
+    r"(?:^|[\s`'\"(])(?:engine/src/flutter/)?lib/web_ui/lib/[^\s`'\"#)]+\.dart\b"
+)
+TRIAGE_CORPUS_MARKER_RE = re.compile(
+    r"REQUIRED\s*\(`(run_flutter_paragraph_tests\.py|run_webparagraph_corpus\.py)`\)"
+    r"|"
+    r'"required":\s*true[\s\S]{0,160}?"script":\s*"(run_flutter_paragraph_tests\.py|run_webparagraph_corpus\.py)"'
+)
+
+
+# Verify that script_name is executed rather than merely inspected via grep/cat
+def _invokes_script_in_cmd(cmd: str, script_name: str) -> bool:
+  if script_name not in cmd:
+    return False
+  for seg in re.split(r"&&|\|\||;|\||\n", cmd):
+    seg = seg.strip()
+    if not seg or script_name not in seg:
+      continue
+    if re.match(
+        r"^(?:grep|egrep|fgrep|rg|git|ls|cat|head|tail|echo|find|wc|stat)\b",
+        seg,
+    ):
+      continue
+    return True
+  return False
 
 
 def discover_skills() -> dict:
@@ -262,14 +306,22 @@ def _unquote_path(value) -> str:
   return str(value or "").strip().strip('"').strip("'")
 
 
+# Audit transcript for unread named skills, missing Execution Ledgers, and unverified corpus gates
 def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
-  """Collects skill-reading and review-report violations for the current turn.
+  """Collects skill-reading, review-report, and corpus-gate violations for the current turn.
 
   A skill counts as named when its directory name appears in the current
   turn's user request; it counts as read when any step of the conversation
-  read its SKILL.md. Artifacts written in this turn are checked on disk.
+  read its SKILL.md. Artifacts written in this turn and the final planner
+  response are checked for Execution Ledger and mandatory Flutter corpus runs.
   """
-  result = {"last_user_idx": -1, "unread_skills": [], "artifact_issues": []}
+  # Include corpus_issues alongside skill and artifact checks
+  result = {
+      "last_user_idx": -1,
+      "unread_skills": [],
+      "artifact_issues": [],
+      "corpus_issues": [],
+  }
   if not transcript_path or not os.path.exists(transcript_path):
     return result
   steps = []
@@ -290,30 +342,97 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
   steps.sort(key=lambda s: int(s["step_index"]))
 
   request_text = ""
+  # Collect all user prompts in the conversation to honor earlier corpus opt-outs
+  all_user_requests = []
   for step in steps:
     if step.get("type") == "USER_INPUT":
       result["last_user_idx"] = int(step["step_index"])
       content = str(step.get("content", ""))
       match = USER_REQUEST_RE.search(content)
       request_text = match.group(1) if match else content
+      all_user_requests.append(request_text)
 
   read_blobs = []
   written_artifacts = []
+  # Track triage corpus requirements and passing corpus test executions across steps
+  last_planner_text = ""
+  required_corpus_script = ""
+  required_corpus_domain = ""
+  corpus_passed = {
+      "run_flutter_paragraph_tests.py": False,
+      "run_webparagraph_corpus.py": False,
+  }
+  pending_triage = False
+  pending_corpus_script = ""
+
+  # Walk planner tool calls and command outputs in chronological order
   for step in steps:
-    if step.get("type") != "PLANNER_RESPONSE":
-      continue
-    in_turn = int(step["step_index"]) > result["last_user_idx"]
-    for tc in step.get("tool_calls") or []:
-      tname = tc.get("name", "")
-      targs = tc.get("args") or {}
-      if tname in READ_TOOLS:
-        read_blobs.append(_unquote_path(get_tool_target_file(targs)))
-      elif tname == "run_command":
-        read_blobs.append(str(targs.get("CommandLine", "")))
-      elif tname in EDIT_TOOLS and in_turn and artifact_dir:
-        target = os.path.abspath(_unquote_path(get_tool_target_file(targs)))
-        if target.startswith(os.path.abspath(artifact_dir) + "/"):
-          written_artifacts.append(target)
+    stype = step.get("type")
+    if stype == "PLANNER_RESPONSE":
+      in_turn = int(step["step_index"]) > result["last_user_idx"]
+      if in_turn and str(step.get("content", "")).strip():
+        last_planner_text = str(step.get("content", ""))
+      pending_triage = False
+      pending_corpus_script = ""
+      for tc in step.get("tool_calls") or []:
+        tname = tc.get("name", "")
+        targs = tc.get("args") or {}
+        if tname in READ_TOOLS:
+          read_blobs.append(_unquote_path(get_tool_target_file(targs)))
+        elif tname == "run_command":
+          cmd = str(targs.get("CommandLine", ""))
+          read_blobs.append(cmd)
+          if _invokes_script_in_cmd(cmd, "triage_cl.py"):
+            pending_triage = True
+          for c_script in (
+              "run_flutter_paragraph_tests.py",
+              "run_webparagraph_corpus.py",
+          ):
+            if _invokes_script_in_cmd(cmd, c_script):
+              pending_corpus_script = c_script
+        elif tname in EDIT_TOOLS and in_turn and artifact_dir:
+          target = os.path.abspath(_unquote_path(get_tool_target_file(targs)))
+          if target.startswith(os.path.abspath(artifact_dir) + "/"):
+            written_artifacts.append(target)
+    elif stype == "GENERIC":
+      content = str(step.get("content", ""))
+      if "\nFile Path: " in content[:200]:
+        continue
+      if pending_triage:
+        m_marker = TRIAGE_CORPUS_MARKER_RE.search(content)
+        if m_marker:
+          script = m_marker.group(1) or m_marker.group(2)
+          required_corpus_script = script
+          required_corpus_domain = (
+              "SkParagraph/SkUnicode/SkShaper"
+              if script == "run_flutter_paragraph_tests.py"
+              else "WebParagraph (web_ui)"
+          )
+          corpus_passed[script] = False
+        elif (
+            SKIA_CORPUS_PATH_RE.search(content)
+            and "LGTM for rollback." not in content
+        ):
+          required_corpus_script = "run_flutter_paragraph_tests.py"
+          required_corpus_domain = "SkParagraph/SkUnicode/SkShaper"
+          corpus_passed["run_flutter_paragraph_tests.py"] = False
+        elif (
+            WEBPARAGRAPH_CORPUS_PATH_RE.search(content)
+            and "LGTM for rollback." not in content
+        ):
+          required_corpus_script = "run_webparagraph_corpus.py"
+          required_corpus_domain = "WebParagraph (web_ui)"
+          corpus_passed["run_webparagraph_corpus.py"] = False
+        pending_triage = False
+      if pending_corpus_script:
+        m_exit = EXIT_CODE_RE.search(content)
+        if (
+            m_exit
+            and int(m_exit.group(1)) == 0
+            and step.get("status") == "DONE"
+        ):
+          corpus_passed[pending_corpus_script] = True
+        pending_corpus_script = ""
 
   for name in sorted(discover_skills()):
     if not re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", request_text):
@@ -322,12 +441,15 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
     if not any(suffix in blob for blob in read_blobs):
       result["unread_skills"].append(name)
 
+  # Retain artifact bodies so inline and artifact review checks can inspect both
+  artifact_texts = []
   for path in dict.fromkeys(written_artifacts):
     try:
       with open(path, "r", encoding="utf-8") as f:
         text = f.read()
     except Exception:
       continue
+    artifact_texts.append(text)
     base = os.path.basename(path)
     # A 5-case review verdict without a step ledger hides skipped steps
     if path.endswith(".md") and CASE_CLASSIFICATION_RE.search(text):
@@ -342,6 +464,44 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
         result["artifact_issues"].append(
             f"`{base}` is a testharness test with no `assert_*` call, so it cannot fail"
         )
+
+  # Also require Execution Ledger when a Case 1-5 review verdict is delivered inline in chat
+  if (
+      last_planner_text
+      and CASE_CLASSIFICATION_RE.search(last_planner_text)
+      and not LEDGER_HEADING_RE.search(last_planner_text)
+      and not any(LEDGER_HEADING_RE.search(t) for t in artifact_texts)
+  ):
+    result["artifact_issues"].append(
+        "Your chat response classifies a review (Case 1-5) but has no `### Execution Ledger` "
+        "section listing every skill step as done / skipped (with reason)"
+    )
+
+  # Enforce mandatory Flutter corpus verification before approving a reviewed CL
+  combined_review_out = "\n".join([last_planner_text] + artifact_texts)
+  user_opted_out = any(USER_CORPUS_OPTOUT_RE.search(u) for u in all_user_requests)
+  if (
+      required_corpus_script
+      and not corpus_passed.get(required_corpus_script)
+      and not user_opted_out
+      and REVIEW_APPROVAL_RE.search(combined_review_out)
+      and not UNVERIFIED_FLUTTER_RE.search(combined_review_out)
+  ):
+    script_path = (
+        "~/.gemini/config/skills/flutter-test-paragraph-engine/"
+        "scripts/run_flutter_paragraph_tests.py"
+        if required_corpus_script == "run_flutter_paragraph_tests.py"
+        else "~/.gemini/config/skills/webparagraph-corpus/scripts/run_webparagraph_corpus.py"
+    )
+    result["corpus_issues"].append(
+        f"[REVIEW CORPUS GUARD] The reviewed CL modifies `{required_corpus_domain}` "
+        "production code, and your response recommends approval (`Case 1-3` / `LGTM`), "
+        f"but `{required_corpus_script}` has not passed (`exit code 0`) on the author's "
+        "patchset in this conversation. Check out the author's patchset and run "
+        f"`python3 {script_path}` before approving (or explicitly mark the review as "
+        "`UNVERIFIED IN FLUTTER` if the environment prevents running it)"
+    )
+
   return result
 
 
@@ -353,6 +513,9 @@ def review_discipline_reason(info: dict) -> str:
         "conversation. Read it now and redo any step it requires that you skipped."
     )
   for issue in info.get("artifact_issues", []):
+    parts.append(f"- {issue}.")
+  # Append any unverified review corpus violations to the stop block reason
+  for issue in info.get("corpus_issues", []):
     parts.append(f"- {issue}.")
   if not parts:
     return ""

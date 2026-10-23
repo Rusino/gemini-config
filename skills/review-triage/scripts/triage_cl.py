@@ -42,6 +42,99 @@ NON_DOMAIN_HINTS = [
     "shell/platform/darwin", "shell/platform/windows"
 ]
 
+# Restrict corpus gating to production C++/Dart/TS directories (excluding tests/slides)
+SKIA_CORPUS_PATH_RE = re.compile(
+    r"(?:^|/)modules/(?:skparagraph|skunicode|skshaper)/(?:src|include)/"
+)
+WEBPARAGRAPH_CORPUS_PATH_RE = re.compile(
+    r"(?:^|/)(?:engine/src/flutter/)?lib/web_ui/lib/"
+)
+CODE_CORPUS_EXTENSIONS = {
+    ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".mm", ".dart", ".ts"
+}
+
+
+# Scan hunk diff lines to distinguish executable code changes from comment-only edits
+def hunk_has_executable_code_changes(hunk):
+    """True if hunk has added/deleted non-comment code lines."""
+    in_block = False
+    for raw_line in hunk.lines:
+        if not raw_line or raw_line[0] not in ("+", "-") or raw_line.startswith(("+++", "---")):
+            continue
+        line = raw_line[1:].strip()
+        while line:
+            if in_block:
+                end_idx = line.find("*/")
+                if end_idx < 0:
+                    line = ""
+                    break
+                in_block = False
+                line = line[end_idx + 2:].strip()
+            else:
+                if line.startswith("//"):
+                    line = ""
+                    break
+                start_idx = line.find("/*")
+                line_comment_idx = line.find("//")
+                if 0 <= line_comment_idx < (start_idx if start_idx >= 0 else len(line)):
+                    if line[:line_comment_idx].strip():
+                        return True
+                    line = ""
+                    break
+                if start_idx == 0:
+                    end_idx = line.find("*/", 2)
+                    if end_idx < 0:
+                        in_block = True
+                        line = ""
+                        break
+                    line = line[end_idx + 2:].strip()
+                elif start_idx > 0:
+                    return True
+                else:
+                    return True
+    return False
+
+
+# Flag reviews that touch SkParagraph/SkUnicode/SkShaper or WebParagraph executable code
+def detect_required_review_corpus(files):
+    """Detect if changed files touch SkParagraph/SkUnicode/SkShaper or WebParagraph executable code."""
+    skia_files = []
+    wp_files = []
+    for f in files:
+        norm = f.path.strip().replace("\\", "/")
+        _, ext = os.path.splitext(norm)
+        if ext.lower() not in CODE_CORPUS_EXTENSIONS or f.is_test:
+            continue
+        if not any(hunk_has_executable_code_changes(h) for h in f.hunks):
+            continue
+        if SKIA_CORPUS_PATH_RE.search(norm):
+            skia_files.append(norm)
+        elif WEBPARAGRAPH_CORPUS_PATH_RE.search(norm):
+            wp_files.append(norm)
+    if skia_files:
+        return {
+            "required": True,
+            "domain": "SkParagraph/SkUnicode/SkShaper",
+            "script": "run_flutter_paragraph_tests.py",
+            "command": (
+                "python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/"
+                "scripts/run_flutter_paragraph_tests.py"
+            ),
+            "files": skia_files,
+        }
+    if wp_files:
+        return {
+            "required": True,
+            "domain": "WebParagraph (web_ui)",
+            "script": "run_webparagraph_corpus.py",
+            "command": (
+                "python3 ~/.gemini/config/skills/webparagraph-corpus/"
+                "scripts/run_webparagraph_corpus.py"
+            ),
+            "files": wp_files,
+        }
+    return {"required": False, "domain": "", "script": "", "command": "", "files": []}
+
 REVIEWER_EMAILS = {"jlavrova@google.com", "jlavrova@gmail.com"}
 REVIEWER_NAMES = {"Julia Lavrova"}
 
@@ -548,6 +641,8 @@ def analyze_review(cl_data, files):
 
     ranked_hunks.sort(key=lambda x: x[0], reverse=True)
     top_hunks = ranked_hunks[:3]
+    # Attach corpus requirement metadata so stop_guard can block unverified approvals
+    corpus_gate = detect_required_review_corpus(files)
 
     return {
         "category": category,
@@ -565,7 +660,8 @@ def analyze_review(cl_data, files):
         "is_missing_tests": is_missing_tests,
         "arch_violations": arch_violations,
         "sound_patterns": sound_patterns,
-        "top_hunks": top_hunks
+        "top_hunks": top_hunks,
+        "corpus_gate": corpus_gate,
     }
 
 def suggest_reviewer(files):
@@ -621,7 +717,27 @@ def generate_report(cl_data, analysis, files):
             else "Initial review (no prior comments from you)"
         )
         md.append(f"| **Patchset** | `PS{tctx['current_ps']}` | {ps_detail} |")
+    # Emit machine-readable corpus gate marker for stop_guard.py on non-revert CLs
+    corpus_gate = analysis.get("corpus_gate") or {}
+    if corpus_gate.get("required") and not analysis.get("is_revert"):
+        md.append(
+            f"| **Flutter Corpus Gate** | 🚨 **REQUIRED (`{corpus_gate['script']}`)** | "
+            f"Touches `{corpus_gate['domain']}` (`{os.path.basename(corpus_gate['files'][0])}`) |"
+        )
     md.append("")
+
+    # Surface prominent corpus gate instructions before the follow-up thread
+    if corpus_gate.get("required") and not analysis.get("is_revert"):
+        md.append("### 🚨 Mandatory Flutter Corpus Gate (`[REVIEW CORPUS GUARD]`)")
+        md.append(
+            f"> **Hard Gate:** This CL modifies executable production code in "
+            f"**{corpus_gate['domain']}** "
+            f"({', '.join(f'`{p}`' for p in corpus_gate['files'][:4])}).  \n"
+            f"> Approving (`LGTM`, `Case 1`, `Case 2`, `Case 3`) is **mechanically blocked "
+            f"by `stop_guard.py`** until you check out the author's exact patchset and run "
+            f"`{corpus_gate['command']}` with exit code 0 (unless the user explicitly opted "
+            f"out of corpus verification).\n"
+        )
 
     if tctx.get("last_reviewed_ps") or tctx.get("dialogue"):
         md.append("### 🔄 Follow-Up Patchset & Prior Review Thread")

@@ -495,6 +495,179 @@ class TestStopGuard(unittest.TestCase):
       }
       self.assertEqual(self.run_discipline_stop(tmp_dir, steps, files=files), {})
 
+  # Verify inline chat review verdicts and mandatory Flutter corpus gating on reviewed CLs
+  def test_inline_chat_case_classification_without_ledger_blocks_stop(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      steps = [
+          {
+              "step_index": 1,
+              "type": "USER_INPUT",
+              "content": "<USER_REQUEST>review</USER_REQUEST>",
+          },
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "content": "Verdict: **Case 1: Ideal CL**. LGTM.",
+          },
+      ]
+      out = self.run_discipline_stop(tmp_dir, steps)
+      self.assertEqual(out.get("decision"), "continue")
+      self.assertIn("Execution Ledger", out["reason"])
+
+  def test_skparagraph_review_approval_without_flutter_corpus_blocks_stop(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      steps = [
+          {
+              "step_index": 1,
+              "type": "USER_INPUT",
+              "content": "<USER_REQUEST>review CL</USER_REQUEST>",
+          },
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": (
+                          "python3 ~/.gemini/config/skills/review-triage/"
+                          "scripts/triage_cl.py 12345"
+                      )
+                  },
+              }],
+          },
+          {
+              "step_index": 3,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": (
+                  "The command exited with code 0.\n"
+                  "| **Flutter Corpus Gate** | 🚨 **REQUIRED"
+                  " (`run_flutter_paragraph_tests.py`)** | Touches"
+                  " `SkParagraph/SkUnicode/SkShaper` (`ParagraphImpl.cpp`) |\n"
+              ),
+          },
+          {
+              "step_index": 4,
+              "type": "PLANNER_RESPONSE",
+              "content": (
+                  "### Execution Ledger\n- Triage: done\n\n"
+                  "Verdict: **Case 1: Ideal CL**. LGTM!"
+              ),
+          },
+      ]
+      out = self.run_discipline_stop(tmp_dir, steps)
+      self.assertEqual(out.get("decision"), "continue")
+      self.assertIn("[REVIEW CORPUS GUARD]", out["reason"])
+      self.assertIn("run_flutter_paragraph_tests.py", out["reason"])
+
+  def test_skparagraph_review_approval_with_passing_flutter_corpus_allows_stop(
+      self,
+  ):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      steps = [
+          {
+              "step_index": 1,
+              "type": "USER_INPUT",
+              "content": "<USER_REQUEST>review CL</USER_REQUEST>",
+          },
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": (
+                          "python3 ~/.gemini/config/skills/review-triage/"
+                          "scripts/triage_cl.py 12345"
+                      )
+                  },
+              }],
+          },
+          {
+              "step_index": 3,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": (
+                  "The command exited with code 0.\n"
+                  "| **Flutter Corpus Gate** | 🚨 **REQUIRED"
+                  " (`run_flutter_paragraph_tests.py`)** |\n"
+              ),
+          },
+          {
+              "step_index": 4,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": (
+                          "python3 ~/.gemini/config/skills/"
+                          "flutter-test-paragraph-engine/scripts/"
+                          "run_flutter_paragraph_tests.py"
+                      )
+                  },
+              }],
+          },
+          {
+              "step_index": 5,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": "The command exited with code 0.\nAll 2400 tests passed.",
+          },
+          {
+              "step_index": 6,
+              "type": "PLANNER_RESPONSE",
+              "content": (
+                  "### Execution Ledger\n- Triage: done\n- Flutter corpus:"
+                  " done\n\n**Case 1: Ideal CL**. LGTM!"
+              ),
+          },
+      ]
+      self.assertEqual(self.run_discipline_stop(tmp_dir, steps), {})
+
+  def test_skparagraph_review_pushback_case4_allows_stop_without_flutter_corpus(
+      self,
+  ):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      steps = [
+          {
+              "step_index": 1,
+              "type": "USER_INPUT",
+              "content": "<USER_REQUEST>review CL</USER_REQUEST>",
+          },
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": (
+                          "python3 ~/.gemini/config/skills/review-triage/"
+                          "scripts/triage_cl.py 12345"
+                      )
+                  },
+              }],
+          },
+          {
+              "step_index": 3,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": (
+                  "The command exited with code 0.\n"
+                  "| **Flutter Corpus Gate** | 🚨 **REQUIRED"
+                  " (`run_flutter_paragraph_tests.py`)** |\n"
+              ),
+          },
+          {
+              "step_index": 4,
+              "type": "PLANNER_RESPONSE",
+              "content": (
+                  "### Execution Ledger\n- Triage: done\n\n"
+                  "**Case 4: Fundamental Flaw**. Do not submit."
+              ),
+          },
+      ]
+      self.assertEqual(self.run_discipline_stop(tmp_dir, steps), {})
+
 
 if __name__ == "__main__":
   unittest.main()
