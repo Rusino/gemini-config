@@ -1,17 +1,11 @@
 ---
 name: perf-optimization-loop
 description: >-
-  Iterative C++/Dart performance optimization protocol for SkParagraph, WebParagraph, SkShaper
-  and other hot paths, adapted from Nico Weber's "Making everything go fast". Enforces (1) a
-  persistent hypothesis ledger (`optimizations.txt`, one per branch in the git common dir) that
-  records every tested idea, won or rejected, so nothing is retried after /compact or handoff,
-  (2) 1 optimization = 1 atomic commit with `Perf:` measurement trailers produced by
-  `bench_compare.py` (median + bootstrap 95% CI, nanobench / hyperfine / custom samples), and
-  (3) a post-loop "remove work rather than add machinery" audit that ranks branch commits by
-  win and by win per changed source line and flags unmeasured, single-benchmark, regressing
-  and cache/table-adding commits. Trigger when the user asks to "оптимизируй производительность",
-  "ускорь layout", "сделай perf-цикл", "замерь ускорение", "проверь perf-ветку",
-  "сравни производительность двух версий", "perf optimization loop", or "audit perf branch".
+  Iterative C++/Dart/TS performance optimization protocol for SkParagraph, WebParagraph, and
+  SkShaper (`opt_ledger.py`, `bench_compare.py` bootstrap 95% CI `Perf:` trailers, and
+  `opt_branch_audit.py`). Trigger when asked to "оптимизируй производительность", "ускорь layout",
+  "сделай perf-цикл", "замерь ускорение", "проверь perf-ветку", "сравни производительность двух
+  версий", or "perf optimization loop".
 ---
 
 # Performance Optimization Loop (`perf-optimization-loop`)

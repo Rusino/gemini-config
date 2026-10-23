@@ -1,8 +1,11 @@
 ---
 name: flutter-test-paragraph-engine
 description: >-
-  Build the Flutter engine with custom Skia or SkParagraph modifications and run the canonical ~2400 test suite covering text layout, rendering, selection, editable text, input fields, and dropdown menus (or all ~925 framework test files via --full sharded mode, using standard ICU by default or opt-in full Apple Unicode replacement via --unicode apple / @apple).
-  Trigger this skill when the user asks to "протестируй параграф во Флаттере", "протестируй параграф", "прогони тесты параграфа", "проверь во Флаттере с подменой на Apple Unicode", "протестируй во Флаттере с Аппл юникодом", "test paragraph in Flutter", or when verifying custom SkParagraph/SkUnicode/Skia changes against the Flutter framework.
+  Build the Flutter engine with custom Skia/SkParagraph changes and run the canonical ~2400
+  Flutter text/paragraph/editable/dropdown tests (`run_flutter_paragraph_tests.py`, or `--full`
+  sharded mode). Trigger when asked to "протестируй параграф во Флаттере", "протестируй параграф",
+  "прогони тесты параграфа", "test paragraph in Flutter", or before uploading SkParagraph/SkUnicode
+  changes.
 ---
 
 # Testing Custom Skia / SkParagraph in Flutter Engine
@@ -15,24 +18,23 @@ This skill provides the automated and end-to-end workflow for compiling custom S
 - [How to Run](#how-to-run)
 - [Inspecting Results & Run Attestation](#inspecting-results--run-attestation)
 - [Mandatory Reporting Rule](#mandatory-reporting-rule)
-- [Manual Step-by-Step Workflow](#manual-step-by-step-workflow)
 - [Common Pitfalls & Gotchas](#common-pitfalls--gotchas)
 
 ---
 
-## Repository Paths & Structure (Auto-Detected on macOS & Jetski Cloud)
+## Repository Paths & Structure (Auto-Detected on Linux Jetski Cloud & macOS)
 
-* **Flutter Framework**: `/Users/jlavrova/Sources/flutter` (macOS) or `~/.gemini/jetski/scratch/flutter` (Jetski Cloud)
+* **Flutter Framework**: `~/.gemini/jetski/scratch/flutter` (Jetski Cloud) or `/Users/jlavrova/Sources/flutter` (macOS)
 * **Flutter Engine Source**: `<repo>/engine/src`
 * **Skia Submodule**: `<repo>/engine/src/flutter/third_party/skia`
-* **Engine Build Output**: `<repo>/engine/src/out/host_debug_unopt_arm64` (macOS) or `<repo>/engine/src/out/host_debug_unopt` (Linux / Jetski Cloud)
+* **Engine Build Output**: `<repo>/engine/src/out/host_debug_unopt` (Linux) or `<repo>/engine/src/out/host_debug_unopt_arm64` (macOS)
 
 ---
 
 ## Automated Scripts
 
-- Orchestrator: [`run_flutter_paragraph_tests.py`](file:///Users/jlavrova/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py)
-- Log parser & comparator: [`parse_flutter_paragraph_tests.py`](file:///Users/jlavrova/.gemini/config/skills/flutter-test-paragraph-engine/scripts/parse_flutter_paragraph_tests.py)
+- Orchestrator: [`run_flutter_paragraph_tests.py`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py)
+- Log parser & comparator: [`parse_flutter_paragraph_tests.py`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/flutter-test-paragraph-engine/scripts/parse_flutter_paragraph_tests.py)
 
 ---
 
@@ -44,16 +46,16 @@ By default, `--unicode` is `icu` (standard Flutter ICU backend). Apple Unicode r
 ```bash
 python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py \
   --out /tmp/flutter_paragraph_tests \
-  baseline=origin/main \
+  baseline=HEAD \
   current=WORKTREE
 ```
 
 ### 2. Run or compare with opt-in Apple Unicode replacement (`@apple` / `--unicode apple`)
-Compare baseline on standard ICU against a branch from `/Users/jlavrova/Sources/skia` (`ext:<ref>`) with full Apple Unicode replacement:
+Compare baseline on standard ICU against a branch from `--external-skia` (`ext:<ref>`) with full Apple Unicode replacement:
 ```bash
 python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py \
   --out /tmp/flutter_paragraph_tests \
-  baseline=origin/main@icu \
+  baseline=HEAD@icu \
   apple_cand=ext:HEAD@apple
 ```
 Or run a single target with `--unicode apple`:
@@ -76,7 +78,7 @@ Run all ~925 `packages/flutter/test/**/*_test.dart` files sharded across paralle
 python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py \
   --out /tmp/flutter_paragraph_tests_full \
   --full \
-  baseline=origin/main \
+  baseline=HEAD \
   current=WORKTREE
 ```
 
@@ -116,79 +118,6 @@ Whenever presenting test results to the user, the agent **must** include both:
 2. The complete **Паспорт прогона (Run Attestation)** section including the **Вердикт целостности (Integrity Check)** banner and all table columns without truncation.
 
 If the integrity check verdict is `WARNING / INVALID`, never report the run as clean; report the exact invariant violations prominently.
-
----
-
-## Manual Step-by-Step Workflow
-
-If running steps manually without the orchestrator:
-
-### 1. Building the Local Engine
-
-```bash
-# Working directory: /Users/jlavrova/Sources/flutter/engine/src
-ninja -C out/host_debug_unopt_arm64 flutter_tester sky_engine txt_unittests ui_unittests
-```
-
-### 2. Engine Smoke Tests (C++)
-
-```bash
-# Working directory: /Users/jlavrova/Sources/flutter/engine/src
-./out/host_debug_unopt_arm64/txt_unittests
-./out/host_debug_unopt_arm64/ui_unittests
-```
-
-### 3. Verifying Build Artifacts
-
-Ensure the `.o` files and `flutter_tester` timestamps are newer than modified source files:
-```bash
-ls -la /Users/jlavrova/Sources/flutter/engine/src/out/host_debug_unopt_arm64/flutter_tester
-```
-
-### 4. Running the Flutter Text Suite in 3 Batches
-
-From `/Users/jlavrova/Sources/flutter`:
-
-#### Batch 1: Text Layout & Rendering (~210 tests)
-```bash
-./bin/flutter test \
-  --local-engine=host_debug_unopt_arm64 \
-  --local-engine-host=host_debug_unopt_arm64 \
-  --local-engine-src-path=/Users/jlavrova/Sources/flutter/engine/src \
-  packages/flutter/test/rendering/paragraph_test.dart \
-  packages/flutter/test/rendering/paragraph_intrinsics_test.dart \
-  packages/flutter/test/painting/text_painter_test.dart \
-  packages/flutter/test/painting/text_painter_rtl_test.dart \
-  packages/flutter/test/painting/text_span_test.dart \
-  packages/flutter/test/painting/text_style_test.dart \
-  packages/flutter/test/widgets/rich_text_test.dart \
-  packages/flutter/test/widgets/text_test.dart
-```
-
-#### Batch 2: Editing & Selection (~792 tests)
-```bash
-./bin/flutter test \
-  --local-engine=host_debug_unopt_arm64 \
-  --local-engine-host=host_debug_unopt_arm64 \
-  --local-engine-src-path=/Users/jlavrova/Sources/flutter/engine/src \
-  packages/flutter/test/widgets/editable_text_test.dart \
-  packages/flutter/test/widgets/editable_text_styles_test.dart \
-  packages/flutter/test/material/selectable_text_test.dart \
-  packages/flutter/test/widgets/text_selection_test.dart
-```
-
-#### Batch 3: Input Fields, Dropdown Menus, Boundaries & Deltas (~1294 tests)
-```bash
-./bin/flutter test \
-  --local-engine=host_debug_unopt_arm64 \
-  --local-engine-host=host_debug_unopt_arm64 \
-  --local-engine-src-path=/Users/jlavrova/Sources/flutter/engine/src \
-  packages/flutter/test/material/text_field_test.dart \
-  packages/flutter/test/cupertino/text_field_test.dart \
-  packages/flutter/test/material/dropdown_menu_test.dart \
-  packages/flutter/test/services/text_boundary_test.dart \
-  packages/flutter/test/services/text_editing_delta_test.dart
-```
 
 ---
 

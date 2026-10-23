@@ -911,10 +911,18 @@ class TestChatLifecycle(unittest.TestCase):
   )
 
   def _run_cli(self, *args):
-    import subprocess
-    return subprocess.run(
-        [sys.executable, self.SCRIPT, *args], capture_output=True, text=True, check=False
-    )
+    out = io.StringIO()
+    err = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+      try:
+        rc = chat_lifecycle.main(list(args))
+      except SystemExit as exc:
+        rc = exc.code if isinstance(exc.code, int) else 1
+    res = unittest.mock.MagicMock()
+    res.returncode = rc
+    res.stdout = out.getvalue()
+    res.stderr = err.getvalue()
+    return res
 
   def test_cli_help_lists_public_commands(self):
     for argv in (["--help"], ["-h"], ["help"], []):
@@ -955,15 +963,33 @@ class TestChatLifecycle(unittest.TestCase):
           self.assertNotIn("RoadmapError", res.stderr)
 
   def test_cli_requires_conversation_id_without_env(self):
-    import subprocess
     env = {k: v for k, v in os.environ.items() if k not in ("CONVERSATION_ID", "ANTIGRAVITY_CONVERSATION_ID")}
-    for cmd in ("status", "handoff", "summary-path", "finalize", "reopen", "archive"):
-      with self.subTest(cmd=cmd):
-        res = subprocess.run(
-            [sys.executable, self.SCRIPT, cmd], capture_output=True, text=True, check=False, env=env
-        )
-        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
-        self.assertNotIn("Traceback", res.stderr)
+    with patch.dict(os.environ, env, clear=True):
+      for cmd in ("status", "handoff", "summary-path", "finalize", "reopen", "archive"):
+        with self.subTest(cmd=cmd):
+          res = self._run_cli(cmd)
+          self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+          self.assertNotIn("Traceback", res.stderr)
+
+  def test_auto_archive_projects_skips_outside_or_unconfigured_projects(self):
+    with (
+        patch.object(chat_lifecycle, "load_retention_rules", return_value={"skia-g3-roll-check": 1}),
+        patch.object(chat_lifecycle, "resolve_project_id", return_value="proj-roll-1"),
+        patch.object(chat_lifecycle, "archive_project_conversations") as mock_arch,
+    ):
+      with patch.object(chat_lifecycle, "get_conversation_project_id", return_value=""):
+        self.assertEqual(chat_lifecycle.auto_archive_projects(target_cid="cid-outside"), {})
+        mock_arch.assert_not_called()
+
+      with patch.object(chat_lifecycle, "get_conversation_project_id", return_value="proj-other"):
+        self.assertEqual(chat_lifecycle.auto_archive_projects(target_cid="cid-other"), {})
+        mock_arch.assert_not_called()
+
+      mock_arch.return_value = {"archived_ids": ["old-1"], "count": 1}
+      with patch.object(chat_lifecycle, "get_conversation_project_id", return_value="proj-roll-1"):
+        res = chat_lifecycle.auto_archive_projects(target_cid="cid-roll")
+        self.assertEqual(res, {"skia-g3-roll-check": {"archived_ids": ["old-1"], "count": 1}})
+        mock_arch.assert_called_once_with("proj-roll-1", keep=1)
 
   def _outside_project_handoff_env(self, tmp_dir: str):
     db_path = os.path.join(tmp_dir, chat_lifecycle.SUMMARY_DB_NAME)

@@ -1,6 +1,11 @@
 ---
 name: veteran-review
-description: Expert code review in the voice and technical rigor of a veteran Skia typography, font platform, and core C++ systems reviewer, distilled from historical Skia Gerrit reviews. Evaluates memory ownership, stream contracts, numerical stability, iterator conformance, font table parsing, surrogate handling, variable font instances, and OS port quirks. Runs in lens mode (precedent search + invariants, no voice) inside review-triage, ruthless-code-audit, and amnesia-precommit for Skia C++ / text / font diffs, and in full voice mode when the user asks to "позови ветерана", "ревью от ветерана", "что бы сказал ветеран", "veteran review", or asks for an authoritative typography and C++ systems review.
+description: >-
+  Code review in the technical rigor and voice of a veteran Skia typography, font platform, and
+  C++ systems reviewer. Runs in lens mode (precedent search + Layer 1/2 invariants) inside
+  `review-triage`, `ruthless-code-audit`, and `amnesia-precommit` for Skia C++/text/font diffs, and
+  in full voice mode when asked to "позови ветерана", "ревью от ветерана", "что бы сказал ветеран",
+  or "veteran review".
 ---
 
 # Veteran Code Review (`veteran-review`)
@@ -45,7 +50,7 @@ python3 ~/.gemini/config/skills/veteran-review/scripts/search_reviews.py \
   --limit 10
 ```
 
-Read `~/.gemini/config/skills/veteran-review/references/voice_and_invariants.md` to ground the analysis in the established rhetorical patterns and technical contracts.
+When running in **Voice mode** (Steps 4–5), also read `~/.gemini/config/skills/veteran-review/references/voice_and_invariants.md` to ground the review prose in the veteran's authentic rhetorical patterns and historical quotes (Lens mode uses only Steps 1–3 below without reading `references/voice_and_invariants.md`).
 
 ### 3. Apply Multi-Layer Technical Evaluation
 Examine the change through two distinct lenses:

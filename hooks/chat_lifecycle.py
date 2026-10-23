@@ -193,39 +193,18 @@ def resolve_project_id(
 
 
 def update_conversation_title_rpc(conv_id: str, new_title: str) -> bool:
-  """Notifies running Language Server daemon via Connect RPC to update annotations.
-
-  This pushes updates immediately to active Web UI streaming subscribers (sidebar),
-  avoiding stale in-memory cache until manual chat selection.
-  """
-  ls_address = os.environ.get("ANTIGRAVITY_LS_ADDRESS", "localhost:5387")
-  csrf_token = get_ls_csrf_token(ls_address)
-  if not csrf_token:
-    return False
-
-  if not ls_address.startswith(("http://", "https://")):
-    url = f"http://{ls_address}/exa.language_server_pb.LanguageServerService/UpdateConversationAnnotations"
-  else:
-    url = f"{ls_address}/exa.language_server_pb.LanguageServerService/UpdateConversationAnnotations"
-
-  payload = json.dumps({
-      "cascadeIds": [conv_id],
-      "annotations": {"title": new_title},
-      "mergeAnnotations": True,
-  }).encode("utf-8")
-
-  req = urllib.request.Request(
-      url,
-      data=payload,
-      headers={
-          "Content-Type": "application/json",
-          "x-codeium-csrf-token": csrf_token,
-      },
-      method="POST",
-  )
+  """Notifies running Language Server daemon via Connect RPC to update annotations."""
   try:
-    with urllib.request.urlopen(req, timeout=2.0) as resp:
-      return resp.status == 200
+    ls_rpc(
+        "UpdateConversationAnnotations",
+        {
+            "cascadeIds": [conv_id],
+            "annotations": {"title": new_title},
+            "mergeAnnotations": True,
+        },
+        timeout=2.0,
+    )
+    return True
   except Exception:
     return False
 
@@ -1601,33 +1580,7 @@ def auto_archive_projects(target_cid: str = "") -> dict:
   """Archives older conversations for projects configured with a retention policy."""
   rules = load_retention_rules()
   results: dict[str, dict] = {}
-  target_project_id = ""
-
-  if target_cid:
-    env_pid = os.environ.get("ANTIGRAVITY_PROJECT_ID", "").strip()
-    if env_pid:
-      target_project_id = env_pid
-    else:
-      for app_dir in find_app_data_dirs():
-        db_file = os.path.join(app_dir, SUMMARY_DB_NAME)
-        if os.path.isfile(db_file):
-          try:
-            conn = sqlite3.connect(
-                f"file:{db_file}?mode=ro", uri=True, timeout=1.0
-            )
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT project_id FROM conversation_summaries WHERE conversation_id = ?",
-                (target_cid,),
-            )
-            row = cur.fetchone()
-            if row and row[0]:
-              target_project_id = str(row[0]).strip()
-            conn.close()
-          except Exception:
-            pass
-        if target_project_id:
-          break
+  target_project_id = get_conversation_project_id(target_cid) if target_cid else ""
 
   # Map project names/UUIDs to canonical project IDs
   resolved_rules: dict[str, tuple[str, int]] = {}
@@ -1638,8 +1591,8 @@ def auto_archive_projects(target_cid: str = "") -> dict:
     except Exception:
       pass
 
-  # If triggered by a specific chat whose project is not under retention, exit early
-  if target_project_id and target_project_id not in resolved_rules:
+  # If triggered by a specific chat whose project is unassigned or not under retention, exit early
+  if target_cid and (not target_project_id or target_project_id not in resolved_rules):
     return results
 
   for pid, (proj_key, keep) in resolved_rules.items():
@@ -2055,51 +2008,55 @@ def parse_handoff_args(args: list[str]) -> dict:
   return opts
 
 
-if __name__ == "__main__":
-  if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+def main(argv: list[str] | None = None) -> int:
+  if argv is None:
+    argv = sys.argv[1:]
+  if not argv or argv[0] in ("-h", "--help", "help"):
     print_usage()
-    sys.exit(0)
-  if sys.argv[1] not in KNOWN_COMMANDS:
-    print(f"chat_lifecycle.py: unknown command '{sys.argv[1]}'\n", file=sys.stderr)
+    return 0
+  if argv[0] not in KNOWN_COMMANDS:
+    print(f"chat_lifecycle.py: unknown command '{argv[0]}'\n", file=sys.stderr)
     print_usage(sys.stderr)
-    sys.exit(2)
-  if any(a in ("-h", "--help") for a in sys.argv[2:]):
+    return 2
+  if any(a in ("-h", "--help") for a in argv[1:]):
     print_usage()
-    sys.exit(0)
+    return 0
 
-  if sys.argv[1] == "set":
-    cid = _require_conversation_id("set", sys.argv[2] if len(sys.argv) > 2 else "")
-    title = sys.argv[3] if len(sys.argv) > 3 else ""
+  cmd = argv[0]
+  args = argv[1:]
+  if cmd == "set":
+    cid = _require_conversation_id("set", args[0] if args else "")
+    title = args[1] if len(args) > 1 else ""
     update_conversation_title(cid, title)
-  elif sys.argv[1] == "set-title":
-    cid = _require_conversation_id("set-title", sys.argv[2] if len(sys.argv) > 2 else "")
-    topic = sys.argv[3] if len(sys.argv) > 3 else ""
-    marker = sys.argv[4] if len(sys.argv) > 4 else MARKER_ACTIVE
+  elif cmd == "set-title":
+    cid = _require_conversation_id("set-title", args[0] if args else "")
+    topic = args[1] if len(args) > 1 else ""
+    marker = args[2] if len(args) > 2 else MARKER_ACTIVE
     new_t = set_conversation_topic(cid, topic, marker)
     print(f"Updated title for {cid}: {new_t}")
-  elif sys.argv[1] == "auto-title":
-    cid = _require_conversation_id("auto-title", sys.argv[2] if len(sys.argv) > 2 else "")
-    prompt = sys.argv[3] if len(sys.argv) > 3 else ""
+  elif cmd == "auto-title":
+    cid = _require_conversation_id("auto-title", args[0] if args else "")
+    prompt = args[1] if len(args) > 1 else ""
     new_t = auto_title_conversation(cid, prompt)
     if new_t:
       print(f"Updated title for {cid}: {new_t}")
-  elif sys.argv[1] == "summary-path":
+  elif cmd == "summary-path":
     cid = _require_conversation_id(
-        "summary-path", sys.argv[2] if len(sys.argv) > 2 else _env_conversation_id())
-    topic = sys.argv[3] if len(sys.argv) > 3 else ""
+        "summary-path", args[0] if args else _env_conversation_id())
+    topic = args[1] if len(args) > 1 else ""
     p = get_handoff_summary_path(cid, topic)
     print(p)
-  elif sys.argv[1] == "status":
+  elif cmd == "status":
     cid = _require_conversation_id(
-        "status", sys.argv[2] if len(sys.argv) > 2 else _env_conversation_id())
+        "status", args[0] if args else _env_conversation_id())
     info = get_chain_status(cid)
     print(json.dumps(info, ensure_ascii=False, indent=2))
-  elif sys.argv[1] == "model":
-    # Read-only diagnostic: what <id> last used and what a handoff would pick now.
-    trailer_mode = "--trailer" in sys.argv
-    args = [a for a in sys.argv[2:] if a != "--trailer"]
+  elif cmd == "model":
+    # Read-only diagnostic: what <id> last used and what a handoff would pick now
+    trailer_mode = "--trailer" in args
+    rest = [a for a in args if a != "--trailer"]
     cid = _require_conversation_id(
-        "model", args[0] if args else _env_conversation_id())
+        "model", rest[0] if rest else _env_conversation_id())
     pid = get_conversation_project_id(cid) if cid else ""
     pref = get_project_model_preference(pid) if pid else ""
     out = {
@@ -2117,8 +2074,7 @@ if __name__ == "__main__":
       print(get_model_trailer(cid))
     else:
       print(json.dumps(out, ensure_ascii=False, indent=2))
-  elif sys.argv[1] == "project-model":
-    args = sys.argv[2:]
+  elif cmd == "project-model":
     if not args:
       print(json.dumps(load_project_models(), ensure_ascii=False, indent=2))
     elif len(args) == 1:
@@ -2152,8 +2108,8 @@ if __name__ == "__main__":
           "preferred_model": new_model,
           "saved_to": DEFAULT_PROJECT_MODELS_FILE,
       }, ensure_ascii=False, indent=2))
-  elif sys.argv[1] == "handoff":
-    opts = parse_handoff_args(sys.argv[2:])
+  elif cmd == "handoff":
+    opts = parse_handoff_args(args)
     cid = _require_conversation_id("handoff", opts["cid"] or _env_conversation_id())
     result = create_handoff(
         cid,
@@ -2165,8 +2121,7 @@ if __name__ == "__main__":
         force=opts["force"],
     )
     print_handoff_result(result)
-  elif sys.argv[1] == "audit":
-    args = sys.argv[2:]
+  elif cmd == "audit":
     do_fix = False
     proj_filter = ""
     i = 0
@@ -2184,8 +2139,7 @@ if __name__ == "__main__":
         i += 1
     report = audit_conversations(fix=do_fix, project_filter=proj_filter)
     print(json.dumps(report, ensure_ascii=False, indent=2))
-  elif sys.argv[1] == "archive":
-    args = sys.argv[2:]
+  elif cmd == "archive":
     inc_chain = False
     proj_filter = ""
     keep_count = 1
@@ -2223,8 +2177,8 @@ if __name__ == "__main__":
           "archive",
           "either --project <p> or at least one conversation ID is required",
       )
-  elif sys.argv[1] == "auto-archive":
-    is_hook = "--hook" in sys.argv[2:]
+  elif cmd == "auto-archive":
+    is_hook = "--hook" in args
     target_cid = ""
     if is_hook:
       try:
@@ -2234,7 +2188,7 @@ if __name__ == "__main__":
       except Exception:
         pass
     else:
-      for a in sys.argv[2:]:
+      for a in args:
         if a != "--hook" and not a.startswith("-"):
           target_cid = _require_conversation_id("auto-archive", a)
           break
@@ -2243,23 +2197,28 @@ if __name__ == "__main__":
       print("{}")
     else:
       print(json.dumps(res, ensure_ascii=False, indent=2))
-  elif sys.argv[1] == "reopen":
-    cid = _require_conversation_id("reopen", sys.argv[2] if len(sys.argv) > 2 else "")
+  elif cmd == "reopen":
+    cid = _require_conversation_id("reopen", args[0] if args else "")
     reopen_conversation(cid, force=True)
-  elif sys.argv[1] == "advance":
-    cids = [_require_conversation_id("advance", a) for a in sys.argv[2:]]
+  elif cmd == "advance":
+    cids = [_require_conversation_id("advance", a) for a in args]
     if not cids:
       _cli_fail("advance", "at least one conversation ID is required")
     if len(cids) == 1:
       advance_in_progress_chain(current_conv_id=cids[0])
     else:
       advance_in_progress_chain(chain_ids=cids)
-  elif sys.argv[1] == "finalize":
-    cids = [_require_conversation_id("finalize", a) for a in sys.argv[2:]]
+  elif cmd == "finalize":
+    cids = [_require_conversation_id("finalize", a) for a in args]
     if not cids:
       _cli_fail("finalize", "at least one conversation ID is required")
     if len(cids) == 1:
       finalize_conversation_chain(cids[0])
     else:
       finalize_conversation_chain(cids[0], cids)
+  return 0
+
+
+if __name__ == "__main__":
+  sys.exit(main())
 

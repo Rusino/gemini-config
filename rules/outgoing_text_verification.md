@@ -9,55 +9,47 @@ Code has a compiler; prose documents do not, and incoming specs or code snippets
 
 ## 1. Documents & Technical Prose (`amnesia-doc-check`)
 
-1. **Outgoing Documents & Substantive Technical Writeups -> Full `amnesia-doc-check` (Script + Two-Stage Clean-Context Pipeline)**:
-   - **Applies to**:
-     - Any standalone document or presentation: Google Docs (`update_doc`, `create_file`), design docs, architecture proposals, postmortems, audit/benchmark reports, slide decks, `README.md`, `SKILL.md`, or agent rule files.
-     - Any multi-paragraph outgoing technical text (detailed CL/PR descriptions, Buganizer / GitHub issue writeups, design review comments, or team chat posts) that presents multi-step arguments/tables or cites file paths, skill/target names, code symbols, CLI flags, commit SHAs, or subsystem mechanics.
-   - **Required Action**: Before updating a Google Doc, creating a shareable deliverable, or presenting the final draft to the user to send externally, execute the `amnesia-doc-check` skill (`~/.gemini/config/skills/amnesia-doc-check/SKILL.md`):
-     1. Run `python3 ~/.gemini/config/skills/amnesia-doc-check/scripts/check_doc_grounding.py --repo <repo> <draft>` to catch leftover placeholders (`[find link]`, `TBD`), intra-document path drift, missing paths, paraphrased skill/directory names, and prior refuted claims from the Persistent Finding Ledger (`~/.gemini/config/scripts/finding_ledger.py`).
-     2. Spawn a clean-context Hunter subagent (with zero chat history bias, passing prior refuted ledger entries so they are not re-raised) to verify both **external grounding** (every path, symbol, CLI flag, and `file:line` mechanism claim) and **internal content self-consistency** (cross-section contradictions between proposals and caveats, terminology/naming drift across sections, summary-vs-table arithmetic, and problem-to-solution alignment), followed by a batched `keeper_skeptic` refutation pass (`Hunt then Refute` with `XFAMILY_REFUTE` auto-routing) whenever non-trivial mechanism or contradiction findings are raised. Persist any newly `REFUTED` findings or user overrides via `finding_ledger.py add`.
+1. **Outgoing Documents & Substantive Technical Writeups -> Full `amnesia-doc-check`**:
+   - **Applies to**: Standalone docs/presentations (`update_doc`, `create_file`, design docs, postmortems, audit/benchmark reports, slide decks, `README.md`, `SKILL.md`, rule files) and multi-paragraph outgoing technical texts (CL/PR descriptions, Buganizer/GitHub writeups, design review comments, team chat posts) with tables or code/path/symbol/CLI citations.
+   - **Required Action**: Before sharing externally or updating a Google Doc, read and execute `~/.gemini/config/skills/amnesia-doc-check/SKILL.md` (`check_doc_grounding.py` + clean-context Hunter + batched `keeper_skeptic` refutation + `finding_ledger.py`).
 
 2. **Incoming Documents & Specs -> Verify Before Trusting (`amnesia-doc-check` on Read)**:
-   - **Applies to**: Any Google Doc (`read_file_content`, `read_doc`), local `.md` design doc/spec, bug report, or multi-paragraph technical text that the user asks you to read, review, analyze, or implement from.
-   - **Required Action**: Never trust an incoming document's technical claims or paths at face value:
-     1. Run `check_doc_grounding.py` against the document text (when a target repository applies) and verify its cited paths, symbols, CLI flags, `file:line` mechanism claims, and internal self-consistency against actual source files (using the clean-context Hunter + Skeptic pipeline for substantive docs/specs).
-     2. Surface a concise grounding verdict at the top of your response (`Grounding OK` or the exact factual/logical discrepancies against the codebase) before answering or implementing from the document.
+   - **Applies to**: Any Google Doc (`read_file_content`, `read_doc`), local `.md` design doc/spec, bug report, or multi-paragraph technical text the user asks you to read, review, analyze, or implement from.
+   - **Required Action**: Run `check_doc_grounding.py` and verify cited paths, symbols, flags, `file:line` claims, and self-consistency against actual source files (using Hunter + `keeper_skeptic` for substantive specs). Surface a concise grounding verdict (`Grounding OK` or exact discrepancies) at the top of your response before implementing.
 
 3. **Short Replies & Trivial Commit Messages -> Inline Grounding (0 Subagents)**:
    - **Applies to**: Short 1–3 sentence chat replies, brief inline review comments, or small single-hunk commit messages where all referenced lines are already open in the current turn's context.
-   - **Required Action**: Do not spawn a subagent for trivial replies, but **never** type a file path, directory name, skill/target name, class/function identifier, CLI flag, or commit SHA from memory or by paraphrasing section headings. Every identifier must match the repository character-for-character.
+   - **Required Action**: Never type a file path, directory name, skill/target name, class/function identifier, CLI flag, or commit SHA from memory or by paraphrasing headings; match repository identifiers character-for-character.
 
 4. **Automatic Redline on Document Updates (`redline`)**:
-   - **Applies to**: Any edit, shortening, translation, or restructuring of an existing document (Markdown file, artifact, design doc, specification, or Google Doc) that the user has already seen in earlier turns of the conversation, whenever the change touches more than 1 line or 15 words.
-   - **Required Action**: Automatically run `python3 ~/.gemini/config/skills/redline/scripts/redline.py` against the last version the user saw, verify the generated `<stem>_diff.html` via headless browser screenshot (`browser_navigate`, `browser_get_console_logs`, `browser_capture_screenshot`), and link `<stem>_diff.html` alongside the updated document without waiting for the user to ask `"покажи изменения"`.
+   - **Applies to**: Any edit, shortening, translation, or restructuring (>1 line or >15 words) of an existing document/artifact/spec that the user has already seen in earlier turns.
+   - **Required Action**: Automatically run `python3 ~/.gemini/config/skills/redline/scripts/redline.py` against the last version the user saw, verify `<stem>_diff.html` via headless browser screenshot (`~/.gemini/config/skills/redline/SKILL.md`), and link `<stem>_diff.html` alongside the updated document without waiting to be asked.
 
 ## 2. Incoming & Outgoing Code (`amnesia-precommit`, Corpus Gate & KEEPER Invariants)
 
 1. **Outgoing Repository Code Changes -> Run `amnesia-precommit` & Pre-Upload Flutter Corpus**:
-   - **Applies to**: Any source code modifications in a repository before committing (`git commit`), uploading/pushing (`git cl upload`, `gh pr create`, `git push`), or reporting the implementation as complete.
-   - **Required Action**: Execute the `amnesia-precommit` workflow (`~/.gemini/config/skills/amnesia-precommit/SKILL.md`):
-     1. Run `python3 ~/.gemini/config/skills/code-comments/scripts/audit_comments.py --diff HEAD --repo <repo>` and `python3 ~/.gemini/config/skills/ruthless-code-audit/scripts/ruthless_audit.py <repo> --repo <repo> --diff HEAD` (plus `SKIP_GCE_AUTH_FOR_GIT=1 git cl presubmit --force` if `PRESUBMIT.py` exists).
-     2. For non-trivial diffs, run the two-stage **Hunt then Refute** clean-context pipeline: spawn a Hunter subagent (`keeper_inquisitor` or `self`, passing prior refuted findings from `finding_ledger.py`) to shrink drive-by changes, verify dropped guards via `git log -S`, check pattern completeness across all callers/backends, and enforce KEEPER invariants (`cpp_systems_invariants.md`, `text_domain_invariants.md`, `code_style.md`), then challenge any candidate `HIGH`/`CRITICAL` defects or non-trivial code removals with a single batched `keeper_skeptic` refutation pass (`Model="flash"` by default, escalating to `Model="pro"` for deep invariants, with automatic `pro` → `flash` → Trapsmith TDD fallback on quota exhaustion). Persist all newly `REFUTED` findings and user design overrides in `~/.gemini/config/scripts/finding_ledger.py` (`--scope repo` for code invariants, `--scope cl` for CL-specific deferrals).
-     3. **Pre-Upload / Pre-Push Flutter Corpus Gate (`CORPUS-CHECK GUARD` in `pre_tool_guard.py`)**: Before running `git cl upload`, `gh pr create`, or `git push`, if the diff contains **executable production code changes** (excluding comment-only edits, `.md` docs, summaries, or commit messages):
-        - Touching `modules/{skparagraph,skunicode,skshaper}/{src,include}/` -> must run `flutter-test-paragraph-engine` (`python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py`).
-        - Touching `lib/web_ui/lib/` (WebParagraph / text layout) -> must run `webparagraph-corpus` (`python3 ~/.gemini/config/skills/webparagraph-corpus/scripts/run_webparagraph_corpus.py`, both Part 1 `felt` and Part 2 `packages/flutter`).
+   - **Applies to**: Any source code modifications in a repository before committing (`git commit`), uploading/pushing (`git cl upload`, `gh pr create`, `git push`), or reporting implementation complete.
+   - **Required Action**: Read and execute `~/.gemini/config/skills/amnesia-precommit/SKILL.md`:
+     1. Run `audit_comments.py --diff HEAD --repo <repo>` and `ruthless_audit.py <repo> --repo <repo> --diff HEAD` (plus `SKIP_GCE_AUTH_FOR_GIT=1 git cl presubmit --force` if `PRESUBMIT.py` exists).
+     2. For non-trivial diffs, run the clean-context Hunter (`keeper_inquisitor`) + batched `keeper_skeptic` refutation pass (`plugins/keeper/agents/keeper_skeptic.md`) + `finding_ledger.py`.
+     3. **Pre-Upload / Pre-Push Flutter Corpus Gate (`CORPUS-CHECK GUARD` in `pre_tool_guard.py`)**: Before `git cl upload`, `gh pr create`, or `git push` with executable production code changes:
+        - Touching `modules/{skparagraph,skunicode,skshaper}/{src,include}/` -> run `flutter-test-paragraph-engine` (`run_flutter_paragraph_tests.py`).
+        - Touching `lib/web_ui/lib/` -> run `webparagraph-corpus` (`run_webparagraph_corpus.py`, Part 1 `felt` + Part 2 `packages/flutter`).
 
-2. **Bug Triage & Fixes -> Automatic Before/After Visual Slide (`dual-version-bug-slide`) by Default**:
-   - **Applies to**: Any bug report (GitHub issue, Buganizer `b/...`, or regression) in `SkParagraph`, `SkUnicode`, `SkShaper`, `WebParagraph`, or `Skia` that has a visual, geometric, metric, glyph, caret/selection, or layout-crash manifestation.
-   - **Required Action**: In addition to authoring a failing-then-passing contract unit test, automatically generate the before/after visual comparison slide (`~/.gemini/config/skills/dual-version-bug-slide/SKILL.md`) without waiting for the user to ask for a slide (skip only when the issue is purely non-visual, such as build/CI config or memory/ASan bookkeeping).
+2. **Bug Triage & Fixes -> Failing-Then-Passing Contract Test (and On-Demand `dual-version-bug-slide`)**:
+   - **Applies to**: Any bug report or regression in `SkParagraph`, `SkUnicode`, `SkShaper`, `WebParagraph`, or `Skia`.
+   - **Required Action**: Author a failing-then-passing contract unit test before fixing production code; when the user asks for a visual before/after comparison or slide, run `~/.gemini/config/skills/dual-version-bug-slide/SKILL.md`.
 
 3. **Outgoing Code Snippets in Chat (>5 Lines) -> Inline Invariant Check (0 Subagents)**:
    - **Applies to**: Any non-trivial code block or patch (>5 lines) proposed in chat.
-   - **Required Action**: Read the actual header/definition before calling any API, and verify the snippet against `cpp_systems_invariants.md`, `text_domain_invariants.md`, and `code_style.md` (no trailing periods in non-Dart comments, `<= 100` cols, zero-allocation hot paths, loop guards, `SkASSERT` over defensive `if (!ptr) return;`).
+   - **Required Action**: Read the actual header/definition before calling any API, and verify against `cpp_systems_invariants.md`, `text_domain_invariants.md`, and `code_style.md` (no trailing periods in non-Dart comments, `<= 100` cols, zero-allocation hot paths, loop guards, `SkASSERT` over defensive `if (!ptr) return;`).
 
 4. **Incoming Code (CLs, PRs, Commits, Patches, or User-Pasted Snippets >5 Lines) -> Zero-Trust Audit on Read**:
    - **Applies to**: Any external CL/PR, commit, branch, diff, or code snippet (>5 lines) the user asks you to read, explain, review, or integrate.
-   - **Required Action**:
-     1. For incoming CLs/PRs or local diffs, run `audit_comments.py` and `ruthless_audit.py --diff` (and use `review-triage` (`~/.gemini/config/skills/review-triage/SKILL.md`) + `companion-cl-review` (`~/.gemini/config/skills/companion-cl-review/SKILL.md`) by default for full CL/PR reviews, unless the user explicitly asks for a prose-only review without a companion CL).
-     2. Audit the incoming code against `cpp_systems_invariants.md`, `text_domain_invariants.md`, and `code_style.md` (checking for hot-path allocations, missing loop guards, UTF-8/UTF-16/BiDi index mismatches, dropped guards, or missing sibling backend updates), and highlight any defects immediately alongside your explanation or review.
+   - **Required Action**: Run `audit_comments.py` and `ruthless_audit.py --diff` (and use `review-triage` + `companion-cl-review` by default for full CL/PR reviews unless the user opts out with "без компаньона" / "только текстом"), and audit against `cpp_systems_invariants.md`, `text_domain_invariants.md`, and `code_style.md`.
 
 ## 3. Hard Prohibitions
 
-- **No Paraphrased Identifiers**: Never reconstruct file paths or skill/target names from prose headings (e.g., turning `skia-style-check` into `skia-code-style-audit` or `agents/core_skills.json` into `_agents/core_skills.json`).
-- **No Unbacked Mechanism Claims**: Never state that a parser, build system, or runtime behaves a certain way without first reading the implementation (`file:line`).
-- **Zero Leftover Scaffolding**: Never leave generation placeholders (`[find link]`, `[insert ...]`, `TBD`, `TODO`, `(AI evaluation...)`, or empty markdown links) in any text delivered to the user.
+- **No Paraphrased Identifiers**: Never reconstruct file paths or skill/target names from prose headings.
+- **No Unbacked Mechanism Claims**: Never state how a parser, build system, or runtime works without reading `file:line`.
+- **Zero Leftover Scaffolding**: Never leave generation placeholders (`[find link]`, `[insert ...]`, `TBD`, `TODO`, `(AI evaluation...)`, or empty markdown links) in any delivered text.

@@ -1,23 +1,11 @@
 ---
 name: amnesia-doc-check
 description: >-
-  Clean-context fact-checking, internal self-consistency, and referential grounding pipeline
-  for incoming and outgoing documents, design docs, slide decks, and substantive technical texts
-  (CL/PR descriptions, bug reports, specs, review summaries). Combines (1) a zero-token deterministic
-  pass (`check_doc_grounding.py`) for leftover LLM placeholders, intra-document path drift,
-  nonexistent paths, and wrong skill/symbol names, (2) a clean-context Hunter subagent pass
-  (zero chat history bias) that checks internal logical/numeric/terminological consistency
-  across sections, verifies every path, symbol, CLI flag, and `file:line` mechanism claim
-  against actual source code, audits dropped caveats via `git diff`/`git log`, and checks
-  pattern completeness across enumerations and paired docs, and (2.5) a clean-context Skeptic
-  Refutation pass (`keeper_skeptic`, `Hunt then Refute` with `XFAMILY_REFUTE` auto-routing)
-  backed by the Persistent Finding Ledger (`finding_ledger.py`) to filter out and cache
-  false-positive contradiction or mechanism claims across passes before rewriting prose or
-  reporting issues. Trigger before sharing any document
-  or substantive technical writeup externally, when reading/implementing from an incoming spec or
-  Google Doc, or when the user asks to "проверь документ", "проверь док на лажу",
-  "проверь на непротиворечивость", "проверь текст перед отправкой", "сделай амнезия-проверку дока",
-  or "run amnesia doc check".
+  Clean-context fact-checking, self-consistency, and referential grounding pipeline for incoming
+  and outgoing documents, specs, and technical writeups (`check_doc_grounding.py` + Hunter +
+  `keeper_skeptic`). Trigger before sharing docs externally, when reading incoming specs, or when
+  asked to "проверь документ", "проверь док на лажу", "проверь на непротиворечивость",
+  "сделай амнезия-проверку дока", or "run amnesia doc check".
 ---
 
 # Amnesia Document & Technical Text Fact-Checker (`amnesia-doc-check`)
@@ -157,37 +145,22 @@ Brief count of verified paths, symbols, and mechanism claims.
 
 ---
 
-### Phase 2.5: The Skeptic Refutation Pass (Stage B Skeptic Subagent, `Hunt then Refute` + `XFAMILY_REFUTE`)
+### Phase 2.5: The Skeptic Refutation Pass (`keeper_skeptic`, `Hunt then Refute` + `XFAMILY_REFUTE`)
 
-Hostile document fact-checkers sometimes misread conditional caveats in the prose or over-interpret a simplified architectural diagram as a "contradiction".
+Whenever Phase 2 flags non-trivial **Mechanism Claims (`M1, M2...`)** or **Internal Contradictions / Architectural Flaws (`C1, C2...`)** (skip if Phase 2 only found deterministic path/typo fixes or returned `None`), spawn **one batched `keeper_skeptic` subagent** following the `XFAMILY_REFUTE` routing, Quota Fallback Ladder, and Three Iron Verification Principles in [`plugins/keeper/agents/keeper_skeptic.md`](file:///usr/local/google/home/jlavrova/.gemini/config/plugins/keeper/agents/keeper_skeptic.md):
 
-Whenever Phase 2 flags non-trivial **Mechanism Claims (`M1, M2...`)** or **Internal Contradictions / Architectural Flaws (`C1, C2...`)** (skip if Phase 2 only found deterministic path/typo fixes or returned `None`), spawn **one batched `keeper_skeptic` subagent** in a clean context to challenge those findings before rewriting the document:
-
-1. **Automatic Model Routing (`XFAMILY_REFUTE`) & Quota Fallback**:
-   - **`Model="flash"` (Default Fast Skeptic)**: Use for routine prose self-consistency, arithmetic, and straightforward `file:line` mechanism checks.
-   - **`Model="pro"` (Auto-Escalation)**: Escalate to `Model="pro"` when a candidate disputes deep subsystem contracts (concurrency, BiDi/UTF-8/UTF-16/grapheme math, `SkParagraph` ↔ `WebParagraph` architecture) or when `flash` returns `UNPROVEN`.
-   - **Quota Fallback**: On `pro` quota exhaustion, auto-downgrade to `Model="flash"` (`[Verified via Flash fallback (Pro quota exhausted)]`); if all subagent models are exhausted, verify the cited `file:line` and prose section directly via `read_file` or mark `[UNVERIFIED: Quota Exhausted]` and alert the user.
-
-2. **Batched Skeptic Invocation**:
 ```python
 invoke_subagent(
     TypeName="keeper_skeptic",
     Role="Batched Document Verification Skeptic",
-    Model="<flash or pro per routing rules above>",
+    Model="<flash or pro per keeper_skeptic.md XFAMILY_REFUTE rules>",
     Workspace="inherit",
     Prompt="""
-You are the Verification Skeptic (`keeper_skeptic`) for a technical document audit of `<path_to_draft>`.
-Your sole job is to REFUTE each candidate finding below using the actual document text and source files in `<repo_paths>`. A refutation you cannot prove with an exact `section:line` quote or `path:line` code citation is a confirmation, not a dismissal.
+You are the Verification Skeptic (`keeper_skeptic`) for a technical document audit of `<path_to_draft>` against `<repo_paths>`.
+Refute each candidate below using exact `section:line` quotes or `path:line` code citations per your Three Iron Verification Principles.
 
 Candidates Under Test (Batch V001):
 <paste all candidate Mechanism Claims (M1, M2...) and Internal Contradictions / Architectural Flaws (C1, C2...)>
-
-Instructions:
-1. Apply the Three Iron Verification Principles:
-   - **Refute with Text & Code (`section:line` or `path:line`), Never Memory**: Quote the exact sentence/table in the document or the exact `path:line` in the codebase that resolves the alleged error.
-   - **Documented Scope & Caveats Override Pedantic Nitpicks**: If the document explicitly scopes a claim or states the caveat in an adjacent section/footnote, a claim that it "ignores edge case X" is `REFUTED`.
-   - **Burden of Proof Requires Material Inaccuracy**: Stylistic phrasing preferences that do not alter factual accuracy or operational behavior are `REFUTED`.
-2. Output one verdict (`REFUTED`, `CONFIRMED`, or `UNPROVEN`) per candidate ID (`M1...`, `C1...`) with mandatory evidence citations.
 """
 )
 ```

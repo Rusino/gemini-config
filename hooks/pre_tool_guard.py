@@ -323,10 +323,24 @@ CODE_CORPUS_EXTENSIONS = {
 }
 
 
+def _non_inspection_cmd_segments(cmd: str) -> str:
+  """Strip heredocs and drop shell segments that start with read-only inspection commands."""
+  cmd_code = strip_heredocs(cmd)
+  kept = []
+  for seg in re.split(r"&&|\|\||;|\||\n", cmd_code):
+    s = seg.strip()
+    if not s:
+      continue
+    if re.match(r"^(?:grep|egrep|fgrep|rg|git\s+grep|echo|cat)\b", s):
+      continue
+    kept.append(s)
+  return " ; ".join(kept)
+
+
 def is_git_commit_or_upload_command(cmd: str) -> bool:
   """True if cmd invokes git commit, git cl upload, or gh pr create outside heredocs/grep."""
-  cmd_code = strip_heredocs(cmd)
-  if re.match(r"^\s*(?:grep|egrep|fgrep|rg|git\s+grep|echo|cat)\b", cmd_code):
+  cmd_code = _non_inspection_cmd_segments(cmd)
+  if not cmd_code:
     return False
   if re.search(r"\b(?:commit|upload|create)\s+(?:--help|-h|help)\b", cmd_code):
     return False
@@ -335,8 +349,8 @@ def is_git_commit_or_upload_command(cmd: str) -> bool:
 
 # Detect external publishing commands (upload, push, PR creation) outside grep/help calls
 def is_git_upload_or_push_command(cmd: str) -> bool:
-  cmd_code = strip_heredocs(cmd)
-  if re.match(r"^\s*(?:grep|egrep|fgrep|rg|git\s+grep|echo|cat)\b", cmd_code):
+  cmd_code = _non_inspection_cmd_segments(cmd)
+  if not cmd_code:
     return False
   if re.search(
       r"\b(?:upload|push|create)\s+(?:--help|-h|help)\b", cmd_code
@@ -547,7 +561,7 @@ def diff_text_has_executable_code_changes(diff_text: str) -> bool:
 
 # Verify against the actual git repository diff when on disk so reverted edits do not block upload
 def _git_branch_has_executable_code_changes(
-    file_path: str, pathspec: str
+    file_path: str, pathspec: str | tuple[str, ...]
 ) -> bool | None:
   clean = os.path.abspath(
       os.path.expanduser(file_path.strip().strip('"').strip("'"))
@@ -578,8 +592,9 @@ def _git_branch_has_executable_code_changes(
       if mb.returncode == 0 and mb.stdout.strip():
         base_ref = mb.stdout.strip()
         break
+    specs = [pathspec] if isinstance(pathspec, str) else list(pathspec)
     diff_res = subprocess.run(
-        ["git", "-C", repo_root, "diff", "-U0", base_ref, "--", pathspec],
+        ["git", "-C", repo_root, "diff", "-U0", base_ref, "--", *specs],
         capture_output=True,
         text=True,
         timeout=2.0,
@@ -652,7 +667,8 @@ def unverified_corpus_before_upload_or_push(
 
   if last_wp_file and not has_wp_corpus:
     git_has_code = _git_branch_has_executable_code_changes(
-        last_wp_full_path, "engine/src/flutter/lib/web_ui/lib/"
+        last_wp_full_path,
+        ("engine/src/flutter/lib/web_ui/lib/", "lib/web_ui/lib/"),
     )
     if git_has_code is not False:
       return (
@@ -797,7 +813,7 @@ def enrich_handoff_summary_files(
               steps_by_idx[int(idx)] = obj
           except Exception:
             continue
-      pending_cmd = None
+      pending_cmds: list[str] = []
       for idx in sorted(steps_by_idx.keys()):
         step = steps_by_idx[idx]
         stype = step.get("type", "")
@@ -823,12 +839,15 @@ def enrich_handoff_summary_files(
             elif tname == "run_command":
               cmd_str = str(targs.get("CommandLine", "")).strip().replace("\n", " ")
               if "new-conversation" not in cmd_str:
-                pending_cmd = cmd_str[:140]
-        elif stype == "GENERIC" and pending_cmd:
-          m = EXIT_CODE_RE.search(str(step.get("content", "")))
+                pending_cmds.append(cmd_str[:140])
+        elif stype == "GENERIC" and pending_cmds:
+          content_s = str(step.get("content", ""))
+          if "\nFile Path: " in content_s[:200]:
+            continue
+          pending_cmd = pending_cmds.pop(0)
+          m = EXIT_CODE_RE.search(content_s)
           code_str = f"exit {m.group(1)}" if m else "async/running"
           recent_cmds.append(f"- `[{code_str}]` `{pending_cmd}`")
-          pending_cmd = None
     except Exception:
       pass
 
@@ -1485,6 +1504,59 @@ def _active_foreign_file_leases(
   return out
 
 
+def _check_and_claim_worktree_lease(
+    git_dir: str,
+    top_level: str,
+    effective_cid: str,
+    cur_title: str,
+    override_path: str,
+    guard_state_path: str,
+    transcript_path: str,
+    now: float,
+) -> str:
+  """Verifies or acquires the exclusive per-worktree lease for a code repository."""
+  lease_file = os.path.join(git_dir, "jetski_lease.json")
+  existing = _read_json_file(lease_file)
+  owner_cid = str(existing.get("conv_id") or "")
+  ts = float(existing.get("ts") or 0.0)
+  if (
+      owner_cid
+      and owner_cid != effective_cid
+      and not os.path.exists(override_path)
+  ):
+    still_active, db_title = _is_conv_still_active_tip(
+        owner_cid, effective_cid, transcript_path
+    )
+    if still_active:
+      unexpired, eff_ts = _is_worktree_lease_unexpired(
+          owner_cid, ts, top_level, transcript_path, now
+      )
+      if unexpired:
+        _record_parallel_guard_block(guard_state_path, transcript_path)
+        owner_label = db_title or existing.get("title") or owner_cid[:8]
+        age_m = int(max(1, (now - eff_ts) // 60))
+        return (
+            f"[WORKTREE LEASE GUARD] Worktree `{top_level}` is currently leased by "
+            f"another active conversation (`{owner_label}` -> `conversation://{owner_cid}`, "
+            f"active {age_m}m ago). Sharing a single code worktree or `out/` build directory "
+            f"between concurrent chats causes branch, build, and test collisions! "
+            f"Create and use a separate git worktree (e.g. "
+            f"`git -C {top_level} worktree add {top_level}_wt_{effective_cid[:6]} -b <branch>`) "
+            f"or ask the user whether to take over `{top_level}`. Only after the user "
+            f"explicitly confirms in a subsequent turn may you write `{override_path}`."
+        )
+  _write_json_atomic(
+      lease_file,
+      {
+          "conv_id": effective_cid,
+          "title": cur_title,
+          "ts": now,
+          "worktree": top_level,
+      },
+  )
+  return ""
+
+
 def parallel_chat_isolation_denial(
     tool_name: str,
     tool_args: dict,
@@ -1606,46 +1678,16 @@ def parallel_chat_isolation_denial(
       return ""
 
     # Code repository / worktree: enforce exclusive per-worktree lease
-    lease_file = os.path.join(git_dir, "jetski_lease.json")
-    existing = _read_json_file(lease_file)
-    owner_cid = str(existing.get("conv_id") or "")
-    ts = float(existing.get("ts") or 0.0)
-    if (
-        owner_cid
-        and owner_cid != effective_cid
-        and not os.path.exists(override_path)
-    ):
-      still_active, db_title = _is_conv_still_active_tip(
-          owner_cid, effective_cid, transcript_path
-      )
-      if still_active:
-        unexpired, eff_ts = _is_worktree_lease_unexpired(
-            owner_cid, ts, top_level, transcript_path, now
-        )
-        if unexpired:
-          _record_parallel_guard_block(guard_state_path, transcript_path)
-          owner_label = db_title or existing.get("title") or owner_cid[:8]
-          age_m = int(max(1, (now - eff_ts) // 60))
-          return (
-              f"[WORKTREE LEASE GUARD] Worktree `{top_level}` is currently leased by "
-              f"another active conversation (`{owner_label}` -> `conversation://{owner_cid}`, "
-              f"active {age_m}m ago). Sharing a single code worktree or `out/` build directory "
-              f"between concurrent chats causes branch, build, and test collisions! "
-              f"Create and use a separate git worktree (e.g. "
-              f"`git -C {top_level} worktree add {top_level}_wt_{effective_cid[:6]} -b <branch>`) "
-              f"or ask the user whether to take over `{top_level}`. Only after the user "
-              f"explicitly confirms in a subsequent turn may you write `{override_path}`."
-          )
-    _write_json_atomic(
-        lease_file,
-        {
-            "conv_id": effective_cid,
-            "title": cur_title,
-            "ts": now,
-            "worktree": top_level,
-        },
+    return _check_and_claim_worktree_lease(
+        git_dir,
+        top_level,
+        effective_cid,
+        cur_title,
+        override_path,
+        guard_state_path,
+        transcript_path,
+        now,
     )
-    return ""
 
   if tool_name != "run_command":
     return ""
@@ -1653,8 +1695,8 @@ def parallel_chat_isolation_denial(
   cmd_str = str(tool_args.get("CommandLine", "")).strip()
   if not cmd_str:
     return ""
-  cmd_code = strip_heredocs(cmd_str)
-  if re.match(r"^\s*(?:grep|egrep|fgrep|rg|git\s+grep|echo|cat)\b", cmd_code):
+  cmd_code = _non_inspection_cmd_segments(cmd_str)
+  if not cmd_code:
     return ""
 
   cand_dirs = _extract_cmd_target_dirs(cmd_str, workspace_paths)
@@ -1689,45 +1731,18 @@ def parallel_chat_isolation_denial(
 
     # Code worktree lease check on mutating git / build / test commands
     if not _is_shared_config_repo(top_level) and is_claiming_cmd:
-      lease_file = os.path.join(git_dir, "jetski_lease.json")
-      existing = _read_json_file(lease_file)
-      owner_cid = str(existing.get("conv_id") or "")
-      ts = float(existing.get("ts") or 0.0)
-      if (
-          owner_cid
-          and owner_cid != effective_cid
-          and not os.path.exists(override_path)
-      ):
-        still_active, db_title = _is_conv_still_active_tip(
-            owner_cid, effective_cid, transcript_path
-        )
-        if still_active:
-          unexpired, eff_ts = _is_worktree_lease_unexpired(
-              owner_cid, ts, top_level, transcript_path, now
-          )
-          if unexpired:
-            _record_parallel_guard_block(guard_state_path, transcript_path)
-            owner_label = db_title or existing.get("title") or owner_cid[:8]
-            age_m = int(max(1, (now - eff_ts) // 60))
-            return (
-                f"[WORKTREE LEASE GUARD] Worktree `{top_level}` is currently leased by "
-                f"another active conversation (`{owner_label}` -> `conversation://{owner_cid}`, "
-                f"active {age_m}m ago). Do NOT run mutating git commands or builds "
-                f"(`ninja`/`felt`) inside another active chat's worktree! Create a separate "
-                f"git worktree (`git -C {top_level} worktree add "
-                f"{top_level}_wt_{effective_cid[:6]} -b <branch>`) or ask the user whether "
-                f"to take over `{top_level}`. Only after the user explicitly confirms in a "
-                f"subsequent turn may you write `{override_path}`."
-            )
-      _write_json_atomic(
-          lease_file,
-          {
-              "conv_id": effective_cid,
-              "title": cur_title,
-              "ts": now,
-              "worktree": top_level,
-          },
+      denial = _check_and_claim_worktree_lease(
+          git_dir,
+          top_level,
+          effective_cid,
+          cur_title,
+          override_path,
+          guard_state_path,
+          transcript_path,
+          now,
       )
+      if denial:
+        return denial
 
     # Shared-worktree per-file stage and commit guard
     if (add_invocations or commit_invocations) and not os.path.exists(override_path):
@@ -2311,8 +2326,9 @@ def main() -> None:
             state_file=target["file"] if target["in_project"] else "",
         )
 
-      if "agentapi" in cmd and not re.match(
-          r"^\s*(?:python3?|grep|egrep|fgrep|rg|git\s+grep|echo|cat)\b", cmd
+      cmd_non_inspect = _non_inspection_cmd_segments(cmd)
+      if "agentapi" in cmd_non_inspect and not re.match(
+          r"^\s*python3?\b", cmd_non_inspect
       ):
         new_title = state.get("pending_title") or build_continuation_title(
             conv_id, ""

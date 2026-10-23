@@ -1,42 +1,17 @@
 ---
 name: code-comments
 description: >-
-  Add, rewrite, compress, or remove code comments across files, commits, or git diffs.
-  Enforces concise English rationale comments ("why" over "what", timeless invariants
-  for fixes and deletions, 1–4 line limit, periods allowed inside multi-sentence blocks
-  but never at the very end of a comment or block). Use when the user asks to clean up,
-  add, review, or fix comments ("причеши комментарии", "прокомментируй дифф", "убери
-  лишние комментарии", "проверь комментарии").
+  Add, rewrite, compress, or remove code comments across files, commits, or git diffs (`audit_comments.py`),
+  enforcing concise English rationale comments ("why" over "what", 1–4 lines, no trailing period
+  outside Dart). Use when the user asks to "причеши комментарии", "прокомментируй дифф", "убери
+  лишние комментарии", or "проверь комментарии".
 ---
 
 # Code Comment Curator (`code-comments`)
 
-Curate code comments so that every remaining or newly added comment earns its place by explaining **why** — never **what** — in clear, compact English.
+Curate code comments so that every remaining or newly added comment earns its place by explaining **why** — never **what** — in clear, compact English, enforcing all comment and ownership rules from [`rules/code_style.md` Section 1](file:///usr/local/google/home/jlavrova/.gemini/config/rules/code_style.md#L5-L17).
 
-## 1. Core Formatting & Style Contract
-
-1. **Language**: English only, imperative or declarative prose, zero filler.
-2. **Length & Punctuation**:
-   - Prefer **1 line** (`// ...`) for straightforward invariants.
-   - Allow **2–4 lines** for nuanced domain mechanics or multi-part invariants.
-   - **Periods (`.`)**: Allowed *between* sentences inside a multi-line comment block, **strictly forbidden at the very end** of a single-line comment or at the end of the last line of a comment block.
-   - **Dart exception**: In `.dart` files the rule is inverted — every `//` and `///` comment **must** end with a period (Effective Dart, enforced by flutter/flutter review bots). `audit_comments.py` switches modes automatically by file extension.
-3. **Method Header vs. Targeted Branch Placement (No Umbrella Substitutes)**:
-   - **Above a method/function header**: Place a concise comment (1–2 lines) describing the method's role or contract as a whole — **without** narrating internal implementation details, loops, or branches.
-   - **Inside the method body**: Place short, focused comments **immediately above each specific non-trivial branch, condition, `switch` arm, or loop** explaining why that branch/invariant exists.
-   - **Never** use a header comment above a method, diff hunk, or `switch` statement as an "umbrella" substitute that leaves internal branches uncommented (`audit_comments.py` flags `[HEADER_ONLY]` when a multi-branch method body has a comment only above its signature).
-4. **No Slop / No Formatting Noise**:
-   - No numbered tutorial steps (`// 1. Setup`, `// 2. Run`).
-   - No markdown emphasis (`*word*`, `**word**`) or ASCII dividers (`// ---`, `// ===`).
-   - No narrative headers above unit test assertions (`REPORTER_ASSERT`, `expect(...)`).
-
-## 2. Comment Ownership Guardrail (Strict)
-
-- **Only rewrite or delete comments that YOU (the AI) added and explicitly remember adding** during the current task/session.
-- **Never silently alter or delete pre-existing comments or user-written comments** — even if they have trailing periods, look verbose, or seem outdated.
-- If a pre-existing or unknown comment looks wrong, noisy, or violates style rules, **ask the user first** and show the proposed change before touching it.
-
-## 3. Comment Taxonomy: Add, Rewrite, or Delete
+## 1. Comment Taxonomy: Add, Rewrite, or Delete
 
 ### A. What to ADD (Including 1-Line Non-Trivial Changes)
 

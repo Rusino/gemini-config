@@ -701,6 +701,8 @@ def main() -> int:
             if not args.skip_build:
                 log(f"[{label}] Compiling engine targets with ninja...", driver_log)
                 t_ninja0 = time.time()
+                # Share RBE/Siso build cache across worktrees regardless of absolute path
+                ninja_env = {**os.environ, "DEPOT_TOOLS_USE_VIRTUAL_BUILD_PATH": "1"}
                 with open(ninja_log, "w") as lf:
                     res = subprocess.run(
                         [
@@ -713,6 +715,7 @@ def main() -> int:
                             "ui_unittests",
                         ],
                         cwd=str(engine_src),
+                        env=ninja_env,
                         stdout=lf,
                         stderr=subprocess.STDOUT,
                     )

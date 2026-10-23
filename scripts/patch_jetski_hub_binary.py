@@ -13,9 +13,6 @@ from typing import List, Optional
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PRIMARY_JS_SRC = os.path.join(SCRIPT_DIR, "jetski_closed_filter.js")
-FALLBACK_JS_SRC = os.path.expanduser(
-    "~/.gemini/jetski/scratch/jetski_sidebar_filter/content.js"
-)
 ARTIFACT_JS_DST = os.path.expanduser(
     "~/.gemini/jetski/brain/jetski-closed-filter.js"
 )
@@ -47,11 +44,7 @@ REPLACEMENT_SUFFIX = b"</script>"
 def resolve_source_js() -> str:
   if os.path.isfile(PRIMARY_JS_SRC):
     return PRIMARY_JS_SRC
-  if os.path.isfile(FALLBACK_JS_SRC):
-    return FALLBACK_JS_SRC
-  raise FileNotFoundError(
-      f"Missing filter script at {PRIMARY_JS_SRC} and {FALLBACK_JS_SRC}"
-  )
+  raise FileNotFoundError(f"Missing filter script at {PRIMARY_JS_SRC}")
 
 
 def sync_artifact_js(

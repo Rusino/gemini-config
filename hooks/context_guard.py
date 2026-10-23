@@ -231,6 +231,25 @@ def _normalize_workspace_root(path: str, allow_any_dir: bool = False) -> str:
   return clean if allow_any_dir else ""
 
 
+def _is_archived_in_pbtxt(cid_s: str, hint_path: str = "") -> bool:
+  """True if annotations/<cid>.pbtxt marks the conversation archived."""
+  dirs = [app_data_dir_from_path(hint_path)] + [
+      os.path.expanduser(d) for d in APP_DATA_DIR_CANDIDATES
+  ]
+  for ad in dirs:
+    if not ad or not os.path.isdir(ad):
+      continue
+    pb_file = os.path.join(ad, "annotations", f"{cid_s}.pbtxt")
+    if os.path.isfile(pb_file):
+      try:
+        with open(pb_file, "r", encoding="utf-8", errors="ignore") as f:
+          if re.search(r"\barchived\s*:\s*true\b", f.read()):
+            return True
+      except OSError:
+        continue
+  return False
+
+
 def get_active_chats_by_project(
     hint_path: str = "", exclude_conv_id: str = ""
 ) -> dict[str, tuple[str, str]]:
@@ -242,7 +261,7 @@ def get_active_chats_by_project(
   query = (
       "SELECT conversation_id, title, project_id, last_modified_time "
       "FROM conversation_summaries "
-      "WHERE parent_conversation_id = '' AND (title LIKE '%⦿%' OR title LIKE '%▸%')"
+      "WHERE parent_conversation_id = '' AND title LIKE '%⦿%'"
   )
   for db_path in summary_db_paths(hint_path):
     for flags in ("mode=ro", "mode=ro&immutable=1"):
@@ -263,6 +282,7 @@ def get_active_chats_by_project(
               or not pid_s
               or pid_s == "outside-of-project"
               or cid_s == exclude_conv_id
+              or _is_archived_in_pbtxt(cid_s, hint_path)
           ):
             continue
           is_tip = 1 if "⦿" in title_s else 0
@@ -442,7 +462,7 @@ def get_active_sibling_chats_in_project(
       "SELECT conversation_id, title, last_modified_time "
       "FROM conversation_summaries "
       "WHERE project_id = ? AND parent_conversation_id = '' "
-      "AND (title LIKE '%⦿%' OR title LIKE '%▸%')"
+      "AND title LIKE '%⦿%'"
   )
   for db_path in summary_db_paths(hint_path):
     for flags in ("mode=ro", "mode=ro&immutable=1"):
@@ -457,7 +477,11 @@ def get_active_sibling_chats_in_project(
         for cid, title, lmt in rows:
           cid_s = str(cid or "").strip()
           title_s = str(title or "").strip()
-          if not cid_s or cid_s == exclude_conv_id:
+          if (
+              not cid_s
+              or cid_s == exclude_conv_id
+              or _is_archived_in_pbtxt(cid_s, hint_path)
+          ):
             continue
           ts = 0.0
           if lmt and not str(lmt).startswith("0001-"):
@@ -949,35 +973,33 @@ def get_consecutive_cmd_failures(transcript_path: str) -> tuple[int, int]:
     return 0, -1
   streak = 0
   last_cmd_idx = -1
-  pending_cmd_idx = None
-  pending_cmd_str = ""
+  pending_cmds: list[tuple[int, str]] = []
   for idx, step in turn_steps:
     stype = step.get("type", "")
     tool_calls = step.get("tool_calls") or []
     if stype == "PLANNER_RESPONSE" and tool_calls:
+      pending_cmds.clear()
       for tc in tool_calls:
         if tc.get("name") == "run_command":
-          pending_cmd_idx = idx
-          pending_cmd_str = str((tc.get("args") or {}).get("CommandLine", ""))
-    elif stype == "GENERIC" and pending_cmd_idx is not None:
+          pending_cmds.append(
+              (idx, str((tc.get("args") or {}).get("CommandLine", "")))
+          )
+    elif stype == "GENERIC" and pending_cmds:
       content = str(step.get("content", ""))
       if "\nFile Path: " in content[:200]:
         continue
       m = EXIT_CODE_RE.search(content)
       if m:
+        cmd_idx, cmd_str = pending_cmds.pop(0)
         code = int(m.group(1))
         # Ignore exit code 1 from grep/rg/git check-ignore ("no matches found")
-        if code == 1 and BENIGN_EXIT1_CMD_RE.search(pending_cmd_str):
-          pending_cmd_idx = None
-          pending_cmd_str = ""
+        if code == 1 and BENIGN_EXIT1_CMD_RE.search(cmd_str):
           continue
-        last_cmd_idx = pending_cmd_idx
+        last_cmd_idx = cmd_idx
         if code != 0:
           streak += 1
         else:
           streak = 0
-        pending_cmd_idx = None
-        pending_cmd_str = ""
   return streak, last_cmd_idx
 
 
@@ -1541,9 +1563,8 @@ def run(data: dict, log: dict) -> dict:
   new_title = build_continuation_title(conv_id, last_user_input)
   cmd_prefix = build_agentapi_prefix(conv_id, transcript_path, workspace_paths)
 
-  # The state is replaced wholesale so per-trigger flags (stop_guard's
-  # stop_blocked_handoff, the fail-streak marker) start fresh
-  save_state(state_path, {
+  # Preserve stop_guard's per-turn block markers while resetting handoff flags
+  new_state = {
       "gm_count": state.get("gm_count", 0),
       "soft_last_steps": state.get("soft_last_steps", -SOFT_REMIND_EVERY_STEPS),
       "last_triggered_level": level,
@@ -1561,7 +1582,11 @@ def run(data: dict, log: dict) -> dict:
           if not is_turn_start
           else MAX_TURN_INVOCATIONS
       ),
-  })
+  }
+  for k in ("discipline_blocked_turn", "last_blocked_edit_idx", "auto_title_notice"):
+    if k in state:
+      new_state[k] = state[k]
+  save_state(state_path, new_state)
 
   late_note = (
       " History was already compacted, so earlier details may be gone: take"

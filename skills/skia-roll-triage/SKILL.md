@@ -1,14 +1,11 @@
 ---
 name: skia-roll-triage
 description: >-
-  Triage the google3 Skia autoroll in one command: find the newest pending
-  "Roll Skia" CL, pull its TAP/Sponge diagnostics via autorepair, classify every
-  failing target by its HEAD status (Skia regression / broken at HEAD by someone
-  else / infra / flaky), extract the first compiler error and the pending CLs
-  that already fix it. Use when the user asks why the google3 Skia roll is
-  broken or stuck ("почему ролл сломан", "что с роллом в гугл3", "ролл стоит",
-  "is the g3 roll stuck", "triage the skia roll"), or before deciding whether
-  to re-roll with SKIA_DEPENDENTS_ALREADY_FAILING=true.
+  Triage the google3 Skia autoroll in one command: pull TAP/Sponge diagnostics for the newest
+  pending "Roll Skia" CL, classify failing targets by HEAD status, and extract the first compiler
+  error and pending fix CLs. Use when asked why the google3 Skia roll is broken ("почему ролл
+  сломан", "что с роллом в гугл3", "ролл стоит", "triage the skia roll") or before re-rolling with
+  `SKIA_DEPENDENTS_ALREADY_FAILING=true`.
 ---
 
 # Skia google3 roll triage

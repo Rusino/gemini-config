@@ -52,6 +52,10 @@ EXCLUDE_DIRS = {
     "vendor",
     ".pub-cache",
     ".dart_tool",
+    "logs",
+    "roadmaps",
+    "ledgers",
+    "projects",
 }
 
 SOURCE_EXTENSIONS = {
@@ -302,6 +306,17 @@ def detect_exact_file_duplicates(file_records):
   return duplicates
 
 
+def _strip_comments_for_ext(content: str, ext: str, keep_newlines: bool = False) -> str:
+  """Strip comments using syntax appropriate for the file extension."""
+  if ext == ".py":
+    return re.sub(r"(?m)#.*$", "", content)
+  if keep_newlines:
+    content = BLOCK_COMMENT_RE.sub(lambda m: "\n" * m.group(0).count("\n"), content)
+  else:
+    content = BLOCK_COMMENT_RE.sub("", content)
+  return LINE_COMMENT_RE.sub("", content)
+
+
 def run_builtin_block_clone_detector(file_records, min_lines=10, min_tokens=50):
   """Cross-platform normalized sliding-window clone detector for when Google3 CPD is absent."""
   window_size = max(6, min_lines // 2)
@@ -310,9 +325,8 @@ def run_builtin_block_clone_detector(file_records, min_lines=10, min_tokens=50):
   norm_streams = {}
 
   for _, rel_path, content, _ in file_records:
-    cleaned = BLOCK_COMMENT_RE.sub(
-        lambda m: "\n" * m.group(0).count("\n"), content
-    )
+    ext = pathlib.Path(rel_path).suffix.lower()
+    cleaned = _strip_comments_for_ext(content, ext, keep_newlines=True)
     norm_entries = []
     for line_no, raw in enumerate(cleaned.splitlines(), start=1):
       norm = normalize_line_for_clone(raw)
@@ -429,11 +443,18 @@ def run_google_cpd(targets, repo_root: pathlib.Path, min_lines=10, min_tokens=60
         locs = []
         for loc in d.get("locations", []):
           f = loc.get("file_path") or loc.get("file") or loc.get("path", "")
+          f_path = pathlib.Path(f)
+          if (
+              not f
+              or f_path.suffix.lower() not in SOURCE_EXTENSIONS
+              or any(part in EXCLUDE_DIRS for part in f_path.parts)
+          ):
+            continue
           s = loc.get("start_line") or loc.get("startLine", 0)
           e = loc.get("end_line") or loc.get("endLine", 0)
           locs.append(f"{f}:L{s}-L{e}")
         loc_key = tuple(sorted(locs))
-        if not locs or loc_key in seen_loc_sets:
+        if len(locs) < 2 or loc_key in seen_loc_sets:
           continue
         seen_loc_sets.add(loc_key)
         findings.append({
@@ -460,15 +481,15 @@ def analyze_functions_and_dead_code(file_records, max_func_lines=120, max_file_l
     if len(lines) > max_file_lines:
       bloated_files.append({"file": rel_path, "lines": len(lines), "is_test": test_flag})
 
+    ext = pathlib.Path(rel_path).suffix.lower()
     # Count all identifier occurrences per file to avoid quadratic regex scans
-    cleaned = LINE_COMMENT_RE.sub("", BLOCK_COMMENT_RE.sub("", content))
+    cleaned = _strip_comments_for_ext(content, ext, keep_newlines=False)
     for match in IDENT_RE.finditer(cleaned):
       word = match.group(1)
       ident_counts[word] += 1
       if test_flag:
         test_ident_counts[word] += 1
 
-    ext = pathlib.Path(rel_path).suffix.lower()
     func_re = FUNC_PATTERNS.get(ext)
     if not func_re:
       continue

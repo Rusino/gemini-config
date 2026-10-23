@@ -1,13 +1,11 @@
 ---
 name: webparagraph-corpus
 description: >-
-  Run the targeted two-part Flutter test corpus for WebParagraph changes (Part 1:
-  `engine/src/flutter/lib/web_ui` `test/webparagraph/*` and `test/ui/*` text tests via
-  `felt`; Part 2: `packages/flutter` paragraph and `TextPainter` tests on Chrome with
-  `preferWebParagraph: true`). Use when the user asks to test a branch, PR, or current
-  changes against the Flutter test corpus ("на всем корпусе Флаттеровских тестов",
-  "прогнать корпус тестов", "проверить на корпусе") or compare multiple branches/PRs
-  against a baseline.
+  Run the targeted two-part Flutter test corpus for WebParagraph changes (`felt` `web_ui`
+  tests + `packages/flutter` Chrome paragraph/TextPainter tests) and generate `compare.md`.
+  Trigger when asked to test on the Flutter corpus ("на всем корпусе Флаттеровских тестов",
+  "прогнать корпус тестов", "проверить на корпусе", "webparagraph corpus") or before
+  uploading/pushing WebParagraph changes.
 ---
 
 # WebParagraph Targeted Flutter Corpus Testing

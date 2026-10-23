@@ -1,15 +1,11 @@
 ---
 name: amnesia-precommit
 description: >-
-  Token-efficient pre-commit pipeline for Skia, SkParagraph, WebParagraph, and Flutter changes.
-  Combines (1) deterministic mechanical pruning (comment & anti-slop rules), (2) a clean-context
-  Hunter subagent pass (keeper_inquisitor) to minimize diff size, verify dropped guards, and check
-  pattern completeness, (3) a clean-context Skeptic Refutation pass (keeper_skeptic, Hunt then Refute
-  with XFAMILY_REFUTE auto-routing) to eliminate false-positive defects and unsafe code removals,
-  (4) a Persistent Finding Ledger (`finding_ledger.py`) that caches refuted findings across runs,
-  and (5) a hostile TDD filter to validate surviving bugs before a single rebuild. Trigger when the
-  user asks to "подготовь к коммиту", "минимизируй дифф", "проверь перед пушем",
-  "сделай амнезия-ревью", or "run amnesia precommit".
+  Token-efficient pre-commit audit and diff minimizer for Skia, SkParagraph, WebParagraph, and
+  Flutter changes (deterministic comment/code checks, clean-context Hunter + keeper_skeptic
+  refutation, finding_ledger caching, and single-rebuild TDD verification). Trigger before
+  committing/uploading or when the user asks to "подготовь к коммиту", "минимизируй дифф",
+  "проверь перед пушем", "сделай амнезия-ревью", or "run amnesia precommit".
 ---
 
 # Amnesia Pre-Commit & Diff Minimizer (`amnesia-precommit`)
@@ -108,51 +104,25 @@ If nothing is found in a section, write `None`.
 
 ---
 
-### Phase 2.5: The Skeptic Refutation Pass (Stage B Skeptic Subagent, `Hunt then Refute` + `XFAMILY_REFUTE`)
+### Phase 2.5: The Skeptic Refutation Pass (`keeper_skeptic`, `Hunt then Refute` + `XFAMILY_REFUTE`)
 
-Aggressive Hunter subagents suffer from confirmation bias: they frequently invent hypothetical null/bounds bugs already prevented by upstream callers, or misclassify a load-bearing guard as "redundant bloat" under Section 1 (`Scope & Size Reductions`).
+Whenever Phase 2 produces any candidate defects in **Section 2 (`B1, B2...`)** OR any non-trivial code/branch removal in **Section 1 (`S1, S2...`)** (skip if Phase 2 returned `None` or only trivial whitespace/comment cleanup), spawn **one batched `keeper_skeptic` subagent** following the `XFAMILY_REFUTE` routing (`Model="flash"` default, `Model="pro"` for concurrency/BiDi/metrics/dropped guards/cross-backend), Quota Exhaustion Fallback Ladder (`pro` → `flash` → Phase 3 Trapsmith TDD → user escalation), and Three Iron Verification Principles in [`plugins/keeper/agents/keeper_skeptic.md`](file:///usr/local/google/home/jlavrova/.gemini/config/plugins/keeper/agents/keeper_skeptic.md):
 
-Whenever Phase 2 produces any candidate defects in **Section 2 (`B1, B2...`)** OR any non-trivial code/branch removal in **Section 1 (`S1, S2...`)** (skip if Phase 2 returned `None` or only trivial whitespace/comment cleanup), spawn **one batched `keeper_skeptic` subagent** in a clean context to challenge all candidates at once.
-
-#### 1. Automatic Model Routing (`XFAMILY_REFUTE`)
-Select the `Model` argument for `invoke_subagent` automatically based on the hardest candidate in the packet:
-- **`Model="flash"` (Default Fast Skeptic)**: Use when all candidates are local single-function invariants, dead-code/scope reductions, or straightforward caller checks.
-- **`Model="pro"` (Auto-Escalation for Deep Invariants)**: Automatically escalate to `Model="pro"` if **any** candidate in the batch involves:
-  1. Concurrency, locks, thread safety, or asynchronous object lifetimes;
-  2. BiDi level resolution, UTF-8 / UTF-16 / grapheme cluster index math, or `SkParagraph` line/run metrics;
-  3. Dropped historical guards (`-` lines requiring `git log -S` / `git blame` root-cause tracing);
-  4. Cross-backend symmetry (`SkParagraph` ↔ `WebParagraph`, ICU ↔ Apple/Client `SkUnicode`);
-  5. Re-verification of a blocking candidate that a `flash` Skeptic marked `UNPROVEN`.
-
-#### 2. Batched Skeptic Invocation
 ```python
 invoke_subagent(
     TypeName="keeper_skeptic",
     Role="Batched Verification Skeptic",
-    Model="<flash or pro per routing rules above>",
+    Model="<flash or pro per keeper_skeptic.md XFAMILY_REFUTE rules>",
     Workspace="inherit",
     Prompt="""
-You are the Verification Skeptic for a pre-commit audit in `<repo_path>`.
-Your sole job is to REFUTE each candidate below using real code, callers, comments, git history, and tests. A refutation you cannot prove with an exact `path:line` citation or caller search is a confirmation, not a dismissal.
+You are the Verification Skeptic (`keeper_skeptic`) for a pre-commit audit in `<repo_path>`.
+Refute each candidate below using real code, callers (`git grep`, `code_search`), comments, git history (`git log -S`), and tests per your Three Iron Verification Principles.
 
 Candidates Under Test (Batch V001):
 <paste all non-trivial Section 1 Scope/Size removals (S1, S2...) and all Section 2 Behavioral/Completeness defects (B1, B2...)>
-
-Instructions:
-1. Apply the Three Iron Verification Principles:
-   - **Refute with Code (`file:line`), Never Memory**: Never write "looks handled" or "the caller probably checks". Cite the exact `path:line` guard, caller `SkASSERT`, or `git grep` / `code_search` output.
-   - **Documented Intent Overrides Syntactic Omissions**: Adjacent comments, header docstrings, and unit tests that explicitly codify the behavior refute claims of accidental omission.
-   - **Burden of Proof Requires Reachable Harm**: A missing defensive `if (!ptr)` check is REFUTED if callers already guarantee the contract via `SkASSERT` or API boundary. For a proposed code removal (`S1...`), REFUTE the removal if `git log -S` or a caller trace shows the branch guards a real edge case.
-2. Output exactly one verdict (`REFUTED`, `CONFIRMED`, or `UNPROVEN`) per candidate ID with its mandatory evidence fields.
 """
 )
 ```
-
-#### 3. Quota Exhaustion Fallback Ladder
-If the `keeper_skeptic` call fails due to model quota exhaustion (`429` / resource exhausted) or timeout:
-1. **Step 1 — Auto-Downgrade (`pro` → `flash` → `flash_lite`)**: Immediately retry the exact same Skeptic batch on `Model="flash"` (or `flash_lite`) and tag the resulting verdicts `[Verified via Flash fallback (Pro quota exhausted)]`.
-2. **Step 2 — Deterministic Trapsmith TDD Fallback (0 LLM Quota)**: In `amnesia-precommit`, if subagent quota is exhausted across models, bypass the LLM Skeptic and validate each candidate directly in Phase 3 by writing the minimal unit test and running the native test binary (`dm`, `felt`, or `flutter test`).
-3. **Step 3 — User Escalation**: If all models are exhausted and no local test binary can settle the candidate, never silently drop or blindly apply it—mark it `[UNVERIFIED: Quota Exhausted]` in the final report and ask the user whether to switch the chat model (`python3 ~/.gemini/config/hooks/chat_lifecycle.py model`) or pause.
 
 ---
 

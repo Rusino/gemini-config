@@ -664,21 +664,39 @@ def analyze_review(cl_data, files):
         "corpus_gate": corpus_gate,
     }
 
+def _is_active_ldap(email: str) -> bool:
+    ldap = email.split("@", 1)[0].strip().lower()
+    if not ldap or not os.path.exists("/usr/bin/id"):
+        return True
+    try:
+        res = subprocess.run(
+            ["id", "-u", ldap],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1.5,
+            check=False,
+        )
+        return res.returncode == 0
+    except Exception:
+        return True
+
+
 def suggest_reviewer(files):
-    """Suggest alternative reviewers based on path hints."""
+    """Suggest active alternative reviewers based on path hints."""
     path_map = {
-        "gpu/ganesh/vk": ("Vulkan Backend Team", "sunnyps@google.com, bsalomon@google.com"),
-        "gpu/ganesh/mtl": ("Metal Backend Team", "armansito@google.com"),
-        "gpu/graphite": ("Graphite Team", "robertphillips@google.com, bsalomon@google.com"),
-        "bazel": ("Infra / Build Team", "kjlubick@google.com"),
-        "gn": ("Build Team", "kjlubick@google.com"),
-        "flutter/engine/shell": ("Flutter Shell Team", "chinmaygarde@google.com, dnfield@google.com"),
-        "flutter/lib/web_ui": ("Flutter Web Team", "yjbanov@google.com, mdebbar@google.com")
+        "gpu/ganesh/vk": ("Vulkan Backend Team", ["sunnyps@google.com", "egdaniel@google.com"]),
+        "gpu/ganesh/mtl": ("Metal Backend Team", ["michaelludwig@google.com", "egdaniel@google.com"]),
+        "gpu/graphite": ("Graphite Team", ["robertphillips@google.com", "michaelludwig@google.com"]),
+        "bazel": ("Infra / Build Team", ["borenet@google.com"]),
+        "gn": ("Build Team", ["borenet@google.com"]),
+        "flutter/engine/shell": ("Flutter Engine Team", ["cbracken@google.com"]),
+        "flutter/lib/web_ui": ("Flutter Web Team", ["yjbanov@google.com", "mdebbar@google.com"]),
     }
     for f in files:
-        for k, (team, reviewer) in path_map.items():
+        for k, (team, candidates) in path_map.items():
             if k in f.path.lower():
-                return team, reviewer
+                active = [c for c in candidates if _is_active_ldap(c)]
+                return team, (", ".join(active) if active else "relevant subsystem owner")
     return "Subsystem Owner", "relevant subsystem owner"
 
 def generate_report(cl_data, analysis, files):

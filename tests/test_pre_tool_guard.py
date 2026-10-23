@@ -969,6 +969,27 @@ class TestPreToolGuard(unittest.TestCase):
           "allow",
       )
 
+  def test_compound_command_inspection_prefix_does_not_bypass_mutation_guards(self):
+    import pre_tool_guard
+    self.assertEqual(
+        pre_tool_guard._non_inspection_cmd_segments("grep -rn foo . && echo ok"),
+        "",
+    )
+    self.assertEqual(
+        pre_tool_guard._non_inspection_cmd_segments("grep -rn 'git commit' . && git commit -m 'x'"),
+        "git commit -m 'x'",
+    )
+    self.assertTrue(
+        pre_tool_guard.is_git_commit_or_upload_command(
+            "grep -rn 'git commit' . && git commit -m 'x'"
+        )
+    )
+    self.assertTrue(
+        pre_tool_guard.is_git_upload_or_push_command(
+            "echo checking && git push origin main"
+        )
+    )
+
   # Verify per-worktree lease blocks a second active chat on the same worktree
   def test_worktree_lease_guard_blocks_concurrent_chat_on_same_code_worktree(self):
     with tempfile.TemporaryDirectory() as tmp_dir:

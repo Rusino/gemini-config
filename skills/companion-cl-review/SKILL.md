@@ -1,19 +1,11 @@
 ---
 name: companion-cl-review
 description: >-
-  Proof-by-WIP-CL code review discipline for Gerrit CLs and GitHub PRs. Instead of relying solely
-  on prose comments, checks out the author's exact patchset without rebasing, tests domain edge
-  cases with a compiler and test runner, classifies the CL into 5 operational outcomes (1: Ideal CL,
-  2: Near-Ideal / Minor Nits, 3: No Failing Tests / Coverage or Cleanup Only, 4: Fundamental Design
-  Flaw / Failing Reproducer Tests Only, 5: Edge-Case Defects + Clean Fix in 2 Patchsets), uploads a
-  silent stacked WIP companion CL (PS1 = failing tests with timeless comments, PS2 = passing fix)
-  when warranted, and drafts a collaborative English review message giving the author full freedom
-  to cherry-pick tests, fold in the fix, or split the CL. Trigger by default on code reviews (via
-  `review-triage` or directly) or when the user asks for "ревью с компаньоном", "сделай WIP СЛ для
-  ревью", "повесь дочерний СЛ с тестами и фиксом", "companion cl review", unless the user explicitly
-  opts out ("без компаньона", "только текстом", "without companion CL"). Supports a dry mode
-  ("dry", "сухой прогон", "только доложи", "без действий") that builds and tests locally but only
-  reports the planned actions without pushing anything.
+  Proof-by-WIP-CL code review for Gerrit CLs and GitHub PRs: checks out the exact patchset,
+  runs adversarial contract tests, classifies into 5 outcomes, and stacks a silent WIP companion
+  CL (`PS1` = failing tests, `PS2` = passing fix). Trigger by default on code reviews or when
+  asked for "ревью с компаньоном", "сделай WIP СЛ для ревью", "companion cl review" (opt out:
+  "без компаньона" / "только текстом"; dry mode: "dry" / "сухой прогон").
 ---
 
 # Proof-by-WIP-CL Code Review (`companion-cl-review`)
@@ -75,7 +67,7 @@ Never upload a companion WIP CL blindly. After auditing the patchset and testing
    - Write comments inside the test file as **timeless domain invariants** (describing *why* the contract must hold in `main`, without trailing periods in C++).
    - **Never** write `"// Fails on cl/123456 because..."` or `"// Reproducer for PS3 bug"` in test comments — when the author folds your patchset into their CL, temporary review-time phrasing pollutes their commit and requires another round of review cleanup.
 3. **Compile and run the test binary (plus `flutter-test-paragraph-engine` for `SkParagraph` changes)**:
-   - For any Skia CL that modifies `modules/skparagraph/src/`, `modules/skunicode/src/`, or `modules/skshaper/src/`, running native Skia `dm --match SkParagraph` (`skia-test-paragraph`) alone is **not sufficient**: you **must** also run `flutter-test-paragraph-engine` (`~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py`) to verify that Flutter framework layout, intrinsic width, editing, and widget consumers (including `dropdown_menu_test.dart`) pass with zero regressions before classifying the CL as **Case 1** or **Case 2**.
+   - For any Skia CL that modifies executable code in `modules/skparagraph/{src,include}/`, `modules/skunicode/{src,include}/`, or `modules/skshaper/{src,include}/`, running native Skia `dm --match SkParagraph` (`skia-test-paragraph`) alone is **not sufficient**: you **must** also run `flutter-test-paragraph-engine` (`~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py`) to verify that Flutter framework layout, intrinsic width, editing, and widget consumers (including `dropdown_menu_test.dart`) pass with zero regressions before classifying the CL as **Case 1** or **Case 2** (for Case 5, run `flutter-test-paragraph-engine` once on the final `PS2` tree in Phase 4 rather than twice).
    - If no defects exist and no new tests are needed → **Case 1** or **Case 2** (stop here and draft prose review).
    - If the new tests **pass** on the author's unmodified code → **Case 3**.
    - If the new tests **fail** (`Gate A` confirmed), record the exact failing test names and assertion count (`N failing assertions across K tests`), then decide between **Case 4** (reproducer tests only) and **Case 5** (tests in `PS1` + fix in `PS2`).
@@ -112,7 +104,7 @@ When **Case 5** applies:
    - Ensure all code comments follow project conventions (concise English rationale explaining *why*, 1–4 lines, no trailing periods in C++, `<= 100` columns).
 2. **Verify all tests pass (including `flutter-test-paragraph-engine` for `SkParagraph` changes)**:
    - Recompile and run both the new contract tests from `PS1` and the full module test suite to prove zero regressions.
-   - Whenever the CL modifies `modules/skparagraph/src/`, `modules/skunicode/src/`, or `modules/skshaper/src/`, you **must** also run `flutter-test-paragraph-engine` (`~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py`) against the `PS2` tree before uploading `PS2`. Never upload a `PS2` fix verified only with native Skia `dm`.
+   - Whenever the CL modifies executable code in `modules/skparagraph/{src,include}/`, `modules/skunicode/{src,include}/`, or `modules/skshaper/{src,include}/`, you **must** also run `flutter-test-paragraph-engine` (`~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py`) against the `PS2` tree before uploading `PS2`. Never upload a `PS2` fix verified only with native Skia `dm`.
 3. **Mandatory clean-context audit of our own fix (non-skippable)**:
    - `PS2` is code we ask someone else to adopt, so it gets the full `amnesia-precommit` pipeline (or the environment's equivalent): comment and code audits on `HEAD`, the clean-context Hunter (`keeper_inquisitor`), and the batched Skeptic (`keeper_skeptic`, `pro` for line-breaking, BiDi, or index math) on every candidate defect.
    - Fix every `CONFIRMED` defect, then rerun the **full** module test suite once more, not just the new tests: a fix for a skeptic finding can break a different edge case that only one of the `PS1` reproducers covers.
@@ -145,7 +137,7 @@ Structure the English review comment using this proven template:
    Acknowledge the goal and direction of the patchset (`"Thanks for putting this together! While testing PS<N> against a few additional scenarios, I found <K> edge cases where..."`).
 2. **Numbered Root-Cause Breakdown**:
    For each edge case (`1.`, `2.`, ...):
-   - Cite the exact `File.cpp:line` and symbol in the author's patchset.
+   - Cite the exact `File.cpp:line` and symbol in the author's patchset (if linking to `source.chromium.org` or Gitiles with `;l=<line>`, always pin the URL with `;drc=<full_commit_sha>` so line numbers never drift).
    - Explain the concrete input scenario and why the current logic miscomputes or crashes.
    - Explain the invariant fix in 1–2 sentences (or with a 3-line inline snippet if helpful).
 3. **Side Effects & Predicate Scope**:

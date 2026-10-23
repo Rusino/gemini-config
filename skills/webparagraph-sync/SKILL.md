@@ -39,9 +39,9 @@ All `Web*` class prefixes in Dart (`WebParagraph`, `WebTextLayout`, `WebCluster`
 | `paragraph.dart` | `src/clusters.ts` | `ClusterRange`, `TextClusterMapping`, `Cluster`, `TextCluster`, `EmptyCluster`, `PlaceholderCluster` |
 | `layout.dart` | `src/layout.ts` | `LayoutBidiRun`, `TextLayout` (`extractTextClusters`, `addLine`, `formatLines`, `getBoxesForRange`, `getPositionForOffset`, `getGlyphInfoAt`, `getWordBoundary`, `getLineBoundary`) |
 | `layout.dart` | `src/lines.ts` | `LineBlock`, `TextBlock`, `PlaceholderBlock`, `EllipsisBlock`, `TextLine` |
-| `layout.dart` + `font_collection.dart` | `src/measurer.ts` | `MeasureProvider`, `OracleFontMeasureProvider`, `CanvasMeasureProvider`, `TextRulerCache`, `FontRuler` |
+| `layout.dart` + `font_collection.dart` | `src/measurer.ts` | `MeasureProvider`, `OracleFontMeasureProvider`, `CanvasMeasureProvider` |
 | `wrapper.dart` | `src/wrapper.ts` | `TextWrapper`, `LineBuilder` (4-zone cluster state machine, greedy breaking, backward `ellipsize`) |
-| `decorations.dart` | `src/decorations.ts` | `CanvasDecorationPainter` (`calculateThickness`, `paintDecorations`, wavy/double/dashed/solid lines) |
+| `decorations.dart` | `src/decorations.ts` | `CanvasDecorationPainter` (`calculateThickness`, `fillDecorations`, wavy/double/dashed/solid lines) |
 | `painter.dart` | `src/painter.ts` | `ParagraphPainter`, `ParagraphVisitor`, `LayoutVisitorPainter`, `LayoutTreeInspector`, `CanvasParagraphPainter` |
 | `bidi.dart` + `code_unit_flags.dart` | `src/providers.ts` | `BidiProvider`, `CodeUnitClassifier`, `ClusterProvider`, `CodeUnitFlags`, browser/WASM default implementations |
 | `dart:ui` primitives | `src/types.ts` | `Rect`, `Offset`, `Size`, `TextBox`, `TextRange`, `TextPosition`, `GlyphInfo`, `LineMetrics`, enums |

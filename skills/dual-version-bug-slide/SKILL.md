@@ -1,47 +1,42 @@
 ---
 name: dual-version-bug-slide
 description: >-
-  Transform a reported bug (GitHub issue, Buganizer ID, or regression report) into
-  a rigorous contract unit test and an interactive dual-engine comparison slide ("how
-  it was" vs "how it is / how it should be"). Enforces hostile mutation testing,
-  loop guards, English-only UI/code, and strict code comment invariants. Runs by
-  default whenever investigating or fixing a bug in SkParagraph, SkUnicode, SkShaper,
-  WebParagraph, or Skia that has a visual, geometric, metric, glyph, caret/selection,
-  or layout-crash manifestation, or when explicitly triggered ("создай слайд по багу",
-  "проверь ошибку на двух версиях", "сделай слайд сравнения", "сделай визуализацию до/после",
-  "слайд").
+  Transform a reported bug (GitHub issue, Buganizer ID, or regression report) into a contract
+  unit test and an interactive dual-version comparison slide ("how it was" vs "how it is / should be").
+  Trigger when the user asks to "создай слайд по багу", "проверь ошибку на двух версиях",
+  "сделай слайд сравнения", "сделай визуализацию до/после", or "слайд".
 ---
 
 # Dual-Version Bug Slide Curator (`dual-version-bug-slide`)
 
-Transform bug reports into verifiable regression tests and interactive dual-engine comparison slides that visually contrast legacy baseline behavior with candidate or target implementations. This workflow runs **automatically by default** when investigating or fixing any bug in `SkParagraph`, `SkUnicode`, `SkShaper`, `WebParagraph`, or `Skia` that can be visually or structurally rendered (skipping only purely non-visual issues such as build/CI configuration or memory/ASan bookkeeping).
+Transform bug reports in `SkParagraph`, `SkUnicode`, `SkShaper`, `WebParagraph`, or `Skia` into verifiable regression tests and interactive before/after comparison slides that visually contrast legacy baseline behavior with candidate or target implementations.
 
 ---
 
 ## 1. Core Invariants & Anti-Slop Contract
 
 1. **Strict English-Only:**
-   - All generated C++ code, slide titles, subtitles, card headers, descriptive prose, assertion messages, and UI text must be written strictly in English.
+   - All generated code, slide titles, subtitles, card headers, descriptive prose, assertion messages, and UI text must be written strictly in English.
    - No Cyrillic or localized text in compiled source files or binaries.
 
 2. **Code Comment Discipline (Integration with `code-comments`):**
-   - **Why over What:** Explain timeless architectural invariants, hardware/API quirks, or why a check is omitted; never restate C++ syntax.
-   - **Length & Punctuation:** Keep comments to 1–4 lines. Periods (`.`) are allowed between sentences within a multi-line comment block, but **strictly forbidden at the very end** of a single-line comment or at the end of the last line of a comment block.
+   - **Why over What:** Explain timeless architectural invariants, hardware/API quirks, or why a check is omitted; never restate syntax.
+   - **Length & Punctuation:** Keep comments to 1–4 lines. Periods (`.`) are allowed between sentences within a multi-line comment block, but **strictly forbidden at the very end** of a single-line comment or at the end of the last line of a comment block (except `.dart` files).
    - **Zero Noise:** No numbered tutorial steps (`// 1. Setup`), markdown formatting (`**bold**`), or ASCII dividers (`// ===`).
    - **Ownership:** Never rewrite or delete pre-existing or user-written comments without explicit permission.
 
 3. **Fail-Fast Dimensional Honesty:**
    - Never hardcode bounding boxes, caret offsets, or advance widths with magic numbers (`x + 120.0f`).
-   - Dimensions must be queried dynamically via runtime API calls (`paragraph->getRectsForRange`, `Run::positions()`, `Run::advance()`).
+   - Dimensions must be queried dynamically via runtime API calls (`paragraph->getRectsForRange`, `Run::positions()`, `Run::advance()`, `getBoxesForRange`).
 
 4. **Roadmap Honesty (No Faking):**
    - If candidate behavior is not yet implemented in the codebase, the status is **`UNRESOLVED / KNOWN DEFECT (ROADMAP)`**.
    - The right card must feature an amber banner: `[NOT IMPLEMENTED IN CURRENT BUILD (ROADMAP)]`.
-   - The unit test must be guarded with `DEF_TEST_DISABLED` and explain the exact failing contract.
+   - The unit test must be guarded with `DEF_TEST_DISABLED` (or `skip: true`) and explain the exact failing contract.
    - If manual simulation is necessary (e.g. inserting `\n` to model strict line breaks), mark it explicitly: `[MANUALLY SIMULATED FOR ROADMAP]`.
 
 5. **Crash Isolation:**
-   - Legacy code that triggers `SkASSERT`, `abort()`, or unhandled exceptions must **never** be executed inside the GUI `viewer` draw loop.
+   - Legacy code that triggers `SkASSERT`, `abort()`, or unhandled exceptions must **never** be executed inside a live UI draw loop.
    - Such cases use the **Crash Anatomy** rendering mode (static structural diagram with the exact asserted condition and stack).
 
 6. **The Invariant Triplet:**
@@ -51,45 +46,12 @@ Transform bug reports into verifiable regression tests and interactive dual-engi
      3. `Architectural Invariant:` fundamental property preserved by the contract.
 
 7. **Public Artifact & Visual Proof Hygiene:**
-   - Rendered slide titles, subtitles, cards, code comments, and catalog artifacts (`slides_gallery.html`, `DualEngine_Typography_Bugs_Carousel.md`) must be safe to attach to public Gerrit CLs, GitHub PRs, and external issue trackers.
+   - Rendered slide titles, subtitles, cards, code comments, and catalog artifacts must be safe to attach to public Gerrit CLs, GitHub PRs, and external issue trackers.
    - Never embed internal corporate shortlinks (`go/`, `goto.google.com`, `cl/`, `cr/`, `sponge`, `critique`), non-public `b/<id>` bug numbers, internal depot/CitC paths, or machine-local home paths in visible slide text or metadata. Always use public issue identifiers (`FLUTTER ISSUE <id>`, `crbug.com/<id>`, `skia:<id>`) or short commit SHAs.
 
 ---
 
 ## 2. Phased Workflow
-
-```
-Input: Bug Link / ID + Dual-Version Context (Backends / Commits)
-                           │
-           [Phase 1: Universal Defect Analysis]
-           - Input Vector (text, styles, constraints, locale)
-           - Contract Invariant (monotonicity, 2D anchors, UTF-16)
-           - Failure Mode (crash, topological, metric, semantic)
-                           │
-           [Phase 2: Gate A — Hostile Test & Mutation Probe]
-           - Route to target test file
-           - Loop Guard: max 3 test attempts, max 2 mutation probes
-           - Stop-the-Line: if test is tautological -> STOP, escalate
-                           │
-           [Phase 3: State & Render Mode Classification]
-           - FIXED + LIVE_EXECUTION (soft metric mismatch resolved)
-           - FIXED + CRASH_ISOLATED (fatal crash resolved; legacy isolated)
-           - UNRESOLVED (ROADMAP) (unimplemented; DEF_TEST_DISABLED)
-                           │
-           [Phase 4: Slide Authoring (English + code-comments)]
-           - Subclass ParagraphBugSlide_Base
-           - Left card: Legacy (live or crash anatomy)
-           - Right card: Candidate (live or roadmap banner)
-           - Bottom card: The Invariant Triplet
-                           │
-           [Phase 5: Build, Headless Render & Catalog Integration]
-           - Register in ParagraphBugsSlide.cpp (DEF_SLIDE)
-           - Update Slide 0 Dashboard with verified balance (X Passing | Y Roadmap)
-           - Headless PNG render (1050x750)
-           - Update Markdown carousel and slides_gallery.html
-```
-
----
 
 ### Phase 1: Universal Defect Analysis
 
@@ -111,17 +73,17 @@ Decompose the reported bug along three orthogonal axes:
 
 #### Test File Routing Protocol
 Identify target test file before writing any code:
-1. Search codebase for existing test references: `git grep -i "<issue_id>" modules/skparagraph/tests/`.
-2. If none, route by subsystem:
-   - Paragraph layout/wrapping $\to$ `modules/skparagraph/tests/ParagraphTest.cpp`.
-   - Fonts/Typefaces/Descriptors $\to$ `modules/skparagraph/tests/TypefaceTest.cpp` or `FontCollectionTest.cpp`.
-   - Unicode/Word boundaries $\to$ `modules/skparagraph/tests/SkUnicodeTest.cpp`.
-3. Canonical regression fallback: dedicated bug suite (e.g. `modules/skparagraph/tests/SkParagraphFlutterBugsTest.cpp` or `SkParagraphSkiaBugsTest.cpp`).
-4. **State the chosen file and rationale in the turn response before editing.**
+1. Search codebase for existing test references (`git grep -i "<issue_id>"`).
+2. Route by repository and subsystem:
+   - Skia Paragraph (`SkParagraph`) $\to$ `modules/skparagraph/tests/SkParagraphTest.cpp`
+   - Skia Unicode (`SkUnicode`) $\to$ `modules/skunicode/tests/SkUnicodeTest.cpp`
+   - Flutter `WebParagraph` (Dart) $\to$ `engine/src/flutter/lib/web_ui/test/webparagraph/`
+   - TypeScript `WebParagraph` (`Rusino/paragraph`) $\to$ `tests/webparagraph/`
+3. **State the chosen file and rationale in the turn response before editing.**
 
 #### Loop Guard Limits
 - **Maximum Test Formulation Attempts: 3.**
-  - Attempt 1: Direct translation of repro steps into C++ test.
+  - Attempt 1: Direct translation of repro steps into unit test.
   - Attempt 2: Refined constraints (layout width, explicit font, BiDi direction).
   - Attempt 3: Minimal synthetic isolation of the shaper/layout call.
 - **Maximum Mutation Probes: 2.**
@@ -143,59 +105,16 @@ Classify the test case into one of three execution states:
 
 | State | Status | Legacy Card Mode | Candidate Card Mode | Unit Test |
 |---|---|---|---|---|
-| **1. Soft Defect Fixed** | `FIXED` (Green) | `LIVE_EXECUTION` (makeHarfBuzzParagraph) | `LIVE_EXECUTION` (makeCoreTextParagraph) | `DEF_TEST` |
-| **2. Crash Defect Fixed** | `FIXED` (Green) | `CRASH_ISOLATED` (Static Crash Anatomy) | `LIVE_EXECUTION` (makeCoreTextParagraph) | `DEF_TEST` |
-| **3. Unresolved Roadmap** | `UNRESOLVED` (Amber) | `LIVE_EXECUTION` or `CRASH_ISOLATED` | `TARGET_MOCK` + Warning Banner | `DEF_TEST_DISABLED` |
+| **1. Soft Defect Fixed** | `FIXED` (Green) | `LIVE_EXECUTION` (Baseline Commit/Backend) | `LIVE_EXECUTION` (Candidate Commit/Backend) | Passing test |
+| **2. Crash Defect Fixed** | `FIXED` (Green) | `CRASH_ISOLATED` (Static Crash Anatomy) | `LIVE_EXECUTION` (Candidate Commit/Backend) | Passing test |
+| **3. Unresolved Roadmap** | `UNRESOLVED` (Amber) | `LIVE_EXECUTION` or `CRASH_ISOLATED` | `TARGET_MOCK` + Warning Banner | Disabled test (`DEF_TEST_DISABLED` / `skip: true`) |
 
 ---
 
-### Phase 4: Slide Authoring Pattern
+### Phase 4: Slide Authoring & Headless Browser Verification
 
-Author the slide in `modules/skparagraph/slides/ParagraphBugsSlide.cpp` inheriting from `ParagraphBugSlide_Base`:
-
-```cpp
-// Verifies that keycap emoji sequences form an atomic cluster in CoreText
-class ParagraphSlide_Flutter_121680_KeycapEmoji : public ParagraphBugSlide_Base {
-public:
-    void draw(SkCanvas* canvas) override {
-        drawComparisonSlide(
-            canvas,
-            "FLUTTER ISSUE 121680",
-            "Keycap Emoji Sequence Grapheme Clustering",
-            "FIXED IN CORETEXT",
-            SkColorSetRGB(22, 163, 74),
-            "CoreText shapes 3-codepoint keycap sequences as an atomic Apple Color Emoji glyph",
-            "Legacy (HarfBuzz / ICU)",
-            "Splits keycap into decomposed clusters",
-            [this](const SkRect& r) { drawLegacy(r); },
-            "Candidate (CoreText / Apple)",
-            "Atomic single cluster representation",
-            [this](const SkRect& r) { drawCandidate(r); },
-            "HarfBuzz splits [1] + [VS-16] + [Keycap] across separate runs, trapping caret inside",
-            "CoreText unifies sequence into 1 glyph, advancing caret across entire cluster",
-            "Grapheme Cluster Invariant: User-perceived characters must behave atomically"
-        );
-    }
-};
-```
-
----
-
-### Phase 5: Build, Headless Render & Catalog Integration
-
-1. **Register Slide:**
-   - Append `DEF_SLIDE(return new ParagraphSlide_<Name>();)` to `ParagraphBugsSlide.cpp`.
-   - Add entry to `bugs[]` array in `ParagraphSlide_BugsOverview`.
-   - Update header string to match exact arithmetic count: `"13 TESTS: X PASSING | Y ROADMAP"`.
-2. **Build and Render:**
-   ```bash
-   ninja -C out/Debug viewer && \
-   ./<render_tool> <output_dir>
-   ```
-3. **Visual Verification:**
-   - Confirm zero tofu (missing glyph boxes).
-   - Verify all text stays within card boundaries with no clipping.
-   - Verify warning banners on any roadmap slides.
-4. **Catalog Synchronization:**
-   - Update Markdown carousel artifact (`DualEngine_Typography_Bugs_Carousel.md`).
-   - Update interactive gallery (`slides_gallery.html`).
+1. **Generate Standalone Comparison Slide (`<artifact_dir>/<issue>_slide.html` + PNG)**:
+   - Render the two-column comparison card (`Legacy (Baseline)` on the left, `Candidate (Fixed)` on the right) and the bottom **Invariant Triplet** card (`Legacy Version (Baseline):`, `Candidate Version:`, `Architectural Invariant:`) using real measured geometry/metrics extracted from the baseline and candidate runs.
+2. **Visual Verification**:
+   - Navigate with `browser_navigate` (`ServerName="browser_browser"`), check `browser_get_console_logs`, and capture a screenshot via `browser_capture_screenshot` into `<artifact_dir>/<issue>_slide.png`.
+   - Confirm zero tofu, zero text clipping, and clear visual contrast of the defect vs. fix.

@@ -189,24 +189,29 @@ def parse_git_diff(repo_path, diff_ref):
     nonlocal hunk_added, hunk_deleted
     if not cur_file or (not hunk_added and not hunk_deleted):
       return
-    has_new_comment = any(COMMENT_RE.match(l) for l in hunk_added)
-    added_code = [l.strip() for l in hunk_added if l.strip() and not COMMENT_RE.match(l)]
-    deleted_code = [l.strip() for l in hunk_deleted if l.strip() and not COMMENT_RE.match(l)]
+    def is_comment(line_s: str) -> bool:
+      if COMMENT_RE.match(line_s):
+        return True
+      return bool(cur_file and cur_file.endswith(".py") and line_s.lstrip().startswith("#"))
+
+    has_new_comment = any(is_comment(l) for l in hunk_added)
+    added_code = [l.strip() for l in hunk_added if l.strip() and not is_comment(l)]
+    deleted_code = [l.strip() for l in hunk_deleted if l.strip() and not is_comment(l)]
     if (added_code or deleted_code) and not has_new_comment:
       uncommented_hunks.append((cur_file, hunk_start, added_code, deleted_code))
     elif has_new_comment and not test_file_re.search(cur_file):
       # A method-header comment describes only the method contract and does not substitute for
       # targeted comments on internal control-flow branches inside the body
       first_brace_idx = next(
-          (i for i, l in enumerate(hunk_added) if not COMMENT_RE.match(l) and "{" in l),
+          (i for i, l in enumerate(hunk_added) if not is_comment(l) and "{" in l),
           None,
       )
       if first_brace_idx is not None:
         body_lines = hunk_added[first_brace_idx + 1 :]
         body_branches = [
-            l.strip() for l in body_lines if not COMMENT_RE.match(l) and branch_re.match(l)
+            l.strip() for l in body_lines if not is_comment(l) and branch_re.match(l)
         ]
-        has_body_comment = any(COMMENT_RE.match(l) for l in body_lines)
+        has_body_comment = any(is_comment(l) for l in body_lines)
         if len(body_branches) >= 2 and not has_body_comment:
           tag = f"[HEADER_ONLY: {len(body_branches)} uncommented branches inside body]"
           uncommented_hunks.append((
@@ -287,7 +292,7 @@ def main():
         lines = full_path.read_text(encoding="utf-8").splitlines()
       except UnicodeDecodeError:
         continue
-      blocks = extract_comment_blocks(lines, line_filter=added_lines)
+      blocks = [] if full_path.suffix == ".py" else extract_comment_blocks(lines, line_filter=added_lines)
       issues = audit_blocks(
           blocks,
           max_lines=args.max_lines,
@@ -331,7 +336,7 @@ def main():
         not args.no_cl_hygiene and ".gemini" not in p.resolve().parts
     )
     lines = p.read_text(encoding="utf-8").splitlines()
-    blocks = extract_comment_blocks(lines)
+    blocks = [] if p.suffix == ".py" else extract_comment_blocks(lines)
     issues = audit_blocks(
         blocks,
         max_lines=args.max_lines,

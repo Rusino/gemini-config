@@ -20,58 +20,16 @@ import socket
 import subprocess
 import sys
 
+from pre_tool_guard import (
+    EDIT_TOOLS,
+    SOURCE_EXTENSIONS,
+    SOURCE_FILENAMES,
+    get_tool_target_file,
+    is_tracked_source_file,
+)
+
 NOTIFY_SELF_BIN = "/google/bin/releases/g3n-team/notify_self"
 _CURRENT_CONV_ID = ""
-
-SOURCE_EXTENSIONS = {
-    ".c",
-    ".cc",
-    ".cpp",
-    ".cxx",
-    ".h",
-    ".hh",
-    ".hpp",
-    ".hxx",
-    ".py",
-    ".rs",
-    ".go",
-    ".js",
-    ".jsx",
-    ".ts",
-    ".tsx",
-    ".dart",
-    ".java",
-    ".kt",
-    ".gn",
-    ".gni",
-    ".sh",
-    ".cmake",
-}
-SOURCE_FILENAMES = {
-    "CMakeLists.txt",
-    "Makefile",
-    "BUILD",
-    "BUILD.bazel",
-    "Cargo.toml",
-    "package.json",
-    "pubspec.yaml",
-}
-
-EDIT_TOOLS = {
-    "write_to_file",
-    "replace_file_content",
-    "multi_replace_file_content",
-    "write_file",
-    "edit_file",
-}
-
-
-def get_tool_target_file(tool_args: dict) -> str:
-  for key in ("TargetFile", "Path", "AbsolutePath"):
-    val = tool_args.get(key)
-    if val:
-      return str(val).strip()
-  return ""
 
 # Tool results may indent this line (e.g. "\n\n\t\t\t\tThe command exited ..." on
 # macOS Jetski), so allow leading whitespace.
@@ -94,32 +52,6 @@ def is_inspection_command(cmd: str) -> bool:
   """True if every segment of a (possibly chained/piped) command is read-only."""
   segments = [s.strip() for s in re.split(r"&&|\|\||;|\|", cmd) if s.strip()]
   return bool(segments) and all(INSPECTION_SEGMENT_RE.match(s) for s in segments)
-
-
-def is_tracked_source_file(file_path: str) -> bool:
-  if not file_path:
-    return False
-  clean = os.path.abspath(
-      os.path.expanduser(file_path.strip().strip('"').strip("'"))
-  )
-  # Ignore agent customization/artifact files under ~/.gemini/config and
-  # ~/.gemini/{antigravity,jetski}/brain (keep in sync with
-  # context_guard.APP_DATA_DIR_CANDIDATES), but DO NOT ignore user project
-  # workspaces under ~/.gemini/<client>/scratch!
-  config_dir = os.path.abspath(os.path.expanduser("~/.gemini/config"))
-  internal_dirs = [config_dir] + [
-      os.path.abspath(os.path.expanduser(f"~/.gemini/{client}/brain"))
-      for client in ("antigravity", "jetski")
-  ]
-  if clean.startswith("/tmp/") or any(
-      clean == d or clean.startswith(d + "/") for d in internal_dirs
-  ):
-    return False
-  basename = os.path.basename(clean)
-  if basename in SOURCE_FILENAMES:
-    return True
-  _, ext = os.path.splitext(basename)
-  return ext.lower() in SOURCE_EXTENSIONS
 
 
 def load_state(state_path: str) -> dict:
@@ -236,10 +168,10 @@ SKILL_GLOBS = (
 )
 READ_TOOLS = {"read_file", "view_file"}
 USER_REQUEST_RE = re.compile(r"<USER_REQUEST>(.*?)</USER_REQUEST>", re.DOTALL)
-CASE_CLASSIFICATION_RE = re.compile(r"\bCase [1-5]\b")
+CASE_CLASSIFICATION_RE = re.compile(r"(?:\*\*Case\s*[1-5]\b|\bCase\s*[1-5]\s*:)")
 # Patterns detecting review approval verdicts and user or environment corpus exemptions
 REVIEW_APPROVAL_RE = re.compile(
-    r"\b(?:Case\s*[123]|LGTM|Code-Review\+1|safe\s+to\s+approve)\b",
+    r"(?<!not\s)(?<!no\s)(?<!do\snot\s)\b(?:Case\s*[123]\b|LGTM\b|Code-Review\+1|safe\s+to\s+approve\b)",
     re.IGNORECASE,
 )
 UNVERIFIED_FLUTTER_RE = re.compile(
@@ -379,6 +311,8 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
         targs = tc.get("args") or {}
         if tname in READ_TOOLS:
           read_blobs.append(_unquote_path(get_tool_target_file(targs)))
+        elif tname == "invoke_subagent":
+          read_blobs.append(str(targs.get("Prompt", "")))
         elif tname == "run_command":
           cmd = str(targs.get("CommandLine", ""))
           read_blobs.append(cmd)
@@ -567,9 +501,7 @@ def analyze_current_turn(transcript_path: str) -> dict:
   last_edited_file = ""
   last_cmd_idx = -1
   last_cmd_exit_code = None
-  pending_cmd_check = False
-  pending_new_conv_cmd = False
-  pending_is_cli = False
+  pending_cmds: list[tuple[int, bool, bool]] = []
   launched_new_conv = False
 
   for idx in ordered_indices:
@@ -580,8 +512,7 @@ def analyze_current_turn(transcript_path: str) -> dict:
     tool_calls = step.get("tool_calls") or []
 
     if stype == "PLANNER_RESPONSE" and tool_calls:
-      pending_new_conv_cmd = False
-      pending_is_cli = False
+      pending_cmds.clear()
       for tc in tool_calls:
         tname = tc.get("name", "")
         targs = tc.get("args") or {}
@@ -592,37 +523,37 @@ def analyze_current_turn(transcript_path: str) -> dict:
             last_edited_file = target.strip().strip('"').strip("'")
         elif tname == "run_command":
           cmd = str(targs.get("CommandLine", ""))
-          if is_handoff_launch_command(cmd):
-            pending_new_conv_cmd = True
-            pending_is_cli = is_chat_lifecycle_handoff_command(cmd)
-          elif is_inspection_command(cmd):
+          is_handoff = is_handoff_launch_command(cmd)
+          is_cli = is_chat_lifecycle_handoff_command(cmd) if is_handoff else False
+          if not is_handoff and is_inspection_command(cmd):
             continue
           last_cmd_idx = idx
-          pending_cmd_check = True
+          pending_cmds.append((idx, is_handoff, is_cli))
 
-    elif stype == "GENERIC" and pending_cmd_check:
+    elif stype == "GENERIC" and pending_cmds:
       content = str(step.get("content", ""))
       if "\nFile Path: " in content[:200]:
         continue
       m = EXIT_CODE_RE.search(content)
       if m:
-        last_cmd_exit_code = int(m.group(1))
+        _, is_handoff, is_cli = pending_cmds.pop(0)
+        code = int(m.group(1))
+        if last_cmd_exit_code is None or code != 0 or not pending_cmds:
+          last_cmd_exit_code = code
         # Tool output truncation keeps only the tail, so a real CLI handoff is
         # proven by exit code 0 alone whereas raw agentapi still needs its JSON
         launched_marker = (
             '"newConversation"' in content
             or '"new_conversation_id"' in content
-            or pending_is_cli
+            or is_cli
         )
         if (
-            pending_new_conv_cmd
-            and last_cmd_exit_code == 0
+            is_handoff
+            and code == 0
             and step.get("status") == "DONE"
             and launched_marker
         ):
           launched_new_conv = True
-          pending_new_conv_cmd = False
-        pending_cmd_check = False
 
   return {
       "last_code_edit_idx": last_code_edit_idx,

@@ -435,6 +435,37 @@ class TestContextGuard(unittest.TestCase):
       self.assertIn("doing: R1", msg)
       self.assertIn("flutter_perf_r16", msg)
 
+      # Handed-off `▸` predecessors and `.pbtxt` archived chats are excluded from SQLite query
+      import sqlite3
+      db_path = os.path.join(self.tmp.name, "conversation_summaries.db")
+      conn = sqlite3.connect(db_path)
+      with conn:
+        conn.execute(
+            "CREATE TABLE conversation_summaries "
+            "(conversation_id TEXT, title TEXT, project_id TEXT, parent_conversation_id TEXT, last_modified_time TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?)",
+            ("handed01", "[10:00] ▸ Handed Off Chat", "proj-1", "", "2026-10-23T18:00:00Z"),
+        )
+        conn.execute(
+            "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?)",
+            ("archived01", "[10:05] ⦿ Archived Chat", "proj-1", "", "2026-10-23T18:05:00Z"),
+        )
+      conn.close()
+      ann_dir = os.path.join(self.tmp.name, "annotations")
+      os.makedirs(ann_dir, exist_ok=True)
+      with open(os.path.join(ann_dir, "archived01.pbtxt"), "w") as f:
+        f.write('title:"[10:05] ⦿ Archived Chat"\narchived:true\n')
+      with (
+          patch.object(context_guard, "summary_db_paths", return_value=[db_path]),
+          patch.object(context_guard, "APP_DATA_DIR_CANDIDATES", (self.tmp.name,)),
+      ):
+        siblings = context_guard.get_active_sibling_chats_in_project("proj-1", "current-cid")
+        cids = [s["cid"] for s in siblings]
+        self.assertNotIn("handed01", cids)
+        self.assertNotIn("archived01", cids)
+
   # Verify Russian and English challenge phrases inject the pre-mortem & alternatives directive
   def test_critical_challenge_trigger_injects_on_russian_and_english_phrases(self):
     with patch.object(chat_lifecycle, "auto_title_conversation", return_value=""), \

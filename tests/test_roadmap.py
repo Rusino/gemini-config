@@ -287,12 +287,23 @@ class TestRoadmap(unittest.TestCase):
          patch("context_guard.get_conversation_db_info", return_value=("", "")):
       self.assertEqual(roadmap.project_id_for("c1"), "fallback-proj")
 
-  def test_cli_round_trip(self):
-    def cli(*args):
-      return subprocess.run(
-          [sys.executable, ROADMAP_CLI, *args], capture_output=True, text=True, check=False
-      )
+  def _run_cli(self, *args):
+    out = io.StringIO()
+    err = io.StringIO()
+    with (
+        patch.object(sys, "argv", ["roadmap.py", *args]),
+        patch("sys.stdout", out),
+        patch("sys.stderr", err),
+    ):
+      rc = roadmap.main()
+    res = unittest.mock.MagicMock()
+    res.returncode = rc
+    res.stdout = out.getvalue()
+    res.stderr = err.getvalue()
+    return res
 
+  def test_cli_round_trip(self):
+    cli = self._run_cli
     res = cli("add", "c1", "Via CLI")
     self.assertEqual((res.returncode, res.stdout), (0, "R1 added: Via CLI\n"))
     res = cli("set", "c1", "R1", "bogus")
@@ -390,11 +401,7 @@ class TestRoadmap(unittest.TestCase):
     self.assertEqual(self.order(), ["R2", "R7", "R1", "R3", "R4", "R5", "R6"])
 
   def test_cli_edit_reorder_move(self):
-    def cli(*args):
-      return subprocess.run(
-          [sys.executable, ROADMAP_CLI, *args], capture_output=True, text=True, check=False
-      )
-
+    cli = self._run_cli
     for t in ("A", "B", "C"):
       roadmap.add_item("p1", "c1", t)
     self.assertEqual(cli("edit", "c1", "R2", "B2").returncode, 0)

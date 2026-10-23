@@ -74,7 +74,7 @@ FILE_EXT_RE = re.compile(rf"^[\w./~-]+?\.(?:{KNOWN_EXTS})$")
 PATH_TOKEN_RE = re.compile(r"`([^`\n]{2,120})`")
 FILE_LINK_RE = re.compile(r"file://(/[^\s)#`\"']+)")
 BARE_PATH_RE = re.compile(
-    rf"(?<![\w:/.~])((?:/|~|\.\.?/)?[\w.-]+(?:/[\w.*<>-]+)+/?|[\w.-]+\.(?:{KNOWN_EXTS}))(?![\w/])"
+    rf"(?<![\w:/.~+-])((?:/|~|\.\.?/)?[\w.-]+(?:/[\w.*<>-]+)+/?|[\w.-]+\.(?:{KNOWN_EXTS}))(?![\w/-])"
 )
 SKILL_BULLET_RE = re.compile(
     r"^\s*[-*]\s+(?:\*\*|`)+([a-z0-9]+(?:-[a-z0-9]+)+)(?:\*\*|`)+"
@@ -82,6 +82,14 @@ SKILL_BULLET_RE = re.compile(
 HEX_SHA_RE = re.compile(r"`([0-9a-f]{7,40})`")
 HEADING_RE = re.compile(r"^\s*#{1,6}\s+(.+?)\s*$")
 ANCHOR_LINK_RE = re.compile(r"\[[^\]]+\]\(#([a-zA-Z0-9_-]+)\)")
+
+KNOWN_PATH_ROOTS = {
+    "agents", "_agents", ".agents", ".gemini", "skills", "rules", "hooks",
+    "scripts", "plugins", "tests", "documentation", "githooks", "references",
+    "assets", "examples", "resources", "src", "include", "lib", "modules",
+    "tools", "infra", "gn", "out", "packages", "engine", "web_ui", "flutter",
+    "third_party", "depot", "google3",
+}
 
 
 def slugify_heading(title: str) -> str:
@@ -194,6 +202,8 @@ def looks_like_path(token: str) -> bool:
         return False
     if token.startswith("-") or "::" in token or "(" in token or "=" in token:
         return False
+    if re.search(r"[А-Яа-яЁё]", token):
+        return False
     if FILE_EXT_RE.match(token):
         return True
     if "/" in token:
@@ -211,20 +221,14 @@ def looks_like_path(token: str) -> bool:
         # Single-segment trailing-slash directory like `agents/` or `.agents/`
         if len(segments) == 1 and token.endswith("/"):
             seg = segments[0]
-            return seg.startswith((".", "_")) or seg in (
-                "agents", "skills", "rules", "scripts", "references", "assets",
-                "src", "include", "tests", "modules", "tools", "infra", "gn", "out",
-            )
-        # Filter out ordinary English slash pairs like `read/write` or `Error/Verification`
-        if len(segments) == 2 and not token.endswith("/"):
-            s0, s1 = segments[0].lower(), segments[1].lower()
-            repo_roots = (
-                "agents", "_agents", ".agents", "src", "include",
-                "tools", "tests", "modules", "infra", "gn",
-            )
-            if (s0 in PROSE_SLASH_WORDS or s1 in PROSE_SLASH_WORDS) and s0 not in repo_roots:
+            return seg.startswith((".", "_")) or seg in KNOWN_PATH_ROOTS
+        # Relative tokens without a file extension, leading path prefix, or trailing slash
+        # must start with a known repository root to distinguish paths from prose slash lists
+        if not token.startswith(("/", "~", "./", "../")) and not token.endswith("/"):
+            s0 = segments[0].lower()
+            if s0 not in KNOWN_PATH_ROOTS:
                 return False
-            if segments[0][0].isupper() and segments[1][0].isupper():
+            if len(segments) == 2 and segments[1].lower() in PROSE_SLASH_WORDS:
                 return False
         return True
     return False
@@ -241,8 +245,15 @@ def normalize_candidate_path(token: str) -> str:
     return cleaned.rstrip("/")
 
 
-def path_exists_anywhere(cand: str, repos: list[Path], repo_rel_set: set[str]) -> bool:
+def path_exists_anywhere(
+    cand: str,
+    repos: list[Path],
+    repo_rel_set: set[str],
+    by_basename: dict[str, list[str]] | None = None,
+) -> bool:
     if not cand:
+        return True
+    if "/" not in cand and by_basename and cand in by_basename:
         return True
     expanded = os.path.expanduser(cand)
     if os.path.exists(expanded):
@@ -327,9 +338,32 @@ def main() -> int:
             print(f"Repositories checked: {', '.join(str(r) for r in repos)}")
 
         placeholders: list[tuple[int, str, str]] = []
+        is_internal_config_repo = any(".gemini" in r.parts for r in repos)
+        in_fence = False
         for idx, line in enumerate(lines, start=1):
+            if line.lstrip().startswith("```"):
+                in_fence = not in_fence
+                continue
+            if in_fence:
+                continue
+            line_no_code = re.sub(r"`[^`\n]+`", "", line)
             for regex, label in PLACEHOLDER_PATTERNS:
-                for m in regex.finditer(line):
+                if (
+                    is_internal_config_repo
+                    and label == "Local-machine / ephemeral path or private link leak"
+                ):
+                    continue
+                target_line = (
+                    line
+                    if label
+                    in (
+                        "Empty or dummy markdown link",
+                        "Local-machine / ephemeral path or private link leak",
+                        "LLM-slop giveaway phrase",
+                    )
+                    else line_no_code
+                )
+                for m in regex.finditer(target_line):
                     placeholders.append((idx, label, m.group(0)))
 
         seen_paths: set[str] = set()
@@ -351,8 +385,8 @@ def main() -> int:
                     broken_anchors.append((idx, am.group(1)))
 
         for idx, line in enumerate(lines, start=1):
-            # Ignore URLs before scanning bare paths
-            line_no_urls = re.sub(r"https?://\S+", "", line)
+            # Ignore URLs, file:// links, and backtick spans before scanning bare paths
+            line_no_urls = re.sub(r"(?:https?|file)://\S+|`[^`\n]*`", " ", line)
             candidates: list[str] = []
             for m in FILE_LINK_RE.finditer(line):
                 candidates.append(m.group(1))
@@ -369,14 +403,14 @@ def main() -> int:
                 cand = normalize_candidate_path(raw_cand)
                 if not cand or cand in seen_paths:
                     continue
-                if "<" in cand or ">" in cand or "$" in cand or "*" in cand:
+                if any(ch in cand for ch in ("<", ">", "$", "*", "{", "}")):
                     continue
                 seen_paths.add(cand)
                 if "/" in cand:
                     base = os.path.basename(cand)
                     if base and base not in ("SKILL.md", "AGENTS.md", "GEMINI.md", "README.md"):
                         doc_paths_by_base.setdefault(base, []).append((idx, cand))
-                if path_exists_anywhere(cand, repos, repo_rel_set):
+                if path_exists_anywhere(cand, repos, repo_rel_set, by_basename):
                     verified_paths.append(cand)
                 else:
                     base = os.path.basename(cand)
@@ -415,6 +449,12 @@ def main() -> int:
         invalid_ldaps: list[tuple[int, str]] = []
         seen_ldaps: set[str] = set()
         for idx, line in enumerate(lines, start=1):
+            if re.search(
+                r"\b(?:former|no longer at Google|never suggest|inactive|retired)\b",
+                line,
+                re.I,
+            ):
+                continue
             for m in LDAP_RE.finditer(line):
                 ldap = m.group(1).lower()
                 if ldap in seen_ldaps or ldap in ("user", "username", "author", "ldap", "example"):
@@ -507,6 +547,58 @@ def main() -> int:
                 )
         else:
             print("  None")
+
+        # [8] Rule & Skill Deduplication / Always-On Budget Check (R20)
+        if file_arg != "-":
+            fpath = Path(file_arg).resolve()
+            hygiene_warnings: list[str] = []
+            if fpath.name == "SKILL.md" and text.startswith("---"):
+                fm_end = text.find("\n---", 3)
+                if fm_end > 0:
+                    fm_block = text[3:fm_end]
+                    m_desc = re.search(
+                        r"^description:\s*(.+?)(?:\n[a-zA-Z_-]+:|\Z)",
+                        fm_block,
+                        re.M | re.S,
+                    )
+                    if m_desc:
+                        desc_clean = " ".join(m_desc.group(1).split())
+                        if len(desc_clean) > 450:
+                            hygiene_warnings.append(
+                                f"YAML frontmatter `description:` is {len(desc_clean)} chars "
+                                "(keep <= 450 chars: 1-sentence purpose + trigger phrases only; "
+                                "move multi-stage details to SKILL.md body)"
+                            )
+            elif fpath.parent.name == "rules" and fpath.suffix == ".md":
+                sibling_headings: dict[str, str] = {}
+                for sib in sorted(fpath.parent.glob("*.md")):
+                    if sib == fpath:
+                        continue
+                    for sline in sib.read_text(encoding="utf-8", errors="ignore").splitlines():
+                        shm = HEADING_RE.match(sline)
+                        if shm:
+                            sibling_headings[slugify_heading(shm.group(1))] = sib.name
+                for idx, line in enumerate(lines, start=1):
+                    hm = HEADING_RE.match(line)
+                    if hm:
+                        slug = slugify_heading(hm.group(1))
+                        if slug in sibling_headings:
+                            hygiene_warnings.append(
+                                f"Line {idx}: Heading `{hm.group(1)}` duplicates section in "
+                                f"`rules/{sibling_headings[slug]}` (merge in-place instead of "
+                                "splitting across rule files)"
+                            )
+            if fpath.name == "SKILL.md" or (
+                fpath.parent.name == "rules" and fpath.suffix == ".md"
+            ):
+                print(
+                    f"\n[8] Rule & Skill Hygiene / Always-On Budget ({len(hygiene_warnings)} warning(s)):"
+                )
+                if hygiene_warnings:
+                    for w in hygiene_warnings:
+                        print(f"  - {w}")
+                else:
+                    print("  None (frontmatter concise & no duplicate rule headings)")
 
     return 1 if total_issues > 0 else 0
 

@@ -2,12 +2,14 @@
 """Unit tests for the ruthless-code-audit skill script."""
 
 import importlib.util
+import io
 import json
 import pathlib
 import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 SCRIPT_PATH = (
     pathlib.Path(__file__).resolve().parents[1]
@@ -140,6 +142,75 @@ class TestRuthlessCodeAudit(unittest.TestCase):
     self.assertIn("completelyDeadHelper", dead_names)
     self.assertNotIn("usedHelper", dead_names)
     self.assertIn("onlyCalledInTestHelper", test_only_names)
+
+  def test_python_hash_comments_do_not_hide_callers_or_glob_strings(self):
+    py_code = "\n".join([
+        "def caller_fn(root):",
+        "  # C-style /* inside python comment",
+        "  files = root.glob('**/*.py')",
+        "  return helper_after_glob(files)",
+        "",
+        "def helper_after_glob(items):",
+        "  # Closing */ inside python comment",
+        "  return list(items)",
+        "",
+        "# def commented_out_call(): return dead_py_fn()",
+        "def dead_py_fn():",
+        "  return 42",
+    ])
+    self._write("mod.py", py_code)
+    raw_files = ruthless_audit.collect_files([self.root], self.root)
+    records = [
+        (p, rel, p.read_text(encoding="utf-8"), p.read_text(encoding="utf-8").splitlines())
+        for p, rel in raw_files
+    ]
+    struct = ruthless_audit.analyze_functions_and_dead_code(
+        records, max_func_lines=50, max_file_lines=500
+    )
+    dead_names = [fn["name"] for fn in struct["dead_functions"]]
+    self.assertNotIn("helper_after_glob", dead_names)
+    self.assertIn("dead_py_fn", dead_names)
+
+  def test_check_doc_grounding_bare_paths_and_rule_hygiene(self):
+    grounding_path = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "skills"
+        / "amnesia-doc-check"
+        / "scripts"
+        / "check_doc_grounding.py"
+    )
+    gspec = importlib.util.spec_from_file_location("check_doc_grounding", grounding_path)
+    cdg = importlib.util.module_from_spec(gspec)
+    gspec.loader.exec_module(cdg)
+
+    self._write("rules/first.md", "# Shared Heading\nBody 1\n")
+    self._write("rules/second.md", "# Shared Heading\nBody 2\n")
+    skill_doc = self._write(
+        "skills/demo-skill/SKILL.md",
+        "---\nname: demo-skill\ndescription: " + ("x" * 460) + "\n---\n"
+        "See `skills/demo-skill/SKILL.md` and bare arithmetic 125/480 or C++/Dart/TS.\n",
+    )
+    out = io.StringIO()
+    with (
+        unittest.mock.patch.object(
+            sys,
+            "argv",
+            [
+                "check_doc_grounding.py",
+                "--repo",
+                str(self.root),
+                str(skill_doc),
+                str(self.root / "rules/first.md"),
+            ],
+        ),
+        unittest.mock.patch("sys.stdout", out),
+    ):
+      rc = cdg.main()
+    printed = out.getvalue()
+    self.assertEqual(rc, 0, printed)
+    self.assertIn("Unresolved / Missing Paths (0 missing, 1 verified)", printed)
+    self.assertIn("460 chars (keep <= 450 chars", printed)
+    self.assertIn("Heading `Shared Heading` duplicates section in `rules/second.md`", printed)
 
   def test_keeper_invariants_and_test_horrors(self):
     cpp_prod = "\n".join([

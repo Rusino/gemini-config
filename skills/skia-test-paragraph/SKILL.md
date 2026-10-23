@@ -39,8 +39,8 @@ This skill orchestrates running Skia's `dm` test runner for `SkParagraph` tests 
 
 ## Scripts
 
-- Orchestrator: [`run_skparagraph_tests.py`](file:///Users/jlavrova/.gemini/config/skills/skia-test-paragraph/scripts/run_skparagraph_tests.py)
-- Log parser & comparator: [`parse_dm_logs.py`](file:///Users/jlavrova/.gemini/config/skills/skia-test-paragraph/scripts/parse_dm_logs.py)
+- Orchestrator: [`run_skparagraph_tests.py`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/skia-test-paragraph/scripts/run_skparagraph_tests.py)
+- Log parser & comparator: [`parse_dm_logs.py`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/skia-test-paragraph/scripts/parse_dm_logs.py)
 
 ---
 
@@ -50,7 +50,7 @@ This skill orchestrates running Skia's `dm` test runner for `SkParagraph` tests 
 ```bash
 python3 ~/.gemini/config/skills/skia-test-paragraph/scripts/run_skparagraph_tests.py \
   --out /tmp/skia_paragraph_tests \
-  baseline=origin/main \
+  baseline=HEAD \
   current=WORKTREE
 ```
 
@@ -58,7 +58,7 @@ python3 ~/.gemini/config/skills/skia-test-paragraph/scripts/run_skparagraph_test
 ```bash
 python3 ~/.gemini/config/skills/skia-test-paragraph/scripts/run_skparagraph_tests.py \
   --out /tmp/skia_paragraph_tests \
-  baseline=origin/main \
+  baseline=HEAD~1 \
   candidate=my_feature_branch
 ```
 

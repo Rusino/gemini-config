@@ -34,3 +34,15 @@ For each candidate ID in the batch, output exactly one verdict block:
   - `Verdict`: `UNPROVEN`
   - `Traced`: `<paths/callers/sections checked>`
   - `Open Obligation & Question`: `<what could not be proven from code/text and the exact question for the CL author or user>`
+
+# Host Invocation Protocol (`XFAMILY_REFUTE`, Quota Fallback & Finding Ledger)
+Callers (`amnesia-precommit`, `ruthless-code-audit`, `amnesia-doc-check`, `review-triage`, `veteran-review`) invoke `keeper_skeptic` as a single batched subagent packet:
+1. **Automatic Model Routing (`XFAMILY_REFUTE`)**:
+   - **`Model="flash"` (Default Fast Skeptic)**: Routine local single-function invariants, dead-code/scope reductions (`DELETE`/`SIMPLIFY`), and prose/arithmetic checks.
+   - **`Model="pro"` (Auto-Escalation)**: Escalate to `Model="pro"` if any candidate involves: (a) concurrency, locks, or async lifetimes; (b) BiDi, UTF-8/UTF-16/grapheme cluster math, or `SkParagraph` line/run metrics; (c) dropped historical guards (`-` lines requiring `git log -S` / `git blame`); (d) cross-backend symmetry (`SkParagraph` ↔ `WebParagraph`, ICU ↔ Apple/Client `SkUnicode`); or (e) re-verifying a blocking candidate marked `UNPROVEN` by `flash`.
+2. **Quota Exhaustion Fallback Ladder**:
+   - **Step 1 (`pro` → `flash` → `flash_lite`)**: On `429` / resource exhaustion or timeout, retry the same batch on `Model="flash"` (or `flash_lite`) and tag verdicts `[Verified via Flash fallback (Pro quota exhausted)]`.
+   - **Step 2 (Deterministic Tool / TDD Fallback)**: If all subagent models hit quota limits, verify directly via native test execution (`dm`, `felt`, `flutter test`), caller search (`git grep`, `code_search`), or `read_file`.
+   - **Step 3 (User Escalation)**: Mark any remaining unsettled item `[UNVERIFIED: Quota Exhausted]` and ask the user whether to switch the chat model (`python3 ~/.gemini/config/hooks/chat_lifecycle.py model`) or pause.
+3. **Persistent Finding Ledger (`finding_ledger.py`)**:
+   - Persist every `REFUTED` verdict (and any user design override) via `python3 ~/.gemini/config/scripts/finding_ledger.py add --repo <repo> --file <path> --symbol "<sym>" --claim "<claim>" --reason "<evidence>" [--scope repo|cl --cl <cl_id> | --doc <doc> --category doc-check]` so subsequent passes skip it.
