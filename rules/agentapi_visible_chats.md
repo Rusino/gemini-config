@@ -77,7 +77,10 @@ For moving chats or whole chains between projects (or listing unassigned chats),
 - **Two-Level Plan Bifurcation**: Always separate:
   1. `Epic Roadmap`: Complete checklist of all macro-deliverables across the entire task lifetime. When completing a handoff, copy the previous roadmap forward, updating only the status (`[ ]` -> `[x]`).
   2. `Immediate Next Step`: The concrete, isolated first action for the continuation chat to resume immediately.
-- **Continuation Inception Check**: When waking up in a continuation chat, the incoming agent must review the full `Epic Roadmap` from the summary (in projects: `roadmap.py show`), acknowledge the overall task progress, and ensure broader objectives are not abandoned after local deep-dives.
+- **No Handoff Anchoring (Separate Proven Facts from Unverified Hypotheses)**:
+  - Never record an unverified user or agent idea or last-minute compromise in a handoff summary or chain state file as a settled decision (`"Decided to do X"`). Explicitly label untested proposals as **`[UNVERIFIED HYPOTHESIS]`** so the continuation chat stress-tests them and checks alternatives before writing code.
+  - **Preserve Rejected Alternatives**: Briefly record rejected approaches and the exact counterexample or invariant that killed them (`Rejected: <approach> because <reason>`) in the handoff summary so continuation chats do not re-propose or re-accept dead ends.
+- **Continuation Inception Check**: When waking up in a continuation chat, the incoming agent must review the full `Epic Roadmap` from the summary (in projects: `roadmap.py show`), verify that any pending design in `Immediate Next Step` was actually proven against the codebase rather than assumed at handoff boundary, acknowledge the overall task progress, and ensure broader objectives are not abandoned after local deep-dives.
 
 Strict rules:
 - **Never** silently prune or drop pending stages from a handoff summary. If an epic had 5 steps and the current chat only addressed step 2, all steps 3–5 MUST remain in the summary as pending `[ ]`.
