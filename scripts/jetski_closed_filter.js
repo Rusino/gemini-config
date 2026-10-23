@@ -1190,18 +1190,14 @@
       btn.removeAttribute('title');
     }
 
-    let labelText = '';
-    if (filterEnabled) {
-      labelText =
-        filterScope === 'active-only'
-          ? `Active only · ${totalClosedCount} hidden`
-          : `Closed hidden: ${totalClosedCount}`;
-    } else {
-      labelText =
-        filterScope === 'active-only'
-          ? `All chats (${totalClosedCount} non-active)`
-          : `All chats (${totalClosedCount} closed)`;
-    }
+    // Show active (⦿) count alongside hidden/closed count across all modes without widening the pill
+    const activeCount = breakdownStats.active;
+    const hiddenSuffix =
+      filterScope === 'active-only'
+        ? `${totalClosedCount} hidden`
+        : `${totalClosedCount} closed`;
+    const countsText = `${activeCount} active · ${hiddenSuffix}`;
+    const labelText = filterEnabled ? countsText : `All (${countsText})`;
 
     if (btn.getAttribute('aria-label') !== labelText) {
       btn.setAttribute('aria-label', labelText);

@@ -449,9 +449,9 @@ const CLOSED_SCOPE_HIDDEN = [
 
 // Initial state: filterEnabled=true, filterScope='closed'
 // Hidden: closed-solo («»), closed-pair-* (« »), closed-root/step/tail (« ‹✓› ») => 6
-// Visible: solo-active (⦿), open-root (▸), open-step (✓), open-current (⦿), quoted-title => 5
+// Visible: solo-active (⦿), open-root (▸), open-step (✓), open-current (⦿), quoted-title => 5 (3 active)
 // Total eligible: 11 (native-hidden is excluded)
-assert.strictEqual(btn.getAttribute('aria-label'), 'Closed hidden: 6');
+assert.strictEqual(btn.getAttribute('aria-label'), '3 active · 6 closed');
 assert.strictEqual(btn.getAttribute('data-active'), 'true');
 assert.strictEqual(emptyProjSpan.textContent, 'No active chats (3 hidden)');
 
@@ -502,7 +502,7 @@ btn.dispatchEvent('mousedown', { button: 0 });
 btn.dispatchEvent('click', { button: 0 });
 
 assert.strictEqual(btn.getAttribute('data-active'), 'false');
-assert.strictEqual(btn.getAttribute('aria-label'), 'All chats (6 closed)');
+assert.strictEqual(btn.getAttribute('aria-label'), 'All (3 active · 6 closed)');
 assert.strictEqual(emptyProjSpan.textContent, 'No conversations yet');
 assert(bubble.innerHTML.includes('Filter OFF: showing all chats'));
 assert(bubble.innerHTML.includes('Would be hidden (count on button):'));
@@ -515,7 +515,7 @@ assertHidden(['native-hidden'], true);
 btn.dispatchEvent('contextmenu', { button: 2 });
 assert.strictEqual(btn.getAttribute('data-active'), 'true');
 // In 'active-only' scope, open-root (▸) and open-step (✓) are also hidden => 8 hidden of 11
-assert.strictEqual(btn.getAttribute('aria-label'), 'Active only · 8 hidden');
+assert.strictEqual(btn.getAttribute('aria-label'), '3 active · 8 hidden');
 assert(bubble.innerHTML.includes('Filter ON: active chats only'));
 assert(bubble.innerHTML.includes('● <b>Active only</b>'));
 assert(bubble.innerHTML.includes('8 of 11'));
@@ -523,7 +523,7 @@ assertHidden([...CLOSED_SCOPE_HIDDEN, 'open-root', 'open-step'], true);
 assertHidden(['solo-active', 'open-current', 'quoted-title'], false);
 
 btn.dispatchEvent('contextmenu', { button: 2 });
-assert.strictEqual(btn.getAttribute('aria-label'), 'Closed hidden: 6');
+assert.strictEqual(btn.getAttribute('aria-label'), '3 active · 6 closed');
 assertHidden(['open-root', 'open-step'], false);
 
 // Incoming stream batch while filter is ON automatically hides newly arrived closed chat
