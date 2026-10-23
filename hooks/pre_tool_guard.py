@@ -979,6 +979,15 @@ def _extract_cmd_target_dirs(cmd: str, workspace_paths: list[str]) -> list[str]:
 
 # Expire worktree and file leases after 30 minutes of inactivity
 WORKTREE_LEASE_TTL_S = int(os.environ.get("JETSKI_WORKTREE_LEASE_TTL_S", "1800"))
+# Extend worktree lease to 2 hours while the owner chat holds a doing item in roadmap.json
+WORKTREE_DOING_LEASE_TTL_S = int(
+    os.environ.get("JETSKI_WORKTREE_DOING_LEASE_TTL_S", "7200")
+)
+
+WORKTREE_BUILD_PROC_RE = re.compile(
+    r"\b(?:ninja|siso|felt|flutter|dart|dm|clang\+\+|run_flutter_paragraph_tests"
+    r"|run_webparagraph_corpus|run_skparagraph_tests)\b"
+)
 
 WORKTREE_CLAIMING_CMD_RE = re.compile(
     r"(?:^|(?<=[\s;&|(`]))(?:"
@@ -1092,6 +1101,127 @@ def _is_conv_still_active_tip(
       except Exception:
         pass
   return True, title
+
+
+# Return the most recent mtime among owner_cid's transcript, background task logs,
+# and spawned subagent transcripts/tasks so long-running tests keep leases alive
+def _latest_conv_activity_ts(
+    owner_cid: str, base_ts: float, transcript_path: str
+) -> float:
+  latest = base_ts
+  from context_guard import APP_DATA_DIR_CANDIDATES, app_data_dir_from_path
+
+  cand_dirs: list[str] = []
+  if transcript_path:
+    ad = app_data_dir_from_path(transcript_path)
+    if ad:
+      cand_dirs.append(ad)
+    parts = os.path.abspath(transcript_path).split(os.sep)
+    if "brain" in parts:
+      idx = parts.index("brain")
+      cand_dirs.append(os.sep.join(parts[:idx]))
+  for d in APP_DATA_DIR_CANDIDATES:
+    cand_dirs.append(os.path.expanduser(d))
+
+  seen_brains: set[str] = set()
+  for ad in cand_dirs:
+    if not ad:
+      continue
+    brain_root = os.path.join(ad, "brain")
+    if brain_root in seen_brains or not os.path.isdir(brain_root):
+      continue
+    seen_brains.add(brain_root)
+
+    conv_ids = [owner_cid]
+    owner_trans = os.path.join(
+        brain_root, owner_cid, ".system_generated", "logs", "transcript.jsonl"
+    )
+    if os.path.isfile(owner_trans):
+      try:
+        with open(owner_trans, "r", encoding="utf-8", errors="ignore") as f:
+          txt = f.read()
+        for sub_cid in re.findall(
+            r'"conversationId"\s*:\s*"([0-9a-fA-F-]{8,36})"', txt
+        ):
+          if sub_cid not in conv_ids:
+            conv_ids.append(sub_cid)
+      except Exception:
+        pass
+
+    for cid in conv_ids:
+      sys_dir = os.path.join(brain_root, cid, ".system_generated")
+      if not os.path.isdir(sys_dir):
+        continue
+      for p in (
+          [os.path.join(sys_dir, "logs", "transcript.jsonl")]
+          + glob.glob(os.path.join(sys_dir, "tasks", "*.log"))
+      ):
+        try:
+          mt = os.path.getmtime(p)
+          if mt > latest:
+            latest = mt
+        except OSError:
+          pass
+  return latest
+
+
+# Check whether a live OS build/test process or active roadmap doing item keeps the
+# worktree lease valid beyond WORKTREE_LEASE_TTL_S
+def _is_worktree_lease_unexpired(
+    owner_cid: str,
+    base_ts: float,
+    top_level: str,
+    transcript_path: str,
+    now: float,
+) -> tuple[bool, float]:
+  eff_ts = _latest_conv_activity_ts(owner_cid, base_ts, transcript_path)
+  if now - eff_ts < WORKTREE_LEASE_TTL_S:
+    return True, eff_ts
+
+  # Check if owner_cid holds a doing item in its project's roadmap.json
+  try:
+    from context_guard import get_conversation_db_info
+    import roadmap
+
+    _, pid = get_conversation_db_info(owner_cid, transcript_path)
+    if pid and pid != "outside-of-project":
+      rdata = _read_json_file(roadmap.roadmap_path(pid))
+      for it in rdata.get("items") or []:
+        if (
+            isinstance(it, dict)
+            and it.get("status") == "doing"
+            and (
+                it.get("owner") == owner_cid
+                or str(it.get("owner") or "").startswith(owner_cid[:8])
+            )
+        ):
+          if now - eff_ts < WORKTREE_DOING_LEASE_TTL_S:
+            return True, eff_ts
+  except Exception:
+    pass
+
+  # Check /proc for an active build/test process referencing top_level
+  if os.path.isdir("/proc") and now - base_ts < 14400:
+    try:
+      for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+          continue
+        try:
+          with open(
+              os.path.join(entry.path, "cmdline"), "rb"
+          ) as f:
+            raw = f.read(4096)
+          if not raw:
+            continue
+          cmd_s = raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+          if top_level in cmd_s and WORKTREE_BUILD_PROC_RE.search(cmd_s):
+            return True, now
+        except OSError:
+          continue
+    except OSError:
+      pass
+
+  return False, eff_ts
 
 
 def _read_json_file(path: str) -> dict:
@@ -1340,19 +1470,18 @@ def _active_foreign_file_leases(
       continue
     owner_cid = str(info.get("conv_id") or "")
     ts = float(info.get("ts") or 0.0)
-    if (
-        owner_cid
-        and owner_cid != effective_cid
-        and now - ts < WORKTREE_LEASE_TTL_S
-    ):
-      still_active, db_title = _is_conv_still_active_tip(
-          owner_cid, effective_cid, transcript_path
-      )
-      if still_active:
-        out[rel] = {
-            **info,
-            "title": db_title or info.get("title") or owner_cid[:8],
-        }
+    if owner_cid and owner_cid != effective_cid:
+      eff_ts = _latest_conv_activity_ts(owner_cid, ts, transcript_path)
+      if now - eff_ts < WORKTREE_LEASE_TTL_S:
+        still_active, db_title = _is_conv_still_active_tip(
+            owner_cid, effective_cid, transcript_path
+        )
+        if still_active:
+          out[rel] = {
+              **info,
+              "title": db_title or info.get("title") or owner_cid[:8],
+              "ts": eff_ts,
+          }
   return out
 
 
@@ -1437,28 +1566,36 @@ def parallel_chat_isolation_denial(
         if (
             owner_cid
             and owner_cid != effective_cid
-            and now - ts < WORKTREE_LEASE_TTL_S
             and not os.path.exists(override_path)
         ):
-          still_active, db_title = _is_conv_still_active_tip(
-              owner_cid, effective_cid, transcript_path
-          )
-          if still_active:
-            _record_parallel_guard_block(guard_state_path, transcript_path)
-            owner_label = db_title or existing.get("title") or owner_cid[:8]
-            age_m = int(max(1, (now - ts) // 60))
-            return (
-                f"[SHARED-FILE LEASE GUARD] File `{rel_path}` in `{top_level}` is currently "
-                f"leased by another active conversation (`{owner_label}` -> "
-                f"`conversation://{owner_cid}`, edited {age_m}m ago). Do NOT overwrite "
-                f"another active chat's file concurrently! Ask the user first; only after "
-                f"the user explicitly confirms in a subsequent turn may you write "
-                f"`{override_path}`."
+          eff_ts = _latest_conv_activity_ts(owner_cid, ts, transcript_path)
+          if now - eff_ts < WORKTREE_LEASE_TTL_S:
+            still_active, db_title = _is_conv_still_active_tip(
+                owner_cid, effective_cid, transcript_path
             )
+            if still_active:
+              _record_parallel_guard_block(guard_state_path, transcript_path)
+              owner_label = db_title or existing.get("title") or owner_cid[:8]
+              age_m = int(max(1, (now - eff_ts) // 60))
+              return (
+                  f"[SHARED-FILE LEASE GUARD] File `{rel_path}` in `{top_level}` is currently "
+                  f"leased by another active conversation (`{owner_label}` -> "
+                  f"`conversation://{owner_cid}`, edited {age_m}m ago). Do NOT overwrite "
+                  f"another active chat's file concurrently! Ask the user first; only after "
+                  f"the user explicitly confirms in a subsequent turn may you write "
+                  f"`{override_path}`."
+              )
       pruned = {
           k: v
           for k, v in files_map.items()
-          if isinstance(v, dict) and now - float(v.get("ts") or 0.0) < WORKTREE_LEASE_TTL_S
+          if isinstance(v, dict)
+          and now
+          - _latest_conv_activity_ts(
+              str(v.get("conv_id") or ""),
+              float(v.get("ts") or 0.0),
+              transcript_path,
+          )
+          < WORKTREE_LEASE_TTL_S
       }
       pruned[rel_path] = {
           "conv_id": effective_cid,
@@ -1476,26 +1613,29 @@ def parallel_chat_isolation_denial(
     if (
         owner_cid
         and owner_cid != effective_cid
-        and now - ts < WORKTREE_LEASE_TTL_S
         and not os.path.exists(override_path)
     ):
       still_active, db_title = _is_conv_still_active_tip(
           owner_cid, effective_cid, transcript_path
       )
       if still_active:
-        _record_parallel_guard_block(guard_state_path, transcript_path)
-        owner_label = db_title or existing.get("title") or owner_cid[:8]
-        age_m = int(max(1, (now - ts) // 60))
-        return (
-            f"[WORKTREE LEASE GUARD] Worktree `{top_level}` is currently leased by "
-            f"another active conversation (`{owner_label}` -> `conversation://{owner_cid}`, "
-            f"active {age_m}m ago). Sharing a single code worktree or `out/` build directory "
-            f"between concurrent chats causes branch, build, and test collisions! "
-            f"Create and use a separate git worktree (e.g. "
-            f"`git -C {top_level} worktree add {top_level}_wt_{effective_cid[:6]} -b <branch>`) "
-            f"or ask the user whether to take over `{top_level}`. Only after the user "
-            f"explicitly confirms in a subsequent turn may you write `{override_path}`."
+        unexpired, eff_ts = _is_worktree_lease_unexpired(
+            owner_cid, ts, top_level, transcript_path, now
         )
+        if unexpired:
+          _record_parallel_guard_block(guard_state_path, transcript_path)
+          owner_label = db_title or existing.get("title") or owner_cid[:8]
+          age_m = int(max(1, (now - eff_ts) // 60))
+          return (
+              f"[WORKTREE LEASE GUARD] Worktree `{top_level}` is currently leased by "
+              f"another active conversation (`{owner_label}` -> `conversation://{owner_cid}`, "
+              f"active {age_m}m ago). Sharing a single code worktree or `out/` build directory "
+              f"between concurrent chats causes branch, build, and test collisions! "
+              f"Create and use a separate git worktree (e.g. "
+              f"`git -C {top_level} worktree add {top_level}_wt_{effective_cid[:6]} -b <branch>`) "
+              f"or ask the user whether to take over `{top_level}`. Only after the user "
+              f"explicitly confirms in a subsequent turn may you write `{override_path}`."
+          )
     _write_json_atomic(
         lease_file,
         {
@@ -1556,25 +1696,29 @@ def parallel_chat_isolation_denial(
       if (
           owner_cid
           and owner_cid != effective_cid
-          and now - ts < WORKTREE_LEASE_TTL_S
           and not os.path.exists(override_path)
       ):
         still_active, db_title = _is_conv_still_active_tip(
             owner_cid, effective_cid, transcript_path
         )
         if still_active:
-          _record_parallel_guard_block(guard_state_path, transcript_path)
-          owner_label = db_title or existing.get("title") or owner_cid[:8]
-          age_m = int(max(1, (now - ts) // 60))
-          return (
-              f"[WORKTREE LEASE GUARD] Worktree `{top_level}` is currently leased by "
-              f"another active conversation (`{owner_label}` -> `conversation://{owner_cid}`, "
-              f"active {age_m}m ago). Do NOT run mutating git commands or builds (`ninja`/`felt`) "
-              f"inside another active chat's worktree! Create a separate git worktree "
-              f"(`git -C {top_level} worktree add {top_level}_wt_{effective_cid[:6]} -b <branch>`) "
-              f"or ask the user whether to take over `{top_level}`. Only after the user "
-              f"explicitly confirms in a subsequent turn may you write `{override_path}`."
+          unexpired, eff_ts = _is_worktree_lease_unexpired(
+              owner_cid, ts, top_level, transcript_path, now
           )
+          if unexpired:
+            _record_parallel_guard_block(guard_state_path, transcript_path)
+            owner_label = db_title or existing.get("title") or owner_cid[:8]
+            age_m = int(max(1, (now - eff_ts) // 60))
+            return (
+                f"[WORKTREE LEASE GUARD] Worktree `{top_level}` is currently leased by "
+                f"another active conversation (`{owner_label}` -> `conversation://{owner_cid}`, "
+                f"active {age_m}m ago). Do NOT run mutating git commands or builds "
+                f"(`ninja`/`felt`) inside another active chat's worktree! Create a separate "
+                f"git worktree (`git -C {top_level} worktree add "
+                f"{top_level}_wt_{effective_cid[:6]} -b <branch>`) or ask the user whether "
+                f"to take over `{top_level}`. Only after the user explicitly confirms in a "
+                f"subsequent turn may you write `{override_path}`."
+            )
       _write_json_atomic(
           lease_file,
           {

@@ -1043,11 +1043,48 @@ class TestPreToolGuard(unittest.TestCase):
             "allow",
         )
 
+        # Even if jetski_lease.json is older than 30m, a fresh background task log
+        # or subagent transcript for c1 keeps the lease alive
+        import time
+
+        git_dir = os.path.join(repo, ".git")
+        with open(os.path.join(git_dir, "jetski_lease.json"), "w") as f:
+          json.dump(
+              {
+                  "conv_id": "c1",
+                  "title": titles["c1"][0],
+                  "ts": time.time() - 3600,
+                  "worktree": repo,
+              },
+              f,
+          )
+        c1_tasks = os.path.join(tmp_dir, "brain", "c1", ".system_generated", "tasks")
+        c2_logs = os.path.join(tmp_dir, "brain", "c2", ".system_generated", "logs")
+        os.makedirs(c1_tasks, exist_ok=True)
+        os.makedirs(c2_logs, exist_ok=True)
+        with open(os.path.join(c1_tasks, "task-99.log"), "w") as f:
+          f.write("running long test suite...\n")
+        trans_c2 = os.path.join(c2_logs, "transcript.jsonl")
+        with open(trans_c2, "w") as f:
+          f.write("{}\n")
+
+        out_still_running = self.run_guard({
+            "conversationId": "c2",
+            "transcriptPath": trans_c2,
+            "toolCall": {
+                "name": "run_command",
+                "args": {"CommandLine": f"cd {repo} && felt test"},
+            },
+        })
+        self.assertEqual(out_still_running.get("decision"), "deny")
+        self.assertIn("WORKTREE LEASE GUARD", out_still_running.get("reason", ""))
+
         # Once c1 is finalized (`✓`), c2 automatically takes over `repo` without needing override
         titles["c1"] = ("[11:04] ✓ R16 C++ perf loop", "proj-1")
         self.assertEqual(
             self.run_guard({
                 "conversationId": "c2",
+                "transcriptPath": trans_c2,
                 "toolCall": {
                     "name": "run_command",
                     "args": {"CommandLine": f"cd {repo} && felt test"},
