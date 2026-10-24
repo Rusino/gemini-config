@@ -691,12 +691,9 @@ assert.strictEqual(btnsAfterReload.length, 1, 'Reloading script must not duplica
 
   def test_extract_sar_supports_var_tmp(self) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
-      fake_sar_dir = os.path.join(tmpdir, "var", "tmp", "sar.server.123.abc")
-      rel_bin = (
-          "server_impl.runfiles/google3/third_party/jetski/"
-          "cmd/hub/server/jetski-hub-server"
-      )
-      fake_bin = os.path.join(fake_sar_dir, rel_bin)
+      var_tmp_root = os.path.join(tmpdir, "var", "tmp")
+      fake_sar_dir = os.path.join(var_tmp_root, "sar.server.123.abc")
+      fake_bin = os.path.join(fake_sar_dir, patcher.SAR_BIN_RELPATH)
       os.makedirs(os.path.dirname(fake_bin), exist_ok=True)
       with open(fake_bin, "wb") as f:
         f.write(b"ELF")
@@ -705,25 +702,26 @@ assert.strictEqual(btnsAfterReload.length, 1, 'Reloading script must not duplica
       with open(launcher, "w", encoding="utf-8") as f:
         f.write(
             "#!/bin/sh\n"
-            'echo "Extraction directory [random_tmpdir=0]:'
-            ' /var/tmp/sar.server.123.abc."\n'
+            f'echo "Extraction directory [random_tmpdir=0]: {fake_sar_dir}."\n'
         )
       os.chmod(launcher, 0o755)
 
       orig_launcher = patcher.SAR_LAUNCHER
-      orig_isfile = patcher.os.path.isfile
+      orig_roots = patcher.SAR_SEARCH_ROOTS
+      orig_env = os.environ.get("SAR_EXTRACT_DIR")
       try:
         patcher.SAR_LAUNCHER = launcher
-        patcher.os.path.isfile = lambda p: (
-            True
-            if p == "/var/tmp/sar.server.123.abc/" + rel_bin
-            else orig_isfile(p)
-        )
+        patcher.SAR_SEARCH_ROOTS = (var_tmp_root,)
+        os.environ.pop("SAR_EXTRACT_DIR", None)
         found = patcher.extract_sar_and_find_binaries()
-        self.assertIn("/var/tmp/sar.server.123.abc/" + rel_bin, found)
+        self.assertEqual(found, [fake_bin])
       finally:
         patcher.SAR_LAUNCHER = orig_launcher
-        patcher.os.path.isfile = orig_isfile
+        patcher.SAR_SEARCH_ROOTS = orig_roots
+        if orig_env is None:
+          os.environ.pop("SAR_EXTRACT_DIR", None)
+        else:
+          os.environ["SAR_EXTRACT_DIR"] = orig_env
 
   def test_extract_sar_retries_when_binfs_swaps_launcher_hash(self) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -738,39 +736,47 @@ assert.strictEqual(btnsAfterReload.length, 1, 'Reloading script must not duplica
           f.write(b"ELF")
 
       launcher = os.path.join(tmpdir, "server")
+      launcher_v2 = os.path.join(tmpdir, "server_v2")
       state_file = os.path.join(tmpdir, "called_once")
-      # First run outputs old_dir and rewrites its own header to point to 5368aa
+      # Avoid sed -i (incompatible between GNU sed and macOS BSD sed) by swapping
+      # the launcher script via cp on first run
+      with open(launcher_v2, "w", encoding="utf-8") as f:
+        f.write(
+            "#!/bin/sh\n"
+            '# SHARDIR="${SAR_EXTRACT_DIR}/${STUB}.5368aa"\n'
+            f'echo "Extraction directory: {new_dir}"\n'
+        )
+      os.chmod(launcher_v2, 0o755)
       with open(launcher, "w", encoding="utf-8") as f:
         f.write(
             "#!/bin/sh\n"
             '# SHARDIR="${SAR_EXTRACT_DIR}/${STUB}.a16e06"\n'
             f'if [ ! -f "{state_file}" ]; then\n'
             f'  touch "{state_file}"\n'
-            f'  echo "Extraction directory: /var/tmp/sar.server.{uid}.a16e06"\n'
-            f'  sed -i "s/a16e06/5368aa/" "{launcher}"\n'
+            f'  echo "Extraction directory: {old_dir}"\n'
+            f'  cp "{launcher_v2}" "{launcher}"\n'
             "else\n"
-            f'  echo "Extraction directory: /var/tmp/sar.server.{uid}.5368aa"\n'
+            f'  echo "Extraction directory: {new_dir}"\n'
             "fi\n"
         )
       os.chmod(launcher, 0o755)
 
       orig_launcher = patcher.SAR_LAUNCHER
-      orig_isfile = patcher.os.path.isfile
+      orig_roots = patcher.SAR_SEARCH_ROOTS
+      orig_env = os.environ.get("SAR_EXTRACT_DIR")
       try:
         patcher.SAR_LAUNCHER = launcher
-        valid_bins = {
-            f"/var/tmp/sar.server.{uid}.a16e06/{patcher.SAR_BIN_RELPATH}",
-            f"/var/tmp/sar.server.{uid}.5368aa/{patcher.SAR_BIN_RELPATH}",
-        }
-        patcher.os.path.isfile = lambda p: (
-            True if p in valid_bins else orig_isfile(p)
-        )
+        patcher.SAR_SEARCH_ROOTS = (tmpdir,)
+        os.environ.pop("SAR_EXTRACT_DIR", None)
         found = patcher.extract_sar_and_find_binaries()
-        for expected in valid_bins:
-          self.assertIn(expected, found)
+        self.assertEqual(found, [old_bin, new_bin])
       finally:
         patcher.SAR_LAUNCHER = orig_launcher
-        patcher.os.path.isfile = orig_isfile
+        patcher.SAR_SEARCH_ROOTS = orig_roots
+        if orig_env is None:
+          os.environ.pop("SAR_EXTRACT_DIR", None)
+        else:
+          os.environ["SAR_EXTRACT_DIR"] = orig_env
 
 
 if __name__ == "__main__":

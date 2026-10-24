@@ -13,6 +13,8 @@ Scans markdown/text or Google Drive JSON dumps for:
 5. Invalid git commit SHAs and inactive/nonexistent @google.com LDAPs cited in the text
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os

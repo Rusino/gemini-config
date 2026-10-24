@@ -71,6 +71,8 @@ SAR_BIN_RELPATH = (
     "server_impl.runfiles/google3/third_party/jetski/"
     "cmd/hub/server/jetski-hub-server"
 )
+# Allow tests to point SAR extraction and fallback globbing at an isolated tmpdir
+SAR_SEARCH_ROOTS = ("/var/tmp", "/tmp")
 
 
 def read_launcher_shardir(
@@ -97,7 +99,8 @@ def extract_sar_and_find_binaries() -> List[str]:
     env = dict(os.environ)
     env["SAR_EXTRACT_ONLY"] = "1"
     # Match jetski-hub.service Environment=SAR_EXTRACT_DIR=/var/tmp when run manually
-    extract_dir = env.setdefault("SAR_EXTRACT_DIR", "/var/tmp")
+    default_extract_dir = SAR_SEARCH_ROOTS[0] if SAR_SEARCH_ROOTS else "/var/tmp"
+    extract_dir = env.setdefault("SAR_EXTRACT_DIR", default_extract_dir)
 
     # binfs refreshes stale release symlinks asynchronously on first open, so
     # re-check the launcher header after extraction and repeat if the hash changed
@@ -110,7 +113,7 @@ def extract_sar_and_find_binaries() -> List[str]:
           check=False,
       )
       out = (res.stdout or "") + "\n" + (res.stderr or "")
-      for m in re.finditer(r"((?:/var)?/tmp/sar\.server\.[^\s]+)", out):
+      for m in re.finditer(r"([^\s\"']+/sar\.server\.[^\s]+)", out):
         shardir = m.group(1).rstrip(".")
         candidate = os.path.join(shardir, SAR_BIN_RELPATH)
         if os.path.isfile(candidate) and candidate not in binaries:
@@ -123,7 +126,7 @@ def extract_sar_and_find_binaries() -> List[str]:
       if expected_bin in binaries:
         break
 
-  for root in ("/var/tmp", "/tmp"):
+  for root in SAR_SEARCH_ROOTS:
     pattern = f"{root}/sar.server.*/{SAR_BIN_RELPATH}"
     for candidate in sorted(glob.glob(pattern)):
       if candidate not in binaries:

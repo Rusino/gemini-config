@@ -7,6 +7,8 @@ runs of amnesia-precommit, ruthless-code-audit, review-triage, and amnesia-doc-c
 do not waste tokens re-raising the same issues.
 """
 
+from __future__ import annotations
+
 import argparse
 from datetime import datetime, timezone
 import hashlib

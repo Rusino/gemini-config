@@ -8,6 +8,8 @@ Updates:
 4. Optionally restarts `jetski-hub.service` safely in the background via systemd-run.
 """
 
+from __future__ import annotations
+
 import argparse
 import glob
 import json

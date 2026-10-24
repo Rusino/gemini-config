@@ -598,7 +598,8 @@ def select_last_seen_snapshot(
 
 def load_git_version(file_path: str, rev: Optional[str] = None) -> tuple[str, str]:
   """Load a version of file_path from git (default: HEAD if dirty, else HEAD~1)."""
-  abs_path = os.path.abspath(file_path)
+  # Resolve symlinks on both paths so macOS /var -> /private/var matches git rev-parse
+  abs_path = os.path.realpath(file_path)
   cwd = os.path.dirname(abs_path) or "."
   top = subprocess.run(
       ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
@@ -608,7 +609,8 @@ def load_git_version(file_path: str, rev: Optional[str] = None) -> tuple[str, st
   )
   if top.returncode != 0:
     raise ValueError(f"{file_path} is not inside a git repository")
-  repo_root = top.stdout.strip()
+  # Also canonicalize git's toplevel path to match abs_path
+  repo_root = os.path.realpath(top.stdout.strip())
   rel_path = os.path.relpath(abs_path, repo_root)
 
   chosen_rev = rev

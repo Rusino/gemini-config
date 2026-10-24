@@ -238,6 +238,15 @@ class RedlineTest(unittest.TestCase):
       self.assertEqual(base_dirty, "# Note\n\nVersion 2.\n")
       self.assertIn("HEAD:", lbl_dirty)
 
+      # Symlinked parent directory (simulating macOS /var -> /private/var)
+      with tempfile.TemporaryDirectory() as link_parent:
+        symlink_repo = os.path.join(link_parent, "alias_repo")
+        os.symlink(tmp, symlink_repo)
+        symlink_doc = os.path.join(symlink_repo, "note.md")
+        base_sym, lbl_sym = redline.load_git_version(symlink_doc)
+        self.assertEqual(base_sym, "# Note\n\nVersion 2.\n")
+        self.assertEqual(lbl_sym, "git HEAD:note.md")
+
   def test_table_diff_under_unchanged_heading_aligns_deleted_and_inserted_rows(self):
     old = (
         "### Matrix\n\n"
