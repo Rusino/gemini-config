@@ -1063,14 +1063,26 @@ class TestChatLifecycle(unittest.TestCase):
     self.assertIn('"new_conversation_id": "child-1"', out[-200:])
 
   def test_get_model_trailer(self):
-    with patch.object(
-        chat_lifecycle,
-        "resolve_handoff_model",
-        return_value={"id": "gemini-3.8-flash-high", "label": "Gemini 3.8 Flash (High)"},
-    ):
-      self.assertEqual(chat_lifecycle.get_model_trailer("cid-1"), "Assisted-by: Gemini 3.8 Flash (High)")
+    catalog = {"models": {
+        "gemini-3.8-flash-high": {"model": "MODEL_PLACEHOLDER_M50",
+                                  "displayName": "Gemini 3.8 Flash (High)"},
+        "snowball-subagent": {"model": "MODEL_PLACEHOLDER_M136"},
+        "helper": {"model": "MODEL_PLACEHOLDER_M7", "displayName": "research-subagent"},
+    }}
 
-    with patch.object(chat_lifecycle, "resolve_handoff_model", side_effect=RuntimeError("no model")):
+    def trailer(enum):
+      with patch.object(chat_lifecycle, "get_conversation_model_enum", return_value=enum), \
+           patch.object(chat_lifecycle, "get_available_models", return_value=catalog), \
+           patch.object(chat_lifecycle, "resolve_handoff_model",
+                        side_effect=AssertionError("project default is not the model used")):
+        return chat_lifecycle.get_model_trailer("cid-1")
+
+    self.assertEqual(trailer("MODEL_PLACEHOLDER_M50"), "Assisted-by: Gemini 3.8 Flash (High)")
+    for internal in ("MODEL_PLACEHOLDER_M136", "MODEL_PLACEHOLDER_M7", "MODEL_UNKNOWN", ""):
+      self.assertEqual(trailer(internal), "Assisted-by: AI")
+
+    with patch.object(chat_lifecycle, "get_conversation_model_enum",
+                      side_effect=RuntimeError("no LS")):
       self.assertEqual(chat_lifecycle.get_model_trailer("cid-1"), "Assisted-by: AI")
 
   def test_pbtxt_escapes_backslashes_quotes_and_heals_broken_file(self):

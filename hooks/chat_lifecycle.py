@@ -558,13 +558,42 @@ def resolve_handoff_model(
   raise RuntimeError("no usable model found in GetAvailableModels")
 
 
-def get_model_trailer(conv_id: str = "") -> str:
-  """Returns git trailer e.g. 'Assisted-by: Gemini 3.8 Flash (High)' or fallback 'Assisted-by: AI'."""
+# Catalog entries without a display name are internal (e.g. `snowball-subagent` for
+# MODEL_PLACEHOLDER_M136) and must never reach a public commit trailer
+INTERNAL_MODEL_RE = re.compile(r"MODEL_PLACEHOLDER_|subagent|placeholder", re.IGNORECASE)
+
+
+def get_conversation_model_enum(conv_id: str) -> str:
+  """Model enum that generated the conversation's latest step, or ""."""
   try:
-    info = resolve_handoff_model(conv_id) if conv_id else {}
-    label = info.get("label") or info.get("id") or ""
-    if label:
-      return f"Assisted-by: {label}"
+    r = ls_rpc(
+        "GetCascadeTrajectoryGeneratorMetadata",
+        {"cascadeId": conv_id, "generatorMetadataOffset": 0, "includeMessages": False},
+    )
+    for gm in reversed(r.get("generatorMetadata") or []):
+      enum = (gm.get("chatModel") or {}).get("model") or ""
+      if enum:
+        return enum
+  except Exception:
+    pass
+  return get_last_used_model(conv_id)
+
+
+def get_model_trailer(conv_id: str = "") -> str:
+  """Returns git trailer e.g. 'Assisted-by: Gemini 3.8 Flash (High)' or fallback 'Assisted-by: AI'.
+
+  Names only the model that actually ran the conversation, never handoff guesses such as
+  the project default, and only by its public catalog display name.
+  """
+  try:
+    enum = get_conversation_model_enum(conv_id) if conv_id else ""
+    models = (get_available_models().get("models") or {}) if enum else {}
+    for mid, det in models.items():
+      if det.get("model") != enum:
+        continue
+      label = (det.get("displayName") or "").strip()
+      if label and label != mid and not INTERNAL_MODEL_RE.search(label):
+        return f"Assisted-by: {label}"
   except Exception:
     pass
   return "Assisted-by: AI"
