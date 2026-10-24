@@ -681,6 +681,180 @@ def unverified_corpus_before_upload_or_push(
   return ("", "", "")
 
 
+# Subjects that claim a speedup; a perf claim without measurements is the failure mode the
+# perf-optimization-loop skill exists to prevent
+PERF_CLAIM_RE = re.compile(
+    r"\b(?:speed(?:s|ed)?[\s-]*up|speedup|faster|optimi[sz](?:e|ing|ation|er)\w*"
+    r"|improve[sd]?\s+(?:perf(?:ormance)?|latency|throughput)"
+    r"|reduce[sd]?\s+(?:allocations?|copies|overhead|latency))\b"
+    r"|\bускор\w*|\bбыстрее\b|\bоптимиз\w*|\bпроизводительн\w*",
+    re.IGNORECASE,
+)
+PERF_TRAILER_RE = re.compile(r"^Perf:\s*\S", re.MULTILINE)
+PERF_EXEMPT_RE = re.compile(r"^Perf-Exempt:\s*\S", re.MULTILINE)
+PERF_SKILL_DIR = "~/.gemini/config/skills/perf-optimization-loop"
+# opt_branch_audit.py writes the audited HEAD here; see its main()
+PERF_AUDIT_STAMP = os.path.join("optimizations", ".audited")
+GIT_COMMIT_AT_RE = re.compile(
+    r"(?:^|(?<=[\s;&|(`]))git(?:\s+(?:-[Cc]\s+\S+|--[a-z-]+(?:=\S+)?))*\s+commit\b"
+)
+# The skill targets SkParagraph / SkShaper / WebParagraph; other repos are not gated
+PERF_REPO_MARKERS = ("modules/skparagraph", "engine/src/flutter/lib/web_ui", "lib/web_ui/lib")
+
+
+def _perf_repo_root(cmd: str, workspace_paths: list[str]) -> str:
+  cmd_code = strip_heredocs(cmd)
+  explicit = re.search(r"(?:^|[\s;&|(`])cd\s+|\bgit\s+-C\s+", cmd_code)
+  dirs = _extract_cmd_target_dirs(cmd, workspace_paths)
+  # Without cd / -C the shell runs in the first workspace, which is also the relative base
+  repo_dir = dirs[-1] if explicit and dirs else next(
+      (os.path.expanduser(wp) for wp in workspace_paths if wp), "")
+  if not repo_dir or not os.path.isdir(repo_dir):
+    return ""
+  try:
+    top = subprocess.run(
+        ["git", "-C", repo_dir, "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True, timeout=1.5, check=False,
+    )
+  except Exception:
+    return ""
+  root = top.stdout.strip() if top.returncode == 0 else ""
+  if root and any(os.path.isdir(os.path.join(root, m)) for m in PERF_REPO_MARKERS):
+    return root
+  return ""
+
+
+def _commit_message_from_cmd(cmd: str) -> str:
+  """Message of the first `git commit` in cmd: its own heredoc, an absolute -F file, or -m."""
+  spans = [(m.start(), m.end()) for m in HEREDOC_RE.finditer(cmd)]
+  start = next((m.start() for m in GIT_COMMIT_AT_RE.finditer(cmd)
+                if not any(s <= m.start() < e for s, e in spans)), -1)
+  if start < 0:
+    return ""
+  # The commit segment ends at the next top-level separator outside heredocs and quotes
+  tail = cmd[start:]
+  seg_end = len(tail)
+  for m in re.finditer(r"&&|\|\||;|\n", strip_heredocs(tail)):
+    seg_end = m.start()
+    break
+  seg = strip_heredocs(tail)[:seg_end]
+  # `-F -` and `-m "$(cat <<EOF` read the heredoc that belongs to this very command
+  if re.search(r"(?:-F|--file)(?:\s+|=)-(?:\s|$)|\$\(\s*cat\s+<<", seg):
+    m = next((h for h in HEREDOC_RE.finditer(cmd) if h.start() >= start), None)
+    if m:
+      body = m.group(0).split("\n", 1)[1] if "\n" in m.group(0) else ""
+      return body.rsplit("\n", 1)[0]
+    return ""
+  try:
+    tokens = shlex.split(seg, posix=True)
+  except ValueError:
+    return ""
+  parts: list[str] = []
+  for i, tok in enumerate(tokens):
+    nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
+    # Combined short flags such as -am / -qm take the message as the next token
+    if re.fullmatch(r"-[a-zA-Z]*m", tok) or tok == "--message":
+      parts.append(nxt)
+    elif tok.startswith("--message="):
+      parts.append(tok.split("=", 1)[1])
+    elif tok in ("-F", "--file") and os.path.isabs(os.path.expanduser(nxt)):
+      # Relative paths resolve against the shell cwd, which the hook cannot see
+      try:
+        with open(os.path.expanduser(nxt), encoding="utf-8", errors="replace") as f:
+          parts.append(f.read())
+      except OSError:
+        pass
+  return "\n\n".join(p for p in parts if p)
+
+
+# Deny a commit whose subject claims a speedup but carries no Perf: measurement trailer
+def perf_claim_commit_denial(cmd: str, workspace_paths: list[str]) -> str:
+  if not is_git_commit_or_upload_command(cmd):
+    return ""
+  msg = _commit_message_from_cmd(cmd).strip()
+  if not msg:
+    return ""
+  subject = msg.splitlines()[0]
+  if (not PERF_CLAIM_RE.search(subject) or subject.startswith('Revert "')
+      or PERF_TRAILER_RE.search(msg) or PERF_EXEMPT_RE.search(msg)):
+    return ""
+  if not _perf_repo_root(cmd, workspace_paths):
+    return ""
+  return (
+      f"[PERF-CLAIM GUARD] The commit subject claims a speedup (`{subject[:80]}`) but the "
+      "message has no `Perf:` trailer. Follow 1 optimization = 1 measured commit: measure "
+      "at least 2 interleaved rounds, run "
+      f"`python3 {PERF_SKILL_DIR}/scripts/bench_compare.py old.r1,old.r2 new.r1,new.r2` and "
+      "paste its `Perf:` lines into the message, then record the win with `opt_ledger.py add`. "
+      "If the change is not a performance claim (e.g. \"optimize imports\"), add a "
+      "`Perf-Exempt: <reason>` line instead."
+  )
+
+
+def _git_out(root: str, *args: str) -> str:
+  try:
+    res = subprocess.run(["git", "-C", root, *args], capture_output=True, text=True,
+                         timeout=2.0, check=False)
+  except Exception:
+    return ""
+  return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def _perf_claim_commits_to_publish(root: str) -> list[str]:
+  # Forks keep origin behind upstream, so origin/main would pull in other people's commits
+  base = next((b for b in (_git_out(root, "merge-base", "HEAD", c) for c in
+                           ("@{u}", "upstream/main", "upstream/master", "origin/main",
+                            "origin/master")) if b), "")
+  # GIT_AUTHOR_IDENT honours GIT_AUTHOR_EMAIL as well as user.email, like `git commit` does
+  m = re.search(r"<([^>]+)>", _git_out(root, "var", "GIT_AUTHOR_IDENT"))
+  email = m.group(1) if m else ""
+  if not base or not email:
+    return []
+  log = _git_out(root, "log", "-n", "50", f"--author={email}", "--format=%h%x00%B%x01",
+                 f"{base}..HEAD")
+  hits = []
+  for rec in log.split("\x01"):
+    if "\x00" not in rec:
+      continue
+    sha, body = rec.strip("\n").split("\x00", 1)
+    subject = body.strip().splitlines()[0] if body.strip() else ""
+    if (PERF_CLAIM_RE.search(subject) and not subject.startswith('Revert "')
+        and not PERF_EXEMPT_RE.search(body)):
+      hits.append(f"{sha} {subject[:60]}")
+  return hits
+
+
+# Deny publishing perf-claim commits until opt_branch_audit.py has audited the current HEAD
+def perf_audit_before_upload_denial(cmd: str, workspace_paths: list[str]) -> str:
+  if _invokes_script(cmd, "opt_branch_audit.py"):
+    return ""
+  if re.search(r"\bpush\b[^;&|\n]*\s(?:--delete|-d|--tags)\b", strip_heredocs(cmd)):
+    return ""
+  root = _perf_repo_root(cmd, workspace_paths)
+  if not root:
+    return ""
+  hits = _perf_claim_commits_to_publish(root)
+  if not hits:
+    return ""
+  head = _git_out(root, "rev-parse", "HEAD")
+  common = _git_out(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+  try:
+    with open(os.path.join(common, PERF_AUDIT_STAMP), encoding="utf-8") as f:
+      if head and f.read().strip() == head:
+        return ""
+  except OSError:
+    pass
+  listed = "; ".join(hits[:5])
+  return (
+      f"[PERF-AUDIT GUARD] The branch about to be published has performance-claim commits "
+      f"({listed}) and `opt_branch_audit.py` has not audited the current HEAD. Run "
+      f"`python3 {PERF_SKILL_DIR}/scripts/opt_branch_audit.py --repo {root} <base> HEAD`, "
+      "review MACHINERY / SINGLE_BENCH / NO_MEASUREMENT flags (prefer removing work over "
+      "adding caches), then publish. The audit is required even when commits carry `Perf:`; "
+      "commits that are not perf claims can carry a `Perf-Exempt: <reason>` line."
+  )
+
+
 def was_doc_grounding_run_in_chat(
     transcript_path: str, current_step_idx: int = -1
 ) -> bool:
@@ -2634,6 +2808,12 @@ def main() -> None:
         )
         return
 
+    # A speedup claim must carry its measurements in the same commit (1 win = 1 commit)
+    perf_commit = perf_claim_commit_denial(cmd_str, workspace_paths)
+    if perf_commit:
+      print(json.dumps({"decision": "deny", "reason": perf_commit}, ensure_ascii=False))
+      return
+
     # Require the full Flutter test corpus only on upload/push/PR when executable code changed
     if is_git_upload_or_push_command(cmd_str):
       subsys, edited_code_file, req_script = (
@@ -2659,6 +2839,11 @@ def main() -> None:
                 ensure_ascii=False,
             )
         )
+        return
+      # Perf branches get the "remove work rather than add machinery" audit before review
+      perf_audit = perf_audit_before_upload_denial(cmd_str, workspace_paths)
+      if perf_audit:
+        print(json.dumps({"decision": "deny", "reason": perf_audit}, ensure_ascii=False))
         return
 
   # Guard 8: Google Docs update_doc grounding check (amnesia-doc-check Phase 1)

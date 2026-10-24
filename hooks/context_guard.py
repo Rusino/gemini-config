@@ -864,6 +864,37 @@ def build_critical_challenge_notice(last_user_input: str) -> str:
   return "\n\n".join(notices)
 
 
+# The perf skill is only found by semantic matching otherwise, and a missed protocol means
+# unmeasured "wins" and retried ideas, so perf vocabulary in the prompt names it explicitly
+PERF_LOOP_RE = re.compile(
+    r"(?:\bоптимиз\w*|\bускор\w*|\bпроизводительност\w*|\bзамер(?![зл])\w*|\bбенчмарк\w*"
+    r"|\bперф\b|\bperf\b|\bperformance\b|\bfaster\b|\bspeed[\s-]?up\b|\bbenchmark\w*"
+    r"|\bnanobench\b|\bhyperfine\b|\boptimi[sz](?:e|ing|ation|er)\w*)",
+    re.IGNORECASE,
+)
+
+PERF_SKILL_MD = "~/.gemini/config/skills/perf-optimization-loop/SKILL.md"
+
+
+def build_perf_loop_notice(last_user_input: str) -> str:
+  if not last_user_input or re.search(
+      r"Continuing unfinished work from previous conversation", last_user_input
+  ):
+    return ""
+  m = PERF_LOOP_RE.search(last_user_input)
+  if not m:
+    return ""
+  return (
+      "[PERF LOOP TRIGGER]\n"
+      f'The prompt mentions performance work ("{m.group(0)}"). If this turn measures, compares, '
+      f"or changes performance, read `{PERF_SKILL_MD}` first and follow it: "
+      "`opt_ledger.py check` before each hypothesis, a load preflight and at least 2 "
+      "interleaved rounds per measurement, one optimization per commit with the `Perf:` "
+      "trailers from `bench_compare.py`, and `opt_branch_audit.py` before upload. "
+      "Ignore this if the mention is incidental."
+  )
+
+
 # Tool results may indent this line (e.g. "\n\n\t\t\t\tThe command exited ..." on
 # macOS Jetski), so allow leading whitespace; otherwise the guard never fires.
 EXIT_CODE_RE = re.compile(r"^\s*The command exited with code (\d+)\.", re.MULTILINE)
@@ -1523,6 +1554,10 @@ def run(data: dict, log: dict) -> dict:
       challenge_notice = build_critical_challenge_notice(last_user_input)
       if challenge_notice:
         messages.append(challenge_notice)
+      # Name the perf skill explicitly; semantic skill matching alone misses perf requests
+      perf_notice = build_perf_loop_notice(last_user_input)
+      if perf_notice:
+        messages.append(perf_notice)
     soft_due = steps - int(
         state.get("soft_last_steps", -SOFT_REMIND_EVERY_STEPS)
     ) >= SOFT_REMIND_EVERY_STEPS

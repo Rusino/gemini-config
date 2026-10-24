@@ -146,6 +146,11 @@ def main():
     if not counts:
         print("- clean")
 
+    # pre_tool_guard's PERF-AUDIT GUARD allows publishing only the HEAD audited here
+    stamp = opt_ledger.ledger_dir(args.repo) / ".audited"
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.write_text(git(args.repo, "rev-parse", args.head).strip() + "\n")
+
 
 if __name__ == "__main__":
     main()

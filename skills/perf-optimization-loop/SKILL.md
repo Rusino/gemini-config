@@ -96,6 +96,20 @@ positive tag `REMOVES_WORK`. Then review by hand:
 - `SINGLE_BENCH` wins must be re-measured on at least one other input (different length,
   script, or style mix) before upload.
 
+## Automatic Enforcement
+
+- `hooks/context_guard.py` injects `[PERF LOOP TRIGGER]` at turn start when the prompt uses
+  perf vocabulary (ускорь, производительность, замер, perf, speed up, benchmark, ...).
+- `hooks/pre_tool_guard.py`, only in repos with `modules/skparagraph` or `lib/web_ui/lib`:
+  - `[PERF-CLAIM GUARD]` denies a `git commit` whose subject claims a speedup without a
+    `Perf:` trailer.
+  - `[PERF-AUDIT GUARD]` denies `git push` / `git cl upload` / `gh pr create` while your own
+    unpublished commits include speedup claims and `opt_branch_audit.py` has not audited the
+    current HEAD (it records the audited HEAD in `.git/optimizations/.audited`). The audit is
+    required even when every commit carries `Perf:`.
+  - A commit that is not a runtime perf claim (e.g. "Optimize imports") opts out with a
+    `Perf-Exempt: <reason>` line; `Revert "..."` subjects are ignored.
+
 ## Comparing Two Versions (no loop)
 
 To compare e.g. a week-old revision with HEAD, collect samples for both revisions with the
