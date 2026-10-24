@@ -99,6 +99,16 @@ class TestRuthlessCodeAudit(unittest.TestCase):
     all_clone_locs = " ".join(loc for c in clones for loc in c["locations"])
     self.assertIn("pkg_c/clone.go", all_clone_locs)
 
+    # Symlinked scan root (simulating macOS /var -> /private/var)
+    with tempfile.TemporaryDirectory() as link_parent:
+      symlink_root = pathlib.Path(link_parent) / "alias_root"
+      symlink_root.symlink_to(self.root)
+      sym_files = ruthless_audit.collect_files([symlink_root], symlink_root)
+      self.assertEqual(
+          sorted(rel for _, rel in sym_files),
+          ["pkg_a/dup1.go", "pkg_b/dup2.go", "pkg_c/clone.go"],
+      )
+
   def test_dead_and_test_only_functions(self):
     prod_code = "\n".join([
         "package engine",

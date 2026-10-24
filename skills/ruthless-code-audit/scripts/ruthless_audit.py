@@ -225,6 +225,9 @@ def is_generated_file(rel_path: str) -> bool:
 
 
 def collect_files(targets, repo_root: pathlib.Path):
+  # Canonicalize repo_root so symlinked roots (e.g. macOS /var -> /private/var)
+  # match resolved file paths
+  repo_root = pathlib.Path(repo_root).resolve()
   files = []
   seen = set()
   for target in targets:
@@ -399,6 +402,8 @@ def run_google_cpd(targets, repo_root: pathlib.Path, min_lines=10, min_tokens=60
   if not os.path.isfile(CPD_BINARY) or not os.access(CPD_BINARY, os.X_OK):
     return None
 
+  # Canonicalize repo_root before relativizing resolved target paths
+  repo_root = pathlib.Path(repo_root).resolve()
   rel_targets = [
       str(pathlib.Path(t).resolve().relative_to(repo_root))
       if pathlib.Path(t).resolve().is_relative_to(repo_root)
