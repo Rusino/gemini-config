@@ -92,6 +92,7 @@ python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutte
 - `--skip-build` — Skip running ninja if the engine is already built.
 - `--skip-cpp` — Skip C++ smoke tests (`txt_unittests`, `ui_unittests`).
 - `--resume` — Skip re-running refs whose `attestation.json` and `summary.json` already exist.
+- `--allow-skia-base-mismatch` — Run even though the Skia submodule `HEAD` differs from `skia_revision` in Flutter `DEPS` (recorded as `skia_base_matches_deps: false` in `attestation.json`); without it the script aborts before touching anything.
 
 ---
 
@@ -127,3 +128,4 @@ If the integrity check verdict is `WARNING / INVALID`, never report the run as c
 2. **Missing `sky_engine`**: Building only `flutter_tester` without `sky_engine` leads to compilation failures in framework tests when `dart:ui` declarations change or cache is invalidated.
 3. **`selectable_text_test.dart` Location**: Note that `selectable_text_test.dart` is under `packages/flutter/test/material/`, not `widgets/`.
 4. **Apple Unicode Engine Glue Is Off `master`**: On macOS the Flutter-side glue for `--unicode apple` / `@apple` lives on branch `apple-unicode-engine-glue` in the Flutter Framework repo, not on `master`. Apply it with `git show apple-unicode-engine-glue | git apply` before an Apple run and revert with `git show apple-unicode-engine-glue | git apply -R` afterwards; the script aborts before building if the glue is missing.
+5. **Skia Submodule Must Match `DEPS` After Updating Flutter**: `baseline=HEAD`, `ext:<ref>` and `WORKTREE` all build on the current submodule `HEAD`, so after pulling Flutter run `gclient sync -D` from the Flutter Framework repo root (commit or back up any submodule work first). The script aborts when the submodule `HEAD` differs from `DEPS` `skia_revision` unless `--allow-skia-base-mismatch` is passed.

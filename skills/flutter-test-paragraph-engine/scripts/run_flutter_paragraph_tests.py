@@ -173,6 +173,15 @@ def set_gn_unicode_backend(gn_args_file: pathlib.Path, mode: str) -> None:
         gn_args_file.write_text(new_text)
 
 
+# The Skia revision Flutter's DEPS pins; `gclient sync -D` checks the submodule out at it
+def read_deps_skia_revision(repo: pathlib.Path) -> Optional[str]:
+    deps = repo / "DEPS"
+    if not deps.exists():
+        return None
+    m = re.search(r"'skia_revision'\s*:\s*'([0-9a-f]{40})'", deps.read_text(errors="replace"))
+    return m.group(1) if m else None
+
+
 def verify_flutter_apple_glue(engine_src: pathlib.Path) -> list[str]:
     missing: list[str] = []
     checks = [
@@ -570,6 +579,11 @@ def main() -> int:
         action="store_true",
         help="Skip ref if attestation and summary JSON already exist",
     )
+    ap.add_argument(
+        "--allow-skia-base-mismatch",
+        action="store_true",
+        help="Run even if the Skia submodule HEAD differs from skia_revision in Flutter DEPS",
+    )
     args = ap.parse_args()
 
     repo = pathlib.Path(args.repo).resolve()
@@ -592,6 +606,24 @@ def main() -> int:
         text=True,
         check=True,
     ).stdout.strip()
+
+    # `baseline=HEAD`, `ext:` and `WORKTREE` all build on the submodule HEAD; after a Flutter
+    # update without `gclient sync -D` that HEAD is a stale or foreign Skia and the run lies
+    deps_skia_revision = read_deps_skia_revision(repo)
+    skia_base_head = subprocess.run(
+        ["git", "-C", str(skia_repo), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    skia_base_matches_deps = deps_skia_revision == skia_base_head
+    if not skia_base_matches_deps and not args.allow_skia_base_mismatch:
+        raise RuntimeError(
+            f"Skia submodule HEAD {skia_base_head[:12]} ({orig_branch_or_sha}) != DEPS "
+            f"skia_revision {(deps_skia_revision or 'not found')[:12]}. Commit or back up any "
+            f"submodule work, then run `gclient sync -D` in {repo}; pass "
+            "--allow-skia-base-mismatch only for an intentional non-DEPS base."
+        )
 
     out_dir = pathlib.Path(args.out).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -686,6 +718,9 @@ def main() -> int:
                 "label": label,
                 "ref": raw_ref,
                 "missing_apple_glue": [],
+                "deps_skia_revision": deps_skia_revision,
+                "skia_base_head": skia_base_head,
+                "skia_base_matches_deps": skia_base_matches_deps,
             }
             attestation.update(git_meta)
             attestation["ref"] = raw_ref
