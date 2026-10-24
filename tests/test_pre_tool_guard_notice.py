@@ -110,7 +110,7 @@ class TestPreToolGuardNotice(unittest.TestCase):
       specs = json.load(f).values()
     commands = [
         h["command"] for s in specs if s.get("enabled", True) for h in s.get("PreInvocation", [])]
-    self.assertIn("~/.gemini/config/hooks/pre_tool_guard_notice.py", commands)
+    self.assertIn("python3 ~/.gemini/config/hooks/pre_tool_guard_notice.py", commands)
     self.assertTrue(os.access(os.path.join(HOOKS_DIR, "pre_tool_guard_notice.py"), os.X_OK))
 
   def test_marker_path_matches_the_guard(self):

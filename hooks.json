@@ -11,17 +11,17 @@
     "PreInvocation": [
       {
         "type": "command",
-        "command": "~/.gemini/config/hooks/project_activity_badge.py --event PreInvocation",
+        "command": "python3 ~/.gemini/config/hooks/project_activity_badge.py --event PreInvocation",
         "timeout": 5
       },
       {
         "type": "command",
-        "command": "~/.gemini/config/hooks/context_guard.py",
+        "command": "python3 ~/.gemini/config/hooks/context_guard.py",
         "timeout": 5
       },
       {
         "type": "command",
-        "command": "~/.gemini/config/hooks/pre_tool_guard_notice.py",
+        "command": "python3 ~/.gemini/config/hooks/pre_tool_guard_notice.py",
         "timeout": 5
       }
     ],
@@ -31,7 +31,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.gemini/config/hooks/pre_tool_guard.py",
+            "command": "python3 ~/.gemini/config/hooks/pre_tool_guard.py",
             "timeout": 5
           }
         ]
@@ -40,12 +40,12 @@
     "Stop": [
       {
         "type": "command",
-        "command": "~/.gemini/config/hooks/stop_guard.py",
+        "command": "python3 ~/.gemini/config/hooks/stop_guard.py",
         "timeout": 5
       },
       {
         "type": "command",
-        "command": "~/.gemini/config/hooks/project_activity_badge.py --event Stop",
+        "command": "python3 ~/.gemini/config/hooks/project_activity_badge.py --event Stop",
         "timeout": 5
       },
       {

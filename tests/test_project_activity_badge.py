@@ -414,6 +414,19 @@ class TestProjectActivityBadge(unittest.TestCase):
           },
       )
 
+  # Verifies self-healing of `+x` bits stripped by `.tmp` -> `mv` hook overwrites
+  def test_ensure_hooks_executable_restores_dropped_exec_bit(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      hook_py = os.path.join(tmp, "context_guard.py")
+      with open(hook_py, "w") as f:
+        f.write("#!/usr/bin/env python3\n")
+      os.chmod(hook_py, 0o644)
+      self.assertFalse(os.access(hook_py, os.X_OK))
+      restored = badge.ensure_hooks_executable(tmp)
+      self.assertEqual(restored, ["context_guard.py"])
+      self.assertTrue(os.access(hook_py, os.X_OK))
+      self.assertEqual(badge.ensure_hooks_executable(tmp), [])
+
 
 if __name__ == "__main__":
   unittest.main()

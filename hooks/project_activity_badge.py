@@ -937,8 +937,25 @@ def spawn_detached_trigger(
     pass
 
 
+# Atomic `.tmp` -> `mv` replacements drop 0755; restore `+x` before sibling hooks run
+def ensure_hooks_executable(hooks_dir: str | None = None) -> list[str]:
+  target_dir = hooks_dir or os.path.dirname(os.path.abspath(__file__))
+  restored: list[str] = []
+  try:
+    for entry in os.scandir(target_dir):
+      if entry.name.endswith(".py") and entry.is_file(follow_symlinks=False):
+        mode = entry.stat(follow_symlinks=False).st_mode
+        if (mode & 0o111) != 0o111:
+          os.chmod(entry.path, mode | 0o111)
+          restored.append(entry.name)
+  except OSError:
+    pass
+  return restored
+
+
 def handle_hook_invocation(event: str, projects_dir: str) -> None:
   """Handles `PreInvocation` or `Stop` hook execution in <10ms."""
+  ensure_hooks_executable()
   raw_stdin = ""
   try:
     if not sys.stdin.isatty():
