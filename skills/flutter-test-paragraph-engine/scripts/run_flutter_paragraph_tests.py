@@ -652,6 +652,17 @@ def main() -> int:
                     f"[{label}] Apple Unicode backend (--unicode apple / @apple) is only supported on macOS."
                 )
 
+            # Without the engine glue the build silently links ICU, producing an apple-labeled ICU run
+            if target_unicode == "apple":
+                absent_glue = verify_flutter_apple_glue(engine_src)
+                if absent_glue:
+                    raise RuntimeError(
+                        f"[{label}] Missing Apple Unicode glue in Flutter engine: {absent_glue}. "
+                        "It lives on branch `apple-unicode-engine-glue` in the Flutter repo; apply "
+                        "it with `git show apple-unicode-engine-glue | git apply` and revert after "
+                        "the run with `git show apple-unicode-engine-glue | git apply -R`."
+                    )
+
             ref_dir = out_dir / label
             ref_dir.mkdir(parents=True, exist_ok=True)
             att_path = ref_dir / "attestation.json"
@@ -671,19 +682,10 @@ def main() -> int:
             )
             set_gn_unicode_backend(gn_args_file, target_unicode)
 
-            missing_glue: list[str] = []
-            if target_unicode == "apple":
-                missing_glue = verify_flutter_apple_glue(engine_src)
-                if missing_glue:
-                    log(
-                        f"WARNING: [{label}] Missing Apple Unicode glue in Flutter engine: {missing_glue}",
-                        driver_log,
-                    )
-
             attestation: dict[str, Any] = {
                 "label": label,
                 "ref": raw_ref,
-                "missing_apple_glue": missing_glue,
+                "missing_apple_glue": [],
             }
             attestation.update(git_meta)
             attestation["ref"] = raw_ref
