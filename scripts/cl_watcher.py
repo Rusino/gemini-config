@@ -71,6 +71,7 @@ RE_CL_ID = re.compile(r"(?:\bcl/|\bCL\s+)(\d{6,10})\b", re.IGNORECASE)
 # unless explicitly prefixed with PR
 RE_PR_ID = re.compile(r"(?:\bPR\s*#?|\bpull/)(\d{5,7})\b", re.IGNORECASE)
 # Strip any trailing roll badge we previously attached to a title
+TITLE_TOPIC_MAX = 38
 RE_ROLL_BADGE = re.compile(r"\s*\[(?:⏳|✓|🔴|🔄)[^\]]*\]\s*$")
 
 _GMAIL_TOKEN_CACHE: dict[str, Any] = {"access_token": "", "expires_at": 0.0}
@@ -1152,13 +1153,21 @@ def update_chat_roll_badge(conv_id: str, current_title: str, badge: str) -> None
   base = cl.clean_base_title(current_title)
   base_no_badge = RE_ROLL_BADGE.sub("", base).strip()
   new_topic = f"{base_no_badge} {badge}".strip() if badge else base_no_badge
-  if len(new_topic) > 54 and badge:
-    avail = max(12, 53 - len(badge))
-    new_topic = f"{base_no_badge[:avail].rstrip()} {badge}"
+  # "[HH:MM] ⦿ " takes 10 characters and titles must stay under 50, so the topic is
+  # cut to make room for the badge rather than dropping it
+  if len(new_topic) > TITLE_TOPIC_MAX and badge:
+    avail = max(12, TITLE_TOPIC_MAX - 1 - len(badge))
+    # Discovery reads the CL or PR from the title, so a cut must never split it
+    tokens = [m.group(0) for r in (RE_CL_ID, RE_PR_ID) for m in r.finditer(base_no_badge)]
+    rest = base_no_badge
+    for tok in tokens:
+      rest = rest.replace(tok, " ")
+    kept = " ".join(tokens + rest.split())
+    new_topic = f"{kept[:avail].rstrip()} {badge}"
   if new_topic == base:
     return
   try:
-    cl.set_title_with_AutoMarker(conv_id, new_topic)
+    cl.set_conversation_topic(conv_id, new_topic)
   except Exception:
     pass
 

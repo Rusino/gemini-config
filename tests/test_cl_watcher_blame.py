@@ -115,5 +115,26 @@ class RollVerdictTest(unittest.TestCase):
     self.assertEqual(res["rolls"]["Chrome"]["state"], "🔴")
 
 
+class RollBadgeTitleTest(unittest.TestCase):
+
+  def setUp(self):
+    self.calls = []
+    self._orig = w.cl.set_conversation_topic
+    w.cl.set_conversation_topic = lambda _cid, topic: self.calls.append(topic)
+
+  def tearDown(self):
+    w.cl.set_conversation_topic = self._orig
+
+  def test_long_title_keeps_cl_and_fits(self):
+    w.update_chat_roll_badge("c", "[16:56] ⦿ Code Review cl/1400736", "[⏳St · 0/4 rolls]")
+    self.assertEqual(len(self.calls), 1)
+    self.assertRegex(self.calls[0], r"^cl/1400736 ")
+    self.assertLessEqual(len(self.calls[0]), w.TITLE_TOPIC_MAX)
+
+  def test_same_badge_does_not_rename(self):
+    w.update_chat_roll_badge("c", "[11:17] ⦿ cl/1396956 [⏳St · 0/4 rolls]", "[⏳St · 0/4 rolls]")
+    self.assertEqual(self.calls, [])
+
+
 if __name__ == "__main__":
   unittest.main()
