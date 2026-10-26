@@ -1532,6 +1532,82 @@ def create_handoff(
 ROADMAP_ITEM_ID_RE = re.compile(r"^R[1-9]\d*(?:\.[1-9]\d*)*$", re.IGNORECASE)
 
 
+# Finalizes open sibling chats in project_id that completed roadmap items and own no open items
+def sweep_completed_project_chats(
+    project_id: str,
+    exclude_cids: set[str] | None = None,
+    finalized_cids: set[str] | None = None,
+) -> list[list[str]]:
+  if not project_id or project_id == "outside-of-project":
+    return []
+  try:
+    import roadmap
+
+    doc = roadmap.load(project_id)
+  except Exception:
+    return []
+
+  busy_cids: set[str] = set()
+  # Protect the active baton holder unless the caller is explicitly finalizing it
+  baton = doc.get("baton")
+  baton_holder = (baton.get("conv") or "").strip() if isinstance(baton, dict) else ""
+  if baton_holder and baton_holder not in (finalized_cids or ()):
+    busy_cids.add(baton_holder)
+
+  closed_candidates: list[str] = []
+  for it in doc.get("items", []):
+    st = it.get("status", "")
+    if st in ("todo", "doing"):
+      for field in ("owner", "link"):
+        val = (it.get(field) or "").strip()
+        if val:
+          busy_cids.add(val)
+    elif st in ("done", "dropped"):
+      for field in ("link", "updated_by"):
+        val = (it.get(field) or "").strip()
+        if val and val not in closed_candidates:
+          closed_candidates.append(val)
+
+  visited: set[str] = set(exclude_cids or ()) | set(finalized_cids or ())
+  actually_finalized: set[str] = set(finalized_cids or ())
+  swept_chains: list[list[str]] = []
+  for cid in closed_candidates:
+    if cid in visited:
+      continue
+    chain = discover_conversation_chain(cid) or [cid]
+    if any(c in visited for c in chain):
+      visited.update(chain)
+      continue
+    visited.update(chain)
+    # Never sweep a chain that still owns or is linked to an open todo/doing item
+    if any(c in busy_cids for c in chain):
+      continue
+    leaf_id = chain[-1]
+    leaf_pid = get_conversation_project_id(leaf_id)
+    if leaf_pid and leaf_pid != project_id:
+      continue
+    leaf_title = get_conversation_title(leaf_id)
+    if not leaf_title or is_finalized_title(leaf_title) or is_waiting_title(leaf_title):
+      continue
+    finalized = finalize_conversation_chain(leaf_id, chain)
+    swept_chains.append(finalized)
+    actually_finalized.update(finalized)
+    for c in chain:
+      try:
+        sf = roadmap.state_path(project_id, c)
+        if os.path.isfile(sf):
+          os.unlink(sf)
+      except Exception:
+        pass
+
+  if actually_finalized:
+    try:
+      roadmap.clear_baton(project_id, actually_finalized)
+    except Exception:
+      pass
+  return swept_chains
+
+
 # Finalizes current_conv_id's chain and opens a fresh root chat for the next roadmap item
 def create_next_task(
     current_conv_id: str,
@@ -1658,7 +1734,9 @@ def create_next_task(
           f"{notes_block}\n"
           f"## Immediate Next Step\n- {next_line}\n"
       )
-    if os.path.isfile(old_state_file) and os.path.abspath(old_state_file) != os.path.abspath(new_sf):
+    if os.path.isfile(old_state_file) and os.path.abspath(old_state_file) != os.path.abspath(
+        new_sf
+    ):
       try:
         os.unlink(old_state_file)
       except OSError:
@@ -1739,8 +1817,14 @@ def create_next_task(
 
   fetched, source_meta = get_conversation_source_metadata(new_cid)
 
-  # Close the finished task's chat/chain («» or «...») and record new_cid as an active root chat
+  # Close the finished task's chat/chain («» or «...»), sweep completed sibling chats,
+  # and record new_cid as an active root chat
   finalized_chain = finalize_conversation_chain(current_conv_id)
+  swept_sibling_chains = sweep_completed_project_chats(
+      project_id,
+      exclude_cids={new_cid},
+      finalized_cids=set(finalized_chain),
+  )
   update_conversation_title(new_cid, cont_title)
   export_chain_index()
 
@@ -1750,6 +1834,7 @@ def create_next_task(
       "title": cont_title,
       "summary_file": new_state_file,
       "finalized_chain": finalized_chain,
+      "swept_sibling_chains": swept_sibling_chains,
       "model": model_info,
       "source_metadata": source_meta,
       "verified_visible": bool(fetched and source_meta is None),
@@ -2729,10 +2814,14 @@ def main(argv: list[str] | None = None) -> int:
     cids = [_require_conversation_id("finalize", a) for a in args]
     if not cids:
       _cli_fail("finalize", "at least one conversation ID is required")
+    # Also sweep completed sibling worker chats in the same project so one finalize closes the batch
     if len(cids) == 1:
-      finalize_conversation_chain(cids[0])
+      closed = finalize_conversation_chain(cids[0])
     else:
-      finalize_conversation_chain(cids[0], cids)
+      closed = finalize_conversation_chain(cids[0], cids)
+    pid = get_conversation_project_id(cids[0])
+    if pid and pid != "outside-of-project":
+      sweep_completed_project_chats(pid, finalized_cids=set(closed))
   return 0
 
 

@@ -442,6 +442,52 @@ class TestRoadmap(unittest.TestCase):
     with open(os.path.join(self.tmp.name, "p1", "journal.jsonl"), encoding="utf-8") as f:
       self.assertEqual(len(f.readlines()), workers * per_worker)
 
+  def test_last_chat_baton_holds_until_last_doing_finishes_and_prevents_duplicate_proposals(self):
+    cli = self._run_cli
+    for t in ("Task 1", "Task 2", "Task 3", "Task 4"):
+      roadmap.add_item("p1", "c1", t)
+    roadmap.set_status("p1", "c1", "R1", "doing")
+    roadmap.set_status("p1", "c2", "R2", "doing")
+    roadmap.set_status("p1", "c3", "R3", "doing")
+
+    # c1 finishes R1 while R2 and R3 are still doing -> HOLD
+    r1 = cli("set", "c1", "R1", "done")
+    self.assertEqual(r1.returncode, 0)
+    self.assertIn("[NEXT-TASK BATON: HOLD", r1.stdout)
+    self.assertIn("R2 [c2]", r1.stdout)
+    self.assertIn("R3 [c3]", r1.stdout)
+
+    # c2 finishes R2 while R3 is still doing -> HOLD
+    r2 = cli("set", "c2", "R2", "done")
+    self.assertEqual(r2.returncode, 0)
+    self.assertIn("[NEXT-TASK BATON: HOLD", r2.stdout)
+    self.assertIn("R3 [c3]", r2.stdout)
+
+    # c3 finishes R3 (last doing item -> 0 doing) -> YOURS for R4
+    r3 = cli("set", "c3", "R3", "done")
+    self.assertEqual(r3.returncode, 0)
+    self.assertIn("[NEXT-TASK BATON: YOURS", r3.stdout)
+    self.assertIn("R4", r3.stdout)
+
+    # If another chat c0 closes an un-claimed item while c3 already holds the baton for R4 -> HOLD
+    roadmap.add_item("p1", "c0", "Extra task")
+    r5 = cli("set", "c0", "R5", "done")
+    self.assertEqual(r5.returncode, 0)
+    self.assertIn("[NEXT-TASK BATON: HOLD", r5.stdout)
+    self.assertIn("c3", r5.stdout)
+
+    # Once R4 is also done -> ALL DONE
+    r4 = cli("set", "c3", "R4", "done")
+    self.assertEqual(r4.returncode, 0)
+    self.assertIn("[NEXT-TASK BATON: ALL DONE", r4.stdout)
+
+    # Corrupted baton dicts (empty or missing conv/item) are rejected by validate()
+    doc = roadmap.load("p1")
+    for bad_baton in ({}, {"conv": "c1"}, {"conv": "", "item": "R1"}, "c1"):
+      doc["baton"] = bad_baton
+      with self.assertRaises(roadmap.RoadmapError):
+        roadmap.validate(doc)
+
 
 if __name__ == "__main__":
   unittest.main()

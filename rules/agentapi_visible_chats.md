@@ -28,9 +28,9 @@ Use only these commands (`python3 ~/.gemini/config/hooks/chat_lifecycle.py ...`)
 | `set-title <id> "<Topic>"` | User asks to name/rename the chat, or on the first turn once you know the bug/CL/PR/commit topic to refine the auto-detected ID or replace a generic title. Pass bare `<Topic>`. |
 | `auto-title <id> "<prompt>"` | Detect PR/CL/bug/commit in prompt and set title if untitled (invoked automatically by `context_guard.py`). |
 | `handoff <id> [summary_file] [--notes "..."] [--next "..."] [--topic "<Topic>"] [--force]` | Context guard alert, or user asks to continue in a new chat. Writes/updates summary, launches visible continuation in the same project on `<id>`'s last model, verifies `sourceMetadata: null`, updates chain markers. `--model <id\|name>` only on explicit user request; `--force` only when user explicitly asked for a second continuation. |
-| `next-task [<id>] [<R_ID>] [--topic "<Topic>"] [--notes "..."] [--next "..."] [--force]` | After finishing a task (`roadmap.py set <id> <R_prev> done`), when the user confirms starting the next roadmap item `<R_ID>` in a fresh chat: auto-finalizes `<id>`'s chain (`«»` / `«…»`, releasing its worktree lease), launches an independent root chat (`⦿`) in the same project, claims `<R_ID>` as `doing`, links `<R_ID> → <new_id>`, and seeds `state/<new_id>.md`. |
+| `next-task [<id>] [<R_ID>] [--topic "<Topic>"] [--notes "..."] [--next "..."] [--force]` | After finishing a task (`roadmap.py set <id> <R_prev> done`), when `[NEXT-TASK BATON: YOURS ...]` is granted and the user confirms starting `<R_ID>` in a fresh chat: auto-finalizes `<id>`'s chain and all completed sibling chats in the project (`«»` / `«…»`, releasing worktree leases), launches an independent root chat (`⦿`) in the same project, claims `<R_ID>` as `doing`, links `<R_ID> → <new_id>`, and seeds `state/<new_id>.md`. |
 | `summary-path <id>` | Returns the canonical summary path before writing with `write_file`. |
-| `finalize <id>` | **Only** when the user explicitly says *"финал"* (or unambiguous equivalent). |
+| `finalize <id>` | **Only** when the user explicitly says *"финал"* (or unambiguous equivalent); also auto-finalizes completed sibling chats in the same project that own no open roadmap items. |
 | `status [id]` | Inspect chain structure and summary paths. |
 | `model [id] [--trailer]` | Inspect chat model or print `Assisted-by: ...` git trailer (`--trailer`). |
 | `project-model [<p>] [<m>]` | View or set project preferred model in `~/.gemini/config/projects_models.json`. |
@@ -44,9 +44,10 @@ To move chats/chains between projects, run `python3 ~/.gemini/config/scripts/mov
 
 - **In-project chats: Epic Roadmap via `roadmap.py` only**: Manage the project roadmap exclusively via `python3 ~/.gemini/config/hooks/roadmap.py add|set|link|show|edit|reorder|move ...` (never edit `~/.gemini/config/roadmaps/` files directly, except the chain state file from `roadmap.py state-path <id>`).
   - **Backlog requests ("в бэклог: X")**: run `roadmap.py add <id> "X"`, confirm on one line (or bulleted list separated by blank lines for multiple items), then continue current work.
-  - **Finishing a task & proposing the next roadmap item (`next-task`)**:
-    - Once the current roadmap item is completed and marked `done` (`roadmap.py set <id> <R_prev> done`), check `roadmap.py show` for the next `todo` item `<R_next>`.
-    - For a **top-level item (`R2`, `R3`)** or whenever context is **`>= 30%`**, propose opening `<R_next>` in a fresh chat (`chat_lifecycle.py next-task <id> <R_next> --topic "<Topic>"`) so each task has a clean context and `<id>` is auto-finalized (`«»` / `«…»`). For a small **sub-item (`R1.1`, `R1.2`)** with context **`< 30%`**, offer to either do it right here or open a new chat via `next-task`.
+  - **Finishing a task & proposing the next roadmap item (`next-task`, Last-Chat Baton)**:
+    - Once the current roadmap item is completed and marked `done` (`roadmap.py set <id> <R_prev> done`), obey the `[NEXT-TASK BATON: ...]` line printed by `roadmap.py`:
+      - **`[NEXT-TASK BATON: HOLD ...]`** (other items are still `doing` in parallel chats, or another chat already holds the proposal baton) or **`[NEXT-TASK BATON: ALL DONE ...]`**: report the completed task and **stop without proposing `next-task`**.
+      - **`[NEXT-TASK BATON: YOURS ...]`** (`0 doing` in the project): only this last finishing chat proposes `<R_next>`. For a **top-level item (`R2`, `R3`)** or whenever context is **`>= 30%`**, propose opening `<R_next>` in a fresh chat (`chat_lifecycle.py next-task <id> <R_next> --topic "<Topic>"`), which auto-finalizes `<id>` and any completed sibling worker chats (`«»` / `«…»`). For a small **sub-item (`R1.1`, `R1.2`)** with context **`< 30%`**, offer to either do it right here or open a new chat via `next-task`.
   - **Spin-offs**: run `roadmap.py link <id> <item ID> <new_chat_id>`.
   - **At handoff / `next-task`**: paste the roadmap block printed by `chat_lifecycle.py handoff` / `next-task` into the final message alongside `[👉 <Title>](conversation://<new_conversation_id>)`.
 - **Parallel chats in one project share resources — claim before touching**:

@@ -1270,9 +1270,12 @@ class TestChatLifecycle(unittest.TestCase):
       self.assertEqual(r2["link"], "child-2")
 
       # Worktree lease check treats parent-1 as inactive/closed immediately
+      child_log = os.path.join(
+          tmp_dir, "brain", "child-2", ".system_generated", "logs", "transcript.jsonl"
+      )
       with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]):
         still_active, _ = pre_tool_guard._is_conv_still_active_tip(
-            "parent-1", "child-2", os.path.join(tmp_dir, "brain", "child-2", ".system_generated", "logs", "transcript.jsonl")
+            "parent-1", "child-2", child_log
         )
         self.assertFalse(still_active)
 
@@ -1383,6 +1386,69 @@ class TestChatLifecycle(unittest.TestCase):
             chat_lifecycle.set_conversation_wait_state(cid, waiting=True),
             t_updated,
         )
+
+  def test_create_next_task_sweeps_completed_sibling_chats_in_project(self):
+    import roadmap
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.write_chain(tmp_dir, [("c1", None), ("c2", None), ("c3", None), ("c_busy", None)])
+      self.write_titles(tmp_dir, {
+          "c1": "[10:00] ⦿ R1 First",
+          "c2": "[10:05] ⦿ R2 Second",
+          "c3": "[10:10] ⦿ R3 Third",
+          "c_busy": "[10:15] ⦿ R5 Still working",
+      }, project="proj-abc")
+      for idx, cid in enumerate(("c1", "c2", "c3"), start=1):
+        roadmap.add_item("proj-abc", cid, f"Task {idx}")
+        roadmap.set_status("proj-abc", cid, f"R{idx}", "doing")
+        st_path = roadmap.state_path("proj-abc", cid)
+        os.makedirs(os.path.dirname(st_path), exist_ok=True)
+        with open(st_path, "w", encoding="utf-8") as f:
+          f.write(f"# R{idx}\n")
+        roadmap.set_status("proj-abc", cid, f"R{idx}", "done")
+
+      roadmap.add_item("proj-abc", "c3", "Task 4 Next")
+      roadmap.add_item("proj-abc", "c_busy", "Task 5 Busy")
+      roadmap.set_status("proj-abc", "c_busy", "R5", "doing")
+
+      start = unittest.mock.MagicMock(
+          side_effect=lambda enum, title, prompt, pid, before_send=None: (
+              before_send("c4") if before_send else None,
+              "c4",
+          )[1]
+      )
+      p = self.handoff_patches(tmp_dir, start)
+      with p[0], p[1], p[2], p[3], p[4], p[5]:
+        # If c1 is finalized while c_busy is still doing R5 (or c3 holds the baton),
+        # sweep_completed_project_chats does NOT sweep a live baton holder
+        roadmap.set_status("proj-abc", "c_busy", "R5", "done")
+        # Now c_busy holds the baton for R4
+        self.assertEqual(roadmap.load("proj-abc").get("baton", {}).get("conv"), "c_busy")
+        chat_lifecycle.sweep_completed_project_chats("proj-abc", finalized_cids={"c1"})
+        # c_busy (holding baton for R4) stays open ⦿ and keeps its baton
+        self.assertEqual(
+            chat_lifecycle.get_conversation_title("c_busy"), "[10:15] ⦿ R5 Still working"
+        )
+        self.assertEqual(roadmap.load("proj-abc").get("baton", {}).get("conv"), "c_busy")
+
+        # Keep R5 as doing for the next-task sweep check
+        roadmap.set_status("proj-abc", "c_busy", "R5", "doing")
+        chat_lifecycle.update_conversation_title("c2", "[10:05] ⦿ R2 Second")
+        res = chat_lifecycle.create_next_task(current_conv_id="c3", item_id="R4")
+        self.assertEqual(res["new_conversation_id"], "c4")
+        # c3 AND finished sibling chats c1, c2 are all finalized to «»
+        self.assertEqual(chat_lifecycle.get_conversation_title("c1"), "[10:00] «» R1 First")
+        self.assertEqual(chat_lifecycle.get_conversation_title("c2"), "[10:05] «» R2 Second")
+        self.assertEqual(chat_lifecycle.get_conversation_title("c3"), "[10:10] «» R3 Third")
+        # Busy sibling chat c_busy (owns doing R5) and new chat c4 remain open ⦿
+        self.assertEqual(
+            chat_lifecycle.get_conversation_title("c_busy"), "[10:15] ⦿ R5 Still working"
+        )
+        self.assertEqual(chat_lifecycle.get_conversation_title("c4"), "[15:45] ⦿ R4 Task 4 Next")
+        self.assertEqual(sorted(res["swept_sibling_chains"]), [["c1"], ["c2"]])
+        # State files for c1, c2, c3 were cleaned up
+        for cid in ("c1", "c2", "c3"):
+          self.assertFalse(os.path.exists(roadmap.state_path("proj-abc", cid)))
 
 
 if __name__ == "__main__":

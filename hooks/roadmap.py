@@ -137,6 +137,13 @@ def validate(doc: object) -> None:
   items = doc.get("items")
   if not isinstance(next_id, int) or next_id < 1 or not isinstance(items, list):
     raise RoadmapError("corrupted roadmap.json: bad next_id/items")
+  # Optional baton tracks which chat already proposed the current next todo item
+  baton = doc.get("baton")
+  if baton is not None:
+    if not isinstance(baton, dict) or not all(
+        isinstance(baton.get(k), str) and baton[k].strip() for k in ("conv", "item")
+    ):
+      raise RoadmapError("corrupted roadmap.json: bad baton")
   by_id: dict[str, dict] = {}
   for it in items:
     if not isinstance(it, dict):
@@ -287,11 +294,60 @@ def add_item(project_id: str, conv_id: str, text: str, parent: str = "") -> str:
   return _mutate(project_id, conv_id, apply)
 
 
-def set_status(project_id: str, conv_id: str, item_id: str, status: str) -> tuple[str, str]:
-  """Returns (message, ownership warning or "")."""
+# Computes the next-task baton state under the roadmap lock when an item changes status
+def _evaluate_baton(doc: dict, conv_id: str, status: str) -> str:
+  if status == "doing":
+    doc.pop("baton", None)
+    return ""
+  if status not in CLOSED_STATUSES:
+    return ""
+
+  doing_items = [it for it in doc["items"] if it["status"] == "doing"]
+  if doing_items:
+    doc.pop("baton", None)
+    active_desc = ", ".join(
+        f"{it['id']} [{it['owner'][:8]}]" if it.get("owner") else it["id"]
+        for it in doing_items
+    )
+    return (
+        f"[NEXT-TASK BATON: HOLD — {len(doing_items)} item(s) still doing"
+        f" ({active_desc}); do NOT propose next-task from this chat]"
+    )
+
+  top_todos = [
+      it for it in doc["items"] if not it.get("parent") and it["status"] == "todo"
+  ]
+  any_todos = [it for it in doc["items"] if it["status"] == "todo"]
+  next_todo = (top_todos or any_todos or [None])[0]
+  if not next_todo:
+    doc.pop("baton", None)
+    return "[NEXT-TASK BATON: ALL DONE — 0 doing, 0 todo remaining in project]"
+
+  cur_baton = doc.get("baton")
+  holder = cur_baton.get("conv", "") if isinstance(cur_baton, dict) else ""
+  held_item = cur_baton.get("item", "") if isinstance(cur_baton, dict) else ""
+  # Prevent duplicate next-task proposals when another chat already holds the baton for next_todo
+  if holder and holder != conv_id and held_item == next_todo["id"]:
+    return (
+        f"[NEXT-TASK BATON: HOLD — {next_todo['id']} is already proposed by"
+        f" conversation {holder[:8]}; do NOT propose next-task from this chat]"
+    )
+
+  doc["baton"] = {"conv": conv_id, "item": next_todo["id"]}
+  return (
+      f"[NEXT-TASK BATON: YOURS — 0 doing in project; propose next todo"
+      f" {next_todo['id']} ({next_todo['text']})]"
+  )
+
+
+# Updates item status and returns (message, ownership warning, baton notice)
+def set_status_with_baton(
+    project_id: str, conv_id: str, item_id: str, status: str
+) -> tuple[str, str, str]:
   if status not in STATUSES:
     raise RoadmapError(f"bad status '{status}' (expected {'|'.join(STATUSES)})")
-  warning = []
+  warning: list[str] = []
+  baton_notice: list[str] = []
 
   def apply(doc: dict):
     it = _find(doc, item_id)
@@ -309,10 +365,20 @@ def set_status(project_id: str, conv_id: str, item_id: str, status: str) -> tupl
     it["status"] = status
     it["owner"] = conv_id if status == "doing" else ""
     _touch(it, conv_id)
+    # Compute baton notice inside the lock so parallel chats serialize on doing == 0
+    notice = _evaluate_baton(doc, conv_id, status)
+    if notice:
+      baton_notice.append(notice)
     return f"{item_id} {status}: {it['text']}", "set", {"id": item_id, "status": status}
 
   msg = _mutate(project_id, conv_id, apply)
-  return msg, (warning[0] if warning else "")
+  return msg, (warning[0] if warning else ""), (baton_notice[0] if baton_notice else "")
+
+
+# Preserves the 2-tuple (message, warning) contract for callers that do not print baton hints
+def set_status(project_id: str, conv_id: str, item_id: str, status: str) -> tuple[str, str]:
+  msg, warn, _ = set_status_with_baton(project_id, conv_id, item_id, status)
+  return msg, warn
 
 
 def link_item(project_id: str, conv_id: str, item_id: str, chat_id: str) -> str:
@@ -446,8 +512,13 @@ def state_move(project_id: str, old_conv: str, new_conv: str) -> str:
         it["owner"] = new_conv
         _touch(it, old_conv)
         moved.append(it["id"])
+    # Transfer baton ownership along with doing items when a chain hands off
+    baton_moved = False
+    if isinstance(doc.get("baton"), dict) and doc["baton"].get("conv") == old_conv:
+      doc["baton"]["conv"] = new_conv
+      baton_moved = True
     os.replace(src, dst)
-    if moved:
+    if moved or baton_moved:
       try:
         validate(doc)
         _write_atomic(os.path.join(pdir, "roadmap.json"), doc)
@@ -457,6 +528,25 @@ def state_move(project_id: str, old_conv: str, new_conv: str) -> str:
     _journal(pdir, old_conv, "state-move", to=new_conv, items=moved)
   owned = f"; {len(moved)} doing item(s) now owned by {new_conv[:8]}" if moved else ""
   return f"state moved to {dst}{owned}"
+
+
+# Releases the next-task baton when any of the given conversations is finalized
+def clear_baton(project_id: str, conv_ids: set[str] | list[str]) -> bool:
+  if not project_id or not conv_ids:
+    return False
+  pdir = project_dir(project_id)
+  if not os.path.exists(os.path.join(pdir, "roadmap.json")):
+    return False
+  target_set = set(conv_ids)
+  with _locked(pdir):
+    doc = load(project_id)
+    baton = doc.get("baton")
+    if isinstance(baton, dict) and baton.get("conv") in target_set:
+      doc.pop("baton", None)
+      validate(doc)
+      _write_atomic(os.path.join(pdir, "roadmap.json"), doc)
+      return True
+  return False
 
 
 def _format_id_ranges(ids: list[str]) -> str:
@@ -565,10 +655,13 @@ def _cli(argv: list[str]) -> int:
     print(add_item(pid, args[0], args[1], args[3] if len(args) == 4 else ""))
   elif cmd == "set" and len(args) == 3:
     pid = require_project_id(args[0])
-    msg, warning = set_status(pid, args[0], args[1], args[2])
+    # Emit baton notice on stdout so CLI callers know whether to propose next-task
+    msg, warning, baton_notice = set_status_with_baton(pid, args[0], args[1], args[2])
     if warning:
       print(warning, file=sys.stderr)
     print(msg)
+    if baton_notice:
+      print(baton_notice)
   elif cmd == "link" and len(args) == 3:
     pid = require_project_id(args[0])
     print(link_item(pid, args[0], args[1], args[2]))
