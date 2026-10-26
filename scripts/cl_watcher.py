@@ -342,6 +342,17 @@ def get_pen_url(port: int) -> str:
   return f"http://localhost:{port}"
 
 
+_GARDENER_PEN_URL: list[str] = []
+
+
+def gardener_pen_url() -> str:
+  """Returns the Gardener dashboard PEN URL, resolved once per process."""
+  if not _GARDENER_PEN_URL:
+    port = urllib.parse.urlparse(DEFAULT_GARDENER_URL).port or 8080
+    _GARDENER_PEN_URL.append(get_pen_url(port))
+  return _GARDENER_PEN_URL[0]
+
+
 def load_project_names() -> dict[str, str]:
   res: dict[str, str] = {}
   for pfile in glob.glob(os.path.join(PROJECTS_DIR, "*.json")):
@@ -456,11 +467,86 @@ def _git_is_ancestor(skia_dir: str, ancestor_sha: str, descendant_sha: str) -> b
     return False
 
 
+def _same_commit(a: str, b: str) -> bool:
+  return bool(a) and bool(b) and (a.startswith(b[:10]) or b.startswith(a[:10]))
+
+
+def classify_incident_for_commit(
+    inc: dict[str, Any], merged_sha: str
+) -> dict[str, Any] | None:
+  """Maps a Skia Gardener incident to its verdict on `merged_sha`, or None if unrelated.
+
+  The verdict mirrors the Gardener overlay: only the incident's chosen culprit can be
+  accused, and flakes or low-confidence single-bot blames stay informational.
+  """
+  blame = inc.get("blame") or {}
+  task = inc.get("task") or {}
+  culprit = str(blame.get("commit_hash") or "")
+  is_culprit = _same_commit(culprit, merged_sha)
+  in_blamelist = any(
+      _same_commit(str(c), merged_sha) for c in task.get("commits") or []
+  )
+  if not is_culprit and not in_blamelist:
+    return None
+  affected = inc.get("affected_tasks") or []
+  is_flake = bool(inc.get("is_intermittent_flake")) or any(
+      a.get("is_intermittent_flake") for a in affected
+  )
+  is_compile = any(
+      str(a.get("classification")) in ("COMPILE_ERROR", "COMPILE_FAILURE")
+      for a in affected
+  )
+  score = int(blame.get("confidence_score") or 0)
+  low_conf = blame.get("confidence") == "Low" or 0 < score < 65
+  multi_bot = max(int(inc.get("bot_count") or 0), len(affected)) >= 2
+  # The overlay treats compile breaks and multi-bot regressions as certain even
+  # at low confidence, so only single-bot test failures are downgraded
+  if not is_culprit:
+    verdict = "blamelist"
+  elif is_flake:
+    verdict = "flake"
+  elif low_conf and not (is_compile or multi_bot):
+    verdict = "low_confidence"
+  else:
+    verdict = "blamed"
+  negatives = [
+      str(f.get("reason") or "")
+      for f in blame.get("confidence_factors") or []
+      if int(f.get("impact") or 0) < 0
+  ]
+  swarming_id = str(task.get("swarming_task_id") or "")
+  return {
+      "verdict": verdict,
+      "task_name": str(task.get("name") or "bot"),
+      "task_url": (
+          f"https://task-scheduler.skia.org/task/{task['id']}"
+          if task.get("id")
+          else ""
+      ),
+      "swarming_url": (
+          f"https://chromium-swarm.appspot.com/task?id={swarming_id}"
+          if swarming_id
+          else ""
+      ),
+      "blamelist_size": len(task.get("commits") or []),
+      "culprit_short": culprit[:7],
+      "culprit_commit_url": (
+          f"https://skia.googlesource.com/skia/+/{culprit}" if culprit else ""
+      ),
+      "culprit_cl": str(blame.get("gerrit_change_number") or ""),
+      "culprit_cl_url": str(blame.get("gerrit_url") or ""),
+      "culprit_subject": str(blame.get("subject") or ""),
+      "confidence_score": score,
+      "reason": negatives[0] if negatives else "",
+  }
+
+
 def check_skia_post_submit(
     merged_sha: str,
     rollers: dict[str, Any],
     incidents: list[dict[str, Any]],
     skia_dir: str = DEFAULT_SKIA_DIR,
+    cl_id: str = "",
 ) -> dict[str, Any]:
   """Checks Skia tree status and the 4 outgoing autorollers for a merged Skia commit."""
   res: dict[str, Any] = {
@@ -473,6 +559,7 @@ def check_skia_post_submit(
           "Google3": {"state": "⏳", "detail": "Not rolled yet"},
           "Flutter": {"state": "⏳", "detail": "Not rolled yet"},
       },
+      "incidents": [],
       "passed_rolls": 0,
       "all_passed": False,
       "has_alert": False,
@@ -482,28 +569,26 @@ def check_skia_post_submit(
   if not merged_sha:
     return res
 
-  # Check if merged_sha is blamed in any active Skia Status incident
-  blamed_tasks: list[str] = []
-  for inc in incidents:
-    blame = inc.get("blame") or {}
-    suspects = blame.get("suspects") or []
-    for susp in suspects:
-      sh = str(susp.get("hash") or "")
-      if sh and (sh.startswith(merged_sha[:10]) or merged_sha.startswith(sh[:10])):
-        tname = (inc.get("task") or {}).get("name") or "bot"
-        blamed_tasks.append(tname)
-    t_commits = (inc.get("task") or {}).get("commits") or []
-    for ch in t_commits:
-      if ch and (ch.startswith(merged_sha[:10]) or merged_sha.startswith(ch[:10])):
-        tname = (inc.get("task") or {}).get("name") or "bot"
-        if tname not in blamed_tasks:
-          blamed_tasks.append(tname)
-
-  if blamed_tasks:
+  hits = [
+      h
+      for h in (classify_incident_for_commit(inc, merged_sha) for inc in incidents)
+      if h
+  ]
+  res["incidents"] = hits
+  blamed = [h for h in hits if h["verdict"] == "blamed"]
+  if blamed:
     res["skia_status"] = "🔴"
-    res["skia_status_detail"] = f"Blamed in failing task(s): {', '.join(blamed_tasks[:2])}"
+    res["skia_status_detail"] = (
+        f"Blamed by Gardener in: {', '.join(h['task_name'] for h in blamed[:2])}"
+    )
     res["has_alert"] = True
     res["alert_reason"] = res["skia_status_detail"]
+  elif hits:
+    res["skia_status"] = "⚠️"
+    res["skia_status_detail"] = "Near a failing task, not blamed by Gardener"
+  else:
+    res["skia_status"] = "✓"
+    res["skia_status_detail"] = "Clean on status.skia.org"
 
   passed_rolls = 0
   for rname in ("Android", "Chrome", "Google3", "Flutter"):
@@ -512,36 +597,57 @@ def check_skia_post_submit(
     curr_rev = str(r.get("current_roll_rev") or "")
     num_failed = int(r.get("num_failed") or 0)
     diag = r.get("diagnosis") or {}
+    roll_url = str(r.get("url") or "")
 
     if _git_is_ancestor(skia_dir, merged_sha, last_rev):
-      res["rolls"][rname] = {"state": "✓", "detail": f"Rolled ({last_rev[:8]})"}
+      res["rolls"][rname] = {
+          "state": "✓",
+          "detail": f"Rolled ({last_rev[:8]})",
+          "url": roll_url,
+          "rev": last_rev,
+      }
       passed_rolls += 1
     elif _git_is_ancestor(skia_dir, merged_sha, curr_rev):
-      suspect_hit = False
-      for s_cl in (diag.get("in_flight_fix_cls") or []) + (diag.get("runner_up_cls") or []):
-        if isinstance(s_cl, dict) and str(s_cl.get("hash") or "").startswith(merged_sha[:8]):
-          suspect_hit = True
-      if num_failed > 0 or suspect_hit:
+      # A failing roll carries every commit in its range; accuse this one only when
+      # the Gardener puts the fault on Skia and names it, since upstream verdicts
+      # list exonerated Skia commits in the same summary text
+      summary = str(diag.get("culprit_summary") or "")
+      named = diag.get("fault_category") == "Skia" and (
+          (cl_id and cl_id in summary) or merged_sha[:7] in summary
+      )
+      if num_failed > 0 and named:
         res["rolls"][rname] = {
             "state": "🔴",
-            "detail": f"In failing roll ({curr_rev[:8]}, failed={num_failed})",
+            "detail": f"Blamed in failing roll ({curr_rev[:8]}, failed={num_failed})",
+            "url": roll_url,
+            "rev": curr_rev,
         }
         res["has_alert"] = True
         if not res["alert_reason"]:
-          res["alert_reason"] = f"{rname} roll failing with commit in range ({curr_rev[:8]})"
+          res["alert_reason"] = f"{rname} roll blames this commit ({curr_rev[:8]})"
+      elif num_failed > 0:
+        res["rolls"][rname] = {
+            "state": "🟠",
+            "detail": f"In failing roll, not blamed ({curr_rev[:8]}, failed={num_failed})",
+            "url": roll_url,
+            "rev": curr_rev,
+        }
       else:
         res["rolls"][rname] = {
             "state": "🔄",
             "detail": f"In CQ ({curr_rev[:8]})",
+            "url": roll_url,
+            "rev": curr_rev,
         }
     else:
-      res["rolls"][rname] = {"state": "⏳", "detail": "Waiting for roll window"}
+      res["rolls"][rname] = {
+          "state": "⏳",
+          "detail": "Waiting for roll window",
+          "url": roll_url,
+          "rev": "",
+      }
 
   res["passed_rolls"] = passed_rolls
-
-  if not blamed_tasks:
-    res["skia_status"] = "✓"
-    res["skia_status_detail"] = "Clean on status.skia.org"
 
   res["all_passed"] = (
       res["skia_status"] == "✓" and passed_rolls == 4 and not res["has_alert"]
@@ -657,7 +763,7 @@ def fetch_gerrit_cl_status(
       post_submit = None
       if status == "MERGED" and host == "skia-review.googlesource.com":
         post_submit = check_skia_post_submit(
-            cur_sha, rollers, incidents, skia_dir=skia_dir
+            cur_sha, rollers, incidents, skia_dir=skia_dir, cl_id=cl_id
         )
 
       if status == "ABANDONED":
@@ -696,6 +802,11 @@ def fetch_gerrit_cl_status(
           "is_external": is_external,
           "patchset": ps_num,
           "revision": cur_sha,
+          "commit_url": (
+              f"https://{host.replace('-review', '')}/{d.get('project')}/+/{cur_sha}"
+              if status == "MERGED" and d.get("project")
+              else ""
+          ),
           "in_my_attention": in_my_attention,
           "cr_summary": (
               f"+{max_cr}" if max_cr > 0 else (str(min_cr) if min_cr < 0 else "0")
@@ -818,6 +929,9 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         "is_external": not is_self,
         "patchset": len(reviews) + 1,
         "revision": head_sha[:10],
+        "commit_url": (
+            f"https://github.com/flutter/flutter/commit/{head_sha}" if head_sha else ""
+        ),
         "in_my_attention": phase in ("NEEDS_YOUR_ACTION", "ALERT_CQ_FAILED"),
         "cr_summary": f"{len(reviews)} rev",
         "cq_status": cq_status,
@@ -1087,6 +1201,19 @@ def sync_once(
             f"Ask the user if we should finalize this chat."
         )
       elif (
+          prev_phase == "ALERT_ROLL_OR_STATUS"
+          and info["phase"] != "ALERT_ROLL_OR_STATUS"
+      ):
+        # An earlier critical wakeup must be withdrawn explicitly, or the chat keeps
+        # chasing a culprit the Gardener no longer names. It sits below the all-rolls
+        # branch so that branch still archives Gmail when both happen in one sync
+        transition_msg = (
+            f"[CL-WATCHER] ✅ Alert withdrawn for {ikey} ({info['revision'][:10]}): "
+            f"Skia Gardener does not blame this commit "
+            f"({post.get('skia_status_detail') or 'no matching incident'}). "
+            f"Disregard the earlier CRITICAL ALERT."
+        )
+      elif (
           info["status"] in ("NEW", "OPEN")
           and (info["patchset"] != prev_ps or info["last_msg_date"] != prev_msg_date)
           and info["last_msg_author"] not in SELF_EMAILS
@@ -1124,10 +1251,12 @@ def sync_once(
   state["items"] = new_items
   state["events"] = events
   state["last_sync"] = now_et_str()
+  state["gardener_url"] = gardener_pen_url()
   state["rollers_summary"] = {
       k: {
-          "last_roll_rev": (v.get("last_roll_rev") or "")[:10],
-          "current_roll_rev": (v.get("current_roll_rev") or "")[:10],
+          "last_roll_rev": v.get("last_roll_rev") or "",
+          "current_roll_rev": v.get("current_roll_rev") or "",
+          "url": v.get("url") or "",
           "num_failed": v.get("num_failed", 0),
           "num_behind": v.get("num_behind", 0),
           "badge": (v.get("diagnosis") or {}).get("fault_badge", ""),
@@ -1453,21 +1582,53 @@ function testNotification() {
   );
 }
 
+function link(url, html) {
+  return url ? `<a href="${esc(url)}" target="_blank" rel="noopener">${html}</a>` : html;
+}
+
+// Maps a Gerrit email, GitHub login, or Piper LDAP to the page that profiles that person
+function actorUrl(it, raw) {
+  const s = String(raw || '');
+  if (!s || s === 'bot' || shortActor(s) === 'SkCQ') return '';
+  if (it.kind === 'github') return `https://github.com/${encodeURIComponent(s)}`;
+  if (s.endsWith('@google.com')) {
+    return `https://moma.corp.google.com/person/${encodeURIComponent(s.split('@')[0])}`;
+  }
+  if (it.kind === 'piper') return `https://moma.corp.google.com/person/${encodeURIComponent(s)}`;
+  if (s.includes('@') && it.host) return `https://${it.host}/q/owner:${encodeURIComponent(s)}`;
+  return '';
+}
+
+function actorHtml(it, raw) {
+  return link(actorUrl(it, raw), `<code>${esc(shortActor(raw))}</code>`);
+}
+
+function checksUrl(it) {
+  if (it.kind === 'github') return `${it.url}/checks`;
+  if (it.kind === 'gerrit') return `${it.url}?tab=checks`;
+  return it.url;
+}
+
+function commitUrl(sha) {
+  return sha ? `https://skia.googlesource.com/skia/+/${sha}` : '';
+}
+
 function formatAuthorAndCl(it) {
   let label = `CL ${esc(it.target_id)}`;
   if (it.kind === 'github') label = `PR #${esc(it.target_id)}`;
   else if (it.kind === 'piper') label = `cl/${esc(it.target_id)}`;
 
-  const who = esc(shortActor(it.owner_email || it.owner_name));
+  const who = actorHtml(it, it.owner_email || it.owner_name);
   let roleDesc = '';
   if (it.is_self) {
-    roleDesc = `<code>${who}</code> — your CL`;
+    roleDesc = `${who} — your CL`;
   } else if (it.is_external) {
-    roleDesc = `<code>${who}</code> — external author`;
+    roleDesc = `${who} — external author`;
   } else {
-    roleDesc = `<code>${who}</code> — colleague`;
+    roleDesc = `${who} — colleague`;
   }
-  return `<strong><a href="${esc(it.url)}" target="_blank">${label}</a></strong> (${roleDesc})<br><em>${esc(it.subject)}</em>`;
+  const subject = link(it.url, `<em>${esc(it.subject)}</em>`);
+  return `<strong>${link(it.url, label)}</strong> (${roleDesc})<br>${subject}`;
 }
 
 function formatGerritStatusCell(it) {
@@ -1476,35 +1637,69 @@ function formatGerritStatusCell(it) {
     const post = it.post_submit;
     const isDone = !post || post.all_passed;
     const icon = (post && post.has_alert) ? '🔴' : (isDone ? '🏁' : '🟢');
-    const shaShort = esc((it.revision || '').slice(0, 10));
+    const sha = link(it.commit_url, `<code>${esc((it.revision || '').slice(0, 10))}</code>`);
     let timeLine = '';
     if (it.submitted_et) {
       const agePart = it.submitted_age ? ` (${esc(it.submitted_age)})` : '';
-      timeLine = `Submitted ${esc(it.submitted_et)}${agePart}, commit <code>${shaShort}</code>.`;
+      timeLine = `Submitted ${esc(it.submitted_et)}${agePart}, commit ${sha}.`;
     } else {
-      timeLine = `Submitted, commit <code>${shaShort}</code>.`;
+      timeLine = `Submitted, commit ${sha}.`;
     }
-    return `${icon} <strong><code>MERGED</code> (${ps})</strong><br><span class="muted">${timeLine}</span>`;
+    return `${icon} <strong>${link(it.url, '<code>MERGED</code>')} (${ps})</strong>` +
+      `<br><span class="muted">${timeLine}</span>`;
   }
 
   if (it.status === 'ABANDONED' || it.status === 'CLOSED') {
-    return `⚪ <strong><code>${esc(it.status)}</code> (${ps})</strong>`;
+    return `⚪ <strong>${link(it.url, `<code>${esc(it.status)}</code>`)} (${ps})</strong>`;
   }
 
   // Active NEW / OPEN CL or PR
   const lastWho = esc(shortActor(it.last_msg_author));
+  const lastWhoHtml = actorHtml(it, it.last_msg_author);
+  const statusHtml = link(it.url, `<code>${esc(it.status)}</code>`);
+  const cqHtml = link(checksUrl(it), esc(it.cq_status));
+  const snippetHtml = link(it.url, esc(it.last_msg_snippet));
   if (it.cq_failed) {
-    return `🔴 <strong><code>${esc(it.status)}</code> (${ps} · ${esc(it.cq_status)})</strong><br><span class="muted">Latest from <code>${lastWho}</code>: ${esc(it.last_msg_snippet)}</span>`;
+    return `🔴 <strong>${statusHtml} (${ps} · ${cqHtml})</strong>` +
+      `<br><span class="muted">Latest from ${lastWhoHtml}: ${snippetHtml}</span>`;
   }
   if (it.phase === 'SUBMITTING') {
     const agePart = it.last_msg_age ? ` (${esc(it.last_msg_age)})` : '';
-    return `🟡 <strong><code>${esc(it.status)}</code> (${ps} in CQ+2)</strong><br><span class="muted">Submitted to CQ${agePart}, running <code>SkCQ</code>.</span>`;
+    const skcq = link(checksUrl(it), '<code>SkCQ</code>');
+    return `🟡 <strong>${statusHtml} (${ps} in CQ+2)</strong>` +
+      `<br><span class="muted">Submitted to CQ${agePart}, running ${skcq}.</span>`;
   }
   if (it.in_my_attention && !(it.is_self && lastWho === 'SkCQ')) {
     const agePart = it.last_msg_age ? ` (${esc(it.last_msg_age)})` : '';
-    return `⚡ <strong><code>${esc(it.status)}</code> (${ps} · needs your reply)</strong><br><span class="muted">CR: ${esc(it.cr_summary)} · ${esc(it.cq_status)}. From <code>${lastWho}</code>${agePart}: ${esc(it.last_msg_snippet)}</span>`;
+    return `⚡ <strong>${statusHtml} (${ps} · needs your reply)</strong><br>` +
+      `<span class="muted">CR: ${esc(it.cr_summary)} · ${cqHtml}. ` +
+      `From ${lastWhoHtml}${agePart}: ${snippetHtml}</span>`;
   }
-  return `⏸️ <strong><code>${esc(it.status)}</code> (${ps})</strong><br><span class="muted">In progress (CR: ${esc(it.cr_summary)} · ${esc(it.cq_status)}).</span>`;
+  return `⏸️ <strong>${statusHtml} (${ps})</strong>` +
+    `<br><span class="muted">In progress (CR: ${esc(it.cr_summary)} · ${cqHtml}).</span>`;
+}
+
+const INCIDENT_VERDICT_LABEL = {
+  blamed: '🔴 blamed',
+  flake: '⚪ flake',
+  low_confidence: '⚠️ low-confidence suspect',
+  blamelist: '⚪ in blamelist only'
+};
+
+function formatIncidentLine(h) {
+  const task = link(h.task_url, `<code>${esc(h.task_name)}</code>`);
+  const swarm = h.swarming_url ? ` ${link(h.swarming_url, 'log')}` : '';
+  let culprit = '';
+  if (h.verdict === 'blamelist' && h.culprit_short) {
+    const cl = h.culprit_cl ? link(h.culprit_cl_url, `CL ${esc(h.culprit_cl)}`) : '';
+    const sha = link(h.culprit_commit_url, `<code>${esc(h.culprit_short)}</code>`);
+    culprit = `; Gardener culprit: ${sha} ${cl}`;
+  } else if (h.confidence_score) {
+    culprit = ` (${h.confidence_score}%)`;
+  }
+  const why = h.reason ? `<br><span class="muted">${esc(h.reason)}</span>` : '';
+  const label = INCIDENT_VERDICT_LABEL[h.verdict] || esc(h.verdict);
+  return `<div>${label}: ${task}${swarm}${culprit}${why}</div>`;
 }
 
 function formatRollsCell(it) {
@@ -1518,20 +1713,36 @@ function formatRollsCell(it) {
   if (!ps) {
     return `<strong><code>✓ Merged</code></strong>`;
   }
+  const statusLink = (html) => link('https://status.skia.org/repo/skia', html);
   if (ps.all_passed) {
-    return `<strong><code>✓Status · ✓And ✓Chr ✓G3 ✓Flt</code></strong><br><span class="muted">(all 4/4 rolls passed!)</span>`;
+    return `<strong><code>${statusLink('✓Status')} · ✓And ✓Chr ✓G3 ✓Flt</code></strong>` +
+      `<br><span class="muted">(all 4/4 rolls passed!)</span>`;
   }
   const r = ps.rolls || {};
-  const andSt = (r.Android || {}).state || '⏳';
-  const chrSt = (r.Chrome || {}).state || '⏳';
-  const g3St = (r.Google3 || {}).state || '⏳';
-  const fltSt = (r.Flutter || {}).state || '⏳';
+  const rollHtml = (name, label) => {
+    const x = r[name] || {};
+    return link(x.url, `<code title="${esc(x.detail || '')}">${label}: ${x.state || '⏳'}</code>`);
+  };
   const cnt = ps.passed_rolls ?? 0;
-  let header = `<code>${ps.skia_status}Status · ${cnt}/4 rolls</code>`;
+  let header = `<code>${statusLink(`${esc(ps.skia_status)}Status`)} · ${cnt}/4 rolls</code>`;
   if (ps.has_alert) {
-    header = `<strong style="color:var(--danger-text)"><code>🔴 ${esc(ps.alert_reason || 'Roll/Status Alert')}</code></strong>`;
+    const reason = `<code>🔴 ${esc(ps.alert_reason || 'Roll/Status Alert')}</code>`;
+    header = `<strong style="color:var(--danger-text)">${statusLink(reason)}</strong>`;
   }
-  return `${header}<br><span class="muted">(<code>Android: ${andSt}</code>, <code>Chrome: ${chrSt}</code>, <code>G3: ${g3St}</code>, <code>Flutter: ${fltSt}</code>)</span>`;
+  const incidents = (ps.incidents || []).map(formatIncidentLine).join('');
+  const gardener = cachedData && cachedData.gardener_url
+    ? ` · ${link(cachedData.gardener_url, 'Gardener')}`
+    : '';
+  const rolls = [['Android', 'Android'], ['Chrome', 'Chrome'], ['Google3', 'G3'],
+    ['Flutter', 'Flutter']].map(([name, label]) => rollHtml(name, label)).join(', ');
+  const incidentsHtml = incidents
+    ? `<div class="muted" style="margin-top:4px">${incidents}</div>`
+    : '';
+  return `${header}<br><span class="muted">(${rolls})${gardener}</span>${incidentsHtml}`;
+}
+
+function gmailThreadUrl(tid) {
+  return `https://mail.google.com/mail/u/0/#all/${encodeURIComponent(tid)}`;
 }
 
 function formatGmailCell(it) {
@@ -1542,11 +1753,14 @@ function formatGmailCell(it) {
   const inb = g.inbox_msgs || 0;
   const tr = g.trash_msgs || 0;
 
+  const searchUrl = 'https://mail.google.com/mail/u/0/#search/' +
+    encodeURIComponent('in:anywhere ' + it.target_id);
   if (tids.length === 0) {
-    return `<span class="muted">No threads</span>`;
+    return `<span class="muted">${link(searchUrl, 'No threads')}</span>`;
   }
-  const firstTid = esc(tids[0]);
-  const tidLabel = tids.length === 1 ? `Thread <code>${firstTid}</code>` : `Threads <code>${firstTid}</code> (+${tids.length - 1})`;
+  const firstTid = link(gmailThreadUrl(tids[0]), `<code>${esc(tids[0])}</code>`);
+  const more = tids.length > 1 ? ` (${link(searchUrl, `+${tids.length - 1}`)})` : '';
+  const tidLabel = `${tids.length === 1 ? 'Thread' : 'Threads'} ${firstTid}${more}`;
 
   if (inb > 0) {
     const trashPart = tr > 0 ? `${tr} in <code>TRASH</code>, ` : '';
@@ -1634,8 +1848,19 @@ function renderFromCache() {
     ['Android', 'Chrome', 'Google3', 'Flutter'].map(name => {
       const r = rsum[name] || {};
       const icon = (r.num_failed > 0) ? '🔴' : '🟢';
-      return `<span>${icon} <strong>${name}</strong>: <code>${esc(r.last_roll_rev || '—')}</code> (behind: ${r.num_behind ?? 0})</span>`;
-    }).join('');
+      const rev = r.last_roll_rev
+        ? link(commitUrl(r.last_roll_rev), `<code>${esc(r.last_roll_rev.slice(0, 10))}</code>`)
+        : '<code>—</code>';
+      const inFlight = r.current_roll_rev
+        ? `, rolling ${link(commitUrl(r.current_roll_rev),
+            `<code>${esc(r.current_roll_rev.slice(0, 7))}</code>`)}`
+        : '';
+      const behind = `behind: ${r.num_behind ?? 0}${inFlight}`;
+      return `<span>${icon} <strong>${link(r.url, name)}</strong>: ${rev} (${behind})</span>`;
+    }).join('') +
+    `<span>${link('https://status.skia.org/repo/skia', 'status.skia.org')}` +
+    (data.gardener_url ? ` · ${link(data.gardener_url, 'Skia Gardener')}` : '') +
+    `</span>`;
 
   const allItems = Object.values(data.items || {});
   const prio = {
