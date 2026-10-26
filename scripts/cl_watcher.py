@@ -78,6 +78,12 @@ RE_AUTOROLL_SUBJECT = re.compile(
     r"^Roll\s+(?:Skia\b|\S+\s+from\s+[0-9a-f]{7,40}\s+to\s+[0-9a-f]{7,40}\b)",
     re.IGNORECASE,
 )
+# Match explicit WIP/Draft prefixes in CL and PR subjects, after optional [module] tags
+RE_DRAFT_SUBJECT = re.compile(
+    r"^(?:\[(?!wip\]|draft\])[^\]]+\]\s*)*"
+    r"(?:\[(?:wip|draft)\]\s*|wip\b[:\s\-]*|draft\s*[:\-]\s*)",
+    re.IGNORECASE,
+)
 
 _GMAIL_TOKEN_CACHE: dict[str, Any] = {"access_token": "", "expires_at": 0.0}
 _GMAIL_LOCK = threading.Lock()
@@ -814,6 +820,31 @@ def fetch_gerrit_cl_status(
       if reviewer_removed:
         in_my_attention = False
         waiting_on = []
+      reviewer_accounts = (d.get("reviewers") or {}).get("REVIEWER") or []
+      # Exclude the owner and service accounts when checking whether review has started
+      non_owner_reviewers = [
+          str(r.get("email") or r.get("name") or "")
+          for r in reviewer_accounts
+          if isinstance(r, dict)
+          and str(r.get("email") or "") != owner_email
+          and not (is_self and str(r.get("email") or "") in SELF_EMAILS)
+          and not str(r.get("email") or "").endswith(".gserviceaccount.com")
+          and (r.get("email") or r.get("name"))
+      ]
+      is_draft = status == "NEW" and (
+          bool(d.get("work_in_progress"))
+          or bool(RE_DRAFT_SUBJECT.match(subject))
+      )
+      in_development = (
+          status == "NEW"
+          and not is_draft
+          and not reviewer_removed
+          and not non_owner_reviewers
+      )
+      # Draft and unreviewed CLs keep the owner in attention_set without needing a reply
+      if is_draft or in_development:
+        in_my_attention = False
+        waiting_on = []
       merge_conflict = status == "NEW" and not gerrit_mergeable(host, cl_id)
 
       labels = d.get("labels") or {}
@@ -912,6 +943,8 @@ def fetch_gerrit_cl_status(
           "role": role,
           "is_self": is_self,
           "is_external": is_external,
+          "is_draft": is_draft,
+          "in_development": in_development,
           "reviewer_removed": reviewer_removed,
           "removed_at": removed_at,
           "patchset": ps_num,
@@ -957,7 +990,7 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
             "--repo",
             "flutter/flutter",
             "--json",
-            "number,title,state,author,mergedAt,headRefOid,reviews,comments,"
+            "number,title,state,isDraft,author,mergedAt,headRefOid,reviews,comments,"
             # Include commits so author pushes after a review update the PR timeline
             "commits,statusCheckRollup,url,mergeable,reviewRequests",
         ],
@@ -967,10 +1000,40 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
     )
     d = json.loads(out)
     state = str(d.get("state") or "OPEN")
+    subject = str(d.get("title") or f"PR #{pr_id}")
     author_login = str((d.get("author") or {}).get("login") or "")
     is_self = author_login in SELF_GITHUB_LOGINS
     role = "author" if is_self else "reviewer"
     head_sha = str(d.get("headRefOid") or "")
+    is_draft = state == "OPEN" and (
+        bool(d.get("isDraft")) or bool(RE_DRAFT_SUBJECT.match(subject))
+    )
+    req_logins = [
+        str(r.get("login") or r.get("name") or "")
+        for r in d.get("reviewRequests") or []
+        if r.get("login") or r.get("name")
+    ]
+    rev_logins = [
+        str((r.get("author") or {}).get("login") or "")
+        for r in d.get("reviews") or []
+    ]
+    cmt_logins = [
+        str((c.get("author") or {}).get("login") or "")
+        for c in d.get("comments") or []
+    ]
+    # Automated bot reviews do not mean a PR has been sent to a human reviewer
+    human_reviewers = [
+        u
+        for u in [*req_logins, *rev_logins, *cmt_logins]
+        if u
+        and u != author_login
+        and not (is_self and u in SELF_GITHUB_LOGINS)
+        and u not in GITHUB_STATUS_BOTS
+        and u != "gemini-code-assist"
+        and not u.endswith("[bot]")
+        and not u.endswith("-bot")
+    ]
+    in_development = state == "OPEN" and not is_draft and not human_reviewers
 
     checks = d.get("statusCheckRollup") or []
     merge_conflict = str(d.get("mergeable") or "") == "CONFLICTING"
@@ -1062,7 +1125,13 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
       phase = "ABANDONED"
     elif failed_checks:
       phase = "ALERT_CQ_FAILED"
-    elif last_actor and last_actor not in SELF_GITHUB_LOGINS:
+    # Bot reviews on a draft or unreviewed PR do not require a review reply
+    elif (
+        not is_draft
+        and not in_development
+        and last_actor
+        and last_actor not in SELF_GITHUB_LOGINS
+    ):
       phase = "NEEDS_YOUR_ACTION"
     else:
       phase = "WAITING_ON_OTHERS"
@@ -1075,12 +1144,14 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         ),
         "status": state,
         "phase": phase,
-        "subject": str(d.get("title") or f"PR #{pr_id}"),
+        "subject": subject,
         "owner_name": author_login,
         "owner_email": author_login,
         "role": role,
         "is_self": is_self,
         "is_external": not is_self,
+        "is_draft": is_draft,
+        "in_development": in_development,
         "patchset": len(reviews) + 1,
         "revision": head_sha[:10],
         "commit_url": (
@@ -1138,6 +1209,19 @@ def fetch_piper_cl_status(cl_id: str) -> dict[str, Any]:
       if line.strip():
         desc_lines.append(line.strip())
     subject = desc_lines[0] if desc_lines else f"cl/{cl_id}"
+    # Parse R= tags to detect whether any non-owner reviewer is assigned in Critique
+    reviewers = []
+    for line in desc_lines:
+      m_rev = re.match(r"^R=(.+)$", line)
+      if m_rev:
+        reviewers.extend(
+            r.strip()
+            for r in m_rev.group(1).split(",")
+            if r.strip() and r.strip() != owner
+        )
+    is_open = status != "SUBMITTED"
+    is_draft = is_open and bool(RE_DRAFT_SUBJECT.match(subject))
+    in_development = is_open and not is_draft and not reviewers
     phase = "READY_TO_CLOSE" if status == "SUBMITTED" else "WAITING_ON_OTHERS"
     return {
         "ok": True,
@@ -1151,6 +1235,8 @@ def fetch_piper_cl_status(cl_id: str) -> dict[str, Any]:
         "role": "author" if is_self else "reviewer (goog)",
         "is_self": is_self,
         "is_external": False,
+        "is_draft": is_draft,
+        "in_development": in_development,
         "patchset": 1,
         "revision": cl_id,
         "in_my_attention": False,
@@ -1984,7 +2070,8 @@ function statusNotesHtml(it) {
   if (it.merge_conflict) {
     notes += '<div style="color:var(--danger-text)">⛔ Merge conflict: rebase needed</div>';
   }
-  if (it.tree_red) {
+  // Draft and unreviewed PRs are not waiting on tree status to land
+  if (it.tree_red && !it.is_draft && !it.in_development) {
     notes += `<div class="muted">🌲 ${link(FLUTTER_DASHBOARD_URL, 'flutter/flutter tree')} ` +
       'is red; landing waits for it</div>';
   }
@@ -2018,9 +2105,10 @@ function statusCoreHtml(it) {
     return `⚪ <strong>${link(it.url, `<code>${esc(it.status)}</code>`)} (${ps})</strong>`;
   }
 
-  // Active NEW / OPEN CL or PR
+  // Active NEW / OPEN CL or PR; show DRAFT/WIP badge when explicitly in draft
   const lastWhoHtml = actorHtml(it, it.last_msg_author);
-  const statusHtml = link(it.url, `<code>${esc(it.status)}</code>`);
+  const badgeLabel = it.is_draft ? (it.kind === 'github' ? 'DRAFT' : 'WIP') : it.status;
+  const statusHtml = link(it.url, `<code>${esc(badgeLabel)}</code>`);
   const cqHtml = link(checksUrl(it), esc(it.cq_status));
   const snippetHtml = link(it.url, esc(it.last_msg_snippet));
   if (it.cq_failed) {
@@ -2039,14 +2127,24 @@ function statusCoreHtml(it) {
       `<span class="muted">CR: ${esc(it.cr_summary)} · ${cqHtml}. ` +
       `From ${lastWhoHtml}${agePart}: ${snippetHtml}</span>`;
   }
+  // Separate draft, unreviewed development, and active review states
+  if (it.is_draft) {
+    return `📝 <strong>${statusHtml} (${ps})</strong>` +
+      `<br><span class="muted">In draft (CR: ${esc(it.cr_summary)} · ${cqHtml}).</span>`;
+  }
+  if (it.in_development) {
+    return `🛠️ <strong>${statusHtml} (${ps})</strong>` +
+      `<br><span class="muted">In development — no reviewers yet (${cqHtml}).</span>`;
+  }
   return `⏸️ <strong>${statusHtml} (${ps})</strong>` +
-    `<br><span class="muted">In progress (CR: ${esc(it.cr_summary)} · ${cqHtml}).</span>`;
+    `<br><span class="muted">In review (CR: ${esc(it.cr_summary)} · ${cqHtml}).</span>`;
 }
 
 // One predicate drives both the ⚡ badge and the sort, so the top rows are exactly the
 // ⚡ ones. A bot message on my own CL keeps me in the attention set but asks nothing
 function needsMyReply(it) {
   return Boolean(it.in_my_attention) && !it.cq_failed && it.phase !== 'SUBMITTING' &&
+    !it.is_draft && !it.in_development &&
     !(it.is_self && shortActor(it.last_msg_author) === 'SkCQ');
 }
 
@@ -2061,6 +2159,7 @@ const STATUSES = [
   {id: 'tree', label: '🌲 Tree red'},
   {id: 'cq', label: '⏳ CQ running'},
   {id: 'waiting', label: '⏸ Waiting on others'},
+  {id: 'draft', label: '📝 Draft / dev'},
   {id: 'merged', label: '🟢 Merged'},
   {id: 'old', label: '📦 OLD'},
   {id: 'abandoned', label: '⚪ Abandoned'},
@@ -2073,18 +2172,17 @@ function isAlert(it) {
 // Alerts count as needing me even on merged CLs, since a blamed commit needs a reaction
 function statusOf(it) {
   if (isAlert(it) || needsMyReply(it)) return 'attention';
-  if (it.status === 'NEW' || it.status === 'OPEN') {
-    // A conflict needs my rebase now; a red tree clears by itself, so it comes second
-    if (it.merge_conflict) return 'conflict';
-    if (it.tree_red) return 'tree';
-  }
   if (it.status === 'ABANDONED' || it.status === 'CLOSED') return 'abandoned';
   if (it.status === 'MERGED') {
     const ageDays = (Date.now() / 1000 - (it.submitted_ts || 0)) / 86400;
     return ageDays > OLD_MERGED_DAYS ? 'old' : 'merged';
   }
+  // A conflict needs my rebase now; active CQ runs precede draft/dev and red tree
+  if (it.merge_conflict) return 'conflict';
   const cq = String(it.cq_status || '');
   if (it.phase === 'SUBMITTING' || cq.startsWith('CQ+') || cq.includes('running')) return 'cq';
+  if (it.is_draft || it.in_development) return 'draft';
+  if (it.tree_red) return 'tree';
   return 'waiting';
 }
 
@@ -2119,11 +2217,22 @@ function formatIncidentLine(h) {
 }
 
 function formatRollsCell(it) {
+  // Abandoned and closed changes never roll post-submit
+  if (it.status === 'ABANDONED' || it.status === 'CLOSED') {
+    return `<span class="muted">—</span>`;
+  }
   if (it.status !== 'MERGED') {
     if (it.phase === 'SUBMITTING') {
       return `Waiting for submit`;
     }
-    return `<span class="muted">In review / development</span>`;
+    // Distinguish pre-submit draft, unreviewed development, and active review
+    if (it.is_draft) {
+      return `<span class="muted">In draft</span>`;
+    }
+    if (it.in_development) {
+      return `<span class="muted">In development</span>`;
+    }
+    return `<span class="muted">In review</span>`;
   }
   const ps = it.post_submit;
   if (!ps) {
