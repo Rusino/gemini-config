@@ -1138,6 +1138,18 @@ def sync_once(
         "gmail": gstat,
         "composite_key": composite_key,
         "updated_at": now_et_str(),
+        # Sort key for rows in the same status group: newest review or submit event
+        "activity_ts": max(
+            (
+                dt.timestamp()
+                for dt in (
+                    parse_gerrit_or_iso_time(info.get("last_msg_date") or ""),
+                    parse_gerrit_or_iso_time(info.get("submitted") or ""),
+                )
+                if dt
+            ),
+            default=0.0,
+        ),
     }
 
     prev = prev_items.get(composite_key) or {}
@@ -1654,7 +1666,6 @@ function formatGerritStatusCell(it) {
   }
 
   // Active NEW / OPEN CL or PR
-  const lastWho = esc(shortActor(it.last_msg_author));
   const lastWhoHtml = actorHtml(it, it.last_msg_author);
   const statusHtml = link(it.url, `<code>${esc(it.status)}</code>`);
   const cqHtml = link(checksUrl(it), esc(it.cq_status));
@@ -1669,7 +1680,7 @@ function formatGerritStatusCell(it) {
     return `🟡 <strong>${statusHtml} (${ps} in CQ+2)</strong>` +
       `<br><span class="muted">Submitted to CQ${agePart}, running ${skcq}.</span>`;
   }
-  if (it.in_my_attention && !(it.is_self && lastWho === 'SkCQ')) {
+  if (needsMyReply(it)) {
     const agePart = it.last_msg_age ? ` (${esc(it.last_msg_age)})` : '';
     return `⚡ <strong>${statusHtml} (${ps} · needs your reply)</strong><br>` +
       `<span class="muted">CR: ${esc(it.cr_summary)} · ${cqHtml}. ` +
@@ -1677,6 +1688,24 @@ function formatGerritStatusCell(it) {
   }
   return `⏸️ <strong>${statusHtml} (${ps})</strong>` +
     `<br><span class="muted">In progress (CR: ${esc(it.cr_summary)} · ${cqHtml}).</span>`;
+}
+
+// One predicate drives both the ⚡ badge and the sort, so the top rows are exactly the
+// ⚡ ones. A bot message on my own CL keeps me in the attention set but asks nothing
+function needsMyReply(it) {
+  return Boolean(it.in_my_attention) && !it.cq_failed && it.phase !== 'SUBMITTING' &&
+    !(it.is_self && shortActor(it.last_msg_author) === 'SkCQ');
+}
+
+// Lower rank sorts first: what needs me, then open work, then finished work. Alerts
+// come first even on merged CLs, since a blamed commit needs a reaction
+function sortRank(it) {
+  if ((it.phase || '').startsWith('ALERT_')) return 0;
+  if (needsMyReply(it)) return 1;
+  if (it.status === 'MERGED') return it.phase === 'READY_TO_CLOSE' ? 6 : 5;
+  if (it.status === 'ABANDONED' || it.status === 'CLOSED') return 4;
+  if (it.phase === 'SUBMITTING') return 3;
+  return 2;
 }
 
 const INCIDENT_VERDICT_LABEL = {
@@ -1863,17 +1892,8 @@ function renderFromCache() {
     `</span>`;
 
   const allItems = Object.values(data.items || {});
-  const prio = {
-    'ALERT_ROLL_OR_STATUS': 0,
-    'ALERT_CQ_FAILED': 1,
-    'SUBMITTING': 2,
-    'POST_SUBMIT_ROLLING': 3,
-    'NEEDS_YOUR_ACTION': 4,
-    'WAITING_ON_OTHERS': 5,
-    'READY_TO_CLOSE': 6,
-    'ABANDONED': 7
-  };
-  allItems.sort((a, b) => (prio[a.phase] ?? 9) - (prio[b.phase] ?? 9));
+  allItems.sort((a, b) =>
+    sortRank(a) - sortRank(b) || (b.activity_ts || 0) - (a.activity_ts || 0));
 
   document.getElementById('total-count').textContent = allItems.length;
 
