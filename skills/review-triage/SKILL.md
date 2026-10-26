@@ -130,6 +130,14 @@ For every targeted single-CL review in `🔴 SURGICAL AUDIT / CORE DOMAIN` (and 
 
 ---
 
+## Skia Canary Recommendation (Others' Skia CLs)
+
+For surviving Skia CLs in `🔴 SURGICAL AUDIT` or `🟠 PUSHBACK`, run
+[`skia-canary-advisor`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/skia-canary-advisor/SKILL.md)
+(`canary_advisor.py advise --cl <N>`). Never trigger canaries on someone else's CL; if STRONG
+canaries remain after the `AGENT TODO` google3 checks, add a draft comment asking the author to run
+them, naming the symbol/guard and usage evidence.
+
 ## Report Contract: Execution Ledger & Finding Statuses
 
 Every review report (chat summary or artifact) must make skipped work visible. The Stop hook
