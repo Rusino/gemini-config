@@ -958,7 +958,8 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
             "flutter/flutter",
             "--json",
             "number,title,state,author,mergedAt,headRefOid,reviews,comments,"
-            "statusCheckRollup,url,mergeable,reviewRequests",
+            # Include commits so author pushes after a review update the PR timeline
+            "commits,statusCheckRollup,url,mergeable,reviewRequests",
         ],
         stderr=subprocess.STDOUT,
         text=True,
@@ -1027,6 +1028,25 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
             str((c.get("author") or {}).get("login") or ""),
             str(c.get("body") or "").strip(),
         ))
+    # Subsequent commits address earlier review feedback on the PR timeline
+    for cm in d.get("commits") or []:
+      cm_date = str(cm.get("committedDate") or cm.get("authoredDate") or "")
+      if not cm_date:
+        continue
+      cm_authors = cm.get("authors") or []
+      cm_actor = author_login
+      for ca in cm_authors:
+        if not isinstance(ca, dict):
+          continue
+        ca_login = str(ca.get("login") or "")
+        ca_email = str(ca.get("email") or "")
+        if ca_login in SELF_GITHUB_LOGINS or ca_email in SELF_EMAILS:
+          cm_actor = ca_login if ca_login in SELF_GITHUB_LOGINS else "Rusino"
+          break
+        if ca_login:
+          cm_actor = ca_login
+      headline = str(cm.get("messageHeadline") or cm.get("oid") or "").strip()
+      events.append((cm_date, cm_actor, f"[COMMIT] {headline}".strip()))
     if events:
       events.sort(key=lambda x: x[0])
       last_date, last_actor, last_snippet = events[-1]
