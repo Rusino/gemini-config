@@ -1473,19 +1473,43 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     flex-wrap: wrap;
     gap: 6px;
   }
-  details.fold {
-    margin: -8px 0 16px 0;
+  .filter-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
   }
-  details.fold > summary {
-    cursor: pointer;
+  .filter-row .project-tabs {
+    margin-bottom: 0;
+  }
+  .filter-label {
+    width: 56px;
     color: var(--muted);
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+  button.seg {
     font-size: 13px;
-    padding: 4px 0;
+    padding: 6px 12px;
   }
-  details.fold[open] > summary {
-    margin-bottom: 8px;
+  button.chip {
+    border-radius: 999px;
+    padding: 2px 10px;
+    font-size: 12px;
+    background: transparent;
   }
-  .col-chat { width: 21%; }
+  button.chip.active-tab {
+    background: var(--link);
+  }
+  button.empty:not(.active-tab) {
+    opacity: 0.45;
+  }
+  button .count {
+    font-variant-numeric: tabular-nums;
+    opacity: 0.8;
+  }
+  .col-chat { width: 21%; }  .col-chat { width: 21%; }
   .col-cl { width: 25%; }
   .col-gerrit { width: 20%; }
   .col-rolls { width: 17%; }
@@ -1509,14 +1533,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 <div class="rollers-inline" id="rollers-bar"></div>
 
-<div class="project-tabs" id="project-tabs"></div>
+<div class="filter-row">
+  <span class="filter-label">Status</span>
+  <div class="project-tabs" id="status-tabs"></div>
+</div>
+<div class="filter-row">
+  <span class="filter-label">Project</span>
+  <div class="project-tabs" id="project-tabs"></div>
+</div>
 
 <div id="tables-container"></div>
 
 <script>
 let cachedData = null;
-let selectedProject = 'SkParagraph';
-let initialProjectPicked = false;
+let selectedProject = 'ALL';
+let selectedStatus = 'attention';
 let seenEventIds = new Set();
 let initialLoadDone = false;
 
@@ -1709,15 +1740,42 @@ function needsMyReply(it) {
     !(it.is_self && shortActor(it.last_msg_author) === 'SkCQ');
 }
 
-// Lower rank sorts first: what needs me, then open work, then finished work. Alerts
-// come first even on merged CLs, since a blamed commit needs a reaction
-function sortRank(it) {
-  if ((it.phase || '').startsWith('ALERT_')) return 0;
-  if (needsMyReply(it)) return 1;
-  if (it.status === 'MERGED') return it.phase === 'READY_TO_CLOSE' ? 6 : 5;
-  if (it.status === 'ABANDONED' || it.status === 'CLOSED') return 4;
-  if (it.phase === 'SUBMITTING') return 3;
-  return 2;
+// Merged CLs older than this are chats left open after the work ended
+const OLD_MERGED_DAYS = 3;
+
+// Status filters in display and sort order; one classifier drives the chips, their
+// counts, and the row order, so a row never shows up under two statuses
+const STATUSES = [
+  {id: 'attention', label: '⚡ Needs you'},
+  {id: 'cq', label: '⏳ CQ running'},
+  {id: 'waiting', label: '⏸ Waiting on others'},
+  {id: 'merged', label: '🟢 Merged'},
+  {id: 'old', label: '📦 OLD'},
+  {id: 'abandoned', label: '⚪ Abandoned'},
+];
+
+function isAlert(it) {
+  return (it.phase || '').startsWith('ALERT_');
+}
+
+// Alerts count as needing me even on merged CLs, since a blamed commit needs a reaction
+function statusOf(it) {
+  if (isAlert(it) || needsMyReply(it)) return 'attention';
+  if (it.status === 'ABANDONED' || it.status === 'CLOSED') return 'abandoned';
+  if (it.status === 'MERGED') {
+    const ageDays = (Date.now() / 1000 - (it.submitted_ts || 0)) / 86400;
+    return ageDays > OLD_MERGED_DAYS ? 'old' : 'merged';
+  }
+  const cq = String(it.cq_status || '');
+  if (it.phase === 'SUBMITTING' || cq.startsWith('CQ+') || cq.includes('running')) return 'cq';
+  return 'waiting';
+}
+
+function compareRows(a, b) {
+  const sa = STATUSES.findIndex(x => x.id === statusOf(a));
+  const sb = STATUSES.findIndex(x => x.id === statusOf(b));
+  return sa - sb || Number(isAlert(b)) - Number(isAlert(a)) ||
+    (b.activity_ts || 0) - (a.activity_ts || 0);
 }
 
 const INCIDENT_VERDICT_LABEL = {
@@ -1856,43 +1914,6 @@ async function triggerRefresh() {
   await fetchState();
 }
 
-// Merged CLs older than this are chats left open after the work ended
-const OLD_MERGED_DAYS = 3;
-const openFolds = new Set();
-const foldChats = {};
-
-// Splits rows so that only CLs that may still need attention stay in the open table
-function foldOf(it) {
-  if (sortRank(it) < 4) return 'main';
-  if (it.status === 'ABANDONED' || it.status === 'CLOSED') return 'abandoned';
-  const ageDays = (Date.now() / 1000 - (it.submitted_ts || 0)) / 86400;
-  return ageDays > OLD_MERGED_DAYS ? 'old' : 'merged';
-}
-
-function mergedIcon(it) {
-  const ps = it.post_submit;
-  if (!ps || ps.all_passed) return '🏁';
-  return ps.skia_status === '⚠️' ? '⚠️' : '🔄';
-}
-
-function toggleFold(key, isOpen) {
-  if (isOpen) openFolds.add(key);
-  else openFolds.delete(key);
-}
-
-async function finalizeFold(key) {
-  const chats = foldChats[key] || [];
-  if (chats.length === 0) return;
-  const list = chats.map(c => `  • ${c.title}`).join('\n');
-  if (!confirm(`Finalize («») ${chats.length} chat(s)?\n\n${list}`)) return;
-  await fetch('/api/finalize', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({conversation_ids: chats.map(c => c.cid)})
-  });
-  await fetchState();
-}
-
 function renderTable(pname, rows) {
   return `
       <table class="md-table">
@@ -1911,47 +1932,34 @@ function renderTable(pname, rows) {
       </table>`;
 }
 
-// A collapsed group of rows; open state survives the 20 s re-render
-function renderFold(pname, kind, label, rows, withFinalize, activeCids) {
-  if (rows.length === 0) return '';
-  const key = `${pname}:${kind}`;
-  const chats = new Map();
-  // A chat that also tracks an open CL is still in use, so bulk finalize skips it
-  rows.filter(it => !activeCids.has(it.conversation_id))
-    .forEach(it => chats.set(it.conversation_id, it.title));
-  foldChats[key] = [...chats].map(([cid, title]) => ({cid, title}));
-  const btn = withFinalize && chats.size > 0
-    ? ` <button class="btn-sm" onclick="event.preventDefault(); ` +
-      `finalizeFold(${esc(JSON.stringify(key))})">✓ Finalize all (${chats.size})</button>`
-    : '';
-  const open = openFolds.has(key) ? 'open' : '';
-  return `<details class="fold" ${open} ` +
-    `ontoggle="toggleFold(${esc(JSON.stringify(key))}, this.open)">` +
-    `<summary>${label}${btn}</summary>${renderTable(pname, rows)}</details>`;
-}
-
 function renderProject(pname, rows) {
-  const groups = {main: [], merged: [], old: [], abandoned: []};
-  rows.forEach(it => groups[foldOf(it)].push(it));
-  const icons = {};
-  groups.merged.forEach(it => { const i = mergedIcon(it); icons[i] = (icons[i] || 0) + 1; });
-  const activeCids = new Set(groups.main.map(it => it.conversation_id));
-  const iconSummary = Object.entries(icons).map(([i, n]) => `${i}${n}`).join(' ');
-  const main = groups.main.length
-    ? renderTable(pname, groups.main)
-    : '<p class="muted">Nothing needs attention here.</p>';
   return `
       <div class="section-title">
         <span>Project <code>${esc(pname)}</code> (${rows.length})</span>
       </div>
-      ${main}
-      ${renderFold(pname, 'merged', `Merged · ${groups.merged.length} · ${iconSummary}`,
-        groups.merged, false, activeCids)}
-      ${renderFold(pname, 'old',
-        `OLD · merged more than ${OLD_MERGED_DAYS} days ago · ${groups.old.length}`,
-        groups.old, true, activeCids)}
-      ${renderFold(pname, 'abandoned', `Abandoned / closed · ${groups.abandoned.length}`,
-        groups.abandoned, true, activeCids)}`;
+      ${renderTable(pname, rows)}`;
+}
+
+function readHashFilters() {
+  const h = new URLSearchParams(location.hash.slice(1));
+  selectedStatus = h.get('status') || 'attention';
+  selectedProject = h.get('project') || 'ALL';
+}
+
+// The URL hash keeps the view across reloads and makes it bookmarkable
+function setFilter(kind, value) {
+  if (kind === 'status') selectedStatus = value;
+  else selectedProject = value;
+  const h = new URLSearchParams({status: selectedStatus, project: selectedProject});
+  history.replaceState(null, '', `#${h}`);
+  renderFromCache();
+}
+
+function chipHtml(cls, kind, value, label, count, active) {
+  const state = (active ? ' active-tab' : '') + (count === 0 ? ' empty' : '');
+  return `<button class="${cls}${state}" ` +
+    `onclick="setFilter('${kind}', ${esc(JSON.stringify(value))})">` +
+    `${label} <span class="count">${count}</span></button>`;
 }
 
 function renderTableRows(rows) {
@@ -2001,30 +2009,12 @@ function renderFromCache() {
     (data.gardener_url ? ` · ${link(data.gardener_url, 'Skia Gardener')}` : '') +
     `</span>`;
 
-  const allItems = Object.values(data.items || {});
-  allItems.sort((a, b) =>
-    sortRank(a) - sortRank(b) || (b.activity_ts || 0) - (a.activity_ts || 0));
-
+  const allItems = Object.values(data.items || {}).sort(compareRows);
   document.getElementById('total-count').textContent = allItems.length;
 
-
-  // Group counts by project
-  const byProj = {};
-  allItems.forEach(it => {
-    const p = it.project_name || 'Unassigned';
-    if (!byProj[p]) byProj[p] = [];
-    byProj[p].push(it);
-  });
-
-  if (!initialProjectPicked) {
-    if (!byProj['SkParagraph'] && Object.keys(byProj).length > 0) {
-      selectedProject = 'ALL';
-    }
-    initialProjectPicked = true;
-  }
-
+  const projOf = it => it.project_name || 'Unassigned';
   const preferredOrder = ['SkParagraph', 'Skia', 'WebParagraph', 'Skia Gardener', 'TextClusters API'];
-  const projNames = Object.keys(byProj).sort((a, b) => {
+  const projNames = [...new Set(allItems.map(projOf))].sort((a, b) => {
     const ia = preferredOrder.indexOf(a);
     const ib = preferredOrder.indexOf(b);
     if (ia !== -1 && ib !== -1) return ia - ib;
@@ -2032,31 +2022,48 @@ function renderFromCache() {
     if (ib !== -1) return 1;
     return a.localeCompare(b);
   });
-
-  // Render project tabs
-  const tabsHtml = [
-    `<button class="${selectedProject === 'ALL' ? 'active-tab' : ''}" ` +
-      `onclick="selectedProject='ALL'; renderFromCache();">` +
-      `All Projects (${allItems.length})</button>`
-  ].concat(projNames.map(pname => {
-    const active = selectedProject === pname ? 'active-tab' : '';
-    return `<button class="${active}" onclick="selectedProject='${esc(pname)}'; renderFromCache();">${esc(pname)} (${byProj[pname].length})</button>`;
-  }));
-  document.getElementById('project-tabs').innerHTML = tabsHtml.join('');
-
-  const projectsToRender = selectedProject === 'ALL'
-    ? projNames
-    : (byProj[selectedProject] ? [selectedProject] : projNames);
-
-  const container = document.getElementById('tables-container');
-  if (projectsToRender.length === 0) {
-    container.innerHTML = `<p class="muted">No active chats match the current filter.</p>`;
-    return;
+  if (selectedProject !== 'ALL' && !projNames.includes(selectedProject)) {
+    selectedProject = 'ALL';
   }
 
-  container.innerHTML = projectsToRender
-    .map(pname => renderProject(pname, byProj[pname] || []))
-    .join('');
+  // Each axis counts rows under the other axis's current choice, so a chip's number
+  // always equals the rows shown after clicking it
+  const inProject = it => selectedProject === 'ALL' || projOf(it) === selectedProject;
+  const inStatus = it => selectedStatus === 'all' || statusOf(it) === selectedStatus;
+  const projRows = allItems.filter(inProject);
+  const statusCount = id => projRows.filter(it => statusOf(it) === id).length;
+
+  document.getElementById('status-tabs').innerHTML =
+    STATUSES.map(st => chipHtml('seg', 'status', st.id, st.label, statusCount(st.id),
+      selectedStatus === st.id)).join('') +
+    chipHtml('seg', 'status', 'all', 'All', projRows.length, selectedStatus === 'all');
+
+  const statusRows = allItems.filter(inStatus);
+  const projCount = p => statusRows.filter(it => projOf(it) === p).length;
+  document.getElementById('project-tabs').innerHTML =
+    chipHtml('chip', 'project', 'ALL', 'All', statusRows.length, selectedProject === 'ALL') +
+    projNames.map(p => chipHtml('chip', 'project', p, esc(p), projCount(p),
+      selectedProject === p)).join('');
+
+  const shown = statusRows.filter(inProject);
+  const container = document.getElementById('tables-container');
+  if (shown.length === 0) {
+    const others = STATUSES.filter(st => st.id !== selectedStatus && statusCount(st.id) > 0)
+      .map(st => `<a href="#" onclick="event.preventDefault(); ` +
+        `setFilter('status', '${st.id}')">${st.label} (${statusCount(st.id)})</a>`)
+      .join(' · ');
+    const head = selectedStatus === 'attention'
+      ? 'Nothing needs you right now.'
+      : 'No chats match this filter.';
+    container.innerHTML = `<p class="muted">${head}${others ? ` See ${others}.` : ''}</p>`;
+  } else {
+    const groups = selectedProject === 'ALL'
+      ? projNames.filter(p => shown.some(it => projOf(it) === p))
+      : [selectedProject];
+    container.innerHTML = groups
+      .map(p => renderProject(p, shown.filter(it => projOf(it) === p)))
+      .join('');
+  }
 
   // Fire browser notifications on new events
   const evList = data.events || [];
@@ -2082,6 +2089,7 @@ async function fetchState() {
 }
 
 initTheme();
+readHashFilters();
 updateNotifButton();
 fetchState();
 setInterval(fetchState, 20000);
@@ -2152,16 +2160,9 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
       return
 
     if parsed.path == "/api/finalize":
-      # Bulk sections send conversation_ids; one sync after the batch keeps a
-      # 15-chat cleanup from paying 15 full polls
-      cids = data.get("conversation_ids")
-      if not isinstance(cids, list):
-        cids = [data.get("conversation_id")]
-      finalized = []
-      for cid in dict.fromkeys(str(c or "").strip() for c in cids):
-        if not cid:
-          continue
-        res = subprocess.run(
+      cid = str(data.get("conversation_id") or "").strip()
+      if cid:
+        subprocess.run(
             [
                 "python3",
                 os.path.join(HOOKS_DIR, "chat_lifecycle.py"),
@@ -2171,14 +2172,8 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
             check=False,
             timeout=10,
         )
-        if res.returncode == 0:
-          finalized.append(cid)
       state = sync_once(wake_chats=False, update_titles=False)
-      self._send_json({
-          "ok": True,
-          "finalized": finalized,
-          "count": len(state.get("items") or {}),
-      })
+      self._send_json({"ok": True, "count": len(state.get("items") or {})})
       return
 
     if parsed.path == "/api/wake":
