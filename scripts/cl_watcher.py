@@ -94,6 +94,16 @@ RE_DRAFT_SUBJECT = re.compile(
     r"(?:\[(?:wip|draft)\]\s*|wip\b[:\s\-]*|draft\s*[:\-]\s*)",
     re.IGNORECASE,
 )
+# Flight Deck chats discuss dashboard behavior rather than owning tracked CLs/PRs
+EXCLUDED_WATCHER_PROJECTS = frozenset({"Flight Deck"})
+# Domain projects take precedence when a CL/PR is also mentioned in a meta project
+META_PROJECT_NAMES = frozenset({
+    "Flight Deck",
+    "Improving Experience",
+    "Code Review organizer",
+    "Breaking Chats",
+    "Unassigned",
+})
 
 _GMAIL_TOKEN_CACHE: dict[str, Any] = {"access_token": "", "expires_at": 0.0}
 _GMAIL_LOCK = threading.Lock()
@@ -101,6 +111,12 @@ _GMAIL_LOCK = threading.Lock()
 _FLUTTER_TREE_CACHE: dict[str, Any] = {"tasks": set(), "expires_at": 0.0}
 _FLUTTER_BASE_CACHE: dict[str, set[str]] = {}
 _FLUTTER_TREE_LOCK = threading.Lock()
+# Cache the startup mtime so --serve can re-exec when cl_watcher.py changes on disk
+_SCRIPT_PATH = os.path.abspath(__file__)
+try:
+  _INITIAL_SCRIPT_MTIME = os.path.getmtime(_SCRIPT_PATH)
+except OSError:
+  _INITIAL_SCRIPT_MTIME = 0.0
 
 EN_MONTHS = {
     1: "Jan",
@@ -446,6 +462,16 @@ def load_project_names() -> dict[str, str]:
   return res
 
 
+def _chat_candidate_rank(item: dict[str, Any]) -> tuple[bool, bool, str]:
+  """Ranks candidate chats for one CL/PR: domain project > 1:1 target > newest."""
+  # Prefer domain project over meta tooling, dedicated 1:1 chat over multi-target, then newest
+  return (
+      item.get("project_name", "Unassigned") not in META_PROJECT_NAMES,
+      bool(item.get("single_target", True)),
+      str(item.get("chat_last_modified") or ""),
+  )
+
+
 def discover_active_cl_chats() -> list[dict[str, Any]]:
   """Scans active (`⦿`) conversations and maps them to CLs or GitHub PRs."""
   summaries = cl._fetch_ls_summaries_for_audit() or {}
@@ -469,6 +495,9 @@ def discover_active_cl_chats() -> list[dict[str, Any]]:
 
     pid = str(meta.get("projectId") or "").strip()
     pname = proj_names.get(pid, "Unassigned")
+    # Ignore meta-chats in Flight Deck that mention a CL/PR as a bug example
+    if pname in EXCLUDED_WATCHER_PROJECTS:
+      continue
     last_mod = str(meta.get("lastModifiedTime") or meta.get("createdAt") or "")
 
     # Deduplicate IDs when a title repeats the same CL or PR number
@@ -512,9 +541,19 @@ def discover_active_cl_chats() -> list[dict[str, Any]]:
           "single_target": single_target,
       })
 
-  # Sort newest chat modification first
-  discovered.sort(key=lambda x: x["chat_last_modified"], reverse=True)
-  return discovered
+  # Collapse multiple chats referencing the same CL/PR to one canonical owner
+  best_by_key: dict[str, dict[str, Any]] = {}
+  for item in discovered:
+    ikey = item["item_key"]
+    prev = best_by_key.get(ikey)
+    # Replace when this is the first candidate or outranks the existing candidate
+    if prev is None or _chat_candidate_rank(item) > _chat_candidate_rank(prev):
+      best_by_key[ikey] = item
+
+  deduped = list(best_by_key.values())
+  # Keep newest chat modification first for deterministic dashboard sort
+  deduped.sort(key=lambda x: x["chat_last_modified"], reverse=True)
+  return deduped
 
 
 def fetch_gardener_snapshot() -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -3055,7 +3094,24 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
     except Exception:
       data = {}
 
-    if parsed.path == "/api/refresh":
+    if parsed.path in ("/api/refresh", "/api/sync"):
+      # Run the updated script when the daemon's in-memory code is stale
+      if script_changed_on_disk():
+        subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "--sync-once"],
+            check=False,
+            timeout=90,
+        )
+        state = load_watcher_state()
+        self._send_json({
+            "ok": True,
+            "reloaded": True,
+            "count": len(state.get("items") or {}),
+        })
+        threading.Thread(
+            target=reexec_self, args=(self.server,), daemon=True
+        ).start()
+        return
       state = sync_once(wake_chats=True, update_titles=True)
       self._send_json({"ok": True, "count": len(state.get("items") or {})})
       return
@@ -3109,23 +3165,58 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
   daemon_threads = True
 
 
+def script_changed_on_disk(
+    path: str = _SCRIPT_PATH, initial_mtime: float = _INITIAL_SCRIPT_MTIME
+) -> bool:
+  """Returns True when `path` on disk is newer than `initial_mtime` and compiles."""
+  if initial_mtime <= 0.0:
+    return False
+  try:
+    if os.path.getmtime(path) <= initial_mtime:
+      return False
+    # Verify syntax before replacing the daemon so a half-written edit cannot crash it
+    with open(path, "rb") as f:
+      compile(f.read(), path, "exec")
+    return True
+  except Exception:
+    return False
+
+
+def reexec_self(server: http.server.HTTPServer | None = None) -> None:
+  """Closes the HTTP listener and replaces the process with the updated script."""
+  if server is not None:
+    try:
+      server.server_close()
+    except Exception:
+      pass
+  os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
 def serve_forever(
     port: int, poll_interval_sec: int, max_polls: int = 1000000
 ) -> None:
   """Runs the HTTP server and bounded background watcher loop."""
+  server = ThreadedHTTPServer(("0.0.0.0", port), FlightDeckHandler)
 
   def bg_loop() -> None:
+    wait_sec = max(30, poll_interval_sec)
     for _ in range(max_polls):
+      # Replace the running daemon before polling when cl_watcher.py changed on disk
+      if script_changed_on_disk():
+        reexec_self(server)
       try:
         sync_once(wake_chats=True, update_titles=True)
       except Exception:
         pass
-      time.sleep(max(30, poll_interval_sec))
+      # Poll mtime in 2-second slices so commits reload the server without waiting a full cycle
+      for _ in range(max(1, wait_sec // 2)):
+        time.sleep(2)
+        if script_changed_on_disk():
+          reexec_self(server)
 
   t = threading.Thread(target=bg_loop, daemon=True)
   t.start()
 
-  server = ThreadedHTTPServer(("0.0.0.0", port), FlightDeckHandler)
   pen = get_pen_url(port)
   print(
       f"CL Flight Deck listening on http://localhost:{port} (PEN: {pen})",
