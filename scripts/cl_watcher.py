@@ -126,11 +126,15 @@ def now_et_str() -> str:
 
 
 def parse_gerrit_or_iso_time(ts_str: str) -> datetime | None:
-  """Parses Gerrit ('2026-10-26 15:15:24.000000000') or ISO-8601 UTC timestamps."""
+  """Parses Gerrit, GitHub ISO-8601, or Piper local timestamps."""
   if not ts_str:
     return None
   s = ts_str.strip()
   try:
+    # Piper describe prints local ET timestamps as YYYY/MM/DD HH:MM:SS
+    is_piper = bool(re.match(r"^\d{4}/\d{2}/\d{2}\b", s))
+    if is_piper:
+      s = s[:10].replace("/", "-") + s[10:]
     if s.endswith("Z"):
       s = s[:-1]
     if "." in s:
@@ -140,10 +144,30 @@ def parse_gerrit_or_iso_time(ts_str: str) -> datetime | None:
     s = s.replace("T", " ")
     dt = datetime.fromisoformat(s)
     if dt.tzinfo is None:
-      dt = dt.replace(tzinfo=timezone.utc)
+      # Piper describe local timestamps are in America/New_York; others default to UTC
+      dt = dt.replace(
+          tzinfo=ZoneInfo("America/New_York") if is_piper else timezone.utc
+      )
     return dt
   except Exception:
     return None
+
+
+def latest_timestamp(*candidates: str) -> str:
+  """Returns the candidate string with the latest parsed timestamp."""
+  best_str = ""
+  best_ts = -1.0
+  for c in candidates:
+    if not c:
+      continue
+    dt = parse_gerrit_or_iso_time(c)
+    if dt is not None:
+      ts = dt.timestamp()
+      # Isolate the newest event timestamp across candidate transitions
+      if ts > best_ts:
+        best_ts = ts
+        best_str = c
+  return best_str
 
 
 def format_et_and_age(ts_str: str) -> tuple[str, str]:
@@ -905,8 +929,31 @@ def fetch_gerrit_cl_status(
               f"<GERRIT_ACCOUNT_{acc['_account_id']}>", label
           )
 
+      # Gather candidate timestamps across attention set, votes, and patchsets
+      updated_raw = str(d.get("updated") or "")
+      created_raw = str(d.get("created") or "")
+      rev_created_raw = str(cur_rev.get("created") or "")
+      self_att_dates = [
+          str(v.get("last_update") or "")
+          for v in (d.get("attention_set") or {}).values()
+          if isinstance(v, dict)
+          and str((v.get("account") or {}).get("email") or "") in SELF_EMAILS
+      ]
+      other_att_dates = [
+          str(v.get("last_update") or "")
+          for v in (d.get("attention_set") or {}).values()
+          if isinstance(v, dict)
+          and str((v.get("account") or {}).get("email") or "") not in SELF_EMAILS
+      ]
+      cq_vote_dates = [
+          str(a.get("date") or "")
+          for a in ((labels.get("Commit-Queue") or {}).get("all") or [])
+          if isinstance(a, dict) and a.get("value")
+      ]
+
       cq_failed = False
       cq_status = "Idle"
+      cq_msg_date = ""
       if max_cq == 2:
         cq_status = "CQ+2 (Submitting)"
       elif max_cq == 1:
@@ -923,14 +970,47 @@ def fetch_gerrit_cl_status(
           if max_cq == 0:
             cq_failed = True
             cq_status = "🔴 CQ Failed"
+            cq_msg_date = str(m.get("date") or "")
           break
         if "passed the SkCQ dry run" in txt and max_cq == 0:
           cq_status = "✓ Dry Run Passed"
+          cq_msg_date = str(m.get("date") or "")
           break
 
       submitted_raw = str(d.get("submitted") or "")
       submitted_et, submitted_age = format_et_and_age(submitted_raw)
       last_msg_et, last_msg_age = format_et_and_age(last_msg_date)
+
+      # Anchor status change timestamp to the event driving the current phase
+      if status == "MERGED":
+        status_changed_raw = submitted_raw or latest_timestamp(
+            last_msg_date, updated_raw
+        )
+      elif status == "ABANDONED":
+        status_changed_raw = latest_timestamp(last_msg_date, updated_raw)
+      elif cq_failed and not reviewer_removed and not is_watching:
+        status_changed_raw = cq_msg_date or latest_timestamp(
+            last_msg_date, updated_raw
+        )
+      elif max_cq in (1, 2):
+        status_changed_raw = latest_timestamp(
+            *cq_vote_dates, cq_msg_date, last_msg_date, updated_raw
+        )
+      elif in_my_attention:
+        status_changed_raw = latest_timestamp(
+            *self_att_dates, last_msg_date, updated_raw
+        )
+      else:
+        status_changed_raw = latest_timestamp(
+            rev_created_raw,
+            *other_att_dates,
+            last_msg_date,
+            updated_raw,
+            created_raw,
+        )
+      status_changed_et, status_changed_age = format_et_and_age(
+          status_changed_raw
+      )
 
       post_submit = None
       if status == "MERGED" and host == "skia-review.googlesource.com":
@@ -1002,6 +1082,9 @@ def fetch_gerrit_cl_status(
           "submitted": submitted_raw,
           "submitted_et": submitted_et,
           "submitted_age": submitted_age,
+          "status_changed_raw": status_changed_raw,
+          "status_changed_et": status_changed_et,
+          "status_changed_age": status_changed_age,
           "post_submit": post_submit,
       }
     except Exception:
@@ -1211,7 +1294,8 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
             "--json",
             "number,title,state,isDraft,author,mergedAt,headRefOid,reviews,comments,"
             # Include commits so author pushes after a review update the PR timeline
-            "commits,statusCheckRollup,url,mergeable,reviewRequests",
+            "commits,statusCheckRollup,url,mergeable,reviewRequests,"
+            "createdAt,updatedAt,closedAt",
         ],
         stderr=subprocess.STDOUT,
         text=True,
@@ -1352,9 +1436,50 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
       last_date, last_actor, last_snippet = events[-1]
       last_snippet = last_snippet.replace("\n", " ")[:180]
 
+    # Gather lifecycle and check run completion dates for status transition tracking
     merged_raw = str(d.get("mergedAt") or "")
+    created_raw = str(d.get("createdAt") or "")
+    updated_raw = str(d.get("updatedAt") or "")
+    closed_raw = str(d.get("closedAt") or "")
+    own_failed_set = set(own_failed_checks)
+    failed_check_dates = [
+        str(c.get("completedAt") or c.get("startedAt") or "")
+        for c in checks
+        if str(c.get("name") or c.get("context") or "") in own_failed_set
+    ]
+    pending_check_dates = [
+        str(c.get("startedAt") or "")
+        for c in checks
+        if str(c.get("status") or "").upper() in ("IN_PROGRESS", "QUEUED", "PENDING")
+    ]
+
     submitted_et, submitted_age = format_et_and_age(merged_raw)
     last_msg_et, last_msg_age = format_et_and_age(last_date)
+
+    # Map the status change date to the latest event driving the current PR phase
+    if state == "MERGED":
+      status_changed_raw = merged_raw or latest_timestamp(
+          closed_raw, updated_raw, last_date
+      )
+    elif state == "CLOSED":
+      status_changed_raw = latest_timestamp(
+          closed_raw, last_date, updated_raw
+      )
+    elif own_failed_checks and not is_watching:
+      status_changed_raw = latest_timestamp(
+          *failed_check_dates, last_date, updated_raw
+      )
+    elif pending_checks:
+      status_changed_raw = latest_timestamp(
+          *pending_check_dates, last_date, updated_raw
+      )
+    else:
+      status_changed_raw = latest_timestamp(
+          last_date, updated_raw, created_raw
+      )
+    status_changed_et, status_changed_age = format_et_and_age(
+        status_changed_raw
+    )
 
     if state == "MERGED":
       phase = "READY_TO_CLOSE"
@@ -1423,6 +1548,9 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         "submitted": merged_raw,
         "submitted_et": submitted_et,
         "submitted_age": submitted_age,
+        "status_changed_raw": status_changed_raw,
+        "status_changed_et": status_changed_et,
+        "status_changed_age": status_changed_age,
         "post_submit": None,
     }
   except Exception as e:
@@ -1472,6 +1600,12 @@ def fetch_piper_cl_status(cl_id: str) -> dict[str, Any]:
     is_draft = is_self and is_open and bool(RE_DRAFT_SUBJECT.match(subject))
     in_development = is_self and is_open and not is_draft and not reviewers
     phase = "READY_TO_CLOSE" if status == "SUBMITTED" else "WAITING_ON_OTHERS"
+    # Extract timestamp from describe header to track submit or last edit time
+    m_ts = re.search(
+        r"\bon\s+(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})\b", first_line
+    )
+    piper_ts = m_ts.group(1) if m_ts else ""
+    piper_et, piper_age = format_et_and_age(piper_ts)
     return {
         "ok": True,
         "host": "critique.corp.google.com",
@@ -1498,13 +1632,16 @@ def fetch_piper_cl_status(cl_id: str) -> dict[str, Any]:
         "cq_status": status,
         "cq_failed": False,
         "last_msg_author": owner,
-        "last_msg_date": "",
-        "last_msg_et": "",
-        "last_msg_age": "",
+        "last_msg_date": piper_ts,
+        "last_msg_et": piper_et,
+        "last_msg_age": piper_age,
         "last_msg_snippet": subject,
-        "submitted": "",
-        "submitted_et": "",
-        "submitted_age": "",
+        "submitted": piper_ts if status == "SUBMITTED" else "",
+        "submitted_et": piper_et if status == "SUBMITTED" else "",
+        "submitted_age": piper_age if status == "SUBMITTED" else "",
+        "status_changed_raw": piper_ts,
+        "status_changed_et": piper_et,
+        "status_changed_age": piper_age,
         "post_submit": None,
     }
   except Exception as e:
@@ -1745,6 +1882,9 @@ def sync_once(
             (
                 dt.timestamp()
                 for dt in (
+                    parse_gerrit_or_iso_time(
+                        info.get("status_changed_raw") or ""
+                    ),
                     parse_gerrit_or_iso_time(info.get("last_msg_date") or ""),
                     parse_gerrit_or_iso_time(info.get("submitted") or ""),
                 )
@@ -1756,6 +1896,36 @@ def sync_once(
 
     prev = prev_items.get(composite_key) or {}
     post = info.get("post_submit") or {}
+    if post:
+      # Key post-submit rolls on state changes to track duration in each status bucket
+      post_state_key = (
+          f"{post.get('skia_status')}:{post.get('passed_rolls')}:"
+          f"{post.get('all_passed')}:{post.get('has_alert')}"
+      )
+      prev_post = (prev.get("post_submit") or {}) if prev else {}
+      if (
+          prev_post.get("state_key") == post_state_key
+          and prev_post.get("status_changed_raw")
+      ):
+        # Keep earlier transition timestamp while post-submit roll state remains identical
+        post_ts_raw = str(prev_post["status_changed_raw"])
+      elif (
+          not prev_post
+          and not post.get("all_passed")
+          and not post.get("has_alert")
+          and info.get("submitted")
+      ):
+        # Newly tracked in-flight roll inherits the CL submit timestamp
+        post_ts_raw = str(info["submitted"])
+      else:
+        # First poll witnessing a state transition records the current wall-clock
+        post_ts_raw = datetime.now(timezone.utc).isoformat()
+      post["state_key"] = post_state_key
+      post["status_changed_raw"] = post_ts_raw
+      post_et, post_age = format_et_and_age(post_ts_raw)
+      post["status_changed_et"] = post_et
+      post["status_changed_age"] = post_age
+
     badge = post.get("compact_badge", "")
 
     if update_titles and badge:
@@ -2343,6 +2513,15 @@ function formatGerritStatusCell(it) {
   return statusCoreHtml(it) + statusNotesHtml(it);
 }
 
+// Formats status transition time into 'Oct 26 at 14:15 ET (2h ago)' format
+function formatStatusTime(it, fallbackEt, fallbackAge) {
+  const et = it.status_changed_et || fallbackEt || it.last_msg_et || it.submitted_et || '';
+  const age = it.status_changed_age || fallbackAge || it.last_msg_age || it.submitted_age || '';
+  if (!et && !age) return '';
+  if (et && age) return `${esc(et)} (${esc(age)})`;
+  return esc(et || age);
+}
+
 function statusCoreHtml(it) {
   const ps = `PS${it.patchset || 1}`;
   if (it.status === 'MERGED') {
@@ -2350,19 +2529,17 @@ function statusCoreHtml(it) {
     const isDone = !post || post.all_passed;
     const icon = (post && post.has_alert) ? '🔴' : (isDone ? '🏁' : '🟢');
     const sha = link(it.commit_url, `<code>${esc((it.revision || '').slice(0, 10))}</code>`);
-    let timeLine = '';
-    if (it.submitted_et) {
-      const agePart = it.submitted_age ? ` (${esc(it.submitted_age)})` : '';
-      timeLine = `Submitted ${esc(it.submitted_et)}${agePart}, commit ${sha}.`;
-    } else {
-      timeLine = `Submitted, commit ${sha}.`;
-    }
+    const ts = formatStatusTime(it, it.submitted_et, it.submitted_age);
+    const timeLine = ts ? `Submitted ${ts}, commit ${sha}.` : `Submitted, commit ${sha}.`;
     return `${icon} <strong>${link(it.url, '<code>MERGED</code>')} (${ps})</strong>` +
       `<br><span class="muted">${timeLine}</span>`;
   }
 
   if (it.status === 'ABANDONED' || it.status === 'CLOSED') {
-    return `⚪ <strong>${link(it.url, `<code>${esc(it.status)}</code>`)} (${ps})</strong>`;
+    const ts = formatStatusTime(it);
+    const verb = it.status === 'ABANDONED' ? 'Abandoned' : 'Closed';
+    const tsLine = ts ? `<br><span class="muted">${verb} ${ts}.</span>` : '';
+    return `⚪ <strong>${link(it.url, `<code>${esc(it.status)}</code>`)} (${ps})</strong>${tsLine}`;
   }
 
   // Active NEW / OPEN CL or PR; show DRAFT/WIP badge when explicitly in draft
@@ -2372,36 +2549,48 @@ function statusCoreHtml(it) {
   const cqHtml = link(checksUrl(it), esc(it.cq_status));
   const snippetHtml = link(it.url, esc(it.last_msg_snippet));
   if (it.cq_failed && !it.is_watching) {
+    const ts = formatStatusTime(it);
+    const tsPart = ts ? ` (${ts})` : '';
     return `🔴 <strong>${statusHtml} (${ps} · ${cqHtml})</strong>` +
-      `<br><span class="muted">Latest from ${lastWhoHtml}: ${snippetHtml}</span>`;
+      `<br><span class="muted">Latest from ${lastWhoHtml}${tsPart}: ${snippetHtml}</span>`;
   }
   if (it.phase === 'SUBMITTING') {
-    const agePart = it.last_msg_age ? ` (${esc(it.last_msg_age)})` : '';
+    const ts = formatStatusTime(it, '', it.last_msg_age);
+    const tsPart = ts ? ` ${ts}` : '';
     const skcq = link(checksUrl(it), '<code>SkCQ</code>');
     return `🟡 <strong>${statusHtml} (${ps} in CQ+2)</strong>` +
-      `<br><span class="muted">Submitted to CQ${agePart}, running ${skcq}.</span>`;
+      `<br><span class="muted">Submitted to CQ${tsPart}, running ${skcq}.</span>`;
   }
   if (needsMyReply(it)) {
-    const agePart = it.last_msg_age ? ` (${esc(it.last_msg_age)})` : '';
+    const ts = formatStatusTime(it, '', it.last_msg_age);
+    const tsPart = ts ? ` (${ts})` : '';
     return `⚡ <strong>${statusHtml} (${ps} · needs your reply)</strong><br>` +
       `<span class="muted">CR: ${esc(it.cr_summary)} · ${cqHtml}. ` +
-      `From ${lastWhoHtml}${agePart}: ${snippetHtml}</span>`;
+      `From ${lastWhoHtml}${tsPart}: ${snippetHtml}</span>`;
   }
   if (it.is_watching) {
+    const ts = formatStatusTime(it);
+    const tsPart = ts ? ` · ${ts}` : '';
     return `👀 <strong>${statusHtml} (${ps})</strong>` +
-      `<br><span class="muted">Watching (CR: ${esc(it.cr_summary)} · ${cqHtml}).</span>`;
+      `<br><span class="muted">Watching (CR: ${esc(it.cr_summary)} · ${cqHtml})${tsPart}.</span>`;
   }
   // Separate draft, unreviewed development, and active review states
   if (it.is_draft) {
+    const ts = formatStatusTime(it);
+    const tsPart = ts ? ` · ${ts}` : '';
     return `📝 <strong>${statusHtml} (${ps})</strong>` +
-      `<br><span class="muted">In draft (CR: ${esc(it.cr_summary)} · ${cqHtml}).</span>`;
+      `<br><span class="muted">In draft (CR: ${esc(it.cr_summary)} · ${cqHtml})${tsPart}.</span>`;
   }
   if (it.in_development) {
+    const ts = formatStatusTime(it);
+    const tsPart = ts ? ` · ${ts}` : '';
     return `🛠️ <strong>${statusHtml} (${ps})</strong>` +
-      `<br><span class="muted">In development — no reviewers yet (${cqHtml}).</span>`;
+      `<br><span class="muted">In development — no reviewers yet (${cqHtml})${tsPart}.</span>`;
   }
+  const ts = formatStatusTime(it);
+  const tsPart = ts ? ` · ${ts}` : '';
   return `⏸️ <strong>${statusHtml} (${ps})</strong>` +
-    `<br><span class="muted">In review (CR: ${esc(it.cr_summary)} · ${cqHtml}).</span>`;
+    `<br><span class="muted">In review (CR: ${esc(it.cr_summary)} · ${cqHtml})${tsPart}.</span>`;
 }
 
 // One predicate drives both the ⚡ badge and the sort, so the top rows are exactly the
@@ -2512,9 +2701,13 @@ function formatRollsCell(it) {
     return `<strong><code>✓ Merged</code></strong>`;
   }
   const statusLink = (html) => link('https://status.skia.org/repo/skia', html);
+  const psTs = (ps.status_changed_et && ps.status_changed_age)
+    ? `${esc(ps.status_changed_et)} (${esc(ps.status_changed_age)})`
+    : esc(ps.status_changed_et || ps.status_changed_age || '');
   if (ps.all_passed) {
+    const doneTs = psTs ? ` · ${psTs}` : '';
     return `<strong><code>${statusLink('✓Status')} · ✓And ✓Chr ✓G3 ✓Flt</code></strong>` +
-      `<br><span class="muted">(all 4/4 rolls passed!)</span>`;
+      `<br><span class="muted">(all 4/4 rolls passed${doneTs}!)</span>`;
   }
   const r = ps.rolls || {};
   const rollHtml = (name, label) => {
@@ -2531,12 +2724,14 @@ function formatRollsCell(it) {
   const gardener = cachedData && cachedData.gardener_url
     ? ` · ${link(cachedData.gardener_url, 'Gardener')}`
     : '';
+  const postUpdated = psTs ? ` · ${psTs}` : '';
   const rolls = [['Android', 'Android'], ['Chrome', 'Chrome'], ['Google3', 'G3'],
     ['Flutter', 'Flutter']].map(([name, label]) => rollHtml(name, label)).join(', ');
   const incidentsHtml = incidents
     ? `<div class="muted" style="margin-top:4px">${incidents}</div>`
     : '';
-  return `${header}<br><span class="muted">(${rolls})${gardener}</span>${incidentsHtml}`;
+  return `${header}<br><span class="muted">(${rolls})${gardener}` +
+    `${postUpdated}</span>${incidentsHtml}`;
 }
 
 function formatGmailCell(it) {

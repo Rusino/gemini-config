@@ -39,6 +39,7 @@ description: "Global communication style, grammatical gender, and critical feedb
 # Development Environment
 
 - **Time Zone (America/New_York)**: The user is in New York. Always state times and deadlines in the user's local time (ET). When the source is in another zone (PT events, UTC logs), convert and give ET first, with the original in parentheses only if useful (e.g. "14:00 по Нью-Йорку (11:00 PT)"). Never leave a bare PT or UTC time in a reply.
+- **CL / PR Status Timestamps**: Whenever listing, summarizing, or displaying CLs or PRs (in chat tables/lists or in Flight Deck UI), always include the date, time (in ET), and relative age of the last status change (e.g., `Oct 26 at 14:15 ET (2h ago)` or `14:15 ET (42m ago)` for today).
 - **Local Git + `google3` Reference**:
   - The user primarily works on **Open Source** projects using standard **Git** repositories on the local filesystem (use `git`, `rg`, `grep`, `find` for local repositories).
   - You **may** look into `google3` (using `code_search`) whenever referencing internal code, callers, or examples in `google3` is useful.
