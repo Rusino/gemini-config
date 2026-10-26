@@ -679,6 +679,37 @@ assert.strictEqual(barsAfterReload.length, 1, 'Reloading script must not duplica
   assert.strictEqual(titlebarBtn.getAttribute('data-finalized'), 'false');
   assert.strictEqual(rpcRequests.length, 3);
 
+  // Even if a handed-off predecessor loses its ▸ marker and has ⦿ in its title,
+  // jetski-chains.json parentOf still classifies it into 'steps' (hidden when steps is off)
+  const reloadBar = bodyEl.querySelector('.jetski-attention-filter-bar');
+  const reloadBtnSteps = reloadBar.querySelector('button[data-bucket="steps"]');
+  const nowStepToggle = Date.now;
+  Date.now = () => nowStepToggle() + 1500;
+  reloadBtnSteps.dispatchEvent('pointerdown', { button: 0 });
+  Date.now = nowStepToggle;
+  assert.strictEqual(reloadBtnSteps.getAttribute('data-active'), 'false');
+  reduxStore.dispatch({
+    type: 'trajectorySummaries/applyStreamBatch',
+    payload: {
+      updates: [
+        [
+          'open-root',
+          {
+            ...storeState.trajectorySummaries.summaries['open-root'],
+            summary: '[09:00] ⦿ Open chain topic',
+            annotations: { title: '[09:00] ⦿ Open chain topic' },
+          },
+        ],
+      ],
+      deletes: [],
+    },
+  });
+  assert.strictEqual(
+    storeState.trajectorySummaries.summaries['open-root'].trajectoryMetadata
+      .sourceMetadata.hideFromConversationList,
+    true
+  );
+
   console.log('ALL_JS_ASSERTIONS_PASSED');
 })().catch((err) => {
   console.error(err);

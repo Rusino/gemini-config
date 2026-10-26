@@ -986,6 +986,44 @@ def last_user_input_mention_urls(transcript_path: str) -> str:
   return "\n".join(MENTION_URL_RE.findall(last_input))
 
 
+CRON_WAKEUP_RE = re.compile(r"\(iteration\s+\d+\)")
+
+
+# Detects whether the current turn has an active schedule or killed a schedule
+def detect_schedule_state_in_turn(
+    transcript_path: str, last_user_input: str = "", invocation_num: int = 0
+) -> tuple[bool, bool]:
+  active = False
+  killed = False
+  for _, step in parse_current_turn_steps(transcript_path):
+    stype = step.get("type", "")
+    if stype == "PLANNER_RESPONSE":
+      for tc in step.get("tool_calls") or []:
+        tname = tc.get("name", "")
+        if tname == "schedule":
+          active = True
+          killed = False
+        elif (
+            tname == "manage_task"
+            and str((tc.get("args") or {}).get("Action", "")).lower() == "kill"
+        ):
+          active = False
+          killed = True
+    elif stype == "SYSTEM_MESSAGE":
+      if CRON_WAKEUP_RE.search(str(step.get("content", ""))):
+        active = True
+        killed = False
+  # At invocationNum == 0 of a cron wakeup, the new SYSTEM_MESSAGE may arrive via lastUserInput
+  if (
+      invocation_num == 0
+      and "<SYSTEM_MESSAGE>" in (last_user_input or "")
+      and CRON_WAKEUP_RE.search(last_user_input or "")
+  ):
+    active = True
+    killed = False
+  return active, killed
+
+
 def is_async_wakeup(transcript_path: str, last_user_input: str = "") -> bool:
   """True when invocationNum == 0 is a background-task or subagent wakeup, not a user turn.
 
@@ -1507,6 +1545,31 @@ def run(data: dict, log: dict) -> dict:
         f" once the user agrees, run {forward} and end the turn."
     )
 
+  # Stop hooks do not fire while a schedule task keeps the chat in STATE_WAITING_FOR_TASKS,
+  # so promote active schedule/cron chats to ⏳ on PreInvocation and restore ⦿ when killed
+  if not is_turn_start and conv_id:
+    sched_active, sched_killed = detect_schedule_state_in_turn(
+        transcript_path, last_user_input, invocation_num
+    )
+    if sched_active and not state.get("auto_waiting_schedule"):
+      try:
+        import chat_lifecycle
+
+        chat_lifecycle.set_conversation_wait_state(conv_id, waiting=True)
+        state["auto_waiting_schedule"] = True
+        save_state(state_path, state)
+      except Exception:
+        pass
+    elif sched_killed and state.get("auto_waiting_schedule"):
+      try:
+        import chat_lifecycle
+
+        chat_lifecycle.set_conversation_wait_state(conv_id, waiting=False)
+        state.pop("auto_waiting_schedule", None)
+        save_state(state_path, state)
+      except Exception:
+        pass
+
   m = measure_context(conv_id, transcript_path, int(state.get("gm_count", 0)))
   log.update(
       pct=round(m["pct"], 1),
@@ -1642,7 +1705,12 @@ def run(data: dict, log: dict) -> dict:
           else MAX_TURN_INVOCATIONS
       ),
   }
-  for k in ("discipline_blocked_turn", "last_blocked_edit_idx", "auto_title_notice"):
+  for k in (
+      "discipline_blocked_turn",
+      "last_blocked_edit_idx",
+      "auto_title_notice",
+      "auto_waiting_schedule",
+  ):
     if k in state:
       new_state[k] = state[k]
   save_state(state_path, new_state)

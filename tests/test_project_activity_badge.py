@@ -458,6 +458,11 @@ class TestProjectActivityBadge(unittest.TestCase):
     )
     self.assertEqual(running2["p1"], 2)
 
+  def test_urlopen_ls_blocks_unmocked_live_ls_in_unittest(self):
+    req = badge.urllib.request.Request("http://localhost:5387/")
+    with self.assertRaises(badge.urllib.error.URLError):
+      badge._urlopen_ls(req, timeout=0.1)
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -516,6 +516,49 @@ class TestContextGuard(unittest.TestCase):
           {},
       )
 
+  def test_preinvocation_promotes_and_restores_schedule_wait_state(self):
+    self.write_transcript(
+        {"type": "USER_INPUT", "content": "poll every 5m"},
+        {
+            "type": "PLANNER_RESPONSE",
+            "tool_calls": [
+                {"name": "schedule", "args": {"CronExpression": "*/5 * * * *"}}
+            ],
+        },
+        {
+            "type": "GENERIC",
+            "status": "DONE",
+            "content": "Tool is running as a background task with task id: t1",
+        },
+    )
+    with patch.object(chat_lifecycle, "set_conversation_wait_state") as mock_wait:
+      self.run_guard(inv=1, lastUserInput="poll every 5m")
+      mock_wait.assert_called_once_with("c1", waiting=True)
+
+    # Killing the task via manage_task(Action="kill") restores ⦿ (waiting=False)
+    self.write_transcript(
+        {"type": "USER_INPUT", "content": "poll every 5m"},
+        {
+            "type": "PLANNER_RESPONSE",
+            "tool_calls": [
+                {"name": "schedule", "args": {"CronExpression": "*/5 * * * *"}}
+            ],
+        },
+        {
+            "type": "SYSTEM_MESSAGE",
+            "content": "tick (iteration 3)",
+        },
+        {
+            "type": "PLANNER_RESPONSE",
+            "tool_calls": [
+                {"name": "manage_task", "args": {"Action": "kill", "TaskId": "t1"}}
+            ],
+        },
+    )
+    with patch.object(chat_lifecycle, "set_conversation_wait_state") as mock_wait:
+      self.run_guard(inv=1, lastUserInput="poll every 5m")
+      mock_wait.assert_called_once_with("c1", waiting=False)
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -707,6 +707,20 @@ class TestStopGuard(unittest.TestCase):
             "12345678-1234-1234-1234-123456789abc", waiting=True
         )
 
+      # Once the scheduled task ends or is killed and fullyIdle becomes True,
+      # stop_guard restores the auto-promoted chat back to ⦿ (waiting=False)
+      data["fullyIdle"] = True
+      with patch("sys.stdin", io.StringIO(json.dumps(data))), patch(
+          "sys.stdout", new_callable=io.StringIO
+      ) as mock_out, patch(
+          "chat_lifecycle.set_conversation_wait_state"
+      ) as mock_wait, patch.object(stop_guard, "play_stop_sound"):
+        stop_guard.main()
+        self.assertEqual(json.loads(mock_out.getvalue()), {})
+        mock_wait.assert_called_once_with(
+            "12345678-1234-1234-1234-123456789abc", waiting=False
+        )
+
 
 if __name__ == "__main__":
   unittest.main()

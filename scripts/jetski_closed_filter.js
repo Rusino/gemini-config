@@ -145,6 +145,8 @@
   let activeHoverBucket = null;
   let chainIndexCache = null;
   let chainIndexFetchedAt = 0;
+  let chainIndexFetching = false;
+  let chainPredecessorIds = new Set();
 
   function parseTitleMarker(title) {
     if (typeof title !== 'string') return null;
@@ -164,6 +166,27 @@
   function isChainPredecessorTitle(title) {
     const marker = parseTitleMarker(title);
     return marker === OPEN_CHAIN_ROOT_MARKER || marker === OPEN_CHAIN_STEP_MARKER;
+  }
+
+  // Returns IDs that have at least one visible continuation child in jetski-chains.json
+  function computeChainPredecessorIds(summariesMap, chainIndex) {
+    const preds = new Set();
+    const parentOf = chainIndex?.parentOf;
+    if (!parentOf || typeof parentOf !== 'object') return preds;
+    for (const [childId, parentId] of Object.entries(parentOf)) {
+      if (!parentId || !childId) continue;
+      if (!summariesMap || (childId in summariesMap && parentId in summariesMap)) {
+        preds.add(parentId);
+      }
+    }
+    return preds;
+  }
+
+  function isChainPredecessor(cascadeId, title) {
+    return (
+      isChainPredecessorTitle(title) ||
+      Boolean(cascadeId && chainPredecessorIds.has(cascadeId))
+    );
   }
 
   function getCurrentTimeStr() {
@@ -253,6 +276,28 @@
       // Ignore network errors and fall back to cached or single-chat resolution
     }
     return chainIndexCache || { parentOf: {}, createdAt: {} };
+  }
+
+  // Periodically refreshes jetski-chains.json in the background so chain steps filter by graph too
+  function ensureChainIndexLoaded() {
+    const now = Date.now();
+    if (chainIndexFetching || (chainIndexCache && now - chainIndexFetchedAt < 15000)) {
+      return;
+    }
+    if (typeof window.fetch !== 'function') return;
+    chainIndexFetching = true;
+    const prevCount = Object.keys(chainIndexCache?.parentOf || {}).length;
+    fetchChainIndex()
+      .then((idx) => {
+        chainIndexFetching = false;
+        const nextCount = Object.keys(idx?.parentOf || {}).length;
+        if (nextCount !== prevCount) {
+          scheduleSync();
+        }
+      })
+      .catch(() => {
+        chainIndexFetching = false;
+      });
   }
 
   function resolveChainIds(cascadeId, chainIndex, summariesMap) {
@@ -394,7 +439,7 @@
     const store = findReduxStore();
     const curTitle = getTitleForCascadeId(cascadeId, fallbackDomTitle);
     // Finalized («, ‹✓›, », «») and handed-off (▸, ✓) steps cannot toggle wait state
-    if (isFinalizedTitle(curTitle) || isChainPredecessorTitle(curTitle)) return;
+    if (isFinalizedTitle(curTitle) || isChainPredecessor(cascadeId, curTitle)) return;
 
     const nowTime = getCurrentTimeStr();
     const ts = extractTimePrefix(curTitle, nowTime);
@@ -494,17 +539,14 @@
   }
 
   // Classifies a conversation into one of the 5 mutually exclusive state buckets
-  function classifyChatBucket(summary, fallbackTitle) {
+  function classifyChatBucket(summary, fallbackTitle, cascadeId) {
     const title =
       summary?.annotations?.title || summary?.summary || fallbackTitle || '';
     const marker = parseTitleMarker(title);
     if (marker && FINALIZED_MARKERS.has(marker)) {
       return 'closed';
     }
-    if (
-      marker === OPEN_CHAIN_ROOT_MARKER ||
-      marker === OPEN_CHAIN_STEP_MARKER
-    ) {
+    if (isChainPredecessor(cascadeId, title)) {
       return 'steps';
     }
     // Cron chats with marker ⏳ keep notFullyIdle=true between ticks, so only
@@ -551,13 +593,14 @@
   }
 
   function classifySummaries(summariesMap, allowedBuckets) {
+    chainPredecessorIds = computeChainPredecessorIds(summariesMap, chainIndexCache);
     const hiddenIds = new Set();
     const perProjectHidden = new Map();
     const statsSummary = emptyBreakdown();
 
     for (const [cascadeId, summary] of Object.entries(summariesMap || {})) {
       if (!isEligibleTopLevelSummary(cascadeId, summary)) continue;
-      const bucket = classifyChatBucket(summary, '');
+      const bucket = classifyChatBucket(summary, '', cascadeId);
       countBucket(statsSummary, bucket);
       if (allowedBuckets.has(bucket)) continue;
       hiddenIds.add(cascadeId);
@@ -1171,7 +1214,7 @@
       const linkEl = rowEl.querySelector('a[aria-label]');
       const spanEl = rowEl.querySelector('span.truncate');
       const title = linkEl?.getAttribute('aria-label') || spanEl?.textContent || '';
-      const bucket = classifyChatBucket(summariesMap[rowId], title);
+      const bucket = classifyChatBucket(summariesMap[rowId], title, rowId);
       countBucket(domStats, bucket);
 
       if (!visibleBuckets.has(bucket)) {
@@ -1560,7 +1603,8 @@
     btn.setAttribute('data-cascade-id', cascadeId);
     const curTitle = getTitleForCascadeId(cascadeId, '');
     // Hide the Wait toggle on closed chats and handed-off chain predecessors
-    const isLeafOpen = !isFinalizedTitle(curTitle) && !isChainPredecessorTitle(curTitle);
+    const isLeafOpen =
+      !isFinalizedTitle(curTitle) && !isChainPredecessor(cascadeId, curTitle);
     btn.style.display = isLeafOpen ? '' : 'none';
     const waiting = isWaitingTitle(curTitle);
     const waitStr = waiting ? 'true' : 'false';
@@ -1663,7 +1707,8 @@
     btn.setAttribute('data-cascade-id', cascadeId);
     const curTitle = getTitleForCascadeId(cascadeId, fallbackDomTitle);
     // Only open leaf chats can be moved between Needs Me and Waiting
-    const isLeafOpen = !isFinalizedTitle(curTitle) && !isChainPredecessorTitle(curTitle);
+    const isLeafOpen =
+      !isFinalizedTitle(curTitle) && !isChainPredecessor(cascadeId, curTitle);
     btn.style.display = isLeafOpen ? '' : 'none';
     const waiting = isWaitingTitle(curTitle);
     const waitStr = waiting ? 'true' : 'false';
@@ -1774,6 +1819,7 @@
   }
 
   function runFullSync() {
+    ensureChainIndexLoaded();
     ensureStylesInjected();
     const reduxActive = syncReduxFilter();
     syncDomRowsAndPlaceholders(reduxActive);

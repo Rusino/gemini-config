@@ -519,6 +519,11 @@ def analyze_current_turn(transcript_path: str) -> dict:
         targs = tc.get("args") or {}
         if tname == "schedule":
           scheduled_timer = True
+        elif (
+            tname == "manage_task"
+            and str(targs.get("Action", "")).lower() == "kill"
+        ):
+          scheduled_timer = False
         elif tname in EDIT_TOOLS:
           target = get_tool_target_file(targs)
           if is_tracked_source_file(target):
@@ -594,27 +599,40 @@ def main() -> None:
   transcript_path = data.get("transcriptPath", "")
   artifact_dir = data.get("artifactDirectoryPath", "")
 
-  info = analyze_current_turn(transcript_path)
-  # Automatically promote a chat that scheduled a timer/cron this turn to ⏳
-  # before returning on fullyIdle=False (since active schedules keep fullyIdle False)
-  if conv_id and info.get("scheduled_timer"):
-    try:
-      from chat_lifecycle import set_conversation_wait_state
-
-      set_conversation_wait_state(conv_id, waiting=True)
-    except Exception:
-      pass
-
-  if not data.get("fullyIdle", True):
-    print("{}")
-    return
-
   state_path = (
       os.path.join(artifact_dir, "scratch", ".context_guard_state.json")
       if artifact_dir
       else f"/tmp/jetski_context_guard_{conv_id}.json"
   )
   state = load_state(state_path)
+
+  info = analyze_current_turn(transcript_path)
+  if not data.get("fullyIdle", True):
+    # Promote a chat with an active schedule to ⏳ when not fullyIdle
+    if conv_id and info.get("scheduled_timer"):
+      try:
+        from chat_lifecycle import set_conversation_wait_state
+
+        set_conversation_wait_state(conv_id, waiting=True)
+        if not state.get("auto_waiting_schedule"):
+          state["auto_waiting_schedule"] = True
+          save_state(state_path, state)
+      except Exception:
+        pass
+    print("{}")
+    return
+
+  # Once all scheduled tasks finish or are killed and the chat reaches fullyIdle,
+  # restore an auto-promoted chat from ⏳ back to ⦿ (Needs Me)
+  if conv_id and state.get("auto_waiting_schedule"):
+    try:
+      from chat_lifecycle import set_conversation_wait_state
+
+      set_conversation_wait_state(conv_id, waiting=False)
+      state.pop("auto_waiting_schedule", None)
+      save_state(state_path, state)
+    except Exception:
+      pass
 
   if (
       info.get("launched_new_conv")

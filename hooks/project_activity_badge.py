@@ -219,13 +219,24 @@ def _write_cached_conn(ls_address: str, csrf_token: str) -> None:
       pass
 
 
+def _urlopen_ls(req: urllib.request.Request, timeout: float):
+  # Block unmocked HTTP calls to the live Language Server during unit tests
+  if (
+      "unittest" in sys.modules
+      and not os.environ.get("JETSKI_TEST_ALLOW_LS_DISCOVERY")
+      and getattr(urllib.request.urlopen, "__module__", "") == "urllib.request"
+  ):
+    raise urllib.error.URLError("Blocked live LS request during unittest")
+  return urllib.request.urlopen(req, timeout=timeout)
+
+
 def _discover_from_http_index(ls_address: str) -> str:
   """Extracts csrfToken from `window.__APP_CONFIG__` on the Jetbox web index."""
   addr = ls_address.removeprefix("http://").removeprefix("https://")
   url = f"http://{addr}/"
   try:
     req = urllib.request.Request(url, method="GET")
-    with urllib.request.urlopen(req, timeout=1.0) as resp:
+    with _urlopen_ls(req, timeout=1.0) as resp:
       html = resp.read().decode("utf-8", errors="ignore")
     m = re.search(r'"csrfToken"\s*:\s*"([^"]+)"', html)
     if m:
@@ -328,7 +339,7 @@ def _fetch_jetbox_summaries_burst(
   )
   merged: dict[str, Any] = {}
   packets = 0
-  with urllib.request.urlopen(req, timeout=2.0) as resp:
+  with _urlopen_ls(req, timeout=2.0) as resp:
     raw_sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
     while True:
       try:
@@ -405,7 +416,7 @@ def fetch_trajectories(
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=2.0) as resp:
+    with _urlopen_ls(req, timeout=2.0) as resp:
       payload = json.loads(resp.read().decode("utf-8"))
     if isinstance(payload, dict):
       return payload.get("trajectorySummaries") or {}
@@ -555,7 +566,7 @@ def _mark_predecessors_read(summaries: dict[str, Any]) -> None:
         method="POST",
     )
     try:
-      with urllib.request.urlopen(req, timeout=1.5):
+      with _urlopen_ls(req, timeout=1.5):
         pass
     except Exception:
       pass
