@@ -4,6 +4,7 @@
 import json
 import os
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -209,6 +210,35 @@ class GitHubTreeBrokenChecksTest(unittest.TestCase):
     self.assertEqual(res_own["cq_status"], "🔴 1 check(s) failed")
     self.assertEqual(res_own["phase"], "ALERT_CQ_FAILED")
     self.assertTrue(res_own["in_my_attention"])
+
+  def test_script_changed_on_disk_validates_mtime_and_syntax(self):
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".py", delete=False
+    ) as tf:
+      tf.write("x = 1\n")
+      path = tf.name
+    try:
+      base_mtime = os.path.getmtime(path)
+      self.assertFalse(w.script_changed_on_disk(path, base_mtime))
+      # Newer mtime with valid Python syntax triggers reload
+      os.utime(path, (base_mtime + 10.0, base_mtime + 10.0))
+      self.assertTrue(w.script_changed_on_disk(path, base_mtime))
+      # Newer mtime with broken Python syntax does not trigger reload
+      with open(path, "w", encoding="utf-8") as f:
+        f.write("def broken(:\n")
+      os.utime(path, (base_mtime + 20.0, base_mtime + 20.0))
+      self.assertFalse(w.script_changed_on_disk(path, base_mtime))
+    finally:
+      os.unlink(path)
+
+  def test_reexec_self_closes_server_before_execv(self):
+    fake_server = mock.MagicMock()
+    with mock.patch.object(w.os, "execv") as mock_execv:
+      w.reexec_self(fake_server)
+    fake_server.server_close.assert_called_once()
+    mock_execv.assert_called_once_with(
+        w.sys.executable, [w.sys.executable, *w.sys.argv]
+    )
 
 
 if __name__ == "__main__":
