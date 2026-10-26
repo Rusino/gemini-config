@@ -357,7 +357,7 @@ def fetch_github_issue_updates(max_days, include_all):
             "updated_et": format_et(updated_dt),
         }))
 
-    # Also include recent issue notifications (e.g. mentions/state_change on closed issues)
+    # Notifications also cover subscribed and team-mention issues that involves: does not match
     try:
         notif_raw = subprocess.check_output(
             ["gh", "api", "notifications?all=true&per_page=30"],
