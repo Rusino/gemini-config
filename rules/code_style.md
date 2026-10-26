@@ -40,8 +40,17 @@ description: "Skia-style C++ minimalism and suppression of LLM coding reflexes."
   Change-Id: I...
   ```
   Run `python3 ~/.gemini/config/hooks/chat_lifecycle.py model --trailer` to obtain the trailer (e.g. `Assisted-by: Gemini 3.8 Flash (High)` or `Assisted-by: Gemini 3.8 Pro`). If the model cannot be determined, use `Assisted-by: AI`
-- **Direct & concise prose**: Write concise, direct prose (1–3 sentences explaining the problem and the fix)
-- **No LLM bulleted lists**: Never generate LLM-style bulleted lists of imperative verbs (`- Add...`, `- Refactor...`, `- Update...`) in commit descriptions unless explicitly asked
+- **Two-Tier Commit / PR Description Scaling**:
+  - **Tier 1 (Simple / localized bug fixes & small refactors)**: Write concise, direct prose (1–3 sentences explaining the problem and the fix), plus 1 explicit line stating how the new test fails without the fix (exact assertion, call count, or crash)
+  - **Tier 2 (Algorithmic, caching, concurrency, or performance CLs/PRs)**: Write a structured engineering specification containing:
+    1. **Problem & per-call cost**: Concrete mechanics and cost of the current code path
+    2. **Equivalence proof**: Why the new path produces the exact same result as the old path (and the input generator corpus size tested)
+    3. **`Behavior notes` / `Assumptions` / `Thread safety`**: Edge-case invariants, leaf-lock or lock-order proof, and bounded-cache memory math (`bytes/entry × capacity = max KB`)
+    4. **Empirical tables**: Compact `Before | After` benchmark tables and capacity/threshold selection sweep tables (`no cache`, `cap1`, `cap2`, `cap3`, `no limit`)
+    5. **Explicit pre-fix test failure & honest scope disclosures**: Exact failure of the new test before the fix (e.g., `Without the lock, the test crashes in 28 of 30 runs`) and explicit `Not tested:` / `Not profiled:` lines whenever a platform or scenario was not measured (never speculate)
+- **Plain Technical English (UNIX / Bell Labs style)**: Write simple, declarative Subject-Verb-Object sentences in the present tense using plain words (`keep`, `give`, `get`, `make`, `run`, `call`, `has`, `same as before`, `Thus`, `Now`); never use pompous Latinate LLM vocabulary (`utilize`, `facilitate`, `subsequently`, `consequently`, `mitigate`, `invocations`, `redundantly`, `leverage`, `comprehensive`, `seamlessly`)
+- **No LLM bulleted lists**: Never generate mechanical LLM-style bulleted lists of imperative verbs (`- Add...`, `- Refactor...`, `- Update...`) that restate the diff; structured `Behavior notes` / `Assumptions` / `Thread safety` bullets in Tier 2 specs are encouraged
+- **2×2 Ablation Matrix in Code Review Replies**: When a reviewer suggests an alternative or combined optimization/design (`A` vs. `B`), measure all 4 combinations (`baseline`, `A alone`, `B alone`, `A + B`) and include the exact numbers in the draft review reply
 - **Never publish review replies or resolve threads without asking**: Never publish review replies
   or comments to Gerrit or GitHub yourself, and never resolve/unresolve review threads (`resolveReviewThread`)
   unless the user explicitly asks you to. Only prepare / draft replies (either save as drafts on Gerrit or

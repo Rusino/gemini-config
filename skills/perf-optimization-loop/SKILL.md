@@ -74,6 +74,19 @@ For each hypothesis:
    `Change-Id:`, then `add --status WIN --delta <target delta> --sha HEAD`.
 6. Re-run correctness tests (`skia-test-paragraph`, `webparagraph-corpus`) at least every few
    commits and always before the audit.
+7. **Differential Equivalence Check**: For algorithmic fast paths, lookup tables, or caching
+   refactors, run a byte-for-byte / element-for-element comparison of the old vs. new
+   implementation across a large generated corpus of boundary inputs (e.g. all `0x110000`
+   Unicode code points, lone surrogates, mixed scripts, custom configs) and cite the exact
+   corpus size in the commit message.
+8. **Empirical Capacity / Threshold Selection Sweep**: Whenever introducing a bounded cache
+   (`SkLRUCache`, `THashMap` cap) or numeric threshold, benchmark a sweep of candidate
+   capacities (`no cache`, `cap1`, `cap2`, `cap3`, `no limit`) across working-set pools both
+   within and exceeding the cap (`N <= cap` and `N > cap`), and include the compact sweep table
+   plus per-entry memory math (`bytes/entry × cap = max KB`) in the commit message.
+9. **2×2 Ablation Matrix**: For compound optimizations or when a reviewer proposes combining or
+   choosing between two options (`A` vs. `B`), measure all 4 combinations (`baseline`, `A alone`,
+   `B alone`, `A + B`) to isolate each factor's true contribution before committing or replying.
 
 Never batch two ideas into one commit: the audit and any later bisect need per-idea numbers.
 

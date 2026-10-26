@@ -14,25 +14,24 @@ Responsibilities:
    the 4 outgoing autorollers (`Android`, `Chrome`, `Google3`, `Flutter`) via
    the local `skia-gardener` daemon (`http://localhost:8080/api/autorollers` and
    `/api/incidents`) and `git merge-base --is-ancestor` in `skia_main`.
-3. Updates a compact progress badge on the conversation title (via
-   `chat_lifecycle.py`) and wakes the target conversation via `agentapi send-message`
-   ONLY on significant transitions (new patchset, new reviewer/author comment,
-   CQ failure, merge, roll/status regression, or 100% roll completion).
-4. Serves the live "CL Flight Deck" HTML dashboard with SSE/polling updates,
-   Web Notifications (`new Notification(...)`) + desktop G3N alerts on breakages,
-   and one-click actions (Finalize chat, Wake chat, Copy Gmail cleanup command).
+3. Queries Gmail via the local MCP OAuth token (`gmailmcp.googleapis.com`) to
+   report `INBOX` vs `TRASH` message counts per CL/PR and support one-click
+   `INBOX` archiving (`batch_unlabel_threads` with `includeTrash=true`).
+4. Updates a compact progress badge on the conversation title and wakes the
+   target conversation via `agentapi send-message` only on significant transitions.
+5. Serves the live 5-column Markdown-styled "CL Flight Deck" HTML dashboard.
 """
 
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import glob
 import http.server
 import json
 import os
 import re
-import socket
 import socketserver
 import subprocess
 import sys
@@ -55,6 +54,8 @@ DEFAULT_SKIA_DIR = os.path.expanduser("~/.gemini/jetski/scratch/skia_main")
 DEFAULT_GARDENER_URL = "http://localhost:8080"
 STATE_FILE = os.path.expanduser("~/.gemini/config/logs/cl_watcher_state.json")
 PROJECTS_DIR = os.path.expanduser("~/.gemini/config/projects")
+MCP_TOKENS_FILE = os.path.expanduser("~/.gemini/jetski/mcp_oauth_tokens.json")
+GMAIL_MCP_URL = "https://gmailmcp.googleapis.com/mcp/v1"
 NOTIFY_SELF_BIN = "/google/bin/releases/g3n-team/notify_self"
 PEN_URL_SH = (
     "/google/src/files/head/depot/google3/security/uberproxy/tools/contrib/pen_url.sh"
@@ -70,12 +71,233 @@ RE_PR_ID = re.compile(r"(?:\bPR\s*#?|\bpull/)(\d{5,7})\b", re.IGNORECASE)
 # Strip any trailing roll badge we previously attached to a title
 RE_ROLL_BADGE = re.compile(r"\s*\[(?:⏳|✓|🔴|🔄)[^\]]*\]\s*$")
 
+_GMAIL_TOKEN_CACHE: dict[str, Any] = {"access_token": "", "expires_at": 0.0}
+_GMAIL_LOCK = threading.Lock()
+
+RU_MONTHS = {
+    1: "\u044f\u043d\u0432",
+    2: "\u0444\u0435\u0432",
+    3: "\u043c\u0430\u0440",
+    4: "\u0430\u043f\u0440",
+    5: "\u043c\u0430\u044f",
+    6: "\u0438\u044e\u043d",
+    7: "\u0438\u044e\u043b",
+    8: "\u0430\u0432\u0433",
+    9: "\u0441\u0435\u043d",
+    10: "\u043e\u043a\u0442",
+    11: "\u043d\u043e\u044f",
+    12: "\u0434\u0435\u043a",
+}
+
 
 def now_et_str() -> str:
   try:
     return datetime.now(ZoneInfo("America/New_York")).strftime("%H:%M:%S ET")
   except Exception:
     return datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+
+
+def parse_gerrit_or_iso_time(ts_str: str) -> datetime | None:
+  """Parses Gerrit ('2026-10-26 15:15:24.000000000') or ISO-8601 UTC timestamps."""
+  if not ts_str:
+    return None
+  s = ts_str.strip()
+  try:
+    if s.endswith("Z"):
+      s = s[:-1]
+    if "." in s:
+      head, frac = s.split(".", 1)
+      frac_digits = re.sub(r"[^0-9]", "", frac)[:6]
+      s = f"{head}.{frac_digits}" if frac_digits else head
+    s = s.replace("T", " ")
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+      dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+  except Exception:
+    return None
+
+
+def format_et_and_age(ts_str: str) -> tuple[str, str]:
+  """Returns formatted ET timestamp and relative age in America/New_York time."""
+  dt = parse_gerrit_or_iso_time(ts_str)
+  if not dt:
+    return "", ""
+  try:
+    et_tz = ZoneInfo("America/New_York")
+    dt_et = dt.astimezone(et_tz)
+    now_et = datetime.now(et_tz)
+    diff_sec = max(0, int((now_et - dt_et).total_seconds()))
+    if diff_sec < 90:
+      age = "\u0442\u043e\u043b\u044c\u043a\u043e \u0447\u0442\u043e"
+    elif diff_sec < 3600:
+      age = f"{diff_sec // 60} \u043c\u0438\u043d \u043d\u0430\u0437\u0430\u0434"
+    elif diff_sec < 86400:
+      hrs = diff_sec // 3600
+      mins = (diff_sec % 3600) // 60
+      age = f"{hrs} \u0447 {mins} \u043c\u0438\u043d \u043d\u0430\u0437\u0430\u0434" if mins else f"{hrs} \u0447 \u043d\u0430\u0437\u0430\u0434"
+    else:
+      days = diff_sec // 86400
+      age = f"{days} \u0434\u043d. \u043d\u0430\u0437\u0430\u0434"
+
+    m_str = RU_MONTHS.get(dt_et.month, str(dt_et.month))
+    if dt_et.date() == now_et.date():
+      et_fmt = dt_et.strftime("%H:%M ET")
+    else:
+      et_fmt = f"{dt_et.day} {m_str} \u0432 {dt_et.strftime('%H:%M')} ET"
+    return et_fmt, age
+  except Exception:
+    return "", ""
+
+
+def get_gmail_access_token() -> str:
+  """Obtains a fresh OAuth access token for the Gmail MCP server."""
+  with _GMAIL_LOCK:
+    now = time.time()
+    if _GMAIL_TOKEN_CACHE["access_token"] and now < _GMAIL_TOKEN_CACHE["expires_at"]:
+      return str(_GMAIL_TOKEN_CACHE["access_token"])
+    try:
+      if not os.path.isfile(MCP_TOKENS_FILE):
+        return ""
+      with open(MCP_TOKENS_FILE, "r", encoding="utf-8") as f:
+        all_tokens = json.load(f)
+      entry = all_tokens.get(GMAIL_MCP_URL) or {}
+      tok = entry.get("token") or {}
+      refresh_tok = tok.get("refresh_token")
+      client_id = entry.get("client_id")
+      client_secret = entry.get("client_secret")
+      token_url = entry.get("token_url") or "https://oauth2.googleapis.com/token"
+      if not (refresh_tok and client_id and client_secret):
+        return ""
+      form = urllib.parse.urlencode({
+          "client_id": client_id,
+          "client_secret": client_secret,
+          "refresh_token": refresh_tok,
+          "grant_type": "refresh_token",
+      }).encode("utf-8")
+      req = urllib.request.Request(token_url, data=form)
+      with urllib.request.urlopen(req, timeout=8) as resp:
+        resp_data = json.loads(resp.read().decode("utf-8", errors="replace"))
+      access_tok = str(resp_data.get("access_token") or "")
+      expires_in = int(resp_data.get("expires_in") or 3500)
+      if access_tok:
+        _GMAIL_TOKEN_CACHE["access_token"] = access_tok
+        _GMAIL_TOKEN_CACHE["expires_at"] = now + max(60, expires_in - 120)
+      return access_tok
+    except Exception:
+      return ""
+
+
+def call_gmail_mcp(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+  """Invokes a tool on https://gmailmcp.googleapis.com/mcp/v1 via JSON-RPC."""
+  tok = get_gmail_access_token()
+  if not tok:
+    return {}
+  payload = json.dumps({
+      "jsonrpc": "2.0",
+      "id": 1,
+      "method": "tools/call",
+      "params": {"name": tool_name, "arguments": arguments},
+  }).encode("utf-8")
+  req = urllib.request.Request(
+      GMAIL_MCP_URL,
+      data=payload,
+      headers={
+          "Authorization": f"Bearer {tok}",
+          "Content-Type": "application/json",
+          "Accept": "application/json, text/event-stream",
+      },
+  )
+  try:
+    with urllib.request.urlopen(req, timeout=10) as resp:
+      raw = json.loads(resp.read().decode("utf-8", errors="replace"))
+    content = (raw.get("result") or {}).get("content") or []
+    if content and isinstance(content[0], dict) and content[0].get("text"):
+      return json.loads(content[0]["text"])
+  except Exception:
+    pass
+  return {}
+
+
+def fetch_gmail_status_for_id(target_id: str) -> dict[str, Any]:
+  """Searches Gmail (including TRASH) for notification threads matching a CL/PR ID."""
+  res: dict[str, Any] = {
+      "thread_ids": [],
+      "inbox_thread_ids": [],
+      "total_msgs": 0,
+      "inbox_msgs": 0,
+      "trash_msgs": 0,
+      "unread_msgs": 0,
+  }
+  if not target_id:
+    return res
+  data = call_gmail_mcp(
+      "search_threads",
+      {"query": str(target_id), "includeTrash": True, "pageSize": 10},
+  )
+  threads = data.get("threads") or []
+  matched_threads = []
+  for th in threads:
+    if not isinstance(th, dict):
+      continue
+    msgs = th.get("messages") or []
+    # Match threads where the CL/PR number is in the subject or from an automated code review mailer
+    subj_match = any(str(target_id) in str(m.get("subject") or "") for m in msgs)
+    bot_match = any(
+        any(
+            b in str(m.get("sender") or "").lower()
+            for b in ("gerritcodereview", "skcq-be", "github.com", "critique")
+        )
+        for m in msgs
+    )
+    if subj_match and bot_match:
+      matched_threads.append(th)
+
+  # Fallback if subject did not explicitly include the ID on a short thread
+  if not matched_threads:
+    for th in threads:
+      if not isinstance(th, dict):
+        continue
+      msgs = th.get("messages") or []
+      if any(str(target_id) in str(m.get("subject") or "") for m in msgs):
+        matched_threads.append(th)
+
+  for th in matched_threads:
+    tid = str(th.get("id") or "")
+    if not tid:
+      continue
+    res["thread_ids"].append(tid)
+    msgs = th.get("messages") or []
+    th_has_inbox = False
+    for m in msgs:
+      res["total_msgs"] += 1
+      labels = set(m.get("labelIds") or [])
+      if "INBOX" in labels:
+        res["inbox_msgs"] += 1
+        th_has_inbox = True
+      if "TRASH" in labels:
+        res["trash_msgs"] += 1
+      if "UNREAD" in labels:
+        res["unread_msgs"] += 1
+    if th_has_inbox:
+      res["inbox_thread_ids"].append(tid)
+
+  return res
+
+
+def archive_gmail_threads_for_id(target_id: str, thread_ids: list[str] | None = None) -> dict[str, Any]:
+  """Removes INBOX and UNREAD labels from all matching threads (including split TRASH/INBOX threads)."""
+  tids = list(thread_ids or [])
+  if not tids and target_id:
+    gstat = fetch_gmail_status_for_id(target_id)
+    tids = gstat.get("inbox_thread_ids") or gstat.get("thread_ids") or []
+  if not tids:
+    return {"ok": True, "archived": []}
+  call_gmail_mcp(
+      "batch_unlabel_threads",
+      {"threadIds": tids, "labelIds": ["INBOX", "UNREAD"]},
+  )
+  return {"ok": True, "archived": tids}
 
 
 def load_watcher_state() -> dict[str, Any]:
@@ -127,7 +349,9 @@ def load_project_names() -> dict[str, str]:
       pid = str(pdata.get("id") or "").strip()
       pname = cl.clean_base_title(str(pdata.get("name") or "").strip())
       # Strip activity badge suffix (" · ⟳ 1 ● 2")
-      pname = re.sub(r"(?:\s*·\s*(?:[⟳⚠●]\s*\d+)(?:\s+(?:[⟳⚠●]\s*\d+))*)+$", "", pname).strip()
+      pname = re.sub(
+          r"(?:\s*·\s*(?:[⟳⚠●]\s*\d+)(?:\s+(?:[⟳⚠●]\s*\d+))*)+$", "", pname
+      ).strip()
       if pid and pname:
         res[pid] = pname
     except Exception:
@@ -189,7 +413,7 @@ def discover_active_cl_chats() -> list[dict[str, Any]]:
           "chat_last_modified": last_mod,
       })
 
-  # Deduplicate by (item_key, conversation_id), sorting newest chat modification first
+  # Sort newest chat modification first
   discovered.sort(key=lambda x: x["chat_last_modified"], reverse=True)
   return discovered
 
@@ -247,6 +471,7 @@ def check_skia_post_submit(
           "Google3": {"state": "⏳", "detail": "Not rolled yet"},
           "Flutter": {"state": "⏳", "detail": "Not rolled yet"},
       },
+      "passed_rolls": 0,
       "all_passed": False,
       "has_alert": False,
       "alert_reason": "",
@@ -290,7 +515,6 @@ def check_skia_post_submit(
       res["rolls"][rname] = {"state": "✓", "detail": f"Rolled ({last_rev[:8]})"}
       passed_rolls += 1
     elif _git_is_ancestor(skia_dir, merged_sha, curr_rev):
-      # Check if skia-gardener flagged this commit as a suspect in a failing roll
       suspect_hit = False
       for s_cl in (diag.get("in_flight_fix_cls") or []) + (diag.get("runner_up_cls") or []):
         if isinstance(s_cl, dict) and str(s_cl.get("hash") or "").startswith(merged_sha[:8]):
@@ -311,20 +535,16 @@ def check_skia_post_submit(
     else:
       res["rolls"][rname] = {"state": "⏳", "detail": "Waiting for roll window"}
 
-  # If at least one roll has already landed or commit is older and not blamed in any incident,
-  # mark Skia Status green
+  res["passed_rolls"] = passed_rolls
+
   if not blamed_tasks:
-    if passed_rolls > 0:
-      res["skia_status"] = "✓"
-      res["skia_status_detail"] = "Clean on status.skia.org"
-    else:
-      # Check if origin/main has at least 1 commit on top or if tasks finished cleanly
-      res["skia_status"] = "✓"
-      res["skia_status_detail"] = "No active regressions on status.skia.org"
+    res["skia_status"] = "✓"
+    res["skia_status_detail"] = "Clean on status.skia.org"
 
-  res["all_passed"] = (res["skia_status"] == "✓" and passed_rolls == 4 and not res["has_alert"])
+  res["all_passed"] = (
+      res["skia_status"] == "✓" and passed_rolls == 4 and not res["has_alert"]
+  )
 
-  # Build compact badge for chat title
   if res["has_alert"]:
     res["compact_badge"] = f"[🔴Alert · {passed_rolls}/4 rolls]"
   elif res["all_passed"]:
@@ -363,8 +583,15 @@ def fetch_gerrit_cl_status(
       owner_email = str(owner_obj.get("email") or "")
       owner_name = str(owner_obj.get("name") or owner_email)
       is_self = owner_email in SELF_EMAILS
-      is_external = not owner_email.endswith("@google.com") and not owner_email.endswith("@chromium.org")
-      role = "author" if is_self else ("reviewer (ext)" if is_external else "reviewer (goog)")
+      is_external = (
+          not owner_email.endswith("@google.com")
+          and not owner_email.endswith("@chromium.org")
+      )
+      role = (
+          "author"
+          if is_self
+          else ("reviewer (ext)" if is_external else "reviewer (goog)")
+      )
 
       cur_sha = str(d.get("current_revision") or "")
       revs = d.get("revisions") or {}
@@ -398,7 +625,6 @@ def fetch_gerrit_cl_status(
       last_msg_date = str(last_msg.get("date") or "")
       last_msg_text = str(last_msg.get("message") or "").strip().replace("\n", " ")
 
-      # Detect CQ / dry-run failure in the latest bot messages on the current patchset
       cq_failed = False
       cq_status = "Idle"
       if max_cq == 2:
@@ -409,7 +635,11 @@ def fetch_gerrit_cl_status(
         if int(m.get("_revision_number") or 0) != ps_num:
           continue
         txt = str(m.get("message") or "")
-        if "This CL failed the SkCQ" in txt or "Failed builds:" in txt or "Tryjobs failed" in txt:
+        if (
+            "This CL failed the SkCQ" in txt
+            or "Failed builds:" in txt
+            or "Tryjobs failed" in txt
+        ):
           if max_cq == 0:
             cq_failed = True
             cq_status = "🔴 CQ Failed"
@@ -418,11 +648,16 @@ def fetch_gerrit_cl_status(
           cq_status = "✓ Dry Run Passed"
           break
 
+      submitted_raw = str(d.get("submitted") or "")
+      submitted_et, submitted_age = format_et_and_age(submitted_raw)
+      last_msg_et, last_msg_age = format_et_and_age(last_msg_date)
+
       post_submit = None
       if status == "MERGED" and host == "skia-review.googlesource.com":
-        post_submit = check_skia_post_submit(cur_sha, rollers, incidents, skia_dir=skia_dir)
+        post_submit = check_skia_post_submit(
+            cur_sha, rollers, incidents, skia_dir=skia_dir
+        )
 
-      # Determine overall lifecycle phase
       if status == "ABANDONED":
         phase = "ABANDONED"
       elif status == "MERGED":
@@ -460,13 +695,19 @@ def fetch_gerrit_cl_status(
           "patchset": ps_num,
           "revision": cur_sha,
           "in_my_attention": in_my_attention,
-          "cr_summary": f"+{max_cr}" if max_cr > 0 else (str(min_cr) if min_cr < 0 else "0"),
+          "cr_summary": (
+              f"+{max_cr}" if max_cr > 0 else (str(min_cr) if min_cr < 0 else "0")
+          ),
           "cq_status": cq_status,
           "cq_failed": cq_failed,
           "last_msg_author": last_msg_author,
           "last_msg_date": last_msg_date,
-          "last_msg_snippet": last_msg_text[:160],
-          "submitted": str(d.get("submitted") or ""),
+          "last_msg_et": last_msg_et,
+          "last_msg_age": last_msg_age,
+          "last_msg_snippet": last_msg_text[:180],
+          "submitted": submitted_raw,
+          "submitted_et": submitted_et,
+          "submitted_age": submitted_age,
           "post_submit": post_submit,
       }
     except Exception:
@@ -503,7 +744,8 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
     failed_checks = [
         str(c.get("name") or "")
         for c in checks
-        if str(c.get("conclusion") or "").upper() in ("FAILURE", "TIMED_OUT", "ACTION_REQUIRED")
+        if str(c.get("conclusion") or "").upper()
+        in ("FAILURE", "TIMED_OUT", "ACTION_REQUIRED")
     ]
     pending_checks = [
         str(c.get("name") or "")
@@ -541,7 +783,11 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
     if events:
       events.sort(key=lambda x: x[0])
       last_date, last_actor, last_snippet = events[-1]
-      last_snippet = last_snippet.replace("\n", " ")[:160]
+      last_snippet = last_snippet.replace("\n", " ")[:180]
+
+    merged_raw = str(d.get("mergedAt") or "")
+    submitted_et, submitted_age = format_et_and_age(merged_raw)
+    last_msg_et, last_msg_age = format_et_and_age(last_date)
 
     if state == "MERGED":
       phase = "READY_TO_CLOSE"
@@ -557,7 +803,9 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
     return {
         "ok": True,
         "host": "github.com/flutter/flutter",
-        "url": str(d.get("url") or f"https://github.com/flutter/flutter/pull/{pr_id}"),
+        "url": str(
+            d.get("url") or f"https://github.com/flutter/flutter/pull/{pr_id}"
+        ),
         "status": state,
         "phase": phase,
         "subject": str(d.get("title") or f"PR #{pr_id}"),
@@ -574,8 +822,12 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         "cq_failed": bool(failed_checks),
         "last_msg_author": last_actor,
         "last_msg_date": last_date,
+        "last_msg_et": last_msg_et,
+        "last_msg_age": last_msg_age,
         "last_msg_snippet": last_snippet,
-        "submitted": str(d.get("mergedAt") or ""),
+        "submitted": merged_raw,
+        "submitted_et": submitted_et,
+        "submitted_age": submitted_age,
         "post_submit": None,
     }
   except Exception as e:
@@ -592,7 +844,11 @@ def fetch_piper_cl_status(cl_id: str) -> dict[str, Any]:
         timeout=10,
     )
     first_line = out.splitlines()[0] if out.splitlines() else ""
-    status = "SUBMITTED" if " *submitted* " in first_line or " submitted " in first_line else "PENDING"
+    status = (
+        "SUBMITTED"
+        if " *submitted* " in first_line or " submitted " in first_line
+        else "PENDING"
+    )
     owner = "unknown"
     m = re.match(r"^Change\s+\d+\s+by\s+([^\s@]+)", first_line)
     if m:
@@ -626,8 +882,12 @@ def fetch_piper_cl_status(cl_id: str) -> dict[str, Any]:
         "cq_failed": False,
         "last_msg_author": owner,
         "last_msg_date": "",
+        "last_msg_et": "",
+        "last_msg_age": "",
         "last_msg_snippet": subject,
         "submitted": "",
+        "submitted_et": "",
+        "submitted_age": "",
         "post_submit": None,
     }
   except Exception as e:
@@ -681,7 +941,6 @@ def update_chat_roll_badge(conv_id: str, current_title: str, badge: str) -> None
   base = cl.clean_base_title(current_title)
   base_no_badge = RE_ROLL_BADGE.sub("", base).strip()
   new_topic = f"{base_no_badge} {badge}".strip() if badge else base_no_badge
-  # Keep within ~52 chars
   if len(new_topic) > 54 and badge:
     avail = max(12, 53 - len(badge))
     new_topic = f"{base_no_badge[:avail].rstrip()} {badge}"
@@ -716,6 +975,14 @@ def sync_once(
   rollers, incidents = fetch_gardener_snapshot()
   discovered = discover_active_cl_chats()
 
+  # Fetch Gmail thread statuses in parallel across unique target IDs
+  unique_tids = sorted({d["target_id"] for d in discovered if d.get("target_id")})
+  gmail_cache: dict[str, dict[str, Any]] = {}
+  if unique_tids:
+    with ThreadPoolExecutor(max_workers=6) as pool:
+      for tid, gstat in zip(unique_tids, pool.map(fetch_gmail_status_for_id, unique_tids)):
+        gmail_cache[tid] = gstat
+
   # Cache fetched CL/PR metadata so multiple chats referencing the same CL don't re-fetch
   fetched_cache: dict[str, dict[str, Any]] = {}
   new_items: dict[str, Any] = {}
@@ -723,25 +990,36 @@ def sync_once(
   for d in discovered:
     ikey = d["item_key"]
     cid = d["conversation_id"]
+    tid = d["target_id"]
     composite_key = f"{ikey}@{cid}"
 
     if ikey not in fetched_cache:
       if d["kind"] == "gerrit":
         fetched_cache[ikey] = fetch_gerrit_cl_status(
-            d["target_id"], rollers, incidents, skia_dir=skia_dir
+            tid, rollers, incidents, skia_dir=skia_dir
         )
       elif d["kind"] == "github":
-        fetched_cache[ikey] = fetch_github_pr_status(d["target_id"])
+        fetched_cache[ikey] = fetch_github_pr_status(tid)
       else:
-        fetched_cache[ikey] = fetch_piper_cl_status(d["target_id"])
+        fetched_cache[ikey] = fetch_piper_cl_status(tid)
 
     info = fetched_cache[ikey]
     if not info.get("ok"):
       continue
 
+    gstat = gmail_cache.get(tid) or {
+        "thread_ids": [],
+        "inbox_thread_ids": [],
+        "total_msgs": 0,
+        "inbox_msgs": 0,
+        "trash_msgs": 0,
+        "unread_msgs": 0,
+    }
+
     record = {
         **d,
         **info,
+        "gmail": gstat,
         "composite_key": composite_key,
         "updated_at": now_et_str(),
     }
@@ -759,24 +1037,35 @@ def sync_once(
       prev_ps = prev.get("patchset")
       prev_msg_date = prev.get("last_msg_date")
       prev_phase = prev.get("phase")
-      prev_all_passed = ((prev.get("post_submit") or {}).get("all_passed"))
+      prev_all_passed = (prev.get("post_submit") or {}).get("all_passed")
 
       transition_msg = ""
       is_critical = False
 
       if prev_status != "MERGED" and info["status"] == "MERGED":
+        # Automatically archive Gmail threads from INBOX on merge
+        if gstat.get("inbox_thread_ids"):
+          archive_gmail_threads_for_id(tid, gstat["inbox_thread_ids"])
+          gstat["inbox_msgs"] = 0
+          gstat["inbox_thread_ids"] = []
         transition_msg = (
             f"[CL-WATCHER] ✅ {ikey} ('{info['subject']}') has just MERGED "
-            f"(revision {info['revision'][:10]}). Please archive any Gmail threads for "
-            f"{d['target_id']} from INBOX (using batch_unlabel_threads with includeTrash=true) "
-            f"and report the initial Skia Status / Autoroll watch checklist."
+            f"(revision {info['revision'][:10]}). Gmail INBOX threads for {tid} "
+            f"were automatically archived. Please report the initial Skia Status "
+            f"and 4-autoroll watch checklist."
         )
-      elif info["phase"] == "ALERT_ROLL_OR_STATUS" and prev_phase != "ALERT_ROLL_OR_STATUS":
+      elif (
+          info["phase"] == "ALERT_ROLL_OR_STATUS"
+          and prev_phase != "ALERT_ROLL_OR_STATUS"
+      ):
         is_critical = True
-        reason = post.get("alert_reason") or "Post-submit regression or roll failure"
+        reason = (
+            post.get("alert_reason") or "Post-submit regression or roll failure"
+        )
         transition_msg = (
             f"[CL-WATCHER] 🔴 CRITICAL ALERT for {ikey} ({info['revision'][:10]}): "
-            f"{reason}. Please inspect skia-gardener / status.skia.org immediately and prepare a diagnosis."
+            f"{reason}. Please inspect skia-gardener / status.skia.org immediately "
+            f"and prepare a diagnosis."
         )
       elif info["phase"] == "ALERT_CQ_FAILED" and prev_phase != "ALERT_CQ_FAILED":
         is_critical = True
@@ -785,14 +1074,18 @@ def sync_once(
             f"{info['last_msg_snippet']}. Please inspect the failure and propose a fix."
         )
       elif post.get("all_passed") and not prev_all_passed:
+        if gstat.get("inbox_thread_ids"):
+          archive_gmail_threads_for_id(tid, gstat["inbox_thread_ids"])
+          gstat["inbox_msgs"] = 0
+          gstat["inbox_thread_ids"] = []
         transition_msg = (
             f"[CL-WATCHER] 🏁 All 4 autorolls (Android, Chrome, Google3, Flutter) and "
             f"Skia Status have passed cleanly for {ikey} ({info['revision'][:10]})! "
-            f"Please archive any remaining Gmail threads for {d['target_id']} from INBOX "
-            f"and ask the user if we should finalize this chat."
+            f"Remaining Gmail threads for {tid} have been archived from INBOX. "
+            f"Ask the user if we should finalize this chat."
         )
       elif (
-          info["status"] == "NEW"
+          info["status"] in ("NEW", "OPEN")
           and (info["patchset"] != prev_ps or info["last_msg_date"] != prev_msg_date)
           and info["last_msg_author"] not in SELF_EMAILS
           and info["last_msg_author"] not in SELF_GITHUB_LOGINS
@@ -806,10 +1099,10 @@ def sync_once(
 
       if transition_msg:
         ev = {
-            "id": f"ev-{int(time.time() * 1000)}-{d['target_id']}",
+            "id": f"ev-{int(time.time() * 1000)}-{tid}",
             "time": now_et_str(),
             "item_key": ikey,
-            "target_id": d["target_id"],
+            "target_id": tid,
             "conversation_id": cid,
             "project_name": d["project_name"],
             "critical": is_critical,
@@ -818,7 +1111,9 @@ def sync_once(
         events.insert(0, ev)
         events = events[:50]
         if is_critical:
-          send_desktop_alert(f"CL Alert: {ikey}", transition_msg, info.get("url", ""))
+          send_desktop_alert(
+              f"CL Alert: {ikey}", transition_msg, info.get("url", "")
+          )
         if wake_chats:
           wake_conversation(cid, transition_msg)
 
@@ -842,281 +1137,271 @@ def sync_once(
   return state
 
 
-DASHBOARD_HTML = r"""<!DOCTYPE html>
-<html lang="en">
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CL Flight Deck · Skia & Flutter</title>
+<title>\u0421\u0432\u043e\u0434\u043a\u0430 \u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0445 \u0421\u041b\u0435\u0439 \u0438 PR · Skia & Flutter</title>
 <style>
   :root {
+    --bg: #ffffff;
+    --bg-subtle: #f6f8fa;
+    --row-hover: #f3f6f9;
+    --border: #d0d7de;
+    --text: #1f2328;
+    --muted: #59636e;
+    --link: #0969da;
+    --code-bg: rgba(175, 184, 193, 0.22);
+    --alert-row: #ffebe9;
+    --warn-bg: #fff8c5;
+    --warn-border: #d4a72c;
+    --ok-text: #1a7f37;
+    --danger-text: #cf222e;
+  }
+  [data-theme="dark"] {
     --bg: #0d1117;
-    --panel: #161b22;
-    --panel-hover: #1c222b;
+    --bg-subtle: #161b22;
+    --row-hover: #1c2128;
     --border: #30363d;
     --text: #e6edf3;
     --muted: #8b949e;
-    --accent: #58a6ff;
-    --green: #3fb950;
-    --green-bg: rgba(63, 185, 80, 0.14);
-    --yellow: #d29922;
-    --yellow-bg: rgba(210, 153, 34, 0.15);
-    --red: #f85149;
-    --red-bg: rgba(248, 81, 73, 0.16);
-    --purple: #a371f7;
-    --purple-bg: rgba(163, 113, 247, 0.15);
+    --link: #58a6ff;
+    --code-bg: rgba(110, 118, 129, 0.28);
+    --alert-row: rgba(248, 81, 73, 0.12);
+    --warn-bg: rgba(210, 153, 34, 0.15);
+    --warn-border: rgba(210, 153, 34, 0.45);
+    --ok-text: #3fb950;
+    --danger-text: #f85149;
   }
   * { box-sizing: border-box; }
   body {
     margin: 0;
-    padding: 20px 28px;
+    padding: 24px 32px 48px;
     background: var(--bg);
     color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    font-size: 13px;
-    line-height: 1.45;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    max-width: 1560px;
+    margin-left: auto;
+    margin-right: auto;
   }
-  header {
+  .top-header {
     display: flex;
     flex-wrap: wrap;
-    align-items: center;
+    align-items: baseline;
     justify-content: space-between;
-    gap: 14px;
-    padding-bottom: 16px;
+    gap: 12px;
     border-bottom: 1px solid var(--border);
-    margin-bottom: 18px;
+    padding-bottom: 12px;
+    margin-bottom: 16px;
   }
-  .title-block h1 {
+  .top-header h1 {
     margin: 0;
     font-size: 20px;
     font-weight: 600;
-    display: flex;
-    align-items: center;
-    gap: 10px;
   }
-  .subtitle {
+  .meta-line {
     color: var(--muted);
-    font-size: 12px;
-    margin-top: 3px;
+    font-size: 13px;
+    margin-top: 4px;
   }
-  .controls {
+  .toolbar {
     display: flex;
-    align-items: center;
-    gap: 10px;
     flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
   }
-  button, .btn {
-    background: var(--panel);
+  button {
+    background: var(--bg-subtle);
     color: var(--text);
     border: 1px solid var(--border);
     border-radius: 6px;
-    padding: 6px 12px;
-    font-size: 12px;
+    padding: 5px 11px;
+    font-size: 12.5px;
     font-weight: 500;
     cursor: pointer;
-    transition: background 0.15s, border-color 0.15s;
-    text-decoration: none;
     display: inline-flex;
     align-items: center;
+    gap: 5px;
+  }
+  button:hover {
+    background: var(--row-hover);
+  }
+  button.active-tab {
+    background: var(--link);
+    color: #ffffff;
+    border-color: var(--link);
+  }
+  button.btn-sm {
+    padding: 2px 8px;
+    font-size: 11.5px;
+    border-radius: 5px;
+  }
+  button.btn-warn {
+    background: var(--warn-bg);
+    border-color: var(--warn-border);
+    color: var(--text);
+    font-weight: 600;
+  }
+  .project-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
     gap: 6px;
-  }
-  button:hover, .btn:hover {
-    background: var(--panel-hover);
-    border-color: var(--muted);
-  }
-  button.primary {
-    background: rgba(88, 166, 255, 0.15);
-    border-color: rgba(88, 166, 255, 0.45);
-    color: var(--accent);
-  }
-  button.danger {
-    background: var(--red-bg);
-    border-color: rgba(248, 81, 73, 0.45);
-    color: var(--red);
-  }
-  .rollers-bar {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-    gap: 10px;
     margin-bottom: 18px;
   }
-  .roller-card {
-    background: var(--panel);
+  .rollers-inline {
+    background: var(--bg-subtle);
     border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 10px 14px;
+    border-radius: 6px;
+    padding: 8px 14px;
+    margin-bottom: 18px;
+    font-size: 13px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 18px;
+  }
+  .section-title {
+    font-size: 16px;
+    font-weight: 600;
+    margin: 22px 0 10px 0;
     display: flex;
     align-items: center;
     justify-content: space-between;
   }
-  .roller-name {
-    font-weight: 600;
-    font-size: 13px;
-  }
-  .roller-meta {
-    color: var(--muted);
-    font-size: 11px;
-    margin-top: 2px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  }
-  .filter-bar {
-    display: flex;
-    gap: 8px;
-    margin-bottom: 14px;
-    flex-wrap: wrap;
-  }
-  .pill {
-    padding: 4px 10px;
-    border-radius: 999px;
-    font-size: 11.5px;
-    font-weight: 600;
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    white-space: nowrap;
-  }
-  .pill.green { background: var(--green-bg); color: var(--green); }
-  .pill.yellow { background: var(--yellow-bg); color: var(--yellow); }
-  .pill.red { background: var(--red-bg); color: var(--red); }
-  .pill.purple { background: var(--purple-bg); color: var(--purple); }
-  .pill.muted { background: rgba(139, 148, 158, 0.15); color: var(--muted); }
-
-  table {
+  /* Markdown-style table */
+  table.md-table {
     width: 100%;
     border-collapse: collapse;
-    background: var(--panel);
+    margin-bottom: 20px;
+    font-size: 13.5px;
     border: 1px solid var(--border);
-    border-radius: 8px;
-    overflow: hidden;
   }
-  th, td {
-    padding: 10px 12px;
+  table.md-table th,
+  table.md-table td {
+    border: 1px solid var(--border);
+    padding: 10px 13px;
     text-align: left;
-    border-bottom: 1px solid var(--border);
-    vertical-align: middle;
+    vertical-align: top;
   }
-  th {
-    background: rgba(255, 255, 255, 0.02);
-    color: var(--muted);
+  table.md-table th {
+    background: var(--bg-subtle);
     font-weight: 600;
-    font-size: 11.5px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-  }
-  tr:last-child td { border-bottom: none; }
-  tr:hover td { background: var(--panel-hover); }
-  tr.row-alert td { background: rgba(248, 81, 73, 0.07); }
-  tr.row-ready td { opacity: 0.85; }
-
-  a { color: var(--accent); text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  .mono {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 12px;
-  }
-  .roll-grid {
-    display: inline-flex;
-    gap: 6px;
-    flex-wrap: wrap;
-  }
-  .roll-chip {
-    padding: 2px 7px;
-    border-radius: 4px;
-    font-size: 11px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    border: 1px solid var(--border);
-  }
-  .roll-chip.ok { background: var(--green-bg); color: var(--green); border-color: rgba(63,185,80,0.3); }
-  .roll-chip.wait { background: rgba(139,148,158,0.1); color: var(--muted); }
-  .roll-chip.cq { background: var(--yellow-bg); color: var(--yellow); border-color: rgba(210,153,34,0.35); }
-  .roll-chip.fail { background: var(--red-bg); color: var(--red); border-color: rgba(248,81,73,0.45); font-weight: 700; }
-
-  .snippet {
-    color: var(--muted);
-    font-size: 11.5px;
-    max-width: 340px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .events-panel {
-    margin-top: 22px;
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 12px 16px;
-  }
-  .events-panel h3 {
-    margin: 0 0 8px 0;
     font-size: 13px;
-    color: var(--muted);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
   }
-  .event-row {
-    padding: 6px 0;
-    border-bottom: 1px solid var(--border);
+  table.md-table tr:nth-child(even) td {
+    background: rgba(175, 184, 193, 0.04);
+  }
+  table.md-table tr:hover td {
+    background: var(--row-hover);
+  }
+  table.md-table tr.row-alert td {
+    background: var(--alert-row);
+  }
+  code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
     font-size: 12px;
-    display: flex;
-    gap: 10px;
+    background: var(--code-bg);
+    padding: 2px 5px;
+    border-radius: 4px;
+    word-break: break-word;
   }
-  .event-row:last-child { border-bottom: none; }
+  a {
+    color: var(--link);
+    text-decoration: none;
+  }
+  a:hover {
+    text-decoration: underline;
+  }
+  .muted {
+    color: var(--muted);
+    font-size: 12.5px;
+  }
+  .cell-actions {
+    margin-top: 7px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .col-chat { width: 21%; }
+  .col-cl { width: 25%; }
+  .col-gerrit { width: 20%; }
+  .col-rolls { width: 17%; }
+  .col-gmail { width: 17%; }
 </style>
 </head>
 <body>
 
-<header>
-  <div class="title-block">
-    <h1>✈️ CL &amp; PR Flight Deck <span class="pill purple" id="count-badge">0 tracked</span></h1>
-    <div class="subtitle" id="sync-status">Connecting to watcher...</div>
+<div class="top-header">
+  <div>
+    <h1>\u0427\u0442\u043e \u0441\u0435\u0439\u0447\u0430\u0441 \u043f\u0440\u043e\u0438\u0441\u0445\u043e\u0434\u0438\u0442 \u0441 \u0421\u041b\u044f\u043c\u0438 \u0438 PR (<span id="total-count">0</span> \u043e\u0442\u043a\u0440\u044b\u0442\u044b\u0445 \u0447\u0430\u0442\u043e\u0432)</h1>
+    <div class="meta-line" id="sync-status">\u041e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u0435...</div>
   </div>
-  <div class="controls">
-    <button id="notif-btn" onclick="enableNotifications()">🔔 Enable Browser Alerts</button>
-    <button onclick="testNotification()">🔊 Test Alert</button>
-    <button class="primary" onclick="triggerRefresh()">⟳ Poll Now</button>
+  <div class="toolbar">
+    <label style="font-size:12.5px; display:inline-flex; align-items:center; gap:5px; cursor:pointer; margin-right:6px;">
+      <input type="checkbox" id="hide-ready-cb" onchange="renderFromCache()">
+      \u0421\u043a\u0440\u044b\u0442\u044c \u0443\u0436\u0435 \u043f\u0440\u043e\u0448\u0435\u0434\u0448\u0438\u0435 \u0432\u0441\u0435 4 \u0440\u043e\u043b\u043b\u0430 (🏁)
+    </label>
+    <button id="notif-btn" onclick="enableNotifications()">🔔 \u0423\u0432\u0435\u0434\u043e\u043c\u043b\u0435\u043d\u0438\u044f \u0431\u0440\u0430\u0443\u0437\u0435\u0440\u0430</button>
+    <button onclick="testNotification()">🔊 \u0422\u0435\u0441\u0442 \u0437\u0432\u0443\u043a\u0430</button>
+    <button onclick="toggleTheme()" id="theme-btn">🌙 \u0422\u0451\u043c\u043d\u0430\u044f \u0442\u0435\u043c\u0430</button>
+    <button onclick="triggerRefresh()">⟳ \u041e\u0431\u043d\u043e\u0432\u0438\u0442\u044c \u0441\u0435\u0439\u0447\u0430\u0441</button>
   </div>
-</header>
-
-<div class="rollers-bar" id="rollers-bar"></div>
-
-<div class="filter-bar" id="project-filters"></div>
-
-<table>
-  <thead>
-    <tr>
-      <th>Project &amp; Chat</th>
-      <th>CL / PR</th>
-      <th>Role &amp; Owner</th>
-      <th>Phase &amp; Gerrit / CQ</th>
-      <th>Skia Status &amp; 4 Autorolls</th>
-      <th>Latest Activity</th>
-      <th>Actions</th>
-    </tr>
-  </thead>
-  <tbody id="table-body"></tbody>
-</table>
-
-<div class="events-panel">
-  <h3>Recent Watcher Wakeups &amp; Alerts</h3>
-  <div id="events-list"><div style="color:var(--muted)">No transitions recorded yet.</div></div>
 </div>
 
+<div class="rollers-inline" id="rollers-bar"></div>
+
+<div class="project-tabs" id="project-tabs"></div>
+
+<div id="tables-container"></div>
+
 <script>
-let currentProjectFilter = 'ALL';
+let cachedData = null;
+let selectedProject = 'SkParagraph';
+let initialProjectPicked = false;
 let seenEventIds = new Set();
 let initialLoadDone = false;
+
+function initTheme() {
+  const saved = localStorage.getItem('cl_deck_theme') || 'light';
+  document.documentElement.setAttribute('data-theme', saved);
+  updateThemeBtn(saved);
+}
+
+function toggleTheme() {
+  const cur = document.documentElement.getAttribute('data-theme') || 'light';
+  const next = cur === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('cl_deck_theme', next);
+  updateThemeBtn(next);
+}
+
+function updateThemeBtn(theme) {
+  const btn = document.getElementById('theme-btn');
+  btn.textContent = theme === 'dark' ? '☀️ \u0421\u0432\u0435\u0442\u043b\u0430\u044f \u0442\u0435\u043c\u0430' : '🌙 \u0422\u0451\u043c\u043d\u0430\u044f \u0442\u0435\u043c\u0430';
+}
+
+function esc(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
 
 function updateNotifButton() {
   const btn = document.getElementById('notif-btn');
   if (!('Notification' in window)) {
-    btn.textContent = '🔕 Notifications Unsupported';
+    btn.textContent = '🔕 \u0423\u0432\u0435\u0434\u043e\u043c\u043b\u0435\u043d\u0438\u044f \u043d\u0435 \u043f\u043e\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u044e\u0442\u0441\u044f';
     return;
   }
   if (Notification.permission === 'granted') {
-    btn.textContent = '🔔 Browser Alerts: ON';
-    btn.classList.add('primary');
+    btn.textContent = '🔔 \u0423\u0432\u0435\u0434\u043e\u043c\u043b\u0435\u043d\u0438\u044f: \u0412\u041a\u041b';
   } else if (Notification.permission === 'denied') {
-    btn.textContent = '🔕 Browser Alerts: Blocked';
+    btn.textContent = '🔕 \u0423\u0432\u0435\u0434\u043e\u043c\u043b\u0435\u043d\u0438\u044f \u0437\u0430\u0431\u043b\u043e\u043a\u0438\u0440\u043e\u0432\u0430\u043d\u044b';
   }
 }
 
@@ -1152,57 +1437,130 @@ function fireBrowserNotification(title, body, critical) {
 
 function testNotification() {
   fireBrowserNotification(
-    '🔴 CL Flight Deck Test Alert',
-    'Browser notifications and audio chime are active for CQ/Roll breakages.',
+    '🔴 \u0422\u0435\u0441\u0442\u043e\u0432\u044b\u0439 \u0430\u043b\u0435\u0440\u0442 CL Flight Deck',
+    '\u0411\u0440\u0430\u0443\u0437\u0435\u0440\u043d\u044b\u0435 \u0443\u0432\u0435\u0434\u043e\u043c\u043b\u0435\u043d\u0438\u044f \u0438 \u0437\u0432\u0443\u043a\u043e\u0432\u043e\u0439 \u0441\u0438\u0433\u043d\u0430\u043b \u0440\u0430\u0431\u043e\u0442\u0430\u044e\u0442.',
     true
   );
 }
 
-function phaseBadge(item) {
-  const p = item.phase;
-  if (p === 'ALERT_ROLL_OR_STATUS' || p === 'ALERT_CQ_FAILED') {
-    return `<span class="pill red">🔴 ${p.replace('ALERT_', '')}</span>`;
+function formatAuthorAndCl(it) {
+  let label = `CL ${esc(it.target_id)}`;
+  if (it.kind === 'github') label = `PR #${esc(it.target_id)}`;
+  else if (it.kind === 'piper') label = `cl/${esc(it.target_id)}`;
+
+  let roleDesc = '';
+  if (it.is_self) {
+    roleDesc = `<code>${esc(it.owner_email || it.owner_name)}</code> — \u0442\u0432\u043e\u0439 \u0421\u041b`;
+  } else if (it.is_external) {
+    roleDesc = `<code>${esc(it.owner_email || it.owner_name)}</code> — \u0432\u043d\u0435\u0448\u043d\u0438\u0439 \u0430\u0432\u0442\u043e\u0440!`;
+  } else {
+    roleDesc = `<code>${esc(it.owner_email || it.owner_name)}</code> — \u043a\u043e\u043b\u043b\u0435\u0433\u0430`;
   }
-  if (p === 'NEEDS_YOUR_ACTION') {
-    return `<span class="pill yellow">⚡ Needs Your Action</span>`;
-  }
-  if (p === 'SUBMITTING') {
-    return `<span class="pill purple">🚀 Submitting (CQ+2)</span>`;
-  }
-  if (p === 'POST_SUBMIT_ROLLING') {
-    return `<span class="pill yellow">⏳ Rolling Post-Submit</span>`;
-  }
-  if (p === 'READY_TO_CLOSE') {
-    return `<span class="pill green">🏁 All Checks Passed</span>`;
-  }
-  if (p === 'ABANDONED') {
-    return `<span class="pill muted">Abandoned</span>`;
-  }
-  return `<span class="pill muted">⏳ Waiting</span>`;
+  return `<strong><a href="${esc(it.url)}" target="_blank">${label}</a></strong> (${roleDesc})<br><em>${esc(it.subject)}</em>`;
 }
 
-function renderRollsCell(item) {
-  const ps = item.post_submit;
-  if (!ps) {
-    if (item.status === 'MERGED') {
-      return `<span class="pill green">✓ Merged</span>`;
+function formatGerritStatusCell(it) {
+  const ps = `PS${it.patchset || 1}`;
+  if (it.status === 'MERGED') {
+    const post = it.post_submit;
+    const isDone = !post || post.all_passed;
+    const icon = (post && post.has_alert) ? '🔴' : (isDone ? '🏁' : '🟢');
+    const shaShort = esc((it.revision || '').slice(0, 10));
+    let timeLine = '';
+    if (it.submitted_et) {
+      const agePart = it.submitted_age ? ` (${esc(it.submitted_age)})` : '';
+      timeLine = `\u0417\u0430\u0441\u0430\u0431\u043c\u0438\u0447\u0435\u043d ${esc(it.submitted_et)}${agePart}, \u043a\u043e\u043c\u043c\u0438\u0442 <code>${shaShort}</code>.`;
+    } else {
+      timeLine = `\u0417\u0430\u0441\u0430\u0431\u043c\u0438\u0447\u0435\u043d, \u043a\u043e\u043c\u043c\u0438\u0442 <code>${shaShort}</code>.`;
     }
-    return `<span style="color:var(--muted)">Pre-submit (${item.cq_status})</span>`;
+    return `${icon} <strong><code>MERGED</code> (${ps})</strong><br><span class="muted">${timeLine}</span>`;
   }
-  const chipClass = (st) => st === '✓' ? 'ok' : (st === '🔴' ? 'fail' : (st === '🔄' ? 'cq' : 'wait'));
-  let html = `<div class="roll-grid">`;
-  html += `<span class="roll-chip ${chipClass(ps.skia_status)}" title="${ps.skia_status_detail}">Status ${ps.skia_status}</span>`;
-  for (const rname of ['Android', 'Chrome', 'Google3', 'Flutter']) {
-    const r = (ps.rolls || {})[rname] || {state: '⏳', detail: ''};
-    const shortName = rname === 'Google3' ? 'G3' : rname.slice(0, 3);
-    html += `<span class="roll-chip ${chipClass(r.state)}" title="${rname}: ${r.detail}">${shortName} ${r.state}</span>`;
+
+  if (it.status === 'ABANDONED' || it.status === 'CLOSED') {
+    return `⚪ <strong><code>${esc(it.status)}</code> (${ps})</strong>`;
   }
-  html += `</div>`;
-  return html;
+
+  // Active NEW / OPEN CL or PR
+  if (it.cq_failed) {
+    return `🔴 <strong><code>${esc(it.status)}</code> (${ps} · ${esc(it.cq_status)})</strong><br><span class="muted">\u041f\u043e\u0441\u043b\u0435\u0434\u043d\u0435\u0435 \u043e\u0442 <code>${esc(it.last_msg_author)}</code>: ${esc(it.last_msg_snippet)}</span>`;
+  }
+  if (it.phase === 'SUBMITTING') {
+    const agePart = it.last_msg_age ? ` (${esc(it.last_msg_age)})` : '';
+    return `🟡 <strong><code>${esc(it.status)}</code> (${ps} \u0432 CQ+2)</strong><br><span class="muted">\u041e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d \u0432 \u0441\u0430\u0431\u043c\u0438\u0442${agePart}, \u0441\u0435\u0439\u0447\u0430\u0441 \u0431\u0435\u0436\u0438\u0442 <code>SkCQ</code>.</span>`;
+  }
+  if (it.in_my_attention) {
+    const agePart = it.last_msg_age ? ` (${esc(it.last_msg_age)})` : '';
+    return `⚡ <strong><code>${esc(it.status)}</code> (${ps} · \u0436\u0434\u0451\u0442 \u043e\u0442\u0432\u0435\u0442\u0430)</strong><br><span class="muted">CR: ${esc(it.cr_summary)} · ${esc(it.cq_status)}. \u041e\u0442 <code>${esc(it.last_msg_author)}</code>${agePart}: ${esc(it.last_msg_snippet)}</span>`;
+  }
+  return `⏸️ <strong><code>${esc(it.status)}</code> (${ps})</strong><br><span class="muted">\u0412 \u0440\u0430\u0431\u043e\u0442\u0435 (CR: ${esc(it.cr_summary)} · ${esc(it.cq_status)}).</span>`;
+}
+
+function formatRollsCell(it) {
+  if (it.status !== 'MERGED') {
+    if (it.phase === 'SUBMITTING') {
+      return `\u041e\u0436\u0438\u0434\u0430\u0435\u0442 \u0441\u0430\u0431\u043c\u0438\u0442\u0430`;
+    }
+    return `<span class="muted">\u041d\u0430 \u0440\u0435\u0432\u044c\u044e / \u0432 \u0440\u0430\u0437\u0440\u0430\u0431\u043e\u0442\u043a\u0435</span>`;
+  }
+  const ps = it.post_submit;
+  if (!ps) {
+    return `<strong><code>✓ Merged</code></strong>`;
+  }
+  if (ps.all_passed) {
+    return `<strong><code>✓Status · ✓And ✓Chr ✓G3 ✓Flt</code></strong><br><span class="muted">(\u0432\u0441\u0435 4/4 \u0440\u043e\u043b\u043b\u0430 \u043f\u0440\u043e\u0439\u0434\u0435\u043d\u044b!)</span>`;
+  }
+  const r = ps.rolls || {};
+  const andSt = (r.Android || {}).state || '⏳';
+  const chrSt = (r.Chrome || {}).state || '⏳';
+  const g3St = (r.Google3 || {}).state || '⏳';
+  const fltSt = (r.Flutter || {}).state || '⏳';
+  const cnt = ps.passed_rolls ?? 0;
+  let header = `<code>${ps.skia_status}Status · ${cnt}/4 rolls</code>`;
+  if (ps.has_alert) {
+    header = `<strong style="color:var(--danger-text)"><code>🔴 ${esc(ps.alert_reason || 'Roll/Status Alert')}</code></strong>`;
+  }
+  return `${header}<br><span class="muted">(<code>Android: ${andSt}</code>, <code>Chrome: ${chrSt}</code>, <code>G3: ${g3St}</code>, <code>Flutter: ${fltSt}</code>)</span>`;
+}
+
+function formatGmailCell(it) {
+  const g = it.gmail || {};
+  const tids = g.thread_ids || [];
+  const inboxTids = g.inbox_thread_ids || [];
+  const total = g.total_msgs || 0;
+  const inb = g.inbox_msgs || 0;
+  const tr = g.trash_msgs || 0;
+
+  if (tids.length === 0) {
+    return `<span class="muted">\u041d\u0435\u0442 \u043f\u0438\u0441\u0435\u043c</span>`;
+  }
+  const firstTid = esc(tids[0]);
+  const tidLabel = tids.length === 1 ? `\u0422\u0440\u0435\u0434 <code>${firstTid}</code>` : `\u0422\u0440\u0435\u0434\u044b <code>${firstTid}</code> (+${tids.length - 1})`;
+
+  if (inb > 0) {
+    const trashPart = tr > 0 ? `${tr} \u0442\u044b \u0443\u0434\u0430\u043b\u0438\u043b\u0430 \u0432 <code>TRASH</code>, \u0430 ` : '';
+    const tidJson = esc(JSON.stringify(inboxTids.length ? inboxTids : tids));
+    return `⚠️ ${tidLabel} (${total} \u043f\u0438\u0441\u0435\u043c: ${trashPart}<strong>${inb} \u0432 <code>INBOX</code>!</strong>)
+      <div class="cell-actions">
+        <button class="btn-sm btn-warn" onclick='archiveGmail("${esc(it.target_id)}", ${tidJson})'>📥 \u0423\u0431\u0440\u0430\u0442\u044c \u0438\u0437 Inbox</button>
+      </div>`;
+  }
+  if (tr > 0) {
+    return `${tidLabel} (${tr} \u043f\u0438\u0441\u0435\u043c \u0432 <code>TRASH</code>)`;
+  }
+  return `${tidLabel} (${total} \u043f\u0438\u0441\u0435\u043c \u0432 \u0430\u0440\u0445\u0438\u0432\u0435)`;
+}
+
+async function archiveGmail(targetId, threadIds) {
+  await fetch('/api/archive_gmail', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({target_id: targetId, thread_ids: threadIds})
+  });
+  await fetchState();
 }
 
 async function finalizeChat(convId, targetId) {
-  if (!confirm(`Finalize chat for ${targetId} («»)?`)) return;
+  if (!confirm(`\u0417\u0430\u043a\u0440\u044b\u0442\u044c (finalize «») \u0447\u0430\u0442 \u0434\u043b\u044f ${targetId}?`)) return;
   await fetch('/api/finalize', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -1217,38 +1575,55 @@ async function wakeChatForTriage(convId, itemKey, targetId) {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
       conversation_id: convId,
-      message: `[CL-WATCHER] Please check the latest status of ${itemKey}, archive any handled Gmail threads for ${targetId} from INBOX, and summarize what action is needed.`
+      message: `[CL-WATCHER] \u041f\u0440\u043e\u0432\u0435\u0440\u044c \u0441\u0432\u0435\u0436\u0438\u0439 \u0441\u0442\u0430\u0442\u0443\u0441 ${itemKey}, \u0443\u0431\u0435\u0440\u0438 \u043f\u0438\u0441\u044c\u043c\u0430 \u043f\u043e ${targetId} \u0438\u0437 INBOX \u0438 \u043d\u0430\u043f\u0438\u0448\u0438, \u043d\u0443\u0436\u043d\u043e \u043b\u0438 \u043d\u0430\u0448\u0435 \u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0435.`
     })
   });
-  alert(`Sent wakeup request to chat ${convId.slice(0, 8)}!`);
+  alert(`\u041e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d \u0437\u0430\u043f\u0440\u043e\u0441 \u0432 \u0447\u0430\u0442 ${convId.slice(0, 8)}!`);
 }
 
 async function triggerRefresh() {
-  document.getElementById('sync-status').textContent = 'Polling Gerrit, GitHub, and Skia Gardener...';
+  document.getElementById('sync-status').textContent = '\u041e\u043f\u0440\u0430\u0448\u0438\u0432\u0430\u0435\u043c Gerrit, GitHub, Skia Gardener \u0438 Gmail...';
   await fetch('/api/refresh', {method: 'POST'});
   await fetchState();
 }
 
-function renderDashboard(data) {
-  document.getElementById('sync-status').textContent = `Last synced: ${data.last_sync || 'now'} · Auto-refresh every 20s`;
-
-  // Render rollers bar
-  const rbar = document.getElementById('rollers-bar');
-  const rsum = data.rollers_summary || {};
-  rbar.innerHTML = ['Android', 'Chrome', 'Google3', 'Flutter'].map(name => {
-    const r = rsum[name] || {};
-    const cls = r.num_failed > 0 ? 'red' : 'green';
-    return `<div class="roller-card">
-      <div>
-        <div class="roller-name">Skia ➔ ${name}</div>
-        <div class="roller-meta">last: ${r.last_roll_rev || '—'} · behind: ${r.num_behind ?? 0}</div>
-      </div>
-      <span class="pill ${cls}">${r.badge || 'Healthy'}</span>
-    </div>`;
+function renderTableRows(rows) {
+  return rows.map(it => {
+    const rowClass = (it.phase || '').startsWith('ALERT_') ? 'row-alert' : '';
+    const shortCid = esc((it.conversation_id || '').slice(0, 8));
+    return `<tr class="${rowClass}">
+      <td class="col-chat">
+        <code>${esc(it.title)}</code> (<code>${shortCid}</code>)
+        <div class="cell-actions">
+          <button class="btn-sm" onclick="wakeChatForTriage('${esc(it.conversation_id)}', '${esc(it.item_key)}', '${esc(it.target_id)}')">💬 \u0420\u0430\u0437\u0431\u0443\u0434\u0438\u0442\u044c \u0447\u0430\u0442</button>
+          <button class="btn-sm" onclick="finalizeChat('${esc(it.conversation_id)}', '${esc(it.target_id)}')">✓ \u0417\u0430\u043a\u0440\u044b\u0442\u044c («»)</button>
+        </div>
+      </td>
+      <td class="col-cl">${formatAuthorAndCl(it)}</td>
+      <td class="col-gerrit">${formatGerritStatusCell(it)}</td>
+      <td class="col-rolls">${formatRollsCell(it)}</td>
+      <td class="col-gmail">${formatGmailCell(it)}</td>
+    </tr>`;
   }).join('');
+}
 
-  const items = Object.values(data.items || {});
-  // Sort: alerts first, then submitting/rolling, then needs action, then ready to close
+function renderFromCache() {
+  if (!cachedData) return;
+  const data = cachedData;
+  document.getElementById('sync-status').textContent =
+    `\u041e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u043e: ${data.last_sync || '\u0441\u0435\u0439\u0447\u0430\u0441'} · \u0410\u0432\u0442\u043e-\u043e\u043f\u0440\u043e\u0441 \u043a\u0430\u0436\u0434\u044b\u0435 20 \u0441\u0435\u043a`;
+
+  // Render inline rollers summary bar
+  const rsum = data.rollers_summary || {};
+  document.getElementById('rollers-bar').innerHTML =
+    `<strong>\u0410\u0432\u0442\u043e\u0440\u043e\u043b\u043b\u0435\u0440\u044b Skia:</strong> ` +
+    ['Android', 'Chrome', 'Google3', 'Flutter'].map(name => {
+      const r = rsum[name] || {};
+      const icon = (r.num_failed > 0) ? '🔴' : '🟢';
+      return `<span>${icon} <strong>${name}</strong>: <code>${esc(r.last_roll_rev || '—')}</code> (behind: ${r.num_behind ?? 0})</span>`;
+    }).join('');
+
+  const allItems = Object.values(data.items || {});
   const prio = {
     'ALERT_ROLL_OR_STATUS': 0,
     'ALERT_CQ_FAILED': 1,
@@ -1259,72 +1634,84 @@ function renderDashboard(data) {
     'READY_TO_CLOSE': 6,
     'ABANDONED': 7
   };
-  items.sort((a, b) => (prio[a.phase] ?? 9) - (prio[b.phase] ?? 9));
+  allItems.sort((a, b) => (prio[a.phase] ?? 9) - (prio[b.phase] ?? 9));
 
-  document.getElementById('count-badge').textContent = `${items.length} tracked`;
+  document.getElementById('total-count').textContent = allItems.length;
 
-  // Project filter buttons
-  const countsByProj = {'ALL': items.length};
-  items.forEach(it => {
-    countsByProj[it.project_name] = (countsByProj[it.project_name] || 0) + 1;
+  const hideReady = document.getElementById('hide-ready-cb').checked;
+  const filteredItems = hideReady
+    ? allItems.filter(it => it.phase !== 'READY_TO_CLOSE')
+    : allItems;
+
+  // Group counts by project
+  const byProj = {};
+  filteredItems.forEach(it => {
+    const p = it.project_name || 'Unassigned';
+    if (!byProj[p]) byProj[p] = [];
+    byProj[p].push(it);
   });
-  const fbar = document.getElementById('project-filters');
-  fbar.innerHTML = Object.entries(countsByProj).map(([pname, cnt]) => {
-    const active = currentProjectFilter === pname ? 'primary' : '';
-    return `<button class="${active}" onclick="currentProjectFilter='${pname}'; fetchState();">${pname} (${cnt})</button>`;
-  }).join('');
 
-  const visible = items.filter(it => currentProjectFilter === 'ALL' || it.project_name === currentProjectFilter);
-  const tbody = document.getElementById('table-body');
-  tbody.innerHTML = visible.map(it => {
-    const rowClass = it.phase.startsWith('ALERT_') ? 'row-alert' : (it.phase === 'READY_TO_CLOSE' ? 'row-ready' : '');
-    const roleClass = it.is_self ? 'purple' : (it.is_external ? 'yellow' : 'muted');
-    return `<tr class="${rowClass}">
-      <td>
-        <div style="font-weight:600">${it.project_name}</div>
-        <div class="mono" style="color:var(--muted)" title="${it.conversation_id}">${it.title}</div>
-      </td>
-      <td>
-        <a href="${it.url}" target="_blank" class="mono" style="font-weight:600">${it.item_key} (PS${it.patchset})</a>
-        <div style="max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${it.subject}">${it.subject}</div>
-      </td>
-      <td>
-        <span class="pill ${roleClass}">${it.role}</span>
-        <div style="color:var(--muted); font-size:11px; margin-top:2px;">${it.owner_name}</div>
-      </td>
-      <td>
-        ${phaseBadge(it)}
-        <div class="mono" style="color:var(--muted); font-size:11px; margin-top:3px;">CR: ${it.cr_summary} · ${it.cq_status}</div>
-      </td>
-      <td>${renderRollsCell(it)}</td>
-      <td>
-        <div class="mono" style="font-size:11px;">${it.last_msg_author}</div>
-        <div class="snippet" title="${it.last_msg_snippet}">${it.last_msg_snippet || '—'}</div>
-      </td>
-      <td>
-        <div style="display:flex; gap:6px;">
-          <button onclick="wakeChatForTriage('${it.conversation_id}', '${it.item_key}', '${it.target_id}')" title="Wake chat to triage & clean Inbox">💬 Wake &amp; Clean Mail</button>
-          <button onclick="finalizeChat('${it.conversation_id}', '${it.target_id}')" title="Finalize chat («»)">✓ Close</button>
-        </div>
-      </td>
-    </tr>`;
-  }).join('');
-
-  // Events & notifications
-  const evList = data.events || [];
-  const evDiv = document.getElementById('events-list');
-  if (evList.length > 0) {
-    evDiv.innerHTML = evList.slice(0, 12).map(ev => {
-      const badge = ev.critical ? `<span class="pill red">ALERT</span>` : `<span class="pill green">UPDATE</span>`;
-      return `<div class="event-row">
-        <span class="mono" style="color:var(--muted)">${ev.time}</span>
-        ${badge}
-        <strong>${ev.project_name} · ${ev.item_key}</strong>
-        <span>${ev.message}</span>
-      </div>`;
-    }).join('');
+  if (!initialProjectPicked) {
+    if (!byProj['SkParagraph'] && Object.keys(byProj).length > 0) {
+      selectedProject = 'ALL';
+    }
+    initialProjectPicked = true;
   }
 
+  const preferredOrder = ['SkParagraph', 'Skia', 'WebParagraph', 'Skia Gardener', 'TextClusters API'];
+  const projNames = Object.keys(byProj).sort((a, b) => {
+    const ia = preferredOrder.indexOf(a);
+    const ib = preferredOrder.indexOf(b);
+    if (ia !== -1 && ib !== -1) return ia - ib;
+    if (ia !== -1) return -1;
+    if (ib !== -1) return 1;
+    return a.localeCompare(b);
+  });
+
+  // Render project tabs
+  const tabsHtml = [
+    `<button class="${selectedProject === 'ALL' ? 'active-tab' : ''}" onclick="selectedProject='ALL'; renderFromCache();">\u0412\u0441\u0435 \u043f\u0440\u043e\u0435\u043a\u0442\u044b (${filteredItems.length})</button>`
+  ].concat(projNames.map(pname => {
+    const active = selectedProject === pname ? 'active-tab' : '';
+    return `<button class="${active}" onclick="selectedProject='${esc(pname)}'; renderFromCache();">${esc(pname)} (${byProj[pname].length})</button>`;
+  }));
+  document.getElementById('project-tabs').innerHTML = tabsHtml.join('');
+
+  const projectsToRender = selectedProject === 'ALL'
+    ? projNames
+    : (byProj[selectedProject] ? [selectedProject] : projNames);
+
+  const container = document.getElementById('tables-container');
+  if (projectsToRender.length === 0) {
+    container.innerHTML = `<p class="muted">\u041d\u0435\u0442 \u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0445 \u0447\u0430\u0442\u043e\u0432 \u043f\u043e \u0432\u044b\u0431\u0440\u0430\u043d\u043d\u043e\u043c\u0443 \u0444\u0438\u043b\u044c\u0442\u0440\u0443.</p>`;
+    return;
+  }
+
+  container.innerHTML = projectsToRender.map(pname => {
+    const rows = byProj[pname] || [];
+    return `
+      <div class="section-title">
+        <span>\u041f\u0440\u043e\u0435\u043a\u0442 <code>${esc(pname)}</code> (${rows.length})</span>
+      </div>
+      <table class="md-table">
+        <thead>
+          <tr>
+            <th class="col-chat">\u0427\u0430\u0442 \u0432 <code>${esc(pname)}</code></th>
+            <th class="col-cl">\u0421\u041b / PR \u0438 \u0430\u0432\u0442\u043e\u0440</th>
+            <th class="col-gerrit">\u0421\u0442\u0430\u0442\u0443\u0441 \u0432 Gerrit / GitHub</th>
+            <th class="col-rolls">\u0421\u0442\u0430\u0442\u0443\u0441 <code>Skia Status</code> \u0438 4 \u0440\u043e\u043b\u043b\u043e\u0432</th>
+            <th class="col-gmail">\u0427\u0442\u043e \u0432 Gmail (<code>INBOX</code> vs <code>TRASH</code>)</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${renderTableRows(rows)}
+        </tbody>
+      </table>
+    `;
+  }).join('');
+
+  // Fire browser notifications on new events
+  const evList = data.events || [];
   for (const ev of evList) {
     if (!seenEventIds.has(ev.id)) {
       seenEventIds.add(ev.id);
@@ -1339,13 +1726,14 @@ function renderDashboard(data) {
 async function fetchState() {
   try {
     const resp = await fetch('/api/status');
-    const data = await resp.json();
-    renderDashboard(data);
+    cachedData = await resp.json();
+    renderFromCache();
   } catch (e) {
-    document.getElementById('sync-status').textContent = 'Connection error — retrying...';
+    document.getElementById('sync-status').textContent = '\u041e\u0448\u0438\u0431\u043a\u0430 \u0441\u043e\u0435\u0434\u0438\u043d\u0435\u043d\u0438\u044f \u0441 \u0441\u0435\u0440\u0432\u0435\u0440\u043e\u043c — \u043f\u043e\u0432\u0442\u043e\u0440...';
   }
 }
 
+initTheme();
 updateNotifButton();
 fetchState();
 setInterval(fetchState, 20000);
@@ -1390,7 +1778,11 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
   def do_POST(self) -> None:  # pylint: disable=invalid-name
     parsed = urllib.parse.urlparse(self.path)
     length = int(self.headers.get("Content-Length") or 0)
-    body = self.rfile.read(length).decode("utf-8", errors="replace") if length > 0 else "{}"
+    body = (
+        self.rfile.read(length).decode("utf-8", errors="replace")
+        if length > 0
+        else "{}"
+    )
     try:
       data = json.loads(body)
     except Exception:
@@ -1401,11 +1793,26 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
       self._send_json({"ok": True, "count": len(state.get("items") or {})})
       return
 
+    if parsed.path == "/api/archive_gmail":
+      tid = str(data.get("target_id") or "").strip()
+      tids = data.get("thread_ids")
+      if not isinstance(tids, list):
+        tids = None
+      res = archive_gmail_threads_for_id(tid, tids)
+      state = sync_once(wake_chats=False, update_titles=False)
+      self._send_json({**res, "count": len(state.get("items") or {})})
+      return
+
     if parsed.path == "/api/finalize":
       cid = str(data.get("conversation_id") or "").strip()
       if cid:
         subprocess.run(
-            ["python3", os.path.join(HOOKS_DIR, "chat_lifecycle.py"), "finalize", cid],
+            [
+                "python3",
+                os.path.join(HOOKS_DIR, "chat_lifecycle.py"),
+                "finalize",
+                cid,
+            ],
             check=False,
             timeout=10,
         )
@@ -1428,7 +1835,9 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
   daemon_threads = True
 
 
-def serve_forever(port: int, poll_interval_sec: int, max_polls: int = 1000000) -> None:
+def serve_forever(
+    port: int, poll_interval_sec: int, max_polls: int = 1000000
+) -> None:
   """Runs the HTTP server and bounded background watcher loop."""
 
   def bg_loop() -> None:
@@ -1444,18 +1853,46 @@ def serve_forever(port: int, poll_interval_sec: int, max_polls: int = 1000000) -
 
   server = ThreadedHTTPServer(("0.0.0.0", port), FlightDeckHandler)
   pen = get_pen_url(port)
-  print(f"CL Flight Deck listening on http://localhost:{port} (PEN: {pen})", flush=True)
+  print(
+      f"CL Flight Deck listening on http://localhost:{port} (PEN: {pen})",
+      flush=True,
+  )
   server.serve_forever()
 
 
 def main() -> int:
-  parser = argparse.ArgumentParser(description="CL Flight Deck & Autonomous Watcher")
-  parser.add_argument("--sync-once", action="store_true", help="Run a single poll and update state")
-  parser.add_argument("--no-wake", action="store_true", help="Do not send agentapi wakeups on sync")
-  parser.add_argument("--serve", action="store_true", help="Run live HTTP dashboard & watcher")
-  parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="HTTP server port")
-  parser.add_argument("--interval", type=int, default=120, help="Background poll interval in seconds")
-  parser.add_argument("--pen-url", action="store_true", help="Print UberProxy PEN URL for port")
+  parser = argparse.ArgumentParser(
+      description="CL Flight Deck & Autonomous Watcher"
+  )
+  parser.add_argument(
+      "--sync-once",
+      action="store_true",
+      help="Run a single poll and update state",
+  )
+  parser.add_argument(
+      "--no-wake",
+      action="store_true",
+      help="Do not send agentapi wakeups on sync",
+  )
+  parser.add_argument(
+      "--serve",
+      action="store_true",
+      help="Run live HTTP dashboard & watcher",
+  )
+  parser.add_argument(
+      "--port", type=int, default=DEFAULT_PORT, help="HTTP server port"
+  )
+  parser.add_argument(
+      "--interval",
+      type=int,
+      default=120,
+      help="Background poll interval in seconds",
+  )
+  parser.add_argument(
+      "--pen-url",
+      action="store_true",
+      help="Print UberProxy PEN URL for port",
+  )
   args = parser.parse_args()
 
   if args.pen_url:
