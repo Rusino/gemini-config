@@ -203,3 +203,4 @@ Once the author responds with a new patchset of their parent CL:
 
 1. **Verify the fold-in mechanically**: fetch the new patchset and check that `git diff <companion_PS2_sha> <author_new_PS_sha>` is empty and that both commits share the same parent. If the diff is not empty, review only that delta (the author may have adjusted the fix) before going further.
 2. **Recommend, do not act**: when the check passes (or the author landed an alternative fix that you reviewed), recommend `Code-Review+1` on the parent CL and abandoning the companion WIP CL. Voting and abandoning are left to the user.
+3. **Follow-up Gerrit draft**: if saving a follow-up draft in Gerrit, save it as a standalone `/PATCHSET_LEVEL` draft on the **current** patchset (no `in_reply_to`, only new text); never reply inside the old patchset's thread or resolve it unless the user explicitly asks (in which case resolve via a minimal `"Done"` reply).
