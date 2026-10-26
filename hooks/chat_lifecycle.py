@@ -1464,6 +1464,234 @@ def create_handoff(
   }
 
 
+ROADMAP_ITEM_ID_RE = re.compile(r"^R[1-9]\d*(?:\.[1-9]\d*)*$", re.IGNORECASE)
+
+
+# Finalizes current_conv_id's chain and opens a fresh root chat for the next roadmap item
+def create_next_task(
+    current_conv_id: str,
+    item_id: str = "",
+    new_topic: str = "",
+    notes: str = "",
+    next_step_prompt: str = "",
+    model: str = "pro",
+    exact_model: str = "",
+    force: bool = False,
+) -> dict:
+  if not current_conv_id:
+    raise ValueError("current_conv_id must not be empty")
+
+  prior = load_guard_state(current_conv_id).get("handed_off_to", "")
+  if prior and not force:
+    raise RuntimeError(
+        f"{current_conv_id} was already handed off to {prior}; no second chat was"
+        " started. If this turn launched it, end the turn now; pass --force only when"
+        " the user explicitly asked for another chat"
+    )
+
+  project_id = get_conversation_project_id(current_conv_id)
+  if not project_id or project_id == "outside-of-project":
+    raise RuntimeError(
+        f"next-task requires an in-project conversation with a roadmap ({current_conv_id})"
+    )
+
+  import roadmap
+
+  doc = roadmap.load(project_id)
+  norm_id = item_id.strip().upper() if item_id else ""
+
+  # Refuse to abandon an in-flight doing item owned by current_conv_id without closing it first
+  owned_doing = [
+      it["id"]
+      for it in doc.get("items", [])
+      if it.get("status") == "doing"
+      and it.get("owner") == current_conv_id
+      and it.get("id") != norm_id
+  ]
+  if owned_doing and not force:
+    raise RuntimeError(
+        f"conversation {current_conv_id[:8]} still owns 'doing' item(s)"
+        f" {', '.join(owned_doing)}: mark them done/todo via `roadmap.py set`"
+        " before starting the next task"
+    )
+
+  # Auto-select the first top-level todo item (or any todo item) when item_id is omitted
+  if not norm_id:
+    top_todos = [
+        it
+        for it in doc.get("items", [])
+        if not it.get("parent") and it.get("status") == "todo"
+    ]
+    any_todos = [it for it in doc.get("items", []) if it.get("status") == "todo"]
+    chosen = (top_todos or any_todos or [None])[0]
+    if not chosen:
+      raise RuntimeError("no 'todo' items left in the project roadmap")
+    norm_id = chosen["id"]
+    target_item = chosen
+  else:
+    target_item = roadmap._find(doc, norm_id)
+
+  st = target_item.get("status", "")
+  if st in ("done", "dropped"):
+    raise RuntimeError(f"roadmap item {norm_id} is already {st}")
+  owner = target_item.get("owner") or ""
+  if st == "doing" and owner and owner != current_conv_id and not force:
+    raise RuntimeError(
+        f"roadmap item {norm_id} is already 'doing' in conversation {owner[:8]}"
+    )
+
+  item_text = target_item["text"]
+  if new_topic:
+    clean_topic = clean_base_title(new_topic)
+  else:
+    entity = extract_entity_topic(item_text)
+    clean_topic = (
+        f"{norm_id} {entity}"
+        if entity
+        else f"{norm_id} {item_text}"[:38].rstrip()
+    )
+  if not clean_topic:
+    clean_topic = norm_id
+  time_str = get_current_time_str()
+  cont_title = f"[{time_str}] {MARKER_ACTIVE} {clean_topic}"
+
+  old_state_file = roadmap.state_path(project_id, current_conv_id)
+  state_dir = os.path.dirname(old_state_file)
+  # Use 'split out of conversation://...' so HANDOFF_PARENT_RE keeps the new chat as a root
+  prompt = (
+      f"Starting roadmap task {norm_id} ({item_text}), split out of"
+      f" conversation://{current_conv_id}. First run `python3"
+      " ~/.gemini/config/hooks/roadmap.py show`, then read your chain state file"
+      f" {state_dir}/<this conversation's id>.md via view_file (`python3"
+      " ~/.gemini/config/hooks/roadmap.py state-path $ANTIGRAVITY_CONVERSATION_ID`"
+      f" prints the path). Begin working on {norm_id} immediately without asking"
+      " for confirmation. Keep the state file and roadmap statuses current as you"
+      " work."
+  )
+  if next_step_prompt:
+    prompt = f"{prompt}\n\nNext immediate task: {next_step_prompt}"
+
+  seeded_for = ""
+
+  def seed_task_state(cid: str) -> None:
+    nonlocal seeded_for
+    roadmap.set_status(project_id, cid, norm_id, "doing")
+    roadmap.link_item(project_id, cid, norm_id, cid)
+    new_sf = roadmap.state_path(project_id, cid)
+    os.makedirs(os.path.dirname(new_sf), exist_ok=True)
+    notes_block = f"\n## Context Notes\n{notes.strip()}\n" if notes.strip() else ""
+    next_line = (
+        next_step_prompt.strip()
+        if next_step_prompt.strip()
+        else f"Investigate and implement {norm_id}: {item_text}"
+    )
+    with open(new_sf, "w", encoding="utf-8") as f:
+      f.write(
+          f"# {norm_id}: {item_text}\n\n"
+          f"Split out of conversation://{current_conv_id}.\n\n"
+          f"## Goal\n- {norm_id}: {item_text}\n"
+          f"{notes_block}\n"
+          f"## Immediate Next Step\n- {next_line}\n"
+      )
+    if os.path.isfile(old_state_file) and os.path.abspath(old_state_file) != os.path.abspath(new_sf):
+      try:
+        os.unlink(old_state_file)
+      except OSError:
+        pass
+    seeded_for = cid
+
+  model_info: dict = {}
+  new_cid = ""
+  try:
+    model_info = resolve_handoff_model(
+        current_conv_id,
+        tier=model,
+        explicit=exact_model,
+        project_id=project_id,
+    )
+    new_cid = start_conversation_exact(
+        model_info["enum"],
+        cont_title,
+        prompt,
+        project_id,
+        before_send=seed_task_state,
+    )
+  except BeforeSendError as exc:
+    try:
+      archive_conversations([exc.cascade_id])
+    except Exception:
+      pass
+    raise RuntimeError(
+        f"next-task state setup failed, no conversation was started: {exc}"
+    ) from exc
+  except Exception as exc:
+    model_info = {
+        "source": f"agentapi tier:{model}",
+        "fallback_reason": str(exc)[:300],
+    }
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k != "ANTIGRAVITY_SOURCE_METADATA"
+    }
+    env["ANTIGRAVITY_PROJECT_ID"] = project_id
+    cmd = [
+        "agentapi",
+        "new-conversation",
+        f"--model={model}",
+        f"--title={cont_title}",
+        prompt,
+    ]
+    res = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+    if res.returncode != 0:
+      raise RuntimeError(
+          f"agentapi new-conversation failed (code {res.returncode}): {res.stderr or res.stdout}"
+      )
+    m = re.search(r'"conversationId":\s*"([^"]+)"', res.stdout)
+    if not m:
+      raise RuntimeError(
+          f"Failed to parse conversationId from agentapi output: {res.stdout}"
+      )
+    new_cid = m.group(1)
+
+  extra: dict = {}
+  try:
+    record_handoff(current_conv_id, new_cid)
+  except Exception as exc:
+    extra["guard_state_error"] = str(exc)[:300]
+
+  if seeded_for != new_cid:
+    try:
+      seed_task_state(new_cid)
+    except Exception as exc:
+      extra["state_seed_error"] = str(exc)[:300]
+
+  new_state_file = roadmap.state_path(project_id, new_cid)
+  try:
+    extra["roadmap"] = roadmap.show(project_id)
+  except Exception as exc:
+    extra["roadmap"] = f"(roadmap unavailable: {exc})"
+
+  fetched, source_meta = get_conversation_source_metadata(new_cid)
+
+  # Close the finished task's chat/chain («» or «...») and record new_cid as an active root chat
+  finalized_chain = finalize_conversation_chain(current_conv_id)
+  update_conversation_title(new_cid, cont_title)
+  export_chain_index()
+
+  return {
+      "new_conversation_id": new_cid,
+      "item_id": norm_id,
+      "title": cont_title,
+      "summary_file": new_state_file,
+      "finalized_chain": finalized_chain,
+      "model": model_info,
+      "source_metadata": source_meta,
+      "verified_visible": bool(fetched and source_meta is None),
+      **extra,
+  }
+
+
 def print_handoff_result(result: dict) -> None:
   # The roadmap is plain text so the old chat can paste it verbatim into its
   # final message; escaped inside JSON it would be unreadable. The JSON goes
@@ -2010,6 +2238,11 @@ Commands:
                                       turn (see Notes); --model pins one explicitly.
                                       A chat that already handed off refuses a second
                                       continuation unless --force is passed.
+  next-task [<id>] [<R_ID>]           Finalize <id>'s chain («» / «…») and launch a
+          [--topic "<Topic>"]         fresh root chat (⦿) in the same project for roadmap
+          [--notes "..."]             item <R_ID> (or the first todo item if omitted).
+          [--next "..."]              Claims <R_ID> as doing, links <R_ID> -> <new_id>,
+          [--model <m>] [--force]     seeds state/<new_id>.md, and removes state/<id>.md.
   model [id] [--trailer]              Read-only: show the model <id> last used and the
                                       model a handoff would pick now (or output
                                       git `Assisted-by: <Model>` trailer with --trailer).
@@ -2067,6 +2300,7 @@ KNOWN_COMMANDS = (
     "model",
     "project-model",
     "handoff",
+    "next-task",
     "reopen",
     "advance",
     "finalize",
@@ -2129,6 +2363,54 @@ def parse_handoff_args(args: list[str]) -> dict:
       i += 1
     else:
       _cli_fail("handoff", f"unexpected argument '{a}'")
+  return opts
+
+
+# Disambiguates optional positional UUID conv_id and R<N> roadmap item_id in either order
+def parse_next_task_args(args: list[str]) -> dict:
+  """Parses `next-task [cid] [item_id] [--topic ..] [--notes ..] [--next ..] [--model ..] [--force]`."""
+  opts = {
+      "cid": "",
+      "item_id": "",
+      "notes": "",
+      "next_step": "",
+      "new_topic": "",
+      "exact_model": "",
+      "force": False,
+  }
+  valued = {
+      "--notes": "notes",
+      "--next": "next_step",
+      "--topic": "new_topic",
+      "--model": "exact_model",
+  }
+  i = 0
+  # Accept --flag=val, --flag val, R<N> item IDs, and UUID conversation IDs in any order
+  while i < len(args):
+    a = args[i]
+    key, eq, inline = a.partition("=")
+    if a == "--force":
+      opts["force"] = True
+      i += 1
+    elif eq and key in valued:
+      opts[valued[key]] = inline
+      i += 1
+    elif a in valued and i + 1 < len(args):
+      opts[valued[a]] = args[i + 1]
+      i += 2
+    elif a in valued:
+      _cli_fail("next-task", f"option '{a}' requires a value")
+    elif a.startswith("-"):
+      _cli_fail("next-task", f"unknown option '{a}'")
+    # Match R<N> tokens before UUIDs so `next-task R2` works without an explicit chat ID
+    elif not opts["item_id"] and ROADMAP_ITEM_ID_RE.match(a):
+      opts["item_id"] = a.upper()
+      i += 1
+    elif not opts["cid"]:
+      opts["cid"] = a
+      i += 1
+    else:
+      _cli_fail("next-task", f"unexpected argument '{a}'")
   return opts
 
 
@@ -2241,6 +2523,20 @@ def main(argv: list[str] | None = None) -> int:
         notes=opts["notes"],
         next_step_prompt=opts["next_step"],
         new_topic=opts["new_topic"],
+        exact_model=opts["exact_model"],
+        force=opts["force"],
+    )
+    print_handoff_result(result)
+  # Transition to a new root chat for the next roadmap item while closing the current chain
+  elif cmd == "next-task":
+    opts = parse_next_task_args(args)
+    cid = _require_conversation_id("next-task", opts["cid"] or _env_conversation_id())
+    result = create_next_task(
+        cid,
+        item_id=opts["item_id"],
+        new_topic=opts["new_topic"],
+        notes=opts["notes"],
+        next_step_prompt=opts["next_step"],
         exact_model=opts["exact_model"],
         force=opts["force"],
     )

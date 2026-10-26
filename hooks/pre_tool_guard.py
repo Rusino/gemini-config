@@ -187,27 +187,51 @@ def is_agentapi_new_conversation_launch(cmd: str) -> bool:
   return count_agentapi_new_conversation_launches(cmd) > 0
 
 
+# Match both continuation handoffs and next-task transitions as chat-launching CLI calls
 CHAT_LIFECYCLE_HANDOFF_RE = re.compile(
-    r"(?:^|(?<=[\s;&|(`]))(?:\S*/)?chat_lifecycle\.py\s+handoff\b"
+    r"(?:^|(?<=[\s;&|(`]))(?:\S*/)?chat_lifecycle\.py\s+(?:handoff|next-task)\b"
 )
 
 
 def count_chat_lifecycle_handoff_launches(cmd: str) -> int:
-  """Number of real `chat_lifecycle.py handoff` invocations in the command line."""
+  """Number of real `chat_lifecycle.py handoff|next-task` invocations in the command line."""
   cmd = strip_heredocs(cmd)
   try:
     tokens = shlex.split(cmd, posix=True)
   except ValueError:
     return len(CHAT_LIFECYCLE_HANDOFF_RE.findall(cmd))
   n = 0
-  for tok, nxt in zip(tokens, tokens[1:]):
-    if _clean_cmd_token(tok) == "chat_lifecycle.py" and nxt == "handoff":
+  # Ignore help queries so `next-task --help` never marks the conversation closed
+  for i, (tok, nxt) in enumerate(zip(tokens, tokens[1:])):
+    if _clean_cmd_token(tok) == "chat_lifecycle.py" and nxt in ("handoff", "next-task"):
+      if nxt == "next-task" and any(a in ("-h", "--help", "help") for a in tokens[i + 2 :]):
+        continue
       n += 1
   return n
 
 
+# Detect next-task launches so pre_tool_guard skips requiring an existing old state file
+def is_chat_lifecycle_next_task_launch(cmd: str) -> bool:
+  """True only if the command really invokes `chat_lifecycle.py next-task` (excluding --help)"""
+  cmd = strip_heredocs(cmd)
+  try:
+    tokens = shlex.split(cmd, posix=True)
+  except ValueError:
+    return bool(
+        re.search(
+            r"(?:^|(?<=[\s;&|(`]))(?:\S*/)?chat_lifecycle\.py\s+next-task\b(?!\s+(?:--help|-h|help)\b)",
+            cmd,
+        )
+    )
+  for i, (tok, nxt) in enumerate(zip(tokens, tokens[1:])):
+    if _clean_cmd_token(tok) == "chat_lifecycle.py" and nxt == "next-task":
+      if not any(a in ("-h", "--help", "help") for a in tokens[i + 2 :]):
+        return True
+  return False
+
+
 def is_chat_lifecycle_handoff_launch(cmd: str) -> bool:
-  """True only if the command really *invokes* `chat_lifecycle.py handoff`."""
+  """True only if the command really *invokes* `chat_lifecycle.py handoff` or `next-task`."""
   return count_chat_lifecycle_handoff_launches(cmd) > 0
 
 
@@ -2530,8 +2554,9 @@ def main() -> None:
         )
         return
 
+      # Gate both handoff and next-task against duplicate launches in one shell command
       if is_chat_lifecycle_handoff_launch(cmd) and not re.search(
-          r"\bhandoff\s+(?:--help|-h|help)\b", cmd
+          r"\b(?:handoff|next-task)\s+(?:--help|-h|help)\b", cmd
       ):
         if count_chat_lifecycle_handoff_launches(cmd) > 1:
           print(
@@ -2548,7 +2573,8 @@ def main() -> None:
           )
           return
 
-        has_notes_flag = "--notes" in strip_heredocs(cmd)
+        # next-task seeds a fresh state file for the new roadmap item itself
+        has_notes_flag = "--notes" in strip_heredocs(cmd) or is_chat_lifecycle_next_task_launch(cmd)
         ref_match = re.search(r"(/\S*handoff_summary[^\s\"']*\.md)", cmd)
         if state.get("pending_handoff_launch") and state.get("pending_handoff_file"):
           target = {

@@ -28,6 +28,7 @@ Use only these commands (`python3 ~/.gemini/config/hooks/chat_lifecycle.py ...`)
 | `set-title <id> "<Topic>"` | User asks to name/rename the chat, or on the first turn once you know the bug/CL/PR/commit topic to refine the auto-detected ID or replace a generic title. Pass bare `<Topic>`. |
 | `auto-title <id> "<prompt>"` | Detect PR/CL/bug/commit in prompt and set title if untitled (invoked automatically by `context_guard.py`). |
 | `handoff <id> [summary_file] [--notes "..."] [--next "..."] [--topic "<Topic>"] [--force]` | Context guard alert, or user asks to continue in a new chat. Writes/updates summary, launches visible continuation in the same project on `<id>`'s last model, verifies `sourceMetadata: null`, updates chain markers. `--model <id\|name>` only on explicit user request; `--force` only when user explicitly asked for a second continuation. |
+| `next-task [<id>] [<R_ID>] [--topic "<Topic>"] [--notes "..."] [--next "..."] [--force]` | After finishing a task (`roadmap.py set <id> <R_prev> done`), when the user confirms starting the next roadmap item `<R_ID>` in a fresh chat: auto-finalizes `<id>`'s chain (`«»` / `«…»`, releasing its worktree lease), launches an independent root chat (`⦿`) in the same project, claims `<R_ID>` as `doing`, links `<R_ID> → <new_id>`, and seeds `state/<new_id>.md`. |
 | `summary-path <id>` | Returns the canonical summary path before writing with `write_file`. |
 | `finalize <id>` | **Only** when the user explicitly says *"финал"* (or unambiguous equivalent). |
 | `status [id]` | Inspect chain structure and summary paths. |
@@ -43,8 +44,11 @@ To move chats/chains between projects, run `python3 ~/.gemini/config/scripts/mov
 
 - **In-project chats: Epic Roadmap via `roadmap.py` only**: Manage the project roadmap exclusively via `python3 ~/.gemini/config/hooks/roadmap.py add|set|link|show|edit|reorder|move ...` (never edit `~/.gemini/config/roadmaps/` files directly, except the chain state file from `roadmap.py state-path <id>`).
   - **Backlog requests ("в бэклог: X")**: run `roadmap.py add <id> "X"`, confirm on one line (or bulleted list separated by blank lines for multiple items), then continue current work.
+  - **Finishing a task & proposing the next roadmap item (`next-task`)**:
+    - Once the current roadmap item is completed and marked `done` (`roadmap.py set <id> <R_prev> done`), check `roadmap.py show` for the next `todo` item `<R_next>`.
+    - For a **top-level item (`R2`, `R3`)** or whenever context is **`>= 30%`**, propose opening `<R_next>` in a fresh chat (`chat_lifecycle.py next-task <id> <R_next> --topic "<Topic>"`) so each task has a clean context and `<id>` is auto-finalized (`«»` / `«…»`). For a small **sub-item (`R1.1`, `R1.2`)** with context **`< 30%`**, offer to either do it right here or open a new chat via `next-task`.
   - **Spin-offs**: run `roadmap.py link <id> <item ID> <new_chat_id>`.
-  - **At handoff**: paste the roadmap block printed by `chat_lifecycle.py handoff` into the final message.
+  - **At handoff / `next-task`**: paste the roadmap block printed by `chat_lifecycle.py handoff` / `next-task` into the final message alongside `[👉 <Title>](conversation://<new_conversation_id>)`.
 - **Parallel chats in one project share resources — claim before touching**:
   - Run `roadmap.py show` before editing or building; if an item is `doing` in another live chat, report the owner and wait, otherwise claim it with `roadmap.py set <id> <item> doing`.
   - **Worktree & shared-checkout guards (`hooks/pre_tool_guard.py`)**: If a code worktree is leased by another active chat (`[WORKTREE LEASE GUARD]`), create a separate linked worktree (`git worktree add`). In shared checkouts (`~/.gemini/config`), stage and commit only your own files with explicit pathspecs (`git add -- <files> && git commit -m "..." -- <files>`), and never `git push` when `@{u}..HEAD` contains another active chat's commits (`[FOREIGN-COMMIT PUSH GUARD]`). One deliverable document lives at one canonical path.

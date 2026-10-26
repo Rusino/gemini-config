@@ -1219,6 +1219,130 @@ class TestChatLifecycle(unittest.TestCase):
           data = json.load(f)
         self.assertEqual(data["parentOf"], {"c2": "c1", "c3": "c2"})
 
+  def test_create_next_task_finalizes_old_chat_claims_roadmap_item_and_starts_root_chat(self):
+    import pre_tool_guard
+    import roadmap
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.make_project_db(tmp_dir)
+      roadmap.add_item("proj-abc", "parent-1", "First task")
+      roadmap.set_status("proj-abc", "parent-1", "R1", "done")
+      roadmap.add_item("proj-abc", "parent-1", "Implement feature X")
+      old_state = self.write_old_state()
+      start = unittest.mock.MagicMock(
+          side_effect=lambda enum, title, prompt, pid, before_send=None: (
+              before_send("child-2") if before_send else None,
+              "child-2",
+          )[1]
+      )
+      p = self.handoff_patches(tmp_dir, start)
+      with p[0], p[1], p[2], p[3], p[4], p[5]:
+        res = chat_lifecycle.create_next_task(
+            current_conv_id="parent-1",
+            item_id="R2",
+            new_topic="R2 Feature X",
+            notes="R1 merged cleanly",
+        )
+        self.assertEqual(res["new_conversation_id"], "child-2")
+        self.assertEqual(res["item_id"], "R2")
+        self.assertEqual(chat_lifecycle.get_conversation_title("parent-1"), "[10:00] «» My Feature")
+        self.assertEqual(chat_lifecycle.get_conversation_title("child-2"), "[15:45] ⦿ R2 Feature X")
+
+      # New chat prompt must NOT match HANDOFF_PARENT_RE so it stays an independent root chat
+      prompt = start.call_args[0][2]
+      self.assertIsNone(chat_lifecycle.HANDOFF_PARENT_RE.search(prompt))
+      self.assertIn("split out of conversation://parent-1", prompt)
+
+      # Old state file removed; new state file seeded for R2
+      self.assertFalse(os.path.exists(old_state))
+      new_state = roadmap.state_path("proj-abc", "child-2")
+      self.assertEqual(res["summary_file"], new_state)
+      with open(new_state, encoding="utf-8") as f:
+        st_txt = f.read()
+      self.assertIn("# R2: Implement feature X", st_txt)
+      self.assertIn("R1 merged cleanly", st_txt)
+
+      # Roadmap R2 is claimed as doing by child-2 and linked to child-2
+      doc = roadmap.load("proj-abc")
+      r2 = [it for it in doc["items"] if it["id"] == "R2"][0]
+      self.assertEqual(r2["status"], "doing")
+      self.assertEqual(r2["owner"], "child-2")
+      self.assertEqual(r2["link"], "child-2")
+
+      # Worktree lease check treats parent-1 as inactive/closed immediately
+      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]):
+        still_active, _ = pre_tool_guard._is_conv_still_active_tip(
+            "parent-1", "child-2", os.path.join(tmp_dir, "brain", "child-2", ".system_generated", "logs", "transcript.jsonl")
+        )
+        self.assertFalse(still_active)
+
+  def test_create_next_task_refuses_when_current_chat_still_owns_doing_item(self):
+    import roadmap
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.make_project_db(tmp_dir)
+      roadmap.add_item("proj-abc", "parent-1", "First task")
+      roadmap.set_status("proj-abc", "parent-1", "R1", "doing")
+      roadmap.add_item("proj-abc", "parent-1", "Second task")
+      start = unittest.mock.MagicMock(return_value="child-2")
+      p = self.handoff_patches(tmp_dir, start)
+      with p[0], p[1], p[2], p[3], p[4], p[5]:
+        with self.assertRaisesRegex(RuntimeError, "still owns 'doing' item.*R1"):
+          chat_lifecycle.create_next_task(current_conv_id="parent-1", item_id="R2")
+      start.assert_not_called()
+
+  def test_create_next_task_auto_picks_first_todo_and_finalizes_multi_step_chain(self):
+    import roadmap
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.write_chain(tmp_dir, [("root-0", None), ("parent-1", "root-0")])
+      self.write_titles(tmp_dir, {
+          "root-0": "[09:30] ▸ First Task",
+          "parent-1": "[10:00] ⦿ First Task",
+      }, project="proj-abc")
+      roadmap.add_item("proj-abc", "parent-1", "First task")
+      roadmap.set_status("proj-abc", "parent-1", "R1", "done")
+      roadmap.add_item("proj-abc", "parent-1", "Fix crash in b/345678901")
+      start = unittest.mock.MagicMock(
+          side_effect=lambda enum, title, prompt, pid, before_send=None: (
+              before_send("child-2") if before_send else None,
+              "child-2",
+          )[1]
+      )
+      p = self.handoff_patches(tmp_dir, start)
+      with p[0], p[1], p[2], p[3], p[4], p[5]:
+        res = chat_lifecycle.create_next_task(current_conv_id="parent-1")
+        self.assertEqual(res["item_id"], "R2")
+        self.assertEqual(chat_lifecycle.get_conversation_title("root-0"), "[09:30] « First Task")
+        self.assertEqual(chat_lifecycle.get_conversation_title("parent-1"), "[10:00] » First Task")
+        self.assertEqual(chat_lifecycle.get_conversation_title("child-2"), "[15:45] ⦿ R2 b/345678901")
+
+  def test_parse_next_task_args(self):
+    cid = "12345678-1234-1234-1234-123456789abc"
+    opts = chat_lifecycle.parse_next_task_args(
+        [cid, "R5", "--topic", "R5 Widget", "--notes", "done R4"]
+    )
+    self.assertEqual(opts["cid"], cid)
+    self.assertEqual(opts["item_id"], "R5")
+    self.assertEqual(opts["new_topic"], "R5 Widget")
+    self.assertEqual(opts["notes"], "done R4")
+
+    opts_no_cid = chat_lifecycle.parse_next_task_args(["R12.2", "--topic=Subtask"])
+    self.assertEqual(opts_no_cid["cid"], "")
+    self.assertEqual(opts_no_cid["item_id"], "R12.2")
+    self.assertEqual(opts_no_cid["new_topic"], "Subtask")
+
+  def test_next_task_cli_recognized_by_guards(self):
+    import context_guard
+    import pre_tool_guard
+
+    cmd_run = "python3 ~/.gemini/config/hooks/chat_lifecycle.py next-task R2 --topic 'R2 Work'"
+    cmd_help = "python3 ~/.gemini/config/hooks/chat_lifecycle.py next-task --help"
+    self.assertTrue(pre_tool_guard.is_chat_lifecycle_next_task_launch(cmd_run))
+    self.assertTrue(context_guard.is_chat_lifecycle_handoff_command(cmd_run))
+    self.assertFalse(pre_tool_guard.is_chat_lifecycle_next_task_launch(cmd_help))
+    self.assertFalse(context_guard.is_chat_lifecycle_handoff_command(cmd_help))
+
 
 if __name__ == "__main__":
   unittest.main()
