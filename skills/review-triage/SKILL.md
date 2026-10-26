@@ -171,3 +171,6 @@ named skill's `SKILL.md` was not read, when a report with a `Case 1-5` verdict l
    implementation and measuring actual `dm` runtime, and never hold up approval asking to add doc
    comments to headers whose existing methods have no doc comments when the contract is already
    stated in the commit message.
+7. **Daily Queue Summary Shows Open Issues Only**: In `run_queue_triage.py` summaries, never list or
+   mention GitHub issues that are already closed (including ones closed during the window or still
+   receiving bot activity); report only open issues and the user's own open PRs.
