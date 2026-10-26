@@ -230,6 +230,7 @@ def fetch_gmail_status_for_id(target_id: str) -> dict[str, Any]:
       "inbox_msgs": 0,
       "trash_msgs": 0,
       "unread_msgs": 0,
+      "threads": [],
   }
   if not target_id:
     return res
@@ -270,6 +271,27 @@ def fetch_gmail_status_for_id(target_id: str) -> dict[str, Any]:
       continue
     res["thread_ids"].append(tid)
     msgs = th.get("messages") or []
+    # Thread IDs mean nothing to a reader; the dashboard names a thread by who
+    # sends it and links it through Gmail's own viewUrl
+    senders = " ".join(str(m.get("sender") or "").lower() for m in msgs)
+    source = next(
+        (
+            label
+            for key, label in (
+                ("gerritcodereview", "Gerrit"),
+                ("github.com", "GitHub"),
+                ("critique", "Critique"),
+            )
+            if key in senders
+        ),
+        "Mail",
+    )
+    res["threads"].append({
+        "url": str(th.get("viewUrl") or ""),
+        "source": source,
+        "msgs": len(msgs),
+        "last_date": str(msgs[-1].get("date") or "") if msgs else "",
+    })
     th_has_inbox = False
     for m in msgs:
       res["total_msgs"] += 1
@@ -1972,10 +1994,6 @@ function formatRollsCell(it) {
   return `${header}<br><span class="muted">(${rolls})${gardener}</span>${incidentsHtml}`;
 }
 
-function gmailThreadUrl(tid) {
-  return `https://mail.google.com/mail/u/0/#all/${encodeURIComponent(tid)}`;
-}
-
 function formatGmailCell(it) {
   const g = it.gmail || {};
   const tids = g.thread_ids || [];
@@ -1987,11 +2005,15 @@ function formatGmailCell(it) {
   const searchUrl = 'https://mail.google.com/mail/u/0/#search/' +
     encodeURIComponent('in:anywhere ' + it.target_id);
   if (tids.length === 0) {
-    return `<span class="muted">${link(searchUrl, 'No threads')}</span>`;
+    return `<span class="muted">${link(searchUrl, 'No mail')}</span>`;
   }
-  const firstTid = link(gmailThreadUrl(tids[0]), `<code>${esc(tids[0])}</code>`);
-  const more = tids.length > 1 ? ` (${link(searchUrl, `+${tids.length - 1}`)})` : '';
-  const tidLabel = `${tids.length === 1 ? 'Thread' : 'Threads'} ${firstTid}${more}`;
+  // State saved before threads[] existed has only IDs; fall back to one search link
+  const threads = g.threads && g.threads.length
+    ? g.threads
+    : [{url: searchUrl, source: 'Mail', msgs: total}];
+  const tidLabel = threads
+    .map(t => link(t.url || searchUrl, `📧 ${esc(t.source)} thread`))
+    .join(', ');
 
   if (inb > 0) {
     const trashPart = tr > 0 ? `${tr} in <code>TRASH</code>, ` : '';
