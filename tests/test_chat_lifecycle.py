@@ -1450,6 +1450,11 @@ class TestChatLifecycle(unittest.TestCase):
         for cid in ("c1", "c2", "c3"):
           self.assertFalse(os.path.exists(roadmap.state_path("proj-abc", cid)))
 
+  def test_urlopen_ls_blocks_unmocked_live_ls_in_unittest(self):
+    req = chat_lifecycle.urllib.request.Request("http://localhost:5387/")
+    with self.assertRaises(chat_lifecycle.urllib.error.URLError):
+      chat_lifecycle._urlopen_ls(req, timeout=0.1)
+
 
 if __name__ == "__main__":
   unittest.main()

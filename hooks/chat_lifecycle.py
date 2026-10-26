@@ -194,6 +194,13 @@ def get_ls_endpoint() -> tuple[str, str]:
 
 
 def _urlopen_ls(req: urllib.request.Request, timeout: float):
+  # Block unmocked HTTP calls to the live Language Server during unit tests
+  if (
+      "unittest" in sys.modules
+      and not os.environ.get("JETSKI_TEST_ALLOW_LS_DISCOVERY")
+      and getattr(urllib.request.urlopen, "__module__", "") == "urllib.request"
+  ):
+    raise urllib.error.URLError("Blocked live LS request during unittest")
   # Local desktop language_server uses an ephemeral self-signed localhost cert
   if req.full_url.startswith(("https://127.0.0.1", "https://localhost")):
     import ssl
