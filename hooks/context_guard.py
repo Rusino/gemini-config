@@ -80,6 +80,10 @@ CONT_SUFFIX_RE = re.compile(
     r"\s*\((?:продолжение|continue)\s+(?:\d{4}-\d{2}-\d{2}\s+)?\d{2}:\d{2}\)\s*$",
     re.IGNORECASE,
 )
+# Matches the leading lifecycle marker token in "[HH:MM] <marker> <Topic>"
+LEADING_MARKER_RE = re.compile(
+    r"^\s*\[\d{1,2}:\d{2}\]\s*(‹✓›|«»|⏳|[✓⦿▸«»])(?:\s|$)"
+)
 
 
 def get_transcript_size_kb(transcript_path: str) -> float:
@@ -263,7 +267,7 @@ def get_active_chats_by_project(
   query = (
       "SELECT conversation_id, title, project_id, last_modified_time "
       "FROM conversation_summaries "
-      "WHERE parent_conversation_id = '' AND title LIKE '%⦿%'"
+      "WHERE parent_conversation_id = '' AND (title LIKE '%⦿%' OR title LIKE '%⏳%')"
   )
   for db_path in summary_db_paths(hint_path):
     for flags in ("mode=ro", "mode=ro&immutable=1"):
@@ -287,7 +291,15 @@ def get_active_chats_by_project(
               or _is_archived_in_pbtxt(cid_s, hint_path)
           ):
             continue
-          is_tip = 1 if "⦿" in title_s else 0
+          # Match only the leading lifecycle marker token rather than ⏳ inside [⏳St · 1/4 rolls]
+          m_marker = LEADING_MARKER_RE.match(title_s)
+          marker = m_marker.group(1) if m_marker else ""
+          # Prefer Needs-Me (⦿) over background Waiting (⏳) when picking the project's primary chat
+          is_tip = 2 if marker == "⦿" else (1 if marker == "⏳" else 0)
+          if is_tip == 0 and not marker:
+            is_tip = 2 if "⦿" in title_s else (1 if "⏳" in title_s else 0)
+          if is_tip == 0:
+            continue
           ts = 0.0
           if lmt and not str(lmt).startswith("0001-"):
             try:
@@ -464,7 +476,7 @@ def get_active_sibling_chats_in_project(
       "SELECT conversation_id, title, last_modified_time "
       "FROM conversation_summaries "
       "WHERE project_id = ? AND parent_conversation_id = '' "
-      "AND title LIKE '%⦿%'"
+      "AND (title LIKE '%⦿%' OR title LIKE '%⏳%')"
   )
   for db_path in summary_db_paths(hint_path):
     for flags in ("mode=ro", "mode=ro&immutable=1"):
@@ -484,6 +496,10 @@ def get_active_sibling_chats_in_project(
               or cid_s == exclude_conv_id
               or _is_archived_in_pbtxt(cid_s, hint_path)
           ):
+            continue
+          # Skip closed or handed-off chats that matched LIKE '%⏳%' via a [⏳St · ...] roll badge
+          m_sib = LEADING_MARKER_RE.match(title_s)
+          if m_sib and m_sib.group(1) not in ("⦿", "⏳"):
             continue
           ts = 0.0
           if lmt and not str(lmt).startswith("0001-"):

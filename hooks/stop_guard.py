@@ -503,6 +503,7 @@ def analyze_current_turn(transcript_path: str) -> dict:
   last_cmd_exit_code = None
   pending_cmds: list[tuple[int, bool, bool]] = []
   launched_new_conv = False
+  scheduled_timer = False
 
   for idx in ordered_indices:
     if idx <= last_user_idx:
@@ -516,7 +517,9 @@ def analyze_current_turn(transcript_path: str) -> dict:
       for tc in tool_calls:
         tname = tc.get("name", "")
         targs = tc.get("args") or {}
-        if tname in EDIT_TOOLS:
+        if tname == "schedule":
+          scheduled_timer = True
+        elif tname in EDIT_TOOLS:
           target = get_tool_target_file(targs)
           if is_tracked_source_file(target):
             last_code_edit_idx = idx
@@ -561,6 +564,7 @@ def analyze_current_turn(transcript_path: str) -> dict:
       "last_cmd_idx": last_cmd_idx,
       "last_cmd_exit_code": last_cmd_exit_code,
       "launched_new_conv": launched_new_conv,
+      "scheduled_timer": scheduled_timer,
   }
 
 
@@ -584,10 +588,6 @@ def main() -> None:
     print("{}")
     return
 
-  if not data.get("fullyIdle", True):
-    print("{}")
-    return
-
   global _CURRENT_CONV_ID
   conv_id = data.get("conversationId", "")
   _CURRENT_CONV_ID = conv_id
@@ -595,6 +595,19 @@ def main() -> None:
   artifact_dir = data.get("artifactDirectoryPath", "")
 
   info = analyze_current_turn(transcript_path)
+  # Automatically promote a chat that scheduled a timer/cron this turn to ⏳
+  # before returning on fullyIdle=False (since active schedules keep fullyIdle False)
+  if conv_id and info.get("scheduled_timer"):
+    try:
+      from chat_lifecycle import set_conversation_wait_state
+
+      set_conversation_wait_state(conv_id, waiting=True)
+    except Exception:
+      pass
+
+  if not data.get("fullyIdle", True):
+    print("{}")
+    return
 
   state_path = (
       os.path.join(artifact_dir, "scratch", ".context_guard_state.json")

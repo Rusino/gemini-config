@@ -59,6 +59,11 @@ BADGE_RE = re.compile(
 PREDECESSOR_TITLE_RE = re.compile(
     r"^\s*\[\d{1,2}:\d{2}\]\s*(?:‹✓›|«»|[▸✓«»])(?:\s|$)"
 )
+# Open leaf chats marked with ⏳ keep notFullyIdle=True between cron ticks, so
+# only an actively executing turn (CASCADE_RUN_STATUS_RUNNING) counts as running
+WAITING_TITLE_RE = re.compile(
+    r"^\s*\[\d{1,2}:\d{2}\]\s*⏳(?:\s|$)"
+)
 
 WATCH_POLL_INTERVAL_SEC = 1.5
 STOP_SETTLE_DELAY_SEC = 0.4
@@ -483,6 +488,16 @@ def _is_handed_off_predecessor(summary: dict[str, Any]) -> bool:
   return False
 
 
+# Returns True when a conversation title carries the explicit ⏳ waiting marker
+def _is_waiting_conversation(summary: dict[str, Any]) -> bool:
+  annotations = summary.get("annotations") or {}
+  # Check both annotations.title and summary.summary so unsynced RPC snapshots still match
+  for candidate in (annotations.get("title"), summary.get("summary")):
+    if isinstance(candidate, str) and WAITING_TITLE_RE.match(candidate):
+      return True
+  return False
+
+
 def _mark_predecessors_read(summaries: dict[str, Any]) -> None:
   """Stamps `lastUserViewTime` on idle handed-off predecessor conversations.
 
@@ -671,7 +686,8 @@ def is_conversation_unread(
     viewed_lmt: dict[str, float] | None = None,
 ) -> bool:
   """Returns True if an idle conversation has unread updates."""
-  if _is_handed_off_predecessor(summary):
+  # Background cron/waiting chats (⏳) and handed-off steps do not light up unread project badges
+  if _is_handed_off_predecessor(summary) or _is_waiting_conversation(summary):
     return False
   annotations = summary.get("annotations") or {}
   if annotations.get("markedAsUnread"):
@@ -722,9 +738,10 @@ def compute_project_activity(
       continue
 
     waiting_steps = summary.get("waitingSteps") or []
+    is_waiting_chat = _is_waiting_conversation(summary)
     is_running = (
         summary.get("status") == "CASCADE_RUN_STATUS_RUNNING"
-        or bool(summary.get("notFullyIdle"))
+        or (not is_waiting_chat and bool(summary.get("notFullyIdle")))
     )
     if force_running_cid and cid == force_running_cid:
       seen_forced = True

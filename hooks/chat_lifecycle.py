@@ -43,14 +43,19 @@ DEFAULT_PROJECT_MODELS: dict[str, str] = {
 MARKER_START = "▸"       # In-progress branch root
 MARKER_STEP = "✓"        # In-progress completed step
 MARKER_ACTIVE = "⦿"      # In-progress current active focal point
+MARKER_WAITING = "⏳"    # Open leaf chat waiting on cron or external event
 MARKER_CLOSED_START = "«"  # Finalized branch root
 MARKER_CLOSED_STEP = "‹✓›" # Finalized intermediate step
 MARKER_CLOSED_END = "»"    # Finalized branch tail
 MARKER_SINGLE_CLOSED = "«»" # Finalized single-chat task
 
+# Matches the leading lifecycle marker token in "[HH:MM] <marker> <Topic>"
+TITLE_MARKER_RE = re.compile(
+    r"^\s*\[\d{1,2}:\d{2}\]\s*(‹✓›|«»|⏳|[✓⦿▸«»])(?:\s|$)"
+)
 # Regex matching any existing lifecycle prefix: [HH:MM] [marker] Topic
 TITLE_CLEANUP_RE = re.compile(
-    r"^(?:\[\d{2}:\d{2}(?:\s+(?:продолжение|continue))?\]\s*(?:[▸✓⦿«»]|‹✓›|«»|\s*)*)"
+    r"^(?:\[\d{2}:\d{2}(?:\s+(?:продолжение|continue))?\]\s*(?:[▸✓⦿⏳«»]|‹✓›|«»|\s*)*)"
     r"|^(?:(?:продолжение|continue)(?:\s+\d{2}:\d{2})?\s*:\s*)+",
     re.IGNORECASE,
 )
@@ -1000,7 +1005,9 @@ def advance_in_progress_chain(chain_ids: list[str] = None, current_conv_id: str 
     cid = chain_ids[0]
     cur_title = get_conversation_title(cid)
     base = clean_base_title(cur_title) or base_topic
-    new_title = f"[{now_time}] {MARKER_ACTIVE} {base}"
+    # Preserve explicit cron/external wait marker across chain marker recalculations
+    leaf_marker = MARKER_WAITING if is_waiting_title(cur_title) else MARKER_ACTIVE
+    new_title = f"[{now_time}] {leaf_marker} {base}"
     update_conversation_title(cid, new_title)
     updated.append(cid)
     export_chain_index()
@@ -1022,12 +1029,13 @@ def advance_in_progress_chain(chain_ids: list[str] = None, current_conv_id: str 
     update_conversation_title(mid_id, f"[{t_mid}] {MARKER_STEP} {base_mid}")
     updated.append(mid_id)
 
-  # 3. Last chat (current active step) -> ⦿
+  # 3. Last chat (current active step) -> ⦿ (or preserve ⏳ if waiting on cron/external)
   active_id = chain_ids[-1]
   cur_active = get_conversation_title(active_id)
   t_active = extract_time_prefix(cur_active, now_time)
   base_active = clean_base_title(cur_active) or base_topic
-  update_conversation_title(active_id, f"[{t_active}] {MARKER_ACTIVE} {base_active}")
+  leaf_marker = MARKER_WAITING if is_waiting_title(cur_active) else MARKER_ACTIVE
+  update_conversation_title(active_id, f"[{t_active}] {leaf_marker} {base_active}")
   updated.append(active_id)
 
   export_chain_index()
@@ -1070,7 +1078,23 @@ def finalize_conversation_chain(current_conv_id: str, chain_ids: list[str] = Non
   return updated
 
 
+# Parses the leading lifecycle marker token from "[HH:MM] <marker> <Topic>"
+def parse_title_marker(title: str) -> str:
+  if not title:
+    return ""
+  m = TITLE_MARKER_RE.match(title)
+  return m.group(1) if m else ""
+
+
 def is_finalized_title(title: str) -> bool:
+  marker = parse_title_marker(title)
+  if marker:
+    return marker in (
+        MARKER_SINGLE_CLOSED,
+        MARKER_CLOSED_END,
+        MARKER_CLOSED_STEP,
+        MARKER_CLOSED_START,
+    )
   if not title:
     return False
   return (
@@ -1079,6 +1103,37 @@ def is_finalized_title(title: str) -> bool:
       or MARKER_CLOSED_STEP in title
       or MARKER_CLOSED_START in title
   )
+
+
+# Checks whether an open leaf chat title carries the explicit leading ⏳ waiting marker
+def is_waiting_title(title: str) -> bool:
+  if not title or is_finalized_title(title):
+    return False
+  return parse_title_marker(title) == MARKER_WAITING
+
+
+# Switches or toggles an open leaf chat between ⦿ (Needs Me) and ⏳ (Waiting External/Cron)
+def set_conversation_wait_state(
+    conv_id: str, waiting: bool | None = None
+) -> str:
+  if not conv_id:
+    return ""
+  cur_title = get_conversation_title(conv_id)
+  # Handed-off chain steps (▸, ✓) and finalized chats («, ‹✓›, », «») cannot toggle wait state
+  if is_finalized_title(cur_title) or parse_title_marker(cur_title) in (
+      MARKER_START,
+      MARKER_STEP,
+  ):
+    return cur_title
+  # Toggle when waiting is None so UI and CLI callers can flip state in one call
+  target_waiting = (not is_waiting_title(cur_title)) if waiting is None else bool(waiting)
+  target_marker = MARKER_WAITING if target_waiting else MARKER_ACTIVE
+  ts = extract_time_prefix(cur_title, get_current_time_str())
+  base = clean_base_title(cur_title) or "Investigation"
+  new_title = f"[{ts}] {target_marker} {base}"
+  if cur_title != new_title:
+    update_conversation_title(conv_id, new_title)
+  return new_title
 
 
 def reopen_conversation(conv_id: str, force: bool = False) -> bool:
@@ -1092,11 +1147,21 @@ def reopen_conversation(conv_id: str, force: bool = False) -> bool:
   return bool(updated)
 
 
-def set_conversation_topic(conv_id: str, topic: str, marker: str = MARKER_ACTIVE) -> str:
+def set_conversation_topic(
+    conv_id: str, topic: str, marker: str = ""
+) -> str:
   """Sets the topic for a conversation, formatting as `[HH:MM] <marker> <clean_topic>`."""
   clean = clean_base_title(topic)
   if not clean:
     clean = "Investigation"
+  # Preserve existing chain/wait marker (▸, ✓, ⏳) when caller does not specify one
+  if not marker:
+    cur_marker = parse_title_marker(get_conversation_title(conv_id))
+    marker = (
+        cur_marker
+        if cur_marker in (MARKER_START, MARKER_STEP, MARKER_WAITING)
+        else MARKER_ACTIVE
+    )
   time_str = get_current_time_str()
   new_title = f"[{time_str}] {marker} {clean}" if marker else f"[{time_str}] {clean}"
   ok = update_conversation_title(conv_id, new_title)
@@ -2115,7 +2180,7 @@ def audit_conversations(
 
   # Regex for a strictly valid Scheme Γ title: [HH:MM] <single_marker> <non-marker topic>
   valid_gamma_re = re.compile(
-      r"^\[\d{2}:\d{2}\] (?:▸|✓|⦿|«|‹✓›|»|«») (?!(?:[▸✓⦿«»]|‹✓›|«»)(?:\s|$))\S"
+      r"^\[\d{2}:\d{2}\] (?:▸|✓|⦿|⏳|«|‹✓›|»|«») (?!(?:[▸✓⦿⏳«»]|‹✓›|«»)(?:\s|$))\S"
   )
 
   for root_id in roots:
@@ -2140,12 +2205,16 @@ def audit_conversations(
 
     for idx, cid in enumerate(chain):
       cur_title = _BestTitle(cid)
+      # Preserve explicit ⏳ wait marker on open leaf chats during audit
+      open_leaf_marker = (
+          MARKER_WAITING if is_waiting_title(cur_title) else MARKER_ACTIVE
+      )
       if len(chain) == 1:
-        exp_marker = MARKER_SINGLE_CLOSED if finalized else MARKER_ACTIVE
+        exp_marker = MARKER_SINGLE_CLOSED if finalized else open_leaf_marker
       elif idx == 0:
         exp_marker = MARKER_CLOSED_START if finalized else MARKER_START
       elif idx == len(chain) - 1:
-        exp_marker = MARKER_CLOSED_END if finalized else MARKER_ACTIVE
+        exp_marker = MARKER_CLOSED_END if finalized else open_leaf_marker
       else:
         exp_marker = MARKER_CLOSED_STEP if finalized else MARKER_STEP
 
@@ -2265,6 +2334,8 @@ Commands:
                                       only on the user's explicit word ("финал").
                                       Timestamps are preserved.
   reopen <id>                         Re-activate a finalized chain. USER-ONLY.
+  wait [<id>] [on|off|toggle]         Set or toggle an open chat's idle attention marker
+                                      between ⏳ (Waiting Cron/External) and ⦿ (Needs Me).
 
 Internal (used by hooks; do not run manually):
   set <id> "<raw title>"              Write a title verbatim, no marker handling.
@@ -2274,7 +2345,7 @@ Notes:
   * <id> may be any conversation of the chain for finalize/reopen/status/archive --chain.
   * When <id> is omitted, $CONVERSATION_ID is used (set inside the agent's
     run_command only).
-  * Markers (▸ ✓ ⦿ « ‹✓› » «») are derived mechanically from the chain; never
+  * Markers (▸ ✓ ⦿ ⏳ « ‹✓› » «») are derived mechanically from the chain; never
     choose or edit them by hand. A chain is the set of chats joined by handoff
     links (who continues whom); topics may differ from step to step.
   * Model of a continuation: --model <id|display name|enum|flash_lite|flash|pro>
@@ -2302,6 +2373,7 @@ KNOWN_COMMANDS = (
     "handoff",
     "next-task",
     "reopen",
+    "wait",
     "advance",
     "finalize",
     "audit",
@@ -2620,6 +2692,31 @@ def main(argv: list[str] | None = None) -> int:
   elif cmd == "reopen":
     cid = _require_conversation_id("reopen", args[0] if args else "")
     reopen_conversation(cid, force=True)
+  elif cmd == "wait":
+    # Allow `wait [on|off|toggle]` using $CONVERSATION_ID or `wait <id> [on|off|toggle]`
+    mode_tokens = {
+        "on", "true", "1", "waiting", "wait",
+        "off", "false", "0", "needs-me", "active", "toggle",
+    }
+    if args and args[0].lower() in mode_tokens:
+      cid = _require_conversation_id("wait", _env_conversation_id())
+      mode_str = args[0].lower()
+    else:
+      cid = _require_conversation_id(
+          "wait", args[0] if args else _env_conversation_id()
+      )
+      mode_str = args[1].lower() if len(args) > 1 else "on"
+    if mode_str in ("on", "true", "1", "waiting", "wait"):
+      waiting_arg: bool | None = True
+    elif mode_str in ("off", "false", "0", "needs-me", "active"):
+      waiting_arg = False
+    elif mode_str == "toggle":
+      waiting_arg = None
+    else:
+      _cli_fail("wait", f"unknown mode '{mode_str}' (expected on, off, or toggle)")
+      return 2
+    new_t = set_conversation_wait_state(cid, waiting=waiting_arg)
+    print(f"Updated title for {cid}: {new_t}")
   elif cmd == "advance":
     cids = [_require_conversation_id("advance", a) for a in args]
     if not cids:

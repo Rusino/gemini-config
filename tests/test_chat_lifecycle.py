@@ -1343,6 +1343,47 @@ class TestChatLifecycle(unittest.TestCase):
     self.assertFalse(pre_tool_guard.is_chat_lifecycle_next_task_launch(cmd_help))
     self.assertFalse(context_guard.is_chat_lifecycle_handoff_command(cmd_help))
 
+  def test_set_conversation_wait_state_and_audit_preserves_waiting_marker(self):
+    cid = "12345678-1234-1234-1234-123456789abc"
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.write_chain(tmp_dir, [(cid, None)])
+      self.write_titles(tmp_dir, {cid: "[10:15] ⦿ Flight Deck"}, project="proj-1")
+      with unittest.mock.patch.object(
+          chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]
+      ), unittest.mock.patch.object(
+          chat_lifecycle, "discover_local_ls_endpoint", return_value=("", "")
+      ), unittest.mock.patch.object(
+          chat_lifecycle, "_fetch_ls_summaries_for_audit", return_value={}
+      ):
+        t_wait = chat_lifecycle.set_conversation_wait_state(cid, waiting=True)
+        self.assertEqual(t_wait, "[10:15] ⏳ Flight Deck")
+        self.assertTrue(chat_lifecycle.is_waiting_title(t_wait))
+
+        report = chat_lifecycle.audit_conversations(fix=True)
+        self.assertEqual(report["issues_count"], 0)
+        self.assertEqual(
+            chat_lifecycle.get_conversation_title(cid), "[10:15] ⏳ Flight Deck"
+        )
+
+        t_toggle = chat_lifecycle.set_conversation_wait_state(cid, waiting=None)
+        self.assertEqual(t_toggle, "[10:15] ⦿ Flight Deck")
+        self.assertFalse(chat_lifecycle.is_waiting_title(t_toggle))
+
+        # A trailing [⏳St · 1/4 rolls] badge must not be mistaken for a leading ⏳ wait marker
+        t_badge = "[10:15] ⦿ cl/1396956 [⏳St · 1/4 rolls]"
+        self.assertFalse(chat_lifecycle.is_waiting_title(t_badge))
+        # set_conversation_topic preserves an existing ▸ root marker when updating a roll badge
+        chat_lifecycle.update_conversation_title(cid, "[10:15] ▸ cl/1396956")
+        t_updated = chat_lifecycle.set_conversation_topic(
+            cid, "cl/1396956 [⏳St · 1/4 rolls]"
+        )
+        self.assertIn(" ▸ cl/1396956 [⏳St · 1/4 rolls]", t_updated)
+        # set_conversation_wait_state ignores handed-off chain predecessors (▸, ✓)
+        self.assertEqual(
+            chat_lifecycle.set_conversation_wait_state(cid, waiting=True),
+            t_updated,
+        )
+
 
 if __name__ == "__main__":
   unittest.main()

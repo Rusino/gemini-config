@@ -668,6 +668,45 @@ class TestStopGuard(unittest.TestCase):
       ]
       self.assertEqual(self.run_discipline_stop(tmp_dir, steps), {})
 
+  def test_schedule_tool_call_promotes_conversation_to_waiting_state(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      transcript = os.path.join(tmp_dir, "transcript.jsonl")
+      steps = [
+          {
+              "step_index": 1,
+              "type": "USER_INPUT",
+              "content": "<USER_REQUEST>poll every 5m</USER_REQUEST>",
+          },
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "schedule",
+                  "args": {"CronExpression": "*/5 * * * *", "Prompt": "tick"},
+              }],
+          },
+      ]
+      with open(transcript, "w", encoding="utf-8") as f:
+        for s in steps:
+          f.write(json.dumps(s) + "\n")
+      data = {
+          "conversationId": "12345678-1234-1234-1234-123456789abc",
+          "transcriptPath": transcript,
+          "artifactDirectoryPath": tmp_dir,
+          "fullyIdle": False,
+          "terminationReason": "MODEL_STOP",
+      }
+      with patch("sys.stdin", io.StringIO(json.dumps(data))), patch(
+          "sys.stdout", new_callable=io.StringIO
+      ) as mock_out, patch(
+          "chat_lifecycle.set_conversation_wait_state"
+      ) as mock_wait:
+        stop_guard.main()
+        self.assertEqual(json.loads(mock_out.getvalue()), {})
+        mock_wait.assert_called_once_with(
+            "12345678-1234-1234-1234-123456789abc", waiting=True
+        )
+
 
 if __name__ == "__main__":
   unittest.main()

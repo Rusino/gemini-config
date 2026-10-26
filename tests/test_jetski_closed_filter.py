@@ -187,6 +187,10 @@ function matches(el, selector) {
   if (selector === 'button[aria-label="Display Options"]') {
     return el.tagName === 'BUTTON' && el.getAttribute('aria-label') === 'Display Options';
   }
+  const bucketMatch = /^button\[data-bucket="([^"]+)"\]$/.exec(selector);
+  if (bucketMatch) {
+    return el.tagName === 'BUTTON' && el.getAttribute('data-bucket') === bucketMatch[1];
+  }
   if (selector === 'script[src*="jetski-closed-filter.js"]') {
     return el.tagName === 'SCRIPT' && (el.getAttribute('src') || '').includes('jetski-closed-filter.js');
   }
@@ -271,7 +275,7 @@ rowHoverBar.appendChild(pinBtn);
 sidebarRow.appendChild(rowHoverBar);
 bodyEl.appendChild(sidebarRow);
 
-function makeSummary(title, projectId, extraMeta = {}, archived = false) {
+function makeSummary(title, projectId, extraMeta = {}, archived = false, extraSummary = {}) {
   return {
     summary: title,
     annotations: { archived },
@@ -279,12 +283,20 @@ function makeSummary(title, projectId, extraMeta = {}, archived = false) {
       projectId,
       ...extraMeta,
     },
+    ...extraSummary,
   };
 }
 
-// Scheme Γ: open chains read ▸ root, ✓ steps, ⦿ current; finalize rewrites them to «, ‹✓›, » or «» solo
+// Scheme Γ: open chains read ▸ root, ✓ steps, ⦿ (Needs Me) or ⏳ (Waiting) leaf
 const initialSummaries = {
   'solo-active': makeSummary('[10:00] ⦿ Active solo task', 'proj-1'),
+  'agent-working': makeSummary('[10:02] ⦿ Busy agent task', 'proj-1', {}, false, {
+    status: 'CASCADE_RUN_STATUS_RUNNING',
+  }),
+  'cron-waiting': makeSummary('[10:04] ⏳ Flight Deck cron', 'proj-1', {}, false, {
+    status: 'CASCADE_RUN_STATUS_IDLE',
+    notFullyIdle: true,
+  }),
   'open-root': makeSummary('[09:00] ▸ Open chain topic', 'proj-1'),
   'open-step': makeSummary('[09:30] ✓ Open chain topic', 'proj-1'),
   'open-current': makeSummary('[10:05] ⦿ Open chain topic', 'proj-1'),
@@ -432,9 +444,17 @@ global.requestAnimationFrame = (cb) => {
 
 eval(code);
 
-const btn = actionRow.querySelector('.jetski-closed-chats-filter-btn');
-assert(btn, 'Filter toggle button must be injected before Display Options');
-assert.strictEqual(actionRow.children[0], btn);
+const filterBar = bodyEl.querySelector('.jetski-attention-filter-bar');
+assert(filterBar, '5-button filter bar must be injected below the sidebar header row');
+assert.strictEqual(bodyEl.children[1], filterBar, 'Filter bar must sit directly below actionRow');
+const bucketBtns = filterBar.querySelectorAll('.jetski-closed-chats-filter-btn');
+assert.strictEqual(bucketBtns.length, 5, 'Filter bar must render 5 state buttons');
+
+const btnNeedsMe = filterBar.querySelector('button[data-bucket="needs-me"]');
+const btnWorking = filterBar.querySelector('button[data-bucket="working"]');
+const btnWaiting = filterBar.querySelector('button[data-bucket="waiting"]');
+const btnSteps = filterBar.querySelector('button[data-bucket="steps"]');
+const btnClosed = filterBar.querySelector('button[data-bucket="closed"]');
 
 const isHidden = (id) => Boolean(
   storeState.trajectorySummaries.summaries[id].trajectoryMetadata?.sourceMetadata?.hideFromConversationList
@@ -447,16 +467,27 @@ const CLOSED_SCOPE_HIDDEN = [
   'closed-root', 'closed-step', 'closed-tail',
 ];
 
-// Initial state: filterEnabled=true, filterScope='closed'
-// Hidden: closed-solo («»), closed-pair-* (« »), closed-root/step/tail (« ‹✓› ») => 6
-// Visible: solo-active (⦿), open-root (▸), open-step (✓), open-current (⦿), quoted-title => 5 (3 active)
-// Total eligible: 11 (native-hidden is excluded)
-assert.strictEqual(btn.getAttribute('aria-label'), '3 active · 6 closed');
-assert.strictEqual(btn.getAttribute('data-active'), 'true');
-assert.strictEqual(emptyProjSpan.textContent, 'No active chats (3 hidden)');
+// Default visible buckets: ['needs-me', 'working']
+// Counts across 13 eligible chats:
+// - needs-me (3): solo-active, open-current, quoted-title
+// - working (1): agent-working
+// - waiting (1): cron-waiting (⏳ with status IDLE & notFullyIdle=true stays in waiting!)
+// - steps (2): open-root (▸), open-step (✓)
+// - closed (6): closed-solo, closed-pair-*, closed-root/step/tail
+assert.strictEqual(btnNeedsMe.getAttribute('aria-label'), '🚨 Needs Me: 3 (shown)');
+assert.strictEqual(btnNeedsMe.getAttribute('data-active'), 'true');
+assert.strictEqual(btnWorking.getAttribute('aria-label'), '🤖 Working: 1 (shown)');
+assert.strictEqual(btnWorking.getAttribute('data-active'), 'true');
+assert.strictEqual(btnWaiting.getAttribute('aria-label'), '⏳ Waiting: 1 (hidden)');
+assert.strictEqual(btnWaiting.getAttribute('data-active'), 'false');
+assert.strictEqual(btnSteps.getAttribute('aria-label'), '▸✓ Chain Steps: 2 (hidden)');
+assert.strictEqual(btnSteps.getAttribute('data-active'), 'false');
+assert.strictEqual(btnClosed.getAttribute('aria-label'), '«» Closed: 6 (hidden)');
+assert.strictEqual(btnClosed.getAttribute('data-active'), 'false');
+assert.strictEqual(emptyProjSpan.textContent, 'No matching chats (3 hidden)');
 
-assertHidden(CLOSED_SCOPE_HIDDEN, true);
-assertHidden(['solo-active', 'open-root', 'open-step', 'open-current', 'quoted-title'], false);
+assertHidden([...CLOSED_SCOPE_HIDDEN, 'open-root', 'open-step', 'cron-waiting'], true);
+assertHidden(['solo-active', 'agent-working', 'open-current', 'quoted-title'], false);
 assert.strictEqual(storeState.trajectorySummaries.summaries['closed-solo'].annotations.archived, false);
 
 // Overview Panel stays closed in Redux for active chats and resists open/restore actions
@@ -476,57 +507,67 @@ const injectedStyle = global.document.getElementById('jetski-closed-chats-filter
 assert(injectedStyle.textContent.includes('[data-testid="overview-panel-host-gutter"]'));
 assert(injectedStyle.textContent.includes('--overview-panel-reserve: 0px !important;'));
 
-// Hover bubble in Filter ON (closed) state
-btn.dispatchEvent('mouseenter');
+// Hovering each button displays a dedicated tooltip explaining that button's state
+btnWaiting.dispatchEvent('mouseenter');
 const bubble = global.document.getElementById('jetski-closed-chats-filter-bubble');
 assert(bubble, 'Hover bubble must be created');
 assert.strictEqual(bubble.getAttribute('data-visible'), 'true');
-assert(bubble.innerHTML.includes('Filter ON: closed chats hidden'));
-assert(bubble.innerHTML.includes('Active (⦿, no marker):'));
-assert(bubble.innerHTML.includes('Open chain roots (▸):'));
-assert(bubble.innerHTML.includes('Handed-off steps (✓):'));
-assert(bubble.innerHTML.includes('Finalized chains («, ‹✓›, », «»):'));
-assert(bubble.innerHTML.includes('6 of 11'));
+assert(bubble.innerHTML.includes('⏳ Waiting (Cron / External)'));
+assert(bubble.innerHTML.includes('[HIDDEN · 1]'));
+assert(bubble.innerHTML.includes('Background cron/timer chats or chats waiting on external events'));
+assert(bubble.innerHTML.includes('4 of 13 (9 hidden)'));
 assert(!/[А-Яа-яЁё]/.test(bubble.innerHTML), 'Bubble HTML must not contain Cyrillic');
 
-// Verify MutationObserver ignores mutations inside bubble and button
+btnNeedsMe.dispatchEvent('mouseenter');
+assert(bubble.innerHTML.includes('🚨 Needs Me (⦿)'));
+assert(bubble.innerHTML.includes('[SHOWN · 3]'));
+
+// Verify MutationObserver ignores mutations inside bubble and filter bar
 rafCallbacks = [];
-observerCallback([{ target: bubble }, { target: btn }]);
+observerCallback([{ target: bubble }, { target: btnWaiting }, { target: filterBar }]);
 assert.strictEqual(rafCallbacks.length, 0, 'Bubble/button mutations must not schedule sync');
 
-// Left-click via pointerdown + mousedown + click sequence must toggle ONCE (to Filter OFF)
-const pdRes = btn.dispatchEvent('pointerdown', { button: 0 });
+// Left-click on ⏳ Waiting button toggles it ON independently (combining 🚨 + 🤖 + ⏳)
+const pdRes = btnWaiting.dispatchEvent('pointerdown', { button: 0 });
 assert.strictEqual(pdRes.defaultPrevented, true);
 assert.strictEqual(pdRes.propagationStopped, true);
-btn.dispatchEvent('mousedown', { button: 0 });
-btn.dispatchEvent('click', { button: 0 });
+btnWaiting.dispatchEvent('mousedown', { button: 0 });
+btnWaiting.dispatchEvent('click', { button: 0 });
 
-assert.strictEqual(btn.getAttribute('data-active'), 'false');
-assert.strictEqual(btn.getAttribute('aria-label'), 'All (3 active · 6 closed)');
-assert.strictEqual(emptyProjSpan.textContent, 'No conversations yet');
-assert(bubble.innerHTML.includes('Filter OFF: showing all chats'));
-assert(bubble.innerHTML.includes('Would be hidden (count on button):'));
+assert.strictEqual(btnWaiting.getAttribute('data-active'), 'true');
+assert.strictEqual(btnWaiting.getAttribute('aria-label'), '⏳ Waiting: 1 (shown)');
+assertHidden(['cron-waiting'], false);
+assertHidden(['solo-active', 'agent-working', 'open-current', 'quoted-title'], false);
+assertHidden([...CLOSED_SCOPE_HIDDEN, 'open-root', 'open-step'], true);
 
+// Right-click (contextmenu) on «» Closed solos ONLY the closed bucket
+btnClosed.dispatchEvent('contextmenu', { button: 2 });
+assert.strictEqual(btnClosed.getAttribute('data-active'), 'true');
+assert.strictEqual(btnNeedsMe.getAttribute('data-active'), 'false');
+assert.strictEqual(btnWorking.getAttribute('data-active'), 'false');
+assert.strictEqual(btnWaiting.getAttribute('data-active'), 'false');
+assert.strictEqual(btnSteps.getAttribute('data-active'), 'false');
 assertHidden(CLOSED_SCOPE_HIDDEN, false);
-// Natively hidden conversation must remain hidden even when filter is turned OFF
+assertHidden(['solo-active', 'agent-working', 'cron-waiting', 'open-root', 'open-step'], true);
+
+// Right-click again on already-soloed «» Closed turns all 5 buckets ON
+btnClosed.dispatchEvent('contextmenu', { button: 2 });
+for (const b of [btnNeedsMe, btnWorking, btnWaiting, btnSteps, btnClosed]) {
+  assert.strictEqual(b.getAttribute('data-active'), 'true');
+}
+assert.strictEqual(emptyProjSpan.textContent, 'No conversations yet');
+assertHidden(CLOSED_SCOPE_HIDDEN, false);
 assertHidden(['native-hidden'], true);
 
-// Right-click (contextmenu) switches scope to 'active-only' and enables filter
-btn.dispatchEvent('contextmenu', { button: 2 });
-assert.strictEqual(btn.getAttribute('data-active'), 'true');
-// In 'active-only' scope, open-root (▸) and open-step (✓) are also hidden => 8 hidden of 11
-assert.strictEqual(btn.getAttribute('aria-label'), '3 active · 8 hidden');
-assert(bubble.innerHTML.includes('Filter ON: active chats only'));
-assert(bubble.innerHTML.includes('● <b>Active only</b>'));
-assert(bubble.innerHTML.includes('8 of 11'));
-assertHidden([...CLOSED_SCOPE_HIDDEN, 'open-root', 'open-step'], true);
-assertHidden(['solo-active', 'open-current', 'quoted-title'], false);
+// Turn «» Closed back OFF via left-click (after advancing Date.now past 300ms debounce)
+const origNowSync = Date.now;
+Date.now = () => origNowSync() + 500;
+btnClosed.dispatchEvent('pointerdown', { button: 0 });
+Date.now = origNowSync;
+assert.strictEqual(btnClosed.getAttribute('data-active'), 'false');
+assertHidden(CLOSED_SCOPE_HIDDEN, true);
 
-btn.dispatchEvent('contextmenu', { button: 2 });
-assert.strictEqual(btn.getAttribute('aria-label'), '3 active · 6 closed');
-assertHidden(['open-root', 'open-step'], false);
-
-// Incoming stream batch while filter is ON automatically hides newly arrived closed chat
+// Incoming stream batch while «» Closed is OFF automatically hides newly arrived closed chat
 reduxStore.dispatch({
   type: 'trajectorySummaries/applyStreamBatch',
   payload: {
@@ -538,25 +579,42 @@ reduxStore.dispatch({
 });
 assertHidden(['streamed-closed'], true);
 
-// Re-evaluating the script cleanly replaces the button via __jetskiClosedChatsFilterCleanup
+// Re-evaluating the script cleanly replaces the bar via __jetskiClosedChatsFilterCleanup
 eval(code);
-const btnsAfterReload = actionRow.querySelectorAll('.jetski-closed-chats-filter-btn');
-assert.strictEqual(btnsAfterReload.length, 1, 'Reloading script must not duplicate button');
+const barsAfterReload = bodyEl.querySelectorAll('.jetski-attention-filter-bar');
+assert.strictEqual(barsAfterReload.length, 1, 'Reloading script must not duplicate filter bar');
 
 (async () => {
+  const titlebarWaitBtn = titlebarToolbar.querySelector('.jetski-titlebar-wait-btn');
   const titlebarBtn = titlebarToolbar.querySelector('.jetski-titlebar-close-reopen-btn');
+  assert(titlebarWaitBtn, 'Titlebar Wait button must be injected before Close button');
   assert(titlebarBtn, 'Titlebar Close/Reopen button must be injected before titlebar-more-actions');
-  assert.strictEqual(titlebarToolbar.children[0], titlebarBtn);
+  assert.strictEqual(titlebarToolbar.children[0], titlebarWaitBtn);
+  assert.strictEqual(titlebarToolbar.children[1], titlebarBtn);
   assert.strictEqual(titlebarBtn.getAttribute('aria-label'), 'Close chat');
   assert.strictEqual(titlebarBtn.getAttribute('data-finalized'), 'false');
 
+  const rowWaitBtn = rowHoverBar.querySelector('.jetski-row-wait-btn');
   const rowBtn = rowHoverBar.querySelector('.jetski-row-close-reopen-btn');
+  assert(rowWaitBtn, 'Sidebar row Wait button must be injected before Close button');
   assert(rowBtn, 'Sidebar row Close/Reopen button must be injected before pin button');
-  assert.strictEqual(rowHoverBar.children[0], rowBtn);
+  assert.strictEqual(rowHoverBar.children[0], rowWaitBtn);
+  assert.strictEqual(rowHoverBar.children[1], rowBtn);
   assert.strictEqual(rowBtn.getAttribute('aria-label'), 'Close chat');
   assert.strictEqual(rowBtn.getAttribute('data-finalized'), 'false');
 
-  // Clicking the sidebar row Close button on a solo chat swaps its marker to «»
+  // Clicking the sidebar row Wait button on 'solo-active' swaps its marker between ⦿ and ⏳
+  rpcRequests.length = 0;
+  rowWaitBtn.dispatchEvent('pointerdown', { button: 0 });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.strictEqual(
+    storeState.trajectorySummaries.summaries['solo-active'].summary,
+    '[10:00] ⏳ Active solo task'
+  );
+  assert.strictEqual(rowWaitBtn.getAttribute('data-waiting'), 'true');
+  assert.strictEqual(rpcRequests.length, 1);
+
+  // Clicking the sidebar row Close button on 'solo-active' swaps its marker to «»
   rpcRequests.length = 0;
   rowBtn.dispatchEvent('pointerdown', { button: 0 });
   await new Promise((r) => setTimeout(r, 10));

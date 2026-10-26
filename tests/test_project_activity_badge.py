@@ -427,6 +427,37 @@ class TestProjectActivityBadge(unittest.TestCase):
       self.assertTrue(os.access(hook_py, os.X_OK))
       self.assertEqual(badge.ensure_hooks_executable(tmp), [])
 
+  def test_waiting_cron_chat_not_counted_as_running_when_idle_between_ticks(self):
+    known_projects = {"p1": ("/tmp/p1.json", {"id": "p1", "name": "Flight Deck"})}
+    summaries = {
+        "c-cron": {
+            "summary": "[10:00] ⏳ Flight Deck",
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "notFullyIdle": True,
+            "lastModifiedTime": "2026-10-26T20:00:00Z",
+            "annotations": {"lastUserViewTime": "2026-10-26T10:00:00Z"},
+            "trajectoryMetadata": {"projectId": "p1"},
+        },
+        "c-active": {
+            "summary": "[10:05] ⦿ Active Subagent Chat",
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "notFullyIdle": True,
+            "trajectoryMetadata": {"projectId": "p1"},
+        },
+    }
+    running, blocked, unread = badge.compute_project_activity(
+        summaries, known_projects, []
+    )
+    self.assertEqual(running["p1"], 1)
+    self.assertEqual(blocked.get("p1", 0), 0)
+    self.assertEqual(unread.get("p1", 0), 0)
+
+    summaries["c-cron"]["status"] = "CASCADE_RUN_STATUS_RUNNING"
+    running2, _, _ = badge.compute_project_activity(
+        summaries, known_projects, []
+    )
+    self.assertEqual(running2["p1"], 2)
+
 
 if __name__ == "__main__":
   unittest.main()

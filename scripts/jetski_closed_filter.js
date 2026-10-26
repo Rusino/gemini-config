@@ -8,21 +8,23 @@
   }
   window.__jetskiClosedChatsFilterInstalled = true;
 
-  const STORAGE_ENABLED_KEY = 'jetski_closed_filter_enabled';
-  const STORAGE_SCOPE_KEY = 'jetski_closed_filter_scope';
+  const STORAGE_BUCKETS_KEY = 'jetski_visible_buckets_v1';
+  const BAR_CLASS = 'jetski-attention-filter-bar';
   const BUTTON_CLASS = 'jetski-closed-chats-filter-btn';
   const TITLEBAR_BTN_CLASS = 'jetski-titlebar-close-reopen-btn';
+  const TITLEBAR_WAIT_BTN_CLASS = 'jetski-titlebar-wait-btn';
   const ROW_BTN_CLASS = 'jetski-row-close-reopen-btn';
+  const ROW_WAIT_BTN_CLASS = 'jetski-row-wait-btn';
   const STYLE_ID = 'jetski-closed-chats-filter-style';
 
-  // Lifecycle titles follow "[HH:MM] <marker> <Topic>" where marker encodes chain state
+  // Lifecycle titles follow "[HH:MM] <marker> <Topic>" where marker encodes chain/wait state
   // The time prefix and the space after the marker are mandatory so a plain title opening
   // with a guillemet quote is never read as the finalized « marker
-  const TITLE_MARKER_RE = /^\s*\[\d{1,2}:\d{2}\]\s*(‹✓›|«»|[✓⦿▸«»])(?:\s|$)/u;
+  const TITLE_MARKER_RE = /^\s*\[\d{1,2}:\d{2}\]\s*(‹✓›|«»|⏳|[✓⦿▸«»])(?:\s|$)/u;
   const TIME_PREFIX_EXTRACT_RE = /^\s*\[(\d{1,2}:\d{2})\]/;
   const CONT_WORD = '(?:\\u043f\\u0440\\u043e\\u0434\\u043e\\u043b\\u0436\\u0435\\u043d\\u0438\\u0435|continue)';
   const TITLE_CLEANUP_RE = new RegExp(
-    `^(?:\\s*\\[\\d{1,2}:\\d{2}(?:\\s+${CONT_WORD})?\\]\\s*(?:‹✓›|«»|[▸✓⦿«»]|\\s*)*)|^(?:${CONT_WORD}(?:\\s+\\d{1,2}:\\d{2})?\\s*:\\s*)+`,
+    `^(?:\\s*\\[\\d{1,2}:\\d{2}(?:\\s+${CONT_WORD})?\\]\\s*(?:‹✓›|«»|⏳|[▸✓⦿«»]|\\s*)*)|^(?:${CONT_WORD}(?:\\s+\\d{1,2}:\\d{2})?\\s*:\\s*)+`,
     'iu'
   );
   const TRAILING_CLEANUP_RE = new RegExp(
@@ -32,14 +34,61 @@
   // chat_lifecycle.py finalize rewrites every chat of a chain to «, ‹✓›, » (or «» for a
   // single-chat task), so each title alone tells whether its task is closed
   const FINALIZED_MARKERS = new Set(['«', '‹✓›', '»', '«»']);
-  // Open chains read ▸ root, ✓ handed-off steps, ⦿ current chat
+  // Open chains read ▸ root, ✓ handed-off steps, and ⦿ (Needs Me) or ⏳ (Waiting) leaf
   const OPEN_CHAIN_ROOT_MARKER = '▸';
   const OPEN_CHAIN_STEP_MARKER = '✓';
   const OPEN_ACTIVE_MARKER = '⦿';
+  const OPEN_WAITING_MARKER = '⏳';
   const CLOSED_START_MARKER = '«';
   const CLOSED_STEP_MARKER = '‹✓›';
   const CLOSED_END_MARKER = '»';
   const CLOSED_SINGLE_MARKER = '«»';
+
+  const BUCKET_ORDER = ['needs-me', 'working', 'waiting', 'steps', 'closed'];
+  const DEFAULT_VISIBLE_BUCKETS = ['needs-me', 'working'];
+
+  const BUCKET_DEFS = {
+    'needs-me': {
+      key: 'needs-me',
+      icon: '🚨',
+      shortLabel: 'Needs Me',
+      title: '🚨 Needs Me (⦿)',
+      description:
+        'Open chats stopped and waiting for your reply, decision, or sign-off.',
+    },
+    working: {
+      key: 'working',
+      icon: '🤖',
+      shortLabel: 'Working',
+      title: '🤖 Agent Working',
+      description:
+        'Open chats where the agent or a background command/subagent is actively running right now.',
+    },
+    waiting: {
+      key: 'waiting',
+      icon: '⏳',
+      shortLabel: 'Waiting',
+      title: '⏳ Waiting (Cron / External)',
+      description:
+        'Background cron/timer chats or chats waiting on external events (Gerrit, CQ) that do not need your action right now.',
+    },
+    steps: {
+      key: 'steps',
+      icon: '▸✓',
+      shortLabel: 'Chain Steps',
+      title: '▸/✓ Handed-off Chain Steps',
+      description:
+        'Earlier handed-off parts (▸ root, ✓ intermediate step) of open multi-chat chains.',
+    },
+    closed: {
+      key: 'closed',
+      icon: '«»',
+      shortLabel: 'Closed',
+      title: '«» Closed Chats',
+      description:
+        'Completed and finalized single-chat tasks («») or handoff chains («, ‹✓›, »).',
+    },
+  };
 
   function safeGetStorage(key) {
     try {
@@ -57,11 +106,28 @@
     }
   }
 
-  let filterEnabled = safeGetStorage(STORAGE_ENABLED_KEY) !== 'false';
-  let filterScope =
-    safeGetStorage(STORAGE_SCOPE_KEY) === 'active-only'
-      ? 'active-only'
-      : 'closed';
+  function loadVisibleBuckets() {
+    const raw = safeGetStorage(STORAGE_BUCKETS_KEY);
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          const valid = parsed.filter((k) => BUCKET_ORDER.includes(k));
+          return new Set(valid);
+        }
+      } catch {
+        // Fall back to default visible buckets on malformed storage JSON
+      }
+    }
+    return new Set(DEFAULT_VISIBLE_BUCKETS);
+  }
+
+  function saveVisibleBuckets(bucketsSet) {
+    const arr = BUCKET_ORDER.filter((k) => bucketsSet.has(k));
+    safeSetStorage(STORAGE_BUCKETS_KEY, JSON.stringify(arr));
+  }
+
+  let visibleBuckets = loadVisibleBuckets();
 
   // Tracks conversations whose hideFromConversationList flag we flipped in Redux
   // so we never unhide conversations that were natively hidden by their source
@@ -70,12 +136,13 @@
   // without the auxPaneV2 reducer never re-dispatch in a loop
   const overviewCloseDispatchedIds = new Set();
   let hiddenCountsByProject = new Map();
-  let totalClosedCount = 0;
+  let totalHiddenCount = 0;
   let breakdownStats = emptyBreakdown();
   let reduxStore = null;
   let isInternalDispatch = false;
   let rafScheduled = false;
   let activeHoverBtn = null;
+  let activeHoverBucket = null;
   let chainIndexCache = null;
   let chainIndexFetchedAt = 0;
 
@@ -88,6 +155,15 @@
   function isFinalizedTitle(title) {
     const marker = parseTitleMarker(title);
     return Boolean(marker && FINALIZED_MARKERS.has(marker));
+  }
+
+  function isWaitingTitle(title) {
+    return parseTitleMarker(title) === OPEN_WAITING_MARKER;
+  }
+
+  function isChainPredecessorTitle(title) {
+    const marker = parseTitleMarker(title);
+    return marker === OPEN_CHAIN_ROOT_MARKER || marker === OPEN_CHAIN_STEP_MARKER;
   }
 
   function getCurrentTimeStr() {
@@ -312,6 +388,38 @@
     }
   }
 
+  // Swaps an open leaf conversation between ⦿ (Needs Me) and ⏳ (Waiting External/Cron)
+  async function toggleConversationWaiting(cascadeId, fallbackDomTitle) {
+    if (!cascadeId) return;
+    const store = findReduxStore();
+    const curTitle = getTitleForCascadeId(cascadeId, fallbackDomTitle);
+    // Finalized («, ‹✓›, », «») and handed-off (▸, ✓) steps cannot toggle wait state
+    if (isFinalizedTitle(curTitle) || isChainPredecessorTitle(curTitle)) return;
+
+    const nowTime = getCurrentTimeStr();
+    const ts = extractTimePrefix(curTitle, nowTime);
+    const base = cleanBaseTitle(curTitle) || 'Investigation';
+    const nextMarker = isWaitingTitle(curTitle)
+      ? OPEN_ACTIVE_MARKER
+      : OPEN_WAITING_MARKER;
+    const newTitle = `[${ts}] ${nextMarker} ${base}`;
+
+    const s = store?.getState()?.trajectorySummaries?.summaries?.[cascadeId];
+    // Apply optimistic Redux title update immediately before the async LS RPC completes
+    if (store && s) {
+      store.dispatch({
+        type: 'trajectorySummaries/applyStreamBatch',
+        payload: {
+          updates: [[cascadeId, cloneSummaryWithTitle(s, newTitle)]],
+          deletes: [],
+        },
+      });
+    }
+
+    runFullSync();
+    await postUpdateTitleRpc(cascadeId, newTitle);
+  }
+
   async function toggleConversationLifecycle(cascadeId, fallbackDomTitle) {
     if (!cascadeId) return;
     const store = findReduxStore();
@@ -385,26 +493,50 @@
     );
   }
 
-  // 'closed' hides only finalized chains («, ‹✓›, », «») while keeping all steps (▸, ✓, ⦿)
-  // of open chains visible; 'active-only' also hides open chain roots (▸) and steps (✓)
-  function isHiddenMarker(marker, scope) {
-    if (FINALIZED_MARKERS.has(marker)) return true;
-    return (
-      scope === 'active-only' &&
-      (marker === OPEN_CHAIN_ROOT_MARKER || marker === OPEN_CHAIN_STEP_MARKER)
-    );
+  // Classifies a conversation into one of the 5 mutually exclusive state buckets
+  function classifyChatBucket(summary, fallbackTitle) {
+    const title =
+      summary?.annotations?.title || summary?.summary || fallbackTitle || '';
+    const marker = parseTitleMarker(title);
+    if (marker && FINALIZED_MARKERS.has(marker)) {
+      return 'closed';
+    }
+    if (
+      marker === OPEN_CHAIN_ROOT_MARKER ||
+      marker === OPEN_CHAIN_STEP_MARKER
+    ) {
+      return 'steps';
+    }
+    // Cron chats with marker ⏳ keep notFullyIdle=true between ticks, so only
+    // CASCADE_RUN_STATUS_RUNNING counts as actively working for ⏳ chats
+    const isRunning =
+      summary?.status === 'CASCADE_RUN_STATUS_RUNNING' ||
+      (marker !== OPEN_WAITING_MARKER && Boolean(summary?.notFullyIdle));
+    if (isRunning) {
+      return 'working';
+    }
+    if (marker === OPEN_WAITING_MARKER) {
+      return 'waiting';
+    }
+    return 'needs-me';
   }
 
   function emptyBreakdown() {
-    return { totalEligible: 0, active: 0, openRoots: 0, steps: 0, finalized: 0 };
+    return {
+      totalEligible: 0,
+      'needs-me': 0,
+      working: 0,
+      waiting: 0,
+      steps: 0,
+      closed: 0,
+    };
   }
 
-  function countMarker(stats, marker) {
+  function countBucket(stats, bucket) {
     stats.totalEligible++;
-    if (FINALIZED_MARKERS.has(marker)) stats.finalized++;
-    else if (marker === OPEN_CHAIN_STEP_MARKER) stats.steps++;
-    else if (marker === OPEN_CHAIN_ROOT_MARKER) stats.openRoots++;
-    else stats.active++;
+    if (bucket in stats) {
+      stats[bucket]++;
+    }
   }
 
   function isEligibleTopLevelSummary(cascadeId, summary) {
@@ -418,22 +550,22 @@
     return true;
   }
 
-  function classifySummaries(summariesMap, scope) {
-    const closedIds = new Set();
+  function classifySummaries(summariesMap, allowedBuckets) {
+    const hiddenIds = new Set();
     const perProjectHidden = new Map();
     const statsSummary = emptyBreakdown();
 
     for (const [cascadeId, summary] of Object.entries(summariesMap || {})) {
       if (!isEligibleTopLevelSummary(cascadeId, summary)) continue;
-      const marker = parseTitleMarker(summary.summary);
-      countMarker(statsSummary, marker);
-      if (!isHiddenMarker(marker, scope)) continue;
-      closedIds.add(cascadeId);
+      const bucket = classifyChatBucket(summary, '');
+      countBucket(statsSummary, bucket);
+      if (allowedBuckets.has(bucket)) continue;
+      hiddenIds.add(cascadeId);
       const projectId = summary.trajectoryMetadata?.projectId || '__standalone__';
       perProjectHidden.set(projectId, (perProjectHidden.get(projectId) || 0) + 1);
     }
 
-    return { closedIds, perProjectHidden, statsSummary };
+    return { hiddenIds, perProjectHidden, statsSummary };
   }
 
   function cloneSummaryWithHideFlag(summary, hide) {
@@ -535,7 +667,7 @@
     if (reduxStore === store) return;
     reduxStore = store;
 
-    // Intercept incoming stream batches so closed conversations stay hidden
+    // Intercept incoming stream batches so filtered conversations stay hidden
     // without flickering into the sidebar index on server stream ticks
     const origDispatch = store.dispatch;
     store.dispatch = function patchedDispatch(action) {
@@ -584,10 +716,10 @@
             currentSummaries[id] = incomingSummary;
           }
         }
-        const { closedIds } = classifySummaries(currentSummaries, filterScope);
+        const { hiddenIds } = classifySummaries(currentSummaries, visibleBuckets);
         const rewrittenUpdates = action.payload.updates.map(([id, incomingSummary]) => {
           if (!incomingSummary) return [id, incomingSummary];
-          if (filterEnabled && closedIds.has(id)) {
+          if (hiddenIds.has(id)) {
             if (!incomingSummary.trajectoryMetadata?.sourceMetadata?.hideFromConversationList) {
               managedHiddenIds.set(id, false);
               return [id, cloneSummaryWithHideFlag(incomingSummary, true)];
@@ -696,11 +828,11 @@
     const summariesMap = store.getState()?.trajectorySummaries?.summaries;
     if (!summariesMap) return false;
 
-    const { closedIds, perProjectHidden, statsSummary } = classifySummaries(
+    const { hiddenIds, perProjectHidden, statsSummary } = classifySummaries(
       summariesMap,
-      filterScope
+      visibleBuckets
     );
-    totalClosedCount = closedIds.size;
+    totalHiddenCount = hiddenIds.size;
     hiddenCountsByProject = perProjectHidden;
     if (statsSummary) {
       breakdownStats = statsSummary;
@@ -708,28 +840,18 @@
 
     const updates = [];
 
-    if (filterEnabled) {
-      for (const cascadeId of closedIds) {
-        const summary = summariesMap[cascadeId];
-        if (!summary) continue;
-        const alreadyHidden =
-          Boolean(summary.trajectoryMetadata?.sourceMetadata?.hideFromConversationList);
-        if (!alreadyHidden) {
-          managedHiddenIds.set(cascadeId, false);
-          updates.push([cascadeId, cloneSummaryWithHideFlag(summary, true)]);
-        }
+    for (const cascadeId of hiddenIds) {
+      const summary = summariesMap[cascadeId];
+      if (!summary) continue;
+      const alreadyHidden =
+        Boolean(summary.trajectoryMetadata?.sourceMetadata?.hideFromConversationList);
+      if (!alreadyHidden) {
+        managedHiddenIds.set(cascadeId, false);
+        updates.push([cascadeId, cloneSummaryWithHideFlag(summary, true)]);
       }
-      for (const [cascadeId] of Array.from(managedHiddenIds.entries())) {
-        if (!closedIds.has(cascadeId)) {
-          managedHiddenIds.delete(cascadeId);
-          const summary = summariesMap[cascadeId];
-          if (summary?.trajectoryMetadata?.sourceMetadata?.hideFromConversationList) {
-            updates.push([cascadeId, cloneSummaryWithHideFlag(summary, false)]);
-          }
-        }
-      }
-    } else if (managedHiddenIds.size > 0) {
-      for (const [cascadeId] of Array.from(managedHiddenIds.entries())) {
+    }
+    for (const [cascadeId] of Array.from(managedHiddenIds.entries())) {
+      if (!hiddenIds.has(cascadeId)) {
         managedHiddenIds.delete(cascadeId);
         const summary = summariesMap[cascadeId];
         if (summary?.trajectoryMetadata?.sourceMetadata?.hideFromConversationList) {
@@ -788,13 +910,24 @@
         --overview-panel-reserve: 0px !important;
         --overview-panel-gutter-reserve: 0px !important;
       }
+      .${BAR_CLASS} {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 4px 10px 6px 10px;
+        width: 100%;
+        box-sizing: border-box;
+        flex-wrap: nowrap;
+      }
       .${BUTTON_CLASS} {
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        gap: 4px;
+        flex: 1 1 0;
+        min-width: 0;
+        gap: 3px;
         height: 22px;
-        padding: 0 7px;
+        padding: 0 5px;
         border-radius: 6px;
         border: 1px solid transparent;
         font-family: inherit;
@@ -809,36 +942,36 @@
       .${BUTTON_CLASS} > * {
         pointer-events: none;
       }
-      .${BUTTON_CLASS} svg {
-        width: 12px;
-        height: 12px;
-        flex-shrink: 0;
-      }
       .${BUTTON_CLASS}[data-active="false"] {
-        background: rgba(128, 134, 139, 0.10);
-        border-color: rgba(128, 134, 139, 0.22);
+        background: rgba(128, 134, 139, 0.08);
+        border-color: rgba(128, 134, 139, 0.20);
         color: var(--muted-foreground, #9aa0a6);
-        opacity: 0.9;
+        opacity: 0.68;
       }
       .${BUTTON_CLASS}[data-active="false"]:hover {
-        background: var(--sidebar-secondary, rgba(128, 134, 139, 0.20));
+        background: var(--sidebar-secondary, rgba(128, 134, 139, 0.18));
         color: var(--foreground, #e8eaed);
-        opacity: 1;
+        opacity: 0.95;
       }
       .${BUTTON_CLASS}[data-active="true"] {
-        background: color-mix(in srgb, var(--primary, #8ab4f8) 16%, transparent);
-        border-color: color-mix(in srgb, var(--primary, #8ab4f8) 34%, transparent);
+        background: color-mix(in srgb, var(--primary, #8ab4f8) 18%, transparent);
+        border-color: color-mix(in srgb, var(--primary, #8ab4f8) 38%, transparent);
         color: var(--primary, #8ab4f8);
         opacity: 1;
       }
       .${BUTTON_CLASS}[data-active="true"]:hover {
-        background: color-mix(in srgb, var(--primary, #8ab4f8) 24%, transparent);
+        background: color-mix(in srgb, var(--primary, #8ab4f8) 26%, transparent);
+      }
+      .${BUTTON_CLASS} .jetski-bucket-icon {
+        font-size: 11px;
+        line-height: 1;
       }
       .${BUTTON_CLASS} .jetski-filter-badge {
         font-variant-numeric: tabular-nums;
         font-weight: 600;
       }
-      .${TITLEBAR_BTN_CLASS} {
+      .${TITLEBAR_BTN_CLASS},
+      .${TITLEBAR_WAIT_BTN_CLASS} {
         display: inline-flex;
         align-items: center;
         justify-content: center;
@@ -857,25 +990,27 @@
         cursor: pointer;
         user-select: none;
         flex-shrink: 0;
+        margin-right: 4px;
         transition: background-color 120ms ease, color 120ms ease, border-color 120ms ease;
       }
-      .${TITLEBAR_BTN_CLASS} > * {
+      .${TITLEBAR_BTN_CLASS} > *,
+      .${TITLEBAR_WAIT_BTN_CLASS} > * {
         pointer-events: none;
       }
-      .${TITLEBAR_BTN_CLASS}:hover {
+      .${TITLEBAR_BTN_CLASS}:hover,
+      .${TITLEBAR_WAIT_BTN_CLASS}:hover {
         background: var(--secondary, rgba(128, 134, 139, 0.22));
         color: var(--foreground, #e8eaed);
         border-color: rgba(128, 134, 139, 0.40);
       }
-      .${TITLEBAR_BTN_CLASS}[data-finalized="true"] {
+      .${TITLEBAR_BTN_CLASS}[data-finalized="true"],
+      .${TITLEBAR_WAIT_BTN_CLASS}[data-waiting="true"] {
         background: color-mix(in srgb, var(--primary, #8ab4f8) 16%, transparent);
         border-color: color-mix(in srgb, var(--primary, #8ab4f8) 36%, transparent);
         color: var(--primary, #8ab4f8);
       }
-      .${TITLEBAR_BTN_CLASS}[data-finalized="true"]:hover {
-        background: color-mix(in srgb, var(--primary, #8ab4f8) 24%, transparent);
-      }
-      .${ROW_BTN_CLASS} {
+      .${ROW_BTN_CLASS},
+      .${ROW_WAIT_BTN_CLASS} {
         display: inline-flex;
         align-items: center;
         justify-content: center;
@@ -895,23 +1030,23 @@
         flex-shrink: 0;
         transition: background-color 120ms ease, color 120ms ease;
       }
-      .${ROW_BTN_CLASS} > * {
+      .${ROW_BTN_CLASS} > *,
+      .${ROW_WAIT_BTN_CLASS} > * {
         pointer-events: none;
       }
-      .${ROW_BTN_CLASS}:hover {
+      .${ROW_BTN_CLASS}:hover,
+      .${ROW_WAIT_BTN_CLASS}:hover {
         background: var(--sidebar-secondary, rgba(128, 134, 139, 0.22));
         color: var(--foreground, #e8eaed);
       }
-      .${ROW_BTN_CLASS}[data-finalized="true"] {
+      .${ROW_BTN_CLASS}[data-finalized="true"],
+      .${ROW_WAIT_BTN_CLASS}[data-waiting="true"] {
         color: var(--primary, #8ab4f8);
-      }
-      .${ROW_BTN_CLASS}[data-finalized="true"]:hover {
-        background: color-mix(in srgb, var(--primary, #8ab4f8) 20%, transparent);
       }
       #jetski-closed-chats-filter-bubble {
         position: fixed;
         z-index: 2147483647;
-        width: 310px;
+        width: 320px;
         padding: 10px 12px;
         border-radius: 8px;
         background: var(--popover, #1e1f22);
@@ -933,12 +1068,16 @@
       #jetski-closed-chats-filter-bubble .jcfb-header {
         display: flex;
         align-items: center;
+        justify-content: space-between;
         gap: 6px;
         font-weight: 600;
         font-size: 12px;
-        margin-bottom: 6px;
-        padding-bottom: 6px;
-        border-bottom: 1px solid rgba(128, 134, 139, 0.22);
+        margin-bottom: 4px;
+      }
+      #jetski-closed-chats-filter-bubble .jcfb-header-left {
+        display: flex;
+        align-items: center;
+        gap: 6px;
       }
       #jetski-closed-chats-filter-bubble .jcfb-dot {
         width: 7px;
@@ -946,20 +1085,32 @@
         border-radius: 999px;
         flex-shrink: 0;
       }
+      #jetski-closed-chats-filter-bubble .jcfb-desc {
+        font-size: 11px;
+        color: var(--muted-foreground, #b8bdc4);
+        padding-bottom: 7px;
+        margin-bottom: 6px;
+        border-bottom: 1px solid rgba(128, 134, 139, 0.22);
+      }
       #jetski-closed-chats-filter-bubble .jcfb-section-title {
         font-size: 10.5px;
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.04em;
         color: var(--muted-foreground, #9aa0a6);
-        margin: 6px 0 3px 0;
+        margin: 4px 0 3px 0;
       }
       #jetski-closed-chats-filter-bubble .jcfb-row {
         display: flex;
         justify-content: space-between;
         align-items: baseline;
         gap: 8px;
-        padding: 1.5px 0;
+        padding: 2px 4px;
+        border-radius: 4px;
+      }
+      #jetski-closed-chats-filter-bubble .jcfb-row[data-hovered="true"] {
+        background: rgba(138, 180, 248, 0.14);
+        font-weight: 600;
       }
       #jetski-closed-chats-filter-bubble .jcfb-val {
         font-variant-numeric: tabular-nums;
@@ -968,7 +1119,7 @@
       }
       #jetski-closed-chats-filter-bubble .jcfb-total-row {
         margin-top: 3px;
-        padding-top: 3px;
+        padding-top: 4px;
         border-top: 1px dashed rgba(128, 134, 139, 0.25);
         font-weight: 600;
       }
@@ -999,7 +1150,8 @@
   }
 
   function syncDomRowsAndPlaceholders(reduxActive) {
-    if (filterEnabled) {
+    const anyHidden = visibleBuckets.size < BUCKET_ORDER.length;
+    if (anyHidden) {
       if (document.documentElement.getAttribute('data-jetski-hide-closed') !== 'true') {
         document.documentElement.setAttribute('data-jetski-hide-closed', 'true');
       }
@@ -1007,19 +1159,23 @@
       document.documentElement.removeAttribute('data-jetski-hide-closed');
     }
 
+    const store = findReduxStore();
+    const summariesMap = store?.getState()?.trajectorySummaries?.summaries || {};
+
     // Fallback DOM row tagging for rows rendered before Redux hook or outside standard slices
     const rowEls = document.querySelectorAll('div[data-sidebar-row-id]');
     const domStats = emptyBreakdown();
-    let domClosedCount = 0;
+    let domHiddenCount = 0;
     for (const rowEl of rowEls) {
+      const rowId = rowEl.getAttribute('data-sidebar-row-id') || '';
       const linkEl = rowEl.querySelector('a[aria-label]');
       const spanEl = rowEl.querySelector('span.truncate');
       const title = linkEl?.getAttribute('aria-label') || spanEl?.textContent || '';
-      const marker = parseTitleMarker(title);
-      countMarker(domStats, marker);
+      const bucket = classifyChatBucket(summariesMap[rowId], title);
+      countBucket(domStats, bucket);
 
-      if (isHiddenMarker(marker, filterScope)) {
-        domClosedCount++;
+      if (!visibleBuckets.has(bucket)) {
+        domHiddenCount++;
         if (rowEl.getAttribute('data-jetski-closed-row') !== 'true') {
           rowEl.setAttribute('data-jetski-closed-row', 'true');
         }
@@ -1029,7 +1185,7 @@
     }
 
     if (!reduxActive) {
-      totalClosedCount = domClosedCount;
+      totalHiddenCount = domHiddenCount;
       breakdownStats = domStats;
     }
 
@@ -1054,8 +1210,8 @@
       }
       const origText = span.getAttribute('data-jetski-orig-placeholder') || 'No conversations yet';
       const hiddenInProject = hiddenCountsByProject.get(projectId) || 0;
-      if (filterEnabled && hiddenInProject > 0) {
-        const nextText = `No active chats (${hiddenInProject} hidden)`;
+      if (anyHidden && hiddenInProject > 0) {
+        const nextText = `No matching chats (${hiddenInProject} hidden)`;
         if (span.textContent !== nextText) {
           span.textContent = nextText;
         }
@@ -1065,71 +1221,52 @@
     }
   }
 
-  const EYE_OFF_SVG =
-    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
-  const EYE_ON_SVG =
-    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+  function buildBubbleHtml(hoveredBucketKey) {
+    const bucketKey = BUCKET_DEFS[hoveredBucketKey] ? hoveredBucketKey : 'needs-me';
+    const def = BUCKET_DEFS[bucketKey];
+    const isShown = visibleBuckets.has(bucketKey);
+    const dotColor = isShown ? '#34d399' : '#9ca3af';
+    const stateTag = isShown ? 'SHOWN' : 'HIDDEN';
+    const bucketCount = breakdownStats[bucketKey] || 0;
+    const clickVerb = isShown ? 'hide' : 'show';
 
-  function buildBubbleHtml() {
-    const dotColor = filterEnabled
-      ? filterScope === 'active-only'
-        ? '#60a5fa'
-        : '#34d399'
-      : '#9ca3af';
+    const totalVisible = Math.max(0, breakdownStats.totalEligible - totalHiddenCount);
 
-    let headerTitle = '';
-    if (filterEnabled && filterScope === 'closed') {
-      headerTitle = 'Filter ON: closed chats hidden';
-    } else if (filterEnabled && filterScope === 'active-only') {
-      headerTitle = 'Filter ON: active chats only';
-    } else {
-      headerTitle = 'Filter OFF: showing all chats';
-    }
-
-    const totalActionLabel = filterEnabled
-      ? 'Hidden by filter (count on button):'
-      : 'Would be hidden (count on button):';
-
-    const leftClickAction = filterEnabled
-      ? 'Show all chats (turn filter OFF)'
-      : 'Hide filtered chats (turn filter ON)';
-
-    const mode1Mark = filterScope === 'closed' ? '●' : '○';
-    const mode2Mark = filterScope === 'active-only' ? '●' : '○';
+    const rowsHtml = BUCKET_ORDER.map((k) => {
+      const bDef = BUCKET_DEFS[k];
+      const bShown = visibleBuckets.has(k);
+      const bCount = breakdownStats[k] || 0;
+      const bStatus = bShown ? 'shown' : 'hidden';
+      const hoveredAttr = k === bucketKey ? 'true' : 'false';
+      return `
+        <div class="jcfb-row" data-hovered="${hoveredAttr}">
+          <span>${bDef.title}:</span>
+          <span class="jcfb-val">${bCount} (${bStatus})</span>
+        </div>
+      `;
+    }).join('');
 
     return `
       <div class="jcfb-header">
-        <span class="jcfb-dot" style="background:${dotColor}"></span>
-        <span>${headerTitle}</span>
+        <span class="jcfb-header-left">
+          <span class="jcfb-dot" style="background:${dotColor}"></span>
+          <span>${def.title}</span>
+        </span>
+        <span>[${stateTag} · ${bucketCount}]</span>
       </div>
-      <div class="jcfb-section-title">Chat count breakdown (all projects)</div>
-      <div class="jcfb-row">
-        <span>Active (⦿, no marker):</span>
-        <span class="jcfb-val">${breakdownStats.active}</span>
+      <div class="jcfb-desc">
+        ${def.description}<br/>
+        <b>Click</b> to ${clickVerb} ${def.shortLabel} chats.
       </div>
-      <div class="jcfb-row">
-        <span>Open chain roots (▸):</span>
-        <span class="jcfb-val">${breakdownStats.openRoots}</span>
-      </div>
-      <div class="jcfb-row">
-        <span>Handed-off steps (✓):</span>
-        <span class="jcfb-val">${breakdownStats.steps}</span>
-      </div>
-      <div class="jcfb-row">
-        <span>Finalized chains («, ‹✓›, », «»):</span>
-        <span class="jcfb-val">${breakdownStats.finalized}</span>
-      </div>
+      <div class="jcfb-section-title">All 5 chat states (independent filters)</div>
+      ${rowsHtml}
       <div class="jcfb-row jcfb-total-row">
-        <span>${totalActionLabel}</span>
-        <span class="jcfb-val">${totalClosedCount} of ${breakdownStats.totalEligible}</span>
+        <span>Showing in sidebar:</span>
+        <span class="jcfb-val">${totalVisible} of ${breakdownStats.totalEligible} (${totalHiddenCount} hidden)</span>
       </div>
       <div class="jcfb-controls">
-        <div><kbd>Left-click</kbd> — ${leftClickAction}</div>
-        <div><kbd>Right-click</kbd> / <kbd>Shift+click</kbd> — switch mode:</div>
-        <div style="padding-left:6px;margin-top:2px;">
-          ${mode1Mark} <b>Closed hidden</b> (hide finalized «, ‹✓›, », «»)<br/>
-          ${mode2Mark} <b>Active only</b> (also hide open chain ▸ and ✓)
-        </div>
+        <div><kbd>Left-click</kbd> — toggle this state ON / OFF (combine filters)</div>
+        <div><kbd>Right-click</kbd> / <kbd>Shift+click</kbd> — show ONLY this state (or all 5 if solo)</div>
       </div>
     `;
   }
@@ -1145,11 +1282,12 @@
     return bubble;
   }
 
-  function showBubbleForButton(btn) {
+  function showBubbleForButton(btn, bucketKey) {
     activeHoverBtn = btn;
+    activeHoverBucket = bucketKey || btn?.getAttribute('data-bucket') || 'needs-me';
     const bubble = ensureBubbleElement();
     if (!bubble || !btn) return;
-    const nextBubbleHtml = buildBubbleHtml();
+    const nextBubbleHtml = buildBubbleHtml(activeHoverBucket);
     if (bubble.innerHTML !== nextBubbleHtml) {
       bubble.innerHTML = nextBubbleHtml;
     }
@@ -1158,7 +1296,7 @@
     }
 
     const rect = btn.getBoundingClientRect();
-    const bubbleWidth = 310;
+    const bubbleWidth = 320;
     let left = rect.left;
     if (left + bubbleWidth + 8 > window.innerWidth) {
       left = Math.max(8, window.innerWidth - bubbleWidth - 8);
@@ -1171,15 +1309,18 @@
 
   function hideBubble() {
     activeHoverBtn = null;
+    activeHoverBucket = null;
     const bubble = document.getElementById('jetski-closed-chats-filter-bubble');
     if (bubble && bubble.getAttribute('data-visible') !== 'false') {
       bubble.setAttribute('data-visible', 'false');
     }
   }
 
-  function updateButtonUI(btn) {
-    if (!btn) return;
-    const activeStr = filterEnabled ? 'true' : 'false';
+  function updateBucketButtonUI(btn, bucketKey) {
+    if (!btn || !BUCKET_DEFS[bucketKey]) return;
+    const def = BUCKET_DEFS[bucketKey];
+    const isShown = visibleBuckets.has(bucketKey);
+    const activeStr = isShown ? 'true' : 'false';
     if (btn.getAttribute('data-active') !== activeStr) {
       btn.setAttribute('data-active', activeStr);
     }
@@ -1190,115 +1331,151 @@
       btn.removeAttribute('title');
     }
 
-    // Show active (⦿) count alongside hidden/closed count across all modes without widening the pill
-    const activeCount = breakdownStats.active;
-    const hiddenSuffix =
-      filterScope === 'active-only'
-        ? `${totalClosedCount} hidden`
-        : `${totalClosedCount} closed`;
-    const countsText = `${activeCount} active · ${hiddenSuffix}`;
-    const labelText = filterEnabled ? countsText : `All (${countsText})`;
-
+    const count = breakdownStats[bucketKey] || 0;
+    const stateWord = isShown ? 'shown' : 'hidden';
+    const labelText = `${def.icon} ${def.shortLabel}: ${count} (${stateWord})`;
     if (btn.getAttribute('aria-label') !== labelText) {
       btn.setAttribute('aria-label', labelText);
     }
 
-    const iconSvg = filterEnabled ? EYE_OFF_SVG : EYE_ON_SVG;
     const nextHtml =
-      iconSvg + `<span class="jetski-filter-badge">${labelText}</span>`;
+      `<span class="jetski-bucket-icon">${def.icon}</span>` +
+      `<span class="jetski-filter-badge">${count}</span>`;
     if (btn.innerHTML !== nextHtml) {
       btn.innerHTML = nextHtml;
     }
 
     if (activeHoverBtn === btn) {
-      showBubbleForButton(btn);
+      showBubbleForButton(btn, bucketKey);
     }
   }
 
-  function executePrimaryButtonAction(btn, isShift) {
-    if (isShift) {
-      toggleFilterScope();
-      showBubbleForButton(btn);
-      return;
+  function toggleBucketVisibility(bucketKey, soloMode) {
+    if (!BUCKET_DEFS[bucketKey]) return;
+    if (soloMode) {
+      if (visibleBuckets.size === 1 && visibleBuckets.has(bucketKey)) {
+        visibleBuckets = new Set(BUCKET_ORDER);
+      } else {
+        visibleBuckets = new Set([bucketKey]);
+      }
+    } else if (visibleBuckets.has(bucketKey)) {
+      visibleBuckets.delete(bucketKey);
+    } else {
+      visibleBuckets.add(bucketKey);
     }
-    filterEnabled = !filterEnabled;
-    safeSetStorage(STORAGE_ENABLED_KEY, String(filterEnabled));
+    saveVisibleBuckets(visibleBuckets);
     runFullSync();
-    showBubbleForButton(btn);
   }
 
-  function ensureToggleButton() {
+  function createBucketButton(bucketKey) {
+    const btn = document.createElement('button');
+    btn.className = BUTTON_CLASS;
+    btn.type = 'button';
+    btn.setAttribute('data-bucket', bucketKey);
+
+    let lastPressTs = 0;
+
+    btn.addEventListener('mouseenter', () => {
+      showBubbleForButton(btn, bucketKey);
+    });
+    btn.addEventListener('mouseleave', () => {
+      hideBubble();
+    });
+    btn.addEventListener('focus', () => {
+      showBubbleForButton(btn, bucketKey);
+    });
+    btn.addEventListener('blur', () => {
+      hideBubble();
+    });
+
+    // Handle left-button press immediately on pointerdown/mousedown so virtualizer
+    // re-renders or parent header handlers between mousedown and mouseup never swallow clicks
+    btn.addEventListener('pointerdown', (e) => {
+      e.stopPropagation();
+      if (e.button === 0 && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        lastPressTs = Date.now();
+        toggleBucketVisibility(bucketKey, Boolean(e.shiftKey));
+        showBubbleForButton(btn, bucketKey);
+      }
+    });
+
+    btn.addEventListener('mousedown', (e) => {
+      e.stopPropagation();
+      if (e.button === 0 && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        if (Date.now() - lastPressTs > 300) {
+          lastPressTs = Date.now();
+          toggleBucketVisibility(bucketKey, Boolean(e.shiftKey));
+          showBubbleForButton(btn, bucketKey);
+        }
+      }
+    });
+
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (Date.now() - lastPressTs > 300) {
+        lastPressTs = Date.now();
+        toggleBucketVisibility(bucketKey, Boolean(e.shiftKey));
+        showBubbleForButton(btn, bucketKey);
+      }
+    });
+
+    btn.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      toggleBucketVisibility(bucketKey, true);
+      showBubbleForButton(btn, bucketKey);
+    });
+
+    return btn;
+  }
+
+  // Injects the 5-button filter bar directly below the sidebar header row
+  function ensureFilterBar() {
     const displayOptionsBtns = document.querySelectorAll(
       'button[aria-label="Display Options"]'
     );
     for (const displayOptionsBtn of displayOptionsBtns) {
       const actionRow = displayOptionsBtn.parentElement;
       if (!actionRow) continue;
+      const headerHost = actionRow.parentElement || actionRow;
 
-      let btn = actionRow.querySelector(`.${BUTTON_CLASS}`);
-      if (!btn) {
-        btn = document.createElement('button');
-        btn.className = BUTTON_CLASS;
-        btn.id = BUTTON_CLASS;
-        btn.type = 'button';
+      let bar = headerHost.querySelector(`.${BAR_CLASS}`);
+      if (!bar) {
+        bar = document.createElement('div');
+        bar.className = BAR_CLASS;
+        bar.setAttribute('data-testid', 'jetski-attention-filter-bar');
 
-        let lastPressTs = 0;
+        for (const bucketKey of BUCKET_ORDER) {
+          bar.appendChild(createBucketButton(bucketKey));
+        }
 
-        btn.addEventListener('mouseenter', () => {
-          showBubbleForButton(btn);
-        });
-        btn.addEventListener('mouseleave', () => {
-          hideBubble();
-        });
-        btn.addEventListener('focus', () => {
-          showBubbleForButton(btn);
-        });
-        btn.addEventListener('blur', () => {
-          hideBubble();
-        });
-
-        // Handle left-button press immediately on pointerdown/mousedown so virtualizer
-        // re-renders or parent header handlers between mousedown and mouseup never swallow clicks
-        btn.addEventListener('pointerdown', (e) => {
-          e.stopPropagation();
-          if (e.button === 0 && !e.ctrlKey && !e.metaKey) {
-            e.preventDefault();
-            lastPressTs = Date.now();
-            executePrimaryButtonAction(btn, e.shiftKey);
+        // Insert right after actionRow when headerHost is actionRow's parent
+        if (headerHost !== actionRow) {
+          const idx = Array.isArray(headerHost.children)
+            ? headerHost.children.indexOf(actionRow)
+            : -1;
+          const nextSib =
+            actionRow.nextSibling ||
+            (idx >= 0 && idx + 1 < headerHost.children.length
+              ? headerHost.children[idx + 1]
+              : null);
+          if (nextSib) {
+            headerHost.insertBefore(bar, nextSib);
+          } else {
+            headerHost.appendChild(bar);
           }
-        });
-
-        btn.addEventListener('mousedown', (e) => {
-          e.stopPropagation();
-          if (e.button === 0 && !e.ctrlKey && !e.metaKey) {
-            e.preventDefault();
-            if (Date.now() - lastPressTs > 300) {
-              lastPressTs = Date.now();
-              executePrimaryButtonAction(btn, e.shiftKey);
-            }
-          }
-        });
-
-        btn.addEventListener('click', (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          if (Date.now() - lastPressTs > 300) {
-            lastPressTs = Date.now();
-            executePrimaryButtonAction(btn, e.shiftKey);
-          }
-        });
-
-        btn.addEventListener('contextmenu', (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          toggleFilterScope();
-          showBubbleForButton(btn);
-        });
-
-        actionRow.insertBefore(btn, displayOptionsBtn);
+        } else {
+          headerHost.insertBefore(bar, displayOptionsBtn);
+        }
       }
 
-      updateButtonUI(btn);
+      for (const bucketKey of BUCKET_ORDER) {
+        const btn = bar.querySelector(`button[data-bucket="${bucketKey}"]`);
+        updateBucketButtonUI(btn, bucketKey);
+      }
     }
   }
 
@@ -1377,6 +1554,37 @@
     });
   }
 
+  // Syncs the titlebar wait-toggle button for open leaf chats (⦿ <-> ⏳)
+  function updateTitlebarWaitButtonUI(btn, cascadeId) {
+    if (!btn || !cascadeId) return;
+    btn.setAttribute('data-cascade-id', cascadeId);
+    const curTitle = getTitleForCascadeId(cascadeId, '');
+    // Hide the Wait toggle on closed chats and handed-off chain predecessors
+    const isLeafOpen = !isFinalizedTitle(curTitle) && !isChainPredecessorTitle(curTitle);
+    btn.style.display = isLeafOpen ? '' : 'none';
+    const waiting = isWaitingTitle(curTitle);
+    const waitStr = waiting ? 'true' : 'false';
+    if (btn.getAttribute('data-waiting') !== waitStr) {
+      btn.setAttribute('data-waiting', waitStr);
+    }
+    const label = waiting
+      ? 'Move chat to 🚨 Needs Me (⦿)'
+      : 'Move chat to ⏳ Waiting (Cron / External)';
+    // Sync DOM attributes and innerHTML only on change to avoid re-triggering MutationObserver
+    if (btn.getAttribute('aria-label') !== label) {
+      btn.setAttribute('aria-label', label);
+    }
+    if (btn.getAttribute('title') !== label) {
+      btn.setAttribute('title', label);
+    }
+    const nextHtml = waiting
+      ? '<span>🚨</span><span>Needs Me</span>'
+      : '<span>⏳</span><span>Wait</span>';
+    if (btn.innerHTML !== nextHtml) {
+      btn.innerHTML = nextHtml;
+    }
+  }
+
   // Syncs the titlebar pill button label and finalized attribute with the current chat title
   function updateTitlebarCloseButtonUI(btn, cascadeId) {
     if (!btn || !cascadeId) return;
@@ -1402,7 +1610,7 @@
     }
   }
 
-  // Injects or updates the Close/Reopen pill button before the ⋮ button in each conversation titlebar
+  // Injects or updates the Wait and Close/Reopen pill buttons before ⋮ in each conversation titlebar
   function ensureTitlebarCloseButtons() {
     const moreActionsBtns = document.querySelectorAll(
       '[data-testid="titlebar-more-actions"]'
@@ -1412,6 +1620,23 @@
       if (!container) continue;
       const cascadeId = findCascadeIdFromElement(moreBtn);
       if (!cascadeId) continue;
+
+      let waitBtn = container.querySelector(`.${TITLEBAR_WAIT_BTN_CLASS}`);
+      if (!waitBtn) {
+        waitBtn = document.createElement('button');
+        waitBtn.className = TITLEBAR_WAIT_BTN_CLASS;
+        waitBtn.type = 'button';
+        waitBtn.setAttribute('data-testid', 'jetski-titlebar-wait-btn');
+        bindActionBtnHandlers(waitBtn, () => {
+          const cid =
+            waitBtn.getAttribute('data-cascade-id') || findCascadeIdFromElement(moreBtn);
+          if (cid) {
+            void toggleConversationWaiting(cid, '');
+          }
+        });
+        container.insertBefore(waitBtn, moreBtn);
+      }
+      updateTitlebarWaitButtonUI(waitBtn, cascadeId);
 
       let btn = container.querySelector(`.${TITLEBAR_BTN_CLASS}`);
       if (!btn) {
@@ -1429,6 +1654,35 @@
         container.insertBefore(btn, moreBtn);
       }
       updateTitlebarCloseButtonUI(btn, cascadeId);
+    }
+  }
+
+  // Syncs the compact sidebar row wait-toggle button for open leaf chats (⦿ <-> ⏳)
+  function updateRowWaitButtonUI(btn, cascadeId, fallbackDomTitle) {
+    if (!btn || !cascadeId) return;
+    btn.setAttribute('data-cascade-id', cascadeId);
+    const curTitle = getTitleForCascadeId(cascadeId, fallbackDomTitle);
+    // Only open leaf chats can be moved between Needs Me and Waiting
+    const isLeafOpen = !isFinalizedTitle(curTitle) && !isChainPredecessorTitle(curTitle);
+    btn.style.display = isLeafOpen ? '' : 'none';
+    const waiting = isWaitingTitle(curTitle);
+    const waitStr = waiting ? 'true' : 'false';
+    if (btn.getAttribute('data-waiting') !== waitStr) {
+      btn.setAttribute('data-waiting', waitStr);
+    }
+    const label = waiting
+      ? 'Move chat to 🚨 Needs Me (⦿)'
+      : 'Move chat to ⏳ Waiting (Cron / External)';
+    // Guard DOM mutations so the sidebar observer does not loop on unchanged buttons
+    if (btn.getAttribute('aria-label') !== label) {
+      btn.setAttribute('aria-label', label);
+    }
+    if (btn.getAttribute('title') !== label) {
+      btn.setAttribute('title', label);
+    }
+    const nextHtml = waiting ? '<span>🚨</span>' : '<span>⏳</span>';
+    if (btn.innerHTML !== nextHtml) {
+      btn.innerHTML = nextHtml;
     }
   }
 
@@ -1455,7 +1709,7 @@
     }
   }
 
-  // Injects or updates the compact Close/Reopen button inside each sidebar row's hover action bar
+  // Injects or updates the compact Wait and Close/Reopen buttons inside each sidebar row hover bar
   function ensureSidebarRowCloseButtons() {
     const rowEls = document.querySelectorAll(
       '[data-testid="conversation-row-sidebar"][data-cascade-id], div[data-sidebar-row-id]'
@@ -1476,6 +1730,26 @@
       const spanEl = rowEl.querySelector('span.truncate');
       const fallbackDomTitle =
         linkEl?.getAttribute('aria-label') || spanEl?.textContent || '';
+
+      let waitBtn = hoverBar.querySelector(`.${ROW_WAIT_BTN_CLASS}`);
+      if (!waitBtn) {
+        waitBtn = document.createElement('button');
+        waitBtn.className = ROW_WAIT_BTN_CLASS;
+        waitBtn.type = 'button';
+        waitBtn.setAttribute('data-testid', 'jetski-row-wait-btn');
+        bindActionBtnHandlers(waitBtn, () => {
+          const cid = waitBtn.getAttribute('data-cascade-id') || cascadeId;
+          const curLink = rowEl.querySelector('a[aria-label]');
+          const curSpan = rowEl.querySelector('span.truncate');
+          const domTitle =
+            curLink?.getAttribute('aria-label') || curSpan?.textContent || '';
+          if (cid) {
+            void toggleConversationWaiting(cid, domTitle);
+          }
+        });
+        hoverBar.insertBefore(waitBtn, anchorBtn);
+      }
+      updateRowWaitButtonUI(waitBtn, cascadeId, fallbackDomTitle);
 
       let btn = hoverBar.querySelector(`.${ROW_BTN_CLASS}`);
       if (!btn) {
@@ -1499,21 +1773,11 @@
     }
   }
 
-  function toggleFilterScope() {
-    filterScope = filterScope === 'closed' ? 'active-only' : 'closed';
-    safeSetStorage(STORAGE_SCOPE_KEY, filterScope);
-    if (!filterEnabled) {
-      filterEnabled = true;
-      safeSetStorage(STORAGE_ENABLED_KEY, 'true');
-    }
-    runFullSync();
-  }
-
   function runFullSync() {
     ensureStylesInjected();
     const reduxActive = syncReduxFilter();
     syncDomRowsAndPlaceholders(reduxActive);
-    ensureToggleButton();
+    ensureFilterBar();
     ensureTitlebarCloseButtons();
     ensureSidebarRowCloseButtons();
   }
@@ -1534,14 +1798,20 @@
       if (
         target.id === 'jetski-closed-chats-filter-bubble' ||
         target.id === STYLE_ID ||
-        target.id === BUTTON_CLASS ||
+        target.className === BAR_CLASS ||
+        target.className === BUTTON_CLASS ||
         target.className === TITLEBAR_BTN_CLASS ||
+        target.className === TITLEBAR_WAIT_BTN_CLASS ||
         target.className === ROW_BTN_CLASS ||
+        target.className === ROW_WAIT_BTN_CLASS ||
         (typeof target.closest === 'function' &&
           (target.closest('#jetski-closed-chats-filter-bubble') ||
+            target.closest(`.${BAR_CLASS}`) ||
             target.closest(`.${BUTTON_CLASS}`) ||
             target.closest(`.${TITLEBAR_BTN_CLASS}`) ||
-            target.closest(`.${ROW_BTN_CLASS}`)))
+            target.closest(`.${TITLEBAR_WAIT_BTN_CLASS}`) ||
+            target.closest(`.${ROW_BTN_CLASS}`) ||
+            target.closest(`.${ROW_WAIT_BTN_CLASS}`)))
       ) {
         return false;
       }
@@ -1562,7 +1832,7 @@
   window.__jetskiClosedChatsFilterCleanup = () => {
     observer.disconnect();
     for (const el of document.querySelectorAll(
-      `.${BUTTON_CLASS}, .${TITLEBAR_BTN_CLASS}, .${ROW_BTN_CLASS}`
+      `.${BAR_CLASS}, .${BUTTON_CLASS}, .${TITLEBAR_BTN_CLASS}, .${TITLEBAR_WAIT_BTN_CLASS}, .${ROW_BTN_CLASS}, .${ROW_WAIT_BTN_CLASS}`
     )) {
       el.remove();
     }
