@@ -131,6 +131,11 @@ When **Case 5** applies:
 
 Never auto-publish the review comment to Gerrit or GitHub unless the user explicitly asks you to post it. Present the draft in chat for the user to review and post on the parent CL.
 
+**Gerrit Drafts & Thread Follow-ups**:
+- A follow-up after a new patchset is saved as a standalone `/PATCHSET_LEVEL` draft on the CURRENT patchset (no `in_reply_to`), containing only new text.
+- Use `in_reply_to` only for inline (`file:line`) replies or when the user explicitly asks to answer inside a thread; never include or re-quote already-published text in a draft.
+- Never resolve the old thread unless the user asks; if asked, resolve via a minimal "Done" reply in that thread.
+
 Structure the English review comment using this proven template:
 
 1. **Constructive Opening**:

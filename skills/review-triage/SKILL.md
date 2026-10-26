@@ -155,14 +155,18 @@ named skill's `SKILL.md` was not read, when a report with a `Case 1-5` verdict l
 ## Review & VCS Guidelines (Strict Rules)
 1. **English-Only Review Surface**: All generated review comments, reassignment notes, and pushback messages must be strictly in English. Direct discussion with the user remains in Russian.
 2. **Never Auto-Publish or Resolve**: The agent must NEVER publish review comments to Gerrit/GitHub or resolve threads automatically. Drafts are presented in chat for the user to review and post.
-3. **No Auto-Submit or CQ Votes**: Never trigger CQ votes (`Commit-Queue+1`/`+2`) or merge actions.
-4. **Respect `PRESUBMIT.py` Include & Forward-Declaration Sorting**: In Skia, `PRESUBMIT.py` runs
+3. **Gerrit Drafts & Thread Follow-ups**:
+   - A follow-up after a new patchset is saved as a standalone `/PATCHSET_LEVEL` draft on the CURRENT patchset (no `in_reply_to`), containing only new text.
+   - Use `in_reply_to` only for inline (`file:line`) replies or when the user explicitly asks to answer inside a thread; never include or re-quote already-published text in a draft.
+   - Never resolve the old thread unless the user asks; if asked, resolve via a minimal "Done" reply in that thread.
+4. **No Auto-Submit or CQ Votes**: Never trigger CQ votes (`Commit-Queue+1`/`+2`) or merge actions.
+5. **Respect `PRESUBMIT.py` Include & Forward-Declaration Sorting**: In Skia, `PRESUBMIT.py` runs
    `python3 tools/rewrite_includes.py --dry-run` on all modified files and fails CQ
    (`Housekeeper-OnDemand-Presubmit`) if existing `#include` lines or forward declarations
    (`class Foo;`) in a touched header/source file are not sorted alphabetically. Never flag
    alphabetical `#include` or forward-declaration reordering in a modified file as "unrelated
    churn".
-5. **No Unmeasured Test-Runtime or Header Doc-Comment Bikeshedding**: Never question unit-test
+6. **No Unmeasured Test-Runtime or Header Doc-Comment Bikeshedding**: Never question unit-test
    loop counts (e.g., `65536` iterations) as slow on Debug bots without inspecting the mock/helper
    implementation and measuring actual `dm` runtime, and never hold up approval asking to add doc
    comments to headers whose existing methods have no doc comments when the contract is already
