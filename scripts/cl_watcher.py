@@ -62,6 +62,8 @@ PEN_URL_SH = (
 )
 SELF_EMAILS = {"jlavrova@google.com", "jlavrova@gmail.com"}
 SELF_GITHUB_LOGINS = {"Rusino", "jlavrova"}
+FLUTTER_TREE_CHECK = "tree-status"
+GITHUB_STATUS_BOTS = {"flutter-dashboard"}
 
 # Regexes to extract CL and PR identifiers from chat titles
 RE_CL_ID = re.compile(r"(?:\bcl/|\bCL\s+)(\d{6,10})\b", re.IGNORECASE)
@@ -664,6 +666,44 @@ def check_skia_post_submit(
   return res
 
 
+_ACCOUNT_ACTIVE: dict[str, bool] = {}
+
+
+def google_account_active(email: str) -> bool:
+  """Reports whether a @google.com account still exists; other domains count as active.
+
+  Attention sets keep former employees, and pinging them is wasted effort.
+  """
+  if not email.endswith("@google.com"):
+    return True
+  ldap = email.split("@", 1)[0]
+  if ldap not in _ACCOUNT_ACTIVE:
+    try:
+      res = subprocess.run(
+          ["id", "-u", ldap],
+          stdout=subprocess.DEVNULL,
+          stderr=subprocess.DEVNULL,
+          timeout=3,
+          check=False,
+      )
+      _ACCOUNT_ACTIVE[ldap] = res.returncode == 0
+    except Exception:
+      return True
+  return _ACCOUNT_ACTIVE[ldap]
+
+
+def gerrit_mergeable(host: str, cl_id: str) -> bool:
+  """Asks Gerrit whether the current patchset still applies; unknown counts as yes."""
+  url = f"https://{host}/changes/{cl_id}/revisions/current/mergeable"
+  try:
+    req = urllib.request.Request(url, headers={"User-Agent": "CLFlightDeck/1.0"})
+    with urllib.request.urlopen(req, timeout=8) as resp:
+      raw = resp.read().decode("utf-8", errors="replace")
+    return bool(json.loads(raw[4:] if raw.startswith(")]}'") else raw).get("mergeable", True))
+  except Exception:
+    return True
+
+
 def fetch_gerrit_cl_status(
     cl_id: str,
     rollers: dict[str, Any],
@@ -711,6 +751,12 @@ def fetch_gerrit_cl_status(
           for v in (d.get("attention_set") or {}).values()
       ]
       in_my_attention = any(e in SELF_EMAILS for e in att_set)
+      waiting_on = [
+          {"id": e, "active": google_account_active(e)}
+          for e in att_set
+          if e and e not in SELF_EMAILS and not e.endswith(".gserviceaccount.com")
+      ]
+      merge_conflict = status == "NEW" and not gerrit_mergeable(host, cl_id)
 
       labels = d.get("labels") or {}
       cr_votes = [
@@ -808,6 +854,9 @@ def fetch_gerrit_cl_status(
               else ""
           ),
           "in_my_attention": in_my_attention,
+          "waiting_on": waiting_on,
+          "merge_conflict": merge_conflict,
+          "tree_red": False,
           "cr_summary": (
               f"+{max_cr}" if max_cr > 0 else (str(min_cr) if min_cr < 0 else "0")
           ),
@@ -840,7 +889,8 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
             "--repo",
             "flutter/flutter",
             "--json",
-            "number,title,state,author,mergedAt,headRefOid,reviews,comments,statusCheckRollup,url",
+            "number,title,state,author,mergedAt,headRefOid,reviews,comments,"
+            "statusCheckRollup,url,mergeable,reviewRequests",
         ],
         stderr=subprocess.STDOUT,
         text=True,
@@ -854,12 +904,22 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
     head_sha = str(d.get("headRefOid") or "")
 
     checks = d.get("statusCheckRollup") or []
-    failed_checks = [
-        str(c.get("name") or "")
+    merge_conflict = str(d.get("mergeable") or "") == "CONFLICTING"
+    # Flutter's Dashboard Checks turn ACTION_REQUIRED when presubmit cannot start on
+    # a conflicting branch; the Conflict status already reports that
+    failing = {"FAILURE", "ERROR", "TIMED_OUT"}
+    if not merge_conflict:
+      failing.add("ACTION_REQUIRED")
+    # Check runs carry name/conclusion, legacy status contexts carry context/state
+    failed_all = [
+        str(c.get("name") or c.get("context") or "")
         for c in checks
-        if str(c.get("conclusion") or "").upper()
-        in ("FAILURE", "TIMED_OUT", "ACTION_REQUIRED")
+        if str(c.get("conclusion") or c.get("state") or "").upper() in failing
     ]
+    # tree-status fails on every open PR while the flutter/flutter tree is red; it
+    # says nothing about this PR, so it must not raise a CQ alert
+    tree_red = FLUTTER_TREE_CHECK in failed_all
+    failed_checks = [c for c in failed_all if c != FLUTTER_TREE_CHECK]
     pending_checks = [
         str(c.get("name") or "")
         for c in checks
@@ -868,6 +928,8 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
 
     if failed_checks:
       cq_status = f"🔴 {len(failed_checks)} check(s) failed"
+    elif tree_red:
+      cq_status = "🌲 Tree is red"
     elif pending_checks:
       cq_status = f"🔄 {len(pending_checks)} running"
     else:
@@ -887,6 +949,10 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
             f"[{r.get('state')}] {str(r.get('body') or '')}".strip(),
         ))
     for c in comments:
+      # Status bots repeat what the Conflict and Tree red statuses already show,
+      # and their posts must not read as a reviewer waiting for my reply
+      if str((c.get("author") or {}).get("login") or "") in GITHUB_STATUS_BOTS:
+        continue
       if c.get("createdAt"):
         events.append((
             str(c.get("createdAt")),
@@ -936,6 +1002,13 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         "cr_summary": f"{len(reviews)} rev",
         "cq_status": cq_status,
         "cq_failed": bool(failed_checks),
+        "tree_red": tree_red,
+        "merge_conflict": merge_conflict,
+        "waiting_on": [
+            {"id": str(r.get("login") or r.get("name") or ""), "active": True}
+            for r in d.get("reviewRequests") or []
+            if r.get("login") or r.get("name")
+        ],
         "last_msg_author": last_actor,
         "last_msg_date": last_date,
         "last_msg_et": last_msg_et,
@@ -1686,7 +1759,59 @@ function formatAuthorAndCl(it) {
   return `<strong>${link(it.url, label)}</strong> (${roleDesc})<br>${subject}`;
 }
 
+const FLUTTER_DASHBOARD_URL = 'https://flutter-dashboard.appspot.com/#/build';
+
+// Copies a ping draft and opens the place to paste it: Chat for Googlers, the review
+// page for everyone else
+function pingPerson(btn) {
+  if (navigator.clipboard) navigator.clipboard.writeText(btn.dataset.text);
+  window.open(btn.dataset.url, '_blank', 'noopener');
+  btn.textContent = '✓ Copied';
+}
+
+function waitingOnHtml(it) {
+  const people = it.waiting_on || [];
+  if (people.length === 0) return '';
+  const items = people.map(p => {
+    const who = actorHtml(it, p.id);
+    if (!p.active) return `<s>${who}</s> (left Google)`;
+    let url = it.url;
+    let text = `Hi ${shortActor(p.id)}, friendly ping on ${it.url} ("${it.subject}"). ` +
+      'Could you take a look when you have a moment? Thanks!';
+    if (it.kind === 'github') {
+      text = `@${p.id} friendly ping on this PR when you have a moment. Thanks!`;
+    } else if (p.id.endsWith('@google.com')) {
+      url = `https://moma.corp.google.com/chat?with=${encodeURIComponent(p.id.split('@')[0])}`;
+    }
+    const btn = `<button class="btn-sm" title="Copy a ping draft and open where to paste it" ` +
+      `data-url="${esc(url)}" data-text="${esc(text)}" onclick="pingPerson(this)">` +
+      '📋 Ping</button>';
+    return `${who} ${btn}`;
+  });
+  return `<div class="muted" style="margin-top:4px">Waiting on: ${items.join(', ')}</div>`;
+}
+
+// Notes for conditions that sit next to review state: they decide the status chip
+// but do not replace the review summary
+function statusNotesHtml(it) {
+  if (it.status !== 'NEW' && it.status !== 'OPEN') return '';
+  let notes = '';
+  if (it.merge_conflict) {
+    notes += '<div style="color:var(--danger-text)">⛔ Merge conflict: rebase needed</div>';
+  }
+  if (it.tree_red) {
+    notes += `<div class="muted">🌲 ${link(FLUTTER_DASHBOARD_URL, 'flutter/flutter tree')} ` +
+      'is red; landing waits for it</div>';
+  }
+  if (['waiting', 'cq', 'tree', 'conflict'].includes(statusOf(it))) notes += waitingOnHtml(it);
+  return notes;
+}
+
 function formatGerritStatusCell(it) {
+  return statusCoreHtml(it) + statusNotesHtml(it);
+}
+
+function statusCoreHtml(it) {
   const ps = `PS${it.patchset || 1}`;
   if (it.status === 'MERGED') {
     const post = it.post_submit;
@@ -1747,6 +1872,8 @@ const OLD_MERGED_DAYS = 3;
 // counts, and the row order, so a row never shows up under two statuses
 const STATUSES = [
   {id: 'attention', label: '⚡ Needs you'},
+  {id: 'conflict', label: '⛔ Conflict'},
+  {id: 'tree', label: '🌲 Tree red'},
   {id: 'cq', label: '⏳ CQ running'},
   {id: 'waiting', label: '⏸ Waiting on others'},
   {id: 'merged', label: '🟢 Merged'},
@@ -1761,6 +1888,11 @@ function isAlert(it) {
 // Alerts count as needing me even on merged CLs, since a blamed commit needs a reaction
 function statusOf(it) {
   if (isAlert(it) || needsMyReply(it)) return 'attention';
+  if (it.status === 'NEW' || it.status === 'OPEN') {
+    // A conflict needs my rebase now; a red tree clears by itself, so it comes second
+    if (it.merge_conflict) return 'conflict';
+    if (it.tree_red) return 'tree';
+  }
   if (it.status === 'ABANDONED' || it.status === 'CLOSED') return 'abandoned';
   if (it.status === 'MERGED') {
     const ageDays = (Date.now() / 1000 - (it.submitted_ts || 0)) / 86400;
@@ -1866,7 +1998,9 @@ function formatGmailCell(it) {
     const tidJson = esc(JSON.stringify(inboxTids.length ? inboxTids : tids));
     return `⚠️ ${tidLabel} (${total} msgs: ${trashPart}<strong>${inb} in <code>INBOX</code>!</strong>)
       <div class="cell-actions">
-        <button class="btn-sm btn-warn" onclick='archiveGmail("${esc(it.target_id)}", ${tidJson})'>📥 Archive from Inbox</button>
+        <button class="btn-sm btn-warn"
+          title="Remove these threads from Gmail INBOX; they stay in All Mail"
+          onclick='archiveGmail(this, "${esc(it.target_id)}", ${tidJson})'>📥 Archive</button>
       </div>`;
   }
   if (tr > 0) {
@@ -1877,13 +2011,21 @@ function formatGmailCell(it) {
   return `${tidLabel} (${total} msgs archived)`;
 }
 
-async function archiveGmail(targetId, threadIds) {
-  await fetch('/api/archive_gmail', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({target_id: targetId, thread_ids: threadIds})
-  });
-  await fetchState();
+async function archiveGmail(btn, targetId, threadIds) {
+  btn.disabled = true;
+  btn.textContent = '⏳ Archiving…';
+  try {
+    const resp = await fetch('/api/archive_gmail', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({target_id: targetId, thread_ids: threadIds})
+    });
+    if (!resp.ok) throw new Error(resp.statusText);
+    await fetchState();
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = '⚠️ Archive failed, retry';
+  }
 }
 
 async function finalizeChat(convId, targetId) {
@@ -2155,8 +2297,15 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
       if not isinstance(tids, list):
         tids = None
       res = archive_gmail_threads_for_id(tid, tids)
-      state = sync_once(wake_chats=False, update_titles=False)
-      self._send_json({**res, "count": len(state.get("items") or {})})
+      # A full sync takes about a minute, which made the button look dead; the
+      # next background poll re-reads Gmail anyway
+      state = load_watcher_state()
+      for item in (state.get("items") or {}).values():
+        if item.get("target_id") == tid and item.get("gmail"):
+          item["gmail"]["inbox_msgs"] = 0
+          item["gmail"]["inbox_thread_ids"] = []
+      save_watcher_state(state)
+      self._send_json(res)
       return
 
     if parsed.path == "/api/finalize":
