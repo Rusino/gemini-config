@@ -422,10 +422,20 @@ def discover_active_cl_chats() -> list[dict[str, Any]]:
     pname = proj_names.get(pid, "Unassigned")
     last_mod = str(meta.get("lastModifiedTime") or meta.get("createdAt") or "")
 
-    cls_found = RE_CL_ID.findall(title)
-    prs_found = RE_PR_ID.findall(title)
+    # Deduplicate IDs when a title repeats the same CL or PR number
+    cls_found = list(dict.fromkeys(RE_CL_ID.findall(title)))
+    prs_found = list(dict.fromkeys(RE_PR_ID.findall(title)))
     if not cls_found and not prs_found:
       continue
+    # A slash list like "PR #194466/#194475" or multiple IDs means the chat is not 1:1 with one CL
+    multi_slash = bool(
+        re.search(
+            r"(?:PR\s*#?\d+|cl/\d+|CL\s+\d+)\s*[/,&+]\s*#?\d+",
+            title,
+            re.IGNORECASE,
+        )
+    )
+    single_target = (len(cls_found) + len(prs_found) == 1) and not multi_slash
 
     for cl_id in cls_found:
       kind = "piper" if len(cl_id) >= 9 else "gerrit"
@@ -438,6 +448,7 @@ def discover_active_cl_chats() -> list[dict[str, Any]]:
           "project_id": pid,
           "project_name": pname,
           "chat_last_modified": last_mod,
+          "single_target": single_target,
       })
     for pr_id in prs_found:
       discovered.append({
@@ -449,6 +460,7 @@ def discover_active_cl_chats() -> list[dict[str, Any]]:
           "project_id": pid,
           "project_name": pname,
           "chat_last_modified": last_mod,
+          "single_target": single_target,
       })
 
   # Sort newest chat modification first
@@ -779,6 +791,24 @@ def fetch_gerrit_cl_status(
           for e in att_set
           if e and e not in SELF_EMAILS and not e.endswith(".gserviceaccount.com")
       ]
+      # Removing yourself from reviewers records state="REMOVED" in reviewer_updates
+      self_updates = [
+          u
+          for u in (d.get("reviewer_updates") or [])
+          if isinstance(u, dict)
+          and str((u.get("reviewer") or {}).get("email") or "") in SELF_EMAILS
+      ]
+      reviewer_removed = (
+          not is_self
+          and bool(self_updates)
+          and str(self_updates[-1].get("state") or "") == "REMOVED"
+      )
+      removed_at = (
+          str(self_updates[-1].get("updated") or "") if reviewer_removed else ""
+      )
+      if reviewer_removed:
+        in_my_attention = False
+        waiting_on = []
       merge_conflict = status == "NEW" and not gerrit_mergeable(host, cl_id)
 
       labels = d.get("labels") or {}
@@ -801,6 +831,13 @@ def fetch_gerrit_cl_status(
       last_msg_author = str(((last_msg.get("author") or {}).get("email")) or "bot")
       last_msg_date = str(last_msg.get("date") or "")
       last_msg_text = str(last_msg.get("message") or "").strip().replace("\n", " ")
+      # NoteDb stores account mentions as <GERRIT_ACCOUNT_N> tokens in message bodies
+      for acc in last_msg.get("accounts_in_message") or []:
+        if isinstance(acc, dict) and acc.get("_account_id"):
+          label = str(acc.get("email") or acc.get("name") or acc["_account_id"])
+          last_msg_text = last_msg_text.replace(
+              f"<GERRIT_ACCOUNT_{acc['_account_id']}>", label
+          )
 
       cq_failed = False
       cq_status = "Idle"
@@ -848,7 +885,8 @@ def fetch_gerrit_cl_status(
         else:
           phase = "READY_TO_CLOSE"
       else:
-        if cq_failed:
+        # Once removed from reviewers, CQ failures belong to the author and must not alert us
+        if cq_failed and not reviewer_removed:
           phase = "ALERT_CQ_FAILED"
         elif max_cq == 2:
           phase = "SUBMITTING"
@@ -869,6 +907,8 @@ def fetch_gerrit_cl_status(
           "role": role,
           "is_self": is_self,
           "is_external": is_external,
+          "reviewer_removed": reviewer_removed,
+          "removed_at": removed_at,
           "patchset": ps_num,
           "revision": cur_sha,
           "commit_url": (
@@ -1148,6 +1188,44 @@ def wake_conversation(conv_id: str, message: str) -> bool:
     return False
 
 
+def finalize_conversation(conv_id: str) -> bool:
+  """Finalizes a conversation chain via chat_lifecycle.py."""
+  if not conv_id:
+    return False
+  try:
+    res = subprocess.run(
+        [
+            "python3",
+            os.path.join(HOOKS_DIR, "chat_lifecycle.py"),
+            "finalize",
+            conv_id,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    return res.returncode == 0
+  except Exception:
+    return False
+
+
+def should_finalize_removed_reviewer_chat(
+    chat_item: dict[str, Any], cl_info: dict[str, Any]
+) -> bool:
+  """Returns whether a 1:1 CL chat should be finalized after reviewer self-removal."""
+  if not cl_info.get("reviewer_removed") or not chat_item.get("single_target", True):
+    return False
+  removed_dt = parse_gerrit_or_iso_time(str(cl_info.get("removed_at") or ""))
+  chat_dt = parse_gerrit_or_iso_time(
+      str(chat_item.get("chat_last_modified") or "")
+  )
+  # Keep a newly opened chat alive when the user starts it after removing themselves
+  if removed_dt and chat_dt and chat_dt > removed_dt:
+    return False
+  return True
+
+
 def update_chat_roll_badge(conv_id: str, current_title: str, badge: str) -> None:
   """Updates the trailing roll badge on a conversation title without waking the LLM."""
   base = cl.clean_base_title(current_title)
@@ -1235,6 +1313,31 @@ def sync_once(
         "trash_msgs": 0,
         "unread_msgs": 0,
     }
+
+    # Leaving a 1:1 CL review in Gerrit ends our work on it, so archive mail and close the chat
+    if should_finalize_removed_reviewer_chat(d, info):
+      if gstat.get("inbox_thread_ids"):
+        archive_gmail_threads_for_id(tid, gstat["inbox_thread_ids"])
+      finalize_conversation(cid)
+      events.insert(
+          0,
+          {
+              "id": f"ev-{int(time.time() * 1000)}-{tid}",
+              "time": now_et_str(),
+              "item_key": ikey,
+              "target_id": tid,
+              "conversation_id": cid,
+              "project_name": d["project_name"],
+              "critical": False,
+              "message": (
+                  f"[CL-WATCHER] 🚫 Removed from reviewers on {ikey} "
+                  f"('{info['subject']}') — archived Gmail and finalized chat "
+                  f"{cid[:8]}."
+              ),
+          },
+      )
+      events = events[:50]
+      continue
 
     record = {
         **d,
