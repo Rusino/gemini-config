@@ -1717,10 +1717,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     align-items: center;
     gap: 5px;
   }
-  button:hover {
+  button:hover:not(:disabled) {
     background: var(--row-hover);
   }
-  button.active-tab {
+  button.active-tab,
+  button.active-tab:hover:not(:disabled) {
     background: var(--link);
     color: #ffffff;
     border-color: var(--link);
@@ -1845,6 +1846,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   button.chip.active-tab {
     background: var(--link);
+  }
+  button:disabled {
+    cursor: default;
   }
   button.empty:not(.active-tab) {
     opacity: 0.45;
@@ -2151,18 +2155,19 @@ function needsMyReply(it) {
 // Merged CLs older than this are chats left open after the work ended
 const OLD_MERGED_DAYS = 3;
 
-// Status filters in display and sort order; one classifier drives the chips, their
-// counts, and the row order, so a row never shows up under two statuses
+// Status filters in display and sort order; alwaysShow keeps core workflow chips visible
+// as 0-count indicators while hiding empty situational/tail chips unless selected
 const STATUSES = [
-  {id: 'attention', label: '⚡ Needs you'},
-  {id: 'conflict', label: '⛔ Conflict'},
-  {id: 'tree', label: '🌲 Tree red'},
-  {id: 'cq', label: '⏳ CQ running'},
-  {id: 'waiting', label: '⏸ Waiting on others'},
-  {id: 'draft', label: '📝 Draft / dev'},
-  {id: 'merged', label: '🟢 Merged'},
-  {id: 'old', label: '📦 OLD'},
-  {id: 'abandoned', label: '⚪ Abandoned'},
+  {id: 'attention', label: '⚡ Needs you', alwaysShow: true},
+  {id: 'conflict', label: '⛔ Conflict', alwaysShow: false},
+  {id: 'tree', label: '🌲 Tree red', alwaysShow: false},
+  {id: 'cq', label: '⏳ CQ running', alwaysShow: true},
+  {id: 'waiting', label: '⏸ Waiting on others', alwaysShow: true},
+  {id: 'dev', label: '🛠️ In development', alwaysShow: true},
+  {id: 'draft', label: '📝 Draft', alwaysShow: false},
+  {id: 'merged', label: '🟢 Merged', alwaysShow: true},
+  {id: 'old', label: '📦 OLD', alwaysShow: false},
+  {id: 'abandoned', label: '⚪ Abandoned', alwaysShow: false},
 ];
 
 function isAlert(it) {
@@ -2181,7 +2186,9 @@ function statusOf(it) {
   if (it.merge_conflict) return 'conflict';
   const cq = String(it.cq_status || '');
   if (it.phase === 'SUBMITTING' || cq.startsWith('CQ+') || cq.includes('running')) return 'cq';
-  if (it.is_draft || it.in_development) return 'draft';
+  // Separate explicit drafts from live unreviewed changes so each has its own filter
+  if (it.is_draft) return 'draft';
+  if (it.in_development) return 'dev';
   if (it.tree_red) return 'tree';
   return 'waiting';
 }
@@ -2299,10 +2306,13 @@ function formatGmailCell(it) {
   }
   if (tr > 0) {
     const arch = Math.max(0, total - tr);
-    const archPart = arch > 0 ? `, ${arch} archived` : '';
-    return `${tidLabel} (${tr} in <code>TRASH</code>${archPart})`;
+    // Explicitly state when all messages are in TRASH vs split across TRASH and All Mail
+    if (arch === 0) {
+      return `${tidLabel} (all ${tr} in <code>TRASH</code>)`;
+    }
+    return `${tidLabel} (${total} msgs: ${tr} in <code>TRASH</code>, ${arch} archived)`;
   }
-  return `${tidLabel} (${total} msgs archived)`;
+  return `${tidLabel} (all ${total} archived)`;
 }
 
 async function archiveGmail(btn, targetId, threadIds) {
@@ -2391,9 +2401,11 @@ function setFilter(kind, value) {
   renderFromCache();
 }
 
+// Disable 0-count filter chips so they serve as read-only zero confirmations
 function chipHtml(cls, kind, value, label, count, active) {
   const state = (active ? ' active-tab' : '') + (count === 0 ? ' empty' : '');
-  return `<button class="${cls}${state}" ` +
+  const dis = count === 0 ? ' disabled' : '';
+  return `<button class="${cls}${state}"${dis} ` +
     `onclick="setFilter('${kind}', ${esc(JSON.stringify(value))})">` +
     `${label} <span class="count">${count}</span></button>`;
 }
@@ -2469,9 +2481,11 @@ function renderFromCache() {
   const projRows = allItems.filter(inProject);
   const statusCount = id => projRows.filter(it => statusOf(it) === id).length;
 
+  // Keep core workflow statuses visible at 0; hide empty situational/tail statuses unless active
   document.getElementById('status-tabs').innerHTML =
-    STATUSES.map(st => chipHtml('seg', 'status', st.id, st.label, statusCount(st.id),
-      selectedStatus === st.id)).join('') +
+    STATUSES.filter(st => st.alwaysShow || statusCount(st.id) > 0 || selectedStatus === st.id)
+      .map(st => chipHtml('seg', 'status', st.id, st.label, statusCount(st.id),
+        selectedStatus === st.id)).join('') +
     chipHtml('seg', 'status', 'all', 'All', projRows.length, selectedStatus === 'all');
 
   const statusRows = allItems.filter(inStatus);

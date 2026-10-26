@@ -294,11 +294,40 @@ const abandonedCl = {
   kind: 'gerrit', status: 'ABANDONED', phase: 'ABANDONED',
   is_draft: false, in_development: false, patchset: 1, url: 'https://example.com/5'
 };
+const closedPr = {
+  kind: 'github', status: 'CLOSED', phase: 'ABANDONED',
+  is_draft: false, in_development: false, patchset: 1, url: 'https://example.com/6'
+};
+const gmailAllTrash = {
+  target_id: '101',
+  gmail: {
+    thread_ids: ['t1'], inbox_thread_ids: [],
+    total_msgs: 5, inbox_msgs: 0, trash_msgs: 5,
+    threads: [{url: 'https://mail/1', source: 'Gerrit', msgs: 5}]
+  }
+};
+const gmailMixedTrash = {
+  target_id: '102',
+  gmail: {
+    thread_ids: ['t2'], inbox_thread_ids: [],
+    total_msgs: 5, inbox_msgs: 0, trash_msgs: 3,
+    threads: [{url: 'https://mail/2', source: 'Gerrit', msgs: 5}]
+  }
+};
+const gmailAllArchived = {
+  target_id: '103',
+  gmail: {
+    thread_ids: ['t3'], inbox_thread_ids: [],
+    total_msgs: 4, inbox_msgs: 0, trash_msgs: 0,
+    threads: [{url: 'https://mail/3', source: 'Gerrit', msgs: 4}]
+  }
+};
 console.log(JSON.stringify({
   draftRolls: formatRollsCell(draftPr),
   devRolls: formatRollsCell(devCl),
   reviewRolls: formatRollsCell(reviewCl),
   abandonedRolls: formatRollsCell(abandonedCl),
+  closedRolls: formatRollsCell(closedPr),
   draftCore: statusCoreHtml(draftPr),
   devCore: statusCoreHtml(devCl),
   reviewCore: statusCoreHtml(reviewCl),
@@ -306,6 +335,19 @@ console.log(JSON.stringify({
   devStatus: statusOf(devCl),
   devCqStatus: statusOf(devCqRunningCl),
   reviewStatus: statusOf(reviewCl),
+  gmailAllTrashHtml: formatGmailCell(gmailAllTrash),
+  gmailMixedTrashHtml: formatGmailCell(gmailMixedTrash),
+  gmailAllArchivedHtml: formatGmailCell(gmailAllArchived),
+  chipZeroInactive: chipHtml('seg', 'status', 'waiting', '⏸ Waiting on others', 0, false),
+  chipZeroActive: chipHtml('seg', 'status', 'attention', '⚡ Needs you', 0, true),
+  chipNonZero: chipHtml('seg', 'status', 'waiting', '⏸ Waiting on others', 2, false),
+  visibleWhenAllZero: STATUSES
+    .filter(st => st.alwaysShow || 0 > 0 || 'attention' === st.id)
+    .map(st => st.id),
+  visibleWhenDraftSelectedAtZero: STATUSES
+    .filter(st => st.alwaysShow || 0 > 0 || 'draft' === st.id)
+    .map(st => st.id),
+  statuses: STATUSES,
 }));
 """
     proc = subprocess.run(
@@ -316,15 +358,39 @@ console.log(JSON.stringify({
     self.assertEqual(out["devRolls"], '<span class="muted">In development</span>')
     self.assertEqual(out["reviewRolls"], '<span class="muted">In review</span>')
     self.assertEqual(out["abandonedRolls"], '<span class="muted">—</span>')
+    self.assertEqual(out["closedRolls"], '<span class="muted">—</span>')
     self.assertIn("📝", out["draftCore"])
     self.assertIn("<code>DRAFT</code>", out["draftCore"])
     self.assertIn("🛠️", out["devCore"])
     self.assertIn("In development — no reviewers yet", out["devCore"])
     self.assertIn("In review (CR: +1", out["reviewCore"])
     self.assertEqual(out["draftStatus"], "draft")
-    self.assertEqual(out["devStatus"], "draft")
+    self.assertEqual(out["devStatus"], "dev")
     self.assertEqual(out["devCqStatus"], "cq")
     self.assertEqual(out["reviewStatus"], "waiting")
+    self.assertIn("(all 5 in <code>TRASH</code>)", out["gmailAllTrashHtml"])
+    self.assertIn(
+        "(5 msgs: 3 in <code>TRASH</code>, 2 archived)", out["gmailMixedTrashHtml"]
+    )
+    self.assertIn("(all 4 archived)", out["gmailAllArchivedHtml"])
+    self.assertIn(" disabled", out["chipZeroInactive"])
+    self.assertIn(" disabled", out["chipZeroActive"])
+    self.assertNotIn(" disabled", out["chipNonZero"])
+    self.assertEqual(
+        out["visibleWhenAllZero"],
+        ["attention", "cq", "waiting", "dev", "merged"],
+    )
+    self.assertEqual(
+        out["visibleWhenDraftSelectedAtZero"],
+        ["attention", "cq", "waiting", "dev", "draft", "merged"],
+    )
+    status_ById = {s["id"]: s for s in out["statuses"]}
+    self.assertIn("dev", status_ById)
+    self.assertIn("draft", status_ById)
+    for core_id in ("attention", "dev", "cq", "waiting", "merged"):
+      self.assertTrue(status_ById[core_id].get("alwaysShow"), core_id)
+    for tail_id in ("draft", "conflict", "tree", "old", "abandoned"):
+      self.assertFalse(status_ById[tail_id].get("alwaysShow"), tail_id)
 
 
 if __name__ == "__main__":
