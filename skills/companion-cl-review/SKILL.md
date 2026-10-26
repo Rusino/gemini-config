@@ -68,6 +68,8 @@ Never upload a companion WIP CL blindly. After auditing the patchset and testing
    - **Never** write `"// Fails on cl/123456 because..."` or `"// Reproducer for PS3 bug"` in test comments — when the author folds your patchset into their CL, temporary review-time phrasing pollutes their commit and requires another round of review cleanup.
 3. **Compile and run the test binary (plus `flutter-test-paragraph-engine` for `SkParagraph` changes)**:
    - For any Skia CL that modifies executable code in `modules/skparagraph/{src,include}/`, `modules/skunicode/{src,include}/`, or `modules/skshaper/{src,include}/`, running native Skia `dm --match SkParagraph` (`skia-test-paragraph`) alone is **not sufficient**: you **must** also run `flutter-test-paragraph-engine` (`~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py`) to verify that Flutter framework layout, intrinsic width, editing, and widget consumers (including `dropdown_menu_test.dart`) pass with zero regressions before classifying the CL as **Case 1** or **Case 2** (for Case 5, run `flutter-test-paragraph-engine` once on the final `PS2` tree in Phase 4 rather than twice).
+   - For any Flutter PR that modifies executable code in `engine/src/flutter/lib/web_ui/lib/`, you **must** run `webparagraph-corpus` (`~/.gemini/config/skills/webparagraph-corpus/scripts/run_webparagraph_corpus.py`, Part 1 `felt` + Part 2 `packages/flutter`) before classifying as **Case 1**/**Case 2** or before pushing Commit 2 in **Case 5**.
+   - Place new contract tests inside the dedicated test file the author's CL/PR already created or touched for that feature (so `git cherry-pick` lands cleanly in place without moving tests across files).
    - If no defects exist and no new tests are needed → **Case 1** or **Case 2** (stop here and draft prose review).
    - If the new tests **pass** on the author's unmodified code → **Case 3**.
    - If the new tests **fail** (`Gate A` confirmed), record the exact failing test names and assertion count (`N failing assertions across K tests`), then decide between **Case 4** (reproducer tests only) and **Case 5** (tests in `PS1` + fix in `PS2`).
@@ -123,7 +125,15 @@ When **Case 5** applies:
      - `Base -> PS1`: Reproducer unit tests only (fails on the parent CL).
      - `PS1 -> PS2`: Pure production fix delta (turns the tests green).
      - `Base -> PS2`: Complete combined diff ready to fold in.
-   - *(GitHub PR equivalent: instead of `git commit --amend`, push two separate commits to a Draft PR or comparison branch — Commit 1 with the failing contract tests and Commit 2 with the production fix — so the commit list preserves the same 2-step separation.)*
+6. **GitHub Companion Draft PR Protocol (2 Commits + Direct Compare URL)**:
+   - On GitHub (where there is no patchset selector), keep **two separate commits** stacked directly on top of the author's PR `HEAD` (`<author_head_sha>`) instead of `git commit --amend`:
+     - **Commit 1** (`<commit1_sha>`): Failing contract tests only (`[<module>] Add failing <topic> tests`).
+     - **Commit 2** (`<commit2_sha>`): Production fix (`[<module>] Fix <topic> edge cases`).
+   - Push the branch to the user's personal fork (`git push -u fork companion-pr-<PR>`) and open a **Draft PR** in the upstream repository (`gh pr create --draft --repo <upstream_owner>/<repo> --base master --head <fork_owner>:companion-pr-<PR>`) with **zero reviewers** (`--reviewer` omitted):
+     - Opening the Draft PR in `<upstream_owner>/<repo>` (rather than inside the personal fork) runs upstream CI (e.g. LUCI in `flutter/flutter`) on the combined branch and automatically cross-links the companion Draft PR in the parent PR's GitHub timeline.
+   - **Mandatory `<author_head_sha>...<commit2_sha>` Compare Link**:
+     - Because the author's branch lives in their personal fork (`<author_fork>:<branch>`), the companion Draft PR in `<upstream_owner>/<repo>` must target `master`/`main` as `--base`. As a result, GitHub's `Files changed` tab on the companion PR diffs against `master` and includes the author's commits alongside Commit 1 and Commit 2.
+     - Therefore, **always** include the direct 2-commit compare link (`https://github.com/<upstream_owner>/<repo>/compare/<author_head_sha>...<commit2_sha>`) at the top of the companion Draft PR description **and** in the review message on the parent PR, alongside the direct links to Commit 1 (`/pull/<COMPANION_PR>/commits/<commit1_sha>`) and Commit 2 (`/pull/<COMPANION_PR>/commits/<commit2_sha>`).
 
 ---
 
@@ -147,14 +157,23 @@ Structure the English review comment using this proven template:
    - Explain the invariant fix in 1–2 sentences (or with a 3-line inline snippet if helpful).
 3. **Side Effects & Predicate Scope**:
    State every behavior change of `PS2` outside the targeted bugs found in Phase 4 (e.g., "the post-`maxLines` scan now also splits CJK text into per-ideograph words, because `isSoftBreak()` covers every break opportunity"), or state explicitly that there are none.
-4. **Companion WIP CL Link & Patchset Guide**:
-   Provide the direct link to the stacked companion WIP CL, explicitly explaining the patchset layout and giving the author complete autonomy:
-   > I uploaded a companion WIP CL stacked on top of PS`<N>` so you can inspect the isolated diffs:
-   > `<https://...-review.googlesource.com/c/.../+/<COMPANION_CL>>`
-   > - **Patchset 1** adds the `<K>` unit tests (`<TestName1>`, `<TestName2>`, ...) that fail on PS`<N>`.
-   > - **Patchset 2** has the corresponding fix (all `<Total>` `<Module>` tests pass).
-   >
-   > Feel free to fold the whole patchset into this CL, cherry-pick just the parts/tests you want, or keep the fix as a separate follow-up CL — whichever you prefer! (Once it's folded in or no longer needed, I'll abandon the WIP CL.)
+4. **Companion WIP CL / Draft PR Link & Patchset Guide**:
+   Provide the direct link to the stacked companion WIP CL (or GitHub Draft PR), explicitly explaining the patchset/commit layout and giving the author complete autonomy:
+   - **Gerrit WIP CL template**:
+     > I uploaded a companion WIP CL stacked on top of PS`<N>` so you can inspect the isolated diffs:
+     > `<https://...-review.googlesource.com/c/.../+/<COMPANION_CL>>`
+     > - **Patchset 1** adds the `<K>` unit tests (`<TestName1>`, `<TestName2>`, ...) that fail on PS`<N>`.
+     > - **Patchset 2** has the corresponding fix (all `<Total>` `<Module>` tests pass).
+     >
+     > Feel free to fold the whole patchset into this CL, cherry-pick just the parts/tests you want, or keep the fix as a separate follow-up CL — whichever you prefer! (Once it's folded in or no longer needed, I'll abandon the WIP CL.)
+   - **GitHub Draft PR template**:
+     > To make inspecting and reproducing these cases easy, I uploaded a companion Draft PR stacked directly on top of your branch:
+     > **`https://github.com/<owner>/<repo>/pull/<COMPANION_PR>`** ([diff of just the 2 companion commits on top of `<author_short_sha>`](`https://github.com/<owner>/<repo>/compare/<author_full_sha>...<commit2_full_sha>`))
+     >
+     > - **[Commit 1 (`<commit1_short_sha>`)](`https://github.com/<owner>/<repo>/pull/<COMPANION_PR>/commits/<commit1_full_sha>`)** adds the `<K>` unit tests in `<test_file>` reproducing the issues above (fails on your current HEAD).
+     > - **[Commit 2 (`<commit2_short_sha>`)](`https://github.com/<owner>/<repo>/pull/<COMPANION_PR>/commits/<commit2_full_sha>`)** has the corresponding fix in `<prod_files>` (all `<Total>` tests pass).
+     >
+     > Feel free to cherry-pick both commits, fold the changes into this PR, or take only the parts you want — whichever you prefer! (I will close the draft PR once this PR is updated.)
 
 ---
 
