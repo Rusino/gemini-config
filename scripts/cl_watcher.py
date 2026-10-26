@@ -63,6 +63,16 @@ PEN_URL_SH = (
 SELF_EMAILS = {"jlavrova@google.com", "jlavrova@gmail.com"}
 SELF_GITHUB_LOGINS = {"Rusino", "jlavrova"}
 FLUTTER_TREE_CHECK = "tree-status"
+# Cocoon aggregates Luci presubmit jobs under one umbrella check-run and exposes
+# tip-of-tree and per-commit post-submit failures on flutter-dashboard
+FLUTTER_DASHBOARD_CHECK = "Dashboard Checks"
+FLUTTER_BUILD_STATUS_URL = (
+    "https://flutter-dashboard.appspot.com/api/public/build-status?repo=flutter"
+)
+FLUTTER_GET_STATUS_URL = (
+    "https://flutter-dashboard.appspot.com/api/public/get-status?repo=flutter"
+)
+RE_DASHBOARD_SUBJOB = re.compile(r"^\s*-\s*`([^`]+)`", re.MULTILINE)
 GITHUB_STATUS_BOTS = {"flutter-dashboard"}
 
 # Regexes to extract CL and PR identifiers from chat titles
@@ -87,6 +97,10 @@ RE_DRAFT_SUBJECT = re.compile(
 
 _GMAIL_TOKEN_CACHE: dict[str, Any] = {"access_token": "", "expires_at": 0.0}
 _GMAIL_LOCK = threading.Lock()
+# Cache tip-of-tree and immutable base-commit check failures across PR polls
+_FLUTTER_TREE_CACHE: dict[str, Any] = {"tasks": set(), "expires_at": 0.0}
+_FLUTTER_BASE_CACHE: dict[str, set[str]] = {}
+_FLUTTER_TREE_LOCK = threading.Lock()
 
 EN_MONTHS = {
     1: "Jan",
@@ -995,6 +1009,194 @@ def fetch_gerrit_cl_status(
   return {"ok": False, "error": f"CL {cl_id} not found on Gerrit"}
 
 
+def fetch_commit_failed_checks(
+    sha_or_ref: str, failing: set[str]
+) -> tuple[bool, set[str]]:
+  """Returns (ok, failed_names) from GitHub check-runs on `sha_or_ref`."""
+  try:
+    out = subprocess.check_output(
+        [
+            "gh",
+            "api",
+            f"repos/flutter/flutter/commits/{sha_or_ref}/check-runs?per_page=100",
+        ],
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=10,
+    )
+    d = json.loads(out)
+    runs = d.get("check_runs")
+    # Non-check-run payloads (e.g. unit test mocks returning a PR fixture) signal
+    # that baseline subtraction should be skipped
+    if not isinstance(runs, list):
+      return False, set()
+    # Keep each check name's latest run by id so a green rerun clears an earlier failure
+    latest: dict[str, tuple[int, str]] = {}
+    for r in runs:
+      if not isinstance(r, dict):
+        continue
+      name = str(r.get("name") or "")
+      if not name:
+        continue
+      rid = int(r.get("id") or 0)
+      conc = str(r.get("conclusion") or r.get("state") or "").upper()
+      prev = latest.get(name)
+      # Higher check-run id means a newer attempt on the same commit
+      if prev is None or rid >= prev[0]:
+        latest[name] = (rid, conc)
+    return True, {name for name, (_, conc) in latest.items() if conc in failing}
+  except Exception:
+    return False, set()
+
+
+def fetch_flutter_dashboard_json(url: str) -> dict[str, Any]:
+  """Fetches JSON from flutter-dashboard, falling back to IPv4 curl on IPv6 timeout."""
+  try:
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=8) as resp:
+      return json.loads(resp.read().decode("utf-8"))
+  except Exception:
+    # Python's urlopen can exhaust its timeout on blackholed IPv6 routes before trying IPv4
+    try:
+      out = subprocess.check_output(
+          ["curl", "-4", "-fsSL", "--max-time", "5", url],
+          stderr=subprocess.DEVNULL,
+          text=True,
+          timeout=6,
+      )
+      return json.loads(out)
+    except Exception:
+      return {}
+
+
+def fetch_flutter_tree_failures(failing: set[str]) -> tuple[bool, set[str]]:
+  """Returns (ok, failing_tasks) across flutter/flutter master and Cocoon build-status."""
+  now = time.time()
+  with _FLUTTER_TREE_LOCK:
+    # Reuse tip-of-tree status across all PRs within the same polling cycle
+    if (
+        _FLUTTER_TREE_CACHE["expires_at"] > now
+        and _FLUTTER_TREE_CACHE["tasks"] is not None
+    ):
+      return True, set(_FLUTTER_TREE_CACHE["tasks"])
+
+  ok, broken = fetch_commit_failed_checks("master", failing)
+  # Abort baseline lookup when GitHub check-runs are unavailable
+  if not ok:
+    return False, set()
+  bdata = fetch_flutter_dashboard_json(FLUTTER_BUILD_STATUS_URL)
+  # Merge Cocoon post-submit failures with GitHub Actions check-run failures on master
+  for task in bdata.get("failingTasks") or []:
+    if task:
+      broken.add(str(task))
+
+  with _FLUTTER_TREE_LOCK:
+    _FLUTTER_TREE_CACHE["tasks"] = set(broken)
+    _FLUTTER_TREE_CACHE["expires_at"] = now + 45.0
+  return True, broken
+
+
+def fetch_pr_base_failed_checks(pr_id: str, failing: set[str]) -> set[str]:
+  """Fetches check-run and Cocoon task names that failed on the PR's base commit."""
+  try:
+    out = subprocess.check_output(
+        ["gh", "api", f"repos/flutter/flutter/pulls/{pr_id}"],
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=10,
+    )
+    d = json.loads(out)
+    base_sha = str((d.get("base") or {}).get("sha") or "")
+    if not base_sha:
+      return set()
+    with _FLUTTER_TREE_LOCK:
+      cached = _FLUTTER_BASE_CACHE.get(base_sha)
+    # A commit's post-submit result rarely changes once recorded, so serve from cache
+    if cached is not None:
+      return set(cached)
+    ok, failed = fetch_commit_failed_checks(base_sha, failing)
+    sdata = fetch_flutter_dashboard_json(FLUTTER_GET_STATUS_URL)
+    # Also include Cocoon post-submit tasks that failed on this exact base commit
+    for entry in sdata.get("Commits") or []:
+      commit_sha = str(((entry.get("Commit") or {}).get("Sha")) or "")
+      if commit_sha == base_sha:
+        for task in entry.get("Tasks") or []:
+          if str(task.get("Status") or "") in ("Failed", "Infra Failure"):
+            bname = str(task.get("BuilderName") or "")
+            if bname:
+              failed.add(bname)
+        break
+    if ok:
+      with _FLUTTER_TREE_LOCK:
+        if len(_FLUTTER_BASE_CACHE) >= 64:
+          _FLUTTER_BASE_CACHE.clear()
+        _FLUTTER_BASE_CACHE[base_sha] = set(failed)
+    return failed
+  except Exception:
+    return set()
+
+
+def fetch_dashboard_failed_subjobs(head_sha: str) -> list[str]:
+  """Extracts failing presubmit job names from Cocoon's `Dashboard Checks` summary."""
+  if not head_sha:
+    return []
+  try:
+    out = subprocess.check_output(
+        [
+            "gh",
+            "api",
+            f"repos/flutter/flutter/commits/{head_sha}/check-runs"
+            "?check_name=Dashboard%20Checks",
+        ],
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=10,
+    )
+    d = json.loads(out)
+    runs = [r for r in d.get("check_runs") or [] if isinstance(r, dict)]
+    if not runs:
+      return []
+    # Inspect the latest Dashboard Checks run and parse its markdown bullet list
+    latest = max(runs, key=lambda r: int(r.get("id") or 0))
+    text = str((latest.get("output") or {}).get("text") or "")
+    return [m.strip() for m in RE_DASHBOARD_SUBJOB.findall(text) if m.strip()]
+  except Exception:
+    return []
+
+
+def partition_github_failed_checks(
+    pr_id: str, head_sha: str, failed_checks: list[str], failing: set[str]
+) -> tuple[list[str], list[str]]:
+  """Splits PR check failures into (own_failed_checks, tree_failed_checks)."""
+  if not failed_checks:
+    return [], []
+  ok, tree_broken = fetch_flutter_tree_failures(failing)
+  # Fall back to treating all failures as PR-owned when tree status cannot be queried
+  if not ok:
+    return list(failed_checks), []
+
+  candidates: list[str] = []
+  for c in failed_checks:
+    # Expand the umbrella Dashboard Checks run into individual failing Luci job names
+    if c == FLUTTER_DASHBOARD_CHECK:
+      subjobs = fetch_dashboard_failed_subjobs(head_sha)
+      if subjobs:
+        for job in subjobs:
+          if job not in candidates:
+            candidates.append(job)
+        continue
+    if c not in candidates:
+      candidates.append(c)
+
+  # Check the PR's base commit when tip-of-tree master has already moved past a breakage
+  if any(c not in tree_broken for c in candidates):
+    tree_broken |= fetch_pr_base_failed_checks(pr_id, failing)
+
+  own_failed = [c for c in candidates if c not in tree_broken]
+  tree_failed = [c for c in candidates if c in tree_broken]
+  return own_failed, tree_failed
+
+
 def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
   """Fetches Flutter GitHub PR status via `gh pr view`."""
   try:
@@ -1076,14 +1278,25 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
     # says nothing about this PR, so it must not raise a CQ alert
     tree_red = FLUTTER_TREE_CHECK in failed_all
     failed_checks = [c for c in failed_all if c != FLUTTER_TREE_CHECK]
+    # Subtract checks already failing on master or the PR's base commit so tree
+    # breakages do not trigger a false CQ failure alert on this PR
+    own_failed_checks, tree_failed_checks = partition_github_failed_checks(
+        str(pr_id), head_sha, failed_checks, failing
+    )
     pending_checks = [
         str(c.get("name") or "")
         for c in checks
         if str(c.get("status") or "").upper() in ("IN_PROGRESS", "QUEUED", "PENDING")
     ]
 
-    if failed_checks:
-      cq_status = f"🔴 {len(failed_checks)} check(s) failed"
+    # Only PR-specific failures count as red CQ; tree-broken checks show a tree badge
+    if own_failed_checks:
+      cq_status = f"🔴 {len(own_failed_checks)} check(s) failed"
+    elif tree_failed_checks:
+      if len(tree_failed_checks) == 1:
+        cq_status = f"🌲 Tree broken ({tree_failed_checks[0]})"
+      else:
+        cq_status = f"🌲 Tree broken ({len(tree_failed_checks)} checks)"
     elif tree_red:
       cq_status = "🌲 Tree is red"
     elif pending_checks:
@@ -1147,7 +1360,8 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
       phase = "READY_TO_CLOSE"
     elif state == "CLOSED":
       phase = "ABANDONED"
-    elif failed_checks and not is_watching:
+    # Raise a CQ alert only when checks not already broken on the tree failed
+    elif own_failed_checks and not is_watching:
       phase = "ALERT_CQ_FAILED"
     # Bot reviews on a draft, unreviewed, or watched PR do not require a review reply
     elif (
@@ -1186,7 +1400,10 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         "in_my_attention": phase in ("NEEDS_YOUR_ACTION", "ALERT_CQ_FAILED"),
         "cr_summary": f"{len(reviews)} rev",
         "cq_status": cq_status,
-        "cq_failed": bool(failed_checks),
+        # Expose both PR-owned and tree-broken check lists for UI and diagnostics
+        "cq_failed": bool(own_failed_checks),
+        "own_failed_checks": own_failed_checks,
+        "tree_failed_checks": tree_failed_checks,
         "tree_red": tree_red,
         "merge_conflict": merge_conflict,
         "waiting_on": (
