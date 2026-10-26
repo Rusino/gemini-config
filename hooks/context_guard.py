@@ -747,30 +747,34 @@ def build_scope_radar_notice(
   if not other_lines and not sibling_lines:
     return ""
 
-  # Format combined intra-project sibling and cross-project radar blocks
   blocks = [
       "[SCOPE GUARD: WRONG-CHAT / WRONG-PROJECT RADAR]",
       f"Current chat: `{cur_title or conv_id}` | Project: `{cur_proj_name}` | "
       f"Workspace(s): {cur_roots}",
   ]
+  # Same-project sibling chats only coordinate shared resources and never redirect the user
   if sibling_lines:
     blocks.append(
         f"Active sibling chats in `{cur_proj_name}` "
-        "(avoid colliding on their files/worktrees):"
+        "(same project — coordinate shared files, worktrees, and `doing` roadmap "
+        "items via `roadmap.py show`; never issue a wrong-chat redirect for "
+        "same-project work):"
     )
     blocks.extend(sibling_lines)
+  # Only foreign projects and workspaces trigger a stop-and-redirect warning
   if other_lines:
     blocks.append("Other active projects & workspaces:")
     blocks.extend(other_lines)
-  blocks.append(
-      "If the user's new request clearly targets another project, workspace, or "
-      f"sibling chat topic listed above rather than `{cur_title or cur_proj_name}`, DO NOT start "
-      "investigating, reading foreign project files, or running commands! "
-      "Reply immediately warning the user which project/chat the request belongs to "
-      "(`[👉 <Target Chat Title>](conversation://<target_conv_id>)`), and ask whether "
-      'to forward the message via `agentapi send-message <target_conv_id> "<user '
-      'message>"` or execute it in this chat.'
-  )
+    blocks.append(
+        "If the user's new request clearly targets another project or foreign "
+        "workspace listed under 'Other active projects & workspaces' rather than "
+        f"`{cur_proj_name}` (never a sibling chat in the same project), DO NOT "
+        "start investigating, reading foreign project files, or running commands! "
+        "Reply immediately warning the user which project/chat the request belongs "
+        "to (`[👉 <Target Chat Title>](conversation://<target_conv_id>)`), and ask "
+        'whether to forward the message via `agentapi send-message <target_conv_id> '
+        '"<user message>"` or execute it in this chat.'
+    )
   return "\n".join(blocks)
 
 

@@ -434,6 +434,9 @@ class TestContextGuard(unittest.TestCase):
       self.assertIn("conversation://ea2b5a0f", msg)
       self.assertIn("doing: R1", msg)
       self.assertIn("flutter_perf_r16", msg)
+      self.assertIn("never issue a wrong-chat redirect for same-project work", msg)
+      self.assertNotIn("sibling chat topic listed above", msg)
+      self.assertNotIn("agentapi send-message", msg)
 
       # Handed-off `▸` predecessors and `.pbtxt` archived chats are excluded from SQLite query
       import sqlite3
