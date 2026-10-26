@@ -73,6 +73,11 @@ RE_PR_ID = re.compile(r"(?:\bPR\s*#?|\bpull/)(\d{5,7})\b", re.IGNORECASE)
 # Strip any trailing roll badge we previously attached to a title
 TITLE_TOPIC_MAX = 38
 RE_ROLL_BADGE = re.compile(r"\s*\[(?:⏳|✓|🔴|🔄)[^\]]*\]\s*$")
+# Automated roll CLs/PRs belong to the Skia Gardener rather than personal Flight Deck rows
+RE_AUTOROLL_SUBJECT = re.compile(
+    r"^Roll\s+(?:Skia\b|\S+\s+from\s+[0-9a-f]{7,40}\s+to\s+[0-9a-f]{7,40}\b)",
+    re.IGNORECASE,
+)
 
 _GMAIL_TOKEN_CACHE: dict[str, Any] = {"access_token": "", "expires_at": 0.0}
 _GMAIL_LOCK = threading.Lock()
@@ -1210,6 +1215,24 @@ def finalize_conversation(conv_id: str) -> bool:
     return False
 
 
+def is_autoroll_change(cl_info: dict[str, Any]) -> bool:
+  """Returns whether a CL/PR is an automated roll handled by Skia Gardener."""
+  # Manual rolls authored by the user still belong on the personal Flight Deck
+  if cl_info.get("is_self"):
+    return False
+  owner_name = str(cl_info.get("owner_name") or "").lower()
+  owner_email = str(cl_info.get("owner_email") or "").lower()
+  # Match roller bot logins and Gerrit IAM service accounts
+  if (
+      "autoroll" in owner_name
+      or "autoroll" in owner_email
+      or owner_email.endswith(".gserviceaccount.com")
+  ):
+    return True
+  subject = str(cl_info.get("subject") or "").strip()
+  return bool(RE_AUTOROLL_SUBJECT.match(subject))
+
+
 def should_finalize_removed_reviewer_chat(
     chat_item: dict[str, Any], cl_info: dict[str, Any]
 ) -> bool:
@@ -1273,24 +1296,12 @@ def sync_once(
   rollers, incidents = fetch_gardener_snapshot()
   discovered = discover_active_cl_chats()
 
-  # Fetch Gmail thread statuses in parallel across unique target IDs
-  unique_tids = sorted({d["target_id"] for d in discovered if d.get("target_id")})
-  gmail_cache: dict[str, dict[str, Any]] = {}
-  if unique_tids:
-    with ThreadPoolExecutor(max_workers=6) as pool:
-      for tid, gstat in zip(unique_tids, pool.map(fetch_gmail_status_for_id, unique_tids)):
-        gmail_cache[tid] = gstat
-
   # Cache fetched CL/PR metadata so multiple chats referencing the same CL don't re-fetch
   fetched_cache: dict[str, dict[str, Any]] = {}
-  new_items: dict[str, Any] = {}
-
+  active_discovered: list[dict[str, Any]] = []
   for d in discovered:
     ikey = d["item_key"]
-    cid = d["conversation_id"]
     tid = d["target_id"]
-    composite_key = f"{ikey}@{cid}"
-
     if ikey not in fetched_cache:
       if d["kind"] == "gerrit":
         fetched_cache[ikey] = fetch_gerrit_cl_status(
@@ -1300,10 +1311,30 @@ def sync_once(
         fetched_cache[ikey] = fetch_github_pr_status(tid)
       else:
         fetched_cache[ikey] = fetch_piper_cl_status(tid)
-
     info = fetched_cache[ikey]
-    if not info.get("ok"):
+    # Drop broken lookups and automated rolls before querying Gmail or building rows
+    if not info.get("ok") or is_autoroll_change(info):
       continue
+    active_discovered.append(d)
+
+  unique_tids = sorted(
+      {d["target_id"] for d in active_discovered if d.get("target_id")}
+  )
+  gmail_cache: dict[str, dict[str, Any]] = {}
+  # Fetch Gmail thread statuses in parallel across unique non-autoroll target IDs
+  if unique_tids:
+    with ThreadPoolExecutor(max_workers=6) as pool:
+      for tid, gstat in zip(unique_tids, pool.map(fetch_gmail_status_for_id, unique_tids)):
+        gmail_cache[tid] = gstat
+
+  new_items: dict[str, Any] = {}
+
+  for d in active_discovered:
+    ikey = d["item_key"]
+    cid = d["conversation_id"]
+    tid = d["target_id"]
+    composite_key = f"{ikey}@{cid}"
+    info = fetched_cache[ikey]
 
     gstat = gmail_cache.get(tid) or {
         "thread_ids": [],
