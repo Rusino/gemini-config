@@ -2115,8 +2115,8 @@ function statusNotesHtml(it) {
   }
   // Draft, unreviewed, and watched PRs are not waiting on tree status to land
   if (it.tree_red && !it.is_draft && !it.in_development && !it.is_watching) {
-    notes += `<div class="muted">🌲 ${link(FLUTTER_DASHBOARD_URL, 'flutter/flutter tree')} ` +
-      'is red; landing waits for it</div>';
+    notes += '<div style="color:var(--danger-text)">🌲 ' +
+      `${link(FLUTTER_DASHBOARD_URL, 'flutter/flutter tree')} is red; landing waits for it</div>`;
   }
   if (['waiting', 'cq', 'tree', 'conflict'].includes(statusOf(it))) notes += waitingOnHtml(it);
   return notes;

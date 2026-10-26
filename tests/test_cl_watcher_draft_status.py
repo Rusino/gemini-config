@@ -408,6 +408,11 @@ const reviewCl = {
   is_draft: false, in_development: false, is_watching: false,
   patchset: 2, url: 'https://example.com/4', cr_summary: '+1', cq_status: 'Idle'
 };
+const treeRedPr = {
+  kind: 'github', status: 'OPEN', phase: 'WAITING_ON_OTHERS',
+  is_draft: false, in_development: false, is_watching: false, tree_red: true,
+  patchset: 1, url: 'https://example.com/7', cr_summary: '1 rev', cq_status: '🌲 Tree is red'
+};
 const abandonedCl = {
   kind: 'gerrit', status: 'ABANDONED', phase: 'ABANDONED',
   is_draft: false, in_development: false, patchset: 1, url: 'https://example.com/5'
@@ -452,6 +457,8 @@ console.log(JSON.stringify({
   watchingCore: statusCoreHtml(watchingCl),
   watchingAuthorHtml: formatAuthorAndCl(watchingCl),
   reviewCore: statusCoreHtml(reviewCl),
+  draftNotes: statusNotesHtml(draftPr),
+  treeRedNotes: statusNotesHtml(treeRedPr),
   draftStatus: statusOf(draftPr),
   devStatus: statusOf(devCl),
   devCqStatus: statusOf(devCqRunningCl),
@@ -490,6 +497,9 @@ console.log(JSON.stringify({
     self.assertIn("Watching (CR: 0", out["watchingCore"])
     self.assertIn("watching", out["watchingAuthorHtml"])
     self.assertIn("In review (CR: +1", out["reviewCore"])
+    self.assertEqual(out["draftNotes"], "")
+    self.assertIn('style="color:var(--danger-text)">🌲', out["treeRedNotes"])
+    self.assertIn("is red; landing waits for it", out["treeRedNotes"])
     self.assertEqual(out["draftStatus"], "draft")
     self.assertEqual(out["devStatus"], "dev")
     self.assertEqual(out["devCqStatus"], "cq")
