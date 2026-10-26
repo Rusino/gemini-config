@@ -2,14 +2,18 @@
   "builtin": "schedule",
   "args": [
     "CRON_TZ=America/New_York 30 9 * * 1,5",
+    "env",
+    "-u",
+    "ANTIGRAVITY_SOURCE_METADATA",
     "agentapi",
-    "new-conversation",
-    "--",
+    "send-message",
+    "--title=Daily review queue triage",
+    "099b10d3-fd4e-4e70-9be2-bf6a3451d5f7",
     "Daily morning triage of the incoming code review queue for jlavrova@google.com. Run: python3 /usr/local/google/home/jlavrova/.gemini/config/skills/review-triage/scripts/run_queue_triage.py. Present the results in Russian, informal (ты). Output the summary table with badges (🟢 MECHANICAL, 🟡 REASSIGN, 🔴 SURGICAL AUDIT, 🟠 PUSHBACK), estimated review time, pinpointed core lines for surgical audits, and ready-to-copy review drafts in English. If the queue is empty, report that there are 0 pending reviews in one cheerful sentence. Do not vote, submit, or resolve threads on Gerrit."
   ],
   "restart_policy": "always",
   "display_name": "Review Queue Digest (Mon, Fri 9:30 AM)",
-  "description": "Every Monday and Friday at 9:30 AM (America/New_York), triages incoming code reviews in Gerrit/Piper, classifies them into 4 categories, isolates core logic, and drafts review actions.",
+  "description": "Every Monday and Friday at 9:30 AM (America/New_York), sends the review queue triage prompt to the \"Review queue triage\" chat (Code Review organizer), which triages incoming code reviews in Gerrit/Piper, classifies them into 4 categories, isolates core logic, and drafts review actions.",
   "agent_permissions": {
     "access_grants": [
       "command(python3 /usr/local/google/home/jlavrova/.gemini/config/skills/review-triage/scripts/run_queue_triage.py)",
