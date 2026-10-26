@@ -19,7 +19,7 @@ Responsibilities:
    `INBOX` archiving (`batch_unlabel_threads` with `includeTrash=true`).
 4. Updates a compact progress badge on the conversation title and wakes the
    target conversation via `agentapi send-message` only on significant transitions.
-5. Serves the live 5-column Markdown-styled "CL Flight Deck" HTML dashboard.
+5. Serves the live 5-column Markdown-styled "CL Flight Deck" HTML dashboard in English.
 """
 
 from __future__ import annotations
@@ -74,19 +74,19 @@ RE_ROLL_BADGE = re.compile(r"\s*\[(?:⏳|✓|🔴|🔄)[^\]]*\]\s*$")
 _GMAIL_TOKEN_CACHE: dict[str, Any] = {"access_token": "", "expires_at": 0.0}
 _GMAIL_LOCK = threading.Lock()
 
-RU_MONTHS = {
-    1: "\u044f\u043d\u0432",
-    2: "\u0444\u0435\u0432",
-    3: "\u043c\u0430\u0440",
-    4: "\u0430\u043f\u0440",
-    5: "\u043c\u0430\u044f",
-    6: "\u0438\u044e\u043d",
-    7: "\u0438\u044e\u043b",
-    8: "\u0430\u0432\u0433",
-    9: "\u0441\u0435\u043d",
-    10: "\u043e\u043a\u0442",
-    11: "\u043d\u043e\u044f",
-    12: "\u0434\u0435\u043a",
+EN_MONTHS = {
+    1: "Jan",
+    2: "Feb",
+    3: "Mar",
+    4: "Apr",
+    5: "May",
+    6: "Jun",
+    7: "Jul",
+    8: "Aug",
+    9: "Sep",
+    10: "Oct",
+    11: "Nov",
+    12: "Dec",
 }
 
 
@@ -119,7 +119,7 @@ def parse_gerrit_or_iso_time(ts_str: str) -> datetime | None:
 
 
 def format_et_and_age(ts_str: str) -> tuple[str, str]:
-  """Returns formatted ET timestamp and relative age in America/New_York time."""
+  """Returns ('Oct 26 at 11:15 ET', '42m ago') in America/New_York time."""
   dt = parse_gerrit_or_iso_time(ts_str)
   if not dt:
     return "", ""
@@ -129,22 +129,22 @@ def format_et_and_age(ts_str: str) -> tuple[str, str]:
     now_et = datetime.now(et_tz)
     diff_sec = max(0, int((now_et - dt_et).total_seconds()))
     if diff_sec < 90:
-      age = "\u0442\u043e\u043b\u044c\u043a\u043e \u0447\u0442\u043e"
+      age = "just now"
     elif diff_sec < 3600:
-      age = f"{diff_sec // 60} \u043c\u0438\u043d \u043d\u0430\u0437\u0430\u0434"
+      age = f"{diff_sec // 60}m ago"
     elif diff_sec < 86400:
       hrs = diff_sec // 3600
       mins = (diff_sec % 3600) // 60
-      age = f"{hrs} \u0447 {mins} \u043c\u0438\u043d \u043d\u0430\u0437\u0430\u0434" if mins else f"{hrs} \u0447 \u043d\u0430\u0437\u0430\u0434"
+      age = f"{hrs}h {mins}m ago" if mins else f"{hrs}h ago"
     else:
       days = diff_sec // 86400
-      age = f"{days} \u0434\u043d. \u043d\u0430\u0437\u0430\u0434"
+      age = f"{days}d ago"
 
-    m_str = RU_MONTHS.get(dt_et.month, str(dt_et.month))
+    m_str = EN_MONTHS.get(dt_et.month, str(dt_et.month))
     if dt_et.date() == now_et.date():
       et_fmt = dt_et.strftime("%H:%M ET")
     else:
-      et_fmt = f"{dt_et.day} {m_str} \u0432 {dt_et.strftime('%H:%M')} ET"
+      et_fmt = f"{m_str} {dt_et.day} at {dt_et.strftime('%H:%M')} ET"
     return et_fmt, age
   except Exception:
     return "", ""
@@ -285,7 +285,9 @@ def fetch_gmail_status_for_id(target_id: str) -> dict[str, Any]:
   return res
 
 
-def archive_gmail_threads_for_id(target_id: str, thread_ids: list[str] | None = None) -> dict[str, Any]:
+def archive_gmail_threads_for_id(
+    target_id: str, thread_ids: list[str] | None = None
+) -> dict[str, Any]:
   """Removes INBOX and UNREAD labels from all matching threads (including split TRASH/INBOX threads)."""
   tids = list(thread_ids or [])
   if not tids and target_id:
@@ -1137,12 +1139,12 @@ def sync_once(
   return state
 
 
-DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="ru">
+DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>\u0421\u0432\u043e\u0434\u043a\u0430 \u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0445 \u0421\u041b\u0435\u0439 \u0438 PR · Skia & Flutter</title>
+<title>CL &amp; PR Flight Deck · Skia &amp; Flutter</title>
 <style>
   :root {
     --bg: #ffffff;
@@ -1337,18 +1339,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <div class="top-header">
   <div>
-    <h1>\u0427\u0442\u043e \u0441\u0435\u0439\u0447\u0430\u0441 \u043f\u0440\u043e\u0438\u0441\u0445\u043e\u0434\u0438\u0442 \u0441 \u0421\u041b\u044f\u043c\u0438 \u0438 PR (<span id="total-count">0</span> \u043e\u0442\u043a\u0440\u044b\u0442\u044b\u0445 \u0447\u0430\u0442\u043e\u0432)</h1>
-    <div class="meta-line" id="sync-status">\u041e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u0435...</div>
+    <h1>Active CL &amp; PR Flight Deck (<span id="total-count">0</span> open chats)</h1>
+    <div class="meta-line" id="sync-status">Syncing...</div>
   </div>
   <div class="toolbar">
     <label style="font-size:12.5px; display:inline-flex; align-items:center; gap:5px; cursor:pointer; margin-right:6px;">
       <input type="checkbox" id="hide-ready-cb" onchange="renderFromCache()">
-      \u0421\u043a\u0440\u044b\u0442\u044c \u0443\u0436\u0435 \u043f\u0440\u043e\u0448\u0435\u0434\u0448\u0438\u0435 \u0432\u0441\u0435 4 \u0440\u043e\u043b\u043b\u0430 (🏁)
+      Hide completed (🏁 all 4 rolls passed)
     </label>
-    <button id="notif-btn" onclick="enableNotifications()">🔔 \u0423\u0432\u0435\u0434\u043e\u043c\u043b\u0435\u043d\u0438\u044f \u0431\u0440\u0430\u0443\u0437\u0435\u0440\u0430</button>
-    <button onclick="testNotification()">🔊 \u0422\u0435\u0441\u0442 \u0437\u0432\u0443\u043a\u0430</button>
-    <button onclick="toggleTheme()" id="theme-btn">🌙 \u0422\u0451\u043c\u043d\u0430\u044f \u0442\u0435\u043c\u0430</button>
-    <button onclick="triggerRefresh()">⟳ \u041e\u0431\u043d\u043e\u0432\u0438\u0442\u044c \u0441\u0435\u0439\u0447\u0430\u0441</button>
+    <button id="notif-btn" onclick="enableNotifications()">🔔 Browser Alerts</button>
+    <button onclick="testNotification()">🔊 Test Sound</button>
+    <button onclick="toggleTheme()" id="theme-btn">🌙 Dark Theme</button>
+    <button onclick="triggerRefresh()">⟳ Poll Now</button>
   </div>
 </div>
 
@@ -1381,7 +1383,7 @@ function toggleTheme() {
 
 function updateThemeBtn(theme) {
   const btn = document.getElementById('theme-btn');
-  btn.textContent = theme === 'dark' ? '☀️ \u0421\u0432\u0435\u0442\u043b\u0430\u044f \u0442\u0435\u043c\u0430' : '🌙 \u0422\u0451\u043c\u043d\u0430\u044f \u0442\u0435\u043c\u0430';
+  btn.textContent = theme === 'dark' ? '☀️ Light Theme' : '🌙 Dark Theme';
 }
 
 function esc(s) {
@@ -1392,16 +1394,24 @@ function esc(s) {
     .replace(/"/g, '&quot;');
 }
 
+function shortActor(raw) {
+  const s = String(raw || '');
+  if (s.includes('skcq-be') || s.includes('gerritcodereview')) return 'SkCQ';
+  if (s.endsWith('@google.com')) return s.replace('@google.com', '@');
+  if (s.endsWith('@chromium.org')) return s.replace('@chromium.org', '@chromium');
+  return s;
+}
+
 function updateNotifButton() {
   const btn = document.getElementById('notif-btn');
   if (!('Notification' in window)) {
-    btn.textContent = '🔕 \u0423\u0432\u0435\u0434\u043e\u043c\u043b\u0435\u043d\u0438\u044f \u043d\u0435 \u043f\u043e\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u044e\u0442\u0441\u044f';
+    btn.textContent = '🔕 Alerts Unsupported';
     return;
   }
   if (Notification.permission === 'granted') {
-    btn.textContent = '🔔 \u0423\u0432\u0435\u0434\u043e\u043c\u043b\u0435\u043d\u0438\u044f: \u0412\u041a\u041b';
+    btn.textContent = '🔔 Browser Alerts: ON';
   } else if (Notification.permission === 'denied') {
-    btn.textContent = '🔕 \u0423\u0432\u0435\u0434\u043e\u043c\u043b\u0435\u043d\u0438\u044f \u0437\u0430\u0431\u043b\u043e\u043a\u0438\u0440\u043e\u0432\u0430\u043d\u044b';
+    btn.textContent = '🔕 Browser Alerts: Blocked';
   }
 }
 
@@ -1437,8 +1447,8 @@ function fireBrowserNotification(title, body, critical) {
 
 function testNotification() {
   fireBrowserNotification(
-    '🔴 \u0422\u0435\u0441\u0442\u043e\u0432\u044b\u0439 \u0430\u043b\u0435\u0440\u0442 CL Flight Deck',
-    '\u0411\u0440\u0430\u0443\u0437\u0435\u0440\u043d\u044b\u0435 \u0443\u0432\u0435\u0434\u043e\u043c\u043b\u0435\u043d\u0438\u044f \u0438 \u0437\u0432\u0443\u043a\u043e\u0432\u043e\u0439 \u0441\u0438\u0433\u043d\u0430\u043b \u0440\u0430\u0431\u043e\u0442\u0430\u044e\u0442.',
+    '🔴 CL Flight Deck Test Alert',
+    'Browser notifications and audio chime are active.',
     true
   );
 }
@@ -1448,13 +1458,14 @@ function formatAuthorAndCl(it) {
   if (it.kind === 'github') label = `PR #${esc(it.target_id)}`;
   else if (it.kind === 'piper') label = `cl/${esc(it.target_id)}`;
 
+  const who = esc(shortActor(it.owner_email || it.owner_name));
   let roleDesc = '';
   if (it.is_self) {
-    roleDesc = `<code>${esc(it.owner_email || it.owner_name)}</code> — \u0442\u0432\u043e\u0439 \u0421\u041b`;
+    roleDesc = `<code>${who}</code> — your CL`;
   } else if (it.is_external) {
-    roleDesc = `<code>${esc(it.owner_email || it.owner_name)}</code> — \u0432\u043d\u0435\u0448\u043d\u0438\u0439 \u0430\u0432\u0442\u043e\u0440!`;
+    roleDesc = `<code>${who}</code> — external author`;
   } else {
-    roleDesc = `<code>${esc(it.owner_email || it.owner_name)}</code> — \u043a\u043e\u043b\u043b\u0435\u0433\u0430`;
+    roleDesc = `<code>${who}</code> — colleague`;
   }
   return `<strong><a href="${esc(it.url)}" target="_blank">${label}</a></strong> (${roleDesc})<br><em>${esc(it.subject)}</em>`;
 }
@@ -1469,9 +1480,9 @@ function formatGerritStatusCell(it) {
     let timeLine = '';
     if (it.submitted_et) {
       const agePart = it.submitted_age ? ` (${esc(it.submitted_age)})` : '';
-      timeLine = `\u0417\u0430\u0441\u0430\u0431\u043c\u0438\u0447\u0435\u043d ${esc(it.submitted_et)}${agePart}, \u043a\u043e\u043c\u043c\u0438\u0442 <code>${shaShort}</code>.`;
+      timeLine = `Submitted ${esc(it.submitted_et)}${agePart}, commit <code>${shaShort}</code>.`;
     } else {
-      timeLine = `\u0417\u0430\u0441\u0430\u0431\u043c\u0438\u0447\u0435\u043d, \u043a\u043e\u043c\u043c\u0438\u0442 <code>${shaShort}</code>.`;
+      timeLine = `Submitted, commit <code>${shaShort}</code>.`;
     }
     return `${icon} <strong><code>MERGED</code> (${ps})</strong><br><span class="muted">${timeLine}</span>`;
   }
@@ -1481,33 +1492,34 @@ function formatGerritStatusCell(it) {
   }
 
   // Active NEW / OPEN CL or PR
+  const lastWho = esc(shortActor(it.last_msg_author));
   if (it.cq_failed) {
-    return `🔴 <strong><code>${esc(it.status)}</code> (${ps} · ${esc(it.cq_status)})</strong><br><span class="muted">\u041f\u043e\u0441\u043b\u0435\u0434\u043d\u0435\u0435 \u043e\u0442 <code>${esc(it.last_msg_author)}</code>: ${esc(it.last_msg_snippet)}</span>`;
+    return `🔴 <strong><code>${esc(it.status)}</code> (${ps} · ${esc(it.cq_status)})</strong><br><span class="muted">Latest from <code>${lastWho}</code>: ${esc(it.last_msg_snippet)}</span>`;
   }
   if (it.phase === 'SUBMITTING') {
     const agePart = it.last_msg_age ? ` (${esc(it.last_msg_age)})` : '';
-    return `🟡 <strong><code>${esc(it.status)}</code> (${ps} \u0432 CQ+2)</strong><br><span class="muted">\u041e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d \u0432 \u0441\u0430\u0431\u043c\u0438\u0442${agePart}, \u0441\u0435\u0439\u0447\u0430\u0441 \u0431\u0435\u0436\u0438\u0442 <code>SkCQ</code>.</span>`;
+    return `🟡 <strong><code>${esc(it.status)}</code> (${ps} in CQ+2)</strong><br><span class="muted">Submitted to CQ${agePart}, running <code>SkCQ</code>.</span>`;
   }
-  if (it.in_my_attention) {
+  if (it.in_my_attention && !(it.is_self && lastWho === 'SkCQ')) {
     const agePart = it.last_msg_age ? ` (${esc(it.last_msg_age)})` : '';
-    return `⚡ <strong><code>${esc(it.status)}</code> (${ps} · \u0436\u0434\u0451\u0442 \u043e\u0442\u0432\u0435\u0442\u0430)</strong><br><span class="muted">CR: ${esc(it.cr_summary)} · ${esc(it.cq_status)}. \u041e\u0442 <code>${esc(it.last_msg_author)}</code>${agePart}: ${esc(it.last_msg_snippet)}</span>`;
+    return `⚡ <strong><code>${esc(it.status)}</code> (${ps} · needs your reply)</strong><br><span class="muted">CR: ${esc(it.cr_summary)} · ${esc(it.cq_status)}. From <code>${lastWho}</code>${agePart}: ${esc(it.last_msg_snippet)}</span>`;
   }
-  return `⏸️ <strong><code>${esc(it.status)}</code> (${ps})</strong><br><span class="muted">\u0412 \u0440\u0430\u0431\u043e\u0442\u0435 (CR: ${esc(it.cr_summary)} · ${esc(it.cq_status)}).</span>`;
+  return `⏸️ <strong><code>${esc(it.status)}</code> (${ps})</strong><br><span class="muted">In progress (CR: ${esc(it.cr_summary)} · ${esc(it.cq_status)}).</span>`;
 }
 
 function formatRollsCell(it) {
   if (it.status !== 'MERGED') {
     if (it.phase === 'SUBMITTING') {
-      return `\u041e\u0436\u0438\u0434\u0430\u0435\u0442 \u0441\u0430\u0431\u043c\u0438\u0442\u0430`;
+      return `Waiting for submit`;
     }
-    return `<span class="muted">\u041d\u0430 \u0440\u0435\u0432\u044c\u044e / \u0432 \u0440\u0430\u0437\u0440\u0430\u0431\u043e\u0442\u043a\u0435</span>`;
+    return `<span class="muted">In review / development</span>`;
   }
   const ps = it.post_submit;
   if (!ps) {
     return `<strong><code>✓ Merged</code></strong>`;
   }
   if (ps.all_passed) {
-    return `<strong><code>✓Status · ✓And ✓Chr ✓G3 ✓Flt</code></strong><br><span class="muted">(\u0432\u0441\u0435 4/4 \u0440\u043e\u043b\u043b\u0430 \u043f\u0440\u043e\u0439\u0434\u0435\u043d\u044b!)</span>`;
+    return `<strong><code>✓Status · ✓And ✓Chr ✓G3 ✓Flt</code></strong><br><span class="muted">(all 4/4 rolls passed!)</span>`;
   }
   const r = ps.rolls || {};
   const andSt = (r.Android || {}).state || '⏳';
@@ -1531,23 +1543,25 @@ function formatGmailCell(it) {
   const tr = g.trash_msgs || 0;
 
   if (tids.length === 0) {
-    return `<span class="muted">\u041d\u0435\u0442 \u043f\u0438\u0441\u0435\u043c</span>`;
+    return `<span class="muted">No threads</span>`;
   }
   const firstTid = esc(tids[0]);
-  const tidLabel = tids.length === 1 ? `\u0422\u0440\u0435\u0434 <code>${firstTid}</code>` : `\u0422\u0440\u0435\u0434\u044b <code>${firstTid}</code> (+${tids.length - 1})`;
+  const tidLabel = tids.length === 1 ? `Thread <code>${firstTid}</code>` : `Threads <code>${firstTid}</code> (+${tids.length - 1})`;
 
   if (inb > 0) {
-    const trashPart = tr > 0 ? `${tr} \u0442\u044b \u0443\u0434\u0430\u043b\u0438\u043b\u0430 \u0432 <code>TRASH</code>, \u0430 ` : '';
+    const trashPart = tr > 0 ? `${tr} in <code>TRASH</code>, ` : '';
     const tidJson = esc(JSON.stringify(inboxTids.length ? inboxTids : tids));
-    return `⚠️ ${tidLabel} (${total} \u043f\u0438\u0441\u0435\u043c: ${trashPart}<strong>${inb} \u0432 <code>INBOX</code>!</strong>)
+    return `⚠️ ${tidLabel} (${total} msgs: ${trashPart}<strong>${inb} in <code>INBOX</code>!</strong>)
       <div class="cell-actions">
-        <button class="btn-sm btn-warn" onclick='archiveGmail("${esc(it.target_id)}", ${tidJson})'>📥 \u0423\u0431\u0440\u0430\u0442\u044c \u0438\u0437 Inbox</button>
+        <button class="btn-sm btn-warn" onclick='archiveGmail("${esc(it.target_id)}", ${tidJson})'>📥 Archive from Inbox</button>
       </div>`;
   }
   if (tr > 0) {
-    return `${tidLabel} (${tr} \u043f\u0438\u0441\u0435\u043c \u0432 <code>TRASH</code>)`;
+    const arch = Math.max(0, total - tr);
+    const archPart = arch > 0 ? `, ${arch} archived` : '';
+    return `${tidLabel} (${tr} in <code>TRASH</code>${archPart})`;
   }
-  return `${tidLabel} (${total} \u043f\u0438\u0441\u0435\u043c \u0432 \u0430\u0440\u0445\u0438\u0432\u0435)`;
+  return `${tidLabel} (${total} msgs archived)`;
 }
 
 async function archiveGmail(targetId, threadIds) {
@@ -1560,7 +1574,7 @@ async function archiveGmail(targetId, threadIds) {
 }
 
 async function finalizeChat(convId, targetId) {
-  if (!confirm(`\u0417\u0430\u043a\u0440\u044b\u0442\u044c (finalize «») \u0447\u0430\u0442 \u0434\u043b\u044f ${targetId}?`)) return;
+  if (!confirm(`Finalize («») chat for ${targetId}?`)) return;
   await fetch('/api/finalize', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -1575,14 +1589,14 @@ async function wakeChatForTriage(convId, itemKey, targetId) {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
       conversation_id: convId,
-      message: `[CL-WATCHER] \u041f\u0440\u043e\u0432\u0435\u0440\u044c \u0441\u0432\u0435\u0436\u0438\u0439 \u0441\u0442\u0430\u0442\u0443\u0441 ${itemKey}, \u0443\u0431\u0435\u0440\u0438 \u043f\u0438\u0441\u044c\u043c\u0430 \u043f\u043e ${targetId} \u0438\u0437 INBOX \u0438 \u043d\u0430\u043f\u0438\u0448\u0438, \u043d\u0443\u0436\u043d\u043e \u043b\u0438 \u043d\u0430\u0448\u0435 \u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0435.`
+      message: `[CL-WATCHER] Please check the latest status of ${itemKey}, archive any handled Gmail threads for ${targetId} from INBOX, and summarize what action is needed.`
     })
   });
-  alert(`\u041e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d \u0437\u0430\u043f\u0440\u043e\u0441 \u0432 \u0447\u0430\u0442 ${convId.slice(0, 8)}!`);
+  alert(`Sent wakeup request to chat ${convId.slice(0, 8)}!`);
 }
 
 async function triggerRefresh() {
-  document.getElementById('sync-status').textContent = '\u041e\u043f\u0440\u0430\u0448\u0438\u0432\u0430\u0435\u043c Gerrit, GitHub, Skia Gardener \u0438 Gmail...';
+  document.getElementById('sync-status').textContent = 'Polling Gerrit, GitHub, Skia Gardener, and Gmail...';
   await fetch('/api/refresh', {method: 'POST'});
   await fetchState();
 }
@@ -1595,8 +1609,8 @@ function renderTableRows(rows) {
       <td class="col-chat">
         <code>${esc(it.title)}</code> (<code>${shortCid}</code>)
         <div class="cell-actions">
-          <button class="btn-sm" onclick="wakeChatForTriage('${esc(it.conversation_id)}', '${esc(it.item_key)}', '${esc(it.target_id)}')">💬 \u0420\u0430\u0437\u0431\u0443\u0434\u0438\u0442\u044c \u0447\u0430\u0442</button>
-          <button class="btn-sm" onclick="finalizeChat('${esc(it.conversation_id)}', '${esc(it.target_id)}')">✓ \u0417\u0430\u043a\u0440\u044b\u0442\u044c («»)</button>
+          <button class="btn-sm" onclick="wakeChatForTriage('${esc(it.conversation_id)}', '${esc(it.item_key)}', '${esc(it.target_id)}')">💬 Wake Chat</button>
+          <button class="btn-sm" onclick="finalizeChat('${esc(it.conversation_id)}', '${esc(it.target_id)}')">✓ Finalize («»)</button>
         </div>
       </td>
       <td class="col-cl">${formatAuthorAndCl(it)}</td>
@@ -1611,12 +1625,12 @@ function renderFromCache() {
   if (!cachedData) return;
   const data = cachedData;
   document.getElementById('sync-status').textContent =
-    `\u041e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u043e: ${data.last_sync || '\u0441\u0435\u0439\u0447\u0430\u0441'} · \u0410\u0432\u0442\u043e-\u043e\u043f\u0440\u043e\u0441 \u043a\u0430\u0436\u0434\u044b\u0435 20 \u0441\u0435\u043a`;
+    `Last synced: ${data.last_sync || 'now'} · Auto-refresh every 20s`;
 
   // Render inline rollers summary bar
   const rsum = data.rollers_summary || {};
   document.getElementById('rollers-bar').innerHTML =
-    `<strong>\u0410\u0432\u0442\u043e\u0440\u043e\u043b\u043b\u0435\u0440\u044b Skia:</strong> ` +
+    `<strong>Skia Autorollers:</strong> ` +
     ['Android', 'Chrome', 'Google3', 'Flutter'].map(name => {
       const r = rsum[name] || {};
       const icon = (r.num_failed > 0) ? '🔴' : '🟢';
@@ -1670,7 +1684,7 @@ function renderFromCache() {
 
   // Render project tabs
   const tabsHtml = [
-    `<button class="${selectedProject === 'ALL' ? 'active-tab' : ''}" onclick="selectedProject='ALL'; renderFromCache();">\u0412\u0441\u0435 \u043f\u0440\u043e\u0435\u043a\u0442\u044b (${filteredItems.length})</button>`
+    `<button class="${selectedProject === 'ALL' ? 'active-tab' : ''}" onclick="selectedProject='ALL'; renderFromCache();">All Projects (${filteredItems.length})</button>`
   ].concat(projNames.map(pname => {
     const active = selectedProject === pname ? 'active-tab' : '';
     return `<button class="${active}" onclick="selectedProject='${esc(pname)}'; renderFromCache();">${esc(pname)} (${byProj[pname].length})</button>`;
@@ -1683,7 +1697,7 @@ function renderFromCache() {
 
   const container = document.getElementById('tables-container');
   if (projectsToRender.length === 0) {
-    container.innerHTML = `<p class="muted">\u041d\u0435\u0442 \u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0445 \u0447\u0430\u0442\u043e\u0432 \u043f\u043e \u0432\u044b\u0431\u0440\u0430\u043d\u043d\u043e\u043c\u0443 \u0444\u0438\u043b\u044c\u0442\u0440\u0443.</p>`;
+    container.innerHTML = `<p class="muted">No active chats match the current filter.</p>`;
     return;
   }
 
@@ -1691,16 +1705,16 @@ function renderFromCache() {
     const rows = byProj[pname] || [];
     return `
       <div class="section-title">
-        <span>\u041f\u0440\u043e\u0435\u043a\u0442 <code>${esc(pname)}</code> (${rows.length})</span>
+        <span>Project <code>${esc(pname)}</code> (${rows.length})</span>
       </div>
       <table class="md-table">
         <thead>
           <tr>
-            <th class="col-chat">\u0427\u0430\u0442 \u0432 <code>${esc(pname)}</code></th>
-            <th class="col-cl">\u0421\u041b / PR \u0438 \u0430\u0432\u0442\u043e\u0440</th>
-            <th class="col-gerrit">\u0421\u0442\u0430\u0442\u0443\u0441 \u0432 Gerrit / GitHub</th>
-            <th class="col-rolls">\u0421\u0442\u0430\u0442\u0443\u0441 <code>Skia Status</code> \u0438 4 \u0440\u043e\u043b\u043b\u043e\u0432</th>
-            <th class="col-gmail">\u0427\u0442\u043e \u0432 Gmail (<code>INBOX</code> vs <code>TRASH</code>)</th>
+            <th class="col-chat">Chat in <code>${esc(pname)}</code></th>
+            <th class="col-cl">CL / PR &amp; Author</th>
+            <th class="col-gerrit">Gerrit / GitHub Status</th>
+            <th class="col-rolls"><code>Skia Status</code> &amp; 4 Rolls</th>
+            <th class="col-gmail">Gmail (<code>INBOX</code> vs <code>TRASH</code>)</th>
           </tr>
         </thead>
         <tbody>
@@ -1729,7 +1743,7 @@ async function fetchState() {
     cachedData = await resp.json();
     renderFromCache();
   } catch (e) {
-    document.getElementById('sync-status').textContent = '\u041e\u0448\u0438\u0431\u043a\u0430 \u0441\u043e\u0435\u0434\u0438\u043d\u0435\u043d\u0438\u044f \u0441 \u0441\u0435\u0440\u0432\u0435\u0440\u043e\u043c — \u043f\u043e\u0432\u0442\u043e\u0440...';
+    document.getElementById('sync-status').textContent = 'Connection error — retrying...';
   }
 }
 
