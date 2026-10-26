@@ -1138,6 +1138,10 @@ def sync_once(
         "gmail": gstat,
         "composite_key": composite_key,
         "updated_at": now_et_str(),
+        "submitted_ts": (
+            parse_gerrit_or_iso_time(info.get("submitted") or "")
+            or datetime.fromtimestamp(0, timezone.utc)
+        ).timestamp(),
         # Sort key for rows in the same status group: newest review or submit event
         "activity_ts": max(
             (
@@ -1469,6 +1473,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     flex-wrap: wrap;
     gap: 6px;
   }
+  details.fold {
+    margin: -8px 0 16px 0;
+  }
+  details.fold > summary {
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 13px;
+    padding: 4px 0;
+  }
+  details.fold[open] > summary {
+    margin-bottom: 8px;
+  }
   .col-chat { width: 21%; }
   .col-cl { width: 25%; }
   .col-gerrit { width: 20%; }
@@ -1484,10 +1500,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="meta-line" id="sync-status">Syncing...</div>
   </div>
   <div class="toolbar">
-    <label style="font-size:12.5px; display:inline-flex; align-items:center; gap:5px; cursor:pointer; margin-right:6px;">
-      <input type="checkbox" id="hide-ready-cb" onchange="renderFromCache()">
-      Hide completed (🏁 all 4 rolls passed)
-    </label>
     <button id="notif-btn" onclick="enableNotifications()">🔔 Browser Alerts</button>
     <button onclick="testNotification()">🔊 Test Sound</button>
     <button onclick="toggleTheme()" id="theme-btn">🌙 Dark Theme</button>
@@ -1844,6 +1856,104 @@ async function triggerRefresh() {
   await fetchState();
 }
 
+// Merged CLs older than this are chats left open after the work ended
+const OLD_MERGED_DAYS = 3;
+const openFolds = new Set();
+const foldChats = {};
+
+// Splits rows so that only CLs that may still need attention stay in the open table
+function foldOf(it) {
+  if (sortRank(it) < 4) return 'main';
+  if (it.status === 'ABANDONED' || it.status === 'CLOSED') return 'abandoned';
+  const ageDays = (Date.now() / 1000 - (it.submitted_ts || 0)) / 86400;
+  return ageDays > OLD_MERGED_DAYS ? 'old' : 'merged';
+}
+
+function mergedIcon(it) {
+  const ps = it.post_submit;
+  if (!ps || ps.all_passed) return '🏁';
+  return ps.skia_status === '⚠️' ? '⚠️' : '🔄';
+}
+
+function toggleFold(key, isOpen) {
+  if (isOpen) openFolds.add(key);
+  else openFolds.delete(key);
+}
+
+async function finalizeFold(key) {
+  const chats = foldChats[key] || [];
+  if (chats.length === 0) return;
+  const list = chats.map(c => `  • ${c.title}`).join('\n');
+  if (!confirm(`Finalize («») ${chats.length} chat(s)?\n\n${list}`)) return;
+  await fetch('/api/finalize', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({conversation_ids: chats.map(c => c.cid)})
+  });
+  await fetchState();
+}
+
+function renderTable(pname, rows) {
+  return `
+      <table class="md-table">
+        <thead>
+          <tr>
+            <th class="col-chat">Chat in <code>${esc(pname)}</code></th>
+            <th class="col-cl">CL / PR &amp; Author</th>
+            <th class="col-gerrit">Gerrit / GitHub Status</th>
+            <th class="col-rolls"><code>Skia Status</code> &amp; 4 Rolls</th>
+            <th class="col-gmail">Gmail (<code>INBOX</code> vs <code>TRASH</code>)</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${renderTableRows(rows)}
+        </tbody>
+      </table>`;
+}
+
+// A collapsed group of rows; open state survives the 20 s re-render
+function renderFold(pname, kind, label, rows, withFinalize, activeCids) {
+  if (rows.length === 0) return '';
+  const key = `${pname}:${kind}`;
+  const chats = new Map();
+  // A chat that also tracks an open CL is still in use, so bulk finalize skips it
+  rows.filter(it => !activeCids.has(it.conversation_id))
+    .forEach(it => chats.set(it.conversation_id, it.title));
+  foldChats[key] = [...chats].map(([cid, title]) => ({cid, title}));
+  const btn = withFinalize && chats.size > 0
+    ? ` <button class="btn-sm" onclick="event.preventDefault(); ` +
+      `finalizeFold(${esc(JSON.stringify(key))})">✓ Finalize all (${chats.size})</button>`
+    : '';
+  const open = openFolds.has(key) ? 'open' : '';
+  return `<details class="fold" ${open} ` +
+    `ontoggle="toggleFold(${esc(JSON.stringify(key))}, this.open)">` +
+    `<summary>${label}${btn}</summary>${renderTable(pname, rows)}</details>`;
+}
+
+function renderProject(pname, rows) {
+  const groups = {main: [], merged: [], old: [], abandoned: []};
+  rows.forEach(it => groups[foldOf(it)].push(it));
+  const icons = {};
+  groups.merged.forEach(it => { const i = mergedIcon(it); icons[i] = (icons[i] || 0) + 1; });
+  const activeCids = new Set(groups.main.map(it => it.conversation_id));
+  const iconSummary = Object.entries(icons).map(([i, n]) => `${i}${n}`).join(' ');
+  const main = groups.main.length
+    ? renderTable(pname, groups.main)
+    : '<p class="muted">Nothing needs attention here.</p>';
+  return `
+      <div class="section-title">
+        <span>Project <code>${esc(pname)}</code> (${rows.length})</span>
+      </div>
+      ${main}
+      ${renderFold(pname, 'merged', `Merged · ${groups.merged.length} · ${iconSummary}`,
+        groups.merged, false, activeCids)}
+      ${renderFold(pname, 'old',
+        `OLD · merged more than ${OLD_MERGED_DAYS} days ago · ${groups.old.length}`,
+        groups.old, true, activeCids)}
+      ${renderFold(pname, 'abandoned', `Abandoned / closed · ${groups.abandoned.length}`,
+        groups.abandoned, true, activeCids)}`;
+}
+
 function renderTableRows(rows) {
   return rows.map(it => {
     const rowClass = (it.phase || '').startsWith('ALERT_') ? 'row-alert' : '';
@@ -1897,14 +2007,10 @@ function renderFromCache() {
 
   document.getElementById('total-count').textContent = allItems.length;
 
-  const hideReady = document.getElementById('hide-ready-cb').checked;
-  const filteredItems = hideReady
-    ? allItems.filter(it => it.phase !== 'READY_TO_CLOSE')
-    : allItems;
 
   // Group counts by project
   const byProj = {};
-  filteredItems.forEach(it => {
+  allItems.forEach(it => {
     const p = it.project_name || 'Unassigned';
     if (!byProj[p]) byProj[p] = [];
     byProj[p].push(it);
@@ -1929,7 +2035,9 @@ function renderFromCache() {
 
   // Render project tabs
   const tabsHtml = [
-    `<button class="${selectedProject === 'ALL' ? 'active-tab' : ''}" onclick="selectedProject='ALL'; renderFromCache();">All Projects (${filteredItems.length})</button>`
+    `<button class="${selectedProject === 'ALL' ? 'active-tab' : ''}" ` +
+      `onclick="selectedProject='ALL'; renderFromCache();">` +
+      `All Projects (${allItems.length})</button>`
   ].concat(projNames.map(pname => {
     const active = selectedProject === pname ? 'active-tab' : '';
     return `<button class="${active}" onclick="selectedProject='${esc(pname)}'; renderFromCache();">${esc(pname)} (${byProj[pname].length})</button>`;
@@ -1946,28 +2054,9 @@ function renderFromCache() {
     return;
   }
 
-  container.innerHTML = projectsToRender.map(pname => {
-    const rows = byProj[pname] || [];
-    return `
-      <div class="section-title">
-        <span>Project <code>${esc(pname)}</code> (${rows.length})</span>
-      </div>
-      <table class="md-table">
-        <thead>
-          <tr>
-            <th class="col-chat">Chat in <code>${esc(pname)}</code></th>
-            <th class="col-cl">CL / PR &amp; Author</th>
-            <th class="col-gerrit">Gerrit / GitHub Status</th>
-            <th class="col-rolls"><code>Skia Status</code> &amp; 4 Rolls</th>
-            <th class="col-gmail">Gmail (<code>INBOX</code> vs <code>TRASH</code>)</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${renderTableRows(rows)}
-        </tbody>
-      </table>
-    `;
-  }).join('');
+  container.innerHTML = projectsToRender
+    .map(pname => renderProject(pname, byProj[pname] || []))
+    .join('');
 
   // Fire browser notifications on new events
   const evList = data.events || [];
@@ -2063,9 +2152,16 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
       return
 
     if parsed.path == "/api/finalize":
-      cid = str(data.get("conversation_id") or "").strip()
-      if cid:
-        subprocess.run(
+      # Bulk sections send conversation_ids; one sync after the batch keeps a
+      # 15-chat cleanup from paying 15 full polls
+      cids = data.get("conversation_ids")
+      if not isinstance(cids, list):
+        cids = [data.get("conversation_id")]
+      finalized = []
+      for cid in dict.fromkeys(str(c or "").strip() for c in cids):
+        if not cid:
+          continue
+        res = subprocess.run(
             [
                 "python3",
                 os.path.join(HOOKS_DIR, "chat_lifecycle.py"),
@@ -2075,8 +2171,14 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
             check=False,
             timeout=10,
         )
+        if res.returncode == 0:
+          finalized.append(cid)
       state = sync_once(wake_chats=False, update_titles=False)
-      self._send_json({"ok": True, "count": len(state.get("items") or {})})
+      self._send_json({
+          "ok": True,
+          "finalized": finalized,
+          "count": len(state.get("items") or {}),
+      })
       return
 
     if parsed.path == "/api/wake":
