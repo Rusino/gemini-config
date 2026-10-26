@@ -15,12 +15,16 @@
   const TITLEBAR_WAIT_BTN_CLASS = 'jetski-titlebar-wait-btn';
   const ROW_BTN_CLASS = 'jetski-row-close-reopen-btn';
   const ROW_WAIT_BTN_CLASS = 'jetski-row-wait-btn';
+  // Right-side ⏳ badge rendered on open ⦿ rows waiting on background tasks or subagents
+  const ROW_BG_WAIT_INDICATOR_CLASS = 'jetski-row-bg-wait-indicator';
   const STYLE_ID = 'jetski-closed-chats-filter-style';
 
   // Lifecycle titles follow "[HH:MM] <marker> <Topic>" where marker encodes chain/wait state
   // The time prefix and the space after the marker are mandatory so a plain title opening
   // with a guillemet quote is never read as the finalized « marker
   const TITLE_MARKER_RE = /^\s*\[\d{1,2}:\d{2}\]\s*(‹✓›|«»|⏳|[✓⦿▸«»])(?:\s|$)/u;
+  // Matches the leading "[HH:MM] ⦿" prefix so background-waiting rows can display ⏳ in DOM
+  const ACTIVE_TO_WAITING_DISPLAY_RE = /^(\s*\[\d{1,2}:\d{2}\]\s*)⦿(\s|$)/u;
   const TIME_PREFIX_EXTRACT_RE = /^\s*\[(\d{1,2}:\d{2})\]/;
   const CONT_WORD = '(?:\\u043f\\u0440\\u043e\\u0434\\u043e\\u043b\\u0436\\u0435\\u043d\\u0438\\u0435|continue)';
   const TITLE_CLEANUP_RE = new RegExp(
@@ -187,6 +191,38 @@
       isChainPredecessorTitle(title) ||
       Boolean(cascadeId && chainPredecessorIds.has(cascadeId))
     );
+  }
+
+  // True when an open leaf ⦿ chat has finished its LLM turn and is waiting on a subagent or task
+  function isWaitingOnBackgroundWork(summary, fallbackTitle, cascadeId) {
+    // Summaries without Redux state cannot report background task activity
+    if (!summary) return false;
+    const title =
+      summary?.annotations?.title || summary?.summary || fallbackTitle || '';
+    // Only open leaf chats with ⦿ qualify; cron ⏳ chats already have a permanent marker
+    if (parseTitleMarker(title) !== OPEN_ACTIVE_MARKER) return false;
+    // Handed-off chain predecessors never show active background wait state
+    if (isChainPredecessor(cascadeId, title)) return false;
+    return (
+      summary.status !== 'CASCADE_RUN_STATUS_RUNNING' &&
+      Boolean(summary.notFullyIdle)
+    );
+  }
+
+  // Returns the underlying row title before any visual ⦿ -> ⏳ background-wait DOM substitution
+  function getRawDomTitle(rowEl) {
+    const linkEl = rowEl?.querySelector('a[aria-label]');
+    const spanEl = rowEl?.querySelector('span.truncate');
+    // Prefer the saved original title while a temporary ⏳ display swap is active on spanEl
+    if (spanEl?.hasAttribute('data-jetski-orig-title')) {
+      const curText = spanEl.textContent || '';
+      // If React re-rendered spanEl with a non-⏳ title, use the fresh text directly
+      if (curText && parseTitleMarker(curText) !== OPEN_WAITING_MARKER) {
+        return curText;
+      }
+      return spanEl.getAttribute('data-jetski-orig-title') || curText;
+    }
+    return linkEl?.getAttribute('aria-label') || spanEl?.textContent || '';
   }
 
   function getCurrentTimeStr() {
@@ -1086,6 +1122,20 @@
       .${ROW_WAIT_BTN_CLASS}[data-waiting="true"] {
         color: var(--primary, #8ab4f8);
       }
+      /* Style the right-side ⏳ indicator and hide false unread dots while waiting on tasks */
+      .${ROW_BG_WAIT_INDICATOR_CLASS} {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 12.5px;
+        line-height: 1;
+        flex-shrink: 0;
+        user-select: none;
+      }
+      [data-jetski-bg-waiting="true"] [data-testid="status-unread-dot"],
+      [data-jetski-bg-waiting="true"] .status-unread-dot {
+        display: none !important;
+      }
       #jetski-closed-chats-filter-bubble {
         position: fixed;
         z-index: 2147483647;
@@ -1211,9 +1261,8 @@
     let domHiddenCount = 0;
     for (const rowEl of rowEls) {
       const rowId = rowEl.getAttribute('data-sidebar-row-id') || '';
-      const linkEl = rowEl.querySelector('a[aria-label]');
-      const spanEl = rowEl.querySelector('span.truncate');
-      const title = linkEl?.getAttribute('aria-label') || spanEl?.textContent || '';
+      // Read the raw title so a temporary ⏳ display swap never alters bucket classification
+      const title = getRawDomTitle(rowEl);
       const bucket = classifyChatBucket(summariesMap[rowId], title, rowId);
       countBucket(domStats, bucket);
 
@@ -1754,27 +1803,116 @@
     }
   }
 
+  // Visually swaps ⦿ -> ⏳ in the row title and renders a right-side ⏳ badge while an open
+  // leaf chat is idle waiting on a background task or subagent, without touching .pbtxt
+  function syncRowBackgroundWaitUI(rowEl, cascadeId, summary, rawDomTitle) {
+    // Skip detached or unidentified row nodes
+    if (!rowEl || !cascadeId) return;
+    const curTitle =
+      summary?.annotations?.title || summary?.summary || rawDomTitle || '';
+    const waitingBg = isWaitingOnBackgroundWork(summary, curTitle, cascadeId);
+    const spanEl = rowEl.querySelector('span.truncate');
+
+    // Apply visual ⏳ swap and right-side indicator while background work is active
+    if (waitingBg) {
+      // Mark the row so CSS hides false unread blue dots while subagents run
+      if (rowEl.getAttribute('data-jetski-bg-waiting') !== 'true') {
+        rowEl.setAttribute('data-jetski-bg-waiting', 'true');
+      }
+      // Replace the leading ⦿ marker in the DOM title span while saving the original title
+      if (spanEl && ACTIVE_TO_WAITING_DISPLAY_RE.test(curTitle)) {
+        // Record the raw ⦿ title so bucket classification and restoration stay exact
+        if (spanEl.getAttribute('data-jetski-orig-title') !== curTitle) {
+          spanEl.setAttribute('data-jetski-orig-title', curTitle);
+        }
+        const displayTitle = curTitle.replace(
+          ACTIVE_TO_WAITING_DISPLAY_RE,
+          `$1${OPEN_WAITING_MARKER}$2`
+        );
+        // Guard textContent write to avoid redundant childList mutations
+        if (spanEl.textContent !== displayTitle) {
+          spanEl.textContent = displayTitle;
+        }
+      }
+      let badge = rowEl.querySelector(`.${ROW_BG_WAIT_INDICATOR_CLASS}`);
+      // Mount the right-side ⏳ badge once inside the row status cluster
+      if (!badge) {
+        badge = document.createElement('span');
+        badge.className = ROW_BG_WAIT_INDICATOR_CLASS;
+        badge.setAttribute('data-testid', 'jetski-row-bg-wait-indicator');
+        badge.setAttribute('title', 'Waiting on background task or subagent');
+        badge.setAttribute('aria-label', 'Waiting on background task or subagent');
+        badge.textContent = OPEN_WAITING_MARKER;
+        const anchorBtn =
+          rowEl.querySelector('[data-testid="conversation-pin-button"]') ||
+          rowEl.querySelector('[data-testid="conversation-archive-button"]');
+        const hoverBar = anchorBtn?.parentElement;
+        const statusWrapper = hoverBar?.parentElement;
+        const statusContainer =
+          statusWrapper && statusWrapper !== rowEl
+            ? Array.from(statusWrapper.children || []).find((c) => c !== hoverBar) ||
+              statusWrapper
+            : rowEl;
+        statusContainer.appendChild(badge);
+      }
+    } else {
+      // Clear the background-wait attribute once the chat is no longer waiting
+      if (rowEl.hasAttribute('data-jetski-bg-waiting')) {
+        rowEl.removeAttribute('data-jetski-bg-waiting');
+      }
+      // Restore the original ⦿ title text when leaving background-wait state
+      if (spanEl && spanEl.hasAttribute('data-jetski-orig-title')) {
+        const origTitle = spanEl.getAttribute('data-jetski-orig-title') || '';
+        spanEl.removeAttribute('data-jetski-orig-title');
+        const targetTitle = curTitle || origTitle;
+        // Only write textContent if it still differs from the restored title
+        if (targetTitle && spanEl.textContent !== targetTitle) {
+          spanEl.textContent = targetTitle;
+        }
+      }
+      const badge = rowEl.querySelector(`.${ROW_BG_WAIT_INDICATOR_CLASS}`);
+      // Remove the right-side ⏳ badge when background work finishes
+      if (badge) {
+        badge.remove();
+      }
+    }
+  }
+
   // Injects or updates the compact Wait and Close/Reopen buttons inside each sidebar row hover bar
   function ensureSidebarRowCloseButtons() {
+    // Read Redux summaries so each row can sync its live background-wait state
+    const store = findReduxStore();
+    const summariesMap = store?.getState()?.trajectorySummaries?.summaries || {};
     const rowEls = document.querySelectorAll(
       '[data-testid="conversation-row-sidebar"][data-cascade-id], div[data-sidebar-row-id]'
     );
     for (const rowEl of rowEls) {
+      // Skip outer virtualizer wrappers that already contain an inner conversation-row-sidebar
+      if (
+        rowEl.getAttribute('data-testid') !== 'conversation-row-sidebar' &&
+        rowEl.querySelector('[data-testid="conversation-row-sidebar"][data-cascade-id]')
+      ) {
+        continue;
+      }
       const cascadeId =
         rowEl.getAttribute('data-cascade-id') ||
         rowEl.getAttribute('data-sidebar-row-id');
       if (!cascadeId) continue;
+
+      // Sync the live ⏳ indicator before checking hover action buttons
+      const fallbackDomTitle = getRawDomTitle(rowEl);
+      syncRowBackgroundWaitUI(
+        rowEl,
+        cascadeId,
+        summariesMap[cascadeId],
+        fallbackDomTitle
+      );
 
       const anchorBtn =
         rowEl.querySelector('[data-testid="conversation-pin-button"]') ||
         rowEl.querySelector('[data-testid="conversation-archive-button"]');
       if (!anchorBtn || !anchorBtn.parentElement) continue;
       const hoverBar = anchorBtn.parentElement;
-
-      const linkEl = rowEl.querySelector('a[aria-label]');
-      const spanEl = rowEl.querySelector('span.truncate');
-      const fallbackDomTitle =
-        linkEl?.getAttribute('aria-label') || spanEl?.textContent || '';
 
       let waitBtn = hoverBar.querySelector(`.${ROW_WAIT_BTN_CLASS}`);
       if (!waitBtn) {
@@ -1784,10 +1922,8 @@
         waitBtn.setAttribute('data-testid', 'jetski-row-wait-btn');
         bindActionBtnHandlers(waitBtn, () => {
           const cid = waitBtn.getAttribute('data-cascade-id') || cascadeId;
-          const curLink = rowEl.querySelector('a[aria-label]');
-          const curSpan = rowEl.querySelector('span.truncate');
-          const domTitle =
-            curLink?.getAttribute('aria-label') || curSpan?.textContent || '';
+          // Read the raw title so clicking Wait uses the real marker rather than the DOM swap
+          const domTitle = getRawDomTitle(rowEl);
           if (cid) {
             void toggleConversationWaiting(cid, domTitle);
           }
@@ -1804,10 +1940,8 @@
         btn.setAttribute('data-testid', 'jetski-row-close-reopen-btn');
         bindActionBtnHandlers(btn, () => {
           const cid = btn.getAttribute('data-cascade-id') || cascadeId;
-          const curLink = rowEl.querySelector('a[aria-label]');
-          const curSpan = rowEl.querySelector('span.truncate');
-          const domTitle =
-            curLink?.getAttribute('aria-label') || curSpan?.textContent || '';
+          // Read the raw title so closing/reopening preserves the underlying topic text
+          const domTitle = getRawDomTitle(rowEl);
           if (cid) {
             void toggleConversationLifecycle(cid, domTitle);
           }
@@ -1841,6 +1975,7 @@
     const hasExternalMutation = mutations.some((m) => {
       const target = m.target;
       if (!target || typeof target !== 'object') return true;
+      // Ignore self-triggered mutations on injected filter controls and badges
       if (
         target.id === 'jetski-closed-chats-filter-bubble' ||
         target.id === STYLE_ID ||
@@ -1850,6 +1985,7 @@
         target.className === TITLEBAR_WAIT_BTN_CLASS ||
         target.className === ROW_BTN_CLASS ||
         target.className === ROW_WAIT_BTN_CLASS ||
+        target.className === ROW_BG_WAIT_INDICATOR_CLASS ||
         (typeof target.closest === 'function' &&
           (target.closest('#jetski-closed-chats-filter-bubble') ||
             target.closest(`.${BAR_CLASS}`) ||
@@ -1857,7 +1993,8 @@
             target.closest(`.${TITLEBAR_BTN_CLASS}`) ||
             target.closest(`.${TITLEBAR_WAIT_BTN_CLASS}`) ||
             target.closest(`.${ROW_BTN_CLASS}`) ||
-            target.closest(`.${ROW_WAIT_BTN_CLASS}`)))
+            target.closest(`.${ROW_WAIT_BTN_CLASS}`) ||
+            target.closest(`.${ROW_BG_WAIT_INDICATOR_CLASS}`)))
       ) {
         return false;
       }
@@ -1877,10 +2014,21 @@
 
   window.__jetskiClosedChatsFilterCleanup = () => {
     observer.disconnect();
+    // Remove all injected filter buttons and background-wait badges on reload
     for (const el of document.querySelectorAll(
-      `.${BAR_CLASS}, .${BUTTON_CLASS}, .${TITLEBAR_BTN_CLASS}, .${TITLEBAR_WAIT_BTN_CLASS}, .${ROW_BTN_CLASS}, .${ROW_WAIT_BTN_CLASS}`
+      `.${BAR_CLASS}, .${BUTTON_CLASS}, .${TITLEBAR_BTN_CLASS}, .${TITLEBAR_WAIT_BTN_CLASS}, .${ROW_BTN_CLASS}, .${ROW_WAIT_BTN_CLASS}, .${ROW_BG_WAIT_INDICATOR_CLASS}`
     )) {
       el.remove();
+    }
+    // Restore any row titles whose ⦿ marker was visually swapped to ⏳
+    for (const spanEl of document.querySelectorAll('span.truncate')) {
+      if (spanEl.hasAttribute('data-jetski-orig-title')) {
+        const origTitle = spanEl.getAttribute('data-jetski-orig-title') || '';
+        spanEl.removeAttribute('data-jetski-orig-title');
+        if (origTitle && spanEl.textContent !== origTitle) {
+          spanEl.textContent = origTitle;
+        }
+      }
     }
     const bubble = document.getElementById('jetski-closed-chats-filter-bubble');
     if (bubble) {

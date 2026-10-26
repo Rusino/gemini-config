@@ -279,6 +279,14 @@ class TestChatLifecycle(unittest.TestCase):
         ("глянь @[flutter/flutter | 150000:Fix text]", None),
         ("сделай 1402416 тестов", None),
         ("Just a normal conversation without entities", None),
+        # Quoted or pasted lifecycle titles must be stripped before entity extraction
+        (
+            "Вот чат [18:51] ⦿ cl/1405639 Issue #195102 fontconfig запустил агента и ждет",
+            None,
+        ),
+        ('Why is "[18:51] ⦿ cl/1405639 Issue #195102 fontconfig" waiting?', None),
+        ("Look at [18:51] ⦿ cl/1405639, please check cl/999999", "cl/999999"),
+        ("Compare `[18:51] ⦿ cl/1405639` with cl/888888", "cl/888888"),
     ]
     for prompt, expected in cases:
       with self.subTest(prompt=prompt):

@@ -1200,12 +1200,23 @@ _ENTITY_BUG_TEXT_RE = re.compile(r"(?:\b(?:bug|баг))\s*[:#\s]*(\d{6,10})\b", 
 _ENTITY_COMMIT_TEXT_RE = re.compile(
     r"(?:\b(?:commit|коммит|sha|rev|revision))\s*[:#\s]*([0-9a-f]{7,40})\b", re.IGNORECASE
 )
+# Matches quoted or pasted lifecycle chat titles like "[18:51] ⦿ cl/1405639 ..." so they
+# do not hijack new chat titles with foreign CL/PR numbers
+_PASTED_LIFECYCLE_TITLE_RE = re.compile(
+    r"[`\"'«“‘]?\s*\[\d{1,2}:\d{2}\]\s*(?:‹✓›|«»|⏳|[✓⦿▸«»])"
+    r"(?:[^`\"'»“”’\n\]]{0,60}?)(?:[`\"'»”’]|(?=[`\"'»“”’\],;\.!?\n\(\)]|\s+[\u0400-\u04ff]|"
+    r"\s+(?:and|with|vs\.?|versus|or|but|is|was|are|has|have|had|can|could|will|would|please|"
+    r"why|where|how|now)\b|\s*—|\s*-{2,}|\s*$))",
+    re.IGNORECASE,
+)
 
 
 def extract_entity_topic(text: str) -> str | None:
   """Extracts a canonical entity topic (e.g. 'cl/12345', 'PR #123') from prompt text."""
   if not text:
     return None
+  # Ignore quoted lifecycle chat titles so examples never hijack current topic
+  text = _PASTED_LIFECYCLE_TITLE_RE.sub(" ", text)
   m = _ENTITY_GERRIT_URL_RE.search(text)
   if m:
     return f"cl/{m.group(1)}"

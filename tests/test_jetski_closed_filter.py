@@ -710,6 +710,66 @@ assert.strictEqual(barsAfterReload.length, 1, 'Reloading script must not duplica
     true
   );
 
+  // Verify live ⏳ row indicator when an open ⦿ chat waits on a background task or subagent
+  const rowTitleSpan = new FakeElement('span');
+  rowTitleSpan.className = 'truncate';
+  rowTitleSpan.textContent = '[18:51] ⦿ cl/1405639 Issue #195102 fontconfig';
+  sidebarRow.insertBefore(rowTitleSpan, rowHoverBar);
+
+  reduxStore.dispatch({
+    type: 'trajectorySummaries/applyStreamBatch',
+    payload: {
+      updates: [
+        [
+          'solo-active',
+          makeSummary('[18:51] ⦿ cl/1405639 Issue #195102 fontconfig', 'proj-1', {}, false, {
+            status: 'CASCADE_RUN_STATUS_IDLE',
+            notFullyIdle: true,
+          }),
+        ],
+      ],
+      deletes: [],
+    },
+  });
+  while (rafCallbacks.length > 0) rafCallbacks.shift()();
+
+  assert.strictEqual(sidebarRow.getAttribute('data-jetski-bg-waiting'), 'true');
+  assert.strictEqual(rowTitleSpan.textContent, '[18:51] ⏳ cl/1405639 Issue #195102 fontconfig');
+  assert.strictEqual(
+    rowTitleSpan.getAttribute('data-jetski-orig-title'),
+    '[18:51] ⦿ cl/1405639 Issue #195102 fontconfig'
+  );
+  assert.strictEqual(
+    storeState.trajectorySummaries.summaries['solo-active'].summary,
+    '[18:51] ⦿ cl/1405639 Issue #195102 fontconfig'
+  );
+  const bgWaitBadge = sidebarRow.querySelector('.jetski-row-bg-wait-indicator');
+  assert(bgWaitBadge, 'Right-side ⏳ badge must be rendered while waiting on background work');
+  assert.strictEqual(bgWaitBadge.textContent, '⏳');
+
+  // Once background work finishes (notFullyIdle: false), restore ⦿ and remove the ⏳ badge
+  reduxStore.dispatch({
+    type: 'trajectorySummaries/applyStreamBatch',
+    payload: {
+      updates: [
+        [
+          'solo-active',
+          makeSummary('[18:51] ⦿ cl/1405639 Issue #195102 fontconfig', 'proj-1', {}, false, {
+            status: 'CASCADE_RUN_STATUS_IDLE',
+            notFullyIdle: false,
+          }),
+        ],
+      ],
+      deletes: [],
+    },
+  });
+  while (rafCallbacks.length > 0) rafCallbacks.shift()();
+
+  assert.strictEqual(sidebarRow.hasAttribute('data-jetski-bg-waiting'), false);
+  assert.strictEqual(rowTitleSpan.textContent, '[18:51] ⦿ cl/1405639 Issue #195102 fontconfig');
+  assert.strictEqual(rowTitleSpan.hasAttribute('data-jetski-orig-title'), false);
+  assert.strictEqual(sidebarRow.querySelector('.jetski-row-bg-wait-indicator'), null);
+
   console.log('ALL_JS_ASSERTIONS_PASSED');
 })().catch((err) => {
   console.error(err);
