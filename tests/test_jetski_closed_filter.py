@@ -734,19 +734,14 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(titlebarWaitBtn.style.display, '');
 
   const rowWaitBtn = rowHoverBar.querySelector('.jetski-row-wait-btn');
-  const rowBtn = rowHoverBar.querySelector('.jetski-row-archive-btn');
-  assert(rowWaitBtn, 'Sidebar row Wait button must be injected before Archive button');
-  assert(rowBtn, 'Sidebar row Archive button must be injected before pin button');
+  assert(rowWaitBtn, 'Sidebar row Wait button must be injected before the native buttons');
   assert.strictEqual(rowHoverBar.children[0], rowWaitBtn);
-  assert.strictEqual(rowHoverBar.children[1], rowBtn);
-  assert.strictEqual(rowBtn.getAttribute('data-testid'), 'jetski-row-archive-btn');
-  assert.strictEqual(rowBtn.getAttribute('aria-label'), 'Archive chat');
-  assert.strictEqual(rowBtn.getAttribute('data-archived'), 'false');
+  assert(!rowHoverBar.querySelector('.jetski-row-archive-btn'), 'Rows keep only native Archive');
   assert.strictEqual(rowWaitBtn.style.display, '');
 
   // Mutations inside injected action buttons must not schedule a sync loop
   rafCallbacks = [];
-  observerCallback([{ target: titlebarBtn }, { target: rowBtn }]);
+  observerCallback([{ target: titlebarBtn }, { target: rowWaitBtn }]);
   assert.strictEqual(rafCallbacks.length, 0);
 
   const advanceClock = () => {
@@ -769,48 +764,6 @@ const liveBucketBtn = (k) =>
     mergeAnnotations: true,
   });
 
-  // Clicking the sidebar row Archive button archives exactly that chat, keeping its title
-  rpcRequests.length = 0;
-  rowBtn.dispatchEvent('pointerdown', { button: 0 });
-  await new Promise((r) => setTimeout(r, 10));
-  assert.strictEqual(summaryOf('solo-active').annotations.archived, true);
-  assert.strictEqual(summaryOf('solo-active').summary, '[10:00] ⏳ Active solo task');
-  assert.strictEqual(rpcRequests.length, 1);
-  assert.strictEqual(
-    rpcRequests[0].url,
-    '/exa.language_server_pb.LanguageServerService/UpdateConversationAnnotations'
-  );
-  assert.deepStrictEqual(rpcRequests[0].body, {
-    cascadeIds: ['solo-active'],
-    annotations: { archived: true },
-    mergeAnnotations: true,
-  });
-  assert.strictEqual(rpcRequests[0].headers['x-codeium-csrf-token'], 'test-csrf-token');
-  assert.strictEqual(rowBtn.getAttribute('aria-label'), 'Unarchive chat');
-  assert.strictEqual(rowBtn.getAttribute('data-archived'), 'true');
-  assert.strictEqual(rowWaitBtn.style.display, 'none');
-  assert.strictEqual(liveBucketBtn('waiting').getAttribute('aria-label'), '⏳ Waiting: 3 (hidden)');
-  assertHidden(['solo-active'], false);
-
-  // Unarchive sends archived:false and brings the chat back into its bucket
-  rpcRequests.length = 0;
-  advanceClock();
-  rowBtn.dispatchEvent('pointerdown', { button: 0 });
-  await new Promise((r) => setTimeout(r, 10));
-  assert.strictEqual(summaryOf('solo-active').annotations.archived, false);
-  assert.strictEqual(rpcRequests.length, 1);
-  assert.deepStrictEqual(rpcRequests[0].body, {
-    cascadeIds: ['solo-active'],
-    annotations: { archived: false },
-    mergeAnnotations: true,
-  });
-  assert.strictEqual(rpcRequests[0].headers['x-codeium-csrf-token'], 'test-csrf-token');
-  assert.strictEqual(rowBtn.getAttribute('aria-label'), 'Archive chat');
-  assert.strictEqual(rowBtn.getAttribute('data-archived'), 'false');
-  assert.strictEqual(rowWaitBtn.style.display, '');
-  assert.strictEqual(liveBucketBtn('waiting').getAttribute('aria-label'), '⏳ Waiting: 4 (hidden)');
-  assertHidden(['solo-active'], true);
-
   // The titlebar Archive button on a chain tail archives only that chat: no chain walk, no
   // retitling of the already archived pieces
   rpcRequests.length = 0;
@@ -823,6 +776,11 @@ const liveBucketBtn = (k) =>
     annotations: { archived: true },
     mergeAnnotations: true,
   });
+  assert.strictEqual(
+    rpcRequests[0].url,
+    '/exa.language_server_pb.LanguageServerService/UpdateConversationAnnotations'
+  );
+  assert.strictEqual(rpcRequests[0].headers['x-codeium-csrf-token'], 'test-csrf-token');
   assert.strictEqual(summaryOf('open-current').annotations.archived, true);
   assert.strictEqual(summaryOf('open-current').summary, '[10:05] ⦿ Open chain topic');
   assert.strictEqual(summaryOf('open-root').summary, '[09:00] ⦿ Open chain topic');

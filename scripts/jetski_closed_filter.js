@@ -13,7 +13,6 @@
   const BUTTON_CLASS = 'jetski-closed-chats-filter-btn';
   const TITLEBAR_BTN_CLASS = 'jetski-titlebar-archive-btn';
   const TITLEBAR_WAIT_BTN_CLASS = 'jetski-titlebar-wait-btn';
-  const ROW_BTN_CLASS = 'jetski-row-archive-btn';
   const ROW_WAIT_BTN_CLASS = 'jetski-row-wait-btn';
   // Right-side ⏳ badge rendered on open ⦿ rows waiting on background tasks or subagents
   const ROW_BG_WAIT_INDICATOR_CLASS = 'jetski-row-bg-wait-indicator';
@@ -941,7 +940,6 @@
         border-color: color-mix(in srgb, var(--primary, #8ab4f8) 36%, transparent);
         color: var(--primary, #8ab4f8);
       }
-      .${ROW_BTN_CLASS},
       .${ROW_WAIT_BTN_CLASS} {
         display: inline-flex;
         align-items: center;
@@ -962,16 +960,13 @@
         flex-shrink: 0;
         transition: background-color 120ms ease, color 120ms ease;
       }
-      .${ROW_BTN_CLASS} > *,
       .${ROW_WAIT_BTN_CLASS} > * {
         pointer-events: none;
       }
-      .${ROW_BTN_CLASS}:hover,
       .${ROW_WAIT_BTN_CLASS}:hover {
         background: var(--sidebar-secondary, rgba(128, 134, 139, 0.22));
         color: var(--foreground, #e8eaed);
       }
-      .${ROW_BTN_CLASS}[data-archived="true"],
       .${ROW_WAIT_BTN_CLASS}[data-waiting="true"] {
         color: var(--primary, #8ab4f8);
       }
@@ -2111,28 +2106,6 @@
     }
   }
 
-  // Syncs the compact sidebar row archive button icon and tooltip with the chat annotations
-  function updateRowArchiveButtonUI(btn, cascadeId) {
-    if (!btn || !cascadeId) return;
-    btn.setAttribute('data-cascade-id', cascadeId);
-    const archived = isArchivedCascadeId(cascadeId);
-    const archStr = archived ? 'true' : 'false';
-    if (btn.getAttribute('data-archived') !== archStr) {
-      btn.setAttribute('data-archived', archStr);
-    }
-    const label = archived ? 'Unarchive chat' : 'Archive chat';
-    if (btn.getAttribute('aria-label') !== label) {
-      btn.setAttribute('aria-label', label);
-    }
-    if (btn.getAttribute('title') !== label) {
-      btn.setAttribute('title', label);
-    }
-    const nextHtml = archived ? '<span>⦿</span>' : '<span>🗄</span>';
-    if (btn.innerHTML !== nextHtml) {
-      btn.innerHTML = nextHtml;
-    }
-  }
-
   // Visually swaps ⦿ -> ⏳ in the row title and renders a right-side ⏳ badge while an open
   // leaf chat is idle waiting on a background task or subagent, without touching .pbtxt
   function syncRowBackgroundWaitUI(rowEl, cascadeId, summary, rawDomTitle) {
@@ -2208,7 +2181,8 @@
     }
   }
 
-  // Injects or updates the compact Wait and Archive buttons inside each sidebar row hover bar
+  // Injects or updates the compact Wait button inside each sidebar row hover bar; archiving
+  // stays with the native row button
   function ensureSidebarRowButtons() {
     // Read Redux summaries so each row can sync its live background-wait state
     const store = findReduxStore();
@@ -2261,22 +2235,6 @@
         hoverBar.insertBefore(waitBtn, anchorBtn);
       }
       updateRowWaitButtonUI(waitBtn, cascadeId, fallbackDomTitle);
-
-      let btn = hoverBar.querySelector(`.${ROW_BTN_CLASS}`);
-      if (!btn) {
-        btn = document.createElement('button');
-        btn.className = ROW_BTN_CLASS;
-        btn.type = 'button';
-        btn.setAttribute('data-testid', 'jetski-row-archive-btn');
-        bindActionBtnHandlers(btn, () => {
-          const cid = btn.getAttribute('data-cascade-id') || cascadeId;
-          if (cid) {
-            void toggleConversationArchived(cid);
-          }
-        });
-        hoverBar.insertBefore(btn, anchorBtn);
-      }
-      updateRowArchiveButtonUI(btn, cascadeId);
     }
   }
 
@@ -2314,7 +2272,6 @@
         target.className === BUTTON_CLASS ||
         target.className === TITLEBAR_BTN_CLASS ||
         target.className === TITLEBAR_WAIT_BTN_CLASS ||
-        target.className === ROW_BTN_CLASS ||
         target.className === ROW_WAIT_BTN_CLASS ||
         target.className === ROW_BG_WAIT_INDICATOR_CLASS ||
         target.className === PROJECT_ROADMAP_BADGE_CLASS ||
@@ -2325,7 +2282,6 @@
             target.closest(`.${BUTTON_CLASS}`) ||
             target.closest(`.${TITLEBAR_BTN_CLASS}`) ||
             target.closest(`.${TITLEBAR_WAIT_BTN_CLASS}`) ||
-            target.closest(`.${ROW_BTN_CLASS}`) ||
             target.closest(`.${ROW_WAIT_BTN_CLASS}`) ||
             target.closest(`.${ROW_BG_WAIT_INDICATOR_CLASS}`) ||
             target.closest(`.${PROJECT_ROADMAP_BADGE_CLASS}`) ||
@@ -2369,7 +2325,6 @@
       `.${BUTTON_CLASS}`,
       `.${TITLEBAR_BTN_CLASS}`,
       `.${TITLEBAR_WAIT_BTN_CLASS}`,
-      `.${ROW_BTN_CLASS}`,
       `.${ROW_WAIT_BTN_CLASS}`,
       `.${ROW_BG_WAIT_INDICATOR_CLASS}`,
       `.${PROJECT_ROADMAP_BADGE_CLASS}`,
