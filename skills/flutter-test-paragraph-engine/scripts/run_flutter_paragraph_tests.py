@@ -92,6 +92,15 @@ def compute_skia_source_tree_sha256(skia_repo: pathlib.Path) -> tuple[str, int]:
     return h.hexdigest()[:12], file_count
 
 
+# Query uncommitted modifications so foreign test or engine edits cannot pollute clean runs
+def list_dirty_files(repo: pathlib.Path, ignore_submodules: bool = False) -> list[str]:
+    cmd = ["git", "-C", str(repo), "status", "--porcelain"]
+    if ignore_submodules:
+        cmd.append("--ignore-submodules=all")
+    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
+
+
 def compute_git_metadata(repo: pathlib.Path, ref: str) -> dict[str, Any]:
     commit_target = "HEAD" if ref == "WORKTREE" else ref
     git_sha = (
@@ -112,13 +121,7 @@ def compute_git_metadata(repo: pathlib.Path, ref: str) -> dict[str, Any]:
     )
     dirty_files: list[str] = []
     if ref == "WORKTREE":
-        diff_names = subprocess.run(
-            ["git", "-C", str(repo), "status", "--porcelain"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.splitlines()
-        dirty_files = [ln.strip() for ln in diff_names if ln.strip()]
+        dirty_files = list_dirty_files(repo)
 
     return {
         "ref": ref,
@@ -584,6 +587,16 @@ def main() -> int:
         action="store_true",
         help="Run even if the Skia submodule HEAD differs from skia_revision in Flutter DEPS",
     )
+    ap.add_argument(
+        "--allow-dirty-flutter",
+        action="store_true",
+        help="Run even if the outer Flutter repository has uncommitted changes",
+    )
+    ap.add_argument(
+        "--allow-dirty-skia",
+        action="store_true",
+        help="Allow uncommitted Skia submodule changes even when no target uses WORKTREE",
+    )
     args = ap.parse_args()
 
     repo = pathlib.Path(args.repo).resolve()
@@ -606,6 +619,32 @@ def main() -> int:
         text=True,
         check=True,
     ).stdout.strip()
+
+    # Uncommitted Flutter framework or txt test edits pollute clean Skia runs with false failures
+    flutter_dirty_files = list_dirty_files(repo, ignore_submodules=True)
+    if flutter_dirty_files and not args.allow_dirty_flutter:
+        preview = ", ".join(flutter_dirty_files[:5])
+        raise RuntimeError(
+            f"Flutter repository {repo} has {len(flutter_dirty_files)} uncommitted file(s) "
+            f"({preview}). Uncommitted Flutter tests or engine edits pollute Skia test runs; "
+            "commit, stash, or revert them first, or pass --allow-dirty-flutter if testing "
+            "uncommitted Flutter changes intentionally."
+        )
+
+    # Reject leftover Skia submodule edits when no target requests WORKTREE so stale patches
+    # are not silently stashed and re-applied across unrelated ext: or HEAD runs
+    uses_worktree = any(
+        pair.split("=", 1)[-1].rsplit("@", 1)[0] == "WORKTREE" for pair in args.targets
+    )
+    skia_dirty_files = list_dirty_files(skia_repo)
+    if skia_dirty_files and not uses_worktree and not args.allow_dirty_skia:
+        preview = ", ".join(skia_dirty_files[:5])
+        raise RuntimeError(
+            f"Skia submodule {skia_repo} has {len(skia_dirty_files)} uncommitted file(s) "
+            f"({preview}), but no target uses WORKTREE. Commit, stash, or revert submodule "
+            "edits before testing clean/ext refs, or pass --allow-dirty-skia to temporarily "
+            "stash and restore them."
+        )
 
     # `baseline=HEAD`, `ext:` and `WORKTREE` all build on the submodule HEAD; after a Flutter
     # update without `gclient sync -D` that HEAD is a stale or foreign Skia and the run lies
@@ -721,6 +760,7 @@ def main() -> int:
                 "deps_skia_revision": deps_skia_revision,
                 "skia_base_head": skia_base_head,
                 "skia_base_matches_deps": skia_base_matches_deps,
+                "flutter_dirty_files": flutter_dirty_files,
             }
             attestation.update(git_meta)
             attestation["ref"] = raw_ref

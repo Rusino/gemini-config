@@ -93,6 +93,8 @@ python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutte
 - `--skip-cpp` — Skip C++ smoke tests (`txt_unittests`, `ui_unittests`).
 - `--resume` — Skip re-running refs whose `attestation.json` and `summary.json` already exist.
 - `--allow-skia-base-mismatch` — Run even though the Skia submodule `HEAD` differs from `skia_revision` in Flutter `DEPS` (recorded as `skia_base_matches_deps: false` in `attestation.json`); without it the script aborts before touching anything.
+- `--allow-dirty-flutter` — Run even if the outer Flutter repository has uncommitted changes (recorded as `flutter_dirty_files` in `attestation.json` and flagged by the Integrity Check); without it the script aborts so leftover Flutter test/engine edits cannot pollute clean Skia runs.
+- `--allow-dirty-skia` — Allow uncommitted changes in the Skia submodule even when no target uses `WORKTREE` (stashes and restores them via `worktree_skia.patch`).
 
 ---
 

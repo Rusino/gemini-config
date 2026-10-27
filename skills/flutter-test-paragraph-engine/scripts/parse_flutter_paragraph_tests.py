@@ -258,13 +258,21 @@ def _evaluate_attestation(runs: list[tuple[str, dict[str, Any]]]) -> tuple[list[
         ref_spec = att.get("ref") or run.get("ref_spec") or "—"
         git_sha = att.get("git_sha")
         dirty_files = att.get("dirty_files") or []
+        flutter_dirty = att.get("flutter_dirty_files") or []
         if git_sha:
             git_col = f"`{ref_spec}` (`{git_sha}`"
             if dirty_files:
                 git_col += f" + `{len(dirty_files)} dirty`"
+            if flutter_dirty:
+                git_col += f" + `{len(flutter_dirty)} flutter-dirty`"
             git_col += ")"
         else:
             git_col = f"`{ref_spec}`"
+        # Flag uncommitted outer Flutter edits so dirty test files cannot pass as a clean baseline
+        if flutter_dirty:
+            issues.append(
+                f"`{label}` ran with `{len(flutter_dirty)}` uncommitted file(s) in Flutter repo"
+            )
 
         unicode_backend = att.get("unicode_backend") or "—"
         requested_unicode = att.get("requested_unicode") or "keep"
