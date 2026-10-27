@@ -13,12 +13,13 @@ description: >-
 This skill provides the automated and end-to-end workflow for compiling custom Skia/SkParagraph changes within the local Flutter engine and running all relevant Flutter framework text tests with a tamper-evident **Паспорт прогона (Run Attestation)** and automated **Integrity Check (Вердикт целостности)**.
 
 ## Contents
-- [Repository Paths & Structure](#repository-paths--structure)
+- [Repository Paths & Structure](#repository-paths-structure-auto-detected-on-linux-jetski-cloud-macos)
 - [Automated Scripts](#automated-scripts)
 - [How to Run](#how-to-run)
-- [Inspecting Results & Run Attestation](#inspecting-results--run-attestation)
+- [Inspecting Results & Run Attestation](#inspecting-results-run-attestation)
+- [Model Routing (Cost & Context Hygiene)](#model-routing-cost-context-hygiene)
 - [Mandatory Reporting Rule](#mandatory-reporting-rule)
-- [Common Pitfalls & Gotchas](#common-pitfalls--gotchas)
+- [Common Pitfalls & Gotchas](#common-pitfalls-gotchas)
 
 ---
 
@@ -111,6 +112,13 @@ After the run finishes:
    - `ninja.log` — raw compilation output.
    - `txt_unittests.log`, `ui_unittests.log` — C++ smoke test logs.
    - `batch1.log`, `batch2.log`, `batch3.log` — Dart framework test logs.
+
+---
+
+## Model Routing (Cost & Context Hygiene)
+
+- **Direct runs in Plan Mode**: Do not execute [`run_flutter_paragraph_tests.py`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py) on the planning model. Immediately call `exit_plan_mode` with the exact command line, a strict ban on adding `--allow-dirty-flutter`, `--allow-dirty-skia`, `--allow-skia-base-mismatch`, `--skip-build`, or `--skip-cpp` unless explicitly requested by the user, and instructions to output `<out>/compare.md` verbatim without truncation (`Re-plan if:` pre-flight/build fails, Integrity Check is `WARNING / INVALID`, or regressions appear).
+- **In-workflow runs & failure triage (including `amnesia-precommit` Corpus Gate)**: Delegate the script execution and any failure extraction from `ninja.log`, `txt_unittests.log`, `ui_unittests.log`, `batch*.log`, and `shards/shard_*.log` to `invoke_subagent(TypeName="self", Model="flash")` so multi-thousand-line build and test logs stay out of the main context window.
 
 ---
 

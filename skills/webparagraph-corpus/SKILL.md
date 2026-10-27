@@ -74,6 +74,11 @@ python3 ~/.gemini/config/skills/webparagraph-corpus/scripts/run_webparagraph_cor
 - `--skip-analyze` — Skip `dart analyze --fatal-infos` in Part 1.
 - `--repo <path>` — Path to the Flutter checkout (defaults to `/usr/local/google/home/jlavrova/.gemini/jetski/scratch/flutter`).
 
+## Model Routing (Cost & Context Hygiene)
+
+- **Direct runs in Plan Mode**: Do not execute [`run_webparagraph_corpus.py`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/webparagraph-corpus/scripts/run_webparagraph_corpus.py) on the planning model. Immediately call `exit_plan_mode` with the exact command line, a strict ban on adding `--skip-analyze` or `--no-force-test-fonts` unless explicitly requested by the user, and instructions to output `<out>/compare.md` verbatim without truncation (`Re-plan if:` `dart analyze`/build fails, Integrity Check is `WARNING / INVALID`, or regressions appear).
+- **In-workflow runs & failure triage (including `amnesia-precommit` Corpus Gate)**: Delegate the script execution and any failure extraction from `analyze.log`, `felt.log`, and `flutter.log` to `invoke_subagent(TypeName="self", Model="flash")` so raw compiler and browser test logs stay out of the main context window.
+
 ## Inspecting Results & Run Attestation
 
 After the run finishes:

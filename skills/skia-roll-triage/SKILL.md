@@ -28,6 +28,10 @@ target, and for each non-flaky target the best error line across all of its
 action logs (a compiler `error:` beats `DISTRIBUTOR(...)`) and pending CLs
 touching the failing file or package.
 
+### Model Routing
+
+When triggered in Plan Mode, do not run `go run . -triage-google3` on the planning model. Immediately call `exit_plan_mode` with the exact command (`cd /usr/local/google/home/jlavrova/.gemini/jetski/scratch/skia_gardener && go run . -triage-google3`) so the execution model runs it and outputs the Markdown report verbatim (`Re-plan if:` the verdict is `SKIA_REGRESSION` or a failing dependent target cites Skia symbols and requires bisecting or source inspection).
+
 ## Reading the verdict
 
 | Verdict | Meaning | What to do |

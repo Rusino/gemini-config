@@ -80,6 +80,13 @@ python3 ~/.gemini/config/skills/skia-test-paragraph/scripts/run_skparagraph_test
 
 ---
 
+## Model Routing (Cost & Context Hygiene)
+
+- **Direct runs in Plan Mode**: Do not execute [`run_skparagraph_tests.py`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/skia-test-paragraph/scripts/run_skparagraph_tests.py) on the planning model. Immediately call `exit_plan_mode` with the exact command line, a ban on unrequested `--skip-build`, and instructions to output `<out>/compare.md` verbatim without truncation (`Re-plan if:` compilation/pre-flight fails, Integrity Check is `WARNING / INVALID`, or regressions appear).
+- **In-workflow runs & failure triage**: When invoked inside a multi-step coding or audit workflow, delegate the script execution and any failure extraction from `<out>/<label>/` logs to `invoke_subagent(TypeName="self", Model="flash")` so raw `ninja` and `dm` output stays out of the main context window.
+
+---
+
 ## Mandatory Reporting Rule
 
 Whenever presenting test results to the user, the agent **must** include both:
