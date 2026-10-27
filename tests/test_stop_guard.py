@@ -710,6 +710,7 @@ class TestStopGuard(unittest.TestCase):
       # Once the scheduled task ends or is killed and fullyIdle becomes True,
       # stop_guard restores the auto-promoted chat back to ⦿ (waiting=False)
       data["fullyIdle"] = True
+      data["terminationReason"] = "NO_TOOL_CALL"
       with patch("sys.stdin", io.StringIO(json.dumps(data))), patch(
           "sys.stdout", new_callable=io.StringIO
       ) as mock_out, patch(
@@ -720,6 +721,75 @@ class TestStopGuard(unittest.TestCase):
         mock_wait.assert_called_once_with(
             "12345678-1234-1234-1234-123456789abc", waiting=False
         )
+
+  def test_duration_seconds_schedule_does_not_promote_to_waiting(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      transcript = os.path.join(tmp_dir, "transcript.jsonl")
+      steps = [
+          {
+              "step_index": 1,
+              "type": "USER_INPUT",
+              "content": "<USER_REQUEST>wait 60s</USER_REQUEST>",
+          },
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "schedule",
+                  "args": {"DurationSeconds": 60, "TimerCondition": "task-1", "Prompt": "tick"},
+              }],
+          },
+      ]
+      with open(transcript, "w", encoding="utf-8") as f:
+        for s in steps:
+          f.write(json.dumps(s) + "\n")
+      data = {
+          "conversationId": "12345678-1234-1234-1234-123456789abc",
+          "transcriptPath": transcript,
+          "artifactDirectoryPath": tmp_dir,
+          "fullyIdle": False,
+          "terminationReason": "NO_TOOL_CALL",
+      }
+      with patch("sys.stdin", io.StringIO(json.dumps(data))), patch(
+          "sys.stdout", new_callable=io.StringIO
+      ) as mock_out, patch(
+          "chat_lifecycle.set_conversation_wait_state"
+      ) as mock_wait:
+        stop_guard.main()
+        self.assertEqual(json.loads(mock_out.getvalue()), {})
+        mock_wait.assert_not_called()
+
+  def test_termination_reason_no_tool_call_runs_verification_guard(self):
+    fake_src = "/workspace/project/feature.py"
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl") as f_trans, \
+         tempfile.TemporaryDirectory() as tmp_dir:
+      steps = [
+          {"step_index": 1, "type": "USER_INPUT", "content": "Please implement feature"},
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "write_file",
+                  "args": {"Path": fake_src, "Content": "x = 1"},
+              }],
+          },
+      ]
+      for s in steps:
+        f_trans.write(json.dumps(s) + "\n")
+      f_trans.flush()
+      data = {
+          "conversationId": "c1",
+          "transcriptPath": f_trans.name,
+          "artifactDirectoryPath": tmp_dir,
+          "fullyIdle": True,
+          "terminationReason": "NO_TOOL_CALL",
+      }
+      with patch("sys.stdin", io.StringIO(json.dumps(data))), \
+           patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+        stop_guard.main()
+      res = json.loads(mock_out.getvalue())
+      self.assertEqual(res.get("decision"), "continue")
+      self.assertIn("[VERIFICATION GUARD]", res.get("reason", ""))
 
 
 if __name__ == "__main__":

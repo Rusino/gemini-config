@@ -1000,7 +1000,9 @@ def detect_schedule_state_in_turn(
     if stype == "PLANNER_RESPONSE":
       for tc in step.get("tool_calls") or []:
         tname = tc.get("name", "")
-        if tname == "schedule":
+        # Only recurring cron schedules promote the title marker to ⏳;
+        # one-shot duration timers are in-turn waits handled by notFullyIdle
+        if tname == "schedule" and bool((tc.get("args") or {}).get("CronExpression")):
           active = True
           killed = False
         elif (

@@ -34,6 +34,8 @@ _CURRENT_CONV_ID = ""
 # Tool results may indent this line (e.g. "\n\n\t\t\t\tThe command exited ..." on
 # macOS Jetski), so allow leading whitespace.
 EXIT_CODE_RE = re.compile(r"^\s*The command exited with code (\d+)\.", re.MULTILINE)
+# Recurring cron ticks emit an iteration marker in their wakeup system message
+CRON_WAKEUP_RE = re.compile(r"\(iteration\s+\d+\)")
 
 # Read-only inspection commands neither verify an edit (a `git diff` exiting 0 is
 # not a build/test) nor indicate a broken build (`grep`/`rg`/`git grep` exit 1
@@ -517,7 +519,9 @@ def analyze_current_turn(transcript_path: str) -> dict:
       for tc in tool_calls:
         tname = tc.get("name", "")
         targs = tc.get("args") or {}
-        if tname == "schedule":
+        # Only recurring cron schedules promote the title marker to ⏳;
+        # one-shot duration timers are in-turn waits handled by notFullyIdle
+        if tname == "schedule" and bool(targs.get("CronExpression")):
           scheduled_timer = True
         elif (
             tname == "manage_task"
@@ -563,6 +567,11 @@ def analyze_current_turn(transcript_path: str) -> dict:
         ):
           launched_new_conv = True
 
+    # Keep cron chats marked as scheduled across recurring wakeup ticks
+    elif stype == "SYSTEM_MESSAGE":
+      if CRON_WAKEUP_RE.search(str(step.get("content", ""))):
+        scheduled_timer = True
+
   return {
       "last_code_edit_idx": last_code_edit_idx,
       "last_edited_file": last_edited_file,
@@ -589,7 +598,8 @@ def main() -> None:
     return
 
   term_reason = str(data.get("terminationReason", "")).upper()
-  if term_reason and term_reason != "MODEL_STOP":
+  # Jetski's Go runtime passes NO_TOOL_CALL on normal turn completion
+  if term_reason not in ("", "MODEL_STOP", "NO_TOOL_CALL"):
     print("{}")
     return
 

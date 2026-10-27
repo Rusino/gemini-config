@@ -559,6 +559,27 @@ class TestContextGuard(unittest.TestCase):
       self.run_guard(inv=1, lastUserInput="poll every 5m")
       mock_wait.assert_called_once_with("c1", waiting=False)
 
+  def test_preinvocation_ignores_duration_seconds_schedule(self):
+    self.write_transcript(
+        {"type": "USER_INPUT", "content": "wait 60s"},
+        {
+            "type": "PLANNER_RESPONSE",
+            "tool_calls": [
+                {
+                    "name": "schedule",
+                    "args": {
+                        "DurationSeconds": 60,
+                        "TimerCondition": "task-154",
+                        "Prompt": "check task",
+                    },
+                }
+            ],
+        },
+    )
+    with patch.object(chat_lifecycle, "set_conversation_wait_state") as mock_wait:
+      self.run_guard(inv=1, lastUserInput="wait 60s")
+      mock_wait.assert_not_called()
+
 
 if __name__ == "__main__":
   unittest.main()
