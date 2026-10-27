@@ -131,15 +131,16 @@ When **Case 5** applies:
      - **Commit 2** (`<commit2_sha>`): Production fix (`[<module>] Fix <topic> edge cases`).
    - Push the branch to the user's personal fork (`git push -u fork companion-pr-<PR>`) and open a **Draft PR** in the upstream repository (`gh pr create --draft --repo <upstream_owner>/<repo> --base master --head <fork_owner>:companion-pr-<PR>`) with **zero reviewers** (`--reviewer` omitted):
      - Opening the Draft PR in `<upstream_owner>/<repo>` (rather than inside the personal fork) runs upstream CI (e.g. LUCI in `flutter/flutter`) on the combined branch and automatically cross-links the companion Draft PR in the parent PR's GitHub timeline.
-   - **Mandatory `<author_head_sha>...<commit2_sha>` Compare Link**:
+   - **Mandatory `<author_head_sha>...<commit2_sha>` Compare Link & Inline Diff in Summary**:
      - Because the author's branch lives in their personal fork (`<author_fork>:<branch>`), the companion Draft PR in `<upstream_owner>/<repo>` must target `master`/`main` as `--base`. As a result, GitHub's `Files changed` tab on the companion PR diffs against `master` and includes the author's commits alongside Commit 1 and Commit 2.
-     - Therefore, **always** include the direct 2-commit compare link (`https://github.com/<upstream_owner>/<repo>/compare/<author_head_sha>...<commit2_sha>`) at the top of the companion Draft PR description **and** in the review message on the parent PR, alongside the direct links to Commit 1 (`/pull/<COMPANION_PR>/commits/<commit1_sha>`) and Commit 2 (`/pull/<COMPANION_PR>/commits/<commit2_sha>`).
+     - Therefore, **always** include the direct 2-commit compare link (`https://github.com/<upstream_owner>/<repo>/compare/<author_head_sha>...<commit2_sha>`) at the top of the companion Draft PR description, in the review message on the parent PR, **and** prominently in the chat summary presented to the user, alongside the direct links to Commit 1 (`/pull/<COMPANION_PR>/commits/<commit1_sha>`) and Commit 2 (`/pull/<COMPANION_PR>/commits/<commit2_sha>`).
+     - In addition, **always paste the full diff between the original CL/PR and the companion CL/PR (`git diff <author_head_sha>..<companion_head_sha>`) directly in the chat summary** so the user can inspect the exact companion changes immediately in chat without leaving the conversation.
 
 ---
 
 ### Phase 5: Drafting the Collaborative Review Message (Author Freedom)
 
-Never auto-publish the review comment to Gerrit or GitHub unless the user explicitly asks you to post it. Present the draft in chat for the user to review and post on the parent CL.
+Never auto-publish the review comment to Gerrit or GitHub unless the user explicitly asks you to post it. Present the draft in chat for the user to review and post on the parent CL, accompanied in the chat summary by the full companion diff (`git diff <author_head_sha>..<companion_head_sha>`) and (for GitHub PRs) the direct compare URL (`https://github.com/<upstream_owner>/<repo>/compare/<author_head_sha>...<commit2_sha>`).
 
 **Gerrit Drafts & Thread Follow-ups**:
 - A follow-up after a new patchset is saved as a standalone `/PATCHSET_LEVEL` draft on the CURRENT patchset (no `in_reply_to`), containing only new text.
