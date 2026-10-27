@@ -136,7 +136,7 @@ class TestProjectActivityBadge(unittest.TestCase):
       self.assertEqual(blocked, {"proj-1": 1})
       self.assertEqual(unread, {"proj-1": 1, "proj-2": 1})
 
-  def test_handed_off_predecessors_excluded_from_unread(self):
+  def test_archived_chats_excluded_from_unread(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
       p1 = {
           "id": "proj-1",
@@ -151,37 +151,37 @@ class TestProjectActivityBadge(unittest.TestCase):
           "c-start": {
               "status": "CASCADE_RUN_STATUS_IDLE",
               "lastModifiedTime": "2026-10-04T01:08:00Z",
-              "annotations": {"title": "[21:07] ▸ Task Chain"},
+              "annotations": {"title": "[21:07] ▸ Task Chain", "archived": True},
               "trajectoryMetadata": {"projectId": "proj-1"},
           },
           "c-step": {
               "status": "CASCADE_RUN_STATUS_IDLE",
               "lastModifiedTime": "2026-10-04T01:09:00Z",
-              "annotations": {"title": "[21:07] ✓ Task Chain"},
+              "annotations": {"title": "[21:07] ✓ Task Chain", "archived": True},
               "trajectoryMetadata": {"projectId": "proj-1"},
           },
           "c-closed-start": {
               "status": "CASCADE_RUN_STATUS_IDLE",
               "lastModifiedTime": "2026-10-04T01:09:00Z",
-              "annotations": {"title": "[21:07] « Closed Chain"},
+              "annotations": {"title": "[21:07] « Closed Chain", "archived": True},
               "trajectoryMetadata": {"projectId": "proj-1"},
           },
           "c-closed-step": {
               "status": "CASCADE_RUN_STATUS_IDLE",
               "lastModifiedTime": "2026-10-04T01:09:00Z",
-              "annotations": {"title": "[21:07] ‹✓› Closed Chain"},
+              "annotations": {"title": "[21:07] ‹✓› Closed Chain", "archived": True},
               "trajectoryMetadata": {"projectId": "proj-1"},
           },
           "c-closed-end": {
               "status": "CASCADE_RUN_STATUS_IDLE",
               "lastModifiedTime": "2026-10-04T01:09:00Z",
-              "annotations": {"title": "[21:07] » Closed Chain"},
+              "annotations": {"title": "[21:07] » Closed Chain", "archived": True},
               "trajectoryMetadata": {"projectId": "proj-1"},
           },
           "c-single-closed": {
               "status": "CASCADE_RUN_STATUS_IDLE",
               "lastModifiedTime": "2026-10-04T01:10:00Z",
-              "annotations": {"title": "[21:07] «» Standalone Closed"},
+              "annotations": {"title": "[21:07] «» Standalone Closed", "archived": True},
               "trajectoryMetadata": {"projectId": "proj-1"},
           },
           "c-leaf-active": {

@@ -56,15 +56,22 @@ class TestChatLifecycle(unittest.TestCase):
       with self.subTest(raw=raw):
         self.assertEqual(chat_lifecycle.clean_base_title(raw), expected)
 
-  def test_is_finalized_title(self):
-    self.assertTrue(chat_lifecycle.is_finalized_title("[14:20] «» Single Closed"))
-    self.assertTrue(chat_lifecycle.is_finalized_title("[14:20] » End Branch"))
-    self.assertTrue(chat_lifecycle.is_finalized_title("[14:20] « Start Branch"))
-    self.assertTrue(chat_lifecycle.is_finalized_title("[14:20] ‹✓› Mid Branch"))
-    self.assertFalse(chat_lifecycle.is_finalized_title("[14:20] ⦿ Active Task"))
-    self.assertFalse(chat_lifecycle.is_finalized_title("[14:20] ▸ Start Active"))
-    self.assertFalse(chat_lifecycle.is_finalized_title("Normal Title"))
-    self.assertFalse(chat_lifecycle.is_finalized_title(""))
+  def test_is_archived_reads_pbtxt(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      ann_dir = os.path.join(tmp_dir, chat_lifecycle.ANNOTATIONS_DIR_NAME)
+      os.makedirs(ann_dir)
+      for cid, body in (
+          ("on", 'title:"[10:00] ⦿ A"  archived:true\n'),
+          ("off", 'title:"[10:00] ⦿ B"  archived:false\n'),
+          ("plain", 'title:"[10:00] ⦿ C"\n'),
+      ):
+        with open(os.path.join(ann_dir, f"{cid}.pbtxt"), "w", encoding="utf-8") as f:
+          f.write(body)
+      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]):
+        self.assertTrue(chat_lifecycle.is_archived("on"))
+        self.assertFalse(chat_lifecycle.is_archived("off"))
+        self.assertFalse(chat_lifecycle.is_archived("plain"))
+        self.assertFalse(chat_lifecycle.is_archived("missing"))
 
   def test_update_conversation_title_disk(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -104,121 +111,76 @@ class TestChatLifecycle(unittest.TestCase):
           content = f.read()
         self.assertIn('title:"[12:00] ⦿ New Title"', content)
 
-  def test_finalize_conversation_chain(self):
+  def test_archive_chain_archives_every_piece_and_unarchive_round_trips(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
-      db_path = os.path.join(tmp_dir, chat_lifecycle.SUMMARY_DB_NAME)
-      conn = sqlite3.connect(db_path)
-      with conn:
-        conn.execute(
-            "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT)"
-        )
-        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?)", ("c1", "[10:00] ▸ First"))
-        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?)", ("c2", "[10:30] ✓ Second"))
-        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?)", ("c3", "[11:00] ⦿ Third"))
-      conn.close()
+      self.write_chain(tmp_dir, [("c1", None), ("c2", "c1"), ("c3", "c2")])
+      self.write_titles(tmp_dir, {
+          "c1": "[10:00] ⦿ First",
+          "c2": "[10:30] ⦿ Second",
+          "c3": "[11:00] ⦿ Third",
+          "other": "[09:00] ⦿ Other",
+      })
+      rpc_calls = []
 
+      def fake_ls_rpc(method, body, timeout=20.0):
+        rpc_calls.append((method, body))
+        return {}
+
+      ann_dir = os.path.join(tmp_dir, chat_lifecycle.ANNOTATIONS_DIR_NAME)
       with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
-           patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=False), \
-           patch.object(chat_lifecycle, "get_current_time_str", return_value="12:00"):
-
-        # Finalize chain [c1, c2, c3]: markers change, original timestamps stay
-        updated = chat_lifecycle.finalize_conversation_chain("c3", ["c1", "c2", "c3"])
-        self.assertEqual(updated, ["c1", "c2", "c3"])
-
-        self.assertEqual(chat_lifecycle.get_conversation_title("c1"), "[10:00] « First")
-        self.assertEqual(chat_lifecycle.get_conversation_title("c2"), "[10:30] ‹✓› Second")
-        self.assertEqual(chat_lifecycle.get_conversation_title("c3"), "[11:00] » Third")
-
-  def test_finalize_single_conversation(self):
-    with tempfile.TemporaryDirectory() as tmp_dir:
-      db_path = os.path.join(tmp_dir, chat_lifecycle.SUMMARY_DB_NAME)
-      conn = sqlite3.connect(db_path)
-      with conn:
-        conn.execute(
-            "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT)"
+           patch.object(chat_lifecycle, "ls_rpc", side_effect=fake_ls_rpc):
+        self.assertEqual(chat_lifecycle.archive_chain("c2"), ["c1", "c2", "c3"])
+        self.assertEqual(rpc_calls[0][1]["cascadeIds"], ["c1", "c2", "c3"])
+        self.assertEqual(rpc_calls[0][1]["annotations"], {"archived": True})
+        for cid, title in (("c1", "[10:00] ⦿ First"), ("c3", "[11:00] ⦿ Third")):
+          with open(os.path.join(ann_dir, f"{cid}.pbtxt"), encoding="utf-8") as f:
+            content = f.read()
+          self.assertIn("archived:true", content)
+          self.assertIn(f'title:"{title}"', content)
+          self.assertTrue(chat_lifecycle.is_archived(cid))
+          self.assertEqual(chat_lifecycle.get_conversation_title(cid), title)
+        self.assertFalse(chat_lifecycle.is_archived("other"))
+        self.assertTrue(
+            os.path.isfile(os.path.join(tmp_dir, "brain", chat_lifecycle.CHAIN_INDEX_FILE_NAME))
         )
-        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?)", ("c1", "[10:00] ⦿ Solo Task"))
-      conn.close()
 
-      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
-           patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=False), \
-           patch.object(chat_lifecycle, "get_current_time_str", return_value="12:00"):
-
-        updated = chat_lifecycle.finalize_conversation_chain("c1")
-        self.assertEqual(updated, ["c1"])
-        self.assertEqual(chat_lifecycle.get_conversation_title("c1"), "[10:00] «» Solo Task")
+        res = chat_lifecycle.archive_conversations(["c2"], archived=False)
+        self.assertEqual(res["archived_ids"], ["c2"])
+        self.assertEqual(rpc_calls[-1][1]["annotations"], {"archived": False})
+        with open(os.path.join(ann_dir, "c2.pbtxt"), encoding="utf-8") as f:
+          content = f.read()
+        self.assertIn("archived:false", content)
+        self.assertNotIn("archived:true", content)
+        self.assertFalse(chat_lifecycle.is_archived("c2"))
+        self.assertTrue(chat_lifecycle.is_archived("c1"))
+        self.assertTrue(chat_lifecycle.is_archived("c3"))
 
   def test_reopen_conversation(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
-      db_path = os.path.join(tmp_dir, chat_lifecycle.SUMMARY_DB_NAME)
-      conn = sqlite3.connect(db_path)
-      with conn:
-        conn.execute(
-            "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT)"
-        )
-        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?)", ("c1", "[10:00] «» Closed Solo"))
-        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?)", ("c2", "[10:00] ⦿ Already Active"))
-      conn.close()
-
+      self.write_titles(tmp_dir, {
+          "c1": "[10:00] «» Closed Solo",
+          "c2": "[10:05] ⏳ Cron Watch",
+          "c3": "[10:10] ⦿ Already Active",
+      })
       with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
            patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=False), \
            patch.object(chat_lifecycle, "get_current_time_str", return_value="12:00"):
+        chat_lifecycle.archive_conversations(["c1", "c2", "c3"])
 
-        # Reopen finalized conversation
-        ok = chat_lifecycle.reopen_conversation("c1")
-        self.assertTrue(ok)
-        self.assertEqual(chat_lifecycle.get_conversation_title("c1"), "[12:00] ⦿ Closed Solo")
+        self.assertTrue(chat_lifecycle.reopen_conversation("c1"))
+        self.assertFalse(chat_lifecycle.is_archived("c1"))
+        self.assertEqual(chat_lifecycle.get_conversation_title("c1"), "[10:00] ⦿ Closed Solo")
 
-        # Reopen already active conversation (without force) does nothing
-        ok = chat_lifecycle.reopen_conversation("c2")
-        self.assertFalse(ok)
-        self.assertEqual(chat_lifecycle.get_conversation_title("c2"), "[10:00] ⦿ Already Active")
+        self.assertTrue(chat_lifecycle.reopen_conversation("c2"))
+        self.assertFalse(chat_lifecycle.is_archived("c2"))
+        self.assertEqual(chat_lifecycle.get_conversation_title("c2"), "[10:05] ⏳ Cron Watch")
 
-  def test_advance_in_progress_chain(self):
-    with tempfile.TemporaryDirectory() as tmp_dir:
-      db_path = os.path.join(tmp_dir, chat_lifecycle.SUMMARY_DB_NAME)
-      conn = sqlite3.connect(db_path)
-      with conn:
-        conn.execute(
-            "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT)"
-        )
-        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?)", ("c1", "[10:00] ✓ First"))
-        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?)", ("c2", "[10:30] ✓ Second"))
-        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?)", ("c3", "Third"))
-      conn.close()
+        self.assertTrue(chat_lifecycle.reopen_conversation("c3"))
+        self.assertFalse(chat_lifecycle.is_archived("c3"))
+        self.assertEqual(chat_lifecycle.get_conversation_title("c3"), "[10:10] ⦿ Already Active")
 
-      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
-           patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=False), \
-           patch.object(chat_lifecycle, "get_current_time_str", return_value="12:00"):
-
-        updated = chat_lifecycle.advance_in_progress_chain(["c1", "c2", "c3"])
-        self.assertEqual(updated, ["c1", "c2", "c3"])
-
-        # Root gets ▸ and preserves original timestamp
-        self.assertEqual(chat_lifecycle.get_conversation_title("c1"), "[10:00] ▸ First")
-        # Intermediate gets ✓ and preserves original timestamp
-        self.assertEqual(chat_lifecycle.get_conversation_title("c2"), "[10:30] ✓ Second")
-        # Active focal point gets ⦿ and uses current time (as it had no timestamp)
-        self.assertEqual(chat_lifecycle.get_conversation_title("c3"), "[12:00] ⦿ Third")
-
-  def test_advance_single_conversation(self):
-    with tempfile.TemporaryDirectory() as tmp_dir:
-      db_path = os.path.join(tmp_dir, chat_lifecycle.SUMMARY_DB_NAME)
-      conn = sqlite3.connect(db_path)
-      with conn:
-        conn.execute(
-            "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT)"
-        )
-        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?)", ("c1", "[10:00] Old Title"))
-      conn.close()
-
-      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
-           patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=False), \
-           patch.object(chat_lifecycle, "get_current_time_str", return_value="12:00"):
-
-        updated = chat_lifecycle.advance_in_progress_chain(["c1"])
-        self.assertEqual(updated, ["c1"])
-        self.assertEqual(chat_lifecycle.get_conversation_title("c1"), "[12:00] ⦿ Old Title")
+        self.assertFalse(chat_lifecycle.reopen_conversation("missing"))
+        self.assertFalse(chat_lifecycle.is_archived("missing"))
 
   def test_discover_conversation_chain(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -370,8 +332,10 @@ class TestChatLifecycle(unittest.TestCase):
         self.assertEqual(res["new_conversation_id"], "child-2")
         self.assertTrue(res["verified_visible"])
         self.assertTrue(os.path.isfile(summary_file))
-        # Parent must advance from ⦿ to ▸ even though child-2 has no transcript.jsonl yet
-        self.assertEqual(chat_lifecycle.get_conversation_title("parent-1"), "[10:00] ▸ My Feature")
+        # The caller is archived even though child-2 has no transcript.jsonl yet
+        self.assertTrue(chat_lifecycle.is_archived("parent-1"))
+        self.assertEqual(chat_lifecycle.get_conversation_title("parent-1"), "[10:00] ⦿ My Feature")
+        self.assertFalse(chat_lifecycle.is_archived("child-2"))
         self.assertEqual(chat_lifecycle.get_conversation_title("child-2"), "[15:45] ⦿ My Feature")
 
   def test_create_handoff_multi_step_chain(self):
@@ -413,8 +377,11 @@ class TestChatLifecycle(unittest.TestCase):
         self.assertEqual(res["new_conversation_id"], "child-2")
         self.assertTrue(res["verified_visible"])
         self.assertEqual(chat_lifecycle.get_conversation_title("root-0"), "[09:30] ▸ My Feature")
-        self.assertEqual(chat_lifecycle.get_conversation_title("parent-1"), "[10:00] ✓ My Feature")
+        self.assertFalse(chat_lifecycle.is_archived("root-0"))
+        self.assertEqual(chat_lifecycle.get_conversation_title("parent-1"), "[10:00] ⦿ My Feature")
+        self.assertTrue(chat_lifecycle.is_archived("parent-1"))
         self.assertEqual(chat_lifecycle.get_conversation_title("child-2"), "[15:45] ⦿ My Feature")
+        self.assertFalse(chat_lifecycle.is_archived("child-2"))
 
   def test_get_chain_status(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -440,15 +407,24 @@ class TestChatLifecycle(unittest.TestCase):
         f.write("{}")
 
       with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
+           patch.object(chat_lifecycle, "ls_rpc", side_effect=RuntimeError("offline in test")), \
            patch.object(chat_lifecycle, "discover_conversation_chain", return_value=["c1", "c2"]):
         status = chat_lifecycle.get_chain_status("c2")
         self.assertEqual(status["current_conversation_id"], "c2")
         self.assertEqual(status["chain_length"], 2)
-        self.assertFalse(status["is_finalized"])
+        self.assertFalse(status["is_archived"])
+        self.assertFalse(status["chain"][1]["is_archived"])
         self.assertEqual(status["chain"][0]["conversation_id"], "c1")
         self.assertEqual(status["chain"][1]["conversation_id"], "c2")
         self.assertTrue(status["chain"][1]["is_current"])
         self.assertEqual(status["summary_files"], [summary_path])
+
+        chat_lifecycle.archive_conversations(["c1"])
+        status = chat_lifecycle.get_chain_status("c2")
+        self.assertTrue(status["chain"][0]["is_archived"])
+        self.assertFalse(status["chain"][1]["is_archived"])
+        self.assertFalse(status["is_archived"])
+        self.assertTrue(chat_lifecycle.get_chain_status("c1")["is_archived"])
 
   def test_get_handoff_summary_path(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -493,7 +469,10 @@ class TestChatLifecycle(unittest.TestCase):
         with open(summary_file, "r") as f:
           content = f.read()
         self.assertIn("Completed part 1, now starting part 2", content)
-        self.assertEqual(chat_lifecycle.get_conversation_title("parent-notes"), "[10:00] ▸ Parent Task")
+        self.assertTrue(chat_lifecycle.is_archived("parent-notes"))
+        self.assertEqual(
+            chat_lifecycle.get_conversation_title("parent-notes"), "[10:00] ⦿ Parent Task"
+        )
         self.assertEqual(chat_lifecycle.get_conversation_title("child-notes"), "[15:55] ⦿ Parent Task")
 
   def make_project_db(self, tmp_dir: str, cid: str = "parent-1") -> None:
@@ -738,8 +717,8 @@ class TestChatLifecycle(unittest.TestCase):
     with tempfile.TemporaryDirectory() as tmp_dir:
       self.write_chain(tmp_dir, [("c1", None), ("c2", "c1"), ("c3", "c2")])
       titles = {
-          "c1": "[10:00] ▸ Topic A",
-          "c2": "[10:30] ✓ Topic B",
+          "c1": "[10:00] ⦿ Topic A",
+          "c2": "[10:30] ⦿ Topic B",
           "c3": "[11:00] ⦿ Topic C",
       }
       self.write_titles(tmp_dir, titles)
@@ -752,11 +731,54 @@ class TestChatLifecycle(unittest.TestCase):
           for i, (cid, t) in enumerate(titles.items())
       }
       with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
+           patch.object(chat_lifecycle, "ls_rpc", side_effect=RuntimeError("offline in test")), \
            patch.object(chat_lifecycle, "_fetch_ls_summaries_for_audit", return_value=fake_ls):
         report = chat_lifecycle.audit_conversations(fix=False)
         self.assertEqual(report["total_chains"], 1)
         self.assertEqual(report["total_visible_chats"], 3)
+        self.assertEqual(
+            [(d["conversation_id"], d["issues"], d["title"], d["fixed"])
+             for d in report["discrepancies"]],
+            [("c1", ["should_be_archived"], titles["c1"], False),
+             ("c2", ["should_be_archived"], titles["c2"], False)],
+        )
+        self.assertFalse(chat_lifecycle.is_archived("c1"))
+
+        chat_lifecycle.archive_conversations(["c1", "c2"])
+        report = chat_lifecycle.audit_conversations(fix=False)
+        self.assertEqual(report["total_chains"], 1)
+        self.assertEqual(report["total_visible_chats"], 1)
         self.assertEqual(report["discrepancies"], [])
+
+  def test_forked_chain_archives_only_handed_off_pieces(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.write_chain(tmp_dir, [("root", None), ("a", "root"), ("b", "root")])
+      titles = {"root": "[09:00] ⦿ T", "a": "[10:00] ⦿ T", "b": "[11:00] ⏳ T"}
+      self.write_titles(tmp_dir, titles)
+      fake_ls = {
+          cid: {"annotations": {"title": t}, "trajectoryMetadata": {"projectId": "proj-1"}}
+          for cid, t in titles.items()
+      }
+      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
+           patch.object(chat_lifecycle, "ls_rpc", side_effect=RuntimeError("offline in test")), \
+           patch.object(chat_lifecycle, "_fetch_ls_summaries_for_audit", return_value=fake_ls):
+        report = chat_lifecycle.audit_conversations(fix=False)
+        self.assertEqual(
+            [(d["conversation_id"], d["issues"]) for d in report["discrepancies"]],
+            [("root", ["should_be_archived"])],
+        )
+        self.assertEqual(sorted(chat_lifecycle.archive_chain("a")), ["a", "root"])
+        self.assertFalse(chat_lifecycle.is_archived("b"))
+
+  def test_handoff_keeps_caller_visible_when_continuation_is_not_verified(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      ctx, launched = self._outside_project_handoff_env(tmp_dir)
+      with ctx, patch.object(
+          chat_lifecycle, "get_conversation_source_metadata", return_value=(True, {"tool": "x"})
+      ):
+        res = chat_lifecycle.create_handoff("parent-1", next_step_prompt="go")
+        self.assertFalse(res["verified_visible"])
+        self.assertFalse(chat_lifecycle.is_archived("parent-1"))
 
   def test_parse_handoff_args_topic(self):
     cid = "12345678-1234-1234-1234-123456789abc"
@@ -800,7 +822,9 @@ class TestChatLifecycle(unittest.TestCase):
         with open(summary_path, "r", encoding="utf-8") as f:
           self.assertEqual(f.read(), "# real summary\n")
         self.assertEqual(start_mock.call_args.args[1], "[15:45] ⦿ Topic B")
-        self.assertEqual(chat_lifecycle.get_conversation_title("parent-1"), "[10:00] ▸ Topic A")
+        self.assertTrue(chat_lifecycle.is_archived("parent-1"))
+        self.assertEqual(chat_lifecycle.get_conversation_title("parent-1"), "[10:00] ⦿ Topic A")
+        self.assertFalse(chat_lifecycle.is_archived("child-2"))
         self.assertEqual(chat_lifecycle.get_conversation_title("child-2"), "[15:45] ⦿ Topic B")
 
   def test_archive_conversations_with_chain(self):
@@ -844,70 +868,70 @@ class TestChatLifecycle(unittest.TestCase):
 
   def test_audit_conversations_detects_and_fixes_issues(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
-      ann_dir = os.path.join(tmp_dir, "annotations")
-      os.makedirs(ann_dir, exist_ok=True)
-
-      # Chain c1 -> c2:
-      # c1 has wrong intermediate marker ‹✓› instead of «
-      # c2 has correct disk title "[13:14] » Moving Chats", but LS RPC has double marker "[13:08] » ⦿ Moving Chats"
-      with open(os.path.join(ann_dir, "c1.pbtxt"), "w", encoding="utf-8") as f:
-        f.write('title:"[13:00] ‹✓› Moving Chats"\n')
-      with open(os.path.join(ann_dir, "c2.pbtxt"), "w", encoding="utf-8") as f:
-        f.write('title:"[13:14] » Moving Chats"\n')
-
-      db_path = os.path.join(tmp_dir, chat_lifecycle.SUMMARY_DB_NAME)
-      conn = sqlite3.connect(db_path)
-      with conn:
-        conn.execute(
-            "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, project_id TEXT)"
-        )
-        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?, ?)", ("c1", "[13:00] ‹✓› Moving Chats", "proj-1"))
-        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?, ?)", ("c2", "[13:14] » Moving Chats", "proj-1"))
-      conn.close()
-
-      for cid, parent in [("c1", None), ("c2", "c1")]:
-        log_dir = os.path.join(tmp_dir, "brain", cid, ".system_generated", "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        with open(os.path.join(log_dir, "transcript.jsonl"), "w", encoding="utf-8") as f:
-          if parent:
-            f.write(f'{{"type": "USER_INPUT", "step_index": 0, "content": "Continuing work (conversation://{parent})"}}\n')
-          else:
-            f.write('{"type": "USER_INPUT", "step_index": 0, "content": "Start"}\n')
-
+      self.write_chain(tmp_dir, [("c1", None), ("c2", "c1"), ("s1", None), ("s2", None)])
+      disk = {
+          "c1": "[13:00] ‹✓› Moving Chats",
+          "c2": "[13:14] ▸ Moving Chats",
+          "s1": "[12:00] » Old Done",
+          "s2": "[12:30] ✓ Lonely",
+      }
+      self.write_titles(tmp_dir, disk)
+      ls_titles = dict(disk, c2="[13:08] ▸ ⦿ Moving Chats")
       fake_ls_summaries = {
-          "c1": {
-              "summary": "[13:00] ‹✓› Moving Chats",
-              "annotations": {"title": "[13:00] ‹✓› Moving Chats"},
-              "trajectoryMetadata": {"projectId": "proj-1", "createdAt": "2026-10-01T17:00:00Z"},
-          },
-          "c2": {
-              "summary": "[13:08] » ⦿ Moving Chats",
-              "annotations": {"title": "[13:08] » ⦿ Moving Chats"},
-              "trajectoryMetadata": {"projectId": "proj-1", "createdAt": "2026-10-01T17:14:00Z"},
-          },
+          cid: {
+              "summary": t,
+              "annotations": {"title": t},
+              "trajectoryMetadata": {
+                  "projectId": "proj-1", "createdAt": f"2026-10-01T1{i}:00:00Z"
+              },
+          }
+          for i, (cid, t) in enumerate(ls_titles.items())
       }
 
       with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
-           patch.object(chat_lifecycle, "_fetch_ls_summaries_for_audit", return_value=fake_ls_summaries), \
+           patch.object(
+               chat_lifecycle, "_fetch_ls_summaries_for_audit", return_value=fake_ls_summaries
+           ), \
+           patch.object(chat_lifecycle, "ls_rpc", side_effect=RuntimeError("offline in test")), \
            patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=True):
-        # 1. Dry-run audit (fix=False)
         report = chat_lifecycle.audit_conversations(fix=False)
-        self.assertEqual(report["total_visible_chats"], 2)
-        self.assertEqual(report["total_chains"], 1)
-        self.assertEqual(report["issues_count"], 2)
+        self.assertEqual(report["total_visible_chats"], 4)
+        self.assertEqual(report["total_chains"], 3)
+        self.assertEqual(report["issues_count"], 4)
         self.assertEqual(report["fixed_count"], 0)
 
         by_cid = {d["conversation_id"]: d for d in report["discrepancies"]}
-        self.assertIn("marker_mismatch", by_cid["c1"]["issues"])
-        self.assertEqual(by_cid["c1"]["expected_title"], "[13:00] « Moving Chats")
-        self.assertIn("storage_desync", by_cid["c2"]["issues"])
-        self.assertEqual(by_cid["c2"]["expected_title"], "[13:14] » Moving Chats")
+        for cid in ("c1", "s1"):
+          self.assertEqual(by_cid[cid]["issues"], ["should_be_archived"])
+          self.assertEqual(by_cid[cid]["title"], disk[cid])
+          self.assertFalse(by_cid[cid]["fixed"])
+        self.assertIn("marker_mismatch", by_cid["c2"]["issues"])
+        self.assertEqual(by_cid["c2"]["expected_title"], "[13:14] ⦿ Moving Chats")
+        self.assertIn("marker_mismatch", by_cid["s2"]["issues"])
+        self.assertEqual(by_cid["s2"]["expected_title"], "[12:30] ⦿ Lonely")
+        for cid in disk:
+          self.assertFalse(chat_lifecycle.is_archived(cid))
 
-        # 2. Fix mode (fix=True)
+        busy = {"c1": {"backgroundTaskCount": 1}, "s1": {"hasRunningSubagents": True}}
+        for live in (None, busy):
+          with self.subTest(live=live):
+            self.live_mock.return_value = live
+            blocked = chat_lifecycle.audit_conversations(fix=True)
+            by_cid = {d["conversation_id"]: d for d in blocked["discrepancies"]}
+            for cid in ("c1", "s1"):
+              self.assertFalse(by_cid[cid]["fixed"])
+              self.assertFalse(chat_lifecycle.is_archived(cid))
+
+        self.live_mock.return_value = {}
         fix_report = chat_lifecycle.audit_conversations(fix=True)
-        self.assertEqual(fix_report["fixed_count"], 2)
-        self.assertEqual(chat_lifecycle.get_conversation_title("c1"), "[13:00] « Moving Chats")
-        self.assertEqual(chat_lifecycle.get_conversation_title("c2"), "[13:14] » Moving Chats")
+        self.assertEqual(fix_report["fixed_count"], 4)
+        self.assertTrue(chat_lifecycle.is_archived("c1"))
+        self.assertTrue(chat_lifecycle.is_archived("s1"))
+        self.assertEqual(chat_lifecycle.get_conversation_title("c1"), disk["c1"])
+        self.assertFalse(chat_lifecycle.is_archived("c2"))
+        self.assertFalse(chat_lifecycle.is_archived("s2"))
+        self.assertEqual(chat_lifecycle.get_conversation_title("c2"), "[13:14] ⦿ Moving Chats")
+        self.assertEqual(chat_lifecycle.get_conversation_title("s2"), "[12:30] ⦿ Lonely")
 
   # --- CLI usage -------------------------------------------------------------
 
@@ -954,7 +978,7 @@ class TestChatLifecycle(unittest.TestCase):
     self.assertIn("frobnicate", res.stderr)
     self.assertIn("status", res.stderr)
 
-  ALL_COMMANDS = PUBLIC_COMMANDS + ("model", "set", "advance")
+  ALL_COMMANDS = PUBLIC_COMMANDS + ("model", "set")
 
   def test_cli_subcommand_help_prints_usage(self):
     for cmd in self.ALL_COMMANDS:
@@ -975,6 +999,26 @@ class TestChatLifecycle(unittest.TestCase):
           self.assertIn(bad, res.stderr)
           self.assertNotIn("Traceback", res.stderr)
           self.assertNotIn("RoadmapError", res.stderr)
+
+  def test_cli_finalize_archives_chain_and_reopen_unarchives(self):
+    root = "11111111-1111-1111-1111-111111111111"
+    tail = "22222222-2222-2222-2222-222222222222"
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.write_chain(tmp_dir, [(root, None), (tail, root)])
+      self.write_titles(tmp_dir, {root: "[10:00] ⦿ Topic", tail: "[10:30] ⦿ Topic"})
+      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
+           patch.object(chat_lifecycle, "ls_rpc", side_effect=RuntimeError("offline in test")), \
+           patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=False):
+        res = self._run_cli("finalize", tail)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue(chat_lifecycle.is_archived(root))
+        self.assertTrue(chat_lifecycle.is_archived(tail))
+
+        res = self._run_cli("reopen", tail)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertFalse(chat_lifecycle.is_archived(tail))
+        self.assertTrue(chat_lifecycle.is_archived(root))
+        self.assertEqual(chat_lifecycle.get_conversation_title(tail), "[10:30] ⦿ Topic")
 
   def test_cli_requires_conversation_id_without_env(self):
     env = {k: v for k, v in os.environ.items() if k not in ("CONVERSATION_ID", "ANTIGRAVITY_CONVERSATION_ID")}
@@ -1224,7 +1268,7 @@ class TestChatLifecycle(unittest.TestCase):
       })
       with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
            patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=False):
-        chat_lifecycle.finalize_conversation_chain("c3")
+        chat_lifecycle.archive_chain("c3")
         idx_path = os.path.join(tmp_dir, "brain", chat_lifecycle.CHAIN_INDEX_FILE_NAME)
         self.assertTrue(os.path.isfile(idx_path))
         with open(idx_path, "r", encoding="utf-8") as f:
@@ -1257,7 +1301,10 @@ class TestChatLifecycle(unittest.TestCase):
         )
         self.assertEqual(res["new_conversation_id"], "child-2")
         self.assertEqual(res["item_id"], "R2")
-        self.assertEqual(chat_lifecycle.get_conversation_title("parent-1"), "[10:00] «» My Feature")
+        self.assertEqual(res["finalized_chain"], ["parent-1"])
+        self.assertTrue(chat_lifecycle.is_archived("parent-1"))
+        self.assertEqual(chat_lifecycle.get_conversation_title("parent-1"), "[10:00] ⦿ My Feature")
+        self.assertFalse(chat_lifecycle.is_archived("child-2"))
         self.assertEqual(chat_lifecycle.get_conversation_title("child-2"), "[15:45] ⦿ R2 Feature X")
 
       # New chat prompt must NOT match HANDOFF_PARENT_RE so it stays an independent root chat
@@ -1328,9 +1375,15 @@ class TestChatLifecycle(unittest.TestCase):
       with p[0], p[1], p[2], p[3], p[4], p[5]:
         res = chat_lifecycle.create_next_task(current_conv_id="parent-1")
         self.assertEqual(res["item_id"], "R2")
-        self.assertEqual(chat_lifecycle.get_conversation_title("root-0"), "[09:30] « First Task")
-        self.assertEqual(chat_lifecycle.get_conversation_title("parent-1"), "[10:00] » First Task")
-        self.assertEqual(chat_lifecycle.get_conversation_title("child-2"), "[15:45] ⦿ R2 b/345678901")
+        self.assertEqual(res["finalized_chain"], ["root-0", "parent-1"])
+        self.assertTrue(chat_lifecycle.is_archived("root-0"))
+        self.assertTrue(chat_lifecycle.is_archived("parent-1"))
+        self.assertEqual(chat_lifecycle.get_conversation_title("root-0"), "[09:30] ▸ First Task")
+        self.assertEqual(chat_lifecycle.get_conversation_title("parent-1"), "[10:00] ⦿ First Task")
+        self.assertFalse(chat_lifecycle.is_archived("child-2"))
+        self.assertEqual(
+            chat_lifecycle.get_conversation_title("child-2"), "[15:45] ⦿ R2 b/345678901"
+        )
 
   def test_parse_next_task_args(self):
     cid = "12345678-1234-1234-1234-123456789abc"
@@ -1368,13 +1421,16 @@ class TestChatLifecycle(unittest.TestCase):
       ), unittest.mock.patch.object(
           chat_lifecycle, "discover_local_ls_endpoint", return_value=("", "")
       ), unittest.mock.patch.object(
-          chat_lifecycle, "_fetch_ls_summaries_for_audit", return_value={}
+          chat_lifecycle, "ls_rpc", side_effect=RuntimeError("offline in test")
+      ), unittest.mock.patch.object(
+          chat_lifecycle, "_fetch_ls_summaries_for_audit", return_value=None
       ):
         t_wait = chat_lifecycle.set_conversation_wait_state(cid, waiting=True)
         self.assertEqual(t_wait, "[10:15] ⏳ Flight Deck")
         self.assertTrue(chat_lifecycle.is_waiting_title(t_wait))
 
         report = chat_lifecycle.audit_conversations(fix=True)
+        self.assertEqual(report["total_visible_chats"], 1)
         self.assertEqual(report["issues_count"], 0)
         self.assertEqual(
             chat_lifecycle.get_conversation_title(cid), "[10:15] ⏳ Flight Deck"
@@ -1387,17 +1443,18 @@ class TestChatLifecycle(unittest.TestCase):
         # A trailing [⏳St · 1/4 rolls] badge must not be mistaken for a leading ⏳ wait marker
         t_badge = "[10:15] ⦿ cl/1396956 [⏳St · 1/4 rolls]"
         self.assertFalse(chat_lifecycle.is_waiting_title(t_badge))
-        # set_conversation_topic preserves an existing ▸ root marker when updating a roll badge
-        chat_lifecycle.update_conversation_title(cid, "[10:15] ▸ cl/1396956")
+        chat_lifecycle.set_conversation_wait_state(cid, waiting=True)
         t_updated = chat_lifecycle.set_conversation_topic(
             cid, "cl/1396956 [⏳St · 1/4 rolls]"
         )
-        self.assertIn(" ▸ cl/1396956 [⏳St · 1/4 rolls]", t_updated)
-        # set_conversation_wait_state ignores handed-off chain predecessors (▸, ✓)
+        self.assertIn(" ⏳ cl/1396956 [⏳St · 1/4 rolls]", t_updated)
+
+        chat_lifecycle.archive_conversations([cid])
         self.assertEqual(
-            chat_lifecycle.set_conversation_wait_state(cid, waiting=True),
-            t_updated,
+            chat_lifecycle.set_conversation_wait_state(cid, waiting=False), t_updated
         )
+        self.assertEqual(chat_lifecycle.set_conversation_wait_state(cid), t_updated)
+        self.assertEqual(chat_lifecycle.get_conversation_title(cid), t_updated)
 
   def test_create_next_task_sweeps_completed_sibling_chats_in_project(self):
     import roadmap
@@ -1436,23 +1493,30 @@ class TestChatLifecycle(unittest.TestCase):
         roadmap.set_status("proj-abc", "c_busy", "R5", "done")
         # Now c_busy holds the baton for R4
         self.assertEqual(roadmap.load("proj-abc").get("baton", {}).get("conv"), "c_busy")
-        chat_lifecycle.sweep_completed_project_chats("proj-abc", finalized_cids={"c1"})
-        # c_busy (holding baton for R4) stays open ⦿ and keeps its baton
-        self.assertEqual(
-            chat_lifecycle.get_conversation_title("c_busy"), "[10:15] ⦿ R5 Still working"
-        )
+        swept = chat_lifecycle.sweep_completed_project_chats("proj-abc", finalized_cids={"c1"})
+        self.assertEqual(sorted(swept), [["c2"], ["c3"]])
+        # c_busy (holding baton for R4) stays visible and keeps its baton
+        self.assertFalse(chat_lifecycle.is_archived("c_busy"))
+        self.assertFalse(chat_lifecycle.is_archived("c1"))
         self.assertEqual(roadmap.load("proj-abc").get("baton", {}).get("conv"), "c_busy")
 
         # Keep R5 as doing for the next-task sweep check
         roadmap.set_status("proj-abc", "c_busy", "R5", "doing")
-        chat_lifecycle.update_conversation_title("c2", "[10:05] ⦿ R2 Second")
+        chat_lifecycle.archive_conversations(["c2", "c3"], archived=False)
         res = chat_lifecycle.create_next_task(current_conv_id="c3", item_id="R4")
         self.assertEqual(res["new_conversation_id"], "c4")
-        # c3 AND finished sibling chats c1, c2 are all finalized to «»
-        self.assertEqual(chat_lifecycle.get_conversation_title("c1"), "[10:00] «» R1 First")
-        self.assertEqual(chat_lifecycle.get_conversation_title("c2"), "[10:05] «» R2 Second")
-        self.assertEqual(chat_lifecycle.get_conversation_title("c3"), "[10:10] «» R3 Third")
-        # Busy sibling chat c_busy (owns doing R5) and new chat c4 remain open ⦿
+        self.assertEqual(res["finalized_chain"], ["c3"])
+        # c3 AND finished sibling chats c1, c2 are all archived with titles kept
+        for cid, title in (
+            ("c1", "[10:00] ⦿ R1 First"),
+            ("c2", "[10:05] ⦿ R2 Second"),
+            ("c3", "[10:10] ⦿ R3 Third"),
+        ):
+          self.assertTrue(chat_lifecycle.is_archived(cid))
+          self.assertEqual(chat_lifecycle.get_conversation_title(cid), title)
+        # Busy sibling chat c_busy (owns doing R5) and new chat c4 stay visible
+        self.assertFalse(chat_lifecycle.is_archived("c_busy"))
+        self.assertFalse(chat_lifecycle.is_archived("c4"))
         self.assertEqual(
             chat_lifecycle.get_conversation_title("c_busy"), "[10:15] ⦿ R5 Still working"
         )
@@ -1472,6 +1536,14 @@ class TestChatLifecycle(unittest.TestCase):
     self.assertEqual(
         chat_lifecycle.list_live_dependents(["busy", "own-turn", "idle", "absent"], summaries),
         {"busy": ["2 background task(s)", "running subagent(s)"]},
+    )
+
+  def test_list_live_dependents_counts_running_turn_of_another_chat(self):
+    summaries = {"sib": {"status": "CASCADE_RUN_STATUS_RUNNING"}}
+    self.assertEqual(chat_lifecycle.list_live_dependents(["sib"], summaries), {})
+    self.assertEqual(
+        chat_lifecycle.list_live_dependents(["sib"], summaries, include_running=True),
+        {"sib": ["running turn"]},
     )
 
   def test_handoff_refuses_while_chat_has_live_dependents(self):
@@ -1518,10 +1590,31 @@ class TestChatLifecycle(unittest.TestCase):
            patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=False):
         swept = chat_lifecycle.sweep_completed_project_chats("proj-abc")
         self.assertEqual(swept, [["c1"]])
-        self.assertEqual(chat_lifecycle.get_conversation_title("c2"), "[10:05] ⦿ R2 Second")
+        self.assertTrue(chat_lifecycle.is_archived("c1"))
+        self.assertFalse(chat_lifecycle.is_archived("c2"))
         self.live_mock.return_value = None
-        chat_lifecycle.update_conversation_title("c1", "[10:00] ⦿ R1 First")
+        chat_lifecycle.archive_conversations(["c1"], archived=False)
         self.assertEqual(chat_lifecycle.sweep_completed_project_chats("proj-abc"), [])
+        self.assertFalse(chat_lifecycle.is_archived("c1"))
+
+  def test_sweep_skips_waiting_leaf(self):
+    import roadmap
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.write_chain(tmp_dir, [("c1", None), ("c2", None)])
+      self.write_titles(tmp_dir, {
+          "c1": "[10:00] ⦿ R1 First",
+          "c2": "[10:05] ⏳ R2 Cron",
+      }, project="proj-abc")
+      for idx, cid in enumerate(("c1", "c2"), start=1):
+        roadmap.add_item("proj-abc", cid, f"Task {idx}")
+        roadmap.set_status("proj-abc", cid, f"R{idx}", "doing")
+        roadmap.set_status("proj-abc", cid, f"R{idx}", "done")
+      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
+           patch.object(chat_lifecycle, "ls_rpc", side_effect=RuntimeError("offline in test")):
+        self.assertEqual(chat_lifecycle.sweep_completed_project_chats("proj-abc"), [["c1"]])
+        self.assertTrue(chat_lifecycle.is_archived("c1"))
+        self.assertFalse(chat_lifecycle.is_archived("c2"))
 
   def test_live_state_unknown_blocks_handoff_and_sweep(self):
     self.live_mock.return_value = None

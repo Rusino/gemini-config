@@ -39,15 +39,12 @@ DEFAULT_PROJECT_MODELS: dict[str, str] = {
     "skia-g3-roll-check": "flash",
 }
 
-# Lifecycle marker tokens
-MARKER_START = "▸"       # In-progress branch root
-MARKER_STEP = "✓"        # In-progress completed step
-MARKER_ACTIVE = "⦿"      # In-progress current active focal point
-MARKER_WAITING = "⏳"    # Open leaf chat waiting on cron or external event
-MARKER_CLOSED_START = "«"  # Finalized branch root
-MARKER_CLOSED_STEP = "‹✓›" # Finalized intermediate step
-MARKER_CLOSED_END = "»"    # Finalized branch tail
-MARKER_SINGLE_CLOSED = "«»" # Finalized single-chat task
+# Lifecycle marker tokens: only visible chats carry one. Finished chats and handed-off
+# pieces are archived instead of re-marked
+MARKER_ACTIVE = "⦿"      # Open chat that needs the user
+MARKER_WAITING = "⏳"    # Open chat waiting on cron or an external event
+# Pre-archive "closed" markers still found on old titles; audit --fix archives such chats
+LEGACY_CLOSED_MARKERS = ("«", "‹✓›", "»", "«»")
 
 # Matches the leading lifecycle marker token in "[HH:MM] <marker> <Topic>"
 TITLE_MARKER_RE = re.compile(
@@ -1052,107 +1049,13 @@ def expand_chain_with_ancestors(chain_ids: list[str]) -> list[str]:
   return full_chain
 
 
-def advance_in_progress_chain(chain_ids: list[str] = None, current_conv_id: str = "") -> list[str]:
-  """Updates conversation titles in an active branch to reflect Scheme Γ markers.
-
-  - Root (first) chat: [HH:MM] ▸ Topic
-  - Intermediate closed chats: [HH:MM] ✓ Topic
-  - Current active chat: [HH:MM] ⦿ Topic
-  - Single standalone chat: [HH:MM] ⦿ Topic
-  """
-  if not chain_ids:
-    chain_ids = [current_conv_id] if current_conv_id else []
-  chain_ids = expand_chain_with_ancestors(chain_ids)
-  if not chain_ids:
-    return []
-
-  now_time = get_current_time_str()
-  updated = []
-
-  base_topic = ""
-  for cid in reversed(chain_ids):
-    t = clean_base_title(get_conversation_title(cid))
-    if t and t != "Investigation":
-      base_topic = t
-      break
-  if not base_topic:
-    base_topic = "Investigation"
-
-  if len(chain_ids) == 1:
-    cid = chain_ids[0]
-    cur_title = get_conversation_title(cid)
-    base = clean_base_title(cur_title) or base_topic
-    # Preserve explicit cron/external wait marker across chain marker recalculations
-    leaf_marker = MARKER_WAITING if is_waiting_title(cur_title) else MARKER_ACTIVE
-    new_title = f"[{now_time}] {leaf_marker} {base}"
-    update_conversation_title(cid, new_title)
-    updated.append(cid)
-    export_chain_index()
-    return updated
-
-  # 1. First chat (root of branch) -> ▸
-  root_id = chain_ids[0]
-  cur_root = get_conversation_title(root_id)
-  t_root = extract_time_prefix(cur_root, now_time)
-  base_root = clean_base_title(cur_root) or base_topic
-  update_conversation_title(root_id, f"[{t_root}] {MARKER_START} {base_root}")
-  updated.append(root_id)
-
-  # 2. Intermediate closed steps -> ✓
-  for mid_id in chain_ids[1:-1]:
-    cur_mid = get_conversation_title(mid_id)
-    t_mid = extract_time_prefix(cur_mid, now_time)
-    base_mid = clean_base_title(cur_mid) or base_topic
-    update_conversation_title(mid_id, f"[{t_mid}] {MARKER_STEP} {base_mid}")
-    updated.append(mid_id)
-
-  # 3. Last chat (current active step) -> ⦿ (or preserve ⏳ if waiting on cron/external)
-  active_id = chain_ids[-1]
-  cur_active = get_conversation_title(active_id)
-  t_active = extract_time_prefix(cur_active, now_time)
-  base_active = clean_base_title(cur_active) or base_topic
-  leaf_marker = MARKER_WAITING if is_waiting_title(cur_active) else MARKER_ACTIVE
-  update_conversation_title(active_id, f"[{t_active}] {leaf_marker} {base_active}")
-  updated.append(active_id)
-
+# Archives every piece of conv_id's chain: ancestors and the newest-child path, the same
+# pieces chain search treats as one chat. Sibling branches from a forced second handoff are
+# other chats and stay as they are
+def archive_chain(conv_id: str) -> list[str]:
+  res = archive_conversations(_graph_chain(conv_id, _scan_transcript_graph()))
   export_chain_index()
-  return updated
-
-
-def finalize_conversation_chain(current_conv_id: str, chain_ids: list[str] = None) -> list[str]:
-  """Finalizes the whole chain or single conversation to closed lifecycle markers.
-
-  Original [HH:MM] timestamps are preserved; only the marker changes.
-  """
-  if not chain_ids:
-    chain_ids = [current_conv_id] if current_conv_id else []
-  chain_ids = expand_chain_with_ancestors(chain_ids)
-
-  now_time = get_current_time_str()
-  updated = []
-
-  def _finalize_one(cid: str, marker: str) -> None:
-    cur_title = get_conversation_title(cid)
-    t = extract_time_prefix(cur_title, now_time)
-    base = clean_base_title(cur_title) or "Investigation"
-    update_conversation_title(cid, f"[{t}] {marker} {base}")
-    updated.append(cid)
-
-  if len(chain_ids) <= 1:
-    cid = chain_ids[0] if chain_ids else current_conv_id
-    if cid:
-      _finalize_one(cid, MARKER_SINGLE_CLOSED)
-    export_chain_index()
-    return updated
-
-  # Multiple conversations in chain: « ... ‹✓› ... »
-  _finalize_one(chain_ids[0], MARKER_CLOSED_START)
-  for mid_id in chain_ids[1:-1]:
-    _finalize_one(mid_id, MARKER_CLOSED_STEP)
-  _finalize_one(chain_ids[-1], MARKER_CLOSED_END)
-
-  export_chain_index()
-  return updated
+  return res["archived_ids"]
 
 
 # Parses the leading lifecycle marker token from "[HH:MM] <marker> <Topic>"
@@ -1163,30 +1066,22 @@ def parse_title_marker(title: str) -> str:
   return m.group(1) if m else ""
 
 
-def is_finalized_title(title: str) -> bool:
-  marker = parse_title_marker(title)
-  if marker:
-    return marker in (
-        MARKER_SINGLE_CLOSED,
-        MARKER_CLOSED_END,
-        MARKER_CLOSED_STEP,
-        MARKER_CLOSED_START,
-    )
-  if not title:
-    return False
-  return (
-      MARKER_SINGLE_CLOSED in title
-      or MARKER_CLOSED_END in title
-      or MARKER_CLOSED_STEP in title
-      or MARKER_CLOSED_START in title
-  )
+# Reads the archived flag the LS mirrors into annotations/<id>.pbtxt
+def is_archived(conv_id: str) -> bool:
+  for app_dir in find_app_data_dirs():
+    ann_file = os.path.join(app_dir, ANNOTATIONS_DIR_NAME, f"{conv_id}.pbtxt")
+    try:
+      with open(ann_file, "r", encoding="utf-8") as f:
+        if re.search(r"\barchived\s*:\s*true\b", f.read()):
+          return True
+    except OSError:
+      continue
+  return False
 
 
 # Checks whether an open leaf chat title carries the explicit leading ⏳ waiting marker
 def is_waiting_title(title: str) -> bool:
-  if not title or is_finalized_title(title):
-    return False
-  return parse_title_marker(title) == MARKER_WAITING
+  return parse_title_marker(title or "") == MARKER_WAITING
 
 
 # Switches or toggles an open leaf chat between ⦿ (Needs Me) and ⏳ (Waiting External/Cron)
@@ -1196,11 +1091,8 @@ def set_conversation_wait_state(
   if not conv_id:
     return ""
   cur_title = get_conversation_title(conv_id)
-  # Handed-off chain steps (▸, ✓) and finalized chats («, ‹✓›, », «») cannot toggle wait state
-  if is_finalized_title(cur_title) or parse_title_marker(cur_title) in (
-      MARKER_START,
-      MARKER_STEP,
-  ):
+  # Archived chats are finished or handed off; only visible chats switch between ⦿ and ⏳
+  if is_archived(conv_id):
     return cur_title
   # Toggle when waiting is None so UI and CLI callers can flip state in one call
   target_waiting = (not is_waiting_title(cur_title)) if waiting is None else bool(waiting)
@@ -1213,15 +1105,18 @@ def set_conversation_wait_state(
   return new_title
 
 
-def reopen_conversation(conv_id: str, force: bool = False) -> bool:
-  """Reopens a finalized conversation back to active marker ⦿ (and restores ancestors)."""
+# Brings a finished chat back into the sidebar as an open ⦿ chat (⏳ is kept)
+def reopen_conversation(conv_id: str) -> bool:
+  archive_conversations([conv_id], archived=False)
   cur_title = get_conversation_title(conv_id)
   if not cur_title:
     return False
-  if not force and not is_finalized_title(cur_title):
-    return False
-  updated = advance_in_progress_chain(current_conv_id=conv_id)
-  return bool(updated)
+  if parse_title_marker(cur_title) not in (MARKER_ACTIVE, MARKER_WAITING):
+    ts = extract_time_prefix(cur_title, get_current_time_str())
+    update_conversation_title(
+        conv_id, f"[{ts}] {MARKER_ACTIVE} {clean_base_title(cur_title) or 'Investigation'}"
+    )
+  return True
 
 
 def set_conversation_topic(
@@ -1231,14 +1126,10 @@ def set_conversation_topic(
   clean = clean_base_title(topic)
   if not clean:
     clean = "Investigation"
-  # Preserve existing chain/wait marker (▸, ✓, ⏳) when caller does not specify one
+  # Keep ⏳ when the caller does not pick a marker; renaming must not wake a cron chat
   if not marker:
     cur_marker = parse_title_marker(get_conversation_title(conv_id))
-    marker = (
-        cur_marker
-        if cur_marker in (MARKER_START, MARKER_STEP, MARKER_WAITING)
-        else MARKER_ACTIVE
-    )
+    marker = MARKER_WAITING if cur_marker == MARKER_WAITING else MARKER_ACTIVE
   time_str = get_current_time_str()
   new_title = f"[{time_str}] {marker} {clean}" if marker else f"[{time_str}] {clean}"
   ok = update_conversation_title(conv_id, new_title)
@@ -1417,7 +1308,7 @@ def _fetch_live_summaries() -> dict | None:
 # The LS counts neither the caller's own turn nor foreground commands, so a chat can
 # check itself from inside its turn; notFullyIdle / RUNNING would always be true there
 def list_live_dependents(
-    conv_ids: list[str], summaries: dict | None = None
+    conv_ids: list[str], summaries: dict | None = None, include_running: bool = False
 ) -> dict[str, list[str]] | None:
   if summaries is None:
     summaries = _fetch_live_summaries()
@@ -1432,6 +1323,9 @@ def list_live_dependents(
       reasons.append(f"{tasks} background task(s)")
     if s.get("hasRunningSubagents"):
       reasons.append("running subagent(s)")
+    # Checking another chat (sweep, audit): its own running turn is live work too
+    if include_running and s.get("status") == "CASCADE_RUN_STATUS_RUNNING":
+      reasons.append("running turn")
     if reasons:
       live[cid] = reasons
   return live
@@ -1659,13 +1553,14 @@ def create_handoff(
   # 6. Verify sourceMetadata (lives under metadata.sourceMetadata; null => visible in the sidebar)
   fetched, source_meta = get_conversation_source_metadata(new_cid)
 
-  # 7. Advance lifecycle markers across the chain.
-  # Pass [current_conv_id, new_cid] explicitly because SendUserCascadeMessage is
-  # non-blocking and brain/<new_cid>/.../transcript.jsonl may not exist on disk yet.
-  # The new chat has no local title yet either, and advance falls back to the
-  # predecessor's topic for empty titles, so its own title is recorded first
+  # 7. Once the continuation is verified visible, the handed-off chat leaves the sidebar. It
+  # stays reachable via conversation:// and chain search; the live-work guard above ensures
+  # nothing reports into it later. An unverified continuation keeps the caller visible, or
+  # both chats could vanish
   update_conversation_title(new_cid, cont_title)
-  advance_in_progress_chain(chain_ids=[current_conv_id, new_cid])
+  if fetched and source_meta is None:
+    archive_conversations([current_conv_id])
+  export_chain_index()
 
   return {
       "new_conversation_id": new_cid,
@@ -1738,15 +1633,17 @@ def sweep_completed_project_chats(
     if leaf_pid and leaf_pid != project_id:
       continue
     leaf_title = get_conversation_title(leaf_id)
-    if not leaf_title or is_finalized_title(leaf_title) or is_waiting_title(leaf_title):
+    if not leaf_title or is_archived(leaf_id) or is_waiting_title(leaf_title):
       continue
     # A finalized chat drops out of sight, so live work must not report into it; with live
     # state unknown nothing is finalized
     if not live_fetched:
       live_summaries, live_fetched = _fetch_live_summaries(), True
-    if live_summaries is None or list_live_dependents([leaf_id], live_summaries):
+    if live_summaries is None or list_live_dependents(
+        [leaf_id], live_summaries, include_running=True
+    ):
       continue
-    finalized = finalize_conversation_chain(leaf_id, chain)
+    finalized = archive_chain(leaf_id)
     swept_chains.append(finalized)
     actually_finalized.update(finalized)
     for c in chain:
@@ -1978,9 +1875,9 @@ def create_next_task(
 
   fetched, source_meta = get_conversation_source_metadata(new_cid)
 
-  # Close the finished task's chat/chain («» or «...»), sweep completed sibling chats,
-  # and record new_cid as an active root chat
-  finalized_chain = finalize_conversation_chain(current_conv_id)
+  # Archive the finished task's chain (only once new_cid is verified visible, same as
+  # handoff), sweep completed sibling chats, and record new_cid as an active root chat
+  finalized_chain = archive_chain(current_conv_id) if fetched and source_meta is None else []
   swept_sibling_chains = sweep_completed_project_chats(
       project_id,
       exclude_cids={new_cid},
@@ -2049,7 +1946,7 @@ def get_chain_status(conv_id: str) -> dict:
         "conversation_id": cid,
         "title": raw_title,
         "base_topic": clean_base_title(raw_title),
-        "is_finalized": is_finalized_title(raw_title),
+        "is_archived": is_archived(cid),
         "is_current": (cid == conv_id),
     })
 
@@ -2069,7 +1966,7 @@ def get_chain_status(conv_id: str) -> dict:
       "current_conversation_id": conv_id,
       "current_title": cur_title,
       "base_topic": clean_base_title(cur_title),
-      "is_finalized": is_finalized_title(cur_title),
+      "is_archived": is_archived(conv_id),
       "chain_length": len(chain),
       "chain": items,
       "summary_files": summaries,
@@ -2077,9 +1974,9 @@ def get_chain_status(conv_id: str) -> dict:
 
 
 def archive_conversations(
-    conv_ids: list[str], include_chain: bool = False
+    conv_ids: list[str], include_chain: bool = False, archived: bool = True
 ) -> dict:
-  """Archives conversations via Language Server RPC and updates annotations/<id>.pbtxt."""
+  """Sets the archived flag via Language Server RPC and in annotations/<id>.pbtxt."""
   target_ids: list[str] = []
   seen: set[str] = set()
   for cid in conv_ids:
@@ -2104,7 +2001,7 @@ def archive_conversations(
         "UpdateConversationAnnotations",
         {
             "cascadeIds": target_ids,
-            "annotations": {"archived": True},
+            "annotations": {"archived": archived},
             "mergeAnnotations": True,
         },
     )
@@ -2113,6 +2010,7 @@ def archive_conversations(
     pass
 
   disk_ok = False
+  flag = f"archived:{'true' if archived else 'false'}"
   for app_dir in find_app_data_dirs():
     ann_dir = os.path.join(app_dir, ANNOTATIONS_DIR_NAME)
     try:
@@ -2126,13 +2024,11 @@ def archive_conversations(
           with open(ann_file, "r", encoding="utf-8") as f:
             content = f.read()
           if re.search(r"\barchived\s*:\s*(?:true|false)", content):
-            new_content = re.sub(
-                r"\barchived\s*:\s*(?:true|false)", "archived:true", content
-            )
+            new_content = re.sub(r"\barchived\s*:\s*(?:true|false)", flag, content)
           else:
-            new_content = f"{content.rstrip()}  archived:true\n"
+            new_content = f"{content.rstrip()}  {flag}\n"
         else:
-          new_content = "archived:true\n"
+          new_content = f"{flag}\n"
         with open(ann_file, "w", encoding="utf-8") as f:
           f.write(new_content)
         disk_ok = True
@@ -2433,11 +2329,13 @@ def audit_conversations(
   audited_chains = 0
   audited_chats = 0
 
-  # Regex for a strictly valid Scheme Γ title: [HH:MM] <single_marker> <non-marker topic>
-  valid_gamma_re = re.compile(
-      r"^\[\d{2}:\d{2}\] (?:▸|✓|⦿|⏳|«|‹✓›|»|«») (?!(?:[▸✓⦿⏳«»]|‹✓›|«»)(?:\s|$))\S"
+  # A visible chat reads "[HH:MM] ⦿|⏳ <topic>" with exactly one marker
+  valid_title_re = re.compile(
+      r"^\[\d{2}:\d{2}\] (?:⦿|⏳) (?!(?:[▸✓⦿⏳«»]|‹✓›|«»)(?:\s|$))\S"
   )
 
+  live_summaries: dict | None = None
+  live_fetched = False
   for root_id in roots:
     chain = _order_chain_from_root(root_id, vis_children, created_at_of)
     if target_project_id:
@@ -2455,38 +2353,50 @@ def audit_conversations(
         chain_topic = t
         break
 
-    tail_title = _BestTitle(chain[-1])
-    finalized = is_finalized_title(tail_title)
-
     for idx, cid in enumerate(chain):
       cur_title = _BestTitle(cid)
-      # Preserve explicit ⏳ wait marker on open leaf chats during audit
-      open_leaf_marker = (
-          MARKER_WAITING if is_waiting_title(cur_title) else MARKER_ACTIVE
-      )
-      if len(chain) == 1:
-        exp_marker = MARKER_SINGLE_CLOSED if finalized else open_leaf_marker
-      elif idx == 0:
-        exp_marker = MARKER_CLOSED_START if finalized else MARKER_START
-      elif idx == len(chain) - 1:
-        exp_marker = MARKER_CLOSED_END if finalized else open_leaf_marker
-      else:
-        exp_marker = MARKER_CLOSED_STEP if finalized else MARKER_STEP
+      marker = parse_title_marker(cur_title)
+      # Handed-off pieces and chats closed under the pre-archive «…» scheme belong in the
+      # archive, not in the sidebar
+      # A piece is handed off only when a visible chat continues it: in a forked tree the
+      # older branch's leaf is still an open chat
+      if cid in vis_children or marker in LEGACY_CLOSED_MARKERS:
+        is_fixed = False
+        # Same rule as handoff: live work must not report into a chat that gets hidden,
+        # and unknown live state archives nothing
+        if fix and not live_fetched:
+          live_summaries, live_fetched = _fetch_live_summaries(), True
+        if fix and live_summaries is not None and not list_live_dependents(
+            [cid], live_summaries, include_running=True
+        ):
+          res = archive_conversations([cid])
+          is_fixed = bool(res["rpc_ok"] or res["disk_ok"])
+          fixed_count += int(is_fixed)
+        discrepancies.append({
+            "conversation_id": cid,
+            "project_id": _ProjectOf(cid),
+            "chain_position": f"{idx + 1}/{len(chain)}",
+            "issues": ["should_be_archived"],
+            "title": cur_title,
+            "fixed": is_fixed,
+        })
+        continue
 
+      open_leaf_marker = MARKER_WAITING if marker == MARKER_WAITING else MARKER_ACTIVE
       fallback_hhmm = _iso_to_hhmm(created_at_of.get(cid, "")) or get_current_time_str()
       ts = extract_time_prefix(cur_title, fallback_hhmm)
       base = clean_base_title(cur_title) or chain_topic
-      expected_title = f"[{ts}] {exp_marker} {base}"
+      expected_title = f"[{ts}] {open_leaf_marker} {base}"
 
       pb_t = pbtxt_titles.get(cid, "")
       db_t = db_titles.get(cid, "")
       ls_t = ls_titles.get(cid, "") if ls_online else ""
 
       issues: list[str] = []
-      if cur_title != expected_title or not valid_gamma_re.match(cur_title):
+      if cur_title != expected_title or not valid_title_re.match(cur_title):
         issues.append("marker_mismatch")
 
-      if ls_online and ls_t != expected_title and not valid_gamma_re.match(ls_t):
+      if ls_online and ls_t != expected_title and not valid_title_re.match(ls_t):
         if "marker_mismatch" not in issues:
           issues.append("ls_marker_mismatch")
 
@@ -2542,7 +2452,7 @@ Usage:
 
 Commands:
   status [id]                         Show the chain for <id>: titles, markers,
-                                      is_finalized, summary file paths. Read-only.
+                                      is_archived, summary file paths. Read-only.
   set-title <id> "<Topic>"            Rename the chat. Time prefix [HH:MM] and the
                                       marker are added automatically.
   auto-title <id> "<prompt>"          Detect PR/CL/bug/commit in prompt and set title
@@ -2551,7 +2461,7 @@ Commands:
                                       (brain/<id>/handoff_summary_<slug>_<id8>.md).
   handoff <id> [summary_file]         Create a visible continuation chat in the same
           [--notes "..."]             project, verify sourceMetadata is null and
-          [--next "..."]              update chain markers. In a project the summary
+          [--next "..."]              archive <id>. In a project the summary
           [--topic "<Topic>"]         is the chain state file (roadmap.py state-path);
           [--model <m>] [--force]     it moves to the new chat and the roadmap is
                                       printed before the JSON. Outside projects it
@@ -2565,7 +2475,7 @@ Commands:
                                       refuses while <id> has running subagents or
                                       background tasks (incl. timers): their reports
                                       would land in a hidden chat. --ignore-live skips it.
-  next-task [<id>] [<R_ID>]           Finalize <id>'s chain («» / «…») and launch a
+  next-task [<id>] [<R_ID>]           Archive <id>'s chain and launch a
           [--topic "<Topic>"]         fresh root chat (⦿) in the same project for roadmap
           [--notes "..."]             item <R_ID> (or the first todo item if omitted).
           [--next "..."]              Claims <R_ID> as doing, links <R_ID> -> <new_id>,
@@ -2586,8 +2496,9 @@ Commands:
                                       arguments, lists all configured project models.
   audit [--fix] [--project <p>]       Scan visible top-level chats and handoff chains
                                       for storage desync (LS RPC vs .pbtxt vs SQLite)
-                                      and broken/double Scheme Γ markers. With --fix,
-                                      repairs all discrepancies via update_conversation_title.
+                                      and broken/double markers; visible handed-off
+                                      pieces and old «…»-closed chats are reported as
+                                      should_be_archived. --fix retitles / archives.
   archive [<id...>] [--chain]         Archive the specified conversation(s) (or their
           [--project <p>] [--keep <N>] entire handoff chain with --chain) via LS RPC
                                       and annotations/<id>.pbtxt. With --project,
@@ -2596,24 +2507,23 @@ Commands:
   auto-archive [<id>] [--hook]        Prune older chats across projects configured with
                                       a retention policy (default: keep 1 newest for
                                       skia-g3-roll-check). Use --hook for lifecycle hooks.
-  finalize <id>                       Close the whole chain. USER-ONLY: run it
+  finalize <id>                       Archive the whole chain. USER-ONLY: run it
                                       only on the user's explicit word ("финал").
-                                      Timestamps are preserved.
-  reopen <id>                         Re-activate a finalized chain. USER-ONLY.
+  reopen <id>                         Unarchive <id> as an open ⦿ chat. USER-ONLY.
   wait [<id>] [on|off|toggle]         Set or toggle an open chat's idle attention marker
                                       between ⏳ (Waiting Cron/External) and ⦿ (Needs Me).
 
 Internal (used by hooks; do not run manually):
   set <id> "<raw title>"              Write a title verbatim, no marker handling.
-  advance <id> [<id>...]              Recompute in-progress markers for a chain.
 
 Notes:
   * <id> may be any conversation of the chain for finalize/reopen/status/archive --chain.
   * When <id> is omitted, $CONVERSATION_ID is used (set inside the agent's
     run_command only).
-  * Markers (▸ ✓ ⦿ ⏳ « ‹✓› » «») are derived mechanically from the chain; never
-    choose or edit them by hand. A chain is the set of chats joined by handoff
-    links (who continues whom); topics may differ from step to step.
+  * Only visible chats carry a marker: ⦿ (needs the user) or ⏳ (waiting). Handed-off
+    pieces and finished chats are archived. Never choose or edit markers by hand. A
+    chain is the set of chats joined by handoff links (who continues whom); topics may
+    differ from step to step.
   * Model of a continuation: --model <id|display name|enum|flash_lite|flash|pro>
     -> project default (projects_models.json / DEFAULT_PROJECT_MODELS / project.json)
     -> model of <id>'s last turn (inherit) -> $HANDOFF_MODEL or the first
@@ -2640,7 +2550,6 @@ KNOWN_COMMANDS = (
     "next-task",
     "reopen",
     "wait",
-    "advance",
     "finalize",
     "audit",
     "archive",
@@ -3015,7 +2924,7 @@ def main(argv: list[str] | None = None) -> int:
       print(json.dumps(res, ensure_ascii=False, indent=2))
   elif cmd == "reopen":
     cid = _require_conversation_id("reopen", args[0] if args else "")
-    reopen_conversation(cid, force=True)
+    reopen_conversation(cid)
   elif cmd == "wait":
     # Allow `wait [on|off|toggle]` using $CONVERSATION_ID or `wait <id> [on|off|toggle]`
     mode_tokens = {
@@ -3041,23 +2950,14 @@ def main(argv: list[str] | None = None) -> int:
       return 2
     new_t = set_conversation_wait_state(cid, waiting=waiting_arg)
     print(f"Updated title for {cid}: {new_t}")
-  elif cmd == "advance":
-    cids = [_require_conversation_id("advance", a) for a in args]
-    if not cids:
-      _cli_fail("advance", "at least one conversation ID is required")
-    if len(cids) == 1:
-      advance_in_progress_chain(current_conv_id=cids[0])
-    else:
-      advance_in_progress_chain(chain_ids=cids)
   elif cmd == "finalize":
     cids = [_require_conversation_id("finalize", a) for a in args]
     if not cids:
       _cli_fail("finalize", "at least one conversation ID is required")
+    closed: list[str] = []
+    for cid in cids:
+      closed += archive_chain(cid)
     # Also sweep completed sibling worker chats in the same project so one finalize closes the batch
-    if len(cids) == 1:
-      closed = finalize_conversation_chain(cids[0])
-    else:
-      closed = finalize_conversation_chain(cids[0], cids)
     pid = get_conversation_project_id(cids[0])
     if pid and pid != "outside-of-project":
       sweep_completed_project_chats(pid, finalized_cids=set(closed))

@@ -11,9 +11,9 @@
   const STORAGE_BUCKETS_KEY = 'jetski_visible_buckets_v1';
   const BAR_CLASS = 'jetski-attention-filter-bar';
   const BUTTON_CLASS = 'jetski-closed-chats-filter-btn';
-  const TITLEBAR_BTN_CLASS = 'jetski-titlebar-close-reopen-btn';
+  const TITLEBAR_BTN_CLASS = 'jetski-titlebar-archive-btn';
   const TITLEBAR_WAIT_BTN_CLASS = 'jetski-titlebar-wait-btn';
-  const ROW_BTN_CLASS = 'jetski-row-close-reopen-btn';
+  const ROW_BTN_CLASS = 'jetski-row-archive-btn';
   const ROW_WAIT_BTN_CLASS = 'jetski-row-wait-btn';
   // Right-side ⏳ badge rendered on open ⦿ rows waiting on background tasks or subagents
   const ROW_BG_WAIT_INDICATOR_CLASS = 'jetski-row-bg-wait-indicator';
@@ -21,10 +21,9 @@
   const PROJECT_ROADMAP_BADGE_CLASS = 'jetski-project-roadmap-badge';
   const STYLE_ID = 'jetski-closed-chats-filter-style';
 
-  // Lifecycle titles follow "[HH:MM] <marker> <Topic>" where marker encodes chain/wait state
-  // The time prefix and the space after the marker are mandatory so a plain title opening
-  // with a guillemet quote is never read as the finalized « marker
-  const TITLE_MARKER_RE = /^\s*\[\d{1,2}:\d{2}\]\s*(‹✓›|«»|⏳|[✓⦿▸«»])(?:\s|$)/u;
+  // Lifecycle titles follow "[HH:MM] <marker> <Topic>"; finished chats and handed-off chain
+  // pieces are archived by chat_lifecycle.py, so visible chats carry only ⦿ or ⏳
+  const TITLE_MARKER_RE = /^\s*\[\d{1,2}:\d{2}\]\s*([⏳⦿])(?:\s|$)/u;
   // Matches the leading "[HH:MM] ⦿" prefix so background-waiting rows can display ⏳ in DOM
   const ACTIVE_TO_WAITING_DISPLAY_RE = /^(\s*\[\d{1,2}:\d{2}\]\s*)⦿(\s|$)/u;
   const TIME_PREFIX_EXTRACT_RE = /^\s*\[(\d{1,2}:\d{2})\]/;
@@ -37,26 +36,13 @@
     `\\s*\\(${CONT_WORD}\\s+(?:\\d{4}-\\d{2}-\\d{2}\\s+)?\\d{1,2}:\\d{2}\\)\\s*$`,
     'iu'
   );
-  // chat_lifecycle.py finalize rewrites every chat of a chain to «, ‹✓›, » (or «» for a
-  // single-chat task), so each title alone tells whether its task is closed
-  const FINALIZED_MARKERS = new Set(['«', '‹✓›', '»', '«»']);
-  // Open chains read ▸ root, ✓ handed-off steps, and ⦿ (Needs Me) or ⏳ (Waiting) leaf
-  const OPEN_CHAIN_ROOT_MARKER = '▸';
-  const OPEN_CHAIN_STEP_MARKER = '✓';
   const OPEN_ACTIVE_MARKER = '⦿';
   const OPEN_WAITING_MARKER = '⏳';
-  const CLOSED_START_MARKER = '«';
-  const CLOSED_STEP_MARKER = '‹✓›';
-  const CLOSED_END_MARKER = '»';
-  const CLOSED_SINGLE_MARKER = '«»';
 
-  const BUCKET_ORDER = ['needs-me', 'working', 'waiting', 'closed'];
+  const BUCKET_ORDER = ['needs-me', 'working', 'waiting'];
   const SEARCH_BTN_CLASS = 'jetski-chat-search-btn';
   const SEARCH_PANEL_ID = 'jetski-chat-search-panel';
   const DEFAULT_VISIBLE_BUCKETS = ['needs-me', 'working'];
-  // Handed-off pieces of a chain stay hidden under every bucket selection; the chain tail
-  // alone carries the task state and earlier pieces are reached through search
-  const CHAIN_STEP_CLASS = 'chain-step';
 
   const BUCKET_DEFS = {
     'needs-me': {
@@ -83,14 +69,6 @@
       description:
         'Background cron/timer chats or chats waiting on external events (Gerrit, CQ) that do not need your action right now.',
     },
-    closed: {
-      key: 'closed',
-      icon: '«»',
-      shortLabel: 'Closed',
-      title: '«» Closed Chats',
-      description:
-        'Completed and finalized single-chat tasks («») or handoff chains («, ‹✓›, »).',
-    },
   };
 
   function safeGetStorage(key) {
@@ -116,7 +94,9 @@
         const parsed = JSON.parse(raw);
         if (Array.isArray(parsed)) {
           const valid = parsed.filter((k) => BUCKET_ORDER.includes(k));
-          return new Set(valid);
+          // A set made only of retired buckets ('closed', 'steps') is not a choice of an empty
+          // sidebar, so it falls back to the defaults; a saved [] stays empty
+          if (valid.length > 0 || parsed.length === 0) return new Set(valid);
         }
       } catch {
         // Fall back to default visible buckets on malformed storage JSON
@@ -144,6 +124,9 @@
   let reduxStore = null;
   let isInternalDispatch = false;
   let rafScheduled = false;
+  // Set by cleanup; the store keeps this instance's dispatch patch and subscriber after a
+  // re-injection, so both must go inert instead of fighting the new instance
+  let disposed = false;
   let activeHoverBtn = null;
   let activeHoverBucket = null;
   // Tracks which project roadmap badge owns the shared floating bubble tooltip
@@ -151,9 +134,6 @@
   let activeHoverRoadmapProjectId = null;
   let chainIndexCache = null;
   let chainIndexFetchedAt = 0;
-  let chainIndexFetching = false;
-  let chainPredecessorIds = new Set();
-  let chainGraphIds = new Set();
   // Caches jetski-roadmaps.json across DOM sync cycles within ROADMAP_INDEX_TTL_MS
   const ROADMAP_INDEX_TTL_MS = 5000;
   let roadmapIndexCache = null;
@@ -166,59 +146,18 @@
     return match ? match[1] : null;
   }
 
-  function isFinalizedTitle(title) {
-    const marker = parseTitleMarker(title);
-    return Boolean(marker && FINALIZED_MARKERS.has(marker));
-  }
-
   function isWaitingTitle(title) {
     return parseTitleMarker(title) === OPEN_WAITING_MARKER;
   }
 
-  function isChainPredecessorTitle(title) {
-    const marker = parseTitleMarker(title);
-    return (
-      marker === OPEN_CHAIN_ROOT_MARKER ||
-      marker === OPEN_CHAIN_STEP_MARKER ||
-      marker === CLOSED_START_MARKER ||
-      marker === CLOSED_STEP_MARKER
-    );
-  }
-
-  // Returns IDs that have at least one eligible continuation child in jetski-chains.json;
-  // an archived or tool-created child must not hide its parent, or the chain would vanish
-  function computeChainPredecessorIds(summariesMap, chainIndex) {
-    const preds = new Set();
-    const parentOf = chainIndex?.parentOf;
-    if (!parentOf || typeof parentOf !== 'object') return preds;
-    for (const [childId, parentId] of Object.entries(parentOf)) {
-      if (!parentId || !childId) continue;
-      if (
-        !summariesMap ||
-        (parentId in summariesMap && isEligibleTopLevelSummary(childId, summariesMap[childId]))
-      ) {
-        preds.add(parentId);
-      }
-    }
-    return preds;
-  }
-
-  // The graph is the source of truth once loaded; title markers only cover chats it lacks
-  function isChainPredecessor(cascadeId, title) {
-    if (cascadeId && chainPredecessorIds.has(cascadeId)) return true;
-    return !(cascadeId && chainGraphIds.has(cascadeId)) && isChainPredecessorTitle(title);
-  }
-
   // True when an open leaf ⦿ chat has finished its LLM turn and is waiting on a subagent or task
-  function isWaitingOnBackgroundWork(summary, fallbackTitle, cascadeId) {
+  function isWaitingOnBackgroundWork(summary, fallbackTitle) {
     // Summaries without Redux state cannot report background task activity
     if (!summary) return false;
     const title =
       summary?.annotations?.title || summary?.summary || fallbackTitle || '';
     // Only open leaf chats with ⦿ qualify; cron ⏳ chats already have a permanent marker
     if (parseTitleMarker(title) !== OPEN_ACTIVE_MARKER) return false;
-    // Handed-off chain predecessors never show active background wait state
-    if (isChainPredecessor(cascadeId, title)) return false;
     return (
       summary.status !== 'CASCADE_RUN_STATUS_RUNNING' &&
       Boolean(summary.notFullyIdle)
@@ -330,28 +269,6 @@
     return chainIndexCache || { parentOf: {}, createdAt: {} };
   }
 
-  // Periodically refreshes jetski-chains.json in the background so chain steps filter by graph too
-  function ensureChainIndexLoaded() {
-    const now = Date.now();
-    if (chainIndexFetching || (chainIndexCache && now - chainIndexFetchedAt < 15000)) {
-      return;
-    }
-    if (typeof window.fetch !== 'function') return;
-    chainIndexFetching = true;
-    const prevCount = Object.keys(chainIndexCache?.parentOf || {}).length;
-    fetchChainIndex()
-      .then((idx) => {
-        chainIndexFetching = false;
-        const nextCount = Object.keys(idx?.parentOf || {}).length;
-        if (nextCount !== prevCount) {
-          scheduleSync();
-        }
-      })
-      .catch(() => {
-        chainIndexFetching = false;
-      });
-  }
-
   async function fetchRoadmapIndex() {
     const now = Date.now();
     if (roadmapIndexCache && now - roadmapIndexFetchedAt < ROADMAP_INDEX_TTL_MS) {
@@ -406,104 +323,15 @@
       });
   }
 
-  function resolveChainIds(cascadeId, chainIndex, summariesMap) {
-    if (!cascadeId) return [];
-    const parentOf = chainIndex?.parentOf || {};
-    const createdAt = { ...(chainIndex?.createdAt || {}) };
-    if (summariesMap) {
-      for (const [cid, s] of Object.entries(summariesMap)) {
-        const ts = s?.trajectoryMetadata?.createdAt;
-        if (ts && !createdAt[cid]) {
-          createdAt[cid] = String(ts);
-        }
-      }
-    }
-
-    const childrenOf = {};
-    for (const [child, parent] of Object.entries(parentOf)) {
-      if (!parent) continue;
-      if (!childrenOf[parent]) childrenOf[parent] = [];
-      childrenOf[parent].push(child);
-    }
-
-    const ancReversed = [];
-    const seenAnc = new Set();
-    let cur = cascadeId;
-    while (cur && !seenAnc.has(cur)) {
-      seenAnc.add(cur);
-      ancReversed.push(cur);
-      cur = parentOf[cur];
-    }
-    const ancestors = ancReversed.reverse();
-    const rootId = ancestors[0] || cascadeId;
-    if (!childrenOf[rootId] && ancestors.length <= 1) {
-      return [cascadeId];
-    }
-
-    const memoMaxTs = {};
-    const memoHasChildren = {};
-    function getSubtreeInfo(nid, visited) {
-      if (nid in memoMaxTs) {
-        return [memoMaxTs[nid], memoHasChildren[nid]];
-      }
-      const nextVisited = new Set(visited);
-      nextVisited.add(nid);
-      const chList = (childrenOf[nid] || []).filter((ch) => !nextVisited.has(ch));
-      let maxTs = createdAt[nid] || '';
-      for (const ch of chList) {
-        const [chTs] = getSubtreeInfo(ch, nextVisited);
-        if (chTs > maxTs) maxTs = chTs;
-      }
-      memoMaxTs[nid] = maxTs;
-      memoHasChildren[nid] = chList.length > 0;
-      return [maxTs, chList.length > 0];
-    }
-    getSubtreeInfo(rootId, new Set());
-
-    const ordered = [];
-    const seen = new Set();
-    function dfs(nid) {
-      if (seen.has(nid)) return;
-      seen.add(nid);
-      ordered.push(nid);
-      const chList = (childrenOf[nid] || []).filter((ch) => !seen.has(ch));
-      chList.sort((a, b) => {
-        const maxA = memoMaxTs[a] || '';
-        const maxB = memoMaxTs[b] || '';
-        if (maxA !== maxB) return maxA < maxB ? -1 : 1;
-        const hasA = memoHasChildren[a] ? 1 : 0;
-        const hasB = memoHasChildren[b] ? 1 : 0;
-        if (hasA !== hasB) return hasA - hasB;
-        const tsA = createdAt[a] || '';
-        const tsB = createdAt[b] || '';
-        if (tsA !== tsB) return tsA < tsB ? -1 : 1;
-        return a < b ? -1 : a > b ? 1 : 0;
-      });
-      for (const ch of chList) dfs(ch);
-    }
-    dfs(rootId);
-
-    const fullChain = [];
-    const seenOut = new Set();
-    for (const cid of [...ancestors, ...ordered]) {
-      if (cid && !seenOut.has(cid)) {
-        seenOut.add(cid);
-        fullChain.push(cid);
-      }
-    }
-    return fullChain.length > 0 ? fullChain : [cascadeId];
-  }
-
-  function cloneSummaryWithTitle(summary, newTitle) {
-    if (!summary) return summary;
+  // Clones keep the protobuf prototypes, since Redux selectors read the summary as a message
+  function cloneSummaryWithAnnotations(summary, annotationsPatch) {
     const summaryProto = Object.getPrototypeOf(summary);
     const nextSummary = Object.assign(Object.create(summaryProto), summary);
-    nextSummary.summary = newTitle;
     const prevAnn = summary.annotations;
     const nextAnn = prevAnn
       ? Object.assign(Object.create(Object.getPrototypeOf(prevAnn)), prevAnn)
       : {};
-    nextAnn.title = newTitle;
+    Object.assign(nextAnn, annotationsPatch);
     nextSummary.annotations = nextAnn;
     return nextSummary;
   }
@@ -515,7 +343,13 @@
     return fromStore || fallbackDomTitle || '';
   }
 
-  async function postUpdateTitleRpc(cascadeId, newTitle) {
+  function isArchivedCascadeId(cascadeId) {
+    const store = findReduxStore();
+    const s = store?.getState()?.trajectorySummaries?.summaries?.[cascadeId];
+    return Boolean(s?.annotations?.archived);
+  }
+
+  async function postUpdateAnnotationsRpc(cascadeId, annotations) {
     if (typeof window.fetch !== 'function') return false;
     try {
       const resp = await window.fetch(
@@ -528,7 +362,7 @@
           },
           body: JSON.stringify({
             cascadeIds: [cascadeId],
-            annotations: { title: newTitle },
+            annotations,
             mergeAnnotations: true,
           }),
         }
@@ -539,123 +373,53 @@
     }
   }
 
-  // Swaps an open leaf conversation between ⦿ (Needs Me) and ⏳ (Waiting External/Cron)
+  // Applies an optimistic Redux summary update before the async LS RPC completes
+  function dispatchSummaryUpdate(cascadeId, nextSummary) {
+    findReduxStore()?.dispatch({
+      type: 'trajectorySummaries/applyStreamBatch',
+      payload: { updates: [[cascadeId, nextSummary]], deletes: [] },
+    });
+  }
+
+  // Swaps a conversation between ⦿ (Needs Me) and ⏳ (Waiting External/Cron)
   async function toggleConversationWaiting(cascadeId, fallbackDomTitle) {
     if (!cascadeId) return;
-    const store = findReduxStore();
     const curTitle = getTitleForCascadeId(cascadeId, fallbackDomTitle);
-    // Finalized («, ‹✓›, », «») and handed-off (▸, ✓) steps cannot toggle wait state
-    if (isFinalizedTitle(curTitle) || isChainPredecessor(cascadeId, curTitle)) return;
-
-    const nowTime = getCurrentTimeStr();
-    const ts = extractTimePrefix(curTitle, nowTime);
+    const ts = extractTimePrefix(curTitle, getCurrentTimeStr());
     const base = cleanBaseTitle(curTitle) || 'Investigation';
     const nextMarker = isWaitingTitle(curTitle)
       ? OPEN_ACTIVE_MARKER
       : OPEN_WAITING_MARKER;
     const newTitle = `[${ts}] ${nextMarker} ${base}`;
 
-    const s = store?.getState()?.trajectorySummaries?.summaries?.[cascadeId];
-    // Apply optimistic Redux title update immediately before the async LS RPC completes
-    if (store && s) {
-      store.dispatch({
-        type: 'trajectorySummaries/applyStreamBatch',
-        payload: {
-          updates: [[cascadeId, cloneSummaryWithTitle(s, newTitle)]],
-          deletes: [],
-        },
-      });
+    const s = findReduxStore()?.getState()?.trajectorySummaries?.summaries?.[cascadeId];
+    if (s) {
+      const next = cloneSummaryWithAnnotations(s, { title: newTitle });
+      next.summary = newTitle;
+      dispatchSummaryUpdate(cascadeId, next);
     }
-
     runFullSync();
-    await postUpdateTitleRpc(cascadeId, newTitle);
+    await postUpdateAnnotationsRpc(cascadeId, { title: newTitle });
   }
 
-  async function toggleConversationLifecycle(cascadeId, fallbackDomTitle) {
+  // Flips annotations.archived of one chat; chat_lifecycle.py archives handed-off chain pieces
+  // itself, so the UI never walks the chain or rewrites titles
+  async function toggleConversationArchived(cascadeId) {
     if (!cascadeId) return;
-    const store = findReduxStore();
-    const summariesMap = store?.getState()?.trajectorySummaries?.summaries || {};
-    const curTitle = getTitleForCascadeId(cascadeId, fallbackDomTitle);
-    const closing = !isFinalizedTitle(curTitle);
-    const nowTime = getCurrentTimeStr();
-
-    const chainIndex = await fetchChainIndex();
-    const chainIds = resolveChainIds(cascadeId, chainIndex, summariesMap);
-
-    let chainTopic = 'Investigation';
-    for (let i = chainIds.length - 1; i >= 0; i--) {
-      const t = cleanBaseTitle(
-        getTitleForCascadeId(chainIds[i], chainIds[i] === cascadeId ? fallbackDomTitle : '')
-      );
-      if (t && t !== 'Investigation') {
-        chainTopic = t;
-        break;
-      }
+    const archived = !isArchivedCascadeId(cascadeId);
+    const s = findReduxStore()?.getState()?.trajectorySummaries?.summaries?.[cascadeId];
+    if (s) {
+      dispatchSummaryUpdate(cascadeId, cloneSummaryWithAnnotations(s, { archived }));
     }
-
-    const titleUpdates = [];
-    for (let idx = 0; idx < chainIds.length; idx++) {
-      const cid = chainIds[idx];
-      const existingTitle = getTitleForCascadeId(
-        cid,
-        cid === cascadeId ? fallbackDomTitle : ''
-      );
-      let marker = OPEN_ACTIVE_MARKER;
-      if (chainIds.length === 1) {
-        marker = closing ? CLOSED_SINGLE_MARKER : OPEN_ACTIVE_MARKER;
-      } else if (idx === 0) {
-        marker = closing ? CLOSED_START_MARKER : OPEN_CHAIN_ROOT_MARKER;
-      } else if (idx === chainIds.length - 1) {
-        marker = closing ? CLOSED_END_MARKER : OPEN_ACTIVE_MARKER;
-      } else {
-        marker = closing ? CLOSED_STEP_MARKER : OPEN_CHAIN_STEP_MARKER;
-      }
-
-      const ts =
-        chainIds.length === 1 && !closing
-          ? nowTime
-          : extractTimePrefix(existingTitle, nowTime);
-      const base = cleanBaseTitle(existingTitle) || chainTopic;
-      const newTitle = `[${ts}] ${marker} ${base}`;
-      titleUpdates.push([cid, newTitle]);
-    }
-
-    if (store && store.getState()?.trajectorySummaries?.summaries) {
-      const currentSummaries = store.getState().trajectorySummaries.summaries;
-      const batchUpdates = [];
-      for (const [cid, newTitle] of titleUpdates) {
-        const s = currentSummaries[cid];
-        if (s) {
-          batchUpdates.push([cid, cloneSummaryWithTitle(s, newTitle)]);
-        }
-      }
-      if (batchUpdates.length > 0) {
-        store.dispatch({
-          type: 'trajectorySummaries/applyStreamBatch',
-          payload: { updates: batchUpdates, deletes: [] },
-        });
-      }
-    }
-
     runFullSync();
-
-    await Promise.all(
-      titleUpdates.map(([cid, newTitle]) => postUpdateTitleRpc(cid, newTitle))
-    );
+    await postUpdateAnnotationsRpc(cascadeId, { archived });
   }
 
-  // Classifies a conversation into one of the 4 state buckets, or CHAIN_STEP_CLASS for a
-  // handed-off piece of an open or finalized chain
-  function classifyChatBucket(summary, fallbackTitle, cascadeId) {
+  // Classifies a conversation into one of the 3 state buckets
+  function classifyChatBucket(summary, fallbackTitle) {
     const title =
       summary?.annotations?.title || summary?.summary || fallbackTitle || '';
-    if (isChainPredecessor(cascadeId, title)) {
-      return CHAIN_STEP_CLASS;
-    }
     const marker = parseTitleMarker(title);
-    if (marker && FINALIZED_MARKERS.has(marker)) {
-      return 'closed';
-    }
     // Cron chats with marker ⏳ keep notFullyIdle=true between ticks, so only
     // CASCADE_RUN_STATUS_RUNNING counts as actively working for ⏳ chats
     const isRunning =
@@ -676,7 +440,6 @@
       'needs-me': 0,
       working: 0,
       waiting: 0,
-      closed: 0,
     };
   }
 
@@ -699,9 +462,6 @@
   }
 
   function classifySummaries(summariesMap, allowedBuckets) {
-    chainPredecessorIds = computeChainPredecessorIds(summariesMap, chainIndexCache);
-    const parentOf = chainIndexCache?.parentOf || {};
-    chainGraphIds = new Set([...Object.keys(parentOf), ...Object.values(parentOf)]);
     const hiddenIds = new Set();
     let chosenHiddenCount = 0;
     const perProjectHidden = new Map();
@@ -709,12 +469,7 @@
 
     for (const [cascadeId, summary] of Object.entries(summariesMap || {})) {
       if (!isEligibleTopLevelSummary(cascadeId, summary)) continue;
-      const bucket = classifyChatBucket(summary, '', cascadeId);
-      // Chain steps are not a choice, so they stay out of counts and per-project "hidden"
-      if (bucket === CHAIN_STEP_CLASS) {
-        hiddenIds.add(cascadeId);
-        continue;
-      }
+      const bucket = classifyChatBucket(summary, '');
       countBucket(statsSummary, bucket);
       if (allowedBuckets.has(bucket)) continue;
       hiddenIds.add(cascadeId);
@@ -829,6 +584,7 @@
     // without flickering into the sidebar index on server stream ticks
     const origDispatch = store.dispatch;
     store.dispatch = function patchedDispatch(action) {
+      if (disposed) return origDispatch.call(this, action);
       // Rewrite any open request so keyboard shortcuts or UI triggers cannot open the panel
       if (
         action?.type === 'auxPaneV2/setOverviewPanelOpen' &&
@@ -1059,7 +815,7 @@
       .${SEARCH_BTN_CLASS} {
         background: transparent; border: none; cursor: pointer; padding: 0 4px; opacity: 0.8;
       }
-      html[data-jetski-hide-closed="true"] div[data-sidebar-row-id][data-jetski-closed-row="true"]:not([data-sidebar-section-id="pinned"]) {
+      [data-sidebar-row-id][data-jetski-closed-row="true"]:not([data-sidebar-section-id="pinned"]) {
         height: 0px !important;
         min-height: 0px !important;
         max-height: 0px !important;
@@ -1179,7 +935,7 @@
         color: var(--foreground, #e8eaed);
         border-color: rgba(128, 134, 139, 0.40);
       }
-      .${TITLEBAR_BTN_CLASS}[data-finalized="true"],
+      .${TITLEBAR_BTN_CLASS}[data-archived="true"],
       .${TITLEBAR_WAIT_BTN_CLASS}[data-waiting="true"] {
         background: color-mix(in srgb, var(--primary, #8ab4f8) 16%, transparent);
         border-color: color-mix(in srgb, var(--primary, #8ab4f8) 36%, transparent);
@@ -1215,7 +971,7 @@
         background: var(--sidebar-secondary, rgba(128, 134, 139, 0.22));
         color: var(--foreground, #e8eaed);
       }
-      .${ROW_BTN_CLASS}[data-finalized="true"],
+      .${ROW_BTN_CLASS}[data-archived="true"],
       .${ROW_WAIT_BTN_CLASS}[data-waiting="true"] {
         color: var(--primary, #8ab4f8);
       }
@@ -1399,10 +1155,6 @@
 
   function syncDomRowsAndPlaceholders(reduxActive) {
     const anyHidden = visibleBuckets.size < BUCKET_ORDER.length;
-    // Chain steps hide even with every bucket on, so the row-hiding CSS stays armed
-    if (document.documentElement.getAttribute('data-jetski-hide-closed') !== 'true') {
-      document.documentElement.setAttribute('data-jetski-hide-closed', 'true');
-    }
 
     const store = findReduxStore();
     const summariesMap = store?.getState()?.trajectorySummaries?.summaries || {};
@@ -1415,13 +1167,11 @@
       const rowId = rowEl.getAttribute('data-sidebar-row-id') || '';
       // Read the raw title so a temporary ⏳ display swap never alters bucket classification
       const title = getRawDomTitle(rowEl);
-      const bucket = classifyChatBucket(summariesMap[rowId], title, rowId);
-      // Same as the Redux path: chain steps always hide and never count as a hidden choice
-      const isChainStep = bucket === CHAIN_STEP_CLASS;
-      if (!isChainStep) countBucket(domStats, bucket);
+      const bucket = classifyChatBucket(summariesMap[rowId], title);
+      countBucket(domStats, bucket);
 
-      if (isChainStep || !visibleBuckets.has(bucket)) {
-        if (!isChainStep) domHiddenCount++;
+      if (!visibleBuckets.has(bucket)) {
+        domHiddenCount++;
         if (rowEl.getAttribute('data-jetski-closed-row') !== 'true') {
           rowEl.setAttribute('data-jetski-closed-row', 'true');
         }
@@ -1504,7 +1254,7 @@
         ${def.description}<br/>
         <b>Click</b> to ${clickVerb} ${def.shortLabel} chats.
       </div>
-      <div class="jcfb-section-title">All 4 chat states (independent filters)</div>
+      <div class="jcfb-section-title">All 3 chat states (independent filters)</div>
       ${rowsHtml}
       <div class="jcfb-row jcfb-total-row">
         <span>Showing in sidebar:</span>
@@ -1513,7 +1263,7 @@
       <div class="jcfb-controls">
         <div><kbd>Left-click</kbd> — toggle this state ON / OFF (combine filters)</div>
         <div><kbd>Right-click</kbd> / <kbd>Shift+click</kbd> —
-          show ONLY this state (or all 4 if solo)</div>
+          show ONLY this state (or all 3 if solo)</div>
       </div>
     `;
   }
@@ -1892,9 +1642,8 @@
 
   // Ordered pieces of cascadeId's handoff chain from jetski-chains.json; past cascadeId the
   // chain follows the newest child, the same branch chat_lifecycle.py treats as the tail
-  function chainOf(cascadeId) {
-    const parentOf = chainIndexCache?.parentOf || {};
-    const createdAt = chainIndexCache?.createdAt || {};
+  async function chainOf(cascadeId) {
+    const { parentOf, createdAt } = await fetchChainIndex();
     const childrenOf = {};
     for (const [child, parent] of Object.entries(parentOf)) {
       (childrenOf[parent] = childrenOf[parent] || []).push(child);
@@ -2055,12 +1804,11 @@
       .join('');
   }
 
-  // Search window over one chat and all its hidden handoff pieces; the chain index is awaited
-  // so a cold first open does not silently search only the current piece
+  // Search window over one chat and all its archived handoff pieces; the chain index is
+  // awaited so a cold first open does not silently search only the current piece
   async function openSearchPanel(cascadeId) {
     closeSearchPanel();
-    await fetchChainIndex();
-    const chain = chainOf(cascadeId);
+    const chain = await chainOf(cascadeId);
     const stepCache = new Map();
     const panel = document.createElement('div');
     panel.id = SEARCH_PANEL_ID;
@@ -2097,7 +1845,7 @@
   // The test harness fake DOM cannot type into the panel, so it drives search directly
   window.__jetskiChatSearch = { runChatSearch, chainOf };
 
-  // Injects the 4-button filter bar directly below the sidebar header row
+  // Injects the 3-button filter bar directly below the sidebar header row
   function ensureFilterBar() {
     const displayOptionsBtns = document.querySelectorAll(
       'button[aria-label="Display Options"]'
@@ -2219,15 +1967,13 @@
     });
   }
 
-  // Syncs the titlebar wait-toggle button for open leaf chats (⦿ <-> ⏳)
+  // Syncs the titlebar wait-toggle button (⦿ <-> ⏳)
   function updateTitlebarWaitButtonUI(btn, cascadeId) {
     if (!btn || !cascadeId) return;
     btn.setAttribute('data-cascade-id', cascadeId);
     const curTitle = getTitleForCascadeId(cascadeId, '');
-    // Hide the Wait toggle on closed chats and handed-off chain predecessors
-    const isLeafOpen =
-      !isFinalizedTitle(curTitle) && !isChainPredecessor(cascadeId, curTitle);
-    btn.style.display = isLeafOpen ? '' : 'none';
+    // Wait state of an archived chat is invisible in every bucket, so the toggle is hidden
+    btn.style.display = isArchivedCascadeId(cascadeId) ? 'none' : '';
     const waiting = isWaitingTitle(curTitle);
     const waitStr = waiting ? 'true' : 'false';
     if (btn.getAttribute('data-waiting') !== waitStr) {
@@ -2251,33 +1997,32 @@
     }
   }
 
-  // Syncs the titlebar pill button label and finalized attribute with the current chat title
-  function updateTitlebarCloseButtonUI(btn, cascadeId) {
+  // Syncs the titlebar pill button label and archived attribute with the chat annotations
+  function updateTitlebarArchiveButtonUI(btn, cascadeId) {
     if (!btn || !cascadeId) return;
     btn.setAttribute('data-cascade-id', cascadeId);
-    const curTitle = getTitleForCascadeId(cascadeId, '');
-    const finalized = isFinalizedTitle(curTitle);
-    const finStr = finalized ? 'true' : 'false';
-    if (btn.getAttribute('data-finalized') !== finStr) {
-      btn.setAttribute('data-finalized', finStr);
+    const archived = isArchivedCascadeId(cascadeId);
+    const archStr = archived ? 'true' : 'false';
+    if (btn.getAttribute('data-archived') !== archStr) {
+      btn.setAttribute('data-archived', archStr);
     }
-    const label = finalized ? 'Reopen chat' : 'Close chat';
+    const label = archived ? 'Unarchive chat' : 'Archive chat';
     if (btn.getAttribute('aria-label') !== label) {
       btn.setAttribute('aria-label', label);
     }
     if (btn.getAttribute('title') !== label) {
       btn.setAttribute('title', label);
     }
-    const nextHtml = finalized
-      ? '<span>⦿</span><span>Reopen</span>'
-      : '<span>«»</span><span>Close</span>';
+    const nextHtml = archived
+      ? '<span>⦿</span><span>Unarchive</span>'
+      : '<span>🗄</span><span>Archive</span>';
     if (btn.innerHTML !== nextHtml) {
       btn.innerHTML = nextHtml;
     }
   }
 
-  // Injects or updates the Wait and Close/Reopen pill buttons before ⋮ in each conversation titlebar
-  function ensureTitlebarCloseButtons() {
+  // Injects or updates the Wait and Archive pill buttons before ⋮ in each conversation titlebar
+  function ensureTitlebarButtons() {
     const moreActionsBtns = document.querySelectorAll(
       '[data-testid="titlebar-more-actions"]'
     );
@@ -2324,29 +2069,27 @@
         btn = document.createElement('button');
         btn.className = TITLEBAR_BTN_CLASS;
         btn.type = 'button';
-        btn.setAttribute('data-testid', 'jetski-titlebar-close-reopen-btn');
+        btn.setAttribute('data-testid', 'jetski-titlebar-archive-btn');
         bindActionBtnHandlers(btn, () => {
           const cid =
             btn.getAttribute('data-cascade-id') || findCascadeIdFromElement(moreBtn);
           if (cid) {
-            void toggleConversationLifecycle(cid, '');
+            void toggleConversationArchived(cid);
           }
         });
         container.insertBefore(btn, moreBtn);
       }
-      updateTitlebarCloseButtonUI(btn, cascadeId);
+      updateTitlebarArchiveButtonUI(btn, cascadeId);
     }
   }
 
-  // Syncs the compact sidebar row wait-toggle button for open leaf chats (⦿ <-> ⏳)
+  // Syncs the compact sidebar row wait-toggle button (⦿ <-> ⏳)
   function updateRowWaitButtonUI(btn, cascadeId, fallbackDomTitle) {
     if (!btn || !cascadeId) return;
     btn.setAttribute('data-cascade-id', cascadeId);
     const curTitle = getTitleForCascadeId(cascadeId, fallbackDomTitle);
-    // Only open leaf chats can be moved between Needs Me and Waiting
-    const isLeafOpen =
-      !isFinalizedTitle(curTitle) && !isChainPredecessor(cascadeId, curTitle);
-    btn.style.display = isLeafOpen ? '' : 'none';
+    // Wait state of an archived chat is invisible in every bucket, so the toggle is hidden
+    btn.style.display = isArchivedCascadeId(cascadeId) ? 'none' : '';
     const waiting = isWaitingTitle(curTitle);
     const waitStr = waiting ? 'true' : 'false';
     if (btn.getAttribute('data-waiting') !== waitStr) {
@@ -2368,24 +2111,23 @@
     }
   }
 
-  // Syncs the compact sidebar row action button icon and tooltip with the row's current title
-  function updateRowCloseButtonUI(btn, cascadeId, fallbackDomTitle) {
+  // Syncs the compact sidebar row archive button icon and tooltip with the chat annotations
+  function updateRowArchiveButtonUI(btn, cascadeId) {
     if (!btn || !cascadeId) return;
     btn.setAttribute('data-cascade-id', cascadeId);
-    const curTitle = getTitleForCascadeId(cascadeId, fallbackDomTitle);
-    const finalized = isFinalizedTitle(curTitle);
-    const finStr = finalized ? 'true' : 'false';
-    if (btn.getAttribute('data-finalized') !== finStr) {
-      btn.setAttribute('data-finalized', finStr);
+    const archived = isArchivedCascadeId(cascadeId);
+    const archStr = archived ? 'true' : 'false';
+    if (btn.getAttribute('data-archived') !== archStr) {
+      btn.setAttribute('data-archived', archStr);
     }
-    const label = finalized ? 'Reopen chat' : 'Close chat';
+    const label = archived ? 'Unarchive chat' : 'Archive chat';
     if (btn.getAttribute('aria-label') !== label) {
       btn.setAttribute('aria-label', label);
     }
     if (btn.getAttribute('title') !== label) {
       btn.setAttribute('title', label);
     }
-    const nextHtml = finalized ? '<span>⦿</span>' : '<span>«»</span>';
+    const nextHtml = archived ? '<span>⦿</span>' : '<span>🗄</span>';
     if (btn.innerHTML !== nextHtml) {
       btn.innerHTML = nextHtml;
     }
@@ -2398,7 +2140,7 @@
     if (!rowEl || !cascadeId) return;
     const curTitle =
       summary?.annotations?.title || summary?.summary || rawDomTitle || '';
-    const waitingBg = isWaitingOnBackgroundWork(summary, curTitle, cascadeId);
+    const waitingBg = isWaitingOnBackgroundWork(summary, curTitle);
     const spanEl = rowEl.querySelector('span.truncate');
 
     // Apply visual ⏳ swap and right-side indicator while background work is active
@@ -2466,8 +2208,8 @@
     }
   }
 
-  // Injects or updates the compact Wait and Close/Reopen buttons inside each sidebar row hover bar
-  function ensureSidebarRowCloseButtons() {
+  // Injects or updates the compact Wait and Archive buttons inside each sidebar row hover bar
+  function ensureSidebarRowButtons() {
     // Read Redux summaries so each row can sync its live background-wait state
     const store = findReduxStore();
     const summariesMap = store?.getState()?.trajectorySummaries?.summaries || {};
@@ -2525,23 +2267,20 @@
         btn = document.createElement('button');
         btn.className = ROW_BTN_CLASS;
         btn.type = 'button';
-        btn.setAttribute('data-testid', 'jetski-row-close-reopen-btn');
+        btn.setAttribute('data-testid', 'jetski-row-archive-btn');
         bindActionBtnHandlers(btn, () => {
           const cid = btn.getAttribute('data-cascade-id') || cascadeId;
-          // Read the raw title so closing/reopening preserves the underlying topic text
-          const domTitle = getRawDomTitle(rowEl);
           if (cid) {
-            void toggleConversationLifecycle(cid, domTitle);
+            void toggleConversationArchived(cid);
           }
         });
         hoverBar.insertBefore(btn, anchorBtn);
       }
-      updateRowCloseButtonUI(btn, cascadeId, fallbackDomTitle);
+      updateRowArchiveButtonUI(btn, cascadeId);
     }
   }
 
   function runFullSync() {
-    ensureChainIndexLoaded();
     // Refresh the cached roadmap index and update project header badges on every sync pass
     ensureRoadmapIndexLoaded();
     ensureStylesInjected();
@@ -2550,12 +2289,12 @@
     ensureFilterBar();
     // Render or remove compact open-roadmap badges after project card DOM rows are synced
     ensureProjectRoadmapBadges();
-    ensureTitlebarCloseButtons();
-    ensureSidebarRowCloseButtons();
+    ensureTitlebarButtons();
+    ensureSidebarRowButtons();
   }
 
   function scheduleSync() {
-    if (rafScheduled) return;
+    if (rafScheduled || disposed) return;
     rafScheduled = true;
     requestAnimationFrame(() => {
       rafScheduled = false;
@@ -2610,6 +2349,20 @@
 
   window.__jetskiClosedChatsFilterCleanup = () => {
     observer.disconnect();
+    disposed = true;
+    // A re-injected instance starts with empty managedHiddenIds and would read our flags as
+    // native hiding, which drops those chats from every bucket, so hand them back unhidden
+    const summaries = reduxStore?.getState()?.trajectorySummaries?.summaries || {};
+    const unhide = [...managedHiddenIds.keys()]
+      .filter((id) => summaries[id])
+      .map((id) => [id, cloneSummaryWithHideFlag(summaries[id], false)]);
+    managedHiddenIds.clear();
+    if (unhide.length > 0) {
+      reduxStore.dispatch({
+        type: 'trajectorySummaries/applyStreamBatch',
+        payload: { updates: unhide, deletes: [] },
+      });
+    }
     // Remove all injected filter buttons and background-wait badges on reload
     const cleanupSelector = [
       `.${BAR_CLASS}`,

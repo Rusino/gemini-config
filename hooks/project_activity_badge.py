@@ -54,11 +54,6 @@ BADGE_RE = re.compile(
     r"(?:\s*·\s*(?:[⟳⚠●]\s*\d+)(?:\s+(?:[⟳⚠●]\s*\d+))*)+$"
 )
 
-# Handed-off predecessors (▸, ✓) and finalized chats («, ‹✓›, », «») are no
-# longer active and should not be counted as unread once their turn finishes
-PREDECESSOR_TITLE_RE = re.compile(
-    r"^\s*\[\d{1,2}:\d{2}\]\s*(?:‹✓›|«»|[▸✓«»])(?:\s|$)"
-)
 # Open leaf chats marked with ⏳ keep notFullyIdle=True between cron ticks, so
 # only an actively executing turn (CASCADE_RUN_STATUS_RUNNING) counts as running
 WAITING_TITLE_RE = re.compile(
@@ -491,14 +486,6 @@ def _is_visible_top_level(summary: dict[str, Any]) -> bool:
   return True
 
 
-def _is_handed_off_predecessor(summary: dict[str, Any]) -> bool:
-  annotations = summary.get("annotations") or {}
-  for candidate in (annotations.get("title"), summary.get("summary")):
-    if isinstance(candidate, str) and PREDECESSOR_TITLE_RE.match(candidate):
-      return True
-  return False
-
-
 # Returns True when a conversation title carries the explicit ⏳ waiting marker
 def _is_waiting_conversation(summary: dict[str, Any]) -> bool:
   annotations = summary.get("annotations") or {}
@@ -507,69 +494,6 @@ def _is_waiting_conversation(summary: dict[str, Any]) -> bool:
     if isinstance(candidate, str) and WAITING_TITLE_RE.match(candidate):
       return True
   return False
-
-
-def _mark_predecessors_read(summaries: dict[str, Any]) -> None:
-  """Stamps `lastUserViewTime` on idle handed-off predecessor conversations.
-
-  When a conversation splits via `handoff`, its final turn finishes a few
-  seconds after the continuation is spawned, leaving `lastModifiedTime` newer
-  than `lastUserViewTime`. Updating `lastUserViewTime` to `lastModifiedTime + 1ms`
-  clears Jetski's sidebar unread dot on intermediate chats without disturbing
-  `max_luvt` of the user's active conversation.
-  """
-  addr, token = _read_cached_conn()
-  if not addr or not token:
-    return
-  clean_addr = addr.removeprefix("http://").removeprefix("https://")
-  url = (
-      f"http://{clean_addr}"
-      "/exa.language_server_pb.LanguageServerService/UpdateConversationAnnotations"
-  )
-
-  for cid, summary in summaries.items():
-    if not isinstance(summary, dict) or not _is_visible_top_level(summary):
-      continue
-    if not _is_handed_off_predecessor(summary):
-      continue
-    if (
-        summary.get("status") == "CASCADE_RUN_STATUS_RUNNING"
-        or summary.get("notFullyIdle")
-        or summary.get("waitingSteps")
-    ):
-      continue
-    annotations = summary.get("annotations") or {}
-    lmt = _parse_iso_timestamp(summary.get("lastModifiedTime", ""))
-    luvt = _parse_iso_timestamp(annotations.get("lastUserViewTime", ""))
-    if lmt <= 0.0 or (lmt <= luvt and not annotations.get("markedAsUnread")):
-      continue
-    stamp_iso = (
-        datetime.fromtimestamp(lmt + 0.001, tz=timezone.utc)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    payload = json.dumps({
-        "cascadeIds": [cid],
-        "annotations": {
-            "lastUserViewTime": stamp_iso,
-            "markedAsUnread": False,
-        },
-        "mergeAnnotations": True,
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "x-codeium-csrf-token": token,
-        },
-        method="POST",
-    )
-    try:
-      with _urlopen_ls(req, timeout=1.5):
-        pass
-    except Exception:
-      pass
 
 
 def resolve_currently_viewing_cid(
@@ -591,7 +515,6 @@ def resolve_currently_viewing_cid(
     if (
         not isinstance(summary, dict)
         or not _is_visible_top_level(summary)
-        or _is_handed_off_predecessor(summary)
     ):
       continue
     luvt = _parse_iso_timestamp(
@@ -627,7 +550,7 @@ def resolve_currently_viewing_cid(
       abs(max_luvt - cached_max_luvt) <= 1e-6
       and cached_cid
       and cached_cid in summaries
-      and not _is_handed_off_predecessor(summaries[cached_cid])
+      and _is_visible_top_level(summaries[cached_cid])
   ):
     current_cid = cached_cid
   else:
@@ -637,7 +560,6 @@ def resolve_currently_viewing_cid(
       if (
           not isinstance(summary, dict)
           or not _is_visible_top_level(summary)
-          or _is_handed_off_predecessor(summary)
       ):
         continue
       luvt = _parse_iso_timestamp(
@@ -697,8 +619,9 @@ def is_conversation_unread(
     viewed_lmt: dict[str, float] | None = None,
 ) -> bool:
   """Returns True if an idle conversation has unread updates."""
-  # Background cron/waiting chats (⏳) and handed-off steps do not light up unread project badges
-  if _is_handed_off_predecessor(summary) or _is_waiting_conversation(summary):
+  # Background cron/waiting chats (⏳) and archived (finished or handed-off) chats do not light
+  # up unread project badges
+  if not _is_visible_top_level(summary) or _is_waiting_conversation(summary):
     return False
   annotations = summary.get("annotations") or {}
   if annotations.get("markedAsUnread"):
@@ -846,7 +769,6 @@ def sync_once(
       summaries = fetch_trajectories()
       if summaries is None:
         return False, 0, []
-      _mark_predecessors_read(summaries)
       known_projects, folder_to_project = load_projects(projects_dir)
       currently_viewing_cid, viewed_lmt = resolve_currently_viewing_cid(
           summaries

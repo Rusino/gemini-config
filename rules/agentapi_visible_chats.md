@@ -19,7 +19,7 @@ echo "ID=$ID" && agentapi get-conversation-metadata "$ID" | grep -E '"sourceMeta
 ## Conversation Titles (`--title`) & Lifecycle
 
 - **One project = one task.** Every non-trivial task lives in its own project; all its chats (including handoff continuations) stay inside that project (`ANTIGRAVITY_PROJECT_ID` is inherited automatically by `handoff`). A project is only a grouping — do not clone or re-sync repositories per task.
-- **Format**: `[HH:MM] <marker> <Topic>` — strictly under 50 chars, plain text only, no project prefix, include short PR/CL/bug/commit ID when applicable. The time prefix and marker (`▸ ✓ ⦿ « ‹✓› » «»`) are mechanical side effects of `chat_lifecycle.py` — **never type or choose markers yourself**.
+- **Format**: `[HH:MM] <marker> <Topic>` — strictly under 50 chars, plain text only, no project prefix, include short PR/CL/bug/commit ID when applicable. The time prefix and marker (`⦿` needs the user, `⏳` waiting) are mechanical side effects of `chat_lifecycle.py` — **never type or choose markers yourself**. Finished chats and handed-off chain pieces carry no special marker: they are archived (hidden from the sidebar, still found by search and opened by `conversation://`).
 
 Use only these commands (`python3 ~/.gemini/config/hooks/chat_lifecycle.py ...`):
 
@@ -27,14 +27,15 @@ Use only these commands (`python3 ~/.gemini/config/hooks/chat_lifecycle.py ...`)
 |---|---|
 | `set-title <id> "<Topic>"` | User asks to name/rename the chat, or on the first turn once you know the bug/CL/PR/commit topic to refine the auto-detected ID or replace a generic title. Pass bare `<Topic>`. |
 | `auto-title <id> "<prompt>"` | Detect PR/CL/bug/commit in prompt and set title if untitled (invoked automatically by `context_guard.py`). |
-| `handoff <id> [summary_file] [--notes "..."] [--next "..."] [--topic "<Topic>"] [--force]` | Context guard alert, or user asks to continue in a new chat. Writes/updates summary, launches visible continuation in the same project on `<id>`'s last model, verifies `sourceMetadata: null`, updates chain markers. `--model <id\|name>` only on explicit user request; `--force` only when user explicitly asked for a second continuation. |
-| `next-task [<id>] [<R_ID>] [--topic "<Topic>"] [--notes "..."] [--next "..."] [--force]` | After finishing a task (`roadmap.py set <id> <R_prev> done`), when `[NEXT-TASK BATON: YOURS ...]` is granted and the user confirms starting `<R_ID>` in a fresh chat: auto-finalizes `<id>`'s chain and all completed sibling chats in the project (`«»` / `«…»`, releasing worktree leases), launches an independent root chat (`⦿`) in the same project, claims `<R_ID>` as `doing`, links `<R_ID> → <new_id>`, and seeds `state/<new_id>.md`. |
+| `handoff <id> [summary_file] [--notes "..."] [--next "..."] [--topic "<Topic>"] [--force]` | Context guard alert, or user asks to continue in a new chat. Writes/updates summary, launches visible continuation in the same project on `<id>`'s last model, verifies `sourceMetadata: null`, archives `<id>`. Refuses while `<id>` has running subagents or background tasks (timers included), since their reports would land in a hidden chat: wait for them or kill them; `--ignore-live` only after recording them in the state file. `--model <id\|name>` only on explicit user request; `--force` only when user explicitly asked for a second continuation. |
+| `next-task [<id>] [<R_ID>] [--topic "<Topic>"] [--notes "..."] [--next "..."] [--force]` | After finishing a task (`roadmap.py set <id> <R_prev> done`), when `[NEXT-TASK BATON: YOURS ...]` is granted and the user confirms starting `<R_ID>` in a fresh chat: archives `<id>`'s chain and all completed sibling chats in the project (releasing worktree leases), launches an independent root chat (`⦿`) in the same project, claims `<R_ID>` as `doing`, links `<R_ID> → <new_id>`, and seeds `state/<new_id>.md`. |
 | `summary-path <id>` | Returns the canonical summary path before writing with `write_file`. |
-| `finalize <id>` | **Only** when the user explicitly says *"финал"* (or unambiguous equivalent); also auto-finalizes completed sibling chats in the same project that own no open roadmap items. |
+| `finalize <id>` | **Only** when the user explicitly says *"финал"* (or unambiguous equivalent): archives the chain; also archives completed sibling chats in the same project that own no open roadmap items. |
+| `search "<query>" [--chain <id>]` | Before answering from memory about earlier work: `--chain` finds every user message / agent reply with the query across all pieces of `<id>`'s chain (hidden pieces included); without it, LS search over all chats (one hit per chat, symbols like `✓` never match). |
 | `status [id]` | Inspect chain structure and summary paths. |
 | `model [id] [--trailer]` | Inspect chat model or print `Assisted-by: ...` git trailer (`--trailer`). |
 | `project-model [<p>] [<m>]` | View or set project preferred model in `~/.gemini/config/projects_models.json`. |
-| `audit [--fix] [--project <id\|name>]` | Scan/repair title desync or broken Scheme Γ markers. |
+| `audit [--fix] [--project <id\|name>]` | Scan/repair title desync and broken markers; visible handed-off pieces and old `«…»`-closed chats are reported as `should_be_archived` (`--fix` archives them unless live work runs in them). |
 | `archive [<id...>] [--chain] [--project <p>] [--keep <N>]` | Archive chats/chains via LS RPC and `.pbtxt`, or prune project `<p>` keeping `<N>` newest. |
 | `auto-archive [--hook]` | Prune older chats across projects with retention policies. |
 
@@ -47,7 +48,7 @@ To move chats/chains between projects, run `python3 ~/.gemini/config/scripts/mov
   - **Finishing a task & proposing the next roadmap item (`next-task`, Last-Chat Baton)**:
     - Once the current roadmap item is completed and marked `done` (`roadmap.py set <id> <R_prev> done`), obey the `[NEXT-TASK BATON: ...]` line printed by `roadmap.py`:
       - **`[NEXT-TASK BATON: HOLD ...]`** (other items are still `doing` in parallel chats, or another chat already holds the proposal baton) or **`[NEXT-TASK BATON: ALL DONE ...]`**: report the completed task and **stop without proposing `next-task`**.
-      - **`[NEXT-TASK BATON: YOURS ...]`** (`0 doing` in the project): only this last finishing chat proposes `<R_next>`. For a **top-level item (`R2`, `R3`)** or whenever context is **`>= 30%`**, propose opening `<R_next>` in a fresh chat (`chat_lifecycle.py next-task <id> <R_next> --topic "<Topic>"`), which auto-finalizes `<id>` and any completed sibling worker chats (`«»` / `«…»`). For a small **sub-item (`R1.1`, `R1.2`)** with context **`< 30%`**, offer to either do it right here or open a new chat via `next-task`.
+      - **`[NEXT-TASK BATON: YOURS ...]`** (`0 doing` in the project): only this last finishing chat proposes `<R_next>`. For a **top-level item (`R2`, `R3`)** or whenever context is **`>= 30%`**, propose opening `<R_next>` in a fresh chat (`chat_lifecycle.py next-task <id> <R_next> --topic "<Topic>"`), which archives `<id>` and any completed sibling worker chats. For a small **sub-item (`R1.1`, `R1.2`)** with context **`< 30%`**, offer to either do it right here or open a new chat via `next-task`.
   - **Spin-offs**: run `roadmap.py link <id> <item ID> <new_chat_id>`.
   - **At handoff / `next-task`**: paste the roadmap block printed by `chat_lifecycle.py handoff` / `next-task` into the final message alongside `[👉 <Title>](conversation://<new_conversation_id>)`.
 - **Parallel chats in one project share resources — claim before touching**:
@@ -59,4 +60,4 @@ To move chats/chains between projects, run `python3 ~/.gemini/config/scripts/mov
   - Never drop or shrink pending `[ ]` roadmap items during handoff.
   - Label untested ideas as **`[UNVERIFIED HYPOTHESIS]`** (never `"Decided to do X"`) and record rejected approaches (`Rejected: <approach> because <reason>`).
   - On continuation start, run `roadmap.py show`, verify the state file against `git status`/tests, and check that any proposed design was proven in code.
-  - Never ask whether to finalize, never auto-reopen finalized chats, and never query SQLite or hook sources directly for lifecycle state.
+  - Never ask whether to finalize, never auto-unarchive archived chats, and never query SQLite or hook sources directly for lifecycle state.

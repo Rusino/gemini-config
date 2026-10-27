@@ -1384,12 +1384,14 @@ def _is_conv_still_active_tip(
     return False, ""
   from context_guard import (
       APP_DATA_DIR_CANDIDATES,
+      _is_archived_in_pbtxt,
       app_data_dir_from_path,
       get_conversation_db_info,
   )
 
   title, _ = get_conversation_db_info(owner_cid, transcript_path)
-  if title and any(m in title for m in ("✓", "«", "»", "‹✓›", "«»")):
+  # Finished and handed-off chats are archived, which releases whatever they leased
+  if _is_archived_in_pbtxt(owner_cid, transcript_path):
     return False, title
 
   cand_dirs = [app_data_dir_from_path(transcript_path)] + [

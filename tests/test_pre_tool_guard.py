@@ -1183,19 +1183,21 @@ class TestPreToolGuard(unittest.TestCase):
         self.assertEqual(out_still_running.get("decision"), "deny")
         self.assertIn("WORKTREE LEASE GUARD", out_still_running.get("reason", ""))
 
-        # Once c1 is finalized (`✓`), c2 automatically takes over `repo` without needing override
-        titles["c1"] = ("[11:04] ✓ R16 C++ perf loop", "proj-1")
-        self.assertEqual(
-            self.run_guard({
-                "conversationId": "c2",
-                "transcriptPath": trans_c2,
-                "toolCall": {
-                    "name": "run_command",
-                    "args": {"CommandLine": f"cd {repo} && felt test"},
-                },
-            }).get("decision"),
-            "allow",
-        )
+        # Once c1 is archived (finished or handed off), c2 takes over `repo` without an override
+        with patch.object(
+            context_guard, "_is_archived_in_pbtxt", side_effect=lambda cid, _h="": cid == "c1"
+        ):
+          self.assertEqual(
+              self.run_guard({
+                  "conversationId": "c2",
+                  "transcriptPath": trans_c2,
+                  "toolCall": {
+                      "name": "run_command",
+                      "args": {"CommandLine": f"cd {repo} && felt test"},
+                  },
+              }).get("decision"),
+              "allow",
+          )
 
   # Verify shared-config repo allows editing distinct files but blocks colliding edits
   def test_shared_config_repo_per_file_lease_and_commit_guard(self):
