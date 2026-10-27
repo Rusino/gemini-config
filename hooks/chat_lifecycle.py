@@ -931,6 +931,76 @@ def export_chain_index() -> dict:
   return payload
 
 
+# SearchConversations returns at most this many chats per query
+SEARCH_RPC_CAP = 100
+
+
+# Ancestors of cid, cid, then the newest-child path below it: the same pieces the sidebar
+# search panel (chainOf in jetski_closed_filter.js) treats as one chat. Sibling branches from
+# a forced second handoff are other chats
+def _graph_chain(cid: str, graph: tuple) -> list[str]:
+  parent_of, children_of, created_at_of = graph
+  chain, seen = [cid], {cid}
+  while parent_of.get(chain[0]) and parent_of[chain[0]] not in seen:
+    chain.insert(0, parent_of[chain[0]])
+    seen.add(chain[0])
+  cur = cid
+  while True:
+    kids = [c for c in children_of.get(cur, []) if c not in seen]
+    if not kids:
+      return chain
+    cur = max(kids, key=lambda c: created_at_of.get(c, ""))
+    seen.add(cur)
+    chain.append(cur)
+
+
+# Searches every chat, archived ones included, through the LS SearchConversations RPC (one
+# best hit per chat) and tags each hit with its piece number in its handoff chain
+def search_conversations(query: str) -> dict:
+  results = ls_rpc("SearchConversations", {"query": query}).get("results") or []
+  graph = _scan_transcript_graph()
+  hits = []
+  for r in results:
+    cid = r.get("cascadeId") or ""
+    chain = _graph_chain(cid, graph)
+    hits.append({
+        **r,
+        "piece": chain.index(cid) + 1 if cid in chain else 1,
+        "chain_length": len(chain),
+        "chain_tail": chain[-1],
+    })
+  return {"hits": hits, "capped": len(results) >= SEARCH_RPC_CAP}
+
+
+# Finds every user message and agent reply that contains query (case-insensitive) across all
+# pieces of conv_id's chain, newest first. SearchConversations cannot do this: it keeps one
+# hit per chat
+def search_chain(query: str, conv_id: str) -> list[dict]:
+  needle = query.strip().lower()
+  chain = _graph_chain(conv_id, _scan_transcript_graph())
+  hits = []
+  for piece in range(len(chain), 0, -1):
+    cid = chain[piece - 1]
+    steps = ls_rpc("GetCascadeTrajectorySteps", {"cascadeId": cid}, timeout=60).get("steps") or []
+    for idx in range(len(steps) - 1, -1, -1):
+      step = steps[idx]
+      if step.get("type") == "CORTEX_STEP_TYPE_USER_INPUT":
+        who, text = "user", (step.get("userInput") or {}).get("userResponse") or ""
+      elif step.get("type") == "CORTEX_STEP_TYPE_PLANNER_RESPONSE":
+        pr = step.get("plannerResponse") or {}
+        who, text = "agent", pr.get("modifiedResponse") or pr.get("response") or ""
+      else:
+        continue
+      at = text.lower().find(needle)
+      if at < 0:
+        continue
+      hits.append({
+          "cascadeId": cid, "piece": piece, "chain_length": len(chain), "step": idx,
+          "who": who, "snippet": text[max(0, at - 80):at + len(needle) + 120].replace("\n", " "),
+      })
+  return hits
+
+
 def discover_conversation_chain(
     conv_id: str,
     include_descendants: bool = True,
@@ -1328,6 +1398,63 @@ def record_handoff(conv_id: str, new_cid: str) -> None:
   save_state(guard_state_path(conv_id), state)
 
 
+# Only JetboxSubscribeToSummaries carries backgroundTaskCount / hasRunningSubagents; the
+# GetAllCascadeTrajectories fallback lacks them and never sets hasActivity, so None (state
+# unknown) is returned then, and callers must not treat it as "nothing running"
+def _fetch_live_summaries() -> dict | None:
+  try:
+    import project_activity_badge as pab  # pylint: disable=g-import-not-at-top
+
+    summaries = pab.fetch_trajectories() or {}
+  except Exception:
+    return None
+  if not any(isinstance(s, dict) and "hasActivity" in s for s in summaries.values()):
+    return None
+  return summaries
+
+
+# Live work that would report back into a chat after it is handed off and hidden.
+# The LS counts neither the caller's own turn nor foreground commands, so a chat can
+# check itself from inside its turn; notFullyIdle / RUNNING would always be true there
+def list_live_dependents(
+    conv_ids: list[str], summaries: dict | None = None
+) -> dict[str, list[str]] | None:
+  if summaries is None:
+    summaries = _fetch_live_summaries()
+  if summaries is None:
+    return None
+  live: dict[str, list[str]] = {}
+  for cid in conv_ids:
+    s = summaries.get(cid) or {}
+    reasons = []
+    tasks = int(s.get("backgroundTaskCount") or 0)
+    if tasks:
+      reasons.append(f"{tasks} background task(s)")
+    if s.get("hasRunningSubagents"):
+      reasons.append("running subagent(s)")
+    if reasons:
+      live[cid] = reasons
+  return live
+
+
+# Must run before anything slow: a CLI call that outlives WaitMsBeforeAsync becomes a
+# background task of the caller and would count itself
+def _refuse_live_dependents(command: str, conv_id: str) -> None:
+  live = list_live_dependents([conv_id])
+  if live is None:
+    raise RuntimeError(
+        f"cannot tell whether {conv_id} still has running subagents or background tasks"
+        f" (LS Jetbox summaries unavailable); rerun `{command}` with --ignore-live only after"
+        f" checking that nothing is running"
+    )
+  if live:
+    raise RuntimeError(
+        f"{conv_id} still has {', '.join(live[conv_id])}; their reports would land in a"
+        f" hidden chat. Wait for them (end the turn, they notify), kill them, or rerun"
+        f" `{command}` with --ignore-live after recording them in the state file"
+    )
+
+
 def create_handoff(
     current_conv_id: str,
     summary_file: str = "",
@@ -1337,6 +1464,7 @@ def create_handoff(
     model: str = "pro",
     exact_model: str = "",
     force: bool = False,
+    ignore_live: bool = False,
 ) -> dict:
   """Executes a clean handoff to a new conversation.
 
@@ -1369,6 +1497,9 @@ def create_handoff(
         " started. If this turn launched it, end the turn now; pass --force only when the"
         " user explicitly asked for another continuation"
     )
+  # The caller is hidden once its continuation exists, so live work would report into nothing
+  if not ignore_live:
+    _refuse_live_dependents("handoff", current_conv_id)
 
   # 1. Determine base topic and new continuation title
   if not new_topic:
@@ -1589,6 +1720,8 @@ def sweep_completed_project_chats(
   visited: set[str] = set(exclude_cids or ()) | set(finalized_cids or ())
   actually_finalized: set[str] = set(finalized_cids or ())
   swept_chains: list[list[str]] = []
+  live_summaries: dict | None = None
+  live_fetched = False
   for cid in closed_candidates:
     if cid in visited:
       continue
@@ -1606,6 +1739,12 @@ def sweep_completed_project_chats(
       continue
     leaf_title = get_conversation_title(leaf_id)
     if not leaf_title or is_finalized_title(leaf_title) or is_waiting_title(leaf_title):
+      continue
+    # A finalized chat drops out of sight, so live work must not report into it; with live
+    # state unknown nothing is finalized
+    if not live_fetched:
+      live_summaries, live_fetched = _fetch_live_summaries(), True
+    if live_summaries is None or list_live_dependents([leaf_id], live_summaries):
       continue
     finalized = finalize_conversation_chain(leaf_id, chain)
     swept_chains.append(finalized)
@@ -1636,6 +1775,7 @@ def create_next_task(
     model: str = "pro",
     exact_model: str = "",
     force: bool = False,
+    ignore_live: bool = False,
 ) -> dict:
   if not current_conv_id:
     raise ValueError("current_conv_id must not be empty")
@@ -1647,6 +1787,9 @@ def create_next_task(
         " started. If this turn launched it, end the turn now; pass --force only when"
         " the user explicitly asked for another chat"
     )
+  # next-task finalizes the caller, which hides it the same way a handoff does
+  if not ignore_live:
+    _refuse_live_dependents("next-task", current_conv_id)
 
   project_id = get_conversation_project_id(current_conv_id)
   if not project_id or project_id == "outside-of-project":
@@ -2160,6 +2303,15 @@ def _iso_to_hhmm(iso_str: str) -> str:
     return ""
 
 
+# Formats an ISO timestamp as 'Oct 27 14:05 ET' in the user's zone
+def _iso_to_et_stamp(iso_str: str) -> str:
+  try:
+    dt = datetime.fromisoformat(re.sub(r"(\.\d{6})\d*", r"\1", iso_str).replace("Z", "+00:00"))
+    return dt.astimezone(ZoneInfo(DEFAULT_TIMEZONE)).strftime("%b %d %H:%M ET")
+  except Exception:
+    return ""
+
+
 def audit_conversations(
     fix: bool = False,
     project_filter: str = "",
@@ -2409,12 +2561,23 @@ Commands:
                                       The continuation keeps the model of <id>'s last
                                       turn (see Notes); --model pins one explicitly.
                                       A chat that already handed off refuses a second
-                                      continuation unless --force is passed.
+                                      continuation unless --force is passed. It also
+                                      refuses while <id> has running subagents or
+                                      background tasks (incl. timers): their reports
+                                      would land in a hidden chat. --ignore-live skips it.
   next-task [<id>] [<R_ID>]           Finalize <id>'s chain («» / «…») and launch a
           [--topic "<Topic>"]         fresh root chat (⦿) in the same project for roadmap
           [--notes "..."]             item <R_ID> (or the first todo item if omitted).
           [--next "..."]              Claims <R_ID> as doing, links <R_ID> -> <new_id>,
           [--model <m>] [--force]     seeds state/<new_id>.md, and removes state/<id>.md.
+          [--ignore-live]             Same live subagent/task guard as handoff.
+  search "<query>"                    Search all chats, archived handoff pieces included
+                                      (LS SearchConversations: one best hit per chat, at
+                                      most 100 chats, symbols like ✓ never match). Each
+                                      hit shows its piece number in its chain.
+  search "<query>" --chain <id>       Every user message and agent reply containing the
+                                      query across all pieces of <id>'s chain, newest
+                                      first (thinking and tool output are skipped).
   model [id] [--trailer]              Read-only: show the model <id> last used and the
                                       model a handoff would pick now (or output
                                       git `Assisted-by: <Model>` trailer with --trailer).
@@ -2482,6 +2645,7 @@ KNOWN_COMMANDS = (
     "audit",
     "archive",
     "auto-archive",
+    "search",
 )
 
 
@@ -2507,10 +2671,12 @@ def _env_conversation_id() -> str:
 
 
 def parse_handoff_args(args: list[str]) -> dict:
-  """Parses `handoff [cid] [summary_file] [--notes ..] [--next ..] [--topic ..] [--model ..] [--force]`."""
+  """Parses `handoff [cid] [summary_file] [--notes ..] [--next ..] [--topic ..] [--model ..]
+  [--force] [--ignore-live]`.
+  """
   opts = {
       "cid": "", "summary": "", "notes": "", "next_step": "", "new_topic": "", "exact_model": "",
-      "force": False,
+      "force": False, "ignore_live": False,
   }
   valued = {"--notes": "notes", "--next": "next_step", "--topic": "new_topic", "--model": "exact_model"}
   i = 0
@@ -2519,6 +2685,9 @@ def parse_handoff_args(args: list[str]) -> dict:
     key, eq, inline = a.partition("=")
     if a == "--force":
       opts["force"] = True
+      i += 1
+    elif a == "--ignore-live":
+      opts["ignore_live"] = True
       i += 1
     elif eq and key in valued:
       opts[valued[key]] = inline
@@ -2543,7 +2712,9 @@ def parse_handoff_args(args: list[str]) -> dict:
 
 # Disambiguates optional positional UUID conv_id and R<N> roadmap item_id in either order
 def parse_next_task_args(args: list[str]) -> dict:
-  """Parses `next-task [cid] [item_id] [--topic ..] [--notes ..] [--next ..] [--model ..] [--force]`."""
+  """Parses `next-task [cid] [item_id] [--topic ..] [--notes ..] [--next ..] [--model ..]
+  [--force] [--ignore-live]`.
+  """
   opts = {
       "cid": "",
       "item_id": "",
@@ -2552,6 +2723,7 @@ def parse_next_task_args(args: list[str]) -> dict:
       "new_topic": "",
       "exact_model": "",
       "force": False,
+      "ignore_live": False,
   }
   valued = {
       "--notes": "notes",
@@ -2566,6 +2738,9 @@ def parse_next_task_args(args: list[str]) -> dict:
     key, eq, inline = a.partition("=")
     if a == "--force":
       opts["force"] = True
+      i += 1
+    elif a == "--ignore-live":
+      opts["ignore_live"] = True
       i += 1
     elif eq and key in valued:
       opts[valued[key]] = inline
@@ -2700,6 +2875,7 @@ def main(argv: list[str] | None = None) -> int:
         new_topic=opts["new_topic"],
         exact_model=opts["exact_model"],
         force=opts["force"],
+        ignore_live=opts["ignore_live"],
     )
     print_handoff_result(result)
   # Transition to a new root chat for the next roadmap item while closing the current chain
@@ -2714,6 +2890,7 @@ def main(argv: list[str] | None = None) -> int:
         next_step_prompt=opts["next_step"],
         exact_model=opts["exact_model"],
         force=opts["force"],
+        ignore_live=opts["ignore_live"],
     )
     print_handoff_result(result)
   elif cmd == "audit":
@@ -2772,6 +2949,50 @@ def main(argv: list[str] | None = None) -> int:
           "archive",
           "either --project <p> or at least one conversation ID is required",
       )
+  elif cmd == "search":
+    query, chain_of = "", ""
+    i = 0
+    while i < len(args):
+      a = args[i]
+      if a == "--chain" and i + 1 < len(args):
+        chain_of = _require_conversation_id("search", args[i + 1])
+        i += 2
+      elif a.startswith("-"):
+        _cli_fail("search", f"unknown option '{a}'")
+      elif not query:
+        query = a
+        i += 1
+      else:
+        _cli_fail("search", f"unexpected argument '{a}'")
+    # A blank needle would match every message
+    if not query.strip():
+      _cli_fail("search", "a query is required")
+    try:
+      chain_hits = search_chain(query, chain_of) if chain_of else []
+      res = {} if chain_of else search_conversations(query)
+    except RuntimeError as exc:
+      _cli_fail("search", str(exc))
+    if chain_of:
+      for h in chain_hits:
+        print(
+            f"[piece {h['piece']}/{h['chain_length']}, {h['who']} step {h['step']}]"
+            f" {h['snippet']}\n  conversation://{h['cascadeId']}"
+        )
+      if not chain_hits:
+        print("No matches")
+    else:
+      for h in res["hits"]:
+        when = _iso_to_et_stamp(h.get("lastModifiedTime", ""))
+        who = "user" if h.get("matchSource") == "MATCH_SOURCE_USER" else "agent"
+        print(
+            f"{h.get('title', '')}  [piece {h['piece']}/{h['chain_length']}, {when},"
+            f" {who} step {h.get('matchedStepIndex', 0)}]\n"
+            f"  {h.get('snippet', '')}\n  conversation://{h.get('cascadeId', '')}"
+        )
+      if res["capped"]:
+        print(f"(LS returned {SEARCH_RPC_CAP} chats, the cap: refine the query)")
+      if not res["hits"]:
+        print("No matches")
   elif cmd == "auto-archive":
     is_hook = "--hook" in args
     target_cid = ""

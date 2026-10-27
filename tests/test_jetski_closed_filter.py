@@ -152,6 +152,7 @@ class FakeElement {
   getBoundingClientRect() {
     return { left: 24, top: 40, bottom: 62, right: 140, width: 116, height: 22 };
   }
+  focus() {}
   closest(selector) {
     let cur = this;
     while (cur) {
@@ -419,6 +420,31 @@ global.window = {
     setItem: (k, v) => storage.set(k, String(v)),
   },
   fetch: async (url, opts) => {
+    if (String(url).includes('GetCascadeTrajectorySteps')) {
+      const body = JSON.parse(opts.body);
+      rpcRequests.push({ url: String(url), body, headers: opts.headers });
+      const stepsByCid = {
+        'open-root': [
+          {
+            type: 'CORTEX_STEP_TYPE_USER_INPUT',
+            userInput: { userResponse: 'Find the <b>probe</b> word' },
+          },
+          { type: 'CORTEX_STEP_TYPE_RUN_COMMAND', runCommand: { output: 'probe in tool output' } },
+        ],
+        'open-step': [
+          {
+            type: 'CORTEX_STEP_TYPE_PLANNER_RESPONSE',
+            plannerResponse: {
+              thinking: 'probe in thinking',
+              response: 'raw',
+              modifiedResponse: 'Intro\n\nA PROBE line\n\nOutro',
+            },
+          },
+        ],
+        'open-current': [],
+      };
+      return { ok: true, json: async () => ({ steps: stepsByCid[body.cascadeId] || [] }) };
+    }
     if (String(url).includes('jetski-chains.json')) {
       return {
         ok: true,
@@ -517,15 +543,18 @@ global.requestAnimationFrame = (cb) => {
 eval(code);
 
 const filterBar = bodyEl.querySelector('.jetski-attention-filter-bar');
-assert(filterBar, '5-button filter bar must be injected below the sidebar header row');
+assert(filterBar, '4-button filter bar must be injected below the sidebar header row');
 assert.strictEqual(bodyEl.children[1], filterBar, 'Filter bar must sit directly below actionRow');
 const bucketBtns = filterBar.querySelectorAll('.jetski-closed-chats-filter-btn');
-assert.strictEqual(bucketBtns.length, 5, 'Filter bar must render 5 state buttons');
+assert.strictEqual(bucketBtns.length, 4, 'Filter bar must render 4 state buttons');
 
 const btnNeedsMe = filterBar.querySelector('button[data-bucket="needs-me"]');
 const btnWorking = filterBar.querySelector('button[data-bucket="working"]');
 const btnWaiting = filterBar.querySelector('button[data-bucket="waiting"]');
-const btnSteps = filterBar.querySelector('button[data-bucket="steps"]');
+assert.deepStrictEqual(
+  bucketBtns.map((b) => b.getAttribute('data-bucket')),
+  ['needs-me', 'working', 'waiting', 'closed']
+);
 const btnClosed = filterBar.querySelector('button[data-bucket="closed"]');
 
 const isHidden = (id) => Boolean(
@@ -534,31 +563,26 @@ const isHidden = (id) => Boolean(
 const assertHidden = (ids, expected) => {
   for (const id of ids) assert.strictEqual(isHidden(id), expected, id);
 };
-const CLOSED_SCOPE_HIDDEN = [
-  'closed-solo', 'closed-pair-root', 'closed-pair-tail',
-  'closed-root', 'closed-step', 'closed-tail',
-];
+const CLOSED_SCOPE_HIDDEN = ['closed-solo', 'closed-pair-tail', 'closed-tail'];
+const CHAIN_STEPS = ['open-root', 'open-step', 'closed-pair-root', 'closed-root', 'closed-step'];
 
 // Default visible buckets: ['needs-me', 'working']
-// Counts across 13 eligible chats:
+// Counts across 8 eligible chats; the 5 chain steps are always hidden and never counted
 // - needs-me (3): solo-active, open-current, quoted-title
 // - working (1): agent-working
 // - waiting (1): cron-waiting (⏳ with status IDLE & notFullyIdle=true stays in waiting!)
-// - steps (2): open-root (▸), open-step (✓)
-// - closed (6): closed-solo, closed-pair-*, closed-root/step/tail
+// - closed (3): closed-solo, closed-pair-tail, closed-tail
 assert.strictEqual(btnNeedsMe.getAttribute('aria-label'), '🚨 Needs Me: 3 (shown)');
 assert.strictEqual(btnNeedsMe.getAttribute('data-active'), 'true');
 assert.strictEqual(btnWorking.getAttribute('aria-label'), '🤖 Working: 1 (shown)');
 assert.strictEqual(btnWorking.getAttribute('data-active'), 'true');
 assert.strictEqual(btnWaiting.getAttribute('aria-label'), '⏳ Waiting: 1 (hidden)');
 assert.strictEqual(btnWaiting.getAttribute('data-active'), 'false');
-assert.strictEqual(btnSteps.getAttribute('aria-label'), '▸✓ Chain Steps: 2 (hidden)');
-assert.strictEqual(btnSteps.getAttribute('data-active'), 'false');
-assert.strictEqual(btnClosed.getAttribute('aria-label'), '«» Closed: 6 (hidden)');
+assert.strictEqual(btnClosed.getAttribute('aria-label'), '«» Closed: 3 (hidden)');
 assert.strictEqual(btnClosed.getAttribute('data-active'), 'false');
-assert.strictEqual(emptyProjSpan.textContent, 'No matching chats (3 hidden)');
+assert.strictEqual(emptyProjSpan.textContent, 'No matching chats (1 hidden)');
 
-assertHidden([...CLOSED_SCOPE_HIDDEN, 'open-root', 'open-step', 'cron-waiting'], true);
+assertHidden([...CLOSED_SCOPE_HIDDEN, ...CHAIN_STEPS, 'cron-waiting'], true);
 assertHidden(['solo-active', 'agent-working', 'open-current', 'quoted-title'], false);
 assert.strictEqual(storeState.trajectorySummaries.summaries['closed-solo'].annotations.archived, false);
 
@@ -587,7 +611,7 @@ assert.strictEqual(bubble.getAttribute('data-visible'), 'true');
 assert(bubble.innerHTML.includes('⏳ Waiting (Cron / External)'));
 assert(bubble.innerHTML.includes('[HIDDEN · 1]'));
 assert(bubble.innerHTML.includes('Background cron/timer chats or chats waiting on external events'));
-assert(bubble.innerHTML.includes('4 of 13 (9 hidden)'));
+assert(bubble.innerHTML.includes('4 of 8 (4 hidden)'));
 assert(!/[А-Яа-яЁё]/.test(bubble.innerHTML), 'Bubble HTML must not contain Cyrillic');
 
 btnNeedsMe.dispatchEvent('mouseenter');
@@ -610,7 +634,7 @@ assert.strictEqual(btnWaiting.getAttribute('data-active'), 'true');
 assert.strictEqual(btnWaiting.getAttribute('aria-label'), '⏳ Waiting: 1 (shown)');
 assertHidden(['cron-waiting'], false);
 assertHidden(['solo-active', 'agent-working', 'open-current', 'quoted-title'], false);
-assertHidden([...CLOSED_SCOPE_HIDDEN, 'open-root', 'open-step'], true);
+assertHidden([...CLOSED_SCOPE_HIDDEN, ...CHAIN_STEPS], true);
 
 // Right-click (contextmenu) on «» Closed solos ONLY the closed bucket
 btnClosed.dispatchEvent('contextmenu', { button: 2 });
@@ -618,17 +642,17 @@ assert.strictEqual(btnClosed.getAttribute('data-active'), 'true');
 assert.strictEqual(btnNeedsMe.getAttribute('data-active'), 'false');
 assert.strictEqual(btnWorking.getAttribute('data-active'), 'false');
 assert.strictEqual(btnWaiting.getAttribute('data-active'), 'false');
-assert.strictEqual(btnSteps.getAttribute('data-active'), 'false');
 assertHidden(CLOSED_SCOPE_HIDDEN, false);
-assertHidden(['solo-active', 'agent-working', 'cron-waiting', 'open-root', 'open-step'], true);
+assertHidden(['solo-active', 'agent-working', 'cron-waiting', ...CHAIN_STEPS], true);
 
-// Right-click again on already-soloed «» Closed turns all 5 buckets ON
+// Right-click again on already-soloed «» Closed turns all 4 buckets ON
 btnClosed.dispatchEvent('contextmenu', { button: 2 });
-for (const b of [btnNeedsMe, btnWorking, btnWaiting, btnSteps, btnClosed]) {
+for (const b of [btnNeedsMe, btnWorking, btnWaiting, btnClosed]) {
   assert.strictEqual(b.getAttribute('data-active'), 'true');
 }
 assert.strictEqual(emptyProjSpan.textContent, 'No conversations yet');
 assertHidden(CLOSED_SCOPE_HIDDEN, false);
+assertHidden(CHAIN_STEPS, true);
 assertHidden(['native-hidden'], true);
 
 // Turn «» Closed back OFF via left-click (after advancing Date.now past 300ms debounce)
@@ -651,18 +675,28 @@ reduxStore.dispatch({
 });
 assertHidden(['streamed-closed'], true);
 
-// Re-evaluating the script cleanly replaces the bar via __jetskiClosedChatsFilterCleanup
+// Re-evaluating the script cleanly replaces the bar via __jetskiClosedChatsFilterCleanup;
+// a bucket set saved before chain steps stopped being a bucket loads without 'steps'
+storage.set(
+  'jetski_visible_buckets_v1',
+  JSON.stringify(['steps', 'needs-me', 'working', 'waiting'])
+);
 eval(code);
 const barsAfterReload = bodyEl.querySelectorAll('.jetski-attention-filter-bar');
 assert.strictEqual(barsAfterReload.length, 1, 'Reloading script must not duplicate filter bar');
+assert.deepStrictEqual(
+  barsAfterReload[0].querySelectorAll('.jetski-closed-chats-filter-btn')
+    .map((b) => [b.getAttribute('data-bucket'), b.getAttribute('data-active')]),
+  [['needs-me', 'true'], ['working', 'true'], ['waiting', 'true'], ['closed', 'false']]
+);
 
 (async () => {
   const titlebarWaitBtn = titlebarToolbar.querySelector('.jetski-titlebar-wait-btn');
   const titlebarBtn = titlebarToolbar.querySelector('.jetski-titlebar-close-reopen-btn');
-  assert(titlebarWaitBtn, 'Titlebar Wait button must be injected before Close button');
+  assert(titlebarWaitBtn, 'Titlebar Wait button must be injected after Search, before Close');
   assert(titlebarBtn, 'Titlebar Close/Reopen button must be injected before titlebar-more-actions');
-  assert.strictEqual(titlebarToolbar.children[0], titlebarWaitBtn);
-  assert.strictEqual(titlebarToolbar.children[1], titlebarBtn);
+  assert.strictEqual(titlebarToolbar.children[1], titlebarWaitBtn);
+  assert.strictEqual(titlebarToolbar.children[2], titlebarBtn);
   assert.strictEqual(titlebarBtn.getAttribute('aria-label'), 'Close chat');
   assert.strictEqual(titlebarBtn.getAttribute('data-finalized'), 'false');
 
@@ -752,14 +786,7 @@ assert.strictEqual(barsAfterReload.length, 1, 'Reloading script must not duplica
   assert.strictEqual(rpcRequests.length, 3);
 
   // Even if a handed-off predecessor loses its ▸ marker and has ⦿ in its title,
-  // jetski-chains.json parentOf still classifies it into 'steps' (hidden when steps is off)
-  const reloadBar = bodyEl.querySelector('.jetski-attention-filter-bar');
-  const reloadBtnSteps = reloadBar.querySelector('button[data-bucket="steps"]');
-  const nowStepToggle = Date.now;
-  Date.now = () => nowStepToggle() + 1500;
-  reloadBtnSteps.dispatchEvent('pointerdown', { button: 0 });
-  Date.now = nowStepToggle;
-  assert.strictEqual(reloadBtnSteps.getAttribute('data-active'), 'false');
+  // jetski-chains.json parentOf still marks it as a chain step, hidden under any buckets
   reduxStore.dispatch({
     type: 'trajectorySummaries/applyStreamBatch',
     payload: {
@@ -781,6 +808,29 @@ assert.strictEqual(barsAfterReload.length, 1, 'Reloading script must not duplica
       .sourceMetadata.hideFromConversationList,
     true
   );
+
+  // Archiving the tail must not leave its chain with no visible piece
+  const archivedTail = storeState.trajectorySummaries.summaries['open-current'];
+  reduxStore.dispatch({
+    type: 'trajectorySummaries/applyStreamBatch',
+    payload: {
+      updates: [
+        [
+          'open-current',
+          { ...archivedTail, annotations: { ...archivedTail.annotations, archived: true } },
+        ],
+      ],
+      deletes: [],
+    },
+  });
+  while (rafCallbacks.length > 0) rafCallbacks.shift()();
+  assertHidden(['open-step'], false);
+  reduxStore.dispatch({
+    type: 'trajectorySummaries/applyStreamBatch',
+    payload: { updates: [['open-current', archivedTail]], deletes: [] },
+  });
+  while (rafCallbacks.length > 0) rafCallbacks.shift()();
+  assertHidden(['open-step'], true);
 
   // Verify live ⏳ row indicator when an open ⦿ chat waits on a background task or subagent
   const rowTitleSpan = new FakeElement('span');
@@ -878,6 +928,35 @@ assert.strictEqual(barsAfterReload.length, 1, 'Reloading script must not duplica
   assert(roadmapBubble.innerHTML.includes('R7.1'));
   proj1Badge.dispatchEvent('mouseleave');
   assert.strictEqual(roadmapBubble.getAttribute('data-visible'), 'false');
+
+  const titlebarSearchBtn = titlebarToolbar.querySelector('.jetski-chat-search-btn');
+  assert(titlebarSearchBtn, 'Titlebar must carry the chain search button');
+  assert(!bodyEl.querySelector('.jetski-attention-filter-bar .jetski-chat-search-btn'));
+
+  assert.deepStrictEqual(
+    window.__jetskiChatSearch.chainOf('open-step'), ['open-root', 'open-step', 'open-current']
+  );
+  rpcRequests.length = 0;
+  const resultsEl = new FakeElement('div');
+  const stepCache = new Map();
+  const chain = ['open-root', 'open-step', 'open-current'];
+  await window.__jetskiChatSearch.runChatSearch('probe', resultsEl, chain, stepCache);
+  assert.deepStrictEqual(
+    rpcRequests.map((r) => r.body.cascadeId),
+    ['open-current', 'open-step', 'open-root']
+  );
+  assert.strictEqual(rpcRequests[0].headers['x-codeium-csrf-token'], 'test-csrf-token');
+  const html = resultsEl.innerHTML;
+  assert(html.indexOf('piece 2/3') < html.indexOf('piece 1/3'), 'Newest piece goes first');
+  assert(!html.includes('piece 3/3'), 'Pieces without hits are skipped');
+  assert(html.includes('A <mark>PROBE</mark> line') && !html.includes('Intro'), 'Paragraph only');
+  assert(html.includes('Find the &lt;b&gt;<mark>probe</mark>'), 'Text must be escaped');
+  assert(!html.includes('tool output') && !html.includes('thinking'), 'Only messages are searched');
+  rpcRequests.length = 0;
+  await window.__jetskiChatSearch.runChatSearch('line', resultsEl, chain, stepCache);
+  assert.strictEqual(rpcRequests.length, 0, 'Steps are cached for the open panel');
+  await window.__jetskiChatSearch.runChatSearch('  ', resultsEl, chain, stepCache);
+  assert.strictEqual(resultsEl.innerHTML, '');
 
   console.log('ALL_JS_ASSERTIONS_PASSED');
 })().catch((err) => {

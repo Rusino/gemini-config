@@ -28,8 +28,12 @@ class TestChatLifecycle(unittest.TestCase):
     self.env = patch.dict(os.environ, {"JETSKI_ROADMAPS_DIR": self.roadmaps_tmp.name})
     self.env.start()
     os.environ.pop("ANTIGRAVITY_PROJECT_ID", None)
+    # Live-dependent checks stream summaries from the LS; tests opt in per case
+    self.live = patch.object(chat_lifecycle, "_fetch_live_summaries", return_value={})
+    self.live_mock = self.live.start()
 
   def tearDown(self):
+    self.live.stop()
     self.env.stop()
     self.roadmaps_tmp.cleanup()
 
@@ -770,7 +774,7 @@ class TestChatLifecycle(unittest.TestCase):
     ])
     self.assertEqual(parsed, {
         "cid": cid, "summary": "/tmp/sum.md", "notes": "a=b", "next_step": "step 2",
-        "new_topic": "T", "exact_model": "gemini-x", "force": False,
+        "new_topic": "T", "exact_model": "gemini-x", "force": False, "ignore_live": False,
     })
     for bad in ([cid, "--bogus", "x"], [cid, "/tmp/sum.md", "extra"], [cid, "--topic"]):
       with self.subTest(args=bad), contextlib.redirect_stderr(io.StringIO()):
@@ -1457,6 +1461,164 @@ class TestChatLifecycle(unittest.TestCase):
         # State files for c1, c2, c3 were cleaned up
         for cid in ("c1", "c2", "c3"):
           self.assertFalse(os.path.exists(roadmap.state_path("proj-abc", cid)))
+
+  def test_list_live_dependents_counts_only_subagents_and_background_tasks(self):
+    summaries = {
+        "busy": {"status": "CASCADE_RUN_STATUS_RUNNING", "notFullyIdle": True,
+                 "backgroundTaskCount": 2, "hasRunningSubagents": True},
+        "own-turn": {"status": "CASCADE_RUN_STATUS_RUNNING", "notFullyIdle": True},
+        "idle": {"status": "CASCADE_RUN_STATUS_IDLE"},
+    }
+    self.assertEqual(
+        chat_lifecycle.list_live_dependents(["busy", "own-turn", "idle", "absent"], summaries),
+        {"busy": ["2 background task(s)", "running subagent(s)"]},
+    )
+
+  def test_handoff_refuses_while_chat_has_live_dependents(self):
+    self.live_mock.return_value = {"parent-1": {"backgroundTaskCount": 1}}
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      ctx, launched = self._outside_project_handoff_env(tmp_dir)
+      with ctx:
+        with self.assertRaisesRegex(RuntimeError, "1 background task"):
+          chat_lifecycle.create_handoff("parent-1", next_step_prompt="go")
+        self.assertEqual(launched, [])
+        self.assertFalse(chat_lifecycle.load_guard_state("parent-1").get("handed_off_to"))
+        res = chat_lifecycle.create_handoff("parent-1", next_step_prompt="go", ignore_live=True)
+        self.assertEqual(res["new_conversation_id"], "child-1")
+
+  def test_create_next_task_refuses_while_chat_has_live_dependents(self):
+    import roadmap
+
+    self.live_mock.return_value = {"parent-1": {"hasRunningSubagents": True}}
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.make_project_db(tmp_dir)
+      roadmap.add_item("proj-abc", "parent-1", "Next task")
+      start = unittest.mock.MagicMock(return_value="child-2")
+      p = self.handoff_patches(tmp_dir, start)
+      with p[0], p[1], p[2], p[3], p[4], p[5]:
+        with self.assertRaisesRegex(RuntimeError, "running subagent"):
+          chat_lifecycle.create_next_task(current_conv_id="parent-1", item_id="R1")
+      start.assert_not_called()
+
+  def test_sweep_skips_chain_whose_leaf_has_live_dependents(self):
+    import roadmap
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.write_chain(tmp_dir, [("c1", None), ("c2", None)])
+      self.write_titles(tmp_dir, {
+          "c1": "[10:00] ⦿ R1 First",
+          "c2": "[10:05] ⦿ R2 Second",
+      }, project="proj-abc")
+      for idx, cid in enumerate(("c1", "c2"), start=1):
+        roadmap.add_item("proj-abc", cid, f"Task {idx}")
+        roadmap.set_status("proj-abc", cid, f"R{idx}", "doing")
+        roadmap.set_status("proj-abc", cid, f"R{idx}", "done")
+      self.live_mock.return_value = {"c2": {"backgroundTaskCount": 1}}
+      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
+           patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=False):
+        swept = chat_lifecycle.sweep_completed_project_chats("proj-abc")
+        self.assertEqual(swept, [["c1"]])
+        self.assertEqual(chat_lifecycle.get_conversation_title("c2"), "[10:05] ⦿ R2 Second")
+        self.live_mock.return_value = None
+        chat_lifecycle.update_conversation_title("c1", "[10:00] ⦿ R1 First")
+        self.assertEqual(chat_lifecycle.sweep_completed_project_chats("proj-abc"), [])
+
+  def test_live_state_unknown_blocks_handoff_and_sweep(self):
+    self.live_mock.return_value = None
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      ctx, launched = self._outside_project_handoff_env(tmp_dir)
+      with ctx:
+        with self.assertRaisesRegex(RuntimeError, "cannot tell"):
+          chat_lifecycle.create_handoff("parent-1", next_step_prompt="go")
+        self.assertEqual(launched, [])
+    self.assertIsNone(chat_lifecycle.list_live_dependents(["c1"]))
+
+  def test_fetch_live_summaries_rejects_fallback_without_jetbox_fields(self):
+    self.live.stop()
+    try:
+      with patch("project_activity_badge.fetch_trajectories", return_value={"c1": {"status": "x"}}):
+        self.assertIsNone(chat_lifecycle._fetch_live_summaries())
+      jetbox = {"c1": {"status": "x", "hasActivity": False}}
+      with patch("project_activity_badge.fetch_trajectories", return_value=jetbox):
+        self.assertEqual(chat_lifecycle._fetch_live_summaries(), jetbox)
+    finally:
+      self.live_mock = self.live.start()
+
+  def test_cli_ignore_live_flag_is_accepted(self):
+    self.assertTrue(chat_lifecycle.parse_handoff_args(["c1", "--ignore-live"])["ignore_live"])
+    self.assertFalse(chat_lifecycle.parse_handoff_args(["c1"])["ignore_live"])
+    self.assertTrue(
+        chat_lifecycle.parse_next_task_args(["R2", "--ignore-live"])["ignore_live"]
+    )
+
+  def _search_fixture(self):
+    hits = [
+        {"cascadeId": "c2", "title": "[10:05] ✓ Topic", "snippet": "found in c2",
+         "matchSource": "MATCH_SOURCE_USER", "matchedStepIndex": 4,
+         "lastModifiedTime": "2026-10-27T15:00:00Z"},
+        {"cascadeId": "solo", "title": "[09:00] ⦿ Other", "snippet": "found in solo",
+         "matchSource": "MATCH_SOURCE_AGENT", "matchedStepIndex": 7,
+         "lastModifiedTime": "2026-10-27T14:00:00Z"},
+    ]
+    graph = (
+        {"c2": "c1", "c3": "c2"},
+        {"c1": ["c2"], "c2": ["c3"]},
+        {"c1": "2026-10-27T10:00:00Z", "c2": "2026-10-27T11:00:00Z",
+         "c3": "2026-10-27T12:00:00Z", "solo": "2026-10-27T09:00:00Z"},
+    )
+    return hits, graph
+
+  def test_search_conversations_tags_chain_position(self):
+    hits, graph = self._search_fixture()
+    with patch.object(chat_lifecycle, "ls_rpc", return_value={"results": hits}) as rpc, \
+         patch.object(chat_lifecycle, "_scan_transcript_graph", return_value=graph):
+      res = chat_lifecycle.search_conversations("found")
+    rpc.assert_called_once_with("SearchConversations", {"query": "found"})
+    self.assertFalse(res["capped"])
+    by_id = {h["cascadeId"]: h for h in res["hits"]}
+    self.assertEqual((by_id["c2"]["piece"], by_id["c2"]["chain_length"]), (2, 3))
+    self.assertEqual(by_id["c2"]["chain_tail"], "c3")
+    self.assertEqual((by_id["solo"]["piece"], by_id["solo"]["chain_length"]), (1, 1))
+    self.assertEqual(by_id["solo"]["chain_tail"], "solo")
+
+  def test_search_conversations_reports_cap(self):
+    hits, graph = self._search_fixture()
+    many = hits + [{"cascadeId": f"x{i}"} for i in range(98)]
+    with patch.object(chat_lifecycle, "ls_rpc", return_value={"results": many}), \
+         patch.object(chat_lifecycle, "_scan_transcript_graph", return_value=graph):
+      res = chat_lifecycle.search_conversations("found")
+    self.assertTrue(res["capped"])
+
+  def test_graph_chain_skips_sibling_branches(self):
+    graph = (
+        {"b": "a", "c1": "b", "c2": "b", "d": "c2"},
+        {"a": ["b"], "b": ["c1", "c2"], "c2": ["d"]},
+        {"a": "1", "b": "2", "c1": "3", "c2": "4", "d": "5"},
+    )
+    self.assertEqual(chat_lifecycle._graph_chain("b", graph), ["a", "b", "c2", "d"])
+    self.assertEqual(chat_lifecycle._graph_chain("c1", graph), ["a", "b", "c1"])
+
+  def test_search_chain_finds_every_message_hit_newest_piece_first(self):
+    _, graph = self._search_fixture()
+    steps = {
+        "c1": [{"type": "CORTEX_STEP_TYPE_USER_INPUT", "userInput": {"userResponse": "a Probe"}}],
+        "c2": [
+            {"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+             "plannerResponse": {"thinking": "probe", "modifiedResponse": "probe one"}},
+            {"type": "CORTEX_STEP_TYPE_RUN_COMMAND", "runCommand": {"output": "probe"}},
+            {"type": "CORTEX_STEP_TYPE_USER_INPUT", "userInput": {"userResponse": "probe two"}},
+        ],
+        "c3": [],
+    }
+    rpc = lambda method, body, timeout=20.0: {"steps": steps[body["cascadeId"]]}
+    with patch.object(chat_lifecycle, "ls_rpc", side_effect=rpc), \
+         patch.object(chat_lifecycle, "_scan_transcript_graph", return_value=graph):
+      hits = chat_lifecycle.search_chain("PROBE", "c1")
+    self.assertEqual(
+        [(h["cascadeId"], h["step"], h["who"]) for h in hits],
+        [("c2", 2, "user"), ("c2", 0, "agent"), ("c1", 0, "user")],
+    )
+    self.assertEqual(hits[0]["chain_length"], 3)
 
   def test_urlopen_ls_blocks_unmocked_live_ls_in_unittest(self):
     req = chat_lifecycle.urllib.request.Request("http://localhost:5387/")

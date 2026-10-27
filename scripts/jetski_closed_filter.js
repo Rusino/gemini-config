@@ -50,8 +50,13 @@
   const CLOSED_END_MARKER = '»';
   const CLOSED_SINGLE_MARKER = '«»';
 
-  const BUCKET_ORDER = ['needs-me', 'working', 'waiting', 'steps', 'closed'];
+  const BUCKET_ORDER = ['needs-me', 'working', 'waiting', 'closed'];
+  const SEARCH_BTN_CLASS = 'jetski-chat-search-btn';
+  const SEARCH_PANEL_ID = 'jetski-chat-search-panel';
   const DEFAULT_VISIBLE_BUCKETS = ['needs-me', 'working'];
+  // Handed-off pieces of a chain stay hidden under every bucket selection; the chain tail
+  // alone carries the task state and earlier pieces are reached through search
+  const CHAIN_STEP_CLASS = 'chain-step';
 
   const BUCKET_DEFS = {
     'needs-me': {
@@ -77,14 +82,6 @@
       title: '⏳ Waiting (Cron / External)',
       description:
         'Background cron/timer chats or chats waiting on external events (Gerrit, CQ) that do not need your action right now.',
-    },
-    steps: {
-      key: 'steps',
-      icon: '▸✓',
-      shortLabel: 'Chain Steps',
-      title: '▸/✓ Handed-off Chain Steps',
-      description:
-        'Earlier handed-off parts (▸ root, ✓ intermediate step) of open multi-chat chains.',
     },
     closed: {
       key: 'closed',
@@ -156,6 +153,7 @@
   let chainIndexFetchedAt = 0;
   let chainIndexFetching = false;
   let chainPredecessorIds = new Set();
+  let chainGraphIds = new Set();
   // Caches jetski-roadmaps.json across DOM sync cycles within ROADMAP_INDEX_TTL_MS
   const ROADMAP_INDEX_TTL_MS = 5000;
   let roadmapIndexCache = null;
@@ -179,28 +177,36 @@
 
   function isChainPredecessorTitle(title) {
     const marker = parseTitleMarker(title);
-    return marker === OPEN_CHAIN_ROOT_MARKER || marker === OPEN_CHAIN_STEP_MARKER;
+    return (
+      marker === OPEN_CHAIN_ROOT_MARKER ||
+      marker === OPEN_CHAIN_STEP_MARKER ||
+      marker === CLOSED_START_MARKER ||
+      marker === CLOSED_STEP_MARKER
+    );
   }
 
-  // Returns IDs that have at least one visible continuation child in jetski-chains.json
+  // Returns IDs that have at least one eligible continuation child in jetski-chains.json;
+  // an archived or tool-created child must not hide its parent, or the chain would vanish
   function computeChainPredecessorIds(summariesMap, chainIndex) {
     const preds = new Set();
     const parentOf = chainIndex?.parentOf;
     if (!parentOf || typeof parentOf !== 'object') return preds;
     for (const [childId, parentId] of Object.entries(parentOf)) {
       if (!parentId || !childId) continue;
-      if (!summariesMap || (childId in summariesMap && parentId in summariesMap)) {
+      if (
+        !summariesMap ||
+        (parentId in summariesMap && isEligibleTopLevelSummary(childId, summariesMap[childId]))
+      ) {
         preds.add(parentId);
       }
     }
     return preds;
   }
 
+  // The graph is the source of truth once loaded; title markers only cover chats it lacks
   function isChainPredecessor(cascadeId, title) {
-    return (
-      isChainPredecessorTitle(title) ||
-      Boolean(cascadeId && chainPredecessorIds.has(cascadeId))
-    );
+    if (cascadeId && chainPredecessorIds.has(cascadeId)) return true;
+    return !(cascadeId && chainGraphIds.has(cascadeId)) && isChainPredecessorTitle(title);
   }
 
   // True when an open leaf ⦿ chat has finished its LLM turn and is waiting on a subagent or task
@@ -638,16 +644,17 @@
     );
   }
 
-  // Classifies a conversation into one of the 5 mutually exclusive state buckets
+  // Classifies a conversation into one of the 4 state buckets, or CHAIN_STEP_CLASS for a
+  // handed-off piece of an open or finalized chain
   function classifyChatBucket(summary, fallbackTitle, cascadeId) {
     const title =
       summary?.annotations?.title || summary?.summary || fallbackTitle || '';
+    if (isChainPredecessor(cascadeId, title)) {
+      return CHAIN_STEP_CLASS;
+    }
     const marker = parseTitleMarker(title);
     if (marker && FINALIZED_MARKERS.has(marker)) {
       return 'closed';
-    }
-    if (isChainPredecessor(cascadeId, title)) {
-      return 'steps';
     }
     // Cron chats with marker ⏳ keep notFullyIdle=true between ticks, so only
     // CASCADE_RUN_STATUS_RUNNING counts as actively working for ⏳ chats
@@ -669,7 +676,6 @@
       'needs-me': 0,
       working: 0,
       waiting: 0,
-      steps: 0,
       closed: 0,
     };
   }
@@ -694,21 +700,30 @@
 
   function classifySummaries(summariesMap, allowedBuckets) {
     chainPredecessorIds = computeChainPredecessorIds(summariesMap, chainIndexCache);
+    const parentOf = chainIndexCache?.parentOf || {};
+    chainGraphIds = new Set([...Object.keys(parentOf), ...Object.values(parentOf)]);
     const hiddenIds = new Set();
+    let chosenHiddenCount = 0;
     const perProjectHidden = new Map();
     const statsSummary = emptyBreakdown();
 
     for (const [cascadeId, summary] of Object.entries(summariesMap || {})) {
       if (!isEligibleTopLevelSummary(cascadeId, summary)) continue;
       const bucket = classifyChatBucket(summary, '', cascadeId);
+      // Chain steps are not a choice, so they stay out of counts and per-project "hidden"
+      if (bucket === CHAIN_STEP_CLASS) {
+        hiddenIds.add(cascadeId);
+        continue;
+      }
       countBucket(statsSummary, bucket);
       if (allowedBuckets.has(bucket)) continue;
       hiddenIds.add(cascadeId);
+      chosenHiddenCount++;
       const projectId = summary.trajectoryMetadata?.projectId || '__standalone__';
       perProjectHidden.set(projectId, (perProjectHidden.get(projectId) || 0) + 1);
     }
 
-    return { hiddenIds, perProjectHidden, statsSummary };
+    return { hiddenIds, chosenHiddenCount, perProjectHidden, statsSummary };
   }
 
   function cloneSummaryWithHideFlag(summary, hide) {
@@ -971,11 +986,9 @@
     const summariesMap = store.getState()?.trajectorySummaries?.summaries;
     if (!summariesMap) return false;
 
-    const { hiddenIds, perProjectHidden, statsSummary } = classifySummaries(
-      summariesMap,
-      visibleBuckets
-    );
-    totalHiddenCount = hiddenIds.size;
+    const { hiddenIds, chosenHiddenCount, perProjectHidden, statsSummary } =
+      classifySummaries(summariesMap, visibleBuckets);
+    totalHiddenCount = chosenHiddenCount;
     hiddenCountsByProject = perProjectHidden;
     if (statsSummary) {
       breakdownStats = statsSummary;
@@ -1026,6 +1039,26 @@
       (document.head || document.documentElement).appendChild(style);
     }
     const nextCss = `
+      #${SEARCH_PANEL_ID} {
+        position: fixed; top: 10vh; left: 50%; transform: translateX(-50%);
+        width: min(720px, 90vw); max-height: 75vh; z-index: 2147483000;
+        display: flex; flex-direction: column; gap: 8px; padding: 12px;
+        background: var(--background, #1e1e1e); color: var(--foreground, #ddd);
+        border: 1px solid var(--border, #555); border-radius: 8px;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45); font-size: 13px;
+      }
+      #${SEARCH_PANEL_ID} input {
+        width: 100%; padding: 6px 8px; font-size: 14px; color: inherit;
+        background: transparent; border: 1px solid var(--border, #555); border-radius: 4px;
+      }
+      #${SEARCH_PANEL_ID} .jcs-results { overflow-y: auto; }
+      #${SEARCH_PANEL_ID} .jcs-hit { padding: 6px 4px; cursor: pointer; border-radius: 4px; }
+      #${SEARCH_PANEL_ID} .jcs-hit:hover { background: rgba(127, 127, 127, 0.18); }
+      #${SEARCH_PANEL_ID} .jcs-meta { opacity: 0.65; font-size: 11px; }
+      #${SEARCH_PANEL_ID} mark { background: rgba(255, 200, 0, 0.35); color: inherit; }
+      .${SEARCH_BTN_CLASS} {
+        background: transparent; border: none; cursor: pointer; padding: 0 4px; opacity: 0.8;
+      }
       html[data-jetski-hide-closed="true"] div[data-sidebar-row-id][data-jetski-closed-row="true"]:not([data-sidebar-section-id="pinned"]) {
         height: 0px !important;
         min-height: 0px !important;
@@ -1366,12 +1399,9 @@
 
   function syncDomRowsAndPlaceholders(reduxActive) {
     const anyHidden = visibleBuckets.size < BUCKET_ORDER.length;
-    if (anyHidden) {
-      if (document.documentElement.getAttribute('data-jetski-hide-closed') !== 'true') {
-        document.documentElement.setAttribute('data-jetski-hide-closed', 'true');
-      }
-    } else if (document.documentElement.hasAttribute('data-jetski-hide-closed')) {
-      document.documentElement.removeAttribute('data-jetski-hide-closed');
+    // Chain steps hide even with every bucket on, so the row-hiding CSS stays armed
+    if (document.documentElement.getAttribute('data-jetski-hide-closed') !== 'true') {
+      document.documentElement.setAttribute('data-jetski-hide-closed', 'true');
     }
 
     const store = findReduxStore();
@@ -1386,10 +1416,12 @@
       // Read the raw title so a temporary ⏳ display swap never alters bucket classification
       const title = getRawDomTitle(rowEl);
       const bucket = classifyChatBucket(summariesMap[rowId], title, rowId);
-      countBucket(domStats, bucket);
+      // Same as the Redux path: chain steps always hide and never count as a hidden choice
+      const isChainStep = bucket === CHAIN_STEP_CLASS;
+      if (!isChainStep) countBucket(domStats, bucket);
 
-      if (!visibleBuckets.has(bucket)) {
-        domHiddenCount++;
+      if (isChainStep || !visibleBuckets.has(bucket)) {
+        if (!isChainStep) domHiddenCount++;
         if (rowEl.getAttribute('data-jetski-closed-row') !== 'true') {
           rowEl.setAttribute('data-jetski-closed-row', 'true');
         }
@@ -1472,7 +1504,7 @@
         ${def.description}<br/>
         <b>Click</b> to ${clickVerb} ${def.shortLabel} chats.
       </div>
-      <div class="jcfb-section-title">All 5 chat states (independent filters)</div>
+      <div class="jcfb-section-title">All 4 chat states (independent filters)</div>
       ${rowsHtml}
       <div class="jcfb-row jcfb-total-row">
         <span>Showing in sidebar:</span>
@@ -1480,7 +1512,8 @@
       </div>
       <div class="jcfb-controls">
         <div><kbd>Left-click</kbd> — toggle this state ON / OFF (combine filters)</div>
-        <div><kbd>Right-click</kbd> / <kbd>Shift+click</kbd> — show ONLY this state (or all 5 if solo)</div>
+        <div><kbd>Right-click</kbd> / <kbd>Shift+click</kbd> —
+          show ONLY this state (or all 4 if solo)</div>
       </div>
     `;
   }
@@ -1856,7 +1889,215 @@
     return btn;
   }
 
-  // Injects the 5-button filter bar directly below the sidebar header row
+
+  // Ordered pieces of cascadeId's handoff chain from jetski-chains.json; past cascadeId the
+  // chain follows the newest child, the same branch chat_lifecycle.py treats as the tail
+  function chainOf(cascadeId) {
+    const parentOf = chainIndexCache?.parentOf || {};
+    const createdAt = chainIndexCache?.createdAt || {};
+    const childrenOf = {};
+    for (const [child, parent] of Object.entries(parentOf)) {
+      (childrenOf[parent] = childrenOf[parent] || []).push(child);
+    }
+    const chain = [cascadeId];
+    const seen = new Set(chain);
+    for (let cur = parentOf[cascadeId]; cur && !seen.has(cur); cur = parentOf[cur]) {
+      seen.add(cur);
+      chain.unshift(cur);
+    }
+    for (let cur = cascadeId; childrenOf[cur]; ) {
+      const next = childrenOf[cur]
+        .filter((c) => !seen.has(c))
+        .sort((x, y) => String(createdAt[x] || '').localeCompare(String(createdAt[y] || '')))
+        .pop();
+      if (!next) break;
+      seen.add(next);
+      chain.push(next);
+      cur = next;
+    }
+    return chain;
+  }
+
+  // Only the user's messages and the agent's replies are searched; thinking and tool output
+  // would bury them
+  function stepSearchText(step) {
+    if (step?.type === 'CORTEX_STEP_TYPE_USER_INPUT') {
+      return { who: 'user', text: step.userInput?.userResponse || '' };
+    }
+    if (step?.type === 'CORTEX_STEP_TYPE_PLANNER_RESPONSE') {
+      const pr = step.plannerResponse || {};
+      return { who: 'agent', text: pr.modifiedResponse || pr.response || '' };
+    }
+    return null;
+  }
+
+  async function fetchChainSteps(cascadeId) {
+    const resp = await window.fetch(
+      '/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-codeium-csrf-token': getCsrfToken(),
+        },
+        body: JSON.stringify({ cascadeId }),
+      }
+    );
+    if (!resp.ok) throw new Error(`HTTP ${resp.status} ${await resp.text()}`);
+    return (await resp.json())?.steps || [];
+  }
+
+  // Paragraph around the match, so most hits read without opening the piece
+  function matchParagraph(text, at, len) {
+    const brk = text.lastIndexOf('\n\n', at);
+    const start = brk < 0 ? 0 : brk + 2;
+    const endIdx = text.indexOf('\n\n', at + len);
+    let para = text.slice(start, endIdx < 0 ? text.length : endIdx);
+    let offset = at - start;
+    if (para.length > 600) {
+      const from = Math.max(0, offset - 250);
+      para = (from > 0 ? '…' : '') + para.slice(from, from + 500) + '…';
+      offset = offset - from + (from > 0 ? 1 : 0);
+    }
+    return (
+      escapeHtml(para.slice(0, offset)) + '<mark>' + escapeHtml(para.slice(offset, offset + len)) +
+      '</mark>' + escapeHtml(para.slice(offset + len))
+    );
+  }
+
+  // Native Find in Conversation keys its state by cascadeId; it finds and scrolls to the term
+  // once the routed conversation view mounts
+  function showNativeFind(cascadeId, term) {
+    const store = findReduxStore();
+    if (!store) return;
+    store.dispatch({
+      type: 'findInPane/setIsFindBarVisible',
+      payload: { tabId: cascadeId, isFindBarVisible: true },
+    });
+    store.dispatch({
+      type: 'findInPane/setSearchTerm',
+      payload: { tabId: cascadeId, searchTerm: term },
+    });
+  }
+
+  // Routes inside the SPA by swapping the conversation ID in the current chat URL; the panel
+  // opens from a chat titlebar, so a chat route is always present
+  function openConversation(cascadeId, term) {
+    const path = window.location?.pathname || '';
+    const m = /^(.*\/(?:c|cascade|conversation)\/)[a-zA-Z0-9_-]+(.*)$/.exec(path);
+    if (!m) return;
+    window.history.pushState({}, '', m[1] + cascadeId + m[2]);
+    window.dispatchEvent(new PopStateEvent('popstate'));
+    // Find computes matches from the mounted view's text, so wait for the routed view to mount
+    setTimeout(() => showNativeFind(cascadeId, term), 600);
+  }
+
+  function closeSearchPanel() {
+    document.getElementById(SEARCH_PANEL_ID)?.remove();
+  }
+
+  let searchSeq = 0;
+  // Searches every piece of the chain; steps are fetched once per opened panel
+  async function runChatSearch(query, resultsEl, chain, stepCache) {
+    const seq = ++searchSeq;
+    const needle = query.trim().toLowerCase();
+    if (!needle) {
+      resultsEl.innerHTML = '';
+      return;
+    }
+    const groups = [];
+    try {
+      for (let i = chain.length - 1; i >= 0; i--) {
+        const cid = chain[i];
+        // Cache the promise so searches fired while a fetch is pending share it
+        if (!stepCache.has(cid)) {
+          stepCache.set(
+            cid,
+            fetchChainSteps(cid).catch((err) => {
+              stepCache.delete(cid);
+              throw err;
+            })
+          );
+        }
+        const hits = [];
+        for (const step of await stepCache.get(cid)) {
+          const st = stepSearchText(step);
+          if (!st?.text) continue;
+          const at = st.text.toLowerCase().indexOf(needle);
+          if (at >= 0) hits.push({ who: st.who, html: matchParagraph(st.text, at, needle.length) });
+        }
+        if (hits.length) groups.push({ cid, piece: i + 1, hits: hits.reverse() });
+      }
+    } catch (err) {
+      if (seq === searchSeq) {
+        resultsEl.innerHTML = `<div class="jcs-meta">Search failed: ${escapeHtml(err)}</div>`;
+      }
+      return;
+    }
+    // A slower earlier search must not overwrite results of a newer query
+    if (seq !== searchSeq) return;
+    if (groups.length === 0) {
+      resultsEl.innerHTML = '<div class="jcs-meta">No matches</div>';
+      return;
+    }
+    resultsEl.innerHTML = groups
+      .map(
+        (g) =>
+          `<div class="jcs-meta">piece ${g.piece}/${chain.length} · ${g.hits.length} hit(s)</div>` +
+          g.hits
+            .map(
+              (h) =>
+                `<div class="jcs-hit" data-cascade-id="${escapeHtml(g.cid)}">` +
+                `<div class="jcs-meta">${h.who}</div><div>${h.html}</div></div>`
+            )
+            .join('')
+      )
+      .join('');
+  }
+
+  // Search window over one chat and all its hidden handoff pieces; the chain index is awaited
+  // so a cold first open does not silently search only the current piece
+  async function openSearchPanel(cascadeId) {
+    closeSearchPanel();
+    await fetchChainIndex();
+    const chain = chainOf(cascadeId);
+    const stepCache = new Map();
+    const panel = document.createElement('div');
+    panel.id = SEARCH_PANEL_ID;
+    const input = document.createElement('input');
+    input.type = 'search';
+    input.setAttribute(
+      'placeholder',
+      chain.length > 1 ? `Search this chat and its ${chain.length - 1} earlier piece(s)` :
+        'Search this chat'
+    );
+    const resultsEl = document.createElement('div');
+    resultsEl.className = 'jcs-results';
+    panel.appendChild(input);
+    panel.appendChild(resultsEl);
+    document.body.appendChild(panel);
+    let timer = 0;
+    input.addEventListener('input', () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => runChatSearch(input.value, resultsEl, chain, stepCache), 250);
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') closeSearchPanel();
+    });
+    resultsEl.addEventListener('click', (e) => {
+      const hit = e.target.closest('.jcs-hit');
+      if (!hit) return;
+      const term = input.value.trim();
+      closeSearchPanel();
+      openConversation(hit.getAttribute('data-cascade-id'), term);
+    });
+    input.focus();
+  }
+
+  // The test harness fake DOM cannot type into the panel, so it drives search directly
+  window.__jetskiChatSearch = { runChatSearch, chainOf };
+
+  // Injects the 4-button filter bar directly below the sidebar header row
   function ensureFilterBar() {
     const displayOptionsBtns = document.querySelectorAll(
       'button[aria-label="Display Options"]'
@@ -2045,6 +2286,21 @@
       if (!container) continue;
       const cascadeId = findCascadeIdFromElement(moreBtn);
       if (!cascadeId) continue;
+
+      // Chain search lives in the titlebar because it needs the open chat as its scope
+      if (!container.querySelector(`.${SEARCH_BTN_CLASS}`)) {
+        const searchBtn = document.createElement('button');
+        searchBtn.className = SEARCH_BTN_CLASS;
+        searchBtn.type = 'button';
+        searchBtn.textContent = '🔍';
+        searchBtn.setAttribute('aria-label', 'Search this chat and its hidden pieces');
+        searchBtn.setAttribute('title', 'Search this chat and its hidden pieces');
+        bindActionBtnHandlers(searchBtn, () => {
+          const cid = findCascadeIdFromElement(moreBtn);
+          if (cid) openSearchPanel(cid);
+        });
+        container.insertBefore(searchBtn, moreBtn);
+      }
 
       let waitBtn = container.querySelector(`.${TITLEBAR_WAIT_BTN_CLASS}`);
       if (!waitBtn) {
@@ -2323,6 +2579,7 @@
         target.className === ROW_WAIT_BTN_CLASS ||
         target.className === ROW_BG_WAIT_INDICATOR_CLASS ||
         target.className === PROJECT_ROADMAP_BADGE_CLASS ||
+        target.className === SEARCH_BTN_CLASS ||
         (typeof target.closest === 'function' &&
           (target.closest('#jetski-closed-chats-filter-bubble') ||
             target.closest(`.${BAR_CLASS}`) ||
@@ -2332,7 +2589,8 @@
             target.closest(`.${ROW_BTN_CLASS}`) ||
             target.closest(`.${ROW_WAIT_BTN_CLASS}`) ||
             target.closest(`.${ROW_BG_WAIT_INDICATOR_CLASS}`) ||
-            target.closest(`.${PROJECT_ROADMAP_BADGE_CLASS}`)))
+            target.closest(`.${PROJECT_ROADMAP_BADGE_CLASS}`) ||
+            target.closest(`#${SEARCH_PANEL_ID}`)))
       ) {
         return false;
       }
@@ -2362,6 +2620,8 @@
       `.${ROW_WAIT_BTN_CLASS}`,
       `.${ROW_BG_WAIT_INDICATOR_CLASS}`,
       `.${PROJECT_ROADMAP_BADGE_CLASS}`,
+      `.${SEARCH_BTN_CLASS}`,
+      `#${SEARCH_PANEL_ID}`,
     ].join(', ');
     for (const el of document.querySelectorAll(cleanupSelector)) {
       el.remove();
