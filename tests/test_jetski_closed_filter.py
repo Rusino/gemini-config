@@ -605,9 +605,18 @@ global.requestAnimationFrame = (cb) => {
 
 eval(code);
 
-const filterBar = bodyEl.querySelector('.jetski-attention-filter-bar');
-assert(filterBar, '3-button filter bar must be injected below the sidebar header row');
-assert.strictEqual(bodyEl.children[1], filterBar, 'Filter bar must sit directly below actionRow');
+const filterBar = actionRow.querySelector('.jetski-attention-filter-bar');
+assert(filterBar, '3-button filter bar must be injected inside actionRow');
+assert.strictEqual(
+  actionRow.children[0],
+  filterBar,
+  'Filter bar must sit inside actionRow before displayOptionsBtn'
+);
+assert.strictEqual(
+  actionRow.children[1],
+  displayOptionsBtn,
+  'displayOptionsBtn must follow filterBar'
+);
 const bucketBtns = filterBar.querySelectorAll('.jetski-closed-chats-filter-btn');
 assert.strictEqual(bucketBtns.length, 3, 'Filter bar must render 3 state buttons');
 
@@ -617,6 +626,11 @@ const btnWaiting = filterBar.querySelector('button[data-bucket="waiting"]');
 assert.deepStrictEqual(
   bucketBtns.map((b) => b.getAttribute('data-bucket')),
   ['needs-me', 'working', 'waiting']
+);
+assert.strictEqual(btnNeedsMe.innerHTML, '<span class="jetski-bucket-icon">🚨</span>');
+assert(
+  !btnNeedsMe.querySelector('.jetski-filter-badge'),
+  'Filter button must not carry count badge'
 );
 
 const isHidden = (id) => Boolean(

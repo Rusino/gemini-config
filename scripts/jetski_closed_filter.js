@@ -850,11 +850,12 @@
         --overview-panel-gutter-reserve: 0px !important;
       }
       .${BAR_CLASS} {
-        display: flex;
+        display: inline-flex;
         align-items: center;
-        gap: 4px;
-        padding: 4px 10px 6px 10px;
-        width: 100%;
+        gap: 2px;
+        padding: 0;
+        width: auto;
+        height: 20px;
         box-sizing: border-box;
         flex-wrap: nowrap;
       }
@@ -862,52 +863,49 @@
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        flex: 1 1 0;
-        min-width: 0;
-        gap: 3px;
-        height: 22px;
-        padding: 0 5px;
-        border-radius: 6px;
-        border: 1px solid transparent;
-        font-family: inherit;
-        font-size: 11px;
-        font-weight: 500;
-        line-height: 1;
-        white-space: nowrap;
+        width: 20px;
+        min-width: 20px !important;
+        height: 20px;
+        min-height: 20px !important;
+        padding: 0 !important;
+        border-radius: 4px;
+        border: none !important;
+        background: transparent;
         cursor: pointer;
         user-select: none;
-        transition: background-color 120ms ease, color 120ms ease, border-color 120ms ease, opacity 120ms ease;
+        transition: opacity 120ms ease, background-color 120ms ease;
+        flex: 0 0 auto;
+        box-sizing: border-box;
       }
       .${BUTTON_CLASS} > * {
         pointer-events: none;
       }
       .${BUTTON_CLASS}[data-active="false"] {
-        background: rgba(128, 134, 139, 0.08);
-        border-color: rgba(128, 134, 139, 0.20);
-        color: var(--muted-foreground, #9aa0a6);
-        opacity: 0.68;
+        background: transparent;
+        border: none;
+        opacity: 0.35;
+        filter: grayscale(0.4);
       }
       .${BUTTON_CLASS}[data-active="false"]:hover {
         background: var(--sidebar-secondary, rgba(128, 134, 139, 0.18));
-        color: var(--foreground, #e8eaed);
-        opacity: 0.95;
+        opacity: 0.8;
       }
       .${BUTTON_CLASS}[data-active="true"] {
-        background: color-mix(in srgb, var(--primary, #8ab4f8) 18%, transparent);
-        border-color: color-mix(in srgb, var(--primary, #8ab4f8) 38%, transparent);
-        color: var(--primary, #8ab4f8);
+        background: transparent;
+        border: none;
         opacity: 1;
+        filter: none;
       }
       .${BUTTON_CLASS}[data-active="true"]:hover {
-        background: color-mix(in srgb, var(--primary, #8ab4f8) 26%, transparent);
+        background: var(--sidebar-secondary, rgba(128, 134, 139, 0.18));
+        opacity: 1;
       }
       .${BUTTON_CLASS} .jetski-bucket-icon {
         font-size: 11px;
         line-height: 1;
-      }
-      .${BUTTON_CLASS} .jetski-filter-badge {
-        font-variant-numeric: tabular-nums;
-        font-weight: 600;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
       }
       .${TITLEBAR_BTN_CLASS},
       .${TITLEBAR_WAIT_BTN_CLASS} {
@@ -1639,9 +1637,7 @@
       btn.setAttribute('aria-label', labelText);
     }
 
-    const nextHtml =
-      `<span class="jetski-bucket-icon">${def.icon}</span>` +
-      `<span class="jetski-filter-badge">${count}</span>`;
+    const nextHtml = `<span class="jetski-bucket-icon">${def.icon}</span>`;
     if (btn.innerHTML !== nextHtml) {
       btn.innerHTML = nextHtml;
     }
@@ -2265,7 +2261,7 @@
 
   window.__jetskiChainNav = { syncConversationChainNavigators };
 
-  // Injects the 3-button filter bar directly below the sidebar header row
+  // Injects the 3-button filter bar inline inside actionRow before Display Options
   function ensureFilterBar() {
     const displayOptionsBtns = document.querySelectorAll(
       'button[aria-label="Display Options"]'
@@ -2273,9 +2269,8 @@
     for (const displayOptionsBtn of displayOptionsBtns) {
       const actionRow = displayOptionsBtn.parentElement;
       if (!actionRow) continue;
-      const headerHost = actionRow.parentElement || actionRow;
 
-      let bar = headerHost.querySelector(`.${BAR_CLASS}`);
+      let bar = actionRow.querySelector(`.${BAR_CLASS}`);
       if (!bar) {
         bar = document.createElement('div');
         bar.className = BAR_CLASS;
@@ -2285,24 +2280,7 @@
           bar.appendChild(createBucketButton(bucketKey));
         }
 
-        // Insert right after actionRow when headerHost is actionRow's parent
-        if (headerHost !== actionRow) {
-          const idx = Array.isArray(headerHost.children)
-            ? headerHost.children.indexOf(actionRow)
-            : -1;
-          const nextSib =
-            actionRow.nextSibling ||
-            (idx >= 0 && idx + 1 < headerHost.children.length
-              ? headerHost.children[idx + 1]
-              : null);
-          if (nextSib) {
-            headerHost.insertBefore(bar, nextSib);
-          } else {
-            headerHost.appendChild(bar);
-          }
-        } else {
-          headerHost.insertBefore(bar, displayOptionsBtn);
-        }
+        actionRow.insertBefore(bar, displayOptionsBtn);
       }
 
       for (const bucketKey of BUCKET_ORDER) {
