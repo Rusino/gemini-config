@@ -22,6 +22,9 @@ from datetime import datetime, timezone
 
 ROADMAPS_DIR_ENV = "JETSKI_ROADMAPS_DIR"
 DEFAULT_ROADMAPS_DIR = "~/.gemini/config/roadmaps"
+# Static JSON snapshot served via /static/artifacts/ so sidebar project headers show open counts
+ROADMAP_INDEX_FILE_NAME = "jetski-roadmaps.json"
+APP_DATA_DIR_CANDIDATES = ("~/.gemini/jetski", "~/.gemini/antigravity")
 OUTSIDE_PROJECT = "outside-of-project"
 SCHEMA_VERSION = 1
 
@@ -60,6 +63,7 @@ Usage:
   roadmap.py state-move <old_conv_id> <new_conv_id>
                                                   Hand the state file (and owned
                                                   `doing` items) to a continuation
+  roadmap.py export-index                         Export jetski-roadmaps.json for UI
 
 The project comes from conversation_summaries.db, else $ANTIGRAVITY_PROJECT_ID.
 Chats outside a project have no roadmap. Never edit roadmap files directly.
@@ -259,6 +263,8 @@ def _mutate(project_id: str, conv_id: str, apply) -> str:
     validate(doc)
     _write_atomic(os.path.join(pdir, "roadmap.json"), doc)
     _journal(pdir, conv_id, op, **fields)
+  # Refresh the static UI roadmap snapshot after releasing the per-project lock
+  export_roadmap_index()
   return msg
 
 
@@ -526,6 +532,9 @@ def state_move(project_id: str, old_conv: str, new_conv: str) -> str:
         os.replace(dst, src)
         raise
     _journal(pdir, old_conv, "state-move", to=new_conv, items=moved)
+  # Update exported owner tags in jetski-roadmaps.json after releasing the project lock
+  if moved or baton_moved:
+    export_roadmap_index()
   owned = f"; {len(moved)} doing item(s) now owned by {new_conv[:8]}" if moved else ""
   return f"state moved to {dst}{owned}"
 
@@ -538,6 +547,8 @@ def clear_baton(project_id: str, conv_ids: set[str] | list[str]) -> bool:
   if not os.path.exists(os.path.join(pdir, "roadmap.json")):
     return False
   target_set = set(conv_ids)
+  # Defer export_roadmap_index until after the per-project lock is closed
+  cleared = False
   with _locked(pdir):
     doc = load(project_id)
     baton = doc.get("baton")
@@ -545,8 +556,128 @@ def clear_baton(project_id: str, conv_ids: set[str] | list[str]) -> bool:
       doc.pop("baton", None)
       validate(doc)
       _write_atomic(os.path.join(pdir, "roadmap.json"), doc)
-      return True
-  return False
+      cleared = True
+  if cleared:
+    export_roadmap_index()
+  return cleared
+
+
+# Returns active app data directories, keeping test runs isolated when JETSKI_ROADMAPS_DIR is set
+def find_app_data_dirs() -> list[str]:
+  default_dirs = {
+      os.path.abspath(os.path.expanduser(c)) for c in APP_DATA_DIR_CANDIDATES
+  }
+  env_dir = os.environ.get("ANTIGRAVITY_APP_DATA_DIR")
+  if os.environ.get(ROADMAPS_DIR_ENV):
+    # Never touch live user app data dirs when JETSKI_ROADMAPS_DIR points to a test dir
+    if env_dir:
+      exp = os.path.abspath(os.path.expanduser(env_dir))
+      if exp not in default_dirs and os.path.isdir(exp):
+        return [exp]
+    return []
+  res: list[str] = []
+  if env_dir:
+    exp = os.path.abspath(os.path.expanduser(env_dir))
+    if os.path.isdir(exp):
+      res.append(exp)
+  for candidate in APP_DATA_DIR_CANDIDATES:
+    exp = os.path.abspath(os.path.expanduser(candidate))
+    if os.path.isdir(exp) and exp not in res:
+      res.append(exp)
+  return res
+
+
+# Summarizes leaf/effective task counts and open items for the sidebar project header badge
+def summarize_doc(doc: dict) -> dict:
+  items = doc.get("items") or []
+  counts = {s: 0 for s in STATUSES}
+  children: dict[str, list[dict]] = {}
+  for it in items:
+    children.setdefault(it.get("parent") or "", []).append(it)
+
+  def descendants(iid: str) -> list[dict]:
+    out = []
+    for ch in children.get(iid, []):
+      out.append(ch)
+      out.extend(descendants(ch["id"]))
+    return out
+
+  for it in items:
+    desc = descendants(it["id"])
+    # Count leaf tasks directly; only count a parent container if it remains open after
+    # all of its descendants were closed, avoiding parent + child double-counting
+    if not desc:
+      counts[it["status"]] += 1
+    elif it["status"] not in CLOSED_STATUSES and all(
+        d["status"] in CLOSED_STATUSES for d in desc
+    ):
+      counts[it["status"]] += 1
+
+  open_items: list[dict] = []
+
+  def collect_open(parent_id: str, depth: int) -> None:
+    for it in children.get(parent_id, []):
+      desc = descendants(it["id"])
+      has_open_desc = any(d["status"] not in CLOSED_STATUSES for d in desc)
+      if it["status"] not in CLOSED_STATUSES or has_open_desc:
+        if it["status"] not in CLOSED_STATUSES:
+          open_items.append({
+              "id": it["id"],
+              "status": it["status"],
+              "text": it["text"],
+              "depth": depth,
+              "owner": (it.get("owner") or "")[:8],
+          })
+        collect_open(it["id"], depth + (1 if it["status"] not in CLOSED_STATUSES else 0))
+
+  collect_open("", 0)
+  doing = counts["doing"]
+  todo = counts["todo"]
+  done = counts["done"]
+  dropped = counts["dropped"]
+  open_count = doing + todo
+  return {
+      "doing": doing,
+      "todo": todo,
+      "done": done,
+      "dropped": dropped,
+      "open": open_count,
+      "total": done + open_count,
+      "openItems": open_items,
+  }
+
+
+# Writes jetski-roadmaps.json to the roadmaps root and mirrors it into brain/ for /static/artifacts/
+def export_roadmap_index() -> dict:
+  root = roadmaps_root()
+  projects: dict[str, dict] = {}
+  if os.path.isdir(root):
+    for entry in sorted(os.listdir(root)):
+      if not SAFE_ID_RE.match(entry):
+        continue
+      rfile = os.path.join(root, entry, "roadmap.json")
+      if not os.path.isfile(rfile):
+        continue
+      try:
+        doc = load(entry)
+      except (RoadmapError, OSError):
+        continue
+      projects[entry] = summarize_doc(doc)
+  payload = {"version": SCHEMA_VERSION, "projects": projects}
+  raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+  targets = [os.path.join(root, ROADMAP_INDEX_FILE_NAME)]
+  for app_dir in find_app_data_dirs():
+    targets.append(os.path.join(app_dir, "brain", ROADMAP_INDEX_FILE_NAME))
+  for dst in targets:
+    try:
+      os.makedirs(os.path.dirname(dst), exist_ok=True)
+      tmp = f"{dst}.tmp.{os.getpid()}"
+      with open(tmp, "w", encoding="utf-8") as f:
+        f.write(raw)
+      os.replace(tmp, dst)
+    except OSError:
+      pass
+  return payload
 
 
 def _format_id_ranges(ids: list[str]) -> str:
@@ -703,6 +834,10 @@ def _cli(argv: list[str]) -> int:
   elif cmd == "state-move" and len(args) == 2:
     pid = require_project_id(args[0])
     print(state_move(pid, args[0], args[1]))
+  # Allow manual or sync-script refresh of jetski-roadmaps.json without mutating any project
+  elif cmd == "export-index" and not args:
+    payload = export_roadmap_index()
+    print(f"exported {len(payload['projects'])} project roadmap(s)")
   else:
     print(f"roadmap.py: bad arguments for '{cmd}'\n", file=sys.stderr)
     print(USAGE, file=sys.stderr, end="")

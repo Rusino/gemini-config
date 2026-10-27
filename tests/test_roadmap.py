@@ -488,6 +488,71 @@ class TestRoadmap(unittest.TestCase):
       with self.assertRaises(roadmap.RoadmapError):
         roadmap.validate(doc)
 
+  def test_summarize_and_export_roadmap_index(self):
+    roadmap.add_item("p1", "c1", "Parent epic")
+    roadmap.add_item("p1", "c1", "Child done", parent="R1")
+    roadmap.add_item("p1", "c1", "Child doing", parent="R1")
+    roadmap.add_item("p1", "c1", "Standalone todo")
+    roadmap.add_item("p1", "c1", "Dropped item")
+    roadmap.set_status("p1", "c1", "R1", "doing")
+    roadmap.set_status("p1", "c1", "R1.1", "done")
+    roadmap.set_status("p1", "c2", "R1.2", "doing")
+    roadmap.set_status("p1", "c1", "R3", "dropped")
+
+    index_path = os.path.join(self.tmp.name, roadmap.ROADMAP_INDEX_FILE_NAME)
+    self.assertTrue(os.path.isfile(index_path))
+    with open(index_path, encoding="utf-8") as f:
+      payload = json.load(f)
+    summary = payload["projects"]["p1"]
+    # Leaf tasks are R1.1 (done), R1.2 (doing), R2 (todo), R3 (dropped); parent R1 is not
+    # double-counted on top of R1.1/R1.2, and dropped R3 is excluded from total
+    self.assertEqual(summary["done"], 1)
+    self.assertEqual(summary["doing"], 1)
+    self.assertEqual(summary["todo"], 1)
+    self.assertEqual(summary["dropped"], 1)
+    self.assertEqual(summary["open"], 2)
+    self.assertEqual(summary["total"], 3)
+    self.assertEqual(
+        [(it["id"], it["status"], it["depth"], it["owner"]) for it in summary["openItems"]],
+        [("R1", "doing", 0, "c1"), ("R1.2", "doing", 1, "c2"), ("R2", "todo", 0, "")],
+    )
+
+    # If R1.2 finishes while parent R1 is still doing, R1 remains counted as 1 open item
+    roadmap.set_status("p1", "c2", "R1.2", "done")
+    summary_after = roadmap.summarize_doc(roadmap.load("p1"))
+    self.assertEqual(summary_after["doing"], 1)
+    self.assertEqual(summary_after["todo"], 1)
+    self.assertEqual(summary_after["open"], 2)
+
+    r_cli = self._run_cli("export-index")
+    self.assertEqual(r_cli.returncode, 0)
+    self.assertIn("exported 1 project roadmap(s)", r_cli.stdout)
+
+    # When JETSKI_ROADMAPS_DIR is set, live production app data dirs in ANTIGRAVITY_APP_DATA_DIR
+    # must never be returned by find_app_data_dirs
+    with patch.dict(
+        os.environ,
+        {
+            roadmap.ROADMAPS_DIR_ENV: self.tmp.name,
+            "ANTIGRAVITY_APP_DATA_DIR": os.path.expanduser("~/.gemini/jetski"),
+        },
+    ):
+      self.assertEqual(roadmap.find_app_data_dirs(), [])
+      app_dir = os.path.join(self.tmp.name, "custom_app_data")
+      os.makedirs(app_dir, exist_ok=True)
+    with patch.dict(
+        os.environ,
+        {
+            roadmap.ROADMAPS_DIR_ENV: self.tmp.name,
+            "ANTIGRAVITY_APP_DATA_DIR": app_dir,
+        },
+    ):
+      self.assertEqual(roadmap.find_app_data_dirs(), [app_dir])
+      roadmap.export_roadmap_index()
+      self.assertTrue(
+          os.path.isfile(os.path.join(app_dir, "brain", roadmap.ROADMAP_INDEX_FILE_NAME))
+      )
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -17,6 +17,8 @@
   const ROW_WAIT_BTN_CLASS = 'jetski-row-wait-btn';
   // Right-side ⏳ badge rendered on open ⦿ rows waiting on background tasks or subagents
   const ROW_BG_WAIT_INDICATOR_CLASS = 'jetski-row-bg-wait-indicator';
+  // Compact open-task badge rendered inside sidebar project headers
+  const PROJECT_ROADMAP_BADGE_CLASS = 'jetski-project-roadmap-badge';
   const STYLE_ID = 'jetski-closed-chats-filter-style';
 
   // Lifecycle titles follow "[HH:MM] <marker> <Topic>" where marker encodes chain/wait state
@@ -147,10 +149,18 @@
   let rafScheduled = false;
   let activeHoverBtn = null;
   let activeHoverBucket = null;
+  // Tracks which project roadmap badge owns the shared floating bubble tooltip
+  let activeHoverRoadmapBadge = null;
+  let activeHoverRoadmapProjectId = null;
   let chainIndexCache = null;
   let chainIndexFetchedAt = 0;
   let chainIndexFetching = false;
   let chainPredecessorIds = new Set();
+  // Caches jetski-roadmaps.json across DOM sync cycles within ROADMAP_INDEX_TTL_MS
+  const ROADMAP_INDEX_TTL_MS = 5000;
+  let roadmapIndexCache = null;
+  let roadmapIndexFetchedAt = 0;
+  let roadmapIndexFetching = false;
 
   function parseTitleMarker(title) {
     if (typeof title !== 'string') return null;
@@ -333,6 +343,60 @@
       })
       .catch(() => {
         chainIndexFetching = false;
+      });
+  }
+
+  async function fetchRoadmapIndex() {
+    const now = Date.now();
+    if (roadmapIndexCache && now - roadmapIndexFetchedAt < ROADMAP_INDEX_TTL_MS) {
+      return roadmapIndexCache;
+    }
+    if (typeof window.fetch !== 'function') {
+      return roadmapIndexCache || { projects: {} };
+    }
+    try {
+      const csrf = encodeURIComponent(getCsrfToken());
+      const resp = await window.fetch(
+        `/static/artifacts/jetski-roadmaps.json?v=${now}&csrf=${csrf}`
+      );
+      if (resp && resp.ok) {
+        const data = await resp.json();
+        if (data && typeof data === 'object') {
+          roadmapIndexCache = {
+            projects: data.projects || {},
+          };
+          roadmapIndexFetchedAt = now;
+          return roadmapIndexCache;
+        }
+      }
+    } catch {
+      // Ignore network errors and preserve cached roadmap summaries
+    }
+    return roadmapIndexCache || { projects: {} };
+  }
+
+  // Periodically refreshes jetski-roadmaps.json so sidebar project badges track CLI updates
+  function ensureRoadmapIndexLoaded() {
+    const now = Date.now();
+    if (
+      roadmapIndexFetching ||
+      (roadmapIndexCache && now - roadmapIndexFetchedAt < ROADMAP_INDEX_TTL_MS)
+    ) {
+      return;
+    }
+    if (typeof window.fetch !== 'function') return;
+    roadmapIndexFetching = true;
+    const prevSig = JSON.stringify(roadmapIndexCache?.projects || {});
+    fetchRoadmapIndex()
+      .then((idx) => {
+        roadmapIndexFetching = false;
+        const nextSig = JSON.stringify(idx?.projects || {});
+        if (nextSig !== prevSig) {
+          scheduleSync();
+        }
+      })
+      .catch(() => {
+        roadmapIndexFetching = false;
       });
   }
 
@@ -1136,6 +1200,64 @@
       [data-jetski-bg-waiting="true"] .status-unread-dot {
         display: none !important;
       }
+      .${PROJECT_ROADMAP_BADGE_CLASS} {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+        padding: 1px 5px;
+        border-radius: 4px;
+        border: 1px solid rgba(128, 134, 139, 0.28);
+        background: rgba(128, 134, 139, 0.12);
+        color: var(--muted-foreground, #b8bdc4);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        font-size: 10.5px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+        line-height: 1.25;
+        flex-shrink: 0;
+        white-space: nowrap;
+        user-select: none;
+      }
+      .${PROJECT_ROADMAP_BADGE_CLASS}[data-has-doing="true"] {
+        border-color: rgba(138, 180, 248, 0.42);
+        background: rgba(138, 180, 248, 0.14);
+        color: #8ab4f8;
+      }
+      #jetski-closed-chats-filter-bubble .jcfb-roadmap-list {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+        max-height: 240px;
+        overflow-y: auto;
+        margin-top: 2px;
+      }
+      #jetski-closed-chats-filter-bubble .jcfb-roadmap-item {
+        display: flex;
+        align-items: flex-start;
+        gap: 5px;
+        padding: 2px 4px;
+        border-radius: 4px;
+        font-size: 11px;
+        line-height: 1.35;
+      }
+      #jetski-closed-chats-filter-bubble .jcfb-roadmap-item[data-status="doing"] {
+        background: rgba(138, 180, 248, 0.12);
+        color: #d2e3fc;
+      }
+      #jetski-closed-chats-filter-bubble .jcfb-roadmap-glyph {
+        flex-shrink: 0;
+        font-weight: 600;
+      }
+      #jetski-closed-chats-filter-bubble .jcfb-roadmap-id {
+        flex-shrink: 0;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+      }
+      #jetski-closed-chats-filter-bubble .jcfb-roadmap-text {
+        flex: 1 1 auto;
+        min-width: 0;
+        word-break: break-word;
+      }
       #jetski-closed-chats-filter-bubble {
         position: fixed;
         z-index: 2147483647;
@@ -1377,6 +1499,9 @@
   function showBubbleForButton(btn, bucketKey) {
     activeHoverBtn = btn;
     activeHoverBucket = bucketKey || btn?.getAttribute('data-bucket') || 'needs-me';
+    // Clear any active roadmap badge hover state since the shared bubble now renders bucket stats
+    activeHoverRoadmapBadge = null;
+    activeHoverRoadmapProjectId = null;
     const bubble = ensureBubbleElement();
     if (!bubble || !btn) return;
     const nextBubbleHtml = buildBubbleHtml(activeHoverBucket);
@@ -1402,9 +1527,216 @@
   function hideBubble() {
     activeHoverBtn = null;
     activeHoverBucket = null;
+    // Reset both bucket and roadmap hover owners when hiding the shared bubble
+    activeHoverRoadmapBadge = null;
+    activeHoverRoadmapProjectId = null;
     const bubble = document.getElementById('jetski-closed-chats-filter-bubble');
     if (bubble && bubble.getAttribute('data-visible') !== 'false') {
       bubble.setAttribute('data-visible', 'false');
+    }
+  }
+
+  function escapeHtml(str) {
+    return String(str || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  // Formats compact open counts (▸doing ☐todo) and tooltip summary; returns null when 0 open
+  function formatProjectRoadmapInfo(summary) {
+    if (!summary || typeof summary !== 'object') return null;
+    const doing = Math.max(0, Number(summary.doing) || 0);
+    const todo = Math.max(0, Number(summary.todo) || 0);
+    const done = Math.max(0, Number(summary.done) || 0);
+    const dropped = Math.max(0, Number(summary.dropped) || 0);
+    const open = doing + todo;
+    if (open <= 0) return null;
+    const total = Math.max(open, Number(summary.total) || done + open);
+    const parts = [];
+    if (doing > 0) parts.push(`▸${doing}`);
+    if (todo > 0) parts.push(`☐${todo}`);
+    const badgeText = parts.join(' ');
+    const breakdownParts = [`${done} done`, `${doing} doing`, `${todo} todo`];
+    if (dropped > 0) {
+      breakdownParts.push(`${dropped} dropped`);
+    }
+    const breakdownText = breakdownParts.join(' · ');
+    const headerLine = `${open} open of ${total} (${breakdownText})`;
+    const openItems = Array.isArray(summary.openItems) ? summary.openItems : [];
+    const itemLines = openItems.map((it) => {
+      const depth = Math.max(0, Number(it?.depth) || 0);
+      const indent = '  '.repeat(depth);
+      const glyph = it?.status === 'doing' ? '▸' : '☐';
+      const ownerSuffix = it?.status === 'doing' && it?.owner ? ` [${it.owner}]` : '';
+      return `${indent}${glyph} ${it?.id || ''} ${it?.text || ''}${ownerSuffix}`;
+    });
+    const tooltipText =
+      itemLines.length > 0 ? `${headerLine}\n${itemLines.join('\n')}` : headerLine;
+    return {
+      doing,
+      todo,
+      done,
+      dropped,
+      open,
+      total,
+      badgeText,
+      breakdownText,
+      headerLine,
+      tooltipText,
+      ariaLabel: `Roadmap: ${headerLine}`,
+      openItems,
+    };
+  }
+
+  function buildRoadmapBubbleHtml(info) {
+    const dotColor = info.doing > 0 ? '#8ab4f8' : '#9ca3af';
+    const itemsHtml = info.openItems
+      .map((it) => {
+        const status = it?.status === 'doing' ? 'doing' : 'todo';
+        const glyph = status === 'doing' ? '▸' : '☐';
+        const depth = Math.max(0, Number(it?.depth) || 0);
+        const padLeft = 4 + depth * 12;
+        const ownerSuffix =
+          status === 'doing' && it?.owner ? ` [${escapeHtml(it.owner)}]` : '';
+        return (
+          `<div class="jcfb-roadmap-item" data-status="${status}" ` +
+          `style="padding-left:${padLeft}px">` +
+          `<span class="jcfb-roadmap-glyph">${glyph}</span>` +
+          `<span class="jcfb-roadmap-id">${escapeHtml(it?.id || '')}</span>` +
+          `<span class="jcfb-roadmap-text">${escapeHtml(it?.text || '')}${ownerSuffix}</span>` +
+          `</div>`
+        );
+      })
+      .join('');
+    const listBlock = itemsHtml
+      ? `<div class="jcfb-section-title">Open roadmap items</div>` +
+        `<div class="jcfb-roadmap-list">${itemsHtml}</div>`
+      : '';
+    return (
+      `<div class="jcfb-header">` +
+      `<span class="jcfb-header-left">` +
+      `<span class="jcfb-dot" style="background:${dotColor}"></span>` +
+      `<span>Project Roadmap</span>` +
+      `</span>` +
+      `<span>[${info.open} open of ${info.total}]</span>` +
+      `</div>` +
+      `<div class="jcfb-desc">${escapeHtml(info.breakdownText)}</div>` +
+      listBlock
+    );
+  }
+
+  function showRoadmapBubbleForBadge(badge, projectId) {
+    const summary = roadmapIndexCache?.projects?.[projectId];
+    const info = formatProjectRoadmapInfo(summary);
+    if (!badge || !info) {
+      hideBubble();
+      return;
+    }
+    activeHoverBtn = null;
+    activeHoverBucket = null;
+    activeHoverRoadmapBadge = badge;
+    activeHoverRoadmapProjectId = projectId;
+    const bubble = ensureBubbleElement();
+    if (!bubble) return;
+    const nextHtml = buildRoadmapBubbleHtml(info);
+    if (bubble.innerHTML !== nextHtml) {
+      bubble.innerHTML = nextHtml;
+    }
+    if (bubble.getAttribute('data-visible') !== 'true') {
+      bubble.setAttribute('data-visible', 'true');
+    }
+
+    const rect = badge.getBoundingClientRect();
+    const bubbleWidth = 320;
+    let left = rect.left;
+    if (left + bubbleWidth + 8 > window.innerWidth) {
+      left = Math.max(8, window.innerWidth - bubbleWidth - 8);
+    }
+    left = Math.max(8, left);
+    const top = rect.bottom + 6;
+    bubble.style.left = `${Math.round(left)}px`;
+    bubble.style.top = `${Math.round(top)}px`;
+  }
+
+  // Renders or removes the compact open-roadmap badge inside each sidebar project header
+  function ensureProjectRoadmapBadges() {
+    const sectionEls = document.querySelectorAll(
+      'div[data-sidebar-section-drop-id]:not([data-sidebar-row-id])'
+    );
+    const projectsMap = roadmapIndexCache?.projects || {};
+    for (const sectionEl of sectionEls) {
+      const projectId = sectionEl.getAttribute('data-sidebar-section-drop-id') || '';
+      if (!projectId) continue;
+      const headerBtn = sectionEl.querySelector(
+        'button[data-testid="project-header"], button[data-project-card]'
+      );
+      if (!headerBtn) continue;
+      const info = formatProjectRoadmapInfo(projectsMap[projectId]);
+      let badge = headerBtn.querySelector(`.${PROJECT_ROADMAP_BADGE_CLASS}`);
+      if (!info) {
+        if (badge) {
+          if (activeHoverRoadmapBadge === badge) {
+            hideBubble();
+          }
+          badge.remove();
+        }
+        continue;
+      }
+      const titleSpan = headerBtn.querySelector('span.truncate');
+      const host = titleSpan?.parentElement || headerBtn;
+      if (!badge) {
+        badge = document.createElement('span');
+        badge.className = PROJECT_ROADMAP_BADGE_CLASS;
+        badge.setAttribute('data-testid', 'project-roadmap-badge');
+        badge.addEventListener('mouseenter', () => {
+          const pid = badge.getAttribute('data-project-id') || projectId;
+          showRoadmapBubbleForBadge(badge, pid);
+        });
+        badge.addEventListener('mouseleave', () => {
+          hideBubble();
+        });
+        badge.addEventListener('focus', () => {
+          const pid = badge.getAttribute('data-project-id') || projectId;
+          showRoadmapBubbleForBadge(badge, pid);
+        });
+        badge.addEventListener('blur', () => {
+          hideBubble();
+        });
+        host.appendChild(badge);
+      }
+      if (badge.getAttribute('data-project-id') !== projectId) {
+        badge.setAttribute('data-project-id', projectId);
+      }
+      const hasDoingStr = info.doing > 0 ? 'true' : 'false';
+      if (badge.getAttribute('data-has-doing') !== hasDoingStr) {
+        badge.setAttribute('data-has-doing', hasDoingStr);
+      }
+      if (badge.getAttribute('data-doing') !== String(info.doing)) {
+        badge.setAttribute('data-doing', String(info.doing));
+      }
+      if (badge.getAttribute('data-todo') !== String(info.todo)) {
+        badge.setAttribute('data-todo', String(info.todo));
+      }
+      if (badge.getAttribute('data-open') !== String(info.open)) {
+        badge.setAttribute('data-open', String(info.open));
+      }
+      if (badge.getAttribute('data-total') !== String(info.total)) {
+        badge.setAttribute('data-total', String(info.total));
+      }
+      if (badge.textContent !== info.badgeText) {
+        badge.textContent = info.badgeText;
+      }
+      if (badge.getAttribute('title') !== info.tooltipText) {
+        badge.setAttribute('title', info.tooltipText);
+      }
+      if (badge.getAttribute('aria-label') !== info.ariaLabel) {
+        badge.setAttribute('aria-label', info.ariaLabel);
+      }
+      if (activeHoverRoadmapBadge === badge && activeHoverRoadmapProjectId === projectId) {
+        showRoadmapBubbleForBadge(badge, projectId);
+      }
     }
   }
 
@@ -1954,10 +2286,14 @@
 
   function runFullSync() {
     ensureChainIndexLoaded();
+    // Refresh the cached roadmap index and update project header badges on every sync pass
+    ensureRoadmapIndexLoaded();
     ensureStylesInjected();
     const reduxActive = syncReduxFilter();
     syncDomRowsAndPlaceholders(reduxActive);
     ensureFilterBar();
+    // Render or remove compact open-roadmap badges after project card DOM rows are synced
+    ensureProjectRoadmapBadges();
     ensureTitlebarCloseButtons();
     ensureSidebarRowCloseButtons();
   }
@@ -1986,6 +2322,7 @@
         target.className === ROW_BTN_CLASS ||
         target.className === ROW_WAIT_BTN_CLASS ||
         target.className === ROW_BG_WAIT_INDICATOR_CLASS ||
+        target.className === PROJECT_ROADMAP_BADGE_CLASS ||
         (typeof target.closest === 'function' &&
           (target.closest('#jetski-closed-chats-filter-bubble') ||
             target.closest(`.${BAR_CLASS}`) ||
@@ -1994,7 +2331,8 @@
             target.closest(`.${TITLEBAR_WAIT_BTN_CLASS}`) ||
             target.closest(`.${ROW_BTN_CLASS}`) ||
             target.closest(`.${ROW_WAIT_BTN_CLASS}`) ||
-            target.closest(`.${ROW_BG_WAIT_INDICATOR_CLASS}`)))
+            target.closest(`.${ROW_BG_WAIT_INDICATOR_CLASS}`) ||
+            target.closest(`.${PROJECT_ROADMAP_BADGE_CLASS}`)))
       ) {
         return false;
       }
@@ -2015,9 +2353,17 @@
   window.__jetskiClosedChatsFilterCleanup = () => {
     observer.disconnect();
     // Remove all injected filter buttons and background-wait badges on reload
-    for (const el of document.querySelectorAll(
-      `.${BAR_CLASS}, .${BUTTON_CLASS}, .${TITLEBAR_BTN_CLASS}, .${TITLEBAR_WAIT_BTN_CLASS}, .${ROW_BTN_CLASS}, .${ROW_WAIT_BTN_CLASS}, .${ROW_BG_WAIT_INDICATOR_CLASS}`
-    )) {
+    const cleanupSelector = [
+      `.${BAR_CLASS}`,
+      `.${BUTTON_CLASS}`,
+      `.${TITLEBAR_BTN_CLASS}`,
+      `.${TITLEBAR_WAIT_BTN_CLASS}`,
+      `.${ROW_BTN_CLASS}`,
+      `.${ROW_WAIT_BTN_CLASS}`,
+      `.${ROW_BG_WAIT_INDICATOR_CLASS}`,
+      `.${PROJECT_ROADMAP_BADGE_CLASS}`,
+    ].join(', ');
+    for (const el of document.querySelectorAll(cleanupSelector)) {
       el.remove();
     }
     // Restore any row titles whose ⦿ marker was visually swapped to ⏳

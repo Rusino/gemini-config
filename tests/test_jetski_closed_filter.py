@@ -187,6 +187,13 @@ function matches(el, selector) {
   if (selector === 'button[aria-label="Display Options"]') {
     return el.tagName === 'BUTTON' && el.getAttribute('aria-label') === 'Display Options';
   }
+  // Match sidebar project header and card selectors used by ensureProjectRoadmapBadges
+  if (selector === 'button[data-testid="project-header"]') {
+    return el.tagName === 'BUTTON' && el.getAttribute('data-testid') === 'project-header';
+  }
+  if (selector === 'button[data-project-card]') {
+    return el.tagName === 'BUTTON' && el.hasAttribute('data-project-card');
+  }
   const bucketMatch = /^button\[data-bucket="([^"]+)"\]$/.exec(selector);
   if (bucketMatch) {
     return el.tagName === 'BUTTON' && el.getAttribute('data-bucket') === bucketMatch[1];
@@ -250,6 +257,32 @@ const emptyProjSpan = new FakeElement('span');
 emptyProjSpan.textContent = 'No conversations yet';
 emptyProjContainer.appendChild(emptyProjSpan);
 bodyEl.appendChild(emptyProjContainer);
+
+// Project header rows for proj-1 (3 open of 8) and proj-closed-only (0 open of 10)
+const proj1HeaderSection = new FakeElement('div');
+proj1HeaderSection.setAttribute('data-sidebar-section-drop-id', 'proj-1');
+const proj1HeaderBtn = new FakeElement('button');
+proj1HeaderBtn.setAttribute('data-testid', 'project-header');
+proj1HeaderBtn.setAttribute('data-project-card', '');
+const proj1TitleWrap = new FakeElement('div');
+const proj1TitleSpan = new FakeElement('span');
+proj1TitleSpan.className = 'truncate';
+proj1TitleSpan.textContent = 'Breaking Chats';
+proj1TitleWrap.appendChild(proj1TitleSpan);
+proj1HeaderBtn.appendChild(proj1TitleWrap);
+proj1HeaderSection.appendChild(proj1HeaderBtn);
+bodyEl.appendChild(proj1HeaderSection);
+
+const projClosedHeaderSection = new FakeElement('div');
+projClosedHeaderSection.setAttribute('data-sidebar-section-drop-id', 'proj-closed-only');
+const projClosedHeaderBtn = new FakeElement('button');
+projClosedHeaderBtn.setAttribute('data-testid', 'project-header');
+const projClosedTitleSpan = new FakeElement('span');
+projClosedTitleSpan.className = 'truncate';
+projClosedTitleSpan.textContent = 'Finished Project';
+projClosedHeaderBtn.appendChild(projClosedTitleSpan);
+projClosedHeaderSection.appendChild(projClosedHeaderBtn);
+bodyEl.appendChild(projClosedHeaderSection);
 
 // Titlebar with more-actions button for an open chain chat ('open-current')
 const titlebarToolbar = new FakeElement('div');
@@ -398,6 +431,45 @@ global.window = {
             'open-root': '2026-10-21T09:00:00Z',
             'open-step': '2026-10-21T09:30:00Z',
             'open-current': '2026-10-21T10:05:00Z',
+          },
+        }),
+      };
+    }
+    // Stub jetski-roadmaps.json with both an open-roadmap project and a zero-open project
+    if (String(url).includes('jetski-roadmaps.json')) {
+      return {
+        ok: true,
+        json: async () => ({
+          version: 1,
+          projects: {
+            'proj-1': {
+              doing: 1,
+              todo: 2,
+              done: 5,
+              dropped: 1,
+              open: 3,
+              total: 8,
+              openItems: [
+                {
+                  id: 'R6',
+                  status: 'doing',
+                  text: 'Fix <tag> & badge',
+                  depth: 0,
+                  owner: 'a26d9ce2',
+                },
+                { id: 'R7', status: 'todo', text: 'Next task item', depth: 0, owner: '' },
+                { id: 'R7.1', status: 'todo', text: 'Subtask item', depth: 1, owner: '' },
+              ],
+            },
+            'proj-closed-only': {
+              doing: 0,
+              todo: 0,
+              done: 10,
+              dropped: 0,
+              open: 0,
+              total: 10,
+              openItems: [],
+            },
           },
         }),
       };
@@ -769,6 +841,43 @@ assert.strictEqual(barsAfterReload.length, 1, 'Reloading script must not duplica
   assert.strictEqual(rowTitleSpan.textContent, '[18:51] ⦿ cl/1405639 Issue #195102 fontconfig');
   assert.strictEqual(rowTitleSpan.hasAttribute('data-jetski-orig-title'), false);
   assert.strictEqual(sidebarRow.querySelector('.jetski-row-bg-wait-indicator'), null);
+
+  // Verify project header roadmap badge for proj-1 (▸1 ☐2) and hidden badge for 0 open
+  const proj1Badge = proj1HeaderBtn.querySelector('.jetski-project-roadmap-badge');
+  assert(proj1Badge, 'Project with open roadmap items must render a roadmap badge');
+  assert.strictEqual(proj1Badge.textContent, '▸1 ☐2');
+  assert.strictEqual(proj1Badge.getAttribute('data-has-doing'), 'true');
+  assert.strictEqual(proj1Badge.getAttribute('data-doing'), '1');
+  assert.strictEqual(proj1Badge.getAttribute('data-todo'), '2');
+  assert.strictEqual(proj1Badge.getAttribute('data-open'), '3');
+  assert.strictEqual(proj1Badge.getAttribute('data-total'), '8');
+  const expectedSummary = '3 open of 8 (5 done · 1 doing · 2 todo · 1 dropped)';
+  assert(
+    proj1Badge.getAttribute('title').includes(expectedSummary),
+    'Badge title must include open/total summary and breakdown'
+  );
+  assert(
+    proj1Badge.getAttribute('title').includes('▸ R6 Fix <tag> & badge [a26d9ce2]'),
+    'Badge title must list open doing items with owner'
+  );
+  assert.strictEqual(
+    projClosedHeaderBtn.querySelector('.jetski-project-roadmap-badge'),
+    null,
+    'Project with 0 open roadmap items must not render a badge'
+  );
+
+  proj1Badge.dispatchEvent('mouseenter');
+  const roadmapBubble = document.getElementById('jetski-closed-chats-filter-bubble');
+  assert.strictEqual(roadmapBubble.getAttribute('data-visible'), 'true');
+  assert(roadmapBubble.innerHTML.includes('[3 open of 8]'));
+  assert(
+    roadmapBubble.innerHTML.includes('<div class="jcfb-section-title">Open roadmap items</div>'),
+    'Section title must not repeat leaf open count above hierarchical openItems list'
+  );
+  assert(roadmapBubble.innerHTML.includes('Fix &lt;tag&gt; &amp; badge [a26d9ce2]'));
+  assert(roadmapBubble.innerHTML.includes('R7.1'));
+  proj1Badge.dispatchEvent('mouseleave');
+  assert.strictEqual(roadmapBubble.getAttribute('data-visible'), 'false');
 
   console.log('ALL_JS_ASSERTIONS_PASSED');
 })().catch((err) => {

@@ -61,8 +61,11 @@ def sync_artifact_js(
     sys.path.insert(0, hooks_dir)
   try:
     import chat_lifecycle  # pylint: disable=g-import-not-at-top
+    # Also export jetski-roadmaps.json so project header roadmap badges populate on startup
+    import roadmap  # pylint: disable=g-import-not-at-top
 
     chat_lifecycle.export_chain_index()
+    roadmap.export_roadmap_index()
   except Exception:
     pass
 
