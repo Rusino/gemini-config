@@ -179,6 +179,21 @@ DEFENSIVE_NULL_RETURN_RE = re.compile(
 )
 API_ENDPOINT_RE = re.compile(r"""['"](/api/[a-zA-Z0-9_/-]+)['"]""")
 
+# Dart / Flutter web_ui & WebParagraph mechanical checks (M4 & M6)
+DART_RAW_ASSERT_IN_TEST_RE = re.compile(r"^\s*assert\s*\(")
+DART_NON_CI_FONT_IN_TEST_RE = re.compile(
+    r"""fontFamily\s*:\s*['"](?:Helvetica(?:\s+Neue)?|Times(?:\s+New\s+Roman)?|Courier(?:\s+New)?|Menlo|Monaco|San\s+Francisco|\.SF\s+[^'"]+|Segoe\s+UI|Consolas|Verdana|Georgia|Tahoma)['"]"""
+)
+DART_ZERO_COLOR_EQUALITY_RE = re.compile(
+    r"(?:==|!=)\s*(?:const\s+)?(?:ui\.)?Color\s*\(\s*0x00000000\s*\)"
+)
+DART_UN_TREESHAKEN_DEBUG_LOG_RE = re.compile(
+    r"^\s*WebParagraphDebug\.(?:log|apiLog)\s*\("
+)
+DART_NON_CONST_DEBUG_FLAG_RE = re.compile(
+    r"^\s*static\s+(?!const\b)(?:final\s+|var\s+)?bool\s+(?:logging|apiLogging)\s*="
+)
+
 FUNC_PATTERNS = {
     ".go": re.compile(r"^\s*func\s+(?:\([^)]+\)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\("),
     ".py": re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("),
@@ -637,6 +652,27 @@ def scan_horrors_and_invariants(file_records, allow_cyrillic=False):
         if TEST_NARRATIVE_COMMENT_RE.match(raw) and idx < len(lines):
           if ASSERT_CALL_RE.match(lines[idx]):
             horrors["test_narrative_headers"].append((loc, stripped[:100]))
+        # Enforce Dart test hygiene (expect over assert, CI-available fonts only)
+        if ext == ".dart":
+          if DART_RAW_ASSERT_IN_TEST_RE.match(raw):
+            horrors["dart_test_raw_asserts"].append((loc, stripped[:100]))
+          if DART_NON_CI_FONT_IN_TEST_RE.search(raw):
+            horrors["dart_test_non_ci_fonts"].append((loc, stripped[:100]))
+
+      # Flag non-idiomatic Dart transparency checks and un-tree-shaken debug logging
+      if ext == ".dart" and not test_flag and not stripped.startswith("//"):
+        if DART_ZERO_COLOR_EQUALITY_RE.search(raw):
+          horrors["dart_zero_color_checks"].append((loc, stripped[:100]))
+        if DART_NON_CONST_DEBUG_FLAG_RE.match(raw):
+          horrors["dart_un_treeshaken_debug"].append((loc, stripped[:100]))
+        if DART_UN_TREESHAKEN_DEBUG_LOG_RE.match(raw):
+          prev_window = "\n".join(lines[max(0, idx - 4) : idx])
+          if (
+              "WebParagraphDebug.logging" not in prev_window
+              and "WebParagraphDebug.apiLogging" not in prev_window
+              and "assert(" not in prev_window
+          ):
+            horrors["dart_un_treeshaken_debug"].append((loc, stripped[:100]))
 
       if ext in (".cc", ".cpp", ".cxx", ".h", ".hpp", ".mm") and not test_flag:
         func_m = FUNC_PATTERNS[".cpp"].match(raw)
@@ -768,6 +804,11 @@ def format_markdown_report(report):
       ("test_sleeps", "Sleep-Based Synchronization in Tests"),
       ("test_magic_pins", "Magic Probability / Score / Sizeof Pinning in Tests"),
       ("test_narrative_headers", "Narrative Comment Headers Above Test Assertions (Rule 5)"),
+      # Report Dart/WebParagraph test and production hygiene categories
+      ("dart_test_raw_asserts", "Raw `assert(...)` in Dart Tests Instead of `expect(...)` (Rule M4)"),
+      ("dart_test_non_ci_fonts", "Non-CI Desktop Font Family in Dart Tests (Rule M4)"),
+      ("dart_zero_color_checks", "Incomplete Transparent Color Check `Color(0x00000000)` (Rule M6)"),
+      ("dart_un_treeshaken_debug", "Un-Tree-Shaken `WebParagraphDebug` Call or Non-`const` Flag (Rule M6)"),
   ]
   for key, title in labels:
     items = horrors.get(key, [])
