@@ -47,6 +47,8 @@
   const CHAIN_STARS_GROUP_CLASS = 'jetski-chain-stars-group';
   const CHAIN_STAR_BTN_CLASS = 'jetski-chain-star-btn';
   const ARCHIVE_BANNER_CLASS = 'jetski-archive-piece-banner';
+  // Holds the read-only notice text so updating it does not wipe the jump button child node
+  const ARCHIVE_LABEL_CLASS = 'jetski-archive-piece-label';
   const JUMP_TO_TAIL_BTN_CLASS = 'jetski-jump-to-tail-btn';
   const STAR_TOOLTIP_ID = 'jetski-chain-star-tooltip';
   const DEFAULT_VISIBLE_BUCKETS = ['needs-me', 'working'];
@@ -2219,9 +2221,14 @@
     const isTail = activeIdx === chain.length - 1;
 
     const inputBox = convoViewEl.querySelector('[data-testid="agent-input-box"]');
+    // Archived chats mount nativeArchivedBanner instead of inputBox, so root footer container there
+    const nativeArchivedBanner = convoViewEl.querySelector?.(
+      '.min-h-\\[80px\\].rounded-2xl.bg-muted, [class*="min-h-"][class*="rounded-2xl"]'
+    );
     const footerInner =
       inputBox?.parentElement ||
       convoViewEl.querySelector?.('[data-testid="input-box-bottom-toolbar"]')?.parentElement ||
+      nativeArchivedBanner?.parentElement ||
       convoViewEl;
 
     if (!isTail) {
@@ -2239,9 +2246,6 @@
         }
       }
 
-      const nativeArchivedBanner = footerInner.querySelector?.(
-        '.min-h-\\[80px\\].rounded-2xl.bg-muted, [class*="min-h-"][class*="rounded-2xl"]'
-      );
       if (nativeArchivedBanner) {
         nativeArchivedBanner.style.display = 'none';
       }
@@ -2253,7 +2257,18 @@
         banner.setAttribute('data-testid', ARCHIVE_BANNER_CLASS);
         footerInner.appendChild(banner);
       }
-      banner.textContent = `🔒 Archived piece #${activeIdx + 1} of ${chain.length} (read-only) `;
+
+      // Preserve DOM identity of jumpBtn by storing read-only label in a dedicated child span
+      let labelSpan = banner.querySelector(`.${ARCHIVE_LABEL_CLASS}`);
+      if (!labelSpan) {
+        labelSpan = document.createElement('span');
+        labelSpan.className = ARCHIVE_LABEL_CLASS;
+        banner.insertBefore(labelSpan, banner.firstChild);
+      }
+      const nextLabel = `🔒 Archived piece #${activeIdx + 1} of ${chain.length} (read-only) `;
+      if (labelSpan.textContent !== nextLabel) {
+        labelSpan.textContent = nextLabel;
+      }
 
       // Bind click handler once at creation time to prevent duplicate listener accumulation
       let jumpBtn = banner.querySelector(`.${JUMP_TO_TAIL_BTN_CLASS}`);
@@ -2272,9 +2287,17 @@
         banner.appendChild(jumpBtn);
       }
       const tailId = chain[chain.length - 1];
-      jumpBtn.textContent = `Jump to active #${chain.length} →`;
-      jumpBtn.setAttribute('data-tail-id', tailId);
-      jumpBtn.setAttribute('data-source-id', cascadeId);
+      const nextBtnText = `Jump to active #${chain.length} →`;
+      // Guard text and data attribute writes to avoid redundant childList/attribute mutations
+      if (jumpBtn.textContent !== nextBtnText) {
+        jumpBtn.textContent = nextBtnText;
+      }
+      if (jumpBtn.getAttribute('data-tail-id') !== tailId) {
+        jumpBtn.setAttribute('data-tail-id', tailId);
+      }
+      if (jumpBtn.getAttribute('data-source-id') !== cascadeId) {
+        jumpBtn.setAttribute('data-source-id', cascadeId);
+      }
     } else {
       convoViewEl.removeAttribute('data-jetski-non-tail-locked');
       if (inputBox) {
@@ -2288,7 +2311,11 @@
           btn.removeAttribute('disabled');
         }
       }
-      const banner = footerInner.querySelector(`.${ARCHIVE_BANNER_CLASS}`);
+      // Restore native banner visibility when switching this view back to the active tail
+      if (nativeArchivedBanner) {
+        nativeArchivedBanner.style.display = '';
+      }
+      const banner = convoViewEl.querySelector(`.${ARCHIVE_BANNER_CLASS}`);
       if (banner) banner.remove();
     }
   }

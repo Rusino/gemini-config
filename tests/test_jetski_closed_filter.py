@@ -68,7 +68,7 @@ class FakeElement {
     this.id = '';
     this.className = '';
     this.type = '';
-    this.textContent = '';
+    this._textContent = '';
     this._innerHTML = '';
     this.style = {};
     this.attributes = new Map();
@@ -81,6 +81,20 @@ class FakeElement {
   }
   get lastChild() {
     return this.children[this.children.length - 1] || null;
+  }
+  get textContent() {
+    if (this.children.length > 0) {
+      return this._textContent + this.children.map((c) => c.textContent).join('');
+    }
+    return this._textContent;
+  }
+  set textContent(val) {
+    this._textContent = String(val);
+    for (const c of this.children) c.parentElement = null;
+    this.children = [];
+    if (global.__recordMutation) {
+      global.__recordMutation(this);
+    }
   }
   get innerHTML() {
     return this._innerHTML;
@@ -248,7 +262,10 @@ function matches(el, selector) {
   }
   if (selector.startsWith('.')) {
     // Support compound class selectors in fake DOM queries
-    const classes = selector.split('.').filter(Boolean);
+    const classes = selector
+      .split('.')
+      .filter(Boolean)
+      .map((cls) => cls.replace(/\\(.)/g, '$1'));
     const elClasses = el.className ? el.className.split(/\s+/) : [];
     return classes.every((cls) => elClasses.includes(cls));
   }
@@ -1127,10 +1144,56 @@ const liveBucketBtn = (k) =>
   const jumpBtn = archiveBanner.querySelector('[data-testid="jetski-jump-to-tail-btn"]');
   assert(jumpBtn, 'Jump to tail button must be present in archive banner');
 
+  // Verify jumpBtn preserves its exact DOM element identity across sync passes
+  await window.__jetskiChainNav.syncConversationChainNavigators();
+  assert.strictEqual(
+    archiveBanner.querySelector('[data-testid="jetski-jump-to-tail-btn"]'),
+    jumpBtn,
+    'Unchanged chain must preserve jump-to-tail button DOM instance'
+  );
+
   // 3. Click jump-to-tail and verify navigation target
   window.history._lastPushed = null;
+  advanceClock();
+  jumpBtn.dispatchEvent('pointerdown', { button: 0 });
   jumpBtn.dispatchEvent('click');
   assert.strictEqual(window.history._lastPushed, '/c/open-current');
+
+  // 3b. Verify layout where ActiveInputArea is absent and nativeArchivedBanner is present
+  convoInputBox.remove();
+  const nativeArchivedBanner = new FakeElement('div');
+  nativeArchivedBanner.className = 'min-h-[80px] rounded-2xl bg-muted';
+  convoFooterInner.appendChild(nativeArchivedBanner);
+  convoViewEl.setAttribute('data-cascade-id', 'open-root');
+  await window.__jetskiChainNav.syncConversationChainNavigators();
+
+  assert.strictEqual(
+    nativeArchivedBanner.style.display,
+    'none',
+    'Native archived banner must be hidden on non-tail archived piece'
+  );
+  const rootArchiveBanner = convoFooterInner.querySelector(
+    '[data-testid="jetski-archive-piece-banner"]'
+  );
+  assert(
+    rootArchiveBanner,
+    'Archive banner must mount in footer container of native archived banner'
+  );
+  assert.strictEqual(rootArchiveBanner.parentElement, convoFooterInner);
+  assert(rootArchiveBanner.textContent.includes('Archived piece #1 of 3'));
+  const rootJumpBtn = rootArchiveBanner.querySelector('[data-testid="jetski-jump-to-tail-btn"]');
+  assert(rootJumpBtn, 'Jump to tail button must be present on archived piece #1');
+  assert.strictEqual(rootJumpBtn.getAttribute('data-source-id'), 'open-root');
+  assert.strictEqual(rootJumpBtn.getAttribute('data-tail-id'), 'open-current');
+  window.history._lastPushed = null;
+  advanceClock();
+  rootJumpBtn.dispatchEvent('pointerdown', { button: 0 });
+  rootJumpBtn.dispatchEvent('click');
+  assert.strictEqual(window.history._lastPushed, '/c/open-current');
+
+  // Restore convoInputBox and remove nativeArchivedBanner for step 4
+  nativeArchivedBanner.remove();
+  convoFooterInner.appendChild(convoInputBox);
 
   // 4. Switch conversation-view to the tail piece 'open-current' and sync
   convoViewEl.setAttribute('data-cascade-id', 'open-current');
