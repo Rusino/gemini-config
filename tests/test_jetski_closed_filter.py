@@ -247,8 +247,10 @@ function matches(el, selector) {
     return el.hasAttribute(attrHasMatch[1]);
   }
   if (selector.startsWith('.')) {
-    const cls = selector.slice(1);
-    return el.className === cls || (el.className && el.className.split(/\s+/).includes(cls));
+    // Support compound class selectors in fake DOM queries
+    const classes = selector.split('.').filter(Boolean);
+    const elClasses = el.className ? el.className.split(/\s+/) : [];
+    return classes.every((cls) => elClasses.includes(cls));
   }
   if (selector.startsWith('#')) {
     return el.id === selector.slice(1);
@@ -1147,6 +1149,20 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(convoContentEditable.getAttribute('contenteditable'), 'true');
   assert.strictEqual(convoSendBtn.hasAttribute('disabled'), false);
   assert(!convoFooterInner.querySelector('[data-testid="jetski-archive-piece-banner"]'));
+
+  // 5. Fallback path when conversation-navigator is unmounted (< 2 turns in ConversationNavigatorRail)
+  convoNavEl.remove();
+  await window.__jetskiChainNav.syncConversationChainNavigators();
+  const fallbackStars = convoRailSlot.querySelector('.jetski-chain-stars-fallback');
+  assert(fallbackStars, 'Fallback stars must mount in rail slot when nav is unmounted');
+  assert.strictEqual(fallbackStars.children.length, 3, 'All 3 pieces in fallback');
+  assert.strictEqual(fallbackStars.children[2].textContent, '★');
+  assert.strictEqual(fallbackStars.children[2].getAttribute('data-active'), 'true');
+  assert.strictEqual(fallbackStars.style.position, 'absolute');
+  assert.strictEqual(fallbackStars.style.left, '0');
+  assert.strictEqual(fallbackStars.style.width, '28px');
+  assert.strictEqual(fallbackStars.style.top, '50%');
+  assert.strictEqual(fallbackStars.style.transform, 'translateY(-50%)');
 
   console.log('ALL_JS_ASSERTIONS_PASSED');
 })().catch((err) => {

@@ -1155,6 +1155,8 @@
         justify-content: center;
         gap: 2px;
         pointer-events: auto;
+        /* Remain visible when narrow-pane responsive rules apply invisible to nav */
+        visibility: visible;
         z-index: 15;
       }
       .jetski-chain-stars-before::after,
@@ -2396,9 +2398,12 @@
         if (!fallback) {
           fallback = document.createElement('div');
           fallback.className = `${CHAIN_STARS_GROUP_CLASS} jetski-chain-stars-fallback`;
+          // Center fallback stars vertically inside the 28px rail slot when nav is unmounted
           fallback.style.position = 'absolute';
-          fallback.style.left = '4px';
-          fallback.style.top = '16px';
+          fallback.style.left = '0';
+          fallback.style.width = '28px';
+          fallback.style.top = '50%';
+          fallback.style.transform = 'translateY(-50%)';
           slot.appendChild(fallback);
         }
         fallback.setAttribute('data-jetski-chain-sig', chainSig);
