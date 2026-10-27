@@ -41,6 +41,14 @@
   const BUCKET_ORDER = ['needs-me', 'working', 'waiting'];
   const SEARCH_BTN_CLASS = 'jetski-chat-search-btn';
   const SEARCH_PANEL_ID = 'jetski-chat-search-panel';
+  // Matryoshka chain star markers and read-only non-tail piece lock banners
+  const CHAIN_STARS_BEFORE_TEST_ID = 'jetski-chain-stars-before';
+  const CHAIN_STARS_AFTER_TEST_ID = 'jetski-chain-stars-after';
+  const CHAIN_STARS_GROUP_CLASS = 'jetski-chain-stars-group';
+  const CHAIN_STAR_BTN_CLASS = 'jetski-chain-star-btn';
+  const ARCHIVE_BANNER_CLASS = 'jetski-archive-piece-banner';
+  const JUMP_TO_TAIL_BTN_CLASS = 'jetski-jump-to-tail-btn';
+  const STAR_TOOLTIP_ID = 'jetski-chain-star-tooltip';
   const DEFAULT_VISIBLE_BUCKETS = ['needs-me', 'working'];
 
   const BUCKET_DEFS = {
@@ -1142,6 +1150,97 @@
         font-size: 10.5px;
         font-weight: 600;
       }
+      .${CHAIN_STARS_GROUP_CLASS} {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 2px;
+        pointer-events: auto;
+        z-index: 15;
+      }
+      .jetski-chain-stars-before::after,
+      .jetski-chain-stars-after::before {
+        content: "";
+        display: block;
+        width: 1.5px;
+        height: 6px;
+        background: rgba(156, 163, 175, 0.4);
+        margin: 2px 0;
+        border-radius: 1px;
+      }
+      .${CHAIN_STAR_BTN_CLASS} {
+        background: none;
+        border: none;
+        padding: 1px 3px;
+        cursor: pointer;
+        border-radius: 4px;
+        line-height: 1;
+        transition: transform 0.15s, color 0.15s;
+        font-size: 13px;
+        color: rgba(156, 163, 175, 0.7);
+        outline: none;
+      }
+      .${CHAIN_STAR_BTN_CLASS}[data-active="true"] {
+        color: #f59e0b;
+        font-size: 14px;
+        filter: drop-shadow(0 0 3px rgba(245, 158, 11, 0.6));
+      }
+      .${CHAIN_STAR_BTN_CLASS}:hover {
+        transform: scale(1.25);
+        color: #fbbf24;
+      }
+      #${STAR_TOOLTIP_ID} {
+        position: fixed;
+        z-index: 2147483647;
+        width: 288px;
+        padding: 9px 12px;
+        border-radius: 8px;
+        background: var(--popover, #1e1f22);
+        color: var(--popover-foreground, #e8eaed);
+        border: 1px solid var(--border, rgba(255, 255, 255, 0.14));
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        font-size: 11.5px;
+        line-height: 1.45;
+        pointer-events: none;
+        opacity: 0;
+        transform: translateY(-2px);
+        transition: opacity 110ms ease, transform 110ms ease;
+      }
+      #${STAR_TOOLTIP_ID}[data-visible="true"] {
+        opacity: 1;
+        transform: translateY(0);
+      }
+      .${ARCHIVE_BANNER_CLASS} {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 9px 14px;
+        border-radius: 12px;
+        background: rgba(128, 134, 139, 0.12);
+        border: 1px solid rgba(128, 134, 139, 0.28);
+        font-size: 12px;
+        width: 100%;
+        box-sizing: border-box;
+        margin-bottom: 4px;
+      }
+      .${JUMP_TO_TAIL_BTN_CLASS} {
+        cursor: pointer;
+        padding: 4px 11px;
+        border-radius: 6px;
+        background: #8ab4f8;
+        color: #1e1e1e;
+        font-weight: 600;
+        font-size: 11.5px;
+        border: none;
+        white-space: nowrap;
+        transition: background 0.15s;
+      }
+      .${JUMP_TO_TAIL_BTN_CLASS}:hover {
+        background: #aecbfa;
+      }
     `;
     if (style.textContent !== nextCss) {
       style.textContent = nextCss;
@@ -1733,7 +1832,9 @@
     window.history.pushState({}, '', m[1] + cascadeId + m[2]);
     window.dispatchEvent(new PopStateEvent('popstate'));
     // Find computes matches from the mounted view's text, so wait for the routed view to mount
-    setTimeout(() => showNativeFind(cascadeId, term), 600);
+    if (term) {
+      setTimeout(() => showNativeFind(cascadeId, term), 600);
+    }
   }
 
   function closeSearchPanel() {
@@ -1839,6 +1940,330 @@
 
   // The test harness fake DOM cannot type into the panel, so it drives search directly
   window.__jetskiChatSearch = { runChatSearch, chainOf };
+
+  // Matryoshka chain star tooltip showing lazy piece turn counts and question previews
+  let chainTooltipEl = null;
+  let activeTooltipBtn = null;
+  let tooltipFetchSeq = 0;
+
+  function ensureChainStarTooltip() {
+    if (chainTooltipEl && document.body?.contains?.(chainTooltipEl)) return chainTooltipEl;
+    chainTooltipEl = document.createElement('div');
+    chainTooltipEl.id = STAR_TOOLTIP_ID;
+    chainTooltipEl.setAttribute('data-visible', 'false');
+    document.body?.appendChild?.(chainTooltipEl);
+    return chainTooltipEl;
+  }
+
+  function hideChainStarTooltip() {
+    activeTooltipBtn = null;
+    if (chainTooltipEl) {
+      chainTooltipEl.setAttribute('data-visible', 'false');
+      chainTooltipEl.innerHTML = '';
+      chainTooltipEl.textContent = '';
+    }
+  }
+
+  async function showChainStarTooltip(btn, pieceCid, pieceIdx, totalPieces, isCurrent, isTail) {
+    activeTooltipBtn = btn;
+    const tooltip = ensureChainStarTooltip();
+    if (!tooltip) return;
+    const rect = typeof btn.getBoundingClientRect === 'function'
+      ? btn.getBoundingClientRect()
+      : { top: 40, right: 28, height: 16 };
+    const top = Math.max(10, (rect.top || 40) + ((rect.height || 16) / 2) - 30);
+    const left = (rect.right || 28) + 12;
+
+    tooltip.style.top = `${top}px`;
+    tooltip.style.left = `${left}px`;
+
+    const store = findReduxStore();
+    const summaryObj = store?.getState()?.trajectorySummaries?.summaries?.[pieceCid] || {};
+    const title = summaryObj.summary || pieceCid.slice(0, 12);
+    const statusLabel = isCurrent
+      ? '<span style="color:#fbbf24;font-weight:600;">Current piece</span>'
+      : (isTail
+          ? '<span style="color:#8ab4f8;font-weight:600;">Active tail</span>'
+          : '<span style="color:#9aa0a6;">Chain archive</span>');
+
+    tooltip.innerHTML = `
+      <div style="font-weight:600;font-size:12px;margin-bottom:2px;display:flex;align-items:center;gap:6px;">
+        <span>Piece #${pieceIdx + 1} of ${totalPieces}</span>
+        <span style="font-size:10px;opacity:0.8;">•</span>
+        <span style="font-size:11px;">${statusLabel}</span>
+      </div>
+      <div style="font-size:11px;color:var(--muted-foreground,#9aa0a6);margin-bottom:6px;word-break:break-word;">
+        ${escapeHtml(title)}
+      </div>
+      <div class="jetski-chain-steps-preview" style="font-size:10.5px;color:#dadce0;border-top:1px solid rgba(128,134,139,0.2);padding-top:4px;">
+        Loading messages…
+      </div>
+    `;
+    tooltip.setAttribute('data-visible', 'true');
+
+    const curSeq = ++tooltipFetchSeq;
+    try {
+      const steps = await fetchChainSteps(pieceCid);
+      if (activeTooltipBtn !== btn || curSeq !== tooltipFetchSeq) return;
+      const userQuestions = [];
+      for (const s of steps) {
+        if (s.type === 'CORTEX_STEP_TYPE_USER_INPUT' && s.userInput?.userResponse) {
+          let text = s.userInput.userResponse.trim();
+          text = text.replace(/^(?:continuing\s+conversation:[^\n]+|\[handoff[^\n]+)\n+/i, '').trim();
+          if (text) userQuestions.push(text);
+        }
+      }
+      const previewEl = tooltip.querySelector?.('.jetski-chain-steps-preview');
+      if (!previewEl) return;
+      if (userQuestions.length === 0) {
+        previewEl.innerHTML = '<span style="opacity:0.6;">0 user prompts</span>';
+      } else if (userQuestions.length === 1) {
+        previewEl.innerHTML = `
+          <div style="font-weight:600;margin-bottom:2px;">1 user prompt:</div>
+          <div style="opacity:0.9;font-style:italic;">"${escapeHtml(userQuestions[0].slice(0, 120))}${userQuestions[0].length > 120 ? '…' : ''}"</div>
+        `;
+      } else {
+        const first = userQuestions[0].slice(0, 90) + (userQuestions[0].length > 90 ? '…' : '');
+        const last = userQuestions[userQuestions.length - 1].slice(0, 90) +
+          (userQuestions[userQuestions.length - 1].length > 90 ? '…' : '');
+        previewEl.innerHTML = `
+          <div style="font-weight:600;margin-bottom:2px;">User prompts: ${userQuestions.length}</div>
+          <div style="margin-bottom:2px;"><span style="opacity:0.6;">First:</span> "${escapeHtml(first)}"</div>
+          <div><span style="opacity:0.6;">Last:</span> "${escapeHtml(last)}"</div>
+        `;
+      }
+    } catch {
+      if (activeTooltipBtn !== btn || curSeq !== tooltipFetchSeq) return;
+      const previewEl = tooltip.querySelector?.('.jetski-chain-steps-preview');
+      if (previewEl) {
+        previewEl.innerHTML = '<span style="opacity:0.5;">Steps unavailable</span>';
+      }
+    }
+  }
+
+  function createStarButton(cid, idx, chain, isCurrent, isTail) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = CHAIN_STAR_BTN_CLASS;
+    btn.setAttribute('data-testid', 'jetski-chain-star-btn');
+    btn.setAttribute('data-piece-id', cid);
+    btn.setAttribute('data-piece-index', String(idx));
+    btn.setAttribute('data-active', isCurrent ? 'true' : 'false');
+    btn.setAttribute(
+      'aria-label',
+      `Chain piece ${idx + 1} of ${chain.length}${isCurrent ? ' (current)' : ''}`
+    );
+    btn.textContent = isCurrent ? '★' : '✦';
+
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      hideChainStarTooltip();
+      if (!isCurrent) {
+        openConversation(cid);
+      }
+    });
+    btn.addEventListener('mouseenter', () => {
+      void showChainStarTooltip(btn, cid, idx, chain.length, isCurrent, isTail);
+    });
+    btn.addEventListener('mouseleave', () => {
+      hideChainStarTooltip();
+    });
+    return btn;
+  }
+
+  function syncConversationPieceLock(convoViewEl, cascadeId, chain) {
+    const activeIdx = chain.indexOf(cascadeId);
+    if (activeIdx === -1) return;
+    const isTail = activeIdx === chain.length - 1;
+
+    const inputBox = convoViewEl.querySelector('[data-testid="agent-input-box"]');
+    const footerInner =
+      inputBox?.parentElement ||
+      convoViewEl.querySelector?.('[data-testid="input-box-bottom-toolbar"]')?.parentElement ||
+      convoViewEl;
+
+    if (!isTail) {
+      convoViewEl.setAttribute('data-jetski-non-tail-locked', 'true');
+      if (inputBox) {
+        inputBox.style.display = 'none';
+        const ceList = inputBox.querySelectorAll('[contenteditable]');
+        for (const ce of ceList) {
+          ce.setAttribute('contenteditable', 'false');
+          if (typeof ce.blur === 'function') ce.blur();
+        }
+        const sendBtns = inputBox.querySelectorAll('button[data-testid="send-button"]');
+        for (const btn of sendBtns) {
+          btn.setAttribute('disabled', 'true');
+        }
+      }
+
+      const nativeArchivedBanner = footerInner.querySelector?.(
+        '.min-h-\\[80px\\].rounded-2xl.bg-muted, [class*="min-h-"][class*="rounded-2xl"]'
+      );
+      if (nativeArchivedBanner) {
+        nativeArchivedBanner.style.display = 'none';
+      }
+
+      let banner = footerInner.querySelector(`.${ARCHIVE_BANNER_CLASS}`);
+      if (!banner) {
+        banner = document.createElement('div');
+        banner.className = ARCHIVE_BANNER_CLASS;
+        banner.setAttribute('data-testid', ARCHIVE_BANNER_CLASS);
+        footerInner.appendChild(banner);
+      }
+      banner.textContent = `🔒 Archived piece #${activeIdx + 1} of ${chain.length} (read-only) `;
+
+      let jumpBtn = banner.querySelector(`.${JUMP_TO_TAIL_BTN_CLASS}`);
+      if (!jumpBtn) {
+        jumpBtn = document.createElement('button');
+        jumpBtn.type = 'button';
+        jumpBtn.className = JUMP_TO_TAIL_BTN_CLASS;
+        jumpBtn.setAttribute('data-testid', JUMP_TO_TAIL_BTN_CLASS);
+        banner.appendChild(jumpBtn);
+      }
+      const tailId = chain[chain.length - 1];
+      jumpBtn.textContent = `Jump to active #${chain.length} →`;
+      jumpBtn.setAttribute('data-tail-id', tailId);
+      jumpBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openConversation(tailId);
+      });
+    } else {
+      convoViewEl.removeAttribute('data-jetski-non-tail-locked');
+      if (inputBox) {
+        inputBox.style.display = '';
+        const ceList = inputBox.querySelectorAll('[contenteditable]');
+        for (const ce of ceList) {
+          ce.setAttribute('contenteditable', 'true');
+        }
+        const sendBtns = inputBox.querySelectorAll('button[data-testid="send-button"]');
+        for (const btn of sendBtns) {
+          btn.removeAttribute('disabled');
+        }
+      }
+      const banner = footerInner.querySelector(`.${ARCHIVE_BANNER_CLASS}`);
+      if (banner) banner.remove();
+    }
+  }
+
+  async function syncConversationChainNavigators() {
+    const convoViews = document.querySelectorAll(
+      '[data-testid="conversation-view"][data-cascade-id]'
+    );
+    for (const convoViewEl of convoViews) {
+      const cid = convoViewEl.getAttribute('data-cascade-id');
+      if (!cid) continue;
+
+      let chain;
+      try {
+        chain = await chainOf(cid);
+      } catch {
+        chain = [cid];
+      }
+
+      syncConversationPieceLock(convoViewEl, cid, chain);
+
+      if (chain.length <= 1) {
+        convoViewEl.querySelector(`[data-testid="${CHAIN_STARS_BEFORE_TEST_ID}"]`)?.remove();
+        convoViewEl.querySelector(`[data-testid="${CHAIN_STARS_AFTER_TEST_ID}"]`)?.remove();
+        convoViewEl.querySelector('.jetski-chain-stars-fallback')?.remove();
+        continue;
+      }
+
+      const activeIdx = chain.indexOf(cid);
+      if (activeIdx === -1) continue;
+
+      const nav = convoViewEl.querySelector('[data-testid="conversation-navigator"]');
+      if (nav) {
+        convoViewEl.querySelector('.jetski-chain-stars-fallback')?.remove();
+        const inner = nav.querySelector('.relative.flex.min-h-0.flex-col') || nav.children[0];
+
+        let beforeGroup = nav.querySelector(`[data-testid="${CHAIN_STARS_BEFORE_TEST_ID}"]`);
+        if (!beforeGroup) {
+          beforeGroup = document.createElement('div');
+          beforeGroup.className = `${CHAIN_STARS_GROUP_CLASS} jetski-chain-stars-before`;
+          beforeGroup.setAttribute('data-testid', CHAIN_STARS_BEFORE_TEST_ID);
+          if (inner) {
+            nav.insertBefore(beforeGroup, inner);
+          } else {
+            nav.appendChild(beforeGroup);
+          }
+        }
+        while (beforeGroup.children?.length > 0) {
+          beforeGroup.children[0].remove();
+        }
+        for (let i = 0; i <= activeIdx; i++) {
+          const pieceCid = chain[i];
+          const isCur = i === activeIdx;
+          const isTl = i === chain.length - 1;
+          beforeGroup.appendChild(createStarButton(pieceCid, i, chain, isCur, isTl));
+        }
+
+        let afterGroup = nav.querySelector(`[data-testid="${CHAIN_STARS_AFTER_TEST_ID}"]`);
+        if (activeIdx < chain.length - 1) {
+          if (!afterGroup) {
+            afterGroup = document.createElement('div');
+            afterGroup.className = `${CHAIN_STARS_GROUP_CLASS} jetski-chain-stars-after`;
+            afterGroup.setAttribute('data-testid', CHAIN_STARS_AFTER_TEST_ID);
+            nav.appendChild(afterGroup);
+          }
+          while (afterGroup.children?.length > 0) {
+            afterGroup.children[0].remove();
+          }
+          for (let i = activeIdx + 1; i < chain.length; i++) {
+            const pieceCid = chain[i];
+            const isCur = false;
+            const isTl = i === chain.length - 1;
+            afterGroup.appendChild(createStarButton(pieceCid, i, chain, isCur, isTl));
+          }
+        } else if (afterGroup) {
+          afterGroup.remove();
+        }
+      } else {
+        convoViewEl.querySelector(`[data-testid="${CHAIN_STARS_BEFORE_TEST_ID}"]`)?.remove();
+        convoViewEl.querySelector(`[data-testid="${CHAIN_STARS_AFTER_TEST_ID}"]`)?.remove();
+        const slot =
+          convoViewEl.querySelector('.pointer-events-none.absolute.inset-y-0.left-0.z-10.w-7') ||
+          convoViewEl;
+        let fallback = slot.querySelector('.jetski-chain-stars-fallback');
+        if (!fallback) {
+          fallback = document.createElement('div');
+          fallback.className = `${CHAIN_STARS_GROUP_CLASS} jetski-chain-stars-fallback`;
+          fallback.style.position = 'absolute';
+          fallback.style.left = '4px';
+          fallback.style.top = '16px';
+          slot.appendChild(fallback);
+        }
+        while (fallback.children?.length > 0) {
+          fallback.children[0].remove();
+        }
+        for (let i = 0; i < chain.length; i++) {
+          const pieceCid = chain[i];
+          const isCur = i === activeIdx;
+          const isTl = i === chain.length - 1;
+          fallback.appendChild(createStarButton(pieceCid, i, chain, isCur, isTl));
+        }
+      }
+    }
+  }
+
+  if (typeof document.addEventListener === 'function') {
+    document.addEventListener(
+      'keydown',
+      (e) => {
+        const view = e.target?.closest?.('[data-testid="conversation-view"]');
+        if (view?.getAttribute('data-jetski-non-tail-locked') === 'true') {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            e.stopPropagation();
+          }
+        }
+      },
+      true
+    );
+  }
+
+  window.__jetskiChainNav = { syncConversationChainNavigators };
 
   // Injects the 3-button filter bar directly below the sidebar header row
   function ensureFilterBar() {
@@ -2249,6 +2674,8 @@
     ensureProjectRoadmapBadges();
     ensureTitlebarButtons();
     ensureSidebarRowButtons();
+    // Synchronize chain stars and read-only piece locks across open conversation views
+    void syncConversationChainNavigators();
   }
 
   function scheduleSync() {
@@ -2268,6 +2695,7 @@
       if (
         target.id === 'jetski-closed-chats-filter-bubble' ||
         target.id === STYLE_ID ||
+        target.id === STAR_TOOLTIP_ID ||
         target.className === BAR_CLASS ||
         target.className === BUTTON_CLASS ||
         target.className === TITLEBAR_BTN_CLASS ||
@@ -2276,8 +2704,12 @@
         target.className === ROW_BG_WAIT_INDICATOR_CLASS ||
         target.className === PROJECT_ROADMAP_BADGE_CLASS ||
         target.className === SEARCH_BTN_CLASS ||
+        target.className === CHAIN_STARS_GROUP_CLASS ||
+        target.className === CHAIN_STAR_BTN_CLASS ||
+        target.className === ARCHIVE_BANNER_CLASS ||
         (typeof target.closest === 'function' &&
           (target.closest('#jetski-closed-chats-filter-bubble') ||
+            target.closest(`#${STAR_TOOLTIP_ID}`) ||
             target.closest(`.${BAR_CLASS}`) ||
             target.closest(`.${BUTTON_CLASS}`) ||
             target.closest(`.${TITLEBAR_BTN_CLASS}`) ||
@@ -2285,6 +2717,8 @@
             target.closest(`.${ROW_WAIT_BTN_CLASS}`) ||
             target.closest(`.${ROW_BG_WAIT_INDICATOR_CLASS}`) ||
             target.closest(`.${PROJECT_ROADMAP_BADGE_CLASS}`) ||
+            target.closest(`.${CHAIN_STARS_GROUP_CLASS}`) ||
+            target.closest(`.${ARCHIVE_BANNER_CLASS}`) ||
             target.closest(`#${SEARCH_PANEL_ID}`)))
       ) {
         return false;
@@ -2319,7 +2753,7 @@
         payload: { updates: unhide, deletes: [] },
       });
     }
-    // Remove all injected filter buttons and background-wait badges on reload
+    // Remove all injected filter buttons, search panels, and chain stars on reload
     const cleanupSelector = [
       `.${BAR_CLASS}`,
       `.${BUTTON_CLASS}`,
@@ -2330,6 +2764,9 @@
       `.${PROJECT_ROADMAP_BADGE_CLASS}`,
       `.${SEARCH_BTN_CLASS}`,
       `#${SEARCH_PANEL_ID}`,
+      `.${CHAIN_STARS_GROUP_CLASS}`,
+      `.${ARCHIVE_BANNER_CLASS}`,
+      `#${STAR_TOOLTIP_ID}`,
     ].join(', ');
     for (const el of document.querySelectorAll(cleanupSelector)) {
       el.remove();

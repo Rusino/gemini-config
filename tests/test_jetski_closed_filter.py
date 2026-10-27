@@ -76,11 +76,21 @@ class FakeElement {
     this.parentElement = null;
     this.listeners = new Map();
   }
+  get firstChild() {
+    return this.children[0] || null;
+  }
+  get lastChild() {
+    return this.children[this.children.length - 1] || null;
+  }
   get innerHTML() {
     return this._innerHTML;
   }
   set innerHTML(val) {
     this._innerHTML = String(val);
+    if (!val) {
+      for (const c of this.children) c.parentElement = null;
+      this.children = [];
+    }
     if (global.__recordMutation) {
       global.__recordMutation(this);
     }
@@ -202,24 +212,14 @@ function matches(el, selector) {
   if (selector === 'script[src*="jetski-closed-filter.js"]') {
     return el.tagName === 'SCRIPT' && (el.getAttribute('src') || '').includes('jetski-closed-filter.js');
   }
-  if (selector === '[data-testid="titlebar-more-actions"]') {
-    return el.getAttribute('data-testid') === 'titlebar-more-actions';
-  }
-  // Match OverviewPanelHost containers when resolving active pane conversation IDs
-  if (selector === '[data-testid="overview-panel-host"]') {
-    return el.getAttribute('data-testid') === 'overview-panel-host';
-  }
-  if (selector === '[data-testid="conversation-pin-button"]') {
-    return el.getAttribute('data-testid') === 'conversation-pin-button';
-  }
-  if (selector === '[data-testid="conversation-archive-button"]') {
-    return el.getAttribute('data-testid') === 'conversation-archive-button';
-  }
   if (selector === '[data-testid="conversation-row-sidebar"][data-cascade-id]') {
     return (
       el.getAttribute('data-testid') === 'conversation-row-sidebar' &&
       el.hasAttribute('data-cascade-id')
     );
+  }
+  if (selector === '[data-testid="conversation-view"][data-cascade-id]') {
+    return el.getAttribute('data-testid') === 'conversation-view' && el.hasAttribute('data-cascade-id');
   }
   if (selector === 'div[data-sidebar-row-id]') {
     return el.tagName === 'DIV' && el.hasAttribute('data-sidebar-row-id');
@@ -231,8 +231,24 @@ function matches(el, selector) {
       !el.hasAttribute('data-sidebar-row-id')
     );
   }
+  const tagAttrMatch = /^([a-zA-Z0-9]+)\[([-a-zA-Z0-9_]+)="([^"]+)"\]$/.exec(selector);
+  if (tagAttrMatch) {
+    return (
+      el.tagName === tagAttrMatch[1].toUpperCase() &&
+      el.getAttribute(tagAttrMatch[2]) === tagAttrMatch[3]
+    );
+  }
+  const attrEqMatch = /^\[([-a-zA-Z0-9_]+)="([^"]+)"\]$/.exec(selector);
+  if (attrEqMatch) {
+    return el.getAttribute(attrEqMatch[1]) === attrEqMatch[2];
+  }
+  const attrHasMatch = /^\[([-a-zA-Z0-9_]+)\]$/.exec(selector);
+  if (attrHasMatch) {
+    return el.hasAttribute(attrHasMatch[1]);
+  }
   if (selector.startsWith('.')) {
-    return el.className === selector.slice(1);
+    const cls = selector.slice(1);
+    return el.className === cls || (el.className && el.className.split(/\s+/).includes(cls));
   }
   if (selector.startsWith('#')) {
     return el.id === selector.slice(1);
@@ -308,6 +324,40 @@ pinBtn.setAttribute('data-testid', 'conversation-pin-button');
 rowHoverBar.appendChild(pinBtn);
 sidebarRow.appendChild(rowHoverBar);
 bodyEl.appendChild(sidebarRow);
+
+// Active conversation view for 'open-step' (middle piece of chain ['open-root', 'open-step', 'open-current'])
+const convoViewEl = new FakeElement('div');
+convoViewEl.setAttribute('data-testid', 'conversation-view');
+convoViewEl.setAttribute('data-cascade-id', 'open-step');
+
+const convoRailSlot = new FakeElement('div');
+convoRailSlot.className = 'pointer-events-none absolute inset-y-0 left-0 z-10 w-7';
+const convoNavEl = new FakeElement('nav');
+convoNavEl.setAttribute('data-testid', 'conversation-navigator');
+const convoNavInner = new FakeElement('div');
+convoNavInner.className = 'relative flex min-h-0 flex-col';
+const convoNavList = new FakeElement('ol');
+convoNavInner.appendChild(convoNavList);
+convoNavEl.appendChild(convoNavInner);
+convoRailSlot.appendChild(convoNavEl);
+convoViewEl.appendChild(convoRailSlot);
+
+const convoFooterEl = new FakeElement('div');
+convoFooterEl.className = 'relative w-full px-4 pb-4';
+const convoFooterInner = new FakeElement('div');
+convoFooterInner.className = 'flex flex-col w-full gap-2 min-h-0';
+const convoInputBox = new FakeElement('div');
+convoInputBox.setAttribute('data-testid', 'agent-input-box');
+const convoContentEditable = new FakeElement('div');
+convoContentEditable.setAttribute('contenteditable', 'true');
+const convoSendBtn = new FakeElement('button');
+convoSendBtn.setAttribute('data-testid', 'send-button');
+convoInputBox.appendChild(convoContentEditable);
+convoInputBox.appendChild(convoSendBtn);
+convoFooterInner.appendChild(convoInputBox);
+convoFooterEl.appendChild(convoFooterInner);
+convoViewEl.appendChild(convoFooterEl);
+bodyEl.appendChild(convoViewEl);
 
 function makeSummary(title, projectId, extraMeta = {}, archived = false, extraSummary = {}) {
   return {
@@ -410,8 +460,23 @@ let observerCallback = null;
 let rafCallbacks = [];
 const rpcRequests = [];
 
+global.PopStateEvent = class {
+  constructor(type) {
+    this.type = type;
+  }
+};
+
 global.window = {
   innerWidth: 1280,
+  location: { pathname: '/c/open-step' },
+  history: {
+    _lastPushed: null,
+    pushState(state, title, url) {
+      this._lastPushed = url;
+      global.window.location.pathname = url;
+    },
+  },
+  dispatchEvent(evt) {},
   __APP_CONFIG__: { csrfToken: 'test-csrf-token' },
   localStorage: {
     getItem: (k) => (storage.has(k) ? storage.get(k) : null),
@@ -931,6 +996,55 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(rpcRequests.length, 0, 'Steps are cached for the open panel');
   await window.__jetskiChatSearch.runChatSearch('  ', resultsEl, chain, stepCache);
   assert.strictEqual(resultsEl.innerHTML, '');
+
+  // 1. Verify chain navigator stars on 'open-step' (middle piece: 2 before, 1 after)
+  const starsBefore = convoNavEl.querySelector('[data-testid="jetski-chain-stars-before"]');
+  assert(starsBefore, 'Stars before group must be mounted in convo navigator');
+  assert.strictEqual(starsBefore.children.length, 2, 'Two pieces up to open-step');
+  assert.strictEqual(starsBefore.children[0].textContent, '✦');
+  assert.strictEqual(starsBefore.children[0].getAttribute('data-active'), 'false');
+  assert.strictEqual(starsBefore.children[1].textContent, '★');
+  assert.strictEqual(starsBefore.children[1].getAttribute('data-active'), 'true');
+
+  const starsAfter = convoNavEl.querySelector('[data-testid="jetski-chain-stars-after"]');
+  assert(starsAfter, 'Stars after group must be mounted in convo navigator');
+  assert.strictEqual(starsAfter.children.length, 1, 'One descendant piece after open-step');
+  assert.strictEqual(starsAfter.children[0].textContent, '✦');
+  assert.strictEqual(starsAfter.children[0].getAttribute('data-active'), 'false');
+
+  // 2. Verify non-tail input lock on 'open-step'
+  assert.strictEqual(convoInputBox.style.display, 'none', 'Input box must be hidden on non-tail piece');
+  assert.strictEqual(convoContentEditable.getAttribute('contenteditable'), 'false');
+  assert.strictEqual(convoSendBtn.getAttribute('disabled'), 'true');
+
+  const archiveBanner = convoFooterInner.querySelector('[data-testid="jetski-archive-piece-banner"]');
+  assert(archiveBanner, 'Archive banner must be displayed on non-tail piece');
+  assert(archiveBanner.textContent.includes('Archived piece #2 of 3'));
+  const jumpBtn = archiveBanner.querySelector('[data-testid="jetski-jump-to-tail-btn"]');
+  assert(jumpBtn, 'Jump to tail button must be present in archive banner');
+
+  // 3. Click jump-to-tail and verify navigation target
+  window.history._lastPushed = null;
+  jumpBtn.dispatchEvent('click');
+  assert.strictEqual(window.history._lastPushed, '/c/open-current');
+
+  // 4. Switch conversation-view to the tail piece 'open-current' and sync
+  convoViewEl.setAttribute('data-cascade-id', 'open-current');
+  await window.__jetskiChainNav.syncConversationChainNavigators();
+
+  const tailStarsBefore = convoNavEl.querySelector('[data-testid="jetski-chain-stars-before"]');
+  assert.strictEqual(tailStarsBefore.children.length, 3, 'All 3 pieces before/at tail');
+  assert.strictEqual(tailStarsBefore.children[2].textContent, '★');
+  assert.strictEqual(tailStarsBefore.children[2].getAttribute('data-active'), 'true');
+
+  const tailStarsAfter = convoNavEl.querySelector('[data-testid="jetski-chain-stars-after"]');
+  assert(!tailStarsAfter || tailStarsAfter.children.length === 0, 'No stars after tail piece');
+
+  // Input must be restored/unlocked on tail piece
+  assert.strictEqual(convoInputBox.style.display, '', 'Input box must be restored on tail piece');
+  assert.strictEqual(convoContentEditable.getAttribute('contenteditable'), 'true');
+  assert.strictEqual(convoSendBtn.hasAttribute('disabled'), false);
+  assert(!convoFooterInner.querySelector('[data-testid="jetski-archive-piece-banner"]'));
 
   console.log('ALL_JS_ASSERTIONS_PASSED');
 })().catch((err) => {
