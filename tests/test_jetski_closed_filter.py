@@ -404,6 +404,22 @@ const storeState = {
       'open-root': true,
     },
   },
+  multiConvoLayout: {
+    rootNode: {
+      type: 'split',
+      id: 'split-1',
+      direction: 'horizontal',
+      children: [
+        { type: 'pane', id: 'pane-1', cascadeId: 'solo-active' },
+        { type: 'pane', id: 'pane-2', cascadeId: 'open-step' },
+      ],
+      weights: [50, 50],
+    },
+    focusedPaneId: 'pane-2',
+  },
+  conversation: {
+    cascadeId: 'open-step',
+  },
 };
 
 const subscribers = [];
@@ -412,6 +428,36 @@ const reduxStore = {
     return storeState;
   },
   dispatch(action) {
+    // Mirror multiConvoLayout/resetPane in test harness
+    if (action?.type === 'multiConvoLayout/resetPane') {
+      const { paneId, cascadeId } = action.payload || {};
+      const updatePane = (node) => {
+        if (!node) return node;
+        if (node.type === 'pane' && node.id === paneId) {
+          return { ...node, cascadeId };
+        }
+        if (node.type === 'split' && Array.isArray(node.children)) {
+          return { ...node, children: node.children.map(updatePane) };
+        }
+        return node;
+      };
+      if (storeState.multiConvoLayout?.rootNode) {
+        storeState.multiConvoLayout.rootNode = updatePane(storeState.multiConvoLayout.rootNode);
+      }
+      return action;
+    }
+    if (action?.type === 'multiConvoLayout/setFocusedPane') {
+      if (storeState.multiConvoLayout) {
+        storeState.multiConvoLayout.focusedPaneId = action.payload;
+      }
+      return action;
+    }
+    if (action?.type === 'conversation/setCascadeId') {
+      if (storeState.conversation) {
+        storeState.conversation.cascadeId = action.payload?.cascadeId;
+      }
+      return action;
+    }
     // Mirror auxPaneV2Slice.setOverviewPanelOpen reducer in the test harness
     if (action?.type === 'auxPaneV2/setOverviewPanelOpen') {
       const { cascadeId, open } = action.payload || {};
@@ -468,12 +514,23 @@ global.PopStateEvent = class {
 
 global.window = {
   innerWidth: 1280,
-  location: { pathname: '/c/open-step' },
+  location: { pathname: '/c/open-step', search: '' },
   history: {
+    state: { __TSR_index: 2, __TSR_key: 'k2', key: 'k2' },
     _lastPushed: null,
+    _lastState: null,
     pushState(state, title, url) {
+      this.state = state;
+      this._lastState = state;
       this._lastPushed = url;
-      global.window.location.pathname = url;
+      const qIdx = String(url).indexOf('?');
+      if (qIdx >= 0) {
+        global.window.location.pathname = url.slice(0, qIdx);
+        global.window.location.search = url.slice(qIdx);
+      } else {
+        global.window.location.pathname = url;
+        global.window.location.search = '';
+      }
     },
   },
   dispatchEvent(evt) {},
@@ -1019,6 +1076,37 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(starsBefore.children[0].getAttribute('data-active'), 'false');
   assert.strictEqual(starsBefore.children[1].textContent, '★');
   assert.strictEqual(starsBefore.children[1].getAttribute('data-active'), 'true');
+
+  // Verify DOM star button instances are preserved across sync passes when chain is unchanged
+  const firstRootStarBtn = starsBefore.children[0];
+  await window.__jetskiChainNav.syncConversationChainNavigators();
+  assert.strictEqual(
+    starsBefore.children[0],
+    firstRootStarBtn,
+    'Unchanged chain must preserve star button DOM instances'
+  );
+
+  // Verify star click in split-view URL mode preserves other panes and sets focused params
+  global.window.location.pathname = '/c/solo-active+open-step';
+  global.window.location.search = '?focused=open-step&section=proj-1';
+  starsBefore.children[0].dispatchEvent('pointerdown', { button: 0 });
+  starsBefore.children[0].dispatchEvent('click', { button: 0 });
+  assert.strictEqual(
+    global.window.history._lastPushed,
+    '/c/solo-active+open-root?focused=open-root&section=proj-1'
+  );
+  assert.strictEqual(global.window.history._lastState?.__TSR_index, 3);
+  assert.strictEqual(global.window.history._lastState?.__TSR_key, 'k2');
+  assert.strictEqual(
+    storeState.multiConvoLayout.rootNode.children[1].cascadeId,
+    'open-root'
+  );
+  assert.strictEqual(storeState.multiConvoLayout.focusedPaneId, 'pane-2');
+  assert.strictEqual(storeState.conversation.cascadeId, 'open-root');
+
+  // Reset URL to single-pane for jump-to-tail test
+  global.window.location.pathname = '/c/open-step';
+  global.window.location.search = '';
 
   const starsAfter = convoNavEl.querySelector('[data-testid="jetski-chain-stars-after"]');
   assert(starsAfter, 'Stars after group must be mounted in convo navigator');

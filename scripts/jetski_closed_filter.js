@@ -1819,14 +1819,126 @@
     });
   }
 
-  // Routes inside the SPA by swapping the conversation ID in the current chat URL; the panel
-  // opens from a chat titlebar, so a chat route is always present
-  function openConversation(cascadeId, term) {
+  // Routes inside the SPA by swapping the conversation ID in the current chat URL; updates both
+  // browser history and Redux multiConvoLayout/conversation slices for split-view stability
+  function openConversation(cascadeId, term, sourceCid) {
     const path = window.location?.pathname || '';
-    const m = /^(.*\/(?:c|cascade|conversation)\/)[a-zA-Z0-9_-]+(.*)$/.exec(path);
+    const m = /^(.*\/(?:c|cascade|conversation)\/)([^/?#]+)(.*)$/.exec(path);
     if (!m) return;
-    window.history.pushState({}, '', m[1] + cascadeId + m[2]);
+    // Extract active conversation IDs from URL pathname, handling split-view '+' separators
+    let decoded = m[2];
+    try {
+      decoded = decodeURIComponent(m[2]);
+    } catch {}
+    const rawIds = decoded.split('+').filter(Boolean);
+    const searchStr = window.location?.search || '';
+    const searchParams = searchStr ? new URLSearchParams(searchStr) : null;
+    const focusedParam = searchParams?.get('focused') || '';
+
+    const store = findReduxStore();
+    const layoutState = store?.getState()?.multiConvoLayout;
+    const convoCascadeId = store?.getState()?.conversation?.cascadeId || '';
+    // Target the clicked pane or active conversation so adjacent split panes remain unchanged
+    const replaceTarget = sourceCid || focusedParam || convoCascadeId;
+
+    let targetIdx = -1;
+    if (replaceTarget) {
+      targetIdx = rawIds.indexOf(replaceTarget);
+    }
+    if (targetIdx === -1 && rawIds.length > 0) {
+      targetIdx = 0;
+    }
+
+    const replacedList = rawIds.length > 0 ? [...rawIds] : [cascadeId];
+    if (targetIdx >= 0 && targetIdx < replacedList.length) {
+      replacedList[targetIdx] = cascadeId;
+    }
+
+    const nextIds = [];
+    const seen = new Set();
+    for (const id of replacedList) {
+      if (id === '_new' || !seen.has(id)) {
+        if (id !== '_new') seen.add(id);
+        nextIds.push(id);
+      }
+    }
+
+    // Preserve non-empty search query params while keeping focused ID aligned with target
+    const nextPath = m[1] + nextIds.join('+') + m[3];
+    let nextUrl = nextPath;
+    if (searchParams) {
+      if (searchParams.has('focused') || nextIds.length > 1) {
+        searchParams.set('focused', cascadeId);
+      }
+      const qs = searchParams.toString();
+      nextUrl = nextPath + (qs ? `?${qs}` : '');
+    }
+
+    // Increment TanStack Router __TSR_index to preserve history navigation order
+    const prevState =
+      window.history?.state && typeof window.history.state === 'object'
+        ? window.history.state
+        : {};
+    const nextState =
+      typeof prevState.__TSR_index === 'number'
+        ? { ...prevState, __TSR_index: prevState.__TSR_index + 1 }
+        : { ...prevState };
+    window.history.pushState(nextState, '', nextUrl);
     window.dispatchEvent(new PopStateEvent('popstate'));
+
+    // Reconcile Redux layout and active conversation slices to prevent router ping-pong
+    if (store) {
+      if (layoutState?.rootNode) {
+        function findPane(node) {
+          if (!node) return null;
+          if (node.type === 'pane') {
+            if (
+              (replaceTarget &&
+                (node.cascadeId === replaceTarget || node.id === replaceTarget)) ||
+              node.id === layoutState.focusedPaneId
+            ) {
+              return node;
+            }
+            return null;
+          }
+          if (Array.isArray(node.children)) {
+            for (const child of node.children) {
+              const found = findPane(child);
+              if (found) return found;
+            }
+          }
+          return null;
+        }
+        function getFirstPane(node) {
+          if (!node) return null;
+          if (node.type === 'pane') return node;
+          if (Array.isArray(node.children)) {
+            for (const child of node.children) {
+              const p = getFirstPane(child);
+              if (p) return p;
+            }
+          }
+          return null;
+        }
+        const targetPane =
+          findPane(layoutState.rootNode) || getFirstPane(layoutState.rootNode);
+        if (targetPane) {
+          store.dispatch({
+            type: 'multiConvoLayout/resetPane',
+            payload: { paneId: targetPane.id, cascadeId },
+          });
+          store.dispatch({
+            type: 'multiConvoLayout/setFocusedPane',
+            payload: targetPane.id,
+          });
+        }
+      }
+      store.dispatch({
+        type: 'conversation/setCascadeId',
+        payload: { cascadeId },
+      });
+    }
+
     // Find computes matches from the mounted view's text, so wait for the routed view to mount
     if (term) {
       setTimeout(() => showNativeFind(cascadeId, term), 600);
@@ -1929,7 +2041,7 @@
       if (!hit) return;
       const term = input.value.trim();
       closeSearchPanel();
-      openConversation(hit.getAttribute('data-cascade-id'), term);
+      openConversation(hit.getAttribute('data-cascade-id'), term, cascadeId);
     });
     input.focus();
   }
@@ -2037,7 +2149,39 @@
     }
   }
 
-  function createStarButton(cid, idx, chain, isCurrent, isTail) {
+  // Intercepts pointerdown/mousedown/click with a 300ms debounce so buttons navigate reliably
+  function bindActionBtnHandlers(btn, onTrigger) {
+    let lastPressTs = 0;
+    const triggerOnce = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      // Debounce rapid multi-event dispatches across pointerdown, mousedown, and click
+      if (Date.now() - lastPressTs > 300) {
+        lastPressTs = Date.now();
+        onTrigger();
+      }
+    };
+    // Trigger on pointerdown before potential DOM replacement between mousedown and mouseup
+    btn.addEventListener('pointerdown', (e) => {
+      e.stopPropagation();
+      if (e.button === 0 && !e.ctrlKey && !e.metaKey) {
+        triggerOnce(e);
+      }
+    });
+    btn.addEventListener('mousedown', (e) => {
+      e.stopPropagation();
+      if (e.button === 0 && !e.ctrlKey && !e.metaKey) {
+        triggerOnce(e);
+      }
+    });
+    btn.addEventListener('click', (e) => {
+      if (!e.ctrlKey && !e.metaKey) {
+        triggerOnce(e);
+      }
+    });
+  }
+
+  function createStarButton(cid, idx, chain, isCurrent, isTail, sourceCid) {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = CHAIN_STAR_BTN_CLASS;
@@ -2051,11 +2195,11 @@
     );
     btn.textContent = isCurrent ? '★' : '✦';
 
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
+    // Route to target chain piece while binding source pane ID for split-view replacement
+    bindActionBtnHandlers(btn, () => {
       hideChainStarTooltip();
       if (!isCurrent) {
-        openConversation(cid);
+        openConversation(cid, undefined, sourceCid || chain[idx]);
       }
     });
     btn.addEventListener('mouseenter', () => {
@@ -2109,21 +2253,26 @@
       }
       banner.textContent = `🔒 Archived piece #${activeIdx + 1} of ${chain.length} (read-only) `;
 
+      // Bind click handler once at creation time to prevent duplicate listener accumulation
       let jumpBtn = banner.querySelector(`.${JUMP_TO_TAIL_BTN_CLASS}`);
       if (!jumpBtn) {
         jumpBtn = document.createElement('button');
         jumpBtn.type = 'button';
         jumpBtn.className = JUMP_TO_TAIL_BTN_CLASS;
         jumpBtn.setAttribute('data-testid', JUMP_TO_TAIL_BTN_CLASS);
+        bindActionBtnHandlers(jumpBtn, () => {
+          const tid = jumpBtn.getAttribute('data-tail-id');
+          const sid = jumpBtn.getAttribute('data-source-id');
+          if (tid) {
+            openConversation(tid, undefined, sid);
+          }
+        });
         banner.appendChild(jumpBtn);
       }
       const tailId = chain[chain.length - 1];
       jumpBtn.textContent = `Jump to active #${chain.length} →`;
       jumpBtn.setAttribute('data-tail-id', tailId);
-      jumpBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        openConversation(tailId);
-      });
+      jumpBtn.setAttribute('data-source-id', cascadeId);
     } else {
       convoViewEl.removeAttribute('data-jetski-non-tail-locked');
       if (inputBox) {
@@ -2163,18 +2312,35 @@
         convoViewEl.querySelector(`[data-testid="${CHAIN_STARS_BEFORE_TEST_ID}"]`)?.remove();
         convoViewEl.querySelector(`[data-testid="${CHAIN_STARS_AFTER_TEST_ID}"]`)?.remove();
         convoViewEl.querySelector('.jetski-chain-stars-fallback')?.remove();
+        convoViewEl.removeAttribute('data-jetski-chain-sig');
         continue;
       }
 
       const activeIdx = chain.indexOf(cid);
       if (activeIdx === -1) continue;
 
+      // Key rendered star buttons by chain topology and active piece to preserve DOM identity
+      const chainSig = `${chain.join(',')}@${cid}`;
       const nav = convoViewEl.querySelector('[data-testid="conversation-navigator"]');
       if (nav) {
         convoViewEl.querySelector('.jetski-chain-stars-fallback')?.remove();
+        let beforeGroup = nav.querySelector(`[data-testid="${CHAIN_STARS_BEFORE_TEST_ID}"]`);
+        let afterGroup = nav.querySelector(`[data-testid="${CHAIN_STARS_AFTER_TEST_ID}"]`);
+        const needsAfter = activeIdx < chain.length - 1;
+        const currentSig = nav.getAttribute('data-jetski-chain-sig');
+
+        // Skip re-rendering star buttons when chain structure has not changed
+        if (
+          currentSig === chainSig &&
+          beforeGroup &&
+          (needsAfter ? afterGroup : !afterGroup)
+        ) {
+          continue;
+        }
+
+        nav.setAttribute('data-jetski-chain-sig', chainSig);
         const inner = nav.querySelector('.relative.flex.min-h-0.flex-col') || nav.children[0];
 
-        let beforeGroup = nav.querySelector(`[data-testid="${CHAIN_STARS_BEFORE_TEST_ID}"]`);
         if (!beforeGroup) {
           beforeGroup = document.createElement('div');
           beforeGroup.className = `${CHAIN_STARS_GROUP_CLASS} jetski-chain-stars-before`;
@@ -2188,15 +2354,15 @@
         while (beforeGroup.children?.length > 0) {
           beforeGroup.children[0].remove();
         }
+        // Render leading and active chain pieces into the before-group container
         for (let i = 0; i <= activeIdx; i++) {
           const pieceCid = chain[i];
           const isCur = i === activeIdx;
           const isTl = i === chain.length - 1;
-          beforeGroup.appendChild(createStarButton(pieceCid, i, chain, isCur, isTl));
+          beforeGroup.appendChild(createStarButton(pieceCid, i, chain, isCur, isTl, cid));
         }
 
-        let afterGroup = nav.querySelector(`[data-testid="${CHAIN_STARS_AFTER_TEST_ID}"]`);
-        if (activeIdx < chain.length - 1) {
+        if (needsAfter) {
           if (!afterGroup) {
             afterGroup = document.createElement('div');
             afterGroup.className = `${CHAIN_STARS_GROUP_CLASS} jetski-chain-stars-after`;
@@ -2206,11 +2372,12 @@
           while (afterGroup.children?.length > 0) {
             afterGroup.children[0].remove();
           }
+          // Render descendant chain pieces into the after-group container
           for (let i = activeIdx + 1; i < chain.length; i++) {
             const pieceCid = chain[i];
             const isCur = false;
             const isTl = i === chain.length - 1;
-            afterGroup.appendChild(createStarButton(pieceCid, i, chain, isCur, isTl));
+            afterGroup.appendChild(createStarButton(pieceCid, i, chain, isCur, isTl, cid));
           }
         } else if (afterGroup) {
           afterGroup.remove();
@@ -2222,6 +2389,10 @@
           convoViewEl.querySelector('.pointer-events-none.absolute.inset-y-0.left-0.z-10.w-7') ||
           convoViewEl;
         let fallback = slot.querySelector('.jetski-chain-stars-fallback');
+        // Preserve fallback DOM buttons when chain signature is unchanged
+        if (fallback && fallback.getAttribute('data-jetski-chain-sig') === chainSig) {
+          continue;
+        }
         if (!fallback) {
           fallback = document.createElement('div');
           fallback.className = `${CHAIN_STARS_GROUP_CLASS} jetski-chain-stars-fallback`;
@@ -2230,6 +2401,7 @@
           fallback.style.top = '16px';
           slot.appendChild(fallback);
         }
+        fallback.setAttribute('data-jetski-chain-sig', chainSig);
         while (fallback.children?.length > 0) {
           fallback.children[0].remove();
         }
@@ -2237,7 +2409,7 @@
           const pieceCid = chain[i];
           const isCur = i === activeIdx;
           const isTl = i === chain.length - 1;
-          fallback.appendChild(createStarButton(pieceCid, i, chain, isCur, isTl));
+          fallback.appendChild(createStarButton(pieceCid, i, chain, isCur, isTl, cid));
         }
       }
     }
@@ -2333,36 +2505,6 @@
     const path = window.location?.pathname || '';
     const m = /\/(?:c|cascade|conversation)\/([a-zA-Z0-9_-]+)/.exec(path);
     return m ? m[1] : '';
-  }
-
-  // Intercepts pointerdown/mousedown/click with a 300ms debounce so parent row links do not navigate
-  function bindActionBtnHandlers(btn, onTrigger) {
-    let lastPressTs = 0;
-    const triggerOnce = (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      if (Date.now() - lastPressTs > 300) {
-        lastPressTs = Date.now();
-        onTrigger();
-      }
-    };
-    btn.addEventListener('pointerdown', (e) => {
-      e.stopPropagation();
-      if (e.button === 0 && !e.ctrlKey && !e.metaKey) {
-        triggerOnce(e);
-      }
-    });
-    btn.addEventListener('mousedown', (e) => {
-      e.stopPropagation();
-      if (e.button === 0 && !e.ctrlKey && !e.metaKey) {
-        triggerOnce(e);
-      }
-    });
-    btn.addEventListener('click', (e) => {
-      if (!e.ctrlKey && !e.metaKey) {
-        triggerOnce(e);
-      }
-    });
   }
 
   // Syncs the titlebar wait-toggle button (⦿ <-> ⏳)
