@@ -82,10 +82,157 @@ class DraftAndDevelopmentStatusTest(unittest.TestCase):
     self.assertFalse(res["is_self"])
     self.assertFalse(res["is_draft"])
     self.assertFalse(res["in_development"])
-    self.assertFalse(res["is_watching"])
+    self.assertTrue(res["is_watching"])
     self.assertEqual(res["role"], "reviewer (goog)")
     self.assertFalse(res["in_my_attention"])
+    self.assertEqual(res["waiting_on"], [])
     self.assertEqual(res["phase"], "WAITING_ON_OTHERS")
+
+  def test_gerrit_colleague_cl_already_reviewed_by_self_routes_to_watching_not_waiting(
+      self,
+  ):
+    payload = {
+        "status": "NEW",
+        "work_in_progress": False,
+        "subject": 'Reland "[SkContext] Forwarding SkGraphics calls to SkContext"',
+        "owner": {"email": "alexisdavidc@google.com", "name": "Alexis Cruz-Ayala"},
+        "current_revision": "rev8",
+        "revisions": {"rev8": {"_number": 8}},
+        "attention_set": {
+            "1": {"account": {"email": "michaelludwig@google.com"}},
+            "2": {"account": {"email": "alexisdavidc@google.com"}},
+        },
+        "reviewers": {
+            "REVIEWER": [
+                {"email": "alexisdavidc@google.com"},
+                {"email": "jlavrova@google.com"},
+                {"email": "michaelludwig@google.com"},
+            ]
+        },
+        "labels": {
+            "Code-Review": {
+                "all": [
+                    {"email": "jlavrova@google.com", "value": 1},
+                ]
+            }
+        },
+        "messages": [],
+    }
+    with mock.patch.object(
+        w.urllib.request, "urlopen", return_value=_FakeGerritResponse(payload)
+    ), mock.patch.object(w, "gerrit_mergeable", return_value=True):
+      res = w.fetch_gerrit_cl_status("1402416", {}, [], skia_dir="/nonexistent")
+
+    self.assertTrue(res["ok"])
+    self.assertFalse(res["is_self"])
+    self.assertFalse(res["is_draft"])
+    self.assertFalse(res["in_development"])
+    self.assertFalse(res["in_my_attention"])
+    self.assertTrue(res["is_watching"])
+    self.assertEqual(res["role"], "reviewer (goog)")
+    self.assertEqual(res["waiting_on"], [])
+    self.assertEqual(res["phase"], "WAITING_ON_OTHERS")
+
+  def test_gerrit_reviewer_cl_with_self_code_review_plus_one_clears_attention_even_in_attention_set(
+      self,
+  ):
+    payload = {
+        "status": "NEW",
+        "work_in_progress": False,
+        "subject": "[skparagraph] Keep line breaking of long words linear",
+        "owner": {"email": "I@YeungKC.com", "name": "Keyuan Yeung"},
+        "current_revision": "rev2",
+        "revisions": {"rev2": {"_number": 2}},
+        "attention_set": {
+            "8956": {
+                "account": {"email": "jlavrova@google.com"},
+                "reason": "SkCQ dry run succeeded.",
+            }
+        },
+        "reviewers": {
+            "REVIEWER": [
+                {"email": "jlavrova@google.com"},
+                {"email": "alexisdavidc@google.com"},
+            ]
+        },
+        "labels": {
+            "Code-Review": {
+                "all": [
+                    {"email": "jlavrova@google.com", "value": 1},
+                    {"email": "alexisdavidc@google.com", "value": 0},
+                ]
+            },
+            "Commit-Queue": {
+                "all": [
+                    {"email": "jlavrova@google.com", "value": 0},
+                ]
+            },
+        },
+        "messages": [
+            {
+                "_revision_number": 2,
+                "author": {
+                    "email": "skcq-be@skia-corp.google.com.iam.gserviceaccount.com"
+                },
+                "date": "2026-10-27 15:54:43.000000000",
+                "message": "Patch Set 2: Dry run: This CL passed the SkCQ dry run.",
+            }
+        ],
+    }
+    with mock.patch.object(
+        w.urllib.request, "urlopen", return_value=_FakeGerritResponse(payload)
+    ), mock.patch.object(w, "gerrit_mergeable", return_value=True):
+      res = w.fetch_gerrit_cl_status("1407016", {}, [], skia_dir="/nonexistent")
+
+    self.assertTrue(res["ok"])
+    self.assertFalse(res["is_self"])
+    self.assertTrue(res["is_external"])
+    self.assertFalse(res["in_my_attention"])
+    self.assertTrue(res["is_watching"])
+    self.assertEqual(res["role"], "reviewer (ext)")
+    self.assertEqual(res["waiting_on"], [])
+    self.assertEqual(res["phase"], "WAITING_ON_OTHERS")
+
+  def test_gerrit_reviewer_cl_with_failed_cq_still_needs_your_action_not_cq_alert(
+      self,
+  ):
+    payload = {
+        "status": "NEW",
+        "work_in_progress": False,
+        "subject": "[skparagraph] Add cluster range helper",
+        "owner": {"email": "alexisdavidc@google.com", "name": "Alexis Cruz-Ayala"},
+        "current_revision": "rev3",
+        "revisions": {"rev3": {"_number": 3}},
+        "attention_set": {
+            "8956": {"account": {"email": "jlavrova@google.com"}},
+        },
+        "reviewers": {
+            "REVIEWER": [
+                {"email": "jlavrova@google.com"},
+            ]
+        },
+        "labels": {},
+        "messages": [
+            {
+                "_revision_number": 3,
+                "author": {
+                    "email": "skcq-be@skia-corp.google.com.iam.gserviceaccount.com"
+                },
+                "date": "2026-10-27 16:00:00.000000000",
+                "message": "Patch Set 3: This CL failed the SkCQ",
+            }
+        ],
+    }
+    with mock.patch.object(
+        w.urllib.request, "urlopen", return_value=_FakeGerritResponse(payload)
+    ), mock.patch.object(w, "gerrit_mergeable", return_value=True):
+      res = w.fetch_gerrit_cl_status("1408001", {}, [], skia_dir="/nonexistent")
+
+    self.assertFalse(res["is_self"])
+    self.assertTrue(res["cq_failed"])
+    self.assertTrue(res["in_my_attention"])
+    self.assertFalse(res["is_watching"])
+    self.assertEqual(res["phase"], "NEEDS_YOUR_ACTION")
 
   def test_gerrit_non_participant_cl_marks_is_watching_not_draft_or_dev(self):
     payload = {
@@ -304,7 +451,7 @@ class DraftAndDevelopmentStatusTest(unittest.TestCase):
       res_rev = w.fetch_piper_cl_status("1002307626")
     self.assertFalse(res_rev["is_draft"])
     self.assertFalse(res_rev["in_development"])
-    self.assertFalse(res_rev["is_watching"])
+    self.assertTrue(res_rev["is_watching"])
     self.assertEqual(res_rev["role"], "reviewer (goog)")
 
     tag_wip_out = (
@@ -377,6 +524,45 @@ class DraftAndDevelopmentStatusTest(unittest.TestCase):
     self.assertTrue(res["in_my_attention"])
     self.assertEqual(res["phase"], "NEEDS_YOUR_ACTION")
 
+  def test_github_reviewer_pr_already_approved_clears_attention_and_watches(self):
+    gh_json = json.dumps({
+        "number": 195400,
+        "title": "[web_paragraph] Fix cluster indexing",
+        "state": "OPEN",
+        "isDraft": False,
+        "author": {"login": "mdebbar"},
+        "mergedAt": None,
+        "headRefOid": "1234567890abcdef",
+        "reviews": [
+            {
+                "author": {"login": "Rusino"},
+                "state": "APPROVED",
+                "body": "LGTM",
+                "submittedAt": "2026-10-27T15:00:00Z",
+            }
+        ],
+        "comments": [
+            {
+                "author": {"login": "mdebbar"},
+                "body": "Thanks! Waiting on second reviewer.",
+                "createdAt": "2026-10-27T15:10:00Z",
+            }
+        ],
+        "statusCheckRollup": [],
+        "url": "https://github.com/flutter/flutter/pull/195400",
+        "mergeable": "MERGEABLE",
+        "reviewRequests": [{"login": "eyebrowsoffire"}],
+    })
+    with mock.patch.object(w.subprocess, "check_output", return_value=gh_json):
+      res = w.fetch_github_pr_status("195400")
+
+    self.assertFalse(res["is_self"])
+    self.assertEqual(res["role"], "reviewer")
+    self.assertFalse(res["in_my_attention"])
+    self.assertTrue(res["is_watching"])
+    self.assertEqual(res["waiting_on"], [])
+    self.assertEqual(res["phase"], "WAITING_ON_OTHERS")
+
   def test_dashboard_js_functions_render_draft_development_review_and_cq_precedence(self):
     self.assertNotIn("In review / development", w.DASHBOARD_HTML)
     script_body = w.DASHBOARD_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
@@ -398,10 +584,18 @@ const devCqRunningCl = {
 };
 const watchingCl = {
   kind: 'gerrit', target_id: '1386096', status: 'NEW', phase: 'WAITING_ON_OTHERS',
-  is_self: false, is_external: false, is_draft: false, in_development: false,
+  is_self: false, is_external: false, role: 'watching', is_draft: false, in_development: false,
   is_watching: true, merge_conflict: true, owner_email: 'jiameil@google.com',
   subject: '[agentic-review] Add starter Skia knowledge base rules',
   patchset: 5, url: 'https://example.com/1386096', cr_summary: '0', cq_status: 'CQ+1 (Dry Run)'
+};
+const reviewedColleagueCl = {
+  kind: 'gerrit', target_id: '1402416', status: 'NEW', phase: 'WAITING_ON_OTHERS',
+  is_self: false, is_external: false, role: 'reviewer (goog)', is_watching: true,
+  in_my_attention: false, is_draft: false, in_development: false,
+  owner_email: 'alexisdavidc@google.com',
+  subject: 'Reland "[SkContext] Forwarding SkGraphics calls to SkContext"',
+  patchset: 8, url: 'https://example.com/1402416', cr_summary: '+1', cq_status: '✓ Dry Run Passed'
 };
 const reviewCl = {
   kind: 'gerrit', status: 'NEW', phase: 'WAITING_ON_OTHERS',
@@ -463,6 +657,9 @@ console.log(JSON.stringify({
   devStatus: statusOf(devCl),
   devCqStatus: statusOf(devCqRunningCl),
   watchingStatus: statusOf(watchingCl),
+  reviewedColleagueStatus: statusOf(reviewedColleagueCl),
+  reviewedColleagueAuthorHtml: formatAuthorAndCl(reviewedColleagueCl),
+  reviewedColleagueNotes: statusNotesHtml(reviewedColleagueCl),
   reviewStatus: statusOf(reviewCl),
   gmailAllTrashHtml: formatGmailCell(gmailAllTrash),
   gmailMixedTrashHtml: formatGmailCell(gmailMixedTrash),
@@ -504,6 +701,9 @@ console.log(JSON.stringify({
     self.assertEqual(out["devStatus"], "dev")
     self.assertEqual(out["devCqStatus"], "cq")
     self.assertEqual(out["watchingStatus"], "watching")
+    self.assertEqual(out["reviewedColleagueStatus"], "watching")
+    self.assertIn("colleague", out["reviewedColleagueAuthorHtml"])
+    self.assertEqual(out["reviewedColleagueNotes"], "")
     self.assertEqual(out["reviewStatus"], "waiting")
     self.assertIn("(all 5 in <code>TRASH</code>)", out["gmailAllTrashHtml"])
     self.assertIn(

@@ -869,11 +869,17 @@ def fetch_gerrit_cl_status(
           for v in (d.get("attention_set") or {}).values()
       ]
       in_my_attention = any(e in SELF_EMAILS for e in att_set)
-      waiting_on = [
-          {"id": e, "active": google_account_active(e)}
-          for e in att_set
-          if e and e not in SELF_EMAILS and not e.endswith(".gserviceaccount.com")
-      ]
+      # Only my own changes track which reviewers are blocking submission
+      waiting_on = (
+          [
+              {"id": e, "active": google_account_active(e)}
+              for e in att_set
+              # Exclude self and bot accounts from reviewer ping targets
+              if e and e not in SELF_EMAILS and not e.endswith(".gserviceaccount.com")
+          ]
+          if is_self
+          else []
+      )
       # Removing yourself from reviewers records state="REMOVED" in reviewer_updates
       self_updates = [
           u
@@ -899,14 +905,13 @@ def fetch_gerrit_cl_status(
           if isinstance(r, dict)
       }
       is_reviewer = not is_self and bool(reviewer_emails & SELF_EMAILS)
-      # Changes where I am neither author nor reviewer are passive watched items
-      is_watching = not is_self and not is_reviewer and not reviewer_removed
       role = (
           "author"
           if is_self
           else (
+              # Preserve reviewer role for author-column labels even when in Watching
               "watching"
-              if is_watching
+              if (not is_reviewer and not reviewer_removed)
               else ("reviewer (ext)" if is_external else "reviewer (goog)")
           )
       )
@@ -932,14 +937,6 @@ def fetch_gerrit_cl_status(
           and not is_draft
           and not non_owner_reviewers
       )
-      # WIP and unreviewed CLs keep participants in attention_set without needing a reply
-      if is_wip or in_development:
-        in_my_attention = False
-        waiting_on = []
-      elif is_watching:
-        waiting_on = []
-      merge_conflict = status == "NEW" and not gerrit_mergeable(host, cl_id)
-
       labels = d.get("labels") or {}
       cr_votes = [
           (str(a.get("email") or ""), int(a.get("value") or 0))
@@ -954,6 +951,18 @@ def fetch_gerrit_cl_status(
       max_cr = max([v for _, v in cr_votes], default=0)
       min_cr = min([v for _, v in cr_votes], default=0)
       max_cq = max([v for _, v in cq_votes], default=0)
+      self_cr_vote = max((v for e, v in cr_votes if e in SELF_EMAILS), default=0)
+      # Once I approved a non-self CL on the current code revision, any remaining review
+      # or dry-run attention belongs to the author or second reviewer
+      if not is_self and self_cr_vote > 0:
+        in_my_attention = False
+      # WIP and unreviewed CLs keep participants in attention_set without needing a reply
+      if is_wip or in_development:
+        in_my_attention = False
+        waiting_on = []
+      # Non-self changes not currently in my attention sit in Watching
+      is_watching = not is_self and not reviewer_removed and not in_my_attention
+      merge_conflict = status == "NEW" and not gerrit_mergeable(host, cl_id)
 
       messages = d.get("messages") or []
       last_msg = messages[-1] if messages else {}
@@ -1027,7 +1036,8 @@ def fetch_gerrit_cl_status(
         )
       elif status == "ABANDONED":
         status_changed_raw = latest_timestamp(last_msg_date, updated_raw)
-      elif cq_failed and not reviewer_removed and not is_watching:
+      # Only my own changes enter the pre-submit CQ failure alert phase
+      elif cq_failed and is_self:
         status_changed_raw = cq_msg_date or latest_timestamp(
             last_msg_date, updated_raw
         )
@@ -1070,8 +1080,8 @@ def fetch_gerrit_cl_status(
         else:
           phase = "READY_TO_CLOSE"
       else:
-        # Once removed from reviewers or only watching, CQ failures belong to the author
-        if cq_failed and not reviewer_removed and not is_watching:
+        # Pre-submit CQ failures belong to the CL author
+        if cq_failed and is_self:
           phase = "ALERT_CQ_FAILED"
         elif max_cq == 2:
           phase = "SUBMITTING"
@@ -1365,8 +1375,8 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
     is_reviewer = not is_self and bool(
         set(req_logins + rev_logins + cmt_logins) & SELF_GITHUB_LOGINS
     )
-    is_watching = not is_self and not is_reviewer
-    role = "author" if is_self else ("watching" if is_watching else "reviewer")
+    # Keep reviewer role independent of is_watching so the author column labels colleagues
+    role = "author" if is_self else ("reviewer" if is_reviewer else "watching")
     # Automated bot reviews do not mean a PR has been sent to a human reviewer
     human_reviewers = [
         u
@@ -1495,6 +1505,30 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
     submitted_et, submitted_age = format_et_and_age(merged_raw)
     last_msg_et, last_msg_age = format_et_and_age(last_date)
 
+    # Check whether I already approved this non-self PR without a fresh review request
+    self_reviews = [
+        r
+        for r in reviews
+        if str((r.get("author") or {}).get("login") or "") in SELF_GITHUB_LOGINS
+        and r.get("state")
+    ]
+    self_approved = (
+        not is_self
+        and bool(self_reviews)
+        and str(self_reviews[-1].get("state") or "").upper() == "APPROVED"
+        and not (set(req_logins) & SELF_GITHUB_LOGINS)
+    )
+    in_my_attention = (
+        state == "OPEN"
+        and not is_wip
+        and not in_development
+        and (is_self or is_reviewer)
+        and not self_approved
+        and bool(last_actor)
+        and last_actor not in SELF_GITHUB_LOGINS
+    )
+    is_watching = not is_self and not in_my_attention
+
     # Map the status change date to the latest event driving the current PR phase
     if state == "MERGED":
       status_changed_raw = merged_raw or latest_timestamp(
@@ -1504,7 +1538,8 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
       status_changed_raw = latest_timestamp(
           closed_raw, last_date, updated_raw
       )
-    elif own_failed_checks and not is_watching:
+    # Only my own PRs enter the CQ failure alert phase
+    elif own_failed_checks and is_self:
       status_changed_raw = latest_timestamp(
           *failed_check_dates, last_date, updated_raw
       )
@@ -1524,17 +1559,11 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
       phase = "READY_TO_CLOSE"
     elif state == "CLOSED":
       phase = "ABANDONED"
-    # Raise a CQ alert only when checks not already broken on the tree failed
-    elif own_failed_checks and not is_watching:
+    # Raise a CQ alert only on my own PR when non-tree checks failed
+    elif own_failed_checks and is_self:
       phase = "ALERT_CQ_FAILED"
-    # Bot reviews on a draft, unreviewed, or watched PR do not require a review reply
-    elif (
-        not is_wip
-        and not in_development
-        and not is_watching
-        and last_actor
-        and last_actor not in SELF_GITHUB_LOGINS
-    ):
+    # Non-self PRs where I am not awaiting a reply stay out of NEEDS_YOUR_ACTION
+    elif in_my_attention:
       phase = "NEEDS_YOUR_ACTION"
     else:
       phase = "WAITING_ON_OTHERS"
@@ -1570,14 +1599,15 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         "tree_failed_checks": tree_failed_checks,
         "tree_red": tree_red,
         "merge_conflict": merge_conflict,
+        # Only my own PRs list reviewers blocking submission
         "waiting_on": (
-            []
-            if is_watching
-            else [
+            [
                 {"id": str(r.get("login") or r.get("name") or ""), "active": True}
                 for r in d.get("reviewRequests") or []
                 if r.get("login") or r.get("name")
             ]
+            if is_self
+            else []
         ),
         "last_msg_author": last_actor,
         "last_msg_date": last_date,
@@ -1634,7 +1664,8 @@ def fetch_piper_cl_status(cl_id: str) -> dict[str, Any]:
             if r.strip() and r.strip() != owner
         )
     is_reviewer = not is_self and "jlavrova" in reviewers
-    is_watching = not is_self and not is_reviewer
+    # Non-self Piper CLs sit in Watching while preserving reviewer role metadata
+    is_watching = not is_self
     is_open = status != "SUBMITTED"
     is_draft = is_self and is_open and bool(RE_DRAFT_SUBJECT.match(subject))
     in_development = is_self and is_open and not is_draft and not reviewers
@@ -1654,10 +1685,11 @@ def fetch_piper_cl_status(cl_id: str) -> dict[str, Any]:
         "subject": subject,
         "owner_name": owner,
         "owner_email": f"{owner}@google.com",
+        # Keep reviewer role separate from is_watching for colleague label formatting
         "role": (
             "author"
             if is_self
-            else ("watching" if is_watching else "reviewer (goog)")
+            else ("reviewer (goog)" if is_reviewer else "watching")
         ),
         "is_self": is_self,
         "is_external": False,
@@ -2041,6 +2073,8 @@ def sync_once(
           and (info["patchset"] != prev_ps or info["last_msg_date"] != prev_msg_date)
           and info["last_msg_author"] not in SELF_EMAILS
           and info["last_msg_author"] not in SELF_GITHUB_LOGINS
+          # Ignore SkCQ dry-run bot messages so they do not wake the chat for a reply
+          and not info["last_msg_author"].endswith(".gserviceaccount.com")
           and info["in_my_attention"]
       ):
         transition_msg = (
@@ -2391,7 +2425,15 @@ function esc(s) {
 
 function shortActor(raw) {
   const s = String(raw || '');
-  if (s.includes('skcq-be') || s.includes('gerritcodereview')) return 'SkCQ';
+  // Normalize CQ and Gerrit service-account bots to a single bot token
+  if (
+    s.includes('skcq-be') ||
+    s.includes('gerritcodereview') ||
+    s.endsWith('.gserviceaccount.com') ||
+    s === 'bot'
+  ) {
+    return 'SkCQ';
+  }
   if (s.endsWith('@google.com')) return s.replace('@google.com', '@');
   if (s.endsWith('@chromium.org')) return s.replace('@chromium.org', '@chromium');
   return s;
@@ -2488,7 +2530,8 @@ function formatAuthorAndCl(it) {
   let roleDesc = '';
   if (it.is_self) {
     roleDesc = `${who} — your CL`;
-  } else if (it.is_watching) {
+  // Check role so reviewed colleague CLs in Watching still display colleague/external
+  } else if (it.role === 'watching') {
     roleDesc = `${who} — watching`;
   } else if (it.is_external) {
     roleDesc = `${who} — external author`;
@@ -2587,7 +2630,8 @@ function statusCoreHtml(it) {
   const statusHtml = link(it.url, `<code>${esc(badgeLabel)}</code>`);
   const cqHtml = link(checksUrl(it), esc(it.cq_status));
   const snippetHtml = link(it.url, esc(it.last_msg_snippet));
-  if (it.cq_failed && !it.is_watching) {
+  // Show the red CQ failure header only on my own changes
+  if (it.cq_failed && it.is_self) {
     const ts = formatStatusTime(it);
     const tsPart = ts ? ` (${ts})` : '';
     return `🔴 <strong>${statusHtml} (${ps} · ${cqHtml})</strong>` +
@@ -2633,11 +2677,12 @@ function statusCoreHtml(it) {
 }
 
 // One predicate drives both the ⚡ badge and the sort, so the top rows are exactly the
-// ⚡ ones. A bot message on my own CL keeps me in the attention set but asks nothing
+// ⚡ ones
 function needsMyReply(it) {
-  return Boolean(it.in_my_attention) && !it.cq_failed && it.phase !== 'SUBMITTING' &&
-    !it.is_draft && !it.in_development &&
-    !(it.is_self && shortActor(it.last_msg_author) === 'SkCQ');
+  return Boolean(it.in_my_attention) && !(it.cq_failed && it.is_self) &&
+    it.phase !== 'SUBMITTING' && !it.is_draft && !it.in_development &&
+    // A bot message keeps a participant in the attention set but asks nothing
+    shortActor(it.last_msg_author) !== 'SkCQ';
 }
 
 // Merged CLs older than this are chats left open after the work ended
