@@ -16,6 +16,7 @@ import fcntl
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -776,6 +777,522 @@ def show(project_id: str, show_all: bool = False) -> str:
   return render(load(project_id), show_all=show_all)
 
 
+def _is_ignored_internal_path(path: str) -> bool:
+  if not path:
+    return True
+  clean = os.path.realpath(os.path.expanduser(path.strip().strip('"').strip("'")))
+  from context_guard import app_data_dir_from_path
+
+  if app_data_dir_from_path(clean):
+    return True
+  norm = clean.replace("\\", "/")
+  if any(
+      seg in norm
+      for seg in (
+          "/.gemini/config/roadmaps/",
+          "/.gemini/config/logs/",
+          "/.gemini/config/projects/",
+      )
+  ):
+    return True
+  base = os.path.basename(clean)
+  if base.startswith((".cross_project_", ".parallel_chat_", ".context_guard_")):
+    return True
+  if norm.startswith("/tmp/jetski_") or norm.startswith("/tmp/handoff_summary"):
+    return True
+  return False
+
+
+def _find_transcript_path(conv_id: str, transcript_path: str = "") -> str:
+  if transcript_path and os.path.isfile(transcript_path):
+    return os.path.realpath(transcript_path)
+  env_p = os.environ.get("JETSKI_TRANSCRIPT_PATH", "").strip()
+  if env_p and os.path.isfile(env_p):
+    return os.path.realpath(env_p)
+  if not conv_id:
+    return ""
+  for ad in find_app_data_dirs():
+    cand = os.path.join(
+        ad, "brain", conv_id, ".system_generated", "logs", "transcript.jsonl"
+    )
+    if os.path.isfile(cand):
+      return os.path.realpath(cand)
+  return ""
+
+
+def _collect_chat_vcs_inputs(
+    conv_id: str, project_id: str, transcript_path: str
+) -> tuple[set[str], list[str], list[str]]:
+  from pre_tool_guard import (
+      EDIT_TOOLS,
+      _analyze_git_add_args,
+      _analyze_git_commit_args,
+      _extract_cmd_target_dirs,
+      _parse_git_subcommand_invocations,
+      get_tool_target_file,
+      strip_heredocs,
+  )
+  from stop_guard import is_inspection_command
+
+  own_touched_files: set[str] = set()
+  candidate_dirs: list[str] = []
+  non_inspection_cmds: list[str] = []
+
+  if transcript_path and os.path.isfile(transcript_path):
+    try:
+      with open(transcript_path, "r", encoding="utf-8") as f:
+        for line in f:
+          if not line.strip() or "PLANNER_RESPONSE" not in line:
+            continue
+          try:
+            obj = json.loads(line)
+          except Exception:
+            continue
+          if obj.get("type") != "PLANNER_RESPONSE":
+            continue
+          for tc in obj.get("tool_calls") or []:
+            tname = tc.get("name", "")
+            targs = tc.get("args") or {}
+            if tname in EDIT_TOOLS:
+              tf = get_tool_target_file(targs)
+              if tf and not _is_ignored_internal_path(tf):
+                p = os.path.realpath(os.path.expanduser(tf.strip().strip('"').strip("'")))
+                own_touched_files.add(p)
+                candidate_dirs.append(os.path.dirname(p))
+            elif tname == "run_command":
+              cmd = str(targs.get("CommandLine", "")).strip()
+              if not cmd or is_inspection_command(cmd):
+                continue
+              cmd_clean = strip_heredocs(cmd)
+              if re.search(
+                  r"^(?:python3?\s+)?(?:\S*/)?(?:roadmap|chat_lifecycle)\.py\b",
+                  cmd_clean.strip(),
+              ):
+                continue
+              non_inspection_cmds.append(cmd)
+              for d in _extract_cmd_target_dirs(cmd, []):
+                if d and not _is_ignored_internal_path(d) and os.path.isdir(d):
+                  candidate_dirs.append(os.path.realpath(d))
+              for a_args in _parse_git_subcommand_invocations(cmd, "add"):
+                _, paths = _analyze_git_add_args(a_args)
+                for p in paths:
+                  if not os.path.isabs(p):
+                    for cd in reversed(candidate_dirs):
+                      cand_p = os.path.join(cd, p)
+                      if os.path.exists(cand_p):
+                        p = cand_p
+                        break
+                  if os.path.isabs(p) and not _is_ignored_internal_path(p):
+                    own_touched_files.add(os.path.realpath(p))
+              for c_args in _parse_git_subcommand_invocations(cmd, "commit"):
+                _, paths = _analyze_git_commit_args(c_args)
+                for p in paths:
+                  if not os.path.isabs(p):
+                    for cd in reversed(candidate_dirs):
+                      cand_p = os.path.join(cd, p)
+                      if os.path.exists(cand_p):
+                        p = cand_p
+                        break
+                  if os.path.isabs(p) and not _is_ignored_internal_path(p):
+                    own_touched_files.add(os.path.realpath(p))
+    except Exception:
+      pass
+
+  if project_id and conv_id:
+    try:
+      sf = state_path(project_id, conv_id)
+      if os.path.isfile(sf):
+        with open(sf, "r", encoding="utf-8", errors="ignore") as f:
+          txt = f.read()
+        mod_idx = txt.find("### Files Modified by Tools in This Conversation")
+        if mod_idx >= 0:
+          mod_end = txt.find("\n### ", mod_idx + 10)
+          mod_chunk = txt[mod_idx : mod_end if mod_end >= 0 else len(txt)]
+          for m in re.findall(r"file://(/[^\s`\"')#]+)", mod_chunk):
+            if not _is_ignored_internal_path(m) and os.path.exists(m):
+              rm = os.path.realpath(m)
+              own_touched_files.add(rm)
+              candidate_dirs.append(os.path.dirname(rm))
+        for gm in re.findall(r"### Git Status in `([^`]+)`", txt):
+          clean_g = os.path.realpath(os.path.expanduser(gm.strip()))
+          if os.path.isdir(clean_g) and not _is_ignored_internal_path(clean_g):
+            candidate_dirs.append(clean_g)
+    except Exception:
+      pass
+
+  if os.environ.get("JETSKI_VCS_BATON_REPOS"):
+    for part in os.environ["JETSKI_VCS_BATON_REPOS"].split(":"):
+      if part.strip():
+        rp = os.path.realpath(os.path.expanduser(part.strip()))
+        if os.path.isdir(rp):
+          candidate_dirs.append(rp)
+
+  return own_touched_files, candidate_dirs, non_inspection_cmds
+
+
+def _inspect_repo_vcs_baton(
+    top_level: str,
+    git_dir: str,
+    git_common_dir: str,
+    conv_id: str,
+    transcript_path: str,
+    own_touched_files: set[str],
+    non_inspection_cmds: list[str],
+) -> str:
+  from pre_tool_guard import _active_foreign_file_leases, _sync_repo_commits
+
+  reg = _sync_repo_commits(top_level, git_common_dir)
+  own_touched_rels = {
+      os.path.relpath(p, top_level)
+      for p in own_touched_files
+      if p == top_level or p.startswith(top_level + os.sep)
+  }
+  lease_file = os.path.join(git_dir, "jetski_file_leases.json")
+  if os.path.isfile(lease_file):
+    try:
+      with open(lease_file, "r", encoding="utf-8") as f:
+        ldata = json.load(f)
+      for rel, info in (ldata.get("files") or {}).items():
+        if isinstance(info, dict) and info.get("conv_id") == conv_id:
+          own_touched_rels.add(rel)
+    except Exception:
+      pass
+
+  foreign_leased = _active_foreign_file_leases(git_dir, conv_id, transcript_path)
+  own_dirty: list[str] = []
+  foreign_dirty: list[str] = []
+
+  try:
+    st_res = subprocess.run(
+        ["git", "-C", top_level, "status", "--porcelain", "-uall"],
+        capture_output=True,
+        text=True,
+        timeout=2.0,
+        check=False,
+    )
+    if st_res.returncode == 0:
+      for ln in st_res.stdout.splitlines():
+        if len(ln) > 3:
+          raw_p = ln[3:].strip().split(" -> ")[-1].strip('"')
+          if not raw_p or _is_ignored_internal_path(os.path.join(top_level, raw_p)):
+            continue
+          if raw_p in own_touched_rels:
+            own_dirty.append(raw_p)
+          elif raw_p not in foreign_leased and any(
+              raw_p in c or (len(os.path.basename(raw_p)) >= 4 and os.path.basename(raw_p) in c)
+              for c in non_inspection_cmds
+          ):
+            own_dirty.append(raw_p)
+            own_touched_rels.add(raw_p)
+          else:
+            foreign_dirty.append(raw_p)
+  except Exception:
+    pass
+
+  branch = "HEAD"
+  try:
+    b_res = subprocess.run(
+        ["git", "-C", top_level, "symbolic-ref", "--short", "-q", "HEAD"],
+        capture_output=True,
+        text=True,
+        timeout=1.0,
+        check=False,
+    )
+    if b_res.returncode == 0 and b_res.stdout.strip():
+      branch = b_res.stdout.strip()
+  except Exception:
+    pass
+
+  head_sha = ""
+  try:
+    h_res = subprocess.run(
+        ["git", "-C", top_level, "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        timeout=1.0,
+        check=False,
+    )
+    if h_res.returncode == 0:
+      head_sha = h_res.stdout.strip()
+  except Exception:
+    pass
+  head_short = head_sha[:7] if head_sha else "unknown"
+
+  cfg: dict[str, str] = {}
+  try:
+    c_res = subprocess.run(
+        ["git", "-C", top_level, "config", "--local", "-l"],
+        capture_output=True,
+        text=True,
+        timeout=1.0,
+        check=False,
+    )
+    if c_res.returncode == 0:
+      for ln in c_res.stdout.splitlines():
+        if "=" in ln:
+          k, v = ln.split("=", 1)
+          cfg[k.strip().lower()] = v.strip()
+  except Exception:
+    pass
+
+  is_gerrit = (
+      cfg.get("gerrit.host", "").lower() == "true"
+      or "googlesource.com" in cfg.get("remote.origin.url", "").lower()
+      or bool(
+          cfg.get(f"branch.{branch}.gerritissue")
+          or cfg.get(f"branch.{branch}.gerritserver")
+      )
+  )
+
+  upstream_ref = ""
+  try:
+    u_res = subprocess.run(
+        ["git", "-C", top_level, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        capture_output=True,
+        text=True,
+        timeout=1.0,
+        check=False,
+    )
+    if u_res.returncode == 0 and u_res.stdout.strip():
+      upstream_ref = u_res.stdout.strip()
+  except Exception:
+    pass
+
+  if not upstream_ref and branch != "HEAD":
+    try:
+      r_res = subprocess.run(
+          ["git", "-C", top_level, "rev-parse", "--verify", f"refs/remotes/origin/{branch}"],
+          capture_output=True,
+          text=True,
+          timeout=1.0,
+          check=False,
+      )
+      if r_res.returncode == 0:
+        upstream_ref = f"origin/{branch}"
+    except Exception:
+      pass
+
+  if not upstream_ref:
+    base_up = cfg.get(f"branch.{branch}.base-upstream", "")
+    if base_up:
+      upstream_ref = base_up.replace("refs/remotes/", "")
+
+  if not upstream_ref:
+    for cand in ("origin/main", "origin/master"):
+      try:
+        cand_res = subprocess.run(
+            ["git", "-C", top_level, "rev-parse", "--verify", f"refs/remotes/{cand}"],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            check=False,
+        )
+        if cand_res.returncode == 0:
+          upstream_ref = cand
+          break
+      except Exception:
+        pass
+
+  own_unpushed: list[tuple[str, str]] = []
+  foreign_unpushed: list[tuple[str, str]] = []
+  if upstream_ref and head_sha:
+    try:
+      log_res = subprocess.run(
+          ["git", "-C", top_level, "log", "--format=%H%x00%s", f"{upstream_ref}..HEAD"],
+          capture_output=True,
+          text=True,
+          timeout=1.5,
+          check=False,
+      )
+      if log_res.returncode == 0:
+        commits_map = reg.get("commits") or {}
+        for ln in log_res.stdout.splitlines():
+          if "\x00" not in ln:
+            continue
+          sha, subj = [x.strip() for x in ln.split("\x00", 1)]
+          if not sha:
+            continue
+          cinfo = commits_map.get(sha)
+          if isinstance(cinfo, dict):
+            owner = str(cinfo.get("conv_id") or "")
+            if owner == conv_id:
+              own_unpushed.append((sha, subj))
+            elif owner:
+              foreign_unpushed.append((sha, subj))
+            else:
+              own_unpushed.append((sha, subj))
+          elif foreign_leased:
+            dt_res = subprocess.run(
+                ["git", "-C", top_level, "diff-tree", "--no-commit-id", "--name-only", "-r", sha],
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+                check=False,
+            )
+            c_files = (
+                [x.strip() for x in dt_res.stdout.splitlines() if x.strip()]
+                if dt_res.returncode == 0
+                else []
+            )
+            if c_files and all(f in foreign_leased for f in c_files) and not any(
+                f in own_touched_rels for f in c_files
+            ):
+              foreign_unpushed.append((sha, subj))
+            else:
+              own_unpushed.append((sha, subj))
+          else:
+            own_unpushed.append((sha, subj))
+    except Exception:
+      pass
+
+  if is_gerrit:
+    issue = cfg.get(f"branch.{branch}.gerritissue", "").strip()
+    patchset = cfg.get(f"branch.{branch}.gerritpatchset", "").strip()
+    last_upload = cfg.get(f"branch.{branch}.last-upload-hash", "").strip()
+    ps_label = f" PS {patchset}" if patchset else ""
+    cl_label = f"cl/{issue}{ps_label}" if issue else ""
+    is_uploaded = bool(issue and ((not last_upload) or (last_upload == head_sha)))
+    if issue:
+      if is_uploaded:
+        gerrit_str = f"{cl_label} (HEAD {head_short} uploaded)"
+      else:
+        gerrit_str = f"{cl_label} (stale: HEAD {head_short} != uploaded {last_upload[:7]})"
+    else:
+      if own_unpushed or own_dirty:
+        gerrit_str = "not uploaded"
+      else:
+        gerrit_str = f"none (HEAD {head_short})"
+
+    if issue and is_uploaded:
+      unpushed_str = f"uploaded to {cl_label}"
+      is_pending = bool(own_dirty)
+    else:
+      unpushed_str = (
+          ", ".join(f'{s[:7]} ("{subj}")' for s, subj in own_unpushed[:3])
+          if own_unpushed
+          else "none"
+      )
+      is_pending = bool(own_dirty or own_unpushed or (issue and not is_uploaded))
+
+    if is_pending:
+      action_str = (
+          'call ask_question ("Commit + push" / "Commit only" / "Not now"; '
+          'Gerrit = amnesia-precommit + corpus gate + git cl upload, never CQ)'
+      )
+    else:
+      action_str = f"report {cl_label or head_short} ({head_short}) to user"
+
+  else:
+    gerrit_str = "n/a"
+    unpushed_str = (
+        ", ".join(f'{s[:7]} ("{subj}")' for s, subj in own_unpushed[:3])
+        if own_unpushed
+        else f"none ({head_short} → {upstream_ref or 'local'})"
+    )
+    is_pending = bool(own_dirty or own_unpushed)
+    if is_pending:
+      action_str = 'call ask_question ("Commit + push" / "Commit only" / "Not now")'
+    else:
+      action_str = f"report {head_short} → {upstream_ref or 'local'} to user"
+
+  status_word = "PENDING" if is_pending else "CLEAN"
+  own_str = ", ".join(own_dirty[:8]) if own_dirty else "none"
+  foreign_str = ", ".join(foreign_dirty[:8]) if foreign_dirty else "none"
+  return (
+      f"[VCS BATON: {status_word} — repo={top_level}; own_dirty={own_str}; "
+      f"foreign_dirty={foreign_str}; unpushed={unpushed_str}; gerrit={gerrit_str}; "
+      f"action: {action_str}]"
+  )
+
+
+def evaluate_vcs_baton(
+    conv_id: str, project_id: str = "", transcript_path: str = ""
+) -> str:
+  tpath = _find_transcript_path(conv_id, transcript_path)
+  pid = project_id or (project_id_for(conv_id) if conv_id else "")
+  own_touched_files, candidate_dirs, non_inspection_cmds = _collect_chat_vcs_inputs(
+      conv_id, pid, tpath
+  )
+
+  from pre_tool_guard import _resolve_git_dirs
+
+  seen_tops: set[str] = set()
+  resolved_repos: list[tuple[str, str, str]] = []
+  for d in candidate_dirs:
+    info = _resolve_git_dirs(d)
+    if info and info[0] not in seen_tops:
+      seen_tops.add(info[0])
+      resolved_repos.append(info)
+
+  env_repos = set()
+  if os.environ.get("JETSKI_VCS_BATON_REPOS"):
+    for part in os.environ["JETSKI_VCS_BATON_REPOS"].split(":"):
+      if part.strip():
+        env_repos.add(os.path.realpath(os.path.expanduser(part.strip())))
+
+  touched_repos: list[tuple[str, str, str]] = []
+  for top_level, git_dir, git_common_dir in resolved_repos:
+    if top_level in env_repos:
+      touched_repos.append((top_level, git_dir, git_common_dir))
+      continue
+    if any(p == top_level or p.startswith(top_level + os.sep) for p in own_touched_files):
+      touched_repos.append((top_level, git_dir, git_common_dir))
+      continue
+    lease_file = os.path.join(git_dir, "jetski_file_leases.json")
+    if os.path.isfile(lease_file):
+      try:
+        with open(lease_file, "r", encoding="utf-8") as f:
+          ldata = json.load(f)
+        if any(
+            isinstance(v, dict) and v.get("conv_id") == conv_id
+            for v in (ldata.get("files") or {}).values()
+        ):
+          touched_repos.append((top_level, git_dir, git_common_dir))
+          continue
+      except Exception:
+        pass
+    wt_lease = os.path.join(git_dir, "jetski_lease.json")
+    if os.path.isfile(wt_lease):
+      try:
+        with open(wt_lease, "r", encoding="utf-8") as f:
+          wdata = json.load(f)
+        if wdata.get("conv_id") == conv_id:
+          touched_repos.append((top_level, git_dir, git_common_dir))
+          continue
+      except Exception:
+        pass
+    commits_file = os.path.join(git_common_dir, "jetski_commits.json")
+    if os.path.isfile(commits_file):
+      try:
+        with open(commits_file, "r", encoding="utf-8") as f:
+          cdata = json.load(f)
+        if any(
+            isinstance(v, dict) and v.get("conv_id") == conv_id and v.get("repo") == top_level
+            for v in (cdata.get("commits") or {}).values()
+        ):
+          touched_repos.append((top_level, git_dir, git_common_dir))
+          continue
+      except Exception:
+        pass
+
+  if not touched_repos:
+    return "[VCS BATON: CLEAN — no git repositories touched in this chat]"
+
+  lines = [
+      _inspect_repo_vcs_baton(
+          top_level,
+          git_dir,
+          git_common_dir,
+          conv_id,
+          tpath,
+          own_touched_files,
+          non_inspection_cmds,
+      )
+      for top_level, git_dir, git_common_dir in touched_repos
+  ]
+  return "\n".join(lines)
+
+
 def _cli(argv: list[str]) -> int:
   if not argv or argv[0] in ("-h", "--help", "help"):
     print(USAGE, end="")
@@ -791,6 +1308,10 @@ def _cli(argv: list[str]) -> int:
     if warning:
       print(warning, file=sys.stderr)
     print(msg)
+    if args[2] == "done":
+      vcs_notice = evaluate_vcs_baton(args[0], pid)
+      if vcs_notice:
+        print(vcs_notice)
     if baton_notice:
       print(baton_notice)
   elif cmd == "link" and len(args) == 3:

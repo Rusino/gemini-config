@@ -791,6 +791,147 @@ class TestStopGuard(unittest.TestCase):
       self.assertEqual(res.get("decision"), "continue")
       self.assertIn("[VERIFICATION GUARD]", res.get("reason", ""))
 
+  def test_vcs_baton_pending_blocks_stop_once_per_turn_without_ask_question(self):
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl") as f_trans, \
+         tempfile.TemporaryDirectory() as tmp_dir:
+      steps = [
+          {"step_index": 1, "type": "USER_INPUT", "content": "finish task"},
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {"CommandLine": "python3 ~/.gemini/config/hooks/roadmap.py set c1 R1 done"},
+              }],
+          },
+          {
+              "step_index": 3,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": (
+                  "The command exited with code 0.\n"
+                  "R1 done: Task 1\n"
+                  "[VCS BATON: PENDING — repo=/work/repo; own_dirty=foo.py; foreign_dirty=none; "
+                  "unpushed=none; gerrit=n/a; action: call ask_question]\n"
+                  "[NEXT-TASK BATON: YOURS — propose R2]\n"
+              ),
+          },
+      ]
+      for s in steps:
+        f_trans.write(json.dumps(s) + "\n")
+      f_trans.flush()
+      data = {
+          "conversationId": "c1",
+          "transcriptPath": f_trans.name,
+          "artifactDirectoryPath": tmp_dir,
+          "fullyIdle": True,
+          "terminationReason": "NO_TOOL_CALL",
+      }
+      with patch("sys.stdin", io.StringIO(json.dumps(data))), \
+           patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+        stop_guard.main()
+      res = json.loads(mock_out.getvalue())
+      self.assertEqual(res.get("decision"), "continue")
+      self.assertIn("[VCS BATON GUARD]", res.get("reason", ""))
+      self.assertIn("own_dirty=foo.py", res.get("reason", ""))
+
+      # Second stop call in same user turn allows stop
+      with patch("sys.stdin", io.StringIO(json.dumps(data))), \
+           patch("sys.stdout", new_callable=io.StringIO) as mock_out, \
+           patch.object(stop_guard, "play_stop_sound"):
+        stop_guard.main()
+      self.assertEqual(json.loads(mock_out.getvalue()), {})
+
+  def test_vcs_baton_pending_allows_stop_when_ask_question_called(self):
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl") as f_trans, \
+         tempfile.TemporaryDirectory() as tmp_dir:
+      steps = [
+          {"step_index": 1, "type": "USER_INPUT", "content": "finish task"},
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [
+                  {
+                      "name": "run_command",
+                      "args": {"CommandLine": "python3 ~/.gemini/config/hooks/roadmap.py set c1 R1 done"},
+                  },
+                  {
+                      "name": "ask_question",
+                      "args": {
+                          "questions": [{
+                              "question": "Commit and push?",
+                              "options": ["(Recommended) Commit + push", "Commit only", "Not now"],
+                          }]
+                      },
+                  },
+              ],
+          },
+          {
+              "step_index": 3,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": (
+                  "The command exited with code 0.\n"
+                  "[VCS BATON: PENDING — repo=/work/repo; own_dirty=foo.py; action: call ask_question]\n"
+              ),
+          },
+      ]
+      for s in steps:
+        f_trans.write(json.dumps(s) + "\n")
+      f_trans.flush()
+      data = {
+          "conversationId": "c1",
+          "transcriptPath": f_trans.name,
+          "artifactDirectoryPath": tmp_dir,
+          "fullyIdle": True,
+          "terminationReason": "NO_TOOL_CALL",
+      }
+      with patch("sys.stdin", io.StringIO(json.dumps(data))), \
+           patch("sys.stdout", new_callable=io.StringIO) as mock_out, \
+           patch.object(stop_guard, "play_stop_sound"):
+        stop_guard.main()
+      self.assertEqual(json.loads(mock_out.getvalue()), {})
+
+  def test_vcs_baton_clean_allows_stop(self):
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl") as f_trans, \
+         tempfile.TemporaryDirectory() as tmp_dir:
+      steps = [
+          {"step_index": 1, "type": "USER_INPUT", "content": "finish task"},
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {"CommandLine": "python3 ~/.gemini/config/hooks/roadmap.py set c1 R1 done"},
+              }],
+          },
+          {
+              "step_index": 3,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": (
+                  "The command exited with code 0.\n"
+                  "R1 done: Task 1\n"
+                  "[VCS BATON: CLEAN — repo=/work/repo; own_dirty=none; unpushed=none; action: report]\n"
+              ),
+          },
+      ]
+      for s in steps:
+        f_trans.write(json.dumps(s) + "\n")
+      f_trans.flush()
+      data = {
+          "conversationId": "c1",
+          "transcriptPath": f_trans.name,
+          "artifactDirectoryPath": tmp_dir,
+          "fullyIdle": True,
+          "terminationReason": "NO_TOOL_CALL",
+      }
+      with patch("sys.stdin", io.StringIO(json.dumps(data))), \
+           patch("sys.stdout", new_callable=io.StringIO) as mock_out, \
+           patch.object(stop_guard, "play_stop_sound"):
+        stop_guard.main()
+      self.assertEqual(json.loads(mock_out.getvalue()), {})
+
 
 if __name__ == "__main__":
   unittest.main()

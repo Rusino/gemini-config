@@ -553,6 +553,148 @@ class TestRoadmap(unittest.TestCase):
           os.path.isfile(os.path.join(app_dir, "brain", roadmap.ROADMAP_INDEX_FILE_NAME))
       )
 
+  def test_evaluate_vcs_baton_no_repos_touched(self):
+    self.assertEqual(
+        roadmap.evaluate_vcs_baton("c1", "p1"),
+        "[VCS BATON: CLEAN — no git repositories touched in this chat]",
+    )
+
+  def test_evaluate_vcs_baton_own_dirty_vs_foreign_and_unpushed(self):
+    repo_dir = os.path.join(self.tmp.name, "my_repo")
+    remote_dir = os.path.join(self.tmp.name, "remote_repo.git")
+    subprocess.run(["git", "init", "--bare", remote_dir], check=True, capture_output=True)
+    subprocess.run(["git", "init", repo_dir], check=True, capture_output=True)
+    subprocess.run(["git", "-C", repo_dir, "config", "user.name", "Tester"], check=True)
+    subprocess.run(["git", "-C", repo_dir, "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", repo_dir, "remote", "add", "origin", remote_dir], check=True)
+
+    # Initial commit pushed to origin/main
+    f_init = os.path.join(repo_dir, "init.txt")
+    with open(f_init, "w") as f:
+      f.write("base")
+    subprocess.run(["git", "-C", repo_dir, "add", "init.txt"], check=True)
+    subprocess.run(["git", "-C", repo_dir, "commit", "-m", "init"], check=True)
+    subprocess.run(["git", "-C", repo_dir, "branch", "-M", "main"], check=True)
+    subprocess.run(["git", "-C", repo_dir, "push", "-u", "origin", "main"], check=True)
+
+    # Create file_a (own touched) and file_b (foreign dirty)
+    f_a = os.path.join(repo_dir, "file_a.py")
+    f_b = os.path.join(repo_dir, "file_b.py")
+    with open(f_a, "w") as f:
+      f.write("print('a')")
+    with open(f_b, "w") as f:
+      f.write("print('b')")
+
+    tpath = os.path.join(self.tmp.name, "transcript.jsonl")
+    steps = [
+        {"step_index": 1, "type": "USER_INPUT", "content": "do work"},
+        {
+            "step_index": 2,
+            "type": "PLANNER_RESPONSE",
+            "tool_calls": [
+                {"name": "write_file", "args": {"Path": f_a}},
+            ],
+        },
+    ]
+    with open(tpath, "w", encoding="utf-8") as f:
+      for s in steps:
+        f.write(json.dumps(s) + "\n")
+
+    out = roadmap.evaluate_vcs_baton("c1", "p1", transcript_path=tpath)
+    self.assertIn("[VCS BATON: PENDING", out)
+    self.assertIn("own_dirty=file_a.py", out)
+    self.assertIn("foreign_dirty=file_b.py", out)
+    self.assertIn("action: call ask_question", out)
+
+    # Commit only file_a (unpushed)
+    subprocess.run(["git", "-C", repo_dir, "add", "file_a.py"], check=True)
+    subprocess.run(["git", "-C", repo_dir, "commit", "-m", "add a", "--", "file_a.py"], check=True)
+    out2 = roadmap.evaluate_vcs_baton("c1", "p1", transcript_path=tpath)
+    self.assertIn("[VCS BATON: PENDING", out2)
+    self.assertIn("own_dirty=none", out2)
+    self.assertIn("foreign_dirty=file_b.py", out2)
+    self.assertIn("unpushed=", out2)
+    self.assertIn("add a", out2)
+
+    # Push file_a commit -> CLEAN
+    subprocess.run(["git", "-C", repo_dir, "push"], check=True)
+    out3 = roadmap.evaluate_vcs_baton("c1", "p1", transcript_path=tpath)
+    self.assertIn("[VCS BATON: CLEAN", out3)
+    self.assertIn("own_dirty=none", out3)
+    self.assertIn("foreign_dirty=file_b.py", out3)
+    self.assertIn("unpushed=none", out3)
+    self.assertIn("action: report", out3)
+
+  def test_evaluate_vcs_baton_gerrit_upload_states(self):
+    repo_dir = os.path.join(self.tmp.name, "gerrit_repo")
+    remote_dir = os.path.join(self.tmp.name, "gerrit_remote.git")
+    subprocess.run(["git", "init", "--bare", remote_dir], check=True, capture_output=True)
+    subprocess.run(["git", "init", repo_dir], check=True, capture_output=True)
+    subprocess.run(["git", "-C", repo_dir, "config", "user.name", "Tester"], check=True)
+    subprocess.run(["git", "-C", repo_dir, "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", repo_dir, "config", "gerrit.host", "true"], check=True)
+    subprocess.run(["git", "-C", repo_dir, "remote", "add", "origin", remote_dir], check=True)
+
+    f_init = os.path.join(repo_dir, "init.txt")
+    with open(f_init, "w") as f:
+      f.write("base")
+    subprocess.run(["git", "-C", repo_dir, "add", "init.txt"], check=True)
+    subprocess.run(["git", "-C", repo_dir, "commit", "-m", "init"], check=True)
+    subprocess.run(["git", "-C", repo_dir, "branch", "-M", "main"], check=True)
+    subprocess.run(["git", "-C", repo_dir, "push", "-u", "origin", "main"], check=True)
+
+    subprocess.run(["git", "-C", repo_dir, "checkout", "-b", "cl-fix"], check=True)
+    f_fix = os.path.join(repo_dir, "fix.cpp")
+    with open(f_fix, "w") as f:
+      f.write("void fix() {}")
+    subprocess.run(["git", "-C", repo_dir, "add", "fix.cpp"], check=True)
+    subprocess.run(["git", "-C", repo_dir, "commit", "-m", "fix bug"], check=True)
+    head_sha = subprocess.check_output(
+        ["git", "-C", repo_dir, "rev-parse", "HEAD"], text=True
+    ).strip()
+
+    tpath = os.path.join(self.tmp.name, "transcript_gerrit.jsonl")
+    steps = [
+        {"step_index": 1, "type": "USER_INPUT", "content": "fix bug"},
+        {
+            "step_index": 2,
+            "type": "PLANNER_RESPONSE",
+            "tool_calls": [{"name": "write_file", "args": {"Path": f_fix}}],
+        },
+    ]
+    with open(tpath, "w", encoding="utf-8") as f:
+      for s in steps:
+        f.write(json.dumps(s) + "\n")
+
+    # Not uploaded yet -> PENDING
+    out1 = roadmap.evaluate_vcs_baton("c1", "p1", transcript_path=tpath)
+    self.assertIn("[VCS BATON: PENDING", out1)
+    self.assertIn("gerrit=not uploaded", out1)
+    self.assertIn("amnesia-precommit", out1)
+
+    # Set gerritissue with matching last-upload-hash -> CLEAN
+    subprocess.run(
+        ["git", "-C", repo_dir, "config", "branch.cl-fix.gerritissue", "1409999"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", repo_dir, "config", "branch.cl-fix.gerritpatchset", "1"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", repo_dir, "config", "branch.cl-fix.last-upload-hash", head_sha], check=True
+    )
+    out2 = roadmap.evaluate_vcs_baton("c1", "p1", transcript_path=tpath)
+    self.assertIn("[VCS BATON: CLEAN", out2)
+    self.assertIn("cl/1409999 PS 1", out2)
+    self.assertIn("uploaded", out2)
+
+    # Make another commit so upload is stale -> PENDING
+    with open(f_fix, "a") as f:
+      f.write("\n// extra")
+    subprocess.run(["git", "-C", repo_dir, "commit", "-am", "extra"], check=True)
+    out3 = roadmap.evaluate_vcs_baton("c1", "p1", transcript_path=tpath)
+    self.assertIn("[VCS BATON: PENDING", out3)
+    self.assertIn("stale", out3)
+
 
 if __name__ == "__main__":
   unittest.main()

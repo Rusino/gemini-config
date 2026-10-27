@@ -16,6 +16,7 @@ Checks the current turn in transcript.jsonl:
 import json
 import os
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -216,6 +217,31 @@ def _invokes_script_in_cmd(cmd: str, script_name: str) -> bool:
     ):
       continue
     return True
+  return False
+
+
+# Detect roadmap.py set ... done invocations outside heredocs and read-only grep/echo
+def is_roadmap_set_done_command(cmd: str) -> bool:
+  from pre_tool_guard import _clean_cmd_token, strip_heredocs
+
+  cmd_code = strip_heredocs(cmd)
+  for seg in re.split(r"&&|\|\||;|\n", cmd_code):
+    seg = seg.strip()
+    if not seg or "roadmap" not in seg:
+      continue
+    if re.match(r"^(?:grep|egrep|fgrep|rg|echo|cat)\b", seg):
+      continue
+    try:
+      tokens = shlex.split(seg, posix=True)
+    except ValueError:
+      tokens = seg.split()
+    for i, tok in enumerate(tokens):
+      if _clean_cmd_token(tok) == "roadmap.py":
+        rest = tokens[i + 1 :]
+        if len(rest) >= 4 and rest[0] == "set" and rest[3] == "done":
+          return True
+        if len(rest) == 3 and rest[0] == "set" and rest[2] == "done":
+          return True
   return False
 
 
@@ -503,9 +529,13 @@ def analyze_current_turn(transcript_path: str) -> dict:
   last_edited_file = ""
   last_cmd_idx = -1
   last_cmd_exit_code = None
-  pending_cmds: list[tuple[int, bool, bool]] = []
+  pending_cmds: list[tuple[int, bool, bool, bool, bool]] = []
   launched_new_conv = False
   scheduled_timer = False
+  asked_question = False
+  roadmap_done_idx = -1
+  vcs_baton_lines: list[str] = []
+  git_publish_after_done = False
 
   for idx in ordered_indices:
     if idx <= last_user_idx:
@@ -519,9 +549,9 @@ def analyze_current_turn(transcript_path: str) -> dict:
       for tc in tool_calls:
         tname = tc.get("name", "")
         targs = tc.get("args") or {}
-        # Only recurring cron schedules promote the title marker to ⏳;
-        # one-shot duration timers are in-turn waits handled by notFullyIdle
-        if tname == "schedule" and bool(targs.get("CronExpression")):
+        if tname == "ask_question":
+          asked_question = True
+        elif tname == "schedule" and bool(targs.get("CronExpression")):
           scheduled_timer = True
         elif (
             tname == "manage_task"
@@ -537,10 +567,17 @@ def analyze_current_turn(transcript_path: str) -> dict:
           cmd = str(targs.get("CommandLine", ""))
           is_handoff = is_handoff_launch_command(cmd)
           is_cli = is_chat_lifecycle_handoff_command(cmd) if is_handoff else False
-          if not is_handoff and is_inspection_command(cmd):
+          is_rm_done = is_roadmap_set_done_command(cmd)
+          is_git_pub = bool(
+              re.search(
+                  r"\b(?:git(?:\s+(?:-[Cc]\s+\S+|--[a-z-]+(?:=\S+)?))*\s+(?:push|commit|cl\s+upload)|gh\s+pr\s+create)\b",
+                  cmd,
+              )
+          )
+          if not is_handoff and not is_rm_done and is_inspection_command(cmd):
             continue
           last_cmd_idx = idx
-          pending_cmds.append((idx, is_handoff, is_cli))
+          pending_cmds.append((idx, is_handoff, is_cli, is_rm_done, is_git_pub))
 
     elif stype == "GENERIC" and pending_cmds:
       content = str(step.get("content", ""))
@@ -548,12 +585,10 @@ def analyze_current_turn(transcript_path: str) -> dict:
         continue
       m = EXIT_CODE_RE.search(content)
       if m:
-        _, is_handoff, is_cli = pending_cmds.pop(0)
+        c_idx, is_handoff, is_cli, is_rm_done, is_git_pub = pending_cmds.pop(0)
         code = int(m.group(1))
         if last_cmd_exit_code is None or code != 0 or not pending_cmds:
           last_cmd_exit_code = code
-        # Tool output truncation keeps only the tail, so a real CLI handoff is
-        # proven by exit code 0 alone whereas raw agentapi still needs its JSON
         launched_marker = (
             '"newConversation"' in content
             or '"new_conversation_id"' in content
@@ -566,6 +601,13 @@ def analyze_current_turn(transcript_path: str) -> dict:
             and launched_marker
         ):
           launched_new_conv = True
+        if is_rm_done and code == 0:
+          roadmap_done_idx = c_idx
+          for ln in content.splitlines():
+            if "[VCS BATON:" in ln:
+              vcs_baton_lines.append(ln.strip())
+        if is_git_pub and code == 0 and roadmap_done_idx >= 0 and c_idx >= roadmap_done_idx:
+          git_publish_after_done = True
 
     # Keep cron chats marked as scheduled across recurring wakeup ticks
     elif stype == "SYSTEM_MESSAGE":
@@ -573,13 +615,59 @@ def analyze_current_turn(transcript_path: str) -> dict:
         scheduled_timer = True
 
   return {
+      "last_user_idx": last_user_idx,
       "last_code_edit_idx": last_code_edit_idx,
       "last_edited_file": last_edited_file,
       "last_cmd_idx": last_cmd_idx,
       "last_cmd_exit_code": last_cmd_exit_code,
       "launched_new_conv": launched_new_conv,
       "scheduled_timer": scheduled_timer,
+      "asked_question": asked_question,
+      "roadmap_done_idx": roadmap_done_idx,
+      "vcs_baton_lines": vcs_baton_lines,
+      "git_publish_after_done": git_publish_after_done,
   }
+
+
+def vcs_baton_guard_reason(
+    info: dict, conv_id: str, transcript_path: str
+) -> str:
+  if info.get("roadmap_done_idx", -1) < 0:
+    return ""
+  if info.get("asked_question"):
+    return ""
+
+  vcs_lines = list(info.get("vcs_baton_lines") or [])
+  if info.get("git_publish_after_done") or not vcs_lines:
+    try:
+      import roadmap
+
+      refreshed = roadmap.evaluate_vcs_baton(
+          conv_id, transcript_path=transcript_path
+      )
+      if refreshed:
+        vcs_lines = [
+            ln.strip()
+            for ln in refreshed.splitlines()
+            if ln.strip().startswith("[VCS BATON:")
+        ]
+    except Exception:
+      pass
+
+  pending_lines = [ln for ln in vcs_lines if "[VCS BATON: PENDING" in ln]
+  if not pending_lines:
+    return ""
+
+  baton_details = "\n".join(pending_lines)
+  return (
+      "[VCS BATON GUARD] You marked a roadmap item `done` in this turn while VCS baton is PENDING, "
+      "but did not call `ask_question`!\n"
+      f"{baton_details}\n"
+      "Before ending your turn, call `ask_question` with options: "
+      "`(Recommended) Commit + push`, `Commit only`, `Not now` "
+      "(remember: stage/commit ONLY your own touched files with explicit pathspecs; for Gerrit repos, "
+      "`Commit + push` runs `amnesia-precommit` + mandatory corpus gate + `git cl upload`, never CQ)."
+  )
 
 
 def main() -> None:
@@ -726,47 +814,52 @@ def main() -> None:
     return
 
   last_edit_idx = info.get("last_code_edit_idx", -1)
-  if last_edit_idx < 0:
-    play_stop_sound(is_handoff=False)
-    print("{}")
-    return
+  if last_edit_idx >= 0 and state.get("last_blocked_edit_idx") != last_edit_idx:
+    last_cmd_idx = info.get("last_cmd_idx", -1)
+    last_cmd_exit = info.get("last_cmd_exit_code")
+    edited_file = os.path.basename(info.get("last_edited_file", "file"))
 
-  # Only block once per code edit step index to prevent infinite loops
-  if state.get("last_blocked_edit_idx") == last_edit_idx:
-    play_stop_sound(is_handoff=False)
-    print("{}")
-    return
+    if last_cmd_idx < last_edit_idx:
+      state["last_blocked_edit_idx"] = last_edit_idx
+      save_state(state_path, state)
+      reason = (
+          f"[VERIFICATION GUARD] You modified source code (`{edited_file}`), but did not run a build, test, "
+          f"or syntax verification command (`run_command`) after the last edit. "
+          f"Run verification before finishing your response (or explicitly state why automated verification does not apply here)."
+      )
+      print(
+          json.dumps(
+              {"decision": "continue", "reason": reason}, ensure_ascii=False
+          )
+      )
+      return
 
-  last_cmd_idx = info.get("last_cmd_idx", -1)
-  last_cmd_exit = info.get("last_cmd_exit_code")
-  edited_file = os.path.basename(info.get("last_edited_file", "file"))
+    if last_cmd_exit is not None and last_cmd_exit != 0:
+      state["last_blocked_edit_idx"] = last_edit_idx
+      save_state(state_path, state)
+      reason = (
+          f"[VERIFICATION GUARD] After editing `{edited_file}`, the last executed command "
+          f"failed with exit code {last_cmd_exit}. Do not finish your turn with broken code: "
+          f"fix the error and re-verify, or revert the broken change and explain why."
+      )
+      print(
+          json.dumps(
+              {"decision": "continue", "reason": reason}, ensure_ascii=False
+          )
+      )
+      return
 
-  if last_cmd_idx < last_edit_idx:
-    state["last_blocked_edit_idx"] = last_edit_idx
+  vcs_reason = vcs_baton_guard_reason(info, conv_id, transcript_path)
+  if (
+      vcs_reason
+      and state.get("vcs_baton_blocked_turn") != info.get("last_user_idx", -1)
+  ):
+    state["vcs_baton_blocked_turn"] = info.get("last_user_idx", -1)
     save_state(state_path, state)
-    reason = (
-        f"[VERIFICATION GUARD] You modified source code (`{edited_file}`), but did not run a build, test, "
-        f"or syntax verification command (`run_command`) after the last edit. "
-        f"Run verification before finishing your response (or explicitly state why automated verification does not apply here)."
-    )
     print(
         json.dumps(
-            {"decision": "continue", "reason": reason}, ensure_ascii=False
-        )
-    )
-    return
-
-  if last_cmd_exit is not None and last_cmd_exit != 0:
-    state["last_blocked_edit_idx"] = last_edit_idx
-    save_state(state_path, state)
-    reason = (
-        f"[VERIFICATION GUARD] After editing `{edited_file}`, the last executed command "
-        f"failed with exit code {last_cmd_exit}. Do not finish your turn with broken code: "
-        f"fix the error and re-verify, or revert the broken change and explain why."
-    )
-    print(
-        json.dumps(
-            {"decision": "continue", "reason": reason}, ensure_ascii=False
+            {"decision": "continue", "reason": vcs_reason},
+            ensure_ascii=False,
         )
     )
     return
