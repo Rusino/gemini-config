@@ -21,7 +21,7 @@ Prose code review discussions on subtle edge cases often degrade into unverified
 
 ## Opt-Out Rule (Prose-Only Override)
 
-This skill is the **default execution phase** for substantive code reviews after triage. However, if the user explicitly asks for a prose-only review (e.g., *"без компаньона"*, *"только текстом"*, *"просто посмотри без дочернего СЛя"*, *"text-only review"*), **skip companion CL creation** and deliver a standard inline/top-level text review.
+This skill is the **default execution phase** for substantive code reviews after triage. However, if the user explicitly asks for a prose-only review (e.g., *"без компаньона"*, *"только текстом"*, *"просто посмотри без дочернего СЛя"*, *"text-only review"*), **skip companion CL creation** and deliver a standard inline/top-level text review (still saving the review draft on the parent Gerrit CL per Phase 5 unless in Dry Mode or Self-Review Mode).
 
 ---
 
@@ -70,7 +70,7 @@ Never upload a companion WIP CL blindly. After auditing the patchset and testing
    - For any Skia CL that modifies executable code in `modules/skparagraph/{src,include}/`, `modules/skunicode/{src,include}/`, or `modules/skshaper/{src,include}/`, running native Skia `dm --match SkParagraph` (`skia-test-paragraph`) alone is **not sufficient**: you **must** also run `flutter-test-paragraph-engine` (`~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py`) to verify that Flutter framework layout, intrinsic width, editing, and widget consumers (including `dropdown_menu_test.dart`) pass with zero regressions before classifying the CL as **Case 1** or **Case 2** (for Case 5, run `flutter-test-paragraph-engine` once on the final `PS2` tree in Phase 4 rather than twice).
    - For any Flutter PR that modifies executable code in `engine/src/flutter/lib/web_ui/lib/`, you **must** run `webparagraph-corpus` (`~/.gemini/config/skills/webparagraph-corpus/scripts/run_webparagraph_corpus.py`, Part 1 `felt` + Part 2 `packages/flutter`) before classifying as **Case 1**/**Case 2** or before pushing Commit 2 in **Case 5**.
    - Place new contract tests inside the dedicated test file the author's CL/PR already created or touched for that feature (so `git cherry-pick` lands cleanly in place without moving tests across files).
-   - If no defects exist and no new tests are needed → **Case 1** or **Case 2** (stop here and draft prose review).
+   - If no defects exist and no new tests are needed → **Case 1** or **Case 2** (skip Phases 3–4 and proceed directly to Phase 5 to draft the prose review and save the Gerrit draft).
    - If the new tests **pass** on the author's unmodified code → **Case 3**.
    - If the new tests **fail** (`Gate A` confirmed), record the exact failing test names and assertion count (`N failing assertions across K tests`), then decide between **Case 4** (reproducer tests only) and **Case 5** (tests in `PS1` + fix in `PS2`).
 
@@ -140,9 +140,10 @@ When **Case 5** applies:
 
 ### Phase 5: Drafting the Collaborative Review Message (Author Freedom)
 
-Never auto-publish the review comment to Gerrit or GitHub unless the user explicitly asks you to post it. Present the draft in chat for the user to review and post on the parent CL, accompanied in the chat summary by the full companion diff (`git diff <author_head_sha>..<companion_head_sha>`) and (for GitHub PRs) the direct compare URL (`https://github.com/<upstream_owner>/<repo>/compare/<author_head_sha>...<commit2_sha>`).
+Never auto-publish the review comment to Gerrit or GitHub unless the user explicitly asks you to post it. For external Gerrit CLs (outside Dry Mode and Self-Review Mode), **always save the drafted English review comment (including the link and patchset guide for the companion WIP CL when one exists) as a `/PATCHSET_LEVEL` draft directly on the parent CL's reviewed patchset** (`PUT https://<host>/a/changes/<CL>/revisions/<PS>/drafts`, or `PUT .../drafts/<existing_id>` if a `/PATCHSET_LEVEL` draft from an earlier pass already exists on `<PS>` via `GET .../drafts`), AND present the draft in chat for the user to review and publish, accompanied in the chat summary by the full companion diff (`git diff <author_head_sha>..<companion_head_sha>`) and (for GitHub PRs) the direct compare URL (`https://github.com/<upstream_owner>/<repo>/compare/<author_head_sha>...<commit2_sha>`).
 
 **Gerrit Drafts & Thread Follow-ups**:
+- Obtain the OAuth Bearer token via `printf "protocol=https\nhost=%s\n\n" "<host>" | git-credential-luci get` (`password=...`), serialize the JSON payload via Python `json.dumps({"path": "/PATCHSET_LEVEL", "message": msg, "unresolved": unresolved})` (`unresolved: True` for Cases 4–5 or open questions; `False` for Case 1/Case 3 approvals; for Case 2 nits, either save inline drafts at `path: "<file>", line: <N>` or a `/PATCHSET_LEVEL` summary draft), and `PUT` to `https://<host>/a/changes/<CL>/revisions/<PS>/drafts` so the draft is immediately ready in the Gerrit UI. If Gerrit auth fails (`reauth` needed), warn the user in chat while still outputting the full draft text.
 - A follow-up after a new patchset is saved as a standalone `/PATCHSET_LEVEL` draft on the CURRENT patchset (no `in_reply_to`), containing only new text.
 - Use `in_reply_to` only for inline (`file:line`) replies or when the user explicitly asks to answer inside a thread; never include or re-quote already-published text in a draft.
 - Never resolve the old thread unless the user asks; if asked, resolve via a minimal "Done" reply in that thread.
