@@ -1326,6 +1326,26 @@
     return bubble;
   }
 
+  // Positions a compact pill bubble centered above btn, flipping below only if clipped at top
+  function positionCompactBubble(bubble, btn) {
+    const rect = btn.getBoundingClientRect();
+    const bubbleWidth = bubble.offsetWidth || 180;
+    const bubbleHeight = bubble.offsetHeight || 26;
+    const btnWidth = rect.width || Math.max(0, (rect.right || 0) - (rect.left || 0)) || 20;
+    let left = rect.left + btnWidth / 2 - bubbleWidth / 2;
+    // Clamp horizontal position so right-aligned titlebar buttons never overflow the viewport
+    if (left + bubbleWidth + 8 > window.innerWidth) {
+      left = Math.max(8, window.innerWidth - bubbleWidth - 8);
+    }
+    left = Math.max(8, left);
+    let top = rect.top - bubbleHeight - 6;
+    if (top < 6) {
+      top = rect.bottom + 6;
+    }
+    bubble.style.left = `${Math.round(left)}px`;
+    bubble.style.top = `${Math.round(top)}px`;
+  }
+
   function showBubbleForButton(btn, bucketKey) {
     activeHoverBtn = btn;
     activeHoverBucket = bucketKey || btn?.getAttribute('data-bucket') || 'needs-me';
@@ -1344,17 +1364,7 @@
     if (bubble.getAttribute('data-visible') !== 'true') {
       bubble.setAttribute('data-visible', 'true');
     }
-
-    const rect = btn.getBoundingClientRect();
-    const bubbleWidth = bubble.offsetWidth || 180;
-    let left = rect.left;
-    if (left + bubbleWidth + 8 > window.innerWidth) {
-      left = Math.max(8, window.innerWidth - bubbleWidth - 8);
-    }
-    left = Math.max(8, left);
-    const top = rect.bottom + 6;
-    bubble.style.left = `${Math.round(left)}px`;
-    bubble.style.top = `${Math.round(top)}px`;
+    positionCompactBubble(bubble, btn);
   }
 
   function hideBubble() {
@@ -1389,18 +1399,7 @@
     if (bubble.getAttribute('data-visible') !== 'true') {
       bubble.setAttribute('data-visible', 'true');
     }
-
-    const rect = btn.getBoundingClientRect();
-    const bubbleWidth = bubble.offsetWidth || 180;
-    let left = rect.left;
-    // Clamp horizontal position so right-aligned titlebar buttons never overflow the viewport
-    if (left + bubbleWidth + 8 > window.innerWidth) {
-      left = Math.max(8, window.innerWidth - bubbleWidth - 8);
-    }
-    left = Math.max(8, left);
-    const top = rect.bottom + 6;
-    bubble.style.left = `${Math.round(left)}px`;
-    bubble.style.top = `${Math.round(top)}px`;
+    positionCompactBubble(bubble, btn);
   }
 
   // Wires hover, focus, and press listeners on an icon button to show/hide the pill bubble

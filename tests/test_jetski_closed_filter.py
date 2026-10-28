@@ -784,6 +784,7 @@ const bubble = global.document.getElementById('jetski-closed-chats-filter-bubble
 assert(bubble, 'Hover bubble must be created');
 assert.strictEqual(bubble.getAttribute('data-visible'), 'true');
 assert.strictEqual(bubble.getAttribute('data-mode'), 'filter');
+assert.strictEqual(bubble.style.top, '8px', 'Compact filter pill must position above button');
 assert(bubble.className.includes('surface-glass'));
 assert(bubble.innerHTML.includes('⏳ Waiting (Cron / External) · 2 hidden'));
 assert(!bubble.innerHTML.includes('All 3 chat states'), 'Must not render multi-state section');
