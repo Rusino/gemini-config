@@ -907,6 +907,8 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(titlebarToolbar.children[1], titlebarLocateBtn);
   assert.strictEqual(titlebarToolbar.children[2], titlebarWaitBtn);
   assert.strictEqual(titlebarToolbar.children[3], titlebarBtn);
+  assert.strictEqual(titlebarWaitBtn.textContent, '⏳');
+  assert.strictEqual(titlebarBtn.textContent, '🗄');
   assert.strictEqual(titlebarBtn.getAttribute('data-testid'), 'jetski-titlebar-archive-btn');
   assert.strictEqual(titlebarBtn.getAttribute('aria-label'), 'Archive chat');
   assert.strictEqual(titlebarBtn.getAttribute('data-archived'), 'false');
@@ -970,6 +972,7 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(summaryOf('open-step').summary, '[09:30] ⦿ Open chain topic');
   assert.strictEqual(titlebarBtn.getAttribute('aria-label'), 'Unarchive chat');
   assert.strictEqual(titlebarBtn.getAttribute('data-archived'), 'true');
+  assert.strictEqual(titlebarBtn.textContent, '⦿');
   assert.strictEqual(titlebarWaitBtn.style.display, 'none');
   assert.strictEqual(liveBucketBtn('needs-me').getAttribute('aria-label'), '🚨 Needs Me: 1 (shown)');
 
@@ -985,6 +988,7 @@ const liveBucketBtn = (k) =>
   });
   assert.strictEqual(summaryOf('open-current').annotations.archived, false);
   assert.strictEqual(titlebarBtn.getAttribute('aria-label'), 'Archive chat');
+  assert.strictEqual(titlebarBtn.textContent, '🗄');
   assert.strictEqual(titlebarWaitBtn.style.display, '');
   assert.strictEqual(liveBucketBtn('needs-me').getAttribute('aria-label'), '🚨 Needs Me: 2 (shown)');
 
@@ -1180,12 +1184,16 @@ const liveBucketBtn = (k) =>
     'Unchanged chain must preserve jump-to-tail button DOM instance'
   );
 
-  // 3. Click jump-to-tail and verify navigation target
+  // 3. Click jump-to-tail and verify navigation target and optimistic banner removal
   window.history._lastPushed = null;
   advanceClock();
   jumpBtn.dispatchEvent('pointerdown', { button: 0 });
   jumpBtn.dispatchEvent('click');
   assert.strictEqual(window.history._lastPushed, '/c/open-current');
+  assert(
+    !convoFooterInner.querySelector('[data-testid="jetski-archive-piece-banner"]'),
+    'Archive banner must be optimistically removed immediately on jump click'
+  );
 
   // 3b. Verify layout where ActiveInputArea is absent and nativeArchivedBanner is present
   convoInputBox.remove();
@@ -1223,9 +1231,12 @@ const liveBucketBtn = (k) =>
   nativeArchivedBanner.remove();
   convoFooterInner.appendChild(convoInputBox);
 
-  // 4. Switch conversation-view to the tail piece 'open-current' and sync
+  // 4. Switch conversation-view rapidly from non-tail to tail and ensure stale sync is dropped
+  convoViewEl.setAttribute('data-cascade-id', 'open-step');
+  const staleSync = window.__jetskiChainNav.syncConversationChainNavigators();
   convoViewEl.setAttribute('data-cascade-id', 'open-current');
-  await window.__jetskiChainNav.syncConversationChainNavigators();
+  const freshSync = window.__jetskiChainNav.syncConversationChainNavigators();
+  await Promise.all([staleSync, freshSync]);
 
   const tailStarsBefore = convoNavEl.querySelector('[data-testid="jetski-chain-stars-before"]');
   assert.strictEqual(tailStarsBefore.children.length, 3, 'All 3 pieces before/at tail');

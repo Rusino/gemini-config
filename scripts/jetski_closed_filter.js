@@ -823,12 +823,23 @@
       #${SEARCH_PANEL_ID} .jcs-hit:hover { background: rgba(127, 127, 127, 0.18); }
       #${SEARCH_PANEL_ID} .jcs-meta { opacity: 0.65; font-size: 11px; }
       #${SEARCH_PANEL_ID} mark { background: rgba(255, 200, 0, 0.35); color: inherit; }
+      // Style all titlebar action buttons as uniform compact icons without pill borders
       .${SEARCH_BTN_CLASS},
-      .${LOCATE_BTN_CLASS} {
-        background: transparent; border: none; cursor: pointer; padding: 0 4px; opacity: 0.8;
+      .${LOCATE_BTN_CLASS},
+      .${TITLEBAR_WAIT_BTN_CLASS},
+      .${TITLEBAR_BTN_CLASS} {
+        background: transparent;
+        border: none;
+        cursor: pointer;
+        padding: 0 4px;
+        opacity: 0.8;
+        font-size: 14px;
+        line-height: 1;
       }
       .${SEARCH_BTN_CLASS}:hover,
-      .${LOCATE_BTN_CLASS}:hover {
+      .${LOCATE_BTN_CLASS}:hover,
+      .${TITLEBAR_WAIT_BTN_CLASS}:hover,
+      .${TITLEBAR_BTN_CLASS}:hover {
         opacity: 1;
       }
       @keyframes jetski-locate-pulse {
@@ -934,45 +945,6 @@
         display: inline-flex;
         align-items: center;
         justify-content: center;
-      }
-      .${TITLEBAR_BTN_CLASS},
-      .${TITLEBAR_WAIT_BTN_CLASS} {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        gap: 4px;
-        height: 24px;
-        padding: 0 8px;
-        border-radius: 6px;
-        border: 1px solid rgba(128, 134, 139, 0.25);
-        background: rgba(128, 134, 139, 0.10);
-        color: var(--secondary-foreground, #c4c7c5);
-        font-family: inherit;
-        font-size: 11.5px;
-        font-weight: 500;
-        line-height: 1;
-        white-space: nowrap;
-        cursor: pointer;
-        user-select: none;
-        flex-shrink: 0;
-        margin-right: 4px;
-        transition: background-color 120ms ease, color 120ms ease, border-color 120ms ease;
-      }
-      .${TITLEBAR_BTN_CLASS} > *,
-      .${TITLEBAR_WAIT_BTN_CLASS} > * {
-        pointer-events: none;
-      }
-      .${TITLEBAR_BTN_CLASS}:hover,
-      .${TITLEBAR_WAIT_BTN_CLASS}:hover {
-        background: var(--secondary, rgba(128, 134, 139, 0.22));
-        color: var(--foreground, #e8eaed);
-        border-color: rgba(128, 134, 139, 0.40);
-      }
-      .${TITLEBAR_BTN_CLASS}[data-archived="true"],
-      .${TITLEBAR_WAIT_BTN_CLASS}[data-waiting="true"] {
-        background: color-mix(in srgb, var(--primary, #8ab4f8) 16%, transparent);
-        border-color: color-mix(in srgb, var(--primary, #8ab4f8) 36%, transparent);
-        color: var(--primary, #8ab4f8);
       }
       .${ROW_WAIT_BTN_CLASS} {
         display: inline-flex;
@@ -1967,6 +1939,8 @@
         type: 'conversation/setCascadeId',
         payload: { cascadeId },
       });
+      // Synchronize button states and conversation piece locks immediately upon routing
+      scheduleSync();
     }
 
     // Find computes matches from the mounted view's text, so wait for the routed view to mount
@@ -2451,7 +2425,13 @@
 
   function syncConversationPieceLock(convoViewEl, cascadeId, chain) {
     const activeIdx = chain.indexOf(cascadeId);
-    if (activeIdx === -1) return;
+    if (activeIdx === -1) {
+      // Purge any dangling read-only banners when conversation is not indexed in chain
+      for (const b of convoViewEl.querySelectorAll(`.${ARCHIVE_BANNER_CLASS}`)) {
+        b.remove();
+      }
+      return;
+    }
     const isTail = activeIdx === chain.length - 1;
 
     const inputBox = convoViewEl.querySelector('[data-testid="agent-input-box"]');
@@ -2514,6 +2494,8 @@
         bindActionBtnHandlers(jumpBtn, () => {
           const tid = jumpBtn.getAttribute('data-tail-id');
           const sid = jumpBtn.getAttribute('data-source-id');
+          // Optimistically discard banner to avoid visual flash while route transition resolves
+          banner.remove();
           if (tid) {
             openConversation(tid, undefined, sid);
           }
@@ -2549,12 +2531,17 @@
       if (nativeArchivedBanner) {
         nativeArchivedBanner.style.display = '';
       }
-      const banner = convoViewEl.querySelector(`.${ARCHIVE_BANNER_CLASS}`);
-      if (banner) banner.remove();
+      // Clear all banners to guarantee complete cleanup across nested or cloned DOM nodes
+      for (const b of convoViewEl.querySelectorAll(`.${ARCHIVE_BANNER_CLASS}`)) {
+        b.remove();
+      }
     }
   }
 
+  let chainNavSyncSeq = 0;
+
   async function syncConversationChainNavigators() {
+    const curSeq = ++chainNavSyncSeq;
     const convoViews = document.querySelectorAll(
       '[data-testid="conversation-view"][data-cascade-id]'
     );
@@ -2568,6 +2555,10 @@
       } catch {
         chain = [cid];
       }
+
+      // Drop stale async resolution if a newer pass started or view navigated to another chat
+      if (curSeq !== chainNavSyncSeq) return;
+      if (convoViewEl.getAttribute('data-cascade-id') !== cid) continue;
 
       syncConversationPieceLock(convoViewEl, cid, chain);
 
@@ -2788,22 +2779,20 @@
     const label = waiting
       ? 'Move chat to 🚨 Needs Me (⦿)'
       : 'Move chat to ⏳ Waiting (Cron / External)';
-    // Sync DOM attributes and innerHTML only on change to avoid re-triggering MutationObserver
+    // Sync DOM attributes and icon text only on change to avoid re-triggering MutationObserver
     if (btn.getAttribute('aria-label') !== label) {
       btn.setAttribute('aria-label', label);
     }
     if (btn.getAttribute('title') !== label) {
       btn.setAttribute('title', label);
     }
-    const nextHtml = waiting
-      ? '<span>🚨</span><span>Needs Me</span>'
-      : '<span>⏳</span><span>Wait</span>';
-    if (btn.innerHTML !== nextHtml) {
-      btn.innerHTML = nextHtml;
+    const nextText = waiting ? '🚨' : '⏳';
+    if (btn.textContent !== nextText) {
+      btn.textContent = nextText;
     }
   }
 
-  // Syncs the titlebar pill button label and archived attribute with the chat annotations
+  // Syncs the titlebar archive button label and icon with the chat annotations
   function updateTitlebarArchiveButtonUI(btn, cascadeId) {
     if (!btn || !cascadeId) return;
     btn.setAttribute('data-cascade-id', cascadeId);
@@ -2819,15 +2808,14 @@
     if (btn.getAttribute('title') !== label) {
       btn.setAttribute('title', label);
     }
-    const nextHtml = archived
-      ? '<span>⦿</span><span>Unarchive</span>'
-      : '<span>🗄</span><span>Archive</span>';
-    if (btn.innerHTML !== nextHtml) {
-      btn.innerHTML = nextHtml;
+    // Render a pure icon without text spans so the titlebar stays compact
+    const nextText = archived ? '⦿' : '🗄';
+    if (btn.textContent !== nextText) {
+      btn.textContent = nextText;
     }
   }
 
-  // Injects or updates the Wait and Archive pill buttons before ⋮ in each conversation titlebar
+  // Injects or updates the Locate, Wait, and Archive icon buttons before ⋮ in each titlebar
   function ensureTitlebarButtons() {
     const moreActionsBtns = document.querySelectorAll(
       '[data-testid="titlebar-more-actions"]'
