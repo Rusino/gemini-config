@@ -139,6 +139,14 @@
   let activeHoverRoadmapProjectId = null;
   let chainIndexCache = null;
   let chainIndexFetchedAt = 0;
+  // Auto-switch follows a fresh handoff redirect only for views the user did not open by hand,
+  // and at most once per edge, so going back to an archived piece never bounces forward.
+  // Both sets live on window: star buttons rendered by an earlier injection keep their DOM
+  // identity and closures, and a re-injected instance must not repeat a done switch
+  const AUTO_SWITCH_MAX_AGE_MS = 60000;
+  const manualVisitedCids = (window.__jetskiManualVisitedCids ||= new Set());
+  const observedArchivedViewIds = new Set();
+  const autoSwitchedEdges = (window.__jetskiAutoSwitchedEdges ||= new Set());
   // Caches jetski-roadmaps.json across DOM sync cycles within ROADMAP_INDEX_TTL_MS
   const ROADMAP_INDEX_TTL_MS = 5000;
   let roadmapIndexCache = null;
@@ -250,7 +258,7 @@
       return chainIndexCache;
     }
     if (typeof window.fetch !== 'function') {
-      return chainIndexCache || { parentOf: {}, createdAt: {} };
+      return chainIndexCache || { parentOf: {}, createdAt: {}, redirects: {} };
     }
     try {
       const csrf = encodeURIComponent(getCsrfToken());
@@ -263,6 +271,7 @@
           chainIndexCache = {
             parentOf: data.parentOf || {},
             createdAt: data.createdAt || {},
+            redirects: data.redirects || {},
           };
           chainIndexFetchedAt = now;
           return chainIndexCache;
@@ -271,7 +280,7 @@
     } catch {
       // Ignore network errors and fall back to cached or single-chat resolution
     }
-    return chainIndexCache || { parentOf: {}, createdAt: {} };
+    return chainIndexCache || { parentOf: {}, createdAt: {}, redirects: {} };
   }
 
   async function fetchRoadmapIndex() {
@@ -1827,8 +1836,10 @@
   }
 
   // Routes inside the SPA by swapping the conversation ID in the current chat URL; updates both
-  // browser history and Redux multiConvoLayout/conversation slices for split-view stability
-  function openConversation(cascadeId, term, sourceCid) {
+  // browser history and Redux multiConvoLayout/conversation slices for split-view stability.
+  // options.preserveFocus replaces the pane without taking focus from another split pane
+  function openConversation(cascadeId, term, sourceCid, options) {
+    const preserveFocus = Boolean(options?.preserveFocus);
     const path = window.location?.pathname || '';
     const m = /^(.*\/(?:c|cascade|conversation)\/)([^/?#]+)(.*)$/.exec(path);
     if (!m) return;
@@ -1870,11 +1881,13 @@
       }
     }
 
-    // Preserve non-empty search query params while keeping focused ID aligned with target
+    // Preserve non-empty search query params while keeping focused ID aligned with target;
+    // preserveFocus keeps the focus on another split pane that the user is working in
     const nextPath = m[1] + nextIds.join('+') + m[3];
     let nextUrl = nextPath;
     if (searchParams) {
-      if (searchParams.has('focused') || nextIds.length > 1) {
+      const keepsFocus = preserveFocus && focusedParam && focusedParam !== replaceTarget;
+      if (!keepsFocus && (searchParams.has('focused') || nextIds.length > 1)) {
         searchParams.set('focused', cascadeId);
       }
       const qs = searchParams.toString();
@@ -1895,55 +1908,49 @@
 
     // Reconcile Redux layout and active conversation slices to prevent router ping-pong
     if (store) {
+      let takeFocus = !preserveFocus || rawIds.length <= 1 || convoCascadeId === replaceTarget;
       if (layoutState?.rootNode) {
-        function findPane(node) {
+        function findPane(node, matches) {
           if (!node) return null;
-          if (node.type === 'pane') {
-            if (
-              (replaceTarget &&
-                (node.cascadeId === replaceTarget || node.id === replaceTarget)) ||
-              node.id === layoutState.focusedPaneId
-            ) {
-              return node;
-            }
-            return null;
-          }
+          if (node.type === 'pane') return matches(node) ? node : null;
           if (Array.isArray(node.children)) {
             for (const child of node.children) {
-              const found = findPane(child);
+              const found = findPane(child, matches);
               if (found) return found;
             }
           }
           return null;
         }
-        function getFirstPane(node) {
-          if (!node) return null;
-          if (node.type === 'pane') return node;
-          if (Array.isArray(node.children)) {
-            for (const child of node.children) {
-              const p = getFirstPane(child);
-              if (p) return p;
-            }
-          }
-          return null;
-        }
+        // The pane showing replaceTarget wins over the focused pane, or a background
+        // auto-switch would replace whatever chat the user is focused on
         const targetPane =
-          findPane(layoutState.rootNode) || getFirstPane(layoutState.rootNode);
+          (replaceTarget &&
+            findPane(
+              layoutState.rootNode,
+              (n) => n.cascadeId === replaceTarget || n.id === replaceTarget
+            )) ||
+          findPane(layoutState.rootNode, (n) => n.id === layoutState.focusedPaneId) ||
+          findPane(layoutState.rootNode, () => true);
         if (targetPane) {
+          takeFocus = !preserveFocus || targetPane.id === layoutState.focusedPaneId;
           store.dispatch({
             type: 'multiConvoLayout/resetPane',
             payload: { paneId: targetPane.id, cascadeId },
           });
-          store.dispatch({
-            type: 'multiConvoLayout/setFocusedPane',
-            payload: targetPane.id,
-          });
+          if (takeFocus) {
+            store.dispatch({
+              type: 'multiConvoLayout/setFocusedPane',
+              payload: targetPane.id,
+            });
+          }
         }
       }
-      store.dispatch({
-        type: 'conversation/setCascadeId',
-        payload: { cascadeId },
-      });
+      if (takeFocus) {
+        store.dispatch({
+          type: 'conversation/setCascadeId',
+          payload: { cascadeId },
+        });
+      }
       // Synchronize button states and conversation piece locks immediately upon routing
       scheduleSync();
     }
@@ -2049,8 +2056,10 @@
       const hit = e.target.closest('.jcs-hit');
       if (!hit) return;
       const term = input.value.trim();
+      const hitCid = hit.getAttribute('data-cascade-id');
       closeSearchPanel();
-      openConversation(hit.getAttribute('data-cascade-id'), term, cascadeId);
+      manualVisitedCids.add(hitCid);
+      openConversation(hitCid, term, cascadeId);
     });
     input.focus();
   }
@@ -2417,6 +2426,7 @@
     bindActionBtnHandlers(btn, () => {
       hideChainStarTooltip();
       if (!isCurrent) {
+        manualVisitedCids.add(cid);
         openConversation(cid, undefined, sourceCid || chain[idx]);
       }
     });
@@ -2546,6 +2556,21 @@
 
   let chainNavSyncSeq = 0;
 
+  // Moves a view off a chat that was just archived by handoff/next-task onto its successor.
+  // Only fresh redirects count: an old archived piece opened later must stay where it is
+  function maybeAutoSwitchToSuccessor(cid, redirects) {
+    if (manualVisitedCids.has(cid) || !isArchivedCascadeId(cid)) return;
+    const r = redirects?.[cid];
+    const target = r?.to;
+    if (!target || target === cid) return;
+    const at = Date.parse(r.at || '') || 0;
+    if (Date.now() - at >= AUTO_SWITCH_MAX_AGE_MS) return;
+    const edge = `${cid}->${target}`;
+    if (autoSwitchedEdges.has(edge)) return;
+    autoSwitchedEdges.add(edge);
+    openConversation(target, undefined, cid, { preserveFocus: true });
+  }
+
   async function syncConversationChainNavigators() {
     const curSeq = ++chainNavSyncSeq;
     const convoViews = document.querySelectorAll(
@@ -2554,6 +2579,13 @@
     for (const convoViewEl of convoViews) {
       const cid = convoViewEl.getAttribute('data-cascade-id');
       if (!cid) continue;
+
+      // A view whose chat just turned archived drops the 5s cache, so the redirect written
+      // right before the archive is read now rather than after the window ends
+      if (isArchivedCascadeId(cid) && !observedArchivedViewIds.has(cid)) {
+        observedArchivedViewIds.add(cid);
+        chainIndexFetchedAt = 0;
+      }
 
       let chain;
       try {
@@ -2565,6 +2597,8 @@
       // Drop stale async resolution if a newer pass started or view navigated to another chat
       if (curSeq !== chainNavSyncSeq) return;
       if (convoViewEl.getAttribute('data-cascade-id') !== cid) continue;
+
+      maybeAutoSwitchToSuccessor(cid, chainIndexCache?.redirects);
 
       syncConversationPieceLock(convoViewEl, cid, chain);
 

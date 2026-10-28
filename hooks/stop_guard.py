@@ -810,7 +810,8 @@ def main() -> None:
           f"2. Overwrite the chain state file `{handoff_file}` (goal, current state with evidence, failed hypotheses, "
           f"running tasks and how to restart them, exact next step).\n"
           f'3. Run `python3 ~/.gemini/config/hooks/chat_lifecycle.py handoff {conv_id} --next "<1-line summary of next immediate action>"`.\n'
-          f"4. Paste the roadmap block from its output and the link `[👉 {new_title}](conversation://<new_conversation_id>)` into your final message."
+          "4. End your turn with a 1-line handoff summary and the link"
+          f" `[👉 {new_title}](conversation://<new_conversation_id>)` (never dump the roadmap)."
       )
     else:
       steps = (

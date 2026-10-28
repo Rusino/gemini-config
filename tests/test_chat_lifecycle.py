@@ -509,7 +509,7 @@ class TestChatLifecycle(unittest.TestCase):
         patch.object(chat_lifecycle, "get_current_time_str", return_value="15:45"),
     )
 
-  def test_in_project_handoff_moves_state_file_and_returns_roadmap(self):
+  def test_in_project_handoff_moves_state_file_without_roadmap_dump(self):
     import roadmap
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -531,7 +531,7 @@ class TestChatLifecycle(unittest.TestCase):
       with open(new_state, encoding="utf-8") as f:
         self.assertEqual(f.read(), "# State\nnext: rerun test_foo\n")
       self.assertNotIn("state_move_error", res)
-      self.assertIn("▸ R1 Ship it [child-2]", res["roadmap"])
+      self.assertNotIn("roadmap", res)
       prompt = start.call_args[0][2]
       self.assertIn("roadmap.py show", prompt)
       self.assertIn(os.path.dirname(new_state), prompt)
@@ -541,14 +541,20 @@ class TestChatLifecycle(unittest.TestCase):
       parent_dir = os.path.join(tmp_dir, "brain", "parent-1")
       self.assertEqual(os.listdir(parent_dir), ["scratch"])
       with open(os.path.join(parent_dir, "scratch", ".context_guard_state.json"), encoding="utf-8") as f:
-        self.assertEqual(json.load(f)["handed_off_to"], "child-2")
+        guard = json.load(f)
+      self.assertEqual(guard["handed_off_to"], "child-2")
+      self.assertEqual(guard["handoff_kind"], "handoff")
+      with open(os.path.join(tmp_dir, "brain", chat_lifecycle.CHAIN_INDEX_FILE_NAME),
+                encoding="utf-8") as f:
+        index = json.load(f)
+      self.assertEqual(index["redirects"]["parent-1"]["to"], "child-2")
+      self.assertEqual(index["parentOf"]["child-2"], "parent-1")
 
       with patch("sys.stdout", new_callable=io.StringIO) as out:
         chat_lifecycle.print_handoff_result(res)
       printed = out.getvalue()
-      head, _, tail = printed.partition("\n{")
-      self.assertIn("▸ R1 Ship it", head)
-      self.assertEqual(json.loads("{" + tail)["new_conversation_id"], "child-2")
+      self.assertNotIn("Ship it", printed)
+      self.assertEqual(json.loads(printed)["new_conversation_id"], "child-2")
 
   def test_in_project_handoff_without_state_file_fails_and_writes_no_stub(self):
     import roadmap
@@ -578,7 +584,7 @@ class TestChatLifecycle(unittest.TestCase):
         res = chat_lifecycle.create_handoff(current_conv_id="parent-1", summary_file=summary)
       with open(roadmap.state_path("proj-abc", "child-2"), encoding="utf-8") as f:
         self.assertEqual(f.read(), "# Summary written under the outside flow\n")
-      self.assertEqual(res["roadmap"], "Roadmap: empty")
+      self.assertNotIn("roadmap", res)
 
   def test_in_project_handoff_prefers_db_project_over_stale_env(self):
     import roadmap
@@ -1126,16 +1132,14 @@ class TestChatLifecycle(unittest.TestCase):
     self.assertEqual(opts["next_step"], "go")
     self.assertFalse(chat_lifecycle.parse_handoff_args(["c1"])["force"])
 
-  def test_print_handoff_result_keeps_json_after_roadmap(self):
+  def test_print_handoff_result_prints_only_json(self):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
       chat_lifecycle.print_handoff_result({
           "new_conversation_id": "child-1",
           "roadmap": "\n".join(f"R{i} item" for i in range(80)),
       })
-    out = buf.getvalue()
-    self.assertLess(out.index("R79 item"), out.index('"new_conversation_id": "child-1"'))
-    self.assertIn('"new_conversation_id": "child-1"', out[-200:])
+    self.assertEqual(json.loads(buf.getvalue()), {"new_conversation_id": "child-1"})
 
   def test_get_model_trailer(self):
     catalog = {"models": {
@@ -1294,6 +1298,33 @@ class TestChatLifecycle(unittest.TestCase):
           data = json.load(f)
         self.assertEqual(data["parentOf"], {"c2": "c1", "c3": "c2"})
 
+  def test_export_chain_index_merges_guard_redirects(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.write_chain(tmp_dir, [("c1", None)])
+
+      def write_guard(cid, state):
+        scratch = os.path.join(tmp_dir, "brain", cid, "scratch")
+        os.makedirs(scratch, exist_ok=True)
+        with open(os.path.join(scratch, ".context_guard_state.json"), "w",
+                  encoding="utf-8") as f:
+          json.dump(state, f)
+
+      # c2 has no transcript yet: the redirect alone links it into c1's chain
+      write_guard("c1", {"handed_off_to": "c2", "handed_off_at": "2026-10-28T00:00:00+00:00"})
+      write_guard("t1", {"handed_off_to": "t2", "handed_off_at": "2026-10-28T00:01:00+00:00",
+                         "handoff_kind": "next-task"})
+      write_guard("idle", {"gm_count": 3})
+      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]):
+        data = chat_lifecycle.export_chain_index()
+      self.assertEqual(data["parentOf"].get("c2"), "c1")
+      self.assertNotIn("t2", data["parentOf"])
+      self.assertEqual(data["createdAt"]["c2"], "2026-10-28T00:00:00+00:00")
+      self.assertEqual(data["createdAt"]["t2"], "2026-10-28T00:01:00+00:00")
+      self.assertEqual(data["redirects"], {
+          "c1": {"to": "c2", "at": "2026-10-28T00:00:00+00:00", "kind": "handoff"},
+          "t1": {"to": "t2", "at": "2026-10-28T00:01:00+00:00", "kind": "next-task"},
+      })
+
   def test_create_next_task_finalizes_old_chat_claims_roadmap_item_and_starts_root_chat(self):
     import pre_tool_guard
     import roadmap
@@ -1321,6 +1352,9 @@ class TestChatLifecycle(unittest.TestCase):
         self.assertEqual(res["new_conversation_id"], "child-2")
         self.assertEqual(res["item_id"], "R2")
         self.assertEqual(res["finalized_chain"], ["parent-1"])
+        self.assertNotIn("roadmap", res)
+        guard = chat_lifecycle.load_guard_state("parent-1")
+        self.assertEqual((guard["handed_off_to"], guard["handoff_kind"]), ("child-2", "next-task"))
         self.assertTrue(chat_lifecycle.is_archived("parent-1"))
         self.assertEqual(chat_lifecycle.get_conversation_title("parent-1"), "[10:00] ⦿ My Feature")
         self.assertFalse(chat_lifecycle.is_archived("child-2"))

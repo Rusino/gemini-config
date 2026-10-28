@@ -1172,10 +1172,50 @@ def link_visible_chains(
   return vis_parent, vis_children
 
 
+# Guard state records each launch before the continuation's transcript exists, so redirects
+# are visible to the browser even when the new chat has not written its first step yet
+def _scan_guard_redirects() -> dict[str, dict]:
+  redirects: dict[str, dict] = {}
+  for app_dir in find_app_data_dirs():
+    brain_dir = os.path.join(app_dir, "brain")
+    if not os.path.isdir(brain_dir):
+      continue
+    for cid in sorted(os.listdir(brain_dir)):
+      if cid in redirects:
+        continue
+      guard_path = os.path.join(brain_dir, cid, "scratch", ".context_guard_state.json")
+      if not os.path.isfile(guard_path):
+        continue
+      try:
+        with open(guard_path, "r", encoding="utf-8") as f:
+          data = json.load(f)
+      except Exception:
+        continue
+      if not isinstance(data, dict):
+        continue
+      to_cid = data.get("handed_off_to")
+      if not to_cid or not isinstance(to_cid, str):
+        continue
+      redirects[cid] = {
+          "to": to_cid,
+          "at": str(data.get("handed_off_at") or ""),
+          "kind": str(data.get("handoff_kind") or "handoff"),
+      }
+  return redirects
+
+
 def export_chain_index() -> dict:
-  """Exports handoff parent links and creation timestamps to brain/jetski-chains.json."""
+  """Exports handoff parent links, creation timestamps and redirects to jetski-chains.json."""
   parent_of, _, created_at_of = _scan_transcript_graph()
-  payload = {"parentOf": parent_of, "createdAt": created_at_of}
+  redirects = _scan_guard_redirects()
+  for cid, r in redirects.items():
+    to_cid, at_ts = r["to"], r["at"]
+    # next-task starts an independent root chat, so it is never a chain link
+    if r["kind"] != "next-task" and to_cid not in parent_of:
+      parent_of[to_cid] = cid
+    if at_ts and to_cid not in created_at_of:
+      created_at_of[to_cid] = at_ts
+  payload = {"parentOf": parent_of, "createdAt": created_at_of, "redirects": redirects}
   raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
   # Mirror the chain index into every active brain directory so /static/artifacts/ can serve it
   for app_dir in find_app_data_dirs():
@@ -1766,7 +1806,7 @@ def load_guard_state(conv_id: str) -> dict:
   return load_state(guard_state_path(conv_id))
 
 
-def record_handoff(conv_id: str, new_cid: str) -> None:
+def record_handoff(conv_id: str, new_cid: str, kind: str = "handoff") -> None:
   """Marks conv_id as handed off to new_cid in its guard state.
 
   The CLI itself is the durable record of the launch: the hooks only see the
@@ -1779,6 +1819,8 @@ def record_handoff(conv_id: str, new_cid: str) -> None:
   state["handoff_completed"] = True
   state["pending_handoff_launch"] = False
   state["handed_off_at"] = datetime.now(ZoneInfo("UTC")).isoformat()
+  # export_chain_index links only "handoff" redirects into the chain
+  state["handoff_kind"] = kind
   save_state(guard_state_path(conv_id), state)
 
 
@@ -2051,10 +2093,6 @@ def create_handoff(
             f"{exc}; the continuation is told to run `roadmap.py state-move` itself"
         )
     summary_file = roadmap.state_path(project_id, new_cid)
-    try:
-      extra["roadmap"] = roadmap.show(project_id)
-    except Exception as exc:
-      extra["roadmap"] = f"(roadmap unavailable: {exc})"
     if ignored_summary:
       extra["ignored_summary_file"] = ignored_summary
 
@@ -2064,11 +2102,12 @@ def create_handoff(
   # 7. Once the continuation is verified visible, the handed-off chat leaves the sidebar. It
   # stays reachable via conversation:// and chain search; the live-work guard above ensures
   # nothing reports into it later. An unverified continuation keeps the caller visible, or
-  # both chats could vanish
+  # both chats could vanish. The chain index is written first: the archive reaches the browser
+  # via LS and triggers the auto-switch, which reads the redirect from jetski-chains.json
+  export_chain_index()
   update_conversation_title(new_cid, cont_title)
   if fetched and source_meta is None:
     archive_conversations([current_conv_id])
-  export_chain_index()
 
   return {
       "new_conversation_id": new_cid,
@@ -2365,7 +2404,7 @@ def create_next_task(
 
   extra: dict = {}
   try:
-    record_handoff(current_conv_id, new_cid)
+    record_handoff(current_conv_id, new_cid, kind="next-task")
   except Exception as exc:
     extra["guard_state_error"] = str(exc)[:300]
 
@@ -2376,15 +2415,13 @@ def create_next_task(
       extra["state_seed_error"] = str(exc)[:300]
 
   new_state_file = roadmap.state_path(project_id, new_cid)
-  try:
-    extra["roadmap"] = roadmap.show(project_id)
-  except Exception as exc:
-    extra["roadmap"] = f"(roadmap unavailable: {exc})"
 
   fetched, source_meta = get_conversation_source_metadata(new_cid)
 
   # Archive the finished task's chain (only once new_cid is verified visible, same as
-  # handoff), sweep completed sibling chats, and record new_cid as an active root chat
+  # handoff), sweep completed sibling chats, and record new_cid as an active root chat.
+  # The chain index goes first so the browser auto-switch finds the redirect on archive
+  export_chain_index()
   finalized_chain = archive_chain(current_conv_id) if fetched and source_meta is None else []
   swept_sibling_chains = sweep_completed_project_chats(
       project_id,
@@ -2392,7 +2429,6 @@ def create_next_task(
       finalized_cids=set(finalized_chain),
   )
   update_conversation_title(new_cid, cont_title)
-  export_chain_index()
 
   return {
       "new_conversation_id": new_cid,
@@ -2408,17 +2444,11 @@ def create_next_task(
   }
 
 
+# The roadmap lives in the sidebar badge and `roadmap.py show`; echoing it here only made
+# the old chat paste it into its final message
 def print_handoff_result(result: dict) -> None:
-  # The roadmap is plain text so the old chat can paste it verbatim into its
-  # final message; escaped inside JSON it would be unreadable. The JSON goes
-  # last because tool-output truncation keeps only the tail of a long result
-  # and the continuation id must survive it
   out = dict(result)
-  roadmap_text = out.pop("roadmap", "")
-  if roadmap_text:
-    print("--- Roadmap (paste this block into your final message) ---")
-    print(roadmap_text)
-    print()
+  out.pop("roadmap", None)
   print(json.dumps(out, ensure_ascii=False, indent=2))
 
 

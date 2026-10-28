@@ -539,6 +539,8 @@ displayOptionsBtn.__reactFiber$test = {
 };
 
 const storage = new Map();
+// Handoff redirects served in jetski-chains.json; empty until the auto-switch checks
+let chainRedirects = {};
 let observerCallback = null;
 let rafCallbacks = [];
 const rpcRequests = [];
@@ -615,6 +617,7 @@ global.window = {
             'open-step': '2026-10-21T09:30:00Z',
             'open-current': '2026-10-21T10:05:00Z',
           },
+          redirects: chainRedirects,
         }),
       };
     }
@@ -1312,6 +1315,67 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(fallbackStars.style.width, '28px');
   assert.strictEqual(fallbackStars.style.top, '50%');
   assert.strictEqual(fallbackStars.style.transform, 'translateY(-50%)');
+
+  // A fresh handoff redirect moves a background split pane off the just-archived chat onto
+  // its successor without taking focus from the pane the user works in
+  {
+    const savedPath = global.window.location.pathname;
+    const savedSearch = global.window.location.search;
+    const savedLayout = JSON.parse(JSON.stringify(storeState.multiConvoLayout));
+    const savedConvo = storeState.conversation.cascadeId;
+    const origNow = Date.now;
+    // Step past the 5s chain index cache so the new redirects are fetched
+    let shiftedNow = origNow() + 6000;
+    Date.now = () => shiftedNow;
+    const isoAgo = (ms) => new Date(shiftedNow - ms).toISOString();
+
+    global.window.location.pathname = '/c/solo-active+open-step';
+    global.window.location.search = '?focused=solo-active';
+    storeState.multiConvoLayout.rootNode.children[0].cascadeId = 'solo-active';
+    storeState.multiConvoLayout.rootNode.children[1].cascadeId = 'open-step';
+    storeState.multiConvoLayout.focusedPaneId = 'pane-1';
+    storeState.conversation.cascadeId = 'solo-active';
+    chainRedirects = {
+      'open-step': { to: 'open-current', at: isoAgo(1000), kind: 'handoff' },
+      'open-root': { to: 'open-step', at: isoAgo(1000), kind: 'handoff' },
+      'closed-root': { to: 'closed-tail', at: isoAgo(120000), kind: 'handoff' },
+    };
+    convoViewEl.setAttribute('data-cascade-id', 'open-step');
+    window.history._lastPushed = null;
+    await window.__jetskiChainNav.syncConversationChainNavigators();
+    assert.strictEqual(
+      window.history._lastPushed,
+      '/c/solo-active+open-current?focused=solo-active'
+    );
+    assert.strictEqual(storeState.multiConvoLayout.rootNode.children[1].cascadeId, 'open-current');
+    assert.strictEqual(storeState.multiConvoLayout.rootNode.children[0].cascadeId, 'solo-active');
+    assert.strictEqual(storeState.multiConvoLayout.focusedPaneId, 'pane-1');
+    assert.strictEqual(storeState.conversation.cascadeId, 'solo-active');
+
+    // Going back to the archived piece does not bounce forward a second time
+    convoViewEl.setAttribute('data-cascade-id', 'open-step');
+    window.history._lastPushed = null;
+    await window.__jetskiChainNav.syncConversationChainNavigators();
+    assert.strictEqual(window.history._lastPushed, null);
+
+    // open-root was opened by a star click, so its redirect is ignored
+    convoViewEl.setAttribute('data-cascade-id', 'open-root');
+    await window.__jetskiChainNav.syncConversationChainNavigators();
+    assert.strictEqual(window.history._lastPushed, null);
+
+    // A redirect older than a minute is history, not a live handoff
+    convoViewEl.setAttribute('data-cascade-id', 'closed-root');
+    await window.__jetskiChainNav.syncConversationChainNavigators();
+    assert.strictEqual(window.history._lastPushed, null);
+
+    chainRedirects = {};
+    Date.now = origNow;
+    convoViewEl.setAttribute('data-cascade-id', 'open-current');
+    global.window.location.pathname = savedPath;
+    global.window.location.search = savedSearch;
+    storeState.multiConvoLayout = savedLayout;
+    storeState.conversation.cascadeId = savedConvo;
+  }
 
   // Verify locateConversationInSidebar resolves chain tail, opens sidebar, unhides bucket,
   // expands collapsed sections/pagination, scrolls virtualizer, and pulses the DOM row

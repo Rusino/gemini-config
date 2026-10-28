@@ -1371,9 +1371,9 @@ def handoff_steps(conv_id: str, target: dict, new_title: str) -> str:
         " to restart them, exact next step. It moves to the continuation as is.\n"
         f'3. Run `python3 {LIFECYCLE_CLI} handoff {conv_id}{topic_opt} --next "<1-line next'
         ' action>"`.\n'
-        "4. In your final message paste the roadmap block from the handoff output"
-        f" and the link `[👉 {new_title}](conversation://<new_conversation_id>)`,"
-        " then end the turn."
+        "4. In your final message give a 1-line handoff summary and the link"
+        f" `[👉 {new_title}](conversation://<new_conversation_id>)`, then end the"
+        " turn (never dump the roadmap)."
     )
   return (
       f"1. Write `{target['file']}` (write_to_file, UserFacing: true): goal, Epic"
