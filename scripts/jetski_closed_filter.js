@@ -160,6 +160,8 @@
   const manualVisitedCids = (window.__jetskiManualVisitedCids ||= new Set());
   const observedArchivedViewIds = new Set();
   const autoSwitchedEdges = (window.__jetskiAutoSwitchedEdges ||= new Set());
+  // Tracks the latest seen modification timestamp (ms) per cascadeId across re-injections
+  const locallySeenModifiedMs = (window.__jetskiSeenModifiedMs ||= new Map());
   // Caches jetski-roadmaps.json across DOM sync cycles within ROADMAP_INDEX_TTL_MS
   const ROADMAP_INDEX_TTL_MS = 5000;
   let roadmapIndexCache = null;
@@ -3057,22 +3059,65 @@
     return false;
   }
 
-  // Classifies a needs-me chat into 'urgent' (waitingSteps or unread finished turn) vs 'open'
-  function classifyInboxTier(cascadeId, summary, store) {
-    if (!summary) return 'open';
-    // Chats blocked on tool approval or user questions always rank in urgent tier
-    if (Array.isArray(summary.waitingSteps) && summary.waitingSteps.length > 0) {
-      return 'urgent';
-    }
-    // Chats whose latest finished turn has not been viewed yet rank in urgent tier
-    const lastMod = Date.parse(summary.lastModifiedTime || '') || 0;
-    if (lastMod > 0 && !isCurrentlyViewing(cascadeId, store)) {
-      const lastView = Date.parse(summary.annotations?.lastUserViewTime || '') || 0;
-      if (!lastView || lastMod > lastView) {
-        return 'urgent';
+  // Converts a protobuf Timestamp ({seconds, nanos}), Date, numeric ms, or ISO string to epoch ms
+  function parseTimestampMs(ts) {
+    if (!ts) return 0;
+    if (typeof ts === 'number') return Number.isFinite(ts) ? ts : 0;
+    if (typeof ts === 'string') return Date.parse(ts) || 0;
+    if (ts instanceof Date) return ts.getTime() || 0;
+    if (typeof ts === 'object' && ts.seconds !== undefined && ts.seconds !== null) {
+      const sec = Number(ts.seconds);
+      const nanos = Number(ts.nanos || 0);
+      if (Number.isFinite(sec)) {
+        return sec * 1000 + (Number.isFinite(nanos) ? Math.floor(nanos / 1e6) : 0);
       }
     }
-    return 'open';
+    return 0;
+  }
+
+  // Returns true when a needs-me chat has activity or waitingSteps not yet viewed by the user
+  function isUnseenNeedsReaction(cascadeId, summary, store) {
+    if (!summary) return false;
+    const lastMod =
+      parseTimestampMs(summary.lastModifiedTime) ||
+      parseTimestampMs(summary.createdTime);
+    const serverLastView = parseTimestampMs(summary.annotations?.lastUserViewTime);
+    // Any chat currently open in a pane is actively viewed by the user right now
+    if (isCurrentlyViewing(cascadeId, store)) {
+      locallySeenModifiedMs.set(
+        cascadeId,
+        Math.max(
+          lastMod,
+          serverLastView + 1,
+          Date.now(),
+          locallySeenModifiedMs.get(cascadeId) || 0,
+          1
+        )
+      );
+      return false;
+    }
+    const localLastView = locallySeenModifiedMs.get(cascadeId) || 0;
+    const effectiveLastView = Math.max(serverLastView, localLastView);
+    if (summary.annotations?.markedAsUnread && localLastView <= serverLastView) {
+      return true;
+    }
+    if (lastMod > 0) {
+      return effectiveLastView === 0 || lastMod > effectiveLastView;
+    }
+    return (
+      Array.isArray(summary.waitingSteps) &&
+      summary.waitingSteps.length > 0 &&
+      effectiveLastView === 0
+    );
+  }
+
+  // Classifies an unseen inbox chat into 'urgent' (blocked on waitingSteps) vs 'unseen'
+  function classifyInboxTier(summary) {
+    // Chats blocked on tool approval or user questions rank above unread finished turns
+    if (Array.isArray(summary?.waitingSteps) && summary.waitingSteps.length > 0) {
+      return 'urgent';
+    }
+    return 'unseen';
   }
 
   // Builds a single Needs-Reaction inbox row with click navigation and quick-action buttons
@@ -3155,8 +3200,17 @@
     bindActionBtnHandlers(row, () => {
       const cid = row.getAttribute('data-cascade-id');
       if (cid) {
+        const s = findReduxStore()?.getState()?.trajectorySummaries?.summaries?.[cid];
+        const modMs =
+          parseTimestampMs(s?.lastModifiedTime) ||
+          parseTimestampMs(s?.createdTime) ||
+          Date.now();
+        const srvViewMs = parseTimestampMs(s?.annotations?.lastUserViewTime);
+        // Mark the clicked chat as seen immediately so it leaves the inbox before RPC round-trip
+        locallySeenModifiedMs.set(cid, Math.max(modMs, srvViewMs + 1, Date.now(), 1));
         manualVisitedCids.add(cid);
         openConversation(cid);
+        ensureNeedsReactionInbox();
       }
     });
 
@@ -3259,15 +3313,19 @@
     for (const [cascadeId, summary] of Object.entries(summariesMap)) {
       if (!isEligibleTopLevelSummary(cascadeId, summary)) continue;
       if (classifyChatBucket(summary, '') !== 'needs-me') continue;
+      // Show only chats whose latest turn or waiting prompt has not been viewed yet
+      if (!isUnseenNeedsReaction(cascadeId, summary, store)) continue;
       const rawTitle = summary?.annotations?.title || summary?.summary || '';
       const baseTitle = cleanBaseTitle(rawTitle) || rawTitle || cascadeId.slice(0, 8);
       const timeMatch = TIME_PREFIX_EXTRACT_RE.exec(rawTitle);
       const timePrefix = timeMatch ? timeMatch[1] : '';
       const projectId = summary?.trajectoryMetadata?.projectId || '__standalone__';
       const projectName = resolveProjectName(projectId, store);
-      const tier = classifyInboxTier(cascadeId, summary, store);
+      const tier = classifyInboxTier(summary);
       if (tier === 'urgent') urgentCount++;
-      const modTs = Date.parse(summary?.lastModifiedTime || '') || 0;
+      const modTs =
+        parseTimestampMs(summary?.lastModifiedTime) ||
+        parseTimestampMs(summary?.createdTime);
       items.push({
         cascadeId,
         baseTitle,

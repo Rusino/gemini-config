@@ -1539,7 +1539,7 @@ const liveBucketBtn = (k) =>
     behavior: 'smooth',
   });
 
-  // Verify Needs-Reaction inbox widget mounted right before vlistEl and tracks urgent vs open tiers
+  // Verify Needs-Reaction inbox widget mounted right before vlistEl and shows only unseen chats
   const inboxEl = bodyEl.querySelector('.jetski-needs-reaction-inbox');
   assert(inboxEl, 'Needs-Reaction inbox widget must be mounted');
   assert.strictEqual(
@@ -1547,10 +1547,12 @@ const liveBucketBtn = (k) =>
     bodyEl.children.indexOf(vlistEl) - 1,
     'Inbox widget must be positioned immediately before conversation-list-sidebar'
   );
-  assert.strictEqual(inboxEl.getAttribute('data-empty'), 'false');
+  // Before any unseen timestamps or waitingSteps exist, the inbox is hidden
+  assert.strictEqual(inboxEl.getAttribute('data-empty'), 'true');
+  assert.strictEqual(inboxEl.style.display, 'none');
   assert.strictEqual(inboxEl.getAttribute('data-collapsed'), 'false');
 
-  // Seed store projects map with activity badges and add urgent chats (waitingSteps + unread turn)
+  // Seed store projects map with activity badges and add unseen vs already-viewed chats
   storeState.projects = {
     projects: {
       'proj-1': { name: 'Breaking Chats · ⟳ 1 ⚠ 2' },
@@ -1571,10 +1573,27 @@ const liveBucketBtn = (k) =>
         [
           'urgent-unread',
           makeSummary('[14:05] ⦿ Finished unread analysis', 'proj-1', {}, false, {
-            lastModifiedTime: '2026-10-28T14:05:00Z',
+            // Protobuf Timestamp object with bigint seconds as stored in Redux
+            lastModifiedTime: { seconds: 1793196300n, nanos: 0 },
             annotations: {
               archived: false,
-              lastUserViewTime: '2026-10-28T13:00:00Z',
+              lastUserViewTime: { seconds: 1793192400n, nanos: 0 },
+            },
+          }),
+        ],
+        [
+          'never-viewed',
+          makeSummary('[14:01] ⦿ Never opened root chat', 'proj-1', {}, false, {
+            lastModifiedTime: '2026-10-28T14:01:00Z',
+          }),
+        ],
+        [
+          'solo-active',
+          makeSummary('[18:51] ⦿ Issue #195102 fontconfig', 'proj-1', {}, false, {
+            lastModifiedTime: '2026-10-28T12:00:00Z',
+            annotations: {
+              archived: false,
+              lastUserViewTime: '2026-10-28T12:05:00Z',
             },
           }),
         ],
@@ -1594,25 +1613,25 @@ const liveBucketBtn = (k) =>
   });
   while (rafCallbacks.length > 0) rafCallbacks.shift()();
 
-  // open-current is viewed in convoViewEl, so even with lastModifiedTime > lastUserViewTime
-  // it stays in the 'open' tier, while urgent-question and urgent-unread are in 'urgent'
+  // open-current (viewed in convoViewEl) and solo-active (already viewed) are excluded;
+  // only urgent-question, urgent-unread, and never-viewed appear in the inbox
+  assert.strictEqual(inboxEl.getAttribute('data-empty'), 'false');
+  assert.strictEqual(inboxEl.style.display, '');
   assert.strictEqual(inboxEl.getAttribute('data-urgent'), 'true');
-  assert.strictEqual(inboxEl.getAttribute('data-urgent-count'), '2');
-  assert.strictEqual(inboxEl.getAttribute('data-count'), '5');
+  assert.strictEqual(inboxEl.getAttribute('data-urgent-count'), '1');
+  assert.strictEqual(inboxEl.getAttribute('data-count'), '3');
   const urgentPill = inboxEl.querySelector('[data-testid="jetski-inbox-urgent-pill"]');
   assert(urgentPill, 'Urgent pill must be rendered when urgentCount > 0');
-  assert.strictEqual(urgentPill.textContent, '🔥 2');
+  assert.strictEqual(urgentPill.textContent, '🔥 1');
 
   const inboxRows = inboxEl.querySelectorAll('.jetski-inbox-row');
-  assert.strictEqual(inboxRows.length, 5);
+  assert.strictEqual(inboxRows.length, 3);
   assert.deepStrictEqual(
     inboxRows.map((r) => [r.getAttribute('data-cascade-id'), r.getAttribute('data-tier')]),
     [
       ['urgent-question', 'urgent'],
-      ['urgent-unread', 'urgent'],
-      ['open-current', 'open'],
-      ['solo-active', 'open'],
-      ['quoted-title', 'open'],
+      ['urgent-unread', 'unseen'],
+      ['never-viewed', 'unseen'],
     ]
   );
 
@@ -1639,38 +1658,31 @@ const liveBucketBtn = (k) =>
   observerCallback([{ target: inboxEl }, { target: inboxRows[0] }]);
   assert.strictEqual(rafCallbacks.length, 0, 'Inbox mutations must not trigger observer sync');
 
-  // Clicking an inbox row navigates to that conversation and marks it manually visited
+  // Clicking an inbox row navigates to that conversation, marks it seen, and drops it from inbox
   window.history._lastPushed = null;
   advanceClock();
   inboxRows[0].dispatchEvent('pointerdown', { button: 0 });
   inboxRows[0].dispatchEvent('click', { button: 0 });
   assert.strictEqual(window.history._lastPushed, '/c/urgent-question');
   assert(window.__jetskiManualVisitedCids.has('urgent-question'));
+  assert.strictEqual(inboxEl.getAttribute('data-count'), '2');
+  assert.strictEqual(inboxEl.getAttribute('data-urgent-count'), '0');
+  assert.strictEqual(inboxEl.getAttribute('data-urgent'), 'false');
 
   // Clicking the inline Wait button on urgent-unread moves it to ⏳ Waiting and drops it
   rpcRequests.length = 0;
   advanceClock();
-  const inboxWaitBtn = inboxRows[1].querySelector('.jetski-inbox-wait-btn');
+  const rowsAfterClick = inboxEl.querySelectorAll('.jetski-inbox-row');
+  const unreadRow = rowsAfterClick.find((r) => r.getAttribute('data-cascade-id') === 'urgent-unread');
+  assert(unreadRow, 'urgent-unread row must be in inbox');
+  const inboxWaitBtn = unreadRow.querySelector('.jetski-inbox-wait-btn');
   inboxWaitBtn.dispatchEvent('pointerdown', { button: 0 });
   await new Promise((r) => setTimeout(r, 10));
   assert.strictEqual(
     summaryOf('urgent-unread').summary,
     '[14:05] ⏳ Finished unread analysis'
   );
-  assert.strictEqual(inboxEl.getAttribute('data-count'), '4');
-  assert.strictEqual(inboxEl.getAttribute('data-urgent-count'), '1');
-
-  // Clicking the inline Archive button on quoted-title archives it and removes it from inbox
-  rpcRequests.length = 0;
-  advanceClock();
-  const updatedRows = inboxEl.querySelectorAll('.jetski-inbox-row');
-  const quotedRow = updatedRows.find((r) => r.getAttribute('data-cascade-id') === 'quoted-title');
-  assert(quotedRow, 'quoted-title row must still be in inbox before archiving');
-  const inboxArchiveBtn = quotedRow.querySelector('.jetski-inbox-archive-btn');
-  inboxArchiveBtn.dispatchEvent('pointerdown', { button: 0 });
-  await new Promise((r) => setTimeout(r, 10));
-  assert.strictEqual(summaryOf('quoted-title').annotations.archived, true);
-  assert.strictEqual(inboxEl.getAttribute('data-count'), '3');
+  assert.strictEqual(inboxEl.getAttribute('data-count'), '1');
 
   // Clicking the inbox header toggles collapsed state and persists it to localStorage
   const inboxHeader = inboxEl.querySelector('.jetski-inbox-header');
@@ -1683,24 +1695,55 @@ const liveBucketBtn = (k) =>
     '▸'
   );
 
-  // Archiving the remaining needs-me chats hides the inbox widget (data-empty="true")
+  // Clicking the inline Archive button on never-viewed archives it and hides the empty inbox
+  rpcRequests.length = 0;
+  advanceClock();
+  const updatedRows = inboxEl.querySelectorAll('.jetski-inbox-row');
+  const neverViewedRow = updatedRows.find((r) => r.getAttribute('data-cascade-id') === 'never-viewed');
+  assert(neverViewedRow, 'never-viewed row must still be in inbox before archiving');
+  const inboxArchiveBtn = neverViewedRow.querySelector('.jetski-inbox-archive-btn');
+  inboxArchiveBtn.dispatchEvent('pointerdown', { button: 0 });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.strictEqual(summaryOf('never-viewed').annotations.archived, true);
+  assert.strictEqual(inboxEl.getAttribute('data-count'), '0');
+  assert.strictEqual(inboxEl.getAttribute('data-empty'), 'true');
+  assert.strictEqual(inboxEl.style.display, 'none');
+
+  // A chat with markedAsUnread: true and string-encoded protobuf seconds enters the inbox,
+  // and viewing it in the active pane clears it even after switching away to another chat
   reduxStore.dispatch({
     type: 'trajectorySummaries/applyStreamBatch',
     payload: {
       updates: [
-        ['urgent-question', makeSummary('[14:10] ⦿ Ask user question', 'proj-urgent', {}, true)],
-        ['open-current', makeSummary('[10:05] ⦿ Open chain topic', 'proj-1', {}, true)],
         [
-          'solo-active',
-          makeSummary('[18:51] ⦿ Issue #195102 fontconfig', 'proj-1', {}, true),
+          'unread-viewed-in-pane',
+          makeSummary('[14:30] ⦿ Manually unread task', 'proj-1', {}, false, {
+            lastModifiedTime: { seconds: '1793196000', nanos: 0 },
+            annotations: {
+              archived: false,
+              markedAsUnread: true,
+              lastUserViewTime: { seconds: '1793196100', nanos: 0 },
+            },
+          }),
         ],
       ],
       deletes: [],
     },
   });
   while (rafCallbacks.length > 0) rafCallbacks.shift()();
-  assert.strictEqual(inboxEl.getAttribute('data-empty'), 'true');
-  assert.strictEqual(inboxEl.style.display, 'none');
+  assert.strictEqual(inboxEl.getAttribute('data-count'), '1');
+  convoViewEl.setAttribute('data-cascade-id', 'unread-viewed-in-pane');
+  observerCallback([{ target: convoViewEl }]);
+  while (rafCallbacks.length > 0) rafCallbacks.shift()();
+  assert.strictEqual(inboxEl.getAttribute('data-count'), '0');
+  convoViewEl.setAttribute('data-cascade-id', 'solo-active');
+  observerCallback([{ target: convoViewEl }]);
+  while (rafCallbacks.length > 0) rafCallbacks.shift()();
+  assert.strictEqual(
+    inboxEl.getAttribute('data-count'),
+    '0',
+    'Chat viewed in active pane must not reappear in inbox as markedAsUnread after switching away'
+  );
 
   // Cleanup must clear located-row attribute, remove locate buttons, and remove the inbox widget
   window.__jetskiClosedChatsFilterCleanup();
