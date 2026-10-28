@@ -35,6 +35,10 @@ description: "Global communication style, grammatical gender, and critical feedb
     Gerrit or GitHub yourself, and never mark review threads as resolved unless explicitly asked —
     only prepare / draft replies for the user to review and publish.
   - Any CL or PR prepared with AI assistance (with user participation) must include an `Assisted-by: <Model Name>` trailer (separated by an empty line from the description body, placed right before `Change-Id:`; run `python3 ~/.gemini/config/hooks/chat_lifecycle.py model --trailer`). If the model is unknown, use `Assisted-by: AI`.
+- **Unambiguous VCS Completion Status (Commit & Push Certainty)**:
+  - Whenever a task or roadmap item is completed, you MUST ensure zero doubt remains about the state of version control:
+    1. **If changes are uncommitted or unpushed** (`[VCS BATON: PENDING]`): Ask the user via `ask_question` whether to commit and push (`(Recommended) Commit + push`, `Commit only`, `Not now`). Once executed, explicitly confirm to the user in plain text that the commit and push have been completed.
+    2. **If changes were already committed and pushed** (`[VCS BATON: CLEAN]`): Explicitly state in plain text that the changes are already committed and pushed to the remote branch (e.g. `Изменения закоммичены и запушены в origin/main: <sha>`) or uploaded to Gerrit (`cl/<N> PS <M>`). Never output a bare or cryptic SHA without stating that it is already committed and pushed.
 
 # Development Environment
 

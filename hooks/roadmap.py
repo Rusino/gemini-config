@@ -1180,7 +1180,7 @@ def _inspect_repo_vcs_baton(
           'Gerrit = amnesia-precommit + corpus gate + git cl upload, never CQ)'
       )
     else:
-      action_str = f"report {cl_label or head_short} ({head_short}) to user"
+      action_str = f"report to user in plain text: already uploaded ({cl_label or head_short})"
 
   else:
     gerrit_str = "n/a"
@@ -1193,7 +1193,7 @@ def _inspect_repo_vcs_baton(
     if is_pending:
       action_str = 'call ask_question ("Commit + push" / "Commit only" / "Not now")'
     else:
-      action_str = f"report {head_short} → {upstream_ref or 'local'} to user"
+      action_str = f"report to user in plain text: already committed and pushed ({head_short} → {upstream_ref or 'local'})"
 
   status_word = "PENDING" if is_pending else "CLEAN"
   own_str = ", ".join(own_dirty[:8]) if own_dirty else "none"
