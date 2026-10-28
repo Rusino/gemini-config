@@ -140,6 +140,33 @@ def decl_names(lines):
     return {n for n in names if n not in KEYWORDS and len(n) > 2 and not n.isupper()}
 
 
+
+def choose_asan_bot(effective_paths):
+    asan_bots = set()
+    for path in effective_paths:
+        if path.endswith(('.md', '.dart', '.ts', '.txt', '.py', '.gn', '.gni', '.bzl', '.json')) or "BUILD" in path or "OWNERS" in path:
+            continue
+            
+        p = path.lower()
+        if re.search(r"^(modules/(skparagraph|skunicode|skshaper)|src/ports|tests?/(paragraph|shaper|unicode|text|font))", p) or "/text/" in p or "font" in p:
+             asan_bots.add("Test-Ubuntu24.04-Clang-GCE-CPU-AVX2-x86_64-Debug-All-NativeFonts_FreeType_ASAN_Upload")
+        elif "metal" in p and ("graphite" in p or "ganesh" in p or "gpu" in p):
+             asan_bots.add("Test-Mac15-Clang-MacMini16.10-GPU-AppleM4-arm64-Debug-All-ASAN_Graphite_Native_Metal")
+        elif "graphite" in p or "ganesh" in p or "gpu" in p or "vulkan" in p:
+             asan_bots.add("Test-Ubuntu24.04-Clang-NUC11TZi5-GPU-IntelIrisXe-x86_64-Debug-All-DDL3_ASAN_Vulkan")
+        elif re.search(r"^(src|include|tests|bench)/", p) and p.endswith(('.h', '.cpp', '.c', '.cc', '.m', '.mm')):
+             asan_bots.add("Test-Ubuntu24.04-Clang-GCE-CPU-AVX2-x86_64-Debug-All-ASAN")
+             
+    if "Test-Ubuntu24.04-Clang-GCE-CPU-AVX2-x86_64-Debug-All-NativeFonts_FreeType_ASAN_Upload" in asan_bots:
+        return "Test-Ubuntu24.04-Clang-GCE-CPU-AVX2-x86_64-Debug-All-NativeFonts_FreeType_ASAN_Upload", "Text/Fonts/Ports/Perf diff"
+    if "Test-Ubuntu24.04-Clang-NUC11TZi5-GPU-IntelIrisXe-x86_64-Debug-All-DDL3_ASAN_Vulkan" in asan_bots:
+        return "Test-Ubuntu24.04-Clang-NUC11TZi5-GPU-IntelIrisXe-x86_64-Debug-All-DDL3_ASAN_Vulkan", "Graphite/Ganesh/Vulkan GPU diff"
+    if "Test-Mac15-Clang-MacMini16.10-GPU-AppleM4-arm64-Debug-All-ASAN_Graphite_Native_Metal" in asan_bots:
+         return "Test-Mac15-Clang-MacMini16.10-GPU-AppleM4-arm64-Debug-All-ASAN_Graphite_Native_Metal", "Metal GPU diff"
+    if "Test-Ubuntu24.04-Clang-GCE-CPU-AVX2-x86_64-Debug-All-ASAN" in asan_bots:
+        return "Test-Ubuntu24.04-Clang-GCE-CPU-AVX2-x86_64-Debug-All-ASAN", "General CPU C++ diff"
+    return None, None
+
 def is_public_header(path):
     return bool(re.match(r"^(include/|modules/[^/]+/include/)", path)) and path.endswith(".h")
 
@@ -311,11 +338,14 @@ def advise(args):
     if args.strong_only:
         recs = {c: r for c, r in recs.items() if r["tier"] == "STRONG"}
 
-    own = meta["owner"] == ME
+    external = not meta["owner"].endswith("@google.com")
+
+    asan_bot, asan_reason = choose_asan_bot(files.keys())
+
     print(f"# Canary advice: {meta['subject']}")
     if meta["cl"]:
         print(f"CL {GERRIT}/c/skia/+/{meta['cl']}/{meta['patchset']}  owner={meta['owner']}"
-              f"  ({'own' if own else 'review'})")
+              f"  ({'own' if own else 'review'}{', external' if external else ''})")
     print(f"files: {len(files)}, client-relevant: {len(effective)}")
     if not recs:
         print("\nNo canary recommended: the diff has no client-visible surface.")
@@ -324,26 +354,65 @@ def advise(args):
         for reason, paths in recs[c]["reasons"].items():
             shown = ", ".join(paths[:3]) + (f" +{len(paths) - 3} more" if len(paths) > 3 else "")
             print(f"- {reason}" + (f" ({shown})" if paths else ""))
+            
+    if asan_bot:
+        print(f"\n## ASAN [ALWAYS_RUN]")
+        print(f"- {asan_reason} -> {asan_bot}")
+
     for n in notes:
         print(f"\nNOTE: {n}")
     if agent_todo:
         print("\nAGENT TODO (google3 usage, run before finalizing):")
         for t in agent_todo:
             print(f"- {t}")
-    bots = [c for c in recs if c.startswith("Canary-")]
-    if bots:
-        issue = f" -i {meta['cl']}" if meta["cl"] else ""
-        cmd = f"git cl try{issue} -B {BUCKET} " + " ".join(f"-b {b}" for b in bots)
-        print(f"\n{'Command (run only after user approval)' if own else 'For the author'}:")
-        print(f"  {cmd}")
 
+    bots_to_run = []
+    canary_bots = [c for c in recs if c.startswith("Canary-")]
+    
+    # Policy: agent ALWAYS triggers ASAN
+    if asan_bot:
+        bots_to_run.append(asan_bot)
+        
+    # Policy: agent triggers Canary for external authors automatically
+    if external and canary_bots:
+        bots_to_run.extend(canary_bots)
+
+    if bots_to_run or (canary_bots and own):
+        issue = f" -i {meta['cl']}" if meta["cl"] else ""
+        
+        if bots_to_run:
+            cmd = f"git cl try{issue} -B {BUCKET} " + " ".join(f"-b {b}" for b in bots_to_run)
+            print(f"\nAGENT ACTION (execute this command):")
+            print(f"  {cmd}")
+            
+        if canary_bots and not external and not own:
+            # Not external, not own -> draft a comment for the author to trigger canaries
+            cmd = f"git cl try{issue} -B {BUCKET} " + " ".join(f"-b {b}" for b in canary_bots)
+            print(f"\nFor the internal author (draft comment to ask them to run canaries):")
+            print(f"  {cmd}")
+            
+        if canary_bots and own:
+            cmd = f"git cl try{issue} -B {BUCKET} " + " ".join(f"-b {b}" for b in canary_bots)
+            if not asan_bot:
+                print(f"\nCommand (run only after user approval):")
+                print(f"  {cmd}")
+            else:
+                # If asan_bot is present, it's already in AGENT ACTION, but we need to prompt the user to run canaries too.
+                # Actually, wait. For own CL, does the agent run ASAN automatically?
+                # "ASAN try job агент запускает САМ (git cl try), не просит автора. Касается и своих CL, и CL на ревью" -> YES.
+                # But canaries for own CL still require user approval?
+                # "Для внутренних авторов (Googlers) канарейки остаются как сейчас." -> YES.
+                print(f"\nCanary Command (run only after user approval):")
+                print(f"  {cmd}")
+    
     if not args.no_log:
         os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
         with open(LEDGER, "a") as fh:
             fh.write(json.dumps({
                 "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
-                "cl": meta["cl"], "patchset": meta["patchset"], "own": own,
+                "cl": meta["cl"], "patchset": meta["patchset"], "own": own, "external": external,
                 "recommended": {c: r["tier"] for c, r in recs.items()},
+                "asan_bot": asan_bot,
             }) + "\n")
 
 
@@ -361,19 +430,35 @@ def cmd_stats(_args):
     with open(LEDGER) as fh:
         for line in fh:
             e = json.loads(line)
-            if e.get("cl") and any(k.startswith("Canary-") for k in e["recommended"]):
+            if e.get("cl") and (any(k.startswith("Canary-") for k in e.get("recommended", {})) or e.get("asan_bot")):
                 latest[e["cl"]] = e
     followed = total = 0
     for cl, e in sorted(latest.items()):
         cur = gerrit_json(f"/changes/{cl}?o=CURRENT_REVISION")
         cur_ps = next(iter(cur["revisions"].values()))["_number"]
-        for canary in (k for k in e["recommended"] if k.startswith("Canary-")):
+        
+        # Check canaries
+        for canary in (k for k in e.get("recommended", {}) if k.startswith("Canary-")):
             ran = any(bb_builds(canary, n=1, cl=f"{GERRIT}/c/skia/+/{cl}/{ps}")
                       for ps in range(e["patchset"], cur_ps + 1))
             total += 1
             followed += ran
-            print(f"{cl} {'own' if e['own'] else 'rev'} {canary:16} "
-                  f"{e['recommended'][canary]:8} {'RAN' if ran else 'skipped'}")
+            
+            # Note RAN-by-agent if external
+            status = 'RAN-by-agent' if ran and e.get("external") else ('RAN' if ran else 'skipped')
+            
+            print(f"{cl} {'own' if e.get('own') else 'rev'} {canary:16} "
+                  f"{e['recommended'][canary]:8} {status}")
+                  
+        # Check ASAN
+        asan_bot = e.get("asan_bot")
+        if asan_bot:
+            ran = any(bb_builds(asan_bot, n=1, cl=f"{GERRIT}/c/skia/+/{cl}/{ps}")
+                      for ps in range(e["patchset"], cur_ps + 1))
+            status = 'RAN-by-agent' if ran else 'skipped'
+            print(f"{cl} {'own' if e.get('own') else 'rev'} {asan_bot[:25]+'...':25} "
+                  f"{'ALWAYS':8} {status}")
+                  
     if total:
         print(f"\nfollow rate: {followed}/{total} = {100 * followed // total}%")
 

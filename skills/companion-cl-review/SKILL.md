@@ -192,7 +192,7 @@ When the CL under review is owned by the user (Gerrit `owner`, not merely the up
 3. **Before reviewers are involved** (no reviewers on the CL yet, the usual case for self-review): upload freely without asking; there are no votes to reset and nobody to notify.
 4. **After reviewers are added**: prepare the patchsets locally and **ask the user before pushing**, because every upload resets copied `Code-Review` votes and notifies reviewers. Upload the intermediate failing-tests patchset with `%notify=NONE` to avoid an extra notification.
 5. **Not uploaded yet** (local branch only): use two local commits (tests, then fix) instead of patchsets; squashing before upload is the user's choice.
-6. **Never trigger CQ** on any patchset unless the user explicitly asks.
+6. **ASAN Gate**: Automatically trigger the ASAN try job (via `skia-canary-advisor` or `git cl try`) for the fix patchset. Never trigger CQ on any patchset unless the user explicitly asks.
 
 ---
 

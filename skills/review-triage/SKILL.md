@@ -134,9 +134,9 @@ For every targeted single-CL review in `🔴 SURGICAL AUDIT / CORE DOMAIN` (and 
 
 For surviving Skia CLs in `🔴 SURGICAL AUDIT` or `🟠 PUSHBACK`, run
 [`skia-canary-advisor`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/skia-canary-advisor/SKILL.md)
-(`canary_advisor.py advise --cl <N>`). Never trigger canaries on someone else's CL; if STRONG
-canaries remain after the `AGENT TODO` google3 checks, add a draft comment asking the author to run
-them, naming the symbol/guard and usage evidence.
+(`canary_advisor.py advise --cl <N>`). Run ASAN automatically. For external authors, trigger recommended canaries automatically. For internal authors, suggest canaries in chat, do not ask them in Gerrit comments.
+
+
 
 ## Report Contract: Execution Ledger & Finding Statuses
 

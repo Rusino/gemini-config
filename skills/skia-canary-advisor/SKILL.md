@@ -1,17 +1,14 @@
 ---
 name: skia-canary-advisor
 description: >-
-  Recommend (never trigger) Skia Canary try jobs — Canary-Flutter, Canary-G3, Canary-Chromium,
-  Canary-Android — for an own or reviewed Skia CL, based on the client-visible surface of the diff
-  (text modules, public API, removed SK_* guards, build files, font ports) and live canary health
-  from Buildbucket. Trigger from `amnesia-precommit` (own CLs) and `review-triage` (others' CLs),
-  or when asked "нужен ли канареечный билд", "какие канарейки запустить", "canary for this CL".
+  Recommend and trigger Skia Canary try jobs and ASAN bots for a Skia CL based on the diff.
+  Trigger from `amnesia-precommit` (own CLs) and `review-triage` (others' CLs).
+  Agent ALWAYS triggers the ASAN bot. Agent triggers canaries automatically for external authors.
 ---
 
-# Skia Canary Advisor
+# Skia Canary & ASAN Advisor
 
-Recommendation-only mode: the user decides. The ledger records every recommendation so that
-`stats` can show the follow rate; if it stays near 100%, switch own CLs to auto-trigger.
+The script checks client-visible diff surface and selects appropriate ASAN and Canary bots.
 
 ## Run
 
@@ -25,20 +22,24 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
 
 ## Agent steps
 
-1. Run `advise` once, on the final patchset (before CR+1 or before your LGTM), not on every
-   patchset: median canary runtime is ~8 min (G3), ~40 min (Chromium), ~75 min (Android),
-   and each run uses target CQ capacity.
-2. Execute every `AGENT TODO` line with `code_search`. A hit makes Canary-G3 STRONG; zero hits for
-   all symbols lets you downgrade a G3 recommendation that came only from API changes.
+1. Run `advise` once on the final patchset (before CR+1 or before LGTM).
+2. Execute every `AGENT TODO` line with `code_search`. A hit makes Canary-G3 STRONG.
 3. Present the result: STRONG items as "run", CONSIDER items as "only if rendering may change".
-4. Own CL: show the printed `git cl try ...` command and run it only after the user says yes.
-   Reviewed CL: never trigger; draft a review comment for the author naming the canaries and the
-   reason (symbol + usage count), for the user to publish.
-5. A red canary is not automatically the CL's fault: Canary-Chromium and Canary-G3 fail often on
-   their own. Compare failing targets with the target's tip before blaming the CL.
+4. **Execution Policy (Agent Actions)**:
+   - **ASAN**: If an ASAN bot is recommended, YOU (the agent) MUST execute the `git cl try` command provided under `AGENT ACTION` immediately, without asking the author or the user.
+   - **External Authors** (owner is not `@google.com`): YOU (the agent) MUST execute the `git cl try` command for ALL recommended canaries AND the ASAN bot immediately, without asking.
+   - **Internal Authors / Own CLs**: Show the printed `Canary Command` for canaries and run it ONLY after the user explicitly approves. (For ASAN, you still run it automatically).
+5. A red canary is not automatically the CL's fault. Compare failing targets with the target's tip before blaming the CL.
+
+## ASAN Sanitizer Selection
+
+The script automatically selects one ASAN bot based on the diff:
+- Text/Fonts C++ -> `Test-Ubuntu24.04-Clang-GCE-CPU-AVX2-x86_64-Debug-All-NativeFonts_FreeType_ASAN_Upload`
+- GPU (Graphite/Vulkan) -> `Test-Ubuntu24.04-Clang-NUC11TZi5-GPU-IntelIrisXe-x86_64-Debug-All-DDL3_ASAN_Vulkan`
+- GPU (Metal) -> `Test-Mac15-Clang-MacMini16.10-GPU-AppleM4-arm64-Debug-All-ASAN_Graphite_Native_Metal`
+- General CPU -> `Test-Ubuntu24.04-Clang-GCE-CPU-AVX2-x86_64-Debug-All-ASAN`
+(Does not trigger for docs/Dart/TS/markdown-only CLs).
 
 ## Health fallback
 
-If `Canary-Flutter` has no SUCCESS/FAILURE in 45 days, the script replaces it with local
-`flutter-test-paragraph-engine` + Canary-G3. It switches back automatically once Canary-Flutter
-produces verdicts again.
+If `Canary-Flutter` has no SUCCESS/FAILURE in 45 days, the script replaces it with local `flutter-test-paragraph-engine` + Canary-G3.

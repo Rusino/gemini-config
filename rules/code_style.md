@@ -57,7 +57,7 @@ description: "Skia-style C++ minimalism and suppression of LLM coding reflexes."
   present them in chat for review); only the user publishes review submissions or resolves threads
 - **No Auto-Submit or Automated CQ Votes**: Never vote `Auto-Submit+1`, `Commit-Queue+1` (dry run),
   or `Commit-Queue+2` on Gerrit CLs, and never auto-merge GitHub PRs, unless the user explicitly
-  asks for it. Do not trigger CI submission automatically
+  asks for it (Try jobs, such as ASAN or Canaries triggered via `git cl try`, are NOT CQ votes and CAN be triggered automatically when rules require it). Do not trigger full CI submission automatically
 
 ## 7. Strict Line Length (<= 100 Columns)
 - **Hard 100-character limit**: Every source line, test line, and code comment must strictly stay
