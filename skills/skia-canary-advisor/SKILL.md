@@ -86,6 +86,24 @@ The script automatically selects one ASAN bot based on the diff:
 - General CPU -> `Test-Ubuntu24.04-Clang-GCE-CPU-AVX2-x86_64-Debug-All-ASAN`
 (Does not trigger for docs/Dart/TS/markdown-only CLs).
 
+## Local Chromium Verification (Fast Pre-Canary Check)
+
+When a Skia diff touches `include/private/chromium/`, `src/text/gpu/SkChromeRemoteGlyphCache*`,
+`Fontations` (`src/ports/*fontations*`, `rust/`), `src/ports/SkFontMgr_fontconfig*`, or fixes a
+`crbug` with an HTML/font reproducer (`poc.html`), verify locally before or alongside
+`Canary-Chromium` using the component build in
+`/usr/local/google/home/jlavrova/chromium/src/out/Default` (`is_component_build = true`):
+1. Apply the Skia diff to `/usr/local/google/home/jlavrova/chromium/src/third_party/skia`.
+2. Rebuild `libskia.so` in seconds and run the relevant target:
+   ```bash
+   autoninja -C /usr/local/google/home/jlavrova/chromium/src/out/Default skia
+   # Run blink_platform_unittests, cc_unittests, or headless/live chrome on poc.html
+   ```
+3. Restore the Chromium Skia checkout cleanly after verification:
+   ```bash
+   git -C /usr/local/google/home/jlavrova/chromium/src/third_party/skia checkout -- .
+   ```
+
 ## Health fallback
 
 If `Canary-Flutter` has no SUCCESS/FAILURE in 45 days, the script replaces it with local `flutter-test-paragraph-engine` + Canary-G3.

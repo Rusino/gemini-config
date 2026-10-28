@@ -59,6 +59,9 @@ NO_EFFECT = re.compile(
 # Chromium's skia/BUILD.gn does not build skparagraph/skunicode; Android.bp compiles skparagraph
 # only into skia_gm_srcs; google3 has many direct skparagraph users (YouTube, Impress, Flutter)
 AREA_RULES = [
+    (r"^include/private/chromium/|^src/text/gpu/SkChromeRemoteGlyphCache",
+     ["Canary-Chromium"], "STRONG",
+     "Chromium-specific OOP-R glyph cache and private headers"),
     (r"^modules/(skparagraph|skunicode)/(src|include)/", ["Canary-Flutter", "Canary-G3"], "STRONG",
      "text layout behavior: Flutter and google3 are the SkParagraph/SkUnicode consumers"),
     (r"^modules/skshaper/(src|include)/", ["Canary-Flutter", "Canary-G3"], "STRONG",

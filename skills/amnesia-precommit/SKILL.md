@@ -192,7 +192,16 @@ When the Skeptic pass completes, process the surviving items as follows:
 1. **Run the Relevant Test Suite Once (Executable Code Only, Enforced by `CORPUS-CHECK GUARD` Before Upload/Push)**:
    - **Skia (`SkParagraph` / `SkUnicode` / `SkShaper`)**: Build and run native Skia `dm --match SkParagraph` (`skia-test-paragraph`). In addition, whenever **executable production code** (excluding comment-only edits, `.md` docs, summaries, or commit messages) under `modules/skparagraph/{src,include}/`, `modules/skunicode/{src,include}/`, or `modules/skshaper/{src,include}/` is modified, you **must** also run `flutter-test-paragraph-engine` (`~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py`) before `git cl upload`, `gh pr create`, or `git push` so Flutter framework layout, intrinsic width, and widget consumers (including `dropdown_menu_test.dart`) are verified with zero regressions.
    - **Flutter Engine / WebParagraph**: Whenever **executable production code** under `lib/web_ui/lib/` is modified, you **must** run `webparagraph-corpus` (`~/.gemini/config/skills/webparagraph-corpus/scripts/run_webparagraph_corpus.py`, both Part 1 `felt` and Part 2 `packages/flutter`) before `git cl upload`, `gh pr create`, or `git push`.
-  - **Skia Canary & ASAN Recommendation**: For Skia diffs with executable changes, run `skia-canary-advisor`. You MUST automatically trigger the ASAN bot. Present canaries to the user for approval.
+   - **Chromium OOP-R / Fontations / PoC Gate**: Whenever a Skia diff modifies
+     `include/private/chromium/`, `src/text/gpu/SkChromeRemoteGlyphCache*`, `Fontations`
+     (`src/ports/*fontations*`, `rust/`), `src/ports/SkFontMgr_fontconfig*`, or fixes a Chromium bug
+     (`crbug`) with an HTML/font reproducer, apply the diff to
+     `/usr/local/google/home/jlavrova/chromium/src/third_party/skia`, rebuild
+     `autoninja -C /usr/local/google/home/jlavrova/chromium/src/out/Default skia` (`libskia.so`), run
+     the relevant Chromium test (`blink_platform_unittests`, `cc_unittests`, or `chrome` on the
+     reproducer), and restore the checkout with
+     `git -C /usr/local/google/home/jlavrova/chromium/src/third_party/skia checkout -- .`.
+   - **Skia Canary & ASAN Recommendation**: For Skia diffs with executable changes, run `skia-canary-advisor`. You MUST automatically trigger the ASAN bot. Present canaries to the user for approval.
 
 2. **Tree-Pinned 3-Way Rebase & Attestation Invalidation (Pre-Upload Gate)**:
    - **Commit at the Verified Base SHA**: Never move changes across branches, worktrees, or checkouts via raw `git diff | git apply`, `--recount`, or `git stash pop` onto a drifted `HEAD`. Always commit the verified diff at the exact `base_commit_sha` where tests passed, then transfer or update using true 3-way Git mechanics (`git rebase` or `git cherry-pick`).
