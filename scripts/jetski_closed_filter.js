@@ -1369,6 +1369,53 @@
     }
   }
 
+  // Displays the shared surface-glass pill tooltip anchored under a titlebar icon button
+  function showActionPillBubble(btn, labelText) {
+    if (!btn || !labelText) return;
+    activeHoverBtn = null;
+    activeHoverBucket = null;
+    activeHoverRoadmapBadge = null;
+    activeHoverRoadmapProjectId = null;
+    const bubble = ensureBubbleElement();
+    if (!bubble) return;
+    // Reuse the compact 1-line filter pill layout for icon button tooltips
+    if (bubble.getAttribute('data-mode') !== 'filter') {
+      bubble.setAttribute('data-mode', 'filter');
+    }
+    const nextBubbleHtml = `<div class="jcfb-pill"><span>${escapeHtml(labelText)}</span></div>`;
+    if (bubble.innerHTML !== nextBubbleHtml) {
+      bubble.innerHTML = nextBubbleHtml;
+    }
+    if (bubble.getAttribute('data-visible') !== 'true') {
+      bubble.setAttribute('data-visible', 'true');
+    }
+
+    const rect = btn.getBoundingClientRect();
+    const bubbleWidth = bubble.offsetWidth || 180;
+    let left = rect.left;
+    // Clamp horizontal position so right-aligned titlebar buttons never overflow the viewport
+    if (left + bubbleWidth + 8 > window.innerWidth) {
+      left = Math.max(8, window.innerWidth - bubbleWidth - 8);
+    }
+    left = Math.max(8, left);
+    const top = rect.bottom + 6;
+    bubble.style.left = `${Math.round(left)}px`;
+    bubble.style.top = `${Math.round(top)}px`;
+  }
+
+  // Wires hover, focus, and press listeners on an icon button to show/hide the pill bubble
+  function bindHoverBubble(btn, getLabel) {
+    const show = () => {
+      const label = typeof getLabel === 'function' ? getLabel() : getLabel;
+      showActionPillBubble(btn, label);
+    };
+    btn.addEventListener('mouseenter', show);
+    btn.addEventListener('mouseleave', hideBubble);
+    btn.addEventListener('focus', show);
+    btn.addEventListener('blur', hideBubble);
+    btn.addEventListener('pointerdown', hideBubble);
+  }
+
   function escapeHtml(str) {
     return String(str || '')
       .replace(/&/g, '&amp;')
@@ -2793,7 +2840,7 @@
         searchBtn.type = 'button';
         searchBtn.textContent = '🔍';
         searchBtn.setAttribute('aria-label', 'Search this chat and its hidden pieces');
-        searchBtn.setAttribute('title', 'Search this chat and its hidden pieces');
+        bindHoverBubble(searchBtn, '🔍 Search this chat and its hidden pieces');
         bindActionBtnHandlers(searchBtn, () => {
           const cid = findCascadeIdFromElement(moreBtn);
           if (cid) openSearchPanel(cid);
@@ -2810,8 +2857,8 @@
         locateBtn.setAttribute('data-testid', 'jetski-chat-locate-btn');
         locateBtn.textContent = '🎯';
         locateBtn.setAttribute('aria-label', 'Locate this chat in sidebar');
-        locateBtn.setAttribute('title', 'Locate this chat in sidebar');
         locateBtn.setAttribute('data-cascade-id', cascadeId);
+        bindHoverBubble(locateBtn, '🎯 Locate this chat in sidebar');
         bindActionBtnHandlers(locateBtn, () => {
           const cid =
             locateBtn.getAttribute('data-cascade-id') || findCascadeIdFromElement(moreBtn);
