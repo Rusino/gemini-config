@@ -300,7 +300,7 @@ PROMPT_FILLER_WORDS = frozenset({
 
 # Collapses bare entity references into one token so "PR #123" or "cl/123" counts as 1 word
 _ENTITY_UNIT_RE = re.compile(
-    r"\b(?:cl|b|crbug(?:\.com)?)/\d+\b"
+    r"\b(?:crrev(?:\.com)?/c/\d+|cl/\d+|b/\d+|crbug(?:\.com)?/\d+)\b"
     r"|\b(?:PR|Issue|CL|СЛ|сл|bug|баг)\s*(?:#|:|\s)\s*\d+\b"
     r"|\b(?:commit|коммит|sha|rev|revision)\s*(?:#|:|\s)\s*[0-9a-f]{7,40}\b",
     re.IGNORECASE,
@@ -698,21 +698,72 @@ def save_project_models(rules: dict[str, str]) -> None:
     json.dump(rules, f, ensure_ascii=False, indent=2)
 
 
+PENDING_MOVES_FILENAME = ".pending_project_moves.json"
+
+
+def _record_pending_move(app_data_dirs: list[str], cid: str, project_id: str) -> None:
+  """Records a pending move in .pending_project_moves.json across app_data_dirs."""
+  if not cid or not project_id:
+    return
+  for app_dir in app_data_dirs:
+    if not app_dir or not os.path.isdir(app_dir):
+      continue
+    pfile = os.path.join(app_dir, PENDING_MOVES_FILENAME)
+    pending: dict[str, str] = {}
+    if os.path.isfile(pfile):
+      try:
+        with open(pfile, "r", encoding="utf-8") as f:
+          data = json.load(f)
+        if isinstance(data, dict):
+          pending.update({str(k): str(v) for k, v in data.items() if k and v})
+      except Exception:
+        pass
+    pending[cid] = project_id
+    tmp_path = f"{pfile}.{os.getpid()}.tmp"
+    try:
+      with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(pending, f, indent=2)
+      os.replace(tmp_path, pfile)
+    except Exception:
+      pass
+
+
 def get_conversation_project_id(conv_id: str) -> str:
-  """Finds project id for conversation from database or environment."""
+  """Finds project id for conversation using multi-tier resolution or environment."""
   if not conv_id:
     return os.environ.get("ANTIGRAVITY_PROJECT_ID", "").strip()
-  try:
-    from context_guard import _query_summary_db
-  except ImportError:
-    _query_summary_db = None
-
-  for d in find_app_data_dirs():
+  app_dirs = find_app_data_dirs()
+  for d in app_dirs:
+    pfile = os.path.join(d, PENDING_MOVES_FILENAME)
+    if os.path.isfile(pfile):
+      try:
+        with open(pfile, "r", encoding="utf-8") as f:
+          data = json.load(f)
+        if isinstance(data, dict) and conv_id in data:
+          pid = str(data[conv_id]).strip()
+          if pid:
+            return pid
+      except Exception:
+        pass
     db_file = os.path.join(d, SUMMARY_DB_NAME)
-    if _query_summary_db and os.path.isfile(db_file):
-      row = _query_summary_db(db_file, conv_id)
-      if row and row[1]:
-        return str(row[1]).strip()
+    if os.path.isfile(db_file):
+      try:
+        from context_guard import _query_summary_db
+
+        row = _query_summary_db(db_file, conv_id)
+        if row and row[1]:
+          return str(row[1]).strip()
+      except Exception:
+        pass
+
+  try:
+    from context_guard import get_conversation_db_info
+
+    _, pid = get_conversation_db_info(conv_id)
+    if pid:
+      return pid
+  except Exception:
+    pass
   return os.environ.get("ANTIGRAVITY_PROJECT_ID", "").strip()
 
 
@@ -910,6 +961,8 @@ def start_conversation_exact(
   new_cid = ls_rpc("StartCascade", body).get("cascadeId", "")
   if not new_cid:
     raise RuntimeError("StartCascade returned no cascadeId")
+  if project_id and project_id != "outside-of-project":
+    _record_pending_move(find_app_data_dirs(), new_cid, project_id)
   ls_rpc(
       "UpdateConversationAnnotations",
       {"cascadeIds": [new_cid], "annotations": {"title": title}, "mergeAnnotations": True},
@@ -1447,6 +1500,7 @@ def _extract_prompt_subject_words(text: str, max_words: int = 4) -> str:
   raw = _PASTED_LIFECYCLE_TITLE_RE.sub(" ", raw)
   raw = _URL_OR_FILE_RE.sub(" ", raw)
   raw = _ENTITY_GERRIT_MENTION_RE.sub(" ", raw)
+  raw = _ENTITY_CRREV_MENTION_RE.sub(" ", raw)
   raw = _ENTITY_UNIT_RE.sub(" ", raw)
   tokens = _TOPIC_WORD_RE.findall(raw)
   subject_tokens: list[str] = []
@@ -1664,7 +1718,7 @@ def set_conversation_topic(
 
 # Regexes to extract entity identifiers from prompts for automatic chat titling:
 _ENTITY_GERRIT_URL_RE = re.compile(
-    r"https?://[a-zA-Z0-9_.-]*-review\.(?:googlesource\.com|git\.corp\.google\.com)/\S*?(\d{5,8})\b"
+    r"https?://([a-zA-Z0-9_.-]*-review)\.(?:googlesource\.com|git\.corp\.google\.com)/\S*?(\d{5,8})\b"
 )
 _ENTITY_GITHUB_PR_URL_RE = re.compile(r"https?://github\.com/[^/\s]+/[^/\s]+/pull/(\d+)")
 _ENTITY_GITHUB_ISSUE_URL_RE = re.compile(r"https?://github\.com/[^/\s]+/[^/\s]+/issues/(\d+)")
@@ -1678,6 +1732,10 @@ _ENTITY_COMMIT_URL_RE = re.compile(
 # Jetski renders a mentioned Gerrit change as "@[<repo> | <number>:<subject>]"; a "/" in the
 # label would mean an owner/repo GitHub mention, whose number is not a CL
 _ENTITY_GERRIT_MENTION_RE = re.compile(r"@\[[^|/\]]+\|\s*(\d{5,8}):")
+_ENTITY_CRREV_MENTION_RE = re.compile(
+    r"@\[(?:crrev(?:\.com)?/c/|chromium-review[^|/\]]*/c/|chromium/src/\+/)?(\d{5,8})[:\]|]"
+)
+_ENTITY_CRREV_SHORT_RE = re.compile(r"(?:^|[\s(])crrev(?:\.com)?/c/(\d{5,8})\b", re.IGNORECASE)
 _ENTITY_CL_SHORT_RE = re.compile(r"(?:^|[\s(])cl/(\d+)\b", re.IGNORECASE)
 _ENTITY_BUG_SHORT_RE = re.compile(r"(?:^|[\s(])b/(\d+)\b", re.IGNORECASE)
 _ENTITY_CRBUG_SHORT_RE = re.compile(r"(?:^|[\s(])crbug(?:\.com)?/(\d+)\b", re.IGNORECASE)
@@ -1704,9 +1762,19 @@ def extract_entity_topic(text: str) -> str | None:
     return None
   # Ignore quoted lifecycle chat titles so examples never hijack current topic
   text = _PASTED_LIFECYCLE_TITLE_RE.sub(" ", text)
+
+  m = _ENTITY_CRREV_SHORT_RE.search(text) or _ENTITY_CRREV_MENTION_RE.search(text)
+  if m:
+    return f"crrev/c/{m.group(1)}"
+
   m = _ENTITY_GERRIT_URL_RE.search(text)
   if m:
-    return f"cl/{m.group(1)}"
+    host = m.group(1).lower()
+    cl_num = m.group(2)
+    if "chromium" in host or "crrev" in host:
+      return f"crrev/c/{cl_num}"
+    return f"cl/{cl_num}"
+
   m = _ENTITY_GITHUB_PR_URL_RE.search(text)
   if m:
     return f"PR #{m.group(1)}"
@@ -3029,6 +3097,9 @@ Commands:
           [--next "..."]              Claims <R_ID> as doing, links <R_ID> -> <new_id>,
           [--model <m>] [--force]     seeds state/<new_id>.md, and removes state/<id>.md.
           [--ignore-live]             Same live subagent/task guard as handoff.
+  start [--project <p>] [--title <Topic>] [--model <m>] "<prompt>"
+                                      Launch an independent root chat (⦿) pinned to
+                                      a project atomically via before_send hook.
   search "<query>"                    Search all chats, archived handoff pieces included
                                       (LS SearchConversations: one best hit per chat, at
                                       most 100 chats, symbols like ✓ never match). Each
@@ -3096,6 +3167,7 @@ KNOWN_COMMANDS = (
     "project-model",
     "handoff",
     "next-task",
+    "start",
     "reopen",
     "wait",
     "finalize",
@@ -3219,6 +3291,126 @@ def parse_next_task_args(args: list[str]) -> dict:
     else:
       _cli_fail("next-task", f"unexpected argument '{a}'")
   return opts
+
+
+def parse_start_args(args: list[str]) -> dict:
+  """Parses `start [--project <p>] [--title <Topic>] [--model <m>] "<prompt>"`."""
+  opts = {
+      "project": "",
+      "title": "",
+      "model": "",
+      "prompt": "",
+  }
+  valued = {
+      "--project": "project",
+      "-p": "project",
+      "--title": "title",
+      "-t": "title",
+      "--model": "model",
+      "-m": "model",
+  }
+  i = 0
+  pos_args: list[str] = []
+  while i < len(args):
+    a = args[i]
+    key, eq, inline = a.partition("=")
+    if eq and key in valued:
+      opts[valued[key]] = inline
+      i += 1
+    elif a in valued and i + 1 < len(args):
+      opts[valued[a]] = args[i + 1]
+      i += 2
+    elif a in valued:
+      _cli_fail("start", f"option '{a}' requires a value")
+    elif a.startswith("-"):
+      _cli_fail("start", f"unknown option '{a}'")
+    else:
+      pos_args.append(a)
+      i += 1
+  if not pos_args:
+    _cli_fail("start", "missing required <prompt> argument")
+  opts["prompt"] = " ".join(pos_args)
+  return opts
+
+
+def cmd_start(opts: dict) -> int:
+  prompt = opts.get("prompt", "").strip()
+  if not prompt:
+    _cli_fail("start", "missing required prompt text")
+    return 1
+
+  # 1. Project
+  project_arg = opts.get("project", "").strip()
+  if project_arg:
+    try:
+      project_id = resolve_project_id(project_arg)
+    except Exception as exc:
+      _cli_fail("start", str(exc))
+      return 1
+  else:
+    project_id = (
+        os.environ.get("ANTIGRAVITY_PROJECT_ID", "").strip()
+        or "outside-of-project"
+    )
+
+  # 2. Topic / Title
+  explicit_topic = opts.get("title", "").strip()
+  if explicit_topic:
+    try:
+      clean_topic = validate_chat_topic(explicit_topic)
+    except InvalidTopicError as exc:
+      _cli_fail("start", str(exc))
+      return 1
+  else:
+    entity = extract_entity_topic(prompt)
+    subj = _extract_prompt_subject_words(prompt, max_words=3)
+    if entity and subj:
+      clean_topic = f"{entity} {subj}"[:42].rstrip()
+    elif entity:
+      clean_topic = entity
+    elif subj:
+      clean_topic = subj
+    else:
+      clean_topic = "New Chat"
+
+  time_str = get_current_time_str()
+  title = f"[{time_str}] ⦿ {clean_topic}"
+
+  # 3. Model
+  model_arg = opts.get("model", "").strip()
+  try:
+    model_info = resolve_handoff_model(
+        "", tier="pro", explicit=model_arg, project_id=project_id
+    )
+    model_enum = model_info["enum"]
+  except Exception as exc:
+    _cli_fail("start", str(exc))
+    return 1
+
+  # 4. Start
+  try:
+    new_cid = start_conversation_exact(
+        model_enum=model_enum,
+        title=title,
+        prompt=prompt,
+        project_id=project_id,
+    )
+  except Exception as exc:
+    _cli_fail("start", f"failed to start conversation: {exc}")
+    return 1
+
+  print(
+      json.dumps(
+          {
+              "conversationId": new_cid,
+              "title": title,
+              "projectId": project_id,
+              "model": model_enum,
+          },
+          indent=2,
+      )
+  )
+  return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -3359,6 +3551,9 @@ def main(argv: list[str] | None = None) -> int:
     except InvalidTopicError as exc:
       _cli_fail("next-task", str(exc))
     print_handoff_result(result)
+  elif cmd == "start":
+    opts = parse_start_args(args)
+    return cmd_start(opts)
   elif cmd == "audit":
     do_fix = False
     proj_filter = ""

@@ -609,6 +609,37 @@ class TestContextGuard(unittest.TestCase):
           )
       )
 
+  def test_extract_proto_field_string(self):
+    # Construct protobuf message with field 18 (wire type 2) = "test-project-id"
+    val = b"test-project-id"
+    # Tag for field 18, wire type 2: (18 << 3) | 2 = 146 -> [0x92, 0x01]
+    proto_bytes = bytes([0x92, 0x01, len(val)]) + val
+    self.assertEqual(
+        context_guard._extract_proto_field_string(proto_bytes, 18),
+        "test-project-id",
+    )
+    # Field 18 absent
+    self.assertEqual(
+        context_guard._extract_proto_field_string(b"\x08\x01", 18),
+        "",
+    )
+
+  def test_multi_tier_project_resolution(self):
+    self.db_info.stop()
+    try:
+      with tempfile.TemporaryDirectory() as tmp_dir:
+        cid = "c-tier-test"
+        # Tier 1: pending moves file
+        pfile = os.path.join(tmp_dir, context_guard.PENDING_MOVES_FILENAME)
+        with open(pfile, "w") as f:
+          json.dump({cid: "proj-tier-1"}, f)
+
+        with patch.object(context_guard, "_candidate_app_data_dirs", return_value=[tmp_dir]):
+          title, pid = context_guard.get_conversation_db_info(cid, tmp_dir)
+          self.assertEqual(pid, "proj-tier-1")
+    finally:
+      self.db_info.start()
+
 
 if __name__ == "__main__":
   unittest.main()

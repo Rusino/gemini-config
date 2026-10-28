@@ -153,6 +153,49 @@ class TestPreToolGuard(unittest.TestCase):
         self.assertIn("--title=", rewritten)
         self.assertIn("--model=pro", rewritten)
 
+  def test_agentapi_send_message_rewrite(self):
+    cmd = 'agentapi send-message c1 "hello"'
+    data = {
+        "conversationId": "c1",
+        "toolCall": {
+            "name": "run_command",
+            "args": {"CommandLine": cmd},
+        },
+    }
+    with patch("sys.stdin", io.StringIO(json.dumps(data))), \
+         patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+      pre_tool_guard.main()
+      out = json.loads(mock_out.getvalue())
+      self.assertEqual(out.get("decision"), "allow")
+      self.assertIn("overwrite", out)
+      rewritten = out["overwrite"]["CommandLine"]
+      self.assertEqual(rewritten, 'env -u ANTIGRAVITY_SOURCE_METADATA agentapi send-message c1 "hello"')
+
+  def test_agentapi_new_conversation_project_flag_rewrite(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      summary_file = os.path.join(tmp_dir, "handoff_summary_123.md")
+      with open(summary_file, "w") as f:
+        f.write("# Summary\n")
+
+      cmd = f'agentapi new-conversation --project="my-proj" "Read {summary_file}"'
+      data = {
+          "conversationId": "c1",
+          "artifactDirectoryPath": tmp_dir,
+          "toolCall": {
+              "name": "run_command",
+              "args": {"CommandLine": cmd},
+          },
+      }
+      with patch("sys.stdin", io.StringIO(json.dumps(data))), \
+           patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+        pre_tool_guard.main()
+        out = json.loads(mock_out.getvalue())
+        self.assertEqual(out.get("decision"), "allow")
+        self.assertIn("overwrite", out)
+        rewritten = out["overwrite"]["CommandLine"]
+        self.assertIn('ANTIGRAVITY_PROJECT_ID="my-proj"', rewritten)
+        self.assertNotIn("--project", rewritten)
+
   def run_guard(self, data: dict) -> dict:
     with patch("sys.stdin", io.StringIO(json.dumps(data))), \
          patch("sys.stdout", new_callable=io.StringIO) as mock_out:

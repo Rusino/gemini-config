@@ -60,6 +60,8 @@ ROADMAP_CLI = "~/.gemini/config/hooks/roadmap.py"
 # Jetski builds use ~/.gemini/jetski (standalone macOS Jetski has no DB at all).
 APP_DATA_DIR_CANDIDATES = ("~/.gemini/antigravity", "~/.gemini/jetski")
 SUMMARY_DB_NAME = "conversation_summaries.db"
+PENDING_MOVES_FILENAME = ".pending_project_moves.json"
+_PBTXT_TITLE_RE = re.compile(r'title:\s*"((?:\\.|[^"\\])*)"')
 # Allow tests to isolate project metadata without touching ~/.gemini/config/projects
 PROJECTS_DIR_ENV = "JETSKI_PROJECTS_DIR"
 PROJECTS_DIR = os.path.expanduser("~/.gemini/config/projects")
@@ -111,16 +113,46 @@ def app_data_dir_from_path(path: str) -> str:
   return ""
 
 
-def summary_db_paths(hint_path: str = "") -> list[str]:
-  """Existing conversation_summaries.db paths, most likely first (deduplicated)."""
-  dirs = [app_data_dir_from_path(hint_path)] + [
-      os.path.expanduser(d) for d in APP_DATA_DIR_CANDIDATES
-  ]
-  paths: list[str] = []
+def _unescape_pbtxt_str(raw: str) -> str:
+  def _replace(m):
+    c = m.group(1)
+    if c == "n":
+      return "\n"
+    if c == "r":
+      return "\r"
+    if c == "t":
+      return "\t"
+    return c
+
+  return re.sub(r"\\(.)", _replace, raw)
+
+
+def _candidate_app_data_dirs(hint_path: str = "") -> list[str]:
+  raw_hint = os.path.abspath(os.path.expanduser(hint_path)) if hint_path else ""
+  from_brain = app_data_dir_from_path(hint_path)
+  hint_dir = ""
+  if from_brain:
+    hint_dir = from_brain
+  elif raw_hint:
+    hint_dir = raw_hint if os.path.isdir(raw_hint) else os.path.dirname(raw_hint)
+  dirs = [hint_dir] + [os.path.expanduser(d) for d in APP_DATA_DIR_CANDIDATES]
+  seen: set[str] = set()
+  res: list[str] = []
   for d in dirs:
     if not d:
       continue
-    p = os.path.join(os.path.abspath(d), SUMMARY_DB_NAME)
+    abs_d = os.path.abspath(d)
+    if abs_d not in seen and os.path.isdir(abs_d):
+      seen.add(abs_d)
+      res.append(abs_d)
+  return res
+
+
+def summary_db_paths(hint_path: str = "") -> list[str]:
+  """Existing conversation_summaries.db paths, most likely first (deduplicated)."""
+  paths: list[str] = []
+  for d in _candidate_app_data_dirs(hint_path):
+    p = os.path.join(d, SUMMARY_DB_NAME)
     if p not in paths and os.path.isfile(p):
       paths.append(p)
   return paths
@@ -149,23 +181,170 @@ def _query_summary_db(db_path: str, conv_id: str):
   return None
 
 
+def _extract_proto_field_string(data: bytes, target_fn: int) -> str:
+  """Extracts a UTF-8 string for a length-delimited field number in proto bytes."""
+  pos = 0
+  n = len(data)
+  res = ""
+  while pos < n:
+    key = 0
+    shift = 0
+    while pos < n:
+      b = data[pos]
+      pos += 1
+      key |= (b & 0x7F) << shift
+      shift += 7
+      if not (b & 0x80):
+        break
+    fn = key >> 3
+    wt = key & 0x7
+    if wt == 0:
+      while pos < n:
+        b = data[pos]
+        pos += 1
+        if not (b & 0x80):
+          break
+    elif wt == 1:
+      pos += 8
+    elif wt == 2:
+      length = 0
+      shift = 0
+      while pos < n:
+        b = data[pos]
+        pos += 1
+        length |= (b & 0x7F) << shift
+        shift += 7
+        if not (b & 0x80):
+          break
+      if pos + length > n:
+        break
+      val = data[pos : pos + length]
+      pos += length
+      if fn == target_fn:
+        try:
+          res = val.decode("utf-8")
+        except Exception:
+          pass
+    elif wt == 5:
+      pos += 4
+    else:
+      break
+  return res
+
+
+def _query_conversation_db_metadata(db_path: str) -> bytes | None:
+  for flags in ("mode=ro", "mode=ro&immutable=1"):
+    try:
+      conn = sqlite3.connect(f"file:{db_path}?{flags}", uri=True, timeout=1.0)
+      try:
+        row = conn.execute(
+            "SELECT data FROM trajectory_metadata_blob WHERE id = 'main'"
+        ).fetchone()
+        if row and row[0]:
+          return bytes(row[0])
+      finally:
+        conn.close()
+    except Exception:
+      continue
+  return None
+
+
+def _fetch_ls_info(conv_id: str) -> tuple[str, str]:
+  try:
+    import chat_lifecycle
+
+    summaries = chat_lifecycle._fetch_ls_summaries_for_audit()
+    if isinstance(summaries, dict):
+      s = summaries.get(conv_id)
+      if isinstance(s, dict):
+        ann = s.get("annotations") or {}
+        meta = s.get("trajectoryMetadata") or {}
+        title = str(ann.get("title") or s.get("summary") or "").strip()
+        pid = str(meta.get("projectId") or s.get("projectId") or "").strip()
+        return (title, pid)
+  except Exception:
+    pass
+  return ("", "")
+
+
 def get_conversation_db_info(
     conv_id: str, hint_path: str = ""
 ) -> tuple[str, str]:
-  """Returns (title, project_id) from conversation_summaries.db.
+  """Returns (title, project_id) for conv_id using multi-tier resolution:
 
-  `hint_path` (transcript or artifact path) selects the current client's app
-  data dir first; otherwise the known client dirs are searched in order.
+  1. .pending_project_moves.json
+  2. annotations/<cid>.pbtxt (title)
+  3. conversations/<cid>.db proto field 18 (project_id)
+  4. conversation_summaries.db
+  5. LS RPC fallback
   """
   if not conv_id:
     return ("", "")
-  for db_path in summary_db_paths(hint_path):
-    row = _query_summary_db(db_path, conv_id)
-    if row:
-      title = str(row[0]).strip() if row[0] else ""
-      project_id = str(row[1]).strip() if row[1] else ""
-      return (title, project_id)
-  return ("", "")
+  title = ""
+  project_id = ""
+  candidate_dirs = _candidate_app_data_dirs(hint_path)
+
+  # Tier 1: .pending_project_moves.json
+  for ad in candidate_dirs:
+    pfile = os.path.join(ad, PENDING_MOVES_FILENAME)
+    if os.path.isfile(pfile):
+      try:
+        with open(pfile, "r", encoding="utf-8") as f:
+          data = json.load(f)
+        if isinstance(data, dict) and conv_id in data:
+          project_id = str(data[conv_id]).strip()
+          if project_id:
+            break
+      except Exception:
+        pass
+
+  # Tier 2: annotations/<cid>.pbtxt
+  for ad in candidate_dirs:
+    pb_file = os.path.join(ad, "annotations", f"{conv_id}.pbtxt")
+    if os.path.isfile(pb_file):
+      try:
+        with open(pb_file, "r", encoding="utf-8", errors="ignore") as f:
+          m = _PBTXT_TITLE_RE.search(f.read())
+          if m:
+            title = _unescape_pbtxt_str(m.group(1)).strip()
+            if title:
+              break
+      except Exception:
+        pass
+
+  # Tier 3: conversations/<cid>.db proto field 18
+  if not project_id:
+    for ad in candidate_dirs:
+      conv_db = os.path.join(ad, "conversations", f"{conv_id}.db")
+      if os.path.isfile(conv_db):
+        blob = _query_conversation_db_metadata(conv_db)
+        if blob:
+          pid = _extract_proto_field_string(blob, 18).strip()
+          if pid:
+            project_id = pid
+            break
+
+  # Tier 4: conversation_summaries.db
+  if not title or not project_id:
+    for db_path in summary_db_paths(hint_path):
+      row = _query_summary_db(db_path, conv_id)
+      if row:
+        if not title and row[0]:
+          title = str(row[0]).strip()
+        if not project_id and row[1]:
+          project_id = str(row[1]).strip()
+        if title and project_id:
+          break
+
+  # Tier 5: LS RPC fallback
+  if not title or not project_id:
+    ls_title, ls_pid = _fetch_ls_info(conv_id)
+    if not title and ls_title:
+      title = ls_title
+    if not project_id and ls_pid:
+      project_id = ls_pid
+
+  return (title, project_id)
 
 
 def _file_uri_to_path(uri: str) -> str:
@@ -239,12 +418,7 @@ def _normalize_workspace_root(path: str, allow_any_dir: bool = False) -> str:
 
 def _is_archived_in_pbtxt(cid_s: str, hint_path: str = "") -> bool:
   """True if annotations/<cid>.pbtxt marks the conversation archived."""
-  dirs = [app_data_dir_from_path(hint_path)] + [
-      os.path.expanduser(d) for d in APP_DATA_DIR_CANDIDATES
-  ]
-  for ad in dirs:
-    if not ad or not os.path.isdir(ad):
-      continue
+  for ad in _candidate_app_data_dirs(hint_path):
     pb_file = os.path.join(ad, "annotations", f"{cid_s}.pbtxt")
     if os.path.isfile(pb_file):
       try:
@@ -788,8 +962,8 @@ def build_scope_radar_notice(
         "start investigating, reading foreign project files, or running commands! "
         "Reply immediately warning the user which project/chat the request belongs "
         "to (`[👉 <Target Chat Title>](conversation://<target_conv_id>)`), and ask "
-        'whether to forward the message via `agentapi send-message <target_conv_id> '
-        '"<user message>"` or execute it in this chat.'
+        'whether to forward the message via `env -u ANTIGRAVITY_SOURCE_METADATA agentapi '
+        'send-message <target_conv_id> "<user message>"` or execute it in this chat.'
     )
   return "\n".join(blocks)
 
@@ -1584,9 +1758,13 @@ def run(data: dict, log: dict) -> dict:
         else f"its continuation (`python3 {LIFECYCLE_CLI} status {conv_id}` shows it)"
     )
     forward = (
-        f"`agentapi send-message {cont} \"<the user's message verbatim>\"`"
+        f"`env -u ANTIGRAVITY_SOURCE_METADATA agentapi send-message"
+        f' {cont} "<the user\'s message verbatim>"`'
         if cont
-        else "`agentapi send-message <continuation id> \"<the user's message verbatim>\"`"
+        else (
+            "`env -u ANTIGRAVITY_SOURCE_METADATA agentapi send-message"
+            ' <continuation id> "<the user\'s message verbatim>"`'
+        )
     )
     return _inject(
         f"[CONTEXT GUARD: CLOSED CHAT] This conversation was already handed off to {where}."

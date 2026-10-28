@@ -232,7 +232,13 @@ class TestChatLifecycle(unittest.TestCase):
   def test_extract_entity_topic(self):
     cases = [
         ("Посмотри на СЛ https://skia-review.git.corp.google.com/c/skia/+/1397896", "cl/1397896"),
-        ("Check https://chromium-review.googlesource.com/c/chromium/src/+/5901234", "cl/5901234"),
+        ("Check https://chromium-review.googlesource.com/c/chromium/src/+/5901234", "crrev/c/5901234"),
+        (
+            "@[crrev/c/8660604:[canvas] Fix PlainTextPainter sub-runs spanning multiple items]",
+            "crrev/c/8660604",
+        ),
+        ("crrev.com/c/8660604", "crrev/c/8660604"),
+        ("crrev/c/8660604", "crrev/c/8660604"),
         ("Look at https://github.com/flutter/engine/pull/55123 please", "PR #55123"),
         ("Issue https://github.com/flutter/flutter/issues/99887", "Issue #99887"),
         ("Fix bug b/345678901 in layout", "b/345678901"),
@@ -304,6 +310,13 @@ class TestChatLifecycle(unittest.TestCase):
         # 4. Prompt without entity does not change title
         res3 = chat_lifecycle.auto_title_conversation("c1", "Just some random question")
         self.assertEqual(res3, "")
+
+        # 5. Chromium review mention with brackets auto-titles with crrev/c
+        res_crrev = chat_lifecycle.auto_title_conversation(
+            "c1",
+            "@[crrev/c/8660604:[canvas] Fix PlainTextPainter sub-runs spanning multiple items]",
+        )
+        self.assertIn("crrev/c/8660604", res_crrev)
 
   def test_create_handoff(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1817,6 +1830,19 @@ class TestChatLifecycle(unittest.TestCase):
     prompt = "Посмотри на PR #999 multi-span BiDi layout crash"
     derived_prompt = chat_lifecycle.derive_fallback_topic("nonexistent_id", prompt=prompt)
     self.assertIn("multi-span BiDi layout", derived_prompt)
+
+  def test_cmd_start_and_parse_args(self):
+    args = ["--project=proj-x", "--title=My Topic Test", "Check this layout issue"]
+    opts = chat_lifecycle.parse_start_args(args)
+    self.assertEqual(opts["project"], "proj-x")
+    self.assertEqual(opts["title"], "My Topic Test")
+    self.assertEqual(opts["prompt"], "Check this layout issue")
+
+    with patch.object(chat_lifecycle, "resolve_project_id", return_value="proj-x"), \
+         patch.object(chat_lifecycle, "resolve_handoff_model", return_value={"enum": "M1"}), \
+         patch.object(chat_lifecycle, "start_conversation_exact", return_value="new-c-123"):
+      ret = chat_lifecycle.cmd_start(opts)
+      self.assertEqual(ret, 0)
 
 
 if __name__ == "__main__":

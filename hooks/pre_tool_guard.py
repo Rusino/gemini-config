@@ -145,6 +145,9 @@ AUTO_SNAPSHOT_HEADER = "## Automatic State Snapshot (Git & Recent Commands)"
 AGENTAPI_NEW_CONV_RE = re.compile(
     r"(?:^|(?<=[\s;&|(`]))(?:\S*/)?agentapi\s+new-conversation\b"
 )
+AGENTAPI_SEND_MSG_RE = re.compile(
+    r"(?:^|(?<=[\s;&|(`]))(?:\S*/)?agentapi\s+send-message\b"
+)
 # `<<EOF` / `<<'EOF'` / `<<-"EOF"` ... body ... `EOF` — the body is data (commit
 # messages, scripts), never a command. With `<<-` the terminator may be
 # tab-indented.
@@ -2331,8 +2334,8 @@ def cross_project_write_denial(
             return (
                 "[CROSS-PROJECT SCOPE GUARD] You cannot create `.cross_project_override.json` "
                 "in the same turn that a cross-project edit was blocked! Stop immediately, "
-                "ask the user whether to forward the request via `agentapi send-message` or "
-                "execute it here, and wait for the user's reply in the next turn."
+                "ask the user whether to forward the request via `env -u ANTIGRAVITY_SOURCE_METADATA "
+                "agentapi send-message` or execute it here, and wait for the user's reply in the next turn."
             )
         except Exception:
           pass
@@ -2412,9 +2415,9 @@ def cross_project_write_denial(
       else ""
   )
   forward_cmd = (
-      f'`agentapi send-message {active_chat[0]} "<user message verbatim>"`'
+      f'`env -u ANTIGRAVITY_SOURCE_METADATA agentapi send-message {active_chat[0]} "<user message verbatim>"`'
       if active_chat
-      else '`agentapi send-message <target_conv_id> "<user message verbatim>"`'
+      else '`env -u ANTIGRAVITY_SOURCE_METADATA agentapi send-message <target_conv_id> "<user message verbatim>"`'
   )
   return (
       f"[CROSS-PROJECT SCOPE GUARD] You are in project `{cur_proj_name}`, but attempting to "
@@ -2678,6 +2681,24 @@ def main() -> None:
           )
           return
 
+        if (
+            AGENTAPI_SEND_MSG_RE.search(cmd)
+            and "ANTIGRAVITY_SOURCE_METADATA" not in cmd
+        ):
+          rewritten = AGENTAPI_SEND_MSG_RE.sub(
+              lambda m: f"env -u ANTIGRAVITY_SOURCE_METADATA {m.group(0).lstrip()}",
+              cmd,
+              count=1,
+          )
+          if rewritten != cmd:
+            print(
+                json.dumps(
+                    {"decision": "allow", "overwrite": {"CommandLine": rewritten}},
+                    ensure_ascii=False,
+                )
+            )
+            return
+
         # If calling `agentapi new-conversation`, verify handoff_summary exists,
         # enrich handoff_summary*.md on disk, and auto-inject missing env / --title!
         # Only a *real* invocation counts — not `grep`/`echo` mentioning the string.
@@ -2726,11 +2747,36 @@ def main() -> None:
           needs_rewrite = False
           rewritten = cmd
 
+          # Check for explicit project flag in command line
+          target_proj = ""
+          proj_match = re.search(r'--project(?:=|\s+)(["\']?)([^"\'\s]+)\1', rewritten)
+          if proj_match:
+            target_proj = proj_match.group(2)
+            rewritten = re.sub(
+                r'--project(?:=|\s+)(["\']?)[^"\'\s]+\1', "", rewritten
+            ).strip()
+            needs_rewrite = True
+
           # Replace bare `/.../agentapi new-conversation` or `agentapi new-conversation`
-          # with `cmd_prefix` if `ANTIGRAVITY_SOURCE_METADATA` is missing
-          if "ANTIGRAVITY_SOURCE_METADATA" not in rewritten:
-            rewritten = AGENTAPI_NEW_CONV_RE.sub(
-                lambda _m: cmd_prefix, rewritten, count=1
+          # with prefix if `ANTIGRAVITY_SOURCE_METADATA` is missing
+          if target_proj:
+            prefix_to_use = (
+                "env -u ANTIGRAVITY_SOURCE_METADATA"
+                f' ANTIGRAVITY_PROJECT_ID="{target_proj}" agentapi new-conversation'
+            )
+            rewritten = re.sub(
+                r'(?:(?:env\s+)?ANTIGRAVITY_PROJECT_ID=[^\s]+\s+)?(?:\S*/)?agentapi\s+new-conversation\b',
+                prefix_to_use,
+                rewritten,
+                count=1,
+            )
+            needs_rewrite = True
+          elif "ANTIGRAVITY_SOURCE_METADATA" not in rewritten:
+            rewritten = re.sub(
+                r'(?:(?:env\s+)?ANTIGRAVITY_PROJECT_ID=[^\s]+\s+)?(?:\S*/)?agentapi\s+new-conversation\b',
+                cmd_prefix,
+                rewritten,
+                count=1,
             )
             needs_rewrite = True
 
