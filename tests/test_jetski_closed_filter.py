@@ -1097,7 +1097,7 @@ const liveBucketBtn = (k) =>
   assert(titlebarSearchBtn, 'Titlebar must carry the chain search button');
   assert(!bodyEl.querySelector('.jetski-attention-filter-bar .jetski-chat-search-btn'));
 
-  // Hovering Search and Locate titlebar buttons renders compact surface-glass pill bubbles
+  // Hovering all 4 titlebar icon buttons renders compact surface-glass pill bubbles
   titlebarSearchBtn.dispatchEvent('mouseenter');
   assert.strictEqual(roadmapBubble.getAttribute('data-visible'), 'true');
   assert.strictEqual(roadmapBubble.getAttribute('data-mode'), 'filter');
@@ -1116,6 +1116,28 @@ const liveBucketBtn = (k) =>
     'Locate button hover must display the compact locate pill bubble'
   );
   titlebarLocateBtn.dispatchEvent('mouseleave');
+  assert.strictEqual(roadmapBubble.getAttribute('data-visible'), 'false');
+
+  assert.strictEqual(titlebarWaitBtn.getAttribute('title'), null);
+  titlebarWaitBtn.dispatchEvent('mouseenter');
+  assert.strictEqual(roadmapBubble.getAttribute('data-visible'), 'true');
+  assert.strictEqual(roadmapBubble.getAttribute('data-mode'), 'filter');
+  assert(
+    roadmapBubble.innerHTML.includes('Move chat to ⏳ Waiting (Cron / External)'),
+    'Wait button hover must display the compact wait pill bubble'
+  );
+  titlebarWaitBtn.dispatchEvent('mouseleave');
+  assert.strictEqual(roadmapBubble.getAttribute('data-visible'), 'false');
+
+  assert.strictEqual(titlebarBtn.getAttribute('title'), null);
+  titlebarBtn.dispatchEvent('mouseenter');
+  assert.strictEqual(roadmapBubble.getAttribute('data-visible'), 'true');
+  assert.strictEqual(roadmapBubble.getAttribute('data-mode'), 'filter');
+  assert(
+    roadmapBubble.innerHTML.includes('🗄 Archive chat'),
+    'Archive button hover must display the compact archive pill bubble'
+  );
+  titlebarBtn.dispatchEvent('mouseleave');
   assert.strictEqual(roadmapBubble.getAttribute('data-visible'), 'false');
 
   assert.deepStrictEqual(

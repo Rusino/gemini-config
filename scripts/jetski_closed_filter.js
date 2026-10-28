@@ -2789,8 +2789,9 @@
     if (btn.getAttribute('aria-label') !== label) {
       btn.setAttribute('aria-label', label);
     }
-    if (btn.getAttribute('title') !== label) {
-      btn.setAttribute('title', label);
+    // Strip native tooltip so it does not overlap the custom surface-glass hover bubble
+    if (btn.hasAttribute('title')) {
+      btn.removeAttribute('title');
     }
     const nextText = waiting ? '🚨' : '⏳';
     if (btn.textContent !== nextText) {
@@ -2811,8 +2812,9 @@
     if (btn.getAttribute('aria-label') !== label) {
       btn.setAttribute('aria-label', label);
     }
-    if (btn.getAttribute('title') !== label) {
-      btn.setAttribute('title', label);
+    // Strip native tooltip so it does not overlap the custom surface-glass hover bubble
+    if (btn.hasAttribute('title')) {
+      btn.removeAttribute('title');
     }
     // Render a pure icon without text spans so the titlebar stays compact
     const nextText = archived ? '⦿' : '🗄';
@@ -2878,6 +2880,7 @@
         waitBtn.className = TITLEBAR_WAIT_BTN_CLASS;
         waitBtn.type = 'button';
         waitBtn.setAttribute('data-testid', 'jetski-titlebar-wait-btn');
+        bindHoverBubble(waitBtn, () => waitBtn.getAttribute('aria-label'));
         bindActionBtnHandlers(waitBtn, () => {
           const cid =
             waitBtn.getAttribute('data-cascade-id') || findCascadeIdFromElement(moreBtn);
@@ -2895,6 +2898,7 @@
         btn.className = TITLEBAR_BTN_CLASS;
         btn.type = 'button';
         btn.setAttribute('data-testid', 'jetski-titlebar-archive-btn');
+        bindHoverBubble(btn, () => `${btn.textContent} ${btn.getAttribute('aria-label')}`);
         bindActionBtnHandlers(btn, () => {
           const cid =
             btn.getAttribute('data-cascade-id') || findCascadeIdFromElement(moreBtn);
