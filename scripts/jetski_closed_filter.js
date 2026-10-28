@@ -9,7 +9,18 @@
   window.__jetskiClosedChatsFilterInstalled = true;
 
   const STORAGE_BUCKETS_KEY = 'jetski_visible_buckets_v1';
+  // Persists whether the top-of-sidebar Needs-Reaction inbox list is collapsed
+  const STORAGE_INBOX_COLLAPSED_KEY = 'jetski_inbox_collapsed_v1';
   const BAR_CLASS = 'jetski-attention-filter-bar';
+  // CSS class names for the collapsible Needs-Reaction inbox widget and its child controls
+  const INBOX_CLASS = 'jetski-needs-reaction-inbox';
+  const INBOX_HEADER_CLASS = 'jetski-inbox-header';
+  const INBOX_TOGGLE_BTN_CLASS = 'jetski-inbox-toggle-btn';
+  const INBOX_LIST_CLASS = 'jetski-inbox-list';
+  const INBOX_ROW_CLASS = 'jetski-inbox-row';
+  const INBOX_LOCATE_BTN_CLASS = 'jetski-inbox-locate-btn';
+  const INBOX_WAIT_BTN_CLASS = 'jetski-inbox-wait-btn';
+  const INBOX_ARCHIVE_BTN_CLASS = 'jetski-inbox-archive-btn';
   const BUTTON_CLASS = 'jetski-closed-chats-filter-btn';
   const TITLEBAR_BTN_CLASS = 'jetski-titlebar-archive-btn';
   const TITLEBAR_WAIT_BTN_CLASS = 'jetski-titlebar-wait-btn';
@@ -116,6 +127,8 @@
   }
 
   let visibleBuckets = loadVisibleBuckets();
+  // Hydrate initial inbox collapsed state so the header renders without layout shift
+  let inboxCollapsed = safeGetStorage(STORAGE_INBOX_COLLAPSED_KEY) === 'true';
 
   // Tracks conversations whose hideFromConversationList flag we flipped in Redux
   // so we never unhide conversations that were natively hidden by their source
@@ -1284,6 +1297,183 @@
       }
       .${JUMP_TO_TAIL_BTN_CLASS}:hover {
         background: #aecbfa;
+      }
+    ` +
+      // Style the collapsible Needs-Reaction inbox widget above the sidebar project list
+      `
+      .${INBOX_CLASS} {
+        display: flex;
+        flex-direction: column;
+        margin: 4px 8px 6px 8px;
+        border-radius: 8px;
+        background: rgba(128, 134, 139, 0.08);
+        border: 1px solid rgba(128, 134, 139, 0.24);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        font-size: 11.5px;
+        line-height: 1.35;
+        overflow: hidden;
+        flex-shrink: 0;
+        user-select: none;
+      }
+      .${INBOX_CLASS}[data-urgent="true"] {
+        border-color: rgba(248, 113, 113, 0.42);
+      }
+      .${INBOX_CLASS}[data-empty="true"] {
+        display: none !important;
+      }
+      .${INBOX_HEADER_CLASS} {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 6px;
+        padding: 4px 8px;
+        background: rgba(128, 134, 139, 0.12);
+        cursor: pointer;
+        font-weight: 600;
+        font-size: 11px;
+        color: var(--foreground, #e8eaed);
+      }
+      .${INBOX_HEADER_CLASS}:hover {
+        background: rgba(128, 134, 139, 0.18);
+      }
+      .${INBOX_HEADER_CLASS} .jetski-inbox-header-left {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        min-width: 0;
+      }
+      .${INBOX_HEADER_CLASS} .jetski-inbox-count-badge {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0 5px;
+        border-radius: 999px;
+        background: rgba(128, 134, 139, 0.24);
+        font-size: 10.5px;
+        font-variant-numeric: tabular-nums;
+      }
+      .${INBOX_HEADER_CLASS} .jetski-inbox-urgent-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 2px;
+        padding: 0 5px;
+        border-radius: 999px;
+        background: rgba(248, 113, 113, 0.2);
+        color: #fca5a5;
+        font-size: 10.5px;
+        font-variant-numeric: tabular-nums;
+      }
+      .${INBOX_TOGGLE_BTN_CLASS} {
+        background: transparent;
+        border: none;
+        padding: 0 2px;
+        cursor: pointer;
+        color: var(--muted-foreground, #9aa0a6);
+        font-size: 10px;
+        line-height: 1;
+      }
+      .${INBOX_LIST_CLASS} {
+        display: flex;
+        flex-direction: column;
+        max-height: 136px;
+        overflow-y: auto;
+        padding: 2px 0;
+      }
+      .${INBOX_CLASS}[data-collapsed="true"] .${INBOX_LIST_CLASS} {
+        display: none !important;
+      }
+      .${INBOX_ROW_CLASS} {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 5px;
+        padding: 3px 6px 3px 8px;
+        cursor: pointer;
+        min-height: 24px;
+        box-sizing: border-box;
+        transition: background-color 100ms ease;
+      }
+      .${INBOX_ROW_CLASS}:hover {
+        background: rgba(128, 134, 139, 0.18);
+      }
+      .${INBOX_ROW_CLASS}[data-tier="urgent"] {
+        background: rgba(248, 113, 113, 0.08);
+      }
+      .${INBOX_ROW_CLASS}[data-tier="urgent"]:hover {
+        background: rgba(248, 113, 113, 0.16);
+      }
+      .${INBOX_ROW_CLASS} .jetski-inbox-row-main {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+      .${INBOX_ROW_CLASS} .jetski-inbox-tier-icon {
+        flex-shrink: 0;
+        font-size: 11px;
+        line-height: 1;
+      }
+      .${INBOX_ROW_CLASS} .jetski-inbox-project {
+        flex: 0 1 auto;
+        max-width: 85px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        padding: 0 4px;
+        border-radius: 3px;
+        background: rgba(128, 134, 139, 0.18);
+        color: var(--muted-foreground, #b8bdc4);
+        font-size: 10px;
+        font-weight: 500;
+      }
+      .${INBOX_ROW_CLASS} .jetski-inbox-title {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: var(--foreground, #e8eaed);
+      }
+      .${INBOX_ROW_CLASS}[data-tier="urgent"] .jetski-inbox-title {
+        font-weight: 600;
+      }
+      .${INBOX_ROW_CLASS} .jetski-inbox-time {
+        flex-shrink: 0;
+        color: var(--muted-foreground, #9aa0a6);
+        font-size: 10px;
+        font-variant-numeric: tabular-nums;
+      }
+      .${INBOX_ROW_CLASS} .jetski-inbox-actions {
+        display: inline-flex;
+        align-items: center;
+        gap: 1px;
+        flex-shrink: 0;
+      }
+      .${INBOX_LOCATE_BTN_CLASS},
+      .${INBOX_WAIT_BTN_CLASS},
+      .${INBOX_ARCHIVE_BTN_CLASS} {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 20px;
+        height: 20px;
+        padding: 0;
+        border: none;
+        border-radius: 4px;
+        background: transparent;
+        color: var(--muted-foreground, #9aa0a6);
+        font-size: 11px;
+        line-height: 1;
+        cursor: pointer;
+        opacity: 0.72;
+      }
+      .${INBOX_LOCATE_BTN_CLASS}:hover,
+      .${INBOX_WAIT_BTN_CLASS}:hover,
+      .${INBOX_ARCHIVE_BTN_CLASS}:hover {
+        opacity: 1;
+        background: rgba(128, 134, 139, 0.24);
+        color: var(--foreground, #e8eaed);
       }
     `;
     if (style.textContent !== nextCss) {
@@ -2807,6 +2997,366 @@
     }
   }
 
+  // Strips live activity suffixes (" · ⟳ 1 ⚠ 2") appended by sidebar project cards
+  const PROJECT_ACTIVITY_SUFFIX_RE =
+    /(?:\s*·\s*(?:[⟳⚠●]\s*\d+)(?:\s+(?:[⟳⚠●]\s*\d+))*)+$/u;
+
+  // Resolves a human-readable project title from Redux slices or sidebar project headers
+  function resolveProjectName(projectId, store) {
+    if (!projectId || projectId === '__standalone__') return 'Standalone';
+    const state = store?.getState();
+    const fromStore =
+      state?.projects?.projects?.[projectId]?.name ||
+      state?.project?.projects?.[projectId]?.name ||
+      state?.projects?.byId?.[projectId]?.name ||
+      '';
+    if (typeof fromStore === 'string' && fromStore.trim()) {
+      return fromStore.replace(PROJECT_ACTIVITY_SUFFIX_RE, '').trim();
+    }
+    const sectionEls = document.querySelectorAll(
+      'div[data-sidebar-section-drop-id]:not([data-sidebar-row-id])'
+    );
+    for (const sec of sectionEls) {
+      if (sec.getAttribute('data-sidebar-section-drop-id') !== projectId) continue;
+      const headerBtn = sec.querySelector(
+        'button[data-testid="project-header"], button[data-project-card]'
+      );
+      const span = headerBtn?.querySelector('span.truncate');
+      const domName = span?.textContent?.trim() || '';
+      if (domName) {
+        return domName.replace(PROJECT_ACTIVITY_SUFFIX_RE, '').trim();
+      }
+    }
+    return projectId;
+  }
+
+  // Returns true when cascadeId is currently mounted in a pane or routed in the URL
+  function isCurrentlyViewing(cascadeId, store) {
+    if (!cascadeId) return false;
+    for (const viewEl of document.querySelectorAll(
+      '[data-testid="conversation-view"][data-cascade-id]'
+    )) {
+      if (viewEl.getAttribute('data-cascade-id') === cascadeId) return true;
+    }
+    const state = store?.getState();
+    if (
+      state?.conversation?.cascadeId === cascadeId ||
+      state?.conversation?.convoState?.cascadeId === cascadeId
+    ) {
+      return true;
+    }
+    const path = window.location?.pathname || '';
+    const m = /^(.*\/(?:c|cascade|conversation)\/)([^/?#]+)(.*)$/.exec(path);
+    if (m) {
+      let decoded = m[2];
+      try {
+        decoded = decodeURIComponent(m[2]);
+      } catch {}
+      if (decoded.split('+').includes(cascadeId)) return true;
+    }
+    return false;
+  }
+
+  // Classifies a needs-me chat into 'urgent' (waitingSteps or unread finished turn) vs 'open'
+  function classifyInboxTier(cascadeId, summary, store) {
+    if (!summary) return 'open';
+    // Chats blocked on tool approval or user questions always rank in urgent tier
+    if (Array.isArray(summary.waitingSteps) && summary.waitingSteps.length > 0) {
+      return 'urgent';
+    }
+    // Chats whose latest finished turn has not been viewed yet rank in urgent tier
+    const lastMod = Date.parse(summary.lastModifiedTime || '') || 0;
+    if (lastMod > 0 && !isCurrentlyViewing(cascadeId, store)) {
+      const lastView = Date.parse(summary.annotations?.lastUserViewTime || '') || 0;
+      if (!lastView || lastMod > lastView) {
+        return 'urgent';
+      }
+    }
+    return 'open';
+  }
+
+  // Builds a single Needs-Reaction inbox row with click navigation and quick-action buttons
+  function createInboxRowElement(item) {
+    const row = document.createElement('div');
+    row.className = INBOX_ROW_CLASS;
+    row.setAttribute('data-testid', 'jetski-inbox-row');
+    row.setAttribute('data-cascade-id', item.cascadeId);
+    row.setAttribute('data-tier', item.tier);
+
+    const main = document.createElement('div');
+    main.className = 'jetski-inbox-row-main';
+
+    const icon = document.createElement('span');
+    icon.className = 'jetski-inbox-tier-icon';
+    icon.textContent = item.tier === 'urgent' ? '🔥' : '⦿';
+
+    const proj = document.createElement('span');
+    proj.className = 'jetski-inbox-project';
+    proj.textContent = item.projectName;
+
+    const title = document.createElement('span');
+    title.className = 'jetski-inbox-title';
+    title.textContent = item.baseTitle;
+
+    main.appendChild(icon);
+    main.appendChild(proj);
+    main.appendChild(title);
+
+    if (item.timePrefix) {
+      const time = document.createElement('span');
+      time.className = 'jetski-inbox-time';
+      time.textContent = item.timePrefix;
+      main.appendChild(time);
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'jetski-inbox-actions';
+
+    const locateBtn = document.createElement('button');
+    locateBtn.type = 'button';
+    locateBtn.className = INBOX_LOCATE_BTN_CLASS;
+    locateBtn.setAttribute('data-testid', 'jetski-inbox-locate-btn');
+    locateBtn.setAttribute('aria-label', 'Locate chat in sidebar');
+    locateBtn.textContent = '🎯';
+    bindActionBtnHandlers(locateBtn, () => {
+      const cid = row.getAttribute('data-cascade-id');
+      if (cid) void locateConversationInSidebar(cid);
+    });
+
+    const waitBtn = document.createElement('button');
+    waitBtn.type = 'button';
+    waitBtn.className = INBOX_WAIT_BTN_CLASS;
+    waitBtn.setAttribute('data-testid', 'jetski-inbox-wait-btn');
+    waitBtn.setAttribute('aria-label', 'Move chat to ⏳ Waiting');
+    waitBtn.textContent = '⏳';
+    bindActionBtnHandlers(waitBtn, () => {
+      const cid = row.getAttribute('data-cascade-id');
+      if (cid) void toggleConversationWaiting(cid, '');
+    });
+
+    const archiveBtn = document.createElement('button');
+    archiveBtn.type = 'button';
+    archiveBtn.className = INBOX_ARCHIVE_BTN_CLASS;
+    archiveBtn.setAttribute('data-testid', 'jetski-inbox-archive-btn');
+    archiveBtn.setAttribute('aria-label', 'Archive chat');
+    archiveBtn.textContent = '🗄';
+    bindActionBtnHandlers(archiveBtn, () => {
+      const cid = row.getAttribute('data-cascade-id');
+      if (cid) void toggleConversationArchived(cid);
+    });
+
+    actions.appendChild(locateBtn);
+    actions.appendChild(waitBtn);
+    actions.appendChild(archiveBtn);
+
+    row.appendChild(main);
+    row.appendChild(actions);
+
+    bindActionBtnHandlers(row, () => {
+      const cid = row.getAttribute('data-cascade-id');
+      if (cid) {
+        manualVisitedCids.add(cid);
+        openConversation(cid);
+      }
+    });
+
+    return row;
+  }
+
+  // Creates the Needs-Reaction inbox container and header once per sidebar mount
+  function createInboxShell() {
+    const el = document.createElement('div');
+    el.className = INBOX_CLASS;
+    el.setAttribute('data-testid', INBOX_CLASS);
+
+    const headerEl = document.createElement('div');
+    headerEl.className = INBOX_HEADER_CLASS;
+    headerEl.setAttribute('data-testid', INBOX_HEADER_CLASS);
+
+    const headerLeft = document.createElement('div');
+    headerLeft.className = 'jetski-inbox-header-left';
+
+    const headerTitle = document.createElement('span');
+    headerTitle.className = 'jetski-inbox-header-title';
+    headerTitle.textContent = '🚨 Needs Reaction';
+
+    const countBadge = document.createElement('span');
+    countBadge.className = 'jetski-inbox-count-badge';
+    countBadge.setAttribute('data-testid', 'jetski-inbox-count-badge');
+
+    const urgentPill = document.createElement('span');
+    urgentPill.className = 'jetski-inbox-urgent-pill';
+    urgentPill.setAttribute('data-testid', 'jetski-inbox-urgent-pill');
+
+    headerLeft.appendChild(headerTitle);
+    headerLeft.appendChild(countBadge);
+    headerLeft.appendChild(urgentPill);
+
+    const toggleBtn = document.createElement('button');
+    toggleBtn.type = 'button';
+    toggleBtn.className = INBOX_TOGGLE_BTN_CLASS;
+    toggleBtn.setAttribute('data-testid', INBOX_TOGGLE_BTN_CLASS);
+
+    headerEl.appendChild(headerLeft);
+    headerEl.appendChild(toggleBtn);
+
+    bindActionBtnHandlers(headerEl, () => {
+      inboxCollapsed = !inboxCollapsed;
+      safeSetStorage(STORAGE_INBOX_COLLAPSED_KEY, inboxCollapsed ? 'true' : 'false');
+      ensureNeedsReactionInbox();
+    });
+
+    const listContainer = document.createElement('div');
+    listContainer.className = INBOX_LIST_CLASS;
+    listContainer.setAttribute('data-testid', INBOX_LIST_CLASS);
+
+    el.appendChild(headerEl);
+    el.appendChild(listContainer);
+    return el;
+  }
+
+  // Mounts and updates the pinned collapsible Needs-Reaction inbox above the sidebar project list
+  function ensureNeedsReactionInbox() {
+    const listEl =
+      document.querySelector('[data-testid="conversation-list-sidebar"]') ||
+      document.querySelector('[data-sidebar-scroll-container="true"]');
+    const displayOptionsBtn = document.querySelector('button[aria-label="Display Options"]');
+    const actionRow = displayOptionsBtn?.parentElement;
+
+    const mountParent = listEl?.parentElement || actionRow?.parentElement;
+    if (!mountParent) return;
+
+    let inboxEl = document.querySelector(`.${INBOX_CLASS}`);
+    if (!inboxEl) {
+      inboxEl = createInboxShell();
+    }
+
+    // Place inbox immediately before listEl when mounted, or right after actionRow
+    if (listEl && listEl.parentElement) {
+      const parentChildren = listEl.parentElement.children || [];
+      const idxInbox = Array.prototype.indexOf.call(parentChildren, inboxEl);
+      const idxList = Array.prototype.indexOf.call(parentChildren, listEl);
+      if (inboxEl.parentElement !== listEl.parentElement || idxInbox !== idxList - 1) {
+        listEl.parentElement.insertBefore(inboxEl, listEl);
+      }
+    } else if (
+      actionRow &&
+      actionRow.parentElement &&
+      inboxEl.parentElement !== actionRow.parentElement
+    ) {
+      const children = actionRow.parentElement.children || [];
+      const actionIdx = Array.prototype.indexOf.call(children, actionRow);
+      const nextSibling =
+        actionIdx >= 0 && actionIdx + 1 < children.length ? children[actionIdx + 1] : null;
+      actionRow.parentElement.insertBefore(inboxEl, nextSibling);
+    }
+
+    const store = findReduxStore();
+    const summariesMap = store?.getState()?.trajectorySummaries?.summaries || {};
+    const items = [];
+    let urgentCount = 0;
+
+    for (const [cascadeId, summary] of Object.entries(summariesMap)) {
+      if (!isEligibleTopLevelSummary(cascadeId, summary)) continue;
+      if (classifyChatBucket(summary, '') !== 'needs-me') continue;
+      const rawTitle = summary?.annotations?.title || summary?.summary || '';
+      const baseTitle = cleanBaseTitle(rawTitle) || rawTitle || cascadeId.slice(0, 8);
+      const timeMatch = TIME_PREFIX_EXTRACT_RE.exec(rawTitle);
+      const timePrefix = timeMatch ? timeMatch[1] : '';
+      const projectId = summary?.trajectoryMetadata?.projectId || '__standalone__';
+      const projectName = resolveProjectName(projectId, store);
+      const tier = classifyInboxTier(cascadeId, summary, store);
+      if (tier === 'urgent') urgentCount++;
+      const modTs = Date.parse(summary?.lastModifiedTime || '') || 0;
+      items.push({
+        cascadeId,
+        baseTitle,
+        timePrefix,
+        projectId,
+        projectName,
+        tier,
+        modTs,
+      });
+    }
+
+    items.sort((a, b) => {
+      if (a.tier !== b.tier) return a.tier === 'urgent' ? -1 : 1;
+      if (b.modTs !== a.modTs) return b.modTs - a.modTs;
+      if (b.timePrefix !== a.timePrefix) return b.timePrefix.localeCompare(a.timePrefix);
+      return a.cascadeId.localeCompare(b.cascadeId);
+    });
+
+    const isEmpty = items.length === 0;
+    const emptyStr = isEmpty ? 'true' : 'false';
+    if (inboxEl.getAttribute('data-empty') !== emptyStr) {
+      inboxEl.setAttribute('data-empty', emptyStr);
+    }
+    inboxEl.style.display = isEmpty ? 'none' : '';
+
+    const urgentStr = urgentCount > 0 ? 'true' : 'false';
+    if (inboxEl.getAttribute('data-urgent') !== urgentStr) {
+      inboxEl.setAttribute('data-urgent', urgentStr);
+    }
+    if (inboxEl.getAttribute('data-count') !== String(items.length)) {
+      inboxEl.setAttribute('data-count', String(items.length));
+    }
+    if (inboxEl.getAttribute('data-urgent-count') !== String(urgentCount)) {
+      inboxEl.setAttribute('data-urgent-count', String(urgentCount));
+    }
+
+    const collapsedStr = inboxCollapsed ? 'true' : 'false';
+    if (inboxEl.getAttribute('data-collapsed') !== collapsedStr) {
+      inboxEl.setAttribute('data-collapsed', collapsedStr);
+    }
+
+    const countBadge = inboxEl.querySelector('.jetski-inbox-count-badge');
+    if (countBadge && countBadge.textContent !== String(items.length)) {
+      countBadge.textContent = String(items.length);
+    }
+    const urgentPill = inboxEl.querySelector('.jetski-inbox-urgent-pill');
+    if (urgentPill) {
+      urgentPill.style.display = urgentCount > 0 ? '' : 'none';
+      const nextUrgentText = urgentCount > 0 ? `🔥 ${urgentCount}` : '';
+      if (urgentPill.textContent !== nextUrgentText) {
+        urgentPill.textContent = nextUrgentText;
+      }
+    }
+
+    const toggleBtn = inboxEl.querySelector(`.${INBOX_TOGGLE_BTN_CLASS}`);
+    if (toggleBtn) {
+      const nextGlyph = inboxCollapsed ? '▸' : '▾';
+      if (toggleBtn.textContent !== nextGlyph) {
+        toggleBtn.textContent = nextGlyph;
+      }
+      const nextLabel = inboxCollapsed
+        ? 'Expand Needs Reaction inbox'
+        : 'Collapse Needs Reaction inbox';
+      if (toggleBtn.getAttribute('aria-label') !== nextLabel) {
+        toggleBtn.setAttribute('aria-label', nextLabel);
+      }
+    }
+
+    // Re-render row nodes only when the ordered inbox signature changes
+    const sig = items
+      .map(
+        (it) =>
+          `${it.cascadeId}:${it.tier}:${it.projectName}:${it.baseTitle}:${it.timePrefix}`
+      )
+      .join('|');
+    if (inboxEl.getAttribute('data-jetski-inbox-sig') !== sig) {
+      inboxEl.setAttribute('data-jetski-inbox-sig', sig);
+      const listContainer = inboxEl.querySelector(`.${INBOX_LIST_CLASS}`);
+      if (listContainer) {
+        while (listContainer.children?.length > 0) {
+          listContainer.children[0].remove();
+        }
+        for (const item of items) {
+          listContainer.appendChild(createInboxRowElement(item));
+        }
+      }
+    }
+  }
+
   // Resolves the conversation ID owning a DOM element via data attributes, React Fiber, or URL
   function findCascadeIdFromElement(el) {
     let cur = el;
@@ -3161,6 +3711,8 @@
     const reduxActive = syncReduxFilter();
     syncDomRowsAndPlaceholders(reduxActive);
     ensureFilterBar();
+    // Sync the Needs-Reaction inbox widget above the sidebar project list
+    ensureNeedsReactionInbox();
     // Render or remove compact open-roadmap badges after project card DOM rows are synced
     ensureProjectRoadmapBadges();
     ensureTitlebarButtons();
@@ -3188,6 +3740,8 @@
         target.id === STYLE_ID ||
         target.id === STAR_TOOLTIP_ID ||
         target.className === BAR_CLASS ||
+        // Ignore mutations on the Needs-Reaction inbox container itself
+        target.className === INBOX_CLASS ||
         target.className === BUTTON_CLASS ||
         target.className === TITLEBAR_BTN_CLASS ||
         target.className === TITLEBAR_WAIT_BTN_CLASS ||
@@ -3203,6 +3757,8 @@
           (target.closest('#jetski-closed-chats-filter-bubble') ||
             target.closest(`#${STAR_TOOLTIP_ID}`) ||
             target.closest(`.${BAR_CLASS}`) ||
+            // Skip subtree mutations inside the Needs-Reaction inbox widget
+            target.closest(`.${INBOX_CLASS}`) ||
             target.closest(`.${BUTTON_CLASS}`) ||
             target.closest(`.${TITLEBAR_BTN_CLASS}`) ||
             target.closest(`.${TITLEBAR_WAIT_BTN_CLASS}`) ||
@@ -3249,6 +3805,8 @@
     // Remove all injected filter buttons, search panels, and chain stars on reload
     const cleanupSelector = [
       `.${BAR_CLASS}`,
+      // Remove the Needs-Reaction inbox widget on script reload
+      `.${INBOX_CLASS}`,
       `.${BUTTON_CLASS}`,
       `.${TITLEBAR_BTN_CLASS}`,
       `.${TITLEBAR_WAIT_BTN_CLASS}`,
