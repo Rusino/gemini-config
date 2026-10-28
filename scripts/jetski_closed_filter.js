@@ -40,6 +40,8 @@
 
   const BUCKET_ORDER = ['needs-me', 'working', 'waiting'];
   const SEARCH_BTN_CLASS = 'jetski-chat-search-btn';
+  const LOCATE_BTN_CLASS = 'jetski-chat-locate-btn';
+  const LOCATED_ROW_ATTR = 'data-jetski-located-row';
   const SEARCH_PANEL_ID = 'jetski-chat-search-panel';
   // Matryoshka chain star markers and read-only non-tail piece lock banners
   const CHAIN_STARS_BEFORE_TEST_ID = 'jetski-chain-stars-before';
@@ -821,8 +823,32 @@
       #${SEARCH_PANEL_ID} .jcs-hit:hover { background: rgba(127, 127, 127, 0.18); }
       #${SEARCH_PANEL_ID} .jcs-meta { opacity: 0.65; font-size: 11px; }
       #${SEARCH_PANEL_ID} mark { background: rgba(255, 200, 0, 0.35); color: inherit; }
-      .${SEARCH_BTN_CLASS} {
+      .${SEARCH_BTN_CLASS},
+      .${LOCATE_BTN_CLASS} {
         background: transparent; border: none; cursor: pointer; padding: 0 4px; opacity: 0.8;
+      }
+      .${SEARCH_BTN_CLASS}:hover,
+      .${LOCATE_BTN_CLASS}:hover {
+        opacity: 1;
+      }
+      @keyframes jetski-locate-pulse {
+        0% {
+          box-shadow: 0 0 0 2px #8ab4f8, 0 0 12px rgba(138, 180, 248, 0.55);
+          background-color: rgba(138, 180, 248, 0.22);
+        }
+        70% {
+          box-shadow: 0 0 0 2px rgba(138, 180, 248, 0.75), 0 0 6px rgba(138, 180, 248, 0.25);
+          background-color: rgba(138, 180, 248, 0.14);
+        }
+        100% {
+          box-shadow: 0 0 0 0 rgba(138, 180, 248, 0);
+          background-color: transparent;
+        }
+      }
+      [data-testid="conversation-row-sidebar"][data-jetski-located-row="true"],
+      div[data-sidebar-row-id][data-jetski-located-row="true"] {
+        border-radius: 8px;
+        animation: jetski-locate-pulse 2.2s ease-out forwards;
       }
       [data-sidebar-row-id][data-jetski-closed-row="true"]:not([data-sidebar-section-id="pinned"]) {
         height: 0px !important;
@@ -2053,6 +2079,214 @@
   // The test harness fake DOM cannot type into the panel, so it drives search directly
   window.__jetskiChatSearch = { runChatSearch, chainOf };
 
+  let locateHighlightTimer = 0;
+
+  function nextFrame() {
+    return new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  }
+
+  // Extracts VirtualizedConversationList props and virtualizer from the sidebar Fiber tree
+  function findSidebarListController() {
+    const listEl =
+      document.querySelector('[data-testid="conversation-list-sidebar"]') ||
+      document.querySelector('[data-sidebar-scroll-container="true"]');
+    if (!listEl) return null;
+
+    const fiberKey = Object.keys(listEl).find(
+      (k) => k.startsWith('__reactFiber$') || k.startsWith('__reactContainer$')
+    );
+    if (!fiberKey) return { listEl, props: null, virtualizer: null };
+
+    let fiber = listEl[fiberKey];
+    let steps = 0;
+    let vlistFiber = null;
+    while (fiber && steps < 40) {
+      steps++;
+      if (Array.isArray(fiber.memoizedProps?.items)) {
+        vlistFiber = fiber;
+        break;
+      }
+      fiber = fiber.return;
+    }
+
+    let virtualizer = null;
+    if (vlistFiber) {
+      let hook = vlistFiber.memoizedState;
+      let hSteps = 0;
+      while (hook && hSteps < 40) {
+        hSteps++;
+        const cand = hook.memoizedState?.current || hook.memoizedState;
+        if (cand && typeof cand.scrollToIndex === 'function') {
+          virtualizer = cand;
+          break;
+        }
+        hook = hook.next;
+      }
+    }
+
+    return {
+      listEl,
+      props: vlistFiber?.memoizedProps || null,
+      virtualizer,
+    };
+  }
+
+  // Reveals, scrolls to, and pulses a conversation row in the left sidebar
+  async function locateConversationInSidebar(cascadeId) {
+    if (!cascadeId) return;
+
+    // Archived pieces are hidden from the sidebar, so resolve to the live chain tail
+    let targetId = cascadeId;
+    try {
+      const chain = await chainOf(cascadeId);
+      if (Array.isArray(chain) && chain.length > 0) {
+        targetId = chain[chain.length - 1];
+      }
+    } catch {
+      targetId = cascadeId;
+    }
+
+    const store = findReduxStore();
+
+    // Open the left sidebar before querying list DOM or Fiber nodes
+    if (store?.getState()?.sideBar?.isOpen === false) {
+      store.dispatch({ type: 'sideBar/setIsOpenInternal', payload: true });
+      await nextFrame();
+      await nextFrame();
+    }
+
+    // Unhide the conversation's attention bucket if currently filtered out
+    const summary = store?.getState()?.trajectorySummaries?.summaries?.[targetId];
+    const rawTitle = summary?.annotations?.title || summary?.summary || '';
+    const bucket = classifyChatBucket(summary, rawTitle);
+    if (!visibleBuckets.has(bucket)) {
+      visibleBuckets.add(bucket);
+      saveVisibleBuckets(visibleBuckets);
+      runFullSync();
+      await nextFrame();
+    }
+
+    let ctrl = findSidebarListController();
+    if (!ctrl) {
+      await nextFrame();
+      ctrl = findSidebarListController();
+    }
+
+    const projectId = summary?.trajectoryMetadata?.projectId;
+
+    if (ctrl?.props) {
+      let needsRerender = false;
+
+      // Expand collapsed section headers and project folder so the row enters flat items
+      if (Array.isArray(ctrl.props.items)) {
+        for (const item of ctrl.props.items) {
+          if (item.type === 'section-header' && item.isCollapsed) {
+            ctrl.props.onToggleSectionHeader?.(item.collapseId || item.id);
+            needsRerender = true;
+          }
+        }
+        if (projectId) {
+          for (const item of ctrl.props.items) {
+            if (item.type === 'header' && item.id === projectId && item.isCollapsed) {
+              ctrl.props.onToggleCollapseSection?.(projectId);
+              needsRerender = true;
+            }
+          }
+        }
+      }
+
+      if (needsRerender) {
+        await nextFrame();
+        ctrl = findSidebarListController() || ctrl;
+      }
+
+      // Expand pagination when the project row is truncated behind "Show N more"
+      if (projectId && Array.isArray(ctrl.props?.items)) {
+        const hasProjectRow = ctrl.props.items.some(
+          (it) =>
+            it.type === 'row' &&
+            it.cascadeId === targetId &&
+            it.groupId !== 'pinned'
+        );
+        if (!hasProjectRow) {
+          const hasShowMore = ctrl.props.items.some(
+            (it) => it.type === 'show-more' && it.groupId === projectId
+          );
+          if (hasShowMore) {
+            ctrl.props.onTogglePagination?.(projectId);
+            await nextFrame();
+            ctrl = findSidebarListController() || ctrl;
+          }
+        }
+      }
+    }
+
+    // Prefer the project folder row over the pinned quick-link when scrolling
+    if (ctrl?.props && Array.isArray(ctrl.props.items)) {
+      let targetIdx = -1;
+      for (let i = 0; i < ctrl.props.items.length; i++) {
+        const it = ctrl.props.items[i];
+        if (it.type === 'row' && it.cascadeId === targetId) {
+          if (targetIdx === -1 || (it.groupId && it.groupId !== 'pinned')) {
+            targetIdx = i;
+            if (it.groupId && it.groupId !== 'pinned') {
+              break;
+            }
+          }
+        }
+      }
+      if (targetIdx >= 0 && ctrl.virtualizer?.scrollToIndex) {
+        ctrl.virtualizer.scrollToIndex(targetIdx, { align: 'center' });
+        await nextFrame();
+        await nextFrame();
+      }
+    }
+
+    let highlightEl =
+      document.querySelector(
+        `[data-testid="conversation-row-sidebar"][data-cascade-id="${targetId}"]`
+      ) ||
+      document.querySelector(`div[data-sidebar-row-id="${targetId}"]`);
+
+    if (!highlightEl) {
+      const candidates = document.querySelectorAll('[data-cascade-id], [data-sidebar-row-id]');
+      for (const el of candidates) {
+        if (
+          el.getAttribute('data-cascade-id') === targetId ||
+          el.getAttribute('data-sidebar-row-id') === targetId
+        ) {
+          highlightEl = el;
+          break;
+        }
+      }
+    }
+
+    if (highlightEl) {
+      if (typeof highlightEl.scrollIntoView === 'function') {
+        highlightEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      }
+      if (locateHighlightTimer) {
+        clearTimeout(locateHighlightTimer);
+        locateHighlightTimer = 0;
+      }
+      for (const prev of document.querySelectorAll(`[${LOCATED_ROW_ATTR}="true"]`)) {
+        prev.removeAttribute(LOCATED_ROW_ATTR);
+      }
+      highlightEl.setAttribute(LOCATED_ROW_ATTR, 'true');
+      locateHighlightTimer = setTimeout(() => {
+        highlightEl.removeAttribute(LOCATED_ROW_ATTR);
+        locateHighlightTimer = 0;
+      }, 2300);
+      if (locateHighlightTimer && typeof locateHighlightTimer.unref === 'function') {
+        locateHighlightTimer.unref();
+      }
+    }
+  }
+
+  window.__jetskiLocateInSidebar = locateConversationInSidebar;
+
   // Matryoshka chain star tooltip showing lazy piece turn counts and question previews
   let chainTooltipEl = null;
   let activeTooltipBtn = null;
@@ -2619,6 +2853,31 @@
         container.insertBefore(searchBtn, moreBtn);
       }
 
+      // Reveals the active conversation or live chain tail in the left sidebar
+      let locateBtn = container.querySelector(`.${LOCATE_BTN_CLASS}`);
+      if (!locateBtn) {
+        locateBtn = document.createElement('button');
+        locateBtn.className = LOCATE_BTN_CLASS;
+        locateBtn.type = 'button';
+        locateBtn.setAttribute('data-testid', 'jetski-chat-locate-btn');
+        locateBtn.textContent = '🎯';
+        locateBtn.setAttribute('aria-label', 'Locate this chat in sidebar');
+        locateBtn.setAttribute('title', 'Locate this chat in sidebar');
+        locateBtn.setAttribute('data-cascade-id', cascadeId);
+        bindActionBtnHandlers(locateBtn, () => {
+          const cid =
+            locateBtn.getAttribute('data-cascade-id') || findCascadeIdFromElement(moreBtn);
+          if (cid) {
+            void locateConversationInSidebar(cid);
+          }
+        });
+        const beforeTarget =
+          container.querySelector(`.${TITLEBAR_WAIT_BTN_CLASS}`) || moreBtn;
+        container.insertBefore(locateBtn, beforeTarget);
+      } else if (locateBtn.getAttribute('data-cascade-id') !== cascadeId) {
+        locateBtn.setAttribute('data-cascade-id', cascadeId);
+      }
+
       let waitBtn = container.querySelector(`.${TITLEBAR_WAIT_BTN_CLASS}`);
       if (!waitBtn) {
         waitBtn = document.createElement('button');
@@ -2856,6 +3115,7 @@
         target.className === ROW_BG_WAIT_INDICATOR_CLASS ||
         target.className === PROJECT_ROADMAP_BADGE_CLASS ||
         target.className === SEARCH_BTN_CLASS ||
+        target.className === LOCATE_BTN_CLASS ||
         target.className === CHAIN_STARS_GROUP_CLASS ||
         target.className === CHAIN_STAR_BTN_CLASS ||
         target.className === ARCHIVE_BANNER_CLASS ||
@@ -2869,6 +3129,7 @@
             target.closest(`.${ROW_WAIT_BTN_CLASS}`) ||
             target.closest(`.${ROW_BG_WAIT_INDICATOR_CLASS}`) ||
             target.closest(`.${PROJECT_ROADMAP_BADGE_CLASS}`) ||
+            target.closest(`.${LOCATE_BTN_CLASS}`) ||
             target.closest(`.${CHAIN_STARS_GROUP_CLASS}`) ||
             target.closest(`.${ARCHIVE_BANNER_CLASS}`) ||
             target.closest(`#${SEARCH_PANEL_ID}`)))
@@ -2915,6 +3176,7 @@
       `.${ROW_BG_WAIT_INDICATOR_CLASS}`,
       `.${PROJECT_ROADMAP_BADGE_CLASS}`,
       `.${SEARCH_BTN_CLASS}`,
+      `.${LOCATE_BTN_CLASS}`,
       `#${SEARCH_PANEL_ID}`,
       `.${CHAIN_STARS_GROUP_CLASS}`,
       `.${ARCHIVE_BANNER_CLASS}`,
@@ -2922,6 +3184,13 @@
     ].join(', ');
     for (const el of document.querySelectorAll(cleanupSelector)) {
       el.remove();
+    }
+    if (locateHighlightTimer) {
+      clearTimeout(locateHighlightTimer);
+      locateHighlightTimer = 0;
+    }
+    for (const prev of document.querySelectorAll(`[${LOCATED_ROW_ATTR}="true"]`)) {
+      prev.removeAttribute(LOCATED_ROW_ATTR);
     }
     // Restore any row titles whose ⦿ marker was visually swapped to ⏳
     for (const spanEl of document.querySelectorAll('span.truncate')) {

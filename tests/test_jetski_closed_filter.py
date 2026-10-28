@@ -176,6 +176,9 @@ class FakeElement {
   getBoundingClientRect() {
     return { left: 24, top: 40, bottom: 62, right: 140, width: 116, height: 22 };
   }
+  scrollIntoView(opts) {
+    this._lastScrolledIntoView = opts || true;
+  }
   focus() {}
   closest(selector) {
     let cur = this;
@@ -250,6 +253,14 @@ function matches(el, selector) {
     return (
       el.tagName === tagAttrMatch[1].toUpperCase() &&
       el.getAttribute(tagAttrMatch[2]) === tagAttrMatch[3]
+    );
+  }
+  const doubleAttrMatch =
+    /^\[([-a-zA-Z0-9_]+)="([^"]+)"\]\[([-a-zA-Z0-9_]+)="([^"]+)"\]$/.exec(selector);
+  if (doubleAttrMatch) {
+    return (
+      el.getAttribute(doubleAttrMatch[1]) === doubleAttrMatch[2] &&
+      el.getAttribute(doubleAttrMatch[3]) === doubleAttrMatch[4]
     );
   }
   const attrEqMatch = /^\[([-a-zA-Z0-9_]+)="([^"]+)"\]$/.exec(selector);
@@ -439,6 +450,9 @@ const storeState = {
   conversation: {
     cascadeId: 'open-step',
   },
+  sideBar: {
+    isOpen: true,
+  },
 };
 
 const subscribers = [];
@@ -447,6 +461,10 @@ const reduxStore = {
     return storeState;
   },
   dispatch(action) {
+    if (action?.type === 'sideBar/setIsOpenInternal') {
+      storeState.sideBar = { isOpen: Boolean(action.payload) };
+      return action;
+    }
     // Mirror multiConvoLayout/resetPane in test harness
     if (action?.type === 'multiConvoLayout/resetPane') {
       const { paneId, cascadeId } = action.payload || {};
@@ -877,12 +895,18 @@ const liveBucketBtn = (k) =>
   bodyEl.querySelector('.jetski-attention-filter-bar').querySelector(`button[data-bucket="${k}"]`);
 
 (async () => {
+  const titlebarLocateBtn = titlebarToolbar.querySelector('.jetski-chat-locate-btn');
   const titlebarWaitBtn = titlebarToolbar.querySelector('.jetski-titlebar-wait-btn');
   const titlebarBtn = titlebarToolbar.querySelector('.jetski-titlebar-archive-btn');
-  assert(titlebarWaitBtn, 'Titlebar Wait button must be injected after Search, before Archive');
+  assert(titlebarLocateBtn, 'Titlebar Locate button must be injected after Search');
+  assert(titlebarWaitBtn, 'Titlebar Wait button must be injected after Locate, before Archive');
   assert(titlebarBtn, 'Titlebar Archive button must be injected before titlebar-more-actions');
-  assert.strictEqual(titlebarToolbar.children[1], titlebarWaitBtn);
-  assert.strictEqual(titlebarToolbar.children[2], titlebarBtn);
+  assert.strictEqual(titlebarLocateBtn.textContent, '🎯');
+  assert.strictEqual(titlebarLocateBtn.getAttribute('data-testid'), 'jetski-chat-locate-btn');
+  assert.strictEqual(titlebarLocateBtn.getAttribute('data-cascade-id'), 'open-current');
+  assert.strictEqual(titlebarToolbar.children[1], titlebarLocateBtn);
+  assert.strictEqual(titlebarToolbar.children[2], titlebarWaitBtn);
+  assert.strictEqual(titlebarToolbar.children[3], titlebarBtn);
   assert.strictEqual(titlebarBtn.getAttribute('data-testid'), 'jetski-titlebar-archive-btn');
   assert.strictEqual(titlebarBtn.getAttribute('aria-label'), 'Archive chat');
   assert.strictEqual(titlebarBtn.getAttribute('data-archived'), 'false');
@@ -896,7 +920,11 @@ const liveBucketBtn = (k) =>
 
   // Mutations inside injected action buttons must not schedule a sync loop
   rafCallbacks = [];
-  observerCallback([{ target: titlebarBtn }, { target: rowWaitBtn }]);
+  observerCallback([
+    { target: titlebarLocateBtn },
+    { target: titlebarBtn },
+    { target: rowWaitBtn },
+  ]);
   assert.strictEqual(rafCallbacks.length, 0);
 
   const advanceClock = () => {
@@ -1226,6 +1254,119 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(fallbackStars.style.width, '28px');
   assert.strictEqual(fallbackStars.style.top, '50%');
   assert.strictEqual(fallbackStars.style.transform, 'translateY(-50%)');
+
+  // Verify locateConversationInSidebar resolves chain tail, opens sidebar, unhides bucket,
+  // expands collapsed sections/pagination, scrolls virtualizer, and pulses the DOM row
+  const vlistEl = new FakeElement('div');
+  vlistEl.setAttribute('data-testid', 'conversation-list-sidebar');
+  const targetSidebarRow = new FakeElement('div');
+  targetSidebarRow.setAttribute('data-testid', 'conversation-row-sidebar');
+  targetSidebarRow.setAttribute('data-cascade-id', 'open-current');
+
+  const toggledSectionHeaders = [];
+  const toggledCollapsedSections = [];
+  const toggledPaginations = [];
+  let lastVirtualScroll = null;
+
+  const vlistProps = {
+    items: [
+      {
+        type: 'section-header',
+        id: 'main-section-header',
+        collapseId: 'main-section-header',
+        isCollapsed: true,
+      },
+      {
+        type: 'row',
+        id: 'pinned:open-current',
+        cascadeId: 'open-current',
+        groupId: 'pinned',
+      },
+      {
+        type: 'header',
+        id: 'proj-1',
+        isCollapsed: true,
+      },
+    ],
+    onToggleSectionHeader(id) {
+      toggledSectionHeaders.push(id);
+      vlistProps.items[0].isCollapsed = false;
+    },
+    onToggleCollapseSection(id) {
+      toggledCollapsedSections.push(id);
+      vlistProps.items[2].isCollapsed = false;
+      vlistProps.items.push({
+        type: 'show-more',
+        id: 'show-more:proj-1',
+        groupId: 'proj-1',
+      });
+    },
+    onTogglePagination(id) {
+      toggledPaginations.push(id);
+      vlistProps.items = vlistProps.items.filter((it) => it.type !== 'show-more');
+      vlistProps.items.push({
+        type: 'row',
+        id: 'proj-1:open-current',
+        cascadeId: 'open-current',
+        groupId: 'proj-1',
+      });
+    },
+  };
+
+  vlistEl.__reactFiber$vlist = {
+    memoizedProps: {},
+    return: {
+      memoizedProps: vlistProps,
+      memoizedState: {
+        memoizedState: {
+          scrollToIndex(idx, opts) {
+            lastVirtualScroll = { idx, opts };
+            if (!targetSidebarRow.parentElement) {
+              vlistEl.appendChild(targetSidebarRow);
+            }
+          },
+        },
+        next: null,
+      },
+    },
+  };
+  bodyEl.appendChild(vlistEl);
+
+  // Close sidebar and hide needs-me bucket before locating archived piece 'open-step'
+  storeState.sideBar = { isOpen: false };
+  if (liveBucketBtn('needs-me').getAttribute('data-active') === 'true') {
+    advanceClock();
+    liveBucketBtn('needs-me').dispatchEvent('pointerdown', { button: 0 });
+    liveBucketBtn('needs-me').dispatchEvent('click');
+  }
+  assert.strictEqual(liveBucketBtn('needs-me').getAttribute('data-active'), 'false');
+
+  await window.__jetskiLocateInSidebar('open-step');
+
+  assert.strictEqual(storeState.sideBar.isOpen, true, 'Sidebar must be opened');
+  assert.strictEqual(
+    liveBucketBtn('needs-me').getAttribute('data-active'),
+    'true',
+    'Filtered bucket must be unhidden'
+  );
+  assert.deepStrictEqual(toggledSectionHeaders, ['main-section-header']);
+  assert.deepStrictEqual(toggledCollapsedSections, ['proj-1']);
+  assert.deepStrictEqual(toggledPaginations, ['proj-1']);
+  assert.deepStrictEqual(
+    lastVirtualScroll,
+    { idx: 3, opts: { align: 'center' } },
+    'Virtualizer must scroll to the project group row rather than the pinned row'
+  );
+  assert.strictEqual(targetSidebarRow.getAttribute('data-jetski-located-row'), 'true');
+  assert.deepStrictEqual(targetSidebarRow._lastScrolledIntoView, {
+    block: 'center',
+    behavior: 'smooth',
+  });
+
+  // Cleanup must clear located-row attribute and remove locate buttons
+  window.__jetskiClosedChatsFilterCleanup();
+  assert.strictEqual(targetSidebarRow.hasAttribute('data-jetski-located-row'), false);
+  assert(!titlebarToolbar.querySelector('.jetski-chat-locate-btn'));
 
   console.log('ALL_JS_ASSERTIONS_PASSED');
 })().catch((err) => {
