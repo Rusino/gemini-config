@@ -730,8 +730,9 @@ console.log(JSON.stringify({
     self.assertIn("https://example.com/9?tab=checks", out["ownCqFailCard"])
     self.assertNotIn("Post-submit alert", out["ownCqFailCard"])
     self.assertNotIn("status.skia.org", out["ownCqFailCard"])
-    self.assertIn("Working in chat", out["busyCard"])
-    self.assertIn("Working in chat…", out["busyCard"])
+    self.assertIn("Chat is working", out["busyCard"])
+    self.assertIn("Open chat", out["busyCard"])
+    self.assertNotIn("Working in chat", out["busyCard"])
     self.assertEqual(out["piperState"], "In review")
 
   def test_dashboard_has_no_manual_chat_actions_or_browser_alerts(self):

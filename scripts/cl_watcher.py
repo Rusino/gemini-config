@@ -2648,10 +2648,9 @@ function rowTime(it) {
 
 function focusCard(it, data) {
   const chat = chatUrl(it, data);
-  const chatLabel = it.chat_busy ? 'Working in chat…' : 'Open chat';
-  const chatBtn = chat ? link(chat, chatLabel, 'btn quiet') : '';
+  const chatBtn = chat ? link(chat, 'Open chat', 'btn quiet') : '';
   const busyBadge = it.chat_busy
-    ? '<span class="busy-pill"><i class="dot moving"></i>Working in chat</span> · '
+    ? '<span class="busy-pill"><i class="dot moving"></i>Chat is working</span> · '
     : '';
   const subject = esc(cleanSubject(it.subject));
   if (isPostSubmitAlert(it)) {
