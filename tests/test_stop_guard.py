@@ -7,7 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import mock_open, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "hooks")))
 
@@ -335,6 +335,23 @@ class TestStopGuard(unittest.TestCase):
       self.assertIn("--summary=Jetski: [14:00] ⦿ Fix bug", cmd)
       self.assertIn("--uri=https://jetski.corp.google.com/box/myhost/c/conv-123", cmd)
       self.assertTrue(mock_popen.call_args[1].get("start_new_session"))
+
+  def test_play_stop_sound_respects_enable_g3_notifications(self):
+    cfg_disabled = '{"userSettings": {"enableG3Notifications": false}}'
+    with patch("os.path.exists", return_value=True), \
+         patch("builtins.open", mock_open(read_data=cfg_disabled)), \
+         patch("time.sleep"), \
+         patch("stop_guard.send_stop_notification") as mock_notify:
+      stop_guard.play_stop_sound(is_handoff=False)
+      mock_notify.assert_not_called()
+
+    cfg_enabled = '{"userSettings": {"enableG3Notifications": true}}'
+    with patch("os.path.exists", return_value=True), \
+         patch("builtins.open", mock_open(read_data=cfg_enabled)), \
+         patch("time.sleep"), \
+         patch("stop_guard.send_stop_notification") as mock_notify:
+      stop_guard.play_stop_sound(is_handoff=False)
+      mock_notify.assert_called_once()
 
   def test_jetski_web_edit_file_blocks_stop_when_unverified(self):
     fake_src = "/workspace/project/Paragraph.cpp"

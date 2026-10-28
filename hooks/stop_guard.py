@@ -160,7 +160,9 @@ def play_stop_sound(is_handoff: bool) -> None:
         with open(config_path, "w", encoding="utf-8") as f:
           json.dump(config, f, indent=2)
         time.sleep(0.3)
-      send_stop_notification(_CURRENT_CONV_ID)
+      # G3 desktop notifications are opt-in to avoid intrusive popups
+      if user_settings.get("enableG3Notifications", False):
+        send_stop_notification(_CURRENT_CONV_ID)
   except Exception:
     pass
 
