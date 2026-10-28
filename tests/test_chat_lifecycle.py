@@ -1294,6 +1294,41 @@ class TestChatLifecycle(unittest.TestCase):
       self.assertEqual(res_inh["enum"], "M_PRO")
       self.assertEqual(res_inh["source"], "inherited")
 
+
+  def test_resolve_handoff_model_tier_skips_nameless(self):
+    fake_catalog = {
+        "models": {
+            "m-nameless": {"model": "M_NAMELESS"},
+            "m-flash": {"model": "M_FLASH", "displayName": "Flash"},
+            "m-fallback": {"model": "gemini-3.8-pro", "displayName": "Pro Fallback"},
+        },
+        "tieredModelIds": {
+            "flash": ["m-nameless", "m-flash"],
+            "pro": ["m-nameless"]
+        }
+    }
+    with patch.object(chat_lifecycle, "get_available_models", return_value=fake_catalog):
+      res = chat_lifecycle.resolve_handoff_model("", tier="flash")
+      self.assertEqual(res["enum"], "M_FLASH")
+      self.assertEqual(res["has_display_name"], True)
+      self.assertEqual(res["source"], "tier:flash")
+
+  def test_resolve_handoff_model_tier_fallback(self):
+    fake_catalog = {
+        "models": {
+            "m-nameless": {"model": "M_NAMELESS"},
+            "m-fallback": {"model": "gemini-3.8-pro", "displayName": "Pro Fallback"},
+        },
+        "tieredModelIds": {
+            "pro": ["m-nameless"]
+        }
+    }
+    with patch.object(chat_lifecycle, "get_available_models", return_value=fake_catalog):
+      res = chat_lifecycle.resolve_handoff_model("", tier="pro")
+      self.assertEqual(res["enum"], "gemini-3.8-pro")
+      self.assertEqual(res["has_display_name"], True)
+      self.assertEqual(res["source"], "tier-fallback:pro")
+
   def test_export_chain_index_writes_jetski_chains_json(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
       self.write_chain(tmp_dir, [("c1", None), ("c2", "c1"), ("c3", "c2")])

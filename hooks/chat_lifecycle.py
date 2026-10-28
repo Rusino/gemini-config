@@ -671,7 +671,7 @@ def lookup_model(models: dict, wanted: str) -> dict:
     enum = det.get("model", "")
     label = det.get("displayName", "")
     if w in (mid.lower(), enum.lower(), label.lower()):
-      return {"enum": enum, "id": mid, "label": label or mid}
+      return {"enum": enum, "id": mid, "label": label or mid, "has_display_name": bool(label), "displayName": label}
   return {}
 
 
@@ -845,11 +845,38 @@ def resolve_handoff_model(
 
   def from_tier(t: str) -> dict:
     key = {"flash_lite": "flashLite", "flash": "flash", "pro": "pro"}.get(t, "pro")
+    
+    # 1. Look for a named model in the tier
+    for mid in tiers.get(key) or []:
+      hit = lookup_model(models, mid)
+      if hit and hit.get("has_display_name"):
+        return {**hit, "source": f"tier:{t}"}
+        
+    # 2. Fallback to known named models if no named model in tier
+    fallbacks = {
+        "flash_lite": ["gemini-3.5-flash-lite", "gemini-3.8-flash-lite"],
+        "flash": ["gemini-3.8-flash-low", "gemini-3.8-flash-medium", "gemini-3.8-flash-high", "gemini-3.8-flash"],
+        "pro": ["gemini-3.8-pro", "gemini-4-argon", "gemini-3.5-pro"]
+    }
+    
+    for fb in fallbacks.get(t, []):
+        hit = lookup_model(models, fb)
+        if hit and hit.get("has_display_name"):
+            sys.stderr.write(f"Warning: No named model found in tier '{t}', falling back to {fb}\n")
+            return {**hit, "source": f"tier-fallback:{t}"}
+            
+    # 3. Last resort
     for mid in tiers.get(key) or []:
       hit = lookup_model(models, mid)
       if hit:
         return {**hit, "source": f"tier:{t}"}
+        
     return {}
+
+  def _check_and_return(hit: dict) -> dict:
+    if hit and not hit.get("has_display_name"):
+      sys.stderr.write(f"Warning: Selected model '{hit.get('enum', '')}' has no displayName (nameless alias)\n")
+    return hit
 
   if explicit:
     if explicit in AGENTAPI_TIERS:
@@ -859,7 +886,7 @@ def resolve_handoff_model(
       hit = {**hit, "source": "explicit"} if hit else {}
     if not hit:
       raise RuntimeError(f"--model '{explicit}' is not available in GetAvailableModels")
-    return hit
+    return _check_and_return(hit)
 
   pid = project_id or (get_conversation_project_id(current_conv_id) if current_conv_id else "")
   if pid and pid != "outside-of-project":
@@ -870,20 +897,20 @@ def resolve_handoff_model(
       else:
         hit = lookup_model(models, proj_pref)
       if hit:
-        return {**hit, "source": f"project:{pid}"}
+        return _check_and_return({**hit, "source": f"project:{pid}"})
 
   inherited = get_last_used_model(current_conv_id) if current_conv_id else ""
   hit = lookup_model(models, inherited)
   if hit:
-    return {**hit, "source": "inherited"}
+    return _check_and_return({**hit, "source": "inherited"})
 
   hit = lookup_model(models, read_handoff_model_override())
   if hit:
-    return {**hit, "source": "override"}
+    return _check_and_return({**hit, "source": "override"})
 
   hit = from_tier(tier)
   if hit:
-    return hit
+    return _check_and_return(hit)
   raise RuntimeError("no usable model found in GetAvailableModels")
 
 
