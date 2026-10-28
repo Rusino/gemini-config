@@ -808,6 +808,11 @@ def generate_report(cl_data, analysis, files):
     md.append("---")
     md.append("### 🎯 Concrete Next Actions\n")
 
+    if cl_data.get("id") and "skia" in (cl_data.get("host") or "") and cat in ("SURGICAL_AUDIT", "PUSHBACK"):
+        md.append(f"> **🛡️ Mandatory ASAN & Canary Gate (`[ASAN/CANARY GUARD]`):**\n"
+                  f"> Run `python3 ~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py advise --cl {cl_data['id']}`\n"
+                  f"> and execute the printed `AGENT ACTION` command (`git cl try ...`) to auto-trigger ASAN and external canaries.\n")
+
     if cat == "MECHANICAL":
         md.append("> **Your Action (15–30 seconds):** Confirm this is a safe mechanical update/revert and approve.")
         md.append("\n**Agent Verification Summary:**")

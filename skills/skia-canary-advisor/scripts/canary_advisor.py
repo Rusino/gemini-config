@@ -338,6 +338,7 @@ def advise(args):
     if args.strong_only:
         recs = {c: r for c, r in recs.items() if r["tier"] == "STRONG"}
 
+    own = meta["owner"] == ME
     external = not meta["owner"].endswith("@google.com")
 
     asan_bot, asan_reason = choose_asan_bot(files.keys())

@@ -201,6 +201,21 @@ TRIAGE_CORPUS_MARKER_RE = re.compile(
     r"|"
     r'"required":\s*true[\s\S]{0,160}?"script":\s*"(run_flutter_paragraph_tests\.py|run_webparagraph_corpus\.py)"'
 )
+# Match Skia C++ paths across modules, core, ports, tests, and bench
+SKIA_CPP_PATH_RE = re.compile(
+    r"(?:^|[\s`'\"(/])(?:modules/[^/\s`'\"]+/(?:src|include)|src|include|tests?|bench|gm)/[^\s`'\"#)]+\.(?:c|cc|cpp|cxx|h|hh|hpp|hxx|mm)\b"
+)
+SKIA_GERRIT_RE = re.compile(
+    r"https?://skia-review\.googlesource\.com/(?:c/skia/\+/|changes/)?(\d{6,8})"
+)
+AGENT_ACTION_TRY_RE = re.compile(
+    r"AGENT ACTION \(execute this command[^\)]*\):\s*\n\s*(git cl try[^\n]+)"
+)
+GIT_CL_TRY_BOT_RE = re.compile(r"-b\s+([A-Za-z0-9_.-]+)")
+USER_TRYJOB_OPTOUT_RE = re.compile(
+    r"(?:без\s+(?:asan|асан|try|трай|канаре|canar)|skip\s+(?:asan|try|canar)|no\s+(?:asan|try|canar))",
+    re.IGNORECASE,
+)
 
 
 # Verify that script_name is executed rather than merely inspected via grep/cat
@@ -281,6 +296,7 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
       "unread_skills": [],
       "artifact_issues": [],
       "corpus_issues": [],
+      "asan_canary_issues": [],
   }
   if not transcript_path or not os.path.exists(transcript_path):
     return result
@@ -324,6 +340,13 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
   }
   pending_triage = False
   pending_corpus_script = ""
+  triggered_try_bots = set()
+  required_agent_bots = set()
+  required_agent_try_cmd = ""
+  canary_advisor_invoked = False
+  skia_review_cl = ""
+  skia_cpp_detected = False
+  pending_canary_advisor = False
 
   # Walk planner tool calls and command outputs in chronological order
   for step in steps:
@@ -346,6 +369,12 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
           read_blobs.append(cmd)
           if _invokes_script_in_cmd(cmd, "triage_cl.py"):
             pending_triage = True
+          if _invokes_script_in_cmd(cmd, "canary_advisor.py"):
+            canary_advisor_invoked = True
+            pending_canary_advisor = True
+          if re.search(r"\bgit\s+cl\s+try\b", cmd):
+            for m in GIT_CL_TRY_BOT_RE.finditer(cmd):
+              triggered_try_bots.add(m.group(1))
           for c_script in (
               "run_flutter_paragraph_tests.py",
               "run_webparagraph_corpus.py",
@@ -360,7 +389,23 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
       content = str(step.get("content", ""))
       if "\nFile Path: " in content[:200]:
         continue
+      m_action = AGENT_ACTION_TRY_RE.search(content)
+      if m_action:
+        cmd_str = m_action.group(1).strip()
+        required_agent_try_cmd = cmd_str
+        for m in GIT_CL_TRY_BOT_RE.finditer(cmd_str):
+          required_agent_bots.add(m.group(1))
+      if pending_canary_advisor:
+        m_g = SKIA_GERRIT_RE.search(content)
+        if m_g:
+          skia_review_cl = m_g.group(1)
+        pending_canary_advisor = False
       if pending_triage:
+        m_gerrit = SKIA_GERRIT_RE.search(content)
+        if m_gerrit:
+          skia_review_cl = m_gerrit.group(1)
+        if SKIA_CPP_PATH_RE.search(content):
+          skia_cpp_detected = True
         m_marker = TRIAGE_CORPUS_MARKER_RE.search(content)
         if m_marker:
           script = m_marker.group(1) or m_marker.group(2)
@@ -464,6 +509,32 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
         "`UNVERIFIED IN FLUTTER` if the environment prevents running it)"
     )
 
+  # Enforce mandatory ASAN try job and external-author canary try jobs
+  user_opted_out_try = any(USER_TRYJOB_OPTOUT_RE.search(u) for u in all_user_requests)
+  if not user_opted_out_try:
+    missing_try_bots = required_agent_bots - triggered_try_bots
+    if missing_try_bots:
+      result["asan_canary_issues"].append(
+          "[ASAN/CANARY GUARD] `skia-canary-advisor` specified required try job(s) for the agent to run, "
+          f"but the following bot(s) were not triggered via `git cl try`: {', '.join(sorted(missing_try_bots))}. "
+          f"Execute this command now:\n  {required_agent_try_cmd}"
+      )
+    elif (
+        skia_review_cl
+        and skia_cpp_detected
+        and not canary_advisor_invoked
+        and (
+            CASE_CLASSIFICATION_RE.search(combined_review_out)
+            or REVIEW_APPROVAL_RE.search(combined_review_out)
+        )
+    ):
+      result["asan_canary_issues"].append(
+          f"[ASAN/CANARY GUARD] You are reviewing Skia CL {skia_review_cl} (modifying C++ code), "
+          "but `skia-canary-advisor` was never executed in this conversation. "
+          f"Run `python3 ~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py advise --cl {skia_review_cl}` "
+          "to select and auto-trigger the required ASAN try job (and canary for external authors) before completing the review"
+      )
+
   return result
 
 
@@ -478,6 +549,8 @@ def review_discipline_reason(info: dict) -> str:
     parts.append(f"- {issue}.")
   # Append any unverified review corpus violations to the stop block reason
   for issue in info.get("corpus_issues", []):
+    parts.append(f"- {issue}.")
+  for issue in info.get("asan_canary_issues", []):
     parts.append(f"- {issue}.")
   if not parts:
     return ""

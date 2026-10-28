@@ -668,6 +668,104 @@ class TestStopGuard(unittest.TestCase):
       ]
       self.assertEqual(self.run_discipline_stop(tmp_dir, steps), {})
 
+  def test_asan_canary_guard_blocks_when_required_bot_not_triggered(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      steps = [
+          {
+              "step_index": 1,
+              "type": "USER_INPUT",
+              "content": "<USER_REQUEST>review CL 1408157</USER_REQUEST>",
+          },
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": (
+                          "python3 ~/.gemini/config/skills/skia-canary-advisor/"
+                          "scripts/canary_advisor.py advise --cl 1408157"
+                      )
+                  },
+              }],
+          },
+          {
+              "step_index": 3,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": (
+                  "AGENT ACTION (execute this command):\n"
+                  "  git cl try -i 1408157 -B skia/skia.primary -b Bot-ASAN -b Canary-Flutter\n"
+              ),
+          },
+          {
+              "step_index": 4,
+              "type": "PLANNER_RESPONSE",
+              "content": "### Execution Ledger\n- Triage: done\n\n**Case 1: Ideal CL**",
+          },
+      ]
+      res = self.run_discipline_stop(tmp_dir, steps)
+      self.assertEqual(res.get("decision"), "continue")
+      self.assertIn("[ASAN/CANARY GUARD]", res.get("reason", ""))
+      self.assertIn("Bot-ASAN", res.get("reason", ""))
+      self.assertIn("Canary-Flutter", res.get("reason", ""))
+
+  def test_asan_canary_guard_allows_when_bots_triggered(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      steps = [
+          {
+              "step_index": 1,
+              "type": "USER_INPUT",
+              "content": "<USER_REQUEST>review CL 1408157</USER_REQUEST>",
+          },
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": (
+                          "python3 ~/.gemini/config/skills/skia-canary-advisor/"
+                          "scripts/canary_advisor.py advise --cl 1408157"
+                      )
+                  },
+              }],
+          },
+          {
+              "step_index": 3,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": (
+                  "AGENT ACTION (execute this command):\n"
+                  "  git cl try -i 1408157 -B skia/skia.primary -b Bot-ASAN -b Canary-Flutter\n"
+              ),
+          },
+          {
+              "step_index": 4,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": (
+                          "git cl try -i 1408157 -B skia/skia.primary -b Bot-ASAN -b Canary-Flutter"
+                      )
+                  },
+              }],
+          },
+          {
+              "step_index": 5,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": "The command exited with code 0.\n",
+          },
+          {
+              "step_index": 6,
+              "type": "PLANNER_RESPONSE",
+              "content": "### Execution Ledger\n- Triage: done\n\n**Case 1: Ideal CL**",
+          },
+      ]
+      self.assertEqual(self.run_discipline_stop(tmp_dir, steps), {})
+
   def test_schedule_tool_call_promotes_conversation_to_waiting_state(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
       transcript = os.path.join(tmp_dir, "transcript.jsonl")
