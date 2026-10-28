@@ -525,6 +525,8 @@ const reduxStore = {
       }
       storeState.trajectorySummaries = { summaries: next };
       for (const sub of subscribers) sub();
+      // Stands in for osConversationNotificationsMiddleware, which runs after the reducer
+      if (fakeNotificationMiddleware) fakeNotificationMiddleware(action);
     }
     return action;
   },
@@ -541,6 +543,9 @@ displayOptionsBtn.__reactFiber$test = {
 const storage = new Map();
 // Handoff redirects served in jetski-chains.json; empty until the auto-switch checks
 let chainRedirects = {};
+let fakeNotificationMiddleware = null;
+// Chime files that reached the network, i.e. were not dropped by the sound gate
+const soundFetches = [];
 let observerCallback = null;
 let rafCallbacks = [];
 const rpcRequests = [];
@@ -666,6 +671,10 @@ global.window = {
         headers: opts?.headers || {},
         body: JSON.parse(opts?.body || '{}'),
       });
+      return { ok: true, status: 200 };
+    }
+    if (String(url).endsWith('.mp3')) {
+      soundFetches.push(String(url));
       return { ok: true, status: 200 };
     }
     return { ok: false, status: 404 };
@@ -1375,6 +1384,46 @@ const liveBucketBtn = (k) =>
     global.window.location.search = savedSearch;
     storeState.multiConvoLayout = savedLayout;
     storeState.conversation.cascadeId = savedConvo;
+  }
+
+  // The archived predecessor ending its handoff turn stays silent; a visible chat that ends
+  // its turn, alone or in the same batch, still chimes
+  {
+    const prevSummaries = { ...storeState.trajectorySummaries.summaries };
+    fakeNotificationMiddleware = (action) => {
+      for (const [id, s] of action.payload.updates) {
+        if (prevSummaries[id]?.notFullyIdle && !s.notFullyIdle) {
+          void window.fetch('/antigravityCascadeDone.mp3');
+        }
+      }
+    };
+    const busy = (id) => ({ ...prevSummaries[id], notFullyIdle: true });
+    const idle = (id) => ({ ...prevSummaries[id], notFullyIdle: false });
+    const endTurns = (ids) => {
+      for (const id of ids) prevSummaries[id] = busy(id);
+      storeState.trajectorySummaries = { summaries: { ...prevSummaries } };
+      reduxStore.dispatch({
+        type: 'trajectorySummaries/applyStreamBatch',
+        payload: { updates: ids.map((id) => [id, idle(id)]), deletes: [] },
+      });
+    };
+
+    endTurns(['open-step']);
+    assert.deepStrictEqual(soundFetches, []);
+    endTurns(['solo-active']);
+    assert.deepStrictEqual(soundFetches, ['/antigravityCascadeDone.mp3']);
+    // A mixed batch is not muted: the real chime of solo-active must play, and the 2s quiet
+    // window in playAgentSound folds both requests into one sound
+    endTurns(['open-step', 'solo-active']);
+    assert.strictEqual(soundFetches.length, 3);
+    assert.strictEqual(window.__jetskiAgentSoundMuted, 0);
+
+    fakeNotificationMiddleware = null;
+    storeState.trajectorySummaries = {
+      summaries: Object.fromEntries(
+        Object.entries(prevSummaries).map(([id, s]) => [id, { ...s, notFullyIdle: false }])
+      ),
+    };
   }
 
   // Verify locateConversationInSidebar resolves chain tail, opens sidebar, unhides bucket,

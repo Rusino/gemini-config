@@ -590,9 +590,49 @@
     return null;
   }
 
+  // True when every chime trigger in a stream batch (top-level turn end or a waiting step)
+  // belongs to an archived chat: an archived chain piece only finishes the turn that handed
+  // it off, and hearing that would expose the chain split
+  function batchOnlyAlertsArchivedPieces(updates, prevSummaries) {
+    let silenced = 0;
+    for (const [id, s] of updates) {
+      if (!s) continue;
+      const prev = prevSummaries[id];
+      // The middleware announces turn ends only for top-level chats
+      const endsTurn =
+        Boolean(prev?.notFullyIdle) &&
+        !s.notFullyIdle &&
+        !s.trajectoryMetadata?.parentConversationId;
+      const asks = Array.isArray(s.waitingSteps) && s.waitingSteps.length > 0;
+      if (!endsTurn && !asks) continue;
+      if (!(s.annotations?.archived || prev?.annotations?.archived)) return false;
+      silenced++;
+    }
+    return silenced > 0;
+  }
+
+  // playAgentSound fetches the chime file before playing it and gives up on a non-ok
+  // response, so failing that fetch drops one chime without touching its 2s quiet window.
+  // One shared gate serves every injection; window.__jetskiAgentSoundMuted opens and closes it
+  const AGENT_SOUND_URL_RE = /\.(?:mp3|wav|ogg)(?:[?#]|$)/i;
+  function installAgentSoundGate() {
+    const innerFetch = window.fetch;
+    if (typeof innerFetch !== 'function' || innerFetch.__jetskiSoundGate) return;
+    const gatedFetch = function (input, init) {
+      const url = typeof input === 'string' ? input : input?.url || String(input || '');
+      if (window.__jetskiAgentSoundMuted > 0 && AGENT_SOUND_URL_RE.test(url)) {
+        return Promise.resolve({ ok: false, status: 204 });
+      }
+      return innerFetch.call(window, input, init);
+    };
+    gatedFetch.__jetskiSoundGate = true;
+    window.fetch = gatedFetch;
+  }
+
   function hookReduxStore(store) {
     if (reduxStore === store) return;
     reduxStore = store;
+    installAgentSoundGate();
 
     // Intercept incoming stream batches so filtered conversations stay hidden
     // without flickering into the sidebar index on server stream ticks
@@ -636,9 +676,8 @@
         action?.type === 'trajectorySummaries/applyStreamBatch' &&
         Array.isArray(action.payload?.updates)
       ) {
-        const currentSummaries = {
-          ...(store.getState()?.trajectorySummaries?.summaries || {}),
-        };
+        const prevSummaries = store.getState()?.trajectorySummaries?.summaries || {};
+        const currentSummaries = { ...prevSummaries };
         for (const [id, incomingSummary] of action.payload.updates) {
           if (incomingSummary) {
             currentSummaries[id] = incomingSummary;
@@ -660,13 +699,22 @@
           }
           return [id, incomingSummary];
         });
-        const result = origDispatch.call(this, {
-          ...action,
-          payload: {
-            ...action.payload,
-            updates: rewrittenUpdates,
-          },
-        });
+        // The notification middleware runs inside this dispatch and starts the chime fetch
+        // synchronously, so the gate only needs to stay closed for the dispatch itself
+        const mute = batchOnlyAlertsArchivedPieces(action.payload.updates, prevSummaries);
+        if (mute) window.__jetskiAgentSoundMuted = (window.__jetskiAgentSoundMuted || 0) + 1;
+        let result;
+        try {
+          result = origDispatch.call(this, {
+            ...action,
+            payload: {
+              ...action.payload,
+              updates: rewrittenUpdates,
+            },
+          });
+        } finally {
+          if (mute) window.__jetskiAgentSoundMuted--;
+        }
         scheduleSync();
         return result;
       }
