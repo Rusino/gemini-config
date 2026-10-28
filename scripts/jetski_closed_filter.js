@@ -61,24 +61,18 @@
       icon: '🚨',
       shortLabel: 'Needs Me',
       title: '🚨 Needs Me (⦿)',
-      description:
-        'Open chats stopped and waiting for your reply, decision, or sign-off.',
     },
     working: {
       key: 'working',
       icon: '🤖',
       shortLabel: 'Working',
       title: '🤖 Agent Working',
-      description:
-        'Open chats where the agent or a background command/subagent is actively running right now.',
     },
     waiting: {
       key: 'waiting',
       icon: '⏳',
       shortLabel: 'Waiting',
       title: '⏳ Waiting (Cron / External)',
-      description:
-        'Background cron/timer chats or chats waiting on external events (Gerrit, CQ) that do not need your action right now.',
     },
   };
 
@@ -1051,24 +1045,50 @@
       #jetski-closed-chats-filter-bubble {
         position: fixed;
         z-index: 2147483647;
-        width: 320px;
-        padding: 10px 12px;
-        border-radius: 8px;
-        background: var(--popover, #1e1f22);
-        color: var(--popover-foreground, #e8eaed);
-        border: 1px solid var(--border, rgba(255, 255, 255, 0.14));
-        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-        font-size: 11.5px;
-        line-height: 1.45;
+        width: max-content;
+        max-width: 320px;
+        padding: 4px 8px;
+        border-radius: 6px;
+        background: var(--glass, var(--card, var(--secondary, #2d2d2d)));
+        color: var(--secondary-foreground, var(--foreground, #cccccc));
+        border: 1px solid var(--glass-border, var(--border, rgba(128, 128, 128, 0.2)));
+        box-shadow: inset 0 1px 0 var(--glass-highlight, transparent),
+          var(--glass-shadow, 0 4px 6px -1px rgba(0, 0, 0, 0.05));
+        -webkit-backdrop-filter: blur(20px) saturate(1.6);
+        backdrop-filter: blur(20px) saturate(1.6);
+        font-family: var(
+          --font-sans,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          Roboto,
+          sans-serif
+        );
+        font-size: 12px;
+        line-height: 1.4;
+        user-select: none;
         pointer-events: none;
         opacity: 0;
         transform: translateY(-2px);
         transition: opacity 110ms ease, transform 110ms ease;
       }
+      #jetski-closed-chats-filter-bubble[data-mode="roadmap"] {
+        width: 320px;
+        padding: 10px 12px;
+        border-radius: 8px;
+        font-size: 11.5px;
+        line-height: 1.45;
+      }
       #jetski-closed-chats-filter-bubble[data-visible="true"] {
         opacity: 1;
         transform: translateY(0);
+      }
+      #jetski-closed-chats-filter-bubble .jcfb-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        white-space: nowrap;
+        font-weight: 500;
       }
       #jetski-closed-chats-filter-bubble .jcfb-header {
         display: flex;
@@ -1104,49 +1124,6 @@
         letter-spacing: 0.04em;
         color: var(--muted-foreground, #9aa0a6);
         margin: 4px 0 3px 0;
-      }
-      #jetski-closed-chats-filter-bubble .jcfb-row {
-        display: flex;
-        justify-content: space-between;
-        align-items: baseline;
-        gap: 8px;
-        padding: 2px 4px;
-        border-radius: 4px;
-      }
-      #jetski-closed-chats-filter-bubble .jcfb-row[data-hovered="true"] {
-        background: rgba(138, 180, 248, 0.14);
-        font-weight: 600;
-      }
-      #jetski-closed-chats-filter-bubble .jcfb-val {
-        font-variant-numeric: tabular-nums;
-        font-weight: 600;
-        white-space: nowrap;
-      }
-      #jetski-closed-chats-filter-bubble .jcfb-total-row {
-        margin-top: 3px;
-        padding-top: 4px;
-        border-top: 1px dashed rgba(128, 134, 139, 0.25);
-        font-weight: 600;
-      }
-      #jetski-closed-chats-filter-bubble .jcfb-controls {
-        margin-top: 7px;
-        padding-top: 6px;
-        border-top: 1px solid rgba(128, 134, 139, 0.22);
-        font-size: 11px;
-        color: var(--muted-foreground, #b0b5bc);
-      }
-      #jetski-closed-chats-filter-bubble .jcfb-controls div + div {
-        margin-top: 3px;
-      }
-      #jetski-closed-chats-filter-bubble kbd {
-        display: inline-block;
-        padding: 0 4px;
-        border-radius: 4px;
-        background: rgba(128, 134, 139, 0.2);
-        color: var(--popover-foreground, #e8eaed);
-        font-family: inherit;
-        font-size: 10.5px;
-        font-weight: 600;
       }
       .${CHAIN_STARS_GROUP_CLASS} {
         display: flex;
@@ -1196,11 +1173,21 @@
         width: 288px;
         padding: 9px 12px;
         border-radius: 8px;
-        background: var(--popover, #1e1f22);
-        color: var(--popover-foreground, #e8eaed);
-        border: 1px solid var(--border, rgba(255, 255, 255, 0.14));
-        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background: var(--glass, var(--card, var(--secondary, #2d2d2d)));
+        color: var(--secondary-foreground, var(--foreground, #cccccc));
+        border: 1px solid var(--glass-border, var(--border, rgba(128, 128, 128, 0.2)));
+        box-shadow: inset 0 1px 0 var(--glass-highlight, transparent),
+          var(--glass-shadow, 0 4px 6px -1px rgba(0, 0, 0, 0.05));
+        -webkit-backdrop-filter: blur(20px) saturate(1.6);
+        backdrop-filter: blur(20px) saturate(1.6);
+        font-family: var(
+          --font-sans,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          Roboto,
+          sans-serif
+        );
         font-size: 11.5px;
         line-height: 1.45;
         pointer-events: none;
@@ -1316,50 +1303,15 @@
     const def = BUCKET_DEFS[bucketKey];
     const isShown = visibleBuckets.has(bucketKey);
     const dotColor = isShown ? '#34d399' : '#9ca3af';
-    const stateTag = isShown ? 'SHOWN' : 'HIDDEN';
+    const stateWord = isShown ? 'shown' : 'hidden';
     const bucketCount = breakdownStats[bucketKey] || 0;
-    const clickVerb = isShown ? 'hide' : 'show';
 
-    const totalVisible = Math.max(0, breakdownStats.totalEligible - totalHiddenCount);
-
-    const rowsHtml = BUCKET_ORDER.map((k) => {
-      const bDef = BUCKET_DEFS[k];
-      const bShown = visibleBuckets.has(k);
-      const bCount = breakdownStats[k] || 0;
-      const bStatus = bShown ? 'shown' : 'hidden';
-      const hoveredAttr = k === bucketKey ? 'true' : 'false';
-      return `
-        <div class="jcfb-row" data-hovered="${hoveredAttr}">
-          <span>${bDef.title}:</span>
-          <span class="jcfb-val">${bCount} (${bStatus})</span>
-        </div>
-      `;
-    }).join('');
-
-    return `
-      <div class="jcfb-header">
-        <span class="jcfb-header-left">
-          <span class="jcfb-dot" style="background:${dotColor}"></span>
-          <span>${def.title}</span>
-        </span>
-        <span>[${stateTag} · ${bucketCount}]</span>
-      </div>
-      <div class="jcfb-desc">
-        ${def.description}<br/>
-        <b>Click</b> to ${clickVerb} ${def.shortLabel} chats.
-      </div>
-      <div class="jcfb-section-title">All 3 chat states (independent filters)</div>
-      ${rowsHtml}
-      <div class="jcfb-row jcfb-total-row">
-        <span>Showing in sidebar:</span>
-        <span class="jcfb-val">${totalVisible} of ${breakdownStats.totalEligible} (${totalHiddenCount} hidden)</span>
-      </div>
-      <div class="jcfb-controls">
-        <div><kbd>Left-click</kbd> — toggle this state ON / OFF (combine filters)</div>
-        <div><kbd>Right-click</kbd> / <kbd>Shift+click</kbd> —
-          show ONLY this state (or all 3 if solo)</div>
-      </div>
-    `;
+    return (
+      `<div class="jcfb-pill">` +
+      `<span class="jcfb-dot" style="background:${dotColor}"></span>` +
+      `<span>${def.title} · ${bucketCount} ${stateWord}</span>` +
+      `</div>`
+    );
   }
 
   function ensureBubbleElement() {
@@ -1367,6 +1319,7 @@
     if (!bubble && document.body) {
       bubble = document.createElement('div');
       bubble.id = 'jetski-closed-chats-filter-bubble';
+      bubble.className = 'compact-tooltip surface-glass';
       bubble.setAttribute('data-visible', 'false');
       document.body.appendChild(bubble);
     }
@@ -1381,6 +1334,9 @@
     activeHoverRoadmapProjectId = null;
     const bubble = ensureBubbleElement();
     if (!bubble || !btn) return;
+    if (bubble.getAttribute('data-mode') !== 'filter') {
+      bubble.setAttribute('data-mode', 'filter');
+    }
     const nextBubbleHtml = buildBubbleHtml(activeHoverBucket);
     if (bubble.innerHTML !== nextBubbleHtml) {
       bubble.innerHTML = nextBubbleHtml;
@@ -1390,7 +1346,7 @@
     }
 
     const rect = btn.getBoundingClientRect();
-    const bubbleWidth = 320;
+    const bubbleWidth = bubble.offsetWidth || 180;
     let left = rect.left;
     if (left + bubbleWidth + 8 > window.innerWidth) {
       left = Math.max(8, window.innerWidth - bubbleWidth - 8);
@@ -1517,6 +1473,9 @@
     activeHoverRoadmapProjectId = projectId;
     const bubble = ensureBubbleElement();
     if (!bubble) return;
+    if (bubble.getAttribute('data-mode') !== 'roadmap') {
+      bubble.setAttribute('data-mode', 'roadmap');
+    }
     const nextHtml = buildRoadmapBubbleHtml(info);
     if (bubble.innerHTML !== nextHtml) {
       bubble.innerHTML = nextHtml;
@@ -2270,6 +2229,7 @@
     if (chainTooltipEl && document.body?.contains?.(chainTooltipEl)) return chainTooltipEl;
     chainTooltipEl = document.createElement('div');
     chainTooltipEl.id = STAR_TOOLTIP_ID;
+    chainTooltipEl.className = 'compact-tooltip surface-glass';
     chainTooltipEl.setAttribute('data-visible', 'false');
     document.body?.appendChild?.(chainTooltipEl);
     return chainTooltipEl;

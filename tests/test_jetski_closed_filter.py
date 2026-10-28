@@ -778,22 +778,24 @@ const injectedStyle = global.document.getElementById('jetski-closed-chats-filter
 assert(injectedStyle.textContent.includes('[data-testid="overview-panel-host-gutter"]'));
 assert(injectedStyle.textContent.includes('--overview-panel-reserve: 0px !important;'));
 
-// Hovering each button displays a dedicated tooltip explaining that button's state
+// Hovering each button displays a dedicated compact tooltip explaining that button's state
 btnWaiting.dispatchEvent('mouseenter');
 const bubble = global.document.getElementById('jetski-closed-chats-filter-bubble');
 assert(bubble, 'Hover bubble must be created');
 assert.strictEqual(bubble.getAttribute('data-visible'), 'true');
-assert(bubble.innerHTML.includes('⏳ Waiting (Cron / External)'));
-assert(bubble.innerHTML.includes('[HIDDEN · 2]'));
-assert(bubble.innerHTML.includes('Background cron/timer chats or chats waiting on external events'));
-assert(bubble.innerHTML.includes('All 3 chat states'));
-assert(bubble.innerHTML.includes('or all 3 if solo'));
-assert(bubble.innerHTML.includes('4 of 6 (2 hidden)'));
+assert.strictEqual(bubble.getAttribute('data-mode'), 'filter');
+assert(bubble.className.includes('surface-glass'));
+assert(bubble.innerHTML.includes('⏳ Waiting (Cron / External) · 2 hidden'));
+assert(!bubble.innerHTML.includes('All 3 chat states'), 'Must not render multi-state section');
+assert(!bubble.innerHTML.includes('Right-click'), 'Must not render controls footer');
+assert(
+  !injectedStyle.textContent.includes('--popover'),
+  'Must use surface-glass/card tokens instead of nonexistent --popover'
+);
 assert(!/[А-Яа-яЁё]/.test(bubble.innerHTML), 'Bubble HTML must not contain Cyrillic');
 
 btnNeedsMe.dispatchEvent('mouseenter');
-assert(bubble.innerHTML.includes('🚨 Needs Me (⦿)'));
-assert(bubble.innerHTML.includes('[SHOWN · 3]'));
+assert(bubble.innerHTML.includes('🚨 Needs Me (⦿) · 3 shown'));
 
 // Verify MutationObserver ignores mutations inside bubble and filter bar
 rafCallbacks = [];
@@ -812,7 +814,7 @@ assert.strictEqual(btnWaiting.getAttribute('aria-label'), '⏳ Waiting: 2 (shown
 assertHidden(['cron-waiting', 'ext-waiting'], false);
 assertHidden(['solo-active', 'agent-working', 'open-current', 'quoted-title'], false);
 assert.strictEqual(emptyProjSpan.textContent, 'No conversations yet');
-assert(bubble.innerHTML.includes('6 of 6 (0 hidden)'));
+assert(bubble.innerHTML.includes('⏳ Waiting (Cron / External) · 2 shown'));
 assertHidden(['native-hidden'], true);
 assertArchivedUntouched();
 
@@ -1079,6 +1081,7 @@ const liveBucketBtn = (k) =>
   proj1Badge.dispatchEvent('mouseenter');
   const roadmapBubble = document.getElementById('jetski-closed-chats-filter-bubble');
   assert.strictEqual(roadmapBubble.getAttribute('data-visible'), 'true');
+  assert.strictEqual(roadmapBubble.getAttribute('data-mode'), 'roadmap');
   assert(roadmapBubble.innerHTML.includes('[3 open of 8]'));
   assert(
     roadmapBubble.innerHTML.includes('<div class="jcfb-section-title">Open roadmap items</div>'),
