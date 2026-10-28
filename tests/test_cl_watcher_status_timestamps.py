@@ -113,7 +113,7 @@ class StatusTimestampsContractTest(unittest.TestCase):
 
   def test_dashboard_js_functions_render_status_timestamps(self):
     script_body = w.DASHBOARD_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
-    harness = script_body.split("initTheme();", 1)[0] + """
+    harness = script_body.split("\nboot();", 1)[0] + """
 const closedPr = {
   kind: 'github', status: 'CLOSED', phase: 'ABANDONED',
   is_draft: false, in_development: false, patchset: 1, url: 'https://example.com/6',
@@ -141,24 +141,34 @@ const mergedCl = {
     status_changed_et: '14:20 ET', status_changed_age: '1h 40m ago'
   }
 };
+const rollingCl = Object.assign({}, mergedCl, {
+  phase: 'POST_SUBMIT_ROLLING', status_changed_et: '', status_changed_age: '',
+  submitted_ts: Date.now() / 1000 - 7200,
+  post_submit: {all_passed: false, rolls: {}}
+});
 console.log(JSON.stringify({
-  closedCore: statusCoreHtml(closedPr),
-  devCore: statusCoreHtml(devCl),
-  reviewCore: statusCoreHtml(reviewCl),
-  mergedCore: statusCoreHtml(mergedCl),
-  mergedRolls: formatRollsCell(mergedCl)
+  closedState: stateHtml(closedPr),
+  closedTime: rowTime(closedPr),
+  devTime: rowTime(devCl),
+  reviewTime: rowTime(reviewCl),
+  mergedState: stateHtml(mergedCl),
+  mergedTime: rowTime(mergedCl),
+  rollingTime: rowTime(rollingCl),
+  rollingLane: laneOf(rollingCl),
 }));
 """
     proc = subprocess.run(
         ["node", "-e", harness], capture_output=True, text=True, check=True
     )
     out = json.loads(proc.stdout.strip())
-    self.assertIn("Closed 15:45 ET (1h ago).", out["closedCore"])
-    self.assertIn("16:00 ET (45m ago)", out["devCore"])
-    self.assertIn("16:15 ET (30m ago)", out["reviewCore"])
-    self.assertIn("Submitted 14:00 ET (2h ago)", out["mergedCore"])
-    self.assertIn("all 4/4 rolls passed · 14:20 ET (1h 40m ago)!", out["mergedRolls"])
-
+    self.assertEqual(out["closedState"], "Closed")
+    self.assertEqual(out["closedTime"], "15:45 ET (1h ago)")
+    self.assertEqual(out["devTime"], "16:00 ET (45m ago)")
+    self.assertEqual(out["reviewTime"], "16:15 ET (30m ago)")
+    self.assertEqual(out["mergedState"], "Shipped to all 4 products")
+    self.assertEqual(out["mergedTime"], "14:20 ET (1h 40m ago)")
+    self.assertEqual(out["rollingTime"], "14:00 ET (2h ago)")
+    self.assertEqual(out["rollingLane"], "landing")
 
 if __name__ == "__main__":
   unittest.main()

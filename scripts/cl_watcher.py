@@ -15,11 +15,12 @@ Responsibilities:
    the local `skia-gardener` daemon (`http://localhost:8080/api/autorollers` and
    `/api/incidents`) and `git merge-base --is-ancestor` in `skia_main`.
 3. Queries Gmail via the local MCP OAuth token (`gmailmcp.googleapis.com`) to
-   report `INBOX` vs `TRASH` message counts per CL/PR and support one-click
-   `INBOX` archiving (`batch_unlabel_threads` with `includeTrash=true`).
+   report `INBOX` vs `TRASH` message counts per CL/PR and archive `INBOX`
+   threads of merged changes (`batch_unlabel_threads` with `includeTrash=true`).
 4. Updates a compact progress badge on the conversation title and wakes the
    target conversation via `agentapi send-message` only on significant transitions.
-5. Serves the live 5-column Markdown-styled "CL Flight Deck" HTML dashboard in English.
+5. Serves the live "Flight Deck" HTML dashboard in English: what needs me first,
+   then lanes by who acts next, filtered by project.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ import http.server
 import json
 import os
 import re
+import socket
 import socketserver
 import subprocess
 import sys
@@ -433,6 +435,12 @@ def get_pen_url(port: int) -> str:
 
 
 _GARDENER_PEN_URL: list[str] = []
+
+
+def jetski_box_url() -> str:
+  """Returns the Jetski Web base URL for this Cloudtop, same form as stop_guard.py uses."""
+  # conversation:// links open only inside the Jetski app; Jetski Web opens from any browser
+  return f"https://jetski.corp.google.com/box/{socket.gethostname().split('.')[0]}"
 
 
 def gardener_pen_url() -> str:
@@ -2130,302 +2138,249 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CL &amp; PR Flight Deck · Skia &amp; Flutter</title>
+<title>Flight Deck</title>
 <style>
   :root {
-    --bg: #ffffff;
-    --bg-subtle: #f6f8fa;
-    --row-hover: #f3f6f9;
-    --border: #d0d7de;
-    --text: #1f2328;
-    --muted: #59636e;
-    --link: #0969da;
-    --code-bg: rgba(175, 184, 193, 0.22);
-    --alert-row: #ffebe9;
-    --warn-bg: #fff8c5;
-    --warn-border: #d4a72c;
-    --ok-text: #1a7f37;
-    --danger-text: #cf222e;
+    --paper: #fbfbfd;
+    --card: #ffffff;
+    --ink: #1d1d1f;
+    --graphite: #86868b;
+    --hairline: #e5e5ea;
+    --blue: #0071e3;
+    --green: #34c759;
+    --amber: #ff9f0a;
+    --red: #ff3b30;
+    --red-wash: #fff2f1;
+    --shadow: 0 1px 2px rgba(0,0,0,.04), 0 8px 28px rgba(0,0,0,.06);
+    --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Helvetica Neue",
+      sans-serif;
+    --display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "Helvetica Neue",
+      sans-serif;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
   }
-  [data-theme="dark"] {
-    --bg: #0d1117;
-    --bg-subtle: #161b22;
-    --row-hover: #1c2128;
-    --border: #30363d;
-    --text: #e6edf3;
-    --muted: #8b949e;
-    --link: #58a6ff;
-    --code-bg: rgba(110, 118, 129, 0.28);
-    --alert-row: rgba(248, 81, 73, 0.12);
-    --warn-bg: rgba(210, 153, 34, 0.15);
-    --warn-border: rgba(210, 153, 34, 0.45);
-    --ok-text: #3fb950;
-    --danger-text: #f85149;
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #000000;
+      --card: #111113;
+      --ink: #f5f5f7;
+      --graphite: #8e8e93;
+      --hairline: #2c2c2e;
+      --blue: #2997ff;
+      --red-wash: #2a0f0d;
+      --shadow: 0 0 0 1px #1c1c1e;
+    }
   }
-  * { box-sizing: border-box; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { -webkit-font-smoothing: antialiased; }
   body {
-    margin: 0;
-    padding: 24px 32px 48px;
-    background: var(--bg);
-    color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
-    font-size: 14px;
-    line-height: 1.5;
-    max-width: 1560px;
-    margin-left: auto;
-    margin-right: auto;
-  }
-  .top-header {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 12px;
-    border-bottom: 1px solid var(--border);
-    padding-bottom: 12px;
-    margin-bottom: 16px;
-  }
-  .top-header h1 {
-    margin: 0;
-    font-size: 20px;
-    font-weight: 600;
-  }
-  .meta-line {
-    color: var(--muted);
-    font-size: 13px;
-    margin-top: 4px;
-  }
-  .toolbar {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 8px;
-  }
-  button {
-    background: var(--bg-subtle);
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 5px 11px;
-    font-size: 12.5px;
-    font-weight: 500;
-    cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-  }
-  button:hover:not(:disabled) {
-    background: var(--row-hover);
-  }
-  button.active-tab,
-  button.active-tab:hover:not(:disabled) {
-    background: var(--link);
-    color: #ffffff;
-    border-color: var(--link);
-  }
-  button.btn-sm {
-    padding: 2px 8px;
-    font-size: 11.5px;
-    border-radius: 5px;
-  }
-  button.btn-warn {
-    background: var(--warn-bg);
-    border-color: var(--warn-border);
-    color: var(--text);
-    font-weight: 600;
-  }
-  .project-tabs {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 6px;
-    margin-bottom: 18px;
-  }
-  .rollers-inline {
-    background: var(--bg-subtle);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 8px 14px;
-    margin-bottom: 18px;
-    font-size: 13px;
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 18px;
-  }
-  .section-title {
-    font-size: 16px;
-    font-weight: 600;
-    margin: 22px 0 10px 0;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-  /* Markdown-style table */
-  table.md-table {
-    width: 100%;
-    border-collapse: collapse;
-    margin-bottom: 20px;
-    font-size: 13.5px;
-    border: 1px solid var(--border);
-  }
-  table.md-table th,
-  table.md-table td {
-    border: 1px solid var(--border);
-    padding: 10px 13px;
-    text-align: left;
-    vertical-align: top;
-  }
-  table.md-table th {
-    background: var(--bg-subtle);
-    font-weight: 600;
-    font-size: 13px;
-  }
-  table.md-table tr:nth-child(even) td {
-    background: rgba(175, 184, 193, 0.04);
-  }
-  table.md-table tr:hover td {
-    background: var(--row-hover);
-  }
-  table.md-table tr.row-alert td {
-    background: var(--alert-row);
-  }
-  code {
-    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-    font-size: 12px;
-    background: var(--code-bg);
-    padding: 2px 5px;
-    border-radius: 4px;
-    word-break: break-word;
-  }
-  a {
-    color: var(--link);
-    text-decoration: none;
-  }
-  a:hover {
-    text-decoration: underline;
-  }
-  .muted {
-    color: var(--muted);
-    font-size: 12.5px;
-  }
-  .cell-actions {
-    margin-top: 7px;
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-  }
-  .filter-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin-bottom: 10px;
-  }
-  .filter-row .project-tabs {
-    margin-bottom: 0;
-  }
-  .filter-label {
-    width: 56px;
-    color: var(--muted);
-    font-size: 12px;
-    font-weight: 600;
-    text-transform: uppercase;
-  }
-  button.seg {
-    font-size: 13px;
-    padding: 6px 12px;
-  }
-  button.chip {
-    border-radius: 999px;
-    padding: 2px 10px;
-    font-size: 12px;
-    background: transparent;
-  }
-  button.chip.active-tab {
-    background: var(--link);
-  }
-  button:disabled {
-    cursor: default;
-  }
-  button.empty:not(.active-tab) {
-    opacity: 0.45;
-  }
-  button .count {
+    background: var(--paper);
+    color: var(--ink);
+    font: 15px/1.45 var(--sans);
     font-variant-numeric: tabular-nums;
-    opacity: 0.8;
   }
-  .col-chat { width: 21%; }  .col-chat { width: 21%; }
-  .col-cl { width: 25%; }
-  .col-gerrit { width: 20%; }
-  .col-rolls { width: 17%; }
-  .col-gmail { width: 17%; }
+  a { color: inherit; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 32px; }
+
+  .bar {
+    position: sticky; top: 0; z-index: 5;
+    backdrop-filter: saturate(180%) blur(20px);
+    -webkit-backdrop-filter: saturate(180%) blur(20px);
+    background: color-mix(in srgb, var(--paper) 78%, transparent);
+    border-bottom: 1px solid var(--hairline);
+  }
+  .bar .wrap { display: flex; align-items: center; gap: 24px; height: 52px; }
+  .brand { font: 600 17px var(--display); letter-spacing: -.01em; }
+  .rollers { display: flex; gap: 16px; margin-left: auto; font-size: 13px; color: var(--graphite); }
+  .rollers a { display: inline-flex; align-items: center; gap: 6px; }
+  .rollers a:hover { color: var(--ink); text-decoration: none; }
+  .synced { font-size: 13px; color: var(--graphite); white-space: nowrap; }
+  .link-btn {
+    background: none; border: 0; color: var(--blue); font: 13px var(--sans); cursor: pointer;
+  }
+
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
+  .ok { background: var(--green); }
+  .wait { background: transparent; box-shadow: inset 0 0 0 1.5px var(--graphite); }
+  .moving { background: var(--amber); animation: pulse 1.6s ease-in-out infinite; }
+  .bad { background: var(--red); }
+  @keyframes pulse { 50% { opacity: .35; } }
+
+  .projects { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 20px; }
+  .proj {
+    border: 0; background: transparent; color: var(--graphite); cursor: pointer;
+    font: 500 13px var(--sans); padding: 5px 12px; border-radius: 980px;
+  }
+  .proj:hover { color: var(--ink); }
+  .proj .n { margin-left: 4px; opacity: .7; }
+  .proj.on { background: var(--ink); color: var(--paper); }
+
+  .hero { padding: 64px 0 36px; }
+  .hero h1 {
+    font: 700 64px/1.02 var(--display);
+    letter-spacing: -.035em;
+    max-width: 22ch;
+    text-wrap: balance;
+  }
+  .hero h1 .soft { color: var(--graphite); }
+  .hero p { margin-top: 18px; font-size: 21px; color: var(--graphite); letter-spacing: -.01em; }
+
+  .focus { display: grid; gap: 16px; }
+  .card {
+    background: var(--card);
+    border-radius: 22px;
+    box-shadow: var(--shadow);
+    padding: 28px 32px;
+    display: grid; grid-template-columns: 1fr auto; gap: 8px 32px; align-items: start;
+  }
+  .card.alert { background: var(--red-wash); }
+  .eyebrow { font-size: 13px; font-weight: 600; color: var(--graphite); }
+  .card.alert .eyebrow { color: var(--red); }
+  .card h2 { font: 600 26px/1.2 var(--display); letter-spacing: -.02em; margin: 4px 0 6px; }
+  .card .why { font-size: 17px; color: var(--graphite); }
+  .card .why b { color: var(--ink); font-weight: 500; }
+  .card .actions { grid-row: 1; grid-column: 2; display: flex; flex-direction: column; gap: 10px; }
+  .card .path, .card .incidents { grid-column: 1 / -1; }
+  .card .path { margin-top: 18px; }
+
+  .btn {
+    display: inline-flex; justify-content: center; align-items: center;
+    height: 36px; padding: 0 18px; border-radius: 980px;
+    font: 500 15px var(--sans); white-space: nowrap;
+  }
+  .btn:hover { text-decoration: none; }
+  .btn.primary { background: var(--blue); color: #fff; }
+  .btn.primary:hover { filter: brightness(1.08); }
+  .btn.quiet { color: var(--blue); }
+  .btn.quiet:hover { text-decoration: underline; }
+  a:focus-visible, button:focus-visible, summary:focus-visible {
+    outline: 3px solid color-mix(in srgb, var(--blue) 45%, transparent); outline-offset: 2px;
+  }
+
+  .path { display: flex; align-items: center; font-size: 12px; color: var(--graphite); }
+  .stop { display: flex; flex-direction: column; align-items: center; gap: 6px; min-width: 64px; }
+  .stop:hover { text-decoration: none; color: var(--ink); }
+  .stop .dot { width: 10px; height: 10px; }
+  .stop.is-bad span { color: var(--red); font-weight: 600; }
+  .leg {
+    height: 2px; background: var(--hairline); margin-bottom: 18px;
+    flex: 0 1 160px; min-width: 24px;
+  }
+  .leg.done { background: var(--green); }
+  .leg.broken {
+    background: repeating-linear-gradient(90deg, var(--red) 0 6px, transparent 6px 10px);
+  }
+  .fan { display: flex; gap: 28px; }
+
+  .incidents { margin-top: 14px; display: grid; gap: 6px; font-size: 14px; }
+  .incident { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  .incident .why-line { color: var(--graphite); }
+  .chip {
+    font: 12px var(--mono); padding: 2px 8px; border-radius: 6px;
+    background: color-mix(in srgb, var(--red) 12%, transparent); color: var(--red);
+  }
+
+  section.lane { margin-top: 56px; }
+  .lane-head, details.done > summary {
+    display: flex; align-items: baseline; gap: 12px;
+    padding-bottom: 12px; border-bottom: 1px solid var(--hairline);
+  }
+  .lane-head h3, details.done h3 { font: 600 22px var(--display); letter-spacing: -.02em; }
+  .lane-head .n, details.done .n { color: var(--graphite); font-size: 17px; }
+  .lane-head .hint { margin-left: auto; font-size: 13px; color: var(--graphite); }
+  details.done > summary { list-style: none; cursor: pointer; }
+  details.done > summary::-webkit-details-marker { display: none; }
+  details.done .chev { margin-left: auto; color: var(--blue); font-size: 15px; }
+  details.done[open] .chev .closed, details.done:not([open]) .chev .open { display: none; }
+
+  .row {
+    display: grid; grid-template-columns: minmax(0, 1fr) 340px 200px;
+    gap: 24px; align-items: center;
+    padding: 16px 0; border-bottom: 1px solid var(--hairline);
+  }
+  .title { font-size: 16px; font-weight: 500; letter-spacing: -.005em; }
+  .meta { font-size: 13px; color: var(--graphite); margin-top: 2px; }
+  .meta .cl { font-family: var(--mono); font-size: 12px; }
+  .meta .proj-tag { font-weight: 600; }
+  .meta .chat { color: var(--blue); }
+  .state { font-size: 14px; color: var(--graphite); }
+  .state b { color: var(--ink); font-weight: 500; }
+  .state .red { color: var(--red); }
+  .when { text-align: right; font-size: 13px; color: var(--graphite); }
+  .row .path { font-size: 13px; }
+  .row .stop { min-width: 0; }
+  .row .stop span { display: none; }
+  .row .leg { flex: 0 0 32px; min-width: 0; margin-bottom: 0; }
+  .row .fan { gap: 10px; }
+  .row .path-label { margin-left: 12px; white-space: nowrap; }
+
+  .empty-note { padding: 40px 0; color: var(--graphite); font-size: 17px; }
+  footer { margin: 96px 0 48px; font-size: 12px; color: var(--graphite); }
+
+  @media (max-width: 860px) {
+    .hero h1 { font-size: 40px; }
+    .card { grid-template-columns: 1fr; padding: 22px; }
+    .card .actions { grid-row: auto; grid-column: 1; flex-direction: row; }
+    .row { grid-template-columns: 1fr; gap: 6px; }
+    .when { text-align: left; }
+    .rollers .name { display: none; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .moving { animation: none; }
+  }
 </style>
 </head>
 <body>
-
-<div class="top-header">
-  <div>
-    <h1>Active CL &amp; PR Flight Deck (<span id="total-count">0</span> open chats)</h1>
-    <div class="meta-line" id="sync-status">Syncing...</div>
+<header class="bar">
+  <div class="wrap">
+    <div class="brand">Flight Deck</div>
+    <nav class="rollers" id="rollers" aria-label="Skia autorollers"></nav>
+    <div class="synced" id="synced">Loading…</div>
+    <button class="link-btn" id="refresh-btn" onclick="triggerRefresh()">Refresh</button>
   </div>
-  <div class="toolbar">
-    <button id="notif-btn" onclick="enableNotifications()">🔔 Browser Alerts</button>
-    <button onclick="testNotification()">🔊 Test Sound</button>
-    <button onclick="toggleTheme()" id="theme-btn">🌙 Dark Theme</button>
-    <button onclick="triggerRefresh()">⟳ Poll Now</button>
+</header>
+
+<main class="wrap">
+  <nav class="projects" id="projects" aria-label="Projects"></nav>
+  <div class="hero">
+    <h1 id="headline"></h1>
+    <p id="subline"></p>
   </div>
-</div>
-
-<div class="rollers-inline" id="rollers-bar"></div>
-
-<div class="filter-row">
-  <span class="filter-label">Status</span>
-  <div class="project-tabs" id="status-tabs"></div>
-</div>
-<div class="filter-row">
-  <span class="filter-label">Project</span>
-  <div class="project-tabs" id="project-tabs"></div>
-</div>
-
-<div id="tables-container"></div>
+  <div class="focus" id="focus"></div>
+  <div id="lanes"></div>
+  <footer id="footer"></footer>
+</main>
 
 <script>
+const PRODUCTS = ['Android', 'Chrome', 'Google3', 'Flutter'];
+const COUNT_WORDS = ['Nothing', 'One thing', 'Two things', 'Three things', 'Four things',
+  'Five things'];
+const PROJECT_ORDER = ['SkParagraph', 'Skia', 'WebParagraph', 'Skia Gardener', 'TextClusters API'];
+const FLUTTER_DASHBOARD_URL = 'https://flutter-dashboard.appspot.com/#/build';
+const STATUS_SKIA_URL = 'https://status.skia.org/repo/skia';
+// Merged CLs older than this are chats left open after the work ended
+const OLD_MERGED_DAYS = 3;
+
 let cachedData = null;
 let selectedProject = 'ALL';
-let selectedStatus = 'attention';
-let seenEventIds = new Set();
-let initialLoadDone = false;
-
-function initTheme() {
-  const saved = localStorage.getItem('cl_deck_theme') || 'light';
-  document.documentElement.setAttribute('data-theme', saved);
-  updateThemeBtn(saved);
-}
-
-function toggleTheme() {
-  const cur = document.documentElement.getAttribute('data-theme') || 'light';
-  const next = cur === 'dark' ? 'light' : 'dark';
-  document.documentElement.setAttribute('data-theme', next);
-  localStorage.setItem('cl_deck_theme', next);
-  updateThemeBtn(next);
-}
-
-function updateThemeBtn(theme) {
-  const btn = document.getElementById('theme-btn');
-  btn.textContent = theme === 'dark' ? '☀️ Light Theme' : '🌙 Dark Theme';
-}
 
 function esc(s) {
-  return String(s || '')
+  return String(s ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
 }
 
+function link(url, html, cls, title) {
+  const c = cls ? ` class="${cls}"` : '';
+  const t = title ? ` title="${esc(title)}"` : '';
+  return url ? `<a${c}${t} href="${esc(url)}" target="_blank" rel="noopener">${html}</a>` : html;
+}
+
 function shortActor(raw) {
   const s = String(raw || '');
-  // Normalize CQ and Gerrit service-account bots to a single bot token
+  // CQ and Gerrit service accounts all read as one bot
   if (
     s.includes('skcq-be') ||
     s.includes('gerritcodereview') ||
@@ -2434,70 +2389,13 @@ function shortActor(raw) {
   ) {
     return 'SkCQ';
   }
-  if (s.endsWith('@google.com')) return s.replace('@google.com', '@');
-  if (s.endsWith('@chromium.org')) return s.replace('@chromium.org', '@chromium');
-  return s;
-}
-
-function updateNotifButton() {
-  const btn = document.getElementById('notif-btn');
-  if (!('Notification' in window)) {
-    btn.textContent = '🔕 Alerts Unsupported';
-    return;
-  }
-  if (Notification.permission === 'granted') {
-    btn.textContent = '🔔 Browser Alerts: ON';
-  } else if (Notification.permission === 'denied') {
-    btn.textContent = '🔕 Browser Alerts: Blocked';
-  }
-}
-
-async function enableNotifications() {
-  if (!('Notification' in window)) return;
-  await Notification.requestPermission();
-  updateNotifButton();
-}
-
-function playAlertBeep() {
-  try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.type = 'triangle';
-    osc.frequency.setValueAtTime(660, ctx.currentTime);
-    osc.frequency.setValueAtTime(880, ctx.currentTime + 0.12);
-    gain.gain.setValueAtTime(0.18, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.start();
-    osc.stop(ctx.currentTime + 0.4);
-  } catch (e) {}
-}
-
-function fireBrowserNotification(title, body, critical) {
-  if (critical) playAlertBeep();
-  if ('Notification' in window && Notification.permission === 'granted') {
-    new Notification(title, { body, requireInteraction: Boolean(critical) });
-  }
-}
-
-function testNotification() {
-  fireBrowserNotification(
-    '🔴 CL Flight Deck Test Alert',
-    'Browser notifications and audio chime are active.',
-    true
-  );
-}
-
-function link(url, html) {
-  return url ? `<a href="${esc(url)}" target="_blank" rel="noopener">${html}</a>` : html;
+  return s.split('@')[0];
 }
 
 // Maps a Gerrit email, GitHub login, or Piper LDAP to the page that profiles that person
 function actorUrl(it, raw) {
   const s = String(raw || '');
-  if (!s || s === 'bot' || shortActor(s) === 'SkCQ') return '';
+  if (!s || shortActor(s) === 'SkCQ') return '';
   if (it.kind === 'github') return `https://github.com/${encodeURIComponent(s)}`;
   if (s.endsWith('@google.com')) {
     return `https://moma.corp.google.com/person/${encodeURIComponent(s.split('@')[0])}`;
@@ -2507,177 +2405,54 @@ function actorUrl(it, raw) {
   return '';
 }
 
-function actorHtml(it, raw) {
-  return link(actorUrl(it, raw), `<code>${esc(shortActor(raw))}</code>`);
-}
-
 function checksUrl(it) {
   if (it.kind === 'github') return `${it.url}/checks`;
   if (it.kind === 'gerrit') return `${it.url}?tab=checks`;
   return it.url;
 }
 
-function commitUrl(sha) {
-  return sha ? `https://skia.googlesource.com/skia/+/${sha}` : '';
+// App-scheme chat links open only inside the Jetski app; Jetski Web opens from any browser
+function chatUrl(it, data) {
+  const base = (data && data.jetski_box_url) || '';
+  return base && it.conversation_id ? `${base}/c/${encodeURIComponent(it.conversation_id)}` : '';
 }
 
-function formatAuthorAndCl(it) {
-  let label = `CL ${esc(it.target_id)}`;
-  if (it.kind === 'github') label = `PR #${esc(it.target_id)}`;
-  else if (it.kind === 'piper') label = `cl/${esc(it.target_id)}`;
-
-  const who = actorHtml(it, it.owner_email || it.owner_name);
-  let roleDesc = '';
-  if (it.is_self) {
-    roleDesc = `${who} — your CL`;
-  // Check role so reviewed colleague CLs in Watching still display colleague/external
-  } else if (it.role === 'watching') {
-    roleDesc = `${who} — watching`;
-  } else if (it.is_external) {
-    roleDesc = `${who} — external author`;
-  } else {
-    roleDesc = `${who} — colleague`;
-  }
-  const subject = link(it.url, `<em>${esc(it.subject)}</em>`);
-  return `<strong>${link(it.url, label)}</strong> (${roleDesc})<br>${subject}`;
+function clLabel(it) {
+  if (it.kind === 'github') return `PR ${it.target_id}`;
+  if (it.kind === 'piper') return `cl/${it.target_id}`;
+  return `CL ${it.target_id}`;
 }
 
-const FLUTTER_DASHBOARD_URL = 'https://flutter-dashboard.appspot.com/#/build';
-
-// Copies a ping draft and opens the place to paste it: Chat for Googlers, the review
-// page for everyone else
-function pingPerson(btn) {
-  if (navigator.clipboard) navigator.clipboard.writeText(btn.dataset.text);
-  window.open(btn.dataset.url, '_blank', 'noopener');
-  btn.textContent = '✓ Copied';
+// The project tag already names the component, so drop the "[component] " prefix
+function cleanSubject(s) {
+  return String(s || '').replace(/^\[[^\]]+\]\s*/, '');
 }
 
-function waitingOnHtml(it) {
-  const people = it.waiting_on || [];
-  if (people.length === 0) return '';
-  const items = people.map(p => {
-    const who = actorHtml(it, p.id);
-    if (!p.active) return `<s>${who}</s> (left Google)`;
-    let url = it.url;
-    let text = `Hi ${shortActor(p.id)}, friendly ping on ${it.url} ("${it.subject}"). ` +
-      'Could you take a look when you have a moment? Thanks!';
-    if (it.kind === 'github') {
-      text = `@${p.id} friendly ping on this PR when you have a moment. Thanks!`;
-    } else if (p.id.endsWith('@google.com')) {
-      url = `https://moma.corp.google.com/chat?with=${encodeURIComponent(p.id.split('@')[0])}`;
-    }
-    const btn = `<button class="btn-sm" title="Copy a ping draft and open where to paste it" ` +
-      `data-url="${esc(url)}" data-text="${esc(text)}" onclick="pingPerson(this)">` +
-      '📋 Ping</button>';
-    return `${who} ${btn}`;
-  });
-  return `<div class="muted" style="margin-top:4px">Waiting on: ${items.join(', ')}</div>`;
+function authorLabel(it) {
+  if (it.is_self) return 'You';
+  const who = it.owner_name || shortActor(it.owner_email);
+  return it.is_external ? `${who} (external)` : who;
 }
 
-// Notes for conditions that sit next to review state: they decide the status chip
-// but do not replace the review summary
-function statusNotesHtml(it) {
-  if (it.status !== 'NEW' && it.status !== 'OPEN') return '';
-  let notes = '';
-  if (it.merge_conflict && !it.is_watching) {
-    notes += '<div style="color:var(--danger-text)">⛔ Merge conflict: rebase needed</div>';
-  }
-  // Draft, unreviewed, and watched PRs are not waiting on tree status to land
-  if (it.tree_red && !it.is_draft && !it.in_development && !it.is_watching) {
-    notes += '<div style="color:var(--danger-text)">🌲 ' +
-      `${link(FLUTTER_DASHBOARD_URL, 'flutter/flutter tree')} is red; landing waits for it</div>`;
-  }
-  if (['waiting', 'cq', 'tree', 'conflict'].includes(statusOf(it))) notes += waitingOnHtml(it);
-  return notes;
+// Gardener task names are long build configs; keep the parts a human scans for
+function shortTask(name) {
+  const parts = String(name || '').split('-');
+  const os = (parts.find(p => /^(Ubuntu|Win|Mac|Android|Debian)/.test(p)) || '')
+    .replace(/^([A-Za-z]+)(\d)/, '$1 $2');
+  const tail = (parts[parts.length - 1] || '').split('_')
+    .filter(t => !/^(Upload|All)$/.test(t));
+  const build = parts.includes('Debug') ? 'Debug' : (parts.includes('Release') ? 'Release' : '');
+  return [tail.join(' '), build, os].filter(Boolean).join(' · ') || String(name || '');
 }
 
-function formatGerritStatusCell(it) {
-  return statusCoreHtml(it) + statusNotesHtml(it);
-}
-
-// Formats status transition time into 'Oct 26 at 14:15 ET (2h ago)' format
 function formatStatusTime(it, fallbackEt, fallbackAge) {
   const et = it.status_changed_et || fallbackEt || it.last_msg_et || it.submitted_et || '';
   const age = it.status_changed_age || fallbackAge || it.last_msg_age || it.submitted_age || '';
-  if (!et && !age) return '';
   if (et && age) return `${esc(et)} (${esc(age)})`;
   return esc(et || age);
 }
 
-function statusCoreHtml(it) {
-  const ps = `PS${it.patchset || 1}`;
-  if (it.status === 'MERGED') {
-    const post = it.post_submit;
-    const isDone = !post || post.all_passed;
-    const icon = (post && post.has_alert) ? '🔴' : (isDone ? '🏁' : '🟢');
-    const sha = link(it.commit_url, `<code>${esc((it.revision || '').slice(0, 10))}</code>`);
-    const ts = formatStatusTime(it, it.submitted_et, it.submitted_age);
-    const timeLine = ts ? `Submitted ${ts}, commit ${sha}.` : `Submitted, commit ${sha}.`;
-    return `${icon} <strong>${link(it.url, '<code>MERGED</code>')} (${ps})</strong>` +
-      `<br><span class="muted">${timeLine}</span>`;
-  }
-
-  if (it.status === 'ABANDONED' || it.status === 'CLOSED') {
-    const ts = formatStatusTime(it);
-    const verb = it.status === 'ABANDONED' ? 'Abandoned' : 'Closed';
-    const tsLine = ts ? `<br><span class="muted">${verb} ${ts}.</span>` : '';
-    return `⚪ <strong>${link(it.url, `<code>${esc(it.status)}</code>`)} (${ps})</strong>${tsLine}`;
-  }
-
-  // Active NEW / OPEN CL or PR; show DRAFT/WIP badge when explicitly in draft
-  const lastWhoHtml = actorHtml(it, it.last_msg_author);
-  const badgeLabel = it.is_draft ? (it.kind === 'github' ? 'DRAFT' : 'WIP') : it.status;
-  const statusHtml = link(it.url, `<code>${esc(badgeLabel)}</code>`);
-  const cqHtml = link(checksUrl(it), esc(it.cq_status));
-  const snippetHtml = link(it.url, esc(it.last_msg_snippet));
-  // Show the red CQ failure header only on my own changes
-  if (it.cq_failed && it.is_self) {
-    const ts = formatStatusTime(it);
-    const tsPart = ts ? ` (${ts})` : '';
-    return `🔴 <strong>${statusHtml} (${ps} · ${cqHtml})</strong>` +
-      `<br><span class="muted">Latest from ${lastWhoHtml}${tsPart}: ${snippetHtml}</span>`;
-  }
-  if (it.phase === 'SUBMITTING') {
-    const ts = formatStatusTime(it, '', it.last_msg_age);
-    const tsPart = ts ? ` ${ts}` : '';
-    const skcq = link(checksUrl(it), '<code>SkCQ</code>');
-    return `🟡 <strong>${statusHtml} (${ps} in CQ+2)</strong>` +
-      `<br><span class="muted">Submitted to CQ${tsPart}, running ${skcq}.</span>`;
-  }
-  if (needsMyReply(it)) {
-    const ts = formatStatusTime(it, '', it.last_msg_age);
-    const tsPart = ts ? ` (${ts})` : '';
-    return `⚡ <strong>${statusHtml} (${ps} · needs your reply)</strong><br>` +
-      `<span class="muted">CR: ${esc(it.cr_summary)} · ${cqHtml}. ` +
-      `From ${lastWhoHtml}${tsPart}: ${snippetHtml}</span>`;
-  }
-  if (it.is_watching) {
-    const ts = formatStatusTime(it);
-    const tsPart = ts ? ` · ${ts}` : '';
-    return `👀 <strong>${statusHtml} (${ps})</strong>` +
-      `<br><span class="muted">Watching (CR: ${esc(it.cr_summary)} · ${cqHtml})${tsPart}.</span>`;
-  }
-  // Separate draft, unreviewed development, and active review states
-  if (it.is_draft) {
-    const ts = formatStatusTime(it);
-    const tsPart = ts ? ` · ${ts}` : '';
-    return `📝 <strong>${statusHtml} (${ps})</strong>` +
-      `<br><span class="muted">In draft (CR: ${esc(it.cr_summary)} · ${cqHtml})${tsPart}.</span>`;
-  }
-  if (it.in_development) {
-    const ts = formatStatusTime(it);
-    const tsPart = ts ? ` · ${ts}` : '';
-    return `🛠️ <strong>${statusHtml} (${ps})</strong>` +
-      `<br><span class="muted">In development — no reviewers yet (${cqHtml})${tsPart}.</span>`;
-  }
-  const ts = formatStatusTime(it);
-  const tsPart = ts ? ` · ${ts}` : '';
-  return `⏸️ <strong>${statusHtml} (${ps})</strong>` +
-    `<br><span class="muted">In review (CR: ${esc(it.cr_summary)} · ${cqHtml})${tsPart}.</span>`;
-}
-
-// One predicate drives both the ⚡ badge and the sort, so the top rows are exactly the
-// ⚡ ones
+// One predicate drives the headline count and the focus cards
 function needsMyReply(it) {
   return Boolean(it.in_my_attention) && !(it.cq_failed && it.is_self) &&
     it.phase !== 'SUBMITTING' && !it.is_draft && !it.in_development &&
@@ -2685,27 +2460,13 @@ function needsMyReply(it) {
     shortActor(it.last_msg_author) !== 'SkCQ';
 }
 
-// Merged CLs older than this are chats left open after the work ended
-const OLD_MERGED_DAYS = 3;
-
-// Status filters in display and sort order; alwaysShow keeps core workflow chips visible
-// as 0-count indicators while hiding empty situational/tail chips unless selected
-const STATUSES = [
-  {id: 'attention', label: '⚡ Needs you', alwaysShow: true},
-  {id: 'conflict', label: '⛔ Conflict', alwaysShow: false},
-  {id: 'tree', label: '🌲 Tree red', alwaysShow: false},
-  {id: 'cq', label: '⏳ CQ running', alwaysShow: true},
-  {id: 'waiting', label: '⏸ Waiting on others', alwaysShow: true},
-  {id: 'dev', label: '🛠️ In development', alwaysShow: true},
-  {id: 'draft', label: '📝 Draft', alwaysShow: false},
-  {id: 'watching', label: '👀 Watching', alwaysShow: false},
-  {id: 'merged', label: '🟢 Merged', alwaysShow: true},
-  {id: 'old', label: '📦 OLD', alwaysShow: false},
-  {id: 'abandoned', label: '⚪ Abandoned', alwaysShow: false},
-];
-
 function isAlert(it) {
   return (it.phase || '').startsWith('ALERT_');
+}
+
+// A post-submit alert means a landed commit broke something; a CQ failure is still pre-submit
+function isPostSubmitAlert(it) {
+  return isAlert(it) && it.phase !== 'ALERT_CQ_FAILED';
 }
 
 // Alerts count as needing me even on merged CLs, since a blamed commit needs a reaction
@@ -2722,372 +2483,308 @@ function statusOf(it) {
   if (it.merge_conflict) return 'conflict';
   const cq = String(it.cq_status || '');
   if (it.phase === 'SUBMITTING' || cq.startsWith('CQ+') || cq.includes('running')) return 'cq';
-  // Separate explicit drafts from live unreviewed changes so each has its own filter
   if (it.is_draft) return 'draft';
   if (it.in_development) return 'dev';
   if (it.tree_red) return 'tree';
   return 'waiting';
 }
 
-function compareRows(a, b) {
-  const sa = STATUSES.findIndex(x => x.id === statusOf(a));
-  const sb = STATUSES.findIndex(x => x.id === statusOf(b));
-  return sa - sb || Number(isAlert(b)) - Number(isAlert(a)) ||
-    (b.activity_ts || 0) - (a.activity_ts || 0);
+// Lanes group statuses by who has to act next; order here is display order
+const LANES = [
+  {id: 'landing', title: 'Landing',
+    hint: 'Commit queue, then Skia → Android · Chrome · Google3 · Flutter'},
+  {id: 'desk', title: 'On your desk', hint: 'Drafts and changes without reviewers'},
+  {id: 'waiting', title: 'Waiting on others', hint: 'Nothing to do until they reply'},
+  {id: 'watching', title: 'Watching', hint: 'Other people’s changes'},
+];
+
+function laneOf(it) {
+  const st = statusOf(it);
+  if (st === 'attention' || st === 'conflict') return 'you';
+  if (st === 'cq') return 'landing';
+  if (st === 'merged') {
+    // A merged CL without post-submit data has nothing left to track
+    const ps = it.post_submit;
+    return ps && !ps.all_passed ? 'landing' : 'done';
+  }
+  if (st === 'draft' || st === 'dev') return 'desk';
+  if (st === 'waiting' || st === 'tree') return 'waiting';
+  if (st === 'watching') return 'watching';
+  return 'done';
+}
+
+function rollClass(state) {
+  if (state === '✓') return 'ok';
+  if (state === '🔄') return 'moving';
+  if (state === '✗' || state === '🔴') return 'bad';
+  return 'wait';
+}
+
+function flightPath(it, withLabels) {
+  const ps = it.post_submit || {};
+  const rolls = ps.rolls || {};
+  const skiaBad = ps.skia_status === '🔴';
+  let html = '<div class="path">';
+  html += link(STATUS_SKIA_URL,
+    `<i class="dot ${skiaBad ? 'bad' : 'ok'}"></i><span>Skia</span>`,
+    `stop${skiaBad ? ' is-bad' : ''}`, ps.skia_status_detail || 'Skia');
+  // Rolls into the four products are independent, so they fan out instead of chaining
+  html += `<i class="leg ${skiaBad ? 'broken' : 'done'}"></i><div class="fan">`;
+  for (const p of PRODUCTS) {
+    const r = rolls[p] || {};
+    html += link(r.url || STATUS_SKIA_URL,
+      `<i class="dot ${rollClass(r.state)}"></i><span>${p}</span>`,
+      'stop', `${p}: ${r.detail || 'waiting'}`);
+  }
+  html += '</div>';
+  if (!withLabels) {
+    const n = PRODUCTS.filter(p => (rolls[p] || {}).state === '✓').length;
+    html += `<span class="path-label">${n} of 4 products</span>`;
+  }
+  return html + '</div>';
 }
 
 const INCIDENT_VERDICT_LABEL = {
-  blamed: '🔴 blamed',
-  flake: '⚪ flake',
-  low_confidence: '⚠️ low-confidence suspect',
-  blamelist: '⚪ in blamelist only'
+  blamed: 'Blamed',
+  flake: 'Flake',
+  low_confidence: 'Low-confidence suspect',
+  blamelist: 'In blamelist only',
 };
 
-function formatIncidentLine(h) {
-  const task = link(h.task_url, `<code>${esc(h.task_name)}</code>`);
-  const swarm = h.swarming_url ? ` ${link(h.swarming_url, 'log')}` : '';
-  let culprit = '';
-  if (h.verdict === 'blamelist' && h.culprit_short) {
-    const cl = h.culprit_cl ? link(h.culprit_cl_url, `CL ${esc(h.culprit_cl)}`) : '';
-    const sha = link(h.culprit_commit_url, `<code>${esc(h.culprit_short)}</code>`);
-    culprit = `; Gardener culprit: ${sha} ${cl}`;
-  } else if (h.confidence_score) {
-    culprit = ` (${h.confidence_score}%)`;
-  }
-  const why = h.reason ? `<br><span class="muted">${esc(h.reason)}</span>` : '';
+function incidentHtml(h) {
   const label = INCIDENT_VERDICT_LABEL[h.verdict] || esc(h.verdict);
-  return `<div>${label}: ${task}${swarm}${culprit}${why}</div>`;
+  const task = link(h.task_url, `<span class="chip" title="${esc(h.task_name)}">` +
+    `${esc(shortTask(h.task_name))}</span>`);
+  const log = h.swarming_url ? link(h.swarming_url, 'log') : '';
+  const score = h.confidence_score ? `${esc(h.confidence_score)}% confidence` : '';
+  const why = [label, score, log].filter(Boolean).join(' · ');
+  return `<div class="incident">${task}<span class="why-line">${why}</span></div>`;
 }
 
-function formatRollsCell(it) {
-  // Abandoned and closed changes never roll post-submit
+function waitingOnHtml(it) {
+  const people = (it.waiting_on || []).map(p => {
+    const who = link(actorUrl(it, p.id), esc(shortActor(p.id)));
+    return p.active ? who : `<s>${who}</s> (left Google)`;
+  });
+  return people.length ? `Waiting on <b>${people.join(', ')}</b>` : '';
+}
+
+// One plain-language line per row: what state the change is in and why
+function stateHtml(it) {
+  const cr = it.cr_summary ? `CR ${esc(it.cr_summary)}` : '';
+  const cq = it.cq_status ? link(checksUrl(it), esc(it.cq_status)) : '';
+  const review = [cr, cq].filter(Boolean).join(' · ');
   if (it.status === 'ABANDONED' || it.status === 'CLOSED') {
-    return `<span class="muted">—</span>`;
+    return it.status === 'ABANDONED' ? 'Abandoned' : 'Closed';
   }
-  if (it.status !== 'MERGED') {
-    if (it.phase === 'SUBMITTING') {
-      return `Waiting for submit`;
+  if (it.status === 'MERGED') {
+    const ps = it.post_submit;
+    if (ps && ps.all_passed) return 'Shipped to all 4 products';
+    if (ps) return flightPath(it, false);
+    return 'Merged';
+  }
+  if (it.phase === 'SUBMITTING') return `Submitting · ${link(checksUrl(it), 'SkCQ')}`;
+  const st = statusOf(it);
+  // GitHub has no commit queue; a running check set is the closest state
+  if (st === 'cq') return `${it.kind === 'github' ? 'Checks' : 'In the commit queue'} · ${cq}`;
+  if (st === 'draft') return `Draft · ${cq || 'no CQ run'}`;
+  if (st === 'dev') return `No reviewers yet · ${cq || 'no CQ run'}`;
+  if (st === 'tree') {
+    return `<span class="red">${link(FLUTTER_DASHBOARD_URL, 'flutter/flutter tree')} is red;` +
+      ' landing waits for it</span>';
+  }
+  if (st === 'watching') return review || 'Watching';
+  return [waitingOnHtml(it) || 'In review', review].filter(Boolean).join(' · ');
+}
+
+// Row time is when the change last changed state, in ET with its age
+function rowTime(it) {
+  if (it.status === 'MERGED') {
+    const ps = it.post_submit;
+    if (ps && ps.all_passed && ps.status_changed_et) {
+      return `${esc(ps.status_changed_et)} (${esc(ps.status_changed_age)})`;
     }
-    if (it.is_watching) {
-      return `<span class="muted">Watching</span>`;
-    }
-    // Distinguish pre-submit draft, unreviewed development, and active review
-    if (it.is_draft) {
-      return `<span class="muted">In draft</span>`;
-    }
-    if (it.in_development) {
-      return `<span class="muted">In development</span>`;
-    }
-    return `<span class="muted">In review</span>`;
+    return formatStatusTime(it, it.submitted_et, it.submitted_age);
   }
-  const ps = it.post_submit;
-  if (!ps) {
-    return `<strong><code>✓ Merged</code></strong>`;
-  }
-  const statusLink = (html) => link('https://status.skia.org/repo/skia', html);
-  const psTs = (ps.status_changed_et && ps.status_changed_age)
-    ? `${esc(ps.status_changed_et)} (${esc(ps.status_changed_age)})`
-    : esc(ps.status_changed_et || ps.status_changed_age || '');
-  if (ps.all_passed) {
-    const doneTs = psTs ? ` · ${psTs}` : '';
-    return `<strong><code>${statusLink('✓Status')} · ✓And ✓Chr ✓G3 ✓Flt</code></strong>` +
-      `<br><span class="muted">(all 4/4 rolls passed${doneTs}!)</span>`;
-  }
-  const r = ps.rolls || {};
-  const rollHtml = (name, label) => {
-    const x = r[name] || {};
-    return link(x.url, `<code title="${esc(x.detail || '')}">${label}: ${x.state || '⏳'}</code>`);
-  };
-  const cnt = ps.passed_rolls ?? 0;
-  let header = `<code>${statusLink(`${esc(ps.skia_status)}Status`)} · ${cnt}/4 rolls</code>`;
-  if (ps.has_alert) {
-    const reason = `<code>🔴 ${esc(ps.alert_reason || 'Roll/Status Alert')}</code>`;
-    header = `<strong style="color:var(--danger-text)">${statusLink(reason)}</strong>`;
-  }
-  const incidents = (ps.incidents || []).map(formatIncidentLine).join('');
-  const gardener = cachedData && cachedData.gardener_url
-    ? ` · ${link(cachedData.gardener_url, 'Gardener')}`
-    : '';
-  const postUpdated = psTs ? ` · ${psTs}` : '';
-  const rolls = [['Android', 'Android'], ['Chrome', 'Chrome'], ['Google3', 'G3'],
-    ['Flutter', 'Flutter']].map(([name, label]) => rollHtml(name, label)).join(', ');
-  const incidentsHtml = incidents
-    ? `<div class="muted" style="margin-top:4px">${incidents}</div>`
-    : '';
-  return `${header}<br><span class="muted">(${rolls})${gardener}` +
-    `${postUpdated}</span>${incidentsHtml}`;
+  return formatStatusTime(it);
 }
 
-function formatGmailCell(it) {
-  const g = it.gmail || {};
-  const tids = g.thread_ids || [];
-  const inboxTids = g.inbox_thread_ids || [];
-  const total = g.total_msgs || 0;
-  const inb = g.inbox_msgs || 0;
-  const tr = g.trash_msgs || 0;
-
-  const searchUrl = 'https://mail.google.com/mail/u/0/#search/' +
-    encodeURIComponent('in:anywhere ' + it.target_id);
-  if (tids.length === 0) {
-    return `<span class="muted">${link(searchUrl, 'No mail')}</span>`;
+function focusCard(it, data) {
+  const chat = chatUrl(it, data);
+  const chatBtn = chat ? link(chat, 'Open chat', 'btn quiet') : '';
+  const subject = esc(cleanSubject(it.subject));
+  if (isPostSubmitAlert(it)) {
+    const ps = it.post_submit || {};
+    const incidents = ps.incidents || [];
+    const blamed = incidents.some(h => h.verdict === 'blamed');
+    const eyebrow = blamed ? 'Broke the Skia tree' : esc(ps.alert_reason || 'Post-submit alert');
+    const first = incidents[0] || {};
+    const primary = link(first.task_url || STATUS_SKIA_URL, 'See failure', 'btn primary');
+    const landedAt = formatStatusTime(it, it.submitted_et, it.submitted_age);
+    const landed = it.submitted_et ? `${esc(authorLabel(it))} landed it ${landedAt}.` : '';
+    const blame = incidents.length
+      ? ` Gardener lists ${incidents.length} failing task${incidents.length > 1 ? 's' : ''}.`
+      : '';
+    return `
+    <article class="card alert">
+      <div><div class="eyebrow">${eyebrow} · ${esc(it.project_name)} ·
+        ${link(it.url, clLabel(it))}</div>
+        <h2>${link(it.url, subject)}</h2>
+        <div class="why">${landed}${blame}</div></div>
+      <div class="actions">${primary}${chatBtn}</div>
+      ${incidents.length
+        ? `<div class="incidents">${incidents.map(incidentHtml).join('')}</div>` : ''}
+      ${it.status === 'MERGED' ? flightPath(it, true) : ''}
+    </article>`;
   }
-  // State saved before threads[] existed has only IDs; fall back to one search link
-  const threads = g.threads && g.threads.length
-    ? g.threads
-    : [{url: searchUrl, source: 'Mail', msgs: total}];
-  const tidLabel = threads
-    .map(t => link(t.url || searchUrl, `📧 ${esc(t.source)} thread`))
-    .join(', ');
-
-  if (inb > 0) {
-    const trashPart = tr > 0 ? `${tr} in <code>TRASH</code>, ` : '';
-    const tidJson = esc(JSON.stringify(inboxTids.length ? inboxTids : tids));
-    return `⚠️ ${tidLabel} (${total} msgs: ${trashPart}<strong>${inb} in <code>INBOX</code>!</strong>)
-      <div class="cell-actions">
-        <button class="btn-sm btn-warn"
-          title="Remove these threads from Gmail INBOX; they stay in All Mail"
-          onclick='archiveGmail(this, "${esc(it.target_id)}", ${tidJson})'>📥 Archive</button>
-      </div>`;
+  const kindWord = it.kind === 'github' ? 'PR' : 'CL';
+  let why;
+  let primary = link(it.url, `Open ${kindWord}`, 'btn primary');
+  if (it.phase === 'ALERT_CQ_FAILED') {
+    why = `The commit queue failed · ${formatStatusTime(it)}`;
+    primary = link(checksUrl(it), 'See checks', 'btn primary');
+  } else if (it.merge_conflict) {
+    why = `Merge conflict: rebase needed · ${formatStatusTime(it)}`;
+  } else {
+    const from = link(actorUrl(it, it.last_msg_author), esc(shortActor(it.last_msg_author)));
+    const snippet = esc(String(it.last_msg_snippet || '').replace(/^Patch Set \d+:\s*/, ''));
+    why = `<b>${from}</b> · ${formatStatusTime(it, '', it.last_msg_age)}: ${snippet}`;
   }
-  if (tr > 0) {
-    const arch = Math.max(0, total - tr);
-    // Explicitly state when all messages are in TRASH vs split across TRASH and All Mail
-    if (arch === 0) {
-      return `${tidLabel} (all ${tr} in <code>TRASH</code>)`;
-    }
-    return `${tidLabel} (${total} msgs: ${tr} in <code>TRASH</code>, ${arch} archived)`;
-  }
-  return `${tidLabel} (all ${total} archived)`;
-}
-
-async function archiveGmail(btn, targetId, threadIds) {
-  btn.disabled = true;
-  btn.textContent = '⏳ Archiving…';
-  try {
-    const resp = await fetch('/api/archive_gmail', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({target_id: targetId, thread_ids: threadIds})
-    });
-    if (!resp.ok) throw new Error(resp.statusText);
-    await fetchState();
-  } catch (e) {
-    btn.disabled = false;
-    btn.textContent = '⚠️ Archive failed, retry';
-  }
-}
-
-async function finalizeChat(convId, targetId) {
-  if (!confirm(`Finalize («») chat for ${targetId}?`)) return;
-  await fetch('/api/finalize', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({conversation_id: convId, target_id: targetId})
-  });
-  await fetchState();
-}
-
-async function wakeChatForTriage(convId, itemKey, targetId) {
-  await fetch('/api/wake', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      conversation_id: convId,
-      message: `[CL-WATCHER] Please check the latest status of ${itemKey}, archive any handled Gmail threads for ${targetId} from INBOX, and summarize what action is needed.`
-    })
-  });
-  alert(`Sent wakeup request to chat ${convId.slice(0, 8)}!`);
-}
-
-async function triggerRefresh() {
-  document.getElementById('sync-status').textContent = 'Polling Gerrit, GitHub, Skia Gardener, and Gmail...';
-  await fetch('/api/refresh', {method: 'POST'});
-  await fetchState();
-}
-
-function renderTable(pname, rows) {
   return `
-      <table class="md-table">
-        <thead>
-          <tr>
-            <th class="col-chat">Chat in <code>${esc(pname)}</code></th>
-            <th class="col-cl">CL / PR &amp; Author</th>
-            <th class="col-gerrit">Gerrit / GitHub Status</th>
-            <th class="col-rolls"><code>Skia Status</code> &amp; 4 Rolls</th>
-            <th class="col-gmail">Gmail (<code>INBOX</code> vs <code>TRASH</code>)</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${renderTableRows(rows)}
-        </tbody>
-      </table>`;
+    <article class="card">
+      <div><div class="eyebrow">${esc(it.project_name)} · ${link(it.url, clLabel(it))} ·
+        PS${esc(it.patchset || 1)}</div>
+        <h2>${link(it.url, subject)}</h2>
+        <div class="why">${why}</div></div>
+      <div class="actions">${primary}${chatBtn}</div>
+    </article>`;
 }
 
-function renderProject(pname, rows) {
+function rowHtml(it, data) {
+  const chat = chatUrl(it, data);
+  const who = link(actorUrl(it, it.owner_email || it.owner_name), esc(authorLabel(it)));
+  const meta = [
+    `<span class="proj-tag">${esc(it.project_name)}</span>`,
+    `<span class="cl">${esc(clLabel(it))}</span>`,
+    who,
+    chat ? link(chat, 'chat', 'chat') : '',
+  ].filter(Boolean).join(' · ');
   return `
-      <div class="section-title">
-        <span>Project <code>${esc(pname)}</code> (${rows.length})</span>
-      </div>
-      ${renderTable(pname, rows)}`;
+    <div class="row">
+      <div><div class="title">${link(it.url, esc(cleanSubject(it.subject)))}</div>
+        <div class="meta">${meta}</div></div>
+      <div class="state">${stateHtml(it)}</div>
+      <div class="when">${rowTime(it)}</div>
+    </div>`;
 }
 
-function readHashFilters() {
-  const h = new URLSearchParams(location.hash.slice(1));
-  selectedStatus = h.get('status') || 'attention';
-  selectedProject = h.get('project') || 'ALL';
+function headlineHtml(n, project) {
+  const scope = project === 'ALL' ? '' : ` in ${esc(project)}`;
+  if (n === 0) return `Nothing${scope} needs you. <span class="soft">Go build something.</span>`;
+  const word = COUNT_WORDS[n] || `${n} things`;
+  return `${word}${scope} ${n === 1 ? 'needs' : 'need'} you.`;
 }
 
-// The URL hash keeps the view across reloads and makes it bookmarkable
-function setFilter(kind, value) {
-  if (kind === 'status') selectedStatus = value;
-  else selectedProject = value;
-  const h = new URLSearchParams({status: selectedStatus, project: selectedProject});
-  history.replaceState(null, '', `#${h}`);
-  renderFromCache();
-}
-
-// Disable 0-count filter chips so they serve as read-only zero confirmations
-function chipHtml(cls, kind, value, label, count, active) {
-  const state = (active ? ' active-tab' : '') + (count === 0 ? ' empty' : '');
-  const dis = count === 0 ? ' disabled' : '';
-  return `<button class="${cls}${state}"${dis} ` +
-    `onclick="setFilter('${kind}', ${esc(JSON.stringify(value))})">` +
-    `${label} <span class="count">${count}</span></button>`;
-}
-
-function renderTableRows(rows) {
-  return rows.map(it => {
-    const rowClass = (it.phase || '').startsWith('ALERT_') ? 'row-alert' : '';
-    const shortCid = esc((it.conversation_id || '').slice(0, 8));
-    return `<tr class="${rowClass}">
-      <td class="col-chat">
-        <code>${esc(it.title)}</code> (<code>${shortCid}</code>)
-        <div class="cell-actions">
-          <button class="btn-sm" onclick="wakeChatForTriage('${esc(it.conversation_id)}', '${esc(it.item_key)}', '${esc(it.target_id)}')">💬 Wake Chat</button>
-          <button class="btn-sm" onclick="finalizeChat('${esc(it.conversation_id)}', '${esc(it.target_id)}')">✓ Finalize («»)</button>
-        </div>
-      </td>
-      <td class="col-cl">${formatAuthorAndCl(it)}</td>
-      <td class="col-gerrit">${formatGerritStatusCell(it)}</td>
-      <td class="col-rolls">${formatRollsCell(it)}</td>
-      <td class="col-gmail">${formatGmailCell(it)}</td>
-    </tr>`;
-  }).join('');
-}
-
-function renderFromCache() {
-  if (!cachedData) return;
-  const data = cachedData;
-  document.getElementById('sync-status').textContent =
-    `Last synced: ${data.last_sync || 'now'} · Auto-refresh every 20s`;
-
-  // Render inline rollers summary bar
-  const rsum = data.rollers_summary || {};
-  document.getElementById('rollers-bar').innerHTML =
-    `<strong>Skia Autorollers:</strong> ` +
-    ['Android', 'Chrome', 'Google3', 'Flutter'].map(name => {
-      const r = rsum[name] || {};
-      const icon = (r.num_failed > 0) ? '🔴' : '🟢';
-      const rev = r.last_roll_rev
-        ? link(commitUrl(r.last_roll_rev), `<code>${esc(r.last_roll_rev.slice(0, 10))}</code>`)
-        : '<code>—</code>';
-      const inFlight = r.current_roll_rev
-        ? `, rolling ${link(commitUrl(r.current_roll_rev),
-            `<code>${esc(r.current_roll_rev.slice(0, 7))}</code>`)}`
-        : '';
-      const behind = `behind: ${r.num_behind ?? 0}${inFlight}`;
-      return `<span>${icon} <strong>${link(r.url, name)}</strong>: ${rev} (${behind})</span>`;
-    }).join('') +
-    `<span>${link('https://status.skia.org/repo/skia', 'status.skia.org')}` +
-    (data.gardener_url ? ` · ${link(data.gardener_url, 'Skia Gardener')}` : '') +
-    `</span>`;
-
-  const allItems = Object.values(data.items || {}).sort(compareRows);
-  document.getElementById('total-count').textContent = allItems.length;
-
-  const projOf = it => it.project_name || 'Unassigned';
-  const preferredOrder = ['SkParagraph', 'Skia', 'WebParagraph', 'Skia Gardener', 'TextClusters API'];
-  const projNames = [...new Set(allItems.map(projOf))].sort((a, b) => {
-    const ia = preferredOrder.indexOf(a);
-    const ib = preferredOrder.indexOf(b);
-    if (ia !== -1 && ib !== -1) return ia - ib;
-    if (ia !== -1) return -1;
-    if (ib !== -1) return 1;
+function projectsOf(items) {
+  const names = [...new Set(items.map(it => it.project_name || 'Unassigned'))];
+  return names.sort((a, b) => {
+    const ia = PROJECT_ORDER.indexOf(a);
+    const ib = PROJECT_ORDER.indexOf(b);
+    if (ia !== -1 || ib !== -1) return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
     return a.localeCompare(b);
   });
-  if (selectedProject !== 'ALL' && !projNames.includes(selectedProject)) {
-    selectedProject = 'ALL';
+}
+
+function setProject(p) {
+  selectedProject = p;
+  history.replaceState(null, '', p === 'ALL' ? '#' : `#project=${encodeURIComponent(p)}`);
+  render();
+}
+
+function render() {
+  const data = cachedData;
+  if (!data) return;
+  const all = Object.values(data.items || {})
+    .sort((a, b) => (b.activity_ts || 0) - (a.activity_ts || 0));
+  const projects = projectsOf(all);
+  if (selectedProject !== 'ALL' && !projects.includes(selectedProject)) selectedProject = 'ALL';
+  const projOf = it => it.project_name || 'Unassigned';
+
+  const chip = (value, label, n) =>
+    `<button class="proj${selectedProject === value ? ' on' : ''}" ` +
+    `onclick="setProject(${esc(JSON.stringify(value))})">` +
+    `${esc(label)}<span class="n">${n}</span></button>`;
+  document.getElementById('projects').innerHTML = chip('ALL', 'All', all.length) +
+    projects.map(p => chip(p, p, all.filter(it => projOf(it) === p).length)).join('');
+
+  const shown = all.filter(it => selectedProject === 'ALL' || projOf(it) === selectedProject);
+  const by = {you: [], landing: [], desk: [], waiting: [], watching: [], done: []};
+  for (const it of shown) by[laneOf(it)].push(it);
+  // Tree breakages first: they block everyone, a pending reply blocks one person
+  by.you.sort((a, b) => Number(isPostSubmitAlert(b)) - Number(isPostSubmitAlert(a)));
+
+  document.getElementById('headline').innerHTML = headlineHtml(by.you.length, selectedProject);
+  const sub = LANES.filter(l => by[l.id].length)
+    .map(l => `${by[l.id].length} ${l.title.toLowerCase()}`);
+  if (by.done.length) sub.push(`${by.done.length} done`);
+  document.getElementById('subline').textContent = sub.length ? `${sub.join(' · ')}.` : '';
+
+  document.getElementById('focus').innerHTML = by.you.map(it => focusCard(it, data)).join('');
+
+  let lanes = LANES.filter(l => by[l.id].length).map(l =>
+    `<section class="lane"><div class="lane-head"><h3>${l.title}</h3>` +
+    `<span class="n">${by[l.id].length}</span><span class="hint">${l.hint}</span></div>` +
+    by[l.id].map(it => rowHtml(it, data)).join('') + '</section>').join('');
+  if (by.done.length) {
+    lanes += '<section class="lane"><details class="done"><summary><h3>Done</h3>' +
+      `<span class="n">${by.done.length}</span>` +
+      '<span class="chev"><span class="closed">Show</span><span class="open">Hide</span></span>' +
+      '</summary>' +
+      by.done.map(it => rowHtml(it, data)).join('') + '</details></section>';
   }
+  document.getElementById('lanes').innerHTML = lanes ||
+    '<p class="empty-note">No open CL or PR chats in this project.</p>';
 
-  // Each axis counts rows under the other axis's current choice, so a chip's number
-  // always equals the rows shown after clicking it
-  const inProject = it => selectedProject === 'ALL' || projOf(it) === selectedProject;
-  const inStatus = it => selectedStatus === 'all' || statusOf(it) === selectedStatus;
-  const projRows = allItems.filter(inProject);
-  const statusCount = id => projRows.filter(it => statusOf(it) === id).length;
-
-  // Keep core workflow statuses visible at 0; hide empty situational/tail statuses unless active
-  document.getElementById('status-tabs').innerHTML =
-    STATUSES.filter(st => st.alwaysShow || statusCount(st.id) > 0 || selectedStatus === st.id)
-      .map(st => chipHtml('seg', 'status', st.id, st.label, statusCount(st.id),
-        selectedStatus === st.id)).join('') +
-    chipHtml('seg', 'status', 'all', 'All', projRows.length, selectedStatus === 'all');
-
-  const statusRows = allItems.filter(inStatus);
-  const projCount = p => statusRows.filter(it => projOf(it) === p).length;
-  document.getElementById('project-tabs').innerHTML =
-    chipHtml('chip', 'project', 'ALL', 'All', statusRows.length, selectedProject === 'ALL') +
-    projNames.map(p => chipHtml('chip', 'project', p, esc(p), projCount(p),
-      selectedProject === p)).join('');
-
-  const shown = statusRows.filter(inProject);
-  const container = document.getElementById('tables-container');
-  if (shown.length === 0) {
-    const others = STATUSES.filter(st => st.id !== selectedStatus && statusCount(st.id) > 0)
-      .map(st => `<a href="#" onclick="event.preventDefault(); ` +
-        `setFilter('status', '${st.id}')">${st.label} (${statusCount(st.id)})</a>`)
-      .join(' · ');
-    const head = selectedStatus === 'attention'
-      ? 'Nothing needs you right now.'
-      : 'No chats match this filter.';
-    container.innerHTML = `<p class="muted">${head}${others ? ` See ${others}.` : ''}</p>`;
-  } else {
-    const groups = selectedProject === 'ALL'
-      ? projNames.filter(p => shown.some(it => projOf(it) === p))
-      : [selectedProject];
-    container.innerHTML = groups
-      .map(p => renderProject(p, shown.filter(it => projOf(it) === p)))
-      .join('');
-  }
-
-  // Fire browser notifications on new events
-  const evList = data.events || [];
-  for (const ev of evList) {
-    if (!seenEventIds.has(ev.id)) {
-      seenEventIds.add(ev.id);
-      if (initialLoadDone) {
-        fireBrowserNotification(`${ev.project_name}: ${ev.item_key}`, ev.message, ev.critical);
-      }
-    }
-  }
-  initialLoadDone = true;
+  const r = data.rollers_summary || {};
+  document.getElementById('rollers').innerHTML = PRODUCTS.map(p => {
+    const x = r[p] || {};
+    const tip = `${p}: ${x.badge || ''} · ${x.num_behind ?? '?'} commits behind`;
+    return link(x.url, `<i class="dot ${x.num_failed ? 'moving' : 'ok'}"></i>` +
+      `<span class="name">${p}</span>`, '', tip);
+  }).join('') + (data.gardener_url ? link(data.gardener_url, 'Gardener') : '');
+  document.getElementById('synced').textContent = data.last_sync || '';
+  document.getElementById('footer').textContent =
+    `${all.length} open CL and PR chats across ${projects.length} projects · refreshes every 20 s`;
 }
 
 async function fetchState() {
   try {
     const resp = await fetch('/api/status');
     cachedData = await resp.json();
-    renderFromCache();
+    render();
   } catch (e) {
-    document.getElementById('sync-status').textContent = 'Connection error — retrying...';
+    document.getElementById('synced').textContent = 'Connection lost, retrying';
   }
 }
 
-initTheme();
-readHashFilters();
-updateNotifButton();
-fetchState();
-setInterval(fetchState, 20000);
+async function triggerRefresh() {
+  const btn = document.getElementById('refresh-btn');
+  btn.textContent = 'Refreshing…';
+  try {
+    await fetch('/api/refresh', {method: 'POST'});
+    await fetchState();
+  } finally {
+    btn.textContent = 'Refresh';
+  }
+}
+
+function boot() {
+  selectedProject = new URLSearchParams(location.hash.slice(1)).get('project') || 'ALL';
+  fetchState();
+  setInterval(fetchState, 20000);
+}
+
+boot();
 </script>
 </body>
 </html>
@@ -3115,6 +2812,7 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
       state = load_watcher_state()
       if not state.get("items"):
         state = sync_once(wake_chats=False, update_titles=True)
+      state["jetski_box_url"] = jetski_box_url()
       self._send_json(state)
       return
 
@@ -3128,17 +2826,6 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
 
   def do_POST(self) -> None:  # pylint: disable=invalid-name
     parsed = urllib.parse.urlparse(self.path)
-    length = int(self.headers.get("Content-Length") or 0)
-    body = (
-        self.rfile.read(length).decode("utf-8", errors="replace")
-        if length > 0
-        else "{}"
-    )
-    try:
-      data = json.loads(body)
-    except Exception:
-      data = {}
-
     if parsed.path in ("/api/refresh", "/api/sync"):
       # Run the updated script when the daemon's in-memory code is stale
       if script_changed_on_disk():
@@ -3159,47 +2846,6 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
         return
       state = sync_once(wake_chats=True, update_titles=True)
       self._send_json({"ok": True, "count": len(state.get("items") or {})})
-      return
-
-    if parsed.path == "/api/archive_gmail":
-      tid = str(data.get("target_id") or "").strip()
-      tids = data.get("thread_ids")
-      if not isinstance(tids, list):
-        tids = None
-      res = archive_gmail_threads_for_id(tid, tids)
-      # A full sync takes about a minute, which made the button look dead; the
-      # next background poll re-reads Gmail anyway
-      state = load_watcher_state()
-      for item in (state.get("items") or {}).values():
-        if item.get("target_id") == tid and item.get("gmail"):
-          item["gmail"]["inbox_msgs"] = 0
-          item["gmail"]["inbox_thread_ids"] = []
-      save_watcher_state(state)
-      self._send_json(res)
-      return
-
-    if parsed.path == "/api/finalize":
-      cid = str(data.get("conversation_id") or "").strip()
-      if cid:
-        subprocess.run(
-            [
-                "python3",
-                os.path.join(HOOKS_DIR, "chat_lifecycle.py"),
-                "finalize",
-                cid,
-            ],
-            check=False,
-            timeout=10,
-        )
-      state = sync_once(wake_chats=False, update_titles=False)
-      self._send_json({"ok": True, "count": len(state.get("items") or {})})
-      return
-
-    if parsed.path == "/api/wake":
-      cid = str(data.get("conversation_id") or "").strip()
-      msg = str(data.get("message") or "").strip()
-      ok = wake_conversation(cid, msg)
-      self._send_json({"ok": ok})
       return
 
     self._send_json({"error": "Not found"}, code=404)

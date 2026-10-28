@@ -566,7 +566,7 @@ class DraftAndDevelopmentStatusTest(unittest.TestCase):
   def test_dashboard_js_functions_render_draft_development_review_and_cq_precedence(self):
     self.assertNotIn("In review / development", w.DASHBOARD_HTML)
     script_body = w.DASHBOARD_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
-    harness = script_body.split("initTheme();", 1)[0] + """
+    harness = script_body.split("\nboot();", 1)[0] + """
 const draftPr = {
   kind: 'github', status: 'OPEN', phase: 'WAITING_ON_OTHERS',
   is_draft: true, in_development: false, is_watching: false, tree_red: true,
@@ -597,15 +597,29 @@ const reviewedColleagueCl = {
   subject: 'Reland "[SkContext] Forwarding SkGraphics calls to SkContext"',
   patchset: 8, url: 'https://example.com/1402416', cr_summary: '+1', cq_status: '✓ Dry Run Passed'
 };
+const externalCl = {
+  kind: 'gerrit', target_id: '1407016', is_self: false, is_external: true,
+  owner_name: 'KC Yeung', owner_email: 'I@YeungKC.com'
+};
 const reviewCl = {
   kind: 'gerrit', status: 'NEW', phase: 'WAITING_ON_OTHERS',
   is_draft: false, in_development: false, is_watching: false,
   patchset: 2, url: 'https://example.com/4', cr_summary: '+1', cq_status: 'Idle'
 };
+const waitingOnCl = Object.assign({}, reviewCl, {
+  waiting_on: [
+    {id: 'alexisdavidc@google.com', active: true}, {id: 'gone@google.com', active: false}
+  ]
+});
 const treeRedPr = {
   kind: 'github', status: 'OPEN', phase: 'WAITING_ON_OTHERS',
   is_draft: false, in_development: false, is_watching: false, tree_red: true,
   patchset: 1, url: 'https://example.com/7', cr_summary: '1 rev', cq_status: '🌲 Tree is red'
+};
+const ownConflictCl = Object.assign({}, reviewCl, {is_self: true, merge_conflict: true});
+const alertCl = {
+  kind: 'gerrit', status: 'MERGED', phase: 'ALERT_ROLL_OR_STATUS', is_self: false,
+  post_submit: {has_alert: true, all_passed: false}
 };
 const abandonedCl = {
   kind: 'gerrit', status: 'ABANDONED', phase: 'ABANDONED',
@@ -615,120 +629,98 @@ const closedPr = {
   kind: 'github', status: 'CLOSED', phase: 'ABANDONED',
   is_draft: false, in_development: false, patchset: 1, url: 'https://example.com/6'
 };
-const gmailAllTrash = {
-  target_id: '101',
-  gmail: {
-    thread_ids: ['t1'], inbox_thread_ids: [],
-    total_msgs: 5, inbox_msgs: 0, trash_msgs: 5,
-    threads: [{url: 'https://mail/1', source: 'Gerrit', msgs: 5}]
-  }
+const box = {jetski_box_url: 'https://jetski.corp.google.com/box/host'};
+const ownCqFail = {
+  kind: 'gerrit', status: 'NEW', phase: 'ALERT_CQ_FAILED', is_self: true, cq_failed: true,
+  post_submit: null, url: 'https://example.com/9', patchset: 2,
+  status_changed_et: '16:00 ET', status_changed_age: '5m ago'
 };
-const gmailMixedTrash = {
-  target_id: '102',
-  gmail: {
-    thread_ids: ['t2'], inbox_thread_ids: [],
-    total_msgs: 5, inbox_msgs: 0, trash_msgs: 3,
-    threads: [{url: 'https://mail/2', source: 'Gerrit', msgs: 5}]
-  }
-};
-const gmailAllArchived = {
-  target_id: '103',
-  gmail: {
-    thread_ids: ['t3'], inbox_thread_ids: [],
-    total_msgs: 4, inbox_msgs: 0, trash_msgs: 0,
-    threads: [{url: 'https://mail/3', source: 'Gerrit', msgs: 4}]
-  }
-};
+const piperCl = {kind: 'piper', status: 'NEW', phase: 'WAITING_ON_OTHERS'};
 console.log(JSON.stringify({
-  draftRolls: formatRollsCell(draftPr),
-  devRolls: formatRollsCell(devCl),
-  watchingRolls: formatRollsCell(watchingCl),
-  reviewRolls: formatRollsCell(reviewCl),
-  abandonedRolls: formatRollsCell(abandonedCl),
-  closedRolls: formatRollsCell(closedPr),
-  draftCore: statusCoreHtml(draftPr),
-  devCore: statusCoreHtml(devCl),
-  watchingCore: statusCoreHtml(watchingCl),
-  watchingAuthorHtml: formatAuthorAndCl(watchingCl),
-  reviewCore: statusCoreHtml(reviewCl),
-  draftNotes: statusNotesHtml(draftPr),
-  treeRedNotes: statusNotesHtml(treeRedPr),
   draftStatus: statusOf(draftPr),
   devStatus: statusOf(devCl),
   devCqStatus: statusOf(devCqRunningCl),
   watchingStatus: statusOf(watchingCl),
   reviewedColleagueStatus: statusOf(reviewedColleagueCl),
-  reviewedColleagueAuthorHtml: formatAuthorAndCl(reviewedColleagueCl),
-  reviewedColleagueNotes: statusNotesHtml(reviewedColleagueCl),
   reviewStatus: statusOf(reviewCl),
-  gmailAllTrashHtml: formatGmailCell(gmailAllTrash),
-  gmailMixedTrashHtml: formatGmailCell(gmailMixedTrash),
-  gmailAllArchivedHtml: formatGmailCell(gmailAllArchived),
-  chipZeroInactive: chipHtml('seg', 'status', 'waiting', '⏸ Waiting on others', 0, false),
-  chipZeroActive: chipHtml('seg', 'status', 'attention', '⚡ Needs you', 0, true),
-  chipNonZero: chipHtml('seg', 'status', 'waiting', '⏸ Waiting on others', 2, false),
-  visibleWhenAllZero: STATUSES
-    .filter(st => st.alwaysShow || 0 > 0 || 'attention' === st.id)
-    .map(st => st.id),
-  visibleWhenDraftSelectedAtZero: STATUSES
-    .filter(st => st.alwaysShow || 0 > 0 || 'draft' === st.id)
-    .map(st => st.id),
-  statuses: STATUSES,
+  lanes: [draftPr, devCl, devCqRunningCl, watchingCl, reviewedColleagueCl, reviewCl, treeRedPr,
+    ownConflictCl, alertCl, abandonedCl, closedPr].map(laneOf),
+  draftState: stateHtml(draftPr),
+  devState: stateHtml(devCl),
+  watchingState: stateHtml(watchingCl),
+  reviewState: stateHtml(reviewCl),
+  waitingOnState: stateHtml(waitingOnCl),
+  treeRedState: stateHtml(treeRedPr),
+  abandonedState: stateHtml(abandonedCl),
+  closedState: stateHtml(closedPr),
+  colleagueAuthor: authorLabel(reviewedColleagueCl),
+  externalAuthor: authorLabel(externalCl),
+  cleanedSubject: cleanSubject(watchingCl.subject),
+  chat: chatUrl({conversation_id: '9db15645-df20'}, box),
+  chatWithoutBox: chatUrl({conversation_id: '9db15645-df20'}, {}),
+  task: shortTask(
+    'Test-Ubuntu24.04-Clang-GCE-CPU-AVX2-x86_64-Debug-All-NativeFonts_FreeType_ASAN_Upload'),
+  headlineZero: headlineHtml(0, 'ALL'),
+  headlineOneInProject: headlineHtml(1, 'Skia'),
+  headlineTwo: headlineHtml(2, 'ALL'),
+  ownCqFailCard: focusCard(ownCqFail, box),
+  piperState: stateHtml(piperCl),
 }));
 """
     proc = subprocess.run(
         ["node", "-e", harness], capture_output=True, text=True, check=True
     )
     out = json.loads(proc.stdout.strip())
-    self.assertEqual(out["draftRolls"], '<span class="muted">In draft</span>')
-    self.assertEqual(out["devRolls"], '<span class="muted">In development</span>')
-    self.assertEqual(out["watchingRolls"], '<span class="muted">Watching</span>')
-    self.assertEqual(out["reviewRolls"], '<span class="muted">In review</span>')
-    self.assertEqual(out["abandonedRolls"], '<span class="muted">—</span>')
-    self.assertEqual(out["closedRolls"], '<span class="muted">—</span>')
-    self.assertIn("📝", out["draftCore"])
-    self.assertIn("<code>DRAFT</code>", out["draftCore"])
-    self.assertIn("🛠️", out["devCore"])
-    self.assertIn("In development — no reviewers yet", out["devCore"])
-    self.assertIn("👀", out["watchingCore"])
-    self.assertIn("Watching (CR: 0", out["watchingCore"])
-    self.assertIn("watching", out["watchingAuthorHtml"])
-    self.assertIn("In review (CR: +1", out["reviewCore"])
-    self.assertEqual(out["draftNotes"], "")
-    self.assertIn('style="color:var(--danger-text)">🌲', out["treeRedNotes"])
-    self.assertIn("is red; landing waits for it", out["treeRedNotes"])
     self.assertEqual(out["draftStatus"], "draft")
     self.assertEqual(out["devStatus"], "dev")
     self.assertEqual(out["devCqStatus"], "cq")
     self.assertEqual(out["watchingStatus"], "watching")
     self.assertEqual(out["reviewedColleagueStatus"], "watching")
-    self.assertIn("colleague", out["reviewedColleagueAuthorHtml"])
-    self.assertEqual(out["reviewedColleagueNotes"], "")
     self.assertEqual(out["reviewStatus"], "waiting")
-    self.assertIn("(all 5 in <code>TRASH</code>)", out["gmailAllTrashHtml"])
-    self.assertIn(
-        "(5 msgs: 3 in <code>TRASH</code>, 2 archived)", out["gmailMixedTrashHtml"]
-    )
-    self.assertIn("(all 4 archived)", out["gmailAllArchivedHtml"])
-    self.assertIn(" disabled", out["chipZeroInactive"])
-    self.assertIn(" disabled", out["chipZeroActive"])
-    self.assertNotIn(" disabled", out["chipNonZero"])
     self.assertEqual(
-        out["visibleWhenAllZero"],
-        ["attention", "cq", "waiting", "dev", "merged"],
+        out["lanes"],
+        ["desk", "desk", "landing", "watching", "watching", "waiting", "waiting",
+         "you", "you", "done", "done"],
     )
-    self.assertEqual(
-        out["visibleWhenDraftSelectedAtZero"],
-        ["attention", "cq", "waiting", "dev", "draft", "merged"],
-    )
-    status_ById = {s["id"]: s for s in out["statuses"]}
-    self.assertIn("dev", status_ById)
-    self.assertIn("draft", status_ById)
-    self.assertIn("watching", status_ById)
-    for core_id in ("attention", "dev", "cq", "waiting", "merged"):
-      self.assertTrue(status_ById[core_id].get("alwaysShow"), core_id)
-    for tail_id in ("draft", "watching", "conflict", "tree", "old", "abandoned"):
-      self.assertFalse(status_ById[tail_id].get("alwaysShow"), tail_id)
+    self.assertTrue(out["draftState"].startswith("Draft · "))
+    self.assertTrue(out["devState"].startswith("No reviewers yet · "))
+    self.assertIn("CR 0", out["watchingState"])
+    self.assertIn("In review · CR +1", out["reviewState"])
+    self.assertIn("Waiting on <b>", out["waitingOnState"])
+    self.assertIn("alexisdavidc", out["waitingOnState"])
+    self.assertIn("(left Google)", out["waitingOnState"])
+    self.assertIn("CR +1", out["waitingOnState"])
+    self.assertIn("is red; landing waits for it", out["treeRedState"])
+    self.assertEqual(out["abandonedState"], "Abandoned")
+    self.assertEqual(out["closedState"], "Closed")
+    self.assertEqual(out["colleagueAuthor"], "alexisdavidc")
+    self.assertEqual(out["externalAuthor"], "KC Yeung (external)")
+    self.assertEqual(out["cleanedSubject"], "Add starter Skia knowledge base rules")
+    self.assertEqual(out["chat"], "https://jetski.corp.google.com/box/host/c/9db15645-df20")
+    self.assertEqual(out["chatWithoutBox"], "")
+    self.assertEqual(out["task"], "NativeFonts FreeType ASAN · Debug · Ubuntu 24.04")
+    self.assertIn("Nothing needs you.", out["headlineZero"])
+    self.assertEqual(out["headlineOneInProject"], "One thing in Skia needs you.")
+    self.assertEqual(out["headlineTwo"], "Two things need you.")
+    self.assertIn("The commit queue failed · 16:00 ET (5m ago)", out["ownCqFailCard"])
+    self.assertIn("https://example.com/9?tab=checks", out["ownCqFailCard"])
+    self.assertNotIn("Post-submit alert", out["ownCqFailCard"])
+    self.assertNotIn("status.skia.org", out["ownCqFailCard"])
+    self.assertEqual(out["piperState"], "In review")
+
+  def test_dashboard_has_no_manual_chat_actions_or_browser_alerts(self):
+    for removed in (
+        "conversation://", "/api/wake", "/api/finalize", "/api/archive_gmail",
+        "Notification", "AudioContext", "Ping",
+    ):
+      self.assertNotIn(removed, w.DASHBOARD_HTML, removed)
+    for path in ("/api/wake", "/api/finalize", "/api/archive_gmail"):
+      handler = w.FlightDeckHandler.__new__(w.FlightDeckHandler)
+      handler.path = path
+      sent = {}
+      handler._send_json = lambda payload, code=200, sent=sent: sent.update(code=code)
+      handler.do_POST()
+      self.assertEqual(sent["code"], 404, path)
 
 
 if __name__ == "__main__":
