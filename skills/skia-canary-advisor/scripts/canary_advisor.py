@@ -248,13 +248,20 @@ def canary_health(builder):
 
 
 def load_cl(cl):
-    info = gerrit_json(f"/changes/{cl}?o=DETAILED_ACCOUNTS&o=CURRENT_REVISION")
+    info = gerrit_json(f"/changes/{cl}?o=DETAILED_ACCOUNTS&o=CURRENT_REVISION&o=DETAILED_LABELS")
     rev = next(iter(info["revisions"].values()))
     patch = base64.b64decode(http_get(f"{GERRIT}/changes/{cl}/revisions/current/patch")).decode(
         "utf-8", "replace")
+    cr_label = info.get("labels", {}).get("Code-Review", {})
+    # Canary-G3 requires either a Googler author or Googler CR+1 (g3_canary.go:134)
+    googler_cr_plus_one = any(
+        vote.get("value", 0) >= 1 and vote.get("email", "").endswith("@google.com")
+        for vote in cr_label.get("all", [])
+    )
     return {
         "cl": int(cl), "patchset": rev["_number"], "subject": info["subject"],
         "owner": info["owner"].get("email", ""), "diff": patch,
+        "googler_cr_plus_one": googler_cr_plus_one,
     }
 
 
@@ -340,6 +347,7 @@ def advise(args):
 
     own = meta["owner"] == ME
     external = not meta["owner"].endswith("@google.com")
+    googler_cr_plus_one = meta.get("googler_cr_plus_one", False)
 
     asan_bot, asan_reason = choose_asan_bot(files.keys())
 
@@ -360,6 +368,11 @@ def advise(args):
         print(f"\n## ASAN [ALWAYS_RUN]")
         print(f"- {asan_reason} -> {asan_bot}")
 
+    if external and "Canary-G3" in recs and not googler_cr_plus_one:
+        notes.append(
+            "Canary-G3 requires a Googler author or Googler Code-Review+1 (g3_canary.go:134); "
+            "deferred until a Googler votes Code-Review+1")
+
     for n in notes:
         print(f"\nNOTE: {n}")
     if agent_todo:
@@ -375,15 +388,25 @@ def advise(args):
         bots_to_run.append(asan_bot)
         
     # Policy: agent triggers Canary for external authors automatically
+    # Canary-G3 requires Googler author or Googler CR+1 approval (g3_canary.go:134)
     if external and canary_bots:
-        bots_to_run.extend(canary_bots)
+        for b in canary_bots:
+            if b == "Canary-G3" and not googler_cr_plus_one:
+                continue
+            bots_to_run.append(b)
 
-    if bots_to_run or (canary_bots and own):
+    if bots_to_run or (canary_bots and own) or (canary_bots and external):
         issue = f" -i {meta['cl']}" if meta["cl"] else ""
         
         if bots_to_run:
             cmd = f"git cl try{issue} -B {BUCKET} " + " ".join(f"-b {b}" for b in bots_to_run)
             print(f"\nAGENT ACTION (execute this command):")
+            print(f"  {cmd}")
+
+        # Provide the exact Canary-G3 command to run once a Googler votes CR+1
+        if canary_bots and external and "Canary-G3" in canary_bots and not googler_cr_plus_one:
+            cmd = f"git cl try{issue} -B {BUCKET} -b Canary-G3"
+            print(f"\nCanary-G3 Command (run after Googler Code-Review+1 approval):")
             print(f"  {cmd}")
             
         if canary_bots and not external and not own:
@@ -398,11 +421,6 @@ def advise(args):
                 print(f"\nCommand (run only after user approval):")
                 print(f"  {cmd}")
             else:
-                # If asan_bot is present, it's already in AGENT ACTION, but we need to prompt the user to run canaries too.
-                # Actually, wait. For own CL, does the agent run ASAN automatically?
-                # "ASAN try job агент запускает САМ (git cl try), не просит автора. Касается и своих CL, и CL на ревью" -> YES.
-                # But canaries for own CL still require user approval?
-                # "Для внутренних авторов (Googlers) канарейки остаются как сейчас." -> YES.
                 print(f"\nCanary Command (run only after user approval):")
                 print(f"  {cmd}")
     
@@ -412,6 +430,7 @@ def advise(args):
             fh.write(json.dumps({
                 "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
                 "cl": meta["cl"], "patchset": meta["patchset"], "own": own, "external": external,
+                "googler_cr_plus_one": googler_cr_plus_one,
                 "recommended": {c: r["tier"] for c, r in recs.items()},
                 "asan_bot": asan_bot,
             }) + "\n")
@@ -431,7 +450,10 @@ def cmd_stats(_args):
     with open(LEDGER) as fh:
         for line in fh:
             e = json.loads(line)
-            if e.get("cl") and (any(k.startswith("Canary-") for k in e.get("recommended", {})) or e.get("asan_bot")):
+            has_canary_or_asan = any(
+                k.startswith("Canary-") for k in e.get("recommended", {})
+            ) or e.get("asan_bot")
+            if e.get("cl") and has_canary_or_asan:
                 latest[e["cl"]] = e
     followed = total = 0
     for cl, e in sorted(latest.items()):
@@ -446,7 +468,15 @@ def cmd_stats(_args):
             followed += ran
             
             # Note RAN-by-agent if external
-            status = 'RAN-by-agent' if ran and e.get("external") else ('RAN' if ran else 'skipped')
+            if ran and e.get("external"):
+                status = 'RAN-by-agent'
+            elif ran:
+                status = 'RAN'
+            # External CLs cannot run G3 canary until approved by a Googler
+            elif canary == "Canary-G3" and e.get("external") and not e.get("googler_cr_plus_one"):
+                status = 'waiting-CR+1'
+            else:
+                status = 'skipped'
             
             print(f"{cl} {'own' if e.get('own') else 'rev'} {canary:16} "
                   f"{e['recommended'][canary]:8} {status}")

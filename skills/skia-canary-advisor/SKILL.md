@@ -3,7 +3,8 @@ name: skia-canary-advisor
 description: >-
   Recommend and trigger Skia Canary try jobs and ASAN bots for a Skia CL based on the diff.
   Trigger from `amnesia-precommit` (own CLs) and `review-triage` (others' CLs).
-  Agent ALWAYS triggers the ASAN bot. Agent triggers canaries automatically for external authors.
+  Agent ALWAYS triggers the ASAN bot. Agent triggers canaries automatically for external authors
+  (Canary-G3 requires Googler author or Googler CR+1).
 ---
 
 # Skia Canary & ASAN Advisor
@@ -27,7 +28,9 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
 3. Present the result: STRONG items as "run", CONSIDER items as "only if rendering may change".
 4. **Execution Policy (Agent Actions)**:
    - **ASAN**: If an ASAN bot is recommended, YOU (the agent) MUST execute the `git cl try` command provided under `AGENT ACTION` immediately, without asking the author or the user.
-   - **External Authors** (owner is not `@google.com`): YOU (the agent) MUST execute the `git cl try` command for ALL recommended canaries AND the ASAN bot immediately, without asking.
+   - **External Authors** (owner is not `@google.com`): YOU (the agent) MUST execute the `git cl try` command provided under `AGENT ACTION` immediately, without asking.
+     - **Canary-G3 restriction (`g3_canary.go:134`)**: Canary-G3 requires a Googler author OR a Googler `Code-Review+1` approval. If the external CL has no Googler CR+1 yet, `canary_advisor.py` automatically excludes Canary-G3 from `AGENT ACTION` and prints a deferred command. Run Canary-G3 only after a Googler approves with `Code-Review+1`.
+     - Other canaries (`Canary-Flutter`, `Canary-Chromium`, `Canary-Android`) have no such restriction and are triggered immediately.
    - **Internal Authors / Own CLs**: Show the printed `Canary Command` for canaries and run it ONLY after the user explicitly approves. (For ASAN, you still run it automatically).
 5. A red canary is not automatically the CL's fault. Compare failing targets with the target's tip before blaming the CL.
 
