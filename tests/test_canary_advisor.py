@@ -127,6 +127,7 @@ class TestCanaryAdvisor(unittest.TestCase):
     self.assertNotIn("Canary-G3", agent_action_line)
     self.assertIn("Canary-G3 requires a Googler author or Googler Code-Review+1", out)
     self.assertIn("Canary-G3 Command (run after Googler Code-Review+1 approval):", out)
+    self.assertIn("follow submit-hold protocol", out)
 
   def test_external_author_includes_canary_g3_when_googler_cr_plus_one_granted(self):
     diff_text = (

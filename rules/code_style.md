@@ -55,6 +55,34 @@ description: "Skia-style C++ minimalism and suppression of LLM coding reflexes."
   or comments to Gerrit or GitHub yourself, and never resolve/unresolve review threads (`resolveReviewThread`)
   unless the user explicitly asks you to. Only prepare / draft replies (either save as drafts on Gerrit or
   present them in chat for review); only the user publishes review submissions or resolves threads
+- **External Author Canary-G3 Submit-Hold Protocol**: When approving an external author's Skia CL
+  that requires Canary-G3 (which runs ~55 min and requires a Googler author or Googler
+  `Code-Review+1` approval per `g3_canary.go:134`), do not vote CR+1 as a bare approval. Because
+  Gerrit submit enforcement requires 2 approvals, another reviewer could submit the CL while
+  Canary-G3 is still running. To prevent premature submit, the user publishes `Code-Review+1`
+  together with an unresolved patchset-level comment (leaving `No-Unresolved-Comments`
+  `UNSATISFIED`). The agent never votes or publishes comments itself: prepare a `/PATCHSET_LEVEL`
+  draft (`unresolved: true`) for the user to publish:
+  > The change looks good to me (Code-Review+1). I leave this comment unresolved on purpose:
+  > it blocks the submit until the Canary-G3 try job passes. Canary-G3 builds and tests the
+  > google3 clients of Skia with this change. Skia starts it for an external author only after a
+  > Googler votes Code-Review+1, so I vote first and hold the submit with this comment. I will
+  > resolve it when Canary-G3 is green, or report the failure here. Please do not resolve or
+  > override it before that.
+  Once the user publishes CR+1 with this hold comment, the agent immediately triggers `Canary-G3`.
+  When `Canary-G3` passes, the user resolves the comment.
+- **Canary-G3 Runtime & Triage Procedure**: Canary-G3 can take ~55 minutes. If it turns red,
+  extract the roll CL number from swarming stdout (`Canary roll [ http://cl/N ]`) and triage:
+  1. Run `cd ~/.gemini/jetski/scratch/skia_gardener && go run . -triage-google3 -cl <CL>`
+  2. For each failing target:
+     - Transitive Dependency Check: Never assume a target does not use Skia/SkParagraph based on
+       local dir code search. Verify transitive paths from `/google/src/head/depot/google3`:
+       `blaze query "somepath(<target>, //third_party/skia/HEAD/<path to changed file>)"`
+     - Flakiness & HEAD Status: Check target status with
+       `/google/bin/releases/gemini-agents-auto-repair-cli/autorepair target-status <target>`
+     - Stack Trace Inspection: Inspect crash logs via
+       `autorepair readonly investigate --sponge_id=<id> --test_target=<target>`
+       to check whether Skia frames appear in the crash stack
 - **No Auto-Submit or Automated CQ Votes**: Never vote `Auto-Submit+1`, `Commit-Queue+1` (dry run),
   or `Commit-Queue+2` on Gerrit CLs, and never auto-merge GitHub PRs, unless the user explicitly
   asks for it (Try jobs, such as ASAN or Canaries triggered via `git cl try`, are NOT CQ votes and CAN be triggered automatically when rules require it). Do not trigger full CI submission automatically

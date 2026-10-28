@@ -408,6 +408,7 @@ def advise(args):
             cmd = f"git cl try{issue} -B {BUCKET} -b Canary-G3"
             print(f"\nCanary-G3 Command (run after Googler Code-Review+1 approval):")
             print(f"  {cmd}")
+            print(f"  (Note: follow submit-hold protocol — leave unresolved comment to hold submit until Canary-G3 passes)")
             
         if canary_bots and not external and not own:
             # Not external, not own -> draft a comment for the author to trigger canaries

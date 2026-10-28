@@ -134,7 +134,10 @@ For every targeted single-CL review in `🔴 SURGICAL AUDIT / CORE DOMAIN` (and 
 
 For surviving Skia CLs in `🔴 SURGICAL AUDIT` or `🟠 PUSHBACK`, run
 [`skia-canary-advisor`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/skia-canary-advisor/SKILL.md)
-(`canary_advisor.py advise --cl <N>`). Run ASAN automatically. For external authors, trigger recommended canaries automatically (note: Canary-G3 requires Googler CR+1 and is deferred until approval). For internal authors, suggest canaries in chat, do not ask them in Gerrit comments.
+(`canary_advisor.py advise --cl <N>`). Run ASAN automatically.
+
+- **External Authors**: Trigger non-G3 canaries (`Canary-Flutter`, `Canary-Chromium`, `Canary-Android`) automatically. For `Canary-G3`, it requires a Googler author or Googler `Code-Review+1` (`g3_canary.go:134`). Follow the **External Author Canary-G3 Submit-Hold Protocol**: when approving, draft the `/PATCHSET_LEVEL` comment with `unresolved: True` holding the submit until Canary-G3 passes. Run Canary-G3 immediately after the user publishes CR+1. If Canary-G3 fails, follow the triage procedure in `skia-canary-advisor`.
+- **Internal Authors**: Suggest recommended canaries in chat; do not ask them in Gerrit comments.
 
 
 
@@ -180,6 +183,18 @@ named skill's `SKILL.md` was not read, when a report with a `Case 1-5` verdict l
    implementation and measuring actual `dm` runtime, and never hold up approval asking to add doc
    comments to headers whose existing methods have no doc comments when the contract is already
    stated in the commit message.
+7. **External Author Canary-G3 Submit-Hold Protocol**: When approving an external author's Skia CL
+   that requires `Canary-G3` (`g3_canary.go:134`), do not draft a bare approval. Prepare the
+   `/PATCHSET_LEVEL` draft with `unresolved: True` containing the standard submit-hold text to prevent
+   premature submit while Canary-G3 (~55 min) runs:
+   > The change looks good to me (Code-Review+1). I leave this comment unresolved on purpose: it blocks
+   > the submit until the Canary-G3 try job passes. Canary-G3 builds and tests the google3 clients of
+   > Skia with this change. Skia starts it for an external author only after a Googler votes
+   > Code-Review+1, so I vote first and hold the submit with this comment. I will resolve it when
+   > Canary-G3 is green, or report the failure here. Please do not resolve or override it before that.
+   After the user publishes CR+1 with this hold comment, immediately trigger Canary-G3 (`git cl try
+   -i <CL> -B skia/skia.primary -b Canary-G3`). If red, follow the Canary-G3 triage procedure in
+   [`skia-canary-advisor`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/skia-canary-advisor/SKILL.md).
 7. **Daily Queue Summary Shows Open Issues Only**: In `run_queue_triage.py` summaries, never list or
    mention GitHub issues that are already closed (including ones closed during the window or still
    receiving bot activity); report only open issues and the user's own open PRs.
