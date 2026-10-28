@@ -267,7 +267,12 @@ class TestChatLifecycle(unittest.TestCase):
             "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT)"
         )
         conn.execute("INSERT INTO conversation_summaries VALUES (?, ?)", ("c1", "Untitled"))
-        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?)", ("c2", "[10:00] ⦿ Custom"))
+        conn.execute(
+            "INSERT INTO conversation_summaries VALUES (?, ?)", ("c2", "[10:00] ⦿ Custom Topic")
+        )
+        conn.execute(
+            "INSERT INTO conversation_summaries VALUES (?, ?)", ("c3", "[10:00] ⦿ Investigation")
+        )
       conn.close()
 
       with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
@@ -281,12 +286,22 @@ class TestChatLifecycle(unittest.TestCase):
         self.assertEqual(res, "[14:15] ⦿ cl/1397896")
         self.assertEqual(chat_lifecycle.get_conversation_title("c1"), "[14:15] ⦿ cl/1397896")
 
-        # 2. Already titled chat (with [HH:MM]) is never overwritten
+        # 2. Already titled chat with a valid multi-word topic is never overwritten
         res2 = chat_lifecycle.auto_title_conversation("c2", "Look at PR #12345")
         self.assertEqual(res2, "")
-        self.assertEqual(chat_lifecycle.get_conversation_title("c2"), "[10:00] ⦿ Custom")
+        self.assertEqual(chat_lifecycle.get_conversation_title("c2"), "[10:00] ⦿ Custom Topic")
 
-        # 3. Prompt without entity does not change title
+        # 3. Chat with generic/single-word title IS overwritten by auto_title
+        res_generic = chat_lifecycle.auto_title_conversation(
+            "c3", "Look at PR #55123 multi-span BiDi"
+        )
+        self.assertEqual(res_generic, "[14:15] ⦿ PR #55123 multi-span BiDi")
+        self.assertEqual(
+            chat_lifecycle.get_conversation_title("c3"),
+            "[14:15] ⦿ PR #55123 multi-span BiDi",
+        )
+
+        # 4. Prompt without entity does not change title
         res3 = chat_lifecycle.auto_title_conversation("c1", "Just some random question")
         self.assertEqual(res3, "")
 
@@ -753,7 +768,11 @@ class TestChatLifecycle(unittest.TestCase):
   def test_forked_chain_archives_only_handed_off_pieces(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
       self.write_chain(tmp_dir, [("root", None), ("a", "root"), ("b", "root")])
-      titles = {"root": "[09:00] ⦿ T", "a": "[10:00] ⦿ T", "b": "[11:00] ⏳ T"}
+      titles = {
+          "root": "[09:00] ⦿ Forked Topic",
+          "a": "[10:00] ⦿ Forked Topic",
+          "b": "[11:00] ⏳ Forked Topic",
+      }
       self.write_titles(tmp_dir, titles)
       fake_ls = {
           cid: {"annotations": {"title": t}, "trajectoryMetadata": {"projectId": "proj-1"}}
@@ -1717,6 +1736,53 @@ class TestChatLifecycle(unittest.TestCase):
     req = chat_lifecycle.urllib.request.Request("http://localhost:5387/")
     with self.assertRaises(chat_lifecycle.urllib.error.URLError):
       chat_lifecycle._urlopen_ls(req, timeout=0.1)
+
+  def test_is_valid_chat_topic_and_validate_chat_topic(self):
+    for bad in [
+        "",
+        "   ",
+        "Investigation",
+        "Debugging",
+        "cl/12345",
+        "PR #99",
+        "Bug investigation",
+        "Code review",
+        "Исследование бага",
+        "Task",
+        "Custom",
+        "Untitled",
+        "Работа",
+        "Чат",
+        "CL",
+        "cl 99",
+        "General work",
+    ]:
+      self.assertFalse(chat_lifecycle.is_valid_chat_topic(bad), f"Expected '{bad}' rejected")
+      with self.assertRaises(chat_lifecycle.InvalidTopicError):
+        chat_lifecycle.validate_chat_topic(bad)
+
+    for good in [
+        "PR #194980 multi-span BiDi",
+        "FontCollection FaceCache thread safety",
+        "R2 b/345678901",
+        "Тест № 2",
+        "Ban single-word and generic chat titles",
+        "Audit visible chats",
+    ]:
+      self.assertTrue(chat_lifecycle.is_valid_chat_topic(good), f"Expected '{good}' accepted")
+      self.assertEqual(chat_lifecycle.validate_chat_topic(good), good)
+
+  def test_derive_fallback_topic_from_state_file_and_prompt(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      st_path = os.path.join(tmp_dir, "state.md")
+      with open(st_path, "w", encoding="utf-8") as f:
+        f.write("# Chain State: Audit visible chats (R27)\n\n## Goal\nTest\n")
+      derived = chat_lifecycle.derive_fallback_topic("nonexistent_id", state_file=st_path)
+      self.assertEqual(derived, "Audit visible chats")
+
+    prompt = "Посмотри на PR #999 multi-span BiDi layout crash"
+    derived_prompt = chat_lifecycle.derive_fallback_topic("nonexistent_id", prompt=prompt)
+    self.assertIn("multi-span BiDi layout", derived_prompt)
 
 
 if __name__ == "__main__":

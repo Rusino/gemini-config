@@ -87,6 +87,275 @@ def clean_base_title(title: str) -> str:
   return s
 
 
+# Dual-inherits ValueError and RuntimeError so both CLI/API and handoff callers catch it
+class InvalidTopicError(ValueError, RuntimeError):
+  """Raised when a chat topic is empty, single-word, bare entity ID, or overly generic"""
+
+
+# Filler nouns/verbs/adjectives that cannot stand alone without a concrete domain subject
+GENERIC_TOPIC_WORDS = frozenset({
+    "investigation",
+    "investigate",
+    "investigating",
+    "debugging",
+    "debug",
+    "bug",
+    "bugs",
+    "issue",
+    "issues",
+    "task",
+    "tasks",
+    "work",
+    "working",
+    "cl",
+    "pr",
+    "chat",
+    "chats",
+    "conversation",
+    "conversations",
+    "continuation",
+    "continue",
+    "continuing",
+    "unfinished",
+    "general",
+    "misc",
+    "miscellaneous",
+    "question",
+    "questions",
+    "help",
+    "fix",
+    "fixes",
+    "fixing",
+    "update",
+    "updates",
+    "updating",
+    "test",
+    "tests",
+    "testing",
+    "review",
+    "reviews",
+    "reviewing",
+    "analysis",
+    "analyze",
+    "analyzing",
+    "check",
+    "checks",
+    "checking",
+    "todo",
+    "todos",
+    "followup",
+    "follow-up",
+    "new",
+    "current",
+    "project",
+    "projects",
+    "code",
+    "change",
+    "changes",
+    "refactor",
+    "refactoring",
+    "untitled",
+    "handoff",
+    "summary",
+    "state",
+    "исследование",
+    "исследования",
+    "исследованию",
+    "исследованием",
+    "исследовании",
+    "отладка",
+    "отладки",
+    "отладке",
+    "отладку",
+    "отладкой",
+    "вопрос",
+    "вопроса",
+    "вопросу",
+    "вопросом",
+    "вопросе",
+    "вопросы",
+    "вопросов",
+    "задача",
+    "задачи",
+    "задач",
+    "задаче",
+    "задачу",
+    "задачей",
+    "продолжение",
+    "проверка",
+    "проверки",
+    "проверок",
+    "проверке",
+    "проверку",
+    "проверкой",
+    "правки",
+    "правка",
+    "правок",
+    "правкам",
+    "правками",
+    "работа",
+    "работы",
+    "работе",
+    "работу",
+    "работой",
+    "чат",
+    "чаты",
+    "чата",
+    "чату",
+    "чатом",
+    "чате",
+    "чатов",
+    "сл",
+    "пр",
+    "баг",
+    "бага",
+    "багу",
+    "багом",
+    "баге",
+    "баги",
+    "багов",
+    "багам",
+    "багами",
+    "багах",
+    "ошибка",
+    "ошибки",
+    "ошибок",
+    "ошибке",
+    "ошибку",
+    "ошибкой",
+    "тест",
+    "теста",
+    "тесту",
+    "тестом",
+    "тесте",
+    "тесты",
+    "тестов",
+    "тестирование",
+    "ревью",
+    "обновление",
+    "обновления",
+    "изменения",
+    "изменение",
+    "исправление",
+    "исправления",
+    "фикс",
+    "фикса",
+    "фиксу",
+    "фиксом",
+    "фиксе",
+    "фиксы",
+    "фиксов",
+    "анализ",
+    "анализа",
+    "анализу",
+    "анализом",
+    "анализе",
+    "код",
+    "кода",
+    "коду",
+    "кодом",
+    "коде",
+    "рефакторинг",
+    "общий",
+    "общая",
+    "общее",
+    "общие",
+    "разное",
+    "текущий",
+    "текущая",
+    "текущее",
+    "новый",
+    "новая",
+    "новое",
+    "новые",
+})
+
+# Prepositions, conjunctions, and articles ignored when counting meaningful topic words
+TOPIC_STOP_WORDS = frozenset({
+    "a", "an", "the", "of", "in", "on", "at", "to", "for", "with", "from", "by",
+    "about", "into", "onto", "upon", "out", "up", "down", "over", "under",
+    "and", "or", "but", "nor", "so", "yet", "as", "if", "than", "that", "this",
+    "these", "those", "it", "its", "is", "are", "was", "were", "be", "been",
+    "being", "do", "does", "did", "have", "has", "had", "can", "could", "will",
+    "would", "shall", "should", "may", "might", "must", "some", "any", "all",
+    "more", "most", "other", "another", "such", "no", "not", "only", "just",
+    "very", "too", "also",
+    "и", "в", "во", "на", "с", "со", "к", "ко", "по", "из", "от", "до", "для",
+    "о", "об", "обо", "за", "над", "под", "при", "про", "без", "через", "между",
+    "а", "но", "да", "или", "либо", "что", "как", "так", "же", "ли", "бы",
+    "не", "ни", "это", "этот", "эта", "эти", "тот", "та", "те", "весь", "вся",
+    "все", "всё", "мой", "моя", "мои", "наш", "наша", "наши",
+})
+
+# Conversational prompt verbs skipped when extracting subject words from user input
+PROMPT_FILLER_WORDS = frozenset({
+    "please", "look", "see", "can", "you", "lets", "let", "need", "want",
+    "tell", "show", "make", "run", "start", "take", "give", "find", "why",
+    "where", "how", "what", "when", "who", "which",
+    "посмотри", "глянь", "пожалуйста", "плз", "давай", "сделай", "проверь",
+    "нужно", "надо", "покажи", "скажи", "запусти", "разбери", "оцени",
+    "проведи", "почему", "зачем", "когда", "где", "какой", "какие", "там",
+    "тут", "здесь", "сейчас", "происходит",
+})
+
+# Collapses bare entity references into one token so "PR #123" or "cl/123" counts as 1 word
+_ENTITY_UNIT_RE = re.compile(
+    r"\b(?:cl|b|crbug(?:\.com)?)/\d+\b"
+    r"|\b(?:PR|Issue|CL|СЛ|сл|bug|баг)\s*(?:#|:|\s)\s*\d+\b"
+    r"|\b(?:commit|коммит|sha|rev|revision)\s*(?:#|:|\s)\s*[0-9a-f]{7,40}\b",
+    re.IGNORECASE,
+)
+_TOPIC_WORD_RE = re.compile(
+    r"[A-Za-zА-Яа-яЁё0-9_]+(?:[-.][A-Za-zА-Яа-яЁё0-9_]+)*"
+)
+
+
+# Returns (all_tokens, content_tokens, non_generic_tokens) after collapsing entity IDs
+def _analyze_topic_tokens(topic: str) -> tuple[list[str], list[str], list[str]]:
+  clean = clean_base_title(topic)
+  if not clean:
+    return [], [], []
+  normalized = re.sub(r"\bfollow-up\b", "followup", clean, flags=re.IGNORECASE)
+  normalized = _ENTITY_UNIT_RE.sub("ENTITY_ID_TOKEN", normalized)
+  tokens = _TOPIC_WORD_RE.findall(normalized)
+  content = [t for t in tokens if t.lower() not in TOPIC_STOP_WORDS]
+  non_generic = [
+      t
+      for t in content
+      if t != "ENTITY_ID_TOKEN" and t.lower() not in GENERIC_TOPIC_WORDS
+  ]
+  return tokens, content, non_generic
+
+
+def is_valid_chat_topic(topic: str) -> bool:
+  """True if topic has >= 2 meaningful words and is not purely generic or a bare entity ID"""
+  tokens, content, non_generic = _analyze_topic_tokens(topic)
+  if len(tokens) < 2 or len(content) < 2:
+    return False
+  return bool(non_generic)
+
+
+def validate_chat_topic(topic: str) -> str:
+  """Returns cleaned topic if valid, or raises InvalidTopicError with actionable guidance"""
+  clean = clean_base_title(topic)
+  tokens, content, non_generic = _analyze_topic_tokens(clean)
+  if not clean or len(tokens) < 2 or len(content) < 2:
+    raise InvalidTopicError(
+        f"Invalid chat title topic {clean!r}: single-word titles and bare entity IDs are"
+        " forbidden. Pass a specific 2-6 word topic (< 50 chars) naming the concrete"
+        ' subsystem/feature/bug/PR/CL and action (e.g. "PR #194980 multi-span BiDi",'
+        ' "FontCollection FaceCache thread safety").'
+    )
+  if not non_generic:
+    raise InvalidTopicError(
+        f"Invalid chat title topic {clean!r}: overly generic title composed only of"
+        " filler words. Pass a specific 2-6 word topic (< 50 chars) naming the concrete"
+        ' subsystem/feature/bug/PR/CL and action (e.g. "PR #194980 multi-span BiDi",'
+        ' "FontCollection FaceCache thread safety").'
+    )
+  return clean
+
+
 def find_app_data_dirs() -> list[str]:
   res = []
   env_dir = os.environ.get("ANTIGRAVITY_APP_DATA_DIR")
@@ -1084,6 +1353,211 @@ def is_waiting_title(title: str) -> bool:
   return parse_title_marker(title or "") == MARKER_WAITING
 
 
+_USER_REQ_TAG_RE = re.compile(r"<USER_REQUEST>(.*?)</USER_REQUEST>", re.DOTALL)
+_CLEAN_PREFIX_RE = re.compile(
+    r"^(?:Chain\s+State|Handoff\s+Summary|Summary|State|Goal|Immediate\s+Next\s+Step"
+    r"|Next\s+immediate\s+task|Next\s+task)\s*:\s*",
+    re.IGNORECASE,
+)
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_URL_OR_FILE_RE = re.compile(r"(?:https?://|file://)\S+")
+
+
+def _clean_candidate_topic(text: str, max_len: int = 38) -> str:
+  """Sanitizes raw prompt or state lines into a concise candidate chat topic."""
+  if not text:
+    return ""
+  m_tag = _USER_REQ_TAG_RE.search(text)
+  raw = m_tag.group(1) if m_tag else text
+  raw = _MD_LINK_RE.sub(r"\1", raw)
+  raw = _URL_OR_FILE_RE.sub(" ", raw)
+  raw = re.sub(r"[`#*_-]", " ", raw)
+  first_line = raw.strip().splitlines()[0] if raw.strip() else ""
+  first_line = _CLEAN_PREFIX_RE.sub("", first_line).strip()
+  if not first_line:
+    return ""
+  # If the first clause before dash, colon or semicolon is already a valid topic, prefer it
+  parts = re.split(r"\s+[—–-]\s+|[:;\n(]", first_line, maxsplit=1)
+  if len(parts) > 1 and is_valid_chat_topic(parts[0].strip()):
+    first_line = parts[0].strip()
+  tokens = [
+      t
+      for t in _TOPIC_WORD_RE.findall(first_line)
+      if t.lower() not in TOPIC_STOP_WORDS
+  ]
+  if not tokens:
+    return ""
+  # Truncate at word boundary to <= 6 words and <= max_len characters
+  words = first_line.split()[:6]
+  res = ""
+  for w in words:
+    cand = f"{res} {w}".strip() if res else w
+    if len(cand) > max_len:
+      break
+    res = cand
+  return res.rstrip()
+
+
+def _extract_prompt_subject_words(text: str, max_words: int = 4) -> str:
+  """Extracts non-generic domain tokens from a prompt following an entity identifier."""
+  if not text:
+    return ""
+  m_tag = _USER_REQ_TAG_RE.search(text)
+  raw = m_tag.group(1) if m_tag else text
+  raw = _PASTED_LIFECYCLE_TITLE_RE.sub(" ", raw)
+  raw = _URL_OR_FILE_RE.sub(" ", raw)
+  raw = _ENTITY_GERRIT_MENTION_RE.sub(" ", raw)
+  raw = _ENTITY_UNIT_RE.sub(" ", raw)
+  tokens = _TOPIC_WORD_RE.findall(raw)
+  subject_tokens: list[str] = []
+  for t in tokens:
+    low = t.lower()
+    if (
+        low in TOPIC_STOP_WORDS
+        or low in PROMPT_FILLER_WORDS
+        or low in GENERIC_TOPIC_WORDS
+        or re.match(r"^\d+$", t)
+        or UUID_RE.match(t)
+    ):
+      continue
+    subject_tokens.append(t)
+    if len(subject_tokens) >= max_words:
+      break
+  res = " ".join(subject_tokens)
+  return res[:32].rstrip()
+
+
+def _first_user_prompt_text(conv_id: str) -> str:
+  if not conv_id:
+    return ""
+  for app_dir in find_app_data_dirs():
+    tr_path = os.path.join(
+        app_dir,
+        "brain",
+        conv_id,
+        ".system_generated",
+        "logs",
+        "transcript.jsonl",
+    )
+    if os.path.isfile(tr_path):
+      try:
+        with open(tr_path, "r", encoding="utf-8") as f:
+          for line in f:
+            if '"USER_INPUT"' not in line:
+              continue
+            try:
+              obj = json.loads(line)
+            except Exception:
+              continue
+            if obj.get("type") == "USER_INPUT":
+              content = str(obj.get("content") or "")
+              if (
+                  HANDOFF_PARENT_RE.search(content)
+                  or "Continuing unfinished work from previous conversation"
+                  in content
+              ):
+                return ""
+              m_tag = _USER_REQ_TAG_RE.search(content)
+              return (m_tag.group(1) if m_tag else content).strip()
+      except Exception:
+        pass
+  return ""
+
+
+def derive_fallback_topic(
+    conv_id: str,
+    state_file: str = "",
+    notes: str = "",
+    next_step: str = "",
+    prompt: str = "",
+) -> str:
+  """Derives a concrete 2-6 word topic (< 50 chars) from chain, state file, roadmap, or prompt."""
+  # Priority 1: Non-generic title already present on conv_id or its ancestor chain
+  if conv_id:
+    cur_t = clean_base_title(get_conversation_title(conv_id))
+    if is_valid_chat_topic(cur_t):
+      return cur_t
+    chain = discover_conversation_chain(conv_id, include_descendants=False)
+    for cid in reversed(chain):
+      cand_t = clean_base_title(get_conversation_title(cid))
+      if is_valid_chat_topic(cand_t):
+        return cand_t
+
+  # Priority 2: Chain state file or handoff summary heading / Goal
+  candidate_files: list[str] = []
+  if state_file and os.path.isfile(state_file):
+    candidate_files.append(state_file)
+  pid = get_conversation_project_id(conv_id) if conv_id else ""
+  in_project = bool(pid) and pid != "outside-of-project"
+  if in_project:
+    try:
+      import roadmap
+
+      sf = roadmap.state_path(pid, conv_id)
+      if os.path.isfile(sf) and sf not in candidate_files:
+        candidate_files.append(sf)
+    except Exception:
+      pass
+  if conv_id:
+    for app_dir in find_app_data_dirs():
+      brain_dir = os.path.join(app_dir, "brain", conv_id)
+      if os.path.isdir(brain_dir):
+        for fn in sorted(os.listdir(brain_dir)):
+          if "handoff_summary" in fn and fn.endswith(".md"):
+            candidate_files.append(os.path.join(brain_dir, fn))
+
+  for fpath in candidate_files:
+    try:
+      with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+        lines = f.readlines()
+      for line in lines[:15]:
+        line_s = line.strip()
+        if line_s.startswith("# ") or line_s.startswith("## Goal"):
+          cleaned = line_s.lstrip("#").strip()
+          if cleaned.lower().startswith("goal"):
+            cleaned = re.sub(
+                r"^goal\s*:\s*", "", cleaned, flags=re.IGNORECASE
+            ).strip()
+          cand = _clean_candidate_topic(cleaned)
+          if is_valid_chat_topic(cand):
+            return cand
+    except Exception:
+      continue
+
+  # Priority 3: Active doing roadmap item owned by or linked to conv_id
+  if in_project:
+    try:
+      import roadmap
+
+      doc = roadmap.load(pid)
+      for it in doc.get("items", []):
+        if it.get("status") == "doing" and (
+            it.get("owner") == conv_id or it.get("link") == conv_id
+        ):
+          cand = f"{it['id']} {_clean_candidate_topic(it.get('text', ''), 32)}".strip()
+          if is_valid_chat_topic(cand):
+            return cand
+    except Exception:
+      pass
+
+  # Priority 4: Concise topic from next_step, notes, prompt, or first user prompt
+  first_prompt = _first_user_prompt_text(conv_id) if conv_id else ""
+  for candidate_text in (next_step, notes, prompt, first_prompt):
+    if not candidate_text:
+      continue
+    ent = extract_entity_topic(candidate_text)
+    subj = _extract_prompt_subject_words(candidate_text)
+    if ent and subj:
+      combined = f"{ent} {subj}"[:42].rstrip()
+      if is_valid_chat_topic(combined):
+        return combined
+    cand = _clean_candidate_topic(candidate_text)
+    if is_valid_chat_topic(cand):
+      return cand
+
+  return ""
+
+
 # Switches or toggles an open leaf chat between ⦿ (Needs Me) and ⏳ (Waiting External/Cron)
 def set_conversation_wait_state(
     conv_id: str, waiting: bool | None = None
@@ -1098,7 +1572,12 @@ def set_conversation_wait_state(
   target_waiting = (not is_waiting_title(cur_title)) if waiting is None else bool(waiting)
   target_marker = MARKER_WAITING if target_waiting else MARKER_ACTIVE
   ts = extract_time_prefix(cur_title, get_current_time_str())
-  base = clean_base_title(cur_title) or "Investigation"
+  raw_base = clean_base_title(cur_title)
+  base = (
+      raw_base
+      if (raw_base and raw_base.lower() not in GENERIC_TOPIC_WORDS)
+      else (derive_fallback_topic(conv_id) or raw_base or f"Chat {conv_id[:8]}")
+  )
   new_title = f"[{ts}] {target_marker} {base}"
   if cur_title != new_title:
     update_conversation_title(conv_id, new_title)
@@ -1113,19 +1592,26 @@ def reopen_conversation(conv_id: str) -> bool:
     return False
   if parse_title_marker(cur_title) not in (MARKER_ACTIVE, MARKER_WAITING):
     ts = extract_time_prefix(cur_title, get_current_time_str())
-    update_conversation_title(
-        conv_id, f"[{ts}] {MARKER_ACTIVE} {clean_base_title(cur_title) or 'Investigation'}"
+    raw_base = clean_base_title(cur_title)
+    base = (
+        raw_base
+        if (raw_base and raw_base.lower() not in GENERIC_TOPIC_WORDS)
+        else (derive_fallback_topic(conv_id) or raw_base or f"Chat {conv_id[:8]}")
     )
+    update_conversation_title(conv_id, f"[{ts}] {MARKER_ACTIVE} {base}")
   return True
 
 
 def set_conversation_topic(
-    conv_id: str, topic: str, marker: str = ""
+    conv_id: str, topic: str, marker: str = "", validate: bool = True
 ) -> str:
   """Sets the topic for a conversation, formatting as `[HH:MM] <marker> <clean_topic>`."""
-  clean = clean_base_title(topic)
-  if not clean:
-    clean = "Investigation"
+  if validate:
+    clean = validate_chat_topic(topic)
+  else:
+    clean = clean_base_title(topic)
+    if not clean:
+      raise InvalidTopicError("Topic must not be empty")
   # Keep ⏳ when the caller does not pick a marker; renaming must not wake a cron chat
   if not marker:
     cur_marker = parse_title_marker(get_conversation_title(conv_id))
@@ -1225,13 +1711,20 @@ def auto_title_conversation(conv_id: str, prompt: str) -> str:
   if not conv_id or not prompt:
     return ""
   cur_title = get_conversation_title(conv_id)
-  # Respect existing time prefix: never overwrite a chat that is already titled
-  if cur_title and TIME_PREFIX_RE.match(cur_title.strip()):
+  cur_base = clean_base_title(cur_title)
+  # Respect existing valid title: never overwrite a chat that already
+  # has a specific multi-word topic
+  if cur_title and TIME_PREFIX_RE.match(cur_title.strip()) and is_valid_chat_topic(cur_base):
     return ""
-  topic = extract_entity_topic(prompt)
-  if not topic:
+  entity = extract_entity_topic(prompt)
+  if not entity:
     return ""
-  return set_conversation_topic(conv_id, topic)
+  subj = _extract_prompt_subject_words(prompt, max_words=3)
+  topic = f"{entity} {subj}"[:42].rstrip() if subj else entity
+  if cur_base == topic and TIME_PREFIX_RE.match((cur_title or "").strip()):
+    return ""
+  # Use validate=False so single-word/bare-entity auto-titles set the base topic without crashing
+  return set_conversation_topic(conv_id, topic, validate=False)
 
 
 def get_handoff_summary_path(conv_id: str, topic: str = "") -> str:
@@ -1240,7 +1733,7 @@ def get_handoff_summary_path(conv_id: str, topic: str = "") -> str:
     return ""
   if not topic:
     cur_title = get_conversation_title(conv_id)
-    topic = clean_base_title(cur_title) or "Investigation"
+    topic = clean_base_title(cur_title) or derive_fallback_topic(conv_id) or conv_id[:8]
   slug = re.sub(r"[^\w\-]+", "_", topic, flags=re.UNICODE).strip("_")[:40]
   filename = f"handoff_summary_{slug}_{conv_id[:8]}.md"
 
@@ -1395,14 +1888,7 @@ def create_handoff(
   if not ignore_live:
     _refuse_live_dependents("handoff", current_conv_id)
 
-  # 1. Determine base topic and new continuation title
-  if not new_topic:
-    cur_title = get_conversation_title(current_conv_id)
-    new_topic = clean_base_title(cur_title) or "Investigation"
-  time_str = get_current_time_str()
-  cont_title = f"[{time_str}] {MARKER_ACTIVE} {new_topic}"
-
-  # 2. Determine project ID to preserve
+  # 1. Determine project ID to preserve
   project_id = get_conversation_project_id(current_conv_id)
   in_project = bool(project_id) and project_id != "outside-of-project"
 
@@ -1439,6 +1925,28 @@ def create_handoff(
           " state with evidence, failed hypotheses, running tasks, exact next step) or pass --notes"
       )
     summary_file = state_file
+
+  # 2. Determine base topic and new continuation title
+  if new_topic:
+    new_topic = validate_chat_topic(new_topic)
+  else:
+    cur_title = get_conversation_title(current_conv_id)
+    cur_base = clean_base_title(cur_title)
+    if is_valid_chat_topic(cur_base):
+      new_topic = cur_base
+    else:
+      derived = derive_fallback_topic(
+          current_conv_id,
+          state_file=summary_file if in_project else "",
+          notes=notes,
+          next_step=next_step_prompt,
+      )
+      new_topic = validate_chat_topic(derived or cur_base)
+
+  time_str = get_current_time_str()
+  cont_title = f"[{time_str}] {MARKER_ACTIVE} {new_topic}"
+
+  if in_project:
     prompt = (
         f"Continuing unfinished work from previous conversation (conversation://{current_conv_id}). "
         f"First run `python3 ~/.gemini/config/hooks/roadmap.py show`, then read your chain state file "
@@ -1741,16 +2249,16 @@ def create_next_task(
 
   item_text = target_item["text"]
   if new_topic:
-    clean_topic = clean_base_title(new_topic)
+    clean_topic = validate_chat_topic(new_topic)
   else:
     entity = extract_entity_topic(item_text)
-    clean_topic = (
-        f"{norm_id} {entity}"
-        if entity
-        else f"{norm_id} {item_text}"[:38].rstrip()
-    )
-  if not clean_topic:
-    clean_topic = norm_id
+    if entity:
+      clean_topic = f"{norm_id} {entity}"
+    else:
+      cand_topic = _clean_candidate_topic(item_text, 34)
+      clean_topic = f"{norm_id} {cand_topic}"[:38].rstrip()
+  if not is_valid_chat_topic(clean_topic):
+    clean_topic = f"{norm_id} Task"
   time_str = get_current_time_str()
   cont_title = f"[{time_str}] {MARKER_ACTIVE} {clean_topic}"
 
@@ -2346,12 +2854,14 @@ def audit_conversations(
     audited_chats += len(chain)
 
     # Determine chain base topic (for fallback if a node has empty title)
-    chain_topic = "Investigation"
+    chain_topic = ""
     for cid in reversed(chain):
       t = clean_base_title(_BestTitle(cid))
-      if t and t != "Investigation":
+      if is_valid_chat_topic(t):
         chain_topic = t
         break
+    if not chain_topic and chain:
+      chain_topic = derive_fallback_topic(chain[-1])
 
     for idx, cid in enumerate(chain):
       cur_title = _BestTitle(cid)
@@ -2385,7 +2895,12 @@ def audit_conversations(
       open_leaf_marker = MARKER_WAITING if marker == MARKER_WAITING else MARKER_ACTIVE
       fallback_hhmm = _iso_to_hhmm(created_at_of.get(cid, "")) or get_current_time_str()
       ts = extract_time_prefix(cur_title, fallback_hhmm)
-      base = clean_base_title(cur_title) or chain_topic
+      raw_base = clean_base_title(cur_title)
+      base = (
+          raw_base
+          if is_valid_chat_topic(raw_base)
+          else (chain_topic or derive_fallback_topic(cid) or raw_base or f"Chat {cid[:8]}")
+      )
       expected_title = f"[{ts}] {open_leaf_marker} {base}"
 
       pb_t = pbtxt_titles.get(cid, "")
@@ -2399,6 +2914,9 @@ def audit_conversations(
       if ls_online and ls_t != expected_title and not valid_title_re.match(ls_t):
         if "marker_mismatch" not in issues:
           issues.append("ls_marker_mismatch")
+
+      if not is_valid_chat_topic(raw_base):
+        issues.append("generic_or_single_word_title")
 
       present_stores = [t for t in (pb_t, db_t) if t]
       if ls_online:
@@ -2697,7 +3215,10 @@ def main(argv: list[str] | None = None) -> int:
     cid = _require_conversation_id("set-title", args[0] if args else "")
     topic = args[1] if len(args) > 1 else ""
     marker = args[2] if len(args) > 2 else MARKER_ACTIVE
-    new_t = set_conversation_topic(cid, topic, marker)
+    try:
+      new_t = set_conversation_topic(cid, topic, marker)
+    except InvalidTopicError as exc:
+      _cli_fail("set-title", str(exc))
     print(f"Updated title for {cid}: {new_t}")
   elif cmd == "auto-title":
     cid = _require_conversation_id("auto-title", args[0] if args else "")
@@ -2776,31 +3297,37 @@ def main(argv: list[str] | None = None) -> int:
   elif cmd == "handoff":
     opts = parse_handoff_args(args)
     cid = _require_conversation_id("handoff", opts["cid"] or _env_conversation_id())
-    result = create_handoff(
-        cid,
-        summary_file=opts["summary"],
-        notes=opts["notes"],
-        next_step_prompt=opts["next_step"],
-        new_topic=opts["new_topic"],
-        exact_model=opts["exact_model"],
-        force=opts["force"],
-        ignore_live=opts["ignore_live"],
-    )
+    try:
+      result = create_handoff(
+          cid,
+          summary_file=opts["summary"],
+          notes=opts["notes"],
+          next_step_prompt=opts["next_step"],
+          new_topic=opts["new_topic"],
+          exact_model=opts["exact_model"],
+          force=opts["force"],
+          ignore_live=opts["ignore_live"],
+      )
+    except InvalidTopicError as exc:
+      _cli_fail("handoff", str(exc))
     print_handoff_result(result)
   # Transition to a new root chat for the next roadmap item while closing the current chain
   elif cmd == "next-task":
     opts = parse_next_task_args(args)
     cid = _require_conversation_id("next-task", opts["cid"] or _env_conversation_id())
-    result = create_next_task(
-        cid,
-        item_id=opts["item_id"],
-        new_topic=opts["new_topic"],
-        notes=opts["notes"],
-        next_step_prompt=opts["next_step"],
-        exact_model=opts["exact_model"],
-        force=opts["force"],
-        ignore_live=opts["ignore_live"],
-    )
+    try:
+      result = create_next_task(
+          cid,
+          item_id=opts["item_id"],
+          new_topic=opts["new_topic"],
+          notes=opts["notes"],
+          next_step_prompt=opts["next_step"],
+          exact_model=opts["exact_model"],
+          force=opts["force"],
+          ignore_live=opts["ignore_live"],
+      )
+    except InvalidTopicError as exc:
+      _cli_fail("next-task", str(exc))
     print_handoff_result(result)
   elif cmd == "audit":
     do_fix = False

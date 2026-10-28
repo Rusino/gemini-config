@@ -529,13 +529,14 @@ def analyze_current_turn(transcript_path: str) -> dict:
   last_edited_file = ""
   last_cmd_idx = -1
   last_cmd_exit_code = None
-  pending_cmds: list[tuple[int, bool, bool, bool, bool]] = []
+  pending_cmds: list[tuple[int, bool, bool, bool, bool, bool]] = []
   launched_new_conv = False
   scheduled_timer = False
   asked_question = False
   roadmap_done_idx = -1
   vcs_baton_lines: list[str] = []
   git_publish_after_done = False
+  set_title_succeeded = False
 
   for idx in ordered_indices:
     if idx <= last_user_idx:
@@ -568,16 +569,22 @@ def analyze_current_turn(transcript_path: str) -> dict:
           is_handoff = is_handoff_launch_command(cmd)
           is_cli = is_chat_lifecycle_handoff_command(cmd) if is_handoff else False
           is_rm_done = is_roadmap_set_done_command(cmd)
+          is_set_title = bool(re.search(r"\bchat_lifecycle\.py\s+set-title\b", cmd))
           is_git_pub = bool(
               re.search(
                   r"\b(?:git(?:\s+(?:-[Cc]\s+\S+|--[a-z-]+(?:=\S+)?))*\s+(?:push|commit|cl\s+upload)|gh\s+pr\s+create)\b",
                   cmd,
               )
           )
-          if not is_handoff and not is_rm_done and is_inspection_command(cmd):
+          if (
+              not is_handoff
+              and not is_rm_done
+              and not is_set_title
+              and is_inspection_command(cmd)
+          ):
             continue
           last_cmd_idx = idx
-          pending_cmds.append((idx, is_handoff, is_cli, is_rm_done, is_git_pub))
+          pending_cmds.append((idx, is_handoff, is_cli, is_rm_done, is_git_pub, is_set_title))
 
     elif stype == "GENERIC" and pending_cmds:
       content = str(step.get("content", ""))
@@ -585,7 +592,7 @@ def analyze_current_turn(transcript_path: str) -> dict:
         continue
       m = EXIT_CODE_RE.search(content)
       if m:
-        c_idx, is_handoff, is_cli, is_rm_done, is_git_pub = pending_cmds.pop(0)
+        c_idx, is_handoff, is_cli, is_rm_done, is_git_pub, is_set_title = pending_cmds.pop(0)
         code = int(m.group(1))
         if last_cmd_exit_code is None or code != 0 or not pending_cmds:
           last_cmd_exit_code = code
@@ -608,6 +615,8 @@ def analyze_current_turn(transcript_path: str) -> dict:
               vcs_baton_lines.append(ln.strip())
         if is_git_pub and code == 0 and roadmap_done_idx >= 0 and c_idx >= roadmap_done_idx:
           git_publish_after_done = True
+        if is_set_title and code == 0:
+          set_title_succeeded = True
 
     # Keep cron chats marked as scheduled across recurring wakeup ticks
     elif stype == "SYSTEM_MESSAGE":
@@ -626,6 +635,7 @@ def analyze_current_turn(transcript_path: str) -> dict:
       "roadmap_done_idx": roadmap_done_idx,
       "vcs_baton_lines": vcs_baton_lines,
       "git_publish_after_done": git_publish_after_done,
+      "set_title_succeeded": set_title_succeeded,
   }
 
 
@@ -667,6 +677,29 @@ def vcs_baton_guard_reason(
       "`(Recommended) Commit + push`, `Commit only`, `Not now` "
       "(remember: stage/commit ONLY your own touched files with explicit pathspecs; for Gerrit repos, "
       "`Commit + push` runs `amnesia-precommit` + mandatory corpus gate + `git cl upload`, never CQ)."
+  )
+
+
+def title_guard_reason(info: dict, state: dict, conv_id: str) -> str:
+  if info.get("set_title_succeeded"):
+    return ""
+  if not state.get("pending_title_guard"):
+    return ""
+  try:
+    from chat_lifecycle import clean_base_title, get_conversation_title, is_valid_chat_topic
+
+    cur_title = get_conversation_title(conv_id)
+    if is_valid_chat_topic(clean_base_title(cur_title)):
+      return ""
+  except Exception:
+    return ""
+  return (
+      f"[TITLE GUARD] This conversation still has a missing, single-word, or overly generic "
+      f"title ({cur_title or 'untitled'!r}). Before finishing your turn, run "
+      f"`python3 ~/.gemini/config/hooks/chat_lifecycle.py set-title {conv_id} "
+      '"<Concrete 2-6 word topic>"` (< 50 chars, naming the concrete '
+      "subsystem/feature/bug/PR/CL and action; never single-word or generic like "
+      "'Investigation' or 'Debugging')."
   )
 
 
@@ -859,6 +892,25 @@ def main() -> None:
     print(
         json.dumps(
             {"decision": "continue", "reason": vcs_reason},
+            ensure_ascii=False,
+        )
+    )
+    return
+
+  if state.get("pending_title_guard") and info.get("set_title_succeeded"):
+    state.pop("pending_title_guard", None)
+    save_state(state_path, state)
+
+  t_reason = title_guard_reason(info, state, conv_id)
+  if (
+      t_reason
+      and state.get("title_guard_blocked_turn") != info.get("last_user_idx", -1)
+  ):
+    state["title_guard_blocked_turn"] = info.get("last_user_idx", -1)
+    save_state(state_path, state)
+    print(
+        json.dumps(
+            {"decision": "continue", "reason": t_reason},
             ensure_ascii=False,
         )
     )

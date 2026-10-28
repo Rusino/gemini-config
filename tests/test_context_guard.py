@@ -42,7 +42,7 @@ class TestContextGuard(unittest.TestCase):
     })
     self.env.start()
     self.db_info = patch.object(
-        context_guard, "get_conversation_db_info", return_value=("[10:00] ⦿ Task", "proj-1")
+        context_guard, "get_conversation_db_info", return_value=("[10:00] ⦿ Sample Task", "proj-1")
     )
     self.mock_db = self.db_info.start()
     self.rpc = patch.object(chat_lifecycle, "ls_rpc", return_value=gm_response(1000))
@@ -579,6 +579,35 @@ class TestContextGuard(unittest.TestCase):
     with patch.object(chat_lifecycle, "set_conversation_wait_state") as mock_wait:
       self.run_guard(inv=1, lastUserInput="wait 60s")
       mock_wait.assert_not_called()
+
+  def test_title_guard_triggers_on_generic_or_bare_entity_title(self):
+    # Generic title triggers title guard notice
+    with patch.object(
+        context_guard,
+        "get_conversation_db_info",
+        return_value=("[10:00] ⦿ Investigation", "proj-1"),
+    ):
+      res = self.run_guard(inv=0, lastUserInput="Look at the code")
+      self.assertTrue(
+          any(
+              "[TITLE GUARD: CONCRETE TOPIC REQUIRED]" in s.get("ephemeralMessage", "")
+              for s in res.get("injectSteps", [])
+          )
+      )
+
+    # Valid multi-word title does not trigger title guard notice
+    with patch.object(
+        context_guard,
+        "get_conversation_db_info",
+        return_value=("[10:00] ⦿ Sample Feature Work", "proj-1"),
+    ):
+      res = self.run_guard(inv=0, lastUserInput="Look at the code")
+      self.assertFalse(
+          any(
+              "[TITLE GUARD: CONCRETE TOPIC REQUIRED]" in s.get("ephemeralMessage", "")
+              for s in res.get("injectSteps", [])
+          )
+      )
 
 
 if __name__ == "__main__":

@@ -20,6 +20,17 @@ echo "ID=$ID" && agentapi get-conversation-metadata "$ID" | grep -E '"sourceMeta
 
 - **One project = one task.** Every non-trivial task lives in its own project; all its chats (including handoff continuations) stay inside that project (`ANTIGRAVITY_PROJECT_ID` is inherited automatically by `handoff`). A project is only a grouping — do not clone or re-sync repositories per task.
 - **Format**: `[HH:MM] <marker> <Topic>` — strictly under 50 chars, plain text only, no project prefix, include short PR/CL/bug/commit ID when applicable. The time prefix and marker (`⦿` needs the user, `⏳` waiting) are mechanical side effects of `chat_lifecycle.py` — **never type or choose markers yourself**. Finished chats and handed-off chain pieces carry no special marker: they are archived (hidden from the sidebar, still found by search and opened by `conversation://`).
+- **Concrete 2–6 word topics required (< 50 chars)**: `<Topic>` must consist of 2–6 specific
+  words naming the concrete subsystem/component/bug/CL/PR and problem or action (e.g.
+  `PR #194980 multi-span BiDi`, `FontCollection FaceCache thread safety`,
+  `R27 Ban generic chat titles`).
+  - **Strictly forbidden**: single-word titles (`Investigation`, `Debugging`, `Perf`, `Skia`),
+    bare entity IDs without a subject (`cl/1405639`, `PR #12345`), and generic filler combinations
+    (`Bug investigation`, `Code review`, `Fix issue`, `Task continuation`, `Исследование бага`).
+  - `set-title`, `handoff`, and `next-task` validate `<Topic>` via `validate_chat_topic` and raise
+    an error on generic/single-word topics (`handoff` derives a fallback from the chain state file
+    or roadmap if needed). `context_guard` and `stop_guard` enforce titling on the first turn
+    with `[TITLE GUARD]`.
 
 Use only these commands (`python3 ~/.gemini/config/hooks/chat_lifecycle.py ...`):
 

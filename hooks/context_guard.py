@@ -1213,8 +1213,14 @@ def build_continuation_title(conv_id: str, fallback_text: str = "") -> str:
   except Exception:
     time_str = datetime.now().strftime("%H:%M")
 
-  if base_title:
+  import chat_lifecycle
+
+  clean_topic = chat_lifecycle.clean_base_title(base_title)
+  if chat_lifecycle.is_valid_chat_topic(clean_topic):
     return f"[{time_str}] {base_title}"
+  derived = chat_lifecycle.derive_fallback_topic(conv_id, prompt=fallback_text)
+  if chat_lifecycle.is_valid_chat_topic(derived):
+    return f"[{time_str}] ⦿ {derived}"
   return f"[{time_str}] <Chat Title>"
 
 
@@ -1345,6 +1351,15 @@ TASKS_NOTE = (
 
 
 def handoff_steps(conv_id: str, target: dict, new_title: str) -> str:
+  import chat_lifecycle
+
+  raw_cur, _ = get_conversation_db_info(conv_id)
+  cur_base = chat_lifecycle.clean_base_title(raw_cur)
+  topic_opt = (
+      ""
+      if chat_lifecycle.is_valid_chat_topic(cur_base)
+      else ' --topic "<Concrete 2-6 word topic>"'
+  )
   if target["in_project"]:
     return (
         f"1. Roadmap: `python3 {ROADMAP_CLI} set {conv_id} <ID> done|doing|todo`"
@@ -1354,7 +1369,7 @@ def handoff_steps(conv_id: str, target: dict, new_title: str) -> str:
         " goal, current state with evidence (modified files, last build/test"
         " result), failed hypotheses, running subagents/background tasks and how"
         " to restart them, exact next step. It moves to the continuation as is.\n"
-        f'3. Run `python3 {LIFECYCLE_CLI} handoff {conv_id} --next "<1-line next'
+        f'3. Run `python3 {LIFECYCLE_CLI} handoff {conv_id}{topic_opt} --next "<1-line next'
         ' action>"`.\n'
         "4. In your final message paste the roadmap block from the handoff output"
         f" and the link `[👉 {new_title}](conversation://<new_conversation_id>)`,"
@@ -1366,7 +1381,7 @@ def handoff_steps(conv_id: str, target: dict, new_title: str) -> str:
       " earlier handoffs), modified files, failed hypotheses, running"
       " subagents/background tasks and how to restart them, exact next step,"
       f" link `[Previous Conversation](conversation://{conv_id})`.\n"
-      f'2. Run `python3 {LIFECYCLE_CLI} handoff {conv_id} "{target["file"]}"'
+      f'2. Run `python3 {LIFECYCLE_CLI} handoff {conv_id} "{target["file"]}"{topic_opt}'
       ' --next "<1-line next action>"`.\n'
       f"3. End the turn with the link `[👉 {new_title}](conversation://<new_conversation_id>)`."
   )
@@ -1446,7 +1461,8 @@ def run(data: dict, log: dict) -> dict:
     # applied mechanically only by `chat_lifecycle.py` (set-title / handoff /
     # finalize / reopen), never inferred from user wording.
 
-    # Auto-title untitled chat when prompt mentions a PR, CL, bug, or commit
+    # Auto-title untitled chat when prompt mentions a PR, CL, bug, or commit,
+    # and enforce concrete 2-6 word titles (< 50 chars) on all top-level chats
     if last_user_input and conv_id:
       try:
         import chat_lifecycle
@@ -1457,12 +1473,46 @@ def run(data: dict, log: dict) -> dict:
         auto_title = chat_lifecycle.auto_title_conversation(conv_id, title_source)
         if auto_title:
           log["auto_title"] = auto_title
-          state["auto_title_notice"] = (
-              f"[TITLE GUARD] Conversation title automatically set to '{auto_title}' "
-              f"based on the entity in your prompt. You may refine the topic description via "
-              f"'python3 {LIFECYCLE_CLI} set-title {conv_id} \"<Topic>\"' if needed."
-          )
+
+        cur_t = (
+            auto_title
+            or get_conversation_db_info(conv_id, transcript_path)[0]
+            or chat_lifecycle.get_conversation_title(conv_id)
+        )
+        cur_base = chat_lifecycle.clean_base_title(cur_t)
+        is_handoff_cont = (
+            "Continuing unfinished work from previous conversation" in last_user_input
+            or bool(chat_lifecycle.HANDOFF_PARENT_RE.search(last_user_input))
+        )
+        if not is_handoff_cont and not chat_lifecycle.is_valid_chat_topic(cur_base):
+          state["pending_title_guard"] = True
+          if auto_title:
+            state["auto_title_notice"] = (
+                f"[TITLE GUARD: CONCRETE TOPIC REQUIRED] Conversation title was provisionally set "
+                f"to '{auto_title}', which is only a bare ID. Before ending this turn, "
+                f"you MUST run `python3 {LIFECYCLE_CLI} set-title {conv_id} "
+                f'"{cur_base} <2-4 word subject>"` with a specific 2-6 word topic '
+                "(< 50 chars). Single-word and generic titles are forbidden."
+            )
+          else:
+            state["auto_title_notice"] = (
+                f"[TITLE GUARD: CONCRETE TOPIC REQUIRED] Current chat title "
+                f"({cur_t or 'untitled'!r}) is missing, single-word, or generic. "
+                f"Before ending this turn, you MUST run "
+                f"`python3 {LIFECYCLE_CLI} set-title {conv_id} \"<Concrete 2-6 word topic>\"` "
+                f"(< 50 chars, naming the specific subsystem/bug/PR/CL and action)."
+            )
           save_state(state_path, state)
+        elif chat_lifecycle.is_valid_chat_topic(cur_base):
+          if auto_title:
+            state["auto_title_notice"] = (
+                f"[TITLE GUARD] Conversation title automatically set to '{auto_title}' "
+                f"based on the entity and subject in your prompt. You may refine the "
+                f"topic description via "
+                f"'python3 {LIFECYCLE_CLI} set-title {conv_id} \"<Topic>\"' if needed."
+            )
+            save_state(state_path, state)
+          state.pop("pending_title_guard", None)
       except Exception as e:
         log["auto_title_err"] = str(e)[:200]
 
@@ -1712,6 +1762,8 @@ def run(data: dict, log: dict) -> dict:
       "last_blocked_edit_idx",
       "auto_title_notice",
       "auto_waiting_schedule",
+      "pending_title_guard",
+      "title_guard_blocked_turn",
   ):
     if k in state:
       new_state[k] = state[k]

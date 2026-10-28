@@ -932,6 +932,39 @@ class TestStopGuard(unittest.TestCase):
         stop_guard.main()
       self.assertEqual(json.loads(mock_out.getvalue()), {})
 
+  def test_title_guard_blocks_stop_when_pending_and_not_titled(self):
+    with tempfile.TemporaryDirectory() as tmp_dir, \
+         tempfile.NamedTemporaryFile("w+", suffix=".jsonl") as f_trans:
+      scratch_dir = os.path.join(tmp_dir, "scratch")
+      os.makedirs(scratch_dir, exist_ok=True)
+      st_file = os.path.join(scratch_dir, ".context_guard_state.json")
+      with open(st_file, "w", encoding="utf-8") as f:
+        json.dump({"pending_title_guard": True}, f)
+
+      steps = [
+          {"step_index": 1, "type": "USER_INPUT", "content": "Help with code"},
+          {"step_index": 2, "type": "PLANNER_RESPONSE", "content": "Done."},
+      ]
+      for s in steps:
+        f_trans.write(json.dumps(s) + "\n")
+      f_trans.flush()
+
+      data = {
+          "conversationId": "c1",
+          "transcriptPath": f_trans.name,
+          "artifactDirectoryPath": tmp_dir,
+          "fullyIdle": True,
+          "terminationReason": "NO_TOOL_CALL",
+      }
+      with patch("sys.stdin", io.StringIO(json.dumps(data))), \
+           patch("sys.stdout", new_callable=io.StringIO) as mock_out, \
+           patch("chat_lifecycle.get_conversation_title", return_value="[10:00] ⦿ Investigation"), \
+           patch.object(stop_guard, "play_stop_sound"):
+        stop_guard.main()
+      res = json.loads(mock_out.getvalue())
+      self.assertEqual(res.get("decision"), "continue")
+      self.assertIn("[TITLE GUARD]", res.get("reason", ""))
+
 
 if __name__ == "__main__":
   unittest.main()
