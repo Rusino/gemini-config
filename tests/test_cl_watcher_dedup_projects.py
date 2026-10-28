@@ -138,6 +138,47 @@ class ClWatcherDedupProjectsTest(unittest.TestCase):
     # Newest single-target beats older single-target for 193774
     self.assertEqual(by_key["github:193774"]["conversation_id"], "c-pr-newer")
 
+  def test_marks_running_subagent_background_and_waiting_chats_as_busy(self):
+    summaries = {
+        "c-idle": self._make_ls_summary(
+            "[11:00] ⦿ cl/1401001 idle review",
+            "proj-skia",
+            "2026-10-28T15:00:00Z",
+        ),
+        "c-subagent": {
+            **self._make_ls_summary(
+                "[11:58] ⦿ cl/1408436 justify invalid cluster ranges",
+                "proj-skia",
+                "2026-10-28T15:58:00Z",
+            ),
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "hasRunningSubagents": True,
+        },
+        "c-running": {
+            **self._make_ls_summary(
+                "[12:00] ⦿ cl/1408437 active turn",
+                "proj-skia",
+                "2026-10-28T16:00:00Z",
+            ),
+            "status": "CASCADE_RUN_STATUS_RUNNING",
+        },
+        "c-waiting-marker": self._make_ls_summary(
+            "[12:05] ⏳ cl/1408438 waiting timer",
+            "proj-skia",
+            "2026-10-28T16:05:00Z",
+        ),
+    }
+    proj_names = {"proj-skia": "Skia"}
+    with mock.patch.object(w.cl, "_fetch_ls_summaries_for_audit", return_value=summaries), \
+         mock.patch.object(w, "load_project_names", return_value=proj_names):
+      discovered = w.discover_active_cl_chats()
+
+    by_key = {d["item_key"]: d for d in discovered}
+    self.assertFalse(by_key["gerrit:1401001"]["chat_busy"])
+    self.assertTrue(by_key["gerrit:1408436"]["chat_busy"])
+    self.assertTrue(by_key["gerrit:1408437"]["chat_busy"])
+    self.assertTrue(by_key["gerrit:1408438"]["chat_busy"])
+
 
 if __name__ == "__main__":
   unittest.main()

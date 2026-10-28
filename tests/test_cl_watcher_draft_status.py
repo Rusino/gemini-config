@@ -635,6 +635,13 @@ const ownCqFail = {
   post_submit: null, url: 'https://example.com/9', patchset: 2,
   status_changed_et: '16:00 ET', status_changed_age: '5m ago'
 };
+const busyAttentionCl = {
+  kind: 'gerrit', target_id: '1408436', status: 'NEW', phase: 'NEEDS_YOUR_ACTION',
+  in_my_attention: true, is_self: false, chat_busy: true, conversation_id: 'a2e9e5f4',
+  project_name: 'SkParagraph', subject: '[skparagraph] Avoid indexing empty fUTF16IndexForUTF8Index',
+  patchset: 1, url: 'https://example.com/1408436', last_msg_author: 'author@example.com',
+  last_msg_age: '15m ago', last_msg_snippet: 'Uploaded patch set 1.'
+};
 const piperCl = {kind: 'piper', status: 'NEW', phase: 'WAITING_ON_OTHERS'};
 console.log(JSON.stringify({
   draftStatus: statusOf(draftPr),
@@ -661,9 +668,13 @@ console.log(JSON.stringify({
   task: shortTask(
     'Test-Ubuntu24.04-Clang-GCE-CPU-AVX2-x86_64-Debug-All-NativeFonts_FreeType_ASAN_Upload'),
   headlineZero: headlineHtml(0, 'ALL'),
+  headlineZeroOneBusy: headlineHtml(0, 'ALL', 1),
+  headlineZeroTwoBusyInProj: headlineHtml(0, 'SkParagraph', 2),
+  headlineOneAndOneBusy: headlineHtml(1, 'ALL', 1),
   headlineOneInProject: headlineHtml(1, 'Skia'),
   headlineTwo: headlineHtml(2, 'ALL'),
   ownCqFailCard: focusCard(ownCqFail, box),
+  busyCard: focusCard(busyAttentionCl, box),
   piperState: stateHtml(piperCl),
 }));
 """
@@ -700,12 +711,27 @@ console.log(JSON.stringify({
     self.assertEqual(out["chatWithoutBox"], "")
     self.assertEqual(out["task"], "NativeFonts FreeType ASAN · Debug · Ubuntu 24.04")
     self.assertIn("Nothing needs you.", out["headlineZero"])
+    self.assertEqual(
+        out["headlineZeroOneBusy"],
+        'Nothing needs you right now. <span class="soft">One chat is working.</span>',
+    )
+    self.assertEqual(
+        out["headlineZeroTwoBusyInProj"],
+        'Nothing in SkParagraph needs you right now. '
+        '<span class="soft">Two chats are working.</span>',
+    )
+    self.assertEqual(
+        out["headlineOneAndOneBusy"],
+        'One thing needs you. <span class="soft">One chat is working.</span>',
+    )
     self.assertEqual(out["headlineOneInProject"], "One thing in Skia needs you.")
     self.assertEqual(out["headlineTwo"], "Two things need you.")
     self.assertIn("The commit queue failed · 16:00 ET (5m ago)", out["ownCqFailCard"])
     self.assertIn("https://example.com/9?tab=checks", out["ownCqFailCard"])
     self.assertNotIn("Post-submit alert", out["ownCqFailCard"])
     self.assertNotIn("status.skia.org", out["ownCqFailCard"])
+    self.assertIn("Working in chat", out["busyCard"])
+    self.assertIn("Working in chat…", out["busyCard"])
     self.assertEqual(out["piperState"], "In review")
 
   def test_dashboard_has_no_manual_chat_actions_or_browser_alerts(self):

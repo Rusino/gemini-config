@@ -480,8 +480,38 @@ def _chat_candidate_rank(item: dict[str, Any]) -> tuple[bool, bool, str]:
   )
 
 
+def is_chat_busy(summary: dict[str, Any], title: str = "") -> bool:
+  """Returns True when the chat is actively running a turn, subagent, task, or waiting timer."""
+  # A parent chat awaiting subagents or background commands reports IDLE until wakeup
+  if summary.get("status") == "CASCADE_RUN_STATUS_RUNNING":
+    return True
+  if summary.get("hasRunningSubagents"):
+    return True
+  if int(summary.get("backgroundTaskCount") or 0) > 0:
+    return True
+  return "⏳" in title
+
+
+def overlay_live_chat_busy(state: dict[str, Any]) -> None:
+  """Refreshes `chat_busy` across cached items from the local Language Server."""
+  items = state.get("items") or {}
+  if not items:
+    return
+  summaries = cl._fetch_ls_summaries_for_audit() or {}
+  if not summaries:
+    return
+  for item in items.values():
+    cid = str(item.get("conversation_id") or "")
+    s = summaries.get(cid)
+    # Recompute busy status from the latest LS trajectory snapshot without re-polling Gerrit
+    if isinstance(s, dict):
+      ann = s.get("annotations") or {}
+      title = str(ann.get("title") or s.get("summary") or item.get("title") or "").strip()
+      item["chat_busy"] = is_chat_busy(s, title)
+
+
 def discover_active_cl_chats() -> list[dict[str, Any]]:
-  """Scans active (`⦿`) conversations and maps them to CLs or GitHub PRs."""
+  """Scans active (`⦿` / `⏳`) conversations and maps them to CLs or GitHub PRs."""
   summaries = cl._fetch_ls_summaries_for_audit() or {}
   proj_names = load_project_names()
   discovered: list[dict[str, Any]] = []
@@ -498,8 +528,10 @@ def discover_active_cl_chats() -> list[dict[str, Any]]:
     if (meta.get("sourceMetadata") or {}).get("tool"):
       continue
     title = str(ann.get("title") or s.get("summary") or "").strip()
-    if "⦿" not in title:
+    # Keep both ⦿ (needs user) and ⏳ (waiting timer/external) chats on Flight Deck
+    if "⦿" not in title and "⏳" not in title:
       continue
+    chat_busy = is_chat_busy(s, title)
 
     pid = str(meta.get("projectId") or "").strip()
     pname = proj_names.get(pid, "Unassigned")
@@ -535,6 +567,7 @@ def discover_active_cl_chats() -> list[dict[str, Any]]:
           "project_name": pname,
           "chat_last_modified": last_mod,
           "single_target": single_target,
+          "chat_busy": chat_busy,
       })
     for pr_id in prs_found:
       discovered.append({
@@ -547,6 +580,7 @@ def discover_active_cl_chats() -> list[dict[str, Any]]:
           "project_name": pname,
           "chat_last_modified": last_mod,
           "single_target": single_target,
+          "chat_busy": chat_busy,
       })
 
   # Collapse multiple chats referencing the same CL/PR to one canonical owner
@@ -2235,6 +2269,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   .card.alert { background: var(--red-wash); }
   .eyebrow { font-size: 13px; font-weight: 600; color: var(--graphite); }
+  .eyebrow .busy-pill {
+    display: inline-flex; align-items: center; gap: 6px; color: var(--amber);
+  }
   .card.alert .eyebrow { color: var(--red); }
   .card h2 { font: 600 26px/1.2 var(--display); letter-spacing: -.02em; margin: 4px 0 6px; }
   .card .why { font-size: 17px; color: var(--graphite); }
@@ -2611,7 +2648,11 @@ function rowTime(it) {
 
 function focusCard(it, data) {
   const chat = chatUrl(it, data);
-  const chatBtn = chat ? link(chat, 'Open chat', 'btn quiet') : '';
+  const chatLabel = it.chat_busy ? 'Working in chat…' : 'Open chat';
+  const chatBtn = chat ? link(chat, chatLabel, 'btn quiet') : '';
+  const busyBadge = it.chat_busy
+    ? '<span class="busy-pill"><i class="dot moving"></i>Working in chat</span> · '
+    : '';
   const subject = esc(cleanSubject(it.subject));
   if (isPostSubmitAlert(it)) {
     const ps = it.post_submit || {};
@@ -2627,7 +2668,7 @@ function focusCard(it, data) {
       : '';
     return `
     <article class="card alert">
-      <div><div class="eyebrow">${eyebrow} · ${esc(it.project_name)} ·
+      <div><div class="eyebrow">${busyBadge}${eyebrow} · ${esc(it.project_name)} ·
         ${link(it.url, clLabel(it))}</div>
         <h2>${link(it.url, subject)}</h2>
         <div class="why">${landed}${blame}</div></div>
@@ -2652,7 +2693,7 @@ function focusCard(it, data) {
   }
   return `
     <article class="card">
-      <div><div class="eyebrow">${esc(it.project_name)} · ${link(it.url, clLabel(it))} ·
+      <div><div class="eyebrow">${busyBadge}${esc(it.project_name)} · ${link(it.url, clLabel(it))} ·
         PS${esc(it.patchset || 1)}</div>
         <h2>${link(it.url, subject)}</h2>
         <div class="why">${why}</div></div>
@@ -2678,11 +2719,23 @@ function rowHtml(it, data) {
     </div>`;
 }
 
-function headlineHtml(n, project) {
+function busyChatsSentence(busyCount) {
+  if (!busyCount) return '';
+  if (busyCount === 1) return 'One chat is working.';
+  const countWord = (COUNT_WORDS[busyCount] || `${busyCount} things`).replace(/things?$/, 'chats');
+  return `${countWord} are working.`;
+}
+
+function headlineHtml(n, project, busyCount = 0) {
   const scope = project === 'ALL' ? '' : ` in ${esc(project)}`;
+  const busy = busyChatsSentence(busyCount);
+  if (n === 0 && busyCount > 0) {
+    return `Nothing${scope} needs you right now. <span class="soft">${busy}</span>`;
+  }
   if (n === 0) return `Nothing${scope} needs you. <span class="soft">Go build something.</span>`;
   const word = COUNT_WORDS[n] || `${n} things`;
-  return `${word}${scope} ${n === 1 ? 'needs' : 'need'} you.`;
+  const base = `${word}${scope} ${n === 1 ? 'needs' : 'need'} you.`;
+  return busy ? `${base} <span class="soft">${busy}</span>` : base;
 }
 
 function projectsOf(items) {
@@ -2720,10 +2773,15 @@ function render() {
   const shown = all.filter(it => selectedProject === 'ALL' || projOf(it) === selectedProject);
   const by = {you: [], landing: [], desk: [], waiting: [], watching: [], done: []};
   for (const it of shown) by[laneOf(it)].push(it);
-  // Tree breakages first: they block everyone, a pending reply blocks one person
-  by.you.sort((a, b) => Number(isPostSubmitAlert(b)) - Number(isPostSubmitAlert(a)));
+  // Idle items needing human action precede chats where the agent is already working
+  by.you.sort((a, b) =>
+    Number(Boolean(a.chat_busy)) - Number(Boolean(b.chat_busy)) ||
+    Number(isPostSubmitAlert(b)) - Number(isPostSubmitAlert(a))
+  );
 
-  document.getElementById('headline').innerHTML = headlineHtml(by.you.length, selectedProject);
+  const busyYou = by.you.filter(it => it.chat_busy).length;
+  const needYou = by.you.length - busyYou;
+  document.getElementById('headline').innerHTML = headlineHtml(needYou, selectedProject, busyYou);
   const sub = LANES.filter(l => by[l.id].length)
     .map(l => `${by[l.id].length} ${l.title.toLowerCase()}`);
   if (by.done.length) sub.push(`${by.done.length} done`);
@@ -2812,6 +2870,8 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
       state = load_watcher_state()
       if not state.get("items"):
         state = sync_once(wake_chats=False, update_titles=True)
+      else:
+        overlay_live_chat_busy(state)
       state["jetski_box_url"] = jetski_box_url()
       self._send_json(state)
       return
