@@ -5246,11 +5246,17 @@ let fakeNow = Date.parse(NOW_ISO);
 Date.now = () => fakeNow;
 
 let outgoingFetchCalls = [];
+// Back localStorage with a persistent Map so F5 reload assertions verify pin persistence
+const autopilotStorage = new Map();
 global.window = {
   innerWidth: 1280,
   location: { pathname: '/', search: '' },
   __APP_CONFIG__: { csrfToken: 'csrf-autopilot-test' },
-  localStorage: { getItem: () => null, setItem: () => {} },
+  localStorage: {
+    getItem: (k) => (autopilotStorage.has(k) ? autopilotStorage.get(k) : null),
+    setItem: (k, v) => { autopilotStorage.set(k, String(v)); },
+    removeItem: (k) => { autopilotStorage.delete(k); },
+  },
   fetch: async (url, opts) => {
     const u = String(url);
     if (u.includes('GetAvailableModels')) {
@@ -5447,7 +5453,94 @@ global.clearTimeout = (id) => {
     'Fetch gate must rewrite 0% planModel before sending'
   );
 
-  // 8. Cleanup removes toast and clears state
+  // 8. Draft manual pick survives reload on the same project draft, does not block other
+  // projects, and transfers to the seeded conversation so the next draft gets fresh autopilot
+  storeState.conversation.cascadeId = '';
+  global.window.location.search = '?section=8acb67c4-2cb7-43ca-ba04-dc547b3c4788';
+  reduxStore.dispatch({
+    type: 'modelSelection/modelPicked',
+    payload: { model: 1226 },
+  });
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(storeState.modelSelection.default.model, 1226);
+
+  // Simulate full browser reload (fresh window RAM, persisted localStorage)
+  delete global.window.__jetskiManualPickedModels;
+  storeState.modelSelection.default = { model: 1018 };
+  eval(code);
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(
+    storeState.modelSelection.default.model,
+    1226,
+    'Manual draft pick must survive window reload on the same project draft'
+  );
+
+  // Switching to triage project draft must not be blocked by SkParagraph draft manual pick
+  global.window.location.search = '?section=3f5b7a12-8e5f-47d2-a2f4-d644447c86a8';
+  reduxStore.dispatch({ type: 'NOOP' });
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(
+    storeState.modelSelection.default.model,
+    312,
+    'Draft manual pick in one project must not block autopilot in another project'
+  );
+
+  // Back on SkParagraph draft, seeding a new conversation transfers the pin and frees the draft
+  global.window.location.search = '?section=8acb67c4-2cb7-43ca-ba04-dc547b3c4788';
+  reduxStore.dispatch({
+    type: 'modelSelection/conversationSeeded',
+    payload: { conversationId: 'seeded-from-draft', model: 1226 },
+  });
+  await new Promise((r) => setImmediate(r));
+  // Next fresh draft in SkParagraph now gets autopilot Opus 5.5 BoN High (1421)
+  reduxStore.dispatch({ type: 'NOOP' });
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(
+    storeState.modelSelection.default.model,
+    1421,
+    'After seeding a conversation, the next draft must auto-select the profile model (1421)'
+  );
+
+  // 9. Existing conversation manual pick (including WTU model) survives full window reload
+  // and is not reverted by trajectoryModelObserved re-observing the previous turn on load
+  storeState.conversation.cascadeId = 'chat-cpp-1';
+  reduxStore.dispatch({
+    type: 'modelSelection/modelPicked',
+    payload: {
+      conversationId: 'chat-cpp-1',
+      model: 1388, // User explicitly pins Fable 5.1 (WTU model) at stepCount=4
+    },
+  });
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(storeState.modelSelection.byConversation['chat-cpp-1'].model, 1388);
+
+  // Simulate F5 window reload: RAM Map and Redux byConversation are wiped, localStorage remains
+  delete global.window.__jetskiManualPickedModels;
+  storeState.modelSelection.byConversation = {};
+  storeState.modelSelection.trajectorySync = {};
+  eval(code);
+  await new Promise((r) => setImmediate(r));
+
+  // On reload, Jetski's trajectory observer fires for the existing turn (executionStartStep: 2 <= atStep: 4)
+  reduxStore.dispatch({
+    type: 'modelSelection/trajectoryModelObserved',
+    payload: {
+      conversationId: 'chat-cpp-1',
+      turnKey: 'turn-reload',
+      label: 'Claude Opus 5.5 BoN (High)',
+      model: 1421,
+      executionStartStep: 2,
+      queuedMessageIds: [],
+    },
+  });
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(
+    storeState.modelSelection.byConversation['chat-cpp-1'].model,
+    1388,
+    'Manual pick in existing chat must survive F5 reload and ignore older turn trajectoryModelObserved'
+  );
+
+  // 10. Cleanup removes toast and clears state
   window.__jetskiClosedChatsFilterCleanup();
   assert.strictEqual(global.document.getElementById('jetski-model-autopilot-toast'), null);
 

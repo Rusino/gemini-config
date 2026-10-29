@@ -347,8 +347,12 @@
   const QUOTA_HARD_FLOOR = 0.15;
   const EMERGENCY_PIN_FLOOR = 0.05;
   const AUTOPILOT_TOAST_ID = 'jetski-model-autopilot-toast';
+  // Persist manual model pins across F5 reloads with a 30m TTL on unsent project drafts
+  const MANUAL_MODEL_PINS_STORAGE_KEY = 'jetski_manual_model_pins_v1';
+  const DRAFT_MANUAL_PIN_TTL_MS = 30 * 60 * 1000;
+  const MANUAL_MODEL_PINS_MAX_ENTRIES = 200;
   let autopilotToastTimer = 0;
-  // Remembers conversations (and '__draft__') where the user manually picked a model
+  // Remembers conversations and project drafts where the user manually picked a model
   const manualPickedModels = (window.__jetskiManualPickedModels ||= new Map());
   // Tracks the last project profile key auto-seeded for a draft or conversation
   const autoSeededTargets = new Map();
@@ -2074,12 +2078,15 @@
               typeof planModel === 'number'
                 ? catalog.byEnum.get(planModel)
                 : catalog.byId.get(String(planModel).toLowerCase());
-            const cid =
+            // Resolve per-conversation or per-project draft manual pin state before failover
+            const rawCid =
               body.cascadeId ||
               reduxStore.getState()?.conversation?.cascadeId ||
-              '__draft__';
+              '';
+            const pinKey = resolveDraftPinKey(reduxStore, rawCid);
+            const pin = getManualPinEntry(pinKey);
             const isPinned = Boolean(
-              entry?.enumVal && manualPickedModels.get(cid) === entry.enumVal
+              entry?.enumVal && pin && pin.model === entry.enumVal
             );
             let replacement = null;
             let reason = '';
@@ -2095,6 +2102,14 @@
                 replacement = shielded;
                 reason = 'WTU shield';
               }
+            }
+            // Promote draft manual pin to the new cascadeId on StartCascade and free the draft slot
+            if (url.includes('/StartCascade') && pinKey.startsWith('__draft__:')) {
+              if (body.cascadeId && pin) {
+                setManualPin(body.cascadeId, replacement?.enumVal || pin.model, 1);
+              }
+              deleteManualPin(pinKey);
+              autoSeededTargets.delete(pinKey);
             }
             if (replacement && replacement.enumVal && replacement.enumVal !== entry?.enumVal) {
               const nextPlanModel =
@@ -2512,6 +2527,117 @@
     return projectId ? 'orchestrator' : '';
   }
 
+  // Computes a project-scoped pin key for drafts so manual draft picks do not leak across projects
+  function resolveDraftPinKey(store, cascadeId) {
+    if (cascadeId) return String(cascadeId);
+    let projectId = '';
+    const search = window.location?.search || '';
+    const m = /[?&]section=([a-zA-Z0-9_-]+)/.exec(search);
+    if (m) projectId = m[1];
+    if (!projectId) {
+      projectId = store?.getState()?.projects?.activeProjectId || '';
+    }
+    const cleanId = String(projectId || 'default').trim().toLowerCase() || 'default';
+    return `__draft__:${cleanId}`;
+  }
+
+  // Hydrates persisted manual model pins from localStorage so F5 reloads keep user picks
+  function loadManualModelPins() {
+    try {
+      const raw = window.localStorage?.getItem(MANUAL_MODEL_PINS_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return;
+      const now = Date.now();
+      for (const [k, v] of Object.entries(parsed)) {
+        if (!k) continue;
+        const model = typeof v === 'number' ? v : Number(v?.model);
+        if (!Number.isFinite(model) || model <= 0) continue;
+        const atStep = typeof v === 'object' && v ? Math.max(0, Number(v.atStep || 0)) : 0;
+        const updatedAt =
+          typeof v === 'object' && v && Number.isFinite(Number(v.updatedAt))
+            ? Number(v.updatedAt)
+            : now;
+        if (k.startsWith('__draft__:') && now - updatedAt > DRAFT_MANUAL_PIN_TTL_MS) {
+          continue;
+        }
+        manualPickedModels.set(k, { model, atStep, updatedAt });
+      }
+    } catch {
+      // Ignore malformed localStorage state
+    }
+  }
+
+  // Persists manual model pins to localStorage bounded to recent entries
+  function saveManualModelPins() {
+    try {
+      if (typeof window.localStorage?.setItem !== 'function') return;
+      const now = Date.now();
+      const entries = [];
+      for (const [k, v] of manualPickedModels.entries()) {
+        if (!k || !v) continue;
+        const model = typeof v === 'number' ? v : Number(v.model);
+        if (!Number.isFinite(model) || model <= 0) continue;
+        const atStep = typeof v === 'object' ? Math.max(0, Number(v.atStep || 0)) : 0;
+        const updatedAt =
+          typeof v === 'object' && Number.isFinite(Number(v.updatedAt))
+            ? Number(v.updatedAt)
+            : now;
+        if (k.startsWith('__draft__:') && now - updatedAt > DRAFT_MANUAL_PIN_TTL_MS) {
+          manualPickedModels.delete(k);
+          continue;
+        }
+        entries.push([k, { model, atStep, updatedAt }]);
+      }
+      const trimmed = entries.slice(-MANUAL_MODEL_PINS_MAX_ENTRIES);
+      const out = {};
+      for (const [k, obj] of trimmed) out[k] = obj;
+      window.localStorage.setItem(MANUAL_MODEL_PINS_STORAGE_KEY, JSON.stringify(out));
+    } catch {
+      // Ignore storage quota errors
+    }
+  }
+
+  function getManualPinEntry(key) {
+    if (!key) return null;
+    const raw = manualPickedModels.get(key);
+    if (!raw) return null;
+    const now = Date.now();
+    const entry =
+      typeof raw === 'number'
+        ? { model: raw, atStep: 0, updatedAt: now }
+        : {
+            model: Number(raw.model),
+            atStep: Math.max(0, Number(raw.atStep || 0)),
+            updatedAt: Number.isFinite(Number(raw.updatedAt)) ? Number(raw.updatedAt) : now,
+          };
+    if (String(key).startsWith('__draft__:') && now - entry.updatedAt > DRAFT_MANUAL_PIN_TTL_MS) {
+      manualPickedModels.delete(key);
+      saveManualModelPins();
+      return null;
+    }
+    return entry;
+  }
+
+  function setManualPin(key, modelEnum, atStep = 0) {
+    if (!key || !modelEnum) return;
+    manualPickedModels.set(key, {
+      model: Number(modelEnum),
+      atStep: Math.max(0, Number(atStep || 0)),
+      updatedAt: Date.now(),
+    });
+    saveManualModelPins();
+  }
+
+  function deleteManualPin(key) {
+    if (!key) return;
+    if (manualPickedModels.delete(key)) {
+      saveManualModelPins();
+    }
+  }
+
+  loadManualModelPins();
+
   // Shows a transient floating notification toast when autopilot fails over a model
   function showAutopilotToast(oldLabel, newLabel, reason) {
     if (disposed || typeof document?.createElement !== 'function') return;
@@ -2561,13 +2687,38 @@
     const profile = resolveProjectProfileForConversation(store, cascadeId);
 
     if (isDraft) {
-      const targetKey = cascadeId || '__draft__';
-      if (manualPickedModels.has(targetKey) || !profile) return;
-      const best = resolveAutopilotModelForProfile(catalog, profile);
-      if (!best || !best.enumVal) return;
+      // Restore or honor project-scoped manual draft picks before applying profile defaults
+      const targetKey = resolveDraftPinKey(store, cascadeId);
       const curModel = cascadeId
         ? state.modelSelection.byConversation?.[cascadeId]?.model
         : state.modelSelection.default?.model;
+      const draftPin = getManualPinEntry(targetKey);
+      if (draftPin && draftPin.model) {
+        const pinEntry = catalog.byEnum.get(draftPin.model);
+        // Keep manual picks while GetAvailableModels is still hydrating (!pinEntry) or quota >= 5%
+        if (!pinEntry || pinEntry.quota >= EMERGENCY_PIN_FLOOR) {
+          if (curModel !== draftPin.model) {
+            isInternalDispatch = true;
+            try {
+              store.dispatch({
+                type: 'modelSelection/modelPicked',
+                payload: {
+                  conversationId: cascadeId || undefined,
+                  model: draftPin.model,
+                  ...(cascadeId ? { pick: { atStep: 999999, queuedMessageIds: [] } } : {}),
+                },
+              });
+            } finally {
+              isInternalDispatch = false;
+            }
+          }
+          return;
+        }
+        deleteManualPin(targetKey);
+      }
+      if (!profile) return;
+      const best = resolveAutopilotModelForProfile(catalog, profile);
+      if (!best || !best.enumVal) return;
       const seedSig = `${profile}:${best.enumVal}`;
       if (curModel === best.enumVal && autoSeededTargets.get(targetKey) === seedSig) {
         return;
@@ -2589,12 +2740,35 @@
       return;
     }
 
-    const curModel =
+    // Look up persisted manual pin for existing conversation before evaluating quota or WTU shield
+    const pin = getManualPinEntry(cascadeId);
+    let curModel =
       state.modelSelection.byConversation?.[cascadeId]?.model ??
       state.modelSelection.default?.model;
+    // Restore persisted manual pick after F5 reload when no newer turn has executed since the pick
+    if (pin && pin.model && stepCount <= pin.atStep && curModel !== pin.model) {
+      const pinEntry = catalog.byEnum.get(pin.model);
+      if (!pinEntry || pinEntry.quota >= EMERGENCY_PIN_FLOOR) {
+        isInternalDispatch = true;
+        try {
+          store.dispatch({
+            type: 'modelSelection/modelPicked',
+            payload: {
+              conversationId: cascadeId,
+              model: pin.model,
+              pick: { atStep: 999999, queuedMessageIds: [] },
+            },
+          });
+        } finally {
+          isInternalDispatch = false;
+        }
+        curModel = pin.model;
+      }
+    }
     if (!curModel) return;
     const curEntry = catalog.byEnum.get(curModel);
-    const isPinned = manualPickedModels.get(cascadeId) === curModel;
+    // Pinned conversations bypass WTU shield and use the 5% emergency floor instead of 15%
+    const isPinned = Boolean(pin && pin.model === curModel);
 
     let replacement = null;
     let reason = '';
@@ -3031,7 +3205,12 @@
         action?.type === 'modelSelection/modelPicked' &&
         action.payload
       ) {
-        const cid = action.payload.conversationId || '__draft__';
+        // Record stepCount alongside the manual pick so older trajectory turns cannot revert it on F5
+        const rawCid = action.payload.conversationId || '';
+        const pinKey = resolveDraftPinKey(store, rawCid);
+        const stepCount = rawCid
+          ? Number(store.getState()?.trajectorySummaries?.summaries?.[rawCid]?.stepCount ?? 0)
+          : 0;
         const pickedModel = action.payload.model;
         const catalog = buildModelCatalogIndex(store);
         const entry = catalog.byEnum.get(pickedModel);
@@ -3041,7 +3220,8 @@
             'orchestrator';
           const rescue = resolveAutopilotModelForProfile(catalog, profile);
           if (rescue && rescue.enumVal && rescue.enumVal !== pickedModel) {
-            manualPickedModels.set(cid, rescue.enumVal);
+            // Persist the rescued model as the active pin for this conversation or draft
+            setManualPin(pinKey, rescue.enumVal, stepCount);
             showAutopilotToast(
               entry.label,
               rescue.label,
@@ -3054,8 +3234,24 @@
           }
         }
         if (pickedModel) {
-          manualPickedModels.set(cid, pickedModel);
+          setManualPin(pinKey, pickedModel, stepCount);
         }
+      }
+      // Transfer a project draft manual pick to the newly seeded conversation and free the draft slot
+      if (
+        !isInternalDispatch &&
+        action?.type === 'modelSelection/conversationSeeded' &&
+        action.payload?.conversationId &&
+        !action.payload.sourceConversationId
+      ) {
+        const draftKey = resolveDraftPinKey(store, '');
+        const draftPin = getManualPinEntry(draftKey);
+        if (draftPin && draftPin.model) {
+          setManualPin(action.payload.conversationId, draftPin.model, 1);
+          deleteManualPin(draftKey);
+        }
+        // Clear cached draft seed signature so the next new draft evaluates fresh autopilot state
+        autoSeededTargets.delete(draftKey);
       }
       // Fail over exhausted trajectory models and shield wasteful WTU runs
       if (
@@ -3066,8 +3262,52 @@
         const cid = action.payload.conversationId;
         const obsModel = action.payload.model;
         const catalog = buildModelCatalogIndex(store);
+        const stepCount = cid
+          ? Number(store.getState()?.trajectorySummaries?.summaries?.[cid]?.stepCount ?? 0)
+          : 0;
+        const execStep = Number(action.payload.executionStartStep ?? stepCount);
+        const pin = cid ? getManualPinEntry(cid) : null;
+        // Preserve manual pick across F5 reload when trajectoryModelObserved replays an older turn
+        if (pin && pin.model && (stepCount <= pin.atStep || execStep <= pin.atStep)) {
+          const pinEntry = catalog.byEnum.get(pin.model);
+          // Keep user's manual pick while catalog hydrates or as long as its quota is >= 5%
+          if (!pinEntry || pinEntry.quota >= EMERGENCY_PIN_FLOOR) {
+            if (obsModel !== pin.model && cid) {
+              isInternalDispatch = true;
+              try {
+                store.dispatch({
+                  type: 'modelSelection/modelPicked',
+                  payload: {
+                    conversationId: cid,
+                    model: pin.model,
+                    pick: { atStep: 999999, queuedMessageIds: [] },
+                  },
+                });
+              } finally {
+                isInternalDispatch = false;
+              }
+            }
+            return origDispatch.call(this, {
+              ...action,
+              payload: {
+                ...action.payload,
+                model: pin.model,
+                label: pinEntry?.label || action.payload.label,
+              },
+            });
+          }
+        } else if (pin && cid && stepCount > pin.atStep && execStep > pin.atStep) {
+          // Advance pin step when a newer turn runs on the pinned model, or clear if switched
+          if (obsModel === pin.model) {
+            setManualPin(cid, pin.model, stepCount);
+          } else {
+            deleteManualPin(cid);
+          }
+        }
         const obsEntry = catalog.byEnum.get(obsModel);
-        const isPinned = Boolean(cid && manualPickedModels.get(cid) === obsModel);
+        // Re-read active pin after step progression so WTU shield and 15% floor respect user pins
+        const activePin = cid ? getManualPinEntry(cid) : null;
+        const isPinned = Boolean(activePin && activePin.model === obsModel);
         let replacement = null;
         let reason = '';
         if (obsEntry && obsEntry.quota < (isPinned ? EMERGENCY_PIN_FLOOR : QUOTA_HARD_FLOOR)) {
