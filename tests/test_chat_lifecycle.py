@@ -1879,6 +1879,170 @@ class TestChatLifecycle(unittest.TestCase):
       ret = chat_lifecycle.cmd_start(opts)
       self.assertEqual(ret, 0)
 
+  def test_get_model_quota_fraction_handles_proto3_omitted_zero_and_expired_reset(self):
+    now = 1800000000.0
+    # Proto3 JSON omission: future resetTime with omitted remainingFraction means 0.0 (0%)
+    proto3_zero = {"quotaInfo": {"resetTime": "2027-01-15T12:00:00Z"}}
+    self.assertEqual(
+        chat_lifecycle.get_model_quota_fraction(proto3_zero, now_ts=now),
+        0.0,
+    )
+
+    # Window expired: resetTime in the past resets effective quota to 1.0 (100%)
+    expired_reset = {
+        "quotaInfo": {
+            "remainingFraction": 0.0,
+            "resetTime": "2026-01-01T00:00:00Z",
+        }
+    }
+    self.assertEqual(
+        chat_lifecycle.get_model_quota_fraction(expired_reset, now_ts=now),
+        1.0,
+    )
+
+    # Normal active fraction
+    active_frac = {
+        "quotaInfo": {
+            "remainingFraction": 0.56,
+            "resetTime": "2027-01-15T12:00:00Z",
+        }
+    }
+    self.assertEqual(
+        chat_lifecycle.get_model_quota_fraction(active_frac, now_ts=now),
+        0.56,
+    )
+
+    # Empty quotaInfo or OneQuota unmetered
+    self.assertEqual(chat_lifecycle.get_model_quota_fraction({}, now_ts=now), 1.0)
+    self.assertEqual(
+        chat_lifecycle.get_model_quota_fraction({"tagTitle": "OneQuota"}, now_ts=now),
+        1.0,
+    )
+
+  def test_resolve_profile_model_cpp_core_balances_bon_and_wtu_and_falls_back_below_30_pct(self):
+    now = 1800000000.0
+    catalog = {
+        "opus-5.5-high-bon-le": {
+            "model": "MODEL_PLACEHOLDER_M380",
+            "displayName": "Claude Opus 5.5 BoN (High)",
+            "quotaInfo": {"remainingFraction": 0.85, "resetTime": "2027-01-15T12:00:00Z"},
+        },
+        "opus-5.5-medium": {
+            "model": "MODEL_PLACEHOLDER_M367",
+            "displayName": "Claude Opus 5.5 (Medium)",
+            "quotaInfo": {"remainingFraction": 0.85, "resetTime": "2027-01-15T12:00:00Z"},
+        },
+        "sonnet-5.5-high-bon-le": {
+            "model": "MODEL_PLACEHOLDER_M420",
+            "displayName": "Claude Sonnet 5.5 (High)",
+            "quotaInfo": {"remainingFraction": 0.75, "resetTime": "2027-01-15T12:00:00Z"},
+        },
+        "bon-experiment-arm-226": {
+            "model": "MODEL_PLACEHOLDER_M226",
+            "displayName": "Gemini 4 Carbon-G",
+            "quotaInfo": {"remainingFraction": 0.95, "resetTime": "2027-01-15T12:00:00Z"},
+        },
+    }
+
+    with patch.object(chat_lifecycle, "_now_ts", return_value=now):
+      # Ties prefer request-counted claude-bon
+      res_tie = chat_lifecycle.resolve_profile_model(catalog, "cpp-core")
+      self.assertEqual(res_tie["id"], "opus-5.5-high-bon-le")
+
+      # When wtu is significantly healthier (> +0.05), pick opus-5.5-medium
+      catalog["opus-5.5-high-bon-le"]["quotaInfo"]["remainingFraction"] = 0.40
+      catalog["opus-5.5-medium"]["quotaInfo"]["remainingFraction"] = 0.90
+      res_wtu = chat_lifecycle.resolve_profile_model(catalog, "cpp-core")
+      self.assertEqual(res_wtu["id"], "opus-5.5-medium")
+
+      # When both Opus pools are below soft floor (< 0.30), fall back to sonnet-bon
+      catalog["opus-5.5-high-bon-le"]["quotaInfo"]["remainingFraction"] = 0.22
+      catalog["opus-5.5-medium"]["quotaInfo"]["remainingFraction"] = 0.18
+      res_fallback = chat_lifecycle.resolve_profile_model(catalog, "cpp-core")
+      self.assertEqual(res_fallback["id"], "sonnet-5.5-high-bon-le")
+
+  def test_reroute_wasteful_wtu_models_proactively(self):
+    catalog = {
+        "fable-5.1-high": {
+            "model": "MODEL_PLACEHOLDER_M388",
+            "displayName": "Claude Fable 5.1 (High)",
+            "quotaInfo": {"remainingFraction": 0.90, "resetTime": "2027-01-15T12:00:00Z"},
+        },
+        "opus-5.5-high-bon-le": {
+            "model": "MODEL_PLACEHOLDER_M380",
+            "displayName": "Claude Opus 5.5 BoN (High)",
+            "quotaInfo": {"remainingFraction": 0.85, "resetTime": "2027-01-15T12:00:00Z"},
+        },
+        "gemini-launch-candidate-high": {
+            "model": "MODEL_PLACEHOLDER_M416",
+            "displayName": "Gemini 4 Argon (High)",
+            "quotaInfo": {"remainingFraction": 0.90, "resetTime": "2027-01-15T12:00:00Z"},
+        },
+        "gemini-pro-coordinator": {
+            "model": "MODEL_PLACEHOLDER_M415",
+            "displayName": "Gemini Pro Orchestrator",
+            "quotaInfo": {"remainingFraction": 0.80, "resetTime": "2027-01-15T12:00:00Z"},
+        },
+        "gemini-4-carbon-high": {
+            "model": "MODEL_PLACEHOLDER_M440",
+            "displayName": "Gemini 4 Carbon (High)",
+            "quotaInfo": {"remainingFraction": 0.90, "resetTime": "2027-01-15T12:00:00Z"},
+        },
+        "bon-experiment-arm-226": {
+            "model": "MODEL_PLACEHOLDER_M226",
+            "displayName": "Gemini 4 Carbon-G",
+            "quotaInfo": {"remainingFraction": 0.95, "resetTime": "2027-01-15T12:00:00Z"},
+        },
+    }
+
+    # Fable -> Opus 5.5
+    fable_rep = chat_lifecycle.reroute_wasteful_wtu_model(catalog, "MODEL_PLACEHOLDER_M388")
+    self.assertEqual(fable_rep["id"], "opus-5.5-high-bon-le")
+
+    # Argon WTU -> Orchestrator
+    argon_rep = chat_lifecycle.reroute_wasteful_wtu_model(catalog, "gemini-launch-candidate-high")
+    self.assertEqual(argon_rep["id"], "gemini-pro-coordinator")
+
+    # Carbon WTU -> Carbon-G
+    carbon_rep = chat_lifecycle.reroute_wasteful_wtu_model(catalog, "gemini-4-carbon-high")
+    self.assertEqual(carbon_rep["id"], "bon-experiment-arm-226")
+
+  def test_resolve_handoff_model_respects_soft_floor_and_explicit_override(self):
+    fake_catalog = {
+        "models": {
+            "gemini-pro-coordinator": {
+                "model": "MODEL_PLACEHOLDER_M415",
+                "displayName": "Gemini Pro Orchestrator",
+                "quotaInfo": {"remainingFraction": 0.85, "resetTime": "2027-01-15T12:00:00Z"},
+            },
+            "gemini-launch-candidate-high": {
+                "model": "MODEL_PLACEHOLDER_M416",
+                "displayName": "Gemini 4 Argon (High)",
+                # 0% via omitted remainingFraction
+                "quotaInfo": {"resetTime": "2027-01-15T12:00:00Z"},
+            },
+        },
+        "tieredModelIds": {
+            "pro": ["gemini-pro-coordinator"],
+        },
+    }
+    with (
+        patch.object(chat_lifecycle, "get_available_models", return_value=fake_catalog),
+        patch.object(chat_lifecycle, "get_last_used_model", return_value="MODEL_PLACEHOLDER_M416"),
+        patch.object(chat_lifecycle, "get_project_model_preference", return_value="orchestrator"),
+    ):
+      # Inherited Argon is 0%, so handoff auto-switches to healthy Orchestrator
+      res = chat_lifecycle.resolve_handoff_model("cid-1", project_id="p-orch")
+      self.assertEqual(res["id"], "gemini-pro-coordinator")
+      self.assertEqual(res["source"], "project:p-orch")
+
+      # Explicit override is preserved
+      res_exp = chat_lifecycle.resolve_handoff_model(
+          "cid-1", explicit="gemini-launch-candidate-high", project_id="p-orch"
+      )
+      self.assertEqual(res_exp["id"], "gemini-launch-candidate-high")
+      self.assertEqual(res_exp["source"], "explicit")
+
 
 if __name__ == "__main__":
   unittest.main()

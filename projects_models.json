@@ -1,0 +1,19 @@
+{
+  "skia-g3-roll-check": "triage",
+  "debug_skia_roll_issue": "triage",
+  "Chromium": "cpp-core",
+  "Lazy Android": "cpp-core",
+  "TextClusters API": "cpp-core",
+  "SkParagraph": "cpp-core",
+  "Skia": "cpp-core",
+  "SkoreText": "cpp-core",
+  "SkGlyphID to 32 bits": "cpp-core",
+  "Typescript WebParagraph": "cpp-core",
+  "WebParagraph": "cpp-core",
+  "Text Editor": "cpp-core",
+  "Improving Experience": "orchestrator",
+  "Flight Deck": "orchestrator",
+  "Code Review organizer": "orchestrator",
+  "Skia Gardener": "orchestrator",
+  "Breaking Chats": "orchestrator"
+}

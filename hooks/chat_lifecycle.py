@@ -36,7 +36,65 @@ DEFAULT_PROJECT_MODELS_FILE = os.path.expanduser(
     "~/.gemini/config/projects_models.json"
 )
 DEFAULT_PROJECT_MODELS: dict[str, str] = {
-    "skia-g3-roll-check": "flash",
+    # triage profile
+    "skia-g3-roll-check": "triage",
+    "debug_skia_roll_issue": "triage",
+    # cpp-core profile
+    "Chromium": "cpp-core",
+    "Lazy Android": "cpp-core",
+    "TextClusters API": "cpp-core",
+    "SkParagraph": "cpp-core",
+    "Skia": "cpp-core",
+    "SkoreText": "cpp-core",
+    "SkGlyphID to 32 bits": "cpp-core",
+    "Typescript WebParagraph": "cpp-core",
+    "WebParagraph": "cpp-core",
+    "Text Editor": "cpp-core",
+    # orchestrator profile
+    "Improving Experience": "orchestrator",
+    "Flight Deck": "orchestrator",
+    "Code Review organizer": "orchestrator",
+    "Skia Gardener": "orchestrator",
+    "Breaking Chats": "orchestrator",
+}
+
+QUOTA_SOFT_FLOOR = 0.30
+QUOTA_HARD_FLOOR = 0.15
+EMERGENCY_PIN_FLOOR = 0.05
+
+MODEL_PROFILES: dict[str, list[str]] = {
+    "cpp-core": [
+        "opus-5.5-high-bon-le",
+        "opus-5.5-medium",
+        "opus-5.5-max-bon-le",
+        "opus-5.5-high",
+        "sonnet-5.5-high-bon-le",
+        "sonnet-5.5-bon-le",
+        "bon-experiment-arm-226",
+        "gemini-pro-coordinator",
+        "auto",
+    ],
+    "orchestrator": [
+        "gemini-pro-coordinator",
+        "bon-experiment-arm-226",
+        "auto",
+        "sonnet-5.5-high-bon-le",
+        "sonnet-5.5-bon-le",
+        "gemini-flash-next",
+        "gemini-3.8-flash-high",
+        "gemini-3.8-flash-medium",
+        "gemini-2.5-flash",
+        "gemini-3.1-pro-high",
+    ],
+    "triage": [
+        "gemini-flash-next",
+        "gemini-3.8-flash-high",
+        "gemini-3.8-flash-medium",
+        "gemini-2.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-pro-coordinator",
+        "auto",
+    ],
 }
 
 # Lifecycle marker tokens: only visible chats carry one. Finished chats and handed-off
@@ -660,6 +718,68 @@ def read_handoff_model_override() -> str:
   return ""
 
 
+# Indirection allows unit tests to freeze time deterministically
+def _now_ts() -> float:
+  import time
+  return time.time()
+
+
+# Handles both ISO-8601 strings from JSON REST and dicts from proto reflection
+def parse_iso_reset_ts(reset_time: object) -> float:
+  """Parses ISO string or protobuf timestamp dict into epoch seconds."""
+  if isinstance(reset_time, str) and reset_time.strip():
+    try:
+      return datetime.fromisoformat(reset_time.replace("Z", "+00:00")).timestamp()
+    except Exception:
+      return 0.0
+  if isinstance(reset_time, dict):
+    try:
+      sec = float(reset_time.get("seconds") or 0)
+      nanos = float(reset_time.get("nanos") or 0)
+      if sec > 0:
+        return sec + (nanos / 1_000_000_000.0)
+    except Exception:
+      return 0.0
+  return 0.0
+
+
+def get_model_quota_fraction(det: dict, now_ts: float | None = None) -> float:
+  """Computes effective remaining quota fraction [0.0, 1.0].
+
+  Handles Protobuf3 JSON omission: when quota is 0.0, JSON serialization omits
+  remainingFraction while resetTime is in the future.
+  """
+  if not isinstance(det, dict):
+    return 1.0
+  if det.get("tagTitle") == "OneQuota":
+    return 1.0
+  q = det.get("quotaInfo")
+  if not isinstance(q, dict) or not q:
+    return 1.0
+  now = _now_ts() if now_ts is None else float(now_ts)
+  reset_ts = parse_iso_reset_ts(q.get("resetTime"))
+  if reset_ts > 0.0 and reset_ts <= now:
+    return 1.0
+  raw_rem = q.get("remainingFraction")
+  if raw_rem is None:
+    return 0.0 if reset_ts > now else 1.0
+  try:
+    val = float(raw_rem)
+    return max(0.0, min(1.0, val))
+  except Exception:
+    return 0.0
+
+
+CURATED_MODEL_LABELS = {
+    "opus-5.5-high-bon-le": "Claude Opus 5.5 BoN (High)",
+    "opus-5.5-max-bon-le": "Claude Opus 5.5 BoN (Max)",
+    "sonnet-5.5-high-bon-le": "Claude Sonnet 5.5 (High)",
+    "sonnet-5.5-bon-le": "Claude Sonnet 5.5 (Max)",
+    "bon-experiment-arm-226": "Gemini 4 Carbon-G",
+    "gemini-pro-coordinator": "Gemini Pro Orchestrator",
+}
+
+
 def lookup_model(models: dict, wanted: str) -> dict:
   """Resolves a model id / display name / enum name among enabled catalog entries."""
   w = (wanted or "").strip().lower()
@@ -670,8 +790,151 @@ def lookup_model(models: dict, wanted: str) -> dict:
       continue
     enum = det.get("model", "")
     label = det.get("displayName", "")
-    if w in (mid.lower(), enum.lower(), label.lower()):
-      return {"enum": enum, "id": mid, "label": label or mid, "has_display_name": bool(label), "displayName": label}
+    curated_label = CURATED_MODEL_LABELS.get(mid, "")
+    cand_labels = (label.lower(), curated_label.lower())
+    if w in (mid.lower(), enum.lower()) or any(w == c for c in cand_labels if c):
+      display = label or curated_label or mid
+      has_display = bool(label or curated_label)
+      quota_frac = get_model_quota_fraction(det)
+      return {
+          "enum": enum,
+          "id": mid,
+          "label": display,
+          "has_display_name": has_display,
+          "displayName": display,
+          "quota": quota_frac,
+      }
+  return {}
+
+
+WASTEFUL_WTU_FABLE_PATTERNS = (
+    "fable-5.1-high",
+    "fable-5.1-medium",
+    "fable-5.1-low",
+    "fable-5.1-dropdown",
+    "model_placeholder_m386",
+    "model_placeholder_m387",
+    "model_placeholder_m388",
+)
+WASTEFUL_WTU_ARGON_PATTERNS = (
+    "gemini-launch-candidate",
+    "gemini-launch-candidate-high",
+    "gemini-launch-candidate-medium",
+    "gemini-launch-candidate-low",
+    "model_placeholder_m393",
+    "model_placeholder_m416",
+    "model_placeholder_m417",
+    "model_placeholder_m418",
+)
+WASTEFUL_WTU_CARBON_PATTERNS = (
+    "gemini-4-carbon",
+    "gemini-4-carbon-high",
+    "gemini-4-carbon-medium",
+    "gemini-4-carbon-low",
+    "model_placeholder_m439",
+    "model_placeholder_m440",
+    "model_placeholder_m441",
+    "model_placeholder_m442",
+)
+
+
+def reroute_wasteful_wtu_model(
+    models: dict, model_id_or_enum: str, min_floor: float = QUOTA_SOFT_FLOOR
+) -> dict:
+  """Reroutes expensive WTU models to cheaper request-counted or Orchestrator pools."""
+  w = (model_id_or_enum or "").strip().lower()
+  if not w:
+    return {}
+
+  # 1. Non-BoN Fable 5.1 (2.5x more expensive in 3p-wtu-daily) -> Opus 5.5
+  if any(
+      w == pat or (w.startswith("fable-5.1") and "-bon-le" not in w)
+      for pat in WASTEFUL_WTU_FABLE_PATTERNS
+  ):
+    for cand in ("opus-5.5-high-bon-le", "opus-5.5-medium", "opus-5.5-max-bon-le", "opus-5.5-high"):
+      hit = lookup_model(models, cand)
+      if hit and hit.get("quota", 1.0) >= min_floor:
+        return {**hit, "source": "wtu_shield"}
+
+  # 2. Gemini 4 Argon WTU -> Gemini Pro Orchestrator / Carbon-G on gemini-next-v2
+  if any(
+      w == pat or w.startswith("gemini-launch-candidate")
+      for pat in WASTEFUL_WTU_ARGON_PATTERNS
+  ):
+    for cand in ("gemini-pro-coordinator", "bon-experiment-arm-226", "auto"):
+      hit = lookup_model(models, cand)
+      if hit and hit.get("quota", 1.0) >= min_floor:
+        return {**hit, "source": "wtu_shield"}
+
+  # 3. Gemini 4 Carbon WTU -> Gemini 4 Carbon-G on gemini-next-v2
+  if any(
+      w == pat or (w.startswith("gemini-4-carbon") and "-g" not in w)
+      for pat in WASTEFUL_WTU_CARBON_PATTERNS
+  ):
+    for cand in ("bon-experiment-arm-226", "gemini-pro-coordinator", "auto"):
+      hit = lookup_model(models, cand)
+      if hit and hit.get("quota", 1.0) >= min_floor:
+        return {**hit, "source": "wtu_shield"}
+
+  return {}
+
+
+def resolve_profile_model(
+    models: dict,
+    profile_name: str,
+    soft_floor: float = QUOTA_SOFT_FLOOR,
+    hard_floor: float = QUOTA_HARD_FLOOR,
+) -> dict:
+  """Resolves the best available healthy model for a named project profile."""
+  p = (profile_name or "").strip().lower().removeprefix("profile:")
+  chain = MODEL_PROFILES.get(p) or MODEL_PROFILES["orchestrator"]
+
+  # cpp-core: balance claude-bon vs 3p-wtu-daily Opus 5.5
+  if p == "cpp-core":
+    hit_bon = (
+        lookup_model(models, "opus-5.5-high-bon-le")
+        or lookup_model(models, "opus-5.5-max-bon-le")
+    )
+    hit_wtu = (
+        lookup_model(models, "opus-5.5-medium")
+        or lookup_model(models, "opus-5.5-high")
+    )
+    q_bon = hit_bon.get("quota", 0.0) if hit_bon else 0.0
+    q_wtu = hit_wtu.get("quota", 0.0) if hit_wtu else 0.0
+
+    if (hit_bon and q_bon >= soft_floor) or (hit_wtu and q_wtu >= soft_floor):
+      # Ties within 0.05 prefer request-counted claude-bon to preserve WTU tokens
+      if hit_wtu and q_wtu > q_bon + 0.05 and q_wtu >= soft_floor:
+        return hit_wtu
+      if hit_bon and q_bon >= soft_floor:
+        return hit_bon
+      if hit_wtu:
+        return hit_wtu
+
+  # Normal chain resolution at soft_floor
+  for mid in chain:
+    hit = lookup_model(models, mid)
+    if hit and hit.get("quota", 1.0) >= soft_floor:
+      return hit
+
+  # Hard floor resolution
+  candidates = []
+  for mid in chain:
+    hit = lookup_model(models, mid)
+    if hit:
+      candidates.append(hit)
+
+  if candidates:
+    candidates.sort(key=lambda c: c.get("quota", 0.0), reverse=True)
+    if candidates[0].get("quota", 0.0) >= hard_floor:
+      return candidates[0]
+    return candidates[0]
+
+  # Fallback to first available model in catalog
+  for mid in models:
+    hit = lookup_model(models, mid)
+    if hit and hit.get("has_display_name"):
+      return hit
   return {}
 
 
@@ -892,20 +1155,50 @@ def resolve_handoff_model(
   if pid and pid != "outside-of-project":
     proj_pref = get_project_model_preference(pid)
     if proj_pref:
-      if proj_pref in AGENTAPI_TIERS:
+      clean_pref = proj_pref.strip().lower().removeprefix("profile:")
+      # Route named profiles to their highest-remaining healthy model
+      if clean_pref in MODEL_PROFILES:
+        hit = resolve_profile_model(models, clean_pref)
+        if hit:
+          return _check_and_return({**hit, "source": f"project:{pid}"})
+      elif proj_pref in AGENTAPI_TIERS:
         hit = from_tier(proj_pref)
+        if hit:
+          return _check_and_return({**hit, "source": f"project:{pid}"})
       else:
+        # Protect against legacy project preferences pinned to expensive WTU models
+        shield = reroute_wasteful_wtu_model(models, proj_pref)
+        if shield:
+          return _check_and_return({**shield, "source": f"project:{pid}:wtu_shield"})
         hit = lookup_model(models, proj_pref)
-      if hit:
-        return _check_and_return({**hit, "source": f"project:{pid}"})
+        if hit and hit.get("quota", 1.0) >= QUOTA_SOFT_FLOOR:
+          return _check_and_return({**hit, "source": f"project:{pid}"})
+        elif hit:
+          fallback = resolve_profile_model(models, "orchestrator")
+          if fallback:
+            return _check_and_return({**fallback, "source": f"project:{pid}:quota_fallback"})
 
   inherited = get_last_used_model(current_conv_id) if current_conv_id else ""
-  hit = lookup_model(models, inherited)
-  if hit:
-    return _check_and_return({**hit, "source": "inherited"})
+  if inherited:
+    # Reroute wasteful WTU models mid-chain on handoff
+    shield = reroute_wasteful_wtu_model(models, inherited)
+    if shield:
+      return _check_and_return({**shield, "source": "inherited:wtu_shield"})
+    hit = lookup_model(models, inherited)
+    if hit and hit.get("quota", 1.0) >= QUOTA_SOFT_FLOOR:
+      return _check_and_return({**hit, "source": "inherited"})
+    # Fail over when inherited model is exhausted below the 30% soft floor
+    fb_profile = (
+        "cpp-core"
+        if (pid and "cpp-core" in get_project_model_preference(pid))
+        else "orchestrator"
+    )
+    fallback = resolve_profile_model(models, fb_profile)
+    if fallback:
+      return _check_and_return({**fallback, "source": "inherited:quota_fallback"})
 
   hit = lookup_model(models, read_handoff_model_override())
-  if hit:
+  if hit and hit.get("quota", 1.0) >= QUOTA_SOFT_FLOOR:
     return _check_and_return({**hit, "source": "override"})
 
   hit = from_tier(tier)
