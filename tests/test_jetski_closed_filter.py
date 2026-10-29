@@ -1548,6 +1548,20 @@ const liveBucketBtn = (k) =>
     bodyEl.children.indexOf(vlistEl) - 1,
     'Inbox widget must be positioned immediately before conversation-list-sidebar'
   );
+  const styleEl = global.document.getElementById('jetski-closed-chats-filter-style');
+  assert(styleEl, 'Filter style must be injected');
+  assert(
+    styleEl.textContent.includes('[data-testid="new-conversation-button"]'),
+    'Style must hide new-conversation-button'
+  );
+  assert(
+    styleEl.textContent.includes('div:has(> .jetski-needs-reaction-inbox)'),
+    'Style must enforce flex column on inbox parent to prevent bottom overflow'
+  );
+  assert(
+    styleEl.textContent.includes('border-radius: 0;'),
+    'Style must format inbox as flat architectural hairline section'
+  );
   // Clear running agent from earlier sidebar-row tests so inbox starts in a clean 0-item state
   reduxStore.dispatch({
     type: 'trajectorySummaries/applyStreamBatch',
@@ -1582,9 +1596,9 @@ const liveBucketBtn = (k) =>
   assert(tabNeedsMe, 'Needs Me tab button must exist');
   assert(tabWorking, 'Working tab button must exist');
   assert(tabStale, 'Stale tab button must exist');
-  assert.strictEqual(tabNeedsMe.querySelector('.jetski-inbox-tab-label').textContent, '🚨 Needs Me');
-  assert.strictEqual(tabWorking.querySelector('.jetski-inbox-tab-label').textContent, '🤖 Working');
-  assert.strictEqual(tabStale.querySelector('.jetski-inbox-tab-label').textContent, '🧹 Stale');
+  assert.strictEqual(tabNeedsMe.querySelector('.jetski-inbox-tab-label').textContent, 'Needs Me');
+  assert.strictEqual(tabWorking.querySelector('.jetski-inbox-tab-label').textContent, 'Working');
+  assert.strictEqual(tabStale.querySelector('.jetski-inbox-tab-label').textContent, 'Stale');
   assert.strictEqual(tabNeedsMe.getAttribute('data-active'), 'true');
   assert.strictEqual(tabWorking.getAttribute('data-active'), 'false');
   assert.strictEqual(tabStale.getAttribute('data-active'), 'false');
@@ -1696,7 +1710,7 @@ const liveBucketBtn = (k) =>
   const urgentPill = tabNeedsMe.querySelector('.jetski-inbox-urgent-pill');
   assert(urgentPill, 'Urgent pill must be rendered when urgentCount > 0');
   assert.strictEqual(urgentPill.style.display, '');
-  assert.strictEqual(urgentPill.textContent, '🔥 1');
+  assert.strictEqual(urgentPill.textContent, '· 1!');
 
   const inboxRows = inboxEl.querySelectorAll('.jetski-inbox-row');
   assert.strictEqual(inboxRows.length, 3);
@@ -3839,7 +3853,7 @@ eval(code);
   const inboxEl = sidebarWrap.querySelector('.jetski-needs-reaction-inbox');
   assert(inboxEl, 'Needs-Reaction inbox must mount');
   const urgentPill = inboxEl.querySelector('[data-testid="jetski-inbox-urgent-pill"]');
-  assert.strictEqual(urgentPill.textContent, '🔥 5');
+  assert.strictEqual(urgentPill.textContent, '· 5!');
 
   const getInboxRows = () =>
     inboxEl.querySelectorAll('[data-testid="jetski-inbox-row"]');
@@ -4035,7 +4049,7 @@ eval(code);
   details = detailByCid();
   assert.strictEqual(details.has('chat-sub-parent'), false);
   assert.strictEqual(details.has('chat-battle'), false);
-  assert.strictEqual(urgentPill.textContent, '🔥 3');
+  assert.strictEqual(urgentPill.textContent, '· 3!');
 
   // Dismiss chat-perm-running while blocked at stepIndex 2 -> disappears from Needs Me
   const permSeenBtn = details
@@ -4045,7 +4059,7 @@ eval(code);
   flushRaf();
   details = detailByCid();
   assert.strictEqual(details.has('chat-perm-running'), false);
-  assert.strictEqual(urgentPill.textContent, '🔥 2');
+  assert.strictEqual(urgentPill.textContent, '· 2!');
 
   // New blocked step (stepIndex 5, npm publish) re-surfaces chat-perm-running in Needs Me!
   reduxStore.dispatch({
@@ -4086,7 +4100,7 @@ eval(code);
     details.get('chat-perm-running').detail,
     'Permission required for execute: npm publish'
   );
-  assert.strictEqual(urgentPill.textContent, '🔥 3');
+  assert.strictEqual(urgentPill.textContent, '· 3!');
 
   window.__jetskiClosedChatsFilterCleanup();
   assert.strictEqual(pendingTimers.size, 0, 'Zero dangling timers after cleanup');
@@ -4560,7 +4574,7 @@ eval(code);
   const inboxEl = sidebarWrap.querySelector('.jetski-needs-reaction-inbox');
   assert(inboxEl, 'Needs-Reaction inbox must mount');
   const urgentPill = inboxEl.querySelector('[data-testid="jetski-inbox-urgent-pill"]');
-  assert.strictEqual(urgentPill.textContent, '🔥 7');
+  assert.strictEqual(urgentPill.textContent, '· 7!');
 
   const rows = inboxEl.querySelectorAll('[data-testid="jetski-inbox-row"]');
   const detailByCid = new Map();

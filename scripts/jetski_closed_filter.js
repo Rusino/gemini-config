@@ -137,10 +137,11 @@
   let inboxCollapsed = safeGetStorage(STORAGE_INBOX_COLLAPSED_KEY) === 'true';
   const STORAGE_INBOX_TAB_KEY = 'jetski_inbox_tab_v1';
   const INBOX_TABS = ['needs-me', 'working', 'stale'];
+  // Typographic tab labels without emoji prefixes fit on one header line in a narrow sidebar
   const INBOX_TAB_DEFS = [
-    { key: 'needs-me', label: '🚨 Needs Me' },
-    { key: 'working', label: '🤖 Working' },
-    { key: 'stale', label: '🧹 Stale' },
+    { key: 'needs-me', label: 'Needs Me' },
+    { key: 'working', label: 'Working' },
+    { key: 'stale', label: 'Stale' },
   ];
   const STALE_THRESHOLD_MS = 7 * 24 * 60 * 60 * 1000;
   const INBOX_EMPTY_TEXT = {
@@ -4075,92 +4076,141 @@
     ` +
       // Style the collapsible Needs-Reaction inbox widget above the sidebar project list
       `
+      /* Hide redundant new-conversation button to pull history and inbox up by ~50px */
+      [aria-label="Sidebar"] [data-testid="new-conversation-button"] {
+        display: none !important;
+      }
+      [aria-label="Sidebar"] > div:first-child {
+        margin-bottom: 4px !important;
+      }
+      [aria-label="Sidebar"] > div.mt-3.h-px {
+        margin-top: 6px !important;
+        background-color: rgba(128, 128, 128, 0.14) !important;
+      }
+      [aria-label="Sidebar"] div.overflow-y-auto:has(.${INBOX_CLASS}) {
+        gap: 6px !important;
+        padding-top: 6px !important;
+        padding-bottom: 0 !important;
+      }
+      /* Make inbox parent a flex column so conversation-list-sidebar never overflows bottom */
+      div:has(> .${INBOX_CLASS}) {
+        display: flex !important;
+        flex-direction: column !important;
+      }
+      div:has(> .${INBOX_CLASS}) > [data-testid="conversation-list-sidebar"],
+      div:has(> .${INBOX_CLASS}) > [data-sidebar-scroll-container="true"] {
+        flex: 1 1 0% !important;
+        min-height: 0 !important;
+        height: auto !important;
+      }
+      /* Borderless hairline section replaces the outdated rounded card box */
       .${INBOX_CLASS} {
         display: flex;
         flex-direction: column;
-        margin: 4px 8px 6px 8px;
-        border-radius: 8px;
-        background: rgba(128, 134, 139, 0.08);
-        border: 1px solid rgba(128, 134, 139, 0.24);
+        margin: 2px 8px 6px 8px;
+        padding: 3px 0 2px 0;
+        border-radius: 0;
+        background: transparent;
+        border: none;
+        border-top: 1px solid rgba(128, 128, 128, 0.16);
+        border-bottom: 1px solid rgba(128, 128, 128, 0.16);
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         font-size: 11.5px;
-        line-height: 1.35;
+        line-height: 1.3;
         overflow: hidden;
         flex-shrink: 0;
         user-select: none;
       }
       .${INBOX_CLASS}[data-urgent="true"] {
-        border-color: rgba(248, 113, 113, 0.42);
+        border-top-color: rgba(128, 128, 128, 0.22);
       }
       .jetski-inbox-empty-row {
         padding: 4px 8px;
         color: var(--muted-foreground, #9aa0a6);
         font-size: 11px;
-        font-style: italic;
       }
       .${INBOX_HEADER_CLASS} {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        gap: 6px;
-        padding: 4px 8px;
-        background: rgba(128, 134, 139, 0.12);
-        font-weight: 600;
+        gap: 4px;
+        padding: 0 4px 2px 6px;
+        min-height: 22px;
+        background: transparent;
+        border-bottom: 1px solid rgba(128, 128, 128, 0.10);
         font-size: 11px;
         color: var(--foreground, #e8eaed);
+      }
+      .${INBOX_CLASS}[data-collapsed="true"] .${INBOX_HEADER_CLASS} {
+        border-bottom-color: transparent;
+        padding-bottom: 0;
       }
       .${INBOX_HEADER_CLASS} .jetski-inbox-header-left {
         display: flex;
         align-items: center;
-        gap: 4px;
+        gap: 10px;
         min-width: 0;
-        flex-wrap: wrap;
+        flex-wrap: nowrap;
+        overflow: hidden;
       }
       .${INBOX_TAB_BTN_CLASS} {
+        position: relative;
         display: inline-flex;
-        align-items: center;
-        gap: 4px;
-        padding: 2px 6px;
-        border-radius: 4px;
+        align-items: baseline;
+        gap: 3.5px;
+        padding: 2px 0 4px 0;
+        margin-bottom: -3px;
+        border-radius: 0;
         border: none;
+        border-bottom: 1.5px solid transparent;
         background: transparent;
-        color: var(--muted-foreground, #9aa0a6);
+        color: rgba(154, 160, 166, 0.72);
         font-family: inherit;
         font-size: 11px;
         font-weight: 500;
+        letter-spacing: -0.005em;
+        white-space: nowrap;
         cursor: pointer;
         user-select: none;
-        transition: background-color 100ms ease, color 100ms ease;
+        transition: color 100ms ease, border-color 100ms ease;
       }
       .${INBOX_TAB_BTN_CLASS}:hover {
-        background: rgba(128, 134, 139, 0.18);
         color: var(--foreground, #e8eaed);
       }
       .${INBOX_TAB_BTN_CLASS}[data-active="true"] {
-        background: rgba(128, 134, 139, 0.28);
         color: var(--foreground, #e8eaed);
         font-weight: 600;
+        border-bottom-color: rgba(232, 234, 237, 0.85);
+      }
+      .${INBOX_CLASS}[data-urgent="true"] .jetski-inbox-tab-needs-me[data-active="true"] {
+        border-bottom-color: #f87171;
       }
       .${INBOX_TAB_BTN_CLASS} .jetski-inbox-count-badge {
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        padding: 0 4px;
-        border-radius: 999px;
-        background: rgba(128, 134, 139, 0.24);
+        padding: 0;
+        border-radius: 0;
+        background: transparent;
         font-size: 10px;
+        font-weight: 500;
         font-variant-numeric: tabular-nums;
         line-height: 1.3;
+        opacity: 0.62;
+      }
+      .${INBOX_TAB_BTN_CLASS}[data-active="true"] .jetski-inbox-count-badge {
+        opacity: 0.88;
       }
       .${INBOX_TAB_BTN_CLASS} .jetski-inbox-urgent-pill {
         display: inline-flex;
         align-items: center;
-        gap: 2px;
-        padding: 0 4px;
-        border-radius: 999px;
-        background: rgba(248, 113, 113, 0.2);
-        color: #fca5a5;
+        gap: 1px;
+        padding: 0;
+        border-radius: 0;
+        background: transparent;
+        color: #f87171;
         font-size: 10px;
+        font-weight: 600;
         font-variant-numeric: tabular-nums;
         line-height: 1.3;
       }
@@ -4170,15 +4220,17 @@
         padding: 0 2px;
         cursor: pointer;
         color: var(--muted-foreground, #9aa0a6);
+        opacity: 0.55;
         font-size: 10px;
         line-height: 1;
+        flex-shrink: 0;
       }
       .${INBOX_LIST_CLASS} {
         display: flex;
         flex-direction: column;
-        max-height: 136px;
+        max-height: 108px;
         overflow-y: auto;
-        padding: 2px 0;
+        padding: 2px 0 0 0;
       }
       .${INBOX_CLASS}[data-collapsed="true"] .${INBOX_LIST_CLASS} {
         display: none !important;
@@ -4188,20 +4240,22 @@
         align-items: center;
         justify-content: space-between;
         gap: 5px;
-        padding: 3px 6px 3px 8px;
+        padding: 2.5px 4px 2.5px 6px;
         cursor: pointer;
-        min-height: 24px;
+        min-height: 22px;
+        border-radius: 0;
         box-sizing: border-box;
         transition: background-color 100ms ease;
       }
       .${INBOX_ROW_CLASS}:hover {
-        background: rgba(128, 134, 139, 0.18);
+        background: rgba(128, 134, 139, 0.14);
       }
       .${INBOX_ROW_CLASS}[data-tier="urgent"] {
-        background: rgba(248, 113, 113, 0.08);
+        box-shadow: inset 2px 0 0 #f87171;
+        background: rgba(248, 113, 113, 0.04);
       }
       .${INBOX_ROW_CLASS}[data-tier="urgent"]:hover {
-        background: rgba(248, 113, 113, 0.16);
+        background: rgba(248, 113, 113, 0.10);
       }
       .${INBOX_ROW_CLASS} .jetski-inbox-row-main {
         display: flex;
@@ -4212,28 +4266,35 @@
       }
       .${INBOX_ROW_CLASS} .jetski-inbox-tier-icon {
         flex-shrink: 0;
-        font-size: 11px;
+        font-size: 10px;
         line-height: 1;
       }
+      .${INBOX_ROW_CLASS}[data-tab="needs-me"] .jetski-inbox-tier-icon {
+        display: none;
+      }
       .${INBOX_ROW_CLASS} .jetski-inbox-project {
-        flex: 0 1 auto;
-        max-width: 85px;
+        flex: 0 0 auto;
+        max-width: 72px;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
-        padding: 0 4px;
-        border-radius: 3px;
-        background: rgba(128, 134, 139, 0.18);
-        color: var(--muted-foreground, #b8bdc4);
+        padding: 0;
+        border-radius: 0;
+        background: transparent;
+        color: rgba(154, 160, 166, 0.72);
         font-size: 10px;
         font-weight: 500;
+      }
+      .${INBOX_ROW_CLASS} .jetski-inbox-project::after {
+        content: " ·";
+        opacity: 0.55;
       }
       .${INBOX_ROW_CLASS} .jetski-inbox-text-col {
         display: flex;
         flex-direction: column;
         flex: 1 1 auto;
         min-width: 0;
-        gap: 1px;
+        gap: 0.5px;
       }
       .${INBOX_ROW_CLASS} .jetski-inbox-title {
         min-width: 0;
@@ -4241,9 +4302,10 @@
         text-overflow: ellipsis;
         white-space: nowrap;
         color: var(--foreground, #e8eaed);
+        font-size: 11.5px;
       }
       .${INBOX_ROW_CLASS}[data-tier="urgent"] .jetski-inbox-title {
-        font-weight: 600;
+        font-weight: 500;
       }
       .${INBOX_ROW_CLASS} .jetski-inbox-detail {
         min-width: 0;
@@ -4251,15 +4313,13 @@
         text-overflow: ellipsis;
         white-space: nowrap;
         font-size: 10px;
-        line-height: 1.25;
-        color: var(--muted-foreground, #9aa0a6);
-      }
-      .${INBOX_ROW_CLASS}[data-tier="urgent"] .jetski-inbox-detail {
-        color: #fca5a5;
+        line-height: 1.2;
+        color: #f87171;
+        opacity: 0.9;
       }
       .${INBOX_ROW_CLASS} .jetski-inbox-time {
         flex-shrink: 0;
-        color: var(--muted-foreground, #9aa0a6);
+        color: rgba(154, 160, 166, 0.65);
         font-size: 10px;
         font-variant-numeric: tabular-nums;
       }
@@ -4274,22 +4334,26 @@
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        width: 20px;
-        height: 20px;
+        width: 18px;
+        height: 18px;
         padding: 0;
         border: none;
-        border-radius: 4px;
+        border-radius: 3px;
         background: transparent;
         color: var(--muted-foreground, #9aa0a6);
-        font-size: 11px;
+        font-size: 10.5px;
         line-height: 1;
         cursor: pointer;
-        opacity: 0.72;
+        opacity: 0.55;
+      }
+      .${INBOX_ARCHIVE_BTN_CLASS} {
+        filter: grayscale(1);
+        font-size: 10px;
       }
       .${INBOX_SEEN_BTN_CLASS}:hover,
       .${INBOX_ARCHIVE_BTN_CLASS}:hover {
         opacity: 1;
-        background: rgba(128, 134, 139, 0.24);
+        background: rgba(128, 134, 139, 0.20);
         color: var(--foreground, #e8eaed);
       }
     `;
@@ -6463,7 +6527,7 @@
           const urgentPill = tabBtn.querySelector('.jetski-inbox-urgent-pill');
           if (urgentPill) {
             urgentPill.style.display = urgentCount > 0 ? '' : 'none';
-            const nextUrgentText = urgentCount > 0 ? `🔥 ${urgentCount}` : '';
+            const nextUrgentText = urgentCount > 0 ? `· ${urgentCount}!` : '';
             if (urgentPill.textContent !== nextUrgentText) {
               urgentPill.textContent = nextUrgentText;
             }
