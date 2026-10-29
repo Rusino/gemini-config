@@ -23,6 +23,14 @@
   const INBOX_ARCHIVE_BTN_CLASS = 'jetski-inbox-archive-btn';
   const BUTTON_CLASS = 'jetski-closed-chats-filter-btn';
   const TITLEBAR_BTN_CLASS = 'jetski-titlebar-archive-btn';
+  // Live context window volume pill rendered before Search in each conversation titlebar
+  const TITLEBAR_CONTEXT_BADGE_CLASS = 'jetski-titlebar-context-badge';
+  const CONTEXT_SOFT_PCT = 60;
+  const CONTEXT_TURN_START_PCT = 65;
+  const CONTEXT_HARD_PCT = 80;
+  const CONTEXT_MIN_FETCH_INTERVAL_MS = 1200;
+  const CONTEXT_RUNNING_POLL_MS = 4000;
+  const CONTEXT_CACHE_MAX_ENTRIES = 64;
   // Right-side ⏳ badge rendered on open ⦿ rows waiting on background tasks or subagents
   const ROW_BG_WAIT_INDICATOR_CLASS = 'jetski-row-bg-wait-indicator';
   // Compact open-task badge rendered inside sidebar project headers
@@ -167,6 +175,11 @@
   // Tracks which project roadmap badge owns the shared floating bubble tooltip
   let activeHoverRoadmapBadge = null;
   let activeHoverRoadmapProjectId = null;
+  // Tracks which titlebar context badge owns the shared floating bubble tooltip
+  let activeHoverContextBadge = null;
+  let activeHoverContextCascadeId = null;
+  // Per-conversation paged generatorMetadata cache so updates stay ~2 KB instead of growing
+  const contextUsageCache = new Map();
   let chainIndexCache = null;
   let chainIndexFetchedAt = 0;
   // Auto-switch follows a fresh handoff redirect only for views the user did not open by hand,
@@ -903,6 +916,55 @@
       .${TITLEBAR_BTN_CLASS}:hover {
         opacity: 1;
       }
+      /* Compact context volume pill aligned with context_guard 60% / 65% / 80% thresholds */
+      .${TITLEBAR_CONTEXT_BADGE_CLASS} {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        height: 20px;
+        padding: 0 7px;
+        margin-right: 4px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 600;
+        line-height: 1;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+        cursor: pointer;
+        user-select: none;
+        border: 1px solid rgba(128, 134, 139, 0.32);
+        background: rgba(128, 134, 139, 0.12);
+        color: var(--muted-foreground, #b8bdc4);
+        transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+      }
+      .${TITLEBAR_CONTEXT_BADGE_CLASS}:hover {
+        background: rgba(128, 134, 139, 0.22);
+        color: var(--foreground, #e8eaed);
+      }
+      .${TITLEBAR_CONTEXT_BADGE_CLASS}[data-level="soft"] {
+        border-color: rgba(251, 191, 36, 0.45);
+        background: rgba(251, 191, 36, 0.13);
+        color: #fde047;
+      }
+      .${TITLEBAR_CONTEXT_BADGE_CLASS}[data-level="soft"]:hover {
+        background: rgba(251, 191, 36, 0.22);
+      }
+      .${TITLEBAR_CONTEXT_BADGE_CLASS}[data-level="turn-start"] {
+        border-color: rgba(251, 146, 60, 0.48);
+        background: rgba(251, 146, 60, 0.15);
+        color: #fdba74;
+      }
+      .${TITLEBAR_CONTEXT_BADGE_CLASS}[data-level="turn-start"]:hover {
+        background: rgba(251, 146, 60, 0.24);
+      }
+      .${TITLEBAR_CONTEXT_BADGE_CLASS}[data-level="hard"] {
+        border-color: rgba(248, 113, 113, 0.5);
+        background: rgba(248, 113, 113, 0.16);
+        color: #fca5a5;
+      }
+      .${TITLEBAR_CONTEXT_BADGE_CLASS}[data-level="hard"]:hover {
+        background: rgba(248, 113, 113, 0.26);
+      }
       @keyframes jetski-locate-pulse {
         0% {
           box-shadow: 0 0 0 2px #8ab4f8, 0 0 12px rgba(138, 180, 248, 0.55);
@@ -1116,6 +1178,32 @@
         border-radius: 8px;
         font-size: 11.5px;
         line-height: 1.45;
+      }
+      /* Context breakdown card width inside the shared floating glass tooltip */
+      #jetski-closed-chats-filter-bubble[data-mode="context"] {
+        width: 288px;
+        padding: 10px 12px;
+        border-radius: 8px;
+        font-size: 11.5px;
+        line-height: 1.45;
+      }
+      #jetski-closed-chats-filter-bubble .jcfb-ctx-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 1.5px 0;
+        font-variant-numeric: tabular-nums;
+      }
+      #jetski-closed-chats-filter-bubble .jcfb-ctx-val {
+        color: var(--muted-foreground, #b8bdc4);
+      }
+      #jetski-closed-chats-filter-bubble .jcfb-ctx-footer {
+        margin-top: 6px;
+        padding-top: 6px;
+        border-top: 1px solid rgba(128, 134, 139, 0.22);
+        font-size: 10.5px;
+        color: var(--muted-foreground, #9aa0a6);
       }
       #jetski-closed-chats-filter-bubble[data-visible="true"] {
         opacity: 1;
@@ -1586,12 +1674,19 @@
     bubble.style.top = `${Math.round(top)}px`;
   }
 
+  // Clears active context badge ownership when another tooltip takes over or hides
+  function clearContextHover() {
+    activeHoverContextBadge = null;
+    activeHoverContextCascadeId = null;
+  }
+
   function showBubbleForButton(btn, bucketKey) {
     activeHoverBtn = btn;
     activeHoverBucket = bucketKey || btn?.getAttribute('data-bucket') || 'needs-me';
     // Clear any active roadmap badge hover state since the shared bubble now renders bucket stats
     activeHoverRoadmapBadge = null;
     activeHoverRoadmapProjectId = null;
+    clearContextHover();
     const bubble = ensureBubbleElement();
     if (!bubble || !btn) return;
     if (bubble.getAttribute('data-mode') !== 'filter') {
@@ -1613,6 +1708,7 @@
     // Reset both bucket and roadmap hover owners when hiding the shared bubble
     activeHoverRoadmapBadge = null;
     activeHoverRoadmapProjectId = null;
+    clearContextHover();
     const bubble = document.getElementById('jetski-closed-chats-filter-bubble');
     if (bubble && bubble.getAttribute('data-visible') !== 'false') {
       bubble.setAttribute('data-visible', 'false');
@@ -1626,6 +1722,7 @@
     activeHoverBucket = null;
     activeHoverRoadmapBadge = null;
     activeHoverRoadmapProjectId = null;
+    clearContextHover();
     const bubble = ensureBubbleElement();
     if (!bubble) return;
     // Reuse the compact 1-line filter pill layout for icon button tooltips
@@ -1757,6 +1854,8 @@
     activeHoverBucket = null;
     activeHoverRoadmapBadge = badge;
     activeHoverRoadmapProjectId = projectId;
+    // Release any hovered context pill before reusing the shared tooltip for roadmap items
+    clearContextHover();
     const bubble = ensureBubbleElement();
     if (!bubble) return;
     if (bubble.getAttribute('data-mode') !== 'roadmap') {
@@ -3620,7 +3719,393 @@
     }
   }
 
-  // Injects or updates the Search, Locate, and Archive icon buttons before ⋮ in each titlebar
+  // Formats token counts for the compact titlebar pill without rounding across unit boundaries
+  function formatCompactTokens(tokens) {
+    const n = Math.max(0, Math.round(Number(tokens) || 0));
+    if (n < 1000) return String(n);
+    if (n < 9950) return `${(n / 1000).toFixed(1).replace(/\.0$/, '')}k`;
+    if (n < 999500) return `${Math.round(n / 1000)}k`;
+    return `${(n / 1000000).toFixed(1).replace(/\.0$/, '')}M`;
+  }
+
+  function formatExactInt(n) {
+    return String(Math.max(0, Math.round(Number(n) || 0))).replace(
+      /\B(?=(\d{3})+(?!\d))/g,
+      ','
+    );
+  }
+
+  // Prevents upward rounding across 60% / 65% / 80% / 100% before pct actually reaches them
+  function formatDisplayPct(pct) {
+    let p = Math.round(pct);
+    if (pct < CONTEXT_SOFT_PCT && p >= CONTEXT_SOFT_PCT) p = CONTEXT_SOFT_PCT - 1;
+    else if (pct < CONTEXT_TURN_START_PCT && p >= CONTEXT_TURN_START_PCT) {
+      p = CONTEXT_TURN_START_PCT - 1;
+    } else if (pct < CONTEXT_HARD_PCT && p >= CONTEXT_HARD_PCT) p = CONTEXT_HARD_PCT - 1;
+    else if (pct < 100 && p >= 100) p = 99;
+    return Math.max(0, p);
+  }
+
+  // Extracts the latest valid contextWindowMetadata entry, matching context_guard.py semantics
+  function parseLatestContextMetadata(gm) {
+    if (!Array.isArray(gm)) return null;
+    for (let i = gm.length - 1; i >= 0; i--) {
+      const csm = gm[i]?.chatModel?.chatStartMetadata;
+      const cwm = csm?.contextWindowMetadata;
+      const maxTokens = Math.round(Number(cwm?.maxContextTokens) || 0);
+      if (
+        maxTokens <= 0 ||
+        (cwm?.estimatedTokensUsed == null && cwm?.tokenBreakdown?.totalTokens == null)
+      ) {
+        continue;
+      }
+      const usedTokens = Math.max(
+        0,
+        Math.round(
+          Number(cwm.estimatedTokensUsed ?? cwm.tokenBreakdown?.totalTokens ?? 0) || 0
+        )
+      );
+      const freeTokens = Math.max(0, maxTokens - usedTokens);
+      const pct = (100 * usedTokens) / maxTokens;
+      // Proto3 JSON sends -1 before compaction and omits 0 on the first checkpoint
+      const ckpt = Number(csm?.checkpointIndex ?? 0);
+      const compacted = Number.isFinite(ckpt) && ckpt >= 0;
+      let level = 'ok';
+      if (compacted || pct >= CONTEXT_HARD_PCT) level = 'hard';
+      else if (pct >= CONTEXT_TURN_START_PCT) level = 'turn-start';
+      else if (pct >= CONTEXT_SOFT_PCT) level = 'soft';
+
+      const rawGroups = Array.isArray(cwm?.tokenBreakdown?.groups)
+        ? cwm.tokenBreakdown.groups
+        : [];
+      const groups = rawGroups
+        .filter((g) => g && Number.isFinite(Number(g.numTokens)))
+        .map((g) => ({
+          name: String(g.name || g.type || 'Other'),
+          tokens: Math.max(0, Math.round(Number(g.numTokens) || 0)),
+        }));
+
+      const usedStr = formatCompactTokens(usedTokens);
+      const maxStr = formatCompactTokens(maxTokens);
+      const dispPct = formatDisplayPct(pct);
+      const prefix = compacted ? '⟳ ' : '';
+      return {
+        matchedIndex: i,
+        usedTokens,
+        maxTokens,
+        freeTokens,
+        pct,
+        ckpt: Number.isFinite(ckpt) ? ckpt : -1,
+        compacted,
+        level,
+        groups,
+        badgeText: `${prefix}${usedStr} / ${maxStr} · ${dispPct}%`,
+      };
+    }
+    return null;
+  }
+
+  function getContextSummarySig(cascadeId) {
+    const s = findReduxStore()?.getState()?.trajectorySummaries?.summaries?.[cascadeId];
+    if (!s) return '__none__';
+    return [
+      s.status || '',
+      parseTimestampMs(s.lastModifiedTime),
+      s.stepCount ?? '',
+      Boolean(s.notFullyIdle),
+    ].join(':');
+  }
+
+  function clearContextEntryTimers(entry) {
+    if (entry.throttleTimerId) {
+      clearTimeout(entry.throttleTimerId);
+      entry.throttleTimerId = 0;
+    }
+    if (entry.pollTimerId) {
+      clearTimeout(entry.pollTimerId);
+      entry.pollTimerId = 0;
+    }
+  }
+
+  function getOrCreateContextCacheEntry(cascadeId) {
+    let entry = contextUsageCache.get(cascadeId);
+    if (entry) {
+      contextUsageCache.delete(cascadeId);
+      contextUsageCache.set(cascadeId, entry);
+      return entry;
+    }
+    if (contextUsageCache.size >= CONTEXT_CACHE_MAX_ENTRIES) {
+      for (const [oldId, oldEntry] of contextUsageCache.entries()) {
+        if (!oldEntry.inFlight && !oldEntry.throttleTimerId && !oldEntry.pollTimerId) {
+          contextUsageCache.delete(oldId);
+          break;
+        }
+      }
+    }
+    entry = {
+      lastValidIndex: 0,
+      summarySig: '',
+      fetchedAt: 0,
+      inFlight: false,
+      pendingRefresh: false,
+      pendingForce: false,
+      throttleTimerId: 0,
+      pollTimerId: 0,
+      info: null,
+    };
+    contextUsageCache.set(cascadeId, entry);
+    return entry;
+  }
+
+  async function fetchContextUsageOnce(cascadeId, offset) {
+    if (typeof window.fetch !== 'function') return { ok: false, gm: [] };
+    try {
+      const resp = await window.fetch(
+        '/exa.language_server_pb.LanguageServerService/GetCascadeTrajectoryGeneratorMetadata',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-codeium-csrf-token': getCsrfToken(),
+          },
+          body: JSON.stringify({
+            cascadeId,
+            generatorMetadataOffset: offset,
+            includeMessages: false,
+          }),
+        }
+      );
+      if (!resp || !resp.ok) return { ok: false, gm: [] };
+      const data = await resp.json();
+      return {
+        ok: true,
+        gm: Array.isArray(data?.generatorMetadata) ? data.generatorMetadata : [],
+      };
+    } catch {
+      return { ok: false, gm: [] };
+    }
+  }
+
+  // True only when cascadeId is actively running and mounted in an open pane titlebar
+  function isOpenRunningCascade(cascadeId) {
+    const summary = findReduxStore()?.getState()?.trajectorySummaries?.summaries?.[cascadeId];
+    if (summary?.status !== 'CASCADE_RUN_STATUS_RUNNING') return false;
+    for (const b of document.querySelectorAll(`.${TITLEBAR_CONTEXT_BADGE_CLASS}`)) {
+      if (b.getAttribute('data-cascade-id') === cascadeId) return true;
+    }
+    return false;
+  }
+
+  async function triggerContextUsageFetch(cascadeId) {
+    if (disposed || !cascadeId) return;
+    const entry = getOrCreateContextCacheEntry(cascadeId);
+    if (entry.inFlight) return;
+    entry.inFlight = true;
+    entry.pendingRefresh = false;
+    entry.pendingForce = false;
+    const reqSig = getContextSummarySig(cascadeId);
+    entry.fetchedAt = Date.now();
+    let resOk = false;
+    try {
+      const initialOffset = entry.lastValidIndex > 0 ? entry.lastValidIndex : 0;
+      let usedOffset = initialOffset;
+      let res = await fetchContextUsageOnce(cascadeId, initialOffset);
+      let parsed = res.ok ? parseLatestContextMetadata(res.gm) : null;
+      // Retry from 0 when trajectory rewound or cached anchor lost contextWindowMetadata
+      if (res.ok && initialOffset > 0 && (res.gm.length === 0 || !parsed)) {
+        usedOffset = 0;
+        res = await fetchContextUsageOnce(cascadeId, 0);
+        parsed = res.ok ? parseLatestContextMetadata(res.gm) : null;
+      }
+      resOk = res.ok;
+      if (!disposed && res.ok) {
+        entry.summarySig = reqSig;
+        entry.lastValidIndex = parsed ? usedOffset + parsed.matchedIndex : 0;
+        const prevSig = entry.info
+          ? `${entry.info.usedTokens}:${entry.info.maxTokens}:${entry.info.ckpt}`
+          : '';
+        entry.info = parsed;
+        const nextSig = parsed ? `${parsed.usedTokens}:${parsed.maxTokens}:${parsed.ckpt}` : '';
+        if (prevSig !== nextSig) {
+          scheduleSync();
+        }
+      }
+    } finally {
+      entry.inFlight = false;
+      const latestSig = getContextSummarySig(cascadeId);
+      if (!disposed && (entry.pendingRefresh || (resOk && latestSig !== reqSig))) {
+        const force = entry.pendingForce;
+        entry.pendingRefresh = false;
+        entry.pendingForce = false;
+        ensureContextUsageLoaded(cascadeId, force);
+      } else if (
+        !disposed &&
+        !entry.throttleTimerId &&
+        !entry.pollTimerId &&
+        isOpenRunningCascade(cascadeId)
+      ) {
+        // Re-check open running turns during silent model thinking; stops immediately once idle
+        entry.pollTimerId = setTimeout(() => {
+          entry.pollTimerId = 0;
+          if (!disposed && isOpenRunningCascade(cascadeId)) {
+            ensureContextUsageLoaded(cascadeId, false);
+          }
+        }, CONTEXT_RUNNING_POLL_MS);
+      }
+    }
+  }
+
+  // Coalesces context metadata fetches per conversation with zero background polling when idle
+  function ensureContextUsageLoaded(cascadeId, forceRefresh = false) {
+    if (disposed || !cascadeId) return;
+    const entry = getOrCreateContextCacheEntry(cascadeId);
+    const summary = findReduxStore()?.getState()?.trajectorySummaries?.summaries?.[cascadeId];
+    const summarySig = getContextSummarySig(cascadeId);
+    const now = Date.now();
+    const isRunningDue =
+      summary?.status === 'CASCADE_RUN_STATUS_RUNNING' &&
+      now - entry.fetchedAt >= CONTEXT_RUNNING_POLL_MS;
+    const needsFetch =
+      forceRefresh ||
+      entry.fetchedAt === 0 ||
+      summarySig !== entry.summarySig ||
+      isRunningDue;
+    if (!needsFetch) return;
+
+    if (entry.inFlight) {
+      entry.pendingRefresh = true;
+      if (forceRefresh) entry.pendingForce = true;
+      return;
+    }
+
+    const elapsed = now - entry.fetchedAt;
+    if (!forceRefresh && entry.fetchedAt > 0 && elapsed < CONTEXT_MIN_FETCH_INTERVAL_MS) {
+      // Pre-empt any conditional 4s running poll so fast idle completions still fire
+      if (entry.pollTimerId) {
+        clearTimeout(entry.pollTimerId);
+        entry.pollTimerId = 0;
+      }
+      if (!entry.throttleTimerId) {
+        const waitMs = Math.max(20, CONTEXT_MIN_FETCH_INTERVAL_MS - elapsed);
+        entry.throttleTimerId = setTimeout(() => {
+          entry.throttleTimerId = 0;
+          if (!disposed) {
+            void triggerContextUsageFetch(cascadeId);
+          }
+        }, waitMs);
+      }
+      return;
+    }
+
+    clearContextEntryTimers(entry);
+    void triggerContextUsageFetch(cascadeId);
+  }
+
+  function buildContextBubbleHtml(info) {
+    const dotColors = {
+      ok: '#8ab4f8',
+      soft: '#fbbf24',
+      'turn-start': '#fb923c',
+      hard: '#f87171',
+    };
+    const dotColor = dotColors[info.level] || '#8ab4f8';
+    const compactTag = info.compacted ? ` · Compacted #${info.ckpt + 1}` : '';
+    const rowsHtml = info.groups
+      .map((g) => {
+        const grpPct = info.maxTokens > 0 ? ((100 * g.tokens) / info.maxTokens).toFixed(1) : '0.0';
+        return (
+          `<div class="jcfb-ctx-row">` +
+          `<span>${escapeHtml(g.name)}</span>` +
+          `<span class="jcfb-ctx-val">${formatExactInt(g.tokens)} (${grpPct}%)</span>` +
+          `</div>`
+        );
+      })
+      .join('');
+    const breakdownBlock = rowsHtml
+      ? `<div class="jcfb-section-title">Token breakdown</div>${rowsHtml}`
+      : '';
+    let statusNote = 'Status: Within budget (< 60%)';
+    if (info.compacted) statusNote = 'Status: Compacted — handoff required';
+    else if (info.level === 'hard') statusNote = 'Status: Hard limit (>= 80%) — handoff now';
+    else if (info.level === 'turn-start') {
+      statusNote = 'Status: Turn-start limit (>= 65%) — handoff on next turn';
+    } else if (info.level === 'soft') {
+      statusNote = 'Status: Soft warning (>= 60%) — handoff at micro-boundary';
+    }
+    return (
+      `<div class="jcfb-header">` +
+      `<span class="jcfb-header-left">` +
+      `<span class="jcfb-dot" style="background:${dotColor}"></span>` +
+      `<span>Context Window</span>` +
+      `</span>` +
+      `<span>${info.pct.toFixed(1)}%${escapeHtml(compactTag)}</span>` +
+      `</div>` +
+      `<div class="jcfb-desc">` +
+      `${formatExactInt(info.usedTokens)} / ${formatExactInt(info.maxTokens)} tokens · ` +
+      `${formatExactInt(info.freeTokens)} free` +
+      `</div>` +
+      breakdownBlock +
+      `<div class="jcfb-ctx-footer">` +
+      `<div>${escapeHtml(statusNote)}</div>` +
+      `<div>Guards: Soft 60% · Turn-start 65% · Hard 80%</div>` +
+      `</div>`
+    );
+  }
+
+  function setAttrIfChanged(el, attr, val) {
+    if (el.getAttribute(attr) !== val) el.setAttribute(attr, val);
+  }
+
+  function showContextBubbleForBadge(badge, cascadeId) {
+    const info = contextUsageCache.get(cascadeId)?.info;
+    if (!badge || !info) {
+      hideBubble();
+      return;
+    }
+    activeHoverBtn = null;
+    activeHoverBucket = null;
+    activeHoverRoadmapBadge = null;
+    activeHoverRoadmapProjectId = null;
+    activeHoverContextBadge = badge;
+    activeHoverContextCascadeId = cascadeId;
+    const bubble = ensureBubbleElement();
+    if (!bubble) return;
+    setAttrIfChanged(bubble, 'data-mode', 'context');
+    const nextHtml = buildContextBubbleHtml(info);
+    if (bubble.innerHTML !== nextHtml) {
+      bubble.innerHTML = nextHtml;
+    }
+    setAttrIfChanged(bubble, 'data-visible', 'true');
+    const rect = badge.getBoundingClientRect();
+    const bubbleWidth = 288;
+    let left = Math.max(8, Math.min(rect.right - bubbleWidth, window.innerWidth - bubbleWidth - 8));
+    bubble.style.left = `${Math.round(left)}px`;
+    bubble.style.top = `${Math.round(rect.bottom + 6)}px`;
+  }
+
+  function updateTitlebarContextBadgeUI(badge, cascadeId) {
+    if (!badge || !cascadeId) return;
+    setAttrIfChanged(badge, 'data-cascade-id', cascadeId);
+    ensureContextUsageLoaded(cascadeId, false);
+    const info = contextUsageCache.get(cascadeId)?.info || null;
+    if (!info) {
+      setAttrIfChanged(badge, 'data-empty', 'true');
+      if (badge.style.display !== 'none') badge.style.display = 'none';
+      if (activeHoverContextBadge === badge) hideBubble();
+      return;
+    }
+    setAttrIfChanged(badge, 'data-empty', 'false');
+    if (badge.style.display !== '') badge.style.display = '';
+    setAttrIfChanged(badge, 'data-level', info.level);
+    setAttrIfChanged(badge, 'data-compacted', info.compacted ? 'true' : 'false');
+    if (badge.textContent !== info.badgeText) badge.textContent = info.badgeText;
+    setAttrIfChanged(badge, 'aria-label', `Context usage: ${info.badgeText}`);
+    if (activeHoverContextBadge === badge) {
+      showContextBubbleForBadge(badge, cascadeId);
+    }
+  }
+
+  // Injects or updates the Context badge, Search, Locate, and Archive buttons before ⋮
   function ensureTitlebarButtons() {
     const moreActionsBtns = document.querySelectorAll(
       '[data-testid="titlebar-more-actions"]'
@@ -3630,6 +4115,33 @@
       if (!container) continue;
       const cascadeId = findCascadeIdFromElement(moreBtn);
       if (!cascadeId) continue;
+
+      // Mount context pill leftmost before Search so archived pieces also show token usage
+      let ctxBadge = container.querySelector(`.${TITLEBAR_CONTEXT_BADGE_CLASS}`);
+      if (!ctxBadge) {
+        ctxBadge = document.createElement('span');
+        ctxBadge.className = TITLEBAR_CONTEXT_BADGE_CLASS;
+        ctxBadge.setAttribute('data-testid', 'jetski-titlebar-context-badge');
+        ctxBadge.setAttribute('role', 'button');
+        ctxBadge.setAttribute('tabIndex', '0');
+        const resolveCid = () =>
+          ctxBadge.getAttribute('data-cascade-id') || findCascadeIdFromElement(moreBtn);
+        const onEnter = () => {
+          const cid = resolveCid();
+          if (cid) showContextBubbleForBadge(ctxBadge, cid);
+        };
+        ctxBadge.addEventListener('mouseenter', onEnter);
+        ctxBadge.addEventListener('mouseleave', hideBubble);
+        ctxBadge.addEventListener('focus', onEnter);
+        ctxBadge.addEventListener('blur', hideBubble);
+        bindActionBtnHandlers(ctxBadge, () => {
+          const cid = resolveCid();
+          if (cid) ensureContextUsageLoaded(cid, true);
+        });
+        const firstInjected = container.querySelector(`.${SEARCH_BTN_CLASS}`) || moreBtn;
+        container.insertBefore(ctxBadge, firstInjected);
+      }
+      updateTitlebarContextBadgeUI(ctxBadge, cascadeId);
 
       // Chain search lives in the titlebar because it needs the open chat as its scope
       if (!container.querySelector(`.${SEARCH_BTN_CLASS}`)) {
@@ -3836,6 +4348,8 @@
         target.className === INBOX_CLASS ||
         target.className === BUTTON_CLASS ||
         target.className === TITLEBAR_BTN_CLASS ||
+        // Ignore async token-count updates on the context pill to avoid feedback sync loops
+        target.className === TITLEBAR_CONTEXT_BADGE_CLASS ||
         target.className === ROW_BG_WAIT_INDICATOR_CLASS ||
         target.className === PROJECT_ROADMAP_BADGE_CLASS ||
         target.className === SEARCH_BTN_CLASS ||
@@ -3851,6 +4365,8 @@
             target.closest(`.${INBOX_CLASS}`) ||
             target.closest(`.${BUTTON_CLASS}`) ||
             target.closest(`.${TITLEBAR_BTN_CLASS}`) ||
+            // Skip text node mutations inside the context volume pill
+            target.closest(`.${TITLEBAR_CONTEXT_BADGE_CLASS}`) ||
             target.closest(`.${ROW_BG_WAIT_INDICATOR_CLASS}`) ||
             target.closest(`.${PROJECT_ROADMAP_BADGE_CLASS}`) ||
             target.closest(`.${LOCATE_BTN_CLASS}`) ||
@@ -3891,6 +4407,11 @@
         payload: { updates: unhide, deletes: [] },
       });
     }
+    // Cancel pending context throttle and running-poll timers so stale closures cannot fire
+    for (const entry of contextUsageCache.values()) {
+      clearContextEntryTimers(entry);
+    }
+    contextUsageCache.clear();
     // Remove all injected filter buttons, search panels, and chain stars on reload
     const cleanupSelector = [
       `.${BAR_CLASS}`,
@@ -3898,6 +4419,8 @@
       `.${INBOX_CLASS}`,
       `.${BUTTON_CLASS}`,
       `.${TITLEBAR_BTN_CLASS}`,
+      // Remove titlebar context pills so the fresh instance mounts its own closures
+      `.${TITLEBAR_CONTEXT_BADGE_CLASS}`,
       `.${ROW_BG_WAIT_INDICATOR_CLASS}`,
       `.${PROJECT_ROADMAP_BADGE_CLASS}`,
       `.${SEARCH_BTN_CLASS}`,

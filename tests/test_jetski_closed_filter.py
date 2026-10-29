@@ -941,8 +941,11 @@ const liveBucketBtn = (k) =>
   bodyEl.querySelector('.jetski-attention-filter-bar').querySelector(`button[data-bucket="${k}"]`);
 
 (async () => {
+  const titlebarContextBadge = titlebarToolbar.querySelector('.jetski-titlebar-context-badge');
+  const titlebarSearchElem = titlebarToolbar.querySelector('.jetski-chat-search-btn');
   const titlebarLocateBtn = titlebarToolbar.querySelector('.jetski-chat-locate-btn');
   const titlebarBtn = titlebarToolbar.querySelector('.jetski-titlebar-archive-btn');
+  assert(titlebarContextBadge, 'Titlebar context badge must be injected leftmost');
   assert(titlebarLocateBtn, 'Titlebar Locate button must be injected after Search');
   assert(
     !titlebarToolbar.querySelector('.jetski-titlebar-wait-btn'),
@@ -952,8 +955,11 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(titlebarLocateBtn.textContent, '🎯');
   assert.strictEqual(titlebarLocateBtn.getAttribute('data-testid'), 'jetski-chat-locate-btn');
   assert.strictEqual(titlebarLocateBtn.getAttribute('data-cascade-id'), 'open-current');
-  assert.strictEqual(titlebarToolbar.children[1], titlebarLocateBtn);
-  assert.strictEqual(titlebarToolbar.children[2], titlebarBtn);
+  assert.strictEqual(titlebarToolbar.children[0], titlebarContextBadge);
+  assert.strictEqual(titlebarToolbar.children[1], titlebarSearchElem);
+  assert.strictEqual(titlebarToolbar.children[2], titlebarLocateBtn);
+  assert.strictEqual(titlebarToolbar.children[3], titlebarBtn);
+  assert.strictEqual(titlebarToolbar.children[4], moreActionsBtn);
   assert.strictEqual(titlebarBtn.textContent, '🗄');
   assert.strictEqual(titlebarBtn.getAttribute('data-testid'), 'jetski-titlebar-archive-btn');
   assert.strictEqual(titlebarBtn.getAttribute('aria-label'), 'Archive chat');
@@ -1882,6 +1888,7 @@ const liveBucketBtn = (k) =>
   // Cleanup must clear located-row attribute, remove locate buttons, and remove the inbox widget
   window.__jetskiClosedChatsFilterCleanup();
   assert.strictEqual(targetSidebarRow.hasAttribute('data-jetski-located-row'), false);
+  assert(!titlebarToolbar.querySelector('.jetski-titlebar-context-badge'));
   assert(!titlebarToolbar.querySelector('.jetski-chat-locate-btn'));
   // Verify the Needs-Reaction inbox widget is removed from the DOM on cleanup
   assert(!bodyEl.querySelector('.jetski-needs-reaction-inbox'));
@@ -2042,6 +2049,588 @@ const liveBucketBtn = (k) =>
           os.environ.pop("SAR_EXTRACT_DIR", None)
         else:
           os.environ["SAR_EXTRACT_DIR"] = orig_env
+
+  def test_context_volume_badge_thresholds_paging_and_tooltip(self) -> None:
+    node_bin = find_node_binary()
+    js_path = os.path.join(SCRIPTS_DIR, "jetski_closed_filter.js")
+
+    harness = r"""
+const fs = require('fs');
+const assert = require('assert');
+
+const scriptPath = process.argv[1];
+const code = fs.readFileSync(scriptPath, 'utf8');
+
+class FakeElement {
+  constructor(tagName) {
+    this.tagName = tagName.toUpperCase();
+    this.id = '';
+    this.className = '';
+    this.type = '';
+    this._textContent = '';
+    this._innerHTML = '';
+    this.style = {};
+    this.attributes = new Map();
+    this.children = [];
+    this.parentElement = null;
+    this.listeners = new Map();
+  }
+  get textContent() {
+    if (this.children.length > 0) {
+      return this._textContent + this.children.map((c) => c.textContent).join('');
+    }
+    return this._textContent;
+  }
+  set textContent(val) {
+    this._textContent = String(val);
+    for (const c of this.children) c.parentElement = null;
+    this.children = [];
+  }
+  get innerHTML() { return this._innerHTML; }
+  set innerHTML(val) { this._innerHTML = String(val); }
+  setAttribute(k, v) {
+    this.attributes.set(k, String(v));
+    if (k === 'id') this.id = String(v);
+    if (k === 'class') this.className = String(v);
+  }
+  getAttribute(k) {
+    if (k === 'id' && this.id) return this.id;
+    return this.attributes.has(k) ? this.attributes.get(k) : null;
+  }
+  hasAttribute(k) { return this.attributes.has(k); }
+  removeAttribute(k) { this.attributes.delete(k); }
+  appendChild(child) {
+    if (child.parentElement) child.remove();
+    child.parentElement = this;
+    this.children.push(child);
+    return child;
+  }
+  insertBefore(child, ref) {
+    if (child === ref) return child;
+    if (child.parentElement) child.remove();
+    child.parentElement = this;
+    const idx = this.children.indexOf(ref);
+    if (idx === -1) this.children.push(child);
+    else this.children.splice(idx, 0, child);
+    return child;
+  }
+  remove() {
+    if (!this.parentElement) return;
+    const idx = this.parentElement.children.indexOf(this);
+    if (idx !== -1) this.parentElement.children.splice(idx, 1);
+    this.parentElement = null;
+  }
+  addEventListener(type, fn) {
+    if (!this.listeners.has(type)) this.listeners.set(type, []);
+    this.listeners.get(type).push(fn);
+  }
+  dispatchEvent(type, eventInit = {}) {
+    const evt = {
+      type,
+      target: this,
+      button: 0,
+      shiftKey: false,
+      ctrlKey: false,
+      metaKey: false,
+      ...eventInit,
+      preventDefault() {},
+      stopPropagation() {},
+    };
+    for (const fn of (this.listeners.get(type) || [])) fn(evt);
+  }
+  getBoundingClientRect() {
+    return { left: 920, top: 12, bottom: 32, right: 1040, width: 120, height: 20 };
+  }
+  closest(selector) {
+    let cur = this;
+    while (cur) {
+      if (matches(cur, selector)) return cur;
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+  querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+  querySelectorAll(selector) {
+    const out = [];
+    const visit = (node) => {
+      for (const child of node.children) {
+        if (matches(child, selector)) out.push(child);
+        visit(child);
+      }
+    };
+    visit(this);
+    return out;
+  }
+}
+
+function matches(el, selector) {
+  if (selector.includes(',')) {
+    return selector.split(',').some((part) => matches(el, part.trim()));
+  }
+  if (selector === 'button[aria-label="Display Options"]') {
+    return el.tagName === 'BUTTON' && el.getAttribute('aria-label') === 'Display Options';
+  }
+  const attrEqMatch = /^\[([-a-zA-Z0-9_]+)="([^"]+)"\]$/.exec(selector);
+  if (attrEqMatch) return el.getAttribute(attrEqMatch[1]) === attrEqMatch[2];
+  if (selector.startsWith('.')) {
+    const classes = selector.split('.').filter(Boolean);
+    const elClasses = el.className ? el.className.split(/\s+/) : [];
+    return classes.every((cls) => elClasses.includes(cls));
+  }
+  if (selector.startsWith('#')) return el.id === selector.slice(1);
+  return false;
+}
+
+const docEl = new FakeElement('html');
+const headEl = new FakeElement('head');
+const bodyEl = new FakeElement('body');
+docEl.appendChild(headEl);
+docEl.appendChild(bodyEl);
+
+const actionRow = new FakeElement('div');
+const displayOptionsBtn = new FakeElement('button');
+displayOptionsBtn.setAttribute('aria-label', 'Display Options');
+actionRow.appendChild(displayOptionsBtn);
+bodyEl.appendChild(actionRow);
+
+const titlebarActive = new FakeElement('div');
+const moreActiveBtn = new FakeElement('button');
+moreActiveBtn.setAttribute('data-testid', 'titlebar-more-actions');
+moreActiveBtn.__reactFiber$t = { return: { memoizedProps: { cascadeId: 'chat-active' } } };
+titlebarActive.appendChild(moreActiveBtn);
+bodyEl.appendChild(titlebarActive);
+
+const titlebarEmpty = new FakeElement('div');
+const moreEmptyBtn = new FakeElement('button');
+moreEmptyBtn.setAttribute('data-testid', 'titlebar-more-actions');
+moreEmptyBtn.__reactFiber$t = { return: { memoizedProps: { cascadeId: 'chat-empty' } } };
+titlebarEmpty.appendChild(moreEmptyBtn);
+bodyEl.appendChild(titlebarEmpty);
+
+let fakeNow = 1000000;
+Date.now = () => fakeNow;
+
+const storeState = {
+  trajectorySummaries: {
+    summaries: {
+      'chat-active': {
+        summary: '[12:00] ⦿ Context badge test',
+        status: 'CASCADE_RUN_STATUS_IDLE',
+        notFullyIdle: false,
+        stepCount: 4,
+        lastModifiedTime: '2026-10-29T16:00:00Z',
+        annotations: { title: '[12:00] ⦿ Context badge test', archived: false },
+      },
+      'chat-empty': {
+        summary: '[12:01] ⦿ Brand new chat',
+        status: 'CASCADE_RUN_STATUS_IDLE',
+        notFullyIdle: false,
+        stepCount: 0,
+        lastModifiedTime: '2026-10-29T16:01:00Z',
+        annotations: { title: '[12:01] ⦿ Brand new chat', archived: false },
+      },
+    },
+  },
+  conversation: { cascadeId: 'chat-active' },
+};
+
+const subscribers = [];
+const reduxStore = {
+  getState: () => storeState,
+  dispatch(action) {
+    if (action?.type === 'trajectorySummaries/applyStreamBatch') {
+      const next = { ...storeState.trajectorySummaries.summaries };
+      for (const [id, s] of (action.payload?.updates || [])) next[id] = s;
+      storeState.trajectorySummaries = { summaries: next };
+    }
+    for (const sub of subscribers) sub();
+    return action;
+  },
+  subscribe(fn) {
+    subscribers.push(fn);
+    return () => {};
+  },
+};
+displayOptionsBtn.__reactFiber$test = { memoizedProps: { store: reduxStore } };
+
+function makeEntry(used, max, ckpt, breakdown) {
+  const csm = {
+    contextWindowMetadata: {
+      estimatedTokensUsed: used,
+      maxContextTokens: max,
+      ...(breakdown ? { tokenBreakdown: { groups: breakdown, totalTokens: used } } : {}),
+    },
+  };
+  if (ckpt !== undefined) csm.checkpointIndex = ckpt;
+  return { chatModel: { chatStartMetadata: csm } };
+}
+
+let activeGmList = [
+  makeEntry(32000, 256000, -1),
+  makeEntry(85000, 256000, -1, [
+    { name: 'System Prompt', type: 'TOKEN_TYPE_SYSTEM_PROMPT', numTokens: 40000 },
+    { name: 'Tools', type: 'TOKEN_TYPE_TOOLS', numTokens: 11000 },
+    { name: 'Chat Messages', type: 'TOKEN_TYPE_CHAT_MESSAGES', numTokens: 34000 },
+  ]),
+  // Trailing entry with explicit null estimatedTokensUsed (S2) and empty metadata (B2)
+  {
+    chatModel: {
+      chatStartMetadata: {
+        contextWindowMetadata: { estimatedTokensUsed: null, maxContextTokens: 256000 },
+      },
+    },
+  },
+  { chatModel: { chatStartMetadata: {} } },
+];
+
+let failNextActiveFetch = true;
+const gmCalls = [];
+let observerCallback = null;
+let rafCallbacks = [];
+
+global.window = {
+  innerWidth: 1280,
+  location: { pathname: '/c/chat-active', search: '' },
+  __APP_CONFIG__: { csrfToken: 'ctx-csrf' },
+  localStorage: { getItem: () => null, setItem: () => {} },
+  fetch: async (url, opts) => {
+    if (String(url).includes('GetCascadeTrajectoryGeneratorMetadata')) {
+      const body = JSON.parse(opts.body);
+      gmCalls.push({ url: String(url), headers: opts.headers, body });
+      if (body.cascadeId === 'chat-active' && failNextActiveFetch) {
+        failNextActiveFetch = false;
+        return { ok: false, status: 503 };
+      }
+      if (body.cascadeId === 'chat-second') {
+        return {
+          ok: true,
+          json: async () => ({ generatorMetadata: [makeEntry(200000, 256000, -1)] }),
+        };
+      }
+      if (body.cascadeId === 'chat-empty') {
+        return { ok: true, json: async () => ({ generatorMetadata: [] }) };
+      }
+      const off = Number(body.generatorMetadataOffset) || 0;
+      return {
+        ok: true,
+        json: async () => ({ generatorMetadata: activeGmList.slice(off) }),
+      };
+    }
+    if (String(url).includes('jetski-chains.json')) {
+      return { ok: true, json: async () => ({ parentOf: {}, createdAt: {}, redirects: {} }) };
+    }
+    if (String(url).includes('jetski-roadmaps.json')) {
+      return { ok: true, json: async () => ({ version: 1, projects: {} }) };
+    }
+    return { ok: false, status: 404 };
+  },
+};
+
+global.document = {
+  documentElement: docEl,
+  head: headEl,
+  body: bodyEl,
+  getElementById: (id) => docEl.querySelector(`#${id}`),
+  createElement: (tag) => new FakeElement(tag),
+  querySelector: (sel) => docEl.querySelector(sel),
+  querySelectorAll: (sel) => docEl.querySelectorAll(sel),
+  addEventListener() {},
+  removeEventListener() {},
+  dispatchEvent() {},
+};
+global.MutationObserver = class {
+  constructor(cb) { observerCallback = cb; }
+  observe() {}
+  disconnect() {}
+};
+global.requestAnimationFrame = (cb) => {
+  rafCallbacks.push(cb);
+  return rafCallbacks.length;
+};
+
+let nextTimerId = 1;
+const pendingTimers = new Map();
+global.setTimeout = (fn, ms) => {
+  const id = nextTimerId++;
+  pendingTimers.set(id, { fn, due: fakeNow + (Number(ms) || 0) });
+  return id;
+};
+global.clearTimeout = (id) => {
+  pendingTimers.delete(id);
+};
+
+const flushRaf = () => {
+  while (rafCallbacks.length > 0) rafCallbacks.shift()();
+};
+
+const flushAsync = async () => {
+  for (let round = 0; round < 4; round++) {
+    flushRaf();
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+  }
+  flushRaf();
+};
+
+const advanceFakeTime = async (ms) => {
+  fakeNow += ms;
+  for (const [id, t] of [...pendingTimers.entries()]) {
+    if (t.due <= fakeNow) {
+      pendingTimers.delete(id);
+      t.fn();
+    }
+  }
+  await flushAsync();
+};
+
+eval(code);
+
+(async () => {
+  await flushAsync();
+
+  const activeBadge = titlebarActive.querySelector('.jetski-titlebar-context-badge');
+  const emptyBadge = titlebarEmpty.querySelector('.jetski-titlebar-context-badge');
+  assert(activeBadge, 'Active titlebar must contain context badge');
+  assert(emptyBadge, 'Empty titlebar must mount hidden context badge placeholder');
+  assert.strictEqual(emptyBadge.style.display, 'none');
+  assert.strictEqual(emptyBadge.getAttribute('data-empty'), 'true');
+
+  // B4a: Initial transient 503 hides badge on mount, then recovers on next UI sync after 1200ms
+  assert.strictEqual(activeBadge.style.display, 'none');
+  gmCalls.length = 0;
+  fakeNow += 2000;
+  reduxStore.dispatch({ type: 'NOOP' });
+  await flushAsync();
+  assert.strictEqual(gmCalls.length, 1, 'Transient 503 must retry on later UI sync');
+  const firstActiveCall = gmCalls[0];
+  assert.deepStrictEqual(firstActiveCall.body, {
+    cascadeId: 'chat-active',
+    generatorMetadataOffset: 0,
+    includeMessages: false,
+  });
+  assert.strictEqual(firstActiveCall.headers['x-codeium-csrf-token'], 'ctx-csrf');
+
+  // S2: Explicit null estimatedTokensUsed is skipped so valid 85k entry is rendered
+  assert.strictEqual(activeBadge.style.display, '');
+  assert.strictEqual(activeBadge.getAttribute('data-empty'), 'false');
+  assert.strictEqual(activeBadge.getAttribute('data-level'), 'ok');
+  assert.strictEqual(activeBadge.getAttribute('data-compacted'), 'false');
+  assert.strictEqual(activeBadge.textContent, '85k / 256k · 33%');
+
+  // Idle syncs with unchanged summary signature must not re-fetch
+  gmCalls.length = 0;
+  fakeNow += 10000;
+  reduxStore.dispatch({ type: 'NOOP' });
+  await flushAsync();
+  assert.strictEqual(gmCalls.length, 0, 'Unchanged idle chat must not poll LS');
+
+  // Mutations on the badge itself must be ignored by MutationObserver
+  rafCallbacks = [];
+  observerCallback([{ target: activeBadge }]);
+  assert.strictEqual(rafCallbacks.length, 0);
+
+  const bumpActiveSummary = (stepCount, status = 'CASCADE_RUN_STATUS_IDLE') => {
+    reduxStore.dispatch({
+      type: 'trajectorySummaries/applyStreamBatch',
+      payload: {
+        updates: [[
+          'chat-active',
+          {
+            ...storeState.trajectorySummaries.summaries['chat-active'],
+            stepCount,
+            status,
+            lastModifiedTime: `2026-10-29T16:00:${String(stepCount).padStart(2, '0')}Z`,
+          },
+        ]],
+        deletes: [],
+      },
+    });
+    flushRaf();
+  };
+
+  // B2: Update while trailing entries lack metadata anchors offset at last valid index (1 -> 1 RPC)
+  gmCalls.length = 0;
+  fakeNow += 2000;
+  bumpActiveSummary(4, 'CASCADE_RUN_STATUS_IDLE');
+  await flushAsync();
+  assert.strictEqual(gmCalls.length, 1, 'Trailing empty metadata must stay paged in 1 RPC');
+  assert.strictEqual(gmCalls[0].body.generatorMetadataOffset, 1);
+
+  // Near-threshold 59.96% (153500 / 256000) must stay ok and display 59%, never 60%
+  gmCalls.length = 0;
+  activeGmList.push(makeEntry(153500, 256000, -1));
+  fakeNow += 2000;
+  bumpActiveSummary(5);
+  await flushAsync();
+  assert.strictEqual(gmCalls.length, 1);
+  assert.strictEqual(gmCalls[0].body.generatorMetadataOffset, 1);
+  assert.strictEqual(activeBadge.getAttribute('data-level'), 'ok');
+  assert.strictEqual(activeBadge.textContent, '154k / 256k · 59%');
+
+  // Burst updates within CONTEXT_MIN_FETCH_INTERVAL_MS (1200ms) coalesce into 1 timer fetch
+  gmCalls.length = 0;
+  activeGmList.push(makeEntry(155000, 256000, -1));
+  fakeNow += 300;
+  bumpActiveSummary(6);
+  await flushAsync();
+  activeGmList.push(makeEntry(158720, 256000, -1));
+  fakeNow += 200;
+  bumpActiveSummary(7);
+  await flushAsync();
+  assert.strictEqual(gmCalls.length, 0, 'Rapid burst within 1200ms must defer to timer');
+  assert.strictEqual(pendingTimers.size, 1);
+
+  // Advancing past 1200ms fires the single coalesced paged fetch and enters soft (>= 60%)
+  await advanceFakeTime(1000);
+  assert.strictEqual(gmCalls.length, 1);
+  assert.strictEqual(gmCalls[0].body.generatorMetadataOffset, 4);
+  assert.strictEqual(activeBadge.getAttribute('data-level'), 'soft');
+  assert.strictEqual(activeBadge.textContent, '159k / 256k · 62%');
+
+  // Turn-start threshold (68% >= 65%)
+  gmCalls.length = 0;
+  activeGmList.push(makeEntry(174080, 256000, -1));
+  fakeNow += 2000;
+  bumpActiveSummary(8);
+  await flushAsync();
+  assert.strictEqual(activeBadge.getAttribute('data-level'), 'turn-start');
+  assert.strictEqual(activeBadge.textContent, '174k / 256k · 68%');
+
+  // Running chat polls after 4000ms even during silent thinking with zero DOM/Redux events
+  gmCalls.length = 0;
+  fakeNow += 2000;
+  bumpActiveSummary(9, 'CASCADE_RUN_STATUS_RUNNING');
+  await flushAsync();
+  assert.strictEqual(gmCalls.length, 1);
+  assert.strictEqual(pendingTimers.size, 1, 'Open running chat must arm 4000ms refresh timer');
+  gmCalls.length = 0;
+  activeGmList.push(makeEntry(212480, 256000, -1));
+  await advanceFakeTime(4000);
+  assert.strictEqual(gmCalls.length, 1, 'Running chat must refresh after 4000ms');
+  assert.strictEqual(activeBadge.getAttribute('data-level'), 'hard');
+  assert.strictEqual(activeBadge.textContent, '212k / 256k · 83%');
+
+  // B1: Fast completion (< 1200ms) while 4s poll timer is armed must keep final count
+  gmCalls.length = 0;
+  activeGmList.push(makeEntry(220000, 256000, -1));
+  fakeNow += 500;
+  bumpActiveSummary(10, 'CASCADE_RUN_STATUS_IDLE');
+  await flushAsync();
+  await advanceFakeTime(1200);
+  assert.strictEqual(gmCalls.length, 1, 'End-of-turn transition within 1200ms must still fetch');
+  assert.strictEqual(activeBadge.textContent, '220k / 256k · 86%');
+
+  // Rewound trajectory + proto3 omitted checkpointIndex=0 (compacted at 40% -> hard)
+  gmCalls.length = 0;
+  activeGmList = [
+    makeEntry(102400, 256000, undefined, [
+      { name: 'System Prompt', type: 'TOKEN_TYPE_SYSTEM_PROMPT', numTokens: 40000 },
+      { name: 'Tools', type: 'TOKEN_TYPE_TOOLS', numTokens: 12400 },
+      { name: 'Chat Messages', type: 'TOKEN_TYPE_CHAT_MESSAGES', numTokens: 50000 },
+    ]),
+  ];
+  fakeNow += 2000;
+  bumpActiveSummary(2);
+  await flushAsync();
+  assert.deepStrictEqual(
+    gmCalls.map((c) => c.body.generatorMetadataOffset),
+    [9, 0],
+    'Empty paged slice after rewind must fall back to offset 0'
+  );
+  assert.strictEqual(activeBadge.getAttribute('data-level'), 'hard');
+  assert.strictEqual(activeBadge.getAttribute('data-compacted'), 'true');
+  assert.strictEqual(activeBadge.textContent, '⟳ 102k / 256k · 40%');
+
+  // Hover tooltip shows exact breakdown, free tokens, compaction, and thresholds
+  activeBadge.dispatchEvent('mouseenter');
+  const bubble = global.document.getElementById('jetski-closed-chats-filter-bubble');
+  assert(bubble, 'Shared hover bubble must exist');
+  assert.strictEqual(bubble.getAttribute('data-visible'), 'true');
+  assert.strictEqual(bubble.getAttribute('data-mode'), 'context');
+  assert(bubble.innerHTML.includes('102,400 / 256,000 tokens'));
+  assert(bubble.innerHTML.includes('153,600 free'));
+  assert(bubble.innerHTML.includes('System Prompt'));
+  assert(bubble.innerHTML.includes('40,000'));
+  assert(bubble.innerHTML.includes('Tools'));
+  assert(bubble.innerHTML.includes('12,400'));
+  assert(bubble.innerHTML.includes('Chat Messages'));
+  assert(bubble.innerHTML.includes('50,000'));
+  assert(bubble.innerHTML.includes('Compacted'));
+  assert(bubble.innerHTML.includes('Soft 60%'));
+  assert(bubble.innerHTML.includes('Turn-start 65%'));
+  assert(bubble.innerHTML.includes('Hard 80%'));
+  assert(!/[А-Яа-яЁё]/.test(bubble.innerHTML), 'Tooltip must be English-only');
+
+  // B3: In-place cascadeId switch while hovered refreshes open tooltip to the new conversation
+  moreEmptyBtn.__reactFiber$t.return.memoizedProps.cascadeId = 'chat-second';
+  reduxStore.dispatch({ type: 'NOOP' });
+  await flushAsync();
+  moreActiveBtn.__reactFiber$t.return.memoizedProps.cascadeId = 'chat-second';
+  reduxStore.dispatch({ type: 'NOOP' });
+  await flushAsync();
+  assert(
+    bubble.innerHTML.includes('200,000 / 256,000 tokens'),
+    'Hovered tooltip must track cascadeId switch'
+  );
+  // B4b: Bounded cache evicts oldest idle entry past CONTEXT_CACHE_MAX_ENTRIES (64)
+  for (let i = 0; i < 66; i++) {
+    moreEmptyBtn.__reactFiber$t.return.memoizedProps.cascadeId = `chat-lru-${i}`;
+    reduxStore.dispatch({ type: 'NOOP' });
+    await flushAsync();
+  }
+  gmCalls.length = 0;
+  moreEmptyBtn.__reactFiber$t.return.memoizedProps.cascadeId = 'chat-lru-0';
+  reduxStore.dispatch({ type: 'NOOP' });
+  await flushAsync();
+  assert.strictEqual(gmCalls.length, 1, 'Evicted oldest entry must re-fetch on revisit');
+
+  moreActiveBtn.__reactFiber$t.return.memoizedProps.cascadeId = 'chat-active';
+  moreEmptyBtn.__reactFiber$t.return.memoizedProps.cascadeId = 'chat-empty';
+  reduxStore.dispatch({ type: 'NOOP' });
+  await flushAsync();
+
+  activeBadge.dispatchEvent('mouseleave');
+  assert.strictEqual(bubble.getAttribute('data-visible'), 'false');
+
+  // Clicking the badge forces an immediate refresh even within throttle interval
+  gmCalls.length = 0;
+  activeGmList.push(makeEntry(110000, 256000, 1));
+  fakeNow += 400;
+  activeBadge.dispatchEvent('pointerdown', { button: 0 });
+  await flushAsync();
+  assert.strictEqual(gmCalls.length, 1);
+  assert.strictEqual(activeBadge.textContent, '⟳ 110k / 256k · 43%');
+
+  // Cleanup cancels any pending throttle timer and removes all context badges
+  fakeNow += 100;
+  bumpActiveSummary(3);
+  await flushAsync();
+  assert.strictEqual(pendingTimers.size, 1);
+  window.__jetskiClosedChatsFilterCleanup();
+  assert.strictEqual(pendingTimers.size, 0, 'Cleanup must cancel pending throttle timers');
+  assert(!titlebarActive.querySelector('.jetski-titlebar-context-badge'));
+  assert(!titlebarEmpty.querySelector('.jetski-titlebar-context-badge'));
+
+  console.log('CONTEXT_BADGE_ASSERTIONS_PASSED');
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"""
+    env = os.environ.copy()
+    env["ELECTRON_RUN_AS_NODE"] = "1"
+    res = subprocess.run(
+        [node_bin, "-e", harness, js_path],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(
+        res.returncode,
+        0,
+        f"Context badge JS harness failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+    )
+    self.assertIn("CONTEXT_BADGE_ASSERTIONS_PASSED", res.stdout)
 
 
 if __name__ == "__main__":
