@@ -523,6 +523,10 @@ def is_chat_busy(summary: dict[str, Any], title: str = "") -> bool:
   return "⏳" in title
 
 
+# Hold chat_busy briefly after agentapi send-message/start before LS reports RUNNING
+CHAT_WAKE_GRACE_SEC = 15.0
+
+
 def overlay_live_chat_busy(state: dict[str, Any]) -> None:
   """Refreshes `chat_busy` across cached items from the local Language Server."""
   items = state.get("items") or {}
@@ -531,6 +535,7 @@ def overlay_live_chat_busy(state: dict[str, Any]) -> None:
   summaries = cl._fetch_ls_summaries_for_audit() or {}
   if not summaries:
     return
+  now_ts = time.time()
   for item in items.values():
     cid = str(item.get("conversation_id") or "")
     s = summaries.get(cid)
@@ -538,7 +543,11 @@ def overlay_live_chat_busy(state: dict[str, Any]) -> None:
     if isinstance(s, dict):
       ann = s.get("annotations") or {}
       title = str(ann.get("title") or s.get("summary") or item.get("title") or "").strip()
-      item["chat_busy"] = is_chat_busy(s, title)
+      # Archived titles keep frozen ⏳ markers; pass empty title so only live execution counts
+      busy = is_chat_busy(s, "" if ann.get("archived") else title)
+      if not busy and now_ts - float(item.get("chat_woken_ts") or 0.0) < CHAT_WAKE_GRACE_SEC:
+        busy = True
+      item["chat_busy"] = busy
 
 
 def extract_cl_ids_with_hosts(text: str) -> dict[str, str]:
@@ -604,7 +613,8 @@ def discover_active_cl_chats(
     # Active chats require ⦿ (needs user) or ⏳ (waiting timer/external)
     if not is_archived and "⦿" not in title and "⏳" not in title:
       continue
-    chat_busy = False if is_archived else is_chat_busy(s, title)
+    # Archived titles keep frozen ⏳ markers; pass empty title so only live execution counts
+    chat_busy = is_chat_busy(s, "" if is_archived else title)
 
     pid = str(meta.get("projectId") or "").strip()
     pname = proj_names.get(pid, "Unassigned")
@@ -1812,7 +1822,8 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
     )
 
     checks = d.get("statusCheckRollup") or []
-    merge_conflict = str(d.get("mergeable") or "") == "CONFLICTING"
+    # GitHub freezes mergeable=CONFLICTING on closed PRs; only open branches need rebase
+    merge_conflict = state == "OPEN" and str(d.get("mergeable") or "") == "CONFLICTING"
     # Flutter's Dashboard Checks turn ACTION_REQUIRED when presubmit cannot start on
     # a conflicting branch; the Conflict status already reports that
     failing = {"FAILURE", "ERROR", "TIMED_OUT"}
@@ -2320,6 +2331,133 @@ def _build_start_chat_topic(rec: dict[str, Any]) -> str:
   return cl.validate_chat_topic(f"{id_tok} {default_sub} patchset"[:TITLE_TOPIC_MAX].rstrip())
 
 
+def _lookup_state_item(
+    items: dict[str, Any], ikey: str
+) -> tuple[str, dict[str, Any] | None]:
+  """Finds a tracked state item by `item_key`, returning `(dict_key, record)`."""
+  unchatted_key = f"{ikey}@unchatted"
+  if isinstance(items.get(unchatted_key), dict):
+    return unchatted_key, items[unchatted_key]
+  for k, v in items.items():
+    if isinstance(v, dict) and v.get("item_key") == ikey:
+      return k, v
+  return "", None
+
+
+def _discover_existing_chat_for_item(
+    ikey: str, rec: dict[str, Any] | None
+) -> tuple[str, bool, str]:
+  """Searches active, companion-parent, and archived chats for `ikey`."""
+  by_key = {
+      c["item_key"]: c
+      for c in discover_active_cl_chats(include_archived=True)
+      if c.get("item_key") and c.get("conversation_id")
+  }
+  cand = by_key.get(ikey)
+  if cand and not cand.get("chat_archived"):
+    return str(cand["conversation_id"]), False, ""
+
+  # Reuse parent chat for companion Gerrit CLs or GitHub PRs when candidates exist
+  parent_keys: list[str] = []
+  if by_key and ikey.startswith("gerrit:"):
+    tid = ikey.split(":", 1)[1]
+    host = str(
+        (rec or {}).get("host")
+        or (rec or {}).get("preferred_host")
+        or GERRIT_SKIA_HOST
+    )
+    parent_keys = [
+        f"gerrit:{rel_id}" for rel_id in fetch_gerrit_related_cl_ids(host, tid)
+    ]
+  elif by_key and ikey.startswith("github:"):
+    subj = str((rec or {}).get("subject") or (rec or {}).get("title") or "")
+    m = RE_COMPANION_PR_REF.search(subj)
+    if m:
+      parent_keys = [f"github:{m.group(1)}"]
+  for parent_key in parent_keys:
+    parent = by_key.get(parent_key)
+    if parent:
+      return (
+          str(parent["conversation_id"]),
+          bool(parent.get("chat_archived")),
+          parent_key,
+      )
+
+  if cand:
+    return str(cand["conversation_id"]), True, ""
+  return "", False, ""
+
+
+def _rekey_state_item_chat(
+    items: dict[str, Any],
+    ikey: str,
+    matched_key: str,
+    rec: dict[str, Any],
+    cid: str,
+    *,
+    chat_archived: bool | None = None,
+    companion_to: str = "",
+) -> None:
+  """Binds `rec` to `cid` and moves its entry under `ikey@cid`."""
+  if matched_key:
+    items.pop(matched_key, None)
+  items.pop(f"{ikey}@unchatted", None)
+  rec["conversation_id"] = cid
+  rec["composite_key"] = f"{ikey}@{cid}"
+  if chat_archived is not None:
+    rec["chat_archived"] = chat_archived
+  if companion_to:
+    rec["companion_to"] = companion_to
+  items[f"{ikey}@{cid}"] = rec
+
+
+def _start_pinned_chat_for_record(
+    items: dict[str, Any],
+    ikey: str,
+    matched_key: str,
+    rec: dict[str, Any],
+    prompt: str,
+) -> dict[str, Any]:
+  """Creates a project-pinned visible Jetski chat for `rec` with `prompt`."""
+  proj_ref = str(rec.get("project_name") or rec.get("project_id") or "").strip()
+  try:
+    project_id = (
+        cl.resolve_project_id(proj_ref) if proj_ref else "outside-of-project"
+    )
+  except ValueError:
+    project_id = str(rec.get("project_id") or "").strip() or "outside-of-project"
+
+  topic = _build_start_chat_topic(rec)
+  full_title = f"[{cl.get_current_time_str()}] ⦿ {topic}"
+  try:
+    model_info = cl.resolve_handoff_model("", tier="pro", project_id=project_id)
+    new_cid = cl.start_conversation_exact(
+        model_enum=model_info["enum"],
+        title=full_title,
+        prompt=prompt,
+        project_id=project_id,
+    )
+  except (OSError, RuntimeError, ValueError, KeyError) as exc:
+    return {"ok": False, "error": str(exc)}
+
+  _rekey_state_item_chat(
+      items, ikey, matched_key, rec, new_cid, chat_archived=False
+  )
+  rec["title"] = full_title
+  rec["project_id"] = project_id
+  rec["chat_busy"] = True
+  rec["chat_woken_ts"] = time.time()
+  rec["chat_last_modified"] = datetime.now(timezone.utc).isoformat()
+  return {
+      "ok": True,
+      "started": True,
+      "conversation_id": new_cid,
+      "title": full_title,
+      "project_id": project_id,
+      "chat_url": f"{jetski_box_url()}/c/{new_cid}",
+  }
+
+
 def start_chat_for_item(item_key: str) -> dict[str, Any]:
   """Starts a project-pinned visible Jetski chat for an unchatted CL/PR item."""
   ikey = str(item_key or "").strip()
@@ -2328,84 +2466,28 @@ def start_chat_for_item(item_key: str) -> dict[str, Any]:
 
   state = load_watcher_state()
   items: dict[str, Any] = state.setdefault("items", {})
-  unchatted_key = f"{ikey}@unchatted"
-  matched_key = unchatted_key if unchatted_key in items else ""
-  rec = items.get(unchatted_key)
-  if rec is None:
-    for k, v in items.items():
-      if isinstance(v, dict) and v.get("item_key") == ikey:
-        matched_key = k
-        rec = v
-        break
+  matched_key, rec = _lookup_state_item(items, ikey)
 
-  # Reuse an existing active chat if one was already opened for this CL/PR
-  for active in discover_active_cl_chats():
-    if active.get("item_key") == ikey and active.get("conversation_id"):
-      existing_cid = str(active["conversation_id"])
-      if isinstance(rec, dict) and not str(rec.get("conversation_id") or "").strip():
-        if matched_key:
-          items.pop(matched_key, None)
-        items.pop(unchatted_key, None)
-        rec["conversation_id"] = existing_cid
-        rec["composite_key"] = f"{ikey}@{existing_cid}"
-        items[f"{ikey}@{existing_cid}"] = rec
-        save_watcher_state(state)
-      return {
-          "ok": True,
-          "already_existed": True,
-          "conversation_id": existing_cid,
-          "chat_url": f"{jetski_box_url()}/c/{existing_cid}",
-      }
-
-  # Reuse parent chat for companion Gerrit CLs or GitHub PRs
-  if ikey.startswith("gerrit:"):
-    tid = ikey.split(":", 1)[1]
-    host = str(
-        (rec or {}).get("host")
-        or (rec or {}).get("preferred_host")
-        or GERRIT_SKIA_HOST
-    )
-    related = fetch_gerrit_related_cl_ids(host, tid)
-    for rel_id in related:
-      parent_key = f"gerrit:{rel_id}"
-      for candidate in discover_active_cl_chats(include_archived=True):
-        if candidate.get("item_key") == parent_key and candidate.get("conversation_id"):
-          existing_cid = str(candidate["conversation_id"])
-          if isinstance(rec, dict) and not str(rec.get("conversation_id") or "").strip():
-            if matched_key:
-              items.pop(matched_key, None)
-            items.pop(unchatted_key, None)
-            rec["conversation_id"] = existing_cid
-            rec["composite_key"] = f"{ikey}@{existing_cid}"
-            rec["companion_to"] = parent_key
-            items[f"{ikey}@{existing_cid}"] = rec
-            save_watcher_state(state)
-          return {
-              "ok": True,
-              "already_existed": True,
-              "conversation_id": existing_cid,
-              "chat_url": f"{jetski_box_url()}/c/{existing_cid}",
-          }
-
-  # Reuse an archived chat if one was already completed for this CL/PR
-  for archived in discover_active_cl_chats(include_archived=True):
-    if archived.get("item_key") == ikey and archived.get("conversation_id"):
-      existing_cid = str(archived["conversation_id"])
-      if isinstance(rec, dict) and not str(rec.get("conversation_id") or "").strip():
-        if matched_key:
-          items.pop(matched_key, None)
-        items.pop(unchatted_key, None)
-        rec["conversation_id"] = existing_cid
-        rec["composite_key"] = f"{ikey}@{existing_cid}"
-        rec["chat_archived"] = True
-        items[f"{ikey}@{existing_cid}"] = rec
-        save_watcher_state(state)
-      return {
-          "ok": True,
-          "already_existed": True,
-          "conversation_id": existing_cid,
-          "chat_url": f"{jetski_box_url()}/c/{existing_cid}",
-      }
+  # Reuse an existing active, companion-parent, or archived chat before spawning a new one
+  existing_cid, is_arch, comp_to = _discover_existing_chat_for_item(ikey, rec)
+  if existing_cid:
+    if isinstance(rec, dict) and not str(rec.get("conversation_id") or "").strip():
+      _rekey_state_item_chat(
+          items,
+          ikey,
+          matched_key,
+          rec,
+          existing_cid,
+          chat_archived=True if is_arch else None,
+          companion_to=comp_to,
+      )
+      save_watcher_state(state)
+    return {
+        "ok": True,
+        "already_existed": True,
+        "conversation_id": existing_cid,
+        "chat_url": f"{jetski_box_url()}/c/{existing_cid}",
+    }
 
   if not isinstance(rec, dict):
     return {"ok": False, "error": f"Unknown item {ikey}"}
@@ -2419,16 +2501,6 @@ def start_chat_for_item(item_key: str) -> dict[str, Any]:
         "chat_url": f"{jetski_box_url()}/c/{existing_cid}",
     }
 
-  proj_ref = str(rec.get("project_name") or rec.get("project_id") or "").strip()
-  try:
-    project_id = (
-        cl.resolve_project_id(proj_ref) if proj_ref else "outside-of-project"
-    )
-  except ValueError:
-    project_id = str(rec.get("project_id") or "").strip() or "outside-of-project"
-
-  topic = _build_start_chat_topic(rec)
-  full_title = f"[{cl.get_current_time_str()}] ⦿ {topic}"
   url = str(rec.get("url") or ikey)
   subj = str(rec.get("subject") or ikey)
   ps = int(rec.get("patchset") or 1)
@@ -2444,35 +2516,155 @@ def start_chat_for_item(item_key: str) -> dict[str, Any]:
         "review analysis (never publish review comments without my confirmation)."
     )
 
-  try:
-    model_info = cl.resolve_handoff_model("", tier="pro", project_id=project_id)
-    new_cid = cl.start_conversation_exact(
-        model_enum=model_info["enum"],
-        title=full_title,
-        prompt=prompt,
-        project_id=project_id,
-    )
-  except (OSError, RuntimeError, ValueError, KeyError) as exc:
-    return {"ok": False, "error": str(exc)}
+  res = _start_pinned_chat_for_record(items, ikey, matched_key, rec, prompt)
+  if res.get("ok"):
+    save_watcher_state(state)
+  return res
 
-  if matched_key:
-    items.pop(matched_key, None)
-  items.pop(unchatted_key, None)
-  rec["conversation_id"] = new_cid
-  rec["title"] = full_title
-  rec["project_id"] = project_id
-  rec["composite_key"] = f"{ikey}@{new_cid}"
-  rec["chat_busy"] = True
-  rec["chat_last_modified"] = datetime.now(timezone.utc).isoformat()
-  items[f"{ikey}@{new_cid}"] = rec
+
+def _build_rebase_prompt(rec: dict[str, Any]) -> str:
+  """Builds the conflict-resolution prompt sent to the CL/PR's owning agent chat."""
+  url = str(rec.get("url") or rec.get("item_key") or "")
+  subj = str(rec.get("subject") or url)
+  ps = int(rec.get("patchset") or 1)
+  if rec.get("kind") == "github":
+    return (
+        f"[FLIGHT-DECK REBASE] {url} ('{subj}') has a merge conflict with upstream main/master. "
+        "Please rebase this PR branch onto the latest upstream main branch in its local worktree "
+        "(create an isolated worktree if the main checkout is dirty or leased), resolve all merge "
+        "conflicts while preserving domain invariants and behavior, rerun the relevant unit tests "
+        "(plus run_webparagraph_corpus.py if lib/web_ui/lib/ production code is touched) and "
+        "amnesia-precommit checks, and push the rebased branch to update the PR. "
+        "Do not merge the PR or enable auto-merge."
+    )
+  return (
+      f"[FLIGHT-DECK REBASE] {url} ('{subj}', PS{ps}) has a merge conflict with origin/main. "
+      "Please fetch and rebase this CL onto the latest origin/main in its local worktree "
+      "(create an isolated worktree if the main checkout is dirty or leased), resolve all merge "
+      "conflicts while preserving domain invariants and behavior, rerun the relevant unit tests "
+      "(plus run_flutter_paragraph_tests.py if modules/{skparagraph,skunicode,skshaper}/"
+      "{src,include}/ production code is touched) and amnesia-precommit checks, and run "
+      "`git cl upload` to upload the rebased patchset. Never vote CQ+1, CQ+2, or Auto-Submit+1."
+  )
+
+
+def rebase_item(item_key: str) -> dict[str, Any]:
+  """Wakes (or starts) the chat owning a conflicting self-authored CL/PR to rebase it."""
+  ikey = str(item_key or "").strip()
+  if not ikey:
+    return {"ok": False, "error": "Missing item_key"}
+
+  state = load_watcher_state()
+  items: dict[str, Any] = state.setdefault("items", {})
+  events: list[dict[str, Any]] = state.setdefault("events", [])
+  matched_key, rec = _lookup_state_item(items, ikey)
+  if not isinstance(rec, dict):
+    return {"ok": False, "error": f"Unknown item {ikey}"}
+  if not rec.get("is_self"):
+    return {"ok": False, "error": f"Cannot rebase non-self change {ikey}"}
+  if rec.get("status") not in ("NEW", "OPEN"):
+    return {"ok": False, "error": f"Change {ikey} is not open"}
+  if not rec.get("merge_conflict"):
+    return {"ok": False, "error": f"Change {ikey} has no merge conflict"}
+
+  prompt = _build_rebase_prompt(rec)
+  cid = str(rec.get("conversation_id") or "").strip()
+  is_arch: bool | None = None
+  comp_to = ""
+  if not cid:
+    disc_cid, disc_arch, comp_to = _discover_existing_chat_for_item(ikey, rec)
+    if disc_cid:
+      cid = disc_cid
+      is_arch = True if disc_arch else False
+
+  if cid:
+    # Follow any handoff descendants so rebase tasks never hit an older mid-chain piece
+    chain = cl.discover_conversation_chain(cid, include_descendants=True)
+    target_cid = chain[-1] if chain else cid
+    summaries = cl._fetch_ls_summaries_for_audit() or {}
+    s = summaries.get(target_cid)
+    now_ts = time.time()
+    in_grace = any(
+        isinstance(it, dict)
+        and it.get("conversation_id") == target_cid
+        and now_ts - float(it.get("chat_woken_ts") or 0.0) < CHAT_WAKE_GRACE_SEC
+        for it in items.values()
+    )
+    ls_busy = False
+    target_arch = False if target_cid != cid else is_arch
+    if isinstance(s, dict):
+      ann = s.get("annotations") or {}
+      target_arch = bool(ann.get("archived"))
+      title = str(
+          ann.get("title") or s.get("summary") or rec.get("title") or ""
+      ).strip()
+      ls_busy = is_chat_busy(s, "" if target_arch else title)
+    if ls_busy or in_grace:
+      _rekey_state_item_chat(
+          items,
+          ikey,
+          matched_key,
+          rec,
+          target_cid,
+          chat_archived=target_arch,
+          companion_to=comp_to,
+      )
+      rec["chat_busy"] = True
+      save_watcher_state(state)
+      return {
+          "ok": True,
+          "already_busy": True,
+          "conversation_id": target_cid,
+          "chat_url": f"{jetski_box_url()}/c/{target_cid}",
+      }
+
+    if not wake_conversation(target_cid, prompt):
+      return {"ok": False, "error": f"Failed to wake conversation {target_cid}"}
+
+    _rekey_state_item_chat(
+        items,
+        ikey,
+        matched_key,
+        rec,
+        target_cid,
+        chat_archived=target_arch,
+        companion_to=comp_to,
+    )
+    rec["chat_busy"] = True
+    rec["chat_woken_ts"] = time.time()
+    rec["chat_last_modified"] = datetime.now(timezone.utc).isoformat()
+    res: dict[str, Any] = {
+        "ok": True,
+        "woken": True,
+        "conversation_id": target_cid,
+        "chat_url": f"{jetski_box_url()}/c/{target_cid}",
+    }
+  else:
+    res = _start_pinned_chat_for_record(items, ikey, matched_key, rec, prompt)
+    if not res.get("ok"):
+      return res
+    target_cid = str(res["conversation_id"])
+
+  tid = str(rec.get("target_id") or ikey)
+  events.insert(
+      0,
+      {
+          "id": f"ev-{int(time.time() * 1000)}-{tid}",
+          "time": now_et_str(),
+          "item_key": ikey,
+          "target_id": tid,
+          "conversation_id": target_cid,
+          "project_name": str(rec.get("project_name") or "Unassigned"),
+          "critical": False,
+          "message": (
+              f"[FLIGHT-DECK] 🔧 Dispatched rebase task for {ikey} "
+              f"('{rec.get('subject') or ikey}') to chat {target_cid[:8]}."
+          ),
+      },
+  )
+  state["events"] = events[:50]
   save_watcher_state(state)
-  return {
-      "ok": True,
-      "conversation_id": new_cid,
-      "title": full_title,
-      "project_id": project_id,
-      "chat_url": f"{jetski_box_url()}/c/{new_cid}",
-  }
+  return res
 
 
 def sync_once(
@@ -2547,6 +2739,7 @@ def sync_once(
         gmail_cache[tid] = gstat
 
   new_items: dict[str, Any] = {}
+  ls_summaries: dict[str, Any] | None = None
 
   for d in active_discovered:
     ikey = d["item_key"]
@@ -2616,11 +2809,62 @@ def sync_once(
         ),
     }
 
-    prev = (
-        prev_items.get(composite_key)
-        or (prev_items.get(f"{ikey}@unchatted") if cid else None)
-        or {}
+    prev = prev_items.get(composite_key) or (
+        prev_items.get(f"{ikey}@unchatted") if cid else None
     )
+    if prev is None:
+      _, prev_fb = _lookup_state_item(prev_items, ikey)
+      if prev_fb:
+        prev_cid = str(prev_fb.get("conversation_id") or "")
+        # Keep handoff tail rekeyed by rebase_item when root title holds the CL ID
+        if (
+            prev_cid
+            and prev_cid != cid
+            and cid
+            and cl.discover_conversation_chain(cid, include_descendants=True)[-1:]
+            == [prev_cid]
+        ):
+          if ls_summaries is None:
+            ls_summaries = cl._fetch_ls_summaries_for_audit() or {}
+          cid = prev_cid
+          composite_key = f"{ikey}@{cid}"
+          record["conversation_id"] = cid
+          record["composite_key"] = composite_key
+          s_tail = ls_summaries.get(cid)
+          if isinstance(s_tail, dict):
+            ann = s_tail.get("annotations") or {}
+            tail_arch = bool(ann.get("archived"))
+            tail_title = str(
+                ann.get("title")
+                or s_tail.get("summary")
+                or prev_fb.get("title")
+                or ""
+            ).strip()
+            meta = s_tail.get("trajectoryMetadata") or {}
+            record["title"] = tail_title
+            record["chat_archived"] = tail_arch
+            record["chat_last_modified"] = str(
+                meta.get("lastModifiedTime") or meta.get("createdAt") or ""
+            )
+            record["chat_busy"] = is_chat_busy(
+                s_tail, "" if tail_arch else tail_title
+            )
+          else:
+            record["title"] = str(prev_fb.get("title") or "")
+            record["chat_archived"] = bool(prev_fb.get("chat_archived", False))
+            record["chat_busy"] = bool(prev_fb.get("chat_busy", False))
+        prev = prev_fb
+    prev = prev or {}
+    # Preserve optimistic chat_busy across sync cycles before LS flips the chat to RUNNING
+    prev_woken = float(prev.get("chat_woken_ts") or 0.0)
+    if (
+        cid
+        and prev.get("conversation_id") == cid
+        and prev_woken
+        and time.time() - prev_woken < CHAT_WAKE_GRACE_SEC
+    ):
+      record["chat_woken_ts"] = prev_woken
+      record["chat_busy"] = True
     post = info.get("post_submit") or {}
     if post:
       # Key post-submit rolls on state changes to track duration in each status bucket
@@ -2655,7 +2899,7 @@ def sync_once(
     badge = post.get("compact_badge", "")
 
     if cid and update_titles and badge and not d.get("companion_to"):
-      update_chat_roll_badge(cid, d["title"], badge)
+      update_chat_roll_badge(cid, str(record.get("title") or ""), badge)
 
     # Detect significant transitions only when `prev` existed (no spam on initial seed)
     if prev:
@@ -2890,7 +3134,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .card h2 { font: 600 26px/1.2 var(--display); letter-spacing: -.02em; margin: 4px 0 6px; }
   .card .why { font-size: 17px; color: var(--graphite); }
   .card .why b { color: var(--ink); font-weight: 500; }
-  .card .actions { grid-row: 1; grid-column: 2; display: flex; flex-direction: column; gap: 10px; }
+  .card .actions { grid-row: 1; grid-column: 2; display: flex; flex-direction: column; gap: 8px; }
   .card .path, .card .incidents { grid-column: 1 / -1; }
   .card .path { margin-top: 18px; }
 
@@ -2901,9 +3145,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   .btn:hover { text-decoration: none; }
   .btn.primary { background: var(--blue); color: #fff; }
-  .btn.primary:hover { filter: brightness(1.08); }
-  .btn.quiet { color: var(--blue); }
-  .btn.quiet:hover { text-decoration: underline; }
+  .btn.primary:not(:disabled):hover { filter: brightness(1.08); }
+  .btn.secondary { background: color-mix(in srgb, var(--ink) 7%, transparent); color: var(--ink); }
+  .btn.secondary:not(:disabled):hover {
+    background: color-mix(in srgb, var(--ink) 12%, transparent);
+  }
+  .btn.quiet { height: 28px; color: var(--blue); }
+  .btn.quiet:not(:disabled):hover { text-decoration: underline; }
+  .btn:disabled, .link-btn:disabled { opacity: .45; cursor: default; }
   a:focus-visible, button:focus-visible, summary:focus-visible {
     outline: 3px solid color-mix(in srgb, var(--blue) 45%, transparent); outline-offset: 2px;
   }
@@ -2956,7 +3205,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .meta .chat { color: var(--blue); }
   .state { font-size: 14px; color: var(--graphite); }
   .state b { color: var(--ink); font-weight: 500; }
-  .state .red { color: var(--red); }
+  .state .red, .why .red { color: var(--red); }
   .when { text-align: right; font-size: 13px; color: var(--graphite); }
   .row .path { font-size: 13px; }
   .row .stop { min-width: 0; }
@@ -3129,9 +3378,9 @@ function statusOf(it) {
     return ageDays > OLD_MERGED_DAYS ? 'old' : 'merged';
   }
   // Non-participant changes sit in Watching rather than personal workflow queues
-  if (it.is_watching) return 'watching';
+  if (it.is_watching || (!it.is_self && it.reviewer_removed)) return 'watching';
   // A conflict needs my rebase now; active CQ runs precede draft/dev and red tree
-  if (it.merge_conflict) return 'conflict';
+  if (it.merge_conflict && it.is_self) return 'conflict';
   const cq = String(it.cq_status || '');
   if (it.phase === 'SUBMITTING' || cq.startsWith('CQ+') || cq.includes('running')) return 'cq';
   if (it.is_draft) return 'draft';
@@ -3275,6 +3524,19 @@ function chatActionHtml(it, data, compact) {
     `${label}</button>`;
 }
 
+// Server-side rebase fails on conflicts, so only my own open changes wake a local chat
+function canRebase(it) {
+  return Boolean(it.merge_conflict && it.is_self) &&
+    (it.status === 'NEW' || it.status === 'OPEN') && Boolean(it.item_key);
+}
+
+function rebaseActionHtml(it) {
+  if (!canRebase(it)) return '';
+  const dis = it.chat_busy ? ' disabled title="Chat is already working"' : '';
+  return `<button class="btn primary"${dis} ` +
+    `onclick="rebaseItem(${esc(JSON.stringify(it.item_key))}, this)">🔧 Rebase</button>`;
+}
+
 function focusCard(it, data) {
   const chatBtn = chatActionHtml(it, data, false);
   const busyBadge = it.chat_busy
@@ -3306,17 +3568,33 @@ function focusCard(it, data) {
     </article>`;
   }
   const kindWord = it.kind === 'github' ? 'PR' : 'CL';
+  const conflictNote = it.is_self ? 'Merge conflict: rebase needed' : 'Merge conflict';
   let why;
-  let primary = link(it.url, `Open ${kindWord}`, 'btn primary');
-  if (it.phase === 'ALERT_CQ_FAILED') {
+  let actions;
+  if (canRebase(it)) {
+    const redConflict = `<span class="red">${conflictNote}</span>`;
+    // Keep failure and comment links alongside conflict note so CQ red never masks conflict
+    if (it.phase === 'ALERT_CQ_FAILED') {
+      why = `${redConflict} · ${link(checksUrl(it), 'Checks failed')} · ${formatStatusTime(it)}`;
+    } else if (needsMyReply(it)) {
+      const from = link(actorUrl(it, it.last_msg_author), esc(shortActor(it.last_msg_author)));
+      const snippet = esc(String(it.last_msg_snippet || '').replace(/^Patch Set \d+:\s*/, ''));
+      why = `${redConflict} · <b>${from}</b> · ${formatStatusTime(it, '', it.last_msg_age)}: ` +
+        snippet;
+    } else {
+      why = `${redConflict} · ${formatStatusTime(it)}`;
+    }
+    actions = rebaseActionHtml(it) +
+      link(it.url, `Open ${kindWord}`, 'btn secondary') + chatBtn;
+  } else if (it.phase === 'ALERT_CQ_FAILED') {
     why = `The commit queue failed · ${formatStatusTime(it)}`;
-    primary = link(checksUrl(it), 'See checks', 'btn primary');
-  } else if (it.merge_conflict) {
-    why = `Merge conflict: rebase needed · ${formatStatusTime(it)}`;
+    actions = link(checksUrl(it), 'See checks', 'btn primary') + chatBtn;
   } else {
     const from = link(actorUrl(it, it.last_msg_author), esc(shortActor(it.last_msg_author)));
     const snippet = esc(String(it.last_msg_snippet || '').replace(/^Patch Set \d+:\s*/, ''));
-    why = `<b>${from}</b> · ${formatStatusTime(it, '', it.last_msg_age)}: ${snippet}`;
+    const msgWhy = `<b>${from}</b> · ${formatStatusTime(it, '', it.last_msg_age)}: ${snippet}`;
+    why = it.merge_conflict ? `<span class="red">${conflictNote}</span> · ${msgWhy}` : msgWhy;
+    actions = link(it.url, `Open ${kindWord}`, 'btn primary') + chatBtn;
   }
   return `
     <article class="card">
@@ -3324,7 +3602,7 @@ function focusCard(it, data) {
         PS${esc(it.patchset || 1)}</div>
         <h2>${link(it.url, subject)}</h2>
         <div class="why">${why}</div></div>
-      <div class="actions">${primary}${chatBtn}</div>
+      <div class="actions">${actions}</div>
     </article>`;
 }
 
@@ -3479,6 +3757,34 @@ async function startChat(itemKey, btn) {
   }
 }
 
+async function rebaseItem(itemKey, btn) {
+  if (!itemKey || (btn && btn.disabled)) return;
+  const orig = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Waking chat…';
+  }
+  try {
+    const resp = await fetch('/api/rebase', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({item_key: itemKey}),
+    });
+    const res = await resp.json();
+    if (res && res.ok) {
+      await fetchState();
+      return;
+    }
+    if (btn && res && res.error) btn.title = res.error;
+  } catch (e) {
+    // Restore button label when the local HTTP call fails
+  }
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
+}
+
 async function triggerRefresh() {
   const btn = document.getElementById('refresh-btn');
   btn.textContent = 'Refreshing…';
@@ -3562,7 +3868,7 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
       self._send_json({"ok": True, "count": len(state.get("items") or {})})
       return
 
-    if parsed.path == "/api/start_chat":
+    if parsed.path in ("/api/start_chat", "/api/rebase"):
       length = int(self.headers.get("Content-Length") or 0)
       raw_body = (
           self.rfile.read(length).decode("utf-8", errors="replace")
@@ -3575,7 +3881,11 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
         self._send_json({"ok": False, "error": "Invalid JSON"}, code=400)
         return
       ikey = str((body if isinstance(body, dict) else {}).get("item_key") or "")
-      res = start_chat_for_item(ikey)
+      res = (
+          start_chat_for_item(ikey)
+          if parsed.path == "/api/start_chat"
+          else rebase_item(ikey)
+      )
       self._send_json(res, code=200 if res.get("ok") else 400)
       return
 
