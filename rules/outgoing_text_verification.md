@@ -36,9 +36,11 @@ Code has a compiler; prose documents do not, and incoming specs or code snippets
         - Touching `modules/{skparagraph,skunicode,skshaper}/{src,include}/` -> run `flutter-test-paragraph-engine` (`run_flutter_paragraph_tests.py`).
         - Touching `lib/web_ui/lib/` -> run `webparagraph-corpus` (`run_webparagraph_corpus.py`, Part 1 `felt` + Part 2 `packages/flutter`).
 
-2. **Bug Triage & Fixes -> Failing-Then-Passing Contract Test (and On-Demand `dual-version-bug-slide`)**:
-   - **Applies to**: Any bug report or regression in `SkParagraph`, `SkUnicode`, `SkShaper`, `WebParagraph`, or `Skia`.
-   - **Required Action**: Author a failing-then-passing contract unit test before fixing production code; when the user asks for a visual before/after comparison or slide, run `~/.gemini/config/skills/dual-version-bug-slide/SKILL.md`.
+2. **Bug Triage & Fixes -> Single-Bug Intake Gate (`paragraph-bug-prioritization`), Failing-Then-Passing Contract Test, and On-Demand `dual-version-bug-slide`**:
+   - **Applies to**: Any bug report, newly discovered pre-existing side-bug on `master`, or regression in `SkParagraph`, `SkUnicode`, `SkShaper`, `WebParagraph`, or `Skia`.
+   - **Required Action**:
+     1. **Automatic Single-Bug Intake Gate (`score_and_rank.py --intake-id ...`)**: Whenever you discover a pre-existing side-bug on `master` (outside the scope of the current PR/CL) or triage an externally filed GitHub/Buganizer issue, run `~/.gemini/config/skills/paragraph-bug-prioritization/scripts/score_and_rank.py --intake-id <ID> --intake-S <0..5> --intake-features <F_ids> --intake-P <P>` (plus `scan_reach.py zoom` if `[NEEDS_ZOOM_SCAN]` triggers) before starting a fix or adding an unranked roadmap item. If `score_nl >= cutoff` (`1.09` for `R42`), insert into the active top Epic at its exact rank; if `score_nl < cutoff`, record in `roadmap.py` as `[FROZEN, rank #K, score X]` and do not divert focus from the active Epic. **Two explicit exemptions** (fix immediately without freezing): (a) in-flight regressions introduced by our own uncommitted/unmerged PR/CL or active roll blockers (`Skia -> Flutter` / `Skia -> google3`), and (b) direct production blockers filed by a named live `google3` client team whose app is already broken in production.
+     2. **Failing-Then-Passing Contract Test**: Author a failing-then-passing contract unit test before fixing production code; when the user asks for a visual before/after comparison or slide, run `~/.gemini/config/skills/dual-version-bug-slide/SKILL.md`.
 
 3. **Outgoing Code Snippets in Chat (>5 Lines) -> Inline Invariant Check (0 Subagents)**:
    - **Applies to**: Any non-trivial code block or patch (>5 lines) proposed in chat.

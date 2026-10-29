@@ -1,11 +1,11 @@
 ---
 name: paragraph-bug-prioritization
 description: >-
-  Impact-driven bug discovery and prioritization pipeline for WebParagraph and SkParagraph using
-  nonlinear user-pain scoring (`score_nl = S_nl[S_release] * R * P`), cached google3 + GitHub
-  reach profiles, and compound-reach zoom scans. Trigger when asked to "приоритизируй баги",
-  "отранжируй баги параграфа", "пересчитай приоритеты WebParagraph", "приоритизируй SkParagraph",
-  or "run paragraph bug prioritization".
+  Impact-driven bug discovery and prioritization for WebParagraph and SkParagraph using nonlinear
+  `score_nl = S_nl[S_release] * R * P`, cached google3 + GitHub reach profiles, and zoom scans.
+  Trigger automatically on newly discovered master side-bugs or filed issues (`--intake-id`), or
+  when asked to "приоритизируй баги", "отранжируй баги параграфа", "пересчитай приоритеты",
+  "приоритизируй SkParagraph", or "run paragraph bug prioritization".
 ---
 
 # Impact-Driven Paragraph Bug Prioritization (`paragraph-bug-prioritization`)
@@ -55,6 +55,33 @@ where:
 ---
 
 ## Workflow
+
+### Fast Path: Automatic Single-Bug Intake Gate (`--intake-id`)
+
+Whenever you stumble on a **pre-existing side-bug on `master`** (outside the scope of your current PR/CL) or triage an **externally filed GitHub/Buganizer issue**, run the 15-second Single-Bug Intake Gate **before** adding an unranked roadmap item or starting to fix it:
+
+1. **Check the Two Exemptions (Fix Immediately Without Scoring)**:
+   - **In-flight regression / roll blocker**: The bug is introduced by our own uncommitted/unmerged PR/CL or blocks an active `Skia -> Flutter` or `Skia -> google3` roll.
+   - **Direct `google3` client production blocker**: The bug is reported by a named live `google3` product team (`GPay`, `Classroom`, `Customer Care Portal`, etc.) where their production UI is already broken ($P = 1.0$ empirically for that client).
+2. **Run Single-Bug Intake (`score_and_rank.py --intake-id`)**:
+   - Determine release-mode severity `S` (`0..5`, verifying with `FELT_NO_ASSERTS=1` / release build if `S5`), affected feature IDs (`F01`–`F30`), and conditional probability `P` (`1.0`, `0.3`, `0.05`, `0.01`):
+     ```bash
+     python3 ~/.gemini/config/skills/paragraph-bug-prioritization/scripts/score_and_rank.py \
+       --profile web \
+       --intake-id "<BUG_ID>" \
+       --intake-what "<1-line summary>" \
+       --intake-S <0..5> \
+       --intake-features "<F_ids>" \
+       --intake-P <1.0|0.3|0.05|0.01> \
+       --cutoff-score 1.09
+     ```
+   - If the output verdict is `BLOCKED_BY_GATES ([NEEDS_ZOOM_SCAN])`, run `scan_reach.py zoom` (Step 4) and pass `--intake-zoom-reach <val> --intake-zoom-basis "<basis>"`.
+   - Pass `--save-intake` to persist the new bug into `wp_candidates.json`.
+   - **Act on the verdict**:
+     - `ACTIVE_TOP_EPIC` (`score_nl >= cutoff`): Insert into the active top Epic (`R42`) at the reported rank via `roadmap.py`.
+     - `FROZEN_BACKLOG` (`score_nl < cutoff`): Add to `roadmap.py` directly as `[FROZEN, rank #K, score X]` and return to your current task.
+
+---
 
 ### Step 1: Select or Refresh Ecosystem Reach Profile
 

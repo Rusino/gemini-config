@@ -106,6 +106,41 @@ def format_markdown(ranked, profile):
     return "\n".join(lines) + "\n"
 
 
+# Classify a newly discovered or externally filed bug against the active Epic score cutoff
+def format_intake_verdict(ranked, intake_id, cutoff_score):
+    target = next((r for r in ranked if r["id"] == intake_id), None)
+    if not target:
+        return ""
+    # Block roadmap placement until release severity and compound zoom reach are verified
+    if target["gates"]:
+        g_str = ", ".join(f"[{g}]" for g in target["gates"])
+        status = f"BLOCKED_BY_GATES ({g_str})"
+        action = "Resolve gates (--intake-release-verified / scan_reach.py zoom) before roadmap placement"
+    # High-pain bugs enter the active top Epic directly at their sorted rank
+    elif target["score_nl"] >= cutoff_score:
+        status = "ACTIVE_TOP_EPIC"
+        action = (
+            f"Insert into active Epic (R42) at rank #{target['rank']} "
+            f"(score_nl={target['score_nl']:.2f} >= cutoff {cutoff_score:.2f})"
+        )
+    # Low-pain bugs are recorded as frozen so they do not divert bandwidth from the active Epic
+    else:
+        status = "FROZEN_BACKLOG"
+        action = (
+            f"Add to roadmap.py as [FROZEN, rank {target['rank']} as {target['id']}, "
+            f"score {target['score_nl']:.2f} < cutoff {cutoff_score:.2f}]"
+        )
+    return (
+        f"## Single-Bug Intake Verdict: {target['id']}\n\n"
+        f"- **Verdict**: `{status}`\n"
+        f"- **Rank**: `#{target['rank']} / {len(ranked)}`\n"
+        f"- **Score**: `score_nl = {target['score_nl']:.2f}` "
+        f"(`S{target['S']}={target['S_nl']}` * `R={target['R']:.3g}` ({target['R_basis']}) * "
+        f"`P={target['P']:.2g}`)\n"
+        f"- **Action**: {action}\n\n"
+    )
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -120,6 +155,53 @@ def main():
         action="store_true",
         help="Ignore Phase 3 zoom_reach overrides to test [NEEDS_ZOOM_SCAN] gate detection",
     )
+    # Single-bug intake flags evaluate a new bug against the pool in one pass without editing JSON
+    ap.add_argument(
+        "--cutoff-score",
+        type=float,
+        default=1.09,
+        help="Minimum score_nl required to enter the active top Epic (default: 1.09 for R42)",
+    )
+    ap.add_argument("--intake-id", help="Evaluate a single new/filed bug ID against the pool")
+    ap.add_argument("--intake-what", default="", help="One-line summary of the intake bug")
+    ap.add_argument(
+        "--intake-S",
+        type=int,
+        choices=(0, 1, 2, 3, 4, 5),
+        help="Release-mode severity (0..5) of the intake bug",
+    )
+    ap.add_argument(
+        "--intake-features",
+        help="Comma-separated feature IDs (e.g. F04,F26) for the intake bug",
+    )
+    ap.add_argument(
+        "--intake-P",
+        type=float,
+        default=1.0,
+        help="Conditional trigger probability (1.0, 0.3, 0.05, 0.01)",
+    )
+    ap.add_argument(
+        "--intake-zoom-reach",
+        type=float,
+        help="Measured Phase 3 zoom reach in [0, 1] if already computed via scan_reach.py zoom",
+    )
+    ap.add_argument(
+        "--intake-zoom-basis",
+        default="",
+        help="Measured Phase 3 zoom basis description",
+    )
+    ap.add_argument(
+        "--intake-release-verified",
+        action="store_true",
+        help="Mark S5 release crash as verified with assertions disabled",
+    )
+    ap.add_argument("--intake-known", default="", help="Roadmap or issue reference")
+    ap.add_argument("--intake-repro", default="", help="Minimal reproducer snippet")
+    ap.add_argument(
+        "--save-intake",
+        action="store_true",
+        help="Persist the intake bug entry into --candidates JSON",
+    )
     ap.add_argument("--out-json", help="Write ranked JSON to path")
     ap.add_argument("--out-md", help="Write ranked Markdown table to path")
     args = ap.parse_args()
@@ -131,11 +213,50 @@ def main():
     )
     reach_map = json.loads(reach_path.read_text())["R"]
     candidates = load_candidates(args.candidates)
+
+    # Inject or replace the intake bug in-memory and optionally persist it to the candidate file
+    if args.intake_id:
+        if args.intake_S is None:
+            ap.error("--intake-S is required when --intake-id is set")
+        f_list = (
+            [f.strip() for f in args.intake_features.split(",") if f.strip()]
+            if args.intake_features
+            else []
+        )
+        entry = {
+            "id": args.intake_id,
+            "what": args.intake_what,
+            "S": args.intake_S,
+            "features": f_list,
+            "reach_feature": f_list[0] if len(f_list) == 1 else None,
+            "P": args.intake_P,
+            "release_verified": args.intake_release_verified,
+            "known": args.intake_known,
+            "repro": args.intake_repro,
+        }
+        # Record measured Phase 3 compound reach when provided so [NEEDS_ZOOM_SCAN] is satisfied
+        if args.intake_zoom_reach is not None:
+            entry["zoom_reach"] = args.intake_zoom_reach
+            entry["zoom_P"] = args.intake_P
+            entry["zoom_basis"] = args.intake_zoom_basis or "measured (Phase 3 zoom)"
+        candidates = [c for c in candidates if c.get("id") != args.intake_id] + [entry]
+        # Only mutate the canonical candidate database when explicitly requested via --save-intake
+        if args.save_intake:
+            Path(args.candidates).write_text(
+                json.dumps(candidates, indent=2, ensure_ascii=False) + "\n"
+            )
+
     ranked = score_candidates(candidates, reach_map, ignore_zoom=args.ignore_zoom)
 
     if args.out_json:
         Path(args.out_json).write_text(json.dumps(ranked, indent=2, ensure_ascii=False) + "\n")
-    md = format_markdown(ranked, args.profile)
+    # Prepend the single-bug intake summary above the full table when --intake-id is used
+    verdict_md = (
+        format_intake_verdict(ranked, args.intake_id, args.cutoff_score)
+        if args.intake_id
+        else ""
+    )
+    md = verdict_md + format_markdown(ranked, args.profile)
     if args.out_md:
         Path(args.out_md).write_text(md)
     print(md)
