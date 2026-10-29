@@ -240,6 +240,8 @@ class AutorollFilterTest(unittest.TestCase):
       ), mock.patch.object(
           w, "discover_active_cl_chats", return_value=discovered
       ), mock.patch.object(
+          w, "discover_open_remote_changes", return_value=[]
+      ), mock.patch.object(
           w, "fetch_github_pr_status", return_value=pr_info
       ), mock.patch.object(
           w, "fetch_gmail_status_for_id"

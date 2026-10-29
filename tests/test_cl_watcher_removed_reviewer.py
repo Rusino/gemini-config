@@ -161,6 +161,8 @@ class RemovedReviewerTest(unittest.TestCase):
       ), mock.patch.object(
           w, "discover_active_cl_chats", return_value=discovered
       ), mock.patch.object(
+          w, "discover_open_remote_changes", return_value=[]
+      ), mock.patch.object(
           w, "fetch_gmail_status_for_id", return_value=gstat
       ), mock.patch.object(
           w, "fetch_gerrit_cl_status", return_value=cl_info
@@ -239,6 +241,8 @@ class RemovedReviewerTest(unittest.TestCase):
       ), mock.patch.object(
           w, "discover_active_cl_chats", return_value=discovered
       ), mock.patch.object(
+          w, "discover_open_remote_changes", return_value=[]
+      ), mock.patch.object(
           w, "fetch_gmail_status_for_id", return_value=gstat
       ), mock.patch.object(
           w, "fetch_gerrit_cl_status", return_value=cl_info
@@ -312,6 +316,8 @@ class RemovedReviewerTest(unittest.TestCase):
           w, "fetch_gardener_snapshot", return_value=({}, [])
       ), mock.patch.object(
           w, "discover_active_cl_chats", return_value=discovered
+      ), mock.patch.object(
+          w, "discover_open_remote_changes", return_value=[]
       ), mock.patch.object(
           w, "fetch_gmail_status_for_id", return_value=gstat
       ), mock.patch.object(

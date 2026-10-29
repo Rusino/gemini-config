@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+"""Contract tests for crrev/skrev title parsing, unchatted remote discovery, and Start chat."""
+
+import http.client
+import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+import urllib.error
+
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts")
+)
+
+import cl_watcher as w  # pylint: disable=g-import-not-at-top
+
+
+def _http_json_resp(payload) -> mock.MagicMock:
+  raw = (")]}'\n" + json.dumps(payload)).encode("utf-8")
+  resp = mock.MagicMock()
+  resp.read.return_value = raw
+  resp.__enter__.return_value = resp
+  resp.__exit__.return_value = False
+  return resp
+
+
+class ClWatcherUnchattedAndCrrevTest(unittest.TestCase):
+
+  def _make_ls_summary(self, title: str, project_id: str, last_mod: str) -> dict:
+    return {
+        "annotations": {"title": title, "archived": False},
+        "trajectoryMetadata": {
+            "projectId": project_id,
+            "lastModifiedTime": last_mod,
+            "parentConversationId": "",
+            "isBattleModeFork": False,
+            "sourceMetadata": None,
+        },
+    }
+
+  def test_re_cl_id_matches_crrev_and_skrev_shortlinks(self):
+    summaries = {
+        "c-crrev": self._make_ls_summary(
+            "[11:53] ⦿ crrev/c/7686597 Linux text gamma & LCD",
+            "proj-cr",
+            "2026-10-29T15:53:00Z",
+        ),
+        "c-skrev": self._make_ls_summary(
+            "[10:15] ⦿ skrev.com/1402416 SkContext reland",
+            "proj-skia",
+            "2026-10-29T14:15:00Z",
+        ),
+        "c-multi": self._make_ls_summary(
+            "[12:30] ⦿ crrev/c/8663038 / 8663538 ShapedText split",
+            "proj-tc",
+            "2026-10-29T16:30:00Z",
+        ),
+    }
+    proj_names = {
+        "proj-cr": "Chromium",
+        "proj-skia": "Skia",
+        "proj-tc": "TextClusters API",
+    }
+    with mock.patch.object(
+        w.cl, "_fetch_ls_summaries_for_audit", return_value=summaries
+    ), mock.patch.object(w, "load_project_names", return_value=proj_names):
+      discovered = w.discover_active_cl_chats()
+
+    by_key = {d["item_key"]: d for d in discovered}
+    self.assertIn("gerrit:7686597", by_key)
+    self.assertEqual(by_key["gerrit:7686597"]["conversation_id"], "c-crrev")
+    self.assertEqual(
+        by_key["gerrit:7686597"].get("preferred_host"),
+        "chromium-review.googlesource.com",
+    )
+    self.assertTrue(by_key["gerrit:7686597"]["single_target"])
+
+    self.assertIn("gerrit:1402416", by_key)
+    self.assertEqual(
+        by_key["gerrit:1402416"].get("preferred_host"),
+        "skia-review.googlesource.com",
+    )
+
+    self.assertIn("gerrit:8663038", by_key)
+    self.assertFalse(by_key["gerrit:8663038"]["single_target"])
+
+    # Roll badge truncation must preserve crrev/c/<id> intact
+    calls = []
+    with mock.patch.object(
+        w.cl, "set_conversation_topic", side_effect=lambda _c, t: calls.append(t)
+    ):
+      w.update_chat_roll_badge(
+          "c-crrev",
+          "[11:53] ⦿ crrev/c/7686597 Linux text gamma & LCD rendering",
+          "[⏳St · 0/4 rolls]",
+      )
+    self.assertEqual(len(calls), 1)
+    self.assertIn("crrev/c/7686597", calls[0])
+    self.assertLessEqual(len(calls[0]), w.TITLE_TOPIC_MAX)
+
+  def test_fetch_gerrit_cl_status_does_not_fall_through_on_transient_timeout(self):
+    probed_urls = []
+
+    def fake_urlopen_timeout(req, timeout=8):
+      url = req.full_url if hasattr(req, "full_url") else str(req)
+      probed_urls.append(url)
+      raise TimeoutError("skia-review timed out")
+
+    with mock.patch.object(
+        w.urllib.request, "urlopen", side_effect=fake_urlopen_timeout
+    ):
+      res = w.fetch_gerrit_cl_status("1404136", {}, [], skia_dir="/nonexistent")
+
+    # Transient failure on Skia Gerrit must not fall through to a 2019 Chromium CL
+    self.assertFalse(res["ok"])
+    self.assertEqual(len(probed_urls), 1)
+    self.assertIn("skia-review.googlesource.com", probed_urls[0])
+
+    probed_inc = []
+
+    def fake_urlopen_incomplete(req, timeout=8):
+      url = req.full_url if hasattr(req, "full_url") else str(req)
+      probed_inc.append(url)
+      raise http.client.IncompleteRead(b"part")
+
+    with mock.patch.object(
+        w.urllib.request, "urlopen", side_effect=fake_urlopen_incomplete
+    ):
+      res_inc = w.fetch_gerrit_cl_status("1404136", {}, [], skia_dir="/nonexistent")
+
+    self.assertFalse(res_inc["ok"])
+    self.assertEqual(len(probed_inc), 1)
+
+    # Explicit 404 on first host still falls through to the second host
+    probed_404 = []
+    cr_detail = {
+        "status": "NEW",
+        "subject": "[canvas] Move TextMetrics shaping state into ShapedText",
+        "owner": {"name": "Florin Malita", "email": "fmalita@chromium.org"},
+        "current_revision": "rev8",
+        "revisions": {"rev8": {"_number": 8}},
+        "attention_set": {
+            "1": {
+                "account": {"email": "jlavrova@google.com"},
+                "last_update": "2026-10-29 16:16:10.000000000",
+            }
+        },
+        "reviewers": {"REVIEWER": [{"email": "jlavrova@google.com"}]},
+        "messages": [],
+    }
+
+    def fake_urlopen_404_then_ok(req, timeout=8):
+      url = req.full_url if hasattr(req, "full_url") else str(req)
+      probed_404.append(url)
+      if "skia-review.googlesource.com" in url:
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, io.BytesIO(b""))
+      return _http_json_resp(cr_detail)
+
+    with mock.patch.object(
+        w.urllib.request, "urlopen", side_effect=fake_urlopen_404_then_ok
+    ), mock.patch.object(w, "gerrit_mergeable", return_value=True):
+      res_ok = w.fetch_gerrit_cl_status(
+          "8663038",
+          {},
+          [],
+          skia_dir="/nonexistent",
+          preferred_host="skia-review.googlesource.com",
+      )
+
+    self.assertTrue(res_ok["ok"])
+    self.assertEqual(res_ok["host"], "chromium-review.googlesource.com")
+    self.assertTrue(res_ok["in_my_attention"])
+
+  def test_discover_open_remote_changes_skips_chatted_and_ignored_ids(self):
+    skia_changes = [
+        {"_number": 580176, "subject": "allow font rasterisation"},
+        {"_number": 1408158, "subject": "[skparagraph] Use std::string"},
+        {"_number": 1406897, "subject": "[skoretext 1/6] Add CoreText build flag"},
+    ]
+    cr_changes = [
+        {"_number": 8663038, "subject": "[canvas] Move TextMetrics shaping state into ShapedText"},
+        {"_number": 8663538, "subject": "[canvas] Move ShapedText into its own files"},
+    ]
+    gh_authored = {"items": [{"number": 195122, "title": "[web_paragraph] Avoid browser queries"}]}
+    gh_involved = {"items": [{"number": 195384, "title": "[web_paragraph] Already chatted"}]}
+
+    def fake_urlopen(req, timeout=10):
+      url = req.full_url if hasattr(req, "full_url") else str(req)
+      if "skia-review.googlesource.com" in url:
+        return _http_json_resp(skia_changes)
+      return _http_json_resp(cr_changes)
+
+    def fake_check_output(cmd, **kwargs):
+      q_arg = " ".join(cmd)
+      if "author:Rusino" in q_arg and "-author:Rusino" not in q_arg:
+        return json.dumps(gh_authored)
+      return json.dumps(gh_involved)
+
+    proj_names = {
+        "p-tc": "TextClusters API",
+        "p-skore": "SkoreText",
+        "p-wp": "WebParagraph",
+        "p-skia": "Skia",
+    }
+    with mock.patch.object(w.urllib.request, "urlopen", side_effect=fake_urlopen), \
+         mock.patch.object(w.subprocess, "check_output", side_effect=fake_check_output):
+      remote = w.discover_open_remote_changes(
+          already_chatted_keys={"gerrit:1408158", "github:195384"},
+          proj_names=proj_names,
+          ignored_ids={"580176"},
+      )
+
+    by_key = {r["item_key"]: r for r in remote}
+    self.assertEqual(
+        set(by_key.keys()),
+        {"gerrit:1406897", "gerrit:8663038", "gerrit:8663538", "github:195122"},
+    )
+    self.assertEqual(by_key["gerrit:8663038"]["project_name"], "TextClusters API")
+    self.assertEqual(by_key["gerrit:8663038"]["conversation_id"], "")
+    self.assertEqual(by_key["gerrit:1406897"]["project_name"], "SkoreText")
+    self.assertEqual(by_key["github:195122"]["project_name"], "WebParagraph")
+
+  def test_sync_once_tracks_unchatted_reviews_without_waking_empty_chat(self):
+    remote = [
+        {
+            "item_key": "gerrit:8663038",
+            "kind": "gerrit",
+            "target_id": "8663038",
+            "preferred_host": "chromium-review.googlesource.com",
+            "conversation_id": "",
+            "title": "",
+            "project_id": "p-tc",
+            "project_name": "TextClusters API",
+            "chat_last_modified": "",
+            "single_target": True,
+            "chat_busy": False,
+        }
+    ]
+    cl_info = {
+        "ok": True,
+        "host": "chromium-review.googlesource.com",
+        "url": "https://chromium-review.googlesource.com/c/8663038",
+        "status": "NEW",
+        "phase": "NEEDS_YOUR_ACTION",
+        "subject": "[canvas] Move TextMetrics shaping state into ShapedText",
+        "owner_name": "Florin Malita",
+        "owner_email": "fmalita@chromium.org",
+        "role": "reviewer (goog)",
+        "is_self": False,
+        "is_external": False,
+        "is_draft": False,
+        "in_development": False,
+        "is_watching": False,
+        "reviewer_removed": False,
+        "patchset": 8,
+        "revision": "rev8888888",
+        "in_my_attention": True,
+        "waiting_on": [],
+        "merge_conflict": False,
+        "tree_red": False,
+        "cr_summary": "0",
+        "cq_status": "CQ+1 (Dry Run)",
+        "cq_failed": False,
+        "last_msg_author": "fmalita@chromium.org",
+        "last_msg_date": "2026-10-29 16:16:10.000000000",
+        "last_msg_et": "12:16 ET",
+        "last_msg_age": "15m ago",
+        "last_msg_snippet": "This change is ready for review.",
+        "submitted": "",
+        "submitted_et": "",
+        "submitted_age": "",
+        "status_changed_raw": "2026-10-29 16:16:10.000000000",
+        "status_changed_et": "12:16 ET",
+        "status_changed_age": "15m ago",
+        "post_submit": None,
+    }
+    empty_gmail = {
+        "thread_ids": [],
+        "inbox_thread_ids": [],
+        "total_msgs": 0,
+        "inbox_msgs": 0,
+        "trash_msgs": 0,
+        "unread_msgs": 0,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+      state_path = os.path.join(tmp, "state.json")
+      with mock.patch.object(w, "STATE_FILE", state_path), \
+           mock.patch.object(w, "fetch_gardener_snapshot", return_value=({}, [])), \
+           mock.patch.object(w, "discover_active_cl_chats", return_value=[]), \
+           mock.patch.object(w, "discover_open_remote_changes", return_value=remote), \
+           mock.patch.object(w, "fetch_gerrit_cl_status", return_value=cl_info), \
+           mock.patch.object(w, "fetch_gmail_status_for_id", return_value=empty_gmail), \
+           mock.patch.object(w, "wake_conversation") as mock_wake:
+        state = w.sync_once(
+            wake_chats=True, update_titles=True, skia_dir="/nonexistent"
+        )
+
+    self.assertIn("gerrit:8663038@unchatted", state["items"])
+    rec = state["items"]["gerrit:8663038@unchatted"]
+    self.assertEqual(rec["conversation_id"], "")
+    self.assertTrue(rec["in_my_attention"])
+    mock_wake.assert_not_called()
+
+  def test_start_chat_for_item_creates_project_pinned_chat_and_rekeys_state(self):
+    initial_state = {
+        "items": {
+            "gerrit:8663038@unchatted": {
+                "item_key": "gerrit:8663038",
+                "kind": "gerrit",
+                "target_id": "8663038",
+                "host": "chromium-review.googlesource.com",
+                "url": "https://chromium-review.googlesource.com/c/8663038",
+                "subject": "[canvas] Move TextMetrics shaping state into ShapedText",
+                "owner_email": "fmalita@chromium.org",
+                "is_self": False,
+                "conversation_id": "",
+                "project_id": "p-tc",
+                "project_name": "TextClusters API",
+                "composite_key": "gerrit:8663038@unchatted",
+            }
+        },
+        "events": [],
+        "last_sync": "12:30:00 ET",
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+      state_path = os.path.join(tmp, "state.json")
+      with open(state_path, "w", encoding="utf-8") as f:
+        json.dump(initial_state, f)
+
+      with mock.patch.object(w, "STATE_FILE", state_path), \
+           mock.patch.object(w, "discover_active_cl_chats", return_value=[]), \
+           mock.patch.object(w.cl, "resolve_project_id", return_value="p-tc"), \
+           mock.patch.object(
+               w.cl, "resolve_handoff_model", return_value={"enum": "MODEL_PRO"}
+           ), \
+           mock.patch.object(
+               w.cl, "start_conversation_exact", return_value="new-cid-1234"
+           ) as mock_start:
+        res = w.start_chat_for_item("gerrit:8663038")
+        with open(state_path, encoding="utf-8") as sf:
+          saved = json.load(sf)
+
+    self.assertTrue(res["ok"])
+    self.assertEqual(res["conversation_id"], "new-cid-1234")
+    self.assertTrue(res["chat_url"].endswith("/c/new-cid-1234"))
+    mock_start.assert_called_once()
+    call_kwargs = mock_start.call_args.kwargs
+    self.assertEqual(call_kwargs["project_id"], "p-tc")
+    self.assertIn("crrev/c/8663038", call_kwargs["title"])
+    self.assertNotIn("gerrit:8663038@unchatted", saved["items"])
+    self.assertIn("gerrit:8663038@new-cid-1234", saved["items"])
+    self.assertTrue(saved["items"]["gerrit:8663038@new-cid-1234"]["chat_busy"])
+
+  def test_start_chat_validates_fallback_topics_and_cleans_legacy_key(self):
+    for rec in (
+        {
+            "kind": "gerrit",
+            "target_id": "8663038",
+            "host": "chromium-review.googlesource.com",
+            "subject": "[canvas] Fix bug",
+            "project_name": "TextClusters API",
+        },
+        {
+            "kind": "gerrit",
+            "target_id": "1408158",
+            "host": "skia-review.googlesource.com",
+            "subject": "Fix bug",
+            "project_name": "Skia",
+        },
+        {
+            "kind": "github",
+            "target_id": "195122",
+            "subject": "",
+            "project_name": "Flight Deck",
+        },
+    ):
+      topic = w._build_start_chat_topic(rec)
+      self.assertLessEqual(len(topic), w.TITLE_TOPIC_MAX)
+      self.assertEqual(w.cl.validate_chat_topic(topic), topic)
+
+    with mock.patch.object(
+        w.urllib.request,
+        "urlopen",
+        side_effect=[
+            http.client.IncompleteRead(b"truncated"),
+            _http_json_resp([{"_number": 8663038, "subject": "[canvas] ShapedText"}]),
+        ],
+    ), mock.patch.object(w.subprocess, "check_output", return_value='{"items":[]}'):
+      remote = w.discover_open_remote_changes(
+          already_chatted_keys=set(),
+          proj_names={"p-tc": "TextClusters API"},
+          ignored_ids=set(),
+      )
+    self.assertEqual([r["item_key"] for r in remote], ["gerrit:8663038"])
+
+    legacy_state = {
+        "items": {
+            "gerrit:8663038": {
+                "item_key": "gerrit:8663038",
+                "kind": "gerrit",
+                "target_id": "8663038",
+                "host": "chromium-review.googlesource.com",
+                "url": "https://chromium-review.googlesource.com/c/8663038",
+                "subject": "[canvas] Fix bug",
+                "is_self": False,
+                "conversation_id": "",
+                "project_id": "p-tc",
+                "project_name": "TextClusters API",
+            }
+        }
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+      state_path = os.path.join(tmp, "state.json")
+      with open(state_path, "w", encoding="utf-8") as f:
+        json.dump(legacy_state, f)
+      with mock.patch.object(w, "STATE_FILE", state_path), \
+           mock.patch.object(w, "discover_active_cl_chats", return_value=[]), \
+           mock.patch.object(w.cl, "resolve_project_id", return_value="p-tc"), \
+           mock.patch.object(
+               w.cl, "resolve_handoff_model", return_value={"enum": "MODEL_PRO"}
+           ), \
+           mock.patch.object(
+               w.cl, "start_conversation_exact", return_value="new-cid-5678"
+           ):
+        res = w.start_chat_for_item("gerrit:8663038")
+        with open(state_path, encoding="utf-8") as sf:
+          saved = json.load(sf)
+
+    self.assertTrue(res["ok"])
+    self.assertEqual(list(saved["items"].keys()), ["gerrit:8663038@new-cid-5678"])
+
+  def test_dashboard_renders_unchatted_reviewer_cl_after_cq_bot_msg_in_needs_you(self):
+    script_body = w.DASHBOARD_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    harness = script_body.split("\nboot();", 1)[0] + """
+const box = {jetski_box_url: 'https://jetski.corp.google.com/box/host'};
+const reviewerAfterBot = {
+  item_key: 'gerrit:8663038', kind: 'gerrit', target_id: '8663038', status: 'NEW',
+  phase: 'NEEDS_YOUR_ACTION', is_self: false, in_my_attention: true,
+  is_draft: false, in_development: false, is_watching: false, conversation_id: '',
+  project_name: 'TextClusters API',
+  subject: '[canvas] Move TextMetrics shaping state into ShapedText',
+  patchset: 8, url: 'https://chromium-review.googlesource.com/c/8663038',
+  last_msg_author: 'chromium-scoped@luci-project-accounts.iam.gserviceaccount.com',
+  last_msg_age: '15m ago', last_msg_snippet: 'Patch Set 8: This CL has passed the run'
+};
+const ownAfterBot = Object.assign({}, reviewerAfterBot, {
+  item_key: 'gerrit:1408158', target_id: '1408158', is_self: true
+});
+console.log(JSON.stringify({
+  revStatus: statusOf(reviewerAfterBot),
+  revLane: laneOf(reviewerAfterBot),
+  ownStatus: statusOf(ownAfterBot),
+  card: focusCard(reviewerAfterBot, box),
+  row: rowHtml(reviewerAfterBot, box),
+}));
+"""
+    proc = subprocess.run(
+        ["node", "-e", harness], capture_output=True, text=True, check=True
+    )
+    out = json.loads(proc.stdout.strip())
+    self.assertEqual(out["revStatus"], "attention")
+    self.assertEqual(out["revLane"], "you")
+    self.assertEqual(out["ownStatus"], "waiting")
+    self.assertIn("Start chat", out["card"])
+    self.assertIn("startChat(", out["card"])
+    self.assertIn("start chat", out["row"])
+
+
+if __name__ == "__main__":
+  unittest.main()

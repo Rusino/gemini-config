@@ -29,6 +29,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import glob
+import http.client
 import http.server
 import json
 import os
@@ -56,12 +57,18 @@ DEFAULT_SKIA_DIR = os.path.expanduser("~/.gemini/jetski/scratch/skia_main")
 DEFAULT_GARDENER_URL = "http://localhost:8080"
 STATE_FILE = os.path.expanduser("~/.gemini/config/logs/cl_watcher_state.json")
 PROJECTS_DIR = os.path.expanduser("~/.gemini/config/projects")
+IGNORED_CLS_FILE = os.path.expanduser(
+    "~/.gemini/config/skills/review-triage/ignored_cls.txt"
+)
 MCP_TOKENS_FILE = os.path.expanduser("~/.gemini/jetski/mcp_oauth_tokens.json")
 GMAIL_MCP_URL = "https://gmailmcp.googleapis.com/mcp/v1"
 NOTIFY_SELF_BIN = "/google/bin/releases/g3n-team/notify_self"
 PEN_URL_SH = (
     "/google/src/files/head/depot/google3/security/uberproxy/tools/contrib/pen_url.sh"
 )
+GERRIT_SKIA_HOST = "skia-review.googlesource.com"
+GERRIT_CHROMIUM_HOST = "chromium-review.googlesource.com"
+GERRIT_HOSTS = (GERRIT_SKIA_HOST, GERRIT_CHROMIUM_HOST)
 SELF_EMAILS = {"jlavrova@google.com", "jlavrova@gmail.com"}
 SELF_GITHUB_LOGINS = {"Rusino", "jlavrova"}
 FLUTTER_TREE_CHECK = "tree-status"
@@ -77,8 +84,11 @@ FLUTTER_GET_STATUS_URL = (
 RE_DASHBOARD_SUBJOB = re.compile(r"^\s*-\s*`([^`]+)`", re.MULTILINE)
 GITHUB_STATUS_BOTS = {"flutter-dashboard"}
 
-# Regexes to extract CL and PR identifiers from chat titles
-RE_CL_ID = re.compile(r"(?:\bcl/|\bCL\s+)(\d{6,10})\b", re.IGNORECASE)
+# Match cl/, CL, crrev(.com)/c/, and skrev(.com)/ shortlinks in chat titles
+RE_CL_ID = re.compile(
+    r"(?:\b(?:crrev(?:\.com)?/c|skrev(?:\.com)?|cl)/|\bCL\s+)(\d{6,10})\b",
+    re.IGNORECASE,
+)
 # Avoid matching flutter#160251 when it is a GitHub issue next to a Skia CL,
 # unless explicitly prefixed with PR
 RE_PR_ID = re.compile(r"(?:\bPR\s*#?|\bpull/)(\d{5,7})\b", re.IGNORECASE)
@@ -540,15 +550,27 @@ def discover_active_cl_chats() -> list[dict[str, Any]]:
       continue
     last_mod = str(meta.get("lastModifiedTime") or meta.get("createdAt") or "")
 
-    # Deduplicate IDs when a title repeats the same CL or PR number
-    cls_found = list(dict.fromkeys(RE_CL_ID.findall(title)))
+    # Deduplicate IDs while preserving Gerrit host hints from crrev/c/ and skrev/
+    cls_hosts: dict[str, str] = {}
+    for m in RE_CL_ID.finditer(title):
+      cl_id = m.group(1)
+      raw_tok = m.group(0).lower()
+      hint = (
+          GERRIT_CHROMIUM_HOST
+          if raw_tok.startswith("crrev")
+          else (GERRIT_SKIA_HOST if raw_tok.startswith("skrev") else "")
+      )
+      if cl_id not in cls_hosts or (hint and not cls_hosts[cl_id]):
+        cls_hosts[cl_id] = hint
+    cls_found = list(cls_hosts.keys())
     prs_found = list(dict.fromkeys(RE_PR_ID.findall(title)))
     if not cls_found and not prs_found:
       continue
     # A slash list like "PR #194466/#194475" or multiple IDs means the chat is not 1:1 with one CL
     multi_slash = bool(
         re.search(
-            r"(?:PR\s*#?\d+|cl/\d+|CL\s+\d+)\s*[/,&+]\s*#?\d+",
+            r"(?:PR\s*#?\d+|(?:crrev(?:\.com)?/c|skrev(?:\.com)?|cl)/\d+|CL\s+\d+)"
+            r"\s*[/,&+]\s*#?\d+",
             title,
             re.IGNORECASE,
         )
@@ -561,6 +583,7 @@ def discover_active_cl_chats() -> list[dict[str, Any]]:
           "item_key": f"{kind}:{cl_id}",
           "kind": kind,
           "target_id": cl_id,
+          "preferred_host": cls_hosts.get(cl_id, ""),
           "conversation_id": cid,
           "title": title,
           "project_id": pid,
@@ -574,6 +597,7 @@ def discover_active_cl_chats() -> list[dict[str, Any]]:
           "item_key": f"github:{pr_id}",
           "kind": "github",
           "target_id": pr_id,
+          "preferred_host": "",
           "conversation_id": cid,
           "title": title,
           "project_id": pid,
@@ -596,6 +620,166 @@ def discover_active_cl_chats() -> list[dict[str, Any]]:
   # Keep newest chat modification first for deterministic dashboard sort
   deduped.sort(key=lambda x: x["chat_last_modified"], reverse=True)
   return deduped
+
+
+def load_ignored_cls(path: str = IGNORED_CLS_FILE) -> set[str]:
+  """Reads permanently ignored Gerrit CL IDs from review-triage's ignore list."""
+  ignored: set[str] = set()
+  if not os.path.isfile(path):
+    return ignored
+  try:
+    with open(path, "r", encoding="utf-8") as f:
+      for raw in f:
+        line = raw.split("#", 1)[0].strip()
+        if line:
+          ignored.add(line)
+  except OSError:
+    pass
+  return ignored
+
+
+def infer_project_for_change(
+    kind: str, host: str, subject: str, proj_names: dict[str, str]
+) -> tuple[str, str]:
+  """Maps an unchatted remote CL/PR to the matching Jetski project (id, name)."""
+  by_name = {name.lower(): (pid, name) for pid, name in proj_names.items()}
+
+  def pick(*candidates: str) -> tuple[str, str]:
+    for cand in candidates:
+      hit = by_name.get(cand.lower())
+      if hit:
+        return hit
+    return ("", candidates[0] if candidates else "Unassigned")
+
+  subj_low = (subject or "").lower()
+  if kind == "github":
+    if "skparagraph" in subj_low and "web" not in subj_low:
+      return pick("SkParagraph", "WebParagraph")
+    return pick("WebParagraph")
+  if host == GERRIT_CHROMIUM_HOST:
+    # Canvas TextMetrics / ShapedText / TextCluster CLs belong to TextClusters API
+    if any(
+        kw in subj_low
+        for kw in ("[canvas]", "textmetrics", "shapedtext", "textcluster", "canvas2d")
+    ):
+      return pick("TextClusters API", "Chromium")
+    return pick("Chromium", "TextClusters API")
+  if "skoretext" in subj_low or "coretext" in subj_low:
+    return pick("SkoreText", "Skia")
+  if "lazy" in subj_low and "android" in subj_low:
+    return pick("Lazy Android", "Skia")
+  if any(
+      kw in subj_low
+      for kw in ("skparagraph", "skunicode", "skshaper", "paragraph")
+  ):
+    return pick("SkParagraph", "Skia")
+  return pick("Skia")
+
+
+def discover_open_remote_changes(
+    already_chatted_keys: set[str],
+    proj_names: dict[str, str] | None = None,
+    ignored_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+  """Queries Gerrit and GitHub for open changes involving the user that lack a chat."""
+  pnames = proj_names if proj_names is not None else load_project_names()
+  ignored = ignored_ids if ignored_ids is not None else load_ignored_cls()
+  seen_keys = set(already_chatted_keys)
+  remote: list[dict[str, Any]] = []
+
+  def _remote_item(
+      ikey: str, kind: str, num: str, host: str, pid: str, pname: str
+  ) -> dict[str, Any]:
+    return {
+        "item_key": ikey,
+        "kind": kind,
+        "target_id": num,
+        "preferred_host": host,
+        "conversation_id": "",
+        "title": "",
+        "project_id": pid,
+        "project_name": pname,
+        "chat_last_modified": "",
+        "single_target": True,
+        "chat_busy": False,
+    }
+
+  gerrit_q = (
+      "status:open+((owner:jlavrova@google.com+OR+owner:jlavrova@gmail.com)"
+      "+OR+((reviewer:jlavrova@google.com+OR+reviewer:jlavrova@gmail.com)+-is:wip))"
+  )
+  for host in GERRIT_HOSTS:
+    url = f"https://{host}/changes/?q={gerrit_q}&n=50"
+    try:
+      req = urllib.request.Request(url, headers={"User-Agent": "CLFlightDeck/1.0"})
+      with urllib.request.urlopen(req, timeout=10) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+      changes = json.loads(raw[4:] if raw.startswith(")]}'") else raw)
+    except (OSError, TimeoutError, ValueError, http.client.HTTPException):
+      continue
+    if not isinstance(changes, list):
+      continue
+    for ch in changes:
+      if not isinstance(ch, dict):
+        continue
+      num = str(ch.get("_number") or "").strip()
+      if not num or num in ignored:
+        continue
+      ikey = f"gerrit:{num}"
+      if ikey in seen_keys:
+        continue
+      subj = str(ch.get("subject") or "")
+      if RE_AUTOROLL_SUBJECT.match(subj):
+        continue
+      seen_keys.add(ikey)
+      pid, pname = infer_project_for_change("gerrit", host, subj, pnames)
+      remote.append(_remote_item(ikey, "gerrit", num, host, pid, pname))
+
+  # GitHub Search rejects parenthesized OR across qualifiers with HTTP 422
+  gh_queries = (
+      "repo:flutter/flutter is:open is:pr author:Rusino",
+      "repo:flutter/flutter is:open is:pr involves:Rusino -author:Rusino",
+  )
+  for gh_q in gh_queries:
+    try:
+      out = subprocess.check_output(
+          [
+              "gh",
+              "api",
+              "-X",
+              "GET",
+              "search/issues",
+              "-f",
+              f"q={gh_q}",
+              "-f",
+              "per_page=30",
+          ],
+          stderr=subprocess.DEVNULL,
+          text=True,
+          timeout=10,
+      )
+      prs = (json.loads(out) or {}).get("items") or []
+    except (OSError, subprocess.SubprocessError, ValueError):
+      continue
+    if not isinstance(prs, list):
+      continue
+    for pr in prs:
+      if not isinstance(pr, dict):
+        continue
+      num = str(pr.get("number") or "").strip()
+      if not num or num in ignored:
+        continue
+      ikey = f"github:{num}"
+      if ikey in seen_keys:
+        continue
+      subj = str(pr.get("title") or "")
+      if RE_AUTOROLL_SUBJECT.match(subj):
+        continue
+      seen_keys.add(ikey)
+      pid, pname = infer_project_for_change("github", "", subj, pnames)
+      remote.append(_remote_item(ikey, "github", num, "", pid, pname))
+
+  return remote
 
 
 def fetch_gardener_snapshot() -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -874,9 +1058,18 @@ def fetch_gerrit_cl_status(
     rollers: dict[str, Any],
     incidents: list[dict[str, Any]],
     skia_dir: str = DEFAULT_SKIA_DIR,
+    preferred_host: str = "",
 ) -> dict[str, Any]:
   """Probes Skia and Chromium Gerrit for a CL."""
-  for host in ("skia-review.googlesource.com", "chromium-review.googlesource.com"):
+  if preferred_host in GERRIT_HOSTS:
+    hosts = (preferred_host, *[h for h in GERRIT_HOSTS if h != preferred_host])
+  elif cl_id.isdigit() and int(cl_id) >= 4_000_000:
+    # Chromium Gerrit IDs are in the millions while Skia Gerrit IDs are ~1.4M
+    hosts = (GERRIT_CHROMIUM_HOST, GERRIT_SKIA_HOST)
+  else:
+    hosts = GERRIT_HOSTS
+
+  for host in hosts:
     try:
       opts = (
           "o=CURRENT_REVISION&o=ALL_REVISIONS&o=MESSAGES"
@@ -1178,8 +1371,14 @@ def fetch_gerrit_cl_status(
           "status_changed_age": status_changed_age,
           "post_submit": post_submit,
       }
-    except Exception:
-      continue
+    except urllib.error.HTTPError as e:
+      # Only HTTP 404 may fall through to the second Gerrit host; transient failures
+      # must abort rather than matching a colliding CL ID on another Gerrit instance
+      if e.code == 404:
+        continue
+      return {"ok": False, "error": f"CL {cl_id} HTTP {e.code} on {host}"}
+    except (OSError, TimeoutError, ValueError, http.client.HTTPException) as e:
+      return {"ok": False, "error": f"CL {cl_id} error on {host}: {e}"}
   return {"ok": False, "error": f"CL {cl_id} not found on Gerrit"}
 
 
@@ -1847,7 +2046,11 @@ def should_finalize_removed_reviewer_chat(
     chat_item: dict[str, Any], cl_info: dict[str, Any]
 ) -> bool:
   """Returns whether a 1:1 CL chat should be finalized after reviewer self-removal."""
-  if not cl_info.get("reviewer_removed") or not chat_item.get("single_target", True):
+  if (
+      not chat_item.get("conversation_id")
+      or not cl_info.get("reviewer_removed")
+      or not chat_item.get("single_target", True)
+  ):
     return False
   removed_dt = parse_gerrit_or_iso_time(str(cl_info.get("removed_at") or ""))
   chat_dt = parse_gerrit_or_iso_time(
@@ -1869,10 +2072,17 @@ def update_chat_roll_badge(conv_id: str, current_title: str, badge: str) -> None
   if len(new_topic) > TITLE_TOPIC_MAX and badge:
     avail = max(12, TITLE_TOPIC_MAX - 1 - len(badge))
     # Discovery reads the CL or PR from the title, so a cut must never split it
-    tokens = [m.group(0) for r in (RE_CL_ID, RE_PR_ID) for m in r.finditer(base_no_badge)]
+    raw_tokens = [
+        m.group(0) for r in (RE_CL_ID, RE_PR_ID) for m in r.finditer(base_no_badge)
+    ]
     rest = base_no_badge
-    for tok in tokens:
+    tokens: list[str] = []
+    for tok in raw_tokens:
       rest = rest.replace(tok, " ")
+      # Shorten crrev.com/c/ or skrev.com/ when a long alert badge leaves <19 chars
+      if len(tok) > avail:
+        tok = re.sub(r"\.com/", "/", tok, flags=re.IGNORECASE)
+      tokens.append(tok)
     kept = " ".join(tokens + rest.split())
     new_topic = f"{kept[:avail].rstrip()} {badge}"
   if new_topic == base:
@@ -1883,12 +2093,166 @@ def update_chat_roll_badge(conv_id: str, current_title: str, badge: str) -> None
     pass
 
 
+def _build_start_chat_topic(rec: dict[str, Any]) -> str:
+  """Builds a validated <38-char chat topic naming the shortlink and change subject."""
+  kind = str(rec.get("kind") or "gerrit")
+  tid = str(rec.get("target_id") or "")
+  host = str(rec.get("host") or rec.get("preferred_host") or "")
+  if kind == "github":
+    id_tok = f"PR #{tid}"
+    default_sub = "Flutter"
+  elif kind == "gerrit" and host == GERRIT_CHROMIUM_HOST:
+    id_tok = f"crrev/c/{tid}"
+    default_sub = "Chromium"
+  else:
+    id_tok = f"cl/{tid}"
+    default_sub = "Skia"
+
+  def _fit_words(text: str) -> str:
+    words: list[str] = []
+    for w_tok in text.split():
+      cand = f"{id_tok} {' '.join([*words, w_tok])}"
+      if len(cand) > TITLE_TOPIC_MAX:
+        break
+      words.append(w_tok)
+    if not words and text:
+      rem = max(4, TITLE_TOPIC_MAX - 1 - len(id_tok))
+      words = [text[:rem].rstrip()]
+    return f"{id_tok} {' '.join(words)}"[:TITLE_TOPIC_MAX].rstrip() if words else ""
+
+  raw_subj = str(rec.get("subject") or "")
+  clean_subj = re.sub(r"^(?:\[[^\]]+\]\s*)+", "", raw_subj).strip()
+  unbracketed = re.sub(r"[\[\]]+", " ", raw_subj).strip()
+  proj_name = str(rec.get("project_name") or "").strip()
+  # Fall back to bracketed tags, domain project name, or subsystem so GENERIC_TOPIC_WORDS
+  # subjects like "[canvas] Fix bug" still pass validate_chat_topic
+  sources = [clean_subj, unbracketed]
+  if proj_name and proj_name not in META_PROJECT_NAMES:
+    sources.append(f"{proj_name} patchset")
+  sources.append(f"{default_sub} patchset")
+
+  for src in sources:
+    cand = _fit_words(src)
+    if not cand:
+      continue
+    try:
+      return cl.validate_chat_topic(cand)
+    except cl.InvalidTopicError:
+      continue
+  return cl.validate_chat_topic(f"{id_tok} {default_sub} patchset"[:TITLE_TOPIC_MAX].rstrip())
+
+
+def start_chat_for_item(item_key: str) -> dict[str, Any]:
+  """Starts a project-pinned visible Jetski chat for an unchatted CL/PR item."""
+  ikey = str(item_key or "").strip()
+  if not ikey:
+    return {"ok": False, "error": "Missing item_key"}
+
+  state = load_watcher_state()
+  items: dict[str, Any] = state.setdefault("items", {})
+  unchatted_key = f"{ikey}@unchatted"
+  matched_key = unchatted_key if unchatted_key in items else ""
+  rec = items.get(unchatted_key)
+  if rec is None:
+    for k, v in items.items():
+      if isinstance(v, dict) and v.get("item_key") == ikey:
+        matched_key = k
+        rec = v
+        break
+
+  # Reuse an existing active chat if one was already opened for this CL/PR
+  for active in discover_active_cl_chats():
+    if active.get("item_key") == ikey and active.get("conversation_id"):
+      existing_cid = str(active["conversation_id"])
+      if isinstance(rec, dict) and not str(rec.get("conversation_id") or "").strip():
+        if matched_key:
+          items.pop(matched_key, None)
+        items.pop(unchatted_key, None)
+        rec["conversation_id"] = existing_cid
+        rec["composite_key"] = f"{ikey}@{existing_cid}"
+        items[f"{ikey}@{existing_cid}"] = rec
+        save_watcher_state(state)
+      return {
+          "ok": True,
+          "already_existed": True,
+          "conversation_id": existing_cid,
+          "chat_url": f"{jetski_box_url()}/c/{existing_cid}",
+      }
+
+  if not isinstance(rec, dict):
+    return {"ok": False, "error": f"Unknown item {ikey}"}
+
+  existing_cid = str(rec.get("conversation_id") or "").strip()
+  if existing_cid:
+    return {
+        "ok": True,
+        "already_existed": True,
+        "conversation_id": existing_cid,
+        "chat_url": f"{jetski_box_url()}/c/{existing_cid}",
+    }
+
+  proj_ref = str(rec.get("project_name") or rec.get("project_id") or "").strip()
+  try:
+    project_id = (
+        cl.resolve_project_id(proj_ref) if proj_ref else "outside-of-project"
+    )
+  except ValueError:
+    project_id = str(rec.get("project_id") or "").strip() or "outside-of-project"
+
+  topic = _build_start_chat_topic(rec)
+  full_title = f"[{cl.get_current_time_str()}] ⦿ {topic}"
+  url = str(rec.get("url") or ikey)
+  subj = str(rec.get("subject") or ikey)
+  ps = int(rec.get("patchset") or 1)
+  if rec.get("is_self"):
+    prompt = (
+        f"Track and assist with my change {url} ('{subj}', PS{ps}). "
+        "Inspect its current status, review comments, and CI checks, and summarize "
+        "anything that needs my attention."
+    )
+  else:
+    prompt = (
+        f"Please run review-triage on {url} ('{subj}', PS{ps}) and prepare a code "
+        "review analysis (never publish review comments without my confirmation)."
+    )
+
+  try:
+    model_info = cl.resolve_handoff_model("", tier="pro", project_id=project_id)
+    new_cid = cl.start_conversation_exact(
+        model_enum=model_info["enum"],
+        title=full_title,
+        prompt=prompt,
+        project_id=project_id,
+    )
+  except (OSError, RuntimeError, ValueError, KeyError) as exc:
+    return {"ok": False, "error": str(exc)}
+
+  if matched_key:
+    items.pop(matched_key, None)
+  items.pop(unchatted_key, None)
+  rec["conversation_id"] = new_cid
+  rec["title"] = full_title
+  rec["project_id"] = project_id
+  rec["composite_key"] = f"{ikey}@{new_cid}"
+  rec["chat_busy"] = True
+  rec["chat_last_modified"] = datetime.now(timezone.utc).isoformat()
+  items[f"{ikey}@{new_cid}"] = rec
+  save_watcher_state(state)
+  return {
+      "ok": True,
+      "conversation_id": new_cid,
+      "title": full_title,
+      "project_id": project_id,
+      "chat_url": f"{jetski_box_url()}/c/{new_cid}",
+  }
+
+
 def sync_once(
     wake_chats: bool = True,
     update_titles: bool = True,
     skia_dir: str = DEFAULT_SKIA_DIR,
 ) -> dict[str, Any]:
-  """Performs one full discovery and status poll across all active CL/PR chats."""
+  """Performs one full discovery and status poll across active and unchatted CLs/PRs."""
   state = load_watcher_state()
   prev_items: dict[str, Any] = state.get("items") or {}
   events: list[dict[str, Any]] = state.get("events") or []
@@ -1904,7 +2268,11 @@ def sync_once(
     )
 
   rollers, incidents = fetch_gardener_snapshot()
-  discovered = discover_active_cl_chats()
+  chatted = discover_active_cl_chats()
+  remote_unchatted = discover_open_remote_changes(
+      {d["item_key"] for d in chatted}
+  )
+  discovered = chatted + remote_unchatted
 
   # Cache fetched CL/PR metadata so multiple chats referencing the same CL don't re-fetch
   fetched_cache: dict[str, dict[str, Any]] = {}
@@ -1915,7 +2283,11 @@ def sync_once(
     if ikey not in fetched_cache:
       if d["kind"] == "gerrit":
         fetched_cache[ikey] = fetch_gerrit_cl_status(
-            tid, rollers, incidents, skia_dir=skia_dir
+            tid,
+            rollers,
+            incidents,
+            skia_dir=skia_dir,
+            preferred_host=str(d.get("preferred_host") or ""),
         )
       elif d["kind"] == "github":
         fetched_cache[ikey] = fetch_github_pr_status(tid)
@@ -1924,6 +2296,9 @@ def sync_once(
     info = fetched_cache[ikey]
     # Drop broken lookups and automated rolls before querying Gmail or building rows
     if not info.get("ok") or is_autoroll_change(info):
+      continue
+    # Skip unchatted remote changes from which the user already removed themselves
+    if not d.get("conversation_id") and info.get("reviewer_removed"):
       continue
     active_discovered.append(d)
 
@@ -1941,9 +2316,9 @@ def sync_once(
 
   for d in active_discovered:
     ikey = d["item_key"]
-    cid = d["conversation_id"]
+    cid = str(d.get("conversation_id") or "")
     tid = d["target_id"]
-    composite_key = f"{ikey}@{cid}"
+    composite_key = f"{ikey}@{cid}" if cid else f"{ikey}@unchatted"
     info = fetched_cache[ikey]
 
     gstat = gmail_cache.get(tid) or {
@@ -2007,7 +2382,11 @@ def sync_once(
         ),
     }
 
-    prev = prev_items.get(composite_key) or {}
+    prev = (
+        prev_items.get(composite_key)
+        or (prev_items.get(f"{ikey}@unchatted") if cid else None)
+        or {}
+    )
     post = info.get("post_submit") or {}
     if post:
       # Key post-submit rolls on state changes to track duration in each status bucket
@@ -2041,7 +2420,7 @@ def sync_once(
 
     badge = post.get("compact_badge", "")
 
-    if update_titles and badge:
+    if cid and update_titles and badge:
       update_chat_roll_badge(cid, d["title"], badge)
 
     # Detect significant transitions only when `prev` existed (no spam on initial seed)
@@ -2142,7 +2521,7 @@ def sync_once(
           send_desktop_alert(
               f"CL Alert: {ikey}", transition_msg, info.get("url", "")
           )
-        if wake_chats:
+        if cid and wake_chats:
           wake_conversation(cid, transition_msg)
 
     new_items[composite_key] = record
@@ -2230,7 +2609,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .rollers a:hover { color: var(--ink); text-decoration: none; }
   .synced { font-size: 13px; color: var(--graphite); white-space: nowrap; }
   .link-btn {
-    background: none; border: 0; color: var(--blue); font: 13px var(--sans); cursor: pointer;
+    background: none; border: 0; padding: 0; color: var(--blue); font: 13px var(--sans);
+    cursor: pointer;
   }
 
   .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
@@ -2282,8 +2662,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   .btn {
     display: inline-flex; justify-content: center; align-items: center;
-    height: 36px; padding: 0 18px; border-radius: 980px;
-    font: 500 15px var(--sans); white-space: nowrap;
+    height: 36px; padding: 0 18px; border-radius: 980px; border: 0; background: none;
+    font: 500 15px var(--sans); white-space: nowrap; cursor: pointer;
   }
   .btn:hover { text-decoration: none; }
   .btn.primary { background: var(--blue); color: #fff; }
@@ -2493,8 +2873,8 @@ function formatStatusTime(it, fallbackEt, fallbackAge) {
 function needsMyReply(it) {
   return Boolean(it.in_my_attention) && !(it.cq_failed && it.is_self) &&
     it.phase !== 'SUBMITTING' && !it.is_draft && !it.in_development &&
-    // A bot message keeps a participant in the attention set but asks nothing
-    shortActor(it.last_msg_author) !== 'SkCQ';
+    // On my own CL a dry-run bot note keeps me in attention_set without asking a question
+    !(it.is_self && shortActor(it.last_msg_author) === 'SkCQ');
 }
 
 function isAlert(it) {
@@ -2646,9 +3026,20 @@ function rowTime(it) {
   return formatStatusTime(it);
 }
 
-function focusCard(it, data) {
+function chatActionHtml(it, data, compact) {
   const chat = chatUrl(it, data);
-  const chatBtn = chat ? link(chat, 'Open chat', 'btn quiet') : '';
+  if (chat) {
+    return compact ? link(chat, 'chat', 'chat') : link(chat, 'Open chat', 'btn quiet');
+  }
+  if (!it.item_key) return '';
+  const cls = compact ? 'link-btn chat' : 'btn quiet';
+  const label = compact ? 'start chat' : 'Start chat';
+  return `<button class="${cls}" onclick="startChat(${esc(JSON.stringify(it.item_key))}, this)">` +
+    `${label}</button>`;
+}
+
+function focusCard(it, data) {
+  const chatBtn = chatActionHtml(it, data, false);
   const busyBadge = it.chat_busy
     ? '<span class="busy-pill"><i class="dot moving"></i>Chat is working</span> · '
     : '';
@@ -2701,13 +3092,12 @@ function focusCard(it, data) {
 }
 
 function rowHtml(it, data) {
-  const chat = chatUrl(it, data);
   const who = link(actorUrl(it, it.owner_email || it.owner_name), esc(authorLabel(it)));
   const meta = [
     `<span class="proj-tag">${esc(it.project_name)}</span>`,
     `<span class="cl">${esc(clLabel(it))}</span>`,
     who,
-    chat ? link(chat, 'chat', 'chat') : '',
+    chatActionHtml(it, data, true),
   ].filter(Boolean).join(' · ');
   return `
     <div class="row">
@@ -2824,6 +3214,34 @@ async function fetchState() {
   }
 }
 
+async function startChat(itemKey, btn) {
+  if (!itemKey || (btn && btn.disabled)) return;
+  const orig = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Starting…';
+  }
+  try {
+    const resp = await fetch('/api/start_chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({item_key: itemKey}),
+    });
+    const res = await resp.json();
+    if (res && res.ok && res.chat_url) {
+      window.open(res.chat_url, '_blank', 'noopener');
+      await fetchState();
+      return;
+    }
+  } catch (e) {
+    // Restore button label when the local HTTP call fails
+  }
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
+}
+
 async function triggerRefresh() {
   const btn = document.getElementById('refresh-btn');
   btn.textContent = 'Refreshing…';
@@ -2905,6 +3323,23 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
         return
       state = sync_once(wake_chats=True, update_titles=True)
       self._send_json({"ok": True, "count": len(state.get("items") or {})})
+      return
+
+    if parsed.path == "/api/start_chat":
+      length = int(self.headers.get("Content-Length") or 0)
+      raw_body = (
+          self.rfile.read(length).decode("utf-8", errors="replace")
+          if length > 0
+          else "{}"
+      )
+      try:
+        body = json.loads(raw_body or "{}")
+      except ValueError:
+        self._send_json({"ok": False, "error": "Invalid JSON"}, code=400)
+        return
+      ikey = str((body if isinstance(body, dict) else {}).get("item_key") or "")
+      res = start_chat_for_item(ikey)
+      self._send_json(res, code=200 if res.get("ok") else 400)
       return
 
     self._send_json({"error": "Not found"}, code=404)
