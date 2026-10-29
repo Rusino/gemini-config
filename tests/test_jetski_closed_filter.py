@@ -1919,6 +1919,516 @@ const liveBucketBtn = (k) =>
     )
     self.assertIn("ALL_JS_ASSERTIONS_PASSED", res.stdout)
 
+  def test_hidden_model_picker_enrichment(self) -> None:
+    node_bin = find_node_binary()
+    js_path = os.path.join(SCRIPTS_DIR, "jetski_closed_filter.js")
+
+    harness = r"""
+const fs = require('fs');
+const assert = require('assert');
+
+const scriptPath = process.argv[1];
+const code = fs.readFileSync(scriptPath, 'utf8');
+
+class FakeElement {
+  constructor(tagName) {
+    this.tagName = tagName.toUpperCase();
+    this.id = '';
+    this.className = '';
+    this.style = {};
+    this.attributes = new Map();
+    this.children = [];
+    this.parentElement = null;
+    this.listeners = new Map();
+    this._textContent = '';
+    this._innerHTML = '';
+  }
+  get textContent() { return this._textContent; }
+  set textContent(v) { this._textContent = String(v); }
+  get innerHTML() { return this._innerHTML; }
+  set innerHTML(v) { this._innerHTML = String(v); }
+  setAttribute(k, v) {
+    this.attributes.set(k, String(v));
+    if (k === 'id') this.id = String(v);
+    if (k === 'class') this.className = String(v);
+  }
+  getAttribute(k) { return this.attributes.has(k) ? this.attributes.get(k) : null; }
+  hasAttribute(k) { return this.attributes.has(k); }
+  removeAttribute(k) { this.attributes.delete(k); }
+  appendChild(c) { c.parentElement = this; this.children.push(c); return c; }
+  insertBefore(c, ref) { c.parentElement = this; this.children.push(c); return c; }
+  remove() {
+    if (!this.parentElement) return;
+    const i = this.parentElement.children.indexOf(this);
+    if (i !== -1) this.parentElement.children.splice(i, 1);
+    this.parentElement = null;
+  }
+  addEventListener(t, fn) {
+    if (!this.listeners.has(t)) this.listeners.set(t, []);
+    this.listeners.get(t).push(fn);
+  }
+  closest() { return null; }
+  querySelector(s) { return this.querySelectorAll(s)[0] || null; }
+  querySelectorAll(s) {
+    const out = [];
+    const visit = (n) => {
+      for (const c of n.children) {
+        if (s === 'button[aria-label="Display Options"]' &&
+            c.tagName === 'BUTTON' &&
+            c.getAttribute('aria-label') === 'Display Options') {
+          out.push(c);
+        } else if (s.startsWith('#') && c.id === s.slice(1)) {
+          out.push(c);
+        }
+        visit(c);
+      }
+    };
+    visit(this);
+    return out;
+  }
+}
+
+const docEl = new FakeElement('html');
+const headEl = new FakeElement('head');
+const bodyEl = new FakeElement('body');
+docEl.appendChild(headEl);
+docEl.appendChild(bodyEl);
+const actionRow = new FakeElement('div');
+const displayOptionsBtn = new FakeElement('button');
+displayOptionsBtn.setAttribute('aria-label', 'Display Options');
+actionRow.appendChild(displayOptionsBtn);
+bodyEl.appendChild(actionRow);
+
+const protoMarker = { __isBufProto: true };
+function protoObj(typeName, fields) {
+  return Object.assign(Object.create(protoMarker), { $typeName: typeName, ...fields });
+}
+
+function makeNativeConfig(label, enumVal, modelId, remaining = 0.95) {
+  return protoObj('exa.codeium_common_pb.ClientModelConfig', {
+    label,
+    modelOrAlias: protoObj('exa.codeium_common_pb.ModelOrAlias', {
+      choice: { case: 'model', value: enumVal },
+    }),
+    creditMultiplier: 0,
+    pricingType: 0,
+    disabled: false,
+    supportsImages: true,
+    supportsLegacy: false,
+    isPremium: false,
+    betaWarningMessage: '',
+    isBeta: false,
+    provider: 0,
+    isRecommended: true,
+    allowedTiers: [1, 2],
+    description: '',
+    quotaInfo: protoObj('exa.codeium_common_pb.QuotaInfo', {
+      remainingFraction: remaining,
+      resetTime: protoObj('google.protobuf.Timestamp', {
+        seconds: 1793447031n,
+        nanos: 0,
+      }),
+    }),
+    tagTitle: '',
+    tagDescription: '',
+    supportedMimeTypes: { 'image/png': true },
+    supportsThoughtCirculation: false,
+    modelUrl: '',
+    modelId,
+    contextWindowOptions: [],
+  });
+}
+
+function makeServerUserStatus(proRemaining = 0.989) {
+  const nativeConfigs = [
+    makeNativeConfig('Gemini Pro Next', 1260, 'auto', proRemaining),
+    makeNativeConfig('Gemini 3.5 Flash Lite', 1198, 'gemini-3.5-flash-lite', 0.998),
+    makeNativeConfig('Claude Opus 5.5 (Max)', 1371, 'opus-5.5-max', 0.56),
+    makeNativeConfig('Claude Opus 5.5 (High)', 1370, 'opus-5.5-high', 0.56),
+  ];
+  return protoObj('exa.codeium_common_pb.UserStatus', {
+    cascadeModelConfigData: protoObj('exa.codeium_common_pb.CascadeModelConfigData', {
+      clientModelConfigs: nativeConfigs,
+      clientModelSorts: [
+        protoObj('exa.codeium_common_pb.ClientModelSort', {
+          name: 'Recommended',
+          groups: [
+            protoObj('exa.codeium_common_pb.ClientModelGroup', {
+              groupName: '',
+              modelLabels: nativeConfigs.map((c) => c.label),
+            }),
+          ],
+        }),
+      ],
+      battleModeModelConfigs: [],
+      battleModeModelSorts: [],
+    }),
+  });
+}
+
+const availableModelsPayload = {
+  response: {
+    models: {
+      'auto': {
+        displayName: 'Gemini Pro Next',
+        model: 'MODEL_PLACEHOLDER_M260',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.989, resetTime: '2026-10-30T11:43:51Z' },
+      },
+      'opus-5.5-high': {
+        displayName: 'Claude Opus 5.5 (High)',
+        model: 'MODEL_PLACEHOLDER_M370',
+        apiProvider: 'API_PROVIDER_ANTHROPIC_VERTEX',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.56, resetTime: '2026-10-30T12:00:00Z' },
+      },
+      'glm-5.2-fp8-bon-arm': {
+        displayName: 'GLM 5.2',
+        model: 'MODEL_PLACEHOLDER_M252',
+        apiProvider: 'API_PROVIDER_OPENAI_VERTEX',
+        supportsImages: false,
+        supportedMimeTypes: { 'text/plain': true },
+        quotaInfo: { remainingFraction: 1, resetTime: '2026-10-30T12:30:00Z' },
+      },
+      'kimi-k3-maas-bon-arm': {
+        displayName: 'Kimi K3',
+        model: 'MODEL_PLACEHOLDER_M284',
+        apiProvider: 'API_PROVIDER_OPENAI_VERTEX',
+        supportsImages: false,
+        quotaInfo: { remainingFraction: 0.85, resetTime: '2026-10-30T12:30:00Z' },
+      },
+      'sonnet-5.5-bon-le': {
+        displayName: 'Gemini Pro Next',
+        model: 'MODEL_PLACEHOLDER_M377',
+        apiProvider: 'API_PROVIDER_ANTHROPIC_VERTEX',
+        supportsImages: true,
+        supportedMimeTypes: { 'image/png': true },
+        quotaInfo: { remainingFraction: 0.72, resetTime: '2026-10-30T12:30:03Z' },
+      },
+      'sonnet-5.5-high-bon-le': {
+        displayName: 'Gemini Pro Next',
+        model: 'MODEL_PLACEHOLDER_M420',
+        apiProvider: 'API_PROVIDER_ANTHROPIC_VERTEX',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.72, resetTime: '2026-10-30T12:30:03Z' },
+      },
+      'opus-5-bon-le': {
+        displayName: 'Gemini Pro Next',
+        model: 'MODEL_PLACEHOLDER_M324',
+        apiProvider: 'API_PROVIDER_ANTHROPIC_VERTEX',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.91, resetTime: '2026-10-30T12:30:03Z' },
+      },
+      'opus-5.5-max-bon-le': {
+        displayName: 'Gemini Pro Next',
+        model: 'MODEL_PLACEHOLDER_M368',
+        apiProvider: 'API_PROVIDER_ANTHROPIC_VERTEX',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 1, resetTime: '2026-10-30T12:30:03Z' },
+      },
+      'bon-experiment-arm-226': {
+        displayName: 'Gemini Pro Next',
+        model: 'MODEL_PLACEHOLDER_M226',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.989 },
+      },
+      'gemini-2.5-flash': {
+        displayName: 'Gemini 3.5 Flash Lite',
+        model: 'MODEL_GOOGLE_GEMINI_2_5_FLASH',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.998, resetTime: '2026-10-30T14:00:00Z' },
+      },
+      'deepseek-r2-bon-arm': {
+        displayName: 'Gemini Pro Next',
+        model: 'MODEL_PLACEHOLDER_M490',
+        apiProvider: 'API_PROVIDER_OPENAI_VERTEX',
+        supportsImages: false,
+        quotaInfo: { remainingFraction: 0.5, resetTime: '2026-10-30T15:00:00Z' },
+      },
+      // Junk / FIM / image / latency-trap / duplicate-alias entries that MUST be filtered out
+      'tab_flash_lite': {
+        model: 'MODEL_GOOGLE_GEMINI_INTERNAL_TAB_FLASH_LITE',
+        apiProvider: 'API_PROVIDER_GOOGLE_EVERGREEN',
+      },
+      'tab_flash_lite_preview': {
+        model: 'MODEL_PLACEHOLDER_M19',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+      },
+      'chat_20706': {
+        model: 'MODEL_CHAT_20706',
+        apiProvider: 'API_PROVIDER_INTERNAL',
+      },
+      'gemini-3.1-flash-image': {
+        displayName: 'Gemini 3.1 Flash Image',
+        model: 'MODEL_PLACEHOLDER_M21',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+      },
+      'models/proactive-observer-v10': {
+        model: 'MODEL_PLACEHOLDER_M150',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+      },
+      'le-01-experiment-arm': {
+        displayName: 'Gemini Pro Next',
+        model: 'MODEL_PLACEHOLDER_M80',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+      },
+      'bon-experiment-arm-232': {
+        displayName: 'Gemini Pro Next',
+        model: 'MODEL_PLACEHOLDER_M232',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+      },
+      'bon-experiment-arm-233': {
+        displayName: 'Gemini Pro Next',
+        model: 'MODEL_PLACEHOLDER_M233',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+      },
+      'bon-experiment-arm-234': {
+        displayName: 'Gemini Pro Next',
+        model: 'MODEL_PLACEHOLDER_M234',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+      },
+      'bon-experiment-arm-235': {
+        displayName: 'Gemini Pro Next',
+        model: 'MODEL_PLACEHOLDER_M235',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+      },
+      'fable-5.1-dropdown': {
+        displayName: 'Claude Fable 5.1 (High)',
+        model: 'MODEL_PLACEHOLDER_M388',
+        apiProvider: 'API_PROVIDER_ANTHROPIC_VERTEX',
+      },
+      'gemini-4-carbon': {
+        displayName: 'Gemini 4 Carbon (High)',
+        model: 'MODEL_PLACEHOLDER_M439',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+      },
+      'gemini-launch-candidate': {
+        displayName: 'Gemini 4 Argon (High)',
+        model: 'MODEL_PLACEHOLDER_M393',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+      },
+      'gemini-opt-out': {
+        displayName: 'Gemini Pro Next',
+        model: 'MODEL_PLACEHOLDER_M94',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+      },
+      'gemini-3.8-flash-tiered': {
+        model: 'MODEL_PLACEHOLDER_M322',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+      },
+      'unknown-enum-model': {
+        displayName: 'Mystery Enum',
+        model: 'MODEL_COMPLETELY_UNMAPPED_XYZ',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+      },
+    },
+    tabModelIds: ['chat_20706', 'tab_flash_lite_preview', 'tab_flash_lite'],
+    imageGenerationModelIds: ['gemini-3.1-flash-image'],
+    audioTranscriptionModelIds: ['models/proactive-observer-v10'],
+    deprecatedModelIds: { 'le-01-experiment-arm': { oldModelEnum: 'MODEL_PLACEHOLDER_M80' } },
+  },
+};
+
+const storeState = {
+  trajectorySummaries: { summaries: {} },
+  userStatus: makeServerUserStatus(0.989),
+};
+
+let userStatusDispatches = 0;
+const subscribers = [];
+const reduxStore = {
+  getState() { return storeState; },
+  dispatch(action) {
+    if (action?.type === 'userStatus/setUserStatus') {
+      userStatusDispatches++;
+      storeState.userStatus = action.payload;
+      for (const fn of subscribers) fn();
+    }
+    return action;
+  },
+  subscribe(fn) {
+    subscribers.push(fn);
+    return () => {};
+  },
+};
+displayOptionsBtn.__reactFiber$test = { memoizedProps: { store: reduxStore } };
+
+let availableModelsFetches = 0;
+global.window = {
+  innerWidth: 1280,
+  location: { pathname: '/', search: '' },
+  __APP_CONFIG__: { csrfToken: 'csrf-models-test' },
+  localStorage: { getItem: () => null, setItem: () => {} },
+  fetch: async (url, opts) => {
+    if (String(url).includes('GetAvailableModels')) {
+      availableModelsFetches++;
+      assert.strictEqual(opts?.method, 'POST');
+      assert.strictEqual(opts?.headers?.['x-codeium-csrf-token'], 'csrf-models-test');
+      return { ok: true, json: async () => availableModelsPayload };
+    }
+    return { ok: false, status: 404 };
+  },
+};
+global.document = {
+  documentElement: docEl,
+  head: headEl,
+  body: bodyEl,
+  getElementById(id) { return docEl.querySelector(`#${id}`); },
+  createElement(t) { return new FakeElement(t); },
+  querySelector(s) { return docEl.querySelector(s); },
+  querySelectorAll(s) { return docEl.querySelectorAll(s); },
+  addEventListener() {},
+  removeEventListener() {},
+};
+global.MutationObserver = class { observe() {} disconnect() {} };
+global.requestAnimationFrame = () => 1;
+
+(async () => {
+  eval(code);
+  await new Promise((r) => setImmediate(r));
+
+  assert.strictEqual(availableModelsFetches, 1, 'Must fetch GetAvailableModels on initial hydrate');
+  assert.strictEqual(
+    userStatusDispatches,
+    1,
+    'Must dispatch enriched userStatus once after hydrate'
+  );
+
+  const data = storeState.userStatus.cascadeModelConfigData;
+  const configs = data.clientModelConfigs;
+  const labels = data.clientModelSorts[0].groups[0].modelLabels;
+
+  // Native order preserved at the front of Recommended sort
+  assert.deepStrictEqual(labels.slice(0, 4), [
+    'Gemini Pro Next',
+    'Gemini 3.5 Flash Lite',
+    'Claude Opus 5.5 (Max)',
+    'Claude Opus 5.5 (High)',
+  ]);
+
+  // Every label in clientModelConfigs and modelLabels must be unique
+  assert.strictEqual(new Set(configs.map((c) => c.label)).size, configs.length);
+  assert.strictEqual(new Set(labels).size, labels.length);
+  assert.strictEqual(labels.length, configs.length);
+
+  const byModelId = new Map(configs.map((c) => [c.modelId, c]));
+
+  const glm = byModelId.get('glm-5.2-fp8-bon-arm');
+  assert(glm, 'GLM 5.2 must be unlocked');
+  assert.strictEqual(glm.label, 'GLM 5.2');
+  assert.strictEqual(glm.tagTitle, '3P');
+  assert.strictEqual(glm.$typeName, 'exa.codeium_common_pb.ClientModelConfig');
+  assert.strictEqual(glm.__isBufProto, true, 'Must preserve ClientModelConfig prototype');
+  assert.deepStrictEqual(glm.modelOrAlias.choice, { case: 'model', value: 1252 });
+  assert.strictEqual(glm.quotaInfo.$typeName, 'exa.codeium_common_pb.QuotaInfo');
+  assert.strictEqual(glm.quotaInfo.remainingFraction, 1);
+  assert.strictEqual(typeof glm.quotaInfo.resetTime.seconds, 'bigint');
+  assert.strictEqual(glm.quotaInfo.resetTime.$typeName, 'google.protobuf.Timestamp');
+
+  assert.strictEqual(byModelId.get('kimi-k3-maas-bon-arm')?.label, 'Kimi K3');
+  assert.strictEqual(byModelId.get('sonnet-5.5-bon-le')?.label, 'Claude Sonnet 5.5 (Max)');
+  assert.strictEqual(byModelId.get('sonnet-5.5-high-bon-le')?.label, 'Claude Sonnet 5.5 (High)');
+  assert.strictEqual(byModelId.get('opus-5-bon-le')?.label, 'Claude Opus 5 (High)');
+  assert.strictEqual(byModelId.get('opus-5.5-max-bon-le')?.label, 'Claude Opus 5.5 BoN (Max)');
+  assert.strictEqual(byModelId.get('bon-experiment-arm-226')?.label, 'Gemini 4 Carbon-G');
+  assert.strictEqual(byModelId.get('bon-experiment-arm-226')?.quotaInfo?.resetTime, undefined);
+
+  const flash25 = byModelId.get('gemini-2.5-flash');
+  assert(flash25, 'Gemini 2.5 Flash must be unlocked with named enum 312');
+  assert.strictEqual(flash25.label, 'Gemini 2.5 Flash');
+  assert.deepStrictEqual(flash25.modelOrAlias.choice, { case: 'model', value: 312 });
+
+  const future = byModelId.get('deepseek-r2-bon-arm');
+  assert(future, 'Unknown future hidden model must be unlocked via fallback');
+  assert.notStrictEqual(future.label, 'Gemini Pro Next');
+  assert(/deepseek/i.test(future.label), `Expected humanized fallback label, got: ${future.label}`);
+  assert.deepStrictEqual(future.modelOrAlias.choice, { case: 'model', value: 1490 });
+
+  // Verify junk, FIM, image, deprecated, duplicate-alias, and artificial-latency arms are excluded
+  for (const blocked of [
+    'tab_flash_lite',
+    'tab_flash_lite_preview',
+    'chat_20706',
+    'gemini-3.1-flash-image',
+    'models/proactive-observer-v10',
+    'le-01-experiment-arm',
+    'bon-experiment-arm-232',
+    'bon-experiment-arm-233',
+    'bon-experiment-arm-234',
+    'bon-experiment-arm-235',
+    'fable-5.1-dropdown',
+    'gemini-4-carbon',
+    'gemini-launch-candidate',
+    'gemini-opt-out',
+    'gemini-3.8-flash-tiered',
+    'unknown-enum-model',
+  ]) {
+    assert(!byModelId.has(blocked), `Blocked model ${blocked} must not appear in picker`);
+  }
+
+  // Subsequent server UserStatus poll must synchronously enrich payload without extra dispatches
+  const dispatchesBeforePoll = userStatusDispatches;
+  reduxStore.dispatch({
+    type: 'userStatus/setUserStatus',
+    payload: makeServerUserStatus(0.777),
+  });
+  assert.strictEqual(userStatusDispatches, dispatchesBeforePoll + 1);
+  const afterPollConfigs = storeState.userStatus.cascadeModelConfigData.clientModelConfigs;
+  assert.strictEqual(afterPollConfigs[0].quotaInfo.remainingFraction, 0.777);
+  assert(
+    afterPollConfigs.some((c) => c.modelId === 'glm-5.2-fp8-bon-arm'),
+    'Synchronous enrichment on poll must keep unlocked models without flicker'
+  );
+
+  // Re-injection idempotence: re-running the script must not duplicate unlocked entries
+  const countBeforeReinject = afterPollConfigs.length;
+  eval(code);
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(
+    storeState.userStatus.cascadeModelConfigData.clientModelConfigs.length,
+    countBeforeReinject,
+    'Re-injection must not duplicate unlocked models'
+  );
+
+  // Cleanup must restore un-enriched server UserStatus cleanly
+  window.__jetskiClosedChatsFilterCleanup();
+  const restoredConfigs = storeState.userStatus.cascadeModelConfigData.clientModelConfigs;
+  const restoredLabels =
+    storeState.userStatus.cascadeModelConfigData.clientModelSorts[0].groups[0].modelLabels;
+  assert.strictEqual(restoredConfigs.length, 4, 'Cleanup must restore original 4 native models');
+  assert.strictEqual(restoredConfigs[0].quotaInfo.remainingFraction, 0.777);
+  assert.deepStrictEqual(restoredLabels, [
+    'Gemini Pro Next',
+    'Gemini 3.5 Flash Lite',
+    'Claude Opus 5.5 (Max)',
+    'Claude Opus 5.5 (High)',
+  ]);
+
+  console.log('MODEL_PICKER_ENRICHMENT_PASSED');
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"""
+    env = os.environ.copy()
+    env["ELECTRON_RUN_AS_NODE"] = "1"
+    res = subprocess.run(
+        [node_bin, "-e", harness, js_path],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(
+        res.returncode,
+        0,
+        f"Model picker harness failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+    )
+    self.assertIn("MODEL_PICKER_ENRICHMENT_PASSED", res.stdout)
+
   def test_patch_binary_and_idempotency(self) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
       bin_path = os.path.join(tmpdir, "jetski-hub-server")

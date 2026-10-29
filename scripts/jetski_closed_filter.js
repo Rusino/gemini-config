@@ -263,6 +263,82 @@
   let roadmapIndexCache = null;
   let roadmapIndexFetchedAt = 0;
   let roadmapIndexFetching = false;
+  // Caches GetAvailableModels across UserStatus polls so hidden models stay unlocked
+  const AVAILABLE_MODELS_TTL_MS = 60000;
+  let availableModelsCache = null;
+  let availableModelsFetchedAt = 0;
+  let availableModelsFetching = null;
+  let lastAppliedModelsFetchedAt = 0;
+
+  // Numeric codeium_common_pb.Model enum values for non-placeholder model identifiers
+  const NAMED_MODEL_ENUM_VALUES = {
+    MODEL_GOOGLE_GEMINI_2_5_PRO: 246,
+    MODEL_CLAUDE_4_SONNET: 281,
+    MODEL_CLAUDE_4_SONNET_THINKING: 282,
+    MODEL_CLAUDE_4_OPUS: 290,
+    MODEL_CLAUDE_4_OPUS_THINKING: 291,
+    MODEL_GOOGLE_GEMINI_2_5_FLASH: 312,
+    MODEL_GOOGLE_GEMINI_2_5_FLASH_THINKING: 313,
+    MODEL_GOOGLE_GEMINI_FOR_GOOGLE_2_5_PRO: 327,
+    MODEL_GOOGLE_GEMINI_NEMOSREEF: 328,
+    MODEL_GOOGLE_GEMINI_2_5_FLASH_THINKING_TOOLS: 329,
+    MODEL_GOOGLE_GEMINI_2_5_FLASH_LITE: 330,
+    MODEL_GOOGLE_GEMINI_2_5_PRO_EVAL: 331,
+    MODEL_CLAUDE_4_5_SONNET: 333,
+    MODEL_CLAUDE_4_5_SONNET_THINKING: 334,
+    MODEL_CLAUDE_4_5_HAIKU: 340,
+    MODEL_CLAUDE_4_5_HAIKU_THINKING: 341,
+    MODEL_OPENAI_GPT_OSS_120B_MEDIUM: 342,
+  };
+
+  // Excludes artificial-latency battle arms and aliases that duplicate visible dropdown models
+  const SKIPPED_HIDDEN_MODEL_IDS = new Set([
+    'bon-experiment-arm-232',
+    'bon-experiment-arm-233',
+    'bon-experiment-arm-234',
+    'bon-experiment-arm-235',
+    'fable-5.1-dropdown',
+    'gemini-4-carbon',
+    'gemini-launch-candidate',
+    'gemini-opt-out',
+    'gemini-3.8-flash-tiered',
+  ]);
+
+  // Unmasks server-side "Gemini Pro Next" labels into unique dropdown labels for ModelSelector
+  const CURATED_HIDDEN_MODELS = [
+    ['glm-5.2-fp8-bon-arm', 'GLM 5.2', '3P'],
+    ['kimi-k3-maas-bon-arm', 'Kimi K3', '3P'],
+    ['sonnet-5.5-bon-le', 'Claude Sonnet 5.5 (Max)', 'BoN'],
+    ['sonnet-5.5-high-bon-le', 'Claude Sonnet 5.5 (High)', 'BoN'],
+    ['opus-5-bon-le', 'Claude Opus 5 (High)', 'BoN'],
+    ['opus-4.8-max-bon-le', 'Claude Opus 4.8 (Max)', 'BoN'],
+    ['opus-4.8-bon-le', 'Claude Opus 4.8 (High)', 'BoN'],
+    ['opus-bon-le', 'Claude Opus 4.6', 'BoN'],
+    ['opus-5.5-max-bon-le', 'Claude Opus 5.5 BoN (Max)', 'BoN'],
+    ['opus-5.5-high-bon-le', 'Claude Opus 5.5 BoN (High)', 'BoN'],
+    ['fable-5.1-max-bon-le', 'Claude Fable 5.1 BoN (Max)', 'BoN'],
+    ['fable-5.1-bon-le', 'Claude Fable 5.1 BoN (High)', 'BoN'],
+    ['bon-experiment-arm-226', 'Gemini 4 Carbon-G', 'Exp'],
+    ['bon-experiment-arm-221', 'Gemini Perseus Fast', 'Exp'],
+    ['bon-experiment-arm-222', 'Gemini CSWise Fast (High)', 'Exp'],
+    ['bon-experiment-arm-223', 'Gemini CSWise Fast (Medium)', 'Exp'],
+    ['bon-experiment-arm-227', 'Gemini Skimaki Fast', 'Exp'],
+    ['bon-experiment-arm-229', 'Gemini Barium-B', 'Exp'],
+    ['bon-experiment-arm-228', 'Gemini LE-01', 'Exp'],
+    ['bon-experiment-arm-225', 'Gemini LE-02', 'Exp'],
+    ['bon-experiment-arm-230', 'Gemini LE-05', 'Exp'],
+    ['bon-experiment-arm-224', 'Gemini LE-06', 'Exp'],
+    ['bon-experiment-arm-231', 'Gemini LE-11', 'Exp'],
+    ['gemini-3.8-flash-router', 'Gemini 3.8 Flash Router', 'Exp'],
+    ['snowball-subagent', 'Gemini Snowball Subagent', 'Exp'],
+    ['gemini-3.1-flash-lite', 'Gemini 3.1 Flash Lite', 'Exp'],
+    ['gemini-2.5-flash-thinking', 'Gemini 2.5 Flash (Thinking)', '2.5'],
+    ['gemini-2.5-flash', 'Gemini 2.5 Flash', '2.5'],
+    ['gemini-2.5-flash-lite', 'Gemini 2.5 Flash Lite', '2.5'],
+  ];
+  const CURATED_HIDDEN_MODEL_MAP = new Map(
+    CURATED_HIDDEN_MODELS.map(([id, label, tag]) => [id, { label, tag }])
+  );
 
   function isActiveRunStatus(status) {
     return ACTIVE_RUN_STATUSES.has(status);
@@ -1898,6 +1974,339 @@
     window.fetch = gatedFetch;
   }
 
+  // Clones a Protobuf-ES v2 message while preserving its descriptor prototype
+  function cloneWithProto(source, overrides) {
+    const proto = source && typeof source === 'object' ? Object.getPrototypeOf(source) : null;
+    const base = proto && proto !== Object.prototype ? Object.create(proto) : {};
+    return Object.assign(base, source || {}, overrides || {});
+  }
+
+  // Maps a server Model enum name or numeric value to codeium_common_pb.Model
+  function resolveModelEnumValue(modelEnum) {
+    if (typeof modelEnum === 'number' && Number.isFinite(modelEnum) && modelEnum > 0) {
+      return modelEnum;
+    }
+    if (typeof modelEnum !== 'string' || !modelEnum) return 0;
+    const placeholderMatch = /^MODEL_PLACEHOLDER_M(\d+)$/.exec(modelEnum);
+    // Placeholder enums M<N> map to 1000 + N in codeium_common.proto
+    if (placeholderMatch) {
+      return 1000 + Number(placeholderMatch[1]);
+    }
+    return NAMED_MODEL_ENUM_VALUES[modelEnum] || 0;
+  }
+
+  // Formats an unknown modelId into a readable fallback label when displayName is masked
+  function humanizeModelId(modelId) {
+    const cleaned = String(modelId || '')
+      .replace(/-(?:bon-arm|bon-le)$/i, '')
+      .replace(/[-_]+/g, ' ')
+      .trim();
+    if (!cleaned) return String(modelId || 'Hidden Model');
+    return cleaned
+      .split(/\s+/)
+      .map((w) =>
+        w.length <= 3 && /\d/.test(w) ? w.toUpperCase() : w[0].toUpperCase() + w.slice(1)
+      )
+      .join(' ');
+  }
+
+  // Strips synthetic unlocked models so re-injection and cleanup restore server UserStatus
+  function stripUnlockedModels(userStatus) {
+    const data = userStatus?.cascadeModelConfigData;
+    if (!data || !Array.isArray(data.clientModelConfigs)) return userStatus;
+    const unlockedConfigs = data.clientModelConfigs.filter(
+      (c) => c && c.__jetskiUnlockedModel === true
+    );
+    if (unlockedConfigs.length === 0) return userStatus;
+
+    const unlockedLabels = new Set(unlockedConfigs.map((c) => c.label));
+    const cleanConfigs = data.clientModelConfigs.filter(
+      (c) => !c || c.__jetskiUnlockedModel !== true
+    );
+    const cleanSorts = Array.isArray(data.clientModelSorts)
+      ? data.clientModelSorts.map((sort) => {
+          if (!sort || !Array.isArray(sort.groups)) return sort;
+          return cloneWithProto(sort, {
+            groups: sort.groups.map((group) => {
+              if (!group || !Array.isArray(group.modelLabels)) return group;
+              return cloneWithProto(group, {
+                modelLabels: group.modelLabels.filter((lbl) => !unlockedLabels.has(lbl)),
+              });
+            }),
+          });
+        })
+      : data.clientModelSorts;
+
+    return cloneWithProto(userStatus, {
+      cascadeModelConfigData: cloneWithProto(data, {
+        clientModelConfigs: cleanConfigs,
+        clientModelSorts: cleanSorts,
+      }),
+    });
+  }
+
+  // Fetches GetAvailableModels once per TTL window to discover hidden executable models
+  async function fetchAvailableModels() {
+    const now = Date.now();
+    if (availableModelsCache && now - availableModelsFetchedAt < AVAILABLE_MODELS_TTL_MS) {
+      return availableModelsCache;
+    }
+    if (availableModelsFetching) return availableModelsFetching;
+    if (typeof window.fetch !== 'function') return availableModelsCache;
+
+    availableModelsFetching = (async () => {
+      try {
+        const resp = await window.fetch(
+          '/exa.language_server_pb.LanguageServerService/GetAvailableModels',
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-codeium-csrf-token': getCsrfToken(),
+            },
+            body: '{}',
+          }
+        );
+        if (resp && resp.ok) {
+          const raw = await resp.json();
+          // GetAvailableModels wraps its payload inside a top-level response object
+          const respObj = raw?.response && typeof raw.response === 'object' ? raw.response : raw;
+          if (respObj?.models && typeof respObj.models === 'object') {
+            availableModelsCache = respObj;
+            availableModelsFetchedAt = Date.now();
+          }
+        }
+      } catch {
+        // Ignore transient ConnectRPC failures and keep previous cache
+      } finally {
+        availableModelsFetching = null;
+      }
+      return availableModelsCache;
+    })();
+    return availableModelsFetching;
+  }
+
+  // Appends hidden executable models from GetAvailableModels to UserStatus
+  function enrichUserStatusWithHiddenModels(userStatus, availablePayload) {
+    const baseStatus = stripUnlockedModels(userStatus);
+    const data = baseStatus?.cascadeModelConfigData;
+    if (!data || !Array.isArray(data.clientModelConfigs) || data.clientModelConfigs.length === 0) {
+      return baseStatus;
+    }
+    const modelsMap = availablePayload?.models;
+    if (!modelsMap || typeof modelsMap !== 'object') return baseStatus;
+
+    // Exclude FIM tab autocomplete, image generation, audio transcription, and deprecated arms
+    const nonChatIds = new Set([
+      ...(Array.isArray(availablePayload.tabModelIds) ? availablePayload.tabModelIds : []),
+      ...(Array.isArray(availablePayload.imageGenerationModelIds)
+        ? availablePayload.imageGenerationModelIds
+        : []),
+      ...(Array.isArray(availablePayload.audioTranscriptionModelIds)
+        ? availablePayload.audioTranscriptionModelIds
+        : []),
+      ...Object.keys(availablePayload.deprecatedModelIds || {}),
+    ]);
+
+    const existingModelIds = new Set();
+    const existingEnums = new Set();
+    const usedLabels = new Set();
+    for (const cfg of data.clientModelConfigs) {
+      if (!cfg) continue;
+      if (cfg.modelId) existingModelIds.add(cfg.modelId);
+      const numVal = cfg.modelOrAlias?.choice?.value;
+      if (typeof numVal === 'number') existingEnums.add(numVal);
+      if (cfg.label) usedLabels.add(cfg.label);
+    }
+
+    // Order curated hidden models first, followed by any newly added server models
+    const candidateIds = [];
+    for (const [id] of CURATED_HIDDEN_MODELS) {
+      if (Object.prototype.hasOwnProperty.call(modelsMap, id)) {
+        candidateIds.push(id);
+      }
+    }
+    for (const id of Object.keys(modelsMap)) {
+      if (!CURATED_HIDDEN_MODEL_MAP.has(id)) {
+        candidateIds.push(id);
+      }
+    }
+
+    const templateConfig = data.clientModelConfigs[0];
+    const unlockedConfigs = [];
+    const unlockedLabels = [];
+
+    for (const modelId of candidateIds) {
+      if (
+        !modelId ||
+        existingModelIds.has(modelId) ||
+        SKIPPED_HIDDEN_MODEL_IDS.has(modelId) ||
+        nonChatIds.has(modelId) ||
+        /^(?:tab_|chat_)/i.test(modelId) ||
+        /image/i.test(modelId) ||
+        modelId.startsWith('models/')
+      ) {
+        continue;
+      }
+      const entry = modelsMap[modelId];
+      // Skip internal routing placeholders that are not interactive chat models
+      if (!entry || typeof entry !== 'object' || entry.apiProvider === 'API_PROVIDER_INTERNAL') {
+        continue;
+      }
+      const enumVal = resolveModelEnumValue(entry.model);
+      // Skip unmapped enum strings so Redux never dispatches an invalid Model enum
+      if (!enumVal || existingEnums.has(enumVal)) continue;
+
+      const curated = CURATED_HIDDEN_MODEL_MAP.get(modelId);
+      let label = '';
+      let tagTitle = 'Hidden';
+      if (curated) {
+        label = curated.label;
+        tagTitle = curated.tag;
+      } else if (
+        typeof entry.displayName === 'string' &&
+        entry.displayName.trim() &&
+        entry.displayName !== 'None' &&
+        !usedLabels.has(entry.displayName.trim())
+      ) {
+        label = entry.displayName.trim();
+      } else {
+        label = humanizeModelId(modelId);
+      }
+      if (usedLabels.has(label)) {
+        label = `${label} (${modelId})`;
+      }
+      if (usedLabels.has(label)) continue;
+
+      const modelOrAlias = cloneWithProto(templateConfig.modelOrAlias, {
+        $typeName: 'exa.codeium_common_pb.ModelOrAlias',
+        choice: { case: 'model', value: enumVal },
+      });
+
+      let quotaObj;
+      if (entry.quotaInfo && typeof entry.quotaInfo === 'object') {
+        const qProto =
+          templateConfig.quotaInfo && typeof templateConfig.quotaInfo === 'object'
+            ? Object.getPrototypeOf(templateConfig.quotaInfo)
+            : null;
+        quotaObj = qProto && qProto !== Object.prototype ? Object.create(qProto) : {};
+        quotaObj.$typeName = 'exa.codeium_common_pb.QuotaInfo';
+        quotaObj.remainingFraction = Number(entry.quotaInfo.remainingFraction ?? 0);
+        // Only attach resetTime when the server provided a valid ISO timestamp
+        if (typeof entry.quotaInfo.resetTime === 'string') {
+          const ms = Date.parse(entry.quotaInfo.resetTime);
+          if (!Number.isNaN(ms)) {
+            const tsProto =
+              templateConfig.quotaInfo?.resetTime &&
+              typeof templateConfig.quotaInfo.resetTime === 'object'
+                ? Object.getPrototypeOf(templateConfig.quotaInfo.resetTime)
+                : null;
+            const tsObj = tsProto && tsProto !== Object.prototype ? Object.create(tsProto) : {};
+            tsObj.$typeName = 'google.protobuf.Timestamp';
+            tsObj.seconds = BigInt(Math.floor(ms / 1000));
+            tsObj.nanos = (ms % 1000) * 1000000;
+            quotaObj.resetTime = tsObj;
+          }
+        }
+      }
+
+      const unlockedCfg = cloneWithProto(templateConfig, {
+        $typeName: 'exa.codeium_common_pb.ClientModelConfig',
+        label,
+        modelOrAlias,
+        disabled: false,
+        supportsImages: Boolean(entry.supportsImages),
+        isRecommended: true,
+        quotaInfo: quotaObj,
+        tagTitle,
+        tagDescription: modelId,
+        supportedMimeTypes:
+          entry.supportedMimeTypes && typeof entry.supportedMimeTypes === 'object'
+            ? { ...entry.supportedMimeTypes }
+            : {},
+        modelId,
+      });
+      // Non-enumerable marker keeps Protobuf-ES reflection clean while allowing strip on cleanup
+      Object.defineProperty(unlockedCfg, '__jetskiUnlockedModel', {
+        value: true,
+        enumerable: false,
+      });
+
+      existingModelIds.add(modelId);
+      existingEnums.add(enumVal);
+      usedLabels.add(label);
+      unlockedConfigs.push(unlockedCfg);
+      unlockedLabels.push(label);
+    }
+
+    if (unlockedConfigs.length === 0) return baseStatus;
+
+    // useModelGroups reads groups[0] of the Recommended sort to populate the dropdown
+    const nextSorts = Array.isArray(data.clientModelSorts)
+      ? data.clientModelSorts.map((sort, idx) => {
+          const isRec =
+            typeof sort?.name === 'string'
+              ? sort.name.toLowerCase() === 'recommended'
+              : idx === 0;
+          if (!isRec || !Array.isArray(sort?.groups) || sort.groups.length === 0) return sort;
+          const firstGroup = sort.groups[0];
+          const baseLabels = Array.isArray(firstGroup?.modelLabels) ? firstGroup.modelLabels : [];
+          return cloneWithProto(sort, {
+            groups: [
+              cloneWithProto(firstGroup, {
+                modelLabels: [...baseLabels, ...unlockedLabels],
+              }),
+              ...sort.groups.slice(1),
+            ],
+          });
+        })
+      : data.clientModelSorts;
+
+    return cloneWithProto(baseStatus, {
+      cascadeModelConfigData: cloneWithProto(data, {
+        clientModelConfigs: [...data.clientModelConfigs, ...unlockedConfigs],
+        clientModelSorts: nextSorts,
+      }),
+    });
+  }
+
+  // Ensures the hydrated Redux userStatus slice includes unlocked models from GetAvailableModels
+  async function syncHiddenModelsInStore(store) {
+    const curStatus = store?.getState()?.userStatus;
+    const curConfigs = curStatus?.cascadeModelConfigData?.clientModelConfigs;
+    if (!Array.isArray(curConfigs) || curConfigs.length === 0) return;
+    const cacheFresh = Boolean(
+      availableModelsCache && Date.now() - availableModelsFetchedAt < AVAILABLE_MODELS_TTL_MS
+    );
+    const hasUnlocked = curConfigs.some((c) => c && c.__jetskiUnlockedModel === true);
+    if (cacheFresh && hasUnlocked && lastAppliedModelsFetchedAt === availableModelsFetchedAt) {
+      return;
+    }
+
+    const payload = cacheFresh ? availableModelsCache : await fetchAvailableModels();
+    if (disposed || !payload) return;
+
+    const latestStatus = store.getState()?.userStatus;
+    const latestConfigs = latestStatus?.cascadeModelConfigData?.clientModelConfigs;
+    if (!Array.isArray(latestConfigs) || latestConfigs.length === 0) return;
+    const latestHasUnlocked = latestConfigs.some((c) => c && c.__jetskiUnlockedModel === true);
+    if (latestHasUnlocked && lastAppliedModelsFetchedAt === availableModelsFetchedAt) return;
+
+    const enriched = enrichUserStatusWithHiddenModels(latestStatus, payload);
+    if (enriched === latestStatus) return;
+    lastAppliedModelsFetchedAt = availableModelsFetchedAt;
+
+    isInternalDispatch = true;
+    try {
+      store.dispatch({
+        type: 'userStatus/setUserStatus',
+        payload: enriched,
+      });
+    } finally {
+      isInternalDispatch = false;
+    }
+  }
+
   function hookReduxStore(store) {
     if (reduxStore === store) return;
     reduxStore = store;
@@ -1908,6 +2317,22 @@
     const origDispatch = store.dispatch;
     store.dispatch = function patchedDispatch(action) {
       if (disposed) return origDispatch.call(this, action);
+      // Enrich periodic UserStatus polls synchronously so unlocked models never flicker out
+      if (
+        !isInternalDispatch &&
+        action?.type === 'userStatus/setUserStatus' &&
+        action.payload &&
+        availableModelsCache
+      ) {
+        lastAppliedModelsFetchedAt = availableModelsFetchedAt;
+        if (Date.now() - availableModelsFetchedAt >= AVAILABLE_MODELS_TTL_MS) {
+          void syncHiddenModelsInStore(store);
+        }
+        return origDispatch.call(this, {
+          ...action,
+          payload: enrichUserStatusWithHiddenModels(action.payload, availableModelsCache),
+        });
+      }
       // Rewrite any open request so keyboard shortcuts or UI triggers cannot open the panel
       if (
         action?.type === 'auxPaneV2/setOverviewPanelOpen' &&
@@ -1995,6 +2420,8 @@
         scheduleSync();
       }
     });
+    // Populate unlocked hidden models as soon as the Redux store is attached
+    void syncHiddenModelsInStore(store);
   }
 
   // Forces the floating Overview Panel closed in Redux for all active conversations
@@ -2069,6 +2496,8 @@
 
     // Keep the floating Overview Panel closed whenever Redux state syncs
     syncOverviewPanelClosed(store);
+    // Unlock hidden executable models in Redux userStatus if hydrated after store attach
+    void syncHiddenModelsInStore(store);
 
     const summariesMap = store.getState()?.trajectorySummaries?.summaries;
     if (!summariesMap) return false;
@@ -5811,6 +6240,15 @@
     unbindInputBoxSeenListeners();
     observer.disconnect();
     disposed = true;
+    // Restore the un-enriched server UserStatus before tearing down the instance
+    const curUserStatus = reduxStore?.getState()?.userStatus;
+    const cleanUserStatus = stripUnlockedModels(curUserStatus);
+    if (cleanUserStatus && cleanUserStatus !== curUserStatus) {
+      reduxStore.dispatch({
+        type: 'userStatus/setUserStatus',
+        payload: cleanUserStatus,
+      });
+    }
     // A re-injected instance starts with empty managedHiddenIds and would read our flags as
     // native hiding, which drops those chats from every bucket, so hand them back unhidden
     const summaries = reduxStore?.getState()?.trajectorySummaries?.summaries || {};
