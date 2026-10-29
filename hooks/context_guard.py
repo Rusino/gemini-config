@@ -581,7 +581,7 @@ def collect_project_directory(
             norm = _normalize_workspace_root(m, allow_any_dir=True)
             if norm:
               roots.add(norm)
-          for m in re.findall(r"file://(/[^\s`\"')#]+)", body):
+          for m in re.findall(r"file://(/[^\s`\"')\]#]+)", body):
             norm = _normalize_workspace_root(m, allow_any_dir=False)
             if norm:
               roots.add(norm)
@@ -717,7 +717,7 @@ def get_active_sibling_chats_in_project(
         norm = _normalize_workspace_root(m, allow_any_dir=True)
         if norm and norm not in rec["files"]:
           rec["files"].append(norm)
-      for m in re.findall(r"file://(/[^\s`\"')#]+)", txt):
+      for m in re.findall(r"file://(/[^\s`\"')\]#]+)", txt):
         base_f = os.path.basename(m.rstrip("/"))
         if base_f and base_f not in rec["files"]:
           rec["files"].append(base_f)
@@ -1619,6 +1619,16 @@ def run(data: dict, log: dict) -> dict:
   # Reset per-turn state at the start of each new user turn; a hard trigger
   # that was ignored last turn is re-evaluated below rather than snoozed
   if is_turn_start:
+    # Pull upstream config commits on macOS so Cloudtop auto-ships land locally
+    if sys.platform == "darwin":
+      try:
+        from auto_ship import maybe_sync_mac_clone
+
+        mac_res = maybe_sync_mac_clone()
+        if mac_res.get("status") == "updated":
+          log["mac_sync"] = f"{mac_res['old']}..{mac_res['new']}"
+      except Exception:
+        pass
     next_turn_inv_threshold = MAX_TURN_INVOCATIONS
     if (
         state.get("next_turn_inv_threshold") != MAX_TURN_INVOCATIONS
@@ -1942,6 +1952,10 @@ def run(data: dict, log: dict) -> dict:
       "auto_waiting_schedule",
       "pending_title_guard",
       "title_guard_blocked_turn",
+      # Keep once-per-turn stop_guard markers across PostToolUse checkpoints
+      "auto_ship_blocked_turn",
+      "auto_ship_deferred_question",
+      "vcs_baton_blocked_turn",
   ):
     if k in state:
       new_state[k] = state[k]

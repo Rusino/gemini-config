@@ -13,6 +13,8 @@ Checks the current turn in transcript.jsonl:
   blocks the stop once per user turn with a `[REVIEW DISCIPLINE GUARD]` reason.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -591,9 +593,13 @@ def analyze_current_turn(transcript_path: str) -> dict:
   ordered_indices = sorted(steps_by_idx.keys())
   # Find the last USER_INPUT step to scope analysis to the current turn
   last_user_idx = -1
+  last_user_request = ""
   for idx in ordered_indices:
     if steps_by_idx[idx].get("type") == "USER_INPUT":
       last_user_idx = idx
+      raw_u = str(steps_by_idx[idx].get("content", ""))
+      m_u = USER_REQUEST_RE.search(raw_u)
+      last_user_request = m_u.group(1) if m_u else raw_u
 
   from context_guard import (
       is_chat_lifecycle_handoff_command,
@@ -647,7 +653,9 @@ def analyze_current_turn(transcript_path: str) -> dict:
           is_set_title = bool(re.search(r"\bchat_lifecycle\.py\s+set-title\b", cmd))
           is_git_pub = bool(
               re.search(
-                  r"\b(?:git(?:\s+(?:-[Cc]\s+\S+|--[a-z-]+(?:=\S+)?))*\s+(?:push|commit|cl\s+upload)|gh\s+pr\s+create)\b",
+                  r"\b(?:git(?:\s+(?:-[Cc]\s+\S+|--[a-z-]+(?:=\S+)?))*\s+"
+                  r"(?:push|commit|cl\s+upload)|gh\s+pr\s+create"
+                  r"|auto_ship\.py\s+ship)\b",
                   cmd,
               )
           )
@@ -655,11 +663,19 @@ def analyze_current_turn(transcript_path: str) -> dict:
               not is_handoff
               and not is_rm_done
               and not is_set_title
+              and not is_git_pub
               and is_inspection_command(cmd)
           ):
             continue
           last_cmd_idx = idx
-          pending_cmds.append((idx, is_handoff, is_cli, is_rm_done, is_git_pub, is_set_title))
+          pending_cmds.append((
+              idx,
+              is_handoff,
+              is_cli,
+              is_rm_done,
+              is_git_pub,
+              is_set_title,
+          ))
 
     elif stype == "GENERIC" and pending_cmds:
       content = str(step.get("content", ""))
@@ -667,7 +683,14 @@ def analyze_current_turn(transcript_path: str) -> dict:
         continue
       m = EXIT_CODE_RE.search(content)
       if m:
-        c_idx, is_handoff, is_cli, is_rm_done, is_git_pub, is_set_title = pending_cmds.pop(0)
+        (
+            c_idx,
+            is_handoff,
+            is_cli,
+            is_rm_done,
+            is_git_pub,
+            is_set_title,
+        ) = pending_cmds.pop(0)
         code = int(m.group(1))
         if last_cmd_exit_code is None or code != 0 or not pending_cmds:
           last_cmd_exit_code = code
@@ -700,6 +723,7 @@ def analyze_current_turn(transcript_path: str) -> dict:
 
   return {
       "last_user_idx": last_user_idx,
+      "last_user_request": last_user_request,
       "last_code_edit_idx": last_code_edit_idx,
       "last_edited_file": last_edited_file,
       "last_cmd_idx": last_cmd_idx,
@@ -712,6 +736,89 @@ def analyze_current_turn(transcript_path: str) -> dict:
       "git_publish_after_done": git_publish_after_done,
       "set_title_succeeded": set_title_succeeded,
   }
+
+
+AUTO_SHIP_OPTOUT_RE = re.compile(
+    r"\b(?:не\s+коммит\w*|не\s+пуш\w*|без\s+коммит\w*|без\s+пуш\w*|только\s+локально\b"
+    r"|do\s+not\s+(?:commit|push)\b|don'?t\s+(?:commit|push)\b"
+    r"|no\s+(?:commit|push)\b|without\s+(?:committing|pushing)\b|not\s+now\b)",
+    re.IGNORECASE,
+)
+VCS_BATON_REPO_RE = re.compile(r"repo=([^;]+);")
+
+
+def _is_personal_vcs_baton_line(line: str) -> bool:
+  if "action: call ask_question" in line:
+    return False
+  if "action: personal repo auto-ship" in line:
+    return True
+  m = VCS_BATON_REPO_RE.search(line)
+  if not m:
+    return False
+  try:
+    import auto_ship
+
+    repo = m.group(1).strip()
+    if not auto_ship.is_personal_repo(repo):
+      return False
+    return auto_ship._repo_branch(repo) in ("", "main")
+  except Exception:
+    return False
+
+
+# Trigger auto-ship for personal repos; keep ask_question for Gerrit and other GitHub repos
+def auto_ship_guard_reason(
+    info: dict, state: dict, conv_id: str, transcript_path: str
+) -> tuple[str, bool]:
+  if info.get("last_cmd_exit_code") not in (None, 0):
+    return "", False
+  if AUTO_SHIP_OPTOUT_RE.search(str(info.get("last_user_request") or "")):
+    return "", False
+  try:
+    import auto_ship
+
+    plan = auto_ship.plan_ship(conv_id, transcript_path)
+  except Exception:
+    return "", False
+  if not plan:
+    return "", False
+
+  force_trigger = bool(
+      info.get("roadmap_done_idx", -1) >= 0
+      or state.get("auto_ship_deferred_question")
+  )
+  eligible = [e for e in plan if e.get("turn_touched") or force_trigger]
+  if not eligible:
+    return "", False
+  if info.get("asked_question"):
+    return "", True
+
+  parts: list[str] = []
+  for entry in eligible:
+    repo = entry.get("repo", "")
+    files = entry.get("files") or []
+    unpushed = entry.get("own_unpushed") or []
+    summary = (
+        ", ".join(files[:8])
+        if files
+        else f"{len(unpushed)} unpushed own commit(s)"
+    )
+    msg_flag = ' -m "<concise English commit message>"' if files else ""
+    parts.append(
+        f"- `{repo}` ({summary}):\n"
+        f"  `python3 ~/.gemini/config/hooks/auto_ship.py ship {conv_id} "
+        f"--repo {repo}{msg_flag}`"
+    )
+  return (
+      "[AUTO-SHIP] Personal repository changes are ready to commit and push:\n"
+      + "\n".join(parts)
+      + "\nExecute the command(s) above now and include the exact "
+      "`committed and pushed: <sha> -> origin/main` line in your reply "
+      "(leave foreign files untouched; if `[FOREIGN-COMMIT PUSH GUARD]` rejects "
+      "the push, ask the user before overriding; if edits are intentionally "
+      "mid-task, skip and write `auto-ship deferred: <reason>`).",
+      False,
+  )
 
 
 def vcs_baton_guard_reason(
@@ -739,7 +846,12 @@ def vcs_baton_guard_reason(
     except Exception:
       pass
 
-  pending_lines = [ln for ln in vcs_lines if "[VCS BATON: PENDING" in ln]
+  # Personal repos are handled automatically by auto_ship_guard_reason without ask_question
+  pending_lines = [
+      ln
+      for ln in vcs_lines
+      if "[VCS BATON: PENDING" in ln and not _is_personal_vcs_baton_line(ln)
+  ]
   if not pending_lines:
     return ""
 
@@ -957,6 +1069,30 @@ def main() -> None:
           )
       )
       return
+
+  # Defer auto-ship until the next turn if this turn already paused on ask_question
+  ship_reason, ship_deferred_q = auto_ship_guard_reason(
+      info, state, conv_id, transcript_path
+  )
+  if ship_deferred_q and not state.get("auto_ship_deferred_question"):
+    state["auto_ship_deferred_question"] = True
+    save_state(state_path, state)
+  elif not ship_deferred_q and state.get("auto_ship_deferred_question"):
+    state.pop("auto_ship_deferred_question", None)
+    save_state(state_path, state)
+  if (
+      ship_reason
+      and state.get("auto_ship_blocked_turn") != info.get("last_user_idx", -1)
+  ):
+    state["auto_ship_blocked_turn"] = info.get("last_user_idx", -1)
+    save_state(state_path, state)
+    print(
+        json.dumps(
+            {"decision": "continue", "reason": ship_reason},
+            ensure_ascii=False,
+        )
+    )
+    return
 
   vcs_reason = vcs_baton_guard_reason(info, conv_id, transcript_path)
   if (

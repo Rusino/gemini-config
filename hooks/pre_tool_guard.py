@@ -1090,6 +1090,8 @@ def enrich_handoff_summary_files(
               steps_by_idx[int(idx)] = obj
           except Exception:
             continue
+      import roadmap
+
       pending_cmds: list[str] = []
       for idx in sorted(steps_by_idx.keys()):
         step = steps_by_idx[idx]
@@ -1111,7 +1113,12 @@ def enrich_handoff_summary_files(
             targs = tc.get("args") or {}
             if tname in EDIT_TOOLS:
               tf = get_tool_target_file(targs)
-              if tf and not is_agent_internal_file(tf) and tf not in edited_files:
+              # Keep ~/.gemini/config edits across handoffs while filtering state/brain noise
+              if (
+                  tf
+                  and not roadmap._is_ignored_internal_path(tf)
+                  and tf not in edited_files
+              ):
                 edited_files.append(tf)
             elif tname == "run_command":
               cmd_str = str(targs.get("CommandLine", "")).strip().replace("\n", " ")
@@ -1585,7 +1592,8 @@ def _files_touched_in_chat(
         if os.path.isfile(sf):
           with open(sf, "r", encoding="utf-8", errors="ignore") as f:
             txt = f.read()
-          for m in re.findall(r"file://(/[^\s`\"')#]+)", txt):
+          # Exclude `]` so Markdown labels like `[file:///path](file:///path)` stop at `]`
+          for m in re.findall(r"file://(/[^\s`\"')\]#]+)", txt):
             touched.add(os.path.realpath(m))
     except Exception:
       pass
@@ -1795,6 +1803,104 @@ def _active_foreign_file_leases(
               "ts": eff_ts,
           }
   return out
+
+
+# Classify unpushed branch commits into active foreign labels and own SHAs
+def inspect_unpushed_commit_owners(
+    top_level: str,
+    git_dir: str,
+    git_common_dir: str,
+    effective_cid: str,
+    transcript_path: str,
+    step_idx: int = -1,
+    reg: dict | None = None,
+) -> tuple[list[str], list[str], dict]:
+  if reg is None:
+    reg = _sync_repo_commits(top_level, git_common_dir)
+  upstream = "@{u}"
+  up_res = subprocess.run(
+      ["git", "-C", top_level, "rev-parse", "--verify", "@{u}"],
+      capture_output=True,
+      text=True,
+      timeout=1.0,
+      check=False,
+  )
+  if up_res.returncode != 0:
+    upstream = "origin/main"
+  rev_res = subprocess.run(
+      ["git", "-C", top_level, "log", "--format=%H%x00%s", f"{upstream}..HEAD"],
+      capture_output=True,
+      text=True,
+      timeout=1.5,
+      check=False,
+  )
+  commits_map = reg.get("commits") if isinstance(reg.get("commits"), dict) else {}
+  foreign_leased = _active_foreign_file_leases(
+      git_dir, effective_cid, transcript_path
+  )
+  touched_abs = _files_touched_in_chat(transcript_path, effective_cid, step_idx)
+  touched_in_repo = {
+      os.path.relpath(p, top_level)
+      for p in touched_abs
+      if p.startswith(top_level + os.sep)
+  }
+  foreign_commits: list[str] = []
+  own_unpushed_shas: list[str] = []
+  if rev_res.returncode != 0:
+    return foreign_commits, own_unpushed_shas, reg
+  for ln in rev_res.stdout.splitlines():
+    if "\x00" not in ln:
+      continue
+    sha, subj = [x.strip() for x in ln.split("\x00", 1)]
+    if not sha:
+      continue
+    cinfo = commits_map.get(sha)
+    if isinstance(cinfo, dict):
+      owner_cid = str(cinfo.get("conv_id") or "")
+      if owner_cid == effective_cid:
+        own_unpushed_shas.append(sha)
+      # Archived owner chats have already handed off or dropped their leases
+      elif owner_cid:
+        still_active, db_title = _is_conv_still_active_tip(
+            owner_cid, effective_cid, transcript_path
+        )
+        if still_active:
+          owner_label = db_title or cinfo.get("title") or owner_cid[:8]
+          foreign_commits.append(
+              f'`{sha[:7]}` ("{subj}", by `{owner_label}` -> '
+              f"`conversation://{owner_cid}`)"
+          )
+    # Manual git commits lack a registry entry; fall back to active file leases
+    elif foreign_leased:
+      dt_res = subprocess.run(
+          [
+              "git",
+              "-C",
+              top_level,
+              "diff-tree",
+              "--no-commit-id",
+              "--name-only",
+              "-r",
+              sha,
+          ],
+          capture_output=True,
+          text=True,
+          timeout=1.0,
+          check=False,
+      )
+      if dt_res.returncode == 0:
+        c_files = [x.strip() for x in dt_res.stdout.splitlines() if x.strip()]
+        if (
+            c_files
+            and all(f in foreign_leased for f in c_files)
+            and not any(f in touched_in_repo for f in c_files)
+        ):
+          finfo = foreign_leased[c_files[0]]
+          foreign_commits.append(
+              f'`{sha[:7]}` ("{subj}", by `{finfo["title"]}` -> '
+              f"`conversation://{finfo['conv_id']}`)"
+          )
+  return foreign_commits, own_unpushed_shas, reg
 
 
 def _check_and_claim_worktree_lease(
@@ -2188,77 +2294,17 @@ def parallel_chat_isolation_denial(
     # Foreign-commit push guard before git push
     if push_invocations and not os.path.exists(override_path):
       try:
-        upstream = "@{u}"
-        up_res = subprocess.run(
-            ["git", "-C", top_level, "rev-parse", "--verify", "@{u}"],
-            capture_output=True,
-            text=True,
-            timeout=1.0,
-            check=False,
+        foreign_commits, own_unpushed_shas, reg = (
+            inspect_unpushed_commit_owners(
+                top_level,
+                git_dir,
+                git_common_dir,
+                effective_cid,
+                transcript_path,
+                step_idx,
+                reg,
+            )
         )
-        if up_res.returncode != 0:
-          upstream = "origin/main"
-        rev_res = subprocess.run(
-            ["git", "-C", top_level, "log", "--format=%H%x00%s", f"{upstream}..HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=1.5,
-            check=False,
-        )
-        commits_map = reg.get("commits") if isinstance(reg.get("commits"), dict) else {}
-        foreign_leased = _active_foreign_file_leases(
-            git_dir, effective_cid, transcript_path
-        )
-        touched_abs = _files_touched_in_chat(transcript_path, effective_cid, step_idx)
-        touched_in_repo = {
-            os.path.relpath(p, top_level)
-            for p in touched_abs
-            if p.startswith(top_level + os.sep)
-        }
-        foreign_commits: list[str] = []
-        own_unpushed_shas: list[str] = []
-        if rev_res.returncode == 0:
-          for ln in rev_res.stdout.splitlines():
-            if "\x00" not in ln:
-              continue
-            sha, subj = [x.strip() for x in ln.split("\x00", 1)]
-            if not sha:
-              continue
-            cinfo = commits_map.get(sha)
-            if isinstance(cinfo, dict):
-              owner_cid = str(cinfo.get("conv_id") or "")
-              if owner_cid == effective_cid:
-                own_unpushed_shas.append(sha)
-              elif owner_cid:
-                still_active, db_title = _is_conv_still_active_tip(
-                    owner_cid, effective_cid, transcript_path
-                )
-                if still_active:
-                  owner_label = db_title or cinfo.get("title") or owner_cid[:8]
-                  foreign_commits.append(
-                      f"`{sha[:7]}` (\"{subj}\", by `{owner_label}` -> "
-                      f"`conversation://{owner_cid}`)"
-                  )
-            elif foreign_leased:
-              dt_res = subprocess.run(
-                  ["git", "-C", top_level, "diff-tree", "--no-commit-id", "--name-only", "-r", sha],
-                  capture_output=True,
-                  text=True,
-                  timeout=1.0,
-                  check=False,
-              )
-              if dt_res.returncode == 0:
-                c_files = [x.strip() for x in dt_res.stdout.splitlines() if x.strip()]
-                if (
-                    c_files
-                    and all(f in foreign_leased for f in c_files)
-                    and not any(f in touched_in_repo for f in c_files)
-                ):
-                  finfo = foreign_leased[c_files[0]]
-                  foreign_commits.append(
-                      f"`{sha[:7]}` (\"{subj}\", by `{finfo['title']}` -> "
-                      f"`conversation://{finfo['conv_id']}`)"
-                  )
         if foreign_commits:
           _record_parallel_guard_block(guard_state_path, transcript_path)
           return (
@@ -2269,6 +2315,9 @@ def parallel_chat_isolation_denial(
               f"explicitly confirms in a subsequent turn may you write `{override_path}`."
           )
         if own_unpushed_shas:
+          commits_map = (
+              reg.get("commits") if isinstance(reg.get("commits"), dict) else {}
+          )
           for sha in own_unpushed_shas:
             if isinstance(commits_map.get(sha), dict):
               commits_map[sha]["pushed_by_owner"] = True
@@ -2855,8 +2904,13 @@ def main() -> None:
     cmd_str = str(tool_args.get("CommandLine", "")).strip()
     step_idx = int(data.get("stepIdx", -1))
     # Require fast Phase 1 lint/audit scripts on every commit, upload, PR creation, or push
-    if is_git_commit_or_upload_command(cmd_str) or is_git_upload_or_push_command(
-        cmd_str
+    is_auto_ship_cmd = _invokes_script(cmd_str, "auto_ship.py") and bool(
+        re.search(r"\bauto_ship\.py\s+ship\b", cmd_str)
+    )
+    if (
+        is_git_commit_or_upload_command(cmd_str)
+        or is_git_upload_or_push_command(cmd_str)
+        or is_auto_ship_cmd
     ):
       unverified_src = unverified_source_edit_before_commit(
           transcript_path, cmd_str, step_idx

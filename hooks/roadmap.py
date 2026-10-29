@@ -904,15 +904,23 @@ def _collect_chat_vcs_inputs(
       if os.path.isfile(sf):
         with open(sf, "r", encoding="utf-8", errors="ignore") as f:
           txt = f.read()
-        mod_idx = txt.find("### Files Modified by Tools in This Conversation")
-        if mod_idx >= 0:
-          mod_end = txt.find("\n### ", mod_idx + 10)
-          mod_chunk = txt[mod_idx : mod_end if mod_end >= 0 else len(txt)]
-          for m in re.findall(r"file://(/[^\s`\"')#]+)", mod_chunk):
+        # A state file can have both a manual section and an auto-appended snapshot section
+        hdr = "### Files Modified by Tools in This Conversation"
+        pos = 0
+        while True:
+          mod_idx = txt.find(hdr, pos)
+          if mod_idx < 0:
+            break
+          body_start = mod_idx + len(hdr)
+          next_h = re.search(r"\n#{1,3}\s+", txt[body_start:])
+          mod_end = body_start + next_h.start() if next_h else len(txt)
+          # Exclude `]` so Markdown labels like `[file:///path](file:///path)` stop at `]`
+          for m in re.findall(r"file://(/[^\s`\"')\]#]+)", txt[mod_idx:mod_end]):
             if not _is_ignored_internal_path(m) and os.path.exists(m):
               rm = os.path.realpath(m)
               own_touched_files.add(rm)
               candidate_dirs.append(os.path.dirname(rm))
+          pos = mod_end
         for gm in re.findall(r"### Git Status in `([^`]+)`", txt):
           clean_g = os.path.realpath(os.path.expanduser(gm.strip()))
           if os.path.isdir(clean_g) and not _is_ignored_internal_path(clean_g):
@@ -1190,10 +1198,31 @@ def _inspect_repo_vcs_baton(
         else f"none ({head_short} → {upstream_ref or 'local'})"
     )
     is_pending = bool(own_dirty or own_unpushed)
+    # Only main auto-ships directly; feature branches still prompt via ask_question
+    is_auto_ship_repo = False
+    if branch == "main":
+      try:
+        import auto_ship
+
+        is_auto_ship_repo = auto_ship.is_personal_repo(top_level)
+      except Exception:
+        pass
     if is_pending:
-      action_str = 'call ask_question ("Commit + push" / "Commit only" / "Not now")'
+      if is_auto_ship_repo:
+        msg_arg = ' -m "<msg>"' if own_dirty else ""
+        action_str = (
+            f"personal repo auto-ship (no ask_question): run "
+            f"`python3 ~/.gemini/config/hooks/auto_ship.py ship {conv_id} "
+            f"--repo {top_level}{msg_arg}` and print "
+            f"`committed and pushed: <sha> -> origin/main`"
+        )
+      else:
+        action_str = 'call ask_question ("Commit + push" / "Commit only" / "Not now")'
     else:
-      action_str = f"report to user in plain text: already committed and pushed ({head_short} → {upstream_ref or 'local'})"
+      action_str = (
+          f"report to user in plain text: already committed and pushed "
+          f"({head_short} → {upstream_ref or 'local'})"
+      )
 
   status_word = "PENDING" if is_pending else "CLEAN"
   own_str = ", ".join(own_dirty[:8]) if own_dirty else "none"
