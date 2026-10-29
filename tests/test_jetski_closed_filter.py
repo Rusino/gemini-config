@@ -1794,6 +1794,25 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(remainingRows.length, 1);
   assert.strictEqual(remainingRows[0].getAttribute('data-cascade-id'), 'never-viewed');
 
+  // Dismissing the last remaining conversation keeps Needs Me active with an empty row
+  agentInputBox.setAttribute('data-cascade-id', 'never-viewed');
+  advanceClock();
+  agentInputBox.dispatchEvent('pointerdown', { button: 0 });
+  assert.strictEqual(
+    inboxEl.getAttribute('data-active-tab'),
+    'needs-me',
+    'Needs Me must stay active even when count reaches 0'
+  );
+  assert.strictEqual(tabNeedsMe.getAttribute('data-active'), 'true');
+  assert.strictEqual(tabWorking.getAttribute('data-active'), 'false');
+  assert.strictEqual(inboxEl.getAttribute('data-count'), '0');
+  assert.strictEqual(tabNeedsMe.querySelector('.jetski-inbox-count-badge').textContent, '0');
+  assert.strictEqual(tabWorking.querySelector('.jetski-inbox-count-badge').textContent, '2');
+  assert.strictEqual(
+    inboxEl.querySelector('.jetski-inbox-empty-row').textContent,
+    '✓ All caught up: nothing needs you'
+  );
+
   // Switch to Working tab
   advanceClock();
   tabWorking.dispatchEvent('pointerdown', { button: 0 });
@@ -1842,9 +1861,9 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(
     inboxEl.getAttribute('data-active-tab'),
     'needs-me',
-    'Auto-fallback must switch to first non-empty tab when active tab becomes empty'
+    'Emptied non-Needs Me tab must return to Needs Me'
   );
-  assert.strictEqual(inboxEl.getAttribute('data-count'), '1');
+  assert.strictEqual(inboxEl.getAttribute('data-count'), '0');
 
   // Clicking the inbox header toggles collapsed state and persists to storage
   const inboxHeader = inboxEl.querySelector('.jetski-inbox-header');

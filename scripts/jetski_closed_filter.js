@@ -149,10 +149,9 @@
     'working': 'No agents are running',
     'stale': 'No stale chats',
   };
-  let activeInboxTab = safeGetStorage(STORAGE_INBOX_TAB_KEY);
-  if (!INBOX_TABS.includes(activeInboxTab)) {
-    activeInboxTab = 'needs-me';
-  }
+  // Always start on Needs Me; manualEmptyTabKey allows viewing an empty tab when clicked
+  let activeInboxTab = 'needs-me';
+  let manualEmptyTabKey = null;
   // Latches unseen needs-me chats so server view timestamps on pane mount do not dismiss them
   const latchedNeedsMeModMs = (window.__jetskiLatchedNeedsMeModMs ||= new Map());
 
@@ -6290,6 +6289,7 @@
 
       bindActionBtnHandlers(tabBtn, () => {
         activeInboxTab = def.key;
+        manualEmptyTabKey = def.key;
         safeSetStorage(STORAGE_INBOX_TAB_KEY, activeInboxTab);
         if (inboxCollapsed) {
           inboxCollapsed = false;
@@ -6477,16 +6477,12 @@
     // Stays visible when empty so the user sees an explicit all-clear instead of a vanished widget
     inboxEl.style.display = '';
 
-    // Auto-fallback to first non-empty tab if active tab has 0 items
-    if (isEmpty) {
+    // Keep Needs Me sticky even at 0 items; return from Working/Stale to Needs Me once emptied
+    if ((itemsByTab[activeInboxTab]?.length || 0) > 0) {
+      manualEmptyTabKey = null;
+    } else if (activeInboxTab !== 'needs-me' && manualEmptyTabKey !== activeInboxTab) {
       activeInboxTab = 'needs-me';
-    } else if (!itemsByTab[activeInboxTab] || itemsByTab[activeInboxTab].length === 0) {
-      for (const tabKey of INBOX_TABS) {
-        if (itemsByTab[tabKey].length > 0) {
-          activeInboxTab = tabKey;
-          break;
-        }
-      }
+      safeSetStorage(STORAGE_INBOX_TAB_KEY, activeInboxTab);
     }
 
     const currentTabItems = itemsByTab[activeInboxTab] || [];
@@ -6568,7 +6564,7 @@
         for (const item of currentTabItems) {
           listContainer.appendChild(createInboxRowElement(item));
         }
-        // Auto-fallback leaves the active tab empty only when all 3 tabs are empty
+        // Render the per-tab all-clear message whenever the active tab has 0 items
         if (currentTabItems.length === 0) {
           const emptyRow = document.createElement('div');
           emptyRow.className = 'jetski-inbox-empty-row';
