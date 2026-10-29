@@ -2010,32 +2010,141 @@
       .join(' ');
   }
 
-  // Strips synthetic unlocked models so re-injection and cleanup restore server UserStatus
+  // Extracts reset timestamp in milliseconds from a Protobuf Timestamp or ISO string
+  function parseQuotaResetMs(resetTime) {
+    if (typeof resetTime === 'string') {
+      const ms = Date.parse(resetTime);
+      return Number.isFinite(ms) ? ms : 0;
+    }
+    if (resetTime && typeof resetTime === 'object') {
+      const rawSec = resetTime.seconds;
+      if (
+        typeof rawSec === 'bigint' ||
+        typeof rawSec === 'number' ||
+        typeof rawSec === 'string'
+      ) {
+        const sec = Number(rawSec);
+        const nanos = Number(resetTime.nanos || 0);
+        if (Number.isFinite(sec) && sec > 0) {
+          return sec * 1000 + Math.floor((Number.isFinite(nanos) ? nanos : 0) / 1000000);
+        }
+      }
+    }
+    return 0;
+  }
+
+  // Formats remaining time until quota reset as a concise duration string
+  function formatQuotaResetRemaining(resetMs) {
+    if (!resetMs || resetMs <= 0) return '';
+    const diffMs = resetMs - Date.now();
+    if (diffMs <= 0) return '';
+    const totalMins = Math.max(1, Math.ceil(diffMs / 60000));
+    const hours = Math.floor(totalMins / 60);
+    const mins = totalMins % 60;
+    if (hours > 0 && mins > 0) return `resets in ${hours}h ${mins}m`;
+    if (hours > 0) return `resets in ${hours}h`;
+    return `resets in ${mins}m`;
+  }
+
+  // Formats live quota percentage pill and tooltip description for a model
+  function formatModelQuotaTag(baseTagTitle, baseTagDescription, modelId, quotaInfo) {
+    const rawTitle = typeof baseTagTitle === 'string' ? baseTagTitle.trim() : '';
+    const rawDesc = typeof baseTagDescription === 'string' ? baseTagDescription.trim() : '';
+    if (
+      rawTitle === 'OneQuota' ||
+      rawDesc.includes('OneQuota') ||
+      !quotaInfo ||
+      typeof quotaInfo !== 'object'
+    ) {
+      return { tagTitle: rawTitle, tagDescription: rawDesc };
+    }
+    const rawFrac = Number(quotaInfo.remainingFraction ?? 0);
+    const clampedFrac = Number.isFinite(rawFrac) ? Math.max(0, Math.min(1, rawFrac)) : 0;
+    const resetMs = parseQuotaResetMs(quotaInfo.resetTime);
+    const pct = resetMs > 0 && resetMs <= Date.now() ? 100 : Math.round(clampedFrac * 100);
+    const tagTitle = rawTitle ? `${rawTitle} · ${pct}%` : `${pct}%`;
+    const resetText = formatQuotaResetRemaining(resetMs);
+    const descParts = [`${pct}% quota left`];
+    if (resetText) descParts.push(resetText);
+    const fallbackDesc = rawDesc || (typeof modelId === 'string' ? modelId.trim() : '');
+    if (fallbackDesc) descParts.push(fallbackDesc);
+    return { tagTitle, tagDescription: descParts.join(' · ') };
+  }
+
+  // Builds a Protobuf-ES QuotaInfo message preserving descriptor prototype
+  function buildQuotaInfoObject(templateConfig, rawQuotaInfo) {
+    if (!rawQuotaInfo || typeof rawQuotaInfo !== 'object') return undefined;
+    const qProto =
+      templateConfig?.quotaInfo && typeof templateConfig.quotaInfo === 'object'
+        ? Object.getPrototypeOf(templateConfig.quotaInfo)
+        : null;
+    const quotaObj = qProto && qProto !== Object.prototype ? Object.create(qProto) : {};
+    quotaObj.$typeName = 'exa.codeium_common_pb.QuotaInfo';
+    quotaObj.remainingFraction = Number(rawQuotaInfo.remainingFraction ?? 0);
+
+    const rawReset = rawQuotaInfo.resetTime;
+    if (typeof rawReset === 'string') {
+      const ms = Date.parse(rawReset);
+      if (!Number.isNaN(ms)) {
+        const tsProto =
+          templateConfig?.quotaInfo?.resetTime &&
+          typeof templateConfig.quotaInfo.resetTime === 'object'
+            ? Object.getPrototypeOf(templateConfig.quotaInfo.resetTime)
+            : null;
+        const tsObj = tsProto && tsProto !== Object.prototype ? Object.create(tsProto) : {};
+        tsObj.$typeName = 'google.protobuf.Timestamp';
+        tsObj.seconds = BigInt(Math.floor(ms / 1000));
+        tsObj.nanos = (ms % 1000) * 1000000;
+        quotaObj.resetTime = tsObj;
+      }
+    } else if (rawReset && typeof rawReset === 'object') {
+      quotaObj.resetTime = rawReset;
+    }
+    return quotaObj;
+  }
+
+  // Strips synthetic unlocked models and restores native tags on cleanup or re-injection
   function stripUnlockedModels(userStatus) {
     const data = userStatus?.cascadeModelConfigData;
     if (!data || !Array.isArray(data.clientModelConfigs)) return userStatus;
+    const hasUnlocked = data.clientModelConfigs.some(
+      (c) => c && c.__jetskiUnlockedModel === true
+    );
+    const hasPatchedNative = data.clientModelConfigs.some((c) => c && c.__jetskiOrigTag);
+    if (!hasUnlocked && !hasPatchedNative) return userStatus;
+
     const unlockedConfigs = data.clientModelConfigs.filter(
       (c) => c && c.__jetskiUnlockedModel === true
     );
-    if (unlockedConfigs.length === 0) return userStatus;
-
     const unlockedLabels = new Set(unlockedConfigs.map((c) => c.label));
-    const cleanConfigs = data.clientModelConfigs.filter(
-      (c) => !c || c.__jetskiUnlockedModel !== true
-    );
-    const cleanSorts = Array.isArray(data.clientModelSorts)
-      ? data.clientModelSorts.map((sort) => {
-          if (!sort || !Array.isArray(sort.groups)) return sort;
-          return cloneWithProto(sort, {
-            groups: sort.groups.map((group) => {
-              if (!group || !Array.isArray(group.modelLabels)) return group;
-              return cloneWithProto(group, {
-                modelLabels: group.modelLabels.filter((lbl) => !unlockedLabels.has(lbl)),
-              });
-            }),
-          });
-        })
-      : data.clientModelSorts;
+    const cleanConfigs = data.clientModelConfigs
+      .filter((c) => !c || c.__jetskiUnlockedModel !== true)
+      .map((c) => {
+        if (!c || !c.__jetskiOrigTag) return c;
+        const orig = c.__jetskiOrigTag;
+        const restored = cloneWithProto(c, {
+          tagTitle: orig.tagTitle,
+          tagDescription: orig.tagDescription,
+          quotaInfo: orig.quotaInfo,
+        });
+        delete restored.__jetskiOrigTag;
+        return restored;
+      });
+
+    const cleanSorts =
+      hasUnlocked && Array.isArray(data.clientModelSorts)
+        ? data.clientModelSorts.map((sort) => {
+            if (!sort || !Array.isArray(sort.groups)) return sort;
+            return cloneWithProto(sort, {
+              groups: sort.groups.map((group) => {
+                if (!group || !Array.isArray(group.modelLabels)) return group;
+                return cloneWithProto(group, {
+                  modelLabels: group.modelLabels.filter((lbl) => !unlockedLabels.has(lbl)),
+                });
+              }),
+            });
+          })
+        : data.clientModelSorts;
 
     return cloneWithProto(userStatus, {
       cascadeModelConfigData: cloneWithProto(data, {
@@ -2086,15 +2195,69 @@
     return availableModelsFetching;
   }
 
-  // Appends hidden executable models from GetAvailableModels to UserStatus
+  // Appends hidden executable models from GetAvailableModels and enriches quota tags
   function enrichUserStatusWithHiddenModels(userStatus, availablePayload) {
     const baseStatus = stripUnlockedModels(userStatus);
     const data = baseStatus?.cascadeModelConfigData;
     if (!data || !Array.isArray(data.clientModelConfigs) || data.clientModelConfigs.length === 0) {
       return baseStatus;
     }
-    const modelsMap = availablePayload?.models;
-    if (!modelsMap || typeof modelsMap !== 'object') return baseStatus;
+    const modelsMap =
+      availablePayload?.models && typeof availablePayload.models === 'object'
+        ? availablePayload.models
+        : null;
+
+    const templateConfig = data.clientModelConfigs[0];
+
+    let nativeModified = false;
+    const enrichedNativeConfigs = data.clientModelConfigs.map((cfg) => {
+      if (!cfg) return cfg;
+      // Prefer fresher GetUserStatus server quota over cached GetAvailableModels
+      const serverQuota =
+        cfg.quotaInfo && typeof cfg.quotaInfo === 'object' ? cfg.quotaInfo : null;
+      const quotaObj =
+        serverQuota || buildQuotaInfoObject(templateConfig, modelsMap?.[cfg.modelId]?.quotaInfo);
+      const { tagTitle, tagDescription } = formatModelQuotaTag(
+        cfg.tagTitle,
+        cfg.tagDescription,
+        cfg.modelId,
+        quotaObj
+      );
+      // Skip cloning when model tags and quota metadata are already up to date
+      if (
+        tagTitle === (cfg.tagTitle || '') &&
+        tagDescription === (cfg.tagDescription || '') &&
+        quotaObj === cfg.quotaInfo
+      ) {
+        return cfg;
+      }
+      nativeModified = true;
+      const patched = cloneWithProto(cfg, {
+        tagTitle,
+        tagDescription,
+        ...(quotaObj !== cfg.quotaInfo ? { quotaInfo: quotaObj } : {}),
+      });
+      // Stash original tags non-enumerably so cleanup restores clean server state
+      Object.defineProperty(patched, '__jetskiOrigTag', {
+        value: {
+          tagTitle: cfg.tagTitle || '',
+          tagDescription: cfg.tagDescription || '',
+          quotaInfo: cfg.quotaInfo,
+        },
+        enumerable: false,
+      });
+      return patched;
+    });
+
+    // When GetAvailableModels is still loading or failed, return native quota updates
+    if (!modelsMap) {
+      if (!nativeModified) return baseStatus;
+      return cloneWithProto(baseStatus, {
+        cascadeModelConfigData: cloneWithProto(data, {
+          clientModelConfigs: enrichedNativeConfigs,
+        }),
+      });
+    }
 
     // Exclude FIM tab autocomplete, image generation, audio transcription, and deprecated arms
     const nonChatIds = new Set([
@@ -2111,7 +2274,7 @@
     const existingModelIds = new Set();
     const existingEnums = new Set();
     const usedLabels = new Set();
-    for (const cfg of data.clientModelConfigs) {
+    for (const cfg of enrichedNativeConfigs) {
       if (!cfg) continue;
       if (cfg.modelId) existingModelIds.add(cfg.modelId);
       const numVal = cfg.modelOrAlias?.choice?.value;
@@ -2132,7 +2295,6 @@
       }
     }
 
-    const templateConfig = data.clientModelConfigs[0];
     const unlockedConfigs = [];
     const unlockedLabels = [];
 
@@ -2183,32 +2345,8 @@
         choice: { case: 'model', value: enumVal },
       });
 
-      let quotaObj;
-      if (entry.quotaInfo && typeof entry.quotaInfo === 'object') {
-        const qProto =
-          templateConfig.quotaInfo && typeof templateConfig.quotaInfo === 'object'
-            ? Object.getPrototypeOf(templateConfig.quotaInfo)
-            : null;
-        quotaObj = qProto && qProto !== Object.prototype ? Object.create(qProto) : {};
-        quotaObj.$typeName = 'exa.codeium_common_pb.QuotaInfo';
-        quotaObj.remainingFraction = Number(entry.quotaInfo.remainingFraction ?? 0);
-        // Only attach resetTime when the server provided a valid ISO timestamp
-        if (typeof entry.quotaInfo.resetTime === 'string') {
-          const ms = Date.parse(entry.quotaInfo.resetTime);
-          if (!Number.isNaN(ms)) {
-            const tsProto =
-              templateConfig.quotaInfo?.resetTime &&
-              typeof templateConfig.quotaInfo.resetTime === 'object'
-                ? Object.getPrototypeOf(templateConfig.quotaInfo.resetTime)
-                : null;
-            const tsObj = tsProto && tsProto !== Object.prototype ? Object.create(tsProto) : {};
-            tsObj.$typeName = 'google.protobuf.Timestamp';
-            tsObj.seconds = BigInt(Math.floor(ms / 1000));
-            tsObj.nanos = (ms % 1000) * 1000000;
-            quotaObj.resetTime = tsObj;
-          }
-        }
-      }
+      const quotaObj = buildQuotaInfoObject(templateConfig, entry.quotaInfo);
+      const tagInfo = formatModelQuotaTag(tagTitle, modelId, modelId, quotaObj);
 
       const unlockedCfg = cloneWithProto(templateConfig, {
         $typeName: 'exa.codeium_common_pb.ClientModelConfig',
@@ -2218,8 +2356,8 @@
         supportsImages: Boolean(entry.supportsImages),
         isRecommended: true,
         quotaInfo: quotaObj,
-        tagTitle,
-        tagDescription: modelId,
+        tagTitle: tagInfo.tagTitle,
+        tagDescription: tagInfo.tagDescription,
         supportedMimeTypes:
           entry.supportedMimeTypes && typeof entry.supportedMimeTypes === 'object'
             ? { ...entry.supportedMimeTypes }
@@ -2239,7 +2377,14 @@
       unlockedLabels.push(label);
     }
 
-    if (unlockedConfigs.length === 0) return baseStatus;
+    if (unlockedConfigs.length === 0) {
+      if (!nativeModified) return baseStatus;
+      return cloneWithProto(baseStatus, {
+        cascadeModelConfigData: cloneWithProto(data, {
+          clientModelConfigs: enrichedNativeConfigs,
+        }),
+      });
+    }
 
     // useModelGroups reads groups[0] of the Recommended sort to populate the dropdown
     const nextSorts = Array.isArray(data.clientModelSorts)
@@ -2264,7 +2409,7 @@
 
     return cloneWithProto(baseStatus, {
       cascadeModelConfigData: cloneWithProto(data, {
-        clientModelConfigs: [...data.clientModelConfigs, ...unlockedConfigs],
+        clientModelConfigs: [...enrichedNativeConfigs, ...unlockedConfigs],
         clientModelSorts: nextSorts,
       }),
     });

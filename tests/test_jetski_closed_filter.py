@@ -2316,10 +2316,23 @@ global.requestAnimationFrame = () => 1;
 
   const byModelId = new Map(configs.map((c) => [c.modelId, c]));
 
+  // Verify native models are enriched with live quota percentage badges
+  const nativeAuto = byModelId.get('auto');
+  assert(nativeAuto, 'auto must be present in configs');
+  assert.strictEqual(nativeAuto.tagTitle, '99%');
+  assert(nativeAuto.tagDescription.includes('99% quota left'));
+  assert(nativeAuto.tagDescription.includes('auto'));
+
+  assert.strictEqual(byModelId.get('gemini-3.5-flash-lite')?.tagTitle, '100%');
+  assert.strictEqual(byModelId.get('opus-5.5-max')?.tagTitle, '56%');
+  assert.strictEqual(byModelId.get('opus-5.5-high')?.tagTitle, '56%');
+
   const glm = byModelId.get('glm-5.2-fp8-bon-arm');
   assert(glm, 'GLM 5.2 must be unlocked');
   assert.strictEqual(glm.label, 'GLM 5.2');
-  assert.strictEqual(glm.tagTitle, '3P');
+  assert.strictEqual(glm.tagTitle, '3P · 100%');
+  assert(glm.tagDescription.includes('100% quota left'));
+  assert(glm.tagDescription.includes('glm-5.2-fp8-bon-arm'));
   assert.strictEqual(glm.$typeName, 'exa.codeium_common_pb.ClientModelConfig');
   assert.strictEqual(glm.__isBufProto, true, 'Must preserve ClientModelConfig prototype');
   assert.deepStrictEqual(glm.modelOrAlias.choice, { case: 'model', value: 1252 });
@@ -2329,22 +2342,30 @@ global.requestAnimationFrame = () => 1;
   assert.strictEqual(glm.quotaInfo.resetTime.$typeName, 'google.protobuf.Timestamp');
 
   assert.strictEqual(byModelId.get('kimi-k3-maas-bon-arm')?.label, 'Kimi K3');
+  assert.strictEqual(byModelId.get('kimi-k3-maas-bon-arm')?.tagTitle, '3P · 85%');
   assert.strictEqual(byModelId.get('sonnet-5.5-bon-le')?.label, 'Claude Sonnet 5.5 (Max)');
+  assert.strictEqual(byModelId.get('sonnet-5.5-bon-le')?.tagTitle, 'BoN · 72%');
   assert.strictEqual(byModelId.get('sonnet-5.5-high-bon-le')?.label, 'Claude Sonnet 5.5 (High)');
+  assert.strictEqual(byModelId.get('sonnet-5.5-high-bon-le')?.tagTitle, 'BoN · 72%');
   assert.strictEqual(byModelId.get('opus-5-bon-le')?.label, 'Claude Opus 5 (High)');
+  assert.strictEqual(byModelId.get('opus-5-bon-le')?.tagTitle, 'BoN · 91%');
   assert.strictEqual(byModelId.get('opus-5.5-max-bon-le')?.label, 'Claude Opus 5.5 BoN (Max)');
+  assert.strictEqual(byModelId.get('opus-5.5-max-bon-le')?.tagTitle, 'BoN · 100%');
   assert.strictEqual(byModelId.get('bon-experiment-arm-226')?.label, 'Gemini 4 Carbon-G');
+  assert.strictEqual(byModelId.get('bon-experiment-arm-226')?.tagTitle, 'Exp · 99%');
   assert.strictEqual(byModelId.get('bon-experiment-arm-226')?.quotaInfo?.resetTime, undefined);
 
   const flash25 = byModelId.get('gemini-2.5-flash');
   assert(flash25, 'Gemini 2.5 Flash must be unlocked with named enum 312');
   assert.strictEqual(flash25.label, 'Gemini 2.5 Flash');
+  assert.strictEqual(flash25.tagTitle, '2.5 · 100%');
   assert.deepStrictEqual(flash25.modelOrAlias.choice, { case: 'model', value: 312 });
 
   const future = byModelId.get('deepseek-r2-bon-arm');
   assert(future, 'Unknown future hidden model must be unlocked via fallback');
   assert.notStrictEqual(future.label, 'Gemini Pro Next');
   assert(/deepseek/i.test(future.label), `Expected humanized fallback label, got: ${future.label}`);
+  assert.strictEqual(future.tagTitle, 'Hidden · 50%');
   assert.deepStrictEqual(future.modelOrAlias.choice, { case: 'model', value: 1490 });
 
   // Verify junk, FIM, image, deprecated, duplicate-alias, and artificial-latency arms are excluded
@@ -2378,6 +2399,8 @@ global.requestAnimationFrame = () => 1;
   assert.strictEqual(userStatusDispatches, dispatchesBeforePoll + 1);
   const afterPollConfigs = storeState.userStatus.cascadeModelConfigData.clientModelConfigs;
   assert.strictEqual(afterPollConfigs[0].quotaInfo.remainingFraction, 0.777);
+  assert.strictEqual(afterPollConfigs[0].tagTitle, '78%');
+  assert(afterPollConfigs[0].tagDescription.includes('78% quota left'));
   assert(
     afterPollConfigs.some((c) => c.modelId === 'glm-5.2-fp8-bon-arm'),
     'Synchronous enrichment on poll must keep unlocked models without flicker'
@@ -2400,12 +2423,30 @@ global.requestAnimationFrame = () => 1;
     storeState.userStatus.cascadeModelConfigData.clientModelSorts[0].groups[0].modelLabels;
   assert.strictEqual(restoredConfigs.length, 4, 'Cleanup must restore original 4 native models');
   assert.strictEqual(restoredConfigs[0].quotaInfo.remainingFraction, 0.777);
+  assert.strictEqual(restoredConfigs[0].tagTitle, '');
+  assert.strictEqual(restoredConfigs[0].tagDescription, '');
   assert.deepStrictEqual(restoredLabels, [
     'Gemini Pro Next',
     'Gemini 3.5 Flash Lite',
     'Claude Opus 5.5 (Max)',
     'Claude Opus 5.5 (High)',
   ]);
+
+  // Verify OneQuota tag is preserved as-is
+  const oqConfig = makeNativeConfig('Gemini 3.1 Pro', 1333, 'gemini-3.1-pro', 0);
+  oqConfig.tagTitle = 'OneQuota';
+  oqConfig.tagDescription = 'Managed outside AICode quota';
+  const oqStatus = protoObj('exa.codeium_common_pb.UserStatus', {
+    cascadeModelConfigData: protoObj('exa.codeium_common_pb.CascadeModelConfigData', {
+      clientModelConfigs: [oqConfig],
+      clientModelSorts: [],
+    }),
+  });
+  reduxStore.dispatch({ type: 'userStatus/setUserStatus', payload: oqStatus });
+  const oqEnriched = storeState.userStatus.cascadeModelConfigData.clientModelConfigs[0];
+  assert.strictEqual(oqEnriched.tagTitle, 'OneQuota');
+  assert.strictEqual(oqEnriched.tagDescription, 'Managed outside AICode quota');
+  window.__jetskiClosedChatsFilterCleanup();
 
   console.log('MODEL_PICKER_ENRICHMENT_PASSED');
 })().catch((err) => {
