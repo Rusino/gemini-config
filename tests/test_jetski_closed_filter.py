@@ -165,6 +165,7 @@ class FakeElement {
     let propagationStopped = false;
     const evt = {
       type,
+      target: this,
       button: 0,
       shiftKey: false,
       ctrlKey: false,
@@ -175,6 +176,13 @@ class FakeElement {
     };
     for (const fn of (this.listeners.get(type) || [])) {
       fn(evt);
+    }
+    if (
+      !propagationStopped &&
+      global.document &&
+      typeof global.document.dispatchEvent === 'function'
+    ) {
+      global.document.dispatchEvent(evt);
     }
     return { defaultPrevented, propagationStopped };
   }
@@ -188,8 +196,7 @@ class FakeElement {
   closest(selector) {
     let cur = this;
     while (cur) {
-      if (selector.startsWith('#') && cur.id === selector.slice(1)) return cur;
-      if (selector.startsWith('.') && cur.className === selector.slice(1)) return cur;
+      if (matches(cur, selector)) return cur;
       cur = cur.parentElement;
     }
     return null;
@@ -685,6 +692,7 @@ global.window = {
     return { ok: false, status: 404 };
   },
 };
+const docListeners = new Map();
 global.document = {
   documentElement: docEl,
   head: headEl,
@@ -700,6 +708,24 @@ global.document = {
   },
   querySelectorAll(sel) {
     return docEl.querySelectorAll(sel);
+  },
+  addEventListener(type, fn) {
+    if (!docListeners.has(type)) docListeners.set(type, []);
+    docListeners.get(type).push(fn);
+  },
+  removeEventListener(type, fn) {
+    if (!docListeners.has(type)) return;
+    const arr = docListeners.get(type);
+    const idx = arr.indexOf(fn);
+    if (idx !== -1) arr.splice(idx, 1);
+  },
+  dispatchEvent(evt) {
+    const type = typeof evt === 'string' ? evt : evt?.type;
+    const eventObj = typeof evt === 'string' ? { type: evt, target: docEl } : evt;
+    for (const fn of (docListeners.get(type) || [])) {
+      fn(eventObj);
+    }
+    return eventObj;
   },
 };
 global.MutationObserver = class {
@@ -916,36 +942,31 @@ const liveBucketBtn = (k) =>
 
 (async () => {
   const titlebarLocateBtn = titlebarToolbar.querySelector('.jetski-chat-locate-btn');
-  const titlebarWaitBtn = titlebarToolbar.querySelector('.jetski-titlebar-wait-btn');
   const titlebarBtn = titlebarToolbar.querySelector('.jetski-titlebar-archive-btn');
   assert(titlebarLocateBtn, 'Titlebar Locate button must be injected after Search');
-  assert(titlebarWaitBtn, 'Titlebar Wait button must be injected after Locate, before Archive');
+  assert(
+    !titlebarToolbar.querySelector('.jetski-titlebar-wait-btn'),
+    'Titlebar must not contain Wait button'
+  );
   assert(titlebarBtn, 'Titlebar Archive button must be injected before titlebar-more-actions');
   assert.strictEqual(titlebarLocateBtn.textContent, '🎯');
   assert.strictEqual(titlebarLocateBtn.getAttribute('data-testid'), 'jetski-chat-locate-btn');
   assert.strictEqual(titlebarLocateBtn.getAttribute('data-cascade-id'), 'open-current');
   assert.strictEqual(titlebarToolbar.children[1], titlebarLocateBtn);
-  assert.strictEqual(titlebarToolbar.children[2], titlebarWaitBtn);
-  assert.strictEqual(titlebarToolbar.children[3], titlebarBtn);
-  assert.strictEqual(titlebarWaitBtn.textContent, '⏳');
+  assert.strictEqual(titlebarToolbar.children[2], titlebarBtn);
   assert.strictEqual(titlebarBtn.textContent, '🗄');
   assert.strictEqual(titlebarBtn.getAttribute('data-testid'), 'jetski-titlebar-archive-btn');
   assert.strictEqual(titlebarBtn.getAttribute('aria-label'), 'Archive chat');
   assert.strictEqual(titlebarBtn.getAttribute('data-archived'), 'false');
-  assert.strictEqual(titlebarWaitBtn.style.display, '');
 
-  const rowWaitBtn = rowHoverBar.querySelector('.jetski-row-wait-btn');
-  assert(rowWaitBtn, 'Sidebar row Wait button must be injected before the native buttons');
-  assert.strictEqual(rowHoverBar.children[0], rowWaitBtn);
+  assert(!rowHoverBar.querySelector('.jetski-row-wait-btn'), 'Sidebar row must not contain Wait button');
   assert(!rowHoverBar.querySelector('.jetski-row-archive-btn'), 'Rows keep only native Archive');
-  assert.strictEqual(rowWaitBtn.style.display, '');
 
   // Mutations inside injected action buttons must not schedule a sync loop
   rafCallbacks = [];
   observerCallback([
     { target: titlebarLocateBtn },
     { target: titlebarBtn },
-    { target: rowWaitBtn },
   ]);
   assert.strictEqual(rafCallbacks.length, 0);
 
@@ -955,19 +976,6 @@ const liveBucketBtn = (k) =>
     Date.now = () => shifted;
   };
   const summaryOf = (id) => storeState.trajectorySummaries.summaries[id];
-
-  // Clicking the sidebar row Wait button on 'solo-active' swaps its marker between ⦿ and ⏳
-  rpcRequests.length = 0;
-  rowWaitBtn.dispatchEvent('pointerdown', { button: 0 });
-  await new Promise((r) => setTimeout(r, 10));
-  assert.strictEqual(summaryOf('solo-active').summary, '[10:00] ⏳ Active solo task');
-  assert.strictEqual(rowWaitBtn.getAttribute('data-waiting'), 'true');
-  assert.strictEqual(rpcRequests.length, 1);
-  assert.deepStrictEqual(rpcRequests[0].body, {
-    cascadeIds: ['solo-active'],
-    annotations: { title: '[10:00] ⏳ Active solo task' },
-    mergeAnnotations: true,
-  });
 
   // The titlebar Archive button on a chain tail archives only that chat: no chain walk, no
   // retitling of the already archived pieces
@@ -993,8 +1001,7 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(titlebarBtn.getAttribute('aria-label'), 'Unarchive chat');
   assert.strictEqual(titlebarBtn.getAttribute('data-archived'), 'true');
   assert.strictEqual(titlebarBtn.textContent, '⦿');
-  assert.strictEqual(titlebarWaitBtn.style.display, 'none');
-  assert.strictEqual(liveBucketBtn('needs-me').getAttribute('aria-label'), '🚨 Needs Me: 1 (shown)');
+  assert.strictEqual(liveBucketBtn('needs-me').getAttribute('aria-label'), '🚨 Needs Me: 2 (shown)');
 
   rpcRequests.length = 0;
   advanceClock();
@@ -1009,8 +1016,7 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(summaryOf('open-current').annotations.archived, false);
   assert.strictEqual(titlebarBtn.getAttribute('aria-label'), 'Archive chat');
   assert.strictEqual(titlebarBtn.textContent, '🗄');
-  assert.strictEqual(titlebarWaitBtn.style.display, '');
-  assert.strictEqual(liveBucketBtn('needs-me').getAttribute('aria-label'), '🚨 Needs Me: 2 (shown)');
+  assert.strictEqual(liveBucketBtn('needs-me').getAttribute('aria-label'), '🚨 Needs Me: 3 (shown)');
 
   // Verify live ⏳ row indicator when an open ⦿ chat waits on a background task or subagent
   const rowTitleSpan = new FakeElement('span');
@@ -1114,7 +1120,7 @@ const liveBucketBtn = (k) =>
   assert(titlebarSearchBtn, 'Titlebar must carry the chain search button');
   assert(!bodyEl.querySelector('.jetski-attention-filter-bar .jetski-chat-search-btn'));
 
-  // Hovering all 4 titlebar icon buttons renders compact surface-glass pill bubbles
+  // Hovering titlebar icon buttons renders compact surface-glass pill bubbles
   titlebarSearchBtn.dispatchEvent('mouseenter');
   assert.strictEqual(roadmapBubble.getAttribute('data-visible'), 'true');
   assert.strictEqual(roadmapBubble.getAttribute('data-mode'), 'filter');
@@ -1133,17 +1139,6 @@ const liveBucketBtn = (k) =>
     'Locate button hover must display the compact locate pill bubble'
   );
   titlebarLocateBtn.dispatchEvent('mouseleave');
-  assert.strictEqual(roadmapBubble.getAttribute('data-visible'), 'false');
-
-  assert.strictEqual(titlebarWaitBtn.getAttribute('title'), null);
-  titlebarWaitBtn.dispatchEvent('mouseenter');
-  assert.strictEqual(roadmapBubble.getAttribute('data-visible'), 'true');
-  assert.strictEqual(roadmapBubble.getAttribute('data-mode'), 'filter');
-  assert(
-    roadmapBubble.innerHTML.includes('Move chat to ⏳ Waiting (Cron / External)'),
-    'Wait button hover must display the compact wait pill bubble'
-  );
-  titlebarWaitBtn.dispatchEvent('mouseleave');
   assert.strictEqual(roadmapBubble.getAttribute('data-visible'), 'false');
 
   assert.strictEqual(titlebarBtn.getAttribute('title'), null);
@@ -1547,10 +1542,41 @@ const liveBucketBtn = (k) =>
     bodyEl.children.indexOf(vlistEl) - 1,
     'Inbox widget must be positioned immediately before conversation-list-sidebar'
   );
-  // Before any unseen timestamps or waitingSteps exist, the inbox is hidden
-  assert.strictEqual(inboxEl.getAttribute('data-empty'), 'true');
+  // Clear running agent from earlier sidebar-row tests so inbox starts in a clean 0-item state
+  reduxStore.dispatch({
+    type: 'trajectorySummaries/applyStreamBatch',
+    payload: {
+      updates: [
+        [
+          'agent-working',
+          makeSummary('[10:02] ⦿ Busy agent task', 'proj-1', { archived: true }, false, {
+            status: 'CASCADE_RUN_STATUS_IDLE',
+          }),
+        ],
+      ],
+      deletes: [],
+    },
+  });
+  while (rafCallbacks.length > 0) rafCallbacks.shift()();
+
+  // Before any items exist across the 3 tabs, the inbox is hidden
+    assert.strictEqual(inboxEl.getAttribute('data-empty'), 'true');
   assert.strictEqual(inboxEl.style.display, 'none');
   assert.strictEqual(inboxEl.getAttribute('data-collapsed'), 'false');
+
+  // Verify the 3 tabs in headerLeft
+  const tabNeedsMe = inboxEl.querySelector('.jetski-inbox-tab-needs-me');
+  const tabWorking = inboxEl.querySelector('.jetski-inbox-tab-working');
+  const tabStale = inboxEl.querySelector('.jetski-inbox-tab-stale');
+  assert(tabNeedsMe, 'Needs Me tab button must exist');
+  assert(tabWorking, 'Working tab button must exist');
+  assert(tabStale, 'Stale tab button must exist');
+  assert.strictEqual(tabNeedsMe.querySelector('.jetski-inbox-tab-label').textContent, '🚨 Needs Me');
+  assert.strictEqual(tabWorking.querySelector('.jetski-inbox-tab-label').textContent, '🤖 Working');
+  assert.strictEqual(tabStale.querySelector('.jetski-inbox-tab-label').textContent, '🧹 Stale');
+  assert.strictEqual(tabNeedsMe.getAttribute('data-active'), 'true');
+  assert.strictEqual(tabWorking.getAttribute('data-active'), 'false');
+  assert.strictEqual(tabStale.getAttribute('data-active'), 'false');
 
   // Seed store projects map with activity badges and add unseen vs already-viewed chats
   storeState.projects = {
@@ -1603,8 +1629,30 @@ const liveBucketBtn = (k) =>
             lastModifiedTime: '2026-10-28T14:20:00Z',
             annotations: {
               archived: false,
-              lastUserViewTime: '2026-10-28T13:00:00Z',
+              lastUserViewTime: '2026-10-28T14:25:00Z',
             },
+          }),
+        ],
+        [
+          'agent-running',
+          makeSummary('[14:25] ⦿ Running agent task', 'proj-1', {}, false, {
+            status: 'CASCADE_RUN_STATUS_RUNNING',
+            lastModifiedTime: '2026-10-28T14:25:00Z',
+          }),
+        ],
+        [
+          'agent-bg-wait',
+          makeSummary('[14:20] ⦿ Waiting on background runner', 'proj-1', {}, false, {
+            status: 'CASCADE_RUN_STATUS_IDLE',
+            notFullyIdle: true,
+            lastModifiedTime: '2026-10-28T14:20:00Z',
+          }),
+        ],
+        [
+          'stale-task',
+          makeSummary('[10:00] ⦿ Forgotten ancient task', 'proj-1', {}, false, {
+            status: 'CASCADE_RUN_STATUS_IDLE',
+            lastModifiedTime: new Date(Date.now() - 10 * 24 * 3600 * 1000).toISOString(),
           }),
         ],
       ],
@@ -1613,15 +1661,25 @@ const liveBucketBtn = (k) =>
   });
   while (rafCallbacks.length > 0) rafCallbacks.shift()();
 
-  // open-current (viewed in convoViewEl) and solo-active (already viewed) are excluded;
-  // only urgent-question, urgent-unread, and never-viewed appear in the inbox
+  // open-current and solo-active (already viewed) are excluded;
+  // urgent-question, urgent-unread, and never-viewed appear in needs-me;
+  // agent-running and agent-bg-wait appear in working;
+  // stale-task appears in stale
   assert.strictEqual(inboxEl.getAttribute('data-empty'), 'false');
   assert.strictEqual(inboxEl.style.display, '');
+  assert.strictEqual(inboxEl.getAttribute('data-active-tab'), 'needs-me');
   assert.strictEqual(inboxEl.getAttribute('data-urgent'), 'true');
   assert.strictEqual(inboxEl.getAttribute('data-urgent-count'), '1');
-  assert.strictEqual(inboxEl.getAttribute('data-count'), '3');
-  const urgentPill = inboxEl.querySelector('[data-testid="jetski-inbox-urgent-pill"]');
+    assert.strictEqual(inboxEl.getAttribute('data-count'), '3');
+
+  // Check badges across all 3 tab buttons
+  assert.strictEqual(tabNeedsMe.querySelector('.jetski-inbox-count-badge').textContent, '3');
+  assert.strictEqual(tabWorking.querySelector('.jetski-inbox-count-badge').textContent, '2');
+  assert.strictEqual(tabStale.querySelector('.jetski-inbox-count-badge').textContent, '1');
+
+  const urgentPill = tabNeedsMe.querySelector('.jetski-inbox-urgent-pill');
   assert(urgentPill, 'Urgent pill must be rendered when urgentCount > 0');
+  assert.strictEqual(urgentPill.style.display, '');
   assert.strictEqual(urgentPill.textContent, '🔥 1');
 
   const inboxRows = inboxEl.querySelectorAll('.jetski-inbox-row');
@@ -1653,77 +1711,153 @@ const liveBucketBtn = (k) =>
     'Breaking Chats'
   );
 
+  // Rows in Needs Me tab have ✓ (seen) and 🗄 (archive), but no Locate or Wait buttons
+  assert(inboxRows[0].querySelector('.jetski-inbox-seen-btn'));
+  assert(inboxRows[0].querySelector('.jetski-inbox-archive-btn'));
+  assert(!inboxRows[0].querySelector('.jetski-inbox-locate-btn'));
+  assert(!inboxRows[0].querySelector('.jetski-inbox-wait-btn'));
+
   // Mutations inside the inbox must not schedule a sync loop
   rafCallbacks = [];
   observerCallback([{ target: inboxEl }, { target: inboxRows[0] }]);
   assert.strictEqual(rafCallbacks.length, 0, 'Inbox mutations must not trigger observer sync');
 
-  // Clicking an inbox row navigates to that conversation, marks it seen, and drops it from inbox
+  // Clicking an inbox row navigates to that conversation, but does NOT dismiss it
   window.history._lastPushed = null;
   advanceClock();
   inboxRows[0].dispatchEvent('pointerdown', { button: 0 });
   inboxRows[0].dispatchEvent('click', { button: 0 });
   assert.strictEqual(window.history._lastPushed, '/c/urgent-question');
   assert(window.__jetskiManualVisitedCids.has('urgent-question'));
+  assert.strictEqual(
+    inboxEl.getAttribute('data-count'),
+    '3',
+    'Clicking row must navigate without dismissing from Needs Me'
+  );
+  assert.strictEqual(inboxEl.getAttribute('data-urgent-count'), '1');
+
+  // Clicking the inline checkmark (seen) button on urgent-question dismisses it
+  advanceClock();
+  const seenBtn = inboxRows[0].querySelector('.jetski-inbox-seen-btn');
+  seenBtn.dispatchEvent('pointerdown', { button: 0 });
+  seenBtn.dispatchEvent('click', { button: 0 });
   assert.strictEqual(inboxEl.getAttribute('data-count'), '2');
   assert.strictEqual(inboxEl.getAttribute('data-urgent-count'), '0');
   assert.strictEqual(inboxEl.getAttribute('data-urgent'), 'false');
+  assert.strictEqual(tabNeedsMe.querySelector('.jetski-inbox-count-badge').textContent, '2');
+  assert.strictEqual(urgentPill.style.display, 'none');
 
-  // Clicking the inline Wait button on urgent-unread moves it to ⏳ Waiting and drops it
+  // Focusing or clicking inside the prompt input box dismisses the active conversation
+  const agentInputBox = new FakeElement('div');
+  agentInputBox.setAttribute('data-testid', 'agent-input-box');
+  agentInputBox.setAttribute('data-cascade-id', 'urgent-unread');
+  bodyEl.appendChild(agentInputBox);
+  advanceClock();
+  agentInputBox.dispatchEvent('pointerdown', { button: 0 });
+  assert.strictEqual(
+    inboxEl.getAttribute('data-count'),
+    '1',
+    'Input box pointerdown must dismiss conversation from Needs Me'
+  );
+  assert.strictEqual(tabNeedsMe.querySelector('.jetski-inbox-count-badge').textContent, '1');
+  const remainingRows = inboxEl.querySelectorAll('.jetski-inbox-row');
+  assert.strictEqual(remainingRows.length, 1);
+  assert.strictEqual(remainingRows[0].getAttribute('data-cascade-id'), 'never-viewed');
+
+  // Switch to Working tab
+  advanceClock();
+  tabWorking.dispatchEvent('pointerdown', { button: 0 });
+  tabWorking.dispatchEvent('click', { button: 0 });
+  assert.strictEqual(inboxEl.getAttribute('data-active-tab'), 'working');
+  assert.strictEqual(tabWorking.getAttribute('data-active'), 'true');
+  assert.strictEqual(tabNeedsMe.getAttribute('data-active'), 'false');
+  assert.strictEqual(storage.get('jetski_inbox_tab_v1'), 'working');
+  assert.strictEqual(inboxEl.getAttribute('data-count'), '2');
+
+  const workingRows = inboxEl.querySelectorAll('.jetski-inbox-row');
+  assert.strictEqual(workingRows.length, 2);
+  assert.strictEqual(workingRows[0].getAttribute('data-cascade-id'), 'agent-running');
+  assert.strictEqual(workingRows[0].querySelector('.jetski-inbox-tier-icon').textContent, '🤖');
+  assert.strictEqual(workingRows[1].getAttribute('data-cascade-id'), 'agent-bg-wait');
+  assert.strictEqual(workingRows[1].querySelector('.jetski-inbox-tier-icon').textContent, '⏳');
+  // Working rows have 0 action buttons
+  assert.strictEqual(workingRows[0].querySelector('.jetski-inbox-actions').children.length, 0);
+  assert.strictEqual(workingRows[1].querySelector('.jetski-inbox-actions').children.length, 0);
+
+  // Switch to Stale tab
+  advanceClock();
+  tabStale.dispatchEvent('pointerdown', { button: 0 });
+  tabStale.dispatchEvent('click', { button: 0 });
+  assert.strictEqual(inboxEl.getAttribute('data-active-tab'), 'stale');
+  assert.strictEqual(storage.get('jetski_inbox_tab_v1'), 'stale');
+  assert.strictEqual(inboxEl.getAttribute('data-count'), '1');
+
+  const staleRows = inboxEl.querySelectorAll('.jetski-inbox-row');
+  assert.strictEqual(staleRows.length, 1);
+  assert.strictEqual(staleRows[0].getAttribute('data-cascade-id'), 'stale-task');
+  assert.strictEqual(staleRows[0].querySelector('.jetski-inbox-tier-icon').textContent, '🧹');
+  assert.strictEqual(staleRows[0].querySelector('.jetski-inbox-time').textContent, '10d');
+  // Stale rows have 1 action button: archive
+  assert.strictEqual(staleRows[0].querySelector('.jetski-inbox-actions').children.length, 1);
+  const staleArchiveBtn = staleRows[0].querySelector('.jetski-inbox-archive-btn');
+  assert(staleArchiveBtn, 'Stale row must have archive button');
+
+  // Archiving stale-task empties the Stale tab and auto-falls back to Needs Me
   rpcRequests.length = 0;
   advanceClock();
-  const rowsAfterClick = inboxEl.querySelectorAll('.jetski-inbox-row');
-  const unreadRow = rowsAfterClick.find((r) => r.getAttribute('data-cascade-id') === 'urgent-unread');
-  assert(unreadRow, 'urgent-unread row must be in inbox');
-  const inboxWaitBtn = unreadRow.querySelector('.jetski-inbox-wait-btn');
-  inboxWaitBtn.dispatchEvent('pointerdown', { button: 0 });
+  staleArchiveBtn.dispatchEvent('pointerdown', { button: 0 });
   await new Promise((r) => setTimeout(r, 10));
+  assert.strictEqual(summaryOf('stale-task').annotations.archived, true);
+  assert.strictEqual(tabStale.querySelector('.jetski-inbox-count-badge').textContent, '0');
   assert.strictEqual(
-    summaryOf('urgent-unread').summary,
-    '[14:05] ⏳ Finished unread analysis'
+    inboxEl.getAttribute('data-active-tab'),
+    'needs-me',
+    'Auto-fallback must switch to first non-empty tab when active tab becomes empty'
   );
   assert.strictEqual(inboxEl.getAttribute('data-count'), '1');
 
-  // Clicking the inbox header toggles collapsed state and persists it to localStorage
+  // Clicking the inbox header toggles collapsed state and persists to storage
   const inboxHeader = inboxEl.querySelector('.jetski-inbox-header');
   advanceClock();
   inboxHeader.dispatchEvent('pointerdown', { button: 0 });
   assert.strictEqual(inboxEl.getAttribute('data-collapsed'), 'true');
   assert.strictEqual(storage.get('jetski_inbox_collapsed_v1'), 'true');
-  assert.strictEqual(
-    inboxEl.querySelector('.jetski-inbox-toggle-btn').textContent,
-    '▸'
-  );
+  assert.strictEqual(inboxEl.querySelector('.jetski-inbox-toggle-btn').textContent, '▸');
 
-  // Clicking the inline Archive button on never-viewed archives it and hides the empty inbox
-  rpcRequests.length = 0;
+  // Clicking any tab button while collapsed auto-expands the inbox
   advanceClock();
-  const updatedRows = inboxEl.querySelectorAll('.jetski-inbox-row');
-  const neverViewedRow = updatedRows.find((r) => r.getAttribute('data-cascade-id') === 'never-viewed');
-  assert(neverViewedRow, 'never-viewed row must still be in inbox before archiving');
-  const inboxArchiveBtn = neverViewedRow.querySelector('.jetski-inbox-archive-btn');
-  inboxArchiveBtn.dispatchEvent('pointerdown', { button: 0 });
-  await new Promise((r) => setTimeout(r, 10));
-  assert.strictEqual(summaryOf('never-viewed').annotations.archived, true);
-  assert.strictEqual(inboxEl.getAttribute('data-count'), '0');
-  assert.strictEqual(inboxEl.getAttribute('data-empty'), 'true');
-  assert.strictEqual(inboxEl.style.display, 'none');
+  tabWorking.dispatchEvent('pointerdown', { button: 0 });
+  tabWorking.dispatchEvent('click', { button: 0 });
+  assert.strictEqual(inboxEl.getAttribute('data-collapsed'), 'false');
+  assert.strictEqual(storage.get('jetski_inbox_collapsed_v1'), 'false');
+  assert.strictEqual(inboxEl.querySelector('.jetski-inbox-toggle-btn').textContent, '▾');
+  assert.strictEqual(inboxEl.getAttribute('data-active-tab'), 'working');
 
-  // A chat with markedAsUnread: true and string-encoded protobuf seconds enters the inbox,
-  // and viewing it in the active pane clears it even after switching away to another chat
+  // Clear remaining items across working and needs-me
   reduxStore.dispatch({
     type: 'trajectorySummaries/applyStreamBatch',
     payload: {
       updates: [
         [
-          'unread-viewed-in-pane',
-          makeSummary('[14:30] ⦿ Manually unread task', 'proj-1', {}, false, {
-            lastModifiedTime: { seconds: '1793196000', nanos: 0 },
-            annotations: {
-              archived: false,
-              markedAsUnread: true,
-              lastUserViewTime: { seconds: '1793196100', nanos: 0 },
-            },
+          'never-viewed',
+          makeSummary('[14:01] ⦿ Never opened root chat', 'proj-1', {}, true, {
+            lastModifiedTime: '2026-10-28T14:01:00Z',
+          }),
+        ],
+        [
+          'agent-running',
+          makeSummary('[14:25] ⦿ Running agent task', 'proj-1', {}, false, {
+            status: 'CASCADE_RUN_STATUS_IDLE',
+            notFullyIdle: false,
+            annotations: { archived: false, lastUserViewTime: '2026-10-28T14:26:00Z' },
+          }),
+        ],
+        [
+          'agent-bg-wait',
+          makeSummary('[14:20] ⦿ Waiting on background runner', 'proj-1', {}, false, {
+            status: 'CASCADE_RUN_STATUS_IDLE',
+            notFullyIdle: false,
+            annotations: { archived: false, lastUserViewTime: '2026-10-28T14:21:00Z' },
           }),
         ],
       ],
@@ -1731,19 +1865,8 @@ const liveBucketBtn = (k) =>
     },
   });
   while (rafCallbacks.length > 0) rafCallbacks.shift()();
-  assert.strictEqual(inboxEl.getAttribute('data-count'), '1');
-  convoViewEl.setAttribute('data-cascade-id', 'unread-viewed-in-pane');
-  observerCallback([{ target: convoViewEl }]);
-  while (rafCallbacks.length > 0) rafCallbacks.shift()();
-  assert.strictEqual(inboxEl.getAttribute('data-count'), '0');
-  convoViewEl.setAttribute('data-cascade-id', 'solo-active');
-  observerCallback([{ target: convoViewEl }]);
-  while (rafCallbacks.length > 0) rafCallbacks.shift()();
-  assert.strictEqual(
-    inboxEl.getAttribute('data-count'),
-    '0',
-    'Chat viewed in active pane must not reappear in inbox as markedAsUnread after switching away'
-  );
+    assert.strictEqual(inboxEl.getAttribute('data-empty'), 'true');
+  assert.strictEqual(inboxEl.style.display, 'none');
 
   // Cleanup must clear located-row attribute, remove locate buttons, and remove the inbox widget
   window.__jetskiClosedChatsFilterCleanup();

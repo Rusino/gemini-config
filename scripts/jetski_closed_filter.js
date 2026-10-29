@@ -18,13 +18,11 @@
   const INBOX_TOGGLE_BTN_CLASS = 'jetski-inbox-toggle-btn';
   const INBOX_LIST_CLASS = 'jetski-inbox-list';
   const INBOX_ROW_CLASS = 'jetski-inbox-row';
-  const INBOX_LOCATE_BTN_CLASS = 'jetski-inbox-locate-btn';
-  const INBOX_WAIT_BTN_CLASS = 'jetski-inbox-wait-btn';
+  const INBOX_TAB_BTN_CLASS = 'jetski-inbox-tab-btn';
+  const INBOX_SEEN_BTN_CLASS = 'jetski-inbox-seen-btn';
   const INBOX_ARCHIVE_BTN_CLASS = 'jetski-inbox-archive-btn';
   const BUTTON_CLASS = 'jetski-closed-chats-filter-btn';
   const TITLEBAR_BTN_CLASS = 'jetski-titlebar-archive-btn';
-  const TITLEBAR_WAIT_BTN_CLASS = 'jetski-titlebar-wait-btn';
-  const ROW_WAIT_BTN_CLASS = 'jetski-row-wait-btn';
   // Right-side ⏳ badge rendered on open ⦿ rows waiting on background tasks or subagents
   const ROW_BG_WAIT_INDICATOR_CLASS = 'jetski-row-bg-wait-indicator';
   // Compact open-task badge rendered inside sidebar project headers
@@ -129,6 +127,20 @@
   let visibleBuckets = loadVisibleBuckets();
   // Hydrate initial inbox collapsed state so the header renders without layout shift
   let inboxCollapsed = safeGetStorage(STORAGE_INBOX_COLLAPSED_KEY) === 'true';
+  const STORAGE_INBOX_TAB_KEY = 'jetski_inbox_tab_v1';
+  const INBOX_TABS = ['needs-me', 'working', 'stale'];
+  const INBOX_TAB_DEFS = [
+    { key: 'needs-me', label: '🚨 Needs Me' },
+    { key: 'working', label: '🤖 Working' },
+    { key: 'stale', label: '🧹 Stale' },
+  ];
+  const STALE_THRESHOLD_MS = 7 * 24 * 60 * 60 * 1000;
+  let activeInboxTab = safeGetStorage(STORAGE_INBOX_TAB_KEY);
+  if (!INBOX_TABS.includes(activeInboxTab)) {
+    activeInboxTab = 'needs-me';
+  }
+  // Latches unseen needs-me chats so server view timestamps on pane mount do not dismiss them
+  const latchedNeedsMeModMs = (window.__jetskiLatchedNeedsMeModMs ||= new Map());
 
   // Tracks conversations whose hideFromConversationList flag we flipped in Redux
   // so we never unhide conversations that were natively hidden by their source
@@ -410,31 +422,11 @@
     });
   }
 
-  // Swaps a conversation between ⦿ (Needs Me) and ⏳ (Waiting External/Cron)
-  async function toggleConversationWaiting(cascadeId, fallbackDomTitle) {
-    if (!cascadeId) return;
-    const curTitle = getTitleForCascadeId(cascadeId, fallbackDomTitle);
-    const ts = extractTimePrefix(curTitle, getCurrentTimeStr());
-    const base = cleanBaseTitle(curTitle) || 'Investigation';
-    const nextMarker = isWaitingTitle(curTitle)
-      ? OPEN_ACTIVE_MARKER
-      : OPEN_WAITING_MARKER;
-    const newTitle = `[${ts}] ${nextMarker} ${base}`;
-
-    const s = findReduxStore()?.getState()?.trajectorySummaries?.summaries?.[cascadeId];
-    if (s) {
-      const next = cloneSummaryWithAnnotations(s, { title: newTitle });
-      next.summary = newTitle;
-      dispatchSummaryUpdate(cascadeId, next);
-    }
-    runFullSync();
-    await postUpdateAnnotationsRpc(cascadeId, { title: newTitle });
-  }
-
   // Flips annotations.archived of one chat; chat_lifecycle.py archives handed-off chain pieces
   // itself, so the UI never walks the chain or rewrites titles
   async function toggleConversationArchived(cascadeId) {
     if (!cascadeId) return;
+    latchedNeedsMeModMs.delete(cascadeId);
     const archived = !isArchivedCascadeId(cascadeId);
     const s = findReduxStore()?.getState()?.trajectorySummaries?.summaries?.[cascadeId];
     if (s) {
@@ -892,7 +884,6 @@
       // Style all titlebar action buttons as uniform compact icons without pill borders
       .${SEARCH_BTN_CLASS},
       .${LOCATE_BTN_CLASS},
-      .${TITLEBAR_WAIT_BTN_CLASS},
       .${TITLEBAR_BTN_CLASS} {
         background: transparent;
         border: none;
@@ -904,7 +895,6 @@
       }
       .${SEARCH_BTN_CLASS}:hover,
       .${LOCATE_BTN_CLASS}:hover,
-      .${TITLEBAR_WAIT_BTN_CLASS}:hover,
       .${TITLEBAR_BTN_CLASS}:hover {
         opacity: 1;
       }
@@ -1012,36 +1002,7 @@
         align-items: center;
         justify-content: center;
       }
-      .${ROW_WAIT_BTN_CLASS} {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        width: 24px;
-        height: 24px;
-        padding: 0;
-        border-radius: 6px;
-        border: none;
-        background: transparent;
-        color: var(--muted-foreground, #9aa0a6);
-        font-family: inherit;
-        font-size: 11px;
-        font-weight: 600;
-        line-height: 1;
-        cursor: pointer;
-        user-select: none;
-        flex-shrink: 0;
-        transition: background-color 120ms ease, color 120ms ease;
-      }
-      .${ROW_WAIT_BTN_CLASS} > * {
-        pointer-events: none;
-      }
-      .${ROW_WAIT_BTN_CLASS}:hover {
-        background: var(--sidebar-secondary, rgba(128, 134, 139, 0.22));
-        color: var(--foreground, #e8eaed);
-      }
-      .${ROW_WAIT_BTN_CLASS}[data-waiting="true"] {
-        color: var(--primary, #8ab4f8);
-      }
+
       /* Style the right-side ⏳ indicator and hide false unread dots while waiting on tasks */
       .${ROW_BG_WAIT_INDICATOR_CLASS} {
         display: inline-flex;
@@ -1330,40 +1291,64 @@
         gap: 6px;
         padding: 4px 8px;
         background: rgba(128, 134, 139, 0.12);
-        cursor: pointer;
         font-weight: 600;
         font-size: 11px;
         color: var(--foreground, #e8eaed);
       }
-      .${INBOX_HEADER_CLASS}:hover {
-        background: rgba(128, 134, 139, 0.18);
-      }
       .${INBOX_HEADER_CLASS} .jetski-inbox-header-left {
         display: flex;
         align-items: center;
-        gap: 5px;
+        gap: 4px;
         min-width: 0;
+        flex-wrap: wrap;
       }
-      .${INBOX_HEADER_CLASS} .jetski-inbox-count-badge {
+      .${INBOX_TAB_BTN_CLASS} {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 2px 6px;
+        border-radius: 4px;
+        border: none;
+        background: transparent;
+        color: var(--muted-foreground, #9aa0a6);
+        font-family: inherit;
+        font-size: 11px;
+        font-weight: 500;
+        cursor: pointer;
+        user-select: none;
+        transition: background-color 100ms ease, color 100ms ease;
+      }
+      .${INBOX_TAB_BTN_CLASS}:hover {
+        background: rgba(128, 134, 139, 0.18);
+        color: var(--foreground, #e8eaed);
+      }
+      .${INBOX_TAB_BTN_CLASS}[data-active="true"] {
+        background: rgba(128, 134, 139, 0.28);
+        color: var(--foreground, #e8eaed);
+        font-weight: 600;
+      }
+      .${INBOX_TAB_BTN_CLASS} .jetski-inbox-count-badge {
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        padding: 0 5px;
+        padding: 0 4px;
         border-radius: 999px;
         background: rgba(128, 134, 139, 0.24);
-        font-size: 10.5px;
+        font-size: 10px;
         font-variant-numeric: tabular-nums;
+        line-height: 1.3;
       }
-      .${INBOX_HEADER_CLASS} .jetski-inbox-urgent-pill {
+      .${INBOX_TAB_BTN_CLASS} .jetski-inbox-urgent-pill {
         display: inline-flex;
         align-items: center;
         gap: 2px;
-        padding: 0 5px;
+        padding: 0 4px;
         border-radius: 999px;
         background: rgba(248, 113, 113, 0.2);
         color: #fca5a5;
-        font-size: 10.5px;
+        font-size: 10px;
         font-variant-numeric: tabular-nums;
+        line-height: 1.3;
       }
       .${INBOX_TOGGLE_BTN_CLASS} {
         background: transparent;
@@ -1452,8 +1437,7 @@
         gap: 1px;
         flex-shrink: 0;
       }
-      .${INBOX_LOCATE_BTN_CLASS},
-      .${INBOX_WAIT_BTN_CLASS},
+      .${INBOX_SEEN_BTN_CLASS},
       .${INBOX_ARCHIVE_BTN_CLASS} {
         display: inline-flex;
         align-items: center;
@@ -1470,8 +1454,7 @@
         cursor: pointer;
         opacity: 0.72;
       }
-      .${INBOX_LOCATE_BTN_CLASS}:hover,
-      .${INBOX_WAIT_BTN_CLASS}:hover,
+      .${INBOX_SEEN_BTN_CLASS}:hover,
       .${INBOX_ARCHIVE_BTN_CLASS}:hover {
         opacity: 1;
         background: rgba(128, 134, 139, 0.24);
@@ -3032,31 +3015,53 @@
     return projectId;
   }
 
-  // Returns true when cascadeId is currently mounted in a pane or routed in the URL
-  function isCurrentlyViewing(cascadeId, store) {
-    if (!cascadeId) return false;
-    for (const viewEl of document.querySelectorAll(
-      '[data-testid="conversation-view"][data-cascade-id]'
-    )) {
-      if (viewEl.getAttribute('data-cascade-id') === cascadeId) return true;
+  // Dismisses a conversation from Needs Me inbox and clears its latch
+  function markConversationSeen(cascadeId) {
+    if (!cascadeId) return;
+    latchedNeedsMeModMs.delete(cascadeId);
+    const s = findReduxStore()?.getState()?.trajectorySummaries?.summaries?.[cascadeId];
+    const modMs =
+      parseTimestampMs(s?.lastModifiedTime) ||
+      parseTimestampMs(s?.createdTime) ||
+      Date.now();
+    const srvViewMs = parseTimestampMs(s?.annotations?.lastUserViewTime);
+    locallySeenModifiedMs.set(
+      cascadeId,
+      Math.max(modMs, srvViewMs + 1, Date.now(), 1)
+    );
+    ensureNeedsReactionInbox();
+  }
+
+  // Dismisses active conversation when the user clicks or focuses the prompt input box
+  function handleInputBoxSeen(event) {
+    const target = event?.target;
+    if (!target || typeof target.closest !== 'function') return;
+    const inputBox = target.closest('[data-testid="agent-input-box"]');
+    if (!inputBox) return;
+    const cid = findCascadeIdFromElement(inputBox);
+    if (!cid) return;
+    if (latchedNeedsMeModMs.has(cid)) {
+      markConversationSeen(cid);
+    } else {
+      const summary = findReduxStore()?.getState()?.trajectorySummaries?.summaries?.[cid];
+      if (isUnseenNeedsReaction(cid, summary)) {
+        markConversationSeen(cid);
+      }
     }
-    const state = store?.getState();
-    if (
-      state?.conversation?.cascadeId === cascadeId ||
-      state?.conversation?.convoState?.cascadeId === cascadeId
-    ) {
-      return true;
+  }
+
+  function bindInputBoxSeenListeners() {
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+      document.addEventListener('pointerdown', handleInputBoxSeen, true);
+      document.addEventListener('focusin', handleInputBoxSeen, true);
     }
-    const path = window.location?.pathname || '';
-    const m = /^(.*\/(?:c|cascade|conversation)\/)([^/?#]+)(.*)$/.exec(path);
-    if (m) {
-      let decoded = m[2];
-      try {
-        decoded = decodeURIComponent(m[2]);
-      } catch {}
-      if (decoded.split('+').includes(cascadeId)) return true;
+  }
+
+  function unbindInputBoxSeenListeners() {
+    if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+      document.removeEventListener('pointerdown', handleInputBoxSeen, true);
+      document.removeEventListener('focusin', handleInputBoxSeen, true);
     }
-    return false;
   }
 
   // Converts a protobuf Timestamp ({seconds, nanos}), Date, numeric ms, or ISO string to epoch ms
@@ -3075,40 +3080,44 @@
     return 0;
   }
 
-  // Returns true when a needs-me chat has activity or waitingSteps not yet viewed by the user
-  function isUnseenNeedsReaction(cascadeId, summary, store) {
+  // Returns true when a needs-me chat has activity or waitingSteps not yet dismissed by the user
+  function isUnseenNeedsReaction(cascadeId, summary) {
     if (!summary) return false;
     const lastMod =
       parseTimestampMs(summary.lastModifiedTime) ||
       parseTimestampMs(summary.createdTime);
-    const serverLastView = parseTimestampMs(summary.annotations?.lastUserViewTime);
-    // Any chat currently open in a pane is actively viewed by the user right now
-    if (isCurrentlyViewing(cascadeId, store)) {
-      locallySeenModifiedMs.set(
-        cascadeId,
-        Math.max(
-          lastMod,
-          serverLastView + 1,
-          Date.now(),
-          locallySeenModifiedMs.get(cascadeId) || 0,
-          1
-        )
-      );
-      return false;
+
+    // Once latched in Needs Me, mounting in pane (which updates serverLastView) does not dismiss
+    if (latchedNeedsMeModMs.has(cascadeId)) {
+      if (lastMod > (latchedNeedsMeModMs.get(cascadeId) || 0)) {
+        latchedNeedsMeModMs.set(cascadeId, lastMod);
+      }
+      return true;
     }
+
     const localLastView = locallySeenModifiedMs.get(cascadeId) || 0;
+    const serverLastView = parseTimestampMs(summary.annotations?.lastUserViewTime);
     const effectiveLastView = Math.max(serverLastView, localLastView);
     if (summary.annotations?.markedAsUnread && localLastView <= serverLastView) {
+      latchedNeedsMeModMs.set(cascadeId, lastMod || Date.now());
       return true;
     }
     if (lastMod > 0) {
-      return effectiveLastView === 0 || lastMod > effectiveLastView;
+      if (effectiveLastView === 0 || lastMod > effectiveLastView) {
+        latchedNeedsMeModMs.set(cascadeId, lastMod);
+        return true;
+      }
+      return false;
     }
-    return (
+    if (
       Array.isArray(summary.waitingSteps) &&
       summary.waitingSteps.length > 0 &&
       effectiveLastView === 0
-    );
+    ) {
+      latchedNeedsMeModMs.set(cascadeId, Date.now());
+      return true;
+    }
+    return false;
   }
 
   // Classifies an unseen inbox chat into 'urgent' (blocked on waitingSteps) vs 'unseen'
@@ -3126,14 +3135,23 @@
     row.className = INBOX_ROW_CLASS;
     row.setAttribute('data-testid', 'jetski-inbox-row');
     row.setAttribute('data-cascade-id', item.cascadeId);
-    row.setAttribute('data-tier', item.tier);
+    row.setAttribute('data-tab', item.tabKey);
+    if (item.tier) {
+      row.setAttribute('data-tier', item.tier);
+    }
 
     const main = document.createElement('div');
     main.className = 'jetski-inbox-row-main';
 
     const icon = document.createElement('span');
     icon.className = 'jetski-inbox-tier-icon';
-    icon.textContent = item.tier === 'urgent' ? '🔥' : '⦿';
+    if (item.tabKey === 'working') {
+      icon.textContent = item.workingIcon || '🤖';
+    } else if (item.tabKey === 'stale') {
+      icon.textContent = '🧹';
+    } else {
+      icon.textContent = item.tier === 'urgent' ? '🔥' : '⦿';
+    }
 
     const proj = document.createElement('span');
     proj.className = 'jetski-inbox-project';
@@ -3157,60 +3175,53 @@
     const actions = document.createElement('div');
     actions.className = 'jetski-inbox-actions';
 
-    const locateBtn = document.createElement('button');
-    locateBtn.type = 'button';
-    locateBtn.className = INBOX_LOCATE_BTN_CLASS;
-    locateBtn.setAttribute('data-testid', 'jetski-inbox-locate-btn');
-    locateBtn.setAttribute('aria-label', 'Locate chat in sidebar');
-    locateBtn.textContent = '🎯';
-    bindActionBtnHandlers(locateBtn, () => {
-      const cid = row.getAttribute('data-cascade-id');
-      if (cid) void locateConversationInSidebar(cid);
-    });
+    if (item.tabKey === 'needs-me') {
+      const seenBtn = document.createElement('button');
+      seenBtn.type = 'button';
+      seenBtn.className = INBOX_SEEN_BTN_CLASS;
+      seenBtn.setAttribute('data-testid', 'jetski-inbox-seen-btn');
+      seenBtn.setAttribute('aria-label', 'Mark as seen');
+      seenBtn.textContent = '✓';
+      bindActionBtnHandlers(seenBtn, () => {
+        const cid = row.getAttribute('data-cascade-id');
+        if (cid) markConversationSeen(cid);
+      });
+      actions.appendChild(seenBtn);
 
-    const waitBtn = document.createElement('button');
-    waitBtn.type = 'button';
-    waitBtn.className = INBOX_WAIT_BTN_CLASS;
-    waitBtn.setAttribute('data-testid', 'jetski-inbox-wait-btn');
-    waitBtn.setAttribute('aria-label', 'Move chat to ⏳ Waiting');
-    waitBtn.textContent = '⏳';
-    bindActionBtnHandlers(waitBtn, () => {
-      const cid = row.getAttribute('data-cascade-id');
-      if (cid) void toggleConversationWaiting(cid, '');
-    });
-
-    const archiveBtn = document.createElement('button');
-    archiveBtn.type = 'button';
-    archiveBtn.className = INBOX_ARCHIVE_BTN_CLASS;
-    archiveBtn.setAttribute('data-testid', 'jetski-inbox-archive-btn');
-    archiveBtn.setAttribute('aria-label', 'Archive chat');
-    archiveBtn.textContent = '🗄';
-    bindActionBtnHandlers(archiveBtn, () => {
-      const cid = row.getAttribute('data-cascade-id');
-      if (cid) void toggleConversationArchived(cid);
-    });
-
-    actions.appendChild(locateBtn);
-    actions.appendChild(waitBtn);
-    actions.appendChild(archiveBtn);
+      const archiveBtn = document.createElement('button');
+      archiveBtn.type = 'button';
+      archiveBtn.className = INBOX_ARCHIVE_BTN_CLASS;
+      archiveBtn.setAttribute('data-testid', 'jetski-inbox-archive-btn');
+      archiveBtn.setAttribute('aria-label', 'Archive chat');
+      archiveBtn.textContent = '🗄';
+      bindActionBtnHandlers(archiveBtn, () => {
+        const cid = row.getAttribute('data-cascade-id');
+        if (cid) void toggleConversationArchived(cid);
+      });
+      actions.appendChild(archiveBtn);
+    } else if (item.tabKey === 'stale') {
+      const archiveBtn = document.createElement('button');
+      archiveBtn.type = 'button';
+      archiveBtn.className = INBOX_ARCHIVE_BTN_CLASS;
+      archiveBtn.setAttribute('data-testid', 'jetski-inbox-archive-btn');
+      archiveBtn.setAttribute('aria-label', 'Archive chat');
+      archiveBtn.textContent = '🗄';
+      bindActionBtnHandlers(archiveBtn, () => {
+        const cid = row.getAttribute('data-cascade-id');
+        if (cid) void toggleConversationArchived(cid);
+      });
+      actions.appendChild(archiveBtn);
+    }
 
     row.appendChild(main);
     row.appendChild(actions);
 
+    // Clicking the row opens the chat without dismissing it from the inbox
     bindActionBtnHandlers(row, () => {
       const cid = row.getAttribute('data-cascade-id');
       if (cid) {
-        const s = findReduxStore()?.getState()?.trajectorySummaries?.summaries?.[cid];
-        const modMs =
-          parseTimestampMs(s?.lastModifiedTime) ||
-          parseTimestampMs(s?.createdTime) ||
-          Date.now();
-        const srvViewMs = parseTimestampMs(s?.annotations?.lastUserViewTime);
-        // Mark the clicked chat as seen immediately so it leaves the inbox before RPC round-trip
-        locallySeenModifiedMs.set(cid, Math.max(modMs, srvViewMs + 1, Date.now(), 1));
         manualVisitedCids.add(cid);
         openConversation(cid);
-        ensureNeedsReactionInbox();
       }
     });
 
@@ -3230,21 +3241,45 @@
     const headerLeft = document.createElement('div');
     headerLeft.className = 'jetski-inbox-header-left';
 
-    const headerTitle = document.createElement('span');
-    headerTitle.className = 'jetski-inbox-header-title';
-    headerTitle.textContent = '🚨 Needs Reaction';
+    for (const def of INBOX_TAB_DEFS) {
+      const tabBtn = document.createElement('button');
+      tabBtn.type = 'button';
+      tabBtn.className = `${INBOX_TAB_BTN_CLASS} jetski-inbox-tab-${def.key}`;
+      tabBtn.setAttribute('data-testid', `jetski-inbox-tab-${def.key}`);
+      tabBtn.setAttribute('data-tab', def.key);
+      tabBtn.setAttribute('data-active', activeInboxTab === def.key ? 'true' : 'false');
 
-    const countBadge = document.createElement('span');
-    countBadge.className = 'jetski-inbox-count-badge';
-    countBadge.setAttribute('data-testid', 'jetski-inbox-count-badge');
+      const labelSpan = document.createElement('span');
+      labelSpan.className = 'jetski-inbox-tab-label';
+      labelSpan.textContent = def.label;
+      tabBtn.appendChild(labelSpan);
 
-    const urgentPill = document.createElement('span');
-    urgentPill.className = 'jetski-inbox-urgent-pill';
-    urgentPill.setAttribute('data-testid', 'jetski-inbox-urgent-pill');
+      const countBadge = document.createElement('span');
+      countBadge.className = 'jetski-inbox-count-badge';
+      countBadge.setAttribute('data-testid', `jetski-inbox-count-badge-${def.key}`);
+      countBadge.textContent = '0';
+      tabBtn.appendChild(countBadge);
 
-    headerLeft.appendChild(headerTitle);
-    headerLeft.appendChild(countBadge);
-    headerLeft.appendChild(urgentPill);
+      if (def.key === 'needs-me') {
+        const urgentPill = document.createElement('span');
+        urgentPill.className = 'jetski-inbox-urgent-pill';
+        urgentPill.setAttribute('data-testid', 'jetski-inbox-urgent-pill');
+        urgentPill.style.display = 'none';
+        tabBtn.appendChild(urgentPill);
+      }
+
+      bindActionBtnHandlers(tabBtn, () => {
+        activeInboxTab = def.key;
+        safeSetStorage(STORAGE_INBOX_TAB_KEY, activeInboxTab);
+        if (inboxCollapsed) {
+          inboxCollapsed = false;
+          safeSetStorage(STORAGE_INBOX_COLLAPSED_KEY, 'false');
+        }
+        ensureNeedsReactionInbox();
+      });
+
+      headerLeft.appendChild(tabBtn);
+    }
 
     const toggleBtn = document.createElement('button');
     toggleBtn.type = 'button';
@@ -3307,56 +3342,128 @@
 
     const store = findReduxStore();
     const summariesMap = store?.getState()?.trajectorySummaries?.summaries || {};
-    const items = [];
+    const now = Date.now();
+
+    const itemsNeedsMe = [];
+    const itemsWorking = [];
+    const itemsStale = [];
     let urgentCount = 0;
 
     for (const [cascadeId, summary] of Object.entries(summariesMap)) {
       if (!isEligibleTopLevelSummary(cascadeId, summary)) continue;
-      if (classifyChatBucket(summary, '') !== 'needs-me') continue;
-      // Show only chats whose latest turn or waiting prompt has not been viewed yet
-      if (!isUnseenNeedsReaction(cascadeId, summary, store)) continue;
       const rawTitle = summary?.annotations?.title || summary?.summary || '';
       const baseTitle = cleanBaseTitle(rawTitle) || rawTitle || cascadeId.slice(0, 8);
       const timeMatch = TIME_PREFIX_EXTRACT_RE.exec(rawTitle);
       const timePrefix = timeMatch ? timeMatch[1] : '';
       const projectId = summary?.trajectoryMetadata?.projectId || '__standalone__';
       const projectName = resolveProjectName(projectId, store);
-      const tier = classifyInboxTier(summary);
-      if (tier === 'urgent') urgentCount++;
       const modTs =
         parseTimestampMs(summary?.lastModifiedTime) ||
-        parseTimestampMs(summary?.createdTime);
-      items.push({
-        cascadeId,
-        baseTitle,
-        timePrefix,
-        projectId,
-        projectName,
-        tier,
-        modTs,
-      });
+        parseTimestampMs(summary?.createdTime) ||
+        now;
+      const ageMs = Math.max(0, now - modTs);
+      const bucket = classifyChatBucket(summary, rawTitle);
+
+      if (bucket === 'working') {
+        const isRunning = summary?.status === 'CASCADE_RUN_STATUS_RUNNING';
+        const workingIcon = isRunning ? '🤖' : '⏳';
+        itemsWorking.push({
+          cascadeId,
+          tabKey: 'working',
+          baseTitle,
+          timePrefix,
+          projectId,
+          projectName,
+          workingIcon,
+          modTs,
+        });
+      } else if (bucket === 'needs-me') {
+        if (ageMs >= STALE_THRESHOLD_MS) {
+          const days = Math.floor(ageMs / (24 * 60 * 60 * 1000));
+          itemsStale.push({
+            cascadeId,
+            tabKey: 'stale',
+            baseTitle,
+            timePrefix: `${days}d`,
+            projectId,
+            projectName,
+            modTs,
+          });
+        } else if (isUnseenNeedsReaction(cascadeId, summary)) {
+          const tier = classifyInboxTier(summary);
+          if (tier === 'urgent') urgentCount++;
+          itemsNeedsMe.push({
+            cascadeId,
+            tabKey: 'needs-me',
+            baseTitle,
+            timePrefix,
+            projectId,
+            projectName,
+            tier,
+            modTs,
+          });
+        }
+      }
     }
 
-    items.sort((a, b) => {
+    // Sort Tab 1 (Needs Me): urgent first, then newest modified first
+    itemsNeedsMe.sort((a, b) => {
       if (a.tier !== b.tier) return a.tier === 'urgent' ? -1 : 1;
       if (b.modTs !== a.modTs) return b.modTs - a.modTs;
       if (b.timePrefix !== a.timePrefix) return b.timePrefix.localeCompare(a.timePrefix);
       return a.cascadeId.localeCompare(b.cascadeId);
     });
 
-    const isEmpty = items.length === 0;
+    // Sort Tab 2 (Working): newest modified first
+    itemsWorking.sort((a, b) => {
+      if (b.modTs !== a.modTs) return b.modTs - a.modTs;
+      if (b.timePrefix !== a.timePrefix) return b.timePrefix.localeCompare(a.timePrefix);
+      return a.cascadeId.localeCompare(b.cascadeId);
+    });
+
+    // Sort Tab 3 (Stale): oldest modified first
+    itemsStale.sort((a, b) => {
+      if (a.modTs !== b.modTs) return a.modTs - b.modTs;
+      return a.cascadeId.localeCompare(b.cascadeId);
+    });
+
+    const itemsByTab = {
+      'needs-me': itemsNeedsMe,
+      'working': itemsWorking,
+      'stale': itemsStale,
+    };
+
+    const totalCount = itemsNeedsMe.length + itemsWorking.length + itemsStale.length;
+    const isEmpty = totalCount === 0;
     const emptyStr = isEmpty ? 'true' : 'false';
     if (inboxEl.getAttribute('data-empty') !== emptyStr) {
       inboxEl.setAttribute('data-empty', emptyStr);
     }
     inboxEl.style.display = isEmpty ? 'none' : '';
 
+    // Auto-fallback to first non-empty tab if active tab has 0 items
+    if (isEmpty) {
+      activeInboxTab = 'needs-me';
+    } else if (!itemsByTab[activeInboxTab] || itemsByTab[activeInboxTab].length === 0) {
+      for (const tabKey of INBOX_TABS) {
+        if (itemsByTab[tabKey].length > 0) {
+          activeInboxTab = tabKey;
+          break;
+        }
+      }
+    }
+
+    const currentTabItems = itemsByTab[activeInboxTab] || [];
+
+    if (inboxEl.getAttribute('data-active-tab') !== activeInboxTab) {
+      inboxEl.setAttribute('data-active-tab', activeInboxTab);
+    }
     const urgentStr = urgentCount > 0 ? 'true' : 'false';
     if (inboxEl.getAttribute('data-urgent') !== urgentStr) {
       inboxEl.setAttribute('data-urgent', urgentStr);
     }
-    if (inboxEl.getAttribute('data-count') !== String(items.length)) {
-      inboxEl.setAttribute('data-count', String(items.length));
+    if (inboxEl.getAttribute('data-count') !== String(currentTabItems.length)) {
+      inboxEl.setAttribute('data-count', String(currentTabItems.length));
     }
     if (inboxEl.getAttribute('data-urgent-count') !== String(urgentCount)) {
       inboxEl.setAttribute('data-urgent-count', String(urgentCount));
@@ -3367,16 +3474,29 @@
       inboxEl.setAttribute('data-collapsed', collapsedStr);
     }
 
-    const countBadge = inboxEl.querySelector('.jetski-inbox-count-badge');
-    if (countBadge && countBadge.textContent !== String(items.length)) {
-      countBadge.textContent = String(items.length);
-    }
-    const urgentPill = inboxEl.querySelector('.jetski-inbox-urgent-pill');
-    if (urgentPill) {
-      urgentPill.style.display = urgentCount > 0 ? '' : 'none';
-      const nextUrgentText = urgentCount > 0 ? `🔥 ${urgentCount}` : '';
-      if (urgentPill.textContent !== nextUrgentText) {
-        urgentPill.textContent = nextUrgentText;
+    // Sync tab buttons (active state, count badges, urgent pill)
+    for (const def of INBOX_TAB_DEFS) {
+      const tabBtn = inboxEl.querySelector(`.jetski-inbox-tab-${def.key}`);
+      if (tabBtn) {
+        const isActive = activeInboxTab === def.key;
+        if (tabBtn.getAttribute('data-active') !== (isActive ? 'true' : 'false')) {
+          tabBtn.setAttribute('data-active', isActive ? 'true' : 'false');
+        }
+        const countBadge = tabBtn.querySelector('.jetski-inbox-count-badge');
+        const count = itemsByTab[def.key]?.length || 0;
+        if (countBadge && countBadge.textContent !== String(count)) {
+          countBadge.textContent = String(count);
+        }
+        if (def.key === 'needs-me') {
+          const urgentPill = tabBtn.querySelector('.jetski-inbox-urgent-pill');
+          if (urgentPill) {
+            urgentPill.style.display = urgentCount > 0 ? '' : 'none';
+            const nextUrgentText = urgentCount > 0 ? `🔥 ${urgentCount}` : '';
+            if (urgentPill.textContent !== nextUrgentText) {
+              urgentPill.textContent = nextUrgentText;
+            }
+          }
+        }
       }
     }
 
@@ -3395,10 +3515,10 @@
     }
 
     // Re-render row nodes only when the ordered inbox signature changes
-    const sig = items
+    const sig = `${activeInboxTab}:` + currentTabItems
       .map(
         (it) =>
-          `${it.cascadeId}:${it.tier}:${it.projectName}:${it.baseTitle}:${it.timePrefix}`
+          `${it.cascadeId}:${it.tier || ''}:${it.workingIcon || ''}:${it.projectName}:${it.baseTitle}:${it.timePrefix}`
       )
       .join('|');
     if (inboxEl.getAttribute('data-jetski-inbox-sig') !== sig) {
@@ -3408,7 +3528,7 @@
         while (listContainer.children?.length > 0) {
           listContainer.children[0].remove();
         }
-        for (const item of items) {
+        for (const item of currentTabItems) {
           listContainer.appendChild(createInboxRowElement(item));
         }
       }
@@ -3460,35 +3580,6 @@
     return m ? m[1] : '';
   }
 
-  // Syncs the titlebar wait-toggle button (⦿ <-> ⏳)
-  function updateTitlebarWaitButtonUI(btn, cascadeId) {
-    if (!btn || !cascadeId) return;
-    btn.setAttribute('data-cascade-id', cascadeId);
-    const curTitle = getTitleForCascadeId(cascadeId, '');
-    // Wait state of an archived chat is invisible in every bucket, so the toggle is hidden
-    btn.style.display = isArchivedCascadeId(cascadeId) ? 'none' : '';
-    const waiting = isWaitingTitle(curTitle);
-    const waitStr = waiting ? 'true' : 'false';
-    if (btn.getAttribute('data-waiting') !== waitStr) {
-      btn.setAttribute('data-waiting', waitStr);
-    }
-    const label = waiting
-      ? 'Move chat to 🚨 Needs Me (⦿)'
-      : 'Move chat to ⏳ Waiting (Cron / External)';
-    // Sync DOM attributes and icon text only on change to avoid re-triggering MutationObserver
-    if (btn.getAttribute('aria-label') !== label) {
-      btn.setAttribute('aria-label', label);
-    }
-    // Strip native tooltip so it does not overlap the custom surface-glass hover bubble
-    if (btn.hasAttribute('title')) {
-      btn.removeAttribute('title');
-    }
-    const nextText = waiting ? '🚨' : '⏳';
-    if (btn.textContent !== nextText) {
-      btn.textContent = nextText;
-    }
-  }
-
   // Syncs the titlebar archive button label and icon with the chat annotations
   function updateTitlebarArchiveButtonUI(btn, cascadeId) {
     if (!btn || !cascadeId) return;
@@ -3513,7 +3604,7 @@
     }
   }
 
-  // Injects or updates the Locate, Wait, and Archive icon buttons before ⋮ in each titlebar
+  // Injects or updates the Search, Locate, and Archive icon buttons before ⋮ in each titlebar
   function ensureTitlebarButtons() {
     const moreActionsBtns = document.querySelectorAll(
       '[data-testid="titlebar-more-actions"]'
@@ -3557,30 +3648,10 @@
             void locateConversationInSidebar(cid);
           }
         });
-        const beforeTarget =
-          container.querySelector(`.${TITLEBAR_WAIT_BTN_CLASS}`) || moreBtn;
-        container.insertBefore(locateBtn, beforeTarget);
+        container.insertBefore(locateBtn, moreBtn);
       } else if (locateBtn.getAttribute('data-cascade-id') !== cascadeId) {
         locateBtn.setAttribute('data-cascade-id', cascadeId);
       }
-
-      let waitBtn = container.querySelector(`.${TITLEBAR_WAIT_BTN_CLASS}`);
-      if (!waitBtn) {
-        waitBtn = document.createElement('button');
-        waitBtn.className = TITLEBAR_WAIT_BTN_CLASS;
-        waitBtn.type = 'button';
-        waitBtn.setAttribute('data-testid', 'jetski-titlebar-wait-btn');
-        bindHoverBubble(waitBtn, () => waitBtn.getAttribute('aria-label'));
-        bindActionBtnHandlers(waitBtn, () => {
-          const cid =
-            waitBtn.getAttribute('data-cascade-id') || findCascadeIdFromElement(moreBtn);
-          if (cid) {
-            void toggleConversationWaiting(cid, '');
-          }
-        });
-        container.insertBefore(waitBtn, moreBtn);
-      }
-      updateTitlebarWaitButtonUI(waitBtn, cascadeId);
 
       let btn = container.querySelector(`.${TITLEBAR_BTN_CLASS}`);
       if (!btn) {
@@ -3599,34 +3670,6 @@
         container.insertBefore(btn, moreBtn);
       }
       updateTitlebarArchiveButtonUI(btn, cascadeId);
-    }
-  }
-
-  // Syncs the compact sidebar row wait-toggle button (⦿ <-> ⏳)
-  function updateRowWaitButtonUI(btn, cascadeId, fallbackDomTitle) {
-    if (!btn || !cascadeId) return;
-    btn.setAttribute('data-cascade-id', cascadeId);
-    const curTitle = getTitleForCascadeId(cascadeId, fallbackDomTitle);
-    // Wait state of an archived chat is invisible in every bucket, so the toggle is hidden
-    btn.style.display = isArchivedCascadeId(cascadeId) ? 'none' : '';
-    const waiting = isWaitingTitle(curTitle);
-    const waitStr = waiting ? 'true' : 'false';
-    if (btn.getAttribute('data-waiting') !== waitStr) {
-      btn.setAttribute('data-waiting', waitStr);
-    }
-    const label = waiting
-      ? 'Move chat to 🚨 Needs Me (⦿)'
-      : 'Move chat to ⏳ Waiting (Cron / External)';
-    // Guard DOM mutations so the sidebar observer does not loop on unchanged buttons
-    if (btn.getAttribute('aria-label') !== label) {
-      btn.setAttribute('aria-label', label);
-    }
-    if (btn.getAttribute('title') !== label) {
-      btn.setAttribute('title', label);
-    }
-    const nextHtml = waiting ? '<span>🚨</span>' : '<span>⏳</span>';
-    if (btn.innerHTML !== nextHtml) {
-      btn.innerHTML = nextHtml;
     }
   }
 
@@ -3705,8 +3748,7 @@
     }
   }
 
-  // Injects or updates the compact Wait button inside each sidebar row hover bar; archiving
-  // stays with the native row button
+  // Injects or updates row action indicators; archiving stays with the native row button
   function ensureSidebarRowButtons() {
     // Read Redux summaries so each row can sync its live background-wait state
     const store = findReduxStore();
@@ -3735,30 +3777,6 @@
         summariesMap[cascadeId],
         fallbackDomTitle
       );
-
-      const anchorBtn =
-        rowEl.querySelector('[data-testid="conversation-pin-button"]') ||
-        rowEl.querySelector('[data-testid="conversation-archive-button"]');
-      if (!anchorBtn || !anchorBtn.parentElement) continue;
-      const hoverBar = anchorBtn.parentElement;
-
-      let waitBtn = hoverBar.querySelector(`.${ROW_WAIT_BTN_CLASS}`);
-      if (!waitBtn) {
-        waitBtn = document.createElement('button');
-        waitBtn.className = ROW_WAIT_BTN_CLASS;
-        waitBtn.type = 'button';
-        waitBtn.setAttribute('data-testid', 'jetski-row-wait-btn');
-        bindActionBtnHandlers(waitBtn, () => {
-          const cid = waitBtn.getAttribute('data-cascade-id') || cascadeId;
-          // Read the raw title so clicking Wait uses the real marker rather than the DOM swap
-          const domTitle = getRawDomTitle(rowEl);
-          if (cid) {
-            void toggleConversationWaiting(cid, domTitle);
-          }
-        });
-        hoverBar.insertBefore(waitBtn, anchorBtn);
-      }
-      updateRowWaitButtonUI(waitBtn, cascadeId, fallbackDomTitle);
     }
   }
 
@@ -3802,8 +3820,6 @@
         target.className === INBOX_CLASS ||
         target.className === BUTTON_CLASS ||
         target.className === TITLEBAR_BTN_CLASS ||
-        target.className === TITLEBAR_WAIT_BTN_CLASS ||
-        target.className === ROW_WAIT_BTN_CLASS ||
         target.className === ROW_BG_WAIT_INDICATOR_CLASS ||
         target.className === PROJECT_ROADMAP_BADGE_CLASS ||
         target.className === SEARCH_BTN_CLASS ||
@@ -3819,8 +3835,6 @@
             target.closest(`.${INBOX_CLASS}`) ||
             target.closest(`.${BUTTON_CLASS}`) ||
             target.closest(`.${TITLEBAR_BTN_CLASS}`) ||
-            target.closest(`.${TITLEBAR_WAIT_BTN_CLASS}`) ||
-            target.closest(`.${ROW_WAIT_BTN_CLASS}`) ||
             target.closest(`.${ROW_BG_WAIT_INDICATOR_CLASS}`) ||
             target.closest(`.${PROJECT_ROADMAP_BADGE_CLASS}`) ||
             target.closest(`.${LOCATE_BTN_CLASS}`) ||
@@ -3845,6 +3859,7 @@
   }
 
   window.__jetskiClosedChatsFilterCleanup = () => {
+    unbindInputBoxSeenListeners();
     observer.disconnect();
     disposed = true;
     // A re-injected instance starts with empty managedHiddenIds and would read our flags as
@@ -3867,8 +3882,6 @@
       `.${INBOX_CLASS}`,
       `.${BUTTON_CLASS}`,
       `.${TITLEBAR_BTN_CLASS}`,
-      `.${TITLEBAR_WAIT_BTN_CLASS}`,
-      `.${ROW_WAIT_BTN_CLASS}`,
       `.${ROW_BG_WAIT_INDICATOR_CLASS}`,
       `.${PROJECT_ROADMAP_BADGE_CLASS}`,
       `.${SEARCH_BTN_CLASS}`,
@@ -3904,5 +3917,6 @@
     }
   };
 
+  bindInputBoxSeenListeners();
   runFullSync();
 })();
