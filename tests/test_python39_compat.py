@@ -4,12 +4,19 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import glob
 import importlib.util
+import inspect
 import os
 import py_compile
 import sys
 import unittest
+
+
+# Jetski run_workflow executes *_workflow.py entry scripts with PyCF_ALLOW_TOP_LEVEL_AWAIT
+def _is_workflow_script(path: str) -> bool:
+  return os.path.basename(path).endswith("_workflow.py")
 
 
 def check_python39_source_compatibility(src: str, filename: str) -> list[str]:
@@ -100,10 +107,13 @@ class TestPython39Compat(unittest.TestCase):
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     all_errors: list[str] = []
     for f in self._all_python_files():
-      py_compile.compile(f, doraise=True)
       rel = os.path.relpath(f, root)
       with open(f, encoding="utf-8") as fp:
         src = fp.read()
+      if _is_workflow_script(f):
+        compile(src, f, "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+      else:
+        py_compile.compile(f, doraise=True)
       all_errors.extend(check_python39_source_compatibility(src, rel))
     self.assertEqual(all_errors, [], "\n".join(all_errors))
 
@@ -127,7 +137,16 @@ class TestPython39Compat(unittest.TestCase):
         if added_path:
           sys.path.insert(0, script_dir)
         try:
-          spec.loader.exec_module(mod)
+          if _is_workflow_script(f):
+            with open(f, encoding="utf-8") as fp:
+              wf_src = fp.read()
+            wf_code = compile(wf_src, f, "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+            mod.__file__ = f
+            res = eval(wf_code, mod.__dict__)
+            if inspect.iscoroutine(res):
+              asyncio.run(res)
+          else:
+            spec.loader.exec_module(mod)
         finally:
           sys.modules.pop(mod_name, None)
           if added_path and script_dir in sys.path:
@@ -144,6 +163,15 @@ class TestPython39Compat(unittest.TestCase):
     self.assertEqual(
         len(check_python39_source_compatibility(bad_isinstance, "bad_rt.py")), 1
     )
+
+  def test_workflow_top_level_await_gated_to_workflow_scripts(self) -> None:
+    wf_src = "async def main() -> int | None:\n  return None\nawait main()\n"
+    self.assertTrue(_is_workflow_script("skills/debate/scripts/debate_workflow.py"))
+    self.assertFalse(_is_workflow_script("skills/debate/scripts/debate_ls_runner.py"))
+    self.assertEqual(len(check_python39_source_compatibility(wf_src, "x_workflow.py")), 1)
+    with self.assertRaises(SyntaxError):
+      compile(wf_src, "regular.py", "exec")
+    compile(wf_src, "x_workflow.py", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
 
 
 if __name__ == "__main__":
