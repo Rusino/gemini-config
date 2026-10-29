@@ -1,0 +1,596 @@
+[
+  {
+    "id": "N02",
+    "what": "LineMetrics.left_always_zero",
+    "features": [
+      "F04",
+      "F25",
+      "F19",
+      "F27"
+    ],
+    "reach_feature": "F04",
+    "S": 3,
+    "severity_debug": 3,
+    "severity_release": 3,
+    "release_verified": true,
+    "P": 1.0,
+    "R_basis": "F25 and F04/F19",
+    "known": "new (TODO in web_paragraph/layout.dart:1475-1477: 'advance.left is always zero')",
+    "repro": "ParagraphStyle(fontFamily:'Roboto', fontSize:20, textAlign:TextAlign.center) ; addText('abc') ; layout(width:200) ; computeLineMetrics()[0].left",
+    "note": ""
+  },
+  {
+    "id": "N01",
+    "what": "ellipsis_maxLines_null_not_honored",
+    "features": [
+      "F02"
+    ],
+    "reach_feature": "F02",
+    "S": 4,
+    "severity_debug": 4,
+    "severity_release": 4,
+    "release_verified": true,
+    "P": 0.3,
+    "R_basis": "F02",
+    "known": "new (R8 covers maxLines>1 ellipsize math, not the maxLines==null contract)",
+    "repro": "ParagraphStyle(fontFamily:'Ahem', fontSize:20, ellipsis:'…') ; addText('Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor') ; layout(width:150)",
+    "note": ""
+  },
+  {
+    "id": "N03",
+    "what": "empty_paragraph_alphabeticBaseline_and_style_height",
+    "features": [
+      "F28",
+      "F25",
+      "F09",
+      "F08"
+    ],
+    "reach_feature": "F28",
+    "S": 2,
+    "severity_debug": 2,
+    "severity_release": 2,
+    "release_verified": true,
+    "P": 1.0,
+    "R_basis": "F28",
+    "known": "R13-related (empty-text metrics TODO, layout.dart:180-188 'not 100% correct'); not verified whether PR #193403 changes it",
+    "repro": "ParagraphStyle(fontFamily:'Roboto', fontSize:20) ; addText('') ; layout(width:200) ; alphabeticBaseline",
+    "note": ""
+  },
+  {
+    "id": "N04",
+    "what": "exc|StateError|No element|TextLayout.wrapText (lines.first)",
+    "features": [
+      "F28",
+      "F22",
+      "F25"
+    ],
+    "reach_feature": "F28",
+    "S": 5,
+    "severity_debug": 5,
+    "severity_release": 5,
+    "release_verified": true,
+    "P": 0.05,
+    "R_basis": "measured: apps with ZWSP-only text field pattern (3/zwsp.json, strict)",
+    "known": "new (R24 is an assert in toTextRange with zero-width chars mixed into text; this is a different site and throws in release)",
+    "repro": "ParagraphStyle(fontFamily:'Ahem', fontSize:20) ; addText('\\u200B') ; layout(width:200)",
+    "note": "P raised: chips TextFields hold exactly \"\\u200B\" (GPay search_field_with_chips, crowdsource textfield_with_chips)",
+    "zoom_reach": 0.053,
+    "zoom_P": 1.0,
+    "zoom_basis": "measured: apps with ZWSP-only text field pattern (3/zwsp.json, strict)"
+  },
+  {
+    "id": "N05",
+    "what": "exc|ArgumentError|TextRange [N:N) is out of paragraph text range|_TextClusterMapping.toClusterRange",
+    "features": [
+      "F06"
+    ],
+    "reach_feature": "F06",
+    "S": 5,
+    "severity_debug": 5,
+    "severity_release": 5,
+    "release_verified": true,
+    "P": 0.05,
+    "R_basis": "F06",
+    "known": "R27 (same message and site; R27's exact repro did not reproduce here with Ahem/Roboto 20px at width 300, so the trigger in R27 likely differs only in where the line breaks)",
+    "repro": "ParagraphStyle(fontFamily:'Ahem', fontSize:20) ; pushStyle(TextStyle(fontSize:20)) ; addText('Hello ') ; pop() ; pushStyle(TextStyle(fontSize:20, color:Color(0xFFFF0000))) ; addText(' world') ; pop() ; layout(width:50)",
+    "note": ""
+  },
+  {
+    "id": "N11",
+    "what": "hit-test right of a wrapped line lands before the trailing space",
+    "features": [
+      "F25",
+      "F26",
+      "F01"
+    ],
+    "reach_feature": "F25",
+    "S": 3,
+    "severity_debug": 3,
+    "severity_release": 3,
+    "release_verified": true,
+    "P": 0.3,
+    "R_basis": "F25 or F26",
+    "known": "new",
+    "repro": "ParagraphStyle(fontFamily:'Ahem', fontSize:20) ; addText('Hello world') ; layout(width:150) ; getPositionForOffset(Offset(125.37, 8))",
+    "note": ""
+  },
+  {
+    "id": "N22",
+    "what": "letterSpacing applied after each glyph only (SkP splits half before/half after)",
+    "features": [
+      "F10"
+    ],
+    "reach_feature": "F10",
+    "S": 1,
+    "severity_debug": 1,
+    "severity_release": 1,
+    "release_verified": true,
+    "P": 1.0,
+    "R_basis": "F10",
+    "known": "new",
+    "repro": "TextStyle(fontFamily:'Ahem', fontSize:20, letterSpacing:4) ; addText('abcdef ghij') ; layout(width:400) ; getBoxesForRange(0, n)",
+    "note": ""
+  },
+  {
+    "id": "N06",
+    "what": "exc|RangeError(-1) in release / AssertionError in _TextClusterMapping.toTextRange (debug): RTL + ellipsis, narrow width",
+    "features": [
+      "F02",
+      "F19"
+    ],
+    "reach_feature": "F19",
+    "S": 5,
+    "severity_debug": 5,
+    "severity_release": 5,
+    "release_verified": true,
+    "P": 0.05,
+    "R_basis": "F02 and F19",
+    "known": "new (assert site shared with R24)",
+    "repro": "ParagraphStyle(fontFamily:'Roboto', fontSize:14, textDirection:TextDirection.rtl, ellipsis:'\\u2026') ; addText('3.') ; layout(width:11.546)",
+    "note": ""
+  },
+  {
+    "id": "R15",
+    "what": "placeholder boxes order (F07)",
+    "features": [
+      "F07"
+    ],
+    "reach_feature": "F07",
+    "S": 3,
+    "severity_debug": 3,
+    "severity_release": 3,
+    "release_verified": true,
+    "P": 0.3,
+    "R_basis": "F07",
+    "known": "R15",
+    "repro": "",
+    "note": ""
+  },
+  {
+    "id": "N09",
+    "what": "RTL paragraph: whitespace at end of a style run moved to the line's visual left (gap); debug assert in getPositionForOffset",
+    "features": [
+      "F19",
+      "F06",
+      "F25",
+      "F26"
+    ],
+    "reach_feature": "F19",
+    "S": 3,
+    "severity_debug": 5,
+    "severity_release": 3,
+    "release_verified": true,
+    "P": 0.3,
+    "R_basis": "F19 required",
+    "known": "new; may interact with #194980 (R33 multi-span BiDi) — not checked",
+    "repro": "ParagraphStyle(fontFamily:'Ahem', fontSize:20, textDirection:TextDirection.rtl) ; pushStyle(TextStyle(fontSize:28)) ; addText('ab ') ; pop() ; addText('cd') ; layout(width:400)",
+    "note": ""
+  },
+  {
+    "id": "N10",
+    "what": "RTL paragraph, LTR text: trailing space of a wrapped line placed at x<0",
+    "features": [
+      "F19",
+      "F04",
+      "F26"
+    ],
+    "reach_feature": "F19",
+    "S": 3,
+    "severity_debug": 3,
+    "severity_release": 3,
+    "release_verified": true,
+    "P": 0.3,
+    "R_basis": "F19 required",
+    "known": "new",
+    "repro": "ParagraphStyle(fontFamily:'Ahem', fontSize:20, textDirection:TextDirection.rtl, textAlign:TextAlign.left) ; addText('Hello world') ; layout(width:150)",
+    "note": ""
+  },
+  {
+    "id": "N08",
+    "what": "ellipsized line wider than layout width (maxLines set)",
+    "features": [
+      "F02"
+    ],
+    "reach_feature": "F02",
+    "S": 2,
+    "severity_debug": 2,
+    "severity_release": 2,
+    "release_verified": true,
+    "P": 0.3,
+    "R_basis": "F02",
+    "known": "R8 (ellipsize width accounting) — likely, not proven",
+    "repro": "ParagraphStyle(fontFamily:'Ahem', fontSize:20, maxLines:1, ellipsis:'\\u2026') ; addText('Supercalifragilisticexpialidocious word') ; layout(width:150)",
+    "note": ""
+  },
+  {
+    "id": "N12",
+    "what": "fontFeatures other than caps ignored in layout",
+    "features": [
+      "F13"
+    ],
+    "reach_feature": "F13",
+    "S": 2,
+    "severity_debug": 2,
+    "severity_release": 2,
+    "release_verified": true,
+    "P": 1.0,
+    "R_basis": "F13",
+    "known": "new (confirms the F13 [UNVERIFIED HYPOTHESIS]: canvas.style.fontFeatureSettings at web_paragraph/paragraph.dart:598-599 has no effect on Canvas2D measureText)",
+    "repro": "TextStyle(fontFamily:'Roboto', fontSize:40, fontFeatures:[FontFeature.proportionalFigures()]) ; addText('1111') ; layout(width:double.infinity) ; maxIntrinsicWidth",
+    "note": ""
+  },
+  {
+    "id": "N07",
+    "what": "exc|AssertionError|TextLayout.addLine: ellipsis with maxLines=null and a word wider than width",
+    "features": [
+      "F02"
+    ],
+    "reach_feature": "F02",
+    "S": 4,
+    "severity_debug": 5,
+    "severity_release": 4,
+    "release_verified": true,
+    "P": 0.05,
+    "R_basis": "F02",
+    "known": "new (same ellipsis path as N01; R8 touches TextLayout.addLine ellipsis code, may overlap)",
+    "repro": "ParagraphStyle(fontFamily:'Ahem', fontSize:14, ellipsis:'...') ; addText(' 1') ; layout(width:0)   // also 'ab abcdefgh' at width 1",
+    "note": ""
+  },
+  {
+    "id": "R28",
+    "what": "decorations cut/position (F15)",
+    "features": [
+      "F15"
+    ],
+    "reach_feature": "F15",
+    "S": 2,
+    "severity_debug": 2,
+    "severity_release": 2,
+    "release_verified": true,
+    "P": 0.3,
+    "R_basis": "F15",
+    "known": "R28/#188322",
+    "repro": "",
+    "note": ""
+  },
+  {
+    "id": "N21",
+    "what": "LineMetrics.hardBreak true on a line truncated by maxLines",
+    "features": [
+      "F03",
+      "F27"
+    ],
+    "reach_feature": "F03",
+    "S": 1,
+    "severity_debug": 1,
+    "severity_release": 1,
+    "release_verified": true,
+    "P": 1.0,
+    "R_basis": "F03",
+    "known": "new",
+    "repro": "ParagraphStyle(fontFamily:'Ahem', fontSize:20, maxLines:1) ; addText('on') ; layout(width:30)",
+    "note": ""
+  },
+  {
+    "id": "R11",
+    "what": "shadows at DPR>1 (F16,F30)",
+    "features": [
+      "F16",
+      "F30"
+    ],
+    "reach_feature": "F16",
+    "S": 1,
+    "severity_debug": 1,
+    "severity_release": 1,
+    "release_verified": true,
+    "P": 1.0,
+    "R_basis": "F16",
+    "known": "R11",
+    "repro": "",
+    "note": ""
+  },
+  {
+    "id": "I-seg",
+    "what": "Intl.Segmenter freeze on long TextField text",
+    "features": [
+      "F25"
+    ],
+    "reach_feature": "F25",
+    "S": 5,
+    "severity_debug": 5,
+    "severity_release": 5,
+    "release_verified": true,
+    "P": 0.01,
+    "R_basis": "F25",
+    "known": "#128575 (perf)",
+    "repro": "",
+    "note": ""
+  },
+  {
+    "id": "R14",
+    "what": "font metric rounding (F09)",
+    "features": [
+      "F09"
+    ],
+    "reach_feature": "F09",
+    "S": 2,
+    "severity_debug": 2,
+    "severity_release": 2,
+    "release_verified": true,
+    "P": 0.3,
+    "R_basis": "F09",
+    "known": "R14",
+    "repro": "",
+    "note": ""
+  },
+  {
+    "id": "G-just",
+    "what": "justify not implemented",
+    "features": [
+      "F05"
+    ],
+    "reach_feature": "F05",
+    "S": 2,
+    "severity_debug": 2,
+    "severity_release": 2,
+    "release_verified": true,
+    "P": 1.0,
+    "R_basis": "F05",
+    "known": "#148486",
+    "repro": "",
+    "note": ""
+  },
+  {
+    "id": "N13",
+    "what": "variable font: fontWeight not mapped to wght axis; fontVariations ignored",
+    "features": [
+      "F14",
+      "F11"
+    ],
+    "reach_feature": "F14",
+    "S": 2,
+    "severity_debug": 2,
+    "severity_release": 2,
+    "release_verified": true,
+    "P": 1.0,
+    "R_basis": "measured: variable text font + fontWeight (3/variable_fonts.json)",
+    "known": "fontVariations: known gap (#109308); fontWeight on variable font: new [mechanism not verified; likely FontFace registered without a weight range]",
+    "repro": "TextStyle(fontFamily:'RobotoVariable', fontSize:40, fontWeight:FontWeight.w900) ; addText('Hamburgefonstiv') ; layout(width:double.infinity)",
+    "note": "",
+    "zoom_reach": 0.094,
+    "zoom_P": 1.0,
+    "zoom_basis": "measured: variable text font + fontWeight (3/variable_fonts.json)"
+  },
+  {
+    "id": "G-strut",
+    "what": "strut leadingDistribution",
+    "features": [
+      "F08"
+    ],
+    "reach_feature": "F08",
+    "S": 2,
+    "severity_debug": 2,
+    "severity_release": 2,
+    "release_verified": true,
+    "P": 1.0,
+    "R_basis": "F08",
+    "known": "R21",
+    "repro": "",
+    "note": ""
+  },
+  {
+    "id": "N19",
+    "what": "didExceedMaxLines with trailing newline exactly at maxLines",
+    "features": [
+      "F03",
+      "F29"
+    ],
+    "reach_feature": "F29",
+    "S": 2,
+    "severity_debug": 2,
+    "severity_release": 2,
+    "release_verified": true,
+    "P": 0.05,
+    "R_basis": "F29",
+    "known": "new",
+    "repro": "ParagraphStyle(fontFamily:'Roboto', fontSize:20, maxLines:2) ; addText('a\\n\\n') ; layout(width:200)   // also '\\n' with maxLines:1",
+    "note": ""
+  },
+  {
+    "id": "R17",
+    "what": "emoji caret (F21,F25)",
+    "features": [
+      "F21",
+      "F25"
+    ],
+    "reach_feature": "F21",
+    "S": 3,
+    "severity_debug": 3,
+    "severity_release": 3,
+    "release_verified": true,
+    "P": 0.05,
+    "R_basis": "F21",
+    "known": "R17",
+    "repro": "",
+    "note": ""
+  },
+  {
+    "id": "N15",
+    "what": "minIntrinsicWidth depends on layout width / whitespace",
+    "features": [
+      "F23",
+      "F24",
+      "F18"
+    ],
+    "reach_feature": "F23",
+    "S": 2,
+    "severity_debug": 2,
+    "severity_release": 2,
+    "release_verified": true,
+    "P": 0.05,
+    "R_basis": "F23",
+    "known": "new",
+    "repro": "ParagraphStyle(fontFamily:'Ahem', fontSize:56) ; addText('Scaled text sample') ; layout(width:200) ; minIntrinsicWidth",
+    "note": ""
+  },
+  {
+    "id": "N14",
+    "what": "layout at own minIntrinsicWidth wraps one more line",
+    "features": [
+      "F23"
+    ],
+    "reach_feature": "F23",
+    "S": 4,
+    "severity_debug": 4,
+    "severity_release": 4,
+    "release_verified": true,
+    "P": 0.01,
+    "R_basis": "F23",
+    "known": "new",
+    "repro": "ParagraphStyle(fontFamily:'Ahem', fontSize:20) ; addText('Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor') ; layout(inf) ; layout(width: paragraph.minIntrinsicWidth)",
+    "note": ""
+  },
+  {
+    "id": "N18",
+    "what": "placeholder-only paragraph metrics",
+    "features": [
+      "F07"
+    ],
+    "reach_feature": "F07",
+    "S": 2,
+    "severity_debug": 2,
+    "severity_release": 2,
+    "release_verified": true,
+    "P": 0.05,
+    "R_basis": "F07",
+    "known": "new (R15 is placeholder box order, different)",
+    "repro": "ParagraphStyle(fontFamily:'Ahem', fontSize:20) ; addPlaceholder(40, 20, PlaceholderAlignment.baseline, baselineOffset:15) ; layout(width:100)",
+    "note": ""
+  },
+  {
+    "id": "N16",
+    "what": "zero-width/bidi format chars (LRM/RLM/ZWSP) take width; debug assert in toTextRange",
+    "features": [
+      "F19",
+      "F22",
+      "F21"
+    ],
+    "reach_feature": "F19",
+    "S": 2,
+    "severity_debug": 5,
+    "severity_release": 2,
+    "release_verified": true,
+    "P": 0.05,
+    "R_basis": "F19/F21",
+    "known": "R24 (same assert site toTextRange with zero-width chars); width part new",
+    "repro": "ParagraphStyle(fontFamily:'Ahem', fontSize:14) ; addText('a\\u200F') ; layout(width:50)   // assert: addText('a x\\u200E'), layout(width: maxIntrinsicWidth - 0.5)",
+    "note": ""
+  },
+  {
+    "id": "N23",
+    "what": "whitespace before newline counted in maxIntrinsicWidth",
+    "features": [
+      "F29",
+      "F23"
+    ],
+    "reach_feature": "F29",
+    "S": 1,
+    "severity_debug": 1,
+    "severity_release": 1,
+    "release_verified": true,
+    "P": 0.05,
+    "R_basis": "F29",
+    "known": "new",
+    "repro": "ParagraphStyle(fontFamily:'Ahem', fontSize:14) ; addText(' \\n') ; layout(width:60) ; maxIntrinsicWidth",
+    "note": ""
+  },
+  {
+    "id": "N20",
+    "what": "line separators: U+0085 not in any line range; U+2028/2029 and '\\n' boxes at x=0",
+    "features": [
+      "F29"
+    ],
+    "reach_feature": "F29",
+    "S": 3,
+    "severity_debug": 3,
+    "severity_release": 3,
+    "release_verified": true,
+    "P": 0.01,
+    "R_basis": "F29",
+    "known": "new",
+    "repro": "ParagraphStyle(fontFamily:'Ahem', fontSize:20) ; addText('x\\u0085y') ; layout(width:120) ; getLineBoundary(...)",
+    "note": ""
+  },
+  {
+    "id": "G-hyph",
+    "what": "hyphens ignored",
+    "features": [
+      "F22"
+    ],
+    "reach_feature": "F22",
+    "S": 2,
+    "severity_debug": 2,
+    "severity_release": 2,
+    "release_verified": true,
+    "P": 0.05,
+    "R_basis": "F22",
+    "known": "#193506",
+    "repro": "",
+    "note": ""
+  },
+  {
+    "id": "N17",
+    "what": "tab after RTL char: debug assert in TextWrapper.breakLines; release width differs",
+    "features": [
+      "F29",
+      "F19"
+    ],
+    "reach_feature": "F19",
+    "S": 2,
+    "severity_debug": 5,
+    "severity_release": 2,
+    "release_verified": true,
+    "P": 0.01,
+    "R_basis": "F19 and F29",
+    "known": "new",
+    "repro": "ParagraphStyle(fontFamily:'Ahem', fontSize:14) ; addText('\\u05DD\\tw') ; layout(width:150) ; layout(width: minIntrinsicWidth)",
+    "note": ""
+  },
+  {
+    "id": "R16",
+    "what": "== / toString",
+    "features": [
+      "F01"
+    ],
+    "reach_feature": "F01",
+    "S": 0,
+    "severity_debug": 0,
+    "severity_release": 0,
+    "release_verified": true,
+    "P": 1.0,
+    "R_basis": "F01",
+    "known": "R16",
+    "repro": "",
+    "note": ""
+  }
+]
