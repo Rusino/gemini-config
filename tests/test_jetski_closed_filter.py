@@ -1593,8 +1593,12 @@ const liveBucketBtn = (k) =>
   storeState.projects = {
     projects: {
       'proj-1': { name: 'Breaking Chats · ⟳ 1 ⚠ 2' },
-      'proj-urgent': { name: 'Skia Text · ● 1' },
     },
+  };
+  // The Workspaces sidebar keeps project names only in the sidebarProjects array
+  storeState.sidebarProjects = {
+    enabled: true,
+    projects: [{ id: 'proj-urgent', name: 'Skia Text · ● 1', hideWhenEmpty: false }],
   };
   reduxStore.dispatch({
     type: 'trajectorySummaries/applyStreamBatch',

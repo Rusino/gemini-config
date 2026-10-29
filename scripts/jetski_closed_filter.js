@@ -3097,7 +3097,13 @@
   function resolveProjectName(projectId, store) {
     if (!projectId || projectId === '__standalone__') return 'Standalone';
     const state = store?.getState();
+    // The Workspaces sidebar keeps names in the sidebarProjects slice as an array of {id, name}
+    const sidebarProjects = state?.sidebarProjects?.projects;
+    const fromSidebar = Array.isArray(sidebarProjects)
+      ? sidebarProjects.find((p) => p?.id === projectId)?.name
+      : '';
     const fromStore =
+      fromSidebar ||
       state?.projects?.projects?.[projectId]?.name ||
       state?.project?.projects?.[projectId]?.name ||
       state?.projects?.byId?.[projectId]?.name ||
