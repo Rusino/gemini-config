@@ -1226,6 +1226,81 @@ class TestProjectActivityBadge(unittest.TestCase):
       )
       self.assertEqual((act, det), ("blocked", detail), f"Failed for {cid}")
 
+  def test_hide_from_conversation_list_excluded_from_activity(self):
+    known_projects = {"proj-1": ("/fake/p1.json", {"name": "Test Project"})}
+    summaries = {
+        "c-hidden-camel": {
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "lastModifiedTime": "2026-10-29T21:34:54Z",
+            "trajectoryMetadata": {
+                "projectId": "proj-1",
+                "sourceMetadata": {"hideFromConversationList": True},
+            },
+        },
+        "c-hidden-snake": {
+            "status": "CASCADE_RUN_STATUS_RUNNING",
+            "trajectoryMetadata": {
+                "projectId": "proj-1",
+                "sourceMetadata": {"hide_from_conversation_list": True},
+            },
+        },
+        "c-visible": {
+            "status": "CASCADE_RUN_STATUS_RUNNING",
+            "trajectoryMetadata": {
+                "projectId": "proj-1",
+            },
+        },
+    }
+    running, blocked, unread = badge.compute_project_activity(
+        summaries, known_projects, []
+    )
+    self.assertEqual(running, {"proj-1": 1})
+    self.assertEqual(blocked, {})
+    self.assertEqual(unread, {})
+
+  def test_evaluate_trajectory_subagent_non_planner_step_no_attribute_error(self):
+    # Steps after last_user_input_idx containing non-PLANNER_RESPONSE steps
+    # must not crash _step_spawns_subagent with NoneType.get
+    traj = {
+        "status": "CASCADE_RUN_STATUS_IDLE",
+        "trajectory": {
+            "steps": [
+                {
+                    "type": 14,
+                    "status": 3,
+                },
+                {
+                    "type": 127,
+                    "status": 3,
+                    "invokeSubagent": {
+                        "results": [{"conversationId": "sub-1"}],
+                        "subagents": [{"role": "Worker"}],
+                    },
+                },
+                {
+                    "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+                    "status": "CORTEX_STEP_STATUS_DONE",
+                    "runCommand": {"commandLine": "echo ok"},
+                },
+                {
+                    "type": 101,
+                    "status": 3,
+                    "systemMessage": {
+                        "message": "Report from sender=sub-1",
+                        "agentMessage": {"sender": "sub-1"},
+                    },
+                },
+                {
+                    "type": 15,
+                    "status": 3,
+                    "plannerResponse": {"response": "All done"},
+                },
+            ]
+        },
+    }
+    state, detail = badge.evaluate_trajectory_status(traj)
+    self.assertEqual(state, "idle")
+
 
 if __name__ == "__main__":
   unittest.main()

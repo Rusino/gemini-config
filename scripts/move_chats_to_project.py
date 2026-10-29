@@ -371,7 +371,12 @@ def list_unassigned_conversations(
       meta = s.get("trajectoryMetadata") or {}
       if meta.get("parentConversationId") or meta.get("isBattleModeFork"):
         continue
-      if (meta.get("sourceMetadata") or {}).get("tool"):
+      source_meta = meta.get("sourceMetadata") or {}
+      if (
+          source_meta.get("tool")
+          or source_meta.get("hideFromConversationList")
+          or source_meta.get("hide_from_conversation_list")
+      ):
         continue
       visible_ids.add(cid)
       ls_t = str(ann.get("title") or s.get("summary") or "").strip()

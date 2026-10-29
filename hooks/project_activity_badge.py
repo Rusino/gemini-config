@@ -493,7 +493,7 @@ def _extract_subagents_and_kills(
 
 
 def _planner_has_tool_calls(step: dict[str, Any]) -> bool:
-  pr = _step_oneof_payload(step, "plannerResponse", "planner_response")
+  pr = _step_oneof_payload(step, "plannerResponse", "planner_response") or {}
   tool_calls = pr.get("toolCalls") or pr.get("tool_calls")
   return isinstance(tool_calls, list) and len(tool_calls) > 0
 
@@ -503,7 +503,7 @@ def _step_spawns_subagent(step: dict[str, Any]) -> bool:
     return True
   if _step_oneof_payload(step, "invokeSubagent", "invoke_subagent"):
     return True
-  pr = _step_oneof_payload(step, "plannerResponse", "planner_response")
+  pr = _step_oneof_payload(step, "plannerResponse", "planner_response") or {}
   tcs = pr.get("toolCalls") or pr.get("tool_calls") or []
   if isinstance(tcs, list):
     for tc in tcs:
@@ -602,7 +602,7 @@ def evaluate_trajectory_status(
     for idx, step in enumerate(steps):
       if not isinstance(step, dict) or step.get("type") not in SYSTEM_MSG_STEP_TYPES:
         continue
-      sys_msg = _step_oneof_payload(step, "systemMessage", "system_message")
+      sys_msg = _step_oneof_payload(step, "systemMessage", "system_message") or {}
       msg_text = str(sys_msg.get("message") or "")
       agent_msg = sys_msg.get("agentMessage") or sys_msg.get("agent_message") or {}
       sender = str(agent_msg.get("sender") or "") if isinstance(agent_msg, dict) else ""
@@ -1173,7 +1173,11 @@ def _is_visible_top_level(summary: dict[str, Any]) -> bool:
   if meta.get("parentConversationId") or meta.get("isBattleModeFork"):
     return False
   source_meta = meta.get("sourceMetadata") or {}
-  if source_meta.get("tool"):
+  if (
+      source_meta.get("tool")
+      or source_meta.get("hideFromConversationList")
+      or source_meta.get("hide_from_conversation_list")
+  ):
     return False
   return True
 
