@@ -135,6 +135,11 @@
     { key: 'stale', label: '🧹 Stale' },
   ];
   const STALE_THRESHOLD_MS = 7 * 24 * 60 * 60 * 1000;
+  const INBOX_EMPTY_TEXT = {
+    'needs-me': '✓ All caught up: nothing needs you',
+    'working': 'No agents are running',
+    'stale': 'No stale chats',
+  };
   let activeInboxTab = safeGetStorage(STORAGE_INBOX_TAB_KEY);
   if (!INBOX_TABS.includes(activeInboxTab)) {
     activeInboxTab = 'needs-me';
@@ -1281,8 +1286,11 @@
       .${INBOX_CLASS}[data-urgent="true"] {
         border-color: rgba(248, 113, 113, 0.42);
       }
-      .${INBOX_CLASS}[data-empty="true"] {
-        display: none !important;
+      .jetski-inbox-empty-row {
+        padding: 4px 8px;
+        color: var(--muted-foreground, #9aa0a6);
+        font-size: 11px;
+        font-style: italic;
       }
       .${INBOX_HEADER_CLASS} {
         display: flex;
@@ -3439,7 +3447,8 @@
     if (inboxEl.getAttribute('data-empty') !== emptyStr) {
       inboxEl.setAttribute('data-empty', emptyStr);
     }
-    inboxEl.style.display = isEmpty ? 'none' : '';
+    // Stays visible when empty so the user sees an explicit all-clear instead of a vanished widget
+    inboxEl.style.display = '';
 
     // Auto-fallback to first non-empty tab if active tab has 0 items
     if (isEmpty) {
@@ -3530,6 +3539,13 @@
         }
         for (const item of currentTabItems) {
           listContainer.appendChild(createInboxRowElement(item));
+        }
+        // Auto-fallback leaves the active tab empty only when all 3 tabs are empty
+        if (currentTabItems.length === 0) {
+          const emptyRow = document.createElement('div');
+          emptyRow.className = 'jetski-inbox-empty-row';
+          emptyRow.textContent = INBOX_EMPTY_TEXT[activeInboxTab] || INBOX_EMPTY_TEXT['needs-me'];
+          listContainer.appendChild(emptyRow);
         }
       }
     }

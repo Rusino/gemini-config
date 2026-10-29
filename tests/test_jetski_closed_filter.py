@@ -1559,9 +1559,14 @@ const liveBucketBtn = (k) =>
   });
   while (rafCallbacks.length > 0) rafCallbacks.shift()();
 
-  // Before any items exist across the 3 tabs, the inbox is hidden
-    assert.strictEqual(inboxEl.getAttribute('data-empty'), 'true');
-  assert.strictEqual(inboxEl.style.display, 'none');
+  // With all 3 tabs empty, the inbox stays visible and shows an all-clear line
+  assert.strictEqual(inboxEl.getAttribute('data-empty'), 'true');
+  assert.strictEqual(inboxEl.style.display, '');
+  assert.strictEqual(
+    inboxEl.querySelector('.jetski-inbox-empty-row').textContent,
+    '✓ All caught up: nothing needs you'
+  );
+  assert.strictEqual(inboxEl.querySelectorAll('.jetski-inbox-row').length, 0);
   assert.strictEqual(inboxEl.getAttribute('data-collapsed'), 'false');
 
   // Verify the 3 tabs in headerLeft
@@ -1666,6 +1671,7 @@ const liveBucketBtn = (k) =>
   // agent-running and agent-bg-wait appear in working;
   // stale-task appears in stale
   assert.strictEqual(inboxEl.getAttribute('data-empty'), 'false');
+  assert(!inboxEl.querySelector('.jetski-inbox-empty-row'));
   assert.strictEqual(inboxEl.style.display, '');
   assert.strictEqual(inboxEl.getAttribute('data-active-tab'), 'needs-me');
   assert.strictEqual(inboxEl.getAttribute('data-urgent'), 'true');
@@ -1865,8 +1871,13 @@ const liveBucketBtn = (k) =>
     },
   });
   while (rafCallbacks.length > 0) rafCallbacks.shift()();
-    assert.strictEqual(inboxEl.getAttribute('data-empty'), 'true');
-  assert.strictEqual(inboxEl.style.display, 'none');
+  assert.strictEqual(inboxEl.getAttribute('data-empty'), 'true');
+  assert.strictEqual(inboxEl.style.display, '');
+  assert.strictEqual(inboxEl.getAttribute('data-active-tab'), 'needs-me');
+  assert.strictEqual(
+    inboxEl.querySelector('.jetski-inbox-empty-row').textContent,
+    '✓ All caught up: nothing needs you'
+  );
 
   // Cleanup must clear located-row attribute, remove locate buttons, and remove the inbox widget
   window.__jetskiClosedChatsFilterCleanup();
