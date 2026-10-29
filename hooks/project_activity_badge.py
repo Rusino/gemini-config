@@ -36,6 +36,7 @@ import glob
 import json
 import os
 import re
+import signal
 import socket
 import struct
 import subprocess
@@ -1808,6 +1809,10 @@ def compute_project_activity(
   children_by_parent = _build_descendant_index(summaries)
 
   for cid, summary in summaries.items():
+    # Mark seen_forced before visibility filtering so hidden/subagent turns never hit the fallback
+    is_forced = bool(force_running_cid and cid == force_running_cid)
+    if is_forced:
+      seen_forced = True
     if not isinstance(summary, dict) or not _is_visible_top_level(summary):
       continue
 
@@ -1825,10 +1830,6 @@ def compute_project_activity(
 
     if not pid or pid not in known_projects:
       continue
-
-    is_forced = bool(force_running_cid and cid == force_running_cid)
-    if is_forced:
-      seen_forced = True
 
     bucket, _ = resolve_conversation_activity(
         cid,
@@ -1973,17 +1974,68 @@ def clear_all_badges(
       fcntl.flock(lock_f, fcntl.LOCK_UN)
 
 
+# Track script mtime so long-lived watcher daemons self-replace after on-disk updates
+def _script_mtime_ns(path: str | None = None) -> int:
+  try:
+    return os.stat(path or os.path.abspath(__file__)).st_mtime_ns
+  except OSError:
+    return 0
+
+
+def _is_watcher_lock_stale(lock_content: str, current_mtime_ns: int) -> tuple[bool, int]:
+  """Returns `(is_stale, holder_pid)` from the watcher lock file content."""
+  raw = (lock_content or "").strip()
+  if not raw or current_mtime_ns <= 0:
+    return False, 0
+  try:
+    data = json.loads(raw)
+    if isinstance(data, dict):
+      pid = int(data.get("pid") or 0)
+      mtime_ns = int(data.get("mtime_ns") or 0)
+      return (pid > 0 and mtime_ns != current_mtime_ns), pid
+  except (ValueError, TypeError):
+    pass
+  # Legacy lock files wrote only the PID without mtime_ns and therefore run outdated code
+  try:
+    pid = int(raw)
+    return (pid > 0), pid
+  except ValueError:
+    return False, 0
+
+
 def run_watcher_loop(projects_dir: str = DEFAULT_PROJECTS_DIR) -> None:
   """Runs a singleton background polling loop until all projects are idle and read."""
-  lock_f = open(_watcher_lock_path(), "w", encoding="utf-8")
+  script_path = os.path.abspath(__file__)
+  initial_mtime_ns = _script_mtime_ns(script_path)
+  # Open with a+ so contending processes never truncate the lock holder's PID/mtime
+  lock_f = open(_watcher_lock_path(), "a+", encoding="utf-8")
   try:
     fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
   except BlockingIOError:
-    lock_f.close()
-    return
+    # Preempt a lock holder that started before the script on disk was modified
+    try:
+      lock_f.seek(0)
+      is_stale, holder_pid = _is_watcher_lock_stale(
+          lock_f.read(), initial_mtime_ns
+      )
+      if is_stale and holder_pid > 0 and holder_pid != os.getpid():
+        os.kill(holder_pid, signal.SIGTERM)
+        time.sleep(0.1)
+        fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      else:
+        lock_f.close()
+        return
+    except (BlockingIOError, OSError, ProcessLookupError, PermissionError):
+      lock_f.close()
+      return
 
+  reexec_needed = False
   try:
-    lock_f.write(str(os.getpid()))
+    lock_f.seek(0)
+    lock_f.truncate()
+    lock_f.write(
+        json.dumps({"pid": os.getpid(), "mtime_ns": initial_mtime_ns})
+    )
     lock_f.flush()
     start_ts = time.monotonic()
     idle_streak = 0
@@ -1991,6 +2043,10 @@ def run_watcher_loop(projects_dir: str = DEFAULT_PROJECTS_DIR) -> None:
 
     while (time.monotonic() - start_ts) < MAX_WATCH_DURATION_SEC:
       time.sleep(WATCH_POLL_INTERVAL_SEC)
+      # Abort before sync_once if the script changed on disk so stale bytecode never writes badges
+      if initial_mtime_ns and _script_mtime_ns(script_path) != initial_mtime_ns:
+        reexec_needed = True
+        break
       rpc_ok, total_tracked, _ = sync_once(projects_dir=projects_dir)
       if not rpc_ok:
         rpc_fail_streak += 1
@@ -2013,6 +2069,16 @@ def run_watcher_loop(projects_dir: str = DEFAULT_PROJECTS_DIR) -> None:
     except OSError:
       pass
     lock_f.close()
+
+  # Re-exec after releasing the lock so the new process loads updated definitions from disk
+  if reexec_needed:
+    try:
+      os.execv(
+          sys.executable,
+          [sys.executable, script_path, "--watch", "--projects-dir", projects_dir],
+      )
+    except OSError:
+      pass
 
 
 def spawn_detached_trigger(

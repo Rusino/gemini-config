@@ -1301,6 +1301,106 @@ class TestProjectActivityBadge(unittest.TestCase):
     state, detail = badge.evaluate_trajectory_status(traj)
     self.assertEqual(state, "idle")
 
+  def test_force_running_cid_on_hidden_or_subagent_does_not_inflate_running(self):
+    known_projects = {"proj-1": ("/fake/p1.json", {"name": "Test Project"})}
+    summaries = {
+        "c-hidden": {
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "trajectoryMetadata": {
+                "projectId": "proj-1",
+                "sourceMetadata": {"hideFromConversationList": True},
+            },
+        },
+        "c-tool": {
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "trajectoryMetadata": {
+                "projectId": "proj-1",
+                "sourceMetadata": {"tool": "agentapi"},
+            },
+        },
+        "c-subagent": {
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "trajectoryMetadata": {
+                "projectId": "proj-1",
+                "parentConversationId": "c-parent",
+            },
+        },
+        "c-battle-fork": {
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "trajectoryMetadata": {
+                "projectId": "proj-1",
+                "isBattleModeFork": True,
+            },
+        },
+        "c-archived": {
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "annotations": {"archived": True},
+            "trajectoryMetadata": {"projectId": "proj-1"},
+        },
+    }
+    for non_visible_cid in summaries:
+      running, blocked, unread = badge.compute_project_activity(
+          summaries,
+          known_projects,
+          [],
+          force_running_cid=non_visible_cid,
+          force_running_project_id="proj-1",
+      )
+      self.assertEqual(
+          running, {}, f"Unexpected running count for {non_visible_cid}"
+      )
+      self.assertEqual(blocked, {})
+      self.assertEqual(unread, {})
+
+  def test_hide_from_conversation_list_excluded_from_unread_and_viewing_cid(self):
+    summaries = {
+        "c-hidden": {
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "lastModifiedTime": "2026-10-29T21:40:00Z",
+            "annotations": {
+                "markedAsUnread": True,
+                "lastUserViewTime": "2026-10-29T21:50:00Z",
+            },
+            "trajectoryMetadata": {
+                "sourceMetadata": {"hideFromConversationList": True},
+            },
+        },
+        "c-visible": {
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "lastModifiedTime": "2026-10-29T21:30:00Z",
+            "annotations": {
+                "lastUserViewTime": "2026-10-29T21:35:00Z",
+            },
+            "trajectoryMetadata": {},
+        },
+    }
+    self.assertFalse(badge.is_conversation_unread("c-hidden", summaries["c-hidden"]))
+    with tempfile.TemporaryDirectory() as tmpdir:
+      cur_cid, _ = badge.resolve_currently_viewing_cid(
+          summaries,
+          annotations_dir=tmpdir,
+          state_file=os.path.join(tmpdir, "view.json"),
+      )
+      self.assertEqual(cur_cid, "c-visible")
+
+  def test_is_watcher_lock_stale(self):
+    self.assertEqual(
+        badge._is_watcher_lock_stale('{"pid": 1234, "mtime_ns": 100}', 200),
+        (True, 1234),
+    )
+    self.assertEqual(
+        badge._is_watcher_lock_stale('{"pid": 1234, "mtime_ns": 200}', 200),
+        (False, 1234),
+    )
+    self.assertEqual(
+        badge._is_watcher_lock_stale("5678\n", 200),
+        (True, 5678),
+    )
+    self.assertEqual(
+        badge._is_watcher_lock_stale("", 200),
+        (False, 0),
+    )
+
 
 if __name__ == "__main__":
   unittest.main()
