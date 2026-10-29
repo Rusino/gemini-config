@@ -335,10 +335,98 @@
     ['gemini-2.5-flash-thinking', 'Gemini 2.5 Flash (Thinking)', '2.5'],
     ['gemini-2.5-flash', 'Gemini 2.5 Flash', '2.5'],
     ['gemini-2.5-flash-lite', 'Gemini 2.5 Flash Lite', '2.5'],
+    ['opus-5.5-medium', 'Claude Opus 5.5 (Medium)', 'WTU'],
+    ['gemini-pro-coordinator', 'Gemini Pro Orchestrator', 'Pro'],
   ];
   const CURATED_HIDDEN_MODEL_MAP = new Map(
     CURATED_HIDDEN_MODELS.map(([id, label, tag]) => [id, { label, tag }])
   );
+
+  // Two-threshold quota autopilot floors and floating notification toast ID (R71.2)
+  const QUOTA_SOFT_FLOOR = 0.30;
+  const QUOTA_HARD_FLOOR = 0.15;
+  const EMERGENCY_PIN_FLOOR = 0.05;
+  const AUTOPILOT_TOAST_ID = 'jetski-model-autopilot-toast';
+  let autopilotToastTimer = 0;
+  // Remembers conversations (and '__draft__') where the user manually picked a model
+  const manualPickedModels = (window.__jetskiManualPickedModels ||= new Map());
+  // Tracks the last project profile key auto-seeded for a draft or conversation
+  const autoSeededTargets = new Map();
+
+  const PROJECT_MODEL_PROFILES = {
+    // triage profile
+    '3f5b7a12-8e5f-47d2-a2f4-d644447c86a8': 'triage',
+    'skia-g3-roll-check': 'triage',
+    '52d8efe1-4a60-4325-b9f8-4c02156f8a25': 'triage',
+    'debug_skia_roll_issue': 'triage',
+    // cpp-core profile
+    '1a021a3a-e0f3-4f85-ab21-42cfba6cf4d4': 'cpp-core',
+    'chromium': 'cpp-core',
+    '9571f9cb-06ce-4b6b-9a5d-9aa1ab55c52a': 'cpp-core',
+    'lazy android': 'cpp-core',
+    '42497f18-ff9d-4fd5-9e8b-e666147873c9': 'cpp-core',
+    'textclusters api': 'cpp-core',
+    '8acb67c4-2cb7-43ca-ba04-dc547b3c4788': 'cpp-core',
+    'skparagraph': 'cpp-core',
+    '9b93560e-8b7f-4b1c-9dfd-8290e4884541': 'cpp-core',
+    'skia': 'cpp-core',
+    '100deebd-72df-4dbe-a33a-aae6712f994e': 'cpp-core',
+    'skoretext': 'cpp-core',
+    'dc42bd7d-5c00-4416-9365-00cb2a59acaa': 'cpp-core',
+    'skglyphid to 32 bits': 'cpp-core',
+    '83acaa3f-d7d7-412d-9d07-d33229f9a45b': 'cpp-core',
+    'typescript webparagraph': 'cpp-core',
+    '2f999b18-d1cd-4eb5-9bdd-1c8fe328762e': 'cpp-core',
+    'webparagraph': 'cpp-core',
+    'bedf614c-197e-4ca3-b2d0-48b9def664c3': 'cpp-core',
+    'text editor': 'cpp-core',
+    // orchestrator profile
+    '04508c43-54a0-4003-8051-7129cd997b88': 'orchestrator',
+    'improving experience': 'orchestrator',
+    '5a2a0f80-96c2-4334-a58d-7631310d4f72': 'orchestrator',
+    'flight deck': 'orchestrator',
+    '1c95149f-2787-4209-976d-350eb2a6532c': 'orchestrator',
+    'code review organizer': 'orchestrator',
+    'e914e1c4-006a-433c-8270-52eff8775667': 'orchestrator',
+    'skia gardener': 'orchestrator',
+    'a29f214d-9fb4-46fd-a8f6-7d60a7e2aaa3': 'orchestrator',
+    'breaking chats': 'orchestrator',
+  };
+
+  const WEB_MODEL_PROFILES = {
+    'cpp-core': [
+      'opus-5.5-high-bon-le',
+      'opus-5.5-medium',
+      'opus-5.5-max-bon-le',
+      'opus-5.5-high',
+      'sonnet-5.5-high-bon-le',
+      'sonnet-5.5-bon-le',
+      'bon-experiment-arm-226',
+      'gemini-pro-coordinator',
+      'auto',
+    ],
+    'orchestrator': [
+      'gemini-pro-coordinator',
+      'bon-experiment-arm-226',
+      'auto',
+      'sonnet-5.5-high-bon-le',
+      'sonnet-5.5-bon-le',
+      'gemini-flash-next',
+      'gemini-3.8-flash-high',
+      'gemini-3.8-flash-medium',
+      'gemini-2.5-flash',
+      'gemini-3.1-pro-high',
+    ],
+    'triage': [
+      'gemini-flash-next',
+      'gemini-3.8-flash-high',
+      'gemini-3.8-flash-medium',
+      'gemini-2.5-flash',
+      'gemini-3.5-flash-lite',
+      'gemini-pro-coordinator',
+      'auto',
+    ],
+  };
 
   function isActiveRunStatus(status) {
     return ACTIVE_RUN_STATUSES.has(status);
@@ -1959,18 +2047,80 @@
   // playAgentSound fetches the chime file before playing it and gives up on a non-ok
   // response, so failing that fetch drops one chime without touching its 2s quiet window.
   // One shared gate serves every injection; window.__jetskiAgentSoundMuted opens and closes it
+  // Gates sound chime fetches and rewrites exhausted model payloads on ConnectRPC requests
   const AGENT_SOUND_URL_RE = /\.(?:mp3|wav|ogg)(?:[?#]|$)/i;
   function installAgentSoundGate() {
     const innerFetch = window.fetch;
-    if (typeof innerFetch !== 'function' || innerFetch.__jetskiSoundGate) return;
+    if (typeof innerFetch !== 'function') return;
+    const baseFetch = innerFetch.__jetskiOrigFetch || innerFetch;
     const gatedFetch = function (input, init) {
       const url = typeof input === 'string' ? input : input?.url || String(input || '');
       if (window.__jetskiAgentSoundMuted > 0 && AGENT_SOUND_URL_RE.test(url)) {
         return Promise.resolve({ ok: false, status: 204 });
       }
-      return innerFetch.call(window, input, init);
+      let nextInit = init;
+      if (
+        !disposed &&
+        reduxStore &&
+        typeof init?.body === 'string' &&
+        (url.includes('/SendUserCascadeMessage') || url.includes('/StartCascade'))
+      ) {
+        try {
+          const body = JSON.parse(init.body);
+          const planModel = body?.cascadeConfig?.plannerConfig?.planModel;
+          if (planModel !== undefined && planModel !== null) {
+            const catalog = buildModelCatalogIndex(reduxStore);
+            const entry =
+              typeof planModel === 'number'
+                ? catalog.byEnum.get(planModel)
+                : catalog.byId.get(String(planModel).toLowerCase());
+            const cid =
+              body.cascadeId ||
+              reduxStore.getState()?.conversation?.cascadeId ||
+              '__draft__';
+            const isPinned = Boolean(
+              entry?.enumVal && manualPickedModels.get(cid) === entry.enumVal
+            );
+            let replacement = null;
+            let reason = '';
+            if (entry && entry.quota < (isPinned ? EMERGENCY_PIN_FLOOR : QUOTA_HARD_FLOOR)) {
+              const profile =
+                resolveProjectProfileForConversation(reduxStore, body.cascadeId) ||
+                'orchestrator';
+              replacement = resolveAutopilotModelForProfile(catalog, profile);
+              reason = `${Math.round(entry.quota * 100)}% quota`;
+            } else if (!isPinned) {
+              const shielded = rerouteWastefulWtuModelInUi(catalog, planModel, QUOTA_SOFT_FLOOR);
+              if (shielded) {
+                replacement = shielded;
+                reason = 'WTU shield';
+              }
+            }
+            if (replacement && replacement.enumVal && replacement.enumVal !== entry?.enumVal) {
+              const nextPlanModel =
+                typeof planModel === 'number'
+                  ? replacement.enumVal
+                  : replacement.enumName ||
+                    (replacement.enumVal >= 1000
+                      ? `MODEL_PLACEHOLDER_M${replacement.enumVal - 1000}`
+                      : planModel);
+              body.cascadeConfig.plannerConfig.planModel = nextPlanModel;
+              nextInit = { ...init, body: JSON.stringify(body) };
+              showAutopilotToast(
+                entry?.label || String(planModel),
+                replacement.label,
+                reason
+              );
+            }
+          }
+        } catch {
+          // Keep untouched request options on malformed payload
+        }
+      }
+      return baseFetch.call(window, input, nextInit);
     };
     gatedFetch.__jetskiSoundGate = true;
+    gatedFetch.__jetskiOrigFetch = baseFetch;
     window.fetch = gatedFetch;
   }
 
@@ -2046,6 +2196,31 @@
     return `resets in ${mins}m`;
   }
 
+  // Computes effective remaining quota fraction [0.0, 1.0] handling Protobuf3 0.0 omission
+  function getEffectiveQuotaFraction(quotaInfo, tagTitle, tagDescription, nowMs) {
+    const rawTitle = typeof tagTitle === 'string' ? tagTitle.trim() : '';
+    const rawDesc = typeof tagDescription === 'string' ? tagDescription.trim() : '';
+    if (
+      rawTitle === 'OneQuota' ||
+      rawDesc.includes('OneQuota') ||
+      !quotaInfo ||
+      typeof quotaInfo !== 'object'
+    ) {
+      return 1.0;
+    }
+    const now = typeof nowMs === 'number' ? nowMs : Date.now();
+    const resetMs = parseQuotaResetMs(quotaInfo.resetTime);
+    if (resetMs > 0 && resetMs <= now) {
+      return 1.0;
+    }
+    const rawFrac = quotaInfo.remainingFraction;
+    if (rawFrac === undefined || rawFrac === null) {
+      return resetMs > now ? 0.0 : 1.0;
+    }
+    const numFrac = Number(rawFrac);
+    return Number.isFinite(numFrac) ? Math.max(0, Math.min(1, numFrac)) : 0.0;
+  }
+
   // Formats live quota percentage pill and tooltip description for a model
   function formatModelQuotaTag(baseTagTitle, baseTagDescription, modelId, quotaInfo) {
     const rawTitle = typeof baseTagTitle === 'string' ? baseTagTitle.trim() : '';
@@ -2058,10 +2233,12 @@
     ) {
       return { tagTitle: rawTitle, tagDescription: rawDesc };
     }
-    const rawFrac = Number(quotaInfo.remainingFraction ?? 0);
-    const clampedFrac = Number.isFinite(rawFrac) ? Math.max(0, Math.min(1, rawFrac)) : 0;
     const resetMs = parseQuotaResetMs(quotaInfo.resetTime);
-    const pct = resetMs > 0 && resetMs <= Date.now() ? 100 : Math.round(clampedFrac * 100);
+    if (quotaInfo.remainingFraction === undefined && !resetMs) {
+      return { tagTitle: rawTitle, tagDescription: rawDesc };
+    }
+    const frac = getEffectiveQuotaFraction(quotaInfo, rawTitle, rawDesc);
+    const pct = Math.round(frac * 100);
     const tagTitle = rawTitle ? `${rawTitle} · ${pct}%` : `${pct}%`;
     const resetText = formatQuotaResetRemaining(resetMs);
     const descParts = [`${pct}% quota left`];
@@ -2080,7 +2257,18 @@
         : null;
     const quotaObj = qProto && qProto !== Object.prototype ? Object.create(qProto) : {};
     quotaObj.$typeName = 'exa.codeium_common_pb.QuotaInfo';
-    quotaObj.remainingFraction = Number(rawQuotaInfo.remainingFraction ?? 0);
+
+    const resetMs = parseQuotaResetMs(rawQuotaInfo.resetTime);
+    const rawFrac = rawQuotaInfo.remainingFraction;
+    const effectiveFrac =
+      rawFrac !== undefined && rawFrac !== null
+        ? Number(rawFrac)
+        : resetMs > Date.now()
+        ? 0
+        : 1;
+    quotaObj.remainingFraction = Number.isFinite(effectiveFrac)
+      ? Math.max(0, Math.min(1, effectiveFrac))
+      : 0;
 
     const rawReset = rawQuotaInfo.resetTime;
     if (typeof rawReset === 'string') {
@@ -2101,6 +2289,349 @@
       quotaObj.resetTime = rawReset;
     }
     return quotaObj;
+  }
+
+  // Indexes models from clientModelConfigs and availableModelsCache
+  function buildModelCatalogIndex(store) {
+    const byId = new Map();
+    const byEnum = new Map();
+
+    const addEntry = (entry) => {
+      if (!entry) return;
+      if (entry.modelId) byId.set(entry.modelId.toLowerCase(), entry);
+      if (entry.enumVal) byEnum.set(entry.enumVal, entry);
+      if (entry.enumName) byId.set(entry.enumName.toLowerCase(), entry);
+    };
+
+    const modelsMap = availableModelsCache?.models;
+    if (modelsMap && typeof modelsMap === 'object') {
+      for (const [mid, det] of Object.entries(modelsMap)) {
+        if (!det || typeof det !== 'object') continue;
+        const enumVal = resolveModelEnumValue(det.model);
+        const curated = CURATED_HIDDEN_MODEL_MAP.get(mid);
+        const label = curated?.label || det.displayName || humanizeModelId(mid);
+        const quota = getEffectiveQuotaFraction(det.quotaInfo, curated?.tag || '', '');
+        addEntry({
+          modelId: mid,
+          enumVal,
+          enumName: det.model || '',
+          label,
+          quota,
+        });
+      }
+    }
+
+    const configs = store?.getState()?.userStatus?.cascadeModelConfigData?.clientModelConfigs;
+    if (Array.isArray(configs)) {
+      for (const cfg of configs) {
+        if (!cfg) continue;
+        const mid = cfg.modelId || '';
+        const numVal = cfg.modelOrAlias?.choice?.value;
+        const enumVal = typeof numVal === 'number' ? numVal : 0;
+        const label = cfg.label || mid;
+        const quota = getEffectiveQuotaFraction(cfg.quotaInfo, cfg.tagTitle, cfg.tagDescription);
+        const prev = (mid && byId.get(mid.toLowerCase())) || (enumVal && byEnum.get(enumVal));
+        const entry = {
+          modelId: mid || prev?.modelId || '',
+          enumVal: enumVal || prev?.enumVal || 0,
+          enumName:
+            prev?.enumName || (enumVal >= 1000 ? `MODEL_PLACEHOLDER_M${enumVal - 1000}` : ''),
+          label,
+          quota,
+        };
+        addEntry(entry);
+      }
+    }
+
+    return { byId, byEnum };
+  }
+
+  // Reroutes wasteful WTU models to request-counted or Orchestrator pools
+  function rerouteWastefulWtuModelInUi(catalog, modelKey, minFloor = QUOTA_SOFT_FLOOR) {
+    if (!catalog || modelKey === undefined || modelKey === null) return null;
+    const entry =
+      typeof modelKey === 'number'
+        ? catalog.byEnum.get(modelKey)
+        : catalog.byId.get(String(modelKey).toLowerCase());
+    const id = (entry?.modelId || String(modelKey)).toLowerCase();
+    const enumStr = (entry?.enumName || String(modelKey)).toLowerCase();
+    const numVal = entry?.enumVal || (typeof modelKey === 'number' ? modelKey : 0);
+
+    // Non-BoN Fable 5.1 -> Opus 5.5
+    const isFable =
+      id === 'fable-5.1-dropdown' ||
+      (id.startsWith('fable-5.1') && !id.includes('-bon-le')) ||
+      numVal === 1388 ||
+      numVal === 1386 ||
+      numVal === 1387 ||
+      enumStr === 'model_placeholder_m388' ||
+      enumStr === 'model_placeholder_m386' ||
+      enumStr === 'model_placeholder_m387';
+    if (isFable) {
+      for (const cand of [
+        'opus-5.5-high-bon-le',
+        'opus-5.5-max-bon-le',
+        'opus-5.5-medium',
+        'opus-5.5-high',
+      ]) {
+        const hit = catalog.byId.get(cand);
+        if (hit && hit.quota >= minFloor) return hit;
+      }
+    }
+
+    // Gemini 4 Argon WTU -> Gemini Pro Orchestrator / Carbon-G
+    const isArgon =
+      id.startsWith('gemini-launch-candidate') ||
+      numVal === 1393 ||
+      (numVal >= 1416 && numVal <= 1418) ||
+      enumStr === 'model_placeholder_m393' ||
+      enumStr === 'model_placeholder_m416' ||
+      enumStr === 'model_placeholder_m417' ||
+      enumStr === 'model_placeholder_m418';
+    if (isArgon) {
+      for (const cand of ['gemini-pro-coordinator', 'bon-experiment-arm-226', 'auto']) {
+        const hit = catalog.byId.get(cand);
+        if (hit && hit.quota >= minFloor) return hit;
+      }
+    }
+
+    // Gemini 4 Carbon WTU -> Gemini 4 Carbon-G
+    const isCarbon =
+      (id.startsWith('gemini-4-carbon') && !id.includes('-g')) ||
+      (numVal >= 1439 && numVal <= 1442) ||
+      (enumStr >= 'model_placeholder_m439' && enumStr <= 'model_placeholder_m442');
+    if (isCarbon) {
+      for (const cand of ['bon-experiment-arm-226', 'gemini-pro-coordinator', 'auto']) {
+        const hit = catalog.byId.get(cand);
+        if (hit && hit.quota >= minFloor) return hit;
+      }
+    }
+
+    return null;
+  }
+
+  // Resolves the best available healthy model for a project profile
+  function resolveAutopilotModelForProfile(
+    catalog,
+    profileName,
+    softFloor = QUOTA_SOFT_FLOOR,
+    hardFloor = QUOTA_HARD_FLOOR
+  ) {
+    if (!catalog) return null;
+    const p = String(profileName || 'orchestrator')
+      .trim()
+      .toLowerCase()
+      .replace(/^profile:/, '');
+
+    if (p === 'cpp-core') {
+      const hitBon =
+        catalog.byId.get('opus-5.5-high-bon-le') || catalog.byId.get('opus-5.5-max-bon-le');
+      const hitWtu = catalog.byId.get('opus-5.5-medium') || catalog.byId.get('opus-5.5-high');
+      const qBon = hitBon ? hitBon.quota : 0;
+      const qWtu = hitWtu ? hitWtu.quota : 0;
+      if ((hitBon && qBon >= softFloor) || (hitWtu && qWtu >= softFloor)) {
+        if (hitWtu && qWtu > qBon + 0.05 && qWtu >= softFloor) return hitWtu;
+        if (hitBon && qBon >= softFloor) return hitBon;
+        if (hitWtu) return hitWtu;
+      }
+    }
+
+    if (p === 'triage') {
+      const hitFlash25 =
+        catalog.byId.get('gemini-2.5-flash') || catalog.byId.get('gemini-3.5-flash-lite');
+      const hitFlashNext =
+        catalog.byId.get('gemini-flash-next') ||
+        catalog.byId.get('gemini-3.8-flash-high') ||
+        catalog.byId.get('gemini-3.8-flash-medium');
+      const q25 = hitFlash25 ? hitFlash25.quota : 0;
+      const qNext = hitFlashNext ? hitFlashNext.quota : 0;
+      if ((hitFlash25 && q25 >= softFloor) || (hitFlashNext && qNext >= softFloor)) {
+        if (hitFlash25 && q25 > qNext + 0.05 && q25 >= softFloor) return hitFlash25;
+        if (hitFlashNext && qNext >= softFloor) return hitFlashNext;
+        if (hitFlash25) return hitFlash25;
+      }
+    }
+
+    const chain = WEB_MODEL_PROFILES[p] || WEB_MODEL_PROFILES.orchestrator;
+    for (const mid of chain) {
+      const hit = catalog.byId.get(mid);
+      if (hit && hit.quota >= softFloor) return hit;
+    }
+
+    const candidates = [];
+    for (const mid of chain) {
+      const hit = catalog.byId.get(mid);
+      if (hit) candidates.push(hit);
+    }
+    if (candidates.length > 0) {
+      candidates.sort((a, b) => (b.quota || 0) - (a.quota || 0));
+      if (candidates[0].quota >= hardFloor) return candidates[0];
+      return candidates[0];
+    }
+
+    return catalog.byId.get('auto') || catalog.byEnum.values().next().value || null;
+  }
+
+  // Finds project profile ('cpp-core', 'triage', 'orchestrator') for a conversation or route
+  function resolveProjectProfileForConversation(store, cascadeId) {
+    const summariesMap = store?.getState()?.trajectorySummaries?.summaries;
+    let projectId = cascadeId && summariesMap?.[cascadeId]?.trajectoryMetadata?.projectId;
+
+    if (!projectId) {
+      const search = window.location?.search || '';
+      const m = /[?&]section=([a-zA-Z0-9_-]+)/.exec(search);
+      if (m) projectId = m[1];
+    }
+    if (!projectId) {
+      projectId = store?.getState()?.projects?.activeProjectId;
+    }
+
+    if (projectId) {
+      const cleanId = String(projectId).trim().toLowerCase();
+      if (PROJECT_MODEL_PROFILES[cleanId]) {
+        return PROJECT_MODEL_PROFILES[cleanId];
+      }
+      let pName = '';
+      const projs = store?.getState()?.projects?.projects;
+      if (Array.isArray(projs)) {
+        const match = projs.find((p) => p && p.id === projectId);
+        pName = match?.name || '';
+      } else if (projs && typeof projs === 'object') {
+        pName = projs[projectId]?.name || '';
+      }
+      if (!pName && roadmapIndexCache?.projects?.[projectId]) {
+        pName = roadmapIndexCache.projects[projectId].name || '';
+      }
+      if (pName) {
+        const cleanName = cleanBaseTitle(pName).toLowerCase();
+        if (PROJECT_MODEL_PROFILES[cleanName]) {
+          return PROJECT_MODEL_PROFILES[cleanName];
+        }
+      }
+    }
+    return projectId ? 'orchestrator' : '';
+  }
+
+  // Shows a transient floating notification toast when autopilot fails over a model
+  function showAutopilotToast(oldLabel, newLabel, reason) {
+    if (disposed || typeof document?.createElement !== 'function') return;
+    let toast = document.getElementById(AUTOPILOT_TOAST_ID);
+    if (!toast) {
+      toast = document.createElement('div');
+      toast.id = AUTOPILOT_TOAST_ID;
+      toast.setAttribute('data-testid', 'jetski-model-autopilot-toast');
+      toast.className = 'jetski-autopilot-toast';
+      document.body?.appendChild(toast);
+    }
+    setAttrIfChanged(toast, 'data-from-model', String(oldLabel || ''));
+    setAttrIfChanged(toast, 'data-to-model', String(newLabel || ''));
+    const reasonText = reason ? ` (${reason})` : '';
+    toast.textContent = `⚡ Autopilot: switched model from ${oldLabel} to ${newLabel}${reasonText}`;
+    if (autopilotToastTimer) {
+      clearTimeout(autopilotToastTimer);
+      autopilotToastTimer = 0;
+    }
+    autopilotToastTimer = setTimeout(() => {
+      autopilotToastTimer = 0;
+      toast?.remove();
+    }, 4500);
+  }
+
+  // Synchronizes project profile defaults on drafts and fails over exhausted models in Redux
+  function syncModelAutopilotInStore(store) {
+    const state = store?.getState();
+    if (!state?.modelSelection) return;
+    const catalog = buildModelCatalogIndex(store);
+    if (catalog.byEnum.size === 0) return;
+
+    let cascadeId =
+      state.conversation?.cascadeId ||
+      state.conversation?.convoState?.cascadeId ||
+      '';
+    if (!cascadeId) {
+      const path = window.location?.pathname || '';
+      const m = /\/(?:c|cascade|conversation)\/([a-zA-Z0-9_-]+)/.exec(path);
+      if (m && m[1]) cascadeId = m[1];
+    }
+
+    const summaries = state.trajectorySummaries?.summaries || {};
+    const summary = cascadeId ? summaries[cascadeId] : null;
+    const stepCount = Number(summary?.stepCount ?? 0);
+    const isDraft = !cascadeId || stepCount === 0;
+    const profile = resolveProjectProfileForConversation(store, cascadeId);
+
+    if (isDraft) {
+      const targetKey = cascadeId || '__draft__';
+      if (manualPickedModels.has(targetKey) || !profile) return;
+      const best = resolveAutopilotModelForProfile(catalog, profile);
+      if (!best || !best.enumVal) return;
+      const curModel = cascadeId
+        ? state.modelSelection.byConversation?.[cascadeId]?.model
+        : state.modelSelection.default?.model;
+      const seedSig = `${profile}:${best.enumVal}`;
+      if (curModel === best.enumVal && autoSeededTargets.get(targetKey) === seedSig) {
+        return;
+      }
+      autoSeededTargets.set(targetKey, seedSig);
+      isInternalDispatch = true;
+      try {
+        store.dispatch({
+          type: 'modelSelection/modelPicked',
+          payload: {
+            conversationId: cascadeId || undefined,
+            model: best.enumVal,
+            ...(cascadeId ? { pick: { atStep: 999999, queuedMessageIds: [] } } : {}),
+          },
+        });
+      } finally {
+        isInternalDispatch = false;
+      }
+      return;
+    }
+
+    const curModel =
+      state.modelSelection.byConversation?.[cascadeId]?.model ??
+      state.modelSelection.default?.model;
+    if (!curModel) return;
+    const curEntry = catalog.byEnum.get(curModel);
+    const isPinned = manualPickedModels.get(cascadeId) === curModel;
+
+    let replacement = null;
+    let reason = '';
+    if (curEntry && curEntry.quota < (isPinned ? EMERGENCY_PIN_FLOOR : QUOTA_HARD_FLOOR)) {
+      replacement = resolveAutopilotModelForProfile(
+        catalog,
+        profile || 'orchestrator'
+      );
+      reason = `${Math.round(curEntry.quota * 100)}% quota`;
+    } else if (!isPinned) {
+      const shielded = rerouteWastefulWtuModelInUi(catalog, curModel, QUOTA_SOFT_FLOOR);
+      if (shielded) {
+        replacement = shielded;
+        reason = 'WTU shield';
+      }
+    }
+
+    if (replacement && replacement.enumVal && replacement.enumVal !== curModel) {
+      isInternalDispatch = true;
+      try {
+        store.dispatch({
+          type: 'modelSelection/modelPicked',
+          payload: {
+            conversationId: cascadeId,
+            model: replacement.enumVal,
+            pick: { atStep: 999999, queuedMessageIds: [] },
+          },
+        });
+      } finally {
+        isInternalDispatch = false;
+      }
+      showAutopilotToast(
+        curEntry?.label || String(curModel),
+        replacement.label,
+        reason
+      );
+    }
   }
 
   // Strips synthetic unlocked models and restores native tags on cleanup or re-injection
@@ -2215,8 +2746,16 @@
       // Prefer fresher GetUserStatus server quota over cached GetAvailableModels
       const serverQuota =
         cfg.quotaInfo && typeof cfg.quotaInfo === 'object' ? cfg.quotaInfo : null;
-      const quotaObj =
-        serverQuota || buildQuotaInfoObject(templateConfig, modelsMap?.[cfg.modelId]?.quotaInfo);
+      let quotaObj = serverQuota;
+      if (
+        serverQuota &&
+        (serverQuota.remainingFraction === undefined || serverQuota.remainingFraction === null) &&
+        parseQuotaResetMs(serverQuota.resetTime) > 0
+      ) {
+        quotaObj = buildQuotaInfoObject(templateConfig, serverQuota);
+      } else if (!serverQuota) {
+        quotaObj = buildQuotaInfoObject(templateConfig, modelsMap?.[cfg.modelId]?.quotaInfo);
+      }
       const { tagTitle, tagDescription } = formatModelQuotaTag(
         cfg.tagTitle,
         cfg.tagDescription,
@@ -2425,6 +2964,7 @@
     );
     const hasUnlocked = curConfigs.some((c) => c && c.__jetskiUnlockedModel === true);
     if (cacheFresh && hasUnlocked && lastAppliedModelsFetchedAt === availableModelsFetchedAt) {
+      syncModelAutopilotInStore(store);
       return;
     }
 
@@ -2435,10 +2975,16 @@
     const latestConfigs = latestStatus?.cascadeModelConfigData?.clientModelConfigs;
     if (!Array.isArray(latestConfigs) || latestConfigs.length === 0) return;
     const latestHasUnlocked = latestConfigs.some((c) => c && c.__jetskiUnlockedModel === true);
-    if (latestHasUnlocked && lastAppliedModelsFetchedAt === availableModelsFetchedAt) return;
+    if (latestHasUnlocked && lastAppliedModelsFetchedAt === availableModelsFetchedAt) {
+      syncModelAutopilotInStore(store);
+      return;
+    }
 
     const enriched = enrichUserStatusWithHiddenModels(latestStatus, payload);
-    if (enriched === latestStatus) return;
+    if (enriched === latestStatus) {
+      syncModelAutopilotInStore(store);
+      return;
+    }
     lastAppliedModelsFetchedAt = availableModelsFetchedAt;
 
     isInternalDispatch = true;
@@ -2450,6 +2996,7 @@
     } finally {
       isInternalDispatch = false;
     }
+    syncModelAutopilotInStore(store);
   }
 
   function hookReduxStore(store) {
@@ -2477,6 +3024,94 @@
           ...action,
           payload: enrichUserStatusWithHiddenModels(action.payload, availableModelsCache),
         });
+      }
+      // Track manual model picks and rescue emergency exhausted picks (< 5% quota)
+      if (
+        !isInternalDispatch &&
+        action?.type === 'modelSelection/modelPicked' &&
+        action.payload
+      ) {
+        const cid = action.payload.conversationId || '__draft__';
+        const pickedModel = action.payload.model;
+        const catalog = buildModelCatalogIndex(store);
+        const entry = catalog.byEnum.get(pickedModel);
+        if (entry && entry.quota < EMERGENCY_PIN_FLOOR) {
+          const profile =
+            resolveProjectProfileForConversation(store, action.payload.conversationId) ||
+            'orchestrator';
+          const rescue = resolveAutopilotModelForProfile(catalog, profile);
+          if (rescue && rescue.enumVal && rescue.enumVal !== pickedModel) {
+            manualPickedModels.set(cid, rescue.enumVal);
+            showAutopilotToast(
+              entry.label,
+              rescue.label,
+              `${Math.round(entry.quota * 100)}% exhausted`
+            );
+            return origDispatch.call(this, {
+              ...action,
+              payload: { ...action.payload, model: rescue.enumVal },
+            });
+          }
+        }
+        if (pickedModel) {
+          manualPickedModels.set(cid, pickedModel);
+        }
+      }
+      // Fail over exhausted trajectory models and shield wasteful WTU runs
+      if (
+        !isInternalDispatch &&
+        action?.type === 'modelSelection/trajectoryModelObserved' &&
+        action.payload
+      ) {
+        const cid = action.payload.conversationId;
+        const obsModel = action.payload.model;
+        const catalog = buildModelCatalogIndex(store);
+        const obsEntry = catalog.byEnum.get(obsModel);
+        const isPinned = Boolean(cid && manualPickedModels.get(cid) === obsModel);
+        let replacement = null;
+        let reason = '';
+        if (obsEntry && obsEntry.quota < (isPinned ? EMERGENCY_PIN_FLOOR : QUOTA_HARD_FLOOR)) {
+          const profile =
+            resolveProjectProfileForConversation(store, cid) || 'orchestrator';
+          replacement = resolveAutopilotModelForProfile(catalog, profile);
+          reason = `${Math.round(obsEntry.quota * 100)}% quota`;
+        } else if (!isPinned) {
+          const shielded = rerouteWastefulWtuModelInUi(catalog, obsModel, QUOTA_SOFT_FLOOR);
+          if (shielded) {
+            replacement = shielded;
+            reason = 'WTU shield';
+          }
+        }
+        if (replacement && replacement.enumVal && replacement.enumVal !== obsModel) {
+          showAutopilotToast(
+            obsEntry?.label || action.payload.label || String(obsModel),
+            replacement.label,
+            reason
+          );
+          if (cid) {
+            isInternalDispatch = true;
+            try {
+              store.dispatch({
+                type: 'modelSelection/modelPicked',
+                payload: {
+                  conversationId: cid,
+                  model: replacement.enumVal,
+                  pick: { atStep: 999999, queuedMessageIds: [] },
+                },
+              });
+            } finally {
+              isInternalDispatch = false;
+            }
+          }
+          return origDispatch.call(this, {
+            ...action,
+            payload: {
+              ...action.payload,
+              model: replacement.enumVal,
+              label: replacement.label,
+            },
+          });
+        }
       }
       // Rewrite any open request so keyboard shortcuts or UI triggers cannot open the panel
       if (
@@ -2643,6 +3278,8 @@
     syncOverviewPanelClosed(store);
     // Unlock hidden executable models in Redux userStatus if hydrated after store attach
     void syncHiddenModelsInStore(store);
+    // Synchronize model autopilot defaults and quota failovers
+    syncModelAutopilotInStore(store);
 
     const summariesMap = store.getState()?.trajectorySummaries?.summaries;
     if (!summariesMap) return false;
@@ -3171,6 +3808,29 @@
       }
       .${JUMP_TO_TAIL_BTN_CLASS}:hover {
         background: #aecbfa;
+      }
+      #${AUTOPILOT_TOAST_ID} {
+        position: fixed;
+        bottom: 24px;
+        right: 24px;
+        z-index: 2147483646;
+        padding: 8px 14px;
+        border-radius: 8px;
+        background: var(--background, #1e1e1e);
+        color: var(--foreground, #e8eaed);
+        border: 1px solid rgba(138, 180, 248, 0.45);
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+        font-family: var(
+          --font-sans,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          Roboto,
+          sans-serif
+        );
+        font-size: 12px;
+        font-weight: 500;
+        pointer-events: none;
       }
     ` +
       // Style the collapsible Needs-Reaction inbox widget above the sidebar project list
@@ -6334,6 +6994,7 @@
         target.id === 'jetski-closed-chats-filter-bubble' ||
         target.id === STYLE_ID ||
         target.id === STAR_TOOLTIP_ID ||
+        target.id === AUTOPILOT_TOAST_ID ||
         target.className === BAR_CLASS ||
         // Ignore mutations on the Needs-Reaction inbox container itself
         target.className === INBOX_CLASS ||
@@ -6363,6 +7024,7 @@
             target.closest(`.${LOCATE_BTN_CLASS}`) ||
             target.closest(`.${CHAIN_STARS_GROUP_CLASS}`) ||
             target.closest(`.${ARCHIVE_BANNER_CLASS}`) ||
+            target.closest(`#${AUTOPILOT_TOAST_ID}`) ||
             target.closest(`#${SEARCH_PANEL_ID}`)))
       ) {
         return false;
@@ -6414,6 +7076,12 @@
     contextUsageCache.clear();
     trajectoryStatusCache.clear();
     singleTrajCache.clear();
+    if (autopilotToastTimer) {
+      clearTimeout(autopilotToastTimer);
+      autopilotToastTimer = 0;
+    }
+    manualPickedModels.clear();
+    autoSeededTargets.clear();
     // Remove all injected filter buttons, search panels, and chain stars on reload
     const cleanupSelector = [
       `.${BAR_CLASS}`,
@@ -6431,6 +7099,7 @@
       `.${CHAIN_STARS_GROUP_CLASS}`,
       `.${ARCHIVE_BANNER_CLASS}`,
       `#${STAR_TOOLTIP_ID}`,
+      `#${AUTOPILOT_TOAST_ID}`,
     ].join(', ');
     for (const el of document.querySelectorAll(cleanupSelector)) {
       el.remove();
@@ -6455,6 +7124,10 @@
     const bubble = document.getElementById('jetski-closed-chats-filter-bubble');
     if (bubble) {
       bubble.remove();
+    }
+    const toast = document.getElementById(AUTOPILOT_TOAST_ID);
+    if (toast) {
+      toast.remove();
     }
   };
 

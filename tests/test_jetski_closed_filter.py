@@ -1970,6 +1970,9 @@ class FakeElement {
   closest() { return null; }
   querySelector(s) { return this.querySelectorAll(s)[0] || null; }
   querySelectorAll(s) {
+    if (typeof s === 'string' && s.includes(',')) {
+      return s.split(',').flatMap((p) => this.querySelectorAll(p.trim()));
+    }
     const out = [];
     const visit = (n) => {
       for (const c of n.children) {
@@ -4681,6 +4684,9 @@ class FakeElement {
   closest() { return null; }
   querySelector(s) { return this.querySelectorAll(s)[0] || null; }
   querySelectorAll(s) {
+    if (typeof s === 'string' && s.includes(',')) {
+      return s.split(',').flatMap((p) => this.querySelectorAll(p.trim()));
+    }
     const out = [];
     const visit = (n) => {
       for (const c of n.children) {
@@ -4887,6 +4893,585 @@ eval(code);
         f"Cross-project JS harness failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
     )
     self.assertIn("ALL_CROSS_PROJECT_TESTS_PASSED", res.stdout)
+
+  def test_web_ui_model_autopilot_and_quota_failover(self) -> None:
+    node_bin = find_node_binary()
+    js_path = os.path.join(SCRIPTS_DIR, "jetski_closed_filter.js")
+
+    harness = r"""
+const fs = require('fs');
+const assert = require('assert');
+
+const scriptPath = process.argv[1];
+const code = fs.readFileSync(scriptPath, 'utf8');
+
+class FakeElement {
+  constructor(tagName) {
+    this.tagName = tagName.toUpperCase();
+    this.id = '';
+    this.className = '';
+    this.style = {};
+    this.attributes = new Map();
+    this.children = [];
+    this.parentElement = null;
+    this.listeners = new Map();
+    this._textContent = '';
+    this._innerHTML = '';
+  }
+  get textContent() { return this._textContent; }
+  set textContent(v) { this._textContent = String(v); }
+  get innerHTML() { return this._innerHTML; }
+  set innerHTML(v) { this._innerHTML = String(v); }
+  setAttribute(k, v) {
+    this.attributes.set(k, String(v));
+    if (k === 'id') this.id = String(v);
+    if (k === 'class') this.className = String(v);
+  }
+  getAttribute(k) { return this.attributes.has(k) ? this.attributes.get(k) : null; }
+  hasAttribute(k) { return this.attributes.has(k); }
+  removeAttribute(k) { this.attributes.delete(k); }
+  appendChild(c) {
+    if (c.parentElement) c.remove();
+    c.parentElement = this;
+    this.children.push(c);
+    return c;
+  }
+  insertBefore(c, ref) {
+    if (c === ref) return c;
+    if (c.parentElement) c.remove();
+    c.parentElement = this;
+    const idx = this.children.indexOf(ref);
+    if (idx === -1) this.children.push(c);
+    else this.children.splice(idx, 0, c);
+    return c;
+  }
+  remove() {
+    if (!this.parentElement) return;
+    const i = this.parentElement.children.indexOf(this);
+    if (i !== -1) this.parentElement.children.splice(i, 1);
+    this.parentElement = null;
+  }
+  addEventListener(t, fn) {
+    if (!this.listeners.has(t)) this.listeners.set(t, []);
+    this.listeners.get(t).push(fn);
+  }
+  closest(selector) {
+    let cur = this;
+    while (cur) {
+      if (typeof selector === 'string' && selector.startsWith('#') && cur.id === selector.slice(1)) {
+        return cur;
+      }
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+  querySelector(s) { return this.querySelectorAll(s)[0] || null; }
+  querySelectorAll(s) {
+    if (typeof s === 'string' && s.includes(',')) {
+      return s.split(',').flatMap((p) => this.querySelectorAll(p.trim()));
+    }
+    const out = [];
+    const visit = (n) => {
+      for (const c of n.children) {
+        if (typeof s === 'string') {
+          if (s.startsWith('#') && c.id === s.slice(1)) {
+            out.push(c);
+          } else if (
+            s === 'button[aria-label="Display Options"]' &&
+            c.tagName === 'BUTTON' &&
+            c.getAttribute('aria-label') === 'Display Options'
+          ) {
+            out.push(c);
+          }
+        }
+        visit(c);
+      }
+    };
+    visit(this);
+    return out;
+  }
+}
+
+const docEl = new FakeElement('html');
+const headEl = new FakeElement('head');
+const bodyEl = new FakeElement('body');
+docEl.appendChild(headEl);
+docEl.appendChild(bodyEl);
+const actionRow = new FakeElement('div');
+const displayOptionsBtn = new FakeElement('button');
+displayOptionsBtn.setAttribute('aria-label', 'Display Options');
+actionRow.appendChild(displayOptionsBtn);
+bodyEl.appendChild(actionRow);
+
+const protoMarker = { __isBufProto: true };
+function protoObj(typeName, fields) {
+  return Object.assign(Object.create(protoMarker), { $typeName: typeName, ...fields });
+}
+
+function makeNativeConfig(label, enumVal, modelId, remaining) {
+  const quotaFields = {
+    resetTime: protoObj('google.protobuf.Timestamp', {
+      seconds: 1793447031n,
+      nanos: 0,
+    }),
+  };
+  if (remaining !== undefined) {
+    quotaFields.remainingFraction = remaining;
+  }
+  return protoObj('exa.codeium_common_pb.ClientModelConfig', {
+    label,
+    modelOrAlias: protoObj('exa.codeium_common_pb.ModelOrAlias', {
+      choice: { case: 'model', value: enumVal },
+    }),
+    creditMultiplier: 0,
+    pricingType: 0,
+    disabled: false,
+    supportsImages: true,
+    supportsLegacy: false,
+    isPremium: false,
+    betaWarningMessage: '',
+    isBeta: false,
+    provider: 0,
+    isRecommended: true,
+    allowedTiers: [1, 2],
+    description: '',
+    quotaInfo: protoObj('exa.codeium_common_pb.QuotaInfo', quotaFields),
+    tagTitle: '',
+    tagDescription: '',
+    supportedMimeTypes: { 'image/png': true },
+    supportsThoughtCirculation: false,
+    modelUrl: '',
+    modelId,
+    contextWindowOptions: [],
+  });
+}
+
+function makeServerUserStatus() {
+  const nativeConfigs = [
+    makeNativeConfig('Gemini Pro Next', 1260, 'auto', 0.989),
+    makeNativeConfig('Claude Opus 5.5 (High)', 1370, 'opus-5.5-high', 0.56),
+    makeNativeConfig('Claude Opus 5.5 (Medium)', 1369, 'opus-5.5-medium', 0.56),
+    makeNativeConfig('Claude Fable 5.1 (High)', 1388, 'fable-5.1-dropdown', 0.80),
+    makeNativeConfig('Gemini 4 Argon (High)', 1393, 'gemini-launch-candidate', undefined),
+  ];
+  return protoObj('exa.codeium_common_pb.UserStatus', {
+    cascadeModelConfigData: protoObj('exa.codeium_common_pb.CascadeModelConfigData', {
+      clientModelConfigs: nativeConfigs,
+      clientModelSorts: [
+        protoObj('exa.codeium_common_pb.ClientModelSort', {
+          name: 'Recommended',
+          groups: [
+            protoObj('exa.codeium_common_pb.ClientModelGroup', {
+              groupName: '',
+              modelLabels: nativeConfigs.map((c) => c.label),
+            }),
+          ],
+        }),
+      ],
+      battleModeModelConfigs: [],
+      battleModeModelSorts: [],
+    }),
+  });
+}
+
+const availableModelsPayload = {
+  response: {
+    models: {
+      'auto': {
+        displayName: 'Gemini Pro Next',
+        model: 'MODEL_PLACEHOLDER_M260',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.989, resetTime: '2026-10-30T11:43:51Z' },
+      },
+      'opus-5.5-high': {
+        displayName: 'Claude Opus 5.5 (High)',
+        model: 'MODEL_PLACEHOLDER_M370',
+        apiProvider: 'API_PROVIDER_ANTHROPIC_VERTEX',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.56, resetTime: '2026-10-30T12:00:00Z' },
+      },
+      'opus-5.5-medium': {
+        displayName: 'Claude Opus 5.5 (Medium)',
+        model: 'MODEL_PLACEHOLDER_M369',
+        apiProvider: 'API_PROVIDER_ANTHROPIC_VERTEX',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.56, resetTime: '2026-10-30T12:00:00Z' },
+      },
+      'opus-5.5-high-bon-le': {
+        displayName: 'Gemini Pro Next',
+        model: 'MODEL_PLACEHOLDER_M421',
+        apiProvider: 'API_PROVIDER_ANTHROPIC_VERTEX',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.95, resetTime: '2026-10-30T12:30:00Z' },
+      },
+      'sonnet-5.5-high-bon-le': {
+        displayName: 'Gemini Pro Next',
+        model: 'MODEL_PLACEHOLDER_M420',
+        apiProvider: 'API_PROVIDER_ANTHROPIC_VERTEX',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.72, resetTime: '2026-10-30T12:30:00Z' },
+      },
+      'bon-experiment-arm-226': {
+        displayName: 'Gemini Pro Next',
+        model: 'MODEL_PLACEHOLDER_M226',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.99 },
+      },
+      'gemini-2.5-flash': {
+        displayName: 'Gemini 2.5 Flash',
+        model: 'MODEL_GOOGLE_GEMINI_2_5_FLASH',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.998, resetTime: '2026-10-30T14:00:00Z' },
+      },
+      'gemini-3.8-flash-high': {
+        displayName: 'Gemini 3.8 Flash (High)',
+        model: 'MODEL_PLACEHOLDER_M320',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.50, resetTime: '2026-10-30T14:00:00Z' },
+      },
+      'gemini-launch-candidate': {
+        displayName: 'Gemini 4 Argon (High)',
+        model: 'MODEL_PLACEHOLDER_M393',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+        supportsImages: true,
+        // Protobuf3 JSON omission: future resetTime with omitted remainingFraction means 0.0
+        quotaInfo: { resetTime: '2026-10-30T15:00:00Z' },
+      },
+      'fable-5.1-dropdown': {
+        displayName: 'Claude Fable 5.1 (High)',
+        model: 'MODEL_PLACEHOLDER_M388',
+        apiProvider: 'API_PROVIDER_ANTHROPIC_VERTEX',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.80, resetTime: '2026-10-30T12:00:00Z' },
+      },
+      'expired-model': {
+        displayName: 'Expired Reset',
+        model: 'MODEL_PLACEHOLDER_M111',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.05, resetTime: '2026-10-29T10:00:00Z' },
+      },
+      'unmetered-model': {
+        displayName: 'Unmetered',
+        model: 'MODEL_PLACEHOLDER_M112',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+        supportsImages: true,
+        quotaInfo: {},
+      },
+    },
+    tabModelIds: [],
+    imageGenerationModelIds: [],
+    audioTranscriptionModelIds: [],
+    deprecatedModelIds: {},
+  },
+};
+
+const storeState = {
+  trajectorySummaries: {
+    summaries: {
+      'chat-cpp-1': {
+        cascadeId: 'chat-cpp-1',
+        summary: '[14:00] ⦿ SkParagraph line metrics',
+        stepCount: 2,
+        trajectoryMetadata: {
+          projectId: '8acb67c4-2cb7-43ca-ba04-dc547b3c4788',
+        },
+        annotations: { title: '[14:00] ⦿ SkParagraph line metrics', archived: false },
+      },
+    },
+  },
+  modelSelection: {
+    default: { model: 1260 }, // auto
+    overrideVersionId: { kind: 1 },
+    byConversation: {},
+    trajectorySync: {},
+  },
+  userStatus: makeServerUserStatus(),
+  projects: {
+    projects: [
+      { id: '8acb67c4-2cb7-43ca-ba04-dc547b3c4788', name: 'SkParagraph · ● 1' },
+      { id: '3f5b7a12-8e5f-47d2-a2f4-d644447c86a8', name: 'skia-g3-roll-check' },
+    ],
+  },
+  conversation: { cascadeId: '' },
+};
+
+const subscribers = [];
+const reduxStore = {
+  getState() { return storeState; },
+  dispatch(action) {
+    if (action?.type === 'userStatus/setUserStatus') {
+      storeState.userStatus = action.payload;
+    } else if (action?.type === 'modelSelection/modelPicked') {
+      const { conversationId, model, pick } = action.payload || {};
+      if (conversationId) {
+        storeState.modelSelection.byConversation[conversationId] = {
+          model,
+          contextWindow: undefined,
+        };
+      } else {
+        storeState.modelSelection.default = { model };
+      }
+      if (pick) {
+        const key = conversationId || '';
+        storeState.modelSelection.trajectorySync[key] = {
+          pick: { atStep: pick.atStep, queuedMessageIds: [...(pick.queuedMessageIds || [])] },
+        };
+      }
+    } else if (action?.type === 'modelSelection/trajectoryModelObserved') {
+      const { conversationId, model } = action.payload || {};
+      if (conversationId) {
+        storeState.modelSelection.byConversation[conversationId] = {
+          model,
+          contextWindow: undefined,
+        };
+      }
+    }
+    for (const fn of subscribers) fn();
+    return action;
+  },
+  subscribe(fn) {
+    subscribers.push(fn);
+    return () => {};
+  },
+};
+displayOptionsBtn.__reactFiber$test = { memoizedProps: { store: reduxStore } };
+
+const NOW_ISO = '2026-10-29T18:30:00Z';
+let fakeNow = Date.parse(NOW_ISO);
+Date.now = () => fakeNow;
+
+let outgoingFetchCalls = [];
+global.window = {
+  innerWidth: 1280,
+  location: { pathname: '/', search: '' },
+  __APP_CONFIG__: { csrfToken: 'csrf-autopilot-test' },
+  localStorage: { getItem: () => null, setItem: () => {} },
+  fetch: async (url, opts) => {
+    const u = String(url);
+    if (u.includes('GetAvailableModels')) {
+      return { ok: true, json: async () => availableModelsPayload };
+    }
+    if (u.includes('SendUserCascadeMessage') || u.includes('StartCascade')) {
+      outgoingFetchCalls.push({ url: u, body: opts?.body ? JSON.parse(opts.body) : null });
+      return { ok: true, json: async () => ({}) };
+    }
+    return { ok: false, status: 404 };
+  },
+};
+global.document = {
+  documentElement: docEl,
+  head: headEl,
+  body: bodyEl,
+  getElementById(id) { return docEl.querySelector(`#${id}`); },
+  createElement(t) { return new FakeElement(t); },
+  querySelector(s) { return docEl.querySelector(s); },
+  querySelectorAll(s) { return docEl.querySelectorAll(s); },
+  addEventListener() {},
+  removeEventListener() {},
+};
+global.MutationObserver = class { observe() {} disconnect() {} };
+global.requestAnimationFrame = (cb) => { cb(); return 1; };
+let pendingTimers = new Map();
+let nextTimerId = 1;
+global.setTimeout = (fn, ms) => {
+  const id = nextTimerId++;
+  pendingTimers.set(id, fn);
+  return id;
+};
+global.clearTimeout = (id) => {
+  pendingTimers.delete(id);
+};
+
+(async () => {
+  eval(code);
+  await new Promise((r) => setImmediate(r));
+
+  const configs = storeState.userStatus.cascadeModelConfigData.clientModelConfigs;
+  const byModelId = new Map(configs.map((c) => [c.modelId, c]));
+
+  // 1. Protobuf3 omitted remainingFraction quota verification
+  const argon = byModelId.get('gemini-launch-candidate');
+  assert(argon, 'Argon must be present in configs');
+  assert.strictEqual(
+    argon.tagTitle,
+    '0%',
+    `Argon with omitted remainingFraction and future resetTime must show 0%, got: ${argon.tagTitle}`
+  );
+  assert.strictEqual(argon.quotaInfo.remainingFraction, 0);
+
+  const expired = byModelId.get('expired-model');
+  assert(expired, 'Expired model must be present');
+  assert.strictEqual(
+    expired.tagTitle,
+    'Hidden · 100%',
+    `Expired resetTime must yield 100%, got: ${expired.tagTitle}`
+  );
+
+  const unmetered = byModelId.get('unmetered-model');
+  assert(unmetered, 'Unmetered model must be present');
+  assert.strictEqual(unmetered.tagTitle, 'Hidden · 100%');
+
+  // 2. Draft chat auto-selection for SkParagraph (?section=<SkParagraph UUID> -> cpp-core)
+  global.window.location.search = '?section=8acb67c4-2cb7-43ca-ba04-dc547b3c4788';
+  reduxStore.dispatch({ type: 'NOOP' });
+  await new Promise((r) => setImmediate(r));
+
+  // In cpp-core, claude-bon (Opus 5.5 BoN High at 95%) must be picked over 3p-wtu-daily (56%)
+  assert.strictEqual(
+    storeState.modelSelection.default.model,
+    1421,
+    `cpp-core draft must auto-select Opus 5.5 BoN High (1421), got: ${storeState.modelSelection.default.model}`
+  );
+
+  // 3. Draft chat in skia-g3-roll-check (?section=<skia-g3-roll-check UUID> -> triage)
+  global.window.location.search = '?section=3f5b7a12-8e5f-47d2-a2f4-d644447c86a8';
+  reduxStore.dispatch({ type: 'NOOP' });
+  await new Promise((r) => setImmediate(r));
+
+  // In triage, Gemini 2.5 Flash (312 at 99.8%) must be picked over Gemini 3.8 Flash (50%)
+  assert.strictEqual(
+    storeState.modelSelection.default.model,
+    312,
+    `triage draft must auto-select Gemini 2.5 Flash (312), got: ${storeState.modelSelection.default.model}`
+  );
+
+  // 4. Existing conversation mid-chat failover: trajectoryModelObserved with exhausted model
+  global.window.location.search = '';
+  storeState.conversation.cascadeId = 'chat-cpp-1';
+  reduxStore.dispatch({
+    type: 'modelSelection/trajectoryModelObserved',
+    payload: {
+      conversationId: 'chat-cpp-1',
+      turnKey: 'turn-1',
+      label: 'Gemini 4 Argon (High)',
+      model: 1393, // 0% exhausted WTU model
+      executionStartStep: 0,
+      queuedMessageIds: [],
+    },
+  });
+  await new Promise((r) => setImmediate(r));
+
+  // Must fail over to cpp-core healthy Opus 5.5 BoN High (1421)
+  assert.strictEqual(
+    storeState.modelSelection.byConversation['chat-cpp-1'].model,
+    1421,
+    `Exhausted Argon model must fail over to healthy Opus 1421, got: ${storeState.modelSelection.byConversation['chat-cpp-1']?.model}`
+  );
+
+  // Floating toast must mount
+  const toast = global.document.getElementById('jetski-model-autopilot-toast');
+  assert(toast, 'Autopilot floating toast must mount on failover');
+  assert.strictEqual(toast.getAttribute('data-to-model'), 'Claude Opus 5.5 BoN (High)');
+
+  // 5. Existing conversation mid-chat failover: wasteful WTU model (Fable 5.1 -> Opus 5.5)
+  reduxStore.dispatch({
+    type: 'modelSelection/trajectoryModelObserved',
+    payload: {
+      conversationId: 'chat-cpp-1',
+      turnKey: 'turn-2',
+      label: 'Claude Fable 5.1 (High)',
+      model: 1388, // wasteful WTU model
+      executionStartStep: 2,
+      queuedMessageIds: [],
+    },
+  });
+  await new Promise((r) => setImmediate(r));
+
+  assert.strictEqual(
+    storeState.modelSelection.byConversation['chat-cpp-1'].model,
+    1421,
+    `Wasteful Fable 5.1 model must shield to Opus 1421, got: ${storeState.modelSelection.byConversation['chat-cpp-1']?.model}`
+  );
+
+  // 6. Manual user pin: user explicitly picks Gemini 4 Carbon-G (1226, 99% quota)
+  reduxStore.dispatch({
+    type: 'modelSelection/modelPicked',
+    payload: {
+      conversationId: 'chat-cpp-1',
+      model: 1226,
+    },
+  });
+  await new Promise((r) => setImmediate(r));
+
+  assert.strictEqual(storeState.modelSelection.byConversation['chat-cpp-1'].model, 1226);
+  // Subsequent sync must respect user pin
+  reduxStore.dispatch({ type: 'NOOP' });
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(
+    storeState.modelSelection.byConversation['chat-cpp-1'].model,
+    1226,
+    'Manual user pin must be preserved across syncs'
+  );
+
+  // If user picks 0% dead model (1393), emergency floor (< 5%) rescues it
+  reduxStore.dispatch({
+    type: 'modelSelection/modelPicked',
+    payload: {
+      conversationId: 'chat-cpp-1',
+      model: 1393,
+    },
+  });
+  await new Promise((r) => setImmediate(r));
+  assert.notStrictEqual(
+    storeState.modelSelection.byConversation['chat-cpp-1'].model,
+    1393,
+    '0% model pick must trigger emergency rescue'
+  );
+
+  // 7. ConnectRPC fetch gate: outgoing SendUserCascadeMessage with 0% planModel rewritten
+  outgoingFetchCalls = [];
+  await global.window.fetch(
+    '/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        cascadeId: 'chat-cpp-1',
+        cascadeConfig: {
+          plannerConfig: {
+            planModel: 'MODEL_PLACEHOLDER_M393', // Argon at 0%
+          },
+        },
+      }),
+    }
+  );
+  assert.strictEqual(outgoingFetchCalls.length, 1);
+  const rewrittenBody = outgoingFetchCalls[0].body;
+  assert.notStrictEqual(
+    rewrittenBody.cascadeConfig.plannerConfig.planModel,
+    'MODEL_PLACEHOLDER_M393',
+    'Fetch gate must rewrite 0% planModel before sending'
+  );
+
+  // 8. Cleanup removes toast and clears state
+  window.__jetskiClosedChatsFilterCleanup();
+  assert.strictEqual(global.document.getElementById('jetski-model-autopilot-toast'), null);
+
+  console.log('ALL_AUTOPILOT_TESTS_PASSED');
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"""
+    env = os.environ.copy()
+    env["ELECTRON_RUN_AS_NODE"] = "1"
+    res = subprocess.run(
+        [node_bin, "-e", harness, js_path],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(
+        res.returncode,
+        0,
+        f"Model autopilot JS harness failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+    )
+    self.assertIn("ALL_AUTOPILOT_TESTS_PASSED", res.stdout)
 
 
 if __name__ == "__main__":
