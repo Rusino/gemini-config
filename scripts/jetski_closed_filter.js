@@ -235,6 +235,7 @@
   const SYSTEM_MSG_STEP_TYPES = new Set(['CORTEX_STEP_TYPE_SYSTEM_MESSAGE', 101]);
   const INVOKE_SUBAGENT_STEP_TYPES = new Set(['CORTEX_STEP_TYPE_INVOKE_SUBAGENT', 127]);
   const ASK_QUESTION_STEP_TYPES = new Set(['CORTEX_STEP_TYPE_ASK_QUESTION', 138]);
+  const GENERIC_STEP_TYPES = new Set(['CORTEX_STEP_TYPE_GENERIC', 132]);
   // Post-response bookkeeping steps emitted after PLANNER_RESPONSE on finished turns
   const TRANSPARENT_TAIL_STEP_TYPES = new Set([
     'CORTEX_STEP_TYPE_FINISH',
@@ -522,14 +523,16 @@
     const direct = step[camel] || step[snake];
     if (direct && typeof direct === 'object') return direct;
     const inner = step.step;
-    if (
-      inner &&
-      typeof inner === 'object' &&
-      (inner.case === camel || inner.case === snake) &&
-      inner.value &&
-      typeof inner.value === 'object'
-    ) {
-      return inner.value;
+    if (inner && typeof inner === 'object') {
+      if (
+        (inner.case === camel || inner.case === snake) &&
+        inner.value &&
+        typeof inner.value === 'object'
+      ) {
+        return inner.value;
+      }
+      const directInner = inner[camel] || inner[snake];
+      if (directInner && typeof directInner === 'object') return directInner;
     }
     return null;
   }
@@ -565,8 +568,65 @@
     if (!ask && (oneofCase === 'askQuestion' || oneofCase === 'ask_question')) {
       ask = oneofVal;
     }
+    if (!ask && oneof && typeof oneof === 'object') {
+      ask =
+        (oneof.askQuestion && typeof oneof.askQuestion === 'object'
+          ? oneof.askQuestion
+          : null) ||
+        (oneof.ask_question && typeof oneof.ask_question === 'object'
+          ? oneof.ask_question
+          : null);
+    }
     if (!ask && ASK_QUESTION_STEP_TYPES.has(step.type)) {
       ask = getStepOneofPayload(step, 'askQuestion', 'ask_question');
+    }
+    if (!ask) {
+      const generic =
+        getStepOneofPayload(step, 'generic', 'generic') ||
+        (GENERIC_STEP_TYPES.has(step.type) ? step : null);
+      if (generic) {
+        const genRes = generic.result || generic;
+        const genPayload =
+          genRes.payload ||
+          genRes.resultStruct ||
+          genRes.result_struct ||
+          genRes.resultValue ||
+          genRes.result_value;
+        const genReq =
+          generic.requestedInteraction ||
+          generic.requested_interaction ||
+          genRes.requestedInteraction ||
+          genRes.requested_interaction;
+        if (genReq && typeof genReq === 'object') {
+          const genInter = genReq.interaction;
+          ask =
+            genReq.askQuestion ||
+            genReq.ask_question ||
+            (genInter?.case === 'askQuestion' || genInter?.case === 'ask_question'
+              ? genInter.value
+              : null) ||
+            genInter?.askQuestion ||
+            genInter?.ask_question;
+        }
+        if (!ask && genPayload && typeof genPayload === 'object') {
+          ask =
+            genPayload.askQuestion ||
+            genPayload.ask_question ||
+            (Array.isArray(genPayload.questions) ? genPayload : null);
+        }
+        if (!ask) {
+          ask =
+            generic.askQuestion ||
+            generic.ask_question ||
+            (Array.isArray(generic.questions) ? generic : null);
+        }
+      }
+    }
+    if (
+      !ask &&
+      (Array.isArray(step.questions) || typeof step.question === 'string')
+    ) {
+      ask = step;
     }
 
     let elic =
@@ -606,6 +666,9 @@
 
     if (detail === 'Waiting for user input') {
       const meta = step.metadata && typeof step.metadata === 'object' ? step.metadata : {};
+      const pr = getStepOneofPayload(step, 'plannerResponse', 'planner_response');
+      const prCalls = pr?.toolCalls || pr?.tool_calls;
+      const prCall = Array.isArray(prCalls) && prCalls.length > 0 ? prCalls[0] : null;
       const toolCall =
         meta.modifiedToolCall ||
         meta.modified_tool_call ||
@@ -613,13 +676,15 @@
         meta.tool_call ||
         step.toolCall ||
         step.tool_call ||
+        prCall ||
         {};
       const stepType = typeof step.type === 'string' ? step.type : '';
       const typeFallback = stepType.startsWith('CORTEX_STEP_TYPE_')
         ? stepType.slice('CORTEX_STEP_TYPE_'.length).toLowerCase()
         : '';
       const toolName = String(toolCall?.name || typeFallback || '');
-      const argsRaw = toolCall?.argumentsJson || toolCall?.arguments_json;
+      const argsRaw =
+        toolCall?.argumentsJson || toolCall?.arguments_json || toolCall?.args;
       let argsObj = {};
       if (typeof argsRaw === 'string' && argsRaw) {
         try {
@@ -631,19 +696,32 @@
       } else if (argsRaw && typeof argsRaw === 'object') {
         argsObj = argsRaw;
       }
-      const runCmd = getStepOneofPayload(step, 'runCommand', 'run_command') || {};
-      const toolSummary = argsObj.toolSummary || argsObj.tool_summary;
-      const cmd =
-        argsObj.CommandLine ||
-        argsObj.command_line ||
-        runCmd.commandLine ||
-        runCmd.command_line;
-      if (toolSummary) {
-        detail = `Permission required for ${toolSummary}`;
-      } else if (cmd) {
-        detail = `Permission required for command: ${cmd}`;
-      } else if (toolName && toolName !== 'unspecified' && toolName !== 'generic') {
-        detail = `Permission required for ${toolName}`;
+      if (toolName === 'ask_question' || toolName === 'askQuestion') {
+        const qList = Array.isArray(argsObj.questions) ? argsObj.questions : [];
+        let qText = '';
+        if (qList.length > 0 && qList[0] && typeof qList[0] === 'object') {
+          qText = String(qList[0].question || '');
+        } else if (qList.length > 0 && typeof qList[0] === 'string') {
+          qText = qList[0];
+        } else if (argsObj.question) {
+          qText = String(argsObj.question);
+        }
+        detail = `Awaiting answer: ${qText || 'Question'}`;
+      } else {
+        const runCmd = getStepOneofPayload(step, 'runCommand', 'run_command') || {};
+        const toolSummary = argsObj.toolSummary || argsObj.tool_summary;
+        const cmd =
+          argsObj.CommandLine ||
+          argsObj.command_line ||
+          runCmd.commandLine ||
+          runCmd.command_line;
+        if (toolSummary) {
+          detail = `Permission required for ${toolSummary}`;
+        } else if (cmd) {
+          detail = `Permission required for command: ${cmd}`;
+        } else if (toolName && toolName !== 'unspecified' && toolName !== 'generic') {
+          detail = `Permission required for ${toolName}`;
+        }
       }
     }
     return detail;
@@ -651,22 +729,26 @@
 
   // Extracts blocked interaction detail and earliest waiting stepIndex from summary.waitingSteps
   function extractSummaryWaitingInfo(summary) {
-    const waitingSteps = summary?.waitingSteps;
+    const waitingSteps = summary?.waitingSteps || summary?.waiting_steps;
     if (!Array.isArray(waitingSteps) || waitingSteps.length === 0) return null;
     let bestEntry = null;
     let bestIdx = null;
     for (const entry of waitingSteps) {
       if (!entry || typeof entry !== 'object') continue;
-      const rawIdx = entry.stepIndex ?? entry.step_index ?? 0;
+      const rawIdx = entry.stepIndex ?? entry.step_index ?? entry.index ?? 0;
       const idx = Number.isFinite(Number(rawIdx)) ? Math.trunc(Number(rawIdx)) : 0;
       if (bestIdx === null || idx < bestIdx) {
         bestIdx = idx;
         bestEntry = entry;
       }
     }
-    const parsed =
+    const stepObj =
       bestEntry?.step && typeof bestEntry.step === 'object'
-        ? parseStepInteraction(bestEntry.step, false)
+        ? bestEntry.step
+        : bestEntry;
+    const parsed =
+      stepObj && typeof stepObj === 'object'
+        ? parseStepInteraction(stepObj, false)
         : null;
     const detail = parsed || 'Waiting for user input';
     return {
@@ -1006,9 +1088,8 @@
 
   function buildSummaryStatusSig(cid, summary) {
     if (!summary) return `${cid}:none`;
-    const wsLen = Array.isArray(summary.waitingSteps)
-      ? summary.waitingSteps.length
-      : 0;
+    const ws = summary.waitingSteps || summary.waiting_steps;
+    const wsLen = Array.isArray(ws) ? ws.length : 0;
     const rawTitle = summary.annotations?.title || summary.summary || '';
     const waitFlag = isWaitingTitle(rawTitle) ? 1 : 0;
     const term =
@@ -1253,12 +1334,18 @@
         null,
         isWaitingChat
       );
-      if (earlySelf.state === 'blocked') {
-        const selfWait = extractSummaryWaitingInfo(curSummary);
-        const selfIdx = selfWait ? selfWait.stepIndex : rootSteps.length;
+      const selfWaitEarly = extractSummaryWaitingInfo(curSummary);
+      if (earlySelf.state === 'blocked' || selfWaitEarly) {
+        const selfIdx = selfWaitEarly ? selfWaitEarly.stepIndex : rootSteps.length;
+        const selfDetail =
+          earlySelf.state === 'blocked' &&
+          earlySelf.detail &&
+          earlySelf.detail !== 'Waiting for user input'
+            ? earlySelf.detail
+            : (selfWaitEarly?.detail || earlySelf.detail || 'Waiting for user input');
         resolvedState = 'blocked';
-        resolvedDetail = earlySelf.detail;
-        resolvedBlockedSig = `self:${selfIdx}:${earlySelf.detail}`;
+        resolvedDetail = selfDetail;
+        resolvedBlockedSig = `self:${selfIdx}:${selfDetail}`;
       } else {
         // BFS walk across non-killed descendants and ongoing battle arms
         const directActiveChildren = new Map();
@@ -1784,7 +1871,8 @@
         Boolean(prev?.notFullyIdle) &&
         !s.notFullyIdle &&
         !s.trajectoryMetadata?.parentConversationId;
-      const asks = Array.isArray(s.waitingSteps) && s.waitingSteps.length > 0;
+      const ws = s.waitingSteps || s.waiting_steps;
+      const asks = Array.isArray(ws) && ws.length > 0;
       if (!endsTurn && !asks) continue;
       if (!(s.annotations?.archived || prev?.annotations?.archived)) return false;
       silenced++;
@@ -3346,6 +3434,43 @@
     });
   }
 
+  // Restores an archived project when navigating to one of its conversations
+  async function unarchiveProjectIfArchived(projectId, store) {
+    if (!projectId || projectId === '__standalone__') return false;
+    const state = store?.getState();
+    const sidebarProjects = state?.sidebarProjects?.projects;
+    if (Array.isArray(sidebarProjects) && sidebarProjects.some((p) => p?.id === projectId)) {
+      return false;
+    }
+    const projectsMap = state?.projects?.projects || state?.projects?.byId;
+    if (projectsMap && typeof projectsMap === 'object') {
+      const p = projectsMap[projectId];
+      if (p && p.archived === false) return false;
+    }
+    if (typeof window.fetch !== 'function') return false;
+    try {
+      const resp = await window.fetch(
+        '/exa.language_server_pb.LanguageServerService/UpdateProject',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-codeium-csrf-token': getCsrfToken(),
+          },
+          body: JSON.stringify({
+            project: {
+              id: projectId,
+              archived: false,
+            },
+          }),
+        }
+      );
+      return Boolean(resp && resp.ok);
+    } catch {
+      return false;
+    }
+  }
+
   // Routes inside the SPA by swapping the conversation ID in the current chat URL; updates both
   // browser history and Redux multiConvoLayout/conversation slices for split-view stability.
   // options.preserveFocus replaces the pane without taking focus from another split pane
@@ -3353,16 +3478,20 @@
     const preserveFocus = Boolean(options?.preserveFocus);
     const path = window.location?.pathname || '';
     const m = /^(.*\/(?:c|cascade|conversation)\/)([^/?#]+)(.*)$/.exec(path);
-    if (!m) return;
+    const routePrefix = m ? m[1] : '/c/';
+    const routeSuffix = m ? m[3] : '';
     // Extract active conversation IDs from URL pathname, handling split-view '+' separators
-    let decoded = m[2];
-    try {
-      decoded = decodeURIComponent(m[2]);
-    } catch {}
-    const rawIds = decoded.split('+').filter(Boolean);
+    let rawIds = [];
+    if (m) {
+      let decoded = m[2];
+      try {
+        decoded = decodeURIComponent(m[2]);
+      } catch {}
+      rawIds = decoded.split('+').filter(Boolean);
+    }
     const searchStr = window.location?.search || '';
-    const searchParams = searchStr ? new URLSearchParams(searchStr) : null;
-    const focusedParam = searchParams?.get('focused') || '';
+    const searchParams = searchStr ? new URLSearchParams(searchStr) : new URLSearchParams();
+    const focusedParam = searchParams.get('focused') || '';
 
     const store = findReduxStore();
     const layoutState = store?.getState()?.multiConvoLayout;
@@ -3394,16 +3523,31 @@
 
     // Preserve non-empty search query params while keeping focused ID aligned with target;
     // preserveFocus keeps the focus on another split pane that the user is working in
-    const nextPath = m[1] + nextIds.join('+') + m[3];
-    let nextUrl = nextPath;
-    if (searchParams) {
-      const keepsFocus = preserveFocus && focusedParam && focusedParam !== replaceTarget;
-      if (!keepsFocus && (searchParams.has('focused') || nextIds.length > 1)) {
-        searchParams.set('focused', cascadeId);
-      }
-      const qs = searchParams.toString();
-      nextUrl = nextPath + (qs ? `?${qs}` : '');
+    const nextPath = routePrefix + nextIds.join('+') + routeSuffix;
+    const keepsFocus = preserveFocus && focusedParam && focusedParam !== replaceTarget;
+    if (!keepsFocus && (searchParams.has('focused') || nextIds.length > 1)) {
+      searchParams.set('focused', cascadeId);
     }
+
+    // Align active sidebar project section and unarchive project if archived
+    const summariesMap = store?.getState()?.trajectorySummaries?.summaries || {};
+    const targetProjectId =
+      summariesMap[cascadeId]?.trajectoryMetadata?.projectId ||
+      store?.getState()?.trajectorySummaries?.externalSummaries?.[cascadeId]?.trajectoryMetadata
+        ?.projectId;
+    const isNonConvoRoute = !m;
+    const shouldSyncSection =
+      Boolean(targetProjectId && targetProjectId !== '__standalone__') &&
+      (isNonConvoRoute || searchParams.has('section'));
+    if (shouldSyncSection) {
+      searchParams.set('section', targetProjectId);
+    }
+    if (targetProjectId && targetProjectId !== '__standalone__') {
+      void unarchiveProjectIfArchived(targetProjectId, store);
+    }
+
+    const qs = searchParams.toString();
+    const nextUrl = nextPath + (qs ? `?${qs}` : '');
 
     // Increment TanStack Router __TSR_index to preserve history navigation order
     const prevState =
@@ -3465,6 +3609,9 @@
       // Synchronize button states and conversation piece locks immediately upon routing
       scheduleSync();
     }
+
+    // Reveal and scroll to conversation row in sidebar
+    void locateConversationInSidebar(cascadeId);
 
     // Find computes matches from the mounted view's text, so wait for the routed view to mount
     if (term) {
@@ -3689,7 +3836,12 @@
         }
         if (projectId) {
           for (const item of ctrl.props.items) {
-            if (item.type === 'header' && item.id === projectId && item.isCollapsed) {
+            const isMatch =
+              item.type === 'header' &&
+              (item.id === projectId ||
+                item.id === 'header-' + projectId ||
+                (typeof item.id === 'string' && item.id.replace(/^header-/, '') === projectId));
+            if (isMatch && item.isCollapsed) {
               ctrl.props.onToggleCollapseSection?.(projectId);
               needsRerender = true;
             }
@@ -3785,6 +3937,7 @@
     }
   }
 
+  window.__jetskiOpenConversation = openConversation;
   window.__jetskiLocateInSidebar = locateConversationInSidebar;
 
   // Matryoshka chain star tooltip showing lazy piece turn counts and question previews
@@ -4431,10 +4584,11 @@
 
   // Classifies an unseen inbox chat into 'urgent' (blocked on self/subagent step) vs 'unseen'
   function classifyInboxTier(summary, statusInfo) {
+    const ws = summary?.waitingSteps || summary?.waiting_steps;
     // Chats blocked on tool approval or user questions rank above unread finished turns
     if (
       statusInfo?.isBlocked ||
-      (Array.isArray(summary?.waitingSteps) && summary.waitingSteps.length > 0)
+      (Array.isArray(ws) && ws.length > 0)
     ) {
       return 'urgent';
     }

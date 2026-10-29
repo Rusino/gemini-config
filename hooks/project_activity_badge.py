@@ -127,6 +127,7 @@ PLANNER_STEP_TYPES = frozenset({"CORTEX_STEP_TYPE_PLANNER_RESPONSE", 15})
 SYSTEM_MSG_STEP_TYPES = frozenset({"CORTEX_STEP_TYPE_SYSTEM_MESSAGE", 101})
 INVOKE_SUBAGENT_STEP_TYPES = frozenset({"CORTEX_STEP_TYPE_INVOKE_SUBAGENT", 127})
 ASK_QUESTION_STEP_TYPES = frozenset({"CORTEX_STEP_TYPE_ASK_QUESTION", 138})
+GENERIC_STEP_TYPES = frozenset({"CORTEX_STEP_TYPE_GENERIC", 132})
 # Post-response bookkeeping steps that appear after PLANNER_RESPONSE on finished turns
 TRANSPARENT_TAIL_STEP_TYPES = frozenset({
     "CORTEX_STEP_TYPE_FINISH",
@@ -155,16 +156,22 @@ STALE_IDLE_TURN_SEC = 900.0
 ONGOING_BATTLE_END_TYPES = frozenset({0, "", None, "BATTLE_END_TYPE_UNSPECIFIED"})
 
 
-def _step_oneof_payload(step: dict[str, Any], camel: str, snake: str) -> dict[str, Any]:
+def _step_oneof_payload(step: dict[str, Any], camel: str, snake: str) -> dict[str, Any] | None:
+  if not isinstance(step, dict):
+    return None
   direct = step.get(camel) or step.get(snake)
   if isinstance(direct, dict):
     return direct
   inner = step.get("step")
-  if isinstance(inner, dict) and inner.get("case") in (camel, snake):
-    val = inner.get("value")
-    if isinstance(val, dict):
-      return val
-  return {}
+  if isinstance(inner, dict):
+    if inner.get("case") in (camel, snake):
+      val = inner.get("value")
+      if isinstance(val, dict):
+        return val
+    direct_inner = inner.get(camel) or inner.get(snake)
+    if isinstance(direct_inner, dict):
+      return direct_inner
+  return None
 
 
 def parse_step_interaction(
@@ -197,8 +204,76 @@ def parse_step_interaction(
   if not isinstance(ask, dict) and oneof_case in ("askQuestion", "ask_question"):
     if isinstance(oneof_val, dict):
       ask = oneof_val
+  if not isinstance(ask, dict) and isinstance(oneof, dict):
+    ask_oneof = oneof.get("askQuestion") or oneof.get("ask_question")
+    if isinstance(ask_oneof, dict):
+      ask = ask_oneof
   if not isinstance(ask, dict) and step.get("type") in ASK_QUESTION_STEP_TYPES:
     ask = _step_oneof_payload(step, "askQuestion", "ask_question")
+  if not isinstance(ask, dict):
+    generic = (
+        _step_oneof_payload(step, "generic", "generic")
+        or (step if step.get("type") in GENERIC_STEP_TYPES else {})
+    )
+    if isinstance(generic, dict) and generic:
+      gen_res = generic.get("result") if isinstance(generic.get("result"), dict) else generic
+      gen_payload = (
+          gen_res.get("payload")
+          or gen_res.get("resultStruct")
+          or gen_res.get("result_struct")
+          or gen_res.get("resultValue")
+          or gen_res.get("result_value")
+      )
+      gen_req = (
+          generic.get("requestedInteraction")
+          or generic.get("requested_interaction")
+          or (
+              gen_res.get("requestedInteraction")
+              if isinstance(gen_res, dict)
+              else None
+          )
+          or (
+              gen_res.get("requested_interaction")
+              if isinstance(gen_res, dict)
+              else None
+          )
+      )
+      if isinstance(gen_req, dict):
+        gen_inter = (
+            gen_req.get("interaction")
+            if isinstance(gen_req.get("interaction"), dict)
+            else {}
+        )
+        ask_candidate = (
+            gen_req.get("askQuestion")
+            or gen_req.get("ask_question")
+            or (
+                gen_inter.get("value")
+                if gen_inter.get("case") in ("askQuestion", "ask_question")
+                else None
+            )
+            or gen_inter.get("askQuestion")
+            or gen_inter.get("ask_question")
+        )
+        if isinstance(ask_candidate, dict):
+          ask = ask_candidate
+      if not isinstance(ask, dict) and isinstance(gen_payload, dict):
+        if isinstance(gen_payload.get("askQuestion"), dict):
+          ask = gen_payload["askQuestion"]
+        elif isinstance(gen_payload.get("ask_question"), dict):
+          ask = gen_payload["ask_question"]
+        elif isinstance(gen_payload.get("questions"), list):
+          ask = gen_payload
+      if not isinstance(ask, dict):
+        if isinstance(generic.get("askQuestion"), dict):
+          ask = generic["askQuestion"]
+        elif isinstance(generic.get("ask_question"), dict):
+          ask = generic["ask_question"]
+        elif isinstance(generic.get("questions"), list):
+          ask = generic
+  if not isinstance(ask, dict):
+    if isinstance(step.get("questions"), list) or isinstance(step.get("question"), str):
+      ask = step
 
   elic = requested.get("elicitation")
   if not isinstance(elic, dict) and oneof_case == "elicitation" and isinstance(oneof_val, dict):
@@ -243,6 +318,13 @@ def parse_step_interaction(
 
   if detail == "Waiting for user input":
     meta = step.get("metadata") if isinstance(step.get("metadata"), dict) else {}
+    pr = _step_oneof_payload(step, "plannerResponse", "planner_response") or {}
+    pr_calls = pr.get("toolCalls") or pr.get("tool_calls")
+    pr_call = (
+        pr_calls[0]
+        if isinstance(pr_calls, list) and pr_calls and isinstance(pr_calls[0], dict)
+        else {}
+    )
     tool_call = (
         meta.get("modifiedToolCall")
         or meta.get("modified_tool_call")
@@ -250,6 +332,7 @@ def parse_step_interaction(
         or meta.get("tool_call")
         or step.get("toolCall")
         or step.get("tool_call")
+        or pr_call
         or {}
     )
     if not isinstance(tool_call, dict):
@@ -273,27 +356,39 @@ def parse_step_interaction(
     elif isinstance(args_raw, dict):
       args_obj = args_raw
 
-    run_cmd = _step_oneof_payload(step, "runCommand", "run_command")
-    tool_summary = args_obj.get("toolSummary") or args_obj.get("tool_summary")
-    cmd = (
-        args_obj.get("CommandLine")
-        or args_obj.get("command_line")
-        or run_cmd.get("commandLine")
-        or run_cmd.get("command_line")
-    )
-    if tool_summary:
-      detail = f"Permission required for {tool_summary}"
-    elif cmd:
-      detail = f"Permission required for command: {cmd}"
-    elif tool_name and tool_name not in ("unspecified", "generic"):
-      detail = f"Permission required for {tool_name}"
+    if tool_name in ("ask_question", "askQuestion"):
+      q_list = args_obj.get("questions")
+      q_text = ""
+      if isinstance(q_list, list) and q_list:
+        if isinstance(q_list[0], dict):
+          q_text = str(q_list[0].get("question") or "")
+        elif isinstance(q_list[0], str):
+          q_text = q_list[0]
+      elif args_obj.get("question"):
+        q_text = str(args_obj.get("question") or "")
+      detail = f"Awaiting answer: {q_text or 'Question'}"
+    else:
+      run_cmd = _step_oneof_payload(step, "runCommand", "run_command") or {}
+      tool_summary = args_obj.get("toolSummary") or args_obj.get("tool_summary")
+      cmd = (
+          args_obj.get("CommandLine")
+          or args_obj.get("command_line")
+          or run_cmd.get("commandLine")
+          or run_cmd.get("command_line")
+      )
+      if tool_summary:
+        detail = f"Permission required for {tool_summary}"
+      elif cmd:
+        detail = f"Permission required for command: {cmd}"
+      elif tool_name and tool_name not in ("unspecified", "generic"):
+        detail = f"Permission required for {tool_name}"
 
   return detail
 
 
 def extract_summary_waiting_detail(summary: dict[str, Any]) -> str | None:
   """Returns blocked interaction detail from `summary.waitingSteps`, if any."""
-  waiting_steps = summary.get("waitingSteps")
+  waiting_steps = summary.get("waitingSteps") or summary.get("waiting_steps")
   if not isinstance(waiting_steps, list) or not waiting_steps:
     return None
   best_entry: dict[str, Any] | None = None
@@ -301,17 +396,21 @@ def extract_summary_waiting_detail(summary: dict[str, Any]) -> str | None:
   for entry in waiting_steps:
     if not isinstance(entry, dict):
       continue
-    raw_idx = entry.get("stepIndex", entry.get("step_index", 0))
+    raw_idx = entry.get("stepIndex", entry.get("step_index", entry.get("index", 0)))
     idx = int(raw_idx) if isinstance(raw_idx, (int, float)) else 0
     if best_idx is None or idx < best_idx:
       best_idx = idx
       best_entry = entry
-  if best_entry is not None and isinstance(best_entry.get("step"), dict):
-    parsed = parse_step_interaction(
-        best_entry["step"], require_waiting_status=False
+  if best_entry is not None:
+    step_obj = (
+        best_entry.get("step")
+        if isinstance(best_entry.get("step"), dict)
+        else best_entry
     )
-    if parsed:
-      return parsed
+    if isinstance(step_obj, dict):
+      parsed = parse_step_interaction(step_obj, require_waiting_status=False)
+      if parsed:
+        return parsed
   return "Waiting for user input"
 
 
@@ -1314,7 +1413,7 @@ def _merge_summary_into_traj(
 
 
 def _summary_sig(cid: str, summary: dict[str, Any]) -> str:
-  ws = summary.get("waitingSteps")
+  ws = summary.get("waitingSteps") or summary.get("waiting_steps")
   ws_len = len(ws) if isinstance(ws, list) else 0
   term = (
       summary.get("latestExecutorTerminationReason")
@@ -1388,7 +1487,7 @@ def resolve_conversation_activity(
   4. `idle`.
   """
   self_wait = extract_summary_waiting_detail(summary)
-  if self_wait:
+  if self_wait and self_wait != "Waiting for user input":
     return "blocked", self_wait
 
   child_index = (
@@ -1504,6 +1603,15 @@ def resolve_conversation_activity(
             "ts": now_ts or time.time(),
         }
       return "blocked", early_detail
+  if self_wait:
+    if eval_cache is not None and trajectories is None:
+      eval_cache[cid] = {
+          "sig": tree_sig,
+          "state": "blocked",
+          "detail": self_wait,
+          "ts": now_ts or time.time(),
+      }
+    return "blocked", self_wait
 
   # Walk non-killed descendants in BFS order so blocked subagents/arms surface with role
   direct_active_children: dict[str, str] = {}

@@ -3559,6 +3559,525 @@ eval(code);
     )
     self.assertIn("R22_ASSERTIONS_PASSED", res.stdout)
 
+  def test_r76_ask_question_waiting_steps_and_payload_variants(self) -> None:
+    node_bin = find_node_binary()
+    js_path = os.path.join(SCRIPTS_DIR, "jetski_closed_filter.js")
+
+    harness = r"""
+const fs = require('fs');
+const assert = require('assert');
+
+const scriptPath = process.argv[1];
+const code = fs.readFileSync(scriptPath, 'utf8');
+
+class FakeElement {
+  constructor(tagName) {
+    this.tagName = tagName.toUpperCase();
+    this.id = '';
+    this.className = '';
+    this._textContent = '';
+    this._innerHTML = '';
+    this.style = {};
+    this.attributes = new Map();
+    this.children = [];
+    this.parentElement = null;
+    this.listeners = new Map();
+  }
+  get textContent() {
+    if (this.children.length > 0) {
+      return this._textContent + this.children.map((c) => c.textContent).join('');
+    }
+    return this._textContent;
+  }
+  set textContent(val) {
+    this._textContent = String(val);
+    for (const c of this.children) c.parentElement = null;
+    this.children = [];
+  }
+  get innerHTML() { return this._innerHTML; }
+  set innerHTML(val) { this._innerHTML = String(val); }
+  setAttribute(k, v) {
+    this.attributes.set(k, String(v));
+    if (k === 'id') this.id = String(v);
+    if (k === 'class') this.className = String(v);
+  }
+  getAttribute(k) {
+    if (k === 'id' && this.id) return this.id;
+    return this.attributes.has(k) ? this.attributes.get(k) : null;
+  }
+  hasAttribute(k) { return this.attributes.has(k); }
+  removeAttribute(k) { this.attributes.delete(k); }
+  appendChild(child) {
+    if (child.parentElement) child.remove();
+    child.parentElement = this;
+    this.children.push(child);
+    return child;
+  }
+  insertBefore(child, ref) {
+    if (child === ref) return child;
+    if (child.parentElement) child.remove();
+    child.parentElement = this;
+    const idx = this.children.indexOf(ref);
+    if (idx === -1) this.children.push(child);
+    else this.children.splice(idx, 0, child);
+    return child;
+  }
+  remove() {
+    if (!this.parentElement) return;
+    const idx = this.parentElement.children.indexOf(this);
+    if (idx !== -1) this.parentElement.children.splice(idx, 1);
+    this.parentElement = null;
+  }
+  addEventListener(type, fn) {
+    if (!this.listeners.has(type)) this.listeners.set(type, []);
+    this.listeners.get(type).push(fn);
+  }
+  dispatchEvent(type, eventInit = {}) {
+    for (const fn of (this.listeners.get(type) || [])) {
+      fn({ type, target: this, ...eventInit });
+    }
+  }
+  getBoundingClientRect() {
+    return { left: 24, top: 40, bottom: 62, right: 140, width: 116, height: 22 };
+  }
+  querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+  querySelectorAll(selector) {
+    const out = [];
+    const visit = (node) => {
+      for (const child of node.children) {
+        if (matches(child, selector)) out.push(child);
+        visit(child);
+      }
+    };
+    visit(this);
+    return out;
+  }
+}
+
+function matches(el, selector) {
+  if (selector === 'button[aria-label="Display Options"]') {
+    return el.tagName === 'BUTTON' && el.getAttribute('aria-label') === 'Display Options';
+  }
+  const bucketMatch = /^button\[data-bucket="([^"]+)"\]$/.exec(selector);
+  if (bucketMatch) {
+    return el.tagName === 'BUTTON' && el.getAttribute('data-bucket') === bucketMatch[1];
+  }
+  if (selector === '[data-testid="conversation-row-sidebar"][data-cascade-id]') {
+    return (
+      el.getAttribute('data-testid') === 'conversation-row-sidebar' &&
+      el.hasAttribute('data-cascade-id')
+    );
+  }
+  const attrEqMatch = /^\[([-a-zA-Z0-9_]+)="([^"]+)"\]$/.exec(selector);
+  if (attrEqMatch) return el.getAttribute(attrEqMatch[1]) === attrEqMatch[2];
+  if (selector.startsWith('.')) {
+    const classes = selector.split('.').filter(Boolean);
+    const elClasses = el.className ? el.className.split(/\s+/) : [];
+    return classes.every((cls) => elClasses.includes(cls));
+  }
+  return false;
+}
+
+const docEl = new FakeElement('html');
+const headEl = new FakeElement('head');
+const bodyEl = new FakeElement('body');
+docEl.appendChild(headEl);
+docEl.appendChild(bodyEl);
+
+const sidebarWrap = new FakeElement('div');
+const actionRow = new FakeElement('div');
+const displayOptionsBtn = new FakeElement('button');
+displayOptionsBtn.setAttribute('aria-label', 'Display Options');
+actionRow.appendChild(displayOptionsBtn);
+sidebarWrap.appendChild(actionRow);
+
+const sidebarListEl = new FakeElement('div');
+sidebarListEl.setAttribute('data-testid', 'conversation-list-sidebar');
+sidebarWrap.appendChild(sidebarListEl);
+bodyEl.appendChild(sidebarWrap);
+
+const cids = [
+  'chat-snake-ws',
+  'chat-toolcall-meta',
+  'chat-toolcall-pr',
+  'chat-toolcall-string-array',
+  'chat-generic-payload',
+  'chat-direct-step-questions',
+  'chat-oneof-direct',
+];
+
+for (const cid of cids) {
+  const row = new FakeElement('div');
+  row.setAttribute('data-testid', 'conversation-row-sidebar');
+  row.setAttribute('data-cascade-id', cid);
+  const titleSpan = new FakeElement('span');
+  titleSpan.className = 'truncate';
+  titleSpan.textContent = `[14:00] ⦿ ${cid}`;
+  const hoverBar = new FakeElement('div');
+  const pinBtn = new FakeElement('button');
+  pinBtn.setAttribute('data-testid', 'conversation-pin-button');
+  hoverBar.appendChild(pinBtn);
+  row.appendChild(titleSpan);
+  row.appendChild(hoverBar);
+  sidebarListEl.appendChild(row);
+}
+
+const trajectoriesByCid = {
+  'chat-snake-ws': {
+    numTotalSteps: 1,
+    trajectory: { steps: [{ type: 14, status: 3 }] },
+  },
+  'chat-toolcall-meta': {
+    numTotalSteps: 2,
+    trajectory: {
+      steps: [
+        { type: 14, status: 3 },
+        {
+          type: 132,
+          status: 9,
+          metadata: {
+            toolCall: {
+              name: 'ask_question',
+              argumentsJson: JSON.stringify({
+                questions: [{ question: 'Pick database shard' }],
+              }),
+            },
+          },
+        },
+      ],
+    },
+  },
+  'chat-toolcall-pr': {
+    numTotalSteps: 2,
+    trajectory: {
+      steps: [
+        { type: 14, status: 3 },
+        {
+          type: 15,
+          status: 9,
+          plannerResponse: {
+            toolCalls: [{
+              name: 'askQuestion',
+              argumentsJson: JSON.stringify({ question: 'Proceed with wipe?' }),
+            }],
+          },
+        },
+      ],
+    },
+  },
+  'chat-toolcall-string-array': {
+    numTotalSteps: 2,
+    trajectory: {
+      steps: [
+        { type: 14, status: 3 },
+        {
+          type: 132,
+          status: 9,
+          metadata: {
+            toolCall: {
+              name: 'ask_question',
+              argumentsJson: JSON.stringify({ questions: ['Deploy now?'] }),
+            },
+          },
+        },
+      ],
+    },
+  },
+  'chat-generic-payload': {
+    numTotalSteps: 2,
+    trajectory: {
+      steps: [
+        { type: 14, status: 3 },
+        {
+          type: 132,
+          status: 9,
+          generic: {
+            result: {
+              payload: {
+                ask_question: {
+                  questions: [{ question: 'Confirm migration?' }],
+                },
+              },
+            },
+          },
+        },
+      ],
+    },
+  },
+  'chat-direct-step-questions': {
+    numTotalSteps: 2,
+    trajectory: {
+      steps: [
+        { type: 14, status: 3 },
+        {
+          type: 138,
+          status: 9,
+          questions: [{ question: 'Which branch to merge?' }],
+        },
+      ],
+    },
+  },
+  'chat-oneof-direct': {
+    numTotalSteps: 2,
+    trajectory: {
+      steps: [
+        { type: 14, status: 3 },
+        {
+          type: 138,
+          status: 9,
+          requestedInteraction: {
+            interaction: {
+              ask_question: {
+                questions: [{ question: 'Approve cherry-pick?' }],
+              },
+            },
+          },
+        },
+      ],
+    },
+  },
+};
+
+const storeState = {
+  trajectorySummaries: {
+    summaries: {
+      'chat-snake-ws': {
+        summary: '[14:00] ⦿ chat-snake-ws',
+        status: 1,
+        stepCount: 1,
+        lastModifiedTime: '2026-10-29T18:29:50Z',
+        annotations: { title: '[14:00] ⦿ chat-snake-ws', archived: false },
+        waiting_steps: [
+          {
+            index: 0,
+            status: 9,
+            type: 138,
+            requestedInteraction: {
+              interaction: {
+                case: 'askQuestion',
+                value: { questions: [{ question: 'Roll out to canary?' }] },
+              },
+            },
+          },
+        ],
+      },
+      'chat-toolcall-meta': {
+        summary: '[14:00] ⦿ chat-toolcall-meta',
+        status: 1,
+        stepCount: 2,
+        lastModifiedTime: '2026-10-29T18:29:40Z',
+        annotations: { title: '[14:00] ⦿ chat-toolcall-meta', archived: false },
+      },
+      'chat-toolcall-pr': {
+        summary: '[14:00] ⦿ chat-toolcall-pr',
+        status: 1,
+        stepCount: 2,
+        lastModifiedTime: '2026-10-29T18:29:30Z',
+        annotations: { title: '[14:00] ⦿ chat-toolcall-pr', archived: false },
+      },
+      'chat-toolcall-string-array': {
+        summary: '[14:00] ⦿ chat-toolcall-string-array',
+        status: 1,
+        stepCount: 2,
+        lastModifiedTime: '2026-10-29T18:29:20Z',
+        annotations: { title: '[14:00] ⦿ chat-toolcall-string-array', archived: false },
+      },
+      'chat-generic-payload': {
+        summary: '[14:00] ⦿ chat-generic-payload',
+        status: 1,
+        stepCount: 2,
+        lastModifiedTime: '2026-10-29T18:29:10Z',
+        annotations: { title: '[14:00] ⦿ chat-generic-payload', archived: false },
+      },
+      'chat-direct-step-questions': {
+        summary: '[14:00] ⦿ chat-direct-step-questions',
+        status: 1,
+        stepCount: 2,
+        lastModifiedTime: '2026-10-29T18:29:00Z',
+        annotations: { title: '[14:00] ⦿ chat-direct-step-questions', archived: false },
+      },
+      'chat-oneof-direct': {
+        summary: '[14:00] ⦿ chat-oneof-direct',
+        status: 1,
+        stepCount: 2,
+        lastModifiedTime: '2026-10-29T18:28:50Z',
+        annotations: { title: '[14:00] ⦿ chat-oneof-direct', archived: false },
+      },
+    },
+  },
+  conversation: { cascadeId: 'chat-snake-ws' },
+  sideBar: { isOpen: true },
+};
+
+const subscribers = [];
+const reduxStore = {
+  getState: () => storeState,
+  dispatch(action) {
+    for (const sub of subscribers) sub();
+    return action;
+  },
+  subscribe(fn) {
+    subscribers.push(fn);
+    return () => {};
+  },
+};
+displayOptionsBtn.__reactFiber$test = { memoizedProps: { store: reduxStore } };
+
+const storage = new Map();
+let rafCallbacks = [];
+
+global.window = {
+  innerWidth: 1280,
+  location: { pathname: '/c/chat-snake-ws', search: '' },
+  __APP_CONFIG__: { csrfToken: 'r76-csrf' },
+  localStorage: {
+    getItem: (k) => (storage.has(k) ? storage.get(k) : null),
+    setItem: (k, v) => storage.set(k, String(v)),
+  },
+  fetch: async (url, opts) => {
+    const u = String(url);
+    const body = opts?.body ? JSON.parse(opts.body) : {};
+    if (u.includes('/GetCascadeTrajectory')) {
+      const src = trajectoriesByCid[body.cascadeId];
+      if (!src) return { ok: true, json: async () => ({ trajectory: { steps: [] } }) };
+      return { ok: true, json: async () => JSON.parse(JSON.stringify(src)) };
+    }
+    if (u.includes('jetski-chains.json')) {
+      return { ok: true, json: async () => ({ parentOf: {}, createdAt: {}, redirects: {} }) };
+    }
+    if (u.includes('jetski-roadmaps.json')) {
+      return { ok: true, json: async () => ({ version: 1, projects: {} }) };
+    }
+    return { ok: false, status: 404 };
+  },
+};
+
+global.document = {
+  documentElement: docEl,
+  head: headEl,
+  body: bodyEl,
+  getElementById: (id) => docEl.querySelector(`#${id}`),
+  createElement: (tag) => new FakeElement(tag),
+  querySelector: (sel) => docEl.querySelector(sel),
+  querySelectorAll: (sel) => docEl.querySelectorAll(sel),
+  addEventListener() {},
+  removeEventListener() {},
+  dispatchEvent() {},
+};
+global.MutationObserver = class {
+  observe() {}
+  disconnect() {}
+};
+global.requestAnimationFrame = (cb) => {
+  rafCallbacks.push(cb);
+  return rafCallbacks.length;
+};
+let nextTimerId = 1;
+const pendingTimers = new Map();
+global.setTimeout = (fn, ms) => {
+  const id = nextTimerId++;
+  pendingTimers.set(id, { fn, due: Date.now() + (Number(ms) || 0) });
+  return id;
+};
+global.clearTimeout = (id) => {
+  pendingTimers.delete(id);
+};
+
+const flushRaf = () => {
+  while (rafCallbacks.length > 0) rafCallbacks.shift()();
+};
+const flushAsync = async () => {
+  for (let round = 0; round < 5; round++) {
+    flushRaf();
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+  }
+  flushRaf();
+};
+
+eval(code);
+
+(async () => {
+  await flushAsync();
+
+  const filterBar = actionRow.querySelector('.jetski-attention-filter-bar');
+  const btnNeedsMe = filterBar.querySelector('button[data-bucket="needs-me"]');
+  assert.strictEqual(btnNeedsMe.getAttribute('aria-label'), '🚨 Needs Me: 7 (shown)');
+
+  const inboxEl = sidebarWrap.querySelector('.jetski-needs-reaction-inbox');
+  assert(inboxEl, 'Needs-Reaction inbox must mount');
+  const urgentPill = inboxEl.querySelector('[data-testid="jetski-inbox-urgent-pill"]');
+  assert.strictEqual(urgentPill.textContent, '🔥 7');
+
+  const rows = inboxEl.querySelectorAll('[data-testid="jetski-inbox-row"]');
+  const detailByCid = new Map();
+  for (const r of rows) {
+    const cid = r.getAttribute('data-cascade-id');
+    const det = r.querySelector('[data-testid="jetski-inbox-detail"]');
+    detailByCid.set(cid, {
+      tier: r.getAttribute('data-tier'),
+      detail: det ? det.textContent : '',
+    });
+  }
+
+  assert.strictEqual(detailByCid.size, 7);
+  assert.strictEqual(
+    detailByCid.get('chat-snake-ws').detail,
+    'Awaiting answer: Roll out to canary?'
+  );
+  assert.strictEqual(
+    detailByCid.get('chat-toolcall-meta').detail,
+    'Awaiting answer: Pick database shard'
+  );
+  assert.strictEqual(
+    detailByCid.get('chat-toolcall-pr').detail,
+    'Awaiting answer: Proceed with wipe?'
+  );
+  assert.strictEqual(
+    detailByCid.get('chat-toolcall-string-array').detail,
+    'Awaiting answer: Deploy now?'
+  );
+  assert.strictEqual(
+    detailByCid.get('chat-generic-payload').detail,
+    'Awaiting answer: Confirm migration?'
+  );
+  assert.strictEqual(
+    detailByCid.get('chat-direct-step-questions').detail,
+    'Awaiting answer: Which branch to merge?'
+  );
+  assert.strictEqual(
+    detailByCid.get('chat-oneof-direct').detail,
+    'Awaiting answer: Approve cherry-pick?'
+  );
+
+  for (const cid of cids) {
+    assert.strictEqual(detailByCid.get(cid).tier, 'urgent', `Urgent tier expected for ${cid}`);
+  }
+
+  window.__jetskiClosedChatsFilterCleanup();
+  assert.strictEqual(pendingTimers.size, 0, 'Zero dangling timers after cleanup');
+
+  console.log('R76_ASSERTIONS_PASSED');
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"""
+    env = os.environ.copy()
+    env["ELECTRON_RUN_AS_NODE"] = "1"
+    res = subprocess.run(
+        [node_bin, "-e", harness, js_path],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(
+        res.returncode,
+        0,
+        f"R76 JS harness failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+    )
+    self.assertIn("R76_ASSERTIONS_PASSED", res.stdout)
+
 
 if __name__ == "__main__":
   unittest.main()

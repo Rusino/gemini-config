@@ -1045,6 +1045,187 @@ class TestProjectActivityBadge(unittest.TestCase):
       self.assertEqual(run_b, {})
       self.assertEqual(unread_b, {"p1": 1})
 
+  def test_r76_ask_question_waiting_steps_and_payload_variants(self):
+    known_projects = {"p1": ("/tmp/p1.json", {"id": "p1", "name": "Breaking Chats"})}
+    summaries = {
+        "c-snake-ws": {
+            "status": 1,
+            "trajectoryMetadata": {"projectId": "p1"},
+            "waiting_steps": [{
+                "index": 0,
+                "status": "CORTEX_STEP_STATUS_WAITING",
+                "type": 138,
+                "requestedInteraction": {
+                    "interaction": {
+                        "case": "askQuestion",
+                        "value": {"questions": [{"question": "Roll out to canary?"}]},
+                    }
+                },
+            }],
+        },
+        "c-toolcall-meta": {
+            "status": 1,
+            "trajectoryMetadata": {"projectId": "p1"},
+        },
+        "c-toolcall-pr": {
+            "status": 1,
+            "trajectoryMetadata": {"projectId": "p1"},
+        },
+        "c-toolcall-string-array": {
+            "status": 1,
+            "trajectoryMetadata": {"projectId": "p1"},
+        },
+        "c-generic-payload": {
+            "status": 1,
+            "trajectoryMetadata": {"projectId": "p1"},
+        },
+        "c-direct-step-questions": {
+            "status": 1,
+            "trajectoryMetadata": {"projectId": "p1"},
+        },
+        "c-oneof-direct": {
+            "status": 1,
+            "trajectoryMetadata": {"projectId": "p1"},
+        },
+    }
+    trajectories = {
+        "c-snake-ws": {
+            "trajectory": {
+                "steps": [
+                    {"type": 14, "status": 3},
+                ]
+            }
+        },
+        "c-toolcall-meta": {
+            "trajectory": {
+                "steps": [
+                    {"type": 14, "status": 3},
+                    {
+                        "type": 132,
+                        "status": 9,
+                        "metadata": {
+                            "toolCall": {
+                                "name": "ask_question",
+                                "argumentsJson": json.dumps(
+                                    {"questions": [{"question": "Pick database shard"}]}
+                                ),
+                            }
+                        },
+                    },
+                ]
+            }
+        },
+        "c-toolcall-pr": {
+            "trajectory": {
+                "steps": [
+                    {"type": 14, "status": 3},
+                    {
+                        "type": 15,
+                        "status": 9,
+                        "plannerResponse": {
+                            "toolCalls": [{
+                                "name": "askQuestion",
+                                "argumentsJson": json.dumps(
+                                    {"question": "Proceed with wipe?"}
+                                ),
+                            }]
+                        },
+                    },
+                ]
+            }
+        },
+        "c-toolcall-string-array": {
+            "trajectory": {
+                "steps": [
+                    {"type": 14, "status": 3},
+                    {
+                        "type": 132,
+                        "status": 9,
+                        "metadata": {
+                            "toolCall": {
+                                "name": "ask_question",
+                                "argumentsJson": json.dumps(
+                                    {"questions": ["Deploy now?"]}
+                                ),
+                            }
+                        },
+                    },
+                ]
+            }
+        },
+        "c-generic-payload": {
+            "trajectory": {
+                "steps": [
+                    {"type": 14, "status": 3},
+                    {
+                        "type": 132,
+                        "status": 9,
+                        "generic": {
+                            "result": {
+                                "payload": {
+                                    "ask_question": {
+                                        "questions": [{"question": "Confirm migration?"}]
+                                    }
+                                }
+                            }
+                        },
+                    },
+                ]
+            }
+        },
+        "c-direct-step-questions": {
+            "trajectory": {
+                "steps": [
+                    {"type": 14, "status": 3},
+                    {
+                        "type": 138,
+                        "status": 9,
+                        "questions": [{"question": "Which branch to merge?"}],
+                    },
+                ]
+            }
+        },
+        "c-oneof-direct": {
+            "trajectory": {
+                "steps": [
+                    {"type": 14, "status": 3},
+                    {
+                        "type": 138,
+                        "status": 9,
+                        "requestedInteraction": {
+                            "interaction": {
+                                "ask_question": {
+                                    "questions": [{"question": "Approve cherry-pick?"}]
+                                }
+                            }
+                        },
+                    },
+                ]
+            }
+        },
+    }
+    running, blocked, unread = badge.compute_project_activity(
+        summaries, known_projects, [], trajectories=trajectories
+    )
+    self.assertEqual(running, {})
+    self.assertEqual(blocked, {"p1": 7})
+    self.assertEqual(unread, {})
+
+    expected = {
+        "c-snake-ws": "Awaiting answer: Roll out to canary?",
+        "c-toolcall-meta": "Awaiting answer: Pick database shard",
+        "c-toolcall-pr": "Awaiting answer: Proceed with wipe?",
+        "c-toolcall-string-array": "Awaiting answer: Deploy now?",
+        "c-generic-payload": "Awaiting answer: Confirm migration?",
+        "c-direct-step-questions": "Awaiting answer: Which branch to merge?",
+        "c-oneof-direct": "Awaiting answer: Approve cherry-pick?",
+    }
+    for cid, detail in expected.items():
+      act, det = badge.resolve_conversation_activity(
+          cid, summaries[cid], summaries, trajectories=trajectories
+      )
+      self.assertEqual((act, det), ("blocked", detail), f"Failed for {cid}")
+
 
 if __name__ == "__main__":
   unittest.main()
