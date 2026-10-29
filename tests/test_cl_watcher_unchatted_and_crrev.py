@@ -59,11 +59,27 @@ class ClWatcherUnchattedAndCrrevTest(unittest.TestCase):
             "proj-tc",
             "2026-10-29T16:30:00Z",
         ),
+        "c-space": self._make_ls_summary(
+            "[14:10] ⦿ cl/1409697 1410416 indent fix",
+            "proj-skia",
+            "2026-10-29T14:10:00Z",
+        ),
+        "c-pr-group": self._make_ls_summary(
+            "[10:00] ⦿ PR #195122 / #195384 WebParagraph update",
+            "proj-wp",
+            "2026-10-29T15:00:00Z",
+        ),
+        "c-bug": self._make_ls_summary(
+            "[15:17] ⦿ cl/1404136 b/557269199 RenameFont OOB",
+            "proj-skia",
+            "2026-10-29T15:17:00Z",
+        ),
     }
     proj_names = {
         "proj-cr": "Chromium",
         "proj-skia": "Skia",
         "proj-tc": "TextClusters API",
+        "proj-wp": "WebParagraph",
     }
     with mock.patch.object(
         w.cl, "_fetch_ls_summaries_for_audit", return_value=summaries
@@ -87,6 +103,30 @@ class ClWatcherUnchattedAndCrrevTest(unittest.TestCase):
 
     self.assertIn("gerrit:8663038", by_key)
     self.assertFalse(by_key["gerrit:8663038"]["single_target"])
+    self.assertIn("gerrit:8663538", by_key)
+    self.assertEqual(by_key["gerrit:8663538"]["conversation_id"], "c-multi")
+    self.assertEqual(
+        by_key["gerrit:8663538"].get("preferred_host"),
+        "chromium-review.googlesource.com",
+    )
+    self.assertFalse(by_key["gerrit:8663538"]["single_target"])
+
+    self.assertIn("gerrit:1409697", by_key)
+    self.assertIn("gerrit:1410416", by_key)
+    self.assertEqual(by_key["gerrit:1409697"]["conversation_id"], "c-space")
+    self.assertEqual(by_key["gerrit:1410416"]["conversation_id"], "c-space")
+    self.assertFalse(by_key["gerrit:1409697"]["single_target"])
+
+    self.assertIn("github:195122", by_key)
+    self.assertIn("github:195384", by_key)
+    self.assertEqual(by_key["github:195122"]["conversation_id"], "c-pr-group")
+    self.assertEqual(by_key["github:195384"]["conversation_id"], "c-pr-group")
+    self.assertFalse(by_key["github:195122"]["single_target"])
+
+    self.assertIn("gerrit:1404136", by_key)
+    self.assertTrue(by_key["gerrit:1404136"]["single_target"])
+    self.assertNotIn("piper:557269199", by_key)
+    self.assertNotIn("gerrit:557269199", by_key)
 
     # Roll badge truncation must preserve crrev/c/<id> intact
     calls = []
@@ -468,6 +508,255 @@ console.log(JSON.stringify({
     self.assertIn("Start chat", out["card"])
     self.assertIn("startChat(", out["card"])
     self.assertIn("start chat", out["row"])
+
+  def test_sync_once_links_archived_chat_and_companion_cls_and_prs(self):
+    summaries = {
+        "c-archived-1409697": {
+            "annotations": {
+                "title": "[15:11] ⦿ cl/1409697 first-line indent review",
+                "archived": True,
+            },
+            "trajectoryMetadata": {
+                "projectId": "proj-skia",
+                "lastModifiedTime": "2026-10-29T15:11:00Z",
+                "parentConversationId": "",
+                "isBattleModeFork": False,
+                "sourceMetadata": None,
+            },
+        },
+        "c-active-195122": {
+            "annotations": {
+                "title": "[10:00] ⦿ PR #195122 Avoid browser queries",
+                "archived": False,
+            },
+            "trajectoryMetadata": {
+                "projectId": "proj-wp",
+                "lastModifiedTime": "2026-10-29T14:00:00Z",
+                "parentConversationId": "",
+                "isBattleModeFork": False,
+                "sourceMetadata": None,
+            },
+        },
+    }
+    proj_names = {
+        "proj-skia": "Skia",
+        "proj-wp": "WebParagraph",
+    }
+    remote = [
+        {
+            "item_key": "gerrit:1409697",
+            "kind": "gerrit",
+            "target_id": "1409697",
+            "preferred_host": "skia-review.googlesource.com",
+            "conversation_id": "",
+            "title": "",
+            "project_id": "proj-skia",
+            "project_name": "Skia",
+            "chat_last_modified": "",
+            "single_target": True,
+            "chat_busy": False,
+        },
+        {
+            "item_key": "gerrit:1410416",
+            "kind": "gerrit",
+            "target_id": "1410416",
+            "preferred_host": "skia-review.googlesource.com",
+            "conversation_id": "",
+            "title": "",
+            "project_id": "proj-skia",
+            "project_name": "Skia",
+            "chat_last_modified": "",
+            "single_target": True,
+            "chat_busy": False,
+        },
+        {
+            "item_key": "github:195123",
+            "kind": "github",
+            "target_id": "195123",
+            "preferred_host": "",
+            "conversation_id": "",
+            "title": "",
+            "project_id": "proj-wp",
+            "project_name": "WebParagraph",
+            "chat_last_modified": "",
+            "single_target": True,
+            "chat_busy": False,
+        },
+    ]
+
+    def fake_gerrit_status(cl_id, *args, **kwargs):
+      is_comp = cl_id == "1410416"
+      return {
+          "ok": True,
+          "host": "skia-review.googlesource.com",
+          "url": f"https://skia-review.googlesource.com/c/{cl_id}",
+          "status": "NEW",
+          "phase": "WAITING_ON_REVIEWERS" if is_comp else "NEEDS_YOUR_ACTION",
+          "subject": (
+              "[skparagraph] Fix first-line indent edge cases"
+              if is_comp
+              else "[skparagraph] Add first-line indentation to Paragraph::layout"
+          ),
+          "owner_name": "Julia Lavrova" if is_comp else "William Selna",
+          "owner_email": "jlavrova@google.com" if is_comp else "wselna123@gmail.com",
+          "role": "author" if is_comp else "reviewer (goog)",
+          "is_self": is_comp,
+          "is_external": not is_comp,
+          "is_draft": is_comp,
+          "in_development": is_comp,
+          "is_watching": False,
+          "reviewer_removed": False,
+          "patchset": 2 if is_comp else 3,
+          "revision": "rev2222" if is_comp else "rev3333",
+          "in_my_attention": not is_comp,
+          "waiting_on": [],
+          "merge_conflict": False,
+          "tree_red": False,
+          "cr_summary": "0",
+          "cq_status": "",
+          "cq_failed": False,
+          "last_msg_author": "jlavrova@google.com" if is_comp else "wselna123@gmail.com",
+          "last_msg_date": "2026-10-29 19:07:54.000000000",
+          "last_msg_et": "15:07 ET",
+          "last_msg_age": "5m ago",
+          "last_msg_snippet": "Uploaded patchset 2",
+          "submitted": "",
+          "submitted_et": "",
+          "submitted_age": "",
+          "status_changed_raw": "2026-10-29 19:07:54.000000000",
+          "status_changed_et": "15:07 ET",
+          "status_changed_age": "5m ago",
+          "post_submit": None,
+      }
+
+    def fake_github_status(pr_id, *args, **kwargs):
+      return {
+          "ok": True,
+          "host": "",
+          "url": f"https://github.com/flutter/flutter/pull/{pr_id}",
+          "status": "OPEN",
+          "phase": "WAITING_ON_REVIEWERS",
+          "subject": "[web_paragraph] Avoid browser queries (companion to #195122)",
+          "owner_name": "Julia Lavrova",
+          "owner_email": "jlavrova@google.com",
+          "role": "author",
+          "is_self": True,
+          "is_external": False,
+          "is_draft": True,
+          "in_development": True,
+          "is_watching": False,
+          "reviewer_removed": False,
+          "patchset": 1,
+          "revision": "rev1111",
+          "in_my_attention": False,
+          "waiting_on": [],
+          "merge_conflict": False,
+          "tree_red": False,
+          "cr_summary": "",
+          "cq_status": "",
+          "cq_failed": False,
+          "last_msg_author": "jlavrova@google.com",
+          "last_msg_date": "2026-10-29 18:00:00.000000000",
+          "last_msg_et": "14:00 ET",
+          "last_msg_age": "1h ago",
+          "last_msg_snippet": "Companion PR",
+          "submitted": "",
+          "submitted_et": "",
+          "submitted_age": "",
+          "status_changed_raw": "2026-10-29 18:00:00.000000000",
+          "status_changed_et": "14:00 ET",
+          "status_changed_age": "1h ago",
+          "post_submit": None,
+      }
+
+    def fake_related(host, cl_id):
+      if cl_id == "1410416":
+        return ["1409697"]
+      return []
+
+    empty_gmail = {
+        "thread_ids": [],
+        "inbox_thread_ids": [],
+        "total_msgs": 0,
+        "inbox_msgs": 0,
+        "trash_msgs": 0,
+        "unread_msgs": 0,
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+      state_path = os.path.join(tmp, "state.json")
+      w._RELATED_CLS_CACHE.clear()
+      with mock.patch.object(w, "STATE_FILE", state_path), \
+           mock.patch.object(
+               w.cl, "_fetch_ls_summaries_for_audit", return_value=summaries
+           ), \
+           mock.patch.object(w, "load_project_names", return_value=proj_names), \
+           mock.patch.object(w, "fetch_gardener_snapshot", return_value=({}, [])), \
+           mock.patch.object(w, "discover_open_remote_changes", return_value=remote), \
+           mock.patch.object(
+               w, "fetch_gerrit_cl_status", side_effect=fake_gerrit_status
+           ), \
+           mock.patch.object(
+               w, "fetch_github_pr_status", side_effect=fake_github_status
+           ), \
+           mock.patch.object(
+               w, "fetch_gerrit_related_cl_ids", side_effect=fake_related
+           ), \
+           mock.patch.object(
+               w, "fetch_gmail_status_for_id", return_value=empty_gmail
+           ):
+        state = w.sync_once(
+            wake_chats=False, update_titles=False, skia_dir="/nonexistent"
+        )
+
+    # 1. 1409697 was matched to its archived chat
+    self.assertIn("gerrit:1409697@c-archived-1409697", state["items"])
+    rec_parent = state["items"]["gerrit:1409697@c-archived-1409697"]
+    self.assertEqual(rec_parent["conversation_id"], "c-archived-1409697")
+    self.assertTrue(rec_parent["chat_archived"])
+
+    # 2. 1410416 companion was linked to 1409697's archived chat
+    self.assertIn("gerrit:1410416@c-archived-1409697", state["items"])
+    rec_comp = state["items"]["gerrit:1410416@c-archived-1409697"]
+    self.assertEqual(rec_comp["conversation_id"], "c-archived-1409697")
+    self.assertEqual(rec_comp["companion_to"], "gerrit:1409697")
+    self.assertFalse(rec_comp["single_target"])
+
+    # 3. 195123 companion PR was linked to 195122's active chat
+    self.assertIn("github:195123@c-active-195122", state["items"])
+    rec_pr_comp = state["items"]["github:195123@c-active-195122"]
+    self.assertEqual(rec_pr_comp["conversation_id"], "c-active-195122")
+    self.assertEqual(rec_pr_comp["companion_to"], "github:195122")
+    self.assertFalse(rec_pr_comp["single_target"])
+
+    # None of them remain unchatted
+    self.assertNotIn("gerrit:1409697@unchatted", state["items"])
+    self.assertNotIn("gerrit:1410416@unchatted", state["items"])
+    self.assertNotIn("github:195123@unchatted", state["items"])
+
+    # 4. start_chat_for_item reuses the linked companion chat
+    with tempfile.TemporaryDirectory() as tmp2:
+      state_path2 = os.path.join(tmp2, "state.json")
+      with open(state_path2, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+      with mock.patch.object(w, "STATE_FILE", state_path2), \
+           mock.patch.object(
+               w.cl, "_fetch_ls_summaries_for_audit", return_value=summaries
+           ), \
+           mock.patch.object(w, "load_project_names", return_value=proj_names), \
+           mock.patch.object(
+               w, "fetch_gerrit_related_cl_ids", side_effect=fake_related
+           ):
+        res_comp = w.start_chat_for_item("gerrit:1410416")
+        res_arch = w.start_chat_for_item("gerrit:1409697")
+
+    self.assertTrue(res_comp["ok"])
+    self.assertTrue(res_comp["already_existed"])
+    self.assertEqual(res_comp["conversation_id"], "c-archived-1409697")
+
+    self.assertTrue(res_arch["ok"])
+    self.assertTrue(res_arch["already_existed"])
+    self.assertEqual(res_arch["conversation_id"], "c-archived-1409697")
 
 
 if __name__ == "__main__":

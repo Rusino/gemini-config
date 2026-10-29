@@ -89,9 +89,26 @@ RE_CL_ID = re.compile(
     r"(?:\b(?:crrev(?:\.com)?/c|skrev(?:\.com)?|cl)/|\bCL\s+)(\d{6,10})\b",
     re.IGNORECASE,
 )
+RE_CL_ID_GROUP = re.compile(
+    r"(?P<prefix>\b(?:crrev(?:\.com)?/c|skrev(?:\.com)?|cl)/|\bCL\s+)"
+    r"(?P<first>\d{6,10})"
+    r"(?P<rest>(?:(?:\s*(?:[/,&+]|\band\b)\s*|\s+)(?<![a-zA-Z_]/)(?<![a-zA-Z_])\d{6,10}\b)*)",
+    re.IGNORECASE,
+)
 # Avoid matching flutter#160251 when it is a GitHub issue next to a Skia CL,
 # unless explicitly prefixed with PR
 RE_PR_ID = re.compile(r"(?:\bPR\s*#?|\bpull/)(\d{5,7})\b", re.IGNORECASE)
+RE_PR_ID_GROUP = re.compile(
+    r"(?P<prefix>\b(?:PR\s*#?|pull/))"
+    r"(?P<first>\d{5,7})"
+    r"(?P<rest>(?:(?:\s*(?:[/,&+]|\band\b)\s*|\s+#?|\s+)(?<![a-zA-Z_]/)(?<![a-zA-Z_])#?\d{5,7}\b)*)",
+    re.IGNORECASE,
+)
+# Match explicit companion references in PR subjects/bodies (e.g. companion to #195122)
+RE_COMPANION_PR_REF = re.compile(
+    r"(?:companion\s+(?:to\s+)?(?:PR\s*#?|#)|(?:re|for)\s+(?:PR\s*#?|#))(\d{5,7})\b",
+    re.IGNORECASE,
+)
 # Strip any trailing roll badge we previously attached to a title
 TITLE_TOPIC_MAX = 38
 RE_ROLL_BADGE = re.compile(r"\s*\[(?:⏳|✓|🔴|🔄)[^\]]*\]\s*$")
@@ -480,10 +497,14 @@ def load_project_names() -> dict[str, str]:
   return res
 
 
-def _chat_candidate_rank(item: dict[str, Any]) -> tuple[bool, bool, str]:
-  """Ranks candidate chats for one CL/PR: domain project > 1:1 target > newest."""
-  # Prefer domain project over meta tooling, dedicated 1:1 chat over multi-target, then newest
+def _chat_candidate_rank(
+    item: dict[str, Any],
+) -> tuple[bool, bool, bool, str]:
+  """Ranks candidate chats for one CL/PR: active > domain project > 1:1 target > newest."""
+  # Prefer active chat over archived, domain project over meta tooling,
+  # dedicated 1:1 chat over multi-target, then newest
   return (
+      not bool(item.get("chat_archived", False)),
       item.get("project_name", "Unassigned") not in META_PROJECT_NAMES,
       bool(item.get("single_target", True)),
       str(item.get("chat_last_modified") or ""),
@@ -520,8 +541,49 @@ def overlay_live_chat_busy(state: dict[str, Any]) -> None:
       item["chat_busy"] = is_chat_busy(s, title)
 
 
-def discover_active_cl_chats() -> list[dict[str, Any]]:
-  """Scans active (`⦿` / `⏳`) conversations and maps them to CLs or GitHub PRs."""
+def extract_cl_ids_with_hosts(text: str) -> dict[str, str]:
+  """Extracts all Gerrit/Piper CL IDs from a title, preserving Gerrit host hints.
+
+  Handles multi-CL lists separated by slashes, commas, ampersands, or spaces
+  without colliding with bug numbers like b/557269199.
+  """
+  cls_hosts: dict[str, str] = {}
+  for m in RE_CL_ID_GROUP.finditer(text):
+    pref = m.group("prefix").lower()
+    hint = (
+        GERRIT_CHROMIUM_HOST
+        if "crrev" in pref
+        else (GERRIT_SKIA_HOST if "skrev" in pref else "")
+    )
+    first = m.group("first")
+    if first not in cls_hosts or (hint and not cls_hosts[first]):
+      cls_hosts[first] = hint
+    rest = m.group("rest")
+    if rest:
+      for extra in re.finditer(r"\b(\d{6,10})\b", rest):
+        eid = extra.group(1)
+        if eid not in cls_hosts or (hint and not cls_hosts[eid]):
+          cls_hosts[eid] = hint
+  return cls_hosts
+
+
+def extract_pr_ids(text: str) -> list[str]:
+  """Extracts GitHub PR numbers from a title, including grouped PR lists."""
+  prs: list[str] = []
+  for m in RE_PR_ID_GROUP.finditer(text):
+    prs.append(m.group("first"))
+    rest = m.group("rest")
+    if rest:
+      for extra in re.finditer(r"\b(\d{5,7})\b", rest):
+        prs.append(extra.group(1))
+  # Deduplicate while preserving first appearance order
+  return list(dict.fromkeys(prs))
+
+
+def discover_active_cl_chats(
+    include_archived: bool = False,
+) -> list[dict[str, Any]]:
+  """Scans conversations and maps them to CLs or GitHub PRs."""
   summaries = cl._fetch_ls_summaries_for_audit() or {}
   proj_names = load_project_names()
   discovered: list[dict[str, Any]] = []
@@ -530,7 +592,8 @@ def discover_active_cl_chats() -> list[dict[str, Any]]:
     if not isinstance(s, dict):
       continue
     ann = s.get("annotations") or {}
-    if ann.get("archived"):
+    is_archived = bool(ann.get("archived"))
+    if is_archived and not include_archived:
       continue
     meta = s.get("trajectoryMetadata") or {}
     if meta.get("parentConversationId") or meta.get("isBattleModeFork"):
@@ -538,10 +601,10 @@ def discover_active_cl_chats() -> list[dict[str, Any]]:
     if (meta.get("sourceMetadata") or {}).get("tool"):
       continue
     title = str(ann.get("title") or s.get("summary") or "").strip()
-    # Keep both ⦿ (needs user) and ⏳ (waiting timer/external) chats on Flight Deck
-    if "⦿" not in title and "⏳" not in title:
+    # Active chats require ⦿ (needs user) or ⏳ (waiting timer/external)
+    if not is_archived and "⦿" not in title and "⏳" not in title:
       continue
-    chat_busy = is_chat_busy(s, title)
+    chat_busy = False if is_archived else is_chat_busy(s, title)
 
     pid = str(meta.get("projectId") or "").strip()
     pname = proj_names.get(pid, "Unassigned")
@@ -550,20 +613,9 @@ def discover_active_cl_chats() -> list[dict[str, Any]]:
       continue
     last_mod = str(meta.get("lastModifiedTime") or meta.get("createdAt") or "")
 
-    # Deduplicate IDs while preserving Gerrit host hints from crrev/c/ and skrev/
-    cls_hosts: dict[str, str] = {}
-    for m in RE_CL_ID.finditer(title):
-      cl_id = m.group(1)
-      raw_tok = m.group(0).lower()
-      hint = (
-          GERRIT_CHROMIUM_HOST
-          if raw_tok.startswith("crrev")
-          else (GERRIT_SKIA_HOST if raw_tok.startswith("skrev") else "")
-      )
-      if cl_id not in cls_hosts or (hint and not cls_hosts[cl_id]):
-        cls_hosts[cl_id] = hint
+    cls_hosts = extract_cl_ids_with_hosts(title)
     cls_found = list(cls_hosts.keys())
-    prs_found = list(dict.fromkeys(RE_PR_ID.findall(title)))
+    prs_found = extract_pr_ids(title)
     if not cls_found and not prs_found:
       continue
     # A slash list like "PR #194466/#194475" or multiple IDs means the chat is not 1:1 with one CL
@@ -591,6 +643,7 @@ def discover_active_cl_chats() -> list[dict[str, Any]]:
           "chat_last_modified": last_mod,
           "single_target": single_target,
           "chat_busy": chat_busy,
+          "chat_archived": is_archived,
       })
     for pr_id in prs_found:
       discovered.append({
@@ -605,6 +658,7 @@ def discover_active_cl_chats() -> list[dict[str, Any]]:
           "chat_last_modified": last_mod,
           "single_target": single_target,
           "chat_busy": chat_busy,
+          "chat_archived": is_archived,
       })
 
   # Collapse multiple chats referencing the same CL/PR to one canonical owner
@@ -620,6 +674,128 @@ def discover_active_cl_chats() -> list[dict[str, Any]]:
   # Keep newest chat modification first for deterministic dashboard sort
   deduped.sort(key=lambda x: x["chat_last_modified"], reverse=True)
   return deduped
+
+
+def attach_archived_chats_to_open_changes(
+    remote_unchatted: list[dict[str, Any]],
+    all_chats: list[dict[str, Any]] | None = None,
+) -> None:
+  """Links open remote changes with no active chat to their archived chat if one exists."""
+  if not remote_unchatted:
+    return
+  candidates = (
+      all_chats
+      if all_chats is not None
+      else discover_active_cl_chats(include_archived=True)
+  )
+  by_key: dict[str, dict[str, Any]] = {
+      c["item_key"]: c for c in candidates if c.get("conversation_id")
+  }
+  for item in remote_unchatted:
+    if item.get("conversation_id"):
+      continue
+    ikey = item.get("item_key")
+    matched = by_key.get(ikey)
+    if matched:
+      item["conversation_id"] = matched["conversation_id"]
+      item["title"] = matched["title"]
+      item["project_id"] = matched["project_id"]
+      item["project_name"] = matched["project_name"]
+      item["chat_last_modified"] = matched.get("chat_last_modified", "")
+      item["chat_busy"] = matched.get("chat_busy", False)
+      item["chat_archived"] = matched.get("chat_archived", True)
+      item["single_target"] = matched.get("single_target", True)
+
+
+_RELATED_CLS_CACHE: dict[str, list[str]] = {}
+
+
+def fetch_gerrit_related_cl_ids(host: str, cl_id: str) -> list[str]:
+  """Fetches related change IDs from Gerrit's revision chain endpoint."""
+  cache_key = f"{host}:{cl_id}"
+  if cache_key in _RELATED_CLS_CACHE:
+    return _RELATED_CLS_CACHE[cache_key]
+
+  url = f"https://{host}/changes/{cl_id}/revisions/current/related"
+  related_ids: list[str] = []
+  try:
+    req = urllib.request.Request(url, headers={"User-Agent": "CLFlightDeck/1.0"})
+    with urllib.request.urlopen(req, timeout=8) as resp:
+      raw = resp.read().decode("utf-8", errors="replace")
+    if raw.startswith(")]}'"):
+      raw = raw[4:]
+    data = json.loads(raw)
+    for ch in data.get("changes") or []:
+      num = str(ch.get("_change_number") or "").strip()
+      if num and num != str(cl_id) and num not in related_ids:
+        related_ids.append(num)
+  except Exception:
+    # Fail open when Gerrit /related is unreachable or change has no revisions
+    pass
+
+  _RELATED_CLS_CACHE[cache_key] = related_ids
+  return related_ids
+
+
+def link_companion_changes_to_parent_chats(
+    active_discovered: list[dict[str, Any]],
+    fetched_cache: dict[str, dict[str, Any]],
+    all_chat_candidates: list[dict[str, Any]] | None = None,
+) -> None:
+  """Links unchatted companion CLs or PRs to their parent change's chat."""
+  # Index known chatted changes from active discovered and any archived chats
+  known_chats: dict[str, dict[str, Any]] = {
+      d["item_key"]: d
+      for d in active_discovered
+      if d.get("conversation_id")
+  }
+  if all_chat_candidates is not None:
+    for c in all_chat_candidates:
+      ckey = c.get("item_key")
+      if ckey and c.get("conversation_id") and ckey not in known_chats:
+        known_chats[ckey] = c
+
+  for d in active_discovered:
+    if d.get("conversation_id"):
+      continue
+    ikey = d.get("item_key", "")
+    info = fetched_cache.get(ikey) or {}
+    parent: dict[str, Any] | None = None
+    parent_key = ""
+
+    if d.get("kind") == "gerrit":
+      host = str(
+          d.get("preferred_host")
+          or info.get("host")
+          or GERRIT_SKIA_HOST
+      )
+      related = fetch_gerrit_related_cl_ids(host, d.get("target_id", ""))
+      for rel_id in related:
+        cand_key = f"gerrit:{rel_id}"
+        if cand_key in known_chats:
+          parent = known_chats[cand_key]
+          parent_key = cand_key
+          break
+    elif d.get("kind") == "github":
+      subj = str(info.get("subject") or d.get("title") or "")
+      m = RE_COMPANION_PR_REF.search(subj)
+      if m:
+        cand_key = f"github:{m.group(1)}"
+        if cand_key in known_chats:
+          parent = known_chats[cand_key]
+          parent_key = cand_key
+
+    if parent and parent.get("conversation_id"):
+      d["conversation_id"] = parent["conversation_id"]
+      d["title"] = parent.get("title", "")
+      d["project_id"] = parent.get("project_id", "")
+      d["project_name"] = parent.get("project_name", "")
+      d["chat_last_modified"] = parent.get("chat_last_modified", "")
+      d["chat_busy"] = parent.get("chat_busy", False)
+      d["chat_archived"] = parent.get("chat_archived", False)
+      d["single_target"] = False
+      d["companion_to"] = parent_key
+      parent["single_target"] = False
 
 
 def load_ignored_cls(path: str = IGNORED_CLS_FILE) -> set[str]:
@@ -2073,7 +2249,9 @@ def update_chat_roll_badge(conv_id: str, current_title: str, badge: str) -> None
     avail = max(12, TITLE_TOPIC_MAX - 1 - len(badge))
     # Discovery reads the CL or PR from the title, so a cut must never split it
     raw_tokens = [
-        m.group(0) for r in (RE_CL_ID, RE_PR_ID) for m in r.finditer(base_no_badge)
+        m.group(0)
+        for r in (RE_CL_ID_GROUP, RE_PR_ID_GROUP)
+        for m in r.finditer(base_no_badge)
     ]
     rest = base_no_badge
     tokens: list[str] = []
@@ -2179,6 +2357,56 @@ def start_chat_for_item(item_key: str) -> dict[str, Any]:
           "chat_url": f"{jetski_box_url()}/c/{existing_cid}",
       }
 
+  # Reuse parent chat for companion Gerrit CLs or GitHub PRs
+  if ikey.startswith("gerrit:"):
+    tid = ikey.split(":", 1)[1]
+    host = str(
+        (rec or {}).get("host")
+        or (rec or {}).get("preferred_host")
+        or GERRIT_SKIA_HOST
+    )
+    related = fetch_gerrit_related_cl_ids(host, tid)
+    for rel_id in related:
+      parent_key = f"gerrit:{rel_id}"
+      for candidate in discover_active_cl_chats(include_archived=True):
+        if candidate.get("item_key") == parent_key and candidate.get("conversation_id"):
+          existing_cid = str(candidate["conversation_id"])
+          if isinstance(rec, dict) and not str(rec.get("conversation_id") or "").strip():
+            if matched_key:
+              items.pop(matched_key, None)
+            items.pop(unchatted_key, None)
+            rec["conversation_id"] = existing_cid
+            rec["composite_key"] = f"{ikey}@{existing_cid}"
+            rec["companion_to"] = parent_key
+            items[f"{ikey}@{existing_cid}"] = rec
+            save_watcher_state(state)
+          return {
+              "ok": True,
+              "already_existed": True,
+              "conversation_id": existing_cid,
+              "chat_url": f"{jetski_box_url()}/c/{existing_cid}",
+          }
+
+  # Reuse an archived chat if one was already completed for this CL/PR
+  for archived in discover_active_cl_chats(include_archived=True):
+    if archived.get("item_key") == ikey and archived.get("conversation_id"):
+      existing_cid = str(archived["conversation_id"])
+      if isinstance(rec, dict) and not str(rec.get("conversation_id") or "").strip():
+        if matched_key:
+          items.pop(matched_key, None)
+        items.pop(unchatted_key, None)
+        rec["conversation_id"] = existing_cid
+        rec["composite_key"] = f"{ikey}@{existing_cid}"
+        rec["chat_archived"] = True
+        items[f"{ikey}@{existing_cid}"] = rec
+        save_watcher_state(state)
+      return {
+          "ok": True,
+          "already_existed": True,
+          "conversation_id": existing_cid,
+          "chat_url": f"{jetski_box_url()}/c/{existing_cid}",
+      }
+
   if not isinstance(rec, dict):
     return {"ok": False, "error": f"Unknown item {ikey}"}
 
@@ -2272,6 +2500,8 @@ def sync_once(
   remote_unchatted = discover_open_remote_changes(
       {d["item_key"] for d in chatted}
   )
+  all_chats = discover_active_cl_chats(include_archived=True)
+  attach_archived_chats_to_open_changes(remote_unchatted, all_chats=all_chats)
   discovered = chatted + remote_unchatted
 
   # Cache fetched CL/PR metadata so multiple chats referencing the same CL don't re-fetch
@@ -2301,6 +2531,10 @@ def sync_once(
     if not d.get("conversation_id") and info.get("reviewer_removed"):
       continue
     active_discovered.append(d)
+
+  link_companion_changes_to_parent_chats(
+      active_discovered, fetched_cache, all_chat_candidates=all_chats
+  )
 
   unique_tids = sorted(
       {d["target_id"] for d in active_discovered if d.get("target_id")}
@@ -2420,7 +2654,7 @@ def sync_once(
 
     badge = post.get("compact_badge", "")
 
-    if cid and update_titles and badge:
+    if cid and update_titles and badge and not d.get("companion_to"):
       update_chat_roll_badge(cid, d["title"], badge)
 
     # Detect significant transitions only when `prev` existed (no spam on initial seed)
@@ -3029,7 +3263,10 @@ function rowTime(it) {
 function chatActionHtml(it, data, compact) {
   const chat = chatUrl(it, data);
   if (chat) {
-    return compact ? link(chat, 'chat', 'chat') : link(chat, 'Open chat', 'btn quiet');
+    const label = it.chat_archived
+      ? (compact ? 'chat (archived)' : 'Open chat (archived)')
+      : (compact ? 'chat' : 'Open chat');
+    return compact ? link(chat, label, 'chat') : link(chat, label, 'btn quiet');
   }
   if (!it.item_key) return '';
   const cls = compact ? 'link-btn chat' : 'btn quiet';
