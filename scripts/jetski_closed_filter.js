@@ -40,6 +40,8 @@
   // Lifecycle titles follow "[HH:MM] <marker> <Topic>"; finished chats and handed-off chain
   // pieces are archived by chat_lifecycle.py, so visible chats carry only ⦿ or ⏳
   const TITLE_MARKER_RE = /^\s*\[\d{1,2}:\d{2}\]\s*([⏳⦿])(?:\s|$)/u;
+  // Matches legacy pre-archive closed markers ("[HH:MM] «»|‹✓›|«|» <Topic>")
+  const LEGACY_CLOSED_TITLE_RE = /^\s*\[\d{1,2}:\d{2}\]\s*(?:‹✓›|«»|[«»])(?:\s|$)/u;
   // Matches the leading "[HH:MM] ⦿" prefix so background-waiting rows can display ⏳ in DOM
   const ACTIVE_TO_WAITING_DISPLAY_RE = /^(\s*\[\d{1,2}:\d{2}\]\s*)⦿(\s|$)/u;
   const TIME_PREFIX_EXTRACT_RE = /^\s*\[(\d{1,2}:\d{2})\]/;
@@ -1893,14 +1895,52 @@
     }
   }
 
+  function hasLegacyClosedMarker(title) {
+    return typeof title === 'string' && LEGACY_CLOSED_TITLE_RE.test(title);
+  }
+
+  // Looks up a project metadata object across Redux project slices
+  function findProjectEntry(projectId, store) {
+    if (!projectId || projectId === '__standalone__') return null;
+    const state = (store || findReduxStore())?.getState();
+    if (!state) return null;
+    const projs = state?.projects?.projects;
+    if (Array.isArray(projs)) {
+      const m = projs.find((p) => p && p.id === projectId);
+      if (m) return m;
+    } else if (projs && typeof projs === 'object' && projs[projectId]) {
+      return projs[projectId];
+    }
+    const byId = state?.projects?.byId?.[projectId] || state?.project?.projects?.[projectId];
+    if (byId && typeof byId === 'object') return byId;
+    const sidebarProjects = state?.sidebarProjects?.projects;
+    if (Array.isArray(sidebarProjects)) {
+      const m = sidebarProjects.find((p) => p && p.id === projectId);
+      if (m) return m;
+    }
+    return null;
+  }
+
+  // Returns true when the project is explicitly marked archived in Redux
+  function isArchivedProject(projectId, store) {
+    const entry = findProjectEntry(projectId, store);
+    return Boolean(entry && entry.archived === true);
+  }
+
   function isEligibleTopLevelSummary(cascadeId, summary) {
     if (!summary) return false;
     const meta = summary.trajectoryMetadata;
     if (meta?.parentConversationId || meta?.isBattleModeFork) return false;
     if (summary.annotations?.archived) return false;
+    // Chats created by CLI automation or internal tools do not belong in user inboxes
+    if (meta?.sourceMetadata?.tool) return false;
     if (meta?.sourceMetadata?.hideFromConversationList && !managedHiddenIds.has(cascadeId)) {
       return false;
     }
+    const rawTitle = summary?.annotations?.title || summary?.summary || '';
+    // Pre-archive closed chats and chats of archived projects are never actionable
+    if (hasLegacyClosedMarker(rawTitle)) return false;
+    if (isArchivedProject(meta?.projectId)) return false;
     return true;
   }
 
@@ -3876,7 +3916,7 @@
       }
       /* Context breakdown card width inside the shared floating glass tooltip */
       #jetski-closed-chats-filter-bubble[data-mode="context"] {
-        width: 288px;
+        width: 312px;
         padding: 10px 12px;
         border-radius: 8px;
         font-size: 11.5px;
@@ -3892,6 +3932,8 @@
       }
       #jetski-closed-chats-filter-bubble .jcfb-ctx-val {
         color: var(--muted-foreground, #b8bdc4);
+        text-align: right;
+        word-break: break-word;
       }
       #jetski-closed-chats-filter-bubble .jcfb-ctx-footer {
         margin-top: 6px;
@@ -6671,9 +6713,188 @@
     return Math.max(0, p);
   }
 
+  // Parses router arm, backend checkpoint, and underlying model family from responseModel
+  function parseBackendDetails(routeId, backendRaw) {
+    const rawR = String(routeId || '').trim();
+    const rawB = String(backendRaw || '').trim();
+    if (!rawR && !rawB) return { familyShort: '', backendDisplay: '' };
+
+    let familyShort = '';
+    const full = `${rawR} ${rawB}`.toLowerCase();
+    if (full.includes('barium-b')) familyShort = 'Barium-B';
+    else if (full.includes('skimaki')) familyShort = 'Skimaki';
+    else if (full.includes('carbon-g')) familyShort = 'Carbon-G';
+    else if (full.includes('perseus')) familyShort = 'Perseus';
+    else if (full.includes('cswise')) familyShort = 'CSWise';
+    else if (full.includes('snowball')) familyShort = 'Snowball';
+    else if (full.includes('argon')) familyShort = 'Argon';
+
+    let ckpt = '';
+    if (rawB) {
+      const gMatch = /Gemini-\d[A-Za-z0-9._-]+/i.exec(rawB);
+      if (gMatch) {
+        ckpt = gMatch[0]
+          .replace(/-EEVEE$/i, '')
+          .replace(/-(?:Barium-B|Topo-Skimaki|Skimaki|Carbon-G)$/i, '');
+      } else {
+        const soupMatch = /soup_[A-Za-z0-9_]+/i.exec(rawB);
+        if (soupMatch) {
+          ckpt = soupMatch[0];
+        } else if (!rawB.includes('/')) {
+          ckpt = rawB.replace(/@default$/i, '');
+        } else {
+          ckpt = rawB.split('/')[0].replace(/-(?:jetski(?:-launch-prep)?|agy-fast)$/i, '');
+        }
+      }
+    }
+
+    const parts = [];
+    if (rawR) parts.push(rawR);
+    if (familyShort && ckpt) {
+      parts.push(`${familyShort} (${ckpt})`);
+    } else if (familyShort || ckpt) {
+      parts.push(familyShort || ckpt);
+    }
+    const backendDisplay = parts.join(' · ');
+    return { familyShort, backendDisplay };
+  }
+
+  // Shortens display name and appends router family when not already in the label
+  function formatShortModelBadge(displayName, familyShort) {
+    if (!displayName) return '';
+    let b = String(displayName).trim();
+    if (b.startsWith('Gemini Pro Orchestrator')) {
+      b = 'Orchestrator';
+    } else if (b.startsWith('Gemini 3.8 Flash (router)') || b === 'Gemini 3.8 Flash Router') {
+      b = 'Flash 3.8';
+    } else if (b.startsWith('Claude ')) {
+      b = b.slice(7);
+    } else if (b.startsWith('Gemini ')) {
+      b = b.slice(7);
+    }
+    b = b.replace(/\(Medium\)/i, '(Med)');
+    if (
+      familyShort &&
+      !b.toLowerCase().includes(familyShort.toLowerCase().replace(/-g$/, ''))
+    ) {
+      b = `${b} (${familyShort})`;
+    }
+    return b;
+  }
+
+  // Resolves actual model information from generatorMetadata chatModel
+  function parseActualModelInfo(cm, fallbackResponseModel) {
+    const rawEnum = String(cm?.model || '').trim();
+    const rawDisplay = String(cm?.modelDisplayName || '').trim();
+    const rawResponseModel = String(cm?.responseModel || fallbackResponseModel || '').trim();
+    if (!rawEnum && !rawDisplay && !rawResponseModel) return null;
+
+    const pipeIdx = rawResponseModel.indexOf('|');
+    const routeId = (pipeIdx >= 0 ? rawResponseModel.slice(0, pipeIdx) : rawResponseModel).trim();
+    const backendRaw = (pipeIdx >= 0 ? rawResponseModel.slice(pipeIdx + 1) : '').trim();
+
+    const { familyShort, backendDisplay } = parseBackendDetails(routeId, backendRaw);
+
+    const mMatch = /^MODEL_PLACEHOLDER_M(\d+)$/.exec(rawEnum);
+    const enumShort = mMatch ? `M${mMatch[1]}` : rawEnum;
+
+    let baseRouteId = routeId;
+    if (baseRouteId.endsWith('-router-plan')) {
+      baseRouteId = baseRouteId.slice(0, -12);
+    } else if (baseRouteId.endsWith('-router-exec')) {
+      baseRouteId = baseRouteId.slice(0, -12);
+    }
+
+    const curated =
+      CURATED_HIDDEN_MODEL_MAP.get(routeId) ||
+      CURATED_HIDDEN_MODEL_MAP.get(baseRouteId);
+
+    const catalog = buildModelCatalogIndex(findReduxStore());
+    const enumVal = resolveModelEnumValue(rawEnum);
+    const catalogEntry =
+      (routeId && catalog.byId.get(routeId.toLowerCase())) ||
+      (baseRouteId && catalog.byId.get(baseRouteId.toLowerCase())) ||
+      (enumVal && catalog.byEnum.get(enumVal)) ||
+      (rawEnum && catalog.byId.get(rawEnum.toLowerCase()));
+
+    let displayName = curated?.label || '';
+    if (!displayName && catalogEntry?.label && catalogEntry.label !== 'Gemini Pro Next') {
+      displayName = catalogEntry.label;
+    }
+    if (!displayName && rawDisplay && rawDisplay !== 'Gemini Pro Next' && rawDisplay !== 'None') {
+      displayName = rawDisplay;
+    }
+    if (!displayName && catalogEntry?.label) {
+      displayName = catalogEntry.label;
+    }
+    if (!displayName && routeId) {
+      displayName = humanizeModelId(routeId);
+    }
+    if (!displayName) {
+      displayName = rawDisplay || rawEnum || 'Unknown Model';
+    }
+
+    const shortBadge = formatShortModelBadge(displayName, familyShort);
+    return {
+      rawEnum,
+      enumShort,
+      displayName,
+      shortBadge,
+      responseModel: rawResponseModel,
+      routeId,
+      familyShort,
+      backendDisplay,
+    };
+  }
+
+  // Returns selected model label for next turn from Redux modelSelection
+  function resolveNextTurnModelLabel(cascadeId) {
+    const store = findReduxStore();
+    const state = store?.getState();
+    const selection = state?.modelSelection;
+    if (!selection) return '';
+    const rawVal =
+      (cascadeId && selection.byConversation?.[cascadeId]?.model) ??
+      selection.default?.model;
+    const enumVal = resolveModelEnumValue(rawVal);
+    if (!enumVal) return '';
+    const catalog = buildModelCatalogIndex(store);
+    const entry = catalog.byEnum.get(enumVal);
+    let label = entry?.label;
+    if (!label && enumVal >= 1000) {
+      const armId = `bon-experiment-arm-${enumVal - 1000}`;
+      const curated = CURATED_HIDDEN_MODEL_MAP.get(armId);
+      if (curated) label = curated.label;
+    }
+    if (!label) {
+      label = humanizeModelId(String(rawVal));
+    }
+    const pinKey = resolveDraftPinKey(store, cascadeId);
+    const pin = getManualPinEntry(pinKey);
+    if (pin && pin.model === enumVal) {
+      label = `${label} · Pinned`;
+    }
+    return label;
+  }
+
   // Extracts the latest valid contextWindowMetadata entry, matching context_guard.py semantics
   function parseLatestContextMetadata(gm) {
     if (!Array.isArray(gm)) return null;
+    let latestModelCm = null;
+    let latestModelResponseModel = '';
+    for (let j = gm.length - 1; j >= 0; j--) {
+      const cm = gm[j]?.chatModel;
+      if (cm && (cm.model || cm.modelDisplayName || cm.responseModel)) {
+        if (!latestModelCm) latestModelCm = cm;
+        if (!latestModelResponseModel && cm.responseModel) {
+          if (!latestModelCm.model || cm.model === latestModelCm.model) {
+            latestModelResponseModel = cm.responseModel;
+          }
+        }
+        if (latestModelCm && latestModelResponseModel) break;
+      }
+    }
+
     for (let i = gm.length - 1; i >= 0; i--) {
       const csm = gm[i]?.chatModel?.chatStartMetadata;
       const cwm = csm?.contextWindowMetadata;
@@ -6714,6 +6935,13 @@
       const maxStr = formatCompactTokens(maxTokens);
       const dispPct = formatDisplayPct(pct);
       const prefix = compacted ? '⟳ ' : '';
+
+      const modelInfo = parseActualModelInfo(
+        latestModelCm || gm[i]?.chatModel,
+        latestModelResponseModel
+      );
+      const modelTag = modelInfo?.shortBadge ? `${modelInfo.shortBadge} · ` : '';
+
       return {
         matchedIndex: i,
         usedTokens,
@@ -6724,7 +6952,8 @@
         compacted,
         level,
         groups,
-        badgeText: `${prefix}${usedStr} / ${maxStr} · ${dispPct}%`,
+        modelInfo,
+        badgeText: `${prefix}${modelTag}${usedStr} / ${maxStr} · ${dispPct}%`,
       };
     }
     return null;
@@ -6847,10 +7076,12 @@
         entry.summarySig = reqSig;
         entry.lastValidIndex = parsed ? usedOffset + parsed.matchedIndex : 0;
         const prevSig = entry.info
-          ? `${entry.info.usedTokens}:${entry.info.maxTokens}:${entry.info.ckpt}`
+          ? `${entry.info.usedTokens}:${entry.info.maxTokens}:${entry.info.ckpt}:${entry.info.badgeText}`
           : '';
         entry.info = parsed;
-        const nextSig = parsed ? `${parsed.usedTokens}:${parsed.maxTokens}:${parsed.ckpt}` : '';
+        const nextSig = parsed
+          ? `${parsed.usedTokens}:${parsed.maxTokens}:${parsed.ckpt}:${parsed.badgeText}`
+          : '';
         if (prevSig !== nextSig) {
           scheduleSync();
         }
@@ -6926,7 +7157,7 @@
     void triggerContextUsageFetch(cascadeId);
   }
 
-  function buildContextBubbleHtml(info) {
+  function buildContextBubbleHtml(info, cascadeId) {
     const dotColors = {
       ok: '#8ab4f8',
       soft: '#fbbf24',
@@ -6949,6 +7180,39 @@
     const breakdownBlock = rowsHtml
       ? `<div class="jcfb-section-title">Token breakdown</div>${rowsHtml}`
       : '';
+
+    const modelInfo = info.modelInfo;
+    const nextTurnModel = resolveNextTurnModelLabel(cascadeId);
+    let modelRows = '';
+    if (modelInfo) {
+      const enumSuffix =
+        modelInfo.enumShort && modelInfo.enumShort !== modelInfo.displayName
+          ? ` (${escapeHtml(modelInfo.enumShort)})`
+          : '';
+      modelRows +=
+        `<div class="jcfb-ctx-row">` +
+        `<span>Last turn</span>` +
+        `<span class="jcfb-ctx-val">${escapeHtml(modelInfo.displayName)}${enumSuffix}</span>` +
+        `</div>`;
+      if (modelInfo.backendDisplay) {
+        modelRows +=
+          `<div class="jcfb-ctx-row">` +
+          `<span>Backend</span>` +
+          `<span class="jcfb-ctx-val">${escapeHtml(modelInfo.backendDisplay)}</span>` +
+          `</div>`;
+      }
+    }
+    if (nextTurnModel) {
+      modelRows +=
+        `<div class="jcfb-ctx-row">` +
+        `<span>Next turn</span>` +
+        `<span class="jcfb-ctx-val">${escapeHtml(nextTurnModel)}</span>` +
+        `</div>`;
+    }
+    const modelBlock = modelRows
+      ? `<div class="jcfb-section-title">Model</div>${modelRows}`
+      : '';
+
     let statusNote = 'Status: Within budget (< 60%)';
     if (info.compacted) statusNote = 'Status: Compacted — handoff required';
     else if (info.level === 'hard') statusNote = 'Status: Hard limit (>= 80%) — handoff now';
@@ -6969,6 +7233,7 @@
       `${formatExactInt(info.usedTokens)} / ${formatExactInt(info.maxTokens)} tokens · ` +
       `${formatExactInt(info.freeTokens)} free` +
       `</div>` +
+      modelBlock +
       breakdownBlock +
       `<div class="jcfb-ctx-footer">` +
       `<div>${escapeHtml(statusNote)}</div>` +
@@ -6996,13 +7261,13 @@
     const bubble = ensureBubbleElement();
     if (!bubble) return;
     setAttrIfChanged(bubble, 'data-mode', 'context');
-    const nextHtml = buildContextBubbleHtml(info);
+    const nextHtml = buildContextBubbleHtml(info, cascadeId);
     if (bubble.innerHTML !== nextHtml) {
       bubble.innerHTML = nextHtml;
     }
     setAttrIfChanged(bubble, 'data-visible', 'true');
     const rect = badge.getBoundingClientRect();
-    const bubbleWidth = 288;
+    const bubbleWidth = 312;
     let left = Math.max(8, Math.min(rect.right - bubbleWidth, window.innerWidth - bubbleWidth - 8));
     bubble.style.left = `${Math.round(left)}px`;
     bubble.style.top = `${Math.round(rect.bottom + 6)}px`;
@@ -7023,6 +7288,7 @@
     if (badge.style.display !== '') badge.style.display = '';
     setAttrIfChanged(badge, 'data-level', info.level);
     setAttrIfChanged(badge, 'data-compacted', info.compacted ? 'true' : 'false');
+    setAttrIfChanged(badge, 'data-actual-model', info.modelInfo?.shortBadge || '');
     if (badge.textContent !== info.badgeText) badge.textContent = info.badgeText;
     setAttrIfChanged(badge, 'aria-label', `Context usage: ${info.badgeText}`);
     if (activeHoverContextBadge === badge) {
