@@ -1607,6 +1607,7 @@ const liveBucketBtn = (k) =>
   storeState.projects = {
     projects: {
       'proj-1': { name: 'Breaking Chats · ⟳ 1 ⚠ 2' },
+      'proj-archived': { id: 'proj-archived', name: 'Old Hackathon', archived: true },
     },
   };
   // The Workspaces sidebar keeps project names only in the sidebarProjects array
@@ -1682,6 +1683,33 @@ const liveBucketBtn = (k) =>
           makeSummary('[10:00] ⦿ Forgotten ancient task', 'proj-1', {}, false, {
             status: 'CASCADE_RUN_STATUS_IDLE',
             lastModifiedTime: new Date(Date.now() - 10 * 24 * 3600 * 1000).toISOString(),
+          }),
+        ],
+        [
+          'tool-stale',
+          makeSummary(
+            '[10:00] ⦿ Hidden CLI chat',
+            'proj-1',
+            { sourceMetadata: { tool: 'agentapi' } },
+            false,
+            {
+              status: 'CASCADE_RUN_STATUS_IDLE',
+              lastModifiedTime: new Date(Date.now() - 12 * 24 * 3600 * 1000).toISOString(),
+            }
+          ),
+        ],
+        [
+          'legacy-closed-stale',
+          makeSummary('[10:00] «» Handed off legacy chat', 'proj-1', {}, false, {
+            status: 'CASCADE_RUN_STATUS_IDLE',
+            lastModifiedTime: new Date(Date.now() - 12 * 24 * 3600 * 1000).toISOString(),
+          }),
+        ],
+        [
+          'archived-proj-stale',
+          makeSummary('[10:00] ⦿ Hackathon demo', 'proj-archived', {}, false, {
+            status: 'CASCADE_RUN_STATUS_IDLE',
+            lastModifiedTime: new Date(Date.now() - 12 * 24 * 3600 * 1000).toISOString(),
           }),
         ],
       ],
@@ -2844,7 +2872,7 @@ const reduxStore = {
 };
 displayOptionsBtn.__reactFiber$test = { memoizedProps: { store: reduxStore } };
 
-function makeEntry(used, max, ckpt, breakdown) {
+function makeEntry(used, max, ckpt, breakdown, modelOpts) {
   const csm = {
     contextWindowMetadata: {
       estimatedTokensUsed: used,
@@ -2853,7 +2881,12 @@ function makeEntry(used, max, ckpt, breakdown) {
     },
   };
   if (ckpt !== undefined) csm.checkpointIndex = ckpt;
-  return { chatModel: { chatStartMetadata: csm } };
+  return {
+    chatModel: {
+      chatStartMetadata: csm,
+      ...(modelOpts || {}),
+    },
+  };
 }
 
 let activeGmList = [
@@ -3190,6 +3223,81 @@ eval(code);
   await flushAsync();
   assert.strictEqual(gmCalls.length, 1);
   assert.strictEqual(activeBadge.textContent, '⟳ 110k / 256k · 43%');
+
+  // R71.3: Gemini Pro Orchestrator planning turn surfaces router arm and underlying Barium-B
+  gmCalls.length = 0;
+  activeGmList.push(
+    makeEntry(112000, 256000, 1, undefined, {
+      model: 'MODEL_PLACEHOLDER_M415',
+      modelDisplayName: 'Gemini Pro Orchestrator',
+      responseModel:
+        'gemini-pro-coordinator-router-plan|barium-b-jetski/tfhub/prod/ml-gemini-experimental/Gemini-5-M-IT-G1085-Rev27-Barium-B-EEVEE/1',
+    })
+  );
+  fakeNow += 2000;
+  bumpActiveSummary(11);
+  await flushAsync();
+  assert.strictEqual(activeBadge.textContent, '⟳ Orchestrator (Barium-B) · 112k / 256k · 44%');
+  assert.strictEqual(activeBadge.getAttribute('data-actual-model'), 'Orchestrator (Barium-B)');
+
+  // Tooltip displays Last turn and Backend checkpoint details
+  activeBadge.dispatchEvent('mouseenter');
+  assert(bubble.innerHTML.includes('Gemini Pro Orchestrator (M415)'));
+  assert(bubble.innerHTML.includes('Barium-B'));
+  assert(bubble.innerHTML.includes('Gemini-5-M-IT-G1085-Rev27'));
+  assert(bubble.innerHTML.includes('gemini-pro-coordinator-router-plan'));
+  activeBadge.dispatchEvent('mouseleave');
+
+  // R71.3: Execution turn (M422 Flash router) surfaces Skimaki backend
+  gmCalls.length = 0;
+  activeGmList.push(
+    makeEntry(115000, 256000, 1, undefined, {
+      model: 'MODEL_PLACEHOLDER_M422',
+      modelDisplayName: 'Gemini 3.8 Flash (router)',
+      responseModel:
+        'gemini-3.8-flash-router|skimaki-agy-fast/tfhub/prod/ml-gemini-bip/Gemini-4.1-S-IT-G1038-Rev25-Topo-Skimaki-EEVEE/2',
+    })
+  );
+  fakeNow += 2000;
+  bumpActiveSummary(12);
+  await flushAsync();
+  assert.strictEqual(activeBadge.textContent, '⟳ Flash 3.8 (Skimaki) · 115k / 256k · 45%');
+  assert.strictEqual(activeBadge.getAttribute('data-actual-model'), 'Flash 3.8 (Skimaki)');
+
+  // R71.3: Masked BoN model unmasks in pill and tooltip shows Next turn selected model
+  storeState.modelSelection = {
+    byConversation: { 'chat-active': { model: 1226 } },
+  };
+  gmCalls.length = 0;
+  activeGmList.push(
+    makeEntry(118000, 256000, 1, undefined, {
+      model: 'MODEL_PLACEHOLDER_M380',
+      modelDisplayName: 'Gemini Pro Next',
+      responseModel: 'opus-5.5-high-bon-le|claude-opus-5-5@default',
+    })
+  );
+  fakeNow += 2000;
+  bumpActiveSummary(13);
+  await flushAsync();
+  assert.strictEqual(activeBadge.textContent, '⟳ Opus 5.5 BoN (High) · 118k / 256k · 46%');
+  assert.strictEqual(activeBadge.getAttribute('data-actual-model'), 'Opus 5.5 BoN (High)');
+
+  activeBadge.dispatchEvent('mouseenter');
+  assert(bubble.innerHTML.includes('Claude Opus 5.5 BoN (High) (M380)'));
+  assert(bubble.innerHTML.includes('opus-5.5-high-bon-le · claude-opus-5-5'));
+  assert(bubble.innerHTML.includes('Next turn'));
+  assert(bubble.innerHTML.includes('Gemini 4 Carbon-G'));
+  activeBadge.dispatchEvent('mouseleave');
+
+  // Manual pin surfaces "· Pinned" marker next to selected next turn model
+  window.__jetskiManualPickedModels.set('chat-active', {
+    model: 1226,
+    atStep: 0,
+    updatedAt: fakeNow,
+  });
+  activeBadge.dispatchEvent('mouseenter');
+  assert(bubble.innerHTML.includes('Gemini 4 Carbon-G · Pinned'));
+  activeBadge.dispatchEvent('mouseleave');
 
   // Cleanup cancels any pending throttle timer and removes all context badges
   fakeNow += 100;
