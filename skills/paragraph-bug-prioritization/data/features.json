@@ -1,0 +1,43 @@
+{
+  "version": 2,
+  "note": "Detection regexes run over Dart sources (lib/**.dart) for Flutter apps and C++ sources (*.cc, *.cpp, *.h) for native SkParagraph callers. Count files and repos/targets that match, never raw hits.",
+  "features": [
+    {"id": "F01", "name": "Plain wrapped text", "regex": "\\bText\\(", "cpp_regex": "\\bParagraphBuilder(::make|Impl)\\b", "web_only": false},
+    {"id": "F02", "name": "maxLines + ellipsis", "regex": "TextOverflow\\.ellipsis", "cpp_regex": "\\b(setEllipsis|setMaxLines)\\s*\\(", "web_only": false},
+    {"id": "F03", "name": "maxLines + fade/clip (didExceedMaxLines)", "regex": "TextOverflow\\.(fade|clip)", "cpp_regex": "\\bdidExceedMaxLines\\s*\\(", "web_only": false},
+    {"id": "F04", "name": "Non-start alignment", "regex": "TextAlign\\.(center|right|end)", "cpp_regex": "TextAlign::(kCenter|kRight|kEnd)", "web_only": false},
+    {"id": "F05", "name": "Justified text", "regex": "TextAlign\\.justify", "cpp_regex": "TextAlign::kJustify", "web_only": false},
+    {"id": "F06", "name": "Rich text, multiple style runs", "regex": "TextSpan\\(|Text\\.rich\\(|RichText\\(", "cpp_regex": "\\bpushStyle\\s*\\(", "web_only": false},
+    {"id": "F07", "name": "WidgetSpan placeholders", "regex": "WidgetSpan\\(|addPlaceholder\\(", "cpp_regex": "\\baddPlaceholder\\s*\\(", "web_only": false},
+    {"id": "F08", "name": "Strut", "regex": "StrutStyle\\(|forceStrutHeight", "cpp_regex": "\\bsetStrutStyle\\s*\\(|\\bStrutStyle\\b", "web_only": false},
+    {"id": "F09", "name": "Line height, height behavior, leading distribution", "regex": "TextHeightBehavior|leadingDistribution|TextStyle\\([^)]*\\bheight:", "cpp_regex": "\\b(setHeight|setHeightOverride|setHalfLeading|TextHeightBehavior)\\b", "web_only": false},
+    {"id": "F10", "name": "letterSpacing / wordSpacing", "regex": "letterSpacing:|wordSpacing:", "cpp_regex": "\\b(setLetterSpacing|setWordSpacing)\\s*\\(", "web_only": false},
+    {"id": "F11", "name": "Custom fonts and runtime font loading", "regex": "GoogleFonts\\.|fontFamily:|FontLoader\\(|loadFontFromList", "pubspec_regex": "google_fonts:|fonts:", "cpp_regex": "\\b(setFontFamilies|TypefaceFontProvider)\\b", "web_only": false},
+    {"id": "F12", "name": "Glyph fallback (CJK, emoji, symbols)", "regex": "fontFamilyFallback", "content_signal": "non-Latin or non-BMP characters in string literals or .arb files", "cpp_regex": "\\bsetFontFamilies\\s*\\(", "web_only": false},
+    {"id": "F13", "name": "fontFeatures (tabular figures, small caps)", "regex": "FontFeature\\.|fontFeatures:", "cpp_regex": "\\baddFontFeature\\s*\\(", "web_only": false},
+    {"id": "F14", "name": "fontVariations (variable font axes)", "regex": "FontVariation\\(|fontVariations:", "cpp_regex": "\\bFontArguments\\b|\\bVariationPosition\\b", "web_only": false},
+    {"id": "F15", "name": "Decorations", "regex": "TextDecoration\\.(underline|lineThrough|overline)|decorationStyle:", "cpp_regex": "\\b(setDecoration|TextDecoration::k)", "web_only": false},
+    {"id": "F16", "name": "Text shadows", "regex": "(?<!Box)Shadow\\(", "cpp_regex": "\\baddShadow\\s*\\(|\\bTextShadow\\b", "web_only": false},
+    {"id": "F17", "name": "foreground / background Paint (stroke, gradient text)", "regex": "foreground:\\s*Paint|background:\\s*Paint|ShaderMask\\(", "cpp_regex": "\\b(setForegroundPaint|setBackgroundPaint|setForegroundColor|setBackgroundColor)\\s*\\(", "web_only": false},
+    {"id": "F18", "name": "Text scaling", "regex": "textScaler|textScaleFactor", "cpp_regex": "\\bsetFontSize\\s*\\(", "web_only": false},
+    {"id": "F19", "name": "RTL and mixed BiDi", "regex": "TextDirection\\.rtl|Locale\\('(ar|he|fa|ur)'", "scope_extra": "lib/l10n/*_(ar|he|fa|ur).arb", "cpp_regex": "TextDirection::kRtl", "web_only": false},
+    {"id": "F20", "name": "Complex scripts (Indic, Thai, Khmer)", "regex": "Locale\\('(hi|bn|ta|te|th|km|my)'", "scope_extra": "lib/l10n/*_(hi|bn|ta|te|th|km|my).arb", "cpp_regex": "\\bsetLocale\\s*\\(", "web_only": false},
+    {"id": "F21", "name": "Emoji and multi-code-point graphemes", "content_signal": "non-BMP or ZWJ (U+200D) in string literals", "web_only": false},
+    {"id": "F22", "name": "Hyphenation / soft hyphen", "regex": "\\\\u00AD|hyphens", "cpp_regex": "\\\\u00AD|0x00[aA][dD]", "web_only": false},
+    {"id": "F23", "name": "Intrinsic sizing", "regex": "IntrinsicWidth\\(|IntrinsicHeight\\(|textWidthBasis|(min|max)IntrinsicWidth", "cpp_regex": "\\b(getMinIntrinsicWidth|getMaxIntrinsicWidth)\\s*\\(", "web_only": false},
+    {"id": "F24", "name": "Direct TextPainter / Paragraph use (charts, custom painters)", "regex": "TextPainter\\(|ParagraphBuilder\\(", "cpp_regex": "\\bskia::textlayout::Paragraph\\b", "web_only": false},
+    {"id": "F25", "name": "Text editing (caret, selection, hit-test)", "regex": "TextField\\(|TextFormField\\(|EditableText\\(|CupertinoTextField\\(", "cpp_regex": "\\b(getGlyphPositionAtCoordinate|getRectsForRange|getWordBoundary)\\s*\\(", "web_only": false},
+    {"id": "F26", "name": "Selectable static text", "regex": "SelectionArea\\(|SelectableText\\(|SelectableRegion\\(", "cpp_regex": "\\bgetRectsForRange\\s*\\(", "web_only": false},
+    {"id": "F27", "name": "Line metrics consumers / auto-size", "regex": "computeLineMetrics|AutoSizeText\\(|didExceedMaxLines", "pubspec_regex": "auto_size_text:", "cpp_regex": "\\b(getLineMetrics|visitLineMetrics)\\s*\\(", "web_only": false},
+    {"id": "F28", "name": "Empty and whitespace-only paragraphs", "content_signal": "implied by F25 (empty TextField), trailing newline, double spaces", "web_only": false},
+    {"id": "F29", "name": "Hard breaks, CRLF, tabs", "regex": "'[^']*\\\\n[^']*'|\\\\t|\\\\r\\\\n", "cpp_regex": "\\\\r\\\\n|\\\\t", "web_only": false},
+    {"id": "F30", "name": "Transformed / scaled painting (DPR, zoom, Transform, FittedBox)", "regex": "Transform\\.(scale|rotate)\\(|FittedBox\\(|RotatedBox\\(", "web_only": true}
+  ],
+  "web_app_signals": [
+    {"signal": "flutter build web in CI", "path": ".github/workflows/*.y*ml", "regex": "flutter build web"},
+    {"signal": "Firebase hosting", "path": "firebase.json", "regex": "\"hosting\""},
+    {"signal": "GitHub Pages deploy", "path": ".github/workflows/*.y*ml", "regex": "gh-pages|deploy-pages|peaceiris/actions-gh-pages"},
+    {"signal": "kIsWeb branches", "path": "lib/**.dart", "regex": "\\bkIsWeb\\b"},
+    {"signal": "web/ directory (weak, created by flutter create)", "path": "web/index.html", "regex": ""}
+  ]
+}
