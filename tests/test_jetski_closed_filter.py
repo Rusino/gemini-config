@@ -4079,5 +4079,264 @@ eval(code);
     self.assertIn("R76_ASSERTIONS_PASSED", res.stdout)
 
 
+  def test_cross_project_open_and_sidebar_locate(self) -> None:
+    node_bin = find_node_binary()
+    js_path = os.path.join(SCRIPTS_DIR, "jetski_closed_filter.js")
+
+    harness = r"""
+const fs = require('fs');
+const assert = require('assert');
+
+const scriptPath = process.argv[1];
+const code = fs.readFileSync(scriptPath, 'utf8');
+
+class FakeElement {
+  constructor(tagName) {
+    this.tagName = tagName.toUpperCase();
+    this.id = '';
+    this.className = '';
+    this.style = {};
+    this.attributes = new Map();
+    this.children = [];
+    this.parentElement = null;
+    this.listeners = new Map();
+    this._textContent = '';
+    this._innerHTML = '';
+  }
+  get textContent() { return this._textContent; }
+  set textContent(v) { this._textContent = String(v); }
+  get innerHTML() { return this._innerHTML; }
+  set innerHTML(v) { this._innerHTML = String(v); }
+  setAttribute(k, v) {
+    this.attributes.set(k, String(v));
+    if (k === 'id') this.id = String(v);
+    if (k === 'class') this.className = String(v);
+  }
+  getAttribute(k) { return this.attributes.has(k) ? this.attributes.get(k) : null; }
+  hasAttribute(k) { return this.attributes.has(k); }
+  removeAttribute(k) { this.attributes.delete(k); }
+  appendChild(c) { c.parentElement = this; this.children.push(c); return c; }
+  insertBefore(c, ref) { c.parentElement = this; this.children.push(c); return c; }
+  remove() {
+    if (!this.parentElement) return;
+    const i = this.parentElement.children.indexOf(this);
+    if (i !== -1) this.parentElement.children.splice(i, 1);
+    this.parentElement = null;
+  }
+  addEventListener(t, fn) {
+    if (!this.listeners.has(t)) this.listeners.set(t, []);
+    this.listeners.get(t).push(fn);
+  }
+  closest() { return null; }
+  querySelector(s) { return this.querySelectorAll(s)[0] || null; }
+  querySelectorAll(s) {
+    const out = [];
+    const visit = (n) => {
+      for (const c of n.children) {
+        if (typeof s === 'string') {
+          if (s.startsWith('#') && c.id === s.slice(1)) {
+            out.push(c);
+          } else if (
+            s.includes('conversation-list-sidebar') &&
+            c.getAttribute('data-testid') === 'conversation-list-sidebar'
+          ) {
+            out.push(c);
+          } else if (
+            s.includes('conversation-row-sidebar') &&
+            c.getAttribute('data-testid') === 'conversation-row-sidebar'
+          ) {
+            out.push(c);
+          }
+        }
+        visit(c);
+      }
+    };
+    visit(this);
+    return out;
+  }
+  scrollIntoView(opts) {
+    this._scrolledOpts = opts;
+  }
+}
+
+const docEl = new FakeElement('html');
+const headEl = new FakeElement('head');
+const bodyEl = new FakeElement('body');
+docEl.appendChild(headEl);
+docEl.appendChild(bodyEl);
+
+const mockStore = {
+  getState: () => ({
+    multiConvoLayout: { activeConversations: [] },
+    trajectorySummaries: {
+      summaries: {
+        'chat-cross-1': {
+          cascadeId: 'chat-cross-1',
+          trajectoryMetadata: { projectId: 'proj-other' },
+        },
+      },
+    },
+    projects: {
+      projects: [
+        { id: 'proj-other', archived: true },
+      ],
+    },
+  }),
+  dispatch: () => {},
+  subscribe: () => () => {},
+};
+
+const toggledSections = [];
+const vlistEl = new FakeElement('div');
+vlistEl.setAttribute('data-testid', 'conversation-list-sidebar');
+
+const vlistItems = [
+  { type: 'header', id: 'header-proj-other', isCollapsed: true },
+  { type: 'row', cascadeId: 'chat-cross-1' },
+];
+
+vlistEl['__reactFiber$test'] = {
+  memoizedProps: {
+    store: mockStore,
+    items: vlistItems,
+    onToggleCollapseSection: (pid) => toggledSections.push(pid),
+  },
+  memoizedState: {
+    memoizedState: {
+      scrollToIndex: (idx) => { vlistEl._scrolledToItem = idx; },
+    },
+  },
+};
+bodyEl.appendChild(vlistEl);
+
+const chatRow = new FakeElement('div');
+chatRow.setAttribute('data-testid', 'conversation-row-sidebar');
+chatRow.setAttribute('data-cascade-id', 'chat-cross-1');
+vlistEl.appendChild(chatRow);
+
+const fetchCalls = [];
+let navigatedUrl = null;
+let navState = null;
+
+global.requestAnimationFrame = (cb) => cb();
+global.window = {
+  __APP_CONFIG__: { csrfToken: 'test-csrf' },
+  location: {
+    pathname: '/battle',
+    search: '',
+    hash: '',
+  },
+  history: {
+    state: { __TSR_index: 2 },
+    pushState: (state, title, url) => {
+      navState = state;
+      navigatedUrl = url;
+    },
+    replaceState: (state, title, url) => {
+      navState = state;
+      navigatedUrl = url;
+    },
+  },
+  document: null,
+  fetch: async (url, opts) => {
+    fetchCalls.push({ url: String(url), body: opts?.body ? JSON.parse(opts.body) : null });
+    if (String(url).includes('jetski-chains.json')) {
+      return { ok: true, json: async () => ({ parentOf: {}, createdAt: {}, redirects: {} }) };
+    }
+    return { ok: true, json: async () => ({}) };
+  },
+  localStorage: {
+    getItem: () => null,
+    setItem: () => {},
+  },
+  dispatchEvent: () => {},
+  addEventListener: () => {},
+  removeEventListener: () => {},
+  requestAnimationFrame: (cb) => cb(),
+  setTimeout: (cb) => { Promise.resolve().then(cb); return 1; },
+  clearTimeout: () => {},
+};
+global.setTimeout = window.setTimeout;
+global.clearTimeout = window.clearTimeout;
+global.PopStateEvent = class {
+  constructor(type, init) {
+    this.type = type;
+    this.state = init?.state;
+  }
+};
+
+global.document = {
+  documentElement: docEl,
+  head: headEl,
+  body: bodyEl,
+  getElementById: (id) => docEl.querySelector(`#${id}`),
+  createElement: (tag) => new FakeElement(tag),
+  querySelector: (sel) => {
+    if (typeof sel === 'string' && sel.includes('conversation-list-sidebar')) return vlistEl;
+    if (typeof sel === 'string' && sel.includes('chat-cross-1')) return chatRow;
+    return docEl.querySelector(sel);
+  },
+  querySelectorAll: (sel) => docEl.querySelectorAll(sel),
+  addEventListener() {},
+  removeEventListener() {},
+  dispatchEvent() {},
+};
+global.MutationObserver = class {
+  observe() {}
+  disconnect() {}
+};
+
+eval(code);
+
+(async () => {
+  assert(
+    typeof window.__jetskiOpenConversation === 'function',
+    '__jetskiOpenConversation must be exported'
+  );
+  assert(
+    typeof window.__jetskiLocateInSidebar === 'function',
+    '__jetskiLocateInSidebar must be exported'
+  );
+
+  await window.__jetskiLocateInSidebar('chat-cross-1');
+  assert(toggledSections.includes('proj-other'), 'Must expand header-proj-other section');
+
+  window.__jetskiOpenConversation('chat-cross-1');
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  assert.strictEqual(
+    navigatedUrl,
+    '/c/chat-cross-1?section=proj-other',
+    'Must navigate to /c/chat-cross-1?section=proj-other'
+  );
+
+  const unarchiveCall = fetchCalls.find((c) => c.url.includes('/UpdateProject'));
+  assert(unarchiveCall, 'Must call UpdateProject RPC to unarchive proj-other');
+  assert.strictEqual(unarchiveCall.body?.project?.id, 'proj-other');
+  assert.strictEqual(unarchiveCall.body?.project?.archived, false);
+
+  window.__jetskiClosedChatsFilterCleanup?.();
+  console.log('ALL_CROSS_PROJECT_TESTS_PASSED');
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"""
+    env = os.environ.copy()
+    env["ELECTRON_RUN_AS_NODE"] = "1"
+    res = subprocess.run(
+        [node_bin, "-e", harness, js_path],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(
+        res.returncode,
+        0,
+        f"Cross-project JS harness failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+    )
+    self.assertIn("ALL_CROSS_PROJECT_TESTS_PASSED", res.stdout)
+
+
 if __name__ == "__main__":
   unittest.main()
