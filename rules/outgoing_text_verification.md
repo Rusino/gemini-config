@@ -25,6 +25,10 @@ Code has a compiler; prose documents do not, and incoming specs or code snippets
    - **Applies to**: Any edit, shortening, translation, or restructuring (>1 line or >15 words) of an existing document/artifact/spec that the user has already seen in earlier turns.
    - **Required Action**: Automatically run `python3 ~/.gemini/config/skills/redline/scripts/redline.py` against the last version the user saw, verify `<stem>_diff.html` via headless browser screenshot (`~/.gemini/config/skills/redline/SKILL.md`), and link `<stem>_diff.html` alongside the updated document without waiting to be asked.
 
+5. **Default Alphabet-Wide Sharing for Google Docs (`gdocs mutate share`)**:
+   - **Applies to**: Every Google Doc created or imported (`gdocs mutate create`, `gdocs mutate import-md`, `gdocs mutate copy`) for open-source / Skia / Flutter projects.
+   - **Required Action**: Immediately share the document with the `google.com` domain (`~/.gemini/antigravity/bin/gdocs mutate share <docID> --domain google.com --role commenter`) right after creation so anyone at Google/Alphabet can open and comment on it without access requests.
+
 ## 2. Incoming & Outgoing Code (`amnesia-precommit`, Corpus Gate & KEEPER Invariants)
 
 1. **Outgoing Repository Code Changes -> Run `amnesia-precommit` & Pre-Upload Flutter Corpus**:

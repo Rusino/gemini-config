@@ -346,8 +346,20 @@ def checkout_skia_ref(
 
     if ref.startswith("ext:") and external_skia_repo and external_skia_repo.exists():
         ext_ref = ref[len("ext:") :]
+        # Git fetch rejects short SHAs over the wire; resolve to full SHA or commit first
+        resolved = subprocess.run(
+            ["git", "-C", str(external_skia_repo), "rev-parse", ext_ref],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        fetch_target = (
+            resolved.stdout.strip()
+            if resolved.returncode == 0 and resolved.stdout.strip()
+            else ext_ref
+        )
         subprocess.run(
-            ["git", "-C", str(skia_repo), "fetch", str(external_skia_repo), ext_ref],
+            ["git", "-C", str(skia_repo), "fetch", str(external_skia_repo), fetch_target],
             capture_output=True,
             check=True,
         )
