@@ -3139,6 +3139,27 @@ def _iso_to_et_stamp(iso_str: str) -> str:
     return ""
 
 
+# Returns IDs of projects marked archived:true in projects/*.json
+def _load_archived_project_ids(projects_dir: str = "") -> set[str]:
+  pdir = projects_dir or os.path.expanduser(
+      os.environ.get("ANTIGRAVITY_PROJECTS_DIR", DEFAULT_PROJECTS_DIR)
+  )
+  archived: set[str] = set()
+  if not os.path.isdir(pdir):
+    return archived
+  for pfile in sorted(glob.glob(os.path.join(pdir, "*.json"))):
+    try:
+      with open(pfile, "r", encoding="utf-8") as f:
+        pdata = json.load(f)
+      if isinstance(pdata, dict) and pdata.get("archived") is True:
+        pid = str(pdata.get("id") or os.path.basename(pfile)[:-5]).strip()
+        if pid:
+          archived.add(pid)
+    except (OSError, ValueError):
+      continue
+  return archived
+
+
 def audit_conversations(
     fix: bool = False,
     project_filter: str = "",
@@ -3158,6 +3179,7 @@ def audit_conversations(
         project_filter, projects_dir=projects_dir
     )
 
+  archived_project_ids = _load_archived_project_ids(projects_dir)
   ls_summaries = _fetch_ls_summaries_for_audit()
   ls_online = ls_summaries is not None
 
@@ -3223,17 +3245,23 @@ def audit_conversations(
       meta = s.get("trajectoryMetadata") or {}
       if meta.get("parentConversationId") or meta.get("isBattleModeFork"):
         continue
+      ls_t = str(ann.get("title") or s.get("summary") or "").strip()
+      pid = str(meta.get("projectId") or "").strip()
       source_meta = meta.get("sourceMetadata") or {}
       if (
           source_meta.get("tool")
           or source_meta.get("hideFromConversationList")
           or source_meta.get("hide_from_conversation_list")
       ):
-        continue
+        eff_title = pbtxt_titles.get(cid) or db_titles.get(cid) or ls_t
+        eff_pid = pid or db_projects.get(cid) or ""
+        if (
+            parse_title_marker(eff_title) not in LEGACY_CLOSED_MARKERS
+            and eff_pid not in archived_project_ids
+        ):
+          continue
       visible_ids.add(cid)
-      ls_t = str(ann.get("title") or s.get("summary") or "").strip()
       ls_titles[cid] = ls_t
-      pid = str(meta.get("projectId") or "").strip()
       if pid:
         ls_projects[cid] = pid
       cat = str(meta.get("createdAt") or "").strip()
@@ -3298,7 +3326,11 @@ def audit_conversations(
       # archive, not in the sidebar
       # A piece is handed off only when a visible chat continues it: in a forked tree the
       # older branch's leaf is still an open chat
-      if cid in vis_children or marker in LEGACY_CLOSED_MARKERS:
+      if (
+          cid in vis_children
+          or marker in LEGACY_CLOSED_MARKERS
+          or _ProjectOf(cid) in archived_project_ids
+      ):
         is_fixed = False
         # Same rule as handoff: live work must not report into a chat that gets hidden,
         # and unknown live state archives nothing

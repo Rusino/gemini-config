@@ -971,6 +971,68 @@ class TestChatLifecycle(unittest.TestCase):
         self.assertEqual(chat_lifecycle.get_conversation_title("c2"), "[13:14] ⦿ Moving Chats")
         self.assertEqual(chat_lifecycle.get_conversation_title("s2"), "[12:30] ⦿ Lonely")
 
+  def test_audit_archives_legacy_tool_chats_and_archived_project_chats(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      projects_dir = os.path.join(tmp_dir, "projects")
+      os.makedirs(projects_dir, exist_ok=True)
+      with open(os.path.join(projects_dir, "proj-arch.json"), "w", encoding="utf-8") as f:
+        json.dump({"id": "proj-arch", "name": "Text Editor", "archived": True}, f)
+      with open(os.path.join(projects_dir, "proj-active.json"), "w", encoding="utf-8") as f:
+        json.dump({"id": "proj-active", "name": "Active Project", "archived": False}, f)
+
+      self.write_chain(
+          tmp_dir, [("t_closed", None), ("t_open_worker", None), ("p_arch_open", None)]
+      )
+      titles = {
+          "t_closed": "[22:30] «» Text Editor",
+          "t_open_worker": "[11:00] ⦿ Worker batch",
+          "p_arch_open": "[11:01] ⦿ Check Hackathon Chat Updates",
+      }
+      self.write_titles(tmp_dir, titles)
+      fake_ls = {
+          "t_closed": {
+              "summary": titles["t_closed"],
+              "annotations": {"title": titles["t_closed"]},
+              "trajectoryMetadata": {
+                  "projectId": "proj-active",
+                  "sourceMetadata": {"tool": "agent"},
+              },
+          },
+          "t_open_worker": {
+              "summary": titles["t_open_worker"],
+              "annotations": {"title": titles["t_open_worker"]},
+              "trajectoryMetadata": {
+                  "projectId": "proj-active",
+                  "sourceMetadata": {"tool": "agent"},
+              },
+          },
+          "p_arch_open": {
+              "summary": titles["p_arch_open"],
+              "annotations": {"title": titles["p_arch_open"]},
+              "trajectoryMetadata": {
+                  "projectId": "proj-arch",
+              },
+          },
+      }
+      with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]), \
+           patch.object(chat_lifecycle, "ls_rpc", side_effect=RuntimeError("offline in test")), \
+           patch.object(chat_lifecycle, "_fetch_ls_summaries_for_audit", return_value=fake_ls):
+        report = chat_lifecycle.audit_conversations(fix=False, projects_dir=projects_dir)
+        disc_ids = [d["conversation_id"] for d in report["discrepancies"]]
+        self.assertIn("t_closed", disc_ids)
+        self.assertIn("p_arch_open", disc_ids)
+        self.assertNotIn("t_open_worker", disc_ids)
+        for d in report["discrepancies"]:
+          if d["conversation_id"] in ("t_closed", "p_arch_open"):
+            self.assertEqual(d["issues"], ["should_be_archived"])
+            self.assertFalse(d["fixed"])
+
+        self.live_mock.return_value = {}
+        fix_report = chat_lifecycle.audit_conversations(fix=True, projects_dir=projects_dir)
+        self.assertTrue(chat_lifecycle.is_archived("t_closed"))
+        self.assertTrue(chat_lifecycle.is_archived("p_arch_open"))
+        self.assertFalse(chat_lifecycle.is_archived("t_open_worker"))
+
   # --- CLI usage -------------------------------------------------------------
 
   SCRIPT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "hooks", "chat_lifecycle.py"))
