@@ -192,11 +192,80 @@
   const autoSwitchedEdges = (window.__jetskiAutoSwitchedEdges ||= new Set());
   // Tracks the latest seen modification timestamp (ms) per cascadeId across re-injections
   const locallySeenModifiedMs = (window.__jetskiSeenModifiedMs ||= new Map());
+  // Remembers explicitly dismissed blocked-step signatures so ✓ clears only that exact block
+  const dismissedBlockedSigs = (window.__jetskiDismissedBlockedSigs ||= new Map());
+  // Bounded trajectory evaluation caches keyed by summary tree signature with zero poll timers
+  const TRAJ_STATUS_CACHE_MAX_ENTRIES = 64;
+  const SINGLE_TRAJ_CACHE_MAX_ENTRIES = 96;
+  const RECENT_TRAJ_CHECK_WINDOW_MS = 6 * 60 * 60 * 1000;
+  const SILENT_SUBAGENT_GRACE_MS = 30 * 1000;
+  const STALE_IDLE_TURN_MS = 15 * 60 * 1000;
+  const trajectoryStatusCache = new Map();
+  const singleTrajCache = new Map();
+  // Accept both @bufbuild/protobuf v2 numeric enums in Redux and Connect-JSON strings
+  const ACTIVE_RUN_STATUSES = new Set([
+    'CASCADE_RUN_STATUS_RUNNING',
+    'CASCADE_RUN_STATUS_BUSY',
+    'CASCADE_RUN_STATUS_CANCELING',
+    2,
+    3,
+    4,
+  ]);
+  const WAITING_STEP_STATUSES = new Set(['CORTEX_STEP_STATUS_WAITING', 9, 'WAITING']);
+  const DONE_STEP_STATUSES = new Set(['CORTEX_STEP_STATUS_DONE', 3, 'DONE']);
+  const TERMINAL_STEP_STATUSES = new Set([
+    'CORTEX_STEP_STATUS_CANCELED',
+    6,
+    'CANCELED',
+    'CORTEX_STEP_STATUS_ERROR',
+    7,
+    'ERROR',
+    'CORTEX_STEP_STATUS_INTERRUPTED',
+    12,
+    'INTERRUPTED',
+  ]);
+  const ERROR_TERM_REASONS = new Set(['EXECUTOR_TERMINATION_REASON_ERROR', 1, 'ERROR']);
+  const CANCELED_TERM_REASONS = new Set([
+    'EXECUTOR_TERMINATION_REASON_USER_CANCELED',
+    2,
+    'USER_CANCELED',
+  ]);
+  const USER_INPUT_STEP_TYPES = new Set(['CORTEX_STEP_TYPE_USER_INPUT', 14]);
+  const PLANNER_STEP_TYPES = new Set(['CORTEX_STEP_TYPE_PLANNER_RESPONSE', 15]);
+  const SYSTEM_MSG_STEP_TYPES = new Set(['CORTEX_STEP_TYPE_SYSTEM_MESSAGE', 101]);
+  const INVOKE_SUBAGENT_STEP_TYPES = new Set(['CORTEX_STEP_TYPE_INVOKE_SUBAGENT', 127]);
+  const ASK_QUESTION_STEP_TYPES = new Set(['CORTEX_STEP_TYPE_ASK_QUESTION', 138]);
+  // Post-response bookkeeping steps emitted after PLANNER_RESPONSE on finished turns
+  const TRANSPARENT_TAIL_STEP_TYPES = new Set([
+    'CORTEX_STEP_TYPE_FINISH',
+    2,
+    'CORTEX_STEP_TYPE_CHECKPOINT',
+    23,
+    'CORTEX_STEP_TYPE_SUGGESTED_RESPONSES',
+    27,
+    'CORTEX_STEP_TYPE_MEMORY',
+    38,
+    'CORTEX_STEP_TYPE_EPHEMERAL_MESSAGE',
+    90,
+    'CORTEX_STEP_TYPE_CONVERSATION_HISTORY',
+    98,
+    'CORTEX_STEP_TYPE_KNOWLEDGE_ARTIFACTS',
+    99,
+    'CORTEX_STEP_TYPE_KNOWLEDGE_GENERATION',
+    102,
+    'CORTEX_STEP_TYPE_DIRECTORY_RULES',
+    139,
+  ]);
+  const ONGOING_BATTLE_END_TYPES = new Set([0, '', null, undefined, 'BATTLE_END_TYPE_UNSPECIFIED']);
   // Caches jetski-roadmaps.json across DOM sync cycles within ROADMAP_INDEX_TTL_MS
   const ROADMAP_INDEX_TTL_MS = 5000;
   let roadmapIndexCache = null;
   let roadmapIndexFetchedAt = 0;
   let roadmapIndexFetching = false;
+
+  function isActiveRunStatus(status) {
+    return ACTIVE_RUN_STATUSES.has(status);
+  }
 
   function parseTitleMarker(title) {
     if (typeof title !== 'string') return null;
@@ -208,18 +277,12 @@
     return parseTitleMarker(title) === OPEN_WAITING_MARKER;
   }
 
-  // True when an open leaf ⦿ chat has finished its LLM turn and is waiting on a subagent or task
-  function isWaitingOnBackgroundWork(summary, fallbackTitle) {
-    // Summaries without Redux state cannot report background task activity
-    if (!summary) return false;
-    const title =
-      summary?.annotations?.title || summary?.summary || fallbackTitle || '';
-    // Only open leaf chats with ⦿ qualify; cron ⏳ chats already have a permanent marker
-    if (parseTitleMarker(title) !== OPEN_ACTIVE_MARKER) return false;
-    return (
-      summary.status !== 'CASCADE_RUN_STATUS_RUNNING' &&
-      Boolean(summary.notFullyIdle)
-    );
+  // True when an open leaf ⦿ chat is unblocked and waiting on background work or subagent synthesis
+  function isWaitingOnBackgroundWork(summary, curTitle, statusInfo) {
+    if (!summary || parseTitleMarker(curTitle) !== OPEN_ACTIVE_MARKER) return false;
+    // Blocked chats need immediate user input and must keep ⦿ rather than swapping to ⏳
+    if (!statusInfo || statusInfo.isBlocked || isActiveRunStatus(summary.status)) return false;
+    return statusInfo.bucket === 'working';
   }
 
   // Returns the underlying row title before any visual ⦿ -> ⏳ background-wait DOM substitution
@@ -454,23 +517,1109 @@
     await postUpdateAnnotationsRpc(cascadeId, { archived });
   }
 
-  // Classifies a conversation into one of the 3 state buckets
-  function classifyChatBucket(summary, fallbackTitle) {
+  function getStepOneofPayload(step, camel, snake) {
+    if (!step || typeof step !== 'object') return null;
+    const direct = step[camel] || step[snake];
+    if (direct && typeof direct === 'object') return direct;
+    const inner = step.step;
+    if (
+      inner &&
+      typeof inner === 'object' &&
+      (inner.case === camel || inner.case === snake) &&
+      inner.value &&
+      typeof inner.value === 'object'
+    ) {
+      return inner.value;
+    }
+    return null;
+  }
+
+  // Extracts user-facing detail when a step is blocked on permission, question, or elicitation
+  function parseStepInteraction(step, requireWaitingStatus = true) {
+    if (!step || typeof step !== 'object') return null;
+    if (requireWaitingStatus && !WAITING_STEP_STATUSES.has(step.status)) return null;
+
+    const requested =
+      step.requestedInteraction || step.requested_interaction || {};
+    const oneof =
+      requested && typeof requested.interaction === 'object'
+        ? requested.interaction
+        : null;
+    const oneofCase = oneof?.case || '';
+    const oneofVal =
+      oneof && oneof.value && typeof oneof.value === 'object' ? oneof.value : null;
+
+    let perm =
+      requested?.permission && typeof requested.permission === 'object'
+        ? requested.permission
+        : null;
+    if (!perm && oneofCase === 'permission') perm = oneofVal;
+
+    let ask =
+      (requested?.askQuestion && typeof requested.askQuestion === 'object'
+        ? requested.askQuestion
+        : null) ||
+      (requested?.ask_question && typeof requested.ask_question === 'object'
+        ? requested.ask_question
+        : null);
+    if (!ask && (oneofCase === 'askQuestion' || oneofCase === 'ask_question')) {
+      ask = oneofVal;
+    }
+    if (!ask && ASK_QUESTION_STEP_TYPES.has(step.type)) {
+      ask = getStepOneofPayload(step, 'askQuestion', 'ask_question');
+    }
+
+    let elic =
+      requested?.elicitation && typeof requested.elicitation === 'object'
+        ? requested.elicitation
+        : null;
+    if (!elic && oneofCase === 'elicitation') elic = oneofVal;
+
+    let detail = 'Waiting for user input';
+    if (perm) {
+      const res =
+        perm.resource && typeof perm.resource === 'object' ? perm.resource : {};
+      const action =
+        res.action ||
+        perm.actionDescription ||
+        perm.action_description ||
+        perm.toolName ||
+        'command';
+      const target = res.target || perm.reason || perm.command || '';
+      detail = `Permission required for ${action}: ${target}`.replace(/[:\s]+$/, '');
+    } else if (ask) {
+      const questions = Array.isArray(ask.questions) ? ask.questions : [];
+      let qText = '';
+      if (questions.length > 0 && questions[0] && typeof questions[0] === 'object') {
+        qText = String(questions[0].question || '');
+      } else if (questions.length > 0 && typeof questions[0] === 'string') {
+        qText = questions[0];
+      } else if (ask.question) {
+        qText = String(ask.question);
+      }
+      detail = `Awaiting answer: ${qText || 'Question'}`;
+    } else if (elic) {
+      const msg =
+        elic.message || elic.url || elic.serverName || elic.server_name || '';
+      detail = `Input required: ${msg}`.replace(/[:\s]+$/, '');
+    }
+
+    if (detail === 'Waiting for user input') {
+      const meta = step.metadata && typeof step.metadata === 'object' ? step.metadata : {};
+      const toolCall =
+        meta.modifiedToolCall ||
+        meta.modified_tool_call ||
+        meta.toolCall ||
+        meta.tool_call ||
+        step.toolCall ||
+        step.tool_call ||
+        {};
+      const stepType = typeof step.type === 'string' ? step.type : '';
+      const typeFallback = stepType.startsWith('CORTEX_STEP_TYPE_')
+        ? stepType.slice('CORTEX_STEP_TYPE_'.length).toLowerCase()
+        : '';
+      const toolName = String(toolCall?.name || typeFallback || '');
+      const argsRaw = toolCall?.argumentsJson || toolCall?.arguments_json;
+      let argsObj = {};
+      if (typeof argsRaw === 'string' && argsRaw) {
+        try {
+          const parsed = JSON.parse(argsRaw);
+          if (parsed && typeof parsed === 'object') argsObj = parsed;
+        } catch {
+          // Ignore malformed tool argument JSON and fall back to step payload fields
+        }
+      } else if (argsRaw && typeof argsRaw === 'object') {
+        argsObj = argsRaw;
+      }
+      const runCmd = getStepOneofPayload(step, 'runCommand', 'run_command') || {};
+      const toolSummary = argsObj.toolSummary || argsObj.tool_summary;
+      const cmd =
+        argsObj.CommandLine ||
+        argsObj.command_line ||
+        runCmd.commandLine ||
+        runCmd.command_line;
+      if (toolSummary) {
+        detail = `Permission required for ${toolSummary}`;
+      } else if (cmd) {
+        detail = `Permission required for command: ${cmd}`;
+      } else if (toolName && toolName !== 'unspecified' && toolName !== 'generic') {
+        detail = `Permission required for ${toolName}`;
+      }
+    }
+    return detail;
+  }
+
+  // Extracts blocked interaction detail and earliest waiting stepIndex from summary.waitingSteps
+  function extractSummaryWaitingInfo(summary) {
+    const waitingSteps = summary?.waitingSteps;
+    if (!Array.isArray(waitingSteps) || waitingSteps.length === 0) return null;
+    let bestEntry = null;
+    let bestIdx = null;
+    for (const entry of waitingSteps) {
+      if (!entry || typeof entry !== 'object') continue;
+      const rawIdx = entry.stepIndex ?? entry.step_index ?? 0;
+      const idx = Number.isFinite(Number(rawIdx)) ? Math.trunc(Number(rawIdx)) : 0;
+      if (bestIdx === null || idx < bestIdx) {
+        bestIdx = idx;
+        bestEntry = entry;
+      }
+    }
+    const parsed =
+      bestEntry?.step && typeof bestEntry.step === 'object'
+        ? parseStepInteraction(bestEntry.step, false)
+        : null;
+    const detail = parsed || 'Waiting for user input';
+    return {
+      detail,
+      stepIndex: bestIdx ?? 0,
+      generic: detail === 'Waiting for user input',
+    };
+  }
+
+  function extractSubagentsAndKills(steps) {
+    const subagents = new Map();
+    const invokeIndices = new Map();
+    const killedIds = new Set();
+    let lastKillAllIdx = -1;
+
+    for (let idx = 0; idx < steps.length; idx++) {
+      const step = steps[idx];
+      if (!step || typeof step !== 'object') continue;
+      let inv = getStepOneofPayload(step, 'invokeSubagent', 'invoke_subagent');
+      if (!inv && INVOKE_SUBAGENT_STEP_TYPES.has(step.type)) inv = step;
+      if (inv) {
+        const specs = Array.isArray(inv.subagents) ? inv.subagents : [];
+        const results = Array.isArray(inv.results) ? inv.results : [];
+        for (let rIdx = 0; rIdx < results.length; rIdx++) {
+          const res = results[rIdx];
+          const childCid = res?.conversationId || res?.conversation_id;
+          if (!childCid || typeof childCid !== 'string') continue;
+          const spec = specs[rIdx];
+          const role = String(
+            spec?.role || spec?.typeName || spec?.type_name || ''
+          );
+          subagents.set(childCid, role || 'Subagent');
+          invokeIndices.set(childCid, idx);
+          killedIds.delete(childCid);
+        }
+        const legacyCid = inv.conversationId || inv.conversation_id;
+        if (typeof legacyCid === 'string' && legacyCid && !subagents.has(legacyCid)) {
+          const legacyRole = String(inv.subagentName || inv.subagent_name || '');
+          subagents.set(legacyCid, legacyRole || 'Subagent');
+          invokeIndices.set(legacyCid, idx);
+          killedIds.delete(legacyCid);
+        }
+      }
+
+      const toolCalls = [];
+      const pr = getStepOneofPayload(step, 'plannerResponse', 'planner_response');
+      const prCalls = pr?.toolCalls || pr?.tool_calls;
+      if (Array.isArray(prCalls)) toolCalls.push(...prCalls);
+      const meta = step.metadata && typeof step.metadata === 'object' ? step.metadata : {};
+      const metaTc = meta.toolCall || meta.tool_call || step.toolCall;
+      if (metaTc && typeof metaTc === 'object') toolCalls.push(metaTc);
+
+      for (const tc of toolCalls) {
+        if (!tc || tc.name !== 'manage_subagents') continue;
+        const argsRaw = tc.argumentsJson || tc.arguments_json || '{}';
+        let args = null;
+        try {
+          args = typeof argsRaw === 'string' ? JSON.parse(argsRaw) : argsRaw;
+        } catch {
+          continue;
+        }
+        const action = String(args?.Action || args?.action || '').toLowerCase();
+        if (action === 'kill_all') {
+          lastKillAllIdx = idx;
+          for (const k of subagents.keys()) killedIds.add(k);
+        } else if (action === 'kill') {
+          const cids = args?.ConversationIds || args?.conversation_ids;
+          if (Array.isArray(cids)) {
+            for (const kid of cids) {
+              if (typeof kid === 'string' && kid) killedIds.add(kid);
+            }
+          }
+        }
+      }
+    }
+    return { subagents, invokeIndices, killedIds, lastKillAllIdx };
+  }
+
+  function plannerHasToolCalls(step) {
+    const pr = getStepOneofPayload(step, 'plannerResponse', 'planner_response');
+    const tcs = pr?.toolCalls || pr?.tool_calls;
+    return Array.isArray(tcs) && tcs.length > 0;
+  }
+
+  function stepSpawnsSubagent(step) {
+    if (!step || typeof step !== 'object') return false;
+    if (INVOKE_SUBAGENT_STEP_TYPES.has(step.type)) return true;
+    if (getStepOneofPayload(step, 'invokeSubagent', 'invoke_subagent')) return true;
+    const pr = getStepOneofPayload(step, 'plannerResponse', 'planner_response');
+    const tcs = pr?.toolCalls || pr?.tool_calls;
+    if (Array.isArray(tcs)) {
+      for (const tc of tcs) {
+        if (tc && (tc.name === 'invoke_subagent' || tc.name === 'swarm')) return true;
+      }
+    }
+    const meta = step.metadata && typeof step.metadata === 'object' ? step.metadata : {};
+    const mtc = meta.toolCall || meta.tool_call || step.toolCall;
+    return Boolean(mtc && (mtc.name === 'invoke_subagent' || mtc.name === 'swarm'));
+  }
+
+  // Evaluates trajectory steps for trailing WAITING blocks and coordinator subagent synthesis
+  function evaluateTrajectoryStatus(
+    trajPayload,
+    extraActiveSubagents,
+    silentSubagents,
+    isWaitingChat
+  ) {
+    if (!trajPayload || typeof trajPayload !== 'object') {
+      return { state: 'unknown', detail: '' };
+    }
+    const rawStatus = trajPayload.status ?? '';
+    const traj =
+      trajPayload.trajectory && typeof trajPayload.trajectory === 'object'
+        ? trajPayload.trajectory
+        : trajPayload;
+    const meta = traj.metadata && typeof traj.metadata === 'object' ? traj.metadata : {};
+    const steps = Array.isArray(traj.steps) ? traj.steps : [];
+    const termReason =
+      trajPayload.latestExecutorTerminationReason ??
+      trajPayload.latest_executor_termination_reason ??
+      traj.latestExecutorTerminationReason ??
+      traj.latest_executor_termination_reason ??
+      meta.latestExecutorTerminationReason ??
+      meta.latest_executor_termination_reason ??
+      '';
+
+    // Check trailing WAITING steps before RUNNING or IDLE; stop only at USER_INPUT or a
+    // concluding no-tool-call DONE PLANNER_RESPONSE so parallel DONE tools cannot mask WAITING
+    for (let i = steps.length - 1; i >= 0; i--) {
+      const step = steps[i];
+      if (!step || typeof step !== 'object') continue;
+      const waitingDetail = parseStepInteraction(step, true);
+      if (waitingDetail) return { state: 'blocked', detail: waitingDetail };
+      if (USER_INPUT_STEP_TYPES.has(step.type)) break;
+      if (
+        PLANNER_STEP_TYPES.has(step.type) &&
+        DONE_STEP_STATUSES.has(step.status) &&
+        !plannerHasToolCalls(step)
+      ) {
+        break;
+      }
+    }
+
+    if (isActiveRunStatus(rawStatus)) {
+      return { state: 'running', detail: 'Agent turn running' };
+    }
+    if (ERROR_TERM_REASONS.has(termReason)) {
+      return { state: 'error', detail: 'Execution stopped due to error' };
+    }
+    if (CANCELED_TERM_REASONS.has(termReason)) {
+      return { state: 'canceled', detail: 'Canceled by user' };
+    }
+
+    let lastUserInputIdx = -1;
+    for (let i = 0; i < steps.length; i++) {
+      if (steps[i] && USER_INPUT_STEP_TYPES.has(steps[i].type)) {
+        lastUserInputIdx = i;
+      }
+    }
+
+    const { subagents, invokeIndices, killedIds, lastKillAllIdx } =
+      extractSubagentsAndKills(steps);
+    const activeSubagents = new Map();
+    for (const [cid, role] of subagents.entries()) {
+      if (!killedIds.has(cid)) activeSubagents.set(cid, role);
+    }
+    const killAllInTurn = lastKillAllIdx > lastUserInputIdx;
+    if (extraActiveSubagents && !killAllInTurn) {
+      for (const [cid, role] of extraActiveSubagents.entries()) {
+        if (!killedIds.has(cid) && !activeSubagents.has(cid)) {
+          activeSubagents.set(cid, role || 'Subagent');
+        }
+      }
+    }
+
+    if (activeSubagents.size > 0) {
+      const lastReportIdx = new Map();
+      for (let i = 0; i < steps.length; i++) {
+        const step = steps[i];
+        if (!step || !SYSTEM_MSG_STEP_TYPES.has(step.type)) continue;
+        const sysMsg =
+          getStepOneofPayload(step, 'systemMessage', 'system_message') || {};
+        const msgText = String(sysMsg.message || '');
+        const agentMsg = sysMsg.agentMessage || sysMsg.agent_message || {};
+        const sender = typeof agentMsg.sender === 'string' ? agentMsg.sender : '';
+        for (const cid of activeSubagents.keys()) {
+          if (
+            sender === cid ||
+            msgText.includes(`sender=${cid}`) ||
+            msgText.includes(cid)
+          ) {
+            lastReportIdx.set(cid, i);
+          }
+        }
+      }
+
+      const silentIds = silentSubagents || new Set();
+      let turnSpawned = false;
+      for (let i = lastUserInputIdx + 1; i < steps.length; i++) {
+        if (stepSpawnsSubagent(steps[i])) {
+          turnSpawned = true;
+          break;
+        }
+      }
+      for (const cid of activeSubagents.keys()) {
+        if (silentIds.has(cid)) continue;
+        let invIdx = -1;
+        if (invokeIndices.has(cid)) {
+          invIdx = invokeIndices.get(cid);
+        } else if (turnSpawned) {
+          invIdx = lastUserInputIdx + 1;
+        } else {
+          continue;
+        }
+        if (invIdx > lastUserInputIdx) {
+          const repIdx = lastReportIdx.has(cid) ? lastReportIdx.get(cid) : -1;
+          if (repIdx <= invIdx) {
+            return { state: 'running', detail: 'Waiting for subagent reports' };
+          }
+        }
+      }
+
+      let latestReport = -1;
+      for (const repIdx of lastReportIdx.values()) {
+        if (repIdx > latestReport) latestReport = repIdx;
+      }
+      if (latestReport > lastUserInputIdx) {
+        let hasSynthesis = false;
+        let terminatedAfterReport = false;
+        for (let i = steps.length - 1; i > latestReport; i--) {
+          const step = steps[i];
+          if (!step || typeof step !== 'object') continue;
+          if (TERMINAL_STEP_STATUSES.has(step.status)) {
+            terminatedAfterReport = true;
+            break;
+          }
+          if (
+            PLANNER_STEP_TYPES.has(step.type) &&
+            DONE_STEP_STATUSES.has(step.status) &&
+            !plannerHasToolCalls(step)
+          ) {
+            hasSynthesis = true;
+            break;
+          }
+        }
+        if (!hasSynthesis && !terminatedAfterReport) {
+          return { state: 'running', detail: 'Synthesizing subagent findings' };
+        }
+      }
+    }
+
+    for (let i = steps.length - 1; i > lastUserInputIdx; i--) {
+      const step = steps[i];
+      if (!step || typeof step !== 'object') continue;
+      if (TRANSPARENT_TAIL_STEP_TYPES.has(step.type)) continue;
+      if (TERMINAL_STEP_STATUSES.has(step.status)) {
+        return { state: 'canceled', detail: 'Canceled' };
+      }
+      if (
+        PLANNER_STEP_TYPES.has(step.type) &&
+        DONE_STEP_STATUSES.has(step.status) &&
+        !plannerHasToolCalls(step)
+      ) {
+        return { state: 'idle', detail: 'Complete' };
+      }
+      if (isWaitingChat) return { state: 'idle', detail: 'Scheduled' };
+      return { state: 'running', detail: 'Agent turn in progress' };
+    }
+    return { state: 'idle', detail: 'Idle' };
+  }
+
+  // Maps each parent conversation ID to its non-killed child subagents and ongoing battle arms
+  function buildDescendantIndex(summariesMap) {
+    const childrenByParent = new Map();
+    const seenEdges = new Set();
+    if (!summariesMap || typeof summariesMap !== 'object') return childrenByParent;
+
+    const addEdge = (parentCid, childCid, label, isBattleArm) => {
+      const edgeKey = `${parentCid}->${childCid}`;
+      let list = childrenByParent.get(parentCid);
+      if (seenEdges.has(edgeKey)) {
+        if (isBattleArm && list) {
+          const prev = list.find((e) => e.cid === childCid);
+          if (prev) prev.isBattleArm = true;
+        }
+        return;
+      }
+      seenEdges.add(edgeKey);
+      if (!list) {
+        list = [];
+        childrenByParent.set(parentCid, list);
+      }
+      list.push({
+        cid: childCid,
+        label: label || 'Subagent',
+        isBattleArm: Boolean(isBattleArm),
+      });
+    };
+
+    for (const [childCid, childSummary] of Object.entries(summariesMap)) {
+      if (!childSummary || childSummary.killed) continue;
+      const parentCid = childSummary.trajectoryMetadata?.parentConversationId || '';
+      if (!parentCid || typeof parentCid !== 'string') continue;
+      const label = String(
+        childSummary.annotations?.title || childSummary.summary || 'Subagent'
+      ).trim();
+      const isFork = Boolean(
+        childSummary.isBattleModeFork ||
+          childSummary.trajectoryMetadata?.isBattleModeFork
+      );
+      addEdge(parentCid, childCid, label || 'Subagent', isFork);
+    }
+
+    for (const [parentCid, parentSummary] of Object.entries(summariesMap)) {
+      if (!parentSummary) continue;
+      const battle =
+        parentSummary.battleModeInfo || parentSummary.battle_mode_info;
+      if (!battle || typeof battle !== 'object') continue;
+      const endType = battle.endType ?? battle.end_type ?? 0;
+      const winner =
+        battle.winningConversationId || battle.winning_conversation_id;
+      if (!ONGOING_BATTLE_END_TYPES.has(endType) || winner) continue;
+      const armIds =
+        battle.childrenConversationIds || battle.children_conversation_ids;
+      const eliminated = Array.isArray(battle.eliminated) ? battle.eliminated : [];
+      if (!Array.isArray(armIds)) continue;
+      for (let idx = 0; idx < armIds.length; idx++) {
+        const armCid = armIds[idx];
+        if (!armCid || typeof armCid !== 'string') continue;
+        if (eliminated[idx]) continue;
+        if (summariesMap[armCid]?.killed) continue;
+        addEdge(parentCid, armCid, `Battle arm ${idx + 1}`, true);
+      }
+    }
+    return childrenByParent;
+  }
+
+  function buildSummaryStatusSig(cid, summary) {
+    if (!summary) return `${cid}:none`;
+    const wsLen = Array.isArray(summary.waitingSteps)
+      ? summary.waitingSteps.length
+      : 0;
+    const rawTitle = summary.annotations?.title || summary.summary || '';
+    const waitFlag = isWaitingTitle(rawTitle) ? 1 : 0;
+    const term =
+      summary.latestExecutorTerminationReason ??
+      summary.latest_executor_termination_reason ??
+      '';
+    return (
+      `${cid}:${summary.stepCount ?? ''}:${parseTimestampMs(summary.lastModifiedTime)}:` +
+      `${summary.status ?? ''}:${summary.notFullyIdle ? 1 : 0}:` +
+      `${summary.hasRunningSubagents ? 1 : 0}:${wsLen}:${term}:` +
+      `${summary.killed ? 1 : 0}:${summary.interrupted ? 1 : 0}:${waitFlag}`
+    );
+  }
+
+  function collectDescendantTreeIds(cascadeId, childIndex) {
+    const tree = [];
+    const seen = new Set([cascadeId]);
+    const queue = (childIndex.get(cascadeId) || []).map((c) => c.cid);
+    while (queue.length > 0) {
+      const nxt = queue.shift();
+      if (seen.has(nxt)) continue;
+      seen.add(nxt);
+      tree.push(nxt);
+      for (const gc of childIndex.get(nxt) || []) {
+        if (!seen.has(gc.cid)) queue.push(gc.cid);
+      }
+    }
+    return tree;
+  }
+
+  function mergeSummaryIntoTraj(summary, trajPayload) {
+    const merged = { ...(trajPayload || {}) };
+    if (!merged.status && summary?.status !== undefined) {
+      merged.status = summary.status;
+    }
+    const term =
+      summary?.latestExecutorTerminationReason ??
+      summary?.latest_executor_termination_reason;
+    if (
+      term !== undefined &&
+      !merged.latestExecutorTerminationReason &&
+      !merged.latest_executor_termination_reason
+    ) {
+      merged.latestExecutorTerminationReason = term;
+    }
+    return merged;
+  }
+
+  async function fetchSingleTrajectoryRpc(cascadeId, summary) {
+    if (!cascadeId || typeof window.fetch !== 'function') return null;
+    const sig = buildSummaryStatusSig(cascadeId, summary);
+    const cached = singleTrajCache.get(cascadeId);
+    if (cached && cached.sig === sig) {
+      singleTrajCache.delete(cascadeId);
+      singleTrajCache.set(cascadeId, cached);
+      return cached.payload;
+    }
+    const headers = {
+      'Content-Type': 'application/json',
+      'x-codeium-csrf-token': getCsrfToken(),
+    };
+    try {
+      const resp = await window.fetch(
+        '/exa.language_server_pb.LanguageServerService/GetCascadeTrajectory',
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            cascadeId,
+            trajectoryVerbosity: 'CLIENT_TRAJECTORY_VERBOSITY_PROD_UI',
+          }),
+        }
+      );
+      if (!resp || !resp.ok) return null;
+      const data = await resp.json();
+      if (!data || typeof data !== 'object') return null;
+      const steps = data.trajectory?.steps;
+      const total = Number(data.numTotalSteps ?? data.num_total_steps ?? 0);
+      // Fetch remaining pages when GetCascadeTrajectory truncates at GRPCMaxMessageSize
+      if (Array.isArray(steps)) {
+        for (let page = 0; page < 8 && steps.length > 0 && steps.length < total; page++) {
+          try {
+            const tailResp = await window.fetch(
+              '/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps',
+              {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                  cascadeId,
+                  stepOffset: steps.length,
+                  trajectoryVerbosity: 'CLIENT_TRAJECTORY_VERBOSITY_PROD_UI',
+                }),
+              }
+            );
+            if (!tailResp || !tailResp.ok) break;
+            const tailData = await tailResp.json();
+            if (!Array.isArray(tailData?.steps) || tailData.steps.length === 0) {
+              break;
+            }
+            steps.push(...tailData.steps);
+          } catch {
+            // Proceed with fetched trajectory prefix when tail page fails
+            break;
+          }
+        }
+      }
+      if (singleTrajCache.size >= SINGLE_TRAJ_CACHE_MAX_ENTRIES) {
+        const oldestKey = singleTrajCache.keys().next().value;
+        if (oldestKey !== undefined) singleTrajCache.delete(oldestKey);
+      }
+      singleTrajCache.set(cascadeId, { sig, payload: data });
+      return data;
+    } catch {
+      return null;
+    }
+  }
+
+  function getOrCreateTrajStatusEntry(cascadeId) {
+    let entry = trajectoryStatusCache.get(cascadeId);
+    if (entry) {
+      trajectoryStatusCache.delete(cascadeId);
+      trajectoryStatusCache.set(cascadeId, entry);
+      return entry;
+    }
+    if (trajectoryStatusCache.size >= TRAJ_STATUS_CACHE_MAX_ENTRIES) {
+      for (const [oldId, oldEntry] of trajectoryStatusCache.entries()) {
+        if (!oldEntry.inFlight) {
+          trajectoryStatusCache.delete(oldId);
+          break;
+        }
+      }
+    }
+    entry = {
+      treeSig: '',
+      attemptedSig: '',
+      inFlight: false,
+      state: '',
+      detail: '',
+      blockedSig: '',
+      fetchedAt: 0,
+    };
+    trajectoryStatusCache.set(cascadeId, entry);
+    return entry;
+  }
+
+  function isSilentSubagentSummary(sSum, nowMs) {
+    if (!sSum || Object.keys(sSum).length === 0) return false;
+    const term =
+      sSum.latestExecutorTerminationReason ??
+      sSum.latest_executor_termination_reason;
+    if (ERROR_TERM_REASONS.has(term) || CANCELED_TERM_REASONS.has(term)) {
+      return true;
+    }
+    const modMs =
+      parseTimestampMs(sSum.lastModifiedTime) ||
+      parseTimestampMs(sSum.createdTime);
+    return modMs > 0 && nowMs - modMs > SILENT_SUBAGENT_GRACE_MS;
+  }
+
+  function shouldInspectTrajectory(cascadeId, summary, childIndex) {
+    if (!cascadeId || !summary || typeof window.fetch !== 'function') return false;
+    if (
+      isActiveRunStatus(summary.status) ||
+      Boolean(summary.notFullyIdle) ||
+      Boolean(summary.hasRunningSubagents)
+    ) {
+      return true;
+    }
+    if ((childIndex.get(cascadeId) || []).length > 0) return true;
+    const prev = trajectoryStatusCache.get(cascadeId);
+    if (prev && (prev.state === 'running' || prev.state === 'blocked')) return true;
+    const modMs =
+      parseTimestampMs(summary.lastModifiedTime) ||
+      parseTimestampMs(summary.createdTime);
+    if (modMs > 0 && Date.now() - modMs <= RECENT_TRAJ_CHECK_WINDOW_MS) {
+      return true;
+    }
+    return false;
+  }
+
+  async function ensureTrajectoryStatusLoaded(
+    cascadeId,
+    summary,
+    treeSig,
+    summariesMap,
+    childIndex
+  ) {
+    if (disposed || !shouldInspectTrajectory(cascadeId, summary, childIndex)) return;
+    const entry = getOrCreateTrajStatusEntry(cascadeId);
+    const now = Date.now();
+    const graceStale =
+      entry.treeSig === treeSig &&
+      entry.detail === 'Waiting for subagent reports' &&
+      now - entry.fetchedAt > SILENT_SUBAGENT_GRACE_MS;
+    if (!graceStale && (entry.treeSig === treeSig || entry.attemptedSig === treeSig)) {
+      return;
+    }
+    if (entry.inFlight) return;
+    entry.inFlight = true;
+    entry.attemptedSig = treeSig;
+
+    try {
+      const rootTraj = await fetchSingleTrajectoryRpc(cascadeId, summary);
+      if (disposed || !rootTraj) return;
+
+      const latestStoreMap =
+        findReduxStore()?.getState()?.trajectorySummaries?.summaries ||
+        summariesMap ||
+        {};
+      const curSummary = latestStoreMap[cascadeId] || summary;
+      const curChildIndex = buildDescendantIndex(latestStoreMap);
+      const curTree = collectDescendantTreeIds(cascadeId, curChildIndex);
+      const curTreeSig = [
+        buildSummaryStatusSig(cascadeId, curSummary),
+        ...curTree.map((d) => buildSummaryStatusSig(d, latestStoreMap[d])),
+      ].join('|');
+
+      const rawTitle = curSummary?.annotations?.title || curSummary?.summary || '';
+      const isWaitingChat = isWaitingTitle(rawTitle);
+      const rootSteps = Array.isArray(rootTraj.trajectory?.steps)
+        ? rootTraj.trajectory.steps
+        : Array.isArray(rootTraj.steps)
+          ? rootTraj.steps
+          : [];
+      const rootSubInfo = extractSubagentsAndKills(rootSteps);
+      let rootLastUi = -1;
+      for (let i = 0; i < rootSteps.length; i++) {
+        if (rootSteps[i] && USER_INPUT_STEP_TYPES.has(rootSteps[i].type)) {
+          rootLastUi = i;
+        }
+      }
+      const rootKillAllActive = rootSubInfo.lastKillAllIdx > rootLastUi;
+
+      let resolvedState = 'idle';
+      let resolvedDetail = '';
+      let resolvedBlockedSig = '';
+
+      // Trailing WAITING on self trajectory takes precedence over RUNNING and IDLE
+      const earlySelf = evaluateTrajectoryStatus(
+        mergeSummaryIntoTraj(curSummary, rootTraj),
+        null,
+        null,
+        isWaitingChat
+      );
+      if (earlySelf.state === 'blocked') {
+        const selfWait = extractSummaryWaitingInfo(curSummary);
+        const selfIdx = selfWait ? selfWait.stepIndex : rootSteps.length;
+        resolvedState = 'blocked';
+        resolvedDetail = earlySelf.detail;
+        resolvedBlockedSig = `self:${selfIdx}:${earlySelf.detail}`;
+      } else {
+        // BFS walk across non-killed descendants and ongoing battle arms
+        const directActiveChildren = new Map();
+        const silentChildren = new Set();
+        let anyDescRunning = false;
+        let blockedDescMsg = '';
+        let blockedDescSig = '';
+        const visited = new Set([cascadeId]);
+        const bfsQueue = (curChildIndex.get(cascadeId) || []).map((c) => ({
+          cid: c.cid,
+          label: c.label,
+          isBattleArm: Boolean(c.isBattleArm),
+          isDirect: true,
+          pKilled: rootSubInfo.killedIds,
+          pKillAll: rootKillAllActive,
+          pRoles: rootSubInfo.subagents,
+        }));
+
+        while (bfsQueue.length > 0) {
+          const item = bfsQueue.shift();
+          if (visited.has(item.cid)) continue;
+          visited.add(item.cid);
+          if (
+            item.pKilled.has(item.cid) ||
+            (item.pKillAll && !item.pRoles.has(item.cid))
+          ) {
+            continue;
+          }
+          const dSummary = latestStoreMap[item.cid] || {};
+          if (dSummary.killed) continue;
+          const role = item.pRoles.get(item.cid) || item.label || 'Subagent';
+          const dWait = extractSummaryWaitingInfo(dSummary);
+          if (dWait && !dWait.generic) {
+            blockedDescMsg = `[${role}] ${dWait.detail}`;
+            blockedDescSig = `desc:${item.cid}:${dWait.stepIndex}:${blockedDescMsg}`;
+            break;
+          }
+          const dTraj = await fetchSingleTrajectoryRpc(item.cid, dSummary);
+          if (disposed) return;
+          const dSteps = Array.isArray(dTraj?.trajectory?.steps)
+            ? dTraj.trajectory.steps
+            : Array.isArray(dTraj?.steps)
+              ? dTraj.steps
+              : [];
+          const dSubInfo = extractSubagentsAndKills(dSteps);
+          let dLastUi = -1;
+          for (let i = 0; i < dSteps.length; i++) {
+            if (dSteps[i] && USER_INPUT_STEP_TYPES.has(dSteps[i].type)) {
+              dLastUi = i;
+            }
+          }
+          let dTrajState = '';
+          if (dTraj) {
+            const dEval = evaluateTrajectoryStatus(
+              mergeSummaryIntoTraj(dSummary, dTraj),
+              null,
+              null,
+              false
+            );
+            dTrajState = dEval.state;
+            if (dEval.state === 'blocked') {
+              const descIdx = dWait ? dWait.stepIndex : dSteps.length;
+              blockedDescMsg = `[${role}] ${dEval.detail}`;
+              blockedDescSig = `desc:${item.cid}:${descIdx}:${blockedDescMsg}`;
+              break;
+            }
+          }
+          if (dWait) {
+            blockedDescMsg = `[${role}] ${dWait.detail}`;
+            blockedDescSig = `desc:${item.cid}:${dWait.stepIndex}:${blockedDescMsg}`;
+            break;
+          }
+          const dRunning =
+            isActiveRunStatus(dSummary.status) ||
+            Boolean(dSummary.notFullyIdle) ||
+            Boolean(dSummary.hasRunningSubagents) ||
+            dTrajState === 'running';
+          if (dRunning) anyDescRunning = true;
+
+          // Battle Mode arms never send SYSTEM_MESSAGE reports, so skip synthesis tracking
+          const isBattleArm = Boolean(
+            item.isBattleArm ||
+              dSummary.isBattleModeFork ||
+              dSummary.trajectoryMetadata?.isBattleModeFork
+          );
+          if (item.isDirect && !isBattleArm) {
+            directActiveChildren.set(item.cid, role);
+            if (!dRunning && isSilentSubagentSummary(dSummary, Date.now())) {
+              silentChildren.add(item.cid);
+            }
+          }
+
+          for (const gc of curChildIndex.get(item.cid) || []) {
+            if (!visited.has(gc.cid)) {
+              bfsQueue.push({
+                cid: gc.cid,
+                label: gc.label,
+                isBattleArm: Boolean(gc.isBattleArm),
+                isDirect: false,
+                pKilled: dSubInfo.killedIds,
+                pKillAll: dSubInfo.lastKillAllIdx > dLastUi,
+                pRoles: dSubInfo.subagents,
+              });
+            }
+          }
+        }
+
+        const evalNowMs = Date.now();
+        for (const sCid of rootSubInfo.subagents.keys()) {
+          if (silentChildren.has(sCid) || !latestStoreMap[sCid]) continue;
+          const sSum = latestStoreMap[sCid];
+          if (sSum.killed) {
+            silentChildren.add(sCid);
+            continue;
+          }
+          if (
+            !isActiveRunStatus(sSum.status) &&
+            !sSum.notFullyIdle &&
+            isSilentSubagentSummary(sSum, evalNowMs)
+          ) {
+            silentChildren.add(sCid);
+          }
+        }
+
+        if (blockedDescMsg) {
+          resolvedState = 'blocked';
+          resolvedDetail = blockedDescMsg;
+          resolvedBlockedSig = blockedDescSig;
+        } else if (
+          isActiveRunStatus(curSummary?.status) ||
+          (!isWaitingChat && Boolean(curSummary?.notFullyIdle)) ||
+          anyDescRunning
+        ) {
+          resolvedState = 'running';
+          resolvedDetail = 'Agent turn running';
+        } else if (!curSummary?.interrupted) {
+          const fullEval = evaluateTrajectoryStatus(
+            mergeSummaryIntoTraj(curSummary, rootTraj),
+            directActiveChildren,
+            silentChildren,
+            isWaitingChat
+          );
+          const lmtMs = parseTimestampMs(curSummary?.lastModifiedTime);
+          const staleIdle =
+            lmtMs > 0 && Date.now() - lmtMs > STALE_IDLE_TURN_MS;
+          if (fullEval.state === 'running' && !staleIdle) {
+            resolvedState = 'running';
+            resolvedDetail = fullEval.detail;
+          } else {
+            resolvedState = 'idle';
+            resolvedDetail = fullEval.detail;
+          }
+        }
+      }
+
+      const prevSig = `${entry.state}:${entry.detail}:${entry.blockedSig}`;
+      entry.treeSig = curTreeSig;
+      entry.attemptedSig = curTreeSig;
+      entry.state = resolvedState;
+      entry.detail = resolvedDetail;
+      entry.blockedSig = resolvedBlockedSig;
+      entry.fetchedAt = Date.now();
+      if (`${resolvedState}:${resolvedDetail}:${resolvedBlockedSig}` !== prevSig) {
+        scheduleSync();
+      }
+    } finally {
+      entry.inFlight = false;
+      if (!disposed) {
+        const latestMap =
+          findReduxStore()?.getState()?.trajectorySummaries?.summaries;
+        const latestSummary = latestMap?.[cascadeId];
+        if (latestMap && latestSummary && entry.treeSig) {
+          const latestIdx = buildDescendantIndex(latestMap);
+          const latestTree = collectDescendantTreeIds(cascadeId, latestIdx);
+          const latestSig = [
+            buildSummaryStatusSig(cascadeId, latestSummary),
+            ...latestTree.map((d) => buildSummaryStatusSig(d, latestMap[d])),
+          ].join('|');
+          if (latestSig !== entry.attemptedSig) {
+            void ensureTrajectoryStatusLoaded(
+              cascadeId,
+              latestSummary,
+              latestSig,
+              latestMap,
+              latestIdx
+            );
+          }
+        }
+      }
+    }
+  }
+
+  // Resolves unified bucket, blocked detail, and coordinator subagent synthesis state
+  function resolveConversationStatus(
+    cascadeId,
+    summary,
+    fallbackTitle,
+    summariesMap,
+    childIndex
+  ) {
+    const resolvedMap =
+      summariesMap || findReduxStore()?.getState()?.trajectorySummaries?.summaries || {};
+    let resolvedId = cascadeId || '';
+    if (!resolvedId && summary && resolvedMap) {
+      for (const [k, v] of Object.entries(resolvedMap)) {
+        if (v === summary) {
+          resolvedId = k;
+          break;
+        }
+      }
+    }
+    const idxMap = childIndex || buildDescendantIndex(resolvedMap);
     const title =
       summary?.annotations?.title || summary?.summary || fallbackTitle || '';
     const marker = parseTitleMarker(title);
-    // Cron chats with marker ⏳ keep notFullyIdle=true between ticks, so only
-    // CASCADE_RUN_STATUS_RUNNING counts as actively working for ⏳ chats
-    const isRunning =
-      summary?.status === 'CASCADE_RUN_STATUS_RUNNING' ||
-      (marker !== OPEN_WAITING_MARKER && Boolean(summary?.notFullyIdle));
-    if (isRunning) {
-      return 'working';
+    const isWaitingChat = marker === OPEN_WAITING_MARKER;
+
+    const treeIds = resolvedId ? collectDescendantTreeIds(resolvedId, idxMap) : [];
+    const treeSig = resolvedId
+      ? [
+          buildSummaryStatusSig(resolvedId, summary),
+          ...treeIds.map((d) => buildSummaryStatusSig(d, resolvedMap[d])),
+        ].join('|')
+      : '';
+    if (resolvedId && summary) {
+      void ensureTrajectoryStatusLoaded(
+        resolvedId,
+        summary,
+        treeSig,
+        resolvedMap,
+        idxMap
+      );
     }
-    if (marker === OPEN_WAITING_MARKER) {
-      return 'waiting';
+    const cachedTraj = resolvedId ? trajectoryStatusCache.get(resolvedId) : null;
+    const cachedMatches = Boolean(cachedTraj && cachedTraj.treeSig === treeSig);
+    // Keep prior running/blocked trajectory state while an update RPC is in flight to avoid
+    // 1-frame flicker into Needs Me (and premature latching) between step transitions
+    const useCachedTraj = Boolean(
+      cachedMatches ||
+        (cachedTraj?.inFlight &&
+          (cachedTraj.state === 'running' || cachedTraj.state === 'blocked'))
+    );
+
+    // Blocked check on self or active descendants takes precedence over running and waiting
+    const selfWait = extractSummaryWaitingInfo(summary);
+    if (selfWait) {
+      const detail =
+        selfWait.generic && cachedMatches && cachedTraj.state === 'blocked' && cachedTraj.detail
+          ? cachedTraj.detail
+          : selfWait.detail;
+      return {
+        bucket: 'needs-me',
+        isBlocked: true,
+        blockedDetail: detail,
+        blockedSig: `self:${selfWait.stepIndex}:${detail}`,
+        workingDetail: '',
+      };
     }
-    return 'needs-me';
+
+    // Fall back to raw descendant summaries only before trajectory kill-filtering resolves
+    let anyDescendantRunning = false;
+    if (!cachedMatches) {
+      for (const dCid of treeIds) {
+        const dSummary = resolvedMap[dCid];
+        if (!dSummary || dSummary.killed) continue;
+        const dWait = extractSummaryWaitingInfo(dSummary);
+        if (dWait) {
+          const directEntry = (idxMap.get(resolvedId) || []).find((c) => c.cid === dCid);
+          const role = String(
+            directEntry?.label ||
+              dSummary.annotations?.title ||
+              dSummary.summary ||
+              'Subagent'
+          ).trim();
+          const detail = `[${role || 'Subagent'}] ${dWait.detail}`;
+          return {
+            bucket: 'needs-me',
+            isBlocked: true,
+            blockedDetail: detail,
+            blockedSig: `desc:${dCid}:${dWait.stepIndex}:${detail}`,
+            workingDetail: '',
+          };
+        }
+        if (
+          isActiveRunStatus(dSummary.status) ||
+          Boolean(dSummary.notFullyIdle) ||
+          Boolean(dSummary.hasRunningSubagents)
+        ) {
+          anyDescendantRunning = true;
+        }
+      }
+    }
+
+    if (useCachedTraj && cachedTraj.state === 'blocked') {
+      const detail = cachedTraj.detail || 'Waiting for user input';
+      return {
+        bucket: 'needs-me',
+        isBlocked: true,
+        blockedDetail: detail,
+        blockedSig: cachedTraj.blockedSig || `traj:${summary?.stepCount ?? ''}:${detail}`,
+        workingDetail: '',
+      };
+    }
+
+    // Working check: active turn, non-⏳ background task, active child, or pending synthesis
+    const selfRunning =
+      isActiveRunStatus(summary?.status) ||
+      (!isWaitingChat && Boolean(summary?.notFullyIdle)) ||
+      Boolean(summary?.hasRunningSubagents);
+    const lmtMs = parseTimestampMs(summary?.lastModifiedTime);
+    const staleIdle = lmtMs > 0 && Date.now() - lmtMs > STALE_IDLE_TURN_MS;
+    const trajRunning =
+      useCachedTraj &&
+      cachedTraj.state === 'running' &&
+      (cachedTraj.detail === 'Agent turn running' || (!staleIdle && !summary?.interrupted));
+    if (selfRunning || anyDescendantRunning || trajRunning) {
+      return {
+        bucket: 'working',
+        isBlocked: false,
+        blockedDetail: '',
+        blockedSig: '',
+        workingDetail: trajRunning ? cachedTraj.detail : '',
+      };
+    }
+
+    // Cron or external waiting chat without blocked steps or active turns
+    if (isWaitingChat) {
+      return {
+        bucket: 'waiting',
+        isBlocked: false,
+        blockedDetail: '',
+        blockedSig: '',
+        workingDetail: '',
+      };
+    }
+
+    // Idle open chat awaiting user review or next prompt
+    return {
+      bucket: 'needs-me',
+      isBlocked: false,
+      blockedDetail: '',
+      blockedSig: '',
+      workingDetail: '',
+    };
+  }
+
+  // Classifies a conversation into one of the 3 state buckets
+  function classifyChatBucket(
+    summary,
+    fallbackTitle,
+    cascadeId,
+    summariesMap,
+    childIndex
+  ) {
+    return resolveConversationStatus(
+      cascadeId,
+      summary,
+      fallbackTitle,
+      summariesMap,
+      childIndex
+    ).bucket;
   }
 
   function emptyBreakdown() {
@@ -505,10 +1654,17 @@
     let chosenHiddenCount = 0;
     const perProjectHidden = new Map();
     const statsSummary = emptyBreakdown();
+    const childIndex = buildDescendantIndex(summariesMap);
 
     for (const [cascadeId, summary] of Object.entries(summariesMap || {})) {
       if (!isEligibleTopLevelSummary(cascadeId, summary)) continue;
-      const bucket = classifyChatBucket(summary, '');
+      const bucket = classifyChatBucket(
+        summary,
+        '',
+        cascadeId,
+        summariesMap,
+        childIndex
+      );
       countBucket(statsSummary, bucket);
       if (allowedBuckets.has(bucket)) continue;
       hiddenIds.add(cascadeId);
@@ -1510,8 +2666,14 @@
         font-size: 10px;
         font-weight: 500;
       }
-      .${INBOX_ROW_CLASS} .jetski-inbox-title {
+      .${INBOX_ROW_CLASS} .jetski-inbox-text-col {
+        display: flex;
+        flex-direction: column;
         flex: 1 1 auto;
+        min-width: 0;
+        gap: 1px;
+      }
+      .${INBOX_ROW_CLASS} .jetski-inbox-title {
         min-width: 0;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -1520,6 +2682,18 @@
       }
       .${INBOX_ROW_CLASS}[data-tier="urgent"] .jetski-inbox-title {
         font-weight: 600;
+      }
+      .${INBOX_ROW_CLASS} .jetski-inbox-detail {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 10px;
+        line-height: 1.25;
+        color: var(--muted-foreground, #9aa0a6);
+      }
+      .${INBOX_ROW_CLASS}[data-tier="urgent"] .jetski-inbox-detail {
+        color: #fca5a5;
       }
       .${INBOX_ROW_CLASS} .jetski-inbox-time {
         flex-shrink: 0;
@@ -1567,6 +2741,7 @@
 
     const store = findReduxStore();
     const summariesMap = store?.getState()?.trajectorySummaries?.summaries || {};
+    const childIndex = buildDescendantIndex(summariesMap);
 
     // Fallback DOM row tagging for rows rendered before Redux hook or outside standard slices
     const rowEls = document.querySelectorAll('div[data-sidebar-row-id]');
@@ -1576,7 +2751,13 @@
       const rowId = rowEl.getAttribute('data-sidebar-row-id') || '';
       // Read the raw title so a temporary ⏳ display swap never alters bucket classification
       const title = getRawDomTitle(rowEl);
-      const bucket = classifyChatBucket(summariesMap[rowId], title);
+      const bucket = classifyChatBucket(
+        summariesMap[rowId],
+        title,
+        rowId,
+        summariesMap,
+        childIndex
+      );
       countBucket(domStats, bucket);
 
       if (!visibleBuckets.has(bucket)) {
@@ -2476,9 +3657,10 @@
     }
 
     // Unhide the conversation's attention bucket if currently filtered out
-    const summary = store?.getState()?.trajectorySummaries?.summaries?.[targetId];
+    const summariesMap = store?.getState()?.trajectorySummaries?.summaries || {};
+    const summary = summariesMap[targetId];
     const rawTitle = summary?.annotations?.title || summary?.summary || '';
-    const bucket = classifyChatBucket(summary, rawTitle);
+    const bucket = classifyChatBucket(summary, rawTitle, targetId, summariesMap);
     if (!visibleBuckets.has(bucket)) {
       visibleBuckets.add(bucket);
       saveVisibleBuckets(visibleBuckets);
@@ -3132,7 +4314,15 @@
   function markConversationSeen(cascadeId) {
     if (!cascadeId) return;
     latchedNeedsMeModMs.delete(cascadeId);
-    const s = findReduxStore()?.getState()?.trajectorySummaries?.summaries?.[cascadeId];
+    const summariesMap =
+      findReduxStore()?.getState()?.trajectorySummaries?.summaries || {};
+    const s = summariesMap[cascadeId];
+    if (s) {
+      const statusInfo = resolveConversationStatus(cascadeId, s, '', summariesMap);
+      if (statusInfo.isBlocked && statusInfo.blockedSig) {
+        dismissedBlockedSigs.set(cascadeId, statusInfo.blockedSig);
+      }
+    }
     const modMs =
       parseTimestampMs(s?.lastModifiedTime) ||
       parseTimestampMs(s?.createdTime) ||
@@ -3193,12 +4383,26 @@
     return 0;
   }
 
-  // Returns true when a needs-me chat has activity or waitingSteps not yet dismissed by the user
-  function isUnseenNeedsReaction(cascadeId, summary) {
+  // Returns true when a needs-me chat has activity or a blocked step not yet dismissed by the user
+  function isUnseenNeedsReaction(cascadeId, summary, statusInfo) {
     if (!summary) return false;
+    const resolvedStatus =
+      statusInfo || resolveConversationStatus(cascadeId, summary, '');
     const lastMod =
       parseTimestampMs(summary.lastModifiedTime) ||
       parseTimestampMs(summary.createdTime);
+
+    // Live blocked steps (self or subagent) stay visible until resolved or explicitly dismissed
+    if (resolvedStatus.isBlocked) {
+      if (
+        resolvedStatus.blockedSig &&
+        dismissedBlockedSigs.get(cascadeId) === resolvedStatus.blockedSig
+      ) {
+        return false;
+      }
+      return true;
+    }
+    dismissedBlockedSigs.delete(cascadeId);
 
     // Once latched in Needs Me, mounting in pane (which updates serverLastView) does not dismiss
     if (latchedNeedsMeModMs.has(cascadeId)) {
@@ -3222,21 +4426,16 @@
       }
       return false;
     }
-    if (
-      Array.isArray(summary.waitingSteps) &&
-      summary.waitingSteps.length > 0 &&
-      effectiveLastView === 0
-    ) {
-      latchedNeedsMeModMs.set(cascadeId, Date.now());
-      return true;
-    }
     return false;
   }
 
-  // Classifies an unseen inbox chat into 'urgent' (blocked on waitingSteps) vs 'unseen'
-  function classifyInboxTier(summary) {
+  // Classifies an unseen inbox chat into 'urgent' (blocked on self/subagent step) vs 'unseen'
+  function classifyInboxTier(summary, statusInfo) {
     // Chats blocked on tool approval or user questions rank above unread finished turns
-    if (Array.isArray(summary?.waitingSteps) && summary.waitingSteps.length > 0) {
+    if (
+      statusInfo?.isBlocked ||
+      (Array.isArray(summary?.waitingSteps) && summary.waitingSteps.length > 0)
+    ) {
       return 'urgent';
     }
     return 'unseen';
@@ -3251,6 +4450,10 @@
     row.setAttribute('data-tab', item.tabKey);
     if (item.tier) {
       row.setAttribute('data-tier', item.tier);
+    }
+    if (item.detailText) {
+      row.setAttribute('data-detail', item.detailText);
+      row.setAttribute('title', `${item.baseTitle} — ${item.detailText}`);
     }
 
     const main = document.createElement('div');
@@ -3270,13 +4473,25 @@
     proj.className = 'jetski-inbox-project';
     proj.textContent = item.projectName;
 
+    const textCol = document.createElement('div');
+    textCol.className = 'jetski-inbox-text-col';
+
     const title = document.createElement('span');
     title.className = 'jetski-inbox-title';
     title.textContent = item.baseTitle;
+    textCol.appendChild(title);
+
+    if (item.detailText) {
+      const detail = document.createElement('span');
+      detail.className = 'jetski-inbox-detail';
+      detail.setAttribute('data-testid', 'jetski-inbox-detail');
+      detail.textContent = item.detailText;
+      textCol.appendChild(detail);
+    }
 
     main.appendChild(icon);
     main.appendChild(proj);
-    main.appendChild(title);
+    main.appendChild(textCol);
 
     if (item.timePrefix) {
       const time = document.createElement('span');
@@ -3455,6 +4670,7 @@
 
     const store = findReduxStore();
     const summariesMap = store?.getState()?.trajectorySummaries?.summaries || {};
+    const childIndex = buildDescendantIndex(summariesMap);
     const now = Date.now();
 
     const itemsNeedsMe = [];
@@ -3475,11 +4691,22 @@
         parseTimestampMs(summary?.createdTime) ||
         now;
       const ageMs = Math.max(0, now - modTs);
-      const bucket = classifyChatBucket(summary, rawTitle);
+      const statusInfo = resolveConversationStatus(
+        cascadeId,
+        summary,
+        rawTitle,
+        summariesMap,
+        childIndex
+      );
+      const bucket = statusInfo.bucket;
 
       if (bucket === 'working') {
-        const isRunning = summary?.status === 'CASCADE_RUN_STATUS_RUNNING';
+        const isRunning = isActiveRunStatus(summary?.status);
         const workingIcon = isRunning ? '🤖' : '⏳';
+        const subagentDetail =
+          statusInfo.workingDetail && statusInfo.workingDetail !== 'Agent turn running'
+            ? statusInfo.workingDetail
+            : '';
         itemsWorking.push({
           cascadeId,
           tabKey: 'working',
@@ -3488,10 +4715,12 @@
           projectId,
           projectName,
           workingIcon,
+          detailText: subagentDetail,
           modTs,
         });
       } else if (bucket === 'needs-me') {
-        if (ageMs >= STALE_THRESHOLD_MS) {
+        // Never demote an actively blocked chat to Stale even if its last turn predates 7 days
+        if (!statusInfo.isBlocked && ageMs >= STALE_THRESHOLD_MS) {
           const days = Math.floor(ageMs / (24 * 60 * 60 * 1000));
           itemsStale.push({
             cascadeId,
@@ -3502,8 +4731,8 @@
             projectName,
             modTs,
           });
-        } else if (isUnseenNeedsReaction(cascadeId, summary)) {
-          const tier = classifyInboxTier(summary);
+        } else if (isUnseenNeedsReaction(cascadeId, summary, statusInfo)) {
+          const tier = classifyInboxTier(summary, statusInfo);
           if (tier === 'urgent') urgentCount++;
           itemsNeedsMe.push({
             cascadeId,
@@ -3513,6 +4742,7 @@
             projectId,
             projectName,
             tier,
+            detailText: statusInfo.isBlocked ? statusInfo.blockedDetail : '',
             modTs,
           });
         }
@@ -3632,7 +4862,8 @@
     const sig = `${activeInboxTab}:` + currentTabItems
       .map(
         (it) =>
-          `${it.cascadeId}:${it.tier || ''}:${it.workingIcon || ''}:${it.projectName}:${it.baseTitle}:${it.timePrefix}`
+          `${it.cascadeId}:${it.tier || ''}:${it.workingIcon || ''}:` +
+          `${it.projectName}:${it.baseTitle}:${it.timePrefix}:${it.detailText || ''}`
       )
       .join('|');
     if (inboxEl.getAttribute('data-jetski-inbox-sig') !== sig) {
@@ -3895,7 +5126,7 @@
   // True only when cascadeId is actively running and mounted in an open pane titlebar
   function isOpenRunningCascade(cascadeId) {
     const summary = findReduxStore()?.getState()?.trajectorySummaries?.summaries?.[cascadeId];
-    if (summary?.status !== 'CASCADE_RUN_STATUS_RUNNING') return false;
+    if (!isActiveRunStatus(summary?.status)) return false;
     for (const b of document.querySelectorAll(`.${TITLEBAR_CONTEXT_BADGE_CLASS}`)) {
       if (b.getAttribute('data-cascade-id') === cascadeId) return true;
     }
@@ -3969,7 +5200,7 @@
     const summarySig = getContextSummarySig(cascadeId);
     const now = Date.now();
     const isRunningDue =
-      summary?.status === 'CASCADE_RUN_STATUS_RUNNING' &&
+      isActiveRunStatus(summary?.status) &&
       now - entry.fetchedAt >= CONTEXT_RUNNING_POLL_MS;
     const needsFetch =
       forceRefresh ||
@@ -4209,12 +5440,28 @@
 
   // Visually swaps ⦿ -> ⏳ in the row title and renders a right-side ⏳ badge while an open
   // leaf chat is idle waiting on a background task or subagent, without touching .pbtxt
-  function syncRowBackgroundWaitUI(rowEl, cascadeId, summary, rawDomTitle) {
+  function syncRowBackgroundWaitUI(
+    rowEl,
+    cascadeId,
+    summary,
+    rawDomTitle,
+    summariesMap,
+    childIndex
+  ) {
     // Skip detached or unidentified row nodes
     if (!rowEl || !cascadeId) return;
     const curTitle =
       summary?.annotations?.title || summary?.summary || rawDomTitle || '';
-    const waitingBg = isWaitingOnBackgroundWork(summary, curTitle);
+    const statusInfo = summary
+      ? resolveConversationStatus(
+          cascadeId,
+          summary,
+          curTitle,
+          summariesMap,
+          childIndex
+        )
+      : null;
+    const waitingBg = isWaitingOnBackgroundWork(summary, curTitle, statusInfo);
     const spanEl = rowEl.querySelector('span.truncate');
 
     // Apply visual ⏳ swap and right-side indicator while background work is active
@@ -4238,14 +5485,18 @@
           spanEl.textContent = displayTitle;
         }
       }
+      const waitLabel =
+        statusInfo?.workingDetail && statusInfo.workingDetail !== 'Agent turn running'
+          ? statusInfo.workingDetail
+          : 'Waiting on background task or subagent';
       let badge = rowEl.querySelector(`.${ROW_BG_WAIT_INDICATOR_CLASS}`);
       // Mount the right-side ⏳ badge once inside the row status cluster
       if (!badge) {
         badge = document.createElement('span');
         badge.className = ROW_BG_WAIT_INDICATOR_CLASS;
         badge.setAttribute('data-testid', 'jetski-row-bg-wait-indicator');
-        badge.setAttribute('title', 'Waiting on background task or subagent');
-        badge.setAttribute('aria-label', 'Waiting on background task or subagent');
+        badge.setAttribute('title', waitLabel);
+        badge.setAttribute('aria-label', waitLabel);
         badge.textContent = OPEN_WAITING_MARKER;
         const anchorBtn =
           rowEl.querySelector('[data-testid="conversation-pin-button"]') ||
@@ -4258,6 +5509,9 @@
               statusWrapper
             : rowEl;
         statusContainer.appendChild(badge);
+      } else {
+        setAttrIfChanged(badge, 'title', waitLabel);
+        setAttrIfChanged(badge, 'aria-label', waitLabel);
       }
     } else {
       // Clear the background-wait attribute once the chat is no longer waiting
@@ -4287,6 +5541,7 @@
     // Read Redux summaries so each row can sync its live background-wait state
     const store = findReduxStore();
     const summariesMap = store?.getState()?.trajectorySummaries?.summaries || {};
+    const childIndex = buildDescendantIndex(summariesMap);
     const rowEls = document.querySelectorAll(
       '[data-testid="conversation-row-sidebar"][data-cascade-id], div[data-sidebar-row-id]'
     );
@@ -4309,7 +5564,9 @@
         rowEl,
         cascadeId,
         summariesMap[cascadeId],
-        fallbackDomTitle
+        fallbackDomTitle,
+        summariesMap,
+        childIndex
       );
     }
   }
@@ -4418,6 +5675,8 @@
       clearContextEntryTimers(entry);
     }
     contextUsageCache.clear();
+    trajectoryStatusCache.clear();
+    singleTrajCache.clear();
     // Remove all injected filter buttons, search panels, and chain stars on reload
     const cleanupSelector = [
       `.${BAR_CLASS}`,

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from collections.abc import Callable
 from datetime import datetime, timezone
 import fcntl
 import glob
@@ -87,6 +88,493 @@ def _watcher_lock_path() -> str:
 
 def _view_state_path() -> str:
   return f"/tmp/jetski_project_badge_view_{_uid_suffix()}.json"
+
+
+def _traj_cache_path() -> str:
+  return f"/tmp/jetski_project_badge_traj_{_uid_suffix()}.json"
+
+
+# Status and step type values across Connect-JSON strings and numeric proto enums
+WAITING_STEP_STATUSES = frozenset({"CORTEX_STEP_STATUS_WAITING", 9, "WAITING"})
+DONE_STEP_STATUSES = frozenset({"CORTEX_STEP_STATUS_DONE", 3, "DONE"})
+TERMINAL_STEP_STATUSES = frozenset({
+    "CORTEX_STEP_STATUS_CANCELED",
+    6,
+    "CANCELED",
+    "CORTEX_STEP_STATUS_ERROR",
+    7,
+    "ERROR",
+    "CORTEX_STEP_STATUS_INTERRUPTED",
+    12,
+    "INTERRUPTED",
+})
+ACTIVE_RUN_STATUSES = frozenset({
+    "CASCADE_RUN_STATUS_RUNNING",
+    "CASCADE_RUN_STATUS_BUSY",
+    "CASCADE_RUN_STATUS_CANCELING",
+    2,
+    3,
+    4,
+})
+ERROR_TERM_REASONS = frozenset({"EXECUTOR_TERMINATION_REASON_ERROR", 1, "ERROR"})
+CANCELED_TERM_REASONS = frozenset({
+    "EXECUTOR_TERMINATION_REASON_USER_CANCELED",
+    2,
+    "USER_CANCELED",
+})
+USER_INPUT_STEP_TYPES = frozenset({"CORTEX_STEP_TYPE_USER_INPUT", 14})
+PLANNER_STEP_TYPES = frozenset({"CORTEX_STEP_TYPE_PLANNER_RESPONSE", 15})
+SYSTEM_MSG_STEP_TYPES = frozenset({"CORTEX_STEP_TYPE_SYSTEM_MESSAGE", 101})
+INVOKE_SUBAGENT_STEP_TYPES = frozenset({"CORTEX_STEP_TYPE_INVOKE_SUBAGENT", 127})
+ASK_QUESTION_STEP_TYPES = frozenset({"CORTEX_STEP_TYPE_ASK_QUESTION", 138})
+# Post-response bookkeeping steps that appear after PLANNER_RESPONSE on finished turns
+TRANSPARENT_TAIL_STEP_TYPES = frozenset({
+    "CORTEX_STEP_TYPE_FINISH",
+    2,
+    "CORTEX_STEP_TYPE_CHECKPOINT",
+    23,
+    "CORTEX_STEP_TYPE_SUGGESTED_RESPONSES",
+    27,
+    "CORTEX_STEP_TYPE_MEMORY",
+    38,
+    "CORTEX_STEP_TYPE_EPHEMERAL_MESSAGE",
+    90,
+    "CORTEX_STEP_TYPE_CONVERSATION_HISTORY",
+    98,
+    "CORTEX_STEP_TYPE_KNOWLEDGE_ARTIFACTS",
+    99,
+    "CORTEX_STEP_TYPE_KNOWLEDGE_GENERATION",
+    102,
+    "CORTEX_STEP_TYPE_DIRECTORY_RULES",
+    139,
+})
+TRAJ_CACHE_MAX_ENTRIES = 128
+RECENT_TRAJ_CHECK_WINDOW_SEC = 21600.0
+SILENT_SUBAGENT_GRACE_SEC = 30.0
+STALE_IDLE_TURN_SEC = 900.0
+ONGOING_BATTLE_END_TYPES = frozenset({0, "", None, "BATTLE_END_TYPE_UNSPECIFIED"})
+
+
+def _step_oneof_payload(step: dict[str, Any], camel: str, snake: str) -> dict[str, Any]:
+  direct = step.get(camel) or step.get(snake)
+  if isinstance(direct, dict):
+    return direct
+  inner = step.get("step")
+  if isinstance(inner, dict) and inner.get("case") in (camel, snake):
+    val = inner.get("value")
+    if isinstance(val, dict):
+      return val
+  return {}
+
+
+def parse_step_interaction(
+    step: dict[str, Any], require_waiting_status: bool = True
+) -> str | None:
+  """Extracts user-facing detail when a step is blocked on permission, question, or input."""
+  if not isinstance(step, dict):
+    return None
+  if require_waiting_status and step.get("status") not in WAITING_STEP_STATUSES:
+    return None
+
+  requested = (
+      step.get("requestedInteraction")
+      or step.get("requested_interaction")
+      or {}
+  )
+  if not isinstance(requested, dict):
+    requested = {}
+
+  # Support both Connect-JSON fields and @bufbuild/protobuf v2 {case, value} oneof
+  oneof = requested.get("interaction")
+  oneof_case = oneof.get("case") if isinstance(oneof, dict) else ""
+  oneof_val = oneof.get("value") if isinstance(oneof, dict) else None
+
+  perm = requested.get("permission")
+  if not isinstance(perm, dict) and oneof_case == "permission" and isinstance(oneof_val, dict):
+    perm = oneof_val
+
+  ask = requested.get("ask_question") or requested.get("askQuestion")
+  if not isinstance(ask, dict) and oneof_case in ("askQuestion", "ask_question"):
+    if isinstance(oneof_val, dict):
+      ask = oneof_val
+  if not isinstance(ask, dict) and step.get("type") in ASK_QUESTION_STEP_TYPES:
+    ask = _step_oneof_payload(step, "askQuestion", "ask_question")
+
+  elic = requested.get("elicitation")
+  if not isinstance(elic, dict) and oneof_case == "elicitation" and isinstance(oneof_val, dict):
+    elic = oneof_val
+
+  detail = "Waiting for user input"
+  if isinstance(perm, dict):
+    res = perm.get("resource") if isinstance(perm.get("resource"), dict) else {}
+    action = (
+        res.get("action")
+        or perm.get("actionDescription")
+        or perm.get("action_description")
+        or perm.get("toolName")
+        or "command"
+    )
+    target = (
+        res.get("target")
+        or perm.get("reason")
+        or perm.get("command")
+        or ""
+    )
+    detail = f"Permission required for {action}: {target}".rstrip(": ")
+  elif isinstance(ask, dict):
+    questions = ask.get("questions") if isinstance(ask.get("questions"), list) else []
+    q_text = ""
+    if questions and isinstance(questions[0], dict):
+      q_text = str(questions[0].get("question") or "")
+    elif questions and isinstance(questions[0], str):
+      q_text = questions[0]
+    else:
+      q_text = str(ask.get("question") or "")
+    detail = f"Awaiting answer: {q_text or 'Question'}"
+  elif isinstance(elic, dict):
+    msg = (
+        elic.get("message")
+        or elic.get("url")
+        or elic.get("serverName")
+        or elic.get("server_name")
+        or ""
+    )
+    detail = f"Input required: {msg}".rstrip(": ")
+
+  if detail == "Waiting for user input":
+    meta = step.get("metadata") if isinstance(step.get("metadata"), dict) else {}
+    tool_call = (
+        meta.get("modifiedToolCall")
+        or meta.get("modified_tool_call")
+        or meta.get("toolCall")
+        or meta.get("tool_call")
+        or step.get("toolCall")
+        or step.get("tool_call")
+        or {}
+    )
+    if not isinstance(tool_call, dict):
+      tool_call = {}
+    step_type = str(step.get("type") or "")
+    type_fallback = (
+        step_type.removeprefix("CORTEX_STEP_TYPE_").lower()
+        if step_type.startswith("CORTEX_STEP_TYPE_")
+        else ""
+    )
+    tool_name = str(tool_call.get("name") or type_fallback or "")
+    args_raw = tool_call.get("argumentsJson") or tool_call.get("arguments_json")
+    args_obj: dict[str, Any] = {}
+    if isinstance(args_raw, str) and args_raw:
+      try:
+        parsed = json.loads(args_raw)
+        if isinstance(parsed, dict):
+          args_obj = parsed
+      except ValueError:
+        pass
+    elif isinstance(args_raw, dict):
+      args_obj = args_raw
+
+    run_cmd = _step_oneof_payload(step, "runCommand", "run_command")
+    tool_summary = args_obj.get("toolSummary") or args_obj.get("tool_summary")
+    cmd = (
+        args_obj.get("CommandLine")
+        or args_obj.get("command_line")
+        or run_cmd.get("commandLine")
+        or run_cmd.get("command_line")
+    )
+    if tool_summary:
+      detail = f"Permission required for {tool_summary}"
+    elif cmd:
+      detail = f"Permission required for command: {cmd}"
+    elif tool_name and tool_name not in ("unspecified", "generic"):
+      detail = f"Permission required for {tool_name}"
+
+  return detail
+
+
+def extract_summary_waiting_detail(summary: dict[str, Any]) -> str | None:
+  """Returns blocked interaction detail from `summary.waitingSteps`, if any."""
+  waiting_steps = summary.get("waitingSteps")
+  if not isinstance(waiting_steps, list) or not waiting_steps:
+    return None
+  best_entry: dict[str, Any] | None = None
+  best_idx: int | None = None
+  for entry in waiting_steps:
+    if not isinstance(entry, dict):
+      continue
+    raw_idx = entry.get("stepIndex", entry.get("step_index", 0))
+    idx = int(raw_idx) if isinstance(raw_idx, (int, float)) else 0
+    if best_idx is None or idx < best_idx:
+      best_idx = idx
+      best_entry = entry
+  if best_entry is not None and isinstance(best_entry.get("step"), dict):
+    parsed = parse_step_interaction(
+        best_entry["step"], require_waiting_status=False
+    )
+    if parsed:
+      return parsed
+  return "Waiting for user input"
+
+
+def _extract_subagents_and_kills(
+    steps: list[dict[str, Any]],
+) -> tuple[dict[str, str], dict[str, int], set[str], int]:
+  """Extracts spawned subagent roles, invocation indices, killed IDs, and last kill_all index."""
+  subagents: dict[str, str] = {}
+  invoke_indices: dict[str, int] = {}
+  killed_ids: set[str] = set()
+  last_kill_all_idx = -1
+
+  for idx, step in enumerate(steps):
+    if not isinstance(step, dict):
+      continue
+    inv = _step_oneof_payload(step, "invokeSubagent", "invoke_subagent")
+    if not inv and step.get("type") in INVOKE_SUBAGENT_STEP_TYPES:
+      inv = step
+    if inv:
+      specs = inv.get("subagents") if isinstance(inv.get("subagents"), list) else []
+      results = inv.get("results") if isinstance(inv.get("results"), list) else []
+      for r_idx, res in enumerate(results):
+        if not isinstance(res, dict):
+          continue
+        child_cid = res.get("conversationId") or res.get("conversation_id")
+        if not child_cid or not isinstance(child_cid, str):
+          continue
+        role = ""
+        if r_idx < len(specs) and isinstance(specs[r_idx], dict):
+          role = str(
+              specs[r_idx].get("role")
+              or specs[r_idx].get("typeName")
+              or specs[r_idx].get("type_name")
+              or ""
+          )
+        subagents[child_cid] = role or "Subagent"
+        invoke_indices[child_cid] = idx
+        killed_ids.discard(child_cid)
+      legacy_cid = inv.get("conversationId") or inv.get("conversation_id")
+      if isinstance(legacy_cid, str) and legacy_cid and legacy_cid not in subagents:
+        legacy_role = str(inv.get("subagentName") or inv.get("subagent_name") or "")
+        subagents[legacy_cid] = legacy_role or "Subagent"
+        invoke_indices[legacy_cid] = idx
+        killed_ids.discard(legacy_cid)
+
+    # Inspect both plannerResponse.toolCalls and executed toolCall metadata for kills
+    tool_calls: list[Any] = []
+    pr = _step_oneof_payload(step, "plannerResponse", "planner_response")
+    if pr:
+      tcs = pr.get("toolCalls") or pr.get("tool_calls")
+      if isinstance(tcs, list):
+        tool_calls.extend(tcs)
+    meta = step.get("metadata") if isinstance(step.get("metadata"), dict) else {}
+    meta_tc = meta.get("toolCall") or meta.get("tool_call") or step.get("toolCall")
+    if isinstance(meta_tc, dict):
+      tool_calls.append(meta_tc)
+
+    for tc in tool_calls:
+      if not isinstance(tc, dict) or tc.get("name") != "manage_subagents":
+        continue
+      args_raw = tc.get("argumentsJson") or tc.get("arguments_json") or "{}"
+      try:
+        args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+      except ValueError:
+        continue
+      if not isinstance(args, dict):
+        continue
+      action = str(args.get("Action") or args.get("action") or "").lower()
+      if action == "kill_all":
+        last_kill_all_idx = idx
+        killed_ids.update(subagents.keys())
+      elif action == "kill":
+        cids = args.get("ConversationIds") or args.get("conversation_ids") or []
+        if isinstance(cids, list):
+          for kid in cids:
+            if isinstance(kid, str) and kid:
+              killed_ids.add(kid)
+
+  return subagents, invoke_indices, killed_ids, last_kill_all_idx
+
+
+def _planner_has_tool_calls(step: dict[str, Any]) -> bool:
+  pr = _step_oneof_payload(step, "plannerResponse", "planner_response")
+  tool_calls = pr.get("toolCalls") or pr.get("tool_calls")
+  return isinstance(tool_calls, list) and len(tool_calls) > 0
+
+
+def _step_spawns_subagent(step: dict[str, Any]) -> bool:
+  if step.get("type") in INVOKE_SUBAGENT_STEP_TYPES:
+    return True
+  if _step_oneof_payload(step, "invokeSubagent", "invoke_subagent"):
+    return True
+  pr = _step_oneof_payload(step, "plannerResponse", "planner_response")
+  tcs = pr.get("toolCalls") or pr.get("tool_calls") or []
+  if isinstance(tcs, list):
+    for tc in tcs:
+      if isinstance(tc, dict) and tc.get("name") in ("invoke_subagent", "swarm"):
+        return True
+  meta = step.get("metadata") if isinstance(step.get("metadata"), dict) else {}
+  mtc = meta.get("toolCall") or meta.get("tool_call") or step.get("toolCall")
+  return isinstance(mtc, dict) and mtc.get("name") in ("invoke_subagent", "swarm")
+
+
+def evaluate_trajectory_status(
+    traj_payload: dict[str, Any],
+    extra_active_subagents: dict[str, str] | None = None,
+    silent_subagents: set[str] | None = None,
+    is_waiting_chat: bool = False,
+) -> tuple[str, str]:
+  """Evaluates trajectory steps for trailing WAITING blocks and subagent synthesis.
+
+  Follows central_todo `poll_cascade_status()` priority order while handling
+  multi-turn Jetski chats, parallel tool calls, and post-response checkpoints:
+  1. Trailing `CORTEX_STEP_STATUS_WAITING` steps BEFORE `RUNNING` and `IDLE`.
+  2. Active `RUNNING`/`BUSY`/`CANCELING` status.
+  3. Terminal `ERROR`/`USER_CANCELED` once idle (`jetski_cortex.proto:752`).
+  4. Coordinator final `PLANNER_RESPONSE` synthesis (`DONE`, no `toolCalls`)
+     strictly after the last active subagent `SYSTEM_MESSAGE` report.
+  5. Unfulfilled tool calls / pending wakeups before concluding `IDLE`.
+  """
+  if not isinstance(traj_payload, dict):
+    return "unknown", ""
+
+  raw_status = traj_payload.get("status", "")
+  traj = traj_payload.get("trajectory")
+  if not isinstance(traj, dict):
+    traj = traj_payload
+  meta = traj.get("metadata") if isinstance(traj.get("metadata"), dict) else {}
+  raw_steps = traj.get("steps")
+  steps = raw_steps if isinstance(raw_steps, list) else []
+  termination_reason = (
+      traj_payload.get("latestExecutorTerminationReason")
+      or traj_payload.get("latest_executor_termination_reason")
+      or traj.get("latestExecutorTerminationReason")
+      or traj.get("latest_executor_termination_reason")
+      or meta.get("latestExecutorTerminationReason")
+      or meta.get("latest_executor_termination_reason")
+      or ""
+  )
+
+  # Check trailing WAITING steps before RUNNING or IDLE; stop only at USER_INPUT
+  # or a concluding no-tool-call DONE PLANNER_RESPONSE so parallel DONE sibling
+  # tool calls never mask a WAITING step in the same invocation
+  for step in reversed(steps):
+    if not isinstance(step, dict):
+      continue
+    waiting_detail = parse_step_interaction(step, require_waiting_status=True)
+    if waiting_detail:
+      return "blocked", waiting_detail
+    step_type = step.get("type")
+    if step_type in USER_INPUT_STEP_TYPES:
+      break
+    if (
+        step_type in PLANNER_STEP_TYPES
+        and step.get("status") in DONE_STEP_STATUSES
+        and not _planner_has_tool_calls(step)
+    ):
+      break
+
+  if raw_status in ACTIVE_RUN_STATUSES:
+    return "running", "Agent turn running"
+
+  # latestExecutorTerminationReason is not cleared on new turns (jetski_cortex.proto:752),
+  # so inspect it only after confirming no step is WAITING and status is not RUNNING
+  if termination_reason in ERROR_TERM_REASONS:
+    return "error", "Execution stopped due to error"
+  if termination_reason in CANCELED_TERM_REASONS:
+    return "canceled", "Canceled by user"
+
+  last_user_input_idx = -1
+  for idx, step in enumerate(steps):
+    if isinstance(step, dict) and step.get("type") in USER_INPUT_STEP_TYPES:
+      last_user_input_idx = idx
+
+  step_subagents, invoke_indices, killed_ids, last_kill_all_idx = (
+      _extract_subagents_and_kills(steps)
+  )
+  active_subagents: dict[str, str] = {
+      cid: role for cid, role in step_subagents.items() if cid not in killed_ids
+  }
+  kill_all_in_turn = last_kill_all_idx > last_user_input_idx
+  if extra_active_subagents and not kill_all_in_turn:
+    for cid, role in extra_active_subagents.items():
+      if cid not in killed_ids and cid not in active_subagents:
+        active_subagents[cid] = role or "Subagent"
+
+  if active_subagents:
+    last_report_idx: dict[str, int] = {}
+    for idx, step in enumerate(steps):
+      if not isinstance(step, dict) or step.get("type") not in SYSTEM_MSG_STEP_TYPES:
+        continue
+      sys_msg = _step_oneof_payload(step, "systemMessage", "system_message")
+      msg_text = str(sys_msg.get("message") or "")
+      agent_msg = sys_msg.get("agentMessage") or sys_msg.get("agent_message") or {}
+      sender = str(agent_msg.get("sender") or "") if isinstance(agent_msg, dict) else ""
+      for cid in active_subagents:
+        if sender == cid or f"sender={cid}" in msg_text or cid in msg_text:
+          last_report_idx[cid] = idx
+
+    silent_ids = silent_subagents or set()
+    turn_spawned = any(
+        isinstance(steps[i], dict) and _step_spawns_subagent(steps[i])
+        for i in range(last_user_input_idx + 1, len(steps))
+    )
+    # Active subagents spawned in the current user turn must deliver a report unless
+    # their own trajectory already aborted or went idle past the silent grace window
+    for cid in active_subagents:
+      if cid in silent_ids:
+        continue
+      if cid in invoke_indices:
+        inv_idx = invoke_indices[cid]
+      elif turn_spawned:
+        inv_idx = last_user_input_idx + 1
+      else:
+        continue
+      if inv_idx > last_user_input_idx and last_report_idx.get(cid, -1) <= inv_idx:
+        return "running", "Waiting for subagent reports"
+
+    # Any subagent report after the latest user turn (or at the tail) requires a
+    # subsequent completed PLANNER_RESPONSE without toolCalls to synthesize findings
+    latest_report = max(last_report_idx.values(), default=-1)
+    if latest_report > last_user_input_idx:
+      has_synthesis = False
+      terminated_after_report = False
+      for idx in range(len(steps) - 1, latest_report, -1):
+        step = steps[idx]
+        if not isinstance(step, dict):
+          continue
+        if step.get("status") in TERMINAL_STEP_STATUSES:
+          terminated_after_report = True
+          break
+        if (
+            step.get("type") in PLANNER_STEP_TYPES
+            and step.get("status") in DONE_STEP_STATUSES
+            and not _planner_has_tool_calls(step)
+        ):
+          has_synthesis = True
+          break
+      if not has_synthesis and not terminated_after_report:
+        return "running", "Synthesizing subagent findings"
+
+  # Verify the turn after last_user_input_idx concluded rather than pausing mid-tool-loop
+  for idx in range(len(steps) - 1, last_user_input_idx, -1):
+    step = steps[idx]
+    if not isinstance(step, dict):
+      continue
+    step_type = step.get("type")
+    if step_type in TRANSPARENT_TAIL_STEP_TYPES:
+      continue
+    step_status = step.get("status")
+    if step_status in TERMINAL_STEP_STATUSES:
+      return "canceled", "Canceled"
+    if (
+        step_type in PLANNER_STEP_TYPES
+        and step_status in DONE_STEP_STATUSES
+        and not _planner_has_tool_calls(step)
+    ):
+      return "idle", "Complete"
+    if is_waiting_chat:
+      return "idle", "Scheduled"
+    return "running", "Agent turn in progress"
+
+  return "idle", "Idle"
 
 
 def strip_activity_badge(name: str) -> str:
@@ -402,9 +890,10 @@ def fetch_trajectories(
         f"http://{clean_addr}"
         "/exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories"
     )
+    # Include subtrajectories in fallback mode so child subagent statuses map to parents
     req = urllib.request.Request(
         url,
-        data=b'{"excludeSubtrajectories": true}',
+        data=b"{}",
         headers={
             "Content-Type": "application/json",
             "x-codeium-csrf-token": token,
@@ -462,6 +951,110 @@ def fetch_trajectories(
       pass
 
   return None
+
+
+def fetch_single_trajectory(
+    cid: str, ls_address: str = "", csrf_token: str = ""
+) -> dict[str, Any] | None:
+  """Fetches a single `PROD_UI` trajectory, appending any truncated tail steps."""
+  if not cid:
+    return None
+  addr = ls_address or os.environ.get("ANTIGRAVITY_LS_ADDRESS", "")
+  token = csrf_token or os.environ.get("ANTIGRAVITY_CSRF_TOKEN", "")
+  if not addr or not token:
+    cached_addr, cached_csrf = _read_cached_conn()
+    addr = addr or cached_addr
+    token = token or cached_csrf
+  if not addr or not token:
+    return None
+
+  clean_addr = addr.removeprefix("http://").removeprefix("https://")
+  base_url = f"http://{clean_addr}/exa.language_server_pb.LanguageServerService"
+  headers = {
+      "Content-Type": "application/json",
+      "x-codeium-csrf-token": token,
+  }
+  req = urllib.request.Request(
+      f"{base_url}/GetCascadeTrajectory",
+      data=json.dumps({
+          "cascadeId": cid,
+          "trajectoryVerbosity": "CLIENT_TRAJECTORY_VERBOSITY_PROD_UI",
+      }).encode("utf-8"),
+      headers=headers,
+      method="POST",
+  )
+  try:
+    with _urlopen_ls(req, timeout=1.5) as resp:
+      data = json.loads(resp.read().decode("utf-8"))
+  except Exception:
+    return None
+  if not isinstance(data, dict):
+    return None
+
+  traj = data.get("trajectory")
+  steps = traj.get("steps") if isinstance(traj, dict) else None
+  total = data.get("numTotalSteps") or data.get("num_total_steps") or 0
+  # Fetch remaining pages when GetCascadeTrajectory truncates at GRPCMaxMessageSize
+  if isinstance(steps, list) and isinstance(total, int):
+    for _ in range(8):
+      if not (0 < len(steps) < total):
+        break
+      tail_req = urllib.request.Request(
+          f"{base_url}/GetCascadeTrajectorySteps",
+          data=json.dumps({
+              "cascadeId": cid,
+              "stepOffset": len(steps),
+              "trajectoryVerbosity": "CLIENT_TRAJECTORY_VERBOSITY_PROD_UI",
+          }).encode("utf-8"),
+          headers=headers,
+          method="POST",
+      )
+      try:
+        with _urlopen_ls(tail_req, timeout=1.5) as tail_resp:
+          tail_data = json.loads(tail_resp.read().decode("utf-8"))
+        tail_steps = tail_data.get("steps") if isinstance(tail_data, dict) else None
+        if not isinstance(tail_steps, list) or not tail_steps:
+          break
+        steps.extend(tail_steps)
+      except Exception:
+        break
+  return data
+
+
+def _load_traj_eval_cache(cache_path: str = "") -> dict[str, dict[str, Any]]:
+  path = cache_path or _traj_cache_path()
+  try:
+    with open(path, "r", encoding="utf-8") as f:
+      raw = json.load(f)
+    if isinstance(raw, dict):
+      return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, dict)}
+  except (OSError, ValueError):
+    pass
+  return {}
+
+
+def _save_traj_eval_cache(
+    cache: dict[str, dict[str, Any]], cache_path: str = ""
+) -> None:
+  path = cache_path or _traj_cache_path()
+  if len(cache) > TRAJ_CACHE_MAX_ENTRIES:
+    ranked = sorted(
+        cache.items(),
+        key=lambda item: float(item[1].get("ts") or 0.0),
+        reverse=True,
+    )
+    cache = dict(ranked[:TRAJ_CACHE_MAX_ENTRIES])
+  tmp_path = f"{path}.tmp.{os.getpid()}"
+  try:
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+      json.dump(cache, f)
+    os.replace(tmp_path, path)
+  except OSError:
+    try:
+      os.unlink(tmp_path)
+    except OSError:
+      pass
 
 
 def _parse_iso_timestamp(ts: str) -> float:
@@ -636,6 +1229,451 @@ def is_conversation_unread(
   return lmt > effective_view
 
 
+def _build_descendant_index(
+    summaries: dict[str, Any],
+) -> dict[str, list[tuple[str, str]]]:
+  """Maps each parent conversation ID to its non-killed child subagents and active battle arms."""
+  children_by_parent: dict[str, list[tuple[str, str]]] = defaultdict(list)
+  seen_edges: set[tuple[str, str]] = set()
+
+  for child_cid, child_summary in summaries.items():
+    if not isinstance(child_summary, dict) or bool(child_summary.get("killed")):
+      continue
+    meta = child_summary.get("trajectoryMetadata") or {}
+    parent_cid = meta.get("parentConversationId") or ""
+    if not isinstance(parent_cid, str) or not parent_cid:
+      continue
+    annotations = child_summary.get("annotations") or {}
+    label = str(
+        annotations.get("title")
+        or child_summary.get("summary")
+        or "Subagent"
+    ).strip()
+    edge = (parent_cid, child_cid)
+    if edge not in seen_edges:
+      seen_edges.add(edge)
+      children_by_parent[parent_cid].append((child_cid, label or "Subagent"))
+
+  for parent_cid, parent_summary in summaries.items():
+    if not isinstance(parent_summary, dict):
+      continue
+    battle = (
+        parent_summary.get("battleModeInfo")
+        or parent_summary.get("battle_mode_info")
+    )
+    if not isinstance(battle, dict):
+      continue
+    end_type = battle.get("endType", battle.get("end_type", 0))
+    winner = (
+        battle.get("winningConversationId")
+        or battle.get("winning_conversation_id")
+    )
+    if end_type not in ONGOING_BATTLE_END_TYPES or winner:
+      continue
+    arm_ids = (
+        battle.get("childrenConversationIds")
+        or battle.get("children_conversation_ids")
+        or []
+    )
+    eliminated = battle.get("eliminated") or []
+    if not isinstance(arm_ids, list):
+      continue
+    for idx, arm_cid in enumerate(arm_ids):
+      if not isinstance(arm_cid, str) or not arm_cid:
+        continue
+      if isinstance(eliminated, list) and idx < len(eliminated) and bool(eliminated[idx]):
+        continue
+      arm_summary = summaries.get(arm_cid)
+      if isinstance(arm_summary, dict) and bool(arm_summary.get("killed")):
+        continue
+      edge = (parent_cid, arm_cid)
+      if edge not in seen_edges:
+        seen_edges.add(edge)
+        children_by_parent[parent_cid].append((arm_cid, f"Battle arm {idx + 1}"))
+
+  return dict(children_by_parent)
+
+
+def _merge_summary_into_traj(
+    summary: dict[str, Any], traj_payload: dict[str, Any]
+) -> dict[str, Any]:
+  merged = dict(traj_payload)
+  if not merged.get("status") and summary.get("status") is not None:
+    merged["status"] = summary.get("status")
+  term = (
+      summary.get("latestExecutorTerminationReason")
+      or summary.get("latest_executor_termination_reason")
+  )
+  if (
+      term is not None
+      and not merged.get("latestExecutorTerminationReason")
+      and not merged.get("latest_executor_termination_reason")
+  ):
+    merged["latestExecutorTerminationReason"] = term
+  return merged
+
+
+def _summary_sig(cid: str, summary: dict[str, Any]) -> str:
+  ws = summary.get("waitingSteps")
+  ws_len = len(ws) if isinstance(ws, list) else 0
+  term = (
+      summary.get("latestExecutorTerminationReason")
+      or summary.get("latest_executor_termination_reason")
+      or ""
+  )
+  return (
+      f"{cid}:{summary.get('stepCount', '')}:{summary.get('lastModifiedTime', '')}:"
+      f"{summary.get('status', '')}:{int(bool(summary.get('notFullyIdle')))}:"
+      f"{int(bool(summary.get('hasRunningSubagents')))}:{ws_len}:{term}:"
+      f"{int(bool(summary.get('killed')))}:{int(bool(summary.get('interrupted')))}:"
+      f"{int(_is_waiting_conversation(summary))}"
+  )
+
+
+def _battle_arm_ids(summary: dict[str, Any]) -> set[str]:
+  battle = summary.get("battleModeInfo") or summary.get("battle_mode_info")
+  if not isinstance(battle, dict):
+    return set()
+  arms = (
+      battle.get("childrenConversationIds")
+      or battle.get("children_conversation_ids")
+      or []
+  )
+  return {a for a in arms if isinstance(a, str) and a}
+
+
+def _is_silent_subagent_summary(
+    s_sum: dict[str, Any], now_ts: float | None
+) -> bool:
+  if not s_sum:
+    return False
+  term = (
+      s_sum.get("latestExecutorTerminationReason")
+      or s_sum.get("latest_executor_termination_reason")
+  )
+  if term in ERROR_TERM_REASONS or term in CANCELED_TERM_REASONS:
+    return True
+  lmt = _parse_iso_timestamp(
+      s_sum.get("lastModifiedTime") or s_sum.get("createdTime") or ""
+  )
+  return (
+      now_ts is not None
+      and lmt > 0.0
+      and (now_ts - lmt) > SILENT_SUBAGENT_GRACE_SEC
+  )
+
+
+def resolve_conversation_activity(
+    cid: str,
+    summary: dict[str, Any],
+    summaries: dict[str, Any],
+    children_by_parent: dict[str, list[tuple[str, str]]] | None = None,
+    trajectories: dict[str, dict[str, Any]] | None = None,
+    traj_fetcher: Callable[[str], dict[str, Any] | None] | None = None,
+    eval_cache: dict[str, dict[str, Any]] | None = None,
+    now_ts: float | None = None,
+    force_running: bool = False,
+    currently_viewing_cid: str = "",
+    viewed_lmt: dict[str, float] | None = None,
+) -> tuple[str, str]:
+  """Resolves `(bucket, detail)` for a visible top-level conversation.
+
+  Priority order:
+  1. `blocked` (summary `waitingSteps`, trailing `WAITING` step, or blocked active
+     descendant subagent / ongoing battle arm) — checked BEFORE `running` and `idle`.
+  2. `running` (active run status, non-`⏳` `notFullyIdle`, active descendant,
+     `force_running`, or pending coordinator `PLANNER_RESPONSE` synthesis after
+     active subagent reports).
+  3. `unread` (idle finished chat newer than `lastUserViewTime`).
+  4. `idle`.
+  """
+  self_wait = extract_summary_waiting_detail(summary)
+  if self_wait:
+    return "blocked", self_wait
+
+  child_index = (
+      children_by_parent
+      if children_by_parent is not None
+      else _build_descendant_index(summaries)
+  )
+  is_waiting_chat = _is_waiting_conversation(summary)
+  lmt = _parse_iso_timestamp(summary.get("lastModifiedTime", ""))
+  self_active = (
+      summary.get("status") in ACTIVE_RUN_STATUSES
+      or (not is_waiting_chat and bool(summary.get("notFullyIdle")))
+      or bool(summary.get("hasRunningSubagents"))
+  )
+
+  # Collect candidate descendant tree first for cache signature & fast summary checks
+  raw_tree: list[str] = []
+  seen_tree: set[str] = {cid}
+  q_ids = [c for c, _ in child_index.get(cid, [])]
+  while q_ids:
+    nxt = q_ids.pop(0)
+    if nxt in seen_tree:
+      continue
+    seen_tree.add(nxt)
+    raw_tree.append(nxt)
+    for gc, _ in child_index.get(nxt, []):
+      if gc not in seen_tree:
+        q_ids.append(gc)
+
+  # Check cached evaluation when neither self nor any descendant summary changed
+  tree_sig = "|".join(
+      [_summary_sig(cid, summary)]
+      + [_summary_sig(d, summaries.get(d, {})) for d in raw_tree]
+  )
+  if eval_cache is not None and trajectories is None and not force_running:
+    cached_entry = eval_cache.get(cid)
+    if isinstance(cached_entry, dict) and cached_entry.get("sig") == tree_sig:
+      c_state = str(cached_entry.get("state") or "")
+      c_detail = str(cached_entry.get("detail") or "")
+      c_ts = float(cached_entry.get("ts") or 0.0)
+      grace_stale = (
+          c_detail == "Waiting for subagent reports"
+          and now_ts is not None
+          and (now_ts - c_ts) > SILENT_SUBAGENT_GRACE_SEC
+      )
+      if not grace_stale and c_state in ("blocked", "running", "idle_traj"):
+        if c_state == "blocked":
+          return "blocked", c_detail
+        if c_state == "running":
+          return "running", c_detail
+        if is_conversation_unread(
+            cid,
+            summary,
+            currently_viewing_cid=currently_viewing_cid,
+            viewed_lmt=viewed_lmt,
+        ):
+          return "unread", ""
+        return "idle", c_detail
+
+  def _get_traj(target_cid: str, target_summary: dict[str, Any]) -> dict[str, Any] | None:
+    if trajectories is not None and target_cid in trajectories:
+      return trajectories[target_cid]
+    if traj_fetcher is None:
+      return None
+    t_lmt = _parse_iso_timestamp(target_summary.get("lastModifiedTime", ""))
+    t_active = (
+        target_summary.get("status") in ACTIVE_RUN_STATUSES
+        or bool(target_summary.get("notFullyIdle"))
+        or bool(target_summary.get("hasRunningSubagents"))
+    )
+    has_children = bool(child_index.get(target_cid))
+    is_recent = (
+        now_ts is None
+        or t_lmt <= 0.0
+        or (now_ts - t_lmt) <= RECENT_TRAJ_CHECK_WINDOW_SEC
+        or target_cid == currently_viewing_cid
+    )
+    if not (t_active or has_children or is_recent):
+      return None
+    return traj_fetcher(target_cid)
+
+  def _extract_steps(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+      return []
+    inner = payload.get("trajectory")
+    src = inner if isinstance(inner, dict) else payload
+    raw_s = src.get("steps")
+    return raw_s if isinstance(raw_s, list) else []
+
+  root_traj = _get_traj(cid, summary)
+  root_steps = _extract_steps(root_traj)
+  root_step_subs, _, root_killed, root_last_kill_all = (
+      _extract_subagents_and_kills(root_steps) if root_steps else ({}, {}, set(), -1)
+  )
+  root_last_ui = -1
+  for idx, s in enumerate(root_steps):
+    if isinstance(s, dict) and s.get("type") in USER_INPUT_STEP_TYPES:
+      root_last_ui = idx
+  root_kill_all_active = root_last_kill_all > root_last_ui
+
+  # Check self trajectory for trailing WAITING step BEFORE inspecting RUNNING
+  if root_traj is not None:
+    early_state, early_detail = evaluate_trajectory_status(
+        _merge_summary_into_traj(summary, root_traj),
+        is_waiting_chat=is_waiting_chat,
+    )
+    if early_state == "blocked":
+      if eval_cache is not None and trajectories is None:
+        eval_cache[cid] = {
+            "sig": tree_sig,
+            "state": "blocked",
+            "detail": early_detail,
+            "ts": now_ts or time.time(),
+        }
+      return "blocked", early_detail
+
+  # Walk non-killed descendants in BFS order so blocked subagents/arms surface with role
+  direct_active_children: dict[str, str] = {}
+  silent_children: set[str] = set()
+  root_battle_arms = _battle_arm_ids(summary)
+  any_descendant_running = False
+  visited: set[str] = {cid}
+  # Queue items: (desc_cid, label, is_direct, parent_killed, parent_kill_all, roles)
+  bfs_queue: list[tuple[str, str, bool, set[str], bool, dict[str, str]]] = [
+      (c_cid, c_label, True, root_killed, root_kill_all_active, root_step_subs)
+      for c_cid, c_label in child_index.get(cid, [])
+  ]
+  while bfs_queue:
+    d_cid, d_label, is_direct, p_killed, p_kill_all, p_roles = bfs_queue.pop(0)
+    if d_cid in visited:
+      continue
+    visited.add(d_cid)
+    if d_cid in p_killed or (p_kill_all and d_cid not in p_roles):
+      continue
+    d_summary = summaries.get(d_cid)
+    if not isinstance(d_summary, dict):
+      d_summary = {}
+    if bool(d_summary.get("killed")):
+      continue
+
+    role = p_roles.get(d_cid) or d_label or "Subagent"
+    d_wait = extract_summary_waiting_detail(d_summary)
+    if d_wait:
+      blocked_msg = f"[{role}] {d_wait}"
+      if eval_cache is not None and trajectories is None:
+        eval_cache[cid] = {
+            "sig": tree_sig,
+            "state": "blocked",
+            "detail": blocked_msg,
+            "ts": now_ts or time.time(),
+        }
+      return "blocked", blocked_msg
+
+    d_traj = _get_traj(d_cid, d_summary)
+    d_steps = _extract_steps(d_traj)
+    d_subs, _, d_killed, d_last_kill_all = (
+        _extract_subagents_and_kills(d_steps) if d_steps else ({}, {}, set(), -1)
+    )
+    d_last_ui = -1
+    for idx, s in enumerate(d_steps):
+      if isinstance(s, dict) and s.get("type") in USER_INPUT_STEP_TYPES:
+        d_last_ui = idx
+
+    d_traj_state = ""
+    if d_traj is not None:
+      d_traj_state, d_traj_detail = evaluate_trajectory_status(
+          _merge_summary_into_traj(d_summary, d_traj),
+          is_waiting_chat=False,
+      )
+      if d_traj_state == "blocked":
+        blocked_msg = f"[{role}] {d_traj_detail}"
+        if eval_cache is not None and trajectories is None:
+          eval_cache[cid] = {
+              "sig": tree_sig,
+              "state": "blocked",
+              "detail": blocked_msg,
+              "ts": now_ts or time.time(),
+          }
+        return "blocked", blocked_msg
+
+    d_running = (
+        d_summary.get("status") in ACTIVE_RUN_STATUSES
+        or bool(d_summary.get("notFullyIdle"))
+        or bool(d_summary.get("hasRunningSubagents"))
+        or d_traj_state == "running"
+    )
+    if d_running:
+      any_descendant_running = True
+
+    # Battle Mode arms never send SYSTEM_MESSAGE reports, so exclude them from synthesis checks
+    is_battle_arm = (
+        d_cid in root_battle_arms
+        or bool(d_summary.get("isBattleModeFork"))
+        or bool((d_summary.get("trajectoryMetadata") or {}).get("isBattleModeFork"))
+    )
+    if is_direct and not is_battle_arm:
+      direct_active_children[d_cid] = role
+      if not d_running and _is_silent_subagent_summary(d_summary, now_ts):
+        silent_children.add(d_cid)
+
+    for gc_cid, gc_label in child_index.get(d_cid, []):
+      if gc_cid not in visited:
+        bfs_queue.append((
+            gc_cid,
+            gc_label,
+            False,
+            d_killed,
+            d_last_kill_all > d_last_ui,
+            d_subs,
+        ))
+
+  # Also mark step-spawned subagents whose summary in `summaries` aborted or went stale-idle
+  for s_cid in root_step_subs:
+    if s_cid in silent_children or s_cid not in summaries:
+      continue
+    s_sum = summaries.get(s_cid)
+    if not isinstance(s_sum, dict):
+      continue
+    if bool(s_sum.get("killed")):
+      silent_children.add(s_cid)
+      continue
+    s_running = (
+        s_sum.get("status") in ACTIVE_RUN_STATUSES
+        or bool(s_sum.get("notFullyIdle"))
+    )
+    if not s_running and _is_silent_subagent_summary(s_sum, now_ts):
+      silent_children.add(s_cid)
+
+  if force_running:
+    return "running", "Agent turn starting"
+
+  if (
+      summary.get("status") in ACTIVE_RUN_STATUSES
+      or (not is_waiting_chat and bool(summary.get("notFullyIdle")))
+      or any_descendant_running
+  ):
+    if eval_cache is not None and trajectories is None:
+      eval_cache[cid] = {
+          "sig": tree_sig,
+          "state": "running",
+          "detail": "Agent turn running",
+          "ts": now_ts or time.time(),
+      }
+    return "running", "Agent turn running"
+
+  if root_traj is not None and not bool(summary.get("interrupted")):
+    traj_state, traj_detail = evaluate_trajectory_status(
+        _merge_summary_into_traj(summary, root_traj),
+        extra_active_subagents=direct_active_children,
+        silent_subagents=silent_children,
+        is_waiting_chat=is_waiting_chat,
+    )
+    stale_idle_turn = (
+        now_ts is not None
+        and lmt > 0.0
+        and (now_ts - lmt) > STALE_IDLE_TURN_SEC
+        and not self_active
+    )
+    if traj_state == "running" and not stale_idle_turn:
+      if eval_cache is not None and trajectories is None:
+        eval_cache[cid] = {
+            "sig": tree_sig,
+            "state": "running",
+            "detail": traj_detail,
+            "ts": now_ts or time.time(),
+        }
+      return "running", traj_detail
+    if eval_cache is not None and trajectories is None:
+      eval_cache[cid] = {
+          "sig": tree_sig,
+          "state": "idle_traj",
+          "detail": traj_detail,
+          "ts": now_ts or time.time(),
+      }
+
+  if is_conversation_unread(
+      cid,
+      summary,
+      currently_viewing_cid=currently_viewing_cid,
+      viewed_lmt=viewed_lmt,
+  ):
+    return "unread", ""
+  return "idle", ""
+
+
 def compute_project_activity(
     summaries: dict[str, Any],
     known_projects: dict[str, tuple[str, dict[str, Any]]],
@@ -645,12 +1683,17 @@ def compute_project_activity(
     force_running_workspaces: list[str] | None = None,
     currently_viewing_cid: str = "",
     viewed_lmt: dict[str, float] | None = None,
+    trajectories: dict[str, dict[str, Any]] | None = None,
+    traj_fetcher: Callable[[str], dict[str, Any] | None] | None = None,
+    eval_cache: dict[str, dict[str, Any]] | None = None,
+    now_ts: float | None = None,
 ) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
   """Computes `(running_counts, blocked_counts, unread_counts)` per project ID."""
   running_counts: dict[str, int] = defaultdict(int)
   blocked_counts: dict[str, int] = defaultdict(int)
   unread_counts: dict[str, int] = defaultdict(int)
   seen_forced = False
+  children_by_parent = _build_descendant_index(summaries)
 
   for cid, summary in summaries.items():
     if not isinstance(summary, dict) or not _is_visible_top_level(summary):
@@ -671,26 +1714,28 @@ def compute_project_activity(
     if not pid or pid not in known_projects:
       continue
 
-    waiting_steps = summary.get("waitingSteps") or []
-    is_waiting_chat = _is_waiting_conversation(summary)
-    is_running = (
-        summary.get("status") == "CASCADE_RUN_STATUS_RUNNING"
-        or (not is_waiting_chat and bool(summary.get("notFullyIdle")))
-    )
-    if force_running_cid and cid == force_running_cid:
+    is_forced = bool(force_running_cid and cid == force_running_cid)
+    if is_forced:
       seen_forced = True
-      is_running = True
 
-    if waiting_steps:
-      blocked_counts[pid] += 1
-    elif is_running:
-      running_counts[pid] += 1
-    elif is_conversation_unread(
+    bucket, _ = resolve_conversation_activity(
         cid,
         summary,
+        summaries,
+        children_by_parent=children_by_parent,
+        trajectories=trajectories,
+        traj_fetcher=traj_fetcher,
+        eval_cache=eval_cache,
+        now_ts=now_ts,
+        force_running=is_forced,
         currently_viewing_cid=currently_viewing_cid,
         viewed_lmt=viewed_lmt,
-    ):
+    )
+    if bucket == "blocked":
+      blocked_counts[pid] += 1
+    elif bucket == "running":
+      running_counts[pid] += 1
+    elif bucket == "unread":
       unread_counts[pid] += 1
 
   # If PreInvocation fired for a brand-new conversation before its summary or
@@ -773,6 +1818,9 @@ def sync_once(
       currently_viewing_cid, viewed_lmt = resolve_currently_viewing_cid(
           summaries
       )
+      # Persist trajectory evaluations across watcher ticks so idle polls issue 0 step RPCs
+      eval_cache = _load_traj_eval_cache()
+      before_cache = json.dumps(eval_cache, sort_keys=True)
       running_counts, blocked_counts, unread_counts = compute_project_activity(
           summaries,
           known_projects,
@@ -782,7 +1830,12 @@ def sync_once(
           force_running_workspaces=force_running_workspaces,
           currently_viewing_cid=currently_viewing_cid,
           viewed_lmt=viewed_lmt,
+          traj_fetcher=fetch_single_trajectory,
+          eval_cache=eval_cache,
+          now_ts=time.time(),
       )
+      if json.dumps(eval_cache, sort_keys=True) != before_cache:
+        _save_traj_eval_cache(eval_cache)
       changes = apply_project_badges(
           projects_dir, running_counts, blocked_counts, unread_counts
       )
@@ -1052,12 +2105,16 @@ def main() -> None:
       sys.exit(1)
     known_projects, folder_to_project = load_projects(args.projects_dir)
     currently_viewing_cid, viewed_lmt = resolve_currently_viewing_cid(summaries)
+    eval_cache = _load_traj_eval_cache()
     running_counts, blocked_counts, unread_counts = compute_project_activity(
         summaries,
         known_projects,
         folder_to_project,
         currently_viewing_cid=currently_viewing_cid,
         viewed_lmt=viewed_lmt,
+        traj_fetcher=fetch_single_trajectory,
+        eval_cache=eval_cache,
+        now_ts=time.time(),
     )
     for pid, (_, pdata) in known_projects.items():
       base = strip_activity_badge(pdata.get("name", ""))

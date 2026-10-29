@@ -463,6 +463,588 @@ class TestProjectActivityBadge(unittest.TestCase):
     with self.assertRaises(badge.urllib.error.URLError):
       badge._urlopen_ls(req, timeout=0.1)
 
+  def test_trailing_waiting_step_overrides_idle_and_running_with_detail(self):
+    known_projects = {"p1": ("/tmp/p1.json", {"id": "p1", "name": "Breaking Chats"})}
+    summaries = {
+        "c-perm-idle": {
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "latestExecutorTerminationReason": (
+                "EXECUTOR_TERMINATION_REASON_USER_CANCELED"
+            ),
+            "trajectoryMetadata": {"projectId": "p1"},
+        },
+        "c-ask-parallel-running": {
+            "status": 2,
+            "notFullyIdle": True,
+            "summary": "[14:00] ⏳ Blocked Behind Timer Marker",
+            "trajectoryMetadata": {"projectId": "p1"},
+        },
+        "c-elicitation-v2": {
+            "status": 1,
+            "trajectoryMetadata": {"projectId": "p1"},
+        },
+        "c-toolcall-fallback": {
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "trajectoryMetadata": {"projectId": "p1"},
+        },
+    }
+    trajectories = {
+        "c-perm-idle": {
+            "trajectory": {
+                "steps": [
+                    {"type": "CORTEX_STEP_TYPE_USER_INPUT", "status": 3},
+                    {
+                        "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+                        "status": "CORTEX_STEP_STATUS_WAITING",
+                        "requestedInteraction": {
+                            "permission": {
+                                "resource": {
+                                    "action": "execute",
+                                    "target": "git push origin main",
+                                }
+                            }
+                        },
+                    },
+                ]
+            }
+        },
+        "c-ask-parallel-running": {
+            "trajectory": {
+                "steps": [
+                    {"type": 14, "status": 3},
+                    {
+                        "type": 138,
+                        "status": 9,
+                        "requestedInteraction": {
+                            "interaction": {
+                                "case": "askQuestion",
+                                "value": {
+                                    "questions": [{"question": "Commit + push?"}]
+                                },
+                            }
+                        },
+                    },
+                    {"type": 132, "status": 3},
+                ]
+            }
+        },
+        "c-elicitation-v2": {
+            "trajectory": {
+                "steps": [
+                    {"type": 14, "status": 3},
+                    {
+                        "type": 132,
+                        "status": "CORTEX_STEP_STATUS_WAITING",
+                        "requestedInteraction": {
+                            "interaction": {
+                                "case": "elicitation",
+                                "value": {"message": "2FA code"},
+                            }
+                        },
+                    },
+                ]
+            }
+        },
+        "c-toolcall-fallback": {
+            "trajectory": {
+                "steps": [
+                    {"type": 14, "status": 3},
+                    {
+                        "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+                        "status": 9,
+                        "metadata": {
+                            "toolCall": {
+                                "name": "run_command",
+                                "argumentsJson": json.dumps(
+                                    {"toolSummary": "Deploy hub patch"}
+                                ),
+                            }
+                        },
+                    },
+                ]
+            }
+        },
+    }
+    running, blocked, unread = badge.compute_project_activity(
+        summaries, known_projects, [], trajectories=trajectories
+    )
+    self.assertEqual(running, {})
+    self.assertEqual(blocked, {"p1": 4})
+    self.assertEqual(unread, {})
+
+    b1, d1 = badge.resolve_conversation_activity(
+        "c-perm-idle", summaries["c-perm-idle"], summaries, trajectories=trajectories
+    )
+    self.assertEqual((b1, d1), ("blocked", "Permission required for execute: git push origin main"))
+
+    b2, d2 = badge.resolve_conversation_activity(
+        "c-ask-parallel-running",
+        summaries["c-ask-parallel-running"],
+        summaries,
+        trajectories=trajectories,
+    )
+    self.assertEqual((b2, d2), ("blocked", "Awaiting answer: Commit + push?"))
+
+    b3, d3 = badge.resolve_conversation_activity(
+        "c-elicitation-v2",
+        summaries["c-elicitation-v2"],
+        summaries,
+        trajectories=trajectories,
+    )
+    self.assertEqual((b3, d3), ("blocked", "Input required: 2FA code"))
+
+    b4, d4 = badge.resolve_conversation_activity(
+        "c-toolcall-fallback",
+        summaries["c-toolcall-fallback"],
+        summaries,
+        trajectories=trajectories,
+    )
+    self.assertEqual((b4, d4), ("blocked", "Permission required for Deploy hub patch"))
+
+  def test_blocked_subagent_and_battle_arm_bubble_up_ignoring_kills(self):
+    known_projects = {"p1": ("/tmp/p1.json", {"id": "p1", "name": "Breaking Chats"})}
+    summaries = {
+        "c-parent-blocked-child": {
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "notFullyIdle": True,
+            "hasRunningSubagents": True,
+            "trajectoryMetadata": {"projectId": "p1"},
+        },
+        "sub-grandparent": {
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "notFullyIdle": True,
+            "summary": "Orchestrator",
+            "trajectoryMetadata": {"parentConversationId": "c-parent-blocked-child"},
+        },
+        "sub-grandchild": {
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "summary": "DB Debugger",
+            "waitingSteps": [{
+                "stepIndex": 4,
+                "step": {
+                    "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+                    "requestedInteraction": {
+                        "permission": {"actionDescription": "drop table"}
+                    },
+                },
+            }],
+            "trajectoryMetadata": {"parentConversationId": "sub-grandparent"},
+        },
+        "c-killed-child-parent": {
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "lastModifiedTime": "2026-10-04T00:50:00Z",
+            "annotations": {"lastUserViewTime": "2026-10-04T00:55:00Z"},
+            "trajectoryMetadata": {"projectId": "p1"},
+        },
+        "sub-killed-flag": {
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "killed": True,
+            "waitingSteps": [{"stepIndex": 1}],
+            "trajectoryMetadata": {"parentConversationId": "c-killed-child-parent"},
+        },
+        "sub-killed-tool": {
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "waitingSteps": [{"stepIndex": 2}],
+            "trajectoryMetadata": {"parentConversationId": "c-killed-child-parent"},
+        },
+        "c-battle": {
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "notFullyIdle": True,
+            "battleModeInfo": {
+                "endType": 0,
+                "childrenConversationIds": ["arm-elim", "arm-live"],
+                "eliminated": [True, False],
+            },
+            "trajectoryMetadata": {"projectId": "p1"},
+        },
+        "arm-elim": {
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "waitingSteps": [{"stepIndex": 1}],
+            "trajectoryMetadata": {"isBattleModeFork": True},
+        },
+        "arm-live": {
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "waitingSteps": [{
+                "stepIndex": 2,
+                "step": {
+                    "type": 138,
+                    "askQuestion": {"questions": [{"question": "Pick API?"}]},
+                },
+            }],
+            "trajectoryMetadata": {"isBattleModeFork": True},
+        },
+    }
+    trajectories = {
+        "c-killed-child-parent": {
+            "trajectory": {
+                "steps": [
+                    {"type": 14, "status": 3},
+                    {
+                        "type": 127,
+                        "status": 3,
+                        "invokeSubagent": {
+                            "subagents": [{"role": "Worker"}],
+                            "results": [{"conversationId": "sub-killed-tool"}],
+                        },
+                    },
+                    {
+                        "type": 15,
+                        "status": 3,
+                        "plannerResponse": {
+                            "toolCalls": [{
+                                "name": "manage_subagents",
+                                "argumentsJson": json.dumps({
+                                    "Action": "kill",
+                                    "ConversationIds": ["sub-killed-tool"],
+                                }),
+                            }]
+                        },
+                    },
+                    {"type": 15, "status": 3, "plannerResponse": {"response": "Done"}},
+                ]
+            }
+        }
+    }
+    running, blocked, unread = badge.compute_project_activity(
+        summaries, known_projects, [], trajectories=trajectories
+    )
+    self.assertEqual(running, {})
+    self.assertEqual(blocked, {"p1": 2})
+    self.assertEqual(unread, {})
+
+    b_gc, d_gc = badge.resolve_conversation_activity(
+        "c-parent-blocked-child",
+        summaries["c-parent-blocked-child"],
+        summaries,
+        trajectories=trajectories,
+    )
+    self.assertEqual((b_gc, d_gc), ("blocked", "[DB Debugger] Permission required for drop table"))
+
+    b_arm, d_arm = badge.resolve_conversation_activity(
+        "c-battle", summaries["c-battle"], summaries, trajectories=trajectories
+    )
+    self.assertEqual((b_arm, d_arm), ("blocked", "[Battle arm 2] Awaiting answer: Pick API?"))
+
+    now = badge._parse_iso_timestamp("2026-10-29T18:30:00Z")
+    with self.subTest("idle_ongoing_battle_awaiting_vote"):
+      battle_ready_sums = {
+          "c-battle-ready": {
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "notFullyIdle": False,
+              "lastModifiedTime": "2026-10-29T18:29:59Z",
+              "annotations": {"lastUserViewTime": "2026-10-29T18:20:00Z"},
+              "battleModeInfo": {
+                  "endType": 0,
+                  "childrenConversationIds": ["arm-r1", "arm-r2"],
+              },
+              "trajectoryMetadata": {"projectId": "p1"},
+          },
+          "arm-r1": {
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "lastModifiedTime": "2026-10-29T18:29:59Z",
+              "trajectoryMetadata": {"isBattleModeFork": True},
+          },
+          "arm-r2": {
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "lastModifiedTime": "2026-10-29T18:29:59Z",
+              "trajectoryMetadata": {"isBattleModeFork": True},
+          },
+      }
+      battle_ready_trajs = {
+          "c-battle-ready": {
+              "trajectory": {
+                  "steps": [
+                      {"type": 14, "status": 3},
+                      {
+                          "type": 127,
+                          "status": 3,
+                          "invokeSubagent": {"results": [{"conversationId": "sub-done"}]},
+                      },
+                      {"type": 101, "status": 3, "systemMessage": {"message": "sender=sub-done"}},
+                      {"type": 15, "status": 3, "plannerResponse": {"response": "Ready"}},
+                  ]
+              }
+          }
+      }
+      self.assertEqual(
+          badge.resolve_conversation_activity(
+              "c-battle-ready",
+              battle_ready_sums["c-battle-ready"],
+              battle_ready_sums,
+              trajectories=battle_ready_trajs,
+              now_ts=now,
+          ),
+          ("unread", ""),
+      )
+
+    with self.subTest("prior_turn_unindexed_child_and_created_time_fallback"):
+      prior_child_sums = {
+          "c-multi": {
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "lastModifiedTime": "2026-10-29T18:29:59Z",
+              "annotations": {"lastUserViewTime": "2026-10-29T18:20:00Z"},
+              "trajectoryMetadata": {"projectId": "p1"},
+          },
+          "sub-turn1": {
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "createdTime": "2026-10-29T18:29:55Z",
+              "trajectoryMetadata": {"parentConversationId": "c-multi"},
+          },
+      }
+      prior_child_trajs = {
+          "c-multi": {
+              "trajectory": {
+                  "steps": [
+                      {"type": 14, "status": 3},
+                      {"type": 15, "status": 3, "plannerResponse": {"response": "Turn 2 done"}},
+                  ]
+              }
+          }
+      }
+      self.assertEqual(
+          badge.resolve_conversation_activity(
+              "c-multi",
+              prior_child_sums["c-multi"],
+              prior_child_sums,
+              trajectories=prior_child_trajs,
+              now_ts=now,
+          ),
+          ("unread", ""),
+      )
+
+  def test_coordinator_synthesis_required_after_subagent_reports(self):
+    known_projects = {"p1": ("/tmp/p1.json", {"id": "p1", "name": "Breaking Chats"})}
+    summaries = {
+        "c-coord": {
+            "summary": "[14:10] ⏳ Coordinator Waiting",
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "notFullyIdle": False,
+            "lastModifiedTime": "2026-10-29T18:00:10Z",
+            "annotations": {"lastUserViewTime": "2026-10-29T18:00:00Z"},
+            "trajectoryMetadata": {"projectId": "p1"},
+        },
+        "sub-1": {
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "notFullyIdle": False,
+            "lastModifiedTime": "2026-10-29T18:00:09Z",
+            "trajectoryMetadata": {"parentConversationId": "c-coord"},
+        },
+    }
+    steps: list[dict] = [
+        {"type": "CORTEX_STEP_TYPE_USER_INPUT", "status": "CORTEX_STEP_STATUS_DONE"},
+        {
+            "type": "CORTEX_STEP_TYPE_INVOKE_SUBAGENT",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "invokeSubagent": {
+                "subagents": [{"role": "Auditor"}],
+                "results": [{"conversationId": "sub-1"}],
+            },
+        },
+        {
+            "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "plannerResponse": {"response": "Launched Auditor in background."},
+        },
+    ]
+    trajectories = {"c-coord": {"trajectory": {"steps": steps}}}
+
+    b0, d0 = badge.resolve_conversation_activity(
+        "c-coord", summaries["c-coord"], summaries, trajectories=trajectories
+    )
+    self.assertEqual((b0, d0), ("running", "Waiting for subagent reports"))
+
+    # Subagent report arrives via IdleSubagentGuardStopHook systemMessage, still unsynthesized
+    steps.append({
+        "type": "CORTEX_STEP_TYPE_SYSTEM_MESSAGE",
+        "status": "CORTEX_STEP_STATUS_DONE",
+        "systemMessage": {"message": "Subagent sub-1 has gone idle with final output."},
+    })
+    # Intermediate tool-calling planner step does NOT count as final synthesis
+    steps.append({
+        "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+        "status": "CORTEX_STEP_STATUS_DONE",
+        "plannerResponse": {
+            "response": "Checking file...",
+            "toolCalls": [{"name": "read_file", "argumentsJson": "{}"}],
+        },
+    })
+    b1, d1 = badge.resolve_conversation_activity(
+        "c-coord", summaries["c-coord"], summaries, trajectories=trajectories
+    )
+    self.assertEqual((b1, d1), ("running", "Synthesizing subagent findings"))
+
+    # Coordinator produces final DONE PLANNER_RESPONSE followed by transparent CHECKPOINT
+    summaries["c-coord"]["summary"] = "[14:10] ⦿ Coordinator Ready"
+    steps.append({
+        "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+        "status": "CORTEX_STEP_STATUS_DONE",
+        "plannerResponse": {"response": "All findings verified and fixed."},
+    })
+    steps.append({"type": "CORTEX_STEP_TYPE_CHECKPOINT", "status": "CORTEX_STEP_STATUS_DONE"})
+    steps.append({
+        "type": "CORTEX_STEP_TYPE_SUGGESTED_RESPONSES",
+        "status": "CORTEX_STEP_STATUS_DONE",
+    })
+    running, blocked, unread = badge.compute_project_activity(
+        summaries, known_projects, [], trajectories=trajectories
+    )
+    self.assertEqual(running, {})
+    self.assertEqual(blocked, {})
+    self.assertEqual(unread, {"p1": 1})
+
+    # If execution aborts with ERROR before synthesis, do not stay stuck in running
+    steps.pop()
+    steps.pop()
+    steps.pop()
+    summaries["c-coord"]["latestExecutorTerminationReason"] = (
+        "EXECUTOR_TERMINATION_REASON_ERROR"
+    )
+    b_err, _ = badge.resolve_conversation_activity(
+        "c-coord", summaries["c-coord"], summaries, trajectories=trajectories
+    )
+    self.assertEqual(b_err, "unread")
+
+  def test_eval_cache_and_truncated_trajectory_tail_fetch(self):
+    known_projects = {"p1": ("/tmp/p1.json", {"id": "p1", "name": "Breaking Chats"})}
+    summaries = {
+        "c-1": {
+            "stepCount": 3,
+            "lastModifiedTime": "2026-10-29T18:10:00Z",
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "trajectoryMetadata": {"projectId": "p1"},
+        }
+    }
+    calls: list[str] = []
+
+    def fake_fetcher(cid: str):
+      calls.append(cid)
+      return {
+          "trajectory": {
+              "steps": [
+                  {"type": 14, "status": 3},
+                  {
+                      "type": 21,
+                      "status": 9,
+                      "requestedInteraction": {
+                          "permission": {"actionDescription": "rm -rf /tmp/x"}
+                      },
+                  },
+              ]
+          }
+      }
+
+    eval_cache: dict = {}
+    now = badge._parse_iso_timestamp("2026-10-29T18:10:05Z")
+    _, blocked1, _ = badge.compute_project_activity(
+        summaries,
+        known_projects,
+        [],
+        traj_fetcher=fake_fetcher,
+        eval_cache=eval_cache,
+        now_ts=now,
+    )
+    self.assertEqual(blocked1, {"p1": 1})
+    self.assertEqual(calls, ["c-1"])
+
+    # Unchanged summary hits eval_cache with zero additional RPCs
+    _, blocked2, _ = badge.compute_project_activity(
+        summaries,
+        known_projects,
+        [],
+        traj_fetcher=fake_fetcher,
+        eval_cache=eval_cache,
+        now_ts=now + 1.5,
+    )
+    self.assertEqual(blocked2, {"p1": 1})
+    self.assertEqual(calls, ["c-1"])
+
+    # Verify fetch_single_trajectory appends multi-page truncated tail steps
+    responses = [
+        json.dumps({
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "numTotalSteps": 5,
+            "trajectory": {"steps": [{"type": 14, "status": 3}]},
+        }).encode("utf-8"),
+        json.dumps({
+            "steps": [
+                {"type": 15, "status": 3, "plannerResponse": {"toolCalls": [{"name": "view"}]}},
+                {"type": 16, "status": 3},
+            ]
+        }).encode("utf-8"),
+        json.dumps({
+            "steps": [
+                {"type": 15, "status": 3, "plannerResponse": {"response": "ok"}},
+                {"type": 23, "status": 3},
+            ]
+        }).encode("utf-8"),
+    ]
+
+    class FakeHttpResp(io.BytesIO):
+      def __enter__(self):
+        return self
+
+      def __exit__(self, *args):
+        self.close()
+
+    with self.subTest("multipage_tail_fetch"):
+      with mock.patch(
+          "urllib.request.urlopen",
+          side_effect=[FakeHttpResp(b) for b in responses],
+      ):
+        merged = badge.fetch_single_trajectory("c-1", "localhost:5387", "tok")
+        self.assertIsNotNone(merged)
+        self.assertEqual(len(merged["trajectory"]["steps"]), 5)
+
+    with self.subTest("eval_cache_invalidates_on_interrupted_and_snake_term"):
+      int_sums = {
+          "c-int": {
+              "stepCount": 2,
+              "lastModifiedTime": "2026-10-29T18:10:00Z",
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "interrupted": False,
+              "annotations": {"lastUserViewTime": "2026-10-29T18:00:00Z"},
+              "trajectoryMetadata": {"projectId": "p1"},
+          }
+      }
+      int_cache: dict = {}
+
+      def running_tail_fetcher(_cid: str):
+        return {
+            "trajectory": {
+                "steps": [
+                    {"type": 14, "status": 3},
+                    {
+                        "type": 15,
+                        "status": 3,
+                        "plannerResponse": {"toolCalls": [{"name": "read_file"}]},
+                    },
+                ]
+            }
+        }
+
+      run_a, _, unread_a = badge.compute_project_activity(
+          int_sums,
+          known_projects,
+          [],
+          traj_fetcher=running_tail_fetcher,
+          eval_cache=int_cache,
+          now_ts=now,
+      )
+      self.assertEqual(run_a, {"p1": 1})
+      self.assertEqual(unread_a, {})
+
+      int_sums["c-int"]["interrupted"] = True
+      run_b, _, unread_b = badge.compute_project_activity(
+          int_sums,
+          known_projects,
+          [],
+          traj_fetcher=running_tail_fetcher,
+          eval_cache=int_cache,
+          now_ts=now + 1.0,
+      )
+      self.assertEqual(run_b, {})
+      self.assertEqual(unread_b, {"p1": 1})
+
 
 if __name__ == "__main__":
   unittest.main()

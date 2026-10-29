@@ -2636,6 +2636,929 @@ eval(code);
     )
     self.assertIn("CONTEXT_BADGE_ASSERTIONS_PASSED", res.stdout)
 
+  def test_r22_blocked_steps_subagent_tree_and_coordinator_synthesis(self) -> None:
+    node_bin = find_node_binary()
+    js_path = os.path.join(SCRIPTS_DIR, "jetski_closed_filter.js")
+
+    harness = r"""
+const fs = require('fs');
+const assert = require('assert');
+
+const scriptPath = process.argv[1];
+const code = fs.readFileSync(scriptPath, 'utf8');
+
+class FakeElement {
+  constructor(tagName) {
+    this.tagName = tagName.toUpperCase();
+    this.id = '';
+    this.className = '';
+    this.type = '';
+    this._textContent = '';
+    this._innerHTML = '';
+    this.style = {};
+    this.attributes = new Map();
+    this.children = [];
+    this.parentElement = null;
+    this.listeners = new Map();
+  }
+  get textContent() {
+    if (this.children.length > 0) {
+      return this._textContent + this.children.map((c) => c.textContent).join('');
+    }
+    return this._textContent;
+  }
+  set textContent(val) {
+    this._textContent = String(val);
+    for (const c of this.children) c.parentElement = null;
+    this.children = [];
+  }
+  get innerHTML() { return this._innerHTML; }
+  set innerHTML(val) { this._innerHTML = String(val); }
+  setAttribute(k, v) {
+    this.attributes.set(k, String(v));
+    if (k === 'id') this.id = String(v);
+    if (k === 'class') this.className = String(v);
+  }
+  getAttribute(k) {
+    if (k === 'id' && this.id) return this.id;
+    return this.attributes.has(k) ? this.attributes.get(k) : null;
+  }
+  hasAttribute(k) { return this.attributes.has(k); }
+  removeAttribute(k) { this.attributes.delete(k); }
+  appendChild(child) {
+    if (child.parentElement) child.remove();
+    child.parentElement = this;
+    this.children.push(child);
+    return child;
+  }
+  insertBefore(child, ref) {
+    if (child === ref) return child;
+    if (child.parentElement) child.remove();
+    child.parentElement = this;
+    const idx = this.children.indexOf(ref);
+    if (idx === -1) this.children.push(child);
+    else this.children.splice(idx, 0, child);
+    return child;
+  }
+  remove() {
+    if (!this.parentElement) return;
+    const idx = this.parentElement.children.indexOf(this);
+    if (idx !== -1) this.parentElement.children.splice(idx, 1);
+    this.parentElement = null;
+  }
+  addEventListener(type, fn) {
+    if (!this.listeners.has(type)) this.listeners.set(type, []);
+    this.listeners.get(type).push(fn);
+  }
+  dispatchEvent(type, eventInit = {}) {
+    const evt = {
+      type,
+      target: this,
+      button: 0,
+      shiftKey: false,
+      ctrlKey: false,
+      metaKey: false,
+      ...eventInit,
+      preventDefault() {},
+      stopPropagation() {},
+    };
+    for (const fn of (this.listeners.get(type) || [])) fn(evt);
+  }
+  getBoundingClientRect() {
+    return { left: 24, top: 40, bottom: 62, right: 140, width: 116, height: 22 };
+  }
+  closest(selector) {
+    let cur = this;
+    while (cur) {
+      if (matches(cur, selector)) return cur;
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+  querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+  querySelectorAll(selector) {
+    const out = [];
+    const visit = (node) => {
+      for (const child of node.children) {
+        if (matches(child, selector)) out.push(child);
+        visit(child);
+      }
+    };
+    visit(this);
+    return out;
+  }
+}
+
+function matches(el, selector) {
+  if (selector.includes(',')) {
+    return selector.split(',').some((part) => matches(el, part.trim()));
+  }
+  if (selector === 'span') return el.tagName === 'SPAN';
+  if (selector === 'span.truncate') return el.tagName === 'SPAN' && el.className === 'truncate';
+  if (selector === 'a[aria-label]') return el.tagName === 'A' && el.hasAttribute('aria-label');
+  if (selector === 'button[aria-label="Display Options"]') {
+    return el.tagName === 'BUTTON' && el.getAttribute('aria-label') === 'Display Options';
+  }
+  const bucketMatch = /^button\[data-bucket="([^"]+)"\]$/.exec(selector);
+  if (bucketMatch) {
+    return el.tagName === 'BUTTON' && el.getAttribute('data-bucket') === bucketMatch[1];
+  }
+  if (selector === '[data-testid="conversation-row-sidebar"][data-cascade-id]') {
+    return (
+      el.getAttribute('data-testid') === 'conversation-row-sidebar' &&
+      el.hasAttribute('data-cascade-id')
+    );
+  }
+  const doubleAttrMatch =
+    /^\[([-a-zA-Z0-9_]+)="([^"]+)"\]\[([-a-zA-Z0-9_]+)="([^"]+)"\]$/.exec(selector);
+  if (doubleAttrMatch) {
+    return (
+      el.getAttribute(doubleAttrMatch[1]) === doubleAttrMatch[2] &&
+      el.getAttribute(doubleAttrMatch[3]) === doubleAttrMatch[4]
+    );
+  }
+  const attrEqMatch = /^\[([-a-zA-Z0-9_]+)="([^"]+)"\]$/.exec(selector);
+  if (attrEqMatch) return el.getAttribute(attrEqMatch[1]) === attrEqMatch[2];
+  if (selector.startsWith('.')) {
+    const classes = selector.split('.').filter(Boolean);
+    const elClasses = el.className ? el.className.split(/\s+/) : [];
+    return classes.every((cls) => elClasses.includes(cls));
+  }
+  if (selector.startsWith('#')) return el.id === selector.slice(1);
+  return false;
+}
+
+const docEl = new FakeElement('html');
+const headEl = new FakeElement('head');
+const bodyEl = new FakeElement('body');
+docEl.appendChild(headEl);
+docEl.appendChild(bodyEl);
+
+const sidebarWrap = new FakeElement('div');
+const actionRow = new FakeElement('div');
+const displayOptionsBtn = new FakeElement('button');
+displayOptionsBtn.setAttribute('aria-label', 'Display Options');
+actionRow.appendChild(displayOptionsBtn);
+sidebarWrap.appendChild(actionRow);
+
+const sidebarListEl = new FakeElement('div');
+sidebarListEl.setAttribute('data-testid', 'conversation-list-sidebar');
+sidebarWrap.appendChild(sidebarListEl);
+bodyEl.appendChild(sidebarWrap);
+
+function makeSidebarRow(cascadeId, title) {
+  const row = new FakeElement('div');
+  row.setAttribute('data-testid', 'conversation-row-sidebar');
+  row.setAttribute('data-cascade-id', cascadeId);
+  const titleSpan = new FakeElement('span');
+  titleSpan.className = 'truncate';
+  titleSpan.textContent = title;
+  const hoverBar = new FakeElement('div');
+  const pinBtn = new FakeElement('button');
+  pinBtn.setAttribute('data-testid', 'conversation-pin-button');
+  hoverBar.appendChild(pinBtn);
+  row.appendChild(titleSpan);
+  row.appendChild(hoverBar);
+  sidebarListEl.appendChild(row);
+  return { row, titleSpan };
+}
+
+const { row: rowPermRunning, titleSpan: spanPermRunning } = makeSidebarRow(
+  'chat-perm-running',
+  '[14:00] ⦿ Clean scratch'
+);
+const { row: rowCoord, titleSpan: spanCoord } = makeSidebarRow(
+  'chat-coord',
+  '[14:20] ⦿ Multi-agent review'
+);
+
+const NOW_ISO = '2026-10-29T18:30:00Z';
+let fakeNow = Date.parse(NOW_ISO);
+Date.now = () => fakeNow;
+
+const trajectoriesByCid = {
+  'chat-wait-ask': {
+    numTotalSteps: 3,
+    trajectory: {
+      steps: [
+        { type: 14, status: 3 },
+        {
+          type: 138,
+          status: 9,
+          requestedInteraction: {
+            interaction: {
+              case: 'askQuestion',
+              value: {
+                questions: [{ question: 'Which branch should I audit?' }],
+              },
+            },
+          },
+        },
+        // Parallel DONE VIEW_FILE step after WAITING must not mask the blocked step
+        { type: 16, status: 3 },
+      ],
+    },
+  },
+  'chat-sub-parent': {
+    numTotalSteps: 2,
+    trajectory: {
+      steps: [
+        { type: 14, status: 3 },
+        {
+          type: 127,
+          status: 3,
+          invokeSubagent: {
+            subagents: [{ role: 'Security Auditor' }],
+            results: [{ conversationId: 'sub-traj-blocked' }],
+          },
+        },
+      ],
+    },
+  },
+  'sub-traj-blocked': {
+    numTotalSteps: 2,
+    trajectory: {
+      steps: [
+        { type: 14, status: 3 },
+        {
+          type: 21,
+          status: 9,
+          requestedInteraction: {
+            interaction: {
+              case: 'permission',
+              value: {
+                resource: { action: 'edit', target: '/etc/hosts' },
+              },
+            },
+          },
+        },
+      ],
+    },
+  },
+  'chat-coord': {
+    numTotalSteps: 4,
+    trajectory: {
+      steps: [
+        { type: 14, status: 3 },
+        {
+          type: 15,
+          status: 3,
+          plannerResponse: {
+            toolCalls: [{ name: 'invoke_subagent', argumentsJson: '{}' }],
+          },
+        },
+        {
+          type: 127,
+          status: 3,
+          invokeSubagent: {
+            subagents: [{ role: 'Code Reviewer' }],
+            results: [{ conversationId: 'sub-worker-1' }],
+          },
+        },
+      ],
+    },
+  },
+  'chat-battle-ready': {
+    numTotalSteps: 2,
+    trajectory: {
+      steps: [
+        { type: 14, status: 3 },
+        { type: 15, status: 3, plannerResponse: { response: 'Ready for vote' } },
+      ],
+    },
+  },
+};
+
+const stepTailsByCid = {
+  'chat-coord': [{ type: 23, status: 3 }],
+};
+
+const storeState = {
+  trajectorySummaries: {
+    summaries: {
+      'chat-perm-running': {
+        summary: '[14:00] ⦿ Clean scratch',
+        // Numeric RUNNING (2) + notFullyIdle=true must still yield to waitingSteps
+        status: 2,
+        notFullyIdle: true,
+        stepCount: 3,
+        lastModifiedTime: '2026-10-29T18:29:50Z',
+        annotations: { title: '[14:00] ⦿ Clean scratch', archived: false },
+        waitingSteps: [
+          {
+            stepIndex: 2,
+            step: {
+              status: 9,
+              type: 21,
+              requestedInteraction: {
+                interaction: {
+                  case: 'permission',
+                  value: {
+                    resource: { action: 'execute', target: 'rm -rf /tmp/scratch' },
+                  },
+                },
+              },
+            },
+          },
+        ],
+      },
+      'chat-wait-ask': {
+        summary: '[14:05] ⏳ Daily digest',
+        // ⏳ waiting chat with generic summary waitingStep refined via GetCascadeTrajectory
+        status: 1,
+        notFullyIdle: true,
+        stepCount: 3,
+        lastModifiedTime: '2026-10-29T18:29:40Z',
+        annotations: { title: '[14:05] ⏳ Daily digest', archived: false },
+        waitingSteps: [{ stepIndex: 1, step: { status: 9, type: 138 } }],
+      },
+      'chat-elicitation': {
+        summary: '[14:08] ⦿ OAuth setup',
+        status: 1,
+        notFullyIdle: false,
+        stepCount: 2,
+        lastModifiedTime: '2026-10-29T18:29:30Z',
+        annotations: { title: '[14:08] ⦿ OAuth setup', archived: false },
+        waitingSteps: [
+          {
+            stepIndex: 1,
+            step: {
+              status: 'CORTEX_STEP_STATUS_WAITING',
+              requested_interaction: {
+                elicitation: { message: 'Enter API token' },
+              },
+            },
+          },
+        ],
+      },
+      'chat-sub-parent': {
+        summary: '[14:10] ⦿ Audit pipeline',
+        status: 1,
+        notFullyIdle: false,
+        stepCount: 2,
+        lastModifiedTime: '2026-10-29T18:20:00Z',
+        // Already viewed by user, yet blocked active child must surface in Needs Me
+        annotations: {
+          title: '[14:10] ⦿ Audit pipeline',
+          archived: false,
+          lastUserViewTime: '2026-10-29T18:25:00Z',
+        },
+      },
+      'sub-killed-flag': {
+        summary: 'Dead Helper',
+        status: 1,
+        killed: true,
+        lastModifiedTime: '2026-10-29T18:29:00Z',
+        trajectoryMetadata: {
+          parentConversationId: 'chat-sub-parent',
+          sourceMetadata: { hideFromConversationList: true },
+        },
+        waitingSteps: [
+          {
+            stepIndex: 1,
+            step: {
+              status: 9,
+              requestedInteraction: {
+                permission: { actionDescription: 'ignored' },
+              },
+            },
+          },
+        ],
+      },
+      'sub-traj-blocked': {
+        summary: 'Raw Child Title',
+        status: 1,
+        notFullyIdle: false,
+        stepCount: 2,
+        lastModifiedTime: '2026-10-29T18:29:45Z',
+        waitingSteps: [{ stepIndex: 1, step: { status: 9, type: 21 } }],
+        trajectoryMetadata: {
+          parentConversationId: 'chat-sub-parent',
+          sourceMetadata: { hideFromConversationList: true },
+        },
+      },
+      'chat-battle': {
+        summary: '[14:15] ⦿ Arenabakeoff',
+        status: 1,
+        notFullyIdle: false,
+        stepCount: 2,
+        lastModifiedTime: '2026-10-29T18:21:00Z',
+        annotations: {
+          title: '[14:15] ⦿ Arenabakeoff',
+          archived: false,
+          lastUserViewTime: '2026-10-29T18:26:00Z',
+        },
+        battleModeInfo: {
+          endType: 0,
+          childrenConversationIds: ['arm-1', 'arm-2'],
+          eliminated: [false, true],
+        },
+      },
+      'arm-1': {
+        summary: 'Arm 1',
+        status: 1,
+        isBattleModeFork: true,
+        trajectoryMetadata: { isBattleModeFork: true },
+        waitingSteps: [
+          {
+            stepIndex: 3,
+            step: {
+              status: 9,
+              requestedInteraction: {
+                permission: { actionDescription: 'git push' },
+              },
+            },
+          },
+        ],
+      },
+      'arm-2': {
+        summary: 'Arm 2',
+        status: 1,
+        isBattleModeFork: true,
+        trajectoryMetadata: { isBattleModeFork: true },
+        waitingSteps: [
+          {
+            stepIndex: 1,
+            step: {
+              status: 9,
+              requestedInteraction: {
+                permission: { actionDescription: 'eliminated' },
+              },
+            },
+          },
+        ],
+      },
+      'chat-coord': {
+        summary: '[14:20] ⦿ Multi-agent review',
+        status: 1,
+        notFullyIdle: false,
+        hasRunningSubagents: false,
+        stepCount: 4,
+        lastModifiedTime: '2026-10-29T18:29:55Z',
+        annotations: { title: '[14:20] ⦿ Multi-agent review', archived: false },
+      },
+      'sub-worker-1': {
+        summary: 'Code Reviewer',
+        status: 1,
+        notFullyIdle: false,
+        stepCount: 3,
+        lastModifiedTime: '2026-10-29T18:29:58Z',
+        trajectoryMetadata: {
+          parentConversationId: 'chat-coord',
+          sourceMetadata: { hideFromConversationList: true },
+        },
+      },
+      'chat-num-running': {
+        summary: '[14:22] ⦿ Numeric busy agent',
+        status: 2,
+        notFullyIdle: true,
+        stepCount: 2,
+        lastModifiedTime: '2026-10-29T18:29:59Z',
+        annotations: { title: '[14:22] ⦿ Numeric busy agent', archived: false },
+      },
+      'chat-battle-ready': {
+        summary: '[14:18] ⦿ Battle awaiting vote',
+        status: 1,
+        notFullyIdle: false,
+        stepCount: 2,
+        lastModifiedTime: '2026-10-29T18:29:56Z',
+        annotations: {
+          title: '[14:18] ⦿ Battle awaiting vote',
+          archived: false,
+          lastUserViewTime: '2026-10-29T18:20:00Z',
+        },
+        battleModeInfo: {
+          endType: 0,
+          childrenConversationIds: ['arm-ready-1', 'arm-ready-2'],
+        },
+      },
+      'arm-ready-1': {
+        summary: 'Ready Arm 1',
+        status: 1,
+        lastModifiedTime: '2026-10-29T18:29:56Z',
+        isBattleModeFork: true,
+        trajectoryMetadata: { isBattleModeFork: true },
+      },
+      'arm-ready-2': {
+        summary: 'Ready Arm 2',
+        status: 1,
+        lastModifiedTime: '2026-10-29T18:29:56Z',
+        isBattleModeFork: true,
+        trajectoryMetadata: { isBattleModeFork: true },
+      },
+    },
+  },
+  conversation: { cascadeId: 'chat-coord' },
+  sideBar: { isOpen: true },
+};
+
+const subscribers = [];
+const reduxStore = {
+  getState: () => storeState,
+  dispatch(action) {
+    if (action?.type === 'trajectorySummaries/applyStreamBatch') {
+      const next = { ...storeState.trajectorySummaries.summaries };
+      for (const [id, s] of (action.payload?.updates || [])) next[id] = s;
+      storeState.trajectorySummaries = { summaries: next };
+    }
+    for (const sub of subscribers) sub();
+    return action;
+  },
+  subscribe(fn) {
+    subscribers.push(fn);
+    return () => {};
+  },
+};
+displayOptionsBtn.__reactFiber$test = { memoizedProps: { store: reduxStore } };
+
+const storage = new Map();
+let rafCallbacks = [];
+
+global.window = {
+  innerWidth: 1280,
+  location: { pathname: '/c/chat-coord', search: '' },
+  __APP_CONFIG__: { csrfToken: 'r22-csrf' },
+  localStorage: {
+    getItem: (k) => (storage.has(k) ? storage.get(k) : null),
+    setItem: (k, v) => storage.set(k, String(v)),
+  },
+  fetch: async (url, opts) => {
+    const u = String(url);
+    const body = opts?.body ? JSON.parse(opts.body) : {};
+    if (u.includes('/GetCascadeTrajectorySteps')) {
+      const tail = stepTailsByCid[body.cascadeId] || [];
+      const initLen =
+        trajectoriesByCid[body.cascadeId]?.trajectory?.steps?.length || 0;
+      const start = Math.max(0, (body.stepOffset || 0) - initLen);
+      const pageSlice = tail.slice(start, start + 2).map((s) => ({ ...s }));
+      return { ok: true, json: async () => ({ steps: pageSlice }) };
+    }
+    if (u.includes('/GetCascadeTrajectory')) {
+      const src = trajectoriesByCid[body.cascadeId];
+      if (!src) return { ok: true, json: async () => ({ trajectory: { steps: [] } }) };
+      const cloned = JSON.parse(JSON.stringify(src));
+      return { ok: true, json: async () => cloned };
+    }
+    if (u.includes('jetski-chains.json')) {
+      return { ok: true, json: async () => ({ parentOf: {}, createdAt: {}, redirects: {} }) };
+    }
+    if (u.includes('jetski-roadmaps.json')) {
+      return { ok: true, json: async () => ({ version: 1, projects: {} }) };
+    }
+    return { ok: false, status: 404 };
+  },
+};
+
+global.document = {
+  documentElement: docEl,
+  head: headEl,
+  body: bodyEl,
+  getElementById: (id) => docEl.querySelector(`#${id}`),
+  createElement: (tag) => new FakeElement(tag),
+  querySelector: (sel) => docEl.querySelector(sel),
+  querySelectorAll: (sel) => docEl.querySelectorAll(sel),
+  addEventListener() {},
+  removeEventListener() {},
+  dispatchEvent() {},
+};
+global.MutationObserver = class {
+  observe() {}
+  disconnect() {}
+};
+global.requestAnimationFrame = (cb) => {
+  rafCallbacks.push(cb);
+  return rafCallbacks.length;
+};
+let nextTimerId = 1;
+const pendingTimers = new Map();
+global.setTimeout = (fn, ms) => {
+  const id = nextTimerId++;
+  pendingTimers.set(id, { fn, due: fakeNow + (Number(ms) || 0) });
+  return id;
+};
+global.clearTimeout = (id) => {
+  pendingTimers.delete(id);
+};
+
+const flushRaf = () => {
+  while (rafCallbacks.length > 0) rafCallbacks.shift()();
+};
+const flushAsync = async () => {
+  for (let round = 0; round < 5; round++) {
+    flushRaf();
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+  }
+  flushRaf();
+};
+
+eval(code);
+
+(async () => {
+  await flushAsync();
+
+  const filterBar = actionRow.querySelector('.jetski-attention-filter-bar');
+  const btnNeedsMe = filterBar.querySelector('button[data-bucket="needs-me"]');
+  const btnWorking = filterBar.querySelector('button[data-bucket="working"]');
+  const btnWaiting = filterBar.querySelector('button[data-bucket="waiting"]');
+
+  // Eligible top-level chats (8):
+  // - needs-me (6): 5 blocked + 1 unread finished battle awaiting vote (chat-battle-ready)
+  // - working (2): chat-coord (waiting for subagent report), chat-num-running (status: 2)
+  // - waiting (0): chat-wait-ask promoted out of waiting into needs-me because blocked
+  assert.strictEqual(btnNeedsMe.getAttribute('aria-label'), '🚨 Needs Me: 6 (shown)');
+  assert.strictEqual(btnWorking.getAttribute('aria-label'), '🤖 Working: 2 (shown)');
+  assert.strictEqual(btnWaiting.getAttribute('aria-label'), '⏳ Waiting: 0 (hidden)');
+
+  // Blocked chat with status=2 & notFullyIdle=true must NOT swap ⦿ -> ⏳ on its sidebar row
+  assert.strictEqual(rowPermRunning.hasAttribute('data-jetski-bg-waiting'), false);
+  assert.strictEqual(spanPermRunning.textContent, '[14:00] ⦿ Clean scratch');
+  assert.strictEqual(rowPermRunning.querySelector('.jetski-row-bg-wait-indicator'), null);
+
+  // Unblocked coordinator waiting for subagent report swaps ⦿ -> ⏳ with exact tooltip
+  assert.strictEqual(rowCoord.getAttribute('data-jetski-bg-waiting'), 'true');
+  assert.strictEqual(spanCoord.textContent, '[14:20] ⏳ Multi-agent review');
+  const coordWaitBadge = rowCoord.querySelector('.jetski-row-bg-wait-indicator');
+  assert(coordWaitBadge, 'Coordinator waiting on subagent must show ⏳ row indicator');
+  assert.strictEqual(coordWaitBadge.getAttribute('title'), 'Waiting for subagent reports');
+
+  // Verify Needs Me inbox rows: 5 blocked chats as 🔥 urgent + chat-battle-ready as unseen
+  const inboxEl = sidebarWrap.querySelector('.jetski-needs-reaction-inbox');
+  assert(inboxEl, 'Needs-Reaction inbox must mount');
+  const urgentPill = inboxEl.querySelector('[data-testid="jetski-inbox-urgent-pill"]');
+  assert.strictEqual(urgentPill.textContent, '🔥 5');
+
+  const getInboxRows = () =>
+    inboxEl.querySelectorAll('[data-testid="jetski-inbox-row"]');
+  const detailByCid = () => {
+    const m = new Map();
+    for (const r of getInboxRows()) {
+      const cid = r.getAttribute('data-cascade-id');
+      const det = r.querySelector('[data-testid="jetski-inbox-detail"]');
+      m.set(cid, {
+        tier: r.getAttribute('data-tier'),
+        detail: det ? det.textContent : '',
+        row: r,
+      });
+    }
+    return m;
+  };
+
+  let details = detailByCid();
+  assert.strictEqual(details.size, 6);
+  assert.strictEqual(details.get('chat-battle-ready').tier, 'unseen');
+  assert.strictEqual(details.get('chat-perm-running').tier, 'urgent');
+  assert.strictEqual(
+    details.get('chat-perm-running').detail,
+    'Permission required for execute: rm -rf /tmp/scratch'
+  );
+  assert.strictEqual(
+    details.get('chat-wait-ask').detail,
+    'Awaiting answer: Which branch should I audit?'
+  );
+  assert.strictEqual(
+    details.get('chat-elicitation').detail,
+    'Input required: Enter API token'
+  );
+  assert.strictEqual(
+    details.get('chat-sub-parent').detail,
+    '[Security Auditor] Permission required for edit: /etc/hosts'
+  );
+  assert.strictEqual(
+    details.get('chat-battle').detail,
+    '[Battle arm 1] Permission required for git push'
+  );
+
+  // Switch inbox to 🤖 Working tab and verify coordinator subagent detail + numeric running icon
+  const tabWorking = inboxEl.querySelector('[data-testid="jetski-inbox-tab-working"]');
+  tabWorking.dispatchEvent('pointerdown', { button: 0 });
+  flushRaf();
+  let workingDetails = detailByCid();
+  assert.strictEqual(workingDetails.size, 2);
+  assert.strictEqual(workingDetails.get('chat-coord').detail, 'Waiting for subagent reports');
+  assert.strictEqual(
+    workingDetails.get('chat-coord').row.querySelector('.jetski-inbox-tier-icon').textContent,
+    '⏳'
+  );
+  assert.strictEqual(workingDetails.get('chat-num-running').detail, '');
+  assert.strictEqual(
+    workingDetails.get('chat-num-running').row.querySelector('.jetski-inbox-tier-icon').textContent,
+    '🤖'
+  );
+
+  // Phase B: Subagent reports via SYSTEM_MESSAGE (tail via GetCascadeTrajectorySteps),
+  // coordinator still status=1 IDLE without final synthesis -> stays in Working!
+  stepTailsByCid['chat-coord'] = [
+    {
+      type: 101,
+      status: 3,
+      systemMessage: { agentMessage: { sender: 'sub-worker-1' } },
+    },
+    { type: 23, status: 3 },
+  ];
+  trajectoriesByCid['chat-coord'].numTotalSteps = 5;
+  reduxStore.dispatch({
+    type: 'trajectorySummaries/applyStreamBatch',
+    payload: {
+      updates: [[
+        'chat-coord',
+        {
+          ...storeState.trajectorySummaries.summaries['chat-coord'],
+          stepCount: 5,
+          lastModifiedTime: '2026-10-29T18:30:02Z',
+        },
+      ]],
+      deletes: [],
+    },
+  });
+  await flushAsync();
+  workingDetails = detailByCid();
+  assert.strictEqual(workingDetails.get('chat-coord').detail, 'Synthesizing subagent findings');
+  assert.strictEqual(coordWaitBadge.getAttribute('title'), 'Synthesizing subagent findings');
+
+  // Phase C: Coordinator emits intermediate tool call on page 1 and concluding DONE
+  // PLANNER_RESPONSE + CHECKPOINT on page 2 -> transitions to 🚨 Needs Me and clears ⏳
+  stepTailsByCid['chat-coord'] = [
+    {
+      type: 101,
+      status: 3,
+      systemMessage: { agentMessage: { sender: 'sub-worker-1' } },
+    },
+    {
+      type: 15,
+      status: 3,
+      plannerResponse: {
+        response: 'Reading file...',
+        toolCalls: [{ name: 'read_file', argumentsJson: '{}' }],
+      },
+    },
+    {
+      type: 15,
+      status: 3,
+      plannerResponse: { response: 'All subagent checks passed.' },
+    },
+    { type: 23, status: 3 },
+  ];
+  trajectoriesByCid['chat-coord'].numTotalSteps = 7;
+  reduxStore.dispatch({
+    type: 'trajectorySummaries/applyStreamBatch',
+    payload: {
+      updates: [[
+        'chat-coord',
+        {
+          ...storeState.trajectorySummaries.summaries['chat-coord'],
+          stepCount: 7,
+          lastModifiedTime: '2026-10-29T18:30:05Z',
+        },
+      ]],
+      deletes: [],
+    },
+  });
+  await flushAsync();
+
+  assert.strictEqual(btnNeedsMe.getAttribute('aria-label'), '🚨 Needs Me: 7 (shown)');
+  assert.strictEqual(btnWorking.getAttribute('aria-label'), '🤖 Working: 1 (shown)');
+  assert.strictEqual(rowCoord.hasAttribute('data-jetski-bg-waiting'), false);
+  assert.strictEqual(spanCoord.textContent, '[14:20] ⦿ Multi-agent review');
+  assert.strictEqual(rowCoord.querySelector('.jetski-row-bg-wait-indicator'), null);
+
+  // Switch back to 🚨 Needs Me tab; verify killing sub-traj-blocked via manage_subagents and
+  // finishing battleModeInfo clears both already-viewed parents from Needs Me without poisoning
+  const tabNeedsMe = inboxEl.querySelector('[data-testid="jetski-inbox-tab-needs-me"]');
+  tabNeedsMe.dispatchEvent('pointerdown', { button: 0 });
+  flushRaf();
+
+  trajectoriesByCid['chat-sub-parent'].trajectory.steps.push(
+    {
+      type: 15,
+      status: 3,
+      plannerResponse: {
+        toolCalls: [
+          {
+            name: 'manage_subagents',
+            argumentsJson: JSON.stringify({
+              Action: 'kill',
+              ConversationIds: ['sub-traj-blocked'],
+            }),
+          },
+        ],
+      },
+    },
+    {
+      type: 15,
+      status: 3,
+      plannerResponse: { response: 'Terminated stuck child.' },
+    }
+  );
+  trajectoriesByCid['chat-sub-parent'].numTotalSteps = 4;
+
+  reduxStore.dispatch({
+    type: 'trajectorySummaries/applyStreamBatch',
+    payload: {
+      updates: [
+        [
+          'chat-sub-parent',
+          {
+            ...storeState.trajectorySummaries.summaries['chat-sub-parent'],
+            stepCount: 4,
+          },
+        ],
+        [
+          'chat-battle',
+          {
+            ...storeState.trajectorySummaries.summaries['chat-battle'],
+            battleModeInfo: {
+              endType: 'BATTLE_END_TYPE_WINNER_SELECTED',
+              winningConversationId: 'arm-1',
+              childrenConversationIds: ['arm-1', 'arm-2'],
+            },
+          },
+        ],
+      ],
+      deletes: [],
+    },
+  });
+  await flushAsync();
+  details = detailByCid();
+  assert.strictEqual(details.has('chat-sub-parent'), false);
+  assert.strictEqual(details.has('chat-battle'), false);
+  assert.strictEqual(urgentPill.textContent, '🔥 3');
+
+  // Dismiss chat-perm-running while blocked at stepIndex 2 -> disappears from Needs Me
+  const permSeenBtn = details
+    .get('chat-perm-running')
+    .row.querySelector('[data-testid="jetski-inbox-seen-btn"]');
+  permSeenBtn.dispatchEvent('pointerdown', { button: 0 });
+  flushRaf();
+  details = detailByCid();
+  assert.strictEqual(details.has('chat-perm-running'), false);
+  assert.strictEqual(urgentPill.textContent, '🔥 2');
+
+  // New blocked step (stepIndex 5, npm publish) re-surfaces chat-perm-running in Needs Me!
+  reduxStore.dispatch({
+    type: 'trajectorySummaries/applyStreamBatch',
+    payload: {
+      updates: [[
+        'chat-perm-running',
+        {
+          ...storeState.trajectorySummaries.summaries['chat-perm-running'],
+          stepCount: 6,
+          waitingSteps: [
+            {
+              stepIndex: 5,
+              step: {
+                status: 9,
+                type: 21,
+                requestedInteraction: {
+                  interaction: {
+                    case: 'permission',
+                    value: {
+                      resource: { action: 'execute', target: 'npm publish' },
+                    },
+                  },
+                },
+              },
+            },
+          ],
+        },
+      ]],
+      deletes: [],
+    },
+  });
+  await flushAsync();
+  details = detailByCid();
+  assert.strictEqual(details.has('chat-perm-running'), true);
+  assert.strictEqual(details.get('chat-perm-running').tier, 'urgent');
+  assert.strictEqual(
+    details.get('chat-perm-running').detail,
+    'Permission required for execute: npm publish'
+  );
+  assert.strictEqual(urgentPill.textContent, '🔥 3');
+
+  window.__jetskiClosedChatsFilterCleanup();
+  assert.strictEqual(pendingTimers.size, 0, 'Zero dangling timers after cleanup');
+
+  console.log('R22_ASSERTIONS_PASSED');
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"""
+    env = os.environ.copy()
+    env["ELECTRON_RUN_AS_NODE"] = "1"
+    res = subprocess.run(
+        [node_bin, "-e", harness, js_path],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(
+        res.returncode,
+        0,
+        f"R22 JS harness failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+    )
+    self.assertIn("R22_ASSERTIONS_PASSED", res.stdout)
+
 
 if __name__ == "__main__":
   unittest.main()
