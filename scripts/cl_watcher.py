@@ -762,10 +762,54 @@ def fetch_gerrit_related_cl_ids(host: str, cl_id: str) -> list[str]:
     if raw.startswith(")]}'"):
       raw = raw[4:]
     data = json.loads(raw)
-    for ch in data.get("changes") or []:
-      num = str(ch.get("_change_number") or "").strip()
-      if num and num != str(cl_id) and num not in related_ids:
-        related_ids.append(num)
+    changes = data.get("changes") or []
+    # Build graph of active (not MERGED/ABANDONED) changes in the revision stack
+    active_changes = [
+        ch
+        for ch in changes
+        if isinstance(ch, dict)
+        and str(ch.get("status") or "").upper() not in ("MERGED", "ABANDONED")
+    ]
+    by_commit: dict[str, dict[str, Any]] = {}
+    children_of: dict[str, list[str]] = {}
+    target_commit = ""
+    for ch in active_changes:
+      csha = str(((ch.get("commit") or {}).get("commit")) or "").strip()
+      if not csha:
+        continue
+      by_commit[csha] = ch
+      if str(ch.get("_change_number") or "").strip() == str(cl_id):
+        target_commit = csha
+      for p in (ch.get("commit") or {}).get("parents") or []:
+        psha = str(p.get("commit") or "").strip()
+        if psha:
+          children_of.setdefault(psha, []).append(csha)
+
+    if target_commit and target_commit in by_commit:
+      visited: set[str] = set()
+      stack = [target_commit]
+      while stack:
+        cur = stack.pop()
+        if cur in visited or cur not in by_commit:
+          continue
+        visited.add(cur)
+        for p in (by_commit[cur].get("commit") or {}).get("parents") or []:
+          psha = str(p.get("commit") or "").strip()
+          if psha in by_commit and psha not in visited:
+            stack.append(psha)
+        for ch_sha in children_of.get(cur, []):
+          if ch_sha in by_commit and ch_sha not in visited:
+            stack.append(ch_sha)
+      for ch in active_changes:
+        csha = str(((ch.get("commit") or {}).get("commit")) or "").strip()
+        num = str(ch.get("_change_number") or "").strip()
+        if csha in visited and num and num != str(cl_id) and num not in related_ids:
+          related_ids.append(num)
+    else:
+      for ch in active_changes:
+        num = str(ch.get("_change_number") or "").strip()
+        if num and num != str(cl_id) and num not in related_ids:
+          related_ids.append(num)
   except Exception:
     # Fail open when Gerrit /related is unreachable or change has no revisions
     pass
@@ -823,6 +867,9 @@ def link_companion_changes_to_parent_chats(
           if not cand_parent:
             continue
           rel_info = fetched_cache.get(cand_key) or {}
+          # Never inherit archived chat from a MERGED or ABANDONED change without explicit companion
+          if str(rel_info.get("status") or "").upper() in ("MERGED", "ABANDONED"):
+            continue
           rel_is_self = bool(rel_info.get("is_self", False))
           # A companion stacks on a non-self CL or is marked WIP/Draft/companion
           is_candidate_comp = (
@@ -867,6 +914,23 @@ def link_companion_changes_to_parent_chats(
       d["single_target"] = False
       parent["single_target"] = False
 
+    # Propagate SkoreText project across unchatted changes in the same open stack
+    if d.get("kind") == "gerrit" and not d.get("conversation_id"):
+      host = str(
+          d.get("preferred_host")
+          or info.get("host")
+          or GERRIT_SKIA_HOST
+      )
+      related = fetch_gerrit_related_cl_ids(host, d.get("target_id", ""))
+      for rel_id in related:
+        cand_key = f"gerrit:{rel_id}"
+        rel_item = by_item_key.get(cand_key)
+        if rel_item and rel_item.get("project_name") == "SkoreText":
+          if d.get("project_name") in ("SkParagraph", "Skia", "Unassigned", ""):
+            d["project_id"] = rel_item.get("project_id", "")
+            d["project_name"] = "SkoreText"
+            break
+
 
 def load_ignored_cls(path: str = IGNORED_CLS_FILE) -> set[str]:
   """Reads permanently ignored Gerrit CL IDs from review-triage's ignore list."""
@@ -885,7 +949,15 @@ def load_ignored_cls(path: str = IGNORED_CLS_FILE) -> set[str]:
 
 
 def infer_project_for_change(
-    kind: str, host: str, subject: str, proj_names: dict[str, str]
+    kind: str,
+    host: str,
+    subject: str,
+    proj_names: dict[str, str],
+    *,
+    commit_message: str = "",
+    files: list[str] | tuple[str, ...] = (),
+    hashtags: list[str] | tuple[str, ...] = (),
+    topic: str = "",
 ) -> tuple[str, str]:
   """Maps an unchatted remote CL/PR to the matching Jetski project (id, name)."""
   by_name = {name.lower(): (pid, name) for pid, name in proj_names.items()}
@@ -910,7 +982,27 @@ def infer_project_for_change(
     ):
       return pick("TextClusters API", "Chromium")
     return pick("Chromium", "TextClusters API")
-  if "skoretext" in subj_low or "coretext" in subj_low:
+  # CoreText / SkoreText macOS layout pipeline belongs to SkoreText
+  msg_low = (commit_message or "").lower()
+  topic_low = (topic or "").lower()
+  hashtags_low = {str(h).lower() for h in hashtags}
+  files_low = [str(f).lower() for f in files]
+  is_skoretext = (
+      any(kw in subj_low for kw in ("skoretext", "coretext"))
+      or any(kw in topic_low for kw in ("skoretext", "coretext"))
+      or any("skoretext" in h or "coretext" in h for h in hashtags_low)
+      or any(
+          kw in msg_low
+          for kw in (
+              "skoretext",
+              "coretext pipeline",
+              "coretext layout",
+              "coretext shaping",
+          )
+      )
+      or any("coretext" in f or "_mac_ct" in f for f in files_low)
+  )
+  if is_skoretext:
     return pick("SkoreText", "Skia")
   if "lazy" in subj_low and "android" in subj_low:
     return pick("Lazy Android", "Skia")
@@ -1318,8 +1410,8 @@ def fetch_gerrit_cl_status(
   for host in hosts:
     try:
       opts = (
-          "o=CURRENT_REVISION&o=ALL_REVISIONS&o=MESSAGES"
-          "&o=DETAILED_ACCOUNTS&o=LABELS&o=SUBMIT_REQUIREMENTS"
+          "o=CURRENT_REVISION&o=CURRENT_COMMIT&o=CURRENT_FILES&o=ALL_REVISIONS"
+          "&o=MESSAGES&o=DETAILED_ACCOUNTS&o=LABELS&o=SUBMIT_REQUIREMENTS"
       )
       url = f"https://{host}/changes/{cl_id}/detail?{opts}"
       req = urllib.request.Request(url, headers={"User-Agent": "CLFlightDeck/1.0"})
@@ -1344,6 +1436,11 @@ def fetch_gerrit_cl_status(
       revs = d.get("revisions") or {}
       cur_rev = revs.get(cur_sha) or {}
       ps_num = int(cur_rev.get("_number") or 1)
+      commit_msg = str(((cur_rev.get("commit") or {}).get("message")) or "")
+      files_dict = cur_rev.get("files") or {}
+      files = sorted(str(f) for f in files_dict.keys() if f != "/COMMIT_MSG")
+      hashtags = [str(h) for h in (d.get("hashtags") or []) if h]
+      topic = str(d.get("topic") or "")
 
       att_set = [
           str((v.get("account") or {}).get("email") or "")
@@ -1658,6 +1755,10 @@ def fetch_gerrit_cl_status(
           "reviewer_status": reviewer_status,
           "patchset": ps_num,
           "revision": cur_sha,
+          "commit_message": commit_msg,
+          "files": files,
+          "hashtags": hashtags,
+          "topic": topic,
           "commit_url": (
               f"https://{host.replace('-review', '')}/{d.get('project')}/+/{cur_sha}"
               if status == "MERGED" and d.get("project")
@@ -2951,9 +3052,11 @@ def sync_once(
     )
 
   rollers, incidents = fetch_gardener_snapshot()
+  proj_names = load_project_names()
   chatted = discover_active_cl_chats()
   remote_unchatted = discover_open_remote_changes(
-      {d["item_key"] for d in chatted}
+      {d["item_key"] for d in chatted},
+      proj_names=proj_names,
   )
   all_chats = discover_active_cl_chats(include_archived=True)
   attach_archived_chats_to_open_changes(remote_unchatted, all_chats=all_chats)
@@ -2985,6 +3088,21 @@ def sync_once(
     # Skip unchatted remote changes from which the user already removed themselves
     if not d.get("conversation_id") and info.get("reviewer_removed"):
       continue
+    # Re-infer project with full commit message, files, hashtags, and topic for unchatted changes
+    if not d.get("conversation_id") and d.get("kind") == "gerrit":
+      re_pid, re_pname = infer_project_for_change(
+          "gerrit",
+          str(info.get("host") or d.get("preferred_host") or GERRIT_SKIA_HOST),
+          str(info.get("subject") or d.get("title") or ""),
+          proj_names,
+          commit_message=str(info.get("commit_message") or ""),
+          files=info.get("files") or (),
+          hashtags=info.get("hashtags") or (),
+          topic=str(info.get("topic") or ""),
+      )
+      if re_pid and re_pname:
+        d["project_id"] = re_pid
+        d["project_name"] = re_pname
     active_discovered.append(d)
 
   link_companion_changes_to_parent_chats(
@@ -3676,7 +3794,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 const PRODUCTS = ['Android', 'Chrome', 'Google3', 'Flutter'];
 const COUNT_WORDS = ['Nothing', 'One thing', 'Two things', 'Three things', 'Four things',
   'Five things'];
-const PROJECT_ORDER = ['SkParagraph', 'Skia', 'WebParagraph', 'Skia Gardener', 'TextClusters API'];
+const PROJECT_ORDER = ['SkParagraph', 'SkoreText', 'Skia', 'WebParagraph', 'Skia Gardener', 'TextClusters API'];
 const FLUTTER_DASHBOARD_URL = 'https://flutter-dashboard.appspot.com/#/build';
 const STATUS_SKIA_URL = 'https://status.skia.org/repo/skia';
 // Merged CLs older than this are chats left open after the work ended

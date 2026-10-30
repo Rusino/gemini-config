@@ -934,5 +934,242 @@ console.log(JSON.stringify({
     self.assertIn("No reviewers assigned", out["compCard"])
 
 
+  def test_skoretext_stack_and_stale_merged_related_cls_stay_in_skoretext(self):
+    related_payload = {
+        "changes": [
+            {
+                "_change_number": 1380156,
+                "status": "MERGED",
+                "commit": {"commit": "sha-merged-1380156", "parents": []},
+            },
+            {
+                "_change_number": 1382476,
+                "status": "ABANDONED",
+                "commit": {"commit": "sha-abandoned-1382476", "parents": []},
+            },
+            {
+                "_change_number": 1406897,
+                "status": "NEW",
+                "commit": {"commit": "sha-ct-1", "parents": [{"commit": "sha-base"}]},
+            },
+            {
+                "_change_number": 1382196,
+                "status": "NEW",
+                "commit": {"commit": "sha-ct-5", "parents": [{"commit": "sha-ct-1"}]},
+            },
+            {
+                "_change_number": 1383896,
+                "status": "NEW",
+                "commit": {"commit": "sha-ct-7", "parents": [{"commit": "sha-ct-5"}]},
+            },
+            {
+                "_change_number": 1389816,
+                "status": "NEW",
+                "commit": {"commit": "sha-ct-8", "parents": [{"commit": "sha-ct-7"}]},
+            },
+        ]
+    }
+    with mock.patch.object(
+        w.urllib.request, "urlopen", return_value=_http_json_resp(related_payload)
+    ):
+      w._RELATED_CLS_CACHE.clear()
+      related = w.fetch_gerrit_related_cl_ids(w.GERRIT_SKIA_HOST, "1382196")
+
+    self.assertNotIn("1380156", related)
+    self.assertNotIn("1382476", related)
+    self.assertIn("1406897", related)
+    self.assertIn("1383896", related)
+    self.assertIn("1389816", related)
+
+    proj_names = {
+        "p-skia": "Skia",
+        "p-sp": "SkParagraph",
+        "p-skore": "SkoreText",
+    }
+    pid, pname = w.infer_project_for_change(
+        "gerrit",
+        w.GERRIT_SKIA_HOST,
+        "[skparagraph] Add Flutter bug tests for the CoreText pipeline",
+        proj_names,
+    )
+    self.assertEqual((pid, pname), ("p-skore", "SkoreText"))
+
+    pid2, pname2 = w.infer_project_for_change(
+        "gerrit",
+        w.GERRIT_SKIA_HOST,
+        "[viewer] Add ParagraphBugsSlide comparison viewer",
+        proj_names,
+        commit_message="Viewer slides with CoreText shaping",
+    )
+    self.assertEqual((pid2, pname2), ("p-skore", "SkoreText"))
+
+    pid3, pname3 = w.infer_project_for_change(
+        "gerrit",
+        w.GERRIT_SKIA_HOST,
+        "[skparagraph] Add build rules",
+        proj_names,
+        files=["modules/skparagraph/src/CoreTextLineShaper.cpp"],
+    )
+    self.assertEqual((pid3, pname3), ("p-skore", "SkoreText"))
+
+    pid4, pname4 = w.infer_project_for_change(
+        "gerrit",
+        w.GERRIT_SKIA_HOST,
+        "[skparagraph] Add build flag",
+        proj_names,
+        hashtags=["skoretext"],
+    )
+    self.assertEqual((pid4, pname4), ("p-skore", "SkoreText"))
+
+    summaries = {
+        "c-archived-1380156": {
+            "annotations": {
+                "title": "[13:45] » cl/1380156 Grapheme & ligature styling",
+                "archived": True,
+            },
+            "trajectoryMetadata": {
+                "projectId": "p-sp",
+                "lastModifiedTime": "2026-10-13T17:45:00Z",
+                "parentConversationId": "",
+                "isBattleModeFork": False,
+                "sourceMetadata": None,
+            },
+        }
+    }
+    remote = [
+        {
+            "item_key": "gerrit:1382196",
+            "kind": "gerrit",
+            "target_id": "1382196",
+            "preferred_host": "skia-review.googlesource.com",
+            "conversation_id": "",
+            "title": "",
+            "project_id": "p-skore",
+            "project_name": "SkoreText",
+            "chat_last_modified": "",
+            "single_target": True,
+            "chat_busy": False,
+        },
+        {
+            "item_key": "gerrit:1389816",
+            "kind": "gerrit",
+            "target_id": "1389816",
+            "preferred_host": "skia-review.googlesource.com",
+            "conversation_id": "",
+            "title": "",
+            "project_id": "p-skia",
+            "project_name": "Skia",
+            "chat_last_modified": "",
+            "single_target": True,
+            "chat_busy": False,
+        },
+    ]
+
+    def fake_status(cl_id, *args, **kwargs):
+      is_slide = cl_id == "1389816"
+      return {
+          "ok": True,
+          "host": "skia-review.googlesource.com",
+          "url": f"https://skia-review.googlesource.com/c/{cl_id}",
+          "status": "NEW",
+          "phase": "WAITING_ON_OTHERS",
+          "subject": (
+              "[viewer] Add ParagraphBugsSlide comparison viewer"
+              if is_slide
+              else "[skoretext 5/6] Add opt-in CoreText layout pipeline"
+          ),
+          "commit_message": (
+              "Viewer slides with CoreText shaping"
+              if is_slide
+              else "[skoretext 5/6] Add opt-in CoreText layout pipeline"
+          ),
+          "files": (
+              ["modules/skparagraph/slides/ParagraphBugsSlide.cpp"]
+              if is_slide
+              else ["modules/skparagraph/src/CoreTextLineShaper.cpp"]
+          ),
+          "hashtags": [] if is_slide else ["skoretext"],
+          "topic": "",
+          "owner_name": "Julia Lavrova",
+          "owner_email": "jlavrova@google.com",
+          "role": "author",
+          "is_self": True,
+          "is_external": False,
+          "is_draft": True,
+          "in_development": True,
+          "is_watching": False,
+          "reviewer_removed": False,
+          "patchset": 1,
+          "revision": "rev111",
+          "in_my_attention": False,
+          "waiting_on": [],
+          "merge_conflict": False,
+          "tree_red": False,
+          "cr_summary": "0",
+          "cq_status": "",
+          "cq_failed": False,
+          "last_msg_author": "jlavrova@google.com",
+          "last_msg_date": "2026-10-29 18:00:00.000000000",
+          "last_msg_et": "14:00 ET",
+          "last_msg_age": "1h ago",
+          "last_msg_snippet": "Uploaded patchset 1",
+          "submitted": "",
+          "submitted_et": "",
+          "submitted_age": "",
+          "status_changed_raw": "2026-10-29 18:00:00.000000000",
+          "status_changed_et": "14:00 ET",
+          "status_changed_age": "1h ago",
+          "post_submit": None,
+      }
+
+    def fake_related(host, cl_id):
+      if cl_id == "1382196":
+        return ["1389816"]
+      if cl_id == "1389816":
+        return ["1382196"]
+      return []
+
+    empty_gmail = {
+        "thread_ids": [],
+        "inbox_thread_ids": [],
+        "total_msgs": 0,
+        "inbox_msgs": 0,
+        "trash_msgs": 0,
+        "unread_msgs": 0,
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+      state_path = os.path.join(tmp, "state.json")
+      w._RELATED_CLS_CACHE.clear()
+      with mock.patch.object(w, "STATE_FILE", state_path), \
+           mock.patch.object(
+               w.cl, "_fetch_ls_summaries_for_audit", return_value=summaries
+           ), \
+           mock.patch.object(w, "load_project_names", return_value=proj_names), \
+           mock.patch.object(w, "fetch_gardener_snapshot", return_value=({}, [])), \
+           mock.patch.object(w, "discover_open_remote_changes", return_value=remote), \
+           mock.patch.object(
+               w, "fetch_gerrit_cl_status", side_effect=fake_status
+           ), \
+           mock.patch.object(
+               w, "fetch_gerrit_related_cl_ids", side_effect=fake_related
+           ), \
+           mock.patch.object(
+               w, "fetch_gmail_status_for_id", return_value=empty_gmail
+           ):
+        state = w.sync_once(
+            wake_chats=False, update_titles=False, skia_dir="/nonexistent"
+        )
+
+    self.assertIn("gerrit:1382196@unchatted", state["items"])
+    self.assertIn("gerrit:1389816@unchatted", state["items"])
+    rec_ct = state["items"]["gerrit:1382196@unchatted"]
+    rec_slide = state["items"]["gerrit:1389816@unchatted"]
+    self.assertEqual(rec_ct["project_name"], "SkoreText")
+    self.assertEqual(rec_slide["project_name"], "SkoreText")
+    self.assertEqual(rec_ct["conversation_id"], "")
+    self.assertEqual(rec_slide["conversation_id"], "")
+
+
 if __name__ == "__main__":
   unittest.main()
