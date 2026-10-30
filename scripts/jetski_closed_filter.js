@@ -11,16 +11,21 @@
   const STORAGE_BUCKETS_KEY = 'jetski_visible_buckets_v1';
   // Persists whether the top-of-sidebar Needs-Reaction inbox list is collapsed
   const STORAGE_INBOX_COLLAPSED_KEY = 'jetski_inbox_collapsed_v1';
+  const STORAGE_INBOX_HEIGHT_KEY = 'jetski_inbox_height_v1';
   const BAR_CLASS = 'jetski-attention-filter-bar';
   // CSS class names for the collapsible Needs-Reaction inbox widget and its child controls
   const INBOX_CLASS = 'jetski-needs-reaction-inbox';
   const INBOX_HEADER_CLASS = 'jetski-inbox-header';
   const INBOX_TOGGLE_BTN_CLASS = 'jetski-inbox-toggle-btn';
   const INBOX_LIST_CLASS = 'jetski-inbox-list';
+  const INBOX_RESIZE_HANDLE_CLASS = 'jetski-inbox-resize-handle';
   const INBOX_ROW_CLASS = 'jetski-inbox-row';
   const INBOX_TAB_BTN_CLASS = 'jetski-inbox-tab-btn';
   const INBOX_SEEN_BTN_CLASS = 'jetski-inbox-seen-btn';
   const INBOX_ARCHIVE_BTN_CLASS = 'jetski-inbox-archive-btn';
+  const INBOX_DEFAULT_HEIGHT_PX = 90;
+  const INBOX_MIN_HEIGHT_PX = 46;
+  const INBOX_MAX_HEIGHT_PX = 360;
   const BUTTON_CLASS = 'jetski-closed-chats-filter-btn';
   // Collapse-first button in the sidebar filter bar to collapse or expand all project folders
   const COLLAPSE_PROJECTS_BTN_CLASS = 'jetski-collapse-projects-btn';
@@ -150,6 +155,23 @@
   let visibleBuckets = loadVisibleBuckets();
   // Hydrate initial inbox collapsed state so the header renders without layout shift
   let inboxCollapsed = safeGetStorage(STORAGE_INBOX_COLLAPSED_KEY) === 'true';
+
+  // Clamps inbox list height between minimum 2 rows (46px) and maximum 360px
+  function clampInboxHeight(px) {
+    const n = Math.round(Number(px));
+    if (!Number.isFinite(n)) return INBOX_DEFAULT_HEIGHT_PX;
+    return Math.min(INBOX_MAX_HEIGHT_PX, Math.max(INBOX_MIN_HEIGHT_PX, n));
+  }
+
+  // Loads persisted inbox list height from storage or returns 4-row default (90px)
+  function loadInboxHeight() {
+    const raw = safeGetStorage(STORAGE_INBOX_HEIGHT_KEY);
+    if (raw === null || raw === '') return INBOX_DEFAULT_HEIGHT_PX;
+    return clampInboxHeight(Number(raw));
+  }
+
+  let inboxListHeightPx = loadInboxHeight();
+  let activeInboxResizeCleanup = null;
   const STORAGE_INBOX_TAB_KEY = 'jetski_inbox_tab_v1';
   const INBOX_TABS = ['needs-me', 'working', 'stale'];
   // Typographic tab labels without emoji prefixes fit on one header line in a narrow sidebar
@@ -4631,7 +4653,7 @@
         display: flex;
         flex-direction: column;
         margin: 2px 8px 6px 8px;
-        padding: 3px 0 2px 0;
+        padding: 3px 0 0 0;
         border-radius: 0;
         background: transparent;
         border: none;
@@ -4751,12 +4773,41 @@
       .${INBOX_LIST_CLASS} {
         display: flex;
         flex-direction: column;
-        max-height: 200px;
+        height: 90px;
+        min-height: 90px;
+        max-height: 90px;
         overflow-y: auto;
         padding: 2px 0 0 0;
+        box-sizing: border-box;
       }
-      .${INBOX_CLASS}[data-collapsed="true"] .${INBOX_LIST_CLASS} {
+      .${INBOX_CLASS}[data-collapsed="true"] .${INBOX_LIST_CLASS},
+      .${INBOX_CLASS}[data-collapsed="true"] .${INBOX_RESIZE_HANDLE_CLASS} {
         display: none !important;
+      }
+      .${INBOX_RESIZE_HANDLE_CLASS} {
+        position: relative;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        height: 5px;
+        cursor: ns-resize;
+        flex-shrink: 0;
+        user-select: none;
+        touch-action: none;
+      }
+      .${INBOX_RESIZE_HANDLE_CLASS}::after {
+        content: "";
+        width: 24px;
+        height: 2px;
+        border-radius: 1px;
+        background: rgba(154, 160, 166, 0.24);
+        transition: background-color 100ms ease, width 100ms ease;
+      }
+      .${INBOX_RESIZE_HANDLE_CLASS}:hover::after,
+      .${INBOX_RESIZE_HANDLE_CLASS}[data-dragging="true"]::after {
+        width: 32px;
+        background: rgba(138, 180, 248, 0.78);
       }
       .${INBOX_ROW_CLASS} {
         display: flex;
@@ -7701,6 +7752,23 @@
     return row;
   }
 
+  // Synchronizes inline styles, data-list-height attribute, and storage persistence
+  function applyInboxListHeight(inboxEl, listContainer, nextHeightPx, persist) {
+    inboxListHeightPx = clampInboxHeight(nextHeightPx);
+    const hStr = `${inboxListHeightPx}px`;
+    if (listContainer) {
+      if (listContainer.style.height !== hStr) listContainer.style.height = hStr;
+      if (listContainer.style.minHeight !== hStr) listContainer.style.minHeight = hStr;
+      if (listContainer.style.maxHeight !== hStr) listContainer.style.maxHeight = hStr;
+    }
+    if (inboxEl && inboxEl.getAttribute('data-list-height') !== String(inboxListHeightPx)) {
+      inboxEl.setAttribute('data-list-height', String(inboxListHeightPx));
+    }
+    if (persist) {
+      safeSetStorage(STORAGE_INBOX_HEIGHT_KEY, String(inboxListHeightPx));
+    }
+  }
+
   // Creates the Needs-Reaction inbox container and header once per sidebar mount
   function createInboxShell() {
     const el = document.createElement('div');
@@ -7773,8 +7841,76 @@
     listContainer.className = INBOX_LIST_CLASS;
     listContainer.setAttribute('data-testid', INBOX_LIST_CLASS);
 
+    const resizeHandle = document.createElement('div');
+    resizeHandle.className = INBOX_RESIZE_HANDLE_CLASS;
+    resizeHandle.setAttribute('data-testid', INBOX_RESIZE_HANDLE_CLASS);
+    resizeHandle.setAttribute('role', 'separator');
+    resizeHandle.setAttribute('aria-orientation', 'horizontal');
+    resizeHandle.setAttribute(
+      'aria-label',
+      'Resize Needs Me inbox (double-click to reset)'
+    );
+    resizeHandle.setAttribute(
+      'title',
+      'Drag to resize · Double-click to reset height'
+    );
+
+    applyInboxListHeight(el, listContainer, inboxListHeightPx, false);
+
+    let isDragging = false;
+    // Tracks vertical pointer drag to resize the inbox list without layout shift
+    const startResize = (e) => {
+      if (e.button !== undefined && e.button !== 0) return;
+      if (isDragging) return;
+      isDragging = true;
+      e.preventDefault();
+      e.stopPropagation();
+      const startY = Number(e.clientY) || 0;
+      const startHeight = inboxListHeightPx;
+      resizeHandle.setAttribute('data-dragging', 'true');
+
+      const onMove = (ev) => {
+        const delta = (Number(ev.clientY) || 0) - startY;
+        applyInboxListHeight(el, listContainer, startHeight + delta, false);
+      };
+
+      const onEnd = () => {
+        if (!isDragging) return;
+        isDragging = false;
+        if (typeof document !== 'undefined') {
+          document.removeEventListener('pointermove', onMove, true);
+          document.removeEventListener('mousemove', onMove, true);
+          document.removeEventListener('pointerup', onEnd, true);
+          document.removeEventListener('mouseup', onEnd, true);
+          document.removeEventListener('pointercancel', onEnd, true);
+        }
+        activeInboxResizeCleanup = null;
+        resizeHandle.removeAttribute('data-dragging');
+        applyInboxListHeight(el, listContainer, inboxListHeightPx, true);
+      };
+
+      activeInboxResizeCleanup = onEnd;
+
+      if (typeof document !== 'undefined') {
+        document.addEventListener('pointermove', onMove, true);
+        document.addEventListener('mousemove', onMove, true);
+        document.addEventListener('pointerup', onEnd, true);
+        document.addEventListener('mouseup', onEnd, true);
+        document.addEventListener('pointercancel', onEnd, true);
+      }
+    };
+
+    resizeHandle.addEventListener('pointerdown', startResize);
+    resizeHandle.addEventListener('mousedown', startResize);
+    resizeHandle.addEventListener('dblclick', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      applyInboxListHeight(el, listContainer, INBOX_DEFAULT_HEIGHT_PX, true);
+    });
+
     el.appendChild(headerEl);
     el.appendChild(listContainer);
+    el.appendChild(resizeHandle);
     return el;
   }
 
@@ -7793,6 +7929,12 @@
     if (!inboxEl) {
       inboxEl = createInboxShell();
     }
+    applyInboxListHeight(
+      inboxEl,
+      inboxEl.querySelector(`.${INBOX_LIST_CLASS}`),
+      inboxListHeightPx,
+      false
+    );
 
     // Place inbox immediately before listEl when mounted, or right after actionRow
     if (listEl && listEl.parentElement) {
@@ -8979,6 +9121,7 @@
         target.className === BAR_CLASS ||
         // Ignore mutations on the Needs-Reaction inbox container itself
         target.className === INBOX_CLASS ||
+        target.className === INBOX_RESIZE_HANDLE_CLASS ||
         target.className === BUTTON_CLASS ||
         target.className === COLLAPSE_PROJECTS_BTN_CLASS ||
         target.className === TITLEBAR_BTN_CLASS ||
@@ -9147,6 +9290,10 @@
     if (locateHighlightTimer) {
       clearTimeout(locateHighlightTimer);
       locateHighlightTimer = 0;
+    }
+    if (typeof activeInboxResizeCleanup === 'function') {
+      activeInboxResizeCleanup();
+      activeInboxResizeCleanup = null;
     }
     for (const prev of document.querySelectorAll(`[${LOCATED_ROW_ATTR}="true"]`)) {
       prev.removeAttribute(LOCATED_ROW_ATTR);

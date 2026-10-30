@@ -1820,6 +1820,35 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(inboxEl.querySelectorAll('.jetski-inbox-row').length, 0);
   assert.strictEqual(inboxEl.getAttribute('data-collapsed'), 'false');
 
+  const inboxListEl = inboxEl.querySelector('.jetski-inbox-list');
+  const resizeHandleEl = inboxEl.querySelector('.jetski-inbox-resize-handle');
+  assert(inboxListEl, 'Inbox list element must exist');
+  assert(resizeHandleEl, 'Inbox resize handle must exist');
+  assert.strictEqual(inboxListEl.style.height, '90px');
+  assert.strictEqual(inboxListEl.style.minHeight, '90px');
+  assert.strictEqual(inboxListEl.style.maxHeight, '90px');
+  assert.strictEqual(inboxEl.getAttribute('data-list-height'), '90');
+
+  // Drag resize handle down (+45px -> 135px), clamp at max (360px) and min (46px), and dblclick reset
+  resizeHandleEl.dispatchEvent('pointerdown', { button: 0, clientY: 100 });
+  assert.strictEqual(resizeHandleEl.getAttribute('data-dragging'), 'true');
+  global.document.dispatchEvent({ type: 'pointermove', clientY: 145 });
+  assert.strictEqual(inboxListEl.style.height, '135px');
+  assert.strictEqual(inboxEl.getAttribute('data-list-height'), '135');
+  global.document.dispatchEvent({ type: 'pointermove', clientY: 600 });
+  assert.strictEqual(inboxListEl.style.height, '360px');
+  global.document.dispatchEvent({ type: 'pointermove', clientY: 10 });
+  assert.strictEqual(inboxListEl.style.height, '46px');
+  global.document.dispatchEvent({ type: 'pointermove', clientY: 145 });
+  global.document.dispatchEvent({ type: 'pointerup', clientY: 145 });
+  assert.strictEqual(resizeHandleEl.getAttribute('data-dragging'), null);
+  assert.strictEqual(storage.get('jetski_inbox_height_v1'), '135');
+
+  resizeHandleEl.dispatchEvent('dblclick');
+  assert.strictEqual(inboxListEl.style.height, '90px');
+  assert.strictEqual(inboxEl.getAttribute('data-list-height'), '90');
+  assert.strictEqual(storage.get('jetski_inbox_height_v1'), '90');
+
   // Verify the 3 tabs in headerLeft
   const tabNeedsMe = inboxEl.querySelector('.jetski-inbox-tab-needs-me');
   const tabWorking = inboxEl.querySelector('.jetski-inbox-tab-working');
@@ -6586,12 +6615,24 @@ global.MutationObserver = class {
 eval(code);
 
 (async () => {
-  // 1. Verify injected CSS rules for Needs Me max-height and top navigation collapse
+  // 1. Verify injected CSS rules for Needs Me fixed height and top navigation collapse
   const styleEl = document.getElementById('jetski-closed-chats-filter-style');
   assert(styleEl, 'Filter styles must be injected into document head');
   assert(
-    styleEl.textContent.includes('max-height: 200px;'),
-    'Needs Me inbox list max-height must be raised to 200px'
+    styleEl.textContent.includes('height: 90px;'),
+    'Needs Me inbox list height must be fixed to 90px'
+  );
+  assert(
+    styleEl.textContent.includes('min-height: 90px;'),
+    'Needs Me inbox list min-height must be fixed to 90px'
+  );
+  assert(
+    styleEl.textContent.includes('max-height: 90px;'),
+    'Needs Me inbox list max-height must be fixed to 90px'
+  );
+  assert(
+    styleEl.textContent.includes('.jetski-inbox-resize-handle'),
+    'Style must include bottom resize handle rules'
   );
   assert(
     styleEl.textContent.includes('[data-jetski-top-nav-section="true"]'),
