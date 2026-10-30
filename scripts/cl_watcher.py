@@ -1038,6 +1038,8 @@ def link_companion_changes_to_parent_chats(
       else:
         related = fetch_gerrit_related_cl_ids(host, d.get("target_id", ""))
         for rel_id in related:
+          if str(rel_id) == str(d.get("target_id", "")):
+            continue
           cand_key = f"gerrit:{rel_id}"
           cand_parent = known_chats.get(cand_key) or by_item_key.get(cand_key)
           if not cand_parent:
@@ -3112,7 +3114,7 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
             "number,title,body,state,isDraft,author,mergedAt,headRefOid,headRefName,"
             "reviewDecision,latestReviews,reviews,comments,"
             # Include commits so author pushes after a review update the PR timeline
-            "commits,statusCheckRollup,url,mergeable,reviewRequests,"
+            "commits,statusCheckRollup,labels,url,mergeable,reviewRequests,"
             "createdAt,updatedAt,closedAt",
         ],
         stderr=subprocess.STDOUT,
@@ -3199,6 +3201,21 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         for c in checks
         if str(c.get("status") or "").upper() in ("IN_PROGRESS", "QUEUED", "PENDING")
     ]
+    label_names = {
+        str(lbl.get("name") or "")
+        for lbl in (d.get("labels") or [])
+        if isinstance(lbl, dict)
+    }
+    # External Flutter PRs stay queued until a flutter-hackers member adds the CICD label
+    awaiting_cicd_label = (
+        state == "OPEN"
+        and "CICD" not in label_names
+        and any(
+            str(c.get("name") or "") == "Awaiting CICD label"
+            and str(c.get("status") or "").upper() in ("QUEUED", "IN_PROGRESS", "PENDING")
+            for c in checks
+        )
+    )
 
     # Only PR-specific failures count as red CQ; tree-broken checks show a tree badge
     if own_failed_checks:
@@ -3210,6 +3227,8 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         cq_status = f"🌲 Tree broken ({len(tree_failed_checks)} checks)"
     elif tree_red:
       cq_status = "🌲 Tree is red"
+    elif awaiting_cicd_label:
+      cq_status = "🏷️ Needs CICD label"
     elif pending_checks:
       cq_status = f"🔄 {len(pending_checks)} running"
     else:
@@ -3225,10 +3244,13 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
     for r in latest_reviews:
       r_login = str((r.get("author") or {}).get("login") or "")
       r_state = str(r.get("state") or "").upper()
+      r_assoc = str(r.get("authorAssociation") or "").upper()
       if not r_login or r_login == author_login:
         continue
       if r_state == "APPROVED":
-        approved_by.add(r_login)
+        # Only repository members/owners satisfy branch protection and Cocoon approval rules
+        if r_assoc in ("", "MEMBER", "OWNER"):
+          approved_by.add(r_login)
         changes_requested_by.discard(r_login)
       elif r_state == "CHANGES_REQUESTED":
         changes_requested_by.add(r_login)
@@ -3249,10 +3271,30 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
             and not u.endswith("-bot")
         }
     )
+    author_assocs = {
+        str(entry.get("authorAssociation") or "").upper()
+        for entry in [
+            *(d.get("reviews") or []),
+            *(d.get("latestReviews") or []),
+            *(d.get("comments") or []),
+        ]
+        if isinstance(entry, dict)
+        and str((entry.get("author") or {}).get("login") or "") == author_login
+        and entry.get("authorAssociation")
+    }
+    # Non-member authors on flutter/flutter need 2 member approvals under Cocoon auto-submit
+    is_external_contributor = not is_self and (
+        bool(author_assocs and not (author_assocs & {"MEMBER", "OWNER"}))
+        or awaiting_cicd_label
+        or any(str(c.get("name") or "") == "Awaiting CICD label" for c in checks)
+    )
     assigned_reviewers_count = len(active_review_candidates)
     required_approvals = (
         2
-        if (review_decision == "REVIEW_REQUIRED" and approved_count >= 1)
+        if (
+            (review_decision == "REVIEW_REQUIRED" and approved_count >= 1)
+            or is_external_contributor
+        )
         else 1
     )
     missing_reviewers_to_assign = (
@@ -3262,7 +3304,7 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
     )
     if state != "OPEN":
       missing_approvals = 0
-    elif review_decision == "APPROVED":
+    elif review_decision == "APPROVED" and required_approvals == 1:
       missing_approvals = 0
     elif review_decision == "REVIEW_REQUIRED":
       missing_approvals = max(1, required_approvals - approved_count)
@@ -3491,6 +3533,7 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
             )
         ),
         "cq_status": cq_status,
+        "awaiting_cicd_label": awaiting_cicd_label,
         # Expose both PR-owned and tree-broken check lists for UI and diagnostics
         "cq_failed": bool(own_failed_checks),
         "own_failed_checks": own_failed_checks,

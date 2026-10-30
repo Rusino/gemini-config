@@ -249,6 +249,17 @@ def extract_draft_from_audit(body: str) -> str:
         if "no comment needed" in val.lower():
             return ""
         return val
+    # 4. Reply draft heading followed by --- fenced text
+    m_fence = re.search(
+        r"(?:Reply draft|Draft reply|Suggested reply)[^\n]*:\s*\n+---\s*\n(.*?)\n---",
+        body,
+        re.S | re.I,
+    )
+    if m_fence and m_fence.group(1).strip():
+        val = m_fence.group(1).strip()
+        if "no comment needed" in val.lower():
+            return ""
+        return val
     return ""
 
 
@@ -296,7 +307,10 @@ def parse_single_audit_text(
     elif "waiting on others" in cat_raw.lower():
         summary = "Waiting on others; no comment needed"
     elif not draft or "no comment needed" in lower_draft:
-        summary = "No comment needed (already approved)"
+        if "already approved" in lower_body or "+1 still stands" in lower_body:
+            summary = "No comment needed (already approved)"
+        else:
+            summary = "No comment needed"
     elif "pushback" in cat_raw.lower():
         summary = "Needs pushback on missing tests or scope"
     elif "reassign" in cat_raw.lower():
@@ -474,8 +488,20 @@ def overlay_triage_on_items(
         except (ValueError, TypeError):
             is_stale = False
 
+        summary = str(tr.get("summary") or "")
+        if "already approved" in summary.lower():
+            if not it.get("self_approved"):
+                summary = "No comment needed"
+            elif int(it.get("missing_approvals") or 0) > 0:
+                rem = int(it.get("missing_approvals") or 0)
+                summary = (
+                    f"You approved; needs +{rem} more approval"
+                    f"{'s' if rem > 1 else ''}"
+                )
+
         it["triage"] = {
             **tr,
+            "summary": summary,
             "current_patchset": cur_ps,
             "is_stale": is_stale,
         }
