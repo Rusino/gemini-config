@@ -1080,6 +1080,49 @@ class TestStopGuard(unittest.TestCase):
       self.assertEqual(res.get("decision"), "continue")
       self.assertIn("[TITLE GUARD]", res.get("reason", ""))
 
+  def test_macos_subagent_without_parent_field_skips_stop_guard(self):
+    parent_id = "0687185b-9c27-41f8-9a0a-bfec291f51f8"
+    sub_id = "b8d01615-02b4-46ed-93ee-3774ec3a473f"
+    with tempfile.TemporaryDirectory() as app_dir:
+      sub_brain = os.path.join(app_dir, "brain", sub_id)
+      scratch_dir = os.path.join(sub_brain, "scratch")
+      tx_dir = os.path.join(sub_brain, ".system_generated", "logs")
+      os.makedirs(scratch_dir, exist_ok=True)
+      os.makedirs(tx_dir, exist_ok=True)
+      with open(os.path.join(scratch_dir, ".context_guard_state.json"), "w", encoding="utf-8") as f:
+        json.dump({"pending_title_guard": True}, f)
+
+      tx_path = os.path.join(tx_dir, "transcript.jsonl")
+      with open(tx_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "step_index": 0,
+            "source": "SYSTEM",
+            "type": "SYSTEM_MESSAGE",
+            "content": (
+                f"<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-29T23:33:42Z "
+                f"sender={parent_id} priority=MESSAGE_PRIORITY_HIGH content=Run\n"
+                "</SYSTEM_MESSAGE>"
+            ),
+        }) + "\n")
+        f.write(
+            json.dumps({"step_index": 1, "type": "PLANNER_RESPONSE", "content": "Done."})
+            + "\n"
+        )
+
+      data = {
+          "conversationId": sub_id,
+          "transcriptPath": tx_path,
+          "artifactDirectoryPath": sub_brain,
+          "fullyIdle": True,
+          "terminationReason": "NO_TOOL_CALL",
+      }
+      with patch("sys.stdin", io.StringIO(json.dumps(data))), \
+           patch("sys.stdout", new_callable=io.StringIO) as mock_out, \
+           patch("chat_lifecycle.get_conversation_title", return_value=""), \
+           patch.object(stop_guard, "play_stop_sound"):
+        stop_guard.main()
+      self.assertEqual(json.loads(mock_out.getvalue()), {})
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -10,6 +10,8 @@ pre_tool_guard.py imports, context_guard.py included, cannot silence it
 
 import json
 import os
+import re
+import sqlite3
 import sys
 import time
 import traceback
@@ -19,6 +21,67 @@ FAILURE_MARKER_DEFAULT = "~/.gemini/config/logs/pre_tool_guard_failure.json"
 # A broken guard rewrites the marker on every gated call; one notice per chat
 # per interval is enough to make the agent tell the user
 NOTICE_INTERVAL_S = 900
+APP_DATA_DIR_CANDIDATES = ("~/.gemini/antigravity", "~/.gemini/jetski")
+_BRAIN_ROOT_RE = re.compile(r"^(.*?)/brain/[^/]+(?:/|$)")
+_SUBAGENT_SENDER_RE = re.compile(
+    r"\[Message\]\s+timestamp=\S+\s+sender="
+    r"([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})(?=\s|$)"
+)
+
+
+def _is_subagent(data: dict, conv: str) -> bool:
+  if data.get("parentConversationId"):
+    return True
+  transcript_path = str(data.get("transcriptPath") or "").strip()
+  if transcript_path and os.path.isfile(transcript_path):
+    try:
+      with open(transcript_path, "r", encoding="utf-8", errors="ignore") as f:
+        line = f.readline()
+      if line:
+        step0 = json.loads(line)
+        if (
+            isinstance(step0, dict)
+            and step0.get("step_index") == 0
+            and step0.get("source") == "SYSTEM"
+            and step0.get("type") == "SYSTEM_MESSAGE"
+        ):
+          m = _SUBAGENT_SENDER_RE.search(str(step0.get("content") or ""))
+          if m and m.group(1) != conv:
+            return True
+    except Exception:
+      pass
+  # Kept inline so a broken context_guard.py cannot silence failure notices
+  dirs: list[str] = []
+  for hint in (transcript_path, str(data.get("artifactDirectoryPath") or "")):
+    m = _BRAIN_ROOT_RE.match(hint.replace("\\", "/"))
+    if m and os.path.isdir(m.group(1)) and m.group(1) not in dirs:
+      dirs.append(m.group(1))
+  for raw in APP_DATA_DIR_CANDIDATES:
+    d = os.path.abspath(os.path.expanduser(raw))
+    if os.path.isdir(d) and d not in dirs:
+      dirs.append(d)
+  query = (
+      "SELECT parent_conversation_id FROM conversation_summaries WHERE"
+      " conversation_id = ?"
+  )
+  for d in dirs:
+    db_path = os.path.join(d, "conversation_summaries.db")
+    if not os.path.isfile(db_path):
+      continue
+    for flags in ("mode=ro", "mode=ro&immutable=1"):
+      try:
+        conn = sqlite3.connect(f"file:{db_path}?{flags}", uri=True, timeout=1.0)
+        try:
+          row = conn.execute(query, (conv,)).fetchone()
+        finally:
+          conn.close()
+        if row is not None:
+          parent = str(row[0] or "").strip()
+          return bool(parent and parent != conv)
+        break
+      except Exception:
+        continue
+  return False
 
 
 def failure_marker_path() -> str:
@@ -60,6 +123,9 @@ def notice(data: dict, now: float) -> dict:
     return {}
   marker = _read_json(failure_marker_path())
   if marker.get("ts", 0) <= state["quiet_until"]:
+    return {}
+  # Defer DB/transcript subagent lookup until a fresh failure marker actually exists
+  if _is_subagent(data, conv):
     return {}
   _write_json(state_path, {"quiet_until": now + NOTICE_INTERVAL_S})
   where = "this chat" if marker.get("conv") == conv else f"chat {marker.get('conv') or '?'}"

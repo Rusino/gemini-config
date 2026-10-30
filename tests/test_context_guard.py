@@ -45,11 +45,16 @@ class TestContextGuard(unittest.TestCase):
         context_guard, "get_conversation_db_info", return_value=("[10:00] ⦿ Sample Task", "proj-1")
     )
     self.mock_db = self.db_info.start()
+    self.app_dirs = patch.object(
+        context_guard, "APP_DATA_DIR_CANDIDATES", (self.tmp.name,)
+    )
+    self.app_dirs.start()
     self.rpc = patch.object(chat_lifecycle, "ls_rpc", return_value=gm_response(1000))
     self.mock_rpc = self.rpc.start()
 
   def tearDown(self):
     self.rpc.stop()
+    self.app_dirs.stop()
     self.db_info.stop()
     self.env.stop()
     self.tmp.cleanup()
@@ -184,7 +189,8 @@ class TestContextGuard(unittest.TestCase):
 
   def test_below_soft_is_silent_and_skips_sqlite(self):
     self.mock_rpc.return_value = gm_response(100000)
-    self.assertEqual(self.run_guard(inv=3), {})
+    with patch("sqlite3.connect", side_effect=AssertionError("unexpected sqlite open")):
+      self.assertEqual(self.run_guard(inv=3), {})
     self.mock_db.assert_not_called()
     log = self.last_log()
     self.assertEqual((log["level"], log["pct"], log["fallback"]), ("none", 39.1, False))
@@ -639,6 +645,173 @@ class TestContextGuard(unittest.TestCase):
           self.assertEqual(pid, "proj-tier-1")
     finally:
       self.db_info.start()
+
+  def test_resolve_parent_conversation_id_macos_fallbacks(self):
+    import sqlite3
+
+    parent_id = "0687185b-9c27-41f8-9a0a-bfec291f51f8"
+    sub_tx = "b8d01615-02b4-46ed-93ee-3774ec3a473f"
+    sub_proto = "11111111-2222-3333-4444-555555555555"
+    sub_sql = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    top_proto = "22222222-3333-4444-5555-666666666666"
+    top_id = "ac507d76-cae2-4090-a7b1-01321a6ddd00"
+
+    with tempfile.TemporaryDirectory() as app_dir, tempfile.TemporaryDirectory() as app_dir2:
+      # Tier 2: subagent transcript step 0 SYSTEM_MESSAGE with sender=<uuid>
+      tx_path = os.path.join(
+          app_dir, "brain", sub_tx, ".system_generated", "logs", "transcript.jsonl"
+      )
+      os.makedirs(os.path.dirname(tx_path), exist_ok=True)
+      with open(tx_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "step_index": 0,
+            "source": "SYSTEM",
+            "type": "SYSTEM_MESSAGE",
+            "content": (
+                "<SYSTEM_MESSAGE>\n"
+                f"[Message] timestamp=2026-10-29T23:33:42Z sender={parent_id} "
+                "priority=MESSAGE_PRIORITY_HIGH content=Run corpus\n"
+                "</SYSTEM_MESSAGE>"
+            ),
+        }) + "\n")
+
+      # Tier 3: conversations/<cid>.db trajectory_metadata_blob proto field 5
+      conv_dir = os.path.join(app_dir, "conversations")
+      os.makedirs(conv_dir, exist_ok=True)
+      proto_db = os.path.join(conv_dir, f"{sub_proto}.db")
+      conn = sqlite3.connect(proto_db)
+      conn.execute(
+          "CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB)"
+      )
+      parent_bytes = parent_id.encode("utf-8")
+      blob = bytes([(5 << 3) | 2, len(parent_bytes)]) + parent_bytes
+      conn.execute(
+          "INSERT INTO trajectory_metadata_blob VALUES ('main', ?)", (blob,)
+      )
+      conn.commit()
+      conn.close()
+
+      top_proto_db = os.path.join(conv_dir, f"{top_proto}.db")
+      tconn = sqlite3.connect(top_proto_db)
+      tconn.execute(
+          "CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB)"
+      )
+      proj_blob = bytes([(18 << 3) | 2, 2]) + b"p1"
+      tconn.execute(
+          "INSERT INTO trajectory_metadata_blob VALUES ('main', ?)", (proj_blob,)
+      )
+      tconn.commit()
+      tconn.close()
+
+      # Tier 4: conversation_summaries.db parent_conversation_id column
+      sum_db = os.path.join(app_dir, context_guard.SUMMARY_DB_NAME)
+      sconn = sqlite3.connect(sum_db)
+      sconn.execute(
+          "CREATE TABLE conversation_summaries ("
+          "conversation_id TEXT PRIMARY KEY, title TEXT, project_id TEXT, "
+          "parent_conversation_id TEXT)"
+      )
+      sconn.execute(
+          "INSERT INTO conversation_summaries VALUES (?, '', 'p1', ?)",
+          (sub_sql, parent_id),
+      )
+      sconn.execute(
+          "INSERT INTO conversation_summaries VALUES (?, 'Top chat', 'p1', '')",
+          (top_id,),
+      )
+      sconn.commit()
+      sconn.close()
+
+      # Secondary DB that must never be reached once the primary DB resolves a row
+      sum_db2 = os.path.join(app_dir2, context_guard.SUMMARY_DB_NAME)
+      sconn2 = sqlite3.connect(sum_db2)
+      sconn2.execute(
+          "CREATE TABLE conversation_summaries ("
+          "conversation_id TEXT PRIMARY KEY, parent_conversation_id TEXT)"
+      )
+      sconn2.execute(
+          "INSERT INTO conversation_summaries VALUES (?, ?)", (top_id, parent_id)
+      )
+      sconn2.execute(
+          "INSERT INTO conversation_summaries VALUES (?, ?)", (top_proto, parent_id)
+      )
+      sconn2.commit()
+      sconn2.close()
+
+      top_tx = os.path.join(
+          app_dir, "brain", top_id, ".system_generated", "logs", "transcript.jsonl"
+      )
+      os.makedirs(os.path.dirname(top_tx), exist_ok=True)
+      with open(top_tx, "w", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "step_index": 0,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "content": "Hello",
+        }) + "\n")
+
+      with patch.object(context_guard, "APP_DATA_DIR_CANDIDATES", (app_dir, app_dir2)):
+        self.assertEqual(
+            context_guard.resolve_parent_conversation_id({
+                "conversationId": top_id,
+                "parentConversationId": "explicit-parent",
+            }),
+            "explicit-parent",
+        )
+        self.assertEqual(
+            context_guard.resolve_parent_conversation_id({
+                "conversationId": sub_tx,
+                "transcriptPath": tx_path,
+            }),
+            parent_id,
+        )
+        self.assertEqual(
+            context_guard.resolve_parent_conversation_id({
+                "conversationId": sub_proto,
+                "artifactDirectoryPath": os.path.join(app_dir, "brain", sub_proto),
+            }),
+            parent_id,
+        )
+        self.assertEqual(
+            context_guard.resolve_parent_conversation_id({
+                "conversationId": sub_sql,
+                "artifactDirectoryPath": os.path.join(app_dir, "brain", sub_sql),
+            }),
+            parent_id,
+        )
+        real_connect = sqlite3.connect
+        with patch("sqlite3.connect", wraps=real_connect) as spy_proto:
+          self.assertEqual(
+              context_guard.resolve_parent_conversation_id({
+                  "conversationId": top_proto,
+                  "artifactDirectoryPath": os.path.join(app_dir, "brain", top_proto),
+              }),
+              "",
+          )
+          self.assertEqual(spy_proto.call_count, 1)
+        with patch("sqlite3.connect", wraps=real_connect) as spy_sum:
+          self.assertEqual(
+              context_guard.resolve_parent_conversation_id({
+                  "conversationId": top_id,
+                  "transcriptPath": top_tx,
+              }),
+              "",
+          )
+          self.assertEqual(spy_sum.call_count, 1)
+
+        # context_guard.run skips macOS subagents even when parentConversationId is absent
+        log = {}
+        res = context_guard.run(
+            {
+                "conversationId": sub_proto,
+                "artifactDirectoryPath": os.path.join(app_dir, "brain", sub_proto),
+                "invocationNum": 45,
+                "initialNumSteps": 96,
+            },
+            log,
+        )
+        self.assertEqual(res, {})
+        self.assertEqual(log.get("level"), "skip")
 
 
 if __name__ == "__main__":

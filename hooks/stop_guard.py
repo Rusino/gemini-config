@@ -901,7 +901,10 @@ def main() -> None:
     print("{}")
     return
 
-  if data.get("isBattleMode") or data.get("parentConversationId"):
+  # Skip battle mode forks and subagents (including macOS subagents missing parentConversationId)
+  from context_guard import resolve_parent_conversation_id
+
+  if data.get("isBattleMode") or resolve_parent_conversation_id(data):
     print("{}")
     return
 

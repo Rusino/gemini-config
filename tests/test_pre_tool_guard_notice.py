@@ -30,6 +30,11 @@ class TestPreToolGuardNotice(unittest.TestCase):
     })
     env.start()
     self.addCleanup(env.stop)
+    app_dirs = patch.object(
+        pre_tool_guard_notice, "APP_DATA_DIR_CANDIDATES", (self.tmp,), create=True
+    )
+    app_dirs.start()
+    self.addCleanup(app_dirs.stop)
     self.chat = {"conversationId": "c1", "artifactDirectoryPath": os.path.join(self.tmp, "brain")}
 
   def write_marker(self, ts):
@@ -66,6 +71,95 @@ class TestPreToolGuardNotice(unittest.TestCase):
         pre_tool_guard_notice.notice(chat, 1000)
         self.write_marker(1001)
         self.assertEqual(pre_tool_guard_notice.notice(chat, 1002), {})
+
+  def test_macos_subagents_without_parent_field_are_not_noticed(self):
+    import sqlite3
+
+    parent_id = "0687185b-9c27-41f8-9a0a-bfec291f51f8"
+    sub_db_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    sub_tx_id = "b8d01615-02b4-46ed-93ee-3774ec3a473f"
+    top_id = "ac507d76-cae2-4090-a7b1-01321a6ddd00"
+    app_dir = os.path.join(self.tmp, "antigravity")
+    app_dir2 = os.path.join(self.tmp, "jetski")
+    os.makedirs(app_dir, exist_ok=True)
+    os.makedirs(app_dir2, exist_ok=True)
+
+    sum_db = os.path.join(app_dir, "conversation_summaries.db")
+    conn = sqlite3.connect(sum_db)
+    conn.execute(
+        "CREATE TABLE conversation_summaries ("
+        "conversation_id TEXT PRIMARY KEY, parent_conversation_id TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO conversation_summaries VALUES (?, ?)", (sub_db_id, parent_id)
+    )
+    conn.execute(
+        "INSERT INTO conversation_summaries VALUES (?, '')", (top_id,)
+    )
+    conn.commit()
+    conn.close()
+
+    sum_db2 = os.path.join(app_dir2, "conversation_summaries.db")
+    conn2 = sqlite3.connect(sum_db2)
+    conn2.execute(
+        "CREATE TABLE conversation_summaries ("
+        "conversation_id TEXT PRIMARY KEY, parent_conversation_id TEXT)"
+    )
+    conn2.execute(
+        "INSERT INTO conversation_summaries VALUES (?, ?)", (top_id, parent_id)
+    )
+    conn2.commit()
+    conn2.close()
+
+    tx_path = os.path.join(
+        app_dir, "brain", sub_tx_id, ".system_generated", "logs", "transcript.jsonl"
+    )
+    os.makedirs(os.path.dirname(tx_path), exist_ok=True)
+    with open(tx_path, "w", encoding="utf-8") as f:
+      f.write(json.dumps({
+          "step_index": 0,
+          "source": "SYSTEM",
+          "type": "SYSTEM_MESSAGE",
+          "content": (
+              f"<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-29T23:33:42Z "
+              f"sender={parent_id} priority=MESSAGE_PRIORITY_HIGH content=Run\n"
+              "</SYSTEM_MESSAGE>"
+          ),
+      }) + "\n")
+
+    with patch.object(
+        pre_tool_guard_notice, "APP_DATA_DIR_CANDIDATES", (app_dir, app_dir2), create=True
+    ):
+      for chat in (
+          {
+              "conversationId": sub_db_id,
+              "artifactDirectoryPath": os.path.join(app_dir, "brain", sub_db_id),
+          },
+          {
+              "conversationId": sub_tx_id,
+              "transcriptPath": tx_path,
+              "artifactDirectoryPath": os.path.join(app_dir, "brain", sub_tx_id),
+          },
+      ):
+        with self.subTest(conv=chat["conversationId"]):
+          pre_tool_guard_notice.notice(chat, 1000)
+          self.write_marker(1001)
+          self.assertEqual(pre_tool_guard_notice.notice(chat, 1002), {})
+
+      top_chat = {
+          "conversationId": top_id,
+          "artifactDirectoryPath": os.path.join(app_dir, "brain", top_id),
+      }
+      real_connect = sqlite3.connect
+      with patch("sqlite3.connect", wraps=real_connect) as spy_healthy:
+        self.write_marker(999)
+        self.assertEqual(pre_tool_guard_notice.notice(top_chat, 1000), {})
+        self.assertEqual(pre_tool_guard_notice.notice(top_chat, 1001), {})
+        self.assertEqual(spy_healthy.call_count, 0)
+      self.write_marker(1002)
+      with patch("sqlite3.connect", wraps=real_connect) as spy_active:
+        self.assertEqual(len(self.notices(pre_tool_guard_notice.notice(top_chat, 1003))), 1)
+        self.assertEqual(spy_active.call_count, 1)
 
   def run_chain(self, sibling, edit):
     # A copy keeps the injected fault away from the live hooks; both hooks run

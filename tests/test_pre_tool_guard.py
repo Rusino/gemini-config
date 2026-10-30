@@ -1529,6 +1529,66 @@ class TestPreToolGuard(unittest.TestCase):
       })
       self.assertEqual(out_sub.get("decision"), "allow")
 
+  # Verify macOS subagents without stdin parentConversationId inherit their parent's worktree lease
+  def test_macos_subagent_inherits_parent_worktree_lease_via_db_fallback(self):
+    import sqlite3
+
+    parent_id = "0687185b-9c27-41f8-9a0a-bfec291f51f8"
+    sub_id = "b8d01615-02b4-46ed-93ee-3774ec3a473f"
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      repo = os.path.join(tmp_dir, "flutter")
+      os.makedirs(repo)
+      subprocess.run(["git", "-C", repo, "init", "-q"], check=True)
+      git_dir = os.path.join(repo, ".git")
+      with open(os.path.join(git_dir, "jetski_lease.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "conv_id": parent_id,
+                "title": "[19:29] ⦿ SkoreText design doc (RU)",
+                "ts": 4102444800.0,
+                "worktree": repo,
+            },
+            f,
+        )
+
+      app_dir = os.path.join(tmp_dir, "antigravity")
+      os.makedirs(app_dir)
+      sum_db = os.path.join(app_dir, "conversation_summaries.db")
+      conn = sqlite3.connect(sum_db)
+      conn.execute(
+          "CREATE TABLE conversation_summaries ("
+          "conversation_id TEXT PRIMARY KEY, title TEXT, project_id TEXT, "
+          "parent_conversation_id TEXT)"
+      )
+      conn.execute(
+          "INSERT INTO conversation_summaries VALUES (?, ?, 'p1', '')",
+          (parent_id, "[19:29] ⦿ SkoreText design doc (RU)"),
+      )
+      conn.execute(
+          "INSERT INTO conversation_summaries VALUES (?, '', 'p1', ?)",
+          (sub_id, parent_id),
+      )
+      conn.commit()
+      conn.close()
+
+      sub_brain = os.path.join(app_dir, "brain", sub_id)
+      sub_tx = os.path.join(sub_brain, ".system_generated", "logs", "transcript.jsonl")
+      os.makedirs(os.path.dirname(sub_tx), exist_ok=True)
+      with open(sub_tx, "w", encoding="utf-8") as f:
+        f.write("")
+
+      out = self.run_guard({
+          "conversationId": sub_id,
+          "transcriptPath": sub_tx,
+          "artifactDirectoryPath": sub_brain,
+          "workspacePaths": [repo],
+          "toolCall": {
+              "name": "run_command",
+              "args": {"CommandLine": f"ninja -C {repo}/out/host && git -C {repo} status --short"},
+          },
+      })
+      self.assertEqual(out.get("decision"), "allow", out)
+
 
 if __name__ == "__main__":
   unittest.main()

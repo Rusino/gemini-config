@@ -158,27 +158,29 @@ def summary_db_paths(hint_path: str = "") -> list[str]:
   return paths
 
 
-def _query_summary_db(db_path: str, conv_id: str):
-  """Returns the (title, project_id) row or None.
-
-  `mode=ro` cannot open a WAL database whose -shm file is absent (e.g. while
-  the client is not holding it open), so fall back to `immutable=1`, which may
-  miss the newest un-checkpointed rows but never writes.
-  """
-  query = (
-      "SELECT title, project_id FROM conversation_summaries WHERE"
-      " conversation_id = ?"
-  )
+def _query_sqlite_ro(db_path: str, query: str, params: tuple = ()):
+  # mode=ro fails on a WAL database whose -shm file is absent; retry immutable=1
+  # only when connecting or querying raises so absent/empty rows open the DB once
   for flags in ("mode=ro", "mode=ro&immutable=1"):
     try:
       conn = sqlite3.connect(f"file:{db_path}?{flags}", uri=True, timeout=1.0)
       try:
-        return conn.execute(query, (conv_id,)).fetchone()
+        return conn.execute(query, params).fetchone()
       finally:
         conn.close()
     except Exception:
       continue
   return None
+
+
+def _query_summary_db(db_path: str, conv_id: str):
+  """Returns the (title, project_id) row or None."""
+  return _query_sqlite_ro(
+      db_path,
+      "SELECT title, project_id FROM conversation_summaries WHERE"
+      " conversation_id = ?",
+      (conv_id,),
+  )
 
 
 def _extract_proto_field_string(data: bytes, target_fn: int) -> str:
@@ -233,20 +235,10 @@ def _extract_proto_field_string(data: bytes, target_fn: int) -> str:
 
 
 def _query_conversation_db_metadata(db_path: str) -> bytes | None:
-  for flags in ("mode=ro", "mode=ro&immutable=1"):
-    try:
-      conn = sqlite3.connect(f"file:{db_path}?{flags}", uri=True, timeout=1.0)
-      try:
-        row = conn.execute(
-            "SELECT data FROM trajectory_metadata_blob WHERE id = 'main'"
-        ).fetchone()
-        if row and row[0]:
-          return bytes(row[0])
-      finally:
-        conn.close()
-    except Exception:
-      continue
-  return None
+  row = _query_sqlite_ro(
+      db_path, "SELECT data FROM trajectory_metadata_blob WHERE id = 'main'"
+  )
+  return bytes(row[0]) if row and row[0] else None
 
 
 def _fetch_ls_info(conv_id: str) -> tuple[str, str]:
@@ -265,6 +257,66 @@ def _fetch_ls_info(conv_id: str) -> tuple[str, str]:
   except Exception:
     pass
   return ("", "")
+
+
+_SUBAGENT_SENDER_RE = re.compile(
+    r"\[Message\]\s+timestamp=\S+\s+sender="
+    r"([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})(?=\s|$)"
+)
+
+
+# Resolves a subagent's parent conversation ID across Linux and macOS hook payloads
+def resolve_parent_conversation_id(data: dict) -> str:
+  explicit = str(data.get("parentConversationId") or "").strip()
+  if explicit:
+    return explicit
+  conv_id = str(data.get("conversationId") or "").strip()
+  if not conv_id:
+    return ""
+  transcript_path = str(data.get("transcriptPath") or "").strip()
+  artifact_dir = str(data.get("artifactDirectoryPath") or "").strip()
+
+  # Antigravity on macOS omits parentConversationId in hook stdin; step 0 exposes
+  # the parent sender UUID even before SQLite WAL checkpoints or in isolated tests
+  if transcript_path and os.path.isfile(transcript_path):
+    try:
+      with open(transcript_path, "r", encoding="utf-8", errors="ignore") as f:
+        first_line = f.readline()
+      if first_line:
+        step0 = json.loads(first_line)
+        if (
+            isinstance(step0, dict)
+            and step0.get("step_index") == 0
+            and step0.get("source") == "SYSTEM"
+            and step0.get("type") == "SYSTEM_MESSAGE"
+        ):
+          m = _SUBAGENT_SENDER_RE.search(str(step0.get("content") or ""))
+          if m and m.group(1) != conv_id:
+            return m.group(1)
+    except Exception:
+      pass
+
+  hint_path = transcript_path or artifact_dir
+  # Field 5 of trajectory_metadata_blob stores parentConversationId from creation;
+  # an empty field 5 in a non-empty blob authoritatively marks a top-level chat
+  for ad in _candidate_app_data_dirs(hint_path):
+    conv_db = os.path.join(ad, "conversations", f"{conv_id}.db")
+    if os.path.isfile(conv_db):
+      blob = _query_conversation_db_metadata(conv_db)
+      if blob:
+        parent = _extract_proto_field_string(blob, 5).strip()
+        return parent if parent != conv_id else ""
+
+  query = (
+      "SELECT parent_conversation_id FROM conversation_summaries WHERE"
+      " conversation_id = ?"
+  )
+  for db_path in summary_db_paths(hint_path):
+    row = _query_sqlite_ro(db_path, query, (conv_id,))
+    if row is not None:
+      parent = str(row[0] or "").strip()
+      return parent if parent != conv_id else ""
+  return ""
 
 
 def get_conversation_db_info(
@@ -1591,8 +1643,8 @@ def append_log(record: dict) -> None:
 
 def run(data: dict, log: dict) -> dict:
   """Decides the hook output for one PreInvocation event and fills `log`."""
-  # Skip battle mode forks and subagents
-  if data.get("isBattleMode") or data.get("parentConversationId"):
+  # Skip battle mode forks and subagents (resolving parent ID via DB/transcript on macOS)
+  if data.get("isBattleMode") or resolve_parent_conversation_id(data):
     log["level"] = "skip"
     return {}
 

@@ -2503,6 +2503,12 @@ def main() -> None:
   transcript_path = data.get("transcriptPath", "")
   artifact_dir = data.get("artifactDirectoryPath", "")
   workspace_paths = data.get("workspacePaths") or []
+  # macOS Antigravity omits parentConversationId in stdin; resolve it so subagents
+  # share their parent's worktree leases and skip top-level handoff/exploration guards
+  if not parent_conv_id and conv_id:
+    from context_guard import resolve_parent_conversation_id
+
+    parent_conv_id = resolve_parent_conversation_id(data)
 
   if tool_name in EDIT_TOOLS:
     denial = roadmap_edit_denial(get_tool_target_file(tool_args), conv_id)
