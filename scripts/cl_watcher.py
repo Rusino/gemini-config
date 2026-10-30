@@ -1527,6 +1527,130 @@ def link_fix_changes_to_parent_chats(
       parent["single_target"] = False
 
 
+def _build_fix_entry(rec: dict[str, Any], fix_self_label: str) -> dict[str, Any]:
+  """Summarizes a fix CL/PR's operational lifecycle stage for display on broken CLs."""
+  status = str(rec.get("status") or "").upper()
+  cq_st = str(rec.get("cq_status") or "")
+  is_wip = bool(rec.get("is_wip") or rec.get("is_draft"))
+  in_dev = bool(rec.get("in_development"))
+  phase = str(rec.get("phase") or "")
+  cq_failed = bool(rec.get("cq_failed"))
+  approved_count = int(rec.get("approved_count") or 0)
+  missing_approvals = int(rec.get("missing_approvals") or 0)
+
+  # Merged fix CLs track post-submit roll propagation into downstream products
+  if status == "MERGED":
+    f_ps = rec.get("post_submit") or {}
+    if f_ps.get("all_passed"):
+      stage = "shipped"
+      stage_label = "Fix shipped"
+      status_summary = "merged · ✓All Rolls"
+    elif "passed_rolls" in f_ps or f_ps.get("total_rolls"):
+      stage = "merged_rolling"
+      stage_label = "Fix landed · rolling"
+      total_r = (
+          len(f_ps.get("rolls") or ()) or int(f_ps.get("total_rolls") or 4)
+      )
+      passed_r = f_ps.get("passed_rolls", 0)
+      status_summary = f"merged · {passed_r}/{total_r} rolls"
+    else:
+      stage = "merged_rolling"
+      stage_label = "Fix landed · rolling"
+      status_summary = "merged"
+  # Active submission in CQ takes priority before general review states
+  elif phase == "SUBMITTING" or cq_st.startswith("CQ+2"):
+    stage = "submitting"
+    stage_label = "Fix submitting"
+    status_summary = "submitting"
+  # CQ failures require intervention before review can proceed
+  elif cq_failed:
+    stage = "cq_failed"
+    stage_label = "Fix failed CQ"
+    status_summary = "CQ failed"
+  # WIP and draft fixes remain in development until marked ready
+  elif is_wip:
+    stage = "in_progress"
+    stage_label = "Fix in progress"
+    wip_name = str(
+        rec.get("wip_label")
+        or ("Draft" if rec.get("is_draft") else "WIP")
+    )
+    status_summary = (
+        f"{wip_name} · {cq_st}"
+        if (cq_st and cq_st != "Idle")
+        else wip_name
+    )
+  # Unassigned changes wait for initial reviewer assignment
+  elif in_dev:
+    stage = "in_progress"
+    stage_label = "Fix in progress"
+    status_summary = (
+        f"needs reviewers · {cq_st}"
+        if (cq_st and cq_st != "Idle")
+        else "needs reviewers"
+    )
+  # Dry run verification underway prior to full approval
+  elif cq_st.startswith("CQ+") or "running" in cq_st or "Dry Run" in cq_st:
+    stage = "in_cq"
+    stage_label = (
+        "Fix in dry run"
+        if rec.get("kind") != "github"
+        else "Fix in checks"
+    )
+    status_summary = cq_st
+  # Approved fixes ready for landing
+  elif approved_count > 0 and missing_approvals == 0:
+    stage = "approved"
+    stage_label = "Fix approved"
+    status_summary = "approved"
+  # Open reviews awaiting author response
+  elif rec.get("is_self") and phase == "NEEDS_YOUR_ACTION":
+    stage = "needs_reply"
+    stage_label = "Fix needs your reply"
+    status_summary = "needs reply"
+  else:
+    raw_waiting = rec.get("waiting_on") or []
+    waiting_reviewers = [
+        str(w.get("id") or "").split("@")[0]
+        for w in raw_waiting
+        if isinstance(w, dict) and w.get("active") and w.get("id")
+    ]
+    stage = "in_review"
+    stage_label = "Fix awaiting review"
+    if waiting_reviewers:
+      names = ", ".join(waiting_reviewers[:2])
+      cr_sum = str(rec.get("cr_summary") or "")
+      status_summary = (
+          f"waiting on {names} · CR {cr_sum}"
+          if (approved_count > 0 and cr_sum)
+          else f"waiting on {names}"
+      )
+    elif rec.get("reviewer_status"):
+      status_summary = str(rec.get("reviewer_status")).lower()
+    else:
+      status_summary = "in review"
+
+  fix_age = str(
+      rec.get("status_changed_age")
+      or rec.get("last_msg_age")
+      or rec.get("submitted_age")
+      or ""
+  )
+  return {
+      "item_key": str(rec.get("item_key") or ""),
+      "target_id": str(rec.get("target_id") or ""),
+      "label": fix_self_label,
+      "url": str(rec.get("url") or ""),
+      "subject": str(rec.get("subject") or ""),
+      "status": status,
+      "stage": stage,
+      "stage_label": stage_label,
+      "status_summary": status_summary,
+      "age": fix_age,
+      "is_wip": is_wip,
+  }
+
+
 def load_ignored_cls(path: str = IGNORED_CLS_FILE) -> set[str]:
   """Reads permanently ignored Gerrit CL IDs from review-triage's ignore list."""
   ignored: set[str] = set()
@@ -4579,55 +4703,7 @@ def sync_once(
             else f"Gerrit {rec.get('target_id')}"
         )
     )
-    cq_st = str(rec.get("cq_status") or "")
-    # Summarize the fix CL's review/CQ stage so the broken CL shows fix progress at a glance
-    if str(rec.get("status") or "").upper() == "MERGED":
-      f_ps = rec.get("post_submit") or {}
-      # Show post-submit roll progress on merged fix CLs
-      if f_ps.get("all_passed"):
-        fix_status_summary = "merged · ✓All Rolls"
-      elif "passed_rolls" in f_ps or f_ps.get("total_rolls"):
-        total_r = len(f_ps.get("rolls") or ()) or int(f_ps.get("total_rolls") or 4)
-        fix_status_summary = (
-            f"merged · {f_ps.get('passed_rolls', 0)}/{total_r} rolls"
-        )
-      else:
-        fix_status_summary = "merged"
-    elif rec.get("is_wip") or rec.get("is_draft"):
-      fix_status_summary = str(rec.get("wip_label") or "WIP")
-    elif rec.get("phase") == "SUBMITTING":
-      fix_status_summary = "submitting"
-    elif rec.get("cq_failed"):
-      fix_status_summary = "CQ failed"
-    elif cq_st.startswith("CQ+") or "running" in cq_st:
-      fix_status_summary = cq_st
-    elif (
-        int(rec.get("approved_count") or 0) > 0
-        and int(rec.get("missing_approvals") or 0) == 0
-    ):
-      fix_status_summary = "approved"
-    elif rec.get("reviewer_status"):
-      fix_status_summary = str(rec.get("reviewer_status")).lower()
-    else:
-      fix_status_summary = "in review"
-
-    fix_age = str(
-        rec.get("status_changed_age")
-        or rec.get("last_msg_age")
-        or rec.get("submitted_age")
-        or ""
-    )
-    fix_entry = {
-        "item_key": str(rec.get("item_key") or ""),
-        "target_id": str(rec.get("target_id") or ""),
-        "label": fix_self_label,
-        "url": str(rec.get("url") or ""),
-        "subject": str(rec.get("subject") or ""),
-        "status": str(rec.get("status") or ""),
-        "status_summary": fix_status_summary,
-        "age": fix_age,
-        "is_wip": bool(rec.get("is_wip") or rec.get("is_draft")),
-    }
+    fix_entry = _build_fix_entry(rec, fix_self_label)
     # Attach the fix summary to every record representing the broken parent CL
     for p_rec in parent_recs:
       f_list = p_rec.setdefault("fixes", [])
@@ -4872,6 +4948,25 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     background: color-mix(in srgb, var(--green) 16%, transparent);
     color: var(--green);
   }
+  .eyebrow .fix-stage-pill {
+    display: inline-flex; align-items: center; padding: 1px 8px; border-radius: 980px;
+    font-size: 12px; font-weight: 600;
+  }
+  .fix-stage-pill.good, .fix-stage-head.good { color: var(--green); }
+  .fix-stage-pill.good { background: color-mix(in srgb, var(--green) 15%, transparent); }
+  .fix-stage-pill.progress, .fix-stage-head.progress { color: var(--blue); }
+  .fix-stage-pill.progress { background: color-mix(in srgb, var(--blue) 14%, transparent); }
+  .fix-stage-pill.warn, .fix-stage-head.warn { color: var(--amber); }
+  .fix-stage-pill.warn { background: color-mix(in srgb, var(--amber) 18%, transparent); }
+  .fix-stage-pill.bad, .fix-stage-head.bad { color: var(--red); }
+  .fix-stage-pill.bad { background: color-mix(in srgb, var(--red) 15%, transparent); }
+  .fix-primary-status {
+    font-size: 17px; color: var(--ink); margin-bottom: 4px; line-height: 1.4;
+  }
+  .fix-primary-status .fix-stage-head { font-weight: 600; }
+  .fix-primary-status .fix-detail { color: var(--graphite); font-size: 15px; }
+  .fix-primary-status .fix-subj { color: var(--ink); }
+  .why-context { font-size: 15px; color: var(--graphite); }
   .fix-banner {
     margin-top: 8px; padding: 8px 12px; border-radius: 10px;
     background: color-mix(in srgb, var(--ink) 4.5%, transparent);
@@ -5149,7 +5244,7 @@ function isCompanion(it) {
   return Boolean(it.companion_to);
 }
 
-function badgesHtml(it) {
+function badgesHtml(it, opts) {
   const out = [];
   const wip = wipLabel(it);
   if (wip) out.push(`<span class="badge wip">${esc(wip)}</span>`);
@@ -5177,14 +5272,16 @@ function badgesHtml(it) {
       ? link(it.fixes_breakage_url, text, 'badge fix-for', 'Open broken CL/PR')
       : `<span class="badge fix-for">${text}</span>`);
   }
-  const fixes = Array.isArray(it.fixes) ? it.fixes : [];
-  for (const f of fixes) {
-    if (!f || !f.label) continue;
-    const meta = [f.status_summary, f.age].filter(Boolean).join(', ');
-    const text = `fix: ${esc(f.label)}${meta ? ` (${esc(meta)})` : ''}`;
-    out.push(f.url
-      ? link(f.url, text, 'badge has-fix', f.subject || 'Open fix CL/PR')
-      : `<span class="badge has-fix">${text}</span>`);
+  if (!opts || !opts.omitFixes) {
+    const fixes = Array.isArray(it.fixes) ? it.fixes : [];
+    for (const f of fixes) {
+      if (!f || !f.label) continue;
+      const meta = [f.status_summary, f.age].filter(Boolean).join(', ');
+      const text = `fix: ${esc(f.label)}${meta ? ` (${esc(meta)})` : ''}`;
+      out.push(f.url
+        ? link(f.url, text, 'badge has-fix', f.subject || 'Open fix CL/PR')
+        : `<span class="badge has-fix">${text}</span>`);
+    }
   }
   return out.join('');
 }
@@ -5246,6 +5343,89 @@ function fixesBreakageBannerHtml(it) {
   const bots = Array.isArray(it.fixes_breakage_bots) ? it.fixes_breakage_bots : [];
   const botsPart = bots.length ? ` · Red bots: ${formatBotsListHtml(bots)}` : '';
   return `<div class="fix-banner">Fixes breakage from → ${refLink}${botsPart}</div>`;
+}
+
+// Maps fix CL stage and summary to display pill title and tone
+function fixStageInfo(f) {
+  if (!f) return {stage: '', stageLabel: 'Fix', tone: 'progress'};
+  const stage = String(f.stage || '').toLowerCase();
+  const summary = String(f.status_summary || '').toLowerCase();
+  const status = String(f.status || '').toUpperCase();
+  let stageLabel = f.stage_label || '';
+  let tone = 'progress';
+
+  if (stage === 'shipped' || summary.includes('all rolls')) {
+    stageLabel = stageLabel || 'Fix shipped';
+    tone = 'good';
+  } else if (stage === 'merged_rolling' || status === 'MERGED' || summary.startsWith('merged')) {
+    stageLabel = stageLabel || 'Fix landed · rolling';
+    tone = 'good';
+  } else if (stage === 'approved' || summary === 'approved') {
+    stageLabel = stageLabel || 'Fix approved';
+    tone = 'good';
+  } else if (stage === 'submitting' || summary === 'submitting') {
+    stageLabel = stageLabel || 'Fix submitting';
+    tone = 'progress';
+  } else if (stage === 'in_cq' || summary.includes('cq+') || summary.includes('dry run')) {
+    stageLabel = stageLabel || 'Fix in dry run';
+    tone = 'progress';
+  } else if (stage === 'cq_failed' || summary.includes('cq failed')) {
+    stageLabel = stageLabel || 'Fix failed CQ';
+    tone = 'bad';
+  } else if (stage === 'needs_reply' || summary.includes('needs reply')) {
+    stageLabel = stageLabel || 'Fix needs reply';
+    tone = 'warn';
+  } else if (
+    stage === 'in_progress' ||
+    f.is_wip ||
+    summary.includes('wip') ||
+    summary.includes('draft') ||
+    summary.includes('needs reviewers')
+  ) {
+    stageLabel = stageLabel || 'Fix in progress';
+    tone = 'warn';
+  } else {
+    stageLabel = stageLabel || 'Fix awaiting review';
+    tone = 'progress';
+  }
+  return {stage, stageLabel, tone};
+}
+
+// Renders prominent fix status line at 17px in focus card why section
+function fixPrimaryStatusHtml(it) {
+  const fixes = Array.isArray(it.fixes) ? it.fixes : [];
+  if (!fixes.length) return '';
+  return fixes.map(f => {
+    if (!f || !f.label) return '';
+    const info = fixStageInfo(f);
+    const meta = [f.status_summary, f.age].filter(Boolean).join(', ');
+    const fLink = f.url
+      ? link(f.url, `<b>${esc(f.label)}</b>`, '', f.subject || 'Open fix')
+      : `<b>${esc(f.label)}</b>`;
+    const metaSpan = meta ? ` <span class="fix-detail">(${esc(meta)})</span>` : '';
+    const subjClean = cleanSubject(f.subject);
+    const subjSpan = subjClean ? ` <span class="fix-subj">— ${esc(subjClean)}</span>` : '';
+    return `<div class="fix-primary-status">` +
+      `<span class="fix-stage-head ${esc(info.tone)}">${esc(info.stageLabel)}:</span> ` +
+      `${fLink}${metaSpan}${subjSpan}</div>`;
+  }).join('');
+}
+
+// Renders Open fix action buttons for focus cards
+function openFixActionHtml(it) {
+  const fixes = Array.isArray(it.fixes) ? it.fixes : [];
+  const withUrl = fixes.filter(f => f && f.url);
+  if (!withUrl.length) return '';
+  if (withUrl.length === 1) {
+    const f = withUrl[0];
+    const tip = [f.label, cleanSubject(f.subject)].filter(Boolean).join(': ');
+    return link(f.url, 'Open fix', 'btn secondary', tip);
+  }
+  return withUrl.map(f => {
+    const tip = [f.label, cleanSubject(f.subject)].filter(Boolean).join(': ');
+    const shortLabel = f.target_id ? `Open fix (${f.target_id})` : 'Open fix';
+    return link(f.url, esc(shortLabel), 'btn secondary', tip);
+  }).join('');
 }
 
 function reviewerGapHtml(it) {
@@ -6075,13 +6255,23 @@ function focusCard(it, data) {
     ? '<span class="busy-pill"><i class="dot moving"></i>Chat is working</span> · '
     : '';
   const subject = esc(cleanSubject(it.subject));
-  const cardTitle = `${badgesHtml(it)}${link(it.url, subject)}`;
+  const cardTitle = `${badgesHtml(it, {omitFixes: true})}${link(it.url, subject)}`;
+  const openFixBtn = openFixActionHtml(it);
+  const fixPrimary = fixPrimaryStatusHtml(it);
   if (isPostSubmitAlert(it)) {
     const ps = it.post_submit || {};
     // Show all affected tasks on multi-bot incidents and include fix-for banners
     const incidents = expandIncidentsForDisplay(ps);
     const blamed = incidents.some(h => h.verdict === 'blamed');
-    const eyebrow = blamed ? 'Broke the Skia tree' : esc(ps.alert_reason || 'Post-submit alert');
+    const baseEyebrow = blamed
+      ? 'Broke the Skia tree'
+      : esc(ps.alert_reason || 'Post-submit alert');
+    const firstFix = Array.isArray(it.fixes) && it.fixes.length ? it.fixes[0] : null;
+    const fixPill = firstFix
+      ? ` · <span class="fix-stage-pill ${esc(fixStageInfo(firstFix).tone)}">` +
+        `${esc(fixStageInfo(firstFix).stageLabel)}</span>`
+      : '';
+    const eyebrow = `${baseEyebrow}${fixPill}`;
     const first = incidents[0] || {};
     const primary = link(first.task_url || STATUS_SKIA_URL, 'See failure', 'btn primary');
     const landedAt = formatStatusTime(it, it.submitted_et, it.submitted_age);
@@ -6089,15 +6279,18 @@ function focusCard(it, data) {
     const blame = incidents.length
       ? ` Gardener lists ${incidents.length} failing task${incidents.length > 1 ? 's' : ''}.`
       : '';
+    const whyContent = fixPrimary
+      ? `${fixPrimary}<div class="why-context">${landed}${blame}</div>`
+      : `${landed}${blame}`;
     return `
     <article class="card alert">
       <div><div class="eyebrow">${busyBadge}${eyebrow} · ${esc(it.project_name)} ·
         ${link(it.url, clLabel(it))}</div>
         <h2>${cardTitle}</h2>
-        <div class="why">${landed}${blame}</div>
-        <!-- Surface broken bots and linked fix CLs directly inside the alert card -->
-        ${brokenAndFixBannerHtml(it)}${fixesBreakageBannerHtml(it)}</div>
-      <div class="actions">${primary}${chatBtn}</div>
+        <div class="why">${whyContent}</div>
+        <!-- Surface fix-for linkage on broken alert card -->
+        ${fixesBreakageBannerHtml(it)}</div>
+      <div class="actions">${primary}${openFixBtn}${chatBtn}</div>
       ${incidents.length
         ? `<div class="incidents">${incidents.map(incidentHtml).join('')}</div>` : ''}
       ${it.status === 'MERGED' ? flightPath(it, true) : ''}
@@ -6134,15 +6327,19 @@ function focusCard(it, data) {
   }
   const gapNote = reviewerGapHtml(it);
   const fullWhy = gapNote ? `${why} · ${gapNote}` : why;
+  const whyContent = fixPrimary
+    ? `${fixPrimary}<div class="why-context">${fullWhy}</div>`
+    : fullWhy;
+  const actionsWithFix = openFixBtn ? actions.replace(chatBtn, `${openFixBtn}${chatBtn}`) : actions;
   return `
     <article class="card">
       <div><div class="eyebrow">${busyBadge}${esc(it.project_name)} · ${link(it.url, clLabel(it))} ·
         PS${esc(it.patchset || 1)}</div>
         <h2>${cardTitle}</h2>
-        <div class="why">${fullWhy}</div>
+        <div class="why">${whyContent}</div>
         <!-- Surface fix-for linkage on pre-submit focus cards -->
         ${brokenAndFixBannerHtml(it)}${fixesBreakageBannerHtml(it)}</div>
-      <div class="actions">${actions}</div>
+      <div class="actions">${actionsWithFix}</div>
       ${triageHtml(it, false)}
     </article>`;
 }
@@ -6221,10 +6418,15 @@ function render() {
   const shown = all.filter(it => selectedProject === 'ALL' || projOf(it) === selectedProject);
   const by = {you: [], landing: [], desk: [], waiting: [], watching: [], done: []};
   for (const it of shown) by[laneOf(it)].push(it);
-  // Idle items needing human action precede chats where the agent is already working
+  // Idle items needing human action precede chats where the agent is already working.
+  // Unaddressed post-submit alerts precede alerts where a fix is already linked.
   by.you.sort((a, b) =>
     Number(Boolean(a.chat_busy)) - Number(Boolean(b.chat_busy)) ||
-    Number(isPostSubmitAlert(b)) - Number(isPostSubmitAlert(a))
+    Number(isPostSubmitAlert(b)) - Number(isPostSubmitAlert(a)) ||
+    (isPostSubmitAlert(a) && isPostSubmitAlert(b)
+      ? Number(Boolean(a.fixes && a.fixes.length)) -
+        Number(Boolean(b.fixes && b.fixes.length))
+      : 0)
   );
 
   const busyYou = by.you.filter(it => it.chat_busy).length;
@@ -6575,9 +6777,8 @@ def main() -> int:
 
   if args.sync_once:
     state = sync_once(wake_chats=not args.no_wake, update_titles=True)
-    print(
-        f"Synced {len(state.get('items') or {})} active CL/PR chat items at {state.get('last_sync')}"
-    )
+    count = len(state.get("items") or {})
+    print(f"Synced {count} active CL/PR chat items at {state.get('last_sync')}")
     return 0
 
   if args.serve:

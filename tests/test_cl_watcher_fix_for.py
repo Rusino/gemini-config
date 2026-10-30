@@ -606,6 +606,127 @@ process.exit(0);
     res = subprocess.run(cmd, capture_output=True, text=True, check=False)
     self.assertEqual(res.returncode, 0, f"Node output: {res.stdout}\nError: {res.stderr}")
 
+  def test_focus_card_prominent_fix_stages_and_open_fix_button(self) -> None:
+    # 1. Verify backend _build_fix_entry stage classification
+    wip_fix_rec = {
+        "item_key": "gerrit:1411716",
+        "target_id": "1411716",
+        "status": "NEW",
+        "is_wip": True,
+        "wip_label": "WIP",
+        "cq_status": "CQ+1 (Dry Run)",
+        "subject": "Fix Mac bounds check",
+        "url": "https://skia-review.googlesource.com/c/1411716",
+        "status_changed_age": "20m ago",
+    }
+    wip_entry = cl_watcher._build_fix_entry(wip_fix_rec, "Gerrit 1411716")
+    self.assertEqual(wip_entry["stage"], "in_progress")
+    self.assertEqual(wip_entry["stage_label"], "Fix in progress")
+    self.assertEqual(wip_entry["status_summary"], "WIP · CQ+1 (Dry Run)")
+
+    review_fix_rec = {
+        "item_key": "gerrit:1411716",
+        "target_id": "1411716",
+        "status": "NEW",
+        "is_wip": False,
+        "is_self": True,
+        "phase": "WAITING_ON_OTHERS",
+        "approved_count": 1,
+        "missing_approvals": 1,
+        "cr_summary": "+1 (1/2)",
+        "waiting_on": [{"id": "fmalita@google.com", "active": True}],
+        "subject": "Fix Mac bounds check",
+        "url": "https://skia-review.googlesource.com/c/1411716",
+        "status_changed_age": "15m ago",
+    }
+    review_entry = cl_watcher._build_fix_entry(review_fix_rec, "Gerrit 1411716")
+    self.assertEqual(review_entry["stage"], "in_review")
+    self.assertEqual(review_entry["stage_label"], "Fix awaiting review")
+    self.assertEqual(review_entry["status_summary"], "waiting on fmalita · CR +1 (1/2)")
+
+    # 2. Verify focusCard HTML rendering via Node.js
+    broken_card_data = {
+        "item_key": "gerrit:1404196",
+        "kind": "gerrit",
+        "target_id": "1404196",
+        "status": "MERGED",
+        "phase": "ALERT_ROLL_OR_STATUS",
+        "project_name": "Skia",
+        "is_self": True,
+        "subject": "Fix integer overflow in SDF generation",
+        "url": "https://skia-review.googlesource.com/c/1404196",
+        "submitted_et": "12:08 ET",
+        "submitted_age": "1h ago",
+        "conversation_id": "chat-d900b6b5",
+        "post_submit": {
+            "has_alert": True,
+            "skia_status": "🔴",
+            "alert_reason": "Blamed by Gardener in Mac14",
+            "incidents": [{
+                "verdict": "blamed",
+                "task_name": MAC14_BOT,
+                "task_url": "https://task/mac14",
+            }],
+        },
+        "fixes": [review_entry],
+    }
+
+    js_code = r"""
+const assert = require('assert');
+const html = process.argv[1];
+const cardData = JSON.parse(process.argv[2]);
+const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
+assert(scriptMatch, 'Script block found');
+const scriptContent = scriptMatch[1].split('\nboot();')[0];
+
+global.navigator = { clipboard: { writeText: async () => {} } };
+global.window = {};
+global.location = { hash: '' };
+global.document = {
+  getElementById: () => ({ innerHTML: '', textContent: '', style: {} }),
+  addEventListener: () => {}
+};
+
+eval(scriptContent);
+
+const card = focusCard(cardData, { jetski_box_url: 'https://jetski.corp.google.com' });
+
+// 1. Eyebrow has the prominent fix stage pill
+assert(card.includes('fix-stage-pill'), 'fix-stage-pill in card: ' + card);
+assert(card.includes('Fix awaiting review'), 'Fix awaiting review pill in card: ' + card);
+
+// 2. Why section has the prominent 17px fix-primary-status headline
+assert(card.includes('fix-primary-status'), 'fix-primary-status in card: ' + card);
+assert(card.includes('fix-stage-head'), 'fix-stage-head in card: ' + card);
+assert(card.includes('Gerrit 1411716'), 'Gerrit 1411716 link in card: ' + card);
+assert(card.includes('waiting on fmalita · CR +1 (1/2)'), 'fix detail in card: ' + card);
+assert(card.includes('Fix Mac bounds check'), 'fix subject in card: ' + card);
+assert(card.includes('why-context'), 'why-context container in card: ' + card);
+
+// 3. Actions section has 3 buttons: See failure, Open fix, and Open chat
+assert(card.includes('Open fix'), 'Open fix button in card: ' + card);
+assert(card.includes('https://skia-review.googlesource.com/c/1411716'), 'fix url in button');
+assert(card.includes('btn secondary'), 'secondary class on Open fix button');
+assert(card.includes('See failure'), 'See failure button present');
+assert(card.includes('Open chat'), 'Open chat button present');
+
+// 4. No duplicate badge or fix-banner in alert card
+assert(!card.includes('badge has-fix'), 'badge has-fix omitted from alert card title');
+assert(!card.includes('class="fix-banner"'), 'duplicate fix-banner omitted from alert card');
+
+console.log('Focus card fix prominence and Open fix button verified successfully');
+process.exit(0);
+"""
+    cmd = [
+        "node",
+        "-e",
+        js_code,
+        cl_watcher.DASHBOARD_HTML,
+        json.dumps(broken_card_data),
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    self.assertEqual(res.returncode, 0, f"Node output: {res.stdout}\nError: {res.stderr}")
+
 
 if __name__ == "__main__":
   unittest.main()
