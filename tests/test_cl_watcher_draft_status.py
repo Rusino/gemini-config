@@ -736,9 +736,10 @@ console.log(JSON.stringify({
     self.assertEqual(out["piperState"], "In review")
 
   def test_dashboard_has_no_manual_chat_actions_or_browser_alerts(self):
+    # Check for the removed legacy row button function rather than the Reviewer Pings heading
     for removed in (
         "conversation://", "/api/wake", "/api/finalize", "/api/archive_gmail",
-        "Notification", "AudioContext", "Ping",
+        "Notification", "AudioContext", "pingPerson",
     ):
       self.assertNotIn(removed, w.DASHBOARD_HTML, removed)
     for path in ("/api/wake", "/api/finalize", "/api/archive_gmail"):

@@ -149,6 +149,12 @@ RE_DRAFT_SUBJECT = re.compile(
     r"(?:wip|draft|do\s+not\s+submit)\b[:\s\-]*)",
     re.IGNORECASE,
 )
+# Matches commit or reviewer notes indicating a patchset was a rebase without code edits
+RE_REBASE_MSG = re.compile(
+    r"(\bwas rebased\b|\brebased on\b|\brebased onto\b|"
+    r"\brebased?\b.*\bno code change\b|\bno code change\b)",
+    re.IGNORECASE,
+)
 # Flight Deck chats discuss dashboard behavior rather than owning tracked CLs/PRs
 EXCLUDED_WATCHER_PROJECTS = frozenset({"Flight Deck"})
 # Domain projects take precedence when a CL/PR is also mentioned in a meta project
@@ -1395,6 +1401,231 @@ def gerrit_mergeable(host: str, cl_id: str) -> bool:
     return True
 
 
+def compute_gerrit_reviewer_pings(
+    host: str,
+    cl_id: str,
+    project: str,
+    status: str,
+    is_wip: bool,
+    is_draft: bool,
+    min_cr: int,
+    missing_approvals: int,
+    approved_count: int,
+    approved_emails: set[str],
+    is_self: bool,
+    is_reviewer: bool,
+    ps_num: int,
+    revs: dict[str, Any],
+    messages: list[dict[str, Any]],
+    reviewer_accounts: list[dict[str, Any]],
+    cr_votes: list[tuple[str, int]],
+    att_set: list[str],
+    owner_email: str,
+    removed_emails: set[str],
+) -> list[dict[str, Any]]:
+  """Detects reviewers who need to review or whose +1 was lost on rebase/update"""
+  if status != "NEW" or is_wip or is_draft or min_cr < 0 or missing_approvals <= 0:
+    return []
+  if not (is_self or is_reviewer):
+    return []
+
+  rev_by_ps: dict[int, dict[str, Any]] = {}
+  for r in revs.values():
+    if isinstance(r, dict) and r.get("_number"):
+      try:
+        rev_by_ps[int(r["_number"])] = r
+      except (ValueError, TypeError):
+        continue
+
+  rebase_ps: set[int] = set()
+  for p in range(2, ps_num + 1):
+    kind = str(rev_by_ps.get(p, {}).get("kind") or "")
+    desc = str(rev_by_ps.get(p, {}).get("description") or "")
+    if kind in (
+        "TRIVIAL_REBASE",
+        "NO_CODE_CHANGE",
+        "NO_CHANGE",
+        "MERGE_FIRST_PARENT_UPDATE",
+    ):
+      rebase_ps.add(p)
+    elif RE_REBASE_MSG.search(desc):
+      rebase_ps.add(p)
+    elif any(
+        RE_REBASE_MSG.search(str(m.get("message") or ""))
+        for m in messages
+        if int(m.get("_revision_number") or 0) == p
+    ):
+      rebase_ps.add(p)
+
+  # Track chronological votes and review comments per reviewer
+  plus_one_ps: dict[str, int] = {}
+  revoked_emails: set[str] = set()
+  comment_ps: dict[str, int] = {}
+  reviewer_names: dict[str, str] = {}
+
+  for acc in reviewer_accounts:
+    if isinstance(acc, dict) and acc.get("email"):
+      reviewer_names[str(acc["email"])] = str(acc.get("name") or acc["email"])
+
+  for m in messages:
+    rev_n = int(m.get("_revision_number") or 0)
+    auth = m.get("author") or {}
+    auth_email = str(auth.get("email") or "")
+    if auth.get("name"):
+      reviewer_names.setdefault(auth_email, str(auth["name"]))
+    txt = str(m.get("message") or "")
+    if not auth_email:
+      continue
+    # Reviewer vote or comment events
+    if "Code-Review+1" in txt or "Code-Review+2" in txt:
+      plus_one_ps[auth_email] = rev_n
+      revoked_emails.discard(auth_email)
+    elif "-Code-Review" in txt or "Code-Review-1" in txt or "Code-Review-2" in txt:
+      revoked_emails.add(auth_email)
+      plus_one_ps.pop(auth_email, None)
+    elif auth_email != owner_email and not auth_email.endswith(".gserviceaccount.com"):
+      comment_ps[auth_email] = max(comment_ps.get(auth_email, 0), rev_n)
+
+  # Candidate reviewers: assigned or past reviewers who have not approved current PS
+  candidate_emails: set[str] = set()
+  for acc in reviewer_accounts:
+    if isinstance(acc, dict) and acc.get("email"):
+      e = str(acc["email"])
+      if (
+          e != owner_email
+          and e not in SELF_EMAILS
+          and not e.endswith(".gserviceaccount.com")
+          and e not in removed_emails
+          and e not in approved_emails
+      ):
+        candidate_emails.add(e)
+
+  for e in plus_one_ps.keys():
+    if (
+        e != owner_email
+        and e not in SELF_EMAILS
+        and not e.endswith(".gserviceaccount.com")
+        and e not in removed_emails
+        and e not in approved_emails
+    ):
+      candidate_emails.add(e)
+
+  pings: list[dict[str, Any]] = []
+  base_cl_url = (
+      f"https://{host}/c/{project}/+/{cl_id}"
+      if project
+      else f"https://{host}/c/{cl_id}"
+  )
+
+  for e in sorted(candidate_emails):
+    last_approved = plus_one_ps.get(e)
+    last_comment = comment_ps.get(e)
+    prev_ps: int | None = None
+    had_approval = False
+    reason = ""
+
+    if last_approved is not None and last_approved < ps_num and e not in revoked_emails:
+      had_approval = True
+      prev_ps = last_approved
+      all_rebase = all(p in rebase_ps for p in range(last_approved + 1, ps_num + 1))
+      reason = "lost_on_rebase" if all_rebase else "updated_after_approval"
+    elif last_comment is not None and last_comment < ps_num:
+      prev_ps = last_comment
+      reason = "updated_after_review"
+    elif approved_count >= 1 and missing_approvals > 0:
+      reason = "needs_second_approval"
+    elif is_self:
+      reason = "awaiting_review"
+    else:
+      continue
+
+    if prev_ps is not None and prev_ps < ps_num:
+      diff_url = f"{base_cl_url}/{prev_ps}..{ps_num}"
+    else:
+      diff_url = base_cl_url
+
+    pings.append({
+        "reviewer": e,
+        "reviewer_name": reviewer_names.get(e, e),
+        "active": google_account_active(e),
+        "in_attention_set": e in att_set,
+        "reason": reason,
+        "prev_ps": prev_ps,
+        "current_ps": ps_num,
+        "had_approval": had_approval,
+        "diff_url": diff_url,
+    })
+
+  return pings
+
+
+def compute_github_reviewer_pings(
+    pr_id: str,
+    state: str,
+    is_wip: bool,
+    is_draft: bool,
+    missing_approvals: int,
+    approved_count: int,
+    is_self: bool,
+    is_reviewer: bool,
+    human_reviewers: list[str],
+    approved_by: set[str],
+    changes_requested_by: set[str],
+    reviews: list[dict[str, Any]],
+    commits: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+  """Detects reviewers who need to review or re-review on GitHub"""
+  if state != "OPEN" or is_wip or is_draft or missing_approvals <= 0:
+    return []
+  if not (is_self or is_reviewer):
+    return []
+
+  pings: list[dict[str, Any]] = []
+  base_pr_url = f"https://github.com/flutter/flutter/pull/{pr_id}"
+  latest_commit_date = ""
+  for cm in commits:
+    d = str(cm.get("committedDate") or cm.get("authoredDate") or "")
+    if d and d > latest_commit_date:
+      latest_commit_date = d
+
+  rev_by_author: dict[str, dict[str, Any]] = {}
+  for r in reviews:
+    login = str((r.get("author") or {}).get("login") or "")
+    if login and login not in SELF_GITHUB_LOGINS:
+      rev_by_author[login] = r
+
+  for login in sorted(set(human_reviewers) - approved_by):
+    rev = rev_by_author.get(login)
+    had_approval = False
+    reason = ""
+    if rev:
+      sub_date = str(rev.get("submittedAt") or "")
+      st = str(rev.get("state") or "").upper()
+      had_approval = (st == "APPROVED")
+      if latest_commit_date and sub_date and sub_date < latest_commit_date:
+        reason = "updated_after_approval" if had_approval else "updated_after_review"
+    if not reason:
+      if approved_count >= 1 and missing_approvals > 0:
+        reason = "needs_second_approval"
+      elif is_self:
+        reason = "awaiting_review"
+      else:
+        continue
+
+    pings.append({
+        "reviewer": login,
+        "reviewer_name": login,
+        "active": True,
+        "in_attention_set": True,
+        "reason": reason,
+        "prev_ps": None,
+        "current_ps": 1,
+        "had_approval": had_approval,
+        "diff_url": f"{base_pr_url}/files",
+    })
+  return pings
+
+
 def fetch_gerrit_cl_status(
     cl_id: str,
     rollers: dict[str, Any],
@@ -1732,6 +1963,37 @@ def fetch_gerrit_cl_status(
         else:
           phase = "WAITING_ON_OTHERS"
 
+      # Exclude reviewers who were explicitly removed from the change
+      removed_emails = {
+          str((u.get("reviewer") or {}).get("email") or "")
+          for u in (d.get("reviewer_updates") or [])
+          if isinstance(u, dict) and str(u.get("state") or "") == "REMOVED"
+      }
+      project = str(d.get("project") or "")
+      # Compute reviewer ping candidates for lost +1s and missing second approvals
+      reviewer_pings = compute_gerrit_reviewer_pings(
+          host=host,
+          cl_id=cl_id,
+          project=project,
+          status=status,
+          is_wip=is_wip,
+          is_draft=is_draft,
+          min_cr=min_cr,
+          missing_approvals=missing_approvals,
+          approved_count=approved_count,
+          approved_emails=approved_emails,
+          is_self=is_self,
+          is_reviewer=is_reviewer,
+          ps_num=ps_num,
+          revs=revs,
+          messages=messages,
+          reviewer_accounts=reviewer_accounts,
+          cr_votes=cr_votes,
+          att_set=att_set,
+          owner_email=owner_email,
+          removed_emails=removed_emails,
+      )
+
       return {
           "ok": True,
           "host": host,
@@ -1757,6 +2019,8 @@ def fetch_gerrit_cl_status(
           "missing_reviewers_to_assign": missing_reviewers_to_assign,
           "missing_approvals": missing_approvals,
           "reviewer_status": reviewer_status,
+          # Per-reviewer ping entries for lost +1s and missing 2nd approvals
+          "reviewer_pings": reviewer_pings,
           "patchset": ps_num,
           "revision": cur_sha,
           "commit_message": commit_msg,
@@ -2324,6 +2588,23 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
     else:
       phase = "WAITING_ON_OTHERS"
 
+    # Compute reviewer ping candidates from PR reviews and commit timestamps
+    reviewer_pings = compute_github_reviewer_pings(
+        pr_id=str(pr_id),
+        state=state,
+        is_wip=is_wip,
+        is_draft=is_draft,
+        missing_approvals=missing_approvals,
+        approved_count=approved_count,
+        is_self=is_self,
+        is_reviewer=is_reviewer,
+        human_reviewers=human_reviewers,
+        approved_by=approved_by,
+        changes_requested_by=changes_requested_by,
+        reviews=reviews,
+        commits=d.get("commits") or [],
+    )
+
     return {
         "ok": True,
         "host": "github.com/flutter/flutter",
@@ -2349,6 +2630,8 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         "missing_reviewers_to_assign": missing_reviewers_to_assign,
         "missing_approvals": missing_approvals,
         "reviewer_status": reviewer_status,
+        # Per-reviewer ping entries for stale reviews and missing 2nd approvals
+        "reviewer_pings": reviewer_pings,
         "in_development": in_development,
         "is_watching": is_watching,
         "patchset": len(reviews) + 1,
@@ -2490,6 +2773,8 @@ def fetch_piper_cl_status(cl_id: str) -> dict[str, Any]:
         "missing_reviewers_to_assign": missing_reviewers_to_assign,
         "missing_approvals": missing_approvals,
         "reviewer_status": reviewer_status,
+        # Piper CLs do not use Skia 2-reviewer Gerrit attention sets
+        "reviewer_pings": [],
         "in_development": in_development,
         "is_watching": is_watching,
         "patchset": 1,
@@ -3826,6 +4111,54 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .empty-note { padding: 40px 0; color: var(--graphite); font-size: 17px; }
   footer { margin: 96px 0 48px; font-size: 12px; color: var(--graphite); }
 
+  /* Grouped Reviewer Pings panel */
+  .pings-wrap { margin-top: 28px; display: grid; gap: 14px; }
+  .pings-head {
+    display: flex; align-items: baseline; gap: 10px;
+    padding-bottom: 8px; border-bottom: 1px solid var(--hairline);
+  }
+  .pings-head h3 { font: 600 20px var(--display); letter-spacing: -.02em; margin: 0; }
+  .pings-head .n { color: var(--graphite); font-size: 15px; }
+  .pings-head .hint { margin-left: auto; font-size: 13px; color: var(--graphite); }
+  .ping-card {
+    background: var(--card); border-radius: 16px; box-shadow: var(--shadow);
+    padding: 18px 22px; display: grid; gap: 12px;
+  }
+  .ping-card-top {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  }
+  .ping-who { font: 600 16px var(--sans); color: var(--ink); }
+  .ping-counts { font-size: 13px; color: var(--graphite); }
+  .ping-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+  .ping-list { display: grid; gap: 8px; }
+  .ping-row {
+    display: flex; align-items: baseline; gap: 8px; font-size: 14px;
+    padding: 6px 10px; border-radius: 10px;
+    background: color-mix(in srgb, var(--ink) 3.5%, transparent);
+    flex-wrap: wrap;
+  }
+  .ping-row.excluded { opacity: .48; }
+  .ping-row input[type="checkbox"] {
+    margin: 0 2px 0 0; cursor: pointer; accent-color: var(--blue);
+    transform: translateY(1px);
+  }
+  .ping-row .ping-subj { color: var(--ink); font-weight: 500; }
+  .ping-row .ping-diff {
+    margin-left: auto; font: 500 12px var(--mono); color: var(--blue); white-space: nowrap;
+  }
+  .badge.ping-rebase {
+    background: color-mix(in srgb, var(--blue) 15%, transparent); color: var(--blue);
+  }
+  .badge.ping-updated {
+    background: color-mix(in srgb, var(--amber) 18%, transparent); color: var(--amber);
+  }
+  .badge.ping-second {
+    background: color-mix(in srgb, var(--ink) 9%, transparent); color: var(--ink);
+  }
+  .badge.ping-off-att {
+    background: color-mix(in srgb, var(--red) 13%, transparent); color: var(--red);
+  }
+
   @media (max-width: 860px) {
     .hero h1 { font-size: 40px; }
     .card { grid-template-columns: 1fr; padding: 22px; }
@@ -3856,10 +4189,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <p id="subline"></p>
   </div>
   <div class="focus" id="focus"></div>
+  <div id="pings"></div>
   <div id="lanes"></div>
   <footer id="footer"></footer>
 </main>
 <div id="triage-modal-root"></div>
+<div id="ping-modal-root"></div>
 
 <script>
 const PRODUCTS = ['Android', 'Chrome', 'Google3', 'Flutter'];
@@ -4133,6 +4468,42 @@ function waitingOnHtml(it) {
   return people.length ? `Waiting on <b>${people.join(', ')}</b>` : '';
 }
 
+// Formats per-reviewer ping status for the row state column
+function reviewerPingInlineHtml(it) {
+  if (it.status === 'MERGED' || it.status === 'ABANDONED' || it.status === 'CLOSED') return '';
+  const pings = Array.isArray(it.reviewer_pings) ? it.reviewer_pings : [];
+  if (!pings.length) return '';
+  return pings.map(p => {
+    const who = link(actorUrl(it, p.reviewer), esc(shortActor(p.reviewer)));
+    const prev = p.prev_ps
+      ? `PS${esc(p.prev_ps)}→PS${esc(p.current_ps || it.patchset || 1)}`
+      : '';
+    const diffLink = (p.diff_url && prev) ? link(p.diff_url, prev) : prev;
+    let tag = '';
+    // Map each ping category to its badge and inter-patchset diff link
+    if (p.reason === 'lost_on_rebase') {
+      const extra = diffLink ? ' ' + diffLink : '';
+      tag = `<span class="badge ping-rebase">🔄 +1 lost on rebase${extra}</span>`;
+    } else if (p.reason === 'updated_after_approval') {
+      const extra = diffLink ? ' ' + diffLink : '';
+      tag = `<span class="badge ping-updated">📝 updated after +1${extra}</span>`;
+    } else if (p.reason === 'updated_after_review') {
+      const extra = diffLink ? ' ' + diffLink : '';
+      tag = `<span class="badge ping-updated">📝 updated after review${extra}</span>`;
+    } else if (p.reason === 'needs_second_approval') {
+      tag = `<span class="badge ping-second">⏳ needs 2nd +1</span>`;
+    } else {
+      tag = `<span class="badge ping-second">⏳ awaiting review</span>`;
+    }
+    // Flag reviewers dropped from Gerrit attention_set so they can be pinged directly
+    const offAtt = p.in_attention_set === false
+      ? `<span class="badge ping-off-att" ` +
+        `title="Not in Gerrit attention set">🔕 off attention</span>`
+      : '';
+    return `${tag}${offAtt} <b>${who}</b>`;
+  }).join(' · ');
+}
+
 // One plain-language line per row: what state the change is in and why
 function stateHtml(it) {
   const cr = it.cr_summary ? `CR ${esc(it.cr_summary)}` : '';
@@ -4168,10 +4539,12 @@ function stateHtml(it) {
     return `<span class="red">${link(FLUTTER_DASHBOARD_URL, 'flutter/flutter tree')} is red;` +
       ' landing waits for it</span>';
   }
+  // Surface per-reviewer ping status in the state column ahead of generic waiting labels
+  const pingNote = reviewerPingInlineHtml(it);
   if (st === 'watching') {
-    return [wipTag, compNote, review, gap].filter(Boolean).join(' · ') || 'Watching';
+    return [wipTag, compNote, pingNote, review, gap].filter(Boolean).join(' · ') || 'Watching';
   }
-  return [wipTag, compNote, waitingOnHtml(it) || 'In review', review, gap]
+  return [wipTag, compNote, pingNote || waitingOnHtml(it) || 'In review', review, gap]
     .filter(Boolean).join(' · ');
 }
 
@@ -4363,9 +4736,367 @@ function triageHtml(it, compact) {
     `<span class="triage-actions">${actions}</span></div>`;
 }
 
+// Tracks which (reviewer::item_key) pairs the user unchecked in the Reviewer Pings panel
+const excludedPingItems = {};
+
+function pingExclusionKey(reviewer, itemKey) {
+  return `${String(reviewer || '')}::${String(itemKey || '')}`;
+}
+
+function isPingItemIncluded(reviewer, itemKey) {
+  return !excludedPingItems[pingExclusionKey(reviewer, itemKey)];
+}
+
+function togglePingItem(reviewer, itemKey, checked) {
+  const k = pingExclusionKey(reviewer, itemKey);
+  if (checked === undefined) {
+    excludedPingItems[k] = !excludedPingItems[k];
+  } else {
+    excludedPingItems[k] = !checked;
+  }
+  if (typeof cachedData !== 'undefined' && cachedData && typeof render === 'function') {
+    render();
+  }
+  if (typeof currentPingModalReviewer !== 'undefined' && currentPingModalReviewer === reviewer) {
+    renderPingModal(reviewer);
+  }
+}
+
+const PING_REASON_ORDER = {
+  lost_on_rebase: 0,
+  updated_after_approval: 1,
+  updated_after_review: 2,
+  needs_second_approval: 3,
+  awaiting_review: 4,
+};
+
+// Aggregates open CLs/PRs by reviewer so one Chat ping covers all items for that colleague
+function collectReviewerPingGroups(items) {
+  const byRev = new Map();
+  for (const it of (items || [])) {
+    if (!it || it.status === 'MERGED' || it.status === 'ABANDONED' || it.status === 'CLOSED') {
+      continue;
+    }
+    const pings = Array.isArray(it.reviewer_pings) ? it.reviewer_pings : [];
+    for (const p of pings) {
+      if (!p || !p.reviewer || p.active === false) continue;
+      const rev = String(p.reviewer);
+      if (!byRev.has(rev)) {
+        byRev.set(rev, {
+          reviewer: rev,
+          reviewer_name: p.reviewer_name || shortActor(rev),
+          items: [],
+        });
+      }
+      const grp = byRev.get(rev);
+      const key = it.item_key || `${it.kind || 'gerrit'}:${it.target_id}`;
+      grp.items.push({
+        item: it,
+        item_key: key,
+        ping: p,
+        included: isPingItemIncluded(rev, key),
+      });
+    }
+  }
+  const groups = [...byRev.values()];
+  for (const g of groups) {
+    g.items.sort((a, b) => {
+      const oa = PING_REASON_ORDER[a.ping.reason] ?? 9;
+      const ob = PING_REASON_ORDER[b.ping.reason] ?? 9;
+      if (oa !== ob) return oa - ob;
+      return (b.item.activity_ts || 0) - (a.item.activity_ts || 0);
+    });
+  }
+  groups.sort((a, b) => {
+    const aRebase = a.items.filter(x => x.ping.reason === 'lost_on_rebase').length;
+    const bRebase = b.items.filter(x => x.ping.reason === 'lost_on_rebase').length;
+    if (aRebase !== bRebase) return bRebase - aRebase;
+    if (a.items.length !== b.items.length) return b.items.length - a.items.length;
+    return a.reviewer.localeCompare(b.reviewer);
+  });
+  return groups;
+}
+
+function reviewerFirstName(nameOrEmail) {
+  const raw = String(nameOrEmail || '').trim();
+  if (!raw) return 'there';
+  if (raw.includes('@')) {
+    const local = raw.split('@')[0].split(/[._-]/)[0] || raw.split('@')[0];
+    return local.charAt(0).toUpperCase() + local.slice(1);
+  }
+  return raw.split(/\s+/)[0];
+}
+
+// Builds a single ready-to-paste English ping message grouped by reason with PS diff URLs
+function buildReviewerPingMessage(reviewer, itemsOverride) {
+  const sourceItems = itemsOverride ||
+    (typeof cachedData !== 'undefined' && cachedData ? Object.values(cachedData.items || {}) : []);
+  const groups = collectReviewerPingGroups(sourceItems);
+  const grp = groups.find(g => g.reviewer === reviewer);
+  if (!grp) return '';
+  const selected = grp.items.filter(x => x.included);
+  if (!selected.length) return '';
+
+  const first = reviewerFirstName(grp.reviewer_name || grp.reviewer);
+  const count = selected.length;
+  const intro = count === 1
+    ? `Hi ${first}! When you have a moment, could you take a look at this CL?`
+    : `Hi ${first}! When you have a moment, could you take a look at these ${count} CLs?`;
+
+  const rebaseList = selected.filter(x => x.ping.reason === 'lost_on_rebase');
+  const updatedAfterPlusOne = selected.filter(x => x.ping.reason === 'updated_after_approval');
+  const updatedAfterReview = selected.filter(x => x.ping.reason === 'updated_after_review');
+  const secondApproval = selected.filter(
+    x => x.ping.reason === 'needs_second_approval' || x.ping.reason === 'awaiting_review'
+  );
+
+  const fmtBullet = (entry) => {
+    const it = entry.item;
+    const p = entry.ping;
+    const url = p.diff_url || it.url || '';
+    const subj = String(it.subject || '').trim();
+    const psNote = (p.prev_ps && p.current_ps && p.prev_ps < p.current_ps)
+      ? ` (PS${p.prev_ps} -> PS${p.current_ps})`
+      : '';
+    return `• ${url} — ${subj}${psNote}`;
+  };
+
+  const sections = [intro];
+  if (rebaseList.length) {
+    sections.push(
+      'Lost +1 after rebase (no code changes since your +1):\n' +
+      rebaseList.map(fmtBullet).join('\n')
+    );
+  }
+  if (updatedAfterPlusOne.length) {
+    sections.push(
+      'Updated since your +1:\n' +
+      updatedAfterPlusOne.map(fmtBullet).join('\n')
+    );
+  }
+  if (updatedAfterReview.length) {
+    sections.push(
+      'Updated since your review:\n' +
+      updatedAfterReview.map(fmtBullet).join('\n')
+    );
+  }
+  if (secondApproval.length) {
+    sections.push(
+      'Waiting for a second +1:\n' +
+      secondApproval.map(fmtBullet).join('\n')
+    );
+  }
+  return sections.join('\n\n');
+}
+
+async function copyTextToClipboard(text) {
+  if (!text) return false;
+  try {
+    if (typeof navigator !== 'undefined' &&
+        navigator.clipboard &&
+        navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (e) {
+    // Fall back to hidden textarea copy below
+  }
+  if (typeof document !== 'undefined') {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return Boolean(ok);
+    } catch (e) {
+      return false;
+    }
+  }
+  return false;
+}
+
+async function copyReviewerPing(reviewer, btn, customTextId) {
+  let text = '';
+  if (customTextId && typeof document !== 'undefined') {
+    const el = document.getElementById(customTextId);
+    if (el && typeof el.value === 'string') text = el.value;
+  }
+  if (!text) {
+    const shown = currentShownItems();
+    text = buildReviewerPingMessage(reviewer, shown);
+  }
+  if (!text) return;
+  const orig = btn ? btn.textContent : '';
+  const ok = await copyTextToClipboard(text);
+  if (btn) {
+    btn.textContent = ok ? '✓ Copied to clipboard!' : 'Copy failed';
+    setTimeout(() => { btn.textContent = orig; }, 1800);
+  }
+}
+
+function currentShownItems() {
+  const data = typeof cachedData !== 'undefined' ? cachedData : null;
+  if (!data || !data.items) return [];
+  const all = Object.values(data.items);
+  const projOf = it => it.project_name || 'Unassigned';
+  const sel = typeof selectedProject !== 'undefined' ? selectedProject : 'ALL';
+  return all.filter(it => sel === 'ALL' || projOf(it) === sel);
+}
+
+function pingReasonBadgeHtml(p, it) {
+  const cur = p.current_ps || it.patchset || 1;
+  const prev = p.prev_ps ? `PS${esc(p.prev_ps)} → PS${esc(cur)}` : '';
+  if (p.reason === 'lost_on_rebase') {
+    const extra = prev ? ` (${prev})` : '';
+    return `<span class="badge ping-rebase">🔄 +1 lost on rebase${extra}</span>`;
+  }
+  if (p.reason === 'updated_after_approval') {
+    const extra = prev ? ` (${prev})` : '';
+    return `<span class="badge ping-updated">📝 Updated after +1${extra}</span>`;
+  }
+  if (p.reason === 'updated_after_review') {
+    const extra = prev ? ` (${prev})` : '';
+    return `<span class="badge ping-updated">📝 Updated after review${extra}</span>`;
+  }
+  if (p.reason === 'needs_second_approval') {
+    return `<span class="badge ping-second">⏳ Needs 2nd +1 (PS${esc(cur)})</span>`;
+  }
+  return `<span class="badge ping-second">⏳ Awaiting review</span>`;
+}
+
+function renderPingsSection(shownItems) {
+  const groups = collectReviewerPingGroups(shownItems);
+  if (!groups.length) return '';
+  const totalCls = new Set();
+  for (const g of groups) {
+    for (const x of g.items) totalCls.add(x.item_key);
+  }
+  const cards = groups.map(g => {
+    const revJson = esc(JSON.stringify(g.reviewer));
+    const selectedCount = g.items.filter(x => x.included).length;
+    const nRebase = g.items.filter(x => x.ping.reason === 'lost_on_rebase').length;
+    const nUpdated = g.items.filter(
+      x => x.ping.reason === 'updated_after_approval' || x.ping.reason === 'updated_after_review'
+    ).length;
+    const nSecond = g.items.filter(
+      x => x.ping.reason === 'needs_second_approval' || x.ping.reason === 'awaiting_review'
+    ).length;
+    const summaryParts = [];
+    if (nRebase) summaryParts.push(`${nRebase} lost +1 on rebase`);
+    if (nUpdated) summaryParts.push(`${nUpdated} updated after review/+1`);
+    if (nSecond) summaryParts.push(`${nSecond} awaiting 2nd +1`);
+
+    const rows = g.items.map(x => {
+      const it = x.item;
+      const p = x.ping;
+      const keyJson = esc(JSON.stringify(x.item_key));
+      const offAtt = p.in_attention_set === false
+        ? `<span class="badge ping-off-att" ` +
+          `title="Reviewer is not in Gerrit attention set">🔕 off attention set</span>`
+        : '';
+      const diffLabel = (p.prev_ps && p.current_ps && p.prev_ps < p.current_ps)
+        ? `Diff PS${esc(p.prev_ps)}..${esc(p.current_ps)} ↗`
+        : `Open ${esc(clLabel(it))} ↗`;
+      const diffLink = link(p.diff_url || it.url, diffLabel, 'ping-diff');
+      return `
+        <label class="ping-row${x.included ? '' : ' excluded'}">
+          <input type="checkbox" ${x.included ? 'checked' : ''}
+            onchange="togglePingItem(${revJson}, ${keyJson}, this.checked)">
+          ${pingReasonBadgeHtml(p, it)}${offAtt}
+          <span class="meta"><span class="proj-tag">${esc(it.project_name)}</span> ·
+            <span class="cl">${link(it.url, esc(clLabel(it)))}</span></span>
+          <span class="ping-subj">${esc(cleanSubject(it.subject))}</span>
+          ${diffLink}
+        </label>`;
+    }).join('');
+
+    const copyDis = selectedCount === 0 ? ' disabled' : '';
+    const btnLabel = `📋 Copy Chat ping (${selectedCount} CL${selectedCount === 1 ? '' : 's'})`;
+    return `
+      <div class="ping-card">
+        <div class="ping-card-top">
+          <span class="ping-who">${esc(g.reviewer_name)} (${esc(shortActor(g.reviewer))})</span>
+          <span class="ping-counts">${esc(summaryParts.join(' · '))}</span>
+          <div class="ping-actions">
+            <button class="triage-btn" onclick="openPingModal(${revJson})">Preview / Edit</button>
+            <button class="triage-btn primary"${copyDis}
+              onclick="copyReviewerPing(${revJson}, this)">${btnLabel}</button>
+          </div>
+        </div>
+        <div class="ping-list">${rows}</div>
+      </div>`;
+  }).join('');
+
+  return `
+    <section class="pings-wrap">
+      <div class="pings-head">
+        <h3>Reviewer Pings</h3>
+        <span class="n">${totalCls.size} CL${totalCls.size === 1 ? '' : 's'} · ` +
+          `${groups.length} reviewer${groups.length === 1 ? '' : 's'}</span>
+        <span class="hint">Lost +1 on rebase, updated after +1, or waiting for 2nd approval — ` +
+          `copy one message per reviewer</span>
+      </div>
+      ${cards}
+    </section>`;
+}
+
+let currentPingModalReviewer = null;
+
+function openPingModal(reviewer) {
+  currentPingModalReviewer = reviewer;
+  renderPingModal(reviewer);
+}
+
+function closePingModal() {
+  currentPingModalReviewer = null;
+  const root = typeof document !== 'undefined'
+    ? document.getElementById('ping-modal-root') : null;
+  if (root) root.innerHTML = '';
+}
+
+function renderPingModal(reviewer) {
+  const root = typeof document !== 'undefined'
+    ? document.getElementById('ping-modal-root') : null;
+  if (!root) return;
+  const shown = currentShownItems();
+  const msg = buildReviewerPingMessage(reviewer, shown);
+  const revJson = esc(JSON.stringify(reviewer));
+  root.innerHTML = `
+    <div class="triage-modal-backdrop" onclick="if (event.target === this) closePingModal()">
+      <div class="triage-modal">
+        <div class="triage-modal-head">
+          <h3>Ping message for ${esc(reviewer)}</h3>
+          <button class="triage-modal-close" onclick="closePingModal()" title="Close">✕</button>
+        </div>
+        <div class="triage-modal-body">
+          <textarea id="ping-modal-textarea" class="triage-pre"
+            style="width: 100%; min-height: 220px; border: 1px solid var(--hairline); ` +
+            `resize: vertical;">${esc(msg)}</textarea>
+        </div>
+        <div class="triage-modal-tabs" style="padding: 12px 20px; ` +
+          `border-top: 1px solid var(--hairline); border-bottom: 0;">
+          <span class="triage-meta">Edit the message if needed, ` +
+            `or toggle CL checkboxes in the card behind.</span>
+          <button class="triage-btn primary" style="margin-left: auto;"
+            onclick="copyReviewerPing(${revJson}, this, 'ping-modal-textarea')">
+            📋 Copy to clipboard
+          </button>
+        </div>
+      </div>
+    </div>`;
+}
+
 if (typeof document !== 'undefined') {
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') closeTriageModal();
+    // Escape dismisses whichever modal is open
+    if (e.key === 'Escape') {
+      closeTriageModal();
+      closePingModal();
+    }
   });
 }
 
@@ -4529,6 +5260,10 @@ function render() {
   document.getElementById('subline').textContent = sub.length ? `${sub.join(' · ')}.` : '';
 
   document.getElementById('focus').innerHTML = by.you.map(it => focusCard(it, data)).join('');
+
+  // Render grouped reviewer ping cards between Needs You and the status lanes
+  const pingsEl = document.getElementById('pings');
+  if (pingsEl) pingsEl.innerHTML = renderPingsSection(shown);
 
   let lanes = LANES.filter(l => by[l.id].length).map(l =>
     `<section class="lane"><div class="lane-head"><h3>${l.title}</h3>` +
