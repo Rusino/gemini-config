@@ -735,6 +735,14 @@ console.log(JSON.stringify({
             "label": "CL 1410416",
             "url": "https://skia-review.googlesource.com/c/1410416",
             "is_wip": True,
+            "status": "NEW",
+            "patchset": 2,
+            "base_ps": 0,
+            "companion_state": "active",
+            "ready_to_abandon": False,
+            "ready_to_abandon_reason": "",
+            "companion_duplicate": False,
+            "companion_status_note": "Waiting on author",
         }],
     )
 
@@ -930,10 +938,13 @@ console.log(JSON.stringify({
     self.assertIn("Needs +1 reviewer (1/2)", out["parentState"])
     self.assertIn('<span class="badge wip">WIP</span>', out["compRow"])
     self.assertIn("Companion → CL 1409697", out["compRow"])
-    self.assertIn("No reviewers assigned", out["compState"])
+    self.assertNotIn("No reviewers assigned", out["compState"])
+    self.assertIn("Companion to CL 1409697", out["compState"])
+    self.assertIn("Waiting on author", out["compState"])
+    self.assertIn("🗑️ Abandon", out["compState"])
     self.assertIn('<span class="badge wip">WIP</span>', out["compCard"])
     self.assertIn("Companion → CL 1409697", out["compCard"])
-    self.assertIn("No reviewers assigned", out["compCard"])
+    self.assertNotIn("No reviewers assigned", out["compCard"])
 
 
   def test_skoretext_stack_and_stale_merged_related_cls_stay_in_skoretext(self):

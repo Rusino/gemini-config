@@ -1018,6 +1018,7 @@ def link_companion_changes_to_parent_chats(
     ikey = d.get("item_key", "")
     info = fetched_cache.get(ikey) or {}
     subj = str(info.get("subject") or d.get("title") or "")
+    d_is_self = bool(info.get("is_self", False))
     parent: dict[str, Any] | None = None
     parent_key = ""
     is_comp = False
@@ -1029,7 +1030,7 @@ def link_companion_changes_to_parent_chats(
           or GERRIT_SKIA_HOST
       )
       m_cl = RE_COMPANION_CL_REF.search(subj)
-      if m_cl:
+      if m_cl and d_is_self:
         cand_key = f"gerrit:{m_cl.group(1)}"
         parent = known_chats.get(cand_key) or by_item_key.get(cand_key)
         parent_key = cand_key
@@ -1046,16 +1047,18 @@ def link_companion_changes_to_parent_chats(
           if str(rel_info.get("status") or "").upper() in ("MERGED", "ABANDONED"):
             continue
           rel_is_self = bool(rel_info.get("is_self", False))
-          # A companion stacks on a non-self CL or is marked WIP/Draft/companion
+          # A companion stacks on a non-self CL or carries explicit companion markers in its subject
           is_candidate_comp = (
-              (not rel_is_self)
-              or bool(info.get("is_wip") or info.get("is_draft"))
-              or ("companion" in subj.lower())
+              d_is_self
+              and (not rel_is_self or "companion" in subj.lower())
           )
-          # Self feature stacks inherit the shared chat without being labeled companions
+          # Prevent cyclic A <-> B companion links
+          if cand_parent.get("companion_to") == ikey:
+            is_candidate_comp = False
+          # Multi-CL stacks inherit the shared chat without being labeled companions
           if not d.get("conversation_id") and cand_parent.get("conversation_id"):
             parent = cand_parent
-            parent_key = cand_key
+            parent_key = cand_key if is_candidate_comp else ""
             is_comp = is_candidate_comp
             break
           if is_candidate_comp:
@@ -1064,10 +1067,14 @@ def link_companion_changes_to_parent_chats(
             is_comp = True
             break
     elif d.get("kind") == "github":
-      m = RE_COMPANION_PR_REF.search(subj)
-      branch_m = RE_COMPANION_BRANCH.match(str(info.get("head_ref_name") or ""))
+      m = RE_COMPANION_PR_REF.search(subj) or RE_COMPANION_PR_REF.search(
+          str(info.get("commit_message") or "")
+      )
+      branch_m = RE_COMPANION_BRANCH.match(
+          str(info.get("head_ref") or info.get("head_ref_name") or "")
+      )
       ref_id = m.group(1) if m else (branch_m.group(1) if branch_m else "")
-      if ref_id:
+      if ref_id and d_is_self:
         cand_key = f"github:{ref_id}"
         parent = known_chats.get(cand_key) or by_item_key.get(cand_key)
         parent_key = cand_key
@@ -2465,6 +2472,17 @@ def fetch_gerrit_cl_status(
       revs = d.get("revisions") or {}
       cur_rev = revs.get(cur_sha) or {}
       ps_num = int(cur_rev.get("_number") or 1)
+      cur_parents = ((cur_rev.get("commit") or {}).get("parents")) or []
+      parent_commit = (
+          str(cur_parents[0].get("commit") or "")
+          if cur_parents and isinstance(cur_parents[0], dict)
+          else ""
+      )
+      revision_ps_by_sha = {
+          str(sha): int(r.get("_number") or 0)
+          for sha, r in revs.items()
+          if isinstance(r, dict) and r.get("_number")
+      }
       commit_msg = str(((cur_rev.get("commit") or {}).get("message")) or "")
       files_dict = cur_rev.get("files") or {}
       files = sorted(str(f) for f in files_dict.keys() if f != "/COMMIT_MSG")
@@ -2632,6 +2650,20 @@ def fetch_gerrit_cl_status(
       merge_conflict = status == "NEW" and not gerrit_mergeable(host, cl_id)
 
       messages = d.get("messages") or []
+      self_approval_ps = 0
+      for m in messages:
+        if not isinstance(m, dict):
+          continue
+        m_email = str(((m.get("author") or {}).get("email")) or "")
+        if m_email not in SELF_EMAILS:
+          continue
+        m_txt = str(m.get("message") or "")
+        if "Code-Review+1" in m_txt or "Code-Review+2" in m_txt:
+          self_approval_ps = int(m.get("_revision_number") or ps_num)
+        elif "-Code-Review" in m_txt or "Code-Review-1" in m_txt:
+          self_approval_ps = 0
+      if self_cr_vote > 0 and self_approval_ps == 0:
+        self_approval_ps = ps_num
       last_msg = messages[-1] if messages else {}
       last_msg_author = str(((last_msg.get("author") or {}).get("email")) or "bot")
       last_msg_date = str(last_msg.get("date") or "")
@@ -2815,6 +2847,11 @@ def fetch_gerrit_cl_status(
           "reviewer_status": reviewer_status,
           # Per-reviewer ping entries for lost +1s and missing 2nd approvals
           "reviewer_pings": reviewer_pings,
+          "self_cr_vote": self_cr_vote,
+          "self_approved": bool(self_cr_vote > 0),
+          "self_approval_ps": self_approval_ps,
+          "parent_commit": parent_commit,
+          "revision_ps_by_sha": revision_ps_by_sha,
           "patchset": ps_num,
           "revision": cur_sha,
           "commit_message": commit_msg,
@@ -3416,6 +3453,7 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         "role": role,
         "is_self": is_self,
         "is_external": not is_self,
+        "self_approved": self_approved,
         "is_draft": is_draft,
         "is_wip": is_wip,
         "wip_label": wip_label,
@@ -3816,6 +3854,10 @@ def _discover_existing_chat_for_item(
 
   # Reuse parent chat for companion Gerrit CLs or GitHub PRs when candidates exist
   parent_keys: list[str] = []
+  rec_is_self = (
+      True if not rec or "is_self" not in rec else bool(rec.get("is_self"))
+  )
+  is_companion_ref = False
   if by_key and ikey.startswith("gerrit:"):
     tid = ikey.split(":", 1)[1]
     host = str(
@@ -3823,21 +3865,42 @@ def _discover_existing_chat_for_item(
         or (rec or {}).get("preferred_host")
         or GERRIT_SKIA_HOST
     )
-    parent_keys = [
-        f"gerrit:{rel_id}" for rel_id in fetch_gerrit_related_cl_ids(host, tid)
-    ]
+    subj = str((rec or {}).get("subject") or (rec or {}).get("title") or "")
+    m_cl = RE_COMPANION_CL_REF.search(subj)
+    if m_cl and rec_is_self:
+      parent_keys = [f"gerrit:{m_cl.group(1)}"]
+      is_companion_ref = True
+    else:
+      parent_keys = [
+          f"gerrit:{rel_id}" for rel_id in fetch_gerrit_related_cl_ids(host, tid)
+      ]
+      is_companion_ref = rec_is_self and ("companion" in subj.lower())
   elif by_key and ikey.startswith("github:"):
     subj = str((rec or {}).get("subject") or (rec or {}).get("title") or "")
+    head_ref = str(
+        (rec or {}).get("head_ref") or (rec or {}).get("head_ref_name") or ""
+    )
     m = RE_COMPANION_PR_REF.search(subj)
-    if m:
-      parent_keys = [f"github:{m.group(1)}"]
+    branch_m = RE_COMPANION_BRANCH.match(head_ref)
+    ref_id = m.group(1) if m else (branch_m.group(1) if branch_m else "")
+    if ref_id and rec_is_self:
+      parent_keys = [f"github:{ref_id}"]
+      is_companion_ref = True
   for parent_key in parent_keys:
     parent = by_key.get(parent_key)
     if parent:
+      comp_key = (
+          parent_key
+          if (
+              is_companion_ref
+              or (rec_is_self and not bool(parent.get("is_self", False)))
+          )
+          else ""
+      )
       return (
           str(parent["conversation_id"]),
           bool(parent.get("chat_archived")),
-          parent_key,
+          comp_key,
       )
 
   if cand:
@@ -4189,6 +4252,509 @@ def rebase_item(item_key: str) -> dict[str, Any]:
   state["events"] = events[:50]
   save_watcher_state(state)
   return res
+
+
+def _get_gerrit_bearer_token(host: str) -> str:
+  """Obtains Gerrit Bearer token from git-credential-luci for `host`."""
+  try:
+    proc = subprocess.run(
+        ["git-credential-luci", "get"],
+        input=f"protocol=https\nhost={host}\n\n",
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    for line in proc.stdout.splitlines():
+      if line.startswith("password="):
+        return line.split("=", 1)[1].strip()
+  except (OSError, subprocess.SubprocessError):
+    pass
+  return ""
+
+
+def fetch_gerrit_companion_threads(
+    host: str,
+    parent_cl_id: str,
+    companion_cl_ids: list[str],
+    *,
+    skia_dir: str = DEFAULT_SKIA_DIR,
+) -> dict[str, dict[str, Any]]:
+  """Inspects comment threads on parent Gerrit CL mentioning companion CL IDs."""
+  if not companion_cl_ids or not parent_cl_id or skia_dir == "/nonexistent":
+    return {}
+  url = f"https://{host}/changes/{parent_cl_id}/comments"
+  req = urllib.request.Request(
+      url, headers={"User-Agent": "flight-deck-cl-watcher/1.0"}
+  )
+  try:
+    with urllib.request.urlopen(req, timeout=8) as resp:
+      raw = resp.read().decode("utf-8", errors="replace")
+    if raw.startswith(")]}'"):
+      raw = raw.split("\n", 1)[1]
+    comments_by_path = json.loads(raw)
+  except (OSError, urllib.error.URLError, ValueError, TimeoutError):
+    return {}
+
+  if not isinstance(comments_by_path, dict):
+    return {}
+
+  # Collect all comments and map each comment ID to its root thread ID
+  all_comments: list[dict[str, Any]] = []
+  parent_of: dict[str, str] = {}
+  for path, clist in comments_by_path.items():
+    if not isinstance(clist, list):
+      continue
+    for c in clist:
+      if not isinstance(c, dict):
+        continue
+      cid = str(c.get("id") or "")
+      if not cid:
+        continue
+      c_copy = dict(c)
+      c_copy["_path"] = str(path)
+      all_comments.append(c_copy)
+      in_reply = str(c.get("in_reply_to") or "")
+      if in_reply:
+        parent_of[cid] = in_reply
+
+  def get_root(cid: str) -> str:
+    visited = set()
+    curr = cid
+    while curr in parent_of and curr not in visited:
+      visited.add(curr)
+      curr = parent_of[curr]
+    return curr
+
+  threads_by_root: dict[str, list[dict[str, Any]]] = {}
+  for c in all_comments:
+    cid = str(c.get("id") or "")
+    root = get_root(cid)
+    threads_by_root.setdefault(root, []).append(c)
+
+  # Sort comments in each thread chronologically by updated time and patchset
+  for t in threads_by_root.values():
+    t.sort(
+        key=lambda x: (
+            str(x.get("updated") or ""),
+            int(x.get("patch_set") or 0),
+        )
+    )
+
+  out: dict[str, dict[str, Any]] = {}
+  for comp_id in companion_cl_ids:
+    comp_str = str(comp_id)
+    pat = re.compile(rf"\b{re.escape(comp_str)}\b")
+    matching_threads: list[list[dict[str, Any]]] = []
+    unresolved_leaves: list[dict[str, Any]] = []
+
+    for t in threads_by_root.values():
+      if any(pat.search(str(c.get("message") or "")) for c in t):
+        matching_threads.append(t)
+        leaf = t[-1]
+        if bool(leaf.get("unresolved", False)):
+          unresolved_leaves.append({
+              "id": str(leaf.get("id") or ""),
+              "path": str(leaf.get("_path") or "/PATCHSET_LEVEL"),
+              "patch_set": int(leaf.get("patch_set") or 1),
+              "line": leaf.get("line"),
+          })
+
+    mentioned = bool(matching_threads)
+    out[comp_str] = {
+        "mentioned": mentioned,
+        "all_resolved": mentioned and not unresolved_leaves,
+        "any_unresolved": bool(unresolved_leaves),
+        "unresolved_leaves": unresolved_leaves,
+    }
+  return out
+
+
+def resolve_gerrit_companion_threads(
+    host: str,
+    parent_cl_id: str,
+    companion_cl_id: str,
+    token: str = "",
+) -> dict[str, Any]:
+  """Resolves only the comment threads mentioning companion_cl_id on parent Gerrit CL."""
+  thread_info = fetch_gerrit_companion_threads(
+      host, parent_cl_id, [companion_cl_id], skia_dir=""
+  )
+  info = thread_info.get(str(companion_cl_id)) or {}
+  leaves = info.get("unresolved_leaves") or []
+  if not leaves:
+    return {"ok": True, "resolved_count": 0}
+
+  bearer = token or _get_gerrit_bearer_token(host)
+  if not bearer:
+    return {"ok": False, "error": f"No Gerrit credential for {host}"}
+
+  # Build review payload responding to each unresolved leaf comment with unresolved: False
+  by_path: dict[str, list[dict[str, Any]]] = {}
+  for leaf in leaves:
+    p = str(leaf.get("path") or "/PATCHSET_LEVEL")
+    comment_payload: dict[str, Any] = {
+        "in_reply_to": leaf["id"],
+        "message": "Abandoned companion WIP CL.",
+        "unresolved": False,
+    }
+    if leaf.get("line"):
+      comment_payload["line"] = leaf["line"]
+    by_path.setdefault(p, []).append(comment_payload)
+
+  review_url = f"https://{host}/a/changes/{parent_cl_id}/revisions/current/review"
+  req_body = json.dumps({"comments": by_path, "notify": "NONE"}).encode("utf-8")
+  req = urllib.request.Request(
+      review_url,
+      data=req_body,
+      headers={
+          "Authorization": f"Bearer {bearer}",
+          "Content-Type": "application/json; charset=UTF-8",
+          "User-Agent": "flight-deck-cl-watcher/1.0",
+      },
+      method="POST",
+  )
+  try:
+    with urllib.request.urlopen(req, timeout=10) as resp:
+      resp.read()
+    return {"ok": True, "resolved_count": len(leaves)}
+  except (OSError, urllib.error.URLError, TimeoutError) as exc:
+    return {"ok": False, "error": str(exc), "resolved_count": 0}
+
+
+def abandon_companion_items(
+    item_keys: list[str], reason: str = ""
+) -> dict[str, Any]:
+  """Abandons companion CLs or PRs and resolves parent Gerrit review comments."""
+  state = load_watcher_state()
+  items = state.get("items") or {}
+  events = state.get("events") or []
+  abandoned: list[str] = []
+  errors: list[str] = []
+  resolved_total = 0
+
+  for ikey in item_keys:
+    ikey = str(ikey).strip()
+    if not ikey:
+      continue
+    # Find matching record(s) in state
+    matching_entries = [
+        (k, v)
+        for k, v in items.items()
+        if isinstance(v, dict)
+        and (v.get("item_key") == ikey or k.startswith(f"{ikey}@") or k == ikey)
+    ]
+    if not matching_entries:
+      errors.append(f"{ikey}: not found in state")
+      continue
+
+    rec = matching_entries[0][1]
+    if not rec.get("is_self"):
+      errors.append(f"{ikey}: cannot abandon external author's change")
+      continue
+
+    kind = str(rec.get("kind") or "")
+    tid = str(rec.get("target_id") or "")
+    host = str(rec.get("host") or GERRIT_SKIA_HOST)
+    parent_key = str(rec.get("companion_to") or "")
+
+    if kind == "gerrit":
+      bearer = _get_gerrit_bearer_token(host)
+      if not bearer:
+        errors.append(f"{ikey}: no Gerrit credential for {host}")
+        continue
+      url = f"https://{host}/a/changes/{tid}/abandon"
+      body = json.dumps(
+          {"message": reason or "Abandoning companion WIP CL."}
+      ).encode("utf-8")
+      req = urllib.request.Request(
+          url,
+          data=body,
+          headers={
+              "Authorization": f"Bearer {bearer}",
+              "Content-Type": "application/json; charset=UTF-8",
+              "User-Agent": "flight-deck-cl-watcher/1.0",
+          },
+          method="POST",
+      )
+      try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+          resp.read()
+      except urllib.error.HTTPError as h_err:
+        # HTTP 409 means the change is already abandoned
+        if h_err.code != 409:
+          errors.append(f"{ikey}: HTTP {h_err.code} abandon failed")
+          continue
+      except (OSError, urllib.error.URLError, TimeoutError) as exc:
+        errors.append(f"{ikey}: abandon request failed ({exc})")
+        continue
+
+      # Automatically resolve the companion comment thread on parent Gerrit CL
+      if parent_key.startswith("gerrit:"):
+        parent_tid = parent_key.split(":", 1)[1]
+        res_comments = resolve_gerrit_companion_threads(
+            host, parent_tid, tid, token=bearer
+        )
+        resolved_total += int(res_comments.get("resolved_count") or 0)
+
+    elif kind == "github":
+      cmd = [
+          "gh", "pr", "close", tid, "--repo", "flutter/flutter", "--delete-branch"
+      ]
+      proc = subprocess.run(
+          cmd, capture_output=True, text=True, timeout=15, check=False
+      )
+      if proc.returncode != 0:
+        cmd_fallback = ["gh", "pr", "close", tid, "--repo", "flutter/flutter"]
+        proc2 = subprocess.run(
+            cmd_fallback, capture_output=True, text=True, timeout=15, check=False
+        )
+        if proc2.returncode != 0:
+          err_msg = proc2.stderr.strip() or proc.stderr.strip()
+          errors.append(f"{ikey}: gh pr close failed: {err_msg}")
+          continue
+    else:
+      errors.append(f"{ikey}: unsupported platform {kind}")
+      continue
+
+    # Update companion record status in state
+    now_iso = datetime.now(timezone.utc).isoformat()
+    et_str, age_str = format_et_and_age(now_iso)
+    for _, m_rec in matching_entries:
+      m_rec["status"] = "ABANDONED" if kind == "gerrit" else "CLOSED"
+      m_rec["phase"] = "ABANDONED"
+      m_rec["in_my_attention"] = False
+      m_rec["ready_to_abandon"] = False
+      m_rec["companion_state"] = "abandoned"
+      m_rec["companion_duplicate"] = False
+      m_rec["status_changed_raw"] = now_iso
+      m_rec["status_changed_et"] = et_str
+      m_rec["status_changed_age"] = age_str
+
+    # Update parent record companions list
+    if parent_key:
+      for p_rec in items.values():
+        if isinstance(p_rec, dict) and p_rec.get("item_key") == parent_key:
+          p_rec["companions"] = [
+              c
+              for c in p_rec.get("companions", [])
+              if isinstance(c, dict) and c.get("item_key") != ikey
+          ]
+
+    abandoned.append(ikey)
+    events.insert(
+        0,
+        {
+            "id": f"ev-{int(time.time() * 1000)}-{tid}",
+            "time": now_et_str(),
+            "item_key": ikey,
+            "target_id": tid,
+            "conversation_id": rec.get("conversation_id", ""),
+            "project_name": str(rec.get("project_name") or "Unassigned"),
+            "critical": False,
+            "message": (
+                f"[FLIGHT-DECK] 🗑️ Abandoned companion {ikey} "
+                f"('{rec.get('subject') or ikey}')."
+            ),
+        },
+    )
+
+  state["events"] = events[:50]
+  save_watcher_state(state)
+  return {
+      "ok": len(errors) == 0,
+      "abandoned": abandoned,
+      "resolved_threads": resolved_total,
+      "errors": errors,
+  }
+
+
+def compute_companion_states(
+    new_items: dict[str, Any], *, skia_dir: str = DEFAULT_SKIA_DIR
+) -> None:
+  """Suppresses companion noise, computes ready-to-abandon triggers, and deduplicates."""
+  by_ikey: dict[str, list[dict[str, Any]]] = {}
+  for rec in new_items.values():
+    if isinstance(rec, dict) and rec.get("item_key"):
+      by_ikey.setdefault(str(rec["item_key"]), []).append(rec)
+
+  # Suppress author-centric noise on all companion records
+  for rec in new_items.values():
+    if not isinstance(rec, dict) or not rec.get("companion_to"):
+      continue
+    rec["is_companion"] = True
+    rec["merge_conflict"] = False
+    rec["missing_reviewers_to_assign"] = 0
+    rec["missing_approvals"] = 0
+    rec["reviewer_status"] = ""
+    rec["reviewer_pings"] = []
+    rec["cq_failed"] = False
+    rec["tree_red"] = False
+    rec["is_draft"] = False
+    rec["in_development"] = False
+    rec["is_watching"] = False
+    if str(rec.get("status") or "").upper() in ("NEW", "OPEN"):
+      rec["in_my_attention"] = False
+      rec["phase"] = "WAITING_ON_OTHERS"
+      rec["companion_state"] = "active"
+      rec["ready_to_abandon"] = False
+      rec["ready_to_abandon_reason"] = ""
+      rec["companion_duplicate"] = False
+    else:
+      rec["companion_state"] = "abandoned"
+      rec["ready_to_abandon"] = False
+      rec["ready_to_abandon_reason"] = ""
+      rec["companion_duplicate"] = False
+
+  # Group companions by parent item key
+  comps_by_parent: dict[str, list[dict[str, Any]]] = {}
+  for rec in new_items.values():
+    if isinstance(rec, dict) and rec.get("companion_to"):
+      comps_by_parent.setdefault(str(rec["companion_to"]), []).append(rec)
+
+  for parent_key, comp_recs in comps_by_parent.items():
+    parent_recs = by_ikey.get(parent_key) or []
+    parent_rec = parent_recs[0] if parent_recs else {}
+    parent_status = str(parent_rec.get("status") or "").upper()
+    parent_self_approved = bool(parent_rec.get("self_approved", False))
+    parent_approval_ps = int(
+        parent_rec.get("self_approval_ps")
+        or parent_rec.get("patchset")
+        or 0
+    )
+    parent_revs = parent_rec.get("revision_ps_by_sha") or {}
+
+    # Map open companions by unique item_key
+    open_comps_by_ikey: dict[str, list[dict[str, Any]]] = {}
+    for r in comp_recs:
+      if str(r.get("status") or "").upper() in ("NEW", "OPEN"):
+        open_comps_by_ikey.setdefault(str(r.get("item_key") or ""), []).append(r)
+        base_ps = int(parent_revs.get(str(r.get("parent_commit") or ""), 0))
+        r["companion_base_ps"] = base_ps
+
+    thread_map: dict[str, dict[str, Any]] = {}
+    if parent_key.startswith("gerrit:") and open_comps_by_ikey:
+      p_host = str(
+          parent_rec.get("host")
+          or comp_recs[0].get("host")
+          or GERRIT_SKIA_HOST
+      )
+      p_tid = parent_key.split(":", 1)[1]
+      target_ids = [
+          r_list[0].get("target_id", "")
+          for r_list in open_comps_by_ikey.values()
+          if r_list[0].get("target_id")
+      ]
+      thread_map = fetch_gerrit_companion_threads(
+          p_host, p_tid, target_ids, skia_dir=skia_dir
+      )
+
+    # Evaluate deterministic ready-to-abandon triggers
+    for ikey, r_list in open_comps_by_ikey.items():
+      r0 = r_list[0]
+      tid = str(r0.get("target_id") or "")
+      t_info = thread_map.get(tid) or {}
+      mentioned = bool(t_info.get("mentioned", False))
+      all_resolved = bool(t_info.get("all_resolved", False))
+      base_ps = int(r0.get("companion_base_ps") or 0)
+      p_label = str(r0.get("companion_to_label") or parent_key)
+      reason = ""
+
+      if parent_status in ("MERGED", "ABANDONED", "CLOSED"):
+        reason = f"Parent {p_label} is {parent_status.lower()}"
+      elif parent_self_approved and (base_ps == 0 or parent_approval_ps >= base_ps):
+        ps_sfx = f" (PS{parent_approval_ps})" if parent_approval_ps else ""
+        reason = f"You approved {p_label}{ps_sfx}"
+      elif all_resolved:
+        reason = f"Companion thread resolved on {p_label}"
+
+      for r in r_list:
+        r["companion_mentioned"] = mentioned
+        r["companion_thread_resolved"] = all_resolved
+        r["ready_to_abandon"] = bool(reason)
+        r["ready_to_abandon_reason"] = reason
+
+    # Deduplicate multiple open companions for the same parent change
+    if len(open_comps_by_ikey) > 1:
+      def comp_rank_key(k: str) -> tuple[int, int, float, int]:
+        first_r = open_comps_by_ikey[k][0]
+        ment = 1 if first_r.get("companion_mentioned") else 0
+        bps = int(first_r.get("companion_base_ps") or 0)
+        act = float(first_r.get("activity_ts") or 0.0)
+        tid_str = str(first_r.get("target_id") or "")
+        tid_int = int(tid_str) if tid_str.isdigit() else 0
+        return (ment, bps, act, tid_int)
+
+      sorted_keys = sorted(
+          open_comps_by_ikey.keys(), key=comp_rank_key, reverse=True
+      )
+      canonical_key = sorted_keys[0]
+      can_r0 = open_comps_by_ikey[canonical_key][0]
+      can_label = (
+          f"CL {can_r0.get('target_id')}"
+          if can_r0.get("kind") == "gerrit"
+          else f"PR #{can_r0.get('target_id')}"
+      )
+      for dup_key in sorted_keys[1:]:
+        for r in open_comps_by_ikey[dup_key]:
+          r["companion_duplicate"] = True
+          r["companion_superseded_by"] = can_label
+          r["ready_to_abandon"] = True
+          if not r.get("ready_to_abandon_reason"):
+            r["ready_to_abandon_reason"] = (
+                f"Duplicate companion (superseded by {can_label})"
+            )
+
+    # Route ready-to-abandon companions to Needs You and build plain-text status note
+    for r in comp_recs:
+      if str(r.get("status") or "").upper() in ("NEW", "OPEN"):
+        if r.get("ready_to_abandon"):
+          r["companion_state"] = (
+              "duplicate" if r.get("companion_duplicate") else "ready_to_abandon"
+          )
+          r["in_my_attention"] = True
+          r["phase"] = "NEEDS_YOUR_ACTION"
+        else:
+          r["companion_state"] = "active"
+        if r.get("ready_to_abandon_reason"):
+          r["companion_status_note"] = str(r["ready_to_abandon_reason"])
+        elif r.get("companion_base_ps"):
+          r["companion_status_note"] = (
+              f"Stacked on PS{r['companion_base_ps']} · waiting on author"
+          )
+        else:
+          r["companion_status_note"] = "Waiting on author"
+
+    # Synchronize enriched metadata onto the parent record's companions list
+    for p_rec in parent_recs:
+      # Exclude abandoned or closed companions from parent view
+      active_comps = [
+          c
+          for c in p_rec.get("companions", [])
+          if isinstance(c, dict)
+          and c.get("status") not in ("ABANDONED", "CLOSED")
+      ]
+      for c in active_comps:
+        matching_r = next(
+            (r for r in comp_recs if r.get("item_key") == c.get("item_key")),
+            None,
+        )
+        if matching_r:
+          c["status"] = matching_r.get("status", "")
+          c["patchset"] = matching_r.get("patchset", 1)
+          c["base_ps"] = matching_r.get("companion_base_ps", 0)
+          c["companion_state"] = matching_r.get("companion_state", "active")
+          c["ready_to_abandon"] = matching_r.get("ready_to_abandon", False)
+          c["ready_to_abandon_reason"] = matching_r.get(
+              "ready_to_abandon_reason", ""
+          )
+          c["companion_duplicate"] = matching_r.get(
+              "companion_duplicate", False
+          )
+          c["companion_status_note"] = matching_r.get(
+              "companion_status_note", ""
+          )
+      p_rec["companions"] = active_comps
 
 
 def sync_once(
@@ -4652,6 +5218,9 @@ def sync_once(
       ):
         c_list.append(comp_entry)
 
+  # Suppress noise, calculate ready-to-abandon triggers, and deduplicate companions
+  compute_companion_states(new_items, skia_dir=skia_dir)
+
   for rec in new_items.values():
     if not isinstance(rec, dict):
       continue
@@ -5029,6 +5598,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .triage-btn.primary {
     border-color: color-mix(in srgb, var(--blue) 35%, transparent); color: var(--blue);
   }
+  .triage-btn.danger, .btn.danger {
+    border-color: color-mix(in srgb, var(--red) 45%, transparent);
+    background: color-mix(in srgb, var(--red) 12%, transparent);
+    color: var(--red);
+  }
+  .companion-banner {
+    margin-top: 8px; padding: 8px 12px; border-radius: 10px;
+    background: color-mix(in srgb, var(--ink) 4.5%, transparent);
+    font-size: 13.5px; line-height: 1.45; color: var(--ink);
+    display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px;
+  }
+  .row .companion-banner {
+    margin-top: 5px; padding: 5px 9px; font-size: 12.5px;
+  }
   .triage-modal-backdrop {
     position: fixed; inset: 0; z-index: 100;
     background: rgba(0, 0, 0, 0.45); backdrop-filter: blur(4px);
@@ -5369,6 +5952,57 @@ function fixesBreakageBannerHtml(it) {
   return `<div class="fix-banner">Fixes breakage from → ${refLink}${botsPart}</div>`;
 }
 
+// Renders an inline or card button that triggers two-click companion abandon
+function abandonActionHtml(itemKeys, label, cls) {
+  const keys = Array.isArray(itemKeys) ? itemKeys : [itemKeys];
+  const valid = keys.filter(Boolean);
+  if (!valid.length) return '';
+  const keysJson = esc(JSON.stringify(valid));
+  const btnCls = cls || 'triage-btn';
+  const text = esc(label || '🗑️ Abandon');
+  return `<button class="${btnCls}" onclick="abandonCompanions(${keysJson}, this)">` +
+    `${text}</button>`;
+}
+
+// Renders active companions on the parent CL card/row with state badges and abandon actions
+function companionsBannerHtml(it) {
+  const comps = (Array.isArray(it.companions) ? it.companions : [])
+    .filter(c => c && c.label && c.status !== 'ABANDONED' && c.status !== 'CLOSED');
+  if (!comps.length) return '';
+  const itemsHtml = comps.map(c => {
+    const cLink = c.url ? link(c.url, `<b>${esc(c.label)}</b>`) : `<b>${esc(c.label)}</b>`;
+    const stateBadge = c.companion_duplicate
+      ? `<span class="badge warn">⚠️ Duplicate</span>`
+      : (c.ready_to_abandon ? `<span class="badge has-fix">✅ Ready to abandon</span>` : '');
+    const note = c.companion_status_note
+      ? ` <span class="triage-meta">(${esc(c.companion_status_note)})</span>`
+      : '';
+    const abBtn = c.item_key
+      ? ` ${abandonActionHtml([c.item_key], '🗑️ Abandon', 'triage-btn')}`
+      : '';
+    const psPart = c.patchset ? ` PS${esc(c.patchset)}` : '';
+    return `<span>Companion ${cLink}${psPart} ${stateBadge}${note}${abBtn}</span>`;
+  }).join(' · ');
+  const dupKeys = comps.filter(c => c.companion_duplicate && c.item_key).map(c => c.item_key);
+  const readyKeys = comps.filter(c => c.ready_to_abandon && c.item_key).map(c => c.item_key);
+  let batchBtn = '';
+  if (readyKeys.length > 1) {
+    batchBtn = abandonActionHtml(
+      readyKeys,
+      `🗑️ Abandon all companions (${readyKeys.length})`,
+      'triage-btn primary'
+    );
+  } else if (dupKeys.length >= 1 && comps.length > 1) {
+    batchBtn = abandonActionHtml(
+      dupKeys,
+      `🗑️ Abandon ${dupKeys.length} duplicate${dupKeys.length > 1 ? 's' : ''}`,
+      'triage-btn primary'
+    );
+  }
+  const actionsSpan = batchBtn ? `<span class="triage-actions">${batchBtn}</span>` : '';
+  return `<div class="companion-banner">${itemsHtml}${actionsSpan}</div>`;
+}
+
 // Maps fix CL stage and summary to display pill title and tone
 function fixStageInfo(f) {
   if (!f) return {stage: '', stageLabel: 'Fix', tone: 'progress'};
@@ -5453,6 +6087,7 @@ function openFixActionHtml(it) {
 }
 
 function reviewerGapHtml(it) {
+  if (isCompanion(it)) return '';
   if (it.status === 'MERGED' || it.status === 'ABANDONED' || it.status === 'CLOSED') return '';
   const missRev = Number(it.missing_reviewers_to_assign || 0);
   const reqApp = Number(it.required_approvals || 1);
@@ -5516,6 +6151,10 @@ function isPostSubmitAlert(it) {
 function statusOf(it) {
   if (isAlert(it) || needsMyReply(it)) return 'attention';
   if (it.status === 'ABANDONED' || it.status === 'CLOSED') return 'abandoned';
+  // Open companions wait on the parent author unless marked ready to abandon
+  if (isCompanion(it)) {
+    return it.ready_to_abandon ? 'attention' : 'waiting';
+  }
   if (it.status === 'MERGED') {
     const ageDays = (Date.now() / 1000 - (it.submitted_ts || 0)) / 86400;
     return ageDays > OLD_MERGED_DAYS ? 'old' : 'merged';
@@ -5691,6 +6330,16 @@ function stateHtml(it) {
   if (it.status === 'ABANDONED' || it.status === 'CLOSED') {
     return it.status === 'ABANDONED' ? 'Abandoned' : 'Closed';
   }
+  // Companion rows show parent linkage, stacked status note, and an inline Abandon button
+  if (isCompanion(it)) {
+    const parentRef = it.companion_to_label || it.companion_to;
+    const note = it.companion_status_note || 'Waiting on author';
+    const abBtn = it.item_key
+      ? ` · ${abandonActionHtml([it.item_key], '🗑️ Abandon', 'triage-btn')}`
+      : '';
+    return [wipTag, `Companion to ${esc(parentRef)}`, esc(note)].filter(Boolean).join(' · ') +
+      abBtn;
+  }
   if (it.status === 'MERGED') {
     const ps = it.post_submit;
     if (ps && ps.all_passed) return 'Shipped to all 4 products';
@@ -5754,6 +6403,7 @@ function chatActionHtml(it, data, compact) {
 
 // Server-side rebase fails on conflicts, so only my own open changes wake a local chat
 function canRebase(it) {
+  if (isCompanion(it)) return false;
   return Boolean(it.merge_conflict && it.is_self) &&
     (it.status === 'NEW' || it.status === 'OPEN') && Boolean(it.item_key);
 }
@@ -6382,7 +7032,12 @@ function focusCard(it, data) {
   const conflictNote = it.is_self ? 'Merge conflict: rebase needed' : 'Merge conflict';
   let why;
   let actions;
-  if (canRebase(it)) {
+  if (isCompanion(it) && it.ready_to_abandon) {
+    const reason = esc(it.ready_to_abandon_reason || 'Review complete');
+    why = `<b>Ready to abandon</b>: ${reason} · ${formatStatusTime(it)}`;
+    actions = abandonActionHtml([it.item_key], '🗑️ Abandon companion', 'btn primary') +
+      link(it.url, `Open ${kindWord}`, 'btn secondary') + chatBtn;
+  } else if (canRebase(it)) {
     const redConflict = `<span class="red">${conflictNote}</span>`;
     // Keep failure and comment links alongside conflict note so CQ red never masks conflict
     if (it.phase === 'ALERT_CQ_FAILED') {
@@ -6420,7 +7075,8 @@ function focusCard(it, data) {
         <h2>${cardTitle}</h2>
         <div class="why">${whyContent}</div>
         <!-- Surface fix-for linkage on pre-submit focus cards -->
-        ${brokenAndFixBannerHtml(it)}${fixesBreakageBannerHtml(it)}</div>
+        ${brokenAndFixBannerHtml(it)}${fixesBreakageBannerHtml(it)}
+        ${companionsBannerHtml(it)}</div>
       <div class="actions">${actionsWithFix}</div>
       ${triageHtml(it, false)}
     </article>`;
@@ -6440,6 +7096,7 @@ function rowHtml(it, data) {
         <div class="meta">${meta}</div>
         <!-- Surface fix-for linkage and broken bots on lane rows -->
         ${brokenAndFixBannerHtml(it)}${fixesBreakageBannerHtml(it)}
+        ${companionsBannerHtml(it)}
         ${triageHtml(it, true)}</div>
       <div class="state">${stateHtml(it)}</div>
       <div class="when">${rowTime(it)}</div>
@@ -6641,6 +7298,57 @@ async function rebaseItem(itemKey, btn) {
   }
 }
 
+async function abandonCompanions(itemKeys, btn) {
+  const keys = Array.isArray(itemKeys) ? itemKeys.filter(Boolean) : [itemKeys].filter(Boolean);
+  if (!keys.length || (btn && btn.disabled)) return;
+  // Require a second click within 3.5s before sending the destructive abandon request
+  if (btn && btn.dataset.confirming !== '1') {
+    const orig = btn.textContent;
+    btn.dataset.confirming = '1';
+    btn.dataset.origLabel = orig;
+    btn.textContent = keys.length > 1
+      ? `Confirm Abandon (${keys.length})?`
+      : 'Confirm Abandon?';
+    btn.classList.add('danger');
+    setTimeout(() => {
+      if (btn && btn.dataset.confirming === '1') {
+        delete btn.dataset.confirming;
+        btn.classList.remove('danger');
+        btn.textContent = btn.dataset.origLabel || orig;
+      }
+    }, 3500);
+    return;
+  }
+  const orig = (btn && btn.dataset.origLabel) || (btn ? btn.textContent : '');
+  if (btn) {
+    delete btn.dataset.confirming;
+    btn.disabled = true;
+    btn.textContent = 'Abandoning…';
+  }
+  try {
+    const resp = await fetch('/api/abandon', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({item_keys: keys}),
+    });
+    const res = await resp.json();
+    if (res && res.ok) {
+      await fetchState();
+      return;
+    }
+    if (btn && res && Array.isArray(res.errors) && res.errors.length) {
+      btn.title = res.errors.join('; ');
+    }
+  } catch (e) {
+    // Restore button label when the local HTTP call fails
+  }
+  if (btn) {
+    btn.disabled = false;
+    btn.classList.remove('danger');
+    btn.textContent = orig;
+  }
+}
+
 async function triggerRefresh() {
   const btn = document.getElementById('refresh-btn');
   btn.textContent = 'Refreshing…';
@@ -6727,7 +7435,12 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
       self._send_json({"ok": True, "count": len(state.get("items") or {})})
       return
 
-    if parsed.path in ("/api/start_chat", "/api/rebase", "/api/open_chat"):
+    if parsed.path in (
+        "/api/start_chat",
+        "/api/rebase",
+        "/api/open_chat",
+        "/api/abandon",
+    ):
       length = int(self.headers.get("Content-Length") or 0)
       raw_body = (
           self.rfile.read(length).decode("utf-8", errors="replace")
@@ -6745,6 +7458,17 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
         res = open_chat_for_id(cid)
       elif parsed.path == "/api/start_chat":
         res = start_chat_for_item(str(bdict.get("item_key") or ""))
+      elif parsed.path == "/api/abandon":
+        raw_keys = bdict.get("item_keys")
+        if isinstance(raw_keys, list):
+          keys = [str(k) for k in raw_keys if k]
+        elif bdict.get("item_key"):
+          keys = [str(bdict.get("item_key"))]
+        else:
+          keys = []
+        res = abandon_companion_items(
+            keys, reason=str(bdict.get("reason") or "")
+        )
       else:
         res = rebase_item(str(bdict.get("item_key") or ""))
       self._send_json(res, code=200 if res.get("ok") else 400)

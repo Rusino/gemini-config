@@ -56,6 +56,9 @@ Never upload a companion WIP CL blindly. After auditing the patchset and testing
    - Rebasing onto `origin/main` before pushing a child CL either rewrites the author's parent CL in Gerrit or breaks the clean single-parent diff between the author's patchset and your companion CL.
 3. **Never push a new patchset directly to the author's CL or edit the author's commit message in Gerrit**:
    - Uploading to the author's own CL number makes you the patchset uploader, which disqualifies your `Code-Review+1` from counting toward `OWNERS` approval in Gerrit and forces the author to re-upload an identical patchset just to restore ownership. Always use a separate `Change-Id`.
+4. **One Companion per Parent CL (Reuse Existing `Change-Id` / Branch)**:
+   - Before creating a new companion WIP CL or Draft PR, verify whether an open self-owned companion already exists for the parent CL/PR (check Gerrit `owner:self status:open` stacked on the parent CL or mentioned in parent comments; on GitHub: `gh pr list --repo <repo> --author "@me" --state open --head companion-pr-<PR>`).
+   - If an open companion already exists, never create a duplicate companion CL/PR: reuse its existing `Change-Id:` trailer on Gerrit (uploading new patchsets to the same companion CL stacked on the author's latest patchset) or push updates to the existing `companion-pr-<PR>` branch on GitHub.
 
 ---
 
