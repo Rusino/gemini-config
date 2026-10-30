@@ -1513,7 +1513,10 @@ const liveBucketBtn = (k) =>
     ],
     onToggleSectionHeader(id) {
       toggledSectionHeaders.push(id);
-      vlistProps.items[0].isCollapsed = false;
+      const it = vlistProps.items.find(
+        (x) => x && x.type === 'section-header' && (x.collapseId === id || x.id === id)
+      );
+      if (it) it.isCollapsed = !it.isCollapsed;
     },
     onToggleCollapseSection(id) {
       toggledCollapsedSections.push(id);
@@ -1594,10 +1597,18 @@ const liveBucketBtn = (k) =>
     'jetski-collapse-projects-btn'
   );
 
-  // Set up 3 projects in vlistProps: proj-1 (open), proj-2 (open), proj-3 (collapsed)
+  // Set up 3 projects and 1 standalone conversation section in vlistProps
   vlistProps.items.push(
     { type: 'header', id: 'proj-2', isCollapsed: false },
-    { type: 'header', id: 'proj-3', isCollapsed: true }
+    { type: 'header', id: 'proj-3', isCollapsed: true },
+    {
+      type: 'section-header',
+      id: 'section-standalone',
+      collapseId: 'standalone',
+      title: 'Conversations',
+      isCollapsible: true,
+      isCollapsed: false,
+    }
   );
   const toggledByCollapseAll = [];
   vlistProps.onToggleCollapseSection = (id) => {
@@ -1616,44 +1627,97 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(collapseBtn.textContent, '⇈');
   assert.strictEqual(
     collapseBtn.getAttribute('aria-label'),
-    '⇈ Collapse all projects (2/3 open)'
+    '⇈ Collapse all projects (3/4 open)'
   );
 
-  // First click: collapses all open projects (only proj-1 and proj-2 need toggling)
+  // First click: collapses all open projects and standalone sections (proj-1, proj-2, standalone)
   toggledByCollapseAll.length = 0;
+  toggledSectionHeaders.length = 0;
   advanceClock();
   collapseBtn.dispatchEvent('pointerdown', { button: 0 });
   collapseBtn.dispatchEvent('click');
 
   assert.deepStrictEqual(toggledByCollapseAll.sort(), ['proj-1', 'proj-2']);
+  assert.deepStrictEqual(toggledSectionHeaders, ['standalone']);
   assert.strictEqual(collapseBtn.getAttribute('data-action'), 'expand');
   assert.strictEqual(collapseBtn.textContent, '⇊');
   assert.strictEqual(
     collapseBtn.getAttribute('aria-label'),
-    '⇊ Expand all projects (3 collapsed)'
+    '⇊ Expand all projects (4 collapsed)'
   );
   const allCollapsed = vlistProps.items
-    .filter((x) => x && x.type === 'header')
+    .filter((x) => x && (x.type === 'header' || x.id === 'section-standalone'))
     .every((x) => x.isCollapsed);
-  assert.strictEqual(allCollapsed, true, 'All project headers must be collapsed');
+  assert.strictEqual(allCollapsed, true, 'All project and standalone headers must be collapsed');
 
-  // Second click: expands all projects (all 3 need toggling)
+  // Second click: expands all projects and standalone sections (all 4 need toggling)
   toggledByCollapseAll.length = 0;
+  toggledSectionHeaders.length = 0;
   advanceClock();
   collapseBtn.dispatchEvent('pointerdown', { button: 0 });
   collapseBtn.dispatchEvent('click');
 
   assert.deepStrictEqual(toggledByCollapseAll.sort(), ['proj-1', 'proj-2', 'proj-3']);
+  assert.deepStrictEqual(toggledSectionHeaders, ['standalone']);
   assert.strictEqual(collapseBtn.getAttribute('data-action'), 'collapse');
   assert.strictEqual(collapseBtn.textContent, '⇈');
   assert.strictEqual(
     collapseBtn.getAttribute('aria-label'),
-    '⇈ Collapse all projects (3/3 open)'
+    '⇈ Collapse all projects (4/4 open)'
   );
   const allExpanded = vlistProps.items
-    .filter((x) => x && x.type === 'header')
+    .filter((x) => x && (x.type === 'header' || x.id === 'section-standalone'))
     .every((x) => !x.isCollapsed);
-  assert.strictEqual(allExpanded, true, 'All project headers must be expanded');
+  assert.strictEqual(allExpanded, true, 'All project and standalone headers must be expanded');
+
+  // Edge case: all 3 project folders collapsed, but standalone conversations section is open
+  for (const it of vlistProps.items) {
+    if (it && it.type === 'header') it.isCollapsed = true;
+    if (it && it.id === 'section-standalone') it.isCollapsed = false;
+  }
+  advanceClock();
+  for (const sub of subscribers) sub();
+  while (rafCallbacks.length > 0) rafCallbacks.shift()();
+
+  assert.strictEqual(collapseBtn.getAttribute('data-action'), 'collapse');
+  assert.strictEqual(
+    collapseBtn.getAttribute('aria-label'),
+    '⇈ Collapse all projects (1/4 open)'
+  );
+
+  // Click collapses the 1 open standalone section
+  toggledByCollapseAll.length = 0;
+  toggledSectionHeaders.length = 0;
+  advanceClock();
+  collapseBtn.dispatchEvent('pointerdown', { button: 0 });
+  collapseBtn.dispatchEvent('click');
+
+  assert.deepStrictEqual(toggledByCollapseAll, []);
+  assert.deepStrictEqual(toggledSectionHeaders, ['standalone']);
+  assert.strictEqual(collapseBtn.getAttribute('data-action'), 'expand');
+  assert.strictEqual(
+    collapseBtn.getAttribute('aria-label'),
+    '⇊ Expand all projects (4 collapsed)'
+  );
+
+  // Click again expands all 4
+  toggledByCollapseAll.length = 0;
+  toggledSectionHeaders.length = 0;
+  advanceClock();
+  collapseBtn.dispatchEvent('pointerdown', { button: 0 });
+  collapseBtn.dispatchEvent('click');
+
+  assert.deepStrictEqual(toggledByCollapseAll.sort(), ['proj-1', 'proj-2', 'proj-3']);
+  assert.deepStrictEqual(toggledSectionHeaders, ['standalone']);
+  assert.strictEqual(collapseBtn.getAttribute('data-action'), 'collapse');
+  assert.strictEqual(
+    collapseBtn.getAttribute('aria-label'),
+    '⇈ Collapse all projects (4/4 open)'
+  );
+  const allRestored = vlistProps.items
+    .filter((x) => x && (x.type === 'header' || x.id === 'section-standalone'))
+    .every((x) => !x.isCollapsed);
+  assert.strictEqual(allRestored, true, 'All project and standalone headers must be restored');
 
   // Verify Needs-Reaction inbox widget mounted right before vlistEl and shows only unseen chats
   const inboxEl = bodyEl.querySelector('.jetski-needs-reaction-inbox');

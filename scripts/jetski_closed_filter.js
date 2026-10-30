@@ -6460,6 +6460,23 @@
 
   window.__jetskiChainNav = { syncConversationChainNavigators };
 
+  // Checks if an item is a collapsible conversation section header outside project folders
+  function isCollapsibleConversationSectionHeader(item) {
+    // Exclude non-collapsible headers, project folders, and chat rows
+    if (!item || item.type !== 'section-header' || item.isCollapsible === false) {
+      return false;
+    }
+    const collapseId = String(item.collapseId || item.id || '')
+      .replace(/^header-/, '')
+      .replace(/^section-/, '');
+    if (!collapseId) return false;
+    // Exclude the Workspaces toolbar header and pinned chats section
+    return (
+      collapseId !== 'main-section-header' &&
+      collapseId !== 'pinned'
+    );
+  }
+
   // Reads expanded/collapsed counts across all sidebar projects from VirtualizedConversationList
   function getProjectCollapseStats() {
     const ctrl = findSidebarListController();
@@ -6467,14 +6484,27 @@
     const headers = [];
     if (Array.isArray(items)) {
       for (const it of items) {
+        // Project folders
         if (it && it.type === 'header' && typeof it.id === 'string') {
           const projectId = it.id.replace(/^header-/, '');
           if (projectId) {
             headers.push({
+              kind: 'project',
+              id: projectId,
               projectId,
               isCollapsed: Boolean(it.isCollapsed),
             });
           }
+        // Standalone conversation and custom convgroup section headers
+        } else if (isCollapsibleConversationSectionHeader(it)) {
+          const rawId = String(it.collapseId || it.id || '').replace(/^header-/, '');
+          const sectionId = it.collapseId || it.id;
+          headers.push({
+            kind: rawId.startsWith('convgroup:') ? 'project' : 'section-header',
+            id: sectionId,
+            projectId: rawId,
+            isCollapsed: Boolean(it.isCollapsed),
+          });
         }
       }
     }
@@ -6497,7 +6527,9 @@
     // Fall back to DOM project header buttons before VirtualizedConversationList Fiber is ready
     const domHeaders = document.querySelectorAll(
       'div[data-sidebar-section-drop-id]:not([data-sidebar-row-id]) ' +
-        'button[data-testid="project-header"]'
+        'button[data-testid="project-header"], ' +
+        'div[data-sidebar-section-drop-id="standalone"] ' +
+        'div[data-testid="section-header"] button[aria-expanded]'
     );
     let domExpanded = 0;
     let domCollapsed = 0;
@@ -6553,17 +6585,31 @@
       // Uncollapse the outer Workspaces section header first when expanding all projects
       if (!shouldCollapse && typeof ctrl.props.onToggleSectionHeader === 'function') {
         for (const item of ctrl.props.items) {
-          if (item && item.type === 'section-header' && item.isCollapsed) {
+          const rawId = String(item?.collapseId || item?.id || '').replace(/^header-/, '');
+          if (
+            item &&
+            item.type === 'section-header' &&
+            rawId === 'main-section-header' &&
+            item.isCollapsed
+          ) {
             ctrl.props.onToggleSectionHeader(item.collapseId || item.id);
           }
         }
       }
-      if (typeof ctrl.props.onToggleCollapseSection === 'function' && s.headers.length > 0) {
+      if (s.headers.length > 0) {
         for (const h of s.headers) {
-          if (shouldCollapse && !h.isCollapsed) {
-            ctrl.props.onToggleCollapseSection(h.projectId);
-          } else if (!shouldCollapse && h.isCollapsed) {
-            ctrl.props.onToggleCollapseSection(h.projectId);
+          if (
+            (shouldCollapse && !h.isCollapsed) ||
+            (!shouldCollapse && h.isCollapsed)
+          ) {
+            // Dispatch section-header vs project collapse toggle based on header kind
+            if (h.kind === 'section-header') {
+              if (typeof ctrl.props.onToggleSectionHeader === 'function') {
+                ctrl.props.onToggleSectionHeader(h.id);
+              }
+            } else if (typeof ctrl.props.onToggleCollapseSection === 'function') {
+              ctrl.props.onToggleCollapseSection(h.projectId);
+            }
           }
         }
       }
