@@ -6352,6 +6352,7 @@ class FakeElement {
   }
   get firstChild() { return this.children[0] || null; }
   get lastChild() { return this.children[this.children.length - 1] || null; }
+  click() { return this.dispatchEvent('click'); }
   get nextSibling() {
     if (!this.parentElement) return null;
     const idx = this.parentElement.children.indexOf(this);
@@ -6608,6 +6609,18 @@ eval(code);
     styleEl.textContent.includes('[data-jetski-hiring-banner="true"]'),
     'Style must hide tagged sidebar hiring banner wrapper'
   );
+  assert(
+    styleEl.textContent.includes('[data-testid="settings-button"]'),
+    'Style must hide bottom settings button'
+  );
+  assert(
+    styleEl.textContent.includes('[data-jetski-sidebar-footer="true"]'),
+    'Style must add hairline divider above tagged sidebar footer'
+  );
+  assert(
+    styleEl.textContent.includes('border-top: 1px solid rgba(128, 128, 128, 0.16) !important;'),
+    'Style must use hairline border-top on footer'
+  );
 
   // 2. Set up sidebar structure with header, top-nav items, plugins section, and bottom settings
   const sidebarEl = new FakeElement('div');
@@ -6671,6 +6684,11 @@ eval(code);
     'Settings section must not be tagged as top navigation'
   );
   assert.strictEqual(
+    settingsSec.getAttribute('data-jetski-sidebar-footer'),
+    'true',
+    'Settings section must be tagged as sidebar footer'
+  );
+  assert.strictEqual(
     sidebarEl.getAttribute('data-jetski-topnav-open'),
     null,
     'Sidebar top navigation must be closed by default'
@@ -6682,8 +6700,19 @@ eval(code);
   assert.strictEqual(toggleBtn.getAttribute('data-expanded'), 'false');
   assert.strictEqual(
     toggleBtn.getAttribute('aria-label'),
-    'Top navigation (Automations, Customizations, Extensions)'
+    'Top navigation (Automations, Customizations, Extensions, Settings)'
   );
+
+  // Verify proxy Settings button is mounted inside top nav section
+  const topSettingsBtn = topNavSec.querySelector('[data-testid="jetski-top-nav-settings-btn"]');
+  assert(topSettingsBtn, 'Settings button must be mirrored in top navigation');
+  assert.strictEqual(topSettingsBtn.getAttribute('aria-label'), 'Settings');
+  let settingsClicked = false;
+  settingsBtn.addEventListener('click', () => { settingsClicked = true; });
+  window.__jetskiTopNav.setExpanded(true);
+  topSettingsBtn.dispatchEvent('pointerdown');
+  assert.strictEqual(settingsClicked, true, 'Proxy button must trigger click on settings button');
+  assert.strictEqual(window.__jetskiTopNav.isExpanded(), false, 'Top nav must collapse after settings click');
 
   // 3. Status dot forwarding from Automations button
   const autoDot = new FakeElement('span');
@@ -6706,7 +6735,7 @@ eval(code);
   assert.strictEqual(toggleBtn.getAttribute('data-status'), null);
   assert.strictEqual(
     toggleBtn.getAttribute('aria-label'),
-    'Top navigation (Automations, Customizations, Extensions)'
+    'Top navigation (Automations, Customizations, Extensions, Settings)'
   );
 
   // 4. Click toggle button to expand top navigation
@@ -6742,12 +6771,18 @@ eval(code);
   window.__jetskiTopNav.setExpanded(true);
   window.__jetskiClosedChatsFilterCleanup();
   assert.strictEqual(headerRow.querySelector('.jetski-top-nav-toggle-btn'), null);
+  assert.strictEqual(topNavSec.querySelector('.jetski-top-nav-settings-btn'), null);
   assert.strictEqual(sidebarEl.getAttribute('data-jetski-topnav-open'), null);
   assert.strictEqual(topNavSec.getAttribute('data-jetski-top-nav-section'), null);
   assert.strictEqual(
     hiringRow.getAttribute('data-jetski-hiring-banner'),
     null,
     'Hiring banner tag must be cleared on cleanup'
+  );
+  assert.strictEqual(
+    settingsSec.getAttribute('data-jetski-sidebar-footer'),
+    null,
+    'Sidebar footer tag must be cleared on cleanup'
   );
   assert.strictEqual(window.__jetskiTopNav.isExpanded(), false);
 

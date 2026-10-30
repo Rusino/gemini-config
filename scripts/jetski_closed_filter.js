@@ -27,6 +27,7 @@
   // Compact toggle button in sidebar top bar to expand or collapse top navigation
   const TOP_NAV_TOGGLE_BTN_CLASS = 'jetski-top-nav-toggle-btn';
   const TOP_NAV_STATUS_DOT_CLASS = 'jetski-top-nav-status-dot';
+  const TOP_NAV_SETTINGS_BTN_CLASS = 'jetski-top-nav-settings-btn';
   let topNavExpanded = false;
   const TITLEBAR_BTN_CLASS = 'jetski-titlebar-archive-btn';
   // Live context window volume pill rendered before Search in each conversation titlebar
@@ -4518,8 +4519,9 @@
     ` +
       // Style the collapsible Needs-Reaction inbox widget above the sidebar project list
       `
-      /* Hide redundant new-conversation button and bottom hiring promo banner to save space */
+      /* Hide redundant new conversation, settings, and bottom hiring promo banner */
       [aria-label="Sidebar"] [data-testid="new-conversation-button"],
+      [aria-label="Sidebar"] [data-testid="settings-button"],
       [aria-label="Sidebar"] [data-jetski-hiring-banner="true"],
       [aria-label="Sidebar"] div:has(> [data-testid="sidebar-hiring-link"]),
       [aria-label="Sidebar"] [data-testid="sidebar-hiring-link"],
@@ -4530,10 +4532,21 @@
       [aria-label="Sidebar"]:not([data-jetski-topnav-open="true"])
         [data-jetski-top-nav-section="true"],
       [aria-label="Sidebar"]:not([data-jetski-topnav-open="true"])
-        > div.px-2:not(:has([data-testid="settings-button"])),
+        > div.px-2:not([data-jetski-sidebar-footer="true"]):not(:has([data-testid="settings-button"])):not(:has([data-testid="machine-sidebar-button"])),
       [aria-label="Sidebar"]:not([data-jetski-topnav-open="true"]) > div.mt-3.h-px,
       [aria-label="Sidebar"]:not([data-jetski-topnav-open="true"]) [data-testid="plugins-section"] {
         display: none !important;
+      }
+      /* Hairline divider above the bottom Cloudtop machine info footer */
+      [aria-label="Sidebar"] > div.mx-2.h-px:not(.mt-3) {
+        display: none !important;
+      }
+      [aria-label="Sidebar"] [data-jetski-sidebar-footer="true"],
+      [aria-label="Sidebar"] > div.px-2:has([data-testid="machine-sidebar-button"]),
+      [aria-label="Sidebar"] > div.px-2:has([data-testid="settings-button"]) {
+        border-top: 1px solid rgba(128, 128, 128, 0.16) !important;
+        margin-top: 4px !important;
+        padding-top: 4px !important;
       }
       [aria-label="Sidebar"]:not([data-jetski-topnav-open="true"]) > div:first-child {
         margin-bottom: 0 !important;
@@ -7145,12 +7158,64 @@
     const sidebarEl = document.querySelector('[aria-label="Sidebar"]');
     if (!sidebarEl) return;
 
-    findTopNavSection(sidebarEl);
+    const topNavSec = findTopNavSection(sidebarEl);
     // Tag the bottom hiring promo wrapper so the entire footer row collapses to zero height
     const hiringLink = sidebarEl.querySelector('[data-testid="sidebar-hiring-link"]');
     const hiringWrapper = hiringLink?.parentElement;
     if (hiringWrapper && hiringWrapper !== sidebarEl) {
       setAttrIfChanged(hiringWrapper, 'data-jetski-hiring-banner', 'true');
+    }
+    // Tag the bottom footer container so it renders a permanent hairline divider above machine info
+    const footerAnchor =
+      sidebarEl.querySelector('[data-testid="machine-sidebar-button"]') ||
+      sidebarEl.querySelector('[data-testid="settings-button"]');
+    const footerSection =
+      footerAnchor?.closest?.('[aria-label="Sidebar"] > div.px-2') ||
+      footerAnchor?.parentElement;
+    if (footerSection && footerSection !== sidebarEl) {
+      setAttrIfChanged(footerSection, 'data-jetski-sidebar-footer', 'true');
+    }
+    // Mirror Settings inside collapsible top navigation container without moving React DOM nodes
+    const origSettingsBtn = sidebarEl.querySelector('[data-testid="settings-button"]');
+    if (topNavSec && origSettingsBtn) {
+      const topNavList = topNavSec.querySelector('div.flex.flex-col') || topNavSec;
+      let topSettingsBtn = topNavSec.querySelector(`.${TOP_NAV_SETTINGS_BTN_CLASS}`);
+      if (!topSettingsBtn) {
+        topSettingsBtn = document.createElement('button');
+        topSettingsBtn.type = 'button';
+        const baseClass =
+          origSettingsBtn.className ||
+          'flex-grow w-full justify-start select-none font-normal h-8 min-w-0 gap-1.5 px-2 py-1' +
+          ' rounded-lg bg-transparent text-secondary-foreground hover:bg-sidebar-muted' +
+          ' hover:text-foreground';
+        topSettingsBtn.className = `${baseClass} ${TOP_NAV_SETTINGS_BTN_CLASS}`.trim();
+        topSettingsBtn.setAttribute('data-testid', 'jetski-top-nav-settings-btn');
+        topSettingsBtn.setAttribute('aria-label', 'Settings');
+        topSettingsBtn.setAttribute('title', 'Settings');
+        if (origSettingsBtn.innerHTML) {
+          topSettingsBtn.innerHTML = origSettingsBtn.innerHTML;
+        } else {
+          topSettingsBtn.textContent = origSettingsBtn.textContent || 'Settings';
+        }
+        bindHoverBubble(topSettingsBtn, () => 'Settings');
+        bindActionBtnHandlers(topSettingsBtn, () => {
+          const liveSettingsBtn =
+            sidebarEl.querySelector('[data-testid="settings-button"]') ||
+            document.querySelector('[data-testid="settings-button"]');
+          if (liveSettingsBtn) {
+            if (typeof liveSettingsBtn.click === 'function') {
+              liveSettingsBtn.click();
+            } else if (typeof liveSettingsBtn.dispatchEvent === 'function') {
+              liveSettingsBtn.dispatchEvent('click');
+            }
+          }
+          topNavExpanded = false;
+          ensureTopNavToggle();
+        });
+        topNavList.appendChild(topSettingsBtn);
+      } else if (!topSettingsBtn.innerHTML && origSettingsBtn.innerHTML) {
+        topSettingsBtn.innerHTML = origSettingsBtn.innerHTML;
+      }
     }
     if (topNavExpanded) {
       sidebarEl.setAttribute('data-jetski-topnav-open', 'true');
@@ -7217,7 +7282,7 @@
       toggleBtn.removeAttribute('data-status');
       const title = topNavExpanded
         ? 'Collapse top navigation'
-        : 'Top navigation (Automations, Customizations, Extensions)';
+        : 'Top navigation (Automations, Customizations, Extensions, Settings)';
       toggleBtn.setAttribute('aria-label', title);
       toggleBtn.setAttribute('title', title);
     }
@@ -9059,6 +9124,7 @@
       `#${STAR_TOOLTIP_ID}`,
       `#${AUTOPILOT_TOAST_ID}`,
       `.${TOP_NAV_TOGGLE_BTN_CLASS}`,
+      `.${TOP_NAV_SETTINGS_BTN_CLASS}`,
     ].join(', ');
     for (const el of document.querySelectorAll(cleanupSelector)) {
       el.remove();
@@ -9071,9 +9137,12 @@
     for (const el of document.querySelectorAll('[data-jetski-top-nav-section]')) {
       el.removeAttribute('data-jetski-top-nav-section');
     }
-    // Clear hiring banner attributes on teardown
+    // Clear hiring banner and bottom footer attributes on teardown
     for (const el of document.querySelectorAll('[data-jetski-hiring-banner]')) {
       el.removeAttribute('data-jetski-hiring-banner');
+    }
+    for (const el of document.querySelectorAll('[data-jetski-sidebar-footer]')) {
+      el.removeAttribute('data-jetski-sidebar-footer');
     }
     if (locateHighlightTimer) {
       clearTimeout(locateHighlightTimer);
