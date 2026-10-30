@@ -568,6 +568,15 @@ def patch_flutter_tools_for_web_corpus(repo):
     if tc_anchor in tc_text:
         tc_path.write_text(tc_text.replace(tc_anchor, tc_repl, 1))
 
+    # 6. Ensure felt test logs the Chrome binary used
+    felt_chrome_path = repo / "engine/src/flutter/lib/web_ui/dev/chrome.dart"
+    if felt_chrome_path.exists():
+        fc_text = felt_chrome_path.read_text()
+        fc_anchor = "_installation = await getOrInstallChrome(version, infoLog: isCi ? stdout : DevNull());"
+        fc_repl = "_installation = await getOrInstallChrome(version, infoLog: stdout);"
+        if fc_anchor in fc_text:
+            felt_chrome_path.write_text(fc_text.replace(fc_anchor, fc_repl, 1))
+
 
 def ensure_force_test_fonts(repo):
     web_ui = repo / "engine/src/flutter/lib/web_ui"
@@ -593,33 +602,35 @@ def ensure_force_test_fonts(repo):
         dom_path.write_text(dom_text.replace(dom_anchor, dom_repl, 1))
 
     fc_text = fc_path.read_text()
-    fc_anchor = """      final DomFontFace fontFace = createDomFontFace(family, list);
-      if (fontFace.status == 'error') {
-        // Font failed to load.
-        return false;
-      }
-      domDocument.fonts!.add(fontFace);
-
-      // There might be paragraph measurements for this new font before it is
-      // loaded. They were measured using fallback fonts, so we should clear the
-      // cache."""
-    fc_repl = """      final DomFontFace fontFace = createDomFontFace(family, list);
-      await fontFace.load();
-      if (fontFace.status == 'error') {
-        // Font failed to load.
-        return false;
-      }
-      domDocument.fonts!.add(fontFace);
-      await domDocument.fonts!.ready;
-
-      // There might be paragraph measurements for this new font before it is
-      // loaded. They were measured using fallback fonts, so we should clear the
-      // cache.
-      invalidateLayoutContextFont();"""
+    fc_pattern = re.compile(
+        r"(      final DomFontFace fontFace = createDomFontFace\(family, list(?:, descriptors)?\);\n)"
+        r"(      if \(fontFace\.status == 'error'\) \{\n"
+        r"        // Font failed to load\.\n"
+        r"        return false;\n"
+        r"      \}\n"
+        r"      domDocument\.fonts!\.add\(fontFace\);\n\n"
+        r"      // There might be paragraph measurements for this new font before it is\n"
+        r"      // loaded\. They were measured using fallback fonts, so we should clear the\n"
+        r"      // cache\.)"
+    )
+    fc_repl = (
+        r"\1"
+        "      await fontFace.load();\n"
+        "      if (fontFace.status == 'error') {\n"
+        "        // Font failed to load.\n"
+        "        return false;\n"
+        "      }\n"
+        "      domDocument.fonts!.add(fontFace);\n"
+        "      await domDocument.fonts!.ready;\n\n"
+        "      // There might be paragraph measurements for this new font before it is\n"
+        "      // loaded. They were measured using fallback fonts, so we should clear the\n"
+        "      // cache.\n"
+        "      invalidateLayoutContextFont();"
+    )
     if "invalidateLayoutContextFont()" not in fc_text:
-        if fc_anchor not in fc_text:
+        if not fc_pattern.search(fc_text):
             raise RuntimeError(f"Could not find WebFontCollection anchor in {fc_path}")
-        fc_path.write_text(fc_text.replace(fc_anchor, fc_repl, 1))
+        fc_path.write_text(fc_pattern.sub(fc_repl, fc_text, count=1))
 
     p_anchor1 = "import 'package:ui/ui.dart' as ui;"
     p_repl1 = (
@@ -634,31 +645,16 @@ def ensure_force_test_fonts(repo):
         "  layoutContext.font = '';\n"
         "}"
     )
-    p_anchor3 = """  String _buildCssFontString() {
-    final String cssFontStyle = fontStyle?.toCssString() ?? StyleManager.defaultFontStyle;
-    final String cssFontWeight = fontWeight?.toCssString() ?? StyleManager.defaultFontWeight;
-    final double cssFontSize = fontSize ?? StyleManager.defaultFontSize;
+    p_anchor3 = """    final double cssFontSize = fontSize ?? StyleManager.defaultFontSize;
     final String cssFontFamily = fontFamily ?? StyleManager.defaultFontFamily;
     final String fullFontName = canonicalizeFontFamily(cssFontFamily, fontFamilyFallback)!;
     return '$cssFontStyle $cssFontWeight ${cssFontSize.toStringAsFixed(2)}px $fullFontName';
   }"""
-    p_repl3 = """  String _buildCssFontFamily() {
-    if (ui_web.TestEnvironment.instance.forceTestFonts) {
-      final String? family = fontFamily;
-      final String testFont = _webParagraphTestFonts.contains(family)
-          ? family!
-          : _webParagraphTestFonts.first;
-      return '"$testFont"';
-    }
+    p_repl3 = """    final double cssFontSize = fontSize ?? StyleManager.defaultFontSize;
     final String cssFontFamily = fontFamily ?? StyleManager.defaultFontFamily;
-    return canonicalizeFontFamily(cssFontFamily, fontFamilyFallback)!;
-  }
-
-  String _buildCssFontString() {
-    final String cssFontStyle = fontStyle?.toCssString() ?? StyleManager.defaultFontStyle;
-    final String cssFontWeight = fontWeight?.toCssString() ?? StyleManager.defaultFontWeight;
-    final double cssFontSize = fontSize ?? StyleManager.defaultFontSize;
-    final String fullFontName = _buildCssFontFamily();
+    final String fullFontName = ui_web.TestEnvironment.instance.forceTestFonts
+        ? '"${_webParagraphTestFonts.contains(fontFamily) ? fontFamily! : _webParagraphTestFonts.first}"'
+        : canonicalizeFontFamily(cssFontFamily, fontFamilyFallback)!;
     return '$cssFontStyle $cssFontWeight ${cssFontSize.toStringAsFixed(2)}px $fullFontName';
   }"""
     for name, a in (("import ui", p_anchor1), ("layoutContext", p_anchor2), ("_buildCssFontString", p_anchor3)):
@@ -674,6 +670,13 @@ def checkout_web_ui_ref(repo, ref, worktree_patch_path):
         ["git", "-C", str(repo), "checkout", "--", "engine/src/flutter/lib/web_ui"],
         check=True,
     )
+    if worktree_patch_path and worktree_patch_path.exists() and worktree_patch_path.stat().st_size > 0:
+        patch_content = worktree_patch_path.read_text(errors="replace")
+        for match in re.finditer(r"^diff --git a/(\S+) b/(\S+)\nnew file mode", patch_content, re.MULTILINE):
+            new_file = repo / match.group(2)
+            if new_file.exists():
+                new_file.unlink()
+
     if ref == "WORKTREE":
         subprocess.run(
             ["git", "-C", str(repo), "checkout", "--no-overlay", "HEAD", "--", "engine/src/flutter/lib/web_ui"],
@@ -1006,6 +1009,7 @@ def main():
         repo / "packages/flutter_tools/lib/src/web/chrome.dart",
         repo / "packages/flutter_tools/lib/src/test/web_test_compiler.dart",
         repo / "packages/flutter_tools/lib/src/test/test_compiler.dart",
+        repo / "engine/src/flutter/lib/web_ui/dev/chrome.dart",
     ]
     tools_stamp = repo / "bin/cache/flutter_tools.stamp"
     dart_bin = repo / "engine/src/flutter/prebuilts/linux-x64/dart-sdk/bin/dart"
@@ -1108,6 +1112,8 @@ def main():
             )
             attestation["part"] = args.part
             attestation["force_test_fonts"] = not args.no_force_test_fonts
+            if os.environ.get("CHROME_EXECUTABLE"):
+                attestation["chrome_executable"] = os.environ.get("CHROME_EXECUTABLE")
             att_path.write_text(json.dumps(attestation, indent=2))
 
             felt_sum_json = ref_dir / "felt_summary.json"
@@ -1142,6 +1148,20 @@ def main():
                     ftf_applied = ensure_force_test_fonts(repo)
                     if ftf_applied:
                         log(f"[{label}] Applied temporary forceTestFonts patch for Part 1", driver_log)
+
+                # felt serves flutter.js from out/wasm_release/flutter_web_sdk, so without this
+                # build Part 1 runs the loader (CanvasKit variant pick) of the previously built ref
+                t0 = time.time()
+                with open(ref_dir / "ninja_flutter_js_part1.log", "w") as lf:
+                    res = subprocess.run(
+                        [ninja_bin, "-C", str(repo / "engine/src/out/wasm_release"), "flutter/web_sdk"],
+                        env=env,
+                        stdout=lf,
+                        stderr=subprocess.STDOUT,
+                    )
+                if res.returncode != 0:
+                    raise RuntimeError(f"[{label}] flutter/web_sdk build for Part 1 failed")
+                log(f"[{label}] Built flutter/web_sdk for Part 1 ({int(time.time() - t0)}s)", driver_log)
 
                 ensure_felt_temp_suite(felt_config)
                 wp_tests = sorted(
