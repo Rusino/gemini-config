@@ -4533,6 +4533,7 @@ const trajectoriesByCid = {
   },
 };
 
+const nowIso = new Date().toISOString();
 const storeState = {
   trajectorySummaries: {
     summaries: {
@@ -4540,7 +4541,7 @@ const storeState = {
         summary: '[14:00] ⦿ chat-snake-ws',
         status: 1,
         stepCount: 1,
-        lastModifiedTime: '2026-10-29T18:29:50Z',
+        lastModifiedTime: nowIso,
         annotations: { title: '[14:00] ⦿ chat-snake-ws', archived: false },
         waiting_steps: [
           {
@@ -4560,42 +4561,42 @@ const storeState = {
         summary: '[14:00] ⦿ chat-toolcall-meta',
         status: 1,
         stepCount: 2,
-        lastModifiedTime: '2026-10-29T18:29:40Z',
+        lastModifiedTime: nowIso,
         annotations: { title: '[14:00] ⦿ chat-toolcall-meta', archived: false },
       },
       'chat-toolcall-pr': {
         summary: '[14:00] ⦿ chat-toolcall-pr',
         status: 1,
         stepCount: 2,
-        lastModifiedTime: '2026-10-29T18:29:30Z',
+        lastModifiedTime: nowIso,
         annotations: { title: '[14:00] ⦿ chat-toolcall-pr', archived: false },
       },
       'chat-toolcall-string-array': {
         summary: '[14:00] ⦿ chat-toolcall-string-array',
         status: 1,
         stepCount: 2,
-        lastModifiedTime: '2026-10-29T18:29:20Z',
+        lastModifiedTime: nowIso,
         annotations: { title: '[14:00] ⦿ chat-toolcall-string-array', archived: false },
       },
       'chat-generic-payload': {
         summary: '[14:00] ⦿ chat-generic-payload',
         status: 1,
         stepCount: 2,
-        lastModifiedTime: '2026-10-29T18:29:10Z',
+        lastModifiedTime: nowIso,
         annotations: { title: '[14:00] ⦿ chat-generic-payload', archived: false },
       },
       'chat-direct-step-questions': {
         summary: '[14:00] ⦿ chat-direct-step-questions',
         status: 1,
         stepCount: 2,
-        lastModifiedTime: '2026-10-29T18:29:00Z',
+        lastModifiedTime: nowIso,
         annotations: { title: '[14:00] ⦿ chat-direct-step-questions', archived: false },
       },
       'chat-oneof-direct': {
         summary: '[14:00] ⦿ chat-oneof-direct',
         status: 1,
         stepCount: 2,
-        lastModifiedTime: '2026-10-29T18:28:50Z',
+        lastModifiedTime: nowIso,
         annotations: { title: '[14:00] ⦿ chat-oneof-direct', archived: false },
       },
     },
