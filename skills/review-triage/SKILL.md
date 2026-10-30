@@ -130,14 +130,29 @@ For every targeted single-CL review in `🔴 SURGICAL AUDIT / CORE DOMAIN` (and 
 
 ---
 
-## Skia Canary Recommendation (Others' Skia CLs)
+## Skia Canary & ASAN Recommendation (Others' Skia CLs)
 
 For surviving Skia CLs in `🔴 SURGICAL AUDIT` or `🟠 PUSHBACK`, run
 [`skia-canary-advisor`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/skia-canary-advisor/SKILL.md)
 (`canary_advisor.py advise --cl <N>`). Run ASAN automatically.
 
-- **External Authors**: Trigger non-G3 canaries (`Canary-Flutter`, `Canary-Chromium`, `Canary-Android`) automatically. For `Canary-G3`, it requires a Googler author or Googler `Code-Review+1` (`g3_canary.go:134`). Follow the **External Author Canary-G3 Submit-Hold Protocol**: when approving, draft the `/PATCHSET_LEVEL` comment with `unresolved: True` holding the submit until Canary-G3 passes. Run Canary-G3 immediately after the user publishes CR+1. If Canary-G3 fails, follow the triage procedure in `skia-canary-advisor`.
+- **External Authors**: Trigger non-G3 canaries (`Canary-Flutter`, `Canary-Chromium`,
+  `Canary-Android`) automatically. For `Canary-G3`, it requires a Googler author or Googler
+  `Code-Review+1` (`g3_canary.go:134`). Follow the **External Author Canary-G3 Submit-Hold Protocol**:
+  when approving, draft the `/PATCHSET_LEVEL` comment with `unresolved: True` holding the submit
+  until Canary-G3 passes. Run Canary-G3 immediately after the user publishes CR+1. If Canary-G3 fails,
+  follow the triage procedure in `skia-canary-advisor`.
 - **Internal Authors**: Suggest recommended canaries in chat; do not ask them in Gerrit comments.
+- **Background Watcher & Wakeup Protocol**: Immediately after triggering `git cl try`, launch
+  `python3 ~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py watch --cl <N> --save-draft`
+  in the background (`WaitMsBeforeAsync=500`, `NotificationTimeoutSeconds=5400`).
+  - **On Red Canary (`UNRELATED_HEAD_BREAKAGE`)**: `watch --save-draft` automatically saves a
+    sanitized Gerrit `/PATCHSET_LEVEL` draft (only when Canary is red; never when green) and wakes
+    the chat.
+  - **On Red ASAN**: Never touch external/others' CLs directly. Create or update the `%wip`
+    companion CL per `companion-cl-review` (`PS1` = reproducer test, `PS2` = fix), update the
+    parent CL's `/PATCHSET_LEVEL` draft (`unresolved: true`) with the ASAN trace and companion link,
+    and notify the user.
 
 
 

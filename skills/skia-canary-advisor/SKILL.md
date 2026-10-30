@@ -17,6 +17,8 @@ The script checks client-visible diff surface and selects appropriate ASAN and C
 S=~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py
 python3 $S advise --cl <change>      # Gerrit CL, own or under review
 python3 $S advise --repo <skia>      # local branch vs origin/main
+python3 $S triage --cl <change>      # triage tryjobs (ASAN + Canaries)
+python3 $S watch --cl <change> --save-draft  # background watcher + draft on red
 python3 $S health                    # OK/DEAD per canary (real verdicts in last 45 days)
 python3 $S stats                     # RAN/skipped per logged recommendation + follow rate
 ```
@@ -27,13 +29,48 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
 2. Execute every `AGENT TODO` line with `code_search`. A hit makes Canary-G3 STRONG.
 3. Present the result: STRONG items as "run", CONSIDER items as "only if rendering may change".
 4. **Execution Policy (Agent Actions)**:
-   - **ASAN**: If an ASAN bot is recommended, YOU (the agent) MUST execute the `git cl try` command provided under `AGENT ACTION` immediately, without asking the author or the user.
-   - **External Authors** (owner is not `@google.com`): YOU (the agent) MUST execute the `git cl try` command provided under `AGENT ACTION` immediately, without asking.
-     - **Canary-G3 restriction (`g3_canary.go:134`)**: Canary-G3 requires a Googler author OR a Googler `Code-Review+1` approval. If the external CL has no Googler CR+1 yet, `canary_advisor.py` automatically excludes Canary-G3 from `AGENT ACTION` and prints a deferred command.
-     - **External Author Submit-Hold Protocol**: Follow the submit-hold protocol below: prepare a `/PATCHSET_LEVEL` draft with `unresolved: true` for the user to publish with `Code-Review+1`. Run Canary-G3 immediately after the user publishes the approval and hold comment.
-     - Other canaries (`Canary-Flutter`, `Canary-Chromium`, `Canary-Android`) have no such restriction and are triggered immediately.
-   - **Internal Authors / Own CLs**: Show the printed `Canary Command` for canaries and run it ONLY after the user explicitly approves. (For ASAN, you still run it automatically).
-5. A red canary is not automatically the CL's fault. Follow the **Canary-G3 Runtime & Triage Procedure** below before blaming the CL.
+   - **ASAN**: If an ASAN bot is recommended, YOU (the agent) MUST execute the `git cl try`
+     command provided under `AGENT ACTION` immediately, without asking the author or the user.
+   - **External Authors** (owner is not `@google.com`): YOU (the agent) MUST execute the
+     `git cl try` command provided under `AGENT ACTION` immediately, without asking.
+     - **Canary-G3 restriction (`g3_canary.go:134`)**: Canary-G3 requires a Googler author OR a
+       Googler `Code-Review+1` approval. If the external CL has no Googler CR+1 yet,
+       `canary_advisor.py` automatically excludes Canary-G3 from `AGENT ACTION` and prints a
+       deferred command.
+     - **External Author Submit-Hold Protocol**: Follow the submit-hold protocol below: prepare
+       a `/PATCHSET_LEVEL` draft with `unresolved: true` for the user to publish with
+       `Code-Review+1`. Run Canary-G3 immediately after the user publishes the approval and hold
+       comment.
+     - Other canaries (`Canary-Flutter`, `Canary-Chromium`, `Canary-Android`) have no such
+       restriction and are triggered immediately.
+   - **Internal Authors / Own CLs**: Show the printed `Canary Command` for canaries and run it
+     ONLY after the user explicitly approves. (For ASAN, you still run it automatically).
+5. **Background Monitoring & Wakeup Protocol**:
+   - Immediately after triggering `git cl try`, launch
+     `python3 ~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py watch --cl <CL> --save-draft`
+     as a background command (`WaitMsBeforeAsync=500`, `NotificationTimeoutSeconds=5400`).
+   - For external authors needing `Canary-G3`, `watch` automatically polls Gerrit for the Googler
+     `Code-Review+1` vote, triggers `Canary-G3` the moment `CR+1` is published, and watches
+     `Canary-G3` to completion.
+   - **On Red Canary (`UNRELATED_HEAD_BREAKAGE`)**: `watch --save-draft` automatically verifies
+     `CheckTestsSkia` + `blaze query somepath` for all failing targets and saves a strictly
+     sanitized English `/PATCHSET_LEVEL` draft on Gerrit (never leaking internal `google3` target
+     paths or `cl/N` numbers to public Gerrit). When woken up, the agent shows the internal triage
+     table in chat and confirms the draft is saved. (No Gerrit draft is created when Canary is
+     green).
+   - **On Red Canary (`CL_SUSPECTED_REGRESSION`)**: Report the failing target, `somepath` chain,
+     and stack trace to the user and proceed to fix.
+   - **On Red ASAN (`COMPILE_FAILURE` or `SANITIZER_OR_TEST_FAILURE`)**:
+     - **External / Others' CLs (`review-triage`)**: Never modify the author's CL directly.
+       Create or update the `%wip` **companion CL** per `companion-cl-review` (`PS1` = failing
+       reproducer test if needed, `PS2` = fix passing ASAN), update the `/PATCHSET_LEVEL` draft
+       on the parent CL (`unresolved: true`) with the ASAN trace and companion CL link, and
+       notify the user.
+     - **Own CLs (`amnesia-precommit` / Self-Review)**: Reproduce and fix in an isolated worktree,
+       verify with a local ASAN build, upload the fix (or ask first if reviewers have already
+       voted `CR+1`), re-trigger ASAN + `watch`, and report to the user.
+6. A red canary is not automatically the CL's fault. Follow the **Canary-G3 Runtime & Triage
+   Procedure** below before blaming the CL.
 
 ## External Author Canary-G3 Submit-Hold Protocol
 

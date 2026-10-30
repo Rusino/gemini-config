@@ -8,6 +8,8 @@ measure how often the recommendation was actually followed.
 Usage:
   canary_advisor.py advise --cl 1402416            # Gerrit CL (own or under review)
   canary_advisor.py advise --repo ~/skia [--base origin/main]
+  canary_advisor.py triage --cl 1402416 [--ps 3]   # triage tryjobs (ASAN + Canaries)
+  canary_advisor.py watch --cl 1402416             # watch until terminal / ASAN early exit
   canary_advisor.py health                         # per-canary health from Buildbucket
   canary_advisor.py stats                          # follow-rate of logged recommendations
 """
@@ -30,6 +32,9 @@ ME = "jlavrova@google.com"
 LEDGER = os.environ.get("CANARY_ADVISOR_LEDGER",
                         os.path.expanduser("~/.gemini/config/ledgers/canary_advisor.jsonl"))
 BB = os.path.expanduser("~/depot_tools/bb")
+PRPC = os.path.expanduser("~/depot_tools/prpc")
+GARDENER_DIR = os.path.expanduser("~/.gemini/jetski/scratch/skia_gardener")
+GOOGLE3_DIR = "/google/src/head/depot/google3"
 HEALTH_WINDOW_DAYS = 45
 
 # Client-side files that define SK_* macros; a removed guard is only dangerous if a client still
@@ -250,11 +255,30 @@ def canary_health(builder):
     return {"healthy": bool(verdicts), "counts": counts}
 
 
-def load_cl(cl):
-    info = gerrit_json(f"/changes/{cl}?o=DETAILED_ACCOUNTS&o=CURRENT_REVISION&o=DETAILED_LABELS")
-    rev = next(iter(info["revisions"].values()))
-    patch = base64.b64decode(http_get(f"{GERRIT}/changes/{cl}/revisions/current/patch")).decode(
-        "utf-8", "replace")
+def load_cl(cl, ps=None):
+    url = f"/changes/{cl}?o=DETAILED_ACCOUNTS&o=ALL_REVISIONS&o=DETAILED_LABELS"
+    info = gerrit_json(url)
+    cur_rev = None
+    if "current_revision_number" in info:
+        cur_num = info["current_revision_number"]
+        cur_rev = next(
+            (r for r in info["revisions"].values()
+             if r.get("_number") == cur_num or r.get("ref", "").endswith(f"/{cur_num}")),
+            None,
+        )
+    if not cur_rev and "current_revision" in info:
+        cur_rev = info["revisions"].get(info["current_revision"])
+    if not cur_rev:
+        cur_rev = next(iter(info["revisions"].values()))
+    target_rev = cur_rev
+    if ps is not None:
+        for rev in info.get("revisions", {}).values():
+            if rev.get("_number") == int(ps):
+                target_rev = rev
+                break
+    ps_num = target_rev["_number"]
+    patch_url = f"{GERRIT}/changes/{cl}/revisions/{ps_num}/patch"
+    patch = base64.b64decode(http_get(patch_url)).decode("utf-8", "replace")
     cr_label = info.get("labels", {}).get("Code-Review", {})
     # Canary-G3 requires either a Googler author or Googler CR+1 (g3_canary.go:134)
     googler_cr_plus_one = any(
@@ -262,8 +286,8 @@ def load_cl(cl):
         for vote in cr_label.get("all", [])
     )
     return {
-        "cl": int(cl), "patchset": rev["_number"], "subject": info["subject"],
-        "owner": info["owner"].get("email", ""), "diff": patch,
+        "cl": int(cl), "patchset": ps_num, "current_patchset": cur_rev["_number"],
+        "subject": info["subject"], "owner": info["owner"].get("email", ""), "diff": patch,
         "googler_cr_plus_one": googler_cr_plus_one,
     }
 
@@ -405,6 +429,11 @@ def advise(args):
             cmd = f"git cl try{issue} -B {BUCKET} " + " ".join(f"-b {b}" for b in bots_to_run)
             print(f"\nAGENT ACTION (execute this command):")
             print(f"  {cmd}")
+            if meta["cl"]:
+                script_path = os.path.abspath(__file__)
+                print(f"\nAGENT WATCH (launch in background after git cl try, "
+                      f"WaitMsBeforeAsync=500, NotificationTimeoutSeconds=5400):")
+                print(f"  python3 {script_path} watch --cl {meta['cl']} --save-draft")
 
         # Provide the exact Canary-G3 command to run once a Googler votes CR+1
         if canary_bots and external and "Canary-G3" in canary_bots and not googler_cr_plus_one:
@@ -498,6 +527,562 @@ def cmd_stats(_args):
         print(f"\nfollow rate: {followed}/{total} = {100 * followed // total}%")
 
 
+def bb_cl_builds(cl, ps):
+    cmd = [BB, "ls", "-n", "50", "-json",
+           "-fields", "id,builder,status,create_time,start_time,end_time,summary_markdown",
+           "-cl", f"{GERRIT}/c/skia/+/{cl}/{ps}"]
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=90, cwd="/tmp")
+    builds = {}
+    for line in out.stdout.splitlines():
+        if not line.startswith("{"):
+            continue
+        try:
+            b = json.loads(line)
+            builder = b.get("builder", {}).get("builder")
+            if not builder:
+                continue
+            cur = builds.get(builder)
+            if not cur or b.get("createTime", "") > cur.get("createTime", ""):
+                builds[builder] = b
+        except json.JSONDecodeError:
+            continue
+    return builds
+
+
+def swarming_tasks_for_cl(cl, ps):
+    if not os.path.exists(PRPC):
+        return []
+    req = {
+        "tags": [f"sk_issue:{cl}", f"sk_patchset:{ps}"],
+        "state": "QUERY_ALL",
+        "limit": 50,
+    }
+    proc = subprocess.run([PRPC, "call", "chromium-swarm.appspot.com",
+                           "swarming.v2.Tasks.ListTasks"],
+                          input=json.dumps(req), capture_output=True, text=True, timeout=30)
+    if proc.returncode != 0:
+        return []
+    try:
+        data = json.loads(proc.stdout)
+        return data.get("items", [])
+    except json.JSONDecodeError:
+        return []
+
+
+def swarming_task_stdout(task_id):
+    if not os.path.exists(PRPC) or not task_id:
+        return ""
+    proc = subprocess.run([PRPC, "call", "chromium-swarm.appspot.com",
+                           "swarming.v2.Tasks.GetStdout"],
+                          input=json.dumps({"taskId": task_id}),
+                          capture_output=True, text=True, timeout=30)
+    if proc.returncode != 0:
+        return ""
+    try:
+        data = json.loads(proc.stdout)
+        out_b64 = data.get("output", "")
+        return base64.b64decode(out_b64).decode("utf-8", "replace")
+    except (json.JSONDecodeError, ValueError):
+        return ""
+
+
+def swarming_task_result(task_id):
+    if not os.path.exists(PRPC) or not task_id:
+        return {}
+    proc = subprocess.run([PRPC, "call", "chromium-swarm.appspot.com",
+                           "swarming.v2.Tasks.GetResult"],
+                          input=json.dumps({"taskId": task_id}),
+                          capture_output=True, text=True, timeout=30)
+    if proc.returncode != 0:
+        return {}
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {}
+
+
+def fetch_logdog_step(task_id, run_id, step):
+    run_ids = []
+    if run_id:
+        run_ids.append(run_id)
+    if task_id and len(task_id) > 1:
+        # Swarming run IDs end with 1 or 2 for task shards
+        run_ids.extend([task_id[:-1] + "1", task_id[:-1] + "2"])
+    for rid in run_ids:
+        url = f"https://logs.chromium.org/logs/skia/{rid}/+/steps/{step}/0/stdout?format=raw"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "canary-advisor"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return r.read().decode("utf-8", "replace")
+        except (urllib.error.URLError, OSError):
+            continue
+    return ""
+
+
+def check_google3_somepath(target, touched_files):
+    if not os.path.isdir(GOOGLE3_DIR):
+        return False, []
+    labels = []
+    for f in touched_files:
+        full = os.path.join(GOOGLE3_DIR, "third_party/skia/HEAD", f)
+        if not os.path.exists(full):
+            continue
+        d = os.path.dirname(f)
+        b = os.path.basename(f)
+        label = f"//third_party/skia/HEAD/{d}:{b}" if d else f"//third_party/skia/HEAD:{b}"
+        labels.append(label)
+    if not labels:
+        return False, []
+    set_expr = " ".join(labels)
+    query = f"somepath({target}, set({set_expr}))"
+    cmd = ["blaze", "query", query]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60, cwd=GOOGLE3_DIR)
+    if proc.returncode != 0:
+        return False, []
+    lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+    return bool(lines), lines
+
+
+def triage_asan_failure(cl, ps, builder, bb_build, sw_tasks, touched_files):
+    failed_tasks = []
+    for t in sw_tasks:
+        name = t.get("name", "")
+        is_asan = "ASAN" in name or (builder and builder in name)
+        if not is_asan:
+            continue
+        state = t.get("state")
+        failure = t.get("failure", False)
+        if failure or state in ("BOT_DIED", "TIMED_OUT", "NO_RESOURCE", "EXPIRED", "KILLED"):
+            failed_tasks.append(t)
+
+    if not failed_tasks and bb_build.get("status") in ("FAILURE", "INFRA_FAILURE"):
+        for t in sw_tasks:
+            if builder and builder in t.get("name", ""):
+                failed_tasks.append(t)
+
+    for t in failed_tasks:
+        state = t.get("state")
+        if state in ("BOT_DIED", "TIMED_OUT", "NO_RESOURCE", "CANCELED", "EXPIRED", "KILLED"):
+            return {
+                "verdict": "INFRA_MISHAP", "task_id": t.get("taskId"), "name": t.get("name"),
+                "summary": f"Swarming task {t.get('taskId')} failed with state {state}",
+            }
+
+    extracted_error = []
+    failing_tests = []
+    task_name = ""
+    target_task_id = ""
+
+    for t in failed_tasks:
+        tid = t.get("taskId")
+        target_task_id = tid
+        task_name = t.get("name", "")
+        res = swarming_task_result(tid)
+        rid = res.get("runId", "")
+        stdout = swarming_task_stdout(tid)
+
+        if "Build-" in task_name or "ninja" in stdout:
+            ninja_log = fetch_logdog_step(tid, rid, "ninja")
+            log_text = ninja_log or stdout
+            for line in log_text.splitlines():
+                if any(k in line for k in ("FAILED:", ": error:", ": fatal error:",
+                                           "undefined reference to")):
+                    extracted_error.append(line.strip())
+            if extracted_error:
+                return {
+                    "verdict": "COMPILE_FAILURE", "task_id": tid, "name": task_name,
+                    "errors": extracted_error[:10],
+                    "summary": f"ASAN compilation failed in {task_name}",
+                }
+
+        steps_to_check = ["symbolized_dm", "dm", "symbolize_stack_trace", "test_skia"]
+        step_log = ""
+        for s in steps_to_check:
+            step_log = fetch_logdog_step(tid, rid, s)
+            if step_log:
+                break
+        test_text = step_log or stdout
+        in_asan_block = False
+        asan_lines = []
+        for line in test_text.splitlines():
+            if "ERROR: AddressSanitizer" in line or "ERROR: LeakSanitizer" in line or \
+               "ERROR: UndefinedBehaviorSanitizer" in line:
+                in_asan_block = True
+            if in_asan_block:
+                asan_lines.append(line)
+                if len(asan_lines) > 25:
+                    in_asan_block = False
+            m_fail = re.search(r"^\s*Failure in (?:test )?(\w+):", line)
+            if m_fail:
+                failing_tests.append(m_fail.group(1))
+
+        if asan_lines or failing_tests:
+            touches_cl = any(os.path.basename(f) in "\n".join(asan_lines) for f in touched_files)
+            return {
+                "verdict": "SANITIZER_OR_TEST_FAILURE", "task_id": tid, "name": task_name,
+                "sanitizer_stack": asan_lines[:25], "failing_tests": failing_tests,
+                "intersects_cl": touches_cl,
+                "summary": f"Sanitizer or test failure in {task_name}",
+            }
+
+    summary_md = bb_build.get("summaryMarkdown", "")
+    return {
+        "verdict": "FAILED_UNSPECIFIED", "task_id": target_task_id, "name": task_name or builder,
+        "summary": summary_md or "ASAN tryjob failed",
+    }
+
+
+def triage_canary_g3_failure(cl, ps, bb_build, sw_tasks, touched_files):
+    g3_task = next((t for t in sw_tasks if "Canary-G3" in t.get("name", "")), None)
+    if not g3_task:
+        return {
+            "verdict": "INFRA_NO_TASK", "our_part_passed": False,
+            "summary": "Canary-G3 Swarming task not found",
+        }
+    tid = g3_task.get("taskId")
+    stdout = swarming_task_stdout(tid)
+    m_cl = re.search(r"http://cl/(\d+)", stdout)
+    if not m_cl:
+        return {
+            "verdict": "INFRA_NO_ROLL_CL", "our_part_passed": False,
+            "summary": "Canary-G3 did not produce a google3 roll CL",
+        }
+    g3_cl = m_cl.group(1)
+    if not os.path.isdir(GARDENER_DIR):
+        return {
+            "verdict": "CANNOT_TRIAGE", "g3_cl": g3_cl, "our_part_passed": False,
+            "summary": f"skia_gardener not found at {GARDENER_DIR}",
+        }
+    proc = subprocess.run(["go", "run", ".", "-triage-google3", "-cl", g3_cl, "-json"],
+                          capture_output=True, text=True, timeout=180, cwd=GARDENER_DIR)
+    if proc.returncode != 0:
+        return {
+            "verdict": "GARDENER_ERROR", "g3_cl": g3_cl, "our_part_passed": False,
+            "summary": f"skia_gardener failed: {proc.stderr[:200]}",
+        }
+    try:
+        triage_data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {
+            "verdict": "GARDENER_PARSE_ERROR", "g3_cl": g3_cl, "our_part_passed": False,
+            "summary": "Failed to parse skia_gardener JSON output",
+        }
+
+    gardener_verdict = triage_data.get("verdict", "")
+    runs = triage_data.get("runs", [])
+    targets = triage_data.get("targets", [])
+
+    skia_tests_ran = any(
+        r.get("check") == "CheckTestsSkia" and
+        r.get("status") not in ("BROKEN", "PENDING", "RUNNING") and not r.get("setup_error")
+        for r in runs
+    )
+
+    if gardener_verdict in ("PRESUBMIT_CONFIG_BROKEN", "INFRA_ONLY") and not skia_tests_ran:
+        return {
+            "verdict": "INFRA_DID_NOT_RUN", "g3_cl": g3_cl, "our_part_passed": False,
+            "summary": "google3 presubmit broken or infra failure before Skia tests ran",
+        }
+
+    target_details = []
+    all_unrelated = True
+    for t in targets:
+        if not t.get("failed_in_latest", True):
+            continue
+        tgt_name = t.get("target", "")
+        kind = t.get("kind", "")
+        if kind == "BROKEN_AT_HEAD":
+            target_details.append({
+                "target": tgt_name, "unrelated": True, "reason": "BROKEN_AT_HEAD",
+            })
+            continue
+        has_path, path_lines = check_google3_somepath(tgt_name, touched_files)
+        if not has_path:
+            target_details.append({
+                "target": tgt_name, "unrelated": True,
+                "reason": "somepath empty (no dependency on touched Skia files)",
+            })
+        else:
+            all_unrelated = False
+            target_details.append({
+                "target": tgt_name, "unrelated": False,
+                "reason": f"depends on touched files: {path_lines[0]}",
+                "somepath": path_lines[:5],
+            })
+
+    our_part_passed = skia_tests_ran and (all_unrelated or not target_details)
+    verdict = "UNRELATED_HEAD_BREAKAGE" if our_part_passed else "CL_SUSPECTED_REGRESSION"
+
+    sanitized_draft = ""
+    if our_part_passed:
+        sanitized_draft = (
+            "Canary-G3 failed on unrelated google3 targets that are already broken at HEAD "
+            "or do not depend on the files modified in this CL. All Skia tests "
+            "(CheckTestsSkia) and dependent targets exercising the touched code passed."
+        )
+
+    return {
+        "verdict": verdict, "g3_cl": g3_cl, "our_part_passed": our_part_passed,
+        "skia_tests_ran": skia_tests_ran, "gardener_verdict": gardener_verdict,
+        "targets": target_details, "sanitized_draft": sanitized_draft,
+    }
+
+
+def triage_other_canary_failure(cl, ps, builder, bb_build, sw_tasks, touched_files):
+    task = next((t for t in sw_tasks if builder in t.get("name", "")), None)
+    tid = task.get("taskId") if task else ""
+    stdout = swarming_task_stdout(tid) if tid else ""
+    stems = [os.path.splitext(os.path.basename(f))[0] for f in touched_files]
+    mentions_cl = any(st in stdout for st in stems) if stems else False
+
+    if not mentions_cl:
+        return {
+            "verdict": "UNRELATED_HEAD_BREAKAGE", "builder": builder,
+            "our_part_passed": True,
+            "summary": f"{builder} failed without mentioning modified Skia files",
+            "sanitized_draft": (
+                f"{builder} failed on unrelated upstream targets outside the files "
+                "modified in this CL."
+            ),
+        }
+    return {
+        "verdict": "CL_SUSPECTED_REGRESSION", "builder": builder,
+        "our_part_passed": False,
+        "summary": f"{builder} failure intersects modified Skia files or symbols",
+    }
+
+
+def save_gerrit_patchset_draft(cl, ps, note_text, unresolved=False):
+    try:
+        proc = subprocess.run(
+            ["git-credential-luci", "get"],
+            input="protocol=https\nhost=skia-review.googlesource.com\n\n",
+            capture_output=True, text=True, timeout=10, check=True
+        )
+        token = ""
+        for line in proc.stdout.splitlines():
+            if line.startswith("password="):
+                token = line.split("=", 1)[1].strip()
+                break
+        if not token:
+            print("WARNING: git-credential-luci returned empty password, cannot save draft")
+            return False
+    except (subprocess.SubprocessError, OSError) as e:
+        print(f"WARNING: failed to get git-credential-luci token: {e}")
+        return False
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json; charset=UTF-8",
+        "User-Agent": "canary-advisor",
+    }
+    drafts_url = f"{GERRIT}/a/changes/{cl}/revisions/{ps}/drafts"
+    try:
+        req = urllib.request.Request(drafts_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            drafts_data = json.loads(r.read().decode("utf-8")[4:])
+    except (urllib.error.URLError, OSError) as e:
+        print(f"WARNING: failed to list Gerrit drafts on CL {cl} PS {ps}: {e}")
+        return False
+
+    existing_ps_draft = None
+    for item in drafts_data.get("/PATCHSET_LEVEL", []):
+        existing_ps_draft = item
+        break
+
+    if existing_ps_draft:
+        old_msg = existing_ps_draft.get("message", "")
+        if note_text in old_msg:
+            return True
+        new_msg = f"{old_msg}\n\n{note_text}".strip()
+        update_url = f"{drafts_url}/{existing_ps_draft['id']}"
+        payload = json.dumps({
+            "path": "/PATCHSET_LEVEL",
+            "message": new_msg,
+            "unresolved": existing_ps_draft.get("unresolved", unresolved),
+        }).encode("utf-8")
+        req = urllib.request.Request(update_url, data=payload, headers=headers, method="PUT")
+    else:
+        payload = json.dumps({
+            "path": "/PATCHSET_LEVEL",
+            "message": note_text,
+            "unresolved": unresolved,
+        }).encode("utf-8")
+        req = urllib.request.Request(drafts_url, data=payload, headers=headers, method="PUT")
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status in (200, 201)
+    except (urllib.error.URLError, OSError) as e:
+        print(f"WARNING: failed to save Gerrit draft on CL {cl} PS {ps}: {e}")
+        return False
+
+
+def cmd_triage(args):
+    meta = load_cl(args.cl, ps=args.ps)
+    cl = meta["cl"]
+    ps = meta["patchset"]
+    files = parse_diff(meta["diff"])
+    touched_files = list(files.keys())
+
+    builds = bb_cl_builds(cl, ps)
+    sw_tasks = swarming_tasks_for_cl(cl, ps)
+
+    results = {"cl": cl, "patchset": ps, "builds": {}, "drafts_saved": []}
+    drafts_to_save = []
+
+    print(f"# Tryjob Triage: CL {cl} PS {ps} ({meta['subject']})\n")
+
+    asan_builder = next((b for b in builds if "ASAN" in b), None)
+    if asan_builder:
+        b_info = builds[asan_builder]
+        status = b_info.get("status", "UNKNOWN")
+        print(f"## ASAN: {asan_builder} [{status}]")
+        if status in ("FAILURE", "INFRA_FAILURE"):
+            triage_res = triage_asan_failure(
+                cl, ps, asan_builder, b_info, sw_tasks, touched_files)
+            results["builds"][asan_builder] = triage_res
+            print(f"- Verdict: {triage_res['verdict']}")
+            print(f"- Summary: {triage_res['summary']}")
+            if triage_res.get("errors"):
+                print("```")
+                for err in triage_res["errors"]:
+                    print(err)
+                print("```")
+            if triage_res.get("sanitizer_stack"):
+                print("```")
+                for ln in triage_res["sanitizer_stack"]:
+                    print(ln)
+                print("```")
+        else:
+            results["builds"][asan_builder] = {"verdict": status}
+            print(f"- Verdict: {status}")
+    else:
+        print("## ASAN: No ASAN build found on this patchset")
+
+    canary_builders = [b for b in builds if b.startswith("Canary-")]
+    if canary_builders:
+        for cb in canary_builders:
+            b_info = builds[cb]
+            status = b_info.get("status", "UNKNOWN")
+            print(f"\n## Canary: {cb} [{status}]")
+            if status in ("FAILURE", "INFRA_FAILURE"):
+                if cb == "Canary-G3":
+                    triage_res = triage_canary_g3_failure(
+                        cl, ps, b_info, sw_tasks, touched_files)
+                else:
+                    triage_res = triage_other_canary_failure(
+                        cl, ps, cb, b_info, sw_tasks, touched_files)
+                results["builds"][cb] = triage_res
+                print(f"- Verdict: {triage_res['verdict']}")
+                if cb == "Canary-G3":
+                    print(f"- Roll CL: http://cl/{triage_res.get('g3_cl', '')}")
+                    print(f"- Skia Tests Ran: {triage_res.get('skia_tests_ran')}")
+                    if triage_res.get("targets"):
+                        print("- Failing Targets:")
+                        for tgt in triage_res["targets"]:
+                            print(f"  * {tgt['target']}: {tgt['reason']}")
+                if triage_res.get("sanitized_draft"):
+                    print(f"- Sanitized Draft Message: \"{triage_res['sanitized_draft']}\"")
+                    if triage_res.get("verdict") == "UNRELATED_HEAD_BREAKAGE":
+                        drafts_to_save.append(triage_res["sanitized_draft"])
+            else:
+                results["builds"][cb] = {"verdict": status}
+                print(f"- Verdict: {status}")
+    else:
+        print("\n## Canaries: No Canary builds found on this patchset")
+
+    if args.save_draft and drafts_to_save:
+        combined_draft = "\n\n".join(drafts_to_save)
+        ok = save_gerrit_patchset_draft(cl, ps, combined_draft, unresolved=False)
+        if ok:
+            print(f"\n[GERRIT DRAFT SAVED] Saved sanitized draft to CL {cl} PS {ps}")
+            results["drafts_saved"].append(combined_draft)
+        else:
+            print(f"\n[GERRIT DRAFT FAILED] Could not save draft to CL {cl} PS {ps}")
+
+    if args.json:
+        print(f"\n```json\n{json.dumps(results, indent=2)}\n```")
+    return results
+
+
+def cmd_watch(args):
+    cl = args.cl
+    meta = load_cl(cl, ps=args.ps)
+    ps = meta["patchset"]
+    poll_sec = args.poll_sec
+    timeout_sec = args.timeout_min * 60
+    start_time = time.time()
+    canary_g3_triggered = False
+
+    print(f"# Watching Tryjobs on CL {cl} PS {ps} (poll={poll_sec}s, timeout={args.timeout_min}m)")
+
+    files = parse_diff(meta["diff"])
+    recs = {}
+    for path in [p for p in files if not NO_EFFECT.search(p)]:
+        for rx, canaries, tier, reason in AREA_RULES:
+            if re.search(rx, path):
+                for c in canaries:
+                    recs[c] = True
+                break
+    g3_needed = "Canary-G3" in recs
+    asan_retried = False
+
+    while True:
+        elapsed = time.time() - start_time
+        if elapsed > timeout_sec:
+            print(f"\nWAKEUP_REASON: TIMEOUT ({args.timeout_min}m elapsed)")
+            cmd_triage(args)
+            return 1
+
+        meta = load_cl(cl, ps=None)
+        if meta["patchset"] > ps:
+            print(f"\nWAKEUP_REASON: SUPERSEDED (PS {ps} replaced by PS {meta['patchset']})")
+            return 0
+
+        if g3_needed and not canary_g3_triggered and not meta["owner"].endswith("@google.com"):
+            builds = bb_cl_builds(cl, ps)
+            if "Canary-G3" not in builds and meta["googler_cr_plus_one"]:
+                print(f"Googler CR+1 detected on external CL {cl}; triggering Canary-G3")
+                cmd = ["git", "cl", "try", "-i", str(cl), "-B", BUCKET, "-b", "Canary-G3"]
+                subprocess.run(cmd, check=False)
+                canary_g3_triggered = True
+
+        builds = bb_cl_builds(cl, ps)
+        sw_tasks = swarming_tasks_for_cl(cl, ps)
+
+        asan_builder = next((b for b in builds if "ASAN" in b), None)
+        if asan_builder:
+            b_info = builds[asan_builder]
+            status = b_info.get("status")
+            if status in ("FAILURE", "INFRA_FAILURE"):
+                touched = list(files.keys())
+                triage_res = triage_asan_failure(cl, ps, asan_builder, b_info, sw_tasks, touched)
+                if triage_res["verdict"] == "INFRA_MISHAP" and not asan_retried:
+                    print(f"ASAN infra mishap on {asan_builder}; retrying once")
+                    cmd = ["git", "cl", "try", "-i", str(cl), "-B", BUCKET, "-b", asan_builder]
+                    subprocess.run(cmd, check=False)
+                    asan_retried = True
+                elif triage_res["verdict"] in ("COMPILE_FAILURE", "SANITIZER_OR_TEST_FAILURE"):
+                    print(f"\nWAKEUP_REASON: ASAN_FAILURE ({triage_res['verdict']})")
+                    cmd_triage(args)
+                    return 0
+
+        terminal_statuses = ("SUCCESS", "FAILURE", "INFRA_FAILURE", "CANCELED")
+        if builds:
+            all_terminal = all(b.get("status") in terminal_statuses for b in builds.values())
+            if all_terminal:
+                if g3_needed and not meta["owner"].endswith("@google.com") and \
+                   not meta["googler_cr_plus_one"] and "Canary-G3" not in builds:
+                    pass
+                else:
+                    print("\nWAKEUP_REASON: ALL_TRYJOBS_COMPLETE")
+                    cmd_triage(args)
+                    return 0
+
+        time.sleep(poll_sec)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -513,6 +1098,22 @@ def main():
     a.set_defaults(fn=advise)
     sub.add_parser("health").set_defaults(fn=cmd_health)
     sub.add_parser("stats").set_defaults(fn=cmd_stats)
+    t = sub.add_parser("triage")
+    t.add_argument("--cl", required=True, help="Skia Gerrit change number")
+    t.add_argument("--ps", help="Patchset number (defaults to current)")
+    t.add_argument("--save-draft", action="store_true",
+                   help="save sanitized draft to Gerrit if Canary is red due to unrelated failures")
+    t.add_argument("--json", action="store_true", help="output JSON results")
+    t.set_defaults(fn=cmd_triage)
+    w = sub.add_parser("watch")
+    w.add_argument("--cl", required=True, help="Skia Gerrit change number")
+    w.add_argument("--ps", help="Patchset number (defaults to current)")
+    w.add_argument("--poll-sec", type=int, default=60, help="Poll interval in seconds")
+    w.add_argument("--timeout-min", type=int, default=90, help="Maximum watch time in minutes")
+    w.add_argument("--save-draft", action="store_true",
+                   help="save sanitized draft to Gerrit on completion if Canary is red")
+    w.add_argument("--json", action="store_true", help="output JSON results")
+    w.set_defaults(fn=cmd_watch)
     args = p.parse_args()
     args.fn(args)
 
