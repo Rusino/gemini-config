@@ -166,6 +166,9 @@ def extract_gerrit_thread_context(detail, inline_comments):
 
     owner_email = (detail.get("owner") or {}).get("email", "")
     last_reviewed_ps = None
+    # A review on the current patchset (often a bare "Code-Review+1" message) means the CL is
+    # already reviewed, not an initial review or a follow-up on an older patchset
+    reviewed_current_ps = False
     companion_urls = []
     dialogue = []
 
@@ -182,6 +185,8 @@ def extract_gerrit_thread_context(detail, inline_comments):
             continue
         if is_self_author(author) and ps and ps < cur_ps:
             last_reviewed_ps = max(last_reviewed_ps or 0, ps)
+        if is_self_author(author) and ps == cur_ps:
+            reviewed_current_ps = True
         for u in re.findall(r"https://[^\s)>]+/\+/\d+", msg):
             if str(detail.get("_number", "")) not in u and u not in companion_urls:
                 companion_urls.append(u)
@@ -204,6 +209,8 @@ def extract_gerrit_thread_context(detail, inline_comments):
                     continue
                 if is_self_author(author) and ps and ps < cur_ps:
                     last_reviewed_ps = max(last_reviewed_ps or 0, ps)
+                if is_self_author(author) and ps == cur_ps:
+                    reviewed_current_ps = True
                 for u in re.findall(r"https://[^\s)>]+/\+/\d+", msg):
                     if str(detail.get("_number", "")) not in u and u not in companion_urls:
                         companion_urls.append(u)
@@ -222,6 +229,13 @@ def extract_gerrit_thread_context(detail, inline_comments):
 
     dialogue.sort(key=lambda x: x[0])
     prev_info = ps_map.get(last_reviewed_ps) or {}
+    # Gerrit label "all" lists the votes that stand on the current patchset; a sticky vote
+    # carried over by a trivial rebase shows here even without a message on the new patchset
+    self_votes = []
+    for label, info in (detail.get("labels") or {}).items():
+        for v in (info or {}).get("all") or []:
+            if is_self_author(v) and v.get("value"):
+                self_votes.append(f"{label}{v['value']:+d}")
     return {
         "current_ps": cur_ps,
         "current_sha": cur_sha,
@@ -230,6 +244,8 @@ def extract_gerrit_thread_context(detail, inline_comments):
         "last_reviewed_ps": last_reviewed_ps,
         "last_reviewed_sha": prev_info.get("sha", ""),
         "last_reviewed_ref": prev_info.get("ref", ""),
+        "reviewed_current_ps": reviewed_current_ps,
+        "self_votes": self_votes,
         "companion_urls": companion_urls,
         "dialogue": [item[1] for item in dialogue[-12:]],
     }
@@ -246,7 +262,7 @@ def probe_gerrit(cl_id, host_hint=None):
             # Request full commit message, all revisions, and messages to support follow-up diffs
             opts = (
                 "o=CURRENT_REVISION&o=CURRENT_COMMIT"
-                "&o=ALL_REVISIONS&o=MESSAGES&o=DETAILED_ACCOUNTS"
+                "&o=ALL_REVISIONS&o=MESSAGES&o=DETAILED_ACCOUNTS&o=DETAILED_LABELS"
             )
             url = f"https://{host}/changes/{cl_id}/detail?{opts}"
             req = urllib.request.Request(url, headers={"User-Agent": "ReviewTriageAgent"})
@@ -729,11 +745,20 @@ def generate_report(cl_data, analysis, files):
     tctx = cl_data.get("thread_context") or {}
     if tctx.get("current_ps"):
         last_ps = tctx.get("last_reviewed_ps")
-        ps_detail = (
-            f"Follow-up since your review on **PS{last_ps}** (`{tctx['last_reviewed_sha'][:10]}`)"
-            if last_ps
-            else "Initial review (no prior comments from you)"
-        )
+        votes = ", ".join(f"`{v}`" for v in tctx.get("self_votes") or [])
+        if tctx.get("reviewed_current_ps"):
+            ps_detail = "**Already reviewed by you on this patchset**" + (
+                f" (your votes: {votes})" if votes else ""
+            )
+        elif last_ps:
+            ps_detail = (
+                f"Follow-up since your review on **PS{last_ps}** "
+                f"(`{tctx['last_reviewed_sha'][:10]}`)"
+            )
+            if votes:
+                ps_detail += f"; your votes carried over: {votes}"
+        else:
+            ps_detail = "Initial review (no prior comments or votes from you)"
         md.append(f"| **Patchset** | `PS{tctx['current_ps']}` | {ps_detail} |")
     # Emit machine-readable corpus gate marker for stop_guard.py on non-revert CLs
     corpus_gate = analysis.get("corpus_gate") or {}
@@ -757,9 +782,17 @@ def generate_report(cl_data, analysis, files):
             f"out of corpus verification).\n"
         )
 
-    if tctx.get("last_reviewed_ps") or tctx.get("dialogue"):
+    if tctx.get("last_reviewed_ps") or tctx.get("dialogue") or tctx.get("reviewed_current_ps"):
         md.append("### 🔄 Follow-Up Patchset & Prior Review Thread")
-        if tctx.get("last_reviewed_ps"):
+        if tctx.get("reviewed_current_ps"):
+            # The code under review has not changed since the user's own review, so a
+            # delta audit would re-review code she already approved or commented on
+            md.append(
+                f"> **Already Reviewed (`PS{tctx['current_ps']}`):** You already reviewed the "
+                f"current patchset. Do not re-audit the code; only check messages posted after "
+                f"your review and what still blocks submit (votes, CQ, unresolved threads)."
+            )
+        elif tctx.get("last_reviewed_ps"):
             prev_ps = tctx["last_reviewed_ps"]
             cur_ps = tctx["current_ps"]
             prev_sha = tctx["last_reviewed_sha"][:10]
