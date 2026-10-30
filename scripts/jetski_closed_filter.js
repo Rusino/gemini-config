@@ -349,6 +349,10 @@
   const QUOTA_HARD_FLOOR = 0.15;
   const EMERGENCY_PIN_FLOOR = 0.05;
   const AUTOPILOT_TOAST_ID = 'jetski-model-autopilot-toast';
+  // Synthetic dropdown option that clears a manual model pin and restores project Autopilot
+  const AUTOPILOT_OPTION_MODEL_ID = '__jetski_autopilot__';
+  const AUTOPILOT_OPTION_LABEL = 'Auto';
+  const AUTOPILOT_OPTION_ENUM = 999999;
   // Persist manual model pins across F5 reloads with a 30m TTL on unsent project drafts
   const MANUAL_MODEL_PINS_STORAGE_KEY = 'jetski_manual_model_pins_v1';
   const DRAFT_MANUAL_PIN_TTL_MS = 30 * 60 * 1000;
@@ -2124,13 +2128,28 @@
               reduxStore.getState()?.conversation?.cascadeId ||
               '';
             const pinKey = resolveDraftPinKey(reduxStore, rawCid);
+            // Rewrite the synthetic Auto sentinel to the active profile model if dispatched before Redux sync
+            const isAutopilotSentinel =
+              planModel === AUTOPILOT_OPTION_ENUM ||
+              String(planModel) === `MODEL_PLACEHOLDER_M${AUTOPILOT_OPTION_ENUM - 1000}`;
+            if (isAutopilotSentinel) {
+              deleteManualPin(pinKey);
+              autoSeededTargets.delete(pinKey);
+            }
             const pin = getManualPinEntry(pinKey);
             const isPinned = Boolean(
               entry?.enumVal && pin && pin.model === entry.enumVal
             );
             let replacement = null;
             let reason = '';
-            if (entry && entry.quota < (isPinned ? EMERGENCY_PIN_FLOOR : QUOTA_HARD_FLOOR)) {
+            // Substitute Auto sentinel with the project profile model before sending RPC
+            if (isAutopilotSentinel) {
+              const profile =
+                resolveProjectProfileForConversation(reduxStore, body.cascadeId) ||
+                'orchestrator';
+              replacement = resolveAutopilotModelForProfile(catalog, profile);
+              reason = `${profile} profile`;
+            } else if (entry && entry.quota < (isPinned ? EMERGENCY_PIN_FLOOR : QUOTA_HARD_FLOOR)) {
               const profile =
                 resolveProjectProfileForConversation(reduxStore, body.cascadeId) ||
                 'orchestrator';
@@ -2379,7 +2398,8 @@
     const configs = store?.getState()?.userStatus?.cascadeModelConfigData?.clientModelConfigs;
     if (Array.isArray(configs)) {
       for (const cfg of configs) {
-        if (!cfg) continue;
+        // Exclude the synthetic Auto reset entry from executable catalog candidates
+        if (!cfg || cfg.modelId === AUTOPILOT_OPTION_MODEL_ID) continue;
         const mid = cfg.modelId || '';
         const numVal = cfg.modelOrAlias?.choice?.value;
         const enumVal = typeof numVal === 'number' ? numVal : 0;
@@ -3051,6 +3071,46 @@
     const unlockedConfigs = [];
     const unlockedLabels = [];
 
+    const hasSorts = Array.isArray(data.clientModelSorts) && data.clientModelSorts.length > 0;
+    // Inject synthetic Auto reset entry at the start of unlocked dropdown options
+    if (
+      hasSorts &&
+      !existingModelIds.has(AUTOPILOT_OPTION_MODEL_ID) &&
+      !existingEnums.has(AUTOPILOT_OPTION_ENUM) &&
+      !usedLabels.has(AUTOPILOT_OPTION_LABEL)
+    ) {
+      const autopilotModelOrAlias = cloneWithProto(templateConfig.modelOrAlias, {
+        $typeName: 'exa.codeium_common_pb.ModelOrAlias',
+        choice: { case: 'model', value: AUTOPILOT_OPTION_ENUM },
+      });
+      const mimeTypes =
+        templateConfig.supportedMimeTypes && typeof templateConfig.supportedMimeTypes === 'object'
+          ? { ...templateConfig.supportedMimeTypes }
+          : {};
+      const autopilotCfg = cloneWithProto(templateConfig, {
+        $typeName: 'exa.codeium_common_pb.ClientModelConfig',
+        label: AUTOPILOT_OPTION_LABEL,
+        modelOrAlias: autopilotModelOrAlias,
+        disabled: false,
+        supportsImages: true,
+        isRecommended: true,
+        quotaInfo: undefined,
+        tagTitle: 'Autopilot',
+        tagDescription: 'Reset manual model pin and use project profile Autopilot',
+        supportedMimeTypes: mimeTypes,
+        modelId: AUTOPILOT_OPTION_MODEL_ID,
+      });
+      Object.defineProperty(autopilotCfg, '__jetskiUnlockedModel', {
+        value: true,
+        enumerable: false,
+      });
+      existingModelIds.add(AUTOPILOT_OPTION_MODEL_ID);
+      existingEnums.add(AUTOPILOT_OPTION_ENUM);
+      usedLabels.add(AUTOPILOT_OPTION_LABEL);
+      unlockedConfigs.push(autopilotCfg);
+      unlockedLabels.push(AUTOPILOT_OPTION_LABEL);
+    }
+
     for (const modelId of candidateIds) {
       if (
         !modelId ||
@@ -3247,12 +3307,76 @@
       ) {
         // Record stepCount alongside the manual pick so older trajectory turns cannot revert it on F5
         const rawCid = action.payload.conversationId || '';
+        // Fall back to active cascade ID if conversationId is omitted in draft state
+        const activeCid =
+          rawCid ||
+          store.getState()?.conversation?.cascadeId ||
+          store.getState()?.conversation?.convoState?.cascadeId ||
+          '';
         const pinKey = resolveDraftPinKey(store, rawCid);
         const stepCount = rawCid
           ? Number(store.getState()?.trajectorySummaries?.summaries?.[rawCid]?.stepCount ?? 0)
           : 0;
         const pickedModel = action.payload.model;
         const catalog = buildModelCatalogIndex(store);
+
+        // Selecting Auto unpins the chat/draft and resets immediately to project profile
+        if (pickedModel === AUTOPILOT_OPTION_ENUM) {
+          deleteManualPin(pinKey);
+          autoSeededTargets.delete(pinKey);
+          // Purge active cascade ID pin when different from draft pin key
+          if (activeCid && activeCid !== pinKey) {
+            deleteManualPin(activeCid);
+            autoSeededTargets.delete(activeCid);
+          }
+          // Clear unsent draft pin for the active project
+          const draftKey = resolveDraftPinKey(store, '');
+          if (draftKey && draftKey !== pinKey) {
+            deleteManualPin(draftKey);
+            autoSeededTargets.delete(draftKey);
+          }
+          const targetCid = rawCid || activeCid;
+          const profile =
+            resolveProjectProfileForConversation(store, targetCid) || 'orchestrator';
+          const target =
+            resolveAutopilotModelForProfile(catalog, profile) ||
+            catalog.byId.get('auto') ||
+            catalog.byEnum.values().next().value;
+          // Dispatch resolved profile model and update UI toast if a valid target exists
+          if (target && target.enumVal) {
+            autoSeededTargets.set(pinKey, `${profile}:${target.enumVal}`);
+            showAutopilotToast(AUTOPILOT_OPTION_LABEL, target.label, `${profile} profile`);
+            // Synchronize active conversation Redux slice when pick originated from draft header
+            if (
+              !rawCid &&
+              activeCid &&
+              store.getState()?.modelSelection?.byConversation?.[activeCid]
+            ) {
+              isInternalDispatch = true;
+              try {
+                store.dispatch({
+                  type: 'modelSelection/modelPicked',
+                  payload: {
+                    conversationId: activeCid,
+                    model: target.enumVal,
+                    pick: { atStep: 999999, queuedMessageIds: [] },
+                  },
+                });
+              } finally {
+                isInternalDispatch = false;
+              }
+            }
+            return origDispatch.call(this, {
+              ...action,
+              payload: {
+                ...action.payload,
+                model: target.enumVal,
+                ...(rawCid ? { pick: { atStep: 999999, queuedMessageIds: [] } } : {}),
+              },
+            });
+          }
+        }
+
         const entry = catalog.byEnum.get(pickedModel);
         if (entry && entry.quota < EMERGENCY_PIN_FLOOR) {
           const profile =
