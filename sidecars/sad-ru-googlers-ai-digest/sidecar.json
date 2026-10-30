@@ -1,0 +1,32 @@
+{
+  "builtin": "schedule",
+  "args": [
+    "CRON_TZ=America/New_York 0 18 * * *",
+    "env",
+    "-u",
+    "ANTIGRAVITY_SOURCE_METADATA",
+    "agentapi",
+    "new-conversation",
+    "--title=Sad RU Googlers AI digest",
+    "--",
+    "Ежедневный дайджест ИИ-находок из чата Sad RU Googlers (HISTORY OFF) (`spaces/AAAAn_HZbYs`), где сообщения стираются каждые 24 часа.\n\n1. Вызови MCP-инструмент `list_messages` сервера `google_chat_google_chat` (`~/.gemini/jetski/mcp/google_chat_google_chat/list_messages.json`) для `conversationId: \"spaces/AAAAn_HZbYs\"` с `pageSize: 50` (пролистай `nextPageToken`, чтобы охватить все сообщения за последние 24 часа).\n2. Отфильтруй только треды и сообщения, относящиеся к ИИ, LLM, Jetski, агентам, скиллам, промптам, моделям, квотам, MCP и автоматизации разработки (игнорируй бытовой флуд и оффтоп). Сверься с `/usr/local/google/home/jlavrova/.gemini/config/sad_ru_googlers_ai_digest.md`, чтобы не дублировать уже сохранённые сообщения.\n3. Если в сообщениях упоминаются пути к скиллам/конфигам/правилам в `//depot/...` или `configs/users/...`, прочитай их через `/google/src/files/head/depot/...` или найди через `cs --tool_tag=JETSKI`.\n4. Если нашлось что-то новое и полезное по ИИ: допиши структурированную запись за сегодняшнюю дату в `/usr/local/google/home/jlavrova/.gemini/config/sad_ru_googlers_ai_digest.md` (с датой/временем в ET, авторами, сутью, ссылками на файлы и сравнением с нашим сетапом в `~/.gemini/config`) и выведи краткую выжимку в чат на русском языке (неформально на «ты», женский род от лица агента). Если за сутки ничего по ИИ не было, ничего не пиши в файл и ответь одной строкой: «За последние 24 часа в Sad RU Googlers ничего нового по ИИ не было.»"
+  ],
+  "restart_policy": "always",
+  "display_name": "Sad RU Googlers AI Digest (Daily 6:00 PM ET)",
+  "description": "Every day at 6:00 PM America/New_York (before the 24-hour history wipe), scans 'Sad RU Googlers (HISTORY OFF)' (spaces/AAAAn_HZbYs) for AI/Jetski skills, prompts, and workflows, archives new findings to ~/.gemini/config/sad_ru_googlers_ai_digest.md, and reports a concise digest.",
+  "agent_permissions": {
+    "workspace_uris": [
+      "file:///usr/local/google/home/jlavrova/.gemini/config"
+    ],
+    "access_grants": [
+      "mcp(google_chat_google_chat/list_messages)",
+      "mcp(google_chat_google_chat/search_messages)",
+      "mcp(google_chat_google_chat/search_conversations)",
+      "read_file(/usr/local/google/home/jlavrova/.gemini/config)",
+      "write_file(/usr/local/google/home/jlavrova/.gemini/config/sad_ru_googlers_ai_digest.md)",
+      "read_file(/google/src/files/head/depot)",
+      "command(cs --tool_tag=JETSKI)",
+      "command(python3 /usr/local/google/home/jlavrova/.gemini/config/hooks/chat_lifecycle.py)"
+    ]
+  }
+}
