@@ -2711,6 +2711,12 @@ def create_handoff(
     )
   if next_step_prompt:
     prompt = f"{prompt}\n\nNext immediate task: {next_step_prompt}"
+  # The prompt is English for the agent; without this line new chats answer the user in
+  # English, since the auto-generated prompt is the only "user" message they have seen
+  prompt = (
+      f"{prompt}\n\nThis prompt is auto-generated and does not set the chat language: talk to "
+      f"the user in Russian (their language) unless they write to you in another language."
+  )
 
   # 5. Launch the continuation: exact plan model via LS RPC, else agentapi tier.
   project_id_final = project_id if project_id and project_id != "outside-of-project" else "outside-of-project"
@@ -3000,6 +3006,12 @@ def create_next_task(
   )
   if next_step_prompt:
     prompt = f"{prompt}\n\nNext immediate task: {next_step_prompt}"
+  # The prompt is English for the agent; without this line new chats answer the user in
+  # English, since the auto-generated prompt is the only "user" message they have seen
+  prompt = (
+      f"{prompt}\n\nThis prompt is auto-generated and does not set the chat language: talk to "
+      f"the user in Russian (their language) unless they write to you in another language."
+  )
 
   seeded_for = ""
 
