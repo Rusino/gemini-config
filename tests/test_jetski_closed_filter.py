@@ -1586,6 +1586,75 @@ const liveBucketBtn = (k) =>
     behavior: 'smooth',
   });
 
+  // Verify collapse-first "Collapse All / Expand All" projects button in sidebar filter bar
+  const collapseBtn = actionRow.querySelector('.jetski-collapse-projects-btn');
+  assert(collapseBtn, 'Collapse projects button must be mounted inside actionRow filter bar');
+  assert.strictEqual(
+    collapseBtn.getAttribute('data-testid'),
+    'jetski-collapse-projects-btn'
+  );
+
+  // Set up 3 projects in vlistProps: proj-1 (open), proj-2 (open), proj-3 (collapsed)
+  vlistProps.items.push(
+    { type: 'header', id: 'proj-2', isCollapsed: false },
+    { type: 'header', id: 'proj-3', isCollapsed: true }
+  );
+  const toggledByCollapseAll = [];
+  vlistProps.onToggleCollapseSection = (id) => {
+    toggledByCollapseAll.push(id);
+    const it = vlistProps.items.find(
+      (x) => x && x.type === 'header' && (x.id === id || x.id === 'header-' + id)
+    );
+    if (it) it.isCollapsed = !it.isCollapsed;
+  };
+
+  advanceClock();
+  for (const sub of subscribers) sub();
+  while (rafCallbacks.length > 0) rafCallbacks.shift()();
+
+  assert.strictEqual(collapseBtn.getAttribute('data-action'), 'collapse');
+  assert.strictEqual(collapseBtn.textContent, '⇈');
+  assert.strictEqual(
+    collapseBtn.getAttribute('aria-label'),
+    '⇈ Collapse all projects (2/3 open)'
+  );
+
+  // First click: collapses all open projects (only proj-1 and proj-2 need toggling)
+  toggledByCollapseAll.length = 0;
+  advanceClock();
+  collapseBtn.dispatchEvent('pointerdown', { button: 0 });
+  collapseBtn.dispatchEvent('click');
+
+  assert.deepStrictEqual(toggledByCollapseAll.sort(), ['proj-1', 'proj-2']);
+  assert.strictEqual(collapseBtn.getAttribute('data-action'), 'expand');
+  assert.strictEqual(collapseBtn.textContent, '⇊');
+  assert.strictEqual(
+    collapseBtn.getAttribute('aria-label'),
+    '⇊ Expand all projects (3 collapsed)'
+  );
+  const allCollapsed = vlistProps.items
+    .filter((x) => x && x.type === 'header')
+    .every((x) => x.isCollapsed);
+  assert.strictEqual(allCollapsed, true, 'All project headers must be collapsed');
+
+  // Second click: expands all projects (all 3 need toggling)
+  toggledByCollapseAll.length = 0;
+  advanceClock();
+  collapseBtn.dispatchEvent('pointerdown', { button: 0 });
+  collapseBtn.dispatchEvent('click');
+
+  assert.deepStrictEqual(toggledByCollapseAll.sort(), ['proj-1', 'proj-2', 'proj-3']);
+  assert.strictEqual(collapseBtn.getAttribute('data-action'), 'collapse');
+  assert.strictEqual(collapseBtn.textContent, '⇈');
+  assert.strictEqual(
+    collapseBtn.getAttribute('aria-label'),
+    '⇈ Collapse all projects (3/3 open)'
+  );
+  const allExpanded = vlistProps.items
+    .filter((x) => x && x.type === 'header')
+    .every((x) => !x.isCollapsed);
+  assert.strictEqual(allExpanded, true, 'All project headers must be expanded');
+
   // Verify Needs-Reaction inbox widget mounted right before vlistEl and shows only unseen chats
   const inboxEl = bodyEl.querySelector('.jetski-needs-reaction-inbox');
   assert(inboxEl, 'Needs-Reaction inbox widget must be mounted');

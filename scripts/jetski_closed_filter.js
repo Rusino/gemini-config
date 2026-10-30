@@ -22,6 +22,8 @@
   const INBOX_SEEN_BTN_CLASS = 'jetski-inbox-seen-btn';
   const INBOX_ARCHIVE_BTN_CLASS = 'jetski-inbox-archive-btn';
   const BUTTON_CLASS = 'jetski-closed-chats-filter-btn';
+  // Collapse-first button in the sidebar filter bar to collapse or expand all project folders
+  const COLLAPSE_PROJECTS_BTN_CLASS = 'jetski-collapse-projects-btn';
   const TITLEBAR_BTN_CLASS = 'jetski-titlebar-archive-btn';
   // Live context window volume pill rendered before Search in each conversation titlebar
   const TITLEBAR_CONTEXT_BADGE_CLASS = 'jetski-titlebar-context-badge';
@@ -4022,6 +4024,32 @@
         align-items: center;
         justify-content: center;
       }
+      .${COLLAPSE_PROJECTS_BTN_CLASS} {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 20px;
+        height: 20px;
+        padding: 0;
+        margin-left: 1px;
+        border-radius: 4px;
+        border: none;
+        background: transparent;
+        color: var(--muted-foreground, #9aa0a6);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        font-size: 11.5px;
+        font-weight: 600;
+        line-height: 1;
+        cursor: pointer;
+        user-select: none;
+        opacity: 0.72;
+        transition: background-color 120ms ease, opacity 120ms ease, color 120ms ease;
+      }
+      .${COLLAPSE_PROJECTS_BTN_CLASS}:hover {
+        background: var(--sidebar-secondary, rgba(128, 134, 139, 0.18));
+        color: var(--foreground, #e8eaed);
+        opacity: 1;
+      }
 
       /* Style the right-side ⏳ indicator and hide false unread dots while waiting on tasks */
       .${ROW_BG_WAIT_INDICATOR_CLASS} {
@@ -6388,11 +6416,141 @@
 
   window.__jetskiChainNav = { syncConversationChainNavigators };
 
-  // Injects the 3-button filter bar inline inside actionRow before Display Options
+  // Reads expanded/collapsed counts across all sidebar projects from VirtualizedConversationList
+  function getProjectCollapseStats() {
+    const ctrl = findSidebarListController();
+    const items = ctrl?.props?.items;
+    const headers = [];
+    if (Array.isArray(items)) {
+      for (const it of items) {
+        if (it && it.type === 'header' && typeof it.id === 'string') {
+          const projectId = it.id.replace(/^header-/, '');
+          if (projectId) {
+            headers.push({
+              projectId,
+              isCollapsed: Boolean(it.isCollapsed),
+            });
+          }
+        }
+      }
+    }
+    if (headers.length > 0) {
+      let expandedCount = 0;
+      let collapsedCount = 0;
+      for (const h of headers) {
+        if (h.isCollapsed) collapsedCount++;
+        else expandedCount++;
+      }
+      return {
+        ctrl,
+        headers,
+        expandedCount,
+        collapsedCount,
+        totalCount: headers.length,
+      };
+    }
+
+    // Fall back to DOM project header buttons before VirtualizedConversationList Fiber is ready
+    const domHeaders = document.querySelectorAll(
+      'div[data-sidebar-section-drop-id]:not([data-sidebar-row-id]) ' +
+        'button[data-testid="project-header"]'
+    );
+    let domExpanded = 0;
+    let domCollapsed = 0;
+    for (const btn of domHeaders) {
+      const ariaExp = btn.getAttribute('aria-expanded');
+      const dataState = btn.getAttribute('data-state');
+      if (ariaExp === 'false' || dataState === 'closed') {
+        domCollapsed++;
+      } else {
+        domExpanded++;
+      }
+    }
+    return {
+      ctrl,
+      headers: [],
+      expandedCount: domExpanded,
+      collapsedCount: domCollapsed,
+      totalCount: domExpanded + domCollapsed,
+    };
+  }
+
+  // Collapse-first: shows Collapse whenever at least one project is open; switches to Expand
+  // only when all projects are already collapsed
+  function updateCollapseProjectsButtonUI(btn, stats) {
+    if (!btn) return;
+    const s = stats || getProjectCollapseStats();
+    const shouldCollapse = s.totalCount === 0 || s.expandedCount > 0;
+    const action = shouldCollapse ? 'collapse' : 'expand';
+    const icon = shouldCollapse ? '⇈' : '⇊';
+    const label = shouldCollapse
+      ? s.totalCount > 0
+        ? `⇈ Collapse all projects (${s.expandedCount}/${s.totalCount} open)`
+        : '⇈ Collapse all projects'
+      : `⇊ Expand all projects (${s.collapsedCount} collapsed)`;
+    setAttrIfChanged(btn, 'data-action', action);
+    setAttrIfChanged(btn, 'data-expanded-count', String(s.expandedCount));
+    setAttrIfChanged(btn, 'data-collapsed-count', String(s.collapsedCount));
+    setAttrIfChanged(btn, 'aria-label', label);
+    if (btn.textContent !== icon) {
+      btn.textContent = icon;
+    }
+    if (btn.hasAttribute('title')) {
+      btn.removeAttribute('title');
+    }
+  }
+
+  // Collapses all open project folders when any project is open, or expands all when all are shut
+  function toggleAllProjectsCollapse() {
+    const s = getProjectCollapseStats();
+    const shouldCollapse = s.totalCount === 0 || s.expandedCount > 0;
+    const ctrl = s.ctrl;
+    if (ctrl?.props && Array.isArray(ctrl.props.items)) {
+      // Uncollapse the outer Workspaces section header first when expanding all projects
+      if (!shouldCollapse && typeof ctrl.props.onToggleSectionHeader === 'function') {
+        for (const item of ctrl.props.items) {
+          if (item && item.type === 'section-header' && item.isCollapsed) {
+            ctrl.props.onToggleSectionHeader(item.collapseId || item.id);
+          }
+        }
+      }
+      if (typeof ctrl.props.onToggleCollapseSection === 'function' && s.headers.length > 0) {
+        for (const h of s.headers) {
+          if (shouldCollapse && !h.isCollapsed) {
+            ctrl.props.onToggleCollapseSection(h.projectId);
+          } else if (!shouldCollapse && h.isCollapsed) {
+            ctrl.props.onToggleCollapseSection(h.projectId);
+          }
+        }
+      }
+    }
+    ensureFilterBar();
+    scheduleSync();
+  }
+
+  function createCollapseProjectsButton() {
+    const btn = document.createElement('button');
+    btn.className = COLLAPSE_PROJECTS_BTN_CLASS;
+    btn.type = 'button';
+    btn.setAttribute('data-testid', 'jetski-collapse-projects-btn');
+    bindHoverBubble(btn, () => btn.getAttribute('aria-label') || '⇈ Collapse all projects');
+    bindActionBtnHandlers(btn, () => {
+      toggleAllProjectsCollapse();
+      const label = btn.getAttribute('aria-label');
+      if (label) {
+        showActionPillBubble(btn, label);
+      }
+    });
+    return btn;
+  }
+
+  // Injects the 3-button filter bar and collapse-all projects button inside actionRow
   function ensureFilterBar() {
     const displayOptionsBtns = document.querySelectorAll(
       'button[aria-label="Display Options"]'
     );
+    // Snapshot folder collapse counts once before updating each mounted filter bar instance
+    const collapseStats = getProjectCollapseStats();
     for (const displayOptionsBtn of displayOptionsBtns) {
       const actionRow = displayOptionsBtn.parentElement;
       if (!actionRow) continue;
@@ -6414,6 +6572,14 @@
         const btn = bar.querySelector(`button[data-bucket="${bucketKey}"]`);
         updateBucketButtonUI(btn, bucketKey);
       }
+
+      // Mount collapse-first projects button directly after state filter buttons
+      let collapseBtn = bar.querySelector(`.${COLLAPSE_PROJECTS_BTN_CLASS}`);
+      if (!collapseBtn) {
+        collapseBtn = createCollapseProjectsButton();
+        bar.appendChild(collapseBtn);
+      }
+      updateCollapseProjectsButtonUI(collapseBtn, collapseStats);
     }
   }
 
@@ -8004,6 +8170,7 @@
         // Ignore mutations on the Needs-Reaction inbox container itself
         target.className === INBOX_CLASS ||
         target.className === BUTTON_CLASS ||
+        target.className === COLLAPSE_PROJECTS_BTN_CLASS ||
         target.className === TITLEBAR_BTN_CLASS ||
         // Ignore async token-count updates on the context pill to avoid feedback sync loops
         target.className === TITLEBAR_CONTEXT_BADGE_CLASS ||
@@ -8021,6 +8188,7 @@
             // Skip subtree mutations inside the Needs-Reaction inbox widget
             target.closest(`.${INBOX_CLASS}`) ||
             target.closest(`.${BUTTON_CLASS}`) ||
+            target.closest(`.${COLLAPSE_PROJECTS_BTN_CLASS}`) ||
             target.closest(`.${TITLEBAR_BTN_CLASS}`) ||
             // Skip text node mutations inside the context volume pill
             target.closest(`.${TITLEBAR_CONTEXT_BADGE_CLASS}`) ||
@@ -8093,6 +8261,7 @@
       // Remove the Needs-Reaction inbox widget on script reload
       `.${INBOX_CLASS}`,
       `.${BUTTON_CLASS}`,
+      `.${COLLAPSE_PROJECTS_BTN_CLASS}`,
       `.${TITLEBAR_BTN_CLASS}`,
       // Remove titlebar context pills so the fresh instance mounts its own closures
       `.${TITLEBAR_CONTEXT_BADGE_CLASS}`,
