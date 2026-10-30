@@ -43,7 +43,23 @@ description: "Global communication style, grammatical gender, and critical feedb
 # Development Environment
 
 - **Time Zone (America/New_York)**: The user is in New York. Always state times and deadlines in the user's local time (ET). When the source is in another zone (PT events, UTC logs), convert and give ET first, with the original in parentheses only if useful (e.g. "14:00 по Нью-Йорку (11:00 PT)"). Never leave a bare PT or UTC time in a reply.
-- **CL / PR Status Timestamps**: Whenever listing, summarizing, or displaying CLs or PRs (in chat tables/lists or in Flight Deck UI), always include the date, time (in ET), and relative age of the last status change (e.g., `Oct 26 at 14:15 ET (2h ago)` or `14:15 ET (42m ago)` for today).
+- **CL / PR Status Reporting (Timestamps, WIP/Draft, Companion Links, and Missing Reviewers)**:
+  Whenever listing, summarizing, or displaying CLs or PRs (in chat tables/lists or in Flight Deck
+  UI), always include:
+  1. **Status timestamp**: The date, time (in ET), and relative age of the last status change
+     (e.g., `Oct 26 at 14:15 ET (2h ago)` or `14:15 ET (42m ago)` for today).
+  2. **Explicit WIP / Draft status**: Explicitly mark any change that has Gerrit
+     `work_in_progress: true`, a `WIP` / `Draft` / `DO NOT SUBMIT` subject prefix, or GitHub
+     `isDraft: true` as **`WIP`** (or **`Draft`**). Never present a WIP/Draft change as an active
+     review waiting on others without the `WIP`/`Draft` badge.
+  3. **Companion CL / PR cross-links**: Explicitly identify companion review CLs/PRs and link them
+     to their parent CL/PR (`Companion → cl/<N>` or `Companion → PR #<N>`), and note on the parent
+     when a companion exists (`Has companion cl/<M> (WIP)`).
+  4. **Missing reviewers / approvals for submit**: Explicitly state when an open change has no
+     reviewers assigned (`No reviewers assigned` / `Needs 2 reviewers`), needs additional
+     reviewers to meet the repository's submit requirement (e.g., external-author Gerrit CLs
+     under `Review-Enforcement` or `flutter/flutter` PRs requiring 2 approvals), or has only 1 of 2
+     required approvals (`CR +1 (1/2) · Needs +1 CR`).
 - **Local Git + `google3` Reference**:
   - The user primarily works on **Open Source** projects using standard **Git** repositories on the local filesystem (use `git`, `rg`, `grep`, `find` for local repositories).
   - You **may** look into `google3` (using `code_search`) whenever referencing internal code, callers, or examples in `google3` is useful.

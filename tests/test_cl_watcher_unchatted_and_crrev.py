@@ -720,13 +720,32 @@ console.log(JSON.stringify({
     rec_comp = state["items"]["gerrit:1410416@c-archived-1409697"]
     self.assertEqual(rec_comp["conversation_id"], "c-archived-1409697")
     self.assertEqual(rec_comp["companion_to"], "gerrit:1409697")
+    self.assertEqual(rec_comp["companion_to_label"], "CL 1409697")
+    self.assertEqual(
+        rec_comp["companion_to_url"], "https://skia-review.googlesource.com/c/1409697"
+    )
     self.assertFalse(rec_comp["single_target"])
+    self.assertEqual(
+        rec_parent["companions"],
+        [{
+            "item_key": "gerrit:1410416",
+            "target_id": "1410416",
+            "label": "CL 1410416",
+            "url": "https://skia-review.googlesource.com/c/1410416",
+            "is_wip": True,
+        }],
+    )
 
     # 3. 195123 companion PR was linked to 195122's active chat
     self.assertIn("github:195123@c-active-195122", state["items"])
     rec_pr_comp = state["items"]["github:195123@c-active-195122"]
     self.assertEqual(rec_pr_comp["conversation_id"], "c-active-195122")
     self.assertEqual(rec_pr_comp["companion_to"], "github:195122")
+    self.assertEqual(rec_pr_comp["companion_to_label"], "PR #195122")
+    self.assertEqual(
+        rec_pr_comp["companion_to_url"],
+        "https://github.com/flutter/flutter/pull/195122",
+    )
     self.assertFalse(rec_pr_comp["single_target"])
 
     # None of them remain unchatted
@@ -757,6 +776,162 @@ console.log(JSON.stringify({
     self.assertTrue(res_arch["ok"])
     self.assertTrue(res_arch["already_existed"])
     self.assertEqual(res_arch["conversation_id"], "c-archived-1409697")
+
+  def test_fetch_gerrit_cl_status_wip_and_submit_requirements(self):
+    wip_self_payload = {
+        "status": "NEW",
+        "subject": "[skparagraph] Implement feature",
+        "owner": {"email": "jlavrova@google.com", "name": "Julia Lavrova"},
+        "current_revision": "sha111",
+        "revisions": {"sha111": {"_number": 1}},
+        "work_in_progress": True,
+        "reviewers": {"REVIEWER": []},
+        "labels": {},
+        "messages": [],
+    }
+    with mock.patch.object(
+        w.urllib.request, "urlopen", return_value=_http_json_resp(wip_self_payload)
+    ), mock.patch.object(w, "gerrit_mergeable", return_value=True):
+      res = w.fetch_gerrit_cl_status("1410001", [], [], skia_dir="/nonexistent")
+    self.assertTrue(res["ok"])
+    self.assertTrue(res["is_wip"])
+    self.assertEqual(res["wip_label"], "WIP")
+    self.assertTrue(res["is_draft"])
+    self.assertFalse(res["in_development"])
+    self.assertEqual(res["missing_reviewers_to_assign"], 1)
+    self.assertEqual(res["reviewer_status"], "No reviewers assigned")
+
+    external_payload = {
+        "status": "NEW",
+        "subject": "[skparagraph] First-line indent",
+        "owner": {"email": "wselna123@gmail.com", "name": "William Selna"},
+        "current_revision": "sha222",
+        "revisions": {"sha222": {"_number": 2}},
+        "reviewers": {"REVIEWER": [{"email": "jlavrova@google.com"}]},
+        "labels": {
+            "Code-Review": {
+                "all": [{"email": "jlavrova@google.com", "value": 1}]
+            }
+        },
+        "submit_requirements": [
+            {"name": "Review-Enforcement", "status": "UNSATISFIED"}
+        ],
+        "messages": [],
+    }
+    with mock.patch.object(
+        w.urllib.request, "urlopen", return_value=_http_json_resp(external_payload)
+    ), mock.patch.object(w, "gerrit_mergeable", return_value=True):
+      res = w.fetch_gerrit_cl_status("1409697", [], [], skia_dir="/nonexistent")
+    self.assertTrue(res["ok"])
+    self.assertTrue(res["is_external"])
+    self.assertFalse(res["is_wip"])
+    self.assertEqual(res["required_approvals"], 2)
+    self.assertEqual(res["approved_count"], 1)
+    self.assertEqual(res["assigned_reviewers_count"], 1)
+    self.assertEqual(res["missing_reviewers_to_assign"], 1)
+    self.assertEqual(res["missing_approvals"], 1)
+    self.assertEqual(res["cr_summary"], "+1 (1/2)")
+    self.assertIn("Needs +1 more reviewer", res["reviewer_status"])
+
+  def test_fetch_github_pr_status_draft_companion_and_two_approvals(self):
+    pr_payload = {
+        "number": 195123,
+        "title": "[web_paragraph] Avoid browser queries",
+        "state": "OPEN",
+        "isDraft": False,
+        "headRefName": "companion-pr-195122",
+        "headRefOid": "head1234567890",
+        "reviewDecision": "REVIEW_REQUIRED",
+        "author": {"login": "wselna"},
+        "latestReviews": [{"author": {"login": "jlavrova"}, "state": "APPROVED"}],
+        "reviews": [{"author": {"login": "jlavrova"}, "state": "APPROVED"}],
+        "reviewRequests": [],
+        "comments": [],
+        "commits": [],
+        "statusCheckRollup": [],
+    }
+    with mock.patch.object(
+        w.subprocess, "check_output", return_value=json.dumps(pr_payload)
+    ):
+      res = w.fetch_github_pr_status("195123")
+    self.assertTrue(res["ok"])
+    self.assertEqual(res["required_approvals"], 2)
+    self.assertEqual(res["approved_count"], 1)
+    self.assertEqual(res["assigned_reviewers_count"], 1)
+    self.assertEqual(res["missing_reviewers_to_assign"], 1)
+    self.assertEqual(res["missing_approvals"], 1)
+    self.assertEqual(res["cr_summary"], "✓ 1/2")
+
+    # Explicit [WIP] in title flags PR as WIP with "WIP" label
+    pr_payload["title"] = "[WIP] [web_paragraph] Avoid browser queries"
+    with mock.patch.object(
+        w.subprocess, "check_output", return_value=json.dumps(pr_payload)
+    ):
+      res_wip = w.fetch_github_pr_status("195123")
+    self.assertTrue(res_wip["is_wip"])
+    self.assertEqual(res_wip["wip_label"], "WIP")
+
+    # Native GitHub isDraft flags PR as WIP with "Draft" label
+    pr_payload["title"] = "[web_paragraph] Avoid browser queries"
+    pr_payload["isDraft"] = True
+    with mock.patch.object(
+        w.subprocess, "check_output", return_value=json.dumps(pr_payload)
+    ):
+      res_draft = w.fetch_github_pr_status("195123")
+    self.assertTrue(res_draft["is_wip"])
+    self.assertEqual(res_draft["wip_label"], "Draft")
+
+  def test_dashboard_renders_wip_companion_and_reviewer_gap_badges(self):
+    script_body = w.DASHBOARD_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    harness = script_body.split("\nboot();", 1)[0] + """
+const box = {jetski_box_url: 'https://jetski.corp.google.com/box/host'};
+const parentCl = {
+  item_key: 'gerrit:1409697', kind: 'gerrit', target_id: '1409697', status: 'NEW',
+  phase: 'WAITING_ON_REVIEWERS', is_self: false, is_external: true, in_my_attention: false,
+  is_draft: false, in_development: false, is_watching: true, conversation_id: 'c-archived-1409697',
+  project_name: 'Skia',
+  subject: '[skparagraph] Add first-line indentation to Paragraph::layout',
+  patchset: 3, url: 'https://skia-review.googlesource.com/c/1409697',
+  required_approvals: 2, approved_count: 1, assigned_reviewers_count: 1,
+  missing_reviewers_to_assign: 1, missing_approvals: 1, cr_summary: '+1 (1/2)',
+  companions: [{
+    item_key: 'gerrit:1410416', label: 'CL 1410416',
+    url: 'https://skia-review.googlesource.com/c/1410416', is_wip: true
+  }],
+};
+const compCl = {
+  item_key: 'gerrit:1410416', kind: 'gerrit', target_id: '1410416', status: 'NEW',
+  phase: 'WAITING_ON_REVIEWERS', is_self: true, is_external: false, in_my_attention: false,
+  is_draft: true, in_development: false, is_watching: false, conversation_id: 'c-archived-1409697',
+  project_name: 'Skia',
+  subject: '[skparagraph] Fix first-line indent edge cases',
+  patchset: 2, url: 'https://skia-review.googlesource.com/c/1410416',
+  is_wip: true, wip_label: 'WIP',
+  companion_to: 'gerrit:1409697', companion_to_label: 'CL 1409697',
+  companion_to_url: 'https://skia-review.googlesource.com/c/1409697',
+  required_approvals: 1, approved_count: 0, assigned_reviewers_count: 0,
+  missing_reviewers_to_assign: 1, missing_approvals: 1, cr_summary: '0',
+};
+console.log(JSON.stringify({
+  parentRow: rowHtml(parentCl, box),
+  parentState: stateHtml(parentCl),
+  compRow: rowHtml(compCl, box),
+  compState: stateHtml(compCl),
+  compCard: focusCard(compCl, box),
+}));
+"""
+    proc = subprocess.run(
+        ["node", "-e", harness], capture_output=True, text=True, check=True
+    )
+    out = json.loads(proc.stdout.strip())
+    self.assertIn("Has companion CL 1410416 (WIP)", out["parentRow"])
+    self.assertIn("Needs +1 reviewer (1/2)", out["parentState"])
+    self.assertIn('<span class="badge wip">WIP</span>', out["compRow"])
+    self.assertIn("Companion → CL 1409697", out["compRow"])
+    self.assertIn("No reviewers assigned", out["compState"])
+    self.assertIn('<span class="badge wip">WIP</span>', out["compCard"])
+    self.assertIn("Companion → CL 1409697", out["compCard"])
+    self.assertIn("No reviewers assigned", out["compCard"])
 
 
 if __name__ == "__main__":

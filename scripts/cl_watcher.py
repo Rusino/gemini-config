@@ -106,7 +106,23 @@ RE_PR_ID_GROUP = re.compile(
 )
 # Match explicit companion references in PR subjects/bodies (e.g. companion to #195122)
 RE_COMPANION_PR_REF = re.compile(
-    r"(?:companion\s+(?:to\s+)?(?:PR\s*#?|#)|(?:re|for)\s+(?:PR\s*#?|#))(\d{5,7})\b",
+    r"(?:companion\s+(?:(?:to|for)\s+)?(?:PR\s*#?|#)|"
+    r"(?:re|for)\s+(?:PR\s*#?|#)|"
+    r"(?:hypotheses|hypothesis|check|repro)\s+(?:about|for|on)\s+(?:PR\s*#?|#))"
+    r"(\d{5,7})\b",
+    re.IGNORECASE,
+)
+# Match explicit companion references to Gerrit changes in subjects
+RE_COMPANION_CL_REF = re.compile(
+    r"(?:companion\s+(?:(?:to|for)\s+)?(?:CL\s*|cl/|crrev(?:\.com)?/c/|skrev(?:\.com)?/)|"
+    r"(?:hypotheses|hypothesis|check|repro)\s+(?:about|for|on)\s+"
+    r"(?:CL\s*|cl/|crrev(?:\.com)?/c/|skrev(?:\.com)?/))"
+    r"(\d{5,8})\b",
+    re.IGNORECASE,
+)
+# Match GitHub companion head branch naming (companion-pr-<id>)
+RE_COMPANION_BRANCH = re.compile(
+    r"^companion-(?:pr|cl)?-?(\d{5,8})\b",
     re.IGNORECASE,
 )
 # Strip any trailing roll badge we previously attached to a title
@@ -117,10 +133,11 @@ RE_AUTOROLL_SUBJECT = re.compile(
     r"^Roll\s+(?:Skia\b|\S+\s+from\s+[0-9a-f]{7,40}\s+to\s+[0-9a-f]{7,40}\b)",
     re.IGNORECASE,
 )
-# Match explicit WIP/Draft prefixes in CL and PR subjects, after optional [module] tags
+# Match explicit WIP/Draft and DO NOT SUBMIT prefixes in CL and PR subjects
 RE_DRAFT_SUBJECT = re.compile(
-    r"^(?:\[(?!wip\]|draft\])[^\]]+\]\s*)*"
-    r"(?:\[(?:wip|draft)\]\s*|wip\b[:\s\-]*|draft\s*[:\-]\s*)",
+    r"^(?:\[(?!wip\b|draft\b|do\s+not\s+submit\b)[^\]]+\]\s*)*"
+    r"(?:\[(?:wip|draft|do\s+not\s+submit)[^\]]*\]\s*|"
+    r"(?:wip|draft|do\s+not\s+submit)\b[:\s\-]*)",
     re.IGNORECASE,
 )
 # Flight Deck chats discuss dashboard behavior rather than owning tracked CLs/PRs
@@ -757,7 +774,7 @@ def link_companion_changes_to_parent_chats(
     fetched_cache: dict[str, dict[str, Any]],
     all_chat_candidates: list[dict[str, Any]] | None = None,
 ) -> None:
-  """Links unchatted companion CLs or PRs to their parent change's chat."""
+  """Links companion CLs or PRs to their parent change and chat."""
   # Index known chatted changes from active discovered and any archived chats
   known_chats: dict[str, dict[str, Any]] = {
       d["item_key"]: d
@@ -769,14 +786,17 @@ def link_companion_changes_to_parent_chats(
       ckey = c.get("item_key")
       if ckey and c.get("conversation_id") and ckey not in known_chats:
         known_chats[ckey] = c
+  by_item_key: dict[str, dict[str, Any]] = {
+      d["item_key"]: d for d in active_discovered
+  }
 
   for d in active_discovered:
-    if d.get("conversation_id"):
-      continue
     ikey = d.get("item_key", "")
     info = fetched_cache.get(ikey) or {}
+    subj = str(info.get("subject") or d.get("title") or "")
     parent: dict[str, Any] | None = None
     parent_key = ""
+    is_comp = False
 
     if d.get("kind") == "gerrit":
       host = str(
@@ -784,32 +804,62 @@ def link_companion_changes_to_parent_chats(
           or info.get("host")
           or GERRIT_SKIA_HOST
       )
-      related = fetch_gerrit_related_cl_ids(host, d.get("target_id", ""))
-      for rel_id in related:
-        cand_key = f"gerrit:{rel_id}"
-        if cand_key in known_chats:
-          parent = known_chats[cand_key]
-          parent_key = cand_key
-          break
+      m_cl = RE_COMPANION_CL_REF.search(subj)
+      if m_cl:
+        cand_key = f"gerrit:{m_cl.group(1)}"
+        parent = known_chats.get(cand_key) or by_item_key.get(cand_key)
+        parent_key = cand_key
+        is_comp = True
+      else:
+        related = fetch_gerrit_related_cl_ids(host, d.get("target_id", ""))
+        for rel_id in related:
+          cand_key = f"gerrit:{rel_id}"
+          cand_parent = known_chats.get(cand_key) or by_item_key.get(cand_key)
+          if not cand_parent:
+            continue
+          rel_info = fetched_cache.get(cand_key) or {}
+          rel_is_self = bool(rel_info.get("is_self", False))
+          # A companion stacks on a non-self CL or is marked WIP/Draft/companion
+          is_candidate_comp = (
+              (not rel_is_self)
+              or bool(info.get("is_wip") or info.get("is_draft"))
+              or ("companion" in subj.lower())
+          )
+          # Self feature stacks inherit the shared chat without being labeled companions
+          if not d.get("conversation_id") and cand_parent.get("conversation_id"):
+            parent = cand_parent
+            parent_key = cand_key
+            is_comp = is_candidate_comp
+            break
+          if is_candidate_comp:
+            parent = cand_parent
+            parent_key = cand_key
+            is_comp = True
+            break
     elif d.get("kind") == "github":
-      subj = str(info.get("subject") or d.get("title") or "")
       m = RE_COMPANION_PR_REF.search(subj)
-      if m:
-        cand_key = f"github:{m.group(1)}"
-        if cand_key in known_chats:
-          parent = known_chats[cand_key]
-          parent_key = cand_key
+      branch_m = RE_COMPANION_BRANCH.match(str(info.get("head_ref_name") or ""))
+      ref_id = m.group(1) if m else (branch_m.group(1) if branch_m else "")
+      if ref_id:
+        cand_key = f"github:{ref_id}"
+        parent = known_chats.get(cand_key) or by_item_key.get(cand_key)
+        parent_key = cand_key
+        is_comp = True
+
+    if is_comp and parent_key:
+      d["companion_to"] = parent_key
+      d["is_companion"] = True
 
     if parent and parent.get("conversation_id"):
-      d["conversation_id"] = parent["conversation_id"]
-      d["title"] = parent.get("title", "")
-      d["project_id"] = parent.get("project_id", "")
-      d["project_name"] = parent.get("project_name", "")
-      d["chat_last_modified"] = parent.get("chat_last_modified", "")
-      d["chat_busy"] = parent.get("chat_busy", False)
-      d["chat_archived"] = parent.get("chat_archived", False)
+      if not d.get("conversation_id"):
+        d["conversation_id"] = parent["conversation_id"]
+        d["title"] = parent.get("title", "")
+        d["project_id"] = parent.get("project_id", "")
+        d["project_name"] = parent.get("project_name", "")
+        d["chat_last_modified"] = parent.get("chat_last_modified", "")
+        d["chat_busy"] = parent.get("chat_busy", False)
+        d["chat_archived"] = parent.get("chat_archived", False)
       d["single_target"] = False
-      d["companion_to"] = parent_key
       parent["single_target"] = False
 
 
@@ -1264,7 +1314,7 @@ def fetch_gerrit_cl_status(
     try:
       opts = (
           "o=CURRENT_REVISION&o=ALL_REVISIONS&o=MESSAGES"
-          "&o=DETAILED_ACCOUNTS&o=LABELS"
+          "&o=DETAILED_ACCOUNTS&o=LABELS&o=SUBMIT_REQUIREMENTS"
       )
       url = f"https://{host}/changes/{cl_id}/detail?{opts}"
       req = urllib.request.Request(url, headers={"User-Agent": "CLFlightDeck/1.0"})
@@ -1355,6 +1405,12 @@ def fetch_gerrit_cl_status(
           bool(d.get("work_in_progress"))
           or bool(RE_DRAFT_SUBJECT.match(subject))
       )
+      # Distinguish explicit Gerrit WIP flag from subject-prefix draft markers
+      wip_label = (
+          "WIP"
+          if (status == "NEW" and bool(d.get("work_in_progress")))
+          else ("Draft" if is_wip else "")
+      )
       # Draft and in-development buckets track only my own pre-review changes
       is_draft = is_self and is_wip
       in_development = (
@@ -1378,6 +1434,60 @@ def fetch_gerrit_cl_status(
       min_cr = min([v for _, v in cr_votes], default=0)
       max_cq = max([v for _, v in cq_votes], default=0)
       self_cr_vote = max((v for e, v in cr_votes if e in SELF_EMAILS), default=0)
+      # External authors on Skia and Chromium Gerrit need 2 Googler approvals (Review-Enforcement)
+      required_approvals = 2 if is_external else 1
+      approved_emails = {
+          e
+          for e, v in cr_votes
+          if v > 0 and e and e != owner_email
+      }
+      approved_count = len(approved_emails)
+      assigned_reviewers_count = len(set(non_owner_reviewers) | approved_emails)
+      missing_reviewers_to_assign = (
+          max(0, required_approvals - assigned_reviewers_count)
+          if status == "NEW"
+          else 0
+      )
+      submit_reqs = d.get("submit_requirements") or []
+      unsatisfied_review_reqs = [
+          str(sr.get("name") or "")
+          for sr in submit_reqs
+          if isinstance(sr, dict)
+          and str(sr.get("status") or "") == "UNSATISFIED"
+          and str(sr.get("name") or "")
+          in ("Code-Review", "Review-Enforcement", "Owners-Override")
+      ]
+      missing_approvals = (
+          max(
+              0,
+              required_approvals - approved_count,
+              1 if (unsatisfied_review_reqs and min_cr >= 0) else 0,
+          )
+          if status == "NEW"
+          else 0
+      )
+      if status != "NEW" or min_cr < 0:
+        reviewer_status = ""
+      elif assigned_reviewers_count == 0:
+        reviewer_status = (
+            f"Needs {required_approvals} reviewers"
+            if required_approvals > 1
+            else "No reviewers assigned"
+        )
+      elif missing_reviewers_to_assign > 0:
+        reviewer_status = (
+            f"Needs +{missing_reviewers_to_assign} more reviewer"
+            f"{'s' if missing_reviewers_to_assign > 1 else ''} "
+            f"({assigned_reviewers_count}/{required_approvals} assigned)"
+        )
+      elif missing_approvals > 0:
+        reviewer_status = (
+            f"Needs +{missing_approvals} CR ({approved_count}/{required_approvals} approved)"
+            if required_approvals > 1
+            else "Awaiting CR+1"
+        )
+      else:
+        reviewer_status = "Ready to submit"
       # Once I approved a non-self CL on the current code revision, any remaining review
       # or dry-run attention belongs to the author or second reviewer
       if not is_self and self_cr_vote > 0:
@@ -1529,10 +1639,18 @@ def fetch_gerrit_cl_status(
           "is_self": is_self,
           "is_external": is_external,
           "is_draft": is_draft,
+          "is_wip": is_wip,
+          "wip_label": wip_label,
           "in_development": in_development,
           "is_watching": is_watching,
           "reviewer_removed": reviewer_removed,
           "removed_at": removed_at,
+          "required_approvals": required_approvals,
+          "approved_count": approved_count,
+          "assigned_reviewers_count": assigned_reviewers_count,
+          "missing_reviewers_to_assign": missing_reviewers_to_assign,
+          "missing_approvals": missing_approvals,
+          "reviewer_status": reviewer_status,
           "patchset": ps_num,
           "revision": cur_sha,
           "commit_url": (
@@ -1545,7 +1663,17 @@ def fetch_gerrit_cl_status(
           "merge_conflict": merge_conflict,
           "tree_red": False,
           "cr_summary": (
-              f"+{max_cr}" if max_cr > 0 else (str(min_cr) if min_cr < 0 else "0")
+              f"+{max_cr} ({approved_count}/{required_approvals})"
+              if (
+                  max_cr > 0
+                  and required_approvals > 1
+                  and approved_count < required_approvals
+              )
+              else (
+                  f"+{max_cr}"
+                  if max_cr > 0
+                  else (str(min_cr) if min_cr < 0 else "0")
+              )
           ),
           "cq_status": cq_status,
           "cq_failed": cq_failed,
@@ -1773,7 +1901,8 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
             "--repo",
             "flutter/flutter",
             "--json",
-            "number,title,state,isDraft,author,mergedAt,headRefOid,reviews,comments,"
+            "number,title,state,isDraft,author,mergedAt,headRefOid,headRefName,"
+            "reviewDecision,latestReviews,reviews,comments,"
             # Include commits so author pushes after a review update the PR timeline
             "commits,statusCheckRollup,url,mergeable,reviewRequests,"
             "createdAt,updatedAt,closedAt",
@@ -1788,8 +1917,16 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
     author_login = str((d.get("author") or {}).get("login") or "")
     is_self = author_login in SELF_GITHUB_LOGINS
     head_sha = str(d.get("headRefOid") or "")
+    head_ref = str(d.get("headRefName") or "")
+    review_decision = str(d.get("reviewDecision") or "")
     is_wip = state == "OPEN" and (
         bool(d.get("isDraft")) or bool(RE_DRAFT_SUBJECT.match(subject))
+    )
+    # Distinguish native GitHub Draft PRs from [WIP] title tags
+    wip_label = (
+        "Draft"
+        if (state == "OPEN" and bool(d.get("isDraft")))
+        else ("WIP" if is_wip else "")
     )
     req_logins = [
         str(r.get("login") or r.get("name") or "")
@@ -1871,6 +2008,82 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
       cq_status = "✓ Checks green"
 
     reviews = d.get("reviews") or []
+    # flutter/flutter requires 2 approvals on external PRs; reviewDecision reflects branch rules
+    latest_reviews = [
+        r for r in (d.get("latestReviews") or reviews) if isinstance(r, dict)
+    ]
+    approved_by: set[str] = set()
+    changes_requested_by: set[str] = set()
+    for r in latest_reviews:
+      r_login = str((r.get("author") or {}).get("login") or "")
+      r_state = str(r.get("state") or "").upper()
+      if not r_login or r_login == author_login:
+        continue
+      if r_state == "APPROVED":
+        approved_by.add(r_login)
+        changes_requested_by.discard(r_login)
+      elif r_state == "CHANGES_REQUESTED":
+        changes_requested_by.add(r_login)
+        approved_by.discard(r_login)
+    approved_count = len(approved_by)
+    active_review_candidates = (
+        {u for u in req_logins if u and u != author_login}
+        | approved_by
+        | changes_requested_by
+        | {
+            u
+            for u in rev_logins
+            if u
+            and u != author_login
+            and u not in GITHUB_STATUS_BOTS
+            and u != "gemini-code-assist"
+            and not u.endswith("[bot]")
+            and not u.endswith("-bot")
+        }
+    )
+    assigned_reviewers_count = len(active_review_candidates)
+    required_approvals = (
+        2
+        if (review_decision == "REVIEW_REQUIRED" and approved_count >= 1)
+        else 1
+    )
+    missing_reviewers_to_assign = (
+        max(0, required_approvals - assigned_reviewers_count)
+        if state == "OPEN"
+        else 0
+    )
+    if state != "OPEN":
+      missing_approvals = 0
+    elif review_decision == "APPROVED":
+      missing_approvals = 0
+    elif review_decision == "REVIEW_REQUIRED":
+      missing_approvals = max(1, required_approvals - approved_count)
+    else:
+      missing_approvals = max(0, required_approvals - approved_count)
+
+    if state != "OPEN":
+      reviewer_status = ""
+    elif changes_requested_by or review_decision == "CHANGES_REQUESTED":
+      reviewer_status = "Changes requested"
+    elif assigned_reviewers_count == 0:
+      reviewer_status = "No reviewers assigned"
+    elif missing_reviewers_to_assign > 0:
+      reviewer_status = (
+          f"Needs +{missing_reviewers_to_assign} more reviewer"
+          f"{'s' if missing_reviewers_to_assign > 1 else ''} "
+          f"({assigned_reviewers_count}/{required_approvals} assigned)"
+      )
+    elif missing_approvals > 0:
+      reviewer_status = (
+          f"Needs +{missing_approvals} approval"
+          f"{'s' if missing_approvals > 1 else ''} "
+          f"({approved_count}/{required_approvals} approved)"
+          if required_approvals > 1
+          else "Awaiting approval"
+      )
+    else:
+      reviewer_status = "Approved"
+
     comments = d.get("comments") or []
     last_actor = author_login
     last_snippet = ""
@@ -2016,6 +2229,16 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         "is_self": is_self,
         "is_external": not is_self,
         "is_draft": is_draft,
+        "is_wip": is_wip,
+        "wip_label": wip_label,
+        "head_ref": head_ref,
+        "review_decision": review_decision,
+        "required_approvals": required_approvals,
+        "approved_count": approved_count,
+        "assigned_reviewers_count": assigned_reviewers_count,
+        "missing_reviewers_to_assign": missing_reviewers_to_assign,
+        "missing_approvals": missing_approvals,
+        "reviewer_status": reviewer_status,
         "in_development": in_development,
         "is_watching": is_watching,
         "patchset": len(reviews) + 1,
@@ -2024,7 +2247,19 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
             f"https://github.com/flutter/flutter/commit/{head_sha}" if head_sha else ""
         ),
         "in_my_attention": phase in ("NEEDS_YOUR_ACTION", "ALERT_CQ_FAILED"),
-        "cr_summary": f"{len(reviews)} rev",
+        "cr_summary": (
+            f"✓ {approved_count}/{required_approvals}"
+            if (approved_count > 0 and missing_approvals > 0)
+            else (
+                f"✓ {approved_count} app"
+                if approved_count > 0
+                else (
+                    "✗ changes req"
+                    if (changes_requested_by or review_decision == "CHANGES_REQUESTED")
+                    else f"{len(reviews)} rev"
+                )
+            )
+        ),
         "cq_status": cq_status,
         # Expose both PR-owned and tree-broken check lists for UI and diagnostics
         "cq_failed": bool(own_failed_checks),
@@ -2100,8 +2335,18 @@ def fetch_piper_cl_status(cl_id: str) -> dict[str, Any]:
     # Non-self Piper CLs sit in Watching while preserving reviewer role metadata
     is_watching = not is_self
     is_open = status != "SUBMITTED"
-    is_draft = is_self and is_open and bool(RE_DRAFT_SUBJECT.match(subject))
+    is_wip = is_open and bool(RE_DRAFT_SUBJECT.match(subject))
+    wip_label = "WIP" if is_wip else ""
+    is_draft = is_self and is_wip
     in_development = is_self and is_open and not is_draft and not reviewers
+    assigned_reviewers_count = len(reviewers)
+    missing_reviewers_to_assign = 1 if (is_open and not reviewers) else 0
+    missing_approvals = 1 if is_open else 0
+    reviewer_status = (
+        "No reviewers assigned"
+        if (is_open and not reviewers)
+        else ("In review" if is_open else "")
+    )
     phase = "READY_TO_CLOSE" if status == "SUBMITTED" else "WAITING_ON_OTHERS"
     # Extract timestamp from describe header to track submit or last edit time
     m_ts = re.search(
@@ -2127,6 +2372,14 @@ def fetch_piper_cl_status(cl_id: str) -> dict[str, Any]:
         "is_self": is_self,
         "is_external": False,
         "is_draft": is_draft,
+        "is_wip": is_wip,
+        "wip_label": wip_label,
+        "required_approvals": 1,
+        "approved_count": 0,
+        "assigned_reviewers_count": assigned_reviewers_count,
+        "missing_reviewers_to_assign": missing_reviewers_to_assign,
+        "missing_approvals": missing_approvals,
+        "reviewer_status": reviewer_status,
         "in_development": in_development,
         "is_watching": is_watching,
         "patchset": 1,
@@ -3009,6 +3262,60 @@ def sync_once(
 
     new_items[composite_key] = record
 
+  # Cross-link companion CLs/PRs and their parent CLs/PRs so the UI can badge both sides
+  by_ikey: dict[str, list[dict[str, Any]]] = {}
+  for rec in new_items.values():
+    if isinstance(rec, dict) and rec.get("item_key"):
+      by_ikey.setdefault(str(rec["item_key"]), []).append(rec)
+
+  for rec in new_items.values():
+    if not isinstance(rec, dict):
+      continue
+    comp_to = str(rec.get("companion_to") or "")
+    if not comp_to:
+      continue
+    comp_kind, _, comp_tid = comp_to.partition(":")
+    parent_recs = by_ikey.get(comp_to) or []
+    parent_url = str(parent_recs[0].get("url") or "") if parent_recs else (
+        f"https://github.com/flutter/flutter/pull/{comp_tid}"
+        if comp_kind == "github"
+        else (
+            f"http://cl/{comp_tid}"
+            if comp_kind == "piper"
+            else f"https://{rec.get('host') or GERRIT_SKIA_HOST}/c/{comp_tid}"
+        )
+    )
+    parent_label = (
+        f"PR #{comp_tid}"
+        if comp_kind == "github"
+        else (f"cl/{comp_tid}" if comp_kind == "piper" else f"CL {comp_tid}")
+    )
+    rec["companion_to_label"] = parent_label
+    rec["companion_to_url"] = parent_url
+    comp_self_label = (
+        f"PR #{rec.get('target_id')}"
+        if rec.get("kind") == "github"
+        else (
+            f"cl/{rec.get('target_id')}"
+            if rec.get("kind") == "piper"
+            else f"CL {rec.get('target_id')}"
+        )
+    )
+    comp_entry = {
+        "item_key": str(rec.get("item_key") or ""),
+        "target_id": str(rec.get("target_id") or ""),
+        "label": comp_self_label,
+        "url": str(rec.get("url") or ""),
+        "is_wip": bool(rec.get("is_wip") or rec.get("is_draft")),
+    }
+    for p_rec in parent_recs:
+      c_list = p_rec.setdefault("companions", [])
+      if not any(
+          isinstance(x, dict) and x.get("item_key") == comp_entry["item_key"]
+          for x in c_list
+      ):
+        c_list.append(comp_entry)
+
   state["items"] = new_items
   state["events"] = events
   state["last_sync"] = now_et_str()
@@ -3211,6 +3518,29 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .state { font-size: 14px; color: var(--graphite); }
   .state b { color: var(--ink); font-weight: 500; }
   .state .red, .why .red { color: var(--red); }
+  .state .amber, .why .amber { color: var(--amber); }
+  .badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    font: 600 11px/1.3 var(--sans); letter-spacing: .01em;
+    padding: 2px 7px; border-radius: 6px; vertical-align: middle;
+    margin-right: 6px; white-space: nowrap;
+  }
+  .badge.wip {
+    background: color-mix(in srgb, var(--amber) 16%, transparent);
+    color: var(--amber);
+  }
+  .badge.companion {
+    background: color-mix(in srgb, var(--blue) 14%, transparent);
+    color: var(--blue);
+  }
+  .badge.has-companion {
+    background: color-mix(in srgb, var(--ink) 8%, transparent);
+    color: var(--graphite);
+  }
+  .badge.warn {
+    background: color-mix(in srgb, var(--red) 13%, transparent);
+    color: var(--red);
+  }
   .when { text-align: right; font-size: 13px; color: var(--graphite); }
   .row .path { font-size: 13px; }
   .row .stop { min-width: 0; }
@@ -3331,6 +3661,60 @@ function clLabel(it) {
 // The project tag already names the component, so drop the "[component] " prefix
 function cleanSubject(s) {
   return String(s || '').replace(/^\[[^\]]+\]\s*/, '');
+}
+
+// Returns the explicit WIP or Draft label when an open change is not ready for submit
+function wipLabel(it) {
+  if (it.status === 'MERGED' || it.status === 'ABANDONED' || it.status === 'CLOSED') return '';
+  if (it.wip_label) return String(it.wip_label);
+  if (it.is_wip) return it.kind === 'github' ? 'Draft' : 'WIP';
+  if (it.is_draft) return 'Draft';
+  return '';
+}
+
+function isCompanion(it) {
+  return Boolean(it.companion_to);
+}
+
+function badgesHtml(it) {
+  const out = [];
+  const wip = wipLabel(it);
+  if (wip) out.push(`<span class="badge wip">${esc(wip)}</span>`);
+  if (isCompanion(it)) {
+    const refLabel = it.companion_to_label || String(it.companion_to).replace(/^.*:/, '#');
+    const text = `Companion → ${esc(refLabel)}`;
+    out.push(it.companion_to_url
+      ? link(it.companion_to_url, text, 'badge companion', 'Open parent CL/PR')
+      : `<span class="badge companion">${text}</span>`);
+  }
+  const comps = Array.isArray(it.companions) ? it.companions : [];
+  for (const c of comps) {
+    if (!c || !c.label) continue;
+    const text = `Has companion ${esc(c.label)}${c.is_wip ? ' (WIP)' : ''}`;
+    out.push(c.url
+      ? link(c.url, text, 'badge has-companion', 'Open companion CL/PR')
+      : `<span class="badge has-companion">${text}</span>`);
+  }
+  return out.join('');
+}
+
+function reviewerGapHtml(it) {
+  if (it.status === 'MERGED' || it.status === 'ABANDONED' || it.status === 'CLOSED') return '';
+  const missRev = Number(it.missing_reviewers_to_assign || 0);
+  const reqApp = Number(it.required_approvals || 1);
+  const assigned = Number(it.assigned_reviewers_count || 0);
+  if (missRev > 0) {
+    if (assigned === 0) {
+      return `<span class="amber">${reqApp > 1 ? `Needs ${reqApp} reviewers` : 'No reviewers assigned'}</span>`;
+    }
+    return `<span class="amber">Needs +${missRev} reviewer${missRev > 1 ? 's' : ''} (${assigned}/${reqApp})</span>`;
+  }
+  const missApp = Number(it.missing_approvals || 0);
+  const approved = Number(it.approved_count || 0);
+  if (missApp > 0 && reqApp > 1 && approved > 0) {
+    return `<span class="amber">Needs +${missApp} CR (${approved}/${reqApp})</span>`;
+  }
+  return '';
 }
 
 function authorLabel(it) {
@@ -3478,6 +3862,12 @@ function waitingOnHtml(it) {
 function stateHtml(it) {
   const cr = it.cr_summary ? `CR ${esc(it.cr_summary)}` : '';
   const cq = it.cq_status ? link(checksUrl(it), esc(it.cq_status)) : '';
+  const gap = reviewerGapHtml(it);
+  const wip = wipLabel(it);
+  const wipTag = (wip && wip !== 'Draft') ? `<b>${esc(wip)}</b>` : (wip || '');
+  const compNote = isCompanion(it)
+    ? `Companion to ${esc(it.companion_to_label || it.companion_to)}`
+    : '';
   const review = [cr, cq].filter(Boolean).join(' · ');
   if (it.status === 'ABANDONED' || it.status === 'CLOSED') {
     return it.status === 'ABANDONED' ? 'Abandoned' : 'Closed';
@@ -3492,14 +3882,22 @@ function stateHtml(it) {
   const st = statusOf(it);
   // GitHub has no commit queue; a running check set is the closest state
   if (st === 'cq') return `${it.kind === 'github' ? 'Checks' : 'In the commit queue'} · ${cq}`;
-  if (st === 'draft') return `Draft · ${cq || 'no CQ run'}`;
-  if (st === 'dev') return `No reviewers yet · ${cq || 'no CQ run'}`;
+  if (st === 'draft') {
+    return [wipTag || 'Draft', compNote, gap, cq || 'no CQ run'].filter(Boolean).join(' · ');
+  }
+  if (st === 'dev') {
+    return [wipTag, compNote, gap || 'No reviewers yet', cq || 'no CQ run']
+      .filter(Boolean).join(' · ');
+  }
   if (st === 'tree') {
     return `<span class="red">${link(FLUTTER_DASHBOARD_URL, 'flutter/flutter tree')} is red;` +
       ' landing waits for it</span>';
   }
-  if (st === 'watching') return review || 'Watching';
-  return [waitingOnHtml(it) || 'In review', review].filter(Boolean).join(' · ');
+  if (st === 'watching') {
+    return [wipTag, compNote, review, gap].filter(Boolean).join(' · ') || 'Watching';
+  }
+  return [wipTag, compNote, waitingOnHtml(it) || 'In review', review, gap]
+    .filter(Boolean).join(' · ');
 }
 
 // Row time is when the change last changed state, in ET with its age
@@ -3548,6 +3946,7 @@ function focusCard(it, data) {
     ? '<span class="busy-pill"><i class="dot moving"></i>Chat is working</span> · '
     : '';
   const subject = esc(cleanSubject(it.subject));
+  const cardTitle = `${badgesHtml(it)}${link(it.url, subject)}`;
   if (isPostSubmitAlert(it)) {
     const ps = it.post_submit || {};
     const incidents = ps.incidents || [];
@@ -3564,7 +3963,7 @@ function focusCard(it, data) {
     <article class="card alert">
       <div><div class="eyebrow">${busyBadge}${eyebrow} · ${esc(it.project_name)} ·
         ${link(it.url, clLabel(it))}</div>
-        <h2>${link(it.url, subject)}</h2>
+        <h2>${cardTitle}</h2>
         <div class="why">${landed}${blame}</div></div>
       <div class="actions">${primary}${chatBtn}</div>
       ${incidents.length
@@ -3601,12 +4000,14 @@ function focusCard(it, data) {
     why = it.merge_conflict ? `<span class="red">${conflictNote}</span> · ${msgWhy}` : msgWhy;
     actions = link(it.url, `Open ${kindWord}`, 'btn primary') + chatBtn;
   }
+  const gapNote = reviewerGapHtml(it);
+  const fullWhy = gapNote ? `${why} · ${gapNote}` : why;
   return `
     <article class="card">
       <div><div class="eyebrow">${busyBadge}${esc(it.project_name)} · ${link(it.url, clLabel(it))} ·
         PS${esc(it.patchset || 1)}</div>
-        <h2>${link(it.url, subject)}</h2>
-        <div class="why">${why}</div></div>
+        <h2>${cardTitle}</h2>
+        <div class="why">${fullWhy}</div></div>
       <div class="actions">${actions}</div>
     </article>`;
 }
@@ -3621,7 +4022,7 @@ function rowHtml(it, data) {
   ].filter(Boolean).join(' · ');
   return `
     <div class="row">
-      <div><div class="title">${link(it.url, esc(cleanSubject(it.subject)))}</div>
+      <div><div class="title">${badgesHtml(it)}${link(it.url, esc(cleanSubject(it.subject)))}</div>
         <div class="meta">${meta}</div></div>
       <div class="state">${stateHtml(it)}</div>
       <div class="when">${rowTime(it)}</div>
