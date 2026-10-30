@@ -882,6 +882,166 @@ def perf_audit_before_upload_denial(cmd: str, workspace_paths: list[str]) -> str
   )
 
 
+GERRIT_UPLOAD_CMD_RE = re.compile(
+    r"(?:^|[\s;&|(`])git(?:\s+(?:-[Cc]\s+\S+|--[a-z-]+(?:=\S+)?))*\s+"
+    r"(?:cl\s+upload\b|push\b[^;&|\n]*\brefs/for/)"
+)
+REFS_FOR_SPEC_RE = re.compile(r"^\+?([^:\s]*):refs/for/\S+$")
+
+
+# Return (is_upload, local_refs) for a real `git cl upload` (no refs) or for
+# `git push ...:refs/for/...` (one local ref per refspec). Commit messages and echo
+# strings are single shell tokens, so text inside them never counts as an invocation;
+# the regex fallback runs only on unbalanced quoting
+def _gerrit_upload_invocation(cmd: str) -> tuple[bool, list[str]]:
+  cmd_code = strip_heredocs(cmd)
+  # Newlines separate commands like `;`, but stay literal inside quoted tokens
+  lexer = shlex.shlex(cmd_code, posix=True, punctuation_chars=";&|()\n")
+  lexer.whitespace = " \t\r"
+  lexer.whitespace_split = True
+  try:
+    tokens = list(lexer)
+  except ValueError:
+    return bool(GERRIT_UPLOAD_CMD_RE.search(_non_inspection_cmd_segments(cmd))), ["HEAD"]
+  at_cmd_start = True
+  for i, tok in enumerate(tokens):
+    if tok and set(tok) <= set(";&|()\n"):
+      at_cmd_start = True
+      continue
+    # Env prefixes such as `SKIP_GCE_AUTH_FOR_GIT=1 git cl upload` keep the command start
+    if at_cmd_start and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
+      continue
+    if not (at_cmd_start and _clean_cmd_token(tok) == "git"):
+      at_cmd_start = False
+      continue
+    at_cmd_start = False
+    j = i + 1
+    while j < len(tokens) and tokens[j].startswith("-"):
+      j += 2 if tokens[j] in ("-C", "-c") else 1
+    args = []
+    for t in tokens[j:]:
+      if t and set(t) <= set(";&|()\n"):
+        break
+      args.append(t)
+    if args[:2] == ["cl", "upload"]:
+      return True, []
+    if args[:1] == ["push"]:
+      refs = [m.group(1) or "HEAD" for m in map(REFS_FOR_SPEC_RE.match, args[1:]) if m]
+      if refs:
+        return True, refs
+  return False, []
+
+
+def _upload_repo_root(cmd: str, workspace_paths: list[str]) -> str:
+  cmd_code = strip_heredocs(cmd)
+  explicit = re.search(r"(?:^|[\s;&|(`])cd\s+|\bgit\s+-C\s+", cmd_code)
+  dirs = _extract_cmd_target_dirs(cmd, workspace_paths)
+  repo_dir = dirs[-1] if explicit and dirs else next(
+      (os.path.expanduser(wp) for wp in workspace_paths if wp), ""
+  )
+  if not repo_dir or not os.path.isdir(repo_dir):
+    return ""
+  return _git_out(repo_dir, "rev-parse", "--show-toplevel")
+
+
+def _is_skoretext_project_context(
+    conv_id: str,
+    parent_conv_id: str,
+    transcript_path: str,
+    workspace_paths: list[str],
+) -> bool:
+  from context_guard import (
+      get_conversation_db_info,
+      infer_project_id_from_workspaces,
+      projects_root,
+  )
+
+  effective_cid = parent_conv_id or conv_id
+  _, pid = (
+      get_conversation_db_info(effective_cid, transcript_path)
+      if effective_cid
+      else ("", "")
+  )
+  if not pid or pid == "outside-of-project":
+    pid = infer_project_id_from_workspaces(workspace_paths)
+  if not pid:
+    return False
+  pdata = _read_json_file(os.path.join(projects_root(), f"{pid}.json"))
+  base_name = str(pdata.get("name") or "").split("·", 1)[0].strip()
+  return base_name.lower() == "skoretext"
+
+
+# Enforce the [SkoreText] subject prefix on every Gerrit CL uploaded from SkoreText
+def skoretext_cl_prefix_denial(
+    cmd: str,
+    conv_id: str,
+    parent_conv_id: str,
+    transcript_path: str,
+    workspace_paths: list[str],
+) -> str:
+  is_upload, push_refs = _gerrit_upload_invocation(cmd)
+  if not is_upload:
+    return ""
+  if not _is_skoretext_project_context(
+      conv_id, parent_conv_id, transcript_path, workspace_paths
+  ):
+    return ""
+  root = _upload_repo_root(cmd, workspace_paths)
+  if not root:
+    return ""
+  # For refs/for/ stack pushes check every own commit above remote main; for git cl
+  # upload check @{u}..HEAD or fall back to target_sha when @{u} already equals HEAD
+  base_candidates = (
+      ("upstream/main", "upstream/master", "origin/main", "origin/master")
+      if push_refs
+      else ("@{u}", "upstream/main", "upstream/master", "origin/main", "origin/master")
+  )
+  m = re.search(r"<([^>]+)>", _git_out(root, "var", "GIT_AUTHOR_IDENT"))
+  author_arg = [f"--author={m.group(1)}"] if m else []
+  bad: list[str] = []
+  for ref in push_refs or ["HEAD"]:
+    target_sha = _git_out(root, "rev-parse", "--verify", ref)
+    if not target_sha:
+      continue
+    base = next(
+        (
+            b
+            for b in (_git_out(root, "merge-base", target_sha, c) for c in base_candidates)
+            if b and b != target_sha
+        ),
+        "",
+    )
+    log_args = (
+        ["log", "-n", "30", *author_arg, "--format=%h%x00%B%x01", f"{base}..{target_sha}"]
+        if base
+        else ["log", "-n", "1", *author_arg, "--format=%h%x00%B%x01", target_sha]
+    )
+    raw = _git_out(root, *log_args)
+    for rec in raw.split("\x01"):
+      if "\x00" not in rec:
+        continue
+      sha, body = rec.strip("\n").split("\x00", 1)
+      subject = body.strip().splitlines()[0] if body.strip() else ""
+      if not subject or subject.startswith("[SkoreText] "):
+        continue
+      # Companion WIP CLs stacked on external authors' changes use companion naming
+      if "companion" in subject.lower() or re.search(
+          r"^Companion(?:-for)?:", body, re.MULTILINE | re.IGNORECASE
+      ):
+        continue
+      entry = f"{sha} (`{subject[:70]}`)"
+      if entry not in bad:
+        bad.append(entry)
+  if not bad:
+    return ""
+  listed = ", ".join(bad[:5])
+  return (
+      "[SKORETEXT-PREFIX GUARD] Every Gerrit CL produced in the `SkoreText` project "
+      f"must start its commit subject with `[SkoreText] ` (missing prefix on: {listed}). "
+      "Reword the commit subject to start with `[SkoreText] ` before uploading."
+  )
+
+
 def was_doc_grounding_run_in_chat(
     transcript_path: str, current_step_idx: int = -1
 ) -> bool:
@@ -2975,6 +3135,13 @@ def main() -> None:
       perf_audit = perf_audit_before_upload_denial(cmd_str, workspace_paths)
       if perf_audit:
         print(json.dumps({"decision": "deny", "reason": perf_audit}, ensure_ascii=False))
+        return
+      # SkoreText CLs must carry the [SkoreText] subject prefix before they reach Gerrit
+      skoretext_denial = skoretext_cl_prefix_denial(
+          cmd_str, conv_id, parent_conv_id, transcript_path, workspace_paths
+      )
+      if skoretext_denial:
+        print(json.dumps({"decision": "deny", "reason": skoretext_denial}, ensure_ascii=False))
         return
 
   # Guard 8: Google Docs update_doc grounding check (amnesia-doc-check Phase 1)

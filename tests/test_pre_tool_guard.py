@@ -1622,6 +1622,73 @@ class TestPreToolGuard(unittest.TestCase):
       })
       self.assertEqual(out.get("decision"), "allow", out)
 
+  def test_skoretext_cl_prefix_guard(self):
+    import context_guard
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      origin = os.path.join(tmp_dir, "origin.git")
+      repo = os.path.join(tmp_dir, "skia")
+      proj_root = os.path.join(tmp_dir, "projects")
+      os.makedirs(proj_root)
+      for pid, name in (("p-sk", "SkoreText · CoreText"), ("p-other", "SkParagraph")):
+        with open(os.path.join(proj_root, f"{pid}.json"), "w", encoding="utf-8") as f:
+          json.dump({"name": name}, f)
+
+      def git(*args):
+        return subprocess.run(
+            ["git", "-C", repo, *args], check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+      subprocess.run(["git", "init", "--bare", "-b", "main", origin], check=True,
+                     capture_output=True)
+      subprocess.run(["git", "init", "-b", "main", repo], check=True, capture_output=True)
+      git("config", "user.email", "t@example.com")
+      git("config", "user.name", "Test")
+      git("remote", "add", "origin", origin)
+      git("commit", "--allow-empty", "-m", "Upstream base")
+      git("push", "-u", "origin", "main")
+      git("commit", "--allow-empty", "-m", "[SkoreText] [1/2] Add CoreTextIndexMap")
+      git("commit", "--allow-empty", "-m", "[skparagraph] Fix line break width")
+      git("commit", "--allow-empty", "-m", "Companion: tests for cl/123\n\nCompanion-for: 123")
+      git("branch", "--set-upstream-to=origin/main")
+
+      push_cmd = f"cd {repo} && git push origin HEAD:refs/for/main%notify=NONE"
+      upload_cmd = f"git -C {repo} cl upload -f"
+
+      def denial(cmd, pid="p-sk"):
+        with patch.object(context_guard, "projects_root", return_value=proj_root), \
+             patch.object(context_guard, "get_conversation_db_info",
+                          return_value=("[14:00] Retitle CLs", pid)):
+          return pre_tool_guard.skoretext_cl_prefix_denial(cmd, "c1", "", "", [repo])
+
+      for cmd in (push_cmd, upload_cmd, f"cd {repo} && SKIP_GCE_AUTH_FOR_GIT=1 git cl upload"):
+        reason = denial(cmd)
+        self.assertIn("[SKORETEXT-PREFIX GUARD]", reason)
+        self.assertIn("[skparagraph] Fix line break width", reason)
+        self.assertNotIn("CoreTextIndexMap", reason)
+        self.assertNotIn("Companion", reason)
+
+      self.assertEqual(denial(push_cmd, pid="p-other"), "")
+      good_sha = git("rev-parse", "HEAD~2")
+      self.assertIn(
+          "[skparagraph] Fix line break width",
+          denial(f"git -C {repo} push origin {good_sha}:refs/for/main HEAD:refs/for/main"),
+      )
+      self.assertEqual(denial(f"git -C {repo} log --oneline -3"), "")
+      self.assertEqual(denial(f"git -C {repo} push origin main"), "")
+      self.assertEqual(
+          denial(f"cd {repo} && python3 ship.py -m \"Guard git cl\nupload and git push "
+                 "to refs/for/ in SkoreText\""),
+          "",
+      )
+
+      git("rebase", "-q", "--exec",
+          "git commit --amend --allow-empty -q -m \"$(git log -1 --format=%B | "
+          "sed '1s/^\\[skparagraph\\] /[SkoreText] /')\"",
+          "origin/main")
+      self.assertEqual(denial(push_cmd), "")
+      self.assertEqual(denial(upload_cmd), "")
+
 
 if __name__ == "__main__":
   unittest.main()
