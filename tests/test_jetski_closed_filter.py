@@ -2365,12 +2365,13 @@ global.requestAnimationFrame = () => 1;
   const configs = data.clientModelConfigs;
   const labels = data.clientModelSorts[0].groups[0].modelLabels;
 
-  // Native order preserved at the front of Recommended sort
+  // Auto is placed first, followed immediately by strongest models (Opus 5.5)
+  assert.strictEqual(labels[0], 'Auto');
   assert.deepStrictEqual(labels.slice(0, 4), [
-    'Gemini Pro Next',
-    'Gemini 3.5 Flash Lite',
-    'Claude Opus 5.5 (Max)',
+    'Auto',
+    'Claude Opus 5.5 BoN (Max)',
     'Claude Opus 5.5 (High)',
+    'Claude Opus 5.5 (Max)',
   ]);
 
   // Every label in clientModelConfigs and modelLabels must be unique

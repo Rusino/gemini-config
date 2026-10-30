@@ -346,7 +346,12 @@ global.clearTimeout = () => {};
   assert.strictEqual(autoCfg.label, 'Auto');
   assert.strictEqual(autoCfg.tagTitle, 'Autopilot');
   assert.deepStrictEqual(autoCfg.modelOrAlias.choice, { case: 'model', value: 999999 });
-  assert(labels.includes('Auto'), 'Auto label must appear in Recommended modelLabels');
+  assert.strictEqual(labels[0], 'Auto', 'Auto must be the first option in the dropdown');
+  assert.strictEqual(
+    labels[1],
+    'Claude Opus 5.5 BoN (High)',
+    'Strongest model Opus 5.5 BoN High must immediately follow Auto'
+  );
 
   // 2. User manually picks Claude Fable 5.1 (1388) in existing chat-cpp-1
   storeState.conversation.cascadeId = 'chat-cpp-1';

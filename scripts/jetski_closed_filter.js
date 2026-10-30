@@ -353,6 +353,61 @@
   const AUTOPILOT_OPTION_MODEL_ID = '__jetski_autopilot__';
   const AUTOPILOT_OPTION_LABEL = 'Auto';
   const AUTOPILOT_OPTION_ENUM = 999999;
+  // Priority ordering for Recommended dropdown: Auto first, followed by strongest models
+  const PREFERRED_DROPDOWN_MODEL_ORDER = [
+    AUTOPILOT_OPTION_MODEL_ID,
+    // Tier 1: Flagship models (Opus 5.5, Sonnet 5.5, Carbon-G, Gemini Pro, 3P top models)
+    'opus-5.5-high-bon-le',
+    'opus-5.5-max-bon-le',
+    'opus-5.5-high',
+    'opus-5.5-medium',
+    'opus-5.5-max',
+    'sonnet-5.5-high-bon-le',
+    'sonnet-5.5-bon-le',
+    'bon-experiment-arm-226',
+    'gemini-pro-coordinator',
+    'auto',
+    'glm-5.2-fp8-bon-arm',
+    'kimi-k3-maas-bon-arm',
+    // Tier 2: Strong secondary & reasoning models
+    'opus-5-bon-le',
+    'fable-5.1-max-bon-le',
+    'fable-5.1-bon-le',
+    'fable-5.1-dropdown',
+    'opus-4.8-max-bon-le',
+    'opus-4.8-bon-le',
+    'opus-bon-le',
+    'deepseek-r2-bon-arm',
+    // Tier 3: Flash / triage models
+    'gemini-flash-next',
+    'gemini-3.8-flash-high',
+    'gemini-3.8-flash-medium',
+    'gemini-2.5-flash',
+    'gemini-3.5-flash-lite',
+  ];
+  const PREFERRED_DROPDOWN_ORDER_MAP = new Map(
+    PREFERRED_DROPDOWN_MODEL_ORDER.map((id, idx) => [id, idx])
+  );
+
+  // Computes a dropdown priority rank so Auto is first and strongest models follow
+  function getModelDropdownRank(label, config) {
+    if (!config) return 9999;
+    const mid = config.modelId || '';
+    // Auto reset sentinel always claims the #0 top spot
+    if (mid === AUTOPILOT_OPTION_MODEL_ID || label === AUTOPILOT_OPTION_LABEL) return 0;
+    // Exact match in curated preference order
+    if (PREFERRED_DROPDOWN_ORDER_MAP.has(mid)) return PREFERRED_DROPDOWN_ORDER_MAP.get(mid);
+    const low = mid.toLowerCase();
+    const lbl = (label || '').toLowerCase();
+    // Group any unlisted Opus 5.5 and Sonnet 5.5 variants into flagship tier
+    if (low.includes('opus-5.5') || lbl.includes('opus 5.5')) return 4;
+    if (low.includes('sonnet-5.5') || lbl.includes('sonnet 5.5')) return 7;
+    // Older Opus and reasoning models follow flagship models
+    if (low.includes('opus') || lbl.includes('opus')) return 16;
+    // Flash and lite models appear below primary models
+    if (low.includes('flash') || lbl.includes('flash') || low.includes('lite')) return 30;
+    return 100;
+  }
   // Persist manual model pins across F5 reloads with a 30m TTL on unsent project drafts
   const MANUAL_MODEL_PINS_STORAGE_KEY = 'jetski_manual_model_pins_v1';
   const DRAFT_MANUAL_PIN_TTL_MS = 30 * 60 * 1000;
@@ -2901,10 +2956,17 @@
         ? data.clientModelSorts.map((sort) => {
             if (!sort || !Array.isArray(sort.groups)) return sort;
             return cloneWithProto(sort, {
-              groups: sort.groups.map((group) => {
+              groups: sort.groups.map((group, gIdx) => {
                 if (!group || !Array.isArray(group.modelLabels)) return group;
+                // Restore exact server-native model list if recorded before enrichment
+                const orig =
+                  gIdx === 0 && Array.isArray(sort.__jetskiOrigLabels)
+                    ? sort.__jetskiOrigLabels
+                    : null;
                 return cloneWithProto(group, {
-                  modelLabels: group.modelLabels.filter((lbl) => !unlockedLabels.has(lbl)),
+                  modelLabels: orig
+                    ? [...orig]
+                    : group.modelLabels.filter((lbl) => !unlockedLabels.has(lbl)),
                 });
               }),
             });
@@ -3199,6 +3261,9 @@
       });
     }
 
+    const allConfigs = [...enrichedNativeConfigs, ...unlockedConfigs];
+    const configByLabel = new Map(allConfigs.map((c) => [c.label, c]));
+
     // useModelGroups reads groups[0] of the Recommended sort to populate the dropdown
     const nextSorts = Array.isArray(data.clientModelSorts)
       ? data.clientModelSorts.map((sort, idx) => {
@@ -3209,14 +3274,33 @@
           if (!isRec || !Array.isArray(sort?.groups) || sort.groups.length === 0) return sort;
           const firstGroup = sort.groups[0];
           const baseLabels = Array.isArray(firstGroup?.modelLabels) ? firstGroup.modelLabels : [];
-          return cloneWithProto(sort, {
+          // Preserve exact server-native labels on the sort object so cleanup restores them
+          const origLabels = Array.isArray(sort.__jetskiOrigLabels)
+            ? sort.__jetskiOrigLabels
+            : [...baseLabels];
+
+          const combinedLabels = Array.from(new Set([...baseLabels, ...unlockedLabels]));
+          // Sort with Auto first (#0), followed by strongest models in preference order
+          const sortedLabels = combinedLabels.slice().sort((a, b) => {
+            const rankA = getModelDropdownRank(a, configByLabel.get(a));
+            const rankB = getModelDropdownRank(b, configByLabel.get(b));
+            if (rankA !== rankB) return rankA - rankB;
+            return combinedLabels.indexOf(a) - combinedLabels.indexOf(b);
+          });
+
+          const nextSort = cloneWithProto(sort, {
             groups: [
               cloneWithProto(firstGroup, {
-                modelLabels: [...baseLabels, ...unlockedLabels],
+                modelLabels: sortedLabels,
               }),
               ...sort.groups.slice(1),
             ],
           });
+          Object.defineProperty(nextSort, '__jetskiOrigLabels', {
+            value: origLabels,
+            enumerable: false,
+          });
+          return nextSort;
         })
       : data.clientModelSorts;
 
