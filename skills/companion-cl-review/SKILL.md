@@ -46,7 +46,8 @@ Never upload a companion WIP CL blindly. After auditing the patchset and testing
 1. **Fetch the exact reviewed patchset into an isolated worktree (or a clean checkout)**:
    - Check `git status` first; if the primary working copy has local modifications or another active branch, create a separate `git worktree` (never switch branches inside a dirty checkout):
    ```bash
-   git fetch https://skia.googlesource.com/skia refs/changes/<NN>/<CL>/<PS>
+   # Use `origin` or the repo's Gerrit URL (e.g. https://skia.googlesource.com/skia or https://chromium.googlesource.com/chromium/src)
+   git fetch origin refs/changes/<NN>/<CL>/<PS>
    git worktree add -B companion-<CL>-ps<PS> ../companion-<CL>-ps<PS> FETCH_HEAD
    ```
    *(If Gerrit rejects the stored credentials with HTTP 400 "Invalid authentication credentials", retry the same fetch or push with `git -c http.extraheader= -c http.cookiefile= fetch|push ...`. For GitHub PRs, fetch `pull/<PR>/head`.)*

@@ -56,7 +56,7 @@ Even if a change touches **only a single line** (1 line added, modified, or dele
 
 ---
 
-## 4. Workflow
+## 2. Workflow
 
 ### Step 1: Determine Scope & Run the Audit Script
 - **Diff mode** (default when working on uncommitted changes, a commit, or a branch):

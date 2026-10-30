@@ -76,7 +76,7 @@ FILE_EXT_RE = re.compile(rf"^[\w./~-]+?\.(?:{KNOWN_EXTS})$")
 PATH_TOKEN_RE = re.compile(r"`([^`\n]{2,120})`")
 FILE_LINK_RE = re.compile(r"file://(/[^\s)#`\"']+)")
 BARE_PATH_RE = re.compile(
-    rf"(?<![\w:/.~+-])((?:/|~|\.\.?/)?[\w.-]+(?:/[\w.*<>-]+)+/?|[\w.-]+\.(?:{KNOWN_EXTS}))(?![\w/-])"
+    rf"(?<![\w:/.~+\-$}}])((?:/|~|\.\.?/)?[\w.-]+(?:/[\w.*<>-]+)+/?|[\w.-]+\.(?:{KNOWN_EXTS}))(?![\w/-])"
 )
 SKILL_BULLET_RE = re.compile(
     r"^\s*[-*]\s+(?:\*\*|`)+([a-z0-9]+(?:-[a-z0-9]+)+)(?:\*\*|`)+"
@@ -247,11 +247,19 @@ def normalize_candidate_path(token: str) -> str:
     return cleaned.rstrip("/")
 
 
+# Strip leading ./ without touching ../ parent traversals
+def strip_leading_curdir(p: str) -> str:
+    while p.startswith("./"):
+        p = p[2:]
+    return p
+
+
 def path_exists_anywhere(
     cand: str,
     repos: list[Path],
     repo_rel_set: set[str],
     by_basename: dict[str, list[str]] | None = None,
+    doc_dirs: list[Path] | None = None,
 ) -> bool:
     if not cand:
         return True
@@ -260,6 +268,16 @@ def path_exists_anywhere(
     expanded = os.path.expanduser(cand)
     if os.path.exists(expanded):
         return True
+    if doc_dirs and not os.path.isabs(expanded):
+        clean_rel = strip_leading_curdir(cand)
+        for d in doc_dirs:
+            if (d / cand).exists() or (d / clean_rel).exists():
+                return True
+            if "/" not in cand and (d / "references" / cand).exists():
+                return True
+            # Support kebab-case to snake_case sibling skill directory resolution
+            if "-" in clean_rel and (d / clean_rel.replace("-", "_")).exists():
+                return True
     if cand.startswith("/google3/") or cand.startswith("google3/"):
         g3_rel = cand.lstrip("/")
         if (Path("/google/src/files/head/depot") / g3_rel).exists():
@@ -268,10 +286,70 @@ def path_exists_anywhere(
         bazel_rel = cand.lstrip("/").split(":")[0]
         if bazel_rel in repo_rel_set or any((r / bazel_rel).exists() for r in repos):
             return True
-    rel = cand.lstrip("./")
+    rel = strip_leading_curdir(cand)
     if rel in repo_rel_set:
         return True
     return any((r / rel).exists() for r in repos)
+
+
+def canonicalize_for_conflict(
+    cand: str,
+    repos: list[Path],
+    doc_dirs: list[Path] | None = None,
+) -> str:
+    """Canonicalizes a path so intra-doc links to the same file share an identity."""
+    exp = os.path.expanduser(cand)
+    resolved_p: Path | None = None
+    if os.path.isabs(exp):
+        p = Path(exp)
+        if p.exists():
+            try:
+                resolved_p = p.resolve()
+            except Exception:
+                resolved_p = p
+        else:
+            resolved_p = p
+    elif doc_dirs:
+        for d in doc_dirs:
+            clean = strip_leading_curdir(exp)
+            if (d / exp).exists():
+                try:
+                    resolved_p = (d / exp).resolve()
+                    break
+                except Exception:
+                    pass
+            elif (d / clean).exists():
+                try:
+                    resolved_p = (d / clean).resolve()
+                    break
+                except Exception:
+                    pass
+    if resolved_p is None:
+        clean = strip_leading_curdir(cand)
+        for r in repos:
+            if (r / clean).exists():
+                try:
+                    resolved_p = (r / clean).resolve()
+                    break
+                except Exception:
+                    pass
+
+    if resolved_p is not None:
+        for r in repos:
+            try:
+                r_res = r.resolve()
+                if resolved_p == r_res or r_res in resolved_p.parents:
+                    return str(resolved_p.relative_to(r_res))
+            except Exception:
+                pass
+        return str(resolved_p)
+
+    clean = strip_leading_curdir(exp)
+    for r in repos:
+        r_str = str(r).rstrip("/") + "/"
+        if clean.startswith(r_str):
+            return clean[len(r_str):]
+    return clean
 
 
 def check_commit_sha(sha: str, repos: list[Path]) -> bool:
@@ -339,6 +417,23 @@ def main() -> int:
         if repos:
             print(f"Repositories checked: {', '.join(str(r) for r in repos)}")
 
+        doc_dirs: list[Path] = []
+        if file_arg != "-":
+            try:
+                abs_dir = Path(os.path.abspath(file_arg)).parent
+                doc_dirs.append(abs_dir)
+                real_dir = Path(file_arg).resolve().parent
+                if real_dir not in doc_dirs:
+                    doc_dirs.append(real_dir)
+                for d in list(doc_dirs):
+                    if (
+                        d.parent.name in ("skills", "plugins", "agents")
+                        and d.parent not in doc_dirs
+                    ):
+                        doc_dirs.append(d.parent)
+            except Exception:
+                pass
+
         placeholders: list[tuple[int, str, str]] = []
         is_internal_config_repo = any(".gemini" in r.parts for r in repos)
         in_fence = False
@@ -388,7 +483,11 @@ def main() -> int:
 
         for idx, line in enumerate(lines, start=1):
             # Ignore URLs, file:// links, and backtick spans before scanning bare paths
-            line_no_urls = re.sub(r"(?:https?|file)://\S+|`[^`\n]*`", " ", line)
+            line_no_urls = re.sub(
+                r"(?:https?|file)://\S+|`[^`\n]*`|\$(?:\{[^}\s]+\}|[A-Za-z_]\w*)(?:/[^\s`'\")]+)*",
+                " ",
+                line,
+            )
             candidates: list[str] = []
             for m in FILE_LINK_RE.finditer(line):
                 candidates.append(m.group(1))
@@ -412,7 +511,7 @@ def main() -> int:
                     base = os.path.basename(cand)
                     if base and base not in ("SKILL.md", "AGENTS.md", "GEMINI.md", "README.md"):
                         doc_paths_by_base.setdefault(base, []).append((idx, cand))
-                if path_exists_anywhere(cand, repos, repo_rel_set, by_basename):
+                if path_exists_anywhere(cand, repos, repo_rel_set, by_basename, doc_dirs):
                     verified_paths.append(cand)
                 else:
                     base = os.path.basename(cand)
@@ -422,7 +521,7 @@ def main() -> int:
         intra_doc_path_conflicts: list[tuple[str, list[tuple[int, str]]]] = [
             (base, entries)
             for base, entries in sorted(doc_paths_by_base.items())
-            if len({c.lstrip("./") for _, c in entries}) > 1
+            if len({canonicalize_for_conflict(c, repos, doc_dirs) for _, c in entries}) > 1
         ]
 
         unresolved_skills: list[tuple[int, str]] = []

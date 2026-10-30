@@ -195,6 +195,6 @@ named skill's `SKILL.md` was not read, when a report with a `Case 1-5` verdict l
    After the user publishes CR+1 with this hold comment, immediately trigger Canary-G3 (`git cl try
    -i <CL> -B skia/skia.primary -b Canary-G3`). If red, follow the Canary-G3 triage procedure in
    [`skia-canary-advisor`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/skia-canary-advisor/SKILL.md).
-7. **Daily Queue Summary Shows Open Issues Only**: In `run_queue_triage.py` summaries, never list or
+8. **Daily Queue Summary Shows Open Issues Only**: In `run_queue_triage.py` summaries, never list or
    mention GitHub issues that are already closed (including ones closed during the window or still
    receiving bot activity); report only open issues and the user's own open PRs.
