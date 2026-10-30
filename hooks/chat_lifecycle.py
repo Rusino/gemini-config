@@ -1610,7 +1610,265 @@ def export_chain_index() -> dict:
       os.replace(tmp, dst)
     except OSError:
       pass
+  # Update FTS index with any supplemental tool and command text from fresh transcripts
+  try:
+    sync_transcript_search_index()
+  except Exception:
+    pass
   return payload
+
+
+# Synchronizes transcript tool calls and command outputs into conversations_fts
+def sync_transcript_search_index(app_dirs: list[str] | None = None) -> int:
+  """Indexes supplemental transcript text (tool calls, command output) into conversations_fts."""
+  if app_dirs is None and "unittest" in sys.modules:
+    return 0
+
+  target_dirs = app_dirs if app_dirs is not None else find_app_data_dirs()
+  synced_count = 0
+
+  for app_dir in target_dirs:
+    db_file = os.path.join(app_dir, SUMMARY_DB_NAME)
+    brain_dir = os.path.join(app_dir, "brain")
+    if not os.path.isfile(db_file) or not os.path.isdir(brain_dir):
+      continue
+
+    try:
+      conn = sqlite3.connect(db_file, timeout=5.0)
+    except sqlite3.Error:
+      continue
+
+    cur = conn.cursor()
+    try:
+      cur.execute(
+          "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations_fts'"
+      )
+      if not cur.fetchone():
+        conn.close()
+        continue
+
+      cur.execute("""
+      CREATE TABLE IF NOT EXISTS jetski_transcript_fts_sync (
+          conversation_id TEXT PRIMARY KEY,
+          mtime_ns INTEGER NOT NULL,
+          file_size INTEGER NOT NULL
+      )
+      """)
+
+      cur.execute("SELECT conversation_id, mtime_ns, file_size FROM jetski_transcript_fts_sync")
+      synced = {row[0]: (row[1], row[2]) for row in cur.fetchall()}
+
+      cur.execute("SELECT conversation_id FROM conversations_fts WHERE chunk_index = -1")
+      fts_headers = {row[0] for row in cur.fetchall()}
+
+      cur.execute("SELECT conversation_id FROM conversations_fts WHERE chunk_index = 0")
+      fts_chunk0 = {row[0] for row in cur.fetchall()}
+
+      summaries_meta = {}
+      try:
+        cur.execute(
+            "SELECT conversation_id, title, workspace_uris, project_id, parent_conversation_id,"
+            " step_count, last_modified_time FROM conversation_summaries"
+        )
+        for cid, t, ws, pid, parent_id, sc, lmt in cur.fetchall():
+          summaries_meta[cid] = {
+              "title": t,
+              "workspace": ws,
+              "project": pid,
+              "parent_conversation_id": parent_id,
+              "step_count": sc,
+              "last_modified_time": lmt,
+          }
+      except sqlite3.Error:
+        pass
+
+      t_pattern = os.path.join(brain_dir, "*", ".system_generated", "logs", "transcript.jsonl")
+      for t_path in glob.glob(t_pattern):
+        # Extract conversation ID from path
+        parts = t_path.split(os.sep)
+        try:
+          b_idx = parts.index("brain")
+          cid = parts[b_idx + 1]
+        except (ValueError, IndexError):
+          continue
+
+        # Skip subagent conversations because LS search deliberately excludes them
+        meta = summaries_meta.get(cid) or {}
+        if meta.get("parent_conversation_id"):
+          continue
+
+        try:
+          st = os.stat(t_path)
+        except OSError:
+          continue
+
+        if (
+            cid in synced
+            and synced[cid] == (st.st_mtime_ns, st.st_size)
+            and cid in fts_headers
+        ):
+          continue
+
+        # Parse transcript lines for supplemental tool and command text
+        supplemental_entries = []
+        user_entries = []
+        agent_entries = []
+        try:
+          with open(t_path, "r", encoding="utf-8") as tf:
+            for line in tf:
+              if not line.strip():
+                continue
+              step_obj = json.loads(line)
+              step_idx = int(step_obj.get("step_index", 0))
+              st_type = str(step_obj.get("type", ""))
+
+              if st_type == "USER_INPUT":
+                u_text = str(step_obj.get("content") or "").strip()
+                if u_text:
+                  user_entries.append((step_idx, u_text))
+              elif st_type == "PLANNER_RESPONSE":
+                p_text = str(step_obj.get("content") or "").strip()
+                if p_text:
+                  agent_entries.append((step_idx, p_text))
+                thinking = str(step_obj.get("thinking") or "").strip()
+                tcalls = step_obj.get("tool_calls") or []
+                tc_parts = []
+                for tc in tcalls:
+                  tc_name = str(tc.get("name") or "")
+                  tc_args = json.dumps(tc.get("args") or {}, ensure_ascii=False)
+                  tc_parts.append(f"{tc_name}: {tc_args}")
+                supp = f"{thinking}\n{' '.join(tc_parts)}".strip()
+                if supp:
+                  supplemental_entries.append((step_idx, supp))
+              elif st_type == "GENERIC":
+                g_text = str(step_obj.get("content") or "").strip()
+                if g_text:
+                  supplemental_entries.append((step_idx, g_text))
+        except (OSError, json.JSONDecodeError):
+          continue
+
+        # Insert missing header row for chats that were never indexed by LS
+        if cid not in fts_headers:
+          title = meta.get("title") or get_conversation_title(cid) or ""
+          ws = meta.get("workspace") or ""
+          pid = meta.get("project") or ""
+          arch = 1 if is_archived(cid) else 0
+          lmt_val = meta.get("last_modified_time")
+          lmt_ns = st.st_mtime_ns
+          if lmt_val:
+            try:
+              clean_ts = re.sub(r"\.(\d{6})\d+", r".\1", str(lmt_val).replace("Z", "+00:00"))
+              dt = datetime.fromisoformat(clean_ts)
+              lmt_ns = int(dt.timestamp() * 1e9)
+            except Exception:
+              lmt_ns = st.st_mtime_ns
+          sc = meta.get("step_count") or 0
+          cur.execute(
+              "INSERT INTO conversations_fts ("
+              " conversation_id, chunk_index, chunk_first_step, chunk_last_step,"
+              " last_modified_time, step_count, last_step_created_at, archived,"
+              " user_step_byte_offsets, agent_step_byte_offsets,"
+              " title, workspace, project, user_body, agent_body"
+              ") VALUES (?, -1, 0, 0, ?, ?, ?, ?, '', '', ?, ?, ?, '', '')",
+              (cid, lmt_ns, sc, lmt_ns, arch, title, ws, pid),
+          )
+          fts_headers.add(cid)
+
+        # Insert chunk 0 for conversations whose main messages were never indexed
+        if cid not in fts_chunk0 and (user_entries or agent_entries):
+          u_parts, u_offsets, u_bytes = [], [], 0
+          for u_step, u_t in user_entries:
+            u_offsets.append([u_step, u_bytes])
+            u_parts.append(u_t)
+            u_bytes += len(u_t.encode("utf-8")) + 1
+          a_parts, a_offsets, a_bytes = [], [], 0
+          for a_step, a_t in agent_entries:
+            a_offsets.append([a_step, a_bytes])
+            a_parts.append(a_t)
+            a_bytes += len(a_t.encode("utf-8")) + 1
+          first_st = min(
+              [s for s, _ in user_entries] + [s for s, _ in agent_entries]
+          )
+          last_st = max(
+              [s for s, _ in user_entries] + [s for s, _ in agent_entries]
+          )
+          cur.execute(
+              "INSERT INTO conversations_fts ("
+              " conversation_id, chunk_index, chunk_first_step, chunk_last_step,"
+              " last_modified_time, step_count, last_step_created_at, archived,"
+              " user_step_byte_offsets, agent_step_byte_offsets,"
+              " title, workspace, project, user_body, agent_body"
+              ") VALUES (?, 0, ?, ?, 0, 0, 0, 0, ?, ?, '', '', '', ?, ?)",
+              (
+                  cid,
+                  first_st,
+                  last_st,
+                  json.dumps(u_offsets).encode("utf-8"),
+                  json.dumps(a_offsets).encode("utf-8"),
+                  "\n".join(u_parts),
+                  "\n".join(a_parts),
+              ),
+          )
+          fts_chunk0.add(cid)
+
+        # Chunk supplemental entries into ~16KB chunks with chunk_index <= -2
+        cur.execute(
+            "DELETE FROM conversations_fts WHERE conversation_id = ? AND chunk_index <= -2",
+            (cid,),
+        )
+        if supplemental_entries:
+          supp_chunks = []
+          curr_parts, curr_offsets, curr_bytes = [], [], 0
+          curr_first, curr_last = -1, -1
+          for s_step, s_t in supplemental_entries:
+            encoded_len = len(s_t.encode("utf-8"))
+            curr_offsets.append([s_step, curr_bytes])
+            curr_parts.append(s_t)
+            curr_bytes += encoded_len + 1
+            if curr_first == -1:
+              curr_first = s_step
+            curr_last = s_step
+            if curr_bytes >= 16384:
+              supp_chunks.append((
+                  curr_first,
+                  curr_last,
+                  "\n".join(curr_parts),
+                  json.dumps(curr_offsets).encode("utf-8"),
+              ))
+              curr_parts, curr_offsets, curr_bytes = [], [], 0
+              curr_first, curr_last = -1, -1
+          if curr_parts:
+            supp_chunks.append((
+                curr_first,
+                curr_last,
+                "\n".join(curr_parts),
+                json.dumps(curr_offsets).encode("utf-8"),
+            ))
+
+          for k, (ch_first, ch_last, body, off_bytes) in enumerate(supp_chunks):
+            cur.execute(
+                "INSERT INTO conversations_fts ("
+                " conversation_id, chunk_index, chunk_first_step, chunk_last_step,"
+                " last_modified_time, step_count, last_step_created_at, archived,"
+                " user_step_byte_offsets, agent_step_byte_offsets,"
+                " title, workspace, project, user_body, agent_body"
+                ") VALUES (?, ?, ?, ?, 0, 0, 0, 0, ?, ?, '', '', '', '', ?)",
+                (cid, -2 - k, ch_first, ch_last, b"[]", off_bytes, body),
+            )
+
+        cur.execute(
+            "INSERT OR REPLACE INTO jetski_transcript_fts_sync"
+            " (conversation_id, mtime_ns, file_size) VALUES (?, ?, ?)",
+            (cid, st.st_mtime_ns, st.st_size),
+        )
+        synced[cid] = (st.st_mtime_ns, st.st_size)
+        synced_count += 1
+
+      conn.commit()
+    finally:
+      conn.close()
+
+  return synced_count
 
 
 # SearchConversations returns at most this many chats per query
@@ -1639,6 +1897,11 @@ def _graph_chain(cid: str, graph: tuple) -> list[str]:
 # Searches every chat, archived ones included, through the LS SearchConversations RPC (one
 # best hit per chat) and tags each hit with its piece number in its handoff chain
 def search_conversations(query: str) -> dict:
+  # Ensure supplemental tool and command text is indexed before querying Language Server
+  try:
+    sync_transcript_search_index()
+  except Exception:
+    pass
   results = ls_rpc("SearchConversations", {"query": query}).get("results") or []
   graph = _scan_transcript_graph()
   hits = []
@@ -1666,12 +1929,41 @@ def search_chain(query: str, conv_id: str) -> list[dict]:
     steps = ls_rpc("GetCascadeTrajectorySteps", {"cascadeId": cid}, timeout=60).get("steps") or []
     for idx in range(len(steps) - 1, -1, -1):
       step = steps[idx]
-      if step.get("type") == "CORTEX_STEP_TYPE_USER_INPUT":
+      st_type = step.get("type")
+      who, text = "", ""
+      if st_type == "CORTEX_STEP_TYPE_USER_INPUT":
         who, text = "user", (step.get("userInput") or {}).get("userResponse") or ""
-      elif step.get("type") == "CORTEX_STEP_TYPE_PLANNER_RESPONSE":
+      elif st_type == "CORTEX_STEP_TYPE_PLANNER_RESPONSE":
         pr = step.get("plannerResponse") or {}
         who, text = "agent", pr.get("modifiedResponse") or pr.get("response") or ""
-      else:
+        # Match tool call parameters when the query is absent from agent prose
+        if not text or needle not in text.lower():
+          tc_parts = []
+          for tc in (pr.get("toolCalls") or []):
+            tc_name = str(tc.get("name") or "")
+            tc_args = json.dumps(
+                tc.get("argumentsJson") or tc.get("args") or {}, ensure_ascii=False
+            )
+            tc_parts.append(f"{tc_name}: {tc_args}")
+          if tc_parts:
+            tc_text = " ".join(tc_parts)
+            if needle in tc_text.lower():
+              who = "agent"
+              text = f"{text} {tc_text}".strip()
+      elif st_type == "CORTEX_STEP_TYPE_RUN_COMMAND":
+        # Search command invocation and output for tool execution hits
+        rc = step.get("runCommand") or {}
+        cmd = str(rc.get("commandLine") or "")
+        comb = rc.get("combinedOutput") or {}
+        out = (
+            (comb.get("full") if isinstance(comb, dict) else "")
+            or (comb.get("truncated") if isinstance(comb, dict) else "")
+            or ""
+        )
+        cmd_text = f"{cmd}\n{out}".strip()
+        if cmd_text and needle in cmd_text.lower():
+          who, text = "tool", cmd_text
+      if not who or not text:
         continue
       at = text.lower().find(needle)
       if at < 0:

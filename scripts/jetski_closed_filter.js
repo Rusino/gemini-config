@@ -3837,6 +3837,16 @@
         width: 100%; padding: 6px 8px; font-size: 14px; color: inherit;
         background: transparent; border: 1px solid var(--border, #555); border-radius: 4px;
       }
+      #${SEARCH_PANEL_ID} .jcs-mode-bar {
+        display: flex; gap: 8px; font-size: 12px; margin-bottom: 2px;
+      }
+      #${SEARCH_PANEL_ID} .jcs-mode-btn {
+        background: transparent; border: 1px solid var(--border, #555); border-radius: 4px;
+        color: inherit; cursor: pointer; padding: 4px 8px; opacity: 0.7;
+      }
+      #${SEARCH_PANEL_ID} .jcs-mode-btn[data-active="true"] {
+        background: rgba(138, 180, 248, 0.2); border-color: #8ab4f8; opacity: 1; font-weight: 500;
+      }
       #${SEARCH_PANEL_ID} .jcs-results { overflow-y: auto; }
       #${SEARCH_PANEL_ID} .jcs-hit { padding: 6px 4px; cursor: pointer; border-radius: 4px; }
       #${SEARCH_PANEL_ID} .jcs-hit:hover { background: rgba(127, 127, 127, 0.18); }
@@ -5159,15 +5169,34 @@
     return chain;
   }
 
-  // Only the user's messages and the agent's replies are searched; thinking and tool output
-  // would bury them
+  // User messages, agent replies, and non-trivial tool/command invocations are searched
   function stepSearchText(step) {
     if (step?.type === 'CORTEX_STEP_TYPE_USER_INPUT') {
       return { who: 'user', text: step.userInput?.userResponse || '' };
     }
     if (step?.type === 'CORTEX_STEP_TYPE_PLANNER_RESPONSE') {
       const pr = step.plannerResponse || {};
-      return { who: 'agent', text: pr.modifiedResponse || pr.response || '' };
+      let text = pr.modifiedResponse || pr.response || '';
+      const toolCalls = Array.isArray(pr.toolCalls) ? pr.toolCalls : [];
+      if (toolCalls.length > 0) {
+        const tcTexts = [];
+        for (const tc of toolCalls) {
+          const args = tc.argumentsJson || (tc.args ? JSON.stringify(tc.args) : '');
+          if (tc.name || args) tcTexts.push(`${tc.name || ''}: ${args}`.trim());
+        }
+        if (tcTexts.length > 0) {
+          text = text ? `${text}\n${tcTexts.join('\n')}` : tcTexts.join('\n');
+        }
+      }
+      return text ? { who: 'agent', text } : null;
+    }
+    if (step?.type === 'CORTEX_STEP_TYPE_RUN_COMMAND') {
+      const rc = step.runCommand || {};
+      const cmd = rc.commandLine || '';
+      const comb = rc.combinedOutput || {};
+      const out = (typeof comb === 'object' ? comb.full || comb.truncated : '') || '';
+      const text = `${cmd}\n${out}`.trim();
+      return text ? { who: 'tool', text } : null;
     }
     return null;
   }
@@ -5469,30 +5498,201 @@
       .join('');
   }
 
-  // Search window over one chat and all its archived handoff pieces; the chain index is
-  // awaited so a cold first open does not silently search only the current piece
-  async function openSearchPanel(cascadeId) {
+  // Searches all conversations (including archived chats and chain pieces) via Language Server
+  async function runGlobalSearch(query, resultsEl) {
+    const seq = ++searchSeq;
+    const needle = query.trim();
+    if (!needle) {
+      resultsEl.innerHTML = '';
+      return;
+    }
+    let data;
+    try {
+      const resp = await window.fetch(
+        '/exa.language_server_pb.LanguageServerService/SearchConversations',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-codeium-csrf-token': getCsrfToken(),
+          },
+          body: JSON.stringify({ query: needle }),
+        }
+      );
+      if (!resp.ok) throw new Error(`HTTP ${resp.status} ${await resp.text()}`);
+      data = await resp.json();
+    } catch (err) {
+      if (seq === searchSeq) {
+        resultsEl.innerHTML = `<div class="jcs-meta">Search failed: ${escapeHtml(err)}</div>`;
+      }
+      return;
+    }
+    if (seq !== searchSeq) return;
+    const rawResults = Array.isArray(data?.results) ? data.results : [];
+    if (rawResults.length === 0) {
+      resultsEl.innerHTML = '<div class="jcs-meta">No matches</div>';
+      return;
+    }
+
+    const items = [];
+    for (const r of rawResults) {
+      const cid = r.cascadeId || '';
+      if (!cid) continue;
+      let chain = [cid];
+      try {
+        chain = await chainOf(cid);
+      } catch {
+        chain = [cid];
+      }
+      if (seq !== searchSeq) return;
+      const pieceIdx = chain.indexOf(cid);
+      const piece = pieceIdx >= 0 ? pieceIdx + 1 : 1;
+      const isArchived = Boolean(r.archived || isArchivedCascadeId(cid));
+      const title = r.title || cid;
+      const snippet = r.snippet || '';
+      items.push({
+        cid,
+        piece,
+        chainLength: chain.length,
+        isArchived,
+        title,
+        snippet,
+        matchedStepIndex: r.matchedStepIndex ?? -1,
+      });
+    }
+
+    resultsEl.innerHTML = items
+      .map((it) => {
+        const metaParts = [];
+        if (it.chainLength > 1) {
+          metaParts.push(`piece ${it.piece}/${it.chainLength}`);
+        }
+        if (it.isArchived) {
+          metaParts.push('🗄 archived');
+        }
+        if (it.matchedStepIndex >= 0) {
+          metaParts.push(`step ${it.matchedStepIndex}`);
+        }
+        const metaStr = metaParts.length > 0 ? ` · ${metaParts.join(' · ')}` : '';
+        const titleHtml = escapeHtml(it.title);
+        let snippetHtml = escapeHtml(it.snippet);
+        const lowerSnip = it.snippet.toLowerCase();
+        const lowerNeedle = needle.toLowerCase();
+        const at = lowerSnip.indexOf(lowerNeedle);
+        if (at >= 0) {
+          snippetHtml =
+            escapeHtml(it.snippet.slice(0, at)) +
+            '<mark>' +
+            escapeHtml(it.snippet.slice(at, at + needle.length)) +
+            '</mark>' +
+            escapeHtml(it.snippet.slice(at + needle.length));
+        }
+        return (
+          `<div class="jcs-hit" data-cascade-id="${escapeHtml(it.cid)}">` +
+          `<div class="jcs-meta">${titleHtml}${metaStr}</div>` +
+          `<div>${snippetHtml}</div>` +
+          `</div>`
+        );
+      })
+      .join('');
+  }
+
+  // Search window over all chats or one chat's chain; supports global search mode
+  // that finds archived chats and chain pieces across the entire workspace
+  async function openSearchPanel(cascadeId, options) {
     closeSearchPanel();
-    const chain = await chainOf(cascadeId);
+    let currentMode = options?.mode || (cascadeId ? 'chain' : 'global');
+    let chain = [];
+    if (cascadeId) {
+      try {
+        chain = await chainOf(cascadeId);
+      } catch {
+        chain = [cascadeId];
+      }
+    }
     const stepCache = new Map();
     const panel = document.createElement('div');
     panel.id = SEARCH_PANEL_ID;
+
+    // Mode toggle bar when an active chat scope is present
+    const modeBar = document.createElement('div');
+    modeBar.className = 'jcs-mode-bar';
+    const globalBtn = document.createElement('button');
+    globalBtn.type = 'button';
+    globalBtn.className = 'jcs-mode-btn';
+    globalBtn.setAttribute('data-mode', 'global');
+    globalBtn.textContent = 'All chats (incl. archived)';
+    modeBar.appendChild(globalBtn);
+
+    let chainBtn = null;
+    if (cascadeId) {
+      chainBtn = document.createElement('button');
+      chainBtn.type = 'button';
+      chainBtn.className = 'jcs-mode-btn';
+      chainBtn.setAttribute('data-mode', 'chain');
+      chainBtn.textContent = 'This chat chain';
+      modeBar.appendChild(chainBtn);
+    }
+    panel.appendChild(modeBar);
+
     const input = document.createElement('input');
     input.type = 'search';
-    input.setAttribute(
-      'placeholder',
-      chain.length > 1 ? `Search this chat and its ${chain.length - 1} earlier piece(s)` :
-        'Search this chat'
-    );
+
+    const updateModeUI = () => {
+      globalBtn.setAttribute('data-active', currentMode === 'global' ? 'true' : 'false');
+      if (chainBtn) {
+        chainBtn.setAttribute('data-active', currentMode === 'chain' ? 'true' : 'false');
+      }
+      if (currentMode === 'global') {
+        input.setAttribute('placeholder', 'Search all chats (including archived & chain pieces)');
+      } else {
+        input.setAttribute(
+          'placeholder',
+          chain.length > 1
+            ? `Search this chat and its ${chain.length - 1} earlier piece(s)`
+            : 'Search this chat'
+        );
+      }
+    };
+    updateModeUI();
+
     const resultsEl = document.createElement('div');
     resultsEl.className = 'jcs-results';
     panel.appendChild(input);
     panel.appendChild(resultsEl);
     document.body.appendChild(panel);
+
+    const executeSearch = () => {
+      if (currentMode === 'global') {
+        void runGlobalSearch(input.value, resultsEl);
+      } else {
+        void runChatSearch(input.value, resultsEl, chain, stepCache);
+      }
+    };
+
+    globalBtn.addEventListener('click', () => {
+      if (currentMode !== 'global') {
+        currentMode = 'global';
+        updateModeUI();
+        executeSearch();
+        input.focus();
+      }
+    });
+    if (chainBtn) {
+      chainBtn.addEventListener('click', () => {
+        if (currentMode !== 'chain') {
+          currentMode = 'chain';
+          updateModeUI();
+          executeSearch();
+          input.focus();
+        }
+      });
+    }
+
     let timer = 0;
     input.addEventListener('input', () => {
       clearTimeout(timer);
-      timer = setTimeout(() => runChatSearch(input.value, resultsEl, chain, stepCache), 250);
+      timer = setTimeout(executeSearch, 250);
     });
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') closeSearchPanel();
@@ -5510,7 +5710,13 @@
   }
 
   // The test harness fake DOM cannot type into the panel, so it drives search directly
-  window.__jetskiChatSearch = { runChatSearch, chainOf };
+  window.__jetskiChatSearch = {
+    runChatSearch,
+    runGlobalSearch,
+    openSearchPanel,
+    closeSearchPanel,
+    chainOf,
+  };
 
   let locateHighlightTimer = 0;
 
@@ -6293,10 +6499,33 @@
     }
   }
 
+  // Intercepts built-in sidebar search button to open our archive-aware global search panel
+  function handleSidebarSearchIntercept(event) {
+    const target = event?.target;
+    if (!target || typeof target.closest !== 'function') return;
+    const searchBtn = target.closest('[data-testid="sidebar-search-button"]');
+    if (!searchBtn) return;
+    // Suppress native search palette popup across capture events
+    event.preventDefault();
+    event.stopPropagation();
+    if (typeof event.stopImmediatePropagation === 'function') {
+      event.stopImmediatePropagation();
+    }
+    // Target the active chat pane if open, otherwise open standalone global search
+    const store = findReduxStore();
+    const activeCid =
+      store?.getState()?.conversation?.cascadeId ||
+      store?.getState()?.multiConvoLayout?.focusedPaneId ||
+      '';
+    void openSearchPanel(activeCid, { mode: 'global' });
+  }
+
   function bindInputBoxSeenListeners() {
     if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
       document.addEventListener('pointerdown', handleInputBoxSeen, true);
       document.addEventListener('focusin', handleInputBoxSeen, true);
+      document.addEventListener('pointerdown', handleSidebarSearchIntercept, true);
+      document.addEventListener('click', handleSidebarSearchIntercept, true);
     }
   }
 
@@ -6304,6 +6533,8 @@
     if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
       document.removeEventListener('pointerdown', handleInputBoxSeen, true);
       document.removeEventListener('focusin', handleInputBoxSeen, true);
+      document.removeEventListener('pointerdown', handleSidebarSearchIntercept, true);
+      document.removeEventListener('click', handleSidebarSearchIntercept, true);
     }
   }
 

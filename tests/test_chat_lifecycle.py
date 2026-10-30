@@ -1880,6 +1880,103 @@ class TestChatLifecycle(unittest.TestCase):
     )
     self.assertEqual(hits[0]["chain_length"], 3)
 
+  def test_sync_transcript_search_index_indexes_supplemental_text(self):
+    with tempfile.TemporaryDirectory() as td:
+      db_path = os.path.join(td, "conversation_summaries.db")
+      conn = sqlite3.connect(db_path)
+      cur = conn.cursor()
+      cur.execute("""
+      CREATE VIRTUAL TABLE conversations_fts USING fts5(
+          conversation_id UNINDEXED, chunk_index UNINDEXED, chunk_first_step UNINDEXED,
+          chunk_last_step UNINDEXED, last_modified_time UNINDEXED, step_count UNINDEXED,
+          last_step_created_at UNINDEXED, archived UNINDEXED, user_step_byte_offsets UNINDEXED,
+          agent_step_byte_offsets UNINDEXED, title, workspace, project, user_body, agent_body
+      )
+      """)
+      cur.execute("""
+      CREATE TABLE conversation_summaries (
+          conversation_id TEXT PRIMARY KEY, title TEXT, workspace_uris TEXT,
+          project_id TEXT, parent_conversation_id TEXT, step_count INTEGER,
+          last_modified_time DATETIME
+      )
+      """)
+      cid = "c-target-1410476"
+      cur.execute(
+          "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?)",
+          (cid, "Target Title", "", "proj-1", "", 2, "2026-10-30T12:00:00Z"),
+      )
+      conn.commit()
+      conn.close()
+
+      logs_dir = os.path.join(td, "brain", cid, ".system_generated", "logs")
+      os.makedirs(logs_dir, exist_ok=True)
+      t_file = os.path.join(logs_dir, "transcript.jsonl")
+      with open(t_file, "w", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "step_index": 0, "type": "USER_INPUT", "content": "hello search"
+        }) + "\n")
+        f.write(json.dumps({
+            "step_index": 1, "type": "PLANNER_RESPONSE", "content": "starting work",
+            "thinking": "plan to run 1410476 tool",
+            "tool_calls": [{"name": "run_command", "args": {"CommandLine": "git cl 1410476"}}],
+        }) + "\n")
+
+      synced = chat_lifecycle.sync_transcript_search_index([td])
+      self.assertEqual(synced, 1)
+
+      conn = sqlite3.connect(db_path)
+      cur = conn.cursor()
+      cur.execute("SELECT chunk_index, agent_body FROM conversations_fts WHERE conversation_id = ?", (cid,))
+      rows = cur.fetchall()
+      self.assertTrue(any(r[0] == -1 for r in rows), "Must insert header row -1")
+      self.assertTrue(any(r[0] == 0 for r in rows), "Must insert chunk 0")
+      supp_rows = [r for r in rows if r[0] <= -2]
+      self.assertTrue(bool(supp_rows), "Must insert supplemental row chunk_index <= -2")
+      self.assertIn("1410476", supp_rows[0][1])
+
+      cur.execute("SELECT conversation_id, mtime_ns, file_size FROM jetski_transcript_fts_sync")
+      sync_rows = cur.fetchall()
+      self.assertEqual(len(sync_rows), 1)
+      self.assertEqual(sync_rows[0][0], cid)
+      conn.close()
+
+      # Subsequent sync without changes is a no-op
+      synced_again = chat_lifecycle.sync_transcript_search_index([td])
+      self.assertEqual(synced_again, 0)
+
+  def test_search_chain_finds_tool_and_command_hits(self):
+    _, graph = self._search_fixture()
+    steps = {
+        "c1": [
+            {
+                "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                "plannerResponse": {
+                    "toolCalls": [
+                        {"name": "run_command", "argumentsJson": "{\"cmd\": \"git cl 1410476\"}"}
+                    ]
+                },
+            },
+            {
+                "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+                "runCommand": {
+                    "commandLine": "git cl upload",
+                    "combinedOutput": {"full": "Uploaded 1410476 successfully"},
+                },
+            },
+        ],
+        "c2": [],
+        "c3": [],
+    }
+    rpc = lambda method, body, timeout=20.0: {"steps": steps[body["cascadeId"]]}
+    with patch.object(chat_lifecycle, "ls_rpc", side_effect=rpc), \
+         patch.object(chat_lifecycle, "_scan_transcript_graph", return_value=graph):
+      hits = chat_lifecycle.search_chain("1410476", "c1")
+    self.assertEqual(len(hits), 2)
+    self.assertEqual(hits[0]["who"], "tool")
+    self.assertIn("Uploaded 1410476", hits[0]["snippet"])
+    self.assertEqual(hits[1]["who"], "agent")
+    self.assertIn("1410476", hits[1]["snippet"])
+
   def test_urlopen_ls_blocks_unmocked_live_ls_in_unittest(self):
     req = chat_lifecycle.urllib.request.Request("http://localhost:5387/")
     with self.assertRaises(chat_lifecycle.urllib.error.URLError):

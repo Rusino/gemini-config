@@ -596,6 +596,24 @@ global.window = {
     setItem: (k, v) => storage.set(k, String(v)),
   },
   fetch: async (url, opts) => {
+    if (String(url).includes('SearchConversations')) {
+      const body = JSON.parse(opts.body);
+      rpcRequests.push({ url: String(url), body, headers: opts.headers });
+      return {
+        ok: true,
+        json: async () => ({
+          results: [
+            {
+              cascadeId: 'open-step',
+              title: '[10:00] ⦿ Open Step Chat',
+              snippet: 'Found 1410476 in test step',
+              archived: true,
+              matchedStepIndex: 1,
+            },
+          ],
+        }),
+      };
+    }
     if (String(url).includes('GetCascadeTrajectorySteps')) {
       const body = JSON.parse(opts.body);
       rpcRequests.push({ url: String(url), body, headers: opts.headers });
@@ -1183,6 +1201,34 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(rpcRequests.length, 0, 'Steps are cached for the open panel');
   await window.__jetskiChatSearch.runChatSearch('  ', resultsEl, chain, stepCache);
   assert.strictEqual(resultsEl.innerHTML, '');
+
+  // Verify global search covers archived chats and chain pieces
+  rpcRequests.length = 0;
+  const globalResultsEl = new FakeElement('div');
+  await window.__jetskiChatSearch.runGlobalSearch('1410476', globalResultsEl);
+  assert.strictEqual(rpcRequests.length, 1);
+  assert(rpcRequests[0].url.includes('SearchConversations'));
+  assert.strictEqual(rpcRequests[0].body.query, '1410476');
+  assert(globalResultsEl.innerHTML.includes('open-step'));
+  assert(globalResultsEl.innerHTML.includes('piece 2/3'));
+  assert(globalResultsEl.innerHTML.includes('🗄 archived'));
+  assert(globalResultsEl.innerHTML.includes('<mark>1410476</mark>'));
+
+  // Verify sidebar search button opens global search panel
+  const sidebarSearchBtn = new FakeElement('button');
+  sidebarSearchBtn.setAttribute('data-testid', 'sidebar-search-button');
+  bodyEl.appendChild(sidebarSearchBtn);
+  sidebarSearchBtn.dispatchEvent('pointerdown', { button: 0 });
+  await new Promise((r) => setTimeout(r, 10));
+  const searchPanel = document.getElementById('jetski-chat-search-panel');
+  assert(searchPanel, 'Clicking sidebar search button must mount search panel');
+  const modeBar = searchPanel.querySelector('.jcs-mode-bar');
+  assert(modeBar, 'Search panel must carry mode toggle bar');
+  const globalModeBtn = modeBar.querySelector('[data-mode="global"]');
+  assert(globalModeBtn, 'Mode bar must carry global search button');
+  assert.strictEqual(globalModeBtn.getAttribute('data-active'), 'true');
+  searchPanel.remove();
+  sidebarSearchBtn.remove();
 
   // 1. Verify chain navigator stars on 'open-step' (middle piece: 2 before, 1 after)
   const starsBefore = convoNavEl.querySelector('[data-testid="jetski-chain-stars-before"]');
