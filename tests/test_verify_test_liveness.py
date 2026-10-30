@@ -139,6 +139,51 @@ class TestVerifyTestLiveness(unittest.TestCase):
       self.assertIn("[STALE MUTATION ATTESTATION]",
                     self.run_script(tmp, test_file, name, LIVE_LOG).stdout)
 
+  def test_font_metric_pin_caught_and_invariant_or_guard_passes(self):
+    bad_body = """
+DEF_TEST(FontPinBad, reporter) {
+    sk_sp<SkFontMgr> mgr = ToolUtils::TestFontMgr();
+    SkGlyph glyph;
+    REPORTER_ASSERT(reporter, glyph.width() == 4071 && glyph.height() == 65527);
+}
+"""
+    invariant_body = """
+DEF_TEST(FontPinInvariant, reporter) {
+    sk_sp<SkFontMgr> mgr = ToolUtils::TestFontMgr();
+    SkGlyph glyph;
+    REPORTER_ASSERT(reporter, SkComputeDistanceFieldSize(glyph.width(), glyph.height()) == 0);
+}
+"""
+    guarded_body = """
+DEF_TEST(FontPinGuarded, reporter) {
+    sk_sp<SkFontMgr> mgr = SkFontMgr_New_FreeType(nullptr);
+    SkGlyph glyph;
+    REPORTER_ASSERT(reporter, glyph.width() == 4071 && glyph.height() == 65527);
+}
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+      self.make_repo(tmp, bad_body, register_scanner_test=False)
+      self.attest(tmp, "tests/FontMgrAndroidParserTest.cpp", "FontPinBad")
+      log = "start unit test FontPinBad\nFinished!\n"
+      res = self.run_script(tmp, "tests/FontMgrAndroidParserTest.cpp", "FontPinBad", log)
+      self.assertEqual(res.returncode, 1)
+      self.assertIn("[FONT-BACKEND PIN]", res.stdout)
+      self.assertIn("Gerrit 1404196 -> 1411716", res.stdout)
+
+    with tempfile.TemporaryDirectory() as tmp:
+      self.make_repo(tmp, invariant_body, register_scanner_test=False)
+      self.attest(tmp, "tests/FontMgrAndroidParserTest.cpp", "FontPinInvariant")
+      log = "start unit test FontPinInvariant\nFinished!\n"
+      res = self.run_script(tmp, "tests/FontMgrAndroidParserTest.cpp", "FontPinInvariant", log)
+      self.assertEqual(res.returncode, 0, res.stdout)
+
+    with tempfile.TemporaryDirectory() as tmp:
+      self.make_repo(tmp, guarded_body, register_scanner_test=False)
+      self.attest(tmp, "tests/FontMgrAndroidParserTest.cpp", "FontPinGuarded")
+      log = "start unit test FontPinGuarded\nFinished!\n"
+      res = self.run_script(tmp, "tests/FontMgrAndroidParserTest.cpp", "FontPinGuarded", log)
+      self.assertEqual(res.returncode, 0, res.stdout)
+
 
 if __name__ == "__main__":
   unittest.main()

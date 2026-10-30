@@ -183,6 +183,28 @@ def choose_asan_bot(effective_paths):
         return "Test-Ubuntu24.04-Clang-GCE-CPU-AVX2-x86_64-Debug-All-ASAN", "General CPU C++ diff"
     return None, None
 
+MAC_NATIVE_FONTS_BOT = (
+    "Test-Mac14-Clang-MacMini8.1-CPU-AVX2-x86_64-Debug-All-NativeFonts_Fontations"
+)
+FONT_TEST_HINT_RE = re.compile(
+    r"\b(?:TestFontMgr|DefaultFontMgr|makeFromData|makeFromStream|makeFromFile|"
+    r"MakeFromData|MakeFromFile|MakeFromName|CreateTestTypeface|DefaultTypeface|"
+    r"SampleUserTypeface|SkRemoteGlyphCache|SkScalerContext)\b"
+)
+
+def needs_mac_native_fonts_bot(files):
+    for path, data in files.items():
+        p = path.lower()
+        if not (p.startswith("tests/") or "/tests/" in p) or not p.endswith((".cpp", ".cc", ".h")):
+            continue
+        added_text = " ".join(data.get("added", []))
+        if FONT_TEST_HINT_RE.search(added_text):
+            return (
+                MAC_NATIVE_FONTS_BOT,
+                "Font-backed cross-platform test diff (CoreText NativeFonts check)",
+            )
+    return None, None
+
 def is_public_header(path):
     return bool(re.match(r"^(include/|modules/[^/]+/include/)", path)) and path.endswith(".h")
 
@@ -389,6 +411,7 @@ def advise(args):
     googler_cr_plus_one = meta.get("googler_cr_plus_one", False)
 
     asan_bot, asan_reason = choose_asan_bot(files.keys())
+    mac_font_bot, mac_font_reason = needs_mac_native_fonts_bot(files)
 
     print(f"# Canary advice: {meta['subject']}")
     if meta["cl"]:
@@ -406,6 +429,10 @@ def advise(args):
     if asan_bot:
         print(f"\n## ASAN [ALWAYS_RUN]")
         print(f"- {asan_reason} -> {asan_bot}")
+
+    if mac_font_bot:
+        print(f"\n## Font-Backend Trybot [ALWAYS_RUN]")
+        print(f"- {mac_font_reason} -> {mac_font_bot}")
 
     if external and "Canary-G3" in recs and not googler_cr_plus_one:
         notes.append(
@@ -425,6 +452,10 @@ def advise(args):
     # Policy: agent ALWAYS triggers ASAN
     if asan_bot:
         bots_to_run.append(asan_bot)
+
+    # Policy: agent ALWAYS triggers Mac NativeFonts trybot for font-backed tests
+    if mac_font_bot and mac_font_bot not in bots_to_run:
+        bots_to_run.append(mac_font_bot)
         
     # Policy: agent triggers Canary for external authors automatically
     # Canary-G3 requires Googler author or Googler CR+1 approval (g3_canary.go:134)
@@ -478,6 +509,7 @@ def advise(args):
                 "googler_cr_plus_one": googler_cr_plus_one,
                 "recommended": {c: r["tier"] for c, r in recs.items()},
                 "asan_bot": asan_bot,
+                "mac_font_bot": mac_font_bot,
             }) + "\n")
 
 

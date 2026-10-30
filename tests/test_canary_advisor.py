@@ -178,6 +178,58 @@ class TestCanaryAdvisor(unittest.TestCase):
     self.assertIn("NativeFonts_FreeType_ASAN_Upload", agent_action_line)
     self.assertNotIn("deferred until a Googler votes Code-Review+1", out)
 
+  def test_font_backed_test_adds_mac_native_fonts_trybot(self):
+    diff_text = (
+        "diff --git a/tests/SkRemoteGlyphCacheTest.cpp b/tests/SkRemoteGlyphCacheTest.cpp\n"
+        "--- a/tests/SkRemoteGlyphCacheTest.cpp\n"
+        "+++ b/tests/SkRemoteGlyphCacheTest.cpp\n"
+        "@@ -10,2 +10,4 @@\n"
+        "+DEF_TEST(SkRemoteGlyphCache_Test, reporter) {\n"
+        "+    auto mgr = ToolUtils::TestFontMgr();\n"
+        "+}\n"
+    )
+    fake_meta = {
+        "cl": 1404196,
+        "patchset": 1,
+        "subject": "Add font test",
+        "owner": "googler@google.com",
+        "diff": diff_text,
+        "googler_cr_plus_one": True,
+    }
+    args = type(
+        "Args",
+        (),
+        {
+            "cl": "1404196",
+            "repo": None,
+            "base": "origin/main",
+            "max_symbols": 6,
+            "no_search": True,
+            "no_health": True,
+            "no_log": True,
+            "strong_only": False,
+        },
+    )()
+
+    buf = io.StringIO()
+    with patch.object(canary_advisor, "load_cl", return_value=fake_meta):
+      with patch("sys.stdout", buf):
+        canary_advisor.advise(args)
+
+    out = buf.getvalue()
+    self.assertIn("Font-Backend Trybot [ALWAYS_RUN]", out)
+    self.assertIn(
+        "Test-Mac14-Clang-MacMini8.1-CPU-AVX2-x86_64-Debug-All-NativeFonts_Fontations",
+        out,
+    )
+    agent_action_line = [
+        line for line in out.splitlines() if line.strip().startswith("git cl try")
+    ][0]
+    self.assertIn(
+        "Test-Mac14-Clang-MacMini8.1-CPU-AVX2-x86_64-Debug-All-NativeFonts_Fontations",
+        agent_action_line,
+    )
+
 
 if __name__ == "__main__":
   unittest.main()

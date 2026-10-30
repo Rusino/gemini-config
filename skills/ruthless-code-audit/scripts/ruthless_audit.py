@@ -194,6 +194,34 @@ DART_NON_CONST_DEBUG_FLAG_RE = re.compile(
     r"^\s*static\s+(?!const\b)(?:final\s+|var\s+)?bool\s+(?:logging|apiLogging)\s*="
 )
 
+# Font-backed test inspection: pinning font metrics against hardcoded numbers breaks cross-platform
+FONT_MGR_RE = re.compile(
+    r"\b(?:TestFontMgr|DefaultFontMgr|makeFromData|makeFromStream|makeFromFile|"
+    r"MakeFromData|MakeFromFile|MakeFromName|CreateTestTypeface|DefaultTypeface|"
+    r"SampleUserTypeface)\b"
+)
+FONT_BACKEND_GUARD_RE = re.compile(
+    r"\b(?:SkFontMgr_New_(?:FreeType|Fontations|CoreText|DirectWrite|GDI|Android|FontConfig)|"
+    r"SkTypeface_Make_Fontations|SK_BUILD_FOR_(?:MAC|WIN|IOS|ANDROID)|ToolUtils::TestFontMgrIs)\b"
+)
+_FONT_METRIC_EXPR = (
+    r"(?:\b\w*(?:glyph|Glyph|mx|metrics|Metrics|bounds|Bounds|advance|Advance)\w*\s*(?:\.|->)\s*"
+    r"(?:width|height|left|top|right|bottom|fAscent|fDescent|fLeading|fTop|fBottom|"
+    r"fXMin|fXMax|fAvgCharWidth|fMaxCharWidth|fCapHeight|fXHeight|"
+    r"fUnderlineThickness|fUnderlinePosition)\b"
+    r"|\.(?:getBounds|getWidthsBounds|getWidths|getPos|getMetrics|measureText)\b)"
+)
+_NON_ZERO_NUM = r"[-+]?(?:[1-9]\d*(?:\.\d+)?|0\.\d+)f?\b"
+FONT_METRIC_PIN_RE = re.compile(
+    r"\b(?:REPORTER_ASSERT|SkASSERT|ASSERT_\w+|EXPECT_\w+)\s*\([^;]*?"
+    rf"(?:{_FONT_METRIC_EXPR}[^;]*?"
+    rf"(?:==\s*{_NON_ZERO_NUM}|SkScalarNearlyEqual\s*\([^;]*,\s*{_NON_ZERO_NUM})"
+    rf"|{_NON_ZERO_NUM}\s*==\s*{_FONT_METRIC_EXPR})"
+)
+CPP_TEST_DEF_RE = re.compile(
+    r"\b(?:DEF_\w*TEST\w*\(\s*(\w+)|TEST(?:_F|_P)?\(\s*(\w+)\s*,\s*(\w+))[^{]*\{"
+)
+
 FUNC_PATTERNS = {
     ".go": re.compile(r"^\s*func\s+(?:\([^)]+\)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\("),
     ".py": re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("),
@@ -686,6 +714,23 @@ def scan_horrors_and_invariants(file_records, allow_cyrillic=False):
         if in_hot_func and HOT_ALLOC_RE.search(raw) and not raw.lstrip().startswith("//"):
           horrors["hot_path_allocations"].append((loc, stripped[:100]))
 
+    if test_flag and ext in (".cc", ".cpp", ".cxx", ".mm") and FONT_MGR_RE.search(content):
+      for m in CPP_TEST_DEF_RE.finditer(content):
+        depth, i = 0, m.end() - 1
+        while i < len(content):
+          depth += {"{": 1, "}": -1}.get(content[i], 0)
+          if depth == 0:
+            break
+          i += 1
+        body = content[m.start():i+1]
+        if not FONT_MGR_RE.search(body) or FONT_BACKEND_GUARD_RE.search(body):
+          continue
+        for pm in FONT_METRIC_PIN_RE.finditer(body):
+          ln = content.count("\n", 0, m.start() + pm.start()) + 1
+          horrors["test_font_metric_pins"].append(
+              (f"{rel_path}:L{ln}", " ".join(pm.group(0).split())[:100])
+          )
+
   duplicated_endpoints = [
       {"endpoint": ep, "files": sorted(flist)}
       for ep, flist in sorted(endpoints.items())
@@ -804,6 +849,7 @@ def format_markdown_report(report):
       ("test_sleeps", "Sleep-Based Synchronization in Tests"),
       ("test_magic_pins", "Magic Probability / Score / Sizeof Pinning in Tests"),
       ("test_narrative_headers", "Narrative Comment Headers Above Test Assertions (Rule 5)"),
+      ("test_font_metric_pins", "Cross-Platform Font Metric Pinning in Tests (Invariant 10)"),
       # Report Dart/WebParagraph test and production hygiene categories
       ("dart_test_raw_asserts", "Raw `assert(...)` in Dart Tests Instead of `expect(...)` (Rule M4)"),
       ("dart_test_non_ci_fonts", "Non-CI Desktop Font Family in Dart Tests (Rule M4)"),

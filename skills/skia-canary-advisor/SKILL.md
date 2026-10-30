@@ -115,7 +115,7 @@ When reviewing an external author's Skia CL that requires `Canary-G3`:
        autorepair readonly investigate --sponge_id=<id> --test_target=<target>
        ```
 
-## ASAN Sanitizer Selection
+## ASAN Sanitizer & Font-Backend Trybot Selection
 
 The script automatically selects one ASAN bot based on the diff:
 - Text/Fonts C++ -> `Test-Ubuntu24.04-Clang-GCE-CPU-AVX2-x86_64-Debug-All-NativeFonts_FreeType_ASAN_Upload`
@@ -123,6 +123,13 @@ The script automatically selects one ASAN bot based on the diff:
 - GPU (Metal) -> `Test-Mac15-Clang-MacMini16.10-GPU-AppleM4-arm64-Debug-All-ASAN_Graphite_Native_Metal`
 - General CPU -> `Test-Ubuntu24.04-Clang-GCE-CPU-AVX2-x86_64-Debug-All-ASAN`
 (Does not trigger for docs/Dart/TS/markdown-only CLs).
+
+In addition, when a diff adds or modifies C++ tests using `TestFontMgr()`, `DefaultFontMgr()`,
+`makeFromData()`, `MakeFromFile()`, `CreateTestTypeface()`, or font metrics, the script also selects
+`Test-Mac14-Clang-MacMini8.1-CPU-AVX2-x86_64-Debug-All-NativeFonts_Fontations` (`[ALWAYS_RUN]`).
+This ensures `--nativeFonts` (CoreText, where `SkScalerContext_Mac::generateMetrics` outsets bounds
+by 1) and `--fontations` are exercised before submit, preventing font-backend-specific test
+breakages on Mac trybots (`cpp_systems_invariants.md` #10; Gerrit 1404196 -> 1411716).
 
 ## Local Chromium Verification (Fast Pre-Canary Check)
 

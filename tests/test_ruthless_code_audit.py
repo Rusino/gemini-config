@@ -252,6 +252,14 @@ class TestRuthlessCodeAudit(unittest.TestCase):
         "  // Test that width is positive",
         "  REPORTER_ASSERT(r, width > 0);",
         "}",
+        "DEF_TEST(FontPinBad, r) {",
+        "  sk_sp<SkFontMgr> mgr = ToolUtils::TestFontMgr();",
+        "  REPORTER_ASSERT(r, glyph.width() == 4071 && glyph.height() == 65527);",
+        "}",
+        "DEF_TEST(FontPinGuarded, r) {",
+        "  sk_sp<SkFontMgr> mgr = SkFontMgr_New_FreeType(nullptr);",
+        "  REPORTER_ASSERT(r, glyph.width() == 4071 && glyph.height() == 65527);",
+        "}",
     ])
     self._write("src/layout.cpp", cpp_prod)
     self._write("overlay/proxy.go", go_proxy)
@@ -276,6 +284,7 @@ class TestRuthlessCodeAudit(unittest.TestCase):
     self.assertEqual(len(horrors["test_sleeps"]), 1)
     self.assertEqual(len(horrors["test_magic_pins"]), 1)
     self.assertEqual(len(horrors["test_narrative_headers"]), 1)
+    self.assertEqual(len(horrors["test_font_metric_pins"]), 1)
 
   def test_cli_json_and_markdown_execution(self):
     self._write("a.py", "def unused_fn():\n  return 1\n")

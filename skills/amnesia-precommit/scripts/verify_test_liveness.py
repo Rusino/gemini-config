@@ -40,6 +40,31 @@ ASSERT_RE = re.compile(
 DEVICE_PATH_RE = re.compile(r"[\"'](/system/|/vendor/|/product/|/odm/)")
 DEVICE_DEFAULT_RE = re.compile(r"SkFontMgr_New_Android\s*\(\s*nullptr")
 
+# Font-backed test inspection: pinning font metrics against hardcoded numbers breaks cross-platform
+FONT_MGR_RE = re.compile(
+    r"\b(?:TestFontMgr|DefaultFontMgr|makeFromData|makeFromStream|makeFromFile|"
+    r"MakeFromData|MakeFromFile|MakeFromName|CreateTestTypeface|DefaultTypeface|"
+    r"SampleUserTypeface)\b"
+)
+FONT_BACKEND_GUARD_RE = re.compile(
+    r"\b(?:SkFontMgr_New_(?:FreeType|Fontations|CoreText|DirectWrite|GDI|Android|FontConfig)|"
+    r"SkTypeface_Make_Fontations|SK_BUILD_FOR_(?:MAC|WIN|IOS|ANDROID)|ToolUtils::TestFontMgrIs)\b"
+)
+_FONT_METRIC_EXPR = (
+    r"(?:\b\w*(?:glyph|Glyph|mx|metrics|Metrics|bounds|Bounds|advance|Advance)\w*\s*(?:\.|->)\s*"
+    r"(?:width|height|left|top|right|bottom|fAscent|fDescent|fLeading|fTop|fBottom|"
+    r"fXMin|fXMax|fAvgCharWidth|fMaxCharWidth|fCapHeight|fXHeight|"
+    r"fUnderlineThickness|fUnderlinePosition)\b"
+    r"|\.(?:getBounds|getWidthsBounds|getWidths|getPos|getMetrics|measureText)\b)"
+)
+_NON_ZERO_NUM = r"[-+]?(?:[1-9]\d*(?:\.\d+)?|0\.\d+)f?\b"
+FONT_METRIC_PIN_RE = re.compile(
+    r"\b(?:REPORTER_ASSERT|SkASSERT|ASSERT_\w+|EXPECT_\w+)\s*\([^;]*?"
+    rf"(?:{_FONT_METRIC_EXPR}[^;]*?"
+    rf"(?:==\s*{_NON_ZERO_NUM}|SkScalarNearlyEqual\s*\([^;]*,\s*{_NON_ZERO_NUM})"
+    rf"|{_NON_ZERO_NUM}\s*==\s*{_FONT_METRIC_EXPR})"
+)
+
 LOG_WARNING_RE = re.compile(
     r"could not be opened|no such file|not found|cannot open|failed to (?:open|load)|warning",
     re.IGNORECASE,
@@ -96,6 +121,21 @@ def _vacuous_loops(code: str, offset: int, full: str) -> list[str]:
     if not guarded:
       line = full.count("\n", 0, offset + m.start()) + 1
       issues.append(f"L{line}: range-for over `{m.group(1)}` has no preceding non-empty assert")
+  return issues
+
+
+def _font_metric_pins(body: str, offset: int, full: str) -> list[str]:
+  issues = []
+  if not FONT_MGR_RE.search(body) or FONT_BACKEND_GUARD_RE.search(body):
+    return issues
+  for pm in FONT_METRIC_PIN_RE.finditer(body):
+    line = full.count("\n", 0, offset + pm.start()) + 1
+    snippet = " ".join(pm.group(0).split())[:100]
+    issues.append(
+        f"L{line}: exact numeric assert `{snippet}` on font-backend output; "
+        "assert a backend-independent property, compare against the same backend, "
+        "or guard by backend (Gerrit 1404196 -> 1411716)"
+    )
   return issues
 
 
@@ -189,6 +229,9 @@ def check(repo: str, test_file: str, names: list[str], args) -> list[str]:
           errors.append(
               f"[HOST-EMPTY ENV] {test_file}:L{line}: {what}; use resources/ fixtures on host"
           )
+    if not args.allow_font_metric_pins:
+      for issue in _font_metric_pins(body, offset, code):
+        errors.append(f"[FONT-BACKEND PIN] {test_file}:{issue}")
     errors += _attestation_errors(repo, test_file, name)
   return errors
 
@@ -220,6 +263,7 @@ def main() -> int:
   ap.add_argument("--log", help="verbose test runner output")
   ap.add_argument("--explained-warning", action="append", default=[])
   ap.add_argument("--allow-device-paths", action="store_true")
+  ap.add_argument("--allow-font-metric-pins", action="store_true")
   args = ap.parse_args()
   repo = os.path.abspath(args.repo)
 
