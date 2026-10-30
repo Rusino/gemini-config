@@ -24,6 +24,10 @@
   const BUTTON_CLASS = 'jetski-closed-chats-filter-btn';
   // Collapse-first button in the sidebar filter bar to collapse or expand all project folders
   const COLLAPSE_PROJECTS_BTN_CLASS = 'jetski-collapse-projects-btn';
+  // Compact toggle button in sidebar top bar to expand or collapse top navigation
+  const TOP_NAV_TOGGLE_BTN_CLASS = 'jetski-top-nav-toggle-btn';
+  const TOP_NAV_STATUS_DOT_CLASS = 'jetski-top-nav-status-dot';
+  let topNavExpanded = false;
   const TITLEBAR_BTN_CLASS = 'jetski-titlebar-archive-btn';
   // Live context window volume pill rendered before Search in each conversation titlebar
   const TITLEBAR_CONTEXT_BADGE_CLASS = 'jetski-titlebar-context-badge';
@@ -4518,17 +4522,81 @@
       [aria-label="Sidebar"] [data-testid="new-conversation-button"] {
         display: none !important;
       }
-      [aria-label="Sidebar"] > div:first-child {
+      /* Collapse top navigation items and extensions behind header toggle button by default */
+      [aria-label="Sidebar"]:not([data-jetski-topnav-open="true"])
+        [data-jetski-top-nav-section="true"],
+      [aria-label="Sidebar"]:not([data-jetski-topnav-open="true"])
+        > div.px-2:not(:has([data-testid="settings-button"])),
+      [aria-label="Sidebar"]:not([data-jetski-topnav-open="true"]) > div.mt-3.h-px,
+      [aria-label="Sidebar"]:not([data-jetski-topnav-open="true"]) [data-testid="plugins-section"] {
+        display: none !important;
+      }
+      [aria-label="Sidebar"]:not([data-jetski-topnav-open="true"]) > div:first-child {
+        margin-bottom: 0 !important;
+      }
+      [aria-label="Sidebar"]:not([data-jetski-topnav-open="true"])
+        div.overflow-y-auto:has(.${INBOX_CLASS}) {
+        gap: 4px !important;
+        padding-top: 2px !important;
+        padding-bottom: 0 !important;
+      }
+      [aria-label="Sidebar"][data-jetski-topnav-open="true"] > div:first-child {
         margin-bottom: 4px !important;
       }
-      [aria-label="Sidebar"] > div.mt-3.h-px {
+      [aria-label="Sidebar"][data-jetski-topnav-open="true"] > div.mt-3.h-px {
         margin-top: 6px !important;
         background-color: rgba(128, 128, 128, 0.14) !important;
       }
-      [aria-label="Sidebar"] div.overflow-y-auto:has(.${INBOX_CLASS}) {
+      [aria-label="Sidebar"][data-jetski-topnav-open="true"]
+        div.overflow-y-auto:has(.${INBOX_CLASS}) {
         gap: 6px !important;
         padding-top: 6px !important;
         padding-bottom: 0 !important;
+      }
+      .${TOP_NAV_TOGGLE_BTN_CLASS} {
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 24px;
+        height: 24px;
+        border-radius: 6px;
+        border: none;
+        background: transparent;
+        color: var(--muted-foreground, #9aa0a6);
+        font-size: 13px;
+        line-height: 1;
+        cursor: pointer;
+        padding: 0;
+        margin: 0;
+        flex-shrink: 0;
+        transition: background-color 100ms ease, color 100ms ease;
+      }
+      .${TOP_NAV_TOGGLE_BTN_CLASS}:hover {
+        background: var(--sidebar-secondary, rgba(128, 134, 139, 0.16));
+        color: var(--foreground, #e8eaed);
+      }
+      .${TOP_NAV_TOGGLE_BTN_CLASS}[data-expanded="true"] {
+        background: var(--sidebar-secondary, rgba(128, 134, 139, 0.24));
+        color: #8ab4f8;
+      }
+      .${TOP_NAV_STATUS_DOT_CLASS} {
+        position: absolute;
+        top: 2px;
+        right: 2px;
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        display: none;
+        pointer-events: none;
+      }
+      .${TOP_NAV_TOGGLE_BTN_CLASS}[data-status="expired"] .${TOP_NAV_STATUS_DOT_CLASS} {
+        display: block;
+        background: #f87171;
+      }
+      .${TOP_NAV_TOGGLE_BTN_CLASS}[data-status="warning"] .${TOP_NAV_STATUS_DOT_CLASS} {
+        display: block;
+        background: #fbbf24;
       }
       /* Make inbox parent a flex column so conversation-list-sidebar never overflows bottom */
       div:has(> .${INBOX_CLASS}) {
@@ -4666,7 +4734,7 @@
       .${INBOX_LIST_CLASS} {
         display: flex;
         flex-direction: column;
-        max-height: 108px;
+        max-height: 200px;
         overflow-y: auto;
         padding: 2px 0 0 0;
       }
@@ -7039,6 +7107,171 @@
     return btn;
   }
 
+  // Tags and returns the sidebar top navigation container (containing Automations, etc.)
+  function findTopNavSection(sidebarEl) {
+    if (!sidebarEl) return null;
+    const directTagged = sidebarEl.querySelector('[data-jetski-top-nav-section="true"]');
+    if (directTagged) return directTagged;
+
+    for (const child of sidebarEl.children || []) {
+      if (child.querySelector?.('[data-testid="settings-button"]')) continue;
+      if (
+        child.querySelector?.('[data-testid="automations-button"]') ||
+        child.querySelector?.('[data-testid="history-button"]') ||
+        child.querySelector?.('[data-testid="concierge-button"]') ||
+        child.querySelector?.('a[href="/customizations"]') ||
+        child.querySelector?.('[data-testid="new-conversation-button"]')
+      ) {
+        child.setAttribute('data-jetski-top-nav-section', 'true');
+        return child;
+      }
+    }
+    const px2Children = sidebarEl.querySelectorAll('div.px-2');
+    for (const child of px2Children) {
+      if (!child.querySelector('[data-testid="settings-button"]')) {
+        child.setAttribute('data-jetski-top-nav-section', 'true');
+        return child;
+      }
+    }
+    return null;
+  }
+
+  // Injects or updates the compact top navigation toggle button in the sidebar header
+  function ensureTopNavToggle() {
+    const sidebarEl = document.querySelector('[aria-label="Sidebar"]');
+    if (!sidebarEl) return;
+
+    findTopNavSection(sidebarEl);
+    if (topNavExpanded) {
+      sidebarEl.setAttribute('data-jetski-topnav-open', 'true');
+    } else {
+      sidebarEl.removeAttribute('data-jetski-topnav-open');
+    }
+
+    const searchBtn =
+      document.querySelector('[data-testid="sidebar-search-button"]') ||
+      sidebarEl.querySelector('[data-testid="sidebar-search-button"]');
+    const mountParent =
+      searchBtn?.parentElement ||
+      sidebarEl.querySelector('div:first-child');
+    if (!mountParent) return;
+
+    let toggleBtn = mountParent.querySelector(`.${TOP_NAV_TOGGLE_BTN_CLASS}`);
+    if (!toggleBtn) {
+      toggleBtn = document.createElement('button');
+      toggleBtn.type = 'button';
+      toggleBtn.className = TOP_NAV_TOGGLE_BTN_CLASS;
+      toggleBtn.setAttribute('data-testid', 'jetski-top-nav-toggle-btn');
+
+      const iconSpan = document.createElement('span');
+      iconSpan.className = 'jetski-top-nav-toggle-icon';
+      iconSpan.textContent = '⊞';
+      toggleBtn.appendChild(iconSpan);
+
+      const statusDot = document.createElement('span');
+      statusDot.className = TOP_NAV_STATUS_DOT_CLASS;
+      statusDot.setAttribute('data-testid', 'jetski-top-nav-status-dot');
+      toggleBtn.appendChild(statusDot);
+
+      bindHoverBubble(toggleBtn, () => toggleBtn.getAttribute('aria-label') || 'Top navigation');
+      bindActionBtnHandlers(toggleBtn, () => {
+        topNavExpanded = !topNavExpanded;
+        ensureTopNavToggle();
+        const label = toggleBtn.getAttribute('aria-label');
+        if (label) {
+          showActionPillBubble(toggleBtn, label);
+        }
+      });
+
+      if (searchBtn && searchBtn.parentElement === mountParent) {
+        mountParent.insertBefore(toggleBtn, searchBtn.nextSibling);
+      } else {
+        mountParent.appendChild(toggleBtn);
+      }
+    }
+
+    toggleBtn.setAttribute('data-expanded', topNavExpanded ? 'true' : 'false');
+
+    // Forward status dot from Automations button if credentials expired or expiring soon
+    const autoDot = document.querySelector('[data-testid="automations-status-dot"]');
+    const autoStatus = autoDot?.getAttribute('data-status') || '';
+    const autoLabel = autoDot?.getAttribute('aria-label') || '';
+    if (autoStatus) {
+      toggleBtn.setAttribute('data-status', autoStatus);
+      const title = autoLabel
+        ? `Top navigation (${autoLabel})`
+        : 'Top navigation (Automations status alert)';
+      toggleBtn.setAttribute('aria-label', title);
+      toggleBtn.setAttribute('title', title);
+    } else {
+      toggleBtn.removeAttribute('data-status');
+      const title = topNavExpanded
+        ? 'Collapse top navigation'
+        : 'Top navigation (Automations, Customizations, Extensions)';
+      toggleBtn.setAttribute('aria-label', title);
+      toggleBtn.setAttribute('title', title);
+    }
+  }
+
+  // Collapses the top navigation when clicking outside or activating a navigation link
+  function handleTopNavOutsideClick(event) {
+    if (!topNavExpanded) return;
+    const target = event?.target;
+    if (!target || typeof target.closest !== 'function') return;
+
+    if (target.closest(`.${TOP_NAV_TOGGLE_BTN_CLASS}`)) return;
+    if (target.closest('[data-radix-popper-content-wrapper]') || target.closest('[role="menu"]')) {
+      return;
+    }
+
+    const topNavSec = target.closest('[data-jetski-top-nav-section="true"]');
+    const pluginsSec = target.closest('[data-testid="plugins-section"]');
+
+    if (!topNavSec && !pluginsSec) {
+      topNavExpanded = false;
+      ensureTopNavToggle();
+      return;
+    }
+
+    // Keep top nav open when toggling extensions accordion or filter dropdown
+    if (
+      target.closest('[data-testid="plugins-section-header"]') ||
+      target.closest('[data-testid="plugins-visibility-trigger"]') ||
+      target.closest('[data-testid="plugins-visibility-option"]')
+    ) {
+      return;
+    }
+
+    // Auto-collapse after clicking an actionable navigation item
+    const actionEl =
+      target.closest('button') ||
+      target.closest('a') ||
+      target.closest('[role="button"]');
+    if (actionEl) {
+      setTimeout(() => {
+        topNavExpanded = false;
+        ensureTopNavToggle();
+      }, 0);
+    }
+  }
+
+  function handleTopNavKeydown(event) {
+    if (event?.key === 'Escape' && topNavExpanded) {
+      topNavExpanded = false;
+      ensureTopNavToggle();
+    }
+  }
+
+  window.__jetskiTopNav = {
+    ensureTopNavToggle,
+    findTopNavSection,
+    isExpanded: () => topNavExpanded,
+    setExpanded: (val) => {
+      topNavExpanded = Boolean(val);
+      ensureTopNavToggle();
+    },
+  };
+
   // Injects the 3-button filter bar and collapse-all projects button inside actionRow
   function ensureFilterBar() {
     const displayOptionsBtns = document.querySelectorAll(
@@ -7187,6 +7420,8 @@
       document.addEventListener('focusin', handleInputBoxSeen, true);
       document.addEventListener('pointerdown', handleSidebarSearchIntercept, true);
       document.addEventListener('click', handleSidebarSearchIntercept, true);
+      document.addEventListener('pointerdown', handleTopNavOutsideClick, true);
+      document.addEventListener('keydown', handleTopNavKeydown, true);
     }
   }
 
@@ -7196,6 +7431,8 @@
       document.removeEventListener('focusin', handleInputBoxSeen, true);
       document.removeEventListener('pointerdown', handleSidebarSearchIntercept, true);
       document.removeEventListener('click', handleSidebarSearchIntercept, true);
+      document.removeEventListener('pointerdown', handleTopNavOutsideClick, true);
+      document.removeEventListener('keydown', handleTopNavKeydown, true);
     }
   }
 
@@ -8631,6 +8868,7 @@
     ensureStylesInjected();
     const reduxActive = syncReduxFilter();
     syncDomRowsAndPlaceholders(reduxActive);
+    ensureTopNavToggle();
     ensureFilterBar();
     // Sync the Needs-Reaction inbox widget above the sidebar project list
     ensureNeedsReactionInbox();
@@ -8682,6 +8920,8 @@
         target.className === CHAIN_PROMPT_LIST_CLASS ||
         target.className === CHAIN_PROMPT_ROW_CLASS ||
         target.className === ARCHIVE_BANNER_CLASS ||
+        target.className === TOP_NAV_TOGGLE_BTN_CLASS ||
+        target.className === TOP_NAV_STATUS_DOT_CLASS ||
         (typeof target.closest === 'function' &&
           (target.closest('#jetski-closed-chats-filter-bubble') ||
             target.closest(`#${STAR_TOOLTIP_ID}`) ||
@@ -8691,6 +8931,7 @@
             target.closest(`.${BUTTON_CLASS}`) ||
             target.closest(`.${COLLAPSE_PROJECTS_BTN_CLASS}`) ||
             target.closest(`.${TITLEBAR_BTN_CLASS}`) ||
+            target.closest(`.${TOP_NAV_TOGGLE_BTN_CLASS}`) ||
             // Skip text node mutations inside the context volume pill
             target.closest(`.${TITLEBAR_CONTEXT_BADGE_CLASS}`) ||
             target.closest(`.${ROW_BG_WAIT_INDICATOR_CLASS}`) ||
@@ -8807,9 +9048,18 @@
       `.${ARCHIVE_BANNER_CLASS}`,
       `#${STAR_TOOLTIP_ID}`,
       `#${AUTOPILOT_TOAST_ID}`,
+      `.${TOP_NAV_TOGGLE_BTN_CLASS}`,
     ].join(', ');
     for (const el of document.querySelectorAll(cleanupSelector)) {
       el.remove();
+    }
+    topNavExpanded = false;
+    const sidebarEl = document.querySelector('[aria-label="Sidebar"]');
+    if (sidebarEl) {
+      sidebarEl.removeAttribute('data-jetski-topnav-open');
+    }
+    for (const el of document.querySelectorAll('[data-jetski-top-nav-section]')) {
+      el.removeAttribute('data-jetski-top-nav-section');
     }
     if (locateHighlightTimer) {
       clearTimeout(locateHighlightTimer);

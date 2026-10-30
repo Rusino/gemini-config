@@ -6325,6 +6325,426 @@ eval(code);
     )
     self.assertIn("ALL_EXPANSION_TESTS_PASSED", res.stdout)
 
+  def test_sidebar_top_nav_collapse_and_needs_me_expansion(self) -> None:
+    node_bin = find_node_binary()
+    js_path = os.path.join(SCRIPTS_DIR, "jetski_closed_filter.js")
+
+    harness = r"""
+const fs = require('fs');
+const assert = require('assert');
+
+const scriptPath = process.argv[1];
+const code = fs.readFileSync(scriptPath, 'utf8');
+
+class FakeElement {
+  constructor(tagName) {
+    this.tagName = tagName.toUpperCase();
+    this.id = '';
+    this.className = '';
+    this.type = '';
+    this.style = {};
+    this.attributes = new Map();
+    this.children = [];
+    this.parentElement = null;
+    this.listeners = new Map();
+    this._textContent = '';
+    this._innerHTML = '';
+  }
+  get firstChild() { return this.children[0] || null; }
+  get lastChild() { return this.children[this.children.length - 1] || null; }
+  get nextSibling() {
+    if (!this.parentElement) return null;
+    const idx = this.parentElement.children.indexOf(this);
+    if (idx === -1 || idx === this.parentElement.children.length - 1) return null;
+    return this.parentElement.children[idx + 1];
+  }
+  get textContent() {
+    if (this.children.length > 0) {
+      return this._textContent + this.children.map((c) => c.textContent).join('');
+    }
+    return this._textContent;
+  }
+  set textContent(v) {
+    this._textContent = String(v);
+    for (const c of this.children) c.parentElement = null;
+    this.children = [];
+  }
+  get innerHTML() { return this._innerHTML; }
+  set innerHTML(v) {
+    this._innerHTML = String(v);
+    for (const c of this.children) c.parentElement = null;
+    this.children = [];
+  }
+  setAttribute(k, v) {
+    this.attributes.set(k, String(v));
+    if (k === 'id') this.id = String(v);
+    if (k === 'class') this.className = String(v);
+    if (k === 'type') this.type = String(v);
+  }
+  getAttribute(k) { return this.attributes.has(k) ? this.attributes.get(k) : null; }
+  hasAttribute(k) { return this.attributes.has(k); }
+  removeAttribute(k) {
+    this.attributes.delete(k);
+    if (k === 'id') this.id = '';
+    if (k === 'class') this.className = '';
+    if (k === 'type') this.type = '';
+  }
+  appendChild(c) {
+    if (c.parentElement) c.remove();
+    c.parentElement = this;
+    this.children.push(c);
+    return c;
+  }
+  insertBefore(child, ref) {
+    if (child === ref) return child;
+    if (child.parentElement) child.remove();
+    child.parentElement = this;
+    if (!ref) {
+      this.children.push(child);
+      return child;
+    }
+    const idx = this.children.indexOf(ref);
+    if (idx === -1) this.children.push(child);
+    else this.children.splice(idx, 0, child);
+    return child;
+  }
+  remove() {
+    if (!this.parentElement) return;
+    const i = this.parentElement.children.indexOf(this);
+    if (i !== -1) this.parentElement.children.splice(i, 1);
+    this.parentElement = null;
+  }
+  contains(node) {
+    let cur = node;
+    while (cur) {
+      if (cur === this) return true;
+      cur = cur.parentElement;
+    }
+    return false;
+  }
+  getBoundingClientRect() {
+    return { top: 10, bottom: 34, left: 10, right: 34, width: 24, height: 24 };
+  }
+  addEventListener(t, fn, opts) {
+    if (!this.listeners.has(t)) this.listeners.set(t, []);
+    this.listeners.get(t).push({ fn, capture: Boolean(opts?.capture || opts === true) });
+  }
+  dispatchEvent(type, eventInit = {}) {
+    const ev = {
+      type,
+      button: 0,
+      ctrlKey: false,
+      metaKey: false,
+      shiftKey: false,
+      defaultPrevented: false,
+      propagationStopped: false,
+      preventDefault() { this.defaultPrevented = true; },
+      stopPropagation() { this.propagationStopped = true; },
+      target: this,
+      currentTarget: this,
+      ...eventInit,
+    };
+    if (global.document && typeof global.document.dispatchCapture === 'function') {
+      global.document.dispatchCapture(ev);
+    }
+    if (!ev.propagationStopped) {
+      const handlers = this.listeners.get(type) || [];
+      for (const h of handlers) {
+        h.fn(ev);
+      }
+    }
+    return !ev.defaultPrevented;
+  }
+  closest(sel) {
+    let cur = this;
+    while (cur) {
+      if (cur.matches(sel)) return cur;
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+  matches(sel) {
+    if (!sel) return false;
+    if (sel.includes(',')) {
+      return sel.split(',').some((p) => this.matches(p.trim()));
+    }
+    if (sel === 'div.px-2') {
+      return this.tagName === 'DIV' && this.className.split(/\s+/).includes('px-2');
+    }
+    if (sel === 'div:first-child') {
+      return (
+        this.tagName === 'DIV' &&
+        this.parentElement &&
+        this.parentElement.children[0] === this
+      );
+    }
+    if (sel.startsWith('#')) return this.id === sel.slice(1);
+    if (sel.startsWith('.')) return this.className.split(/\s+/).includes(sel.slice(1));
+    if (sel.startsWith('[') && sel.endsWith(']')) {
+      const inner = sel.slice(1, -1);
+      const eq = inner.indexOf('=');
+      if (eq === -1) return this.hasAttribute(inner);
+      const k = inner.slice(0, eq).trim();
+      const rawVal = inner.slice(eq + 1).trim();
+      const v = rawVal.replace(/^["\x27]|["\x27]$/g, '');
+      return this.getAttribute(k) === v;
+    }
+    return this.tagName.toLowerCase() === sel.toLowerCase();
+  }
+  querySelector(sel) {
+    return this.querySelectorAll(sel)[0] || null;
+  }
+  querySelectorAll(sel) {
+    const parts = (typeof sel === 'string' && sel.includes(','))
+      ? sel.split(',').map((p) => p.trim())
+      : [sel];
+    const out = [];
+    const visit = (node) => {
+      for (const p of parts) {
+        if (node.matches(p) && !out.includes(node)) {
+          out.push(node);
+        }
+      }
+      for (const child of node.children) {
+        visit(child);
+      }
+    };
+    for (const child of this.children) {
+      visit(child);
+    }
+    return out;
+  }
+}
+
+const docEl = new FakeElement('html');
+const headEl = new FakeElement('head');
+const bodyEl = new FakeElement('body');
+docEl.appendChild(headEl);
+docEl.appendChild(bodyEl);
+
+const documentListeners = new Map();
+global.document = {
+  documentElement: docEl,
+  head: headEl,
+  body: bodyEl,
+  getElementById: (id) => docEl.querySelector(`#${id}`),
+  createElement: (tag) => new FakeElement(tag),
+  querySelector: (sel) => docEl.querySelector(sel),
+  querySelectorAll: (sel) => docEl.querySelectorAll(sel),
+  addEventListener(t, fn, opts) {
+    if (!documentListeners.has(t)) documentListeners.set(t, []);
+    documentListeners.get(t).push({ fn, capture: Boolean(opts?.capture || opts === true) });
+  },
+  removeEventListener(t, fn) {
+    if (!documentListeners.has(t)) return;
+    const arr = documentListeners.get(t).filter((item) => item.fn !== fn);
+    documentListeners.set(t, arr);
+  },
+  dispatchCapture(ev) {
+    const list = documentListeners.get(ev.type) || [];
+    for (const h of list) {
+      if (h.capture) h.fn(ev);
+      if (ev.propagationStopped) break;
+    }
+  },
+  dispatchEvent(evOrType, init) {
+    const ev = typeof evOrType === 'string'
+      ? { type: evOrType, target: docEl, preventDefault() {}, stopPropagation() {}, ...init }
+      : evOrType;
+    const list = documentListeners.get(ev.type) || [];
+    for (const h of list) {
+      h.fn(ev);
+    }
+    return true;
+  },
+};
+
+global.window = {
+  __APP_CONFIG__: { csrfToken: 'test-csrf-token' },
+  location: { pathname: '/c/test-chat', search: '' },
+  history: {
+    state: {},
+    pushState(state, title, url) { this.state = state; this._lastPushed = url; },
+    replaceState(state, title, url) { this.state = state; this._lastReplaced = url; },
+  },
+  localStorage: { getItem: () => null, setItem: () => {} },
+  setTimeout: (fn, ms) => setTimeout(fn, ms),
+  clearTimeout: (id) => clearTimeout(id),
+  requestAnimationFrame: (cb) => cb(),
+  addEventListener() {},
+  removeEventListener() {},
+  dispatchEvent() { return true; },
+  document: global.document,
+};
+
+global.MutationObserver = class {
+  observe() {}
+  disconnect() {}
+};
+
+eval(code);
+
+(async () => {
+  // 1. Verify injected CSS rules for Needs Me max-height and top navigation collapse
+  const styleEl = document.getElementById('jetski-closed-chats-filter-style');
+  assert(styleEl, 'Filter styles must be injected into document head');
+  assert(
+    styleEl.textContent.includes('max-height: 200px;'),
+    'Needs Me inbox list max-height must be raised to 200px'
+  );
+  assert(
+    styleEl.textContent.includes('[data-jetski-top-nav-section="true"]'),
+    'Style must collapse data-jetski-top-nav-section when topnav is closed'
+  );
+  assert(
+    styleEl.textContent.includes('[data-testid="plugins-section"]'),
+    'Style must collapse plugins section when topnav is closed'
+  );
+
+  // 2. Set up sidebar structure with header, top-nav items, plugins section, and bottom settings
+  const sidebarEl = new FakeElement('div');
+  sidebarEl.setAttribute('aria-label', 'Sidebar');
+  bodyEl.appendChild(sidebarEl);
+
+  const headerRow = new FakeElement('div');
+  sidebarEl.appendChild(headerRow);
+
+  const searchBtn = new FakeElement('button');
+  searchBtn.setAttribute('data-testid', 'sidebar-search-button');
+  headerRow.appendChild(searchBtn);
+
+  const topNavSec = new FakeElement('div');
+  topNavSec.className = 'px-2';
+  const autoBtn = new FakeElement('button');
+  autoBtn.setAttribute('data-testid', 'automations-button');
+  topNavSec.appendChild(autoBtn);
+  sidebarEl.appendChild(topNavSec);
+
+  const pluginsSec = new FakeElement('div');
+  pluginsSec.setAttribute('data-testid', 'plugins-section');
+  const pluginsHeader = new FakeElement('div');
+  pluginsHeader.setAttribute('data-testid', 'plugins-section-header');
+  pluginsSec.appendChild(pluginsHeader);
+  sidebarEl.appendChild(pluginsSec);
+
+  const settingsSec = new FakeElement('div');
+  settingsSec.className = 'px-2';
+  const settingsBtn = new FakeElement('button');
+  settingsBtn.setAttribute('data-testid', 'settings-button');
+  settingsSec.appendChild(settingsBtn);
+  sidebarEl.appendChild(settingsSec);
+
+  // Initial call mounts toggle button and tags top nav section
+  window.__jetskiTopNav.ensureTopNavToggle();
+
+  assert.strictEqual(
+    topNavSec.getAttribute('data-jetski-top-nav-section'),
+    'true',
+    'Top navigation section must be tagged'
+  );
+  assert.strictEqual(
+    settingsSec.getAttribute('data-jetski-top-nav-section'),
+    null,
+    'Settings section must not be tagged as top navigation'
+  );
+  assert.strictEqual(
+    sidebarEl.getAttribute('data-jetski-topnav-open'),
+    null,
+    'Sidebar top navigation must be closed by default'
+  );
+
+  const toggleBtn = headerRow.querySelector('.jetski-top-nav-toggle-btn');
+  assert(toggleBtn, 'Toggle button must be mounted inside sidebar header row');
+  assert.strictEqual(toggleBtn.getAttribute('data-testid'), 'jetski-top-nav-toggle-btn');
+  assert.strictEqual(toggleBtn.getAttribute('data-expanded'), 'false');
+  assert.strictEqual(
+    toggleBtn.getAttribute('aria-label'),
+    'Top navigation (Automations, Customizations, Extensions)'
+  );
+
+  // 3. Status dot forwarding from Automations button
+  const autoDot = new FakeElement('span');
+  autoDot.setAttribute('data-testid', 'automations-status-dot');
+  autoDot.setAttribute('data-status', 'expired');
+  autoDot.setAttribute('aria-label', 'Automations credentials expired');
+  autoBtn.appendChild(autoDot);
+
+  window.__jetskiTopNav.ensureTopNavToggle();
+  assert.strictEqual(toggleBtn.getAttribute('data-status'), 'expired');
+  assert.strictEqual(
+    toggleBtn.getAttribute('aria-label'),
+    'Top navigation (Automations credentials expired)'
+  );
+
+  // Clearing status dot resets button status and label
+  autoDot.removeAttribute('data-status');
+  autoDot.removeAttribute('aria-label');
+  window.__jetskiTopNav.ensureTopNavToggle();
+  assert.strictEqual(toggleBtn.getAttribute('data-status'), null);
+  assert.strictEqual(
+    toggleBtn.getAttribute('aria-label'),
+    'Top navigation (Automations, Customizations, Extensions)'
+  );
+
+  // 4. Click toggle button to expand top navigation
+  toggleBtn.dispatchEvent('pointerdown');
+  assert.strictEqual(window.__jetskiTopNav.isExpanded(), true);
+  assert.strictEqual(sidebarEl.getAttribute('data-jetski-topnav-open'), 'true');
+  assert.strictEqual(toggleBtn.getAttribute('data-expanded'), 'true');
+  assert.strictEqual(toggleBtn.getAttribute('aria-label'), 'Collapse top navigation');
+
+  // Clicking plugins-section-header keeps top navigation open
+  pluginsHeader.dispatchEvent('pointerdown');
+  assert.strictEqual(window.__jetskiTopNav.isExpanded(), true);
+
+  // Clicking an actionable navigation button auto-collapses top navigation
+  autoBtn.dispatchEvent('pointerdown');
+  await new Promise((r) => setTimeout(r, 10));
+  assert.strictEqual(window.__jetskiTopNav.isExpanded(), false);
+  assert.strictEqual(sidebarEl.getAttribute('data-jetski-topnav-open'), null);
+
+  // Re-expand and test outside click collapse
+  window.__jetskiTopNav.setExpanded(true);
+  assert.strictEqual(window.__jetskiTopNav.isExpanded(), true);
+  bodyEl.dispatchEvent('pointerdown');
+  assert.strictEqual(window.__jetskiTopNav.isExpanded(), false);
+
+  // Re-expand and test Escape keydown collapse
+  window.__jetskiTopNav.setExpanded(true);
+  assert.strictEqual(window.__jetskiTopNav.isExpanded(), true);
+  document.dispatchEvent('keydown', { key: 'Escape' });
+  assert.strictEqual(window.__jetskiTopNav.isExpanded(), false);
+
+  // 5. Cleanup removes toggle button and clears tagged attributes
+  window.__jetskiTopNav.setExpanded(true);
+  window.__jetskiClosedChatsFilterCleanup();
+  assert.strictEqual(headerRow.querySelector('.jetski-top-nav-toggle-btn'), null);
+  assert.strictEqual(sidebarEl.getAttribute('data-jetski-topnav-open'), null);
+  assert.strictEqual(topNavSec.getAttribute('data-jetski-top-nav-section'), null);
+  assert.strictEqual(window.__jetskiTopNav.isExpanded(), false);
+
+  console.log('ALL_TOP_NAV_TESTS_PASSED');
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"""
+    env = os.environ.copy()
+    env["ELECTRON_RUN_AS_NODE"] = "1"
+    res = subprocess.run(
+        [node_bin, "-e", harness, js_path],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(
+        res.returncode,
+        0,
+        f"Top nav collapse JS harness failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+    )
+    self.assertIn("ALL_TOP_NAV_TESTS_PASSED", res.stdout)
+
 
 if __name__ == "__main__":
   unittest.main()
