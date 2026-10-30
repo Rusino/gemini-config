@@ -557,6 +557,13 @@ class ChatGcTest(unittest.TestCase):
     self._touch_conv_db(c2, old_dt)
     self._touch_archived_pbtxt(c2)
     guard_path = os.path.join(self.brain_dir, c2, "scratch", ".context_guard_state.json")
+    # Self-loop or foreign-owner guard state copied into c2's scratch must not create a parent cycle
+    _write_json(guard_path, {"handed_off_to": c2, "handoff_kind": "handoff"})
+    parent_of, _, _ = chat_gc._scan_transcript_graph_in_dirs([self.app_dir])
+    self.assertNotIn(c2, parent_of)
+    _write_json(guard_path, {"owner": c1, "handed_off_to": c2, "handoff_kind": "handoff"})
+    parent_of, _, _ = chat_gc._scan_transcript_graph_in_dirs([self.app_dir])
+    self.assertNotIn(c2, parent_of)
     _write_json(
         guard_path,
         {"handed_off_to": "99999999-9999-9999-9999-999999999999", "handoff_kind": "handoff"},

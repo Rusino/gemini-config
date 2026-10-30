@@ -1123,6 +1123,33 @@ class TestStopGuard(unittest.TestCase):
         stop_guard.main()
       self.assertEqual(json.loads(mock_out.getvalue()), {})
 
+  def test_copied_predecessor_scratch_state_does_not_rearm_handoff_completed(self):
+    with tempfile.TemporaryDirectory() as app_dir:
+      brain_dir = os.path.join(app_dir, "brain", "c1")
+      scratch_dir = os.path.join(brain_dir, "scratch")
+      os.makedirs(scratch_dir, exist_ok=True)
+      state_file = os.path.join(scratch_dir, ".context_guard_state.json")
+      with open(state_file, "w", encoding="utf-8") as f:
+        json.dump({"handed_off_to": "c1", "handoff_completed": False}, f)
+      tx_path = os.path.join(brain_dir, "transcript.jsonl")
+      with open(tx_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"step_index": 1, "type": "USER_INPUT", "content": "hi"}) + "\n")
+        f.write(json.dumps({"step_index": 2, "type": "PLANNER_RESPONSE", "content": "ok"}) + "\n")
+      data = {
+          "conversationId": "c1",
+          "transcriptPath": tx_path,
+          "artifactDirectoryPath": brain_dir,
+          "fullyIdle": True,
+          "terminationReason": "NO_TOOL_CALL",
+      }
+      with patch("sys.stdin", io.StringIO(json.dumps(data))), \
+           patch("sys.stdout", new_callable=io.StringIO), \
+           patch("chat_lifecycle.get_conversation_title", return_value="[10:00] ⦿ Fix hook"), \
+           patch.object(stop_guard, "play_stop_sound") as mock_sound:
+        stop_guard.main()
+      mock_sound.assert_called_once_with(is_handoff=False)
+      self.assertFalse(os.path.exists(state_file))
+
 
 if __name__ == "__main__":
   unittest.main()

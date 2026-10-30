@@ -1567,8 +1567,10 @@ def _scan_guard_redirects() -> dict[str, dict]:
         continue
       if not isinstance(data, dict):
         continue
+      owner = str(data.get("owner") or "").strip()
       to_cid = data.get("handed_off_to")
-      if not to_cid or not isinstance(to_cid, str):
+      # Skip foreign or self-referential guard files copied across scratch/ dirs
+      if (owner and owner != cid) or not to_cid or not isinstance(to_cid, str) or to_cid == cid:
         continue
       redirects[cid] = {
           "to": to_cid,
@@ -2192,7 +2194,7 @@ def guard_state_path(conv_id: str) -> str:
 def load_guard_state(conv_id: str) -> dict:
   from context_guard import load_state
 
-  return load_state(guard_state_path(conv_id))
+  return load_state(guard_state_path(conv_id), conv_id)
 
 
 def record_handoff(conv_id: str, new_cid: str, kind: str = "handoff") -> None:
@@ -2204,13 +2206,14 @@ def record_handoff(conv_id: str, new_cid: str, kind: str = "handoff") -> None:
   from context_guard import save_state
 
   state = load_guard_state(conv_id)
+  state["owner"] = conv_id
   state["handed_off_to"] = new_cid
   state["handoff_completed"] = True
   state["pending_handoff_launch"] = False
   state["handed_off_at"] = datetime.now(ZoneInfo("UTC")).isoformat()
   # export_chain_index links only "handoff" redirects into the chain
   state["handoff_kind"] = kind
-  save_state(guard_state_path(conv_id), state)
+  save_state(guard_state_path(conv_id), state, conv_id)
 
 
 # Only JetboxSubscribeToSummaries carries backgroundTaskCount / hasRunningSubagents; the

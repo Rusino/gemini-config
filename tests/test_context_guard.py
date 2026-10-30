@@ -813,6 +813,30 @@ class TestContextGuard(unittest.TestCase):
         self.assertEqual(res, {})
         self.assertEqual(log.get("level"), "skip")
 
+  def test_copied_predecessor_scratch_state_is_discarded_and_unlinked(self):
+    self.mock_rpc.return_value = gm_response(10000)
+    self.write_transcript({"type": "USER_INPUT", "content": "continue"})
+    state_file = os.path.join(self.artifact_dir, "scratch", ".context_guard_state.json")
+    for poisoned in (
+        # Legacy predecessor file copied via `cp -R old/scratch/. new/scratch/` (self-loop)
+        {"handoff_completed": True, "handed_off_to": "c1"},
+        # Owner-stamped predecessor file copied into a different conversation
+        {"owner": "parent-0", "handoff_completed": True, "handed_off_to": "other-9"},
+        # Pre-handoff predecessor file whose pending state path names another chat
+        {"pending_handoff_launch": True, "pending_handoff_file": "/r/p/state/parent-0.md"},
+    ):
+      with self.subTest(poisoned=poisoned):
+        os.makedirs(os.path.dirname(state_file), exist_ok=True)
+        with open(state_file, "w", encoding="utf-8") as f:
+          json.dump(poisoned, f)
+        out = self.run_guard(inv=0)
+        self.assertNotIn("CLOSED CHAT", self.message(out))
+        self.assertNotIn("REMINDER", self.message(out))
+        saved = self.state()
+        self.assertNotIn("handed_off_to", saved)
+        self.assertFalse(saved.get("handoff_completed"))
+        self.assertEqual(saved.get("owner"), "c1")
+
 
 if __name__ == "__main__":
   unittest.main()

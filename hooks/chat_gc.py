@@ -264,9 +264,17 @@ def _scan_transcript_graph_in_dirs(
           with open(guard_path, "r", encoding="utf-8") as f:
             gdata = json.load(f)
           if isinstance(gdata, dict):
+            owner = str(gdata.get("owner") or "").strip()
             to_cid = str(gdata.get("handed_off_to") or "").strip()
             kind = str(gdata.get("handoff_kind") or "handoff")
-            if to_cid and kind != "next-task" and to_cid not in parent_of:
+            # Ignore foreign or self-referential guard files copied across scratch/ dirs
+            if (
+                (not owner or owner == cid)
+                and to_cid
+                and to_cid != cid
+                and kind != "next-task"
+                and to_cid not in parent_of
+            ):
               if UUID_RE.match(to_cid):
                 parent_of[to_cid] = cid
                 children_of.setdefault(cid, []).append(to_cid)

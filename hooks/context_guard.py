@@ -1450,17 +1450,64 @@ def build_continuation_title(conv_id: str, fallback_text: str = "") -> str:
   return f"[{time_str}] <Chat Title>"
 
 
-def load_state(state_path: str) -> dict:
+def _conv_id_from_state_path(state_path: str) -> str:
+  """Extracts the conversation ID from a canonical guard state path."""
+  if not state_path:
+    return ""
+  base = os.path.basename(state_path)
+  if base.startswith("jetski_context_guard_") and base.endswith(".json"):
+    return base[len("jetski_context_guard_") : -len(".json")]
+  scratch_dir = os.path.dirname(os.path.abspath(state_path))
+  if os.path.basename(scratch_dir) == "scratch":
+    conv_dir = os.path.dirname(scratch_dir)
+    if os.path.basename(os.path.dirname(conv_dir)) == "brain":
+      return os.path.basename(conv_dir)
+  return ""
+
+
+def is_foreign_guard_state(state: dict, conv_id: str) -> bool:
+  """True when a guard state dict was copied from another chat's scratch dir."""
+  if not isinstance(state, dict) or not conv_id:
+    return False
+  owner = str(state.get("owner") or "").strip()
+  if owner and owner != conv_id:
+    return True
+  # Even without an explicit owner, a chat cannot hand off to itself: a self-loop
+  # happens when a continuation copies its predecessor's scratch/ directory
+  if str(state.get("handed_off_to") or "").strip() == conv_id:
+    return True
+  pending_file = str(state.get("pending_handoff_file") or "").strip()
+  if not owner and pending_file.endswith(".md"):
+    parent = os.path.basename(os.path.dirname(pending_file))
+    stem = os.path.basename(pending_file)[:-3]
+    if parent == "state" and stem and stem != conv_id:
+      return True
+  return False
+
+
+def load_state(state_path: str, conv_id: str = "") -> dict:
+  expected_cid = conv_id or _conv_id_from_state_path(state_path)
   try:
     if os.path.exists(state_path):
       with open(state_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+      if isinstance(data, dict):
+        if is_foreign_guard_state(data, expected_cid):
+          try:
+            os.unlink(state_path)
+          except OSError:
+            pass
+          return {}
+        return data
   except Exception:
     pass
   return {}
 
 
-def save_state(state_path: str, state: dict) -> None:
+def save_state(state_path: str, state: dict, conv_id: str = "") -> None:
+  expected_cid = conv_id or _conv_id_from_state_path(state_path)
+  if expected_cid and isinstance(state, dict) and not state.get("owner"):
+    state["owner"] = expected_cid
   try:
     os.makedirs(os.path.dirname(state_path), exist_ok=True)
     with open(state_path, "w", encoding="utf-8") as f:
@@ -1662,7 +1709,9 @@ def run(data: dict, log: dict) -> dict:
       if artifact_dir
       else f"/tmp/jetski_context_guard_{conv_id}.json"
   )
-  state = load_state(state_path)
+  state = load_state(state_path, conv_id)
+  if conv_id:
+    state.setdefault("owner", conv_id)
   async_wakeup = invocation_num == 0 and is_async_wakeup(
       transcript_path, last_user_input
   )
@@ -1998,6 +2047,7 @@ def run(data: dict, log: dict) -> dict:
       ),
   }
   for k in (
+      "owner",
       "discipline_blocked_turn",
       "last_blocked_edit_idx",
       "auto_title_notice",

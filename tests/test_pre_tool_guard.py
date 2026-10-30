@@ -363,6 +363,39 @@ class TestPreToolGuard(unittest.TestCase):
       self.assertEqual(out.get("decision"), "deny")
       self.assertIn("child-9", out["reason"])
 
+  def test_copied_predecessor_scratch_state_does_not_block_or_drop_lease(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      artifact_dir = os.path.join(tmp_dir, "brain", "c1")
+      scratch_dir = os.path.join(artifact_dir, "scratch")
+      os.makedirs(scratch_dir, exist_ok=True)
+      state_file = os.path.join(scratch_dir, ".context_guard_state.json")
+      for poisoned in (
+          {"handoff_completed": True, "handed_off_to": "c1"},
+          {"owner": "parent-0", "handoff_completed": True, "handed_off_to": "other-9"},
+      ):
+        with self.subTest(poisoned=poisoned):
+          with open(state_file, "w", encoding="utf-8") as f:
+            json.dump(poisoned, f)
+          out = self.run_guard({
+              "conversationId": "c1",
+              "artifactDirectoryPath": artifact_dir,
+              "toolCall": {
+                  "name": "run_command",
+                  "args": {"CommandLine": "echo ok"},
+              },
+          })
+          self.assertEqual(out.get("decision"), "allow")
+          self.assertFalse(os.path.exists(state_file))
+
+          # A poisoned scratch copy must also not trick lease checks into releasing c1's lease
+          with open(state_file, "w", encoding="utf-8") as f:
+            json.dump(poisoned, f)
+          with patch("context_guard.APP_DATA_DIR_CANDIDATES", (tmp_dir,)), \
+               patch("context_guard.get_conversation_db_info", return_value=("[10:00] ⦿ Test", "")), \
+               patch("context_guard._is_archived_in_pbtxt", return_value=False):
+            active, _ = pre_tool_guard._is_conv_still_active_tip("c1", "c2", "")
+          self.assertTrue(active)
+
   def test_batch_workflow_requires_advanced_verify(self):
     unverified_script = (
         'res = await parallel(\n'

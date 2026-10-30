@@ -116,10 +116,12 @@ def notice(data: dict, now: float) -> dict:
       else f"/tmp/jetski_pre_tool_guard_notice_{conv}.json"
   )
   state = _read_json(state_path)
+  if state.get("owner") not in (None, "", conv):
+    state = {}
   if "quiet_until" not in state:
     # Failures before the chat's first model call happened in other chats; if
     # the guard is still broken, this chat's own calls refresh the marker
-    _write_json(state_path, {"quiet_until": now})
+    _write_json(state_path, {"owner": conv, "quiet_until": now})
     return {}
   marker = _read_json(failure_marker_path())
   if marker.get("ts", 0) <= state["quiet_until"]:
@@ -127,7 +129,7 @@ def notice(data: dict, now: float) -> dict:
   # Defer DB/transcript subagent lookup until a fresh failure marker actually exists
   if _is_subagent(data, conv):
     return {}
-  _write_json(state_path, {"quiet_until": now + NOTICE_INTERVAL_S})
+  _write_json(state_path, {"owner": conv, "quiet_until": now + NOTICE_INTERVAL_S})
   where = "this chat" if marker.get("conv") == conv else f"chat {marker.get('conv') or '?'}"
   when = time.strftime("%H:%MZ", time.gmtime(marker["ts"]))
   return {"injectSteps": [{"ephemeralMessage": (

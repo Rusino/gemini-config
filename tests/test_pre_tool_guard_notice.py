@@ -211,6 +211,18 @@ class TestPreToolGuardNotice(unittest.TestCase):
     self.assertEqual(
         pre_tool_guard_notice.FAILURE_MARKER_DEFAULT, pre_tool_guard.FAILURE_MARKER_DEFAULT)
 
+  def test_copied_foreign_notice_state_is_ignored(self):
+    state_file = os.path.join(self.chat["artifactDirectoryPath"], "scratch", ".pre_tool_guard_notice.json")
+    os.makedirs(os.path.dirname(state_file), exist_ok=True)
+    with open(state_file, "w", encoding="utf-8") as f:
+      json.dump({"owner": "other-chat", "quiet_until": 500}, f)
+    self.write_marker(900)
+    # Foreign state is treated as uninitialized for c1 (baselines quiet_until at 1000)
+    self.assertEqual(pre_tool_guard_notice.notice(self.chat, 1000), {})
+    with open(state_file, encoding="utf-8") as f:
+      saved = json.load(f)
+    self.assertEqual(saved, {"owner": "c1", "quiet_until": 1000})
+
 
 if __name__ == "__main__":
   unittest.main()

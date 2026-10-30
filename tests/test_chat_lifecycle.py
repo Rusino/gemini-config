@@ -1421,12 +1421,16 @@ class TestChatLifecycle(unittest.TestCase):
 
       # c2 has no transcript yet: the redirect alone links it into c1's chain
       write_guard("c1", {"handed_off_to": "c2", "handed_off_at": "2026-10-28T00:00:00+00:00"})
+      # A predecessor's guard state copied into c2's scratch dir must not self-redirect c2 -> c2
+      write_guard("c2", {"handed_off_to": "c2", "handed_off_at": "2026-10-28T00:00:00+00:00"})
+      write_guard("c3", {"owner": "c1", "handed_off_to": "c4", "handed_off_at": "2026-10-28T00:00:00+00:00"})
       write_guard("t1", {"handed_off_to": "t2", "handed_off_at": "2026-10-28T00:01:00+00:00",
                          "handoff_kind": "next-task"})
       write_guard("idle", {"gm_count": 3})
       with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]):
         data = chat_lifecycle.export_chain_index()
       self.assertEqual(data["parentOf"].get("c2"), "c1")
+      self.assertNotIn("c4", data["parentOf"])
       self.assertNotIn("t2", data["parentOf"])
       self.assertEqual(data["createdAt"]["c2"], "2026-10-28T00:00:00+00:00")
       self.assertEqual(data["createdAt"]["t2"], "2026-10-28T00:01:00+00:00")

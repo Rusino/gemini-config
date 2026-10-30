@@ -1397,6 +1397,7 @@ def _is_conv_still_active_tip(
       _is_archived_in_pbtxt,
       app_data_dir_from_path,
       get_conversation_db_info,
+      load_state,
   )
 
   title, _ = get_conversation_db_info(owner_cid, transcript_path)
@@ -1412,13 +1413,9 @@ def _is_conv_still_active_tip(
       continue
     st_file = os.path.join(ad, "brain", owner_cid, "scratch", ".context_guard_state.json")
     if os.path.isfile(st_file):
-      try:
-        with open(st_file, "r", encoding="utf-8") as f:
-          st = json.load(f)
-        if st.get("handoff_completed") or st.get("handed_off_to"):
-          return False, title
-      except Exception:
-        pass
+      st = load_state(st_file, owner_cid)
+      if st.get("handoff_completed") or st.get("handed_off_to"):
+        return False, title
   return True, title
 
 
@@ -2549,7 +2546,7 @@ def main() -> None:
         if artifact_dir
         else f"/tmp/jetski_context_guard_{conv_id}.json"
     )
-    state = load_state(state_path)
+    state = load_state(state_path, conv_id)
     launch_step = get_handoff_launch_step_in_turn(transcript_path)
 
     # 1a. If this conversation has ALREADY launched a continuation in the current turn,

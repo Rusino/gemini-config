@@ -59,7 +59,13 @@ def is_inspection_command(cmd: str) -> bool:
   return bool(segments) and all(INSPECTION_SEGMENT_RE.match(s) for s in segments)
 
 
-def load_state(state_path: str) -> dict:
+def load_state(state_path: str, conv_id: str = "") -> dict:
+  try:
+    from context_guard import load_state as cg_load_state
+
+    return cg_load_state(state_path, conv_id)
+  except Exception:
+    pass
   try:
     if os.path.exists(state_path):
       with open(state_path, "r", encoding="utf-8") as f:
@@ -69,7 +75,14 @@ def load_state(state_path: str) -> dict:
   return {}
 
 
-def save_state(state_path: str, state: dict) -> None:
+def save_state(state_path: str, state: dict, conv_id: str = "") -> None:
+  try:
+    from context_guard import save_state as cg_save_state
+
+    cg_save_state(state_path, state, conv_id)
+    return
+  except Exception:
+    pass
   try:
     os.makedirs(os.path.dirname(state_path), exist_ok=True)
     with open(state_path, "w", encoding="utf-8") as f:
@@ -925,7 +938,9 @@ def main() -> None:
       if artifact_dir
       else f"/tmp/jetski_context_guard_{conv_id}.json"
   )
-  state = load_state(state_path)
+  state = load_state(state_path, conv_id)
+  if conv_id:
+    state.setdefault("owner", conv_id)
 
   info = analyze_current_turn(transcript_path)
   if not data.get("fullyIdle", True):
