@@ -5159,7 +5159,13 @@ def sync_once(
             f"{reason}. Немедленно проверь skia-gardener / status.skia.org и подготовь "
             f"диагностику."
         )
-      elif info["phase"] == "ALERT_CQ_FAILED" and prev_phase != "ALERT_CQ_FAILED":
+      elif (
+          info["phase"] == "ALERT_CQ_FAILED"
+          and prev_phase != "ALERT_CQ_FAILED"
+          and not info.get("is_draft")
+          and not info.get("in_development")
+      ):
+        # Skip critical wakeup on pre-review changes still in On your desk
         is_critical = True
         transition_msg = (
             f"[CL-WATCHER] 🔴 Упал CQ / Presubmit на {ikey} (PS{info['patchset']}): "
@@ -6241,7 +6247,11 @@ function isPostSubmitAlert(it) {
 
 // Alerts count as needing me even on merged CLs, since a blamed commit needs a reaction
 function statusOf(it) {
-  if (isAlert(it) || needsMyReply(it)) return 'attention';
+  const preReview = Boolean(it.is_draft || it.in_development);
+  // Pre-review drafts and no-reviewer changes stay out of Needs You until reviewers are added
+  if (isPostSubmitAlert(it) || (!preReview && (isAlert(it) || needsMyReply(it)))) {
+    return 'attention';
+  }
   if (it.status === 'ABANDONED' || it.status === 'CLOSED') return 'abandoned';
   // Surface parent CLs in Needs You when an attached companion is ready to abandon
   if (hasReadyCompanion(it)) return 'attention';
@@ -6255,8 +6265,8 @@ function statusOf(it) {
   }
   // Non-participant changes sit in Watching rather than personal workflow queues
   if (it.is_watching || (!it.is_self && it.reviewer_removed)) return 'watching';
-  // A conflict needs my rebase now; active CQ runs precede draft/dev and red tree
-  if (it.merge_conflict && it.is_self) return 'conflict';
+  // A conflict on an in-review change needs rebase now; pre-review conflicts stay in On your desk
+  if (it.merge_conflict && it.is_self && !preReview) return 'conflict';
   const cq = String(it.cq_status || '');
   if (it.phase === 'SUBMITTING' || cq.startsWith('CQ+') || cq.includes('running')) return 'cq';
   if (it.is_draft) return 'draft';
@@ -6444,11 +6454,17 @@ function stateHtml(it) {
   const st = statusOf(it);
   // GitHub has no commit queue; a running check set is the closest state
   if (st === 'cq') return `${it.kind === 'github' ? 'Checks' : 'In the commit queue'} · ${cq}`;
-  if (st === 'draft') {
-    return [wipTag || 'Draft', compNote, gap, cq || 'no CQ run'].filter(Boolean).join(' · ');
-  }
-  if (st === 'dev') {
-    return [wipTag, compNote, gap || 'No reviewers yet', cq || 'no CQ run']
+  if (st === 'draft' || st === 'dev') {
+    // Keep conflict and inline rebase visible inside On your desk rows
+    const conflictRebase = it.merge_conflict
+      ? ['<span class="red">Conflict</span>', rebaseActionHtml(it, 'triage-btn')].filter(Boolean)
+          .join(' ')
+      : '';
+    if (st === 'draft') {
+      return [wipTag || 'Draft', compNote, conflictRebase, gap, cq || 'no CQ run']
+        .filter(Boolean).join(' · ');
+    }
+    return [wipTag, compNote, conflictRebase, gap || 'No reviewers yet', cq || 'no CQ run']
       .filter(Boolean).join(' · ');
   }
   if (st === 'tree') {
@@ -6502,10 +6518,12 @@ function canRebase(it) {
     (it.status === 'NEW' || it.status === 'OPEN') && Boolean(it.item_key);
 }
 
-function rebaseActionHtml(it) {
+// cls overrides the button style (e.g. triage-btn) when embedded in lane rows
+function rebaseActionHtml(it, cls) {
   if (!canRebase(it)) return '';
+  const btnCls = cls || 'btn primary';
   const dis = it.chat_busy ? ' disabled title="Chat is already working"' : '';
-  return `<button class="btn primary"${dis} ` +
+  return `<button class="${btnCls}"${dis} ` +
     `onclick="rebaseItem(${esc(JSON.stringify(it.item_key))}, this)">🔧 Rebase</button>`;
 }
 
@@ -7271,6 +7289,12 @@ function render() {
       ? Number(Boolean(a.fixes && a.fixes.length)) -
         Number(Boolean(b.fixes && b.fixes.length))
       : 0)
+  );
+
+  // Changes without reviewers precede explicit drafts inside On your desk
+  by.desk.sort((a, b) =>
+    Number(Boolean(a.is_draft)) - Number(Boolean(b.is_draft)) ||
+    (b.activity_ts || 0) - (a.activity_ts || 0)
   );
 
   const busyYou = by.you.filter(it => it.chat_busy).length;

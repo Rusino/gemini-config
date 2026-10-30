@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -629,6 +630,26 @@ const closedPr = {
   kind: 'github', status: 'CLOSED', phase: 'ABANDONED',
   is_draft: false, in_development: false, patchset: 1, url: 'https://example.com/6'
 };
+const draftConflictCl = {
+  kind: 'gerrit', target_id: '8683229', item_key: 'gerrit:8683229', status: 'NEW',
+  phase: 'WAITING_ON_OTHERS', is_self: true, is_draft: true, in_development: false,
+  is_watching: false, merge_conflict: true, cq_failed: false, patchset: 1,
+  url: 'https://example.com/8683229', activity_ts: 300, subject: 'Draft conflict'
+};
+const devConflictCqFailPr = {
+  kind: 'github', target_id: '195122', item_key: 'github:195122', status: 'OPEN',
+  phase: 'ALERT_CQ_FAILED', is_self: true, is_draft: false, in_development: true,
+  is_watching: false, merge_conflict: true, cq_failed: true, patchset: 2,
+  url: 'https://example.com/195122', cq_status: '🔴 1 check(s) failed', activity_ts: 100,
+  subject: 'Dev conflict and checks fail'
+};
+const draftCqFailPr = {
+  kind: 'github', target_id: '193403', item_key: 'github:193403', status: 'OPEN',
+  phase: 'ALERT_CQ_FAILED', is_self: true, is_draft: true, in_development: false,
+  is_watching: false, merge_conflict: false, cq_failed: true, patchset: 1,
+  url: 'https://example.com/193403', cq_status: '🔴 2 check(s) failed', activity_ts: 200,
+  subject: 'Draft checks fail'
+};
 const box = {jetski_box_url: 'https://jetski.corp.google.com/box/host'};
 const ownCqFail = {
   kind: 'gerrit', status: 'NEW', phase: 'ALERT_CQ_FAILED', is_self: true, cq_failed: true,
@@ -638,7 +659,8 @@ const ownCqFail = {
 const busyAttentionCl = {
   kind: 'gerrit', target_id: '1408436', status: 'NEW', phase: 'NEEDS_YOUR_ACTION',
   in_my_attention: true, is_self: false, chat_busy: true, conversation_id: 'a2e9e5f4',
-  project_name: 'SkParagraph', subject: '[skparagraph] Avoid indexing empty fUTF16IndexForUTF8Index',
+  project_name: 'SkParagraph',
+  subject: '[skparagraph] Avoid indexing empty fUTF16IndexForUTF8Index',
   patchset: 1, url: 'https://example.com/1408436', last_msg_author: 'author@example.com',
   last_msg_age: '15m ago', last_msg_snippet: 'Uploaded patch set 1.'
 };
@@ -676,6 +698,37 @@ console.log(JSON.stringify({
   ownCqFailCard: focusCard(ownCqFail, box),
   busyCard: focusCard(busyAttentionCl, box),
   piperState: stateHtml(piperCl),
+  draftConflictStatus: statusOf(draftConflictCl),
+  draftConflictLane: laneOf(draftConflictCl),
+  devConflictCqFailStatus: statusOf(devConflictCqFailPr),
+  devConflictCqFailLane: laneOf(devConflictCqFailPr),
+  draftCqFailStatus: statusOf(draftCqFailPr),
+  draftCqFailLane: laneOf(draftCqFailPr),
+  draftConflictState: stateHtml(draftConflictCl),
+  devConflictCqFailState: stateHtml(devConflictCqFailPr),
+  draftCqFailState: stateHtml(draftCqFailPr),
+  deskRender: (() => {
+    const elements = {};
+    function getEl(id) {
+      if (!elements[id]) elements[id] = { innerHTML: '', textContent: '' };
+      return elements[id];
+    }
+    global.document = { getElementById: getEl, addEventListener: () => {} };
+    global.history = { replaceState: () => {} };
+    cachedData = {
+      items: {
+        'gerrit:8683229': draftConflictCl,
+        'github:195122': devConflictCqFailPr,
+        'github:193403': draftCqFailPr
+      }
+    };
+    render();
+    return {
+      focusHtml: elements['focus'] ? elements['focus'].innerHTML : '',
+      lanesHtml: elements['lanes'] ? elements['lanes'].innerHTML : '',
+      headlineHtml: elements['headline'] ? elements['headline'].innerHTML : ''
+    };
+  })(),
 }));
 """
     proc = subprocess.run(
@@ -734,6 +787,149 @@ console.log(JSON.stringify({
     self.assertIn("Open chat", out["busyCard"])
     self.assertNotIn("Working in chat", out["busyCard"])
     self.assertEqual(out["piperState"], "In review")
+
+    self.assertEqual(out["draftConflictStatus"], "draft")
+    self.assertEqual(out["draftConflictLane"], "desk")
+    self.assertEqual(out["devConflictCqFailStatus"], "dev")
+    self.assertEqual(out["devConflictCqFailLane"], "desk")
+    self.assertEqual(out["draftCqFailStatus"], "draft")
+    self.assertEqual(out["draftCqFailLane"], "desk")
+
+    self.assertIn('<span class="red">Conflict</span>', out["draftConflictState"])
+    self.assertIn("rebaseItem(", out["draftConflictState"])
+    self.assertIn('<span class="red">Conflict</span>', out["devConflictCqFailState"])
+    self.assertIn("rebaseItem(", out["devConflictCqFailState"])
+    self.assertIn("🔴 1 check(s) failed", out["devConflictCqFailState"])
+
+    desk = out["deskRender"]
+    self.assertEqual(desk["focusHtml"], "")
+    self.assertIn("Nothing needs you", desk["headlineHtml"])
+    dev_idx = desk["lanesHtml"].find("195122")
+    draft_idx = desk["lanesHtml"].find("8683229")
+    self.assertNotEqual(dev_idx, -1)
+    self.assertNotEqual(draft_idx, -1)
+    self.assertLess(dev_idx, draft_idx)
+
+  def test_sync_once_suppresses_cq_failed_alert_for_draft_and_in_development(self):
+    initial = {
+        "items": {
+            "github:193403@c-draft": {
+                "item_key": "github:193403",
+                "kind": "github",
+                "target_id": "193403",
+                "status": "OPEN",
+                "phase": "WAITING_ON_OTHERS",
+                "patchset": 1,
+                "is_self": True,
+                "is_draft": True,
+                "in_development": False,
+                "conversation_id": "c-draft",
+                "project_id": "p-wp",
+                "project_name": "WebParagraph",
+                "composite_key": "github:193403@c-draft",
+            },
+            "github:195122@c-dev": {
+                "item_key": "github:195122",
+                "kind": "github",
+                "target_id": "195122",
+                "status": "OPEN",
+                "phase": "WAITING_ON_OTHERS",
+                "patchset": 2,
+                "is_self": True,
+                "is_draft": False,
+                "in_development": True,
+                "conversation_id": "c-dev",
+                "project_id": "p-wp",
+                "project_name": "WebParagraph",
+                "composite_key": "github:195122@c-dev",
+            },
+        },
+        "events": [],
+    }
+    remote = [
+        {
+            "item_key": "github:193403",
+            "kind": "github",
+            "target_id": "193403",
+            "conversation_id": "c-draft",
+            "project_id": "p-wp",
+            "project_name": "WebParagraph",
+            "chat_busy": False,
+        },
+        {
+            "item_key": "github:195122",
+            "kind": "github",
+            "target_id": "195122",
+            "conversation_id": "c-dev",
+            "project_id": "p-wp",
+            "project_name": "WebParagraph",
+            "chat_busy": False,
+        },
+    ]
+
+    def fake_github_status(pr_id: str):
+      is_draft = str(pr_id) == "193403"
+      return {
+          "ok": True,
+          "host": "github.com/flutter/flutter",
+          "url": f"https://github.com/flutter/flutter/pull/{pr_id}",
+          "status": "OPEN",
+          "phase": "ALERT_CQ_FAILED",
+          "subject": f"PR {pr_id}",
+          "owner_name": "Rusino",
+          "owner_email": "Rusino",
+          "role": "author",
+          "is_self": True,
+          "is_external": False,
+          "is_draft": is_draft,
+          "is_wip": is_draft,
+          "wip_label": "Draft" if is_draft else "",
+          "in_development": not is_draft,
+          "is_watching": False,
+          "patchset": 2,
+          "revision": "rev123",
+          "in_my_attention": True,
+          "waiting_on": [],
+          "merge_conflict": False,
+          "tree_red": False,
+          "cr_summary": "0",
+          "cq_status": "🔴 1 check(s) failed",
+          "cq_failed": True,
+          "last_msg_author": "Rusino",
+          "last_msg_date": "2026-10-30 20:00:00",
+          "last_msg_et": "16:00 ET",
+          "last_msg_age": "5m ago",
+          "last_msg_snippet": "Checks failed",
+          "submitted": "",
+          "submitted_et": "",
+          "submitted_age": "",
+          "status_changed_raw": "2026-10-30 20:00:00",
+          "status_changed_et": "16:00 ET",
+          "status_changed_age": "5m ago",
+          "post_submit": None,
+      }
+
+    with tempfile.TemporaryDirectory() as tmp:
+      state_path = os.path.join(tmp, "state.json")
+      with open(state_path, "w", encoding="utf-8") as f:
+        json.dump(initial, f)
+      with mock.patch.object(w, "STATE_FILE", state_path), \
+           mock.patch.object(w.cl, "_fetch_ls_summaries_for_audit", return_value={}), \
+           mock.patch.object(w, "load_project_names", return_value={"p-wp": "WebParagraph"}), \
+           mock.patch.object(w, "fetch_gardener_snapshot", return_value=({}, [])), \
+           mock.patch.object(w, "discover_open_remote_changes", return_value=remote), \
+           mock.patch.object(w, "fetch_github_pr_status", side_effect=fake_github_status), \
+           mock.patch.object(
+               w, "fetch_gmail_status_for_id",
+               return_value={"thread_ids": [], "inbox_thread_ids": [], "total_msgs": 0}
+           ), \
+           mock.patch.object(w, "wake_conversation") as mock_wake, \
+           mock.patch.object(w, "send_desktop_alert") as mock_alert:
+        state = w.sync_once(wake_chats=True, update_titles=False, skia_dir="/nonexistent")
+
+    mock_wake.assert_not_called()
+    mock_alert.assert_not_called()
+    self.assertEqual(len(state.get("events", [])), 0)
 
   def test_dashboard_has_no_manual_chat_actions_or_browser_alerts(self):
     # Check for the removed legacy row button function rather than the Reviewer Pings heading
