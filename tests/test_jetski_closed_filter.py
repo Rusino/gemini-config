@@ -2063,6 +2063,10 @@ displayOptionsBtn.setAttribute('aria-label', 'Display Options');
 actionRow.appendChild(displayOptionsBtn);
 bodyEl.appendChild(actionRow);
 
+// Freeze clock before fixture evaluation to prevent resetTime expiration
+const NOW_ISO = '2026-10-29T18:30:00Z';
+Date.now = () => Date.parse(NOW_ISO);
+
 const protoMarker = { __isBufProto: true };
 function protoObj(typeName, fields) {
   return Object.assign(Object.create(protoMarker), { $typeName: typeName, ...fields });
