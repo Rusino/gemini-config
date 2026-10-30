@@ -318,6 +318,11 @@ def post_push_steps(
       steps.append(
           (["systemctl", "--user", "restart", "cl-flight-deck.service"], rp)
       )
+    # Restart hub daemon so in-memory index.html string table reloads the patched bootstrap shim
+    if {"scripts/patch_jetski_hub_binary.py"} & set(changed_rels):
+      steps.append(
+          (["systemctl", "--user", "restart", "jetski-hub.service"], rp)
+      )
   return steps
 
 
