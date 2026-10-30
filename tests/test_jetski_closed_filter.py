@@ -5893,5 +5893,386 @@ global.clearTimeout = (id) => {
     self.assertIn("ALL_AUTOPILOT_TESTS_PASSED", res.stdout)
 
 
+  def test_turn_navigator_and_chain_star_prompt_expansion(self) -> None:
+    # Verifies gesture-based user prompt expansion in turn navigator and chain star tooltips
+    node_bin = find_node_binary()
+    js_path = os.path.join(SCRIPTS_DIR, "jetski_closed_filter.js")
+
+    harness = r"""
+const fs = require('fs');
+const assert = require('assert');
+
+const scriptPath = process.argv[1];
+const code = fs.readFileSync(scriptPath, 'utf8');
+
+class FakeElement {
+  constructor(tagName) {
+    this.tagName = tagName.toUpperCase();
+    this.id = '';
+    this.className = '';
+    this.style = {};
+    this.attributes = new Map();
+    this.children = [];
+    this.parentElement = null;
+    this.listeners = new Map();
+    this._textContent = '';
+    this._innerHTML = '';
+  }
+  get textContent() { return this._textContent; }
+  set textContent(v) { this._textContent = String(v); }
+  get innerHTML() { return this._innerHTML; }
+  set innerHTML(v) {
+    this._innerHTML = String(v);
+    this.children = [];
+    if (this._innerHTML.includes('jetski-chain-steps-preview')) {
+      const preview = new FakeElement('div');
+      preview.className = 'jetski-chain-steps-preview';
+      this.appendChild(preview);
+    }
+  }
+  setAttribute(k, v) {
+    this.attributes.set(k, String(v));
+    if (k === 'id') this.id = String(v);
+    if (k === 'class') this.className = String(v);
+  }
+  getAttribute(k) { return this.attributes.has(k) ? this.attributes.get(k) : null; }
+  hasAttribute(k) { return this.attributes.has(k); }
+  removeAttribute(k) {
+    this.attributes.delete(k);
+    if (k === 'id') this.id = '';
+    if (k === 'class') this.className = '';
+  }
+  appendChild(c) {
+    if (c.parentElement) c.remove();
+    c.parentElement = this;
+    this.children.push(c);
+    return c;
+  }
+  remove() {
+    if (!this.parentElement) return;
+    const i = this.parentElement.children.indexOf(this);
+    if (i !== -1) this.parentElement.children.splice(i, 1);
+    this.parentElement = null;
+  }
+  contains(node) {
+    let cur = node;
+    while (cur) {
+      if (cur === this) return true;
+      cur = cur.parentElement;
+    }
+    return false;
+  }
+  getBoundingClientRect() {
+    return { top: 100, bottom: 120, left: 10, right: 30, width: 20, height: 20 };
+  }
+  addEventListener(t, fn, opts) {
+    if (!this.listeners.has(t)) this.listeners.set(t, []);
+    this.listeners.get(t).push({ fn, capture: Boolean(opts?.capture || opts === true) });
+  }
+  dispatchEvent(type, eventInit = {}) {
+    const ev = {
+      type,
+      defaultPrevented: false,
+      propagationStopped: false,
+      preventDefault() { this.defaultPrevented = true; },
+      stopPropagation() { this.propagationStopped = true; },
+      target: this,
+      currentTarget: this,
+      ...eventInit,
+    };
+    const handlers = this.listeners.get(type) || [];
+    for (const h of handlers) {
+      h.fn(ev);
+    }
+    return !ev.defaultPrevented;
+  }
+  closest(sel) {
+    let cur = this;
+    while (cur) {
+      if (cur.matches(sel)) return cur;
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+  matches(sel) {
+    if (!sel) return false;
+    if (sel.startsWith('#')) return this.id === sel.slice(1);
+    if (sel.startsWith('.')) return this.className.split(/\s+/).includes(sel.slice(1));
+    if (sel.startsWith('[') && sel.endsWith(']')) {
+      const inner = sel.slice(1, -1);
+      const eq = inner.indexOf('=');
+      if (eq === -1) return this.hasAttribute(inner);
+      const k = inner.slice(0, eq).trim();
+      const rawVal = inner.slice(eq + 1).trim();
+      const v = rawVal.replace(/^["\x27]|["\x27]$/g, '');
+      return this.getAttribute(k) === v;
+    }
+    return this.tagName.toLowerCase() === sel.toLowerCase();
+  }
+  querySelector(sel) {
+    return this.querySelectorAll(sel)[0] || null;
+  }
+  querySelectorAll(sel) {
+    const parts = (typeof sel === 'string' && sel.includes(','))
+      ? sel.split(',').map((p) => p.trim())
+      : [sel];
+    const out = [];
+    const visit = (node) => {
+      for (const p of parts) {
+        if (node.matches(p) && !out.includes(node)) {
+          out.push(node);
+        }
+      }
+      for (const child of node.children) {
+        visit(child);
+      }
+    };
+    for (const child of this.children) {
+      visit(child);
+    }
+    return out;
+  }
+}
+
+const docEl = new FakeElement('html');
+const headEl = new FakeElement('head');
+const bodyEl = new FakeElement('body');
+docEl.appendChild(headEl);
+docEl.appendChild(bodyEl);
+
+global.PopStateEvent = class {
+  constructor(type, init) {
+    this.type = type;
+    this.state = init?.state;
+  }
+};
+
+let curSelectionText = '';
+global.window = {
+  __APP_CONFIG__: { csrfToken: 'test-csrf-token' },
+  location: { pathname: '/c/chat-tail', search: '' },
+  history: {
+    state: {},
+    pushState(state, title, url) { this.state = state; this._lastPushed = url; },
+    replaceState(state, title, url) { this.state = state; this._lastReplaced = url; },
+  },
+  localStorage: { getItem: () => null, setItem: () => {} },
+  getSelection: () => ({
+    isCollapsed: !curSelectionText,
+    toString: () => curSelectionText,
+  }),
+  fetch: async (url, opts) => {
+    const urlStr = String(url);
+    if (urlStr.includes('GetCascadeTrajectorySteps')) {
+      const body = JSON.parse(opts?.body || '{}');
+      const cid = body.cascadeId || '';
+      return {
+        ok: true,
+        json: async () => ({
+          steps: [
+            {
+              type: 'CORTEX_STEP_TYPE_USER_INPUT',
+              userInput: { userResponse: `[handoff continuing]\nInitial prompt for ${cid}` },
+            },
+            {
+              type: 'CORTEX_STEP_TYPE_USER_INPUT',
+              userInput: { userResponse: `Second follow-up query for ${cid}` },
+            },
+          ],
+        }),
+      };
+    }
+    if (urlStr.includes('jetski-chains.json')) {
+      return {
+        ok: true,
+        json: async () => ({
+          parentOf: { 'chat-tail': 'chat-root' },
+          createdAt: {},
+          redirects: {},
+        }),
+      };
+    }
+    return { ok: true, json: async () => ({}) };
+  },
+  setTimeout: (fn, ms) => setTimeout(fn, ms),
+  clearTimeout: (id) => clearTimeout(id),
+  requestAnimationFrame: (cb) => cb(),
+  addEventListener() {},
+  removeEventListener() {},
+  dispatchEvent() { return true; },
+  document: null,
+};
+
+global.document = {
+  documentElement: docEl,
+  head: headEl,
+  body: bodyEl,
+  getElementById: (id) => docEl.querySelector(`#${id}`),
+  createElement: (tag) => new FakeElement(tag),
+  querySelector: (sel) => docEl.querySelector(sel),
+  querySelectorAll: (sel) => docEl.querySelectorAll(sel),
+  addEventListener() {},
+  removeEventListener() {},
+};
+global.MutationObserver = class {
+  observe() {}
+  disconnect() {}
+};
+
+eval(code);
+
+(async () => {
+  // 1. Verify single TurnHoverCard hover-inside and contextmenu toggle
+  const singleCard = new FakeElement('div');
+  singleCard.setAttribute('data-testid', 'conversation-navigator-card');
+  bodyEl.appendChild(singleCard);
+
+  window.__jetskiChainNav.enhanceNativeNavigatorCards();
+  assert.strictEqual(singleCard.getAttribute('data-jetski-enhanced'), 'true');
+
+  singleCard.dispatchEvent('mouseenter');
+  assert.strictEqual(singleCard.getAttribute('data-jetski-hover-inside'), 'true');
+
+  singleCard.dispatchEvent('mouseleave');
+  assert.strictEqual(singleCard.getAttribute('data-jetski-hover-inside'), null);
+
+  singleCard.dispatchEvent('contextmenu');
+  assert.strictEqual(singleCard.getAttribute('data-jetski-expanded'), 'true');
+
+  singleCard.dispatchEvent('contextmenu');
+  assert.strictEqual(singleCard.getAttribute('data-jetski-expanded'), 'false');
+
+  // 2. Verify GroupHoverCard row button injection and interactive prompt toggle
+  const groupCard = new FakeElement('div');
+  groupCard.setAttribute('data-testid', 'conversation-navigator-group-card');
+  const ul = new FakeElement('ul');
+  groupCard.appendChild(ul);
+
+  const li1 = new FakeElement('li');
+  const rowBtn1 = new FakeElement('button');
+  const spanTrunc1 = new FakeElement('span');
+  spanTrunc1.className = 'truncate';
+  spanTrunc1.textContent = 'Long prompt text #1';
+  rowBtn1.appendChild(spanTrunc1);
+  li1.appendChild(rowBtn1);
+  ul.appendChild(li1);
+
+  const li2 = new FakeElement('li');
+  const rowBtn2 = new FakeElement('button');
+  const spanTrunc2 = new FakeElement('span');
+  spanTrunc2.className = 'truncate';
+  spanTrunc2.textContent = 'Second prompt text #2';
+  rowBtn2.appendChild(spanTrunc2);
+  li2.appendChild(rowBtn2);
+  ul.appendChild(li2);
+
+  bodyEl.appendChild(groupCard);
+
+  let jumpCalls = 0;
+  rowBtn1.addEventListener('click', () => { jumpCalls++; });
+
+  window.__jetskiChainNav.enhanceNativeNavigatorCards();
+
+  const expandBtn1 = rowBtn1.querySelector('.jetski-turn-expand-btn');
+  assert(expandBtn1, 'GroupHoverCard row must receive injected expand button');
+  assert.strictEqual(expandBtn1.textContent, '▾');
+
+  // Expand row #1 via expand button click
+  expandBtn1.dispatchEvent('click');
+  assert.strictEqual(rowBtn1.getAttribute('data-jetski-expanded'), 'true');
+  assert.strictEqual(expandBtn1.textContent, '▴');
+  assert.strictEqual(groupCard.getAttribute('data-has-expanded'), 'true');
+  assert.strictEqual(jumpCalls, 0, 'Chevron click must not fire row jump handler');
+
+  // Collapse row #1 via row contextmenu
+  rowBtn1.dispatchEvent('contextmenu');
+  assert.strictEqual(rowBtn1.getAttribute('data-jetski-expanded'), 'false');
+  assert.strictEqual(expandBtn1.textContent, '▾');
+  assert.strictEqual(groupCard.getAttribute('data-has-expanded'), null);
+
+  // Active text selection suppresses row jump click
+  curSelectionText = 'selected snippet';
+  const preventedOnSelect = !rowBtn1.dispatchEvent('click');
+  assert.strictEqual(preventedOnSelect, true, 'Row click must be suppressed on text selection');
+  curSelectionText = '';
+
+  // 3. Verify Chain Star Tooltip progressive disclosure and grace timer
+  const starBtn = new FakeElement('button');
+  bodyEl.appendChild(starBtn);
+
+  // Trigger star hover
+  await window.__jetskiChainNav.showChainStarTooltip(
+    starBtn,
+    'chat-root',
+    0,
+    2,
+    false,
+    false,
+    'chat-tail'
+  );
+
+  const starTooltip = document.getElementById('jetski-chain-star-tooltip');
+  assert(starTooltip, 'Chain star tooltip element must mount in document body');
+  assert.strictEqual(starTooltip.getAttribute('data-visible'), 'true');
+
+  const promptRows = starTooltip.querySelectorAll('.jetski-chain-prompt-row');
+  assert.strictEqual(promptRows.length, 2, 'All user prompts must render in star tooltip');
+
+  // First prompt stripped handoff prefix
+  const promptText1 = promptRows[0].querySelector('.jetski-chain-prompt-text');
+  assert.strictEqual(promptText1.textContent, 'Initial prompt for chat-root');
+
+  const tooltipExpandBtn1 = promptRows[0].querySelector('.jetski-turn-expand-btn');
+  assert(tooltipExpandBtn1, 'Prompt row must have expand button');
+  assert.strictEqual(tooltipExpandBtn1.textContent, '▾');
+
+  // Toggle prompt expansion in tooltip
+  tooltipExpandBtn1.dispatchEvent('click');
+  assert.strictEqual(promptRows[0].getAttribute('data-jetski-expanded'), 'true');
+  assert.strictEqual(tooltipExpandBtn1.textContent, '▴');
+  assert.strictEqual(starTooltip.getAttribute('data-has-expanded'), 'true');
+
+  // Collapse prompt in tooltip via right click
+  promptRows[0].dispatchEvent('contextmenu');
+  assert.strictEqual(promptRows[0].getAttribute('data-jetski-expanded'), 'false');
+  assert.strictEqual(tooltipExpandBtn1.textContent, '▾');
+  assert.strictEqual(starTooltip.getAttribute('data-has-expanded'), null);
+
+  // Clicking a prompt row opens conversation
+  window.history._lastPushed = null;
+  promptRows[0].dispatchEvent('click');
+  assert(
+    window.history._lastPushed && window.history._lastPushed.includes('chat-root'),
+    'Clicking prompt row must navigate to target piece'
+  );
+
+  // 4. Verify cleanup resets attributes and removes injected buttons
+  window.__jetskiClosedChatsFilterCleanup();
+  assert.strictEqual(rowBtn1.querySelector('.jetski-turn-expand-btn'), null);
+  assert.strictEqual(singleCard.getAttribute('data-jetski-enhanced'), null);
+
+  console.log('ALL_EXPANSION_TESTS_PASSED');
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"""
+    env = os.environ.copy()
+    env["ELECTRON_RUN_AS_NODE"] = "1"
+    res = subprocess.run(
+        [node_bin, "-e", harness, js_path],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(
+        res.returncode,
+        0,
+        f"Prompt expansion JS harness failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+    )
+    self.assertIn("ALL_EXPANSION_TESTS_PASSED", res.stdout)
+
+
 if __name__ == "__main__":
   unittest.main()

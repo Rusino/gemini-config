@@ -74,6 +74,12 @@
   const ARCHIVE_LABEL_CLASS = 'jetski-archive-piece-label';
   const JUMP_TO_TAIL_BTN_CLASS = 'jetski-jump-to-tail-btn';
   const STAR_TOOLTIP_ID = 'jetski-chain-star-tooltip';
+  // Class names for turn prompt expansion and chain star prompt lists
+  const TURN_EXPAND_BTN_CLASS = 'jetski-turn-expand-btn';
+  const CHAIN_PROMPT_LIST_CLASS = 'jetski-chain-prompt-list';
+  const CHAIN_PROMPT_ROW_CLASS = 'jetski-chain-prompt-row';
+  const CHAIN_PROMPT_IDX_CLASS = 'jetski-chain-prompt-idx';
+  const CHAIN_PROMPT_TEXT_CLASS = 'jetski-chain-prompt-text';
   const DEFAULT_VISIBLE_BUCKETS = ['needs-me', 'working'];
 
   const BUCKET_DEFS = {
@@ -4276,10 +4282,13 @@
         transform: scale(1.25);
         color: #fbbf24;
       }
+      /* Chain star tooltip with progressive disclosure and prompt list */
       #${STAR_TOOLTIP_ID} {
         position: fixed;
         z-index: 2147483647;
-        width: 288px;
+        width: min(420px, calc(100vw - 64px));
+        max-height: min(70vh, 460px);
+        overflow-y: auto;
         padding: 9px 12px;
         border-radius: 8px;
         background: var(--glass, var(--card, var(--secondary, #2d2d2d)));
@@ -4302,11 +4311,139 @@
         pointer-events: none;
         opacity: 0;
         transform: translateY(-2px);
-        transition: opacity 110ms ease, transform 110ms ease;
+        transition: opacity 110ms ease, transform 110ms ease, width 120ms ease;
       }
       #${STAR_TOOLTIP_ID}[data-visible="true"] {
         opacity: 1;
         transform: translateY(0);
+        pointer-events: auto;
+        user-select: text;
+      }
+      #${STAR_TOOLTIP_ID}[data-has-expanded="true"] {
+        width: min(520px, calc(100vw - 64px));
+      }
+      /* Chain prompt list, index badge, and expand button */
+      .${CHAIN_PROMPT_LIST_CLASS} {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        margin-top: 4px;
+        padding-top: 4px;
+        border-top: 1px solid rgba(128, 134, 139, 0.2);
+      }
+      .${CHAIN_PROMPT_ROW_CLASS} {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 6px;
+        padding: 3px 4px;
+        border-radius: 4px;
+        cursor: pointer;
+        transition: background-color 100ms ease;
+      }
+      .${CHAIN_PROMPT_ROW_CLASS}:hover {
+        background: rgba(128, 134, 139, 0.15);
+      }
+      .${CHAIN_PROMPT_ROW_CLASS}[data-jetski-expanded="true"] {
+        background: rgba(128, 134, 139, 0.12);
+      }
+      .${CHAIN_PROMPT_IDX_CLASS} {
+        flex: 0 0 auto;
+        font-size: 10px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+        color: var(--muted-foreground, #9aa0a6);
+        padding-top: 1px;
+      }
+      .${CHAIN_PROMPT_TEXT_CLASS} {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 11px;
+        line-height: 1.35;
+        color: var(--foreground, #e8eaed);
+      }
+      .${CHAIN_PROMPT_ROW_CLASS}[data-jetski-expanded="true"] .${CHAIN_PROMPT_TEXT_CLASS} {
+        white-space: pre-wrap !important;
+        word-break: break-word !important;
+        max-height: 220px !important;
+        overflow-y: auto !important;
+        user-select: text !important;
+      }
+      .${TURN_EXPAND_BTN_CLASS} {
+        flex: 0 0 auto;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 16px;
+        height: 16px;
+        padding: 0;
+        border: none;
+        border-radius: 3px;
+        background: transparent;
+        color: var(--muted-foreground, #9aa0a6);
+        font-size: 9.5px;
+        line-height: 1;
+        cursor: pointer;
+        opacity: 0.7;
+        transition: opacity 100ms ease, background-color 100ms ease, color 100ms ease;
+      }
+      .${TURN_EXPAND_BTN_CLASS}:hover {
+        opacity: 1;
+        background: rgba(128, 134, 139, 0.22);
+        color: var(--foreground, #e8eaed);
+      }
+      /* Expand TurnHoverCard popup and prompt when hovering into card or on contextmenu */
+      [data-testid="conversation-navigator-card"] {
+        transition: width 120ms ease;
+      }
+      [data-testid="conversation-navigator-card"][data-jetski-hover-inside="true"],
+      [data-testid="conversation-navigator-card"][data-jetski-expanded="true"] {
+        width: min(520px, calc(100vw - 64px)) !important;
+      }
+      [data-testid="conversation-navigator-card"][data-jetski-hover-inside="true"]
+        span.line-clamp-2,
+      [data-testid="conversation-navigator-card"][data-jetski-expanded="true"]
+        span.line-clamp-2 {
+        display: block !important;
+        -webkit-line-clamp: unset !important;
+        white-space: pre-wrap !important;
+        word-break: break-word !important;
+        max-height: 260px !important;
+        overflow-y: auto !important;
+        user-select: text !important;
+      }
+      /* GroupHoverCard chapter popup width, max-height, and row prompt expansion */
+      [data-testid="conversation-navigator-group-card"] {
+        width: min(380px, calc(100vw - 64px)) !important;
+        transition: width 120ms ease;
+      }
+      [data-testid="conversation-navigator-group-card"][data-has-expanded="true"] {
+        width: min(520px, calc(100vw - 64px)) !important;
+      }
+      [data-testid="conversation-navigator-group-card"] ul {
+        max-height: min(65vh, 420px) !important;
+        overflow-y: auto !important;
+      }
+      [data-testid="conversation-navigator-group-card"] li > button {
+        display: flex !important;
+        align-items: center !important;
+        justify-content: space-between !important;
+        gap: 4px !important;
+      }
+      [data-testid="conversation-navigator-group-card"] li > button[data-jetski-expanded="true"] {
+        align-items: flex-start !important;
+      }
+      [data-testid="conversation-navigator-group-card"]
+        li > button[data-jetski-expanded="true"] span.truncate {
+        display: block !important;
+        white-space: pre-wrap !important;
+        word-break: break-word !important;
+        max-height: 220px !important;
+        overflow-y: auto !important;
+        user-select: text !important;
       }
       .${ARCHIVE_BANNER_CLASS} {
         display: flex;
@@ -6009,6 +6146,24 @@
   let chainTooltipEl = null;
   let activeTooltipBtn = null;
   let tooltipFetchSeq = 0;
+  // Grace timer prevents tooltip from closing when cursor moves between star and popup
+  let starTooltipHideTimer = 0;
+
+  function cancelHideChainStarTooltip() {
+    if (starTooltipHideTimer) {
+      clearTimeout(starTooltipHideTimer);
+      starTooltipHideTimer = 0;
+    }
+  }
+
+  // Delays tooltip dismissal so the user has time to move cursor inside the popup
+  function scheduleHideChainStarTooltip(delayMs = 180) {
+    cancelHideChainStarTooltip();
+    starTooltipHideTimer = setTimeout(() => {
+      starTooltipHideTimer = 0;
+      hideChainStarTooltip();
+    }, delayMs);
+  }
 
   function ensureChainStarTooltip() {
     if (chainTooltipEl && document.body?.contains?.(chainTooltipEl)) return chainTooltipEl;
@@ -6016,20 +6171,95 @@
     chainTooltipEl.id = STAR_TOOLTIP_ID;
     chainTooltipEl.className = 'compact-tooltip surface-glass';
     chainTooltipEl.setAttribute('data-visible', 'false');
+    // Keep tooltip open while pointer hovers inside its bounds
+    chainTooltipEl.addEventListener('mouseenter', () => {
+      cancelHideChainStarTooltip();
+    });
+    // Schedule grace-window dismissal when pointer leaves tooltip bounds
+    chainTooltipEl.addEventListener('mouseleave', () => {
+      scheduleHideChainStarTooltip();
+    });
     document.body?.appendChild?.(chainTooltipEl);
     return chainTooltipEl;
   }
 
   function hideChainStarTooltip() {
+    // Cancel any pending grace hide timer before clearing state
+    cancelHideChainStarTooltip();
     activeTooltipBtn = null;
     if (chainTooltipEl) {
       chainTooltipEl.setAttribute('data-visible', 'false');
+      // Reset expansion state so subsequent hovers start in compact view
+      chainTooltipEl.removeAttribute('data-has-expanded');
       chainTooltipEl.innerHTML = '';
       chainTooltipEl.textContent = '';
     }
   }
 
-  async function showChainStarTooltip(btn, pieceCid, pieceIdx, totalPieces, isCurrent, isTail) {
+  // Toggles expanded state of a prompt row in turn/chain tooltips and updates container flag
+  function togglePromptRowExpanded(rowEl, expandBtnEl, containerEl) {
+    const isExp = rowEl.getAttribute('data-jetski-expanded') === 'true';
+    const nextExp = !isExp;
+    rowEl.setAttribute('data-jetski-expanded', nextExp ? 'true' : 'false');
+    if (expandBtnEl) {
+      expandBtnEl.textContent = nextExp ? '▴' : '▾';
+    }
+    if (containerEl) {
+      const anyExp = Boolean(
+        containerEl.querySelector('[data-jetski-expanded="true"]')
+      );
+      if (anyExp) {
+        containerEl.setAttribute('data-has-expanded', 'true');
+      } else {
+        containerEl.removeAttribute('data-has-expanded');
+      }
+    }
+  }
+
+  // Creates chevron expand button with click/pointerdown propagation isolation
+  function createTurnExpandButton(ariaLabel, onToggle) {
+    const expandBtn = document.createElement('button');
+    expandBtn.type = 'button';
+    expandBtn.className = TURN_EXPAND_BTN_CLASS;
+    expandBtn.setAttribute('data-testid', 'jetski-turn-expand-btn');
+    expandBtn.setAttribute('aria-label', ariaLabel || 'Toggle prompt expansion');
+    expandBtn.textContent = '▾';
+    const stopEvt = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    expandBtn.addEventListener('pointerdown', stopEvt);
+    expandBtn.addEventListener('mousedown', stopEvt);
+    expandBtn.addEventListener('click', (e) => {
+      stopEvt(e);
+      onToggle();
+    });
+    return expandBtn;
+  }
+
+  // Returns true if click target is expand button or user is selecting text for copying
+  function shouldIgnoreRowJumpClick(e, expandBtn) {
+    if (
+      e.target === expandBtn ||
+      (typeof e.target?.closest === 'function' &&
+        e.target.closest(`.${TURN_EXPAND_BTN_CLASS}`))
+    ) {
+      return true;
+    }
+    const sel = typeof window.getSelection === 'function' ? window.getSelection() : null;
+    return Boolean(sel && !sel.isCollapsed && sel.toString().trim());
+  }
+
+  // Renders all user prompts of the piece with progressive disclosure and gesture expansion
+  async function showChainStarTooltip(
+    btn,
+    pieceCid,
+    pieceIdx,
+    totalPieces,
+    isCurrent,
+    isTail,
+    sourceCid
+  ) {
     activeTooltipBtn = btn;
     const tooltip = ensureChainStarTooltip();
     if (!tooltip) return;
@@ -6071,31 +6301,78 @@
       const steps = await fetchChainSteps(pieceCid);
       if (activeTooltipBtn !== btn || curSeq !== tooltipFetchSeq) return;
       const userQuestions = [];
+      // Strip handoff prefix and extract untruncated prompt text
       for (const s of steps) {
         if (s.type === 'CORTEX_STEP_TYPE_USER_INPUT' && s.userInput?.userResponse) {
           let text = s.userInput.userResponse.trim();
-          text = text.replace(/^(?:continuing\s+conversation:[^\n]+|\[handoff[^\n]+)\n+/i, '').trim();
+          text = text.replace(
+            /^(?:continuing\s+conversation:[^\n]+|\[handoff[^\n]+)\n+/i,
+            ''
+          ).trim();
           if (text) userQuestions.push(text);
         }
       }
       const previewEl = tooltip.querySelector?.('.jetski-chain-steps-preview');
       if (!previewEl) return;
+      // Populate prompt rows via DOM elements instead of raw HTML string formatting
+      previewEl.innerHTML = '';
+      previewEl.textContent = '';
       if (userQuestions.length === 0) {
-        previewEl.innerHTML = '<span style="opacity:0.6;">0 user prompts</span>';
-      } else if (userQuestions.length === 1) {
-        previewEl.innerHTML = `
-          <div style="font-weight:600;margin-bottom:2px;">1 user prompt:</div>
-          <div style="opacity:0.9;font-style:italic;">"${escapeHtml(userQuestions[0].slice(0, 120))}${userQuestions[0].length > 120 ? '…' : ''}"</div>
-        `;
+        const emptySpan = document.createElement('span');
+        emptySpan.style.opacity = '0.6';
+        emptySpan.textContent = '0 user prompts';
+        previewEl.appendChild(emptySpan);
       } else {
-        const first = userQuestions[0].slice(0, 90) + (userQuestions[0].length > 90 ? '…' : '');
-        const last = userQuestions[userQuestions.length - 1].slice(0, 90) +
-          (userQuestions[userQuestions.length - 1].length > 90 ? '…' : '');
-        previewEl.innerHTML = `
-          <div style="font-weight:600;margin-bottom:2px;">User prompts: ${userQuestions.length}</div>
-          <div style="margin-bottom:2px;"><span style="opacity:0.6;">First:</span> "${escapeHtml(first)}"</div>
-          <div><span style="opacity:0.6;">Last:</span> "${escapeHtml(last)}"</div>
-        `;
+        // Render prompt count header and scrollable list of user prompts
+        const countHeader = document.createElement('div');
+        countHeader.style.fontWeight = '600';
+        countHeader.style.marginBottom = '3px';
+        countHeader.textContent = `User prompts (${userQuestions.length}):`;
+        previewEl.appendChild(countHeader);
+
+        const listEl = document.createElement('div');
+        listEl.className = CHAIN_PROMPT_LIST_CLASS;
+        // Build interactive prompt row with index prefix, truncated text, and toggle button
+        for (let qIdx = 0; qIdx < userQuestions.length; qIdx++) {
+          const qText = userQuestions[qIdx];
+          const rowEl = document.createElement('div');
+          rowEl.className = CHAIN_PROMPT_ROW_CLASS;
+          rowEl.setAttribute('data-prompt-idx', String(qIdx));
+
+          const idxEl = document.createElement('span');
+          idxEl.className = CHAIN_PROMPT_IDX_CLASS;
+          idxEl.textContent = `#${qIdx + 1}`;
+          rowEl.appendChild(idxEl);
+
+          const textEl = document.createElement('span');
+          textEl.className = CHAIN_PROMPT_TEXT_CLASS;
+          textEl.textContent = qText;
+          rowEl.appendChild(textEl);
+
+          const expandBtn = createTurnExpandButton('Toggle prompt expansion', () => {
+            togglePromptRowExpanded(rowEl, expandBtn, tooltip);
+          });
+          rowEl.appendChild(expandBtn);
+
+          rowEl.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            togglePromptRowExpanded(rowEl, expandBtn, tooltip);
+          });
+
+          rowEl.addEventListener('click', (e) => {
+            // Ignore click if user clicked expand chevron or dragged text for selection
+            if (shouldIgnoreRowJumpClick(e, expandBtn)) {
+              return;
+            }
+            hideChainStarTooltip();
+            manualVisitedCids.add(pieceCid);
+            openConversation(pieceCid, qText.slice(0, 64), sourceCid || pieceCid);
+          });
+
+          listEl.appendChild(rowEl);
+        }
+        previewEl.appendChild(listEl);
       }
     } catch {
       if (activeTooltipBtn !== btn || curSeq !== tooltipFetchSeq) return;
@@ -6160,11 +6437,14 @@
         openConversation(cid, undefined, sourceCid || chain[idx]);
       }
     });
+    // Show tooltip immediately and cancel hide timer on star hover
     btn.addEventListener('mouseenter', () => {
-      void showChainStarTooltip(btn, cid, idx, chain.length, isCurrent, isTail);
+      cancelHideChainStarTooltip();
+      void showChainStarTooltip(btn, cid, idx, chain.length, isCurrent, isTail, sourceCid);
     });
+    // Schedule grace-window dismissal when pointer leaves star button
     btn.addEventListener('mouseleave', () => {
-      hideChainStarTooltip();
+      scheduleHideChainStarTooltip();
     });
     return btn;
   }
@@ -6458,7 +6738,92 @@
     );
   }
 
-  window.__jetskiChainNav = { syncConversationChainNavigators };
+  // Traverses group card DOM to collect all turn row button elements
+  function collectGroupCardRowButtons(groupCard) {
+    if (!groupCard) return [];
+    const buttons = [];
+    const walk = (node) => {
+      if (!node) return;
+      if (node.tagName === 'BUTTON' && node.parentElement?.tagName === 'LI') {
+        buttons.push(node);
+      }
+      for (const child of node.children || []) {
+        walk(child);
+      }
+    };
+    walk(groupCard);
+    return buttons;
+  }
+
+  // Injects hover-inside and right-click toggle handlers into single TurnHoverCard
+  function enhanceSingleTurnCard(card) {
+    if (!card || card.getAttribute('data-jetski-enhanced') === 'true') return;
+    card.setAttribute('data-jetski-enhanced', 'true');
+    card.addEventListener('mouseenter', () => {
+      card.setAttribute('data-jetski-hover-inside', 'true');
+    });
+    card.addEventListener('mouseleave', () => {
+      card.removeAttribute('data-jetski-hover-inside');
+    });
+    card.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const isExp = card.getAttribute('data-jetski-expanded') === 'true';
+      card.setAttribute('data-jetski-expanded', isExp ? 'false' : 'true');
+    });
+  }
+
+  // Injects expand buttons and contextmenu handlers into GroupHoverCard row buttons
+  function enhanceGroupCard(groupCard) {
+    if (!groupCard) return;
+    const rowButtons = collectGroupCardRowButtons(groupCard);
+    for (const rowBtn of rowButtons) {
+      let expandBtn = rowBtn.querySelector(`.${TURN_EXPAND_BTN_CLASS}`);
+      if (!expandBtn) {
+        expandBtn = createTurnExpandButton('Toggle turn prompt expansion', () => {
+          togglePromptRowExpanded(rowBtn, expandBtn, groupCard);
+        });
+        rowBtn.appendChild(expandBtn);
+      }
+      if (rowBtn.getAttribute('data-jetski-enhanced') !== 'true') {
+        rowBtn.setAttribute('data-jetski-enhanced', 'true');
+        rowBtn.addEventListener('contextmenu', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          togglePromptRowExpanded(rowBtn, expandBtn, groupCard);
+        });
+        rowBtn.addEventListener('click', (e) => {
+          if (shouldIgnoreRowJumpClick(e, expandBtn)) {
+            e.preventDefault();
+            e.stopPropagation();
+          }
+        }, true);
+      }
+    }
+  }
+
+  // Discovers and enhances all native navigator cards mounted by React
+  function enhanceNativeNavigatorCards() {
+    const singleCards = document.querySelectorAll(
+      '[data-testid="conversation-navigator-card"]'
+    );
+    for (const card of singleCards) {
+      enhanceSingleTurnCard(card);
+    }
+    const groupCards = document.querySelectorAll(
+      '[data-testid="conversation-navigator-group-card"]'
+    );
+    for (const groupCard of groupCards) {
+      enhanceGroupCard(groupCard);
+    }
+  }
+
+  window.__jetskiChainNav = {
+    syncConversationChainNavigators,
+    enhanceNativeNavigatorCards,
+    showChainStarTooltip,
+    hideChainStarTooltip,
+  };
 
   // Checks if an item is a collapsible conversation section header outside project folders
   function isCollapsibleConversationSectionHeader(item) {
@@ -8233,6 +8598,8 @@
     ensureProjectRoadmapBadges();
     ensureTitlebarButtons();
     ensureSidebarRowButtons();
+    // Enhance native conversation navigator cards (TurnHoverCard and GroupHoverCard)
+    enhanceNativeNavigatorCards();
     // Synchronize chain stars and read-only piece locks across open conversation views
     void syncConversationChainNavigators();
   }
@@ -8270,6 +8637,10 @@
         target.className === LOCATE_BTN_CLASS ||
         target.className === CHAIN_STARS_GROUP_CLASS ||
         target.className === CHAIN_STAR_BTN_CLASS ||
+        // Ignore mutations on prompt list and expand buttons to avoid feedback loops
+        target.className === TURN_EXPAND_BTN_CLASS ||
+        target.className === CHAIN_PROMPT_LIST_CLASS ||
+        target.className === CHAIN_PROMPT_ROW_CLASS ||
         target.className === ARCHIVE_BANNER_CLASS ||
         (typeof target.closest === 'function' &&
           (target.closest('#jetski-closed-chats-filter-bubble') ||
@@ -8287,6 +8658,12 @@
             target.closest(`.${LOCATE_BTN_CLASS}`) ||
             target.closest(`.${CHAIN_STARS_GROUP_CLASS}`) ||
             target.closest(`.${ARCHIVE_BANNER_CLASS}`) ||
+            // Skip subtree mutations inside turn cards and prompt expand controls
+            target.closest(`.${TURN_EXPAND_BTN_CLASS}`) ||
+            target.closest(`.${CHAIN_PROMPT_LIST_CLASS}`) ||
+            target.closest(`.${CHAIN_PROMPT_ROW_CLASS}`) ||
+            target.closest('[data-testid="conversation-navigator-card"]') ||
+            target.closest('[data-testid="conversation-navigator-group-card"]') ||
             target.closest(`#${AUTOPILOT_TOAST_ID}`) ||
             target.closest(`#${SEARCH_PANEL_ID}`)))
       ) {
@@ -8310,6 +8687,26 @@
     unbindInputBoxSeenListeners();
     observer.disconnect();
     disposed = true;
+    hideChainStarTooltip();
+    // Clean up turn expand buttons and reset navigator expansion attributes
+    for (const btn of document.querySelectorAll(`.${TURN_EXPAND_BTN_CLASS}`)) {
+      btn.remove();
+    }
+    // Reset data attributes on turn cards
+    for (const card of document.querySelectorAll(
+      '[data-testid="conversation-navigator-card"], ' +
+      '[data-testid="conversation-navigator-group-card"]'
+    )) {
+      card.removeAttribute('data-jetski-enhanced');
+      card.removeAttribute('data-jetski-hover-inside');
+      card.removeAttribute('data-jetski-expanded');
+      card.removeAttribute('data-has-expanded');
+    }
+    // Reset data attributes on enhanced row buttons
+    for (const row of document.querySelectorAll('button[data-jetski-expanded]')) {
+      row.removeAttribute('data-jetski-enhanced');
+      row.removeAttribute('data-jetski-expanded');
+    }
     // Restore the un-enriched server UserStatus before tearing down the instance
     const curUserStatus = reduxStore?.getState()?.userStatus;
     const cleanUserStatus = stripUnlockedModels(curUserStatus);
