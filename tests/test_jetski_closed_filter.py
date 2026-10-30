@@ -5298,6 +5298,12 @@ eval(code);
   assert.strictEqual(handled, true, 'pollOpenChatRequest must handle fresh request');
   const openChatCall = fetchCalls.find((c) => c.url.includes('jetski-open-chat.json'));
   assert(openChatCall, 'Must fetch jetski-open-chat.json');
+  assert(
+    openChatCall.url.startsWith(
+      '/box/jlavrova-for-jetski.c.googlers.com:10023/static/artifacts/jetski-open-chat.json'
+    ),
+    'Fetch URL must preserve /box/<host> route prefix'
+  );
   assert(openChatCall.url.includes('csrf=test-csrf'), 'Fetch must include csrf query parameter');
   assert.strictEqual(storageMap.get('ag:claimedOpenChatReqId'), 'req-open-999');
 

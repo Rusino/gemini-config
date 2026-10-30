@@ -625,6 +625,21 @@
     return '';
   }
 
+  // Extracts the /box/<host> routing prefix when Jetski Web is accessed through the
+  // corp reverse proxy
+  function getBoxRoutePrefix() {
+    const path = typeof window !== 'undefined' ? window.location?.pathname || '' : '';
+    const m = /^(\/box\/[^/]+)(?:\/|$)/.exec(path);
+    return m ? m[1] : '';
+  }
+
+  // Prepends the /box/<host> prefix to root-relative artifact and RPC paths on proxied routes
+  function resolveApiUrl(path) {
+    const p = path.startsWith('/') ? path : `/${path}`;
+    const prefix = getBoxRoutePrefix();
+    return prefix ? `${prefix}${p}` : p;
+  }
+
   async function fetchChainIndex() {
     const now = Date.now();
     if (chainIndexCache && now - chainIndexFetchedAt < 5000) {
@@ -635,9 +650,8 @@
     }
     try {
       const csrf = encodeURIComponent(getCsrfToken());
-      const resp = await window.fetch(
-        `/static/artifacts/jetski-chains.json?v=${now}&csrf=${csrf}`
-      );
+      const url = resolveApiUrl(`/static/artifacts/jetski-chains.json?v=${now}&csrf=${csrf}`);
+      const resp = await window.fetch(url);
       if (resp && resp.ok) {
         const data = await resp.json();
         if (data && typeof data === 'object') {
@@ -666,9 +680,8 @@
     }
     try {
       const csrf = encodeURIComponent(getCsrfToken());
-      const resp = await window.fetch(
-        `/static/artifacts/jetski-roadmaps.json?v=${now}&csrf=${csrf}`
-      );
+      const url = resolveApiUrl(`/static/artifacts/jetski-roadmaps.json?v=${now}&csrf=${csrf}`);
+      const resp = await window.fetch(url);
       if (resp && resp.ok) {
         const data = await resp.json();
         if (data && typeof data === 'object') {
@@ -739,9 +752,10 @@
   async function postUpdateAnnotationsRpc(cascadeId, annotations) {
     if (typeof window.fetch !== 'function') return false;
     try {
-      const resp = await window.fetch(
-        '/exa.language_server_pb.LanguageServerService/UpdateConversationAnnotations',
-        {
+      const url = resolveApiUrl(
+        '/exa.language_server_pb.LanguageServerService/UpdateConversationAnnotations'
+      );
+      const resp = await window.fetch(url, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -1416,9 +1430,10 @@
       'x-codeium-csrf-token': getCsrfToken(),
     };
     try {
-      const resp = await window.fetch(
-        '/exa.language_server_pb.LanguageServerService/GetCascadeTrajectory',
-        {
+      const url = resolveApiUrl(
+        '/exa.language_server_pb.LanguageServerService/GetCascadeTrajectory'
+      );
+      const resp = await window.fetch(url, {
           method: 'POST',
           headers,
           body: JSON.stringify({
@@ -1436,9 +1451,10 @@
       if (Array.isArray(steps)) {
         for (let page = 0; page < 8 && steps.length > 0 && steps.length < total; page++) {
           try {
-            const tailResp = await window.fetch(
-              '/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps',
-              {
+            const stepsUrl = resolveApiUrl(
+              '/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps'
+            );
+            const tailResp = await window.fetch(stepsUrl, {
                 method: 'POST',
                 headers,
                 body: JSON.stringify({
@@ -3027,9 +3043,10 @@
 
     availableModelsFetching = (async () => {
       try {
-        const resp = await window.fetch(
-          '/exa.language_server_pb.LanguageServerService/GetAvailableModels',
-          {
+        const url = resolveApiUrl(
+          '/exa.language_server_pb.LanguageServerService/GetAvailableModels'
+        );
+        const resp = await window.fetch(url, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -5517,9 +5534,10 @@
   }
 
   async function fetchChainSteps(cascadeId) {
-    const resp = await window.fetch(
-      '/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps',
-      {
+    const url = resolveApiUrl(
+      '/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps'
+    );
+    const resp = await window.fetch(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -5580,9 +5598,10 @@
     }
     if (typeof window.fetch !== 'function') return false;
     try {
-      const resp = await window.fetch(
-        '/exa.language_server_pb.LanguageServerService/UpdateProject',
-        {
+      const url = resolveApiUrl(
+        '/exa.language_server_pb.LanguageServerService/UpdateProject'
+      );
+      const resp = await window.fetch(url, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -5824,9 +5843,10 @@
     }
     let data;
     try {
-      const resp = await window.fetch(
-        '/exa.language_server_pb.LanguageServerService/SearchConversations',
-        {
+      const url = resolveApiUrl(
+        '/exa.language_server_pb.LanguageServerService/SearchConversations'
+      );
+      const resp = await window.fetch(url, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -6267,24 +6287,60 @@
     }
   }
 
+  let scriptLastModified = '';
+  let lastHotReloadCheckAt = 0;
+
+  // Periodically checks if jetski-closed-filter.js was updated on disk and hot-reloads it in-place
+  async function checkFilterScriptHotReload() {
+    const now = Date.now();
+    if (disposed || now - lastHotReloadCheckAt < 15000 || typeof window.fetch !== 'function') {
+      return;
+    }
+    lastHotReloadCheckAt = now;
+    try {
+      const csrf = encodeURIComponent(getCsrfToken());
+      const url = resolveApiUrl(`/static/artifacts/jetski-closed-filter.js?csrf=${csrf}`);
+      const resp = await window.fetch(url, { method: 'HEAD', cache: 'no-store' });
+      if (!resp || !resp.ok) return;
+      const lm = resp.headers?.get?.('Last-Modified') || '';
+      if (!lm) return;
+      if (!scriptLastModified) {
+        scriptLastModified = lm;
+        return;
+      }
+      if (lm !== scriptLastModified && !disposed) {
+        scriptLastModified = lm;
+        const scriptUrl = resolveApiUrl(
+          `/static/artifacts/jetski-closed-filter.js?v=${now}&csrf=${csrf}`
+        );
+        const s = document.createElement('script');
+        s.src = scriptUrl;
+        document.head.append(s);
+      }
+    } catch {
+      // Ignore network errors during hot-reload check
+    }
+  }
+
   // Polls /static/artifacts/jetski-open-chat.json so Flight Deck can navigate an existing tab
   async function pollOpenChatRequest() {
     if (disposed || openChatPollingInFlight || typeof window.fetch !== 'function') return false;
+    void checkFilterScriptHotReload();
     openChatPollingInFlight = true;
     try {
       const csrf = encodeURIComponent(getCsrfToken());
-      const resp = await window.fetch(
-        `/static/artifacts/jetski-open-chat.json?t=${Date.now()}&csrf=${csrf}`,
-        { cache: 'no-store' }
+      const url = resolveApiUrl(
+        `/static/artifacts/jetski-open-chat.json?t=${Date.now()}&csrf=${csrf}`
       );
+      const resp = await window.fetch(url, { cache: 'no-store' });
       if (!resp || !resp.ok) return false;
       const data = await resp.json();
       const reqId = typeof data?.requestId === 'string' ? data.requestId : '';
       const cid = typeof data?.cascadeId === 'string' ? data.cascadeId.trim() : '';
       const reqAt = Number(data?.requestedAt || 0);
       if (!reqId || !cid || reqId === lastOpenChatReqId) return false;
-      // Ignore stale requests older than 15 seconds on initial tab load
-      if (reqAt > 0 && Math.abs(Date.now() - reqAt) > 15000) {
+      // Ignore stale requests older than 4 seconds on initial tab load
+      if (reqAt > 0 && Math.abs(Date.now() - reqAt) > 4000) {
         lastOpenChatReqId = reqId;
         return false;
       }
@@ -6404,6 +6460,7 @@
   window.__jetskiPollOpenChatRequest = pollOpenChatRequest;
   window.__jetskiStartOpenChatPoller = startOpenChatPoller;
   window.__jetskiStopOpenChatPoller = stopOpenChatPoller;
+  window.__jetskiCheckFilterScriptHotReload = checkFilterScriptHotReload;
 
   // Matryoshka chain star tooltip showing lazy piece turn counts and question previews
   let chainTooltipEl = null;
@@ -8681,9 +8738,10 @@
   async function fetchContextUsageOnce(cascadeId, offset) {
     if (typeof window.fetch !== 'function') return { ok: false, gm: [] };
     try {
-      const resp = await window.fetch(
-        '/exa.language_server_pb.LanguageServerService/GetCascadeTrajectoryGeneratorMetadata',
-        {
+      const url = resolveApiUrl(
+        '/exa.language_server_pb.LanguageServerService/GetCascadeTrajectoryGeneratorMetadata'
+      );
+      const resp = await window.fetch(url, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
