@@ -217,6 +217,19 @@ class ClWatcherCompanionTest(unittest.TestCase):
         "Companion thread resolved on CL 1409697",
     )
 
+    items["gerrit:1410416"]["ready_to_abandon"] = False
+    items["gerrit:1410416"]["ready_to_abandon_reason"] = ""
+    items["gerrit:1410416"]["cq_status"] = "CQ+1 running"
+    fake_thread_none = {}
+    with mock.patch.object(
+        w, "fetch_gerrit_companion_threads", return_value=fake_thread_none
+    ):
+      w.compute_companion_states(items, skia_dir="/nonexistent")
+    self.assertEqual(
+        items["gerrit:1410416"]["companion_status_note"],
+        "Stacked on PS2 · CQ+1 running · waiting on author",
+    )
+
   def test_multiple_companions_deduplication(self):
     items = {
         "gerrit:1409436": {
@@ -435,16 +448,32 @@ const parentCl = {
       item_key: 'gerrit:1410416', label: 'CL 1410416',
       url: 'https://skia-review.googlesource.com/c/1410416', patchset: 2,
       companion_duplicate: true, ready_to_abandon: true,
+      ready_to_abandon_reason: 'Duplicate companion',
       companion_status_note: 'Duplicate companion',
     },
     {
       item_key: 'gerrit:1410418', label: 'CL 1410418',
       url: 'https://skia-review.googlesource.com/c/1410418', patchset: 1,
       companion_duplicate: false, ready_to_abandon: true,
+      ready_to_abandon_reason: 'Ready to abandon',
       companion_status_note: 'Ready to abandon',
     },
   ],
 };
+const orphanComp = {
+  ...activeComp,
+  item_key: 'gerrit:999999',
+  target_id: '999999',
+  companion_to: 'gerrit:missing',
+};
+const visibleAll = visibleItemsFromData({
+  items: {
+    'gerrit:1409697': parentCl,
+    'gerrit:1410416': activeComp,
+    'gerrit:1410418': readyComp,
+    'gerrit:999999': orphanComp,
+  },
+});
 console.log(JSON.stringify({
   activeStatus: statusOf(activeComp),
   activeLane: laneOf(activeComp),
@@ -454,7 +483,11 @@ console.log(JSON.stringify({
   readyStatus: statusOf(readyComp),
   readyLane: laneOf(readyComp),
   readyCard: focusCard(readyComp, box),
+  parentStatus: statusOf(parentCl),
+  parentLane: laneOf(parentCl),
+  parentCard: focusCard(parentCl, box),
   parentBanner: companionsBannerHtml(parentCl),
+  visibleKeys: visibleAll.map(x => x.item_key),
 }));
 """
     proc = subprocess.run(
@@ -475,6 +508,12 @@ console.log(JSON.stringify({
     self.assertIn("Ready to abandon", out["readyCard"])
     self.assertIn("You approved CL 1409697 (PS3)", out["readyCard"])
     self.assertIn("🗑️ Abandon companion", out["readyCard"])
+
+    self.assertEqual(out["parentStatus"], "attention")
+    self.assertEqual(out["parentLane"], "you")
+    self.assertIn("Companion CL 1410416, CL 1410418 ready to abandon", out["parentCard"])
+    self.assertIn("🗑️ Abandon companions (2)", out["parentCard"])
+    self.assertEqual(out["visibleKeys"], ["gerrit:1409697", "gerrit:999999"])
 
     self.assertIn("⚠️ Duplicate", out["parentBanner"])
     self.assertIn("✅ Ready to abandon", out["parentBanner"])

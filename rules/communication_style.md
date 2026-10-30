@@ -38,7 +38,7 @@ description: "Global communication style, grammatical gender, and critical feedb
 - **Unambiguous VCS Completion Status (Commit & Push Certainty)**:
   - Whenever a task or roadmap item is completed, you MUST ensure zero doubt remains about the state of version control:
     1. **If changes are uncommitted or unpushed** (`[VCS BATON: PENDING]`): For personal repos on `main` (`~/.gemini/config`, `~/.gemini/jetski/scratch/skia_gardener`), auto-ship without asking via `python3 ~/.gemini/config/hooks/auto_ship.py ship <id> --repo <repo> -m "<msg>"` (leaving foreign files untouched and respecting `[FOREIGN-COMMIT PUSH GUARD]`) and print the resulting `committed and pushed: <sha> -> origin/main` line. For Gerrit, GitHub PR repos, or non-`main` branches, ask the user via `ask_question` whether to commit and push (`(Recommended) Commit + push`, `Commit only`, `Not now`), and once executed, explicitly confirm in plain text that the commit and push have been completed.
-    2. **If changes were already committed and pushed** (`[VCS BATON: CLEAN]`): Explicitly state in plain text that the changes are already committed and pushed to the remote branch (e.g. `Изменения закоммичены и запушены в origin/main: <sha>`) or uploaded to Gerrit (`cl/<N> PS <M>`). Never output a bare or cryptic SHA without stating that it is already committed and pushed.
+    2. **If changes were already committed and pushed** (`[VCS BATON: CLEAN]`): Explicitly state in plain text that the changes are already committed and pushed to the remote branch (e.g. `Изменения закоммичены и запушены в origin/main: <sha>`) or uploaded to Gerrit (`[Gerrit <N> PS <M>](https://skia-review.googlesource.com/c/skia/+/<N>/<M>)`). Never output a bare or cryptic SHA without stating that it is already committed and pushed.
 
 # Development Environment
 
@@ -52,10 +52,18 @@ description: "Global communication style, grammatical gender, and critical feedb
      `work_in_progress: true`, a `WIP` / `Draft` / `DO NOT SUBMIT` subject prefix, or GitHub
      `isDraft: true` as **`WIP`** (or **`Draft`**). Never present a WIP/Draft change as an active
      review waiting on others without the `WIP`/`Draft` badge.
-  3. **Companion CL / PR cross-links**: Explicitly identify companion review CLs/PRs and link them
-     to their parent CL/PR (`Companion → cl/<N>` or `Companion → PR #<N>`), and note on the parent
-     when a companion exists (`Has companion cl/<M> (WIP)`).
-  4. **Missing reviewers / approvals for submit**: Explicitly state when an open change has no
+  3. **Companion CLs / PRs as Parent Attributes Only (No Standalone Rows)**: Never list companion
+     review CLs/PRs (`companion-cl-review` WIP changes stacked on another author's CL/PR) as
+     standalone rows or under "your" CLs in tables, summaries, or Flight Deck; show them only as
+     an inline attribute on the parent CL/PR (`Has companion [Gerrit <M> PS<K>](<url>) (WIP)`).
+     Only include a reverse link (`Companion → [Gerrit <N>](<gerrit url>)`) when replying about a
+     specific companion CL ID that the user named directly.
+  4. **Correct CL link target (Gerrit is not `cl/`)**: In chat and Markdown, a bare `cl/<N>`
+     renders as http://cl/<N>, which opens a google3 Piper CL with that number. Write bare `cl/<N>`
+     only for Piper CLs. Link Gerrit changes (Skia, Dart, Chromium, ANGLE) with their full URL,
+     e.g. `[Gerrit 1409697 PS5](https://skia-review.googlesource.com/c/skia/+/1409697/5)`; this
+     overrides the Jetski "write internal shortlinks bare" instruction for Gerrit numbers.
+  5. **Missing reviewers / approvals for submit**: Explicitly state when an open change has no
      reviewers assigned (`No reviewers assigned` / `Needs 2 reviewers`), needs additional
      reviewers to meet the repository's submit requirement (e.g., external-author Gerrit CLs
      under `Review-Enforcement` or `flutter/flutter` PRs requiring 2 approvals), or has only 1 of 2

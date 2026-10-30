@@ -4759,12 +4759,16 @@ def compute_companion_states(
           r["phase"] = "NEEDS_YOUR_ACTION"
         else:
           r["companion_state"] = "active"
+        cq_st = str(r.get("cq_status") or "")
+        cq_part = f" · {cq_st}" if (cq_st and cq_st != "Idle") else ""
         if r.get("ready_to_abandon_reason"):
           r["companion_status_note"] = str(r["ready_to_abandon_reason"])
         elif r.get("companion_base_ps"):
           r["companion_status_note"] = (
-              f"Stacked on PS{r['companion_base_ps']} · waiting on author"
+              f"Stacked on PS{r['companion_base_ps']}{cq_part} · waiting on author"
           )
+        elif cq_part:
+          r["companion_status_note"] = f"{cq_st} · waiting on author"
         else:
           r["companion_status_note"] = "Waiting on author"
 
@@ -4900,12 +4904,19 @@ def sync_once(
       for d in active_discovered
       if d.get("fixes_breakage_from")
   }
+  open_companion_parents = {
+      str(d.get("companion_to"))
+      for d in active_discovered
+      if d.get("companion_to")
+      and str((fetched_cache.get(d["item_key"]) or {}).get("status") or "").upper()
+      in ("NEW", "OPEN")
+  }
   kept_active: list[dict[str, Any]] = []
   for d in active_discovered:
     ikey = d["item_key"]
     info = fetched_cache.get(ikey) or {}
     st = str(info.get("status") or "").upper()
-    # Filter completed merged changes that have no active chat or fix relationship
+    # Filter completed merged changes that have no active chat, companion, or fix relationship
     if st == "MERGED":
       ps = info.get("post_submit") or {}
       cid = str(d.get("conversation_id") or "")
@@ -4913,13 +4924,21 @@ def sync_once(
       has_active_chat = bool(cid and not is_arch)
       is_fix = bool(d.get("fixes_breakage_from"))
       has_fix = bool(ikey in fix_targets)
+      has_open_companion = bool(ikey in open_companion_parents)
       rolling = bool(not ps.get("all_passed") or ps.get("has_alert"))
       _, prev_d = _lookup_state_item(prev_items, ikey)
       just_merged = bool(
           prev_d and str(prev_d.get("status") or "").upper() != "MERGED"
       )
-      # Keep merged change if actively chatted, fixing/fixed, rolling, or newly merged
-      if not (has_active_chat or is_fix or has_fix or rolling or just_merged):
+      # Keep merged change if chatted, fixing/fixed, holding an open companion, rolling, or new
+      if not (
+          has_active_chat
+          or is_fix
+          or has_fix
+          or has_open_companion
+          or rolling
+          or just_merged
+      ):
         continue
     kept_active.append(d)
   active_discovered = kept_active
@@ -5894,6 +5913,36 @@ function isCompanion(it) {
   return Boolean(it.companion_to);
 }
 
+// Returns active companions on a parent item that are ready to abandon
+function readyCompanionsOf(it) {
+  const comps = Array.isArray(it && it.companions) ? it.companions : [];
+  return comps.filter(c =>
+    c && c.ready_to_abandon && c.status !== 'ABANDONED' && c.status !== 'CLOSED'
+  );
+}
+
+function hasReadyCompanion(it) {
+  return readyCompanionsOf(it).length > 0;
+}
+
+// Filters out standalone companion rows when their parent CL/PR is present in items
+function visibleItemsFromData(data) {
+  if (!data || !data.items) return [];
+  const raw = Object.values(data.items);
+  const parentKeys = new Set(
+    raw.filter(it => it && !isCompanion(it))
+      .map(it => it.item_key || `${it.kind || 'gerrit'}:${it.target_id}`)
+  );
+  return raw.filter(it => {
+    if (!it) return false;
+    if (!isCompanion(it)) return true;
+    // Abandoned or closed companions never render as standalone rows
+    if (it.status === 'ABANDONED' || it.status === 'CLOSED') return false;
+    // Keep open orphan companions visible only when the parent CL/PR is absent
+    return !parentKeys.has(String(it.companion_to || ''));
+  });
+}
+
 function badgesHtml(it, opts) {
   const out = [];
   const wip = wipLabel(it);
@@ -6194,7 +6243,9 @@ function isPostSubmitAlert(it) {
 function statusOf(it) {
   if (isAlert(it) || needsMyReply(it)) return 'attention';
   if (it.status === 'ABANDONED' || it.status === 'CLOSED') return 'abandoned';
-  // Open companions wait on the parent author unless marked ready to abandon
+  // Surface parent CLs in Needs You when an attached companion is ready to abandon
+  if (hasReadyCompanion(it)) return 'attention';
+  // Open orphan companions wait on the parent author unless marked ready to abandon
   if (isCompanion(it)) {
     return it.ready_to_abandon ? 'attention' : 'waiting';
   }
@@ -6696,7 +6747,7 @@ function reviewerFirstName(nameOrEmail) {
 // Builds a single ready-to-paste English ping message grouped by reason with PS diff URLs
 function buildReviewerPingMessage(reviewer, itemsOverride) {
   const sourceItems = itemsOverride ||
-    (typeof cachedData !== 'undefined' && cachedData ? Object.values(cachedData.items || {}) : []);
+    (typeof cachedData !== 'undefined' && cachedData ? visibleItemsFromData(cachedData) : []);
   const groups = collectReviewerPingGroups(sourceItems);
   const grp = groups.find(g => g.reviewer === reviewer);
   if (!grp) return '';
@@ -6806,8 +6857,7 @@ async function copyReviewerPing(reviewer, btn, customTextId) {
 
 function currentShownItems() {
   const data = typeof cachedData !== 'undefined' ? cachedData : null;
-  if (!data || !data.items) return [];
-  const all = Object.values(data.items);
+  const all = visibleItemsFromData(data);
   const projOf = it => it.project_name || 'Unassigned';
   const sel = typeof selectedProject !== 'undefined' ? selectedProject : 'ALL';
   return all.filter(it => sel === 'ALL' || projOf(it) === sel);
@@ -7080,6 +7130,18 @@ function focusCard(it, data) {
     why = `<b>Ready to abandon</b>: ${reason} · ${formatStatusTime(it)}`;
     actions = abandonActionHtml([it.item_key], '🗑️ Abandon companion', 'btn primary') +
       link(it.url, `Open ${kindWord}`, 'btn secondary') + chatBtn;
+  } else if (hasReadyCompanion(it) && !needsMyReply(it) && !canRebase(it)) {
+    const readyComps = readyCompanionsOf(it);
+    const readyKeys = readyComps.map(c => c.item_key).filter(Boolean);
+    const firstReason = esc(readyComps[0].ready_to_abandon_reason || 'Review complete');
+    const compLabels = readyComps.map(c => esc(c.label || c.item_key)).join(', ');
+    why = `<b>Companion ${compLabels} ready to abandon</b>: ${firstReason} · ` +
+      formatStatusTime(it);
+    const btnLbl = readyKeys.length > 1
+      ? `🗑️ Abandon companions (${readyKeys.length})`
+      : `🗑️ Abandon ${readyComps[0].label || 'companion'}`;
+    actions = abandonActionHtml(readyKeys, btnLbl, 'btn primary') +
+      link(it.url, `Open ${kindWord}`, 'btn secondary') + chatBtn;
   } else if (canRebase(it)) {
     const redConflict = `<span class="red">${conflictNote}</span>`;
     // Keep failure and comment links alongside conflict note so CQ red never masks conflict
@@ -7184,7 +7246,7 @@ function setProject(p) {
 function render() {
   const data = cachedData;
   if (!data) return;
-  const all = Object.values(data.items || {})
+  const all = visibleItemsFromData(data)
     .sort((a, b) => (b.activity_ts || 0) - (a.activity_ts || 0));
   const projects = projectsOf(all);
   if (selectedProject !== 'ALL' && !projects.includes(selectedProject)) selectedProject = 'ALL';
