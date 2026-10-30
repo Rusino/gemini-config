@@ -15,20 +15,31 @@ and **Flutter** (GitHub via `gh api`), filtering out bots and autorollers.
 
 Trigger this skill whenever the user asks:
 - "Кто из моих коллег сейчас работает?" / "Кто сейчас активен?" / "Кто на месте?"
-- "Посмотри активность в Скии и Флаттере" / "Кто коммитит / пушит?"
-- "Who is active right now?" / "Check colleague activity"
+- "Посмотри активность в Скии и Флаттере" / "Кто коммитит / пушит?" / "Коллеги"
+- "Who is active right now?" / "Check colleague activity" / "/colleague-activity"
 
 ## Quick CLI Usage
 
+A global executable symlink `colleagues` is available in `~/.gemini/jetski/bin` and `~/.local/bin`:
+
 ```bash
 # Scan both Skia and Flutter for the last 12 hours (default timezone: America/New_York)
-python3 ~/.gemini/config/skills/colleague-activity/scripts/scan_activity.py
+colleagues
 
-# Custom lookback window (e.g. 6 hours)
-python3 ~/.gemini/config/skills/colleague-activity/scripts/scan_activity.py --hours 6
+# Custom lookback window (e.g. 3 hours)
+colleagues --hours 3
+
+# Filter to Skia Gerrit or Flutter GitHub only
+colleagues --skia-only
+colleagues --flutter-only
 
 # JSON output for structured inspection
-python3 ~/.gemini/config/skills/colleague-activity/scripts/scan_activity.py --json
+colleagues --json
+```
+
+Direct script invocation:
+```bash
+python3 ~/.gemini/config/skills/colleague-activity/scripts/scan_activity.py --hours 3
 ```
 
 ## How to Present Results to the User

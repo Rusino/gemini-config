@@ -13,13 +13,15 @@ from zoneinfo import ZoneInfo
 
 BOT_MARKERS = (
     "gserviceaccount", "autoroll", "copybara", "skia-recreate", "[bot]",
-    "exitgate", "fluttergithubbot", "engine-flutter-autoroll", "dependabot",
-    "flutter-dashboard", "auto-submit", "roller",
+    "exitgate", "fluttergithubbot", "flutteractionsbot", "engine-flutter-autoroll",
+    "dependabot", "flutter-dashboard", "auto-submit", "roller",
 )
 
 
 def is_bot(name: str) -> bool:
     low = name.lower()
+    if low.endswith("bot") or low.endswith("-agent") or low.endswith("[bot]"):
+        return True
     return any(marker in low for marker in BOT_MARKERS)
 
 
