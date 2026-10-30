@@ -1377,6 +1377,50 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(fallbackStars.style.top, '50%');
   assert.strictEqual(fallbackStars.style.transform, 'translateY(-50%)');
 
+  // 6. Remount convoNavEl and verify sync removes fallback stars
+  convoRailSlot.appendChild(convoNavEl);
+  await window.__jetskiChainNav.syncConversationChainNavigators();
+  assert.strictEqual(convoRailSlot.querySelector('.jetski-chain-stars-fallback'), null);
+
+  // 7. Switch to standalone chat (chain.length === 1): all stars removed and sig cleared
+  convoViewEl.setAttribute('data-cascade-id', 'solo-active');
+  const syncPromise = window.__jetskiChainNav.syncConversationChainNavigators();
+  // Verify synchronous purge ran immediately before await chainOf resolves
+  assert.strictEqual(
+    convoNavEl.querySelector('[data-testid="jetski-chain-stars-before"]'),
+    null,
+    'Stale stars must be purged synchronously on chat switch before await'
+  );
+  await syncPromise;
+  assert.strictEqual(
+    convoNavEl.querySelector('[data-testid="jetski-chain-stars-before"]'),
+    null,
+    'Stars before group must remain removed on single-piece chat'
+  );
+  assert.strictEqual(
+    convoNavEl.querySelector('[data-testid="jetski-chain-stars-after"]'),
+    null,
+    'Stars after group must remain removed on single-piece chat'
+  );
+  assert.strictEqual(
+    convoRailSlot.querySelector('.jetski-chain-stars-fallback'),
+    null
+  );
+  assert.strictEqual(
+    convoNavEl.getAttribute('data-jetski-chain-sig'),
+    null,
+    'nav sig must be cleared on single-piece chat'
+  );
+
+  // 8. Switch back to chain piece: stars re-mount cleanly on the same nav instance
+  convoViewEl.setAttribute('data-cascade-id', 'open-current');
+  await window.__jetskiChainNav.syncConversationChainNavigators();
+  const remountedStarsBefore = convoNavEl.querySelector(
+    '[data-testid="jetski-chain-stars-before"]'
+  );
+  assert(remountedStarsBefore, 'Stars before group must remount on return to chain');
+  assert.strictEqual(remountedStarsBefore.children.length, 3);
+
   // A fresh handoff redirect moves a background split pane off the just-archived chat onto
   // its successor without taking focus from the pane the user works in
   {
@@ -1740,6 +1784,14 @@ const liveBucketBtn = (k) =>
   assert(
     styleEl.textContent.includes('border-radius: 0;'),
     'Style must format inbox as flat architectural hairline section'
+  );
+  assert(
+    styleEl.textContent.includes('flex-shrink: 0;'),
+    'Style must prevent flex compression of chain stars group'
+  );
+  assert(
+    styleEl.textContent.includes('ol[data-fade="top"]'),
+    'Style must reserve scroll button clearance when rail fades'
   );
   // Clear running agent from earlier sidebar-row tests so inbox starts in a clean 0-item state
   reduxStore.dispatch({

@@ -4246,10 +4246,24 @@
         align-items: center;
         justify-content: center;
         gap: 2px;
+        flex-shrink: 0;
         pointer-events: auto;
         /* Remain visible when narrow-pane responsive rules apply invisible to nav */
         visibility: visible;
         z-index: 15;
+      }
+      /* Reserve vertical clearance for RailScrollButton (h-3.5) when turn list overflows */
+      [data-testid="conversation-navigator"]:has(ol[data-fade="top"])
+        .jetski-chain-stars-before,
+      [data-testid="conversation-navigator"]:has(ol[data-fade="both"])
+        .jetski-chain-stars-before {
+        margin-bottom: 14px;
+      }
+      [data-testid="conversation-navigator"]:has(ol[data-fade="bottom"])
+        .jetski-chain-stars-after,
+      [data-testid="conversation-navigator"]:has(ol[data-fade="both"])
+        .jetski-chain-stars-after {
+        margin-top: 14px;
       }
       .jetski-chain-stars-before::after,
       .jetski-chain-stars-after::before {
@@ -6590,6 +6604,24 @@
       const cid = convoViewEl.getAttribute('data-cascade-id');
       if (!cid) continue;
 
+      // Synchronously purge stale stars or fallback before awaiting chain resolution
+      const navPre = convoViewEl.querySelector('[data-testid="conversation-navigator"]');
+      const navSigPre = navPre?.getAttribute('data-jetski-chain-sig') || '';
+      if (navPre && navSigPre && !navSigPre.endsWith(`@${cid}`)) {
+        navPre.querySelector(`[data-testid="${CHAIN_STARS_BEFORE_TEST_ID}"]`)?.remove();
+        navPre.querySelector(`[data-testid="${CHAIN_STARS_AFTER_TEST_ID}"]`)?.remove();
+        navPre.removeAttribute('data-jetski-chain-sig');
+        hideChainStarTooltip();
+      }
+      const fallbackPre = convoViewEl.querySelector('.jetski-chain-stars-fallback');
+      if (
+        fallbackPre &&
+        (navPre || !(fallbackPre.getAttribute('data-jetski-chain-sig') || '').endsWith(`@${cid}`))
+      ) {
+        fallbackPre.remove();
+        hideChainStarTooltip();
+      }
+
       // A view whose chat just turned archived drops the 5s cache, so the redirect written
       // right before the archive is read now rather than after the window ends
       if (isArchivedCascadeId(cid) && !observedArchivedViewIds.has(cid)) {
@@ -6613,10 +6645,18 @@
       syncConversationPieceLock(convoViewEl, cid, chain);
 
       if (chain.length <= 1) {
-        convoViewEl.querySelector(`[data-testid="${CHAIN_STARS_BEFORE_TEST_ID}"]`)?.remove();
-        convoViewEl.querySelector(`[data-testid="${CHAIN_STARS_AFTER_TEST_ID}"]`)?.remove();
-        convoViewEl.querySelector('.jetski-chain-stars-fallback')?.remove();
+        for (const el of convoViewEl.querySelectorAll(
+          `[data-testid="${CHAIN_STARS_BEFORE_TEST_ID}"], ` +
+            `[data-testid="${CHAIN_STARS_AFTER_TEST_ID}"], ` +
+            '.jetski-chain-stars-fallback'
+        )) {
+          el.remove();
+        }
+        convoViewEl
+          .querySelector('[data-testid="conversation-navigator"]')
+          ?.removeAttribute('data-jetski-chain-sig');
         convoViewEl.removeAttribute('data-jetski-chain-sig');
+        hideChainStarTooltip();
         continue;
       }
 
@@ -8680,6 +8720,8 @@
     observer.observe(document.documentElement, {
       childList: true,
       subtree: true,
+      attributes: true,
+      attributeFilter: ['data-cascade-id'],
     });
   }
 
