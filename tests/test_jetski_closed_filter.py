@@ -5181,6 +5181,8 @@ vlistEl.appendChild(chatRow);
 const fetchCalls = [];
 let navigatedUrl = null;
 let navState = null;
+const storageMap = new Map();
+let openChatPayload = null;
 
 global.requestAnimationFrame = (cb) => cb();
 global.window = {
@@ -5207,11 +5209,14 @@ global.window = {
     if (String(url).includes('jetski-chains.json')) {
       return { ok: true, json: async () => ({ parentOf: {}, createdAt: {}, redirects: {} }) };
     }
+    if (String(url).includes('jetski-open-chat.json')) {
+      return { ok: Boolean(openChatPayload), json: async () => openChatPayload || {} };
+    }
     return { ok: true, json: async () => ({}) };
   },
   localStorage: {
-    getItem: () => null,
-    setItem: () => {},
+    getItem: (k) => storageMap.get(k) || null,
+    setItem: (k, v) => storageMap.set(k, String(v)),
   },
   dispatchEvent: () => {},
   addEventListener: () => {},
@@ -5273,10 +5278,39 @@ eval(code);
     'Must navigate to /c/chat-cross-1?section=proj-other'
   );
 
+  // Non-convo box routes preserve the /box/<host>/c/ prefix
+  window.location.pathname = '/box/jlavrova-for-jetski.c.googlers.com:10023/automations';
+  window.__jetskiOpenConversation('chat-cross-1');
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  assert.strictEqual(
+    navigatedUrl,
+    '/box/jlavrova-for-jetski.c.googlers.com:10023/c/chat-cross-1?section=proj-other',
+    'Must preserve box route prefix when navigating from non-convo route'
+  );
+
+  // pollOpenChatRequest includes csrf token, deduplicates in storage, and navigates
+  openChatPayload = {
+    requestId: 'req-open-999',
+    cascadeId: 'chat-cross-1',
+    requestedAt: Date.now(),
+  };
+  const handled = await window.__jetskiPollOpenChatRequest();
+  assert.strictEqual(handled, true, 'pollOpenChatRequest must handle fresh request');
+  const openChatCall = fetchCalls.find((c) => c.url.includes('jetski-open-chat.json'));
+  assert(openChatCall, 'Must fetch jetski-open-chat.json');
+  assert(openChatCall.url.includes('csrf=test-csrf'), 'Fetch must include csrf query parameter');
+  assert.strictEqual(storageMap.get('ag:claimedOpenChatReqId'), 'req-open-999');
+
+  const secondHandled = await window.__jetskiPollOpenChatRequest();
+  assert.strictEqual(secondHandled, false, 'Duplicate requestId must be skipped');
+
   const unarchiveCall = fetchCalls.find((c) => c.url.includes('/UpdateProject'));
   assert(unarchiveCall, 'Must call UpdateProject RPC to unarchive proj-other');
   assert.strictEqual(unarchiveCall.body?.project?.id, 'proj-other');
   assert.strictEqual(unarchiveCall.body?.project?.archived, false);
+
+  assert.strictEqual(typeof window.__jetskiStartOpenChatPoller, 'function');
+  assert.strictEqual(typeof window.__jetskiStopOpenChatPoller, 'function');
 
   window.__jetskiClosedChatsFilterCleanup?.();
   console.log('ALL_CROSS_PROJECT_TESTS_PASSED');

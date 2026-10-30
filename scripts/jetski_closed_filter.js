@@ -5609,7 +5609,8 @@
     const preserveFocus = Boolean(options?.preserveFocus);
     const path = window.location?.pathname || '';
     const m = /^(.*\/(?:c|cascade|conversation)\/)([^/?#]+)(.*)$/.exec(path);
-    const routePrefix = m ? m[1] : '/c/';
+    const boxMatch = !m ? /^(\/box\/[^/]+)(?:\/|$)/.exec(path) : null;
+    const routePrefix = m ? m[1] : boxMatch ? `${boxMatch[1]}/c/` : '/c/';
     const routeSuffix = m ? m[3] : '';
     // Extract active conversation IDs from URL pathname, handling split-view '+' separators
     let rawIds = [];
@@ -6250,16 +6251,32 @@
 
   let lastOpenChatReqId = '';
   let openChatPollTimer = 0;
+  let openChatPollWorker = null;
+  let openChatPollWorkerUrl = '';
   let openChatPollingInFlight = false;
+  const OPEN_CHAT_TAB_ID = `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  // Marks this browser tab as the active Jetski tab when focused or visible
+  function markThisJetskiTabActive() {
+    try {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        window.localStorage?.setItem('ag:activeJetskiTabId', OPEN_CHAT_TAB_ID);
+      }
+    } catch {
+      // Ignore storage access errors in restricted iframe contexts
+    }
+  }
 
   // Polls /static/artifacts/jetski-open-chat.json so Flight Deck can navigate an existing tab
   async function pollOpenChatRequest() {
     if (disposed || openChatPollingInFlight || typeof window.fetch !== 'function') return false;
     openChatPollingInFlight = true;
     try {
-      const resp = await window.fetch('/static/artifacts/jetski-open-chat.json?t=' + Date.now(), {
-        cache: 'no-store',
-      });
+      const csrf = encodeURIComponent(getCsrfToken());
+      const resp = await window.fetch(
+        `/static/artifacts/jetski-open-chat.json?t=${Date.now()}&csrf=${csrf}`,
+        { cache: 'no-store' }
+      );
       if (!resp || !resp.ok) return false;
       const data = await resp.json();
       const reqId = typeof data?.requestId === 'string' ? data.requestId : '';
@@ -6271,17 +6288,45 @@
         lastOpenChatReqId = reqId;
         return false;
       }
+      // Check if another Jetski tab already claimed and processed this open-chat request
+      try {
+        if (window.localStorage?.getItem('ag:claimedOpenChatReqId') === reqId) {
+          lastOpenChatReqId = reqId;
+          return false;
+        }
+      } catch {
+        // Fall back to per-tab handling if localStorage access fails
+      }
+      // Give the visible foreground tab priority when multiple tabs are open
+      const isVisible = typeof document !== 'undefined' && document.visibilityState === 'visible';
+      let activeTabId = '';
+      try {
+        activeTabId = window.localStorage?.getItem('ag:activeJetskiTabId') || '';
+      } catch {}
+      if (!isVisible && activeTabId && activeTabId !== OPEN_CHAT_TAB_ID) {
+        // Defer claiming if a fresh request arrived within the last 400ms
+        if (reqAt > 0 && Date.now() - reqAt < 400) {
+          return false;
+        }
+      }
+      // Claim request in localStorage so sibling tabs do not perform duplicate navigation
+      try {
+        window.localStorage?.setItem('ag:claimedOpenChatReqId', reqId);
+        window.localStorage?.setItem('ag:activeJetskiTabId', OPEN_CHAT_TAB_ID);
+      } catch {}
       lastOpenChatReqId = reqId;
       manualVisitedCids.add(cid);
+      // Fire RPC acknowledgment immediately so Flight Deck detects the modified .pbtxt fast
+      const ackPromise = postUpdateAnnotationsRpc(cid, {
+        lastUserViewTime: new Date().toISOString(),
+      });
       openConversation(cid);
       try {
         window.focus?.();
       } catch {
         // Ignore window.focus failures in restricted browsing contexts
       }
-      await postUpdateAnnotationsRpc(cid, {
-        lastUserViewTime: new Date().toISOString(),
-      });
+      await ackPromise;
       return true;
     } catch {
       return false;
@@ -6290,7 +6335,75 @@
     }
   }
 
+  // Starts polling via Web Worker to prevent Chrome background tab timer throttling
+  function startOpenChatPoller() {
+    markThisJetskiTabActive();
+    if (openChatPollWorker || openChatPollTimer) return;
+    try {
+      if (
+        typeof window.Worker === 'function' &&
+        typeof window.Blob === 'function' &&
+        typeof window.URL?.createObjectURL === 'function'
+      ) {
+        const workerCode = 'setInterval(function(){ postMessage(1); }, 250);';
+        const blob = new window.Blob([workerCode], { type: 'application/javascript' });
+        openChatPollWorkerUrl = window.URL.createObjectURL(blob);
+        const worker = new window.Worker(openChatPollWorkerUrl);
+        worker.onmessage = () => {
+          void pollOpenChatRequest();
+        };
+        worker.onerror = () => {
+          // Fall back to main-thread interval if Web Worker execution is blocked
+          try {
+            worker.terminate();
+          } catch {}
+          openChatPollWorker = null;
+          if (!openChatPollTimer && !disposed) {
+            openChatPollTimer = setInterval(() => {
+              void pollOpenChatRequest();
+            }, 250);
+            if (openChatPollTimer && typeof openChatPollTimer.unref === 'function') {
+              openChatPollTimer.unref();
+            }
+          }
+        };
+        openChatPollWorker = worker;
+        return;
+      }
+    } catch {
+      // Fall back to standard setInterval when Worker/Blob creation is disallowed
+    }
+    openChatPollTimer = setInterval(() => {
+      void pollOpenChatRequest();
+    }, 250);
+    if (openChatPollTimer && typeof openChatPollTimer.unref === 'function') {
+      openChatPollTimer.unref();
+    }
+  }
+
+  // Stops the open-chat poller worker and timer
+  function stopOpenChatPoller() {
+    if (openChatPollWorker) {
+      try {
+        openChatPollWorker.terminate();
+      } catch {}
+      openChatPollWorker = null;
+    }
+    if (openChatPollWorkerUrl) {
+      try {
+        window.URL?.revokeObjectURL(openChatPollWorkerUrl);
+      } catch {}
+      openChatPollWorkerUrl = '';
+    }
+    if (openChatPollTimer) {
+      clearInterval(openChatPollTimer);
+      openChatPollTimer = 0;
+    }
+  }
+
   window.__jetskiPollOpenChatRequest = pollOpenChatRequest;
+  window.__jetskiStartOpenChatPoller = startOpenChatPoller;
+  window.__jetskiStopOpenChatPoller = stopOpenChatPoller;
 
   // Matryoshka chain star tooltip showing lazy piece turn counts and question previews
   let chainTooltipEl = null;
@@ -9241,10 +9354,9 @@
       clearTimeout(autopilotToastTimer);
       autopilotToastTimer = 0;
     }
-    if (openChatPollTimer) {
-      clearInterval(openChatPollTimer);
-      openChatPollTimer = 0;
-    }
+    stopOpenChatPoller();
+    window.removeEventListener?.('focus', markThisJetskiTabActive);
+    document.removeEventListener?.('visibilitychange', markThisJetskiTabActive);
     manualPickedModels.clear();
     autoSeededTargets.clear();
     // Remove all injected filter buttons, search panels, and chain stars on reload
@@ -9320,10 +9432,7 @@
 
   bindInputBoxSeenListeners();
   runFullSync();
-  openChatPollTimer = setInterval(() => {
-    void pollOpenChatRequest();
-  }, 250);
-  if (openChatPollTimer && typeof openChatPollTimer.unref === 'function') {
-    openChatPollTimer.unref();
-  }
+  window.addEventListener?.('focus', markThisJetskiTabActive);
+  document.addEventListener?.('visibilitychange', markThisJetskiTabActive);
+  startOpenChatPoller();
 })();

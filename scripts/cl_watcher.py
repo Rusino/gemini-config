@@ -4086,7 +4086,7 @@ def start_chat_for_item(item_key: str) -> dict[str, Any]:
 
 
 def request_open_in_existing_tab(
-    conv_id: str, timeout_sec: float = 0.85
+    conv_id: str, timeout_sec: float = 1.8
 ) -> bool:
   """Asks an open Jetski Web tab to navigate in-place to `conv_id` and waits for ack."""
   cid = str(conv_id or "").strip()
@@ -4136,7 +4136,7 @@ def request_open_in_existing_tab(
 
 
 def open_chat_for_id(
-    conv_id: str, timeout_sec: float = 0.85
+    conv_id: str, timeout_sec: float = 1.8
 ) -> dict[str, Any]:
   """Handles `/api/open_chat` by routing in-place when an open Jetski tab acknowledges."""
   cid = str(conv_id or "").strip()
@@ -7352,6 +7352,8 @@ async function openChat(convId, url, ev) {
     if (ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.button === 1) return true;
     if (typeof ev.preventDefault === 'function') ev.preventDefault();
   }
+  const btn = ev && (ev.currentTarget || ev.target) ? (ev.currentTarget || ev.target) : null;
+  const origText = btn ? btn.textContent : '';
   if (convId && typeof fetch === 'function') {
     try {
       const resp = await fetch('/api/open_chat', {
@@ -7360,7 +7362,17 @@ async function openChat(convId, url, ev) {
         body: JSON.stringify({conversation_id: convId}),
       });
       const res = await resp.json();
-      if (res && res.ok && res.reused_tab) return false;
+      if (res && res.ok && res.reused_tab) {
+        if (btn) {
+          btn.textContent = '✓ Opened in Jetski';
+          setTimeout(() => {
+            if (btn && btn.textContent === '✓ Opened in Jetski') {
+              btn.textContent = origText;
+            }
+          }, 1400);
+        }
+        return false;
+      }
     } catch (e) {
       // Fall back to named window navigation when local server is unreachable
     }

@@ -752,10 +752,40 @@ const item = {
   conversation_id: 'c-789',
   chat_archived: false,
 };
-console.log(JSON.stringify({
-  actionHtml: chatActionHtml(item, {jetski_box_url: 'https://jetski.test'}, false),
-  compactHtml: chatActionHtml(item, {jetski_box_url: 'https://jetski.test'}, true),
-}));
+(async () => {
+  const btn = { textContent: 'Open chat' };
+  let openedUrl = '';
+  let openedTarget = '';
+  global.window = {
+    open: (u, t) => { openedUrl = u; openedTarget = t; },
+  };
+  global.setTimeout = (fn) => fn();
+  global.fetch = async () => ({
+    json: async () => ({ ok: true, reused_tab: true }),
+  });
+  const reusedRes = await openChat('c-789', 'https://jetski.test/c/c-789', {
+    currentTarget: btn,
+    preventDefault: () => {},
+  });
+
+  let fallbackOpenedUrl = '';
+  global.fetch = async () => ({
+    json: async () => ({ ok: true, reused_tab: false }),
+  });
+  global.window.open = (u, t) => { fallbackOpenedUrl = u; };
+  const fallbackRes = await openChat('c-789', 'https://jetski.test/c/c-789', {
+    preventDefault: () => {},
+  });
+
+  console.log(JSON.stringify({
+    actionHtml: chatActionHtml(item, {jetski_box_url: 'https://jetski.test'}, false),
+    compactHtml: chatActionHtml(item, {jetski_box_url: 'https://jetski.test'}, true),
+    reusedRes,
+    reusedBtnText: btn.textContent,
+    openedUrl,
+    fallbackOpenedUrl,
+  }));
+})();
 """
     proc = subprocess.run(
         ["node", "-e", harness], capture_output=True, text=True, check=True
@@ -765,6 +795,16 @@ console.log(JSON.stringify({
     self.assertIn("openChat(", out["actionHtml"])
     self.assertIn("c-789", out["actionHtml"])
     self.assertIn('target="jetski-chat"', out["compactHtml"])
+    self.assertFalse(out["reusedRes"])
+    self.assertEqual(out["openedUrl"], "")
+    self.assertEqual(out["fallbackOpenedUrl"], "https://jetski.test/c/c-789")
+
+    # Verify 1.8s default timeout on both backend open_chat helpers
+    import inspect
+    sig_req = inspect.signature(w.request_open_in_existing_tab)
+    self.assertEqual(sig_req.parameters["timeout_sec"].default, 1.8)
+    sig_open = inspect.signature(w.open_chat_for_id)
+    self.assertEqual(sig_open.parameters["timeout_sec"].default, 1.8)
 
 
 if __name__ == "__main__":
