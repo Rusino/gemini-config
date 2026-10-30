@@ -41,8 +41,9 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
        a `/PATCHSET_LEVEL` draft with `unresolved: true` for the user to publish with
        `Code-Review+1`. Run Canary-G3 immediately after the user publishes the approval and hold
        comment.
-     - Other canaries (`Canary-Flutter`, `Canary-Chromium`, `Canary-Android`) have no such
-       restriction and are triggered immediately.
+     - Other canaries (`Canary-Chromium`, `Canary-Android`) have no such restriction and are
+       triggered immediately. `Canary-Flutter` is disabled (see below): run the full local
+       Flutter corpus instead.
    - **Internal Authors / Own CLs**: Show the printed `Canary Command` for canaries and run it
      ONLY after the user explicitly approves. (For ASAN, you still run it automatically).
 5. **Background Monitoring & Wakeup Protocol**:
@@ -141,6 +142,11 @@ When a Skia diff touches `include/private/chromium/`, `src/text/gpu/SkChromeRemo
    git -C /usr/local/google/home/jlavrova/chromium/src/third_party/skia checkout -- .
    ```
 
-## Health fallback
+## Canary-Flutter is disabled
 
-If `Canary-Flutter` has no SUCCESS/FAILURE in 45 days, the script replaces it with local `flutter-test-paragraph-engine` + Canary-G3.
+Never trigger `Canary-Flutter` (R38: it runs but gives no verdict, every run ends in
+`INFRA_FAILURE` at the 3h timeout). `canary_advisor.py` lists it in `DISABLED_CANARIES` and
+recommends the full local Flutter corpus instead:
+`python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py --full`
+(see `flutter-test-paragraph-engine`). Remove the entry only after the bot gives real
+SUCCESS/FAILURE results again.

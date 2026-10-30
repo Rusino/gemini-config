@@ -136,8 +136,9 @@ For surviving Skia CLs in `🔴 SURGICAL AUDIT` or `🟠 PUSHBACK`, run
 [`skia-canary-advisor`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/skia-canary-advisor/SKILL.md)
 (`canary_advisor.py advise --cl <N>`). Run ASAN automatically.
 
-- **External Authors**: Trigger non-G3 canaries (`Canary-Flutter`, `Canary-Chromium`,
-  `Canary-Android`) automatically. For `Canary-G3`, it requires a Googler author or Googler
+- **External Authors**: Trigger non-G3 canaries (`Canary-Chromium`, `Canary-Android`)
+  automatically. Never trigger `Canary-Flutter` (disabled, R38); run the full local Flutter corpus
+  (`run_flutter_paragraph_tests.py --full`) instead. For `Canary-G3`, it requires a Googler author or Googler
   `Code-Review+1` (`g3_canary.go:134`). Follow the **External Author Canary-G3 Submit-Hold Protocol**:
   when approving, draft the `/PATCHSET_LEVEL` comment with `unresolved: True` holding the submit
   until Canary-G3 passes. Run Canary-G3 immediately after the user publishes CR+1. If Canary-G3 fails,

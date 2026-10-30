@@ -118,13 +118,14 @@ class TestCanaryAdvisor(unittest.TestCase):
 
     out = buf.getvalue()
     self.assertIn("AGENT ACTION (execute this command):", out)
-    self.assertIn("Canary-Flutter", out)
+    self.assertIn("Canary-Flutter is disabled", out)
     self.assertIn("NativeFonts_FreeType_ASAN_Upload", out)
     # Canary-G3 must NOT be in the immediate AGENT ACTION
     agent_action_line = [
         line for line in out.splitlines() if line.strip().startswith("git cl try")
     ][0]
     self.assertNotIn("Canary-G3", agent_action_line)
+    self.assertNotIn("Canary-Flutter", agent_action_line)
     self.assertIn("Canary-G3 requires a Googler author or Googler Code-Review+1", out)
     self.assertIn("Canary-G3 Command (run after Googler Code-Review+1 approval):", out)
     self.assertIn("follow submit-hold protocol", out)
@@ -172,7 +173,8 @@ class TestCanaryAdvisor(unittest.TestCase):
         line for line in out.splitlines() if line.strip().startswith("git cl try")
     ][0]
     self.assertIn("Canary-G3", agent_action_line)
-    self.assertIn("Canary-Flutter", agent_action_line)
+    self.assertNotIn("Canary-Flutter", agent_action_line)
+    self.assertIn("run_flutter_paragraph_tests.py --full", out)
     self.assertIn("NativeFonts_FreeType_ASAN_Upload", agent_action_line)
     self.assertNotIn("deferred until a Googler votes Code-Review+1", out)
 

@@ -37,6 +37,14 @@ GARDENER_DIR = os.path.expanduser("~/.gemini/jetski/scratch/skia_gardener")
 GOOGLE3_DIR = "/google/src/head/depot/google3"
 HEALTH_WINDOW_DAYS = 45
 
+# Canaries that must never be triggered: they run but give no verdict. Remove an entry only after
+# the bot produces real SUCCESS/FAILURE results again
+DISABLED_CANARIES = {
+    "Canary-Flutter": "R38: every run since 2026-08 ends in INFRA_FAILURE at the 3h timeout",
+}
+FLUTTER_FULL_CORPUS = ("python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/"
+                       "run_flutter_paragraph_tests.py --full")
+
 # Client-side files that define SK_* macros; a removed guard is only dangerous if a client still
 # defines it. google3 has no single config file, so it is delegated to the agent via code_search
 CLIENT_DEFINE_FILES = {
@@ -355,14 +363,18 @@ def advise(args):
 
     health = {c: canary_health(c) for c in recs} if not args.no_health else {}
     notes = []
-    if "Canary-Flutter" in recs and health.get("Canary-Flutter", {}).get("healthy") is False:
+    flutter_disabled = "Canary-Flutter" in DISABLED_CANARIES
+    if "Canary-Flutter" in recs and (
+            flutter_disabled or health.get("Canary-Flutter", {}).get("healthy") is False):
         flutter = recs.pop("Canary-Flutter")
-        notes.append(
-            "Canary-Flutter has produced no SUCCESS/FAILURE verdict in the last "
-            f"{HEALTH_WINDOW_DAYS} days ({health['Canary-Flutter']['counts']}); substituting "
-            "local `flutter-test-paragraph-engine` + Canary-G3")
-        add("Canary-G3", flutter["tier"], "substitute for unhealthy Canary-Flutter")
-        recs["LOCAL flutter-test-paragraph-engine"] = {
+        if flutter_disabled:
+            why = f"Canary-Flutter is disabled ({DISABLED_CANARIES['Canary-Flutter']})"
+        else:
+            why = ("Canary-Flutter has produced no SUCCESS/FAILURE verdict in the last "
+                   f"{HEALTH_WINDOW_DAYS} days ({health['Canary-Flutter']['counts']})")
+        notes.append(f"{why}; never trigger it. Run the full local Flutter corpus instead: "
+                     f"`{FLUTTER_FULL_CORPUS}`")
+        recs["LOCAL flutter-test-paragraph-engine --full"] = {
             "tier": flutter["tier"], "reasons": {r: p for r, p in flutter["reasons"].items()}}
     for c, h in health.items():
         if c in recs and not h["healthy"] and c != "Canary-Flutter":
