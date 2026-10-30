@@ -49,7 +49,12 @@ python3 ~/.gemini/config/skills/colleague-activity/scripts/scan_activity.py --ho
    - State times in user local time (**ET first**, with relative age e.g. `20:25 ET (3m ago)`).
    - Show the specific CL or PR subject and action.
 
-2. **Domain Grouping (Text / Web / Paragraph vs Core / Engine vs Tooling)**:
+2. **Mandatory Titles for PRs, Issues, and CLs (Never Bare Numbers)**:
+   - Whenever mentioning, summarizing, or listing PR, Issue, or CL numbers, **always** include their descriptive title or subject next to the number.
+   - Examples: `PR #194670 (Add PlatformDispatcher.onAlwaysUse24HourFormatChanged)` or `[Gerrit 1404676](...) ([rust jpeg] Support scaled decoding)`.
+   - Never output bare numbers (e.g. `PR #194347` or `CL 1404676`) without their title or domain context.
+
+3. **Domain Grouping (Text / Web / Paragraph vs Core / Engine vs Tooling)**:
    - Group colleagues into:
      - **Text / Web / Paragraph**: `dbebawy`, `mdebbar`, `harryterkelsen`, `YeungKC`,
        `wselna123`, `LongCatIsLooong`, `jlavrova`, etc.
@@ -59,7 +64,8 @@ python3 ~/.gemini/config/skills/colleague-activity/scripts/scan_activity.py --ho
        `chunhtai`, `victorsanni`, `Renzo-Olivares`, `kevmoo`, etc.
      - **Infra & Devicelab**: `smolkaj`, `borenet`, `kentnguyen99`, `davidsegovia`, etc.
 
-3. **Disclosures & Limitations**:
-   - Gerrit captures uploaded patchsets, comments, and reviews; local unpushed commits
-     are invisible.
-   - GitHub tracks PR updates, review comments, issue comments, and merged commits.
+4. **Data Sources & Scope**:
+   - **Skia Gerrit**: Captures uploaded patchsets, comments, votes, and reviews across `skia` and subprojects (`gob-curl`).
+   - **Flutter GitHub**: Captures PR updates, review comments, issue comments, and merged commits (`gh api`).
+   - **Buganizer (`b/...`)**: Checked via `/google/bin/releases/issues-cli/issues readonly search --query="..."` when inspecting internal bug activity.
+   - **Google Chat**: Checked via `google_chat_google_chat` MCP tool `search_messages` when inspecting discussions in team spaces.

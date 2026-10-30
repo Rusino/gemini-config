@@ -127,8 +127,45 @@ def scan_flutter_github(repo: str, hours: int, now_utc: datetime) -> list:
     cutoff = now_utc - timedelta(hours=hours)
     since_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
     events = []
+    pr_titles = {}
 
-    # 1. Issues & PR comments
+    # 1. Pull request activity (author pushes, reviews, merges)
+    try:
+        prs = []
+        for page in (1, 2, 3):
+            url = (
+                f"repos/{repo}/pulls?state=all&sort=updated&direction=desc"
+                f"&per_page=100&page={page}"
+            )
+            sub = fetch_github_json(url, paginate=False)
+            prs.extend(sub)
+            if not sub or parse_utc_timestamp(sub[-1]["updated_at"]) < cutoff:
+                break
+        for pr in prs:
+            num = pr.get("number")
+            title = pr.get("title", "")[:50]
+            if num and title:
+                pr_titles[str(num)] = title
+            user = pr.get("user", {}).get("login", "")
+            if is_bot(user):
+                continue
+            ts = parse_utc_timestamp(pr.get("updated_at", ""))
+            if ts < cutoff:
+                continue
+            state = pr.get("state", "")
+            draft = " draft" if pr.get("draft") else ""
+            events.append({
+                "ts": ts,
+                "actor": user,
+                "repo": repo,
+                "kind": "pr_update",
+                "detail": f"PR #{num} [{state}{draft}] ({title})",
+                "url": f"https://github.com/{repo}/pull/{num}",
+            })
+    except Exception:
+        pass
+
+    # 2. Issues & PR comments
     try:
         path = (
             f"repos/{repo}/issues/comments?sort=updated&direction=desc"
@@ -143,19 +180,21 @@ def scan_flutter_github(repo: str, hours: int, now_utc: datetime) -> list:
                 continue
             issue_url = comment.get("issue_url", "")
             issue_num = issue_url.rsplit("/", 1)[-1]
-            body = comment.get("body", "").replace("\n", " ")[:55]
+            title = pr_titles.get(issue_num, "")
+            title_prefix = f" ({title})" if title else ""
+            body = comment.get("body", "").replace("\n", " ")[:50]
             events.append({
                 "ts": ts,
                 "actor": user,
                 "repo": repo,
                 "kind": "comment",
-                "detail": f"comment #{issue_num}: {body}",
+                "detail": f"comment #{issue_num}{title_prefix}: {body}",
                 "url": f"https://github.com/{repo}/issues/{issue_num}",
             })
     except Exception:
         pass
 
-    # 2. PR Review comments
+    # 3. PR Review comments
     try:
         path = (
             f"repos/{repo}/pulls/comments?sort=updated&direction=desc"
@@ -170,48 +209,16 @@ def scan_flutter_github(repo: str, hours: int, now_utc: datetime) -> list:
                 continue
             pr_url = comment.get("pull_request_url", "")
             pr_num = pr_url.rsplit("/", 1)[-1]
-            body = comment.get("body", "").replace("\n", " ")[:55]
+            title = pr_titles.get(pr_num, "")
+            title_prefix = f" ({title})" if title else ""
+            body = comment.get("body", "").replace("\n", " ")[:50]
             events.append({
                 "ts": ts,
                 "actor": user,
                 "repo": repo,
                 "kind": "pr_review",
-                "detail": f"review PR #{pr_num}: {body}",
+                "detail": f"review PR #{pr_num}{title_prefix}: {body}",
                 "url": f"https://github.com/{repo}/pull/{pr_num}",
-            })
-    except Exception:
-        pass
-
-    # 3. Pull request activity (author pushes, reviews, merges)
-    try:
-        prs = []
-        for page in (1, 2, 3):
-            url = (
-                f"repos/{repo}/pulls?state=all&sort=updated&direction=desc"
-                f"&per_page=100&page={page}"
-            )
-            sub = fetch_github_json(url, paginate=False)
-            prs.extend(sub)
-            if not sub or parse_utc_timestamp(sub[-1]["updated_at"]) < cutoff:
-                break
-        for pr in prs:
-            user = pr.get("user", {}).get("login", "")
-            if is_bot(user):
-                continue
-            ts = parse_utc_timestamp(pr.get("updated_at", ""))
-            if ts < cutoff:
-                continue
-            num = pr.get("number")
-            state = pr.get("state", "")
-            draft = " draft" if pr.get("draft") else ""
-            title = pr.get("title", "")[:55]
-            events.append({
-                "ts": ts,
-                "actor": user,
-                "repo": repo,
-                "kind": "pr_update",
-                "detail": f"PR #{num} [{state}{draft}]: {title}",
-                "url": f"https://github.com/{repo}/pull/{num}",
             })
     except Exception:
         pass
