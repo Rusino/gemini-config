@@ -239,6 +239,30 @@ class TestReviewerPings(unittest.TestCase):
 
     self.assertEqual(res.get("reviewer_pings"), [])
 
+  def test_gerrit_unapproved_external_cl_emits_no_reviewer_pings(self):
+    payload = _make_gerrit_payload(
+        cl_id="7686597",
+        subject="[Extensions] Clean up stale comment",
+        owner_email="kschmi@microsoft.com",
+        current_rev="rev1",
+        revisions={
+            "rev1": {"_number": 1, "kind": "REWORK"},
+        },
+        messages=[],
+    )
+    payload["labels"]["Code-Review"]["all"] = [
+        {"email": "jlavrova@google.com", "value": 0},
+    ]
+    with mock.patch.object(
+        w.urllib.request, "urlopen", return_value=_FakeGerritResponse(payload)
+    ), mock.patch.object(w, "gerrit_mergeable", return_value=True):
+      res = w.fetch_gerrit_cl_status(
+          "7686597", {}, [], preferred_host="chromium-review.googlesource.com"
+      )
+
+    self.assertTrue(res["ok"])
+    self.assertEqual(res.get("reviewer_pings"), [])
+
   def test_js_grouped_reviewer_ping_panel_and_clipboard_message_format(self):
     js_code = r"""
 const assert = require('assert');
@@ -345,6 +369,17 @@ togglePingItem('alexisdavidc@google.com', 'gerrit:1408436', false);
 const filteredMsg = buildReviewerPingMessage('alexisdavidc@google.com', testItems);
 assert(!filteredMsg.includes('1408436/1..3'), 'Excluded item dropped from message: ' + filteredMsg);
 assert(filteredMsg.includes('1406297/1..2'), 'Remaining item preserved: ' + filteredMsg);
+
+// Test renderPingsSection HTML structure
+const rendered = renderPingsSection(testItems);
+assert(!rendered.includes('<label class="ping-row'), 'Must not wrap ping-row in label');
+assert(rendered.includes('<div class="ping-row'), 'Must wrap ping-row in div');
+assert(rendered.includes('class="ping-cl-link"'), 'CL link class present');
+assert(rendered.includes('class="ping-subj"'), 'Subject link class present');
+assert(rendered.includes('Diff PS1..3 ↗'), 'Diff link present on PS delta');
+assert(rendered.includes('Open CL ↗'), 'Open CL link present');
+assert(rendered.includes('https://chat.google.com/'), 'Open Google Chat link present');
+assert(rendered.includes('class="ping-why"'), 'Context why line present');
 
 console.log('JS tests passed successfully');
 process.exit(0);

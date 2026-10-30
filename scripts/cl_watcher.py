@@ -2213,7 +2213,9 @@ def compute_gerrit_reviewer_pings(
   """Detects reviewers who need to review or whose +1 was lost on rebase/update"""
   if status != "NEW" or is_wip or is_draft or min_cr < 0 or missing_approvals <= 0:
     return []
-  if not (is_self or is_reviewer):
+  # Only surface reviewer pings on our own CLs or external CLs where we already gave CR+1
+  self_approved = bool(approved_emails & SELF_EMAILS)
+  if not (is_self or (is_reviewer and self_approved)):
     return []
 
   rev_by_ps: dict[int, dict[str, Any]] = {}
@@ -2274,27 +2276,30 @@ def compute_gerrit_reviewer_pings(
       comment_ps[auth_email] = max(comment_ps.get(auth_email, 0), rev_n)
 
   # Candidate reviewers: assigned or past reviewers who have not approved current PS
+  def is_eligible_reviewer(email: str) -> bool:
+    if (
+        not email
+        or email == owner_email
+        or email in SELF_EMAILS
+        or email.endswith(".gserviceaccount.com")
+        or email in removed_emails
+        or email in approved_emails
+    ):
+      return False
+    # Non-self CLs only need pings to Googler or Chromium reviewers for second approval
+    if not is_self and not email.endswith(("@google.com", "@chromium.org")):
+      return False
+    return True
+
   candidate_emails: set[str] = set()
   for acc in reviewer_accounts:
     if isinstance(acc, dict) and acc.get("email"):
       e = str(acc["email"])
-      if (
-          e != owner_email
-          and e not in SELF_EMAILS
-          and not e.endswith(".gserviceaccount.com")
-          and e not in removed_emails
-          and e not in approved_emails
-      ):
+      if is_eligible_reviewer(e):
         candidate_emails.add(e)
 
   for e in plus_one_ps.keys():
-    if (
-        e != owner_email
-        and e not in SELF_EMAILS
-        and not e.endswith(".gserviceaccount.com")
-        and e not in removed_emails
-        and e not in approved_emails
-    ):
+    if is_eligible_reviewer(e):
       candidate_emails.add(e)
 
   pings: list[dict[str, Any]] = []
@@ -2364,7 +2369,9 @@ def compute_github_reviewer_pings(
   """Detects reviewers who need to review or re-review on GitHub"""
   if state != "OPEN" or is_wip or is_draft or missing_approvals <= 0:
     return []
-  if not (is_self or is_reviewer):
+  # Only surface reviewer pings on our own PRs or PRs where we already approved
+  self_approved = bool(approved_by & SELF_GITHUB_LOGINS)
+  if not (is_self or (is_reviewer and self_approved)):
     return []
 
   pings: list[dict[str, Any]] = []
@@ -5090,8 +5097,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .ping-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
   .ping-list { display: grid; gap: 8px; }
   .ping-row {
-    display: flex; align-items: baseline; gap: 8px; font-size: 14px;
-    padding: 6px 10px; border-radius: 10px;
+    display: flex; align-items: baseline; gap: 6px 8px; font-size: 14px;
+    padding: 8px 12px; border-radius: 10px;
     background: color-mix(in srgb, var(--ink) 3.5%, transparent);
     flex-wrap: wrap;
   }
@@ -5100,10 +5107,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     margin: 0 2px 0 0; cursor: pointer; accent-color: var(--blue);
     transform: translateY(1px);
   }
-  .ping-row .ping-subj { color: var(--ink); font-weight: 500; }
-  .ping-row .ping-diff {
-    margin-left: auto; font: 500 12px var(--mono); color: var(--blue); white-space: nowrap;
+  .ping-row .ping-cl-link { color: var(--blue); font-weight: 600; font-family: var(--mono); }
+  .ping-row a.ping-subj { color: var(--ink); font-weight: 500; }
+  .ping-row a.ping-subj:hover { color: var(--blue); text-decoration: underline; }
+  .ping-row .ping-links {
+    margin-left: auto; display: inline-flex; align-items: baseline; gap: 10px;
+    font: 500 12px var(--mono); white-space: nowrap;
   }
+  .ping-row .ping-diff { color: var(--blue); }
+  .ping-row .ping-why {
+    flex: 1 0 100%; padding-left: 22px; font-size: 12.5px; color: var(--graphite);
+  }
+  .ping-row .ping-why strong { color: var(--ink); font-weight: 600; }
   .badge.ping-rebase {
     background: color-mix(in srgb, var(--blue) 15%, transparent); color: var(--blue);
   }
@@ -5224,6 +5239,15 @@ function clLabel(it) {
   if (it.kind === 'github') return `PR ${it.target_id}`;
   if (it.kind === 'piper') return `cl/${it.target_id}`;
   return `CL ${it.target_id}`;
+}
+
+// Returns concise display label for the change type across platforms
+function clTypeLabel(it) {
+  // GitHub pull requests use PR nomenclature
+  if (it.kind === 'github') return 'PR';
+  // Internal Piper changes use Piper CL label
+  if (it.kind === 'piper') return 'Piper CL';
+  return 'CL';
 }
 
 // The project tag already names the component, so drop the "[component] " prefix
@@ -6117,6 +6141,52 @@ function pingReasonBadgeHtml(p, it) {
   return `<span class="badge ping-second">⏳ Awaiting review</span>`;
 }
 
+// Constructs ownership attribution and plain-language action guidance for a reviewer ping
+function pingOwnershipAndActionText(p, it) {
+  const cur = p.current_ps || it.patchset || 1;
+  const prev = p.prev_ps;
+  const req = Number(it.required_approvals || 2);
+  const approved = Number(it.approved_count || 1);
+  const typeLbl = clTypeLabel(it);
+  let ownerText;
+  // Distinguish own changes from external changes where the user voted CR+1
+  if (it.is_self) {
+    ownerText = `<strong>Your ${typeLbl}</strong>`;
+  } else {
+    const author = authorLabel(it);
+    const voteLbl = it.kind === 'github' ? 'approved' : 'gave CR+1';
+    ownerText = `by <strong>${esc(author)}</strong> · You ${voteLbl} (${approved}/${req})`;
+  }
+
+  let actionText;
+  // Clarify why the reviewer needs attention based on the detected state
+  if (p.reason === 'lost_on_rebase') {
+    actionText = prev
+      ? `No code changes since their +1 on PS${esc(prev)} — ask to restore CR+1 on PS${esc(cur)}`
+      : `No code changes since their +1 — ask to restore CR+1 on PS${esc(cur)}`;
+  } else if (p.reason === 'updated_after_approval') {
+    actionText = prev
+      ? `Code changed between PS${esc(prev)} and PS${esc(cur)} — ` +
+        `ask to re-check delta and restore CR+1`
+      : `Code updated since their approval — ask to re-check delta on PS${esc(cur)}`;
+  } else if (p.reason === 'updated_after_review') {
+    actionText = prev
+      ? `Updated since their review on PS${esc(prev)} — ask to take another look at PS${esc(cur)}`
+      : `Updated since their review — ask to take another look at PS${esc(cur)}`;
+  } else if (p.reason === 'needs_second_approval') {
+    actionText = it.is_self
+      ? `Has ${approved} of ${req} approvals — ask for 2nd CR+1 on PS${esc(cur)}`
+      : `Needs a 2nd Googler CR+1 to land — ask for second review on PS${esc(cur)}`;
+  } else {
+    actionText = `Waiting for review on PS${esc(cur)}`;
+  }
+
+  const attNote = p.in_attention_set === false
+    ? ' <span style="color:var(--red)">(Gerrit dropped them from attention set)</span>'
+    : '';
+  return `${ownerText} · ${actionText}${attNote}`;
+}
+
 function renderPingsSection(shownItems) {
   const groups = collectReviewerPingGroups(shownItems);
   if (!groups.length) return '';
@@ -6147,20 +6217,30 @@ function renderPingsSection(shownItems) {
         ? `<span class="badge ping-off-att" ` +
           `title="Reviewer is not in Gerrit attention set">🔕 off attention set</span>`
         : '';
-      const diffLabel = (p.prev_ps && p.current_ps && p.prev_ps < p.current_ps)
-        ? `Diff PS${esc(p.prev_ps)}..${esc(p.current_ps)} ↗`
-        : `Open ${esc(clLabel(it))} ↗`;
-      const diffLink = link(p.diff_url || it.url, diffLabel, 'ping-diff');
+      const hasDelta = Boolean(p.prev_ps && p.current_ps && p.prev_ps < p.current_ps);
+      const deltaLink = hasDelta
+        ? link(p.diff_url, `Diff PS${esc(p.prev_ps)}..${esc(p.current_ps)} ↗`, 'ping-diff')
+        : '';
+      const openLabel = `Open ${esc(clTypeLabel(it))} ↗`;
+      const openLink = link(it.url, openLabel, 'ping-diff');
+      const chatHtml = chatActionHtml(
+        it, typeof cachedData !== 'undefined' ? cachedData : null, true
+      );
+      const linksHtml = `<span class="ping-links">${deltaLink}${openLink}${chatHtml}</span>`;
+      const clLink = link(it.url, esc(clLabel(it)), 'ping-cl-link');
+      const subjLink = link(it.url, esc(cleanSubject(it.subject)), 'ping-subj');
+      const whyHtml = `<div class="ping-why">${pingOwnershipAndActionText(p, it)}</div>`;
       return `
-        <label class="ping-row${x.included ? '' : ' excluded'}">
+        <div class="ping-row${x.included ? '' : ' excluded'}">
           <input type="checkbox" ${x.included ? 'checked' : ''}
             onchange="togglePingItem(${revJson}, ${keyJson}, this.checked)">
           ${pingReasonBadgeHtml(p, it)}${offAtt}
           <span class="meta"><span class="proj-tag">${esc(it.project_name)}</span> ·
-            <span class="cl">${link(it.url, esc(clLabel(it)))}</span></span>
-          <span class="ping-subj">${esc(cleanSubject(it.subject))}</span>
-          ${diffLink}
-        </label>`;
+            <span class="cl">${clLink}</span></span>
+          ${subjLink}
+          ${linksHtml}
+          ${whyHtml}
+        </div>`;
     }).join('');
 
     const copyDis = selectedCount === 0 ? ' disabled' : '';
@@ -6171,6 +6251,8 @@ function renderPingsSection(shownItems) {
           <span class="ping-who">${esc(g.reviewer_name)} (${esc(shortActor(g.reviewer))})</span>
           <span class="ping-counts">${esc(summaryParts.join(' · '))}</span>
           <div class="ping-actions">
+            <a class="triage-btn" href="https://chat.google.com/" target="_blank" rel="noopener"
+              title="Open Google Chat to paste the ping message">💬 Open Google Chat ↗</a>
             <button class="triage-btn" onclick="openPingModal(${revJson})">Preview / Edit</button>
             <button class="triage-btn primary"${copyDis}
               onclick="copyReviewerPing(${revJson}, this)">${btnLabel}</button>
