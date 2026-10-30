@@ -52,6 +52,11 @@ if HOOKS_DIR not in sys.path:
 
 import chat_lifecycle as cl  # pylint: disable=g-import-not-at-top
 
+SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPTS_DIR not in sys.path:
+  sys.path.insert(0, SCRIPTS_DIR)
+import triage_store  # pylint: disable=g-import-not-at-top
+
 DEFAULT_PORT = 8089
 DEFAULT_SKIA_DIR = os.path.expanduser("~/.gemini/jetski/scratch/skia_main")
 DEFAULT_GARDENER_URL = "http://localhost:8080"
@@ -3316,6 +3321,7 @@ def sync_once(
       ):
         c_list.append(comp_entry)
 
+  triage_store.overlay_triage_on_items(new_items.values())
   state["items"] = new_items
   state["events"] = events
   state["last_sync"] = now_et_str()
@@ -3541,6 +3547,85 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     background: color-mix(in srgb, var(--red) 13%, transparent);
     color: var(--red);
   }
+  .badge.triage-mechanical {
+    background: color-mix(in srgb, var(--green) 16%, transparent);
+    color: var(--green);
+  }
+  .badge.triage-reassign {
+    background: color-mix(in srgb, var(--amber) 16%, transparent);
+    color: var(--amber);
+  }
+  .badge.triage-surgical_audit {
+    background: color-mix(in srgb, var(--red) 14%, transparent);
+    color: var(--red);
+  }
+  .badge.triage-pushback {
+    background: color-mix(in srgb, var(--amber) 22%, transparent);
+    color: var(--amber);
+  }
+  .badge.triage-stale {
+    background: color-mix(in srgb, var(--red) 12%, transparent);
+    color: var(--red);
+  }
+  .card .triage-box {
+    grid-column: 1 / -1; margin-top: 12px; padding: 10px 14px; border-radius: 12px;
+    background: color-mix(in srgb, var(--ink) 4%, transparent);
+    display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; font-size: 13px;
+  }
+  .row .triage-box {
+    margin-top: 6px; display: flex; flex-wrap: wrap; align-items: center;
+    gap: 4px 8px; font-size: 12.5px;
+  }
+  .triage-time {
+    font-family: var(--mono); font-size: 11.5px; font-weight: 600; color: var(--ink);
+  }
+  .triage-summary { color: var(--ink); font-weight: 500; }
+  .triage-meta { color: var(--graphite); font-size: 12px; }
+  .triage-actions { display: inline-flex; gap: 6px; margin-left: auto; }
+  .triage-btn {
+    border: 1px solid var(--hairline); background: var(--card); color: var(--ink);
+    font: 500 11.5px var(--sans); padding: 2px 9px; border-radius: 980px; cursor: pointer;
+  }
+  .triage-btn:hover { background: color-mix(in srgb, var(--ink) 6%, transparent); }
+  .triage-btn.primary {
+    border-color: color-mix(in srgb, var(--blue) 35%, transparent); color: var(--blue);
+  }
+  .triage-modal-backdrop {
+    position: fixed; inset: 0; z-index: 100;
+    background: rgba(0, 0, 0, 0.45); backdrop-filter: blur(4px);
+    display: flex; align-items: center; justify-content: center; padding: 24px;
+  }
+  .triage-modal {
+    background: var(--card); color: var(--ink); border-radius: 16px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.2); max-width: 760px; width: 100%;
+    max-height: 85vh; display: flex; flex-direction: column; overflow: hidden;
+  }
+  .triage-modal-head {
+    padding: 16px 20px; border-bottom: 1px solid var(--hairline);
+    display: flex; align-items: center; gap: 12px;
+  }
+  .triage-modal-head h3 { font: 600 17px var(--display); margin: 0; }
+  .triage-modal-close {
+    margin-left: auto; background: none; border: 0; font-size: 18px; color: var(--graphite);
+    cursor: pointer; padding: 4px 8px; border-radius: 6px;
+  }
+  .triage-modal-close:hover { color: var(--ink); }
+  .triage-modal-tabs {
+    display: flex; gap: 4px; padding: 10px 20px 0; border-bottom: 1px solid var(--hairline);
+  }
+  .triage-tab {
+    border: 0; background: none; padding: 6px 12px; font: 500 13px var(--sans);
+    color: var(--graphite); cursor: pointer; border-bottom: 2px solid transparent;
+  }
+  .triage-tab.active { color: var(--blue); border-bottom-color: var(--blue); font-weight: 600; }
+  .triage-modal-body {
+    padding: 16px 20px; overflow-y: auto; flex: 1; font-size: 14px;
+  }
+  .triage-pre {
+    background: color-mix(in srgb, var(--ink) 4%, transparent); border-radius: 8px;
+    padding: 12px 14px; font-family: var(--mono); font-size: 12px; line-height: 1.5;
+    white-space: pre-wrap; word-break: break-word; user-select: text;
+  }
   .when { text-align: right; font-size: 13px; color: var(--graphite); }
   .row .path { font-size: 13px; }
   .row .stop { min-width: 0; }
@@ -3585,6 +3670,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div id="lanes"></div>
   <footer id="footer"></footer>
 </main>
+<div id="triage-modal-root"></div>
 
 <script>
 const PRODUCTS = ['Android', 'Chrome', 'Google3', 'Flutter'];
@@ -3940,6 +4026,156 @@ function rebaseActionHtml(it) {
     `onclick="rebaseItem(${esc(JSON.stringify(it.item_key))}, this)">🔧 Rebase</button>`;
 }
 
+function findItemByKey(key) {
+  const data = cachedData;
+  if (!data || !data.items) return null;
+  if (data.items[key]) return data.items[key];
+  return Object.values(data.items).find(
+    x => x.item_key === key || x.target_id === key
+  ) || null;
+}
+
+let currentTriageModalKey = null;
+let currentTriageModalTab = 'report';
+
+function openTriageModal(key, tab) {
+  const it = findItemByKey(key);
+  if (!it || !it.triage) return;
+  currentTriageModalKey = key;
+  currentTriageModalTab = tab || (it.triage.draft ? 'draft' : 'report');
+  renderTriageModal(it);
+}
+
+function closeTriageModal() {
+  currentTriageModalKey = null;
+  const root = typeof document !== 'undefined'
+    ? document.getElementById('triage-modal-root') : null;
+  if (root) root.innerHTML = '';
+}
+
+function renderTriageModal(it) {
+  const root = typeof document !== 'undefined'
+    ? document.getElementById('triage-modal-root') : null;
+  if (!root || !it || !it.triage) return;
+  const tr = it.triage;
+  const key = it.item_key || it.target_id;
+  const hasDraft = Boolean(tr.draft && tr.draft.trim());
+  const activeTab = currentTriageModalTab || (hasDraft ? 'draft' : 'report');
+  const content = activeTab === 'draft'
+    ? (tr.draft || 'No draft comment required.')
+    : (tr.report_markdown || 'No report available.');
+
+  root.innerHTML = `
+    <div class="triage-modal-backdrop" onclick="if (event.target === this) closeTriageModal()">
+      <div class="triage-modal">
+        <div class="triage-modal-head">
+          <span class="badge triage-${esc(String(tr.verdict || '').toLowerCase())}">
+            ${esc(tr.verdict_label || tr.verdict || '')}
+          </span>
+          <h3>${esc(clLabel(it))}: ${esc(cleanSubject(it.subject))}</h3>
+          <button class="triage-modal-close" onclick="closeTriageModal()" title="Close">✕</button>
+        </div>
+        <div class="triage-modal-tabs">
+          ${hasDraft ? `
+            <button class="triage-tab${activeTab === 'draft' ? ' active' : ''}"
+              onclick="currentTriageModalTab='draft'; ` +
+              `renderTriageModal(findItemByKey(${esc(JSON.stringify(key))}))">
+              Review Draft
+            </button>` : ''}
+          <button class="triage-tab${activeTab === 'report' ? ' active' : ''}"
+            onclick="currentTriageModalTab='report'; ` +
+            `renderTriageModal(findItemByKey(${esc(JSON.stringify(key))}))">
+            Triage Report
+          </button>
+          ${hasDraft ? `
+            <button class="triage-btn primary" style="margin-left: auto; margin-bottom: 6px;"
+              onclick="copyTriageDraft(${esc(JSON.stringify(key))}, this)">` +
+              `Copy Draft</button>` : ''}
+        </div>
+        <div class="triage-modal-body">
+          <div class="triage-pre">${esc(content)}</div>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function copyTriageDraft(key, btn) {
+  const it = findItemByKey(key);
+  if (!it || !it.triage || !it.triage.draft) return;
+  const orig = btn ? btn.textContent : '';
+  let copied = false;
+  try {
+    if (typeof navigator !== 'undefined' &&
+        navigator.clipboard &&
+        navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(it.triage.draft);
+      copied = true;
+    }
+  } catch (e) {
+    copied = false;
+  }
+  if (!copied && typeof document !== 'undefined') {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = it.triage.draft;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      copied = document.execCommand('copy');
+      document.body.removeChild(ta);
+    } catch (e) {
+      copied = false;
+    }
+  }
+  if (btn) {
+    btn.textContent = copied ? 'Copied!' : 'Copy failed';
+    setTimeout(() => { btn.textContent = orig; }, 1800);
+  }
+}
+
+function triageHtml(it, compact) {
+  if (!it || !it.triage) return '';
+  if (it.status === 'MERGED' || it.status === 'ABANDONED' || it.status === 'CLOSED') return '';
+  const tr = it.triage;
+  const v = esc(tr.verdict_label || tr.verdict || 'SURGICAL AUDIT');
+  const vCls = 'triage-' + esc(String(tr.verdict || 'SURGICAL_AUDIT').toLowerCase());
+  const badge = `<span class="badge ${vCls}">${v}</span>`;
+  const time = tr.review_time_label
+    ? `<span class="triage-time">${esc(tr.review_time_label)}</span>` : '';
+  const summary = tr.summary
+    ? `<span class="triage-summary">${esc(tr.summary)}</span>` : '';
+  const stale = tr.is_stale
+    ? `<span class="badge triage-stale">Stale: PS${esc(tr.triaged_patchset || 1)} → ` +
+      `PS${esc(it.patchset || 1)}</span>`
+    : '';
+  const meta = `<span class="triage-meta">PS${esc(tr.triaged_patchset || 1)} · ` +
+    `${esc(tr.triaged_at_et || '')}</span>`;
+
+  const key = it.item_key || it.target_id;
+  const keyJson = esc(JSON.stringify(key));
+  const hasDraft = Boolean(tr.draft && tr.draft.trim());
+
+  let actions = '';
+  if (hasDraft) {
+    actions += `<button class="triage-btn primary" ` +
+      `onclick="openTriageModal(${keyJson}, 'draft')">Draft</button>`;
+    actions += `<button class="triage-btn" ` +
+      `onclick="copyTriageDraft(${keyJson}, this)">Copy</button>`;
+  }
+  actions += `<button class="triage-btn" ` +
+    `onclick="openTriageModal(${keyJson}, 'report')">Report</button>`;
+
+  return `<div class="triage-box">${badge}${time}${stale}${summary}${meta}` +
+    `<span class="triage-actions">${actions}</span></div>`;
+}
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeTriageModal();
+  });
+}
+
 function focusCard(it, data) {
   const chatBtn = chatActionHtml(it, data, false);
   const busyBadge = it.chat_busy
@@ -4009,6 +4245,7 @@ function focusCard(it, data) {
         <h2>${cardTitle}</h2>
         <div class="why">${fullWhy}</div></div>
       <div class="actions">${actions}</div>
+      ${triageHtml(it, false)}
     </article>`;
 }
 
@@ -4023,7 +4260,8 @@ function rowHtml(it, data) {
   return `
     <div class="row">
       <div><div class="title">${badgesHtml(it)}${link(it.url, esc(cleanSubject(it.subject)))}</div>
-        <div class="meta">${meta}</div></div>
+        <div class="meta">${meta}</div>
+        ${triageHtml(it, true)}</div>
       <div class="state">${stateHtml(it)}</div>
       <div class="when">${rowTime(it)}</div>
     </div>`;
@@ -4238,6 +4476,9 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
         state = sync_once(wake_chats=False, update_titles=True)
       else:
         overlay_live_chat_busy(state)
+        triage_store.overlay_triage_on_items(
+            (state.get("items") or {}).values()
+        )
       state["jetski_box_url"] = jetski_box_url()
       self._send_json(state)
       return

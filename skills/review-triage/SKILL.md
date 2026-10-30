@@ -213,3 +213,10 @@ named skill's `SKILL.md` was not read, when a report with a `Case 1-5` verdict l
 8. **Daily Queue Summary Shows Open Issues Only**: In `run_queue_triage.py` summaries, never list or
    mention GitHub issues that are already closed (including ones closed during the window or still
    receiving bot activity); report only open issues and the user's own open PRs.
+9. **Flight Deck Triage Persistence (`triage_store.py`)**: When running daily queue triage
+   (`run_queue_triage.py`) or per-CL audit workflows (`wf*.md`), save the structured audit report
+   for Flight Deck via:
+   `python3 ~/.gemini/config/scripts/triage_store.py save-audit --target <ID> --report-file <md>`
+   (or run `triage_store.py ingest-tmp` to ingest all `/tmp/wf*.md` and `/tmp/triage_*.md` files).
+   This displays category badges, estimated review times, one-line summaries, and 1-click
+   ready-to-copy drafts next to each CL/PR in Flight Deck.
