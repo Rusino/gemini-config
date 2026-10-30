@@ -2845,6 +2845,129 @@ global.requestAnimationFrame = () => 1;
         patched_again = f.read()
       self.assertEqual(patched_data, patched_again)
 
+  def test_replacement_body_js_syntax_and_execution(self) -> None:
+    # Ensure raw replacement script never exceeds the binary's 743-byte shim limit
+    raw_len = len(patcher.REPLACEMENT_BODY) + len(patcher.REPLACEMENT_SUFFIX)
+    self.assertLessEqual(
+        raw_len,
+        743,
+        f"REPLACEMENT_BODY ({raw_len} bytes) exceeds 743-byte shim limit",
+    )
+
+    node_bin = find_node_binary()
+    raw_script = patcher.REPLACEMENT_BODY.decode("utf-8")
+    self.assertTrue(raw_script.startswith("<script>"))
+    js_code = raw_script[len("<script>") :]
+
+    harness = r"""
+const assert = require('assert');
+const vm = require('vm');
+
+const jsCode = process.argv[1];
+
+function runScenario(pathname) {
+  const storage = new Map();
+  storage.set('ag:existing', 'val1');
+  storage.set('other', 'val2');
+
+  const appended = [];
+  const fakeWindow = {
+    __APP_CONFIG__: { csrfToken: 'test-token-123' },
+  };
+  const fakeDocument = {
+    readyState: 'loading',
+    head: {
+      append: (el) => appended.push(el),
+    },
+    createElement: (tag) => ({ tagName: tag.toUpperCase() }),
+  };
+  const fakeLocation = { pathname };
+  const fakeLocalStorage = {
+    get length() {
+      return Array.from(storage.keys()).length;
+    },
+    key: (i) => Array.from(storage.keys())[i],
+    getItem: (k) => (storage.has(k) ? storage.get(k) : null),
+    setItem: (k, v) => storage.set(k, String(v)),
+    removeItem: (k) => storage.delete(k),
+  };
+
+  const sandbox = {
+    window: fakeWindow,
+    document: fakeDocument,
+    location: fakeLocation,
+    localStorage: fakeLocalStorage,
+    Date,
+    encodeURIComponent,
+    console,
+  };
+
+  vm.runInNewContext(jsCode, sandbox);
+
+  assert(fakeWindow.nativeStorage, 'window.nativeStorage must be defined');
+  assert.strictEqual(typeof fakeWindow.nativeStorage.getItems, 'function');
+  assert.strictEqual(typeof fakeWindow.nativeStorage.updateItems, 'function');
+
+  assert.strictEqual(appended.length, 1, 'Must append exactly 1 script');
+  return { appendedScript: appended[0], fakeWindow, storage };
+}
+
+(async () => {
+  // 1. Root route: /c/test-chat
+  const resRoot = runScenario('/c/test-chat');
+  assert(
+    resRoot.appendedScript.src.startsWith(
+      '/static/artifacts/jetski-closed-filter.js?v='
+    ),
+    'Root route must append root-relative filter script URL'
+  );
+  assert(
+    resRoot.appendedScript.src.includes('&csrf=test-token-123'),
+    'Script URL must carry csrfToken'
+  );
+
+  // Verify nativeStorage getItems / updateItems contract
+  const items = await resRoot.fakeWindow.nativeStorage.getItems();
+  assert.deepStrictEqual({ ...items }, { existing: 'val1' });
+  await resRoot.fakeWindow.nativeStorage.updateItems({ added: 'newVal', existing: null });
+  assert.strictEqual(resRoot.storage.get('ag:added'), 'newVal');
+  assert.strictEqual(resRoot.storage.has('ag:existing'), false);
+
+  // 2. Proxied route: /box/host-1/c/test-chat
+  const resProxied = runScenario('/box/host-1/c/test-chat');
+  assert(
+    resProxied.appendedScript.src.startsWith(
+      '/box/host-1/static/artifacts/jetski-closed-filter.js?v='
+    ),
+    'Proxied route must preserve /box/<host> prefix'
+  );
+  assert(
+    resProxied.appendedScript.src.includes('&csrf=test-token-123'),
+    'Script URL must carry csrfToken on proxied route'
+  );
+
+  console.log('REPLACEMENT_BODY_JS_TEST_PASSED');
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"""
+    env = os.environ.copy()
+    env["ELECTRON_RUN_AS_NODE"] = "1"
+    res = subprocess.run(
+        [node_bin, "-e", harness, js_code],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(
+        res.returncode,
+        0,
+        f"Replacement body JS harness failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+    )
+    self.assertIn("REPLACEMENT_BODY_JS_TEST_PASSED", res.stdout)
+
   def test_extract_sar_supports_var_tmp(self) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
       var_tmp_root = os.path.join(tmpdir, "var", "tmp")

@@ -25,6 +25,8 @@ SHIM_PREFIX = (
 SCRIPT_OPEN_TAG = b"<script>"
 PATCH_MARKER = b"/*JETSKI_CLOSED_FILTER*/"
 
+# Shims nativeStorage and immediately appends filter script to document.head
+# before main.js parses and consumes browser HTTP/1.1 streaming connections
 REPLACEMENT_BODY = (
     b"<script>/*JETSKI_CLOSED_FILTER*/(()=>{"
     b"window.nativeStorage||(window.nativeStorage={"
@@ -33,13 +35,12 @@ REPLACEMENT_BODY = (
     b'k?.startsWith("ag:")&&(o[k.slice(3)]=localStorage.getItem(k))}'
     b"return o},"
     b"updateItems:async c=>{for(let k in c)"
-    b'c[k]==null?localStorage.removeItem("ag:"+k):localStorage.setItem("ag:"+k,c[k])}}});'
-    b'let b=location.pathname.match(/^(\\/box\\/[^/]+)/)?.[1]||\"\";'
-    b'let l=()=>{let s=document.createElement("script");'
+    b'c[k]==null?localStorage.removeItem("ag:"+k):localStorage.setItem("ag:"+k,c[k])}});'
+    b'let b=location.pathname.match(/^(\\/box\\/[^/]+)/)?.[1]||"";'
+    b'let s=document.createElement("script");'
     b's.src=b+"/static/artifacts/jetski-closed-filter.js?v="+Date.now()'
     b'+"&csrf="+encodeURIComponent(window.__APP_CONFIG__?.csrfToken||"");'
-    b"document.head.append(s)};"
-    b'document.readyState==="loading"?document.addEventListener("DOMContentLoaded",l):l()'
+    b"document.head.append(s)"
     b"})();"
 )
 REPLACEMENT_SUFFIX = b"</script>"
