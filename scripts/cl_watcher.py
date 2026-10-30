@@ -66,6 +66,8 @@ OPEN_CHAT_REQ_FILE = os.path.expanduser(
 )
 ANNOTATIONS_DIR = os.path.expanduser("~/.gemini/jetski/annotations")
 PROJECTS_DIR = os.path.expanduser("~/.gemini/config/projects")
+# Root directory for per-project chat state files that record follow-up CLs
+ROADMAPS_DIR = os.path.expanduser("~/.gemini/config/roadmaps")
 IGNORED_CLS_FILE = os.path.expanduser(
     "~/.gemini/config/skills/review-triage/ignored_cls.txt"
 )
@@ -73,13 +75,20 @@ IGNORED_CLS_FILE = os.path.expanduser(
 MANUAL_FIX_LINKS_FILE = os.path.expanduser(
     "~/.gemini/config/fix_for_links.json"
 )
+# Headings and git-config lines in chat state files that identify follow-up fix CLs
+RE_STATE_FIX_SECTION = re.compile(
+    r"^##+\s*(?:[^\n]*\b(?:fix|follow[\s\-]*up|reland)\s+(?:cl|pr|change)\b|"
+    r"(?:fix|follow[\s\-]*up|reland)\b)",
+    re.IGNORECASE,
+)
+RE_STATE_GERRIT_ISSUE = re.compile(r"\bgerritissue\s+(\d{6,10})\b", re.IGNORECASE)
 RE_BUG_TAG = re.compile(r"(?im)^\s*(?:Bug|Fixed|Fixes|Issue)\s*:\s*(.+)$")
 RE_BUG_TOKEN = re.compile(
     r"(?i)\b(?:b/|skia:|crbug\.com/|chromium:|issue\s*#?|b)(\d{4,})\b"
 )
 RE_EXPLICIT_FIX_CL = re.compile(
     r"(?i)\b(?:fix(?:es|ed)?(?:\s+breakage\s+from|\s+regression\s+(?:in|from))?"
-    r"|reland(?:\s+of)?|revert(?:\s+of)?|follow[- ]?up\s+(?:to|for)"
+    r"|reland(?:s|ed)?(?:\s+of)?|revert(?:s|ed)?(?:\s+of)?|follow[- ]?up\s+(?:to|for)"
     r"|original\s+cl\s*:)\b[^\n]{0,80}?"
     r"(?:skia-review\.googlesource\.com/c/skia/\+/"
     r"|dart-review\.googlesource\.com/c/sdk/\+/"
@@ -87,7 +96,7 @@ RE_EXPLICIT_FIX_CL = re.compile(
 )
 RE_EXPLICIT_FIX_SHA = re.compile(
     r"(?i)\b(?:fix(?:es|ed)?(?:\s+breakage\s+from|\s+regression\s+(?:in|from))?"
-    r"|revert(?:\s+of)?|reland(?:\s+of)?|introduced\s+(?:in|by)"
+    r"|revert(?:s|ed)?(?:\s+of)?|reland(?:s|ed)?(?:\s+of)?|introduced\s+(?:in|by)"
     r"|broke\s+in)\s+(?:commit\s+)?([0-9a-f]{7,40})\b"
 )
 RE_QUOTED_REVERT_REL = re.compile(r'(?i)^\s*(?:Revert|Reland)\s+"([^"]+)"')
@@ -133,13 +142,19 @@ FLUTTER_GET_STATUS_URL = (
 RE_DASHBOARD_SUBJOB = re.compile(r"^\s*-\s*`([^`]+)`", re.MULTILINE)
 GITHUB_STATUS_BOTS = {"flutter-dashboard"}
 
-# Match cl/, CL, crrev(.com)/c/, and skrev(.com)/ shortlinks in chat titles
+# Match cl/, CL, Gerrit, crrev(.com)/c/, skrev(.com)/, and Gerrit review URLs
 RE_CL_ID = re.compile(
-    r"(?:\b(?:crrev(?:\.com)?/c|skrev(?:\.com)?|cl)/|\bCL\s+)(\d{6,10})\b",
+    r"(?:\b(?:crrev(?:\.com)?/c|skrev(?:\.com)?|cl)/|"
+    r"(?:https?://)?(?:skia|chromium)-review"
+    r"(?:\.git\.corp\.google|\.googlesource)\.com/c/(?:[^+\s]*/\+/)?|"
+    r"\b(?:CL|Gerrit)\s+#?)(\d{6,10})\b",
     re.IGNORECASE,
 )
 RE_CL_ID_GROUP = re.compile(
-    r"(?P<prefix>\b(?:crrev(?:\.com)?/c|skrev(?:\.com)?|cl)/|\bCL\s+)"
+    r"(?P<prefix>\b(?:crrev(?:\.com)?/c|skrev(?:\.com)?|cl)/|"
+    r"(?:https?://)?(?:skia|chromium)-review"
+    r"(?:\.git\.corp\.google|\.googlesource)\.com/c/(?:[^+\s]*/\+/)?|"
+    r"\b(?:CL|Gerrit)\s+#?)"
     r"(?P<first>\d{6,10})"
     r"(?P<rest>(?:(?:\s*(?:[/,&+]|\band\b)\s*|\s+)(?<![a-zA-Z_]/)(?<![a-zA-Z_])\d{6,10}\b)*)",
     re.IGNORECASE,
@@ -631,10 +646,15 @@ def extract_cl_ids_with_hosts(text: str) -> dict[str, str]:
   cls_hosts: dict[str, str] = {}
   for m in RE_CL_ID_GROUP.finditer(text):
     pref = m.group("prefix").lower()
+    # Map shortlink and full review URL prefixes to their Gerrit host
     hint = (
         GERRIT_CHROMIUM_HOST
-        if "crrev" in pref
-        else (GERRIT_SKIA_HOST if "skrev" in pref else "")
+        if ("crrev" in pref or "chromium-review" in pref)
+        else (
+            GERRIT_SKIA_HOST
+            if ("skrev" in pref or "skia-review" in pref)
+            else ""
+        )
     )
     first = m.group("first")
     if first not in cls_hosts or (hint and not cls_hosts[first]):
@@ -659,6 +679,68 @@ def extract_pr_ids(text: str) -> list[str]:
         prs.append(extra.group(1))
   # Deduplicate while preserving first appearance order
   return list(dict.fromkeys(prs))
+
+
+def extract_state_file_targets(
+    project_id: str,
+    conv_id: str,
+    roadmaps_dir: str | None = None,
+) -> tuple[dict[str, str], list[str]]:
+  """Extracts follow-up fix CLs and PRs recorded in a chat's chain state file."""
+  if not project_id or not conv_id:
+    return {}, []
+  rdir = ROADMAPS_DIR if roadmaps_dir is None else roadmaps_dir
+  state_path = os.path.join(rdir, project_id, "state", f"{conv_id}.md")
+  if not os.path.isfile(state_path):
+    return {}, []
+  extra_cls: dict[str, str] = {}
+  extra_prs: list[str] = []
+  in_fix_section = False
+  try:
+    with open(state_path, "r", encoding="utf-8") as f:
+      for raw_line in f:
+        line = raw_line.strip()
+        if not line:
+          continue
+        # Extract from main H1 header (e.g. "# State: ... fix CL 1411716")
+        if line.startswith("# ") and not line.startswith("##"):
+          for cid_str, h in extract_cl_ids_with_hosts(line).items():
+            if cid_str not in extra_cls or (h and not extra_cls[cid_str]):
+              extra_cls[cid_str] = h
+          for pr_str in extract_pr_ids(line):
+            if pr_str not in extra_prs:
+              extra_prs.append(pr_str)
+          continue
+        # Detect start of a dedicated follow-up or fix section
+        if line.startswith("##"):
+          in_fix_section = bool(RE_STATE_FIX_SECTION.match(line))
+          if in_fix_section:
+            for cid_str, h in extract_cl_ids_with_hosts(line).items():
+              if cid_str not in extra_cls or (h and not extra_cls[cid_str]):
+                extra_cls[cid_str] = h
+            for pr_str in extract_pr_ids(line):
+              if pr_str not in extra_prs:
+                extra_prs.append(pr_str)
+          continue
+        # Extract bullet points naming fix CLs or PRs while inside the fix section
+        if in_fix_section and (line.startswith("-") or line.startswith("*")):
+          low = line.lower()
+          if any(k in low for k in ("incident:", "spin-off", "conversation://")):
+            continue
+          for cid_str, h in extract_cl_ids_with_hosts(line).items():
+            if cid_str not in extra_cls or (h and not extra_cls[cid_str]):
+              extra_cls[cid_str] = h
+          for pr_str in extract_pr_ids(line):
+            if pr_str not in extra_prs:
+              extra_prs.append(pr_str)
+        # Match git config branch.<name>.gerritissue markers recorded in state notes
+        for gm in RE_STATE_GERRIT_ISSUE.finditer(line):
+          gid = gm.group(1)
+          if gid not in extra_cls:
+            extra_cls[gid] = ""
+  except OSError:
+    pass
+  return extra_cls, extra_prs
 
 
 def discover_active_cl_chats(
@@ -705,6 +787,12 @@ def discover_active_cl_chats(
     prs_found = extract_pr_ids(title)
     if not cls_found and not prs_found:
       continue
+
+    # Discover additional follow-up CLs/PRs recorded in the chat state file
+    extra_cls, extra_prs = extract_state_file_targets(pid, cid)
+    state_cls = {k: v for k, v in extra_cls.items() if k not in cls_hosts}
+    state_prs = [p for p in extra_prs if p not in prs_found]
+
     # A slash list like "PR #194466/#194475" or multiple IDs means the chat is not 1:1 with one CL
     multi_slash = bool(
         re.search(
@@ -714,7 +802,11 @@ def discover_active_cl_chats(
             re.IGNORECASE,
         )
     )
-    single_target = (len(cls_found) + len(prs_found) == 1) and not multi_slash
+    # Multiple targets mean the chat does not represent a single 1:1 CL
+    has_multiple = (
+        len(cls_found) + len(prs_found) + len(state_cls) + len(state_prs) > 1
+    )
+    single_target = not has_multiple and not multi_slash
 
     for cl_id in cls_found:
       kind = "piper" if len(cl_id) >= 9 else "gerrit"
@@ -732,6 +824,23 @@ def discover_active_cl_chats(
           "chat_busy": chat_busy,
           "chat_archived": is_archived,
       })
+    # Append state-file CLs to discovered targets without making them single-target
+    for cl_id, s_host in state_cls.items():
+      kind = "piper" if len(cl_id) >= 9 else "gerrit"
+      discovered.append({
+          "item_key": f"{kind}:{cl_id}",
+          "kind": kind,
+          "target_id": cl_id,
+          "preferred_host": s_host,
+          "conversation_id": cid,
+          "title": title,
+          "project_id": pid,
+          "project_name": pname,
+          "chat_last_modified": last_mod,
+          "single_target": False,
+          "chat_busy": chat_busy,
+          "chat_archived": is_archived,
+      })
     for pr_id in prs_found:
       discovered.append({
           "item_key": f"github:{pr_id}",
@@ -744,6 +853,22 @@ def discover_active_cl_chats(
           "project_name": pname,
           "chat_last_modified": last_mod,
           "single_target": single_target,
+          "chat_busy": chat_busy,
+          "chat_archived": is_archived,
+      })
+    # Append state-file PRs to discovered targets without making them single-target
+    for pr_id in state_prs:
+      discovered.append({
+          "item_key": f"github:{pr_id}",
+          "kind": "github",
+          "target_id": pr_id,
+          "preferred_host": "",
+          "conversation_id": cid,
+          "title": title,
+          "project_id": pid,
+          "project_name": pname,
+          "chat_last_modified": last_mod,
+          "single_target": False,
           "chat_busy": chat_busy,
           "chat_archived": is_archived,
       })
@@ -1273,16 +1398,30 @@ def detect_fix_for_pairs(
               and f_has_cue
           )
 
+          # Follow-up CL produced in the same conversation as the broken CL
+          same_chat = bool(
+              f_item.get("conversation_id")
+              and f_item.get("conversation_id") == m_item.get("conversation_id")
+          )
           has_link_signal = bool(
-              shared_bugs or shared_topic or shared_test_syms or shared_test_files
+              shared_bugs
+              or shared_topic
+              or shared_test_syms
+              or shared_test_files
+              or same_chat
           )
           has_breakage_signal = bool(
               f_mentions_m_bot
               or m_has_alert
               or f_has_bot_and_cue
               or f_test_only_followup
+              or same_chat
           )
           if has_link_signal and has_breakage_signal:
+            # Same chat strongly indicates a direct follow-up fix
+            if same_chat:
+              score += 140
+              reasons.append("same_chat_followup")
             if shared_bugs:
               score += 120
               reasons.append(f"shared_bug:{sorted(shared_bugs)[0]}")
@@ -1498,9 +1637,12 @@ def discover_open_remote_changes(
         "chat_busy": False,
     }
 
+  # Include self-authored changes merged in the last 3 days so post-submit rolls
+  # and fixes stay tracked
   gerrit_q = (
-      "status:open+((owner:jlavrova@google.com+OR+owner:jlavrova@gmail.com)"
-      "+OR+((reviewer:jlavrova@google.com+OR+reviewer:jlavrova@gmail.com)+-is:wip))"
+      "((status:open+((owner:jlavrova@google.com+OR+owner:jlavrova@gmail.com)"
+      "+OR+((reviewer:jlavrova@google.com+OR+reviewer:jlavrova@gmail.com)+-is:wip)))"
+      "+OR+(status:merged+(owner:jlavrova@google.com+OR+owner:jlavrova@gmail.com)+-age:3d))"
   )
   for host in GERRIT_HOSTS:
     url = f"https://{host}/changes/?q={gerrit_q}&n=50"
@@ -3990,6 +4132,18 @@ def sync_once(
       if re_pid and re_pname:
         d["project_id"] = re_pid
         d["project_name"] = re_pname
+    # Seed historical breakage and fix linkage from previous items if present
+    _, prev_d = _lookup_state_item(prev_items, ikey)
+    if prev_d:
+      # Carry forward known broken bots when the live record has not re-queried them yet
+      if not d.get("broken_bots") and prev_d.get("broken_bots"):
+        d["broken_bots"] = list(prev_d["broken_bots"])
+      # Preserve existing upstream breakage pointer across sync iterations
+      if not d.get("fixes_breakage_from") and prev_d.get("fixes_breakage_from"):
+        d["fixes_breakage_from"] = prev_d["fixes_breakage_from"]
+      # Preserve matched bot list across sync iterations
+      if not d.get("fixes_breakage_bots") and prev_d.get("fixes_breakage_bots"):
+        d["fixes_breakage_bots"] = list(prev_d["fixes_breakage_bots"])
     active_discovered.append(d)
 
   link_companion_changes_to_parent_chats(
@@ -3999,6 +4153,36 @@ def sync_once(
   link_fix_changes_to_parent_chats(
       active_discovered, fetched_cache, all_chat_candidates=all_chats
   )
+
+  # Prune unchatted/archived MERGED changes whose rolls are already complete and have no fix links
+  fix_targets = {
+      str(d.get("fixes_breakage_from"))
+      for d in active_discovered
+      if d.get("fixes_breakage_from")
+  }
+  kept_active: list[dict[str, Any]] = []
+  for d in active_discovered:
+    ikey = d["item_key"]
+    info = fetched_cache.get(ikey) or {}
+    st = str(info.get("status") or "").upper()
+    # Filter completed merged changes that have no active chat or fix relationship
+    if st == "MERGED":
+      ps = info.get("post_submit") or {}
+      cid = str(d.get("conversation_id") or "")
+      is_arch = bool(d.get("chat_archived", False))
+      has_active_chat = bool(cid and not is_arch)
+      is_fix = bool(d.get("fixes_breakage_from"))
+      has_fix = bool(ikey in fix_targets)
+      rolling = bool(not ps.get("all_passed") or ps.get("has_alert"))
+      _, prev_d = _lookup_state_item(prev_items, ikey)
+      just_merged = bool(
+          prev_d and str(prev_d.get("status") or "").upper() != "MERGED"
+      )
+      # Keep merged change if actively chatted, fixing/fixed, rolling, or newly merged
+      if not (has_active_chat or is_fix or has_fix or rolling or just_merged):
+        continue
+    kept_active.append(d)
+  active_discovered = kept_active
 
   unique_tids = sorted(
       {d["target_id"] for d in active_discovered if d.get("target_id")}
@@ -4337,20 +4521,6 @@ def sync_once(
       ):
         c_list.append(comp_entry)
 
-  # Cross-link fix-for CLs/PRs and the broken merged CLs/PRs they address
-  fallback_pairs = detect_fix_for_pairs(
-      {ikey: recs[0] for ikey, recs in by_ikey.items() if recs}
-  )
-  # Backfill fix-for links on records that were not paired before record assembly
-  for ikey, match in fallback_pairs.items():
-    for rec in by_ikey.get(ikey) or []:
-      # Preserve any explicit link already assigned during chat discovery
-      if not rec.get("fixes_breakage_from"):
-        rec["fixes_breakage_from"] = match["broken_key"]
-      # Preserve any bot list already attached to the fix record
-      if not rec.get("fixes_breakage_bots"):
-        rec["fixes_breakage_bots"] = match.get("matched_bots") or []
-
   for rec in new_items.values():
     if not isinstance(rec, dict):
       continue
@@ -4412,7 +4582,17 @@ def sync_once(
     cq_st = str(rec.get("cq_status") or "")
     # Summarize the fix CL's review/CQ stage so the broken CL shows fix progress at a glance
     if str(rec.get("status") or "").upper() == "MERGED":
-      fix_status_summary = "merged"
+      f_ps = rec.get("post_submit") or {}
+      # Show post-submit roll progress on merged fix CLs
+      if f_ps.get("all_passed"):
+        fix_status_summary = "merged · ✓All Rolls"
+      elif "passed_rolls" in f_ps or f_ps.get("total_rolls"):
+        total_r = len(f_ps.get("rolls") or ()) or int(f_ps.get("total_rolls") or 4)
+        fix_status_summary = (
+            f"merged · {f_ps.get('passed_rolls', 0)}/{total_r} rolls"
+        )
+      else:
+        fix_status_summary = "merged"
     elif rec.get("is_wip") or rec.get("is_draft"):
       fix_status_summary = str(rec.get("wip_label") or "WIP")
     elif rec.get("phase") == "SUBMITTING":
@@ -5012,9 +5192,9 @@ function badgesHtml(it) {
 // Compacts long Skia bot names to prefix…build-config for inline banners
 function compactBotName(name) {
   const s = String(name || '');
-  const m = s.match(
-    /^((?:Test|Build|Perf)-[A-Za-z0-9_.]+)-(?:Clang|GCC|MSVC)-.*?-((?:Debug|Release)-[A-Za-z0-9_.\-]+)$/
-  );
+  const pat = '^((?:Test|Build|Perf)-[A-Za-z0-9_.]+)-(?:Clang|GCC|MSVC)-.*?' +
+    '-((?:Debug|Release)-[A-Za-z0-9_.\\-]+)$';
+  const m = s.match(new RegExp(pat));
   if (m) return `${m[1]}…${m[2]}`;
   return shortTask(s);
 }
