@@ -69,6 +69,46 @@ PROJECTS_DIR = os.path.expanduser("~/.gemini/config/projects")
 IGNORED_CLS_FILE = os.path.expanduser(
     "~/.gemini/config/skills/review-triage/ignored_cls.txt"
 )
+# Patterns and optional manual map for bidirectional fix-for CL/PR cross-linking
+MANUAL_FIX_LINKS_FILE = os.path.expanduser(
+    "~/.gemini/config/fix_for_links.json"
+)
+RE_BUG_TAG = re.compile(r"(?im)^\s*(?:Bug|Fixed|Fixes|Issue)\s*:\s*(.+)$")
+RE_BUG_TOKEN = re.compile(
+    r"(?i)\b(?:b/|skia:|crbug\.com/|chromium:|issue\s*#?|b)(\d{4,})\b"
+)
+RE_EXPLICIT_FIX_CL = re.compile(
+    r"(?i)\b(?:fix(?:es|ed)?(?:\s+breakage\s+from|\s+regression\s+(?:in|from))?"
+    r"|reland(?:\s+of)?|revert(?:\s+of)?|follow[- ]?up\s+(?:to|for)"
+    r"|original\s+cl\s*:)\b[^\n]{0,80}?"
+    r"(?:skia-review\.googlesource\.com/c/skia/\+/"
+    r"|dart-review\.googlesource\.com/c/sdk/\+/"
+    r"|flutter/flutter/pull/|http://cl/|cl/|(?:#|CL\s*|PR\s*#?))(\d{4,10})\b"
+)
+RE_EXPLICIT_FIX_SHA = re.compile(
+    r"(?i)\b(?:fix(?:es|ed)?(?:\s+breakage\s+from|\s+regression\s+(?:in|from))?"
+    r"|revert(?:\s+of)?|reland(?:\s+of)?|introduced\s+(?:in|by)"
+    r"|broke\s+in)\s+(?:commit\s+)?([0-9a-f]{7,40})\b"
+)
+RE_QUOTED_REVERT_REL = re.compile(r'(?i)^\s*(?:Revert|Reland)\s+"([^"]+)"')
+RE_SKIA_BOT_NAME = re.compile(
+    r"\b((?:Test|Build|Perf|Housekeeper)-[A-Za-z0-9_.\-]+)"
+)
+RE_SKIA_BOT_PAIR = re.compile(
+    r"\b((?:Test|Build|Perf)-[A-Za-z0-9_.]+)\s+and\s+"
+    r"((?:Test|Build|Perf)-[A-Za-z0-9_.]+)\s+(?:\.\.\.|…)\s*(-[A-Za-z0-9_.\-]+)"
+)
+RE_FAILURE_CUE = re.compile(
+    r"(?i)\b(?:without\s+this\s+change\b[^\n.]*\bfail"
+    r"|fail(?:s|ed|ing)?\s+(?:on|with|in)\b"
+    r"|fix(?:es|ed)?\s+(?:the\s+)?(?:build|test|bot|failure|breakage"
+    r"|regression|crash|asan|msan|tsan|ubsan)|broke\b|broken\s+on\b)"
+)
+RE_TEST_SYMBOL = re.compile(
+    r"\b([A-Za-z0-9_]*(?:_[bB]\d{5,}|Test[A-Za-z0-9_]*))\b"
+)
+RE_FAILING_TEST_REASON = re.compile(r"matching failing test '([^']+)'")
+RE_CRASH_TEST_NAME = re.compile(r"\[([A-Za-z0-9_]+)\]:")
 MCP_TOKENS_FILE = os.path.expanduser("~/.gemini/jetski/mcp_oauth_tokens.json")
 GMAIL_MCP_URL = "https://gmailmcp.googleapis.com/mcp/v1"
 NOTIFY_SELF_BIN = "/google/bin/releases/g3n-team/notify_self"
@@ -942,6 +982,412 @@ def link_companion_changes_to_parent_chats(
             break
 
 
+def _normalize_item_key_ref(raw: str, default_kind: str = "gerrit") -> str:
+  """Normalizes an item key or numeric CL/PR ID into `<kind>:<id>`."""
+  s = str(raw or "").strip()
+  if not s:
+    return ""
+  if ":" in s:
+    return s
+  return f"{default_kind}:{s}"
+
+
+def load_manual_fix_links(path: str = MANUAL_FIX_LINKS_FILE) -> dict[str, str]:
+  """Loads optional manual fix-to-broken CL overrides from JSON."""
+  if not os.path.isfile(path):
+    return {}
+  try:
+    with open(path, "r", encoding="utf-8") as f:
+      data = json.load(f)
+    if not isinstance(data, dict):
+      return {}
+    out: dict[str, str] = {}
+    for k, v in data.items():
+      nk = _normalize_item_key_ref(str(k))
+      kind = nk.split(":", 1)[0] if ":" in nk else "gerrit"
+      nv = _normalize_item_key_ref(str(v), default_kind=kind)
+      if nk and nv:
+        out[nk] = nv
+    return out
+  except Exception:
+    return {}
+
+
+def extract_bug_ids(
+    subject: str,
+    commit_message: str = "",
+    topic: str = "",
+    hashtags: list[str] | tuple[str, ...] = (),
+) -> set[str]:
+  """Extracts normalized numeric bug IDs from commit footers, subject, topic, and hashtags."""
+  bugs: set[str] = set()
+  for m in RE_BUG_TAG.finditer(commit_message or ""):
+    line_val = m.group(1)
+    for tm in RE_BUG_TOKEN.finditer(line_val):
+      bugs.add(tm.group(1))
+    for bm in re.finditer(r"\b(\d{5,})\b", line_val):
+      bugs.add(bm.group(1))
+  blob = "\n".join(
+      [subject or "", commit_message or "", topic or ""]
+      + [str(h) for h in (hashtags or ())]
+  )
+  for tm in RE_BUG_TOKEN.finditer(blob):
+    bugs.add(tm.group(1))
+  return bugs
+
+
+def extract_bot_mentions_and_failure_cues(
+    subject: str, commit_message: str = ""
+) -> tuple[set[str], set[tuple[str, str]], bool]:
+  """Extracts full Skia bot names, abbreviated bot pairs, and failure cues from text."""
+  blob = f"{subject or ''}\n{commit_message or ''}"
+  full_bots = {m.group(1).rstrip(".,;:") for m in RE_SKIA_BOT_NAME.finditer(blob)}
+  pairs: set[tuple[str, str]] = set()
+  # Expand shorthand like "Test-Mac14 and Test-Mac15 ...-Debug-All-NativeFonts_Fontations"
+  for pm in RE_SKIA_BOT_PAIR.finditer(blob):
+    b1, b2, suffix = pm.group(1), pm.group(2), pm.group(3).rstrip(".,;:")
+    pairs.add((b1, suffix))
+    pairs.add((b2, suffix))
+  has_cue = bool(RE_FAILURE_CUE.search(blob))
+  return full_bots, pairs, has_cue
+
+
+def bot_matches_mentions(
+    bot_name: str, full_bots: set[str], pairs: set[tuple[str, str]]
+) -> bool:
+  """Returns True when `bot_name` matches a full bot token or an abbreviated prefix/suffix pair."""
+  if not bot_name:
+    return False
+  if bot_name in full_bots:
+    return True
+  for fb in full_bots:
+    if len(fb) >= 10 and bot_name.startswith(fb):
+      return True
+  for pref, suf in pairs:
+    if bot_name.startswith(pref) and bot_name.endswith(suf):
+      return True
+  return False
+
+
+def extract_test_identifiers(
+    subject: str,
+    commit_message: str = "",
+    files: list[str] | tuple[str, ...] = (),
+) -> tuple[set[str], set[str]]:
+  """Extracts touched test file paths and unit test symbol names from a change."""
+  test_files = {
+      str(f)
+      for f in (files or ())
+      if "test" in str(f).lower() or str(f).startswith("tests/")
+  }
+  blob = f"{subject or ''}\n{commit_message or ''}"
+  test_symbols = {m.group(1) for m in RE_TEST_SYMBOL.finditer(blob)}
+  return test_files, test_symbols
+
+
+def _collect_broken_bots_from_item(item: dict[str, Any]) -> list[dict[str, str]]:
+  """Returns deduplicated blamed post-submit bot records from a merged item."""
+  ps = item.get("post_submit") or {}
+  bots: list[dict[str, str]] = []
+  seen: set[str] = set()
+  for b in (item.get("broken_bots") or []) + (ps.get("broken_bots") or []):
+    if isinstance(b, dict) and b.get("task_name"):
+      tname = str(b["task_name"])
+      if tname not in seen:
+        seen.add(tname)
+        bots.append({
+            "task_name": tname,
+            "task_url": str(b.get("task_url") or ""),
+            "swarming_url": str(b.get("swarming_url") or ""),
+        })
+  for inc in ps.get("incidents") or []:
+    if not isinstance(inc, dict) or inc.get("verdict") != "blamed":
+      continue
+    for a in inc.get("affected_tasks") or []:
+      if isinstance(a, dict) and a.get("task_name"):
+        tname = str(a["task_name"])
+        if tname not in seen:
+          seen.add(tname)
+          bots.append({
+              "task_name": tname,
+              "task_url": str(a.get("task_url") or inc.get("task_url") or ""),
+              "swarming_url": str(
+                  a.get("swarming_url") or inc.get("swarming_url") or ""
+              ),
+          })
+    tname = str(inc.get("task_name") or "")
+    if tname and tname not in seen:
+      seen.add(tname)
+      bots.append({
+          "task_name": tname,
+          "task_url": str(inc.get("task_url") or ""),
+          "swarming_url": str(inc.get("swarming_url") or ""),
+      })
+  return bots
+
+
+def detect_fix_for_pairs(
+    items_by_key: dict[str, dict[str, Any]],
+    manual_links: dict[str, str] | None = None,
+) -> dict[str, dict[str, Any]]:
+  """Detects fix CLs/PRs and links each to the merged CL/PR whose breakage it addresses."""
+  manual = (
+      manual_links if manual_links is not None else load_manual_fix_links()
+  )
+  merged_candidates: dict[str, dict[str, Any]] = {}
+  for ikey, item in items_by_key.items():
+    if not isinstance(item, dict):
+      continue
+    if str(item.get("status") or "").upper() == "MERGED":
+      merged_candidates[ikey] = item
+
+  fix_map: dict[str, dict[str, Any]] = {}
+  for f_key, f_item in items_by_key.items():
+    if not isinstance(f_item, dict):
+      continue
+    f_status = str(f_item.get("status") or "").upper()
+    if f_status in ("ABANDONED", "CLOSED") or f_item.get("companion_to"):
+      continue
+    f_kind = str(f_item.get("kind") or "")
+    if not f_kind and ":" in f_key:
+      f_kind = f_key.split(":", 1)[0]
+    f_tid = str(f_item.get("target_id") or "")
+    if not f_tid and ":" in f_key:
+      f_tid = f_key.split(":", 1)[1]
+    f_subj = str(f_item.get("subject") or "")
+    f_msg = str(f_item.get("commit_message") or "")
+    f_topic = str(f_item.get("topic") or "").strip()
+    f_hashtags = list(f_item.get("hashtags") or ())
+    f_files = list(f_item.get("files") or ())
+    f_bugs = extract_bug_ids(f_subj, f_msg, f_topic, f_hashtags)
+    f_full_bots, f_bot_pairs, f_has_cue = extract_bot_mentions_and_failure_cues(
+        f_subj, f_msg
+    )
+    f_test_files, f_test_syms = extract_test_identifiers(
+        f_subj, f_msg, f_files
+    )
+    f_blob = f"{f_subj}\n{f_msg}"
+    explicit_cls = {
+        m.group(1)
+        for m in RE_EXPLICIT_FIX_CL.finditer(f_blob)
+        if m.group(1) != f_tid
+    }
+    explicit_shas = {m.group(1) for m in RE_EXPLICIT_FIX_SHA.finditer(f_blob)}
+    qm = RE_QUOTED_REVERT_REL.match(f_subj)
+    quoted_subj = qm.group(1).strip() if qm else ""
+
+    f_sub_dt = parse_gerrit_or_iso_time(str(f_item.get("submitted") or ""))
+    f_cre_dt = parse_gerrit_or_iso_time(str(f_item.get("created") or ""))
+
+    best_m_key = ""
+    best_score = 0
+    best_reasons: list[str] = []
+    best_bots: list[dict[str, str]] = []
+
+    manual_target = manual.get(f_key) or manual.get(
+        f"{f_kind}:{f_tid}", ""
+    )
+    for m_key, m_item in merged_candidates.items():
+      if m_key == f_key:
+        continue
+      m_kind = str(m_item.get("kind") or "")
+      if not m_kind and ":" in m_key:
+        m_kind = m_key.split(":", 1)[0]
+      if f_kind and m_kind and f_kind != m_kind:
+        continue
+      m_tid = str(m_item.get("target_id") or "")
+      if not m_tid and ":" in m_key:
+        m_tid = m_key.split(":", 1)[1]
+      m_rev = str(m_item.get("revision") or "")
+      m_subj = str(m_item.get("subject") or "")
+      m_msg = str(m_item.get("commit_message") or "")
+      m_topic = str(m_item.get("topic") or "").strip()
+      m_hashtags = list(m_item.get("hashtags") or ())
+      m_files = list(m_item.get("files") or ())
+      m_sub_dt = parse_gerrit_or_iso_time(str(m_item.get("submitted") or ""))
+
+      # When both changes are already merged, the fix must not predate the broken CL
+      if f_status == "MERGED" and f_sub_dt and m_sub_dt and f_sub_dt < m_sub_dt:
+        continue
+
+      m_broken_bots = _collect_broken_bots_from_item(m_item)
+      score = 0
+      reasons: list[str] = []
+
+      if manual_target and manual_target in (m_key, f"{m_kind}:{m_tid}"):
+        score += 1000
+        reasons.append("manual_override")
+
+      if m_tid and m_tid in explicit_cls:
+        score += 500
+        reasons.append(f"explicit_cl:{m_tid}")
+      if m_rev and any(_same_commit(sha, m_rev) for sha in explicit_shas):
+        score += 500
+        reasons.append(f"explicit_sha:{m_rev[:10]}")
+      if quoted_subj and m_subj and quoted_subj.lower() == m_subj.strip().lower():
+        score += 450
+        reasons.append("revert_or_reland_subject")
+
+      same_owner = bool(
+          (f_item.get("is_self") and m_item.get("is_self"))
+          or (
+              f_item.get("owner_email")
+              and f_item.get("owner_email") == m_item.get("owner_email")
+          )
+      )
+      # Correlated bug/topic/bot/test signals require same author and plausible timing
+      if same_owner:
+        timing_ok = True
+        if m_sub_dt and f_cre_dt:
+          delta_sec = (f_cre_dt - m_sub_dt).total_seconds()
+          if delta_sec < -3600 or delta_sec > 14 * 86400:
+            timing_ok = False
+        if timing_ok:
+          m_bugs = extract_bug_ids(m_subj, m_msg, m_topic, m_hashtags)
+          m_test_files, m_test_syms = extract_test_identifiers(
+              m_subj, m_msg, m_files
+          )
+          m_ps = m_item.get("post_submit") or {}
+          for inc in m_ps.get("incidents") or []:
+            if isinstance(inc, dict) and inc.get("failing_test"):
+              m_test_syms.add(str(inc["failing_test"]))
+
+          shared_bugs = f_bugs & m_bugs
+          shared_topic = bool(f_topic and f_topic == m_topic)
+          shared_test_syms = f_test_syms & m_test_syms
+          shared_test_files = f_test_files & m_test_files
+
+          f_mentions_m_bot = any(
+              bot_matches_mentions(b["task_name"], f_full_bots, f_bot_pairs)
+              for b in m_broken_bots
+          )
+          m_has_alert = bool(m_ps.get("has_alert") or m_broken_bots)
+          f_has_bot_and_cue = bool((f_full_bots or f_bot_pairs) and f_has_cue)
+          f_test_only_followup = bool(
+              f_files
+              and all(
+                  "test" in str(fp).lower() or str(fp).startswith("tests/")
+                  for fp in f_files
+              )
+              and (shared_test_files or shared_test_syms)
+              and f_has_cue
+          )
+
+          has_link_signal = bool(
+              shared_bugs or shared_topic or shared_test_syms or shared_test_files
+          )
+          has_breakage_signal = bool(
+              f_mentions_m_bot
+              or m_has_alert
+              or f_has_bot_and_cue
+              or f_test_only_followup
+          )
+          if has_link_signal and has_breakage_signal:
+            if shared_bugs:
+              score += 120
+              reasons.append(f"shared_bug:{sorted(shared_bugs)[0]}")
+            if shared_topic:
+              score += 80
+              reasons.append(f"shared_topic:{f_topic}")
+            if shared_test_syms:
+              score += 110
+              reasons.append(f"shared_test_symbol:{sorted(shared_test_syms)[0]}")
+            if shared_test_files:
+              score += 70
+              reasons.append(f"shared_test_file:{sorted(shared_test_files)[0]}")
+            if f_mentions_m_bot:
+              score += 150
+              reasons.append("mentions_blamed_bot")
+            elif m_has_alert:
+              score += 90
+              reasons.append("parent_post_submit_alert")
+            elif f_has_bot_and_cue:
+              score += 60
+              reasons.append("mentions_bot_failure")
+
+      if score > best_score:
+        best_score = score
+        best_m_key = m_key
+        best_reasons = reasons
+        matched_bots = list(m_broken_bots)
+        seen_bnames = {b["task_name"] for b in matched_bots}
+        for fb in sorted(f_full_bots):
+          if (
+              len(fb) > 12
+              and fb not in seen_bnames
+              and not any(bn.startswith(fb) for bn in seen_bnames)
+          ):
+            seen_bnames.add(fb)
+            matched_bots.append(
+                {"task_name": fb, "task_url": "", "swarming_url": ""}
+            )
+        for pref, suf in sorted(f_bot_pairs):
+          if not any(
+              bn.startswith(pref) and bn.endswith(suf) for bn in seen_bnames
+          ):
+            synth = f"{pref}...{suf}"
+            seen_bnames.add(synth)
+            matched_bots.append(
+                {"task_name": synth, "task_url": "", "swarming_url": ""}
+            )
+        best_bots = matched_bots
+
+    if best_m_key and best_score >= 100:
+      fix_map[f_key] = {
+          "broken_key": best_m_key,
+          "reasons": best_reasons,
+          "matched_bots": best_bots,
+      }
+  return fix_map
+
+
+def link_fix_changes_to_parent_chats(
+    active_discovered: list[dict[str, Any]],
+    fetched_cache: dict[str, dict[str, Any]],
+    all_chat_candidates: list[dict[str, Any]] | None = None,
+) -> None:
+  """Tags fix CLs/PRs with `fixes_breakage_from` and shares the broken CL's chat when unchatted."""
+  by_item_key: dict[str, dict[str, Any]] = {}
+  combined_info: dict[str, dict[str, Any]] = {}
+  for d in active_discovered:
+    ikey = str(d.get("item_key") or "")
+    if not ikey:
+      continue
+    if ikey not in by_item_key or d.get("conversation_id"):
+      by_item_key[ikey] = d
+    info = fetched_cache.get(ikey) or {}
+    if info.get("ok"):
+      combined_info[ikey] = {**d, **info}
+
+  known_chats: dict[str, dict[str, Any]] = {}
+  for c in all_chat_candidates or []:
+    ikey = str(c.get("item_key") or "")
+    if ikey and c.get("conversation_id") and ikey not in known_chats:
+      known_chats[ikey] = c
+
+  fix_map = detect_fix_for_pairs(combined_info)
+  for d in active_discovered:
+    ikey = str(d.get("item_key") or "")
+    match = fix_map.get(ikey)
+    if not match:
+      continue
+    broken_key = str(match["broken_key"])
+    d["fixes_breakage_from"] = broken_key
+    d["fixes_breakage_bots"] = match.get("matched_bots") or []
+    parent = known_chats.get(broken_key) or by_item_key.get(broken_key)
+    if parent and parent.get("conversation_id"):
+      if not d.get("conversation_id"):
+        d["conversation_id"] = parent["conversation_id"]
+        d["title"] = parent.get("title", "")
+        d["project_id"] = parent.get("project_id", "")
+        d["project_name"] = parent.get("project_name", "")
+        d["chat_last_modified"] = parent.get("chat_last_modified", "")
+        d["chat_busy"] = parent.get("chat_busy", False)
+        d["chat_archived"] = parent.get("chat_archived", False)
+      d["single_target"] = False
+      parent["single_target"] = False
+
+
 def load_ignored_cls(path: str = IGNORED_CLS_FILE) -> set[str]:
   """Reads permanently ignored Gerrit CL IDs from review-triage's ignore list."""
   ignored: set[str] = set()
@@ -1213,6 +1659,41 @@ def classify_incident_for_commit(
       for f in blame.get("confidence_factors") or []
       if int(f.get("impact") or 0) < 0
   ]
+  # Preserve every affected task on the incident so multi-bot breakages show all bots
+  affected_list: list[dict[str, str]] = []
+  for a in affected:
+    if not isinstance(a, dict) or not a.get("name"):
+      continue
+    a_id = str(a.get("id") or "")
+    a_sw = str(a.get("swarming_task_id") or "")
+    affected_list.append({
+        "task_name": str(a.get("name") or ""),
+        "task_url": (
+            f"https://task-scheduler.skia.org/task/{a_id}" if a_id else ""
+        ),
+        "swarming_url": (
+            f"https://chromium-swarm.appspot.com/task?id={a_sw}"
+            if a_sw
+            else ""
+        ),
+        "latest_main_rev": str(a.get("latest_main_rev") or ""),
+    })
+  # Extract the failing unit test symbol when Gardener records it in blame or crash text
+  failing_test = ""
+  reason_sources = [str(blame.get("reason") or "")] + [
+      str(f.get("reason") or "")
+      for f in blame.get("confidence_factors") or []
+      if isinstance(f, dict)
+  ]
+  for rsrc in reason_sources:
+    m_test = RE_FAILING_TEST_REASON.search(rsrc)
+    if m_test:
+      failing_test = m_test.group(1)
+      break
+  if not failing_test:
+    m_crash = RE_CRASH_TEST_NAME.search(str(blame.get("crash_analysis") or ""))
+    if m_crash:
+      failing_test = m_crash.group(1)
   swarming_id = str(task.get("swarming_task_id") or "")
   return {
       "verdict": verdict,
@@ -1237,6 +1718,9 @@ def classify_incident_for_commit(
       "culprit_subject": str(blame.get("subject") or ""),
       "confidence_score": score,
       "reason": negatives[0] if negatives else "",
+      # Multi-bot and test metadata for fix-for matching and incident expansion
+      "affected_tasks": affected_list,
+      "failing_test": failing_test,
   }
 
 
@@ -1259,6 +1743,8 @@ def check_skia_post_submit(
           "Flutter": {"state": "⏳", "detail": "Not rolled yet"},
       },
       "incidents": [],
+      # Flattened list of blamed post-submit bot tasks across all incidents
+      "broken_bots": [],
       "passed_rolls": 0,
       "all_passed": False,
       "has_alert": False,
@@ -1276,9 +1762,44 @@ def check_skia_post_submit(
   res["incidents"] = hits
   blamed = [h for h in hits if h["verdict"] == "blamed"]
   if blamed:
+    broken_bots: list[dict[str, str]] = []
+    seen_bot_names: set[str] = set()
+    for h in blamed:
+      aff = h.get("affected_tasks") or []
+      # Prefer affected tasks pinned to merged_sha before falling back to all affected tasks
+      matched_aff = [
+          a
+          for a in aff
+          if not a.get("latest_main_rev")
+          or _same_commit(str(a.get("latest_main_rev") or ""), merged_sha)
+      ] or list(aff)
+      for a in matched_aff:
+        tname = str(a.get("task_name") or "")
+        if tname and tname not in seen_bot_names:
+          seen_bot_names.add(tname)
+          broken_bots.append({
+              "task_name": tname,
+              "task_url": str(a.get("task_url") or h.get("task_url") or ""),
+              "swarming_url": str(
+                  a.get("swarming_url") or h.get("swarming_url") or ""
+              ),
+          })
+      primary_name = str(h.get("task_name") or "")
+      if primary_name and primary_name not in seen_bot_names:
+        seen_bot_names.add(primary_name)
+        broken_bots.append({
+            "task_name": primary_name,
+            "task_url": str(h.get("task_url") or ""),
+            "swarming_url": str(h.get("swarming_url") or ""),
+        })
+    res["broken_bots"] = broken_bots
     res["skia_status"] = "🔴"
+    # List up to 3 distinct broken bots in the tooltip and alert summary
+    bot_summary = [b["task_name"] for b in broken_bots[:3]] or [
+        h["task_name"] for h in blamed[:2]
+    ]
     res["skia_status_detail"] = (
-        f"Blamed by Gardener in: {', '.join(h['task_name'] for h in blamed[:2])}"
+        f"Blamed by Gardener in: {', '.join(bot_summary)}"
     )
     res["has_alert"] = True
     res["alert_reason"] = res["skia_status_detail"]
@@ -2056,6 +2577,8 @@ def fetch_gerrit_cl_status(
           "last_msg_et": last_msg_et,
           "last_msg_age": last_msg_age,
           "last_msg_snippet": last_msg_text[:180],
+          # Creation timestamp bounds the window for correlating follow-up fix CLs
+          "created": created_raw,
           "submitted": submitted_raw,
           "submitted_et": submitted_et,
           "submitted_age": submitted_age,
@@ -2275,7 +2798,8 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
             "--repo",
             "flutter/flutter",
             "--json",
-            "number,title,state,isDraft,author,mergedAt,headRefOid,headRefName,"
+            # Include body so fix-for detection can parse PR bug/revert references
+            "number,title,body,state,isDraft,author,mergedAt,headRefOid,headRefName,"
             "reviewDecision,latestReviews,reviews,comments,"
             # Include commits so author pushes after a review update the PR timeline
             "commits,statusCheckRollup,url,mergeable,reviewRequests,"
@@ -2636,6 +3160,8 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         "is_watching": is_watching,
         "patchset": len(reviews) + 1,
         "revision": head_sha[:10],
+        # Expose PR description text under commit_message for shared fix-for extractors
+        "commit_message": str(d.get("body") or ""),
         "commit_url": (
             f"https://github.com/flutter/flutter/commit/{head_sha}" if head_sha else ""
         ),
@@ -2675,6 +3201,8 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         "last_msg_et": last_msg_et,
         "last_msg_age": last_msg_age,
         "last_msg_snippet": last_snippet,
+        # Creation timestamp bounds the window for correlating follow-up fix PRs
+        "created": created_raw,
         "submitted": merged_raw,
         "submitted_et": submitted_et,
         "submitted_age": submitted_age,
@@ -2779,6 +3307,9 @@ def fetch_piper_cl_status(cl_id: str) -> dict[str, Any]:
         "is_watching": is_watching,
         "patchset": 1,
         "revision": cl_id,
+        # Expose Piper description and timestamp for fix-for correlation
+        "commit_message": "\n".join(desc_lines),
+        "created": piper_ts,
         "in_my_attention": False,
         "cr_summary": "—",
         "cq_status": status,
@@ -3464,6 +3995,10 @@ def sync_once(
   link_companion_changes_to_parent_chats(
       active_discovered, fetched_cache, all_chat_candidates=all_chats
   )
+  # Match follow-up fix CLs/PRs to broken merged CLs/PRs and share parent chats
+  link_fix_changes_to_parent_chats(
+      active_discovered, fetched_cache, all_chat_candidates=all_chats
+  )
 
   unique_tids = sorted(
       {d["target_id"] for d in active_discovered if d.get("target_id")}
@@ -3635,7 +4170,14 @@ def sync_once(
 
     badge = post.get("compact_badge", "")
 
-    if cid and update_titles and badge and not d.get("companion_to"):
+    # Keep the broken parent CL's roll badge on a shared chat rather than a companion or fix CL
+    if (
+        cid
+        and update_titles
+        and badge
+        and not d.get("companion_to")
+        and not d.get("fixes_breakage_from")
+    ):
       update_chat_roll_badge(cid, str(record.get("title") or ""), badge)
 
     # Detect significant transitions only when `prev` existed (no spam on initial seed)
@@ -3794,6 +4336,130 @@ def sync_once(
           for x in c_list
       ):
         c_list.append(comp_entry)
+
+  # Cross-link fix-for CLs/PRs and the broken merged CLs/PRs they address
+  fallback_pairs = detect_fix_for_pairs(
+      {ikey: recs[0] for ikey, recs in by_ikey.items() if recs}
+  )
+  # Backfill fix-for links on records that were not paired before record assembly
+  for ikey, match in fallback_pairs.items():
+    for rec in by_ikey.get(ikey) or []:
+      # Preserve any explicit link already assigned during chat discovery
+      if not rec.get("fixes_breakage_from"):
+        rec["fixes_breakage_from"] = match["broken_key"]
+      # Preserve any bot list already attached to the fix record
+      if not rec.get("fixes_breakage_bots"):
+        rec["fixes_breakage_bots"] = match.get("matched_bots") or []
+
+  for rec in new_items.values():
+    if not isinstance(rec, dict):
+      continue
+    # Promote post-submit blamed bots to the top-level record for UI banners
+    if not rec.get("broken_bots"):
+      rec_bots = _collect_broken_bots_from_item(rec)
+      if rec_bots:
+        rec["broken_bots"] = rec_bots
+    fix_from = str(rec.get("fixes_breakage_from") or "")
+    if not fix_from:
+      continue
+    brk_kind, _, brk_tid = fix_from.partition(":")
+    parent_recs = by_ikey.get(fix_from) or []
+    parent_url = (
+        str(parent_recs[0].get("url") or "")
+        if parent_recs
+        else (
+            f"https://github.com/flutter/flutter/pull/{brk_tid}"
+            if brk_kind == "github"
+            else (
+                f"http://cl/{brk_tid}"
+                if brk_kind == "piper"
+                else f"https://{rec.get('host') or GERRIT_SKIA_HOST}/c/{brk_tid}"
+            )
+        )
+    )
+    parent_label = (
+        f"PR #{brk_tid}"
+        if brk_kind == "github"
+        else (
+            f"cl/{brk_tid}" if brk_kind == "piper" else f"Gerrit {brk_tid}"
+        )
+    )
+    rec["fixes_breakage_label"] = parent_label
+    rec["fixes_breakage_url"] = parent_url
+    merged_bots: list[dict[str, str]] = []
+    seen_mb: set[str] = set()
+    parent_bots = (
+        _collect_broken_bots_from_item(parent_recs[0]) if parent_recs else []
+    )
+    # Combine live Gardener blamed bots on the broken CL with bots named in the fix commit
+    for b in parent_bots + list(rec.get("fixes_breakage_bots") or []):
+      if isinstance(b, dict) and b.get("task_name"):
+        bn = str(b["task_name"])
+        if bn not in seen_mb:
+          seen_mb.add(bn)
+          merged_bots.append(b)
+    rec["fixes_breakage_bots"] = merged_bots
+
+    fix_self_label = (
+        f"PR #{rec.get('target_id')}"
+        if rec.get("kind") == "github"
+        else (
+            f"cl/{rec.get('target_id')}"
+            if rec.get("kind") == "piper"
+            else f"Gerrit {rec.get('target_id')}"
+        )
+    )
+    cq_st = str(rec.get("cq_status") or "")
+    # Summarize the fix CL's review/CQ stage so the broken CL shows fix progress at a glance
+    if str(rec.get("status") or "").upper() == "MERGED":
+      fix_status_summary = "merged"
+    elif rec.get("is_wip") or rec.get("is_draft"):
+      fix_status_summary = str(rec.get("wip_label") or "WIP")
+    elif rec.get("phase") == "SUBMITTING":
+      fix_status_summary = "submitting"
+    elif rec.get("cq_failed"):
+      fix_status_summary = "CQ failed"
+    elif cq_st.startswith("CQ+") or "running" in cq_st:
+      fix_status_summary = cq_st
+    elif (
+        int(rec.get("approved_count") or 0) > 0
+        and int(rec.get("missing_approvals") or 0) == 0
+    ):
+      fix_status_summary = "approved"
+    elif rec.get("reviewer_status"):
+      fix_status_summary = str(rec.get("reviewer_status")).lower()
+    else:
+      fix_status_summary = "in review"
+
+    fix_age = str(
+        rec.get("status_changed_age")
+        or rec.get("last_msg_age")
+        or rec.get("submitted_age")
+        or ""
+    )
+    fix_entry = {
+        "item_key": str(rec.get("item_key") or ""),
+        "target_id": str(rec.get("target_id") or ""),
+        "label": fix_self_label,
+        "url": str(rec.get("url") or ""),
+        "subject": str(rec.get("subject") or ""),
+        "status": str(rec.get("status") or ""),
+        "status_summary": fix_status_summary,
+        "age": fix_age,
+        "is_wip": bool(rec.get("is_wip") or rec.get("is_draft")),
+    }
+    # Attach the fix summary to every record representing the broken parent CL
+    for p_rec in parent_recs:
+      f_list = p_rec.setdefault("fixes", [])
+      # Deduplicate when multiple composite keys share the same fix CL
+      if not any(
+          isinstance(x, dict) and x.get("item_key") == fix_entry["item_key"]
+          for x in f_list
+      ):
+        f_list.append(fix_entry)
+      # Backfill broken_bots on the parent when bots came from the fix CL description
+      if merged_bots and not p_rec.get("broken_bots"):
+        p_rec["broken_bots"] = list(merged_bots)
 
   triage_store.overlay_triage_on_items(new_items.values())
   state["items"] = new_items
@@ -4016,6 +4682,23 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .badge.has-companion {
     background: color-mix(in srgb, var(--ink) 8%, transparent);
     color: var(--graphite);
+  }
+  /* Badges and inline banners for bidirectional fix-for CL/PR links */
+  .badge.fix-for {
+    background: color-mix(in srgb, var(--amber) 18%, transparent);
+    color: var(--amber);
+  }
+  .badge.has-fix {
+    background: color-mix(in srgb, var(--green) 16%, transparent);
+    color: var(--green);
+  }
+  .fix-banner {
+    margin-top: 8px; padding: 8px 12px; border-radius: 10px;
+    background: color-mix(in srgb, var(--ink) 4.5%, transparent);
+    font-size: 13.5px; line-height: 1.45; color: var(--ink);
+  }
+  .row .fix-banner {
+    margin-top: 5px; padding: 5px 9px; font-size: 12.5px;
   }
   .badge.warn {
     background: color-mix(in srgb, var(--red) 13%, transparent);
@@ -4305,7 +4988,84 @@ function badgesHtml(it) {
       ? link(c.url, text, 'badge has-companion', 'Open companion CL/PR')
       : `<span class="badge has-companion">${text}</span>`);
   }
+  // Show bidirectional fix-for badges on both the fix CL and the broken merged CL
+  if (it.fixes_breakage_from) {
+    const refLabel = it.fixes_breakage_label ||
+      String(it.fixes_breakage_from).replace(/^.*:/, 'CL ');
+    const text = `Fixes breakage from → ${esc(refLabel)}`;
+    out.push(it.fixes_breakage_url
+      ? link(it.fixes_breakage_url, text, 'badge fix-for', 'Open broken CL/PR')
+      : `<span class="badge fix-for">${text}</span>`);
+  }
+  const fixes = Array.isArray(it.fixes) ? it.fixes : [];
+  for (const f of fixes) {
+    if (!f || !f.label) continue;
+    const meta = [f.status_summary, f.age].filter(Boolean).join(', ');
+    const text = `fix: ${esc(f.label)}${meta ? ` (${esc(meta)})` : ''}`;
+    out.push(f.url
+      ? link(f.url, text, 'badge has-fix', f.subject || 'Open fix CL/PR')
+      : `<span class="badge has-fix">${text}</span>`);
+  }
   return out.join('');
+}
+
+// Compacts long Skia bot names to prefix…build-config for inline banners
+function compactBotName(name) {
+  const s = String(name || '');
+  const m = s.match(
+    /^((?:Test|Build|Perf)-[A-Za-z0-9_.]+)-(?:Clang|GCC|MSVC)-.*?-((?:Debug|Release)-[A-Za-z0-9_.\-]+)$/
+  );
+  if (m) return `${m[1]}…${m[2]}`;
+  return shortTask(s);
+}
+
+// Formats a list of bot dicts as linked chips with full task_name tooltips
+function formatBotsListHtml(bots) {
+  const list = Array.isArray(bots) ? bots : [];
+  if (!list.length) return 'post-submit bots';
+  return list.map(b => {
+    const name = typeof b === 'string' ? b : (b.task_name || 'bot');
+    const url = (typeof b === 'object' && b) ? (b.task_url || b.swarming_url || '') : '';
+    const label = `<span class="chip" title="${esc(name)}">${esc(compactBotName(name))}</span>`;
+    return url ? link(url, label) : label;
+  }).join(' ');
+}
+
+// Renders 'Broke <bots> · fix: <CL> (status, age)' on the broken merged CL
+function brokenAndFixBannerHtml(it) {
+  const fixes = Array.isArray(it.fixes) ? it.fixes : [];
+  const bots = Array.isArray(it.broken_bots) && it.broken_bots.length
+    ? it.broken_bots
+    : ((it.post_submit && Array.isArray(it.post_submit.broken_bots))
+        ? it.post_submit.broken_bots : []);
+  if (!fixes.length && !bots.length) return '';
+  const parts = [];
+  if (bots.length) {
+    parts.push(`Broke ${formatBotsListHtml(bots)}`);
+  }
+  for (const f of fixes) {
+    if (!f || !f.label) continue;
+    const meta = [f.status_summary, f.age].filter(Boolean).join(', ');
+    const fLink = f.url
+      ? link(f.url, `<b>${esc(f.label)}</b>`, '', f.subject || '')
+      : `<b>${esc(f.label)}</b>`;
+    parts.push(`fix: ${fLink}${meta ? ` (${esc(meta)})` : ''}`);
+  }
+  // Avoid duplicating the incident list on post-submit alert cards when no fix CL exists yet
+  if (!fixes.length && isPostSubmitAlert(it)) return '';
+  return `<div class="fix-banner">${parts.join(' · ')}</div>`;
+}
+
+// Renders 'Fixes breakage from → <CL> · Red bots: <bots>' on the fix CL
+function fixesBreakageBannerHtml(it) {
+  if (!it.fixes_breakage_from) return '';
+  const refLabel = it.fixes_breakage_label || String(it.fixes_breakage_from);
+  const refLink = it.fixes_breakage_url
+    ? link(it.fixes_breakage_url, `<b>${esc(refLabel)}</b>`)
+    : `<b>${esc(refLabel)}</b>`;
+  const bots = Array.isArray(it.fixes_breakage_bots) ? it.fixes_breakage_bots : [];
+  const botsPart = bots.length ? ` · Red bots: ${formatBotsListHtml(bots)}` : '';
+  return `<div class="fix-banner">Fixes breakage from → ${refLink}${botsPart}</div>`;
 }
 
 function reviewerGapHtml(it) {
@@ -4449,6 +5209,35 @@ const INCIDENT_VERDICT_LABEL = {
   low_confidence: 'Low-confidence suspect',
   blamelist: 'In blamelist only',
 };
+
+// Expands multi-bot blamed incidents so every affected task appears in the card
+function expandIncidentsForDisplay(ps) {
+  const raw = (ps && Array.isArray(ps.incidents)) ? ps.incidents : [];
+  const out = [];
+  const seen = new Set();
+  for (const h of raw) {
+    const aff = Array.isArray(h.affected_tasks) ? h.affected_tasks : [];
+    // Split a multi-bot blamed incident into one entry per distinct affected bot
+    if (h.verdict === 'blamed' && aff.length > 1) {
+      for (const a of aff) {
+        const name = a.task_name || h.task_name;
+        if (seen.has(name)) continue;
+        seen.add(name);
+        out.push({
+          ...h,
+          task_name: name,
+          task_url: a.task_url || h.task_url,
+          swarming_url: a.swarming_url || h.swarming_url,
+        });
+      }
+    } else {
+      if (seen.has(h.task_name)) continue;
+      seen.add(h.task_name);
+      out.push(h);
+    }
+  }
+  return out;
+}
 
 function incidentHtml(h) {
   const label = INCIDENT_VERDICT_LABEL[h.verdict] || esc(h.verdict);
@@ -5109,7 +5898,8 @@ function focusCard(it, data) {
   const cardTitle = `${badgesHtml(it)}${link(it.url, subject)}`;
   if (isPostSubmitAlert(it)) {
     const ps = it.post_submit || {};
-    const incidents = ps.incidents || [];
+    // Show all affected tasks on multi-bot incidents and include fix-for banners
+    const incidents = expandIncidentsForDisplay(ps);
     const blamed = incidents.some(h => h.verdict === 'blamed');
     const eyebrow = blamed ? 'Broke the Skia tree' : esc(ps.alert_reason || 'Post-submit alert');
     const first = incidents[0] || {};
@@ -5124,7 +5914,9 @@ function focusCard(it, data) {
       <div><div class="eyebrow">${busyBadge}${eyebrow} · ${esc(it.project_name)} ·
         ${link(it.url, clLabel(it))}</div>
         <h2>${cardTitle}</h2>
-        <div class="why">${landed}${blame}</div></div>
+        <div class="why">${landed}${blame}</div>
+        <!-- Surface broken bots and linked fix CLs directly inside the alert card -->
+        ${brokenAndFixBannerHtml(it)}${fixesBreakageBannerHtml(it)}</div>
       <div class="actions">${primary}${chatBtn}</div>
       ${incidents.length
         ? `<div class="incidents">${incidents.map(incidentHtml).join('')}</div>` : ''}
@@ -5167,7 +5959,9 @@ function focusCard(it, data) {
       <div><div class="eyebrow">${busyBadge}${esc(it.project_name)} · ${link(it.url, clLabel(it))} ·
         PS${esc(it.patchset || 1)}</div>
         <h2>${cardTitle}</h2>
-        <div class="why">${fullWhy}</div></div>
+        <div class="why">${fullWhy}</div>
+        <!-- Surface fix-for linkage on pre-submit focus cards -->
+        ${brokenAndFixBannerHtml(it)}${fixesBreakageBannerHtml(it)}</div>
       <div class="actions">${actions}</div>
       ${triageHtml(it, false)}
     </article>`;
@@ -5185,6 +5979,8 @@ function rowHtml(it, data) {
     <div class="row">
       <div><div class="title">${badgesHtml(it)}${link(it.url, esc(cleanSubject(it.subject)))}</div>
         <div class="meta">${meta}</div>
+        <!-- Surface fix-for linkage and broken bots on lane rows -->
+        ${brokenAndFixBannerHtml(it)}${fixesBreakageBannerHtml(it)}
         ${triageHtml(it, true)}</div>
       <div class="state">${stateHtml(it)}</div>
       <div class="when">${rowTime(it)}</div>
