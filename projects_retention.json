@@ -1,0 +1,15 @@
+{
+  "keep": {
+    "skia-g3-roll-check": 1,
+    "debug_skia_roll_issue": 3
+  },
+  "triage_hard_delete_projects": {
+    "skia-g3-roll-check": 30
+  },
+  "gc": {
+    "scratch_gc_days": 7,
+    "task_log_gc_days": 30,
+    "trash_delete_days": 7,
+    "cold_archive_days": 90
+  }
+}

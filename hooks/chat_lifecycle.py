@@ -946,6 +946,7 @@ def load_project_models() -> dict[str, str]:
       with open(DEFAULT_PROJECT_MODELS_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
       if isinstance(data, dict):
+        # Support both legacy flat {"proj": N} and structured {"keep": {...}} formats
         for k, v in data.items():
           if isinstance(v, str) and v.strip():
             rules[k.strip()] = v.strip()
@@ -2977,9 +2978,16 @@ def load_retention_rules() -> dict[str, int]:
       with open(DEFAULT_PROJECT_RETENTION_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
       if isinstance(data, dict):
+        # Support both legacy flat {"proj": N} and structured {"keep": {...}} formats
         for k, v in data.items():
-          if isinstance(v, int):
+          if isinstance(v, int) and k not in (
+              "keep", "gc", "triage_hard_delete_projects"
+          ):
             rules[k] = v
+        if isinstance(data.get("keep"), dict):
+          for k, v in data["keep"].items():
+            if isinstance(v, int):
+              rules[k] = v
     except Exception:
       pass
   return rules
@@ -3465,7 +3473,9 @@ Commands:
   search "<query>"                    Search all chats, archived handoff pieces included
                                       (LS SearchConversations: one best hit per chat, at
                                       most 100 chats, symbols like ✓ never match). Each
-                                      hit shows its piece number in its chain.
+                                      hit shows its piece number in its chain. Pass --cold
+                                      to search only cold_archive (SQLite FTS5), or
+                                      --include-cold to search both live and cold archives.
   search "<query>" --chain <id>       Every user message and agent reply containing the
                                       query across all pieces of <id>'s chain, newest
                                       first (thinking and tool output are skipped).
@@ -3488,6 +3498,12 @@ Commands:
   auto-archive [<id>] [--hook]        Prune older chats across projects configured with
                                       a retention policy (default: keep 1 newest for
                                       skia-g3-roll-check). Use --hook for lifecycle hooks.
+  gc [--apply] [--json]               Run 3-tier conversation garbage collection: Tier 1
+     [--scratch-days N]               scratch/ GC (>=7d), Tier 2 hard delete (>=7d trash/
+     [--trash-days N]                 subagents, >=30d roll checks), Tier 3 cold archive
+     [--cold-days N]                  (>=90d whole chains). Default is dry-run.
+  cold-show <id> [--json]             Show a cold-archived conversation transcript and
+                                      metadata from ~/.gemini/jetski/cold_archive/.
   finalize <id>                       Archive the whole chain. USER-ONLY: run it
                                       only on the user's explicit word ("финал").
   reopen <id>                         Unarchive <id> as an open ⦿ chat. USER-ONLY.
@@ -3536,6 +3552,8 @@ KNOWN_COMMANDS = (
     "audit",
     "archive",
     "auto-archive",
+    "gc",
+    "cold-show",
     "search",
 )
 
@@ -3974,12 +3992,20 @@ def main(argv: list[str] | None = None) -> int:
       )
   elif cmd == "search":
     query, chain_of = "", ""
+    cold_only = False
+    include_cold = False
     i = 0
     while i < len(args):
       a = args[i]
       if a == "--chain" and i + 1 < len(args):
         chain_of = _require_conversation_id("search", args[i + 1])
         i += 2
+      elif a == "--cold":
+        cold_only = True
+        i += 1
+      elif a == "--include-cold":
+        include_cold = True
+        i += 1
       elif a.startswith("-"):
         _cli_fail("search", f"unknown option '{a}'")
       elif not query:
@@ -3990,32 +4016,162 @@ def main(argv: list[str] | None = None) -> int:
     # A blank needle would match every message
     if not query.strip():
       _cli_fail("search", "a query is required")
+    if chain_of and (cold_only or include_cold):
+      _cli_fail("search", "--cold/--include-cold cannot be combined with --chain")
+
     try:
-      chain_hits = search_chain(query, chain_of) if chain_of else []
-      res = {} if chain_of else search_conversations(query)
+      if cold_only:
+        # Search cold storage FTS5 index directly
+        import chat_gc  # pylint: disable=g-import-not-at-top
+        cold_hits = chat_gc.search_cold_archive(query)
+        for h in cold_hits:
+          when = _iso_to_et_stamp(h.get("lastModifiedTime", ""))
+          print(
+              f"{h.get('title', '')}  [COLD piece {h['piece']}/{h['chain_length']}, {when},"
+              f" {h['who']}]\n  {h.get('snippet', '')}\n  cold://{h.get('cascadeId', '')}"
+          )
+        if not cold_hits:
+          print("No matches")
+      elif chain_of:
+        chain_hits = search_chain(query, chain_of)
+        for h in chain_hits:
+          print(
+              f"[piece {h['piece']}/{h['chain_length']}, {h['who']} step {h['step']}]"
+              f" {h['snippet']}\n  conversation://{h['cascadeId']}"
+          )
+        if not chain_hits:
+          print("No matches")
+      else:
+        res = search_conversations(query)
+        for h in res["hits"]:
+          when = _iso_to_et_stamp(h.get("lastModifiedTime", ""))
+          who = "user" if h.get("matchSource") == "MATCH_SOURCE_USER" else "agent"
+          print(
+              f"{h.get('title', '')}  [piece {h['piece']}/{h['chain_length']}, {when},"
+              f" {who} step {h.get('matchedStepIndex', 0)}]\n"
+              f"  {h.get('snippet', '')}\n  conversation://{h.get('cascadeId', '')}"
+          )
+        if res["capped"]:
+          print(f"(LS returned {SEARCH_RPC_CAP} chats, the cap: refine the query)")
+        cold_hits = []
+        if include_cold:
+          # Append matches from cold archive FTS5 index
+          import chat_gc  # pylint: disable=g-import-not-at-top
+          cold_hits = chat_gc.search_cold_archive(query)
+          for h in cold_hits:
+            when = _iso_to_et_stamp(h.get("lastModifiedTime", ""))
+            print(
+                f"{h.get('title', '')}  [COLD piece {h['piece']}/{h['chain_length']}, {when},"
+                f" {h['who']}]\n  {h.get('snippet', '')}\n  cold://{h.get('cascadeId', '')}"
+            )
+        if not res["hits"] and not cold_hits:
+          print("No matches")
     except RuntimeError as exc:
       _cli_fail("search", str(exc))
-    if chain_of:
-      for h in chain_hits:
-        print(
-            f"[piece {h['piece']}/{h['chain_length']}, {h['who']} step {h['step']}]"
-            f" {h['snippet']}\n  conversation://{h['cascadeId']}"
-        )
-      if not chain_hits:
-        print("No matches")
+    except Exception as exc:
+      _cli_fail("search", str(exc))
+  elif cmd == "gc":
+    do_apply = False
+    scratch_days = None
+    trash_days = None
+    cold_days = None
+    i = 0
+    while i < len(args):
+      a = args[i]
+      if a == "--apply":
+        do_apply = True
+        i += 1
+      elif a == "--json":
+        i += 1
+      elif a in ("--scratch-days", "-s") and i + 1 < len(args):
+        try:
+          scratch_days = int(args[i + 1])
+        except ValueError:
+          _cli_fail("gc", f"invalid integer for {a}: '{args[i + 1]}'")
+        i += 2
+      elif a.startswith("--scratch-days="):
+        try:
+          scratch_days = int(a.split("=", 1)[1])
+        except ValueError:
+          _cli_fail("gc", f"invalid integer for --scratch-days: '{a}'")
+        i += 1
+      elif a in ("--trash-days", "-t") and i + 1 < len(args):
+        try:
+          trash_days = int(args[i + 1])
+        except ValueError:
+          _cli_fail("gc", f"invalid integer for {a}: '{args[i + 1]}'")
+        i += 2
+      elif a.startswith("--trash-days="):
+        try:
+          trash_days = int(a.split("=", 1)[1])
+        except ValueError:
+          _cli_fail("gc", f"invalid integer for --trash-days: '{a}'")
+        i += 1
+      elif a in ("--cold-days", "-c") and i + 1 < len(args):
+        try:
+          cold_days = int(args[i + 1])
+        except ValueError:
+          _cli_fail("gc", f"invalid integer for {a}: '{args[i + 1]}'")
+        i += 2
+      elif a.startswith("--cold-days="):
+        try:
+          cold_days = int(a.split("=", 1)[1])
+        except ValueError:
+          _cli_fail("gc", f"invalid integer for --cold-days: '{a}'")
+        i += 1
+      elif a.startswith("-"):
+        _cli_fail("gc", f"unknown option '{a}'")
+      else:
+        _cli_fail("gc", f"unexpected argument '{a}'")
+    try:
+      # Run 3-tier garbage collection and cold archive eviction
+      import chat_gc  # pylint: disable=g-import-not-at-top
+      report = chat_gc.run_gc(
+          apply=do_apply,
+          scratch_days=scratch_days,
+          trash_days=trash_days,
+          cold_days=cold_days,
+      )
+    except Exception as exc:
+      _cli_fail("gc", f"garbage collection failed: {exc}")
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+  elif cmd == "cold-show":
+    target_cid = ""
+    json_mode = False
+    for a in args:
+      if a == "--json":
+        json_mode = True
+      elif not a.startswith("-") and not target_cid:
+        target_cid = a
+      elif a.startswith("-"):
+        _cli_fail("cold-show", f"unknown option '{a}'")
+      else:
+        _cli_fail("cold-show", f"unexpected argument '{a}'")
+    if not target_cid:
+      _cli_fail("cold-show", "conversation ID or prefix is required")
+    try:
+      import chat_gc  # pylint: disable=g-import-not-at-top
+      info = chat_gc.get_cold_conversation(target_cid)
+    except Exception as exc:
+      _cli_fail("cold-show", str(exc))
+    if json_mode:
+      print(json.dumps(info, ensure_ascii=False, indent=2))
     else:
-      for h in res["hits"]:
-        when = _iso_to_et_stamp(h.get("lastModifiedTime", ""))
-        who = "user" if h.get("matchSource") == "MATCH_SOURCE_USER" else "agent"
-        print(
-            f"{h.get('title', '')}  [piece {h['piece']}/{h['chain_length']}, {when},"
-            f" {who} step {h.get('matchedStepIndex', 0)}]\n"
-            f"  {h.get('snippet', '')}\n  conversation://{h.get('cascadeId', '')}"
-        )
-      if res["capped"]:
-        print(f"(LS returned {SEARCH_RPC_CAP} chats, the cap: refine the query)")
-      if not res["hits"]:
-        print("No matches")
+      when = _iso_to_et_stamp(info.get("lastModifiedTime", ""))
+      print(
+          f"Title: {info['title']}\n"
+          f"Cascade ID: {info['cascadeId']}\n"
+          f"Project ID: {info['projectId'] or 'outside-of-project'}\n"
+          f"Chain Piece: {info['piece']}/{info['chainLength']}\n"
+          f"Last Modified: {when}\n"
+      )
+      for m in info.get("messages", []):
+        who = m.get("who", "user").upper()
+        step = m.get("step", 0)
+        txt = m.get("text", "")
+        print(f"--- [{who} Step {step}] ---")
+        print(txt.rstrip())
+        print()
   elif cmd == "auto-archive":
     is_hook = "--hook" in args
     target_cid = ""

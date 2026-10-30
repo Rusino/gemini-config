@@ -1,0 +1,9 @@
+[Unit]
+Description=Jetski 3-Tier Conversation Garbage Collection and Auto-Archive
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -lc '\
+  python3 $HOME/.gemini/config/hooks/chat_lifecycle.py auto-archive && \
+  python3 $HOME/.gemini/config/hooks/chat_lifecycle.py audit --fix && \
+  python3 $HOME/.gemini/config/hooks/chat_lifecycle.py gc --apply'

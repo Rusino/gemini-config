@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Jetski 3-Tier Conversation Garbage Collection Timer
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target
