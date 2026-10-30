@@ -68,6 +68,13 @@ def sync_artifact_js(
     roadmap.export_roadmap_index()
   except Exception:
     pass
+  open_req_dst = os.path.join(os.path.dirname(dst), "jetski-open-chat.json")
+  if not os.path.isfile(open_req_dst):
+    try:
+      with open(open_req_dst, "w", encoding="utf-8") as f:
+        f.write('{"requestId":"","cascadeId":"","requestedAt":0}\n')
+    except OSError:
+      pass
 
 
 SAR_BIN_RELPATH = (

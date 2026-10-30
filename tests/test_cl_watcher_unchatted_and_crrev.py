@@ -391,6 +391,8 @@ class ClWatcherUnchattedAndCrrevTest(unittest.TestCase):
     call_kwargs = mock_start.call_args.kwargs
     self.assertEqual(call_kwargs["project_id"], "p-tc")
     self.assertIn("crrev/c/8663038", call_kwargs["title"])
+    self.assertIn("Проведи review-triage для", call_kwargs["prompt"])
+    self.assertIn("никогда не публикуй комментарии ревью без моего подтверждения", call_kwargs["prompt"])
     self.assertNotIn("gerrit:8663038@unchatted", saved["items"])
     self.assertIn("gerrit:8663038@new-cid-1234", saved["items"])
     self.assertTrue(saved["items"]["gerrit:8663038@new-cid-1234"]["chat_busy"])

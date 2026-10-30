@@ -5961,6 +5961,50 @@
   window.__jetskiOpenConversation = openConversation;
   window.__jetskiLocateInSidebar = locateConversationInSidebar;
 
+  let lastOpenChatReqId = '';
+  let openChatPollTimer = 0;
+  let openChatPollingInFlight = false;
+
+  // Polls /static/artifacts/jetski-open-chat.json so Flight Deck can navigate an existing tab
+  async function pollOpenChatRequest() {
+    if (disposed || openChatPollingInFlight || typeof window.fetch !== 'function') return false;
+    openChatPollingInFlight = true;
+    try {
+      const resp = await window.fetch('/static/artifacts/jetski-open-chat.json?t=' + Date.now(), {
+        cache: 'no-store',
+      });
+      if (!resp || !resp.ok) return false;
+      const data = await resp.json();
+      const reqId = typeof data?.requestId === 'string' ? data.requestId : '';
+      const cid = typeof data?.cascadeId === 'string' ? data.cascadeId.trim() : '';
+      const reqAt = Number(data?.requestedAt || 0);
+      if (!reqId || !cid || reqId === lastOpenChatReqId) return false;
+      // Ignore stale requests older than 15 seconds on initial tab load
+      if (reqAt > 0 && Math.abs(Date.now() - reqAt) > 15000) {
+        lastOpenChatReqId = reqId;
+        return false;
+      }
+      lastOpenChatReqId = reqId;
+      manualVisitedCids.add(cid);
+      openConversation(cid);
+      try {
+        window.focus?.();
+      } catch {
+        // Ignore window.focus failures in restricted browsing contexts
+      }
+      await postUpdateAnnotationsRpc(cid, {
+        lastUserViewTime: new Date().toISOString(),
+      });
+      return true;
+    } catch {
+      return false;
+    } finally {
+      openChatPollingInFlight = false;
+    }
+  }
+
+  window.__jetskiPollOpenChatRequest = pollOpenChatRequest;
+
   // Matryoshka chain star tooltip showing lazy piece turn counts and question previews
   let chainTooltipEl = null;
   let activeTooltipBtn = null;
@@ -8253,6 +8297,10 @@
       clearTimeout(autopilotToastTimer);
       autopilotToastTimer = 0;
     }
+    if (openChatPollTimer) {
+      clearInterval(openChatPollTimer);
+      openChatPollTimer = 0;
+    }
     manualPickedModels.clear();
     autoSeededTargets.clear();
     // Remove all injected filter buttons, search panels, and chain stars on reload
@@ -8307,4 +8355,10 @@
 
   bindInputBoxSeenListeners();
   runFullSync();
+  openChatPollTimer = setInterval(() => {
+    void pollOpenChatRequest();
+  }, 250);
+  if (openChatPollTimer && typeof openChatPollTimer.unref === 'function') {
+    openChatPollTimer.unref();
+  }
 })();

@@ -61,6 +61,10 @@ DEFAULT_PORT = 8089
 DEFAULT_SKIA_DIR = os.path.expanduser("~/.gemini/jetski/scratch/skia_main")
 DEFAULT_GARDENER_URL = "http://localhost:8080"
 STATE_FILE = os.path.expanduser("~/.gemini/config/logs/cl_watcher_state.json")
+OPEN_CHAT_REQ_FILE = os.path.expanduser(
+    "~/.gemini/jetski/brain/jetski-open-chat.json"
+)
+ANNOTATIONS_DIR = os.path.expanduser("~/.gemini/jetski/annotations")
 PROJECTS_DIR = os.path.expanduser("~/.gemini/config/projects")
 IGNORED_CLS_FILE = os.path.expanduser(
     "~/.gemini/config/skills/review-triage/ignored_cls.txt"
@@ -2870,20 +2874,86 @@ def start_chat_for_item(item_key: str) -> dict[str, Any]:
   ps = int(rec.get("patchset") or 1)
   if rec.get("is_self"):
     prompt = (
-        f"Track and assist with my change {url} ('{subj}', PS{ps}). "
-        "Inspect its current status, review comments, and CI checks, and summarize "
-        "anything that needs my attention."
+        f"Отслеживай и помогай с моим изменением {url} ('{subj}', PS{ps}). "
+        "Проверь текущий статус, комментарии ревью и проверки CI, и кратко напиши, "
+        "что требует моего внимания."
     )
   else:
     prompt = (
-        f"Please run review-triage on {url} ('{subj}', PS{ps}) and prepare a code "
-        "review analysis (never publish review comments without my confirmation)."
+        f"Проведи review-triage для {url} ('{subj}', PS{ps}) и подготовь разбор ревью "
+        "(никогда не публикуй комментарии ревью без моего подтверждения)."
     )
 
   res = _start_pinned_chat_for_record(items, ikey, matched_key, rec, prompt)
   if res.get("ok"):
     save_watcher_state(state)
   return res
+
+
+def request_open_in_existing_tab(
+    conv_id: str, timeout_sec: float = 0.85
+) -> bool:
+  """Asks an open Jetski Web tab to navigate in-place to `conv_id` and waits for ack."""
+  cid = str(conv_id or "").strip()
+  if not cid:
+    return False
+  ann_file = os.path.join(ANNOTATIONS_DIR, f"{cid}.pbtxt")
+  before_mtime = 0.0
+  before_txt = ""
+  if os.path.isfile(ann_file):
+    try:
+      before_mtime = os.path.getmtime(ann_file)
+      with open(ann_file, "r", encoding="utf-8", errors="ignore") as f:
+        before_txt = f.read()
+    except OSError:
+      pass
+  req_ts_ms = int(time.time() * 1000)
+  req_id = f"req-{req_ts_ms}-{cid[:8]}"
+  payload = {
+      "requestId": req_id,
+      "cascadeId": cid,
+      "requestedAt": req_ts_ms,
+  }
+  try:
+    os.makedirs(os.path.dirname(OPEN_CHAT_REQ_FILE), exist_ok=True)
+    tmp_path = f"{OPEN_CHAT_REQ_FILE}.tmp.{os.getpid()}"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+      json.dump(payload, f, ensure_ascii=False)
+    os.replace(tmp_path, OPEN_CHAT_REQ_FILE)
+  except OSError:
+    return False
+
+  if timeout_sec <= 0:
+    return False
+  deadline = time.time() + timeout_sec
+  while time.time() < deadline:
+    time.sleep(0.05)
+    if os.path.isfile(ann_file):
+      try:
+        cur_mtime = os.path.getmtime(ann_file)
+        with open(ann_file, "r", encoding="utf-8", errors="ignore") as f:
+          cur_txt = f.read()
+        if cur_mtime > before_mtime or cur_txt != before_txt:
+          return True
+      except OSError:
+        pass
+  return False
+
+
+def open_chat_for_id(
+    conv_id: str, timeout_sec: float = 0.85
+) -> dict[str, Any]:
+  """Handles `/api/open_chat` by routing in-place when an open Jetski tab acknowledges."""
+  cid = str(conv_id or "").strip()
+  if not cid:
+    return {"ok": False, "error": "Missing conversation_id"}
+  reused = request_open_in_existing_tab(cid, timeout_sec=timeout_sec)
+  return {
+      "ok": True,
+      "conversation_id": cid,
+      "chat_url": f"{jetski_box_url()}/c/{cid}",
+      "reused_tab": reused,
+  }
 
 
 def _build_rebase_prompt(rec: dict[str, Any]) -> str:
@@ -2893,22 +2963,23 @@ def _build_rebase_prompt(rec: dict[str, Any]) -> str:
   ps = int(rec.get("patchset") or 1)
   if rec.get("kind") == "github":
     return (
-        f"[FLIGHT-DECK REBASE] {url} ('{subj}') has a merge conflict with upstream main/master. "
-        "Please rebase this PR branch onto the latest upstream main branch in its local worktree "
-        "(create an isolated worktree if the main checkout is dirty or leased), resolve all merge "
-        "conflicts while preserving domain invariants and behavior, rerun the relevant unit tests "
-        "(plus run_webparagraph_corpus.py if lib/web_ui/lib/ production code is touched) and "
-        "amnesia-precommit checks, and push the rebased branch to update the PR. "
-        "Do not merge the PR or enable auto-merge."
+        f"[FLIGHT-DECK REBASE] В {url} ('{subj}') возник merge conflict с upstream "
+        "main/master. Сделай rebase ветки этого PR на свежий upstream main в локальном "
+        "worktree (создай изолированный worktree, если основной checkout грязный или занят "
+        "лизом), разреши все merge conflicts с сохранением доменных инвариантов и поведения, "
+        "прогони релевантные unit-тесты (плюс run_webparagraph_corpus.py, если затронут "
+        "продакшн-код в lib/web_ui/lib/) и проверки amnesia-precommit, после чего запушь "
+        "обновлённую ветку в PR. Не мержи PR и не включай auto-merge."
     )
   return (
-      f"[FLIGHT-DECK REBASE] {url} ('{subj}', PS{ps}) has a merge conflict with origin/main. "
-      "Please fetch and rebase this CL onto the latest origin/main in its local worktree "
-      "(create an isolated worktree if the main checkout is dirty or leased), resolve all merge "
-      "conflicts while preserving domain invariants and behavior, rerun the relevant unit tests "
-      "(plus run_flutter_paragraph_tests.py if modules/{skparagraph,skunicode,skshaper}/"
-      "{src,include}/ production code is touched) and amnesia-precommit checks, and run "
-      "`git cl upload` to upload the rebased patchset. Never vote CQ+1, CQ+2, or Auto-Submit+1."
+      f"[FLIGHT-DECK REBASE] В {url} ('{subj}', PS{ps}) возник merge conflict с "
+      "origin/main. Сделай fetch и rebase этого CL на свежий origin/main в локальном "
+      "worktree (создай изолированный worktree, если основной checkout грязный или занят "
+      "лизом), разреши все merge conflicts с сохранением доменных инвариантов и поведения, "
+      "прогони релевантные unit-тесты (плюс run_flutter_paragraph_tests.py, если затронут "
+      "продакшн-код в modules/{skparagraph,skunicode,skshaper}/{src,include}/) и проверки "
+      "amnesia-precommit, после чего загрузи обновлённый patchset через `git cl upload`. "
+      "Никогда не ставь CQ+1, CQ+2 или Auto-Submit+1."
   )
 
 
@@ -3300,10 +3371,10 @@ def sync_once(
           gstat["inbox_msgs"] = 0
           gstat["inbox_thread_ids"] = []
         transition_msg = (
-            f"[CL-WATCHER] ✅ {ikey} ('{info['subject']}') has just MERGED "
-            f"(revision {info['revision'][:10]}). Gmail INBOX threads for {tid} "
-            f"were automatically archived. Please report the initial Skia Status "
-            f"and 4-autoroll watch checklist."
+            f"[CL-WATCHER] ✅ {ikey} ('{info['subject']}') только что замержен "
+            f"(ревизия {info['revision'][:10]}). Треды Gmail во входящих (INBOX) для "
+            f"{tid} автоматически заархивированы. Сообщи начальный статус Skia Status "
+            f"и чеклист отслеживания 4 автороллов."
         )
       elif (
           info["phase"] == "ALERT_ROLL_OR_STATUS"
@@ -3314,15 +3385,15 @@ def sync_once(
             post.get("alert_reason") or "Post-submit regression or roll failure"
         )
         transition_msg = (
-            f"[CL-WATCHER] 🔴 CRITICAL ALERT for {ikey} ({info['revision'][:10]}): "
-            f"{reason}. Please inspect skia-gardener / status.skia.org immediately "
-            f"and prepare a diagnosis."
+            f"[CL-WATCHER] 🔴 CRITICAL ALERT для {ikey} ({info['revision'][:10]}): "
+            f"{reason}. Немедленно проверь skia-gardener / status.skia.org и подготовь "
+            f"диагностику."
         )
       elif info["phase"] == "ALERT_CQ_FAILED" and prev_phase != "ALERT_CQ_FAILED":
         is_critical = True
         transition_msg = (
-            f"[CL-WATCHER] 🔴 CQ / Presubmit failed on {ikey} (PS{info['patchset']}): "
-            f"{info['last_msg_snippet']}. Please inspect the failure and propose a fix."
+            f"[CL-WATCHER] 🔴 Упал CQ / Presubmit на {ikey} (PS{info['patchset']}): "
+            f"{info['last_msg_snippet']}. Проверь причину падения и предложи фикс."
         )
       elif post.get("all_passed") and not prev_all_passed:
         if gstat.get("inbox_thread_ids"):
@@ -3330,10 +3401,10 @@ def sync_once(
           gstat["inbox_msgs"] = 0
           gstat["inbox_thread_ids"] = []
         transition_msg = (
-            f"[CL-WATCHER] 🏁 All 4 autorolls (Android, Chrome, Google3, Flutter) and "
-            f"Skia Status have passed cleanly for {ikey} ({info['revision'][:10]})! "
-            f"Remaining Gmail threads for {tid} have been archived from INBOX. "
-            f"Ask the user if we should finalize this chat."
+            f"[CL-WATCHER] 🏁 Все 4 авторолла (Android, Chrome, Google3, Flutter) и "
+            f"Skia Status успешно прошли для {ikey} ({info['revision'][:10]})! "
+            f"Оставшиеся треды Gmail для {tid} заархивированы из INBOX. "
+            f"Спроси пользователя, стоит ли финализировать этот чат."
         )
       elif (
           prev_phase == "ALERT_ROLL_OR_STATUS"
@@ -3343,10 +3414,10 @@ def sync_once(
         # chasing a culprit the Gardener no longer names. It sits below the all-rolls
         # branch so that branch still archives Gmail when both happen in one sync
         transition_msg = (
-            f"[CL-WATCHER] ✅ Alert withdrawn for {ikey} ({info['revision'][:10]}): "
-            f"Skia Gardener does not blame this commit "
+            f"[CL-WATCHER] ✅ Алерт снят для {ikey} ({info['revision'][:10]}): "
+            f"Skia Gardener не винит этот коммит "
             f"({post.get('skia_status_detail') or 'no matching incident'}). "
-            f"Disregard the earlier CRITICAL ALERT."
+            f"Игнорируй предыдущий CRITICAL ALERT."
         )
       elif (
           info["status"] in ("NEW", "OPEN")
@@ -3358,9 +3429,9 @@ def sync_once(
           and info["in_my_attention"]
       ):
         transition_msg = (
-            f"[CL-WATCHER] 💬 New update on {ikey} (PS{info['patchset']}) from "
+            f"[CL-WATCHER] 💬 Новое обновление в {ikey} (PS{info['patchset']}) от "
             f"{info['last_msg_author']}: {info['last_msg_snippet']}. "
-            f"Please run incremental triage/analysis and draft a response."
+            f"Проведи инкрементальный триаж/анализ и подготовь черновик ответа."
         )
 
       if transition_msg:
@@ -4122,7 +4193,11 @@ function chatActionHtml(it, data, compact) {
     const label = it.chat_archived
       ? (compact ? 'chat (archived)' : 'Open chat (archived)')
       : (compact ? 'chat' : 'Open chat');
-    return compact ? link(chat, label, 'chat') : link(chat, label, 'btn quiet');
+    const cls = compact ? 'chat' : 'btn quiet';
+    const cidJson = esc(JSON.stringify(it.conversation_id || ''));
+    const urlJson = esc(JSON.stringify(chat));
+    return `<a class="${cls}" href="${esc(chat)}" target="jetski-chat" ` +
+      `onclick="return openChat(${cidJson}, ${urlJson}, event)">${label}</a>`;
   }
   if (!it.item_key) return '';
   const cls = compact ? 'link-btn chat' : 'btn quiet';
@@ -4491,6 +4566,30 @@ async function fetchState() {
   }
 }
 
+async function openChat(convId, url, ev) {
+  if (ev) {
+    if (ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.button === 1) return true;
+    if (typeof ev.preventDefault === 'function') ev.preventDefault();
+  }
+  if (convId && typeof fetch === 'function') {
+    try {
+      const resp = await fetch('/api/open_chat', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({conversation_id: convId}),
+      });
+      const res = await resp.json();
+      if (res && res.ok && res.reused_tab) return false;
+    } catch (e) {
+      // Fall back to named window navigation when local server is unreachable
+    }
+  }
+  if (url && typeof window !== 'undefined' && typeof window.open === 'function') {
+    window.open(url, 'jetski-chat');
+  }
+  return false;
+}
+
 async function startChat(itemKey, btn) {
   if (!itemKey || (btn && btn.disabled)) return;
   const orig = btn ? btn.textContent : '';
@@ -4506,7 +4605,7 @@ async function startChat(itemKey, btn) {
     });
     const res = await resp.json();
     if (res && res.ok && res.chat_url) {
-      window.open(res.chat_url, '_blank', 'noopener');
+      await openChat(res.conversation_id || '', res.chat_url);
       await fetchState();
       return;
     }
@@ -4633,7 +4732,7 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
       self._send_json({"ok": True, "count": len(state.get("items") or {})})
       return
 
-    if parsed.path in ("/api/start_chat", "/api/rebase"):
+    if parsed.path in ("/api/start_chat", "/api/rebase", "/api/open_chat"):
       length = int(self.headers.get("Content-Length") or 0)
       raw_body = (
           self.rfile.read(length).decode("utf-8", errors="replace")
@@ -4645,12 +4744,14 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
       except ValueError:
         self._send_json({"ok": False, "error": "Invalid JSON"}, code=400)
         return
-      ikey = str((body if isinstance(body, dict) else {}).get("item_key") or "")
-      res = (
-          start_chat_for_item(ikey)
-          if parsed.path == "/api/start_chat"
-          else rebase_item(ikey)
-      )
+      bdict = body if isinstance(body, dict) else {}
+      if parsed.path == "/api/open_chat":
+        cid = str(bdict.get("conversation_id") or "")
+        res = open_chat_for_id(cid)
+      elif parsed.path == "/api/start_chat":
+        res = start_chat_for_item(str(bdict.get("item_key") or ""))
+      else:
+        res = rebase_item(str(bdict.get("item_key") or ""))
       self._send_json(res, code=200 if res.get("ok") else 400)
       return
 

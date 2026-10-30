@@ -78,6 +78,7 @@ class ClWatcherRebaseTest(unittest.TestCase):
     self.assertIn("origin/main", msg)
     self.assertIn("git cl upload", msg)
     self.assertIn("CQ+1", msg)
+    self.assertIn("возник merge conflict", msg)
     self.assertNotIn("gerrit:1408158@c-root", saved["items"])
     rec = saved["items"]["gerrit:1408158@c-tail"]
     self.assertTrue(rec["chat_busy"])
@@ -133,6 +134,7 @@ class ClWatcherRebaseTest(unittest.TestCase):
     self.assertIn("PR #193514", kwargs["title"])
     self.assertIn("https://github.com/flutter/flutter/pull/193514", kwargs["prompt"])
     self.assertIn("run_webparagraph_corpus.py", kwargs["prompt"])
+    self.assertIn("возник merge conflict", kwargs["prompt"])
     self.assertNotIn("github:193514@unchatted", saved["items"])
     self.assertTrue(saved["items"]["github:193514@c-new-pr"]["chat_busy"])
 
@@ -688,6 +690,81 @@ console.log(JSON.stringify({
     out = json.loads(proc.stdout.strip())
     self.assertEqual(out["status"], "watching")
     self.assertEqual(out["lane"], "watching")
+
+  def test_open_chat_for_id_and_http_post_api_open_chat(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      req_file = os.path.join(tmp, "jetski-open-chat.json")
+      ann_dir = os.path.join(tmp, "annotations")
+      os.makedirs(ann_dir, exist_ok=True)
+      ann_file = os.path.join(ann_dir, "c-123.pbtxt")
+      with open(ann_file, "w", encoding="utf-8") as f:
+        f.write('title: "Old title"\n')
+
+      with mock.patch.object(w, "OPEN_CHAT_REQ_FILE", req_file), \
+           mock.patch.object(w, "ANNOTATIONS_DIR", ann_dir):
+        # Untouched annotation file causes request_open_in_existing_tab to time out (False)
+        reused_false = w.request_open_in_existing_tab("c-123", timeout_sec=0.08)
+        self.assertFalse(reused_false)
+        self.assertTrue(os.path.isfile(req_file))
+        with open(req_file, "r", encoding="utf-8") as rf:
+          payload = json.load(rf)
+        self.assertEqual(payload["cascadeId"], "c-123")
+
+        def touch_annotation(*args, **kwargs):
+          with open(ann_file, "a", encoding="utf-8") as f:
+            f.write('last_user_view_time: "2026-10-30T12:00:00Z"\n')
+
+        # Annotation modified during poll causes request_open_in_existing_tab to succeed
+        with mock.patch.object(w.time, "sleep", side_effect=touch_annotation):
+          reused_true = w.request_open_in_existing_tab("c-123", timeout_sec=0.2)
+        self.assertTrue(reused_true)
+
+        res = w.open_chat_for_id("c-123", timeout_sec=0.01)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["conversation_id"], "c-123")
+        self.assertTrue(res["chat_url"].endswith("/c/c-123"))
+
+    body = b'{"conversation_id": "c-456"}'
+    handler = w.FlightDeckHandler.__new__(w.FlightDeckHandler)
+    handler.path = "/api/open_chat"
+    handler.headers = {"Content-Length": str(len(body))}
+    handler.rfile = io.BytesIO(body)
+    sent = {}
+
+    def capture(payload, code=200):
+      sent["payload"] = payload
+      sent["code"] = code
+
+    handler._send_json = capture
+    with mock.patch.object(
+        w,
+        "open_chat_for_id",
+        return_value={"ok": True, "conversation_id": "c-456", "reused_tab": True},
+    ) as mock_open:
+      handler.do_POST()
+    mock_open.assert_called_once_with("c-456")
+    self.assertEqual(sent["code"], 200)
+    self.assertTrue(sent["payload"]["reused_tab"])
+
+    script_body = w.DASHBOARD_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    harness = script_body.split("\nboot();", 1)[0] + """
+const item = {
+  conversation_id: 'c-789',
+  chat_archived: false,
+};
+console.log(JSON.stringify({
+  actionHtml: chatActionHtml(item, {jetski_box_url: 'https://jetski.test'}, false),
+  compactHtml: chatActionHtml(item, {jetski_box_url: 'https://jetski.test'}, true),
+}));
+"""
+    proc = subprocess.run(
+        ["node", "-e", harness], capture_output=True, text=True, check=True
+    )
+    out = json.loads(proc.stdout.strip())
+    self.assertIn('target="jetski-chat"', out["actionHtml"])
+    self.assertIn("openChat(", out["actionHtml"])
+    self.assertIn("c-789", out["actionHtml"])
+    self.assertIn('target="jetski-chat"', out["compactHtml"])
 
 
 if __name__ == "__main__":
