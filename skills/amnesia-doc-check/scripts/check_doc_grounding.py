@@ -83,6 +83,15 @@ SKILL_BULLET_RE = re.compile(
 )
 HEX_SHA_RE = re.compile(r"`([0-9a-f]{7,40})`")
 HEADING_RE = re.compile(r"^\s*#{1,6}\s+(.+?)\s*$")
+# Patterns for sequential heading/list numbering and retired skill checks in Section [8]
+NUM_HEADING_RE = re.compile(
+    r"^(#{2,4})\s+(?:(?:Section|Stage|Step|Part|Phase)\s+)?(\d+)(?:\.(\d+))?[\.:)\s-]+\S"
+)
+ORD_LIST_RE = re.compile(r"^(\s*)(\d+)\.\s+\S")
+N_GATE_RE = re.compile(r"\b(\d+)-Rule\s+Gate\b", re.I)
+RETIRED_SKILL_RE = re.compile(
+    r"\bNEVER\b[^\n]*?\bfollow the\s+`([a-z0-9_-]+)`\s+skill\b", re.I
+)
 ANCHOR_LINK_RE = re.compile(r"\[[^\]]+\]\(#([a-zA-Z0-9_-]+)\)")
 
 KNOWN_PATH_ROOTS = {
@@ -381,6 +390,152 @@ def check_active_ldap(ldap: str) -> bool:
         return True
 
 
+# Check SKILL.md, rules/*.md, and agents/*.md for structural, numbering, and MCP sync drift
+def check_rule_skill_hygiene(
+    lines: list[str],
+    text: str,
+    fpath: Path | None = None,
+    repos: list[Path] | None = None,
+) -> list[str]:
+    warnings: list[str] = []
+    if fpath is not None and fpath.name == "SKILL.md" and text.startswith("---"):
+        fm_end = text.find("\n---", 3)
+        if fm_end > 0:
+            fm_block = text[3:fm_end]
+            m_desc = re.search(
+                r"^description:\s*(.+?)(?:\n[a-zA-Z_-]+:|\Z)",
+                fm_block,
+                re.M | re.S,
+            )
+            if m_desc:
+                desc_clean = " ".join(m_desc.group(1).split())
+                if len(desc_clean) > 450:
+                    warnings.append(
+                        f"YAML frontmatter `description:` is {len(desc_clean)} chars "
+                        "(keep <= 450 chars: 1-sentence purpose + trigger phrases only; "
+                        "move multi-stage details to SKILL.md body)"
+                    )
+    elif fpath is not None and fpath.parent.name == "rules" and fpath.suffix == ".md":
+        sibling_headings: dict[str, str] = {}
+        for sib in sorted(fpath.parent.glob("*.md")):
+            if sib == fpath:
+                continue
+            for sline in sib.read_text(encoding="utf-8", errors="ignore").splitlines():
+                shm = HEADING_RE.match(sline)
+                if shm:
+                    sibling_headings[slugify_heading(shm.group(1))] = sib.name
+        for idx, line in enumerate(lines, start=1):
+            hm = HEADING_RE.match(line)
+            if hm:
+                slug = slugify_heading(hm.group(1))
+                if slug in sibling_headings:
+                    warnings.append(
+                        f"Line {idx}: Heading `{hm.group(1)}` duplicates section in "
+                        f"`rules/{sibling_headings[slug]}` (merge in-place instead of "
+                        "splitting across rule files)"
+                    )
+
+    # Check sequential numbered headings, ordered list items, and N-Rule Gate cardinality
+    in_fence = False
+    heading_nums: dict[int, int] = {}
+    list_nums: dict[int, int] = {}
+    for idx, line in enumerate(lines, start=1):
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if line.startswith("#"):
+            lvl = len(line) - len(line.lstrip("#"))
+            for k in [k for k in heading_nums if k > lvl]:
+                heading_nums.pop(k, None)
+            list_nums.clear()
+            m_h = NUM_HEADING_RE.match(line)
+            if m_h and not m_h.group(3):
+                num = int(m_h.group(2))
+                prev = heading_nums.get(lvl)
+                if prev is not None and num != prev + 1 and num != 1:
+                    warnings.append(
+                        f"Line {idx}: Non-sequential heading number `{num}` after `{prev}` "
+                        f"in `{line.strip()}`"
+                    )
+                heading_nums[lvl] = num
+            continue
+
+        m_gate = N_GATE_RE.search(line)
+        if m_gate:
+            expected_n = int(m_gate.group(1))
+            base_indent = len(line) - len(line.lstrip(" "))
+            child_indent: int | None = None
+            actual_n = 0
+            for j in range(idx, len(lines)):
+                s = lines[j]
+                if not s.strip():
+                    continue
+                cur_indent = len(s) - len(s.lstrip(" "))
+                ml_sub = ORD_LIST_RE.match(s)
+                if cur_indent <= base_indent and not ml_sub:
+                    break
+                if ml_sub:
+                    ind = len(ml_sub.group(1))
+                    if child_indent is None or ind == child_indent:
+                        child_indent = ind
+                        actual_n += 1
+            if actual_n > 0 and actual_n != expected_n:
+                warnings.append(
+                    f"Line {idx}: Header claims `{expected_n}-Rule Gate` but block contains "
+                    f"`{actual_n}` numbered items"
+                )
+
+        m_l = ORD_LIST_RE.match(line)
+        if m_l:
+            indent = len(m_l.group(1))
+            num = int(m_l.group(2))
+            for k in [k for k in list_nums if k > indent]:
+                list_nums.pop(k, None)
+            prev = list_nums.get(indent)
+            if prev is not None and (
+                (num != prev + 1 and num != 1) or (num == 1 and prev == 1)
+            ):
+                warnings.append(
+                    f"Line {idx}: Non-sequential ordered list item `{num}.` after `{prev}.` "
+                    f"in `{line.strip()[:70]}`"
+                )
+            list_nums[indent] = num
+        elif line.strip() and not line.startswith(" "):
+            list_nums.clear()
+
+    # Check retired skills and Workspace MCP server mapping in config repositories
+    for idx, line in enumerate(lines, start=1):
+        for m_ret in RETIRED_SKILL_RE.finditer(line):
+            retired_name = m_ret.group(1)
+            for r in repos or []:
+                cand_skill = r / "skills" / retired_name
+                if cand_skill.exists() or cand_skill.is_symlink():
+                    warnings.append(
+                        f"Line {idx}: Retired skill `{retired_name}` is forbidden by rule "
+                        f"but `skills/{retired_name}` still exists in `{r}`"
+                    )
+    if (
+        fpath is not None
+        and fpath.name == "subagent_exploration.md"
+        and fpath.parent.name == "rules"
+    ):
+        for r in repos or []:
+            plugins_dir = r / "plugins"
+            if plugins_dir.is_dir():
+                for gdir in sorted(plugins_dir.glob("google_*")):
+                    if (gdir / "rules" / "AGENTS.md").exists():
+                        expected_srv = f"{gdir.name}_{gdir.name}"
+                        if expected_srv not in text:
+                            warnings.append(
+                                f"Workspace MCP plugin `{gdir.name}` has `rules/AGENTS.md` "
+                                f"but registered server `{expected_srv}` is missing from "
+                                "`rules/subagent_exploration.md`"
+                            )
+    return warnings
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Deterministic document grounding checker.")
     parser.add_argument("files", nargs="+", help="Document file(s) to check ('-' for stdin)")
@@ -649,57 +804,22 @@ def main() -> int:
         else:
             print("  None")
 
-        # [8] Rule & Skill Deduplication / Always-On Budget Check (R20)
+        # [8] Rule & Skill Deduplication / Always-On Budget Check (R20 & R81)
         if file_arg != "-":
             fpath = Path(file_arg).resolve()
-            hygiene_warnings: list[str] = []
-            if fpath.name == "SKILL.md" and text.startswith("---"):
-                fm_end = text.find("\n---", 3)
-                if fm_end > 0:
-                    fm_block = text[3:fm_end]
-                    m_desc = re.search(
-                        r"^description:\s*(.+?)(?:\n[a-zA-Z_-]+:|\Z)",
-                        fm_block,
-                        re.M | re.S,
-                    )
-                    if m_desc:
-                        desc_clean = " ".join(m_desc.group(1).split())
-                        if len(desc_clean) > 450:
-                            hygiene_warnings.append(
-                                f"YAML frontmatter `description:` is {len(desc_clean)} chars "
-                                "(keep <= 450 chars: 1-sentence purpose + trigger phrases only; "
-                                "move multi-stage details to SKILL.md body)"
-                            )
-            elif fpath.parent.name == "rules" and fpath.suffix == ".md":
-                sibling_headings: dict[str, str] = {}
-                for sib in sorted(fpath.parent.glob("*.md")):
-                    if sib == fpath:
-                        continue
-                    for sline in sib.read_text(encoding="utf-8", errors="ignore").splitlines():
-                        shm = HEADING_RE.match(sline)
-                        if shm:
-                            sibling_headings[slugify_heading(shm.group(1))] = sib.name
-                for idx, line in enumerate(lines, start=1):
-                    hm = HEADING_RE.match(line)
-                    if hm:
-                        slug = slugify_heading(hm.group(1))
-                        if slug in sibling_headings:
-                            hygiene_warnings.append(
-                                f"Line {idx}: Heading `{hm.group(1)}` duplicates section in "
-                                f"`rules/{sibling_headings[slug]}` (merge in-place instead of "
-                                "splitting across rule files)"
-                            )
-            if fpath.name == "SKILL.md" or (
-                fpath.parent.name == "rules" and fpath.suffix == ".md"
+            if fpath.name in ("SKILL.md", "AGENTS.md") or (
+                fpath.parent.name in ("rules", "agents") and fpath.suffix == ".md"
             ):
+                hygiene_warnings = check_rule_skill_hygiene(lines, text, fpath, repos)
                 print(
-                    f"\n[8] Rule & Skill Hygiene / Always-On Budget ({len(hygiene_warnings)} warning(s)):"
+                    f"\n[8] Rule & Skill Hygiene / Always-On Budget "
+                    f"({len(hygiene_warnings)} warning(s)):"
                 )
                 if hygiene_warnings:
                     for w in hygiene_warnings:
                         print(f"  - {w}")
                 else:
-                    print("  None (frontmatter concise & no duplicate rule headings)")
+                    print("  None (frontmatter, numbering, and rule/skill hygiene clean)")
 
     return 1 if total_issues > 0 else 0
 

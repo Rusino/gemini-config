@@ -62,7 +62,20 @@ Do not stop at the script output. Inspect the flagged hotspots and read the core
 
 ### Orchestration in Jetski / Antigravity
 - **Persistent Finding Ledger (`finding_ledger.py`)**: Stage 1 (`ruthless_audit.py`) automatically queries `~/.gemini/config/scripts/finding_ledger.py` and outputs any prior refuted findings for the target repo/diff/files. Always include those entries in the prompt of every Stage 2 Hunter subagent so they do not waste tokens re-raising already-refuted issues.
-- **For large repositories (> 3,000 lines or > 5 files)**: spawn parallel read-only subagents (`invoke_subagent` with `TypeName="self"` or `TypeName="keeper_inquisitor"`) partitioned by subsystem (e.g., Subagent 1: Backend & Concurrency; Subagent 2: Frontend/UI & Duplication; Subagent 3: Tests & Mutation Harness) so the main context stays clean.
+- **For diffs `> 5` files, cross-layer changes, or large repositories (`> 3,000` lines)**: shard
+  Stage 2 into parallel read-only Hunter subagents (`invoke_subagent` with `TypeName="self"` or
+  `TypeName="keeper_inquisitor"`), assigning each shard `<= 5` files or a focused rule lens (e.g.,
+  Shard 1: *Scope, Duplication & Dropped Guards (`git log -S`)*; Shard 2: *Callers, Concurrency &
+  Domain Invariants*; Shard 3: *Tests & Mutation Harness*) and feeding all candidate findings into
+  **one** batched Stage 2.5 `keeper_skeptic`.
+- **Mandatory Checked-Site Enumeration Before `None`**: Every Stage 2 Hunter shard must list 3–5
+  concrete sites, callers, or guards it inspected (`Checked Sites: <file:line> (<caller/guard/
+  invariant verified>) — OK`) before reporting `None` for any audit category, preventing
+  superficial skimming of large files.
+- **Separate `BLOCKING` Defects from `OPTIONAL_GOLFING` (`nit:`)**: Tag every candidate as either
+  `BLOCKING` (`HIGH`/`CRITICAL` bugs, broken invariants, or dead/duplicate code in Matrix 2.1
+  `DELETE`) or `OPTIONAL_GOLFING` (`nit:` stylistic micro-compaction). `OPTIONAL_GOLFING` items
+  never block a commit/upload or inflate `HIGH`/`CRITICAL` defect counts.
 - **Veteran lens (Skia C++ / text / font code)**: run `veteran-review` in lens mode (`~/.gemini/config/skills/veteran-review/SKILL.md`, Steps 1–3) and feed its candidates into the Stage 2.5 packet instead of running its own skeptic pass.
 - **Built-in Google3 reference skills** (when `/google/src/files/head/...` is mounted):
   - Consult [`copy-paste-detection`](file:///google/src/files/head/depot/google3/learning/gemini/agents/skills/copy_paste_detection/SKILL.md) for DRY vs. DAMP judgment and `--query-snippet` bug propagation.

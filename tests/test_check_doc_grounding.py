@@ -138,6 +138,51 @@ class TestCheckDocGrounding(unittest.TestCase):
         )
     )
 
+  def test_check_rule_skill_hygiene_catches_numbering_and_gate_drift(self) -> None:
+    doc = (
+        "# Sample Skill\n\n"
+        "## 1. Core Principles\n"
+        "1. First item\n"
+        "2. Second item\n"
+        "2. Duplicate second item\n\n"
+        "## 4. Workflow\n"
+        "- **WebParagraph 11-Rule Gate**:\n"
+        "  1. Rule one\n"
+        "  2. Rule two\n"
+    )
+    warnings = cdg.check_rule_skill_hygiene(
+        doc.splitlines(), doc, self.repo_dir / "skills" / "s" / "SKILL.md", [self.repo_dir]
+    )
+    joined = "\n".join(warnings)
+    self.assertIn("Non-sequential ordered list item `2.` after `2.`", joined)
+    self.assertIn("Non-sequential heading number `4` after `1`", joined)
+    self.assertIn("Header claims `11-Rule Gate` but block contains `2` numbered items", joined)
+
+  def test_check_rule_skill_hygiene_catches_retired_skill_and_missing_mcp(self) -> None:
+    retired_dir = self.repo_dir / "skills" / "gmail"
+    retired_dir.mkdir(parents=True, exist_ok=True)
+    rule_text = "NEVER invoke the CLI or follow the `gmail` skill.\n"
+    w_ret = cdg.check_rule_skill_hygiene(
+        rule_text.splitlines(),
+        rule_text,
+        self.repo_dir / "plugins" / "google_gmail" / "rules" / "AGENTS.md",
+        [self.repo_dir],
+    )
+    self.assertTrue(any("Retired skill `gmail`" in w for w in w_ret))
+
+    gdir = self.repo_dir / "plugins" / "google_gmail" / "rules"
+    gdir.mkdir(parents=True, exist_ok=True)
+    (gdir / "AGENTS.md").write_text(rule_text, encoding="utf-8")
+    rules_dir = self.repo_dir / "rules"
+    rules_dir.mkdir(parents=True, exist_ok=True)
+    sub_path = rules_dir / "subagent_exploration.md"
+    sub_text = "# Exploration\n- Use `google_chat_google_chat` and `google_docs_google_docs`.\n"
+    sub_path.write_text(sub_text, encoding="utf-8")
+    w_mcp = cdg.check_rule_skill_hygiene(
+        sub_text.splitlines(), sub_text, sub_path, [self.repo_dir]
+    )
+    self.assertTrue(any("google_gmail_google_gmail" in w for w in w_mcp))
+
 
 if __name__ == "__main__":
   unittest.main()
