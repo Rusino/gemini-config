@@ -4518,8 +4518,12 @@
     ` +
       // Style the collapsible Needs-Reaction inbox widget above the sidebar project list
       `
-      /* Hide redundant new-conversation button to pull history and inbox up by ~50px */
-      [aria-label="Sidebar"] [data-testid="new-conversation-button"] {
+      /* Hide redundant new-conversation button and bottom hiring promo banner to save space */
+      [aria-label="Sidebar"] [data-testid="new-conversation-button"],
+      [aria-label="Sidebar"] [data-jetski-hiring-banner="true"],
+      [aria-label="Sidebar"] div:has(> [data-testid="sidebar-hiring-link"]),
+      [aria-label="Sidebar"] [data-testid="sidebar-hiring-link"],
+      [aria-label="Sidebar"] [data-testid="sidebar-hiring-link-dismiss"] {
         display: none !important;
       }
       /* Collapse top navigation items and extensions behind header toggle button by default */
@@ -7142,6 +7146,12 @@
     if (!sidebarEl) return;
 
     findTopNavSection(sidebarEl);
+    // Tag the bottom hiring promo wrapper so the entire footer row collapses to zero height
+    const hiringLink = sidebarEl.querySelector('[data-testid="sidebar-hiring-link"]');
+    const hiringWrapper = hiringLink?.parentElement;
+    if (hiringWrapper && hiringWrapper !== sidebarEl) {
+      setAttrIfChanged(hiringWrapper, 'data-jetski-hiring-banner', 'true');
+    }
     if (topNavExpanded) {
       sidebarEl.setAttribute('data-jetski-topnav-open', 'true');
     } else {
@@ -9060,6 +9070,10 @@
     }
     for (const el of document.querySelectorAll('[data-jetski-top-nav-section]')) {
       el.removeAttribute('data-jetski-top-nav-section');
+    }
+    // Clear hiring banner attributes on teardown
+    for (const el of document.querySelectorAll('[data-jetski-hiring-banner]')) {
+      el.removeAttribute('data-jetski-hiring-banner');
     }
     if (locateHighlightTimer) {
       clearTimeout(locateHighlightTimer);

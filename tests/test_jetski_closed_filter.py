@@ -6600,6 +6600,14 @@ eval(code);
     styleEl.textContent.includes('[data-testid="plugins-section"]'),
     'Style must collapse plugins section when topnav is closed'
   );
+  assert(
+    styleEl.textContent.includes('[data-testid="sidebar-hiring-link"]'),
+    'Style must hide sidebar hiring promo link'
+  );
+  assert(
+    styleEl.textContent.includes('[data-jetski-hiring-banner="true"]'),
+    'Style must hide tagged sidebar hiring banner wrapper'
+  );
 
   // 2. Set up sidebar structure with header, top-nav items, plugins section, and bottom settings
   const sidebarEl = new FakeElement('div');
@@ -6632,10 +6640,25 @@ eval(code);
   const settingsBtn = new FakeElement('button');
   settingsBtn.setAttribute('data-testid', 'settings-button');
   settingsSec.appendChild(settingsBtn);
+  const hiringRow = new FakeElement('div');
+  hiringRow.className = 'group/hiring-row relative w-full';
+  const hiringLink = new FakeElement('a');
+  hiringLink.setAttribute('data-testid', 'sidebar-hiring-link');
+  hiringRow.appendChild(hiringLink);
+  const hiringDismiss = new FakeElement('button');
+  hiringDismiss.setAttribute('data-testid', 'sidebar-hiring-link-dismiss');
+  hiringRow.appendChild(hiringDismiss);
+  settingsSec.appendChild(hiringRow);
   sidebarEl.appendChild(settingsSec);
 
   // Initial call mounts toggle button and tags top nav section
   window.__jetskiTopNav.ensureTopNavToggle();
+
+  assert.strictEqual(
+    hiringRow.getAttribute('data-jetski-hiring-banner'),
+    'true',
+    'Hiring promo wrapper must be tagged to collapse bottom space'
+  );
 
   assert.strictEqual(
     topNavSec.getAttribute('data-jetski-top-nav-section'),
@@ -6721,6 +6744,11 @@ eval(code);
   assert.strictEqual(headerRow.querySelector('.jetski-top-nav-toggle-btn'), null);
   assert.strictEqual(sidebarEl.getAttribute('data-jetski-topnav-open'), null);
   assert.strictEqual(topNavSec.getAttribute('data-jetski-top-nav-section'), null);
+  assert.strictEqual(
+    hiringRow.getAttribute('data-jetski-hiring-banner'),
+    null,
+    'Hiring banner tag must be cleared on cleanup'
+  );
   assert.strictEqual(window.__jetskiTopNav.isExpanded(), false);
 
   console.log('ALL_TOP_NAV_TESTS_PASSED');
