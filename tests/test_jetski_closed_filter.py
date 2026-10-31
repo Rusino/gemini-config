@@ -5304,6 +5304,12 @@ vlistEl.appendChild(chatRow);
 const fetchCalls = [];
 let navigatedUrl = null;
 let navState = null;
+global.PopStateEvent = class {
+  constructor(type) {
+    this.type = type;
+  }
+};
+
 const storageMap = new Map();
 let openChatPayload = null;
 
@@ -6297,8 +6303,30 @@ global.window = {
   location: { pathname: '/c/chat-tail', search: '' },
   history: {
     state: {},
-    pushState(state, title, url) { this.state = state; this._lastPushed = url; },
-    replaceState(state, title, url) { this.state = state; this._lastReplaced = url; },
+    pushState(state, title, url) {
+      this.state = state;
+      this._lastPushed = url;
+      const qIdx = String(url).indexOf('?');
+      if (qIdx >= 0) {
+        global.window.location.pathname = url.slice(0, qIdx);
+        global.window.location.search = url.slice(qIdx);
+      } else {
+        global.window.location.pathname = url;
+        global.window.location.search = '';
+      }
+    },
+    replaceState(state, title, url) {
+      this.state = state;
+      this._lastReplaced = url;
+      const qIdx = String(url).indexOf('?');
+      if (qIdx >= 0) {
+        global.window.location.pathname = url.slice(0, qIdx);
+        global.window.location.search = url.slice(qIdx);
+      } else {
+        global.window.location.pathname = url;
+        global.window.location.search = '';
+      }
+    },
   },
   localStorage: { getItem: () => null, setItem: () => {} },
   getSelection: () => ({
@@ -6757,8 +6785,30 @@ global.window = {
   location: { pathname: '/c/test-chat', search: '' },
   history: {
     state: {},
-    pushState(state, title, url) { this.state = state; this._lastPushed = url; },
-    replaceState(state, title, url) { this.state = state; this._lastReplaced = url; },
+    pushState(state, title, url) {
+      this.state = state;
+      this._lastPushed = url;
+      const qIdx = String(url).indexOf('?');
+      if (qIdx >= 0) {
+        global.window.location.pathname = url.slice(0, qIdx);
+        global.window.location.search = url.slice(qIdx);
+      } else {
+        global.window.location.pathname = url;
+        global.window.location.search = '';
+      }
+    },
+    replaceState(state, title, url) {
+      this.state = state;
+      this._lastReplaced = url;
+      const qIdx = String(url).indexOf('?');
+      if (qIdx >= 0) {
+        global.window.location.pathname = url.slice(0, qIdx);
+        global.window.location.search = url.slice(qIdx);
+      } else {
+        global.window.location.pathname = url;
+        global.window.location.search = '';
+      }
+    },
   },
   localStorage: { getItem: () => null, setItem: () => {} },
   setTimeout: (fn, ms) => setTimeout(fn, ms),
@@ -7011,6 +7061,454 @@ eval(code);
         f"Top nav collapse JS harness failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
     )
     self.assertIn("ALL_TOP_NAV_TESTS_PASSED", res.stdout)
+
+
+  def test_flight_deck_side_panel_drawer_and_toggle(self) -> None:
+    node_bin = find_node_binary()
+    js_path = os.path.join(SCRIPTS_DIR, "jetski_closed_filter.js")
+
+    harness = r"""
+const fs = require('fs');
+const assert = require('assert');
+
+const scriptPath = process.argv[1];
+const code = fs.readFileSync(scriptPath, 'utf8');
+
+class FakeElement {
+  constructor(tagName) {
+    this.tagName = tagName.toUpperCase();
+    this.id = '';
+    this.className = '';
+    this.type = '';
+    this.style = {};
+    this.attributes = new Map();
+    this.children = [];
+    this.parentElement = null;
+    this.listeners = new Map();
+    this._textContent = '';
+    this._innerHTML = '';
+  }
+  get firstChild() { return this.children[0] || null; }
+  get lastChild() { return this.children[this.children.length - 1] || null; }
+  click() { return this.dispatchEvent('click'); }
+  get nextSibling() {
+    if (!this.parentElement) return null;
+    const idx = this.parentElement.children.indexOf(this);
+    if (idx === -1 || idx === this.parentElement.children.length - 1) return null;
+    return this.parentElement.children[idx + 1];
+  }
+  get textContent() {
+    if (this.children.length > 0) {
+      return this._textContent + this.children.map((c) => c.textContent).join('');
+    }
+    return this._textContent;
+  }
+  set textContent(v) {
+    this._textContent = String(v);
+    for (const c of this.children) c.parentElement = null;
+    this.children = [];
+  }
+  get innerHTML() { return this._innerHTML; }
+  set innerHTML(v) {
+    this._innerHTML = String(v);
+    for (const c of this.children) c.parentElement = null;
+    this.children = [];
+  }
+  setAttribute(k, v) {
+    this.attributes.set(k, String(v));
+    if (k === 'id') this.id = String(v);
+    if (k === 'class') this.className = String(v);
+    if (k === 'type') this.type = String(v);
+  }
+  getAttribute(k) { return this.attributes.has(k) ? this.attributes.get(k) : null; }
+  hasAttribute(k) { return this.attributes.has(k); }
+  removeAttribute(k) {
+    this.attributes.delete(k);
+    if (k === 'id') this.id = '';
+    if (k === 'class') this.className = '';
+    if (k === 'type') this.type = '';
+  }
+  appendChild(c) {
+    if (c.parentElement) c.remove();
+    c.parentElement = this;
+    this.children.push(c);
+    return c;
+  }
+  insertBefore(child, ref) {
+    if (child === ref) return child;
+    if (child.parentElement) child.remove();
+    child.parentElement = this;
+    if (!ref) {
+      this.children.push(child);
+      return child;
+    }
+    const idx = this.children.indexOf(ref);
+    if (idx === -1) this.children.push(child);
+    else this.children.splice(idx, 0, child);
+    return child;
+  }
+  remove() {
+    if (!this.parentElement) return;
+    const i = this.parentElement.children.indexOf(this);
+    if (i !== -1) this.parentElement.children.splice(i, 1);
+    this.parentElement = null;
+  }
+  getBoundingClientRect() {
+    return { top: 10, bottom: 34, left: 10, right: 34, width: 24, height: 24 };
+  }
+  addEventListener(t, fn, opts) {
+    if (!this.listeners.has(t)) this.listeners.set(t, []);
+    this.listeners.get(t).push({ fn, capture: Boolean(opts?.capture || opts === true) });
+  }
+  dispatchEvent(type, eventInit = {}) {
+    const ev = {
+      type,
+      button: 0,
+      ctrlKey: false,
+      metaKey: false,
+      shiftKey: false,
+      defaultPrevented: false,
+      propagationStopped: false,
+      preventDefault() { this.defaultPrevented = true; },
+      stopPropagation() { this.propagationStopped = true; },
+      target: this,
+      currentTarget: this,
+      ...eventInit,
+    };
+    if (global.document && typeof global.document.dispatchCapture === 'function') {
+      global.document.dispatchCapture(ev);
+    }
+    if (!ev.propagationStopped) {
+      const handlers = this.listeners.get(type) || [];
+      for (const h of handlers) {
+        h.fn(ev);
+      }
+    }
+    return !ev.defaultPrevented;
+  }
+  closest(sel) {
+    let cur = this;
+    while (cur) {
+      if (cur.matches(sel)) return cur;
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+  matches(sel) {
+    if (!sel) return false;
+    if (sel.includes(',')) {
+      return sel.split(',').some((p) => this.matches(p.trim()));
+    }
+    if (sel.startsWith('#')) return this.id === sel.slice(1);
+    if (sel.startsWith('.')) return this.className.split(/\s+/).includes(sel.slice(1));
+    if (sel.startsWith('[') && sel.endsWith(']')) {
+      const inner = sel.slice(1, -1);
+      const eq = inner.indexOf('=');
+      if (eq === -1) return this.hasAttribute(inner);
+      const k = inner.slice(0, eq).trim();
+      const rawVal = inner.slice(eq + 1).trim();
+      const v = rawVal.replace(/^["\x27]|["\x27]$/g, '');
+      return this.getAttribute(k) === v;
+    }
+    return this.tagName.toLowerCase() === sel.toLowerCase();
+  }
+  querySelector(sel) {
+    return this.querySelectorAll(sel)[0] || null;
+  }
+  querySelectorAll(sel) {
+    const parts = (typeof sel === 'string' && sel.includes(','))
+      ? sel.split(',').map((p) => p.trim())
+      : [sel];
+    const out = [];
+    const visit = (node) => {
+      for (const p of parts) {
+        if (node.matches(p) && !out.includes(node)) {
+          out.push(node);
+        }
+      }
+      for (const child of node.children) {
+        visit(child);
+      }
+    };
+    for (const child of this.children) {
+      visit(child);
+    }
+    return out;
+  }
+}
+
+const docEl = new FakeElement('html');
+const headEl = new FakeElement('head');
+const bodyEl = new FakeElement('body');
+bodyEl.style = {
+  setProperty(k, v) { this[k] = v; },
+};
+docEl.appendChild(headEl);
+docEl.appendChild(bodyEl);
+
+const documentListeners = new Map();
+global.document = {
+  documentElement: docEl,
+  head: headEl,
+  body: bodyEl,
+  getElementById: (id) => docEl.querySelector(`#${id}`),
+  createElement: (tag) => new FakeElement(tag),
+  querySelector: (sel) => docEl.querySelector(sel),
+  querySelectorAll: (sel) => docEl.querySelectorAll(sel),
+  addEventListener(t, fn, opts) {
+    if (!documentListeners.has(t)) documentListeners.set(t, []);
+    documentListeners.get(t).push({ fn, capture: Boolean(opts?.capture || opts === true) });
+  },
+  removeEventListener(t, fn) {
+    if (!documentListeners.has(t)) return;
+    const arr = documentListeners.get(t).filter((item) => item.fn !== fn);
+    documentListeners.set(t, arr);
+  },
+  dispatchCapture(ev) {
+    const list = documentListeners.get(ev.type) || [];
+    for (const h of list) {
+      if (h.capture) h.fn(ev);
+      if (ev.propagationStopped) break;
+    }
+  },
+  dispatchEvent(evOrType, init) {
+    const ev = typeof evOrType === 'string'
+      ? { type: evOrType, target: docEl, preventDefault() {}, stopPropagation() {}, ...init }
+      : evOrType;
+    const list = documentListeners.get(ev.type) || [];
+    for (const h of list) {
+      h.fn(ev);
+    }
+    return true;
+  },
+};
+
+global.PopStateEvent = class {
+  constructor(type) {
+    this.type = type;
+  }
+};
+
+const storageMap = new Map();
+const windowListeners = new Map();
+global.window = {
+  __APP_CONFIG__: { csrfToken: 'test-csrf-token' },
+  location: { hostname: 'localhost', pathname: '/c/test-chat', search: '' },
+  history: {
+    state: {},
+    pushState(state, title, url) {
+      this.state = state;
+      this._lastPushed = url;
+      const qIdx = String(url).indexOf('?');
+      if (qIdx >= 0) {
+        global.window.location.pathname = url.slice(0, qIdx);
+        global.window.location.search = url.slice(qIdx);
+      } else {
+        global.window.location.pathname = url;
+        global.window.location.search = '';
+      }
+    },
+    replaceState(state, title, url) {
+      this.state = state;
+      this._lastReplaced = url;
+      const qIdx = String(url).indexOf('?');
+      if (qIdx >= 0) {
+        global.window.location.pathname = url.slice(0, qIdx);
+        global.window.location.search = url.slice(qIdx);
+      } else {
+        global.window.location.pathname = url;
+        global.window.location.search = '';
+      }
+    },
+  },
+  localStorage: {
+    getItem: (k) => (storageMap.has(k) ? storageMap.get(k) : null),
+    setItem: (k, v) => storageMap.set(k, String(v)),
+  },
+  setTimeout: (fn, ms) => setTimeout(fn, ms),
+  clearTimeout: (id) => clearTimeout(id),
+  requestAnimationFrame: (cb) => cb(),
+  addEventListener(t, fn) {
+    if (!windowListeners.has(t)) windowListeners.set(t, []);
+    windowListeners.get(t).push(fn);
+  },
+  removeEventListener(t, fn) {
+    if (!windowListeners.has(t)) return;
+    const arr = windowListeners.get(t).filter((item) => item !== fn);
+    windowListeners.set(t, arr);
+  },
+  dispatchEvent(evOrType, init) {
+    const ev = typeof evOrType === 'string'
+      ? { type: evOrType, data: init }
+      : evOrType;
+    const list = windowListeners.get(ev.type) || [];
+    for (const h of list) h(ev);
+    return true;
+  },
+  fetch: async (url) => {
+    if (String(url).includes('jetski-flight-deck.json')) {
+      return {
+        ok: true,
+        json: async () => ({
+          pen_url: 'https://8089-pen-proxy.corp.goog',
+          local_url: 'http://localhost:8089',
+          port: 8089,
+        }),
+      };
+    }
+    if (String(url).includes('UpdateConversationAnnotations')) {
+      return { ok: true, status: 200 };
+    }
+    return { ok: false, status: 404 };
+  },
+  document: global.document,
+};
+
+global.MutationObserver = class {
+  observe() {}
+  disconnect() {}
+};
+
+eval(code);
+
+(async () => {
+  const sidebarEl = new FakeElement('div');
+  sidebarEl.setAttribute('aria-label', 'Sidebar');
+  bodyEl.appendChild(sidebarEl);
+
+  const headerRow = new FakeElement('div');
+  sidebarEl.appendChild(headerRow);
+
+  const searchBtn = new FakeElement('button');
+  searchBtn.setAttribute('data-testid', 'sidebar-search-button');
+  headerRow.appendChild(searchBtn);
+
+  window.__jetskiFlightDeck.ensureFlightDeckUI();
+
+  const toggleBtn = headerRow.querySelector('.jetski-flight-deck-toggle-btn');
+  assert(toggleBtn, 'Toggle button must be mounted inside sidebar header row');
+  assert.strictEqual(toggleBtn.getAttribute('data-testid'), 'jetski-flight-deck-toggle-btn');
+  assert.strictEqual(toggleBtn.getAttribute('data-active'), 'false');
+  assert.strictEqual(toggleBtn.getAttribute('aria-label'), 'Open Flight Deck panel');
+
+  const drawer = document.getElementById('jetski-flight-deck-drawer');
+  assert(drawer, 'Flight Deck drawer must be mounted in body');
+  assert.strictEqual(drawer.getAttribute('data-open'), 'false');
+  assert.strictEqual(bodyEl.getAttribute('data-jetski-flight-deck-open'), null);
+
+  const testInfo = {
+    local_url: 'http://localhost:8089',
+    pen_url: 'https://8089-pen.corp.goog',
+  };
+  global.window.location.hostname = 'localhost';
+  assert.strictEqual(
+    window.__jetskiFlightDeck.resolveUrl(testInfo, true),
+    'http://localhost:8089?embed=1'
+  );
+  assert.strictEqual(
+    window.__jetskiFlightDeck.resolveUrl(testInfo, false),
+    'http://localhost:8089'
+  );
+
+  global.window.location.hostname = 'cloudtop.corp.goog';
+  assert.strictEqual(
+    window.__jetskiFlightDeck.resolveUrl(testInfo, true),
+    'https://8089-pen.corp.goog?embed=1'
+  );
+  assert.strictEqual(
+    window.__jetskiFlightDeck.resolveUrl(testInfo, false),
+    'https://8089-pen.corp.goog'
+  );
+  global.window.location.hostname = 'localhost';
+
+  toggleBtn.dispatchEvent('pointerdown');
+  assert.strictEqual(window.__jetskiFlightDeck.isOpen(), true);
+  assert.strictEqual(toggleBtn.getAttribute('data-active'), 'true');
+  assert.strictEqual(toggleBtn.getAttribute('aria-label'), 'Hide Flight Deck panel');
+  assert.strictEqual(drawer.getAttribute('data-open'), 'true');
+  assert.strictEqual(bodyEl.getAttribute('data-jetski-flight-deck-open'), 'true');
+
+  await new Promise((r) => setTimeout(r, 10));
+
+  const iframe = drawer.querySelector('.jetski-flight-deck-iframe');
+  assert(iframe, 'Iframe must be mounted in drawer');
+  assert.strictEqual(iframe.getAttribute('src'), 'http://localhost:8089?embed=1');
+
+  const openTabBtn = drawer.querySelector('[data-testid="jetski-flight-deck-open-tab-btn"]');
+  assert(openTabBtn, 'Open tab button must be mounted');
+  assert.strictEqual(openTabBtn.getAttribute('href'), 'http://localhost:8089');
+
+  const handle = drawer.querySelector('.jetski-flight-deck-resize-handle');
+  assert(handle, 'Resize handle must be mounted');
+
+  handle.dispatchEvent('pointerdown', { clientX: 500 });
+  document.dispatchEvent('pointermove', { clientX: 400 });
+  document.dispatchEvent('pointerup', {});
+  assert.strictEqual(window.__jetskiFlightDeck.getWidth(), 580);
+  assert.strictEqual(drawer.style.width, '580px');
+  assert.strictEqual(storageMap.get('jetski_flight_deck_width_v1'), '580');
+
+  handle.dispatchEvent('pointerdown', { clientX: 500 });
+  document.dispatchEvent('pointermove', { clientX: -500 });
+  document.dispatchEvent('pointerup', {});
+  assert.strictEqual(window.__jetskiFlightDeck.getWidth(), 900);
+
+  handle.dispatchEvent('pointerdown', { clientX: 100 });
+  document.dispatchEvent('pointermove', { clientX: 800 });
+  document.dispatchEvent('pointerup', {});
+  assert.strictEqual(window.__jetskiFlightDeck.getWidth(), 320);
+
+  handle.dispatchEvent('dblclick');
+  assert.strictEqual(window.__jetskiFlightDeck.getWidth(), 480);
+  assert.strictEqual(drawer.style.width, '480px');
+
+  window.__jetskiFlightDeck.handleMessage({
+    data: { type: 'jetski-flight-deck-open-chat', cascadeId: 'chat-target-42' },
+  });
+  assert.strictEqual(global.window.location.pathname, '/c/chat-target-42');
+
+  window.__jetskiFlightDeck.handleMessage({
+    data: { type: 'jetski-flight-deck-close' },
+  });
+  assert.strictEqual(window.__jetskiFlightDeck.isOpen(), false);
+  assert.strictEqual(drawer.getAttribute('data-open'), 'false');
+  assert.strictEqual(bodyEl.getAttribute('data-jetski-flight-deck-open'), null);
+
+  window.__jetskiFlightDeck.setOpen(true);
+  assert.strictEqual(drawer.getAttribute('data-open'), 'true');
+  const closeBtn = drawer.querySelector('[data-testid="jetski-flight-deck-close-btn"]');
+  assert(closeBtn, 'Close button must be mounted in header');
+  closeBtn.dispatchEvent('pointerdown');
+  assert.strictEqual(window.__jetskiFlightDeck.isOpen(), false);
+
+  window.__jetskiFlightDeck.setOpen(true);
+  window.__jetskiClosedChatsFilterCleanup();
+  assert.strictEqual(document.getElementById('jetski-flight-deck-drawer'), null);
+  assert.strictEqual(headerRow.querySelector('.jetski-flight-deck-toggle-btn'), null);
+  assert.strictEqual(bodyEl.getAttribute('data-jetski-flight-deck-open'), null);
+
+  console.log('ALL_FLIGHT_DECK_TESTS_PASSED');
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"""
+    env = os.environ.copy()
+    env["ELECTRON_RUN_AS_NODE"] = "1"
+    res = subprocess.run(
+        [node_bin, "-e", harness, js_path],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(
+        res.returncode,
+        0,
+        f"Flight Deck drawer JS harness failed:\n"
+        f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+    )
+    self.assertIn("ALL_FLIGHT_DECK_TESTS_PASSED", res.stdout)
 
 
 if __name__ == "__main__":

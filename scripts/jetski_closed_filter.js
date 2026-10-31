@@ -34,6 +34,19 @@
   const TOP_NAV_STATUS_DOT_CLASS = 'jetski-top-nav-status-dot';
   const TOP_NAV_SETTINGS_BTN_CLASS = 'jetski-top-nav-settings-btn';
   let topNavExpanded = false;
+  // Flight Deck embedded drawer panel, toggle button, and width bounds
+  const STORAGE_FLIGHT_DECK_OPEN_KEY = 'jetski_flight_deck_open_v1';
+  const STORAGE_FLIGHT_DECK_WIDTH_KEY = 'jetski_flight_deck_width_v1';
+  const FLIGHT_DECK_TOGGLE_BTN_CLASS = 'jetski-flight-deck-toggle-btn';
+  const FLIGHT_DECK_DRAWER_ID = 'jetski-flight-deck-drawer';
+  const FLIGHT_DECK_DRAWER_CLASS = 'jetski-flight-deck-drawer';
+  const FLIGHT_DECK_HEADER_CLASS = 'jetski-flight-deck-header';
+  const FLIGHT_DECK_RESIZE_HANDLE_CLASS = 'jetski-flight-deck-resize-handle';
+  const FLIGHT_DECK_IFRAME_CLASS = 'jetski-flight-deck-iframe';
+  const FLIGHT_DECK_DEFAULT_WIDTH_PX = 480;
+  const FLIGHT_DECK_MIN_WIDTH_PX = 320;
+  const FLIGHT_DECK_MAX_WIDTH_PX = 900;
+  const FLIGHT_DECK_INFO_TTL_MS = 10000;
   const TITLEBAR_BTN_CLASS = 'jetski-titlebar-archive-btn';
   // Live context window volume pill rendered before Search in each conversation titlebar
   const TITLEBAR_CONTEXT_BADGE_CLASS = 'jetski-titlebar-context-badge';
@@ -172,6 +185,27 @@
 
   let inboxListHeightPx = loadInboxHeight();
   let activeInboxResizeCleanup = null;
+
+  let flightDeckOpen = safeGetStorage(STORAGE_FLIGHT_DECK_OPEN_KEY) === 'true';
+
+  // Clamps Flight Deck drawer width between 320px and 900px
+  function clampFlightDeckWidth(px) {
+    const n = Math.round(Number(px));
+    if (!Number.isFinite(n)) return FLIGHT_DECK_DEFAULT_WIDTH_PX;
+    return Math.min(FLIGHT_DECK_MAX_WIDTH_PX, Math.max(FLIGHT_DECK_MIN_WIDTH_PX, n));
+  }
+
+  // Loads persisted Flight Deck width from storage or returns default (480px)
+  function loadFlightDeckWidth() {
+    const raw = safeGetStorage(STORAGE_FLIGHT_DECK_WIDTH_KEY);
+    if (raw === null || raw === '') return FLIGHT_DECK_DEFAULT_WIDTH_PX;
+    return clampFlightDeckWidth(Number(raw));
+  }
+
+  let flightDeckWidthPx = loadFlightDeckWidth();
+  let activeFlightDeckResizeCleanup = null;
+  let flightDeckInfoCache = null;
+  let flightDeckInfoFetchedAt = 0;
   const STORAGE_INBOX_TAB_KEY = 'jetski_inbox_tab_v1';
   const INBOX_TABS = ['needs-me', 'working', 'stale'];
   // Typographic tab labels without emoji prefixes fit on one header line in a narrow sidebar
@@ -696,6 +730,45 @@
       // Ignore network errors and preserve cached roadmap summaries
     }
     return roadmapIndexCache || { projects: {} };
+  }
+
+  // Fetches jetski-flight-deck.json so the drawer loads the correct local or PEN proxy URL
+  async function fetchFlightDeckInfo() {
+    const now = Date.now();
+    if (flightDeckInfoCache && now - flightDeckInfoFetchedAt < FLIGHT_DECK_INFO_TTL_MS) {
+      return flightDeckInfoCache;
+    }
+    if (typeof window.fetch !== 'function') {
+      return flightDeckInfoCache || { pen_url: '', local_url: 'http://localhost:8089', port: 8089 };
+    }
+    try {
+      const csrf = encodeURIComponent(getCsrfToken());
+      const url = resolveApiUrl(`/static/artifacts/jetski-flight-deck.json?v=${now}&csrf=${csrf}`);
+      const resp = await window.fetch(url);
+      if (resp && resp.ok) {
+        const data = await resp.json();
+        if (data && typeof data === 'object') {
+          flightDeckInfoCache = data;
+          flightDeckInfoFetchedAt = now;
+          return flightDeckInfoCache;
+        }
+      }
+    } catch {
+      // Fall through to cached data on network error
+    }
+    return flightDeckInfoCache || { pen_url: '', local_url: 'http://localhost:8089', port: 8089 };
+  }
+
+  // Chooses localhost vs PEN proxy based on the Jetski Web host and appends embed param
+  function resolveFlightDeckUrl(info, embedded = true) {
+    const host = typeof window !== 'undefined' ? window.location?.hostname || '' : '';
+    const isLocal = host === 'localhost' || host === '127.0.0.1';
+    let base = isLocal
+      ? (info?.local_url || 'http://localhost:8089')
+      : (info?.pen_url || info?.local_url || 'http://localhost:8089');
+    if (!embedded) return base;
+    const sep = base.includes('?') ? '&' : '?';
+    return `${base}${sep}embed=1`;
   }
 
   // Periodically refreshes jetski-roadmaps.json so sidebar project badges track CLI updates
@@ -4654,6 +4727,144 @@
         display: block;
         background: #fbbf24;
       }
+      /* Flight Deck side panel toggle button */
+      .${FLIGHT_DECK_TOGGLE_BTN_CLASS} {
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 24px;
+        height: 24px;
+        border-radius: 6px;
+        border: none;
+        background: transparent;
+        color: var(--muted-foreground, #9aa0a6);
+        font-size: 13px;
+        line-height: 1;
+        cursor: pointer;
+        padding: 0;
+        margin: 0;
+        flex-shrink: 0;
+        transition: background-color 100ms ease, color 100ms ease;
+      }
+      .${FLIGHT_DECK_TOGGLE_BTN_CLASS}:hover {
+        background: var(--sidebar-secondary, rgba(128, 134, 139, 0.16));
+        color: var(--foreground, #e8eaed);
+      }
+      .${FLIGHT_DECK_TOGGLE_BTN_CLASS}[data-active="true"] {
+        background: var(--sidebar-secondary, rgba(128, 134, 139, 0.24));
+        color: #8ab4f8;
+      }
+      /* Flight Deck drawer container */
+      #${FLIGHT_DECK_DRAWER_ID} {
+        position: fixed;
+        top: 0;
+        right: 0;
+        bottom: 0;
+        width: var(--jetski-flight-deck-width, ${FLIGHT_DECK_DEFAULT_WIDTH_PX}px);
+        max-width: 90vw;
+        z-index: 950;
+        display: flex;
+        flex-direction: column;
+        border-left: 1px solid rgba(128, 128, 128, 0.22);
+        background: var(--background, #111113);
+        box-shadow: -4px 0 24px rgba(0, 0, 0, 0.35);
+        transform: translateX(100%);
+        transition: transform 200ms cubic-bezier(0.16, 1, 0.3, 1);
+        pointer-events: none;
+        visibility: hidden;
+      }
+      #${FLIGHT_DECK_DRAWER_ID}[data-open="true"] {
+        transform: translateX(0);
+        pointer-events: auto;
+        visibility: visible;
+      }
+      body[data-jetski-flight-deck-open="true"] #root {
+        width: calc(
+          100vw - var(--jetski-flight-deck-width, ${FLIGHT_DECK_DEFAULT_WIDTH_PX}px)
+        ) !important;
+        max-width: calc(
+          100vw - var(--jetski-flight-deck-width, ${FLIGHT_DECK_DEFAULT_WIDTH_PX}px)
+        ) !important;
+        transition:
+          width 200ms cubic-bezier(0.16, 1, 0.3, 1),
+          max-width 200ms cubic-bezier(0.16, 1, 0.3, 1);
+      }
+      body[data-jetski-flight-deck-open="true"] .agy-shell {
+        --settled-content-width: calc(
+          100vw - var(--sidebar-width) - var(--aux-pane-width) -
+          var(--jetski-flight-deck-width, ${FLIGHT_DECK_DEFAULT_WIDTH_PX}px)
+        ) !important;
+      }
+      .${FLIGHT_DECK_RESIZE_HANDLE_CLASS} {
+        position: absolute;
+        top: 0;
+        left: -3px;
+        bottom: 0;
+        width: 6px;
+        cursor: col-resize;
+        z-index: 10;
+        background: transparent;
+        transition: background-color 150ms ease;
+      }
+      .${FLIGHT_DECK_RESIZE_HANDLE_CLASS}:hover,
+      .${FLIGHT_DECK_RESIZE_HANDLE_CLASS}[data-resizing="true"] {
+        background: rgba(138, 180, 248, 0.5);
+      }
+      .${FLIGHT_DECK_HEADER_CLASS} {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        height: 38px;
+        min-height: 38px;
+        padding: 0 10px 0 14px;
+        border-bottom: 1px solid rgba(128, 128, 128, 0.18);
+        background: var(--surface-glass, rgba(30, 30, 30, 0.75));
+        backdrop-filter: blur(12px);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--foreground, #e8eaed);
+        user-select: none;
+      }
+      .${FLIGHT_DECK_HEADER_CLASS} .jetski-flight-deck-header-title {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .${FLIGHT_DECK_HEADER_CLASS} .jetski-flight-deck-header-actions {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+      }
+      .jetski-flight-deck-header-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 26px;
+        height: 26px;
+        border-radius: 6px;
+        border: none;
+        background: transparent;
+        color: var(--muted-foreground, #9aa0a6);
+        cursor: pointer;
+        font-size: 13px;
+        line-height: 1;
+        text-decoration: none !important;
+        transition: background-color 100ms ease, color 100ms ease;
+      }
+      .jetski-flight-deck-header-btn:hover {
+        background: rgba(128, 134, 139, 0.18);
+        color: var(--foreground, #e8eaed);
+      }
+      .${FLIGHT_DECK_IFRAME_CLASS} {
+        flex: 1 1 0%;
+        width: 100%;
+        height: 100%;
+        border: none;
+        background: var(--background, #111113);
+      }
       /* Make inbox parent a flex column so conversation-list-sidebar never overflows bottom */
       div:has(> .${INBOX_CLASS}) {
         display: flex !important;
@@ -7568,6 +7779,294 @@
     },
   };
 
+  // Updates Flight Deck drawer width and syncs CSS custom property on body
+  function applyFlightDeckWidth(drawerEl, px, persist = false) {
+    flightDeckWidthPx = clampFlightDeckWidth(px);
+    const pxVal = `${flightDeckWidthPx}px`;
+    if (typeof document !== 'undefined' && document.body?.style) {
+      if (typeof document.body.style.setProperty === 'function') {
+        document.body.style.setProperty('--jetski-flight-deck-width', pxVal);
+      } else {
+        document.body.style['--jetski-flight-deck-width'] = pxVal;
+      }
+    }
+    if (drawerEl) {
+      drawerEl.style.width = pxVal;
+      setAttrIfChanged(drawerEl, 'data-width', String(flightDeckWidthPx));
+    }
+    if (persist) {
+      safeSetStorage(STORAGE_FLIGHT_DECK_WIDTH_KEY, String(flightDeckWidthPx));
+    }
+  }
+
+  // Fetches current Flight Deck host URL and updates open-tab link and embedded iframe src
+  function syncFlightDeckIframeUrl(drawerEl, forceReload = false) {
+    if (!drawerEl) return;
+    const iframe = drawerEl.querySelector(`.${FLIGHT_DECK_IFRAME_CLASS}`);
+    const openTabBtn = drawerEl.querySelector(
+      '[data-testid="jetski-flight-deck-open-tab-btn"]'
+    );
+    return fetchFlightDeckInfo().then((info) => {
+      const tabUrl = resolveFlightDeckUrl(info, false);
+      if (openTabBtn) {
+        setAttrIfChanged(openTabBtn, 'href', tabUrl);
+      }
+      if (iframe && flightDeckOpen) {
+        const embedUrl = resolveFlightDeckUrl(info, true);
+        const curBaseSrc = iframe.getAttribute('data-base-src') || '';
+        if (forceReload || curBaseSrc !== embedUrl) {
+          iframe.setAttribute('data-base-src', embedUrl);
+          const sep = embedUrl.includes('?') ? '&' : '?';
+          iframe.setAttribute(
+            'src',
+            forceReload ? `${embedUrl}${sep}t=${Date.now()}` : embedUrl
+          );
+        }
+      }
+    });
+  }
+
+  // Toggles or sets Flight Deck side panel open state and persists to storage
+  function setFlightDeckOpen(nextOpen) {
+    flightDeckOpen = Boolean(nextOpen);
+    safeSetStorage(STORAGE_FLIGHT_DECK_OPEN_KEY, flightDeckOpen ? 'true' : 'false');
+    ensureFlightDeckUI();
+  }
+
+  // Mounts or updates the Flight Deck resizable right-hand drawer and iframe
+  function ensureFlightDeckDrawer() {
+    if (typeof document === 'undefined' || !document.body) return null;
+    let drawerEl = document.getElementById(FLIGHT_DECK_DRAWER_ID);
+    if (!drawerEl) {
+      drawerEl = document.createElement('aside');
+      drawerEl.id = FLIGHT_DECK_DRAWER_ID;
+      drawerEl.className = FLIGHT_DECK_DRAWER_CLASS;
+      drawerEl.setAttribute('data-testid', FLIGHT_DECK_DRAWER_ID);
+      drawerEl.setAttribute('aria-label', 'Flight Deck panel');
+
+      const resizeHandle = document.createElement('div');
+      resizeHandle.className = FLIGHT_DECK_RESIZE_HANDLE_CLASS;
+      resizeHandle.setAttribute('data-testid', FLIGHT_DECK_RESIZE_HANDLE_CLASS);
+      resizeHandle.setAttribute('role', 'separator');
+      resizeHandle.setAttribute('aria-orientation', 'vertical');
+      resizeHandle.setAttribute(
+        'aria-label',
+        'Resize Flight Deck panel (double-click to reset)'
+      );
+      resizeHandle.setAttribute(
+        'title',
+        'Drag to resize · Double-click to reset width'
+      );
+
+      let isDragging = false;
+      const startResize = (e) => {
+        if (e.button !== undefined && e.button !== 0) return;
+        if (isDragging) return;
+        isDragging = true;
+        e.preventDefault();
+        e.stopPropagation();
+        const startX = Number(e.clientX) || 0;
+        const startWidth = flightDeckWidthPx;
+        resizeHandle.setAttribute('data-resizing', 'true');
+        const iframe = drawerEl.querySelector(`.${FLIGHT_DECK_IFRAME_CLASS}`);
+        if (iframe) iframe.style.pointerEvents = 'none';
+
+        const onMove = (ev) => {
+          const delta = startX - (Number(ev.clientX) || 0);
+          applyFlightDeckWidth(drawerEl, startWidth + delta, false);
+        };
+
+        const onEnd = () => {
+          if (!isDragging) return;
+          isDragging = false;
+          if (typeof document !== 'undefined') {
+            document.removeEventListener('pointermove', onMove, true);
+            document.removeEventListener('mousemove', onMove, true);
+            document.removeEventListener('pointerup', onEnd, true);
+            document.removeEventListener('mouseup', onEnd, true);
+            document.removeEventListener('pointercancel', onEnd, true);
+          }
+          activeFlightDeckResizeCleanup = null;
+          resizeHandle.removeAttribute('data-resizing');
+          if (iframe) iframe.style.pointerEvents = '';
+          applyFlightDeckWidth(drawerEl, flightDeckWidthPx, true);
+        };
+
+        activeFlightDeckResizeCleanup = onEnd;
+
+        if (typeof document !== 'undefined') {
+          document.addEventListener('pointermove', onMove, true);
+          document.addEventListener('mousemove', onMove, true);
+          document.addEventListener('pointerup', onEnd, true);
+          document.addEventListener('mouseup', onEnd, true);
+          document.addEventListener('pointercancel', onEnd, true);
+        }
+      };
+
+      resizeHandle.addEventListener('pointerdown', startResize);
+      resizeHandle.addEventListener('mousedown', startResize);
+      resizeHandle.addEventListener('dblclick', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        applyFlightDeckWidth(drawerEl, FLIGHT_DECK_DEFAULT_WIDTH_PX, true);
+      });
+
+      const headerEl = document.createElement('div');
+      headerEl.className = FLIGHT_DECK_HEADER_CLASS;
+      headerEl.setAttribute('data-testid', FLIGHT_DECK_HEADER_CLASS);
+
+      const titleEl = document.createElement('div');
+      titleEl.className = 'jetski-flight-deck-header-title';
+      titleEl.textContent = '✈️ Flight Deck';
+
+      const actionsEl = document.createElement('div');
+      actionsEl.className = 'jetski-flight-deck-header-actions';
+
+      const refreshBtn = document.createElement('button');
+      refreshBtn.type = 'button';
+      refreshBtn.className = 'jetski-flight-deck-header-btn';
+      refreshBtn.setAttribute('data-testid', 'jetski-flight-deck-refresh-btn');
+      refreshBtn.setAttribute('aria-label', 'Reload Flight Deck');
+      refreshBtn.setAttribute('title', 'Reload Flight Deck');
+      refreshBtn.textContent = '↻';
+      bindHoverBubble(refreshBtn, () => 'Reload Flight Deck');
+      bindActionBtnHandlers(refreshBtn, () => {
+        flightDeckInfoFetchedAt = 0;
+        void syncFlightDeckIframeUrl(drawerEl, true);
+      });
+
+      const openTabBtn = document.createElement('a');
+      openTabBtn.className = 'jetski-flight-deck-header-btn';
+      openTabBtn.setAttribute('data-testid', 'jetski-flight-deck-open-tab-btn');
+      openTabBtn.setAttribute('target', '_blank');
+      openTabBtn.setAttribute('rel', 'noopener noreferrer');
+      openTabBtn.setAttribute('aria-label', 'Open Flight Deck in new tab');
+      openTabBtn.setAttribute('title', 'Open Flight Deck in new tab');
+      openTabBtn.textContent = '↗';
+      bindHoverBubble(openTabBtn, () => 'Open Flight Deck in new tab');
+
+      const closeBtn = document.createElement('button');
+      closeBtn.type = 'button';
+      closeBtn.className = 'jetski-flight-deck-header-btn';
+      closeBtn.setAttribute('data-testid', 'jetski-flight-deck-close-btn');
+      closeBtn.setAttribute('aria-label', 'Close Flight Deck panel');
+      closeBtn.setAttribute('title', 'Close Flight Deck panel');
+      closeBtn.textContent = '✕';
+      bindHoverBubble(closeBtn, () => 'Close Flight Deck panel');
+      bindActionBtnHandlers(closeBtn, () => {
+        setFlightDeckOpen(false);
+      });
+
+      actionsEl.appendChild(refreshBtn);
+      actionsEl.appendChild(openTabBtn);
+      actionsEl.appendChild(closeBtn);
+
+      headerEl.appendChild(titleEl);
+      headerEl.appendChild(actionsEl);
+
+      const iframeEl = document.createElement('iframe');
+      iframeEl.className = FLIGHT_DECK_IFRAME_CLASS;
+      iframeEl.setAttribute('data-testid', FLIGHT_DECK_IFRAME_CLASS);
+      iframeEl.setAttribute('title', 'Flight Deck');
+
+      drawerEl.appendChild(resizeHandle);
+      drawerEl.appendChild(headerEl);
+      drawerEl.appendChild(iframeEl);
+      document.body.appendChild(drawerEl);
+    }
+
+    applyFlightDeckWidth(drawerEl, flightDeckWidthPx, false);
+    setAttrIfChanged(drawerEl, 'data-open', flightDeckOpen ? 'true' : 'false');
+    if (flightDeckOpen) {
+      setAttrIfChanged(document.body, 'data-jetski-flight-deck-open', 'true');
+    } else {
+      document.body.removeAttribute('data-jetski-flight-deck-open');
+    }
+
+    void syncFlightDeckIframeUrl(drawerEl, false);
+    return drawerEl;
+  }
+
+  // Mounts or updates the Flight Deck toggle button in the sidebar top bar
+  function ensureFlightDeckToggle() {
+    const sidebarEl = document.querySelector('[aria-label="Sidebar"]');
+    const searchBtn =
+      document.querySelector('[data-testid="sidebar-search-button"]') ||
+      sidebarEl?.querySelector('[data-testid="sidebar-search-button"]');
+    const mountParent =
+      searchBtn?.parentElement ||
+      sidebarEl?.querySelector('div:first-child');
+    if (!mountParent) return;
+
+    let fdBtn = mountParent.querySelector(`.${FLIGHT_DECK_TOGGLE_BTN_CLASS}`);
+    if (!fdBtn) {
+      fdBtn = document.createElement('button');
+      fdBtn.type = 'button';
+      fdBtn.className = FLIGHT_DECK_TOGGLE_BTN_CLASS;
+      fdBtn.setAttribute('data-testid', 'jetski-flight-deck-toggle-btn');
+      fdBtn.textContent = '✈️';
+      bindHoverBubble(fdBtn, () => fdBtn.getAttribute('aria-label') || 'Flight Deck');
+      bindActionBtnHandlers(fdBtn, () => {
+        setFlightDeckOpen(!flightDeckOpen);
+        const label = fdBtn.getAttribute('aria-label');
+        if (label) {
+          showActionPillBubble(fdBtn, label);
+        }
+      });
+
+      const topNavBtn = mountParent.querySelector(`.${TOP_NAV_TOGGLE_BTN_CLASS}`);
+      if (topNavBtn && topNavBtn.nextSibling) {
+        mountParent.insertBefore(fdBtn, topNavBtn.nextSibling);
+      } else if (searchBtn && searchBtn.nextSibling) {
+        mountParent.insertBefore(fdBtn, searchBtn.nextSibling);
+      } else {
+        mountParent.appendChild(fdBtn);
+      }
+    }
+
+    setAttrIfChanged(fdBtn, 'data-active', flightDeckOpen ? 'true' : 'false');
+    const fdLabel = flightDeckOpen ? 'Hide Flight Deck panel' : 'Open Flight Deck panel';
+    setAttrIfChanged(fdBtn, 'aria-label', fdLabel);
+    setAttrIfChanged(fdBtn, 'title', fdLabel);
+  }
+
+  // Synchronizes Flight Deck toggle button and embedded drawer panel
+  function ensureFlightDeckUI() {
+    ensureFlightDeckToggle();
+    ensureFlightDeckDrawer();
+  }
+
+  // Handles postMessage events from the embedded Flight Deck dashboard
+  function handleFlightDeckMessage(event) {
+    const data = event?.data;
+    if (!data || typeof data !== 'object') return;
+    if (data.type === 'jetski-flight-deck-open-chat') {
+      const cid = String(data.cascadeId || '');
+      if (cid) {
+        manualVisitedCids.add(cid);
+        void postUpdateAnnotationsRpc(cid, {
+          lastUserViewTime: new Date().toISOString(),
+        });
+        openConversation(cid);
+      }
+    } else if (data.type === 'jetski-flight-deck-close') {
+      setFlightDeckOpen(false);
+    }
+  }
+
+  window.__jetskiFlightDeck = {
+    ensureFlightDeckUI,
+    isOpen: () => flightDeckOpen,
+    setOpen: setFlightDeckOpen,
+    getWidth: () => flightDeckWidthPx,
+    setWidth: (px) => {
+      const drawerEl = document.getElementById(FLIGHT_DECK_DRAWER_ID);
+      applyFlightDeckWidth(drawerEl, px, true);
+    },
+    resolveUrl: resolveFlightDeckUrl,
+    handleMessage: handleFlightDeckMessage,
+  };
+
   // Injects the 3-button filter bar and collapse-all projects button inside actionRow
   function ensureFilterBar() {
     const displayOptionsBtns = document.querySelectorAll(
@@ -9257,6 +9756,7 @@
     const reduxActive = syncReduxFilter();
     syncDomRowsAndPlaceholders(reduxActive);
     ensureTopNavToggle();
+    ensureFlightDeckUI();
     ensureFilterBar();
     // Sync the Needs-Reaction inbox widget above the sidebar project list
     ensureNeedsReactionInbox();
@@ -9289,7 +9789,13 @@
         target.id === STYLE_ID ||
         target.id === STAR_TOOLTIP_ID ||
         target.id === AUTOPILOT_TOAST_ID ||
+        target.id === FLIGHT_DECK_DRAWER_ID ||
         target.className === BAR_CLASS ||
+        target.className === FLIGHT_DECK_TOGGLE_BTN_CLASS ||
+        target.className === FLIGHT_DECK_DRAWER_CLASS ||
+        target.className === FLIGHT_DECK_HEADER_CLASS ||
+        target.className === FLIGHT_DECK_RESIZE_HANDLE_CLASS ||
+        target.className === FLIGHT_DECK_IFRAME_CLASS ||
         // Ignore mutations on the Needs-Reaction inbox container itself
         target.className === INBOX_CLASS ||
         target.className === INBOX_RESIZE_HANDLE_CLASS ||
@@ -9315,6 +9821,8 @@
           (target.closest('#jetski-closed-chats-filter-bubble') ||
             target.closest(`#${STAR_TOOLTIP_ID}`) ||
             target.closest(`.${BAR_CLASS}`) ||
+            target.closest(`#${FLIGHT_DECK_DRAWER_ID}`) ||
+            target.closest(`.${FLIGHT_DECK_TOGGLE_BTN_CLASS}`) ||
             // Skip subtree mutations inside the Needs-Reaction inbox widget
             target.closest(`.${INBOX_CLASS}`) ||
             target.closest(`.${BUTTON_CLASS}`) ||
@@ -9438,10 +9946,21 @@
       `#${AUTOPILOT_TOAST_ID}`,
       `.${TOP_NAV_TOGGLE_BTN_CLASS}`,
       `.${TOP_NAV_SETTINGS_BTN_CLASS}`,
+      `.${FLIGHT_DECK_TOGGLE_BTN_CLASS}`,
     ].join(', ');
     for (const el of document.querySelectorAll(cleanupSelector)) {
       el.remove();
     }
+    const fdDrawer = document.getElementById(FLIGHT_DECK_DRAWER_ID);
+    if (fdDrawer) {
+      fdDrawer.remove();
+    }
+    if (typeof activeFlightDeckResizeCleanup === 'function') {
+      activeFlightDeckResizeCleanup();
+      activeFlightDeckResizeCleanup = null;
+    }
+    document.body?.removeAttribute('data-jetski-flight-deck-open');
+    window.removeEventListener?.('message', handleFlightDeckMessage);
     topNavExpanded = false;
     const sidebarEl = document.querySelector('[aria-label="Sidebar"]');
     if (sidebarEl) {
@@ -9492,5 +10011,6 @@
   runFullSync();
   window.addEventListener?.('focus', markThisJetskiTabActive);
   document.addEventListener?.('visibilitychange', markThisJetskiTabActive);
+  window.addEventListener?.('message', handleFlightDeckMessage);
   startOpenChatPoller();
 })();

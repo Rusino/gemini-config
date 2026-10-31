@@ -64,6 +64,9 @@ STATE_FILE = os.path.expanduser("~/.gemini/config/logs/cl_watcher_state.json")
 OPEN_CHAT_REQ_FILE = os.path.expanduser(
     "~/.gemini/jetski/brain/jetski-open-chat.json"
 )
+FLIGHT_DECK_INFO_FILE = os.path.expanduser(
+    "~/.gemini/jetski/brain/jetski-flight-deck.json"
+)
 ANNOTATIONS_DIR = os.path.expanduser("~/.gemini/jetski/annotations")
 PROJECTS_DIR = os.path.expanduser("~/.gemini/config/projects")
 # Root directory for per-project chat state files that record follow-up CLs
@@ -529,6 +532,7 @@ def save_watcher_state(state: dict[str, Any]) -> None:
     os.replace(tmp, STATE_FILE)
   except Exception:
     pass
+  export_flight_deck_info()
 
 
 def get_pen_url(port: int) -> str:
@@ -546,6 +550,35 @@ def get_pen_url(port: int) -> str:
   except Exception:
     pass
   return f"http://localhost:{port}"
+
+
+_FLIGHT_DECK_PEN_URL: dict[int, str] = {}
+
+
+def flight_deck_pen_url(port: int = DEFAULT_PORT) -> str:
+  """Returns the Flight Deck dashboard PEN URL, cached per port."""
+  if port not in _FLIGHT_DECK_PEN_URL:
+    _FLIGHT_DECK_PEN_URL[port] = get_pen_url(port)
+  return _FLIGHT_DECK_PEN_URL[port]
+
+
+def export_flight_deck_info(port: int = DEFAULT_PORT) -> None:
+  """Writes local and PEN URLs to brain so Jetski Web can embed Flight Deck."""
+  try:
+    pen_url = flight_deck_pen_url(port)
+    local_url = f"http://localhost:{port}"
+    data = {
+        "pen_url": pen_url,
+        "local_url": local_url,
+        "port": port,
+    }
+    os.makedirs(os.path.dirname(FLIGHT_DECK_INFO_FILE), exist_ok=True)
+    tmp = f"{FLIGHT_DECK_INFO_FILE}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+      json.dump(data, f, indent=2)
+    os.replace(tmp, FLIGHT_DECK_INFO_FILE)
+  except Exception:
+    pass
 
 
 _GARDENER_PEN_URL: list[str] = []
@@ -5794,6 +5827,25 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   @media (prefers-reduced-motion: reduce) {
     .moving { animation: none; }
   }
+
+  /* Compact layout for embedded drawer mode inside Jetski Web */
+  html.embedded body { font-size: 13px; line-height: 1.35; }
+  html.embedded .wrap { padding: 0 16px; max-width: 100%; }
+  html.embedded .bar .wrap { height: 42px; gap: 12px; }
+  html.embedded .brand { font-size: 14px; }
+  html.embedded .rollers { display: none; }
+  html.embedded .hero { padding: 20px 0 14px; }
+  html.embedded .hero h1 { font-size: 26px; }
+  html.embedded .hero p { margin-top: 6px; font-size: 14px; }
+  html.embedded .projects { padding-top: 10px; gap: 4px; }
+  html.embedded .proj { font-size: 11.5px; padding: 3px 8px; }
+  html.embedded .card { padding: 16px 18px; border-radius: 14px; gap: 6px 16px; }
+  html.embedded .card h2 { font-size: 18px; }
+  html.embedded .card .why { font-size: 13.5px; }
+  html.embedded .row { grid-template-columns: 1fr; gap: 4px; padding: 10px 0; }
+  html.embedded section.lane { margin-top: 28px; }
+  html.embedded .lane-head h3, html.embedded details.done h3 { font-size: 17px; }
+  html.embedded footer { margin: 48px 0 24px; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -7354,6 +7406,33 @@ async function openChat(convId, url, ev) {
   }
   const btn = ev && (ev.currentTarget || ev.target) ? (ev.currentTarget || ev.target) : null;
   const origText = btn ? btn.textContent : '';
+
+  // In embedded iframe mode, postMessage directly to parent Jetski Web for immediate navigation
+  if (convId && typeof window !== 'undefined' && window.parent && window.parent !== window) {
+    try {
+      window.parent.postMessage({
+        type: 'jetski-flight-deck-open-chat',
+        cascadeId: convId,
+      }, '*');
+      if (btn) {
+        btn.textContent = '✓ Opened in Jetski';
+        setTimeout(() => {
+          if (btn && btn.textContent === '✓ Opened in Jetski') {
+            btn.textContent = origText;
+          }
+        }, 1400);
+      }
+      fetch('/api/open_chat', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({conversation_id: convId}),
+      }).catch(() => {});
+      return false;
+    } catch (e) {
+      // Fall through to standard navigation on postMessage failure
+    }
+  }
+
   if (convId && typeof fetch === 'function') {
     try {
       const resp = await fetch('/api/open_chat', {
@@ -7502,6 +7581,11 @@ async function triggerRefresh() {
 }
 
 function boot() {
+  const isEmbed = (window.parent && window.parent !== window) ||
+    new URLSearchParams(location.search).get('embed') === '1';
+  if (isEmbed) {
+    document.documentElement.classList.add('embedded');
+  }
   selectedProject = new URLSearchParams(location.hash.slice(1)).get('project') || 'ALL';
   fetchState();
   setInterval(fetchState, 20000);
@@ -7675,7 +7759,8 @@ def serve_forever(
   t = threading.Thread(target=bg_loop, daemon=True)
   t.start()
 
-  pen = get_pen_url(port)
+  export_flight_deck_info(port)
+  pen = flight_deck_pen_url(port)
   print(
       f"CL Flight Deck listening on http://localhost:{port} (PEN: {pen})",
       flush=True,
