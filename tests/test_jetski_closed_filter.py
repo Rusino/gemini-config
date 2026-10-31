@@ -7433,10 +7433,11 @@ eval(code);
   const iframe = drawer.querySelector('.jetski-flight-deck-iframe');
   assert(iframe, 'Iframe must be mounted in drawer');
   assert.strictEqual(iframe.getAttribute('src'), 'http://localhost:8089?embed=1');
-
-  const openTabBtn = drawer.querySelector('[data-testid="jetski-flight-deck-open-tab-btn"]');
-  assert(openTabBtn, 'Open tab button must be mounted');
-  assert.strictEqual(openTabBtn.getAttribute('href'), 'http://localhost:8089');
+  assert.strictEqual(
+    drawer.querySelector('.jetski-flight-deck-header'),
+    null,
+    'Header bar must not be rendered in embedded drawer'
+  );
 
   const handle = drawer.querySelector('.jetski-flight-deck-resize-handle');
   assert(handle, 'Resize handle must be mounted');
@@ -7476,10 +7477,10 @@ eval(code);
 
   window.__jetskiFlightDeck.setOpen(true);
   assert.strictEqual(drawer.getAttribute('data-open'), 'true');
-  const closeBtn = drawer.querySelector('[data-testid="jetski-flight-deck-close-btn"]');
-  assert(closeBtn, 'Close button must be mounted in header');
-  closeBtn.dispatchEvent('pointerdown');
+  await new Promise((r) => setTimeout(r, 350));
+  toggleBtn.dispatchEvent('pointerdown');
   assert.strictEqual(window.__jetskiFlightDeck.isOpen(), false);
+  assert.strictEqual(drawer.getAttribute('data-open'), 'false');
 
   window.__jetskiFlightDeck.setOpen(true);
   window.__jetskiClosedChatsFilterCleanup();

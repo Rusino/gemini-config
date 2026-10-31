@@ -5829,6 +5829,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
 
   /* Compact layout for embedded drawer mode inside Jetski Web */
+  html.embedded { --paper: #f4f4f6; }
+  @media (prefers-color-scheme: dark) {
+    html.embedded { --paper: #111114; --card: #19191d; }
+  }
   html.embedded body { font-size: 13px; line-height: 1.35; }
   html.embedded .wrap { padding: 0 16px; max-width: 100%; }
   html.embedded .bar .wrap { height: 42px; gap: 12px; }
@@ -5851,7 +5855,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <body>
 <header class="bar">
   <div class="wrap">
-    <div class="brand">Flight Deck</div>
+    <div class="brand">✈️ Flight Deck</div>
     <nav class="rollers" id="rollers" aria-label="Skia autorollers"></nav>
     <div class="synced" id="synced">Loading…</div>
     <button class="link-btn" id="refresh-btn" onclick="triggerRefresh()">Refresh</button>
