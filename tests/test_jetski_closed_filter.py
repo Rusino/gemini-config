@@ -6945,6 +6945,22 @@ eval(code);
     styleEl.textContent.includes('border-top: 1px solid rgba(128, 128, 128, 0.16) !important;'),
     'Style must use hairline border-top on footer'
   );
+  assert(
+    styleEl.textContent.includes('[data-testid="conversation-list-sidebar"]'),
+    'Style must include conversation-list-sidebar typography rules'
+  );
+  assert(
+    styleEl.textContent.includes('font-size: 11.5px !important;'),
+    'Style must set 11.5px font-size for sidebar projects and chats'
+  );
+  assert(
+    styleEl.textContent.includes('height: 24px !important;'),
+    'Style must set 24px height for project headers'
+  );
+  assert(
+    styleEl.textContent.includes('min-height: 22px !important;'),
+    'Style must set 22px min-height for chat rows'
+  );
 
   // 2. Set up sidebar structure with header, top-nav items, plugins section, and bottom settings
   const sidebarEl = new FakeElement('div');

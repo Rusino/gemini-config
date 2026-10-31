@@ -5257,6 +5257,45 @@
         background: rgba(128, 134, 139, 0.20);
         color: var(--foreground, #e8eaed);
       }
+      /* Match sidebar project headers and chat rows to Needs Me inbox typography (11.5px) */
+      [data-testid="conversation-list-sidebar"] {
+        font-size: 11.5px !important;
+        line-height: 1.3 !important;
+      }
+      [data-testid="conversation-list-sidebar"] button[data-testid="project-header"],
+      [data-testid="conversation-list-sidebar"] button[data-project-card] {
+        height: 24px !important;
+        min-height: 24px !important;
+      }
+      [data-testid="conversation-list-sidebar"] button[data-testid="project-header"] span.truncate,
+      [data-testid="conversation-list-sidebar"] button[data-project-card] span.truncate,
+      [data-testid="conversation-list-sidebar"] [data-sidebar-section-drop-id] > div.text-sm,
+      [data-testid="conversation-row-sidebar"] span.truncate,
+      [data-testid="conversation-row-sidebar"] input.truncate,
+      div[data-sidebar-row-id] span.truncate,
+      div[data-sidebar-row-id] input.truncate {
+        font-size: 11.5px !important;
+        line-height: 1.3 !important;
+      }
+      [data-testid="conversation-list-sidebar"] [data-testid="section-header"],
+      [data-testid="conversation-list-sidebar"] [data-testid="section-header"] span,
+      [data-testid="conversation-list-sidebar"] [data-testid="section-header"] button,
+      [data-testid="conversation-list-sidebar"] [data-sidebar-section-drop-id] > span.text-sm {
+        font-size: 11px !important;
+        line-height: 1.3 !important;
+      }
+      [data-testid="conversation-list-sidebar"] [data-sidebar-section-drop-id] > span.text-sm {
+        height: 24px !important;
+      }
+      [data-testid="conversation-row-sidebar"] {
+        padding-top: 2.5px !important;
+        padding-bottom: 2.5px !important;
+        min-height: 22px !important;
+      }
+      [data-testid="conversation-row-sidebar"] .text-xs {
+        font-size: 10px !important;
+        line-height: 1.2 !important;
+      }
     `;
     if (style.textContent !== nextCss) {
       style.textContent = nextCss;
