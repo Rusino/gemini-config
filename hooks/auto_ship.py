@@ -318,6 +318,9 @@ def post_push_steps(
       steps.append(
           (["systemctl", "--user", "restart", "cl-flight-deck.service"], rp)
       )
+    # Sync ~/.gemini/jetski/brain/jetski-closed-filter.js when the source filter script changes
+    if "scripts/jetski_closed_filter.js" in set(changed_rels):
+      steps.append((["python3", "scripts/patch_jetski_hub_binary.py"], rp))
     # Restart hub daemon so in-memory index.html string table reloads the patched bootstrap shim
     if {"scripts/patch_jetski_hub_binary.py"} & set(changed_rels):
       steps.append(

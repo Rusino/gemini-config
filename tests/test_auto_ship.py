@@ -297,6 +297,15 @@ class TestAutoShip(unittest.TestCase):
     self.assertIn(
         ["systemctl", "--user", "restart", "cl-flight-deck.service"], lc_steps
     )
+    js_steps = [
+        c
+        for c, _ in auto_ship.post_push_steps(
+            config, ["scripts/jetski_closed_filter.js"]
+        )
+    ]
+    self.assertIn(
+        ["python3", "scripts/patch_jetski_hub_binary.py"], js_steps
+    )
     self.assertEqual(auto_ship.post_push_steps(config, ["rules/code_style.md"]), [])
 
   def test_ship_commits_deleted_and_renamed_files(self):
