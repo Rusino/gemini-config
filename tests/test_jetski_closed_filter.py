@@ -7439,12 +7439,45 @@ eval(code);
     'Header bar must not be rendered in embedded drawer'
   );
 
+  const filterStyle = document.getElementById('jetski-closed-chats-filter-style');
+  assert(filterStyle, 'Filter styles must be injected into document head');
+  assert(
+    filterStyle.textContent.includes('--max-conversation-width: 92% !important;'),
+    'Conversation width variable must be overridden to 92%'
+  );
+  assert(
+    filterStyle.textContent.includes('max-width: 92% !important;'),
+    'Conversation containers must have max-width: 92%'
+  );
+  assert(
+    filterStyle.textContent.includes('#root .w-screen'),
+    'Tailwind w-screen container must be constrained'
+  );
+  assert(
+    filterStyle.textContent.includes('.agy-sheet > [data-split-root="true"]'),
+    'Split root in agy-sheet must be constrained'
+  );
+
   const handle = drawer.querySelector('.jetski-flight-deck-resize-handle');
   assert(handle, 'Resize handle must be mounted');
 
   handle.dispatchEvent('pointerdown', { clientX: 500 });
+  assert.strictEqual(
+    bodyEl.getAttribute('data-jetski-flight-deck-resizing'),
+    'true',
+    'body must indicate resizing during drawer drag'
+  );
   document.dispatchEvent('pointermove', { clientX: 400 });
+  assert.strictEqual(
+    bodyEl.getAttribute('data-jetski-flight-deck-resizing'),
+    'true'
+  );
   document.dispatchEvent('pointerup', {});
+  assert.strictEqual(
+    bodyEl.getAttribute('data-jetski-flight-deck-resizing'),
+    null,
+    'body resizing attribute must be cleared on pointerup'
+  );
   assert.strictEqual(window.__jetskiFlightDeck.getWidth(), 580);
   assert.strictEqual(drawer.style.width, '580px');
   assert.strictEqual(storageMap.get('jetski_flight_deck_width_v1'), '580');

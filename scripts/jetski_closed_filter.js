@@ -4754,6 +4754,16 @@
         background: var(--sidebar-secondary, rgba(128, 134, 139, 0.24));
         color: #8ab4f8;
       }
+      /* Keep conversation margins proportional to the active conversation pane width */
+      :root,
+      .agy-shell {
+        --max-conversation-width: 92% !important;
+      }
+      [data-testid="conversation-view"] [style*="--max-conversation-width"],
+      [data-media-drop-scope] [style*="--max-conversation-width"],
+      .agy-home [style*="--max-conversation-width"] {
+        max-width: 92% !important;
+      }
       /* Flight Deck drawer container */
       #${FLIGHT_DECK_DRAWER_ID} {
         position: fixed;
@@ -4761,7 +4771,7 @@
         right: 0;
         bottom: 0;
         width: var(--jetski-flight-deck-width, ${FLIGHT_DECK_DEFAULT_WIDTH_PX}px);
-        max-width: 90vw;
+        max-width: calc(100vw - 520px);
         z-index: 950;
         display: flex;
         flex-direction: column;
@@ -4778,21 +4788,58 @@
         pointer-events: auto;
         visibility: visible;
       }
-      body[data-jetski-flight-deck-open="true"] #root {
+      body[data-jetski-flight-deck-open="true"] {
+        overflow-x: hidden !important;
+      }
+      body[data-jetski-flight-deck-open="true"] #root,
+      body[data-jetski-flight-deck-open="true"] #root .w-screen,
+      body[data-jetski-flight-deck-open="true"] .agy-shell {
         width: calc(
-          100vw - var(--jetski-flight-deck-width, ${FLIGHT_DECK_DEFAULT_WIDTH_PX}px)
+          100vw - min(
+            var(--jetski-flight-deck-width, ${FLIGHT_DECK_DEFAULT_WIDTH_PX}px),
+            calc(100vw - 520px)
+          )
         ) !important;
         max-width: calc(
-          100vw - var(--jetski-flight-deck-width, ${FLIGHT_DECK_DEFAULT_WIDTH_PX}px)
+          100vw - min(
+            var(--jetski-flight-deck-width, ${FLIGHT_DECK_DEFAULT_WIDTH_PX}px),
+            calc(100vw - 520px)
+          )
         ) !important;
+        overflow-x: hidden !important;
         transition:
           width 200ms cubic-bezier(0.16, 1, 0.3, 1),
           max-width 200ms cubic-bezier(0.16, 1, 0.3, 1);
       }
+      body[data-jetski-flight-deck-open="true"][data-jetski-flight-deck-resizing="true"]
+        #root,
+      body[data-jetski-flight-deck-open="true"][data-jetski-flight-deck-resizing="true"]
+        #root .w-screen,
+      body[data-jetski-flight-deck-open="true"][data-jetski-flight-deck-resizing="true"]
+        .agy-shell,
+      body[data-jetski-flight-deck-open="true"][data-jetski-flight-deck-resizing="true"]
+        #${FLIGHT_DECK_DRAWER_ID} {
+        transition: none !important;
+      }
+      body[data-jetski-flight-deck-open="true"]
+        .agy-sheet > [data-split-root="true"] > div:first-child {
+        min-width: 180px !important;
+      }
+      body[data-jetski-flight-deck-open="true"]
+        .agy-sheet > [data-split-root="true"] > div:last-child {
+        max-width: calc(100% - 200px) !important;
+      }
+      body[data-jetski-flight-deck-open="true"]
+        .agy-sheet > [data-split-root="true"] > div:last-child > div {
+        max-width: 100% !important;
+      }
       body[data-jetski-flight-deck-open="true"] .agy-shell {
         --settled-content-width: calc(
           100vw - var(--sidebar-width) - var(--aux-pane-width) -
-          var(--jetski-flight-deck-width, ${FLIGHT_DECK_DEFAULT_WIDTH_PX}px)
+          min(
+            var(--jetski-flight-deck-width, ${FLIGHT_DECK_DEFAULT_WIDTH_PX}px),
+            calc(100vw - 520px)
+          )
         ) !important;
       }
       .${FLIGHT_DECK_RESIZE_HANDLE_CLASS} {
@@ -7813,6 +7860,9 @@
         const startX = Number(e.clientX) || 0;
         const startWidth = flightDeckWidthPx;
         resizeHandle.setAttribute('data-resizing', 'true');
+        if (typeof document !== 'undefined' && document.body) {
+          document.body.setAttribute('data-jetski-flight-deck-resizing', 'true');
+        }
         const iframe = drawerEl.querySelector(`.${FLIGHT_DECK_IFRAME_CLASS}`);
         if (iframe) iframe.style.pointerEvents = 'none';
 
@@ -7830,6 +7880,7 @@
             document.removeEventListener('pointerup', onEnd, true);
             document.removeEventListener('mouseup', onEnd, true);
             document.removeEventListener('pointercancel', onEnd, true);
+            document.body?.removeAttribute('data-jetski-flight-deck-resizing');
           }
           activeFlightDeckResizeCleanup = null;
           resizeHandle.removeAttribute('data-resizing');
@@ -7870,6 +7921,10 @@
     setAttrIfChanged(drawerEl, 'data-open', flightDeckOpen ? 'true' : 'false');
     if (flightDeckOpen) {
       setAttrIfChanged(document.body, 'data-jetski-flight-deck-open', 'true');
+      if (typeof document !== 'undefined') {
+        if (document.documentElement) document.documentElement.scrollLeft = 0;
+        if (document.body) document.body.scrollLeft = 0;
+      }
     } else {
       document.body.removeAttribute('data-jetski-flight-deck-open');
     }
@@ -9850,6 +9905,7 @@
       activeFlightDeckResizeCleanup = null;
     }
     document.body?.removeAttribute('data-jetski-flight-deck-open');
+    document.body?.removeAttribute('data-jetski-flight-deck-resizing');
     window.removeEventListener?.('message', handleFlightDeckMessage);
     topNavExpanded = false;
     const sidebarEl = document.querySelector('[aria-label="Sidebar"]');
