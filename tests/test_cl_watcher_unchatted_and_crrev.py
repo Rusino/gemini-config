@@ -507,9 +507,9 @@ console.log(JSON.stringify({
     self.assertEqual(out["revStatus"], "attention")
     self.assertEqual(out["revLane"], "you")
     self.assertEqual(out["ownStatus"], "waiting")
-    self.assertIn("Start chat", out["card"])
+    self.assertIn("Start code review", out["card"])
     self.assertIn("startChat(", out["card"])
-    self.assertIn("start chat", out["row"])
+    self.assertIn("start code review", out["row"])
 
   def test_sync_once_links_archived_chat_and_companion_cls_and_prs(self):
     summaries = {

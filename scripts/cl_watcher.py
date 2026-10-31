@@ -668,6 +668,11 @@ def overlay_live_chat_busy(state: dict[str, Any]) -> None:
       if not busy and now_ts - float(item.get("chat_woken_ts") or 0.0) < CHAT_WAKE_GRACE_SEC:
         busy = True
       item["chat_busy"] = busy
+      if not busy and item.get("review_target_ps"):
+        item["reviewed_ps"] = max(
+            int(item.get("reviewed_ps") or 0),
+            int(item.get("review_target_ps") or 0),
+        )
 
 
 def extract_cl_ids_with_hosts(text: str) -> dict[str, str]:
@@ -4007,6 +4012,20 @@ def _rekey_state_item_chat(
   items[f"{ikey}@{cid}"] = rec
 
 
+def _is_assigned_reviewer_record(rec: dict[str, Any]) -> bool:
+  """Returns True if the user is an assigned reviewer on an open external CL/PR"""
+  if not isinstance(rec, dict):
+    return False
+  if rec.get("is_self") or rec.get("companion_to") or rec.get("is_companion"):
+    return False
+  if rec.get("reviewer_removed"):
+    return False
+  role = str(rec.get("role") or "").strip()
+  if role:
+    return role.startswith("reviewer")
+  return not bool(rec.get("is_watching"))
+
+
 def _start_pinned_chat_for_record(
     items: dict[str, Any],
     ikey: str,
@@ -4044,6 +4063,8 @@ def _start_pinned_chat_for_record(
   rec["chat_busy"] = True
   rec["chat_woken_ts"] = time.time()
   rec["chat_last_modified"] = datetime.now(timezone.utc).isoformat()
+  if _is_assigned_reviewer_record(rec):
+    rec["review_target_ps"] = int(rec.get("patchset") or 1)
   return {
       "ok": True,
       "started": True,
@@ -4066,23 +4087,52 @@ def start_chat_for_item(item_key: str) -> dict[str, Any]:
 
   # Reuse an existing active, companion-parent, or archived chat before spawning a new one
   existing_cid, is_arch, comp_to = _discover_existing_chat_for_item(ikey, rec)
-  if existing_cid:
-    if isinstance(rec, dict) and not str(rec.get("conversation_id") or "").strip():
-      _rekey_state_item_chat(
-          items,
-          ikey,
-          matched_key,
-          rec,
-          existing_cid,
-          chat_archived=True if is_arch else None,
-          companion_to=comp_to,
-      )
+  active_cid = existing_cid or (
+      str(rec.get("conversation_id") or "").strip() if isinstance(rec, dict) else ""
+  )
+  if active_cid:
+    if isinstance(rec, dict):
+      if not str(rec.get("conversation_id") or "").strip():
+        _rekey_state_item_chat(
+            items,
+            ikey,
+            matched_key,
+            rec,
+            active_cid,
+            chat_archived=True if is_arch else None,
+            companion_to=comp_to,
+        )
+      # Trigger incremental review if a new patchset was uploaded after previous review
+      if _is_assigned_reviewer_record(rec) and not rec.get("chat_busy"):
+        cur_ps = int(rec.get("patchset") or 1)
+        rev_ps = int(rec.get("reviewed_ps") or 0)
+        tgt_ps = int(rec.get("review_target_ps") or 0)
+        if rev_ps > 0 and cur_ps > rev_ps and cur_ps > tgt_ps:
+          url = str(rec.get("url") or ikey)
+          subj = str(rec.get("subject") or ikey)
+          wake_msg = (
+              f"[CL-WATCHER] 💬 Новое обновление в {ikey} (PS{cur_ps}): "
+              f"'{subj}'. Проведи инкрементальный триаж/анализ и подготовь разбор ревью "
+              f"для PS{cur_ps}."
+          )
+          rec["review_target_ps"] = cur_ps
+          rec["chat_busy"] = True
+          rec["chat_woken_ts"] = time.time()
+          wake_conversation(active_cid, wake_msg)
+          save_watcher_state(state)
+          return {
+              "ok": True,
+              "already_existed": True,
+              "woken": True,
+              "conversation_id": active_cid,
+              "chat_url": f"{jetski_box_url()}/c/{active_cid}",
+          }
       save_watcher_state(state)
     return {
         "ok": True,
         "already_existed": True,
-        "conversation_id": existing_cid,
-        "chat_url": f"{jetski_box_url()}/c/{existing_cid}",
+        "conversation_id": active_cid,
+        "chat_url": f"{jetski_box_url()}/c/{active_cid}",
     }
 
   if not isinstance(rec, dict):
@@ -4846,6 +4896,16 @@ def sync_once(
   state = load_watcher_state()
   prev_items: dict[str, Any] = state.get("items") or {}
   events: list[dict[str, Any]] = state.get("events") or []
+  review_claims: dict[str, Any] = state.setdefault("review_claims", {})
+  busy_review_chats = sum(
+      1
+      for d in prev_items.values()
+      if isinstance(d, dict)
+      and d.get("conversation_id")
+      and _is_assigned_reviewer_record(d)
+      and d.get("chat_busy")
+  )
+  auto_started_count = 0
 
   # Refresh skia_main git refs so merge-base checks are accurate
   if os.path.isdir(skia_dir):
@@ -5103,6 +5163,10 @@ def sync_once(
             record["chat_busy"] = bool(prev_fb.get("chat_busy", False))
         prev = prev_fb
     prev = prev or {}
+    if prev.get("review_target_ps"):
+      record["review_target_ps"] = prev["review_target_ps"]
+    if prev.get("reviewed_ps"):
+      record["reviewed_ps"] = prev["reviewed_ps"]
     # Preserve optimistic chat_busy across sync cycles before LS flips the chat to RUNNING
     prev_woken = float(prev.get("chat_woken_ts") or 0.0)
     if (
@@ -5113,6 +5177,17 @@ def sync_once(
     ):
       record["chat_woken_ts"] = prev_woken
       record["chat_busy"] = True
+
+    if cid and _is_assigned_reviewer_record(record) and not record.get("chat_busy"):
+      record["reviewed_ps"] = max(
+          int(record.get("reviewed_ps") or 0),
+          int(
+              record.get("review_target_ps")
+              or prev.get("patchset")
+              or record.get("patchset")
+              or 1
+          ),
+      )
     post = info.get("post_submit") or {}
     if post:
       # Key post-submit rolls on state changes to track duration in each status bucket
@@ -5237,6 +5312,10 @@ def sync_once(
           and not info["last_msg_author"].endswith(".gserviceaccount.com")
           and info["in_my_attention"]
       ):
+        if _is_assigned_reviewer_record(record):
+          record["review_target_ps"] = int(info.get("patchset") or 1)
+          record["chat_busy"] = True
+          record["chat_woken_ts"] = time.time()
         transition_msg = (
             f"[CL-WATCHER] 💬 Новое обновление в {ikey} (PS{info['patchset']}) от "
             f"{info['last_msg_author']}: {info['last_msg_snippet']}. "
@@ -5262,6 +5341,53 @@ def sync_once(
           )
         if cid and wake_chats:
           wake_conversation(cid, transition_msg)
+
+    if (
+        wake_chats
+        and not cid
+        and _is_assigned_reviewer_record(record)
+        and str(info.get("status") or "").upper() in ("NEW", "OPEN")
+        and not info.get("is_wip")
+        and not info.get("is_draft")
+        and info.get("in_my_attention")
+    ):
+      cur_ps = int(info.get("patchset") or 1)
+      claim_key = f"{ikey}:{cur_ps}"
+      if (
+          claim_key not in review_claims
+          and auto_started_count < 1
+          and busy_review_chats < 2
+      ):
+        prompt = (
+            f"Проведи review-triage для {info.get('url') or ikey} "
+            f"('{info.get('subject') or ikey}', PS{cur_ps}) и подготовь разбор ревью "
+            "(никогда не публикуй комментарии ревью без моего подтверждения)."
+        )
+        res = _start_pinned_chat_for_record(
+            new_items, ikey, composite_key, record, prompt
+        )
+        if res.get("ok"):
+          cid = str(res.get("conversation_id") or "")
+          composite_key = str(record.get("composite_key") or composite_key)
+          review_claims[claim_key] = {"cid": cid, "ts": time.time()}
+          auto_started_count += 1
+          busy_review_chats += 1
+          events.insert(
+              0,
+              {
+                  "id": f"ev-{int(time.time() * 1000)}-{tid}",
+                  "time": now_et_str(),
+                  "item_key": ikey,
+                  "target_id": tid,
+                  "conversation_id": cid,
+                  "project_name": d["project_name"],
+                  "critical": False,
+                  "message": (
+                      f"[CL-WATCHER] 🔍 Auto-started code review for {ikey} "
+                      f"(PS{cur_ps}) in chat {cid[:8]}."
+                  ),
+              },
+          )
 
     new_items[composite_key] = record
 
@@ -5396,6 +5522,7 @@ def sync_once(
 
   triage_store.overlay_triage_on_items(new_items.values())
   state["items"] = new_items
+  state["review_claims"] = review_claims
   state["events"] = events
   state["last_sync"] = now_et_str()
   state["gardener_url"] = gardener_pen_url()
@@ -6548,9 +6675,55 @@ function rowTime(it) {
   return formatStatusTime(it);
 }
 
+// Assigned reviewer changes use the code review button state machine
+function isReviewerChange(it) {
+  if (!it || it.is_self || isCompanion(it)) return false;
+  if (it.reviewer_removed) return false;
+  const role = String(it.role || '').trim();
+  if (role) return role.startsWith('reviewer');
+  return !it.is_watching;
+}
+
 function chatActionHtml(it, data, compact) {
+  const isRev = isReviewerChange(it);
   const chat = chatUrl(it, data);
+  const curPs = Number(it.patchset || 1);
+  const revPs = Number(it.reviewed_ps || 0);
+  const tgtPs = Number(it.review_target_ps || 0);
   if (chat) {
+    if (isRev) {
+      const cidJson = esc(JSON.stringify(it.conversation_id || ''));
+      const urlJson = esc(JSON.stringify(chat));
+      if (it.chat_busy) {
+        const label = compact ? '⏳ preparing review…' : '⏳ Preparing code review…';
+        const cls = compact ? 'chat' : 'btn quiet';
+        return `<a class="${cls}" href="${esc(chat)}" target="jetski-chat" ` +
+          `title="Code review is running in Jetski; click to watch live" ` +
+          `onclick="return openChat(${cidJson}, ${urlJson}, event)">${label}</a>`;
+      }
+      if (it.item_key && revPs > 0 && curPs > revPs && curPs > tgtPs) {
+        const cls = compact ? 'link-btn chat' : 'btn primary';
+        const label = compact ? `start review (PS${curPs})` : `Start code review (PS${curPs})`;
+        return `<button class="${cls}" ` +
+          `onclick="startChat(${esc(JSON.stringify(it.item_key))}, this)">${label}</button>`;
+      }
+      const alreadyResponded = !it.in_my_attention &&
+        (Boolean(it.self_approved) || Boolean(it.self_review_state));
+      if (alreadyResponded) {
+        const label = it.chat_archived
+          ? (compact ? 'review chat (archived)' : 'Open review chat (archived)')
+          : (compact ? 'review chat' : 'Open review chat');
+        const cls = compact ? 'chat' : 'btn quiet';
+        return `<a class="${cls}" href="${esc(chat)}" target="jetski-chat" ` +
+          `onclick="return openChat(${cidJson}, ${urlJson}, event)">${label}</a>`;
+      }
+      const label = it.chat_archived
+        ? (compact ? 'look at code review (archived)' : 'Look at code review (archived)')
+        : (compact ? 'look at code review' : 'Look at code review');
+      const cls = compact ? 'chat' : 'btn primary';
+      return `<a class="${cls}" href="${esc(chat)}" target="jetski-chat" ` +
+        `onclick="return openChat(${cidJson}, ${urlJson}, event)">${label}</a>`;
+    }
     const label = it.chat_archived
       ? (compact ? 'chat (archived)' : 'Open chat (archived)')
       : (compact ? 'chat' : 'Open chat');
@@ -6561,6 +6734,12 @@ function chatActionHtml(it, data, compact) {
       `onclick="return openChat(${cidJson}, ${urlJson}, event)">${label}</a>`;
   }
   if (!it.item_key) return '';
+  if (isRev) {
+    const cls = compact ? 'link-btn chat' : 'btn primary';
+    const label = compact ? 'start code review' : 'Start code review';
+    return `<button class="${cls}" ` +
+      `onclick="startChat(${esc(JSON.stringify(it.item_key))}, this)">${label}</button>`;
+  }
   const cls = compact ? 'link-btn chat' : 'btn quiet';
   const label = compact ? 'start chat' : 'Start chat';
   return `<button class="${cls}" onclick="startChat(${esc(JSON.stringify(it.item_key))}, this)">` +
@@ -7469,9 +7648,10 @@ async function openChat(convId, url, ev) {
 async function startChat(itemKey, btn) {
   if (!itemKey || (btn && btn.disabled)) return;
   const orig = btn ? btn.textContent : '';
+  const it = findItemByKey(itemKey);
   if (btn) {
     btn.disabled = true;
-    btn.textContent = 'Starting…';
+    btn.textContent = isReviewerChange(it) ? '⏳ Preparing code review…' : 'Starting…';
   }
   try {
     const resp = await fetch('/api/start_chat', {

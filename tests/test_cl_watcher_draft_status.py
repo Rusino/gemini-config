@@ -784,7 +784,7 @@ console.log(JSON.stringify({
     self.assertNotIn("Post-submit alert", out["ownCqFailCard"])
     self.assertNotIn("status.skia.org", out["ownCqFailCard"])
     self.assertIn("Chat is working", out["busyCard"])
-    self.assertIn("Open chat", out["busyCard"])
+    self.assertIn("⏳ Preparing code review…", out["busyCard"])
     self.assertNotIn("Working in chat", out["busyCard"])
     self.assertEqual(out["piperState"], "In review")
 
