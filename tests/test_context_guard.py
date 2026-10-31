@@ -512,15 +512,15 @@ class TestContextGuard(unittest.TestCase):
         self.assertIn("Distrust your own prior claim", msg_d)
         self.assertIn("Re-verify against primary evidence", msg_d)
 
-      # Mid-turn invocations and neutral prompts must not inject the trigger
+      # Mid-turn invocations and neutral prompts must not inject the trigger (a neutral
+      # Russian prompt still gets the [LANGUAGE] reminder at invocation 0)
       self.assertEqual(
           self.run_guard(inv=1, lastUserInput="Что думаешь?"),
           {},
       )
-      self.assertEqual(
-          self.run_guard(inv=0, lastUserInput="Запусти тесты, пожалуйста"),
-          {},
-      )
+      neutral = self.message(self.run_guard(inv=0, lastUserInput="Запусти тесты, пожалуйста"))
+      self.assertNotIn("CRITICAL CHALLENGE", neutral)
+      self.assertNotIn("SELF-AUDIT TRIGGER", neutral)
 
   def test_preinvocation_promotes_and_restores_schedule_wait_state(self):
     self.write_transcript(

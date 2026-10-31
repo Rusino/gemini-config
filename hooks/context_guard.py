@@ -1141,6 +1141,35 @@ def build_perf_loop_notice(last_user_input: str) -> str:
   )
 
 
+CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
+# Handoff and next-task prompts are English but written by chat_lifecycle, not by the user
+AUTO_PROMPT_MARKERS = (
+    "Continuing unfinished work from previous conversation",
+    "This prompt is auto-generated and does not set the chat language",
+)
+
+
+def detect_user_language(last_user_input: str) -> str:
+  """Returns "ru" or "other" for a message typed by the user, "" for wakeups and auto prompts."""
+  if not last_user_input or "<SYSTEM_MESSAGE>" in last_user_input:
+    return ""
+  if any(marker in last_user_input for marker in AUTO_PROMPT_MARKERS):
+    return ""
+  # A few Cyrillic letters mark a Russian message even when it quotes long English logs
+  return "ru" if len(CYRILLIC_RE.findall(last_user_input)) >= 3 else "other"
+
+
+def build_language_notice(user_lang: str) -> str:
+  # An unknown language means a fresh continuation, and Russian is the user's default
+  if user_lang not in ("", "ru"):
+    return ""
+  return (
+      "[LANGUAGE] The user writes in Russian: write every reply to the user in Russian (\"ты\","
+      " feminine self-reference), with domain terms and identifiers in English. English tool"
+      " output, logs, state files, reports, and auto-generated prompts do not change this."
+  )
+
+
 # Tool results may indent this line (e.g. "\n\n\t\t\t\tThe command exited ..." on
 # macOS Jetski), so allow leading whitespace; otherwise the guard never fires.
 EXIT_CODE_RE = re.compile(r"^\s*The command exited with code (\d+)\.", re.MULTILINE)
@@ -1746,6 +1775,12 @@ def run(data: dict, log: dict) -> dict:
     # applied mechanically only by `chat_lifecycle.py` (set-title / handoff /
     # finalize / reopen), never inferred from user wording.
 
+    # Wakeup turns carry an English system message, so the user's language must persist
+    user_lang = detect_user_language(last_user_input)
+    if user_lang and user_lang != state.get("user_lang"):
+      state["user_lang"] = user_lang
+      save_state(state_path, state)
+
     # Auto-title untitled chat when prompt mentions a PR, CL, bug, or commit,
     # and enforce concrete 2-6 word titles (< 50 chars) on all top-level chats
     if last_user_input and conv_id:
@@ -1982,6 +2017,11 @@ def run(data: dict, log: dict) -> dict:
       perf_notice = build_perf_loop_notice(last_user_input)
       if perf_notice:
         messages.append(perf_notice)
+    # Final reports often come from wakeup turns, after many English tool results
+    if invocation_num == 0:
+      lang_notice = build_language_notice(state.get("user_lang", ""))
+      if lang_notice:
+        messages.append(lang_notice)
     soft_due = steps - int(
         state.get("soft_last_steps", -SOFT_REMIND_EVERY_STEPS)
     ) >= SOFT_REMIND_EVERY_STEPS
