@@ -4754,15 +4754,15 @@
         background: var(--sidebar-secondary, rgba(128, 134, 139, 0.24));
         color: #8ab4f8;
       }
-      /* Keep conversation margins proportional to the active conversation pane width */
+      /* Reserve >=56px side margins so the 28px turn rail keeps >=40px content clearance */
       :root,
       .agy-shell {
-        --max-conversation-width: 92% !important;
+        --max-conversation-width: min(92%, calc(100% - 112px)) !important;
       }
       [data-testid="conversation-view"] [style*="--max-conversation-width"],
       [data-media-drop-scope] [style*="--max-conversation-width"],
       .agy-home [style*="--max-conversation-width"] {
-        max-width: 92% !important;
+        max-width: min(92%, calc(100% - 112px)) !important;
       }
       /* Flight Deck drawer container */
       #${FLIGHT_DECK_DRAWER_ID} {

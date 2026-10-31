@@ -7442,13 +7442,35 @@ eval(code);
   const filterStyle = document.getElementById('jetski-closed-chats-filter-style');
   assert(filterStyle, 'Filter styles must be injected into document head');
   assert(
-    filterStyle.textContent.includes('--max-conversation-width: 92% !important;'),
-    'Conversation width variable must be overridden to 92%'
+    filterStyle.textContent.includes(
+      '--max-conversation-width: min(92%, calc(100% - 112px)) !important;'
+    ),
+    'Conversation width variable must preserve >=56px side margins for turn rail clearance'
   );
   assert(
-    filterStyle.textContent.includes('max-width: 92% !important;'),
-    'Conversation containers must have max-width: 92%'
+    filterStyle.textContent.includes(
+      'max-width: min(92%, calc(100% - 112px)) !important;'
+    ),
+    'Conversation containers must cap max-width at min(92%, calc(100% - 112px))'
   );
+  // ConversationNavigatorRail requires column.left - nav.right >= 40 (MIN_CONTENT_CLEARANCE_PX)
+  // where nav.right = 28px and viewport has 16px horizontal padding on each side (W - 32)
+  const capMatch = filterStyle.textContent.match(
+    /--max-conversation-width:\s*min\((\d+)%,\s*calc\(100%\s*-\s*(\d+)px\)\)\s*!important;/
+  );
+  assert(capMatch, 'Conversation width must use min(pct%, calc(100% - reservePx))');
+  const maxPct = Number(capMatch[1]) / 100;
+  const minMarginTotalPx = Number(capMatch[2]);
+  for (const paneWidth of [480, 600, 800, 1024, 1280, 1600]) {
+    const innerWidth = paneWidth - 32;
+    const colWidth = Math.min(maxPct * innerWidth, innerWidth - minMarginTotalPx);
+    const colLeft = 16 + (innerWidth - colWidth) / 2;
+    const clearance = colLeft - 28;
+    assert(
+      clearance >= 40,
+      `Turn navigator rail clearance (${clearance}px) must be >= 40px at paneWidth=${paneWidth}`
+    );
+  }
   assert(
     filterStyle.textContent.includes('#root .w-screen'),
     'Tailwind w-screen container must be constrained'
