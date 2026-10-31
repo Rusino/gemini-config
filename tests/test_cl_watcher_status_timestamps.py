@@ -170,5 +170,15 @@ console.log(JSON.stringify({
     self.assertEqual(out["rollingTime"], "14:00 ET (2h ago)")
     self.assertEqual(out["rollingLane"], "landing")
 
+  def test_dashboard_typography_matches_sidebar_scale(self):
+    self.assertIn("font: 11.5px/1.3 var(--sans);", w.DASHBOARD_HTML)
+    self.assertIn(
+        "html.embedded body { font-size: 11.5px; line-height: 1.3; }",
+        w.DASHBOARD_HTML,
+    )
+    self.assertIn(".title { font-size: 11.5px;", w.DASHBOARD_HTML)
+    self.assertIn(".meta { font-size: 10.5px;", w.DASHBOARD_HTML)
+
+
 if __name__ == "__main__":
   unittest.main()
