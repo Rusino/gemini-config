@@ -90,6 +90,57 @@ Please check zero-allocation hot path in ParagraphImpl::layout.
         it["draft"], "Please check zero-allocation hot path in ParagraphImpl::layout."
     )
 
+  def test_parse_wf_audit_infers_review_outcome_and_eyebrow(self):
+    md = """
+# Deep Audit for CL 1409697
+- **Category:** Surgical audit
+- **Review time:** about 2 min
+- **Patchset:** PS5
+
+**Ready-to-copy draft:**
+```markdown
+LGTM pending corpus gate.
+```
+"""
+    items = ts.parse_wf_audit_markdown(md, source_path="/tmp/wf312_1409697.md")
+    self.assertEqual(len(items), 1)
+    it = items[0]
+    self.assertEqual(it["review_outcome"], "CLEAN")
+    self.assertEqual(it["review_eyebrow_label"], "🟢 Review PS5: Clean (LGTM)")
+
+  def test_link_companion_changes_prevents_stack_chat_leak(self):
+    cand_parent = {
+        "item_key": "gerrit:1412378",
+        "target_id": "1412378",
+        "kind": "gerrit",
+        "host": w.GERRIT_SKIA_HOST,
+        "is_self": False,
+        "status": "NEW",
+        "subject": "Add HarfBuzz font backend",
+        "conversation_id": "review-chat-1",
+        "single_target": True,
+    }
+    sibling = {
+        "item_key": "gerrit:1412379",
+        "target_id": "1412379",
+        "kind": "gerrit",
+        "host": w.GERRIT_SKIA_HOST,
+        "is_self": False,
+        "status": "NEW",
+        "subject": "Use HarfBuzz font backend in Paragraph",
+        "conversation_id": "",
+    }
+    items = {cand_parent["item_key"]: cand_parent, sibling["item_key"]: sibling}
+    from unittest import mock
+    with mock.patch.object(
+        w, "fetch_gerrit_related_cl_ids", return_value={"1412378", "1412379"}
+    ):
+      w.link_companion_changes_to_parent_chats([sibling], items)
+
+    # Sibling must not inherit the review chat from a single_target external review
+    self.assertEqual(sibling.get("conversation_id"), "")
+    self.assertTrue(cand_parent.get("single_target"))
+
   def test_save_and_load_audit_preserves_audit_over_queue_triage(self):
     audit_data = {
         "target_id": "1409697",

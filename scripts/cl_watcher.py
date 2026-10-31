@@ -1283,8 +1283,17 @@ def link_companion_changes_to_parent_chats(
           # Prevent cyclic A <-> B companion links
           if cand_parent.get("companion_to") == ikey:
             is_candidate_comp = False
-          # Multi-CL stacks inherit the shared chat without being labeled companions
-          if not d.get("conversation_id") and cand_parent.get("conversation_id"):
+          # Only inherit a stack sibling's chat for companions, own-author stacks, or multi-target chats
+          can_inherit_stack_chat = (
+              is_candidate_comp
+              or (d_is_self and rel_is_self)
+              or not cand_parent.get("single_target", True)
+          )
+          if (
+              not d.get("conversation_id")
+              and cand_parent.get("conversation_id")
+              and can_inherit_stack_chat
+          ):
             parent = cand_parent
             parent_key = cand_key if is_candidate_comp else ""
             is_comp = is_candidate_comp

@@ -409,13 +409,33 @@ def parse_single_audit_text(
     else:
         summary = cat_raw[:85]
 
+    # Infer structured review outcome and badges from audit text if present
+    review_outcome = ""
+    if verdict == "PUSHBACK" or "pushback" in cat_raw.lower():
+        review_outcome = "PUSHBACK"
+    elif verdict == "REASSIGN" or "reassign" in cat_raw.lower():
+        review_outcome = "REASSIGN"
+    elif (
+        verdict == "MECHANICAL"
+        or "lgtm" in summary.lower()
+        or "no comment needed" in summary.lower()
+        or "approve with conditions" in cat_raw.lower()
+    ):
+        review_outcome = "CLEAN"
+    meta = REVIEW_OUTCOME_META.get(review_outcome, {})
+
     return {
         "target_id": target_id,
         "item_key": f"{kind}:{target_id}",
         "kind": kind,
         "verdict": verdict,
-        "verdict_label": verdict.replace("_", " "),
+        "verdict_label": meta.get("badge") or verdict.replace("_", " "),
         "audit_outcome": cat_raw[:50],
+        "review_outcome": review_outcome,
+        "review_outcome_label": meta.get("badge", ""),
+        "review_eyebrow_label": (
+            meta["eyebrow"].format(ps=triaged_ps) if meta.get("eyebrow") else ""
+        ),
         "est_minutes": est_min,
         "review_time_label": time_label,
         "summary": summary,
