@@ -406,11 +406,48 @@ def call_gmail_mcp(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
   return {}
 
 
+FLIGHT_DECK_GMAIL_LABEL_NAME = "Flight Deck"
+_GMAIL_LABEL_ID_CACHE: dict[str, str] = {}
+
+
+def ensure_flight_deck_gmail_label() -> str:
+  """Finds or creates the user label 'Flight Deck' in Gmail and caches its ID."""
+  cached = _GMAIL_LABEL_ID_CACHE.get(FLIGHT_DECK_GMAIL_LABEL_NAME)
+  if cached:
+    return cached
+  data = call_gmail_mcp("list_labels", {})
+  labels = (data.get("userLabels") or []) + (data.get("systemLabels") or [])
+  for lbl in labels:
+    if not isinstance(lbl, dict):
+      continue
+    name = str(lbl.get("name") or "").strip().lower()
+    if name == FLIGHT_DECK_GMAIL_LABEL_NAME.lower():
+      lid = str(lbl.get("id") or "")
+      if lid:
+        _GMAIL_LABEL_ID_CACHE[FLIGHT_DECK_GMAIL_LABEL_NAME] = lid
+        return lid
+  # Create label if missing
+  created = call_gmail_mcp(
+      "create_label",
+      {
+          "name": FLIGHT_DECK_GMAIL_LABEL_NAME,
+          "labelListVisibility": "LABEL_SHOW",
+          "messageListVisibility": "SHOW",
+      },
+  )
+  lid = str(created.get("id") or "")
+  if lid:
+    _GMAIL_LABEL_ID_CACHE[FLIGHT_DECK_GMAIL_LABEL_NAME] = lid
+    return lid
+  return ""
+
+
 def fetch_gmail_status_for_id(target_id: str) -> dict[str, Any]:
   """Searches Gmail (including TRASH) for notification threads matching a CL/PR ID."""
   res: dict[str, Any] = {
       "thread_ids": [],
       "inbox_thread_ids": [],
+      "inbox_messages": [],
       "total_msgs": 0,
       "inbox_msgs": 0,
       "trash_msgs": 0,
@@ -425,12 +462,16 @@ def fetch_gmail_status_for_id(target_id: str) -> dict[str, Any]:
   )
   threads = data.get("threads") or []
   matched_threads = []
+  id_re = re.compile(rf"(?<!\d){re.escape(str(target_id))}(?!\d)")
   for th in threads:
     if not isinstance(th, dict):
       continue
     msgs = th.get("messages") or []
-    # Match threads where the CL/PR number is in the subject or from an automated code review mailer
-    subj_match = any(str(target_id) in str(m.get("subject") or "") for m in msgs)
+    # Match threads where the CL/PR number is in subject/snippet from a code review mailer
+    subj_or_snippet_match = any(
+        id_re.search(f"{m.get('subject') or ''} {m.get('snippet') or ''}")
+        for m in msgs
+    )
     bot_match = any(
         any(
             b in str(m.get("sender") or "").lower()
@@ -438,7 +479,7 @@ def fetch_gmail_status_for_id(target_id: str) -> dict[str, Any]:
         )
         for m in msgs
     )
-    if subj_match and bot_match:
+    if subj_or_snippet_match and bot_match:
       matched_threads.append(th)
 
   # Fallback if subject did not explicitly include the ID on a short thread
@@ -447,7 +488,7 @@ def fetch_gmail_status_for_id(target_id: str) -> dict[str, Any]:
       if not isinstance(th, dict):
         continue
       msgs = th.get("messages") or []
-      if any(str(target_id) in str(m.get("subject") or "") for m in msgs):
+      if any(id_re.search(str(m.get("subject") or "")) for m in msgs):
         matched_threads.append(th)
 
   for th in matched_threads:
@@ -456,6 +497,15 @@ def fetch_gmail_status_for_id(target_id: str) -> dict[str, Any]:
       continue
     res["thread_ids"].append(tid)
     msgs = th.get("messages") or []
+    # Threads with more messages than returned in summary need full thread metadata
+    if int(th.get("messageCount") or 0) > len(msgs):
+      full_th = call_gmail_mcp(
+          "get_thread",
+          {"threadId": tid, "messageFormat": "METADATA_ONLY"},
+      )
+      full_msgs = (full_th.get("thread") or {}).get("messages")
+      if isinstance(full_msgs, list) and full_msgs:
+        msgs = full_msgs
     # Thread IDs mean nothing to a reader; the dashboard names a thread by who
     # sends it and links it through Gmail's own viewUrl
     senders = " ".join(str(m.get("sender") or "").lower() for m in msgs)
@@ -484,6 +534,12 @@ def fetch_gmail_status_for_id(target_id: str) -> dict[str, Any]:
       if "INBOX" in labels:
         res["inbox_msgs"] += 1
         th_has_inbox = True
+        res["inbox_messages"].append({
+            "id": str(m.get("id") or ""),
+            "thread_id": tid,
+            "date": str(m.get("date") or ""),
+            "unread": "UNREAD" in labels,
+        })
       if "TRASH" in labels:
         res["trash_msgs"] += 1
       if "UNREAD" in labels:
@@ -495,20 +551,152 @@ def fetch_gmail_status_for_id(target_id: str) -> dict[str, Any]:
 
 
 def archive_gmail_threads_for_id(
-    target_id: str, thread_ids: list[str] | None = None
+    target_id: str,
+    thread_ids: list[str] | None = None,
+    message_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-  """Removes INBOX and UNREAD labels from all matching threads (including split TRASH/INBOX threads)."""
+  """Removes INBOX/UNREAD labels and adds Flight Deck label to threads/messages."""
   tids = list(thread_ids or [])
-  if not tids and target_id:
+  mids = list(message_ids or [])
+  if not tids and not mids and target_id:
     gstat = fetch_gmail_status_for_id(target_id)
     tids = gstat.get("inbox_thread_ids") or gstat.get("thread_ids") or []
-  if not tids:
-    return {"ok": True, "archived": []}
-  call_gmail_mcp(
-      "batch_unlabel_threads",
-      {"threadIds": tids, "labelIds": ["INBOX", "UNREAD"]},
+  if not tids and not mids:
+    return {"ok": True, "archived": [], "archived_messages": []}
+  label_id = ensure_flight_deck_gmail_label()
+  if tids:
+    if label_id:
+      call_gmail_mcp(
+          "batch_label_threads",
+          {"threadIds": tids, "labelIds": [label_id]},
+      )
+    call_gmail_mcp(
+        "batch_unlabel_threads",
+        {"threadIds": tids, "labelIds": ["INBOX", "UNREAD"]},
+    )
+  if mids:
+    if label_id:
+      call_gmail_mcp(
+          "batch_label_messages",
+          {"messageIds": mids, "labelIds": [label_id]},
+      )
+    call_gmail_mcp(
+        "batch_unlabel_messages",
+        {"messageIds": mids, "labelIds": ["INBOX", "UNREAD"]},
+    )
+  return {
+      "ok": True,
+      "archived": tids,
+      "archived_messages": mids,
+      "label_id": label_id,
+  }
+
+
+def _parse_ts(val: Any) -> float:
+  dt = parse_gerrit_or_iso_time(str(val or ""))
+  return dt.timestamp() if dt else 0.0
+
+
+def compute_processed_mail_cutoff_ts(record: dict[str, Any]) -> float:
+  """Computes timestamp watermark up to which processed emails should be swept from INBOX."""
+  status = str(record.get("status") or "").upper()
+  if (
+      status in ("MERGED", "ABANDONED", "CLOSED", "SUBMITTED")
+      or record.get("reviewer_removed")
+  ):
+    return float("inf")
+  cands: list[float] = []
+  if record.get("conversation_id") and not record.get("chat_busy"):
+    cands.append(_parse_ts(record.get("chat_last_modified")))
+  last_author = str(record.get("last_msg_author") or "")
+  if last_author in SELF_EMAILS or last_author in SELF_GITHUB_LOGINS:
+    cands.append(_parse_ts(record.get("last_msg_date")) + 120.0)
+  phase = str(record.get("phase") or "")
+  if not record.get("in_my_attention", True) and phase in (
+      "WAITING_ON_OTHERS",
+      "POST_SUBMIT_ROLLING",
+      "READY_TO_CLOSE",
+  ):
+    cands.append(
+        max(
+            _parse_ts(record.get("last_msg_date")),
+            _parse_ts(record.get("status_changed_raw")),
+        )
+        + 120.0
+    )
+  if (
+      record.get("self_review_state")
+      and int(record.get("self_review_ps") or 0) >= int(record.get("patchset") or 1)
+      and not record.get("in_my_attention", True)
+  ):
+    cands.append(
+        max(
+            _parse_ts(record.get("last_msg_date")),
+            _parse_ts(record.get("status_changed_raw")),
+        )
+        + 120.0
+    )
+  triage = record.get("triage")
+  if (
+      isinstance(triage, dict)
+      and not triage.get("is_stale")
+      and not record.get("in_my_attention", True)
+  ):
+    cands.append(_parse_ts(triage.get("triaged_at")))
+  return max(cands, default=0.0)
+
+
+def sweep_processed_gmail_for_record(
+    record: dict[str, Any], gstat: dict[str, Any]
+) -> int:
+  """Moves processed Gerrit/GitHub notification emails out of INBOX into Flight Deck."""
+  if not isinstance(gstat, dict):
+    return 0
+  inbox_msgs = list(gstat.get("inbox_messages") or [])
+  inbox_tids = list(gstat.get("inbox_thread_ids") or [])
+  if not inbox_msgs and not inbox_tids:
+    return 0
+  tid = str(record.get("target_id") or "")
+  cutoff = compute_processed_mail_cutoff_ts(record)
+  if cutoff <= 0.0:
+    return 0
+  if cutoff == float("inf"):
+    archive_gmail_threads_for_id(tid, thread_ids=inbox_tids)
+    swept_count = gstat.get("inbox_msgs") or len(inbox_msgs) or len(inbox_tids)
+    gstat["inbox_msgs"] = 0
+    gstat["inbox_thread_ids"] = []
+    gstat["inbox_messages"] = []
+    gstat["unread_msgs"] = 0
+    return swept_count
+
+  to_sweep: list[dict[str, Any]] = []
+  remaining: list[dict[str, Any]] = []
+  for m in inbox_msgs:
+    m_ts = _parse_ts(m.get("date"))
+    if 0.0 < m_ts <= cutoff:
+      to_sweep.append(m)
+    else:
+      remaining.append(m)
+
+  if not to_sweep:
+    return 0
+
+  swept_mids = [m["id"] for m in to_sweep if m.get("id")]
+  # Check if any threads have all their inbox messages swept
+  remaining_tids = {m["thread_id"] for m in remaining if m.get("thread_id")}
+  fully_swept_tids = [t for t in inbox_tids if t not in remaining_tids]
+
+  archive_gmail_threads_for_id(
+      tid,
+      thread_ids=fully_swept_tids if fully_swept_tids else None,
+      message_ids=swept_mids,
   )
-  return {"ok": True, "archived": tids}
+
+  gstat["inbox_messages"] = remaining
+  gstat["inbox_msgs"] = len(remaining)
+  gstat["inbox_thread_ids"] = sorted(remaining_tids)
+  gstat["unread_msgs"] = sum(1 for m in remaining if m.get("unread"))
+  return len(swept_mids)
 
 
 def load_watcher_state() -> dict[str, Any]:
@@ -5248,6 +5436,7 @@ def sync_once(
           archive_gmail_threads_for_id(tid, gstat["inbox_thread_ids"])
           gstat["inbox_msgs"] = 0
           gstat["inbox_thread_ids"] = []
+          gstat["inbox_messages"] = []
         transition_msg = (
             f"[CL-WATCHER] ✅ {ikey} ('{info['subject']}') только что замержен "
             f"(ревизия {info['revision'][:10]}). Треды Gmail во входящих (INBOX) для "
@@ -5284,6 +5473,7 @@ def sync_once(
           archive_gmail_threads_for_id(tid, gstat["inbox_thread_ids"])
           gstat["inbox_msgs"] = 0
           gstat["inbox_thread_ids"] = []
+          gstat["inbox_messages"] = []
         transition_msg = (
             f"[CL-WATCHER] 🏁 Все 4 авторолла (Android, Chrome, Google3, Flutter) и "
             f"Skia Status успешно прошли для {ikey} ({info['revision'][:10]})! "
@@ -5389,6 +5579,7 @@ def sync_once(
               },
           )
 
+    sweep_processed_gmail_for_record(record, gstat)
     new_items[composite_key] = record
 
   # Cross-link companion CLs/PRs and their parent CLs/PRs so the UI can badge both sides
