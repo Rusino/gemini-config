@@ -17,6 +17,8 @@
   const INBOX_CLASS = 'jetski-needs-reaction-inbox';
   const INBOX_HEADER_CLASS = 'jetski-inbox-header';
   const INBOX_TOGGLE_BTN_CLASS = 'jetski-inbox-toggle-btn';
+  // Header button class and height bounds for vertical fit-to-content toggle
+  const INBOX_FIT_BTN_CLASS = 'jetski-inbox-fit-btn';
   const INBOX_LIST_CLASS = 'jetski-inbox-list';
   const INBOX_RESIZE_HANDLE_CLASS = 'jetski-inbox-resize-handle';
   const INBOX_ROW_CLASS = 'jetski-inbox-row';
@@ -26,6 +28,9 @@
   const INBOX_DEFAULT_HEIGHT_PX = 90;
   const INBOX_MIN_HEIGHT_PX = 46;
   const INBOX_MAX_HEIGHT_PX = 360;
+  // Allows single-line empty row (24px) and tall multi-chat lists (up to 600px) when fitted
+  const INBOX_FIT_MIN_HEIGHT_PX = 24;
+  const INBOX_FIT_MAX_HEIGHT_PX = 600;
   const BUTTON_CLASS = 'jetski-closed-chats-filter-btn';
   // Collapse-first button in the sidebar filter bar to collapse or expand all project folders
   const COLLAPSE_PROJECTS_BTN_CLASS = 'jetski-collapse-projects-btn';
@@ -184,6 +189,68 @@
 
   let inboxListHeightPx = loadInboxHeight();
   let activeInboxResizeCleanup = null;
+  // Outward vertical arrows between top and bottom bars for fit-to-content state
+  const INBOX_FIT_ICON_SVG =
+    '<svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round">' +
+    '<path d="M2.5 1.75h7M2.5 10.25h7M6 3.5v5M4.25 5L6 3.25 7.75 5M4.25 7L6 8.75 7.75 7"/>' +
+    '</svg>';
+  // Inward vertical arrows toward center bar for restore-saved-height state
+  const INBOX_RESTORE_ICON_SVG =
+    '<svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round">' +
+    '<path d="M2.5 6h7M6 1.5v3M4.25 3L6 4.75 7.75 3M6 10.5v-3M4.25 9L6 7.25 7.75 9"/>' +
+    '</svg>';
+
+  let inboxFitted = false;
+  let savedInboxHeightBeforeFitPx = null;
+  let lastRenderedInboxItems = [];
+
+  // Computes max height when fitting inbox to content so bottom project list remains accessible
+  function getInboxMaxFitHeightPx(inboxEl) {
+    const sidebarEl =
+      inboxEl?.closest?.('[aria-label="Sidebar"]') ||
+      document.querySelector('[aria-label="Sidebar"]');
+    const sidebarH = Number(sidebarEl?.clientHeight) || Number(window.innerHeight) || 0;
+    if (sidebarH > 200) {
+      // Reserve at least 140px at the bottom of the sidebar for project folders
+      return Math.min(INBOX_FIT_MAX_HEIGHT_PX, Math.max(INBOX_MAX_HEIGHT_PX, sidebarH - 140));
+    }
+    return INBOX_FIT_MAX_HEIGHT_PX;
+  }
+
+  // Clamps fitted inbox height between 1-row empty minimum (24px) and available sidebar height
+  function clampInboxFitHeight(px, inboxEl) {
+    const n = Math.round(Number(px));
+    if (!Number.isFinite(n)) return INBOX_DEFAULT_HEIGHT_PX;
+    const maxH = getInboxMaxFitHeightPx(inboxEl);
+    return Math.min(maxH, Math.max(INBOX_FIT_MIN_HEIGHT_PX, n));
+  }
+
+  // Measures or estimates the exact vertical height needed for the current tab's rows
+  function computeInboxFitHeightPx(inboxEl, listContainer, items) {
+    const list = Array.isArray(items) ? items : [];
+    const estimated =
+      list.length === 0
+        ? INBOX_FIT_MIN_HEIGHT_PX
+        : 2 + list.reduce((sum, it) => sum + (it?.detailText ? 34 : 22), 0);
+    let measured = 0;
+    if (listContainer) {
+      // Temporarily unclamp inline height styles to read true DOM scrollHeight when rendered
+      const prevH = listContainer.style.height;
+      const prevMinH = listContainer.style.minHeight;
+      const prevMaxH = listContainer.style.maxHeight;
+      listContainer.style.height = 'auto';
+      listContainer.style.minHeight = '0px';
+      listContainer.style.maxHeight = 'none';
+      measured = Number(listContainer.scrollHeight) || 0;
+      listContainer.style.height = prevH;
+      listContainer.style.minHeight = prevMinH;
+      listContainer.style.maxHeight = prevMaxH;
+    }
+    const raw = measured > 0 ? measured : estimated;
+    return clampInboxFitHeight(raw, inboxEl);
+  }
 
   let flightDeckOpen = safeGetStorage(STORAGE_FLIGHT_DECK_OPEN_KEY) === 'true';
 
@@ -4986,6 +5053,39 @@
         font-variant-numeric: tabular-nums;
         line-height: 1.3;
       }
+      /* Right-aligned inbox header group for fit-to-content and collapse buttons */
+      .jetski-inbox-header-right {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+        flex-shrink: 0;
+      }
+      .${INBOX_FIT_BTN_CLASS} {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 18px;
+        height: 18px;
+        padding: 0;
+        border: none;
+        border-radius: 3px;
+        background: transparent;
+        cursor: pointer;
+        color: var(--muted-foreground, #9aa0a6);
+        opacity: 0.65;
+        flex-shrink: 0;
+        transition: color 100ms ease, opacity 100ms ease, background-color 100ms ease;
+      }
+      .${INBOX_FIT_BTN_CLASS}:hover {
+        color: var(--foreground, #e8eaed);
+        opacity: 1;
+        background: rgba(128, 134, 139, 0.16);
+      }
+      .${INBOX_FIT_BTN_CLASS}[data-fitted="true"] {
+        color: #8ab4f8;
+        opacity: 0.95;
+        background: rgba(138, 180, 248, 0.14);
+      }
       .${INBOX_TOGGLE_BTN_CLASS} {
         background: transparent;
         border: none;
@@ -8368,8 +8468,11 @@
   }
 
   // Synchronizes inline styles, data-list-height attribute, and storage persistence
-  function applyInboxListHeight(inboxEl, listContainer, nextHeightPx, persist) {
-    inboxListHeightPx = clampInboxHeight(nextHeightPx);
+  function applyInboxListHeight(inboxEl, listContainer, nextHeightPx, persist, allowFitBounds) {
+    // Fit-to-content mode uses wider [24px, 600px] bounds than manual drag [46px, 360px]
+    inboxListHeightPx = allowFitBounds
+      ? clampInboxFitHeight(nextHeightPx, inboxEl)
+      : clampInboxHeight(nextHeightPx);
     const hStr = `${inboxListHeightPx}px`;
     if (listContainer) {
       if (listContainer.style.height !== hStr) listContainer.style.height = hStr;
@@ -8438,13 +8541,55 @@
       headerLeft.appendChild(tabBtn);
     }
 
+    // Group fit-to-content and collapse buttons on the right side of the inbox header
+    const headerRight = document.createElement('div');
+    headerRight.className = 'jetski-inbox-header-right';
+
+    const fitBtn = document.createElement('button');
+    fitBtn.type = 'button';
+    fitBtn.className = INBOX_FIT_BTN_CLASS;
+    fitBtn.setAttribute('data-testid', 'jetski-inbox-fit-btn');
+    fitBtn.setAttribute('data-fitted', 'false');
+    fitBtn.setAttribute('data-icon', 'fit');
+    fitBtn.setAttribute('aria-label', 'Fit height to section (empty)');
+    fitBtn.innerHTML = INBOX_FIT_ICON_SVG;
+
+    bindHoverBubble(fitBtn, () => fitBtn.getAttribute('aria-label') || 'Fit height to chats');
+    bindActionBtnHandlers(fitBtn, () => {
+      if (inboxCollapsed) {
+        inboxCollapsed = false;
+        safeSetStorage(STORAGE_INBOX_COLLAPSED_KEY, 'false');
+      }
+      if (!inboxFitted) {
+        // Snapshot manual height before fitting without overwriting persisted storage height
+        savedInboxHeightBeforeFitPx = inboxListHeightPx;
+        inboxFitted = true;
+        const targetH = computeInboxFitHeightPx(el, listContainer, lastRenderedInboxItems);
+        applyInboxListHeight(el, listContainer, targetH, false, true);
+      } else {
+        // Restore previous manual height and exit fitted mode
+        const restoreH = savedInboxHeightBeforeFitPx ?? loadInboxHeight();
+        inboxFitted = false;
+        savedInboxHeightBeforeFitPx = null;
+        applyInboxListHeight(el, listContainer, restoreH, true, false);
+      }
+      ensureNeedsReactionInbox();
+      const label = fitBtn.getAttribute('aria-label');
+      if (label) {
+        showActionPillBubble(fitBtn, label);
+      }
+    });
+
     const toggleBtn = document.createElement('button');
     toggleBtn.type = 'button';
     toggleBtn.className = INBOX_TOGGLE_BTN_CLASS;
     toggleBtn.setAttribute('data-testid', INBOX_TOGGLE_BTN_CLASS);
 
+    headerRight.appendChild(fitBtn);
+    headerRight.appendChild(toggleBtn);
+
     headerEl.appendChild(headerLeft);
-    headerEl.appendChild(toggleBtn);
+    headerEl.appendChild(headerRight);
 
     bindActionBtnHandlers(headerEl, () => {
       inboxCollapsed = !inboxCollapsed;
@@ -8480,6 +8625,9 @@
       isDragging = true;
       e.preventDefault();
       e.stopPropagation();
+      // Manual drag resize exits fitted mode so the user's custom height takes over
+      inboxFitted = false;
+      savedInboxHeightBeforeFitPx = null;
       const startY = Number(e.clientY) || 0;
       const startHeight = inboxListHeightPx;
       resizeHandle.setAttribute('data-dragging', 'true');
@@ -8502,6 +8650,8 @@
         activeInboxResizeCleanup = null;
         resizeHandle.removeAttribute('data-dragging');
         applyInboxListHeight(el, listContainer, inboxListHeightPx, true);
+        // Re-render inbox to update header fit-button icons and tooltip after drag ends
+        ensureNeedsReactionInbox();
       };
 
       activeInboxResizeCleanup = onEnd;
@@ -8520,7 +8670,12 @@
     resizeHandle.addEventListener('dblclick', (e) => {
       e.preventDefault();
       e.stopPropagation();
+      // Double-click reset returns to default 90px height and clears fitted mode
+      inboxFitted = false;
+      savedInboxHeightBeforeFitPx = null;
       applyInboxListHeight(el, listContainer, INBOX_DEFAULT_HEIGHT_PX, true);
+      // Re-render inbox to sync header fit-button icons and tooltip after reset
+      ensureNeedsReactionInbox();
     });
 
     el.appendChild(headerEl);
@@ -8548,7 +8703,8 @@
       inboxEl,
       inboxEl.querySelector(`.${INBOX_LIST_CLASS}`),
       inboxListHeightPx,
-      false
+      false,
+      inboxFitted
     );
 
     // Place inbox immediately before listEl when mounted, or right after actionRow
@@ -8697,6 +8853,9 @@
     }
 
     const currentTabItems = itemsByTab[activeInboxTab] || [];
+    // Cache rendered items for on-demand height computation when clicking fitBtn
+    lastRenderedInboxItems = currentTabItems;
+    setAttrIfChanged(inboxEl, 'data-fitted', inboxFitted ? 'true' : 'false');
 
     if (inboxEl.getAttribute('data-active-tab') !== activeInboxTab) {
       inboxEl.setAttribute('data-active-tab', activeInboxTab);
@@ -8782,6 +8941,45 @@
           emptyRow.textContent = INBOX_EMPTY_TEXT[activeInboxTab] || INBOX_EMPTY_TEXT['needs-me'];
           listContainer.appendChild(emptyRow);
         }
+      }
+    }
+
+    // Sync fit button icon and dynamic aria-label without auto-resizing on tab switch
+    const fitBtn = inboxEl.querySelector(`.${INBOX_FIT_BTN_CLASS}`);
+    if (fitBtn) {
+      // Show restore state when currently fitted to content
+      if (inboxFitted) {
+        setAttrIfChanged(fitBtn, 'data-fitted', 'true');
+        setAttrIfChanged(fitBtn, 'data-icon', 'restore');
+        const prevH = savedInboxHeightBeforeFitPx ?? INBOX_DEFAULT_HEIGHT_PX;
+        setAttrIfChanged(fitBtn, 'aria-label', `Restore previous height (${prevH}px)`);
+        if (fitBtn.innerHTML !== INBOX_RESTORE_ICON_SVG) {
+          fitBtn.innerHTML = INBOX_RESTORE_ICON_SVG;
+        }
+      } else {
+        // Show fit state with preview label based on target content height
+        setAttrIfChanged(fitBtn, 'data-fitted', 'false');
+        setAttrIfChanged(fitBtn, 'data-icon', 'fit');
+        const listContainer = inboxEl.querySelector(`.${INBOX_LIST_CLASS}`);
+        const previewFitH = computeInboxFitHeightPx(inboxEl, listContainer, currentTabItems);
+        const n = currentTabItems.length;
+        const noun = n === 1 ? 'chat' : 'chats';
+        let fitLabel = `Fit height to all ${n} ${noun}`;
+        if (n === 0) {
+          fitLabel = 'Fit height to section (empty)';
+        } else if (previewFitH > inboxListHeightPx) {
+          fitLabel = `Expand height to show all ${n} ${noun}`;
+        } else if (previewFitH < inboxListHeightPx) {
+          fitLabel = `Shrink height to fit ${n} ${noun}`;
+        }
+        setAttrIfChanged(fitBtn, 'aria-label', fitLabel);
+        if (fitBtn.innerHTML !== INBOX_FIT_ICON_SVG) {
+          fitBtn.innerHTML = INBOX_FIT_ICON_SVG;
+        }
+      }
+      // Clear native tooltip in favor of floating bubble
+      if (fitBtn.hasAttribute('title')) {
+        fitBtn.removeAttribute('title');
       }
     }
   }
@@ -9743,6 +9941,7 @@
         target.className === FLIGHT_DECK_IFRAME_CLASS ||
         // Ignore mutations on the Needs-Reaction inbox container itself
         target.className === INBOX_CLASS ||
+        target.className === INBOX_FIT_BTN_CLASS ||
         target.className === INBOX_RESIZE_HANDLE_CLASS ||
         target.className === BUTTON_CLASS ||
         target.className === COLLAPSE_PROJECTS_BTN_CLASS ||

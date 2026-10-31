@@ -1849,6 +1849,39 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(inboxEl.getAttribute('data-list-height'), '90');
   assert.strictEqual(storage.get('jetski_inbox_height_v1'), '90');
 
+  // Fit button in empty inbox shrinks list height to 24px without overwriting persisted 90px
+  const fitBtn = inboxEl.querySelector('.jetski-inbox-fit-btn');
+  const toggleBtn = inboxEl.querySelector('.jetski-inbox-toggle-btn');
+  const headerRight = inboxEl.querySelector('.jetski-inbox-header-right');
+  assert(fitBtn, 'Fit button must exist in inbox header');
+  assert(headerRight, 'Header right container must exist');
+  assert.strictEqual(headerRight.children[0], fitBtn);
+  assert.strictEqual(headerRight.children[1], toggleBtn);
+  assert.strictEqual(fitBtn.getAttribute('data-fitted'), 'false');
+  assert.strictEqual(fitBtn.getAttribute('data-icon'), 'fit');
+  assert.strictEqual(fitBtn.getAttribute('aria-label'), 'Fit height to section (empty)');
+  assert.strictEqual(fitBtn.hasAttribute('title'), false);
+
+  advanceClock();
+  fitBtn.dispatchEvent('pointerdown', { button: 0 });
+  fitBtn.dispatchEvent('click', { button: 0 });
+  assert.strictEqual(inboxListEl.style.height, '24px');
+  assert.strictEqual(inboxEl.getAttribute('data-list-height'), '24');
+  assert.strictEqual(inboxEl.getAttribute('data-fitted'), 'true');
+  assert.strictEqual(fitBtn.getAttribute('data-fitted'), 'true');
+  assert.strictEqual(fitBtn.getAttribute('data-icon'), 'restore');
+  assert.strictEqual(fitBtn.getAttribute('aria-label'), 'Restore previous height (90px)');
+  assert.strictEqual(storage.get('jetski_inbox_height_v1'), '90');
+
+  advanceClock();
+  fitBtn.dispatchEvent('pointerdown', { button: 0 });
+  fitBtn.dispatchEvent('click', { button: 0 });
+  assert.strictEqual(inboxListEl.style.height, '90px');
+  assert.strictEqual(inboxEl.getAttribute('data-list-height'), '90');
+  assert.strictEqual(inboxEl.getAttribute('data-fitted'), 'false');
+  assert.strictEqual(fitBtn.getAttribute('data-fitted'), 'false');
+  assert.strictEqual(fitBtn.getAttribute('data-icon'), 'fit');
+
   // Verify the 3 tabs in headerLeft
   const tabNeedsMe = inboxEl.querySelector('.jetski-inbox-tab-needs-me');
   const tabWorking = inboxEl.querySelector('.jetski-inbox-tab-working');
@@ -2035,10 +2068,47 @@ const liveBucketBtn = (k) =>
   assert(!inboxRows[0].querySelector('.jetski-inbox-locate-btn'));
   assert(!inboxRows[0].querySelector('.jetski-inbox-wait-btn'));
 
-  // Mutations inside the inbox must not schedule a sync loop
+  // Mutations inside the inbox or on fit button must not schedule a sync loop
   rafCallbacks = [];
-  observerCallback([{ target: inboxEl }, { target: inboxRows[0] }]);
+  observerCallback([{ target: inboxEl }, { target: inboxRows[0] }, { target: fitBtn }]);
   assert.strictEqual(rafCallbacks.length, 0, 'Inbox mutations must not trigger observer sync');
+
+  // With 3 items (1 urgent with detail = 34px, 2 regular = 44px, +2px = 80px < 90px)
+  // fit shrinks list height to 80px
+  assert.strictEqual(fitBtn.getAttribute('aria-label'), 'Shrink height to fit 3 chats');
+  advanceClock();
+  fitBtn.dispatchEvent('pointerdown', { button: 0 });
+  fitBtn.dispatchEvent('click', { button: 0 });
+  assert.strictEqual(inboxListEl.style.height, '80px');
+  assert.strictEqual(inboxEl.getAttribute('data-fitted'), 'true');
+  assert.strictEqual(fitBtn.getAttribute('aria-label'), 'Restore previous height (90px)');
+
+  // Switching tabs does not auto-jump height while fitted; dblclick on resize handle resets to 90px
+  advanceClock();
+  tabWorking.dispatchEvent('pointerdown', { button: 0 });
+  tabWorking.dispatchEvent('click', { button: 0 });
+  assert.strictEqual(inboxListEl.style.height, '80px');
+  advanceClock();
+  tabNeedsMe.dispatchEvent('pointerdown', { button: 0 });
+  tabNeedsMe.dispatchEvent('click', { button: 0 });
+  resizeHandleEl.dispatchEvent('dblclick');
+  assert.strictEqual(inboxListEl.style.height, '90px');
+  assert.strictEqual(inboxEl.getAttribute('data-fitted'), 'false');
+
+  // When DOM scrollHeight exceeds 90px (e.g. 198px), fit expands to 198px and restores to 90px
+  inboxListEl.scrollHeight = 198;
+  advanceClock();
+  fitBtn.dispatchEvent('pointerdown', { button: 0 });
+  fitBtn.dispatchEvent('click', { button: 0 });
+  assert.strictEqual(inboxListEl.style.height, '198px');
+  assert.strictEqual(inboxEl.getAttribute('data-list-height'), '198');
+  assert.strictEqual(fitBtn.getAttribute('data-fitted'), 'true');
+  advanceClock();
+  fitBtn.dispatchEvent('pointerdown', { button: 0 });
+  fitBtn.dispatchEvent('click', { button: 0 });
+  assert.strictEqual(inboxListEl.style.height, '90px');
+  assert.strictEqual(fitBtn.getAttribute('data-fitted'), 'false');
+  delete inboxListEl.scrollHeight;
 
   // Clicking an inbox row navigates to that conversation, but does NOT dismiss it
   window.history._lastPushed = null;
