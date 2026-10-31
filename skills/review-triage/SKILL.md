@@ -214,10 +214,11 @@ named skill's `SKILL.md` was not read, when a report with a `Case 1-5` verdict l
 8. **Daily Queue Summary Shows Open Issues Only**: In `run_queue_triage.py` summaries, never list or
    mention GitHub issues that are already closed (including ones closed during the window or still
    receiving bot activity); report only open issues and the user's own open PRs.
-9. **Flight Deck Triage Persistence (`triage_store.py`)**: When running daily queue triage
-   (`run_queue_triage.py`) or per-CL audit workflows (`wf*.md`), save the structured audit report
-   for Flight Deck via:
-   `python3 ~/.gemini/config/scripts/triage_store.py save-audit --target <ID> --report-file <md>`
-   (or run `triage_store.py ingest-tmp` to ingest all `/tmp/wf*.md` and `/tmp/triage_*.md` files).
-   This displays category badges, estimated review times, one-line summaries, and 1-click
-   ready-to-copy drafts next to each CL/PR in Flight Deck.
+9. **Flight Deck Review Verdict & Triage Persistence (`triage_store.py`)**: At the end of every
+   code review (interactive single-CL chat or batch workflow), save the finalized review outcome
+   and 1-line finding summary for Flight Deck via:
+   `python3 ~/.gemini/config/scripts/triage_store.py save-review --target <ID> --patchset <PS> --outcome <CLEAN|NITS|COMPANION_TESTS|COMPANION_FIX|PUSHBACK|REASSIGN> --summary "<1-line finding summary>"`
+   (optional: `--draft "<text>"` or `--draft-file <path>`). This immediately updates Flight Deck
+   cards with the review verdict pill (`🟢 Review PS<N>: Clean`, `🟠 Review PS<N>: Defects + fix`,
+   etc.) and finding summary. When running daily queue triage (`run_queue_triage.py`), save the
+   pre-review audit via `triage_store.py save-audit --target <ID> --report-file <md>` (or `ingest-tmp`).

@@ -151,6 +151,10 @@ Never auto-publish the review comment to Gerrit or GitHub unless the user explic
 - A follow-up after a new patchset is saved as a standalone `/PATCHSET_LEVEL` draft on the CURRENT patchset (no `in_reply_to`), containing only new text.
 - Use `in_reply_to` only for inline (`file:line`) replies or when the user explicitly asks to answer inside a thread; never include or re-quote already-published text in a draft.
 - Never resolve the old thread unless the user asks; if asked, resolve via a minimal "Done" reply in that thread.
+- **Save Review Verdict for Flight Deck (`triage_store.py`)**:
+  Always save the review outcome (Case 1 `CLEAN`, Case 2 `NITS`, Case 3 `COMPANION_TESTS`, Case 4 `PUSHBACK`, Case 5 `COMPANION_FIX`) and a concise 1-line summary via:
+  `python3 ~/.gemini/config/scripts/triage_store.py save-review --target <CL_OR_PR> --patchset <PS> --outcome <CLEAN|NITS|COMPANION_TESTS|COMPANION_FIX|PUSHBACK> --summary "<1-line finding summary>"`
+  (passing `--draft "<draft text>"` or `--draft-file <path>`), so Flight Deck displays the verdict badge and summary immediately.
 
 Structure the English review comment using this proven template:
 

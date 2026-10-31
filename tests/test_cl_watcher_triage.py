@@ -148,6 +148,70 @@ Please check zero-allocation hot path in ParagraphImpl::layout.
     self.assertEqual(items[0]["triage"]["triaged_patchset"], 3)
     self.assertNotIn("triage", items[1])
 
+  def test_normalize_review_outcome(self):
+    self.assertEqual(ts.normalize_review_outcome("CLEAN"), "CLEAN")
+    self.assertEqual(ts.normalize_review_outcome("lgtm"), "CLEAN")
+    self.assertEqual(ts.normalize_review_outcome("Case 1"), "CLEAN")
+    self.assertEqual(ts.normalize_review_outcome("nits"), "NITS")
+    self.assertEqual(ts.normalize_review_outcome("case_2"), "NITS")
+    self.assertEqual(ts.normalize_review_outcome("companion_tests"), "COMPANION_TESTS")
+    self.assertEqual(ts.normalize_review_outcome("case 3"), "COMPANION_TESTS")
+    self.assertEqual(ts.normalize_review_outcome("pushback"), "PUSHBACK")
+    self.assertEqual(ts.normalize_review_outcome("case 4"), "PUSHBACK")
+    self.assertEqual(ts.normalize_review_outcome("companion_fix"), "COMPANION_FIX")
+    self.assertEqual(ts.normalize_review_outcome("case 5"), "COMPANION_FIX")
+    self.assertEqual(ts.normalize_review_outcome("reassign"), "REASSIGN")
+    with self.assertRaises(ValueError):
+      ts.normalize_review_outcome("invalid_outcome")
+
+  def test_save_review_verdict_and_source_priority(self):
+    p = ts.save_review_verdict(
+        target_id="1411905",
+        kind="gerrit",
+        patchset=2,
+        outcome="COMPANION_FIX",
+        summary="Caret offset miscomputed in BiDi runs",
+        draft="LGTM with companion CL 1411906.",
+        results_dir=self.test_dir,
+    )
+    self.assertTrue(p.exists())
+    all_res = ts.load_all_triage_results(results_dir=self.test_dir)
+    item = all_res["gerrit:1411905"]
+    self.assertEqual(item["review_outcome"], "COMPANION_FIX")
+    self.assertEqual(item["review_eyebrow_label"], "🟠 Review PS2: Defects + companion fix")
+    self.assertEqual(item["source"], "review")
+    self.assertEqual(item["summary"], "Caret offset miscomputed in BiDi runs")
+
+    # Queue triage on the same patchset must not overwrite the deep review outcome
+    queue_data = {
+        "target_id": "1411905",
+        "kind": "gerrit",
+        "verdict": "SURGICAL_AUDIT",
+        "summary": "Old queue triage summary",
+        "triaged_patchset": 2,
+        "source": "queue_triage",
+    }
+    ts.save_triage_result(queue_data, results_dir=self.test_dir)
+    reloaded = ts.load_all_triage_results(results_dir=self.test_dir)["gerrit:1411905"]
+    self.assertEqual(reloaded["review_outcome"], "COMPANION_FIX")
+    self.assertEqual(reloaded["source"], "review")
+    self.assertEqual(reloaded["summary"], "Caret offset miscomputed in BiDi runs")
+
+  def test_overlay_triage_sets_reviewed_ps_on_item(self):
+    ts.save_review_verdict(
+        target_id="1411906",
+        kind="gerrit",
+        patchset=3,
+        outcome="CLEAN",
+        summary="All tests pass clean",
+        results_dir=self.test_dir,
+    )
+    items = [{"item_key": "gerrit:1411906", "target_id": "1411906", "patchset": 3}]
+    ts.overlay_triage_on_items(items, results_dir=self.test_dir, ingest_tmp=False)
+    self.assertEqual(items[0]["reviewed_ps"], 3)
+    self.assertIn("triage", items[0])
+    self.assertEqual(items[0]["triage"]["review_outcome"], "CLEAN")
+
 
 class FlightDeckTriageDashboardRenderingTest(unittest.TestCase):
 
@@ -206,6 +270,111 @@ console.log(JSON.stringify({
     self.assertIn("triage-box", out["focusHtml"])
     self.assertIn("triage-box", out["rowHtmlStr"])
     self.assertEqual(out["mergedTriage"], "")
+
+  def test_dashboard_review_verdict_eyebrow_and_pill_rendering(self):
+    script_body = w.DASHBOARD_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    harness = script_body.split("\nboot();", 1)[0] + """
+const baseItem = {
+  item_key: 'gerrit:1411905',
+  target_id: '1411905',
+  kind: 'gerrit',
+  role: 'reviewer (goog)',
+  status: 'NEW',
+  phase: 'NEEDS_YOUR_ACTION',
+  patchset: 2,
+  reviewed_ps: 2,
+  url: 'https://example.com/1411905',
+  subject: '[skparagraph] Fix bidi shaping',
+  project_name: 'Skia',
+  triage: {
+    verdict: 'COMPANION_FIX',
+    verdict_label: '🟠 Defects + companion fix',
+    review_outcome: 'COMPANION_FIX',
+    review_outcome_label: '🟠 Defects + companion fix',
+    review_eyebrow_label: '🟠 Review PS2: Defects + companion fix',
+    summary: 'Caret offset miscomputed in BiDi runs',
+    triaged_patchset: 2,
+    triaged_at_et: 'Oct 31, 18:30 ET',
+    is_stale: false,
+    draft: 'Draft comment with companion CL 1411906.',
+    report_markdown: '### Report\\nFound 2 defects.',
+  }
+};
+
+const cleanItem = Object.assign({}, baseItem, {
+  triage: Object.assign({}, baseItem.triage, {
+    verdict: 'CLEAN',
+    verdict_label: '🟢 Clean (LGTM)',
+    review_outcome: 'CLEAN',
+    review_eyebrow_label: '🟢 Review PS2: Clean (LGTM)',
+    summary: 'All invariants verified',
+  })
+});
+
+const staleItem = Object.assign({}, cleanItem, {
+  patchset: 3,
+  triage: Object.assign({}, cleanItem.triage, {
+    is_stale: true,
+  })
+});
+
+const companionFallbackItem = {
+  item_key: 'gerrit:1411907',
+  target_id: '1411907',
+  kind: 'gerrit',
+  role: 'reviewer',
+  status: 'NEW',
+  phase: 'NEEDS_YOUR_ACTION',
+  patchset: 2,
+  url: 'https://example.com/1411907',
+  subject: 'Feature branch',
+  project_name: 'Skia',
+  companions: [
+    {item_key: 'gerrit:1411908', label: 'CL 1411908', status: 'NEW', companion_base_ps: 2}
+  ]
+};
+
+const nonReviewerItem = Object.assign({}, baseItem, {
+  role: 'author',
+  is_self: true,
+});
+
+console.log(JSON.stringify({
+  eyebrowCompanionFix: reviewVerdictEyebrowHtml(baseItem),
+  eyebrowClean: reviewVerdictEyebrowHtml(cleanItem),
+  eyebrowStale: reviewVerdictEyebrowHtml(staleItem),
+  eyebrowFallback: reviewVerdictEyebrowHtml(companionFallbackItem),
+  eyebrowNonReviewer: reviewVerdictEyebrowHtml(nonReviewerItem),
+  focusClean: focusCard(cleanItem, {jetski_box_url: ''}),
+  focusCompanionFix: focusCard(baseItem, {jetski_box_url: ''}),
+}));
+"""
+    proc = subprocess.run(
+        ["node", "-e", harness], capture_output=True, text=True, check=True
+    )
+    out = json.loads(proc.stdout.strip())
+
+    self.assertIn("v-companion_fix", out["eyebrowCompanionFix"])
+    self.assertIn("🟠 Review PS2: Defects + companion fix", out["eyebrowCompanionFix"])
+
+    self.assertIn("v-clean", out["eyebrowClean"])
+    self.assertIn("🟢 Review PS2: Clean (LGTM)", out["eyebrowClean"])
+
+    self.assertIn("v-stale", out["eyebrowStale"])
+    self.assertIn("→ PS3 uploaded", out["eyebrowStale"])
+
+    self.assertIn("v-companion_fix", out["eyebrowFallback"])
+    self.assertIn("Companion CL 1411908", out["eyebrowFallback"])
+
+    self.assertEqual(out["eyebrowNonReviewer"], "")
+
+    self.assertIn("v-clean", out["focusClean"])
+    self.assertIn("triage-clean", out["focusClean"])
+    self.assertIn("All invariants verified", out["focusClean"])
+
+    self.assertIn("v-companion_fix", out["focusCompanionFix"])
+    self.assertIn("triage-companion_fix", out["focusCompanionFix"])
+    self.assertIn("Caret offset miscomputed in BiDi runs", out["focusCompanionFix"])
 
 
 if __name__ == "__main__":

@@ -531,7 +531,7 @@ class TestStopGuard(unittest.TestCase):
       self.assertEqual(out.get("decision"), "continue")
       self.assertIn("Execution Ledger", out["reason"])
 
-  def test_skparagraph_review_approval_without_flutter_corpus_blocks_stop(self):
+  def test_review_after_triage_cl_without_save_review_blocks_stop(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
       steps = [
           {
@@ -551,6 +551,107 @@ class TestStopGuard(unittest.TestCase):
                       )
                   },
               }],
+          },
+          {
+              "step_index": 3,
+              "type": "GENERIC",
+              "content": "triage finished",
+          },
+          {
+              "step_index": 4,
+              "type": "PLANNER_RESPONSE",
+              "content": (
+                  "### Execution Ledger\n| Step | Status |\n|---|---|\n"
+                  "Verdict: **Case 1: Ideal CL**"
+              ),
+          },
+      ]
+      out = self.run_discipline_stop(tmp_dir, steps)
+      self.assertEqual(out.get("decision"), "continue")
+      self.assertIn("save-review", out["reason"])
+
+  def test_review_after_triage_cl_with_save_review_allows_stop(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      steps = [
+          {
+              "step_index": 1,
+              "type": "USER_INPUT",
+              "content": "<USER_REQUEST>review CL</USER_REQUEST>",
+          },
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [
+                  {
+                      "name": "run_command",
+                      "args": {
+                          "CommandLine": (
+                              "python3 ~/.gemini/config/skills/review-triage/"
+                              "scripts/triage_cl.py 12345"
+                          )
+                      },
+                  },
+                  {
+                      "name": "run_command",
+                      "args": {
+                          "CommandLine": (
+                              "python3 ~/.gemini/config/scripts/triage_store.py "
+                              "save-review --target 12345 --patchset 1 "
+                              "--outcome CLEAN --summary 'All tests pass'"
+                          )
+                      },
+                  },
+              ],
+          },
+          {
+              "step_index": 3,
+              "type": "GENERIC",
+              "content": "triage finished",
+          },
+          {
+              "step_index": 4,
+              "type": "PLANNER_RESPONSE",
+              "content": (
+                  "### Execution Ledger\n| Step | Status |\n|---|---|\n"
+                  "Verdict: **Case 1: Ideal CL**"
+              ),
+          },
+      ]
+      out = self.run_discipline_stop(tmp_dir, steps)
+      self.assertEqual(out, {})
+
+  def test_skparagraph_review_approval_without_flutter_corpus_blocks_stop(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      steps = [
+          {
+              "step_index": 1,
+              "type": "USER_INPUT",
+              "content": "<USER_REQUEST>review CL</USER_REQUEST>",
+          },
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [
+                  {
+                      "name": "run_command",
+                      "args": {
+                          "CommandLine": (
+                              "python3 ~/.gemini/config/skills/review-triage/"
+                              "scripts/triage_cl.py 12345"
+                          )
+                      },
+                  },
+                  {
+                      "name": "run_command",
+                      "args": {
+                          "CommandLine": (
+                              "python3 ~/.gemini/config/scripts/triage_store.py "
+                              "save-review --target 12345 --patchset 1 "
+                              "--outcome PUSHBACK --summary 'Fundamental flaw'"
+                          )
+                      },
+                  },
+              ],
           },
           {
               "step_index": 3,
@@ -590,15 +691,27 @@ class TestStopGuard(unittest.TestCase):
           {
               "step_index": 2,
               "type": "PLANNER_RESPONSE",
-              "tool_calls": [{
-                  "name": "run_command",
-                  "args": {
-                      "CommandLine": (
-                          "python3 ~/.gemini/config/skills/review-triage/"
-                          "scripts/triage_cl.py 12345"
-                      )
+              "tool_calls": [
+                  {
+                      "name": "run_command",
+                      "args": {
+                          "CommandLine": (
+                              "python3 ~/.gemini/config/skills/review-triage/"
+                              "scripts/triage_cl.py 12345"
+                          )
+                      },
                   },
-              }],
+                  {
+                      "name": "run_command",
+                      "args": {
+                          "CommandLine": (
+                              "python3 ~/.gemini/config/scripts/triage_store.py "
+                              "save-review --target 12345 --patchset 1 "
+                              "--outcome PUSHBACK --summary 'Fundamental flaw'"
+                          )
+                      },
+                  },
+              ],
           },
           {
               "step_index": 3,
@@ -613,16 +726,28 @@ class TestStopGuard(unittest.TestCase):
           {
               "step_index": 4,
               "type": "PLANNER_RESPONSE",
-              "tool_calls": [{
-                  "name": "run_command",
-                  "args": {
-                      "CommandLine": (
-                          "python3 ~/.gemini/config/skills/"
-                          "flutter-test-paragraph-engine/scripts/"
-                          "run_flutter_paragraph_tests.py"
-                      )
+              "tool_calls": [
+                  {
+                      "name": "run_command",
+                      "args": {
+                          "CommandLine": (
+                              "python3 ~/.gemini/config/skills/"
+                              "flutter-test-paragraph-engine/scripts/"
+                              "run_flutter_paragraph_tests.py"
+                          )
+                      },
                   },
-              }],
+                  {
+                      "name": "run_command",
+                      "args": {
+                          "CommandLine": (
+                              "python3 ~/.gemini/config/scripts/triage_store.py "
+                              "save-review --target 12345 --patchset 1 "
+                              "--outcome CLEAN --summary 'All 2400 tests passed'"
+                          )
+                      },
+                  },
+              ],
           },
           {
               "step_index": 5,
@@ -654,15 +779,27 @@ class TestStopGuard(unittest.TestCase):
           {
               "step_index": 2,
               "type": "PLANNER_RESPONSE",
-              "tool_calls": [{
-                  "name": "run_command",
-                  "args": {
-                      "CommandLine": (
-                          "python3 ~/.gemini/config/skills/review-triage/"
-                          "scripts/triage_cl.py 12345"
-                      )
+              "tool_calls": [
+                  {
+                      "name": "run_command",
+                      "args": {
+                          "CommandLine": (
+                              "python3 ~/.gemini/config/skills/review-triage/"
+                              "scripts/triage_cl.py 12345"
+                          )
+                      },
                   },
-              }],
+                  {
+                      "name": "run_command",
+                      "args": {
+                          "CommandLine": (
+                              "python3 ~/.gemini/config/scripts/triage_store.py "
+                              "save-review --target 12345 --patchset 1 "
+                              "--outcome PUSHBACK --summary 'Fundamental flaw'"
+                          )
+                      },
+                  },
+              ],
           },
           {
               "step_index": 3,

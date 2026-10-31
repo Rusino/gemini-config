@@ -364,6 +364,9 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
   skia_review_cl = ""
   skia_cpp_detected = False
   pending_canary_advisor = False
+  # Track review discipline and triage persistence across turn steps
+  triage_target_seen = False
+  triage_store_saved = False
 
   # Walk planner tool calls and command outputs in chronological order
   for step in steps:
@@ -384,8 +387,14 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
         elif tname == "run_command":
           cmd = str(targs.get("CommandLine", ""))
           read_blobs.append(cmd)
+          # Track triage_cl execution and subsequent triage_store save-review calls
           if _invokes_script_in_cmd(cmd, "triage_cl.py"):
             pending_triage = True
+            triage_target_seen = True
+          if _invokes_script_in_cmd(cmd, "triage_store.py") and (
+              "save-review" in cmd or "save-audit" in cmd
+          ):
+            triage_store_saved = True
           if _invokes_script_in_cmd(cmd, "canary_advisor.py"):
             canary_advisor_invoked = True
             pending_canary_advisor = True
@@ -503,6 +512,21 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
 
   # Enforce mandatory Flutter corpus verification before approving a reviewed CL
   combined_review_out = "\n".join([last_planner_text] + artifact_texts)
+
+  # Require saving review verdict for Flight Deck when a review classifies Case 1-5
+  if (
+      triage_target_seen
+      and CASE_CLASSIFICATION_RE.search(combined_review_out)
+      and not triage_store_saved
+  ):
+    result["artifact_issues"].append(
+        "Your review classifies a Case 1-5 outcome after running `triage_cl.py`, "
+        "but you did not save the review verdict for Flight Deck via "
+        "`python3 ~/.gemini/config/scripts/triage_store.py save-review --target <ID> "
+        "--patchset <PS> --outcome <CLEAN|NITS|COMPANION_TESTS|COMPANION_FIX|PUSHBACK|REASSIGN> "
+        '--summary "<1-line finding summary>"`'
+    )
+
   user_opted_out = any(USER_CORPUS_OPTOUT_RE.search(u) for u in all_user_requests)
   if (
       required_corpus_script

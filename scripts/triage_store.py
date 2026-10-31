@@ -81,15 +81,18 @@ def save_triage_result(data: dict[str, Any], results_dir: Path | str | None = No
         except Exception:
             existing = {}
 
-    # If existing data came from a deep audit on the same or newer patchset, keep audit fields
+    # Source priority ensures deep audits and finalized reviews override shallow queue triage
+    source_priority = {"queue_triage": 0, "audit": 1, "review": 2}
     new_source = data.get("source", "queue_triage")
-    existing_source = existing.get("source")
+    existing_source = existing.get("source", "queue_triage")
     existing_ps = existing.get("triaged_patchset") or 0
     new_ps = data.get("triaged_patchset") or 0
 
     merged = dict(existing)
-    if existing_source == "audit" and new_source == "queue_triage" and existing_ps >= new_ps:
-        # Preserve audit's verdict, summary, review time, report, and draft
+    p_exist = source_priority.get(str(existing_source), 0)
+    p_new = source_priority.get(str(new_source), 0)
+    if p_exist > p_new and existing_ps >= new_ps:
+        # Preserve higher priority verdict, summary, review time, report, and draft
         for k, v in data.items():
             if k not in merged or merged[k] in (None, "", 0):
                 merged[k] = v
@@ -139,6 +142,94 @@ def normalize_verdict(raw: str) -> str:
     if "PUSHBACK" in s:
         return "PUSHBACK"
     return "SURGICAL_AUDIT"
+
+
+# Canonical post-review outcomes mapped from companion-cl-review (Cases 1-5) and review-triage
+REVIEW_OUTCOME_META: dict[str, dict[str, str]] = {
+    "CLEAN": {
+        "badge": "🟢 Clean (LGTM)",
+        "eyebrow": "🟢 Review PS{ps}: Clean (LGTM)",
+    },
+    "NITS": {
+        "badge": "🔵 Minor nits",
+        "eyebrow": "🔵 Review PS{ps}: Minor nits",
+    },
+    "COMPANION_TESTS": {
+        "badge": "🟣 Logic OK + test companion",
+        "eyebrow": "🟣 Review PS{ps}: Logic OK + test companion",
+    },
+    "COMPANION_FIX": {
+        "badge": "🟠 Defects + companion fix",
+        "eyebrow": "🟠 Review PS{ps}: Defects + companion fix",
+    },
+    "PUSHBACK": {
+        "badge": "🔴 Do not land / Pushback",
+        "eyebrow": "🔴 Review PS{ps}: Do not land / Pushback",
+    },
+    "REASSIGN": {
+        "badge": "⚪ Out of domain",
+        "eyebrow": "⚪ Review PS{ps}: Out of domain",
+    },
+}
+
+
+# Normalize raw review outcome string to one of the canonical outcomes
+def normalize_review_outcome(raw: str) -> str:
+    s = raw.strip().upper().replace("-", "_").replace(" ", "_")
+    if s in ("CLEAN", "LGTM", "CASE_1", "CASE1", "IDEAL"):
+        return "CLEAN"
+    if s in ("NITS", "MINOR_NITS", "CASE_2", "CASE2", "NEAR_IDEAL"):
+        return "NITS"
+    if s in ("COMPANION_TESTS", "TESTS", "CASE_3", "CASE3"):
+        return "COMPANION_TESTS"
+    if s in ("PUSHBACK", "DO_NOT_LAND", "CASE_4", "CASE4", "CAT_4", "FUNDAMENTAL_FLAW"):
+        return "PUSHBACK"
+    if s in ("COMPANION_FIX", "COMPANION", "FIX", "DEFECTS", "CASE_5", "CASE5"):
+        return "COMPANION_FIX"
+    if s in ("REASSIGN", "OUT_OF_DOMAIN", "CAT_2"):
+        return "REASSIGN"
+    raise ValueError(f"Unknown review outcome: {raw}")
+
+
+# Persist completed code review verdict and findings for Flight Deck display
+def save_review_verdict(
+    target_id: str,
+    kind: str = "gerrit",
+    patchset: int = 1,
+    outcome: str = "CLEAN",
+    summary: str = "",
+    draft: str = "",
+    report_markdown: str = "",
+    companion_id: str = "",
+    results_dir: Path | str | None = None,
+) -> Path:
+    normalized_outcome = normalize_review_outcome(outcome)
+    meta = REVIEW_OUTCOME_META[normalized_outcome]
+    iso_ts, et_ts = now_et_strings()
+    safe_ps = int(patchset) if patchset else 1
+
+    clean_summary = summary.strip()[:140]
+    data = {
+        "target_id": str(target_id),
+        "item_key": f"{kind}:{target_id}",
+        "kind": kind,
+        "verdict": normalized_outcome,
+        "verdict_label": meta["badge"],
+        "review_outcome": normalized_outcome,
+        "review_outcome_label": meta["badge"],
+        "review_eyebrow_label": meta["eyebrow"].format(ps=safe_ps),
+        "est_minutes": 0.0,
+        "review_time_label": "",
+        "summary": clean_summary,
+        "triaged_patchset": safe_ps,
+        "triaged_at": iso_ts,
+        "triaged_at_et": et_ts,
+        "source": "review",
+        "companion_id": str(companion_id or "").strip(),
+        "draft": draft.strip(),
+        "report_markdown": report_markdown.strip(),
+    }
+    return save_triage_result(data, results_dir=results_dir)
 
 
 # Parse overview markdown from run_queue_triage.py (e.g. /tmp/triage_1030.md)
@@ -488,6 +579,13 @@ def overlay_triage_on_items(
         except (ValueError, TypeError):
             is_stale = False
 
+        # Propagate reviewed patchset to item when review outcome is recorded
+        if tr.get("review_outcome") and tr_ps is not None:
+            try:
+                it["reviewed_ps"] = max(int(it.get("reviewed_ps") or 0), int(tr_ps))
+            except (ValueError, TypeError):
+                pass
+
         summary = str(tr.get("summary") or "")
         if "already approved" in summary.lower():
             if not it.get("self_approved"):
@@ -522,6 +620,18 @@ def main() -> int:
     p_save.add_argument("--patchset", type=int, default=None)
     p_save.add_argument("--est-minutes", type=float, default=None)
 
+    # Subcommand to persist completed review outcome for Flight Deck display
+    p_rev = sub.add_parser("save-review", help="Save a completed code review verdict")
+    p_rev.add_argument("--target", required=True, help="CL number or PR number")
+    p_rev.add_argument("--kind", default="gerrit", choices=["gerrit", "github"])
+    p_rev.add_argument("--patchset", type=int, required=True, help="Reviewed patchset")
+    p_rev.add_argument("--outcome", required=True, help="CLEAN, NITS, COMPANION_FIX, etc.")
+    p_rev.add_argument("--summary", required=True, help="Concise 1-line findings summary")
+    p_rev.add_argument("--draft", default="", help="Ready-to-post draft string")
+    p_rev.add_argument("--draft-file", default="", help="File path with ready-to-post draft")
+    p_rev.add_argument("--report-file", default="", help="Path to markdown report file")
+    p_rev.add_argument("--companion", default="", help="Companion CL or PR ID")
+
     args = parser.parse_args()
     if args.cmd == "ingest-tmp":
         cnt = ingest_tmp_triage_files()
@@ -550,6 +660,31 @@ def main() -> int:
             parsed["review_time_label"] = f"~{int(round(args.est_minutes))}m"
         p = save_triage_result(parsed)
         print(f"Saved audit result to {p}")
+        return 0
+
+    # Execute save-review command reading drafts and reports from flags or files
+    if args.cmd == "save-review":
+        draft_text = args.draft or ""
+        if args.draft_file:
+            df = Path(args.draft_file)
+            if df.exists():
+                draft_text = df.read_text(encoding="utf-8", errors="replace")
+        report_text = ""
+        if args.report_file:
+            rf = Path(args.report_file)
+            if rf.exists():
+                report_text = rf.read_text(encoding="utf-8", errors="replace")
+        p = save_review_verdict(
+            target_id=args.target,
+            kind=args.kind,
+            patchset=args.patchset,
+            outcome=args.outcome,
+            summary=args.summary,
+            draft=draft_text,
+            report_markdown=report_text,
+            companion_id=args.companion,
+        )
+        print(f"Saved review verdict to {p}")
         return 0
 
     parser.print_help()

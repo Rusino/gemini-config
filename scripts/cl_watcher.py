@@ -4300,8 +4300,8 @@ def start_chat_for_item(item_key: str) -> dict[str, Any]:
           subj = str(rec.get("subject") or ikey)
           wake_msg = (
               f"[CL-WATCHER] 💬 Новое обновление в {ikey} (PS{cur_ps}): "
-              f"'{subj}'. Проведи инкрементальный триаж/анализ и подготовь разбор ревью "
-              f"для PS{cur_ps}."
+              f"'{subj}'. Проведи инкрементальный триаж/анализ, подготовь разбор ревью "
+              f"для PS{cur_ps} и запиши вердикт через triage_store.py save-review."
           )
           rec["review_target_ps"] = cur_ps
           rec["chat_busy"] = True
@@ -4346,8 +4346,9 @@ def start_chat_for_item(item_key: str) -> dict[str, Any]:
     )
   else:
     prompt = (
-        f"Проведи review-triage для {url} ('{subj}', PS{ps}) и подготовь разбор ревью "
-        "(никогда не публикуй комментарии ревью без моего подтверждения)."
+        f"Проведи review-triage для {url} ('{subj}', PS{ps}), подготовь разбор ревью "
+        "(никогда не публикуй комментарии ревью без моего подтверждения) и запиши вердикт "
+        "через triage_store.py save-review."
     )
 
   res = _start_pinned_chat_for_record(items, ikey, matched_key, rec, prompt)
@@ -5509,7 +5510,8 @@ def sync_once(
         transition_msg = (
             f"[CL-WATCHER] 💬 Новое обновление в {ikey} (PS{info['patchset']}) от "
             f"{info['last_msg_author']}: {info['last_msg_snippet']}. "
-            f"Проведи инкрементальный триаж/анализ и подготовь черновик ответа."
+            f"Проведи инкрементальный триаж/анализ, подготовь черновик ответа "
+            f"и запиши вердикт через triage_store.py save-review."
         )
 
       if transition_msg:
@@ -5550,8 +5552,9 @@ def sync_once(
       ):
         prompt = (
             f"Проведи review-triage для {info.get('url') or ikey} "
-            f"('{info.get('subject') or ikey}', PS{cur_ps}) и подготовь разбор ревью "
-            "(никогда не публикуй комментарии ревью без моего подтверждения)."
+            f"('{info.get('subject') or ikey}', PS{cur_ps}), подготовь разбор ревью "
+            "(никогда не публикуй комментарии ревью без моего подтверждения) и запиши вердикт "
+            "через triage_store.py save-review."
         )
         res = _start_pinned_chat_for_record(
             new_items, ikey, composite_key, record, prompt
@@ -5839,6 +5842,25 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .eyebrow .busy-pill {
     display: inline-flex; align-items: center; gap: 6px; color: var(--amber);
   }
+  .eyebrow .verdict-pill {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 1px 8px; border-radius: 980px; font-size: 12px; font-weight: 600;
+  }
+  .eyebrow .verdict-pill.v-clean {
+    background: color-mix(in srgb, var(--green) 16%, transparent); color: var(--green);
+  }
+  .eyebrow .verdict-pill.v-nits, .eyebrow .verdict-pill.v-companion_tests {
+    background: color-mix(in srgb, var(--blue) 15%, transparent); color: var(--blue);
+  }
+  .eyebrow .verdict-pill.v-companion_fix {
+    background: color-mix(in srgb, var(--amber) 18%, transparent); color: var(--amber);
+  }
+  .eyebrow .verdict-pill.v-pushback {
+    background: color-mix(in srgb, var(--red) 14%, transparent); color: var(--red);
+  }
+  .eyebrow .verdict-pill.v-reassign, .eyebrow .verdict-pill.v-stale {
+    background: color-mix(in srgb, var(--ink) 8%, transparent); color: var(--graphite);
+  }
   .card.alert .eyebrow { color: var(--red); }
   .card h2 { font: 600 26px/1.2 var(--display); letter-spacing: -.02em; margin: 4px 0 6px; }
   .card .why { font-size: 17px; color: var(--graphite); }
@@ -5993,6 +6015,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .badge.triage-stale {
     background: color-mix(in srgb, var(--red) 12%, transparent);
     color: var(--red);
+  }
+  .badge.triage-clean {
+    background: color-mix(in srgb, var(--green) 16%, transparent);
+    color: var(--green);
+  }
+  .badge.triage-nits, .badge.triage-companion_tests {
+    background: color-mix(in srgb, var(--blue) 15%, transparent);
+    color: var(--blue);
+  }
+  .badge.triage-companion_fix {
+    background: color-mix(in srgb, var(--amber) 18%, transparent);
+    color: var(--amber);
   }
   .card .triage-box {
     grid-column: 1 / -1; margin-top: 12px; padding: 10px 14px; border-radius: 12px;
@@ -7518,6 +7552,37 @@ if (typeof document !== 'undefined') {
   });
 }
 
+// Render completed code review outcome pill in focus card eyebrow
+function reviewVerdictEyebrowHtml(it) {
+  // Author and watching items do not display review outcome badges
+  if (!isReviewerChange(it)) return '';
+  const tr = it.triage || null;
+  // Format explicit post-review verdict and mark stale if author uploaded a new PS
+  if (tr && tr.review_outcome) {
+    const out = String(tr.review_outcome).toUpperCase();
+    const revPs = Number(tr.triaged_patchset || it.reviewed_ps || it.patchset || 1);
+    const curPs = Number(it.patchset || 1);
+    const stale = curPs > revPs;
+    const baseLabel = tr.review_eyebrow_label ||
+      `Review PS${revPs}: ${tr.verdict_label || out}`;
+    const label = stale ? `${baseLabel} → PS${curPs} uploaded` : baseLabel;
+    const cls = stale ? 'v-stale' : `v-${out.toLowerCase()}`;
+    return `<span class="verdict-pill ${cls}">${esc(label)}</span> · `;
+  }
+  // Fall back to active companion label when explicit review JSON is not yet saved
+  if (Array.isArray(it.companions)) {
+    const comp = it.companions.find(
+      c => c && c.status !== 'ABANDONED' && c.status !== 'CLOSED'
+    );
+    if (comp) {
+      const basePs = Number(comp.companion_base_ps || it.reviewed_ps || it.patchset || 1);
+      const label = `Review PS${basePs}: Companion ${comp.label || ''}`.trim();
+      return `<span class="verdict-pill v-companion_fix">🟠 ${esc(label)}</span> · `;
+    }
+  }
+  return '';
+}
+
 function focusCard(it, data) {
   const chatBtn = chatActionHtml(it, data, false);
   const busyBadge = it.chat_busy
@@ -7617,10 +7682,11 @@ function focusCard(it, data) {
     ? `${fixPrimary}<div class="why-context">${fullWhy}</div>`
     : fullWhy;
   const actionsWithFix = openFixBtn ? actions.replace(chatBtn, `${openFixBtn}${chatBtn}`) : actions;
+  const verdictPill = reviewVerdictEyebrowHtml(it);
   return `
     <article class="card">
-      <div><div class="eyebrow">${busyBadge}${esc(it.project_name)} · ${link(it.url, clLabel(it))} ·
-        PS${esc(it.patchset || 1)}</div>
+      <div><div class="eyebrow">${busyBadge}${verdictPill}${esc(it.project_name)} · ` +
+        `${link(it.url, clLabel(it))} · PS${esc(it.patchset || 1)}</div>
         <h2>${cardTitle}</h2>
         <div class="why">${whyContent}</div>
         <!-- Surface fix-for linkage on pre-submit focus cards -->
