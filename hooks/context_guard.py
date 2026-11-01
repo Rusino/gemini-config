@@ -922,6 +922,73 @@ def build_git_sync_notice(conv_id: str, workspace_paths: list[str]) -> str:
   )
 
 
+# Format single-line [CONFIG SYNC] notice for stale state or changed rules/skills/hooks
+def build_config_sync_notice(sync_res: dict, state: dict) -> tuple[str, bool]:
+  if not isinstance(sync_res, dict):
+    return "", False
+  status = str(sync_res.get("status") or "")
+  if status == "updated":
+    state_dirty = bool("config_sync_notice_state" in state)
+    state.pop("config_sync_notice_state", None)
+    # Warn when the incoming pull modified rules, skills, or hooks that influenced the turn prompt
+    impacted = [
+        f
+        for f in (sync_res.get("changed_files") or [])
+        if any(f.startswith(pfx) for pfx in ("rules/", "skills/", "hooks/"))
+    ]
+    if not impacted:
+      return "", state_dirty
+    notice = (
+        f"[CONFIG SYNC] Fast-forwarded ~/.gemini/config "
+        f"({sync_res.get('old', '')}..{sync_res.get('new', '')}) updated: "
+        f"{', '.join(impacted)}. Note: system prompt rules and skills for this turn were "
+        f"loaded before the pull."
+    )
+    return notice, True
+
+  # Clear stale notice signature once repository catches up with upstream
+  if status == "up_to_date":
+    if "config_sync_notice_state" in state:
+      state.pop("config_sync_notice_state", None)
+      return "", True
+    return "", False
+
+  # Surface warning once per distinct stale signature when clone is behind or remote state is unknown
+  if status in ("dirty", "diverged", "fetch_failed", "leased"):
+    behind = int(sync_res.get("behind") or 0)
+    unknown = bool(sync_res.get("unknown"))
+    if behind <= 0 and not unknown:
+      if "config_sync_notice_state" in state:
+        state.pop("config_sync_notice_state", None)
+        return "", True
+      return "", False
+    sig = (
+        f"{status}:{behind}:{int(unknown)}:"
+        f"{sync_res.get('old', '')}:{sync_res.get('remote', '')}"
+    )
+    # Suppress repeated warnings for the identical behind count and commit pair
+    if state.get("config_sync_notice_state") == sig:
+      return "", False
+    state["config_sync_notice_state"] = sig
+    if unknown:
+      detail = (
+          f"remote origin/main state is unknown and behind status cannot be verified "
+          f"(status: {status})"
+      )
+    else:
+      detail = (
+          f"local main is {behind} commit(s) behind origin/main (status: {status})"
+      )
+    notice = (
+        f"[CONFIG SYNC] Warning: {detail}; local rules/skills may be stale. "
+        f"Run `python3 ~/.gemini/config/hooks/auto_ship.py sync` or inspect "
+        f"`git -C ~/.gemini/config status`."
+    )
+    return notice, True
+
+  return "", False
+
+
 def build_scope_radar_notice(
     conv_id: str,
     transcript_path: str,
@@ -1749,14 +1816,26 @@ def run(data: dict, log: dict) -> dict:
   # Reset per-turn state at the start of each new user turn; a hard trigger
   # that was ignored last turn is re-evaluated below rather than snoozed
   if is_turn_start:
-    # Pull upstream config commits on macOS so Cloudtop auto-ships land locally
-    if sys.platform == "darwin":
+    # Pull upstream config commits on macOS and Linux so cross-machine auto-ships land
+    if sys.platform == "darwin" or sys.platform.startswith("linux"):
       try:
         from auto_ship import maybe_sync_mac_clone
 
-        mac_res = maybe_sync_mac_clone()
-        if mac_res.get("status") == "updated":
-          log["mac_sync"] = f"{mac_res['old']}..{mac_res['new']}"
+        mac_res = maybe_sync_mac_clone(
+            conv_id=conv_id, transcript_path=transcript_path
+        )
+        if isinstance(mac_res, dict):
+          st_name = mac_res.get("status")
+          if st_name == "updated":
+            log["mac_sync"] = f"{mac_res.get('old')}..{mac_res.get('new')}"
+          elif st_name not in ("throttled", "up_to_date", "skip_platform", ""):
+            log["config_sync_status"] = st_name
+          cfg_notice, cfg_dirty = build_config_sync_notice(mac_res, state)
+          if cfg_notice:
+            state["config_sync_notice"] = cfg_notice
+            cfg_dirty = True
+          if cfg_dirty:
+            save_state(state_path, state)
       except Exception:
         pass
     next_turn_inv_threshold = MAX_TURN_INVOCATIONS
@@ -1999,6 +2078,10 @@ def run(data: dict, log: dict) -> dict:
     if state.get("auto_title_notice"):
       messages.append(state.pop("auto_title_notice"))
       save_state(state_path, state)
+    # Inject warning or change summary when cross-machine git sync caught new commits or stale state
+    if state.get("config_sync_notice"):
+      messages.append(state.pop("config_sync_notice"))
+      save_state(state_path, state)
     # Inject cross-project / sibling scope radar and git sync notice at turn start
     if is_turn_start and last_user_input:
       radar_notice = build_scope_radar_notice(
@@ -2098,6 +2181,8 @@ def run(data: dict, log: dict) -> dict:
       "auto_ship_blocked_turn",
       "auto_ship_deferred_question",
       "vcs_baton_blocked_turn",
+      "config_sync_notice",
+      "config_sync_notice_state",
   ):
     if k in state:
       new_state[k] = state[k]

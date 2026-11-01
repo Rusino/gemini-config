@@ -51,8 +51,15 @@ class TestContextGuard(unittest.TestCase):
     self.app_dirs.start()
     self.rpc = patch.object(chat_lifecycle, "ls_rpc", return_value=gm_response(1000))
     self.mock_rpc = self.rpc.start()
+    import auto_ship
+
+    self.mock_sync = patch.object(
+        auto_ship, "maybe_sync_mac_clone", return_value={"status": "up_to_date"}
+    )
+    self.mock_sync.start()
 
   def tearDown(self):
+    self.mock_sync.stop()
     self.rpc.stop()
     self.app_dirs.stop()
     self.db_info.stop()
@@ -836,6 +843,100 @@ class TestContextGuard(unittest.TestCase):
         self.assertNotIn("handed_off_to", saved)
         self.assertFalse(saved.get("handoff_completed"))
         self.assertEqual(saved.get("owner"), "c1")
+
+  def test_config_sync_surfaces_stale_dirty_diverged_and_fetch_failed_once_per_state_change(self):
+    import auto_ship
+
+    # Dirty clone with behind=0 does not trigger a notice
+    with patch.object(
+        auto_ship,
+        "maybe_sync_mac_clone",
+        return_value={"status": "dirty", "behind": 0, "unknown": False, "old": "1111111", "remote": "1111111"},
+    ):
+      out = self.run_guard(inv=0, lastUserInput="hello")
+      self.assertNotIn("[CONFIG SYNC]", self.message(out))
+
+    # Dirty clone behind remote by 2 commits triggers a single-line notice
+    with patch.object(
+        auto_ship,
+        "maybe_sync_mac_clone",
+        return_value={"status": "dirty", "behind": 2, "unknown": False, "old": "1111111", "remote": "2222222"},
+    ):
+      out2 = self.run_guard(inv=0, lastUserInput="turn 1")
+      msg2 = self.message(out2)
+      self.assertIn("[CONFIG SYNC]", msg2)
+      self.assertIn("behind", msg2.lower())
+
+    # Turn 2: throttled status does not repeat the notice
+    with patch.object(
+        auto_ship,
+        "maybe_sync_mac_clone",
+        return_value={"status": "throttled"},
+    ):
+      out_th = self.run_guard(inv=0, lastUserInput="turn 2")
+      self.assertNotIn("[CONFIG SYNC]", self.message(out_th))
+
+    # Turn 3: same dirty state does not repeat the notice
+    with patch.object(
+        auto_ship,
+        "maybe_sync_mac_clone",
+        return_value={"status": "dirty", "behind": 2, "unknown": False, "old": "1111111", "remote": "2222222"},
+    ):
+      out_same = self.run_guard(inv=0, lastUserInput="turn 3")
+      self.assertNotIn("[CONFIG SYNC]", self.message(out_same))
+
+    # Turn 4: remote advances so state changes -> notice fires again
+    with patch.object(
+        auto_ship,
+        "maybe_sync_mac_clone",
+        return_value={"status": "dirty", "behind": 3, "unknown": False, "old": "1111111", "remote": "3333333"},
+    ):
+      out_adv = self.run_guard(inv=0, lastUserInput="turn 4")
+      self.assertIn("[CONFIG SYNC]", self.message(out_adv))
+
+    # Turn 5: fetch_failed with unknown remote triggers notice once
+    with patch.object(
+        auto_ship,
+        "maybe_sync_mac_clone",
+        return_value={"status": "fetch_failed", "unknown": True, "old": "1111111", "remote": ""},
+    ):
+      out_ff = self.run_guard(inv=0, lastUserInput="turn 5")
+      self.assertIn("[CONFIG SYNC]", self.message(out_ff))
+
+  def test_config_sync_notifies_changed_rules_skills_and_hooks_on_fast_forward(self):
+    import auto_ship
+
+    # Fast-forward touching rules and skills warns about pre-loaded system prompt
+    with patch.object(
+        auto_ship,
+        "maybe_sync_mac_clone",
+        return_value={
+            "status": "updated",
+            "old": "1111111",
+            "new": "2222222",
+            "changed_files": ["rules/code_style.md", "skills/foo/SKILL.md", "roadmaps/p1/roadmap.json"],
+        },
+    ):
+      out = self.run_guard(inv=0, lastUserInput="check rules")
+      msg = self.message(out)
+      self.assertIn("[CONFIG SYNC]", msg)
+      self.assertIn("rules/code_style.md", msg)
+      self.assertIn("skills/foo/SKILL.md", msg)
+      self.assertNotIn("roadmaps/p1/roadmap.json", msg)
+
+    # Fast-forward touching only roadmaps does not inject config sync notice
+    with patch.object(
+        auto_ship,
+        "maybe_sync_mac_clone",
+        return_value={
+            "status": "updated",
+            "old": "2222222",
+            "new": "3333333",
+            "changed_files": ["roadmaps/p1/roadmap.json"],
+        },
+    ):
+      out_rm = self.run_guard(inv=0, lastUserInput="check roadmap")
+      self.assertNotIn("[CONFIG SYNC]", self.message(out_rm))
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ from pre_tool_guard import (
     get_tool_target_file,
     inspect_unpushed_commit_owners,
 )
+import pre_tool_guard
 
 DEFAULT_PERSONAL_REPOS = (
     "~/.gemini/config",
@@ -514,12 +515,41 @@ def ship(
   return 0
 
 
-# Fast-forward clean Mac ~/.gemini/config clones since Cloudtop->Mac SSH is blocked
+# Measure ahead/behind counts between local HEAD and upstream origin/main
+def _ahead_behind_counts(
+    target: str, old_sha: str, rem_sha: str
+) -> tuple[int, int, bool]:
+  if not old_sha or not rem_sha:
+    return (0, 0, True)
+  if old_sha == rem_sha:
+    return (0, 0, False)
+  res = _run_cmd(
+      ["git", "-C", target, "rev-list", "--left-right", "--count", f"{old_sha}...{rem_sha}"],
+      timeout=1.0,
+  )
+  if res.returncode != 0:
+    return (0, 0, True)
+  parts = res.stdout.strip().split()
+  if len(parts) == 2:
+    try:
+      return (int(parts[0]), int(parts[1]), False)
+    except ValueError:
+      pass
+  return (0, 0, True)
+
+
+# Fast-forward clean Mac and Linux ~/.gemini/config clones when behind origin/main
 def maybe_sync_mac_clone(
-    repo: str = "", platform: str = "", min_interval_s: int = 300
+    repo: str = "",
+    platform: str = "",
+    min_interval_s: int = 300,
+    conv_id: str = "",
+    transcript_path: str = "",
+    fetch_timeout_s: float = 2.0,
 ) -> dict:
+  # Darwin and Linux platforms are supported for personal config sync
   plat = (platform or sys.platform).lower()
-  if plat != "darwin":
+  if plat != "darwin" and not plat.startswith("linux"):
     return {"status": "skip_platform"}
   target = os.path.realpath(os.path.expanduser(repo or "~/.gemini/config"))
   if not os.path.isdir(target):
@@ -527,7 +557,7 @@ def maybe_sync_mac_clone(
   ginfo = _resolve_git_dirs(target)
   if not ginfo or ginfo[0] != target:
     return {"status": "not_git"}
-  _, git_dir, _ = ginfo
+  _, git_dir, git_common_dir = ginfo
   stamp_path = os.path.join(git_dir, "jetski_mac_sync.json")
   now = time.time()
   stamp = _read_json_file(stamp_path)
@@ -543,26 +573,147 @@ def maybe_sync_mac_clone(
       ["git", "-C", target, "status", "--porcelain", "--untracked-files=no"],
       timeout=1.0,
   )
-  if st.returncode != 0 or st.stdout.strip():
-    return {"status": "dirty"}
-  fetch = _run_cmd(["git", "-C", target, "fetch", "-q", "origin", "main"], timeout=2.0)
-  if fetch.returncode != 0:
-    return {"status": "fetch_failed"}
+  is_dirty = st.returncode != 0 or bool(st.stdout.strip())
+  # Fetch remote main before evaluating cleanliness and fast-forward status
+  fetch = _run_cmd(
+      ["git", "-C", target, "fetch", "-q", "origin", "main"],
+      timeout=fetch_timeout_s,
+  )
   old_sha = _git_head_sha(target)
   rem = _run_cmd(["git", "-C", target, "rev-parse", "origin/main"], timeout=0.8)
   rem_sha = rem.stdout.strip() if rem.returncode == 0 else ""
-  if not rem_sha or rem_sha == old_sha:
+
+  # Network or timeout failure during fetch preserves cached behind count with unknown remote
+  if fetch.returncode != 0:
+    _, behind, _ = _ahead_behind_counts(target, old_sha, rem_sha)
+    return {
+        "status": "fetch_failed",
+        "behind": behind,
+        "unknown": True,
+        "old": old_sha[:7],
+        "remote": rem_sha[:7],
+    }
+
+  ahead, behind, unknown = _ahead_behind_counts(target, old_sha, rem_sha)
+  # Dirty working tree prevents automated merge; surface behind count to prompt
+  if is_dirty:
+    return {
+        "status": "dirty",
+        "behind": behind,
+        "ahead": ahead,
+        "unknown": unknown,
+        "old": old_sha[:7],
+        "remote": rem_sha[:7],
+    }
+
+  if not rem_sha or rem_sha == old_sha or (behind == 0 and not unknown):
     return {"status": "up_to_date"}
+
+  # Active worktree lease held by another conversation prevents fast-forward merge
+  lease_file = os.path.join(git_dir, "jetski_lease.json")
+  if os.path.isfile(lease_file):
+    lease_data = _read_json_file(lease_file)
+    lease_owner = str(lease_data.get("conv_id") or "")
+    lease_ts = float(lease_data.get("ts") or 0.0)
+    if lease_owner and lease_owner != conv_id:
+      still_active, _ = pre_tool_guard._is_conv_still_active_tip(
+          lease_owner, conv_id, transcript_path
+      )
+      if still_active:
+        unexpired, _ = pre_tool_guard._is_worktree_lease_unexpired(
+            lease_owner, lease_ts, target, transcript_path, now
+        )
+        if unexpired:
+          return {
+              "status": "leased",
+              "behind": behind,
+              "ahead": ahead,
+              "unknown": unknown,
+              "old": old_sha[:7],
+              "remote": rem_sha[:7],
+          }
+
+  # Inspect incoming changed files
+  incoming_res = _run_cmd(
+      ["git", "-C", target, "diff", "--name-only", f"{old_sha}..{rem_sha}"],
+      timeout=1.5,
+  )
+  incoming_files = (
+      [x.strip() for x in incoming_res.stdout.splitlines() if x.strip()]
+      if incoming_res.returncode == 0
+      else []
+  )
+
+  # Check active foreign file leases against incoming changed files
+  foreign_leases = _active_foreign_file_leases(git_dir, conv_id, transcript_path)
+  if any(f in foreign_leases for f in incoming_files):
+    return {
+        "status": "leased",
+        "behind": behind,
+        "ahead": ahead,
+        "unknown": unknown,
+        "old": old_sha[:7],
+        "remote": rem_sha[:7],
+    }
+
+  # Foreign unpushed commits on the branch block automated merge
+  foreign_unpushed, _, _ = inspect_unpushed_commit_owners(
+      target, git_dir, git_common_dir, conv_id, transcript_path
+  )
+  if foreign_unpushed:
+    return {
+        "status": "diverged",
+        "behind": behind,
+        "ahead": ahead,
+        "unknown": unknown,
+        "old": old_sha[:7],
+        "remote": rem_sha[:7],
+        "foreign_unpushed": foreign_unpushed,
+    }
+
   ff = _run_cmd(
-      ["git", "-C", target, "merge", "--ff-only", "-q", "origin/main"], timeout=1.5
+      ["git", "-C", target, "merge", "--ff-only", "-q", "origin/main"],
+      timeout=1.5,
   )
   if ff.returncode != 0:
-    return {"status": "diverged"}
+    return {
+        "status": "diverged",
+        "behind": behind,
+        "ahead": ahead,
+        "unknown": unknown,
+        "old": old_sha[:7],
+        "remote": rem_sha[:7],
+    }
+
   # `git merge --ff-only` exits 0 without advancing HEAD when local main is ahead of origin
   new_sha = _git_head_sha(target)
   if not new_sha or new_sha == old_sha:
     return {"status": "up_to_date"}
-  return {"status": "updated", "old": old_sha[:7], "new": new_sha[:7]}
+
+  return {
+      "status": "updated",
+      "old": old_sha[:7],
+      "new": new_sha[:7],
+      "changed_files": incoming_files,
+  }
+
+
+# Bypass the sync throttle for callers that require fresh remote state (e.g. decisions.py)
+def force_sync_config_clone(
+    repo: str = "",
+    platform: str = "",
+    fetch_timeout_s: float = 2.0,
+    conv_id: str = "",
+    transcript_path: str = "",
+) -> dict:
+  return maybe_sync_mac_clone(
+      repo=repo,
+      platform=platform,
+      min_interval_s=0,
+      conv_id=conv_id,
+      transcript_path=transcript_path,
+      fetch_timeout_s=fetch_timeout_s,
+  )
 
 
 def _cli(argv: list[str]) -> int:
@@ -580,9 +731,15 @@ def _cli(argv: list[str]) -> int:
   p_ship.add_argument("--transcript", default="")
   p_ship.add_argument("--no-post-push", action="store_true")
 
-  p_mac = sub.add_parser("mac-sync")
-  p_mac.add_argument("--repo", default="")
-  p_mac.add_argument("--min-interval", type=int, default=300)
+  for cmd_name in ("mac-sync", "sync"):
+    p_s = sub.add_parser(cmd_name)
+    p_s.add_argument("--repo", default="")
+    p_s.add_argument("--min-interval", type=int, default=300)
+    p_s.add_argument("--force", action="store_true")
+    p_s.add_argument("--timeout", type=float, default=2.0)
+    p_s.add_argument("--platform", default="")
+    p_s.add_argument("--conv-id", default="")
+    p_s.add_argument("--transcript", default="")
 
   ns = parser.parse_args(argv)
   if ns.cmd == "plan":
@@ -596,10 +753,18 @@ def _cli(argv: list[str]) -> int:
         run_post_push=not ns.no_post_push,
         repo_filter=ns.repo,
     )
-  if ns.cmd == "mac-sync":
+  if ns.cmd in ("mac-sync", "sync"):
+    min_int = 0 if ns.force else ns.min_interval
     print(
         json.dumps(
-            maybe_sync_mac_clone(repo=ns.repo, min_interval_s=ns.min_interval)
+            maybe_sync_mac_clone(
+                repo=ns.repo,
+                platform=ns.platform,
+                min_interval_s=min_int,
+                conv_id=ns.conv_id,
+                transcript_path=ns.transcript,
+                fetch_timeout_s=ns.timeout,
+            )
         )
     )
     return 0

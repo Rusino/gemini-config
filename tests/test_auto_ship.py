@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -531,11 +532,168 @@ class TestAutoShip(unittest.TestCase):
         repo=mac_clone, platform="darwin", min_interval_s=300
     )
     self.assertEqual(res2["status"], "throttled")
-    # Non-Darwin is always a no-op
+    # Linux is also supported and finds the tree up to date
     res3 = auto_ship.maybe_sync_mac_clone(
         repo=mac_clone, platform="linux", min_interval_s=0
     )
-    self.assertEqual(res3["status"], "skip_platform")
+    self.assertEqual(res3["status"], "up_to_date")
+    # Unsupported platform is a no-op
+    res4 = auto_ship.maybe_sync_mac_clone(
+        repo=mac_clone, platform="win32", min_interval_s=0
+    )
+    self.assertEqual(res4["status"], "skip_platform")
+
+  def test_sync_reports_behind_count_for_dirty_and_diverged_clones(self):
+    clone = os.path.realpath(os.path.join(self.root, "clone_dirty"))
+    subprocess.run(
+        ["git", "clone", "-q", self.fx.origin, clone],
+        check=True,
+        capture_output=True,
+    )
+    # Dirty clone with no remote changes
+    with open(os.path.join(clone, "seed.txt"), "w", encoding="utf-8") as f:
+      f.write("modified locally\n")
+    res_clean_rem = auto_ship.maybe_sync_mac_clone(
+        repo=clone, platform="linux", min_interval_s=0
+    )
+    self.assertEqual(res_clean_rem["status"], "dirty")
+    self.assertEqual(res_clean_rem.get("behind"), 0)
+    self.assertFalse(res_clean_rem.get("unknown"))
+
+    # Remote advances while clone is dirty
+    self.fx.write("remote_new.txt", "remote\n")
+    _git(self.fx.repo, "add", "remote_new.txt")
+    _git(self.fx.repo, "commit", "-q", "-m", "remote commit")
+    _git(self.fx.repo, "push", "-q", "origin", "main")
+
+    res_dirty_behind = auto_ship.maybe_sync_mac_clone(
+        repo=clone, platform="linux", min_interval_s=0
+    )
+    self.assertEqual(res_dirty_behind["status"], "dirty")
+    self.assertEqual(res_dirty_behind.get("behind"), 1)
+    self.assertFalse(res_dirty_behind.get("unknown"))
+    self.assertFalse(os.path.exists(os.path.join(clone, "remote_new.txt")))
+
+    # Clean working tree with local unpushed commit diverges from remote
+    _git(clone, "checkout", "-q", "--", "seed.txt")
+    with open(os.path.join(clone, "local.txt"), "w", encoding="utf-8") as f:
+      f.write("local\n")
+    _git(clone, "add", "local.txt")
+    _git(clone, "commit", "-q", "-m", "local commit")
+    res_div = auto_ship.maybe_sync_mac_clone(
+        repo=clone, platform="linux", min_interval_s=0
+    )
+    self.assertEqual(res_div["status"], "diverged")
+    self.assertEqual(res_div.get("behind"), 1)
+    self.assertEqual(res_div.get("ahead"), 1)
+
+  def test_sync_respects_worktree_lease_file_lease_and_foreign_unpushed(self):
+    clone = os.path.realpath(os.path.join(self.root, "clone_leases"))
+    subprocess.run(
+        ["git", "clone", "-q", self.fx.origin, clone],
+        check=True,
+        capture_output=True,
+    )
+    self.fx.write("hooks/foo.py", "remote foo\n")
+    _git(self.fx.repo, "add", "hooks/foo.py")
+    _git(self.fx.repo, "commit", "-q", "-m", "remote foo")
+    _git(self.fx.repo, "push", "-q", "origin", "main")
+
+    # Active worktree lease held by another conversation blocks merge
+    with (
+        patch("pre_tool_guard._is_conv_still_active_tip", return_value=(True, "Other chat")),
+        patch("pre_tool_guard._is_worktree_lease_unexpired", return_value=(True, time.time())),
+    ):
+      with open(os.path.join(clone, ".git", "jetski_lease.json"), "w", encoding="utf-8") as f:
+        json.dump({"conv_id": "other_cid", "title": "Other chat", "ts": time.time()}, f)
+      res_wt = auto_ship.maybe_sync_mac_clone(
+          repo=clone, platform="linux", min_interval_s=0, conv_id="c1"
+      )
+      self.assertEqual(res_wt["status"], "leased")
+      self.assertEqual(res_wt.get("behind"), 1)
+
+    # Active file lease on a file in incoming range blocks merge
+    os.remove(os.path.join(clone, ".git", "jetski_lease.json"))
+    with (
+        patch("pre_tool_guard._is_conv_still_active_tip", return_value=(True, "Other chat")),
+        patch("pre_tool_guard._latest_conv_activity_ts", return_value=time.time()),
+    ):
+      with open(
+          os.path.join(clone, ".git", "jetski_file_leases.json"), "w", encoding="utf-8"
+      ) as f:
+        json.dump({"files": {"hooks/foo.py": {"conv_id": "other_cid", "ts": time.time()}}}, f)
+      res_fl = auto_ship.maybe_sync_mac_clone(
+          repo=clone, platform="linux", min_interval_s=0, conv_id="c1"
+      )
+      self.assertEqual(res_fl["status"], "leased")
+      self.assertEqual(res_fl.get("behind"), 1)
+
+    # Foreign unpushed commit blocks auto-pull as diverged
+    os.remove(os.path.join(clone, ".git", "jetski_file_leases.json"))
+    with open(os.path.join(clone, "local_foreign.py"), "w", encoding="utf-8") as f:
+      f.write("foreign\n")
+    _git(clone, "add", "local_foreign.py")
+    _git(clone, "commit", "-q", "-m", "foreign commit")
+    foreign_sha = _git(clone, "rev-parse", "HEAD")
+    with open(
+        os.path.join(clone, ".git", "jetski_commits.json"), "w", encoding="utf-8"
+    ) as f:
+      json.dump({"commits": {foreign_sha: {"conv_id": "other_cid", "repo": clone}}}, f)
+    with patch("pre_tool_guard._is_conv_still_active_tip", return_value=(True, "Other chat")):
+      res_foreign = auto_ship.maybe_sync_mac_clone(
+          repo=clone, platform="linux", min_interval_s=0, conv_id="c1"
+      )
+      self.assertEqual(res_foreign["status"], "diverged")
+      self.assertEqual(res_foreign.get("behind"), 1)
+      self.assertTrue(bool(res_foreign.get("foreign_unpushed")))
+
+  def test_sync_returns_changed_files_and_force_api_bypasses_throttle(self):
+    clone = os.path.realpath(os.path.join(self.root, "clone_changed"))
+    subprocess.run(
+        ["git", "clone", "-q", self.fx.origin, clone],
+        check=True,
+        capture_output=True,
+    )
+    self.fx.write("rules/code_style.md", "rule\n")
+    self.fx.write("skills/foo/SKILL.md", "skill\n")
+    self.fx.write("hooks/bar.py", "hook\n")
+    _git(self.fx.repo, "add", "rules/code_style.md", "skills/foo/SKILL.md", "hooks/bar.py")
+    _git(self.fx.repo, "commit", "-q", "-m", "update configs")
+    _git(self.fx.repo, "push", "-q", "origin", "main")
+
+    res = auto_ship.maybe_sync_mac_clone(
+        repo=clone, platform="linux", min_interval_s=300
+    )
+    self.assertEqual(res["status"], "updated")
+    self.assertEqual(
+        set(res.get("changed_files") or []),
+        {"rules/code_style.md", "skills/foo/SKILL.md", "hooks/bar.py"},
+    )
+
+    # Next remote commit is throttled under min_interval_s=300
+    self.fx.write("rules/new.md", "more\n")
+    _git(self.fx.repo, "add", "rules/new.md")
+    _git(self.fx.repo, "commit", "-q", "-m", "new rule")
+    _git(self.fx.repo, "push", "-q", "origin", "main")
+
+    res_th = auto_ship.maybe_sync_mac_clone(
+        repo=clone, platform="linux", min_interval_s=300
+    )
+    self.assertEqual(res_th["status"], "throttled")
+
+    # Forced sync bypasses throttle and pulls
+    res_forced = auto_ship.force_sync_config_clone(repo=clone, platform="linux")
+    self.assertEqual(res_forced["status"], "updated")
+    self.assertEqual(res_forced.get("changed_files"), ["rules/new.md"])
+
+    # CLI --force flag also bypasses throttle
+    self.fx.write("rules/cli.md", "cli\n")
+    _git(self.fx.repo, "add", "rules/cli.md")
+    _git(self.fx.repo, "commit", "-q", "-m", "cli rule")
+    _git(self.fx.repo, "push", "-q", "origin", "main")
+    code = auto_ship._cli(["mac-sync", "--repo", clone, "--force", "--min-interval", "300"])
+    self.assertEqual(code, 0)
+    self.assertTrue(os.path.exists(os.path.join(clone, "rules/cli.md")))
 
   def test_roadmap_vcs_baton_action_reports_auto_ship_for_personal_repo(self):
     import roadmap
