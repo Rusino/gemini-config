@@ -1083,6 +1083,7 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(bodyEl.querySelector('#jetski-chat-dossier-popover'), null);
   advanceClock();
   titlebarReminderBtn.dispatchEvent('pointerdown', { button: 0 });
+  await new Promise((r) => setTimeout(r, 15));
   const openPopover = bodyEl.querySelector('#jetski-chat-dossier-popover');
   assert(openPopover, 'Clicking Reminder button must open Context Dossier popover');
   assert.strictEqual(openPopover.getAttribute('data-visible'), 'true');
@@ -1093,6 +1094,15 @@ const liveBucketBtn = (k) =>
   assert(
     openPopover.innerHTML.includes('🤖 Выжимка (TL;DR)'),
     'Popover must contain Cyrillic section header'
+  );
+  assert(
+    openPopover.innerHTML.includes('R99: Chat Context Reminder'),
+    'Popover roadmap badge must display inline roadmap item text alongside ID'
+  );
+  assert(
+    !openPopover.innerHTML.includes('Цель и следующий шаг') &&
+      !openPopover.innerHTML.includes('jcdp-kv-row'),
+    'Popover must not render redundant Цель и следующий шаг section'
   );
   assert(
     !openPopover.innerHTML.includes('\\u04') && !openPopover.innerHTML.includes('\\U04'),

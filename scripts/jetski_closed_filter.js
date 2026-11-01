@@ -4351,6 +4351,10 @@
         background: rgba(52, 211, 153, 0.15);
         color: #34d399;
         border-color: rgba(52, 211, 153, 0.35);
+        max-width: 100%;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
       .jcdp-badge-piece {
         background: rgba(138, 180, 248, 0.15);
@@ -4379,15 +4383,6 @@
         white-space: pre-wrap;
         word-break: break-word;
         line-height: 1.5;
-      }
-      .jcdp-kv-row {
-        margin-bottom: 5px;
-        word-break: break-word;
-      }
-      .jcdp-kv-label {
-        font-weight: 600;
-        color: var(--muted-foreground, #9aa0a6);
-        margin-right: 4px;
       }
       .jcdp-links-row {
         display: flex;
@@ -10700,10 +10695,11 @@
     if (statusText) {
       html += `<span class="jcdp-badge">${escapeHtml(statusText)}</span>`;
     }
+    // Show roadmap item ID and text inline so the task is readable without hovering
     if (roadmapId) {
       const rmTitle = roadmapText ? `${roadmapId}: ${roadmapText}` : roadmapId;
       html += '<span class="jcdp-badge jcdp-badge-roadmap" ' +
-        `title="${escapeHtml(rmTitle)}">${escapeHtml(roadmapId)}</span>`;
+        `title="${escapeHtml(rmTitle)}">${escapeHtml(rmTitle)}</span>`;
     }
     html += '</div>';
 
@@ -10727,29 +10723,6 @@
     }
     html += '<div class="jcdp-tldr-box" data-testid="jetski-dossier-tldr">' +
       `${escapeHtml(tldrDisplay)}</div></div>`;
-
-    if (goal || nextStep || roadmapText) {
-      html +=
-        '<div class="jcdp-section">' +
-        '<div class="jcdp-section-title">📋 \u0426\u0435\u043b\u044c \u0438 ' +
-        '\u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0438\u0439 ' +
-        '\u0448\u0430\u0433</div>';
-      if (goal || roadmapText) {
-        html +=
-          '<div class="jcdp-kv-row">' +
-          '<span class="jcdp-kv-label">\u0426\u0435\u043b\u044c:</span>' +
-          `<span>${escapeHtml(goal || roadmapText)}</span></div>`;
-      }
-      if (nextStep) {
-        html +=
-          '<div class="jcdp-kv-row">' +
-          '<span class="jcdp-kv-label">' +
-          '\u0421\u043b\u0435\u0434\u0443\u044e\u0449\u0438\u0439 ' +
-          '\u0448\u0430\u0433:</span>' +
-          `<span>${escapeHtml(nextStep)}</span></div>`;
-      }
-      html += '</div>';
-    }
 
     if (clLinks.length > 0 || modifiedFiles.length > 0) {
       html +=
