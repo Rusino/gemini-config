@@ -927,7 +927,7 @@
     }
     if (dossierIndexInFlight) return dossierIndexInFlight;
     if (typeof window.fetch !== 'function') {
-      return dossierIndexCache || { conversations: {} };
+      return dossierIndexCache || { items: {}, summaries: {}, conversations: {} };
     }
     const execute = async () => {
       try {
@@ -937,8 +937,12 @@
         if (resp && resp.ok) {
           const data = await resp.json();
           if (data && typeof data === 'object') {
+            const itemsMap = data.items || data.conversations || {};
+            const summariesMap = data.summaries || {};
             dossierIndexCache = {
-              conversations: data.conversations || {},
+              items: itemsMap,
+              summaries: summariesMap,
+              conversations: itemsMap,
             };
             dossierIndexFetchedAt = now;
             return dossierIndexCache;
@@ -949,7 +953,7 @@
       }
       dossierIndexFetchedAt = now;
       if (!dossierIndexCache) {
-        dossierIndexCache = { conversations: {} };
+        dossierIndexCache = { items: {}, summaries: {}, conversations: {} };
       }
       return dossierIndexCache;
     };
@@ -10191,6 +10195,23 @@
     const modifiedFiles = new Set();
     let lastAssistantText = '';
 
+    const addModifiedPath = (rawPath) => {
+      if (!rawPath || typeof rawPath !== 'string') return;
+      const p = rawPath.replace(/^file:\/\//, '');
+      if (
+        p.includes('/brain/') ||
+        p.includes('/.gemini/config/roadmaps/') ||
+        p.includes('/.gemini/config/logs/') ||
+        p.includes('/.gemini/config/projects/') ||
+        p.includes('/tmp/jetski_') ||
+        p.includes('/tmp/handoff_summary')
+      ) {
+        return;
+      }
+      const base = p.split('/').filter(Boolean).pop();
+      if (base) modifiedFiles.add(base);
+    };
+
     const steps = Array.isArray(stepsOrTraj)
       ? stepsOrTraj
       : Array.isArray(stepsOrTraj?.trajectory?.steps)
@@ -10209,15 +10230,17 @@
             ? step.userInput.userResponse
             : typeof step.userInput?.content === 'string'
               ? step.userInput.content
-              : typeof step.cortexStep?.userInput?.content === 'string'
-                ? step.cortexStep.userInput.content
-                : typeof step.plannerResponse?.modifiedResponse === 'string'
-                  ? step.plannerResponse.modifiedResponse
-                  : typeof step.plannerResponse?.response === 'string'
-                    ? step.plannerResponse.response
-                    : typeof step.cortexStep?.plannerResponse?.content === 'string'
-                      ? step.cortexStep.plannerResponse.content
-                      : '';
+              : Array.isArray(step.userInput?.items)
+                ? step.userInput.items.map((x) => x?.text || '').join('')
+                : typeof step.cortexStep?.userInput?.content === 'string'
+                  ? step.cortexStep.userInput.content
+                  : typeof step.plannerResponse?.modifiedResponse === 'string'
+                    ? step.plannerResponse.modifiedResponse
+                    : typeof step.plannerResponse?.response === 'string'
+                      ? step.plannerResponse.response
+                      : typeof step.cortexStep?.plannerResponse?.content === 'string'
+                        ? step.cortexStep.plannerResponse.content
+                        : '';
 
       const isUser =
         type.includes('USER_INPUT') ||
@@ -10233,12 +10256,24 @@
         Boolean(step.plannerResponse);
 
       if (isUser && content) {
-        const clean = content.trim();
-        if (
-          clean &&
-          !clean.startsWith('[CONTEXT GUARD') &&
-          !clean.startsWith('Continuing unfinished')
-        ) {
+        let clean = content
+          .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, '')
+          .replace(/^<USER_REQUEST>[\s\r\n]*/i, '')
+          .replace(/[\s\r\n]*<\/USER_REQUEST>$/i, '')
+          .trim();
+        const contRe = new RegExp(
+          '^(?:continuing\\s+unfinished\\s+work\\s+from\\s+previous\\s+conversation[^\\n]*|' +
+            'continuing\\s+conversation:[^\\n]*|\\[handoff[^\\n]*)\\n*',
+          'i'
+        );
+        clean = clean
+          .replace(contRe, '')
+          .replace(
+            /\n*This prompt is auto-generated and does not set the chat language[^\n]*$/i,
+            ''
+          )
+          .trim();
+        if (clean && !clean.startsWith('[CONTEXT GUARD')) {
           userPrompts.push(clean.length > 280 ? `${clean.slice(0, 277)}...` : clean);
         }
       }
@@ -10270,13 +10305,20 @@
             }
             if (argsObj && typeof argsObj === 'object') {
               const p = argsObj.Path || argsObj.path || argsObj.file_path || '';
-              if (typeof p === 'string' && p) {
-                const base = p.split('/').filter(Boolean).pop();
-                if (base) modifiedFiles.add(base);
-              }
+              addModifiedPath(p);
             }
           }
         }
+      }
+
+      const ca = step.codeAction || step.cortexStep?.codeAction;
+      if (ca) {
+        const p =
+          ca.actionResult?.edit?.absoluteUri ||
+          ca.actionSpec?.command?.file?.absoluteUri ||
+          ca.actionSpec?.createFile?.path?.absoluteUri ||
+          '';
+        addModifiedPath(p);
       }
 
       const textToScan = `${content} ${JSON.stringify(toolCalls || '')}`;
@@ -10316,37 +10358,36 @@
           '/exa.language_server_pb.LanguageServerService/GetModelResponse'
         );
         const promptLines = [
-          '\\u0421\\u0434\\u0435\\u043b\\u0430\\u0439 ' +
-            '\\u043b\\u0430\\u043a\\u043e\\u043d\\u0438\\u0447\\u043d\\u0443\\u044e ' +
-            '\\u0432\\u044b\\u0436\\u0438\\u043c\\u043a\\u0443 ' +
-            '\\u0442\\u0435\\u043a\\u0443\\u0449\\u0435\\u0433\\u043e ' +
-            '\\u043a\\u043e\\u043d\\u0442\\u0435\\u043a\\u0441\\u0442\\u0430 \\u0438 ' +
-            '\\u043f\\u0440\\u043e\\u0433\\u0440\\u0435\\u0441\\u0441\\u0430 ' +
-            '\\u043f\\u043e \\u0437\\u0430\\u0434\\u0430\\u0447\\u0435 ' +
-            '\\u0447\\u0430\\u0442\\u0430 \\u0432 \\u0442\\u0440\\u0435\\u0445 ' +
-            '\\u043f\\u0443\\u043d\\u043a\\u0442\\u0430\\u0445 ' +
-            '\\u0441\\u0442\\u0440\\u043e\\u0433\\u043e \\u043d\\u0430 ' +
-            '\\u0440\\u0443\\u0441\\u0441\\u043a\\u043e\\u043c ' +
-            '\\u044f\\u0437\\u044b\\u043a\\u0435:',
-          '\\u2022 \\u0417\\u0430\\u0434\\u0430\\u0447\\u0430: ' +
-            '<\\u0441\\u0443\\u0442\\u044c ' +
-            '\\u0437\\u0430\\u0434\\u0430\\u0447\\u0438 \\u0432 1 ' +
-            '\\u043f\\u0440\\u0435\\u0434\\u043b\\u043e\\u0436\\u0435\\u043d\\u0438\\u0435>',
-          '\\u2022 \\u0427\\u0442\\u043e ' +
-            '\\u0441\\u0434\\u0435\\u043b\\u0430\\u043b\\u0438: ' +
-            '<\\u043a\\u043b\\u044e\\u0447\\u0435\\u0432\\u043e\\u0439 ' +
-            '\\u043f\\u0440\\u043e\\u0433\\u0440\\u0435\\u0441\\u0441 \\u0432 1 ' +
-            '\\u043f\\u0440\\u0435\\u0434\\u043b\\u043e\\u0436\\u0435\\u043d\\u0438\\u0435>',
-          '\\u2022 \\u0413\\u0434\\u0435 ' +
-            '\\u043e\\u0441\\u0442\\u0430\\u043d\\u043e\\u0432\\u0438\\u043b\\u0438\\u0441\\u044c: '
-            +
-            '<\\u0442\\u0435\\u043a\\u0443\\u0449\\u0435\\u0435 ' +
-            '\\u0441\\u043e\\u0441\\u0442\\u043e\\u044f\\u043d\\u0438\\u0435 \\u0438 ' +
-            '\\u0441\\u043b\\u0435\\u0434\\u0443\\u044e\\u0449\\u0438\\u0439 ' +
-            '\\u0448\\u0430\\u0433 \\u0432 1 ' +
-            '\\u043f\\u0440\\u0435\\u0434\\u043b\\u043e\\u0436\\u0435\\u043d\\u0438\\u0435>',
+          '\u0421\u0434\u0435\u043b\u0430\u0439 ' +
+            '\u043b\u0430\u043a\u043e\u043d\u0438\u0447\u043d\u0443\u044e ' +
+            '\u0432\u044b\u0436\u0438\u043c\u043a\u0443 ' +
+            '\u0442\u0435\u043a\u0443\u0449\u0435\u0433\u043e ' +
+            '\u043a\u043e\u043d\u0442\u0435\u043a\u0441\u0442\u0430 \u0438 ' +
+            '\u043f\u0440\u043e\u0433\u0440\u0435\u0441\u0441\u0430 ' +
+            '\u043f\u043e \u0437\u0430\u0434\u0430\u0447\u0435 ' +
+            '\u0447\u0430\u0442\u0430 \u0432 \u0442\u0440\u0435\u0445 ' +
+            '\u043f\u0443\u043d\u043a\u0442\u0430\u0445 ' +
+            '\u0441\u0442\u0440\u043e\u0433\u043e \u043d\u0430 ' +
+            '\u0440\u0443\u0441\u0441\u043a\u043e\u043c ' +
+            '\u044f\u0437\u044b\u043a\u0435:',
+          '\u2022 \u0417\u0430\u0434\u0430\u0447\u0430: ' +
+            '<\u0441\u0443\u0442\u044c ' +
+            '\u0437\u0430\u0434\u0430\u0447\u0438 \u0432 1 ' +
+            '\u043f\u0440\u0435\u0434\u043b\u043e\u0436\u0435\u043d\u0438\u0435>',
+          '\u2022 \u0427\u0442\u043e ' +
+            '\u0441\u0434\u0435\u043b\u0430\u043b\u0438: ' +
+            '<\u043a\u043b\u044e\u0447\u0435\u0432\u043e\u0439 ' +
+            '\u043f\u0440\u043e\u0433\u0440\u0435\u0441\u0441 \u0432 1 ' +
+            '\u043f\u0440\u0435\u0434\u043b\u043e\u0436\u0435\u043d\u0438\u0435>',
+          '\u2022 \u0413\u0434\u0435 ' +
+            '\u043e\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u043b\u0438\u0441\u044c: ' +
+            '<\u0442\u0435\u043a\u0443\u0449\u0435\u0435 ' +
+            '\u0441\u043e\u0441\u0442\u043e\u044f\u043d\u0438\u0435 \u0438 ' +
+            '\u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0438\u0439 ' +
+            '\u0448\u0430\u0433 \u0432 1 ' +
+            '\u043f\u0440\u0435\u0434\u043b\u043e\u0436\u0435\u043d\u0438\u0435>',
           '',
-          '\\u041a\\u043e\\u043d\\u0442\\u0435\\u043a\\u0441\\u0442:',
+          '\u041a\u043e\u043d\u0442\u0435\u043a\u0441\u0442:',
           `Chat title: ${contextSnapshot.title || ''}`,
           contextSnapshot.goal ? `Goal: ${contextSnapshot.goal}` : '',
           contextSnapshot.nextStep ? `Next step: ${contextSnapshot.nextStep}` : '',
@@ -10367,14 +10408,7 @@
         if (csrf) headers['x-codeium-csrf-token'] = csrf;
 
         const body = JSON.stringify({
-          chat_message: {
-            intent: {
-              mode: 'INTENT_MODE_CHAT',
-              chat: {
-                message: promptLines,
-              },
-            },
-          },
+          prompt: promptLines,
           model: 'MODEL_GOOGLE_GEMINI_2_5_FLASH',
         });
 
@@ -10386,6 +10420,7 @@
         if (resp && resp.ok) {
           const data = await resp.json();
           const tldr =
+            (typeof data?.response === 'string' && data.response.trim()) ||
             (typeof data?.text === 'string' && data.text.trim()) ||
             (typeof data?.chatMessage?.intent?.chat?.message === 'string' &&
               data.chatMessage.intent.chat.message.trim()) ||
@@ -10483,26 +10518,26 @@
 
     let html =
       '<div class="jcdp-header">' +
-      '<span class="jcdp-header-title">💡 \\u041f\\u0430\\u043c\\u044f\\u0442\\u043a\\u0430 ' +
-      '\\u043f\\u043e \\u0447\\u0430\\u0442\\u0443</span>' +
+      '<span class="jcdp-header-title">💡 \u041f\u0430\u043c\u044f\u0442\u043a\u0430 ' +
+      '\u043f\u043e \u0447\u0430\u0442\u0443</span>' +
       '<div class="jcdp-header-actions">' +
       '<button type="button" class="jcdp-icon-btn jcdp-refresh-btn" ' +
       'data-testid="jetski-dossier-refresh-btn" ' +
-      'title="\\u041e\\u0431\\u043d\\u043e\\u0432\\u0438\\u0442\\u044c ' +
-      '\\u0432\\u044b\\u0436\\u0438\\u043c\\u043a\\u0443">🔄</button>';
+      'title="\u041e\u0431\u043d\u043e\u0432\u0438\u0442\u044c ' +
+      '\u0432\u044b\u0436\u0438\u043c\u043a\u0443">🔄</button>';
 
     if (!isCurrentActive) {
       html +=
         '<button type="button" class="jcdp-icon-btn jcdp-open-chat-btn" ' +
         'data-testid="jetski-dossier-open-chat-btn" ' +
-        'title="\\u041e\\u0442\\u043a\\u0440\\u044b\\u0442\\u044c ' +
-        '\\u044d\\u0442\\u043e\\u0442 \\u0447\\u0430\\u0442">📂</button>';
+        'title="\u041e\u0442\u043a\u0440\u044b\u0442\u044c ' +
+        '\u044d\u0442\u043e\u0442 \u0447\u0430\u0442">📂</button>';
     }
 
     html +=
       '<button type="button" class="jcdp-icon-btn jcdp-close-btn" ' +
       'data-testid="jetski-dossier-close-btn" ' +
-      'title="\\u0417\\u0430\\u043a\\u0440\\u044b\\u0442\\u044c">✕</button>' +
+      'title="\u0417\u0430\u043a\u0440\u044b\u0442\u044c">✕</button>' +
       '</div></div>';
 
     html += `<div class="jcdp-chat-title">${escapeHtml(title)}</div>`;
@@ -10524,18 +10559,20 @@
     html +=
       '<div class="jcdp-section">' +
       '<div class="jcdp-section-title">🤖 ' +
-      '\\u0412\\u044b\\u0436\\u0438\\u043c\\u043a\\u0430 (TL;DR)</div>';
+      '\u0412\u044b\u0436\u0438\u043c\u043a\u0430 (TL;DR)</div>';
 
     let tldrDisplay = tldr;
     if (!tldrDisplay) {
       const gText = goal || roadmapText || title;
-      const nText = nextStep || 'Waiting for user input';
+      const doneText = modifiedFiles.length
+        ? `\u0424\u0430\u0439\u043b\u044b: ${modifiedFiles.slice(0, 4).join(', ')}`
+        : `${userPrompts.length} \u0437\u0430\u043f\u0440. \u0432 \u0447\u0430\u0442\u0435`;
+      const nText = nextStep || statusText || 'Waiting for user input';
       tldrDisplay =
-        `\\u2022 \\u0417\\u0430\\u0434\\u0430\\u0447\\u0430: ${gText}\n` +
-        '\\u2022 \\u0427\\u0442\\u043e \\u0441\\u0434\\u0435\\u043b\\u0430\\u043b\\u0438: ' +
-        `${userPrompts.length} turns in conversation\n` +
-        '\\u2022 \\u0413\\u0434\\u0435 \\u043e\\u0441\\u0442\\u0430\\u043d\\u043e\\u0432' +
-        `\\u0438\\u043b\\u0438\\u0441\\u044c: ${nText}`;
+        `\u2022 \u0417\u0430\u0434\u0430\u0447\u0430: ${gText}\n` +
+        `\u2022 \u0427\u0442\u043e \u0441\u0434\u0435\u043b\u0430\u043b\u0438: ${doneText}\n` +
+        '\u2022 \u0413\u0434\u0435 \u043e\u0441\u0442\u0430\u043d\u043e\u0432' +
+        `\u0438\u043b\u0438\u0441\u044c: ${nText}`;
     }
     html += '<div class="jcdp-tldr-box" data-testid="jetski-dossier-tldr">' +
       `${escapeHtml(tldrDisplay)}</div></div>`;
@@ -10543,21 +10580,21 @@
     if (goal || nextStep || roadmapText) {
       html +=
         '<div class="jcdp-section">' +
-        '<div class="jcdp-section-title">📋 \\u0426\\u0435\\u043b\\u044c \\u0438 ' +
-        '\\u0441\\u043b\\u0435\\u0434\\u0443\\u044e\\u0449\\u0438\\u0439 ' +
-        '\\u0448\\u0430\\u0433</div>';
+        '<div class="jcdp-section-title">📋 \u0426\u0435\u043b\u044c \u0438 ' +
+        '\u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0438\u0439 ' +
+        '\u0448\u0430\u0433</div>';
       if (goal || roadmapText) {
         html +=
           '<div class="jcdp-kv-row">' +
-          '<span class="jcdp-kv-label">\\u0426\\u0435\\u043b\\u044c:</span>' +
+          '<span class="jcdp-kv-label">\u0426\u0435\u043b\u044c:</span>' +
           `<span>${escapeHtml(goal || roadmapText)}</span></div>`;
       }
       if (nextStep) {
         html +=
           '<div class="jcdp-kv-row">' +
           '<span class="jcdp-kv-label">' +
-          '\\u0421\\u043b\\u0435\\u0434\\u0443\\u044e\\u0449\\u0438\\u0439 ' +
-          '\\u0448\\u0430\\u0433:</span>' +
+          '\u0421\u043b\u0435\u0434\u0443\u044e\u0449\u0438\u0439 ' +
+          '\u0448\u0430\u0433:</span>' +
           `<span>${escapeHtml(nextStep)}</span></div>`;
       }
       html += '</div>';
@@ -10566,12 +10603,15 @@
     if (clLinks.length > 0 || modifiedFiles.length > 0) {
       html +=
         '<div class="jcdp-section">' +
-        '<div class="jcdp-section-title">🔗 \\u0421\\u0441\\u044b\\u043b\\u043a\\u0438 \\u0438 ' +
-        '\\u0444\\u0430\\u0439\\u043b\\u044b</div>';
+        '<div class="jcdp-section-title">🔗 \u0421\u0441\u044b\u043b\u043a\u0438 \u0438 ' +
+        '\u0444\u0430\u0439\u043b\u044b</div>';
       if (clLinks.length > 0) {
         html += '<div class="jcdp-links-row" style="margin-bottom:6px">';
-        for (const u of clLinks) {
-          const label = u.split('/').pop() || u;
+        for (const item of clLinks) {
+          const u = typeof item === 'string' ? item : item?.url || '';
+          if (!u) continue;
+          const label =
+            (typeof item === 'object' && item?.label) || u.split('/').pop() || u;
           html += `<a href="${escapeHtml(u)}" target="_blank" rel="noopener noreferrer" ` +
             `class="jcdp-link">${escapeHtml(label)}</a>`;
         }
@@ -10590,8 +10630,8 @@
     if (userPrompts.length > 0 || lastAssistantText) {
       html +=
         '<div class="jcdp-section">' +
-        `<div class="jcdp-section-title">💬 \\u0417\\u0430\\u043f\\u0440\\u043e\\u0441\\u044b ` +
-        `\\u0432 \\u0447\\u0430\\u0442\\u0435 (${userPrompts.length})</div>`;
+        `<div class="jcdp-section-title">💬 \u0417\u0430\u043f\u0440\u043e\u0441\u044b ` +
+        `\u0432 \u0447\u0430\u0442\u0435 (${userPrompts.length})</div>`;
       if (userPrompts.length > 0) {
         html += '<ol class="jcdp-prompts-list">';
         for (const p of userPrompts) {
@@ -10602,9 +10642,9 @@
       if (lastAssistantText) {
         html +=
           '<details class="jcdp-details">' +
-          '<summary>\\u041f\\u043e\\u0441\\u043b\\u0435\\u0434\\u043d\\u0438\\u0439 ' +
-          '\\u043e\\u0442\\u0432\\u0435\\u0442 ' +
-          '\\u0430\\u0441\\u0441\\u0438\\u0441\\u0442\\u0435\\u043d\\u0442\\u0430</summary>' +
+          '<summary>\u041f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0439 ' +
+          '\u043e\u0442\u0432\u0435\u0442 ' +
+          '\u0430\u0441\u0441\u0438\u0441\u0442\u0435\u043d\u0442\u0430</summary>' +
           `<div class="jcdp-details-content">${escapeHtml(lastAssistantText)}</div>` +
           '</details>';
       }
@@ -10653,8 +10693,9 @@
       '';
     const isCurrentActive = cascadeId === curActiveCid;
 
-    // Piece navigation
+    // Piece navigation & chain resolution
     let pieceText = '';
+    const chain = [cascadeId];
     if (chainIndexCache?.parentOf) {
       const parentOf = chainIndexCache.parentOf;
       const createdAt = chainIndexCache.createdAt || {};
@@ -10662,7 +10703,6 @@
       for (const [child, parent] of Object.entries(parentOf)) {
         (childrenOf[parent] = childrenOf[parent] || []).push(child);
       }
-      const chain = [cascadeId];
       const seen = new Set(chain);
       for (let cur = parentOf[cascadeId]; cur && !seen.has(cur); cur = parentOf[cur]) {
         seen.add(cur);
@@ -10705,15 +10745,63 @@
       statusText = 'Needs you';
     }
 
-    // Facts from pre-warmed dossier index and local summaries
-    const dossierEntry = dossierIndexCache?.conversations?.[cascadeId] || {};
+    // Auto-fetch dossier index if missing or stale
+    if (
+      !dossierIndexCache ||
+      (!options._internalUpdate && Date.now() - dossierIndexFetchedAt >= DOSSIER_INDEX_TTL_MS)
+    ) {
+      void fetchDossierIndex().then((idx) => {
+        if (activeDossierCascadeId === cascadeId && idx) {
+          openDossierPopover(cascadeId, anchorEl, { ...options, _internalUpdate: true });
+        }
+      });
+    }
+
+    // Candidate lookup keys across the chain
+    const candIds = [
+      cascadeId,
+      ...([...chain].reverse().filter((id) => id !== cascadeId)),
+    ];
+    const itemsMap = dossierIndexCache?.items || dossierIndexCache?.conversations || {};
+    const summariesIdx = dossierIndexCache?.summaries || {};
+
+    let dossierEntry = {};
+    for (const cid of candIds) {
+      const e = itemsMap[cid] || (cid.length > 8 ? itemsMap[cid.slice(0, 8)] : null);
+      if (
+        e &&
+        (e.goal || e.nextStep || e.roadmapItem || e.cls?.length || e.modifiedFiles?.length)
+      ) {
+        dossierEntry = e;
+        break;
+      }
+    }
+    if (!dossierEntry.goal && !dossierEntry.roadmapItem) {
+      dossierEntry = itemsMap[cascadeId] || itemsMap[cascadeId.slice(0, 8)] || {};
+    }
+
+    let summaryEntry = {};
+    for (const cid of candIds) {
+      const s = summariesIdx[cid] || (cid.length > 8 ? summariesIdx[cid.slice(0, 8)] : null);
+      if (s?.tldr) {
+        summaryEntry = s;
+        break;
+      }
+    }
+
     const localEntry = loadLocalDossierSummaries()[cascadeId] || {};
 
+    const rmItem = dossierEntry.roadmapItem || {};
     const goal = dossierEntry.goal || options.goal || '';
     const nextStep = dossierEntry.nextStep || options.nextStep || '';
-    const roadmapId = dossierEntry.roadmapId || options.roadmapId || '';
-    const roadmapText = dossierEntry.roadmapText || options.roadmapText || '';
-    let tldr = localEntry.tldr || dossierEntry.tldr || options.tldr || '';
+    const roadmapId = rmItem.id || dossierEntry.roadmapId || options.roadmapId || '';
+    const roadmapText = rmItem.text || dossierEntry.roadmapText || options.roadmapText || '';
+    let tldr =
+      localEntry.tldr ||
+      summaryEntry.tldr ||
+      dossierEntry.tldr ||
+      options.tldr ||
+      '';
 
     // Facts from trajectory steps if cached
     const cachedEntry = singleTrajCache.get(cascadeId);
@@ -10737,10 +10825,14 @@
       });
     }
 
-    const clLinks = dossierEntry.clLinks?.length ? dossierEntry.clLinks : trajFacts.clLinks;
-    const modifiedFiles = dossierEntry.modifiedFiles?.length
-      ? dossierEntry.modifiedFiles
-      : trajFacts.modifiedFiles;
+    const rawClLinks = dossierEntry.cls?.length
+      ? dossierEntry.cls
+      : dossierEntry.clLinks?.length
+        ? dossierEntry.clLinks
+        : trajFacts.clLinks;
+    const combinedFiles = [
+      ...new Set([...(dossierEntry.modifiedFiles || []), ...(trajFacts.modifiedFiles || [])]),
+    ].slice(0, 8);
 
     const facts = {
       title: cleanTitle,
@@ -10753,8 +10845,8 @@
       nextStep,
       tldr,
       userPrompts: trajFacts.userPrompts,
-      clLinks,
-      modifiedFiles,
+      clLinks: rawClLinks,
+      modifiedFiles: combinedFiles,
       lastAssistantText: trajFacts.lastAssistantText,
       isCurrentActive,
     };
@@ -10788,8 +10880,8 @@
         const tldrBox = popover.querySelector('.jcdp-tldr-box');
         if (tldrBox) {
           tldrBox.textContent =
-            '\\u0413\\u0435\\u043d\\u0435\\u0440\\u0430\\u0446\\u0438\\u044f ' +
-            '\\u0432\\u044b\\u0436\\u0438\\u043c\\u043a\\u0438...';
+            '\u0413\u0435\u043d\u0435\u0440\u0430\u0446\u0438\u044f ' +
+            '\u0432\u044b\u0436\u0438\u043c\u043a\u0438...';
         }
         const freshTldr = await generateOutOfBandDossierTldr(cascadeId, {
           title: cleanTitle,

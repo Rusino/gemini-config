@@ -703,6 +703,43 @@ global.window = {
       });
       return { ok: true, status: 200 };
     }
+    if (String(url).includes('GetModelResponse')) {
+      const parsedBody = JSON.parse(opts?.body || '{}');
+      rpcRequests.push({
+        url: String(url),
+        headers: opts?.headers || {},
+        body: parsedBody,
+      });
+      return {
+        ok: true,
+        json: async () => ({
+          response: '• Задача: Тест\n• Что сделали: Проверка\n• Где остановились: Финал',
+        }),
+      };
+    }
+    if (String(url).includes('jetski-dossiers.json')) {
+      return {
+        ok: true,
+        json: async () => ({
+          version: 1,
+          items: {
+            'open-current': {
+              projectId: 'proj-1',
+              goal: 'Fix context reminder',
+              nextStep: 'Run test',
+              roadmapItem: { id: 'R99', text: 'Chat Context Reminder', status: 'doing' },
+              cls: [{ url: 'https://github.com/foo/bar', label: 'PR #123' }],
+              modifiedFiles: ['jetski_closed_filter.js'],
+            },
+          },
+          summaries: {
+            'open-current': {
+              tldr: '• Задача: Памятка\n• Что сделали: Фикс\n• Где остановились: Тесты',
+            },
+          },
+        }),
+      };
+    }
     if (String(url).endsWith('.mp3')) {
       soundFetches.push(String(url));
       return { ok: true, status: 200 };
@@ -1028,6 +1065,18 @@ const liveBucketBtn = (k) =>
   const openPopover = bodyEl.querySelector('#jetski-chat-dossier-popover');
   assert(openPopover, 'Clicking Reminder button must open Context Dossier popover');
   assert.strictEqual(openPopover.getAttribute('data-visible'), 'true');
+  assert(
+    openPopover.innerHTML.includes('💡 Памятка по чату'),
+    'Popover must contain real Cyrillic text'
+  );
+  assert(
+    openPopover.innerHTML.includes('🤖 Выжимка (TL;DR)'),
+    'Popover must contain Cyrillic section header'
+  );
+  assert(
+    !openPopover.innerHTML.includes('\\u04') && !openPopover.innerHTML.includes('\\U04'),
+    'Popover must not contain unescaped \\u04 sequences'
+  );
   advanceClock();
   titlebarReminderBtn.dispatchEvent('pointerdown', { button: 0 });
   assert.strictEqual(
@@ -1044,11 +1093,61 @@ const liveBucketBtn = (k) =>
       content: 'I will modify the file',
       toolCalls: [{ name: 'edit_file', args: { Path: '/path/to/foo.cpp' } }],
     },
+    {
+      type: 'CORTEX_STEP_TYPE_USER_INPUT',
+      content:
+        '<USER_REQUEST>\n' +
+        'Continuing unfinished work from previous conversation (conversation://cid-1).\n' +
+        'Next immediate task: Fix dossier\n\n' +
+        'This prompt is auto-generated and does not set the chat language\n' +
+        '</USER_REQUEST>',
+    },
+    {
+      type: 'CORTEX_STEP_TYPE_CODE_ACTION',
+      codeAction: {
+        actionResult: { edit: { absoluteUri: 'file:///repo/bar.js' } },
+      },
+    },
+    {
+      type: 'CORTEX_STEP_TYPE_CODE_ACTION',
+      codeAction: {
+        actionResult: {
+          edit: {
+            absoluteUri:
+              'file:///usr/local/google/home/jlavrova/.gemini/config/roadmaps/p1/state/c1.md',
+          },
+        },
+      },
+    },
   ];
   const extractedFacts = window.__jetskiDossier.extractTrajectoryDossierFacts(sampleSteps);
-  assert.deepStrictEqual(extractedFacts.userPrompts, ['Check https://github.com/foo/bar']);
-  assert.deepStrictEqual(extractedFacts.modifiedFiles, ['foo.cpp']);
+  assert.deepStrictEqual(extractedFacts.userPrompts, [
+    'Check https://github.com/foo/bar',
+    'Next immediate task: Fix dossier',
+  ]);
+  assert(
+    extractedFacts.modifiedFiles.includes('foo.cpp') &&
+      extractedFacts.modifiedFiles.includes('bar.js'),
+    'modifiedFiles must include foo.cpp and bar.js'
+  );
+  assert(
+    !extractedFacts.modifiedFiles.includes('c1.md'),
+    'Internal state files must be excluded from modifiedFiles'
+  );
   assert.deepStrictEqual(extractedFacts.clLinks, ['https://github.com/foo/bar']);
+
+  // Verify generateOutOfBandDossierTldr RPC format
+  rpcRequests.length = 0;
+  const genTldr = await window.__jetskiDossier.generateOutOfBandDossierTldr('open-current', {
+    title: 'Test Chat',
+    goal: 'Test Goal',
+    nextStep: 'Test Step',
+    prompts: ['Prompt 1'],
+  });
+  assert(genTldr.includes('Задача: Тест'), 'Generated TL;DR must return response text');
+  assert.strictEqual(rpcRequests.length, 1);
+  assert.strictEqual(rpcRequests[0].body.model, 'MODEL_GOOGLE_GEMINI_2_5_FLASH');
+  assert(typeof rpcRequests[0].body.prompt === 'string', 'RPC prompt must be a string');
 
   // The titlebar Archive button on a chain tail archives only that chat: no chain walk, no
   // retitling of the already archived pieces
