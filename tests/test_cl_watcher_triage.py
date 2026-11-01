@@ -169,6 +169,84 @@ LGTM pending corpus gate.
     self.assertFalse(is_arch)
     self.assertEqual(comp_to, "")
 
+  def test_companion_attached_to_external_cl_does_not_leak_chat_to_stack_siblings(self):
+    active_discovered = [
+        {
+            "item_key": "gerrit:1412380",
+            "kind": "gerrit",
+            "target_id": "1412380",
+            "conversation_id": "chat-1412380",
+            "title": "Review CL 1412380",
+            "single_target": True,
+            "chat_busy": True,
+            "chat_archived": False,
+        },
+        {
+            "item_key": "gerrit:1412417",
+            "kind": "gerrit",
+            "target_id": "1412417",
+            "conversation_id": "",
+            "title": "Companion tests",
+            "single_target": True,
+            "chat_busy": False,
+            "chat_archived": False,
+        },
+        {
+            "item_key": "gerrit:1412376",
+            "kind": "gerrit",
+            "target_id": "1412376",
+            "conversation_id": "",
+            "title": "Derive the half letter spacing",
+            "single_target": True,
+            "chat_busy": False,
+            "chat_archived": False,
+        },
+    ]
+    fetched_cache = {
+        "gerrit:1412380": {
+            "is_self": False,
+            "status": "NEW",
+            "subject": "External change in stack",
+        },
+        "gerrit:1412417": {
+            "is_self": True,
+            "status": "NEW",
+            "subject": "WIP: companion tests",
+            "commit_message": (
+                "Companion tests for https://skia-review.googlesource.com/c/skia/+/1412380\n"
+            ),
+        },
+        "gerrit:1412376": {
+            "is_self": False,
+            "status": "NEW",
+            "subject": "Derive the half letter spacing",
+        },
+    }
+    from unittest import mock
+    with mock.patch.object(
+        w,
+        "fetch_gerrit_related_cl_ids",
+        return_value=["1412380", "1412417", "1412376"],
+    ):
+      w.link_companion_changes_to_parent_chats(active_discovered, fetched_cache)
+
+    parent_rec = next(d for d in active_discovered if d["item_key"] == "gerrit:1412380")
+    comp_rec = next(d for d in active_discovered if d["item_key"] == "gerrit:1412417")
+    sibling_rec = next(d for d in active_discovered if d["item_key"] == "gerrit:1412376")
+
+    # Companion is linked to parent review chat
+    self.assertEqual(comp_rec.get("companion_to"), "gerrit:1412380")
+    self.assertTrue(comp_rec.get("is_companion"))
+    self.assertEqual(comp_rec.get("conversation_id"), "chat-1412380")
+    self.assertTrue(comp_rec.get("chat_busy"))
+
+    # Parent retains single_target so stack siblings never inherit its chat
+    self.assertTrue(parent_rec.get("single_target"))
+
+    # Stack sibling remains unchatted and not busy
+    self.assertEqual(sibling_rec.get("conversation_id"), "")
+    self.assertFalse(sibling_rec.get("chat_busy"))
+
   def test_save_and_load_audit_preserves_audit_over_queue_triage(self):
     audit_data = {
         "target_id": "1409697",

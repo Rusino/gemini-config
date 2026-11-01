@@ -179,11 +179,14 @@ RE_COMPANION_PR_REF = re.compile(
     r"(\d{5,7})\b",
     re.IGNORECASE,
 )
-# Match explicit companion references to Gerrit changes in subjects
+# Match explicit companion references to Gerrit changes in subjects and commit messages
 RE_COMPANION_CL_REF = re.compile(
-    r"(?:companion\s+(?:(?:to|for)\s+)?(?:CL\s*|cl/|crrev(?:\.com)?/c/|skrev(?:\.com)?/)|"
+    r"(?:companion\s+(?:(?:tests?|fix|change|cl)\s+)?(?:(?:to|for)\s+)?"
+    r"(?:CL\s*|cl/|crrev(?:\.com)?/c/|skrev(?:\.com)?/|"
+    r"https?://[a-z0-9.-]+/c/(?:[^/\s]+/)*\+/)|"
     r"(?:hypotheses|hypothesis|check|repro)\s+(?:about|for|on)\s+"
-    r"(?:CL\s*|cl/|crrev(?:\.com)?/c/|skrev(?:\.com)?/))"
+    r"(?:CL\s*|cl/|crrev(?:\.com)?/c/|skrev(?:\.com)?/|"
+    r"https?://[a-z0-9.-]+/c/(?:[^/\s]+/)*\+/))"
     r"(\d{5,8})\b",
     re.IGNORECASE,
 )
@@ -1272,7 +1275,9 @@ def link_companion_changes_to_parent_chats(
           or info.get("host")
           or GERRIT_SKIA_HOST
       )
-      m_cl = RE_COMPANION_CL_REF.search(subj)
+      m_cl = RE_COMPANION_CL_REF.search(subj) or RE_COMPANION_CL_REF.search(
+          str(info.get("commit_message") or "")
+      )
       if m_cl and d_is_self:
         cand_key = f"gerrit:{m_cl.group(1)}"
         parent = known_chats.get(cand_key) or by_item_key.get(cand_key)
@@ -1300,11 +1305,10 @@ def link_companion_changes_to_parent_chats(
           # Prevent cyclic A <-> B companion links
           if cand_parent.get("companion_to") == ikey:
             is_candidate_comp = False
-          # Only inherit a stack sibling's chat for companions, own-author stacks, or multi-target chats
+          # Only inherit a stack sibling's chat for companions or own-author stacks
           can_inherit_stack_chat = (
               is_candidate_comp
               or (d_is_self and rel_is_self)
-              or not cand_parent.get("single_target", True)
           )
           if (
               not d.get("conversation_id")
@@ -1348,7 +1352,9 @@ def link_companion_changes_to_parent_chats(
         d["chat_busy"] = parent.get("chat_busy", False)
         d["chat_archived"] = parent.get("chat_archived", False)
       d["single_target"] = False
-      parent["single_target"] = False
+      # Keep parent single_target intact when attaching a companion to a 1:1 review chat
+      if not is_comp:
+        parent["single_target"] = False
 
     # Propagate SkoreText project across unchatted changes in the same open stack
     if d.get("kind") == "gerrit" and not d.get("conversation_id"):
@@ -4161,7 +4167,8 @@ def _discover_existing_chat_for_item(
         or GERRIT_SKIA_HOST
     )
     subj = str((rec or {}).get("subject") or (rec or {}).get("title") or "")
-    m_cl = RE_COMPANION_CL_REF.search(subj)
+    cmsg = str((rec or {}).get("commit_message") or "")
+    m_cl = RE_COMPANION_CL_REF.search(subj) or RE_COMPANION_CL_REF.search(cmsg)
     if m_cl and rec_is_self:
       parent_keys = [f"gerrit:{m_cl.group(1)}"]
       is_companion_ref = True
@@ -4172,10 +4179,11 @@ def _discover_existing_chat_for_item(
       is_companion_ref = rec_is_self and ("companion" in subj.lower())
   elif by_key and ikey.startswith("github:"):
     subj = str((rec or {}).get("subject") or (rec or {}).get("title") or "")
+    cmsg = str((rec or {}).get("commit_message") or "")
     head_ref = str(
         (rec or {}).get("head_ref") or (rec or {}).get("head_ref_name") or ""
     )
-    m = RE_COMPANION_PR_REF.search(subj)
+    m = RE_COMPANION_PR_REF.search(subj) or RE_COMPANION_PR_REF.search(cmsg)
     branch_m = RE_COMPANION_BRANCH.match(head_ref)
     ref_id = m.group(1) if m else (branch_m.group(1) if branch_m else "")
     if ref_id and rec_is_self:
@@ -4189,7 +4197,6 @@ def _discover_existing_chat_for_item(
       can_inherit_stack_chat = (
           is_cand_comp
           or (rec_is_self and parent_is_self)
-          or not parent.get("single_target", True)
       )
       if not can_inherit_stack_chat:
         continue
@@ -5380,10 +5387,12 @@ def sync_once(
             record["chat_busy"] = bool(prev_fb.get("chat_busy", False))
         prev = prev_fb
     prev = prev or {}
-    if prev.get("review_target_ps"):
-      record["review_target_ps"] = prev["review_target_ps"]
-    if prev.get("reviewed_ps"):
-      record["reviewed_ps"] = prev["reviewed_ps"]
+    # Inherit review target and progress only when the chat identity remains unchanged
+    if cid and prev.get("conversation_id") == cid:
+      if prev.get("review_target_ps"):
+        record["review_target_ps"] = prev["review_target_ps"]
+      if prev.get("reviewed_ps"):
+        record["reviewed_ps"] = prev["reviewed_ps"]
     # Preserve optimistic chat_busy across sync cycles before LS flips the chat to RUNNING
     prev_woken = float(prev.get("chat_woken_ts") or 0.0)
     if (
@@ -5760,6 +5769,8 @@ def sync_once(
       for k, v in rollers.items()
       if k in ("Android", "Chrome", "Google3", "Flutter")
   }
+  # Overlay real-time chat busy states right before saving the snapshot
+  overlay_live_chat_busy(state)
   save_watcher_state(state)
   return state
 
