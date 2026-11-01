@@ -2160,13 +2160,12 @@ class TestChatLifecycle(unittest.TestCase):
     fable_rep = chat_lifecycle.reroute_wasteful_wtu_model(catalog, "MODEL_PLACEHOLDER_M388")
     self.assertEqual(fable_rep["id"], "opus-5.5-medium")
 
-    # Argon WTU -> Orchestrator
+    # Argon and Carbon have their own dedicated 50M WTU pool and are not rerouted away
     argon_rep = chat_lifecycle.reroute_wasteful_wtu_model(catalog, "gemini-launch-candidate-high")
-    self.assertEqual(argon_rep["id"], "gemini-pro-coordinator")
+    self.assertEqual(argon_rep, {})
 
-    # Carbon WTU -> Orchestrator
     carbon_rep = chat_lifecycle.reroute_wasteful_wtu_model(catalog, "gemini-4-carbon-high")
-    self.assertEqual(carbon_rep["id"], "gemini-pro-coordinator")
+    self.assertEqual(carbon_rep, {})
 
   def test_bon_models_strictly_rejected_and_auto_migrated(self):
     self.assertTrue(

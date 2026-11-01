@@ -540,16 +540,19 @@
   const AUTOPILOT_OPTION_MODEL_ID = '__jetski_autopilot__';
   const AUTOPILOT_OPTION_LABEL = 'Auto';
   const AUTOPILOT_OPTION_ENUM = 999999;
-  // Priority ordering for Recommended dropdown: Auto first, followed by strongest models
+  // Priority ordering for Recommended dropdown: Auto first, followed by 4 flagship quota buckets
   const PREFERRED_DROPDOWN_MODEL_ORDER = [
     AUTOPILOT_OPTION_MODEL_ID,
-    // Tier 1: Flagship production models (Opus 5.5, Gemini Pro Orchestrator, Carbon)
+    // Tier 1: Flagship production models across 4 independent quota buckets
     'opus-5.5-high',
     'opus-5.5-medium',
     'opus-5.5-max',
-    'gemini-pro-coordinator',
     'gemini-4-carbon-high',
+    'gemini-4-carbon-medium',
+    'gemini-launch-candidate-high',
+    'gemini-pro-coordinator',
     'auto',
+    'gemini-3.1-pro-high',
     // Tier 2: Secondary models
     'fable-5.1-dropdown',
     // Tier 3: Flash / triage models
@@ -632,24 +635,28 @@
     'breaking chats': 'orchestrator',
   };
 
+  // Fallback chains across the 4 independent flagship quota buckets (Opus, Carbon/Argon, Orchestrator, 3.1 Pro)
   const WEB_MODEL_PROFILES = {
     'cpp-core': [
       'opus-5.5-medium',
       'opus-5.5-high',
       'opus-5.5-max',
-      'gemini-pro-coordinator',
       'gemini-4-carbon-high',
+      'gemini-launch-candidate-high',
+      'gemini-pro-coordinator',
       'auto',
+      'gemini-3.1-pro-high',
     ],
     'orchestrator': [
       'gemini-pro-coordinator',
       'auto',
       'gemini-4-carbon-high',
+      'gemini-launch-candidate-high',
+      'gemini-3.1-pro-high',
       'gemini-flash-next',
       'gemini-3.8-flash-high',
       'gemini-3.8-flash-medium',
       'gemini-2.5-flash',
-      'gemini-3.1-pro-high',
     ],
     'triage': [
       'gemini-flash-next',
@@ -2897,7 +2904,7 @@
     return { byId, byEnum };
   }
 
-  // Reroutes wasteful WTU models to standard Opus 5.5 or Gemini Pro Orchestrator pools
+  // Reroutes Fable 5.1 to Opus 5.5 since both share 3p-wtu-daily at 2.1x higher cost
   function rerouteWastefulWtuModelInUi(catalog, modelKey, minFloor = QUOTA_SOFT_FLOOR) {
     if (!catalog || modelKey === undefined || modelKey === null) return null;
     const entry =
@@ -2908,7 +2915,7 @@
     const enumStr = (entry?.enumName || String(modelKey)).toLowerCase();
     const numVal = entry?.enumVal || (typeof modelKey === 'number' ? modelKey : 0);
 
-    // Fable 5.1 -> Opus 5.5
+    // Fable 5.1 shares 3p-wtu-daily with Opus 5.5 at 2.1x higher WTU per call
     const isFable =
       id === 'fable-5.1-dropdown' ||
       id.startsWith('fable-5.1') ||
@@ -2920,34 +2927,6 @@
       enumStr === 'model_placeholder_m387';
     if (isFable) {
       for (const cand of ['opus-5.5-medium', 'opus-5.5-high', 'opus-5.5-max']) {
-        const hit = catalog.byId.get(cand);
-        if (hit && hit.quota >= minFloor) return hit;
-      }
-    }
-
-    // Gemini 4 Argon WTU -> Gemini Pro Orchestrator / auto
-    const isArgon =
-      id.startsWith('gemini-launch-candidate') ||
-      numVal === 1393 ||
-      (numVal >= 1416 && numVal <= 1418) ||
-      enumStr === 'model_placeholder_m393' ||
-      enumStr === 'model_placeholder_m416' ||
-      enumStr === 'model_placeholder_m417' ||
-      enumStr === 'model_placeholder_m418';
-    if (isArgon) {
-      for (const cand of ['gemini-pro-coordinator', 'auto']) {
-        const hit = catalog.byId.get(cand);
-        if (hit && hit.quota >= minFloor) return hit;
-      }
-    }
-
-    // Gemini 4 Carbon WTU -> Gemini Pro Orchestrator / auto
-    const isCarbon =
-      (id.startsWith('gemini-4-carbon') && !id.includes('-g')) ||
-      (numVal >= 1439 && numVal <= 1442) ||
-      (enumStr >= 'model_placeholder_m439' && enumStr <= 'model_placeholder_m442');
-    if (isCarbon) {
-      for (const cand of ['gemini-pro-coordinator', 'auto']) {
         const hit = catalog.byId.get(cand);
         if (hit && hit.quota >= minFloor) return hit;
       }

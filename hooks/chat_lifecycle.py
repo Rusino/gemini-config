@@ -92,24 +92,28 @@ def is_forbidden_bon_model(model_id: str = "", model_enum: str = "") -> bool:
   return False
 
 
+# Fallback chains across the 4 independent flagship quota buckets (Opus, Carbon/Argon, Orchestrator, 3.1 Pro)
 MODEL_PROFILES: dict[str, list[str]] = {
     "cpp-core": [
         "opus-5.5-medium",
         "opus-5.5-high",
         "opus-5.5-max",
-        "gemini-pro-coordinator",
         "gemini-4-carbon-high",
+        "gemini-launch-candidate-high",
+        "gemini-pro-coordinator",
         "auto",
+        "gemini-3.1-pro-high",
     ],
     "orchestrator": [
         "gemini-pro-coordinator",
         "auto",
         "gemini-4-carbon-high",
+        "gemini-launch-candidate-high",
+        "gemini-3.1-pro-high",
         "gemini-flash-next",
         "gemini-3.8-flash-high",
         "gemini-3.8-flash-medium",
         "gemini-2.5-flash",
-        "gemini-3.1-pro-high",
     ],
     "triage": [
         "gemini-flash-next",
@@ -839,62 +843,22 @@ WASTEFUL_WTU_FABLE_PATTERNS = (
     "model_placeholder_m387",
     "model_placeholder_m388",
 )
-WASTEFUL_WTU_ARGON_PATTERNS = (
-    "gemini-launch-candidate",
-    "gemini-launch-candidate-high",
-    "gemini-launch-candidate-medium",
-    "gemini-launch-candidate-low",
-    "model_placeholder_m393",
-    "model_placeholder_m416",
-    "model_placeholder_m417",
-    "model_placeholder_m418",
-)
-WASTEFUL_WTU_CARBON_PATTERNS = (
-    "gemini-4-carbon",
-    "gemini-4-carbon-high",
-    "gemini-4-carbon-medium",
-    "gemini-4-carbon-low",
-    "model_placeholder_m439",
-    "model_placeholder_m440",
-    "model_placeholder_m441",
-    "model_placeholder_m442",
-)
 
 
 def reroute_wasteful_wtu_model(
     models: dict, model_id_or_enum: str, min_floor: float = QUOTA_SOFT_FLOOR
 ) -> dict:
-  """Reroutes expensive WTU models to cheaper request-counted or Orchestrator pools."""
+  """Reroutes Fable 5.1 to Opus 5.5 since both share 3p-wtu-daily at 2.1x higher cost."""
   w = (model_id_or_enum or "").strip().lower()
   if not w:
     return {}
 
-  # 1. Non-BoN Fable 5.1 (2.5x more expensive in 3p-wtu-daily) -> Opus 5.5
+  # Non-BoN Fable 5.1 (2.1x more expensive in 3p-wtu-daily) -> Opus 5.5
   if any(
       w == pat or (w.startswith("fable-5.1") and "-bon-le" not in w)
       for pat in WASTEFUL_WTU_FABLE_PATTERNS
   ):
     for cand in ("opus-5.5-medium", "opus-5.5-high", "opus-5.5-max"):
-      hit = lookup_model(models, cand)
-      if hit and hit.get("quota", 1.0) >= min_floor:
-        return {**hit, "source": "wtu_shield"}
-
-  # 2. Gemini 4 Argon WTU -> Gemini Pro Orchestrator / auto on gemini-next-v2
-  if any(
-      w == pat or w.startswith("gemini-launch-candidate")
-      for pat in WASTEFUL_WTU_ARGON_PATTERNS
-  ):
-    for cand in ("gemini-pro-coordinator", "auto"):
-      hit = lookup_model(models, cand)
-      if hit and hit.get("quota", 1.0) >= min_floor:
-        return {**hit, "source": "wtu_shield"}
-
-  # 3. Gemini 4 Carbon WTU -> Gemini Pro Orchestrator / auto on gemini-next-v2
-  if any(
-      w == pat or (w.startswith("gemini-4-carbon") and "-g" not in w)
-      for pat in WASTEFUL_WTU_CARBON_PATTERNS
-  ):
-    for cand in ("gemini-pro-coordinator", "auto"):
       hit = lookup_model(models, cand)
       if hit and hit.get("quota", 1.0) >= min_floor:
         return {**hit, "source": "wtu_shield"}
