@@ -1163,16 +1163,22 @@ def build_critical_challenge_notice(last_user_input: str) -> str:
     notices.append(
         "[CRITICAL CHALLENGE TRIGGER: PRE-MORTEM & ALTERNATIVES]\n"
         f'The user explicitly asked for critical evaluation ("{matched}"). '
-        "Treat this as a command to run an adversarial pre-mortem, NOT a social cue for approval:\n"
-        "1. Falsify first: assume the proposed idea or diagnosis has a flaw or breaks an invariant "
-        "(`glyph bounds`, `grapheme cluster`, `trailing spaces`, `strut`, BiDi, selection, "
-        "caching, hot-path allocations) and check the actual source code.\n"
-        "2. Mandatory alternative: formulate at least one concrete orthogonal or simpler "
+        "Treat this as a command to run an adversarial pre-mortem and ROI gate, NOT a social cue "
+        "for approval. Do NOT jump straight into designing implementation variants ('simple' vs "
+        "'hybrid'):\n"
+        "0. ROI / YAGNI & Status Quo Gate ('Is it worth the trouble / what if we change "
+        "nothing?'): evaluate problem frequency, check if existing mechanisms already cover ~95% "
+        "of cases, and determine whether the gain justifies maintenance and complexity costs.\n"
+        "1. Falsify first (Pre-Mortem): assume the proposed idea or diagnosis has a flaw or "
+        "breaks an invariant (`glyph bounds`, `grapheme cluster`, `trailing spaces`, `strut`, "
+        "BiDi, selection, caching, hot-path allocations) and check the actual source code.\n"
+        "2. Mandatory alternative (including Status Quo): always include 'Do Nothing (Status Quo / "
+        "YAGNI)' as an explicit baseline alongside at least one concrete orthogonal or simpler "
         "alternative (including fixing the invariant higher up or deleting code instead of adding "
-        "a branch) and compare trade-offs.\n"
-        "3. No forced contrarianism: if the proposal genuinely holds up after checking code and "
-        "alternatives, do NOT invent cosmetic nitpicks — state the exact failure modes and "
-        "alternatives you tested and why the proposal wins."
+        "a branch). Directly recommend dropping the idea if it does not pay for its complexity.\n"
+        "3. No forced contrarianism: if the proposal genuinely holds up after checking ROI, "
+        "code, and alternatives, do NOT invent cosmetic nitpicks — state the exact failure modes "
+        "and alternatives you tested and why the proposal wins."
     )
   return "\n\n".join(notices)
 

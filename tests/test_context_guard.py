@@ -501,7 +501,9 @@ class TestContextGuard(unittest.TestCase):
             msg,
             f"Missing trigger for: {phrase}",
         )
+        self.assertIn("0. ROI / YAGNI & Status Quo Gate", msg)
         self.assertIn("Mandatory alternative", msg)
+        self.assertIn("Do Nothing (Status Quo / YAGNI)", msg)
         self.assertIn("No forced contrarianism", msg)
 
       for doubt_phrase in (
