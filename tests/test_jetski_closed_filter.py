@@ -7652,6 +7652,292 @@ eval(code);
     )
     self.assertIn("ALL_FLIGHT_DECK_TESTS_PASSED", res.stdout)
 
+  def test_traj_rpc_concurrency_limit_404_backoff_and_redux_cleanup(self) -> None:
+    node_bin = find_node_binary()
+    js_path = os.path.join(SCRIPTS_DIR, "jetski_closed_filter.js")
+
+    harness = r"""
+const fs = require('fs');
+const assert = require('assert');
+
+const scriptPath = process.argv[1];
+const code = fs.readFileSync(scriptPath, 'utf8');
+
+class FakeElement {
+  constructor(tagName) {
+    this.tagName = tagName.toUpperCase();
+    this.id = '';
+    this.className = '';
+    this.type = '';
+    this.style = { setProperty() {} };
+    this.attributes = new Map();
+    this.children = [];
+    this.parentElement = null;
+    this.listeners = new Map();
+    this._textContent = '';
+  }
+  setAttribute(k, v) {
+    this.attributes.set(k, String(v));
+    if (k === 'id') this.id = String(v);
+  }
+  getAttribute(k) { return this.attributes.get(k) || null; }
+  hasAttribute(k) { return this.attributes.has(k); }
+  removeAttribute(k) { this.attributes.delete(k); }
+  appendChild(c) { c.parentElement = this; this.children.push(c); return c; }
+  insertBefore(c) { c.parentElement = this; this.children.push(c); return c; }
+  remove() {}
+  addEventListener(t, fn) {
+    if (!this.listeners.has(t)) this.listeners.set(t, []);
+    this.listeners.get(t).push(fn);
+  }
+  dispatchEvent() { return true; }
+  querySelector() { return null; }
+  querySelectorAll() { return []; }
+  matches() { return false; }
+  getBoundingClientRect() { return { top: 0, bottom: 0, left: 0, right: 0, width: 0, height: 0 }; }
+}
+
+const docEl = new FakeElement('html');
+const headEl = new FakeElement('head');
+const bodyEl = new FakeElement('body');
+docEl.appendChild(headEl);
+docEl.appendChild(bodyEl);
+
+global.document = {
+  documentElement: docEl,
+  head: headEl,
+  body: bodyEl,
+  getElementById: () => null,
+  createElement: (tag) => new FakeElement(tag),
+  querySelector: () => null,
+  querySelectorAll: () => [],
+  addEventListener: () => {},
+  removeEventListener: () => {},
+};
+
+global.PopStateEvent = class { constructor(type) { this.type = type; } };
+
+let chainFetches = 0;
+let openChatFetches = 0;
+let trajFetches = 0;
+let trajResolver = null;
+
+const storageMap = new Map();
+global.window = {
+  __APP_CONFIG__: { csrfToken: 'test-token' },
+  location: { hostname: 'localhost', pathname: '/c/test' },
+  history: {
+    state: {},
+    pushState(state, title, url) { this.state = state; },
+  },
+  localStorage: {
+    getItem: (k) => (storageMap.has(k) ? storageMap.get(k) : null),
+    setItem: (k, v) => storageMap.set(k, String(v)),
+  },
+  setTimeout,
+  clearTimeout,
+  addEventListener: () => {},
+  removeEventListener: () => {},
+  dispatchEvent: () => true,
+  fetch: async (url) => {
+    const s = String(url);
+    if (s.includes('jetski-chains.json')) {
+      chainFetches++;
+      return { ok: false, status: 404 };
+    }
+    if (s.includes('jetski-open-chat.json')) {
+      openChatFetches++;
+      if (global._openChatSuccess) {
+        return {
+          ok: true,
+          json: async () => ({
+            requestId: 'req-123',
+            cascadeId: 'cid-target',
+            requestedAt: Date.now(),
+          }),
+        };
+      }
+      return { ok: false, status: 404 };
+    }
+    if (s.includes('GetCascadeTrajectory')) {
+      trajFetches++;
+      return new Promise((resolve) => {
+        trajResolver = () => resolve({
+          ok: true,
+          json: async () => ({
+            trajectory: { steps: [{ type: 'CORTEX_STEP_STATUS_DONE' }] },
+            numTotalSteps: 1,
+          }),
+        });
+      });
+    }
+    if (s.includes('UpdateConversationAnnotations')) {
+      return { ok: true, status: 200 };
+    }
+    return { ok: false, status: 404 };
+  },
+  document: global.document,
+};
+global.MutationObserver = class { observe() {} disconnect() {} };
+
+eval(code);
+
+(async () => {
+  const rpc = window.__jetskiTrajRpc;
+  assert(rpc, 'window.__jetskiTrajRpc must be exposed');
+
+  // 1. Concurrency limit (max 2 concurrent trajectory RPCs)
+  assert.strictEqual(rpc.getActiveCount(), 0);
+  assert.strictEqual(rpc.getQueueLength(), 0);
+
+  await rpc.acquireSlot();
+  assert.strictEqual(rpc.getActiveCount(), 1);
+  await rpc.acquireSlot();
+  assert.strictEqual(rpc.getActiveCount(), 2);
+  assert.strictEqual(rpc.getQueueLength(), 0);
+
+  let slot3Acquired = false;
+  const p3 = rpc.acquireSlot().then(() => { slot3Acquired = true; });
+  assert.strictEqual(slot3Acquired, false);
+  assert.strictEqual(rpc.getActiveCount(), 2);
+  assert.strictEqual(rpc.getQueueLength(), 1);
+
+  let slot4Acquired = false;
+  const p4 = rpc.acquireSlot().then(() => { slot4Acquired = true; });
+  assert.strictEqual(slot4Acquired, false);
+  assert.strictEqual(rpc.getQueueLength(), 2);
+
+  rpc.releaseSlot();
+  await p3;
+  assert.strictEqual(slot3Acquired, true);
+  assert.strictEqual(slot4Acquired, false);
+  assert.strictEqual(rpc.getActiveCount(), 2);
+  assert.strictEqual(rpc.getQueueLength(), 1);
+
+  rpc.releaseSlot();
+  await p4;
+  assert.strictEqual(slot4Acquired, true);
+  assert.strictEqual(rpc.getActiveCount(), 2);
+  assert.strictEqual(rpc.getQueueLength(), 0);
+
+  rpc.releaseSlot();
+  assert.strictEqual(rpc.getActiveCount(), 1);
+  rpc.releaseSlot();
+  assert.strictEqual(rpc.getActiveCount(), 0);
+
+  // In-flight deduplication
+  const pTraj1 = rpc.fetchSingleTrajectoryRpc('test-cid-1', {
+    status: 'CASCADE_RUN_STATUS_RUNNING',
+  });
+  const pTraj2 = rpc.fetchSingleTrajectoryRpc('test-cid-1', {
+    status: 'CASCADE_RUN_STATUS_RUNNING',
+  });
+  assert.strictEqual(rpc.getInFlightMap().size, 1);
+
+  await new Promise((r) => setTimeout(r, 10));
+  assert.strictEqual(trajFetches, 1);
+  assert(trajResolver !== null);
+
+  trajResolver();
+  const [res1, res2] = await Promise.all([pTraj1, pTraj2]);
+  assert.deepStrictEqual(res1, res2);
+  assert.strictEqual(rpc.getInFlightMap().size, 0);
+
+  // 2. 404 exponential backoff on openChat polling
+  openChatFetches = 0;
+  assert.strictEqual(rpc.getPollFailures(), 0);
+  assert.strictEqual(rpc.getPollNextAllowedAt(), 0);
+
+  const poll1 = await window.__jetskiPollOpenChatRequest(false);
+  assert.strictEqual(poll1, false);
+  assert.strictEqual(rpc.getPollFailures(), 1);
+  const nextAllowed1 = rpc.getPollNextAllowedAt();
+  assert(nextAllowed1 >= Date.now() + 1800 && nextAllowed1 <= Date.now() + 2200);
+
+  const tickSkipped = await window.__jetskiPollOpenChatRequest(true);
+  assert.strictEqual(tickSkipped, false);
+  assert.strictEqual(openChatFetches, 1);
+
+  await window.__jetskiPollOpenChatRequest(false);
+  await window.__jetskiPollOpenChatRequest(false);
+  await window.__jetskiPollOpenChatRequest(false);
+  await window.__jetskiPollOpenChatRequest(false);
+  assert.strictEqual(rpc.getPollFailures(), 5);
+  const nextAllowed5 = rpc.getPollNextAllowedAt();
+  assert(nextAllowed5 >= Date.now() + 29000 && nextAllowed5 <= Date.now() + 31000);
+
+  global._openChatSuccess = true;
+  const pollSuccess = await window.__jetskiPollOpenChatRequest(false);
+  assert.strictEqual(pollSuccess, true);
+  assert.strictEqual(rpc.getPollFailures(), 0);
+  assert.strictEqual(rpc.getPollNextAllowedAt(), 0);
+
+  // Static index negative caching
+  const initialChainFetches = chainFetches;
+  const chainRes1 = await rpc.fetchChainIndex();
+  assert.deepStrictEqual(chainRes1, { parentOf: {}, createdAt: {}, redirects: {} });
+  const chainRes2 = await rpc.fetchChainIndex();
+  assert.deepStrictEqual(chainRes2, { parentOf: {}, createdAt: {}, redirects: {} });
+  assert.strictEqual(
+    chainFetches,
+    initialChainFetches,
+    'Static index fetch must be cached across negative 404 responses'
+  );
+
+  // 3. Redux store cleanup
+  let unsubCalled = false;
+  const mockOrigDispatch = (action) => action;
+  const mockStore = {
+    dispatch: mockOrigDispatch,
+    subscribe: () => () => { unsubCalled = true; },
+    getState: () => ({
+      conversation: { cascadeId: 'c-1' },
+      trajectorySummaries: { summaries: {} },
+    }),
+  };
+
+  rpc.hookReduxStore(mockStore);
+  assert.notStrictEqual(mockStore.dispatch, mockOrigDispatch, 'Store dispatch must be hooked');
+  const hookStateBefore = rpc.getReduxHookState();
+  assert.strictEqual(hookStateBefore.hookedStore, mockStore);
+  assert.strictEqual(hookStateBefore.hasOrigDispatch, true);
+  assert.strictEqual(hookStateBefore.hasUnsubscribe, true);
+
+  window.__jetskiClosedChatsFilterCleanup();
+  assert.strictEqual(unsubCalled, true, 'Redux unsubscribe must be called on filter cleanup');
+  assert.strictEqual(
+    mockStore.dispatch,
+    mockOrigDispatch,
+    'Original dispatch must be restored on cleanup'
+  );
+  const hookStateAfter = rpc.getReduxHookState();
+  assert.strictEqual(hookStateAfter.hookedStore, null);
+  assert.strictEqual(hookStateAfter.hasOrigDispatch, false);
+  assert.strictEqual(hookStateAfter.hasUnsubscribe, false);
+
+  console.log('ALL_TRAJ_RPC_CONCURRENCY_TESTS_PASSED');
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"""
+    env = os.environ.copy()
+    env["ELECTRON_RUN_AS_NODE"] = "1"
+    res = subprocess.run(
+        [node_bin, "-e", harness, js_path],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(
+        res.returncode,
+        0,
+        f"Trajectory RPC concurrency JS harness failed:\n"
+        f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+    )
+    self.assertIn("ALL_TRAJ_RPC_CONCURRENCY_TESTS_PASSED", res.stdout)
+
 
 if __name__ == "__main__":
   unittest.main()

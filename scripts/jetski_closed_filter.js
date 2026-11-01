@@ -339,6 +339,30 @@
   const STALE_IDLE_TURN_MS = 15 * 60 * 1000;
   const trajectoryStatusCache = new Map();
   const singleTrajCache = new Map();
+  // Bound trajectory RPC concurrency so HTTP/1.1 socket pool is never exhausted
+  const MAX_CONCURRENT_TRAJ_RPC = 2;
+  let activeTrajRpcCount = 0;
+  const trajRpcWaitQueue = [];
+  const singleTrajInFlight = new Map();
+
+  function acquireTrajRpcSlot() {
+    if (activeTrajRpcCount < MAX_CONCURRENT_TRAJ_RPC) {
+      activeTrajRpcCount++;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      trajRpcWaitQueue.push(resolve);
+    });
+  }
+
+  function releaseTrajRpcSlot() {
+    if (trajRpcWaitQueue.length > 0) {
+      const next = trajRpcWaitQueue.shift();
+      if (typeof next === 'function') next();
+    } else {
+      activeTrajRpcCount = Math.max(0, activeTrajRpcCount - 1);
+    }
+  }
   // Accept both @bufbuild/protobuf v2 numeric enums in Redux and Connect-JSON strings
   const ACTIVE_RUN_STATUSES = new Set([
     'CASCADE_RUN_STATUS_RUNNING',
@@ -740,34 +764,47 @@
     return prefix ? `${prefix}${p}` : p;
   }
 
+  let chainIndexInFlight = null;
+
   async function fetchChainIndex() {
     const now = Date.now();
     if (chainIndexCache && now - chainIndexFetchedAt < 5000) {
       return chainIndexCache;
     }
+    if (chainIndexInFlight) return chainIndexInFlight;
     if (typeof window.fetch !== 'function') {
       return chainIndexCache || { parentOf: {}, createdAt: {}, redirects: {} };
     }
-    try {
-      const csrf = encodeURIComponent(getCsrfToken());
-      const url = resolveApiUrl(`/static/artifacts/jetski-chains.json?v=${now}&csrf=${csrf}`);
-      const resp = await window.fetch(url);
-      if (resp && resp.ok) {
-        const data = await resp.json();
-        if (data && typeof data === 'object') {
-          chainIndexCache = {
-            parentOf: data.parentOf || {},
-            createdAt: data.createdAt || {},
-            redirects: data.redirects || {},
-          };
-          chainIndexFetchedAt = now;
-          return chainIndexCache;
+    const execute = async () => {
+      try {
+        const csrf = encodeURIComponent(getCsrfToken());
+        const url = resolveApiUrl(`/static/artifacts/jetski-chains.json?v=${now}&csrf=${csrf}`);
+        const resp = await window.fetch(url);
+        if (resp && resp.ok) {
+          const data = await resp.json();
+          if (data && typeof data === 'object') {
+            chainIndexCache = {
+              parentOf: data.parentOf || {},
+              createdAt: data.createdAt || {},
+              redirects: data.redirects || {},
+            };
+            chainIndexFetchedAt = now;
+            return chainIndexCache;
+          }
         }
+      } catch {
+        // Ignore network errors and fall back to cached or single-chat resolution
       }
-    } catch {
-      // Ignore network errors and fall back to cached or single-chat resolution
-    }
-    return chainIndexCache || { parentOf: {}, createdAt: {}, redirects: {} };
+      chainIndexFetchedAt = now;
+      if (!chainIndexCache) {
+        chainIndexCache = { parentOf: {}, createdAt: {}, redirects: {} };
+      }
+      return chainIndexCache;
+    };
+    chainIndexInFlight = execute().finally(() => {
+      chainIndexInFlight = null;
+    });
+    return chainIndexInFlight;
   }
 
   async function fetchRoadmapIndex() {
@@ -795,7 +832,11 @@
     } catch {
       // Ignore network errors and preserve cached roadmap summaries
     }
-    return roadmapIndexCache || { projects: {} };
+    roadmapIndexFetchedAt = now;
+    if (!roadmapIndexCache) {
+      roadmapIndexCache = { projects: {} };
+    }
+    return roadmapIndexCache;
   }
 
   // Fetches jetski-flight-deck.json so the drawer loads the correct local or PEN proxy URL
@@ -805,7 +846,9 @@
       return flightDeckInfoCache;
     }
     if (typeof window.fetch !== 'function') {
-      return flightDeckInfoCache || { pen_url: '', local_url: 'http://localhost:8089', port: 8089 };
+      return (
+        flightDeckInfoCache || { pen_url: '', local_url: 'http://localhost:8089', port: 8089 }
+      );
     }
     try {
       const csrf = encodeURIComponent(getCsrfToken());
@@ -822,7 +865,11 @@
     } catch {
       // Fall through to cached data on network error
     }
-    return flightDeckInfoCache || { pen_url: '', local_url: 'http://localhost:8089', port: 8089 };
+    flightDeckInfoFetchedAt = now;
+    if (!flightDeckInfoCache) {
+      flightDeckInfoCache = { pen_url: '', local_url: 'http://localhost:8089', port: 8089 };
+    }
+    return flightDeckInfoCache;
   }
 
   // Chooses localhost vs PEN proxy based on the Jetski Web host and appends embed param
@@ -1564,66 +1611,87 @@
       singleTrajCache.set(cascadeId, cached);
       return cached.payload;
     }
-    const headers = {
-      'Content-Type': 'application/json',
-      'x-codeium-csrf-token': getCsrfToken(),
-    };
-    try {
-      const url = resolveApiUrl(
-        '/exa.language_server_pb.LanguageServerService/GetCascadeTrajectory'
-      );
-      const resp = await window.fetch(url, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({
-            cascadeId,
-            trajectoryVerbosity: 'CLIENT_TRAJECTORY_VERBOSITY_PROD_UI',
-          }),
+    const flightKey = `${cascadeId}:${sig}`;
+    const existingFlight = singleTrajInFlight.get(flightKey);
+    if (existingFlight) return existingFlight;
+
+    const executeFetch = async () => {
+      await acquireTrajRpcSlot();
+      try {
+        if (disposed) return null;
+        const lateCached = singleTrajCache.get(cascadeId);
+        if (lateCached && lateCached.sig === sig) {
+          return lateCached.payload;
         }
-      );
-      if (!resp || !resp.ok) return null;
-      const data = await resp.json();
-      if (!data || typeof data !== 'object') return null;
-      const steps = data.trajectory?.steps;
-      const total = Number(data.numTotalSteps ?? data.num_total_steps ?? 0);
-      // Fetch remaining pages when GetCascadeTrajectory truncates at GRPCMaxMessageSize
-      if (Array.isArray(steps)) {
-        for (let page = 0; page < 8 && steps.length > 0 && steps.length < total; page++) {
-          try {
-            const stepsUrl = resolveApiUrl(
-              '/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps'
-            );
-            const tailResp = await window.fetch(stepsUrl, {
-                method: 'POST',
-                headers,
-                body: JSON.stringify({
-                  cascadeId,
-                  stepOffset: steps.length,
-                  trajectoryVerbosity: 'CLIENT_TRAJECTORY_VERBOSITY_PROD_UI',
-                }),
+        const headers = {
+          'Content-Type': 'application/json',
+          'x-codeium-csrf-token': getCsrfToken(),
+        };
+        const url = resolveApiUrl(
+          '/exa.language_server_pb.LanguageServerService/GetCascadeTrajectory'
+        );
+        const resp = await window.fetch(url, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              cascadeId,
+              trajectoryVerbosity: 'CLIENT_TRAJECTORY_VERBOSITY_PROD_UI',
+            }),
+          }
+        );
+        if (!resp || !resp.ok) return null;
+        const data = await resp.json();
+        if (!data || typeof data !== 'object') return null;
+        const steps = data.trajectory?.steps;
+        const total = Number(data.numTotalSteps ?? data.num_total_steps ?? 0);
+        // Fetch remaining pages when GetCascadeTrajectory truncates at GRPCMaxMessageSize
+        if (Array.isArray(steps)) {
+          for (let page = 0; page < 8 && steps.length > 0 && steps.length < total; page++) {
+            if (disposed) break;
+            try {
+              const stepsUrl = resolveApiUrl(
+                '/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps'
+              );
+              const tailResp = await window.fetch(stepsUrl, {
+                  method: 'POST',
+                  headers,
+                  body: JSON.stringify({
+                    cascadeId,
+                    stepOffset: steps.length,
+                    trajectoryVerbosity: 'CLIENT_TRAJECTORY_VERBOSITY_PROD_UI',
+                  }),
+                }
+              );
+              if (!tailResp || !tailResp.ok) break;
+              const tailData = await tailResp.json();
+              if (!Array.isArray(tailData?.steps) || tailData.steps.length === 0) {
+                break;
               }
-            );
-            if (!tailResp || !tailResp.ok) break;
-            const tailData = await tailResp.json();
-            if (!Array.isArray(tailData?.steps) || tailData.steps.length === 0) {
+              steps.push(...tailData.steps);
+            } catch {
+              // Proceed with fetched trajectory prefix when tail page fails
               break;
             }
-            steps.push(...tailData.steps);
-          } catch {
-            // Proceed with fetched trajectory prefix when tail page fails
-            break;
           }
         }
+        if (singleTrajCache.size >= SINGLE_TRAJ_CACHE_MAX_ENTRIES) {
+          const oldestKey = singleTrajCache.keys().next().value;
+          if (oldestKey !== undefined) singleTrajCache.delete(oldestKey);
+        }
+        singleTrajCache.set(cascadeId, { sig, payload: data });
+        return data;
+      } catch {
+        return null;
+      } finally {
+        releaseTrajRpcSlot();
       }
-      if (singleTrajCache.size >= SINGLE_TRAJ_CACHE_MAX_ENTRIES) {
-        const oldestKey = singleTrajCache.keys().next().value;
-        if (oldestKey !== undefined) singleTrajCache.delete(oldestKey);
-      }
-      singleTrajCache.set(cascadeId, { sig, payload: data });
-      return data;
-    } catch {
-      return null;
-    }
+    };
+
+    const promise = executeFetch().finally(() => {
+      singleTrajInFlight.delete(flightKey);
+    });
+    singleTrajInFlight.set(flightKey, promise);
+    return promise;
   }
 
   function getOrCreateTrajStatusEntry(cascadeId) {
@@ -1668,8 +1736,26 @@
     return modMs > 0 && nowMs - modMs > SILENT_SUBAGENT_GRACE_MS;
   }
 
-  function shouldInspectTrajectory(cascadeId, summary, childIndex) {
+  function isSummaryClosed(summary) {
+    if (!summary) return true;
+    if (summary.annotations?.archived) return true;
+    const rawTitle = summary.annotations?.title || summary.summary || '';
+    return hasLegacyClosedMarker(rawTitle);
+  }
+
+  function shouldInspectTrajectory(cascadeId, summary, childIndex, summariesMap) {
     if (!cascadeId || !summary || typeof window.fetch !== 'function') return false;
+    if (isSummaryClosed(summary)) return false;
+    if (
+      Boolean(summary.trajectoryMetadata?.sourceMetadata?.hideFromConversationList) &&
+      !managedHiddenIds.has(cascadeId)
+    ) {
+      return false;
+    }
+    const selfWait = extractSummaryWaitingInfo(summary);
+    if (selfWait) {
+      return Boolean(selfWait.generic);
+    }
     if (
       isActiveRunStatus(summary.status) ||
       Boolean(summary.notFullyIdle) ||
@@ -1677,14 +1763,37 @@
     ) {
       return true;
     }
-    if ((childIndex.get(cascadeId) || []).length > 0) return true;
     const prev = trajectoryStatusCache.get(cascadeId);
     if (prev && (prev.state === 'running' || prev.state === 'blocked')) return true;
+    const nowMs = Date.now();
     const modMs =
       parseTimestampMs(summary.lastModifiedTime) ||
       parseTimestampMs(summary.createdTime);
-    if (modMs > 0 && Date.now() - modMs <= RECENT_TRAJ_CHECK_WINDOW_MS) {
+    if (modMs > 0 && nowMs - modMs <= RECENT_TRAJ_CHECK_WINDOW_MS) {
       return true;
+    }
+    const treeIds = collectDescendantTreeIds(cascadeId, childIndex || new Map());
+    if (treeIds.length > 0) {
+      if (modMs === 0) return true;
+      for (const dCid of treeIds) {
+        const dSum = summariesMap?.[dCid];
+        if (!dSum) return true;
+        if (dSum.killed) continue;
+        if (
+          isActiveRunStatus(dSum.status) ||
+          Boolean(dSum.notFullyIdle) ||
+          Boolean(dSum.hasRunningSubagents)
+        ) {
+          return true;
+        }
+        if (Boolean(extractSummaryWaitingInfo(dSum))) return true;
+        const dModMs =
+          parseTimestampMs(dSum.lastModifiedTime) ||
+          parseTimestampMs(dSum.createdTime);
+        if (dModMs === 0 || nowMs - dModMs <= RECENT_TRAJ_CHECK_WINDOW_MS) {
+          return true;
+        }
+      }
     }
     return false;
   }
@@ -1696,7 +1805,7 @@
     summariesMap,
     childIndex
   ) {
-    if (disposed || !shouldInspectTrajectory(cascadeId, summary, childIndex)) return;
+    if (disposed || !shouldInspectTrajectory(cascadeId, summary, childIndex, summariesMap)) return;
     const entry = getOrCreateTrajStatusEntry(cascadeId);
     const now = Date.now();
     const graceStale =
@@ -1989,7 +2098,11 @@
           ...treeIds.map((d) => buildSummaryStatusSig(d, resolvedMap[d])),
         ].join('|')
       : '';
-    if (resolvedId && summary) {
+    if (
+      resolvedId &&
+      summary &&
+      shouldInspectTrajectory(resolvedId, summary, idxMap, resolvedMap)
+    ) {
       void ensureTrajectoryStatusLoaded(
         resolvedId,
         summary,
@@ -3548,6 +3661,9 @@
     syncModelAutopilotInStore(store);
   }
 
+  let origReduxDispatch = null;
+  let reduxUnsubscribe = null;
+
   function hookReduxStore(store) {
     if (reduxStore === store) return;
     reduxStore = store;
@@ -3556,6 +3672,7 @@
     // Intercept incoming stream batches so filtered conversations stay hidden
     // without flickering into the sidebar index on server stream ticks
     const origDispatch = store.dispatch;
+    origReduxDispatch = origDispatch;
     store.dispatch = function patchedDispatch(action) {
       if (disposed) return origDispatch.call(this, action);
       // Enrich periodic UserStatus polls synchronously so unlocked models never flicker out
@@ -3874,7 +3991,7 @@
       return origDispatch.call(this, action);
     };
 
-    store.subscribe(() => {
+    reduxUnsubscribe = store.subscribe(() => {
       if (!isInternalDispatch) {
         scheduleSync();
       }
@@ -6642,7 +6759,13 @@
   // Periodically checks if jetski-closed-filter.js was updated on disk and hot-reloads it in-place
   async function checkFilterScriptHotReload() {
     const now = Date.now();
-    if (disposed || now - lastHotReloadCheckAt < 15000 || typeof window.fetch !== 'function') {
+    if (
+      disposed ||
+      Boolean(window.__jetskiClosedChatsFilterMacVer) ||
+      Boolean(window.__jetskiClosedChatsFilterLoadingVer) ||
+      now - lastHotReloadCheckAt < 15000 ||
+      typeof window.fetch !== 'function'
+    ) {
       return;
     }
     lastHotReloadCheckAt = now;
@@ -6671,9 +6794,19 @@
     }
   }
 
+  let openChatPollFailures = 0;
+  let openChatPollNextAllowedAt = 0;
+
   // Polls /static/artifacts/jetski-open-chat.json so Flight Deck can navigate an existing tab
-  async function pollOpenChatRequest() {
+  async function pollOpenChatRequest(isBackgroundTick = false) {
     if (disposed || openChatPollingInFlight || typeof window.fetch !== 'function') return false;
+    const now = Date.now();
+    const isMacManaged = Boolean(window.__jetskiClosedChatsFilterMacVer);
+    if (isBackgroundTick) {
+      if (now < openChatPollNextAllowedAt) return false;
+      const isHidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+      if (isHidden && isMacManaged) return false;
+    }
     void checkFilterScriptHotReload();
     openChatPollingInFlight = true;
     try {
@@ -6682,7 +6815,14 @@
         `/static/artifacts/jetski-open-chat.json?t=${Date.now()}&csrf=${csrf}`
       );
       const resp = await window.fetch(url, { cache: 'no-store' });
-      if (!resp || !resp.ok) return false;
+      if (!resp || !resp.ok) {
+        openChatPollFailures++;
+        openChatPollNextAllowedAt =
+          Date.now() + Math.min(30000, 2000 * Math.pow(2, Math.min(openChatPollFailures - 1, 4)));
+        return false;
+      }
+      openChatPollFailures = 0;
+      openChatPollNextAllowedAt = 0;
       const data = await resp.json();
       const reqId = typeof data?.requestId === 'string' ? data.requestId : '';
       const cid = typeof data?.cascadeId === 'string' ? data.cascadeId.trim() : '';
@@ -6734,6 +6874,9 @@
       await ackPromise;
       return true;
     } catch {
+      openChatPollFailures++;
+      openChatPollNextAllowedAt =
+        Date.now() + Math.min(30000, 2000 * Math.pow(2, Math.min(openChatPollFailures - 1, 4)));
       return false;
     } finally {
       openChatPollingInFlight = false;
@@ -6744,18 +6887,19 @@
   function startOpenChatPoller() {
     markThisJetskiTabActive();
     if (openChatPollWorker || openChatPollTimer) return;
+    const pollIntervalMs = window.__jetskiClosedChatsFilterMacVer ? 1000 : 250;
     try {
       if (
         typeof window.Worker === 'function' &&
         typeof window.Blob === 'function' &&
         typeof window.URL?.createObjectURL === 'function'
       ) {
-        const workerCode = 'setInterval(function(){ postMessage(1); }, 250);';
+        const workerCode = `setInterval(function(){ postMessage(1); }, ${pollIntervalMs});`;
         const blob = new window.Blob([workerCode], { type: 'application/javascript' });
         openChatPollWorkerUrl = window.URL.createObjectURL(blob);
         const worker = new window.Worker(openChatPollWorkerUrl);
         worker.onmessage = () => {
-          void pollOpenChatRequest();
+          void pollOpenChatRequest(true);
         };
         worker.onerror = () => {
           // Fall back to main-thread interval if Web Worker execution is blocked
@@ -6765,8 +6909,8 @@
           openChatPollWorker = null;
           if (!openChatPollTimer && !disposed) {
             openChatPollTimer = setInterval(() => {
-              void pollOpenChatRequest();
-            }, 250);
+              void pollOpenChatRequest(true);
+            }, pollIntervalMs);
             if (openChatPollTimer && typeof openChatPollTimer.unref === 'function') {
               openChatPollTimer.unref();
             }
@@ -6779,8 +6923,8 @@
       // Fall back to standard setInterval when Worker/Blob creation is disallowed
     }
     openChatPollTimer = setInterval(() => {
-      void pollOpenChatRequest();
-    }, 250);
+      void pollOpenChatRequest(true);
+    }, pollIntervalMs);
     if (openChatPollTimer && typeof openChatPollTimer.unref === 'function') {
       openChatPollTimer.unref();
     }
@@ -6804,12 +6948,33 @@
       clearInterval(openChatPollTimer);
       openChatPollTimer = 0;
     }
+    openChatPollFailures = 0;
+    openChatPollNextAllowedAt = 0;
   }
 
   window.__jetskiPollOpenChatRequest = pollOpenChatRequest;
   window.__jetskiStartOpenChatPoller = startOpenChatPoller;
   window.__jetskiStopOpenChatPoller = stopOpenChatPoller;
   window.__jetskiCheckFilterScriptHotReload = checkFilterScriptHotReload;
+  window.__jetskiTrajRpc = {
+    acquireSlot: acquireTrajRpcSlot,
+    releaseSlot: releaseTrajRpcSlot,
+    getActiveCount: () => activeTrajRpcCount,
+    getQueueLength: () => trajRpcWaitQueue.length,
+    fetchSingleTrajectoryRpc,
+    fetchChainIndex,
+    fetchRoadmapIndex,
+    fetchFlightDeckInfo,
+    getInFlightMap: () => singleTrajInFlight,
+    getPollFailures: () => openChatPollFailures,
+    getPollNextAllowedAt: () => openChatPollNextAllowedAt,
+    hookReduxStore,
+    getReduxHookState: () => ({
+      hookedStore: reduxStore,
+      hasOrigDispatch: Boolean(origReduxDispatch),
+      hasUnsubscribe: Boolean(reduxUnsubscribe),
+    }),
+  };
 
   // Matryoshka chain star tooltip showing lazy piece turn counts and question previews
   let chainTooltipEl = null;
@@ -10092,6 +10257,20 @@
         payload: { updates: unhide, deletes: [] },
       });
     }
+    // Detach Redux store hooks to avoid listener leaks and dispatch wrapper chains on reload
+    if (typeof reduxUnsubscribe === 'function') {
+      try {
+        reduxUnsubscribe();
+      } catch {}
+      reduxUnsubscribe = null;
+    }
+    if (reduxStore && origReduxDispatch && reduxStore.dispatch !== origReduxDispatch) {
+      try {
+        reduxStore.dispatch = origReduxDispatch;
+      } catch {}
+      origReduxDispatch = null;
+    }
+    reduxStore = null;
     // Cancel pending context throttle and running-poll timers so stale closures cannot fire
     for (const entry of contextUsageCache.values()) {
       clearContextEntryTimers(entry);
@@ -10099,6 +10278,12 @@
     contextUsageCache.clear();
     trajectoryStatusCache.clear();
     singleTrajCache.clear();
+    while (trajRpcWaitQueue.length > 0) {
+      const nextWaiter = trajRpcWaitQueue.shift();
+      if (typeof nextWaiter === 'function') nextWaiter();
+    }
+    activeTrajRpcCount = 0;
+    singleTrajInFlight.clear();
     if (autopilotToastTimer) {
       clearTimeout(autopilotToastTimer);
       autopilotToastTimer = 0;

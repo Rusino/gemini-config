@@ -123,6 +123,43 @@ class TestJetskiMacInjector(unittest.TestCase):
           plist_data["ProgramArguments"], ["/usr/bin/python3", "/x/s.py", "watch"]
       )
 
+  def test_sync_mac_artifact_js_seeds_static_json_defaults(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      src = os.path.join(tmp, "src.js")
+      brain_dir = os.path.join(tmp, "brain")
+      dst = os.path.join(brain_dir, "jetski-closed-filter.js")
+      with open(src, "w", encoding="utf-8") as f:
+        f.write("console.log(1);\n")
+
+      # Pre-seed one custom file to verify pre-existing artifacts are not overwritten
+      os.makedirs(brain_dir, exist_ok=True)
+      pre_existing_chat = os.path.join(brain_dir, "jetski-open-chat.json")
+      with open(pre_existing_chat, "w", encoding="utf-8") as f:
+        f.write('{"requestId": "pre-existing", "cascadeId": "cid-99"}\n')
+
+      jmi.sync_mac_artifact_js(src, dst)
+
+      # Verify the filter script itself was copied
+      self.assertTrue(os.path.isfile(dst))
+
+      # Verify pre-existing file was preserved
+      with open(pre_existing_chat, "r", encoding="utf-8") as f:
+        data = json.load(f)
+      self.assertEqual(data.get("requestId"), "pre-existing")
+      self.assertEqual(data.get("cascadeId"), "cid-99")
+
+      # Verify all missing static JSON defaults were created with valid JSON
+      for fname, expected_key in (
+          ("jetski-chains.json", "parentOf"),
+          ("jetski-roadmaps.json", "projects"),
+          ("jetski-flight-deck.json", "local_url"),
+      ):
+        fpath = os.path.join(brain_dir, fname)
+        self.assertTrue(os.path.isfile(fpath), f"Expected {fname} to be seeded")
+        with open(fpath, "r", encoding="utf-8") as f:
+          content = json.load(f)
+        self.assertIn(expected_key, content)
+
   def test_cdp_session_attach_ping_coalescing_and_hot_reload(self):
     recorded = []
     pongs = []

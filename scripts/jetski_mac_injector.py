@@ -94,7 +94,37 @@ def sync_mac_artifact_js(
   if not os.path.isfile(src_path):
     raise FileNotFoundError(f"Missing filter script at {src_path}")
   src_ver = compute_file_version(src_path)
-  os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+  brain_dir = os.path.dirname(dst_path)
+  os.makedirs(brain_dir, exist_ok=True)
+
+  # Seed default static JSON artifacts so browser polling never 404s on Mac
+  defaults = {
+      "jetski-open-chat.json": json.dumps(
+          {"requestId": "", "cascadeId": "", "requestedAt": 0}, indent=2
+      ) + "\n",
+      "jetski-chains.json": json.dumps(
+          {"version": 1, "parentOf": {}, "createdAt": {}, "redirects": {}},
+          indent=2,
+      ) + "\n",
+      "jetski-roadmaps.json": json.dumps(
+          {"version": 1, "projects": {}}, indent=2
+      ) + "\n",
+      "jetski-flight-deck.json": json.dumps(
+          {"pen_url": "", "local_url": "http://localhost:8089", "port": 8089},
+          indent=2,
+      ) + "\n",
+  }
+  for fname, content in defaults.items():
+    fpath = os.path.join(brain_dir, fname)
+    if not os.path.isfile(fpath):
+      tmp_fpath = f"{fpath}.tmp.{os.getpid()}"
+      try:
+        with open(tmp_fpath, "w", encoding="utf-8") as f:
+          f.write(content)
+        os.replace(tmp_fpath, fpath)
+      except OSError:
+        pass
+
   needs_copy = True
   if os.path.isfile(dst_path):
     try:
