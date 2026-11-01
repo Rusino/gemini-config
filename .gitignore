@@ -24,6 +24,7 @@ plugins/cloudtop-use
 plugins/google_chat
 plugins/google_docs
 plugins/google_drive
+plugins/gdocs/
 
 # Machine-local rules (personal aliases)
 rules/local_aliases.md
