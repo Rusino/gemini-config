@@ -7618,6 +7618,7 @@ function focusCard(it, data) {
     const first = incidents[0] || {};
     const primary = link(first.task_url || STATUS_SKIA_URL, 'See failure', 'btn primary');
     const landedAt = formatStatusTime(it, it.submitted_et, it.submitted_age);
+    const authorHtml = it.is_self ? 'You' : link(actorUrl(it, it.owner_email || it.owner_name), esc(authorLabel(it)));
     const landed = it.submitted_et ? `${esc(authorLabel(it))} landed it ${landedAt}.` : '';
     const blame = incidents.length
       ? ` Gardener lists ${incidents.length} failing task${incidents.length > 1 ? 's' : ''}.`
@@ -7628,7 +7629,7 @@ function focusCard(it, data) {
     return `
     <article class="card alert">
       <div><div class="eyebrow">${busyBadge}${eyebrow} · ${esc(it.project_name)} ·
-        ${link(it.url, clLabel(it))}</div>
+        ${link(it.url, clLabel(it))} · by ${authorHtml}</div>
         <h2>${cardTitle}</h2>
         <div class="why">${whyContent}</div>
         <!-- Surface fix-for linkage on broken alert card -->
@@ -7692,10 +7693,11 @@ function focusCard(it, data) {
     : fullWhy;
   const actionsWithFix = openFixBtn ? actions.replace(chatBtn, `${openFixBtn}${chatBtn}`) : actions;
   const verdictPill = reviewVerdictEyebrowHtml(it);
+  const authorHtml = it.is_self ? 'You' : link(actorUrl(it, it.owner_email || it.owner_name), esc(authorLabel(it)));
   return `
     <article class="card">
       <div><div class="eyebrow">${busyBadge}${verdictPill}${esc(it.project_name)} · ` +
-        `${link(it.url, clLabel(it))} · PS${esc(it.patchset || 1)}</div>
+        `${link(it.url, clLabel(it))} · PS${esc(it.patchset || 1)} · by ${authorHtml}</div>
         <h2>${cardTitle}</h2>
         <div class="why">${whyContent}</div>
         <!-- Surface fix-for linkage on pre-submit focus cards -->

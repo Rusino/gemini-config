@@ -329,6 +329,7 @@ const baseItem = {
   item_key: 'gerrit:1411905',
   target_id: '1411905',
   kind: 'gerrit',
+  host: 'skia-review.googlesource.com',
   role: 'reviewer (goog)',
   status: 'NEW',
   phase: 'NEEDS_YOUR_ACTION',
@@ -337,6 +338,9 @@ const baseItem = {
   url: 'https://example.com/1411905',
   subject: '[skparagraph] Fix bidi shaping',
   project_name: 'Skia',
+  owner_name: 'KC Yeung',
+  owner_email: 'I@YeungKC.com',
+  is_external: true,
   triage: {
     verdict: 'COMPANION_FIX',
     verdict_label: '🟠 Defects + companion fix',
@@ -398,6 +402,7 @@ console.log(JSON.stringify({
   eyebrowNonReviewer: reviewVerdictEyebrowHtml(nonReviewerItem),
   focusClean: focusCard(cleanItem, {jetski_box_url: ''}),
   focusCompanionFix: focusCard(baseItem, {jetski_box_url: ''}),
+  focusSelf: focusCard(nonReviewerItem, {jetski_box_url: ''}),
 }));
 """
     proc = subprocess.run(
@@ -422,10 +427,15 @@ console.log(JSON.stringify({
     self.assertIn("v-clean", out["focusClean"])
     self.assertIn("triage-clean", out["focusClean"])
     self.assertIn("All invariants verified", out["focusClean"])
+    self.assertIn("by <a", out["focusClean"])
+    self.assertIn("KC Yeung (external)", out["focusClean"])
 
     self.assertIn("v-companion_fix", out["focusCompanionFix"])
     self.assertIn("triage-companion_fix", out["focusCompanionFix"])
     self.assertIn("Caret offset miscomputed in BiDi runs", out["focusCompanionFix"])
+    self.assertIn("by <a", out["focusCompanionFix"])
+
+    self.assertIn("by You", out["focusSelf"])
 
 
 if __name__ == "__main__":
