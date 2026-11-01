@@ -122,14 +122,24 @@ def parse_tests(path: str, text: str) -> dict:
       key, n = f"{name}#{n}", n + 1
     tests[key] = "\n".join(body)
 
+  # Brace languages end a test at its closing brace, so helpers after it are not attributed to it
+  braces = not path.endswith(".py")
+  depth, opened = 0, False
   for line in text.splitlines():
     found = _header_name(line, path)
     if found:
       if name:
         store()
       name, body = found, []
+      depth, opened = line.count("{") - line.count("}"), "{" in line
     elif name:
       body.append(line)
+      if braces:
+        depth += line.count("{") - line.count("}")
+        opened = opened or "{" in line
+    if name and braces and opened and depth <= 0:
+      store()
+      name, body = "", []
   if name:
     store()
   return tests

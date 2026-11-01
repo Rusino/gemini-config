@@ -148,6 +148,12 @@ class TestContractDelta(RepoCase):
     self.assertEqual(list(asserts), ['REPORTER_ASSERT(r,s==")"&&n==3)'])
     self.assertIn("https://x/7", rest)
 
+  def test_helper_after_test_is_not_part_of_it(self):
+    self.write("modules/skparagraph/tests/TrakTest.cpp",
+               CPP_BASE + "\nstatic int helper() {\n    SkASSERT(true);\n    return 1;\n}\n",
+               stage=True)
+    self.assertEqual(self.kinds(), [])
+
   def test_dart_and_python_tests_are_parsed(self):
     self.write("lib/web_ui/test/text_test.dart",
                "void main() {\n  test('wraps', () {\n    expect(w, 10);\n  });\n}\n")
