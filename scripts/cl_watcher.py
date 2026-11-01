@@ -1874,6 +1874,10 @@ def order_and_link_stack_changes(
       d["stack_ancestors"] = []
       d["stack_parent_ikey"] = ""
       d["stack_depth"] = 0
+      d["stack_root_ikey"] = ""
+      d["stack_size"] = 1
+      d["stack_index"] = 0
+      d["stack_ikeys"] = []
       continue
 
     if kind == "gerrit":
@@ -1948,6 +1952,36 @@ def order_and_link_stack_changes(
           else 10**18,
       )
   )
+
+  # Group items by stack root and record topological stack position and chain keys
+  stacks_by_root: dict[str, list[str]] = {}
+  for d in active_discovered:
+    if d.get("companion_to"):
+      continue
+    ikey = str(d.get("item_key") or "")
+    ancs = d.get("stack_ancestors") or []
+    cand_root = str(ancs[0]) if ancs else ikey
+    if cand_root:
+      stacks_by_root.setdefault(cand_root, []).append(ikey)
+
+  for d in active_discovered:
+    if d.get("companion_to"):
+      continue
+    ikey = str(d.get("item_key") or "")
+    ancs = d.get("stack_ancestors") or []
+    cand_root = str(ancs[0]) if ancs else ikey
+    members = stacks_by_root.get(cand_root) or [ikey]
+    if len(members) >= 2:
+      d["stack_root_ikey"] = cand_root
+      d["stack_size"] = len(members)
+      d["stack_index"] = members.index(ikey) + 1 if ikey in members else 0
+      d["stack_ikeys"] = list(members)
+    else:
+      d["stack_root_ikey"] = ""
+      d["stack_size"] = 1
+      d["stack_index"] = 0
+      d["stack_ikeys"] = []
+
   return active_discovered
 
 
@@ -6951,6 +6985,103 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     background: color-mix(in srgb, var(--red) 13%, transparent); color: var(--red);
   }
 
+  /* Variant C: Visual CL/PR chain grouping and stack container styles */
+  .badge.stack-step {
+    background: color-mix(in srgb, var(--ink) 8%, transparent);
+    color: var(--ink); font-family: var(--mono); font-weight: 600;
+  }
+  .stack-group {
+    border: 1px solid var(--hairline); border-radius: 12px;
+    background: color-mix(in srgb, var(--card) 60%, var(--paper));
+    padding: 10px 12px; display: grid; gap: 8px; box-shadow: var(--shadow);
+  }
+  .stack-head {
+    display: grid; gap: 6px; padding-bottom: 6px;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .stack-head-top {
+    display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  }
+  .stack-head-title {
+    font: 600 12.5px var(--display); letter-spacing: -.01em; color: var(--ink);
+  }
+  .stack-head-meta { font-size: 11px; color: var(--graphite); }
+  .stack-spine {
+    display: flex; align-items: center; gap: 4px; overflow-x: auto;
+    padding: 2px 0; -webkit-overflow-scrolling: touch;
+  }
+  .spine-step {
+    display: inline-flex; align-items: center; gap: 4px; padding: 2px 7px;
+    border-radius: 999px; font: 500 10.5px var(--mono); white-space: nowrap;
+    background: color-mix(in srgb, var(--ink) 6%, transparent);
+    color: var(--ink); text-decoration: none; border: 1px solid transparent;
+  }
+  .spine-step:hover { text-decoration: underline; border-color: var(--hairline); }
+  .spine-step.spine-you {
+    background: color-mix(in srgb, var(--blue) 14%, transparent);
+    color: var(--blue); font-weight: 600;
+    border-color: color-mix(in srgb, var(--blue) 30%, transparent);
+  }
+  .spine-step.spine-ok {
+    background: color-mix(in srgb, var(--green) 12%, transparent);
+    color: var(--green);
+  }
+  .spine-step.spine-warn {
+    background: color-mix(in srgb, var(--amber) 16%, transparent);
+    color: var(--amber);
+  }
+  .spine-step.spine-bad {
+    background: color-mix(in srgb, var(--red) 14%, transparent);
+    color: var(--red);
+  }
+  .spine-step.spine-merged {
+    background: color-mix(in srgb, var(--purple) 12%, transparent);
+    color: var(--purple);
+  }
+  .spine-arrow {
+    font-size: 10px; color: var(--graphite); user-select: none;
+  }
+  details.stack-step-collapsed {
+    border-radius: 8px; padding: 4px 8px;
+    background: color-mix(in srgb, var(--ink) 2.5%, transparent);
+    border: 1px dashed var(--hairline); font-size: 11.5px;
+  }
+  details.stack-step-collapsed > summary {
+    cursor: pointer; display: flex; align-items: baseline; gap: 8px;
+    color: var(--graphite); list-style: none; user-select: none; flex-wrap: wrap;
+  }
+  details.stack-step-collapsed > summary::-webkit-details-marker { display: none; }
+  details.stack-step-collapsed > summary .stack-step-cl {
+    font-family: var(--mono); font-weight: 600; color: var(--blue);
+  }
+  details.stack-step-collapsed > summary .stack-step-subj {
+    color: var(--ink); font-weight: 500;
+  }
+  details.stack-step-collapsed > summary .stack-step-hint {
+    margin-left: auto; font-size: 10px; color: var(--graphite);
+  }
+  details.stack-step-collapsed[open] > summary {
+    padding-bottom: 6px; border-bottom: 1px solid var(--hairline);
+    margin-bottom: 6px;
+  }
+  details.stack-step-collapsed .stack-step-expanded { padding: 4px 0; }
+  .stack-blocker-banner {
+    background: color-mix(in srgb, var(--amber) 14%, transparent);
+    color: var(--ink); border-left: 3px solid var(--amber);
+    padding: 4px 8px; border-radius: 6px; font-size: 11px;
+    margin-top: 4px; display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap;
+  }
+  .stack-blocker-banner b { color: var(--amber); }
+  .stack-blocker-banner a { color: var(--blue); text-decoration: underline; font-weight: 600; }
+  .stack-lane-group {
+    border-left: 2px solid color-mix(in srgb, var(--blue) 35%, transparent);
+    padding-left: 8px; margin: 4px 0; display: grid; gap: 2px;
+  }
+  .stack-lane-head {
+    display: flex; align-items: center; gap: 6px; padding: 3px 0;
+    font-size: 10.5px; color: var(--graphite); flex-wrap: wrap;
+  }
+
   @media (max-width: 860px) {
     .hero h1 { font-size: 16px; }
     .card { grid-template-columns: 1fr; padding: 12px; }
@@ -7188,8 +7319,370 @@ function selfReviewBadgeHtml(it) {
   return out.join('');
 }
 
+let cachedStackByIkey = new Map();
+
+function itemKeyOf(it) {
+  if (!it) return '';
+  return String(it.item_key || `${it.kind || 'gerrit'}:${it.target_id || ''}`);
+}
+
+// Resolves the topological root item key for a stacked CL/PR chain
+function resolveStackRootKey(it, byIkey) {
+  if (!it) return '';
+  if (it.stack_root_ikey) return String(it.stack_root_ikey);
+  const ancs = Array.isArray(it.stack_ancestors) ? it.stack_ancestors : [];
+  if (ancs.length && ancs[0]) return String(ancs[0]);
+  let cur = it;
+  const visited = new Set();
+  while (cur && cur.stack_parent_ikey) {
+    const pKey = String(cur.stack_parent_ikey);
+    if (visited.has(pKey)) break;
+    visited.add(pKey);
+    const parent = byIkey ? byIkey.get(pKey) : null;
+    if (!parent) return pKey;
+    cur = parent;
+  }
+  return itemKeyOf(cur || it);
+}
+
+// Sorts items in the same stack bottom-up: root ancestor first, newest child last
+function stackSortCompare(a, b) {
+  const ia = Number(a._stackPos || a.stack_index || 0);
+  const ib = Number(b._stackPos || b.stack_index || 0);
+  if (ia > 0 && ib > 0 && ia !== ib) return ia - ib;
+  const da = Number(a.stack_depth || (a.stack_ancestors && a.stack_ancestors.length) || 0);
+  const db = Number(b.stack_depth || (b.stack_ancestors && b.stack_ancestors.length) || 0);
+  if (da !== db) return da - db;
+  const ta = Number(a.target_id || 0);
+  const tb = Number(b.target_id || 0);
+  if (ta && tb && ta !== tb) return ta - tb;
+  return itemKeyOf(a).localeCompare(itemKeyOf(b));
+}
+
+// Builds stack index and links multi-item chains for grouped visual rendering
+function buildStackContext(items) {
+  cachedStackByIkey = new Map();
+  const list = Array.isArray(items) ? items : [];
+  for (const it of list) {
+    if (it) cachedStackByIkey.set(itemKeyOf(it), it);
+  }
+
+  const byRoot = new Map();
+  for (const it of list) {
+    if (!it || isCompanion(it)) continue;
+    const rKey = resolveStackRootKey(it, cachedStackByIkey);
+    if (!byRoot.has(rKey)) byRoot.set(rKey, []);
+    byRoot.get(rKey).push(it);
+  }
+
+  for (const [rKey, members] of byRoot.entries()) {
+    members.sort(stackSortCompare);
+    const total = members.length;
+    const isMulti = total >= 2;
+    for (let i = 0; i < members.length; i++) {
+      const it = members[i];
+      if (isMulti || Number(it.stack_size || 0) >= 2) {
+        it._stackRoot = rKey;
+        it._stackPos = it.stack_index || (i + 1);
+        it._stackTotal = it.stack_size || total;
+        let chainMembers = members;
+        if (Array.isArray(it.stack_ikeys) && it.stack_ikeys.length >= 2) {
+          const resolved = it.stack_ikeys.map(k => cachedStackByIkey.get(k)).filter(Boolean);
+          if (resolved.length >= members.length) chainMembers = resolved;
+        }
+        it._stackMembers = chainMembers;
+      } else {
+        it._stackRoot = '';
+        it._stackPos = 0;
+        it._stackTotal = 1;
+        it._stackMembers = [it];
+      }
+    }
+  }
+}
+
+function stackStepBadgeHtml(it) {
+  if (!it || isCompanion(it)) return '';
+  const pos = Number(it._stackPos || it.stack_index || 0);
+  const tot = Number(it._stackTotal || it.stack_size || 0);
+  if (pos >= 1 && tot >= 2) {
+    const tip = `Stack position ${pos} of ${tot}`;
+    return `<span class="badge stack-step" title="${esc(tip)}">⛓ ${pos}/${tot}</span>`;
+  }
+  return '';
+}
+
+// Identifies unmerged upstream stack parents that hold descendants from landing or review
+function upstreamBlockersOf(it, data) {
+  if (!it || isCompanion(it)) return [];
+  const ancestors = Array.isArray(it.stack_ancestors) && it.stack_ancestors.length
+    ? it.stack_ancestors
+    : (it.stack_parent_ikey ? [it.stack_parent_ikey] : []);
+  if (!ancestors.length) return [];
+
+  const byIkey = cachedStackByIkey;
+  const rawItems = (data && data.items) || {};
+  const blockers = [];
+
+  for (const ancKey of ancestors) {
+    const anc = byIkey.get(ancKey) || rawItems[ancKey] || null;
+    if (!anc) continue;
+    const st = String(anc.status || '').toUpperCase();
+    if (st === 'MERGED' || st === 'ABANDONED' || st === 'CLOSED') continue;
+
+    const reasons = [];
+    if (anc.merge_conflict) reasons.push('conflict');
+    if (anc.cq_failed || anc.phase === 'ALERT_CQ_FAILED') reasons.push('CQ failed');
+
+    const tr = anc.triage;
+    if (tr && !anc.self_approved) {
+      const v = String(tr.review_outcome || tr.verdict || '').toUpperCase();
+      if (v === 'PUSHBACK' || v.includes('PUSHBACK') || v.includes('DO_NOT_LAND')) {
+        reasons.push('Pushback');
+      } else if (v === 'COMPANION_FIX' || v.includes('FIX')) {
+        reasons.push('Companion fix');
+      } else if (v === 'COMPANION_TESTS' || v.includes('TESTS')) {
+        reasons.push('Companion tests');
+      } else if (v === 'NITS' || v.includes('NITS')) {
+        reasons.push('NITS');
+      } else if (v === 'SURGICAL_AUDIT' || v.includes('SURGICAL')) {
+        reasons.push('Surgical audit');
+      }
+    }
+
+    const comps = Array.isArray(anc.companions) ? anc.companions : [];
+    const openComps = comps.filter(
+      c => c && c.status !== 'ABANDONED' && c.status !== 'CLOSED'
+    );
+    if (openComps.length && !reasons.some(r => r.startsWith('Companion'))) {
+      reasons.push('Companion');
+    }
+
+    if (!anc.is_self) {
+      if (anc.self_review_state === 'changes_requested') {
+        reasons.push('Changes requested');
+      } else if (anc.self_review_state === 'commented' && !anc.self_approved) {
+        if (!reasons.includes('NITS')) reasons.push('Comments');
+      }
+    }
+
+    if (anc.in_my_attention && !anc.self_approved && !reasons.length) {
+      reasons.push('Needs review');
+    }
+
+    if (reasons.length) {
+      blockers.push({ancestor: anc, reasons: [...new Set(reasons)]});
+    }
+  }
+  return blockers;
+}
+
+// Renders an amber banner warning that an upstream parent holds the stack
+function stackBlockerBannerHtml(it, data) {
+  const blockers = upstreamBlockersOf(it, data);
+  if (!blockers.length) return '';
+  const parts = blockers.map(b => {
+    const anc = b.ancestor;
+    const pos = Number(anc._stackPos || anc.stack_index || 0);
+    const tot = Number(anc._stackTotal || anc.stack_size || 0);
+    const stepPrefix = (pos >= 1 && tot >= 2) ? `[${pos}/${tot}] ` : '';
+    const ancLink = link(anc.url, `${stepPrefix}${esc(clLabel(anc))}`);
+    const rStr = b.reasons.join(', ');
+    return `${ancLink} (${esc(rStr)})`;
+  });
+  const joined = parts.join(' & ');
+  const tip = 'Updating parent will rebase this CL/PR; review or fix parent first';
+  return `<div class="stack-blocker-banner" title="${esc(tip)}">` +
+    `⏸️ <b>Parent holds stack:</b> ${joined} — updating parent will rebase this CL</div>`;
+}
+
+// Formats short status text, icon, and tone for a step in the horizontal chain spine
+function spineStepShortState(m) {
+  if (m.status === 'MERGED') return {short: 'Merged', icon: '✓', tone: 'spine-merged'};
+  if (m.status === 'ABANDONED' || m.status === 'CLOSED') {
+    return {short: 'Closed', icon: '—', tone: 'spine-step'};
+  }
+  if (m.self_approved || m.self_review_state === 'approved') {
+    return {short: 'CR+1', icon: '✓', tone: 'spine-ok'};
+  }
+  if (m.cq_failed || m.phase === 'ALERT_CQ_FAILED') {
+    return {short: 'CQ fail', icon: '✗', tone: 'spine-bad'};
+  }
+  if (m.merge_conflict) return {short: 'Conflict', icon: '⚠️', tone: 'spine-warn'};
+  if (isPostSubmitAlert(m)) return {short: 'Alert', icon: '🔴', tone: 'spine-bad'};
+  if (m.chat_busy) return {short: 'Working', icon: '⏳', tone: 'spine-you'};
+
+  const tr = m.triage;
+  if (tr && tr.review_outcome) {
+    const out = String(tr.review_outcome).toUpperCase();
+    if (out === 'CLEAN') return {short: 'Clean', icon: '🟢', tone: 'spine-ok'};
+    if (out === 'NITS') return {short: 'NITS', icon: '🔵', tone: 'spine-warn'};
+    if (out === 'COMPANION_FIX') return {short: 'Fix', icon: '🟠', tone: 'spine-warn'};
+    if (out === 'COMPANION_TESTS') return {short: 'Tests', icon: '🟣', tone: 'spine-warn'};
+    if (out === 'PUSHBACK') return {short: 'Pushback', icon: '🔴', tone: 'spine-bad'};
+    if (out === 'REASSIGN') return {short: 'Reassign', icon: '⚪', tone: 'spine-step'};
+  }
+
+  const lane = laneOf(m);
+  if (lane === 'you') return {short: 'Needs you', icon: '⦿', tone: 'spine-you'};
+  if (lane === 'landing') return {short: 'Landing', icon: '🛫', tone: 'spine-ok'};
+  if (lane === 'desk') {
+    return {short: m.is_draft ? 'Draft' : 'Desk', icon: '📝', tone: 'spine-warn'};
+  }
+  if (m.self_review_state === 'commented') {
+    return {short: 'Reviewed', icon: '💬', tone: 'spine-step'};
+  }
+  return {short: 'Waiting', icon: '⏳', tone: 'spine-step'};
+}
+
+// Renders the 1-line interactive horizontal chain spine across all stack members
+function stackSpineHtml(members) {
+  const list = Array.isArray(members) ? members : [];
+  if (list.length < 2) return '';
+  const total = list.length;
+  const steps = list.map((m, idx) => {
+    const pos = Number(m._stackPos || m.stack_index || (idx + 1));
+    const tot = Number(m._stackTotal || m.stack_size || total);
+    const info = spineStepShortState(m);
+    const label = `[${pos}/${tot} ${info.icon} ${esc(info.short)}]`;
+    const tip = `${clLabel(m)}: ${cleanSubject(m.subject)} (${info.short})`;
+    return link(m.url, label, `spine-step ${info.tone}`, tip);
+  });
+  return `<div class="stack-spine">${steps.join('<span class="spine-arrow">→</span>')}</div>`;
+}
+
+// Groups stacked changes in Needs You into a single container with a spine and collapsed siblings
+function renderFocusSection(youItems, shownItems, data) {
+  const list = Array.isArray(youItems) ? youItems : [];
+  if (!list.length) return '';
+
+  const seenRoots = new Set();
+  const htmlParts = [];
+
+  for (const it of list) {
+    const rootKey = it._stackRoot;
+    const members = it._stackMembers || [];
+    // Standalone item (not in a stack of >= 2) renders standard focus card
+    if (!rootKey || members.length < 2) {
+      htmlParts.push(focusCard(it, data));
+      continue;
+    }
+
+    if (seenRoots.has(rootKey)) continue;
+    seenRoots.add(rootKey);
+
+    const rootItem = members[0] || it;
+    const author = authorLabel(rootItem);
+    const project = esc(rootItem.project_name || 'Skia');
+    const total = members.length;
+    const kindPlural = (rootItem.kind === 'github' ? 'PR' : 'CL') + (total === 1 ? '' : 's');
+    const inYou = members.filter(m => laneOf(m) === 'you').length;
+    const approved = members.filter(
+      m => m.self_approved || m.self_review_state === 'approved'
+    ).length;
+    const descParts = [`${inYou} need${inYou === 1 ? 's' : ''} you`];
+    if (approved) descParts.push(`${approved} approved`);
+    const countsDesc = esc(descParts.join(', '));
+
+    const headHtml = `
+      <div class="stack-head">
+        <div class="stack-head-top">
+          <span class="stack-head-title">🔗 Stack (${total} ${kindPlural})</span>
+          <span class="stack-head-meta">${project} · by ${author} · ${countsDesc}</span>
+        </div>
+        ${stackSpineHtml(members)}
+      </div>`;
+
+    const memberCards = members.map((m, idx) => {
+      const pos = Number(m._stackPos || m.stack_index || (idx + 1));
+      const tot = Number(m._stackTotal || m.stack_size || total);
+      if (laneOf(m) === 'you') {
+        return focusCard(m, data);
+      }
+      // Stack sibling residing in another lane renders as collapsed 1-line separator
+      const stepBadge = `<span class="badge stack-step">⛓ ${pos}/${tot}</span>`;
+      const clText = esc(clLabel(m));
+      const subjText = esc(cleanSubject(m.subject));
+      const stateText = stateHtml(m);
+      return `
+        <details class="stack-step-collapsed">
+          <summary>
+            ${stepBadge}
+            <span class="stack-step-cl">${clText}</span>
+            <span class="stack-step-subj">${subjText}</span>
+            <span>— ${stateText}</span>
+            <span class="stack-step-hint">click to expand</span>
+          </summary>
+          <div class="stack-step-expanded">${rowHtml(m, data)}</div>
+        </details>`;
+    }).join('');
+
+    htmlParts.push(`
+      <section class="stack-group">
+        ${headHtml}
+        ${memberCards}
+      </section>`);
+  }
+
+  return htmlParts.join('');
+}
+
+// Groups stacked changes within status lanes when multiple members appear together
+function renderLaneItemsHtml(laneItems, data) {
+  const list = Array.isArray(laneItems) ? laneItems : [];
+  if (!list.length) return '';
+
+  const stackCounts = new Map();
+  for (const it of list) {
+    if (it._stackRoot && (it._stackMembers || []).length >= 2) {
+      stackCounts.set(it._stackRoot, (stackCounts.get(it._stackRoot) || 0) + 1);
+    }
+  }
+
+  const seenRoots = new Set();
+  const htmlParts = [];
+
+  for (const it of list) {
+    const rKey = it._stackRoot;
+    const isMultiInLane = rKey && (stackCounts.get(rKey) || 0) >= 2;
+    if (!isMultiInLane) {
+      htmlParts.push(rowHtml(it, data));
+      continue;
+    }
+
+    if (seenRoots.has(rKey)) continue;
+    seenRoots.add(rKey);
+
+    const membersInLane = list.filter(m => m._stackRoot === rKey).sort(stackSortCompare);
+    const fullMembers = it._stackMembers || membersInLane;
+    const rootItem = fullMembers[0] || it;
+    const author = authorLabel(rootItem);
+    const project = esc(rootItem.project_name || 'Skia');
+    const total = fullMembers.length;
+    const kindPlural = (rootItem.kind === 'github' ? 'PR' : 'CL') + (total === 1 ? '' : 's');
+
+    const headHtml = `
+      <div class="stack-lane-head">
+        <b>🔗 Stack (${membersInLane.length} of ${total} ${kindPlural})</b> · ` +
+        `${project} · by ${author}
+      </div>
+      ${stackSpineHtml(fullMembers)}`;
+
+    const rows = membersInLane.map(m => rowHtml(m, data)).join('');
+    htmlParts.push(`
+      <div class="stack-lane-group">
+        ${headHtml}
+        ${rows}
+      </div>`);
+  }
+
+  return htmlParts.join('');
+}
+
 function badgesHtml(it, opts) {
   const out = [];
+  const stepBadge = stackStepBadgeHtml(it);
+  if (stepBadge) out.push(stepBadge);
   const wip = wipLabel(it);
   if (wip) out.push(`<span class="badge wip">${esc(wip)}</span>`);
   const selfRev = selfReviewBadgeHtml(it);
@@ -8050,6 +8543,11 @@ function collectReviewerPingGroups(items) {
   const groups = [...byRev.values()];
   for (const g of groups) {
     g.items.sort((a, b) => {
+      const rKeyA = a.item._stackRoot || '';
+      const rKeyB = b.item._stackRoot || '';
+      if (rKeyA && rKeyB && rKeyA === rKeyB) {
+        return stackSortCompare(a.item, b.item);
+      }
       const oa = PING_REASON_ORDER[a.ping.reason] ?? 9;
       const ob = PING_REASON_ORDER[b.ping.reason] ?? 9;
       if (oa !== ob) return oa - ob;
@@ -8320,7 +8818,7 @@ function renderPingsSection(shownItems) {
         <div class="ping-row${x.included ? '' : ' excluded'}">
           <input type="checkbox" ${x.included ? 'checked' : ''}
             onchange="togglePingItem(${revJson}, ${keyJson}, this.checked)">
-          ${pingReasonBadgeHtml(p, it)}${offAtt}
+          ${stackStepBadgeHtml(it)}${pingReasonBadgeHtml(p, it)}${offAtt}
           <span class="meta"><span class="proj-tag">${esc(it.project_name)}</span> ·
             <span class="cl">${clLink}</span></span>
           ${subjLink}
@@ -8558,7 +9056,8 @@ function focusCard(it, data) {
         <div class="why">${whyContent}</div>
         <!-- Surface fix-for linkage on pre-submit focus cards -->
         ${brokenAndFixBannerHtml(it)}${fixesBreakageBannerHtml(it)}
-        ${companionsBannerHtml(it)}</div>
+        ${companionsBannerHtml(it)}
+        ${stackBlockerBannerHtml(it, data)}</div>
       <div class="actions">${actionsWithFix}</div>
       ${triageHtml(it, false)}
     </article>`;
@@ -8579,6 +9078,7 @@ function rowHtml(it, data) {
         <!-- Surface fix-for linkage and broken bots on lane rows -->
         ${brokenAndFixBannerHtml(it)}${fixesBreakageBannerHtml(it)}
         ${companionsBannerHtml(it)}
+        ${stackBlockerBannerHtml(it, data)}
         ${triageHtml(it, true)}</div>
       <div class="state">${stateHtml(it)}</div>
       <div class="when">${rowTime(it)}</div>
@@ -8625,6 +9125,7 @@ function render() {
   if (!data) return;
   const all = visibleItemsFromData(data)
     .sort((a, b) => (b.activity_ts || 0) - (a.activity_ts || 0));
+  buildStackContext(all);
   const projects = projectsOf(all);
   if (selectedProject !== 'ALL' && !projects.includes(selectedProject)) selectedProject = 'ALL';
   const projOf = it => it.project_name || 'Unassigned';
@@ -8664,7 +9165,7 @@ function render() {
   if (by.done.length) sub.push(`${by.done.length} done`);
   document.getElementById('subline').textContent = sub.length ? `${sub.join(' · ')}.` : '';
 
-  document.getElementById('focus').innerHTML = by.you.map(it => focusCard(it, data)).join('');
+  document.getElementById('focus').innerHTML = renderFocusSection(by.you, shown, data);
 
   // Render grouped reviewer ping cards between Needs You and the status lanes
   const pingsEl = document.getElementById('pings');
@@ -8673,13 +9174,13 @@ function render() {
   let lanes = LANES.filter(l => by[l.id].length).map(l =>
     `<section class="lane"><div class="lane-head"><h3>${l.title}</h3>` +
     `<span class="n">${by[l.id].length}</span><span class="hint">${l.hint}</span></div>` +
-    by[l.id].map(it => rowHtml(it, data)).join('') + '</section>').join('');
+    renderLaneItemsHtml(by[l.id], data) + '</section>').join('');
   if (by.done.length) {
     lanes += '<section class="lane"><details class="done"><summary><h3>Done</h3>' +
       `<span class="n">${by.done.length}</span>` +
       '<span class="chev"><span class="closed">Show</span><span class="open">Hide</span></span>' +
       '</summary>' +
-      by.done.map(it => rowHtml(it, data)).join('') + '</details></section>';
+      renderLaneItemsHtml(by.done, data) + '</details></section>';
   }
   document.getElementById('lanes').innerHTML = lanes ||
     '<p class="empty-note">No open CL or PR chats in this project.</p>';

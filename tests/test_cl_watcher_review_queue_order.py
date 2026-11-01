@@ -2,6 +2,7 @@
 """Contract tests for topological review queue ordering and parent readiness gates."""
 
 import os
+import subprocess
 import sys
 import unittest
 from unittest import mock
@@ -91,6 +92,7 @@ class ReviewQueueOrderAndReadinessTest(unittest.TestCase):
     # 1400000 is depth 0 and older; 1412376 is depth 0; 1412377 is depth 1; 1412378 is depth 2
     self.assertEqual(tids, ["1400000", "1412376", "1412377", "1412378"])
 
+    d00 = next(d for d in ordered if d["target_id"] == "1400000")
     d76 = next(d for d in ordered if d["target_id"] == "1412376")
     d77 = next(d for d in ordered if d["target_id"] == "1412377")
     d78 = next(d for d in ordered if d["target_id"] == "1412378")
@@ -98,14 +100,40 @@ class ReviewQueueOrderAndReadinessTest(unittest.TestCase):
     self.assertEqual(d76["stack_depth"], 0)
     self.assertEqual(d76["stack_ancestors"], [])
     self.assertEqual(d76["stack_parent_ikey"], "")
+    self.assertEqual(d76["stack_root_ikey"], "gerrit:1412376")
+    self.assertEqual(d76["stack_size"], 3)
+    self.assertEqual(d76["stack_index"], 1)
+    self.assertEqual(
+        d76["stack_ikeys"],
+        ["gerrit:1412376", "gerrit:1412377", "gerrit:1412378"],
+    )
 
     self.assertEqual(d77["stack_depth"], 1)
     self.assertEqual(d77["stack_ancestors"], ["gerrit:1412376"])
     self.assertEqual(d77["stack_parent_ikey"], "gerrit:1412376")
+    self.assertEqual(d77["stack_root_ikey"], "gerrit:1412376")
+    self.assertEqual(d77["stack_size"], 3)
+    self.assertEqual(d77["stack_index"], 2)
+    self.assertEqual(
+        d77["stack_ikeys"],
+        ["gerrit:1412376", "gerrit:1412377", "gerrit:1412378"],
+    )
 
     self.assertEqual(d78["stack_depth"], 2)
     self.assertEqual(d78["stack_ancestors"], ["gerrit:1412376", "gerrit:1412377"])
     self.assertEqual(d78["stack_parent_ikey"], "gerrit:1412377")
+    self.assertEqual(d78["stack_root_ikey"], "gerrit:1412376")
+    self.assertEqual(d78["stack_size"], 3)
+    self.assertEqual(d78["stack_index"], 3)
+    self.assertEqual(
+        d78["stack_ikeys"],
+        ["gerrit:1412376", "gerrit:1412377", "gerrit:1412378"],
+    )
+
+    self.assertEqual(d00["stack_root_ikey"], "")
+    self.assertEqual(d00["stack_size"], 1)
+    self.assertEqual(d00["stack_index"], 0)
+    self.assertEqual(d00["stack_ikeys"], [])
 
   def test_parent_readiness_barrier_blocks_descendants_until_triage_or_review(self):
     host = "skia-review.googlesource.com"
@@ -263,11 +291,27 @@ class ReviewQueueOrderAndReadinessTest(unittest.TestCase):
 
     self.assertEqual(tids, ["301", "302", "303"])
     self.assertEqual(ordered[0]["stack_depth"], 0)
+    self.assertEqual(ordered[0]["stack_root_ikey"], "github:301")
+    self.assertEqual(ordered[0]["stack_size"], 3)
+    self.assertEqual(ordered[0]["stack_index"], 1)
+    self.assertEqual(
+        ordered[0]["stack_ikeys"], ["github:301", "github:302", "github:303"]
+    )
+
     self.assertEqual(ordered[1]["stack_depth"], 1)
     self.assertEqual(ordered[1]["stack_parent_ikey"], "github:301")
+    self.assertEqual(ordered[1]["stack_root_ikey"], "github:301")
+    self.assertEqual(ordered[1]["stack_size"], 3)
+    self.assertEqual(ordered[1]["stack_index"], 2)
+
     self.assertEqual(ordered[2]["stack_depth"], 2)
     self.assertEqual(ordered[2]["stack_parent_ikey"], "github:302")
-    self.assertEqual(ordered[2]["stack_ancestors"], ["github:301", "github:302"])
+    self.assertEqual(
+        ordered[2]["stack_ancestors"], ["github:301", "github:302"]
+    )
+    self.assertEqual(ordered[2]["stack_root_ikey"], "github:301")
+    self.assertEqual(ordered[2]["stack_size"], 3)
+    self.assertEqual(ordered[2]["stack_index"], 3)
 
   def test_run_queue_triage_topological_sort(self):
     dated_changes = [
@@ -377,6 +421,135 @@ class ReviewQueueOrderAndReadinessTest(unittest.TestCase):
           check=False,
           cwd=canary_advisor.SKIA_DIR,
       )
+
+  def test_dashboard_variant_c_stack_grouping_and_blocker_banner(self):
+    js_code = r"""
+const assert = require('assert');
+const html = process.argv[1];
+const script = html.split('<script>')[1].split('</script>')[0].replace(/boot\(\);/g, '');
+eval(script);
+
+const testItems = [
+  {
+    item_key: 'gerrit:1412376',
+    target_id: '1412376',
+    kind: 'gerrit',
+    project_name: 'SkParagraph',
+    subject: '[SkParagraph] Root feature step 1',
+    url: 'https://skia-review.googlesource.com/c/skia/+/1412376',
+    patchset: 1,
+    status: 'NEW',
+    in_my_attention: true,
+    stack_ancestors: [],
+    stack_parent_ikey: '',
+    stack_root_ikey: 'gerrit:1412376',
+    stack_size: 3,
+    stack_index: 1,
+    stack_ikeys: ['gerrit:1412376', 'gerrit:1412377', 'gerrit:1412378'],
+    triage: {verdict: 'NITS', verdict_label: '🔵 Minor nits', review_outcome: 'NITS'}
+  },
+  {
+    item_key: 'gerrit:1412377',
+    target_id: '1412377',
+    kind: 'gerrit',
+    project_name: 'SkParagraph',
+    subject: '[SkParagraph] Child step 2',
+    url: 'https://skia-review.googlesource.com/c/skia/+/1412377',
+    patchset: 2,
+    status: 'NEW',
+    in_my_attention: false,
+    self_approved: true,
+    self_review_state: 'approved',
+    stack_ancestors: ['gerrit:1412376'],
+    stack_parent_ikey: 'gerrit:1412376',
+    stack_root_ikey: 'gerrit:1412376',
+    stack_size: 3,
+    stack_index: 2,
+    stack_ikeys: ['gerrit:1412376', 'gerrit:1412377', 'gerrit:1412378']
+  },
+  {
+    item_key: 'gerrit:1412378',
+    target_id: '1412378',
+    kind: 'gerrit',
+    project_name: 'SkParagraph',
+    subject: '[SkParagraph] Grandchild step 3',
+    url: 'https://skia-review.googlesource.com/c/skia/+/1412378',
+    patchset: 1,
+    status: 'NEW',
+    in_my_attention: true,
+    stack_ancestors: ['gerrit:1412376', 'gerrit:1412377'],
+    stack_parent_ikey: 'gerrit:1412377',
+    stack_root_ikey: 'gerrit:1412376',
+    stack_size: 3,
+    stack_index: 3,
+    stack_ikeys: ['gerrit:1412376', 'gerrit:1412377', 'gerrit:1412378']
+  }
+];
+
+const mockData = {
+  items: {
+    'gerrit:1412376': testItems[0],
+    'gerrit:1412377': testItems[1],
+    'gerrit:1412378': testItems[2]
+  }
+};
+
+buildStackContext(testItems);
+
+// 1. Verify badgesHtml contains chain position
+assert(badgesHtml(testItems[0]).includes('⛓ 1/3'), 'Must contain ⛓ 1/3 badge');
+assert(badgesHtml(testItems[1]).includes('⛓ 2/3'), 'Must contain ⛓ 2/3 badge');
+assert(badgesHtml(testItems[2]).includes('⛓ 3/3'), 'Must contain ⛓ 3/3 badge');
+
+// 2. Verify upstreamBlockersOf
+const blockersRoot = upstreamBlockersOf(testItems[0], mockData);
+assert.strictEqual(blockersRoot.length, 0, 'Root must have no upstream blockers');
+
+const blockers77 = upstreamBlockersOf(testItems[1], mockData);
+assert.strictEqual(blockers77.length, 1, 'Child must have 1 blocker (root with NITS)');
+assert.strictEqual(blockers77[0].ancestor.target_id, '1412376');
+assert(blockers77[0].reasons.includes('NITS'), 'Reason must include NITS');
+
+const banner77 = stackBlockerBannerHtml(testItems[1], mockData);
+assert(banner77.includes('Parent holds stack:'), 'Must render blocker banner on child');
+assert(
+    banner77.includes('[1/3] CL 1412376'),
+    'Banner must reference parent with step: ' + banner77,
+);
+assert(banner77.includes('(NITS)'), 'Banner must reference parent reason: ' + banner77);
+
+const bannerRoot = stackBlockerBannerHtml(testItems[0], mockData);
+assert.strictEqual(bannerRoot, '', 'Root must not render blocker banner');
+
+// 3. Verify renderFocusSection grouping and spine
+const youItems = [testItems[0], testItems[2]];
+const focusHtml = renderFocusSection(youItems, testItems, mockData);
+
+assert(focusHtml.includes('class="stack-group"'), 'Must render stack-group container');
+assert(focusHtml.includes('🔗 Stack (3 CLs)'), 'Must render Stack (3 CLs) header');
+assert(focusHtml.includes('class="stack-spine"'), 'Must render stack-spine');
+assert(focusHtml.includes('[1/3 🔵 NITS]'), 'Must render step 1 with NITS in spine');
+assert(focusHtml.includes('[2/3 ✓ CR+1]'), 'Must render step 2 with CR+1 in spine');
+assert(
+    focusHtml.includes('details class="stack-step-collapsed"'),
+    'Sibling in waiting must be collapsed',
+);
+assert(focusHtml.includes('CL 1412377'), 'Collapsed sibling must be 1412377');
+
+// 4. Verify lane rendering grouping
+const laneItems = [testItems[0], testItems[2]];
+const laneHtml = renderLaneItemsHtml(laneItems, mockData);
+assert(laneHtml.includes('class="stack-lane-group"'), 'Must group multi-item stack in lane');
+assert(laneHtml.includes('🔗 Stack (2 of 3 CLs)'), 'Must render stack lane header');
+
+console.log('Variant C Dashboard JS tests passed');
+process.exit(0);
+"""
+    cmd = ["node", "-e", js_code, w.DASHBOARD_HTML]
+    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    self.assertEqual(
+        res.returncode, 0, f"Node output: {res.stdout}\nError: {res.stderr}"
+    )
 
 
 if __name__ == "__main__":
