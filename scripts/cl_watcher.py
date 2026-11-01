@@ -3537,16 +3537,31 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
     own_failed_checks, tree_failed_checks = partition_github_failed_checks(
         str(pr_id), head_sha, failed_checks, failing
     )
-    pending_checks = [
-        str(c.get("name") or "")
-        for c in checks
-        if str(c.get("status") or "").upper() in ("IN_PROGRESS", "QUEUED", "PENDING")
-    ]
     label_names = {
         str(lbl.get("name") or "")
         for lbl in (d.get("labels") or [])
         if isinstance(lbl, dict)
     }
+
+    # Ignore dormant queued gate checks that stay queued until label, review, or merge queue
+    def _is_active_pending_check(c: dict[str, Any]) -> bool:
+      st = str(c.get("status") or "").upper()
+      if st not in ("IN_PROGRESS", "QUEUED", "PENDING"):
+        return False
+      name = str(c.get("name") or "")
+      if name == "Awaiting CICD label":
+        return False
+      if name == "Merge Queue Guard" and st == "QUEUED":
+        return False
+      if is_wip and name == "Dashboard Checks" and st == "QUEUED":
+        return False
+      return True
+
+    pending_checks = [
+        str(c.get("name") or "")
+        for c in checks
+        if _is_active_pending_check(c)
+    ]
     # External Flutter PRs stay queued until a flutter-hackers member adds the CICD label
     awaiting_cicd_label = (
         state == "OPEN"
@@ -3736,7 +3751,7 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
     pending_check_dates = [
         str(c.get("startedAt") or "")
         for c in checks
-        if str(c.get("status") or "").upper() in ("IN_PROGRESS", "QUEUED", "PENDING")
+        if _is_active_pending_check(c)
     ]
 
     submitted_et, submitted_age = format_et_and_age(merged_raw)
@@ -6839,10 +6854,16 @@ function statusOf(it) {
   if (it.is_watching || (!it.is_self && it.reviewer_removed)) return 'watching';
   // A conflict on an in-review change needs rebase now; pre-review conflicts stay in On your desk
   if (it.merge_conflict && it.is_self && !preReview) return 'conflict';
-  const cq = String(it.cq_status || '');
-  if (it.phase === 'SUBMITTING' || cq.startsWith('CQ+') || cq.includes('running')) return 'cq';
   if (it.is_draft) return 'draft';
   if (it.in_development) return 'dev';
+  const cq = String(it.cq_status || '');
+  const isApproved = Number(it.approved_count || 0) > 0 &&
+    Number(it.missing_approvals || 0) === 0;
+  // Submitting or fully approved changes with active checks belong in Landing
+  if (it.phase === 'SUBMITTING' || cq.startsWith('CQ+2') ||
+      (isApproved && (cq.startsWith('CQ+') || cq.includes('running')))) {
+    return 'cq';
+  }
   if (it.tree_red) return 'tree';
   return 'waiting';
 }

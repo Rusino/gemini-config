@@ -583,6 +583,30 @@ const devCqRunningCl = {
   is_draft: false, in_development: true, is_watching: false,
   patchset: 3, url: 'https://example.com/3', cr_summary: '0', cq_status: 'CQ+1 (Dry Run)'
 };
+const draftRunningPr = {
+  kind: 'github', status: 'OPEN', phase: 'WAITING_ON_OTHERS',
+  is_draft: true, in_development: false, is_watching: false, approved_count: 0,
+  missing_approvals: 1, patchset: 5, url: 'https://example.com/187181', cr_summary: '4 rev',
+  cq_status: '🔄 2 running'
+};
+const unapprovedRunningPr = {
+  kind: 'github', status: 'OPEN', phase: 'WAITING_ON_OTHERS',
+  is_draft: false, in_development: false, is_watching: false, approved_count: 0,
+  missing_approvals: 1, patchset: 1, url: 'https://example.com/187182', cr_summary: '1 rev',
+  cq_status: '🔄 2 running'
+};
+const approvedRunningPr = {
+  kind: 'github', status: 'OPEN', phase: 'WAITING_ON_OTHERS',
+  is_draft: false, in_development: false, is_watching: false, approved_count: 1,
+  missing_approvals: 0, patchset: 2, url: 'https://example.com/187183', cr_summary: '✓ 1 app',
+  cq_status: '🔄 2 running'
+};
+const submittingCl = {
+  kind: 'gerrit', status: 'NEW', phase: 'SUBMITTING',
+  is_draft: false, in_development: false, is_watching: false, approved_count: 1,
+  missing_approvals: 0, patchset: 4, url: 'https://example.com/1400000', cr_summary: '+2',
+  cq_status: 'CQ+2 (Submitting)'
+};
 const watchingCl = {
   kind: 'gerrit', target_id: '1386096', status: 'NEW', phase: 'WAITING_ON_OTHERS',
   is_self: false, is_external: false, role: 'watching', is_draft: false, in_development: false,
@@ -669,6 +693,14 @@ console.log(JSON.stringify({
   draftStatus: statusOf(draftPr),
   devStatus: statusOf(devCl),
   devCqStatus: statusOf(devCqRunningCl),
+  draftRunningStatus: statusOf(draftRunningPr),
+  draftRunningLane: laneOf(draftRunningPr),
+  unapprovedRunningStatus: statusOf(unapprovedRunningPr),
+  unapprovedRunningLane: laneOf(unapprovedRunningPr),
+  approvedRunningStatus: statusOf(approvedRunningPr),
+  approvedRunningLane: laneOf(approvedRunningPr),
+  submittingStatus: statusOf(submittingCl),
+  submittingLane: laneOf(submittingCl),
   watchingStatus: statusOf(watchingCl),
   reviewedColleagueStatus: statusOf(reviewedColleagueCl),
   reviewStatus: statusOf(reviewCl),
@@ -737,13 +769,21 @@ console.log(JSON.stringify({
     out = json.loads(proc.stdout.strip())
     self.assertEqual(out["draftStatus"], "draft")
     self.assertEqual(out["devStatus"], "dev")
-    self.assertEqual(out["devCqStatus"], "cq")
+    self.assertEqual(out["devCqStatus"], "dev")
+    self.assertEqual(out["draftRunningStatus"], "draft")
+    self.assertEqual(out["draftRunningLane"], "desk")
+    self.assertEqual(out["unapprovedRunningStatus"], "waiting")
+    self.assertEqual(out["unapprovedRunningLane"], "waiting")
+    self.assertEqual(out["approvedRunningStatus"], "cq")
+    self.assertEqual(out["approvedRunningLane"], "landing")
+    self.assertEqual(out["submittingStatus"], "cq")
+    self.assertEqual(out["submittingLane"], "landing")
     self.assertEqual(out["watchingStatus"], "watching")
     self.assertEqual(out["reviewedColleagueStatus"], "watching")
     self.assertEqual(out["reviewStatus"], "waiting")
     self.assertEqual(
         out["lanes"],
-        ["desk", "desk", "landing", "watching", "watching", "waiting", "waiting",
+        ["desk", "desk", "desk", "watching", "watching", "waiting", "waiting",
          "you", "you", "done", "done"],
     )
     self.assertTrue(out["draftState"].startswith("Draft · "))
@@ -930,6 +970,94 @@ console.log(JSON.stringify({
     mock_wake.assert_not_called()
     mock_alert.assert_not_called()
     self.assertEqual(len(state.get("events", [])), 0)
+
+  def test_fetch_github_pr_status_ignores_queued_gate_checks_on_draft(self):
+    # Draft PR with CICD label and queued Merge Queue Guard and Dashboard Checks
+    draft_gh_json = json.dumps({
+        "number": 187181,
+        "title": "[web_paragraph] Draw text decorations directly on the output canvas",
+        "state": "OPEN",
+        "isDraft": True,
+        "author": {"login": "Rusino"},
+        "mergedAt": None,
+        "headRefOid": "5ac3e19661d03acd7490eddc24d30e02a5a6f0d5",
+        "headRefName": "decor1",
+        "reviews": [],
+        "comments": [],
+        "labels": [{"name": "CICD"}],
+        "statusCheckRollup": [
+            {"name": "cla/google", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "Dashboard Checks", "status": "QUEUED", "conclusion": ""},
+            {"name": "Merge Queue Guard", "status": "QUEUED", "conclusion": ""},
+            {"context": "tree-status", "state": "SUCCESS"},
+        ],
+        "url": "https://github.com/flutter/flutter/pull/187181",
+        "mergeable": "MERGEABLE",
+        "reviewRequests": [],
+    })
+    with mock.patch.object(w.subprocess, "check_output", return_value=draft_gh_json):
+      res = w.fetch_github_pr_status("187181")
+
+    self.assertTrue(res["is_draft"])
+    self.assertEqual(res["cq_status"], "✓ Checks green")
+
+    # With an active running check, report the running check count
+    active_gh_json = json.dumps({
+        "number": 187181,
+        "title": "[web_paragraph] Draw text decorations directly on the output canvas",
+        "state": "OPEN",
+        "isDraft": True,
+        "author": {"login": "Rusino"},
+        "mergedAt": None,
+        "headRefOid": "5ac3e19661d03acd7490eddc24d30e02a5a6f0d5",
+        "headRefName": "decor1",
+        "reviews": [],
+        "comments": [],
+        "labels": [{"name": "CICD"}],
+        "statusCheckRollup": [
+            {"name": "cla/google", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "Dashboard Checks", "status": "QUEUED", "conclusion": ""},
+            {"name": "Merge Queue Guard", "status": "QUEUED", "conclusion": ""},
+            {"name": "Tree_analyze", "status": "IN_PROGRESS", "conclusion": ""},
+            {"context": "tree-status", "state": "SUCCESS"},
+        ],
+        "url": "https://github.com/flutter/flutter/pull/187181",
+        "mergeable": "MERGEABLE",
+        "reviewRequests": [],
+    })
+    with mock.patch.object(w.subprocess, "check_output", return_value=active_gh_json):
+      res_active = w.fetch_github_pr_status("187181")
+
+    self.assertEqual(res_active["cq_status"], "🔄 1 running")
+
+    # On a ready-for-review non-draft PR, queued Dashboard Checks is treated as running
+    ready_gh_json = json.dumps({
+        "number": 187181,
+        "title": "[web_paragraph] Draw text decorations directly on the output canvas",
+        "state": "OPEN",
+        "isDraft": False,
+        "author": {"login": "Rusino"},
+        "mergedAt": None,
+        "headRefOid": "5ac3e19661d03acd7490eddc24d30e02a5a6f0d5",
+        "headRefName": "decor1",
+        "reviews": [],
+        "comments": [],
+        "labels": [{"name": "CICD"}],
+        "statusCheckRollup": [
+            {"name": "cla/google", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "Dashboard Checks", "status": "QUEUED", "conclusion": ""},
+            {"name": "Merge Queue Guard", "status": "QUEUED", "conclusion": ""},
+            {"context": "tree-status", "state": "SUCCESS"},
+        ],
+        "url": "https://github.com/flutter/flutter/pull/187181",
+        "mergeable": "MERGEABLE",
+        "reviewRequests": [],
+    })
+    with mock.patch.object(w.subprocess, "check_output", return_value=ready_gh_json):
+      res_ready = w.fetch_github_pr_status("187181")
+
+    self.assertFalse(res_ready["is_draft"])
+    self.assertEqual(res_ready["cq_status"], "🔄 1 running")
 
   def test_dashboard_has_no_manual_chat_actions_or_browser_alerts(self):
     # Check for the removed legacy row button function rather than the Reviewer Pings heading
