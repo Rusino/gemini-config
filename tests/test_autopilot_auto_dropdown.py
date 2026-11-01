@@ -218,6 +218,20 @@ const availableModelsPayload = {
         supportsImages: true,
         quotaInfo: { remainingFraction: 0.56, resetTime: '2026-10-30T12:00:00Z' },
       },
+      'opus-5.5-medium': {
+        displayName: 'Claude Opus 5.5 (Medium)',
+        model: 'MODEL_PLACEHOLDER_M369',
+        apiProvider: 'API_PROVIDER_ANTHROPIC_VERTEX',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.95, resetTime: '2026-10-30T12:30:00Z' },
+      },
+      'gemini-pro-coordinator': {
+        displayName: 'Gemini Pro Orchestrator',
+        model: 'MODEL_PLACEHOLDER_M415',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.99 },
+      },
       'opus-5.5-high-bon-le': {
         displayName: 'Gemini Pro Next',
         model: 'MODEL_PLACEHOLDER_M421',
@@ -353,8 +367,12 @@ global.clearTimeout = () => {};
   assert.strictEqual(labels[0], 'Auto', 'Auto must be the first option in the dropdown');
   assert.strictEqual(
     labels[1],
-    'Claude Opus 5.5 BoN (High)',
-    'Strongest model Opus 5.5 BoN High must immediately follow Auto'
+    'Claude Opus 5.5 (High)',
+    'Strongest model Opus 5.5 High must immediately follow Auto'
+  );
+  assert(
+    !configs.some((c) => c && c.modelId === 'opus-5.5-high-bon-le'),
+    'BoN models must be excluded from clientModelConfigs'
   );
 
   // 2. User manually picks Claude Fable 5.1 (1388) in existing chat-cpp-1
@@ -389,8 +407,8 @@ global.clearTimeout = () => {};
   );
   assert.strictEqual(
     storeState.modelSelection.byConversation['chat-cpp-1'].model,
-    1421,
-    `Selecting Auto must restore profile model Opus 5.5 BoN High (1421), got: ${
+    1369,
+    `Selecting Auto must restore profile model Opus 5.5 Medium (1369), got: ${
       storeState.modelSelection.byConversation['chat-cpp-1']?.model
     }`
   );
@@ -403,21 +421,21 @@ global.clearTimeout = () => {};
   // Floating toast must show transition from Auto to profile model
   const toast = global.document.getElementById('jetski-model-autopilot-toast');
   assert(toast, 'Autopilot toast must mount when resetting via Auto');
-  assert.strictEqual(toast.getAttribute('data-to-model'), 'Claude Opus 5.5 BoN (High)');
+  assert.strictEqual(toast.getAttribute('data-to-model'), 'Claude Opus 5.5 (Medium)');
 
   // 4. Draft chat manual pin reset via Auto
   storeState.conversation.cascadeId = '';
   global.window.location.search = '?section=8acb67c4-2cb7-43ca-ba04-dc547b3c4788';
   reduxStore.dispatch({
     type: 'modelSelection/modelPicked',
-    payload: { model: 1226 },
+    payload: { model: 1415 },
   });
   await new Promise((r) => setImmediate(r));
-  assert.strictEqual(storeState.modelSelection.default.model, 1226);
+  assert.strictEqual(storeState.modelSelection.default.model, 1415);
   const draftPins = JSON.parse(autopilotStorage.get('jetski_manual_model_pins_v1') || '{}');
   assert(draftPins['__draft__:8acb67c4-2cb7-43ca-ba04-dc547b3c4788']);
 
-  // Selecting Auto on draft clears draft pin and restores Opus 5.5 BoN High (1421)
+  // Selecting Auto on draft clears draft pin and restores Opus 5.5 Medium (1369)
   reduxStore.dispatch({
     type: 'modelSelection/modelPicked',
     payload: { model: 999999 },
@@ -428,8 +446,8 @@ global.clearTimeout = () => {};
   assert.strictEqual(draftPinsAfter['__draft__:8acb67c4-2cb7-43ca-ba04-dc547b3c4788'], undefined);
   assert.strictEqual(
     storeState.modelSelection.default.model,
-    1421,
-    'Selecting Auto on draft must restore profile model (1421)'
+    1369,
+    'Selecting Auto on draft must restore profile model (1369)'
   );
 
   // 5. Cleanup removes Auto and restores native configs

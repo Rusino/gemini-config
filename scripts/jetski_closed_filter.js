@@ -465,12 +465,8 @@
     MODEL_OPENAI_GPT_OSS_120B_MEDIUM: 342,
   };
 
-  // Excludes artificial-latency battle arms and aliases that duplicate visible dropdown models
+  // Excludes aliases that duplicate visible dropdown models
   const SKIPPED_HIDDEN_MODEL_IDS = new Set([
-    'bon-experiment-arm-232',
-    'bon-experiment-arm-233',
-    'bon-experiment-arm-234',
-    'bon-experiment-arm-235',
     'fable-5.1-dropdown',
     'gemini-4-carbon',
     'gemini-launch-candidate',
@@ -478,31 +474,41 @@
     'gemini-3.8-flash-tiered',
   ]);
 
-  // Unmasks server-side "Gemini Pro Next" labels into unique dropdown labels for ModelSelector
+  // SERVING_TYPE_BON preview arms reserved for StartBattleMode (b/580403511)
+  const BON_MODEL_ID_RE = /(?:^|-)bon(?:-|$)/i;
+  const FORBIDDEN_BON_ENUMS = new Set([
+    1002,
+    1160,
+    1221,
+    1222,
+    1223,
+    1224,
+    1225,
+    1226,
+    1227,
+    1228,
+    1229,
+    1230,
+    1231,
+    1232,
+    1233,
+    1234,
+    1235,
+    1252,
+    1284,
+    1324,
+    1325,
+    1328,
+    1332,
+    1368,
+    1377,
+    1380,
+    1420,
+    1421,
+  ]);
+
+  // Labels non-BoN hidden models for ModelSelector and context pill display
   const CURATED_HIDDEN_MODELS = [
-    ['glm-5.2-fp8-bon-arm', 'GLM 5.2', '3P'],
-    ['kimi-k3-maas-bon-arm', 'Kimi K3', '3P'],
-    ['sonnet-5.5-bon-le', 'Claude Sonnet 5.5 (Max)', 'BoN'],
-    ['sonnet-5.5-high-bon-le', 'Claude Sonnet 5.5 (High)', 'BoN'],
-    ['opus-5-bon-le', 'Claude Opus 5 (High)', 'BoN'],
-    ['opus-4.8-max-bon-le', 'Claude Opus 4.8 (Max)', 'BoN'],
-    ['opus-4.8-bon-le', 'Claude Opus 4.8 (High)', 'BoN'],
-    ['opus-bon-le', 'Claude Opus 4.6', 'BoN'],
-    ['opus-5.5-max-bon-le', 'Claude Opus 5.5 BoN (Max)', 'BoN'],
-    ['opus-5.5-high-bon-le', 'Claude Opus 5.5 BoN (High)', 'BoN'],
-    ['fable-5.1-max-bon-le', 'Claude Fable 5.1 BoN (Max)', 'BoN'],
-    ['fable-5.1-bon-le', 'Claude Fable 5.1 BoN (High)', 'BoN'],
-    ['bon-experiment-arm-226', 'Gemini 4 Carbon-G', 'Exp'],
-    ['bon-experiment-arm-221', 'Gemini Perseus Fast', 'Exp'],
-    ['bon-experiment-arm-222', 'Gemini CSWise Fast (High)', 'Exp'],
-    ['bon-experiment-arm-223', 'Gemini CSWise Fast (Medium)', 'Exp'],
-    ['bon-experiment-arm-227', 'Gemini Skimaki Fast', 'Exp'],
-    ['bon-experiment-arm-229', 'Gemini Barium-B', 'Exp'],
-    ['bon-experiment-arm-228', 'Gemini LE-01', 'Exp'],
-    ['bon-experiment-arm-225', 'Gemini LE-02', 'Exp'],
-    ['bon-experiment-arm-230', 'Gemini LE-05', 'Exp'],
-    ['bon-experiment-arm-224', 'Gemini LE-06', 'Exp'],
-    ['bon-experiment-arm-231', 'Gemini LE-11', 'Exp'],
     ['gemini-3.8-flash-router', 'Gemini 3.8 Flash Router', 'Exp'],
     ['snowball-subagent', 'Gemini Snowball Subagent', 'Exp'],
     ['gemini-3.1-flash-lite', 'Gemini 3.1 Flash Lite', 'Exp'],
@@ -515,6 +521,15 @@
   const CURATED_HIDDEN_MODEL_MAP = new Map(
     CURATED_HIDDEN_MODELS.map(([id, label, tag]) => [id, { label, tag }])
   );
+  const CURATED_ENUM_LABELS = new Map([
+    [1367, 'Claude Opus 5.5 (Medium)'],
+    [1369, 'Claude Opus 5.5 (Low)'],
+    [1370, 'Claude Opus 5.5 (High)'],
+    [1371, 'Claude Opus 5.5 (Max)'],
+    [1415, 'Gemini Pro Orchestrator'],
+    [1422, 'Gemini 3.8 Flash Router'],
+    [1427, 'Gemini 4 Carbon (High)'],
+  ]);
 
   // Two-threshold quota autopilot floors and floating notification toast ID (R71.2)
   const QUOTA_SOFT_FLOOR = 0.30;
@@ -528,28 +543,15 @@
   // Priority ordering for Recommended dropdown: Auto first, followed by strongest models
   const PREFERRED_DROPDOWN_MODEL_ORDER = [
     AUTOPILOT_OPTION_MODEL_ID,
-    // Tier 1: Flagship models (Opus 5.5, Sonnet 5.5, Carbon-G, Gemini Pro, 3P top models)
-    'opus-5.5-high-bon-le',
-    'opus-5.5-max-bon-le',
+    // Tier 1: Flagship production models (Opus 5.5, Gemini Pro Orchestrator, Carbon)
     'opus-5.5-high',
     'opus-5.5-medium',
     'opus-5.5-max',
-    'sonnet-5.5-high-bon-le',
-    'sonnet-5.5-bon-le',
-    'bon-experiment-arm-226',
     'gemini-pro-coordinator',
+    'gemini-4-carbon-high',
     'auto',
-    'glm-5.2-fp8-bon-arm',
-    'kimi-k3-maas-bon-arm',
-    // Tier 2: Strong secondary & reasoning models
-    'opus-5-bon-le',
-    'fable-5.1-max-bon-le',
-    'fable-5.1-bon-le',
+    // Tier 2: Secondary models
     'fable-5.1-dropdown',
-    'opus-4.8-max-bon-le',
-    'opus-4.8-bon-le',
-    'opus-bon-le',
-    'deepseek-r2-bon-arm',
     // Tier 3: Flash / triage models
     'gemini-flash-next',
     'gemini-3.8-flash-high',
@@ -632,22 +634,17 @@
 
   const WEB_MODEL_PROFILES = {
     'cpp-core': [
-      'opus-5.5-high-bon-le',
       'opus-5.5-medium',
-      'opus-5.5-max-bon-le',
       'opus-5.5-high',
-      'sonnet-5.5-high-bon-le',
-      'sonnet-5.5-bon-le',
-      'bon-experiment-arm-226',
+      'opus-5.5-max',
       'gemini-pro-coordinator',
+      'gemini-4-carbon-high',
       'auto',
     ],
     'orchestrator': [
       'gemini-pro-coordinator',
-      'bon-experiment-arm-226',
       'auto',
-      'sonnet-5.5-high-bon-le',
-      'sonnet-5.5-bon-le',
+      'gemini-4-carbon-high',
       'gemini-flash-next',
       'gemini-3.8-flash-high',
       'gemini-3.8-flash-medium',
@@ -2597,13 +2594,21 @@
             );
             let replacement = null;
             let reason = '';
-            // Substitute Auto sentinel with the project profile model before sending RPC
-            if (isAutopilotSentinel) {
+            const isForbiddenBon = isForbiddenBonModel(
+              entry?.modelId || String(planModel),
+              planModel
+            );
+            if (isForbiddenBon) {
+              deleteManualPin(pinKey);
+              autoSeededTargets.delete(pinKey);
+            }
+            // Substitute Auto sentinel or forbidden BoN model with the project profile model
+            if (isAutopilotSentinel || isForbiddenBon) {
               const profile =
                 resolveProjectProfileForConversation(reduxStore, body.cascadeId) ||
                 'orchestrator';
               replacement = resolveAutopilotModelForProfile(catalog, profile);
-              reason = `${profile} profile`;
+              reason = isForbiddenBon ? 'BoN disabled' : `${profile} profile`;
             } else if (entry && entry.quota < (isPinned ? EMERGENCY_PIN_FLOOR : QUOTA_HARD_FLOOR)) {
               const profile =
                 resolveProjectProfileForConversation(reduxStore, body.cascadeId) ||
@@ -2619,7 +2624,7 @@
             }
             // Promote draft manual pin to the new cascadeId on StartCascade and free the draft slot
             if (url.includes('/StartCascade') && pinKey.startsWith('__draft__:')) {
-              if (body.cascadeId && pin) {
+              if (body.cascadeId && pin && !isForbiddenBon) {
                 setManualPin(body.cascadeId, replacement?.enumVal || pin.model, 1);
               }
               deleteManualPin(pinKey);
@@ -2674,10 +2679,21 @@
     return NAMED_MODEL_ENUM_VALUES[modelEnum] || 0;
   }
 
+  // Returns true when modelId or modelEnum belongs to a SERVING_TYPE_BON preview arm
+  function isForbiddenBonModel(modelId, modelEnum) {
+    const mid = String(modelId || '').trim();
+    if (mid && BON_MODEL_ID_RE.test(mid)) return true;
+    const numVal =
+      typeof modelEnum === 'number' ? modelEnum : resolveModelEnumValue(String(modelEnum || ''));
+    if (numVal && FORBIDDEN_BON_ENUMS.has(numVal)) return true;
+    const rawEnum = String(modelEnum || '').trim();
+    if (rawEnum && BON_MODEL_ID_RE.test(rawEnum)) return true;
+    return false;
+  }
+
   // Formats an unknown modelId into a readable fallback label when displayName is masked
   function humanizeModelId(modelId) {
     const cleaned = String(modelId || '')
-      .replace(/-(?:bon-arm|bon-le)$/i, '')
       .replace(/[-_]+/g, ' ')
       .trim();
     if (!cleaned) return String(modelId || 'Hidden Model');
@@ -2820,7 +2836,7 @@
     return quotaObj;
   }
 
-  // Indexes models from clientModelConfigs and availableModelsCache
+  // Indexes non-BoN models from clientModelConfigs and availableModelsCache
   function buildModelCatalogIndex(store) {
     const byId = new Map();
     const byEnum = new Map();
@@ -2835,7 +2851,7 @@
     const modelsMap = availableModelsCache?.models;
     if (modelsMap && typeof modelsMap === 'object') {
       for (const [mid, det] of Object.entries(modelsMap)) {
-        if (!det || typeof det !== 'object') continue;
+        if (!det || typeof det !== 'object' || isForbiddenBonModel(mid, det.model)) continue;
         const enumVal = resolveModelEnumValue(det.model);
         const curated = CURATED_HIDDEN_MODEL_MAP.get(mid);
         const label = curated?.label || det.displayName || humanizeModelId(mid);
@@ -2853,11 +2869,12 @@
     const configs = store?.getState()?.userStatus?.cascadeModelConfigData?.clientModelConfigs;
     if (Array.isArray(configs)) {
       for (const cfg of configs) {
-        // Exclude the synthetic Auto reset entry from executable catalog candidates
+        // Exclude the synthetic Auto reset entry and forbidden BoN arms from executable candidates
         if (!cfg || cfg.modelId === AUTOPILOT_OPTION_MODEL_ID) continue;
         const mid = cfg.modelId || '';
         const numVal = cfg.modelOrAlias?.choice?.value;
         const enumVal = typeof numVal === 'number' ? numVal : 0;
+        if (isForbiddenBonModel(mid, enumVal)) continue;
         const label = cfg.label || mid;
         const quota = getEffectiveQuotaFraction(cfg.quotaInfo, cfg.tagTitle, cfg.tagDescription);
         const prev = (mid && byId.get(mid.toLowerCase())) || (enumVal && byEnum.get(enumVal));
@@ -2876,7 +2893,7 @@
     return { byId, byEnum };
   }
 
-  // Reroutes wasteful WTU models to request-counted or Orchestrator pools
+  // Reroutes wasteful WTU models to standard Opus 5.5 or Gemini Pro Orchestrator pools
   function rerouteWastefulWtuModelInUi(catalog, modelKey, minFloor = QUOTA_SOFT_FLOOR) {
     if (!catalog || modelKey === undefined || modelKey === null) return null;
     const entry =
@@ -2887,10 +2904,10 @@
     const enumStr = (entry?.enumName || String(modelKey)).toLowerCase();
     const numVal = entry?.enumVal || (typeof modelKey === 'number' ? modelKey : 0);
 
-    // Non-BoN Fable 5.1 -> Opus 5.5
+    // Fable 5.1 -> Opus 5.5
     const isFable =
       id === 'fable-5.1-dropdown' ||
-      (id.startsWith('fable-5.1') && !id.includes('-bon-le')) ||
+      id.startsWith('fable-5.1') ||
       numVal === 1388 ||
       numVal === 1386 ||
       numVal === 1387 ||
@@ -2898,18 +2915,13 @@
       enumStr === 'model_placeholder_m386' ||
       enumStr === 'model_placeholder_m387';
     if (isFable) {
-      for (const cand of [
-        'opus-5.5-high-bon-le',
-        'opus-5.5-max-bon-le',
-        'opus-5.5-medium',
-        'opus-5.5-high',
-      ]) {
+      for (const cand of ['opus-5.5-medium', 'opus-5.5-high', 'opus-5.5-max']) {
         const hit = catalog.byId.get(cand);
         if (hit && hit.quota >= minFloor) return hit;
       }
     }
 
-    // Gemini 4 Argon WTU -> Gemini Pro Orchestrator / Carbon-G
+    // Gemini 4 Argon WTU -> Gemini Pro Orchestrator / auto
     const isArgon =
       id.startsWith('gemini-launch-candidate') ||
       numVal === 1393 ||
@@ -2919,19 +2931,19 @@
       enumStr === 'model_placeholder_m417' ||
       enumStr === 'model_placeholder_m418';
     if (isArgon) {
-      for (const cand of ['gemini-pro-coordinator', 'bon-experiment-arm-226', 'auto']) {
+      for (const cand of ['gemini-pro-coordinator', 'auto']) {
         const hit = catalog.byId.get(cand);
         if (hit && hit.quota >= minFloor) return hit;
       }
     }
 
-    // Gemini 4 Carbon WTU -> Gemini 4 Carbon-G
+    // Gemini 4 Carbon WTU -> Gemini Pro Orchestrator / auto
     const isCarbon =
       (id.startsWith('gemini-4-carbon') && !id.includes('-g')) ||
       (numVal >= 1439 && numVal <= 1442) ||
       (enumStr >= 'model_placeholder_m439' && enumStr <= 'model_placeholder_m442');
     if (isCarbon) {
-      for (const cand of ['bon-experiment-arm-226', 'gemini-pro-coordinator', 'auto']) {
+      for (const cand of ['gemini-pro-coordinator', 'auto']) {
         const hit = catalog.byId.get(cand);
         if (hit && hit.quota >= minFloor) return hit;
       }
@@ -2952,19 +2964,6 @@
       .trim()
       .toLowerCase()
       .replace(/^profile:/, '');
-
-    if (p === 'cpp-core') {
-      const hitBon =
-        catalog.byId.get('opus-5.5-high-bon-le') || catalog.byId.get('opus-5.5-max-bon-le');
-      const hitWtu = catalog.byId.get('opus-5.5-medium') || catalog.byId.get('opus-5.5-high');
-      const qBon = hitBon ? hitBon.quota : 0;
-      const qWtu = hitWtu ? hitWtu.quota : 0;
-      if ((hitBon && qBon >= softFloor) || (hitWtu && qWtu >= softFloor)) {
-        if (hitWtu && qWtu > qBon + 0.05 && qWtu >= softFloor) return hitWtu;
-        if (hitBon && qBon >= softFloor) return hitBon;
-        if (hitWtu) return hitWtu;
-      }
-    }
 
     if (p === 'triage') {
       const hitFlash25 =
@@ -3067,7 +3066,7 @@
       for (const [k, v] of Object.entries(parsed)) {
         if (!k) continue;
         const model = typeof v === 'number' ? v : Number(v?.model);
-        if (!Number.isFinite(model) || model <= 0) continue;
+        if (!Number.isFinite(model) || model <= 0 || isForbiddenBonModel('', model)) continue;
         const atStep = typeof v === 'object' && v ? Math.max(0, Number(v.atStep || 0)) : 0;
         const updatedAt =
           typeof v === 'object' && v && Number.isFinite(Number(v.updatedAt))
@@ -3092,7 +3091,10 @@
       for (const [k, v] of manualPickedModels.entries()) {
         if (!k || !v) continue;
         const model = typeof v === 'number' ? v : Number(v.model);
-        if (!Number.isFinite(model) || model <= 0) continue;
+        if (!Number.isFinite(model) || model <= 0 || isForbiddenBonModel('', model)) {
+          manualPickedModels.delete(k);
+          continue;
+        }
         const atStep = typeof v === 'object' ? Math.max(0, Number(v.atStep || 0)) : 0;
         const updatedAt =
           typeof v === 'object' && Number.isFinite(Number(v.updatedAt))
@@ -3126,7 +3128,10 @@
             atStep: Math.max(0, Number(raw.atStep || 0)),
             updatedAt: Number.isFinite(Number(raw.updatedAt)) ? Number(raw.updatedAt) : now,
           };
-    if (String(key).startsWith('__draft__:') && now - entry.updatedAt > DRAFT_MANUAL_PIN_TTL_MS) {
+    if (
+      isForbiddenBonModel('', entry.model) ||
+      (String(key).startsWith('__draft__:') && now - entry.updatedAt > DRAFT_MANUAL_PIN_TTL_MS)
+    ) {
       manualPickedModels.delete(key);
       saveManualModelPins();
       return null;
@@ -3135,7 +3140,7 @@
   }
 
   function setManualPin(key, modelEnum, atStep = 0) {
-    if (!key || !modelEnum) return;
+    if (!key || !modelEnum || isForbiddenBonModel('', modelEnum)) return;
     manualPickedModels.set(key, {
       model: Number(modelEnum),
       atStep: Math.max(0, Number(atStep || 0)),
@@ -3282,12 +3287,20 @@
     }
     if (!curModel) return;
     const curEntry = catalog.byEnum.get(curModel);
+    const isForbiddenBon = isForbiddenBonModel(curEntry?.modelId || '', curModel);
     // Pinned conversations bypass WTU shield and use the 5% emergency floor instead of 15%
-    const isPinned = Boolean(pin && pin.model === curModel);
+    const isPinned = Boolean(!isForbiddenBon && pin && pin.model === curModel);
 
     let replacement = null;
     let reason = '';
-    if (curEntry && curEntry.quota < (isPinned ? EMERGENCY_PIN_FLOOR : QUOTA_HARD_FLOOR)) {
+    if (isForbiddenBon) {
+      deleteManualPin(cascadeId);
+      replacement = resolveAutopilotModelForProfile(
+        catalog,
+        profile || 'orchestrator'
+      );
+      reason = 'BoN disabled';
+    } else if (curEntry && curEntry.quota < (isPinned ? EMERGENCY_PIN_FLOOR : QUOTA_HARD_FLOOR)) {
       replacement = resolveAutopilotModelForProfile(
         catalog,
         profile || 'orchestrator'
@@ -3587,8 +3600,13 @@
         continue;
       }
       const entry = modelsMap[modelId];
-      // Skip internal routing placeholders that are not interactive chat models
-      if (!entry || typeof entry !== 'object' || entry.apiProvider === 'API_PROVIDER_INTERNAL') {
+      // Skip internal routing placeholders and forbidden SERVING_TYPE_BON preview arms
+      if (
+        !entry ||
+        typeof entry !== 'object' ||
+        entry.apiProvider === 'API_PROVIDER_INTERNAL' ||
+        isForbiddenBonModel(modelId, entry.model)
+      ) {
         continue;
       }
       const enumVal = resolveModelEnumValue(entry.model);
@@ -3867,18 +3885,22 @@
         }
 
         const entry = catalog.byEnum.get(pickedModel);
-        if (entry && entry.quota < EMERGENCY_PIN_FLOOR) {
+        const isForbiddenBon = isForbiddenBonModel(entry?.modelId || '', pickedModel);
+        if (isForbiddenBon || (entry && entry.quota < EMERGENCY_PIN_FLOOR)) {
           const profile =
             resolveProjectProfileForConversation(store, action.payload.conversationId) ||
             'orchestrator';
           const rescue = resolveAutopilotModelForProfile(catalog, profile);
           if (rescue && rescue.enumVal && rescue.enumVal !== pickedModel) {
-            // Persist the rescued model as the active pin for this conversation or draft
-            setManualPin(pinKey, rescue.enumVal, stepCount);
+            if (!isForbiddenBon) {
+              setManualPin(pinKey, rescue.enumVal, stepCount);
+            } else {
+              deleteManualPin(pinKey);
+            }
             showAutopilotToast(
-              entry.label,
+              entry?.label || String(pickedModel),
               rescue.label,
-              `${Math.round(entry.quota * 100)}% exhausted`
+              isForbiddenBon ? 'BoN disabled' : `${Math.round(entry.quota * 100)}% exhausted`
             );
             return origDispatch.call(this, {
               ...action,
@@ -3886,7 +3908,7 @@
             });
           }
         }
-        if (pickedModel) {
+        if (pickedModel && !isForbiddenBon) {
           setManualPin(pinKey, pickedModel, stepCount);
         }
       }
@@ -9687,7 +9709,7 @@
       (enumVal && catalog.byEnum.get(enumVal)) ||
       (rawEnum && catalog.byId.get(rawEnum.toLowerCase()));
 
-    let displayName = curated?.label || '';
+    let displayName = curated?.label || CURATED_ENUM_LABELS.get(enumVal) || '';
     if (!displayName && catalogEntry?.label && catalogEntry.label !== 'Gemini Pro Next') {
       displayName = catalogEntry.label;
     }
@@ -9730,12 +9752,7 @@
     if (!enumVal) return '';
     const catalog = buildModelCatalogIndex(store);
     const entry = catalog.byEnum.get(enumVal);
-    let label = entry?.label;
-    if (!label && enumVal >= 1000) {
-      const armId = `bon-experiment-arm-${enumVal - 1000}`;
-      const curated = CURATED_HIDDEN_MODEL_MAP.get(armId);
-      if (curated) label = curated.label;
-    }
+    let label = entry?.label || CURATED_ENUM_LABELS.get(enumVal) || '';
     if (!label) {
       label = humanizeModelId(String(rawVal));
     }

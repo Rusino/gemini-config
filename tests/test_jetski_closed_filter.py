@@ -2532,6 +2532,34 @@ const availableModelsPayload = {
         supportsImages: true,
         quotaInfo: { remainingFraction: 0.56, resetTime: '2026-10-30T12:00:00Z' },
       },
+      'opus-5.5-medium': {
+        displayName: 'Gemini Pro Next',
+        model: 'MODEL_PLACEHOLDER_M369',
+        apiProvider: 'API_PROVIDER_ANTHROPIC_VERTEX',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.95, resetTime: '2026-10-30T12:30:00Z' },
+      },
+      'gemini-pro-coordinator': {
+        displayName: 'Gemini Pro Next',
+        model: 'MODEL_PLACEHOLDER_M415',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.99 },
+      },
+      'gemini-3.8-flash-router': {
+        displayName: 'Gemini Pro Next',
+        model: 'MODEL_PLACEHOLDER_M422',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.88, resetTime: '2026-10-30T12:30:00Z' },
+      },
+      'deepseek-r2-preview': {
+        displayName: 'Gemini Pro Next',
+        model: 'MODEL_PLACEHOLDER_M490',
+        apiProvider: 'API_PROVIDER_OPENAI_VERTEX',
+        supportsImages: false,
+        quotaInfo: { remainingFraction: 0.5, resetTime: '2026-10-30T15:00:00Z' },
+      },
       'glm-5.2-fp8-bon-arm': {
         displayName: 'GLM 5.2',
         model: 'MODEL_PLACEHOLDER_M252',
@@ -2752,11 +2780,12 @@ global.requestAnimationFrame = () => 1;
 
   // Auto is placed first, followed immediately by strongest models (Opus 5.5)
   assert.strictEqual(labels[0], 'Auto');
-  assert.deepStrictEqual(labels.slice(0, 4), [
+  assert.deepStrictEqual(labels.slice(0, 5), [
     'Auto',
-    'Claude Opus 5.5 BoN (Max)',
     'Claude Opus 5.5 (High)',
+    'Claude Opus 5.5 (Medium)',
     'Claude Opus 5.5 (Max)',
+    'Gemini Pro Orchestrator',
   ]);
 
   // Every label in clientModelConfigs and modelLabels must be unique
@@ -2777,33 +2806,24 @@ global.requestAnimationFrame = () => 1;
   assert.strictEqual(byModelId.get('opus-5.5-max')?.tagTitle, '56%');
   assert.strictEqual(byModelId.get('opus-5.5-high')?.tagTitle, '56%');
 
-  const glm = byModelId.get('glm-5.2-fp8-bon-arm');
-  assert(glm, 'GLM 5.2 must be unlocked');
-  assert.strictEqual(glm.label, 'GLM 5.2');
-  assert.strictEqual(glm.tagTitle, '3P · 100%');
-  assert(glm.tagDescription.includes('100% quota left'));
-  assert(glm.tagDescription.includes('glm-5.2-fp8-bon-arm'));
-  assert.strictEqual(glm.$typeName, 'exa.codeium_common_pb.ClientModelConfig');
-  assert.strictEqual(glm.__isBufProto, true, 'Must preserve ClientModelConfig prototype');
-  assert.deepStrictEqual(glm.modelOrAlias.choice, { case: 'model', value: 1252 });
-  assert.strictEqual(glm.quotaInfo.$typeName, 'exa.codeium_common_pb.QuotaInfo');
-  assert.strictEqual(glm.quotaInfo.remainingFraction, 1);
-  assert.strictEqual(typeof glm.quotaInfo.resetTime.seconds, 'bigint');
-  assert.strictEqual(glm.quotaInfo.resetTime.$typeName, 'google.protobuf.Timestamp');
+  const opusMed = byModelId.get('opus-5.5-medium');
+  assert(opusMed, 'Opus 5.5 Medium must be unlocked');
+  assert.strictEqual(opusMed.label, 'Claude Opus 5.5 (Medium)');
+  assert.strictEqual(opusMed.tagTitle, 'WTU · 95%');
+  assert(opusMed.tagDescription.includes('95% quota left'));
+  assert(opusMed.tagDescription.includes('opus-5.5-medium'));
+  assert.strictEqual(opusMed.$typeName, 'exa.codeium_common_pb.ClientModelConfig');
+  assert.strictEqual(opusMed.__isBufProto, true, 'Must preserve ClientModelConfig prototype');
+  assert.deepStrictEqual(opusMed.modelOrAlias.choice, { case: 'model', value: 1369 });
+  assert.strictEqual(opusMed.quotaInfo.$typeName, 'exa.codeium_common_pb.QuotaInfo');
+  assert.strictEqual(opusMed.quotaInfo.remainingFraction, 0.95);
+  assert.strictEqual(typeof opusMed.quotaInfo.resetTime.seconds, 'bigint');
+  assert.strictEqual(opusMed.quotaInfo.resetTime.$typeName, 'google.protobuf.Timestamp');
 
-  assert.strictEqual(byModelId.get('kimi-k3-maas-bon-arm')?.label, 'Kimi K3');
-  assert.strictEqual(byModelId.get('kimi-k3-maas-bon-arm')?.tagTitle, '3P · 85%');
-  assert.strictEqual(byModelId.get('sonnet-5.5-bon-le')?.label, 'Claude Sonnet 5.5 (Max)');
-  assert.strictEqual(byModelId.get('sonnet-5.5-bon-le')?.tagTitle, 'BoN · 72%');
-  assert.strictEqual(byModelId.get('sonnet-5.5-high-bon-le')?.label, 'Claude Sonnet 5.5 (High)');
-  assert.strictEqual(byModelId.get('sonnet-5.5-high-bon-le')?.tagTitle, 'BoN · 72%');
-  assert.strictEqual(byModelId.get('opus-5-bon-le')?.label, 'Claude Opus 5 (High)');
-  assert.strictEqual(byModelId.get('opus-5-bon-le')?.tagTitle, 'BoN · 91%');
-  assert.strictEqual(byModelId.get('opus-5.5-max-bon-le')?.label, 'Claude Opus 5.5 BoN (Max)');
-  assert.strictEqual(byModelId.get('opus-5.5-max-bon-le')?.tagTitle, 'BoN · 100%');
-  assert.strictEqual(byModelId.get('bon-experiment-arm-226')?.label, 'Gemini 4 Carbon-G');
-  assert.strictEqual(byModelId.get('bon-experiment-arm-226')?.tagTitle, 'Exp · 99%');
-  assert.strictEqual(byModelId.get('bon-experiment-arm-226')?.quotaInfo?.resetTime, undefined);
+  assert.strictEqual(byModelId.get('gemini-pro-coordinator')?.label, 'Gemini Pro Orchestrator');
+  assert.strictEqual(byModelId.get('gemini-pro-coordinator')?.tagTitle, 'Pro · 99%');
+  assert.strictEqual(byModelId.get('gemini-3.8-flash-router')?.label, 'Gemini 3.8 Flash Router');
+  assert.strictEqual(byModelId.get('gemini-3.8-flash-router')?.tagTitle, 'Exp · 88%');
 
   const flash25 = byModelId.get('gemini-2.5-flash');
   assert(flash25, 'Gemini 2.5 Flash must be unlocked with named enum 312');
@@ -2811,12 +2831,30 @@ global.requestAnimationFrame = () => 1;
   assert.strictEqual(flash25.tagTitle, '2.5 · 100%');
   assert.deepStrictEqual(flash25.modelOrAlias.choice, { case: 'model', value: 312 });
 
-  const future = byModelId.get('deepseek-r2-bon-arm');
+  const future = byModelId.get('deepseek-r2-preview');
   assert(future, 'Unknown future hidden model must be unlocked via fallback');
   assert.notStrictEqual(future.label, 'Gemini Pro Next');
   assert(/deepseek/i.test(future.label), `Expected humanized fallback label, got: ${future.label}`);
   assert.strictEqual(future.tagTitle, 'Hidden · 50%');
   assert.deepStrictEqual(future.modelOrAlias.choice, { case: 'model', value: 1490 });
+
+  // Verify all SERVING_TYPE_BON models are blocked from the picker
+  for (const bonBlocked of [
+    'glm-5.2-fp8-bon-arm',
+    'kimi-k3-maas-bon-arm',
+    'sonnet-5.5-bon-le',
+    'sonnet-5.5-high-bon-le',
+    'opus-5-bon-le',
+    'opus-5.5-max-bon-le',
+    'bon-experiment-arm-226',
+    'deepseek-r2-bon-arm',
+    'bon-experiment-arm-232',
+    'bon-experiment-arm-233',
+    'bon-experiment-arm-234',
+    'bon-experiment-arm-235',
+  ]) {
+    assert(!byModelId.has(bonBlocked), `Forbidden BoN model ${bonBlocked} must not appear in picker`);
+  }
 
   // Verify junk, FIM, image, deprecated, duplicate-alias, and artificial-latency arms are excluded
   for (const blocked of [
@@ -2852,7 +2890,7 @@ global.requestAnimationFrame = () => 1;
   assert.strictEqual(afterPollConfigs[0].tagTitle, '78%');
   assert(afterPollConfigs[0].tagDescription.includes('78% quota left'));
   assert(
-    afterPollConfigs.some((c) => c.modelId === 'glm-5.2-fp8-bon-arm'),
+    afterPollConfigs.some((c) => c.modelId === 'opus-5.5-medium'),
     'Synchronous enrichment on poll must keep unlocked models without flicker'
   );
 
@@ -3773,39 +3811,39 @@ eval(code);
   assert.strictEqual(activeBadge.textContent, '⟳ Flash 3.8 (Skimaki) · 115k / 256k · 45%');
   assert.strictEqual(activeBadge.getAttribute('data-actual-model'), 'Flash 3.8 (Skimaki)');
 
-  // R71.3: Masked BoN model unmasks in pill and tooltip shows Next turn selected model
+  // R71.3: Hidden model unmasks in pill and tooltip shows Next turn selected model
   storeState.modelSelection = {
-    byConversation: { 'chat-active': { model: 1226 } },
+    byConversation: { 'chat-active': { model: 1415 } },
   };
   gmCalls.length = 0;
   activeGmList.push(
     makeEntry(118000, 256000, 1, undefined, {
-      model: 'MODEL_PLACEHOLDER_M380',
+      model: 'MODEL_PLACEHOLDER_M369',
       modelDisplayName: 'Gemini Pro Next',
-      responseModel: 'opus-5.5-high-bon-le|claude-opus-5-5@default',
+      responseModel: 'opus-5.5-medium|claude-opus-5-5@default',
     })
   );
   fakeNow += 2000;
   bumpActiveSummary(13);
   await flushAsync();
-  assert.strictEqual(activeBadge.textContent, '⟳ Opus 5.5 BoN (High) · 118k / 256k · 46%');
-  assert.strictEqual(activeBadge.getAttribute('data-actual-model'), 'Opus 5.5 BoN (High)');
+  assert.strictEqual(activeBadge.textContent, '⟳ Opus 5.5 (Med) · 118k / 256k · 46%');
+  assert.strictEqual(activeBadge.getAttribute('data-actual-model'), 'Opus 5.5 (Med)');
 
   activeBadge.dispatchEvent('mouseenter');
-  assert(bubble.innerHTML.includes('Claude Opus 5.5 BoN (High) (M380)'));
-  assert(bubble.innerHTML.includes('opus-5.5-high-bon-le · claude-opus-5-5'));
+  assert(bubble.innerHTML.includes('Claude Opus 5.5 (Medium) (M369)'));
+  assert(bubble.innerHTML.includes('opus-5.5-medium · claude-opus-5-5'));
   assert(bubble.innerHTML.includes('Next turn'));
-  assert(bubble.innerHTML.includes('Gemini 4 Carbon-G'));
+  assert(bubble.innerHTML.includes('Gemini Pro Orchestrator'));
   activeBadge.dispatchEvent('mouseleave');
 
   // Manual pin surfaces "· Pinned" marker next to selected next turn model
   window.__jetskiManualPickedModels.set('chat-active', {
-    model: 1226,
+    model: 1415,
     atStep: 0,
     updatedAt: fakeNow,
   });
   activeBadge.dispatchEvent('mouseenter');
-  assert(bubble.innerHTML.includes('Gemini 4 Carbon-G · Pinned'));
+  assert(bubble.innerHTML.includes('Gemini Pro Orchestrator · Pinned'));
   activeBadge.dispatchEvent('mouseleave');
 
   // Cleanup cancels any pending throttle timer and removes all context badges
@@ -5793,7 +5831,14 @@ const availableModelsPayload = {
         model: 'MODEL_PLACEHOLDER_M369',
         apiProvider: 'API_PROVIDER_ANTHROPIC_VERTEX',
         supportsImages: true,
-        quotaInfo: { remainingFraction: 0.56, resetTime: '2026-10-30T12:00:00Z' },
+        quotaInfo: { remainingFraction: 0.95, resetTime: '2026-10-30T12:30:00Z' },
+      },
+      'gemini-pro-coordinator': {
+        displayName: 'Gemini Pro Next',
+        model: 'MODEL_PLACEHOLDER_M415',
+        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+        supportsImages: true,
+        quotaInfo: { remainingFraction: 0.99 },
       },
       'opus-5.5-high-bon-le': {
         displayName: 'Gemini Pro Next',
@@ -6024,11 +6069,11 @@ global.clearTimeout = (id) => {
   reduxStore.dispatch({ type: 'NOOP' });
   await new Promise((r) => setImmediate(r));
 
-  // In cpp-core, claude-bon (Opus 5.5 BoN High at 95%) must be picked over 3p-wtu-daily (56%)
+  // In cpp-core, Opus 5.5 Medium (1369 at 95%) must be picked over 3p-wtu-daily (56%)
   assert.strictEqual(
     storeState.modelSelection.default.model,
-    1421,
-    `cpp-core draft must auto-select Opus 5.5 BoN High (1421), got: ${storeState.modelSelection.default.model}`
+    1369,
+    `cpp-core draft must auto-select Opus 5.5 Medium (1369), got: ${storeState.modelSelection.default.model}`
   );
 
   // 3. Draft chat in skia-g3-roll-check (?section=<skia-g3-roll-check UUID> -> triage)
@@ -6059,17 +6104,17 @@ global.clearTimeout = (id) => {
   });
   await new Promise((r) => setImmediate(r));
 
-  // Must fail over to cpp-core healthy Opus 5.5 BoN High (1421)
+  // Must fail over to cpp-core healthy Opus 5.5 Medium (1369)
   assert.strictEqual(
     storeState.modelSelection.byConversation['chat-cpp-1'].model,
-    1421,
-    `Exhausted Argon model must fail over to healthy Opus 1421, got: ${storeState.modelSelection.byConversation['chat-cpp-1']?.model}`
+    1369,
+    `Exhausted Argon model must fail over to healthy Opus 1369, got: ${storeState.modelSelection.byConversation['chat-cpp-1']?.model}`
   );
 
   // Floating toast must mount
   const toast = global.document.getElementById('jetski-model-autopilot-toast');
   assert(toast, 'Autopilot floating toast must mount on failover');
-  assert.strictEqual(toast.getAttribute('data-to-model'), 'Claude Opus 5.5 BoN (High)');
+  assert.strictEqual(toast.getAttribute('data-to-model'), 'Claude Opus 5.5 (Medium)');
 
   // 5. Existing conversation mid-chat failover: wasteful WTU model (Fable 5.1 -> Opus 5.5)
   reduxStore.dispatch({
@@ -6087,28 +6132,43 @@ global.clearTimeout = (id) => {
 
   assert.strictEqual(
     storeState.modelSelection.byConversation['chat-cpp-1'].model,
-    1421,
-    `Wasteful Fable 5.1 model must shield to Opus 1421, got: ${storeState.modelSelection.byConversation['chat-cpp-1']?.model}`
+    1369,
+    `Wasteful Fable 5.1 model must shield to Opus 1369, got: ${storeState.modelSelection.byConversation['chat-cpp-1']?.model}`
   );
 
-  // 6. Manual user pin: user explicitly picks Gemini 4 Carbon-G (1226, 99% quota)
+  // 6. Manual user pin: user explicitly picks Gemini Pro Orchestrator (1415, 99% quota)
   reduxStore.dispatch({
     type: 'modelSelection/modelPicked',
     payload: {
       conversationId: 'chat-cpp-1',
-      model: 1226,
+      model: 1415,
     },
   });
   await new Promise((r) => setImmediate(r));
 
-  assert.strictEqual(storeState.modelSelection.byConversation['chat-cpp-1'].model, 1226);
+  assert.strictEqual(storeState.modelSelection.byConversation['chat-cpp-1'].model, 1415);
   // Subsequent sync must respect user pin
   reduxStore.dispatch({ type: 'NOOP' });
   await new Promise((r) => setImmediate(r));
   assert.strictEqual(
     storeState.modelSelection.byConversation['chat-cpp-1'].model,
-    1226,
+    1415,
     'Manual user pin must be preserved across syncs'
+  );
+
+  // Forbidden BoN model pick (1421) auto-migrates to healthy non-BoN profile model (1369)
+  reduxStore.dispatch({
+    type: 'modelSelection/modelPicked',
+    payload: {
+      conversationId: 'chat-cpp-1',
+      model: 1421,
+    },
+  });
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(
+    storeState.modelSelection.byConversation['chat-cpp-1'].model,
+    1369,
+    'Forbidden BoN model pick must auto-migrate to non-BoN profile model'
   );
 
   // If user picks 0% dead model (1393), emergency floor (< 5%) rescues it
@@ -6156,10 +6216,10 @@ global.clearTimeout = (id) => {
   global.window.location.search = '?section=8acb67c4-2cb7-43ca-ba04-dc547b3c4788';
   reduxStore.dispatch({
     type: 'modelSelection/modelPicked',
-    payload: { model: 1226 },
+    payload: { model: 1415 },
   });
   await new Promise((r) => setImmediate(r));
-  assert.strictEqual(storeState.modelSelection.default.model, 1226);
+  assert.strictEqual(storeState.modelSelection.default.model, 1415);
 
   // Simulate full browser reload (fresh window RAM, persisted localStorage)
   delete global.window.__jetskiManualPickedModels;
@@ -6168,7 +6228,7 @@ global.clearTimeout = (id) => {
   await new Promise((r) => setImmediate(r));
   assert.strictEqual(
     storeState.modelSelection.default.model,
-    1226,
+    1415,
     'Manual draft pick must survive window reload on the same project draft'
   );
 
@@ -6186,16 +6246,16 @@ global.clearTimeout = (id) => {
   global.window.location.search = '?section=8acb67c4-2cb7-43ca-ba04-dc547b3c4788';
   reduxStore.dispatch({
     type: 'modelSelection/conversationSeeded',
-    payload: { conversationId: 'seeded-from-draft', model: 1226 },
+    payload: { conversationId: 'seeded-from-draft', model: 1415 },
   });
   await new Promise((r) => setImmediate(r));
-  // Next fresh draft in SkParagraph now gets autopilot Opus 5.5 BoN High (1421)
+  // Next fresh draft in SkParagraph now gets autopilot Opus 5.5 Medium (1369)
   reduxStore.dispatch({ type: 'NOOP' });
   await new Promise((r) => setImmediate(r));
   assert.strictEqual(
     storeState.modelSelection.default.model,
-    1421,
-    'After seeding a conversation, the next draft must auto-select the profile model (1421)'
+    1369,
+    'After seeding a conversation, the next draft must auto-select the profile model (1369)'
   );
 
   // 9. Existing conversation manual pick (including WTU model) survives full window reload
@@ -6224,8 +6284,8 @@ global.clearTimeout = (id) => {
     payload: {
       conversationId: 'chat-cpp-1',
       turnKey: 'turn-reload',
-      label: 'Claude Opus 5.5 BoN (High)',
-      model: 1421,
+      label: 'Claude Opus 5.5 (Medium)',
+      model: 1369,
       executionStartStep: 2,
       queuedMessageIds: [],
     },
