@@ -91,6 +91,13 @@
   const LOCATE_BTN_CLASS = 'jetski-chat-locate-btn';
   const LOCATED_ROW_ATTR = 'data-jetski-located-row';
   const SEARCH_PANEL_ID = 'jetski-chat-search-panel';
+  // Reminder button classes and floating Context Dossier popover ID
+  const TITLEBAR_REMINDER_BTN_CLASS = 'jetski-titlebar-reminder-btn';
+  const INBOX_REMINDER_BTN_CLASS = 'jetski-inbox-reminder-btn';
+  const ROW_REMINDER_BTN_CLASS = 'jetski-row-reminder-btn';
+  const DOSSIER_POPOVER_ID = 'jetski-chat-dossier-popover';
+  const STORAGE_DOSSIER_SUMMARIES_KEY = 'jetski_dossier_summaries_v1';
+  const DOSSIER_INDEX_TTL_MS = 10000;
   // Matryoshka chain star markers and read-only non-tail piece lock banners
   const CHAIN_STARS_BEFORE_TEST_ID = 'jetski-chain-stars-before';
   const CHAIN_STARS_AFTER_TEST_ID = 'jetski-chain-stars-after';
@@ -272,6 +279,12 @@
   let activeFlightDeckResizeCleanup = null;
   let flightDeckInfoCache = null;
   let flightDeckInfoFetchedAt = 0;
+  let dossierIndexCache = null;
+  let dossierIndexFetchedAt = 0;
+  let dossierIndexInFlight = null;
+  const dossierGenInFlight = new Map();
+  let activeDossierCascadeId = null;
+  let activeDossierAnchorEl = null;
   const STORAGE_INBOX_TAB_KEY = 'jetski_inbox_tab_v1';
   const INBOX_TABS = ['needs-me', 'working', 'stale'];
   // Typographic tab labels without emoji prefixes fit on one header line in a narrow sidebar
@@ -907,6 +920,90 @@
       .catch(() => {
         roadmapIndexFetching = false;
       });
+  }
+
+  // Fetches jetski-dossiers.json so the Context Dossier displays pre-warmed state facts & TL;DR
+  async function fetchDossierIndex(forceRefresh = false) {
+    const now = Date.now();
+    if (!forceRefresh && dossierIndexCache && now - dossierIndexFetchedAt < DOSSIER_INDEX_TTL_MS) {
+      return dossierIndexCache;
+    }
+    if (dossierIndexInFlight) return dossierIndexInFlight;
+    if (typeof window.fetch !== 'function') {
+      return dossierIndexCache || { conversations: {} };
+    }
+    const execute = async () => {
+      try {
+        const csrf = encodeURIComponent(getCsrfToken());
+        const url = resolveApiUrl(`/static/artifacts/jetski-dossiers.json?v=${now}&csrf=${csrf}`);
+        const resp = await window.fetch(url);
+        if (resp && resp.ok) {
+          const data = await resp.json();
+          if (data && typeof data === 'object') {
+            dossierIndexCache = {
+              conversations: data.conversations || {},
+            };
+            dossierIndexFetchedAt = now;
+            return dossierIndexCache;
+          }
+        }
+      } catch {
+        // Fall back to cached or empty index on network error
+      }
+      dossierIndexFetchedAt = now;
+      if (!dossierIndexCache) {
+        dossierIndexCache = { conversations: {} };
+      }
+      return dossierIndexCache;
+    };
+    dossierIndexInFlight = execute().finally(() => {
+      dossierIndexInFlight = null;
+    });
+    return dossierIndexInFlight;
+  }
+
+  function ensureDossierIndexLoaded(forceRefresh = false) {
+    const now = Date.now();
+    if (
+      !forceRefresh &&
+      (dossierIndexInFlight ||
+        (dossierIndexCache && now - dossierIndexFetchedAt < DOSSIER_INDEX_TTL_MS))
+    ) {
+      return;
+    }
+    void fetchDossierIndex(forceRefresh);
+  }
+
+  function loadLocalDossierSummaries() {
+    try {
+      const raw = safeGetStorage(STORAGE_DOSSIER_SUMMARIES_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function saveLocalDossierSummary(cascadeId, entry) {
+    if (!cascadeId || !entry) return;
+    try {
+      const all = loadLocalDossierSummaries();
+      all[cascadeId] = {
+        ...entry,
+        cachedAt: Date.now(),
+      };
+      const keys = Object.keys(all);
+      if (keys.length > 120) {
+        keys
+          .sort((a, b) => (all[a]?.cachedAt || 0) - (all[b]?.cachedAt || 0))
+          .slice(0, keys.length - 120)
+          .forEach((k) => delete all[k]);
+      }
+      safeSetStorage(STORAGE_DOSSIER_SUMMARIES_KEY, JSON.stringify(all));
+    } catch {
+      // Ignore storage write errors
+    }
   }
 
   // Clones keep the protobuf prototypes, since Redux selectors read the summary as a message
@@ -4160,7 +4257,193 @@
       #${SEARCH_PANEL_ID} .jcs-hit:hover { background: rgba(127, 127, 127, 0.18); }
       #${SEARCH_PANEL_ID} .jcs-meta { opacity: 0.65; font-size: 11px; }
       #${SEARCH_PANEL_ID} mark { background: rgba(255, 200, 0, 0.35); color: inherit; }
+      #${DOSSIER_POPOVER_ID} {
+        position: fixed;
+        z-index: 2147483647;
+        width: 420px;
+        max-width: calc(100vw - 32px);
+        max-height: calc(85vh - 24px);
+        overflow-y: auto;
+        border-radius: 12px;
+        background: var(--background, #1e1e1e);
+        color: var(--foreground, #e8eaed);
+        border: 1px solid rgba(138, 180, 248, 0.35);
+        box-shadow: 0 12px 36px rgba(0, 0, 0, 0.45);
+        font-family: var(
+          --font-sans,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          Roboto,
+          sans-serif
+        );
+        font-size: 12px;
+        line-height: 1.45;
+        padding: 14px;
+        box-sizing: border-box;
+      }
+      #${DOSSIER_POPOVER_ID}[data-visible="false"] {
+        display: none !important;
+      }
+      .jcdp-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+      .jcdp-header-title {
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--foreground, #e8eaed);
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .jcdp-header-actions {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+      }
+      .jcdp-icon-btn {
+        background: transparent;
+        border: none;
+        cursor: pointer;
+        padding: 2px 5px;
+        border-radius: 4px;
+        font-size: 13px;
+        color: var(--muted-foreground, #9aa0a6);
+        transition: background 120ms ease, color 120ms ease;
+      }
+      .jcdp-icon-btn:hover {
+        background: rgba(128, 134, 139, 0.2);
+        color: var(--foreground, #e8eaed);
+      }
+      .jcdp-chat-title {
+        font-size: 12.5px;
+        font-weight: 500;
+        margin-bottom: 6px;
+        word-break: break-word;
+      }
+      .jcdp-badges {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 5px;
+        margin-bottom: 12px;
+      }
+      .jcdp-badge {
+        font-size: 10.5px;
+        font-weight: 500;
+        padding: 2px 7px;
+        border-radius: 4px;
+        background: rgba(128, 134, 139, 0.16);
+        color: var(--foreground, #e8eaed);
+        border: 1px solid rgba(128, 134, 139, 0.24);
+      }
+      .jcdp-badge-roadmap {
+        background: rgba(52, 211, 153, 0.15);
+        color: #34d399;
+        border-color: rgba(52, 211, 153, 0.35);
+      }
+      .jcdp-badge-piece {
+        background: rgba(138, 180, 248, 0.15);
+        color: #8ab4f8;
+        border-color: rgba(138, 180, 248, 0.35);
+      }
+      .jcdp-section {
+        border-top: 1px solid rgba(128, 134, 139, 0.18);
+        padding-top: 10px;
+        margin-top: 10px;
+      }
+      .jcdp-section-title {
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        color: var(--muted-foreground, #9aa0a6);
+        margin-bottom: 6px;
+      }
+      .jcdp-tldr-box {
+        background: rgba(138, 180, 248, 0.08);
+        border: 1px solid rgba(138, 180, 248, 0.2);
+        border-radius: 8px;
+        padding: 9px 11px;
+        font-size: 12px;
+        white-space: pre-wrap;
+        word-break: break-word;
+        line-height: 1.5;
+      }
+      .jcdp-kv-row {
+        margin-bottom: 5px;
+        word-break: break-word;
+      }
+      .jcdp-kv-label {
+        font-weight: 600;
+        color: var(--muted-foreground, #9aa0a6);
+        margin-right: 4px;
+      }
+      .jcdp-links-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      .jcdp-link {
+        font-size: 11px;
+        color: #8ab4f8;
+        text-decoration: underline;
+        word-break: break-all;
+      }
+      .jcdp-file-pill {
+        font-size: 11px;
+        font-family: monospace;
+        padding: 1px 6px;
+        border-radius: 4px;
+        background: rgba(128, 134, 139, 0.2);
+        color: var(--foreground, #e8eaed);
+      }
+      .jcdp-prompts-list {
+        margin: 0;
+        padding-left: 18px;
+        font-size: 11.5px;
+      }
+      .jcdp-prompt-item {
+        margin-bottom: 4px;
+        word-break: break-word;
+      }
+      .jcdp-details {
+        margin-top: 6px;
+        font-size: 11px;
+      }
+      .jcdp-details summary {
+        cursor: pointer;
+        color: var(--muted-foreground, #9aa0a6);
+        font-weight: 500;
+      }
+      .jcdp-details-content {
+        margin-top: 6px;
+        padding: 6px 8px;
+        border-radius: 6px;
+        background: rgba(128, 134, 139, 0.12);
+        max-height: 160px;
+        overflow-y: auto;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .${ROW_REMINDER_BTN_CLASS} {
+        background: transparent;
+        border: none;
+        cursor: pointer;
+        padding: 0 2px;
+        opacity: 0.7;
+        font-size: 12px;
+        line-height: 1;
+        transition: opacity 120ms ease;
+      }
+      .${ROW_REMINDER_BTN_CLASS}:hover {
+        opacity: 1;
+      }
       // Style all titlebar action buttons as uniform compact icons without pill borders
+      .${TITLEBAR_REMINDER_BTN_CLASS},
       .${SEARCH_BTN_CLASS},
       .${LOCATE_BTN_CLASS},
       .${TITLEBAR_BTN_CLASS} {
@@ -4172,6 +4455,7 @@
         font-size: 14px;
         line-height: 1;
       }
+      .${TITLEBAR_REMINDER_BTN_CLASS}:hover,
       .${SEARCH_BTN_CLASS}:hover,
       .${LOCATE_BTN_CLASS}:hover,
       .${TITLEBAR_BTN_CLASS}:hover {
@@ -5347,6 +5631,7 @@
         gap: 1px;
         flex-shrink: 0;
       }
+      .${INBOX_REMINDER_BTN_CLASS},
       .${INBOX_SEEN_BTN_CLASS},
       .${INBOX_ARCHIVE_BTN_CLASS} {
         display: inline-flex;
@@ -8618,6 +8903,20 @@
     const actions = document.createElement('div');
     actions.className = 'jetski-inbox-actions';
 
+    const reminderBtn = document.createElement('button');
+    reminderBtn.type = 'button';
+    reminderBtn.className = INBOX_REMINDER_BTN_CLASS;
+    reminderBtn.setAttribute('data-testid', 'jetski-inbox-reminder-btn');
+    reminderBtn.setAttribute('aria-label', 'Remind chat context');
+    reminderBtn.textContent = '💡';
+    bindHoverBubble(reminderBtn, '💡 Remind chat context');
+    bindActionBtnHandlers(reminderBtn, (ev) => {
+      ev?.stopPropagation();
+      const cid = row.getAttribute('data-cascade-id');
+      if (cid) openDossierPopover(cid, reminderBtn);
+    });
+    actions.appendChild(reminderBtn);
+
     if (item.tabKey === 'needs-me') {
       const seenBtn = document.createElement('button');
       seenBtn.type = 'button';
@@ -9868,6 +10167,660 @@
     }
   }
 
+  // Extracts facts from trajectory steps for the Context Dossier
+  function extractTrajectoryDossierFacts(stepsOrTraj) {
+    const userPrompts = [];
+    const clLinks = new Set();
+    const modifiedFiles = new Set();
+    let lastAssistantText = '';
+
+    const steps = Array.isArray(stepsOrTraj)
+      ? stepsOrTraj
+      : Array.isArray(stepsOrTraj?.trajectory?.steps)
+        ? stepsOrTraj.trajectory.steps
+        : Array.isArray(stepsOrTraj?.steps)
+          ? stepsOrTraj.steps
+          : [];
+
+    for (const step of steps) {
+      if (!step) continue;
+      const type = String(step.type || step.stepType || '');
+      const content =
+        typeof step.content === 'string'
+          ? step.content
+          : typeof step.userInput?.userResponse === 'string'
+            ? step.userInput.userResponse
+            : typeof step.userInput?.content === 'string'
+              ? step.userInput.content
+              : typeof step.cortexStep?.userInput?.content === 'string'
+                ? step.cortexStep.userInput.content
+                : typeof step.plannerResponse?.modifiedResponse === 'string'
+                  ? step.plannerResponse.modifiedResponse
+                  : typeof step.plannerResponse?.response === 'string'
+                    ? step.plannerResponse.response
+                    : typeof step.cortexStep?.plannerResponse?.content === 'string'
+                      ? step.cortexStep.plannerResponse.content
+                      : '';
+
+      const isUser =
+        type.includes('USER_INPUT') ||
+        type === '1' ||
+        step.source === 'USER_EXPLICIT' ||
+        step.source === 1 ||
+        Boolean(step.userInput);
+      const isAssistant =
+        type.includes('PLANNER_RESPONSE') ||
+        type === '2' ||
+        step.source === 'MODEL' ||
+        step.source === 2 ||
+        Boolean(step.plannerResponse);
+
+      if (isUser && content) {
+        const clean = content.trim();
+        if (
+          clean &&
+          !clean.startsWith('[CONTEXT GUARD') &&
+          !clean.startsWith('Continuing unfinished')
+        ) {
+          userPrompts.push(clean.length > 280 ? `${clean.slice(0, 277)}...` : clean);
+        }
+      }
+      if (isAssistant && content) {
+        lastAssistantText = content.trim();
+      }
+
+      const toolCalls =
+        step.toolCalls ||
+        step.cortexStep?.plannerResponse?.toolCalls ||
+        step.plannerResponse?.toolCalls ||
+        [];
+      if (Array.isArray(toolCalls)) {
+        for (const tc of toolCalls) {
+          const name = String(tc?.name || tc?.toolName || '');
+          const isEdit =
+            name === 'edit_file' ||
+            name === 'write_file' ||
+            name === 'file_edit' ||
+            name === 'patch_file';
+          if (isEdit) {
+            let argsObj = tc.args;
+            if (!argsObj && typeof tc.argumentsJson === 'string') {
+              try {
+                argsObj = JSON.parse(tc.argumentsJson);
+              } catch {
+                argsObj = null;
+              }
+            }
+            if (argsObj && typeof argsObj === 'object') {
+              const p = argsObj.Path || argsObj.path || argsObj.file_path || '';
+              if (typeof p === 'string' && p) {
+                const base = p.split('/').filter(Boolean).pop();
+                if (base) modifiedFiles.add(base);
+              }
+            }
+          }
+        }
+      }
+
+      const textToScan = `${content} ${JSON.stringify(toolCalls || '')}`;
+      const urls = textToScan.match(/https?:\/\/[^\s"'<>)]+/g) || [];
+      for (const u of urls) {
+        if (
+          u.includes('review.googlesource.com') ||
+          u.includes('github.com') ||
+          u.includes('buganizer') ||
+          u.includes('b.corp.google.com')
+        ) {
+          clLinks.add(u);
+        }
+      }
+    }
+    return {
+      userPrompts: userPrompts.slice(0, 10),
+      clLinks: [...clLinks].slice(0, 5),
+      modifiedFiles: [...modifiedFiles].slice(0, 8),
+      lastAssistantText:
+        lastAssistantText.length > 600
+          ? `${lastAssistantText.slice(0, 597)}...`
+          : lastAssistantText,
+    };
+  }
+
+  // Generates an out-of-band 3-bullet Russian TL;DR via LanguageServer GetModelResponse
+  async function generateOutOfBandDossierTldr(cascadeId, contextSnapshot) {
+    if (!cascadeId) return '';
+    if (dossierGenInFlight.has(cascadeId)) {
+      return dossierGenInFlight.get(cascadeId);
+    }
+    const execute = async () => {
+      try {
+        const csrf = getCsrfToken();
+        const url = resolveApiUrl(
+          '/exa.language_server_pb.LanguageServerService/GetModelResponse'
+        );
+        const promptLines = [
+          '\\u0421\\u0434\\u0435\\u043b\\u0430\\u0439 ' +
+            '\\u043b\\u0430\\u043a\\u043e\\u043d\\u0438\\u0447\\u043d\\u0443\\u044e ' +
+            '\\u0432\\u044b\\u0436\\u0438\\u043c\\u043a\\u0443 ' +
+            '\\u0442\\u0435\\u043a\\u0443\\u0449\\u0435\\u0433\\u043e ' +
+            '\\u043a\\u043e\\u043d\\u0442\\u0435\\u043a\\u0441\\u0442\\u0430 \\u0438 ' +
+            '\\u043f\\u0440\\u043e\\u0433\\u0440\\u0435\\u0441\\u0441\\u0430 ' +
+            '\\u043f\\u043e \\u0437\\u0430\\u0434\\u0430\\u0447\\u0435 ' +
+            '\\u0447\\u0430\\u0442\\u0430 \\u0432 \\u0442\\u0440\\u0435\\u0445 ' +
+            '\\u043f\\u0443\\u043d\\u043a\\u0442\\u0430\\u0445 ' +
+            '\\u0441\\u0442\\u0440\\u043e\\u0433\\u043e \\u043d\\u0430 ' +
+            '\\u0440\\u0443\\u0441\\u0441\\u043a\\u043e\\u043c ' +
+            '\\u044f\\u0437\\u044b\\u043a\\u0435:',
+          '\\u2022 \\u0417\\u0430\\u0434\\u0430\\u0447\\u0430: ' +
+            '<\\u0441\\u0443\\u0442\\u044c ' +
+            '\\u0437\\u0430\\u0434\\u0430\\u0447\\u0438 \\u0432 1 ' +
+            '\\u043f\\u0440\\u0435\\u0434\\u043b\\u043e\\u0436\\u0435\\u043d\\u0438\\u0435>',
+          '\\u2022 \\u0427\\u0442\\u043e ' +
+            '\\u0441\\u0434\\u0435\\u043b\\u0430\\u043b\\u0438: ' +
+            '<\\u043a\\u043b\\u044e\\u0447\\u0435\\u0432\\u043e\\u0439 ' +
+            '\\u043f\\u0440\\u043e\\u0433\\u0440\\u0435\\u0441\\u0441 \\u0432 1 ' +
+            '\\u043f\\u0440\\u0435\\u0434\\u043b\\u043e\\u0436\\u0435\\u043d\\u0438\\u0435>',
+          '\\u2022 \\u0413\\u0434\\u0435 ' +
+            '\\u043e\\u0441\\u0442\\u0430\\u043d\\u043e\\u0432\\u0438\\u043b\\u0438\\u0441\\u044c: '
+            +
+            '<\\u0442\\u0435\\u043a\\u0443\\u0449\\u0435\\u0435 ' +
+            '\\u0441\\u043e\\u0441\\u0442\\u043e\\u044f\\u043d\\u0438\\u0435 \\u0438 ' +
+            '\\u0441\\u043b\\u0435\\u0434\\u0443\\u044e\\u0449\\u0438\\u0439 ' +
+            '\\u0448\\u0430\\u0433 \\u0432 1 ' +
+            '\\u043f\\u0440\\u0435\\u0434\\u043b\\u043e\\u0436\\u0435\\u043d\\u0438\\u0435>',
+          '',
+          '\\u041a\\u043e\\u043d\\u0442\\u0435\\u043a\\u0441\\u0442:',
+          `Chat title: ${contextSnapshot.title || ''}`,
+          contextSnapshot.goal ? `Goal: ${contextSnapshot.goal}` : '',
+          contextSnapshot.nextStep ? `Next step: ${contextSnapshot.nextStep}` : '',
+          contextSnapshot.prompts?.length
+            ? 'User prompts:\n' +
+              contextSnapshot.prompts.map((p, i) => `${i + 1}. ${p}`).join('\n')
+            : '',
+          contextSnapshot.lastAssistantText
+            ? 'Last response excerpt:\n' +
+              contextSnapshot.lastAssistantText.slice(0, 500)
+            : '',
+        ].filter(Boolean).join('\n');
+
+        const headers = {
+          'Content-Type': 'application/json',
+          'Connect-Protocol-Version': '1',
+        };
+        if (csrf) headers['x-codeium-csrf-token'] = csrf;
+
+        const body = JSON.stringify({
+          chat_message: {
+            intent: {
+              mode: 'INTENT_MODE_CHAT',
+              chat: {
+                message: promptLines,
+              },
+            },
+          },
+          model: 'MODEL_GOOGLE_GEMINI_2_5_FLASH',
+        });
+
+        const resp = await window.fetch(url, {
+          method: 'POST',
+          headers,
+          body,
+        });
+        if (resp && resp.ok) {
+          const data = await resp.json();
+          const tldr =
+            (typeof data?.text === 'string' && data.text.trim()) ||
+            (typeof data?.chatMessage?.intent?.chat?.message === 'string' &&
+              data.chatMessage.intent.chat.message.trim()) ||
+            '';
+          if (tldr) {
+            saveLocalDossierSummary(cascadeId, { tldr });
+            return tldr;
+          }
+        }
+      } catch {
+        // Fall back to structural summary on error
+      }
+      return '';
+    };
+
+    const promise = execute().finally(() => {
+      dossierGenInFlight.delete(cascadeId);
+    });
+    dossierGenInFlight.set(cascadeId, promise);
+    return promise;
+  }
+
+  function ensureDossierPopoverElement() {
+    let popover = document.getElementById(DOSSIER_POPOVER_ID);
+    if (!popover && document.body) {
+      popover = document.createElement('div');
+      popover.id = DOSSIER_POPOVER_ID;
+      popover.setAttribute('data-visible', 'false');
+      document.body.appendChild(popover);
+    }
+    return popover;
+  }
+
+  function closeDossierPopover() {
+    activeDossierCascadeId = null;
+    activeDossierAnchorEl = null;
+    const popover = document.getElementById(DOSSIER_POPOVER_ID);
+    if (popover) {
+      popover.setAttribute('data-visible', 'false');
+    }
+  }
+
+  function positionDossierPopover(popover, anchorEl) {
+    if (!popover || !anchorEl) return;
+    const rect =
+      typeof anchorEl.getBoundingClientRect === 'function'
+        ? anchorEl.getBoundingClientRect()
+        : { top: 24, bottom: 48, left: 200, right: 240 };
+    const vw = Number(window.innerWidth) || 1280;
+    const vh = Number(window.innerHeight) || 800;
+    const popWidth = Math.min(420, vw - 24);
+    popover.style.width = `${popWidth}px`;
+
+    const isInTitlebar = rect.top < 80 && rect.right > 240;
+    if (isInTitlebar) {
+      let left = rect.right - popWidth;
+      if (left < 12) left = 12;
+      let top = rect.bottom + 8;
+      if (top + 200 > vh) {
+        const offH = popover.offsetHeight || 300;
+        top = Math.max(12, rect.top - offH - 8);
+      }
+      popover.style.left = `${Math.round(left)}px`;
+      popover.style.top = `${Math.round(top)}px`;
+    } else {
+      let left = rect.right + 8;
+      if (left + popWidth > vw - 12) {
+        left = Math.max(12, rect.left - popWidth - 8);
+      }
+      let top = rect.top - 20;
+      if (top + 300 > vh) {
+        top = Math.max(12, vh - 320);
+      }
+      if (top < 12) top = 12;
+      popover.style.left = `${Math.round(left)}px`;
+      popover.style.top = `${Math.round(top)}px`;
+    }
+  }
+
+  function buildDossierHtml(cascadeId, facts) {
+    const title = facts.title || 'Conversation';
+    const project = facts.project || 'Unassigned';
+    const pieceText = facts.pieceText || '';
+    const statusText = facts.statusText || 'Idle';
+    const roadmapId = facts.roadmapId || '';
+    const roadmapText = facts.roadmapText || '';
+    const goal = facts.goal || '';
+    const nextStep = facts.nextStep || '';
+    const tldr = facts.tldr || '';
+    const userPrompts = facts.userPrompts || [];
+    const clLinks = facts.clLinks || [];
+    const modifiedFiles = facts.modifiedFiles || [];
+    const lastAssistantText = facts.lastAssistantText || '';
+    const isCurrentActive = facts.isCurrentActive || false;
+
+    let html =
+      '<div class="jcdp-header">' +
+      '<span class="jcdp-header-title">💡 \\u041f\\u0430\\u043c\\u044f\\u0442\\u043a\\u0430 ' +
+      '\\u043f\\u043e \\u0447\\u0430\\u0442\\u0443</span>' +
+      '<div class="jcdp-header-actions">' +
+      '<button type="button" class="jcdp-icon-btn jcdp-refresh-btn" ' +
+      'data-testid="jetski-dossier-refresh-btn" ' +
+      'title="\\u041e\\u0431\\u043d\\u043e\\u0432\\u0438\\u0442\\u044c ' +
+      '\\u0432\\u044b\\u0436\\u0438\\u043c\\u043a\\u0443">🔄</button>';
+
+    if (!isCurrentActive) {
+      html +=
+        '<button type="button" class="jcdp-icon-btn jcdp-open-chat-btn" ' +
+        'data-testid="jetski-dossier-open-chat-btn" ' +
+        'title="\\u041e\\u0442\\u043a\\u0440\\u044b\\u0442\\u044c ' +
+        '\\u044d\\u0442\\u043e\\u0442 \\u0447\\u0430\\u0442">📂</button>';
+    }
+
+    html +=
+      '<button type="button" class="jcdp-icon-btn jcdp-close-btn" ' +
+      'data-testid="jetski-dossier-close-btn" ' +
+      'title="\\u0417\\u0430\\u043a\\u0440\\u044b\\u0442\\u044c">✕</button>' +
+      '</div></div>';
+
+    html += `<div class="jcdp-chat-title">${escapeHtml(title)}</div>`;
+    html += '<div class="jcdp-badges">';
+    html += `<span class="jcdp-badge jcdp-project-badge">${escapeHtml(project)}</span>`;
+    if (pieceText) {
+      html += `<span class="jcdp-badge jcdp-badge-piece">${escapeHtml(pieceText)}</span>`;
+    }
+    if (statusText) {
+      html += `<span class="jcdp-badge">${escapeHtml(statusText)}</span>`;
+    }
+    if (roadmapId) {
+      const rmTitle = roadmapText ? `${roadmapId}: ${roadmapText}` : roadmapId;
+      html += '<span class="jcdp-badge jcdp-badge-roadmap" ' +
+        `title="${escapeHtml(rmTitle)}">${escapeHtml(roadmapId)}</span>`;
+    }
+    html += '</div>';
+
+    html +=
+      '<div class="jcdp-section">' +
+      '<div class="jcdp-section-title">🤖 ' +
+      '\\u0412\\u044b\\u0436\\u0438\\u043c\\u043a\\u0430 (TL;DR)</div>';
+
+    let tldrDisplay = tldr;
+    if (!tldrDisplay) {
+      const gText = goal || roadmapText || title;
+      const nText = nextStep || 'Waiting for user input';
+      tldrDisplay =
+        `\\u2022 \\u0417\\u0430\\u0434\\u0430\\u0447\\u0430: ${gText}\n` +
+        '\\u2022 \\u0427\\u0442\\u043e \\u0441\\u0434\\u0435\\u043b\\u0430\\u043b\\u0438: ' +
+        `${userPrompts.length} turns in conversation\n` +
+        '\\u2022 \\u0413\\u0434\\u0435 \\u043e\\u0441\\u0442\\u0430\\u043d\\u043e\\u0432' +
+        `\\u0438\\u043b\\u0438\\u0441\\u044c: ${nText}`;
+    }
+    html += '<div class="jcdp-tldr-box" data-testid="jetski-dossier-tldr">' +
+      `${escapeHtml(tldrDisplay)}</div></div>`;
+
+    if (goal || nextStep || roadmapText) {
+      html +=
+        '<div class="jcdp-section">' +
+        '<div class="jcdp-section-title">📋 \\u0426\\u0435\\u043b\\u044c \\u0438 ' +
+        '\\u0441\\u043b\\u0435\\u0434\\u0443\\u044e\\u0449\\u0438\\u0439 ' +
+        '\\u0448\\u0430\\u0433</div>';
+      if (goal || roadmapText) {
+        html +=
+          '<div class="jcdp-kv-row">' +
+          '<span class="jcdp-kv-label">\\u0426\\u0435\\u043b\\u044c:</span>' +
+          `<span>${escapeHtml(goal || roadmapText)}</span></div>`;
+      }
+      if (nextStep) {
+        html +=
+          '<div class="jcdp-kv-row">' +
+          '<span class="jcdp-kv-label">' +
+          '\\u0421\\u043b\\u0435\\u0434\\u0443\\u044e\\u0449\\u0438\\u0439 ' +
+          '\\u0448\\u0430\\u0433:</span>' +
+          `<span>${escapeHtml(nextStep)}</span></div>`;
+      }
+      html += '</div>';
+    }
+
+    if (clLinks.length > 0 || modifiedFiles.length > 0) {
+      html +=
+        '<div class="jcdp-section">' +
+        '<div class="jcdp-section-title">🔗 \\u0421\\u0441\\u044b\\u043b\\u043a\\u0438 \\u0438 ' +
+        '\\u0444\\u0430\\u0439\\u043b\\u044b</div>';
+      if (clLinks.length > 0) {
+        html += '<div class="jcdp-links-row" style="margin-bottom:6px">';
+        for (const u of clLinks) {
+          const label = u.split('/').pop() || u;
+          html += `<a href="${escapeHtml(u)}" target="_blank" rel="noopener noreferrer" ` +
+            `class="jcdp-link">${escapeHtml(label)}</a>`;
+        }
+        html += '</div>';
+      }
+      if (modifiedFiles.length > 0) {
+        html += '<div class="jcdp-links-row">';
+        for (const f of modifiedFiles) {
+          html += `<span class="jcdp-file-pill">${escapeHtml(f)}</span>`;
+        }
+        html += '</div>';
+      }
+      html += '</div>';
+    }
+
+    if (userPrompts.length > 0 || lastAssistantText) {
+      html +=
+        '<div class="jcdp-section">' +
+        `<div class="jcdp-section-title">💬 \\u0417\\u0430\\u043f\\u0440\\u043e\\u0441\\u044b ` +
+        `\\u0432 \\u0447\\u0430\\u0442\\u0435 (${userPrompts.length})</div>`;
+      if (userPrompts.length > 0) {
+        html += '<ol class="jcdp-prompts-list">';
+        for (const p of userPrompts) {
+          html += `<li class="jcdp-prompt-item">${escapeHtml(p)}</li>`;
+        }
+        html += '</ol>';
+      }
+      if (lastAssistantText) {
+        html +=
+          '<details class="jcdp-details">' +
+          '<summary>\\u041f\\u043e\\u0441\\u043b\\u0435\\u0434\\u043d\\u0438\\u0439 ' +
+          '\\u043e\\u0442\\u0432\\u0435\\u0442 ' +
+          '\\u0430\\u0441\\u0441\\u0438\\u0441\\u0442\\u0435\\u043d\\u0442\\u0430</summary>' +
+          `<div class="jcdp-details-content">${escapeHtml(lastAssistantText)}</div>` +
+          '</details>';
+      }
+      html += '</div>';
+    }
+
+    return html;
+  }
+
+  // Opens the floating read-only Context Dossier popover anchored next to anchorEl
+  function openDossierPopover(cascadeId, anchorEl, options = {}) {
+    if (!cascadeId) return;
+    const popover = ensureDossierPopoverElement();
+    if (!popover) return;
+
+    if (
+      !options._internalUpdate &&
+      activeDossierCascadeId === cascadeId &&
+      activeDossierAnchorEl === anchorEl &&
+      popover.getAttribute('data-visible') === 'true'
+    ) {
+      closeDossierPopover();
+      return;
+    }
+
+    activeDossierCascadeId = cascadeId;
+    activeDossierAnchorEl = anchorEl;
+
+    const store = findReduxStore();
+    const summariesMap = store?.getState()?.trajectorySummaries?.summaries || {};
+    const summary = summariesMap[cascadeId];
+    const rawTitle = summary?.annotations?.title || summary?.summary || cascadeId;
+    const cleanTitle = cleanBaseTitle(rawTitle) || rawTitle;
+    const projectId =
+      summary?.trajectoryMetadata?.projectId ||
+      summary?.annotations?.projectId ||
+      summary?.projectId ||
+      '';
+    const project = resolveProjectName(projectId, store) || 'Unassigned';
+
+    const curActiveEl =
+      document.querySelector('[data-testid="conversation-view"][data-cascade-id]');
+    const curActiveCid =
+      curActiveEl?.getAttribute('data-cascade-id') ||
+      store?.getState()?.conversation?.cascadeId ||
+      '';
+    const isCurrentActive = cascadeId === curActiveCid;
+
+    // Piece navigation
+    let pieceText = '';
+    if (chainIndexCache?.parentOf) {
+      const parentOf = chainIndexCache.parentOf;
+      const createdAt = chainIndexCache.createdAt || {};
+      const childrenOf = {};
+      for (const [child, parent] of Object.entries(parentOf)) {
+        (childrenOf[parent] = childrenOf[parent] || []).push(child);
+      }
+      const chain = [cascadeId];
+      const seen = new Set(chain);
+      for (let cur = parentOf[cascadeId]; cur && !seen.has(cur); cur = parentOf[cur]) {
+        seen.add(cur);
+        chain.unshift(cur);
+      }
+      for (let cur = cascadeId; childrenOf[cur]; ) {
+        const next = childrenOf[cur]
+          .filter((c) => !seen.has(c))
+          .sort((x, y) => String(createdAt[x] || '').localeCompare(String(createdAt[y] || '')))
+          .pop();
+        if (!next) break;
+        seen.add(next);
+        chain.push(next);
+        cur = next;
+      }
+      if (chain.length > 1) {
+        const pIdx = chain.indexOf(cascadeId);
+        pieceText = `Piece #${pIdx + 1} of ${chain.length}`;
+      }
+    } else {
+      void fetchChainIndex().then((idx) => {
+        if (activeDossierCascadeId === cascadeId && idx?.parentOf?.[cascadeId]) {
+          openDossierPopover(cascadeId, anchorEl, { ...options, _internalUpdate: true });
+        }
+      });
+    }
+
+    // Status
+    const statusInfo = summary
+      ? resolveConversationStatus(cascadeId, summary, rawTitle, summariesMap)
+      : null;
+    let statusText = 'Idle';
+    if (statusInfo?.isBlocked) {
+      statusText = 'Needs you (Blocked)';
+    } else if (statusInfo?.bucket === 'working') {
+      statusText = 'Working';
+    } else if (statusInfo?.bucket === 'waiting') {
+      statusText = 'Waiting on task';
+    } else if (statusInfo?.bucket === 'needs-me') {
+      statusText = 'Needs you';
+    }
+
+    // Facts from pre-warmed dossier index and local summaries
+    const dossierEntry = dossierIndexCache?.conversations?.[cascadeId] || {};
+    const localEntry = loadLocalDossierSummaries()[cascadeId] || {};
+
+    const goal = dossierEntry.goal || options.goal || '';
+    const nextStep = dossierEntry.nextStep || options.nextStep || '';
+    const roadmapId = dossierEntry.roadmapId || options.roadmapId || '';
+    const roadmapText = dossierEntry.roadmapText || options.roadmapText || '';
+    let tldr = localEntry.tldr || dossierEntry.tldr || options.tldr || '';
+
+    // Facts from trajectory steps if cached
+    const cachedEntry = singleTrajCache.get(cascadeId);
+    const cachedTraj = cachedEntry?.payload || cachedEntry;
+    let trajFacts = { userPrompts: [], clLinks: [], modifiedFiles: [], lastAssistantText: '' };
+    if (cachedTraj) {
+      trajFacts = extractTrajectoryDossierFacts(cachedTraj);
+    } else {
+      void fetchSingleTrajectoryRpc(cascadeId, summary).then((steps) => {
+        if (activeDossierCascadeId === cascadeId && steps) {
+          openDossierPopover(cascadeId, anchorEl, {
+            ...options,
+            _internalUpdate: true,
+            goal,
+            nextStep,
+            roadmapId,
+            roadmapText,
+            tldr,
+          });
+        }
+      });
+    }
+
+    const clLinks = dossierEntry.clLinks?.length ? dossierEntry.clLinks : trajFacts.clLinks;
+    const modifiedFiles = dossierEntry.modifiedFiles?.length
+      ? dossierEntry.modifiedFiles
+      : trajFacts.modifiedFiles;
+
+    const facts = {
+      title: cleanTitle,
+      project,
+      pieceText,
+      statusText,
+      roadmapId,
+      roadmapText,
+      goal,
+      nextStep,
+      tldr,
+      userPrompts: trajFacts.userPrompts,
+      clLinks,
+      modifiedFiles,
+      lastAssistantText: trajFacts.lastAssistantText,
+      isCurrentActive,
+    };
+
+    popover.innerHTML = buildDossierHtml(cascadeId, facts);
+    popover.setAttribute('data-visible', 'true');
+    positionDossierPopover(popover, anchorEl);
+
+    // Bind action buttons
+    const closeBtn = popover.querySelector('.jcdp-close-btn');
+    if (closeBtn) {
+      bindActionBtnHandlers(closeBtn, (ev) => {
+        ev?.stopPropagation();
+        closeDossierPopover();
+      });
+    }
+
+    const openBtn = popover.querySelector('.jcdp-open-chat-btn');
+    if (openBtn) {
+      bindActionBtnHandlers(openBtn, (ev) => {
+        ev?.stopPropagation();
+        closeDossierPopover();
+        openConversation(cascadeId);
+      });
+    }
+
+    const refreshBtn = popover.querySelector('.jcdp-refresh-btn');
+    if (refreshBtn) {
+      bindActionBtnHandlers(refreshBtn, async (ev) => {
+        ev?.stopPropagation();
+        const tldrBox = popover.querySelector('.jcdp-tldr-box');
+        if (tldrBox) {
+          tldrBox.textContent =
+            '\\u0413\\u0435\\u043d\\u0435\\u0440\\u0430\\u0446\\u0438\\u044f ' +
+            '\\u0432\\u044b\\u0436\\u0438\\u043c\\u043a\\u0438...';
+        }
+        const freshTldr = await generateOutOfBandDossierTldr(cascadeId, {
+          title: cleanTitle,
+          goal,
+          nextStep,
+          prompts: trajFacts.userPrompts,
+          lastAssistantText: trajFacts.lastAssistantText,
+        });
+        if (activeDossierCascadeId === cascadeId && freshTldr && tldrBox) {
+          tldrBox.textContent = freshTldr;
+        }
+      });
+    }
+  }
+
+  // Global listeners to close the dossier popover on outside click or Escape key
+  if (typeof document !== 'undefined') {
+    document.addEventListener('click', (ev) => {
+      const popover = document.getElementById(DOSSIER_POPOVER_ID);
+      if (!popover || popover.getAttribute('data-visible') !== 'true') return;
+      const target = ev.target;
+      if (!target || typeof target.closest !== 'function') return;
+      if (
+        target.closest(`#${DOSSIER_POPOVER_ID}`) ||
+        target.closest(`.${TITLEBAR_REMINDER_BTN_CLASS}`) ||
+        target.closest(`.${INBOX_REMINDER_BTN_CLASS}`) ||
+        target.closest(`.${ROW_REMINDER_BTN_CLASS}`)
+      ) {
+        return;
+      }
+      closeDossierPopover();
+    });
+
+    document.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape') {
+        closeDossierPopover();
+      }
+    });
+  }
+
+  window.__jetskiDossier = {
+    openDossierPopover,
+    closeDossierPopover,
+    fetchDossierIndex,
+    extractTrajectoryDossierFacts,
+    generateOutOfBandDossierTldr,
+  };
+
   // Injects or updates the Context badge, Search, Locate, and Archive buttons before ⋮
   function ensureTitlebarButtons() {
     const moreActionsBtns = document.querySelectorAll(
@@ -9905,6 +10858,28 @@
         container.insertBefore(ctxBadge, firstInjected);
       }
       updateTitlebarContextBadgeUI(ctxBadge, cascadeId);
+
+      // Context reminder button opens the floating structural dossier & AI TL;DR
+      let reminderBtn = container.querySelector(`.${TITLEBAR_REMINDER_BTN_CLASS}`);
+      if (!reminderBtn) {
+        reminderBtn = document.createElement('button');
+        reminderBtn.className = TITLEBAR_REMINDER_BTN_CLASS;
+        reminderBtn.type = 'button';
+        reminderBtn.setAttribute('data-testid', 'jetski-titlebar-reminder-btn');
+        reminderBtn.textContent = '💡';
+        reminderBtn.setAttribute('aria-label', 'Remind chat context');
+        reminderBtn.setAttribute('data-cascade-id', cascadeId);
+        bindHoverBubble(reminderBtn, '💡 Remind chat context');
+        bindActionBtnHandlers(reminderBtn, () => {
+          const cid =
+            reminderBtn.getAttribute('data-cascade-id') || findCascadeIdFromElement(moreBtn);
+          if (cid) openDossierPopover(cid, reminderBtn);
+        });
+        const searchEl = container.querySelector(`.${SEARCH_BTN_CLASS}`) || moreBtn;
+        container.insertBefore(reminderBtn, searchEl);
+      } else if (reminderBtn.getAttribute('data-cascade-id') !== cascadeId) {
+        reminderBtn.setAttribute('data-cascade-id', cascadeId);
+      }
 
       // Chain search lives in the titlebar because it needs the open chat as its scope
       if (!container.querySelector(`.${SEARCH_BTN_CLASS}`)) {
@@ -10094,12 +11069,39 @@
         summariesMap,
         childIndex
       );
+
+      // Inject reminder button into hover action bar if present
+      const anchorBtn =
+        rowEl.querySelector('[data-testid="conversation-pin-button"]') ||
+        rowEl.querySelector('[data-testid="conversation-archive-button"]');
+      const hoverBar = anchorBtn?.parentElement;
+      if (hoverBar) {
+        let rowReminderBtn = hoverBar.querySelector(`.${ROW_REMINDER_BTN_CLASS}`);
+        if (!rowReminderBtn) {
+          rowReminderBtn = document.createElement('button');
+          rowReminderBtn.type = 'button';
+          rowReminderBtn.className = ROW_REMINDER_BTN_CLASS;
+          rowReminderBtn.setAttribute('data-testid', 'jetski-row-reminder-btn');
+          rowReminderBtn.setAttribute('aria-label', 'Remind chat context');
+          rowReminderBtn.setAttribute('data-cascade-id', cascadeId);
+          rowReminderBtn.textContent = '💡';
+          bindHoverBubble(rowReminderBtn, '💡 Remind chat context');
+          bindActionBtnHandlers(rowReminderBtn, (ev) => {
+            ev?.stopPropagation();
+            openDossierPopover(cascadeId, rowReminderBtn);
+          });
+          hoverBar.insertBefore(rowReminderBtn, anchorBtn);
+        } else if (rowReminderBtn.getAttribute('data-cascade-id') !== cascadeId) {
+          rowReminderBtn.setAttribute('data-cascade-id', cascadeId);
+        }
+      }
     }
   }
 
   function runFullSync() {
     // Refresh the cached roadmap index and update project header badges on every sync pass
     ensureRoadmapIndexLoaded();
+    ensureDossierIndexLoaded();
     ensureStylesInjected();
     const reduxActive = syncReduxFilter();
     syncDomRowsAndPlaceholders(reduxActive);
@@ -10134,11 +11136,15 @@
       // Ignore self-triggered mutations on injected filter controls and badges
       if (
         target.id === 'jetski-closed-chats-filter-bubble' ||
+        target.id === DOSSIER_POPOVER_ID ||
         target.id === STYLE_ID ||
         target.id === STAR_TOOLTIP_ID ||
         target.id === AUTOPILOT_TOAST_ID ||
         target.id === FLIGHT_DECK_DRAWER_ID ||
         target.className === BAR_CLASS ||
+        target.className === TITLEBAR_REMINDER_BTN_CLASS ||
+        target.className === INBOX_REMINDER_BTN_CLASS ||
+        target.className === ROW_REMINDER_BTN_CLASS ||
         target.className === FLIGHT_DECK_TOGGLE_BTN_CLASS ||
         target.className === FLIGHT_DECK_DRAWER_CLASS ||
         target.className === FLIGHT_DECK_RESIZE_HANDLE_CLASS ||
@@ -10167,6 +11173,10 @@
         target.className === TOP_NAV_STATUS_DOT_CLASS ||
         (typeof target.closest === 'function' &&
           (target.closest('#jetski-closed-chats-filter-bubble') ||
+            target.closest(`#${DOSSIER_POPOVER_ID}`) ||
+            target.closest(`.${TITLEBAR_REMINDER_BTN_CLASS}`) ||
+            target.closest(`.${INBOX_REMINDER_BTN_CLASS}`) ||
+            target.closest(`.${ROW_REMINDER_BTN_CLASS}`) ||
             target.closest(`#${STAR_TOOLTIP_ID}`) ||
             target.closest(`.${BAR_CLASS}`) ||
             target.closest(`#${FLIGHT_DECK_DRAWER_ID}`) ||
@@ -10213,6 +11223,7 @@
 
   window.__jetskiClosedChatsFilterCleanup = () => {
     unbindInputBoxSeenListeners();
+    closeDossierPopover();
     observer.disconnect();
     disposed = true;
     hideChainStarTooltip();
@@ -10315,6 +11326,10 @@
       `.${TOP_NAV_TOGGLE_BTN_CLASS}`,
       `.${TOP_NAV_SETTINGS_BTN_CLASS}`,
       `.${FLIGHT_DECK_TOGGLE_BTN_CLASS}`,
+      `.${TITLEBAR_REMINDER_BTN_CLASS}`,
+      `.${INBOX_REMINDER_BTN_CLASS}`,
+      `.${ROW_REMINDER_BTN_CLASS}`,
+      `#${DOSSIER_POPOVER_ID}`,
     ].join(', ');
     for (const el of document.querySelectorAll(cleanupSelector)) {
       el.remove();

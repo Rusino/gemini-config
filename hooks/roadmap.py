@@ -25,6 +25,9 @@ ROADMAPS_DIR_ENV = "JETSKI_ROADMAPS_DIR"
 DEFAULT_ROADMAPS_DIR = "~/.gemini/config/roadmaps"
 # Static JSON snapshot served via /static/artifacts/ so sidebar project headers show open counts
 ROADMAP_INDEX_FILE_NAME = "jetski-roadmaps.json"
+# Out-of-band dossier index aggregating roadmap, state, CL/PR links, and AI summaries
+DOSSIER_INDEX_FILE_NAME = "jetski-dossiers.json"
+CL_WATCHER_STATE_PATH = os.path.expanduser("~/.gemini/config/logs/cl_watcher_state.json")
 APP_DATA_DIR_CANDIDATES = ("~/.gemini/jetski", "~/.gemini/antigravity")
 OUTSIDE_PROJECT = "outside-of-project"
 SCHEMA_VERSION = 1
@@ -678,6 +681,8 @@ def export_roadmap_index() -> dict:
       os.replace(tmp, dst)
     except OSError:
       pass
+  # Keep the dossier index in sync alongside roadmaps
+  export_dossier_index()
   return payload
 
 
@@ -818,6 +823,396 @@ def _find_transcript_path(conv_id: str, transcript_path: str = "") -> str:
     if os.path.isfile(cand):
       return os.path.realpath(cand)
   return ""
+
+
+def _parse_state_markdown(md_text: str) -> dict:
+  """Parses a chain state/<id>.md file for goal, status, next step, and modified files."""
+  heading = ""
+  lines = md_text.splitlines()
+  cur_section = ""
+  section_lines: dict[str, list[str]] = {
+      "goal": [],
+      "status": [],
+      "next": [],
+      "files": [],
+  }
+
+  for line in lines:
+    stripped = line.strip()
+    if not heading and stripped.startswith("# "):
+      heading = stripped[2:].strip()
+      continue
+    if stripped.startswith("## "):
+      sec_title = stripped[3:].strip().lower()
+      if "goal" in sec_title:
+        cur_section = "goal"
+      elif any(k in sec_title for k in ("status", "current state", "evidence", "notes")):
+        cur_section = "status"
+      elif "next step" in sec_title or "immediate next" in sec_title:
+        cur_section = "next"
+      elif "files modified" in sec_title:
+        cur_section = "files"
+      else:
+        cur_section = ""
+      continue
+    elif stripped.startswith("### "):
+      subsec_title = stripped[4:].strip().lower()
+      if "files modified" in subsec_title:
+        cur_section = "files"
+      elif cur_section == "files":
+        cur_section = ""
+      continue
+    elif stripped.startswith("---") and cur_section in ("next", "files"):
+      cur_section = ""
+      continue
+
+    if cur_section:
+      section_lines[cur_section].append(line)
+
+  goal = "\n".join(section_lines["goal"]).strip()
+  status_notes = "\n".join(section_lines["status"]).strip()
+  next_step = "\n".join(section_lines["next"]).strip()
+
+  # Extract modified file basenames from files section or file:/// links
+  modified_files: list[str] = []
+  seen_files: set[str] = set()
+  file_pat = re.compile(r"(?:file:///|\b)(/[^\s`\)\"'\*]+\.[A-Za-z0-9_]+)")
+  for fline in section_lines["files"] + section_lines["status"]:
+    for match in file_pat.finditer(fline):
+      path = match.group(1).rstrip(",;.")
+      bname = os.path.basename(path)
+      if bname and not _is_ignored_internal_path(path) and bname not in seen_files:
+        seen_files.add(bname)
+        modified_files.append(bname)
+        if len(modified_files) >= 8:
+          break
+    if len(modified_files) >= 8:
+      break
+
+  return {
+      "heading": heading[:120],
+      "goal": goal[:600],
+      "statusNotes": status_notes[:600],
+      "nextStep": next_step[:600],
+      "modifiedFiles": modified_files,
+  }
+
+
+def export_dossier_index() -> dict:
+  """Exports jetski-dossiers.json combining roadmap items, state files, and CL/PR links."""
+  root = roadmaps_root()
+  items: dict[str, dict] = {}
+  cached_summaries: dict[str, dict] = {}
+
+  # Preserve cached summaries from existing dossier index if available
+  index_path = os.path.join(root, DOSSIER_INDEX_FILE_NAME)
+  if os.path.isfile(index_path):
+    try:
+      with open(index_path, "r", encoding="utf-8") as f:
+        existing = json.load(f)
+        if isinstance(existing, dict) and isinstance(existing.get("summaries"), dict):
+          cached_summaries = existing["summaries"]
+    except Exception:
+      pass
+
+  # Collect CL/PR descriptors from cl_watcher_state.json
+  cl_by_cid: dict[str, list[dict]] = {}
+  if os.path.isfile(CL_WATCHER_STATE_PATH):
+    try:
+      with open(CL_WATCHER_STATE_PATH, "r", encoding="utf-8") as f:
+        cdata = json.load(f)
+      raw_items = cdata.get("items") or {}
+      for item_key, cit in raw_items.items():
+        cid = cit.get("conversation_id") or ""
+        if not cid:
+          continue
+        label = cit.get("subject") or cit.get("cl_id") or item_key
+        url = cit.get("url") or ""
+        status = cit.get("status") or ""
+        is_wip = bool(cit.get("is_wip", False))
+        entry = {
+            "key": item_key,
+            "label": label[:80],
+            "url": url,
+            "status": status,
+            "wip": is_wip,
+        }
+        cl_by_cid.setdefault(cid, []).append(entry)
+    except Exception:
+      pass
+
+  # Scan roadmaps and state files across projects
+  if os.path.isdir(root):
+    for entry in sorted(os.listdir(root)):
+      if not SAFE_ID_RE.match(entry):
+        continue
+      pdir = os.path.join(root, entry)
+      if not os.path.isdir(pdir):
+        continue
+
+      # Map roadmap items by owner and link
+      rfile = os.path.join(pdir, "roadmap.json")
+      r_items_by_cid: dict[str, dict] = {}
+      if os.path.isfile(rfile):
+        try:
+          rdoc = load(entry)
+          for ritem in rdoc.get("items") or []:
+            owner = ritem.get("owner") or ""
+            link = ritem.get("link") or ""
+            r_info = {
+                "id": ritem["id"],
+                "status": ritem["status"],
+                "text": ritem["text"],
+                "projectId": entry,
+            }
+            # Prefer active 'doing' over other statuses
+            for target_cid in (owner, link):
+              if not target_cid:
+                continue
+              prev = r_items_by_cid.get(target_cid)
+              if not prev or (prev["status"] != "doing" and ritem["status"] == "doing"):
+                r_items_by_cid[target_cid] = r_info
+        except Exception:
+          pass
+
+      # Parse state files under <project>/state/<conv_id>.md
+      sdir = os.path.join(pdir, "state")
+      if os.path.isdir(sdir):
+        for sfile in sorted(os.listdir(sdir)):
+          if not sfile.endswith(".md"):
+            continue
+          cid = sfile[:-3]
+          spath = os.path.join(sdir, sfile)
+          try:
+            with open(spath, "r", encoding="utf-8") as f:
+              s_parsed = _parse_state_markdown(f.read())
+          except Exception:
+            s_parsed = {}
+
+          dentry = {
+              "projectId": entry,
+              "roadmapItem": r_items_by_cid.get(cid),
+              "heading": s_parsed.get("heading", ""),
+              "goal": s_parsed.get("goal", ""),
+              "statusNotes": s_parsed.get("statusNotes", ""),
+              "nextStep": s_parsed.get("nextStep", ""),
+              "modifiedFiles": s_parsed.get("modifiedFiles", []),
+              "cls": cl_by_cid.get(cid, []),
+          }
+          items[cid] = dentry
+          if len(cid) > 8:
+            items[cid[:8]] = dentry
+
+      # Attach roadmap-only chats that do not have a state file yet
+      for cid, r_info in r_items_by_cid.items():
+        if cid not in items:
+          dentry = {
+              "projectId": entry,
+              "roadmapItem": r_info,
+              "heading": "",
+              "goal": "",
+              "statusNotes": "",
+              "nextStep": "",
+              "modifiedFiles": [],
+              "cls": cl_by_cid.get(cid, []),
+          }
+          items[cid] = dentry
+          if len(cid) > 8:
+            items[cid[:8]] = dentry
+
+  # Also attach CLs for chats that had neither state file nor roadmap
+  for cid, cls_list in cl_by_cid.items():
+    if cid not in items:
+      dentry = {
+          "projectId": "",
+          "roadmapItem": None,
+          "heading": "",
+          "goal": "",
+          "statusNotes": "",
+          "nextStep": "",
+          "modifiedFiles": [],
+          "cls": cls_list,
+      }
+      items[cid] = dentry
+      if len(cid) > 8:
+        items[cid[:8]] = dentry
+
+  payload = {
+      "version": SCHEMA_VERSION,
+      "items": items,
+      "summaries": cached_summaries,
+  }
+  raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+  targets = [index_path]
+  for app_dir in find_app_data_dirs():
+    targets.append(os.path.join(app_dir, "brain", DOSSIER_INDEX_FILE_NAME))
+  for dst in targets:
+    try:
+      os.makedirs(os.path.dirname(dst), exist_ok=True)
+      tmp = f"{dst}.tmp.{os.getpid()}"
+      with open(tmp, "w", encoding="utf-8") as f:
+        f.write(raw)
+      os.replace(tmp, dst)
+    except OSError:
+      pass
+  return payload
+
+
+def update_conv_dossier_summary(conv_id: str, transcript_path: str = "") -> bool:
+  """Generates and caches an out-of-band Russian TL;DR summary using Language Server RPC."""
+  tpath = _find_transcript_path(conv_id, transcript_path)
+  if not tpath or not os.path.isfile(tpath):
+    return False
+
+  # Read transcript to extract step count, user prompts, last assistant response, and edits
+  step_count = 0
+  user_prompts: list[str] = []
+  last_assistant_response = ""
+  modified_files: set[str] = set()
+
+  from pre_tool_guard import EDIT_TOOLS, get_tool_target_file
+
+  try:
+    with open(tpath, "r", encoding="utf-8") as f:
+      for line in f:
+        stripped = line.strip()
+        if not stripped:
+          continue
+        try:
+          step = json.loads(stripped)
+        except Exception:
+          continue
+        step_count += 1
+        stype = step.get("type") or ""
+        if stype == "USER_INPUT":
+          content = step.get("content") or ""
+          content = re.sub(r"^<USER_REQUEST>[\s\r\n]*", "", content)
+          content = re.sub(r"[\s\r\n]*</USER_REQUEST>$", "", content)
+          # Strip handoff continuation header
+          content = re.sub(
+              r"^(?:Continuing\s+unfinished\s+work[^\n]+|\[handoff[^\n]+)\n*",
+              "",
+              content,
+              flags=re.IGNORECASE,
+          ).strip()
+          if content:
+            user_prompts.append(content)
+        elif stype == "PLANNER_RESPONSE":
+          content = step.get("content") or ""
+          if content.strip():
+            last_assistant_response = content.strip()
+          for tc in step.get("tool_calls") or []:
+            tname = tc.get("name") or ""
+            targs = tc.get("args") or {}
+            if tname in EDIT_TOOLS:
+              tf = get_tool_target_file(targs)
+              if tf and not _is_ignored_internal_path(tf):
+                bname = os.path.basename(tf.strip().strip('"').strip("'"))
+                if bname:
+                  modified_files.add(bname)
+  except Exception:
+    return False
+
+  if step_count == 0:
+    return False
+
+  sig = f"{conv_id}:{step_count}"
+  root = roadmaps_root()
+  index_path = os.path.join(root, DOSSIER_INDEX_FILE_NAME)
+  existing_summaries: dict[str, dict] = {}
+  if os.path.isfile(index_path):
+    try:
+      with open(index_path, "r", encoding="utf-8") as f:
+        edata = json.load(f)
+      if isinstance(edata.get("summaries"), dict):
+        existing_summaries = edata["summaries"]
+    except Exception:
+      pass
+
+  cur_entry = existing_summaries.get(conv_id) or {}
+  if cur_entry.get("sig") == sig and cur_entry.get("tldr"):
+    return True
+
+  # Read existing state file for goal / next step if present
+  pid = project_id_for(conv_id) if conv_id else ""
+  state_md_text = ""
+  if pid:
+    spath = state_path(pid, conv_id)
+    if os.path.isfile(spath):
+      try:
+        with open(spath, "r", encoding="utf-8") as f:
+          state_md_text = f.read()
+      except Exception:
+        pass
+
+  state_parsed = _parse_state_markdown(state_md_text) if state_md_text else {}
+
+  first_req = user_prompts[0][:400] if user_prompts else ""
+  recent_prompts = [p[:250] for p in user_prompts[-3:]]
+  last_resp = last_assistant_response[:1000]
+  files_str = ", ".join(sorted(modified_files)[:6]) if modified_files else "none"
+
+  prompt_parts = [
+      "Ты ассистент разработчика (женский род, неформальное обращение на 'ты').",
+      "Составь предельно краткую памятку (ровно 3 пункта, максимум 60 слов всего) "
+      "о том, чем занимается этот чат:",
+      "• Задача: <в чем изначальная цель разработчика, 1 короткая фраза>",
+      "• Что сделали: <что уже сделано или выяснено, 1 короткая фраза>",
+      "• Где остановились: <на чем остановились и чего ждет агент прямо сейчас, 1 короткая фраза>",
+      "Все названия файлов, методов, коммитов и термины держи на английском в кавычках или бэктиках. "
+      "Без приветствий и общих фраз.",
+      "\nКонтекст чата:",
+      f"Изначальный запрос: {first_req}" if first_req else "",
+      f"Цель из state-файла: {state_parsed.get('goal', '')}" if state_parsed.get("goal") else "",
+      f"Файлы в работе: {files_str}" if files_str != "none" else "",
+      f"Последние реплики пользователя: {' | '.join(recent_prompts)}" if recent_prompts else "",
+      f"Конец последнего ответа агента: {last_resp}" if last_resp else "",
+      f"Следующий шаг: {state_parsed.get('nextStep', '')}" if state_parsed.get("nextStep") else "",
+  ]
+  prompt = "\n".join(p for p in prompt_parts if p)
+
+  try:
+    import chat_lifecycle
+
+    rpc_res = chat_lifecycle.ls_rpc(
+        "GetModelResponse",
+        {"prompt": prompt, "model": "MODEL_GOOGLE_GEMINI_2_5_FLASH"},
+        timeout=15.0,
+    )
+    tldr_text = (rpc_res.get("response") or "").strip()
+  except Exception:
+    tldr_text = ""
+
+  if not tldr_text:
+    return False
+
+  existing_summaries[conv_id] = {
+      "sig": sig,
+      "tldr": tldr_text,
+      "updatedAt": _now(),
+  }
+  if len(conv_id) > 8:
+    existing_summaries[conv_id[:8]] = existing_summaries[conv_id]
+
+  # Export index with updated summaries
+  export_dossier_index()
+  try:
+    with open(index_path, "r", encoding="utf-8") as f:
+      full_idx = json.load(f)
+    full_idx["summaries"] = existing_summaries
+    raw = json.dumps(full_idx, ensure_ascii=False, sort_keys=True)
+    targets = [index_path]
+    for app_dir in find_app_data_dirs():
+      targets.append(os.path.join(app_dir, "brain", DOSSIER_INDEX_FILE_NAME))
+    for dst in targets:
+      tmp = f"{dst}.tmp.{os.getpid()}"
+      with open(tmp, "w", encoding="utf-8") as f:
+        f.write(raw)
+      os.replace(tmp, dst)
+  except Exception:
+    pass
+
+  return True
 
 
 def _collect_chat_vcs_inputs(
@@ -1388,6 +1783,14 @@ def _cli(argv: list[str]) -> int:
   elif cmd == "export-index" and not args:
     payload = export_roadmap_index()
     print(f"exported {len(payload['projects'])} project roadmap(s)")
+  elif cmd == "export-dossier" and not args:
+    payload = export_dossier_index()
+    print(f"exported {len(payload.get('items', {}))} dossier item(s)")
+  elif cmd == "update-dossier" and len(args) in (1, 3):
+    cid = args[0]
+    tpath = args[2] if len(args) == 3 and args[1] == "--transcript" else ""
+    ok = update_conv_dossier_summary(cid, tpath)
+    print("ok" if ok else "failed")
   else:
     print(f"roadmap.py: bad arguments for '{cmd}'\n", file=sys.stderr)
     print(USAGE, file=sys.stderr, end="")

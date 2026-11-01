@@ -91,6 +91,28 @@ def save_state(state_path: str, state: dict, conv_id: str = "") -> None:
     pass
 
 
+def spawn_background_dossier_update(conv_id: str, transcript_path: str) -> None:
+  """Spawns detached background process to pre-warm the Russian AI TL;DR dossier."""
+  if not conv_id:
+    return
+  roadmap_script = os.path.expanduser("~/.gemini/config/hooks/roadmap.py")
+  if not os.path.isfile(roadmap_script):
+    return
+  cmd = [sys.executable, roadmap_script, "update-dossier", conv_id]
+  if transcript_path and os.path.isfile(transcript_path):
+    cmd.extend(["--transcript", transcript_path])
+  try:
+    subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+  except Exception:
+    pass
+
+
 def send_stop_notification(conv_id: str) -> None:
   """Dispatches a detached G3N desktop notification for a completed turn."""
   if not os.path.isfile(NOTIFY_SELF_BIN):
@@ -1170,6 +1192,7 @@ def main() -> None:
     )
     return
 
+  spawn_background_dossier_update(conv_id, transcript_path)
   play_stop_sound(is_handoff=False)
   print("{}")
 

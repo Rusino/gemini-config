@@ -960,35 +960,55 @@ const liveBucketBtn = (k) =>
 
 (async () => {
   const titlebarContextBadge = titlebarToolbar.querySelector('.jetski-titlebar-context-badge');
+  const titlebarReminderBtn = titlebarToolbar.querySelector('.jetski-titlebar-reminder-btn');
   const titlebarSearchElem = titlebarToolbar.querySelector('.jetski-chat-search-btn');
   const titlebarLocateBtn = titlebarToolbar.querySelector('.jetski-chat-locate-btn');
   const titlebarBtn = titlebarToolbar.querySelector('.jetski-titlebar-archive-btn');
   assert(titlebarContextBadge, 'Titlebar context badge must be injected leftmost');
+  assert(titlebarReminderBtn, 'Titlebar Reminder button must be injected after Context badge');
   assert(titlebarLocateBtn, 'Titlebar Locate button must be injected after Search');
   assert(
     !titlebarToolbar.querySelector('.jetski-titlebar-wait-btn'),
     'Titlebar must not contain Wait button'
   );
   assert(titlebarBtn, 'Titlebar Archive button must be injected before titlebar-more-actions');
+  assert.strictEqual(titlebarReminderBtn.textContent, '💡');
+  assert.strictEqual(
+    titlebarReminderBtn.getAttribute('data-testid'),
+    'jetski-titlebar-reminder-btn'
+  );
+  assert.strictEqual(
+    titlebarReminderBtn.getAttribute('data-cascade-id'),
+    'open-current'
+  );
   assert.strictEqual(titlebarLocateBtn.textContent, '🎯');
   assert.strictEqual(titlebarLocateBtn.getAttribute('data-testid'), 'jetski-chat-locate-btn');
   assert.strictEqual(titlebarLocateBtn.getAttribute('data-cascade-id'), 'open-current');
   assert.strictEqual(titlebarToolbar.children[0], titlebarContextBadge);
-  assert.strictEqual(titlebarToolbar.children[1], titlebarSearchElem);
-  assert.strictEqual(titlebarToolbar.children[2], titlebarLocateBtn);
-  assert.strictEqual(titlebarToolbar.children[3], titlebarBtn);
-  assert.strictEqual(titlebarToolbar.children[4], moreActionsBtn);
+  assert.strictEqual(titlebarToolbar.children[1], titlebarReminderBtn);
+  assert.strictEqual(titlebarToolbar.children[2], titlebarSearchElem);
+  assert.strictEqual(titlebarToolbar.children[3], titlebarLocateBtn);
+  assert.strictEqual(titlebarToolbar.children[4], titlebarBtn);
+  assert.strictEqual(titlebarToolbar.children[5], moreActionsBtn);
   assert.strictEqual(titlebarBtn.textContent, '🗄');
   assert.strictEqual(titlebarBtn.getAttribute('data-testid'), 'jetski-titlebar-archive-btn');
   assert.strictEqual(titlebarBtn.getAttribute('aria-label'), 'Archive chat');
   assert.strictEqual(titlebarBtn.getAttribute('data-archived'), 'false');
 
-  assert(!rowHoverBar.querySelector('.jetski-row-wait-btn'), 'Sidebar row must not contain Wait button');
+  assert(
+    rowHoverBar.querySelector('.jetski-row-reminder-btn'),
+    'Sidebar row must contain Reminder button'
+  );
+  assert(
+    !rowHoverBar.querySelector('.jetski-row-wait-btn'),
+    'Sidebar row must not contain Wait button'
+  );
   assert(!rowHoverBar.querySelector('.jetski-row-archive-btn'), 'Rows keep only native Archive');
 
   // Mutations inside injected action buttons must not schedule a sync loop
   rafCallbacks = [];
   observerCallback([
+    { target: titlebarReminderBtn },
     { target: titlebarLocateBtn },
     { target: titlebarBtn },
   ]);
@@ -1000,6 +1020,35 @@ const liveBucketBtn = (k) =>
     Date.now = () => shifted;
   };
   const summaryOf = (id) => storeState.trajectorySummaries.summaries[id];
+
+  // Verify opening and toggle-closing the floating Context Dossier popover
+  assert.strictEqual(bodyEl.querySelector('#jetski-chat-dossier-popover'), null);
+  advanceClock();
+  titlebarReminderBtn.dispatchEvent('pointerdown', { button: 0 });
+  const openPopover = bodyEl.querySelector('#jetski-chat-dossier-popover');
+  assert(openPopover, 'Clicking Reminder button must open Context Dossier popover');
+  assert.strictEqual(openPopover.getAttribute('data-visible'), 'true');
+  advanceClock();
+  titlebarReminderBtn.dispatchEvent('pointerdown', { button: 0 });
+  assert.strictEqual(
+    openPopover.getAttribute('data-visible'),
+    'false',
+    'Re-clicking Reminder button must toggle-close Context Dossier popover'
+  );
+
+  // Verify trajectory facts extraction helper
+  const sampleSteps = [
+    { type: 'CORTEX_STEP_TYPE_USER_INPUT', content: 'Check https://github.com/foo/bar' },
+    {
+      type: 'CORTEX_STEP_TYPE_PLANNER_RESPONSE',
+      content: 'I will modify the file',
+      toolCalls: [{ name: 'edit_file', args: { Path: '/path/to/foo.cpp' } }],
+    },
+  ];
+  const extractedFacts = window.__jetskiDossier.extractTrajectoryDossierFacts(sampleSteps);
+  assert.deepStrictEqual(extractedFacts.userPrompts, ['Check https://github.com/foo/bar']);
+  assert.deepStrictEqual(extractedFacts.modifiedFiles, ['foo.cpp']);
+  assert.deepStrictEqual(extractedFacts.clLinks, ['https://github.com/foo/bar']);
 
   // The titlebar Archive button on a chain tail archives only that chat: no chain walk, no
   // retitling of the already archived pieces
@@ -2187,9 +2236,10 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(workingRows[0].querySelector('.jetski-inbox-tier-icon').textContent, '🤖');
   assert.strictEqual(workingRows[1].getAttribute('data-cascade-id'), 'agent-bg-wait');
   assert.strictEqual(workingRows[1].querySelector('.jetski-inbox-tier-icon').textContent, '⏳');
-  // Working rows have 0 action buttons
-  assert.strictEqual(workingRows[0].querySelector('.jetski-inbox-actions').children.length, 0);
-  assert.strictEqual(workingRows[1].querySelector('.jetski-inbox-actions').children.length, 0);
+  // Working rows have 1 action button: reminder
+  assert.strictEqual(workingRows[0].querySelector('.jetski-inbox-actions').children.length, 1);
+  assert.strictEqual(workingRows[1].querySelector('.jetski-inbox-actions').children.length, 1);
+  assert(workingRows[0].querySelector('.jetski-inbox-reminder-btn'));
 
   // Switch to Stale tab
   advanceClock();
@@ -2204,10 +2254,11 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(staleRows[0].getAttribute('data-cascade-id'), 'stale-task');
   assert.strictEqual(staleRows[0].querySelector('.jetski-inbox-tier-icon').textContent, '🧹');
   assert.strictEqual(staleRows[0].querySelector('.jetski-inbox-time').textContent, '10d');
-  // Stale rows have 1 action button: archive
-  assert.strictEqual(staleRows[0].querySelector('.jetski-inbox-actions').children.length, 1);
+  // Stale rows have 2 action buttons: reminder and archive
+  assert.strictEqual(staleRows[0].querySelector('.jetski-inbox-actions').children.length, 2);
   const staleArchiveBtn = staleRows[0].querySelector('.jetski-inbox-archive-btn');
   assert(staleArchiveBtn, 'Stale row must have archive button');
+  assert(staleRows[0].querySelector('.jetski-inbox-reminder-btn'));
 
   // Archiving stale-task empties the Stale tab and auto-falls back to Needs Me
   rpcRequests.length = 0;

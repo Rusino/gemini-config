@@ -71,6 +71,7 @@ def sync_artifact_js(
 
     chat_lifecycle.export_chain_index()
     roadmap.export_roadmap_index()
+    roadmap.export_dossier_index()
   except Exception:
     pass
   open_req_dst = os.path.join(os.path.dirname(dst), "jetski-open-chat.json")
