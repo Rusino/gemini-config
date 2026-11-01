@@ -34,11 +34,80 @@ from pre_tool_guard import (
 NOTIFY_SELF_BIN = "/google/bin/releases/g3n-team/notify_self"
 _CURRENT_CONV_ID = ""
 
-# Tool results may indent this line (e.g. "\n\n\t\t\t\tThe command exited ..." on
-# macOS Jetski), so allow leading whitespace.
-EXIT_CODE_RE = re.compile(r"^\s*The command exited with code (\d+)\.", re.MULTILINE)
+# Match command exit codes across Antigravity, Linux Jetski Web, and background tasks
+EXIT_CODE_RE = re.compile(
+    r"^\s*(?:The\s+)?[Cc]ommand exited with code (\d+)\.", re.MULTILINE
+)
 # Recurring cron ticks emit an iteration marker in their wakeup system message
 CRON_WAKEUP_RE = re.compile(r"\(iteration\s+\d+\)")
+# Background task launch marker with its unique task identifier
+BG_TASK_LAUNCH_RE = re.compile(
+    r"Tool is running as a background task with task id:\s*(\S+)"
+)
+BG_TASK_DONE_RE = re.compile(r'Task id\s+"([^"]+)"\s+finished with result:')
+SUBAGENT_CREATED_RE = re.compile(r'"conversationId":\s*"([^"]+)"')
+SYS_MSG_SENDER_RE = re.compile(r"\bsender=([^\s]+)")
+VALID_INTEGRITY_RE = re.compile(
+    r"(?:Integrity Check|Вердикт целостности)[^`\n]*`VALID\b", re.IGNORECASE
+)
+INVALID_INTEGRITY_RE = re.compile(
+    r"(?:Integrity Check|Вердикт целостности)[^`\n]*`(?:WARNING|INVALID)\b",
+    re.IGNORECASE,
+)
+SUBAGENT_EXIT_ZERO_RE = re.compile(
+    r"(?:exit\s+(?:code|status)\s*[:=`]*\s*`?0\b|exited\s+with\s+code\s+0\b|\bexit=0\b)",
+    re.IGNORECASE,
+)
+COMPARE_REPORT_PATH_RE = re.compile(r"(/[^\s`'\")]*compare\.md)\b")
+
+
+def _corpus_scripts_in_text(text: str) -> set[str]:
+  res = set()
+  if "run_flutter_paragraph_tests.py" in text or "flutter-test-paragraph-engine" in text:
+    res.add("run_flutter_paragraph_tests.py")
+  if "run_webparagraph_corpus.py" in text or "webparagraph-corpus" in text:
+    res.add("run_webparagraph_corpus.py")
+  return res
+
+
+def _corpus_scripts_from_compare_report(content: str, path_hint: str = "") -> set[str]:
+  # Only valid integrity verdicts without warnings count toward corpus gates
+  if not VALID_INTEGRITY_RE.search(content) or INVALID_INTEGRITY_RE.search(content):
+    return set()
+  matched = set()
+  combined = f"{path_hint}\n{content}"
+  # Match Flutter engine SkParagraph test suite report markers
+  if (
+      "Flutter Paragraph Engine Test Comparison" in content
+      or "все пакеты тестов завершены штатно" in content
+      or "flutter_tester" in content
+      or ("run_flutter_paragraph_tests.py" in content and "webparagraph" not in content.lower())
+      or ("flutter_paragraph" in path_hint.lower() and "webparagraph" not in combined.lower())
+  ):
+    matched.add("run_flutter_paragraph_tests.py")
+  # Match WebParagraph test suite report markers
+  if (
+      "WebParagraph Corpus Report" in content
+      or "WebParagraph активен" in content
+      or "run_webparagraph_corpus.py" in content
+      or "webparagraph" in combined.lower()
+  ):
+    matched.add("run_webparagraph_corpus.py")
+  return matched
+
+
+def _check_compare_md_paths(text: str) -> set[str]:
+  matched = set()
+  for m in COMPARE_REPORT_PATH_RE.finditer(text):
+    p = m.group(1).strip()
+    if os.path.isfile(p):
+      try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+          content = f.read()
+        matched.update(_corpus_scripts_from_compare_report(content, path_hint=p))
+      except Exception:
+        pass
+  return matched
 
 # Read-only inspection commands neither verify an edit (a `git diff` exiting 0 is
 # not a build/test) nor indicate a broken build (`grep`/`rg`/`git grep` exit 1
@@ -389,6 +458,12 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
   # Track review discipline and triage persistence across turn steps
   triage_target_seen = False
   triage_store_saved = False
+  # Background task and subagent tracking for Flutter/WebParagraph corpus runs
+  bg_corpus_tasks: dict[str, str] = {}
+  pending_subagent_scripts: set[str] = set()
+  subagent_corpus: dict[str, set[str]] = {}
+  pending_manage_task_script = ""
+  pending_read_path = ""
 
   # Walk planner tool calls and command outputs in chronological order
   for step in steps:
@@ -397,18 +472,43 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
       in_turn = int(step["step_index"]) > result["last_user_idx"]
       if in_turn and str(step.get("content", "")).strip():
         last_planner_text = str(step.get("content", ""))
+      # Reset per-step pending triggers before parsing tools in this turn
       pending_triage = False
       pending_corpus_script = ""
+      # Track corpus scripts delegated to subagents or task checks
+      pending_subagent_scripts = set()
+      pending_manage_task_script = ""
+      pending_read_path = ""
       for tc in step.get("tool_calls") or []:
         tname = tc.get("name", "")
         targs = tc.get("args") or {}
         if tname in READ_TOOLS:
-          read_blobs.append(_unquote_path(get_tool_target_file(targs)))
+          p = _unquote_path(get_tool_target_file(targs))
+          read_blobs.append(p)
+          pending_read_path = p
+          # Inspect compare.md paths immediately when viewed or read
+          if p.endswith("compare.md"):
+            for s in _check_compare_md_paths(p):
+              corpus_passed[s] = True
         elif tname == "invoke_subagent":
-          read_blobs.append(str(targs.get("Prompt", "")))
+          prompt = str(targs.get("Prompt", ""))
+          read_blobs.append(prompt)
+          # Track corpus test gates delegated to isolated subagents
+          pending_subagent_scripts.update(_corpus_scripts_in_text(prompt))
+        elif tname == "manage_task":
+          action = str(targs.get("Action", "")).lower()
+          tid = str(targs.get("TaskId", "")).strip()
+          # Match status checks on tracked background corpus tasks
+          if action == "status":
+            matched_s = bg_corpus_tasks.get(tid) or bg_corpus_tasks.get(tid.split("/")[-1])
+            if matched_s:
+              pending_manage_task_script = matched_s
         elif tname == "run_command":
           cmd = str(targs.get("CommandLine", ""))
           read_blobs.append(cmd)
+          # Validate compare.md paths embedded in shell commands
+          for s in _check_compare_md_paths(cmd):
+            corpus_passed[s] = True
           # Track triage_cl execution and subsequent triage_store save-review calls
           if _invokes_script_in_cmd(cmd, "triage_cl.py"):
             pending_triage = True
@@ -435,8 +535,34 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
             written_artifacts.append(target)
     elif stype == "GENERIC":
       content = str(step.get("content", ""))
+      # Check command or file output for valid compare.md attestation reports
+      for s in _corpus_scripts_from_compare_report(content, path_hint=pending_read_path):
+        corpus_passed[s] = True
+      for s in _check_compare_md_paths(content):
+        corpus_passed[s] = True
+
       if "\nFile Path: " in content[:200]:
+        # Reset pending read path after inspecting file payload
+        pending_read_path = ""
         continue
+
+      # Map newly created subagent id to its requested corpus scripts
+      m_sub = SUBAGENT_CREATED_RE.search(content)
+      if m_sub and pending_subagent_scripts:
+        subagent_corpus[m_sub.group(1).strip()] = set(pending_subagent_scripts)
+        pending_subagent_scripts = set()
+
+      # Map background task id to its corpus script
+      m_bg = BG_TASK_LAUNCH_RE.search(content)
+      if m_bg:
+        tid = m_bg.group(1).strip()
+        bg_scripts = _corpus_scripts_in_text(content)
+        if not bg_scripts and pending_corpus_script:
+          bg_scripts = {pending_corpus_script}
+        for s in bg_scripts:
+          bg_corpus_tasks[tid] = s
+          bg_corpus_tasks[tid.split("/")[-1]] = s
+
       m_action = AGENT_ACTION_TRY_RE.search(content)
       if m_action:
         cmd_str = m_action.group(1).strip()
@@ -479,15 +605,48 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
           required_corpus_domain = "WebParagraph (web_ui)"
           corpus_passed["run_webparagraph_corpus.py"] = False
         pending_triage = False
-      if pending_corpus_script:
+      # Record synchronous test or task-status completion
+      if pending_corpus_script or pending_manage_task_script:
         m_exit = EXIT_CODE_RE.search(content)
         if (
             m_exit
             and int(m_exit.group(1)) == 0
             and step.get("status") == "DONE"
         ):
-          corpus_passed[pending_corpus_script] = True
+          # Mark the synchronously completed corpus script or task as passed
+          target_s = pending_corpus_script or pending_manage_task_script
+          corpus_passed[target_s] = True
         pending_corpus_script = ""
+        pending_manage_task_script = ""
+
+    elif stype == "SYSTEM_MESSAGE":
+      content = str(step.get("content", ""))
+      for s in _corpus_scripts_from_compare_report(content):
+        corpus_passed[s] = True
+      for s in _check_compare_md_paths(content):
+        corpus_passed[s] = True
+
+      # Check background task completion
+      m_td = BG_TASK_DONE_RE.search(content)
+      sender = ""
+      m_snd = SYS_MSG_SENDER_RE.search(content)
+      if m_snd:
+        sender = m_snd.group(1).strip()
+      task_id = m_td.group(1).strip() if m_td else sender
+      bg_script = bg_corpus_tasks.get(task_id) or bg_corpus_tasks.get(task_id.split("/")[-1])
+      if bg_script:
+        m_exit = EXIT_CODE_RE.search(content)
+        if m_exit and int(m_exit.group(1)) == 0:
+          corpus_passed[bg_script] = True
+
+      # Check subagent completion report
+      cand_scripts = set(subagent_corpus.get(sender, set())) | _corpus_scripts_in_text(content)
+      if cand_scripts and not INVALID_INTEGRITY_RE.search(content):
+        if VALID_INTEGRITY_RE.search(content) or SUBAGENT_EXIT_ZERO_RE.search(content):
+          rep_scripts = _corpus_scripts_from_compare_report(content)
+          for s in cand_scripts:
+            if not rep_scripts or s in rep_scripts or s in content:
+              corpus_passed[s] = True
 
   for name in sorted(discover_skills()):
     if not re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", request_text):
@@ -673,6 +832,8 @@ def analyze_current_turn(transcript_path: str) -> dict:
   last_cmd_idx = -1
   last_cmd_exit_code = None
   pending_cmds: list[tuple[int, bool, bool, bool, bool, bool]] = []
+  # Map background task id to its pending command details
+  bg_pending_cmds: dict[str, tuple[int, bool, bool, bool, bool, bool]] = {}
   launched_new_conv = False
   scheduled_timer = False
   asked_question = False
@@ -781,11 +942,60 @@ def analyze_current_turn(transcript_path: str) -> dict:
           git_publish_after_done = True
         if is_set_title and code == 0:
           set_title_succeeded = True
+      else:
+        # Move command to background table when tool call yields a background task id
+        m_bg = BG_TASK_LAUNCH_RE.search(content)
+        if m_bg:
+          tid = m_bg.group(1).strip()
+          item = pending_cmds.pop(0)
+          bg_pending_cmds[tid] = item
+          bg_pending_cmds[tid.split("/")[-1]] = item
 
     # Keep cron chats marked as scheduled across recurring wakeup ticks
     elif stype == "SYSTEM_MESSAGE":
-      if CRON_WAKEUP_RE.search(str(step.get("content", ""))):
+      # Inspect system message body for timer recurrence or background completion
+      content = str(step.get("content", ""))
+      if CRON_WAKEUP_RE.search(content):
         scheduled_timer = True
+      m_exit = EXIT_CODE_RE.search(content)
+      # Resolve background task completion delivered via system message
+      if m_exit:
+        task_id = ""
+        m_td = BG_TASK_DONE_RE.search(content)
+        if m_td:
+          task_id = m_td.group(1).strip()
+        else:
+          m_snd = SYS_MSG_SENDER_RE.search(content)
+          if m_snd:
+            task_id = m_snd.group(1).strip()
+        item = bg_pending_cmds.get(task_id) or bg_pending_cmds.get(task_id.split("/")[-1])
+        if item:
+          (
+              c_idx,
+              is_handoff,
+              is_cli,
+              is_rm_done,
+              is_git_pub,
+              is_set_title,
+          ) = item
+          code = int(m_exit.group(1))
+          last_cmd_exit_code = code
+          launched_marker = (
+              '"newConversation"' in content
+              or '"new_conversation_id"' in content
+              or is_cli
+          )
+          if is_handoff and code == 0 and launched_marker:
+            launched_new_conv = True
+          if is_rm_done and code == 0:
+            roadmap_done_idx = c_idx
+            for ln in content.splitlines():
+              if "[VCS BATON:" in ln:
+                vcs_baton_lines.append(ln.strip())
+          if is_git_pub and code == 0 and roadmap_done_idx >= 0 and c_idx >= roadmap_done_idx:
+            git_publish_after_done = True
+          if is_set_title and code == 0:
+            set_title_succeeded = True
 
   return {
       "last_user_idx": last_user_idx,

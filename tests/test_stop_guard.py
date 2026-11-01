@@ -16,6 +16,13 @@ import stop_guard
 
 class TestStopGuard(unittest.TestCase):
 
+  def setUp(self):
+    self._patch_dossier = patch("stop_guard.spawn_background_dossier_update")
+    self._patch_dossier.start()
+
+  def tearDown(self):
+    self._patch_dossier.stop()
+
   def test_is_inspection_command(self):
     inspection_commands = [
         "git status -s",
@@ -1286,6 +1293,422 @@ class TestStopGuard(unittest.TestCase):
         stop_guard.main()
       mock_sound.assert_called_once_with(is_handoff=False)
       self.assertFalse(os.path.exists(state_file))
+
+  def test_skparagraph_review_approval_with_background_task_corpus_allows_stop(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      steps = [
+          {
+              "step_index": 1,
+              "type": "USER_INPUT",
+              "content": "<USER_REQUEST>review CL</USER_REQUEST>",
+          },
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [
+                  {
+                      "name": "run_command",
+                      "args": {
+                          "CommandLine": (
+                              "python3 ~/.gemini/config/skills/review-triage/"
+                              "scripts/triage_cl.py 12345"
+                          )
+                      },
+                  },
+                  {
+                      "name": "run_command",
+                      "args": {
+                          "CommandLine": (
+                              "python3 ~/.gemini/config/scripts/triage_store.py "
+                              "save-review --target 12345 --patchset 1 "
+                              "--outcome CLEAN --summary 'All 2400 tests passed'"
+                          )
+                      },
+                  },
+              ],
+          },
+          {
+              "step_index": 3,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": (
+                  "The command exited with code 0.\n"
+                  "| **Flutter Corpus Gate** | 🚨 **REQUIRED "
+                  "(`run_flutter_paragraph_tests.py`)** |\n"
+              ),
+          },
+          {
+              "step_index": 4,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": (
+                          "python3 ~/.gemini/config/skills/"
+                          "flutter-test-paragraph-engine/scripts/"
+                          "run_flutter_paragraph_tests.py --out /tmp/flutter_gate"
+                      )
+                  },
+              }],
+          },
+          {
+              "step_index": 5,
+              "type": "GENERIC",
+              "status": "RUNNING",
+              "content": (
+                  "Tool is running as a background task with task id: c1/task-38\n"
+                  "Task Description: python3 run_flutter_paragraph_tests.py"
+              ),
+          },
+          {
+              "step_index": 6,
+              "type": "PLANNER_RESPONSE",
+              "content": "Waiting for corpus in background (task-38)",
+          },
+          {
+              "step_index": 7,
+              "type": "SYSTEM_MESSAGE",
+              "status": "DONE",
+              "content": (
+                  '<SYSTEM_MESSAGE>\n[Message] sender=c1/task-38\n'
+                  'Task id "c1/task-38" finished with result:\n'
+                  "Command exited with code 0.\n</SYSTEM_MESSAGE>"
+              ),
+          },
+          {
+              "step_index": 8,
+              "type": "PLANNER_RESPONSE",
+              "content": (
+                  "### Execution Ledger\n- Triage: done\n- Flutter corpus: done\n\n"
+                  "**Case 1: Ideal CL**. LGTM!"
+              ),
+          },
+      ]
+      self.assertEqual(self.run_discipline_stop(tmp_dir, steps), {})
+
+  def test_skparagraph_review_approval_with_failed_background_task_corpus_blocks_stop(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      steps = [
+          {
+              "step_index": 1,
+              "type": "USER_INPUT",
+              "content": "<USER_REQUEST>review CL</USER_REQUEST>",
+          },
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [
+                  {
+                      "name": "run_command",
+                      "args": {
+                          "CommandLine": (
+                              "python3 ~/.gemini/config/skills/review-triage/"
+                              "scripts/triage_cl.py 12345"
+                          )
+                      },
+                  },
+                  {
+                      "name": "run_command",
+                      "args": {
+                          "CommandLine": (
+                              "python3 ~/.gemini/config/scripts/triage_store.py "
+                              "save-review --target 12345 --patchset 1 "
+                              "--outcome CLEAN --summary 'All 2400 tests passed'"
+                          )
+                      },
+                  },
+              ],
+          },
+          {
+              "step_index": 3,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": (
+                  "The command exited with code 0.\n"
+                  "| **Flutter Corpus Gate** | 🚨 **REQUIRED "
+                  "(`run_flutter_paragraph_tests.py`)** |\n"
+              ),
+          },
+          {
+              "step_index": 4,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": (
+                          "python3 ~/.gemini/config/skills/"
+                          "flutter-test-paragraph-engine/scripts/"
+                          "run_flutter_paragraph_tests.py --out /tmp/flutter_gate"
+                      )
+                  },
+              }],
+          },
+          {
+              "step_index": 5,
+              "type": "GENERIC",
+              "status": "RUNNING",
+              "content": (
+                  "Tool is running as a background task with task id: c1/task-38\n"
+                  "Task Description: python3 run_flutter_paragraph_tests.py"
+              ),
+          },
+          {
+              "step_index": 6,
+              "type": "PLANNER_RESPONSE",
+              "content": "Waiting for corpus in background (task-38)",
+          },
+          {
+              "step_index": 7,
+              "type": "SYSTEM_MESSAGE",
+              "status": "DONE",
+              "content": (
+                  '<SYSTEM_MESSAGE>\n[Message] sender=c1/task-38\n'
+                  'Task id "c1/task-38" finished with result:\n'
+                  "Command exited with code 1.\n</SYSTEM_MESSAGE>"
+              ),
+          },
+          {
+              "step_index": 8,
+              "type": "PLANNER_RESPONSE",
+              "content": (
+                  "### Execution Ledger\n- Triage: done\n- Flutter corpus: failed\n\n"
+                  "**Case 1: Ideal CL**. LGTM!"
+              ),
+          },
+      ]
+      out = self.run_discipline_stop(tmp_dir, steps)
+      self.assertEqual(out.get("decision"), "continue")
+      self.assertIn("[REVIEW CORPUS GUARD]", out.get("reason", ""))
+
+  def test_skparagraph_review_approval_with_subagent_corpus_report_allows_stop(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      steps = [
+          {
+              "step_index": 1,
+              "type": "USER_INPUT",
+              "content": "<USER_REQUEST>review CL</USER_REQUEST>",
+          },
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [
+                  {
+                      "name": "run_command",
+                      "args": {
+                          "CommandLine": (
+                              "python3 ~/.gemini/config/skills/review-triage/"
+                              "scripts/triage_cl.py 12345"
+                          )
+                      },
+                  },
+                  {
+                      "name": "run_command",
+                      "args": {
+                          "CommandLine": (
+                              "python3 ~/.gemini/config/scripts/triage_store.py "
+                              "save-review --target 12345 --patchset 1 "
+                              "--outcome CLEAN --summary 'All 2400 tests passed'"
+                          )
+                      },
+                  },
+              ],
+          },
+          {
+              "step_index": 3,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": (
+                  "The command exited with code 0.\n"
+                  "| **Flutter Corpus Gate** | 🚨 **REQUIRED "
+                  "(`run_flutter_paragraph_tests.py`)** |\n"
+              ),
+          },
+          {
+              "step_index": 4,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "invoke_subagent",
+                  "args": {
+                      "Prompt": (
+                          "Run run_flutter_paragraph_tests.py on CL 12345 and report "
+                          "compare.md with Integrity Check"
+                      )
+                  },
+              }],
+          },
+          {
+              "step_index": 5,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": (
+                  'Created the following subagent:\n{\n  "conversationId": "sub-123"\n}'
+              ),
+          },
+          {
+              "step_index": 6,
+              "type": "SYSTEM_MESSAGE",
+              "status": "DONE",
+              "content": (
+                  "<SYSTEM_MESSAGE>\n[Message] sender=sub-123\n"
+                  "### Test Gate Results for Skia CL\n"
+                  "Exit status: 0\n"
+                  "**Вердикт целостности (Integrity Check):** "
+                  "`VALID (все пакеты тестов завершены штатно)`\n"
+                  "</SYSTEM_MESSAGE>"
+              ),
+          },
+          {
+              "step_index": 7,
+              "type": "PLANNER_RESPONSE",
+              "content": (
+                  "### Execution Ledger\n- Triage: done\n- Flutter corpus: done\n\n"
+                  "**Case 1: Ideal CL**. LGTM!"
+              ),
+          },
+      ]
+      self.assertEqual(self.run_discipline_stop(tmp_dir, steps), {})
+
+  def test_webparagraph_review_approval_with_compare_md_read_allows_stop(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      compare_path = os.path.join(tmp_dir, "webparagraph_compare.md")
+      with open(compare_path, "w", encoding="utf-8") as f:
+        f.write(
+            "# WebParagraph Corpus Report (baseline = candidate)\n\n"
+            "## Паспорт прогона (Run Attestation)\n"
+            "**Вердикт целостности (Integrity Check):** `VALID (все сьюты завершены)`\n"
+        )
+      steps = [
+          {
+              "step_index": 1,
+              "type": "USER_INPUT",
+              "content": "<USER_REQUEST>review PR</USER_REQUEST>",
+          },
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [
+                  {
+                      "name": "run_command",
+                      "args": {
+                          "CommandLine": (
+                              "python3 ~/.gemini/config/skills/review-triage/"
+                              "scripts/triage_cl.py 99999"
+                          )
+                      },
+                  },
+                  {
+                      "name": "run_command",
+                      "args": {
+                          "CommandLine": (
+                              "python3 ~/.gemini/config/scripts/triage_store.py "
+                              "save-review --target 99999 --patchset 1 "
+                              "--outcome CLEAN --summary 'All pass'"
+                          )
+                      },
+                  },
+              ],
+          },
+          {
+              "step_index": 3,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": (
+                  "The command exited with code 0.\n"
+                  "| **Flutter Corpus Gate** | 🚨 **REQUIRED "
+                  "(`run_webparagraph_corpus.py`)** |\n"
+              ),
+          },
+          {
+              "step_index": 4,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "read_file",
+                  "args": {"Path": compare_path},
+              }],
+          },
+          {
+              "step_index": 5,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": (
+                  f"File Path: {compare_path}\n"
+                  "# WebParagraph Corpus Report\n"
+                  "**Вердикт целостности (Integrity Check):** `VALID (все сьюты завершены)`\n"
+              ),
+          },
+          {
+              "step_index": 6,
+              "type": "PLANNER_RESPONSE",
+              "content": (
+                  "### Execution Ledger\n- Triage: done\n- Corpus: done\n\n"
+                  "**Case 1: Ideal CL**. LGTM!"
+              ),
+          },
+      ]
+      self.assertEqual(self.run_discipline_stop(tmp_dir, steps), {})
+
+  def test_background_verification_command_after_code_edit_allows_stop(self):
+    fake_src = "/workspace/project/feature.py"
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl") as f_trans, \
+         tempfile.TemporaryDirectory() as tmp_dir:
+      steps = [
+          {"step_index": 1, "type": "USER_INPUT", "content": "Please implement feature"},
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [
+                  {"name": "replace_file_content", "args": {"TargetFile": fake_src}}
+              ],
+          },
+          {
+              "step_index": 3,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [
+                  {"name": "run_command", "args": {"CommandLine": "python3 -m unittest"}}
+              ],
+          },
+          {
+              "step_index": 4,
+              "type": "GENERIC",
+              "status": "RUNNING",
+              "content": (
+                  "Tool is running as a background task with task id: c1/task-10\n"
+                  "Task Description: python3 -m unittest"
+              ),
+          },
+          {
+              "step_index": 5,
+              "type": "PLANNER_RESPONSE",
+              "content": "Waiting for tests in background",
+          },
+          {
+              "step_index": 6,
+              "type": "SYSTEM_MESSAGE",
+              "status": "DONE",
+              "content": (
+                  '<SYSTEM_MESSAGE>\n[Message] sender=c1/task-10\n'
+                  'Task id "c1/task-10" finished with result:\n'
+                  "Command exited with code 0.\nRan 10 tests.\nOK\n</SYSTEM_MESSAGE>"
+              ),
+          },
+      ]
+      for s in steps:
+        f_trans.write(json.dumps(s) + "\n")
+      f_trans.flush()
+
+      data = {
+          "conversationId": "c1",
+          "transcriptPath": f_trans.name,
+          "artifactDirectoryPath": tmp_dir,
+          "fullyIdle": True,
+          "terminationReason": "MODEL_STOP",
+      }
+      with patch("sys.stdin", io.StringIO(json.dumps(data))), \
+           patch("sys.stdout", new_callable=io.StringIO) as mock_out, \
+           patch.object(stop_guard, "play_stop_sound"):
+        stop_guard.main()
+        out = json.loads(mock_out.getvalue())
+        self.assertEqual(out, {})
 
 
 if __name__ == "__main__":
