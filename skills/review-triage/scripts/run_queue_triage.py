@@ -85,7 +85,10 @@ def fetch_pending_gerrit_reviews():
     all_changes = []
     seen = set()
     for host in GERRIT_HOSTS:
-        url = f"https://{host}/changes/?q={query}&n=25&o=DETAILED_ACCOUNTS&o=MESSAGES"
+        url = (
+            f"https://{host}/changes/?q={query}&n=25&o=DETAILED_ACCOUNTS&o=MESSAGES"
+            "&o=CURRENT_REVISION&o=ALL_REVISIONS&o=CURRENT_COMMIT"
+        )
         req = urllib.request.Request(url, headers={"User-Agent": "ReviewTriageQueue"})
         try:
             with urllib.request.urlopen(req, timeout=12) as resp:
@@ -170,7 +173,7 @@ def fetch_github_pr_detail(repo_slug, pr_number):
                 "--repo", repo_slug,
                 "--json",
                 "number,title,url,author,createdAt,updatedAt,mergeable,reviewDecision,"
-                "reviewRequests,reviews,comments,statusCheckRollup",
+                "headRefName,baseRefName,reviewRequests,reviews,comments,statusCheckRollup",
             ],
             stderr=subprocess.DEVNULL,
             text=True,
@@ -243,16 +246,54 @@ def fetch_pending_github_reviews(max_days, include_all, include_answered, ignore
         if not include_answered and not is_github_pr_awaiting_reviewer(detail):
             continue
 
-        results.append((updated_dt, {
+        created_dt = parse_iso_time(it.get("created_at") or it.get("updated_at"))
+        head_ref = str((detail or {}).get("headRefName") or "")
+        base_ref = str((detail or {}).get("baseRefName") or "")
+        results.append((created_dt, {
             "source": "github",
             "repo_slug": repo_slug,
             "number": pr_num,
             "url": html_url,
             "subject": it.get("title", f"PR #{pr_num}"),
             "owner": (it.get("user") or {}).get("login", "Unknown"),
+            "head_ref": head_ref,
+            "base_ref": base_ref,
         }))
 
-    results.sort(key=lambda x: x[0], reverse=True)
+    # Map head_ref to pr_num to discover stacked PRs in results
+    head_ref_to_num = {
+        r[1]["head_ref"]: r[1]["number"]
+        for r in results
+        if r[1].get("head_ref")
+    }
+    parent_map = {}
+    for r in results:
+        bref = r[1].get("base_ref") or ""
+        p_num = head_ref_to_num.get(bref)
+        if p_num and p_num != r[1]["number"]:
+            parent_map[r[1]["number"]] = p_num
+
+    def get_pr_depth(pnum):
+        cur = pnum
+        depth = 0
+        visited = set()
+        while cur in parent_map and depth < len(results):
+            p = parent_map[cur]
+            if p in visited:
+                break
+            visited.add(cur)
+            cur = p
+            depth += 1
+        return depth
+
+    # Order bottom-up (stack parents before children) and FIFO (older first)
+    results.sort(
+        key=lambda x: (
+            get_pr_depth(x[1]["number"]),
+            x[0],
+            int(x[1]["number"]) if str(x[1]["number"]).isdigit() else 10**18,
+        )
+    )
     return [x[1] for x in results]
 
 
@@ -424,6 +465,58 @@ def fetch_github_issue_updates(max_days, include_all):
     return [x[1] for x in issues]
 
 
+def sort_gerrit_changes_topological_fifo(dated_changes):
+    """Sorts Gerrit changes bottom-up (parents before children) and FIFO (older first)."""
+    # Map (host, sha) to change number for fast parent matching
+    sha_to_cl = {}
+    for _, c in dated_changes:
+        host = c.get("_gerrit_host", "")
+        cid = str(c.get("_number"))
+        cur_sha = str(c.get("current_revision") or "").strip()
+        if cur_sha:
+            sha_to_cl[(host, cur_sha)] = cid
+        for sha in (c.get("revisions") or {}).keys():
+            s = str(sha).strip()
+            if s:
+                sha_to_cl[(host, s)] = cid
+
+    parent_map = {}
+    for _, c in dated_changes:
+        host = c.get("_gerrit_host", "")
+        cid = str(c.get("_number"))
+        cur_sha = str(c.get("current_revision") or "")
+        rev_info = (c.get("revisions") or {}).get(cur_sha) or {}
+        parents = ((rev_info.get("commit") or {}).get("parents")) or []
+        p_sha = str(parents[0].get("commit") or "").strip() if parents else ""
+        if p_sha and (host, p_sha) in sha_to_cl:
+            p_cid = sha_to_cl[(host, p_sha)]
+            if p_cid != cid:
+                parent_map[cid] = p_cid
+
+    def get_cl_depth(cid):
+        cur = cid
+        depth = 0
+        visited = set()
+        while cur in parent_map and depth < len(dated_changes):
+            p = parent_map[cur]
+            if p in visited:
+                break
+            visited.add(cur)
+            cur = p
+            depth += 1
+        return depth
+
+    # Order bottom-up (stack parents before children) and FIFO (older first)
+    dated_changes.sort(
+        key=lambda x: (
+            get_cl_depth(str(x[1].get("_number"))),
+            x[0],
+            int(x[1].get("_number")) if str(x[1].get("_number", "")).isdigit() else 10**18,
+        )
+    )
+    return dated_changes
+
+
 def main():
     parser = argparse.ArgumentParser(description="Daily Morning Review Queue Triage")
     parser.add_argument(
@@ -461,8 +554,8 @@ def main():
             continue
         dated_changes.append((created_dt, c))
 
-    # Sort newest first by creation timestamp
-    dated_changes.sort(key=lambda x: x[0], reverse=True)
+    # Order bottom-up (stack parents before children) and FIFO (older first)
+    sort_gerrit_changes_topological_fifo(dated_changes)
     gerrit_changes = [x[1] for x in dated_changes]
 
     github_reviews = fetch_pending_github_reviews(

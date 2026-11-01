@@ -1166,6 +1166,7 @@ def attach_archived_chats_to_open_changes(
 
 
 _RELATED_CLS_CACHE: dict[str, list[str]] = {}
+_RELATED_STACK_ORDER_CACHE: dict[str, list[str]] = {}
 
 
 def fetch_gerrit_related_cl_ids(host: str, cl_id: str) -> list[str]:
@@ -1191,6 +1192,18 @@ def fetch_gerrit_related_cl_ids(host: str, cl_id: str) -> list[str]:
         if isinstance(ch, dict)
         and str(ch.get("status") or "").upper() not in ("MERGED", "ABANDONED")
     ]
+    # Record bottom-up stack order across all active changes in the revision chain
+    ordered_stack_nums: list[str] = []
+    for ch in reversed(active_changes):
+      num = str(ch.get("_change_number") or "").strip()
+      if num and num not in ordered_stack_nums:
+        ordered_stack_nums.append(num)
+    if ordered_stack_nums:
+      for s_num in ordered_stack_nums:
+        _RELATED_STACK_ORDER_CACHE[f"{host}:{s_num}"] = ordered_stack_nums
+    else:
+      _RELATED_STACK_ORDER_CACHE[cache_key] = [str(cl_id)]
+
     by_commit: dict[str, dict[str, Any]] = {}
     children_of: dict[str, list[str]] = {}
     target_commit = ""
@@ -1233,10 +1246,20 @@ def fetch_gerrit_related_cl_ids(host: str, cl_id: str) -> list[str]:
           related_ids.append(num)
   except Exception:
     # Fail open when Gerrit /related is unreachable or change has no revisions
-    pass
+    if cache_key not in _RELATED_STACK_ORDER_CACHE:
+      _RELATED_STACK_ORDER_CACHE[cache_key] = [str(cl_id)]
 
   _RELATED_CLS_CACHE[cache_key] = related_ids
   return related_ids
+
+
+def fetch_gerrit_stack_order_ids(host: str, cl_id: str) -> list[str]:
+  """Returns change IDs in the revision stack ordered bottom-up (base parent to tip)."""
+  cache_key = f"{host}:{cl_id}"
+  if cache_key in _RELATED_STACK_ORDER_CACHE:
+    return _RELATED_STACK_ORDER_CACHE[cache_key]
+  fetch_gerrit_related_cl_ids(host, cl_id)
+  return _RELATED_STACK_ORDER_CACHE.get(cache_key, [str(cl_id)])
 
 
 def link_companion_changes_to_parent_chats(
@@ -1792,6 +1815,248 @@ def link_fix_changes_to_parent_chats(
         d["chat_archived"] = parent.get("chat_archived", False)
       d["single_target"] = False
       parent["single_target"] = False
+
+
+def _item_created_sort_key(
+    d: dict[str, Any], fetched_cache: dict[str, dict[str, Any]]
+) -> float:
+  """Extracts creation timestamp as float seconds for FIFO queue ordering."""
+  ikey = str(d.get("item_key") or "")
+  info = fetched_cache.get(ikey) or {}
+  for ts_val in (
+      info.get("created"),
+      d.get("created"),
+      info.get("updated"),
+      d.get("updated"),
+  ):
+    if ts_val:
+      dt = parse_gerrit_or_iso_time(str(ts_val))
+      if dt:
+        return dt.timestamp()
+  return 0.0
+
+
+def order_and_link_stack_changes(
+    active_discovered: list[dict[str, Any]],
+    fetched_cache: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+  """Computes stack ancestors, parents, and depth; orders queue bottom-up and FIFO."""
+  # Index GitHub PR items by head branch name and head commit SHA for stack linking
+  gh_head_to_item: dict[str, dict[str, Any]] = {}
+  gh_sha_to_item: dict[str, dict[str, Any]] = {}
+  for d in active_discovered:
+    if d.get("kind") == "github":
+      ikey = str(d.get("item_key") or "")
+      info = fetched_cache.get(ikey) or {}
+      href = str(info.get("head_ref") or d.get("head_ref") or "").strip()
+      hsha = str(info.get("head_sha") or d.get("head_sha") or "").strip()
+      if href:
+        gh_head_to_item[href] = d
+      if hsha:
+        gh_sha_to_item[hsha] = d
+
+  # Index Gerrit changes by target ID
+  gerrit_by_tid: dict[str, dict[str, Any]] = {
+      str(d.get("target_id") or ""): d
+      for d in active_discovered
+      if d.get("kind") == "gerrit"
+  }
+
+  for d in active_discovered:
+    ikey = str(d.get("item_key") or "")
+    kind = str(d.get("kind") or "")
+    info = fetched_cache.get(ikey) or {}
+    stack_ancestors: list[str] = []
+    parent_ikey = ""
+
+    # Companion CLs are linked to their parent chat via link_companion_changes
+    if d.get("companion_to"):
+      d["stack_ancestors"] = []
+      d["stack_parent_ikey"] = ""
+      d["stack_depth"] = 0
+      continue
+
+    if kind == "gerrit":
+      tid = str(d.get("target_id") or "")
+      host = str(d.get("preferred_host") or info.get("host") or GERRIT_SKIA_HOST)
+      stack_nums = fetch_gerrit_stack_order_ids(host, tid)
+      if tid in stack_nums and len(stack_nums) > 1:
+        idx = stack_nums.index(tid)
+        for anc_tid in stack_nums[:idx]:
+          anc_item = gerrit_by_tid.get(anc_tid)
+          anc_key = (
+              str(anc_item.get("item_key"))
+              if anc_item and anc_item.get("item_key")
+              else f"gerrit:{anc_tid}"
+          )
+          stack_ancestors.append(anc_key)
+        if idx > 0:
+          direct_num = stack_nums[idx - 1]
+          direct_item = gerrit_by_tid.get(direct_num)
+          parent_ikey = (
+              str(direct_item.get("item_key"))
+              if direct_item and direct_item.get("item_key")
+              else f"gerrit:{direct_num}"
+          )
+        d["stack_depth"] = idx
+      else:
+        d["stack_depth"] = 0
+
+    elif kind == "github":
+      bref = str(info.get("base_ref") or d.get("base_ref") or "").strip()
+      gh_parent = gh_head_to_item.get(bref) if bref else None
+      if not gh_parent:
+        commits = info.get("commit_shas") or d.get("commit_shas") or []
+        for csha in commits:
+          cand = gh_sha_to_item.get(str(csha).strip())
+          if cand and cand != d:
+            gh_parent = cand
+            break
+      if gh_parent and gh_parent != d:
+        p_key = str(gh_parent.get("item_key") or "")
+        parent_ikey = p_key
+        # Trace ancestors bottom-up to prevent cycles
+        cur: dict[str, Any] | None = gh_parent
+        visited: set[str] = {ikey}
+        while cur:
+          cur_key = str(cur.get("item_key") or "")
+          if not cur_key or cur_key in visited:
+            break
+          visited.add(cur_key)
+          stack_ancestors.insert(0, cur_key)
+          cur_info = fetched_cache.get(cur_key) or {}
+          next_bref = str(
+              cur_info.get("base_ref") or cur.get("base_ref") or ""
+          ).strip()
+          cur = gh_head_to_item.get(next_bref) if next_bref else None
+        d["stack_depth"] = len(stack_ancestors)
+      else:
+        d["stack_depth"] = 0
+    else:
+      d["stack_depth"] = 0
+
+    d["stack_ancestors"] = stack_ancestors
+    d["stack_parent_ikey"] = parent_ikey
+
+  # Order bottom-up (stack parents before children) and FIFO (older first)
+  active_discovered.sort(
+      key=lambda it: (
+          int(it.get("stack_depth") or 0),
+          _item_created_sort_key(it, fetched_cache),
+          int(it.get("target_id"))
+          if str(it.get("target_id", "")).isdigit()
+          else 10**18,
+      )
+  )
+  return active_discovered
+
+
+def _has_unready_open_stack_parent(
+    ikey: str,
+    active_by_ikey: dict[str, dict[str, Any]],
+    fetched_cache: dict[str, dict[str, Any]],
+    new_items: dict[str, Any],
+    prev_items: dict[str, Any],
+) -> bool:
+  """Returns True if any open ancestor in the stack is still unreviewed or busy."""
+  d = active_by_ikey.get(ikey)
+  if not d:
+    _, d_match = _lookup_state_item(new_items, ikey)
+    d = d_match or _lookup_state_item(prev_items, ikey)[1]
+  if not d:
+    return False
+
+  ancestors = list(d.get("stack_ancestors") or [])
+  if not ancestors:
+    return False
+
+  for anc_key in ancestors:
+    _, anc_rec = _lookup_state_item(new_items, anc_key)
+    if not anc_rec:
+      _, anc_prev = _lookup_state_item(prev_items, anc_key)
+      anc_rec = anc_prev or active_by_ikey.get(anc_key)
+    anc_info = fetched_cache.get(anc_key) or {}
+    if not anc_rec and not anc_info:
+      continue
+
+    status = str(
+        (anc_rec or {}).get("status") or anc_info.get("status") or ""
+    ).upper()
+    # Merged or closed parents do not block review of stacked descendants
+    if status in ("MERGED", "ABANDONED", "CLOSED"):
+      continue
+
+    # Active chat currently running triage or review blocks child auto-start
+    if anc_rec and anc_rec.get("chat_busy"):
+      return True
+
+    anc_kind = str(
+        (anc_rec or {}).get("kind")
+        or anc_info.get("kind")
+        or (anc_key.split(":")[0] if ":" in anc_key else "gerrit")
+    )
+    anc_tid = str(
+        (anc_rec or {}).get("target_id")
+        or anc_info.get("target_id")
+        or (anc_key.split(":")[-1] if ":" in anc_key else "")
+    )
+    anc_ps = int(
+        (anc_rec or {}).get("patchset")
+        or anc_info.get("patchset")
+        or (anc_rec or {}).get("review_target_ps")
+        or 1
+    )
+
+    # Check whether parent was already approved or reviewed on host platform
+    self_rev_st = (anc_rec or {}).get("self_review_state") or anc_info.get(
+        "self_review_state"
+    )
+    self_rev_ps = int(
+        (anc_rec or {}).get("self_review_ps")
+        or anc_info.get("self_review_ps")
+        or 0
+    )
+    self_appr = bool(
+        (anc_rec or {}).get("self_approved") or anc_info.get("self_approved")
+    )
+    if (self_rev_st and self_rev_ps >= anc_ps) or self_appr:
+      continue
+
+    # Check whether parent review was completed and saved in triage_store
+    tr = triage_store.load_triage_result(anc_kind, anc_tid)
+    if tr and int(tr.get("patchset") or 0) >= anc_ps and tr.get("verdict"):
+      continue
+
+    # Check whether chat already completed review for the current patchset
+    if (
+        anc_rec
+        and int(anc_rec.get("reviewed_ps") or 0) >= anc_ps
+        and not anc_rec.get("chat_busy")
+    ):
+      continue
+
+    # When parent review is not assigned to self, check if external approvals exist
+    is_my_rev = (
+        _is_assigned_reviewer_record(anc_rec)
+        if anc_rec
+        else _is_assigned_reviewer_record(active_by_ikey.get(anc_key) or {})
+    )
+    if not is_my_rev:
+      appr_cnt = int(
+          (anc_rec or {}).get("approved_count")
+          or anc_info.get("approved_count")
+          or 0
+      )
+      miss_appr = (anc_rec or {}).get("missing_approvals")
+      if miss_appr is None:
+        miss_appr = anc_info.get("missing_approvals")
+      if appr_cnt > 0 or miss_appr == 0:
+        continue
+
+    # Ancestor is still open and unready
+    return True
+
+  return False
 
 
 def _build_fix_entry(rec: dict[str, Any], fix_self_label: str) -> dict[str, Any]:
@@ -3453,7 +3718,7 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
             "--json",
             # Include body so fix-for detection can parse PR bug/revert references
             "number,title,body,state,isDraft,author,mergedAt,headRefOid,headRefName,"
-            "reviewDecision,latestReviews,reviews,comments,"
+            "baseRefName,reviewDecision,latestReviews,reviews,comments,"
             # Include commits so author pushes after a review update the PR timeline
             "commits,statusCheckRollup,labels,url,mergeable,reviewRequests,"
             "createdAt,updatedAt,closedAt",
@@ -3469,6 +3734,12 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
     is_self = author_login in SELF_GITHUB_LOGINS
     head_sha = str(d.get("headRefOid") or "")
     head_ref = str(d.get("headRefName") or "")
+    base_ref = str(d.get("baseRefName") or "")
+    commit_shas = [
+        str(cm.get("oid") or "").strip()
+        for cm in (d.get("commits") or [])
+        if isinstance(cm, dict) and cm.get("oid")
+    ]
     review_decision = str(d.get("reviewDecision") or "")
     is_wip = state == "OPEN" and (
         bool(d.get("isDraft")) or bool(RE_DRAFT_SUBJECT.match(subject))
@@ -3866,6 +4137,8 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         "wip_label": wip_label,
         "head_sha": head_sha,
         "head_ref": head_ref,
+        "base_ref": base_ref,
+        "commit_shas": commit_shas,
         "review_decision": review_decision,
         "required_approvals": required_approvals,
         "approved_count": approved_count,
@@ -5369,7 +5642,8 @@ def sync_once(
       ):
         continue
     kept_active.append(d)
-  active_discovered = kept_active
+  active_discovered = order_and_link_stack_changes(kept_active, fetched_cache)
+  active_by_ikey = {str(d.get("item_key") or ""): d for d in active_discovered}
 
   unique_tids = sorted(
       {d["target_id"] for d in active_discovered if d.get("target_id")}
@@ -5697,6 +5971,9 @@ def sync_once(
           claim_key not in review_claims
           and auto_started_count < 1
           and busy_review_chats < 2
+          and not _has_unready_open_stack_parent(
+              ikey, active_by_ikey, fetched_cache, new_items, prev_items
+          )
       ):
         prompt = (
             f"Проведи review-triage для {info.get('url') or ikey} "

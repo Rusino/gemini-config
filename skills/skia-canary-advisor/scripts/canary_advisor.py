@@ -1129,6 +1129,7 @@ def cmd_watch(args):
                 break
     g3_needed = "Canary-G3" in recs
     asan_retried = False
+    last_missing_parents = ""
 
     while True:
         elapsed = time.time() - start_time
@@ -1147,16 +1148,16 @@ def cmd_watch(args):
             if "Canary-G3" not in builds and meta["googler_cr_plus_one"]:
                 missing = unapproved_g3_chain(cl, ps)
                 if missing:
-                    # The try service would fail with MissingApproval after a minute
                     listed = ", ".join(f"{c}/{p}" for c, p in missing)
-                    print(f"Googler CR+1 is on {cl}, but Canary-G3 also needs it on the "
-                          f"unmerged parents: {listed}. Not triggering Canary-G3")
-                    g3_needed = False
+                    if listed != last_missing_parents:
+                        print(f"Googler CR+1 is on {cl}, but Canary-G3 also needs it on the "
+                              f"unmerged parents: {listed}. Waiting for parent approval...")
+                        last_missing_parents = listed
                 else:
                     print(f"Googler CR+1 detected on external CL {cl}; triggering Canary-G3")
                     cmd = ["git", "cl", "try", "-i", str(cl), "-B", BUCKET, "-b", "Canary-G3"]
                     subprocess.run(cmd, check=False, cwd=SKIA_DIR)
-                canary_g3_triggered = True
+                    canary_g3_triggered = True
 
         builds = bb_cl_builds(cl, ps)
         sw_tasks = swarming_tasks_for_cl(cl, ps)
@@ -1182,8 +1183,12 @@ def cmd_watch(args):
         if builds:
             all_terminal = all(b.get("status") in terminal_statuses for b in builds.values())
             if all_terminal:
-                if g3_needed and not meta["owner"].endswith("@google.com") and \
-                   not meta["googler_cr_plus_one"] and "Canary-G3" not in builds:
+                if (
+                    g3_needed
+                    and not meta["owner"].endswith("@google.com")
+                    and not canary_g3_triggered
+                    and "Canary-G3" not in builds
+                ):
                     pass
                 else:
                     print("\nWAKEUP_REASON: ALL_TRYJOBS_COMPLETE")
