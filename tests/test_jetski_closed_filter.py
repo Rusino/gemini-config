@@ -174,8 +174,13 @@ class FakeElement {
       preventDefault() { defaultPrevented = true; },
       stopPropagation() { propagationStopped = true; },
     };
-    for (const fn of (this.listeners.get(type) || [])) {
-      fn(evt);
+    let cur = this;
+    while (cur && !propagationStopped) {
+      for (const fn of (cur.listeners.get(type) || [])) {
+        fn(evt);
+        if (propagationStopped) break;
+      }
+      cur = cur.parentElement;
     }
     if (
       !propagationStopped &&
@@ -282,6 +287,20 @@ function matches(el, selector) {
   const attrHasMatch = /^\[([-a-zA-Z0-9_]+)\]$/.exec(selector);
   if (attrHasMatch) {
     return el.hasAttribute(attrHasMatch[1]);
+  }
+  const classAttrValMatch =
+    /^\.([-a-zA-Z0-9_]+)\[([-a-zA-Z0-9_]+)="([^"]+)"\]$/.exec(selector);
+  if (classAttrValMatch) {
+    const elClasses = el.className ? el.className.split(/\s+/) : [];
+    return (
+      elClasses.includes(classAttrValMatch[1]) &&
+      el.getAttribute(classAttrValMatch[2]) === classAttrValMatch[3]
+    );
+  }
+  const classAttrHasMatch = /^\.([-a-zA-Z0-9_]+)\[([-a-zA-Z0-9_]+)\]$/.exec(selector);
+  if (classAttrHasMatch) {
+    const elClasses = el.className ? el.className.split(/\s+/) : [];
+    return elClasses.includes(classAttrHasMatch[1]) && el.hasAttribute(classAttrHasMatch[2]);
   }
   if (selector.startsWith('.')) {
     // Support compound class selectors in fake DOM queries
@@ -677,6 +696,8 @@ global.window = {
                   text: 'Fix <tag> & badge',
                   depth: 0,
                   owner: 'a26d9ce2',
+                  ownerId: 'open-root',
+                  linkId: '',
                 },
                 { id: 'R7', status: 'todo', text: 'Next task item', depth: 0, owner: '' },
                 { id: 'R7.1', status: 'todo', text: 'Subtask item', depth: 1, owner: '' },
@@ -1249,6 +1270,47 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(rowTitleSpan.textContent, '[18:51] ⦿ cl/1405639 Issue #195102 fontconfig');
   assert.strictEqual(rowTitleSpan.hasAttribute('data-jetski-orig-title'), false);
   assert.strictEqual(sidebarRow.querySelector('.jetski-row-bg-wait-indicator'), null);
+  assert.strictEqual(
+    sidebarRow.hasAttribute('data-jetski-doing-roadmap'),
+    false,
+    'Non-doing row must not carry doing roadmap attribute'
+  );
+  assert.strictEqual(
+    sidebarRow.querySelector('.jetski-row-doing-badge'),
+    null,
+    'Non-doing row must not render doing badge'
+  );
+
+  // Test doing roadmap row styling and badge
+  const doingRow = new FakeElement('div');
+  doingRow.setAttribute('data-testid', 'conversation-row-sidebar');
+  doingRow.setAttribute('data-cascade-id', 'open-root');
+  const doingRowTitle = new FakeElement('span');
+  doingRowTitle.className = 'truncate';
+  doingRowTitle.textContent = '[09:00] ⦿ Open chain topic';
+  doingRow.appendChild(doingRowTitle);
+  bodyEl.appendChild(doingRow);
+
+  reduxStore.dispatch({
+    type: 'trajectorySummaries/applyStreamBatch',
+    payload: { updates: [], deletes: [] },
+  });
+  while (rafCallbacks.length > 0) rafCallbacks.shift()();
+
+  assert.strictEqual(
+    doingRow.getAttribute('data-jetski-doing-roadmap'),
+    'R6',
+    'Doing row must record matched doing roadmap item IDs'
+  );
+  const rowDoingBadge = doingRow.querySelector('.jetski-row-doing-badge');
+  assert(rowDoingBadge, 'Doing row must render compact ▸R<N> badge');
+  assert.strictEqual(rowDoingBadge.textContent, '▸R6');
+  assert.strictEqual(
+    rowDoingBadge.getAttribute('title'),
+    'R6: Fix <tag> & badge'
+  );
+
+  doingRow.remove();
 
   // Verify project header roadmap badge for proj-1 (▸1 ☐2) and hidden badge for 0 open
   const proj1Badge = proj1HeaderBtn.querySelector('.jetski-project-roadmap-badge');
@@ -1285,6 +1347,14 @@ const liveBucketBtn = (k) =>
   );
   assert(roadmapBubble.innerHTML.includes('Fix &lt;tag&gt; &amp; badge [a26d9ce2]'));
   assert(roadmapBubble.innerHTML.includes('R7.1'));
+    assert(
+    roadmapBubble.innerHTML.includes('data-cascade-id="open-current"'),
+    'Doing roadmap item must carry resolved cascade-id'
+  );
+  assert(
+    roadmapBubble.innerHTML.includes('💬 Open chain topic'),
+    'Doing roadmap item must render clean chat title link'
+  );
   proj1Badge.dispatchEvent('mouseleave');
   assert.strictEqual(roadmapBubble.getAttribute('data-visible'), 'false');
 
@@ -3437,6 +3507,20 @@ function matches(el, selector) {
   }
   const attrEqMatch = /^\[([-a-zA-Z0-9_]+)="([^"]+)"\]$/.exec(selector);
   if (attrEqMatch) return el.getAttribute(attrEqMatch[1]) === attrEqMatch[2];
+  const classAttrValMatch =
+    /^\.([-a-zA-Z0-9_]+)\[([-a-zA-Z0-9_]+)="([^"]+)"\]$/.exec(selector);
+  if (classAttrValMatch) {
+    const elClasses = el.className ? el.className.split(/\s+/) : [];
+    return (
+      elClasses.includes(classAttrValMatch[1]) &&
+      el.getAttribute(classAttrValMatch[2]) === classAttrValMatch[3]
+    );
+  }
+  const classAttrHasMatch = /^\.([-a-zA-Z0-9_]+)\[([-a-zA-Z0-9_]+)\]$/.exec(selector);
+  if (classAttrHasMatch) {
+    const elClasses = el.className ? el.className.split(/\s+/) : [];
+    return elClasses.includes(classAttrHasMatch[1]) && el.hasAttribute(classAttrHasMatch[2]);
+  }
   if (selector.startsWith('.')) {
     const classes = selector.split('.').filter(Boolean);
     const elClasses = el.className ? el.className.split(/\s+/) : [];
@@ -4120,6 +4204,20 @@ function matches(el, selector) {
   }
   const attrEqMatch = /^\[([-a-zA-Z0-9_]+)="([^"]+)"\]$/.exec(selector);
   if (attrEqMatch) return el.getAttribute(attrEqMatch[1]) === attrEqMatch[2];
+  const classAttrValMatch =
+    /^\.([-a-zA-Z0-9_]+)\[([-a-zA-Z0-9_]+)="([^"]+)"\]$/.exec(selector);
+  if (classAttrValMatch) {
+    const elClasses = el.className ? el.className.split(/\s+/) : [];
+    return (
+      elClasses.includes(classAttrValMatch[1]) &&
+      el.getAttribute(classAttrValMatch[2]) === classAttrValMatch[3]
+    );
+  }
+  const classAttrHasMatch = /^\.([-a-zA-Z0-9_]+)\[([-a-zA-Z0-9_]+)\]$/.exec(selector);
+  if (classAttrHasMatch) {
+    const elClasses = el.className ? el.className.split(/\s+/) : [];
+    return elClasses.includes(classAttrHasMatch[1]) && el.hasAttribute(classAttrHasMatch[2]);
+  }
   if (selector.startsWith('.')) {
     const classes = selector.split('.').filter(Boolean);
     const elClasses = el.className ? el.className.split(/\s+/) : [];
@@ -5011,6 +5109,20 @@ function matches(el, selector) {
   }
   const attrEqMatch = /^\[([-a-zA-Z0-9_]+)="([^"]+)"\]$/.exec(selector);
   if (attrEqMatch) return el.getAttribute(attrEqMatch[1]) === attrEqMatch[2];
+  const classAttrValMatch =
+    /^\.([-a-zA-Z0-9_]+)\[([-a-zA-Z0-9_]+)="([^"]+)"\]$/.exec(selector);
+  if (classAttrValMatch) {
+    const elClasses = el.className ? el.className.split(/\s+/) : [];
+    return (
+      elClasses.includes(classAttrValMatch[1]) &&
+      el.getAttribute(classAttrValMatch[2]) === classAttrValMatch[3]
+    );
+  }
+  const classAttrHasMatch = /^\.([-a-zA-Z0-9_]+)\[([-a-zA-Z0-9_]+)\]$/.exec(selector);
+  if (classAttrHasMatch) {
+    const elClasses = el.className ? el.className.split(/\s+/) : [];
+    return elClasses.includes(classAttrHasMatch[1]) && el.hasAttribute(classAttrHasMatch[2]);
+  }
   if (selector.startsWith('.')) {
     const classes = selector.split('.').filter(Boolean);
     const elClasses = el.className ? el.className.split(/\s+/) : [];

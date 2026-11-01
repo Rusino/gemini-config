@@ -62,6 +62,8 @@
   const CONTEXT_CACHE_MAX_ENTRIES = 64;
   // Right-side ⏳ badge rendered on open ⦿ rows waiting on background tasks or subagents
   const ROW_BG_WAIT_INDICATOR_CLASS = 'jetski-row-bg-wait-indicator';
+  // Compact ▸R<N> badge rendered on sidebar chat rows that own an active doing roadmap item
+  const ROW_DOING_BADGE_CLASS = 'jetski-row-doing-badge';
   // Compact open-task badge rendered inside sidebar project headers
   const PROJECT_ROADMAP_BADGE_CLASS = 'jetski-project-roadmap-badge';
   const STYLE_ID = 'jetski-closed-chats-filter-style';
@@ -4683,6 +4685,30 @@
         background: rgba(138, 180, 248, 0.14);
         color: #8ab4f8;
       }
+      /* Inset blue border and badge for sidebar chat rows owning an active doing roadmap task */
+      [data-testid="conversation-row-sidebar"][data-jetski-doing-roadmap],
+      div[data-sidebar-row-id][data-jetski-doing-roadmap] {
+        box-shadow: inset 2.5px 0 0 #8ab4f8;
+        background: rgba(138, 180, 248, 0.05);
+      }
+      .${ROW_DOING_BADGE_CLASS} {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0 4px;
+        margin-right: 4px;
+        border-radius: 3px;
+        border: 1px solid rgba(138, 180, 248, 0.42);
+        background: rgba(138, 180, 248, 0.14);
+        color: #8ab4f8;
+        font-size: 10px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+        line-height: 1.25;
+        flex-shrink: 0;
+        white-space: nowrap;
+        user-select: none;
+      }
       #jetski-closed-chats-filter-bubble .jcfb-roadmap-list {
         display: flex;
         flex-direction: column;
@@ -4754,6 +4780,33 @@
         border-radius: 8px;
         font-size: 11.5px;
         line-height: 1.45;
+      }
+      #jetski-closed-chats-filter-bubble[data-mode="roadmap"][data-visible="true"] {
+        pointer-events: auto;
+      }
+      #jetski-closed-chats-filter-bubble[data-mode="roadmap"]::before {
+        content: "";
+        position: absolute;
+        top: -10px;
+        left: -12px;
+        right: -12px;
+        height: 12px;
+      }
+      #jetski-closed-chats-filter-bubble .jcfb-roadmap-item[data-cascade-id] {
+        cursor: pointer;
+        transition: background-color 100ms ease;
+      }
+      #jetski-closed-chats-filter-bubble .jcfb-roadmap-item[data-cascade-id]:hover {
+        background: rgba(138, 180, 248, 0.22);
+      }
+      #jetski-closed-chats-filter-bubble .jcfb-roadmap-chat-link {
+        margin-top: 2px;
+        font-size: 10.5px;
+        font-weight: 500;
+        color: #8ab4f8;
+        display: flex;
+        align-items: center;
+        gap: 4px;
       }
       /* Context breakdown card width inside the shared floating glass tooltip */
       #jetski-closed-chats-filter-bubble[data-mode="context"] {
@@ -5803,6 +5856,34 @@
       bubble.id = 'jetski-closed-chats-filter-bubble';
       bubble.className = 'compact-tooltip surface-glass';
       bubble.setAttribute('data-visible', 'false');
+      // Dismiss the interactive roadmap bubble when mouse leaves unless entering the badge
+      bubble.addEventListener('mouseleave', (e) => {
+        if (bubble.getAttribute('data-mode') === 'roadmap') {
+          const rel = e?.relatedTarget;
+          if (
+            rel &&
+            (rel.classList?.contains?.(PROJECT_ROADMAP_BADGE_CLASS) ||
+              rel.closest?.(`.${PROJECT_ROADMAP_BADGE_CLASS}`))
+          ) {
+            return;
+          }
+          hideBubble();
+        }
+      });
+      // Clicking a doing roadmap item routes to that conversation
+      bubble.addEventListener('click', (e) => {
+        const itemEl = e.target?.closest?.('.jcfb-roadmap-item[data-cascade-id]');
+        if (itemEl) {
+          const cid = itemEl.getAttribute('data-cascade-id');
+          if (cid) {
+            e.preventDefault();
+            e.stopPropagation();
+            hideBubble();
+            manualVisitedCids.add(cid);
+            openConversation(cid);
+          }
+        }
+      });
       document.body.appendChild(bubble);
     }
     return bubble;
@@ -5960,7 +6041,69 @@
     };
   }
 
+  // Resolves the conversation ID and cleaned title for a doing roadmap item
+  function resolveRoadmapItemChat(it, summariesMap) {
+    const candIds = [it?.ownerId, it?.linkId, it?.owner]
+      .filter((c) => typeof c === 'string' && c.trim().length > 0);
+    if (candIds.length === 0) {
+      return { cascadeId: '', chatTitle: '' };
+    }
+    let matchedCid = '';
+    const summaries = summariesMap || {};
+    // Prefer exact matches across registered summaries
+    for (const cand of candIds) {
+      if (summaries[cand]) {
+        matchedCid = cand;
+        break;
+      }
+    }
+    // Fall back to prefix matching when conversation ID is truncated
+    if (!matchedCid) {
+      for (const cand of candIds) {
+        for (const sid of Object.keys(summaries)) {
+          if (sid.startsWith(cand) || cand.startsWith(sid)) {
+            matchedCid = sid;
+            break;
+          }
+        }
+        if (matchedCid) break;
+      }
+    }
+    const resolvedCid = matchedCid || candIds[0] || '';
+    // Resolve to the live chain tail piece if chain pieces are recorded
+    let targetCid = resolvedCid;
+    if (chainIndexCache?.parentOf && targetCid) {
+      const parentOf = chainIndexCache.parentOf;
+      const createdAt = chainIndexCache.createdAt || {};
+      const childrenOf = {};
+      for (const [child, parent] of Object.entries(parentOf)) {
+        (childrenOf[parent] = childrenOf[parent] || []).push(child);
+      }
+      const seen = new Set([targetCid]);
+      let cur = targetCid;
+      while (childrenOf[cur]) {
+        const next = childrenOf[cur]
+          .filter((c) => !seen.has(c))
+          .sort((x, y) => String(createdAt[x] || '').localeCompare(String(createdAt[y] || '')))
+          .pop();
+        if (!next) break;
+        seen.add(next);
+        cur = next;
+      }
+      targetCid = cur;
+    }
+    const targetSummary = summaries[targetCid] || summaries[resolvedCid];
+    const rawTitle = targetSummary?.annotations?.title || targetSummary?.summary || '';
+    const cleanChatTitle = cleanBaseTitle(rawTitle) || rawTitle;
+    return {
+      cascadeId: targetCid,
+      chatTitle: cleanChatTitle,
+    };
+  }
+
   function buildRoadmapBubbleHtml(info) {
+    const store = findReduxStore();
+    const summariesMap = store?.getState()?.trajectorySummaries?.summaries || {};
     const dotColor = info.doing > 0 ? '#8ab4f8' : '#9ca3af';
     const itemsHtml = info.openItems
       .map((it) => {
@@ -5970,12 +6113,27 @@
         const padLeft = 4 + depth * 12;
         const ownerSuffix =
           status === 'doing' && it?.owner ? ` [${escapeHtml(it.owner)}]` : '';
+        let chatLinkHtml = '';
+        let itemAttr = `data-status="${status}" style="padding-left:${padLeft}px"`;
+        if (status === 'doing') {
+          const chatInfo = resolveRoadmapItemChat(it, summariesMap);
+          if (chatInfo.cascadeId) {
+            const safeCid = escapeHtml(chatInfo.cascadeId);
+            itemAttr += ` data-cascade-id="${safeCid}" role="button" tabindex="0"`;
+          }
+          if (chatInfo.chatTitle) {
+            const safeTitle = escapeHtml(chatInfo.chatTitle);
+            chatLinkHtml =
+              `<div class="jcfb-roadmap-chat-link" data-testid="jcfb-roadmap-chat-link">` +
+              `💬 ${safeTitle}</div>`;
+          }
+        }
         return (
-          `<div class="jcfb-roadmap-item" data-status="${status}" ` +
-          `style="padding-left:${padLeft}px">` +
+          `<div class="jcfb-roadmap-item" ${itemAttr}>` +
           `<span class="jcfb-roadmap-glyph">${glyph}</span>` +
           `<span class="jcfb-roadmap-id">${escapeHtml(it?.id || '')}</span>` +
-          `<span class="jcfb-roadmap-text">${escapeHtml(it?.text || '')}${ownerSuffix}</span>` +
+          `<span class="jcfb-roadmap-text">` +
+          `${escapeHtml(it?.text || '')}${ownerSuffix}${chatLinkHtml}</span>` +
           `</div>`
         );
       })
@@ -6069,7 +6227,15 @@
           const pid = badge.getAttribute('data-project-id') || projectId;
           showRoadmapBubbleForBadge(badge, pid);
         });
-        badge.addEventListener('mouseleave', () => {
+        badge.addEventListener('mouseleave', (e) => {
+          const rel = e?.relatedTarget;
+          if (
+            rel &&
+            (rel.id === 'jetski-closed-chats-filter-bubble' ||
+              rel.closest?.('#jetski-closed-chats-filter-bubble'))
+          ) {
+            return;
+          }
           hideBubble();
         });
         badge.addEventListener('focus', () => {
@@ -6079,6 +6245,12 @@
         badge.addEventListener('blur', () => {
           hideBubble();
         });
+        const stopBadgeEvt = (e) => {
+          e?.stopPropagation();
+        };
+        badge.addEventListener('click', stopBadgeEvt);
+        badge.addEventListener('pointerdown', stopBadgeEvt);
+        badge.addEventListener('mousedown', stopBadgeEvt);
         host.appendChild(badge);
       }
       if (badge.getAttribute('data-project-id') !== projectId) {
@@ -11125,6 +11297,94 @@
     }
   }
 
+  // Collects doing roadmap items owned by or linked to cascadeId or its chain ancestors
+  function resolveDoingRoadmapItemsForCascade(cascadeId, summary, summariesMap) {
+    if (!cascadeId) return [];
+    const candCids = new Set([cascadeId, cascadeId.slice(0, 8)]);
+    if (chainIndexCache?.parentOf) {
+      let cur = cascadeId;
+      const seen = new Set([cur]);
+      while (chainIndexCache.parentOf[cur] && !seen.has(chainIndexCache.parentOf[cur])) {
+        cur = chainIndexCache.parentOf[cur];
+        seen.add(cur);
+        candCids.add(cur);
+        candCids.add(cur.slice(0, 8));
+      }
+    }
+    const matched = [];
+    const matchedIds = new Set();
+    const projectId = summary?.trajectoryMetadata?.projectId;
+    const projectSummaries = projectId
+      ? [roadmapIndexCache?.projects?.[projectId]].filter(Boolean)
+      : Object.values(roadmapIndexCache?.projects || {});
+    for (const p of projectSummaries) {
+      const openItems = Array.isArray(p?.openItems) ? p.openItems : [];
+      for (const it of openItems) {
+        if (it?.status !== 'doing' || !it?.id) continue;
+        const ownerCand = [it.ownerId, it.linkId, it.owner].filter(Boolean);
+        const isMatch = ownerCand.some((c) => candCids.has(c));
+        if (isMatch && !matchedIds.has(it.id)) {
+          matchedIds.add(it.id);
+          matched.push({ id: it.id, text: it.text || '' });
+        }
+      }
+    }
+    const dossierMap = dossierIndexCache?.items || dossierIndexCache?.conversations || {};
+    for (const cid of candCids) {
+      const entry = dossierMap[cid];
+      const rItem = entry?.roadmapItem;
+      if (rItem && rItem.status === 'doing' && rItem.id && !matchedIds.has(rItem.id)) {
+        matchedIds.add(rItem.id);
+        matched.push({ id: rItem.id, text: rItem.text || '' });
+      }
+    }
+    return matched;
+  }
+
+  // Highlights sidebar chat rows owning an active doing roadmap item with inset border and badge
+  function syncRowDoingRoadmapUI(rowEl, cascadeId, summary, summariesMap) {
+    if (!rowEl || !cascadeId) return;
+    const doingItems = resolveDoingRoadmapItemsForCascade(cascadeId, summary, summariesMap);
+    if (doingItems.length > 0) {
+      const idsAttr = doingItems.map((d) => d.id).join(',');
+      setAttrIfChanged(rowEl, 'data-jetski-doing-roadmap', idsAttr);
+      const primary = doingItems[0];
+      const badgeText = `▸${primary.id}`;
+      const badgeTitle = doingItems
+        .map((d) => (d.text ? `${d.id}: ${d.text}` : d.id))
+        .join(' · ');
+      let badge = rowEl.querySelector(`.${ROW_DOING_BADGE_CLASS}`);
+      if (!badge) {
+        badge = document.createElement('span');
+        badge.className = ROW_DOING_BADGE_CLASS;
+        badge.setAttribute('data-testid', 'jetski-row-doing-badge');
+        badge.textContent = badgeText;
+        badge.setAttribute('title', badgeTitle);
+        badge.setAttribute('aria-label', `Doing: ${badgeTitle}`);
+        const spanEl = rowEl.querySelector('span.truncate');
+        if (spanEl && spanEl.parentElement) {
+          spanEl.parentElement.insertBefore(badge, spanEl);
+        } else {
+          rowEl.insertBefore(badge, rowEl.firstChild);
+        }
+      } else {
+        if (badge.textContent !== badgeText) {
+          badge.textContent = badgeText;
+        }
+        setAttrIfChanged(badge, 'title', badgeTitle);
+        setAttrIfChanged(badge, 'aria-label', `Doing: ${badgeTitle}`);
+      }
+    } else {
+      if (rowEl.hasAttribute('data-jetski-doing-roadmap')) {
+        rowEl.removeAttribute('data-jetski-doing-roadmap');
+      }
+      const badge = rowEl.querySelector(`.${ROW_DOING_BADGE_CLASS}`);
+      if (badge) {
+        badge.remove();
+      }
+    }
+  }
+
   // Injects or updates row action indicators; archiving stays with the native row button
   function ensureSidebarRowButtons() {
     // Read Redux summaries so each row can sync its live background-wait state
@@ -11157,6 +11417,7 @@
         summariesMap,
         childIndex
       );
+      syncRowDoingRoadmapUI(rowEl, cascadeId, summariesMap[cascadeId], summariesMap);
 
       // Inject reminder button into hover action bar if present
       const anchorBtn =
@@ -11247,6 +11508,7 @@
         // Ignore async token-count updates on the context pill to avoid feedback sync loops
         target.className === TITLEBAR_CONTEXT_BADGE_CLASS ||
         target.className === ROW_BG_WAIT_INDICATOR_CLASS ||
+        target.className === ROW_DOING_BADGE_CLASS ||
         target.className === PROJECT_ROADMAP_BADGE_CLASS ||
         target.className === SEARCH_BTN_CLASS ||
         target.className === LOCATE_BTN_CLASS ||
@@ -11265,6 +11527,7 @@
             target.closest(`.${TITLEBAR_REMINDER_BTN_CLASS}`) ||
             target.closest(`.${INBOX_REMINDER_BTN_CLASS}`) ||
             target.closest(`.${ROW_REMINDER_BTN_CLASS}`) ||
+            target.closest(`.${ROW_DOING_BADGE_CLASS}`) ||
             target.closest(`#${STAR_TOOLTIP_ID}`) ||
             target.closest(`.${BAR_CLASS}`) ||
             target.closest(`#${FLIGHT_DECK_DRAWER_ID}`) ||
@@ -11403,6 +11666,7 @@
       // Remove titlebar context pills so the fresh instance mounts its own closures
       `.${TITLEBAR_CONTEXT_BADGE_CLASS}`,
       `.${ROW_BG_WAIT_INDICATOR_CLASS}`,
+      `.${ROW_DOING_BADGE_CLASS}`,
       `.${PROJECT_ROADMAP_BADGE_CLASS}`,
       `.${SEARCH_BTN_CLASS}`,
       `.${LOCATE_BTN_CLASS}`,
@@ -11447,6 +11711,9 @@
     }
     for (const el of document.querySelectorAll('[data-jetski-sidebar-footer]')) {
       el.removeAttribute('data-jetski-sidebar-footer');
+    }
+    for (const el of document.querySelectorAll('[data-jetski-doing-roadmap]')) {
+      el.removeAttribute('data-jetski-doing-roadmap');
     }
     if (locateHighlightTimer) {
       clearTimeout(locateHighlightTimer);

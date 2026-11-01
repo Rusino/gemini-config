@@ -513,8 +513,22 @@ class TestRoadmap(unittest.TestCase):
     self.assertEqual(summary["open"], 2)
     self.assertEqual(summary["total"], 3)
     self.assertEqual(
-        [(it["id"], it["status"], it["depth"], it["owner"]) for it in summary["openItems"]],
-        [("R1", "doing", 0, "c1"), ("R1.2", "doing", 1, "c2"), ("R2", "todo", 0, "")],
+        [
+            (
+                it["id"],
+                it["status"],
+                it["depth"],
+                it["owner"],
+                it["ownerId"],
+                it["linkId"],
+            )
+            for it in summary["openItems"]
+        ],
+        [
+            ("R1", "doing", 0, "c1", "c1", ""),
+            ("R1.2", "doing", 1, "c2", "c2", ""),
+            ("R2", "todo", 0, "", "", ""),
+        ],
     )
 
     # If R1.2 finishes while parent R1 is still doing, R1 remains counted as 1 open item
@@ -523,6 +537,13 @@ class TestRoadmap(unittest.TestCase):
     self.assertEqual(summary_after["doing"], 1)
     self.assertEqual(summary_after["todo"], 1)
     self.assertEqual(summary_after["open"], 2)
+
+    # An active doing parent with an open todo child is still counted in doing
+    roadmap.add_item("p1", "c1", "Child todo", parent="R1")
+    summary_with_todo_child = roadmap.summarize_doc(roadmap.load("p1"))
+    self.assertEqual(summary_with_todo_child["doing"], 1)
+    self.assertEqual(summary_with_todo_child["todo"], 2)
+    self.assertEqual(summary_with_todo_child["open"], 3)
 
     r_cli = self._run_cli("export-index")
     self.assertEqual(r_cli.returncode, 0)

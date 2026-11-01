@@ -608,10 +608,12 @@ def summarize_doc(doc: dict) -> dict:
 
   for it in items:
     desc = descendants(it["id"])
-    # Count leaf tasks directly; only count a parent container if it remains open after
-    # all of its descendants were closed, avoiding parent + child double-counting
+    # Count leaf tasks directly; count a doing parent container when none of its descendants
+    # are doing, or any open parent container whose descendants are all closed
     if not desc:
       counts[it["status"]] += 1
+    elif it["status"] == "doing" and not any(d["status"] == "doing" for d in desc):
+      counts["doing"] += 1
     elif it["status"] not in CLOSED_STATUSES and all(
         d["status"] in CLOSED_STATUSES for d in desc
     ):
@@ -625,12 +627,16 @@ def summarize_doc(doc: dict) -> dict:
       has_open_desc = any(d["status"] not in CLOSED_STATUSES for d in desc)
       if it["status"] not in CLOSED_STATUSES or has_open_desc:
         if it["status"] not in CLOSED_STATUSES:
+          raw_owner = it.get("owner") or ""
+          raw_link = it.get("link") or ""
           open_items.append({
               "id": it["id"],
               "status": it["status"],
               "text": it["text"],
               "depth": depth,
-              "owner": (it.get("owner") or "")[:8],
+              "owner": raw_owner[:8],
+              "ownerId": raw_owner,
+              "linkId": raw_link,
           })
         collect_open(it["id"], depth + (1 if it["status"] not in CLOSED_STATUSES else 0))
 
