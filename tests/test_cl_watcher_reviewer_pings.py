@@ -348,13 +348,36 @@ const testItems = [
         diff_url: 'https://skia-review.googlesource.com/c/skia/+/1409637'
       }
     ]
+  },
+  {
+    item_key: 'github:195384',
+    target_id: '195384',
+    kind: 'github',
+    project_name: 'Flutter',
+    subject: 'Map code units without a cluster to a cluster',
+    url: 'https://github.com/flutter/flutter/pull/195384',
+    reviewer_pings: [
+      {
+        reviewer: 'mdebbar',
+        reviewer_name: 'Mouad Debbar',
+        reason: 'updated_after_review',
+        prev_ps: null,
+        current_ps: 1,
+        had_approval: false,
+        in_attention_set: false,
+        auto_rerequested: false,
+        diff_url: 'https://github.com/flutter/flutter/pull/195384/files'
+      }
+    ]
   }
 ];
 
 const groups = collectReviewerPingGroups(testItems);
-assert.strictEqual(groups.length, 1);
+assert.strictEqual(groups.length, 2);
 assert.strictEqual(groups[0].reviewer, 'alexisdavidc@google.com');
 assert.strictEqual(groups[0].items.length, 3);
+assert.strictEqual(groups[1].reviewer, 'mdebbar');
+assert.strictEqual(groups[1].items.length, 1);
 
 const msg = buildReviewerPingMessage('alexisdavidc@google.com', testItems);
 assert(msg.includes('Lost +1 after rebase'), 'Lost +1 header present: ' + msg);
@@ -380,6 +403,18 @@ assert(rendered.includes('Diff PS1..3 ↗'), 'Diff link present on PS delta');
 assert(rendered.includes('Open CL ↗'), 'Open CL link present');
 assert(rendered.includes('https://chat.google.com/'), 'Open Google Chat link present');
 assert(rendered.includes('class="ping-why"'), 'Context why line present');
+assert(rendered.includes('🔕 no re-request'), 'Must show no re-request badge on GitHub');
+
+const inlineRerequested = reviewerPingInlineHtml({
+  kind: 'github',
+  reviewer_pings: [{
+    reviewer: 'mdebbar',
+    reason: 'updated_after_review',
+    in_attention_set: true,
+    auto_rerequested: true
+  }]
+});
+assert(inlineRerequested.includes('🔄 re-requested'), 'Must show re-requested badge on GitHub');
 
 console.log('JS tests passed successfully');
 process.exit(0);
@@ -387,6 +422,123 @@ process.exit(0);
     cmd = ["node", "-e", js_code, w.DASHBOARD_HTML]
     res = subprocess.run(cmd, capture_output=True, text=True, check=False)
     self.assertEqual(res.returncode, 0, f"Node output: {res.stdout}\nError: {res.stderr}")
+
+  def test_github_dismissed_approval_and_missing_rerequest_detected(self):
+    gh_payload = {
+        "number": 195384,
+        "title": "Map code units without a cluster to a cluster",
+        "body": "Fixes #195000",
+        "state": "OPEN",
+        "isDraft": False,
+        "author": {"login": "ColdPaleLight"},
+        "mergedAt": None,
+        "headRefOid": "abc1234567890",
+        "headRefName": "map-cluster",
+        "reviewDecision": "REVIEW_REQUIRED",
+        "latestReviews": [
+            {
+                "author": {"login": "Rusino"},
+                "state": "DISMISSED",
+                "authorAssociation": "MEMBER",
+            },
+            {
+                "author": {"login": "mdebbar"},
+                "state": "COMMENTED",
+                "authorAssociation": "MEMBER",
+            },
+        ],
+        "reviews": [
+            {
+                "author": {"login": "Rusino"},
+                "state": "APPROVED",
+                "submittedAt": "2026-10-30T10:00:00Z",
+            },
+            {
+                "author": {"login": "mdebbar"},
+                "state": "COMMENTED",
+                "submittedAt": "2026-10-30T11:00:00Z",
+            },
+            {
+                "author": {"login": "Rusino"},
+                "state": "DISMISSED",
+                "submittedAt": "2026-10-30T12:00:00Z",
+            },
+        ],
+        "comments": [],
+        "commits": [
+            {
+                "committedDate": "2026-10-30T13:00:00Z",
+                "messageHeadline": "Address feedback from Mouad",
+            }
+        ],
+        "statusCheckRollup": [],
+        "labels": [],
+        "url": "https://github.com/flutter/flutter/pull/195384",
+        "mergeable": "MERGEABLE",
+        "reviewRequests": [],
+        "createdAt": "2026-10-29T10:00:00Z",
+        "updatedAt": "2026-10-30T13:05:00Z",
+        "closedAt": None,
+    }
+    with mock.patch.object(
+        subprocess, "check_output", return_value=json.dumps(gh_payload)
+    ):
+      res = w.fetch_github_pr_status("195384")
+
+    self.assertTrue(res["ok"])
+    self.assertFalse(res["in_my_attention"])
+    self.assertEqual(res["phase"], "WAITING_ON_OTHERS")
+    pings = res.get("reviewer_pings") or []
+    mdebbar_pings = [p for p in pings if p["reviewer"] == "mdebbar"]
+    self.assertEqual(len(mdebbar_pings), 1)
+    ping = mdebbar_pings[0]
+    self.assertEqual(ping["reason"], "updated_after_review")
+    self.assertFalse(ping["in_attention_set"])
+    self.assertFalse(ping["had_approval"])
+
+  def test_auto_rerequest_github_reviewers_calls_gh_api_once_per_head_sha(self):
+    pings = [
+        {
+            "reviewer": "mdebbar",
+            "in_attention_set": False,
+            "reason": "updated_after_review",
+        }
+    ]
+    ledger = {}
+    with mock.patch.object(
+        w, "rerequest_github_reviewers", return_value=True
+    ) as mock_req:
+      req_users = w.auto_rerequest_github_reviewers(
+          "195384", "abc1234", pings, ledger, do_request=True
+      )
+      self.assertEqual(req_users, ["mdebbar"])
+      mock_req.assert_called_once_with("195384", ["mdebbar"])
+      self.assertTrue(pings[0]["auto_rerequested"])
+      self.assertTrue(pings[0]["in_attention_set"])
+      self.assertIn("195384:abc1234:mdebbar", ledger)
+
+    # Second call with the same SHA does not re-request via GitHub API
+    with mock.patch.object(
+        w, "rerequest_github_reviewers", return_value=True
+    ) as mock_req:
+      req_users = w.auto_rerequest_github_reviewers(
+          "195384", "abc1234", pings, ledger, do_request=True
+      )
+      self.assertEqual(req_users, [])
+      mock_req.assert_not_called()
+
+  def test_rerequest_github_reviewers_runs_gh_api(self):
+    with mock.patch.object(
+        subprocess,
+        "run",
+        return_value=mock.Mock(returncode=0, stdout="{}", stderr=""),
+    ) as mock_run:
+      ok = w.rerequest_github_reviewers("195384", ["mdebbar"])
+      self.assertTrue(ok)
+      self.assertEqual(mock_run.call_count, 1)
+      args = mock_run.call_args[0][0]
+      self.assertIn("repos/flutter/flutter/pulls/195384/requested_reviewers", args[2])
+
 
 
 if __name__ == "__main__":

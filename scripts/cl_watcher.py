@@ -2632,13 +2632,18 @@ def compute_github_reviewer_pings(
     changes_requested_by: set[str],
     reviews: list[dict[str, Any]],
     commits: list[dict[str, Any]],
+    req_logins: list[str] | None = None,
 ) -> list[dict[str, Any]]:
   """Detects reviewers who need to review or re-review on GitHub"""
   if state != "OPEN" or is_wip or is_draft or missing_approvals <= 0:
     return []
-  # Only surface reviewer pings on our own PRs or PRs where we already approved
-  self_approved = bool(approved_by & SELF_GITHUB_LOGINS)
-  if not (is_self or (is_reviewer and self_approved)):
+  # Allow reviewer pings on PRs we approved or where our prior approval was dismissed on push
+  self_had_approval = bool(approved_by & SELF_GITHUB_LOGINS) or any(
+      str((r.get("author") or {}).get("login") or "") in SELF_GITHUB_LOGINS
+      and str(r.get("state") or "").upper() in ("APPROVED", "DISMISSED")
+      for r in reviews
+  )
+  if not (is_self or (is_reviewer and self_had_approval)):
     return []
 
   pings: list[dict[str, Any]] = []
@@ -2649,24 +2654,33 @@ def compute_github_reviewer_pings(
     if d and d > latest_commit_date:
       latest_commit_date = d
 
+  req_set = {u for u in (req_logins or []) if u}
   rev_by_author: dict[str, dict[str, Any]] = {}
+  ever_approved_or_dismissed: set[str] = set()
   for r in reviews:
     login = str((r.get("author") or {}).get("login") or "")
     if login and login not in SELF_GITHUB_LOGINS:
       rev_by_author[login] = r
+      # Flutter branch protection resets approved reviews to DISMISSED on push
+      if str(r.get("state") or "").upper() in ("APPROVED", "DISMISSED"):
+        ever_approved_or_dismissed.add(login)
 
   for login in sorted(set(human_reviewers) - approved_by):
     rev = rev_by_author.get(login)
-    had_approval = False
+    had_approval = login in ever_approved_or_dismissed
+    in_attention_set = login in req_set
     reason = ""
     if rev:
       sub_date = str(rev.get("submittedAt") or "")
       st = str(rev.get("state") or "").upper()
-      had_approval = (st == "APPROVED")
-      if latest_commit_date and sub_date and sub_date < latest_commit_date:
+      # DISMISSED state represents a prior approval invalidated by new commits
+      if st == "DISMISSED":
+        reason = "updated_after_approval"
+      elif latest_commit_date and sub_date and sub_date < latest_commit_date:
         reason = "updated_after_approval" if had_approval else "updated_after_review"
     if not reason:
-      if approved_count >= 1 and missing_approvals > 0:
+      # Prior approval dismissed on push still requires a second reviewer
+      if (approved_count >= 1 or self_had_approval) and missing_approvals > 0:
         reason = "needs_second_approval"
       elif is_self:
         reason = "awaiting_review"
@@ -2677,7 +2691,7 @@ def compute_github_reviewer_pings(
         "reviewer": login,
         "reviewer_name": login,
         "active": True,
-        "in_attention_set": True,
+        "in_attention_set": in_attention_set,
         "reason": reason,
         "prev_ps": None,
         "current_ps": 1,
@@ -2685,6 +2699,75 @@ def compute_github_reviewer_pings(
         "diff_url": f"{base_pr_url}/files",
     })
   return pings
+
+
+def rerequest_github_reviewers(pr_id: str, reviewers: list[str]) -> bool:
+  """Re-requests review on a flutter/flutter PR via the GitHub requested_reviewers API"""
+  clean = [str(u).strip() for u in reviewers if str(u).strip()]
+  if not clean:
+    return False
+  try:
+    proc = subprocess.run(
+        [
+            "gh",
+            "api",
+            f"repos/flutter/flutter/pulls/{pr_id}/requested_reviewers",
+            "--method",
+            "POST",
+            "--input",
+            "-",
+        ],
+        input=json.dumps({"reviewers": clean}),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    return proc.returncode == 0
+  except Exception:
+    return False
+
+
+def auto_rerequest_github_reviewers(
+    pr_id: str,
+    head_sha: str,
+    pings: list[dict[str, Any]],
+    rerequest_ledger: dict[str, Any],
+    *,
+    do_request: bool = True,
+) -> list[str]:
+  """Automatically re-requests GitHub reviewers whose review was updated or dismissed on push"""
+  if not pr_id or not head_sha or not pings:
+    return []
+  to_request: list[str] = []
+  # Only re-request reviewers who already reviewed/approved and were dropped from reviewRequests
+  rerequest_reasons = {"updated_after_approval", "updated_after_review", "lost_on_rebase"}
+  for p in pings:
+    rev = str(p.get("reviewer") or "").strip()
+    if not rev or p.get("in_attention_set", True):
+      continue
+    if str(p.get("reason") or "") not in rerequest_reasons:
+      continue
+    ledger_key = f"{pr_id}:{head_sha}:{rev}"
+    if ledger_key in rerequest_ledger:
+      p["auto_rerequested"] = True
+      p["in_attention_set"] = True
+      continue
+    if do_request:
+      to_request.append(rev)
+  if not to_request:
+    return []
+  if not rerequest_github_reviewers(pr_id, to_request):
+    return []
+  now_ts = time.time()
+  for rev in to_request:
+    rerequest_ledger[f"{pr_id}:{head_sha}:{rev}"] = now_ts
+  requested_set = set(to_request)
+  for p in pings:
+    if str(p.get("reviewer") or "").strip() in requested_set:
+      p["auto_rerequested"] = True
+      p["in_attention_set"] = True
+  return to_request
 
 
 def fetch_gerrit_cl_status(
@@ -3672,12 +3755,20 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         and str(self_reviews[-1].get("state") or "").upper() == "APPROVED"
         and not (set(req_logins) & SELF_GITHUB_LOGINS)
     )
+    # Treat a dismissed prior approval without a new review request as waiting on co-reviewer/author
+    self_approval_dismissed = (
+        not is_self
+        and bool(self_reviews)
+        and str(self_reviews[-1].get("state") or "").upper() == "DISMISSED"
+        and not (set(req_logins) & SELF_GITHUB_LOGINS)
+    )
     in_my_attention = (
         state == "OPEN"
         and not is_wip
         and not in_development
         and (is_self or is_reviewer)
         and not self_approved
+        and not self_approval_dismissed
         and bool(last_actor)
         and last_actor not in SELF_GITHUB_LOGINS
     )
@@ -3737,6 +3828,7 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         changes_requested_by=changes_requested_by,
         reviews=reviews,
         commits=d.get("commits") or [],
+        req_logins=req_logins,
     )
 
     return {
@@ -3757,6 +3849,7 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         "is_draft": is_draft,
         "is_wip": is_wip,
         "wip_label": wip_label,
+        "head_sha": head_sha,
         "head_ref": head_ref,
         "review_decision": review_decision,
         "required_approvals": required_approvals,
@@ -5121,6 +5214,9 @@ def sync_once(
   prev_items: dict[str, Any] = state.get("items") or {}
   events: list[dict[str, Any]] = state.get("events") or []
   review_claims: dict[str, Any] = state.setdefault("review_claims", {})
+  github_rerequest_ledger: dict[str, Any] = state.setdefault(
+      "github_rerequest_ledger", {}
+  )
   busy_review_chats = sum(
       1
       for d in prev_items.values()
@@ -5619,6 +5715,34 @@ def sync_once(
               },
           )
 
+    # Auto-rerequest GitHub reviewers dropped from reviewRequests after author push
+    if d.get("kind") == "github" and record.get("reviewer_pings"):
+      rereq_users = auto_rerequest_github_reviewers(
+          str(tid),
+          str(info.get("head_sha") or info.get("revision") or ""),
+          record["reviewer_pings"],
+          github_rerequest_ledger,
+          do_request=bool(wake_chats),
+      )
+      if rereq_users:
+        events.insert(
+            0,
+            {
+                "id": f"ev-{int(time.time() * 1000)}-{tid}-rereq",
+                "time": now_et_str(),
+                "item_key": ikey,
+                "target_id": tid,
+                "conversation_id": cid,
+                "project_name": d["project_name"],
+                "critical": False,
+                "message": (
+                    f"[CL-WATCHER] 🔄 Auto re-requested GitHub review from "
+                    f"{', '.join(rereq_users)} on {ikey} ('{info['subject']}')."
+                ),
+            },
+        )
+        events = events[:50]
+
     sweep_processed_gmail_for_record(record, gstat)
     new_items[composite_key] = record
 
@@ -5754,6 +5878,7 @@ def sync_once(
   triage_store.overlay_triage_on_items(new_items.values())
   state["items"] = new_items
   state["review_claims"] = review_claims
+  state["github_rerequest_ledger"] = github_rerequest_ledger
   state["events"] = events
   state["last_sync"] = now_et_str()
   state["gardener_url"] = gardener_pen_url()
@@ -6858,11 +6983,17 @@ function reviewerPingInlineHtml(it) {
     } else {
       tag = `<span class="badge ping-second">⏳ awaiting review</span>`;
     }
-    // Flag reviewers dropped from Gerrit attention_set so they can be pinged directly
-    const offAtt = p.in_attention_set === false
-      ? `<span class="badge ping-off-att" ` +
-        `title="Not in Gerrit attention set">🔕 off attention</span>`
-      : '';
+    // Flag reviewers dropped from Gerrit attention_set or GitHub reviewRequests
+    const isGh = it.kind === 'github';
+    const offAtt = p.auto_rerequested
+      ? `<span class="badge ping-rebase" ` +
+        `title="Flight Deck automatically re-requested review on GitHub">🔄 re-requested</span>`
+      : (p.in_attention_set === false
+        ? `<span class="badge ping-off-att" title="${isGh
+            ? 'Author updated PR without clicking Re-request review on GitHub'
+            : 'Not in Gerrit attention set'}">${isGh
+            ? '🔕 no re-request' : '🔕 off attention'}</span>`
+        : '');
     return `${tag}${offAtt} <b>${who}</b>`;
   }).join(' · ');
 }
@@ -7441,9 +7572,14 @@ function pingOwnershipAndActionText(p, it) {
     actionText = `Waiting for review on PS${esc(cur)}`;
   }
 
-  const attNote = p.in_attention_set === false
-    ? ' <span style="color:var(--red)">(Gerrit dropped them from attention set)</span>'
-    : '';
+  const isGh = it.kind === 'github';
+  const attNote = p.auto_rerequested
+    ? ' <span style="color:var(--blue)">(Flight Deck re-requested review on GitHub)</span>'
+    : (p.in_attention_set === false
+      ? ` <span style="color:var(--red)">(${isGh
+          ? 'Author did not click Re-request review on GitHub'
+          : 'Gerrit dropped them from attention set'})</span>`
+      : '');
   return `${ownerText} · ${actionText}${attNote}`;
 }
 
@@ -7473,10 +7609,16 @@ function renderPingsSection(shownItems) {
       const it = x.item;
       const p = x.ping;
       const keyJson = esc(JSON.stringify(x.item_key));
-      const offAtt = p.in_attention_set === false
-        ? `<span class="badge ping-off-att" ` +
-          `title="Reviewer is not in Gerrit attention set">🔕 off attention set</span>`
-        : '';
+      const isGh = it.kind === 'github';
+      const offAtt = p.auto_rerequested
+        ? `<span class="badge ping-rebase" ` +
+          `title="Flight Deck automatically re-requested review on GitHub">🔄 re-requested</span>`
+        : (p.in_attention_set === false
+          ? `<span class="badge ping-off-att" title="${isGh
+              ? 'Reviewer is not in GitHub reviewRequests (no circle icon)'
+              : 'Reviewer is not in Gerrit attention set'}">${isGh
+              ? '🔕 no re-request' : '🔕 off attention set'}</span>`
+          : '');
       const hasDelta = Boolean(p.prev_ps && p.current_ps && p.prev_ps < p.current_ps);
       const deltaLink = hasDelta
         ? link(p.diff_url, `Diff PS${esc(p.prev_ps)}..${esc(p.current_ps)} ↗`, 'ping-diff')
