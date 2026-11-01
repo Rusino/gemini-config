@@ -63,6 +63,23 @@ def ensure_results_dir(override_dir: Path | str | None = None) -> Path:
     return p
 
 
+# Load a single triage result by kind and target_id
+def load_triage_result(
+    kind: str,
+    target_id: str,
+    results_dir: Path | str | None = None,
+) -> dict[str, Any] | None:
+    fn = canonical_filename(kind, target_id)
+    target_path = ensure_results_dir(results_dir) / fn
+    if not target_path.is_file():
+        return None
+    try:
+        with open(target_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 # Atomically persist triage result JSON, preserving deep audit fields over shallow triage
 def save_triage_result(data: dict[str, Any], results_dir: Path | str | None = None) -> Path:
     target_dir = ensure_results_dir(results_dir)

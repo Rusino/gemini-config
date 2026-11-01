@@ -861,6 +861,23 @@ def overlay_live_chat_busy(state: dict[str, Any]) -> None:
             int(item.get("reviewed_ps") or 0),
             int(item.get("review_target_ps") or 0),
         )
+      # If review triage is already completed and saved, mark chat not busy
+      if _is_assigned_reviewer_record(item):
+        tr = triage_store.load_triage_result(
+            str(item.get("kind") or "gerrit"), str(item.get("target_id") or "")
+        )
+        cur_ps = int(item.get("patchset") or item.get("review_target_ps") or 1)
+        if (
+            tr
+            and tr.get("review_outcome")
+            and int(tr.get("triaged_patchset") or 0) >= cur_ps
+        ):
+          item["reviewed_ps"] = max(int(item.get("reviewed_ps") or 0), cur_ps)
+          if (
+              s.get("status") == "CASCADE_RUN_STATUS_IDLE"
+              and not s.get("hasRunningSubagents")
+          ):
+            item["chat_busy"] = False
 
 
 def extract_cl_ids_with_hosts(text: str) -> dict[str, str]:
@@ -4167,14 +4184,16 @@ def _discover_existing_chat_for_item(
   for parent_key in parent_keys:
     parent = by_key.get(parent_key)
     if parent:
-      comp_key = (
-          parent_key
-          if (
-              is_companion_ref
-              or (rec_is_self and not bool(parent.get("is_self", False)))
-          )
-          else ""
+      parent_is_self = bool(parent.get("is_self", False))
+      is_cand_comp = rec_is_self and (not parent_is_self or is_companion_ref)
+      can_inherit_stack_chat = (
+          is_cand_comp
+          or (rec_is_self and parent_is_self)
+          or not parent.get("single_target", True)
       )
+      if not can_inherit_stack_chat:
+        continue
+      comp_key = parent_key if is_cand_comp else ""
       return (
           str(parent["conversation_id"]),
           bool(parent.get("chat_archived")),

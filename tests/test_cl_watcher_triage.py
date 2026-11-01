@@ -141,6 +141,34 @@ LGTM pending corpus gate.
     self.assertEqual(sibling.get("conversation_id"), "")
     self.assertTrue(cand_parent.get("single_target"))
 
+  def test_discover_existing_chat_prevents_external_stack_leak(self):
+    """External siblings in a Gerrit stack must not borrow each other's 1:1 review chats."""
+    sibling_rec = {
+        "item_key": "gerrit:1412384",
+        "target_id": "1412384",
+        "is_self": False,
+        "subject": "Derive the half letter spacing",
+        "patchset": 2,
+    }
+    fake_chats = [{
+        "item_key": "gerrit:1412378",
+        "conversation_id": "review-chat-1412378",
+        "chat_archived": False,
+        "is_self": False,
+        "single_target": True,
+    }]
+    from unittest import mock
+    with mock.patch.object(w, "discover_active_cl_chats", return_value=fake_chats):
+      with mock.patch.object(
+          w, "fetch_gerrit_related_cl_ids", return_value=["1412378", "1412384"]
+      ):
+        cid, is_arch, comp_to = w._discover_existing_chat_for_item(
+            "gerrit:1412384", sibling_rec
+        )
+    self.assertEqual(cid, "")
+    self.assertFalse(is_arch)
+    self.assertEqual(comp_to, "")
+
   def test_save_and_load_audit_preserves_audit_over_queue_triage(self):
     audit_data = {
         "target_id": "1409697",
