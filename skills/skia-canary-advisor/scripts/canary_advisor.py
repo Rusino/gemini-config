@@ -20,6 +20,7 @@ import datetime
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -31,8 +32,18 @@ CANARIES = ["Canary-Flutter", "Canary-G3", "Canary-Chromium", "Canary-Android"]
 ME = "jlavrova@google.com"
 LEDGER = os.environ.get("CANARY_ADVISOR_LEDGER",
                         os.path.expanduser("~/.gemini/config/ledgers/canary_advisor.jsonl"))
-BB = os.path.expanduser("~/depot_tools/bb")
-PRPC = os.path.expanduser("~/depot_tools/prpc")
+
+# depot_tools lives in ~/depot_tools on Linux and in ~/Sources/depot_tools on the Mac
+def _depot_tool(name):
+  for root in ("~/depot_tools", "~/Sources/depot_tools"):
+    path = os.path.expanduser(os.path.join(root, name))
+    if os.path.exists(path):
+      return path
+  return shutil.which(name) or os.path.expanduser(os.path.join("~/depot_tools", name))
+
+
+BB = _depot_tool("bb")
+PRPC = _depot_tool("prpc")
 GARDENER_DIR = os.path.expanduser("~/.gemini/jetski/scratch/skia_gardener")
 GOOGLE3_DIR = "/google/src/head/depot/google3"
 # `git cl try` needs a git checkout as cwd, whatever directory the watcher was started from
@@ -610,6 +621,10 @@ def swarming_tasks_for_cl(cl, ps, name=None):
                            "swarming.v2.Tasks.ListTasks"],
                           input=json.dumps(req), capture_output=True, text=True, timeout=30)
     if proc.returncode != 0:
+        # Swarming hides task lists from anonymous callers; the LUCI refresh token expires
+        if "anonymous:anonymous" in proc.stderr + proc.stdout:
+            sys.exit("ERROR: LUCI is not logged in, Swarming tasks are hidden. "
+                     "Run `luci-auth login` and retry")
         return []
     try:
         data = json.loads(proc.stdout)
@@ -840,6 +855,13 @@ def triage_canary_g3_failure(cl, ps, bb_build, sw_tasks, touched_files):
         }
     m_cl = re.search(r"http://cl/(\d+)", stdout)
     if not m_cl:
+        # The CL does not apply to the Skia hash pinned in google3 (google3 lags upstream main)
+        if "merge conflict" in stdout:
+            return {
+                "verdict": "MERGE_CONFLICT_WITH_G3_SKIA", "our_part_passed": False,
+                "summary": "The CL does not apply to the Skia hash in google3; "
+                           "retry after the google3 Skia roll passes the CL base",
+            }
         return {
             "verdict": "INFRA_NO_ROLL_CL", "our_part_passed": False,
             "summary": "Canary-G3 did not produce a google3 roll CL",
