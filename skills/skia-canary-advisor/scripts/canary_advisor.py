@@ -35,6 +35,8 @@ BB = os.path.expanduser("~/depot_tools/bb")
 PRPC = os.path.expanduser("~/depot_tools/prpc")
 GARDENER_DIR = os.path.expanduser("~/.gemini/jetski/scratch/skia_gardener")
 GOOGLE3_DIR = "/google/src/head/depot/google3"
+# `git cl try` needs a git checkout as cwd, whatever directory the watcher was started from
+SKIA_DIR = os.path.expanduser("~/.gemini/jetski/scratch/skia")
 HEALTH_WINDOW_DAYS = 45
 
 # Canaries that must never be triggered: they run but give no verdict. Remove an entry only after
@@ -593,11 +595,14 @@ def bb_cl_builds(cl, ps):
     return builds
 
 
-def swarming_tasks_for_cl(cl, ps):
+def swarming_tasks_for_cl(cl, ps, name=None):
     if not os.path.exists(PRPC):
         return []
+    tags = [f"sk_issue:{cl}", f"sk_patchset:{ps}"]
+    if name:
+        tags.append(f"sk_name:{name}")
     req = {
-        "tags": [f"sk_issue:{cl}", f"sk_patchset:{ps}"],
+        "tags": tags,
         "state": "QUERY_ALL",
         "limit": 50,
     }
@@ -611,6 +616,41 @@ def swarming_tasks_for_cl(cl, ps):
         return data.get("items", [])
     except json.JSONDecodeError:
         return []
+
+
+def g3_change_approved(change, patchset):
+    # Same rule as IsTryChangeSafe in google3 chrome/skia/autoroller/try_service.py
+    detail = gerrit_json(f"/changes/{change}/detail?o=ALL_REVISIONS&o=ALL_COMMITS")
+    if detail["owner"].get("email", "").endswith("@google.com"):
+        ref = "refs/changes/%02d/%d/%d" % (change % 100, change, patchset)
+        rev = next((r for r in detail["revisions"].values() if r.get("ref") == ref), {})
+        if rev.get("commit", {}).get("author", {}).get("email", "").endswith("@google.com"):
+            return True
+    votes = detail.get("labels", {}).get("Code-Review", {}).get("all", [])
+    return any(v.get("value", 0) == 1 and v.get("email", "").endswith("@google.com")
+               for v in votes)
+
+
+def unapproved_g3_chain(cl, ps):
+    """Returns (change, patchset) pairs that block Canary-G3 for cl/ps.
+
+    The google3 try service cherry-picks every unmerged parent of the change too
+    (GetChangesToCherryPick), and each of them needs its own Googler approval.
+    """
+    related = gerrit_json(f"/changes/{cl}/revisions/{ps}/related").get("changes", [])
+    parent_of, by_commit = {}, {}
+    for c in related:
+        if c.get("status") == "MERGED":
+            continue
+        key = (c["_change_number"], c["_revision_number"])
+        by_commit[c["commit"]["commit"]] = key
+        if c["commit"].get("parents"):
+            parent_of[key] = c["commit"]["parents"][0]["commit"]
+    chain = [(int(cl), int(ps))]
+    # The related list is finite and each step moves to a distinct parent commit
+    while len(chain) <= len(related) and by_commit.get(parent_of.get(chain[0])):
+        chain.insert(0, by_commit[parent_of[chain[0]]])
+    return [(c, p) for c, p in chain if not g3_change_approved(c, p)]
 
 
 def swarming_task_stdout(task_id):
@@ -699,10 +739,11 @@ def triage_asan_failure(cl, ps, builder, bb_build, sw_tasks, touched_files):
         if failure or state in ("BOT_DIED", "TIMED_OUT", "NO_RESOURCE", "EXPIRED", "KILLED"):
             failed_tasks.append(t)
 
-    if not failed_tasks and bb_build.get("status") in ("FAILURE", "INFRA_FAILURE"):
-        for t in sw_tasks:
-            if builder and builder in t.get("name", ""):
-                failed_tasks.append(t)
+    if not failed_tasks and bb_build.get("status") in ("FAILURE", "INFRA_FAILURE") and builder:
+        failed_tasks = [t for t in sw_tasks if builder in t.get("name", "")]
+        if not failed_tasks:
+            # Look past the capped per-CL query: a CQ dry run creates more tasks than it returns
+            failed_tasks = swarming_tasks_for_cl(cl, ps, name=builder)
 
     for t in failed_tasks:
         state = t.get("state")
@@ -779,12 +820,24 @@ def triage_asan_failure(cl, ps, builder, bb_build, sw_tasks, touched_files):
 def triage_canary_g3_failure(cl, ps, bb_build, sw_tasks, touched_files):
     g3_task = next((t for t in sw_tasks if "Canary-G3" in t.get("name", "")), None)
     if not g3_task:
+        # The shared per-CL query is capped, so a CQ dry run can push Canary-G3 out of it
+        g3_task = next(iter(swarming_tasks_for_cl(cl, ps, name="Canary-G3")), None)
+    if not g3_task:
         return {
             "verdict": "INFRA_NO_TASK", "our_part_passed": False,
             "summary": "Canary-G3 Swarming task not found",
         }
     tid = g3_task.get("taskId")
     stdout = swarming_task_stdout(tid)
+    if "changes must be either owned and authored by Googlers" in stdout:
+        missing = unapproved_g3_chain(cl, ps)
+        listed = ", ".join(f"{c}/{p}" for c, p in missing) or "none found (re-check votes)"
+        return {
+            "verdict": "MISSING_APPROVAL", "our_part_passed": False, "task_id": tid,
+            "missing": missing,
+            "summary": f"google3 try service wants a Googler CR+1 on every unmerged change in the "
+                       f"chain; missing on: {listed}",
+        }
     m_cl = re.search(r"http://cl/(\d+)", stdout)
     if not m_cl:
         return {
@@ -874,6 +927,8 @@ def triage_canary_g3_failure(cl, ps, bb_build, sw_tasks, touched_files):
 
 def triage_other_canary_failure(cl, ps, builder, bb_build, sw_tasks, touched_files):
     task = next((t for t in sw_tasks if builder in t.get("name", "")), None)
+    if not task:
+        task = next(iter(swarming_tasks_for_cl(cl, ps, name=builder)), None)
     tid = task.get("taskId") if task else ""
     stdout = swarming_task_stdout(tid) if tid else ""
     stems = [os.path.splitext(os.path.basename(f))[0] for f in touched_files]
@@ -1019,7 +1074,10 @@ def cmd_triage(args):
                         cl, ps, cb, b_info, sw_tasks, touched_files)
                 results["builds"][cb] = triage_res
                 print(f"- Verdict: {triage_res['verdict']}")
-                if cb == "Canary-G3":
+                if cb == "Canary-G3" and triage_res["verdict"] in ("MISSING_APPROVAL",
+                                                                   "INFRA_NO_TASK"):
+                    print(f"- Summary: {triage_res['summary']}")
+                elif cb == "Canary-G3":
                     print(f"- Roll CL: http://cl/{triage_res.get('g3_cl', '')}")
                     print(f"- Skia Tests Ran: {triage_res.get('skia_tests_ran')}")
                     if triage_res.get("targets"):
@@ -1087,9 +1145,17 @@ def cmd_watch(args):
         if g3_needed and not canary_g3_triggered and not meta["owner"].endswith("@google.com"):
             builds = bb_cl_builds(cl, ps)
             if "Canary-G3" not in builds and meta["googler_cr_plus_one"]:
-                print(f"Googler CR+1 detected on external CL {cl}; triggering Canary-G3")
-                cmd = ["git", "cl", "try", "-i", str(cl), "-B", BUCKET, "-b", "Canary-G3"]
-                subprocess.run(cmd, check=False)
+                missing = unapproved_g3_chain(cl, ps)
+                if missing:
+                    # The try service would fail with MissingApproval after a minute
+                    listed = ", ".join(f"{c}/{p}" for c, p in missing)
+                    print(f"Googler CR+1 is on {cl}, but Canary-G3 also needs it on the "
+                          f"unmerged parents: {listed}. Not triggering Canary-G3")
+                    g3_needed = False
+                else:
+                    print(f"Googler CR+1 detected on external CL {cl}; triggering Canary-G3")
+                    cmd = ["git", "cl", "try", "-i", str(cl), "-B", BUCKET, "-b", "Canary-G3"]
+                    subprocess.run(cmd, check=False, cwd=SKIA_DIR)
                 canary_g3_triggered = True
 
         builds = bb_cl_builds(cl, ps)
@@ -1105,7 +1171,7 @@ def cmd_watch(args):
                 if triage_res["verdict"] == "INFRA_MISHAP" and not asan_retried:
                     print(f"ASAN infra mishap on {asan_builder}; retrying once")
                     cmd = ["git", "cl", "try", "-i", str(cl), "-B", BUCKET, "-b", asan_builder]
-                    subprocess.run(cmd, check=False)
+                    subprocess.run(cmd, check=False, cwd=SKIA_DIR)
                     asan_retried = True
                 elif triage_res["verdict"] in ("COMPILE_FAILURE", "SANITIZER_OR_TEST_FAILURE"):
                     print(f"\nWAKEUP_REASON: ASAN_FAILURE ({triage_res['verdict']})")

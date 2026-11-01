@@ -37,6 +37,12 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
        Googler `Code-Review+1` approval. If the external CL has no Googler CR+1 yet,
        `canary_advisor.py` automatically excludes Canary-G3 from `AGENT ACTION` and prints a
        deferred command.
+     - **Stacked CLs**: the google3 try service (`chrome/skia/autoroller/try_service.py`)
+       cherry-picks every unmerged parent of the CL too, and each one needs its own Googler
+       CR+1 (or a Googler owner and author). A CR+1 on the reviewed CL alone gives
+       `MISSING_APPROVAL` after about a minute. `watch` checks the chain first and does not
+       trigger Canary-G3 while a parent lacks approval; `triage` lists the parents that block
+       it. Never vote CR+1 on unreviewed parents just to unblock Canary-G3.
      - **External Author Submit-Hold Protocol**: Follow the submit-hold protocol below: prepare
        a `/PATCHSET_LEVEL` draft with `unresolved: true` for the user to publish with
        `Code-Review+1`. Run Canary-G3 immediately after the user publishes the approval and hold
