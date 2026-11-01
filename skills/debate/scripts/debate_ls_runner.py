@@ -33,13 +33,19 @@ def list_catalog_models() -> None:
   for mid, det in sorted(models.items()):
     if det.get("disabled") or not det.get("displayName"):
       continue
-    disp = det.get("displayName", "")
     m_enum = det.get("model", "")
+    if cl.is_forbidden_bon_model(mid, m_enum):
+      continue
+    disp = det.get("displayName", "")
     print(f"{mid:32s} | {disp:30s} | {m_enum}")
 
 
 def resolve_model_or_fail(models: dict, name: str) -> dict:
   """Resolves a model by id, alias, or display name; fails fast with guidance."""
+  if cl.is_forbidden_bon_model(name, name):
+    raise ValueError(
+        f"Model {name!r} is a SERVING_TYPE_BON arm reserved for StartBattleMode (b/580403511)."
+    )
   hit = cl.lookup_model(models, name)
   if not hit or not hit.get("enum"):
     raise ValueError(f"Unknown or disabled model {name!r}. Run with --list-models to see choices.")
@@ -67,7 +73,6 @@ def auto_pick_scribe(models: dict, arm_families: set[str]) -> dict:
       "opus-5.5-high",
       "gemini-launch-candidate-high",
       "gemini-4-carbon-high",
-      "glm-5.2-fp8-bon-arm",
   ]
   # Try candidate from an unused family first
   for cand in candidates:
@@ -81,7 +86,12 @@ def auto_pick_scribe(models: dict, arm_families: set[str]) -> dict:
     hit = cl.lookup_model(models, cand)
     if hit and not hit.get("disabled"):
       return hit
-  # Last resort
+  # Last resort: first non-BoN enabled model
+  for mid, det in models.items():
+    if not det.get("disabled") and not cl.is_forbidden_bon_model(mid, det.get("model", "")):
+      hit = cl.lookup_model(models, mid)
+      if hit:
+        return hit
   return list(models.values())[0]
 
 

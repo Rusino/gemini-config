@@ -2082,23 +2082,28 @@ class TestChatLifecycle(unittest.TestCase):
         1.0,
     )
 
-  def test_resolve_profile_model_cpp_core_balances_bon_and_wtu_and_falls_back_below_30_pct(self):
+  def test_resolve_profile_model_cpp_core_picks_healthy_dropdown_models_and_rejects_bon(self):
     now = 1800000000.0
     catalog = {
         "opus-5.5-high-bon-le": {
             "model": "MODEL_PLACEHOLDER_M380",
             "displayName": "Claude Opus 5.5 BoN (High)",
-            "quotaInfo": {"remainingFraction": 0.85, "resetTime": "2027-01-15T12:00:00Z"},
+            "quotaInfo": {"remainingFraction": 0.99, "resetTime": "2027-01-15T12:00:00Z"},
         },
         "opus-5.5-medium": {
             "model": "MODEL_PLACEHOLDER_M367",
             "displayName": "Claude Opus 5.5 (Medium)",
             "quotaInfo": {"remainingFraction": 0.85, "resetTime": "2027-01-15T12:00:00Z"},
         },
-        "sonnet-5.5-high-bon-le": {
-            "model": "MODEL_PLACEHOLDER_M420",
-            "displayName": "Claude Sonnet 5.5 (High)",
+        "opus-5.5-high": {
+            "model": "MODEL_PLACEHOLDER_M370",
+            "displayName": "Claude Opus 5.5 (High)",
             "quotaInfo": {"remainingFraction": 0.75, "resetTime": "2027-01-15T12:00:00Z"},
+        },
+        "gemini-pro-coordinator": {
+            "model": "MODEL_PLACEHOLDER_M415",
+            "displayName": "Gemini Pro Orchestrator",
+            "quotaInfo": {"remainingFraction": 0.90, "resetTime": "2027-01-15T12:00:00Z"},
         },
         "bon-experiment-arm-226": {
             "model": "MODEL_PLACEHOLDER_M226",
@@ -2108,21 +2113,19 @@ class TestChatLifecycle(unittest.TestCase):
     }
 
     with patch.object(chat_lifecycle, "_now_ts", return_value=now):
-      # Ties prefer request-counted claude-bon
-      res_tie = chat_lifecycle.resolve_profile_model(catalog, "cpp-core")
-      self.assertEqual(res_tie["id"], "opus-5.5-high-bon-le")
+      # Healthy opus-5.5-medium is picked; BoN models are ignored despite higher quota
+      res = chat_lifecycle.resolve_profile_model(catalog, "cpp-core")
+      self.assertEqual(res["id"], "opus-5.5-medium")
 
-      # When wtu is significantly healthier (> +0.05), pick opus-5.5-medium
-      catalog["opus-5.5-high-bon-le"]["quotaInfo"]["remainingFraction"] = 0.40
-      catalog["opus-5.5-medium"]["quotaInfo"]["remainingFraction"] = 0.90
-      res_wtu = chat_lifecycle.resolve_profile_model(catalog, "cpp-core")
-      self.assertEqual(res_wtu["id"], "opus-5.5-medium")
+      # When opus-5.5-medium is below soft floor (< 0.30), advance to opus-5.5-high
+      catalog["opus-5.5-medium"]["quotaInfo"]["remainingFraction"] = 0.20
+      res_high = chat_lifecycle.resolve_profile_model(catalog, "cpp-core")
+      self.assertEqual(res_high["id"], "opus-5.5-high")
 
-      # When both Opus pools are below soft floor (< 0.30), fall back to sonnet-bon
-      catalog["opus-5.5-high-bon-le"]["quotaInfo"]["remainingFraction"] = 0.22
-      catalog["opus-5.5-medium"]["quotaInfo"]["remainingFraction"] = 0.18
+      # When both Opus models are exhausted, fall back to gemini-pro-coordinator
+      catalog["opus-5.5-high"]["quotaInfo"]["remainingFraction"] = 0.10
       res_fallback = chat_lifecycle.resolve_profile_model(catalog, "cpp-core")
-      self.assertEqual(res_fallback["id"], "sonnet-5.5-high-bon-le")
+      self.assertEqual(res_fallback["id"], "gemini-pro-coordinator")
 
   def test_reroute_wasteful_wtu_models_proactively(self):
     catalog = {
@@ -2131,9 +2134,9 @@ class TestChatLifecycle(unittest.TestCase):
             "displayName": "Claude Fable 5.1 (High)",
             "quotaInfo": {"remainingFraction": 0.90, "resetTime": "2027-01-15T12:00:00Z"},
         },
-        "opus-5.5-high-bon-le": {
-            "model": "MODEL_PLACEHOLDER_M380",
-            "displayName": "Claude Opus 5.5 BoN (High)",
+        "opus-5.5-medium": {
+            "model": "MODEL_PLACEHOLDER_M367",
+            "displayName": "Claude Opus 5.5 (Medium)",
             "quotaInfo": {"remainingFraction": 0.85, "resetTime": "2027-01-15T12:00:00Z"},
         },
         "gemini-launch-candidate-high": {
@@ -2151,24 +2154,74 @@ class TestChatLifecycle(unittest.TestCase):
             "displayName": "Gemini 4 Carbon (High)",
             "quotaInfo": {"remainingFraction": 0.90, "resetTime": "2027-01-15T12:00:00Z"},
         },
-        "bon-experiment-arm-226": {
-            "model": "MODEL_PLACEHOLDER_M226",
-            "displayName": "Gemini 4 Carbon-G",
-            "quotaInfo": {"remainingFraction": 0.95, "resetTime": "2027-01-15T12:00:00Z"},
-        },
     }
 
-    # Fable -> Opus 5.5
+    # Fable -> Opus 5.5 Medium (non-BoN)
     fable_rep = chat_lifecycle.reroute_wasteful_wtu_model(catalog, "MODEL_PLACEHOLDER_M388")
-    self.assertEqual(fable_rep["id"], "opus-5.5-high-bon-le")
+    self.assertEqual(fable_rep["id"], "opus-5.5-medium")
 
     # Argon WTU -> Orchestrator
     argon_rep = chat_lifecycle.reroute_wasteful_wtu_model(catalog, "gemini-launch-candidate-high")
     self.assertEqual(argon_rep["id"], "gemini-pro-coordinator")
 
-    # Carbon WTU -> Carbon-G
+    # Carbon WTU -> Orchestrator
     carbon_rep = chat_lifecycle.reroute_wasteful_wtu_model(catalog, "gemini-4-carbon-high")
-    self.assertEqual(carbon_rep["id"], "bon-experiment-arm-226")
+    self.assertEqual(carbon_rep["id"], "gemini-pro-coordinator")
+
+  def test_bon_models_strictly_rejected_and_auto_migrated(self):
+    self.assertTrue(
+        chat_lifecycle.is_forbidden_bon_model("opus-5.5-high-bon-le", "MODEL_PLACEHOLDER_M380")
+    )
+    self.assertTrue(
+        chat_lifecycle.is_forbidden_bon_model("opus-bon-le", "MODEL_PLACEHOLDER_M160")
+    )
+    self.assertTrue(
+        chat_lifecycle.is_forbidden_bon_model("bon-experiment-arm-226", "MODEL_PLACEHOLDER_M226")
+    )
+    self.assertFalse(
+        chat_lifecycle.is_forbidden_bon_model("opus-5.5-medium", "MODEL_PLACEHOLDER_M367")
+    )
+    self.assertFalse(
+        chat_lifecycle.is_forbidden_bon_model("gemini-pro-coordinator", "MODEL_PLACEHOLDER_M415")
+    )
+
+    catalog = {
+        "opus-bon-le": {
+            "model": "MODEL_PLACEHOLDER_M160",
+            "displayName": "Claude Opus 4.6",
+            "quotaInfo": {"remainingFraction": 0.99},
+        },
+        "gemini-pro-coordinator": {
+            "model": "MODEL_PLACEHOLDER_M415",
+            "displayName": "Gemini Pro Orchestrator",
+            "quotaInfo": {"remainingFraction": 0.85},
+        },
+    }
+    self.assertEqual(chat_lifecycle.lookup_model(catalog, "opus-bon-le"), {})
+    self.assertEqual(chat_lifecycle.lookup_model(catalog, "MODEL_PLACEHOLDER_M160"), {})
+
+    fake_catalog = {
+        "models": {
+            "gemini-pro-coordinator": {
+                "model": "MODEL_PLACEHOLDER_M415",
+                "displayName": "Gemini Pro Orchestrator",
+                "quotaInfo": {"remainingFraction": 0.85},
+            },
+            "opus-bon-le": {
+                "model": "MODEL_PLACEHOLDER_M160",
+                "displayName": "Claude Opus 4.6",
+                "quotaInfo": {"remainingFraction": 0.99},
+            },
+        },
+        "tieredModelIds": {"pro": ["gemini-pro-coordinator"]},
+    }
+    with (
+        patch.object(chat_lifecycle, "get_available_models", return_value=fake_catalog),
+        patch.object(chat_lifecycle, "get_last_used_model", return_value="MODEL_PLACEHOLDER_M160"),
+        patch.object(chat_lifecycle, "get_project_model_preference", return_value="orchestrator"),
+    ):
+      res = chat_lifecycle.resolve_handoff_model("cid-legacy-bon", project_id="p-orch")
+      self.assertEqual(res["id"], "gemini-pro-coordinator")
 
   def test_resolve_handoff_model_respects_soft_floor_and_explicit_override(self):
     fake_catalog = {

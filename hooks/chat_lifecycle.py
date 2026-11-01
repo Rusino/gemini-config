@@ -62,24 +62,49 @@ QUOTA_SOFT_FLOOR = 0.30
 QUOTA_HARD_FLOOR = 0.15
 EMERGENCY_PIN_FLOOR = 0.05
 
+# SERVING_TYPE_BON models are reserved for StartBattleMode (b/580403511)
+BON_MODEL_ID_RE = re.compile(r"(?:^|-)bon(?:-|$)", re.IGNORECASE)
+FORBIDDEN_BON_ENUMS = frozenset({
+    "MODEL_PLACEHOLDER_M2",
+    "MODEL_PLACEHOLDER_M160",
+    *(f"MODEL_PLACEHOLDER_M{n}" for n in range(221, 236)),
+    "MODEL_PLACEHOLDER_M252",
+    "MODEL_PLACEHOLDER_M284",
+    "MODEL_PLACEHOLDER_M324",
+    "MODEL_PLACEHOLDER_M325",
+    "MODEL_PLACEHOLDER_M328",
+    "MODEL_PLACEHOLDER_M332",
+    "MODEL_PLACEHOLDER_M368",
+    "MODEL_PLACEHOLDER_M377",
+    "MODEL_PLACEHOLDER_M380",
+    "MODEL_PLACEHOLDER_M420",
+})
+
+
+def is_forbidden_bon_model(model_id: str = "", model_enum: str = "") -> bool:
+  """Returns True if the model is a SERVING_TYPE_BON arm forbidden outside Battle Mode."""
+  mid = (model_id or "").strip()
+  enum = (model_enum or "").strip().upper()
+  if mid and BON_MODEL_ID_RE.search(mid):
+    return True
+  if enum and (enum in FORBIDDEN_BON_ENUMS or BON_MODEL_ID_RE.search(enum)):
+    return True
+  return False
+
+
 MODEL_PROFILES: dict[str, list[str]] = {
     "cpp-core": [
-        "opus-5.5-high-bon-le",
         "opus-5.5-medium",
-        "opus-5.5-max-bon-le",
         "opus-5.5-high",
-        "sonnet-5.5-high-bon-le",
-        "sonnet-5.5-bon-le",
-        "bon-experiment-arm-226",
+        "opus-5.5-max",
         "gemini-pro-coordinator",
+        "gemini-4-carbon-high",
         "auto",
     ],
     "orchestrator": [
         "gemini-pro-coordinator",
-        "bon-experiment-arm-226",
         "auto",
-        "sonnet-5.5-high-bon-le",
-        "sonnet-5.5-bon-le",
+        "gemini-4-carbon-high",
         "gemini-flash-next",
         "gemini-3.8-flash-high",
         "gemini-3.8-flash-medium",
@@ -771,24 +796,22 @@ def get_model_quota_fraction(det: dict, now_ts: float | None = None) -> float:
 
 
 CURATED_MODEL_LABELS = {
-    "opus-5.5-high-bon-le": "Claude Opus 5.5 BoN (High)",
-    "opus-5.5-max-bon-le": "Claude Opus 5.5 BoN (Max)",
-    "sonnet-5.5-high-bon-le": "Claude Sonnet 5.5 (High)",
-    "sonnet-5.5-bon-le": "Claude Sonnet 5.5 (Max)",
-    "bon-experiment-arm-226": "Gemini 4 Carbon-G",
     "gemini-pro-coordinator": "Gemini Pro Orchestrator",
+    "opus-5.5-medium": "Claude Opus 5.5 (Medium)",
 }
 
 
 def lookup_model(models: dict, wanted: str) -> dict:
   """Resolves a model id / display name / enum name among enabled catalog entries."""
   w = (wanted or "").strip().lower()
-  if not w:
+  if not w or is_forbidden_bon_model(w, w):
     return {}
   for mid, det in models.items():
     if det.get("disabled"):
       continue
     enum = det.get("model", "")
+    if is_forbidden_bon_model(mid, enum):
+      continue
     label = det.get("displayName", "")
     curated_label = CURATED_MODEL_LABELS.get(mid, "")
     cand_labels = (label.lower(), curated_label.lower())
@@ -851,27 +874,27 @@ def reroute_wasteful_wtu_model(
       w == pat or (w.startswith("fable-5.1") and "-bon-le" not in w)
       for pat in WASTEFUL_WTU_FABLE_PATTERNS
   ):
-    for cand in ("opus-5.5-high-bon-le", "opus-5.5-medium", "opus-5.5-max-bon-le", "opus-5.5-high"):
+    for cand in ("opus-5.5-medium", "opus-5.5-high", "opus-5.5-max"):
       hit = lookup_model(models, cand)
       if hit and hit.get("quota", 1.0) >= min_floor:
         return {**hit, "source": "wtu_shield"}
 
-  # 2. Gemini 4 Argon WTU -> Gemini Pro Orchestrator / Carbon-G on gemini-next-v2
+  # 2. Gemini 4 Argon WTU -> Gemini Pro Orchestrator / auto on gemini-next-v2
   if any(
       w == pat or w.startswith("gemini-launch-candidate")
       for pat in WASTEFUL_WTU_ARGON_PATTERNS
   ):
-    for cand in ("gemini-pro-coordinator", "bon-experiment-arm-226", "auto"):
+    for cand in ("gemini-pro-coordinator", "auto"):
       hit = lookup_model(models, cand)
       if hit and hit.get("quota", 1.0) >= min_floor:
         return {**hit, "source": "wtu_shield"}
 
-  # 3. Gemini 4 Carbon WTU -> Gemini 4 Carbon-G on gemini-next-v2
+  # 3. Gemini 4 Carbon WTU -> Gemini Pro Orchestrator / auto on gemini-next-v2
   if any(
       w == pat or (w.startswith("gemini-4-carbon") and "-g" not in w)
       for pat in WASTEFUL_WTU_CARBON_PATTERNS
   ):
-    for cand in ("bon-experiment-arm-226", "gemini-pro-coordinator", "auto"):
+    for cand in ("gemini-pro-coordinator", "auto"):
       hit = lookup_model(models, cand)
       if hit and hit.get("quota", 1.0) >= min_floor:
         return {**hit, "source": "wtu_shield"}
@@ -888,28 +911,6 @@ def resolve_profile_model(
   """Resolves the best available healthy model for a named project profile."""
   p = (profile_name or "").strip().lower().removeprefix("profile:")
   chain = MODEL_PROFILES.get(p) or MODEL_PROFILES["orchestrator"]
-
-  # cpp-core: balance claude-bon vs 3p-wtu-daily Opus 5.5
-  if p == "cpp-core":
-    hit_bon = (
-        lookup_model(models, "opus-5.5-high-bon-le")
-        or lookup_model(models, "opus-5.5-max-bon-le")
-    )
-    hit_wtu = (
-        lookup_model(models, "opus-5.5-medium")
-        or lookup_model(models, "opus-5.5-high")
-    )
-    q_bon = hit_bon.get("quota", 0.0) if hit_bon else 0.0
-    q_wtu = hit_wtu.get("quota", 0.0) if hit_wtu else 0.0
-
-    if (hit_bon and q_bon >= soft_floor) or (hit_wtu and q_wtu >= soft_floor):
-      # Ties within 0.05 prefer request-counted claude-bon to preserve WTU tokens
-      if hit_wtu and q_wtu > q_bon + 0.05 and q_wtu >= soft_floor:
-        return hit_wtu
-      if hit_bon and q_bon >= soft_floor:
-        return hit_bon
-      if hit_wtu:
-        return hit_wtu
 
   # Normal chain resolution at soft_floor
   for mid in chain:
