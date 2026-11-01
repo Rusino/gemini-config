@@ -818,6 +818,84 @@ def perf_claim_commit_denial(cmd: str, workspace_paths: list[str]) -> str:
   )
 
 
+# What a commit records: (worktree content too?, pathspec paths or None for the whole tree)
+def _commit_scope(seg: str) -> tuple[bool, list[str] | None]:
+  try:
+    tokens = shlex.split(seg, posix=True)
+  except ValueError:
+    return True, None
+  takes_value = {"-m", "-F", "-C", "-c", "--message", "--file", "--author", "--date",
+                 "--fixup", "--squash", "-t", "--template", "--reuse-message"}
+  i = tokens.index("commit") + 1 if "commit" in tokens else len(tokens)
+  all_flag, paths = False, []
+  # Bounded by the token count; each step consumes at least one token
+  while i < len(tokens):
+    tok = tokens[i]
+    if tok == "--":
+      paths += tokens[i + 1:]
+      break
+    if tok == "--all" or re.fullmatch(r"-[a-zA-Z]*a[a-zA-Z]*", tok):
+      all_flag = True
+    # Combined short flags such as -qm take the next token as the value of their last letter
+    if tok in takes_value or re.fullmatch(r"-[a-zA-Z]*[mFCct]", tok):
+      i += 2
+      continue
+    if not tok.startswith("-"):
+      paths.append(tok)
+    i += 1
+  if paths:
+    return True, paths
+  return all_flag, None
+
+
+# Deny a commit in a product repo while its test-contract changes are not triaged
+def decision_contract_denial(
+    cmd: str,
+    workspace_paths: list[str],
+    conv_id: str,
+    parent_conv_id: str,
+    transcript_path: str,
+) -> str:
+  cmd_code = _non_inspection_cmd_segments(cmd)
+  m = GIT_COMMIT_AT_RE.search(cmd_code)
+  if not m:
+    return ""
+  seg = re.split(r"&&|\|\||;|\n", cmd_code[m.start():])[0]
+  # commit-graph / commit-tree are other commands; help prints and records nothing
+  if re.search(r"\bcommit-", seg) or re.search(r"\s(?:-h|--help)(?=\s|$)", seg):
+    return ""
+  try:
+    # `git -C <dir> commit` names its repo; a later `cd` in the chain must not redirect it
+    c_dir = re.match(r"git\s+-C\s+(\S+)", seg)
+    if c_dir and os.path.isdir(os.path.expanduser(c_dir.group(1).strip("'\""))):
+      root = _git_out(os.path.expanduser(c_dir.group(1).strip("'\"")), "rev-parse",
+                      "--show-toplevel")
+    else:
+      root = _upload_repo_root(cmd, workspace_paths)
+    if not root:
+      return ""
+    import auto_ship
+    import decision_guard
+
+    # Personal config repos ship on their own and carry no product behavior contracts
+    if auto_ship.is_personal_repo(root):
+      return ""
+    include_wt, paths = _commit_scope(seg)
+    if paths is not None:
+      base = os.path.expanduser(c_dir.group(1).strip("'\"")) if c_dir else root
+      paths = [os.path.relpath(os.path.join(base, p), root) for p in paths]
+    hits = decision_guard.contract_delta(root, include_wt, paths)
+    root_conv = parent_conv_id or conv_id
+    root_transcript = transcript_path
+    if conv_id and root_conv != conv_id and transcript_path:
+      root_transcript = transcript_path.replace(conv_id, root_conv)
+    return decision_guard.commit_denial(
+        root, hits, conv_id, root_conv, root_transcript, include_wt, paths
+    )
+  except Exception:
+    return ""
+
+
 def _git_out(root: str, *args: str) -> str:
   try:
     res = subprocess.run(["git", "-C", root, *args], capture_output=True, text=True,
@@ -3103,6 +3181,14 @@ def main() -> None:
     perf_commit = perf_claim_commit_denial(cmd_str, workspace_paths)
     if perf_commit:
       print(json.dumps({"decision": "deny", "reason": perf_commit}, ensure_ascii=False))
+      return
+
+    # Test-contract changes can flip an earlier decision; triage them before they are committed
+    decision_denial = decision_contract_denial(
+        cmd_str, workspace_paths, conv_id, parent_conv_id, transcript_path
+    )
+    if decision_denial:
+      print(json.dumps({"decision": "deny", "reason": decision_denial}, ensure_ascii=False))
       return
 
     # Require the full Flutter test corpus only on upload/push/PR when executable code changed

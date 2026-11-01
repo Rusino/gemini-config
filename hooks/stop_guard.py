@@ -653,9 +653,12 @@ def analyze_current_turn(transcript_path: str) -> dict:
   # Find the last USER_INPUT step to scope analysis to the current turn
   last_user_idx = -1
   last_user_request = ""
+  # Ledger acks are timestamped, so the turn boundary is needed as a time, not a step index
+  last_user_ts = ""
   for idx in ordered_indices:
     if steps_by_idx[idx].get("type") == "USER_INPUT":
       last_user_idx = idx
+      last_user_ts = str(steps_by_idx[idx].get("created_at", ""))
       raw_u = str(steps_by_idx[idx].get("content", ""))
       m_u = USER_REQUEST_RE.search(raw_u)
       last_user_request = m_u.group(1) if m_u else raw_u
@@ -677,6 +680,8 @@ def analyze_current_turn(transcript_path: str) -> dict:
   vcs_baton_lines: list[str] = []
   git_publish_after_done = False
   set_title_succeeded = False
+  # The decision guard checks the final reply against contract triage made after this user turn
+  last_planner_text = ""
 
   for idx in ordered_indices:
     if idx <= last_user_idx:
@@ -684,6 +689,8 @@ def analyze_current_turn(transcript_path: str) -> dict:
     step = steps_by_idx[idx]
     stype = step.get("type", "")
     tool_calls = step.get("tool_calls") or []
+    if stype == "PLANNER_RESPONSE" and str(step.get("content", "")).strip():
+      last_planner_text = str(step.get("content", ""))
 
     if stype == "PLANNER_RESPONSE" and tool_calls:
       pending_cmds.clear()
@@ -794,6 +801,8 @@ def analyze_current_turn(transcript_path: str) -> dict:
       "vcs_baton_lines": vcs_baton_lines,
       "git_publish_after_done": git_publish_after_done,
       "set_title_succeeded": set_title_succeeded,
+      "last_user_ts": last_user_ts,
+      "last_planner_text": last_planner_text,
   }
 
 
@@ -1171,6 +1180,26 @@ def main() -> None:
             ensure_ascii=False,
         )
     )
+    return
+
+  # Contract-change triage done by this chat or its subagents must reach the user
+  d_reason = ""
+  if conv_id and info.get("last_user_ts"):
+    try:
+      import decision_guard
+
+      d_reason = decision_guard.visibility_reason(
+          conv_id, info["last_user_ts"], info.get("last_planner_text", "")
+      )
+    except Exception:
+      d_reason = ""
+  if (
+      d_reason
+      and state.get("decision_guard_blocked_turn") != info.get("last_user_idx", -1)
+  ):
+    state["decision_guard_blocked_turn"] = info.get("last_user_idx", -1)
+    save_state(state_path, state)
+    print(json.dumps({"decision": "continue", "reason": d_reason}, ensure_ascii=False))
     return
 
   if state.get("pending_title_guard") and info.get("set_title_succeeded"):
