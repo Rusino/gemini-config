@@ -290,6 +290,26 @@ class TestHookWiring(RepoCase):
     self.assertIn("[DECISION GUARD]", pre_tool_guard.decision_contract_denial(
         f"git -C {self.root} commit -m x && cd /tmp", ["/tmp"], "c", "", ""))
 
+  def test_file_changes_in_the_same_line_must_be_split(self):
+    import pre_tool_guard
+    deny = pre_tool_guard.decision_contract_denial(
+        f"cd {self.root} && git apply /tmp/x.diff && git add -A && git commit -m x",
+        [self.root], "conv", "", "")
+    self.assertIn("own command", deny)
+
+  def test_commit_mentioned_in_quotes_is_not_a_commit(self):
+    import pre_tool_guard
+    self.assertEqual(pre_tool_guard.decision_contract_denial(
+        f"cd {self.root} && python3 ship.py -m \"so 'git apply && git commit' was missed\"",
+        [self.root], "conv", "", ""), "")
+
+  def test_add_in_the_same_line_scans_worktree(self):
+    import pre_tool_guard
+    self.write("modules/skparagraph/tests/TrakTest.cpp",
+               CPP_BASE.replace("w == 1.5f", "w == 2.5f"))
+    self.assertIn("Trak_Replaces", pre_tool_guard.decision_contract_denial(
+        f"cd {self.root} && git add -A && git commit -m x", [self.root], "conv", "", ""))
+
   def test_stop_guard_reports_last_reply_and_user_time(self):
     import stop_guard
     path = os.path.join(self.root, "t.jsonl")

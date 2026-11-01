@@ -818,6 +818,14 @@ def perf_claim_commit_denial(cmd: str, workspace_paths: list[str]) -> str:
   )
 
 
+QUOTED_RE = re.compile(r"\"(?:\\.|[^\"\\])*\"|'[^']*'")
+# Steps that may precede `git commit` in one command line without changing tracked files
+COMMIT_SAFE_PRE_RE = re.compile(
+    r"^(?:cd|pushd|export|echo|ls|true|set|:|git\s+(?:-C\s+\S+\s+)?"
+    r"(?:add|status|diff|log|show|rev-parse|branch|config\s+--get))(?:\s|$)"
+)
+
+
 # What a commit records: (worktree content too?, pathspec paths or None for the whole tree)
 def _commit_scope(seg: str) -> tuple[bool, list[str] | None]:
   try:
@@ -840,7 +848,7 @@ def _commit_scope(seg: str) -> tuple[bool, list[str] | None]:
     if tok in takes_value or re.fullmatch(r"-[a-zA-Z]*[mFCct]", tok):
       i += 2
       continue
-    if not tok.startswith("-"):
+    if tok and not tok.startswith("-"):
       paths.append(tok)
     i += 1
   if paths:
@@ -856,7 +864,8 @@ def decision_contract_denial(
     parent_conv_id: str,
     transcript_path: str,
 ) -> str:
-  cmd_code = _non_inspection_cmd_segments(cmd)
+  # Quoted text (commit messages, echo) may mention `git commit` without running it
+  cmd_code = _non_inspection_cmd_segments(QUOTED_RE.sub('""', strip_heredocs(cmd)))
   m = GIT_COMMIT_AT_RE.search(cmd_code)
   if not m:
     return ""
@@ -864,6 +873,17 @@ def decision_contract_denial(
   # commit-graph / commit-tree are other commands; help prints and records nothing
   if re.search(r"\bcommit-", seg) or re.search(r"\s(?:-h|--help)(?=\s|$)", seg):
     return ""
+  # The hook runs before the whole command line, so file changes made earlier in the same
+  # line (git apply, sed -i, scripts) are invisible to it; `git add` only moves worktree content
+  pre = [x.strip() for x in re.split(r"&&|\|\||;|\n", cmd_code[:m.start()]) if x.strip()]
+  unsafe = [x for x in pre if not COMMIT_SAFE_PRE_RE.match(x)]
+  if unsafe:
+    return (
+        "[DECISION GUARD] Run `git commit` as its own command, after the steps that change "
+        f"files (`{unsafe[-1][:60]}`): the contract gate checks the tree before the command "
+        "line runs, so it cannot see changes made earlier in the same line."
+    )
+  staged_in_line = any(re.match(r"git\s+(?:-C\s+\S+\s+)?add\b", x) for x in pre)
   try:
     # `git -C <dir> commit` names its repo; a later `cd` in the chain must not redirect it
     c_dir = re.match(r"git\s+-C\s+(\S+)", seg)
@@ -871,7 +891,7 @@ def decision_contract_denial(
       root = _git_out(os.path.expanduser(c_dir.group(1).strip("'\"")), "rev-parse",
                       "--show-toplevel")
     else:
-      root = _upload_repo_root(cmd, workspace_paths)
+      root = _upload_repo_root(cmd_code, workspace_paths)
     if not root:
       return ""
     import auto_ship
@@ -881,6 +901,7 @@ def decision_contract_denial(
     if auto_ship.is_personal_repo(root):
       return ""
     include_wt, paths = _commit_scope(seg)
+    include_wt = include_wt or staged_in_line
     if paths is not None:
       base = os.path.expanduser(c_dir.group(1).strip("'\"")) if c_dir else root
       paths = [os.path.relpath(os.path.join(base, p), root) for p in paths]
