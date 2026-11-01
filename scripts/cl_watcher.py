@@ -3035,6 +3035,218 @@ def auto_rerequest_github_reviewers(
   return to_request
 
 
+RE_GERRIT_COMMENT_COUNT = re.compile(r"\((\d+)\s+comments?\)", re.IGNORECASE)
+RE_GERRIT_BARE_COMMENT_HEADER = re.compile(
+    r"^Patch Set \d+:\s*(?:Code-Review[+-]\d+\s*)?(?:\(\d+\s+comments?\))?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_gerrit_self_review(
+    messages: list[dict[str, Any]], self_cr_vote: int, ps_num: int
+) -> tuple[str, int, int]:
+  """Extracts (self_review_state, self_review_ps, self_comment_count) from Gerrit messages"""
+  state = ""
+  review_ps = 0
+  comment_count = 0
+  for m in messages:
+    if not isinstance(m, dict):
+      continue
+    email = str(((m.get("author") or {}).get("email")) or "")
+    if email not in SELF_EMAILS:
+      continue
+    rev_n = int(m.get("_revision_number") or ps_num)
+    txt = str(m.get("message") or "").strip()
+    if not txt:
+      continue
+    for cm in RE_GERRIT_COMMENT_COUNT.finditer(txt):
+      comment_count += int(cm.group(1))
+    if "Code-Review-1" in txt or "Code-Review-2" in txt:
+      state = "changes_requested"
+      review_ps = rev_n
+    elif "Code-Review+1" in txt or "Code-Review+2" in txt:
+      state = "approved"
+      review_ps = rev_n
+    elif "-Code-Review" in txt:
+      state = "commented" if comment_count > 0 else ""
+    else:
+      body = re.sub(r"^Patch Set \d+:\s*", "", txt).strip()
+      if body and not body.startswith("Uploaded patch set"):
+        if state not in ("approved", "changes_requested"):
+          state = "commented"
+        review_ps = max(review_ps, rev_n)
+  if self_cr_vote > 0:
+    state = "approved"
+    if review_ps == 0:
+      review_ps = ps_num
+  elif self_cr_vote < 0:
+    state = "changes_requested"
+    if review_ps == 0:
+      review_ps = ps_num
+  return state, review_ps, comment_count
+
+
+def fetch_gerrit_comments(
+    host: str, cl_id: str, preloaded: dict[str, Any] | None = None
+) -> dict[str, list[dict[str, Any]]]:
+  """Fetches `/changes/{cl_id}/comments` from Gerrit or returns preloaded test comments"""
+  if isinstance(preloaded, dict):
+    return preloaded
+  url = f"https://{host}/changes/{cl_id}/comments"
+  req = urllib.request.Request(url, headers={"User-Agent": "CLFlightDeck/1.0"})
+  try:
+    with urllib.request.urlopen(req, timeout=8) as resp:
+      raw = resp.read().decode("utf-8", errors="replace")
+    if raw.startswith(")]}'"):
+      raw = raw[4:]
+    data = json.loads(raw)
+    return data if isinstance(data, dict) else {}
+  except Exception:
+    return {}
+
+
+def _analyze_gerrit_self_threads(
+    comments_by_path: dict[str, list[dict[str, Any]]], owner_email: str
+) -> dict[str, Any]:
+  """Summarizes comment threads where the user participated and tracks author replies"""
+  res: dict[str, Any] = {
+      "self_threads_total": 0,
+      "self_threads_unresolved": 0,
+      "self_threads_resolved": 0,
+      "author_replied_to_me": False,
+      "author_reply_snippet": "",
+      "latest_reply_by_author": {},
+  }
+  if not isinstance(comments_by_path, dict) or not comments_by_path:
+    return res
+
+  all_comments: list[dict[str, Any]] = []
+  parent_of: dict[str, str] = {}
+  for path, clist in comments_by_path.items():
+    if not isinstance(clist, list):
+      continue
+    for c in clist:
+      if not isinstance(c, dict) or not c.get("id"):
+        continue
+      cid = str(c["id"])
+      c_copy = dict(c)
+      c_copy["_path"] = str(path)
+      all_comments.append(c_copy)
+      if c.get("in_reply_to"):
+        parent_of[cid] = str(c["in_reply_to"])
+
+  def get_root(cid: str) -> str:
+    seen: set[str] = set()
+    cur = cid
+    while cur in parent_of and cur not in seen:
+      seen.add(cur)
+      cur = parent_of[cur]
+    return cur
+
+  threads: dict[str, list[dict[str, Any]]] = {}
+  for c in all_comments:
+    threads.setdefault(get_root(str(c["id"])), []).append(c)
+
+  latest_author_reply_ts = ""
+  latest_by_author: dict[str, tuple[str, str]] = {}
+  for t in threads.values():
+    t.sort(
+        key=lambda x: (
+            str(x.get("updated") or ""),
+            int(x.get("patch_set") or 0),
+        )
+    )
+    for c in t:
+      c_email = str(((c.get("author") or {}).get("email")) or "")
+      c_msg = str(c.get("message") or "").strip().replace("\n", " ")
+      c_ts = str(c.get("updated") or "")
+      if c_email and c_msg:
+        prev_ts, _ = latest_by_author.get(c_email, ("", ""))
+        if c_ts >= prev_ts:
+          latest_by_author[c_email] = (c_ts, c_msg)
+
+    has_self = any(
+        str(((c.get("author") or {}).get("email")) or "") in SELF_EMAILS for c in t
+    )
+    if not has_self:
+      continue
+    res["self_threads_total"] += 1
+    leaf = t[-1]
+    if bool(leaf.get("unresolved", False)):
+      res["self_threads_unresolved"] += 1
+    else:
+      res["self_threads_resolved"] += 1
+    last_self_idx = max(
+        i
+        for i, c in enumerate(t)
+        if str(((c.get("author") or {}).get("email")) or "") in SELF_EMAILS
+    )
+    for reply in t[last_self_idx + 1 :]:
+      r_email = str(((reply.get("author") or {}).get("email")) or "")
+      if r_email and r_email not in SELF_EMAILS:
+        res["author_replied_to_me"] = True
+        r_ts = str(reply.get("updated") or "")
+        r_msg = str(reply.get("message") or "").strip().replace("\n", " ")
+        if r_ts >= latest_author_reply_ts and r_msg:
+          latest_author_reply_ts = r_ts
+          res["author_reply_snippet"] = r_msg[:180]
+
+  res["latest_reply_by_author"] = {k: v[1] for k, v in latest_by_author.items()}
+  return res
+
+
+def _extract_gerrit_last_message(
+    messages: list[dict[str, Any]],
+    latest_reply_by_author: dict[str, str] | None = None,
+) -> tuple[str, str, str, str]:
+  """Returns (author_email, author_name, date, coalesced_text) for the latest Gerrit turn"""
+  if not messages:
+    return "bot", "bot", "", ""
+  last_msg = messages[-1] if isinstance(messages[-1], dict) else {}
+  auth_obj = last_msg.get("author") or {}
+  last_author = str(auth_obj.get("email") or "bot")
+  last_name = str(auth_obj.get("name") or "")
+  last_date = str(last_msg.get("date") or "")
+
+  def _clean_msg(m: dict[str, Any]) -> str:
+    txt = str(m.get("message") or "").strip().replace("\n", " ")
+    for acc in m.get("accounts_in_message") or []:
+      if isinstance(acc, dict) and acc.get("_account_id"):
+        label = str(acc.get("email") or acc.get("name") or acc["_account_id"])
+        txt = txt.replace(f"<GERRIT_ACCOUNT_{acc['_account_id']}>", label)
+    return txt
+
+  last_text = _clean_msg(last_msg)
+  if RE_GERRIT_BARE_COMMENT_HEADER.match(last_text):
+    parts: list[str] = []
+    for prev in reversed(messages[:-1]):
+      if not isinstance(prev, dict):
+        continue
+      p_auth = prev.get("author") or {}
+      p_email = str(p_auth.get("email") or "")
+      if p_email != last_author:
+        break
+      if not last_name and p_auth.get("name"):
+        last_name = str(p_auth["name"])
+      p_txt = _clean_msg(prev)
+      p_body = re.sub(r"^Patch Set \d+:\s*", "", p_txt).strip()
+      if (
+          p_body
+          and not RE_GERRIT_BARE_COMMENT_HEADER.match(p_txt)
+          and not re.match(r"^Uploaded patch set \d+\.?$", p_body, re.IGNORECASE)
+      ):
+        parts.append(p_body)
+        break
+    inline_reply = (latest_reply_by_author or {}).get(last_author, "").strip()
+    if inline_reply and inline_reply not in parts:
+      parts.append(f"({inline_reply})" if parts else inline_reply)
+    if parts:
+      prefix_m = re.match(r"^(Patch Set \d+:)", last_text)
+      prefix = f"{prefix_m.group(1)} " if prefix_m else ""
+      last_text = f"{prefix}{' · '.join(parts)}"
+  return last_author, last_name, last_date, last_text
+
+
 def fetch_gerrit_cl_status(
     cl_id: str,
     rollers: dict[str, Any],
@@ -3101,6 +3313,14 @@ def fetch_gerrit_cl_status(
           str((v.get("account") or {}).get("email") or "")
           for v in (d.get("attention_set") or {}).values()
       ]
+      self_att_reasons = [
+          str(v.get("reason") or "")
+          for v in (d.get("attention_set") or {}).values()
+          if isinstance(v, dict)
+          and str((v.get("account") or {}).get("email") or "") in SELF_EMAILS
+          and v.get("reason")
+      ]
+      attention_reason = self_att_reasons[-1] if self_att_reasons else ""
       in_my_attention = any(e in SELF_EMAILS for e in att_set)
       # Only my own changes track which reviewers are blocking submission
       waiting_on = (
@@ -3131,13 +3351,45 @@ def fetch_gerrit_cl_status(
       if reviewer_removed:
         in_my_attention = False
         waiting_on = []
+      messages = d.get("messages") or []
       reviewer_accounts = (d.get("reviewers") or {}).get("REVIEWER") or []
+      cc_accounts = (d.get("reviewers") or {}).get("CC") or []
       reviewer_emails = {
           str(r.get("email") or "")
           for r in reviewer_accounts
           if isinstance(r, dict)
       }
-      is_reviewer = not is_self and bool(reviewer_emails & SELF_EMAILS)
+      cc_emails = {
+          str(r.get("email") or "")
+          for r in cc_accounts
+          if isinstance(r, dict)
+      }
+
+      labels = d.get("labels") or {}
+      cr_votes = [
+          (str(a.get("email") or ""), int(a.get("value") or 0))
+          for a in ((labels.get("Code-Review") or {}).get("all") or [])
+          if a.get("value")
+      ]
+      cq_votes = [
+          (str(a.get("email") or ""), int(a.get("value") or 0))
+          for a in ((labels.get("Commit-Queue") or {}).get("all") or [])
+          if a.get("value")
+      ]
+      max_cr = max([v for _, v in cr_votes], default=0)
+      min_cr = min([v for _, v in cr_votes], default=0)
+      max_cq = max([v for _, v in cq_votes], default=0)
+      self_cr_vote = max((v for e, v in cr_votes if e in SELF_EMAILS), default=0)
+
+      self_review_state, self_review_ps, self_comment_count = (
+          _parse_gerrit_self_review(messages, self_cr_vote, ps_num)
+      )
+
+      is_reviewer = not is_self and (
+          bool(reviewer_emails & SELF_EMAILS)
+          or (bool(cc_emails & SELF_EMAILS) and bool(self_review_state))
+          or bool(self_review_state)
+      )
       role = (
           "author"
           if is_self
@@ -3176,21 +3428,6 @@ def fetch_gerrit_cl_status(
           and not is_draft
           and not non_owner_reviewers
       )
-      labels = d.get("labels") or {}
-      cr_votes = [
-          (str(a.get("email") or ""), int(a.get("value") or 0))
-          for a in ((labels.get("Code-Review") or {}).get("all") or [])
-          if a.get("value")
-      ]
-      cq_votes = [
-          (str(a.get("email") or ""), int(a.get("value") or 0))
-          for a in ((labels.get("Commit-Queue") or {}).get("all") or [])
-          if a.get("value")
-      ]
-      max_cr = max([v for _, v in cr_votes], default=0)
-      min_cr = min([v for _, v in cr_votes], default=0)
-      max_cq = max([v for _, v in cq_votes], default=0)
-      self_cr_vote = max((v for e, v in cr_votes if e in SELF_EMAILS), default=0)
       # External authors on Skia and Chromium Gerrit need 2 Googler approvals (Review-Enforcement)
       required_approvals = 2 if is_external else 1
       approved_emails = {
@@ -3199,7 +3436,21 @@ def fetch_gerrit_cl_status(
           if v > 0 and e and e != owner_email
       }
       approved_count = len(approved_emails)
-      assigned_reviewers_count = len(set(non_owner_reviewers) | approved_emails)
+      self_active_reviewer = (
+          {"jlavrova@google.com"}
+          if (
+              is_reviewer
+              and (
+                  reviewer_emails & SELF_EMAILS
+                  or cc_emails & SELF_EMAILS
+                  or bool(self_review_state)
+              )
+          )
+          else set()
+      )
+      assigned_reviewers_count = len(
+          set(non_owner_reviewers) | approved_emails | self_active_reviewer
+      )
       missing_reviewers_to_assign = (
           max(0, required_approvals - assigned_reviewers_count)
           if status == "NEW"
@@ -3253,11 +3504,28 @@ def fetch_gerrit_cl_status(
       if is_wip or in_development:
         in_my_attention = False
         waiting_on = []
-      # Non-self changes not currently in my attention sit in Watching
-      is_watching = not is_self and not reviewer_removed and not in_my_attention
+      # Non-self changes not currently in my attention sit in Watching unless I commented
+      is_watching = (
+          not is_self
+          and not reviewer_removed
+          and not in_my_attention
+          and self_review_state not in ("commented", "changes_requested")
+      )
       merge_conflict = status == "NEW" and not gerrit_mergeable(host, cl_id)
 
-      messages = d.get("messages") or []
+      comments_by_path: dict[str, list[dict[str, Any]]] = {}
+      if (
+          isinstance(d.get("_comments"), dict)
+          or self_comment_count > 0
+          or "comment" in attention_reason.lower()
+      ):
+        comments_by_path = fetch_gerrit_comments(
+            host, cl_id, preloaded=d.get("_comments")
+        )
+      thread_stats = _analyze_gerrit_self_threads(
+          comments_by_path, owner_email
+      )
+
       self_approval_ps = 0
       for m in messages:
         if not isinstance(m, dict):
@@ -3272,17 +3540,15 @@ def fetch_gerrit_cl_status(
           self_approval_ps = 0
       if self_cr_vote > 0 and self_approval_ps == 0:
         self_approval_ps = ps_num
-      last_msg = messages[-1] if messages else {}
-      last_msg_author = str(((last_msg.get("author") or {}).get("email")) or "bot")
-      last_msg_date = str(last_msg.get("date") or "")
-      last_msg_text = str(last_msg.get("message") or "").strip().replace("\n", " ")
-      # NoteDb stores account mentions as <GERRIT_ACCOUNT_N> tokens in message bodies
-      for acc in last_msg.get("accounts_in_message") or []:
-        if isinstance(acc, dict) and acc.get("_account_id"):
-          label = str(acc.get("email") or acc.get("name") or acc["_account_id"])
-          last_msg_text = last_msg_text.replace(
-              f"<GERRIT_ACCOUNT_{acc['_account_id']}>", label
+
+      last_msg_author, last_msg_name, last_msg_date, last_msg_text = (
+          _extract_gerrit_last_message(
+              messages, thread_stats.get("latest_reply_by_author")
           )
+      )
+      last_msg_author_name = last_msg_name or (
+          owner_name if last_msg_author == owner_email else ""
+      )
 
       # Gather candidate timestamps across attention set, votes, and patchsets
       updated_raw = str(d.get("updated") or "")
@@ -3490,7 +3756,17 @@ def fetch_gerrit_cl_status(
           ),
           "cq_status": cq_status,
           "cq_failed": cq_failed,
+          "attention_reason": attention_reason,
+          "self_review_state": self_review_state,
+          "self_review_ps": self_review_ps,
+          "self_comment_count": self_comment_count,
+          "self_threads_total": thread_stats["self_threads_total"],
+          "self_threads_unresolved": thread_stats["self_threads_unresolved"],
+          "self_threads_resolved": thread_stats["self_threads_resolved"],
+          "author_replied_to_me": thread_stats["author_replied_to_me"],
+          "author_reply_snippet": thread_stats["author_reply_snippet"],
           "last_msg_author": last_msg_author,
+          "last_msg_author_name": last_msg_author_name,
           "last_msg_date": last_msg_date,
           "last_msg_et": last_msg_et,
           "last_msg_age": last_msg_age,
@@ -4048,17 +4324,48 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         and str(self_reviews[-1].get("state") or "").upper() == "DISMISSED"
         and not (set(req_logins) & SELF_GITHUB_LOGINS)
     )
+    self_comments = [
+        c
+        for c in comments
+        if str((c.get("author") or {}).get("login") or "") in SELF_GITHUB_LOGINS
+    ]
+    if self_approved:
+      self_review_state = "approved"
+    elif any(
+        str(r.get("state") or "").upper() == "CHANGES_REQUESTED"
+        for r in self_reviews
+    ):
+      self_review_state = "changes_requested"
+    elif self_reviews or self_comments:
+      self_review_state = "commented"
+    else:
+      self_review_state = ""
+    self_comment_count = len(self_reviews) + len(self_comments)
+
+    self_reviewed_waiting = (
+        not is_self
+        and bool(self_review_state)
+        and not (set(req_logins) & SELF_GITHUB_LOGINS)
+        and (
+            self_approved
+            or self_approval_dismissed
+            or last_snippet.startswith("[COMMIT]")
+        )
+    )
     in_my_attention = (
         state == "OPEN"
         and not is_wip
         and not in_development
         and (is_self or is_reviewer)
-        and not self_approved
-        and not self_approval_dismissed
+        and not self_reviewed_waiting
         and bool(last_actor)
         and last_actor not in SELF_GITHUB_LOGINS
     )
-    is_watching = not is_self and not in_my_attention
+    is_watching = (
+        not is_self
+        and not in_my_attention
+        and self_review_state not in ("commented", "changes_requested")
+    )
 
     # Map the status change date to the latest event driving the current PR phase
     if state == "MERGED":
@@ -4132,6 +4439,8 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         "is_self": is_self,
         "is_external": not is_self,
         "self_approved": self_approved,
+        "self_review_state": self_review_state,
+        "self_comment_count": self_comment_count,
         "is_draft": is_draft,
         "is_wip": is_wip,
         "wip_label": wip_label,
@@ -4347,9 +4656,18 @@ def send_desktop_alert(title: str, message: str, url: str = "") -> None:
 
 
 def wake_conversation(conv_id: str, message: str) -> bool:
-  """Sends a wakeup message to a Jetski conversation via agentapi."""
+  """Sends a wakeup message to a Jetski conversation via LS RPC with agentapi fallback"""
   if not conv_id or not message:
     return False
+  try:
+    resp = cl.ls_rpc(
+        "SendUserCascadeMessage",
+        {"cascadeId": conv_id, "items": [{"text": message}], "blocking": False},
+    )
+    if isinstance(resp, dict):
+      return True
+  except Exception:
+    pass
   env = dict(os.environ)
   env.pop("ANTIGRAVITY_SOURCE_METADATA", None)
   try:
@@ -4719,18 +5037,19 @@ def start_chat_for_item(item_key: str) -> dict[str, Any]:
               f"'{subj}'. Проведи инкрементальный триаж/анализ, подготовь разбор ревью "
               f"для PS{cur_ps} и запиши вердикт через triage_store.py save-review."
           )
-          rec["review_target_ps"] = cur_ps
-          rec["chat_busy"] = True
-          rec["chat_woken_ts"] = time.time()
-          wake_conversation(active_cid, wake_msg)
-          save_watcher_state(state)
-          return {
-              "ok": True,
-              "already_existed": True,
-              "woken": True,
-              "conversation_id": active_cid,
-              "chat_url": f"{jetski_box_url()}/c/{active_cid}",
-          }
+          woken = wake_conversation(active_cid, wake_msg)
+          if woken:
+            rec["review_target_ps"] = cur_ps
+            rec["chat_busy"] = True
+            rec["chat_woken_ts"] = time.time()
+            save_watcher_state(state)
+            return {
+                "ok": True,
+                "already_existed": True,
+                "woken": True,
+                "conversation_id": active_cid,
+                "chat_url": f"{jetski_box_url()}/c/{active_cid}",
+            }
       save_watcher_state(state)
     return {
         "ok": True,
@@ -6421,6 +6740,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     background: color-mix(in srgb, var(--green) 16%, transparent);
     color: var(--green);
   }
+  .badge.self-reviewed {
+    background: color-mix(in srgb, var(--blue) 14%, transparent);
+    color: var(--blue);
+  }
+  .badge.self-approved {
+    background: color-mix(in srgb, var(--green) 16%, transparent);
+    color: var(--green);
+  }
   .eyebrow .fix-stage-pill {
     display: inline-flex; align-items: center; padding: 1px 6px; border-radius: 980px;
     font-size: 10px; font-weight: 600;
@@ -6711,7 +7038,7 @@ function link(url, html, cls, title) {
   return url ? `<a${c}${t} href="${esc(url)}" target="_blank" rel="noopener">${html}</a>` : html;
 }
 
-function shortActor(raw) {
+function shortActor(raw, it) {
   const s = String(raw || '');
   // CQ and Gerrit service accounts all read as one bot
   if (
@@ -6722,7 +7049,19 @@ function shortActor(raw) {
   ) {
     return 'SkCQ';
   }
-  return s.split('@')[0];
+  if (it) {
+    if (it.last_msg_author_name && s === String(it.last_msg_author || '')) {
+      return String(it.last_msg_author_name);
+    }
+    if (it.owner_name && s === String(it.owner_email || '')) {
+      return String(it.owner_name);
+    }
+  }
+  const local = s.split('@')[0];
+  if (local.length <= 2 && s.includes('@')) {
+    return s;
+  }
+  return local;
 }
 
 // Maps a Gerrit email, GitHub login, or Piper LDAP to the page that profiles that person
@@ -6813,10 +7152,48 @@ function visibleItemsFromData(data) {
   });
 }
 
+function selfReviewBadgeHtml(it) {
+  if (!it || it.is_self || isCompanion(it)) return '';
+  if (it.status === 'MERGED' || it.status === 'ABANDONED' || it.status === 'CLOSED') return '';
+  const out = [];
+  const curPs = Number(it.patchset || 1);
+  const revPs = Number(it.self_review_ps || it.self_approval_ps || 0);
+  const cmtCount = Number(it.self_comment_count || 0);
+  const cmtPart = cmtCount > 0 ? ` (${cmtCount} comment${cmtCount === 1 ? '' : 's'})` : '';
+  if (it.self_approved || it.self_review_state === 'approved') {
+    const psPart = revPs > 0 ? ` (PS${revPs})` : '';
+    out.push(`<span class="badge self-approved">✓ You gave CR+1${esc(psPart)}</span>`);
+  } else if (it.self_review_state === 'commented' || it.self_review_state === 'changes_requested') {
+    const baseLabel = revPs > 0
+      ? `💬 Reviewed PS${revPs}${cmtPart}`
+      : `💬 Reviewed${cmtPart}`;
+    if (revPs > 0 && curPs > revPs && it.kind === 'gerrit' && it.url) {
+      const diffUrl = `${it.url.replace(/\/+$/, '')}/${revPs}..${curPs}`;
+      const text = `${esc(baseLabel)} → PS${esc(curPs)} uploaded`;
+      out.push(link(diffUrl, text, 'badge self-reviewed', `Open diff PS${revPs}..PS${curPs}`));
+    } else {
+      const text = (revPs > 0 && curPs > revPs)
+        ? `${esc(baseLabel)} → PS${esc(curPs)} uploaded`
+        : esc(baseLabel);
+      out.push(`<span class="badge self-reviewed">${text}</span>`);
+    }
+  }
+  if (it.author_replied_to_me) {
+    const tot = Number(it.self_threads_total || 0);
+    const res = Number(it.self_threads_resolved || 0);
+    const threadPart = tot > 0 ? ` · ${res}/${tot} resolved` : '';
+    const tip = it.author_reply_snippet ? `Author reply: ${it.author_reply_snippet}` : 'Author replied to your review comment';
+    out.push(`<span class="badge self-reviewed" title="${esc(tip)}">↩ Author replied${esc(threadPart)}</span>`);
+  }
+  return out.join('');
+}
+
 function badgesHtml(it, opts) {
   const out = [];
   const wip = wipLabel(it);
   if (wip) out.push(`<span class="badge wip">${esc(wip)}</span>`);
+  const selfRev = selfReviewBadgeHtml(it);
+  if (selfRev) out.push(selfRev);
   if (isCompanion(it)) {
     const refLabel = it.companion_to_label || String(it.companion_to).replace(/^.*:/, '#');
     const text = `Companion → ${esc(refLabel)}`;
@@ -7062,7 +7439,7 @@ function reviewerGapHtml(it) {
   }
   const missApp = Number(it.missing_approvals || 0);
   const approved = Number(it.approved_count || 0);
-  if (missApp > 0 && reqApp > 1 && approved > 0) {
+  if (missApp > 0 && reqApp > 1 && (approved > 0 || !it.is_self)) {
     return `<span class="amber">Needs +${missApp} CR (${approved}/${reqApp})</span>`;
   }
   return '';
@@ -7248,10 +7625,19 @@ function incidentHtml(h) {
 
 function waitingOnHtml(it) {
   const people = (it.waiting_on || []).map(p => {
-    const who = link(actorUrl(it, p.id), esc(shortActor(p.id)));
+    const who = link(actorUrl(it, p.id), esc(shortActor(p.id, it)));
     return p.active ? who : `<s>${who}</s> (left Google)`;
   });
-  return people.length ? `Waiting on <b>${people.join(', ')}</b>` : '';
+  if (people.length) return `Waiting on <b>${people.join(', ')}</b>`;
+  if (!it.is_self &&
+      (it.self_review_state === 'commented' || it.self_review_state === 'changes_requested')) {
+    const authorWho = link(
+      actorUrl(it, it.owner_email || it.owner_name),
+      esc(shortActor(it.owner_email || it.owner_name, it))
+    );
+    return `Waiting on <b>${authorWho}</b>`;
+  }
+  return '';
 }
 
 // Formats per-reviewer ping status for the row state column
@@ -8137,7 +8523,7 @@ function focusCard(it, data) {
     if (it.phase === 'ALERT_CQ_FAILED') {
       why = `${redConflict} · ${link(checksUrl(it), 'Checks failed')} · ${formatStatusTime(it)}`;
     } else if (needsMyReply(it)) {
-      const from = link(actorUrl(it, it.last_msg_author), esc(shortActor(it.last_msg_author)));
+      const from = link(actorUrl(it, it.last_msg_author), esc(shortActor(it.last_msg_author, it)));
       const snippet = esc(String(it.last_msg_snippet || '').replace(/^Patch Set \d+:\s*/, ''));
       why = `${redConflict} · <b>${from}</b> · ${formatStatusTime(it, '', it.last_msg_age)}: ` +
         snippet;
@@ -8150,7 +8536,7 @@ function focusCard(it, data) {
     why = `The commit queue failed · ${formatStatusTime(it)}`;
     actions = link(checksUrl(it), 'See checks', 'btn primary') + chatBtn;
   } else {
-    const from = link(actorUrl(it, it.last_msg_author), esc(shortActor(it.last_msg_author)));
+    const from = link(actorUrl(it, it.last_msg_author), esc(shortActor(it.last_msg_author, it)));
     const snippet = esc(String(it.last_msg_snippet || '').replace(/^Patch Set \d+:\s*/, ''));
     const msgWhy = `<b>${from}</b> · ${formatStatusTime(it, '', it.last_msg_age)}: ${snippet}`;
     why = it.merge_conflict ? `<span class="red">${conflictNote}</span> · ${msgWhy}` : msgWhy;
