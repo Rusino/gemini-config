@@ -138,6 +138,7 @@ def integrity(att, cfg_data, args):
         issues.append((WARNING, 'no run_attestation.json: load average, Chrome version and '
                                 'build provenance are unknown'))
     renderers, require_gpu = {}, bool(att and att['args'].get('require_gpu'))
+    untraced = set()
     for cfg, data in cfg_data.items():
         expected = att['rounds'] if att else None
         counts = {}
@@ -155,7 +156,10 @@ def integrity(att, cfg_data, args):
                     continue
                 if any(ln.startswith('GALLERY_FAILED') for ln in x['run']['lines']):
                     issues.append((WARNING, f'{tag}: GALLERY_FAILED (scenario threw)'))
-                if not x['hasTrace']:
+                # Control runs skip the trace on purpose: only FrameTiming and /proc CPU there
+                if x['run'].get('config', {}).get('trace') is False:
+                    untraced.add(f'`{name}`')
+                elif not x['hasTrace']:
                     issues.append((WARNING, f'{tag}: no trace, trace metrics empty'))
                 want_wp = x['run'].get('mode') == 'wp'
                 if a.get('webParagraph') is not want_wp:
@@ -217,6 +221,9 @@ def integrity(att, cfg_data, args):
             issues.append((WARNING, f'engines mix build modes {sorted(modes)}'))
         if att.get('aborted'):
             issues.append((INVALID, f"run aborted: {att['aborted']}"))
+    if untraced:
+        issues.append((INFO, f'runs without a trace by design ({", ".join(sorted(untraced))}): '
+                             'renderer main and GPU proc busy empty there'))
     done = [x for d in cfg_data.values() for runs in d.values() for x in runs.values()
             if x['done']]
     if done and not any(x['hasCpu'] for x in done):

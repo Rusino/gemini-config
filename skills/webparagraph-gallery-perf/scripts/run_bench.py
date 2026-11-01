@@ -39,7 +39,8 @@ BUSY_COMM = ('ninja', 'clang', 'clang++', 'cc1plus', 'ld.lld', 'dart', 'dart2js'
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument('--engines', required=True,
-                    help='name:build_dir:mode,... (mode wp or skp; build_dir is build/web)')
+                    help='name:build_dir:mode[:notrace],... (mode wp or skp; build_dir is '
+                         'build/web; notrace runs without a Chrome trace)')
     ap.add_argument('--configs', default='base', help=','.join(CONFIGS))
     ap.add_argument('--rounds', type=int, default=6)
     ap.add_argument('--out', required=True)
@@ -106,13 +107,13 @@ def main():
         sys.exit(f'Chrome not found: {chrome!r}; pass --chrome')
     engines = []
     for spec in args.engines.split(','):
-        name, build, mode = spec.split(':')
-        if mode not in ('wp', 'skp'):
-            sys.exit(f'bad mode {mode!r} in {spec!r}')
+        name, build, mode, *opt = spec.split(':')
+        if mode not in ('wp', 'skp') or opt not in ([], ['notrace']):
+            sys.exit(f'bad mode or option in {spec!r}')
         build = os.path.abspath(build)
         if not os.path.exists(os.path.join(build, 'main.dart.js')):
             sys.exit(f'{build} has no main.dart.js; pass the build/web copy')
-        engines.append((name, build, mode))
+        engines.append((name, build, mode, bool(opt)))
     configs = args.configs.split(',')
     for c in configs:
         if c not in CONFIGS:
@@ -127,8 +128,9 @@ def main():
         'chrome': chrome,
         'chromeVersion': chrome_version(chrome),
         'args': vars(args),
-        'engines': [{'name': n, 'build': b, 'mode': m, 'attestation': read_build_attestation(b)}
-                    for n, b, m in engines],
+        'engines': [{'name': n, 'build': b, 'mode': m, 'trace': not nt,
+                     'attestation': read_build_attestation(b)}
+                    for n, b, m, nt in engines],
         'configs': configs,
         'rounds': args.rounds,
         'start': snapshot(),
@@ -161,10 +163,10 @@ def main():
         print(f'=== {cfg} {time.strftime("%H:%M:%S")}', flush=True)
         for rep in range(1, args.rounds + 1):
             k = rep % len(engines)
-            for name, build, mode in engines[k:] + engines[:k]:
+            for name, build, mode, notrace in engines[k:] + engines[:k]:
                 prefix = os.path.join(out, f'{name}_{rep}')
                 cmd = [sys.executable, os.path.join(HERE, 'drive_gallery.py'), build, prefix,
-                       mode, *common, *CONFIGS[cfg]]
+                       mode, *common, *CONFIGS[cfg], *(['--no-trace'] if notrace else [])]
                 rec = {'config': cfg, 'round': rep, 'engine': name, 'mode': mode,
                        'before': snapshot(), 'attempts': []}
                 for attempt in (1, 2):

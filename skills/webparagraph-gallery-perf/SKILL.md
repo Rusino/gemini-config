@@ -99,6 +99,28 @@ Writes `results/compare.md`; prints the Integrity verdict. Options: `--configs`,
 > Paste the Run Attestation and Integrity Check sections verbatim when reporting. Do not draw
 > conclusions from a run whose verdict is `INVALID`, and say so explicitly for `WARNING`.
 
+In a human-readable report built from `compare.md` (not the verbatim attestation), call the
+variants by what they change ("WebParagraph without FillTextRuns"), not by engine names (`c0`,
+`c1`), commit hashes or roadmap numbers; keep those only in a reproducibility section, with words.
+Prefix CL and issue numbers with their system name (`Chromium CL 8664078`).
+
+### Tracing overhead control
+
+Add an engine spec suffix `:notrace` to run the same build without a Chrome trace
+(`drive_gallery.py --no-trace`). Untraced runs have no renderer main / GPU proc busy, so compare
+traced vs untraced on `build (FrameTiming)`, `CPU all Chrome` and the real-time 60 Hz table:
+
+```bash
+E=skpt:builds/build_c1:skp,skpn:builds/build_c1:skp:notrace
+E=$E,wpt:builds/build_c1:wp,wpn:builds/build_c1:wp:notrace
+python3 $S/run_bench.py --out results_notrace --rounds 6 --configs base,dpr3 --engines $E ...
+python3 $S/compare.py results_notrace \
+  --pairs "trace WP=wpt/wpn,trace SkP=skpt/skpn,WP/SkP traced=wpt/skpt,WP/SkP untraced=wpn/skpn"
+```
+
+If the WP/SkP ratios with and without the trace agree within their CIs, the trace does not bias
+the comparison. The Integrity Check reports untraced runs as INFO.
+
 ### Smoke test on Cloudtop (no GPU)
 
 ```bash

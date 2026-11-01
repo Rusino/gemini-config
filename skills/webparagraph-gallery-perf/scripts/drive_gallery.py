@@ -3,7 +3,8 @@
 # records a Chrome trace (toplevel + user timing), samples per-process CPU time
 # from /proc (Linux), and collects GALLERY_* console lines.
 # Usage: drive_gallery.py <build/web dir> <out prefix> wp|skp [flags]
-# Writes <out prefix>.json and <out prefix>.trace.json.gz; exit 0 only on GALLERY_DONE
+# Writes <out prefix>.json and <out prefix>.trace.json.gz (no trace with --no-trace); exit 0
+# only on GALLERY_DONE
 import argparse
 import asyncio
 import base64
@@ -45,6 +46,8 @@ def main():
                     help='hide the session DBus from Chrome (over SSH it can stall all navigation)')
     ap.add_argument('--chrome-flag', action='append', default=[],
                     help='extra Chrome flag, e.g. --chrome-flag=--use-angle=gl-egl')
+    ap.add_argument('--no-trace', action='store_true',
+                    help='control runs: measure tracing overhead on FrameTiming and /proc CPU')
     args = ap.parse_args()
 
     SOFTWARE = ('swiftshader', 'llvmpipe', 'software', 'none', 'masked')
@@ -272,11 +275,12 @@ def main():
                 await console_ws.send(json.dumps({
                     'id': 2, 'method': 'Emulation.setCPUThrottlingRate',
                     'params': {'rate': args.cpu_throttle}}))
-            await call('Tracing.start', {
-                'transferMode': 'ReturnAsStream',
-                'traceConfig': {'recordMode': 'recordAsMuchAsPossible',
-                                'includedCategories': ['toplevel', 'blink.user_timing']},
-            })
+            if not args.no_trace:
+                await call('Tracing.start', {
+                    'transferMode': 'ReturnAsStream',
+                    'traceConfig': {'recordMode': 'recordAsMuchAsPossible',
+                                    'includedCategories': ['toplevel', 'blink.user_timing']},
+                })
             threading.Thread(target=sample_cpu, daemon=True).start()
             # The page is opened from the command line: a second tab created over
             # CDP can end up in the background with throttled rAF and stall
@@ -288,20 +292,21 @@ def main():
                     failed.set()
                     break
                 await asyncio.sleep(0.2)
-            await call('Tracing.end')
-            while True:
-                m = await events.get()
-                if m.get('method') == 'Tracing.tracingComplete':
-                    stream = m['params']['stream']
-                    break
-            with gzip.open(args.out_prefix + '.trace.json.gz', 'wb') as f:
+            if not args.no_trace:
+                await call('Tracing.end')
                 while True:
-                    r = (await call('IO.read', {'handle': stream, 'size': 4 << 20}))['result']
-                    data = r['data']
-                    f.write(base64.b64decode(data) if r.get('base64Encoded') else data.encode())
-                    if r.get('eof'):
+                    m = await events.get()
+                    if m.get('method') == 'Tracing.tracingComplete':
+                        stream = m['params']['stream']
                         break
-            await call('IO.close', {'handle': stream})
+                with gzip.open(args.out_prefix + '.trace.json.gz', 'wb') as f:
+                    while True:
+                        r = (await call('IO.read', {'handle': stream, 'size': 4 << 20}))['result']
+                        data = r['data']
+                        f.write(base64.b64decode(data) if r.get('base64Encoded') else data.encode())
+                        if r.get('eof'):
+                            break
+                await call('IO.close', {'handle': stream})
             try:
                 await asyncio.wait_for(call('Browser.close'), 5)
             except Exception:
@@ -327,7 +332,8 @@ def main():
     with open(args.out_prefix + '.json', 'w') as f:
         json.dump({'lines': lines, 'marks': marks, 'cpu': cpu_samples, 'mode': args.mode,
                    'config': {'dpr': args.dpr, 'cpuThrottle': args.cpu_throttle,
-                              'chromeFlags': args.chrome_flag}}, f)
+                              'chromeFlags': args.chrome_flag,
+                              'trace': not args.no_trace}}, f)
     sys.exit(0 if ok and done.is_set() and not failed.is_set() else 1)
 
 
