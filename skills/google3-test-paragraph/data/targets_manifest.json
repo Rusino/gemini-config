@@ -1,0 +1,41 @@
+{
+  "generated_at": "2026-11-02T21:40:00Z",
+  "base_cl": 1012150572,
+  "g3_skia_revision": "e5ad3868b8dbc2d3b5d4048232af74041a04a595",
+  "bfs_depth": 4,
+  "slow_threshold_sec": 600,
+  "seeds": [
+    "//third_party/skia/HEAD:skparagraph_harfbuzz_skunicode",
+    "//third_party/skia/HEAD/modules/skparagraph:skparagraph_harfbuzz_skunicode",
+    "//third_party/skia/HEAD/modules/skparagraph/src:srcs",
+    "//third_party/skia/HEAD/modules/skparagraph/include:hdrs",
+    "//third_party/skia/HEAD:skunicode_icu",
+    "//third_party/skia/HEAD/modules/skunicode:skunicode_core",
+    "//third_party/skia/HEAD/modules/skunicode:skunicode_icu",
+    "//third_party/skia/HEAD/modules/skunicode:skunicode_apple",
+    "//third_party/skia/HEAD/modules/skunicode/src:srcs",
+    "//third_party/skia/HEAD/modules/skunicode/src:icu_core_srcs",
+    "//third_party/skia/HEAD/modules/skunicode/src:icu_bidi_srcs",
+    "//third_party/skia/HEAD/modules/skunicode/src:bidi_full_srcs",
+    "//third_party/skia/HEAD/modules/skunicode/src:bidi_subset_srcs",
+    "//third_party/skia/HEAD/modules/skunicode/src:builtin_srcs",
+    "//third_party/skia/HEAD/modules/skunicode/src:runtime_srcs",
+    "//third_party/skia/HEAD/modules/skunicode/src:apple_srcs",
+    "//third_party/skia/HEAD/modules/skunicode/include:core_hdrs",
+    "//third_party/skia/HEAD/modules/skunicode/include:icu_hdrs",
+    "//third_party/skia/HEAD/modules/skunicode/include:apple_hdrs"
+  ],
+  "excluded_branches": [
+    "//third_party/flutter_engine:skia",
+    "//third_party/skia/HEAD:skia_build_test"
+  ],
+  "excluded_tag_regex": "manual|notap|no_presubmit",
+  "counts": {
+    "fast": 1137,
+    "slow": 13,
+    "total_runnable": 1150,
+    "manual_excluded": 741,
+    "canary_covered_runnable": 157,
+    "uncovered_runnable": 993
+  }
+}

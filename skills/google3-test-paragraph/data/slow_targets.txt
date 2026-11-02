@@ -1,0 +1,13 @@
+//googlex/gcam/creative_camera/video_storytelling/video_renderers/skottie_renderer:skottie_renderer_test
+//music/imagecomposition/service/listeningreview/stats/fillers/animations:stats_card_animation_filler_test
+//music/imagecomposition/service/musicanalytics:artist_recap_image_handler_test
+//music/imagecomposition/service/musicanalytics:get_analytics_image_handler_test
+//research/vision/ai4design/superbloom/ads/generation:ads_computer_demandgen_test
+//research/vision/ai4design/superbloom/ads/generation:ads_computer_interstitial_test
+//research/vision/ai4design/superbloom/ads/generation:ads_computer_pmax_test
+//research/vision/ai4design/superbloom/ads/generation:ads_computer_pmax_thumbnail_test
+//research/vision/ai4design/superbloom/ads/generation:ads_computer_square_test
+//research/vision/ai4design/superbloom/ads/generation:ads_computer_thumbnail_test
+//research/vision/ai4design/superbloom/ads/generation:ads_computer_tower_test
+//research/vision/ai4design/superbloom/ads/generation:ads_computer_uac_test
+//research/vision/ai4design/superbloom/ads/generation:ads_computer_ytsquare_test

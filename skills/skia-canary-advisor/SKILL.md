@@ -168,6 +168,20 @@ When a Skia diff touches `include/private/chromium/`, `src/text/gpu/SkChromeRemo
    git -C /usr/local/google/home/jlavrova/chromium/src/third_party/skia checkout -- .
    ```
 
+## Local Google3 Paragraph A/B Corpus (Fast Pre-Canary Check)
+
+`Canary-G3` runs a fixed TAP project list (`third_party/skia/METADATA`, ~55 min) that covers only
+157 of the 1,150 runnable transitive `google3` tests depending on `skparagraph` / `skunicode`
+(leaving 993 runnable tests uncovered). On Linux Cloudtop, when a CL modifies executable code or
+`BUILD.bazel` under `modules/skparagraph/` or `modules/skunicode/`, run `google3-test-paragraph`
+fast tier (~10–13 min per leg, no Piper CL created) before or alongside `Canary-G3`:
+```bash
+python3 ~/.gemini/config/skills/google3-test-paragraph/scripts/run_g3_paragraph_tests.py \
+  --out /tmp/g3_paragraph_tests \
+  baseline=G3_HEAD \
+  cand=cl:<change>/<ps>
+```
+
 ## Canary-Flutter is disabled
 
 Never trigger `Canary-Flutter` (R38: it runs but gives no verdict, every run ends in
