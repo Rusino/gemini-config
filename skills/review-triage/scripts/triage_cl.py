@@ -14,6 +14,8 @@ and ready-to-copy review drafts in English.
 
 import argparse
 import base64
+from datetime import datetime, timezone
+import heapq
 import json
 import os
 import re
@@ -142,10 +144,176 @@ REVIEWER_NAMES = {"Julia Lavrova"}
 def is_self_author(author_obj):
     if not isinstance(author_obj, dict):
         return False
-    return (
-        author_obj.get("email") in REVIEWER_EMAILS
-        or author_obj.get("name") in REVIEWER_NAMES
-    )
+    email = (author_obj.get("email") or "").strip().lower()
+    self_emails = {e.lower() for e in REVIEWER_EMAILS}
+    return email in self_emails or author_obj.get("name") in REVIEWER_NAMES
+
+
+def _is_same_account(a, b):
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    aid = a.get("_account_id")
+    bid = b.get("_account_id")
+    if aid is not None and bid is not None and aid == bid:
+        return True
+    ae = (a.get("email") or "").strip().lower()
+    be = (b.get("email") or "").strip().lower()
+    return bool(ae and ae == be)
+
+
+def _role_label(author_obj, owner_obj):
+    if is_self_author(author_obj):
+        return "you"
+    if _is_same_account(author_obj, owner_obj):
+        return "author"
+    return "reviewer"
+
+
+def _parse_gerrit_ts(ts_str):
+    if not ts_str or not isinstance(ts_str, str):
+        return None
+    s = ts_str.strip()
+    try:
+        # Trim Gerrit 9-digit nanoseconds down to 6-digit microseconds for fromisoformat
+        if len(s) >= 26 and s[19] == ".":
+            frac = re.match(r"^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})\.(\d+)", s)
+            if frac:
+                us = (frac.group(3) + "000000")[:6]
+                return datetime.fromisoformat(
+                    f"{frac.group(1)}T{frac.group(2)}.{us}+00:00"
+                )
+        clean = s.replace("Z", "+00:00")
+        if len(clean) == 19 and clean[10] == " ":
+            return datetime.strptime(clean, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        dt = datetime.fromisoformat(clean)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _short_excerpt(text, limit=140):
+    collapsed = " ".join(str(text or "").split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[: limit - 3].rstrip() + "..."
+
+
+# Reconstruct Gerrit /comments threads via in_reply_to and return unresolved threads with tags
+def extract_open_threads(detail, inline_comments, cur_ps):
+    if not isinstance(inline_comments, dict):
+        return []
+    owner_obj = detail.get("owner") or {}
+    rev_created = {}
+    for r in (detail.get("revisions") or {}).values():
+        if not isinstance(r, dict):
+            continue
+        num = int(r.get("_number") or 0)
+        ts = _parse_gerrit_ts(r.get("created"))
+        if num > 0 and ts is not None:
+            rev_created[num] = ts
+
+    by_id = {}
+    children = {}
+    anon_idx = 0
+    for path, clist in inline_comments.items():
+        for raw in clist or []:
+            if not isinstance(raw, dict):
+                continue
+            cid = str(raw.get("id") or "")
+            if not cid:
+                anon_idx += 1
+                cid = f"_anon_{anon_idx}"
+            by_id[cid] = (path, raw)
+
+    for cid, (_, c) in by_id.items():
+        parent_id = str(c.get("in_reply_to") or "")
+        if parent_id and parent_id in by_id and parent_id != cid:
+            children.setdefault(parent_id, []).append(cid)
+
+    roots = [
+        cid for cid, (_, c) in by_id.items()
+        if not c.get("in_reply_to")
+        or str(c.get("in_reply_to")) not in by_id
+        or str(c.get("in_reply_to")) == cid
+    ]
+
+    open_threads = []
+    for root_id in roots:
+        root_path, root_c = by_id[root_id]
+        heap = [(str(root_c.get("updated") or ""), root_id)]
+        thread = []
+        visited = set()
+        while heap and len(visited) <= len(by_id):
+            _, cid = heapq.heappop(heap)
+            if cid in visited:
+                continue
+            visited.add(cid)
+            thread.append(by_id[cid])
+            for ch_id in children.get(cid, ()):
+                if ch_id not in visited:
+                    ch_c = by_id[ch_id][1]
+                    heapq.heappush(heap, (str(ch_c.get("updated") or ""), ch_id))
+        if not thread:
+            continue
+        _, leaf = thread[-1]
+        if not bool(leaf.get("unresolved", False)):
+            continue
+
+        if root_path == "/PATCHSET_LEVEL":
+            loc = "patchset"
+        else:
+            line_no = root_c.get("line")
+            if not line_no and isinstance(root_c.get("range"), dict):
+                line_no = root_c["range"].get("end_line") or root_c["range"].get("start_line")
+            loc = f"{root_path}:{line_no}" if line_no else root_path
+
+        root_ps = int(root_c.get("patch_set") or 0)
+        root_ts = _parse_gerrit_ts(root_c.get("updated"))
+        newest_ps_at_post = root_ps
+        if root_ts is not None and rev_created:
+            existing = [ps_n for ps_n, c_ts in rev_created.items() if c_ts <= root_ts]
+            if existing:
+                newest_ps_at_post = max(newest_ps_at_post, max(existing))
+        # Flag drafts/comments posted onto an older patchset after a newer patchset already existed
+        stale = bool(root_ps > 0 and newest_ps_at_post > root_ps)
+
+        root_author_obj = root_c.get("author") or {}
+        leaf_author_obj = leaf.get("author") or {}
+        root_role = _role_label(root_author_obj, owner_obj)
+        last_role = _role_label(leaf_author_obj, owner_obj)
+        reply_count = len(thread) - 1
+        author_replied = bool(reply_count > 0 and last_role == "author")
+        tags = []
+        if stale:
+            tags.append("STALE")
+        if author_replied:
+            tags.append("AUTHOR_REPLIED")
+
+        open_threads.append({
+            "id": root_id,
+            "path": root_path,
+            "line": root_c.get("line"),
+            "location": loc,
+            "root_author": root_author_obj.get("name") or root_author_obj.get("email") or "Unknown",
+            "root_email": root_author_obj.get("email") or "",
+            "root_role": root_role,
+            "patch_set": root_ps,
+            "current_ps": cur_ps,
+            "newest_ps_at_post": newest_ps_at_post,
+            "reply_count": reply_count,
+            "last_author": leaf_author_obj.get("name") or leaf_author_obj.get("email") or "Unknown",
+            "last_email": leaf_author_obj.get("email") or "",
+            "last_role": last_role,
+            "stale": stale,
+            "author_replied": author_replied,
+            "tags": tags,
+            "updated": str(root_c.get("updated") or ""),
+            "root_excerpt": _short_excerpt(root_c.get("message", "")),
+            "last_excerpt": _short_excerpt(leaf.get("message", "")) if reply_count > 0 else "",
+        })
+
+    open_threads.sort(key=lambda item: (item["updated"], item["location"], item["id"]))
+    return open_threads
 
 
 def extract_gerrit_thread_context(detail, inline_comments):
@@ -164,7 +332,7 @@ def extract_gerrit_thread_context(detail, inline_comments):
         if num:
             ps_map[num] = {"sha": sha, "ref": r.get("ref", "")}
 
-    owner_email = (detail.get("owner") or {}).get("email", "")
+    owner_obj = detail.get("owner") or {}
     last_reviewed_ps = None
     # A review on the current patchset (often a bare "Code-Review+1" message) means the CL is
     # already reviewed, not an initial review or a follow-up on an older patchset
@@ -190,11 +358,7 @@ def extract_gerrit_thread_context(detail, inline_comments):
         for u in re.findall(r"https://[^\s)>]+/\+/\d+", msg):
             if str(detail.get("_number", "")) not in u and u not in companion_urls:
                 companion_urls.append(u)
-        role = (
-            "YOU"
-            if is_self_author(author)
-            else ("AUTHOR" if author.get("email") == owner_email else "REVIEWER")
-        )
+        role = _role_label(author, owner_obj).upper()
         who = author.get("name", "Unknown")
         dialogue.append((m.get("date", ""), f"[PS{ps} {role} ({who})] {msg}"))
 
@@ -214,11 +378,7 @@ def extract_gerrit_thread_context(detail, inline_comments):
                 for u in re.findall(r"https://[^\s)>]+/\+/\d+", msg):
                     if str(detail.get("_number", "")) not in u and u not in companion_urls:
                         companion_urls.append(u)
-                role = (
-                    "YOU"
-                    if is_self_author(author)
-                    else ("AUTHOR" if author.get("email") == owner_email else "REVIEWER")
-                )
+                role = _role_label(author, owner_obj).upper()
                 who = author.get("name", "Unknown")
                 if path == "/PATCHSET_LEVEL":
                     loc = "patchset"
@@ -236,6 +396,7 @@ def extract_gerrit_thread_context(detail, inline_comments):
         for v in (info or {}).get("all") or []:
             if is_self_author(v) and v.get("value"):
                 self_votes.append(f"{label}{v['value']:+d}")
+    open_threads = extract_open_threads(detail, inline_comments, cur_ps)
     return {
         "current_ps": cur_ps,
         "current_sha": cur_sha,
@@ -248,6 +409,7 @@ def extract_gerrit_thread_context(detail, inline_comments):
         "self_votes": self_votes,
         "companion_urls": companion_urls,
         "dialogue": [item[1] for item in dialogue[-12:]],
+        "open_threads": open_threads,
     }
 
 
@@ -781,6 +943,35 @@ def generate_report(cl_data, analysis, files):
             f"`{corpus_gate['command']}` with exit code 0 (unless the user explicitly opted "
             f"out of corpus verification).\n"
         )
+
+    open_threads = tctx.get("open_threads") or []
+    if open_threads:
+        md.append(f"### 🧵 Open threads ({len(open_threads)} unresolved)")
+        if any(t.get("root_role") != "you" for t in open_threads):
+            md.append(
+                "> **Per-Thread Verdict Required:** Give each unresolved thread from another "
+                "reviewer an explicit verdict (`valid`, `already addressed in PS<n>` with "
+                "`file:line`, or `question for the user`)."
+            )
+        for t in open_threads:
+            tags = " ".join(f"`[{tg}]`" for tg in (t.get("tags") or []))
+            tag_prefix = f"{tags} " if tags else ""
+            email_str = f" (`{t['root_email']}`)" if t.get("root_email") else ""
+            ps_str = f"`PS{t['patch_set']}` vs current `PS{t['current_ps']}`"
+            if t.get("stale"):
+                ps_str += f" *(posted when `PS{t['newest_ps_at_post']}` existed)*"
+            if t.get("reply_count", 0) > 0:
+                last_str = f"last reply: **{t['last_role']}** (`{t['last_author']}`)"
+            else:
+                last_str = f"no replies (last: **{t['last_role']}**)"
+            md.append(
+                f"- {tag_prefix}`{t['location']}` — **{t['root_author']}**{email_str} "
+                f"on {ps_str} · {last_str}"
+            )
+            md.append(f"  - Root: \"{t['root_excerpt']}\"")
+            if t.get("reply_count", 0) > 0 and t.get("last_excerpt"):
+                md.append(f"  - Last reply (`{t['last_role']}`): \"{t['last_excerpt']}\"")
+        md.append("")
 
     if tctx.get("last_reviewed_ps") or tctx.get("dialogue") or tctx.get("reviewed_current_ps"):
         md.append("### 🔄 Follow-Up Patchset & Prior Review Thread")

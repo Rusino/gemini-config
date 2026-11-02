@@ -701,6 +701,114 @@ class TestCanaryAdvisor(unittest.TestCase):
       with patch.object(canary_advisor, "cmd_triage", return_value={"cl": 1412384}):
         self.assertEqual(canary_advisor.main(), 0)
 
+  def test_g3_change_approved_requests_detailed_labels_and_handles_str_args(self):
+    seen_paths = []
+
+    def fake_gerrit_json(path):
+      seen_paths.append(path)
+      has_detailed = "DETAILED_LABELS" in path
+      if "/changes/1409696/" in path:
+        cr = (
+            {"all": [{"value": 1, "email": "jlavrova@google.com"}]}
+            if has_detailed
+            else {"approved": {"_account_id": 8956}}
+        )
+        return {
+            "owner": {"email": "wselna123@gmail.com"},
+            "revisions": {},
+            "labels": {"Code-Review": cr},
+        }
+      if "/changes/1409999/" in path:
+        return {
+            "owner": {"email": "googler@google.com"},
+            "revisions": {
+                "sha4": {
+                    "ref": "refs/changes/99/1409999/4",
+                    "commit": {"author": {"email": "googler@google.com"}},
+                }
+            },
+            "labels": {},
+        }
+      raise AssertionError(f"unexpected path: {path}")
+
+    with patch.object(canary_advisor, "gerrit_json", side_effect=fake_gerrit_json):
+      self.assertTrue(canary_advisor.g3_change_approved("1409696", "4"))
+      self.assertTrue(canary_advisor.g3_change_approved("1409999", "4"))
+
+    self.assertTrue(all("o=DETAILED_LABELS" in p for p in seen_paths))
+    self.assertTrue(all("o=DETAILED_ACCOUNTS" in p for p in seen_paths))
+
+  def test_g3_chain_single_cl_no_related_and_triage_missing_approval(self):
+    missing_stdout = (
+        "Failed to run g3 try: changes must be either owned and authored by Googlers "
+        "or approved (CR+1) by a Googler"
+    )
+    sw_tasks = [{"name": "Canary-G3", "taskId": "task_1409696"}]
+
+    # Case 1: single external CL with empty related changes and no Googler CR+1 on PS4
+    def fake_unapproved_gerrit(path):
+      if path == "/changes/1409696/revisions/4/related":
+        return {"changes": []}
+      if path.startswith("/changes/1409696/detail?"):
+        self.assertIn("o=DETAILED_LABELS", path)
+        return {
+            "owner": {"email": "wselna123@gmail.com"},
+            "revisions": {
+                "sha4": {
+                    "_number": 4,
+                    "ref": "refs/changes/96/1409696/4",
+                    "commit": {"author": {"email": "wselna123@gmail.com"}},
+                }
+            },
+            "labels": {
+                "Code-Review": {
+                    "all": [
+                        {"value": 0, "email": "jlavrova@google.com"},
+                        {"value": 0, "email": "alexisdavidc@google.com"},
+                    ]
+                }
+            },
+        }
+      raise AssertionError(f"unexpected path: {path}")
+
+    with patch.object(canary_advisor, "gerrit_json", side_effect=fake_unapproved_gerrit):
+      self.assertEqual(canary_advisor.g3_chain("1409696", "4"), [(1409696, 4)])
+      self.assertEqual(canary_advisor.unapproved_g3_chain("1409696", "4"), [(1409696, 4)])
+      with patch.object(canary_advisor, "swarming_task_stdout", return_value=missing_stdout):
+        res = canary_advisor.triage_canary_g3_failure(
+            "1409696", "4", {"status": "FAILURE"}, sw_tasks, []
+        )
+    self.assertEqual(res["verdict"], "MISSING_APPROVAL")
+    self.assertEqual(res["missing"], [(1409696, 4)])
+    self.assertFalse(res.get("now_approved", False))
+    self.assertIn("missing on: 1409696/4", res["summary"])
+
+    # Case 2: Canary-G3 failed before CR+1, then Googler CR+1 was added before triage ran
+    def fake_now_approved_gerrit(path):
+      if path == "/changes/1409696/revisions/4/related":
+        return {"changes": []}
+      if path.startswith("/changes/1409696/detail?"):
+        self.assertIn("o=DETAILED_LABELS", path)
+        return {
+            "owner": {"email": "wselna123@gmail.com"},
+            "revisions": {},
+            "labels": {
+                "Code-Review": {"all": [{"value": 1, "email": "jlavrova@google.com"}]}
+            },
+        }
+      raise AssertionError(f"unexpected path: {path}")
+
+    with patch.object(canary_advisor, "gerrit_json", side_effect=fake_now_approved_gerrit):
+      with patch.object(canary_advisor, "swarming_task_stdout", return_value=missing_stdout):
+        res_now = canary_advisor.triage_canary_g3_failure(
+            1409696, 4, {"status": "FAILURE"}, sw_tasks, []
+        )
+    self.assertEqual(res_now["verdict"], "MISSING_APPROVAL")
+    self.assertEqual(res_now["missing"], [])
+    self.assertTrue(res_now["now_approved"])
+    self.assertNotIn("none found", res_now["summary"])
+    self.assertIn("git cl try -i 1409696", res_now["summary"])
+
 
 if __name__ == "__main__":
   unittest.main()

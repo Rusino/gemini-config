@@ -106,9 +106,16 @@ python3 ~/.gemini/config/skills/review-triage/scripts/triage_cl.py --diff-file /
 ## Mandatory Ruthless Audit & Skeptic Refutation Gate for Surviving CLs
 
 Triage output alone is never the final word. Every `🔴 SURGICAL AUDIT / CORE DOMAIN` CL (and any `🟠 PUSHBACK` CL where specific technical defects are cited alongside hygiene feedback; `🟢 MECHANICAL` and `🟡 REASSIGN` skip heavy subagent audits) must go through [`ruthless-code-audit`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/ruthless-code-audit/SKILL.md) and its **Stage 2.5 Skeptic Refutation Pass (`keeper_skeptic`)** before review drafts are presented:
-0. **Load Follow-Up Patchset Context & Commit Message (Pass to Any Auditor Subagent)**:
-   - Always inspect the `### 🔄 Follow-Up Patchset & Prior Review Thread` and `### 📜 Commit Message` sections emitted by `triage_cl.py` (and include them verbatim in the prompt of any subagent auditing the CL).
+0. **Load Follow-Up Context, Open Threads & Commit Message (Pass to Auditor Subagents)**:
+   - Always inspect the `### 🧵 Open threads`, `### 🔄 Follow-Up Patchset & Prior Review Thread`,
+     and `### 📜 Commit Message` sections emitted by `triage_cl.py` (and include them verbatim in
+     the prompt of any subagent auditing the CL).
    - **Follow-up mode (`PS > 1` with prior comments from `YOU`)**: Fetch both `last_reviewed_ref` and `current_ref`, inspect `git diff <last_reviewed_sha> <current_sha>`, and verify whether the author addressed the user's prior comments. **Never** contradict the user's earlier requests or ask to split out/revert code folded in from a companion WIP CL.
+   - **Other reviewers' unresolved threads (`### 🧵 Open threads`)**: Verify every unresolved
+     thread from another reviewer against the current patchset source (especially `[STALE]` threads
+     posted onto an older patchset after a newer patchset already existed, or `[AUTHOR_REPLIED]`
+     threads where the CL owner replied last) and report an explicit verdict (`valid`,
+     `already addressed in PS<n>` with `file:line`, or `question for the user`).
    - **Commit message grounding**: Read the full commit message before drafting comments; never ask the author to document something already explained in the commit message.
 1. Fetch the current patchset into a separate worktree per [`companion-cl-review` Phase 1](file:///usr/local/google/home/jlavrova/.gemini/config/skills/companion-cl-review/SKILL.md). To inspect baseline versions of modified files without switching branches, use `git cat-file -p <base_sha>:<path>`.
 2. Run Stage 1 (`ruthless_audit.py ... --diff <parent>`) and Stage 2 (semantic review of the pinpointed hunks against the full file, passing prior refuted findings from `finding_ledger.py`). For Skia C++ / text / font diffs, include `veteran-review` **lens mode** (`~/.gemini/config/skills/veteran-review/SKILL.md`, Steps 1–3) in the same Stage 2.5 packet.
@@ -236,3 +243,11 @@ named skill's `SKILL.md` was not read, when a report with a `Case 1-5` verdict l
    cards with the review verdict pill (`🟢 Review PS<N>: Clean`, `🟠 Review PS<N>: Defects + fix`,
    etc.) and finding summary. When running daily queue triage (`run_queue_triage.py`), save the
    pre-review audit via `triage_store.py save-audit --target <ID> --report-file <md>` (or `ingest-tmp`).
+10. **Explicit Per-Thread Verdict for Other Reviewers' Open Threads**: In daily queue summaries
+    (`run_queue_triage.py`) and review reports, never reduce an unresolved comment thread from
+    another reviewer (`### 🧵 Open threads`) to a one-line footnote without a verdict. Every
+    unresolved thread from another reviewer must get an explicit verdict: **`valid`** (defect or
+    concern still applies to the current patchset), **`already addressed in PS<n>`** citing the
+    exact `file:line` on the current patchset (especially when tagged `[STALE]` or
+    `[AUTHOR_REPLIED]`), or **`question for the user`** (policy/design call needing the user's
+    decision).

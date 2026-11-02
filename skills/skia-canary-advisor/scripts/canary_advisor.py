@@ -674,10 +674,14 @@ def swarming_tasks_for_cl(cl, ps, name=None):
 
 def g3_change_approved(change, patchset):
     # Same rule as IsTryChangeSafe in google3 chrome/skia/autoroller/try_service.py
-    detail = gerrit_json(f"/changes/{change}/detail?o=ALL_REVISIONS&o=ALL_COMMITS")
-    if detail["owner"].get("email", "").endswith("@google.com"):
+    change, patchset = int(change), int(patchset)
+    detail = gerrit_json(
+        f"/changes/{change}/detail?o=ALL_REVISIONS&o=ALL_COMMITS"
+        "&o=DETAILED_LABELS&o=DETAILED_ACCOUNTS"
+    )
+    if detail.get("owner", {}).get("email", "").endswith("@google.com"):
         ref = "refs/changes/%02d/%d/%d" % (change % 100, change, patchset)
-        rev = next((r for r in detail["revisions"].values() if r.get("ref") == ref), {})
+        rev = next((r for r in detail.get("revisions", {}).values() if r.get("ref") == ref), {})
         if rev.get("commit", {}).get("author", {}).get("email", "").endswith("@google.com"):
             return True
     votes = detail.get("labels", {}).get("Code-Review", {}).get("all", [])
@@ -687,7 +691,8 @@ def g3_change_approved(change, patchset):
 
 def g3_chain(cl, ps):
     """Returns ordered (change, patchset) chain cherry-picked by Canary-G3 for cl/ps."""
-    related = gerrit_json(f"/changes/{cl}/revisions/{ps}/related").get("changes", [])
+    resp = gerrit_json(f"/changes/{int(cl)}/revisions/{int(ps)}/related")
+    related = (resp.get("changes") if isinstance(resp, dict) else None) or []
     parent_of, by_commit = {}, {}
     for c in related:
         if c.get("status") in ("MERGED", "ABANDONED"):
@@ -895,12 +900,22 @@ def triage_canary_g3_failure(cl, ps, bb_build, sw_tasks, touched_files):
     stdout = swarming_task_stdout(tid)
     if "changes must be either owned and authored by Googlers" in stdout:
         missing = unapproved_g3_chain(cl, ps)
-        listed = ", ".join(f"{c}/{p}" for c, p in missing) or "none found (re-check votes)"
+        if missing:
+            listed = ", ".join(f"{c}/{p}" for c, p in missing)
+            summary = (
+                "google3 try service wants a Googler CR+1 on every unmerged change in the "
+                f"chain; missing on: {listed}"
+            )
+        else:
+            # Googler CR+1 landed after this failed tryjob ran, so Canary-G3 can be re-run now
+            summary = (
+                f"Canary-G3 failed before Googler CR+1 was present, but chain is now approved; "
+                f"re-trigger: git cl try -i {int(cl)} -B {BUCKET} -b Canary-G3"
+            )
         return {
             "verdict": "MISSING_APPROVAL", "our_part_passed": False, "task_id": tid,
-            "missing": missing,
-            "summary": f"google3 try service wants a Googler CR+1 on every unmerged change in the "
-                       f"chain; missing on: {listed}",
+            "missing": missing, "now_approved": not missing,
+            "summary": summary,
         }
     m_cl = re.search(r"http://cl/(\d+)", stdout)
     if not m_cl:
