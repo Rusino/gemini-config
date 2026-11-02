@@ -1344,6 +1344,250 @@ def was_doc_grounding_run_in_chat(
   return grounding_available
 
 
+def _unwrap_transcript_arg(val: object) -> object:
+  """Unwraps JSON-encoded scalar or object values stored in Jetski transcript tool_calls."""
+  if isinstance(val, str):
+    s = val.strip()
+    if (s.startswith('"') and s.endswith('"')) or (
+        s.startswith("{") and s.endswith("}")
+    ):
+      try:
+        return json.loads(s)
+      except Exception:
+        return s.strip('"').strip("'")
+  return val
+
+
+def hook_python_syntax_denial(tool_name: str, tool_args: dict) -> str:
+  """Blocks edits to hooks/*.py that introduce SyntaxError or ambiguous multi-matches."""
+  if tool_name not in EDIT_TOOLS:
+    return ""
+
+  raw_target = get_tool_target_file(tool_args)
+  if not raw_target:
+    return ""
+
+  clean_target = os.path.abspath(
+      os.path.expanduser(raw_target.strip().strip('"').strip("'"))
+  )
+  norm_target = clean_target.replace("\\", "/")
+  if not norm_target.endswith(".py") or "/.gemini/config/hooks/" not in norm_target:
+    return ""
+
+  existing_content = ""
+  if os.path.isfile(clean_target):
+    try:
+      with open(clean_target, "r", encoding="utf-8") as f:
+        existing_content = f.read()
+    except OSError:
+      return ""
+
+  base_name = os.path.basename(clean_target)
+  new_content: str | None = None
+  if tool_name in ("write_file", "write_to_file"):
+    if "Content" in tool_args:
+      body = str(tool_args.get("Content") or "")
+    elif "CodeContent" in tool_args:
+      body = str(tool_args.get("CodeContent") or "")
+    else:
+      return ""
+    new_content = (
+        existing_content + body if tool_args.get("Append") else body
+    )
+  elif tool_name in ("edit_file", "replace_file_content", "multi_replace_file_content"):
+    raw_chunks = tool_args.get("ReplacementChunks")
+    if isinstance(raw_chunks, list) and raw_chunks:
+      chunks = [c for c in raw_chunks if isinstance(c, dict)]
+    else:
+      chunks = [tool_args]
+
+    working = existing_content
+    for chunk in chunks:
+      target_str = str(
+          chunk.get("Target")
+          or chunk.get("TargetContent")
+          or chunk.get("target")
+          or ""
+      )
+      if not target_str:
+        return ""
+      if "Replacement" in chunk:
+        repl_str = str(chunk["Replacement"] or "")
+      elif "ReplacementContent" in chunk:
+        repl_str = str(chunk["ReplacementContent"] or "")
+      else:
+        repl_str = str(chunk.get("replacement") or "")
+
+      allow_multi = bool(chunk.get("AllowMultiple")) and tool_name != "edit_file"
+      start_ln = int(chunk.get("StartLine") or 0)
+      end_ln = int(chunk.get("EndLine") or 0)
+
+      if start_ln >= 1 and end_ln >= start_ln and tool_name != "edit_file":
+        lines = working.splitlines(keepends=True)
+        region = "".join(lines[start_ln - 1 : end_ln])
+        count = region.count(target_str)
+        if count == 0:
+          return f"[HOOK-SYNTAX GUARD] Target string not found in `{base_name}`!"
+        if count > 1 and not allow_multi:
+          return (
+              f"[HOOK-SYNTAX GUARD] Target string matches {count} occurrences in "
+              f"`{base_name}`! Multi-match replacements corrupt hook files; "
+              "provide a larger unique multi-line Target block."
+          )
+        replaced_region = region.replace(target_str, repl_str)
+        working = (
+            "".join(lines[: start_ln - 1])
+            + replaced_region
+            + "".join(lines[end_ln:])
+        )
+      else:
+        count = working.count(target_str)
+        if count == 0:
+          return f"[HOOK-SYNTAX GUARD] Target string not found in `{base_name}`!"
+        if count > 1 and not allow_multi:
+          return (
+              f"[HOOK-SYNTAX GUARD] Target string matches {count} occurrences in "
+              f"`{base_name}`! Multi-match replacements corrupt hook files; "
+              "provide a larger unique multi-line Target block."
+          )
+        working = working.replace(target_str, repl_str)
+    new_content = working
+
+  if new_content is not None:
+    try:
+      ast.parse(new_content, filename=clean_target)
+    except SyntaxError as err:
+      return (
+          f"[HOOK-SYNTAX GUARD] Proposed edit introduces a SyntaxError into "
+          f"`{base_name}` (line {err.lineno}: {err.msg})! "
+          "Edit blocked to prevent breaking lifecycle hooks."
+      )
+
+  return ""
+
+
+_DOC_URL_PATTERN = re.compile(
+    r"https://(?:docs\.google\.com/(?:document|spreadsheets|presentation)/d/|"
+    r"drive\.google\.com/(?:file/d/|open\?id=))"
+    r"([a-zA-Z0-9_-]{20,})"
+)
+_OUTGOING_MCP_TOOLS = (
+    "create_draft",
+    "update_draft",
+    "send_email",
+    "send_message",
+    "send_message_markdown",
+    "update_message",
+)
+
+
+def _collect_verified_doc_ids(steps: list[dict]) -> set[str]:
+  verified: set[str] = set()
+  for step in steps:
+    if step.get("type") != "PLANNER_RESPONSE":
+      continue
+    for tc in step.get("tool_calls") or []:
+      t_name = str(tc.get("name") or "")
+      t_args = tc.get("args") or {}
+      sub_tool = ""
+      sub_args: dict = {}
+      if t_name == "call_mcp_tool":
+        sub_tool = str(_unwrap_transcript_arg(t_args.get("ToolName", "")))
+        unwrapped_args = _unwrap_transcript_arg(t_args.get("Arguments"))
+        if isinstance(unwrapped_args, dict):
+          sub_args = unwrapped_args
+      elif any(
+          t_name.endswith(f"_{op}")
+          for op in ("get_file_permissions", "share_file")
+      ):
+        sub_tool = (
+            "get_file_permissions"
+            if t_name.endswith("_get_file_permissions")
+            else "share_file"
+        )
+        if isinstance(t_args, dict):
+          sub_args = {
+              k: _unwrap_transcript_arg(v) for k, v in t_args.items()
+          }
+
+      # Pre-existing docs may already have Alphabet/recipient access, so reading
+      # permissions counts alongside share_file without forcing a redundant write
+      if sub_tool in ("get_file_permissions", "share_file"):
+        fid = str(sub_args.get("fileId") or sub_args.get("file_id") or "")
+        if fid:
+          verified.add(fid)
+  return verified
+
+
+def unshared_google_doc_links_in_outgoing(
+    tool_name: str,
+    tool_args: dict,
+    transcript_path: str,
+    current_step_idx: int = -1,
+) -> list[str]:
+  """Returns doc IDs linked in outgoing mail/chat calls before permission verification."""
+  is_outgoing = False
+  blobs: list[str] = []
+
+  if tool_name == "call_mcp_tool":
+    sname = str(tool_args.get("ServerName", ""))
+    tname = str(tool_args.get("ToolName", ""))
+    if tname in _OUTGOING_MCP_TOOLS and any(
+        sub in sname for sub in ("gmail", "chat")
+    ):
+      is_outgoing = True
+      blobs.append(json.dumps(tool_args.get("Arguments") or {}, ensure_ascii=False))
+  elif any(
+      tool_name.endswith(f"_{op}") for op in _OUTGOING_MCP_TOOLS
+  ) and any(sub in tool_name for sub in ("gmail", "chat")):
+    is_outgoing = True
+    blobs.append(json.dumps(tool_args or {}, ensure_ascii=False))
+  elif tool_name == "run_command":
+    cmd = str(tool_args.get("CommandLine", ""))
+    exec_segs = _non_inspection_cmd_segments(cmd)
+    if re.search(
+        r"\bgmail\b.*\b(?:create-draft|update-draft|reply|send)\b", exec_segs
+    ):
+      is_outgoing = True
+      blobs.append(cmd)
+      file_refs = re.findall(r"--body-file(?:=|\s+)(\S+)", cmd)
+      file_refs.extend(re.findall(r"\$\(\s*cat\s+([^)|;&]+)\)", cmd))
+      for raw_ref in file_refs:
+        bpath = os.path.expanduser(raw_ref.strip().strip("'\""))
+        if os.path.isfile(bpath):
+          try:
+            with open(bpath, "r", encoding="utf-8", errors="ignore") as f:
+              blobs.append(f.read())
+          except OSError:
+            pass
+
+  if not is_outgoing or not blobs:
+    return []
+
+  found_doc_ids: set[str] = set()
+  for b in blobs:
+    found_doc_ids.update(_DOC_URL_PATTERN.findall(b))
+
+  if not found_doc_ids:
+    return []
+
+  if not transcript_path or not os.path.exists(transcript_path):
+    return sorted(found_doc_ids)
+
+  steps = _load_transcript_steps(transcript_path, current_step_idx)
+  verified_doc_ids = _collect_verified_doc_ids(steps)
+  missing = found_doc_ids - verified_doc_ids
+  if missing and transcript_path.endswith("transcript.jsonl"):
+    # Parallel tool batches with large file writes truncate tool_calls in transcript.jsonl
+    full_path = transcript_path[: -len("transcript.jsonl")] + "transcript_full.jsonl"
+    if os.path.isfile(full_path):
+      verified_doc_ids.update(
+          _collect_verified_doc_ids(_load_transcript_steps(full_path, current_step_idx))
+      )
+
+  return sorted(fid for fid in found_doc_ids if fid not in verified_doc_ids)
+
+
 # Cap consecutive source-file reads in a single main-chat turn without a subagent
 MAX_TURN_SOURCE_READ_CALLS = int(
     os.environ.get("JETSKI_MAX_TURN_SOURCE_READS", "15")
@@ -2940,6 +3184,11 @@ def main() -> None:
     if denial:
       print(json.dumps({"decision": "deny", "reason": denial}, ensure_ascii=False))
       return
+    # Reject hook edits that break Python syntax or match multiple sites before writing
+    syntax_denial = hook_python_syntax_denial(tool_name, tool_args)
+    if syntax_denial:
+      print(json.dumps({"decision": "deny", "reason": syntax_denial}, ensure_ascii=False))
+      return
 
   # Block edits or git commits inside another project's exclusive workspace root
   if tool_name in EDIT_TOOLS or tool_name == "run_command":
@@ -3455,6 +3704,31 @@ def main() -> None:
           )
       )
       return
+
+  # Block outgoing mail/chat links to Google Docs whose permissions were not checked in this chat
+  unshared_docs = unshared_google_doc_links_in_outgoing(
+      tool_name, tool_args, transcript_path, int(data.get("stepIdx", -1))
+  )
+  if unshared_docs:
+    docs_list = ", ".join(f"`{d}`" for d in unshared_docs)
+    print(
+        json.dumps(
+            {
+                "decision": "deny",
+                "reason": (
+                    f"[DOC-SHARE GUARD] Outgoing message links to Google Doc(s) {docs_list} "
+                    "without verifying or granting permissions in this chat! Before sending "
+                    "or creating the draft, call `google_drive_google_drive` -> "
+                    "`get_file_permissions(fileId)` to check current access, ensure the "
+                    "Alphabet audience (`permissionId: \"10969126254235447854\"`) has "
+                    "`role: \"commenter\"` via `share_file`, and grant every recipient (`To:`, "
+                    "`CC:`, or Chat recipient) `role: \"writer\"` via `share_file`."
+                ),
+            },
+            ensure_ascii=False,
+        )
+    )
+    return
 
   # Batch agent workflows (`parallel`/`pipeline` + `agent`) must gate outputs via
   # `advanced.verify` unless explicitly marked `# no-verify` for read-only discovery

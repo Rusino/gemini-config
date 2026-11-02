@@ -15,7 +15,9 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 
 import pre_tool_guard
 
-HOOK = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "hooks", "pre_tool_guard.py"))
+HOOK = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "hooks", "run_pre_tool_guard.py")
+)
 
 
 class TestPreToolGuard(unittest.TestCase):
@@ -1748,6 +1750,199 @@ class TestPreToolGuard(unittest.TestCase):
             "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}},
         })
         self.assertEqual(out.get("decision"), "allow", out)
+
+  def test_hook_python_syntax_denial_blocks_syntax_error(self):
+    target = os.path.expanduser("~/.gemini/config/hooks/dummy.py")
+    for tool, args in (
+        ("write_file", {"Path": target, "Content": "def bad_syntax(:\n  pass\n"}),
+        ("write_to_file", {"TargetFile": target, "CodeContent": "def bad_syntax(:\n  pass\n"}),
+    ):
+      with self.subTest(tool=tool):
+        out = pre_tool_guard.hook_python_syntax_denial(tool, args)
+        self.assertIn("[HOOK-SYNTAX GUARD]", out)
+        self.assertIn("SyntaxError", out)
+
+  def test_hook_python_syntax_denial_blocks_multimatch_edit(self):
+    with tempfile.NamedTemporaryFile(
+        dir=os.path.expanduser("~/.gemini/config/hooks"), suffix=".py", mode="w"
+    ) as f:
+      f.write("def f():\n  return 1\ndef g():\n  return 1\n")
+      f.flush()
+      out = pre_tool_guard.hook_python_syntax_denial(
+          "edit_file",
+          {"Path": f.name, "Target": "  return 1", "Replacement": "  return 2"},
+      )
+      self.assertIn("[HOOK-SYNTAX GUARD]", out)
+      self.assertIn("matches 2 occurrences", out)
+      scoped = pre_tool_guard.hook_python_syntax_denial(
+          "replace_file_content",
+          {
+              "TargetFile": f.name,
+              "TargetContent": "  return 1",
+              "ReplacementContent": "  return 2",
+              "StartLine": 1,
+              "EndLine": 2,
+          },
+      )
+      self.assertEqual(scoped, "")
+
+  def test_run_pre_tool_guard_fails_open_on_syntax_error(self):
+    hooks_dir = os.path.dirname(HOOK)
+    wrapper_src = os.path.join(hooks_dir, "run_pre_tool_guard.py")
+    self.assertTrue(os.access(wrapper_src, os.X_OK))
+    with open(os.path.join(hooks_dir, "..", "hooks.json"), encoding="utf-8") as hf:
+      cfg = json.load(hf)
+    cmds = [
+        h["command"]
+        for spec in cfg.values()
+        for entry in spec.get("PreToolUse", [])
+        for h in entry.get("hooks", [])
+    ]
+    self.assertIn("python3 ~/.gemini/config/hooks/run_pre_tool_guard.py", cmds)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      marker = os.path.join(tmp_dir, "marker.json")
+      wrapper_copy = os.path.join(tmp_dir, "run_pre_tool_guard.py")
+      with open(wrapper_src, encoding="utf-8") as src_f, open(
+          wrapper_copy, "w", encoding="utf-8"
+      ) as dst_f:
+        dst_f.write(src_f.read())
+      with open(os.path.join(tmp_dir, "pre_tool_guard.py"), "w", encoding="utf-8") as bad_f:
+        bad_f.write("def broken_guard(:\n  pass\n")
+      proc = subprocess.run(
+          [sys.executable, wrapper_copy],
+          input=json.dumps({
+              "conversationId": "c-broken",
+              "toolCall": {"name": "run_command", "args": {"CommandLine": "git status"}},
+          }),
+          capture_output=True,
+          text=True,
+          env={
+              **os.environ,
+              "ANTIGRAVITY_CONVERSATION_ID": "c-broken",
+              "JETSKI_PRE_TOOL_GUARD_MARKER": marker,
+          },
+          check=False,
+      )
+      self.assertEqual(proc.returncode, 0, proc.stderr)
+      self.assertEqual(json.loads(proc.stdout), {"decision": "allow"})
+      with open(marker, encoding="utf-8") as mf:
+        recorded = json.load(mf)
+      self.assertIn("SyntaxError", recorded["error"])
+      self.assertEqual(recorded["where"], "pre_tool_guard.py:1")
+
+  def test_unshared_google_doc_links_in_outgoing(self):
+    doc_id = "1CtA3d5kmp9njhzjlavFFAohQkSDqMG1WkcHJ9S1_O1c"
+    drive_id = "1v9KDb3WgPWQQGoMdS88qqTWF_l-rhFa2cjvxZHC4yh0"
+    url = f"https://docs.google.com/document/d/{doc_id}/edit"
+    drive_url = f"https://drive.google.com/file/d/{drive_id}/view"
+    with tempfile.NamedTemporaryFile("w+", suffix=".jsonl") as tf, tempfile.NamedTemporaryFile(
+        "w+", suffix=".html"
+    ) as bf:
+      bf.write(f'<p><a href="{drive_url}">Doc</a></p>')
+      bf.flush()
+      tf.write(
+          json.dumps({"step_index": 0, "type": "USER_INPUT", "content": "send email"}) + "\n"
+      )
+      tf.flush()
+      unshared_mcp = pre_tool_guard.unshared_google_doc_links_in_outgoing(
+          "call_mcp_tool",
+          {
+              "ServerName": "google_gmail_google_gmail",
+              "ToolName": "create_draft",
+              "Arguments": {"body": f"Please see {url}"},
+          },
+          tf.name,
+      )
+      self.assertEqual(unshared_mcp, [doc_id])
+
+      unshared_cli = pre_tool_guard.unshared_google_doc_links_in_outgoing(
+          "run_command",
+          {
+              "CommandLine": (
+                  f"/google/bin/releases/gemini-agents-gmail/gmail mutate create-draft "
+                  f"--html --body-file {bf.name}"
+              )
+          },
+          tf.name,
+      )
+      self.assertEqual(unshared_cli, [drive_id])
+
+      grep_only = pre_tool_guard.unshared_google_doc_links_in_outgoing(
+          "run_command",
+          {"CommandLine": f'grep "gmail create-draft {url}" notes.txt'},
+          tf.name,
+      )
+      self.assertEqual(grep_only, [])
+
+      # Shell mentions of "share" with the doc ID must not satisfy Drive MCP verification
+      tf.write(
+          json.dumps({
+              "step_index": 1,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {"CommandLine": json.dumps(f'echo "share {doc_id}"')},
+              }],
+          })
+          + "\n"
+      )
+      tf.flush()
+      still_unshared = pre_tool_guard.unshared_google_doc_links_in_outgoing(
+          "call_mcp_tool",
+          {
+              "ServerName": "google_gmail_google_gmail",
+              "ToolName": "create_draft",
+              "Arguments": {"body": f"Please see {url}"},
+          },
+          tf.name,
+      )
+      self.assertEqual(still_unshared, [doc_id])
+
+      # Real Jetski transcripts store scalar/object tool_calls args as JSON-encoded strings
+      tf.write(
+          json.dumps({
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [
+                  {
+                      "name": "call_mcp_tool",
+                      "args": {
+                          "ServerName": '"google_drive_google_drive"',
+                          "ToolName": '"get_file_permissions"',
+                          "Arguments": json.dumps({"fileId": doc_id}),
+                      },
+                  },
+                  {
+                      "name": "mcp_google_drive_google_drive_share_file",
+                      "args": {"fileId": json.dumps(drive_id), "role": '"commenter"'},
+                  },
+              ],
+          })
+          + "\n"
+      )
+      tf.flush()
+      allowed_mcp = pre_tool_guard.unshared_google_doc_links_in_outgoing(
+          "call_mcp_tool",
+          {
+              "ServerName": "google_gmail_google_gmail",
+              "ToolName": "create_draft",
+              "Arguments": {"body": f"Please see {url}"},
+          },
+          tf.name,
+      )
+      self.assertEqual(allowed_mcp, [])
+
+      allowed_cli = pre_tool_guard.unshared_google_doc_links_in_outgoing(
+          "run_command",
+          {
+              "CommandLine": (
+                  f"/google/bin/releases/gemini-agents-gmail/gmail mutate update-draft d1 "
+                  f'--html --body "$(cat {bf.name})"'
+              )
+          },
+          tf.name,
+      )
+      self.assertEqual(allowed_cli, [])
 
 
 if __name__ == "__main__":

@@ -25,9 +25,22 @@ Code has a compiler; prose documents do not, and incoming specs or code snippets
    - **Applies to**: Any edit, shortening, translation, or restructuring (>1 line or >15 words) of an existing document/artifact/spec that the user has already seen in earlier turns.
    - **Required Action**: Automatically run `python3 ~/.gemini/config/skills/redline/scripts/redline.py` against the last version the user saw, verify `<stem>_diff.html` via headless browser screenshot (`~/.gemini/config/skills/redline/SKILL.md`), and link `<stem>_diff.html` alongside the updated document without waiting to be asked.
 
-5. **Default Alphabet-Wide Sharing for Google Docs (`gdocs mutate share`)**:
-   - **Applies to**: Every Google Doc created or imported (`gdocs mutate create`, `gdocs mutate import-md`, `gdocs mutate copy`) for open-source / Skia / Flutter projects.
-   - **Required Action**: Immediately share the document with the `google.com` domain (`~/.gemini/antigravity/bin/gdocs mutate share <docID> --domain google.com --role commenter`) right after creation so anyone at Google/Alphabet can open and comment on it without access requests.
+5. **Google Docs Sharing on Creation & Linking (`google_drive_google_drive` -> `share_file`)**:
+   - **Applies to**: Every Google Doc created or copied (`create_file`, `copy_file`), and every
+     time a `docs.google.com` or `drive.google.com` link is inserted into an outgoing email
+     draft (`create_draft`), Google Chat message (`send_message`, `send_message_markdown`),
+     Buganizer comment, or Gerrit CL.
+   - **Required Action**:
+     1. Inspect current permissions via `google_drive_google_drive` ->
+        `get_file_permissions(fileId)`.
+     2. Ensure the **Alphabet** (`google.com`) target audience has `role: "commenter"` via
+        `share_file(fileId=..., permissionId="10969126254235447854", role="commenter")`
+        (use `get_audience_recommendations(fileId)` if the `permissionId` differs) so any Googler
+        opening or forwarding the link can view and comment without access requests.
+     3. When inserting the link into an email draft or Chat message addressed to specific
+        recipients (`To:`, `CC:`, or direct Chat recipients), also grant each recipient
+        `role: "writer"` via `share_file(fileId=..., emailAddress="<recipient>@google.com",`
+        `role="writer")` so they can edit directly and see the document in `Shared with me`.
 
 ## 2. Incoming & Outgoing Code (`amnesia-precommit`, Corpus Gate & KEEPER Invariants)
 

@@ -31,7 +31,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ~/.gemini/config/hooks/pre_tool_guard.py",
+            "command": "python3 ~/.gemini/config/hooks/run_pre_tool_guard.py",
             "timeout": 5
           }
         ]
