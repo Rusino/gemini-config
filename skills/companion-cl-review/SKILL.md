@@ -157,8 +157,17 @@ Never auto-publish the review comment to Gerrit or GitHub unless the user explic
 - Never resolve the old thread unless the user asks; if asked, resolve via a minimal "Done" reply in that thread.
 - **Save Review Verdict for Flight Deck (`triage_store.py`)**:
   Always save the review outcome (Case 1 `CLEAN`, Case 2 `NITS`, Case 3 `COMPANION_TESTS`, Case 4 `PUSHBACK`, Case 5 `COMPANION_FIX`) and a concise 1-line summary via:
-  `python3 ~/.gemini/config/scripts/triage_store.py save-review --target <CL_OR_PR> --patchset <PS> --outcome <CLEAN|NITS|COMPANION_TESTS|COMPANION_FIX|PUSHBACK> --summary "<1-line finding summary>"`
-  (passing `--draft "<draft text>"` or `--draft-file <path>`), so Flight Deck displays the verdict badge and summary immediately.
+  ```bash
+  python3 ~/.gemini/config/scripts/triage_store.py save-review \
+    --target <CL_OR_PR> --patchset <PS> \
+    --outcome <CLEAN|NITS|COMPANION_TESTS|COMPANION_FIX|PUSHBACK> \
+    --summary "<1-line finding summary>" \
+    [--corpus auto|not_required|required|pending|passed|failed|waived] \
+    [--compare-md <path/to/compare.md>]
+  ```
+  (passing `--draft "<draft text>"` or `--draft-file <path>`), so Flight Deck displays the verdict
+  badge and summary immediately while keeping `CLEAN`/`NITS`/`COMPANION_TESTS` amber
+  (`⏳ LGTM blocked`) until `compare.md` Run Attestation passes on that exact patchset.
 
 Structure the English review comment using this proven template:
 

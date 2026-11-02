@@ -4559,7 +4559,7 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
             # Include commits so author pushes after a review update the PR timeline,
             # and closingIssuesReferences for automatic PR <-> GitHub issue linking
             "commits,statusCheckRollup,labels,url,mergeable,reviewRequests,"
-            "closingIssuesReferences,createdAt,updatedAt,closedAt",
+            "closingIssuesReferences,createdAt,updatedAt,closedAt,files",
         ],
         stderr=subprocess.STDOUT,
         text=True,
@@ -5025,6 +5025,12 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         "is_watching": is_watching,
         "patchset": len(reviews) + 1,
         "revision": head_sha[:10],
+        # Expose changed PR paths so triage_store detects lib/web_ui/lib/ corpus gates
+        "files": sorted(
+            str(f.get("path") or "").strip()
+            for f in (d.get("files") or [])
+            if isinstance(f, dict) and f.get("path")
+        ),
         # Expose PR description text under commit_message for shared fix-for extractors
         "commit_message": str(d.get("body") or ""),
         # Combine GraphQL closingIssuesReferences with free-text Bug:/Fixes references
@@ -9082,10 +9088,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .eyebrow .verdict-pill.v-nits, .eyebrow .verdict-pill.v-companion_tests {
     background: color-mix(in srgb, var(--blue) 15%, transparent); color: var(--blue);
   }
-  .eyebrow .verdict-pill.v-companion_fix {
+  .eyebrow .verdict-pill.v-companion_fix, .eyebrow .verdict-pill.v-corpus_blocked {
     background: color-mix(in srgb, var(--amber) 18%, transparent); color: var(--amber);
   }
-  .eyebrow .verdict-pill.v-pushback {
+  .eyebrow .verdict-pill.v-pushback, .eyebrow .verdict-pill.v-corpus_failed {
     background: color-mix(in srgb, var(--red) 14%, transparent); color: var(--red);
   }
   .eyebrow .verdict-pill.v-reassign, .eyebrow .verdict-pill.v-stale {
@@ -9284,9 +9290,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     background: color-mix(in srgb, var(--blue) 15%, transparent);
     color: var(--blue);
   }
-  .badge.triage-companion_fix {
+  .badge.triage-companion_fix, .badge.triage-corpus_blocked {
     background: color-mix(in srgb, var(--amber) 18%, transparent);
     color: var(--amber);
+  }
+  .badge.triage-corpus_failed {
+    background: color-mix(in srgb, var(--red) 15%, transparent);
+    color: var(--red);
   }
   .card .triage-box {
     grid-column: 1 / -1; margin-top: 8px; padding: 6px 10px; border-radius: 8px;
@@ -9975,10 +9985,16 @@ function upstreamBlockersOf(it, data) {
     const tr = anc.triage;
     if (tr && !anc.self_approved) {
       const v = String(tr.review_outcome || tr.verdict || '').toUpperCase();
+      const cStat = effectiveCorpusStatus(anc);
       if (v === 'PUSHBACK' || v.includes('PUSHBACK') || v.includes('DO_NOT_LAND')) {
         reasons.push('Pushback');
       } else if (v === 'COMPANION_FIX' || v.includes('FIX')) {
         reasons.push('Companion fix');
+      // Unverified or failing corpus on an unapproved parent blocks approving child CLs
+      } else if (cStat === 'failed') {
+        reasons.push(`${corpusDisplayName(tr)} failed`);
+      } else if (cStat === 'pending' && GATED_LGTM_OUTCOMES.has(v)) {
+        reasons.push(`${corpusDisplayName(tr)} not run`);
       } else if (v === 'COMPANION_TESTS' || v.includes('TESTS')) {
         reasons.push('Companion tests');
       } else if (v === 'NITS' || v.includes('NITS')) {
@@ -10058,8 +10074,15 @@ function spineStepShortState(m) {
   if (m.chat_busy) return {short: 'Working', icon: '⏳', tone: 'spine-you'};
 
   const tr = m.triage;
-  if (tr && tr.review_outcome) {
+  // Stale reviews or unverified corpus gates must never mark a stack spine step green
+  if (tr && tr.review_outcome && !isTriageStale(m)) {
     const out = String(tr.review_outcome).toUpperCase();
+    const cStat = effectiveCorpusStatus(m);
+    if (GATED_LGTM_OUTCOMES.has(out) && tr.corpus_required) {
+      if (cStat === 'failed') return {short: 'Corpus fail', icon: '🔴', tone: 'spine-bad'};
+      if (cStat === 'pending') return {short: 'Corpus needed', icon: '⏳', tone: 'spine-warn'};
+      if (cStat === 'waived') return {short: 'Corpus waived', icon: '⚠️', tone: 'spine-warn'};
+    }
     if (out === 'CLEAN') return {short: 'Clean', icon: '🟢', tone: 'spine-ok'};
     if (out === 'NITS') return {short: 'NITS', icon: '🔵', tone: 'spine-warn'};
     if (out === 'COMPANION_FIX') return {short: 'Fix', icon: '🟠', tone: 'spine-warn'};
@@ -11019,11 +11042,110 @@ function closeTriageModal() {
   if (root) root.innerHTML = '';
 }
 
+// Review outcomes that encourage CR+1 and must block until the mandatory corpus gate passes
+const GATED_LGTM_OUTCOMES = new Set(['CLEAN', 'NITS', 'COMPANION_TESTS']);
+const OUTCOME_BADGES = {
+  CLEAN: ['🟢', 'Clean (LGTM)', 'Clean'],
+  NITS: ['🔵', 'Minor nits', 'Minor nits'],
+  COMPANION_TESTS: ['🟣', 'Logic OK + test companion', 'Logic OK + tests'],
+  COMPANION_FIX: ['🟠', 'Defects + companion fix', 'Defects + fix'],
+  PUSHBACK: ['🔴', 'Do not land / Pushback', 'Pushback'],
+  REASSIGN: ['⚪', 'Out of domain', 'Out of domain'],
+};
+
+function isTriageStale(it) {
+  const tr = it && it.triage;
+  if (!tr) return false;
+  if (tr.is_stale) return true;
+  const revPs = Number(tr.triaged_patchset || it.reviewed_ps || 0);
+  return revPs > 0 && Number(it.patchset || 0) > revPs;
+}
+
+function corpusDisplayName(tr) {
+  return (tr && tr.corpus_script === 'run_webparagraph_corpus.py')
+    ? 'WebParagraph corpus' : 'Flutter corpus';
+}
+
+// Evaluates corpus gate state and resets passed to pending if patchset or commit drifted
+function effectiveCorpusStatus(it) {
+  const tr = it && it.triage;
+  if (!tr || !tr.corpus_required) return 'not_required';
+  if (isTriageStale(it)) return 'pending';
+  const st = String(tr.corpus_status || '').toLowerCase();
+  if (st === 'failed' || st === 'waived') return st;
+  if (st === 'passed') {
+    const curPs = Number(it.patchset || tr.triaged_patchset || 1);
+    const testedPs = Number(tr.corpus_tested_patchset || tr.triaged_patchset || 0);
+    return (testedPs > 0 && curPs === testedPs) ? 'passed' : 'pending';
+  }
+  return 'pending';
+}
+
+// Computes triage badge and eyebrow labels without allowing green LGTM when corpus is blocked
+function triageBadgeInfo(it) {
+  const tr = (it && it.triage) || {};
+  const out = String(tr.review_outcome || tr.verdict || 'SURGICAL_AUDIT').toUpperCase();
+  const revPs = Number(tr.triaged_patchset || (it && it.reviewed_ps) || (it && it.patchset) || 1);
+  const curPs = Number((it && it.patchset) || 1);
+  const stale = isTriageStale(it);
+  const cName = corpusDisplayName(tr);
+  const cStat = effectiveCorpusStatus(it);
+  if (GATED_LGTM_OUTCOMES.has(out) && tr.corpus_required) {
+    if (stale) {
+      const eyebrow = curPs > revPs
+        ? `⏳ Review PS${revPs} → PS${curPs} uploaded (${cName} not run)`
+        : `⏳ Review PS${revPs} stale: new commit (${cName} not run)`;
+      return {
+        cls: 'triage-corpus_blocked', pillCls: 'v-corpus_blocked',
+        label: `⏳ LGTM blocked: ${cName} not run`, eyebrow,
+      };
+    }
+    if (cStat === 'pending') {
+      const lbl = `⏳ LGTM blocked: ${cName} not run`;
+      return {cls: 'triage-corpus_blocked', pillCls: 'v-corpus_blocked', label: lbl, eyebrow: lbl};
+    }
+    if (cStat === 'failed') {
+      const lbl = `🔴 LGTM blocked: ${cName} failed`;
+      return {cls: 'triage-corpus_failed', pillCls: 'v-corpus_failed', label: lbl, eyebrow: lbl};
+    }
+    if (cStat === 'waived') {
+      const short = (OUTCOME_BADGES[out] && OUTCOME_BADGES[out][2]) || out;
+      return {
+        cls: 'triage-corpus_blocked', pillCls: 'v-corpus_blocked',
+        label: `⚠️ ${short} (${cName} waived)`,
+        eyebrow: `⚠️ Review PS${revPs}: ${short} (${cName} waived)`,
+      };
+    }
+  }
+  const meta = OUTCOME_BADGES[out];
+  const rawEye = String(tr.review_eyebrow_label || '');
+  const baseEye = (rawEye && !rawEye.includes('LGTM blocked') && !rawEye.includes('waived'))
+    ? rawEye
+    : (meta ? `${meta[0]} Review PS${revPs}: ${meta[1]}`
+            : `Review PS${revPs}: ${tr.verdict_label || out}`);
+  const eyebrow = stale
+    ? (curPs > revPs ? `${baseEye} → PS${curPs} uploaded` : `${baseEye} (new commit)`)
+    : baseEye;
+  if (tr.review_outcome && meta) {
+    return {
+      cls: `triage-${out.toLowerCase()}`,
+      pillCls: stale ? 'v-stale' : `v-${out.toLowerCase()}`,
+      label: `${meta[0]} ${meta[1]}`, eyebrow,
+    };
+  }
+  return {
+    cls: `triage-${String(tr.verdict || 'SURGICAL_AUDIT').toLowerCase()}`,
+    pillCls: stale ? 'v-stale' : `v-${out.toLowerCase()}`,
+    label: String(tr.verdict_label || tr.verdict || 'SURGICAL AUDIT'), eyebrow,
+  };
+}
+
 function renderTriageModal(it) {
   const root = typeof document !== 'undefined'
     ? document.getElementById('triage-modal-root') : null;
   if (!root || !it || !it.triage) return;
   const tr = it.triage;
+  const bInfo = triageBadgeInfo(it);
   const key = it.item_key || it.target_id;
   const hasDraft = Boolean(tr.draft && tr.draft.trim());
   const activeTab = currentTriageModalTab || (hasDraft ? 'draft' : 'report');
@@ -11035,8 +11157,8 @@ function renderTriageModal(it) {
     <div class="triage-modal-backdrop" onclick="if (event.target === this) closeTriageModal()">
       <div class="triage-modal">
         <div class="triage-modal-head">
-          <span class="badge triage-${esc(String(tr.verdict || '').toLowerCase())}">
-            ${esc(tr.verdict_label || tr.verdict || '')}
+          <span class="badge ${esc(bInfo.cls)}">
+            ${esc(bInfo.label)}
           </span>
           <!-- Link CL identifier directly to review page -->
           <h3>${link(it.url, esc(clLabel(it)))}: ${esc(cleanSubject(it.subject))}</h3>
@@ -11105,18 +11227,26 @@ function triageHtml(it, compact) {
   if (!it || !it.triage) return '';
   if (it.status === 'MERGED' || it.status === 'ABANDONED' || it.status === 'CLOSED') return '';
   const tr = it.triage;
-  const v = esc(tr.verdict_label || tr.verdict || 'SURGICAL AUDIT');
-  const vCls = 'triage-' + esc(String(tr.verdict || 'SURGICAL_AUDIT').toLowerCase());
-  const badge = `<span class="badge ${vCls}">${v}</span>`;
+  const bInfo = triageBadgeInfo(it);
+  const badge = `<span class="badge ${esc(bInfo.cls)}">${esc(bInfo.label)}</span>`;
   const time = tr.review_time_label
     ? `<span class="triage-time">${esc(tr.review_time_label)}</span>` : '';
   const summary = tr.summary
     ? `<span class="triage-summary">${esc(tr.summary)}</span>` : '';
-  const stale = tr.is_stale
-    ? `<span class="badge triage-stale">Stale: PS${esc(tr.triaged_patchset || 1)} → ` +
-      `PS${esc(it.patchset || 1)}</span>`
+  const revPs = Number(tr.triaged_patchset || 1);
+  const curPs = Number(it.patchset || 1);
+  // GitHub PR pushes keep patchset=1 before any review, so distinguish commit drift from PS drift
+  const stale = isTriageStale(it)
+    ? `<span class="badge triage-stale">${curPs > revPs
+        ? `Stale: PS${esc(revPs)} → PS${esc(curPs)}`
+        : 'Stale: new commit pushed'}</span>`
     : '';
-  const meta = `<span class="triage-meta">PS${esc(tr.triaged_patchset || 1)} · ` +
+  // Surface explicit corpus pass confirmation next to the reviewed patchset
+  const cStat = effectiveCorpusStatus(it);
+  const corpusMeta = (!isTriageStale(it) && cStat === 'passed')
+    ? ` · ${esc(corpusDisplayName(tr))} OK`
+    : '';
+  const meta = `<span class="triage-meta">PS${esc(revPs)}${corpusMeta} · ` +
     `${esc(tr.triaged_at_et || '')}</span>`;
 
   const key = it.item_key || it.target_id;
@@ -11585,18 +11715,9 @@ if (typeof document !== 'undefined') {
 function reviewVerdictEyebrowHtml(it) {
   // Author and watching items do not display review outcome badges
   if (!isReviewerChange(it)) return '';
-  const tr = it.triage || null;
-  // Format explicit post-review verdict and mark stale if author uploaded a new PS
-  if (tr && tr.review_outcome) {
-    const out = String(tr.review_outcome).toUpperCase();
-    const revPs = Number(tr.triaged_patchset || it.reviewed_ps || it.patchset || 1);
-    const curPs = Number(it.patchset || 1);
-    const stale = curPs > revPs;
-    const baseLabel = tr.review_eyebrow_label ||
-      `Review PS${revPs}: ${tr.verdict_label || out}`;
-    const label = stale ? `${baseLabel} → PS${curPs} uploaded` : baseLabel;
-    const cls = stale ? 'v-stale' : `v-${out.toLowerCase()}`;
-    return `<span class="verdict-pill ${cls}">${esc(label)}</span> · `;
+  if (it.triage && it.triage.review_outcome) {
+    const bInfo = triageBadgeInfo(it);
+    return `<span class="verdict-pill ${esc(bInfo.pillCls)}">${esc(bInfo.eyebrow)}</span> · `;
   }
   // Fall back to active companion label when explicit review JSON is not yet saved
   if (Array.isArray(it.companions)) {
@@ -11630,7 +11751,7 @@ function cleanMsgSnippet(raw) {
 // Checks whether a completed review verdict for current PS should replace the trigger message
 function hasFreshReviewWithoutNewerReply(it) {
   if (!isReviewerChange(it) || !it.triage) return false;
-  if (it.triage.is_stale || !String(it.triage.summary || '').trim()) return false;
+  if (isTriageStale(it) || !String(it.triage.summary || '').trim()) return false;
   if (it.author_replied_to_me) return false;
   const author = String(it.last_msg_author || '');
   const isSelf = author.startsWith('jlavrova@') || author === 'Rusino';

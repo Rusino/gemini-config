@@ -29,6 +29,7 @@ SHARED_SCRIPTS_DIR = Path(__file__).resolve().parents[3] / "scripts"
 if str(SHARED_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SHARED_SCRIPTS_DIR))
 import finding_ledger
+import triage_store
 
 USER_DOMAIN_KEYWORDS = [
     "text", "paragraph", "skparagraph", "webparagraph", "unicode",
@@ -544,6 +545,7 @@ def fetch_github_pr(repo_url, pr_number):
     subject = f"PR #{pr_number}"
     owner = "Unknown"
     description = subject
+    head_sha = ""
     m_repo = re.search(r"github\.com/([^/]+/[^/]+)$", clean_repo)
     if m_repo:
         repo_slug = m_repo.group(1)
@@ -557,6 +559,8 @@ def fetch_github_pr(repo_url, pr_number):
             meta = json.loads(meta_raw)
             subject = meta.get("title") or subject
             owner = (meta.get("user") or {}).get("login") or owner
+            # Record PR head SHA so new commits reset corpus gate even when patchset stays 1
+            head_sha = str((meta.get("head") or {}).get("sha") or "")
             body = (meta.get("body") or "").strip()
             description = f"{subject}\n\n{body}".strip() if body else subject
         except Exception:
@@ -574,6 +578,7 @@ def fetch_github_pr(repo_url, pr_number):
         "repo_url": clean_repo,
         "pr_number": str(pr_number),
         "id": str(pr_number),
+        "head_sha": head_sha,
         "subject": subject,
         "owner": owner,
         "owner_email": "",
@@ -1256,14 +1261,29 @@ def main():
         ledger_entries, ledger_path=ledger_path, include_empty_header=True
     )
 
+    out_payload = {
+        "metadata": {k: v for k, v in cl_data.items() if k != "patch"},
+        "analysis": {k: v for k, v in analysis.items() if k != "top_hunks"},
+    }
+    report_md = generate_report(cl_data, analysis, files)
+
+    # Persist hunk-level corpus gate requirement for Flight Deck before save-review runs
+    cl_url = ""
+    if cl_data.get("repo_url") and cl_data.get("pr_number"):
+        cl_url = f"{cl_data['repo_url']}/pull/{cl_data['pr_number']}"
+    elif cl_data.get("host") and cl_data.get("id"):
+        proj = detail_dict.get("project", "skia")
+        cl_url = f"https://{cl_data['host']}/c/{proj}/+/{cl_data['id']}"
+    if cl_url:
+        try:
+            triage_store.save_from_triage_cl_output(cl_url, out_payload, report_md)
+        except (OSError, ValueError, TypeError):
+            pass
+
     if args.json:
-        out = {
-            "metadata": {k: v for k, v in cl_data.items() if k != "patch"},
-            "analysis": {k: v for k, v in analysis.items() if k != "top_hunks"}
-        }
-        print(json.dumps(out, indent=2))
+        print(json.dumps(out_payload, indent=2))
     else:
-        print(generate_report(cl_data, analysis, files))
+        print(report_md)
 
 if __name__ == "__main__":
     main()

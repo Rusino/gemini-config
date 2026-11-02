@@ -239,11 +239,21 @@ named skill's `SKILL.md` was not read, when a report with a `Case 1-5` verdict l
 9. **Flight Deck Review Verdict & Triage Persistence (`triage_store.py`)**: At the end of every
    code review (interactive single-CL chat or batch workflow), save the finalized review outcome
    and 1-line finding summary for Flight Deck via:
-   `python3 ~/.gemini/config/scripts/triage_store.py save-review --target <ID> --patchset <PS> --outcome <CLEAN|NITS|COMPANION_TESTS|COMPANION_FIX|PUSHBACK|REASSIGN> --summary "<1-line finding summary>"`
-   (optional: `--draft "<text>"` or `--draft-file <path>`). This immediately updates Flight Deck
-   cards with the review verdict pill (`🟢 Review PS<N>: Clean`, `🟠 Review PS<N>: Defects + fix`,
-   etc.) and finding summary. When running daily queue triage (`run_queue_triage.py`), save the
-   pre-review audit via `triage_store.py save-audit --target <ID> --report-file <md>` (or `ingest-tmp`).
+   ```bash
+   python3 ~/.gemini/config/scripts/triage_store.py save-review \
+     --target <ID> --patchset <PS> \
+     --outcome <CLEAN|NITS|COMPANION_TESTS|COMPANION_FIX|PUSHBACK|REASSIGN> \
+     --summary "<1-line finding summary>" \
+     [--corpus auto|not_required|required|pending|passed|failed|waived] \
+     [--compare-md <path/to/compare.md>]
+   ```
+   (optional: `--draft "<text>"` or `--draft-file <path>`). When `Flutter Corpus Gate` or
+   `WebParagraph Corpus Gate` is required, `save-review` verifies `compare.md` Run Attestation
+   (`Integrity Check: VALID`, `0` regressions) for that exact patchset: `CLEAN`, `NITS`, and
+   `COMPANION_TESTS` render as amber `⏳ LGTM blocked: <Flutter|WebParagraph> corpus not run`
+   until the corpus passes, and reset to `pending` when a new patchset is uploaded. When running
+   daily queue triage (`run_queue_triage.py`), save the pre-review audit via
+   `triage_store.py save-audit --target <ID> --report-file <md>` (or `ingest-tmp`).
 10. **Explicit Per-Thread Verdict for Other Reviewers' Open Threads**: In daily queue summaries
     (`run_queue_triage.py`) and review reports, never reduce an unresolved comment thread from
     another reviewer (`### 🧵 Open threads`) to a one-line footnote without a verdict. Every

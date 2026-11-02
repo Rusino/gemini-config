@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Unit tests for review triage store, overlay, and Flight Deck rendering."""
 
+from __future__ import annotations
+
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -91,7 +95,7 @@ Please check zero-allocation hot path in ParagraphImpl::layout.
     )
 
   def test_parse_wf_audit_infers_review_outcome_and_eyebrow(self):
-    md = """
+    md_pending = """
 # Deep Audit for CL 1409697
 - **Category:** Surgical audit
 - **Review time:** about 2 min
@@ -102,11 +106,29 @@ Please check zero-allocation hot path in ParagraphImpl::layout.
 LGTM pending corpus gate.
 ```
 """
-    items = ts.parse_wf_audit_markdown(md, source_path="/tmp/wf312_1409697.md")
+    items = ts.parse_wf_audit_markdown(md_pending, source_path="/tmp/wf312_1409697.md")
     self.assertEqual(len(items), 1)
     it = items[0]
     self.assertEqual(it["review_outcome"], "CLEAN")
-    self.assertEqual(it["review_eyebrow_label"], "🟢 Review PS5: Clean (LGTM)")
+    self.assertTrue(it["corpus_required"])
+    self.assertEqual(it["corpus_status"], "pending")
+    self.assertEqual(it["review_eyebrow_label"], "⏳ LGTM blocked: Flutter corpus not run")
+
+    md_clean = """
+# Deep Audit for CL 1409698
+- **Category:** Mechanical
+- **Review time:** about 1 min
+- **Patchset:** PS2
+
+**Ready-to-copy draft:**
+```markdown
+LGTM. Verified mechanical churn; no unintended side effects.
+```
+"""
+    clean_items = ts.parse_wf_audit_markdown(md_clean, source_path="/tmp/wf312_1409698.md")
+    self.assertEqual(len(clean_items), 1)
+    self.assertEqual(clean_items[0]["review_outcome"], "CLEAN")
+    self.assertEqual(clean_items[0]["review_eyebrow_label"], "🟢 Review PS2: Clean (LGTM)")
 
   def test_link_companion_changes_prevents_stack_chat_leak(self):
     cand_parent = {
@@ -400,6 +422,530 @@ LGTM pending corpus gate.
     self.assertNotIn("all tests green", res2["summary"])
     self.assertIn("4 extra adversarial cases pass", res2["summary"])
 
+  def _write_corpus_fixture(
+      self,
+      sub_name: str,
+      kind: str = "flutter",
+      integrity: str = "VALID (все пакеты тестов завершены штатно)",
+      regressions: int = 0,
+      cand_sha: str = "7bca43577fd2",
+      cand_ref: str = "ext:7bca43577f",
+      dirty_files: list[str] | None = None,
+      timestamp_utc: str = "2026-11-02T21:49:33Z",
+  ) -> str:
+    out_dir = os.path.join(self.test_dir, sub_name)
+    base_dir = os.path.join(out_dir, "baseline")
+    cand_dir = os.path.join(out_dir, "candidate")
+    os.makedirs(base_dir, exist_ok=True)
+    os.makedirs(cand_dir, exist_ok=True)
+    with open(os.path.join(base_dir, "attestation.json"), "w", encoding="utf-8") as f:
+      json.dump(
+          {"label": "baseline", "ref": "HEAD", "git_sha": "ab9b798555a6", "dirty_files": []},
+          f,
+      )
+    with open(os.path.join(cand_dir, "attestation.json"), "w", encoding="utf-8") as f:
+      json.dump(
+          {
+              "label": "candidate",
+              "ref": cand_ref,
+              "git_sha": cand_sha,
+              "dirty_files": list(dirty_files or []),
+              "timestamp_utc": timestamp_utc,
+          },
+          f,
+      )
+    reg_col = f"**{regressions}**" if regressions > 0 else "0"
+    if kind == "webparagraph":
+      header = "# WebParagraph Corpus Report (baseline = `baseline`)"
+      table = (
+          "| Ref | `dart analyze` | Part 1a | Part 1b | Part 2 | Regressions | Fixed |\n"
+          "| :--- | :---: | :---: | :---: | :---: | :---: | :---: |\n"
+          "| `baseline` | PASS | `+209 -1` | `+26 -6` | `+76 -37` | *(baseline)* | *(baseline)* |\n"
+          f"| `candidate` | PASS | `+209 -1` | `+26 -6` | `+76 -37` | {reg_col} | 0 |"
+      )
+    elif kind == "skia_dm":
+      header = "# Skia SkParagraph Native Tests (baseline = `baseline`)"
+      table = (
+          "| Ref | Tests | Regressions | Fixed |\n"
+          "| :--- | :---: | :---: | :---: |\n"
+          "| `baseline` | `+320 -0` | *(baseline)* | *(baseline)* |\n"
+          f"| `candidate` | `+320 -0` | {reg_col} | 0 |"
+      )
+    else:
+      header = "# Flutter Paragraph Engine Test Comparison (baseline = `baseline`)"
+      table = (
+          "| Ref | C++ Smoke Tests | Full Framework Corpus (Sharded) | Regressions | Fixed |\n"
+          "| :--- | :---: | :---: | :---: | :---: |\n"
+          "| `baseline` | `+99 -0` | `+20098 -1` | *(baseline)* | *(baseline)* |\n"
+          f"| `candidate` | `+99 -0` | `+20098 -1` | {reg_col} | 0 |"
+      )
+    compare_md = os.path.join(out_dir, "compare.md")
+    with open(compare_md, "w", encoding="utf-8") as f:
+      f.write(
+          f"{header}\n\n{table}\n\n"
+          "## Паспорт прогона (Run Attestation)\n\n"
+          f"**Вердикт целостности (Integrity Check):** `{integrity}`\n\n"
+          "## `candidate` vs `baseline`\n\n"
+          f"**Выполнено тестов: 20198 | Было фейлов: 1 | Починено: 0 | Поломано: {regressions}**\n"
+      )
+    return compare_md
+
+  def test_save_review_corpus_gate_states_and_cli_attestation_enforcement(self):
+    # Explicit required and pending states block green LGTM on CLEAN and NITS
+    ts.save_review_verdict(
+        target_id="1414017",
+        kind="gerrit",
+        patchset=1,
+        outcome="CLEAN",
+        summary="Hit width uses glyph's own justification shift",
+        corpus="required",
+        results_dir=self.test_dir,
+    )
+    res_req = ts.load_triage_result("gerrit", "1414017", results_dir=self.test_dir)
+    self.assertTrue(res_req["corpus_required"])
+    self.assertEqual(res_req["corpus_status"], "pending")
+    self.assertEqual(res_req["review_eyebrow_label"], "⏳ LGTM blocked: Flutter corpus not run")
+    self.assertEqual(res_req["verdict_tone"], "corpus_blocked")
+
+    ts.save_review_verdict(
+        target_id="1414018",
+        kind="gerrit",
+        patchset=2,
+        outcome="NITS",
+        summary="Minor comment nit",
+        corpus="pending",
+        results_dir=self.test_dir,
+    )
+    res_pend = ts.load_triage_result("gerrit", "1414018", results_dir=self.test_dir)
+    self.assertEqual(res_pend["corpus_status"], "pending")
+    self.assertEqual(res_pend["review_eyebrow_label"], "⏳ LGTM blocked: Flutter corpus not run")
+
+    # Failed corpus blocks LGTM with failed verdict
+    ts.save_review_verdict(
+        target_id="1414019",
+        kind="gerrit",
+        patchset=1,
+        outcome="CLEAN",
+        summary="Looks clean statically",
+        corpus="failed",
+        results_dir=self.test_dir,
+    )
+    res_fail = ts.load_triage_result("gerrit", "1414019", results_dir=self.test_dir)
+    self.assertEqual(res_fail["corpus_status"], "failed")
+    self.assertEqual(res_fail["review_eyebrow_label"], "🔴 LGTM blocked: Flutter corpus failed")
+    self.assertEqual(res_fail["verdict_tone"], "corpus_failed")
+
+    # Waived corpus records waiver without turning green
+    ts.save_review_verdict(
+        target_id="1414020",
+        kind="gerrit",
+        patchset=1,
+        outcome="CLEAN",
+        summary="Text-only quick check requested by user",
+        corpus="waived",
+        results_dir=self.test_dir,
+    )
+    res_waive = ts.load_triage_result("gerrit", "1414020", results_dir=self.test_dir)
+    self.assertEqual(res_waive["corpus_status"], "waived")
+    self.assertIn("waived", res_waive["review_eyebrow_label"].lower())
+    self.assertNotIn("🟢", res_waive["review_eyebrow_label"])
+    self.assertEqual(res_waive["verdict_tone"], "corpus_blocked")
+
+    # Unattested passed request via verify_attestation=True downgrades to pending
+    empty_search = os.path.join(self.test_dir, "empty_tmp")
+    os.makedirs(empty_search, exist_ok=True)
+    err_buf = io.StringIO()
+    with contextlib.redirect_stderr(err_buf):
+      ts.save_review_verdict(
+          target_id="1414021",
+          kind="gerrit",
+          patchset=1,
+          outcome="CLEAN",
+          summary="Claimed passed without running corpus",
+          corpus="passed",
+          verify_attestation=True,
+          compare_search_dirs=[empty_search],
+          results_dir=self.test_dir,
+      )
+    self.assertIn("recording corpus_status=pending", err_buf.getvalue())
+    res_unatt = ts.load_triage_result("gerrit", "1414021", results_dir=self.test_dir)
+    self.assertEqual(res_unatt["corpus_status"], "pending")
+    self.assertEqual(res_unatt["review_eyebrow_label"], "⏳ LGTM blocked: Flutter corpus not run")
+
+    # Valid compare.md Run Attestation unlocks green Clean (LGTM)
+    valid_md = self._write_corpus_fixture(
+        "flutter_1414021", cand_sha="7bca43577fd2", regressions=0
+    )
+    ts.save_review_verdict(
+        target_id="1414021",
+        kind="gerrit",
+        patchset=1,
+        outcome="CLEAN",
+        summary="All Flutter paragraph tests green",
+        corpus="passed",
+        revision="7bca43577fd2b0f9b3cd00a30dfc60239fd4022f",
+        compare_md=valid_md,
+        verify_attestation=True,
+        results_dir=self.test_dir,
+    )
+    res_ok = ts.load_triage_result("gerrit", "1414021", results_dir=self.test_dir)
+    self.assertEqual(res_ok["corpus_status"], "passed")
+    self.assertEqual(res_ok["corpus_tested_patchset"], 1)
+    self.assertEqual(res_ok["review_eyebrow_label"], "🟢 Review PS1: Clean (LGTM)")
+    self.assertEqual(res_ok["verdict_tone"], "clean")
+
+  def test_auto_derive_corpus_from_triage_cl_and_compare_md_attestation(self):
+    # Incident Gerrit 1414017 PS1: triage_cl flags Flutter Corpus Gate REQUIRED
+    triage_json = {
+        "metadata": {
+            "id": "1414017",
+            "subject": "[skparagraph] Shift the trailing space of an RTL run when justifying",
+            "patchset": 1,
+            "thread_context": {
+                "current_ps": 1,
+                "current_sha": "7bca43577fd2b0f9b3cd00a30dfc60239fd4022f",
+            },
+        },
+        "analysis": {
+            "category": "SURGICAL_AUDIT",
+            "reason": "Core domain logic modification",
+            "corpus_gate": {
+                "required": True,
+                "domain": "SkParagraph/SkUnicode/SkShaper",
+                "script": "run_flutter_paragraph_tests.py",
+                "files": ["modules/skparagraph/src/TextLine.cpp"],
+            },
+        },
+    }
+    triage_md = (
+        "## Review Triage: [skparagraph] Shift the trailing space\n"
+        "### 📊 Churn & Profile\n"
+        "| **Flutter Corpus Gate** | 🚨 **REQUIRED (`run_flutter_paragraph_tests.py`)** | "
+        "Touches `SkParagraph/SkUnicode/SkShaper` (`TextLine.cpp`) |\n"
+    )
+    ts.save_from_triage_cl_output(
+        "https://skia-review.googlesource.com/c/skia/+/1414017",
+        triage_json,
+        triage_md,
+        results_dir=self.test_dir,
+    )
+
+    search_root = os.path.join(self.test_dir, "corpus_runs")
+    os.makedirs(search_root, exist_ok=True)
+
+    # Saving CLEAN while corpus has not run derives pending and blocks green LGTM
+    ts.save_review_verdict(
+        target_id="1414017",
+        kind="gerrit",
+        patchset=1,
+        outcome="CLEAN",
+        summary="Static audit + Skia dm pass; Flutter checkout leased by another chat",
+        compare_search_dirs=[search_root],
+        results_dir=self.test_dir,
+    )
+    r1 = ts.load_triage_result("gerrit", "1414017", results_dir=self.test_dir)
+    self.assertTrue(r1["corpus_required"])
+    self.assertEqual(r1["corpus_status"], "pending")
+    self.assertEqual(r1["review_eyebrow_label"], "⏳ LGTM blocked: Flutter corpus not run")
+
+    # Native Skia dm compare.md must never satisfy the Flutter corpus gate
+    dm_md = self._write_corpus_fixture(
+        "corpus_runs/skia_dm_1414017", kind="skia_dm", cand_sha="7bca43577fd2"
+    )
+    ts.save_review_verdict(
+        target_id="1414017",
+        kind="gerrit",
+        patchset=1,
+        outcome="CLEAN",
+        summary="Only dm ran",
+        compare_md=dm_md,
+        results_dir=self.test_dir,
+    )
+    r_dm = ts.load_triage_result("gerrit", "1414017", results_dir=self.test_dir)
+    self.assertNotEqual(r_dm["corpus_status"], "passed")
+
+    # WARNING / INVALID Integrity Check marks corpus failed
+    inv_md = self._write_corpus_fixture(
+        "corpus_runs/invalid_1414017",
+        integrity="WARNING / INVALID (1 issue(s))",
+        cand_sha="7bca43577fd2",
+    )
+    ts.save_review_verdict(
+        target_id="1414017",
+        kind="gerrit",
+        patchset=1,
+        outcome="CLEAN",
+        summary="Incomplete shards",
+        compare_md=inv_md,
+        results_dir=self.test_dir,
+    )
+    r_inv = ts.load_triage_result("gerrit", "1414017", results_dir=self.test_dir)
+    self.assertEqual(r_inv["corpus_status"], "failed")
+    self.assertEqual(r_inv["review_eyebrow_label"], "🔴 LGTM blocked: Flutter corpus failed")
+
+    # Regressions > 0 marks corpus failed even when Integrity Check is VALID
+    reg_md = self._write_corpus_fixture(
+        "corpus_runs/reg_1414017", regressions=2, cand_sha="7bca43577fd2"
+    )
+    ts.save_review_verdict(
+        target_id="1414017",
+        kind="gerrit",
+        patchset=1,
+        outcome="CLEAN",
+        summary="Has regressions",
+        compare_md=reg_md,
+        results_dir=self.test_dir,
+    )
+    r_reg = ts.load_triage_result("gerrit", "1414017", results_dir=self.test_dir)
+    self.assertEqual(r_reg["corpus_status"], "failed")
+
+    # Valid compare.md in search_dirs matching PS1's commit SHA derives passed automatically
+    self._write_corpus_fixture(
+        "corpus_runs/flutter_paragraph_tests_1414017",
+        regressions=0,
+        cand_sha="7bca43577fd2",
+    )
+    ts.save_review_verdict(
+        target_id="1414017",
+        kind="gerrit",
+        patchset=1,
+        outcome="CLEAN",
+        summary="Flutter corpus 0 regressions",
+        compare_search_dirs=[search_root],
+        results_dir=self.test_dir,
+    )
+    r_pass = ts.load_triage_result("gerrit", "1414017", results_dir=self.test_dir)
+    self.assertEqual(r_pass["corpus_status"], "passed")
+    self.assertEqual(r_pass["review_eyebrow_label"], "🟢 Review PS1: Clean (LGTM)")
+
+  def test_new_patchset_resets_corpus_gate_and_rejects_stale_ps1_attestation(self):
+    search_root = os.path.join(self.test_dir, "ps_reset_runs")
+    os.makedirs(search_root, exist_ok=True)
+    ps1_md = self._write_corpus_fixture(
+        "ps_reset_runs/flutter_1414017",
+        cand_sha="7bca43577fd2",
+        timestamp_utc="2026-11-02T21:49:33Z",
+    )
+    ts.save_review_verdict(
+        target_id="1414017",
+        kind="gerrit",
+        patchset=1,
+        outcome="CLEAN",
+        summary="PS1 verified in Flutter",
+        revision="7bca43577fd2b0f9b3cd00a30dfc60239fd4022f",
+        compare_md=ps1_md,
+        results_dir=self.test_dir,
+    )
+
+    # Uploading PS2 resets overlaid corpus_status from passed to pending
+    items = [{
+        "item_key": "gerrit:1414017",
+        "target_id": "1414017",
+        "kind": "gerrit",
+        "patchset": 2,
+        "revision": "9999888877776666555544443333222211110000",
+        "files": ["modules/skparagraph/src/TextLine.cpp"],
+    }]
+    ts.overlay_triage_on_items(items, results_dir=self.test_dir, ingest_tmp=False)
+    self.assertTrue(items[0]["triage"]["is_stale"])
+    self.assertEqual(items[0]["triage"]["corpus_status"], "pending")
+
+    # Minimal PS2 triage payload without verdict_label must not retain PS1's green LGTM label
+    ts.save_triage_result(
+        {
+            "target_id": "1414017",
+            "kind": "gerrit",
+            "verdict": "SURGICAL_AUDIT",
+            "summary": "Minimal queue update on PS2",
+            "triaged_patchset": 2,
+            "source": "queue_triage",
+        },
+        results_dir=self.test_dir,
+    )
+    min_q = ts.load_triage_result("gerrit", "1414017", results_dir=self.test_dir)
+    self.assertNotIn("Clean", min_q.get("verdict_label", ""))
+    self.assertEqual(min_q.get("verdict_label"), "SURGICAL AUDIT")
+
+    # Queue triage running on PS2 must not inherit PS1's CLEAN outcome or passed corpus
+    ps2_triage_json = {
+        "metadata": {
+            "id": "1414017",
+            "subject": "[skparagraph] Shift trailing space",
+            "patchset": 2,
+            "thread_context": {
+                "current_ps": 2,
+                "current_sha": "9999888877776666555544443333222211110000",
+            },
+        },
+        "analysis": {
+            "category": "SURGICAL_AUDIT",
+            "reason": "Updated TextLine.cpp",
+            "corpus_gate": {
+                "required": True,
+                "domain": "SkParagraph/SkUnicode/SkShaper",
+                "script": "run_flutter_paragraph_tests.py",
+                "files": ["modules/skparagraph/src/TextLine.cpp"],
+            },
+        },
+    }
+    ts.save_from_triage_cl_output(
+        "https://skia-review.googlesource.com/c/skia/+/1414017",
+        ps2_triage_json,
+        "## Review Triage\n",
+        results_dir=self.test_dir,
+    )
+    after_q = ts.load_triage_result("gerrit", "1414017", results_dir=self.test_dir)
+    self.assertEqual(after_q["triaged_patchset"], 2)
+    self.assertEqual(after_q.get("review_outcome", ""), "")
+    self.assertEqual(after_q["corpus_status"], "pending")
+
+    # Saving CLEAN on PS2 while search_root only has PS1's compare.md keeps gate pending
+    ts.save_review_verdict(
+        target_id="1414017",
+        kind="gerrit",
+        patchset=2,
+        outcome="CLEAN",
+        summary="Checked PS2 diff statically",
+        revision="9999888877776666555544443333222211110000",
+        compare_search_dirs=[search_root],
+        results_dir=self.test_dir,
+    )
+    ps2_rev = ts.load_triage_result("gerrit", "1414017", results_dir=self.test_dir)
+    self.assertEqual(ps2_rev["corpus_status"], "pending")
+    self.assertEqual(ps2_rev["review_eyebrow_label"], "⏳ LGTM blocked: Flutter corpus not run")
+
+  def test_webparagraph_corpus_gate_on_github_pr_and_commit_push_reset(self):
+    wp_files = ["engine/src/flutter/lib/web_ui/lib/src/engine/web_paragraph/paragraph.dart"]
+    # Saving NITS without webparagraph-corpus blocks approval with WebParagraph pill
+    ts.save_review_verdict(
+        target_id="195600",
+        kind="github",
+        patchset=1,
+        outcome="NITS",
+        summary="Minor naming nit in WebParagraph",
+        revision="aaaa111122223333444455556666777788889999",
+        files=wp_files,
+        results_dir=self.test_dir,
+    )
+    wp_pend = ts.load_triage_result("github", "195600", results_dir=self.test_dir)
+    self.assertTrue(wp_pend["corpus_required"])
+    self.assertEqual(wp_pend["corpus_script"], "run_webparagraph_corpus.py")
+    self.assertEqual(wp_pend["corpus_status"], "pending")
+    self.assertEqual(
+        wp_pend["review_eyebrow_label"], "⏳ LGTM blocked: WebParagraph corpus not run"
+    )
+
+    # Valid WebParagraph compare.md on exact PR head SHA unlocks Minor nits badge
+    wp_md = self._write_corpus_fixture(
+        "wp_195600",
+        kind="webparagraph",
+        integrity="VALID (все сьюты завершены, WebParagraph активен)",
+        regressions=0,
+        cand_sha="aaaa11112222",
+        cand_ref="aaaa11112222",
+    )
+    ts.save_review_verdict(
+        target_id="195600",
+        kind="github",
+        patchset=1,
+        outcome="NITS",
+        summary="Minor naming nit; webparagraph corpus green",
+        revision="aaaa111122223333444455556666777788889999",
+        files=wp_files,
+        compare_md=wp_md,
+        results_dir=self.test_dir,
+    )
+    wp_ok = ts.load_triage_result("github", "195600", results_dir=self.test_dir)
+    self.assertEqual(wp_ok["corpus_status"], "passed")
+    self.assertEqual(wp_ok["review_eyebrow_label"], "🔵 Review PS1: Minor nits")
+
+    # Author pushes a new commit on GitHub (patchset stays 1 when len(reviews)==0, revision changes)
+    pr_items = [{
+        "item_key": "github:195600",
+        "target_id": "195600",
+        "kind": "github",
+        "patchset": 1,
+        "revision": "bbbb44445555",
+        "head_sha": "bbbb444455556666777788889999000011112222",
+        "files": wp_files,
+    }]
+    ts.overlay_triage_on_items(pr_items, results_dir=self.test_dir, ingest_tmp=False)
+    self.assertTrue(pr_items[0]["triage"]["is_stale"])
+    self.assertEqual(pr_items[0]["triage"]["corpus_status"], "pending")
+
+    # Re-running triage_cl on the new PR commit (patchset still 1) resets review and revision
+    new_commit_triage = {
+        "metadata": {
+            "id": "195600",
+            "subject": "Fix WebParagraph line height",
+            "patchset": 1,
+            "head_sha": "bbbb444455556666777788889999000011112222",
+        },
+        "analysis": {
+            "category": "SURGICAL_AUDIT",
+            "reason": "Updated paragraph.dart",
+            "corpus_gate": {
+                "required": True,
+                "domain": "WebParagraph (web_ui)",
+                "script": "run_webparagraph_corpus.py",
+                "files": wp_files,
+            },
+        },
+    }
+    ts.save_from_triage_cl_output(
+        "https://github.com/flutter/flutter/pull/195600",
+        new_commit_triage,
+        "## Review Triage\n",
+        results_dir=self.test_dir,
+    )
+    after_push_q = ts.load_triage_result("github", "195600", results_dir=self.test_dir)
+    self.assertEqual(
+        after_push_q["triaged_revision"], "bbbb444455556666777788889999000011112222"
+    )
+    self.assertEqual(after_push_q.get("review_outcome", ""), "")
+    self.assertEqual(after_push_q["corpus_status"], "pending")
+
+  def test_worktree_dirty_corpus_attestation_matches_ps1_and_rejects_ps2(self):
+    wt_root = os.path.join(self.test_dir, "wt_runs")
+    os.makedirs(wt_root, exist_ok=True)
+    # Flutter engine tests apply Skia CL patches onto deps_skia_revision as a dirty WORKTREE
+    self._write_corpus_fixture(
+        "wt_runs/flutter_paragraph_tests_1414016",
+        cand_sha="ab9b798555a6",
+        cand_ref="WORKTREE",
+        dirty_files=["modules/skparagraph/src/TextLine.cpp"],
+    )
+    ts.save_review_verdict(
+        target_id="1414016",
+        kind="gerrit",
+        patchset=1,
+        outcome="CLEAN",
+        summary="Hit width uses glyph's own justification shift; Flutter corpus clean",
+        revision="8675bb8ba911223344556677889900aabbccddee",
+        files=["modules/skparagraph/src/TextLine.cpp"],
+        compare_search_dirs=[wt_root],
+        results_dir=self.test_dir,
+    )
+    ps1 = ts.load_triage_result("gerrit", "1414016", results_dir=self.test_dir)
+    self.assertEqual(ps1["corpus_status"], "passed")
+    self.assertEqual(ps1["review_eyebrow_label"], "🟢 Review PS1: Clean (LGTM)")
+
+    # Untimestamped PS1 WORKTREE dir must not satisfy PS2 without a ps2 tag
+    ts.save_review_verdict(
+        target_id="1414016",
+        kind="gerrit",
+        patchset=2,
+        outcome="CLEAN",
+        summary="Checked PS2 statically",
+        revision="ccddeeff00112233445566778899aabbccddeeff",
+        files=["modules/skparagraph/src/TextLine.cpp"],
+        compare_search_dirs=[wt_root],
+        results_dir=self.test_dir,
+    )
+    ps2 = ts.load_triage_result("gerrit", "1414016", results_dir=self.test_dir)
+    self.assertEqual(ps2["corpus_status"], "pending")
+    self.assertEqual(ps2["review_eyebrow_label"], "⏳ LGTM blocked: Flutter corpus not run")
+
 
 class FlightDeckTriageDashboardRenderingTest(unittest.TestCase):
 
@@ -440,7 +986,7 @@ console.log(JSON.stringify({
 }));
 """
     proc = subprocess.run(
-        ["node", "-e", harness], capture_output=True, text=True, check=True
+        ["node", "-"], input=harness, capture_output=True, text=True, check=True
     )
     out = json.loads(proc.stdout.strip())
 
@@ -543,7 +1089,7 @@ console.log(JSON.stringify({
 }));
 """
     proc = subprocess.run(
-        ["node", "-e", harness], capture_output=True, text=True, check=True
+        ["node", "-"], input=harness, capture_output=True, text=True, check=True
     )
     out = json.loads(proc.stdout.strip())
 
@@ -621,7 +1167,7 @@ console.log(JSON.stringify({
 }));
 """
     proc = subprocess.run(
-        ["node", "-e", harness], capture_output=True, text=True, check=True
+        ["node", "-"], input=harness, capture_output=True, text=True, check=True
     )
     out = json.loads(proc.stdout.strip())
 
@@ -638,6 +1184,131 @@ console.log(JSON.stringify({
     self.assertIn('<div class="why">', replied)
     self.assertIn("Thanks Julia! Addressed your question.", replied)
     self.assertIn("triage-box", replied)
+
+  def test_flight_deck_corpus_gate_blocking_and_patchset_reset_rendering(self):
+    script_body = w.DASHBOARD_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    harness = script_body.split("\nboot();", 1)[0] + """
+const skpPending = {
+  item_key: 'gerrit:1414017',
+  target_id: '1414017',
+  kind: 'gerrit',
+  host: 'skia-review.googlesource.com',
+  role: 'reviewer (ext)',
+  status: 'NEW',
+  phase: 'NEEDS_YOUR_ACTION',
+  patchset: 1,
+  reviewed_ps: 1,
+  url: 'https://skia-review.googlesource.com/c/skia/+/1414017',
+  subject: '[skparagraph] Shift trailing space of RTL run',
+  project_name: 'SkParagraph',
+  owner_name: 'David Bebawy',
+  owner_email: 'dbebawy@gmail.com',
+  is_external: true,
+  triage: {
+    verdict: 'CLEAN',
+    verdict_label: '🟢 Clean (LGTM)',
+    review_outcome: 'CLEAN',
+    review_eyebrow_label: '🟢 Review PS1: Clean (LGTM)',
+    corpus_required: true,
+    corpus_status: 'pending',
+    corpus_script: 'run_flutter_paragraph_tests.py',
+    summary: 'Static logic and Skia dm pass; Flutter checkout leased',
+    triaged_patchset: 1,
+    triaged_at_et: 'Nov 02, 16:50 ET',
+    is_stale: false,
+    draft: 'Looks good.',
+  }
+};
+
+const wpNitsPending = Object.assign({}, skpPending, {
+  item_key: 'github:195600',
+  target_id: '195600',
+  kind: 'github',
+  project_name: 'WebParagraph',
+  triage: Object.assign({}, skpPending.triage, {
+    verdict: 'NITS',
+    verdict_label: '🔵 Minor nits',
+    review_outcome: 'NITS',
+    review_eyebrow_label: '🔵 Review PS1: Minor nits',
+    corpus_script: 'run_webparagraph_corpus.py',
+    corpus_status: 'pending',
+  })
+});
+
+const skpFailed = Object.assign({}, skpPending, {
+  triage: Object.assign({}, skpPending.triage, {
+    corpus_status: 'failed',
+  })
+});
+
+const skpWaived = Object.assign({}, skpPending, {
+  triage: Object.assign({}, skpPending.triage, {
+    corpus_status: 'waived',
+  })
+});
+
+const skpPassedPs1 = Object.assign({}, skpPending, {
+  triage: Object.assign({}, skpPending.triage, {
+    corpus_status: 'passed',
+    corpus_tested_patchset: 1,
+  })
+});
+
+const skpUploadedPs2 = Object.assign({}, skpPassedPs1, {
+  patchset: 2,
+});
+
+console.log(JSON.stringify({
+  skpPendingCard: focusCard(skpPending, {jetski_box_url: ''}),
+  skpPendingRow: rowHtml(skpPending, {jetski_box_url: ''}),
+  skpPendingSpine: spineStepShortState(skpPending),
+  wpNitsEyebrow: reviewVerdictEyebrowHtml(wpNitsPending),
+  skpFailedCard: focusCard(skpFailed, {jetski_box_url: ''}),
+  skpWaivedCard: focusCard(skpWaived, {jetski_box_url: ''}),
+  skpPassedCard: focusCard(skpPassedPs1, {jetski_box_url: ''}),
+  skpPs2Card: focusCard(skpUploadedPs2, {jetski_box_url: ''}),
+  skpPs2Spine: spineStepShortState(skpUploadedPs2),
+}));
+"""
+    proc = subprocess.run(
+        ["node", "-"], input=harness, capture_output=True, text=True, check=True
+    )
+    out = json.loads(proc.stdout.strip())
+
+    # Pending SkParagraph corpus renders amber blocked pill and never green LGTM
+    self.assertIn("v-corpus_blocked", out["skpPendingCard"])
+    self.assertIn("⏳ LGTM blocked: Flutter corpus not run", out["skpPendingCard"])
+    self.assertNotIn("v-clean", out["skpPendingCard"])
+    self.assertNotIn("triage-clean", out["skpPendingCard"])
+    self.assertNotIn("🟢", out["skpPendingCard"])
+    self.assertIn("⏳ LGTM blocked: Flutter corpus not run", out["skpPendingRow"])
+    self.assertNotIn("triage-clean", out["skpPendingRow"])
+    self.assertNotEqual(out["skpPendingSpine"]["tone"], "spine-ok")
+
+    # Pending WebParagraph corpus on NITS renders amber blocked pill
+    self.assertIn("v-corpus_blocked", out["wpNitsEyebrow"])
+    self.assertIn("⏳ LGTM blocked: WebParagraph corpus not run", out["wpNitsEyebrow"])
+    self.assertNotIn("v-nits", out["wpNitsEyebrow"])
+
+    # Failed and waived corpus never render green
+    self.assertIn("v-corpus_failed", out["skpFailedCard"])
+    self.assertIn("🔴 LGTM blocked: Flutter corpus failed", out["skpFailedCard"])
+    self.assertNotIn("v-clean", out["skpFailedCard"])
+    self.assertIn("v-corpus_blocked", out["skpWaivedCard"])
+    self.assertNotIn("v-clean", out["skpWaivedCard"])
+    self.assertNotIn("triage-clean", out["skpWaivedCard"])
+
+    # Passed Integrity Check on exact patchset renders green Clean (LGTM)
+    self.assertIn("v-clean", out["skpPassedCard"])
+    self.assertIn("🟢 Review PS1: Clean (LGTM)", out["skpPassedCard"])
+    self.assertIn("triage-clean", out["skpPassedCard"])
+    self.assertIn("Flutter corpus OK", out["skpPassedCard"])
+
+    # Uploading PS2 resets gate to pending and drops green badges immediately
+    self.assertNotIn("v-clean", out["skpPs2Card"])
+    self.assertNotIn("triage-clean", out["skpPs2Card"])
+    self.assertIn("PS2", out["skpPs2Card"])
+    self.assertNotEqual(out["skpPs2Spine"]["tone"], "spine-ok")
 
 
 if __name__ == "__main__":

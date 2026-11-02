@@ -763,8 +763,13 @@ console.log(JSON.stringify({
   })(),
 }));
 """
+    # Feed DASHBOARD_HTML via stdin so growing script bytes never exceed Linux MAX_ARG_STRLEN
     proc = subprocess.run(
-        ["node", "-e", harness], capture_output=True, text=True, check=True
+        ["node", "-"],
+        input=harness,
+        capture_output=True,
+        text=True,
+        check=True,
     )
     out = json.loads(proc.stdout.strip())
     self.assertEqual(out["draftStatus"], "draft")

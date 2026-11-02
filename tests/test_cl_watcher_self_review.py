@@ -644,7 +644,10 @@ console.log(JSON.stringify({
         + "  focusStack: renderFocusSection([c1414016], [c1414016, c1409696], box)\n"
         + "}));\n"
     )
-    out = json.loads(subprocess.check_output(["node", "-e", harness], encoding="utf-8"))
+    # Feed DASHBOARD_HTML via stdin so script bytes stay independent of Linux MAX_ARG_STRLEN
+    out = json.loads(
+        subprocess.check_output(["node", "-"], input=harness, encoding="utf-8")
+    )
     self.assertEqual(out["lane1414016"], "you")
     self.assertEqual(out["lane1412381"], "you")
     self.assertEqual(out["lane1409696"], "waiting")
