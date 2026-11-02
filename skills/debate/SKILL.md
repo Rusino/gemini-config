@@ -35,6 +35,8 @@ deterministic quote verification, per-attack rulings, and a tool-less Scribe syn
 
 ## Two Execution Modes
 
+Both modes share the pure state machine, schemas, quote verifier, and concession ledger in [`scripts/debate_core.py`](scripts/debate_core.py).
+
 | Dimension | Mode A: Native Workflow (`debate_workflow.py`) | Mode B: Cross-Model Runner (`debate_ls_runner.py`) |
 |---|---|---|
 | **Mechanism** | `run_workflow` tool with stateful `agent()` | Language Server ConnectRPC (`StartCascade`) |

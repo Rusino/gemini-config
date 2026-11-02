@@ -94,6 +94,41 @@ RETIRED_SKILL_RE = re.compile(
 )
 ANCHOR_LINK_RE = re.compile(r"\[[^\]]+\]\(#([a-zA-Z0-9_-]+)\)")
 
+# Jetski read_file per-call ceiling is 800 lines / 46,080 bytes; own skills keep tighter budgets
+SKILL_SOFT_MAX_LINES = 400
+SKILL_SOFT_MAX_BYTES = 40_000
+SKILL_HARD_MAX_LINES = 800
+SKILL_HARD_MAX_BYTES = 46_080
+REF_SOFT_MAX_LINES = 500
+REF_SOFT_MAX_BYTES = 42_000
+REF_HARD_MAX_BYTES = 46_080
+EXTERNAL_CEILING_EXEMPT_SKILLS = {"gsheets", "gslides"}
+
+DESC_CLI_FLAG_RE = re.compile(r"(?:^|[\s`\"'(\[])(--[a-zA-Z0-9][a-zA-Z0-9_-]*)")
+DESC_EXEC_PATH_RE = re.compile(
+    r"(?:"
+    r"(?<![\w+.-])/(?:google|usr|bin|sbin|opt|etc|var|tmp|home|Users|Volumes)\b[\w./-]*"
+    r"|(?:~|\.\.?)/[\w./-]+"
+    r"|(?<!:)//[a-zA-Z0-9_][\w./:-]+"
+    r"|\b(?:[\w.-]+/)*(?:scripts|bin|clis|hooks)/[\w./-]+"
+    r"|\b[\w.-]+\.(?:py|sh|bash|zsh|par|exe|pl|rb|mjs|cjs)\b"
+    r")"
+)
+FENCE_OPEN_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
+BASH_FENCE_LANGS = {"bash", "sh", "shell", "zsh"}
+BASH_VAR_CMD_RE = re.compile(
+    r"^\s*(\$(?:[A-Z][A-Z0-9_]{2,}|\{[A-Z][A-Z0-9_]{2,}\}))\s+(?!=)\S"
+)
+HEREDOC_OPEN_RE = re.compile(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?")
+INLINE_CODE_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)")
+UNESCAPED_PIPE_RE = re.compile(r"(?:^|[^\\])(?:\\\\)*\|")
+BLINDNESS_STOPWORDS = {
+    "and", "the", "for", "with", "from", "into", "using", "use", "when", "how",
+    "guide", "reference", "references", "doc", "docs", "notes", "note",
+    "overview", "details", "general", "common", "misc", "other", "part",
+    "step", "section", "skill", "skills",
+}
+
 KNOWN_PATH_ROOTS = {
     "agents", "_agents", ".agents", ".gemini", "skills", "rules", "hooks",
     "scripts", "plugins", "tests", "documentation", "githooks", "references",
@@ -390,7 +425,98 @@ def check_active_ldap(ldap: str) -> bool:
         return True
 
 
-# Check SKILL.md, rules/*.md, and agents/*.md for structural, numbering, and MCP sync drift
+# Distinguish own local-config skills from symlinked or out-of-repo google3/third_party skills
+def _skill_origin(fpath: Path, repos: list[Path] | None) -> tuple[bool, str]:
+    is_sym = fpath.is_symlink() or fpath.parent.is_symlink()
+    try:
+        resolved = fpath.resolve()
+    except Exception:
+        resolved = fpath
+    skill_name = fpath.parent.name or resolved.parent.name
+    res_str = str(resolved)
+    if is_sym or res_str.startswith("/google/src/") or "third_party" in resolved.parts:
+        return True, skill_name
+    if repos:
+        in_any_repo = False
+        for r in repos:
+            try:
+                r_res = r.resolve()
+                if resolved == r_res or r_res in resolved.parents:
+                    in_any_repo = True
+                    break
+            except Exception:
+                pass
+        if not in_any_repo:
+            return True, skill_name
+    return False, skill_name
+
+
+# Extract YAML frontmatter description indicator and body without mixing block-scalar syntax
+def _extract_yaml_description(text: str) -> tuple[str | None, str, str]:
+    if not re.match(r"^---[ \t]*\r?\n", text):
+        return None, "", text
+    m_end = re.search(r"\r?\n---[ \t]*(?:\r?\n|\Z)", text[3:])
+    if not m_end:
+        return None, "", text
+    fm_lines = text[3 : 3 + m_end.start()].splitlines()
+    body_text = text[3 + m_end.end() :]
+    for i, line in enumerate(fm_lines):
+        m_key = re.match(r"^description:[ \t]*(.*)$", line)
+        if not m_key:
+            continue
+        first_val = m_key.group(1).strip()
+        cont: list[str] = []
+        for j in range(i + 1, len(fm_lines)):
+            nxt = fm_lines[j]
+            if nxt.strip() and not nxt.startswith((" ", "\t")):
+                break
+            cont.append(nxt.strip())
+        m_ind = re.match(r"^([>|][-+]?[0-9]*)(?:[ \t]+#.*)?$", first_val)
+        if m_ind:
+            indicator = m_ind.group(1)
+            desc_body = " ".join(c for c in cont if c)
+            return indicator, " ".join(desc_body.split()), body_text
+        parts = [first_val] + [c for c in cont if c]
+        joined = " ".join(p for p in parts if p)
+        if len(joined) >= 2 and joined[0] == joined[-1] and joined[0] in ("'", '"'):
+            joined = joined[1:-1].strip()
+        return "", " ".join(joined.split()), body_text
+    return None, "", body_text
+
+
+# Skip Python bytecode caches, hidden files, package markers, and unit tests in scripts/
+def _is_ignored_script_entry(entry: Path) -> bool:
+    name = entry.name
+    if name.startswith(".") or name in ("__pycache__", "__init__.py") or entry.is_dir():
+        return True
+    if entry.suffix.lower() in (".pyc", ".pyo"):
+        return True
+    low = name.lower()
+    if low.startswith("test_") or low in ("conftest.py", "test.py", "tests.py"):
+        return True
+    return bool(re.search(r"(?:_test|\.test|\.spec)\.[a-z0-9]+$", low))
+
+
+# Extract non-stopword topic tokens from a reference filename stem for blindness checks
+def _topic_keywords(stem: str) -> list[str]:
+    raw_words = [w.lower() for w in re.split(r"[^a-zA-Z0-9]+", stem) if len(w) >= 3]
+    filtered = [w for w in raw_words if w not in BLINDNESS_STOPWORDS]
+    return filtered if filtered else raw_words
+
+
+# Allow common English plural/participle stems (>=4 chars) to match singular trigger terms
+def _word_matches_description(word: str, desc_lower: str) -> bool:
+    if word in desc_lower:
+        return True
+    for suffix in ("ing", "ed", "es", "s"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 4:
+            root = word[: -len(suffix)]
+            if re.search(rf"\b{re.escape(root)}", desc_lower):
+                return True
+    return False
+
+
+# Check SKILL.md, rules/*.md, and agents/*.md for structural, size, orphan, and YAML drift
 def check_rule_skill_hygiene(
     lines: list[str],
     text: str,
@@ -398,28 +524,129 @@ def check_rule_skill_hygiene(
     repos: list[Path] | None = None,
 ) -> list[str]:
     warnings: list[str] = []
-    if fpath is not None and fpath.name == "SKILL.md" and text.startswith("---"):
-        fm_end = text.find("\n---", 3)
-        if fm_end > 0:
-            fm_block = text[3:fm_end]
-            m_desc = re.search(
-                r"^description:\s*(.+?)(?:\n[a-zA-Z_-]+:|\Z)",
-                fm_block,
-                re.M | re.S,
+    if fpath is not None and fpath.name == "SKILL.md":
+        is_external, skill_name = _skill_origin(fpath, repos)
+        skill_dir = fpath.parent
+        skill_lines = len(lines)
+        skill_bytes = fpath.stat().st_size if fpath.is_file() else len(text.encode("utf-8"))
+
+        # Enforce single-call read_file hard ceiling and tighter soft budget on own skills
+        exempt_ceiling = is_external and (
+            skill_name in EXTERNAL_CEILING_EXEMPT_SKILLS
+            or fpath.resolve().parent.name in EXTERNAL_CEILING_EXEMPT_SKILLS
+        )
+        if not exempt_ceiling and (
+            skill_lines > SKILL_HARD_MAX_LINES or skill_bytes > SKILL_HARD_MAX_BYTES
+        ):
+            warnings.append(
+                f"`SKILL.md` is {skill_lines} lines / {skill_bytes:,} bytes, exceeding "
+                f"`read_file` hard ceiling ({SKILL_HARD_MAX_LINES} lines / "
+                f"{SKILL_HARD_MAX_BYTES:,} bytes; split deep details into `references/*.md`)"
             )
-            if m_desc:
-                desc_clean = " ".join(m_desc.group(1).split())
-                if len(desc_clean) > 450:
+        elif not is_external and (
+            skill_lines > SKILL_SOFT_MAX_LINES or skill_bytes > SKILL_SOFT_MAX_BYTES
+        ):
+            warnings.append(
+                f"`SKILL.md` is {skill_lines} lines / {skill_bytes:,} bytes, exceeding "
+                f"own-skill soft ceiling ({SKILL_SOFT_MAX_LINES} lines / "
+                f"{SKILL_SOFT_MAX_BYTES:,} bytes; offload reference material to `references/*.md`)"
+            )
+
+        indicator, desc_clean, body_text = _extract_yaml_description(text)
+        if indicator is not None:
+            # Bare `>` appends a trailing newline to folded scalars; `>-` strips it cleanly
+            if indicator.startswith(">") and indicator != ">-":
+                warnings.append(
+                    f"YAML frontmatter uses bare `description: {indicator}`; "
+                    "use `description: >-` or a single-line scalar"
+                )
+            # Angle brackets collide with XML system-prompt skill tags in agent loaders
+            if "<" in desc_clean or ">" in desc_clean:
+                warnings.append(
+                    "YAML frontmatter `description:` contains angle brackets (`<` or `>`); "
+                    "remove HTML/XML tags and `<placeholder>` tokens from frontmatter"
+                )
+            # Keep CLI flags and script paths in SKILL.md body so agents read full invariants
+            for m_flag in DESC_CLI_FLAG_RE.finditer(desc_clean):
+                warnings.append(
+                    f"YAML frontmatter `description:` exposes CLI flag `{m_flag.group(1)}` "
+                    "(move flags to `SKILL.md` body so agents read `SKILL.md` before running)"
+                )
+            for m_exec in DESC_EXEC_PATH_RE.finditer(desc_clean):
+                warnings.append(
+                    f"YAML frontmatter `description:` exposes script/binary `{m_exec.group(0)}` "
+                    "(move executable names and paths to `SKILL.md` body)"
+                )
+            if len(desc_clean) > 450:
+                warnings.append(
+                    f"YAML frontmatter `description:` is {len(desc_clean)} chars "
+                    "(keep <= 450 chars: 1-sentence purpose + trigger phrases only; "
+                    "move multi-stage details to SKILL.md body)"
+                )
+
+        # Audit references/*.md for read_file truncation, 1-hop reachability, and topic blindness
+        refs_dir = skill_dir / "references"
+        if refs_dir.is_dir():
+            desc_lower = desc_clean.lower()
+            for rf in sorted(refs_dir.glob("*.md")):
+                if rf.name.startswith(".") or not rf.is_file():
+                    continue
+                rf_text = rf.read_text(encoding="utf-8", errors="replace")
+                rf_lines = len(rf_text.splitlines())
+                rf_bytes = rf.stat().st_size
+                if rf_bytes > REF_HARD_MAX_BYTES:
                     warnings.append(
-                        f"YAML frontmatter `description:` is {len(desc_clean)} chars "
-                        "(keep <= 450 chars: 1-sentence purpose + trigger phrases only; "
-                        "move multi-stage details to SKILL.md body)"
+                        f"`references/{rf.name}` is {rf_lines} lines / {rf_bytes:,} bytes, "
+                        f"exceeding `read_file` hard ceiling ({REF_HARD_MAX_BYTES:,} bytes)"
+                    )
+                elif rf_lines > REF_SOFT_MAX_LINES or rf_bytes > REF_SOFT_MAX_BYTES:
+                    warnings.append(
+                        f"`references/{rf.name}` is {rf_lines} lines / {rf_bytes:,} bytes "
+                        f"(keep <= {REF_SOFT_MAX_LINES} lines and <= {REF_SOFT_MAX_BYTES:,} "
+                        f"bytes; hard ceiling {REF_HARD_MAX_BYTES:,} bytes)"
+                    )
+                if rf.name not in body_text:
+                    warnings.append(
+                        f"Orphan reference `references/{rf.name}` is never mentioned by "
+                        "basename in `SKILL.md`"
+                    )
+                # Ensure reference topics surface in description so skill discovery can match them
+                if indicator is not None and rf.name.lower() not in (
+                    "readme.md",
+                    "contributing.md",
+                ):
+                    kws = _topic_keywords(rf.stem)
+                    if kws and not any(_word_matches_description(w, desc_lower) for w in kws):
+                        warnings.append(
+                            f"Frontmatter blindness: `references/{rf.name}` topic keywords "
+                            f"{kws} do not appear in YAML `description:`"
+                        )
+
+        # Require every non-test script in scripts/ to be linked or named in SKILL.md body
+        scripts_dir = skill_dir / "scripts"
+        if scripts_dir.is_dir():
+            for sf in sorted(scripts_dir.iterdir()):
+                if _is_ignored_script_entry(sf):
+                    continue
+                if sf.name not in body_text:
+                    warnings.append(
+                        f"Orphan script `scripts/{sf.name}` is never mentioned by basename "
+                        "in `SKILL.md`"
                     )
     elif fpath is not None and fpath.parent.name == "rules" and fpath.suffix == ".md":
+        # Compare resolved paths so un-resolved orig_fpath never flags itself as its own sibling
+        try:
+            self_res = fpath.resolve()
+        except Exception:
+            self_res = fpath
         sibling_headings: dict[str, str] = {}
         for sib in sorted(fpath.parent.glob("*.md")):
-            if sib == fpath:
-                continue
+            try:
+                if sib.resolve() == self_res:
+                    continue
+            except Exception:
+                if sib == fpath:
+                    continue
             for sline in sib.read_text(encoding="utf-8", errors="ignore").splitlines():
                 shm = HEADING_RE.match(sline)
                 if shm:
@@ -435,16 +662,69 @@ def check_rule_skill_hygiene(
                         "splitting across rule files)"
                     )
 
-    # Check sequential numbered headings, ordered list items, and N-Rule Gate cardinality
+    # Scan fenced bash/sh commands, Markdown table inline code, and heading/list numbering
     in_fence = False
+    fence_marker = ""
+    fence_lang = ""
+    prev_bash_continues = False
+    heredoc_delim: str | None = None
     heading_nums: dict[int, int] = {}
     list_nums: dict[int, int] = {}
     for idx, line in enumerate(lines, start=1):
-        if line.strip().startswith("```"):
-            in_fence = not in_fence
-            continue
+        # Match fence char and minimum length so 4-backtick blocks allow nested 3-backtick fences
+        m_fence = FENCE_OPEN_RE.match(line)
+        if m_fence:
+            ticks, info = m_fence.group(1), m_fence.group(2).strip()
+            if not in_fence:
+                in_fence = True
+                fence_marker = ticks
+                fence_lang = info.split()[0].lower() if info else ""
+                prev_bash_continues = False
+                heredoc_delim = None
+                continue
+            if ticks[0] == fence_marker[0] and len(ticks) >= len(fence_marker) and not info:
+                in_fence = False
+                fence_marker = ""
+                fence_lang = ""
+                prev_bash_continues = False
+                heredoc_delim = None
+                continue
         if in_fence:
+            if fence_lang in BASH_FENCE_LANGS:
+                stripped_cmd = line.strip()
+                if heredoc_delim is not None:
+                    if stripped_cmd == heredoc_delim:
+                        heredoc_delim = None
+                    continue
+                if not stripped_cmd or stripped_cmd.startswith("#"):
+                    continue
+                if not prev_bash_continues:
+                    # Subshells do not persist variables across run_command calls or allowlists
+                    m_var = BASH_VAR_CMD_RE.match(line)
+                    if m_var:
+                        warnings.append(
+                            f"Line {idx}: Bash command starts with variable `{m_var.group(1)}` "
+                            "(use literal command/binary paths instead of `$VAR` prefixes)"
+                        )
+                m_hd = HEREDOC_OPEN_RE.search(line)
+                if m_hd:
+                    heredoc_delim = m_hd.group(1)
+                    prev_bash_continues = False
+                else:
+                    prev_bash_continues = stripped_cmd.endswith("\\")
             continue
+
+        stripped_line = line.strip()
+        if stripped_line.startswith("|") and stripped_line.endswith("|"):
+            # GFM splits table cells on unescaped `|` before parsing inline backtick spans
+            for m_span in INLINE_CODE_SPAN_RE.finditer(line):
+                span_body = m_span.group(2)
+                if UNESCAPED_PIPE_RE.search(span_body):
+                    warnings.append(
+                        f"Line {idx}: Markdown table row has unescaped `|` inside inline code "
+                        f"`{span_body}` (escape as `\\|` so GFM does not split the table cell)"
+                    )
+
         if line.startswith("#"):
             lvl = len(line) - len(line.lstrip("#"))
             for k in [k for k in heading_nums if k > lvl]:
@@ -806,11 +1086,13 @@ def main() -> int:
 
         # [8] Rule & Skill Deduplication / Always-On Budget Check (R20 & R81)
         if file_arg != "-":
-            fpath = Path(file_arg).resolve()
+            # Keep pre-resolve path so _skill_origin sees symlinks into external skill trees
+            orig_fpath = Path(os.path.abspath(os.path.expanduser(file_arg)))
+            fpath = orig_fpath.resolve()
             if fpath.name in ("SKILL.md", "AGENTS.md") or (
                 fpath.parent.name in ("rules", "agents") and fpath.suffix == ".md"
             ):
-                hygiene_warnings = check_rule_skill_hygiene(lines, text, fpath, repos)
+                hygiene_warnings = check_rule_skill_hygiene(lines, text, orig_fpath, repos)
                 print(
                     f"\n[8] Rule & Skill Hygiene / Always-On Budget "
                     f"({len(hygiene_warnings)} warning(s)):"
@@ -818,6 +1100,8 @@ def main() -> int:
                 if hygiene_warnings:
                     for w in hygiene_warnings:
                         print(f"  - {w}")
+                    # Count Section [8] warnings so CLI callers get exit code 1 on hygiene drift
+                    total_issues += len(hygiene_warnings)
                 else:
                     print("  None (frontmatter, numbering, and rule/skill hygiene clean)")
 

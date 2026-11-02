@@ -1,10 +1,10 @@
 ---
 name: code-comments
 description: >-
-  Add, rewrite, compress, or remove code comments across files, commits, or git diffs (`audit_comments.py`),
-  enforcing concise English rationale comments ("why" over "what", 1–4 lines, no trailing period
-  outside Dart). Use when the user asks to "причеши комментарии", "прокомментируй дифф", "убери
-  лишние комментарии", or "проверь комментарии".
+  Add, rewrite, compress, or remove code comments across files, commits, or git diffs, enforcing
+  concise English rationale comments ("why" over "what", 1–4 lines, no trailing period outside
+  Dart). Use when the user asks to "причеши комментарии", "прокомментируй дифф", "убери лишние
+  комментарии", or "проверь комментарии".
 ---
 
 # Code Comment Curator (`code-comments`)

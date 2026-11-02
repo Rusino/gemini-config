@@ -217,7 +217,8 @@ class TestRuthlessCodeAudit(unittest.TestCase):
     ):
       rc = cdg.main()
     printed = out.getvalue()
-    self.assertEqual(rc, 0, printed)
+    # Section [8] hygiene warnings increment total_issues so main() returns exit code 1
+    self.assertEqual(rc, 1, printed)
     self.assertIn("Unresolved / Missing Paths (0 missing, 1 verified)", printed)
     self.assertIn("460 chars (keep <= 450 chars", printed)
     self.assertIn("Heading `Shared Heading` duplicates section in `rules/second.md`", printed)

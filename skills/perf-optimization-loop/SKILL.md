@@ -2,10 +2,10 @@
 name: perf-optimization-loop
 description: >-
   Iterative C++/Dart/TS performance optimization protocol for SkParagraph, WebParagraph, and
-  SkShaper (`opt_ledger.py`, `bench_compare.py` bootstrap 95% CI `Perf:` trailers, and
-  `opt_branch_audit.py`). Trigger when asked to "оптимизируй производительность", "ускорь layout",
-  "сделай perf-цикл", "замерь ускорение", "проверь perf-ветку", "сравни производительность двух
-  версий", or "perf optimization loop".
+  SkShaper (persistent attempt ledger, bootstrap 95% CI `Perf:` trailers, and branch audit).
+  Trigger when asked to "оптимизируй производительность", "ускорь layout", "сделай perf-цикл",
+  "замерь ускорение", "проверь perf-ветку", "сравни производительность двух версий", or "perf
+  optimization loop".
 ---
 
 # Performance Optimization Loop (`perf-optimization-loop`)

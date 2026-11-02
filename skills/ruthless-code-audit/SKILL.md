@@ -2,8 +2,8 @@
 name: ruthless-code-audit
 description: >-
   End-to-end code review and feature utility audit across repositories, packages, branches, or
-  diffs (`ruthless_audit.py`, semantic review, `keeper_skeptic` refutation, and `DELETE / SIMPLIFY
-  / KEEP` pruning plan). Trigger when asked to "проведи аудит кода", "беспощадный аудит",
+  diffs (deterministic clone scan, semantic review, `keeper_skeptic` refutation, and `DELETE /
+  SIMPLIFY / KEEP` pruning plan). Trigger when asked to "проведи аудит кода", "беспощадный аудит",
   "проверь на дублирование и ужасы", "оцени полезность функционала", "найди мёртвый код", or
   "ruthless code review / audit".
 ---

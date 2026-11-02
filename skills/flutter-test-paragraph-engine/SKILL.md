@@ -2,10 +2,9 @@
 name: flutter-test-paragraph-engine
 description: >-
   Build the Flutter engine with custom Skia/SkParagraph changes and run the canonical ~2400
-  Flutter text/paragraph/editable/dropdown tests (`run_flutter_paragraph_tests.py`, or `--full`
-  sharded mode). Trigger when asked to "протестируй параграф во Флаттере", "протестируй параграф",
-  "прогони тесты параграфа", "test paragraph in Flutter", or before uploading SkParagraph/SkUnicode
-  changes.
+  Flutter text/paragraph/editable/dropdown tests (targeted or full sharded mode). Trigger when
+  asked to "протестируй параграф во Флаттере", "протестируй параграф", "прогони тесты параграфа",
+  "test paragraph in Flutter", or before uploading SkParagraph/SkUnicode changes.
 ---
 
 # Testing Custom Skia / SkParagraph in Flutter Engine

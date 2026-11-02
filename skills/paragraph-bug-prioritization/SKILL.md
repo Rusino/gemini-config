@@ -3,9 +3,9 @@ name: paragraph-bug-prioritization
 description: >-
   Impact-driven bug discovery and prioritization for WebParagraph and SkParagraph using nonlinear
   `score_nl = S_nl[S_release] * R * P`, cached google3 + GitHub reach profiles, and zoom scans.
-  Trigger automatically on newly discovered master side-bugs or filed issues (`--intake-id`), or
-  when asked to "приоритизируй баги", "отранжируй баги параграфа", "пересчитай приоритеты",
-  "приоритизируй SkParagraph", or "run paragraph bug prioritization".
+  Trigger automatically on newly discovered master side-bugs or filed issues, or when asked to
+  "приоритизируй баги", "отранжируй баги параграфа", "пересчитай приоритеты", "приоритизируй
+  SkParagraph", or "run paragraph bug prioritization".
 ---
 
 # Impact-Driven Paragraph Bug Prioritization (`paragraph-bug-prioritization`)

@@ -1,11 +1,11 @@
 ---
 name: review-triage
 description: >-
-  Automated Code Review Triage and Action Engine for Gerrit CLs, Git PRs, and Piper diffs
-  (4 triage categories, core 5% hunk isolation, `keeper_skeptic` refutation + `finding_ledger.py`,
-  and default `companion-cl-review` WIP CL execution unless opted out with "без компаньона" /
-  "только текстом"). Trigger when the user asks to "разбери СЛ", "сделай триаж ревью", "оцени СЛ",
-  "посмотри этот ревью", "triage this CL/PR", or "что делать с этим ревью".
+  Code Review Triage and Action Engine for Gerrit CLs, Git PRs, and Piper diffs (4 triage
+  categories, core 5% hunk isolation, `keeper_skeptic` refutation + finding ledger, and default
+  `companion-cl-review` WIP CL unless opted out with "без компаньона" / "только текстом").
+  Trigger when asked to "разбери СЛ", "сделай триаж ревью", "оцени СЛ", "посмотри этот ревью",
+  "triage this CL/PR", or "что делать с этим ревью".
 ---
 
 # Code Review Triage & Action Engine (`review-triage`)

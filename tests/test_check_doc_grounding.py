@@ -183,6 +183,248 @@ class TestCheckDocGrounding(unittest.TestCase):
     )
     self.assertTrue(any("google_gmail_google_gmail" in w for w in w_mcp))
 
+  def test_section8_hygiene_warnings_return_nonzero_exit_code(self) -> None:
+    import io
+    from unittest import mock
+
+    skill_dir = self.repo_dir / "skills" / "bad-skill"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(
+        "---\nname: bad-skill\ndescription: >\n  Uses bare folded scalar.\n---\n# Bad Skill\n",
+        encoding="utf-8",
+    )
+
+    out = io.StringIO()
+    with (
+        mock.patch.object(
+            cdg.sys,
+            "argv",
+            ["check_doc_grounding.py", "--repo", str(self.repo_dir), str(skill_md)],
+        ),
+        mock.patch("sys.stdout", out),
+    ):
+      rc = cdg.main()
+    self.assertEqual(rc, 1, out.getvalue())
+
+    clean_dir = self.repo_dir / "skills" / "clean-skill"
+    clean_dir.mkdir(parents=True, exist_ok=True)
+    clean_md = clean_dir / "SKILL.md"
+    clean_md.write_text(
+        "---\nname: clean-skill\ndescription: >-\n  Clean skill summary.\n---\n# Clean Skill\n",
+        encoding="utf-8",
+    )
+    out_clean = io.StringIO()
+    with (
+        mock.patch.object(
+            cdg.sys,
+            "argv",
+            ["check_doc_grounding.py", "--repo", str(self.repo_dir), str(clean_md)],
+        ),
+        mock.patch("sys.stdout", out_clean),
+    ):
+      rc_clean = cdg.main()
+    self.assertEqual(rc_clean, 0, out_clean.getvalue())
+
+  def test_skill_and_reference_line_and_byte_limits(self) -> None:
+    # Own skill exceeding 400 lines triggers soft warning
+    own_dir = self.repo_dir / "skills" / "own-large"
+    own_dir.mkdir(parents=True, exist_ok=True)
+    own_md = own_dir / "SKILL.md"
+    soft_lines_doc = (
+        "---\nname: own-large\ndescription: >-\n  Valid summary.\n---\n"
+        + "".join(f"Line {i}\n" for i in range(400))
+    )
+    own_md.write_text(soft_lines_doc, encoding="utf-8")
+    w_soft = cdg.check_rule_skill_hygiene(
+        soft_lines_doc.splitlines(), soft_lines_doc, own_md, [self.repo_dir]
+    )
+    self.assertTrue(any("400" in w for w in w_soft), w_soft)
+
+    # Own skill exceeding 40,000 bytes (even with < 400 lines) triggers soft warning
+    soft_bytes_doc = (
+        "---\nname: own-large\ndescription: >-\n  Valid summary.\n---\n"
+        + ("x" * 250 + "\n") * 165
+    )
+    own_md.write_text(soft_bytes_doc, encoding="utf-8")
+    w_soft_b = cdg.check_rule_skill_hygiene(
+        soft_bytes_doc.splitlines(), soft_bytes_doc, own_md, [self.repo_dir]
+    )
+    self.assertTrue(any("40,000" in w or "40000" in w for w in w_soft_b), w_soft_b)
+
+    # Hard ceiling (> 800 lines or > 46,080 bytes) fires on own and non-exempt external skills
+    ext_root = Path(self.temp_dir) / "external_skills"
+    ext_other = ext_root / "other-ext"
+    ext_other.mkdir(parents=True, exist_ok=True)
+    hard_doc = (
+        "---\nname: other-ext\ndescription: >-\n  Valid summary.\n---\n"
+        + "".join(f"Line {i}\n" for i in range(805))
+    )
+    (ext_other / "SKILL.md").write_text(hard_doc, encoding="utf-8")
+    sym_other = self.repo_dir / "skills" / "other-ext"
+    os.symlink(ext_other, sym_other)
+    w_hard = cdg.check_rule_skill_hygiene(
+        hard_doc.splitlines(), hard_doc, sym_other / "SKILL.md", [self.repo_dir]
+    )
+    self.assertTrue(any("800" in w or "46,080" in w for w in w_hard), w_hard)
+
+    # External gsheets / gslides symlink is exempt from SKILL.md soft and hard ceilings
+    ext_gsheets = ext_root / "gsheets"
+    ext_gsheets.mkdir(parents=True, exist_ok=True)
+    gsheets_doc = (
+        "---\nname: gsheets\ndescription: >-\n  Valid summary.\n---\n"
+        + "".join(f"Line {i}\n" for i in range(820))
+    )
+    (ext_gsheets / "SKILL.md").write_text(gsheets_doc, encoding="utf-8")
+    sym_gsheets = self.repo_dir / "skills" / "gsheets"
+    os.symlink(ext_gsheets, sym_gsheets)
+    w_gsheets = cdg.check_rule_skill_hygiene(
+        gsheets_doc.splitlines(), gsheets_doc, sym_gsheets / "SKILL.md", [self.repo_dir]
+    )
+    self.assertEqual(w_gsheets, [])
+
+    # Reference file limits: <= 500 lines & <= 42,000 bytes (hard ceiling 46,080 bytes)
+    ref_skill = self.repo_dir / "skills" / "ref-skill"
+    refs_dir = ref_skill / "references"
+    refs_dir.mkdir(parents=True, exist_ok=True)
+    (refs_dir / "big_topic.md").write_text(
+        "".join(f"Ref line {i}\n" for i in range(505)), encoding="utf-8"
+    )
+    (refs_dir / "huge_bytes.md").write_text(("y" * 250 + "\n") * 190, encoding="utf-8")
+    ref_skill_doc = (
+        "---\nname: ref-skill\n"
+        "description: >-\n  Covers big topic and huge bytes workflows.\n---\n"
+        "See `references/big_topic.md` and `references/huge_bytes.md`.\n"
+    )
+    (ref_skill / "SKILL.md").write_text(ref_skill_doc, encoding="utf-8")
+    w_refs = cdg.check_rule_skill_hygiene(
+        ref_skill_doc.splitlines(), ref_skill_doc, ref_skill / "SKILL.md", [self.repo_dir]
+    )
+    joined_refs = "\n".join(w_refs)
+    self.assertIn("big_topic.md", joined_refs)
+    self.assertIn("500", joined_refs)
+    self.assertIn("huge_bytes.md", joined_refs)
+    self.assertIn("46,080", joined_refs)
+
+  def test_one_hop_orphan_file_check(self) -> None:
+    skill_dir = self.repo_dir / "skills" / "orphan-demo"
+    (skill_dir / "references").mkdir(parents=True, exist_ok=True)
+    (skill_dir / "scripts" / "__pycache__").mkdir(parents=True, exist_ok=True)
+
+    (skill_dir / "references" / "linked_topic.md").write_text("# Linked\n", encoding="utf-8")
+    (skill_dir / "references" / "orphan_topic.md").write_text("# Orphan\n", encoding="utf-8")
+    (skill_dir / "references" / ".hidden.md").write_text("# Hidden\n", encoding="utf-8")
+
+    (skill_dir / "scripts" / "used_tool.py").write_text("print(1)\n", encoding="utf-8")
+    (skill_dir / "scripts" / "orphan_helper.py").write_text("print(2)\n", encoding="utf-8")
+    (skill_dir / "scripts" / "test_used_tool.py").write_text("print(3)\n", encoding="utf-8")
+    (skill_dir / "scripts" / "used_tool_test.py").write_text("print(4)\n", encoding="utf-8")
+    (skill_dir / "scripts" / "cached.pyc").write_bytes(b"\x00")
+    (skill_dir / "scripts" / ".env").write_text("X=1\n", encoding="utf-8")
+    (skill_dir / "scripts" / "__pycache__" / "used_tool.cpython-313.pyc").write_bytes(b"\x00")
+
+    doc = (
+        "---\nname: orphan-demo\n"
+        "description: >-\n  Handles linked and orphan demo topics.\n---\n"
+        "Read `references/linked_topic.md` and run `used_tool.py`.\n"
+    )
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(doc, encoding="utf-8")
+
+    warnings = cdg.check_rule_skill_hygiene(
+        doc.splitlines(), doc, skill_md, [self.repo_dir]
+    )
+    joined = "\n".join(warnings)
+    self.assertIn("orphan_topic.md", joined)
+    self.assertIn("orphan_helper.py", joined)
+    self.assertNotIn("linked_topic.md", joined)
+    self.assertNotIn("used_tool.py", joined)
+    self.assertNotIn("test_used_tool.py", joined)
+    self.assertNotIn("used_tool_test.py", joined)
+    self.assertNotIn("cached.pyc", joined)
+    self.assertNotIn(".hidden.md", joined)
+    self.assertNotIn(".env", joined)
+
+  def test_yaml_description_hygiene_and_frontmatter_blindness(self) -> None:
+    skill_dir = self.repo_dir / "skills" / "desc-check"
+    (skill_dir / "references").mkdir(parents=True, exist_ok=True)
+    (skill_dir / "references" / "README.md").write_text("# Ignored\n", encoding="utf-8")
+    (skill_dir / "references" / "contributing.md").write_text("# Ignored\n", encoding="utf-8")
+    (skill_dir / "references" / "skill_bidi.md").write_text("# BiDi\n", encoding="utf-8")
+
+    bad_doc = (
+        "---\nname: desc-check\n"
+        "description: >\n"
+        "  Run `audit_tool.py` with `--intake-id` or `/google/bin/releases/x/cli` to generate\n"
+        "  `<stem>_diff.html` for this skill.\n"
+        "---\n"
+        "See `README.md`, `contributing.md`, and `skill_bidi.md`.\n"
+    )
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(bad_doc, encoding="utf-8")
+    w_bad = cdg.check_rule_skill_hygiene(
+        bad_doc.splitlines(), bad_doc, skill_md, [self.repo_dir]
+    )
+    joined_bad = "\n".join(w_bad)
+    self.assertIn("description: >", joined_bad)
+    self.assertIn("<", joined_bad)
+    self.assertIn("--intake-id", joined_bad)
+    self.assertIn("audit_tool.py", joined_bad)
+    self.assertIn("skill_bidi.md", joined_bad)
+    self.assertNotIn("README.md", joined_bad)
+    self.assertNotIn("contributing.md", joined_bad)
+
+    # Clean description with >-, prose slashes, URLs, artifact names, and topic keyword 'BiDi'
+    good_doc = (
+        "---\nname: desc-check\n"
+        "description: >-\n"
+        "  Audits C++/Dart/TS and BiDi layout across docs.google.com/spreadsheets, `.csv`,\n"
+        "  `compare.md`, and `attestation.json`.\n"
+        "---\n"
+        "See `README.md`, `contributing.md`, and `skill_bidi.md`.\n"
+    )
+    skill_md.write_text(good_doc, encoding="utf-8")
+    w_good = cdg.check_rule_skill_hygiene(
+        good_doc.splitlines(), good_doc, skill_md, [self.repo_dir]
+    )
+    self.assertEqual(w_good, [])
+
+  def test_bash_var_command_prefix_and_table_inline_code_pipes(self) -> None:
+    skill_dir = self.repo_dir / "skills" / "fmt-check"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_md = skill_dir / "SKILL.md"
+    doc = (
+        "---\nname: fmt-check\ndescription: >-\n  Valid summary.\n---\n"
+        "# Formatting Check\n\n"
+        "```bash\n"
+        "MY_BIN=/usr/bin/env\n"
+        "echo $MY_BIN is set\n"
+        "python3 run.py \\\n"
+        "  $OUT_DIR --verbose\n"
+        "$MY_BIN subcommand --flag\n"
+        "```\n\n"
+        "```python\n"
+        "# Inside python fence, not bash\n"
+        "$NOT_BASH something\n"
+        "```\n\n"
+        "| Command | Notes |\n"
+        "|---|---|\n"
+        "| `handoff --model <id\\|name>` | Escaped `\\|` is valid |\n"
+        "| `foo` | `bar` |\n"
+        "| `run --mode a|b` | Unescaped pipe breaks GFM table |\n"
+    )
+    skill_md.write_text(doc, encoding="utf-8")
+    warnings = cdg.check_rule_skill_hygiene(
+        doc.splitlines(), doc, skill_md, [self.repo_dir]
+    )
+    joined = "\n".join(warnings)
+    self.assertIn("$MY_BIN", joined)
+    self.assertNotIn("$OUT_DIR", joined)
+    self.assertNotIn("$NOT_BASH", joined)
+    self.assertIn("a|b", joined)
+    self.assertNotIn("id\\|name", joined)
+    self.assertEqual(len(warnings), 2, warnings)
+
 
 if __name__ == "__main__":
   unittest.main()

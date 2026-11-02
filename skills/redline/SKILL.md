@@ -1,11 +1,11 @@
 ---
 name: redline
 description: >-
-  Generate a rendered-Markdown HTML redline (`<stem>_diff.html`) with green `<ins>` and red
-  strikethrough `<del>` between two versions of a document (files, git revisions, transcript
-  snapshots, or Google Docs) and verify via headless browser screenshot. Trigger after editing a
-  document the user already read, or when asked to "покажи изменения", "что поменялось",
-  "покажи дифф документа", "зелёным и красным зачёркнутым", or "redline".
+  Generate a rendered-Markdown HTML redline diff with green insertions and red strikethrough
+  deletions between two versions of a document (files, git revisions, transcript snapshots, or
+  Google Docs) and verify via headless browser screenshot. Trigger after editing a document the
+  user already read, or when asked to "покажи изменения", "что поменялось", "покажи дифф
+  документа", "зелёным и красным зачёркнутым", or "redline".
 ---
 
 # Document Redline Skill (`redline`)

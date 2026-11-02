@@ -2,7 +2,7 @@
 name: amnesia-doc-check
 description: >-
   Clean-context fact-checking, self-consistency, and referential grounding pipeline for incoming
-  and outgoing documents, specs, and technical writeups (`check_doc_grounding.py` + Hunter +
+  and outgoing documents, specs, and technical writeups (deterministic grounding razor + Hunter +
   `keeper_skeptic`). Trigger before sharing docs externally, when reading incoming specs, or when
   asked to "проверь документ", "проверь док на лажу", "проверь на непротиворечивость",
   "сделай амнезия-проверку дока", or "run amnesia doc check".
@@ -56,6 +56,7 @@ If the text only exists in memory (e.g., a drafted CL description or message), p
 Immediately fix any deterministic failures that are obvious typos before or alongside Phase 2:
 - Leftover LLM markers (`[find link]`, `[insert ...]`, `(AI evaluation...)`, `TBD`, `TODO`, empty markdown links).
 - Wrong directory prefixes where `check_doc_grounding.py` identifies the existing same-basename path in the repo.
+- Section `[8]` rule and `SKILL.md` hygiene warnings (`read_file` line/byte ceilings, 1-hop orphan reference or script files, YAML `description` flags/paths/angle brackets/blindness, bash `$VAR` command prefixes, and unescaped `|` inside table inline code).
 
 ---
 
