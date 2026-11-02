@@ -144,32 +144,48 @@ def parse_ninja_actions(ninja_log_path: pathlib.Path) -> str:
     return "ran"
 
 
-def set_gn_unicode_backend(gn_args_file: pathlib.Path, mode: str) -> None:
+def set_gn_unicode_backend(
+    gn_args_file: pathlib.Path,
+    mode: str,
+    skia_repo: Optional[pathlib.Path] = None,
+    engine_src: Optional[pathlib.Path] = None,
+) -> None:
     if mode == "keep" or not gn_args_file.exists():
         return
     text = gn_args_file.read_text(errors="replace")
     lines = text.splitlines()
     out_lines: list[str] = []
-    saw_icu = False
-    saw_apple = False
     want_apple = mode == "apple"
     want_icu = mode == "icu"
 
+    engine_has_ct_arg = False
+    if engine_src is not None:
+        skp_gn = engine_src / "flutter/skia/modules/skparagraph/BUILD.gn"
+        engine_has_ct_arg = skp_gn.exists() and (
+            "skia_use_coretext_paragraph" in skp_gn.read_text(errors="replace")
+        )
+    skia_has_ct_shaper = False
+    if skia_repo is not None:
+        style_h = skia_repo / "modules/skparagraph/include/ParagraphStyle.h"
+        skia_has_ct_shaper = style_h.exists() and (
+            "TextShapingEngine" in style_h.read_text(errors="replace")
+        )
+
+    managed_re = re.compile(
+        r"^\s*(skia_use_icu|skia_use_apple_unicode|skia_use_harfbuzz|skia_use_coretext_paragraph)\s*="
+    )
     for ln in lines:
-        if re.match(r"^\s*skia_use_icu\s*=", ln):
-            out_lines.append(f"skia_use_icu = {'true' if want_icu else 'false'}")
-            saw_icu = True
-        elif re.match(r"^\s*skia_use_apple_unicode\s*=", ln):
-            if want_apple:
-                out_lines.append("skia_use_apple_unicode = true")
-            saw_apple = True
-        else:
+        if not managed_re.match(ln):
             out_lines.append(ln)
 
-    if not saw_icu:
-        out_lines.append(f"skia_use_icu = {'true' if want_icu else 'false'}")
-    if want_apple and not saw_apple:
+    out_lines.append(f"skia_use_icu = {'true' if want_icu else 'false'}")
+    if want_apple:
         out_lines.append("skia_use_apple_unicode = true")
+        if engine_has_ct_arg:
+            if skia_has_ct_shaper:
+                out_lines.append("skia_use_harfbuzz = false")
+            else:
+                out_lines.append("skia_use_coretext_paragraph = false")
 
     new_text = "\n".join(out_lines) + "\n"
     if new_text != text:
@@ -264,12 +280,15 @@ def detect_unicode_backend(build_dir: pathlib.Path, requested_mode: str = "keep"
     gn_args_file = build_dir / "args.gn"
     gn_apple = False
     gn_icu = True
+    gn_harfbuzz = True
     if gn_args_file.exists():
         gn_text = gn_args_file.read_text(errors="replace")
         if re.search(r"^\s*skia_use_apple_unicode\s*=\s*true\b", gn_text, re.M):
             gn_apple = True
         if re.search(r"^\s*skia_use_icu\s*=\s*false\b", gn_text, re.M):
             gn_icu = False
+        if re.search(r"^\s*skia_use_harfbuzz\s*=\s*false\b", gn_text, re.M):
+            gn_harfbuzz = False
 
     txt_bin = build_dir / "exe.unstripped/txt_unittests"
     if not txt_bin.exists():
@@ -279,12 +298,16 @@ def detect_unicode_backend(build_dir: pathlib.Path, requested_mode: str = "keep"
         tester_bin = build_dir / "flutter_tester"
     has_apple_sym = False
     has_icu_sym = False
+    has_ct_shaper_sym = False
+    has_hb_shaper_sym = False
     if txt_bin.exists():
         nm_res = subprocess.run(
             ["nm", str(txt_bin)], capture_output=True, text=True, check=False
         )
         has_apple_sym = "_ZN10SkUnicodes5Apple4MakeEv" in nm_res.stdout
         has_icu_sym = "_ZN10SkUnicodes3ICU4MakeEv" in nm_res.stdout
+        has_ct_shaper_sym = "CoreTextLineShaper" in nm_res.stdout
+        has_hb_shaper_sym = "OneLineShaper" in nm_res.stdout
     elif tester_bin.exists():
         nm_res = subprocess.run(
             ["nm", "-u", str(tester_bin)], capture_output=True, text=True, check=False
@@ -292,7 +315,12 @@ def detect_unicode_backend(build_dir: pathlib.Path, requested_mode: str = "keep"
         has_apple_sym = "CFStringTokenizerCreate" in nm_res.stdout
         has_icu_sym = bool(re.search(r"\b_?ubrk_open\b|\b_?u_strToUTF8\b", nm_res.stdout))
 
-    if gn_apple and has_apple_sym and not has_icu_sym:
+    if not gn_harfbuzz and txt_bin.exists() and (not has_ct_shaper_sym or has_hb_shaper_sym):
+        backend = (
+            f"MISMATCH(gn_harfbuzz=False,sym_ct_shaper={has_ct_shaper_sym},"
+            f"sym_hb_shaper={has_hb_shaper_sym})"
+        )
+    elif gn_apple and has_apple_sym and not has_icu_sym:
         backend = "Apple (CFString/CoreText)"
     elif not gn_apple and has_icu_sym and not has_apple_sym:
         backend = "ICU"
@@ -304,8 +332,11 @@ def detect_unicode_backend(build_dir: pathlib.Path, requested_mode: str = "keep"
         "unicode_backend": backend,
         "gn_skia_use_apple_unicode": gn_apple,
         "gn_skia_use_icu": gn_icu,
+        "gn_skia_use_harfbuzz": gn_harfbuzz,
         "sym_apple_make": has_apple_sym,
         "sym_icu_make": has_icu_sym,
+        "sym_coretext_shaper": has_ct_shaper_sym,
+        "sym_onelineshaper": has_hb_shaper_sym,
     }
 
 
@@ -763,7 +794,7 @@ def main() -> int:
             git_meta = checkout_skia_ref(
                 skia_repo, ref, worktree_patch, ext_skia_repo, orig_branch_or_sha
             )
-            set_gn_unicode_backend(gn_args_file, target_unicode)
+            set_gn_unicode_backend(gn_args_file, target_unicode, skia_repo, engine_src)
 
             attestation: dict[str, Any] = {
                 "label": label,
