@@ -851,12 +851,24 @@ console.log(JSON.stringify({
                 "parent_commit": "sha_p1_ps1",
                 "companion_to": "gerrit:1400001",
             },
+            "gerrit:1410007@unchatted": {
+                "item_key": "gerrit:1410007",
+                "target_id": "1410007",
+                "kind": "gerrit",
+                "host": w.GERRIT_SKIA_HOST,
+                "is_self": True,
+                "is_wip": False,
+                "status": "NEW",
+                "parent_commit": "sha_p1_ps2",
+                "companion_to": "gerrit:1400001",
+            },
         },
         "events": [],
     }
     remote_changes = [
         {"item_key": "gerrit:1410001", "target_id": "1410001", "kind": "gerrit"},
         {"item_key": "gerrit:1410006", "target_id": "1410006", "kind": "gerrit"},
+        {"item_key": "gerrit:1410007", "target_id": "1410007", "kind": "gerrit"},
         {"item_key": "gerrit:1400002", "target_id": "1400002", "kind": "gerrit"},
         {"item_key": "gerrit:1410002", "target_id": "1410002", "kind": "gerrit"},
         {"item_key": "gerrit:1400003", "target_id": "1400003", "kind": "gerrit"},
@@ -931,6 +943,15 @@ console.log(JSON.stringify({
             owner_email="jlavrova@google.com",
             subject="[skparagraph] Standalone CL rebased onto main",
             parent_commit="sha_main_new",
+        ),
+        "1410007": base_info(
+            "1410007",
+            is_self=True,
+            is_external=False,
+            role="author",
+            owner_email="jlavrova@google.com",
+            subject="[SkoreText] Own CL uploaded onto the merged 1400001",
+            parent_commit="sha_p1_ps2",
         ),
         "1400002": base_info(
             "1400002",
@@ -1067,6 +1088,7 @@ console.log(JSON.stringify({
     self.assertFalse(any("/1410003/abandon" in u for u in abandoned_urls))
     self.assertFalse(any("/1410005/abandon" in u for u in abandoned_urls))
     self.assertFalse(any("/1410006/abandon" in u for u in abandoned_urls))
+    self.assertFalse(any("/1410007/abandon" in u for u in abandoned_urls))
 
     items_out = out_state["items"]
     self.assertEqual(items_out["gerrit:1410001@unchatted"]["status"], "ABANDONED")
@@ -1076,6 +1098,8 @@ console.log(JSON.stringify({
     self.assertEqual(items_out["gerrit:1410005@unchatted"]["status"], "NEW")
     self.assertEqual(items_out["gerrit:1410006@unchatted"]["status"], "NEW")
     self.assertNotIn("companion_to", items_out["gerrit:1410006@unchatted"])
+    self.assertEqual(items_out["gerrit:1410007@unchatted"]["status"], "NEW")
+    self.assertNotIn("companion_to", items_out["gerrit:1410007@unchatted"])
 
 
 if __name__ == "__main__":

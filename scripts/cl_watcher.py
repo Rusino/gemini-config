@@ -8083,6 +8083,25 @@ def sync_once(
     elif comp_kind == "piper":
       fetched_cache[comp_to] = fetch_piper_cl_status(comp_tid)
 
+  # CQ submits a fresh patchset, so the final revision of a merged CL exists only on main:
+  # a CL based on it was uploaded onto main and is not a companion of the merged CL
+  for d in active_discovered:
+    comp_to = str(d.get("companion_to") or "").strip()
+    if not comp_to.startswith("gerrit:"):
+      continue
+    p_info = fetched_cache.get(comp_to) or {}
+    if str(p_info.get("status") or "").upper() != "MERGED":
+      continue
+    p_revs = p_info.get("revision_ps_by_sha") or {}
+    if not p_revs:
+      continue
+    d_info = fetched_cache.get(str(d.get("item_key") or "")) or {}
+    base_sha = str(d_info.get("parent_commit") or "").strip()
+    last_ps = max(int(ps or 0) for ps in p_revs.values())
+    # A base on an older patchset was stacked before the merge, so it stays a companion
+    if base_sha and int(p_revs.get(base_sha) or 0) == last_ps:
+      for k in ("companion_to", "is_companion", "companion_base_ps_hint"):
+        d.pop(k, None)
   # Match follow-up fix CLs/PRs to broken merged CLs/PRs and share parent chats
   link_fix_changes_to_parent_chats(
       active_discovered, fetched_cache, all_chat_candidates=all_chats
