@@ -179,6 +179,125 @@ console.log(JSON.stringify({
     self.assertIn(".title { font-size: 11.5px;", w.DASHBOARD_HTML)
     self.assertIn(".meta { font-size: 10.5px;", w.DASHBOARD_HTML)
 
+  def test_flight_path_renders_inline_named_stops_and_roll_states(self):
+    self.assertIn(".dot.warn", w.DASHBOARD_HTML)
+    self.assertNotIn(".row .stop span { display: none; }", w.DASHBOARD_HTML)
+
+    script_body = w.DASHBOARD_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    harness = script_body.split("\nboot();", 1)[0] + """
+const baseMerged = {
+  kind: 'gerrit', status: 'MERGED', phase: 'POST_SUBMIT_ROLLING',
+  revision: '1234567890abcdef', patchset: 4, url: 'https://example.com/cl/1'
+};
+const calmCl = Object.assign({}, baseMerged, {
+  post_submit: {
+    all_passed: false,
+    skia_status: '✓',
+    skia_status_detail: 'Clean on status.skia.org',
+    rolls: {
+      Android: {state: '✓', detail: 'Rolled (1d8d81bc)', url: 'https://roll.example/android'},
+      Chrome: {state: '✓', detail: 'Rolled (7a70dae4)', url: 'https://roll.example/chrome'},
+      Google3: {state: '⏳', detail: 'Waiting for roll window', url: 'https://roll.example/g3'},
+      Flutter: {state: '⏳', detail: 'Not rolled yet', url: 'https://roll.example/flutter'}
+    }
+  }
+});
+const activeFailingCl = Object.assign({}, baseMerged, {
+  post_submit: {
+    all_passed: false,
+    skia_status: '✓',
+    skia_status_detail: 'Clean on status.skia.org',
+    rolls: {
+      Android: {state: '🔄', detail: 'In CQ (3715fe5f)', url: 'https://roll.example/android'},
+      Chrome: {state: '✓', detail: 'Rolled (7a70dae4)', url: 'https://roll.example/chrome'},
+      Google3: {state: '✓', detail: 'Rolled (3715fe5f)', url: 'https://roll.example/g3'},
+      Flutter: {
+        state: '🟠',
+        detail: 'In failing roll, not blamed (866b61ca, failed=2)',
+        url: 'https://roll.example/flutter'
+      }
+    }
+  }
+});
+const skiaWarnCl = Object.assign({}, baseMerged, {
+  post_submit: {
+    all_passed: false,
+    skia_status: '⚠️',
+    skia_status_detail: 'Near a failing task, not blamed by Gardener',
+    incidents: [{
+      verdict: 'flake',
+      task_name: 'Test-Mac15-Clang-MacMini9.1-GPU-AppleM1-arm64-Release-All-NativeFonts',
+      task_url: 'https://status.skia.org/task/mac15'
+    }],
+    rolls: {
+      Android: {state: '✓', detail: 'Rolled (1d8d81bc)', url: 'https://roll.example/android'},
+      Chrome: {state: '⏳', detail: 'Waiting for roll window', url: 'https://roll.example/chrome'},
+      Google3: {state: '⏳', detail: 'Waiting for roll window', url: 'https://roll.example/g3'},
+      Flutter: {
+        state: '🔴',
+        detail: 'Blamed in failing roll (866b61ca, failed=1)',
+        url: 'https://roll.example/flutter'
+      }
+    }
+  }
+});
+console.log(JSON.stringify({
+  classes: {
+    ok: rollClass('✓'),
+    moving: rollClass('🔄'),
+    orange: rollClass('🟠'),
+    warn: rollClass('⚠️'),
+    bad: rollClass('🔴'),
+    wait: rollClass('⏳'),
+  },
+  calmRow: stateHtml(calmCl),
+  activeRow: stateHtml(activeFailingCl),
+  warnRow: stateHtml(skiaWarnCl),
+  warnCard: flightPath(skiaWarnCl, true),
+}));
+"""
+    proc = subprocess.run(
+        ["node", "-e", harness], capture_output=True, text=True, check=True
+    )
+    out = json.loads(proc.stdout.strip())
+    self.assertEqual(
+        out["classes"],
+        {
+            "ok": "ok",
+            "moving": "moving",
+            "orange": "warn",
+            "warn": "warn",
+            "bad": "bad",
+            "wait": "wait",
+        },
+    )
+
+    calm_html = out["calmRow"]
+    self.assertNotIn("of 4 products", calm_html)
+    self.assertNotIn("path-label", calm_html)
+    self.assertNotIn("path-notes", calm_html)
+    for stop_name in ("Skia", "Android", "Chrome", "Google3", "Flutter"):
+      self.assertIn(f"<span>{stop_name}</span>", calm_html)
+    self.assertIn("→", calm_html)
+
+    active_html = out["activeRow"]
+    self.assertNotIn("of 4 products", active_html)
+    self.assertIn('class="stop is-moving"', active_html)
+    self.assertIn('class="stop is-warn"', active_html)
+    self.assertIn("Android: in CQ", active_html)
+    self.assertIn("Flutter: failing roll, not blamed (2 failed)", active_html)
+    self.assertIn('title="Flutter: In failing roll, not blamed (866b61ca, failed=2)"', active_html)
+
+    warn_html = out["warnRow"]
+    self.assertIn('<i class="dot warn"></i><span>Skia</span>', warn_html)
+    self.assertIn("Skia: near", warn_html)
+    self.assertIn("Test-Mac15…Release-All-NativeFonts", warn_html)
+    self.assertIn("Flutter: blamed in roll (1 failed)", warn_html)
+
+    card_html = out["warnCard"]
+    self.assertIn('<i class="dot warn"></i><span>Skia</span>', card_html)
+    self.assertIn('<i class="dot bad"></i><span>Flutter</span>', card_html)
+
 
 if __name__ == "__main__":
   unittest.main()
