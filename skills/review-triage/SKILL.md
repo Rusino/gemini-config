@@ -199,11 +199,12 @@ named skill's `SKILL.md` was not read, when a report with a `Case 1-5` verdict l
    targeted external Gerrit CL reviews (outside Dry Mode and Self-Review Mode), always save the
    prepared English review comment (including the companion WIP CL link and patchset guide when a
    companion CL is uploaded) as a `/PATCHSET_LEVEL` draft directly on the parent CL's current
-   patchset (`PUT https://<host>/a/changes/<CL>/revisions/<PS>/drafts`, updating any existing
-   `/PATCHSET_LEVEL` draft on `<PS>` rather than duplicating), and also present the draft in chat
-   for the user to review and publish.
+   patchset (`GET https://<host>/a/changes/<CL>/revisions/<PS>/drafts` followed by in-place
+   `PUT .../drafts/<existing_id>`, or `PUT .../drafts` only when no matching draft exists), and
+   also present the draft in chat for the user to review and publish.
 3. **Gerrit Drafts & Thread Follow-ups**:
-   - Save the prepared review comment on the parent Gerrit CL via `PUT https://<host>/a/changes/<CL>/revisions/<PS>/drafts` using the OAuth token from `printf "protocol=https\nhost=%s\n\n" "<host>" | git-credential-luci get` and Python `json.dumps({"path": "/PATCHSET_LEVEL", "message": msg, "unresolved": unresolved})` (`unresolved: True` when there are defects/questions, `False` for clean approvals), including the full review explanation and companion WIP CL link/patchset guide. If `git-credential-luci` requires reauth, warn the user and still output the full draft in chat.
+   - Obtain the OAuth token from `printf "protocol=https\nhost=%s\n\n" "<host>" | git-credential-luci get` and serialize the payload via Python `json.dumps({"path": "/PATCHSET_LEVEL", "message": msg, "unresolved": unresolved})` (`unresolved: True` when there are defects/questions, `False` for clean approvals; or inline `path: "<file>", line: <N>` / `in_reply_to: "<comment_id>"`), including the full review explanation and companion WIP CL link/patchset guide. If `git-credential-luci` requires reauth, warn the user and still output the full draft in chat.
+   - **Mandatory In-Place Dedup Across All Drafts (b/580882306)**: Before saving **any** Gerrit draft (`/PATCHSET_LEVEL`, inline `file:line`, or `in_reply_to` thread reply), always query `GET https://<host>/a/changes/<CL>/revisions/<PS>/drafts` (strip the 4-byte `)]}'` prefix), search `drafts_data.get(path, [])` for an existing draft matching `(item.get("line") or None, item.get("in_reply_to") or None) == (payload.get("line") or None, payload.get("in_reply_to") or None)`, and update it in place via `PUT https://<host>/a/changes/<CL>/revisions/<PS>/drafts/<existing_id>` (calling `PUT .../drafts` only when no matching draft exists; see `skills/skia-canary-advisor/scripts/canary_advisor.py`). Never run `git cl comment` or blind `PUT .../drafts`: both stack hidden duplicate drafts that Gerrit UI hides until `Reply` publishes every accumulated draft at once.
    - A follow-up after a new patchset is saved as a standalone `/PATCHSET_LEVEL` draft on the CURRENT patchset (no `in_reply_to`), containing only new text.
    - Use `in_reply_to` only for inline (`file:line`) replies or when the user explicitly asks to answer inside a thread; never include or re-quote already-published text in a draft.
    - Never resolve substantive review threads unless the user asks; if asked, resolve via a minimal

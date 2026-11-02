@@ -1689,6 +1689,66 @@ class TestPreToolGuard(unittest.TestCase):
       self.assertEqual(denial(push_cmd), "")
       self.assertEqual(denial(upload_cmd), "")
 
+  # Verify b/580882306 guard blocks direct git cl comment calls while ignoring quoted/heredoc text
+  def test_git_cl_comment_guard_b580882306(self):
+    blocked_cmds = [
+        'git cl comment "LGTM"',
+        'git cl comment -a "Done" --reply-to 8f3b21',
+        'git -C /tmp cl comment -i 1409697 -a "nit"',
+        'SKIP_GCE_AUTH_FOR_GIT=1 git cl comment -a "nit"',
+        'env -u FOO SKIP_GCE_AUTH_FOR_GIT=1 git cl comment -a "nit"',
+        'cd /tmp && git cl comment -a "nit"',
+        'git status; git cl comment -a "nit"',
+        'OUT=$(git cl comment -a "nit")',
+        'OUT=`git cl comment -a "nit"`',
+        'git-cl comment -a "nit"',
+        '~/depot_tools/git_cl.py comment -a "nit"',
+        'python3 ~/depot_tools/git_cl.py comment -a "nit"',
+        'git cl comments -a "Done" --reply-to 8f3b21',
+        'git cl comments --add-comment="Done" --reply-to=8f3b21',
+        'git cl comments -p -a "LGTM"',
+        "bash -c 'git cl comment -a \"nit\"'",
+        "bash -cx 'git cl comment -a \"nit\"'",
+    ]
+    for cmd in blocked_cmds:
+      for parent_id in ("", "parent-conv-1"):
+        with self.subTest(cmd=cmd, parent_id=parent_id):
+          out = self.run_guard({
+              "conversationId": "c1",
+              "parentConversationId": parent_id,
+              "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}},
+          })
+          self.assertEqual(out.get("decision"), "deny", out)
+          reason = out.get("reason", "")
+          self.assertIn("[GERRIT DRAFT DEDUP GUARD]", reason)
+          self.assertIn("b/580882306", reason)
+          self.assertIn("GET", reason)
+          self.assertIn("/drafts", reason)
+          self.assertIn("<existing_id>", reason)
+
+    allowed_cmds = [
+        'grep -rn "git cl comment" ~/.gemini/config/',
+        'rg "git cl comment" skills/',
+        'git grep "git cl comment"',
+        'echo "Do not run git cl comment"',
+        'git commit -m "Block git cl comment in pre_tool_guard (b/580882306)" -- f.py',
+        'git commit -m "Title\n\ngit cl comment stacks hidden drafts" -- f.py',
+        'python3 ship.py -m "Block git cl comment (b/580882306)"',
+        "cat <<'EOF' > /tmp/test_note.md\ngit cl comment -a \"test\"\nEOF",
+        "python3 - <<'EOF'\ncmd = 'git cl comment -a hi'\nprint(cmd)\nEOF",
+        "git cl status",
+        "git cl try -i 1409697 -B skia/skia.primary -b Canary-G3",
+        "SKIP_GCE_AUTH_FOR_GIT=1 git cl presubmit --force",
+        "git cl comments --unresolved -i 1409697",
+    ]
+    for cmd in allowed_cmds:
+      with self.subTest(cmd=cmd):
+        out = self.run_guard({
+            "conversationId": "c1",
+            "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}},
+        })
+        self.assertEqual(out.get("decision"), "allow", out)
+
 
 if __name__ == "__main__":
   unittest.main()

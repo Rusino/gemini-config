@@ -1031,6 +1031,175 @@ def _gerrit_upload_invocation(cmd: str) -> tuple[bool, list[str]]:
   return False, []
 
 
+GIT_CL_COMMENT_FALLBACK_RE = re.compile(
+    r"(?:^|(?<=[\s;&|(`]))(?:\S*/)?(?:"
+    r"git(?:\s+(?:-[Cc]\s+\S+|--[a-z-]+(?:=\S+)?))*\s+cl"
+    r"|git-cl|git_cl\.py"
+    r")\s+(?:comment\b|comments\b[^;&|\n]*"
+    r"(?:\s-(?:a|p)\b|\s--(?:add-comment|reply-to|publish)\b))"
+)
+
+
+# Match depot_tools CMDcomments invocations that stack hidden drafts or auto-publish (b/580882306)
+def _is_git_cl_comment_args(cl_args: list[str]) -> bool:
+  k = 0
+  while k < len(cl_args) and cl_args[k].startswith("-"):
+    k += 1
+  if k >= len(cl_args):
+    return False
+  sub = cl_args[k]
+  rest = cl_args[k + 1 :]
+  # depot_tools prefix-matches any unambiguous prefix of `comments` (`co`..`comment`)
+  if sub in ("co", "com", "comm", "comme", "commen", "comment"):
+    return True
+  if sub != "comments":
+    return False
+  # Allow read-only `git cl comments` listings; block write/publish flags (-a/-p/--reply-to)
+  m = 0
+  while m < len(rest):
+    arg = rest[m]
+    if arg == "--":
+      break
+    if arg in ("-i", "--issue", "-j", "--json-file"):
+      m += 2
+      continue
+    if arg in ("-a", "-p", "--add-comment", "--reply-to", "--publish"):
+      return True
+    if arg.startswith(("--add-comment=", "--reply-to=")):
+      return True
+    if arg.startswith("-") and not arg.startswith("--"):
+      for ch in arg[1:]:
+        if ch in ("i", "j"):
+          break
+        if ch in ("a", "p"):
+          return True
+    m += 1
+  return False
+
+
+# Detect real shell invocations of `git cl comment` while ignoring grep, commit msgs, and heredocs
+def is_git_cl_comment_command(cmd: str, _depth: int = 0) -> bool:
+  if _depth > 2 or not cmd:
+    return False
+  cmd_code = strip_heredocs(cmd)
+  if "comment" not in cmd_code and not re.search(r"\bcl\s+co", cmd_code):
+    return False
+  sep_chars = ";&|()\n`"
+  lexer = shlex.shlex(cmd_code, posix=True, punctuation_chars=sep_chars)
+  lexer.whitespace = " \t\r"
+  lexer.whitespace_split = True
+  try:
+    tokens = list(lexer)
+  except ValueError:
+    return bool(GIT_CL_COMMENT_FALLBACK_RE.search(_non_inspection_cmd_segments(cmd)))
+
+  at_cmd_start = True
+  in_env = False
+  skip_next = False
+  for i, tok in enumerate(tokens):
+    if skip_next:
+      skip_next = False
+      continue
+    if tok and set(tok) <= set(sep_chars):
+      at_cmd_start = True
+      in_env = False
+      continue
+    if at_cmd_start:
+      if in_env:
+        if tok == "--":
+          in_env = False
+          continue
+        if tok in ("-u", "--unset", "-C", "--chdir", "-S", "--split-string"):
+          skip_next = True
+          continue
+        if tok.startswith("-"):
+          continue
+      if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
+        continue
+      exe = _clean_cmd_token(tok)
+      if exe == "env":
+        in_env = True
+        continue
+      if exe in ("command", "nohup", "time"):
+        continue
+      at_cmd_start = False
+
+      seg = []
+      for t in tokens[i + 1 :]:
+        if t and set(t) <= set(sep_chars):
+          break
+        seg.append(t)
+
+      if exe == "git":
+        j = 0
+        while j < len(seg):
+          if seg[j] in (
+              "-C",
+              "-c",
+              "--git-dir",
+              "--work-tree",
+              "--namespace",
+              "--exec-path",
+              "--super-prefix",
+              "--config-env",
+          ):
+            j += 2
+          elif seg[j].startswith("-"):
+            j += 1
+          else:
+            break
+        if j < len(seg) and seg[j] == "cl" and _is_git_cl_comment_args(seg[j + 1 :]):
+          return True
+      elif exe in ("git-cl", "git_cl.py"):
+        if _is_git_cl_comment_args(seg):
+          return True
+      elif exe.startswith("python"):
+        j = 0
+        while j < len(seg):
+          if seg[j] in ("-W", "-X"):
+            j += 2
+          elif seg[j] in ("-c", "-m"):
+            j = len(seg)
+            break
+          elif seg[j].startswith("-"):
+            j += 1
+          else:
+            break
+        if j < len(seg) and os.path.basename(seg[j]) in ("git-cl", "git_cl.py"):
+          if _is_git_cl_comment_args(seg[j + 1 :]):
+            return True
+      elif exe in ("bash", "sh", "zsh"):
+        k = 0
+        while k < len(seg) - 1:
+          st = seg[k]
+          if st in ("-o", "+o"):
+            k += 2
+            continue
+          if st == "-c" or (st.startswith("-") and not st.startswith("--") and "c" in st[1:]):
+            if is_git_cl_comment_command(seg[k + 1], _depth=_depth + 1):
+              return True
+            break
+          k += 1
+  return False
+
+
+# Deny `git cl comment` because it stacks hidden duplicate drafts in Gerrit UI (b/580882306)
+def gerrit_cl_comment_denial(cmd: str) -> str:
+  if not is_git_cl_comment_command(cmd):
+    return ""
+  return (
+      "[GERRIT DRAFT DEDUP GUARD] Direct `git cl comment` / `git cl comments -a` calls are "
+      "blocked (b/580882306): `git cl comment` cannot edit or delete existing Gerrit drafts and "
+      "stacks hidden duplicate drafts that Gerrit UI hides until `Reply` publishes all of them "
+      "at once (or publishes immediately without `--reply-to`). Always manage drafts via the "
+      "Gerrit REST API: first list existing drafts with "
+      "`GET https://<host>/a/changes/<CL>/revisions/<PS>/drafts`, match by "
+      "`(path, line, in_reply_to)`, and update in place with "
+      "`PUT https://<host>/a/changes/<CL>/revisions/<PS>/drafts/<existing_id>` "
+      "(using `PUT .../drafts` only when no matching draft exists)."
+  )
+
+
 def _upload_repo_root(cmd: str, workspace_paths: list[str]) -> str:
   cmd_code = strip_heredocs(cmd)
   explicit = re.search(r"(?:^|[\s;&|(`])cd\s+|\bgit\s+-C\s+", cmd_code)
@@ -3165,6 +3334,16 @@ def main() -> None:
   if tool_name == "run_command":
     cmd_str = str(tool_args.get("CommandLine", "")).strip()
     step_idx = int(data.get("stepIdx", -1))
+    # Block git cl comment in both main chats and subagents so Gerrit never stacks hidden drafts
+    cl_comment_denial = gerrit_cl_comment_denial(cmd_str)
+    if cl_comment_denial:
+      print(
+          json.dumps(
+              {"decision": "deny", "reason": cl_comment_denial},
+              ensure_ascii=False,
+          )
+      )
+      return
     # Require fast Phase 1 lint/audit scripts on every commit, upload, PR creation, or push
     is_auto_ship_cmd = _invokes_script(cmd_str, "auto_ship.py") and bool(
         re.search(r"\bauto_ship\.py\s+ship\b", cmd_str)
