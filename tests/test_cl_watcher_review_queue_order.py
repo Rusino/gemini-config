@@ -554,6 +554,13 @@ assert(
 );
 assert(focusHtml.includes('CL 1412377'), 'Collapsed sibling must be 1412377');
 
+// Verify that rowHtml renders CL label as a link to it.url
+const row77 = rowHtml(testItems[1], mockData);
+assert(
+    row77.includes('<span class="cl"><a href="https://skia-review.googlesource.com/c/skia/+/1412377"'),
+    'rowHtml must render CL identifier as a link to review page: ' + row77,
+);
+
 // 4. Verify lane rendering grouping
 const laneItems = [testItems[0], testItems[2]];
 const laneHtml = renderLaneItemsHtml(laneItems, mockData);
@@ -568,6 +575,23 @@ process.exit(0);
     self.assertEqual(
         res.returncode, 0, f"Node output: {res.stdout}\nError: {res.stderr}"
     )
+
+  def test_export_flight_deck_info_ui_version(self):
+    import json
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+      info_file = os.path.join(tmpdir, "jetski-flight-deck.json")
+      with mock.patch.object(w, "FLIGHT_DECK_INFO_FILE", info_file):
+        with mock.patch.object(w, "_INITIAL_SCRIPT_MTIME", 1730510000.5):
+          with mock.patch.object(
+              w, "flight_deck_pen_url", return_value="https://pen.goog"
+          ):
+            w.export_flight_deck_info(port=8089)
+            with open(info_file, "r", encoding="utf-8") as f:
+              data = json.load(f)
+            self.assertEqual(data.get("ui_version"), 1730510000)
+            self.assertIn("?v=1730510000", data.get("local_url", ""))
+            self.assertIn("?v=1730510000", data.get("pen_url", ""))
 
 
 if __name__ == "__main__":

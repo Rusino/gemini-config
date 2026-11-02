@@ -756,12 +756,17 @@ def flight_deck_pen_url(port: int = DEFAULT_PORT) -> str:
 def export_flight_deck_info(port: int = DEFAULT_PORT) -> None:
   """Writes local and PEN URLs to brain so Jetski Web can embed Flight Deck."""
   try:
-    pen_url = flight_deck_pen_url(port)
-    local_url = f"http://localhost:{port}"
+    ver = int(_INITIAL_SCRIPT_MTIME) if _INITIAL_SCRIPT_MTIME > 0 else 0
+    ver_q = f"?v={ver}" if ver > 0 else ""
+    # Include script mtime query param so embedded drawer reloads on server restart
+    pen_url = f"{flight_deck_pen_url(port)}{ver_q}"
+    local_url = f"http://localhost:{port}{ver_q}"
+    # Record script mtime version for client auto-reload
     data = {
         "pen_url": pen_url,
         "local_url": local_url,
         "port": port,
+        "ui_version": ver,
     }
     os.makedirs(os.path.dirname(FLIGHT_DECK_INFO_FILE), exist_ok=True)
     tmp = f"{FLIGHT_DECK_INFO_FILE}.tmp.{os.getpid()}"
@@ -6741,6 +6746,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .title { font-size: 11.5px; font-weight: 500; line-height: 1.3; letter-spacing: -.005em; }
   .meta { font-size: 10.5px; line-height: 1.25; color: var(--graphite); margin-top: 1px; }
   .meta .cl { font-family: var(--mono); font-size: 10px; }
+  /* Style linked CL identifiers in lane rows and expanded steps */
+  .meta .cl a { color: var(--blue); font-weight: 600; text-decoration: none; }
+  .meta .cl a:hover { text-decoration: underline; }
   .meta .proj-tag { font-weight: 600; }
   .meta .chat { color: var(--blue); }
   .state { font-size: 11px; line-height: 1.3; color: var(--graphite); }
@@ -7163,6 +7171,8 @@ const STATUS_SKIA_URL = 'https://status.skia.org/repo/skia';
 const OLD_MERGED_DAYS = 3;
 
 let cachedData = null;
+// Tracks server script mtime to trigger page reload on daemon re-exec
+let cachedUiVersion = null;
 let selectedProject = 'ALL';
 
 function esc(s) {
@@ -8401,7 +8411,8 @@ function renderTriageModal(it) {
           <span class="badge triage-${esc(String(tr.verdict || '').toLowerCase())}">
             ${esc(tr.verdict_label || tr.verdict || '')}
           </span>
-          <h3>${esc(clLabel(it))}: ${esc(cleanSubject(it.subject))}</h3>
+          <!-- Link CL identifier directly to review page -->
+          <h3>${link(it.url, esc(clLabel(it)))}: ${esc(cleanSubject(it.subject))}</h3>
           <button class="triage-modal-close" onclick="closeTriageModal()" title="Close">✕</button>
         </div>
         <div class="triage-modal-tabs">
@@ -9086,9 +9097,11 @@ function focusCard(it, data) {
 
 function rowHtml(it, data) {
   const who = link(actorUrl(it, it.owner_email || it.owner_name), esc(authorLabel(it)));
+  // Link CL identifier directly to review host
+  const clAnchor = link(it.url, esc(clLabel(it)));
   const meta = [
     `<span class="proj-tag">${esc(it.project_name)}</span>`,
-    `<span class="cl">${esc(clLabel(it))}</span>`,
+    `<span class="cl">${clAnchor}</span>`,
     who,
     chatActionHtml(it, data, true),
   ].filter(Boolean).join(' · ');
@@ -9137,6 +9150,11 @@ function projectsOf(items) {
 
 function setProject(p) {
   selectedProject = p;
+  try {
+    if (typeof localStorage !== 'undefined') localStorage.setItem('flight_deck_project', p);
+  } catch (e) {
+    // Ignore storage quota or security errors in sandboxed iframes
+  }
   history.replaceState(null, '', p === 'ALL' ? '#' : `#project=${encodeURIComponent(p)}`);
   render();
 }
@@ -9221,7 +9239,18 @@ function render() {
 async function fetchState() {
   try {
     const resp = await fetch('/api/status');
-    cachedData = await resp.json();
+    const nextData = await resp.json();
+    const nextVer = Number((nextData && nextData.ui_version) || 0);
+    // Reload document when the server process restarted with updated HTML/JS
+    if (cachedUiVersion !== null && nextVer > 0 && nextVer !== cachedUiVersion) {
+      // Trigger browser reload when new script code is active on daemon
+      if (typeof location !== 'undefined' && typeof location.reload === 'function') {
+        location.reload();
+        return;
+      }
+    }
+    if (nextVer > 0) cachedUiVersion = nextVer;
+    cachedData = nextData;
     render();
   } catch (e) {
     document.getElementById('synced').textContent = 'Connection lost, retrying';
@@ -9405,7 +9434,14 @@ async function triggerRefresh() {
   const btn = document.getElementById('refresh-btn');
   btn.textContent = 'Refreshing…';
   try {
-    await fetch('/api/refresh', {method: 'POST'});
+    const resp = await fetch('/api/refresh', {method: 'POST'});
+    const res = await resp.json().catch(() => null);
+    // Reload document immediately when manual refresh triggered a script re-exec
+    if (res && res.reloaded && typeof location !== 'undefined' &&
+        typeof location.reload === 'function') {
+      location.reload();
+      return;
+    }
     await fetchState();
   } finally {
     btn.textContent = 'Refresh';
@@ -9418,7 +9454,15 @@ function boot() {
   if (isEmbed) {
     document.documentElement.classList.add('embedded');
   }
-  selectedProject = new URLSearchParams(location.hash.slice(1)).get('project') || 'ALL';
+  let savedProj = 'ALL';
+  try {
+    if (typeof localStorage !== 'undefined') {
+      savedProj = localStorage.getItem('flight_deck_project') || 'ALL';
+    }
+  } catch (e) {
+    // Ignore storage errors in sandboxed iframes
+  }
+  selectedProject = new URLSearchParams(location.hash.slice(1)).get('project') || savedProj;
   fetchState();
   setInterval(fetchState, 20000);
 }
@@ -9457,6 +9501,8 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
             (state.get("items") or {}).values()
         )
       state["jetski_box_url"] = jetski_box_url()
+      # Pass daemon script mtime so client detects restarted backend
+      state["ui_version"] = int(_INITIAL_SCRIPT_MTIME) if _INITIAL_SCRIPT_MTIME > 0 else 0
       self._send_json(state)
       return
 
