@@ -1,23 +1,36 @@
 ---
 trigger: always_on
-description: "Gmail drafts: recreate instead of update, HTML body with explicit links, verify links."
+description: "Gmail: use gmail Go CLI for clean links, format drafts as HTML, verify stored links."
 ---
 
-# Gmail Drafts: Recreate, Explicit Links, Verify
+# Gmail & Drafts: Use `gmail` Go CLI for Clean Direct Links
 
-Incident (2026-11-02): three `update_draft` calls on one reply left the user seeing all three
-versions in Gmail, and a plain-text `body` turned every URL into an expiring
-`https://www.google.com/url?q=...&ust=...` redirect in the visible text (the 2026-10-30 letter
-to David Bebawy went out like that).
+Incident (2026-10-30 & 2026-11-02): the `google_gmail` MCP server (`gmailmcp.googleapis.com`)
+rewrote every URL in outgoing drafts (`<a href>`, bare URL, `<pre>`, `<code>`) into an expiring
+24h `https://www.google.com/url?q=...&ust=...` redirect, and three MCP `update_draft` calls while
+a reply was open in Gmail left three draft versions visible in the UI.
 
-- **Never edit a draft in place**: to change a draft, `delete_draft` the old one and
-  `create_draft` a new one (same `replyToMessageId` for replies). Do not call `update_draft`
-- **Write the body as `htmlBody`** with explicit `<a href="https://...">https://...</a>` links
-  and commands in `<pre>`; do not rely on a plain `body` for anything that contains a URL
-- **Verify after creating**: `get_draft` and check that the visible link text has no
-  `google.com/url`
-- **The MCP cannot make clean links**: every URL in a draft (`<a href>`, bare URL, `<pre>`,
-  `<code>`, even without `https://`) is stored as an expiring `google.com/url?...&ust=...`
-  redirect (verified 2026-11-02, the user saw the redirect in the Gmail UI). Before the user
-  sends, tell them so and offer either to fix the links in Gmail compose by hand or to drop the
-  URLs and keep plain IDs such as `Gerrit 1414296`. Do not fall back to the retired gmail CLI
+- **Use `gmail` Go CLI, keep `google_gmail` MCP disabled**: Always run
+  `/google/bin/releases/gemini-agents-gmail/gmail` (`~/.gemini/config/skills/gmail/SKILL.md`),
+  which calls `gmail.googleapis.com` directly over LOAS and preserves clean `https://...` URLs
+  (verified 2026-11-02 in raw MIME and Gmail Web UI; overrides the legacy `google_gmail` / `gmail`
+  note in `rules/subagent_exploration.md`). Keep the `google_gmail` plugin disabled
+  (`enabled: false`); leave `~/.gemini/jetski/mcp_oauth_tokens.json` on disk only for
+  `scripts/cl_watcher.py`
+- **Format bodies with `--html` (explicit `<a href>` and `<pre>`)**: Pass `--html` (using
+  `--body-file` to a scratch file on `create-draft` / `send`, or `--body "$(cat ...)"` on
+  `update-draft`) with explicit `<a href="https://...">...</a>` links and `<pre>` blocks for
+  commands; avoid plain text when sending URLs, and avoid `--md` when fenced code follows a list
+  item (`blackfriday` collapses unindented fences after `- ...` into inline `<code>` inside `<li>`).
+  For replies, pass `--message <MSG_ID>` on `create-draft` / `reply` (adds `ThreadId`,
+  `In-Reply-To`, `References`; add `--all --include-history` for reply-all with thread history)
+- **Safe draft updates vs. open Compose / Undo Send**: Within the same turn before surfacing a
+  draft to the user, `mutate update-draft <DRAFT_ID>` updates it cleanly in place. Once surfaced
+  in any reply (including earlier handoff turns), treat the draft as handed over: never call
+  `mutate delete-draft` unless the user explicitly asks to delete it (`delete-draft` bypasses Trash
+  and permanently deletes a sent message still inside Undo Send, before it reaches `in:sent`), and
+  if revising a handed-over draft that may be open in Compose, create a new `mutate create-draft`
+  and ask the user to discard the old tab rather than racing with Compose autosave
+- **Verify after creating**: Run `readonly get-draft <DRAFT_ID> --json` (never pipe `gmail` CLI
+  output to `grep`, `egrep`, or `awk`) and decode the stored HTML body to confirm zero
+  `google.com/url` redirects and intact `<a href>` / `<pre>` tags before notifying the user
