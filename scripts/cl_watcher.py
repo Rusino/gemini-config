@@ -6907,6 +6907,29 @@ def parse_buganizer_blocks(output_text: str) -> list[dict[str, Any]]:
   return results
 
 
+# Bump whenever parse_rendered_issue_comments changes so cached bugs re-render once
+COMMENTS_PARSER_VERSION = 2
+
+# Terminates each comment body only at the next top-level Comment #N header or EOF
+# because render_issue_with_external uses blank lines between comments and --- inside bodies
+RE_RENDERED_ISSUE_COMMENT = re.compile(
+    r"^Comment\s+#(\d+)\s+by\s+(\S+)\s+at\s+([^\r\n]+?):[ \t]*(?:\r?\n(.*?))?"
+    r"(?=^Comment\s+#\d+\s+by\s+\S+\s+at\s+[^\r\n]+?:[ \t]*(?:\r?\n|\Z)|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def _bug_comments_mod_stamp(bug: dict[str, Any]) -> str:
+  """Builds a versioned modification token covering both Modified Time and Major Modified Time."""
+  mod_tok = str(
+      bug.get("modified_time") or bug.get("major_modified_time") or ""
+  ).strip()
+  if not mod_tok:
+    return ""
+  maj_tok = str(bug.get("major_modified_time") or "").strip()
+  return f"v{COMMENTS_PARSER_VERSION}:{mod_tok}|{maj_tok}"
+
+
 def parse_rendered_issue_comments(rendered_text: str) -> dict[str, Any]:
   """Extracts latest human vs self comment metadata and CL links from rendered bug text."""
   text = _unwrap_mcp_or_json_text(rendered_text)
@@ -6926,29 +6949,34 @@ def parse_rendered_issue_comments(rendered_text: str) -> dict[str, Any]:
   self_lower = {e.lower() for e in SELF_BUG_EMAILS} | {
       u.lower() for u in SELF_GITHUB_LOGINS
   }
-  pattern = re.compile(
-      r"Comment\s+#\d+\s+by\s+(\S+)\s+at\s+([^\n]+?):\n(.*?)(?=\n---\n|\Z)",
-      re.DOTALL,
-  )
-  for m in pattern.finditer(text):
-    author = m.group(1).strip()
+  for m in RE_RENDERED_ISSUE_COMMENT.finditer(text):
+    author = m.group(2).strip()
     author_low = author.lower()
-    ts_raw = m.group(2).strip()
-    body = m.group(3).strip()
+    ts_raw = m.group(3).strip()
+    body = (m.group(4) or "").strip()
     # Extract CL links only from gitwatcher commit-landing bots or self comments
     if "gitwatcher" in author_low or author_low in self_lower:
       for m_g in RE_GERRIT_ANY_URL_ID.finditer(body):
         gid = m_g.group(1)
         cl_ids.append(gid)
         cl_urls.setdefault(gid, _normalize_public_gerrit_url(m_g.group(0)))
+    # Keep self comments separate so last_human_comment_* preserves the latest non-self human
     if author_low in self_lower:
       res["last_self_comment_at"] = ts_raw
+      continue
     if _is_bug_bot_author(author):
       continue
     # Strip collapsed HTML zippy blocks before building the single-line preview
     clean_body = re.sub(r"<details[\s\S]*?</details>", "", body)
     clean_body = re.sub(r"\*Comment created using[^\n]*\*", "", clean_body)
-    snippet = " ".join(clean_body.split())[:180]
+    # Drop standalone markdown horizontal rules and Buganizer edit footers from snippets
+    clean_lines = [
+        ln
+        for ln in clean_body.splitlines()
+        if ln.strip() != "---"
+        and not re.match(r"^Last modified on \d{4}-\d{2}-\d{2}T\S+$", ln.strip())
+    ]
+    snippet = " ".join(" ".join(clean_lines).split())[:180]
     res["last_human_comment_author"] = author
     res["last_human_comment_at"] = ts_raw
     res["last_human_comment_snippet"] = snippet
@@ -6977,6 +7005,15 @@ def merge_bug_record_with_prev(
       merged["tracker_flavor"] = "crbug"
       merged["short_id"] = f"crbug/{merged['id']}"
       merged["url"] = f"https://issues.chromium.org/issues/{merged['id']}"
+    comment_keys = {
+        "last_human_comment_author",
+        "last_human_comment_at",
+        "last_human_comment_snippet",
+        "last_self_comment_at",
+        "comment_cl_ids",
+        "comment_cl_urls",
+        "comments_checked_major_mod",
+    }
     for carry_key in (
         "acked_ts",
         "duplicate_of",
@@ -6995,6 +7032,9 @@ def merge_bug_record_with_prev(
         "comment_cl_urls",
         "comments_checked_major_mod",
     ):
+      # Respect empty comment fields when the caller freshly parsed comments (e.g. GitHub issues)
+      if carry_key in comment_keys and carry_key in curr:
+        continue
       if carry_key not in merged or merged.get(carry_key) in ("", None, [], {}):
         if carry_key in prev and prev[carry_key] not in ("", None):
           merged[carry_key] = prev[carry_key]
@@ -7282,8 +7322,10 @@ def fetch_github_bugs(
       c_login = str((c.get("author") or {}).get("login") or "").strip()
       c_at = str(c.get("createdAt") or "").strip()
       c_body = str(c.get("body") or "").strip()
+      # Keep self replies separate on GitHub issues to match Buganizer comment tracking
       if c_login.lower() in self_gh:
         last_self_at = c_at
+        continue
       if _is_bug_bot_author(c_login):
         continue
       last_human_author = c_login
@@ -7725,10 +7767,12 @@ def classify_bug_status(
   human_author = str(bug.get("last_human_comment_author") or "").strip()
   human_ts = _parse_ts(bug.get("last_human_comment_at"))
   self_ts = _parse_ts(bug.get("last_self_comment_at"))
+  # Treat a self comment as an implicit ack across comment, urgent, and post-merge triggers
+  effective_ack_ts = max(self_ts, acked_ts)
   unacked_comment = (
       bool(human_author)
       and human_author.lower() not in self_lower
-      and human_ts > max(self_ts, acked_ts)
+      and human_ts > effective_ack_ts
   )
 
   pri = str(bug.get("priority") or "P2").upper()
@@ -7739,12 +7783,18 @@ def classify_bug_status(
   unacked_urgent = (
       not is_collab
       and not has_cl
-      and acked_ts <= 0.0
+      and effective_ack_ts <= 0.0
       and (pri in ("P0", "P1") or itype == "VULNERABILITY")
       and (status == "NEW" or recent_created)
   )
   all_merged_unacked = (
-      not is_collab and all_cls_merged and acked_ts < max(latest_merged_ts, 1.0)
+      not is_collab
+      and all_cls_merged
+      and (
+          effective_ack_ts < latest_merged_ts
+          if latest_merged_ts > 0.0
+          else acked_ts < 1.0
+      )
   )
 
   if unacked_comment:
@@ -7925,11 +7975,12 @@ def sync_bugs_into_state(
     fetched_bz.extend(parse_buganizer_blocks(extra_out[0]))
 
   all_bugs: dict[str, dict[str, Any]] = {}
-  to_render_ids: list[str] = []
+  render_cands: list[tuple[tuple[int, int, float], str]] = []
   recent_cutoff_ts = now_ts - 30 * 86400
   for raw_b in fetched_bz:
     bkey = raw_b["bug_key"]
-    merged_b = merge_bug_record_with_prev(raw_b, prev_bugs.get(bkey))
+    prev_entry = prev_bugs.get(bkey) if isinstance(prev_bugs.get(bkey), dict) else {}
+    merged_b = merge_bug_record_with_prev(raw_b, prev_entry)
     # Recompute collaborator role from live query membership so removed/reassigned bugs drop out
     merged_b["is_collaborator"] = bool(
         bkey in primary_self_bkeys
@@ -7942,9 +7993,7 @@ def sync_bugs_into_state(
         or _is_self_bug_assignee(str(merged_b.get("assignee") or ""))
     )
     st = str(merged_b.get("status") or "").upper()
-    maj_mod = str(
-        merged_b.get("major_modified_time") or merged_b.get("modified_time") or ""
-    )
+    mod_stamp = _bug_comments_mod_stamp(merged_b)
     is_active_cand = (
         is_self_bug
         and st in ("NEW", "ASSIGNED", "ACCEPTED")
@@ -7953,16 +8002,23 @@ def sync_bugs_into_state(
             or str(merged_b.get("priority") or "") in ("P0", "P1")
             or float(merged_b.get("modified_ts") or 0.0) >= recent_cutoff_ts
             or bkey in merged_chats
+            or bool(prev_entry.get("needs_you"))
         )
     )
     if (
         is_active_cand
-        and maj_mod
-        and maj_mod != str(merged_b.get("comments_checked_major_mod") or "")
-        and len(to_render_ids) < 12
+        and mod_stamp
+        and mod_stamp != str(merged_b.get("comments_checked_major_mod") or "")
     ):
-      to_render_ids.append(merged_b["id"])
+      # Prioritize currently Needs Me and chatted bugs ahead of passive 30-day activity
+      prio_key = (
+          1 if prev_entry.get("needs_you") else 0,
+          1 if bkey in merged_chats else 0,
+          float(merged_b.get("modified_ts") or 0.0),
+      )
+      render_cands.append((prio_key, merged_b["id"]))
 
+  to_render_ids = [bid for _, bid in sorted(render_cands, reverse=True)[:12]]
   if to_render_ids:
     render_calls = [
         ("render_issue_with_external", {"issueId": bid}) for bid in to_render_ids
@@ -7973,9 +8029,7 @@ def sync_bugs_into_state(
       if isinstance(b_obj, dict) and r_out:
         cinfo = parse_rendered_issue_comments(r_out)
         b_obj.update(cinfo)
-        b_obj["comments_checked_major_mod"] = str(
-            b_obj.get("major_modified_time") or b_obj.get("modified_time") or ""
-        )
+        b_obj["comments_checked_major_mod"] = _bug_comments_mod_stamp(b_obj)
 
   for gh_b in fetch_github_bugs(extra_issue_nums=ref_gh_nums):
     bkey = gh_b["bug_key"]
@@ -8003,12 +8057,18 @@ def sync_bugs_into_state(
     prev_b = prev_bugs.get(bkey) if isinstance(prev_bugs.get(bkey), dict) else {}
     classify_bug_status(bug, now_ts=now_ts)
     # Wake active bug chat when a new human comment arrives upstream
+    # Require human_ts > max(self_ts, acked_ts) so self replies or non-comment Needs Me never wake
+    unacked_human_comment = _parse_ts(bug.get("last_human_comment_at")) > max(
+        _parse_ts(bug.get("last_self_comment_at")),
+        float(bug.get("acked_ts") or 0.0),
+    )
     if (
         wake_chats
         and bug.get("conversation_id")
         and not bug.get("chat_archived")
         and bug.get("needs_you")
         and bug.get("last_human_comment_at")
+        and unacked_human_comment
         and bug.get("last_human_comment_at") != prev_b.get("last_human_comment_at")
         and prev_b
     ):

@@ -86,6 +86,95 @@ SAMPLE_RENDERED_ISSUE = json.dumps({
     )
 })
 
+# Structural fixture from crbug.com/466929543 render_issue_with_external (14 entries:
+# Description #1 + Comment #2..#14 separated by blank lines, with --- rules inside #3)
+SAMPLE_RENDERED_466929543 = (
+    "Issue ID: 466929543\n"
+    "Component ID: 1457031\n"
+    "Assignee: jlavrova@google.com\n"
+    "Reporter: ishitatsuyuki@google.com\n"
+    "Status: ASSIGNED\n"
+    "Priority: P2\n"
+    "Issue Type: BUG\n"
+    "Title: UseAndroidNDKFontAPI breaks Japanese font in Google Search App\n\n"
+    "Created Time: 2025-12-08T07:50:24.570Z\n"
+    "Modified Time: 2026-11-02T21:49:00.678Z\n"
+    "Description by ishitatsuyuki@google.com at 2025-12-08T07:50:24.570Z:\n"
+    "Version\n\n"
+    "```\n"
+    "  Package [com.google.android.webview] (baeb8af):\n"
+    "    versionCode=699813532 minSdk=26 targetSdk=35\n"
+    "```\n\n"
+    "Search \"日本語\" in Google App -> Serif Font (broken)\n\n"
+    "Attaching screenshot and bugreport in threads below\n\n"
+    "Blocking Issue IDs: 297067890\n"
+    "Note: Run with verbose=true to see severity, effort, descendant issue counts.\n\n"
+    "Comment #2 by ishitatsuyuki@google.com at 2025-12-08T07:52:13.029Z:\n"
+    "I see https://skia-review.googlesource.com/1116616 but I don't know if it helps since it"
+    " hasn't trickled down to stable. If there's an easy way to test it out I'm happy to test.\n\n"
+    "Comment #3 by ishitatsuyuki@google.com at 2025-12-08T07:56:33.161Z:\n"
+    "---\n\n"
+    "### What\n\n"
+    "#### More information\n\n"
+    "Attaching bug report and screenshots\n\n"
+    "#### User experience\n\n"
+    "**Has the effect of this issue on your device usage changed, such as lost time or work?**\\\n"
+    "Slight\n\n"
+    "---\n\n"
+    "### When\n\n"
+    "#### Time and frequency\n\n"
+    "**Time when bug report was triggered:** Dec 8, 2025  4:50 PM  GMT+09:00\n\n"
+    "**Has the frequency of this issue changed?**\\\n"
+    "Every time\n\n"
+    "---\n\n"
+    "### Where\n\n"
+    "#### Build and device data\n\n"
+    "**- Build Number:** aosp_arm64-userdebug\\\n"
+    "**- Serial Number:** REDACTED\\\n"
+    "**- Is headless system user mode:** No\n\n"
+    "---\n\n"
+    "**Filed via bug reporter template.**\n\n"
+    "Comment #4 by ishitatsuyuki@google.com at 2025-12-08T07:59:31.156Z:\n"
+    "Sensitive data has been redacted from this bug report.\n\n"
+    "**Do not share, post, or distribute any portion or all of a bug report.**\n\n"
+    "Comment #5 by bungeman@google.com at 2025-12-08T15:51:01.944Z:\n"
+    "The issue here is probably that the Android NDK Font API does not preserve any order of the"
+    " fonts reported (they are reported internally from an `unordered_set`).\n"
+    "Last modified on 2025-12-08T16:22:18.056Z\n\n"
+    "Comment #6 by ishitatsuyuki@google.com at 2025-12-16T04:26:58.747Z:\n"
+    "Per https://chromium-review.googlesource.com/7239069 and"
+    " https://chromium-review.googlesource.com/7242463 the feature should be now disabled on ToT"
+    " (M145) and M144 in the latest versions.\n"
+    "Last modified on 2025-12-16T04:27:07.419Z\n\n"
+    "Comment #7 by ishitatsuyuki@google.com at 2025-12-16T04:27:51.764Z:\n"
+    "I can close this once a version trickles down that I can confirm the fix, or otherwise feel"
+    " free to close it earlier if you are confident.\n\n"
+    "Comment #8 by bungeman@google.com at 2025-12-16T15:35:16.376Z:\n"
+    "This issue should be left open. The underlying issue has not been fixed (probably needs a fix"
+    " in Android), the symptoms have just been papered over for the moment.\n\n"
+    "Comment #9 by ishitatsuyuki@google.com at 2025-12-16T15:36:17.318Z:\n"
+    "That sounds good to me, thanks for clarifying.\n\n"
+    "Comment #10 by nyakkala@google.com at 2026-01-19T05:17:46.577Z:\n"
+    "Removing the Triage Team Chaselist hotlist as the component is not related to search.\n\n"
+    "Comment #11 by patilr@google.com at 2026-02-20T03:53:57.830Z:\n"
+    "This issue is currently in violation of the 30-day P1/P0 SLO. Please transition this to"
+    " P2/P3 within 48 hours if it is still a valid issue.\n\n"
+    "Comment #12 by bungeman@google.com at 2026-02-20T14:47:34.282Z:\n"
+    "Demoting to P2 since the use of the NDK Font API is currently disabled due to it crashing on"
+    " use.\n\n"
+    "Comment #13 by mingtse@google.com at 2026-10-30T10:06:15.298Z:\n"
+    "**[VoU 1P_APP automated triage]**\n"
+    "- Severity S4 -> S2: The issue affects font rendering in a core application, but a practical"
+    " workaround exists as the feature is currently disabled by default.\n\n"
+    "_If you have any concerns about this change, please adjust the priority/severity or remove"
+    " the hotlist and kindly leave a comment. Thank you._\n\n"
+    "Comment #14 by jlavrova@google.com at 2026-11-02T21:49:00.678Z:\n"
+    "I agree with the diagnosis in #5. ASystemFontIterator_open returns fonts from a"
+    " std::unordered_set, so the fallback order is random.\n\n"
+    "I don't think this is urgent right now. kUseAndroidNDKFontAPI is disabled by default in"
+    " Chromium (crbug.com/461659286), and Flutter does not use the NDK font manager."
+)
+
 
 class ClWatcherBugsTest(unittest.TestCase):
 
@@ -129,14 +218,192 @@ class ClWatcherBugsTest(unittest.TestCase):
     bot_only = json.dumps({
         "result": (
             "Issue ID: 576664769\n"
-            "Comment #1 by jlavrova@google.com at 2026-10-29T12:00:00Z:\n"
+            "Comment #1 by vmiura@google.com at 2026-10-28T10:00:00Z:\n"
+            "Initial triage.\n\n---\n\n"
+            "Comment #2 by jlavrova@google.com at 2026-10-29T12:00:00Z:\n"
             "Landing fix.\n\n---\n\n"
-            "Comment #2 by dx-workflow-gitwatcher@prod.google.com at 2026-10-30T17:48:13Z:\n"
+            "Comment #3 by dx-workflow-gitwatcher@prod.google.com at 2026-10-30T17:48:13Z:\n"
             "Project: skia\n"
         )
     })
     cinfo_bot = w.parse_rendered_issue_comments(bot_only)
-    self.assertEqual(cinfo_bot["last_human_comment_author"], "jlavrova@google.com")
+    self.assertEqual(cinfo_bot["last_human_comment_author"], "vmiura@google.com")
+    self.assertEqual(cinfo_bot["last_self_comment_at"], "2026-10-29T12:00:00Z")
+
+  def test_parse_rendered_issue_comments_466929543_fixture_parses_all_14_entries(
+      self,
+  ) -> None:
+    cinfo = w.parse_rendered_issue_comments(SAMPLE_RENDERED_466929543)
+    self.assertEqual(cinfo["last_human_comment_author"], "mingtse@google.com")
+    self.assertEqual(cinfo["last_human_comment_at"], "2026-10-30T10:06:15.298Z")
+    self.assertIn("VoU 1P_APP", cinfo["last_human_comment_snippet"])
+    self.assertEqual(cinfo["last_self_comment_at"], "2026-11-02T21:49:00.678Z")
+    self.assertEqual(cinfo["comment_cl_ids"], [])
+
+    self.assertIsNotNone(
+        re.search(
+            r"^Description\s+by\s+\S+\s+at\s+[^\r\n]+?:",
+            SAMPLE_RENDERED_466929543,
+            re.M,
+        )
+    )
+    comment_nums = [
+        int(m.group(1))
+        for m in w.RE_RENDERED_ISSUE_COMMENT.finditer(SAMPLE_RENDERED_466929543)
+    ]
+    # Description (#1) + Comment #2..#14 = all 14 entries parsed individually
+    self.assertEqual(comment_nums, list(range(2, 15)))
+    self.assertEqual(1 + len(comment_nums), 14)
+
+    # When #13 is authored by a bot, last_human_comment_* falls back to #12 (bungeman)
+    bot_13 = SAMPLE_RENDERED_466929543.replace(
+        "Comment #13 by mingtse@google.com",
+        "Comment #13 by triager-bot@prod.gserviceaccount.com",
+    )
+    cinfo_bot13 = w.parse_rendered_issue_comments(bot_13)
+    self.assertEqual(cinfo_bot13["last_human_comment_author"], "bungeman@google.com")
+    self.assertEqual(cinfo_bot13["last_human_comment_at"], "2026-02-20T14:47:34.282Z")
+    self.assertEqual(cinfo_bot13["last_self_comment_at"], "2026-11-02T21:49:00.678Z")
+
+  def test_self_reply_clears_needs_you_and_sync_does_not_wake_chat(self) -> None:
+    now_ts = w._parse_ts("2026-11-02T22:00:00Z")
+
+    # Stale Needs Me clears once last_self_comment_at > last_human_comment_at
+    bug_466: dict[str, object] = {
+        "bug_key": "buganizer:466929543",
+        "source": "buganizer",
+        "id": "466929543",
+        "short_id": "crbug/466929543",
+        "status": "ASSIGNED",
+        "priority": "P2",
+        "issue_type": "BUG",
+        "assignee": "jlavrova@google.com",
+        "created_time": "2025-12-08T07:50:24.570Z",
+        "modified_time": "2026-11-02T21:49:00.678Z",
+        "needs_you": True,
+        "why_needs_you": "New comment from ishitatsuyuki@google.com: Sensitive data...",
+        "lane": "you",
+        "last_human_comment_author": "mingtse@google.com",
+        "last_human_comment_at": "2026-10-30T10:06:15.298Z",
+        "last_human_comment_snippet": "VoU automated triage",
+        "last_self_comment_at": "2026-11-02T21:49:00.678Z",
+        "linked_cls": [],
+    }
+    w.classify_bug_status(bug_466, now_ts=now_ts)
+    self.assertFalse(bug_466["needs_you"])
+    self.assertEqual(bug_466["why_needs_you"], "")
+    self.assertEqual(bug_466["lane"], "assigned")
+
+    # Urgent P1 / vulnerability without a CL also leaves Needs Me once user replies on the bug
+    bug_p1: dict[str, object] = {
+        "bug_key": "buganizer:599000111",
+        "source": "buganizer",
+        "id": "599000111",
+        "status": "NEW",
+        "priority": "P1",
+        "issue_type": "VULNERABILITY",
+        "assignee": "jlavrova@google.com",
+        "created_time": "2026-11-01T10:00:00Z",
+        "modified_time": "2026-11-02T21:49:00Z",
+        "last_human_comment_author": "reporter@google.com",
+        "last_human_comment_at": "2026-11-01T12:00:00Z",
+        "last_self_comment_at": "",
+        "linked_cls": [],
+    }
+    w.classify_bug_status(bug_p1, now_ts=now_ts)
+    self.assertTrue(bug_p1["needs_you"])
+    bug_p1["last_self_comment_at"] = "2026-11-02T21:49:00Z"
+    w.classify_bug_status(bug_p1, now_ts=now_ts)
+    self.assertFalse(bug_p1["needs_you"])
+    self.assertEqual(bug_p1["why_needs_you"], "")
+
+    # Full sync heals a v1-cached bug stuck in Needs Me without waking its conversation
+    open_out = (
+        "Issue ID: 466929543\n"
+        "Component ID: 1457031\n"
+        "Assignee: jlavrova@google.com\n"
+        "Reporter: ishitatsuyuki@google.com\n"
+        "Status: ASSIGNED\n"
+        "Priority: P2\n"
+        "Issue Type: BUG\n"
+        "Title: UseAndroidNDKFontAPI breaks Japanese font in Google Search App\n"
+        "Created Time: 2025-12-08T07:50:24.570Z\n"
+        "Modified Time: 2026-11-02T21:49:00.678Z\n"
+        "Major Modified Time: 2026-10-30T10:06:15.298Z\n"
+        "Custom Field: Component Tags (1222907)\n"
+        "Custom Field Value: Internals>Skia\n"
+    )
+    state: dict[str, object] = {
+        "items": {},
+        "bugs": {
+            "buganizer:466929543": {
+                "bug_key": "buganizer:466929543",
+                "source": "buganizer",
+                "id": "466929543",
+                "short_id": "crbug/466929543",
+                "status": "ASSIGNED",
+                "priority": "P2",
+                "assignee": "jlavrova@google.com",
+                "conversation_id": "d5638b00-7c70-4cc5-820a-3328ae0e538f",
+                "chat_archived": False,
+                "last_human_comment_author": "ishitatsuyuki@google.com",
+                "last_human_comment_at": "2025-12-08T07:59:31.156Z",
+                "last_human_comment_snippet": "Sensitive data has been redacted...",
+                "last_self_comment_at": "",
+                "comments_checked_major_mod": "2026-11-02T21:49:00.678Z",
+                "needs_you": True,
+                "why_needs_you": "New comment from ishitatsuyuki@google.com: Sensitive data...",
+                "lane": "you",
+            }
+        },
+    }
+
+    def fake_mcp(calls: list[tuple[str, dict[str, object]]]) -> list[str]:
+      outs: list[str] = []
+      for name, args in calls:
+        if name == "get_bugs_with_external":
+          q = str(args.get("query") or "")
+          outs.append(open_out if "status:open" in q and "-status:open" not in q else "")
+        elif name == "render_issue_with_external":
+          outs.append(json.dumps({"result": SAMPLE_RENDERED_466929543}))
+        else:
+          outs.append("")
+      return outs
+
+    with mock.patch.object(
+        w, "call_buganizer_mcp_batch", side_effect=fake_mcp
+    ), mock.patch.object(
+        w, "fetch_github_bugs", return_value=[]
+    ), mock.patch.object(
+        w,
+        "discover_bug_chats",
+        return_value={
+            "buganizer:466929543": {
+                "conversation_id": "d5638b00-7c70-4cc5-820a-3328ae0e538f",
+                "title": "[16:32] \u29bf crbug/466929543 Android NDK font order",
+                "chat_archived": False,
+                "chat_busy": False,
+                "project_id": "proj-skia",
+                "project_name": "Skia",
+            }
+        },
+    ), mock.patch.object(
+        w, "wake_conversation"
+    ) as wake_mock:
+      w.sync_bugs_into_state(
+          state,
+          force=True,
+          wake_chats=True,
+          proj_names={"proj-skia": "Skia"},
+      )
+
+    healed_466 = state["bugs"]["buganizer:466929543"]
+    self.assertEqual(healed_466["last_human_comment_author"], "mingtse@google.com")
+    self.assertEqual(healed_466["last_self_comment_at"], "2026-11-02T21:49:00.678Z")
+    self.assertFalse(healed_466["needs_you"])
+    self.assertEqual(healed_466["why_needs_you"], "")
+    self.assertEqual(healed_466["lane"], "assigned")
+    wake_mock.assert_not_called()
 
   def test_namespaced_bug_extraction_separates_buganizer_and_github(self) -> None:
     gerrit_refs = w.extract_bug_refs_from_text(
