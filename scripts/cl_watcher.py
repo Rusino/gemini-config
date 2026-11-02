@@ -7053,6 +7053,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   details.stack-step-collapsed > summary::-webkit-details-marker { display: none; }
   details.stack-step-collapsed > summary .stack-step-cl {
     font-family: var(--mono); font-weight: 600; color: var(--blue);
+    text-decoration: none;
+  }
+  details.stack-step-collapsed > summary a.stack-step-cl:hover { text-decoration: underline; }
+  details.stack-step-collapsed > summary .stack-step-chat a,
+  details.stack-step-collapsed > summary .stack-step-chat button {
+    color: var(--blue); text-decoration: none;
+  }
+  details.stack-step-collapsed > summary .stack-step-chat a:hover,
+  details.stack-step-collapsed > summary .stack-step-chat button:hover {
+    text-decoration: underline;
   }
   details.stack-step-collapsed > summary .stack-step-subj {
     color: var(--ink); font-weight: 500;
@@ -7602,15 +7612,26 @@ function renderFocusSection(youItems, shownItems, data) {
       // Stack sibling residing in another lane renders as collapsed 1-line separator
       const stepBadge = `<span class="badge stack-step">⛓ ${pos}/${tot}</span>`;
       const clText = esc(clLabel(m));
+      // Direct link to host review UI so collapsed siblings can be inspected in one click
+      const clLink = m.url
+        ? `<a class="stack-step-cl" href="${esc(m.url)}" target="_blank" rel="noopener" ` +
+          `onclick="event.stopPropagation()">${clText}</a>`
+        : `<span class="stack-step-cl">${clText}</span>`;
       const subjText = esc(cleanSubject(m.subject));
       const stateText = stateHtml(m);
+      const chatHtml = chatActionHtml(m, data, true);
+      // Surface direct review chat link on collapsed sibling so parent chat is immediately accessible
+      const chatSpan = chatHtml
+        ? `<span class="stack-step-chat" onclick="event.stopPropagation()">· ${chatHtml}</span>`
+        : '';
       return `
         <details class="stack-step-collapsed">
           <summary>
             ${stepBadge}
-            <span class="stack-step-cl">${clText}</span>
+            ${clLink}
             <span class="stack-step-subj">${subjText}</span>
             <span>— ${stateText}</span>
+            ${chatSpan}
             <span class="stack-step-hint">click to expand</span>
           </summary>
           <div class="stack-step-expanded">${rowHtml(m, data)}</div>
@@ -9211,6 +9232,8 @@ async function openChat(convId, url, ev) {
   if (ev) {
     if (ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.button === 1) return true;
     if (typeof ev.preventDefault === 'function') ev.preventDefault();
+    // Stop propagation so clicking chat links inside summary elements does not toggle disclosure
+    if (typeof ev.stopPropagation === 'function') ev.stopPropagation();
   }
   const btn = ev && (ev.currentTarget || ev.target) ? (ev.currentTarget || ev.target) : null;
   const origText = btn ? btn.textContent : '';

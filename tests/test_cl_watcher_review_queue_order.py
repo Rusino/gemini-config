@@ -460,6 +460,7 @@ const testItems = [
     in_my_attention: false,
     self_approved: true,
     self_review_state: 'approved',
+    conversation_id: 'conv-1412377',
     stack_ancestors: ['gerrit:1412376'],
     stack_parent_ikey: 'gerrit:1412376',
     stack_root_ikey: 'gerrit:1412376',
@@ -487,6 +488,7 @@ const testItems = [
 ];
 
 const mockData = {
+  jetski_box_url: 'http://localhost:8089',
   items: {
     'gerrit:1412376': testItems[0],
     'gerrit:1412377': testItems[1],
@@ -533,6 +535,22 @@ assert(focusHtml.includes('[2/3 ✓ CR+1]'), 'Must render step 2 with CR+1 in sp
 assert(
     focusHtml.includes('details class="stack-step-collapsed"'),
     'Sibling in waiting must be collapsed',
+);
+assert(
+    focusHtml.includes('href="https://skia-review.googlesource.com/c/skia/+/1412377"'),
+    'Collapsed sibling must render direct CL link to Gerrit',
+);
+assert(
+    focusHtml.includes('class="stack-step-chat"'),
+    'Collapsed sibling must render stack-step-chat span',
+);
+assert(
+    focusHtml.includes('conv-1412377'),
+    'Collapsed sibling must render review chat link with conversation ID',
+);
+assert(
+    focusHtml.includes('review chat'),
+    'Collapsed sibling must render review chat button text',
 );
 assert(focusHtml.includes('CL 1412377'), 'Collapsed sibling must be 1412377');
 
