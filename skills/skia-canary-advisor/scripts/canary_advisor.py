@@ -9,7 +9,8 @@ Usage:
   canary_advisor.py advise --cl 1402416            # Gerrit CL (own or under review)
   canary_advisor.py advise --repo ~/skia [--base origin/main]
   canary_advisor.py triage --cl 1402416 [--ps 3]   # triage tryjobs (ASAN + Canaries)
-  canary_advisor.py watch --cl 1402416             # watch until terminal / ASAN early exit
+  canary_advisor.py watch --cl 1402416             # watch + auto-resolve own Canary-G3 hold on pass
+  canary_advisor.py resolve-hold --cl 1402416      # resolve own Canary-G3 hold on verified stack
   canary_advisor.py health                         # per-canary health from Buildbucket
   canary_advisor.py stats                          # follow-rate of logged recommendations
 """
@@ -17,6 +18,7 @@ Usage:
 import argparse
 import base64
 import datetime
+import heapq
 import json
 import os
 import re
@@ -24,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 
 GERRIT = "https://skia-review.googlesource.com"
@@ -682,26 +685,36 @@ def g3_change_approved(change, patchset):
                for v in votes)
 
 
-def unapproved_g3_chain(cl, ps):
-    """Returns (change, patchset) pairs that block Canary-G3 for cl/ps.
-
-    The google3 try service cherry-picks every unmerged parent of the change too
-    (GetChangesToCherryPick), and each of them needs its own Googler approval.
-    """
+def g3_chain(cl, ps):
+    """Returns ordered (change, patchset) chain cherry-picked by Canary-G3 for cl/ps."""
     related = gerrit_json(f"/changes/{cl}/revisions/{ps}/related").get("changes", [])
     parent_of, by_commit = {}, {}
     for c in related:
-        if c.get("status") == "MERGED":
+        if c.get("status") in ("MERGED", "ABANDONED"):
             continue
-        key = (c["_change_number"], c["_revision_number"])
+        key = (int(c["_change_number"]), int(c["_revision_number"]))
         by_commit[c["commit"]["commit"]] = key
         if c["commit"].get("parents"):
             parent_of[key] = c["commit"]["parents"][0]["commit"]
     chain = [(int(cl), int(ps))]
-    # The related list is finite and each step moves to a distinct parent commit
-    while len(chain) <= len(related) and by_commit.get(parent_of.get(chain[0])):
-        chain.insert(0, by_commit[parent_of[chain[0]]])
-    return [(c, p) for c, p in chain if not g3_change_approved(c, p)]
+    visited = {chain[0]}
+    # The related list is finite and each step moves to a distinct unvisited parent commit
+    while len(chain) <= len(related):
+        nxt = by_commit.get(parent_of.get(chain[0]))
+        if not nxt or nxt in visited:
+            break
+        visited.add(nxt)
+        chain.insert(0, nxt)
+    return chain
+
+
+def unapproved_g3_chain(cl, ps):
+    """Returns (change, patchset) pairs that block Canary-G3 for cl/ps.
+
+    The google3 try service cherry-picks every unmerged parent of the change too
+    (GetChangesToCherryPick), and each of them needs its own Googler approval
+    """
+    return [(c, p) for c, p in g3_chain(cl, ps) if not g3_change_approved(c, p)]
 
 
 def swarming_task_stdout(task_id):
@@ -1075,6 +1088,255 @@ def save_gerrit_patchset_draft(cl, ps, note_text, unresolved=False):
         return False
 
 
+# Reconstruct /PATCHSET_LEVEL threads using Gerrit's CommentThreads priority-queue order and
+# return leaf metadata strictly for jlavrova@google.com's own unresolved Canary-G3 submit holds
+def find_unresolved_canary_g3_hold_leaves(comments_by_path):
+    if not isinstance(comments_by_path, dict):
+        return []
+    ps_comments = comments_by_path.get("/PATCHSET_LEVEL") or []
+    by_id, children = {}, {}
+    for raw in ps_comments:
+        if not isinstance(raw, dict):
+            continue
+        cid = str(raw.get("id") or "")
+        # Patchset-level submit holds never carry file line or range anchors
+        if not cid or raw.get("line") is not None or raw.get("range") is not None:
+            continue
+        by_id[cid] = raw
+    for cid, c in by_id.items():
+        parent_id = str(c.get("in_reply_to") or "")
+        if parent_id and parent_id in by_id:
+            children.setdefault(parent_id, []).append(c)
+
+    roots = [
+        c for cid, c in by_id.items()
+        if not c.get("in_reply_to") or str(c.get("in_reply_to")) not in by_id
+    ]
+    leaves = []
+    me_lower = ME.lower()
+    for root in roots:
+        heap = [(str(root.get("updated") or ""), str(root["id"]), root)]
+        thread, visited = [], set()
+        while heap and len(visited) <= len(by_id):
+            _, cid, cur = heapq.heappop(heap)
+            if cid in visited:
+                continue
+            visited.add(cid)
+            thread.append(cur)
+            for child in children.get(cid, ()):
+                ch_id = str(child["id"])
+                if ch_id not in visited:
+                    heapq.heappush(heap, (str(child.get("updated") or ""), ch_id, child))
+        if not thread:
+            continue
+        leaf = thread[-1]
+        if not bool(leaf.get("unresolved", False)):
+            continue
+        # Never touch third-party threads or threads where someone else left an unanswered reply
+        if any(((c.get("author") or {}).get("email") or "").lower() != me_lower for c in thread):
+            continue
+        norm = " ".join(str(root.get("message") or "").split()).lower()
+        if "hold the submit" not in norm or "canary-g3" not in norm:
+            continue
+        if "do not hold the submit" in norm or "don't hold the submit" in norm:
+            continue
+        leaf_ps = int(leaf.get("patch_set") or 0)
+        if leaf_ps > 0:
+            leaves.append({"id": str(leaf["id"]), "patch_set": leaf_ps, "path": "/PATCHSET_LEVEL"})
+    leaves.sort(key=lambda item: (item["patch_set"], item["id"]))
+    return leaves
+
+
+# Check whether an ancestor CL ran its own Canary-G3 on tested_ps and genuinely failed google3 TAP
+def _ancestor_own_canary_g3_status(cl, tested_ps):
+    g3_build = bb_cl_builds(cl, tested_ps).get("Canary-G3")
+    if not g3_build:
+        return False, False
+    st = g3_build.get("status")
+    if st == "SUCCESS":
+        return True, False
+    if st not in ("FAILURE", "INFRA_FAILURE"):
+        return False, False
+    tasks = swarming_tasks_for_cl(cl, tested_ps, name="Canary-G3")
+    if not tasks:
+        return False, True
+    stdout = swarming_task_stdout(tasks[0].get("taskId"))
+    # Pre-roll aborts (MissingApproval or 900s queue timeout waiting for another stack CL's roll to
+    # start) never created a google3 roll CL and are superseded once the stack tip passes TAP
+    if not re.search(r"http://cl/\d+", stdout):
+        return False, False
+    return False, True
+
+
+# Gerrit CommentsUtil.ensureValidInReplyTo requires posting replies on the parent comment's own
+# patchset rather than revisions/current when a newer patchset exists
+def post_gerrit_hold_resolution(cl, leaf_ps, leaf_ids, message):
+    token = _gerrit_luci_token()
+    if not token:
+        return False, "missing_luci_token"
+    url = f"{GERRIT}/a/changes/{int(cl)}/revisions/{int(leaf_ps)}/review"
+    payload = json.dumps({
+        "drafts": "KEEP",
+        "omit_duplicate_comments": True,
+        "comments": {
+            "/PATCHSET_LEVEL": [
+                {
+                    "path": "/PATCHSET_LEVEL",
+                    "patch_set": int(leaf_ps),
+                    "in_reply_to": lid,
+                    "message": message,
+                    "unresolved": False,
+                }
+                for lid in leaf_ids
+            ]
+        },
+    }).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json; charset=UTF-8",
+        "User-Agent": "canary-advisor",
+    }
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            r.read()
+            return r.status in (200, 201), ""
+    except (urllib.error.URLError, OSError) as e:
+        return False, str(e)
+
+
+def resolve_canary_g3_holds(cl, ps, dry_run=False):
+    """Resolves jlavrova@google.com's Canary-G3 submit holds across verified stack patchsets."""
+    top_cl, top_ps = int(cl), int(ps)
+    top_builds = bb_cl_builds(top_cl, top_ps)
+    if top_builds.get("Canary-G3", {}).get("status") != "SUCCESS":
+        return []
+
+    outcomes = []
+    me_lower = ME.lower()
+    for cur_cl, tested_ps in g3_chain(top_cl, top_ps):
+        info = gerrit_json(
+            f"/changes/{cur_cl}?o=CURRENT_REVISION&o=ALL_REVISIONS&o=DETAILED_LABELS"
+            "&o=DETAILED_ACCOUNTS"
+        )
+        status = info.get("status", "")
+        if status != "NEW":
+            outcomes.append({
+                "cl": cur_cl, "tested_ps": tested_ps, "resolved": False,
+                "skip_reason": f"status_{status.lower()}",
+            })
+            continue
+        cur_sha = info.get("current_revision", "")
+        revs = info.get("revisions", {})
+        cur_rev = revs.get(cur_sha) or next(iter(revs.values()), {})
+        cur_ps = int(cur_rev.get("_number") or info.get("current_revision_number") or 0)
+        if cur_ps != tested_ps:
+            outcomes.append({
+                "cl": cur_cl, "tested_ps": tested_ps, "current_ps": cur_ps, "resolved": False,
+                "skip_reason": f"current_ps_{cur_ps}_differs_from_tested_ps_{tested_ps}",
+            })
+            continue
+        votes = info.get("labels", {}).get("Code-Review", {}).get("all", [])
+        has_own_cr = any(
+            v.get("value", 0) >= 1 and (v.get("email") or "").lower() == me_lower
+            for v in votes
+        )
+        if not has_own_cr:
+            outcomes.append({
+                "cl": cur_cl, "tested_ps": tested_ps, "current_ps": cur_ps, "resolved": False,
+                "skip_reason": "missing_own_cr_plus_one",
+            })
+            continue
+
+        comments = gerrit_json(f"/changes/{cur_cl}/comments")
+        leaves = find_unresolved_canary_g3_hold_leaves(comments)
+        if not leaves:
+            outcomes.append({
+                "cl": cur_cl, "tested_ps": tested_ps, "current_ps": cur_ps, "resolved": False,
+                "skip_reason": "no_unresolved_hold_thread",
+            })
+            continue
+
+        own_passed = cur_cl == top_cl
+        if not own_passed:
+            own_passed, own_failed = _ancestor_own_canary_g3_status(cur_cl, tested_ps)
+            if own_failed:
+                outcomes.append({
+                    "cl": cur_cl, "tested_ps": tested_ps, "current_ps": cur_ps, "resolved": False,
+                    "skip_reason": "ancestor_own_canary_g3_failed",
+                })
+                continue
+
+        if own_passed:
+            msg = "Canary-G3 passed; resolving submit hold."
+        else:
+            msg = (f"Canary-G3 passed on {GERRIT}/c/skia/+/{top_cl}/{top_ps} "
+                   f"(including PS{tested_ps} of this CL); resolving submit hold.")
+
+        if dry_run:
+            outcomes.append({
+                "cl": cur_cl, "tested_ps": tested_ps, "current_ps": cur_ps, "resolved": False,
+                "would_resolve": True, "leaves": leaves, "message": msg,
+            })
+            continue
+
+        by_ps = {}
+        for leaf in leaves:
+            by_ps.setdefault(leaf["patch_set"], []).append(leaf["id"])
+        errors = []
+        resolved_ids = []
+        for leaf_ps, leaf_ids in sorted(by_ps.items()):
+            ok, err = post_gerrit_hold_resolution(cur_cl, leaf_ps, leaf_ids, msg)
+            if ok:
+                resolved_ids.extend(leaf_ids)
+            else:
+                errors.append(f"ps{leaf_ps}:{err}")
+        outcomes.append({
+            "cl": cur_cl, "tested_ps": tested_ps, "current_ps": cur_ps,
+            "resolved": bool(resolved_ids) and not errors,
+            "resolved_leaf_ids": resolved_ids, "message": msg,
+            **({"error": "; ".join(errors)} if errors else {}),
+        })
+    return outcomes
+
+
+def _print_hold_outcomes(outcomes, dry_run=False):
+    tag = "[DRY RUN SUBMIT HOLD]" if dry_run else "[SUBMIT HOLD RESOLVED]"
+    for item in outcomes:
+        if item.get("resolved") or item.get("would_resolve"):
+            leaves = item.get("leaves") or [{"id": i} for i in item.get("resolved_leaf_ids", [])]
+            ids = ", ".join(l["id"] for l in leaves)
+            print(f"{tag} CL {item['cl']} (tested PS {item['tested_ps']}): "
+                  f"thread(s) {ids} -> \"{item['message']}\"")
+        elif item.get("error"):
+            print(f"[SUBMIT HOLD ERROR] CL {item['cl']}: {item['error']}")
+
+
+def cmd_resolve_hold(args):
+    meta = load_cl(args.cl, ps=args.ps, include_diff=False)
+    cl, ps = meta["cl"], meta["patchset"]
+    outcomes = resolve_canary_g3_holds(cl, ps, dry_run=args.dry_run)
+    if not outcomes:
+        print(f"Canary-G3 is not SUCCESS on CL {cl} PS {ps}; no submit holds resolved.")
+    else:
+        _print_hold_outcomes(outcomes, dry_run=args.dry_run)
+        for item in outcomes:
+            if not item.get("resolved") and not item.get("would_resolve") and not item.get("error"):
+                print(f"[SUBMIT HOLD SKIP] CL {item['cl']} (PS {item['tested_ps']}): "
+                      f"{item.get('skip_reason')}")
+    if args.json:
+        print(f"\n```json\n{json.dumps(outcomes, indent=2)}\n```")
+    return 0
+
+
+BLOCKING_BUILD_VERDICTS = {
+    "COMPILE_FAILURE",
+    "SANITIZER_OR_TEST_FAILURE",
+    "FAILED_UNSPECIFIED",
+    "CL_SUSPECTED_REGRESSION",
+}
+
+
 def cmd_triage(args):
     meta = load_cl(args.cl, ps=args.ps)
     cl = meta["cl"]
@@ -1085,7 +1347,7 @@ def cmd_triage(args):
     builds = bb_cl_builds(cl, ps)
     sw_tasks = swarming_tasks_for_cl(cl, ps)
 
-    results = {"cl": cl, "patchset": ps, "builds": {}, "drafts_saved": []}
+    results = {"cl": cl, "patchset": ps, "builds": {}, "drafts_saved": [], "holds_resolved": []}
     drafts_to_save = []
 
     print(f"# Tryjob Triage: CL {cl} PS {ps} ({meta['subject']})\n")
@@ -1161,6 +1423,21 @@ def cmd_triage(args):
         else:
             print(f"\n[GERRIT DRAFT FAILED] Could not save draft to CL {cl} PS {ps}")
 
+    # Keep submit holds active when ASAN or another Canary suspected a CL regression
+    has_blocking_failure = any(
+        b.get("verdict") in BLOCKING_BUILD_VERDICTS for b in results["builds"].values()
+    )
+    if (
+        getattr(args, "resolve_hold", False)
+        and builds.get("Canary-G3", {}).get("status") == "SUCCESS"
+        and not has_blocking_failure
+    ):
+        outcomes = resolve_canary_g3_holds(cl, ps)
+        results["holds_resolved"] = outcomes
+        if any(o.get("resolved") or o.get("error") for o in outcomes):
+            print("")
+            _print_hold_outcomes(outcomes)
+
     if args.json:
         print(f"\n```json\n{json.dumps(results, indent=2)}\n```")
     return results
@@ -1187,12 +1464,15 @@ def cmd_watch(args):
                 break
     g3_needed = "Canary-G3" in recs
     asan_retried = False
+    holds_resolved = False
+    auto_resolve = not getattr(args, "no_resolve_hold", False)
     last_missing_parents = ""
 
     while True:
         elapsed = time.time() - start_time
         if elapsed > timeout_sec:
             print(f"\nWAKEUP_REASON: TIMEOUT ({args.timeout_min}m elapsed)")
+            args.resolve_hold = auto_resolve and not holds_resolved
             cmd_triage(args)
             return 1
 
@@ -1240,8 +1520,26 @@ def cmd_watch(args):
                     asan_retried = True
                 elif triage_res["verdict"] in ("COMPILE_FAILURE", "SANITIZER_OR_TEST_FAILURE"):
                     print(f"\nWAKEUP_REASON: ASAN_FAILURE ({triage_res['verdict']})")
+                    args.resolve_hold = False
                     cmd_triage(args)
                     return 0
+
+        if auto_resolve and not holds_resolved:
+            g3_ok = builds.get("Canary-G3", {}).get("status") == "SUCCESS"
+            # Wait until every ASAN and Canary build on the patchset has also succeeded
+            relevant_ok = all(
+                b.get("status") == "SUCCESS"
+                for name, b in builds.items()
+                if "ASAN" in name or name.startswith("Canary-")
+            )
+            # Keep holds active if any other tryjob on the patchset has already failed
+            any_failed = any(
+                b.get("status") in ("FAILURE", "INFRA_FAILURE") for b in builds.values()
+            )
+            if g3_ok and relevant_ok and not any_failed:
+                outcomes = resolve_canary_g3_holds(cl, ps)
+                _print_hold_outcomes(outcomes)
+                holds_resolved = True
 
         terminal_statuses = ("SUCCESS", "FAILURE", "INFRA_FAILURE", "CANCELED")
         if builds:
@@ -1256,6 +1554,7 @@ def cmd_watch(args):
                     pass
                 else:
                     print("\nWAKEUP_REASON: ALL_TRYJOBS_COMPLETE")
+                    args.resolve_hold = auto_resolve and not holds_resolved
                     cmd_triage(args)
                     return 0
 
@@ -1282,6 +1581,8 @@ def main():
     t.add_argument("--ps", help="Patchset number (defaults to current)")
     t.add_argument("--save-draft", action="store_true",
                    help="save sanitized draft to Gerrit if Canary is red due to unrelated failures")
+    t.add_argument("--resolve-hold", action="store_true",
+                   help="auto-resolve own Canary-G3 submit-hold threads if Canary-G3 is SUCCESS")
     t.add_argument("--json", action="store_true", help="output JSON results")
     t.set_defaults(fn=cmd_triage)
     w = sub.add_parser("watch")
@@ -1291,10 +1592,21 @@ def main():
     w.add_argument("--timeout-min", type=int, default=90, help="Maximum watch time in minutes")
     w.add_argument("--save-draft", action="store_true",
                    help="save sanitized draft to Gerrit on completion if Canary is red")
+    w.add_argument("--no-resolve-hold", action="store_true",
+                   help="do not auto-resolve own Canary-G3 submit-hold threads on SUCCESS")
     w.add_argument("--json", action="store_true", help="output JSON results")
     w.set_defaults(fn=cmd_watch)
+    rh = sub.add_parser("resolve-hold")
+    rh.add_argument("--cl", required=True, help="Skia Gerrit change number")
+    rh.add_argument("--ps", help="Patchset number (defaults to current)")
+    rh.add_argument("--dry-run", action="store_true",
+                    help="inspect and report eligible hold threads without posting to Gerrit")
+    rh.add_argument("--json", action="store_true", help="output JSON results")
+    rh.set_defaults(fn=cmd_resolve_hold)
     args = p.parse_args()
-    args.fn(args)
+    # Subcommands like cmd_triage return result dicts for library callers, not process exit codes
+    res = args.fn(args)
+    return res if isinstance(res, int) else 0
 
 
 if __name__ == "__main__":

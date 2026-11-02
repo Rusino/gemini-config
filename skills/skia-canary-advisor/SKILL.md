@@ -18,7 +18,8 @@ S=~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py
 python3 $S advise --cl <change>      # Gerrit CL, own or under review
 python3 $S advise --repo <skia>      # local branch vs origin/main
 python3 $S triage --cl <change>      # triage tryjobs (ASAN + Canaries)
-python3 $S watch --cl <change> --save-draft  # background watcher + draft on red
+python3 $S watch --cl <change> --save-draft  # watch + auto-resolve own Canary-G3 hold on pass
+python3 $S resolve-hold --cl <change> [--dry-run]  # resolve own Canary-G3 hold on verified stack
 python3 $S health                    # OK/DEAD per canary (real verdicts in last 45 days)
 python3 $S stats                     # RAN/skipped per logged recommendation + follow rate
 ```
@@ -59,6 +60,12 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
    - For external authors needing `Canary-G3`, `watch` automatically polls Gerrit for the Googler
      `Code-Review+1` vote, triggers `Canary-G3` the moment `CR+1` is published, and watches
      `Canary-G3` to completion.
+   - **On Green `Canary-G3` (`SUCCESS`)**: `watch` automatically resolves **only**
+     `jlavrova@google.com`'s own `/PATCHSET_LEVEL` `Canary-G3` submit-hold thread (matching
+     `"hold the submit"` + `"Canary-G3"`, with no third-party replies and active `Code-Review+1` on
+     the tested `current_revision`) across the tested `(CL, PS)` and verified unmerged stack
+     ancestors, posting the reply on each hold comment's own revision (`revisions/{leaf_ps}/review`
+     with `drafts: KEEP`). Never resolves substantive comments or third-party threads.
    - **On Red Canary (`UNRELATED_HEAD_BREAKAGE`)**: `watch --save-draft` automatically verifies
      `CheckTestsSkia` + `blaze query somepath` for all failing targets and saves a strictly
      sanitized English `/PATCHSET_LEVEL` draft on Gerrit (never leaking internal `google3` target
@@ -96,7 +103,10 @@ When reviewing an external author's Skia CL that requires `Canary-G3`:
      ```bash
      git cl try -i <CL> -B skia/skia.primary -b Canary-G3
      ```
-   - When `Canary-G3` turns green, the user resolves the comment thread, unblocking submit.
+   - When `Canary-G3` finishes `SUCCESS`, `canary_advisor.py` (`watch` or `resolve-hold --cl <CL>`)
+     automatically resolves `jlavrova@google.com`'s own `/PATCHSET_LEVEL` submit-hold thread on
+     `<CL>` and any unmerged stack ancestors whose `current_revision` matches the cherry-picked
+     patchset and keeps `jlavrova@google.com`'s `Code-Review+1`, unblocking submit.
 
 ## Canary-G3 Runtime & Triage Procedure
 

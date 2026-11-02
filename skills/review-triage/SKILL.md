@@ -147,6 +147,10 @@ For surviving Skia CLs in `🔴 SURGICAL AUDIT` or `🟠 PUSHBACK`, run
 - **Background Watcher & Wakeup Protocol**: Immediately after triggering `git cl try`, launch
   `python3 ~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py watch --cl <N> --save-draft`
   in the background (`WaitMsBeforeAsync=500`, `NotificationTimeoutSeconds=5400`).
+  - **On Green `Canary-G3` (`SUCCESS`)**: `watch` automatically resolves **only**
+    `jlavrova@google.com`'s own `/PATCHSET_LEVEL` `Canary-G3` submit-hold thread (on the tested
+    `(CL, PS)` and verified unmerged stack ancestors whose `current_revision` matches the
+    cherry-picked patchset and keeps `jlavrova@google.com`'s `Code-Review+1`).
   - **On Red Canary (`UNRELATED_HEAD_BREAKAGE`)**: `watch --save-draft` automatically saves a
     sanitized Gerrit `/PATCHSET_LEVEL` draft (only when Canary is red; never when green) and wakes
     the chat.
@@ -181,12 +185,22 @@ named skill's `SKILL.md` was not read, when a report with a `Case 1-5` verdict l
 
 ## Review & VCS Guidelines (Strict Rules)
 1. **English-Only Review Surface**: All generated review comments, reassignment notes, and pushback messages must be strictly in English. Direct discussion with the user remains in Russian.
-2. **Never Auto-Publish or Resolve (Always Save Gerrit Drafts on the Parent CL)**: The agent must NEVER publish review comments to Gerrit/GitHub or resolve threads automatically. For targeted external Gerrit CL reviews (outside Dry Mode and Self-Review Mode), always save the prepared English review comment (including the companion WIP CL link and patchset guide when a companion CL is uploaded) as a `/PATCHSET_LEVEL` draft directly on the parent CL's current patchset (`PUT https://<host>/a/changes/<CL>/revisions/<PS>/drafts`, updating any existing `/PATCHSET_LEVEL` draft on `<PS>` rather than duplicating), and also present the draft in chat for the user to review and publish.
+2. **Never Auto-Publish or Resolve (Always Save Gerrit Drafts on the Parent CL)**: The agent must
+   NEVER publish review comments to Gerrit/GitHub or resolve threads automatically — **except**
+   `canary_advisor.py` (`watch` / `resolve-hold`) resolving `jlavrova@google.com`'s own
+   `/PATCHSET_LEVEL` `Canary-G3` submit-hold thread when `Canary-G3` finishes `SUCCESS`. For
+   targeted external Gerrit CL reviews (outside Dry Mode and Self-Review Mode), always save the
+   prepared English review comment (including the companion WIP CL link and patchset guide when a
+   companion CL is uploaded) as a `/PATCHSET_LEVEL` draft directly on the parent CL's current
+   patchset (`PUT https://<host>/a/changes/<CL>/revisions/<PS>/drafts`, updating any existing
+   `/PATCHSET_LEVEL` draft on `<PS>` rather than duplicating), and also present the draft in chat
+   for the user to review and publish.
 3. **Gerrit Drafts & Thread Follow-ups**:
    - Save the prepared review comment on the parent Gerrit CL via `PUT https://<host>/a/changes/<CL>/revisions/<PS>/drafts` using the OAuth token from `printf "protocol=https\nhost=%s\n\n" "<host>" | git-credential-luci get` and Python `json.dumps({"path": "/PATCHSET_LEVEL", "message": msg, "unresolved": unresolved})` (`unresolved: True` when there are defects/questions, `False` for clean approvals), including the full review explanation and companion WIP CL link/patchset guide. If `git-credential-luci` requires reauth, warn the user and still output the full draft in chat.
    - A follow-up after a new patchset is saved as a standalone `/PATCHSET_LEVEL` draft on the CURRENT patchset (no `in_reply_to`), containing only new text.
    - Use `in_reply_to` only for inline (`file:line`) replies or when the user explicitly asks to answer inside a thread; never include or re-quote already-published text in a draft.
-   - Never resolve the old thread unless the user asks; if asked, resolve via a minimal "Done" reply in that thread.
+   - Never resolve substantive review threads unless the user asks; if asked, resolve via a minimal
+     "Done" reply on that comment's own revision (`revisions/{leaf_ps}/review`).
 4. **No Auto-Submit or CQ Votes**: Never trigger CQ votes (`Commit-Queue+1`/`+2`) or merge actions.
 5. **Respect `PRESUBMIT.py` Include & Forward-Declaration Sorting**: In Skia, `PRESUBMIT.py` runs
    `python3 tools/rewrite_includes.py --dry-run` on all modified files and fails CQ
