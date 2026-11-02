@@ -369,6 +369,37 @@ LGTM pending corpus gate.
     self.assertIn("triage", items[0])
     self.assertEqual(items[0]["triage"]["review_outcome"], "CLEAN")
 
+  def test_save_review_verdict_truncates_on_word_boundary(self):
+    ts.save_review_verdict(
+        target_id="1414016",
+        kind="gerrit",
+        patchset=1,
+        outcome="CLEAN",
+        summary="Short summary",
+        results_dir=self.test_dir,
+    )
+    res1 = ts.load_all_triage_results(results_dir=self.test_dir)["gerrit:1414016"]
+    self.assertEqual(res1["summary"], "Short summary")
+
+    long_sum = (
+        "Correct fix: hit width now uses the glyph's own justification shift; "
+        "author tests fail-before/pass-after, 4 extra adversarial cases pass, "
+        "dm tests pass, flutter corpus clean and all tests green"
+    )
+    ts.save_review_verdict(
+        target_id="1414017",
+        kind="gerrit",
+        patchset=1,
+        outcome="CLEAN",
+        summary=long_sum,
+        results_dir=self.test_dir,
+    )
+    res2 = ts.load_all_triage_results(results_dir=self.test_dir)["gerrit:1414017"]
+    self.assertTrue(len(res2["summary"]) <= 180)
+    self.assertTrue(res2["summary"].endswith("…"))
+    self.assertNotIn("all tests green", res2["summary"])
+    self.assertIn("4 extra adversarial cases pass", res2["summary"])
+
 
 class FlightDeckTriageDashboardRenderingTest(unittest.TestCase):
 
@@ -542,6 +573,71 @@ console.log(JSON.stringify({
     self.assertIn("by <a", out["focusCompanionFix"])
 
     self.assertIn("by You", out["focusSelf"])
+
+  def test_focus_card_suppresses_noise_and_redundant_why_when_review_ready(self):
+    script_body = w.DASHBOARD_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    harness = script_body.split("\nboot();", 1)[0] + """
+const itemBeforeTriage = {
+  item_key: 'gerrit:1414017',
+  target_id: '1414017',
+  kind: 'gerrit',
+  status: 'NEW',
+  phase: 'NEEDS_YOUR_ACTION',
+  role: 'reviewer (ext)',
+  patchset: 1,
+  url: 'https://example.com/1414017',
+  subject: '[skparagraph] Shift trailing space',
+  project_name: 'SkParagraph',
+  in_my_attention: true,
+  last_msg_author: 'dbebawy@gmail.com',
+  last_msg_snippet: 'jlavrova@google.com, who was added as reviewer owns the following files: * `TextLine.cpp`',
+  last_msg_et: '13:53 ET',
+  last_msg_age: '1h ago',
+};
+
+const itemAfterTriage = Object.assign({}, itemBeforeTriage, {
+  triage: {
+    verdict: 'CLEAN',
+    verdict_label: '🟢 Clean (LGTM)',
+    summary: "Correct fix: hit width now uses glyph's own shift",
+    triaged_patchset: 1,
+    triaged_at: '2026-11-02T19:38:09Z',
+    is_stale: false,
+    draft: 'Looks good.',
+  }
+});
+
+const itemAuthorReplied = Object.assign({}, itemAfterTriage, {
+  author_replied_to_me: true,
+  last_msg_author: 'dbebawy@gmail.com',
+  last_msg_snippet: 'Thanks Julia! Addressed your question.',
+  last_msg_date: '2026-11-02 20:10:00.000000000',
+});
+
+console.log(JSON.stringify({
+  beforeTriageHtml: focusCard(itemBeforeTriage, {jetski_box_url: ''}),
+  afterTriageHtml: focusCard(itemAfterTriage, {jetski_box_url: ''}),
+  authorRepliedHtml: focusCard(itemAuthorReplied, {jetski_box_url: ''}),
+}));
+"""
+    proc = subprocess.run(
+        ["node", "-e", harness], capture_output=True, text=True, check=True
+    )
+    out = json.loads(proc.stdout.strip())
+
+    before = out["beforeTriageHtml"]
+    self.assertNotIn("owns the following files", before)
+    self.assertIn("Added as reviewer", before)
+
+    after = out["afterTriageHtml"]
+    self.assertNotIn('<div class="why">', after)
+    self.assertIn("triage-box", after)
+    self.assertIn("Correct fix: hit width now uses glyph's own shift", after)
+
+    replied = out["authorRepliedHtml"]
+    self.assertIn('<div class="why">', replied)
+    self.assertIn("Thanks Julia! Addressed your question.", replied)
+    self.assertIn("triage-box", replied)
 
 
 if __name__ == "__main__":

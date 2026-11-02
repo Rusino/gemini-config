@@ -208,6 +208,19 @@ def normalize_review_outcome(raw: str) -> str:
     raise ValueError(f"Unknown review outcome: {raw}")
 
 
+# Truncates summary to max_len on a word boundary with an ellipsis
+def truncate_summary(text: str, max_len: int = 180) -> str:
+    clean = " ".join(str(text or "").strip().split())
+    if len(clean) <= max_len:
+        return clean
+    cut = clean[: max_len - 1]
+    sp = cut.rfind(" ")
+    if sp >= max_len // 2:
+        cut = cut[:sp]
+    cut = cut.rstrip(" ,;:-")
+    return f"{cut}…"
+
+
 # Persist completed code review verdict and findings for Flight Deck display
 def save_review_verdict(
     target_id: str,
@@ -225,7 +238,8 @@ def save_review_verdict(
     iso_ts, et_ts = now_et_strings()
     safe_ps = int(patchset) if patchset else 1
 
-    clean_summary = summary.strip()[:140]
+    # Truncate on a word boundary so card summaries never cut off mid-word
+    clean_summary = truncate_summary(summary, 180)
     data = {
         "target_id": str(target_id),
         "item_key": f"{kind}:{target_id}",
@@ -279,7 +293,7 @@ def parse_queue_triage_markdown(
         draft_m = RE_DRAFT_BLOCK.search(body)
         draft = draft_m.group(1).strip() if draft_m else ""
 
-        summary = reason[:90]
+        summary = truncate_summary(reason, 180)
         if "Already reviewed by you on this patchset" in ps_details:
             if "Code-Review+1" in ps_details or "Code-Review+2" in ps_details:
                 verdict = "MECHANICAL"
@@ -424,7 +438,7 @@ def parse_single_audit_text(
     elif "reassign" in cat_raw.lower():
         summary = "Needs reassignment to domain owner"
     else:
-        summary = cat_raw[:85]
+        summary = truncate_summary(cat_raw, 180)
 
     # Infer structured review outcome and badges from audit text if present
     review_outcome = ""
@@ -689,7 +703,7 @@ def main() -> int:
             parsed["verdict"] = normalize_verdict(args.verdict)
             parsed["verdict_label"] = parsed["verdict"].replace("_", " ")
         if args.summary:
-            parsed["summary"] = args.summary
+            parsed["summary"] = truncate_summary(args.summary, 180)
         if args.patchset:
             parsed["triaged_patchset"] = args.patchset
         if args.est_minutes:
