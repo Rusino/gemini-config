@@ -56,3 +56,32 @@
 - **R93** (`done`): Автоматизация ежедневного дайджеста `sad-ru-googlers-ai-digest` (cron ежедневно в 18:00 ET перед стиранием истории) и настоящий файл архива.
 - **R94** (`todo`): Разработка скилла `code-debate` (новый скилл `code-debate`) на базе `swarm` с `workspace: share`, проверкой компиляцией и тестами в ворктри и обязательным консенсусом `[AGREED]`.
 - **R95** (`todo`): Ревизия роутинга моделей в `~/.gemini/config/rules/subagent_exploration.md`: ограничение `Model="flash"` в `research-google` только механическим поиском, перенос смыслового ресерча на `inherit`/`pro`, шардирование контекста субагентов.
+
+---
+
+## 2026-11-02
+
+### Sad RU Googlers (HISTORY OFF) (`spaces/AAAAn_HZbYs`)
+- **Статус за 24 часа**: 0 сообщений по ИИ, агентам или тулингу (обсуждались бытовые вопросы отпусков и балансов).
+
+### Chrome AI Discuss (`spaces/AAQA45T8nC8`)
+
+#### 1. Баг Gerrit: скрытые черновики автоматически публикуются (b/580882306)
+- **Автор**: Arthur Milchior (`arthurmilchior@google.com`, 10:17 ET, тред `spaces/AAQA45T8nC8/threads/6_0o2WQUB1w`).
+- **Суть проблемы**: Команда `git cl comment` позволяет писать драфт к комментарию, но не умеет редактировать или удалять существующие драфты. Если агент или скрипт пишет драфт повторно, создаётся новый драфт поверх старого. В интерфейсе Gerrit отображается только самый последний драфт (предыдущие скрыты даже после обновления страницы), однако при нажатии «Reply» Gerrit публикует абсолютно **все** накопившиеся черновики. Это привело к случайной публикации отклонённых версий ответов ревьюерам.
+- **Связь с нашими правилами**: Полностью подтверждает наше правило в `~/.gemini/config/rules/code_style.md` не публиковать драфты и ответы автоматически без явного аппрува пользователя, а также требует осторожности при генерации черновиков через `git cl comment`.
+
+#### 2. Upskill: Telemetry-Driven Surgical Skill Upgrader (go/jetski-upskill, go/100-skills)
+- **Авторы**: Narender Gaddipati (`narenderg@google.com`), репост: Javier Castro (30 окт. 19:55 ET) и Joe Mason (2 нояб. 11:14 ET, тред `spaces/AAQA45T8nC8/threads/rZMXgxljhco`, оригинал `spaces/AAQAN-vNGWg/threads/GE2cjsaIJI4`).
+- **Путь в репозитории**: [`/google/src/files/head/depot/google3/prototypes/projects/upskill/skills/upskill/SKILL.md`](file:///google/src/files/head/depot/google3/prototypes/projects/upskill/skills/upskill/SKILL.md).
+- **Ключевые инварианты и практики**:
+  1. *Оптимизация топ-100 скиллов Google3*: ресерч покрыл 97.6% трафика скиллов в google3, вернув ~650 млрд токенов в месяц за счёт устранения лишних повторных перечитываний (`re-read friction`).
+  2. *Статический доктор из 18 проверок (`--skip-f1`)*: лимит `view_file` ровно 800 строк или 46 080 байт (45 KB); запрет выносить заглушки без флагов в `## Quick Start` (провоцируют агентов спамить `--help`); запрет удалять флаги при сжатии документации; правило 0-tool halt для защитных инструкций.
+  3. *Zero Content Loss (`verify-diff`)*: валидация того, что ни один флаг, ссылка или параметр не потерялись при рефакторинге скилла.
+  4. *Бенчмаркинг Evalin*: прогон тестов `EVAL.txtpb` с обязательным контролем отсутствия регрессий (`Candidate Pass Rate >= Baseline Pass Rate`).
+
+#### 3. Herdr и CRD `terminal_mode` для многоагентной работы в CLI
+- **Авторы**: Judith Hemp (`hempjudith@google.com`), Arthur Sonzogni, Ned Nguyen (30 окт., тред `spaces/AAQA45T8nC8/threads/LWYatSLRkx0`), Joe Downing (тред `spaces/AAQA45T8nC8/threads/LZ2CdRU_w1Q`).
+- **Суть**:
+  - `herdr.dev`: консольный менеджер для многоагентных сессий на Cloudtop, альтернатива tmux/shpool с уведомлениями и интеграцией с ворктри.
+  - Эксперимент Chrome Remote Desktop `terminal_mode` (`https://remotedesktop.corp.google.com/access/?mods=terminal_mode`) для прямого управления терминалами агентов из браузера.
