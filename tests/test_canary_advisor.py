@@ -230,6 +230,98 @@ class TestCanaryAdvisor(unittest.TestCase):
         agent_action_line,
     )
 
+  def test_http_get_authenticates_gerrit_requests_via_luci_token(self):
+    seen_reqs = []
+
+    class FakeResp:
+      def __enter__(self):
+        return self
+
+      def __exit__(self, *args):
+        return False
+
+      def read(self):
+        return b")]}'\n{}"
+
+    def fake_urlopen(req, timeout=20):
+      seen_reqs.append(req)
+      return FakeResp()
+
+    fake_proc = type("Proc", (), {"stdout": "username=git\npassword=tok123\n"})()
+    canary_advisor._LUCI_TOKEN_CACHE = ("", 0.0)
+    with patch("subprocess.run", return_value=fake_proc):
+      with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        body = canary_advisor.http_get(
+            "https://skia-review.googlesource.com/changes/1412380"
+        )
+    self.assertEqual(body, ")]}'\n{}")
+    self.assertEqual(
+        seen_reqs[0].full_url,
+        "https://skia-review.googlesource.com/a/changes/1412380",
+    )
+    self.assertEqual(seen_reqs[0].get_header("Authorization"), "Bearer tok123")
+
+  def test_cmd_watch_survives_transient_http_429_and_skips_poll_diff(self):
+    import urllib.error
+
+    initial_meta = {
+        "cl": 1412380,
+        "patchset": 3,
+        "current_patchset": 3,
+        "subject": "Keep glyph offsets only if needed",
+        "owner": "googler@google.com",
+        "diff": "diff --git a/src/foo.cpp b/src/foo.cpp\n+// x\n",
+        "googler_cr_plus_one": True,
+    }
+    err_429 = urllib.error.HTTPError(
+        "https://skia-review.googlesource.com/changes/1412380",
+        429,
+        "Too Many Requests",
+        {},
+        None,
+    )
+    calls = []
+
+    def fake_load_cl(cl, ps=None, include_diff=True):
+      calls.append((cl, ps, include_diff))
+      if len(calls) == 1:
+        return initial_meta
+      if len(calls) == 2:
+        raise err_429
+      return {**initial_meta, "diff": ""}
+
+    args = type(
+        "Args",
+        (),
+        {
+            "cl": "1412380",
+            "ps": None,
+            "poll_sec": 1,
+            "timeout_min": 5,
+            "save_draft": False,
+            "json": False,
+        },
+    )()
+    fake_builds = {"Canary-G3": {"status": "SUCCESS"}}
+    buf = io.StringIO()
+    with patch.object(canary_advisor, "load_cl", side_effect=fake_load_cl):
+      with patch.object(canary_advisor, "bb_cl_builds", return_value=fake_builds):
+        with patch.object(canary_advisor, "swarming_tasks_for_cl", return_value=[]):
+          with patch.object(canary_advisor, "cmd_triage", return_value={}):
+            with patch("time.sleep"):
+              with patch("sys.stdout", buf):
+                rc = canary_advisor.cmd_watch(args)
+    self.assertEqual(rc, 0)
+    self.assertEqual(
+        calls,
+        [
+            ("1412380", None, True),
+            ("1412380", None, False),
+            ("1412380", None, False),
+        ],
+    )
+    self.assertIn("ALL_TRYJOBS_COMPLETE", buf.getvalue())
+
 
 if __name__ == "__main__":
   unittest.main()

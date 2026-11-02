@@ -118,8 +118,41 @@ KEYWORDS = {
 }
 
 
+_LUCI_TOKEN_CACHE = ("", 0.0)
+
+
+# Authenticate Gerrit reads via git-credential-luci to avoid anonymous IP HTTP 429 limits
+def _gerrit_luci_token():
+    global _LUCI_TOKEN_CACHE
+    tok, ts = _LUCI_TOKEN_CACHE
+    if tok and (time.time() - ts) < 1200:
+        return tok
+    try:
+        proc = subprocess.run(
+            ["git-credential-luci", "get"],
+            input="protocol=https\nhost=skia-review.googlesource.com\n\n",
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        for line in proc.stdout.splitlines():
+            if line.startswith("password="):
+                tok = line.split("=", 1)[1].strip()
+                if tok:
+                    _LUCI_TOKEN_CACHE = (tok, time.time())
+                    return tok
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return ""
+
+
 def http_get(url, timeout=20):
-    req = urllib.request.Request(url, headers={"User-Agent": "canary-advisor"})
+    headers = {"User-Agent": "canary-advisor"}
+    # Route Gerrit reads through /a/ when a LUCI token is available
+    if url.startswith(GERRIT + "/") and not url.startswith(GERRIT + "/a/"):
+        tok = _gerrit_luci_token()
+        if tok:
+            url = GERRIT + "/a/" + url[len(GERRIT) + 1:]
+            headers["Authorization"] = f"Bearer {tok}"
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode("utf-8", "replace")
 
@@ -298,7 +331,7 @@ def canary_health(builder):
     return {"healthy": bool(verdicts), "counts": counts}
 
 
-def load_cl(cl, ps=None):
+def load_cl(cl, ps=None, include_diff=True):
     url = f"/changes/{cl}?o=DETAILED_ACCOUNTS&o=ALL_REVISIONS&o=DETAILED_LABELS"
     info = gerrit_json(url)
     cur_rev = None
@@ -320,8 +353,11 @@ def load_cl(cl, ps=None):
                 target_rev = rev
                 break
     ps_num = target_rev["_number"]
-    patch_url = f"{GERRIT}/changes/{cl}/revisions/{ps_num}/patch"
-    patch = base64.b64decode(http_get(patch_url)).decode("utf-8", "replace")
+    # Watch polls skip the patch download after the initial file-list parse
+    patch = ""
+    if include_diff:
+        patch_url = f"{GERRIT}/changes/{cl}/revisions/{ps_num}/patch"
+        patch = base64.b64decode(http_get(patch_url)).decode("utf-8", "replace")
     cr_label = info.get("labels", {}).get("Code-Review", {})
     # Canary-G3 requires either a Googler author or Googler CR+1 (g3_canary.go:134)
     googler_cr_plus_one = any(
@@ -1160,7 +1196,13 @@ def cmd_watch(args):
             cmd_triage(args)
             return 1
 
-        meta = load_cl(cl, ps=None)
+        # Keep watching across transient Gerrit rate-limit or network errors
+        try:
+            meta = load_cl(cl, ps=None, include_diff=False)
+        except (urllib.error.URLError, OSError) as e:
+            print(f"WARNING: transient Gerrit poll error on CL {cl}: {e}; retrying in {poll_sec}s")
+            time.sleep(poll_sec)
+            continue
         if meta["patchset"] > ps:
             print(f"\nWAKEUP_REASON: SUPERSEDED (PS {ps} replaced by PS {meta['patchset']})")
             return 0
