@@ -125,10 +125,11 @@ _LUCI_TOKEN_CACHE = ("", 0.0)
 
 
 # Authenticate Gerrit reads via git-credential-luci to avoid anonymous IP HTTP 429 limits
-def _gerrit_luci_token():
+def _gerrit_luci_token(force_refresh=False):
     global _LUCI_TOKEN_CACHE
     tok, ts = _LUCI_TOKEN_CACHE
-    if tok and (time.time() - ts) < 1200:
+    # Reuse cached Bearer token within 20 minutes unless Gerrit rejected it on /a/
+    if not force_refresh and tok and (time.time() - ts) < 1200:
         return tok
     try:
         proc = subprocess.run(
@@ -144,20 +145,47 @@ def _gerrit_luci_token():
                     return tok
     except (subprocess.SubprocessError, OSError):
         pass
+    # Drop stale cached token when git-credential-luci fails so callers fall back to public reads
+    _LUCI_TOKEN_CACHE = ("", 0.0)
     return ""
 
 
 def http_get(url, timeout=20):
+    global _LUCI_TOKEN_CACHE
+    orig_url = url
     headers = {"User-Agent": "canary-advisor"}
     # Route Gerrit reads through /a/ when a LUCI token is available
-    if url.startswith(GERRIT + "/") and not url.startswith(GERRIT + "/a/"):
-        tok = _gerrit_luci_token()
-        if tok:
-            url = GERRIT + "/a/" + url[len(GERRIT) + 1:]
-            headers["Authorization"] = f"Bearer {tok}"
+    is_gerrit = orig_url.startswith(GERRIT + "/") and not orig_url.startswith(GERRIT + "/a/")
+    tok = _gerrit_luci_token() if is_gerrit else ""
+    if tok:
+        url = GERRIT + "/a/" + orig_url[len(GERRIT) + 1:]
+        headers["Authorization"] = f"Bearer {tok}"
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read().decode("utf-8", "replace")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        # Gerrit /a/ returns HTTP 400/401/403 when an OAuth token expires mid-watch
+        if not (tok and e.code in (400, 401, 403)):
+            raise
+        _LUCI_TOKEN_CACHE = ("", 0.0)
+        fresh = _gerrit_luci_token(force_refresh=True)
+        # Retry authenticated /a/ once when git-credential-luci mints a distinct fresh token
+        if fresh and fresh != tok:
+            retry_req = urllib.request.Request(
+                GERRIT + "/a/" + orig_url[len(GERRIT) + 1:],
+                headers={"User-Agent": "canary-advisor", "Authorization": f"Bearer {fresh}"},
+            )
+            try:
+                with urllib.request.urlopen(retry_req, timeout=timeout) as r:
+                    return r.read().decode("utf-8", "replace")
+            except urllib.error.HTTPError as e2:
+                if e2.code not in (400, 401, 403):
+                    raise
+        # Public Skia Gerrit changes remain readable anonymously if LUCI auth stays unavailable
+        anon_req = urllib.request.Request(orig_url, headers={"User-Agent": "canary-advisor"})
+        with urllib.request.urlopen(anon_req, timeout=timeout) as r:
+            return r.read().decode("utf-8", "replace")
 
 
 def gerrit_json(path):

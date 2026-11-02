@@ -89,7 +89,7 @@ class DraftAndDevelopmentStatusTest(unittest.TestCase):
     self.assertEqual(res["waiting_on"], [])
     self.assertEqual(res["phase"], "WAITING_ON_OTHERS")
 
-  def test_gerrit_colleague_cl_already_reviewed_by_self_routes_to_watching_not_waiting(
+  def test_gerrit_colleague_cl_already_reviewed_by_self_routes_to_waiting_not_watching(
       self,
   ):
     payload = {
@@ -129,7 +129,7 @@ class DraftAndDevelopmentStatusTest(unittest.TestCase):
     self.assertFalse(res["is_draft"])
     self.assertFalse(res["in_development"])
     self.assertFalse(res["in_my_attention"])
-    self.assertTrue(res["is_watching"])
+    self.assertFalse(res["is_watching"])
     self.assertEqual(res["role"], "reviewer (goog)")
     self.assertEqual(res["waiting_on"], [])
     self.assertEqual(res["phase"], "WAITING_ON_OTHERS")
@@ -189,7 +189,7 @@ class DraftAndDevelopmentStatusTest(unittest.TestCase):
     self.assertFalse(res["is_self"])
     self.assertTrue(res["is_external"])
     self.assertFalse(res["in_my_attention"])
-    self.assertTrue(res["is_watching"])
+    self.assertFalse(res["is_watching"])
     self.assertEqual(res["role"], "reviewer (ext)")
     self.assertEqual(res["waiting_on"], [])
     self.assertEqual(res["phase"], "WAITING_ON_OTHERS")
@@ -525,7 +525,7 @@ class DraftAndDevelopmentStatusTest(unittest.TestCase):
     self.assertTrue(res["in_my_attention"])
     self.assertEqual(res["phase"], "NEEDS_YOUR_ACTION")
 
-  def test_github_reviewer_pr_already_approved_clears_attention_and_watches(self):
+  def test_github_reviewer_pr_already_approved_clears_attention_and_waits(self):
     gh_json = json.dumps({
         "number": 195400,
         "title": "[web_paragraph] Fix cluster indexing",
@@ -560,7 +560,7 @@ class DraftAndDevelopmentStatusTest(unittest.TestCase):
     self.assertFalse(res["is_self"])
     self.assertEqual(res["role"], "reviewer")
     self.assertFalse(res["in_my_attention"])
-    self.assertTrue(res["is_watching"])
+    self.assertFalse(res["is_watching"])
     self.assertEqual(res["waiting_on"], [])
     self.assertEqual(res["phase"], "WAITING_ON_OTHERS")
 

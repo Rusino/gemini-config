@@ -3491,9 +3491,13 @@ def _parse_gerrit_self_review(
     else:
       body = re.sub(r"^Patch Set \d+:\s*", "", txt).strip()
       if body and not body.startswith("Uploaded patch set"):
-        if state not in ("approved", "changes_requested"):
+        # A comment on a newer patchset after Gerrit reset an older +1/-1 supersedes that vote
+        if rev_n > review_ps and self_cr_vote == 0 and state in ("approved", "changes_requested"):
           state = "commented"
-        review_ps = max(review_ps, rev_n)
+          review_ps = rev_n
+        elif state not in ("approved", "changes_requested"):
+          state = "commented"
+          review_ps = max(review_ps, rev_n)
   if self_cr_vote > 0:
     state = "approved"
     if review_ps == 0:
@@ -3980,12 +3984,13 @@ def fetch_gerrit_cl_status(
       if is_wip or in_development:
         in_my_attention = False
         waiting_on = []
-      # Non-self changes not currently in my attention sit in Watching unless I commented
+      # Non-self changes not currently in my attention sit in Watching unless I reviewed them
       is_watching = (
           not is_self
           and not reviewer_removed
           and not in_my_attention
-          and self_review_state not in ("commented", "changes_requested")
+          and not bool(self_cr_vote > 0)
+          and self_review_state not in ("approved", "commented", "changes_requested")
       )
       merge_conflict = status == "NEW" and not gerrit_mergeable(host, cl_id)
 
@@ -4098,6 +4103,48 @@ def fetch_gerrit_cl_status(
           cq_status = "✓ Dry Run Passed"
           cq_msg_date = str(m.get("date") or "")
           break
+
+      # External authors cannot add a 2nd Googler or vote CQ+2 without Googler sponsor action
+      sponsor_action = ""
+      sponsor_action_reason = ""
+      if (
+          status == "NEW"
+          and not is_self
+          and is_external
+          and self_cr_vote > 0
+          and not is_wip
+          and not reviewer_removed
+          and min_cr >= 0
+          and not cq_failed
+          and max_cq == 0
+      ):
+        any_unsatisfied_sr = any(
+            isinstance(sr, dict) and str(sr.get("status") or "") == "UNSATISFIED"
+            for sr in submit_reqs
+        )
+        # Review-Enforcement blocks external submit until a 2nd Googler is assigned
+        if missing_reviewers_to_assign > 0:
+          sponsor_action = "assign_second_reviewer"
+          sponsor_action_reason = "Add 2nd Googler reviewer"
+        # External Skia contributors lack Commit-Queue+2 permission even after 2/2 approvals
+        elif (
+            host == GERRIT_SKIA_HOST
+            and missing_approvals == 0
+            and submit_reqs
+            and not any_unsatisfied_sr
+        ):
+          if not merge_conflict:
+            sponsor_action = "submit_cq"
+            sponsor_action_reason = (
+                f"Ready for Googler CQ+2 ({approved_count}/{required_approvals} CR+1)"
+            )
+          # Mute the rebase prompt once we already asked the author to rebase in the latest reply
+          elif not (last_msg_author in SELF_EMAILS and "rebase" in last_msg_text.lower()):
+            sponsor_action = "submit_cq_conflict"
+            sponsor_action_reason = (
+                f"Approved ({approved_count}/{required_approvals} CR+1)"
+                " — rebase in Gerrit or ask author to rebase"
+            )
 
       submitted_raw = str(d.get("submitted") or "")
       submitted_et, submitted_age = format_et_and_age(submitted_raw)
@@ -4231,6 +4278,8 @@ def fetch_gerrit_cl_status(
           "missing_reviewers_to_assign": missing_reviewers_to_assign,
           "missing_approvals": missing_approvals,
           "reviewer_status": reviewer_status,
+          "sponsor_action": sponsor_action,
+          "sponsor_action_reason": sponsor_action_reason,
           # Per-reviewer ping entries for lost +1s and missing 2nd approvals
           "reviewer_pings": reviewer_pings,
           "self_cr_vote": self_cr_vote,
@@ -4874,10 +4923,12 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         and bool(last_actor)
         and last_actor not in SELF_GITHUB_LOGINS
     )
+    # Keep PRs we reviewed or approved in Waiting on others rather than passive Watching
     is_watching = (
         not is_self
         and not in_my_attention
-        and self_review_state not in ("commented", "changes_requested")
+        and not self_approved
+        and self_review_state not in ("approved", "commented", "changes_requested")
     )
 
     # Map the status change date to the latest event driving the current PR phase
@@ -5323,6 +5374,10 @@ def _build_start_chat_topic(rec: dict[str, Any]) -> str:
   elif kind == "gerrit" and host == GERRIT_CHROMIUM_HOST:
     id_tok = f"crrev/c/{tid}"
     default_sub = "Chromium"
+  elif kind == "gerrit":
+    # Use "Gerrit <id>" so titles never resolve to Google3 Piper via cl/<id>
+    id_tok = f"Gerrit {tid}"
+    default_sub = "Skia"
   else:
     id_tok = f"cl/{tid}"
     default_sub = "Skia"
@@ -6970,7 +7025,7 @@ def _extract_topic_from_bug_chat_title(chat_title: str) -> str:
   t = re.sub(r"\s*»$", "", t).strip()
   t = re.sub(
       r"^(?:(?:crbug(?:\.com)?/|b/|cl/|crrev(?:\.com)?/c/|skrev(?:\.com)?/|"
-      r"flutter#|pr\s*#|bug\s+|issue\s+#?|#)\d+\b[:\s—–-]*)+",
+      r"gerrit\s+|flutter#|pr\s*#|bug\s+|issue\s+#?|#)\d+\b[:\s—–-]*)+",
       "",
       t,
       flags=re.IGNORECASE,
@@ -9701,9 +9756,22 @@ function selfReviewBadgeHtml(it) {
   const revPs = Number(it.self_review_ps || it.self_approval_ps || 0);
   const cmtCount = Number(it.self_comment_count || 0);
   const cmtPart = cmtCount > 0 ? ` (${cmtCount} comment${cmtCount === 1 ? '' : 's'})` : '';
-  if (it.self_approved || it.self_review_state === 'approved') {
+  if (it.self_approved) {
     const psPart = revPs > 0 ? ` (PS${revPs})` : '';
     out.push(`<span class="badge self-approved">✓ You gave CR+1${esc(psPart)}</span>`);
+  } else if (it.self_review_state === 'approved') {
+    // Approval was reset on a newer patchset without a new vote
+    const baseLabel = revPs > 0 ? `✓ Gave CR+1 on PS${revPs}` : '✓ Gave CR+1';
+    if (revPs > 0 && curPs > revPs && it.kind === 'gerrit' && it.url) {
+      const diffUrl = `${it.url.replace(/\/+$/, '')}/${revPs}..${curPs}`;
+      const text = `${esc(baseLabel)} → PS${esc(curPs)} uploaded`;
+      out.push(link(diffUrl, text, 'badge self-reviewed', `Open diff PS${revPs}..PS${curPs}`));
+    } else {
+      const text = (revPs > 0 && curPs > revPs)
+        ? `${esc(baseLabel)} → PS${esc(curPs)} uploaded`
+        : esc(baseLabel);
+      out.push(`<span class="badge self-reviewed">${text}</span>`);
+    }
   } else if (it.self_review_state === 'commented' || it.self_review_state === 'changes_requested') {
     const baseLabel = revPs > 0
       ? `💬 Reviewed PS${revPs}${cmtPart}`
@@ -9880,6 +9948,13 @@ function upstreamBlockersOf(it, data) {
       reasons.push('Needs review');
     }
 
+    // Unmerged stack parents missing a 2nd reviewer or +1 still block child landing
+    if (Number(anc.missing_reviewers_to_assign || 0) > 0) {
+      reasons.push('Needs 2nd reviewer');
+    } else if (anc.self_approved && Number(anc.missing_approvals || 0) > 0) {
+      reasons.push('Needs 2nd +1');
+    }
+
     if (reasons.length) {
       blockers.push({ancestor: anc, reasons: [...new Set(reasons)]});
     }
@@ -10011,6 +10086,8 @@ function renderFocusSection(youItems, shownItems, data) {
       }
       // Stack sibling residing in another lane renders as collapsed 1-line separator
       const stepBadge = `<span class="badge stack-step">⛓ ${pos}/${tot}</span>`;
+      // Strip the focus-card trailing separator dot so the pill sits cleanly inside <summary>
+      const verdictPill = reviewVerdictEyebrowHtml(m).replace(/\s*·\s*$/, '');
       const clText = esc(clLabel(m));
       // Direct link to host review UI so collapsed siblings can be inspected in one click
       const clLink = m.url
@@ -10028,6 +10105,7 @@ function renderFocusSection(youItems, shownItems, data) {
         <details class="stack-step-collapsed">
           <summary>
             ${stepBadge}
+            ${verdictPill}
             ${clLink}
             <span class="stack-step-subj">${subjText}</span>
             <span>— ${stateText}</span>
@@ -10401,6 +10479,30 @@ function isPostSubmitAlert(it) {
   return isAlert(it) && it.phase !== 'ALERT_CQ_FAILED';
 }
 
+// External-author Gerrit CLs with our CR+1 need Googler action to add a 2nd reviewer or CQ+2
+function needsSponsorAction(it) {
+  if (!it || it.is_self || isCompanion(it)) return false;
+  if (it.status !== 'NEW' && it.status !== 'OPEN') return false;
+  if (it.is_wip || it.is_draft || it.reviewer_removed) return false;
+  const act = String(it.sponsor_action || '');
+  if (!act) return false;
+  // Hold CQ+2 until unmerged stack ancestors also have all approvals and no conflict
+  if (act === 'submit_cq') {
+    const ancs = Array.isArray(it.stack_ancestors) ? it.stack_ancestors : [];
+    for (const ancKey of ancs) {
+      const anc = cachedStackByIkey.get(ancKey);
+      if (!anc) continue;
+      const st = String(anc.status || '').toUpperCase();
+      if (st === 'MERGED' || st === 'ABANDONED' || st === 'CLOSED') continue;
+      if (Number(anc.missing_approvals || 0) > 0 || anc.merge_conflict ||
+          anc.cq_failed || anc.is_wip) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 // Alerts count as needing me even on merged CLs, since a blamed commit needs a reaction
 function statusOf(it) {
   const preReview = Boolean(it.is_draft || it.in_development);
@@ -10411,6 +10513,8 @@ function statusOf(it) {
   if (it.status === 'ABANDONED' || it.status === 'CLOSED') return 'abandoned';
   // Surface parent CLs in Needs You when an attached companion is ready to abandon
   if (hasReadyCompanion(it)) return 'attention';
+  // Sponsored external CLs stay out of Gerrit attention_set yet still need Googler action
+  if (needsSponsorAction(it)) return 'attention';
   // Open orphan companions wait on the parent author unless marked ready to abandon
   if (isCompanion(it)) {
     return it.ready_to_abandon ? 'attention' : 'waiting';
@@ -10719,10 +10823,13 @@ function stateHtml(it) {
   }
   // Surface per-reviewer ping status in the state column ahead of generic waiting labels
   const pingNote = reviewerPingInlineHtml(it);
+  // Non-self CLs with merge conflicts stay in Waiting on others and still need a Conflict tag
+  const conflictTag = it.merge_conflict ? '<span class="red">Conflict</span>' : '';
   if (st === 'watching') {
-    return [wipTag, compNote, pingNote, review, gap].filter(Boolean).join(' · ') || 'Watching';
+    return [wipTag, compNote, conflictTag, pingNote, review, gap]
+      .filter(Boolean).join(' · ') || 'Watching';
   }
-  return [wipTag, compNote, pingNote || waitingOnHtml(it) || 'In review', review, gap]
+  return [wipTag, compNote, conflictTag, pingNote || waitingOnHtml(it) || 'In review', review, gap]
     .filter(Boolean).join(' · ');
 }
 
@@ -11603,6 +11710,12 @@ function focusCard(it, data) {
       why = `The commit queue failed · ${formatStatusTime(it)}`;
     }
     actions = link(checksUrl(it), 'See checks', 'btn primary') + chatBtn;
+  } else if (needsSponsorAction(it)) {
+    // Render explicit Googler sponsor callout instead of a stale comment trigger line
+    const reason = esc(it.sponsor_action_reason || 'Needs Googler sponsor action');
+    const conflictPrefix = it.merge_conflict ? `<span class="red">${conflictNote}</span> · ` : '';
+    why = `${conflictPrefix}<b>Sponsor action</b>: ${reason} · ${formatStatusTime(it)}`;
+    actions = link(it.url, `Open ${kindWord}`, 'btn primary') + chatBtn;
   } else {
     // Omit the trigger message when a current-PS review summary is already shown below
     if (hasFreshReviewWithoutNewerReply(it)) {

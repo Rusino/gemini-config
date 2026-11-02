@@ -141,12 +141,22 @@ const updatedAfterReviewCl = Object.assign({}, reviewedCl, {
 const approvedCl = {
   kind: 'gerrit', target_id: '1402416', status: 'NEW', phase: 'WAITING_ON_OTHERS',
   is_self: false, is_external: false, role: 'reviewer (goog)',
-  is_draft: false, in_development: false, is_watching: true,
+  is_draft: false, in_development: false, is_watching: false,
   owner_name: 'Alexis Cruz-Ayala', owner_email: 'alexisdavidc@google.com',
   subject: 'Reland SkGraphics calls',
   patchset: 8, url: 'https://skia-review.googlesource.com/c/skia/+/1402416',
   self_review_state: 'approved', self_review_ps: 6, self_approved: true,
   self_approval_ps: 6, waiting_on: []
+};
+const lostApprovalCl = {
+  kind: 'gerrit', target_id: '1409999', status: 'NEW', phase: 'WAITING_ON_OTHERS',
+  is_self: false, is_external: true, role: 'reviewer (ext)',
+  is_draft: false, in_development: false, is_watching: false,
+  owner_name: 'External Dev', owner_email: 'dev@example.com',
+  subject: 'Fix paragraph metrics',
+  patchset: 5, url: 'https://skia-review.googlesource.com/c/skia/+/1409999',
+  self_review_state: 'approved', self_review_ps: 3, self_approved: false,
+  self_approval_ps: 3, waiting_on: []
 };
 
 console.log(JSON.stringify({
@@ -156,7 +166,9 @@ console.log(JSON.stringify({
   reviewedState: stateHtml(reviewedCl),
   updatedBadges: badgesHtml(updatedAfterReviewCl),
   approvedLane: laneOf(approvedCl),
-  approvedBadges: badgesHtml(approvedCl)
+  approvedBadges: badgesHtml(approvedCl),
+  lostApprovalLane: laneOf(lostApprovalCl),
+  lostApprovalBadges: badgesHtml(lostApprovalCl)
 }));
 """
     cmd = ["node", "-e", harness]
@@ -173,9 +185,14 @@ console.log(JSON.stringify({
     self.assertIn("Reviewed PS2 (25 comments) → PS3 uploaded", data["updatedBadges"])
     self.assertIn("1411816/2..3", data["updatedBadges"])
 
-    self.assertEqual(data["approvedLane"], "watching")
+    self.assertEqual(data["approvedLane"], "waiting")
     self.assertIn("badge self-approved", data["approvedBadges"])
-    self.assertIn("You gave CR+1", data["approvedBadges"])
+    self.assertIn("You gave CR+1 (PS6)", data["approvedBadges"])
+
+    self.assertEqual(data["lostApprovalLane"], "waiting")
+    self.assertNotIn("badge self-approved", data["lostApprovalBadges"])
+    self.assertIn("Gave CR+1 on PS3 → PS5 uploaded", data["lostApprovalBadges"])
+    self.assertIn("1409999/3..5", data["lostApprovalBadges"])
 
   def test_gerrit_author_reply_coalesces_messages_and_tracks_resolved_comment_threads(self):
     payload = {
@@ -389,6 +406,301 @@ console.log(JSON.stringify({
     author, name, date, text = w._extract_gerrit_last_message(messages_with_rebase)
     self.assertEqual(author, "author@example.com")
     self.assertEqual(text, "Patch Set 2: Fixed the indent issue")
+
+  def test_approved_external_cls_route_sponsor_actions_to_needs_you_and_rest_to_waiting(self):
+    # Gerrit 1414016: external author, 1/2 CR+1 from self, no 2nd Googler reviewer assigned
+    payload_1414016 = {
+        "status": "NEW",
+        "subject": "[skparagraph] Measure the hit glyph with its own justification shift",
+        "owner": {"email": "dbebawy@gmail.com", "name": "David H Bebawy"},
+        "current_revision": "rev1",
+        "revisions": {"rev1": {"_number": 1}},
+        "attention_set": {},
+        "reviewers": {
+            "REVIEWER": [{"email": "jlavrova@google.com", "name": "Julia Lavrova"}],
+            "CC": [],
+        },
+        "labels": {
+            "Code-Review": {"all": [{"email": "jlavrova@google.com", "value": 1}]},
+            "Commit-Queue": {"all": []},
+        },
+        "submit_requirements": [
+            {"name": "Review-Enforcement", "status": "UNSATISFIED"},
+            {"name": "Code-Review", "status": "SATISFIED"},
+            {"name": "No-Unresolved-Comments", "status": "NOT_APPLICABLE"},
+            {"name": "Code-Owners", "status": "SATISFIED"},
+        ],
+        "messages": [
+            {
+                "_revision_number": 1,
+                "author": {"email": "jlavrova@google.com", "name": "Julia Lavrova"},
+                "date": "2026-11-02 20:20:00.000000000",
+                "message": "Patch Set 1: Code-Review+1",
+            }
+        ],
+    }
+    with mock.patch.object(
+        w.urllib.request, "urlopen", return_value=_FakeGerritResponse(payload_1414016)
+    ), mock.patch.object(w, "gerrit_mergeable", return_value=True):
+      res_missing_rev = w.fetch_gerrit_cl_status("1414016", {}, [], skia_dir="/nonexistent")
+
+    self.assertTrue(res_missing_rev["ok"])
+    self.assertFalse(res_missing_rev["is_watching"])
+    self.assertFalse(res_missing_rev["in_my_attention"])
+    self.assertTrue(res_missing_rev["self_approved"])
+    self.assertEqual(res_missing_rev["self_review_state"], "approved")
+    self.assertEqual(res_missing_rev["missing_reviewers_to_assign"], 1)
+    self.assertEqual(res_missing_rev["sponsor_action"], "assign_second_reviewer")
+    self.assertIn("2nd Googler reviewer", res_missing_rev["sponsor_action_reason"])
+
+    # Gerrit 1412381: external Skia CL, 2/2 Googler CR+1, all submit_requirements satisfied, idle CQ
+    payload_1412381 = {
+        "status": "NEW",
+        "subject": "[skparagraph] Keep run baseline aligned",
+        "owner": {"email": "ext@example.com", "name": "External Author"},
+        "current_revision": "rev4",
+        "revisions": {"rev4": {"_number": 4}},
+        "attention_set": {},
+        "reviewers": {
+            "REVIEWER": [
+                {"email": "jlavrova@google.com"},
+                {"email": "alexisdavidc@google.com"},
+            ],
+            "CC": [],
+        },
+        "labels": {
+            "Code-Review": {
+                "all": [
+                    {"email": "jlavrova@google.com", "value": 1},
+                    {"email": "alexisdavidc@google.com", "value": 1},
+                ]
+            },
+            "Commit-Queue": {"all": []},
+        },
+        "submit_requirements": [
+            {"name": "Review-Enforcement", "status": "SATISFIED"},
+            {"name": "Code-Review", "status": "SATISFIED"},
+            {"name": "No-Unresolved-Comments", "status": "NOT_APPLICABLE"},
+            {"name": "Code-Owners", "status": "SATISFIED"},
+        ],
+        "messages": [
+            {
+                "_revision_number": 4,
+                "author": {"email": "jlavrova@google.com"},
+                "date": "2026-11-02 18:00:00.000000000",
+                "message": "Patch Set 4: Code-Review+1",
+            },
+            {
+                "_revision_number": 4,
+                "author": {"email": "alexisdavidc@google.com"},
+                "date": "2026-11-02 19:00:00.000000000",
+                "message": "Patch Set 4: Code-Review+1",
+            },
+        ],
+    }
+    with mock.patch.object(
+        w.urllib.request, "urlopen", return_value=_FakeGerritResponse(payload_1412381)
+    ), mock.patch.object(w, "gerrit_mergeable", return_value=True):
+      res_ready_cq = w.fetch_gerrit_cl_status("1412381", {}, [], skia_dir="/nonexistent")
+
+    self.assertFalse(res_ready_cq["is_watching"])
+    self.assertFalse(res_ready_cq["in_my_attention"])
+    self.assertEqual(res_ready_cq["sponsor_action"], "submit_cq")
+    self.assertIn("CQ+2", res_ready_cq["sponsor_action_reason"])
+
+    # Gerrit 1409697: 2/2 Googler CR+1 and all submit_requirements satisfied, but merge conflict
+    with mock.patch.object(
+        w.urllib.request, "urlopen", return_value=_FakeGerritResponse(payload_1412381)
+    ), mock.patch.object(w, "gerrit_mergeable", return_value=False):
+      res_cq_conflict = w.fetch_gerrit_cl_status("1409697", {}, [], skia_dir="/nonexistent")
+
+    self.assertFalse(res_cq_conflict["is_watching"])
+    self.assertEqual(res_cq_conflict["sponsor_action"], "submit_cq_conflict")
+    self.assertIn("rebase", res_cq_conflict["sponsor_action_reason"])
+
+    # Gerrit 1409696: 1/2 CR+1, 2nd Googler assigned, No-Unresolved-Comments UNSATISFIED -> waiting
+    payload_1409696 = dict(payload_1412381)
+    payload_1409696["labels"] = {
+        "Code-Review": {
+            "all": [
+                {"email": "jlavrova@google.com", "value": 1},
+                {"email": "alexisdavidc@google.com", "value": 0},
+            ]
+        },
+        "Commit-Queue": {"all": []},
+    }
+    payload_1409696["submit_requirements"] = [
+        {"name": "Review-Enforcement", "status": "UNSATISFIED"},
+        {"name": "Code-Review", "status": "SATISFIED"},
+        {"name": "No-Unresolved-Comments", "status": "UNSATISFIED"},
+    ]
+    with mock.patch.object(
+        w.urllib.request, "urlopen", return_value=_FakeGerritResponse(payload_1409696)
+    ), mock.patch.object(w, "gerrit_mergeable", return_value=False), mock.patch.object(
+        w, "google_account_active", return_value=True
+    ):
+      res_waiting_2nd = w.fetch_gerrit_cl_status("1409696", {}, [], skia_dir="/nonexistent")
+
+    self.assertFalse(res_waiting_2nd["is_watching"])
+    self.assertFalse(res_waiting_2nd["in_my_attention"])
+    self.assertEqual(res_waiting_2nd["sponsor_action"], "")
+
+    # crrev/c/7686597: CR+1 on PS2 lost on PS4, then self commented on PS4 without +1
+    payload_7686597 = {
+        "status": "NEW",
+        "subject": "Fontations font fallback",
+        "owner": {"email": "jftucker@gmail.com", "name": "James Tucker"},
+        "current_revision": "rev4",
+        "revisions": {"rev2": {"_number": 2}, "rev4": {"_number": 4}},
+        "attention_set": {"1": {"account": {"email": "jftucker@gmail.com"}}},
+        "reviewers": {
+            "REVIEWER": [
+                {"email": "jlavrova@google.com"},
+                {"email": "alexisdavidc@google.com"},
+            ],
+            "CC": [],
+        },
+        "labels": {"Code-Review": {"all": [{"email": "jlavrova@google.com", "value": 0}]}},
+        "messages": [
+            {
+                "_revision_number": 2,
+                "author": {"email": "jlavrova@google.com"},
+                "date": "2026-10-15 14:44:05.000000000",
+                "message": "Patch Set 2: Code-Review+1",
+            },
+            {
+                "_revision_number": 4,
+                "author": {"email": "jlavrova@google.com"},
+                "date": "2026-10-27 16:28:34.000000000",
+                "message": "Patch Set 4:\n\n(4 comments)",
+            },
+        ],
+    }
+    with mock.patch.object(
+        w.urllib.request, "urlopen", return_value=_FakeGerritResponse(payload_7686597)
+    ), mock.patch.object(w, "gerrit_mergeable", return_value=True), mock.patch.object(
+        w, "fetch_gerrit_comments", return_value={}
+    ):
+      res_7686597 = w.fetch_gerrit_cl_status(
+          "7686597", {}, [], skia_dir="/nonexistent", preferred_host=w.GERRIT_CHROMIUM_HOST
+      )
+
+    self.assertFalse(res_7686597["self_approved"])
+    self.assertEqual(res_7686597["self_review_state"], "commented")
+    self.assertEqual(res_7686597["self_review_ps"], 4)
+    self.assertFalse(res_7686597["is_watching"])
+
+    # Verify JS lanes, focusCard rendering for 1414016 & 1412381, and collapsed stack sibling pill
+    res_missing_rev["item_key"] = "gerrit:1414016"
+    res_missing_rev["kind"] = "gerrit"
+    res_missing_rev["target_id"] = "1414016"
+    res_missing_rev["project_name"] = "SkParagraph"
+    res_missing_rev["conversation_id"] = "55006e03-15e4-4762-8c30-454dfeefdcf8"
+    res_missing_rev["reviewed_ps"] = 1
+    res_missing_rev["triage"] = {
+        "verdict": "CLEAN",
+        "verdict_label": "CLEAN",
+        "review_outcome": "CLEAN",
+        "review_eyebrow_label": "🟢 Review PS1: Clean (LGTM)",
+        "triaged_patchset": 1,
+        "summary": "Clean justification hit-test fix.",
+    }
+    res_ready_cq["item_key"] = "gerrit:1412381"
+    res_ready_cq["kind"] = "gerrit"
+    res_ready_cq["target_id"] = "1412381"
+    res_ready_cq["project_name"] = "SkParagraph"
+    res_waiting_2nd["item_key"] = "gerrit:1409696"
+    res_waiting_2nd["kind"] = "gerrit"
+    res_waiting_2nd["target_id"] = "1409696"
+    res_waiting_2nd["project_name"] = "SkParagraph"
+    res_waiting_2nd["stack_ancestors"] = ["gerrit:1414016"]
+    res_waiting_2nd["stack_ikeys"] = ["gerrit:1414016", "gerrit:1409696"]
+    res_missing_rev["stack_ikeys"] = ["gerrit:1414016", "gerrit:1409696"]
+    res_waiting_2nd["triage"] = {
+        "verdict": "CLEAN",
+        "review_outcome": "CLEAN",
+        "review_eyebrow_label": "🟢 Review PS4: Clean (LGTM)",
+        "triaged_patchset": 4,
+    }
+
+    script_body = w.DASHBOARD_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    harness = (
+        script_body.split("\nboot();", 1)[0]
+        + "\nconst c1414016 = "
+        + json.dumps(res_missing_rev)
+        + ";\nconst c1412381 = "
+        + json.dumps(res_ready_cq)
+        + ";\nconst c1409696 = "
+        + json.dumps(res_waiting_2nd)
+        + ";\nconst box = {jetski_box_url: 'https://jetski.corp.google.com/box/host', items: {}};\n"
+        + "buildStackContext([c1414016, c1409696]);\n"
+        + "console.log(JSON.stringify({\n"
+        + "  lane1414016: laneOf(c1414016),\n"
+        + "  lane1412381: laneOf(c1412381),\n"
+        + "  lane1409696: laneOf(c1409696),\n"
+        + "  card1414016: focusCard(c1414016, box),\n"
+        + "  card1412381: focusCard(c1412381, box),\n"
+        + "  state1409696: stateHtml(c1409696),\n"
+        + "  focusStack: renderFocusSection([c1414016], [c1414016, c1409696], box)\n"
+        + "}));\n"
+    )
+    out = json.loads(subprocess.check_output(["node", "-e", harness], encoding="utf-8"))
+    self.assertEqual(out["lane1414016"], "you")
+    self.assertEqual(out["lane1412381"], "you")
+    self.assertEqual(out["lane1409696"], "waiting")
+    self.assertIn("🟢 Review PS1: Clean (LGTM)", out["card1414016"])
+    self.assertIn("https://skia-review.googlesource.com/c/1414016", out["card1414016"])
+    self.assertIn("Sponsor action", out["card1414016"])
+    self.assertIn("2nd Googler reviewer", out["card1414016"])
+    self.assertIn("Open review chat", out["card1414016"])
+    self.assertIn("CQ+2", out["card1412381"])
+    self.assertIn("Conflict", out["state1409696"])
+    self.assertIn("🟢 Review PS4: Clean (LGTM)", out["focusStack"])
+
+  def test_github_approved_pr_and_gerrit_item_chat_title_prefix(self):
+    gh_json = json.dumps({
+        "number": 195600,
+        "title": "[web] Paragraph hit-test",
+        "state": "OPEN",
+        "isDraft": False,
+        "author": {"login": "mdebbar"},
+        "mergedAt": None,
+        "headRefOid": "1122334455667788",
+        "reviews": [
+            {
+                "author": {"login": "Rusino"},
+                "state": "APPROVED",
+                "body": "LGTM",
+                "submittedAt": "2026-11-02T15:00:00Z",
+            }
+        ],
+        "comments": [],
+        "commits": [],
+        "statusCheckRollup": [],
+        "url": "https://github.com/flutter/flutter/pull/195600",
+        "mergeable": "MERGEABLE",
+        "reviewRequests": [],
+    })
+    with mock.patch.object(w.subprocess, "check_output", return_value=gh_json):
+      gh_res = w.fetch_github_pr_status("195600")
+    self.assertEqual(gh_res["self_review_state"], "approved")
+    self.assertFalse(gh_res["is_watching"])
+
+    skia_title = w._build_start_chat_topic({
+        "kind": "gerrit",
+        "host": w.GERRIT_SKIA_HOST,
+        "target_id": "1414016",
+        "subject": "[skparagraph] Measure the hit glyph with its own justification shift",
+    })
+    self.assertTrue(skia_title.startswith("Gerrit 1414016 "), skia_title)
+    self.assertNotIn("cl/1414016", skia_title)
+
+    piper_title = w._build_start_chat_topic({
+        "kind": "piper",
+        "target_id": "1008075988",
+        "subject": "Roll Skia into google3",
+    })
+    self.assertTrue(piper_title.startswith("cl/1008075988 "), piper_title)
 
 
 if __name__ == "__main__":

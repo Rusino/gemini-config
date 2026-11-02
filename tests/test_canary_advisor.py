@@ -892,6 +892,45 @@ class TestCanaryAdvisor(unittest.TestCase):
     self.assertEqual(res_stale["verdict"], "INFRA_NO_TASK")
     self.assertIn("git fetch timeout", res_stale["summary"])
 
+  def test_http_get_invalidates_expired_luci_token_on_400_and_retries(self):
+    # Gerrit /a/ returns HTTP 400/401 when a cached git-credential-luci Bearer token expires
+    # mid-watch (as happened on CL 1414016); http_get must drop cache and retry cleanly
+    canary_advisor._LUCI_TOKEN_CACHE = ("expired-tok", 9999999999.0)
+    seen_urls = []
+
+    class _FakeResp:
+
+      def __init__(self, text):
+        self._text = text
+
+      def read(self):
+        return self._text.encode("utf-8")
+
+      def __enter__(self):
+        return self
+
+      def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def fake_urlopen(req, timeout=20):
+      seen_urls.append((req.full_url, req.headers.get("Authorization")))
+      if req.headers.get("Authorization") == "Bearer expired-tok":
+        raise canary_advisor.urllib.error.HTTPError(req.full_url, 400, "Bad Request", {}, None)
+      return _FakeResp(")]}'\n{\"status\":\"NEW\"}")
+
+    with patch.object(
+        canary_advisor.subprocess,
+        "run",
+        return_value=type("P", (), {"stdout": "password=fresh-tok\n"})(),
+    ):
+      with patch.object(canary_advisor.urllib.request, "urlopen", side_effect=fake_urlopen):
+        body = canary_advisor.http_get(f"{canary_advisor.GERRIT}/changes/1414016/detail")
+
+    self.assertIn('"status":"NEW"', body)
+    self.assertEqual(len(seen_urls), 2)
+    self.assertEqual(seen_urls[0][1], "Bearer expired-tok")
+    self.assertEqual(seen_urls[1][1], "Bearer fresh-tok")
+
 
 if __name__ == "__main__":
   unittest.main()
