@@ -457,6 +457,8 @@ _ENTITY_UNIT_RE = re.compile(
 _TOPIC_WORD_RE = re.compile(
     r"[A-Za-zА-Яа-яЁё0-9_]+(?:[-.][A-Za-zА-Яа-яЁё0-9_]+)*"
 )
+# Cyrillic characters are banned in chat titles to keep the sidebar English-only
+_CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
 
 
 # Returns (all_tokens, content_tokens, non_generic_tokens) after collapsing entity IDs
@@ -495,8 +497,12 @@ def _has_concrete_topic_words(tokens: list[str], non_generic: list[str]) -> bool
 
 
 def is_valid_chat_topic(topic: str) -> bool:
-  """True if topic has >= 2 meaningful words and is not purely generic or a bare entity ID"""
-  tokens, content, non_generic = _analyze_topic_tokens(topic)
+  """True if topic has >= 2 meaningful words, is English-only, and is not purely generic"""
+  clean = clean_base_title(topic)
+  # Chat titles must strictly be English-only
+  if not clean or _CYRILLIC_RE.search(clean):
+    return False
+  tokens, content, non_generic = _analyze_topic_tokens(clean)
   if len(tokens) < 2 or len(content) < 2:
     return False
   return _has_concrete_topic_words(tokens, non_generic)
@@ -505,8 +511,18 @@ def is_valid_chat_topic(topic: str) -> bool:
 def validate_chat_topic(topic: str) -> str:
   """Returns cleaned topic if valid, or raises InvalidTopicError with actionable guidance"""
   clean = clean_base_title(topic)
+  if not clean:
+    raise InvalidTopicError("Topic must not be empty")
+  # Reject non-English chat titles before word counting
+  if _CYRILLIC_RE.search(clean):
+    raise InvalidTopicError(
+        f"Invalid chat title topic {clean!r}: Cyrillic characters are forbidden"
+        " in chat titles. Pass a specific 2-6 word English topic (< 50 chars)"
+        ' naming the concrete subsystem/feature/bug/PR/CL and action (e.g.'
+        ' "PR #194980 multi-span BiDi", "David email: RTL justify boxes").'
+    )
   tokens, content, non_generic = _analyze_topic_tokens(clean)
-  if not clean or len(tokens) < 2 or len(content) < 2:
+  if len(tokens) < 2 or len(content) < 2:
     raise InvalidTopicError(
         f"Invalid chat title topic {clean!r}: single-word titles and bare entity IDs are"
         " forbidden. Pass a specific 2-6 word topic (< 50 chars) naming the concrete"
@@ -2224,10 +2240,12 @@ def _extract_prompt_subject_words(text: str, max_words: int = 4) -> str:
   subject_tokens: list[str] = []
   for t in tokens:
     low = t.lower()
+    # Skip Cyrillic tokens so fallback topic derivation stays English-only
     if (
         low in TOPIC_STOP_WORDS
         or low in PROMPT_FILLER_WORDS
         or low in GENERIC_TOPIC_WORDS
+        or _CYRILLIC_RE.search(t)
         or re.match(r"^\d+$", t)
         or UUID_RE.match(t)
     ):
@@ -2552,7 +2570,7 @@ def extract_entity_topic(text: str) -> str | None:
 
 
 def auto_title_conversation(conv_id: str, prompt: str) -> str:
-  """Titles an untitled conversation if prompt mentions a PR, CL, bug, or commit."""
+  """Titles an untitled conversation with provisional entity ID from prompt"""
   if not conv_id or not prompt:
     return ""
   cur_title = get_conversation_title(conv_id)
@@ -2564,11 +2582,11 @@ def auto_title_conversation(conv_id: str, prompt: str) -> str:
   entity = extract_entity_topic(prompt)
   if not entity:
     return ""
-  subj = _extract_prompt_subject_words(prompt, max_words=3)
-  topic = f"{entity} {subj}"[:42].rstrip() if subj else entity
+  # Set only the provisional entity ID so context_guard requires an explicit English topic
+  topic = entity
   if cur_base == topic and has_lifecycle_title_prefix(cur_title):
     return ""
-  # Use validate=False so single-word/bare-entity auto-titles set the base topic without crashing
+  # Use validate=False so provisional entity auto-titles set the base topic without crashing
   return set_conversation_topic(conv_id, topic, validate=False)
 
 
@@ -4190,16 +4208,8 @@ def cmd_start(opts: dict) -> int:
       _cli_fail("start", str(exc))
       return 1
   else:
-    entity = extract_entity_topic(prompt)
-    subj = _extract_prompt_subject_words(prompt, max_words=3)
-    if entity and subj:
-      clean_topic = f"{entity} {subj}"[:42].rstrip()
-    elif entity:
-      clean_topic = entity
-    elif subj:
-      clean_topic = subj
-    else:
-      clean_topic = "New Chat"
+    # Without --title, set only a provisional entity ID so context_guard requires set-title
+    clean_topic = extract_entity_topic(prompt) or "New Chat"
 
   time_str = get_current_time_str()
   title = f"[{time_str}] ⦿ {clean_topic}"

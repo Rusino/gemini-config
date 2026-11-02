@@ -221,13 +221,19 @@ class TestChatLifecycle(unittest.TestCase):
            patch.object(chat_lifecycle, "get_current_time_str", return_value="15:30"):
 
         # 1. Clean topic with active marker
-        new_title = chat_lifecycle.set_conversation_topic("c1", "Тест № 2")
-        self.assertEqual(new_title, "[15:30] ⦿ Тест № 2")
-        self.assertEqual(chat_lifecycle.get_conversation_title("c1"), "[15:30] ⦿ Тест № 2")
+        new_title = chat_lifecycle.set_conversation_topic("c1", "Custom Feature Test")
+        self.assertEqual(new_title, "[15:30] ⦿ Custom Feature Test")
+        self.assertEqual(
+            chat_lifecycle.get_conversation_title("c1"),
+            "[15:30] ⦿ Custom Feature Test",
+        )
 
         # 2. Strips old markers if provided in input
-        new_title2 = chat_lifecycle.set_conversation_topic("c1", "[10:00] » Тест № 2")
-        self.assertEqual(new_title2, "[15:30] ⦿ Тест № 2")
+        new_title2 = chat_lifecycle.set_conversation_topic("c1", "[10:00] » Custom Feature Test")
+        self.assertEqual(new_title2, "[15:30] ⦿ Custom Feature Test")
+
+        with self.assertRaises(chat_lifecycle.InvalidTopicError):
+          chat_lifecycle.set_conversation_topic("c1", "Тест № 2")
 
   def test_extract_entity_topic(self):
     cases = [
@@ -306,14 +312,25 @@ class TestChatLifecycle(unittest.TestCase):
         self.assertEqual(res2, "")
         self.assertEqual(chat_lifecycle.get_conversation_title("c2"), "[10:00] ⦿ Custom Topic")
 
-        # 3. Chat with generic/single-word title IS overwritten by auto_title
         res_generic = chat_lifecycle.auto_title_conversation(
             "c3", "Look at PR #55123 multi-span BiDi"
         )
-        self.assertEqual(res_generic, "[14:15] ⦿ PR #55123 multi-span BiDi")
+        self.assertEqual(res_generic, "[14:15] ⦿ PR #55123")
         self.assertEqual(
             chat_lifecycle.get_conversation_title("c3"),
-            "[14:15] ⦿ PR #55123 multi-span BiDi",
+            "[14:15] ⦿ PR #55123",
+        )
+        self.assertFalse(
+            chat_lifecycle.is_valid_chat_topic(chat_lifecycle.clean_base_title(res_generic))
+        )
+
+        res_ru = chat_lifecycle.auto_title_conversation(
+            "c3",
+            "Дэвид прислал мне письмо https://skia-review.googlesource.com/c/skia/+/1414016",
+        )
+        self.assertEqual(res_ru, "[14:15] ⦿ cl/1414016")
+        self.assertFalse(
+            chat_lifecycle.is_valid_chat_topic(chat_lifecycle.clean_base_title(res_ru))
         )
 
         # 4. Prompt without entity does not change title
@@ -2051,6 +2068,10 @@ class TestChatLifecycle(unittest.TestCase):
         "Android Bug Report",
         "Посмотри на этот баг",
         "Please look at this bug",
+        "Тест № 2",
+        "cl/1414016 Дэвид прислал мне",
+        "PR #123 разбор бага",
+        "David email: тест",
     ]:
       self.assertFalse(chat_lifecycle.is_valid_chat_topic(bad), f"Expected '{bad}' rejected")
       with self.assertRaises(chat_lifecycle.InvalidTopicError):
@@ -2060,7 +2081,6 @@ class TestChatLifecycle(unittest.TestCase):
         "PR #194980 multi-span BiDi",
         "FontCollection FaceCache thread safety",
         "R2 b/345678901",
-        "Тест № 2",
         "Ban single-word and generic chat titles",
         "Audit visible chats",
         "crbug/468570189 Fontations streamToData OOM",
@@ -2091,9 +2111,26 @@ class TestChatLifecycle(unittest.TestCase):
 
     with patch.object(chat_lifecycle, "resolve_project_id", return_value="proj-x"), \
          patch.object(chat_lifecycle, "resolve_handoff_model", return_value={"enum": "M1"}), \
-         patch.object(chat_lifecycle, "start_conversation_exact", return_value="new-c-123"):
+         patch.object(chat_lifecycle, "get_current_time_str", return_value="16:00"), \
+         patch.object(
+             chat_lifecycle, "start_conversation_exact", return_value="new-c-123"
+         ) as mock_start:
       ret = chat_lifecycle.cmd_start(opts)
       self.assertEqual(ret, 0)
+
+      no_title_opts = chat_lifecycle.parse_start_args(
+          ["--project=proj-x", "Дэвид прислал письмо PR #999 Hi Julia Thank you"]
+      )
+      ret2 = chat_lifecycle.cmd_start(no_title_opts)
+      self.assertEqual(ret2, 0)
+      self.assertEqual(mock_start.call_args.kwargs["title"], "[16:00] ⦿ PR #999")
+
+      cyrillic_opts = chat_lifecycle.parse_start_args(
+          ["--project=proj-x", "--title=Разбор бага PR #999", "Check PR #999"]
+      )
+      with self.assertRaises(SystemExit) as ctx:
+        chat_lifecycle.cmd_start(cyrillic_opts)
+      self.assertEqual(ctx.exception.code, 2)
 
   def test_get_model_quota_fraction_handles_proto3_omitted_zero_and_expired_reset(self):
     now = 1800000000.0

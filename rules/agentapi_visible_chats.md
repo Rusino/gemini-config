@@ -25,20 +25,21 @@ echo "ID=$ID" && agentapi get-conversation-metadata "$ID" | grep -E '"sourceMeta
   `PR #194980 multi-span BiDi`, `FontCollection FaceCache thread safety`,
   `R27 Ban generic chat titles`).
   - **Strictly forbidden**: single-word titles (`Investigation`, `Debugging`, `Perf`, `Skia`),
-    bare entity IDs without a subject (`cl/1405639`, `PR #12345`), and generic filler combinations
-    (`Bug investigation`, `Code review`, `Fix issue`, `Task continuation`, `Исследование бага`).
-  - Commands `set-title`, `handoff`, and `next-task` validate `<Topic>` via `validate_chat_topic` and raise
-    an error on generic/single-word topics. `handoff` always preserves the chain's established valid
-    topic across all continuation pieces (using `--topic` or deriving a fallback only if the caller
-    chat had no valid topic yet). `context_guard` and `stop_guard` enforce titling on the first turn
-    with `[TITLE GUARD]`.
+    bare entity IDs without a subject (`cl/1405639`, `PR #12345`), generic filler combinations
+    (`Bug investigation`, `Code review`, `Fix issue`, `Task continuation`, `Исследование бага`),
+    and Cyrillic characters (chat titles must strictly be in English).
+  - Commands `set-title`, `handoff`, `next-task`, and `start --title` validate `<Topic>` via
+    `validate_chat_topic` and raise an error on generic/single-word or Cyrillic topics. `handoff`
+    always preserves the chain's established valid topic across all continuation pieces (using
+    `--topic` or deriving a fallback only if the caller chat had no valid topic yet).
+    `context_guard` and `stop_guard` enforce titling on the first turn with `[TITLE GUARD]`.
 
 Use only these commands (`python3 ~/.gemini/config/hooks/chat_lifecycle.py ...`):
 
 | Command | When you call it |
 |---|---|
-| `set-title <id> "<Topic>"` | User asks to name/rename the chat, or on the first turn of a root chat to refine an auto-detected ID or replace a generic title (never on continuations or later turns unless asked). Pass bare `<Topic>`. |
-| `auto-title <id> "<prompt>"` | Detect PR/CL/bug/commit in prompt and set title if untitled (invoked automatically by `context_guard.py`). |
+| `set-title <id> "<Topic>"` | User asks to name/rename the chat, or on the first turn of a root chat to refine an auto-detected ID or replace a generic title (never on continuations or later turns unless asked). Pass bare English `<Topic>`. |
+| `auto-title <id> "<prompt>"` | Detect PR/CL/bug/commit in prompt and set provisional entity ID if untitled (invoked automatically by `context_guard.py`; leaves chat requiring English refinement via `set-title`). |
 | `handoff <id> [summary_file] [--notes "..."] [--next "..."] [--force]` | Context guard alert, or user asks to continue in a new chat. Preserves `<id>`'s existing topic verbatim across the continuation chain. Writes/updates summary, launches visible continuation in the same project on `<id>`'s last model, verifies `sourceMetadata: null`, archives `<id>`. Refuses while `<id>` has running subagents or background tasks (timers included), since their reports would land in a hidden chat: wait for them or kill them; `--ignore-live` only after recording them in the state file. `--model <id\|name>` only on explicit user request; `--force` only when user explicitly asked for a second continuation. |
 | `next-task [<id>] [<R_ID>] [--topic "<Topic>"] [--notes "..."] [--next "..."] [--force]` | After finishing a task (`roadmap.py set <id> <R_prev> done`), when `[NEXT-TASK BATON: YOURS ...]` is granted and the user confirms starting `<R_ID>` in a fresh chat: archives `<id>`'s chain and all completed sibling chats in the project (releasing worktree leases), launches an independent root chat (`⦿`) in the same project, claims `<R_ID>` as `doing`, links `<R_ID> → <new_id>`, and seeds `state/<new_id>.md`. |
 | `start [--project <p>] [--title <Topic>] [--model <m>] "<prompt>"` | Starts an independent root chat atomically pinned to the project via before_send hook. |
