@@ -8903,6 +8903,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   .hero h1 .soft { color: var(--graphite); }
   .hero p { margin-top: 4px; font-size: 11.5px; color: var(--graphite); letter-spacing: -.005em; }
+  /* Collapse top margin when secondary counts live in the .sec-tabs bar instead of #subline */
+  .hero p:empty { display: none; }
 
   .focus { display: grid; gap: 10px; }
   .card {
@@ -8992,17 +8994,31 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
 
   section.lane { margin-top: 22px; }
-  .lane-head, details.done > summary {
+  .lane-head {
     display: flex; align-items: baseline; gap: 8px;
     padding-bottom: 6px; border-bottom: 1px solid var(--hairline);
   }
-  .lane-head h3, details.done h3 { font: 600 12.5px var(--display); letter-spacing: -.01em; }
-  .lane-head .n, details.done .n { color: var(--graphite); font-size: 11px; }
+  .lane-head h3 { font: 600 12.5px var(--display); letter-spacing: -.01em; }
+  .lane-head .n { color: var(--graphite); font-size: 11px; }
   .lane-head .hint { margin-left: auto; font-size: 10.5px; color: var(--graphite); }
-  details.done > summary { list-style: none; cursor: pointer; }
-  details.done > summary::-webkit-details-marker { display: none; }
-  details.done .chev { margin-left: auto; color: var(--blue); font-size: 11px; }
-  details.done[open] .chev .closed, details.done:not([open]) .chev .open { display: none; }
+  /* Single-select switcher bar keeps secondary sections collapsed below Needs you by default */
+  .sec-tabs {
+    margin-top: 22px; padding-bottom: 8px; border-bottom: 1px solid var(--hairline);
+    display: flex; flex-wrap: wrap; align-items: center; gap: 5px;
+  }
+  .sec-tab {
+    border: 1px solid var(--hairline); background: var(--card); color: var(--graphite);
+    font: 500 11px var(--sans); padding: 3px 10px; border-radius: 980px; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 5px;
+  }
+  .sec-tab:hover {
+    color: var(--ink); border-color: color-mix(in srgb, var(--ink) 20%, transparent);
+  }
+  .sec-tab.on { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+  .sec-tab .n { font-size: 10.5px; opacity: .75; }
+  section.lane.sec-panel { margin-top: 12px; }
+  .sec-panel[hidden] { display: none !important; }
+  .sec-panel .pings-wrap { margin-top: 0; }
 
   .row {
     display: grid; grid-template-columns: minmax(0, 1fr) 300px 150px;
@@ -9415,7 +9431,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   html.embedded .card .why { font-size: 11.5px; }
   html.embedded .row { grid-template-columns: 1fr; gap: 2px; padding: 6px 0; }
   html.embedded section.lane { margin-top: 18px; }
-  html.embedded .lane-head h3, html.embedded details.done h3 { font-size: 12px; }
+  html.embedded section.lane.sec-panel { margin-top: 10px; }
+  html.embedded .sec-tabs { margin-top: 14px; gap: 4px; padding-bottom: 6px; }
+  html.embedded .sec-tab { font-size: 10.5px; padding: 2px 8px; }
+  html.embedded .lane-head h3 { font-size: 12px; }
   html.embedded footer { margin: 28px 0 16px; font-size: 10px; }
 
   /* Segmented [CLs | Bugs] view switch and bug-CL parent/subtask rows */
@@ -9464,7 +9483,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   details.subtask-more > summary::-webkit-details-marker { display: none; }
   details.subtask-more[open] > .subtask-more-body { margin-top: 3px; display: grid; gap: 3px; }
-  details.backlog { margin-top: 10px; }
 </style>
 </head>
 <body>
@@ -9485,7 +9503,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <p id="subline"></p>
   </div>
   <div class="focus" id="focus"></div>
-  <div id="pings"></div>
   <div id="lanes"></div>
   <footer id="footer"></footer>
 </main>
@@ -9507,6 +9524,8 @@ let cachedData = null;
 let cachedUiVersion = null;
 let selectedProject = 'ALL';
 let selectedView = 'cls';
+// Preserves at most one open secondary section per view across 20s polls
+let selectedSection = {cls: null, bugs: null};
 
 function esc(s) {
   return String(s ?? '')
@@ -11775,11 +11794,38 @@ function bugRowHtml(bug, data) {
     `<div class="when">${whenTxt}</div></div>`;
 }
 
-function doneDisclosureHtml(title, count, bodyHtml, extraCls = '') {
-  return `<details class="done${extraCls ? ' ' + extraCls : ''}"><summary><h3>${title}</h3>` +
-    `<span class="n">${count}</span>` +
-    '<span class="chev"><span class="closed">Show</span><span class="open">Hide</span></span>' +
-    `</summary>${bodyHtml}</details>`;
+function toggleSection(secId) {
+  const v = selectedView === 'bugs' ? 'bugs' : 'cls';
+  selectedSection[v] = selectedSection[v] === secId ? null : secId;
+  render();
+}
+
+function laneSectionBodyHtml(title, count, hint, itemsHtml) {
+  const hintHtml = hint ? `<span class="hint">${hint}</span>` : '';
+  return `<div class="lane-head"><h3>${title}</h3><span class="n">${count}</span>` +
+    `${hintHtml}</div>${itemsHtml}`;
+}
+
+// Renders a single-select toolbar of non-empty secondary sections with 0 or 1 open panel
+function renderSecondarySectionsHtml(view, sections) {
+  if (!sections.length) return '';
+  const activeId = selectedSection[view];
+  const openId = sections.some(s => s.id === activeId) ? activeId : null;
+  const tabs = sections.map(s => {
+    const isOn = openId === s.id;
+    return `<button type="button" class="sec-tab${isOn ? ' on' : ''}" ` +
+      `aria-expanded="${isOn ? 'true' : 'false'}" ` +
+      `onclick="toggleSection(${esc(JSON.stringify(s.id))})">` +
+      `${s.title}<span class="n">${s.count}</span></button>`;
+  }).join('');
+  const panels = sections.map(s => {
+    const isOn = openId === s.id;
+    const cls = isOn ? 'lane sec-panel open' : 'lane sec-panel';
+    const hid = isOn ? '' : ' hidden';
+    return `<section class="${cls}" data-section="${esc(s.id)}"${hid}>${s.bodyHtml}</section>`;
+  }).join('');
+  return `<div class="sec-tabs" role="toolbar" aria-label="Secondary sections">${tabs}</div>` +
+    panels;
 }
 
 function renderProjectChips(items, projects) {
@@ -11919,46 +11965,61 @@ function render() {
     document.getElementById('headline').innerHTML = headlineHtml(
       needBugs, selectedProject, busyBugs
     );
-    const bSub = BUG_LANES.filter(l => byBug[l.id].length)
-      .map(l => `${byBug[l.id].length} ${l.title.toLowerCase()}`);
-    if (byBug.fixed.length) bSub.push(`${byBug.fixed.length} fixed`);
-    if (byBug.closed.length) bSub.push(`${byBug.closed.length} closed`);
-    document.getElementById('subline').textContent = bSub.length ? `${bSub.join(' · ')}.` : '';
+    // Secondary bug counts now appear on the .sec-tabs pills below #focus
+    document.getElementById('subline').textContent = '';
     document.getElementById('focus').innerHTML = byBug.you.map(b => bugFocusCard(b, data)).join('');
-    const pingsEl = document.getElementById('pings');
-    if (pingsEl) pingsEl.innerHTML = '';
 
-    let bugLanesHtml = '';
+    const bugSections = [];
     for (const l of BUG_LANES) {
       const list = byBug[l.id];
       if (!list.length) continue;
-      // Fold >60d unchatted assigned bugs into a collapsed Backlog disclosure
+      // Split stale (>60d) unchatted assigned bugs into their own Backlog section tab
       if (l.id === 'assigned') {
         const act = list.filter(b => !b.is_stale_backlog);
         const stale = list.filter(b => b.is_stale_backlog);
-        const backlogBody = stale.map(b => bugRowHtml(b, data)).join('');
-        bugLanesHtml += `<section class="lane"><div class="lane-head"><h3>${l.title}</h3>` +
-          `<span class="n">${act.length}</span><span class="hint">${l.hint}</span></div>` +
-          act.map(b => bugRowHtml(b, data)).join('') +
-          (stale.length
-            ? doneDisclosureHtml('Backlog (&gt;60d)', stale.length, backlogBody, 'backlog')
-            : '') + '</section>';
+        if (act.length) {
+          bugSections.push({
+            id: 'assigned', title: l.title, count: act.length,
+            bodyHtml: laneSectionBodyHtml(
+              l.title, act.length, l.hint, act.map(b => bugRowHtml(b, data)).join('')
+            ),
+          });
+        }
+        if (stale.length) {
+          bugSections.push({
+            id: 'backlog', title: 'Backlog (>60d)', count: stale.length,
+            bodyHtml: laneSectionBodyHtml(
+              'Backlog (>60d)', stale.length, 'Unchatted assigned bugs older than 60 days',
+              stale.map(b => bugRowHtml(b, data)).join('')
+            ),
+          });
+        }
       } else {
-        bugLanesHtml += `<section class="lane"><div class="lane-head"><h3>${l.title}</h3>` +
-          `<span class="n">${list.length}</span><span class="hint">${l.hint}</span></div>` +
-          list.map(b => bugRowHtml(b, data)).join('') + '</section>';
+        bugSections.push({
+          id: l.id, title: l.title, count: list.length,
+          bodyHtml: laneSectionBodyHtml(
+            l.title, list.length, l.hint, list.map(b => bugRowHtml(b, data)).join('')
+          ),
+        });
       }
     }
-    // Render Fixed and Closed in separate collapsed disclosures at the bottom
+    const closedHints = {
+      fixed: 'Recently fixed issues',
+      closed: 'Won’t fix, duplicate, or obsolete issues',
+    };
     for (const [ck, ct] of [['fixed', 'Fixed'], ['closed', 'Closed']]) {
       if (byBug[ck].length) {
-        bugLanesHtml += '<section class="lane">' + doneDisclosureHtml(
-          ct, byBug[ck].length, byBug[ck].map(b => bugRowHtml(b, data)).join('')
-        ) + '</section>';
+        bugSections.push({
+          id: ck, title: ct, count: byBug[ck].length,
+          bodyHtml: laneSectionBodyHtml(
+            ct, byBug[ck].length, closedHints[ck], byBug[ck].map(b => bugRowHtml(b, data)).join('')
+          ),
+        });
       }
     }
-    document.getElementById('lanes').innerHTML = bugLanesHtml ||
-      '<p class="empty-note">No tracked bugs in this project.</p>';
+    document.getElementById('lanes').innerHTML = bugSections.length
+      ? renderSecondarySectionsHtml('bugs', bugSections)
+      : (shownBugs.length ? '' : '<p class="empty-note">No tracked bugs in this project.</p>');
     const projCount = bugProjects.length;
     document.getElementById('footer').textContent =
       `${allBugs.length} tracked bugs across ${projCount} projects · refreshes every 5 min`;
@@ -11990,30 +12051,42 @@ function render() {
   const busyYou = countUniqueBusyChats(by.you);
   const needYou = by.you.filter(it => !it.chat_busy).length;
   document.getElementById('headline').innerHTML = headlineHtml(needYou, selectedProject, busyYou);
-  const sub = LANES.filter(l => by[l.id].length)
-    .map(l => `${by[l.id].length} ${l.title.toLowerCase()}`);
-  if (by.done.length) sub.push(`${by.done.length} done`);
-  document.getElementById('subline').textContent = sub.length ? `${sub.join(' · ')}.` : '';
+  // Secondary lane counts now appear on the .sec-tabs pills below #focus
+  document.getElementById('subline').textContent = '';
 
   document.getElementById('focus').innerHTML = renderFocusSection(by.you, shown, data);
 
-  // Render grouped reviewer ping cards between Needs You and the status lanes
-  const pingsEl = document.getElementById('pings');
-  if (pingsEl) pingsEl.innerHTML = renderPingsSection(shown);
-
-  let lanes = LANES.filter(l => by[l.id].length).map(l =>
-    `<section class="lane"><div class="lane-head"><h3>${l.title}</h3>` +
-    `<span class="n">${by[l.id].length}</span><span class="hint">${l.hint}</span></div>` +
-    renderLaneItemsHtml(by[l.id], data) + '</section>').join('');
-  if (by.done.length) {
-    lanes += '<section class="lane"><details class="done"><summary><h3>Done</h3>' +
-      `<span class="n">${by.done.length}</span>` +
-      '<span class="chev"><span class="closed">Show</span><span class="open">Hide</span></span>' +
-      '</summary>' +
-      renderLaneItemsHtml(by.done, data) + '</details></section>';
+  const clSections = [];
+  const pingGroups = collectReviewerPingGroups(shown);
+  if (pingGroups.length) {
+    const pingClIds = new Set(pingGroups.flatMap(g => g.items.map(x => x.item_key)));
+    clSections.push({
+      id: 'pings', title: 'Reviewer Pings', count: pingClIds.size,
+      bodyHtml: renderPingsSection(shown),
+    });
   }
-  document.getElementById('lanes').innerHTML = lanes ||
-    '<p class="empty-note">No open CL or PR chats in this project.</p>';
+  for (const l of LANES) {
+    if (by[l.id].length) {
+      clSections.push({
+        id: l.id, title: l.title, count: by[l.id].length,
+        bodyHtml: laneSectionBodyHtml(
+          l.title, by[l.id].length, l.hint, renderLaneItemsHtml(by[l.id], data)
+        ),
+      });
+    }
+  }
+  if (by.done.length) {
+    clSections.push({
+      id: 'done', title: 'Done', count: by.done.length,
+      bodyHtml: laneSectionBodyHtml(
+        'Done', by.done.length, 'Recently merged or abandoned',
+        renderLaneItemsHtml(by.done, data)
+      ),
+    });
+  }
+  document.getElementById('lanes').innerHTML = clSections.length
+    ? renderSecondarySectionsHtml('cls', clSections)
+    : (shown.length ? '' : '<p class="empty-note">No open CL or PR chats in this project.</p>');
   document.getElementById('footer').textContent =
     `${all.length} open CL and PR chats across ${projects.length} projects · refreshes every 20 s`;
 }

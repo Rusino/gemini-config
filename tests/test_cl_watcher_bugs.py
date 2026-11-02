@@ -947,5 +947,147 @@ assert(
     self.assertEqual(dark_hex, "#fbbf24")
     self.assertGreaterEqual(wcag_contrast(dark_hex, "#19191d"), 8.0)
 
+  def test_secondary_section_single_select_switcher_and_poll_persistence(self) -> None:
+    js_code = r"""
+const assert = require('assert');
+const vm = require('vm');
+const html = require('fs').readFileSync(0, 'utf8');
+const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
+assert(scriptMatch, 'Script block found');
+const scriptContent = scriptMatch[1].split('\nboot();')[0];
+
+const elements = {};
+function getEl(id) {
+  if (!elements[id]) elements[id] = { innerHTML: '', textContent: '', style: {} };
+  return elements[id];
+}
+
+global.document = {
+  getElementById: getEl,
+  addEventListener: () => {},
+  documentElement: { classList: { add: () => {} } },
+};
+global.window = {};
+global.location = { hash: '', search: '', reload: () => {} };
+global.history = { replaceState: () => {} };
+global.navigator = { clipboard: { writeText: async () => {} } };
+
+const harness = `
+cachedData = {
+  items: {
+    'gerrit:1': {
+      item_key: 'gerrit:1', target_id: '1', kind: 'gerrit', project_name: 'Skia',
+      status: 'NEW', in_my_attention: true, patchset: 1, subject: 'Needs you item',
+      url: 'https://example.com/1',
+    },
+    'gerrit:2': {
+      item_key: 'gerrit:2', target_id: '2', kind: 'gerrit', project_name: 'Skia',
+      status: 'NEW', is_draft: true, subject: 'Draft item on desk',
+      url: 'https://example.com/2',
+    },
+    'gerrit:3': {
+      item_key: 'gerrit:3', target_id: '3', kind: 'gerrit', project_name: 'Skia',
+      status: 'NEW', waiting_on: [{id: 'peer@google.com', active: true}],
+      subject: 'Waiting item', url: 'https://example.com/3',
+    },
+    'gerrit:4': {
+      item_key: 'gerrit:4', target_id: '4', kind: 'gerrit', project_name: 'Skia',
+      status: 'NEW', is_watching: true, is_self: false,
+      subject: 'Watching item', url: 'https://example.com/4',
+    },
+    'gerrit:5': {
+      item_key: 'gerrit:5', target_id: '5', kind: 'gerrit', project_name: 'Skia',
+      status: 'MERGED', submitted_ts: Date.now() / 1000 - 86400 * 10,
+      subject: 'Old done item', url: 'https://example.com/5',
+    },
+    'gerrit:6': {
+      item_key: 'gerrit:6', target_id: '6', kind: 'gerrit', project_name: 'Skia',
+      status: 'NEW', is_self: true, patchset: 2, subject: 'Ping item',
+      url: 'https://example.com/6',
+      reviewer_pings: [{
+        reviewer: 'peer@google.com', reviewer_name: 'Peer',
+        reason: 'lost_on_rebase', prev_ps: 1, current_ps: 2,
+        had_approval: true, in_attention_set: false,
+      }],
+    },
+  },
+  bugs: {
+    'buganizer:10': {
+      bug_key: 'buganizer:10', short_id: 'b/10', title: 'Needs you bug',
+      project_name: 'Skia', lane: 'you', status: 'ASSIGNED', priority: 'P1',
+    },
+    'buganizer:11': {
+      bug_key: 'buganizer:11', short_id: 'b/11', title: 'Assigned active bug',
+      project_name: 'Skia', lane: 'assigned', status: 'ASSIGNED', priority: 'P2',
+      is_stale_backlog: false,
+    },
+    'buganizer:12': {
+      bug_key: 'buganizer:12', short_id: 'b/12', title: 'Stale backlog bug',
+      project_name: 'Skia', lane: 'assigned', status: 'ASSIGNED', priority: 'P3',
+      is_stale_backlog: true,
+    },
+  },
+};
+
+render();
+
+assert.strictEqual(getEl('subline').textContent, '', 'Subline must be cleared');
+const lanesHtml = getEl('lanes').innerHTML;
+assert(lanesHtml.includes('sec-tabs'), 'Must render secondary section tabs bar');
+assert(lanesHtml.includes('Reviewer Pings'), 'Must render Reviewer Pings tab');
+assert(lanesHtml.includes('On your desk'), 'Must render On your desk tab');
+assert(lanesHtml.includes('Waiting on others'), 'Must render Waiting on others tab');
+assert(lanesHtml.includes('Watching'), 'Must render Watching tab');
+assert(lanesHtml.includes('Done'), 'Must render Done tab');
+assert(!lanesHtml.includes('>Landing<'), 'Empty Landing tab must be omitted');
+
+assert.strictEqual(selectedSection.cls, null, 'Default selectedSection.cls must be null');
+assert(!lanesHtml.includes('class="lane sec-panel open"'), 'No panel open by default');
+
+toggleSection('desk');
+assert.strictEqual(selectedSection.cls, 'desk');
+const deskHtml = getEl('lanes').innerHTML;
+assert(deskHtml.includes('data-section="desk"'), 'Must have desk panel');
+assert(!deskHtml.includes('data-section="desk" hidden'), 'Desk panel must not be hidden');
+assert(deskHtml.includes('data-section="waiting" hidden'), 'Waiting panel must be hidden');
+
+toggleSection('waiting');
+assert.strictEqual(selectedSection.cls, 'waiting');
+const waitHtml = getEl('lanes').innerHTML;
+assert(waitHtml.includes('data-section="desk" hidden'), 'Desk panel must now be hidden');
+assert(!waitHtml.includes('data-section="waiting" hidden'), 'Waiting panel must be visible');
+
+render();
+assert.strictEqual(selectedSection.cls, 'waiting', 'Poll must preserve selected section');
+assert(!getEl('lanes').innerHTML.includes('data-section="waiting" hidden'), 'Waiting still open');
+
+toggleSection('waiting');
+assert.strictEqual(selectedSection.cls, null, 'Toggling active section must collapse it');
+assert(getEl('lanes').innerHTML.includes('data-section="waiting" hidden'), 'Waiting now hidden');
+
+setView('bugs');
+assert.strictEqual(selectedSection.bugs, null, 'Default selectedSection.bugs must be null');
+const bugLanes = getEl('lanes').innerHTML;
+assert(bugLanes.includes('Assigned'), 'Must render Assigned tab');
+assert(bugLanes.includes('Backlog (>60d)'), 'Must render Backlog tab');
+toggleSection('backlog');
+assert.strictEqual(selectedSection.bugs, 'backlog');
+assert(!getEl('lanes').innerHTML.includes('data-section="backlog" hidden'), 'Backlog open');
+assert(getEl('lanes').innerHTML.includes('data-section="assigned" hidden'), 'Assigned hidden');
+`;
+vm.runInThisContext(scriptContent + '\n' + harness);
+"""
+    res = subprocess.run(
+        ["node", "-e", js_code],
+        input=w.DASHBOARD_HTML,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(
+        res.returncode, 0, f"Node stdout: {res.stdout}\nStderr: {res.stderr}"
+    )
+
+
 if __name__ == "__main__":
   unittest.main()
