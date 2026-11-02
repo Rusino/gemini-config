@@ -509,6 +509,15 @@
     1421,
   ]);
 
+  // Models whose Antigravity 2.28.2 feature flags activate the broken model_router_plan
+  // contrib variant on step 0 (when previousContribVariant is nil), crashing constructExecutor
+  const STEP0_BROKEN_CONTRIB_ENUMS = new Set([1415, 1422]);
+  const STEP0_BROKEN_CONTRIB_IDS = new Set([
+    'gemini-pro-coordinator',
+    'gemini-3.8-flash-router',
+  ]);
+  const STEP0_BOOTSTRAP_MAX_ENTRIES = 64;
+
   // Labels non-BoN hidden models for ModelSelector and context pill display
   const CURATED_HIDDEN_MODELS = [
     ['gemini-3.8-flash-router', 'Gemini 3.8 Flash Router', 'Exp'],
@@ -589,6 +598,7 @@
   }
   // Persist manual model pins across F5 reloads with a 30m TTL on unsent project drafts
   const MANUAL_MODEL_PINS_STORAGE_KEY = 'jetski_manual_model_pins_v1';
+  const STEP0_BOOTSTRAP_STORAGE_KEY = 'jetski_step0_bootstrapped_models_v1';
   const DRAFT_MANUAL_PIN_TTL_MS = 30 * 60 * 1000;
   const MANUAL_MODEL_PINS_MAX_ENTRIES = 200;
   let autopilotToastTimer = 0;
@@ -596,6 +606,8 @@
   const manualPickedModels = (window.__jetskiManualPickedModels ||= new Map());
   // Tracks the last project profile key auto-seeded for a draft or conversation
   const autoSeededTargets = new Map();
+  // Tracks conversations whose step-0 request substituted a safe model so turn 2+ restores target
+  const step0BootstrappedModels = (window.__jetskiStep0BootstrappedModels ||= new Map());
 
   const PROJECT_MODEL_PROFILES = {
     // triage profile
@@ -2572,6 +2584,8 @@
         return Promise.resolve({ ok: false, status: 204 });
       }
       let nextInit = init;
+      // Deferred bootstrap target when StartCascade assigns cascadeId only in its response
+      let pendingBootstrapOnStart = null;
       if (
         !disposed &&
         reduxStore &&
@@ -2635,13 +2649,55 @@
                 reason = 'WTU shield';
               }
             }
+            // Bypass step-0 model_router_plan crash while preserving target model for turn 2+
+            const candidateEntry = replacement || entry;
+            const candidateEnum =
+              candidateEntry?.enumVal || resolveModelEnumValue(String(planModel || ''));
+            const candidateId = candidateEntry?.modelId || String(planModel || '');
+            let isStep0Bootstrap = false;
+            if (
+              isStep0BrokenContribModel(candidateId, candidateEnum) &&
+              (url.includes('/StartCascade') || needsStep0ContribBypass(reduxStore, rawCid))
+            ) {
+              const profile =
+                resolveProjectProfileForConversation(reduxStore, rawCid) || 'orchestrator';
+              const safeStep0 = resolveStep0SafeModel(
+                catalog,
+                profile,
+                candidateEntry || { modelId: candidateId, enumVal: candidateEnum }
+              );
+              if (safeStep0 && safeStep0.enumVal && safeStep0.enumVal !== candidateEnum) {
+                replacement = safeStep0;
+                reason = reason ? `${reason}, step-0 safe bootstrap` : 'step-0 safe bootstrap';
+                isStep0Bootstrap = true;
+              }
+            }
             // Promote draft manual pin to the new cascadeId on StartCascade and free the draft slot
             if (url.includes('/StartCascade') && pinKey.startsWith('__draft__:')) {
               if (body.cascadeId && pin && !isForbiddenBon) {
-                setManualPin(body.cascadeId, replacement?.enumVal || pin.model, 1);
+                // Keep the intended router model pinned rather than the temporary step-0 model
+                const nextPinModel = isStep0Bootstrap
+                  ? candidateEnum
+                  : replacement?.enumVal || pin.model;
+                setManualPin(body.cascadeId, nextPinModel, 1);
               }
               deleteManualPin(pinKey);
               autoSeededTargets.delete(pinKey);
+            }
+            // Record step-0 substitution so trajectoryModelObserved restores targetEnum on turn 2+
+            if (isStep0Bootstrap && candidateEnum && replacement?.enumVal) {
+              const bootstrapInfo = {
+                targetEnum: candidateEnum,
+                bootstrapEnum: replacement.enumVal,
+                wasPinned: Boolean(
+                  isPinned || (pin && !isForbiddenBon && pin.model === candidateEnum)
+                ),
+              };
+              if (rawCid) {
+                recordStep0Bootstrap(rawCid, bootstrapInfo);
+              } else if (url.includes('/StartCascade')) {
+                pendingBootstrapOnStart = bootstrapInfo;
+              }
             }
             if (replacement && replacement.enumVal && replacement.enumVal !== entry?.enumVal) {
               const nextPlanModel =
@@ -2664,7 +2720,17 @@
           // Keep untouched request options on malformed payload
         }
       }
-      return baseFetch.call(window, input, nextInit);
+      const respPromise = baseFetch.call(window, input, nextInit);
+      // Bind pending StartCascade bootstrap target once the response yields its new cascadeId
+      if (pendingBootstrapOnStart && respPromise && typeof respPromise.then === 'function') {
+        respPromise
+          .then((resp) => (resp && typeof resp.clone === 'function' ? resp.clone().json() : null))
+          .then((data) => {
+            if (data?.cascadeId) recordStep0Bootstrap(data.cascadeId, pendingBootstrapOnStart);
+          })
+          .catch(() => {});
+      }
+      return respPromise;
     };
     gatedFetch.__jetskiSoundGate = true;
     gatedFetch.__jetskiOrigFetch = baseFetch;
@@ -2702,6 +2768,30 @@
     const rawEnum = String(modelEnum || '').trim();
     if (rawEnum && BON_MODEL_ID_RE.test(rawEnum)) return true;
     return false;
+  }
+
+  // Returns true when modelId or modelEnum activates the broken step-0 model_router_plan variant
+  function isStep0BrokenContribModel(modelId, modelEnum) {
+    const mid = String(modelId || '').trim().toLowerCase();
+    if (mid && STEP0_BROKEN_CONTRIB_IDS.has(mid)) return true;
+    const numVal =
+      typeof modelEnum === 'number' ? modelEnum : resolveModelEnumValue(String(modelEnum || ''));
+    return Boolean(numVal && STEP0_BROKEN_CONTRIB_ENUMS.has(numVal));
+  }
+
+  // Returns true while the trajectory has no completed executor turn (nil previousContribVariant)
+  function needsStep0ContribBypass(store, cascadeId) {
+    if (!cascadeId) return true;
+    const summary = store?.getState()?.trajectorySummaries?.summaries?.[cascadeId];
+    if (!summary) return true;
+    const stepCount = Number(summary.stepCount ?? 0);
+    if (stepCount === 0) return true;
+    // Prior attempts that crashed in constructExecutor leave status set with no termination reason
+    return Boolean(
+      summary.status &&
+        !isActiveRunStatus(summary.status) &&
+        !summary.latestExecutorTerminationReason
+    );
   }
 
   // Formats an unknown modelId into a readable fallback label when displayName is masked
@@ -2986,6 +3076,51 @@
     return catalog.byId.get('auto') || catalog.byEnum.values().next().value || null;
   }
 
+  // Resolves a step-0-safe replacement model from the same quota bucket as the broken router model
+  function resolveStep0SafeModel(catalog, profileName, brokenEntry) {
+    if (!catalog) return null;
+    const brokenId = String(brokenEntry?.modelId || '').trim().toLowerCase();
+    const isFlash = brokenId === 'gemini-3.8-flash-router' || brokenEntry?.enumVal === 1422;
+    const cleanProfile = String(profileName || 'orchestrator')
+      .trim()
+      .toLowerCase()
+      .replace(/^profile:/, '');
+    // Match Flash router to Flash models and Gemini Pro Orchestrator to auto (Gemini Pro Next)
+    const preferred = isFlash
+      ? [
+          'gemini-flash-next',
+          'gemini-3.8-flash-high',
+          'gemini-3.8-flash-medium',
+          'gemini-2.5-flash',
+          'auto',
+        ]
+      : ['auto', ...(WEB_MODEL_PROFILES[cleanProfile] || WEB_MODEL_PROFILES.orchestrator)];
+    const candidates = [];
+    // Pick the first non-broken candidate above the 30% soft floor
+    for (const mid of preferred) {
+      const hit = catalog.byId.get(mid);
+      if (!hit || isStep0BrokenContribModel(hit.modelId, hit.enumVal)) continue;
+      if (hit.quota >= QUOTA_SOFT_FLOOR) return hit;
+      candidates.push(hit);
+    }
+    // Fall back to highest-quota preferred candidate above the 15% hard floor
+    if (candidates.length > 0) {
+      candidates.sort((a, b) => (b.quota || 0) - (a.quota || 0));
+      if (candidates[0].quota >= QUOTA_HARD_FLOOR) return candidates[0];
+    }
+    // Last resort: any non-broken catalog model above the 5% emergency floor
+    for (const hit of catalog.byEnum.values()) {
+      if (
+        hit &&
+        !isStep0BrokenContribModel(hit.modelId, hit.enumVal) &&
+        hit.quota >= EMERGENCY_PIN_FLOOR
+      ) {
+        return hit;
+      }
+    }
+    return null;
+  }
+
   // Finds project profile ('cpp-core', 'triage', 'orchestrator') for a conversation or route
   function resolveProjectProfileForConversation(store, cascadeId) {
     const summariesMap = store?.getState()?.trajectorySummaries?.summaries;
@@ -3141,7 +3276,81 @@
     }
   }
 
+  // Hydrates step-0 bootstrap mappings so unpinned router chats still restore on F5 reload
+  function loadStep0BootstrappedModels() {
+    try {
+      const raw = window.localStorage?.getItem(STEP0_BOOTSTRAP_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return;
+      for (const [k, v] of Object.entries(parsed).slice(-STEP0_BOOTSTRAP_MAX_ENTRIES)) {
+        const targetEnum = Number(v?.targetEnum);
+        const bootstrapEnum = Number(v?.bootstrapEnum);
+        if (
+          !k ||
+          !Number.isFinite(targetEnum) ||
+          targetEnum <= 0 ||
+          !Number.isFinite(bootstrapEnum) ||
+          bootstrapEnum <= 0 ||
+          isForbiddenBonModel('', targetEnum)
+        ) {
+          continue;
+        }
+        step0BootstrappedModels.set(k, {
+          targetEnum,
+          bootstrapEnum,
+          wasPinned: Boolean(v?.wasPinned),
+        });
+      }
+    } catch {
+      // Ignore malformed localStorage state
+    }
+  }
+
+  // Persists bounded step-0 bootstrap mappings across F5 reloads and filter re-injections
+  function saveStep0BootstrappedModels() {
+    try {
+      if (typeof window.localStorage?.setItem !== 'function') return;
+      const out = {};
+      const entries = Array.from(step0BootstrappedModels.entries()).slice(
+        -STEP0_BOOTSTRAP_MAX_ENTRIES
+      );
+      for (const [k, v] of entries) {
+        if (!k || !v?.targetEnum || !v?.bootstrapEnum) continue;
+        out[k] = {
+          targetEnum: Number(v.targetEnum),
+          bootstrapEnum: Number(v.bootstrapEnum),
+          wasPinned: Boolean(v.wasPinned),
+        };
+      }
+      window.localStorage.setItem(STEP0_BOOTSTRAP_STORAGE_KEY, JSON.stringify(out));
+    } catch {
+      // Ignore storage quota errors
+    }
+  }
+
+  // Records a bounded step-0 bootstrap mapping, evicting the oldest entry at capacity
+  function recordStep0Bootstrap(cascadeId, info) {
+    if (!cascadeId || !info?.targetEnum || !info?.bootstrapEnum) return;
+    if (step0BootstrappedModels.has(cascadeId)) {
+      step0BootstrappedModels.delete(cascadeId);
+    } else if (step0BootstrappedModels.size >= STEP0_BOOTSTRAP_MAX_ENTRIES) {
+      // Bound map growth across long-lived Hub sessions
+      const oldestKey = step0BootstrappedModels.keys().next().value;
+      if (oldestKey !== undefined) step0BootstrappedModels.delete(oldestKey);
+    }
+    step0BootstrappedModels.set(cascadeId, info);
+    saveStep0BootstrappedModels();
+  }
+
+  function deleteStep0Bootstrap(cascadeId) {
+    if (cascadeId && step0BootstrappedModels.delete(cascadeId)) {
+      saveStep0BootstrappedModels();
+    }
+  }
+
   loadManualModelPins();
+  loadStep0BootstrappedModels();
 
   // Shows a transient floating notification toast when autopilot fails over a model
   function showAutopilotToast(oldLabel, newLabel, reason) {
@@ -3806,6 +4015,9 @@
           store.getState()?.conversation?.convoState?.cascadeId ||
           '';
         const pinKey = resolveDraftPinKey(store, rawCid);
+        // Explicit user pick supersedes any pending step-0 bootstrap restoration
+        if (rawCid) deleteStep0Bootstrap(rawCid);
+        if (activeCid) deleteStep0Bootstrap(activeCid);
         const stepCount = rawCid
           ? Number(store.getState()?.trajectorySummaries?.summaries?.[rawCid]?.stepCount ?? 0)
           : 0;
@@ -3926,6 +4138,45 @@
           ? Number(store.getState()?.trajectorySummaries?.summaries?.[cid]?.stepCount ?? 0)
           : 0;
         const execStep = Number(action.payload.executionStartStep ?? stepCount);
+        const bootstrap = cid ? step0BootstrappedModels.get(cid) : null;
+        // Restore target router model for turn 2+ after step-0 safe bootstrap turn runs
+        if (bootstrap && obsModel === bootstrap.bootstrapEnum) {
+          const targetEntry = catalog.byEnum.get(bootstrap.targetEnum);
+          // Only restore targetEnum while its quota remains above the 5% emergency floor
+          if (!targetEntry || targetEntry.quota >= EMERGENCY_PIN_FLOOR) {
+            // Advance pin step across multi-step tool turns so later turn-1 observations keep pin
+            if (bootstrap.wasPinned) {
+              setManualPin(cid, bootstrap.targetEnum, Math.max(stepCount, execStep, 1));
+            }
+            if (cid) {
+              isInternalDispatch = true;
+              try {
+                store.dispatch({
+                  type: 'modelSelection/modelPicked',
+                  payload: {
+                    conversationId: cid,
+                    model: bootstrap.targetEnum,
+                    pick: { atStep: 999999, queuedMessageIds: [] },
+                  },
+                });
+              } finally {
+                isInternalDispatch = false;
+              }
+            }
+            return origDispatch.call(this, {
+              ...action,
+              payload: {
+                ...action.payload,
+                model: bootstrap.targetEnum,
+                label: targetEntry?.label || action.payload.label,
+              },
+            });
+          }
+          deleteStep0Bootstrap(cid);
+        } else if (bootstrap && cid && obsModel && obsModel !== bootstrap.bootstrapEnum) {
+          // Clear bootstrap state once turn 2+ runs on a non-bootstrap model
+          deleteStep0Bootstrap(cid);
+        }
         const pin = cid ? getManualPinEntry(cid) : null;
         // Preserve manual pick across F5 reload when trajectoryModelObserved replays an older turn
         if (pin && pin.model && (stepCount <= pin.atStep || execStep <= pin.atStep)) {

@@ -2258,6 +2258,88 @@ class TestChatLifecycle(unittest.TestCase):
       self.assertEqual(res_exp["id"], "gemini-launch-candidate-high")
       self.assertEqual(res_exp["source"], "explicit")
 
+  def test_step0_broken_contrib_models_substituted_with_safe_bootstrap(self):
+    self.assertTrue(
+        chat_lifecycle.is_step0_broken_contrib_model(
+            "gemini-pro-coordinator", "MODEL_PLACEHOLDER_M415"
+        )
+    )
+    self.assertTrue(
+        chat_lifecycle.is_step0_broken_contrib_model(
+            "gemini-3.8-flash-router", "MODEL_PLACEHOLDER_M422"
+        )
+    )
+    self.assertFalse(
+        chat_lifecycle.is_step0_broken_contrib_model("auto", "MODEL_PLACEHOLDER_M260")
+    )
+
+    fake_catalog = {
+        "models": {
+            "gemini-pro-coordinator": {
+                "model": "MODEL_PLACEHOLDER_M415",
+                "displayName": "Gemini Pro Orchestrator",
+                "quotaInfo": {"remainingFraction": 0.78, "resetTime": "2027-01-15T12:00:00Z"},
+            },
+            "gemini-3.8-flash-router": {
+                "model": "MODEL_PLACEHOLDER_M422",
+                "displayName": "Gemini 3.8 Flash (router)",
+                "quotaInfo": {"remainingFraction": 0.89, "resetTime": "2027-01-15T12:00:00Z"},
+            },
+            "auto": {
+                "model": "MODEL_PLACEHOLDER_M260",
+                "displayName": "Gemini Pro Next",
+                "quotaInfo": {"remainingFraction": 0.78, "resetTime": "2027-01-15T12:00:00Z"},
+            },
+            "gemini-3.8-flash-high": {
+                "model": "MODEL_PLACEHOLDER_M320",
+                "displayName": "Gemini 3.8 Flash (High)",
+                "quotaInfo": {"remainingFraction": 0.89, "resetTime": "2027-01-15T12:00:00Z"},
+            },
+        },
+        "tieredModelIds": {"pro": ["gemini-pro-coordinator"]},
+    }
+    with (
+        patch.object(chat_lifecycle, "get_available_models", return_value=fake_catalog),
+        patch.object(chat_lifecycle, "get_last_used_model", return_value="MODEL_PLACEHOLDER_M415"),
+        patch.object(chat_lifecycle, "get_project_model_preference", return_value="orchestrator"),
+    ):
+      res = chat_lifecycle.resolve_handoff_model("cid-orch", project_id="p-orch")
+      self.assertEqual(res["id"], "auto")
+      self.assertEqual(res["enum"], "MODEL_PLACEHOLDER_M260")
+      self.assertEqual(res["source"], "project:p-orch:step0_safe")
+      self.assertEqual(res["step0_replaced"], "gemini-pro-coordinator")
+
+      res_flash = chat_lifecycle.resolve_handoff_model(
+          "cid-orch", explicit="gemini-3.8-flash-router", project_id="p-orch"
+      )
+      self.assertEqual(res_flash["id"], "gemini-3.8-flash-high")
+      self.assertEqual(res_flash["enum"], "MODEL_PLACEHOLDER_M320")
+
+      rpc_calls = []
+
+      def fake_rpc(method, body):
+        rpc_calls.append((method, body))
+        if method == "StartCascade":
+          return {"cascadeId": "new-safe-cid"}
+        return {}
+
+      with (
+          patch.object(chat_lifecycle, "ls_rpc", side_effect=fake_rpc),
+          patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[]),
+      ):
+        cid = chat_lifecycle.start_conversation_exact(
+            "MODEL_PLACEHOLDER_M415",
+            "[20:00] ⦿ Test step0 guard",
+            "hello",
+            "p-orch",
+        )
+      self.assertEqual(cid, "new-safe-cid")
+      start_body = rpc_calls[0][1]
+      self.assertEqual(
+          start_body["customAgentSpec"]["cascadeConfig"]["plannerConfig"]["planModel"],
+          "MODEL_PLACEHOLDER_M260",
+      )
+
 
 if __name__ == "__main__":
   unittest.main()

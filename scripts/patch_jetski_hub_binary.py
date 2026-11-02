@@ -270,6 +270,12 @@ def main() -> int:
   sync_artifact_js()
   binaries = extract_sar_and_find_binaries()
   if not binaries:
+    # macOS runs Electron directly via jetski_mac_injector rather than a Linux SAR binary
+    if sys.platform == "darwin":
+      import jetski_mac_injector  # pylint: disable=g-import-not-at-top
+
+      jetski_mac_injector.sync_mac_artifact_js(export_indexes=True)
+      return 0
     print("[ERROR] No jetski-hub-server binaries found", file=sys.stderr)
     return 1
 

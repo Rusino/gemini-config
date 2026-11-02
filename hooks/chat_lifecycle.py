@@ -92,6 +92,25 @@ def is_forbidden_bon_model(model_id: str = "", model_enum: str = "") -> bool:
   return False
 
 
+# Models whose Antigravity 2.28.2 feature flags activate the broken model_router_plan
+# contrib variant on step 0 (when previousContribVariant is nil), crashing constructExecutor
+STEP0_BROKEN_CONTRIB_IDS = frozenset({
+    "gemini-pro-coordinator",
+    "gemini-3.8-flash-router",
+})
+STEP0_BROKEN_CONTRIB_ENUMS = frozenset({
+    "MODEL_PLACEHOLDER_M415",
+    "MODEL_PLACEHOLDER_M422",
+})
+
+
+# Checks whether a model triggers the step-0 model_router_plan_protocol crash
+def is_step0_broken_contrib_model(model_id: str = "", model_enum: str = "") -> bool:
+  mid = (model_id or "").strip().lower()
+  enum = (model_enum or "").strip().upper()
+  return mid in STEP0_BROKEN_CONTRIB_IDS or enum in STEP0_BROKEN_CONTRIB_ENUMS
+
+
 # Fallback chains across the 4 independent flagship quota buckets (Opus, Carbon/Argon, Orchestrator, 3.1 Pro)
 MODEL_PROFILES: dict[str, list[str]] = {
     "cpp-core": [
@@ -1054,6 +1073,43 @@ def get_project_model_preference(project_id_or_name: str, projects_dir: str = ""
   return ""
 
 
+# Substitutes a step-0-safe model from the same quota tier when starting a new conversation
+def resolve_step0_safe_model(models: dict, broken_hit: dict | None = None) -> dict:
+  broken_id = ((broken_hit or {}).get("id") or "").strip().lower()
+  broken_enum = ((broken_hit or {}).get("enum") or "").strip().upper()
+  is_flash = (
+      broken_id == "gemini-3.8-flash-router"
+      or broken_enum == "MODEL_PLACEHOLDER_M422"
+  )
+  # Match the broken router model's quota tier (Flash vs Gemini Pro auto) via profile chains
+  preferred = MODEL_PROFILES["triage"] if is_flash else MODEL_PROFILES["orchestrator"]
+  candidates = []
+  # Prefer the first step-0-safe candidate above the 30% soft floor
+  for mid in preferred:
+    hit = lookup_model(models, mid)
+    if not hit or is_step0_broken_contrib_model(hit.get("id", ""), hit.get("enum", "")):
+      continue
+    if hit.get("quota", 1.0) >= QUOTA_SOFT_FLOOR:
+      return hit
+    candidates.append(hit)
+  # Fall back to the highest-quota preferred model above the 15% hard floor
+  if candidates:
+    candidates.sort(key=lambda c: c.get("quota", 0.0), reverse=True)
+    if candidates[0].get("quota", 0.0) >= QUOTA_HARD_FLOOR:
+      return candidates[0]
+  # Last resort: any named non-broken catalog model above the 5% emergency floor
+  for mid in models:
+    hit = lookup_model(models, mid)
+    if (
+        hit
+        and hit.get("has_display_name")
+        and not is_step0_broken_contrib_model(hit.get("id", ""), hit.get("enum", ""))
+        and hit.get("quota", 0.0) >= EMERGENCY_PIN_FLOOR
+    ):
+      return hit
+  return {}
+
+
 def resolve_handoff_model(
     current_conv_id: str,
     tier: str = "pro",
@@ -1103,6 +1159,15 @@ def resolve_handoff_model(
     return {}
 
   def _check_and_return(hit: dict) -> dict:
+    # Step 0 of a new chat crashes if started on a broken model_router_plan arm
+    if hit and is_step0_broken_contrib_model(hit.get("id", ""), hit.get("enum", "")):
+      safe = resolve_step0_safe_model(models, hit)
+      if safe:
+        hit = {
+            **safe,
+            "source": f"{hit.get('source', 'step0')}:step0_safe",
+            "step0_replaced": hit.get("id") or hit.get("enum"),
+        }
     if hit and not hit.get("has_display_name"):
       sys.stderr.write(f"Warning: Selected model '{hit.get('enum', '')}' has no displayName (nameless alias)\n")
     return hit
@@ -1233,6 +1298,13 @@ def start_conversation_exact(
   before_send(cascade_id) runs before the first message; if it raises, the
   message is not sent and BeforeSendError is raised.
   """
+  # Guard direct callers against passing a step-0 broken router model into StartCascade
+  if is_step0_broken_contrib_model("", model_enum):
+    safe = resolve_step0_safe_model(
+        get_available_models().get("models") or {}, {"enum": model_enum}
+    )
+    if safe and safe.get("enum"):
+      model_enum = safe["enum"]
   body = {
       "source": "CORTEX_TRAJECTORY_SOURCE_AGENT_API",
       "trajectoryType": "CORTEX_TRAJECTORY_TYPE_CASCADE",

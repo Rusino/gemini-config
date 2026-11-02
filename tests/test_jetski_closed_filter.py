@@ -6518,6 +6518,146 @@ global.clearTimeout = (id) => {
     'Manual pick in existing chat must survive F5 reload and ignore older turn trajectoryModelObserved'
   );
 
+  // Step-0 guard: new chat on 1415 bootstraps turn 1 on 1260 and restores 1415 for turn 2+
+  storeState.conversation.cascadeId = 'chat-step0-orch';
+  reduxStore.dispatch({
+    type: 'modelSelection/modelPicked',
+    payload: {
+      conversationId: 'chat-step0-orch',
+      model: 1415,
+    },
+  });
+  await new Promise((r) => setImmediate(r));
+  outgoingFetchCalls = [];
+  await global.window.fetch(
+    '/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        cascadeId: 'chat-step0-orch',
+        cascadeConfig: {
+          plannerConfig: {
+            planModel: 'MODEL_PLACEHOLDER_M415',
+          },
+        },
+      }),
+    }
+  );
+  assert.strictEqual(outgoingFetchCalls.length, 1);
+  assert.strictEqual(
+    outgoingFetchCalls[0].body.cascadeConfig.plannerConfig.planModel,
+    'MODEL_PLACEHOLDER_M260',
+    'Step-0 SendUserCascadeMessage must substitute MODEL_PLACEHOLDER_M260 for broken M415'
+  );
+
+  // Multi-step turn 1 on 1260 restores 1415 in Redux and keeps manual pin intact
+  storeState.trajectorySummaries.summaries['chat-step0-orch'] = {
+    cascadeId: 'chat-step0-orch',
+    stepCount: 8,
+    status: 'CASCADE_RUN_STATUS_IDLE',
+    latestExecutorTerminationReason: 'EXECUTOR_TERMINATION_REASON_NO_TOOL_CALL',
+    trajectoryMetadata: { projectId: '5a2a0f80-96c2-4334-a58d-7631310d4f72' },
+    annotations: { title: '[20:00] ⦿ Flight Deck check', archived: false },
+  };
+  reduxStore.dispatch({
+    type: 'modelSelection/trajectoryModelObserved',
+    payload: {
+      conversationId: 'chat-step0-orch',
+      turnKey: 'turn-bootstrap',
+      label: 'Gemini Pro Next',
+      model: 1260,
+      executionStartStep: 5,
+      queuedMessageIds: [],
+    },
+  });
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(
+    storeState.modelSelection.byConversation['chat-step0-orch'].model,
+    1415,
+    'Bootstrap turn observation must restore 1415 for turn 2+'
+  );
+
+  // Turn 2+ with initialized executor sends MODEL_PLACEHOLDER_M415 untouched
+  outgoingFetchCalls = [];
+  await global.window.fetch(
+    '/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        cascadeId: 'chat-step0-orch',
+        cascadeConfig: {
+          plannerConfig: {
+            planModel: 'MODEL_PLACEHOLDER_M415',
+          },
+        },
+      }),
+    }
+  );
+  assert.strictEqual(outgoingFetchCalls.length, 1);
+  assert.strictEqual(
+    outgoingFetchCalls[0].body.cascadeConfig.plannerConfig.planModel,
+    'MODEL_PLACEHOLDER_M415',
+    'Turn 2+ must allow MODEL_PLACEHOLDER_M415 through without rewriting'
+  );
+
+  // Previously crashed chat (stepCount > 0, IDLE status, no termination reason) gets step-0 bypass
+  storeState.trajectorySummaries.summaries['chat-crashed-step0'] = {
+    cascadeId: 'chat-crashed-step0',
+    stepCount: 2,
+    status: 'CASCADE_RUN_STATUS_IDLE',
+    trajectoryMetadata: { projectId: '5a2a0f80-96c2-4334-a58d-7631310d4f72' },
+    annotations: { title: '[20:01] ⦿ Crashed chat', archived: false },
+  };
+  outgoingFetchCalls = [];
+  await global.window.fetch(
+    '/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        cascadeId: 'chat-crashed-step0',
+        cascadeConfig: {
+          plannerConfig: {
+            planModel: 1415,
+          },
+        },
+      }),
+    }
+  );
+  assert.strictEqual(outgoingFetchCalls.length, 1);
+  assert.strictEqual(
+    outgoingFetchCalls[0].body.cascadeConfig.plannerConfig.planModel,
+    1260,
+    'Chat with only crashed constructExecutor steps must bypass 1415 to 1260'
+  );
+
+  // Unpinned step-0 bootstrap survives F5 reload when trajectoryModelObserved replays 1260
+  storeState.trajectorySummaries.summaries['chat-crashed-step0'].stepCount = 6;
+  storeState.trajectorySummaries.summaries['chat-crashed-step0'].latestExecutorTerminationReason =
+    'EXECUTOR_TERMINATION_REASON_NO_TOOL_CALL';
+  delete global.window.__jetskiManualPickedModels;
+  delete global.window.__jetskiStep0BootstrappedModels;
+  storeState.modelSelection.byConversation = {};
+  storeState.modelSelection.trajectorySync = {};
+  eval(code);
+  await new Promise((r) => setImmediate(r));
+  reduxStore.dispatch({
+    type: 'modelSelection/trajectoryModelObserved',
+    payload: {
+      conversationId: 'chat-crashed-step0',
+      turnKey: 'turn-reload-bootstrap',
+      label: 'Gemini Pro Next',
+      model: 1260,
+      executionStartStep: 3,
+      queuedMessageIds: [],
+    },
+  });
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(
+    storeState.modelSelection.byConversation['chat-crashed-step0'].model,
+    1415,
+    'Unpinned step-0 bootstrap must persist across F5 reload and restore 1415'
+  );
+
   // 10. Cleanup removes toast and clears state
   window.__jetskiClosedChatsFilterCleanup();
   assert.strictEqual(global.document.getElementById('jetski-model-autopilot-toast'), null);
