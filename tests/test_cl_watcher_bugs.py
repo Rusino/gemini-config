@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -905,6 +906,46 @@ assert(
         "chromium-review.googlesource.com",
         parsed_extra[0]["gerrit_cl_urls"]["8660604"],
     )
+
+  def test_flight_deck_amber_high_contrast(self) -> None:
+    html = w.DASHBOARD_HTML
+
+    def wcag_contrast(hex_a: str, hex_b: str) -> float:
+      weights = (0.2126, 0.7152, 0.0722)
+      lum_pair = [
+          sum(
+              w * (c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4)
+              for w, c in zip(weights, (int(hx[k : k + 2], 16) / 255.0 for k in (0, 2, 4)))
+          )
+          for hx in (hex_a.lstrip("#"), hex_b.lstrip("#"))
+      ]
+      return (max(lum_pair) + 0.05) / (min(lum_pair) + 0.05)
+
+    # Light mode :root must use burnt amber (#b45309, >= 4.5:1 on #f4f4f6 and #fbfbfd)
+    self.assertFalse(
+        "#ff9f0a" in html.lower(),
+        "Low-contrast #ff9f0a must not appear in DASHBOARD_HTML",
+    )
+    light_root = re.search(r":root\s*\{([^}]*)\}", html)
+    self.assertIsNotNone(light_root)
+    light_amber = re.search(r"--amber:\s*(#[0-9a-fA-F]{6});", light_root.group(1))
+    self.assertIsNotNone(light_amber)
+    light_hex = light_amber.group(1).lower()
+    self.assertEqual(light_hex, "#b45309")
+    self.assertGreaterEqual(wcag_contrast(light_hex, "#f4f4f6"), 4.5)
+    self.assertGreaterEqual(wcag_contrast(light_hex, "#fbfbfd"), 4.5)
+
+    # Dark mode @media (prefers-color-scheme: dark) :root must override --amber for dark cards
+    dark_root = re.search(
+        r"@media\s*\(prefers-color-scheme:\s*dark\)\s*\{\s*:root\s*\{([^}]*)\}",
+        html,
+    )
+    self.assertIsNotNone(dark_root)
+    dark_amber = re.search(r"--amber:\s*(#[0-9a-fA-F]{6});", dark_root.group(1))
+    self.assertIsNotNone(dark_amber)
+    dark_hex = dark_amber.group(1).lower()
+    self.assertEqual(dark_hex, "#fbbf24")
+    self.assertGreaterEqual(wcag_contrast(dark_hex, "#19191d"), 8.0)
 
 
 if __name__ == "__main__":

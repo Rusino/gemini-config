@@ -9173,6 +9173,99 @@ eval(code);
     )
     self.assertIn("ALL_LIVE_PROGRESS_BANNER_TESTS_PASSED", res.stdout)
 
+  def test_yellow_text_replaced_with_high_contrast_amber(self) -> None:
+    js_path = os.path.join(SCRIPTS_DIR, "jetski_closed_filter.js")
+    with open(js_path, encoding="utf-8") as f:
+      content = f.read()
+
+    def contrast_ratio(fg: str, bg: str) -> float:
+      lums = []
+      for col in (fg.lstrip("#"), bg.lstrip("#")):
+        r, g, b = (int(col[i : i + 2], 16) / 255.0 for i in (0, 2, 4))
+        lin = [v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4 for v in (r, g, b)]
+        lums.append(0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2])
+      return (max(lums) + 0.05) / (min(lums) + 0.05)
+
+    # Low-contrast yellows/pastels (1.2:1-2.1:1 on #f4f4f6) are unreadable on light gray surfaces
+    banned_low_contrast = (
+        "#fde047",
+        "#fdd663",
+        "#fbbf24",
+        "#fdba74",
+        "#fca5a5",
+        "#f59e0b",
+        "#fb923c",
+    )
+    for bad_hex in banned_low_contrast:
+      self.assertFalse(
+          bad_hex in content.lower(),
+          f"Low-contrast color {bad_hex} must not appear in jetski_closed_filter.js",
+      )
+
+    # Verify high-contrast burnt amber / terracotta / red text rules on #f4f4f6 (>= 4.4:1)
+    required_color_rules = [
+        (
+            r'\.\$\{TITLEBAR_CONTEXT_BADGE_CLASS\}\[data-level="soft"\]\s*\{[^}]*'
+            r"color:\s*(#[0-9a-fA-F]{6});",
+            "#b45309",
+            4.5,
+        ),
+        (
+            r'\.\$\{TITLEBAR_CONTEXT_BADGE_CLASS\}\[data-level="turn-start"\]\s*\{[^}]*'
+            r"color:\s*(#[0-9a-fA-F]{6});",
+            "#c2410c",
+            4.5,
+        ),
+        (
+            r'\.\$\{TITLEBAR_CONTEXT_BADGE_CLASS\}\[data-level="hard"\]\s*\{[^}]*'
+            r"color:\s*(#[0-9a-fA-F]{6});",
+            "#dc2626",
+            4.3,
+        ),
+        (
+            r'\.\$\{ROW_LIVE_BADGE_CLASS\}\[data-state="long-running"\]\s*\{[^}]*'
+            r"color:\s*(#[0-9a-fA-F]{6});",
+            "#b45309",
+            4.5,
+        ),
+        (
+            r'\.\$\{CHAIN_STAR_BTN_CLASS\}\[data-active="true"\]\s*\{[^}]*'
+            r"color:\s*(#[0-9a-fA-F]{6});",
+            "#b45309",
+            4.5,
+        ),
+        (
+            r'\.\$\{LIVE_BANNER_CLASS\}\[data-state="long-running"\]\s+\.jlpb-pill\s*\{[^}]*'
+            r"color:\s*(#[0-9a-fA-F]{6});",
+            "#b45309",
+            4.5,
+        ),
+        (
+            r"#jetski-closed-chats-filter-bubble\s+"
+            r'\.jcfb-inbox-tip-live\[data-long-running="true"\]'
+            r"\s*\{[^}]*color:\s*(#[0-9a-fA-F]{6});",
+            "#b45309",
+            4.5,
+        ),
+    ]
+    for pattern, expected_hex, min_ratio in required_color_rules:
+      match = re.search(pattern, content)
+      self.assertIsNotNone(match, f"Missing expected rule matching {pattern}")
+      actual_hex = match.group(1).lower()
+      self.assertEqual(actual_hex, expected_hex)
+      self.assertGreaterEqual(contrast_ratio(actual_hex, "#f4f4f6"), min_ratio)
+
+    for expected_snippet in (
+        '<span style="color:#b45309;font-weight:600;">Current piece</span>',
+        "soft: '#d97706'",
+        "'turn-start': '#c2410c'",
+        "hard: '#dc2626'",
+    ):
+      self.assertTrue(
+          expected_snippet in content,
+          f"Missing expected snippet in jetski_closed_filter.js: {expected_snippet}",
+      )
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -8681,7 +8681,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     --hairline: #e5e5ea;
     --blue: #0071e3;
     --green: #34c759;
-    --amber: #ff9f0a;
+    /* Burnt amber achieves >=4.5:1 WCAG contrast on light #fbfbfd and #f4f4f6 surfaces */
+    --amber: #b45309;
     --red: #ff3b30;
     --red-wash: #fff2f1;
     --shadow: 0 1px 2px rgba(0,0,0,.04), 0 8px 28px rgba(0,0,0,.06);
@@ -8699,6 +8700,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       --graphite: #8e8e93;
       --hairline: #2c2c2e;
       --blue: #2997ff;
+      --amber: #fbbf24;
       --red-wash: #2a0f0d;
       --shadow: 0 0 0 1px #1c1c1e;
     }

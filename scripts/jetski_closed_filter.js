@@ -4903,29 +4903,30 @@
         background: rgba(128, 134, 139, 0.22);
         color: var(--foreground, #e8eaed);
       }
+      /* Use burnt amber, terracotta, and crimson for >=4.4:1 contrast on #f4f4f6 surfaces */
       .${TITLEBAR_CONTEXT_BADGE_CLASS}[data-level="soft"] {
-        border-color: rgba(251, 191, 36, 0.45);
-        background: rgba(251, 191, 36, 0.13);
-        color: #fde047;
+        border-color: rgba(180, 83, 9, 0.45);
+        background: rgba(180, 83, 9, 0.12);
+        color: #b45309;
       }
       .${TITLEBAR_CONTEXT_BADGE_CLASS}[data-level="soft"]:hover {
-        background: rgba(251, 191, 36, 0.22);
+        background: rgba(180, 83, 9, 0.20);
       }
       .${TITLEBAR_CONTEXT_BADGE_CLASS}[data-level="turn-start"] {
-        border-color: rgba(251, 146, 60, 0.48);
-        background: rgba(251, 146, 60, 0.15);
-        color: #fdba74;
+        border-color: rgba(194, 65, 12, 0.48);
+        background: rgba(194, 65, 12, 0.14);
+        color: #c2410c;
       }
       .${TITLEBAR_CONTEXT_BADGE_CLASS}[data-level="turn-start"]:hover {
-        background: rgba(251, 146, 60, 0.24);
+        background: rgba(194, 65, 12, 0.22);
       }
       .${TITLEBAR_CONTEXT_BADGE_CLASS}[data-level="hard"] {
-        border-color: rgba(248, 113, 113, 0.5);
-        background: rgba(248, 113, 113, 0.16);
-        color: #fca5a5;
+        border-color: rgba(220, 38, 38, 0.45);
+        background: rgba(220, 38, 38, 0.14);
+        color: #dc2626;
       }
       .${TITLEBAR_CONTEXT_BADGE_CLASS}[data-level="hard"]:hover {
-        background: rgba(248, 113, 113, 0.26);
+        background: rgba(220, 38, 38, 0.22);
       }
       @keyframes jetski-locate-pulse {
         0% {
@@ -5139,9 +5140,9 @@
         user-select: none;
       }
       .${ROW_LIVE_BADGE_CLASS}[data-state="long-running"] {
-        border-color: rgba(253, 214, 99, 0.48);
-        background: rgba(253, 214, 99, 0.15);
-        color: #fdd663;
+        border-color: rgba(180, 83, 9, 0.45);
+        background: rgba(180, 83, 9, 0.13);
+        color: #b45309;
       }
       .${ROW_LIVE_BADGE_CLASS}[data-state="blocked"] {
         border-color: rgba(242, 139, 130, 0.52);
@@ -5150,7 +5151,7 @@
       }
       [data-testid="conversation-row-sidebar"][data-jetski-live-state="long-running"],
       div[data-sidebar-row-id][data-jetski-live-state="long-running"] {
-        background: rgba(253, 214, 99, 0.05);
+        background: rgba(180, 83, 9, 0.06);
       }
       [data-testid="conversation-row-sidebar"][data-jetski-live-state="blocked"],
       div[data-sidebar-row-id][data-jetski-live-state="blocked"] {
@@ -5377,13 +5378,13 @@
         outline: none;
       }
       .${CHAIN_STAR_BTN_CLASS}[data-active="true"] {
-        color: #f59e0b;
+        color: #b45309;
         font-size: 14px;
-        filter: drop-shadow(0 0 3px rgba(245, 158, 11, 0.6));
+        filter: drop-shadow(0 0 3px rgba(180, 83, 9, 0.45));
       }
       .${CHAIN_STAR_BTN_CLASS}:hover {
         transform: scale(1.25);
-        color: #fbbf24;
+        color: #d97706;
       }
       /* Chain star tooltip with progressive disclosure and prompt list */
       #${STAR_TOOLTIP_ID} {
@@ -5593,8 +5594,8 @@
         margin-bottom: 6px;
       }
       .${LIVE_BANNER_CLASS}[data-state="long-running"] {
-        background: rgba(253, 214, 99, 0.1);
-        border-color: rgba(253, 214, 99, 0.45);
+        background: rgba(180, 83, 9, 0.10);
+        border-color: rgba(180, 83, 9, 0.42);
       }
       .${LIVE_BANNER_CLASS}[data-state="blocked"] {
         background: rgba(242, 139, 130, 0.12);
@@ -5621,8 +5622,8 @@
         flex-shrink: 0;
       }
       .${LIVE_BANNER_CLASS}[data-state="long-running"] .jlpb-pill {
-        background: rgba(253, 214, 99, 0.18);
-        color: #fdd663;
+        background: rgba(180, 83, 9, 0.16);
+        color: #b45309;
       }
       .${LIVE_BANNER_CLASS}[data-state="blocked"] .jlpb-pill {
         background: rgba(242, 139, 130, 0.2);
@@ -5783,7 +5784,7 @@
       }
       .${TOP_NAV_TOGGLE_BTN_CLASS}[data-status="warning"] .${TOP_NAV_STATUS_DOT_CLASS} {
         display: block;
-        background: #fbbf24;
+        background: #d97706;
       }
       /* Flight Deck side panel toggle button */
       .${FLIGHT_DECK_TOGGLE_BTN_CLASS} {
@@ -6155,11 +6156,11 @@
         background: rgba(248, 113, 113, 0.10);
       }
       .${INBOX_ROW_CLASS}[data-long-running="true"] {
-        box-shadow: inset 2px 0 0 #fdd663;
-        background: rgba(253, 214, 99, 0.04);
+        box-shadow: inset 2px 0 0 #d97706;
+        background: rgba(180, 83, 9, 0.05);
       }
       .${INBOX_ROW_CLASS}[data-long-running="true"]:hover {
-        background: rgba(253, 214, 99, 0.10);
+        background: rgba(180, 83, 9, 0.10);
       }
       .${INBOX_ROW_CLASS} .jetski-inbox-row-main {
         display: flex;
@@ -6233,7 +6234,7 @@
         word-break: break-word;
       }
       #jetski-closed-chats-filter-bubble .jcfb-inbox-tip-live[data-long-running="true"] {
-        color: #fdd663;
+        color: #b45309;
         font-weight: 500;
       }
       .${INBOX_ROW_CLASS} .jetski-inbox-time {
@@ -8175,8 +8176,9 @@
     const store = findReduxStore();
     const summaryObj = store?.getState()?.trajectorySummaries?.summaries?.[pieceCid] || {};
     const title = summaryObj.summary || pieceCid.slice(0, 12);
+    // Burnt amber avoids unreadable pastel yellow on light frosted-glass tooltips
     const statusLabel = isCurrent
-      ? '<span style="color:#fbbf24;font-weight:600;">Current piece</span>'
+      ? '<span style="color:#b45309;font-weight:600;">Current piece</span>'
       : (isTail
           ? '<span style="color:#8ab4f8;font-weight:600;">Active tail</span>'
           : '<span style="color:#9aa0a6;">Chain archive</span>');
@@ -10891,9 +10893,9 @@
   function buildContextBubbleHtml(info, cascadeId) {
     const dotColors = {
       ok: '#8ab4f8',
-      soft: '#fbbf24',
-      'turn-start': '#fb923c',
-      hard: '#f87171',
+      soft: '#d97706',
+      'turn-start': '#c2410c',
+      hard: '#dc2626',
     };
     const dotColor = dotColors[info.level] || '#8ab4f8';
     const compactTag = info.compacted ? ` · Compacted #${info.ckpt + 1}` : '';
