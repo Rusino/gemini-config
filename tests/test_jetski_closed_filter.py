@@ -9266,6 +9266,300 @@ eval(code);
           f"Missing expected snippet in jetski_closed_filter.js: {expected_snippet}",
       )
 
+  def test_sidepanelv2_and_artifact_sidebar_closed(self) -> None:
+    node_bin = find_node_binary()
+    js_path = os.path.join(SCRIPTS_DIR, "jetski_closed_filter.js")
+
+    harness = r"""
+const fs = require('fs');
+const assert = require('assert');
+
+const scriptPath = process.argv[1];
+const code = fs.readFileSync(scriptPath, 'utf8');
+
+class FakeElement {
+  constructor(tagName) {
+    this.tagName = tagName.toUpperCase();
+    this.id = '';
+    this.className = '';
+    this.style = {};
+    this.attributes = new Map();
+    this.children = [];
+    this.parentElement = null;
+    this.listeners = new Map();
+    this._textContent = '';
+    this._innerHTML = '';
+  }
+  get textContent() { return this._textContent; }
+  set textContent(v) { this._textContent = String(v); }
+  get innerHTML() { return this._innerHTML; }
+  set innerHTML(v) { this._innerHTML = String(v); }
+  setAttribute(k, v) {
+    this.attributes.set(k, String(v));
+    if (k === 'id') this.id = String(v);
+    if (k === 'class') this.className = String(v);
+  }
+  getAttribute(k) { return this.attributes.has(k) ? this.attributes.get(k) : null; }
+  hasAttribute(k) { return this.attributes.has(k); }
+  removeAttribute(k) { this.attributes.delete(k); }
+  appendChild(c) { c.parentElement = this; this.children.push(c); return c; }
+  insertBefore(c, ref) { c.parentElement = this; this.children.push(c); return c; }
+  remove() {
+    if (!this.parentElement) return;
+    const i = this.parentElement.children.indexOf(this);
+    if (i !== -1) this.parentElement.children.splice(i, 1);
+    this.parentElement = null;
+  }
+  addEventListener(t, fn) {
+    if (!this.listeners.has(t)) this.listeners.set(t, []);
+    this.listeners.get(t).push(fn);
+  }
+  closest() { return null; }
+  querySelector(s) { return this.querySelectorAll(s)[0] || null; }
+  querySelectorAll(s) {
+    const out = [];
+    const visit = (n) => {
+      for (const c of n.children) {
+        if (s.startsWith('#') && c.id === s.slice(1)) {
+          out.push(c);
+        } else if (s === 'button[aria-label="Display Options"]' &&
+                   c.tagName === 'BUTTON' &&
+                   c.getAttribute('aria-label') === 'Display Options') {
+          out.push(c);
+        } else if (s === '[data-testid="titlebar-more-actions"]' &&
+                   c.getAttribute('data-testid') === 'titlebar-more-actions') {
+          out.push(c);
+        }
+        visit(c);
+      }
+    };
+    visit(this);
+    return out;
+  }
+}
+
+const docEl = new FakeElement('html');
+const headEl = new FakeElement('head');
+const bodyEl = new FakeElement('body');
+docEl.appendChild(headEl);
+docEl.appendChild(bodyEl);
+const actionRow = new FakeElement('div');
+const anchorBtn = new FakeElement('button');
+anchorBtn.setAttribute('data-testid', 'titlebar-more-actions');
+const displayOptionsBtn = new FakeElement('button');
+displayOptionsBtn.setAttribute('aria-label', 'Display Options');
+actionRow.appendChild(anchorBtn);
+actionRow.appendChild(displayOptionsBtn);
+bodyEl.appendChild(actionRow);
+
+const dispatchedActions = [];
+const storeState = {
+  trajectorySummaries: { summaries: {} },
+  sidePanelV2: {
+    overviewPanelOpen: {
+      'chat-stale-open': true,
+    },
+    conversationPanes: {
+      'chat-1': {
+        sidebarOpenByType: {
+          artifactView: true,
+          fileView: true,
+          terminalView: true,
+        },
+      },
+      'chat-2': {
+        sidebarOpenByType: {
+          fileView: true,
+        },
+      },
+    },
+    newConversationPanes: {
+      'proj-alpha': {
+        sidebarOpenByType: {
+          artifactView: true,
+        },
+      },
+    },
+    customViewPanes: {
+      'custom-view-1': {
+        sidebarOpenByType: {
+          artifactView: true,
+        },
+      },
+    },
+    homePane: {
+      sidebarOpenByType: {
+        artifactView: true,
+      },
+    },
+  },
+  conversation: {
+    cascadeId: 'active-convo',
+  },
+};
+
+const subscribers = [];
+const reduxStore = {
+  getState() { return storeState; },
+  dispatch(action) {
+    dispatchedActions.push(action);
+    if (action?.type === 'sidePanelV2/setOverviewPanelOpen') {
+      const { cascadeId, open } = action.payload || {};
+      if (cascadeId) {
+        storeState.sidePanelV2.overviewPanelOpen[cascadeId] = open;
+      }
+    }
+    if (action?.type === 'sidePanelV2/setSidebarOpen') {
+      const { treeId, mode, open } = action.payload || {};
+      if (treeId?.kind === 'cascadeId') {
+        const pane = storeState.sidePanelV2.conversationPanes[treeId.cascadeId] ??= {};
+        (pane.sidebarOpenByType ??= {})[mode] = open;
+      } else if (treeId?.kind === 'newConversation') {
+        const pane = storeState.sidePanelV2.newConversationPanes[treeId.projectId] ??= {};
+        (pane.sidebarOpenByType ??= {})[mode] = open;
+      } else if (treeId?.kind === 'customView') {
+        const pane = storeState.sidePanelV2.customViewPanes[treeId.viewId] ??= {};
+        (pane.sidebarOpenByType ??= {})[mode] = open;
+      } else if (treeId?.kind === 'home') {
+        const pane = storeState.sidePanelV2.homePane ??= {};
+        (pane.sidebarOpenByType ??= {})[mode] = open;
+      }
+    }
+    return action;
+  },
+  subscribe(fn) {
+    subscribers.push(fn);
+    return () => {};
+  },
+};
+displayOptionsBtn.__reactFiber$test = { memoizedProps: { store: reduxStore } };
+
+global.window = {
+  innerWidth: 1280,
+  location: { pathname: '/c/active-convo', search: '' },
+  __APP_CONFIG__: { csrfToken: 'test-csrf' },
+  localStorage: { getItem: () => null, setItem: () => {} },
+  fetch: async () => ({ ok: false, status: 404 }),
+};
+global.document = {
+  documentElement: docEl,
+  head: headEl,
+  body: bodyEl,
+  getElementById(id) { return docEl.querySelector(`#${id}`); },
+  createElement(t) { return new FakeElement(t); },
+  querySelector(s) { return docEl.querySelector(s); },
+  querySelectorAll(s) { return docEl.querySelectorAll(s); },
+  addEventListener() {},
+  removeEventListener() {},
+};
+global.MutationObserver = class { observe() {} disconnect() {} };
+global.requestAnimationFrame = () => 1;
+
+(async () => {
+  eval(code);
+  await new Promise((r) => setImmediate(r));
+
+  // Verify sidePanelV2 overviewPanelOpen is closed for both stale and active conversations
+  assert.strictEqual(
+    storeState.sidePanelV2.overviewPanelOpen['chat-stale-open'],
+    false,
+    'Stale open overview panel must be set to false in sidePanelV2'
+  );
+  assert.strictEqual(
+    storeState.sidePanelV2.overviewPanelOpen['active-convo'],
+    false,
+    'Active conversation overview panel must be set to false in sidePanelV2'
+  );
+
+  // Verify artifactView sidebar is closed for active conversation and panes with explicit open
+  assert.strictEqual(
+    storeState.sidePanelV2.conversationPanes['chat-1']?.sidebarOpenByType?.artifactView,
+    false,
+    'chat-1 artifactView sidebar must be set to false'
+  );
+  assert.strictEqual(
+    storeState.sidePanelV2.conversationPanes['active-convo']?.sidebarOpenByType?.artifactView,
+    false,
+    'active-convo artifactView sidebar must be set to false'
+  );
+  assert.strictEqual(
+    storeState.sidePanelV2.newConversationPanes['proj-alpha']?.sidebarOpenByType?.artifactView,
+    false,
+    'newConversation artifactView sidebar must be set to false'
+  );
+  assert.strictEqual(
+    storeState.sidePanelV2.customViewPanes['custom-view-1']?.sidebarOpenByType?.artifactView,
+    false,
+    'customView artifactView sidebar must be set to false'
+  );
+  assert.strictEqual(
+    storeState.sidePanelV2.homePane?.sidebarOpenByType?.artifactView,
+    false,
+    'homePane artifactView sidebar must be set to false'
+  );
+
+  // Invariants: fileView and terminalView MUST NOT be touched
+  assert.strictEqual(
+    storeState.sidePanelV2.conversationPanes['chat-1']?.sidebarOpenByType?.fileView,
+    true,
+    'fileView must remain untouched'
+  );
+  assert.strictEqual(
+    storeState.sidePanelV2.conversationPanes['chat-1']?.sidebarOpenByType?.terminalView,
+    true,
+    'terminalView must remain untouched'
+  );
+
+  // Check CSS fallback rules injected into the document
+  const injectedStyle = global.document.getElementById('jetski-closed-chats-filter-style');
+  assert(injectedStyle, 'Filter style element must exist');
+  assert(
+    injectedStyle.textContent.includes('artifact-row'),
+    'Style must contain targeted CSS fallback for artifact-row'
+  );
+
+  // Verify UI or shortcut attempts to open Overview Panel or artifactView sidebar are rewritten
+  reduxStore.dispatch({
+    type: 'sidePanelV2/setOverviewPanelOpen',
+    payload: { cascadeId: 'active-convo', open: true },
+  });
+  assert.strictEqual(
+    storeState.sidePanelV2.overviewPanelOpen['active-convo'],
+    false,
+    'Attempt to open overview panel must be rewritten to open: false'
+  );
+
+  reduxStore.dispatch({
+    type: 'sidePanelV2/setSidebarOpen',
+    payload: {
+      treeId: { kind: 'cascadeId', cascadeId: 'active-convo' },
+      mode: 'artifactView',
+      open: true,
+    },
+  });
+  assert.strictEqual(
+    storeState.sidePanelV2.conversationPanes['active-convo']?.sidebarOpenByType?.artifactView,
+    false,
+    'Attempt to open artifactView sidebar must be rewritten to open: false'
+  );
+
+  process.stdout.write('SIDEPANELV2_ARTIFACT_SIDEBAR_PASSED\n');
+})();
+"""
+
+    res = subprocess.run(
+        [node_bin, "-e", harness, js_path],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(
+        res.returncode,
+        0,
+        f"SidePanelV2 artifact sidebar harness failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+    )
+    self.assertIn("SIDEPANELV2_ARTIFACT_SIDEBAR_PASSED", res.stdout)
+
 
 if __name__ == "__main__":
   unittest.main()

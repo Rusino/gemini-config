@@ -327,9 +327,11 @@
   // Tracks conversations whose hideFromConversationList flag we flipped in Redux
   // so we never unhide conversations that were natively hidden by their source
   const managedHiddenIds = new Map();
-  // Tracks cascadeIds where auxPaneV2/setOverviewPanelOpen was dispatched so stores
-  // without the auxPaneV2 reducer never re-dispatch in a loop
+  // Tracks dispatched keys where setOverviewPanelOpen was dispatched so stores
+  // without the reducer never re-dispatch in a loop
   const overviewCloseDispatchedIds = new Set();
+  // Tracks dispatched keys for setSidebarOpen artifactView=false to prevent re-dispatch loops
+  const artifactSidebarCloseDispatchedKeys = new Set();
   let hiddenCountsByProject = new Map();
   let totalHiddenCount = 0;
   let breakdownStats = emptyBreakdown();
@@ -4430,7 +4432,8 @@
       }
       // Rewrite any open request so keyboard shortcuts or UI triggers cannot open the panel
       if (
-        action?.type === 'auxPaneV2/setOverviewPanelOpen' &&
+        (action?.type === 'auxPaneV2/setOverviewPanelOpen' ||
+          action?.type === 'sidePanelV2/setOverviewPanelOpen') &&
         action.payload?.open !== false
       ) {
         return origDispatch.call(this, {
@@ -4441,24 +4444,89 @@
           },
         });
       }
-      // Sanitize hydrated session storage so persisted open flags never restore the panel
+      // Keep in-tab Artifacts sidebar closed so documents and previews get full width
       if (
-        action?.type === 'auxPaneV2/restorePersistedPanes' &&
-        action.payload?.overviewPanelOpen &&
-        typeof action.payload.overviewPanelOpen === 'object'
+        (action?.type === 'auxPaneV2/setSidebarOpen' ||
+          action?.type === 'sidePanelV2/setSidebarOpen') &&
+        action.payload?.mode === 'artifactView' &&
+        action.payload?.open !== false
       ) {
-        const closedMap = {};
-        // Force every persisted conversation entry to false before the reducer merges it
-        for (const k of Object.keys(action.payload.overviewPanelOpen)) {
-          closedMap[k] = false;
-        }
         return origDispatch.call(this, {
           ...action,
           payload: {
             ...action.payload,
-            overviewPanelOpen: closedMap,
+            open: false,
           },
         });
+      }
+      // Sanitize hydrated session storage so persisted open flags never restore the panels
+      if (
+        (action?.type === 'auxPaneV2/restorePersistedPanes' ||
+          action?.type === 'sidePanelV2/restorePersistedPanes') &&
+        action.payload &&
+        typeof action.payload === 'object'
+      ) {
+        let rewrittenPayload = action.payload;
+        if (
+          action.payload.overviewPanelOpen &&
+          typeof action.payload.overviewPanelOpen === 'object'
+        ) {
+          const closedMap = {};
+          // Force every persisted conversation entry to false before the reducer merges it
+          for (const k of Object.keys(action.payload.overviewPanelOpen)) {
+            closedMap[k] = false;
+          }
+          rewrittenPayload = { ...rewrittenPayload, overviewPanelOpen: closedMap };
+        }
+        const sanitizePanes = (panes) => {
+          if (!panes || typeof panes !== 'object') return panes;
+          const next = {};
+          for (const [id, pane] of Object.entries(panes)) {
+            if (pane?.sidebarOpenByType?.artifactView) {
+              next[id] = {
+                ...pane,
+                sidebarOpenByType: {
+                  ...pane.sidebarOpenByType,
+                  artifactView: false,
+                },
+              };
+            } else {
+              next[id] = pane;
+            }
+          }
+          return next;
+        };
+        const nextConvoPanes = sanitizePanes(rewrittenPayload.conversationPanes);
+        const nextNewConvoPanes = sanitizePanes(rewrittenPayload.newConversationPanes);
+        const nextCustomPanes = sanitizePanes(rewrittenPayload.customViewPanes);
+        let nextHomePane = rewrittenPayload.homePane;
+        if (nextHomePane?.sidebarOpenByType?.artifactView) {
+          nextHomePane = {
+            ...nextHomePane,
+            sidebarOpenByType: {
+              ...nextHomePane.sidebarOpenByType,
+              artifactView: false,
+            },
+          };
+        }
+        if (
+          nextConvoPanes !== rewrittenPayload.conversationPanes ||
+          nextNewConvoPanes !== rewrittenPayload.newConversationPanes ||
+          nextCustomPanes !== rewrittenPayload.customViewPanes ||
+          nextHomePane !== rewrittenPayload.homePane ||
+          rewrittenPayload !== action.payload
+        ) {
+          return origDispatch.call(this, {
+            ...action,
+            payload: {
+              ...rewrittenPayload,
+              conversationPanes: nextConvoPanes,
+              newConversationPanes: nextNewConvoPanes,
+              customViewPanes: nextCustomPanes,
+              homePane: nextHomePane,
+            },
+          });
+        }
       }
       if (
         !isInternalDispatch &&
@@ -4515,26 +4583,22 @@
         scheduleSync();
       }
     });
+    // Keep Overview Panel and Artifacts sidebar closed immediately upon store attachment
+    syncOverviewPanelClosed(store);
     // Populate unlocked hidden models as soon as the Redux store is attached
     void syncHiddenModelsInStore(store);
   }
 
-  // Forces the floating Overview Panel closed in Redux for all active conversations
+  // Forces floating Overview Panel and in-tab Artifacts sidebar closed in Redux
   function syncOverviewPanelClosed(store) {
     const state = store?.getState();
-    // Skip stores that have not initialized the auxPaneV2 slice
-    if (!state?.auxPaneV2) return;
+    if (!state) return;
 
-    const openMap = state.auxPaneV2.overviewPanelOpen || {};
-    const targetIds = new Set();
-
-    // Queue any conversation that already has an explicit open flag in Redux
-    for (const [cid, isOpen] of Object.entries(openMap)) {
-      // Unset or true entries default to open in useOverviewPanelOpen
-      if (isOpen !== false) {
-        targetIds.add(cid);
-      }
-    }
+    // Detect all present side panel slice variants (sidePanelV2 or legacy auxPaneV2)
+    const panelSlices = ['sidePanelV2', 'auxPaneV2'].filter(
+      (k) => state[k] && typeof state[k] === 'object'
+    );
+    if (panelSlices.length === 0) return;
 
     const activeCandidates = [
       state.conversation?.cascadeId,
@@ -4555,30 +4619,127 @@
       // Only add resolved non-empty conversation IDs
       if (cid) activeCandidates.push(cid);
     }
+    const validActiveIds = activeCandidates.filter(
+      (cid) => typeof cid === 'string' && cid.length > 0
+    );
 
-    // useOverviewPanelOpen defaults missing map keys to true, so explicitly write false
-    for (const cid of activeCandidates) {
-      // Skip conversations already recorded as false in overviewPanelOpen
-      if (typeof cid === 'string' && cid.length > 0 && openMap[cid] !== false) {
-        // Avoid infinite dispatch loops on mock stores without an auxPaneV2 reducer
-        if (!overviewCloseDispatchedIds.has(cid) || openMap[cid] === true) {
-          targetIds.add(cid);
+    const dispatches = [];
+
+    for (const sliceName of panelSlices) {
+      const sliceState = state[sliceName];
+      const openMap = sliceState.overviewPanelOpen || {};
+
+      // Queue any conversation that already has an explicit open flag in Redux
+      for (const [cid, isOpen] of Object.entries(openMap)) {
+        if (isOpen !== false) {
+          const dispatchKey = `${sliceName}:${cid}`;
+          if (!overviewCloseDispatchedIds.has(dispatchKey) || isOpen === true) {
+            overviewCloseDispatchedIds.add(dispatchKey);
+            dispatches.push({
+              type: `${sliceName}/setOverviewPanelOpen`,
+              payload: { cascadeId: cid, open: false },
+            });
+          }
+        }
+      }
+
+      // useOverviewPanelOpen defaults missing map keys to true, so explicitly write false
+      for (const cid of validActiveIds) {
+        if (openMap[cid] !== false) {
+          const dispatchKey = `${sliceName}:${cid}`;
+          if (!overviewCloseDispatchedIds.has(dispatchKey) || openMap[cid] === true) {
+            overviewCloseDispatchedIds.add(dispatchKey);
+            dispatches.push({
+              type: `${sliceName}/setOverviewPanelOpen`,
+              payload: { cascadeId: cid, open: false },
+            });
+          }
+        }
+      }
+
+      // Automatically close in-tab artifactView sidebars so documents get full width
+      const allConversationIds = new Set([
+        ...validActiveIds,
+        ...Object.keys(sliceState.conversationPanes || {}),
+      ]);
+      for (const cid of allConversationIds) {
+        const pane = sliceState.conversationPanes?.[cid];
+        const explicit = pane?.sidebarOpenByType?.artifactView;
+        if (explicit !== false) {
+          const key = `${sliceName}:cascadeId:${cid}`;
+          if (!artifactSidebarCloseDispatchedKeys.has(key) || explicit === true) {
+            artifactSidebarCloseDispatchedKeys.add(key);
+            dispatches.push({
+              type: `${sliceName}/setSidebarOpen`,
+              payload: {
+                treeId: { kind: 'cascadeId', cascadeId: cid },
+                mode: 'artifactView',
+                open: false,
+              },
+            });
+          }
+        }
+      }
+
+      for (const [pid, pane] of Object.entries(sliceState.newConversationPanes || {})) {
+        const explicit = pane?.sidebarOpenByType?.artifactView;
+        if (explicit !== false) {
+          const key = `${sliceName}:newConversation:${pid}`;
+          if (!artifactSidebarCloseDispatchedKeys.has(key) || explicit === true) {
+            artifactSidebarCloseDispatchedKeys.add(key);
+            dispatches.push({
+              type: `${sliceName}/setSidebarOpen`,
+              payload: {
+                treeId: { kind: 'newConversation', projectId: pid },
+                mode: 'artifactView',
+                open: false,
+              },
+            });
+          }
+        }
+      }
+
+      for (const [vid, pane] of Object.entries(sliceState.customViewPanes || {})) {
+        const explicit = pane?.sidebarOpenByType?.artifactView;
+        if (explicit !== false) {
+          const key = `${sliceName}:customView:${vid}`;
+          if (!artifactSidebarCloseDispatchedKeys.has(key) || explicit === true) {
+            artifactSidebarCloseDispatchedKeys.add(key);
+            dispatches.push({
+              type: `${sliceName}/setSidebarOpen`,
+              payload: {
+                treeId: { kind: 'customView', viewId: vid },
+                mode: 'artifactView',
+                open: false,
+              },
+            });
+          }
+        }
+      }
+
+      if (sliceState.homePane && sliceState.homePane.sidebarOpenByType?.artifactView !== false) {
+        const key = `${sliceName}:home`;
+        const explicit = sliceState.homePane.sidebarOpenByType?.artifactView;
+        if (!artifactSidebarCloseDispatchedKeys.has(key) || explicit === true) {
+          artifactSidebarCloseDispatchedKeys.add(key);
+          dispatches.push({
+            type: `${sliceName}/setSidebarOpen`,
+            payload: {
+              treeId: { kind: 'home' },
+              mode: 'artifactView',
+              open: false,
+            },
+          });
         }
       }
     }
 
-    // Nothing to dispatch when all active conversations are already marked closed
-    if (targetIds.size === 0) return;
+    if (dispatches.length === 0) return;
 
     isInternalDispatch = true;
     try {
-      // Dispatch explicit false per conversation so OverviewPanelHost unmounts the panel
-      for (const cid of targetIds) {
-        overviewCloseDispatchedIds.add(cid);
-        store.dispatch({
-          type: 'auxPaneV2/setOverviewPanelOpen',
-          payload: { cascadeId: cid, open: false },
-        });
+      for (const action of dispatches) {
+        store.dispatch(action);
       }
     } finally {
       isInternalDispatch = false;
@@ -4967,7 +5128,9 @@
       [data-testid="overview-panel-overlay-backdrop"],
       [data-testid="overview-panel-dropdown-popover"],
       [data-testid="battle-overview-dropdown"],
-      [data-testid="toggle-overview-panel"] {
+      [data-testid="toggle-overview-panel"],
+      [data-testid="in-tab-sidebar-overlay"]:has([data-testid="artifact-row"]),
+      .browser-hole-opaque:has([data-testid="artifact-row"]) {
         display: none !important;
       }
       [data-testid="overview-panel-host"] {
