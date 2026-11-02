@@ -843,6 +843,8 @@ def analyze_current_turn(transcript_path: str) -> dict:
   set_title_succeeded = False
   # The decision guard checks the final reply against contract triage made after this user turn
   last_planner_text = ""
+  # Track latest wakeup index so parallel-subagent question blocks key per wakeup
+  last_wakeup_idx = -1
 
   for idx in ordered_indices:
     if idx <= last_user_idx:
@@ -850,8 +852,13 @@ def analyze_current_turn(transcript_path: str) -> dict:
     step = steps_by_idx[idx]
     stype = step.get("type", "")
     tool_calls = step.get("tool_calls") or []
-    if stype == "PLANNER_RESPONSE" and str(step.get("content", "")).strip():
-      last_planner_text = str(step.get("content", ""))
+    # Scope asked_question to the latest non-empty planner step so answered calls do not leak
+    if stype == "PLANNER_RESPONSE":
+      step_text = str(step.get("content", ""))
+      if step_text.strip():
+        last_planner_text = step_text
+      if step_text.strip() or tool_calls:
+        asked_question = any(tc.get("name") == "ask_question" for tc in tool_calls)
 
     if stype == "PLANNER_RESPONSE" and tool_calls:
       pending_cmds.clear()
@@ -953,6 +960,8 @@ def analyze_current_turn(transcript_path: str) -> dict:
 
     # Keep cron chats marked as scheduled across recurring wakeup ticks
     elif stype == "SYSTEM_MESSAGE":
+      # Key parallel-subagent question blocks per wakeup so each wakeup gets one guard check
+      last_wakeup_idx = idx
       # Inspect system message body for timer recurrence or background completion
       content = str(step.get("content", ""))
       if CRON_WAKEUP_RE.search(content):
@@ -1013,7 +1022,127 @@ def analyze_current_turn(transcript_path: str) -> dict:
       "set_title_succeeded": set_title_succeeded,
       "last_user_ts": last_user_ts,
       "last_planner_text": last_planner_text,
+      # Expose wakeup boundary to parallel-subagent question guard
+      "last_wakeup_idx": last_wakeup_idx,
   }
+
+
+# Patterns used to detect plain-text user choice or parallel-subagent questions at turn end
+FENCED_CODE_RE = re.compile(r"```[\s\S]*?```")
+OPTION_LINE_RE = re.compile(
+    r"^(?:[-*]\s+)?(?:\*\*|__)?(?:"
+    r"[1-9][.)]|[a-dA-D][.)]|вариант\s+\d+|option\s+\d+|\(?recommended\)?"
+    r")\b",
+    re.IGNORECASE,
+)
+BULLET_LINE_RE = re.compile(r"^(?:[-*•]|[1-9][.)]|[a-dA-D][.)])\s+\S")
+OPEN_ENDED_PASTE_RE = re.compile(
+    r"\b(?:пришли\w*|скинь\w*|подскажи\w*|укажи\w*|вставь\w*"
+    r"|paste|provide\s+the|send\s+the|share\s+the)\b"
+    r".*?\b(?:url|ссылк\w*|пут[ьи]|названи\w*|имя|id|лог|стек)\b",
+    re.IGNORECASE,
+)
+CHOICE_OR_CONFIRM_TAIL_RE = re.compile(
+    r"(?:"
+    r"\b(?:какой|какую|какое|какие)\s+(?:вариант\w*|опци\w*|подход\w*|путь|из\b)"
+    r"|\bчто\s+(?:выбираеш\w*|предпочитаеш\w*|берём|берем|делаем)\b"
+    r"|\bхочешь\b|\bсдела(?:ть|ю|ем)\b|\bделаем\b"
+    r"|\bзапуска(?:ть|ем)\b|\bзапуст(?:ить|им)\b|\bзапущу\b"
+    r"|\bоткр(?:ыть|ою|оем|ываем)\b|\bначин(?:ать|аем)\b|\bначн(?:у|ём|ем)\b"
+    r"|\bпродолж(?:ать|у|им|аем)\b|\bберём\b|\bберем\b"
+    r"|\bоставля(?:ть|ем)\b|\bостав(?:ить|лю|им)\b"
+    r"|\bпримен(?:ять|ить|ю|им)\b|\bкоммит(?:ить|им)\b|\bпуш(?:ить|им)\b"
+    r"|\bправ(?:ить|лю|им)\b|\bчин(?:ить|ю|им)\b|\bсогласна\b"
+    r"|\b(?:ок|ok)\s*[?？]|\bли\b"
+    r"|\bили\b"
+    r"|\bwhich\s+(?:option|approach|variant|one)\b"
+    r"|\b(?:should|shall)\s+(?:i|we)\b"
+    r"|\bwould\s+you\s+like\b|\bdo\s+you\s+want\b"
+    r"|\bproceed\b|\bgo\s+ahead\b|\bready\s+to\b"
+    r"|\bor\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+# Strips fenced code blocks and returns non-empty prose lines
+def _non_code_lines(text: str) -> list[str]:
+  if not text:
+    return []
+  stripped = FENCED_CODE_RE.sub("", text)
+  return [ln.strip() for ln in stripped.splitlines() if ln.strip()]
+
+
+# Returns True when a prose line ends with a question mark rather than a bare URL
+def _line_is_question(line: str) -> bool:
+  tail = line.rstrip("*_\"'`»)] ")
+  if not tail or tail.startswith(("http://", "https://")):
+    return False
+  return tail.endswith("?") or tail.endswith("？")
+
+
+# Extracts (question_line, option_count) when a turn ends with a question or question+options
+def _extract_trailing_question(text: str) -> tuple[str, int]:
+  lines = _non_code_lines(text)
+  if not lines:
+    return "", 0
+  opt_count = sum(1 for ln in lines if OPTION_LINE_RE.match(ln))
+  if _line_is_question(lines[-1]):
+    return lines[-1], opt_count
+  # Catch questions placed immediately above a trailing >=2-item bullet or numbered list
+  idx = len(lines) - 1
+  while idx >= 0 and BULLET_LINE_RE.match(lines[idx]):
+    idx -= 1
+  trailing_bullets = len(lines) - 1 - idx
+  if trailing_bullets >= 2 and idx >= 0 and _line_is_question(lines[idx]):
+    return lines[idx], max(opt_count, trailing_bullets)
+  return "", 0
+
+
+# Blocks plain-text questions while background work keeps the chat hidden in Working
+def parallel_subagent_question_reason(info: dict) -> str:
+  if (
+      info.get("asked_question")
+      or info.get("scheduled_timer")
+      or info.get("launched_new_conv")
+  ):
+    return ""
+  q_line, _ = _extract_trailing_question(str(info.get("last_planner_text") or ""))
+  if not q_line:
+    return ""
+  return (
+      "[PARALLEL SUBAGENT QUESTION GUARD] Background work is still running "
+      "(`fullyIdle=false`), so this conversation remains in `Working` and will NOT "
+      "surface in `Needs Me`, yet your message ends with a plain-text question to "
+      "the user. Do not ask parallel plain-text questions while subagents or "
+      "background commands are running: either wait silently for the background "
+      "work to finish and ask together with its results, or if you need the user's "
+      "decision right now, call the `ask_question` tool."
+  )
+
+
+# Requires ask_question for end-of-turn choices and action confirmations
+def ask_question_guard_reason(info: dict) -> str:
+  if info.get("asked_question") or info.get("launched_new_conv"):
+    return ""
+  q_line, option_count = _extract_trailing_question(
+      str(info.get("last_planner_text") or "")
+  )
+  if not q_line:
+    return ""
+  # Without >=2 explicit options, exempt open-ended URL/path paste requests
+  if option_count < 2:
+    if OPEN_ENDED_PASTE_RE.search(q_line):
+      return ""
+    if not CHOICE_OR_CONFIRM_TAIL_RE.search(q_line):
+      return ""
+  return (
+      "[ASK_QUESTION GUARD] Your response ends with a choice or confirmation "
+      "question in plain text without calling `ask_question`. Plain-text questions "
+      "leave the conversation unblocked (`DONE` instead of `WAITING` / urgent `🔥` "
+      "in `Needs Me`). Call the `ask_question` tool with concrete options (placing "
+      "`(Recommended) ...` first) instead of asking in plain text."
+  )
 
 
 AUTO_SHIP_OPTOUT_RE = re.compile(
@@ -1228,6 +1357,18 @@ def main() -> None:
           save_state(state_path, state)
       except Exception:
         pass
+    # Catch plain-text user questions while background subagents/tasks keep fullyIdle=false
+    pq_reason = parallel_subagent_question_reason(info)
+    pq_key = f"{info.get('last_user_idx', -1)}:{info.get('last_wakeup_idx', -1)}"
+    if pq_reason and state.get("parallel_q_blocked_key") != pq_key:
+      state["parallel_q_blocked_key"] = pq_key
+      save_state(state_path, state)
+      print(
+          json.dumps(
+              {"decision": "continue", "reason": pq_reason}, ensure_ascii=False
+          )
+      )
+      return
     print("{}")
     return
 
@@ -1360,6 +1501,21 @@ def main() -> None:
           )
       )
       return
+
+  # Check plain-text choice/confirmation questions before auto-ship so unconfirmed edits wait
+  aq_reason = ask_question_guard_reason(info)
+  if (
+      aq_reason
+      and state.get("ask_question_blocked_turn") != info.get("last_user_idx", -1)
+  ):
+    state["ask_question_blocked_turn"] = info.get("last_user_idx", -1)
+    save_state(state_path, state)
+    print(
+        json.dumps(
+            {"decision": "continue", "reason": aq_reason}, ensure_ascii=False
+        )
+    )
+    return
 
   # Defer auto-ship until the next turn if this turn already paused on ask_question
   ship_reason, ship_deferred_q = auto_ship_guard_reason(

@@ -1760,6 +1760,165 @@ class TestStopGuard(unittest.TestCase):
         out = json.loads(mock_out.getvalue())
         self.assertEqual(out, {})
 
+  def _run_stop_with_steps(
+      self, tmp_dir: str, steps: list[dict], fully_idle: bool = True
+  ) -> dict:
+    transcript = os.path.join(tmp_dir, "transcript.jsonl")
+    with open(transcript, "w", encoding="utf-8") as f:
+      for s in steps:
+        f.write(json.dumps(s, ensure_ascii=False) + "\n")
+    data = {
+        "conversationId": "c1",
+        "transcriptPath": transcript,
+        "artifactDirectoryPath": tmp_dir,
+        "fullyIdle": fully_idle,
+        "terminationReason": "NO_TOOL_CALL",
+    }
+    with patch("sys.stdin", io.StringIO(json.dumps(data))), \
+         patch("sys.stdout", new_callable=io.StringIO) as mock_out, \
+         patch.object(stop_guard, "play_stop_sound"):
+      stop_guard.main()
+    return json.loads(mock_out.getvalue())
+
+  def test_parallel_subagent_plain_text_question_blocks_stop_once(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      # Declarative status note while subagent runs (fullyIdle=False) is allowed
+      ok_steps = [
+          {"step_index": 1, "type": "USER_INPUT", "content": "Запусти проверку"},
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{"name": "invoke_subagent", "args": {"Role": "Runner"}}],
+          },
+          {
+              "step_index": 3,
+              "type": "PLANNER_RESPONSE",
+              "content": "Запустила baseline субагента, вернусь с результатами.",
+          },
+      ]
+      self.assertEqual(
+          self._run_stop_with_steps(tmp_dir, ok_steps, fully_idle=False), {}
+      )
+
+      # Asking a question in plain text while subagent runs (fullyIdle=False) blocks once
+      bad_steps = ok_steps[:-1] + [{
+          "step_index": 3,
+          "type": "PLANNER_RESPONSE",
+          "content": "Пока он работает, вопрос к тебе: на чём проверяем?",
+      }]
+      out = self._run_stop_with_steps(tmp_dir, bad_steps, fully_idle=False)
+      self.assertEqual(out.get("decision"), "continue")
+      self.assertIn("[PARALLEL SUBAGENT QUESTION GUARD]", out["reason"])
+      # Second attempt in the same wakeup does not loop forever
+      self.assertEqual(
+          self._run_stop_with_steps(tmp_dir, bad_steps, fully_idle=False), {}
+      )
+
+  def test_plain_text_choice_question_blocks_stop_unless_ask_question_called(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      # 1. Multi-option plain-text choice question blocks once
+      choice_steps = [
+          {"step_index": 1, "type": "USER_INPUT", "content": "Что дальше"},
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "content": (
+                  "Нужен твой выбор, на чём проверять:\n"
+                  "1. Локальный Chromium\n"
+                  "2. CitC google3\n\n"
+                  "Какой вариант берём?"
+              ),
+          },
+      ]
+      out = self._run_stop_with_steps(tmp_dir, choice_steps, fully_idle=True)
+      self.assertEqual(out.get("decision"), "continue")
+      self.assertIn("[ASK_QUESTION GUARD]", out["reason"])
+      self.assertEqual(
+          self._run_stop_with_steps(tmp_dir, choice_steps, fully_idle=True), {}
+      )
+
+    with tempfile.TemporaryDirectory() as tmp_dir2:
+      # 2. Plain-text confirmation question blocks once
+      confirm_steps = [
+          {"step_index": 10, "type": "USER_INPUT", "content": "Посмотри варианты"},
+          {
+              "step_index": 11,
+              "type": "PLANNER_RESPONSE",
+              "content": "Хочешь, сделаю оба пункта прямо сейчас?",
+          },
+      ]
+      out2 = self._run_stop_with_steps(tmp_dir2, confirm_steps, fully_idle=True)
+      self.assertEqual(out2.get("decision"), "continue")
+      self.assertIn("[ASK_QUESTION GUARD]", out2["reason"])
+
+    with tempfile.TemporaryDirectory() as tmp_dir3:
+      # 3. Open-ended factual question without discrete choices is allowed
+      open_steps = [
+          {"step_index": 20, "type": "USER_INPUT", "content": "Проверь мой док"},
+          {
+              "step_index": 21,
+              "type": "PLANNER_RESPONSE",
+              "content": "Не нашла документ по этому имени в Drive — подскажи точный URL?",
+          },
+      ]
+      self.assertEqual(
+          self._run_stop_with_steps(tmp_dir3, open_steps, fully_idle=True), {}
+      )
+
+    with tempfile.TemporaryDirectory() as tmp_dir4:
+      # 4. Calling ask_question satisfies the guard
+      tool_steps = [
+          {"step_index": 30, "type": "USER_INPUT", "content": "Что дальше"},
+          {
+              "step_index": 31,
+              "type": "PLANNER_RESPONSE",
+              "content": "Какой вариант берём?",
+              "tool_calls": [{
+                  "name": "ask_question",
+                  "args": {
+                      "questions": [{
+                          "question": "Какой вариант берём?",
+                          "options": ["(Recommended) Chromium", "Google3"],
+                      }]
+                  },
+              }],
+          },
+      ]
+      self.assertEqual(
+          self._run_stop_with_steps(tmp_dir4, tool_steps, fully_idle=True), {}
+      )
+
+    with tempfile.TemporaryDirectory() as tmp_dir5:
+      # 5. Earlier answered ask_question does NOT mask a later plain-text question (SG-B1 + SG-B2)
+      stale_aq_steps = [
+          {"step_index": 40, "type": "USER_INPUT", "content": "Начни работу"},
+          {
+              "step_index": 41,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{"name": "ask_question", "args": {"questions": []}}],
+          },
+          {"step_index": 42, "type": "GENERIC", "status": "DONE", "content": "Option A"},
+          {
+              "step_index": 43,
+              "type": "PLANNER_RESPONSE",
+              "content": "Which option?\n- (Recommended) Local build\n- Remote build",
+          },
+          {"step_index": 44, "type": "PLANNER_RESPONSE", "content": ""},
+      ]
+      out5 = self._run_stop_with_steps(tmp_dir5, stale_aq_steps, fully_idle=True)
+      self.assertEqual(out5.get("decision"), "continue")
+      self.assertIn("[ASK_QUESTION GUARD]", out5["reason"])
+
+    with tempfile.TemporaryDirectory() as tmp_dir6:
+      # 6. Latin 'ok?' and Russian 'ли' confirmation questions also require ask_question (SG-B8)
+      li_steps = [
+          {"step_index": 50, "type": "USER_INPUT", "content": "Проверь"},
+          {"step_index": 51, "type": "PLANNER_RESPONSE", "content": "Запускаем ли полный прогон?"},
+      ]
+      out6 = self._run_stop_with_steps(tmp_dir6, li_steps, fully_idle=True)
+      self.assertEqual(out6.get("decision"), "continue")
+      self.assertIn("[ASK_QUESTION GUARD]", out6["reason"])
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -323,6 +323,8 @@
   let manualEmptyTabKey = null;
   // Latches unseen needs-me chats so server view timestamps on pane mount do not dismiss them
   const latchedNeedsMeModMs = (window.__jetskiLatchedNeedsMeModMs ||= new Map());
+  // Tracks working chats so completion into needs-me latches even when serverLastView >= lastMod
+  const observedWorkingState = (window.__jetskiObservedWorkingState ||= new Map());
 
   // Tracks conversations whose hideFromConversationList flag we flipped in Redux
   // so we never unhide conversations that were natively hidden by their source
@@ -1258,6 +1260,8 @@
   async function toggleConversationArchived(cascadeId) {
     if (!cascadeId) return;
     latchedNeedsMeModMs.delete(cascadeId);
+    // Drop working-transition tracking so unarchiving later does not synthesize a completion
+    observedWorkingState.delete(cascadeId);
     const archived = !isArchivedCascadeId(cascadeId);
     const s = findReduxStore()?.getState()?.trajectorySummaries?.summaries?.[cascadeId];
     if (s) {
@@ -2485,6 +2489,9 @@
         blockedDetail: '',
         blockedSig: '',
         workingDetail: trajRunning ? cachedTraj.detail : '',
+        // Distinguish confirmed runs from pre-RPC raw descendant guesses on killed children
+        confirmedWorking: Boolean(selfRunning || trajRunning),
+        treeSig,
       };
     }
 
@@ -2506,6 +2513,8 @@
       blockedDetail: '',
       blockedSig: '',
       workingDetail: '',
+      // Expose treeSig so Working -> Needs Me latch skips unchanged pre-RPC killed children
+      treeSig,
     };
   }
 
@@ -9656,10 +9665,22 @@
     ensureNeedsReactionInbox();
   }
 
-  // Dismisses active conversation when the user clicks or focuses the prompt input box
+  // Dismisses active needs-me conversation when the user clicks, focuses, or types in prompt box
   function handleInputBoxSeen(event) {
     const target = event?.target;
     if (!target || typeof target.closest !== 'function') return;
+    // Typing in an already-focused input box does not fire focusin, so dismiss on text keys too
+    if (event.type === 'keydown') {
+      const key = String(event.key || '');
+      if (
+        event.ctrlKey ||
+        event.metaKey ||
+        event.altKey ||
+        (key.length !== 1 && key !== 'Backspace' && key !== 'Delete' && key !== 'Enter')
+      ) {
+        return;
+      }
+    }
     const inputBox = target.closest('[data-testid="agent-input-box"]');
     if (!inputBox) return;
     const cid = findCascadeIdFromElement(inputBox);
@@ -9667,8 +9688,27 @@
     if (latchedNeedsMeModMs.has(cid)) {
       markConversationSeen(cid);
     } else {
-      const summary = findReduxStore()?.getState()?.trajectorySummaries?.summaries?.[cid];
-      if (isUnseenNeedsReaction(cid, summary)) {
+      const summariesMap =
+        findReduxStore()?.getState()?.trajectorySummaries?.summaries || {};
+      const summary = summariesMap[cid];
+      if (!summary) return;
+      // Skip O(N) descendant index rebuild on repeated keystrokes in an already-seen chat
+      if (
+        event.type === 'keydown' &&
+        !summary.annotations?.markedAsUnread &&
+        !extractSummaryWaitingInfo(summary) &&
+        trajectoryStatusCache.get(cid)?.state !== 'blocked' &&
+        (locallySeenModifiedMs.get(cid) || 0) >=
+          (parseTimestampMs(summary.lastModifiedTime) || parseTimestampMs(summary.createdTime))
+      ) {
+        return;
+      }
+      // Never pre-dismiss while the conversation is still working before completion
+      const statusInfo = resolveConversationStatus(cid, summary, '', summariesMap);
+      if (
+        statusInfo.bucket === 'needs-me' &&
+        isUnseenNeedsReaction(cid, summary, statusInfo)
+      ) {
         markConversationSeen(cid);
       }
     }
@@ -9699,6 +9739,8 @@
     if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
       document.addEventListener('pointerdown', handleInputBoxSeen, true);
       document.addEventListener('focusin', handleInputBoxSeen, true);
+      // Capture keystrokes in already-focused prompt boxes after an agent turn finishes
+      document.addEventListener('keydown', handleInputBoxSeen, true);
       document.addEventListener('pointerdown', handleSidebarSearchIntercept, true);
       document.addEventListener('click', handleSidebarSearchIntercept, true);
       document.addEventListener('pointerdown', handleTopNavOutsideClick, true);
@@ -9710,6 +9752,8 @@
     if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
       document.removeEventListener('pointerdown', handleInputBoxSeen, true);
       document.removeEventListener('focusin', handleInputBoxSeen, true);
+      // Balance capture-phase keydown listener registered in bindInputBoxSeenListeners
+      document.removeEventListener('keydown', handleInputBoxSeen, true);
       document.removeEventListener('pointerdown', handleSidebarSearchIntercept, true);
       document.removeEventListener('click', handleSidebarSearchIntercept, true);
       document.removeEventListener('pointerdown', handleTopNavOutsideClick, true);
@@ -10210,18 +10254,36 @@
     const itemsStale = [];
     let urgentCount = 0;
 
+    // Bound observedWorkingState and latchedNeedsMeModMs to active keys in summariesMap
+    for (const trackedId of observedWorkingState.keys()) {
+      if (!(trackedId in summariesMap)) {
+        observedWorkingState.delete(trackedId);
+      }
+    }
+    for (const latchedId of latchedNeedsMeModMs.keys()) {
+      if (!(latchedId in summariesMap)) {
+        latchedNeedsMeModMs.delete(latchedId);
+      }
+    }
+
     for (const [cascadeId, summary] of Object.entries(summariesMap)) {
-      if (!isEligibleTopLevelSummary(cascadeId, summary)) continue;
+      // Clear working and latched state when a chat is archived or hidden from top-level view
+      if (!isEligibleTopLevelSummary(cascadeId, summary)) {
+        observedWorkingState.delete(cascadeId);
+        latchedNeedsMeModMs.delete(cascadeId);
+        continue;
+      }
       const rawTitle = summary?.annotations?.title || summary?.summary || '';
       const baseTitle = cleanBaseTitle(rawTitle) || rawTitle || cascadeId.slice(0, 8);
       const timeMatch = TIME_PREFIX_EXTRACT_RE.exec(rawTitle);
       const timePrefix = timeMatch ? timeMatch[1] : '';
       const projectId = summary?.trajectoryMetadata?.projectId || '__standalone__';
       const projectName = resolveProjectName(projectId, store);
-      const modTs =
+      // Preserve rawModTs === 0 so timestampless synthetic summaries never latch into Needs Me
+      const rawModTs =
         parseTimestampMs(summary?.lastModifiedTime) ||
-        parseTimestampMs(summary?.createdTime) ||
-        now;
+        parseTimestampMs(summary?.createdTime);
+      const modTs = rawModTs || now;
       const ageMs = Math.max(0, now - modTs);
       const statusInfo = resolveConversationStatus(
         cascadeId,
@@ -10233,6 +10295,13 @@
       const bucket = statusInfo.bucket;
 
       if (bucket === 'working') {
+        // Reset prior-turn latch while working so completion re-latches at the new turn timestamp
+        latchedNeedsMeModMs.delete(cascadeId);
+        const prevWork = observedWorkingState.get(cascadeId);
+        observedWorkingState.set(cascadeId, {
+          confirmed: Boolean(prevWork?.confirmed || statusInfo.confirmedWorking),
+          treeSig: prevWork ? prevWork.treeSig : (statusInfo.treeSig || ''),
+        });
         const isRunning = isActiveRunStatus(summary?.status);
         const workingIcon = isRunning ? '🤖' : '⏳';
         const subagentDetail =
@@ -10289,33 +10358,50 @@
           isLongRunning: Boolean(liveInfo?.isLongRunning),
           modTs,
         });
-      } else if (bucket === 'needs-me') {
-        // Never demote an actively blocked chat to Stale even if its last turn predates 7 days
-        if (!statusInfo.isBlocked && ageMs >= STALE_THRESHOLD_MS) {
-          const days = Math.floor(ageMs / (24 * 60 * 60 * 1000));
-          itemsStale.push({
-            cascadeId,
-            tabKey: 'stale',
-            baseTitle,
-            timePrefix: `${days}d`,
-            projectId,
-            projectName,
-            modTs,
-          });
-        } else if (isUnseenNeedsReaction(cascadeId, summary, statusInfo)) {
-          const tier = classifyInboxTier(summary, statusInfo);
-          if (tier === 'urgent') urgentCount++;
-          itemsNeedsMe.push({
-            cascadeId,
-            tabKey: 'needs-me',
-            baseTitle,
-            timePrefix,
-            projectId,
-            projectName,
-            tier,
-            detailText: statusInfo.isBlocked ? statusInfo.blockedDetail : '',
-            modTs,
-          });
+      } else {
+        const prevWork = observedWorkingState.get(cascadeId);
+        if (prevWork) {
+          observedWorkingState.delete(cascadeId);
+          // Latch confirmed Working -> Needs Me completions despite mounted-pane serverLastView
+          const wasRealWorking =
+            prevWork.confirmed || (statusInfo.treeSig || '') !== prevWork.treeSig;
+          if (
+            bucket === 'needs-me' &&
+            wasRealWorking &&
+            rawModTs > 0 &&
+            (statusInfo.isBlocked || ageMs < STALE_THRESHOLD_MS)
+          ) {
+            latchedNeedsMeModMs.set(cascadeId, rawModTs);
+          }
+        }
+        if (bucket === 'needs-me') {
+          // Never demote an actively blocked chat to Stale even if its last turn predates 7 days
+          if (!statusInfo.isBlocked && ageMs >= STALE_THRESHOLD_MS) {
+            const days = Math.floor(ageMs / (24 * 60 * 60 * 1000));
+            itemsStale.push({
+              cascadeId,
+              tabKey: 'stale',
+              baseTitle,
+              timePrefix: `${days}d`,
+              projectId,
+              projectName,
+              modTs,
+            });
+          } else if (isUnseenNeedsReaction(cascadeId, summary, statusInfo)) {
+            const tier = classifyInboxTier(summary, statusInfo);
+            if (tier === 'urgent') urgentCount++;
+            itemsNeedsMe.push({
+              cascadeId,
+              tabKey: 'needs-me',
+              baseTitle,
+              timePrefix,
+              projectId,
+              projectName,
+              tier,
+              detailText: statusInfo.isBlocked ? statusInfo.blockedDetail : '',
+              modTs,
+            });
+          }
         }
       }
     }

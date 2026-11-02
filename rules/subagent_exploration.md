@@ -20,6 +20,9 @@ description: "Prevent context pollution, optimize test-running model costs, gate
 - **Gate Batch Agent Workflows with `advanced.verify` (`run_workflow`)**:
   - Whenever orchestrating a batch task via `run_workflow` that spawns multiple agents (`parallel` or `pipeline` with `agent(...)`) to port commits, edit files, triage bugs, or audit modules, always import `from advanced import parallel, verify` and gate each item's output (or the aggregated batch result) with `await verify(result, criteria)` in a clean adversarial context before applying or reporting it.
   - Only pure read-only discovery fan-outs (or quick `call_tool`-only scripts) may omit `verify(...)` by including `# no-verify` in the workflow script.
+- **User Questions (`ask_question` Only for Choices/Confirmations; No Parallel Subagent Questions)**:
+  - Whenever ending a turn with a choice between options, an offer/proposal (including `next-task` proposals and cross-project message-forwarding offers), or a yes/no action confirmation for the user, call the `ask_question` tool (`WAITING` -> urgent `🔥` in `Needs Me`), overriding the tool schema's default "plain text for trivial yes/no" hint. Reserve plain-text `?` strictly for open-ended free-text inputs (e.g. asking the user to paste a missing URL or identifier).
+  - Never ask the user a question in the same turn that launches or messages a running background subagent/task (`invoke_subagent`, `send_message`, async `run_command`), because `Working` hides non-blocked chats from `Needs Me`: either ask upfront via `ask_question` before spawning, or wait silently for the background work to finish and ask together with its findings.
 - **Read Definitions Before Writing Calls**:
   - Never guess class methods, function signatures, struct fields, or CLI flags from memory.
   - Before calling an API that is not already visible in the open file, view its declaration (`.h`, `.hpp`, `.py`, etc.) or run `--help`.

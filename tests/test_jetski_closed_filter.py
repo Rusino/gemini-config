@@ -9560,6 +9560,512 @@ global.requestAnimationFrame = () => 1;
     )
     self.assertIn("SIDEPANELV2_ARTIFACT_SIDEBAR_PASSED", res.stdout)
 
+  def test_working_to_needs_me_latch_survives_pane_last_view(self) -> None:
+    node_bin = find_node_binary()
+    js_path = os.path.join(SCRIPTS_DIR, "jetski_closed_filter.js")
+
+    harness = r"""
+const fs = require('fs');
+const assert = require('assert');
+
+const scriptPath = process.argv[1];
+const code = fs.readFileSync(scriptPath, 'utf8');
+
+class FakeElement {
+  constructor(tagName) {
+    this.tagName = tagName.toUpperCase();
+    this.id = '';
+    this.className = '';
+    this.style = {};
+    this.attributes = new Map();
+    this.children = [];
+    this.parentElement = null;
+    this.listeners = new Map();
+    this._textContent = '';
+    this._innerHTML = '';
+  }
+  get firstChild() { return this.children[0] || null; }
+  get lastChild() { return this.children[this.children.length - 1] || null; }
+  get textContent() {
+    if (this.children.length > 0) {
+      return this._textContent + this.children.map((c) => c.textContent).join('');
+    }
+    return this._textContent;
+  }
+  set textContent(v) {
+    this._textContent = String(v);
+    for (const c of this.children) c.parentElement = null;
+    this.children = [];
+  }
+  get innerHTML() { return this._innerHTML; }
+  set innerHTML(v) {
+    this._innerHTML = String(v);
+    if (!v) {
+      for (const c of this.children) c.parentElement = null;
+      this.children = [];
+    }
+  }
+  setAttribute(k, v) {
+    this.attributes.set(k, String(v));
+    if (k === 'id') this.id = String(v);
+    if (k === 'class') this.className = String(v);
+  }
+  getAttribute(k) { return this.attributes.has(k) ? this.attributes.get(k) : null; }
+  hasAttribute(k) { return this.attributes.has(k); }
+  removeAttribute(k) { this.attributes.delete(k); }
+  appendChild(c) {
+    if (c.parentElement) c.remove();
+    c.parentElement = this;
+    this.children.push(c);
+    return c;
+  }
+  insertBefore(c, ref) {
+    if (c === ref) return c;
+    if (c.parentElement) c.remove();
+    c.parentElement = this;
+    const idx = this.children.indexOf(ref);
+    if (idx === -1) this.children.push(c);
+    else this.children.splice(idx, 0, c);
+    return c;
+  }
+  remove() {
+    if (!this.parentElement) return;
+    const idx = this.parentElement.children.indexOf(this);
+    if (idx !== -1) this.parentElement.children.splice(idx, 1);
+    this.parentElement = null;
+  }
+  addEventListener(t, fn) {
+    if (!this.listeners.has(t)) this.listeners.set(t, []);
+    this.listeners.get(t).push(fn);
+  }
+  dispatchEvent(type, eventInit = {}) {
+    let propagationStopped = false;
+    const evt = {
+      type,
+      target: this,
+      button: 0,
+      ...eventInit,
+      preventDefault() {},
+      stopPropagation() { propagationStopped = true; },
+      stopImmediatePropagation() { propagationStopped = true; },
+    };
+    let cur = this;
+    while (cur && !propagationStopped) {
+      for (const fn of (cur.listeners.get(type) || [])) {
+        fn(evt);
+        if (propagationStopped) break;
+      }
+      cur = cur.parentElement;
+    }
+    if (!propagationStopped && global.document?.dispatchEvent) {
+      global.document.dispatchEvent(evt);
+    }
+  }
+  getBoundingClientRect() {
+    return { left: 10, top: 10, right: 120, bottom: 30, width: 110, height: 20 };
+  }
+  closest(selector) {
+    let cur = this;
+    while (cur) {
+      if (matchSelector(cur, selector)) return cur;
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+  querySelector(s) { return this.querySelectorAll(s)[0] || null; }
+  querySelectorAll(s) {
+    const out = [];
+    const visit = (n) => {
+      for (const c of n.children) {
+        if (matchSelector(c, s)) out.push(c);
+        visit(c);
+      }
+    };
+    visit(this);
+    return out;
+  }
+}
+
+function matchSelector(el, selector) {
+  if (selector.includes(',')) {
+    return selector.split(',').some((p) => matchSelector(el, p.trim()));
+  }
+  if (selector.startsWith('#')) return el.id === selector.slice(1);
+  if (selector.startsWith('.')) {
+    return (el.className || '').split(/\s+/).includes(selector.slice(1));
+  }
+  if (selector === 'button[aria-label="Display Options"]') {
+    return el.tagName === 'BUTTON' && el.getAttribute('aria-label') === 'Display Options';
+  }
+  const testIdMatch = /^\[data-testid="([^"]+)"\]$/.exec(selector);
+  if (testIdMatch) return el.getAttribute('data-testid') === testIdMatch[1];
+  const cascadeAttr = /^\[data-cascade-id\]$/.exec(selector);
+  if (cascadeAttr) return el.hasAttribute('data-cascade-id');
+  return false;
+}
+
+const docEl = new FakeElement('html');
+const headEl = new FakeElement('head');
+const bodyEl = new FakeElement('body');
+docEl.appendChild(headEl);
+docEl.appendChild(bodyEl);
+
+const sidebarWrap = new FakeElement('div');
+const actionRow = new FakeElement('div');
+const displayOptionsBtn = new FakeElement('button');
+displayOptionsBtn.setAttribute('aria-label', 'Display Options');
+actionRow.appendChild(displayOptionsBtn);
+const convoListSidebar = new FakeElement('div');
+convoListSidebar.setAttribute('data-testid', 'conversation-list-sidebar');
+sidebarWrap.appendChild(actionRow);
+sidebarWrap.appendChild(convoListSidebar);
+bodyEl.appendChild(sidebarWrap);
+
+const openPaneInput = new FakeElement('div');
+openPaneInput.setAttribute('data-testid', 'agent-input-box');
+openPaneInput.setAttribute('data-cascade-id', 'chat-open-pane');
+bodyEl.appendChild(openPaneInput);
+
+const storeState = {
+  trajectorySummaries: {
+    summaries: {
+      'chat-open-pane': {
+        summary: '[13:30] ⦿ Testing without canaries',
+        status: 'CASCADE_RUN_STATUS_RUNNING',
+        notFullyIdle: true,
+        stepCount: 84,
+        lastModifiedTime: '2026-11-02T17:30:00Z',
+        annotations: {
+          title: '[13:30] ⦿ Testing without canaries',
+          archived: false,
+          lastUserViewTime: '2026-11-02T17:30:01Z',
+        },
+        trajectoryMetadata: { projectId: 'proj-skia' },
+      },
+      'chat-old-killed': {
+        summary: '[11:00] ⦿ Already viewed parent',
+        status: 'CASCADE_RUN_STATUS_IDLE',
+        notFullyIdle: false,
+        stepCount: 5,
+        lastModifiedTime: '2026-11-02T15:00:00Z',
+        annotations: {
+          title: '[11:00] ⦿ Already viewed parent',
+          archived: false,
+          lastUserViewTime: '2026-11-02T15:05:00Z',
+        },
+        trajectoryMetadata: { projectId: 'proj-skia' },
+      },
+      'sub-stale-killed': {
+        summary: 'Killed helper',
+        status: 'CASCADE_RUN_STATUS_IDLE',
+        notFullyIdle: true,
+        stepCount: 2,
+        lastModifiedTime: '2026-11-02T14:59:00Z',
+        trajectoryMetadata: {
+          parentConversationId: 'chat-old-killed',
+          sourceMetadata: { hideFromConversationList: true },
+        },
+      },
+    },
+  },
+  conversation: { cascadeId: 'chat-open-pane' },
+  sideBar: { isOpen: true },
+};
+
+const subscribers = [];
+const reduxStore = {
+  getState() { return storeState; },
+  dispatch(action) {
+    if (action?.type === 'trajectorySummaries/applyStreamBatch') {
+      const next = { ...storeState.trajectorySummaries.summaries };
+      for (const [id, s] of (action.payload?.updates || [])) {
+        next[id] = s;
+      }
+      storeState.trajectorySummaries = { summaries: next };
+      for (const sub of subscribers) sub();
+    }
+    return action;
+  },
+  subscribe(fn) {
+    subscribers.push(fn);
+    return () => {};
+  },
+};
+displayOptionsBtn.__reactFiber$test = { memoizedProps: { store: reduxStore } };
+
+const docListeners = new Map();
+const rafQueue = [];
+global.window = {
+  location: { pathname: '/c/chat-open-pane', origin: 'https://jetski.corp.google.com' },
+  history: { pushState() {} },
+  localStorage: { getItem() { return null; }, setItem() {} },
+  fetch: async (url, opts) => {
+    const u = String(url);
+    if (u.includes('GetCascadeTrajectory')) {
+      const body = JSON.parse(opts?.body || '{}');
+      if (body.cascadeId === 'chat-old-killed') {
+        return {
+          ok: true,
+          json: async () => ({
+            numTotalSteps: 5,
+            trajectory: {
+              steps: [
+                { type: 14, status: 3 },
+                {
+                  type: 15,
+                  status: 3,
+                  plannerResponse: {
+                    toolCalls: [{
+                      name: 'invoke_subagent',
+                      argumentsJson: JSON.stringify({ Role: 'Helper' }),
+                    }],
+                  },
+                },
+                {
+                  type: 90,
+                  status: 3,
+                  generic: { content: '{"conversationId": "sub-stale-killed"}' },
+                },
+                {
+                  type: 15,
+                  status: 3,
+                  plannerResponse: {
+                    toolCalls: [{
+                      name: 'manage_subagents',
+                      argumentsJson: JSON.stringify({
+                        Action: 'kill',
+                        ConversationIds: ['sub-stale-killed'],
+                      }),
+                    }],
+                  },
+                },
+                {
+                  type: 15,
+                  status: 3,
+                  plannerResponse: { response: 'Done.' },
+                },
+              ],
+            },
+          }),
+        };
+      }
+      return { ok: true, json: async () => ({ numTotalSteps: 1, trajectory: { steps: [] } }) };
+    }
+    return { ok: false, status: 404, json: async () => ({}) };
+  },
+};
+global.document = {
+  documentElement: docEl,
+  head: headEl,
+  body: bodyEl,
+  createElement(t) { return new FakeElement(t); },
+  getElementById(id) { return docEl.querySelector('#' + id); },
+  querySelector(s) { return docEl.querySelector(s); },
+  querySelectorAll(s) { return docEl.querySelectorAll(s); },
+  addEventListener(t, fn) {
+    if (!docListeners.has(t)) docListeners.set(t, []);
+    docListeners.get(t).push(fn);
+  },
+  removeEventListener() {},
+  dispatchEvent(evt) {
+    for (const fn of (docListeners.get(evt.type) || [])) fn(evt);
+  },
+};
+global.MutationObserver = class { observe() {} disconnect() {} };
+global.requestAnimationFrame = (cb) => { rafQueue.push(cb); return rafQueue.length; };
+const flushAll = async () => {
+  for (let i = 0; i < 6; i++) {
+    while (rafQueue.length > 0) rafQueue.shift()();
+    await new Promise((r) => setImmediate(r));
+  }
+};
+
+(async () => {
+  const realNow = Date.now;
+  Date.now = () => Date.parse('2026-11-02T17:42:30Z');
+  try {
+    eval(code);
+    await flushAll();
+
+    const inboxEl = bodyEl.querySelector('.jetski-needs-reaction-inbox');
+    assert(inboxEl, 'Needs-Reaction inbox must mount');
+    const tabNeedsMe = inboxEl.querySelector('.jetski-inbox-tab-needs-me');
+    const tabWorking = inboxEl.querySelector('.jetski-inbox-tab-working');
+
+    // Old already-viewed parent with killed subagent must NOT latch on initial RPC resolution
+    assert.strictEqual(
+      window.__jetskiLatchedNeedsMeModMs.has('chat-old-killed'),
+      false,
+      'Pre-RPC killed descendant must not falsely latch already-viewed parent into Needs Me'
+    );
+    assert.strictEqual(tabNeedsMe.querySelector('.jetski-inbox-count-badge').textContent, '0');
+    assert.strictEqual(tabWorking.querySelector('.jetski-inbox-count-badge').textContent, '1');
+
+    // Focusing input box while chat-open-pane is still Working must NOT pre-dismiss completion
+    openPaneInput.dispatchEvent('pointerdown', { button: 0 });
+    await flushAll();
+
+    // Turn finishes while mounted in open pane: serverLastView >= lastMod already stamped!
+    reduxStore.dispatch({
+      type: 'trajectorySummaries/applyStreamBatch',
+      payload: {
+        updates: [[
+          'chat-open-pane',
+          {
+            ...storeState.trajectorySummaries.summaries['chat-open-pane'],
+            status: 'CASCADE_RUN_STATUS_IDLE',
+            notFullyIdle: false,
+            stepCount: 91,
+            lastModifiedTime: '2026-11-02T17:42:27Z',
+            annotations: {
+              title: '[13:30] ⦿ Testing without canaries',
+              archived: false,
+              lastUserViewTime: '2026-11-02T17:42:29Z',
+            },
+          },
+        ]],
+        deletes: [],
+      },
+    });
+    await flushAll();
+
+    assert.strictEqual(
+      window.__jetskiLatchedNeedsMeModMs.has('chat-open-pane'),
+      true,
+      'Working -> Needs Me transition must latch even when serverLastView >= lastMod'
+    );
+    assert.strictEqual(tabWorking.querySelector('.jetski-inbox-count-badge').textContent, '0');
+    assert.strictEqual(tabNeedsMe.querySelector('.jetski-inbox-count-badge').textContent, '1');
+    const rows = inboxEl.querySelectorAll('.jetski-inbox-row');
+    assert.strictEqual(rows.length, 1);
+    assert.strictEqual(rows[0].getAttribute('data-cascade-id'), 'chat-open-pane');
+
+    // Clicking input box AFTER completion dismisses chat-open-pane cleanly
+    Date.now = () => Date.parse('2026-11-02T17:43:00Z');
+    openPaneInput.dispatchEvent('pointerdown', { button: 0 });
+    await flushAll();
+    assert.strictEqual(window.__jetskiLatchedNeedsMeModMs.has('chat-open-pane'), false);
+    assert.strictEqual(tabNeedsMe.querySelector('.jetski-inbox-count-badge').textContent, '0');
+
+    // UI-B1 & UI-G1: external archive clears latch, and keydown in focused box dismisses in O(1)
+    reduxStore.dispatch({
+      type: 'trajectorySummaries/applyStreamBatch',
+      payload: {
+        updates: [[
+          'chat-open-pane',
+          {
+            ...storeState.trajectorySummaries.summaries['chat-open-pane'],
+            status: 'CASCADE_RUN_STATUS_RUNNING',
+            notFullyIdle: true,
+            lastModifiedTime: '2026-11-02T17:44:00Z',
+          },
+        ]],
+        deletes: [],
+      },
+    });
+    await flushAll();
+    reduxStore.dispatch({
+      type: 'trajectorySummaries/applyStreamBatch',
+      payload: {
+        updates: [[
+          'chat-open-pane',
+          {
+            ...storeState.trajectorySummaries.summaries['chat-open-pane'],
+            status: 'CASCADE_RUN_STATUS_IDLE',
+            notFullyIdle: false,
+            lastModifiedTime: '2026-11-02T17:45:00Z',
+            annotations: {
+              title: '[13:30] ⦿ Testing without canaries',
+              archived: false,
+              lastUserViewTime: '2026-11-02T17:45:01Z',
+            },
+          },
+        ]],
+        deletes: [],
+      },
+    });
+    await flushAll();
+    assert.strictEqual(window.__jetskiLatchedNeedsMeModMs.has('chat-open-pane'), true);
+
+    // Keydown typing in already-focused input box dismisses latch
+    Date.now = () => Date.parse('2026-11-02T17:45:05Z');
+    openPaneInput.dispatchEvent('keydown', {
+      key: 'a',
+      ctrlKey: false,
+      metaKey: false,
+      altKey: false,
+    });
+    await flushAll();
+    assert.strictEqual(window.__jetskiLatchedNeedsMeModMs.has('chat-open-pane'), false);
+
+    // Re-latch via markedAsUnread, then archive externally -> latch must be pruned immediately
+    reduxStore.dispatch({
+      type: 'trajectorySummaries/applyStreamBatch',
+      payload: {
+        updates: [[
+          'chat-open-pane',
+          {
+            ...storeState.trajectorySummaries.summaries['chat-open-pane'],
+            annotations: {
+              title: '[13:30] ⦿ Testing without canaries',
+              archived: false,
+              markedAsUnread: true,
+              lastUserViewTime: '2026-11-02T17:45:10Z',
+            },
+          },
+        ]],
+        deletes: [],
+      },
+    });
+    await flushAll();
+    assert.strictEqual(window.__jetskiLatchedNeedsMeModMs.has('chat-open-pane'), true);
+    reduxStore.dispatch({
+      type: 'trajectorySummaries/applyStreamBatch',
+      payload: {
+        updates: [[
+          'chat-open-pane',
+          {
+            ...storeState.trajectorySummaries.summaries['chat-open-pane'],
+            annotations: {
+              title: '[13:30] ⦿ Testing without canaries',
+              archived: true,
+              markedAsUnread: false,
+              lastUserViewTime: '2026-11-02T17:45:10Z',
+            },
+          },
+        ]],
+        deletes: [],
+      },
+    });
+    await flushAll();
+    assert.strictEqual(
+      window.__jetskiLatchedNeedsMeModMs.has('chat-open-pane'),
+      false,
+      'External archive must prune latchedNeedsMeModMs entry'
+    );
+
+    process.stdout.write('WORKING_TO_NEEDS_ME_LATCH_PASSED\n');
+  } finally {
+    Date.now = realNow;
+  }
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"""
+    res = subprocess.run(
+        [node_bin, "-e", harness, js_path],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(
+        res.returncode,
+        0,
+        f"Working->Needs Me latch harness failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+    )
+    self.assertIn("WORKING_TO_NEEDS_ME_LATCH_PASSED", res.stdout)
+
 
 if __name__ == "__main__":
   unittest.main()
