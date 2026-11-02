@@ -253,6 +253,9 @@ EXCLUDED_WATCHER_PROJECTS = frozenset({"Flight Deck"})
 META_PROJECT_NAMES = frozenset({
     "Flight Deck",
     "Improving Experience",
+    "Reviews of e-mails, meetings and such",
+    "sad-ru-googlers-ai-digest",
+    "Personal",
     "Code Review organizer",
     "Breaking Chats",
     "Unassigned",
@@ -1111,7 +1114,8 @@ def discover_bug_chats(
       continue
     pid = str(meta.get("projectId") or "").strip()
     pname = proj_names.get(pid, "Unassigned")
-    if pname in EXCLUDED_WATCHER_PROJECTS:
+    # Skip meta, digest, and personal projects while keeping outside-of-project ('Unassigned') chats
+    if pname != "Unassigned" and pname in META_PROJECT_NAMES:
       continue
     bug_keys = extract_bug_refs_from_text(title)
     if not bug_keys:
@@ -5558,9 +5562,13 @@ def _start_chat_for_bug(state: dict[str, Any], bug_key: str) -> dict[str, Any]:
 
   proj_ref = str(bug.get("project_name") or bug.get("project_id") or "").strip()
   try:
+    # Keep internal Jetski/OneQuota bugs pinned to Improving Experience while excluding meta chats
     project_id = (
         cl.resolve_project_id(proj_ref)
-        if (proj_ref and proj_ref not in META_PROJECT_NAMES)
+        if (
+            proj_ref
+            and (proj_ref == "Improving Experience" or proj_ref not in META_PROJECT_NAMES)
+        )
         else "outside-of-project"
     )
   except ValueError:
@@ -5574,11 +5582,20 @@ def _start_chat_for_bug(state: dict[str, Any], bug_key: str) -> dict[str, Any]:
   full_title = f"[{cl.get_current_time_str()}] ⦿ {topic}"
   url = str(bug.get("url") or bug.get("short_id") or bug_key)
   btitle = str(bug.get("title") or bug_key)
-  prompt = (
-      f"Исследуй баг {url} ('{btitle}'). Проверь актуальные детали, воспроизведение "
-      "и связанные CL/PR, оцени приоритет и предложи план действий (не вноси правки "
-      "в репозиторий без подтверждения или контрактного теста)."
-  )
+  # Collaborator bugs ask for domain review and a draft opinion rather than code ownership
+  if bug.get("is_collaborator"):
+    owner_lbl = str(bug.get("assignee") or "коллеги")
+    prompt = (
+        f"Ты указана как Collaborator в баге {url} ('{btitle}', владелец: {owner_lbl}). "
+        "Проверь описание, комментарии и код, и подготовь техническое ревью и черновик "
+        "комментария/мнения для бага (не публикуй комментарий без подтверждения)."
+    )
+  else:
+    prompt = (
+        f"Исследуй баг {url} ('{btitle}'). Проверь актуальные детали, воспроизведение "
+        "и связанные CL/PR, оцени приоритет и предложи план действий (не вноси правки "
+        "в репозиторий без подтверждения или контрактного теста)."
+    )
   try:
     model_info = cl.resolve_handoff_model("", tier="pro", project_id=project_id)
     new_cid = cl.start_conversation_exact(
@@ -6835,13 +6852,6 @@ def parse_rendered_issue_comments(rendered_text: str) -> dict[str, Any]:
 
   cl_ids: list[str] = []
   cl_urls: dict[str, str] = {}
-  for m_g in RE_GERRIT_ANY_URL_ID.finditer(text):
-    gid = m_g.group(1)
-    cl_ids.append(gid)
-    cl_urls.setdefault(gid, _normalize_public_gerrit_url(m_g.group(0)))
-  res["comment_cl_ids"] = list(dict.fromkeys(cl_ids))
-  res["comment_cl_urls"] = cl_urls
-
   self_lower = {e.lower() for e in SELF_BUG_EMAILS} | {
       u.lower() for u in SELF_GITHUB_LOGINS
   }
@@ -6851,9 +6861,16 @@ def parse_rendered_issue_comments(rendered_text: str) -> dict[str, Any]:
   )
   for m in pattern.finditer(text):
     author = m.group(1).strip()
+    author_low = author.lower()
     ts_raw = m.group(2).strip()
     body = m.group(3).strip()
-    if author.lower() in self_lower:
+    # Extract CL links only from gitwatcher commit-landing bots or self comments
+    if "gitwatcher" in author_low or author_low in self_lower:
+      for m_g in RE_GERRIT_ANY_URL_ID.finditer(body):
+        gid = m_g.group(1)
+        cl_ids.append(gid)
+        cl_urls.setdefault(gid, _normalize_public_gerrit_url(m_g.group(0)))
+    if author_low in self_lower:
       res["last_self_comment_at"] = ts_raw
     if _is_bug_bot_author(author):
       continue
@@ -6864,6 +6881,8 @@ def parse_rendered_issue_comments(rendered_text: str) -> dict[str, Any]:
     res["last_human_comment_author"] = author
     res["last_human_comment_at"] = ts_raw
     res["last_human_comment_snippet"] = snippet
+  res["comment_cl_ids"] = list(dict.fromkeys(cl_ids))
+  res["comment_cl_urls"] = cl_urls
   return res
 
 
@@ -6897,8 +6916,6 @@ def merge_bug_record_with_prev(
         "chat_busy",
         "chat_woken_ts",
         "chat_last_modified",
-        "project_id",
-        "project_name",
         "last_human_comment_author",
         "last_human_comment_at",
         "last_human_comment_snippet",
@@ -6910,6 +6927,14 @@ def merge_bug_record_with_prev(
       if carry_key not in merged or merged.get(carry_key) in ("", None, [], {}):
         if carry_key in prev and prev[carry_key] not in ("", None):
           merged[carry_key] = prev[carry_key]
+    # Keep non-default project pins on chatted bugs while letting default 'Skia' re-infer
+    if (
+        prev.get("conversation_id")
+        and prev.get("project_name") not in ("", "Unassigned", "Skia", None)
+        and merged.get("project_name") in ("", None)
+    ):
+      merged["project_id"] = str(prev.get("project_id") or "")
+      merged["project_name"] = str(prev["project_name"])
   if not merged.get("title"):
     if merged.get("title_redacted"):
       merged["title"] = _format_redacted_fallback_title(merged)
@@ -7247,11 +7272,16 @@ def infer_project_for_bug(
         return hit
     return ("", candidates[0] if candidates else "Skia")
 
+  comp_id = str(bug.get("component_id") or "").strip()
   blob = " ".join([
       str(bug.get("title") or ""),
       str(bug.get("component_tags") or ""),
+      str(bug.get("reporter") or ""),
       " ".join(str(x) for x in (bug.get("labels") or ())),
   ]).lower()
+  # Route internal Jetski (component 2271566) and OneQuota bugs out of Skia
+  if comp_id == "2271566" or any(k in blob for k in ("jetski", "onequota")):
+    return pick("Improving Experience")
   if any(k in blob for k in ("skoretext", "coretext", "ctfont", "_mac_ct")):
     return pick("SkoreText", "Skia")
   if "webparagraph" in blob or (
@@ -7300,7 +7330,12 @@ def link_bugs_and_cls(
     for bkey, bchat in bug_chats.items():
       bug = bugs_by_key.get(bkey)
       if isinstance(bug, dict) and bchat.get("conversation_id"):
-        if not bug.get("conversation_id") or bug.get("chat_archived"):
+        # Refresh matching chat metadata so moved or newly archived bug chats update project
+        if (
+            not bug.get("conversation_id")
+            or bug.get("chat_archived")
+            or bug.get("conversation_id") == bchat["conversation_id"]
+        ):
           bug["conversation_id"] = bchat["conversation_id"]
           bug["chat_title"] = bchat.get("title", "")
           bug["chat_archived"] = bool(bchat.get("chat_archived"))
@@ -7393,7 +7428,11 @@ def link_bugs_and_cls(
     bug = bugs_by_key.get(bkey)
     if not isinstance(bug, dict):
       continue
-    if str(bug.get("conversation_id") or "").strip() and not bug.get("chat_archived"):
+    # Still recover project_name from a shared CL chat when merge_bug_record cleared 'Skia'
+    has_active_chat = bool(
+        str(bug.get("conversation_id") or "").strip() and not bug.get("chat_archived")
+    )
+    if has_active_chat and bug.get("project_name") not in ("", "Unassigned", None):
       continue
     self_chatted: list[dict[str, Any]] = []
     for ik in cl_ikeys:
@@ -7406,9 +7445,10 @@ def link_bugs_and_cls(
           self_chatted.append(rec)
     if self_chatted:
       chosen = self_chatted[0]
-      bug["conversation_id"] = str(chosen["conversation_id"])
-      bug["chat_archived"] = False
-      bug["chat_busy"] = any(bool(r.get("chat_busy")) for r in self_chatted)
+      if not has_active_chat:
+        bug["conversation_id"] = str(chosen["conversation_id"])
+        bug["chat_archived"] = False
+        bug["chat_busy"] = any(bool(r.get("chat_busy")) for r in self_chatted)
       if (
           bug.get("project_name") in ("", "Unassigned", None)
           and chosen.get("project_name")
@@ -7588,11 +7628,14 @@ def classify_bug_status(
       hrs = max(1, int((dts - cur_now) // 3600))
       soon_notes.append(f"{label} due in {hrs}h ({et_str or raw_s})")
 
-  if overdue_notes:
-    bug["is_overdue"] = True
-    bug["slo_summary"] = overdue_notes[0]
-  elif soon_notes:
-    bug["slo_summary"] = soon_notes[0]
+  # Collaborators are not responsible for the issue assignee's SLO deadlines
+  is_collab = bool(bug.get("is_collaborator"))
+  if not is_collab:
+    if overdue_notes:
+      bug["is_overdue"] = True
+      bug["slo_summary"] = overdue_notes[0]
+    elif soon_notes:
+      bug["slo_summary"] = soon_notes[0]
 
   linked_cls = [c for c in (bug.get("linked_cls") or []) if isinstance(c, dict)]
   has_cl = len(linked_cls) > 0
@@ -7621,22 +7664,35 @@ def classify_bug_status(
   itype = str(bug.get("issue_type") or "BUG").upper()
   created_ts = _parse_ts(bug.get("created_time"))
   recent_created = created_ts > 0 and (cur_now - created_ts) <= 7 * 86400
+  # Only the assignee owns CL creation and issue closure when linked CLs merge
   unacked_urgent = (
-      not has_cl
+      not is_collab
+      and not has_cl
       and acked_ts <= 0.0
       and (pri in ("P0", "P1") or itype == "VULNERABILITY")
       and (status == "NEW" or recent_created)
   )
-  all_merged_unacked = all_cls_merged and acked_ts < max(latest_merged_ts, 1.0)
+  all_merged_unacked = (
+      not is_collab and all_cls_merged and acked_ts < max(latest_merged_ts, 1.0)
+  )
 
   if unacked_comment:
     snip = str(bug.get("last_human_comment_snippet") or "").strip()
+    prefix = "Collaborator · " if is_collab else ""
     bug["needs_you"] = True
     bug["why_needs_you"] = (
-        f"New comment from {human_author}: {snip}"
+        f"{prefix}New comment from {human_author}: {snip}"
         if snip
-        else f"New comment from {human_author}"
+        else f"{prefix}New comment from {human_author}"
     )
+  # Surface open collaborator bugs in Needs you until the user comments or acknowledges
+  elif is_collab and self_ts <= 0.0 and acked_ts <= 0.0:
+    owner_raw = str(bug.get("assignee") or "").split("@", 1)[0].strip()
+    owner_part = (
+        f" (owner: {owner_raw})" if owner_raw and owner_raw.upper() != "N/A" else ""
+    )
+    bug["needs_you"] = True
+    bug["why_needs_you"] = f"Collaborator{owner_part} — needs your review / input"
   elif all_merged_unacked:
     bug["needs_you"] = True
     bug["why_needs_you"] = "All linked CLs merged — ready to mark Fixed?"
@@ -7682,12 +7738,13 @@ def _is_self_bug_assignee(assignee: str) -> bool:
 
 def _should_retain_bug_in_view(
     bug: dict[str, Any],
-    primary_self_bkeys: set[str],
-    merged_chats: dict[str, Any],
+    primary_self_bkeys: set[str] | None = None,
 ) -> bool:
-  """Retains a bug in the Bugs tab only when owned, collaborated, chatted, or self-CL-linked."""
+  """Retains a bug in the Bugs tab only when owned, collaborated, or self-CL-linked."""
   bkey = str(bug.get("bug_key") or "")
-  if bkey in primary_self_bkeys or bkey in merged_chats:
+  if primary_self_bkeys is not None and bkey in primary_self_bkeys:
+    return True
+  if bool(bug.get("is_collaborator")):
     return True
   if _is_self_bug_assignee(str(bug.get("assignee") or "")):
     return True
@@ -7716,23 +7773,23 @@ def sync_bugs_into_state(
   now_ts = time.time()
   last_bug_ts = float(state.get("last_bug_sync_ts") or 0.0)
   if not force and prev_bugs and (now_ts - last_bug_ts) < BUG_SYNC_TTL_SEC:
-    # Refresh chat links, CL subtasks, and status lanes in-memory between 5-min bug polls
+    # Refresh chat links, CL subtasks, and prune stale non-self entries between 5-min polls
     link_bugs_and_cls(prev_bugs, items, bug_chats=merged_chats)
-    for b in prev_bugs.values():
-      if isinstance(b, dict):
-        _resolve_redacted_bug_title(b, prev_bugs)
-        classify_bug_status(b, now_ts=now_ts)
+    pruned_fast: dict[str, dict[str, Any]] = {}
+    for bk, b in prev_bugs.items():
+      if not isinstance(b, dict) or not _should_retain_bug_in_view(b):
+        continue
+      pruned_fast[bk] = b
+    for b in pruned_fast.values():
+      _resolve_redacted_bug_title(b, pruned_fast)
+      classify_bug_status(b, now_ts=now_ts)
+    state["bugs"] = pruned_fast
     return
 
-  # Gather external bug IDs referenced by tracked CLs/PRs or active Jetski chats
+  # Gather external bug IDs referenced by tracked CLs/PRs (for badges and self-CL bugs)
   ref_buganizer_ids: set[str] = set()
   ref_gh_nums: set[str] = set()
   self_cl_bkeys: set[str] = set()
-  for bkey in merged_chats:
-    if bkey.startswith("buganizer:"):
-      ref_buganizer_ids.add(bkey.split(":", 1)[1])
-    elif bkey.startswith("gh_issue:flutter/flutter#"):
-      ref_gh_nums.add(bkey.split("#", 1)[1])
   for rec in items.values():
     if not isinstance(rec, dict):
       continue
@@ -7760,10 +7817,11 @@ def sync_bugs_into_state(
   ).strftime("%Y-%m-%d")
   open_q = (
       "(assignee:jlavrova@google.com OR assignee:jlavrova@chromium.org "
-      "OR collaborator:jlavrova@google.com) status:open"
+      "OR collaborator:jlavrova@google.com OR collaborator:jlavrova@chromium.org) status:open"
   )
   closed_q = (
-      "(assignee:jlavrova@google.com OR assignee:jlavrova@chromium.org) "
+      "(assignee:jlavrova@google.com OR assignee:jlavrova@chromium.org "
+      "OR collaborator:jlavrova@google.com OR collaborator:jlavrova@chromium.org) "
       f"-status:open modified>={closed_since}"
   )
   mcp_calls: list[tuple[str, dict[str, Any]]] = [
@@ -7801,10 +7859,14 @@ def sync_bugs_into_state(
   for raw_b in fetched_bz:
     bkey = raw_b["bug_key"]
     merged_b = merge_bug_record_with_prev(raw_b, prev_bugs.get(bkey))
+    # Recompute collaborator role from live query membership so removed/reassigned bugs drop out
+    merged_b["is_collaborator"] = bool(
+        bkey in primary_self_bkeys
+        and not _is_self_bug_assignee(str(merged_b.get("assignee") or ""))
+    )
     all_bugs[bkey] = merged_b
     is_self_bug = (
         bkey in primary_self_bkeys
-        or bkey in merged_chats
         or bkey in self_cl_bkeys
         or _is_self_bug_assignee(str(merged_b.get("assignee") or ""))
     )
@@ -7816,7 +7878,8 @@ def sync_bugs_into_state(
         is_self_bug
         and st in ("NEW", "ASSIGNED", "ACCEPTED")
         and (
-            str(merged_b.get("priority") or "") in ("P0", "P1")
+            bool(merged_b.get("is_collaborator"))
+            or str(merged_b.get("priority") or "") in ("P0", "P1")
             or float(merged_b.get("modified_ts") or 0.0) >= recent_cutoff_ts
             or bkey in merged_chats
         )
@@ -7847,7 +7910,9 @@ def sync_bugs_into_state(
     bkey = gh_b["bug_key"]
     if gh_b.get("from_self_query"):
       primary_self_bkeys.add(bkey)
-    all_bugs[bkey] = merge_bug_record_with_prev(gh_b, prev_bugs.get(bkey))
+    merged_gh = merge_bug_record_with_prev(gh_b, prev_bugs.get(bkey))
+    merged_gh["is_collaborator"] = False
+    all_bugs[bkey] = merged_gh
 
   # Link bugs <-> CLs BEFORE project fallback so self-CL chats propagate project & titles
   link_bugs_and_cls(all_bugs, items, bug_chats=merged_chats)
@@ -7861,7 +7926,7 @@ def sync_bugs_into_state(
   # Keep reviewer-only colleague bugs for CL chips, but exclude them from the Bugs tab
   retained_bugs: dict[str, dict[str, Any]] = {}
   for bkey, bug in all_bugs.items():
-    if not _should_retain_bug_in_view(bug, primary_self_bkeys, merged_chats):
+    if not _should_retain_bug_in_view(bug, primary_self_bkeys):
       continue
     retained_bugs[bkey] = bug
     prev_b = prev_bugs.get(bkey) if isinstance(prev_bugs.get(bkey), dict) else {}
@@ -11655,17 +11720,21 @@ function bugSubtasksHtml(bug, data) {
 }
 
 function bugFocusCard(bug, data) {
+  // Reserve red alert styling on P0 issues for owned bugs, not collaborator consults
   const isAlert = Boolean(bug.is_overdue || bug.issue_type === 'VULNERABILITY' ||
-    bug.priority === 'P0');
+    (bug.priority === 'P0' && !bug.is_collaborator));
   const busyBadge = bug.chat_busy
     ? '<span class="busy-pill"><i class="dot moving"></i>Chat is working</span> · ' : '';
+  const ownerActor = (bug.assignee && bug.assignee !== 'N/A') ? shortActor(bug.assignee) : '';
+  const collabTag = bug.is_collaborator
+    ? ` · Collaborator${ownerActor ? ` (owner: ${esc(ownerActor)})` : ''}` : '';
   const typeTag = (bug.issue_type && bug.issue_type !== 'BUG') ? ` · ${esc(bug.issue_type)}` : '';
   const sloPart = bug.slo_summary ? ` · <span class="red">${esc(bug.slo_summary)}</span>` : '';
   const ackBtn = `<button class="btn secondary" ` +
     `onclick="ackBug(${esc(JSON.stringify(bug.bug_key || ''))}, this)">✓ Ack</button>`;
   return `<article class="card${isAlert ? ' alert' : ''}">` +
     `<div><div class="eyebrow">${busyBadge}${esc(bug.project_name || 'Skia')} · ` +
-    `${link(bug.url, esc(bug.short_id || bug.bug_key))}${typeTag}</div>` +
+    `${link(bug.url, esc(bug.short_id || bug.bug_key))}${collabTag}${typeTag}</div>` +
     `<h2>${bugPriorityBadgeHtml(bug)}${link(bug.url, esc(bug.title))}</h2>` +
     `<div class="why">${esc(bug.why_needs_you || 'Needs triage')}${sloPart}</div></div>` +
     `<div class="actions">${link(bug.url, 'Open issue', 'btn primary')}` +
@@ -11674,10 +11743,14 @@ function bugFocusCard(bug, data) {
 }
 
 function bugRowHtml(bug, data) {
+  const ownerActor = (bug.assignee && bug.assignee !== 'N/A') ? shortActor(bug.assignee) : '';
+  const actorMeta = bug.is_collaborator
+    ? `Collaborator${ownerActor ? ` · owner: ${esc(ownerActor)}` : ''}`
+    : (ownerActor ? esc(ownerActor) : '');
   const meta = [
     `<span class="proj-tag">${esc(bug.project_name || 'Skia')}</span>`,
     `<span class="cl">${link(bug.url, esc(bug.short_id || bug.bug_key))}</span>`,
-    bug.assignee ? esc(shortActor(bug.assignee)) : '',
+    actorMeta,
     bugChatActionHtml(bug, data, true),
   ].filter(Boolean).join(' · ');
   const subs = Array.isArray(bug.linked_cls) ? bug.linked_cls : [];

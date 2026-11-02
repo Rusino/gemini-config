@@ -896,8 +896,8 @@ assert(
     self.assertEqual(bugs["buganizer:590000001"]["project_name"], "SkoreText")
     self.assertIn("Fix CoreText axis clamping", bugs["buganizer:590000001"]["title"])
 
-    # Colleague-assigned bug with a dedicated bug chat is retained
-    self.assertIn("buganizer:576507252", bugs)
+    # Colleague-assigned bug without self assignee, collaborator, or self-CL is excluded
+    self.assertNotIn("buganizer:576507252", bugs)
     self.assertIn("buganizer:576664769", bugs)
 
     # Chromium Gerrit URL host is preserved during parse_buganizer_blocks
@@ -946,7 +946,6 @@ assert(
     dark_hex = dark_amber.group(1).lower()
     self.assertEqual(dark_hex, "#fbbf24")
     self.assertGreaterEqual(wcag_contrast(dark_hex, "#19191d"), 8.0)
-
 
 if __name__ == "__main__":
   unittest.main()
