@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Contract tests for how cl_watcher turns Skia Gardener incidents into CL alerts."""
 
+import io
+import json
 import os
 import sys
 import tempfile
@@ -80,6 +82,47 @@ class IncidentVerdictTest(unittest.TestCase):
     self.assertEqual(res["incidents"], [])
     self.assertEqual(res["skia_status"], "✓")
 
+  def test_compile_tree_breakage_advice(self):
+    inc = make_incident([CULPRIT])
+    inc["affected_tasks"] = [
+        {"classification": "COMPILE_FAILURE", "is_intermittent_flake": False}
+    ]
+    res = w.check_skia_post_submit(CULPRIT, {}, [inc], skia_dir="/nonexistent")
+    self.assertTrue(res["has_alert"])
+    self.assertIn(
+        "Compile or multi-bot tree breakage: revert immediately",
+        res["recommended_action"],
+    )
+
+  def test_single_bot_test_failure_advice(self):
+    inc = make_incident([CULPRIT])
+    inc["blame"]["reason"] = (
+        "Failing test correlation: commit modified 'tests/FontTest.cpp' "
+        "matching failing test 'SkRemoteGlyphCache_b576664769'"
+    )
+    res = w.check_skia_post_submit(CULPRIT, {}, [inc], skia_dir="/nonexistent")
+    self.assertTrue(res["has_alert"])
+    self.assertIn(
+        "Single-bot failure in SkRemoteGlyphCache_b576664769",
+        res["recommended_action"],
+    )
+
+  def test_external_author_sponsor_note_in_advice(self):
+    inc = make_incident([CULPRIT])
+    res = w.check_skia_post_submit(
+        CULPRIT,
+        {},
+        [inc],
+        skia_dir="/nonexistent",
+        is_self=False,
+        is_external=True,
+    )
+    self.assertTrue(res["has_alert"])
+    self.assertIn(
+        "External author cannot self-submit a revert or fix",
+        res["recommended_action"],
+    )
+
 
 class RollVerdictTest(unittest.TestCase):
 
@@ -115,6 +158,31 @@ class RollVerdictTest(unittest.TestCase):
     )
     self.assertTrue(res["has_alert"])
     self.assertEqual(res["rolls"]["Chrome"]["state"], "🔴")
+
+  def test_google3_roll_blame_advice(self):
+    rollers = {
+        "Google3": {
+            "current_roll_rev": "curr",
+            "last_roll_rev": "last",
+            "num_failed": 1,
+            "url": "https://autoroll.skia.org/r/google3-autoroll",
+            "diagnosis": {
+                "fault_category": "Skia",
+                "culprit_summary": "Broken by CL 1403456",
+            },
+        }
+    }
+    res = w.check_skia_post_submit(
+        BYSTANDER,
+        rollers,
+        [],
+        cl_id="1403456",
+        is_self=False,
+        is_external=True,
+    )
+    self.assertTrue(res["has_alert"])
+    self.assertIn("skia-roll-triage", res["recommended_action"])
+    self.assertIn("External author needs your CR+1/CQ+2", res["recommended_action"])
 
 
 class RollBadgeTitleTest(unittest.TestCase):
@@ -252,6 +320,153 @@ class AutorollFilterTest(unittest.TestCase):
 
     self.assertEqual(state["items"], {})
     mock_gmail.assert_not_called()
+
+
+class SponsoredExternalGerritStatusTest(unittest.TestCase):
+
+  def _mock_resp(self, payload):
+    raw = (")]}'\n" + json.dumps(payload)).encode("utf-8")
+    cm = mock.MagicMock()
+    cm.__enter__.return_value = io.BytesIO(raw)
+    cm.__exit__.return_value = False
+    return cm
+
+  def _gerrit_payload(
+      self,
+      *,
+      status="MERGED",
+      owner_email="contrib@example.org",
+      ps_num=2,
+      self_cr=1,
+      files=None,
+      messages=None,
+      in_my_att=False,
+  ):
+    att = {}
+    if in_my_att:
+      att["1"] = {
+          "account": {"email": "jlavrova@google.com"},
+          "last_update": "2026-11-02 15:00:00.000000000",
+      }
+    return {
+        "status": status,
+        "subject": "Fix paragraph shaping edge case",
+        "project": "skia",
+        "owner": {"email": owner_email, "name": "Contributor"},
+        "current_revision": CULPRIT,
+        "revisions": {
+            CULPRIT: {
+                "_number": ps_num,
+                "created": "2026-11-02 14:00:00.000000000",
+                "commit": {"message": "Fix\n", "parents": []},
+                "files": {f: {} for f in (files or ["src/gpu/ganesh/Foo.cpp"])},
+            }
+        },
+        "reviewers": {"REVIEWER": [{"email": "jlavrova@google.com"}]},
+        "labels": {
+            "Code-Review": {
+                "all": (
+                    [{"email": "jlavrova@google.com", "value": self_cr}]
+                    if self_cr
+                    else []
+                )
+            },
+            "Commit-Queue": {"all": []},
+        },
+        "attention_set": att,
+        "messages": messages or [],
+        "updated": "2026-11-02 15:05:00.000000000",
+        "submitted": "2026-11-02 15:05:00.000000000" if status == "MERGED" else "",
+    }
+
+  def test_merged_sponsored_external_breakage_pages_needs_you(self):
+    payload = self._gerrit_payload(status="MERGED", owner_email="ext@example.org")
+    inc = make_incident([CULPRIT])
+    with mock.patch("urllib.request.urlopen", return_value=self._mock_resp(payload)):
+      info = w.fetch_gerrit_cl_status(
+          "1400736",
+          {},
+          [inc],
+          skia_dir="/nonexistent",
+          preferred_host="skia-review.googlesource.com",
+      )
+    self.assertEqual(info["phase"], "ALERT_ROLL_OR_STATUS")
+    self.assertTrue(info["is_sponsored_external"])
+    self.assertTrue(info["post_submit"]["has_alert"])
+
+  def test_merged_active_colleague_outside_text_dirs_stays_in_landing(self):
+    payload = self._gerrit_payload(
+        status="MERGED",
+        owner_email="colleague@google.com",
+        files=["src/gpu/ganesh/Foo.cpp"],
+    )
+    inc = make_incident([CULPRIT])
+    with mock.patch(
+        "urllib.request.urlopen", return_value=self._mock_resp(payload)
+    ), mock.patch.object(w, "google_account_active", return_value=True):
+      info = w.fetch_gerrit_cl_status(
+          "1400736",
+          {},
+          [inc],
+          skia_dir="/nonexistent",
+          preferred_host="skia-review.googlesource.com",
+      )
+    self.assertEqual(info["phase"], "POST_SUBMIT_ROLLING")
+    self.assertTrue(info["post_submit"]["has_alert"])
+
+  def test_external_cq_failure_pages_only_when_cr_active_on_current_ps(self):
+    cq_fail_msgs = [
+        {
+            "_revision_number": 1,
+            "author": {"email": "jlavrova@google.com"},
+            "message": "Patch Set 1: Code-Review+1",
+            "date": "2026-11-02 14:10:00.000000000",
+        },
+        {
+            "_revision_number": 2,
+            "author": {"email": "skia-commit-bot@chromium.org"},
+            "message": "Patch Set 2: This CL failed the SkCQ",
+            "date": "2026-11-02 15:00:00.000000000",
+        },
+    ]
+    approved_cur = self._gerrit_payload(
+        status="NEW",
+        owner_email="ext@example.org",
+        ps_num=2,
+        self_cr=1,
+        messages=cq_fail_msgs,
+    )
+    with mock.patch(
+        "urllib.request.urlopen", return_value=self._mock_resp(approved_cur)
+    ), mock.patch.object(w, "gerrit_mergeable", return_value=True):
+      info_approved = w.fetch_gerrit_cl_status(
+          "1400736",
+          {},
+          [],
+          skia_dir="/nonexistent",
+          preferred_host="skia-review.googlesource.com",
+      )
+    self.assertEqual(info_approved["phase"], "ALERT_CQ_FAILED")
+
+    unapproved_new_ps = self._gerrit_payload(
+        status="NEW",
+        owner_email="ext@example.org",
+        ps_num=2,
+        self_cr=0,
+        in_my_att=True,
+        messages=cq_fail_msgs,
+    )
+    with mock.patch(
+        "urllib.request.urlopen", return_value=self._mock_resp(unapproved_new_ps)
+    ), mock.patch.object(w, "gerrit_mergeable", return_value=True):
+      info_unapproved = w.fetch_gerrit_cl_status(
+          "1400736",
+          {},
+          [],
+          skia_dir="/nonexistent",
+          preferred_host="skia-review.googlesource.com",
+      )
+    self.assertEqual(info_unapproved["phase"], "NEEDS_YOUR_ACTION")
 
 
 if __name__ == "__main__":

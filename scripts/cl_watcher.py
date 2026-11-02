@@ -2601,15 +2601,21 @@ def discover_open_remote_changes(
         "chat_busy": False,
     }
 
-  # Include self-authored changes merged in the last 3 days so post-submit rolls
-  # and fixes stay tracked
-  gerrit_q = (
-      "((status:open+((owner:jlavrova@google.com+OR+owner:jlavrova@gmail.com)"
-      "+OR+((reviewer:jlavrova@google.com+OR+reviewer:jlavrova@gmail.com)+-is:wip)))"
-      "+OR+(status:merged+(owner:jlavrova@google.com+OR+owner:jlavrova@gmail.com)+-age:3d))"
-  )
+  # Include self-authored changes merged in the last 3 days (plus reviewed Skia
+  # changes where Gardener tracks post-submit tree/roll health)
   for host in GERRIT_HOSTS:
-    url = f"https://{host}/changes/?q={gerrit_q}&n=50"
+    merged_clause = (
+        "(owner:jlavrova@google.com+OR+owner:jlavrova@gmail.com"
+        "+OR+reviewer:jlavrova@google.com+OR+reviewer:jlavrova@gmail.com)"
+        if host == GERRIT_SKIA_HOST
+        else "(owner:jlavrova@google.com+OR+owner:jlavrova@gmail.com)"
+    )
+    gerrit_q = (
+        "((status:open+((owner:jlavrova@google.com+OR+owner:jlavrova@gmail.com)"
+        "+OR+((reviewer:jlavrova@google.com+OR+reviewer:jlavrova@gmail.com)+-is:wip)))"
+        f"+OR+(status:merged+{merged_clause}+-age:3d))"
+    )
+    url = f"https://{host}/changes/?q={gerrit_q}&n=100"
     try:
       req = urllib.request.Request(url, headers={"User-Agent": "CLFlightDeck/1.0"})
       with urllib.request.urlopen(req, timeout=10) as resp:
@@ -2827,7 +2833,85 @@ def classify_incident_for_commit(
       # Multi-bot and test metadata for fix-for matching and incident expansion
       "affected_tasks": affected_list,
       "failing_test": failing_test,
+      "is_compile": is_compile,
+      "multi_bot": multi_bot,
   }
+
+
+def build_post_submit_advice(
+    res: dict[str, Any], is_self: bool = True, is_external: bool = False
+) -> str:
+  """Produces deterministic action advice for landed commits with post-submit alerts."""
+  if not res.get("has_alert"):
+    return ""
+
+  blamed = [
+      h for h in res.get("incidents") or [] if h.get("verdict") == "blamed"
+  ]
+  broken_bots = res.get("broken_bots") or []
+  rolls = res.get("rolls") or {}
+  failed_rolls = [
+      rname
+      for rname, rinfo in rolls.items()
+      if (rinfo or {}).get("state") == "🔴"
+  ]
+
+  # Case A: Blamed on Skia post-submit tree
+  if blamed:
+    is_compile = any(h.get("is_compile") for h in blamed)
+    multi_bot = (
+        any(h.get("multi_bot") for h in blamed)
+        or len(broken_bots) >= 2
+        or len(blamed) >= 2
+    )
+    if is_compile or multi_bot:
+      base = (
+          "Compile or multi-bot tree breakage: revert immediately unless a"
+          " trivial fix is ready"
+      )
+    else:
+      failing_test = next(
+          (h.get("failing_test") for h in blamed if h.get("failing_test")), ""
+      )
+      if failing_test:
+        base = (
+            f"Single-bot failure in {failing_test}: check platform/font-backend"
+            " metric assumptions or upload a fix-for CL (revert if not quick)"
+        )
+      else:
+        bot_names = [
+            b.get("task_name") for b in broken_bots if b.get("task_name")
+        ]
+        bot_str = f" on {bot_names[0]}" if bot_names else ""
+        base = (
+            f"Post-submit bot failure{bot_str}: inspect task logs via 'See"
+            " failure' and prepare a fix-for CL or revert"
+        )
+    if is_external and not is_self:
+      base += (
+          ". External author cannot self-submit a revert or fix — sponsor or"
+          " land it"
+      )
+    return base
+
+  # Case B: Blamed in a failing autoroller
+  if failed_rolls:
+    if "Google3" in failed_rolls:
+      base = (
+          "Google3 autoroll blames this commit: external/OSS authors cannot see"
+          " internal TAP failures — click 'Start chat' to run skia-roll-triage"
+      )
+    else:
+      rlist = ", ".join(failed_rolls)
+      base = (
+          f"{rlist} autoroll blames this commit: inspect roll trybot logs or"
+          " revert on Skia main to unblock the roller"
+      )
+    if is_external and not is_self:
+      base += ". External author needs your CR+1/CQ+2 to land a fix or revert"
+    return base
+
+  return "Post-submit alert: inspect task logs and verify tree health"
 
 
 def check_skia_post_submit(
@@ -2836,6 +2920,8 @@ def check_skia_post_submit(
     incidents: list[dict[str, Any]],
     skia_dir: str = DEFAULT_SKIA_DIR,
     cl_id: str = "",
+    is_self: bool = True,
+    is_external: bool = False,
 ) -> dict[str, Any]:
   """Checks Skia tree status and the 4 outgoing autorollers for a merged Skia commit."""
   res: dict[str, Any] = {
@@ -2855,6 +2941,7 @@ def check_skia_post_submit(
       "all_passed": False,
       "has_alert": False,
       "alert_reason": "",
+      "recommended_action": "",
       "compact_badge": "",
   }
   if not merged_sha:
@@ -2986,6 +3073,10 @@ def check_skia_post_submit(
   else:
     st_tok = "✓St" if res["skia_status"] == "✓" else "⏳St"
     res["compact_badge"] = f"[{st_tok} · {passed_rolls}/4 rolls]"
+
+  res["recommended_action"] = build_post_submit_advice(
+      res, is_self=is_self, is_external=is_external
+  )
 
   return res
 
@@ -3849,6 +3940,31 @@ def fetch_gerrit_cl_status(
       if self_cr_vote > 0 and self_approval_ps == 0:
         self_approval_ps = ps_num
 
+      # Sponsor responsibility covers our own commits, external authors we reviewed,
+      # departed Googlers, and approved changes inside our text modules
+      self_approved = bool(
+          self_cr_vote > 0
+          or self_approval_ps > 0
+          or (approved_emails & SELF_EMAILS)
+      )
+      is_sponsored_external = bool(
+          not is_self and is_external and (self_approved or is_reviewer)
+      )
+      touches_my_text_dirs = any(
+          f.startswith(
+              ("modules/skparagraph/", "modules/skunicode/", "modules/skshaper/")
+          )
+          for f in files
+      )
+      should_own_post_submit_alert = bool(
+          is_self
+          or is_sponsored_external
+          or (not is_external and not google_account_active(owner_email))
+          or (self_approved and touches_my_text_dirs)
+      )
+      # Only page on external pre-submit CQ failures when CR+1 is active on the current PS
+      should_own_cq_alert = bool(is_self or (is_external and self_cr_vote > 0))
+
       last_msg_author, last_msg_name, last_msg_date, last_msg_text = (
           _extract_gerrit_last_message(
               messages, thread_stats.get("latest_reply_by_author")
@@ -3917,8 +4033,8 @@ def fetch_gerrit_cl_status(
         )
       elif status == "ABANDONED":
         status_changed_raw = latest_timestamp(last_msg_date, updated_raw)
-      # Only my own changes enter the pre-submit CQ failure alert phase
-      elif cq_failed and is_self:
+      # Alert on pre-submit CQ failures for our own changes or sponsored external CLs
+      elif cq_failed and should_own_cq_alert:
         status_changed_raw = cq_msg_date or latest_timestamp(
             last_msg_date, updated_raw
         )
@@ -3945,7 +4061,13 @@ def fetch_gerrit_cl_status(
       post_submit = None
       if status == "MERGED" and host == "skia-review.googlesource.com":
         post_submit = check_skia_post_submit(
-            cur_sha, rollers, incidents, skia_dir=skia_dir, cl_id=cl_id
+            cur_sha,
+            rollers,
+            incidents,
+            skia_dir=skia_dir,
+            cl_id=cl_id,
+            is_self=is_self,
+            is_external=is_external,
         )
 
       if status == "ABANDONED":
@@ -3953,7 +4075,11 @@ def fetch_gerrit_cl_status(
       elif status == "MERGED":
         if post_submit:
           if post_submit["has_alert"]:
-            phase = "ALERT_ROLL_OR_STATUS"
+            if should_own_post_submit_alert:
+              phase = "ALERT_ROLL_OR_STATUS"
+            else:
+              # Active internal colleague's CL outside our text dirs stays in Landing
+              phase = "POST_SUBMIT_ROLLING"
           elif post_submit["all_passed"]:
             phase = "READY_TO_CLOSE"
           else:
@@ -3961,8 +4087,8 @@ def fetch_gerrit_cl_status(
         else:
           phase = "READY_TO_CLOSE"
       else:
-        # Pre-submit CQ failures belong to the CL author
-        if cq_failed and is_self:
+        # Pre-submit CQ failures belong to the CL author or sponsoring reviewer
+        if cq_failed and should_own_cq_alert:
           phase = "ALERT_CQ_FAILED"
         elif max_cq == 2:
           phase = "SUBMITTING"
@@ -4014,6 +4140,7 @@ def fetch_gerrit_cl_status(
           "role": role,
           "is_self": is_self,
           "is_external": is_external,
+          "is_sponsored_external": is_sponsored_external,
           "is_draft": is_draft,
           "is_wip": is_wip,
           "wip_label": wip_label,
@@ -7931,7 +8058,8 @@ def sync_once(
       is_fix = bool(d.get("fixes_breakage_from"))
       has_fix = bool(ikey in fix_targets)
       has_open_companion = bool(ikey in open_companion_parents)
-      rolling = bool(not ps.get("all_passed") or ps.get("has_alert"))
+      # Only Skia commits have post_submit roll tracking; None means nothing is rolling
+      rolling = bool(ps and (not ps.get("all_passed") or ps.get("has_alert")))
       _, prev_d = _lookup_state_item(prev_items, ikey)
       just_merged = bool(
           prev_d and str(prev_d.get("status") or "").upper() != "MERGED"
@@ -8179,9 +8307,11 @@ def sync_once(
         reason = (
             post.get("alert_reason") or "Post-submit regression or roll failure"
         )
+        advice = post.get("recommended_action") or ""
+        advice_str = f" Рекомендация: {advice}." if advice else ""
         transition_msg = (
             f"[CL-WATCHER] 🔴 CRITICAL ALERT для {ikey} ({info['revision'][:10]}): "
-            f"{reason}. Немедленно проверь skia-gardener / status.skia.org и подготовь "
+            f"{reason}.{advice_str} Немедленно проверь skia-gardener / status.skia.org и подготовь "
             f"диагностику."
         )
       elif (
@@ -8192,8 +8322,13 @@ def sync_once(
       ):
         # Skip critical wakeup on pre-review changes still in On your desk
         is_critical = True
+        ext_note = (
+            " (внешний автор, твой аппрув)"
+            if info.get("is_external") and not info.get("is_self")
+            else ""
+        )
         transition_msg = (
-            f"[CL-WATCHER] 🔴 Упал CQ / Presubmit на {ikey} (PS{info['patchset']}): "
+            f"[CL-WATCHER] 🔴 Упал CQ / Presubmit на {ikey}{ext_note} (PS{info['patchset']}): "
             f"{info['last_msg_snippet']}. Проверь причину падения и предложи фикс."
         )
       elif post.get("all_passed") and not prev_all_passed:
@@ -10026,7 +10161,8 @@ function formatStatusTime(it, fallbackEt, fallbackAge) {
 
 // One predicate drives the headline count and the focus cards
 function needsMyReply(it) {
-  return Boolean(it.in_my_attention) && !(it.cq_failed && it.is_self) &&
+  return Boolean(it.in_my_attention) && it.phase !== 'ALERT_CQ_FAILED' &&
+    !(it.cq_failed && it.is_self) &&
     it.phase !== 'SUBMITTING' && !it.is_draft && !it.in_development &&
     // On my own CL a dry-run bot note keeps me in attention_set without asking a question
     !(it.is_self && shortActor(it.last_msg_author) === 'SkCQ');
@@ -11040,7 +11176,10 @@ function focusCard(it, data) {
       ? ` · <span class="fix-stage-pill ${esc(fixStageInfo(firstFix).tone)}">` +
         `${esc(fixStageInfo(firstFix).stageLabel)}</span>`
       : '';
-    const eyebrow = `${baseEyebrow}${fixPill}`;
+    const sponsorBadge = (!it.is_self && it.is_external)
+      ? ' · <span class="badge">Sponsored external</span>'
+      : '';
+    const eyebrow = `${baseEyebrow}${fixPill}${sponsorBadge}`;
     const first = incidents[0] || {};
     const primary = link(first.task_url || STATUS_SKIA_URL, 'See failure', 'btn primary');
     const landedAt = formatStatusTime(it, it.submitted_et, it.submitted_age);
@@ -11049,9 +11188,21 @@ function focusCard(it, data) {
     const blame = incidents.length
       ? ` Gardener lists ${incidents.length} failing task${incidents.length > 1 ? 's' : ''}.`
       : '';
+    // Prefer live fix-for CL progress over initial breakage triage advice
+    let adviceText = '';
+    if (firstFix && (firstFix.status === 'MERGED' || firstFix.stage === 'merged')) {
+      adviceText = 'Fix/revert already landed — waiting for Gardener bot/roller to cycle green.';
+    } else if (firstFix) {
+      adviceText = 'Fix/revert CL is in review — land it to clear the breakage.';
+    } else if (ps.recommended_action) {
+      adviceText = ps.recommended_action;
+    }
+    const adviceHtml = adviceText
+      ? `<div class="why-context"><b>Recommended:</b> ${esc(adviceText)}</div>`
+      : '';
     const whyContent = fixPrimary
-      ? `${fixPrimary}<div class="why-context">${landed}${blame}</div>`
-      : `${landed}${blame}`;
+      ? `${fixPrimary}<div class="why-context">${landed}${blame}</div>${adviceHtml}`
+      : `${landed}${blame}${adviceHtml}`;
     return `
     <article class="card alert">
       <div><div class="eyebrow">${busyBadge}${eyebrow} · ${esc(it.project_name)} ·
@@ -11104,7 +11255,13 @@ function focusCard(it, data) {
     actions = rebaseActionHtml(it) +
       link(it.url, `Open ${kindWord}`, 'btn secondary') + chatBtn;
   } else if (it.phase === 'ALERT_CQ_FAILED') {
-    why = `The commit queue failed · ${formatStatusTime(it)}`;
+    // External authors cannot re-trigger Skia CQ+2 or Canary-G3 without a Googler sponsor
+    if (!it.is_self && it.is_external) {
+      why = `Pre-submit CQ / tryjobs failed after your CR+1 (external author) · ` +
+        `${formatStatusTime(it)} · Keep Canary-G3 hold unresolved or help author fix`;
+    } else {
+      why = `The commit queue failed · ${formatStatusTime(it)}`;
+    }
     actions = link(checksUrl(it), 'See checks', 'btn primary') + chatBtn;
   } else {
     const from = link(actorUrl(it, it.last_msg_author), esc(shortActor(it.last_msg_author, it)));
