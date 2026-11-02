@@ -1172,6 +1172,7 @@ def attach_archived_chats_to_open_changes(
 
 _RELATED_CLS_CACHE: dict[str, list[str]] = {}
 _RELATED_STACK_ORDER_CACHE: dict[str, list[str]] = {}
+_RELATED_RAW_CHANGES_CACHE: dict[str, list[dict[str, Any]]] = {}
 
 
 def fetch_gerrit_related_cl_ids(host: str, cl_id: str) -> list[str]:
@@ -1189,13 +1190,14 @@ def fetch_gerrit_related_cl_ids(host: str, cl_id: str) -> list[str]:
     if raw.startswith(")]}'"):
       raw = raw[4:]
     data = json.loads(raw)
-    changes = data.get("changes") or []
+    changes = [ch for ch in (data.get("changes") or []) if isinstance(ch, dict)]
+    # Retain full revision chain including MERGED/ABANDONED entries for companion parent matching
+    _RELATED_RAW_CHANGES_CACHE[cache_key] = changes
     # Build graph of active (not MERGED/ABANDONED) changes in the revision stack
     active_changes = [
         ch
         for ch in changes
-        if isinstance(ch, dict)
-        and str(ch.get("status") or "").upper() not in ("MERGED", "ABANDONED")
+        if str(ch.get("status") or "").upper() not in ("MERGED", "ABANDONED")
     ]
     # Record bottom-up stack order across all active changes in the revision chain
     ordered_stack_nums: list[str] = []
@@ -1267,6 +1269,112 @@ def fetch_gerrit_stack_order_ids(host: str, cl_id: str) -> list[str]:
   return _RELATED_STACK_ORDER_CACHE.get(cache_key, [str(cl_id)])
 
 
+def _resolve_gerrit_stack_companion_parent(
+    host: str,
+    tid: str,
+    subj: str,
+    info: dict[str, Any],
+    fetched_cache: dict[str, dict[str, Any]],
+    related_ids: Iterable[str],
+) -> tuple[str, int]:
+  """Resolves the direct non-self parent change key and base PS for a stacked self CL."""
+  # A non-WIP self CL already sent out to reviewers without companion markers is standalone
+  if (
+      "in_development" in info
+      and not info.get("is_wip")
+      and not info.get("is_draft")
+      and not info.get("in_development")
+      and "companion" not in subj.lower()
+  ):
+    return "", 0
+
+  has_companion_kw = "companion" in subj.lower()
+  # Index commit SHAs -> (change_num, is_self, is_comp_subj, base_ps, parent_sha)
+  sha_to_entry: dict[str, tuple[str, bool, bool, int, str]] = {}
+  for fk, finfo in fetched_cache.items():
+    if not fk.startswith("gerrit:") or not isinstance(finfo, dict):
+      continue
+    fnum = fk.split(":", 1)[1]
+    fis_self = bool(finfo.get("is_self", False))
+    fis_comp = "companion" in str(finfo.get("subject") or "").lower()
+    fpsha = str(finfo.get("parent_commit") or "").strip()
+    for rsha, rps in (finfo.get("revision_ps_by_sha") or {}).items():
+      if rsha:
+        sha_to_entry[str(rsha)] = (fnum, fis_self, fis_comp, int(rps or 0), fpsha)
+
+  start_parent_sha = str(info.get("parent_commit") or "").strip()
+  self_emails_lc = {e.lower() for e in SELF_EMAILS}
+  raw_changes = _RELATED_RAW_CHANGES_CACHE.get(f"{host}:{tid}") or []
+  for ch in raw_changes:
+    cnum = str(ch.get("_change_number") or "").strip()
+    commit_obj = ch.get("commit") or {}
+    csha = str(commit_obj.get("commit") or "").strip()
+    parents = commit_obj.get("parents") or []
+    psha = (
+        str(parents[0].get("commit") or "").strip()
+        if parents and isinstance(parents[0], dict)
+        else ""
+    )
+    f_override = fetched_cache.get(f"gerrit:{cnum}")
+    if isinstance(f_override, dict) and "is_self" in f_override:
+      cis_self = bool(f_override["is_self"])
+    else:
+      a_email = (
+          str(((commit_obj.get("author") or {}).get("email")) or "")
+          .strip()
+          .lower()
+      )
+      cis_self = a_email in self_emails_lc
+    csubj = str(
+        (f_override.get("subject") if isinstance(f_override, dict) else None)
+        or commit_obj.get("subject")
+        or ""
+    )
+    cis_comp = "companion" in csubj.lower()
+    rev_num = int(ch.get("_revision_number") or 0)
+    if csha and csha not in sha_to_entry:
+      sha_to_entry[csha] = (cnum, cis_self, cis_comp, rev_num, psha)
+    if cnum == tid and not start_parent_sha and psha:
+      start_parent_sha = psha
+
+  # Walk parent_commit across any intermediate self-companions to find the non-self parent
+  if start_parent_sha:
+    cur_sha = start_parent_sha
+    visited: set[str] = set()
+    self_fallback: tuple[str, int] = ("", 0)
+    for _ in range(32):
+      if not cur_sha or cur_sha in visited or cur_sha not in sha_to_entry:
+        break
+      visited.add(cur_sha)
+      cnum, cis_self, cis_comp, rev_num, next_psha = sha_to_entry[cur_sha]
+      if cnum == tid:
+        break
+      if not cis_self:
+        return f"gerrit:{cnum}", rev_num
+      # Record non-companion self parent only as fallback when no external ancestor exists
+      if has_companion_kw and not cis_comp and not self_fallback[0]:
+        self_fallback = (f"gerrit:{cnum}", rev_num)
+      cur_sha = next_psha
+    return self_fallback
+
+  # Fall back to active related IDs only when parent_commit metadata is absent
+  self_rel_fallback = ""
+  for rel_id in related_ids:
+    if str(rel_id) == tid:
+      continue
+    cand_key = f"gerrit:{rel_id}"
+    rel_info = fetched_cache.get(cand_key) or {}
+    if not bool(rel_info.get("is_self", False)):
+      return cand_key, 0
+    if (
+        has_companion_kw
+        and not self_rel_fallback
+        and "companion" not in str(rel_info.get("subject") or "").lower()
+    ):
+      self_rel_fallback = cand_key
+  return self_rel_fallback, 0
+
+
 def link_companion_changes_to_parent_chats(
     active_discovered: list[dict[str, Any]],
     fetched_cache: dict[str, dict[str, Any]],
@@ -1295,9 +1403,11 @@ def link_companion_changes_to_parent_chats(
     d_is_self = bool(info.get("is_self", False))
     parent: dict[str, Any] | None = None
     parent_key = ""
+    base_ps_hint = 0
     is_comp = False
 
     if d.get("kind") == "gerrit":
+      tid = str(d.get("target_id") or "")
       host = str(
           d.get("preferred_host")
           or info.get("host")
@@ -1312,46 +1422,42 @@ def link_companion_changes_to_parent_chats(
         parent_key = cand_key
         is_comp = True
       else:
-        related = fetch_gerrit_related_cl_ids(host, d.get("target_id", ""))
-        for rel_id in related:
-          if str(rel_id) == str(d.get("target_id", "")):
-            continue
-          cand_key = f"gerrit:{rel_id}"
-          cand_parent = known_chats.get(cand_key) or by_item_key.get(cand_key)
-          if not cand_parent:
-            continue
-          rel_info = fetched_cache.get(cand_key) or {}
-          # Never inherit archived chat from a MERGED or ABANDONED change without explicit companion
-          if str(rel_info.get("status") or "").upper() in ("MERGED", "ABANDONED"):
-            continue
-          rel_is_self = bool(rel_info.get("is_self", False))
-          # A companion stacks on a non-self CL or carries explicit companion markers in its subject
-          is_candidate_comp = (
-              d_is_self
-              and (not rel_is_self or "companion" in subj.lower())
+        related = fetch_gerrit_related_cl_ids(host, tid)
+        if d_is_self:
+          comp_cand_key, comp_ps = _resolve_gerrit_stack_companion_parent(
+              host, tid, subj, info, fetched_cache, related
+          )
+          cand_obj = (
+              known_chats.get(comp_cand_key) or by_item_key.get(comp_cand_key)
+              if comp_cand_key
+              else None
           )
           # Prevent cyclic A <-> B companion links
-          if cand_parent.get("companion_to") == ikey:
-            is_candidate_comp = False
-          # Only inherit a stack sibling's chat for companions or own-author stacks
-          can_inherit_stack_chat = (
-              is_candidate_comp
-              or (d_is_self and rel_is_self)
-          )
-          if (
-              not d.get("conversation_id")
-              and cand_parent.get("conversation_id")
-              and can_inherit_stack_chat
+          if comp_cand_key and not (
+              cand_obj and cand_obj.get("companion_to") == ikey
           ):
-            parent = cand_parent
-            parent_key = cand_key if is_candidate_comp else ""
-            is_comp = is_candidate_comp
-            break
-          if is_candidate_comp:
-            parent = cand_parent
-            parent_key = cand_key
+            parent = cand_obj
+            parent_key = comp_cand_key
+            base_ps_hint = comp_ps
             is_comp = True
-            break
+        # Inherit an active stack sibling's chat across multi-CL self-authored stacks
+        if not is_comp and d_is_self and not d.get("conversation_id"):
+          for rel_id in related:
+            if str(rel_id) == tid:
+              continue
+            cand_key = f"gerrit:{rel_id}"
+            cand_parent = known_chats.get(cand_key) or by_item_key.get(cand_key)
+            if not cand_parent or not cand_parent.get("conversation_id"):
+              continue
+            rel_info = fetched_cache.get(cand_key) or {}
+            if str(rel_info.get("status") or "").upper() in (
+                "MERGED",
+                "ABANDONED",
+            ):
+              continue
+            if bool(rel_info.get("is_self", False)):
+              parent = cand_parent
+              break
     elif d.get("kind") == "github":
       m = RE_COMPANION_PR_REF.search(subj) or RE_COMPANION_PR_REF.search(
           str(info.get("commit_message") or "")
@@ -1369,6 +1475,8 @@ def link_companion_changes_to_parent_chats(
     if is_comp and parent_key:
       d["companion_to"] = parent_key
       d["is_companion"] = True
+      if base_ps_hint > 0:
+        d["companion_base_ps_hint"] = base_ps_hint
 
     if parent and parent.get("conversation_id"):
       if not d.get("conversation_id"):
@@ -4897,7 +5005,11 @@ def _discover_existing_chat_for_item(
       True if not rec or "is_self" not in rec else bool(rec.get("is_self"))
   )
   is_companion_ref = False
-  if by_key and ikey.startswith("gerrit:"):
+  known_comp_to = str((rec or {}).get("companion_to") or "").strip()
+  if by_key and known_comp_to and rec_is_self:
+    parent_keys = [known_comp_to]
+    is_companion_ref = True
+  elif by_key and ikey.startswith("gerrit:"):
     tid = ikey.split(":", 1)[1]
     host = str(
         (rec or {}).get("host")
@@ -5512,12 +5624,19 @@ def resolve_gerrit_companion_threads(
 
 
 def abandon_companion_items(
-    item_keys: list[str], reason: str = ""
+    item_keys: list[str],
+    reason: str = "",
+    *,
+    state: dict[str, Any] | None = None,
+    auto: bool = False,
 ) -> dict[str, Any]:
   """Abandons companion CLs or PRs and resolves parent Gerrit review comments."""
-  state = load_watcher_state()
-  items = state.get("items") or {}
-  events = state.get("events") or []
+  own_state = state is None
+  if own_state:
+    state = load_watcher_state()
+  assert state is not None
+  items = state.setdefault("items", {})
+  events = state.setdefault("events", [])
   abandoned: list[str] = []
   errors: list[str] = []
   resolved_total = 0
@@ -5541,11 +5660,14 @@ def abandon_companion_items(
     if not rec.get("is_self"):
       errors.append(f"{ikey}: cannot abandon external author's change")
       continue
+    if auto and str(rec.get("status") or "").upper() not in ("NEW", "OPEN"):
+      continue
 
     kind = str(rec.get("kind") or "")
     tid = str(rec.get("target_id") or "")
     host = str(rec.get("host") or GERRIT_SKIA_HOST)
     parent_key = str(rec.get("companion_to") or "")
+    item_reason = reason or str(rec.get("ready_to_abandon_reason") or "").strip()
 
     if kind == "gerrit":
       bearer = _get_gerrit_bearer_token(host)
@@ -5553,9 +5675,12 @@ def abandon_companion_items(
         errors.append(f"{ikey}: no Gerrit credential for {host}")
         continue
       url = f"https://{host}/a/changes/{tid}/abandon"
-      body = json.dumps(
-          {"message": reason or "Abandoning companion WIP CL."}
-      ).encode("utf-8")
+      abandon_msg = (
+          f"Auto-abandoning companion WIP CL: {item_reason}."
+          if (auto and item_reason)
+          else (item_reason or "Abandoning companion WIP CL.")
+      )
+      body = json.dumps({"message": abandon_msg}).encode("utf-8")
       req = urllib.request.Request(
           url,
           data=body,
@@ -5614,6 +5739,7 @@ def abandon_companion_items(
       m_rec["phase"] = "ABANDONED"
       m_rec["in_my_attention"] = False
       m_rec["ready_to_abandon"] = False
+      m_rec["auto_abandon_eligible"] = False
       m_rec["companion_state"] = "abandoned"
       m_rec["companion_duplicate"] = False
       m_rec["status_changed_raw"] = now_iso
@@ -5631,6 +5757,12 @@ def abandon_companion_items(
           ]
 
     abandoned.append(ikey)
+    prefix = (
+        "[CL-WATCHER] 🗑️ Auto-abandoned"
+        if auto
+        else "[FLIGHT-DECK] 🗑️ Abandoned"
+    )
+    reason_sfx = f" — {item_reason}" if (auto and item_reason) else ""
     events.insert(
         0,
         {
@@ -5642,14 +5774,15 @@ def abandon_companion_items(
             "project_name": str(rec.get("project_name") or "Unassigned"),
             "critical": False,
             "message": (
-                f"[FLIGHT-DECK] 🗑️ Abandoned companion {ikey} "
-                f"('{rec.get('subject') or ikey}')."
+                f"{prefix} companion {ikey} "
+                f"('{rec.get('subject') or ikey}'){reason_sfx}."
             ),
         },
     )
 
   state["events"] = events[:50]
-  save_watcher_state(state)
+  if own_state:
+    save_watcher_state(state)
   return {
       "ok": len(errors) == 0,
       "abandoned": abandoned,
@@ -5659,7 +5792,10 @@ def abandon_companion_items(
 
 
 def compute_companion_states(
-    new_items: dict[str, Any], *, skia_dir: str = DEFAULT_SKIA_DIR
+    new_items: dict[str, Any],
+    *,
+    skia_dir: str = DEFAULT_SKIA_DIR,
+    parent_fallback_cache: dict[str, dict[str, Any]] | None = None,
 ) -> None:
   """Suppresses companion noise, computes ready-to-abandon triggers, and deduplicates."""
   by_ikey: dict[str, list[dict[str, Any]]] = {}
@@ -5682,6 +5818,7 @@ def compute_companion_states(
     rec["is_draft"] = False
     rec["in_development"] = False
     rec["is_watching"] = False
+    rec["auto_abandon_eligible"] = False
     if str(rec.get("status") or "").upper() in ("NEW", "OPEN"):
       rec["in_my_attention"] = False
       rec["phase"] = "WAITING_ON_OTHERS"
@@ -5703,22 +5840,65 @@ def compute_companion_states(
 
   for parent_key, comp_recs in comps_by_parent.items():
     parent_recs = by_ikey.get(parent_key) or []
-    parent_rec = parent_recs[0] if parent_recs else {}
+    parent_rec = (
+        parent_recs[0]
+        if parent_recs
+        else ((parent_fallback_cache or {}).get(parent_key) or {})
+    )
     parent_status = str(parent_rec.get("status") or "").upper()
+    parent_ps = int(parent_rec.get("patchset") or 0)
     parent_self_approved = bool(parent_rec.get("self_approved", False))
     parent_approval_ps = int(
-        parent_rec.get("self_approval_ps")
-        or parent_rec.get("patchset")
-        or 0
+        parent_rec.get("self_approval_ps") or parent_ps or 0
     )
     parent_revs = parent_rec.get("revision_ps_by_sha") or {}
+    parent_head_sha = str(parent_rec.get("head_sha") or "").strip()
 
-    # Map open companions by unique item_key
+    # Map companion revisions so chained A -> B companions share base_ps and avoid false dedup
+    comp_parent_by_sha: dict[str, str] = {}
+    comp_ikey_by_sha: dict[str, str] = {}
+    comp_ikey_by_head_ref: dict[str, str] = {}
+    for cr in comp_recs:
+      cr_ikey = str(cr.get("item_key") or "")
+      cr_pcommit = str(cr.get("parent_commit") or "").strip()
+      for rev_sha in (cr.get("revision_ps_by_sha") or {}).keys():
+        if rev_sha:
+          comp_parent_by_sha[str(rev_sha)] = cr_pcommit
+          if cr_ikey:
+            comp_ikey_by_sha[str(rev_sha)] = cr_ikey
+      href = str(cr.get("head_ref") or "").strip()
+      if href and cr_ikey:
+        comp_ikey_by_head_ref[href] = cr_ikey
+
+    # Map open companions by unique item_key and record parent/child companion chains
     open_comps_by_ikey: dict[str, list[dict[str, Any]]] = {}
+    comp_chain_adj: dict[str, set[str]] = {}
     for r in comp_recs:
       if str(r.get("status") or "").upper() in ("NEW", "OPEN"):
-        open_comps_by_ikey.setdefault(str(r.get("item_key") or ""), []).append(r)
-        base_ps = int(parent_revs.get(str(r.get("parent_commit") or ""), 0))
+        r_ikey = str(r.get("item_key") or "")
+        open_comps_by_ikey.setdefault(r_ikey, []).append(r)
+        comp_chain_adj.setdefault(r_ikey, set())
+        cur_sha = str(r.get("parent_commit") or "").strip()
+        visited_shas: set[str] = set()
+        for _ in range(32):
+          if not cur_sha or cur_sha in parent_revs or cur_sha in visited_shas:
+            break
+          visited_shas.add(cur_sha)
+          anc_ikey = comp_ikey_by_sha.get(cur_sha, "")
+          if anc_ikey and anc_ikey != r_ikey:
+            comp_chain_adj.setdefault(r_ikey, set()).add(anc_ikey)
+            comp_chain_adj.setdefault(anc_ikey, set()).add(r_ikey)
+          if cur_sha not in comp_parent_by_sha:
+            break
+          cur_sha = comp_parent_by_sha[cur_sha]
+        bref = str(r.get("base_ref") or "").strip()
+        anc_gh = comp_ikey_by_head_ref.get(bref, "") if bref else ""
+        if anc_gh and anc_gh != r_ikey:
+          comp_chain_adj.setdefault(r_ikey, set()).add(anc_gh)
+          comp_chain_adj.setdefault(anc_gh, set()).add(r_ikey)
+        base_ps = int(parent_revs.get(cur_sha, 0)) or int(
+            r.get("companion_base_ps_hint") or 0
+        )
         r["companion_base_ps"] = base_ps
 
     thread_map: dict[str, dict[str, Any]] = {}
@@ -5738,23 +5918,38 @@ def compute_companion_states(
           p_host, p_tid, target_ids, skia_dir=skia_dir
       )
 
-    # Evaluate deterministic ready-to-abandon triggers
+    # Evaluate deterministic ready-to-abandon and auto-abandon triggers
     for ikey, r_list in open_comps_by_ikey.items():
       r0 = r_list[0]
+      kind = str(r0.get("kind") or "")
       tid = str(r0.get("target_id") or "")
       t_info = thread_map.get(tid) or {}
       mentioned = bool(t_info.get("mentioned", False))
       all_resolved = bool(t_info.get("all_resolved", False))
       base_ps = int(r0.get("companion_base_ps") or 0)
+      comp_shas = set(r0.get("commit_shas") or ())
+      # Require approval on a revision strictly newer than the companion's base patchset
+      approved_newer = (
+          (base_ps > 0 and parent_approval_ps > base_ps)
+          if kind != "github"
+          else (not parent_head_sha or parent_head_sha not in comp_shas)
+      )
       p_label = str(r0.get("companion_to_label") or parent_key)
       reason = ""
+      auto_eligible = False
 
-      if parent_status in ("MERGED", "ABANDONED", "CLOSED"):
+      if parent_status in ("MERGED", "ABANDONED", "CLOSED", "SUBMITTED"):
         reason = f"Parent {p_label} is {parent_status.lower()}"
-      elif parent_self_approved and (base_ps == 0 or parent_approval_ps >= base_ps):
-        ps_sfx = f" (PS{parent_approval_ps})" if parent_approval_ps else ""
+        auto_eligible = True
+      elif parent_self_approved and approved_newer:
+        ps_sfx = (
+            f" (PS{parent_approval_ps})"
+            if (kind != "github" and parent_approval_ps)
+            else ""
+        )
         reason = f"You approved {p_label}{ps_sfx}"
-      elif all_resolved:
+        auto_eligible = True
+      elif all_resolved and (base_ps == 0 or parent_ps > base_ps):
         reason = f"Companion thread resolved on {p_label}"
 
       for r in r_list:
@@ -5762,8 +5957,9 @@ def compute_companion_states(
         r["companion_thread_resolved"] = all_resolved
         r["ready_to_abandon"] = bool(reason)
         r["ready_to_abandon_reason"] = reason
+        r["auto_abandon_eligible"] = auto_eligible
 
-    # Deduplicate multiple open companions for the same parent change
+    # Deduplicate parallel open companion chains while keeping stacked A -> B companions intact
     if len(open_comps_by_ikey) > 1:
       def comp_rank_key(k: str) -> tuple[int, int, float, int]:
         first_r = open_comps_by_ikey[k][0]
@@ -5774,25 +5970,46 @@ def compute_companion_states(
         tid_int = int(tid_str) if tid_str.isdigit() else 0
         return (ment, bps, act, tid_int)
 
-      sorted_keys = sorted(
-          open_comps_by_ikey.keys(), key=comp_rank_key, reverse=True
-      )
-      canonical_key = sorted_keys[0]
-      can_r0 = open_comps_by_ikey[canonical_key][0]
-      can_label = (
-          f"CL {can_r0.get('target_id')}"
-          if can_r0.get("kind") == "gerrit"
-          else f"PR #{can_r0.get('target_id')}"
-      )
-      for dup_key in sorted_keys[1:]:
-        for r in open_comps_by_ikey[dup_key]:
-          r["companion_duplicate"] = True
-          r["companion_superseded_by"] = can_label
-          r["ready_to_abandon"] = True
-          if not r.get("ready_to_abandon_reason"):
-            r["ready_to_abandon_reason"] = (
-                f"Duplicate companion (superseded by {can_label})"
-            )
+      seen_comp: set[str] = set()
+      components: list[list[str]] = []
+      for k in open_comps_by_ikey:
+        if k in seen_comp:
+          continue
+        comp_group: list[str] = []
+        queue = [k]
+        while queue:
+          cur_k = queue.pop()
+          if cur_k in seen_comp or cur_k not in open_comps_by_ikey:
+            continue
+          seen_comp.add(cur_k)
+          comp_group.append(cur_k)
+          for nb in comp_chain_adj.get(cur_k, ()):
+            if nb not in seen_comp:
+              queue.append(nb)
+        components.append(comp_group)
+
+      if len(components) > 1:
+        components.sort(
+            key=lambda grp: max(comp_rank_key(x) for x in grp), reverse=True
+        )
+        canonical_key = max(components[0], key=comp_rank_key)
+        can_r0 = open_comps_by_ikey[canonical_key][0]
+        can_label = (
+            f"CL {can_r0.get('target_id')}"
+            if can_r0.get("kind") == "gerrit"
+            else f"PR #{can_r0.get('target_id')}"
+        )
+        for dup_grp in components[1:]:
+          for dup_key in dup_grp:
+            for r in open_comps_by_ikey[dup_key]:
+              r["companion_duplicate"] = True
+              r["companion_superseded_by"] = can_label
+              r["ready_to_abandon"] = True
+              r["auto_abandon_eligible"] = True
+              if not r.get("ready_to_abandon_reason"):
+                r["ready_to_abandon_reason"] = (
+                    f"Duplicate companion (superseded by {can_label})"
+                )
 
     # Route ready-to-abandon companions to Needs You and build plain-text status note
     for r in comp_recs:
@@ -5810,9 +6027,15 @@ def compute_companion_states(
         if r.get("ready_to_abandon_reason"):
           r["companion_status_note"] = str(r["ready_to_abandon_reason"])
         elif r.get("companion_base_ps"):
-          r["companion_status_note"] = (
-              f"Stacked on PS{r['companion_base_ps']}{cq_part} · waiting on author"
-          )
+          bps = int(r["companion_base_ps"])
+          if parent_status in ("NEW", "OPEN") and parent_ps > bps:
+            r["companion_status_note"] = (
+                f"Stacked on old PS{bps} (parent at PS{parent_ps}){cq_part}"
+            )
+          else:
+            r["companion_status_note"] = (
+                f"Stacked on PS{bps}{cq_part} · waiting on author"
+            )
         elif cq_part:
           r["companion_status_note"] = f"{cq_st} · waiting on author"
         else:
@@ -5856,6 +6079,11 @@ def sync_once(
     skia_dir: str = DEFAULT_SKIA_DIR,
 ) -> dict[str, Any]:
   """Performs one full discovery and status poll across active and unchatted CLs/PRs."""
+  # Clear per-poll Gerrit /related caches so status transitions and rebases stay fresh
+  _RELATED_CLS_CACHE.clear()
+  _RELATED_STACK_ORDER_CACHE.clear()
+  _RELATED_RAW_CHANGES_CACHE.clear()
+
   state = load_watcher_state()
   prev_items: dict[str, Any] = state.get("items") or {}
   events: list[dict[str, Any]] = state.get("events") or []
@@ -5952,6 +6180,57 @@ def sync_once(
   link_companion_changes_to_parent_chats(
       active_discovered, fetched_cache, all_chat_candidates=all_chats
   )
+  # Preserve companion_to when a parent merges or closes unless the companion was rebased away
+  for d in active_discovered:
+    if d.get("companion_to"):
+      continue
+    ikey = str(d.get("item_key") or "")
+    info = fetched_cache.get(ikey) or {}
+    if not info.get("is_self"):
+      continue
+    _, prev_d = _lookup_state_item(prev_items, ikey)
+    prev_comp_to = str((prev_d or {}).get("companion_to") or "").strip()
+    if not prev_comp_to:
+      continue
+    if d.get("kind") == "gerrit":
+      cur_pc = str(info.get("parent_commit") or "").strip()
+      prev_pc = str((prev_d or {}).get("parent_commit") or "").strip()
+      if cur_pc and prev_pc and cur_pc != prev_pc:
+        continue
+    elif d.get("kind") == "github":
+      cur_br = str(info.get("base_ref") or "").strip()
+      prev_br = str((prev_d or {}).get("base_ref") or "").strip()
+      if cur_br and prev_br and cur_br != prev_br:
+        continue
+    d["companion_to"] = prev_comp_to
+    d["is_companion"] = True
+
+  # Fetch status for unchatted or closed companion parents omitted from open discovery
+  for d in active_discovered:
+    comp_to = str(d.get("companion_to") or "").strip()
+    if not comp_to or comp_to in fetched_cache:
+      continue
+    d_info = fetched_cache.get(str(d.get("item_key") or "")) or {}
+    if str(d_info.get("status") or "").upper() not in ("NEW", "OPEN"):
+      continue
+    comp_kind, _, comp_tid = comp_to.partition(":")
+    if not comp_tid:
+      continue
+    if comp_kind == "gerrit":
+      fetched_cache[comp_to] = fetch_gerrit_cl_status(
+          comp_tid,
+          rollers,
+          incidents,
+          skia_dir=skia_dir,
+          preferred_host=str(
+              d.get("preferred_host") or d_info.get("host") or ""
+          ),
+      )
+    elif comp_kind == "github":
+      fetched_cache[comp_to] = fetch_github_pr_status(comp_tid)
+    elif comp_kind == "piper":
+      fetched_cache[comp_to] = fetch_piper_cl_status(comp_tid)
+
   # Match follow-up fix CLs/PRs to broken merged CLs/PRs and share parent chats
   link_fix_changes_to_parent_chats(
       active_discovered, fetched_cache, all_chat_candidates=all_chats
@@ -6451,7 +6730,9 @@ def sync_once(
         c_list.append(comp_entry)
 
   # Suppress noise, calculate ready-to-abandon triggers, and deduplicate companions
-  compute_companion_states(new_items, skia_dir=skia_dir)
+  compute_companion_states(
+      new_items, skia_dir=skia_dir, parent_fallback_cache=fetched_cache
+  )
 
   for rec in new_items.values():
     if not isinstance(rec, dict):
@@ -6525,11 +6806,30 @@ def sync_once(
       if merged_bots and not p_rec.get("broken_bots"):
         p_rec["broken_bots"] = list(merged_bots)
 
-  triage_store.overlay_triage_on_items(new_items.values())
   state["items"] = new_items
   state["review_claims"] = review_claims
   state["github_rerequest_ledger"] = github_rerequest_ledger
   state["events"] = events
+  # Automatically abandon companions whose parent closed, received newer CR+1, or was superseded
+  if wake_chats:
+    auto_abandon_keys: list[str] = []
+    for rec in new_items.values():
+      if (
+          isinstance(rec, dict)
+          and rec.get("is_companion")
+          and rec.get("is_self")
+          and str(rec.get("status") or "").upper() in ("NEW", "OPEN")
+          and rec.get("ready_to_abandon")
+          and rec.get("auto_abandon_eligible")
+      ):
+        ikey = str(rec.get("item_key") or "").strip()
+        if ikey and ikey not in auto_abandon_keys:
+          auto_abandon_keys.append(ikey)
+    if auto_abandon_keys:
+      abandon_companion_items(auto_abandon_keys, state=state, auto=True)
+      events = state["events"]
+
+  triage_store.overlay_triage_on_items(new_items.values())
   state["last_sync"] = now_et_str()
   state["gardener_url"] = gardener_pen_url()
   state["rollers_summary"] = {
@@ -8970,7 +9270,9 @@ function reviewVerdictEyebrowHtml(it) {
       c => c && c.status !== 'ABANDONED' && c.status !== 'CLOSED'
     );
     if (comp) {
-      const basePs = Number(comp.companion_base_ps || it.reviewed_ps || it.patchset || 1);
+      const basePs = Number(
+        comp.companion_base_ps || comp.base_ps || it.reviewed_ps || it.patchset || 1
+      );
       const label = `Review PS${basePs}: Companion ${comp.label || ''}`.trim();
       return `<span class="verdict-pill v-companion_fix">🟠 ${esc(label)}</span> · `;
     }

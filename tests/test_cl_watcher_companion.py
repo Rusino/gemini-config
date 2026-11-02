@@ -1,6 +1,7 @@
 # Copyright 2026 Google LLC.
 # SPDX-License-Identifier: Apache-2.0
 
+import copy
 import json
 import os
 import subprocess
@@ -221,6 +222,16 @@ class ClWatcherCompanionTest(unittest.TestCase):
     items["gerrit:1410416"]["ready_to_abandon_reason"] = ""
     items["gerrit:1410416"]["cq_status"] = "CQ+1 running"
     fake_thread_none = {}
+    with mock.patch.object(
+        w, "fetch_gerrit_companion_threads", return_value=fake_thread_none
+    ):
+      w.compute_companion_states(items, skia_dir="/nonexistent")
+    self.assertEqual(
+        items["gerrit:1410416"]["companion_status_note"],
+        "Stacked on old PS2 (parent at PS3) · CQ+1 running",
+    )
+
+    items["gerrit:1409697"]["patchset"] = 2
     with mock.patch.object(
         w, "fetch_gerrit_companion_threads", return_value=fake_thread_none
     ):
@@ -518,6 +529,553 @@ console.log(JSON.stringify({
     self.assertIn("⚠️ Duplicate", out["parentBanner"])
     self.assertIn("✅ Ready to abandon", out["parentBanner"])
     self.assertIn("🗑️ Abandon all companions (2)", out["parentBanner"])
+
+  def test_stack_companion_matches_direct_parent_commit_and_chained_companions(self):
+    self_owner = {"email": "jlavrova@google.com", "name": "Julia Lavrova"}
+    ext_owner = {"email": "fmalita@chromium.org", "name": "Florin Malita"}
+    items = {
+        "gerrit:8663938": {
+            "item_key": "gerrit:8663938",
+            "target_id": "8663938",
+            "kind": "gerrit",
+            "host": "chromium-review.googlesource.com",
+            "is_self": False,
+            "is_external": True,
+            "status": "NEW",
+            "patchset": 19,
+            "self_approved": True,
+            "self_approval_ps": 19,
+            "owner": ext_owner,
+            "revision_ps_by_sha": {"sha_root_ps18": 18, "sha_root_ps19": 19},
+            "parent_commit": "sha_main",
+        },
+        "gerrit:8663827": {
+            "item_key": "gerrit:8663827",
+            "target_id": "8663827",
+            "kind": "gerrit",
+            "host": "chromium-review.googlesource.com",
+            "is_self": False,
+            "is_external": True,
+            "status": "NEW",
+            "patchset": 13,
+            "self_approved": False,
+            "self_approval_ps": 0,
+            "owner": ext_owner,
+            "revision_ps_by_sha": {"sha_mid_ps13": 13},
+            "parent_commit": "sha_root_ps18",
+        },
+        "gerrit:8687026": {
+            "item_key": "gerrit:8687026",
+            "target_id": "8687026",
+            "kind": "gerrit",
+            "host": "chromium-review.googlesource.com",
+            "is_self": True,
+            "is_external": False,
+            "is_wip": True,
+            "status": "NEW",
+            "patchset": 1,
+            "subject": "[canvas] WIP companion: Draw GlyphRuns from ShapedText",
+            "owner": self_owner,
+            "revision_ps_by_sha": {"sha_comp_a": 1},
+            "parent_commit": "sha_mid_ps13",
+        },
+        "gerrit:8687027": {
+            "item_key": "gerrit:8687027",
+            "target_id": "8687027",
+            "kind": "gerrit",
+            "host": "chromium-review.googlesource.com",
+            "is_self": True,
+            "is_external": False,
+            "is_wip": True,
+            "status": "NEW",
+            "patchset": 1,
+            "subject": "[canvas] WIP companion: Draw all GlyphRuns in one Draw",
+            "owner": self_owner,
+            "revision_ps_by_sha": {"sha_comp_b": 1},
+            "parent_commit": "sha_comp_a",
+        },
+    }
+    discovered = [
+        items["gerrit:8663938"],
+        items["gerrit:8687026"],
+        items["gerrit:8687027"],
+    ]
+    raw_related = [
+        {
+            "_change_number": 8687027,
+            "_revision_number": 1,
+            "_current_revision_number": 1,
+            "status": "NEW",
+            "commit": {
+                "commit": "sha_comp_b",
+                "parents": [{"commit": "sha_comp_a"}],
+                "author": {"email": "jlavrova@google.com"},
+            },
+        },
+        {
+            "_change_number": 8687026,
+            "_revision_number": 1,
+            "_current_revision_number": 1,
+            "status": "NEW",
+            "commit": {
+                "commit": "sha_comp_a",
+                "parents": [{"commit": "sha_mid_ps13"}],
+                "author": {"email": "jlavrova@google.com"},
+            },
+        },
+        {
+            "_change_number": 8663827,
+            "_revision_number": 13,
+            "_current_revision_number": 13,
+            "status": "NEW",
+            "commit": {
+                "commit": "sha_mid_ps13",
+                "parents": [{"commit": "sha_root_ps18"}],
+                "author": {"email": "fmalita@chromium.org"},
+            },
+        },
+        {
+            "_change_number": 8663938,
+            "_revision_number": 18,
+            "_current_revision_number": 19,
+            "status": "NEW",
+            "commit": {
+                "commit": "sha_root_ps18",
+                "parents": [{"commit": "sha_main"}],
+                "author": {"email": "fmalita@chromium.org"},
+            },
+        },
+    ]
+    host = "chromium-review.googlesource.com"
+    cache_patch = {
+        f"{host}:8687026": raw_related,
+        f"{host}:8687027": raw_related,
+    }
+    with mock.patch.object(
+        w,
+        "fetch_gerrit_related_cl_ids",
+        return_value=["8687027", "8687026", "8663827", "8663938"],
+    ), mock.patch.dict(
+        getattr(w, "_RELATED_RAW_CHANGES_CACHE", {}), cache_patch, clear=False
+    ):
+      w.link_companion_changes_to_parent_chats(discovered, items)
+
+    self.assertEqual(items["gerrit:8687026"].get("companion_to"), "gerrit:8663827")
+    self.assertEqual(items["gerrit:8687027"].get("companion_to"), "gerrit:8663827")
+
+    active_items = {
+        "gerrit:8663938": items["gerrit:8663938"],
+        "gerrit:8687026": items["gerrit:8687026"],
+        "gerrit:8687027": items["gerrit:8687027"],
+    }
+    w.compute_companion_states(
+        active_items, skia_dir="/nonexistent", parent_fallback_cache=items
+    )
+    for k in ("gerrit:8687026", "gerrit:8687027"):
+      self.assertEqual(active_items[k]["companion_base_ps"], 13)
+      self.assertFalse(active_items[k]["companion_duplicate"])
+      self.assertFalse(active_items[k]["ready_to_abandon"])
+      self.assertEqual(active_items[k]["companion_state"], "active")
+      self.assertEqual(
+          active_items[k]["companion_status_note"],
+          "Stacked on PS13 · waiting on author",
+      )
+
+    silent_info = {
+        "is_self": True,
+        "is_wip": True,
+        "parent_commit": "sha_comp_a",
+    }
+    with mock.patch.dict(
+        getattr(w, "_RELATED_RAW_CHANGES_CACHE", {}), cache_patch, clear=False
+    ):
+      p_key, p_ps = w._resolve_gerrit_stack_companion_parent(
+          host,
+          "8687027",
+          "[canvas] Draw all GlyphRuns in one Draw",
+          silent_info,
+          items,
+          ["8687027", "8687026", "8663827", "8663938"],
+      )
+    self.assertEqual((p_key, p_ps), ("gerrit:8663827", 13))
+
+    fallback_key, _ = w._resolve_gerrit_stack_companion_parent(
+        host,
+        "8687027",
+        "[canvas] WIP companion part 2",
+        {"is_self": True, "is_wip": True},
+        items,
+        ["8687027", "8687026", "8663827"],
+    )
+    self.assertEqual(fallback_key, "gerrit:8663827")
+
+  def test_same_patchset_approval_keeps_companion_active_and_stale_base_note(self):
+    items = {
+        "gerrit:1412380": {
+            "item_key": "gerrit:1412380",
+            "target_id": "1412380",
+            "kind": "gerrit",
+            "host": w.GERRIT_SKIA_HOST,
+            "is_self": False,
+            "status": "NEW",
+            "patchset": 2,
+            "self_approved": True,
+            "self_approval_ps": 2,
+            "revision_ps_by_sha": {"sha_ps1": 1, "sha_ps2": 2},
+        },
+        "gerrit:1412999": {
+            "item_key": "gerrit:1412999",
+            "target_id": "1412999",
+            "kind": "gerrit",
+            "host": w.GERRIT_SKIA_HOST,
+            "is_self": True,
+            "is_wip": True,
+            "status": "NEW",
+            "patchset": 1,
+            "parent_commit": "sha_ps2",
+            "companion_to": "gerrit:1412380",
+            "companion_to_label": "CL 1412380",
+        },
+    }
+    resolved_same_ps = {
+        "1412999": {"mentioned": True, "all_resolved": True, "open_count": 0}
+    }
+    with mock.patch.object(
+        w, "fetch_gerrit_companion_threads", return_value=resolved_same_ps
+    ):
+      w.compute_companion_states(items, skia_dir="/nonexistent")
+
+    comp = items["gerrit:1412999"]
+    self.assertFalse(comp["ready_to_abandon"])
+    self.assertFalse(comp.get("auto_abandon_eligible", False))
+    self.assertEqual(comp["companion_state"], "active")
+    self.assertEqual(comp["companion_status_note"], "Stacked on PS2 · waiting on author")
+
+    items["gerrit:1412380"]["patchset"] = 3
+    items["gerrit:1412380"]["self_approved"] = False
+    items["gerrit:1412380"]["self_approval_ps"] = 0
+    items["gerrit:1412380"]["revision_ps_by_sha"]["sha_ps3"] = 3
+    with mock.patch.object(w, "fetch_gerrit_companion_threads", return_value={}):
+      w.compute_companion_states(items, skia_dir="/nonexistent")
+
+    self.assertFalse(comp["ready_to_abandon"])
+    self.assertEqual(
+        comp["companion_status_note"], "Stacked on old PS2 (parent at PS3)"
+    )
+
+    items["gerrit:1412380"]["self_approved"] = True
+    items["gerrit:1412380"]["self_approval_ps"] = 3
+    with mock.patch.object(w, "fetch_gerrit_companion_threads", return_value={}):
+      w.compute_companion_states(items, skia_dir="/nonexistent")
+
+    self.assertTrue(comp["ready_to_abandon"])
+    self.assertTrue(comp.get("auto_abandon_eligible", False))
+    self.assertEqual(comp["ready_to_abandon_reason"], "You approved CL 1412380 (PS3)")
+
+  def test_preserve_companion_to_when_parent_merged_or_abandoned(self):
+    items = {
+        "gerrit:1410416": {
+            "item_key": "gerrit:1410416",
+            "target_id": "1410416",
+            "kind": "gerrit",
+            "host": w.GERRIT_SKIA_HOST,
+            "is_self": True,
+            "is_wip": True,
+            "status": "NEW",
+            "patchset": 1,
+            "subject": "[skparagraph] Add edge-case tests",
+            "parent_commit": "sha_ps2",
+        },
+    }
+    raw_related = [
+        {
+            "_change_number": 1410416,
+            "_revision_number": 1,
+            "_current_revision_number": 1,
+            "status": "NEW",
+            "commit": {
+                "commit": "sha_comp",
+                "parents": [{"commit": "sha_ps2"}],
+                "author": {"email": "jlavrova@google.com"},
+            },
+        },
+        {
+            "_change_number": 1409697,
+            "_revision_number": 2,
+            "_current_revision_number": 5,
+            "status": "MERGED",
+            "commit": {
+                "commit": "sha_ps2",
+                "parents": [{"commit": "sha_main"}],
+                "author": {"email": "external@author.com"},
+            },
+        },
+    ]
+    fake_resp = mock.MagicMock()
+    fake_resp.__enter__.return_value = fake_resp
+    fake_resp.read.return_value = (
+        ")]}'\n" + json.dumps({"changes": raw_related})
+    ).encode("utf-8")
+    with mock.patch.dict(w._RELATED_CLS_CACHE, {}, clear=True), mock.patch.dict(
+        w._RELATED_RAW_CHANGES_CACHE, {}, clear=True
+    ), mock.patch("urllib.request.urlopen", return_value=fake_resp):
+      rel_ids = w.fetch_gerrit_related_cl_ids(w.GERRIT_SKIA_HOST, "1410416")
+      self.assertEqual(rel_ids, [])
+      w.link_companion_changes_to_parent_chats(list(items.values()), items)
+
+    self.assertEqual(items["gerrit:1410416"].get("companion_to"), "gerrit:1409697")
+    self.assertEqual(items["gerrit:1410416"].get("companion_base_ps_hint"), 2)
+
+  def test_sync_once_auto_abandons_eligible_companions(self):
+    prev_state = {
+        "items": {
+            "gerrit:1410001@unchatted": {
+                "item_key": "gerrit:1410001",
+                "target_id": "1410001",
+                "kind": "gerrit",
+                "host": w.GERRIT_SKIA_HOST,
+                "is_self": True,
+                "is_wip": True,
+                "status": "NEW",
+                "parent_commit": "sha_p1_ps1",
+                "companion_to": "gerrit:1400001",
+            },
+            "gerrit:1410006@unchatted": {
+                "item_key": "gerrit:1410006",
+                "target_id": "1410006",
+                "kind": "gerrit",
+                "host": w.GERRIT_SKIA_HOST,
+                "is_self": True,
+                "is_wip": False,
+                "status": "NEW",
+                "parent_commit": "sha_p1_ps1",
+                "companion_to": "gerrit:1400001",
+            },
+        },
+        "events": [],
+    }
+    remote_changes = [
+        {"item_key": "gerrit:1410001", "target_id": "1410001", "kind": "gerrit"},
+        {"item_key": "gerrit:1410006", "target_id": "1410006", "kind": "gerrit"},
+        {"item_key": "gerrit:1400002", "target_id": "1400002", "kind": "gerrit"},
+        {"item_key": "gerrit:1410002", "target_id": "1410002", "kind": "gerrit"},
+        {"item_key": "gerrit:1400003", "target_id": "1400003", "kind": "gerrit"},
+        {"item_key": "gerrit:1410003", "target_id": "1410003", "kind": "gerrit"},
+        {"item_key": "gerrit:1400004", "target_id": "1400004", "kind": "gerrit"},
+        {"item_key": "gerrit:1410004", "target_id": "1410004", "kind": "gerrit"},
+        {"item_key": "gerrit:1410005", "target_id": "1410005", "kind": "gerrit"},
+    ]
+
+    def base_info(tid: str, **overrides):
+      d = {
+          "ok": True,
+          "host": w.GERRIT_SKIA_HOST,
+          "url": f"https://{w.GERRIT_SKIA_HOST}/c/skia/+/{tid}",
+          "status": "NEW",
+          "phase": "WAITING_ON_OTHERS",
+          "subject": f"[skparagraph] CL {tid}",
+          "owner_name": "Author",
+          "owner_email": "ext@author.com",
+          "role": "reviewer",
+          "is_self": False,
+          "is_external": True,
+          "is_wip": False,
+          "is_draft": False,
+          "in_development": False,
+          "is_watching": False,
+          "reviewer_removed": False,
+          "self_approved": False,
+          "self_approval_ps": 0,
+          "patchset": 1,
+          "revision": f"rev_{tid}",
+          "parent_commit": "sha_main",
+          "revision_ps_by_sha": {f"rev_{tid}": 1},
+          "commit_message": "",
+          "files": [],
+          "hashtags": [],
+          "topic": "",
+          "in_my_attention": False,
+          "last_msg_author": "ext@author.com",
+          "last_msg_date": "2026-11-01 12:00:00.000000000",
+          "last_msg_snippet": "Uploaded patch set",
+          "status_changed_raw": "2026-11-01 12:00:00.000000000",
+          "submitted": "",
+          "post_submit": {},
+      }
+      d.update(overrides)
+      return d
+
+    cl_infos = {
+        "1400001": base_info(
+            "1400001",
+            status="MERGED",
+            patchset=2,
+            revision_ps_by_sha={"sha_p1_ps1": 1, "sha_p1_ps2": 2},
+        ),
+        "1410001": base_info(
+            "1410001",
+            is_self=True,
+            is_external=False,
+            is_wip=True,
+            role="author",
+            owner_email="jlavrova@google.com",
+            subject="[skparagraph] Companion for 1400001",
+            parent_commit="sha_p1_ps1",
+        ),
+        "1410006": base_info(
+            "1410006",
+            is_self=True,
+            is_external=False,
+            is_wip=False,
+            role="author",
+            owner_email="jlavrova@google.com",
+            subject="[skparagraph] Standalone CL rebased onto main",
+            parent_commit="sha_main_new",
+        ),
+        "1400002": base_info(
+            "1400002",
+            patchset=3,
+            self_approved=True,
+            self_approval_ps=3,
+            revision_ps_by_sha={"sha_p2_ps2": 2, "sha_p2_ps3": 3},
+        ),
+        "1410002": base_info(
+            "1410002",
+            is_self=True,
+            is_external=False,
+            is_wip=True,
+            role="author",
+            owner_email="jlavrova@google.com",
+            subject="[skparagraph] Companion for cl/1400002",
+            parent_commit="sha_p2_ps2",
+        ),
+        "1400003": base_info(
+            "1400003",
+            patchset=2,
+            self_approved=True,
+            self_approval_ps=2,
+            revision_ps_by_sha={"sha_p3_ps2": 2},
+        ),
+        "1410003": base_info(
+            "1410003",
+            is_self=True,
+            is_external=False,
+            is_wip=True,
+            role="author",
+            owner_email="jlavrova@google.com",
+            subject="[skparagraph] Companion for cl/1400003",
+            parent_commit="sha_p3_ps2",
+        ),
+        "1400004": base_info(
+            "1400004",
+            patchset=2,
+            self_approved=False,
+            revision_ps_by_sha={"sha_p4_ps1": 1, "sha_p4_ps2": 2},
+        ),
+        "1410004": base_info(
+            "1410004",
+            is_self=True,
+            is_external=False,
+            is_wip=True,
+            role="author",
+            owner_email="jlavrova@google.com",
+            subject="[skparagraph] Companion for cl/1400004",
+            parent_commit="sha_p4_ps1",
+        ),
+        "1410005": base_info(
+            "1410005",
+            is_self=True,
+            is_external=False,
+            is_wip=True,
+            role="author",
+            owner_email="jlavrova@google.com",
+            subject="[skparagraph] Companion for cl/1400004",
+            parent_commit="sha_p4_ps2",
+        ),
+    }
+
+    abandoned_urls: list[str] = []
+
+    def fake_urlopen(req, timeout=30):
+      url = req.full_url if hasattr(req, "full_url") else str(req)
+      if "/abandon" in url:
+        abandoned_urls.append(url)
+      resp = mock.MagicMock()
+      resp.status = 200
+      resp.read.return_value = b")]}'\n{}"
+      resp.__enter__.return_value = resp
+      return resp
+
+    empty_gmail = {
+        "thread_ids": [],
+        "inbox_thread_ids": [],
+        "total_msgs": 0,
+        "inbox_msgs": 0,
+        "trash_msgs": 0,
+        "unread_msgs": 0,
+    }
+    saved_states: list[dict] = []
+
+    def run_sync(wake: bool) -> dict:
+      with mock.patch.object(
+          w, "load_watcher_state", return_value=copy.deepcopy(prev_state)
+      ), mock.patch.object(
+          w, "save_watcher_state", side_effect=lambda s: saved_states.append(s)
+      ), mock.patch.object(
+          w, "fetch_gardener_snapshot", return_value=({}, [])
+      ), mock.patch.object(
+          w, "load_project_names", return_value={}
+      ), mock.patch.object(
+          w, "discover_active_cl_chats", return_value=[]
+      ), mock.patch.object(
+          w,
+          "discover_open_remote_changes",
+          side_effect=lambda *a, **kw: [dict(x) for x in remote_changes],
+      ), mock.patch.object(
+          w,
+          "fetch_gerrit_cl_status",
+          side_effect=lambda tid, *a, **kw: dict(cl_infos[str(tid)]),
+      ), mock.patch.object(
+          w, "fetch_gerrit_related_cl_ids", return_value=[]
+      ), mock.patch.object(
+          w, "fetch_gerrit_stack_order_ids", side_effect=lambda h, t: [t]
+      ), mock.patch.object(
+          w, "fetch_gerrit_companion_threads", return_value={}
+      ), mock.patch.object(
+          w, "fetch_gmail_status_for_id", return_value=empty_gmail
+      ), mock.patch.object(
+          w, "_get_gerrit_bearer_token", return_value="tok"
+      ), mock.patch.object(
+          w.urllib.request, "urlopen", side_effect=fake_urlopen
+      ), mock.patch.object(
+          w, "overlay_live_chat_busy"
+      ):
+        return w.sync_once(
+            wake_chats=wake, update_titles=False, skia_dir="/nonexistent"
+        )
+
+    dry_state = run_sync(False)
+    self.assertEqual(abandoned_urls, [])
+    self.assertEqual(dry_state["items"]["gerrit:1410001@unchatted"]["status"], "NEW")
+    self.assertNotIn("companion_to", dry_state["items"]["gerrit:1410006@unchatted"])
+
+    out_state = run_sync(True)
+
+    self.assertTrue(any("/1410001/abandon" in u for u in abandoned_urls))
+    self.assertTrue(any("/1410002/abandon" in u for u in abandoned_urls))
+    self.assertTrue(any("/1410004/abandon" in u for u in abandoned_urls))
+    self.assertFalse(any("/1410003/abandon" in u for u in abandoned_urls))
+    self.assertFalse(any("/1410005/abandon" in u for u in abandoned_urls))
+    self.assertFalse(any("/1410006/abandon" in u for u in abandoned_urls))
+
+    items_out = out_state["items"]
+    self.assertEqual(items_out["gerrit:1410001@unchatted"]["status"], "ABANDONED")
+    self.assertEqual(items_out["gerrit:1410002@unchatted"]["status"], "ABANDONED")
+    self.assertEqual(items_out["gerrit:1410004@unchatted"]["status"], "ABANDONED")
+    self.assertEqual(items_out["gerrit:1410003@unchatted"]["status"], "NEW")
+    self.assertEqual(items_out["gerrit:1410005@unchatted"]["status"], "NEW")
+    self.assertEqual(items_out["gerrit:1410006@unchatted"]["status"], "NEW")
+    self.assertNotIn("companion_to", items_out["gerrit:1410006@unchatted"])
 
 
 if __name__ == "__main__":
