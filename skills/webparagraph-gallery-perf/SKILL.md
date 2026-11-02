@@ -262,7 +262,11 @@ python3 $S/compare.py ~/perf/r45/results --pairs "WP/SkP=wp/skp,FillTextRuns=wpn
 A smoke run on the host prints the attestation line, e.g.
 `ANGLE (AMD, AMD Radeon Pro WX 3200 Series (radeonsi polaris12 ACO), OpenGL ES 3.2)`.
 
-## Mac (not yet validated)
+## Mac
+
+Validated on Nov 1 2026: MacBook Pro, Apple M5 Max (18 cores, 64 GB), macOS 26.7.1, Chrome for
+Testing 156.0.8078.73, `base,dpr2 × 6`, 36/36 runs OK on the first attempt, ~1 h, Integrity
+Check `OK` (results: `~/.gemini/jetski/scratch/wp_gallery_perf/mac/results_mac`).
 
 Builds are plain web assets (`build/web`), so do not rebuild on the Mac: pack the Linux builds
 and the scripts on the Cloudtop and run locally on the Mac.
@@ -286,13 +290,20 @@ python3 scripts/summarize.py results_mac --wp c1 --skp skp --ab c1/c0 \
 - Chrome for Testing (unpacked `chrome-mac-arm64.zip`) avoids managed-Chrome extensions; system
   Chrome is `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`. Remove the
   quarantine flag if macOS blocks it: `xattr -dr com.apple.quarantine ~/cft`.
-- `--require-gpu` aborts on SwiftShader. If headless Chrome does not get the Metal GPU (the
-  `GALLERY_ATTESTATION` line shows SwiftShader), retry with `--headful`.
+- `--require-gpu` aborts on SwiftShader. `--headless=new` gets the hardware Metal GPU without
+  `--headful` (`ANGLE (Apple, ANGLE Metal Renderer: Apple M5 Max, ...)`); keep `--headful` only
+  as a fallback if `GALLERY_ATTESTATION` shows SwiftShader.
+- The Mac GPU process is lightly loaded (e.g. `resize` GPU busy ~90-145 ms vs ~465 ms on the
+  Linux Radeon host), so WebParagraph GPU-process overhead that is invisible on Linux shows up
+  here (+10..+114% vs SkParagraph). Always report the GPU-process table and absolute ms for the
+  Mac, and check one-off long frames in the trace: a 268.9 ms SkParagraph frame was a
+  `CrGpuMain` task waiting 261 ms on an ANGLE worker task, not text work.
 - No `/proc`: `CPU all Chrome` stays empty (INFO in the Integrity Check); trace metrics and
   FrameTiming work. `--no-dbus` is not needed.
 - Retina is DPR 2 natively; `--force-device-scale-factor` still sets DPR 1 and 3. Close other
   apps, keep the Mac on power, and do not let it sleep (`caffeinate -dims` in another terminal).
 - Fetch `results_mac/` back to the Cloudtop for the report; add the Mac as its own subsection
-  next to the Linux results, do not mix Mac and Linux rounds in one table.
+  next to the Linux results, do not mix Mac and Linux rounds in one table, and give each machine
+  its own verdict (example: `assets/report_example_mac_linux.md`).
 - Not checked: `build_variant.sh` on the Mac (it links Linux sysroots
   `engine/src/build/linux/debian_*`).
