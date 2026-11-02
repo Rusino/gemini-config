@@ -159,6 +159,25 @@ class TestJetskiMacInjector(unittest.TestCase):
         with open(fpath, "r", encoding="utf-8") as f:
           content = json.load(f)
         self.assertIn(expected_key, content)
+        # Seeded Flight Deck metadata must point pen_url at the HTTPS UberProxy endpoint
+        if fname == "jetski-flight-deck.json":
+          self.assertTrue(
+              str(content.get("pen_url", "")).startswith("https://"),
+              f"Expected HTTPS pen_url, got {content.get('pen_url')!r}",
+          )
+          with open(fpath, "w", encoding="utf-8") as f:
+            f.write('{"pen_url": "", "local_url": "http://localhost:8089"}\n')
+          jmi.sync_mac_artifact_js(src, dst)
+          with open(fpath, "r", encoding="utf-8") as f:
+            repaired = json.load(f)
+          self.assertEqual(repaired.get("pen_url"), jmi.DEFAULT_FLIGHT_DECK_PEN_URL)
+          custom_pen = "https://custom-pen.proxy.googlers.com"
+          with open(fpath, "w", encoding="utf-8") as f:
+            json.dump({"pen_url": custom_pen, "local_url": "http://localhost:8089"}, f)
+          jmi.sync_mac_artifact_js(src, dst)
+          with open(fpath, "r", encoding="utf-8") as f:
+            preserved = json.load(f)
+          self.assertEqual(preserved.get("pen_url"), custom_pen)
 
   def test_cdp_session_attach_ping_coalescing_and_hot_reload(self):
     recorded = []

@@ -51,6 +51,9 @@
   const FLIGHT_DECK_MIN_WIDTH_PX = 320;
   const FLIGHT_DECK_MAX_WIDTH_PX = 900;
   const FLIGHT_DECK_INFO_TTL_MS = 10000;
+  // Deterministic Cloudtop UberProxy PEN URL for port 8089 when pen_url.sh times out
+  const DEFAULT_FLIGHT_DECK_PEN_URL =
+    'https://b2607f8b048001000013f0f0cac12c3b11f99000000000000000001.proxy.googlers.com';
   const TITLEBAR_BTN_CLASS = 'jetski-titlebar-archive-btn';
   // Live context window volume pill rendered before Search in each conversation titlebar
   const TITLEBAR_CONTEXT_BADGE_CLASS = 'jetski-titlebar-context-badge';
@@ -294,6 +297,8 @@
   let activeFlightDeckResizeCleanup = null;
   let flightDeckInfoCache = null;
   let flightDeckInfoFetchedAt = 0;
+  // Retains the last known non-loopback PEN proxy origin across transient pen_url.sh timeouts
+  let lastValidFlightDeckPenBase = DEFAULT_FLIGHT_DECK_PEN_URL;
   let dossierIndexCache = null;
   let dossierIndexFetchedAt = 0;
   let dossierIndexInFlight = null;
@@ -890,6 +895,30 @@
     return roadmapIndexCache;
   }
 
+  // Returns true for loopback host URLs like localhost or 127.0.0.1
+  function isLoopbackFlightDeckUrl(url) {
+    if (typeof url !== 'string' || !url) return false;
+    return /^https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?(?:[/?#]|$)/i.test(url);
+  }
+
+  // Strips version query parameters so origin comparisons ignore daemon restarts
+  function stripFlightDeckVersionParam(url) {
+    if (typeof url !== 'string' || !url) return '';
+    return url.replace(/([?&])v=\d+(&|$)/g, '$1').replace(/[?&]$/, '');
+  }
+
+  // Normalizes pen_url to preserve the last known valid non-loopback UberProxy endpoint
+  function normalizeFlightDeckPenUrl(rawPenUrl) {
+    const raw = typeof rawPenUrl === 'string' ? rawPenUrl.trim() : '';
+    if (raw && !isLoopbackFlightDeckUrl(raw)) {
+      lastValidFlightDeckPenBase = raw.replace(/[?#].*$/, '');
+      return raw;
+    }
+    const vMatch = raw ? /[?&]v=\d+/.exec(raw) : null;
+    const vSuffix = vMatch ? `?${vMatch[0].slice(1)}` : '';
+    return `${lastValidFlightDeckPenBase}${vSuffix}`;
+  }
+
   // Fetches jetski-flight-deck.json so the drawer loads the correct local or PEN proxy URL
   async function fetchFlightDeckInfo() {
     const now = Date.now();
@@ -897,8 +926,13 @@
       return flightDeckInfoCache;
     }
     if (typeof window.fetch !== 'function') {
+      // Seed pen_url from the cached UberProxy origin when fetch is unavailable
       return (
-        flightDeckInfoCache || { pen_url: '', local_url: 'http://localhost:8089', port: 8089 }
+        flightDeckInfoCache || {
+          pen_url: lastValidFlightDeckPenBase,
+          local_url: 'http://localhost:8089',
+          port: 8089,
+        }
       );
     }
     try {
@@ -908,6 +942,8 @@
       if (resp && resp.ok) {
         const data = await resp.json();
         if (data && typeof data === 'object') {
+          // Keep the last valid UberProxy origin if pen_url is empty or loopback
+          data.pen_url = normalizeFlightDeckPenUrl(data.pen_url);
           flightDeckInfoCache = data;
           flightDeckInfoFetchedAt = now;
           return flightDeckInfoCache;
@@ -918,7 +954,12 @@
     }
     flightDeckInfoFetchedAt = now;
     if (!flightDeckInfoCache) {
-      flightDeckInfoCache = { pen_url: '', local_url: 'http://localhost:8089', port: 8089 };
+      // Fall back to the cached UberProxy origin when jetski-flight-deck.json fails to load
+      flightDeckInfoCache = {
+        pen_url: lastValidFlightDeckPenBase,
+        local_url: 'http://localhost:8089',
+        port: 8089,
+      };
     }
     return flightDeckInfoCache;
   }
@@ -926,10 +967,16 @@
   // Chooses localhost vs PEN proxy based on the Jetski Web host and appends embed param
   function resolveFlightDeckUrl(info, embedded = true) {
     const host = typeof window !== 'undefined' ? window.location?.hostname || '' : '';
-    const isLocal = host === 'localhost' || host === '127.0.0.1';
+    // Treat loopback as local only in native browser, never inside Mac CDP-injected wrapper
+    const isMacWrapper = typeof window !== 'undefined' && Boolean(
+      window.__jetskiClosedChatsFilterMacVer || window.__jetskiClosedChatsFilterLoadingVer
+    );
+    const isLocal = !isMacWrapper && (host === 'localhost' || host === '127.0.0.1');
+    // Normalize caller-supplied pen_url so remote and Mac windows never downgrade to localhost
+    const normalizedPen = normalizeFlightDeckPenUrl(info?.pen_url);
     let base = isLocal
       ? (info?.local_url || 'http://localhost:8089')
-      : (info?.pen_url || info?.local_url || 'http://localhost:8089');
+      : (normalizedPen || info?.local_url || 'http://localhost:8089');
     if (!embedded) return base;
     const sep = base.includes('?') ? '&' : '?';
     return `${base}${sep}embed=1`;
@@ -9082,7 +9129,10 @@
       if (iframe && flightDeckOpen) {
         const embedUrl = resolveFlightDeckUrl(info, true);
         const curBaseSrc = iframe.getAttribute('data-base-src') || '';
-        if (forceReload || curBaseSrc !== embedUrl) {
+        // Ignore ?v= bumps on the same origin because Flight Deck reloads itself on ui_version
+        const prevClean = stripFlightDeckVersionParam(curBaseSrc);
+        const nextClean = stripFlightDeckVersionParam(embedUrl);
+        if (forceReload || !curBaseSrc || prevClean !== nextClean) {
           iframe.setAttribute('data-base-src', embedUrl);
           const sep = embedUrl.includes('?') ? '&' : '?';
           iframe.setAttribute(

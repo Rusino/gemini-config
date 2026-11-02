@@ -47,6 +47,12 @@ IDLE_POLL_SEC = 4.0
 DISCONNECTED_POLL_SEC = 3.0
 
 
+# Deterministic Cloudtop UberProxy PEN URL for port 8089 seeded on Mac before first sync
+DEFAULT_FLIGHT_DECK_PEN_URL = (
+    "https://b2607f8b048001000013f0f0cac12c3b11f99000000000000000001.proxy.googlers.com"
+)
+
+
 class CdpClosedError(OSError):
   """Raised when the CDP TCP or WebSocket stream closes"""
 
@@ -109,14 +115,34 @@ def sync_mac_artifact_js(
       "jetski-roadmaps.json": json.dumps(
           {"version": 1, "projects": {}}, indent=2
       ) + "\n",
+      # Seed PEN URL instead of empty string so Mac windows never fall back to local port 8089
       "jetski-flight-deck.json": json.dumps(
-          {"pen_url": "", "local_url": "http://localhost:8089", "port": 8089},
+          {
+              "pen_url": DEFAULT_FLIGHT_DECK_PEN_URL,
+              "local_url": "http://localhost:8089",
+              "port": 8089,
+          },
           indent=2,
       ) + "\n",
   }
   for fname, content in defaults.items():
     fpath = os.path.join(brain_dir, fname)
-    if not os.path.isfile(fpath):
+    needs_seed = not os.path.isfile(fpath)
+    # Upgrade legacy Mac seed files that left pen_url empty or pointed at loopback
+    if not needs_seed and fname == "jetski-flight-deck.json":
+      try:
+        with open(fpath, "r", encoding="utf-8") as f:
+          cur_fd = json.load(f)
+        cur_pen = (
+            str(cur_fd.get("pen_url") or "").strip()
+            if isinstance(cur_fd, dict)
+            else ""
+        )
+        if not cur_pen.startswith("https://"):
+          needs_seed = True
+      except (OSError, ValueError):
+        needs_seed = True
+    if needs_seed:
       tmp_fpath = f"{fpath}.tmp.{os.getpid()}"
       try:
         with open(tmp_fpath, "w", encoding="utf-8") as f:

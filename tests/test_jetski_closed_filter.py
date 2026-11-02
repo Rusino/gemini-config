@@ -7977,6 +7977,25 @@ eval(code);
     window.__jetskiFlightDeck.resolveUrl(testInfo, false),
     'https://8089-pen.corp.goog'
   );
+
+  // Verify loopback pen_url fallback and Mac CDP wrapper preserve the PEN proxy endpoint
+  const loopbackFallbackInfo = {
+    local_url: 'http://localhost:8089?v=123',
+    pen_url: 'http://localhost:8089?v=123',
+  };
+  assert.strictEqual(
+    window.__jetskiFlightDeck.resolveUrl(loopbackFallbackInfo, true),
+    'https://8089-pen.corp.goog?v=123&embed=1'
+  );
+
+  global.window.location.hostname = '127.0.0.1';
+  global.window.__jetskiClosedChatsFilterMacVer = 'mac-v1';
+  assert.strictEqual(
+    window.__jetskiFlightDeck.resolveUrl(testInfo, true),
+    'https://8089-pen.corp.goog?embed=1'
+  );
+  delete global.window.__jetskiClosedChatsFilterMacVer;
+
   global.window.location.hostname = 'localhost';
 
   toggleBtn.dispatchEvent('pointerdown');
@@ -7996,6 +8015,39 @@ eval(code);
     null,
     'Header bar must not be rendered in embedded drawer'
   );
+
+  // Verify iframe keeps its UberProxy src across pen_url.sh loopback timeouts and ?v= bumps
+  const origDateNow = Date.now;
+  let fakeNow = origDateNow() + 20000;
+  Date.now = () => fakeNow;
+  let mockFlightDeckJson = {
+    pen_url: 'https://8089-pen-proxy.corp.goog?v=10',
+    local_url: 'http://localhost:8089?v=10',
+    port: 8089,
+  };
+  const origFetch = global.window.fetch;
+  global.window.fetch = async (url) => {
+    if (String(url).includes('jetski-flight-deck.json')) {
+      return { ok: true, json: async () => ({ ...mockFlightDeckJson }) };
+    }
+    return origFetch(url);
+  };
+  global.window.location.hostname = 'cloudtop.corp.goog';
+  window.__jetskiFlightDeck.ensureFlightDeckUI();
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  assert.strictEqual(iframe.getAttribute('src'), 'https://8089-pen-proxy.corp.goog?v=10&embed=1');
+  fakeNow += 20000;
+  mockFlightDeckJson = {
+    pen_url: 'http://localhost:8089?v=20',
+    local_url: 'http://localhost:8089?v=20',
+    port: 8089,
+  };
+  window.__jetskiFlightDeck.ensureFlightDeckUI();
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  assert.strictEqual(iframe.getAttribute('src'), 'https://8089-pen-proxy.corp.goog?v=10&embed=1');
+  global.window.location.hostname = 'localhost';
+  global.window.fetch = origFetch;
+  Date.now = origDateNow;
 
   const filterStyle = document.getElementById('jetski-closed-chats-filter-style');
   assert(filterStyle, 'Filter styles must be injected into document head');
