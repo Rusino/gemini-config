@@ -93,11 +93,14 @@ For **Case 3**, **Case 4**, and **Case 5**, commit **only the test file changes*
    - Title format: `[<module>] Add failing <topic> tests` (for Cases 4 & 5) or `[<module>] Add <topic> edge-case tests` (for Case 3).
    - Keep every companion commit subject within 50 characters; Gerrit warns on longer subjects.
    - Include the `Assisted-by:` trailer (`python3 ~/.gemini/config/hooks/chat_lifecycle.py model --trailer` if available, else `Assisted-by: AI`).
-3. **Upload `PS1` strictly as `WIP` with ZERO reviewers**:
+3. **Upload `PS1` strictly as `WIP` with ZERO reviewers and the parent CL's author in CC**:
    ```bash
-   git push origin HEAD:refs/for/main%wip
+   git push origin HEAD:refs/for/main%wip,cc=<parent_author_email>
    ```
    - **Never** add reviewers (not even the parent CL's author) to the Gerrit `Reviewers` field of the companion CL. Leaving `Reviewers` empty with `%wip` prevents notification spam to `OWNERS`/CC lists and signals that you are **not** claiming ownership of a competing CL — the companion CL exists purely as a sandbox for the author.
+   - **CC only the parent CL's author** (Gerrit; with `git cl upload` use `--no-autocc --cc <email>`). The companion then shows up in the author's own dashboard, while `%wip` still sends no mail. Do not CC the other reviewers: the reviewer list changes, and they reach the companion through the link in the review comment.
+   - **Keep the companion public; never `private`**: the companion is evidence linked from a public review, so every reader (second reviewer, a later `git blame` or bisect) must be able to open it. LUCI service accounts may also lose access to private changes (not verified). skia-review rejects private pushes anyway (`private changes are disabled`, 2026-11-02).
+   - When re-uploading with `git cl upload`, the commit subject comes from the Gerrit description, not from the amended local commit; edit the description in Gerrit (or push with `git push ...%wip`) to change it.
 
 ---
 
