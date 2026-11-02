@@ -2301,13 +2301,14 @@ const liveBucketBtn = (k) =>
   observerCallback([{ target: inboxEl }, { target: inboxRows[0] }, { target: fitBtn }]);
   assert.strictEqual(rafCallbacks.length, 0, 'Inbox mutations must not trigger observer sync');
 
-  // With 3 items (1 urgent with detail = 34px, 2 regular = 44px, +2px = 80px < 90px)
-  // fit shrinks list height to 80px
+  // Single-line rows (3 * 22px + 2px top padding = 68px < 90px) carry no inline detail or title
+  assert.strictEqual(inboxRows[0].hasAttribute('title'), false);
+  assert.strictEqual(inboxRows[0].querySelector('[data-testid="jetski-inbox-detail"]'), null);
   assert.strictEqual(fitBtn.getAttribute('aria-label'), 'Shrink height to fit 3 chats');
   advanceClock();
   fitBtn.dispatchEvent('pointerdown', { button: 0 });
   fitBtn.dispatchEvent('click', { button: 0 });
-  assert.strictEqual(inboxListEl.style.height, '80px');
+  assert.strictEqual(inboxListEl.style.height, '68px');
   assert.strictEqual(inboxEl.getAttribute('data-fitted'), 'true');
   assert.strictEqual(fitBtn.getAttribute('aria-label'), 'Restore previous height (90px)');
 
@@ -2315,7 +2316,7 @@ const liveBucketBtn = (k) =>
   advanceClock();
   tabWorking.dispatchEvent('pointerdown', { button: 0 });
   tabWorking.dispatchEvent('click', { button: 0 });
-  assert.strictEqual(inboxListEl.style.height, '80px');
+  assert.strictEqual(inboxListEl.style.height, '68px');
   advanceClock();
   tabNeedsMe.dispatchEvent('pointerdown', { button: 0 });
   tabNeedsMe.dispatchEvent('click', { button: 0 });
@@ -4742,10 +4743,11 @@ eval(code);
     const m = new Map();
     for (const r of getInboxRows()) {
       const cid = r.getAttribute('data-cascade-id');
-      const det = r.querySelector('[data-testid="jetski-inbox-detail"]');
+      assert.strictEqual(r.querySelector('[data-testid="jetski-inbox-detail"]'), null);
+      assert.strictEqual(r.hasAttribute('title'), false);
       m.set(cid, {
         tier: r.getAttribute('data-tier'),
-        detail: det ? det.textContent : '',
+        detail: r.getAttribute('data-detail') || '',
         row: r,
       });
     }
@@ -4760,6 +4762,18 @@ eval(code);
     details.get('chat-perm-running').detail,
     'Permission required for execute: rm -rf /tmp/scratch'
   );
+  // Hovering .jetski-inbox-row-main shows full title and colored status in the glass bubble
+  const permMain = details.get('chat-perm-running').row.querySelector('.jetski-inbox-row-main');
+  permMain.dispatchEvent('mouseenter');
+  const inboxBubble = document.getElementById('jetski-closed-chats-filter-bubble');
+  assert(inboxBubble, 'Shared glass tooltip must mount on inbox row hover');
+  assert.strictEqual(inboxBubble.getAttribute('data-visible'), 'true');
+  assert.strictEqual(inboxBubble.getAttribute('data-mode'), 'inbox-row');
+  assert(inboxBubble.innerHTML.includes('jcfb-inbox-tip-title'));
+  assert(inboxBubble.innerHTML.includes('data-testid="jetski-inbox-detail"'));
+  assert(inboxBubble.innerHTML.includes('Permission required for execute: rm -rf /tmp/scratch'));
+  permMain.dispatchEvent('mouseleave');
+  assert.strictEqual(inboxBubble.getAttribute('data-visible'), 'false');
   assert.strictEqual(
     details.get('chat-wait-ask').detail,
     'Awaiting answer: Which branch should I audit?'
@@ -4793,6 +4807,10 @@ eval(code);
     workingDetails.get('chat-num-running').row.querySelector('.jetski-inbox-tier-icon').textContent,
     '🤖'
   );
+  const prevCoordRow = workingDetails.get('chat-coord').row;
+  const coordMain = prevCoordRow.querySelector('.jetski-inbox-row-main');
+  coordMain.dispatchEvent('mouseenter');
+  assert(inboxBubble.innerHTML.includes('Waiting for subagent reports'));
 
   // Phase B: Subagent reports via SYSTEM_MESSAGE (tail via GetCascadeTrajectorySteps),
   // coordinator still status=1 IDLE without final synthesis -> stays in Working!
@@ -4822,6 +4840,12 @@ eval(code);
   await flushAsync();
   workingDetails = detailByCid();
   assert.strictEqual(workingDetails.get('chat-coord').detail, 'Synthesizing subagent findings');
+  assert(inboxBubble.innerHTML.includes('Synthesizing subagent findings'));
+  workingDetails
+    .get('chat-coord')
+    .row.querySelector('.jetski-inbox-row-main')
+    .dispatchEvent('mouseleave');
+  assert.strictEqual(inboxBubble.getAttribute('data-visible'), 'false');
   assert.strictEqual(coordWaitBadge.getAttribute('title'), 'Synthesizing subagent findings');
 
   // Phase C: Coordinator emits intermediate tool call on page 1 and concluding DONE
@@ -4932,12 +4956,18 @@ eval(code);
   assert.strictEqual(details.has('chat-battle'), false);
   assert.strictEqual(urgentPill.textContent, '· 3!');
 
-  // Dismiss chat-perm-running while blocked at stepIndex 2 -> disappears from Needs Me
+  // Dismiss chat-perm-running while hovered at stepIndex 2 -> disappears and hides tooltip
+  details
+    .get('chat-perm-running')
+    .row.querySelector('.jetski-inbox-row-main')
+    .dispatchEvent('mouseenter');
+  assert.strictEqual(inboxBubble.getAttribute('data-visible'), 'true');
   const permSeenBtn = details
     .get('chat-perm-running')
     .row.querySelector('[data-testid="jetski-inbox-seen-btn"]');
   permSeenBtn.dispatchEvent('pointerdown', { button: 0 });
   flushRaf();
+  assert.strictEqual(inboxBubble.getAttribute('data-visible'), 'false');
   details = detailByCid();
   assert.strictEqual(details.has('chat-perm-running'), false);
   assert.strictEqual(urgentPill.textContent, '· 2!');
@@ -5476,10 +5506,10 @@ eval(code);
   const detailByCid = new Map();
   for (const r of rows) {
     const cid = r.getAttribute('data-cascade-id');
-    const det = r.querySelector('[data-testid="jetski-inbox-detail"]');
+    assert.strictEqual(r.querySelector('[data-testid="jetski-inbox-detail"]'), null);
     detailByCid.set(cid, {
       tier: r.getAttribute('data-tier'),
-      detail: det ? det.textContent : '',
+      detail: r.getAttribute('data-detail') || '',
     });
   }
 
@@ -7390,6 +7420,16 @@ eval(code);
     'Style must include bottom resize handle rules'
   );
   assert(
+    styleEl.textContent.includes('max-height: 22px;') &&
+      styleEl.textContent.includes('flex-shrink: 0;'),
+    'Inbox rows must stay fixed at 22px without flex-shrinking'
+  );
+  assert(
+    styleEl.textContent.includes('.jcfb-inbox-tip') &&
+      styleEl.textContent.includes('.jetski-inbox-row[data-long-running="true"]'),
+    'Style must include hover tooltip and long-running row rules'
+  );
+  assert(
     styleEl.textContent.includes('[data-jetski-top-nav-section="true"]'),
     'Style must collapse data-jetski-top-nav-section when topnav is closed'
   );
@@ -8921,8 +8961,30 @@ eval(code);
   const longInboxRow = inboxRows.find((r) => r.getAttribute('data-cascade-id') === 'chat-long');
   assert(longInboxRow, 'chat-long must appear in Working inbox tab');
   assert.strictEqual(longInboxRow.getAttribute('data-long-running'), 'true');
-  const inboxLiveEl = longInboxRow.querySelector('[data-testid="jetski-inbox-live-progress"]');
-  assert(inboxLiveEl && inboxLiveEl.textContent.includes('22m'));
+  assert.strictEqual(
+    longInboxRow.querySelector('[data-testid="jetski-inbox-live-progress"]'),
+    null
+  );
+  const inboxLiveAttr = longInboxRow.getAttribute('data-live-progress') || '';
+  assert(inboxLiveAttr.includes('22m'));
+  const longMain = longInboxRow.querySelector('.jetski-inbox-row-main');
+  longMain.dispatchEvent('mouseenter');
+  const liveBubble = document.getElementById('jetski-closed-chats-filter-bubble');
+  assert(liveBubble && liveBubble.getAttribute('data-visible') === 'true');
+  assert.strictEqual(liveBubble.getAttribute('data-mode'), 'inbox-row');
+  assert(liveBubble.innerHTML.includes('data-testid="jetski-inbox-live-progress"'));
+  assert(liveBubble.innerHTML.includes('data-long-running="true"'));
+  assert(liveBubble.innerHTML.includes('22m'));
+  liveProgressPayload.conversations['chat-long'].progressLine = 'Checking 9/10 hunks';
+  window.__jetskiLiveProgress.syncNow();
+  const updatedLongRow = inboxEl
+    .querySelectorAll('[data-testid="jetski-inbox-row"]')
+    .find((r) => r.getAttribute('data-cascade-id') === 'chat-long');
+  assert.strictEqual(updatedLongRow, longInboxRow, 'Progress ticks must not rebuild DOM rows');
+  assert(liveBubble.innerHTML.includes('Checking 9/10 hunks'));
+  liveProgressPayload.conversations['chat-long'].progressLine = 'Checking 8/10 hunks';
+  longMain.dispatchEvent('mouseleave');
+  assert.strictEqual(liveBubble.getAttribute('data-visible'), 'false');
 
   // Configurable threshold override via localStorage (30m lowers 22m back to normal working)
   storage.set('jetski_long_run_threshold_min_v1', '30');

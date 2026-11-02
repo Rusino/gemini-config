@@ -126,7 +126,6 @@
   const LIVE_PROGRESS_IDLE_TTL_MS = 10000;
   const LIVE_BANNER_CLASS = 'jetski-live-progress-banner';
   const ROW_LIVE_BADGE_CLASS = 'jetski-row-live-badge';
-  const INBOX_LIVE_PROGRESS_CLASS = 'jetski-inbox-live-progress';
   const DEFAULT_VISIBLE_BUCKETS = ['needs-me', 'working'];
 
   const BUCKET_DEFS = {
@@ -250,15 +249,8 @@
   // Measures or estimates the exact vertical height needed for the current tab's rows
   function computeInboxFitHeightPx(inboxEl, listContainer, items) {
     const list = Array.isArray(items) ? items : [];
-    // Count 1-line or 2-line subtexts (subagent detail + live progress) when estimating height
-    const estimated =
-      list.length === 0
-        ? INBOX_FIT_MIN_HEIGHT_PX
-        : 2 +
-          list.reduce((sum, it) => {
-            const sublines = (it?.detailText ? 1 : 0) + (it?.liveProgressText ? 1 : 0);
-            return sum + (sublines >= 2 ? 46 : sublines === 1 ? 34 : 22);
-          }, 0);
+    // Each single-line row occupies 22px plus 2px top padding on the list container
+    const estimated = list.length === 0 ? INBOX_FIT_MIN_HEIGHT_PX : 2 + list.length * 22;
     let measured = 0;
     if (listContainer) {
       // Temporarily unclamp inline height styles to read true DOM scrollHeight when rendered
@@ -352,9 +344,10 @@
   // Tracks which project roadmap badge owns the shared floating bubble tooltip
   let activeHoverRoadmapBadge = null;
   let activeHoverRoadmapProjectId = null;
-  // Tracks which titlebar context badge owns the shared floating bubble tooltip
+  // Tracks which titlebar context badge or inbox row owns the shared floating bubble tooltip
   let activeHoverContextBadge = null;
   let activeHoverContextCascadeId = null;
+  let activeHoverInboxCascadeId = null;
   // Per-conversation paged generatorMetadata cache so updates stay ~2 KB instead of growing
   const contextUsageCache = new Map();
   let chainIndexCache = null;
@@ -6140,9 +6133,13 @@
         align-items: center;
         justify-content: space-between;
         gap: 5px;
-        padding: 2.5px 4px 2.5px 6px;
+        padding: 0 4px 0 6px;
         cursor: pointer;
+        height: 22px;
         min-height: 22px;
+        max-height: 22px;
+        flex-shrink: 0;
+        overflow: hidden;
         border-radius: 0;
         box-sizing: border-box;
         transition: background-color 100ms ease;
@@ -6156,6 +6153,13 @@
       }
       .${INBOX_ROW_CLASS}[data-tier="urgent"]:hover {
         background: rgba(248, 113, 113, 0.10);
+      }
+      .${INBOX_ROW_CLASS}[data-long-running="true"] {
+        box-shadow: inset 2px 0 0 #fdd663;
+        background: rgba(253, 214, 99, 0.04);
+      }
+      .${INBOX_ROW_CLASS}[data-long-running="true"]:hover {
+        background: rgba(253, 214, 99, 0.10);
       }
       .${INBOX_ROW_CLASS} .jetski-inbox-row-main {
         display: flex;
@@ -6194,7 +6198,6 @@
         flex-direction: column;
         flex: 1 1 auto;
         min-width: 0;
-        gap: 0.5px;
       }
       .${INBOX_ROW_CLASS} .jetski-inbox-title {
         min-width: 0;
@@ -6207,28 +6210,36 @@
       .${INBOX_ROW_CLASS}[data-tier="urgent"] .jetski-inbox-title {
         font-weight: 500;
       }
-      .${INBOX_ROW_CLASS} .jetski-inbox-detail {
-        min-width: 0;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        font-size: 10px;
-        line-height: 1.2;
+      #jetski-closed-chats-filter-bubble[data-mode="inbox-row"] {
+        padding: 5px 9px;
+      }
+      #jetski-closed-chats-filter-bubble .jcfb-inbox-tip {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        max-width: 300px;
+      }
+      #jetski-closed-chats-filter-bubble .jcfb-inbox-tip-title {
+        color: var(--foreground, #e8eaed);
+        font-size: 11.5px;
+        font-weight: 500;
+        line-height: 1.3;
+        word-break: break-word;
+      }
+      #jetski-closed-chats-filter-bubble .jcfb-inbox-tip-detail {
         color: #f87171;
-        opacity: 0.9;
+        font-size: 10.5px;
+        line-height: 1.25;
+        word-break: break-word;
       }
-      .${INBOX_ROW_CLASS} .${INBOX_LIVE_PROGRESS_CLASS} {
-        min-width: 0;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        font-size: 10px;
-        font-variant-numeric: tabular-nums;
-        line-height: 1.2;
+      #jetski-closed-chats-filter-bubble .jcfb-inbox-tip-live {
         color: #8ab4f8;
-        opacity: 0.9;
+        font-size: 10.5px;
+        font-variant-numeric: tabular-nums;
+        line-height: 1.25;
+        word-break: break-word;
       }
-      .${INBOX_ROW_CLASS}[data-long-running="true"] .${INBOX_LIVE_PROGRESS_CLASS} {
+      #jetski-closed-chats-filter-bubble .jcfb-inbox-tip-live[data-long-running="true"] {
         color: #fdd663;
         font-weight: 500;
       }
@@ -6464,10 +6475,11 @@
     bubble.style.top = `${Math.round(top)}px`;
   }
 
-  // Clears active context badge ownership when another tooltip takes over or hides
+  // Clears active context badge and inbox row ownership when another tooltip takes over or hides
   function clearContextHover() {
     activeHoverContextBadge = null;
     activeHoverContextCascadeId = null;
+    activeHoverInboxCascadeId = null;
   }
 
   function showBubbleForButton(btn, bucketKey) {
@@ -6527,6 +6539,47 @@
       bubble.setAttribute('data-visible', 'true');
     }
     positionCompactBubble(bubble, btn);
+  }
+
+  // Displays the shared glass tooltip showing the full chat title and colored status lines
+  function showInboxRowBubble(anchorEl, item) {
+    if (!anchorEl || !item) return;
+    activeHoverBtn = null;
+    activeHoverBucket = null;
+    activeHoverRoadmapBadge = null;
+    activeHoverRoadmapProjectId = null;
+    activeHoverContextBadge = null;
+    activeHoverContextCascadeId = null;
+    activeHoverInboxCascadeId = item.cascadeId || null;
+    const bubble = ensureBubbleElement();
+    if (!bubble) return;
+    if (bubble.getAttribute('data-mode') !== 'inbox-row') {
+      bubble.setAttribute('data-mode', 'inbox-row');
+    }
+    let contentHtml =
+      `<div class="jcfb-inbox-tip">` +
+      `<div class="jcfb-inbox-tip-title">${escapeHtml(item.baseTitle)}</div>`;
+    // Append blocked or subagent status line in red when present
+    if (item.detailText) {
+      contentHtml +=
+        `<div class="jcfb-inbox-tip-detail" data-testid="jetski-inbox-detail">` +
+        `${escapeHtml(item.detailText)}</div>`;
+    }
+    // Append live elapsed timer and progress tail in blue, or amber when exceeding threshold
+    if (item.liveProgressText) {
+      const lrAttr = item.isLongRunning ? ' data-long-running="true"' : '';
+      contentHtml +=
+        `<div class="jcfb-inbox-tip-live" data-testid="jetski-inbox-live-progress"${lrAttr}>` +
+        `${escapeHtml(item.liveProgressText)}</div>`;
+    }
+    contentHtml += `</div>`;
+    if (bubble.innerHTML !== contentHtml) {
+      bubble.innerHTML = contentHtml;
+    }
+    if (bubble.getAttribute('data-visible') !== 'true') {
+      bubble.setAttribute('data-visible', 'true');
+    }
+    positionCompactBubble(bubble, anchorEl);
   }
 
   // Wires hover, focus, and press listeners on an icon button to show/hide the pill bubble
@@ -9578,6 +9631,24 @@
     return 'unseen';
   }
 
+  // Updates status attributes and hover payload in place so timer ticks do not tear down DOM rows
+  function syncInboxRowItemData(row, item) {
+    if (!row || !item) return;
+    row._inboxItem = item;
+    // Keep or clear data-detail attribute in sync with current blocked or subagent status
+    if (item.detailText) {
+      setAttrIfChanged(row, 'data-detail', item.detailText);
+    } else if (row.hasAttribute('data-detail')) {
+      row.removeAttribute('data-detail');
+    }
+    // Keep or clear data-live-progress attribute in sync with current elapsed progress line
+    if (item.liveProgressText) {
+      setAttrIfChanged(row, 'data-live-progress', item.liveProgressText);
+    } else if (row.hasAttribute('data-live-progress')) {
+      row.removeAttribute('data-live-progress');
+    }
+  }
+
   // Builds a single Needs-Reaction inbox row with click navigation and quick-action buttons
   function createInboxRowElement(item) {
     const row = document.createElement('div');
@@ -9588,16 +9659,11 @@
     if (item.tier) {
       row.setAttribute('data-tier', item.tier);
     }
-    // Expose >20m long-running state and live progress line on Working inbox rows
+    // Expose >20m long-running state and hover status attributes without native title delay
     if (item.isLongRunning) {
       row.setAttribute('data-long-running', 'true');
     }
-    if (item.detailText) {
-      row.setAttribute('data-detail', item.detailText);
-      row.setAttribute('title', `${item.baseTitle} — ${item.detailText}`);
-    } else if (item.liveProgressText) {
-      row.setAttribute('title', `${item.baseTitle} — ${item.liveProgressText}`);
-    }
+    syncInboxRowItemData(row, item);
 
     const main = document.createElement('div');
     main.className = 'jetski-inbox-row-main';
@@ -9624,22 +9690,6 @@
     title.textContent = item.baseTitle;
     textCol.appendChild(title);
 
-    if (item.detailText) {
-      const detail = document.createElement('span');
-      detail.className = 'jetski-inbox-detail';
-      detail.setAttribute('data-testid', 'jetski-inbox-detail');
-      detail.textContent = item.detailText;
-      textCol.appendChild(detail);
-    }
-    // Render monotonic elapsed time, active command/subagent step, and stdout tail under the title
-    if (item.liveProgressText) {
-      const liveProg = document.createElement('span');
-      liveProg.className = INBOX_LIVE_PROGRESS_CLASS;
-      liveProg.setAttribute('data-testid', 'jetski-inbox-live-progress');
-      liveProg.textContent = item.liveProgressText;
-      textCol.appendChild(liveProg);
-    }
-
     main.appendChild(icon);
     main.appendChild(proj);
     main.appendChild(textCol);
@@ -9650,6 +9700,14 @@
       time.textContent = item.timePrefix;
       main.appendChild(time);
     }
+
+    // Bind instant glass tooltip to the title region without overlapping right-side action buttons
+    const showTip = () => showInboxRowBubble(main, row._inboxItem || item);
+    main.addEventListener('mouseenter', showTip);
+    main.addEventListener('mouseleave', hideBubble);
+    main.addEventListener('focus', showTip);
+    main.addEventListener('blur', hideBubble);
+    main.addEventListener('pointerdown', hideBubble);
 
     const actions = document.createElement('div');
     actions.className = 'jetski-inbox-actions';
@@ -10209,18 +10267,17 @@
       }
     }
 
-    // Re-render row nodes only when the ordered inbox signature changes
+    // Re-render row nodes only when structural row order or visible row chrome changes
     const sig = `${activeInboxTab}:` + currentTabItems
       .map(
         (it) =>
           `${it.cascadeId}:${it.tier || ''}:${it.workingIcon || ''}:` +
-          `${it.projectName}:${it.baseTitle}:${it.timePrefix}:${it.detailText || ''}:` +
-          `${it.isLongRunning ? 1 : 0}:${it.liveProgressText || ''}`
+          `${it.projectName}:${it.baseTitle}:${it.timePrefix}:${it.isLongRunning ? 1 : 0}`
       )
       .join('|');
+    const listContainer = inboxEl.querySelector(`.${INBOX_LIST_CLASS}`);
     if (inboxEl.getAttribute('data-jetski-inbox-sig') !== sig) {
       inboxEl.setAttribute('data-jetski-inbox-sig', sig);
-      const listContainer = inboxEl.querySelector(`.${INBOX_LIST_CLASS}`);
       if (listContainer) {
         while (listContainer.children?.length > 0) {
           listContainer.children[0].remove();
@@ -10235,6 +10292,27 @@
           emptyRow.textContent = INBOX_EMPTY_TEXT[activeInboxTab] || INBOX_EMPTY_TEXT['needs-me'];
           listContainer.appendChild(emptyRow);
         }
+      }
+    } else if (listContainer) {
+      for (let i = 0; i < currentTabItems.length; i++) {
+        const rowEl = listContainer.children?.[i];
+        if (rowEl) syncInboxRowItemData(rowEl, currentTabItems[i]);
+      }
+    }
+
+    // Refresh or dismiss the shared tooltip when an actively hovered inbox row updates or leaves
+    if (activeHoverInboxCascadeId) {
+      const hoveredIdx = currentTabItems.findIndex(
+        (it) => it.cascadeId === activeHoverInboxCascadeId
+      );
+      const hoveredMain =
+        hoveredIdx >= 0
+          ? listContainer?.children?.[hoveredIdx]?.querySelector?.('.jetski-inbox-row-main')
+          : null;
+      if (hoveredMain && currentTabItems[hoveredIdx]) {
+        showInboxRowBubble(hoveredMain, currentTabItems[hoveredIdx]);
+      } else {
+        hideBubble();
       }
     }
 
@@ -10913,6 +10991,7 @@
     activeHoverBucket = null;
     activeHoverRoadmapBadge = null;
     activeHoverRoadmapProjectId = null;
+    activeHoverInboxCascadeId = null;
     activeHoverContextBadge = badge;
     activeHoverContextCascadeId = cascadeId;
     const bubble = ensureBubbleElement();
