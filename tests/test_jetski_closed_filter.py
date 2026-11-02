@@ -4762,17 +4762,24 @@ eval(code);
     details.get('chat-perm-running').detail,
     'Permission required for execute: rm -rf /tmp/scratch'
   );
-  // Hovering .jetski-inbox-row-main shows full title and colored status in the glass bubble
+  // Hovering .jetski-inbox-row-main shows only non-empty status lines without repeating chat title
   const permMain = details.get('chat-perm-running').row.querySelector('.jetski-inbox-row-main');
+  const permTitle = details.get('chat-perm-running').row.querySelector('.jetski-inbox-title');
   permMain.dispatchEvent('mouseenter');
   const inboxBubble = document.getElementById('jetski-closed-chats-filter-bubble');
-  assert(inboxBubble, 'Shared glass tooltip must mount on inbox row hover');
+  assert(inboxBubble, 'Shared glass tooltip must mount on blocked inbox row hover');
   assert.strictEqual(inboxBubble.getAttribute('data-visible'), 'true');
   assert.strictEqual(inboxBubble.getAttribute('data-mode'), 'inbox-row');
-  assert(inboxBubble.innerHTML.includes('jcfb-inbox-tip-title'));
+  assert.strictEqual(inboxBubble.innerHTML.includes('jcfb-inbox-tip-title'), false);
+  assert.strictEqual(inboxBubble.innerHTML.includes(permTitle.textContent), false);
   assert(inboxBubble.innerHTML.includes('data-testid="jetski-inbox-detail"'));
   assert(inboxBubble.innerHTML.includes('Permission required for execute: rm -rf /tmp/scratch'));
   permMain.dispatchEvent('mouseleave');
+  assert.strictEqual(inboxBubble.getAttribute('data-visible'), 'false');
+
+  // Unseen rows without detailText or liveProgressText must not open a tooltip on hover
+  const unseenMain = details.get('chat-battle-ready').row.querySelector('.jetski-inbox-row-main');
+  unseenMain.dispatchEvent('mouseenter');
   assert.strictEqual(inboxBubble.getAttribute('data-visible'), 'false');
   assert.strictEqual(
     details.get('chat-wait-ask').detail,
@@ -8972,6 +8979,7 @@ eval(code);
   const liveBubble = document.getElementById('jetski-closed-chats-filter-bubble');
   assert(liveBubble && liveBubble.getAttribute('data-visible') === 'true');
   assert.strictEqual(liveBubble.getAttribute('data-mode'), 'inbox-row');
+  assert.strictEqual(liveBubble.innerHTML.includes('Full corpus run'), false);
   assert(liveBubble.innerHTML.includes('data-testid="jetski-inbox-live-progress"'));
   assert(liveBubble.innerHTML.includes('data-long-running="true"'));
   assert(liveBubble.innerHTML.includes('22m'));

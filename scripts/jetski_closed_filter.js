@@ -6219,13 +6219,6 @@
         gap: 2px;
         max-width: 300px;
       }
-      #jetski-closed-chats-filter-bubble .jcfb-inbox-tip-title {
-        color: var(--foreground, #e8eaed);
-        font-size: 11.5px;
-        font-weight: 500;
-        line-height: 1.3;
-        word-break: break-word;
-      }
       #jetski-closed-chats-filter-bubble .jcfb-inbox-tip-detail {
         color: #f87171;
         font-size: 10.5px;
@@ -6541,9 +6534,14 @@
     positionCompactBubble(bubble, btn);
   }
 
-  // Displays the shared glass tooltip showing the full chat title and colored status lines
+  // Displays the shared glass tooltip only when non-empty blocked or live status lines exist
   function showInboxRowBubble(anchorEl, item) {
     if (!anchorEl || !item) return;
+    // Skip or dismiss tooltip for rows without status so chat titles are never echoed above rows
+    if (!item.detailText && !item.liveProgressText) {
+      hideBubble();
+      return;
+    }
     activeHoverBtn = null;
     activeHoverBucket = null;
     activeHoverRoadmapBadge = null;
@@ -6556,9 +6554,7 @@
     if (bubble.getAttribute('data-mode') !== 'inbox-row') {
       bubble.setAttribute('data-mode', 'inbox-row');
     }
-    let contentHtml =
-      `<div class="jcfb-inbox-tip">` +
-      `<div class="jcfb-inbox-tip-title">${escapeHtml(item.baseTitle)}</div>`;
+    let contentHtml = `<div class="jcfb-inbox-tip">`;
     // Append blocked or subagent status line in red when present
     if (item.detailText) {
       contentHtml +=
