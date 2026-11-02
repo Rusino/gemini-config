@@ -1401,6 +1401,482 @@ class TestProjectActivityBadge(unittest.TestCase):
         (False, 0),
     )
 
+  def test_extract_progress_tail_line_ansi_cr_and_boilerplate(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      log_path = os.path.join(tmpdir, "output.txt")
+      padding = "noise line\n" * 2000
+      raw = (
+          padding
+          + "Created At: 2026-11-02T03:09:49Z\n"
+          + "Command output:\n"
+          + "\x1b[32m[100/2400]\x1b[0m Running shard 1\r"
+          + "\x1b[36m[1420/2400]\x1b[0m   packages/flutter/test/widgets/editable_text_test.dart\r\n"
+          + "================\n"
+          + "<truncated 400 bytes>\n"
+          + "Completed At: 2026-11-02T03:15:00Z\n"
+          + "Command exited with code 0.\n"
+      )
+      with open(log_path, "w", encoding="utf-8") as f:
+        f.write(raw)
+      line = badge.extract_progress_tail_line(log_path)
+      self.assertEqual(
+          line,
+          "[1420/2400] packages/flutter/test/widgets/editable_text_test.dart",
+      )
+
+  def test_inspect_live_progress_background_command_and_completed_task(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      cid = "cid-bg-cmd"
+      sys_dir = os.path.join(tmpdir, cid, ".system_generated")
+      os.makedirs(os.path.join(sys_dir, "logs"), exist_ok=True)
+      os.makedirs(os.path.join(sys_dir, "tasks"), exist_ok=True)
+      os.makedirs(os.path.join(sys_dir, "steps", "5"), exist_ok=True)
+
+      transcript_path = os.path.join(sys_dir, "logs", "transcript.jsonl")
+      entries = [
+          {
+              "step_index": 0,
+              "type": "USER_INPUT",
+              "status": "DONE",
+              "created_at": "2026-11-02T03:00:00Z",
+              "content": "Run full tests",
+          },
+          {
+              "step_index": 4,
+              "type": "PLANNER_RESPONSE",
+              "status": "DONE",
+              "created_at": "2026-11-02T03:01:00Z",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": '"python3 run_flutter_paragraph_tests.py"',
+                      "toolSummary": '"Run Flutter paragraph tests"',
+                  },
+              }],
+          },
+          {
+              "step_index": 5,
+              "type": "GENERIC",
+              "status": "RUNNING",
+              "created_at": "2026-11-02T03:01:05Z",
+              "content": (
+                  "Created At: 2026-11-02T03:01:05Z\n"
+                  f"Tool is running as a background task with task id: {cid}/task-5\n"
+              ),
+          },
+          {
+              "step_index": 6,
+              "type": "PLANNER_RESPONSE",
+              "status": "DONE",
+              "created_at": "2026-11-02T03:01:10Z",
+              "content": "Waiting for corpus run to finish.",
+          },
+      ]
+      with open(transcript_path, "w", encoding="utf-8") as f:
+        for e in entries:
+          f.write(json.dumps(e) + "\n")
+      with open(
+          os.path.join(sys_dir, "tasks", "task-5.log"), "w", encoding="utf-8"
+      ) as f:
+        f.write("2026-11-02T03:10:00Z [512/2400] shard 1\n[1420/2400] EditableText\n")
+
+      now_ts = badge._parse_iso_timestamp("2026-11-02T03:22:00Z")
+      summary = {
+          "status": "CASCADE_RUN_STATUS_IDLE",
+          "notFullyIdle": True,
+          "lastModifiedTime": "2026-11-02T03:01:10Z",
+      }
+      info = badge.inspect_conversation_live_progress(
+          cid,
+          summary,
+          {cid: summary},
+          bucket="running",
+          activity_detail="Agent turn running",
+          brain_dirs=[tmpdir],
+          now_ts=now_ts,
+      )
+      self.assertIsNotNone(info)
+      assert info is not None
+      self.assertEqual(info["state"], "running")
+      self.assertEqual(info["activeKind"], "command")
+      self.assertEqual(info["elapsedSec"], 1320)
+      self.assertTrue(info["isLongRunning"])
+      self.assertEqual(info["toolSummary"], "Run Flutter paragraph tests")
+      self.assertEqual(info["progressLine"], "[1420/2400] EditableText")
+      self.assertEqual(info["summaryText"], "Run Flutter paragraph tests")
+
+      # Append completion SYSTEM_MESSAGE for task-5 and a subsequent thinking turn
+      entries.append({
+          "step_index": 7,
+          "type": "SYSTEM_MESSAGE",
+          "status": "DONE",
+          "created_at": "2026-11-02T03:22:10Z",
+          "content": f"[Message] sender={cid}/task-5 content=Task finished",
+      })
+      with open(transcript_path, "w", encoding="utf-8") as f:
+        for e in entries:
+          f.write(json.dumps(e) + "\n")
+      info_after = badge.inspect_conversation_live_progress(
+          cid,
+          summary,
+          {cid: summary},
+          bucket="running",
+          activity_detail="Agent turn running",
+          brain_dirs=[tmpdir],
+          now_ts=now_ts + 15,
+      )
+      self.assertIsNotNone(info_after)
+      assert info_after is not None
+      self.assertNotEqual(info_after["activeKind"], "command")
+      self.assertEqual(info_after["progressLine"], "")
+
+      # Once that turn finishes (PLANNER_RESPONSE DONE, no tool_calls) and a new turn
+      # starts hours later before transcript.jsonl flushes USER_INPUT, elapsedSec is 0
+      entries.append({
+          "step_index": 8,
+          "type": "PLANNER_RESPONSE",
+          "status": "DONE",
+          "created_at": "2026-11-02T03:22:20Z",
+          "content": "Corpus passed.",
+      })
+      with open(transcript_path, "w", encoding="utf-8") as f:
+        for e in entries:
+          f.write(json.dumps(e) + "\n")
+      later_ts = badge._parse_iso_timestamp("2026-11-02T06:00:00Z")
+      info_next_turn = badge.inspect_conversation_live_progress(
+          cid,
+          {
+              "status": "CASCADE_RUN_STATUS_RUNNING",
+              "notFullyIdle": True,
+              "lastModifiedTime": "2026-11-02T03:22:20Z",
+          },
+          {cid: summary},
+          bucket="running",
+          activity_detail="Agent turn running",
+          brain_dirs=[tmpdir],
+          now_ts=later_ts,
+      )
+      self.assertIsNotNone(info_next_turn)
+      assert info_next_turn is not None
+      self.assertEqual(info_next_turn["elapsedSec"], 0)
+      self.assertFalse(info_next_turn["isLongRunning"])
+      self.assertEqual(info_next_turn["summaryText"], "Agent turn running")
+
+      # B2 regression: task-50 completing must NOT pop active prefix-matching task-5
+      entries_b2 = [
+          {
+              "step_index": 10,
+              "type": "USER_INPUT",
+              "status": "DONE",
+              "created_at": "2026-11-02T06:00:00Z",
+              "content": "Run parallel tasks",
+          },
+          {
+              "step_index": 11,
+              "type": "PLANNER_RESPONSE",
+              "status": "DONE",
+              "created_at": "2026-11-02T06:00:02Z",
+              "tool_calls": [
+                  {
+                      "name": "run_command",
+                      "args": {"toolSummary": '"Shard 5 build"'},
+                  },
+                  {
+                      "name": "run_command",
+                      "args": {"toolSummary": '"Shard 50 quick check"'},
+                  },
+              ],
+          },
+          {
+              "step_index": 12,
+              "type": "GENERIC",
+              "status": "RUNNING",
+              "created_at": "2026-11-02T06:00:03Z",
+              "content": (
+                  "Tool is running as a background task with task id:"
+                  f" {cid}/task-5\n"
+              ),
+          },
+          {
+              "step_index": 13,
+              "type": "GENERIC",
+              "status": "RUNNING",
+              "created_at": "2026-11-02T06:00:04Z",
+              "content": (
+                  "Tool is running as a background task with task id:"
+                  f" {cid}/task-50\n"
+              ),
+          },
+          {
+              "step_index": 14,
+              "type": "SYSTEM_MESSAGE",
+              "status": "DONE",
+              "created_at": "2026-11-02T06:00:10Z",
+              "content": f"[Message] sender={cid}/task-50 content=Task finished",
+          },
+      ]
+      with open(transcript_path, "w", encoding="utf-8") as f:
+        for e in entries_b2:
+          f.write(json.dumps(e) + "\n")
+      info_b2 = badge.inspect_conversation_live_progress(
+          cid,
+          {"status": "CASCADE_RUN_STATUS_IDLE", "notFullyIdle": True},
+          {cid: summary},
+          bucket="running",
+          activity_detail="Agent turn running",
+          brain_dirs=[tmpdir],
+          now_ts=later_ts + 20,
+      )
+      self.assertIsNotNone(info_b2)
+      assert info_b2 is not None
+      self.assertEqual(info_b2["activeKind"], "command")
+      self.assertEqual(info_b2["toolSummary"], "Shard 5 build")
+
+      # Quoted regex source in read_file and truncated sync run_command output never stick
+      entries_live_edge = [
+          {
+              "step_index": 20,
+              "type": "USER_INPUT",
+              "status": "DONE",
+              "created_at": "2026-11-02T06:10:00Z",
+              "content": "Inspect source",
+          },
+          {
+              "step_index": 21,
+              "type": "PLANNER_RESPONSE",
+              "status": "DONE",
+              "created_at": "2026-11-02T06:10:02Z",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {"toolSummary": '"Truncated sync check"'},
+              }],
+          },
+          {
+              "step_index": 22,
+              "type": "GENERIC",
+              "status": "DONE",
+              "created_at": "2026-11-02T06:10:04Z",
+              "content": "The tool's output was truncated due to being too long.",
+          },
+          {
+              "step_index": 23,
+              "type": "GENERIC",
+              "status": "DONE",
+              "created_at": "2026-11-02T06:10:05Z",
+              "content": (
+                  '57: r"Tool is running as a background task with task id:\\s*(\\S+)"\n'
+              ),
+          },
+      ]
+      with open(transcript_path, "w", encoding="utf-8") as f:
+        for e in entries_live_edge:
+          f.write(json.dumps(e) + "\n")
+      info_edge = badge.inspect_conversation_live_progress(
+          cid,
+          {"status": "CASCADE_RUN_STATUS_RUNNING", "notFullyIdle": True},
+          {cid: summary},
+          bucket="running",
+          activity_detail="Agent turn running",
+          brain_dirs=[tmpdir],
+          now_ts=later_ts + 620,
+      )
+      self.assertIsNotNone(info_edge)
+      assert info_edge is not None
+      self.assertNotEqual(info_edge["activeKind"], "command")
+
+  def test_inspect_live_progress_active_subagent_step_and_stdout_tail(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      parent_cid = "cid-parent"
+      sub_cid = "cid-sub-runner"
+      p_sys = os.path.join(tmpdir, parent_cid, ".system_generated")
+      s_sys = os.path.join(tmpdir, sub_cid, ".system_generated")
+      os.makedirs(os.path.join(p_sys, "logs"), exist_ok=True)
+      os.makedirs(os.path.join(p_sys, "steps", "2"), exist_ok=True)
+      os.makedirs(os.path.join(s_sys, "logs"), exist_ok=True)
+      os.makedirs(os.path.join(s_sys, "tasks"), exist_ok=True)
+
+      p_entries = [
+          {
+              "step_index": 0,
+              "type": "USER_INPUT",
+              "status": "DONE",
+              "created_at": "2026-11-02T03:00:00Z",
+              "content": "Run corpus via subagent",
+          },
+          {
+              "step_index": 1,
+              "type": "PLANNER_RESPONSE",
+              "status": "DONE",
+              "created_at": "2026-11-02T03:00:10Z",
+              "tool_calls": [{
+                  "name": "invoke_subagent",
+                  "args": {
+                      "Model": '"flash"',
+                      "Role": '"Corpus Runner"',
+                      "TypeName": '"self"',
+                  },
+              }],
+          },
+          {
+              "step_index": 2,
+              "type": "GENERIC",
+              "status": "DONE",
+              "created_at": "2026-11-02T03:00:12Z",
+              "content": (
+                  'Created the following subagent:\n{\n  "conversationId": '
+                  f'"{sub_cid}"\n}}'
+              ),
+          },
+      ]
+      with open(
+          os.path.join(p_sys, "logs", "transcript.jsonl"), "w", encoding="utf-8"
+      ) as f:
+        for e in p_entries:
+          f.write(json.dumps(e) + "\n")
+      with open(
+          os.path.join(p_sys, "steps", "2", "output.txt"), "w", encoding="utf-8"
+      ) as f:
+        f.write(f'Created the following subagent:\n{{\n  "conversationId": "{sub_cid}"\n}}\n')
+
+      s_entries = [
+          {
+              "step_index": 0,
+              "type": "USER_INPUT",
+              "status": "DONE",
+              "created_at": "2026-11-02T03:00:12Z",
+          },
+          {
+              "step_index": 13,
+              "type": "PLANNER_RESPONSE",
+              "status": "DONE",
+              "created_at": "2026-11-02T03:05:00Z",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {"toolSummary": '"Execute shard 3"'},
+              }],
+          },
+          {
+              "step_index": 14,
+              "type": "GENERIC",
+              "status": "RUNNING",
+              "created_at": "2026-11-02T03:05:05Z",
+              "content": (
+                  f"Tool is running as a background task with task id: {sub_cid}/task-14\n"
+              ),
+          },
+      ]
+      with open(
+          os.path.join(s_sys, "logs", "transcript.jsonl"), "w", encoding="utf-8"
+      ) as f:
+        for e in s_entries:
+          f.write(json.dumps(e) + "\n")
+      with open(
+          os.path.join(s_sys, "tasks", "task-14.log"), "w", encoding="utf-8"
+      ) as f:
+        f.write("[1890/2400] shard_3 running\n")
+
+      summaries = {
+          parent_cid: {
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "notFullyIdle": True,
+              "hasRunningSubagents": True,
+              "lastModifiedTime": "2026-11-02T03:00:15Z",
+          },
+          sub_cid: {
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "notFullyIdle": True,
+              "stepCount": 15,
+              "lastModifiedTime": "2026-11-02T03:05:05Z",
+              "trajectoryMetadata": {"parentConversationId": parent_cid},
+          },
+      }
+      now_ts = badge._parse_iso_timestamp("2026-11-02T03:08:00Z")
+      info = badge.inspect_conversation_live_progress(
+          parent_cid,
+          summaries[parent_cid],
+          summaries,
+          bucket="running",
+          activity_detail="Waiting for subagent reports",
+          brain_dirs=[tmpdir],
+          now_ts=now_ts,
+      )
+      self.assertIsNotNone(info)
+      assert info is not None
+      self.assertEqual(info["activeKind"], "subagent")
+      self.assertEqual(info["elapsedSec"], 480)
+      self.assertFalse(info["isLongRunning"])
+      self.assertEqual(info["subagent"]["cid"], sub_cid)
+      self.assertEqual(info["subagent"]["role"], "Corpus Runner")
+      self.assertEqual(info["subagent"]["stepIndex"], 14)
+      self.assertEqual(info["subagent"]["toolSummary"], "Execute shard 3")
+      self.assertEqual(info["progressLine"], "[1890/2400] shard_3 running")
+      self.assertIn(
+          "subagent: Corpus Runner (step 14 · Execute shard 3)",
+          info["summaryText"],
+      )
+
+  def test_inspect_live_progress_blocked_and_standalone_export(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      proj_dir = os.path.join(tmpdir, "projects")
+      brain_dir = os.path.join(tmpdir, "brain")
+      os.makedirs(proj_dir, exist_ok=True)
+      os.makedirs(brain_dir, exist_ok=True)
+
+      summaries = {
+          "cid-standalone-blocked": {
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "lastModifiedTime": "2026-11-02T03:00:00Z",
+              "trajectoryMetadata": {},
+          },
+          "sub-blocked": {
+              "status": "CASCADE_RUN_STATUS_IDLE",
+              "waitingSteps": [{
+                  "stepIndex": 9,
+                  "step": {
+                      "status": "CORTEX_STEP_STATUS_WAITING",
+                      "requestedInteraction": {
+                          "permission": {
+                              "actionDescription": "Clean scratch",
+                          }
+                      },
+                  },
+              }],
+              "trajectoryMetadata": {
+                  "parentConversationId": "cid-standalone-blocked",
+              },
+              "annotations": {"title": "DB Helper"},
+          },
+      }
+      with unittest.mock.patch.object(
+          badge, "fetch_trajectories", return_value=summaries
+      ), unittest.mock.patch.object(
+          badge, "fetch_single_trajectory", return_value=None
+      ), unittest.mock.patch.object(
+          badge, "_find_brain_dirs", return_value=[brain_dir]
+      ), unittest.mock.patch.object(
+          badge, "_sync_lock_path", return_value=os.path.join(tmpdir, "sync.lock")
+      ), unittest.mock.patch.object(
+          badge, "_traj_cache_path", return_value=os.path.join(tmpdir, "traj.json")
+      ), unittest.mock.patch.object(
+          badge, "_view_state_path", return_value=os.path.join(tmpdir, "view.json")
+      ):
+        rpc_ok, total_tracked, _ = badge.sync_once(projects_dir=proj_dir)
+      self.assertTrue(rpc_ok)
+      self.assertEqual(total_tracked, 1)
+      exported_path = os.path.join(brain_dir, "jetski-live-progress.json")
+      self.assertTrue(os.path.isfile(exported_path))
+      with open(exported_path, "r", encoding="utf-8") as f:
+        exported = json.load(f)
+      conv = exported["conversations"]["cid-standalone-blocked"]
+      self.assertEqual(conv["state"], "blocked")
+      self.assertEqual(
+          conv["blockedDetail"], "[DB Helper] Permission required for Clean scratch"
+      )
+      self.assertEqual(conv["subagent"]["cid"], "sub-blocked")
+      # B1 regression: subagent cid itself is exported so opening its pane has 0-token banner data
+      self.assertIn("sub-blocked", exported["conversations"])
+      self.assertEqual(exported["conversations"]["sub-blocked"]["state"], "blocked")
+
 
 if __name__ == "__main__":
   unittest.main()

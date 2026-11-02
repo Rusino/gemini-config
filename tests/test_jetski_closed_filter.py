@@ -8410,6 +8410,647 @@ eval(code);
     )
     self.assertIn("ALL_TRAJ_RPC_CONCURRENCY_TESTS_PASSED", res.stdout)
 
+  def test_live_progress_and_waiting_banner_in_chat_and_sidebar(self) -> None:
+    node_bin = find_node_binary()
+    js_path = os.path.join(SCRIPTS_DIR, "jetski_closed_filter.js")
+
+    harness = r"""
+const fs = require('fs');
+const assert = require('assert');
+const code = fs.readFileSync(process.argv[1], 'utf8');
+
+class FakeElement {
+  constructor(tag) {
+    this.tagName = String(tag || 'DIV').toUpperCase();
+    this.id = '';
+    this.className = '';
+    this.type = '';
+    this._text = '';
+    this._html = '';
+    this.style = {};
+    this.attributes = new Map();
+    this.children = [];
+    this.parentElement = null;
+    this.listeners = new Map();
+  }
+  get firstChild() { return this.children[0] || null; }
+  get lastChild() { return this.children[this.children.length - 1] || null; }
+  get textContent() {
+    return this._text + this.children.map((c) => c.textContent).join('');
+  }
+  set textContent(v) {
+    this._text = String(v);
+    for (const c of this.children) c.parentElement = null;
+    this.children = [];
+  }
+  get innerHTML() { return this._html; }
+  set innerHTML(v) {
+    this._html = String(v);
+    if (!v) {
+      for (const c of this.children) c.parentElement = null;
+      this.children = [];
+    }
+  }
+  setAttribute(k, v) {
+    this.attributes.set(k, String(v));
+    if (k === 'id') this.id = String(v);
+    if (k === 'class') this.className = String(v);
+  }
+  getAttribute(k) {
+    if (k === 'id' && this.id) return this.id;
+    return this.attributes.has(k) ? this.attributes.get(k) : null;
+  }
+  hasAttribute(k) { return this.attributes.has(k); }
+  removeAttribute(k) { this.attributes.delete(k); }
+  appendChild(ch) {
+    if (ch.parentElement) ch.remove();
+    ch.parentElement = this;
+    this.children.push(ch);
+    return ch;
+  }
+  insertBefore(ch, ref) {
+    if (ch === ref) return ch;
+    if (ch.parentElement) ch.remove();
+    ch.parentElement = this;
+    const idx = this.children.indexOf(ref);
+    if (idx === -1) this.children.push(ch);
+    else this.children.splice(idx, 0, ch);
+    return ch;
+  }
+  remove() {
+    if (!this.parentElement) return;
+    const idx = this.parentElement.children.indexOf(this);
+    if (idx !== -1) this.parentElement.children.splice(idx, 1);
+    this.parentElement = null;
+  }
+  addEventListener(t, fn) {
+    if (!this.listeners.has(t)) this.listeners.set(t, []);
+    this.listeners.get(t).push(fn);
+  }
+  removeEventListener() {}
+  dispatchEvent(type, init = {}) {
+    const evt = {
+      type,
+      target: this,
+      button: 0,
+      ...init,
+      preventDefault() {},
+      stopPropagation() {},
+    };
+    for (const fn of (this.listeners.get(type) || [])) fn(evt);
+  }
+  matches(sel) {
+    if (!sel) return false;
+    for (const raw of sel.split(',')) {
+      const s = raw.trim();
+      if (!s) continue;
+      if (this._matchesSingle(s)) return true;
+    }
+    return false;
+  }
+  _matchesSingle(s) {
+    if (s.startsWith('#')) return this.id === s.slice(1);
+    if (s.startsWith('.')) return this.className.split(/\s+/).includes(s.slice(1));
+    const tagMatch = /^([a-zA-Z0-9_-]+)/.exec(s);
+    if (tagMatch && this.tagName !== tagMatch[1].toUpperCase()) return false;
+    const attrRe = /\[([a-zA-Z0-9_-]+)(?:="([^"]*)")?\]/g;
+    let m;
+    let matchedAny = Boolean(tagMatch);
+    while ((m = attrRe.exec(s)) !== null) {
+      matchedAny = true;
+      if (!this.hasAttribute(m[1])) return false;
+      if (m[2] !== undefined && this.getAttribute(m[1]) !== m[2]) return false;
+    }
+    const clsRe = /\.([a-zA-Z0-9_-]+)/g;
+    while ((m = clsRe.exec(s)) !== null) {
+      matchedAny = true;
+      if (!this.className.split(/\s+/).includes(m[1])) return false;
+    }
+    return matchedAny;
+  }
+  closest(sel) {
+    let cur = this;
+    while (cur) {
+      if (typeof cur.matches === 'function' && cur.matches(sel)) return cur;
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+  querySelectorAll(sel) {
+    const out = [];
+    const visit = (el) => {
+      for (const ch of el.children) {
+        if (ch.matches(sel)) out.push(ch);
+        visit(ch);
+      }
+    };
+    visit(this);
+    return out;
+  }
+  querySelector(sel) {
+    return this.querySelectorAll(sel)[0] || null;
+  }
+  getBoundingClientRect() {
+    return { left: 10, top: 10, right: 200, bottom: 40, width: 190, height: 30 };
+  }
+}
+
+let fakeNow = Date.parse('2026-11-02T03:22:00Z');
+Date.now = () => fakeNow;
+
+const docEl = new FakeElement('html');
+const headEl = docEl.appendChild(new FakeElement('head'));
+const bodyEl = docEl.appendChild(new FakeElement('body'));
+
+const sidebarWrap = bodyEl.appendChild(new FakeElement('div'));
+sidebarWrap.setAttribute('aria-label', 'Sidebar');
+const actionRow = sidebarWrap.appendChild(new FakeElement('div'));
+const displayOptionsBtn = actionRow.appendChild(new FakeElement('button'));
+displayOptionsBtn.setAttribute('aria-label', 'Display Options');
+const listEl = sidebarWrap.appendChild(new FakeElement('div'));
+listEl.setAttribute('data-testid', 'conversation-list-sidebar');
+
+function makeSidebarRow(cid, title) {
+  const row = listEl.appendChild(new FakeElement('div'));
+  row.setAttribute('data-testid', 'conversation-row-sidebar');
+  row.setAttribute('data-cascade-id', cid);
+  const span = row.appendChild(new FakeElement('span'));
+  span.className = 'truncate';
+  span.textContent = title;
+  const statusWrap = row.appendChild(new FakeElement('div'));
+  const hoverBar = statusWrap.appendChild(new FakeElement('div'));
+  const archBtn = hoverBar.appendChild(new FakeElement('button'));
+  archBtn.setAttribute('data-testid', 'conversation-archive-button');
+  return row;
+}
+
+const rowCmd = makeSidebarRow('chat-cmd', '[22:18] ⦿ Short test run');
+const rowLong = makeSidebarRow('chat-long', '[22:00] ⦿ Full corpus run');
+const rowBlocked = makeSidebarRow('chat-blocked', '[21:55] ⦿ Deploy check');
+
+function makeConvoView(cid) {
+  const view = bodyEl.appendChild(new FakeElement('div'));
+  view.setAttribute('data-testid', 'conversation-view');
+  view.setAttribute('data-cascade-id', cid);
+  const footer = view.appendChild(new FakeElement('div'));
+  const inputBox = footer.appendChild(new FakeElement('div'));
+  inputBox.setAttribute('data-testid', 'agent-input-box');
+  return { view, footer, inputBox };
+}
+
+const viewCmd = makeConvoView('chat-cmd');
+const viewLong = makeConvoView('chat-long');
+const viewBlocked = makeConvoView('chat-blocked');
+
+let liveProgressPayload = {
+  version: 1,
+  updatedAtMs: fakeNow,
+  longRunThresholdSec: 1200,
+  conversations: {
+    'chat-cmd': {
+      state: 'running',
+      turnStartedAtMs: fakeNow - 240 * 1000,
+      stepStartedAtMs: fakeNow - 180 * 1000,
+      elapsedSec: 240,
+      stepElapsedSec: 180,
+      isLongRunning: false,
+      stepIndex: 8,
+      activeKind: 'command',
+      toolSummary: 'Run baseline tests',
+      progressLine: '[310/2400] paragraph_test.dart',
+      blockedDetail: '',
+      summaryText: 'Run baseline tests',
+    },
+    'chat-long': {
+      state: 'running',
+      turnStartedAtMs: fakeNow - 1320 * 1000,
+      stepStartedAtMs: fakeNow - 900 * 1000,
+      elapsedSec: 1320,
+      stepElapsedSec: 900,
+      isLongRunning: true,
+      stepIndex: 12,
+      activeKind: 'subagent',
+      toolSummary: '',
+      subagent: {
+        cid: 'sub-skeptic',
+        role: 'keeper_skeptic',
+        stepIndex: 14,
+        toolSummary: 'Audit invariants',
+        activeCount: 1,
+      },
+      progressLine: 'Checking 8/10 hunks',
+      blockedDetail: '',
+      summaryText: 'subagent: keeper_skeptic (step 14 · Audit invariants)',
+    },
+  },
+};
+
+const storeState = {
+  projects: { projects: [{ id: 'proj-1', name: 'Skia Text' }] },
+  trajectorySummaries: {
+    summaries: {
+      'chat-cmd': {
+        summary: '[22:18] ⦿ Short test run',
+        status: 'CASCADE_RUN_STATUS_RUNNING',
+        notFullyIdle: true,
+        stepCount: 8,
+        lastModifiedTime: '2026-11-02T03:18:00Z',
+        annotations: { title: '[22:18] ⦿ Short test run', archived: false },
+        trajectoryMetadata: { projectId: 'proj-1' },
+      },
+      'chat-long': {
+        summary: '[22:00] ⦿ Full corpus run',
+        status: 'CASCADE_RUN_STATUS_IDLE',
+        notFullyIdle: true,
+        hasRunningSubagents: true,
+        stepCount: 12,
+        lastModifiedTime: '2026-11-02T03:00:00Z',
+        annotations: { title: '[22:00] ⦿ Full corpus run', archived: false },
+        trajectoryMetadata: { projectId: 'proj-1' },
+      },
+      'sub-skeptic': {
+        summary: 'keeper_skeptic',
+        status: 'CASCADE_RUN_STATUS_RUNNING',
+        notFullyIdle: true,
+        stepCount: 14,
+        lastModifiedTime: '2026-11-02T03:21:00Z',
+        trajectoryMetadata: {
+          parentConversationId: 'chat-long',
+          sourceMetadata: { hideFromConversationList: true },
+        },
+      },
+      'chat-blocked': {
+        summary: '[21:55] ⦿ Deploy check',
+        status: 'CASCADE_RUN_STATUS_IDLE',
+        notFullyIdle: true,
+        stepCount: 6,
+        lastModifiedTime: '2026-11-02T02:55:00Z',
+        annotations: { title: '[21:55] ⦿ Deploy check', archived: false },
+        trajectoryMetadata: { projectId: 'proj-1' },
+      },
+      'sub-db': {
+        summary: 'DB Helper',
+        status: 'CASCADE_RUN_STATUS_IDLE',
+        waitingSteps: [{
+          stepIndex: 4,
+          step: {
+            status: 'CORTEX_STEP_STATUS_WAITING',
+            requestedInteraction: {
+              askQuestion: { questions: [{ question: 'Drop staging table?' }] },
+            },
+          },
+        }],
+        lastModifiedTime: '2026-11-02T02:56:00Z',
+        annotations: { title: 'DB Helper' },
+        trajectoryMetadata: {
+          parentConversationId: 'chat-blocked',
+          sourceMetadata: { hideFromConversationList: true },
+        },
+      },
+    },
+  },
+  multiConvoLayout: { focusedPaneId: 'chat-long' },
+  sideBar: { isOpen: true },
+};
+
+const subscribers = [];
+const navigatedCids = [];
+const reduxStore = {
+  getState: () => storeState,
+  dispatch(action) {
+    if (action?.type === 'trajectorySummaries/applyStreamBatch') {
+      const next = { ...storeState.trajectorySummaries.summaries };
+      for (const [id, s] of (action.payload?.updates || [])) next[id] = s;
+      storeState.trajectorySummaries = { summaries: next };
+    }
+    if (typeof action?.type === 'string' && action.payload?.cascadeId) {
+      navigatedCids.push(action.payload.cascadeId);
+    }
+    for (const sub of subscribers) sub();
+    return action;
+  },
+  subscribe(fn) {
+    subscribers.push(fn);
+    return () => {};
+  },
+};
+displayOptionsBtn.__reactFiber$test = { memoizedProps: { store: reduxStore } };
+
+const storage = new Map();
+const rafCallbacks = [];
+global.requestAnimationFrame = (cb) => {
+  rafCallbacks.push(cb);
+  return rafCallbacks.length;
+};
+const flushAsync = async () => {
+  for (let round = 0; round < 6; round++) {
+    while (rafCallbacks.length > 0) rafCallbacks.shift()();
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+  }
+  while (rafCallbacks.length > 0) rafCallbacks.shift()();
+};
+
+const firedNotifications = [];
+class FakeNotification {
+  constructor(title, opts) {
+    firedNotifications.push({ title, body: opts?.body || '' });
+  }
+}
+FakeNotification.permission = 'granted';
+global.PopStateEvent = class { constructor(type) { this.type = type; } };
+global.window = {
+  Notification: FakeNotification,
+  innerWidth: 1280,
+  location: { pathname: '/c/chat-long', search: '' },
+  history: { pushState(_s, _t, url) { navigatedCids.push(String(url)); } },
+  addEventListener() {},
+  removeEventListener() {},
+  dispatchEvent() {},
+  __APP_CONFIG__: { csrfToken: 'r106-csrf' },
+  localStorage: {
+    getItem: (k) => (storage.has(k) ? storage.get(k) : null),
+    setItem: (k, v) => storage.set(k, String(v)),
+  },
+  fetch: async (url) => {
+    const u = String(url);
+    if (u.includes('jetski-live-progress.json')) {
+      return { ok: true, json: async () => liveProgressPayload };
+    }
+    if (u.includes('jetski-chains.json')) {
+      return { ok: true, json: async () => ({ parentOf: {}, createdAt: {}, redirects: {} }) };
+    }
+    if (u.includes('jetski-roadmaps.json')) {
+      return { ok: true, json: async () => ({ version: 1, projects: {} }) };
+    }
+    if (u.includes('/GetCascadeTrajectory')) {
+      return { ok: true, json: async () => ({ trajectory: { steps: [] } }) };
+    }
+    return { ok: false, status: 404 };
+  },
+  document: null,
+};
+global.document = {
+  documentElement: docEl,
+  head: headEl,
+  body: bodyEl,
+  getElementById: (id) => docEl.querySelector(`#${id}`),
+  createElement: (tag) => new FakeElement(tag),
+  querySelector: (sel) => docEl.querySelector(sel),
+  querySelectorAll: (sel) => docEl.querySelectorAll(sel),
+  addEventListener() {},
+  removeEventListener() {},
+  dispatchEvent() {},
+};
+global.window.document = global.document;
+global.MutationObserver = class { observe() {} disconnect() {} };
+
+eval(code);
+
+(async () => {
+  await flushAsync();
+
+  // 1. Short working command (<20m) banner + sidebar badge + inbox live line
+  const bannerCmd = viewCmd.footer.querySelector('[data-testid="jetski-live-progress-banner"]');
+  assert(bannerCmd, 'Working command chat must mount live progress banner above input box');
+  assert.strictEqual(viewCmd.footer.children[0], bannerCmd, 'Banner must sit above input box');
+  assert.strictEqual(bannerCmd.getAttribute('data-state'), 'working');
+  assert.strictEqual(bannerCmd.getAttribute('data-long-running'), 'false');
+  assert(
+    bannerCmd.querySelector('[data-testid="jetski-live-progress-pill"]').textContent.includes('4m')
+  );
+  assert.strictEqual(
+    bannerCmd.querySelector('[data-testid="jetski-live-progress-summary"]').textContent,
+    'Run baseline tests'
+  );
+  assert(
+    bannerCmd
+      .querySelector('[data-testid="jetski-live-progress-output"]')
+      .textContent.includes('[310/2400] paragraph_test.dart')
+  );
+  assert.strictEqual(rowCmd.getAttribute('data-jetski-live-state'), 'working');
+  const badgeCmd = rowCmd.querySelector('[data-testid="jetski-row-live-badge"]');
+  assert(badgeCmd && badgeCmd.textContent.includes('4m'));
+
+  // 2. Long-running subagent (>20m) threshold alert + subagent jump button
+  const bannerLong = viewLong.footer.querySelector('[data-testid="jetski-live-progress-banner"]');
+  assert(bannerLong, 'Long-running chat must mount live progress banner');
+  assert.strictEqual(bannerLong.getAttribute('data-state'), 'long-running');
+  assert.strictEqual(bannerLong.getAttribute('data-long-running'), 'true');
+  const pillLongEl = bannerLong.querySelector('[data-testid="jetski-live-progress-pill"]');
+  const pillLong = pillLongEl.textContent;
+  assert(pillLong.includes('22m') && pillLong.includes('>20m'), `Unexpected pill: ${pillLong}`);
+  assert(
+    bannerLong
+      .querySelector('[data-testid="jetski-live-progress-summary"]')
+      .textContent.includes('subagent: keeper_skeptic (step 14 · Audit invariants)')
+  );
+  assert(
+    bannerLong
+      .querySelector('[data-testid="jetski-live-progress-output"]')
+      .textContent.includes('Checking 8/10 hunks')
+  );
+  const subBtnLong = bannerLong.querySelector('[data-testid="jetski-live-progress-subagent-btn"]');
+  assert(subBtnLong, 'Subagent banner must expose jump button');
+  subBtnLong.dispatchEvent('click');
+  assert(
+    navigatedCids.some((x) => x.includes('sub-skeptic')),
+    'Clicking subagent jump button must navigate to subagent conversation'
+  );
+  assert.strictEqual(rowLong.getAttribute('data-jetski-live-state'), 'long-running');
+  const badgeLong = rowLong.querySelector('[data-testid="jetski-row-live-badge"]');
+  assert(badgeLong && badgeLong.textContent.includes('22m'));
+
+  // Check Inbox Working tab live progress metadata
+  const inboxEl = sidebarWrap.querySelector('.jetski-needs-reaction-inbox');
+  const tabWorking = inboxEl.querySelector('[data-testid="jetski-inbox-tab-working"]');
+  tabWorking.dispatchEvent('pointerdown', { button: 0 });
+  await flushAsync();
+  const inboxRows = inboxEl.querySelectorAll('[data-testid="jetski-inbox-row"]');
+  const longInboxRow = inboxRows.find((r) => r.getAttribute('data-cascade-id') === 'chat-long');
+  assert(longInboxRow, 'chat-long must appear in Working inbox tab');
+  assert.strictEqual(longInboxRow.getAttribute('data-long-running'), 'true');
+  const inboxLiveEl = longInboxRow.querySelector('[data-testid="jetski-inbox-live-progress"]');
+  assert(inboxLiveEl && inboxLiveEl.textContent.includes('22m'));
+
+  // Configurable threshold override via localStorage (30m lowers 22m back to normal working)
+  storage.set('jetski_long_run_threshold_min_v1', '30');
+  window.__jetskiLiveProgress.syncNow();
+  assert.strictEqual(bannerLong.getAttribute('data-state'), 'working');
+  storage.set('jetski_long_run_threshold_min_v1', '20');
+  window.__jetskiLiveProgress.syncNow();
+  assert.strictEqual(bannerLong.getAttribute('data-state'), 'long-running');
+
+  // 3. CORTEX_STEP_STATUS_WAITING alert without jetski-live-progress.json entry (pure RPC/Redux)
+  const bannerBlocked = viewBlocked.footer.querySelector(
+    '[data-testid="jetski-live-progress-banner"]'
+  );
+  assert(bannerBlocked, 'Blocked waiting chat must mount alert banner even without JSON entry');
+  assert.strictEqual(bannerBlocked.getAttribute('data-state'), 'blocked');
+  assert(
+    bannerBlocked
+      .querySelector('[data-testid="jetski-live-progress-summary"]')
+      .textContent.includes('[DB Helper] Awaiting answer: Drop staging table?')
+  );
+  const subBtnBlocked = bannerBlocked.querySelector(
+    '[data-testid="jetski-live-progress-subagent-btn"]'
+  );
+  assert(subBtnBlocked, 'Blocked descendant subagent must offer direct jump button');
+  assert.strictEqual(rowBlocked.getAttribute('data-jetski-live-state'), 'blocked');
+  const badgeBlocked = rowBlocked.querySelector('[data-testid="jetski-row-live-badge"]');
+  assert(badgeBlocked && badgeBlocked.textContent.includes('⚠'));
+
+  // Starting a brand-new turn on an hours-old chat without JSON must not spike >20m
+  delete liveProgressPayload.conversations['chat-cmd'];
+  reduxStore.dispatch({
+    type: 'trajectorySummaries/applyStreamBatch',
+    payload: {
+      updates: [[
+        'chat-cmd',
+        {
+          ...storeState.trajectorySummaries.summaries['chat-cmd'],
+          status: 'CASCADE_RUN_STATUS_RUNNING',
+          notFullyIdle: true,
+          lastModifiedTime: '2026-11-02T00:15:00Z',
+        },
+      ]],
+      deletes: [],
+    },
+  });
+  liveProgressPayload = { ...liveProgressPayload, updatedAtMs: fakeNow + 5000 };
+  await window.__jetskiLiveProgress.fetchLiveProgressIndex(true, true);
+  window.__jetskiLiveProgress.syncNow();
+  assert.strictEqual(bannerCmd.getAttribute('data-state'), 'working');
+  assert.strictEqual(bannerCmd.getAttribute('data-long-running'), 'false');
+
+  // 4. Immediate banner removal once chat becomes idle (even before JSON cache expires)
+  reduxStore.dispatch({
+    type: 'trajectorySummaries/applyStreamBatch',
+    payload: {
+      updates: [[
+        'chat-cmd',
+        {
+          ...storeState.trajectorySummaries.summaries['chat-cmd'],
+          status: 'CASCADE_RUN_STATUS_IDLE',
+          notFullyIdle: false,
+        },
+      ]],
+      deletes: [],
+    },
+  });
+  await flushAsync();
+  assert.strictEqual(
+    viewCmd.footer.querySelector('[data-testid="jetski-live-progress-banner"]'),
+    null,
+    'Completed idle chat must immediately unmount live progress banner'
+  );
+  assert.strictEqual(rowCmd.hasAttribute('data-jetski-live-state'), false);
+  assert.strictEqual(rowCmd.querySelector('[data-testid="jetski-row-live-badge"]'), null);
+
+  // B3 regression: after chat-long finishes Turn 1 and exceeds >20m again in Turn 2, re-alert
+  const longAlertsTurn1 = firedNotifications.filter((n) =>
+    n.title.includes('Full corpus run')
+  ).length;
+  assert.strictEqual(longAlertsTurn1, 1, 'Turn 1 must fire exactly one >20m notification');
+  reduxStore.dispatch({
+    type: 'trajectorySummaries/applyStreamBatch',
+    payload: {
+      updates: [
+        [
+          'chat-long',
+          {
+            ...storeState.trajectorySummaries.summaries['chat-long'],
+            status: 'CASCADE_RUN_STATUS_IDLE',
+            notFullyIdle: false,
+            hasRunningSubagents: false,
+          },
+        ],
+        [
+          'sub-skeptic',
+          {
+            ...storeState.trajectorySummaries.summaries['sub-skeptic'],
+            status: 'CASCADE_RUN_STATUS_IDLE',
+            notFullyIdle: false,
+          },
+        ],
+      ],
+      deletes: [],
+    },
+  });
+  await flushAsync();
+  fakeNow += 3600 * 1000;
+  liveProgressPayload = {
+    ...liveProgressPayload,
+    updatedAtMs: fakeNow,
+    conversations: {
+      'chat-long': {
+        state: 'running',
+        turnStartedAtMs: fakeNow - 1500 * 1000,
+        stepStartedAtMs: fakeNow - 600 * 1000,
+        elapsedSec: 1500,
+        stepElapsedSec: 600,
+        isLongRunning: true,
+        stepIndex: 20,
+        activeKind: 'command',
+        toolSummary: 'Second corpus run',
+        progressLine: '[900/2400] second pass',
+        blockedDetail: '',
+        summaryText: 'Second corpus run',
+      },
+    },
+  };
+  reduxStore.dispatch({
+    type: 'trajectorySummaries/applyStreamBatch',
+    payload: {
+      updates: [[
+        'chat-long',
+        {
+          ...storeState.trajectorySummaries.summaries['chat-long'],
+          status: 'CASCADE_RUN_STATUS_RUNNING',
+          notFullyIdle: true,
+        },
+      ]],
+      deletes: [],
+    },
+  });
+  await window.__jetskiLiveProgress.fetchLiveProgressIndex(true, true);
+  window.__jetskiLiveProgress.syncNow();
+  const longAlertsTurn2 = firedNotifications.filter((n) =>
+    n.title.includes('Full corpus run')
+  ).length;
+  assert.strictEqual(longAlertsTurn2, 2, 'Turn 2 >20m must fire a second notification');
+
+  // Teardown cleanup removes remaining banners and row badges
+  window.__jetskiClosedChatsFilterCleanup();
+  assert.strictEqual(
+    viewLong.footer.querySelector('[data-testid="jetski-live-progress-banner"]'),
+    null
+  );
+  assert.strictEqual(rowLong.querySelector('[data-testid="jetski-row-live-badge"]'), null);
+  assert.strictEqual(rowLong.hasAttribute('data-jetski-live-state'), false);
+
+  console.log('ALL_LIVE_PROGRESS_BANNER_TESTS_PASSED');
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"""
+    env = os.environ.copy()
+    env["ELECTRON_RUN_AS_NODE"] = "1"
+    res = subprocess.run(
+        [node_bin, "-e", harness, js_path],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(
+        res.returncode,
+        0,
+        f"Live progress banner JS harness failed:\n"
+        f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+    )
+    self.assertIn("ALL_LIVE_PROGRESS_BANNER_TESTS_PASSED", res.stdout)
+
 
 if __name__ == "__main__":
   unittest.main()

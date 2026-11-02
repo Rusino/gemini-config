@@ -49,6 +49,27 @@ import urllib.request
 DEFAULT_PROJECTS_DIR = os.path.expanduser("~/.gemini/config/projects")
 DEFAULT_ANNOTATIONS_DIR = os.path.expanduser("~/.gemini/jetski/annotations")
 DEFAULT_LS_ADDRESS = "localhost:5387"
+LIVE_PROGRESS_FILE_NAME = "jetski-live-progress.json"
+DEFAULT_LONG_RUN_THRESHOLD_SEC = 1200
+
+# Strip terminal escape codes and harness wrapper headers when tailing live stdout logs
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+# Anchor on its own line so reading source files with regex literals never spawns phantom bg tasks
+BG_TASK_ID_RE = re.compile(
+    r"^Tool is running as a background task with task id:\s*([A-Za-z0-9_./:-]+)\s*$",
+    re.MULTILINE,
+)
+SUBAGENT_CID_RE = re.compile(r'"conversationId"\s*:\s*"([^"]+)"')
+TRUNCATED_MARKER_RE = re.compile(r"^<truncated\b.*>$", re.IGNORECASE)
+STEP_BOILERPLATE_PREFIXES = (
+    "Created At:",
+    "Completed At:",
+    "Command exited with code",
+    "Command output:",
+    "The tool's output was truncated",
+    "Here is a preview",
+    "Showing lines ",
+)
 
 # Matches one or more trailing activity badges such as:
 #   " · ⟳ 1", " · ⚠ 2", " · ● 1", " · ⟳ 1 ⚠ 1 ● 2"
@@ -1787,6 +1808,734 @@ def resolve_conversation_activity(
   return "idle", ""
 
 
+# Discovers active Jetski and Antigravity brain directories where /static/artifacts/ serves files
+def _find_brain_dirs() -> list[str]:
+  # Keep unit tests hermetic unless brain_dirs is passed or _find_brain_dirs is explicitly mocked
+  if "unittest" in sys.modules:
+    return []
+  home = os.path.expanduser("~")
+  dirs: list[str] = []
+  for app_name in ("jetski", "antigravity"):
+    app_root = os.path.join(home, ".gemini", app_name)
+    if os.path.isdir(app_root):
+      dirs.append(os.path.join(app_root, "brain"))
+  if not dirs:
+    dirs.append(os.path.join(home, ".gemini", "jetski", "brain"))
+  return dirs
+
+
+# Reads configurable long-run alert threshold in seconds (default 20 minutes)
+def get_long_run_threshold_sec() -> int:
+  raw = os.environ.get("JETSKI_LONG_RUN_THRESHOLD_MIN", "").strip()
+  if raw:
+    try:
+      mins = float(raw)
+      if mins > 0:
+        return max(60, int(mins * 60))
+    except ValueError:
+      pass
+  return DEFAULT_LONG_RUN_THRESHOLD_SEC
+
+
+# Unwraps JSON-stringified scalar/list values stored inside transcript.jsonl tool_calls[*].args
+def _unwrap_transcript_arg(val: Any) -> Any:
+  if isinstance(val, str) and val.strip().startswith(('"', "[", "{")):
+    try:
+      return json.loads(val)
+    except ValueError:
+      pass
+  return val
+
+
+# Matches exact task/subagent tokens so prefix IDs (task-5 vs task-50) never collide
+def _contains_exact_id(text: str, token: str) -> bool:
+  if not text or not token:
+    return False
+  pat = rf"(?<![A-Za-z0-9_/-]){re.escape(token)}(?![A-Za-z0-9_-])"
+  return re.search(pat, text) is not None
+
+
+# Extracts the latest meaningful stdout line from the tail of steps/<idx>/output.txt or tasks/*.log
+def extract_progress_tail_line(
+    log_path: str, max_bytes: int = 16384, max_chars: int = 140
+) -> str:
+  if not log_path or not os.path.isfile(log_path):
+    return ""
+  try:
+    size = os.path.getsize(log_path)
+    if size <= 0:
+      return ""
+    offset = max(0, size - max_bytes)
+    with open(log_path, "rb") as f:
+      if offset > 0:
+        f.seek(offset)
+      chunk = f.read(max_bytes).decode("utf-8", errors="replace")
+  except OSError:
+    return ""
+
+  # Drop a leading partial line when seeking into the middle of a multi-KB log file
+  if offset > 0:
+    first_break = -1
+    for idx, ch in enumerate(chunk):
+      if ch in ("\r", "\n"):
+        first_break = idx
+        break
+    if first_break >= 0 and first_break + 1 < len(chunk):
+      chunk = chunk[first_break + 1 :]
+
+  clean_chunk = ANSI_ESCAPE_RE.sub("", chunk)
+  segments = re.split(r"[\r\n]+", clean_chunk)
+  for seg in reversed(segments):
+    collapsed = re.sub(r"\s+", " ", seg).strip()
+    if not collapsed:
+      continue
+    if any(collapsed.startswith(pfx) for pfx in STEP_BOILERPLATE_PREFIXES):
+      continue
+    if TRUNCATED_MARKER_RE.match(collapsed):
+      continue
+    if all(ch in "-=_*#~" for ch in collapsed):
+      continue
+    if len(collapsed) > max_chars:
+      return collapsed[: max_chars - 1].rstrip() + "…"
+    return collapsed
+  return ""
+
+
+# Parses a conversation's .system_generated directory for zero-token turn/step/stdout telemetry
+def _inspect_system_generated_turn(
+    cid: str, brain_dirs: list[str]
+) -> dict[str, Any]:
+  result: dict[str, Any] = {
+      "found": False,
+      "sys_dir": "",
+      "turn_started_ts": 0.0,
+      "turn_closed": False,
+      "latest_step_idx": 0,
+      "latest_step_ts": 0.0,
+      "active_cmd": None,
+      "spawned_subagents": {},
+      "killed_subagents": set(),
+      "reported_subagents": set(),
+      "kill_all_in_turn": False,
+      "latest_tool_name": "",
+  }
+  if not cid:
+    return result
+
+  sys_dir = ""
+  for bdir in brain_dirs:
+    cand = os.path.join(bdir, cid, ".system_generated")
+    if os.path.isdir(cand):
+      sys_dir = cand
+      break
+  if not sys_dir:
+    return result
+
+  result["sys_dir"] = sys_dir
+  transcript_path = os.path.join(sys_dir, "logs", "transcript.jsonl")
+  if not os.path.isfile(transcript_path):
+    return result
+
+  try:
+    fsize = os.path.getsize(transcript_path)
+    with open(transcript_path, "rb") as f:
+      if fsize > 1048576:
+        f.seek(fsize - 524288)
+        raw_text = f.read().decode("utf-8", errors="replace")
+        nl = raw_text.find("\n")
+        lines = raw_text[nl + 1 :].splitlines() if nl >= 0 else raw_text.splitlines()
+      else:
+        lines = f.read().decode("utf-8", errors="replace").splitlines()
+  except OSError:
+    return result
+
+  entries: list[dict[str, Any]] = []
+  for line in lines:
+    line = line.strip()
+    if not line:
+      continue
+    try:
+      parsed = json.loads(line)
+      if isinstance(parsed, dict):
+        entries.append(parsed)
+    except ValueError:
+      continue
+
+  if not entries:
+    return result
+
+  result["found"] = True
+  last_ui_pos = -1
+  for pos, entry in enumerate(entries):
+    if entry.get("type") == "USER_INPUT":
+      last_ui_pos = pos
+
+  if last_ui_pos >= 0:
+    result["turn_started_ts"] = _parse_iso_timestamp(
+        str(entries[last_ui_pos].get("created_at") or "")
+    )
+    turn_entries = entries[last_ui_pos + 1 :]
+  else:
+    result["turn_started_ts"] = _parse_iso_timestamp(
+        str(entries[0].get("created_at") or "")
+    )
+    turn_entries = entries
+
+  latest_entry = entries[-1]
+  raw_latest_idx = latest_entry.get("step_index")
+  if isinstance(raw_latest_idx, int):
+    result["latest_step_idx"] = raw_latest_idx
+  result["latest_step_ts"] = _parse_iso_timestamp(
+      str(latest_entry.get("created_at") or "")
+  )
+
+  # Track queued tool calls from PLANNER_RESPONSE so GENERIC steps inherit toolSummary and roles
+  pending_cmds: list[dict[str, Any]] = []
+  pending_sub_roles: list[tuple[str, float]] = []
+  active_bg_tasks: dict[str, dict[str, Any]] = {}
+  killed_task_ids: set[str] = set()
+  spawned_subs: dict[str, dict[str, Any]] = {}
+  killed_subs: set[str] = set()
+  reported_subs: set[str] = set()
+  kill_all_in_turn = False
+  latest_tool_name = ""
+
+  for entry in turn_entries:
+    etype = str(entry.get("type") or "")
+    estatus = str(entry.get("status") or "")
+    s_idx = entry.get("step_index")
+    step_idx = s_idx if isinstance(s_idx, int) else 0
+    step_ts = _parse_iso_timestamp(str(entry.get("created_at") or ""))
+    content = str(entry.get("content") or "")
+
+    if etype == "PLANNER_RESPONSE":
+      # Any prior synchronous run_command finished before the planner emitted a new step
+      pending_cmds.clear()
+      tcs = entry.get("tool_calls")
+      if isinstance(tcs, list):
+        for call_offset, tc in enumerate(tcs):
+          if not isinstance(tc, dict):
+            continue
+          tname = str(tc.get("name") or "")
+          raw_args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+          args = {k: _unwrap_transcript_arg(v) for k, v in raw_args.items()}
+          if tname == "run_command":
+            tsum = str(
+                args.get("toolSummary") or args.get("tool_summary") or ""
+            ).strip()
+            cmdline = str(
+                args.get("CommandLine") or args.get("command_line") or ""
+            ).strip()
+            if not tsum and cmdline:
+              first_line = cmdline.splitlines()[0].strip()
+              tsum = first_line[:60] + ("…" if len(first_line) > 60 else "")
+            pending_cmds.append({
+                "planner_idx": step_idx,
+                "started_ts": step_ts,
+                "tool_summary": tsum or "Run command",
+                "step_idx": step_idx + 1 + call_offset,
+            })
+            latest_tool_name = tsum or "run_command"
+          elif tname == "invoke_subagent":
+            role = str(
+                args.get("Role")
+                or args.get("role")
+                or args.get("TypeName")
+                or args.get("type_name")
+                or "Subagent"
+            ).strip()
+            pending_sub_roles.append((role or "Subagent", step_ts))
+            latest_tool_name = f"invoke_subagent ({role or 'Subagent'})"
+          elif tname == "manage_task":
+            action = str(args.get("Action") or args.get("action") or "").lower()
+            tid = str(args.get("TaskId") or args.get("task_id") or "").strip()
+            if action == "kill" and tid:
+              killed_task_ids.add(tid)
+              killed_task_ids.add(tid.split("/")[-1])
+              for k in list(active_bg_tasks.keys()):
+                if k == tid or k.endswith("/" + tid.split("/")[-1]):
+                  active_bg_tasks.pop(k, None)
+          elif tname == "manage_subagents":
+            action = str(args.get("Action") or args.get("action") or "").lower()
+            if action == "kill_all":
+              kill_all_in_turn = True
+              killed_subs.update(spawned_subs.keys())
+            elif action == "kill":
+              cids = (
+                  args.get("ConversationIds") or args.get("conversation_ids") or []
+              )
+              if isinstance(cids, list):
+                for kcid in cids:
+                  if isinstance(kcid, str) and kcid:
+                    killed_subs.add(kcid)
+          elif tname:
+            latest_tool_name = tname
+
+    elif etype == "GENERIC":
+      bg_match = BG_TASK_ID_RE.search(content)
+      if bg_match:
+        task_id = bg_match.group(1).strip()
+        short_tid = task_id.split("/")[-1]
+        cmd_meta = pending_cmds.pop(0) if pending_cmds else {
+            "tool_summary": "Run command",
+            "started_ts": step_ts,
+        }
+        if task_id not in killed_task_ids and short_tid not in killed_task_ids:
+          active_bg_tasks[task_id] = {
+              "task_id": task_id,
+              "short_task_id": short_tid,
+              "step_idx": step_idx,
+              "started_ts": cmd_meta.get("started_ts") or step_ts,
+              "tool_summary": cmd_meta.get("tool_summary") or "Run command",
+          }
+        continue
+
+      # Match invoke_subagent result output from transcript content or steps/<idx>/output.txt
+      sub_text = content
+      if "Created the following subagent" in content and '"conversationId"' not in content:
+        step_out = os.path.join(sys_dir, "steps", str(step_idx), "output.txt")
+        if os.path.isfile(step_out):
+          try:
+            with open(step_out, "r", encoding="utf-8", errors="replace") as sf:
+              sub_text = sf.read(4096)
+          except OSError:
+            pass
+      if "Created the following subagent" in sub_text:
+        m_sub = SUBAGENT_CID_RE.search(sub_text)
+        if m_sub:
+          sub_cid = m_sub.group(1).strip()
+          role, inv_ts = (
+              pending_sub_roles.pop(0)
+              if pending_sub_roles
+              else ("Subagent", step_ts)
+          )
+          spawned_subs[sub_cid] = {
+              "role": role,
+              "invoke_idx": step_idx,
+              "started_ts": inv_ts or step_ts,
+          }
+          killed_subs.discard(sub_cid)
+          reported_subs.discard(sub_cid)
+        continue
+
+      if estatus != "RUNNING":
+        # Clear finished synchronous commands even when truncated output omits exit footer
+        while pending_cmds and pending_cmds[0]["step_idx"] <= step_idx:
+          pending_cmds.pop(0)
+      elif pending_cmds:
+        pending_cmds[0]["step_idx"] = step_idx
+        if not pending_cmds[0].get("started_ts"):
+          pending_cmds[0]["started_ts"] = step_ts
+
+    elif etype == "SYSTEM_MESSAGE":
+      for tid in list(active_bg_tasks.keys()):
+        short_tid = active_bg_tasks[tid]["short_task_id"]
+        if (
+            _contains_exact_id(content, f"sender={tid}")
+            or _contains_exact_id(content, f"Task id {tid}")
+            or _contains_exact_id(content, f"sender={cid}/{short_tid}")
+        ):
+          active_bg_tasks.pop(tid, None)
+      for scid in list(spawned_subs.keys()):
+        if _contains_exact_id(content, f"sender={scid}") or _contains_exact_id(
+            content, scid
+        ):
+          reported_subs.add(scid)
+
+  active_cmd: dict[str, Any] | None = None
+  cmd_cand: tuple[str, int, float, str] | None = None
+  if active_bg_tasks:
+    # Pick the most recently started active background task
+    bg = list(active_bg_tasks.values())[-1]
+    cmd_cand = (
+        bg["short_task_id"],
+        bg["step_idx"],
+        bg["started_ts"],
+        bg["tool_summary"],
+    )
+  elif pending_cmds:
+    sync = pending_cmds[-1]
+    cmd_cand = (
+        f"task-{sync['step_idx']}",
+        sync["step_idx"],
+        sync["started_ts"],
+        sync["tool_summary"],
+    )
+  if cmd_cand is not None:
+    short_tid, s_idx, started_ts, tsum = cmd_cand
+    task_log = os.path.join(sys_dir, "tasks", f"{short_tid}.log")
+    step_out = os.path.join(sys_dir, "steps", str(s_idx), "output.txt")
+    prog = extract_progress_tail_line(task_log) or extract_progress_tail_line(
+        step_out
+    )
+    active_cmd = {
+        "step_idx": s_idx,
+        "started_ts": started_ts,
+        "tool_summary": tsum,
+        "progress_line": prog,
+    }
+
+  has_unreported_sub = any(
+      scid not in killed_subs and scid not in reported_subs
+      for scid in spawned_subs
+  )
+  # Detect a prior finished turn in transcript.jsonl before a new turn flushes USER_INPUT
+  result["turn_closed"] = (
+      latest_entry.get("type") == "PLANNER_RESPONSE"
+      and latest_entry.get("status") == "DONE"
+      and not (latest_entry.get("tool_calls") or [])
+      and active_cmd is None
+      and not has_unreported_sub
+  )
+  result["active_cmd"] = active_cmd
+  result["spawned_subagents"] = spawned_subs
+  result["killed_subagents"] = killed_subs
+  result["reported_subagents"] = reported_subs
+  result["kill_all_in_turn"] = kill_all_in_turn
+  result["latest_tool_name"] = latest_tool_name
+  return result
+
+
+# Builds zero-token live progress & waiting metadata for a single running or blocked conversation
+def inspect_conversation_live_progress(
+    cid: str,
+    summary: dict[str, Any],
+    summaries: dict[str, Any],
+    bucket: str,
+    activity_detail: str,
+    children_by_parent: dict[str, list[tuple[str, str]]] | None = None,
+    trajectories: dict[str, dict[str, Any]] | None = None,
+    brain_dirs: list[str] | None = None,
+    now_ts: float | None = None,
+    long_run_threshold_sec: int | None = None,
+) -> dict[str, Any] | None:
+  if bucket not in ("running", "blocked"):
+    return None
+
+  now = now_ts if now_ts is not None else time.time()
+  threshold_sec = (
+      long_run_threshold_sec
+      if long_run_threshold_sec is not None and long_run_threshold_sec > 0
+      else get_long_run_threshold_sec()
+  )
+  bdirs = brain_dirs if brain_dirs is not None else _find_brain_dirs()
+  child_index = (
+      children_by_parent
+      if children_by_parent is not None
+      else _build_descendant_index(summaries)
+  )
+
+  disk_info = _inspect_system_generated_turn(cid, bdirs)
+  rpc_steps: list[dict[str, Any]] = []
+  if trajectories and isinstance(trajectories.get(cid), dict):
+    inner = trajectories[cid].get("trajectory")
+    src = inner if isinstance(inner, dict) else trajectories[cid]
+    if isinstance(src.get("steps"), list):
+      rpc_steps = src["steps"]
+
+  rpc_subs, rpc_inv_idx, rpc_killed, rpc_last_kill_all = (
+      _extract_subagents_and_kills(rpc_steps) if rpc_steps else ({}, {}, set(), -1)
+  )
+  rpc_last_ui = -1
+  rpc_turn_ts = 0.0
+  for idx, s in enumerate(rpc_steps):
+    if isinstance(s, dict) and s.get("type") in USER_INPUT_STEP_TYPES:
+      rpc_last_ui = idx
+      s_meta = s.get("metadata") if isinstance(s.get("metadata"), dict) else {}
+      rpc_turn_ts = _parse_iso_timestamp(
+          str(s_meta.get("createdAt") or s.get("createdAt") or s.get("created_at") or "")
+      )
+
+  sum_lmt = _parse_iso_timestamp(
+      str(summary.get("lastModifiedTime") or summary.get("createdTime") or "")
+  )
+  # Ignore prior-turn timestamps when PreInvocation forces a brand-new turn to running
+  if bucket == "running" and activity_detail == "Agent turn starting":
+    fresh_lmt = (
+        sum_lmt
+        if disk_info["latest_step_ts"] > 0
+        and sum_lmt > disk_info["latest_step_ts"] + 1.0
+        else 0.0
+    )
+    turn_started_ts = fresh_lmt or now
+  else:
+    turn_started_ts = (
+        disk_info["turn_started_ts"] or rpc_turn_ts or sum_lmt or now
+    )
+  elapsed_sec = max(0, int(now - turn_started_ts))
+  step_idx = (
+      disk_info["latest_step_idx"]
+      or len(rpc_steps)
+      or int(summary.get("stepCount") or 0)
+  )
+
+  # Blocked state (CORTEX_STEP_STATUS_WAITING on self or active descendant subagent)
+  if bucket == "blocked":
+    blocked_detail = activity_detail or "Waiting for user input"
+    blocked_sub: dict[str, Any] | None = None
+    visited = {cid}
+    queue = list(child_index.get(cid, []))
+    while queue:
+      d_cid, d_label = queue.pop(0)
+      if d_cid in visited:
+        continue
+      visited.add(d_cid)
+      if d_cid in disk_info["killed_subagents"] or d_cid in rpc_killed:
+        continue
+      d_sum = summaries.get(d_cid) if isinstance(summaries.get(d_cid), dict) else {}
+      if bool(d_sum.get("killed")):
+        continue
+      role = (
+          (disk_info["spawned_subagents"].get(d_cid) or {}).get("role")
+          or rpc_subs.get(d_cid)
+          or d_label
+          or "Subagent"
+      )
+      d_wait = extract_summary_waiting_detail(d_sum)
+      if not d_wait and trajectories and isinstance(trajectories.get(d_cid), dict):
+        d_inner = trajectories[d_cid].get("trajectory") or trajectories[d_cid]
+        d_steps = d_inner.get("steps") if isinstance(d_inner, dict) else []
+        if isinstance(d_steps, list):
+          for ds in reversed(d_steps):
+            w = parse_step_interaction(ds, require_waiting_status=True)
+            if w:
+              d_wait = w
+              break
+      if d_wait:
+        blocked_sub = {
+            "cid": d_cid,
+            "role": role,
+            "stepIndex": int(d_sum.get("stepCount") or 0),
+            "toolSummary": "",
+            "activeCount": 1,
+        }
+        break
+      for gc_cid, gc_label in child_index.get(d_cid, []):
+        if gc_cid not in visited:
+          queue.append((gc_cid, gc_label))
+
+    step_ts = disk_info["latest_step_ts"] or turn_started_ts
+    payload: dict[str, Any] = {
+        "state": "blocked",
+        "turnStartedAtMs": int(turn_started_ts * 1000),
+        "stepStartedAtMs": int(step_ts * 1000),
+        "elapsedSec": elapsed_sec,
+        "stepElapsedSec": max(0, int(now - step_ts)),
+        "isLongRunning": elapsed_sec >= threshold_sec,
+        "stepIndex": step_idx,
+        "activeKind": "blocked",
+        "toolSummary": "",
+        "progressLine": "",
+        "blockedDetail": blocked_detail,
+        "summaryText": blocked_detail,
+    }
+    if blocked_sub is not None:
+      payload["subagent"] = blocked_sub
+    return payload
+
+  # Running state: check active command on parent first
+  is_long = elapsed_sec >= threshold_sec
+  active_cmd = disk_info["active_cmd"]
+  if active_cmd is not None:
+    cmd_ts = active_cmd["started_ts"] or disk_info["latest_step_ts"] or turn_started_ts
+    tsum = active_cmd["tool_summary"]
+    return {
+        "state": "running",
+        "turnStartedAtMs": int(turn_started_ts * 1000),
+        "stepStartedAtMs": int(cmd_ts * 1000),
+        "elapsedSec": elapsed_sec,
+        "stepElapsedSec": max(0, int(now - cmd_ts)),
+        "isLongRunning": is_long,
+        "stepIndex": active_cmd["step_idx"] or step_idx,
+        "activeKind": "command",
+        "toolSummary": tsum,
+        "progressLine": active_cmd["progress_line"],
+        "blockedDetail": "",
+        "summaryText": tsum,
+    }
+
+  # Collect non-killed, non-completed active subagents from transcript, RPC steps, and summaries
+  cand_subagents: dict[str, str] = {}
+  kill_all_active = disk_info["kill_all_in_turn"] or (rpc_last_kill_all > rpc_last_ui)
+  killed_all_ids = set(disk_info["killed_subagents"]) | set(rpc_killed)
+
+  for scid, smeta in disk_info["spawned_subagents"].items():
+    if scid not in killed_all_ids and scid not in disk_info["reported_subagents"]:
+      cand_subagents[scid] = smeta["role"]
+  for scid, srole in rpc_subs.items():
+    if (
+        scid not in killed_all_ids
+        and scid not in disk_info["reported_subagents"]
+        and rpc_inv_idx.get(scid, -1) > rpc_last_ui
+    ):
+      cand_subagents.setdefault(scid, srole)
+  if not kill_all_active:
+    for c_cid, c_label in child_index.get(cid, []):
+      if c_cid in killed_all_ids or c_cid in disk_info["reported_subagents"]:
+        continue
+      c_sum = summaries.get(c_cid) if isinstance(summaries.get(c_cid), dict) else {}
+      if bool(c_sum.get("killed")):
+        continue
+      c_running = (
+          c_sum.get("status") in ACTIVE_RUN_STATUSES
+          or bool(c_sum.get("notFullyIdle"))
+          or bool(c_sum.get("hasRunningSubagents"))
+      )
+      if c_running:
+        cand_subagents.setdefault(c_cid, c_label or "Subagent")
+
+  live_subs: list[dict[str, Any]] = []
+  for scid, srole in cand_subagents.items():
+    s_sum = summaries.get(scid) if isinstance(summaries.get(scid), dict) else {}
+    if bool(s_sum.get("killed")):
+      continue
+    s_running = (
+        not s_sum
+        or s_sum.get("status") in ACTIVE_RUN_STATUSES
+        or bool(s_sum.get("notFullyIdle"))
+        or bool(s_sum.get("hasRunningSubagents"))
+    )
+    if not s_running and _is_silent_subagent_summary(s_sum, now):
+      continue
+    s_disk = _inspect_system_generated_turn(scid, bdirs)
+    s_step = s_disk["latest_step_idx"] or int(s_sum.get("stepCount") or 0)
+    s_cmd = s_disk["active_cmd"]
+    s_tool = (
+        s_cmd["tool_summary"]
+        if s_cmd is not None
+        else s_disk["latest_tool_name"]
+    )
+    s_prog = s_cmd["progress_line"] if s_cmd is not None else ""
+    s_ts = (
+        (s_cmd["started_ts"] if s_cmd is not None else 0.0)
+        or s_disk["latest_step_ts"]
+        or _parse_iso_timestamp(str(s_sum.get("lastModifiedTime") or ""))
+        or turn_started_ts
+    )
+    live_subs.append({
+        "cid": scid,
+        "role": srole or "Subagent",
+        "stepIndex": s_step,
+        "toolSummary": s_tool,
+        "progressLine": s_prog,
+        "startedTs": s_ts,
+        "hasCmd": s_cmd is not None,
+    })
+
+  if live_subs:
+    # Prefer a subagent actively streaming command stdout, otherwise newest step timestamp
+    live_subs.sort(
+        key=lambda item: (1 if item["hasCmd"] else 0, item["startedTs"]),
+        reverse=True,
+    )
+    primary = live_subs[0]
+    count = len(live_subs)
+    detail_parts: list[str] = []
+    if primary["stepIndex"] > 0:
+      detail_parts.append(f"step {primary['stepIndex']}")
+    if primary["toolSummary"]:
+      detail_parts.append(primary["toolSummary"])
+    paren = f" ({' · '.join(detail_parts)})" if detail_parts else ""
+    more = f" (+{count - 1})" if count > 1 else ""
+    summary_text = f"subagent: {primary['role']}{paren}{more}"
+    sub_ts = primary["startedTs"] or turn_started_ts
+    return {
+        "state": "running",
+        "turnStartedAtMs": int(turn_started_ts * 1000),
+        "stepStartedAtMs": int(sub_ts * 1000),
+        "elapsedSec": elapsed_sec,
+        "stepElapsedSec": max(0, int(now - sub_ts)),
+        "isLongRunning": is_long,
+        "stepIndex": step_idx,
+        "activeKind": "subagent",
+        "toolSummary": primary["toolSummary"],
+        "subagent": {
+            "cid": primary["cid"],
+            "role": primary["role"],
+            "stepIndex": primary["stepIndex"],
+            "toolSummary": primary["toolSummary"],
+            "activeCount": count,
+        },
+        "progressLine": primary["progressLine"],
+        "blockedDetail": "",
+        "summaryText": summary_text,
+    }
+
+  # Reset stale prior-turn timestamps/tools if transcript.jsonl has not flushed USER_INPUT yet
+  if disk_info["turn_closed"] and not rpc_steps:
+    fresh_lmt = (
+        sum_lmt
+        if disk_info["latest_step_ts"] > 0
+        and sum_lmt > disk_info["latest_step_ts"] + 1.0
+        else 0.0
+    )
+    turn_started_ts = fresh_lmt or now
+    step_ts = turn_started_ts
+    elapsed_sec = max(0, int(now - turn_started_ts))
+    is_long = elapsed_sec >= threshold_sec
+    fallback_tool = ""
+  else:
+    step_ts = disk_info["latest_step_ts"] or turn_started_ts
+    fallback_tool = disk_info["latest_tool_name"]
+
+  is_synth = activity_detail == "Synthesizing subagent findings"
+  summary_text = (
+      activity_detail
+      if activity_detail and activity_detail != "Agent turn running"
+      else (fallback_tool or "Agent turn running")
+  )
+  return {
+      "state": "running",
+      "turnStartedAtMs": int(turn_started_ts * 1000),
+      "stepStartedAtMs": int(step_ts * 1000),
+      "elapsedSec": elapsed_sec,
+      "stepElapsedSec": max(0, int(now - step_ts)),
+      "isLongRunning": is_long,
+      "stepIndex": step_idx,
+      "activeKind": "synthesizing" if is_synth else "thinking",
+      "toolSummary": "",
+      "progressLine": "",
+      "blockedDetail": "",
+      "summaryText": summary_text,
+  }
+
+
+# Atomically mirrors jetski-live-progress.json into brain directories for /static/artifacts/
+def export_live_progress_index(
+    conversations: dict[str, dict[str, Any]],
+    brain_dirs: list[str] | None = None,
+    now_ts: float | None = None,
+    long_run_threshold_sec: int | None = None,
+) -> dict[str, Any]:
+  now = now_ts if now_ts is not None else time.time()
+  threshold_sec = (
+      long_run_threshold_sec
+      if long_run_threshold_sec is not None and long_run_threshold_sec > 0
+      else get_long_run_threshold_sec()
+  )
+  payload = {
+      "version": 1,
+      "updatedAtMs": int(now * 1000),
+      "longRunThresholdSec": threshold_sec,
+      "conversations": conversations,
+  }
+  raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+  targets = [
+      os.path.join(bdir, LIVE_PROGRESS_FILE_NAME)
+      for bdir in (brain_dirs if brain_dirs is not None else _find_brain_dirs())
+  ]
+  for dst in targets:
+    try:
+      os.makedirs(os.path.dirname(dst), exist_ok=True)
+      tmp = f"{dst}.tmp.{os.getpid()}"
+      with open(tmp, "w", encoding="utf-8") as f:
+        f.write(raw)
+      os.replace(tmp, dst)
+    except OSError:
+      pass
+  return payload
+
+
 def compute_project_activity(
     summaries: dict[str, Any],
     known_projects: dict[str, tuple[str, dict[str, Any]]],
@@ -1800,6 +2549,8 @@ def compute_project_activity(
     traj_fetcher: Callable[[str], dict[str, Any] | None] | None = None,
     eval_cache: dict[str, dict[str, Any]] | None = None,
     now_ts: float | None = None,
+    live_progress_out: dict[str, dict[str, Any]] | None = None,
+    brain_dirs: list[str] | None = None,
 ) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
   """Computes `(running_counts, blocked_counts, unread_counts)` per project ID."""
   running_counts: dict[str, int] = defaultdict(int)
@@ -1807,13 +2558,53 @@ def compute_project_activity(
   unread_counts: dict[str, int] = defaultdict(int)
   seen_forced = False
   children_by_parent = _build_descendant_index(summaries)
+  # Resolve brain dirs and threshold once per pass only when exporting live progress JSON
+  bdirs = (
+      brain_dirs
+      if brain_dirs is not None
+      else (_find_brain_dirs() if live_progress_out is not None else None)
+  )
+  threshold_sec = (
+      get_long_run_threshold_sec() if live_progress_out is not None else None
+  )
 
   for cid, summary in summaries.items():
     # Mark seen_forced before visibility filtering so hidden/subagent turns never hit the fallback
     is_forced = bool(force_running_cid and cid == force_running_cid)
     if is_forced:
       seen_forced = True
-    if not isinstance(summary, dict) or not _is_visible_top_level(summary):
+    if not isinstance(summary, dict):
+      continue
+    if not _is_visible_top_level(summary):
+      # Export active/blocked subagent telemetry so opened subagent panes get 0-token banners
+      if (
+          live_progress_out is not None
+          and not (summary.get("annotations") or {}).get("archived")
+          and not bool(summary.get("killed"))
+      ):
+        sub_wait = extract_summary_waiting_detail(summary)
+        sub_running = (
+            summary.get("status") in ACTIVE_RUN_STATUSES
+            or bool(summary.get("notFullyIdle"))
+            or bool(summary.get("hasRunningSubagents"))
+        ) and not _is_silent_subagent_summary(summary, now_ts)
+        if sub_wait or sub_running:
+          sub_bucket = "blocked" if sub_wait else "running"
+          sub_detail = sub_wait or "Agent turn running"
+          sub_info = inspect_conversation_live_progress(
+              cid,
+              summary,
+              summaries,
+              bucket=sub_bucket,
+              activity_detail=sub_detail,
+              children_by_parent=children_by_parent,
+              trajectories=trajectories,
+              brain_dirs=bdirs,
+              now_ts=now_ts,
+              long_run_threshold_sec=threshold_sec,
+          )
+          if sub_info is not None:
+            live_progress_out[cid] = sub_info
       continue
 
     meta = summary.get("trajectoryMetadata") or {}
@@ -1828,10 +2619,12 @@ def compute_project_activity(
           ws_uris.append(u)
       pid = match_workspace_to_project(ws_uris, folder_to_project)
 
-    if not pid or pid not in known_projects:
+    # Evaluate standalone top-level chats too when building jetski-live-progress.json
+    in_known_project = bool(pid and pid in known_projects)
+    if not in_known_project and live_progress_out is None:
       continue
 
-    bucket, _ = resolve_conversation_activity(
+    bucket, detail = resolve_conversation_activity(
         cid,
         summary,
         summaries,
@@ -1844,12 +2637,31 @@ def compute_project_activity(
         currently_viewing_cid=currently_viewing_cid,
         viewed_lmt=viewed_lmt,
     )
-    if bucket == "blocked":
-      blocked_counts[pid] += 1
-    elif bucket == "running":
-      running_counts[pid] += 1
-    elif bucket == "unread":
-      unread_counts[pid] += 1
+    # Count project header badges only for chats assigned to a known project
+    if in_known_project:
+      if bucket == "blocked":
+        blocked_counts[pid] += 1
+      elif bucket == "running":
+        running_counts[pid] += 1
+      elif bucket == "unread":
+        unread_counts[pid] += 1
+
+    # Export zero-token progress and waiting metadata for both project and standalone chats
+    if live_progress_out is not None and bucket in ("running", "blocked"):
+      live_info = inspect_conversation_live_progress(
+          cid,
+          summary,
+          summaries,
+          bucket=bucket,
+          activity_detail=detail,
+          children_by_parent=children_by_parent,
+          trajectories=trajectories,
+          brain_dirs=bdirs,
+          now_ts=now_ts,
+          long_run_threshold_sec=threshold_sec,
+      )
+      if live_info is not None:
+        live_progress_out[cid] = live_info
 
   # If PreInvocation fired for a brand-new conversation before its summary or
   # project assignment appeared in GetAllCascadeTrajectories:
@@ -1934,6 +2746,10 @@ def sync_once(
       # Persist trajectory evaluations across watcher ticks so idle polls issue 0 step RPCs
       eval_cache = _load_traj_eval_cache()
       before_cache = json.dumps(eval_cache, sort_keys=True)
+      # Share one clock snapshot and brain discovery pass across activity and live progress export
+      now_ts = time.time()
+      brain_dirs = _find_brain_dirs()
+      live_progress: dict[str, dict[str, Any]] = {}
       running_counts, blocked_counts, unread_counts = compute_project_activity(
           summaries,
           known_projects,
@@ -1945,17 +2761,28 @@ def sync_once(
           viewed_lmt=viewed_lmt,
           traj_fetcher=fetch_single_trajectory,
           eval_cache=eval_cache,
-          now_ts=time.time(),
+          now_ts=now_ts,
+          live_progress_out=live_progress,
+          brain_dirs=brain_dirs,
       )
       if json.dumps(eval_cache, sort_keys=True) != before_cache:
         _save_traj_eval_cache(eval_cache)
+      export_live_progress_index(
+          live_progress, brain_dirs=brain_dirs, now_ts=now_ts
+      )
       changes = apply_project_badges(
           projects_dir, running_counts, blocked_counts, unread_counts
       )
-      total_tracked = (
-          sum(running_counts.values())
-          + sum(blocked_counts.values())
-          + sum(unread_counts.values())
+      # Keep the background watcher alive while any standalone chat is still running or blocked
+      project_active = sum(running_counts.values()) + sum(blocked_counts.values())
+      top_level_live = sum(
+          1
+          for lcid in live_progress
+          if isinstance(summaries.get(lcid), dict)
+          and _is_visible_top_level(summaries[lcid])
+      )
+      total_tracked = max(project_active, top_level_live) + sum(
+          unread_counts.values()
       )
       return True, total_tracked, changes
     finally:
@@ -1969,6 +2796,8 @@ def clear_all_badges(
   with open(_sync_lock_path(), "w", encoding="utf-8") as lock_f:
     fcntl.flock(lock_f, fcntl.LOCK_EX)
     try:
+      # Clear live progress entries alongside project badges so stale banners unmount
+      export_live_progress_index({})
       return apply_project_badges(projects_dir, {}, {}, {})
     finally:
       fcntl.flock(lock_f, fcntl.LOCK_UN)

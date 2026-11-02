@@ -116,6 +116,14 @@
   const CHAIN_PROMPT_ROW_CLASS = 'jetski-chain-prompt-row';
   const CHAIN_PROMPT_IDX_CLASS = 'jetski-chain-prompt-idx';
   const CHAIN_PROMPT_TEXT_CLASS = 'jetski-chain-prompt-text';
+  // Live progress banner, sidebar row badge, and configurable >20m long-run threshold
+  const STORAGE_LONG_RUN_THRESHOLD_KEY = 'jetski_long_run_threshold_min_v1';
+  const DEFAULT_LONG_RUN_THRESHOLD_MIN = 20;
+  const LIVE_PROGRESS_ACTIVE_TTL_MS = 2000;
+  const LIVE_PROGRESS_IDLE_TTL_MS = 10000;
+  const LIVE_BANNER_CLASS = 'jetski-live-progress-banner';
+  const ROW_LIVE_BADGE_CLASS = 'jetski-row-live-badge';
+  const INBOX_LIVE_PROGRESS_CLASS = 'jetski-inbox-live-progress';
   const DEFAULT_VISIBLE_BUCKETS = ['needs-me', 'working'];
 
   const BUCKET_DEFS = {
@@ -239,10 +247,15 @@
   // Measures or estimates the exact vertical height needed for the current tab's rows
   function computeInboxFitHeightPx(inboxEl, listContainer, items) {
     const list = Array.isArray(items) ? items : [];
+    // Count 1-line or 2-line subtexts (subagent detail + live progress) when estimating height
     const estimated =
       list.length === 0
         ? INBOX_FIT_MIN_HEIGHT_PX
-        : 2 + list.reduce((sum, it) => sum + (it?.detailText ? 34 : 22), 0);
+        : 2 +
+          list.reduce((sum, it) => {
+            const sublines = (it?.detailText ? 1 : 0) + (it?.liveProgressText ? 1 : 0);
+            return sum + (sublines >= 2 ? 46 : sublines === 1 ? 34 : 22);
+          }, 0);
     let measured = 0;
     if (listContainer) {
       // Temporarily unclamp inline height styles to read true DOM scrollHeight when rendered
@@ -287,6 +300,13 @@
   const dossierGenInFlight = new Map();
   let activeDossierCascadeId = null;
   let activeDossierAnchorEl = null;
+  // Cache 0-token live progress JSON, per-chat working start timestamps, and fired notifications
+  let liveProgressIndexCache = null;
+  let liveProgressIndexFetchedAt = 0;
+  let liveProgressIndexInFlight = null;
+  let liveProgressTickTimer = 0;
+  const firstObservedWorkingMs = new Map();
+  const alertedLiveSigs = new Set();
   const STORAGE_INBOX_TAB_KEY = 'jetski_inbox_tab_v1';
   const INBOX_TABS = ['needs-me', 'working', 'stale'];
   // Typographic tab labels without emoji prefixes fit on one header line in a narrow sidebar
@@ -994,6 +1014,110 @@
       return;
     }
     void fetchDossierIndex(forceRefresh);
+  }
+
+  // Returns configurable long-run threshold in seconds (default 20 minutes)
+  function getLongRunThresholdSec() {
+    const raw = safeGetStorage(STORAGE_LONG_RUN_THRESHOLD_KEY);
+    if (raw !== null && raw !== '') {
+      const mins = Number(raw);
+      if (Number.isFinite(mins) && mins > 0) {
+        return Math.max(60, Math.round(mins * 60));
+      }
+    }
+    const fromIdx = Number(liveProgressIndexCache?.longRunThresholdSec);
+    if (Number.isFinite(fromIdx) && fromIdx >= 60) {
+      return Math.round(fromIdx);
+    }
+    return DEFAULT_LONG_RUN_THRESHOLD_MIN * 60;
+  }
+
+  // Formats elapsed seconds into compact human-readable duration (45s, 22m, 1h 12m)
+  function formatElapsedCompact(sec) {
+    const s = Math.max(0, Math.floor(Number(sec) || 0));
+    if (s < 60) return `${s}s`;
+    if (s < 3600) return `${Math.floor(s / 60)}m`;
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    return m > 0 ? `${h}h ${m}m` : `${h}h`;
+  }
+
+  // Fetches jetski-live-progress.json written by project_activity_badge.py for 0-token telemetry
+  async function fetchLiveProgressIndex(forceRefresh = false, hasActiveChats = false) {
+    const now = Date.now();
+    const ttl = hasActiveChats ? LIVE_PROGRESS_ACTIVE_TTL_MS : LIVE_PROGRESS_IDLE_TTL_MS;
+    if (!forceRefresh && liveProgressIndexCache && now - liveProgressIndexFetchedAt < ttl) {
+      return liveProgressIndexCache;
+    }
+    if (liveProgressIndexInFlight) return liveProgressIndexInFlight;
+    if (typeof window.fetch !== 'function') {
+      return (
+        liveProgressIndexCache || {
+          version: 1,
+          longRunThresholdSec: DEFAULT_LONG_RUN_THRESHOLD_MIN * 60,
+          conversations: {},
+        }
+      );
+    }
+    const prevSig = JSON.stringify(liveProgressIndexCache?.conversations || {});
+    const execute = async () => {
+      try {
+        const csrf = encodeURIComponent(getCsrfToken());
+        const url = resolveApiUrl(
+          `/static/artifacts/jetski-live-progress.json?v=${now}&csrf=${csrf}`
+        );
+        const resp = await window.fetch(url);
+        if (resp && resp.ok) {
+          const data = await resp.json();
+          if (data && typeof data === 'object') {
+            liveProgressIndexCache = {
+              version: data.version || 1,
+              updatedAtMs: Number(data.updatedAtMs) || now,
+              longRunThresholdSec:
+                Number(data.longRunThresholdSec) || DEFAULT_LONG_RUN_THRESHOLD_MIN * 60,
+              conversations:
+                data.conversations && typeof data.conversations === 'object'
+                  ? data.conversations
+                  : {},
+            };
+            liveProgressIndexFetchedAt = now;
+            const nextSig = JSON.stringify(liveProgressIndexCache.conversations);
+            if (nextSig !== prevSig) {
+              scheduleSync();
+            }
+            return liveProgressIndexCache;
+          }
+        }
+      } catch {
+        // Preserve cached live progress or empty fallback on network failure
+      }
+      liveProgressIndexFetchedAt = now;
+      if (!liveProgressIndexCache) {
+        liveProgressIndexCache = {
+          version: 1,
+          longRunThresholdSec: DEFAULT_LONG_RUN_THRESHOLD_MIN * 60,
+          conversations: {},
+        };
+      }
+      return liveProgressIndexCache;
+    };
+    liveProgressIndexInFlight = execute().finally(() => {
+      liveProgressIndexInFlight = null;
+    });
+    return liveProgressIndexInFlight;
+  }
+
+  function ensureLiveProgressLoaded(forceRefresh = false, hasActiveChats = false) {
+    const now = Date.now();
+    const ttl = hasActiveChats ? LIVE_PROGRESS_ACTIVE_TTL_MS : LIVE_PROGRESS_IDLE_TTL_MS;
+    if (
+      !forceRefresh &&
+      (liveProgressIndexInFlight ||
+        (liveProgressIndexCache && now - liveProgressIndexFetchedAt < ttl))
+    ) {
+      return;
+    }
+    void fetchLiveProgressIndex(forceRefresh, hasActiveChats);
   }
 
   function loadLocalDossierSummaries() {
@@ -4955,6 +5079,43 @@
         white-space: nowrap;
         user-select: none;
       }
+      .${ROW_LIVE_BADGE_CLASS} {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 2px;
+        padding: 0 4px;
+        margin-left: 3px;
+        border-radius: 3px;
+        border: 1px solid rgba(138, 180, 248, 0.32);
+        background: rgba(138, 180, 248, 0.1);
+        color: #8ab4f8;
+        font-size: 10px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+        line-height: 1.25;
+        flex-shrink: 0;
+        white-space: nowrap;
+        user-select: none;
+      }
+      .${ROW_LIVE_BADGE_CLASS}[data-state="long-running"] {
+        border-color: rgba(253, 214, 99, 0.48);
+        background: rgba(253, 214, 99, 0.15);
+        color: #fdd663;
+      }
+      .${ROW_LIVE_BADGE_CLASS}[data-state="blocked"] {
+        border-color: rgba(242, 139, 130, 0.52);
+        background: rgba(242, 139, 130, 0.16);
+        color: #f28b82;
+      }
+      [data-testid="conversation-row-sidebar"][data-jetski-live-state="long-running"],
+      div[data-sidebar-row-id][data-jetski-live-state="long-running"] {
+        background: rgba(253, 214, 99, 0.05);
+      }
+      [data-testid="conversation-row-sidebar"][data-jetski-live-state="blocked"],
+      div[data-sidebar-row-id][data-jetski-live-state="blocked"] {
+        background: rgba(242, 139, 130, 0.06);
+      }
       #jetski-closed-chats-filter-bubble .jcfb-roadmap-list {
         display: flex;
         flex-direction: column;
@@ -5375,6 +5536,92 @@
       }
       .${JUMP_TO_TAIL_BTN_CLASS}:hover {
         background: #aecbfa;
+      }
+      .${LIVE_BANNER_CLASS} {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        padding: 7px 12px;
+        border-radius: 10px;
+        background: rgba(138, 180, 248, 0.08);
+        border: 1px solid rgba(138, 180, 248, 0.28);
+        color: var(--foreground, #e8eaed);
+        font-size: 11.5px;
+        line-height: 1.35;
+        width: 100%;
+        box-sizing: border-box;
+        margin-bottom: 6px;
+      }
+      .${LIVE_BANNER_CLASS}[data-state="long-running"] {
+        background: rgba(253, 214, 99, 0.1);
+        border-color: rgba(253, 214, 99, 0.45);
+      }
+      .${LIVE_BANNER_CLASS}[data-state="blocked"] {
+        background: rgba(242, 139, 130, 0.12);
+        border-color: rgba(242, 139, 130, 0.5);
+      }
+      .${LIVE_BANNER_CLASS} .jlpb-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
+      }
+      .${LIVE_BANNER_CLASS} .jlpb-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 1px 6px;
+        border-radius: 4px;
+        background: rgba(138, 180, 248, 0.16);
+        color: #8ab4f8;
+        font-weight: 600;
+        font-size: 11px;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+        flex-shrink: 0;
+      }
+      .${LIVE_BANNER_CLASS}[data-state="long-running"] .jlpb-pill {
+        background: rgba(253, 214, 99, 0.18);
+        color: #fdd663;
+      }
+      .${LIVE_BANNER_CLASS}[data-state="blocked"] .jlpb-pill {
+        background: rgba(242, 139, 130, 0.2);
+        color: #f28b82;
+      }
+      .${LIVE_BANNER_CLASS} .jlpb-summary {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-weight: 500;
+      }
+      .${LIVE_BANNER_CLASS} .jlpb-subagent-btn {
+        cursor: pointer;
+        padding: 2px 8px;
+        border-radius: 5px;
+        border: 1px solid rgba(138, 180, 248, 0.38);
+        background: rgba(138, 180, 248, 0.12);
+        color: #8ab4f8;
+        font-size: 11px;
+        font-weight: 600;
+        white-space: nowrap;
+        flex-shrink: 0;
+      }
+      .${LIVE_BANNER_CLASS}[data-state="blocked"] .jlpb-subagent-btn {
+        border-color: rgba(242, 139, 130, 0.48);
+        background: rgba(242, 139, 130, 0.16);
+        color: #fad2cf;
+      }
+      .${LIVE_BANNER_CLASS} .jlpb-output {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 10.5px;
+        color: var(--muted-foreground, #9aa0a6);
+        opacity: 0.92;
       }
       #${AUTOPILOT_TOAST_ID} {
         position: fixed;
@@ -5922,6 +6169,21 @@
         line-height: 1.2;
         color: #f87171;
         opacity: 0.9;
+      }
+      .${INBOX_ROW_CLASS} .${INBOX_LIVE_PROGRESS_CLASS} {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 10px;
+        font-variant-numeric: tabular-nums;
+        line-height: 1.2;
+        color: #8ab4f8;
+        opacity: 0.9;
+      }
+      .${INBOX_ROW_CLASS}[data-long-running="true"] .${INBOX_LIVE_PROGRESS_CLASS} {
+        color: #fdd663;
+        font-weight: 500;
       }
       .${INBOX_ROW_CLASS} .jetski-inbox-time {
         flex-shrink: 0;
@@ -8015,6 +8277,8 @@
 
     if (!isTail) {
       convoViewEl.setAttribute('data-jetski-non-tail-locked', 'true');
+      // Strip live progress banners from archived non-tail handoff pieces
+      footerInner.querySelector(`.${LIVE_BANNER_CLASS}`)?.remove();
       if (inputBox) {
         inputBox.style.display = 'none';
         const ceList = inputBox.querySelectorAll('[contenteditable]');
@@ -9274,9 +9538,15 @@
     if (item.tier) {
       row.setAttribute('data-tier', item.tier);
     }
+    // Expose >20m long-running state and live progress line on Working inbox rows
+    if (item.isLongRunning) {
+      row.setAttribute('data-long-running', 'true');
+    }
     if (item.detailText) {
       row.setAttribute('data-detail', item.detailText);
       row.setAttribute('title', `${item.baseTitle} — ${item.detailText}`);
+    } else if (item.liveProgressText) {
+      row.setAttribute('title', `${item.baseTitle} — ${item.liveProgressText}`);
     }
 
     const main = document.createElement('div');
@@ -9310,6 +9580,14 @@
       detail.setAttribute('data-testid', 'jetski-inbox-detail');
       detail.textContent = item.detailText;
       textCol.appendChild(detail);
+    }
+    // Render monotonic elapsed time, active command/subagent step, and stdout tail under the title
+    if (item.liveProgressText) {
+      const liveProg = document.createElement('span');
+      liveProg.className = INBOX_LIVE_PROGRESS_CLASS;
+      liveProg.setAttribute('data-testid', 'jetski-inbox-live-progress');
+      liveProg.textContent = item.liveProgressText;
+      textCol.appendChild(liveProg);
     }
 
     main.appendChild(icon);
@@ -9692,6 +9970,43 @@
           statusInfo.workingDetail && statusInfo.workingDetail !== 'Agent turn running'
             ? statusInfo.workingDetail
             : '';
+        // Attach zero-token live progress subline without duplicating statusInfo.workingDetail
+        const liveInfo = resolveLiveProgressForCascade(
+          cascadeId,
+          summary,
+          statusInfo,
+          summariesMap,
+          childIndex,
+          now
+        );
+        let liveProgressText = '';
+        if (
+          liveInfo &&
+          (liveInfo.fromJson ||
+            liveInfo.isLongRunning ||
+            liveInfo.elapsedSec >= 60 ||
+            liveInfo.progressLine ||
+            (liveInfo.summaryText &&
+              liveInfo.summaryText !== 'Agent turn running' &&
+              liveInfo.summaryText !== subagentDetail))
+        ) {
+          const durPart = liveInfo.isLongRunning
+            ? `${formatElapsedCompact(liveInfo.elapsedSec)} (>${liveInfo.thresholdMin}m)`
+            : formatElapsedCompact(liveInfo.elapsedSec);
+          const parts = [durPart];
+          // Omit summaryText when it repeats the generic fallback or workingDetail subline above
+          if (
+            liveInfo.summaryText &&
+            liveInfo.summaryText !== 'Agent turn running' &&
+            liveInfo.summaryText !== subagentDetail
+          ) {
+            parts.push(liveInfo.summaryText);
+          }
+          if (liveInfo.progressLine) {
+            parts.push(liveInfo.progressLine);
+          }
+          liveProgressText = parts.join(' · ');
+        }
         itemsWorking.push({
           cascadeId,
           tabKey: 'working',
@@ -9701,6 +10016,8 @@
           projectName,
           workingIcon,
           detailText: subagentDetail,
+          liveProgressText,
+          isLongRunning: Boolean(liveInfo?.isLongRunning),
           modTs,
         });
       } else if (bucket === 'needs-me') {
@@ -9847,7 +10164,8 @@
       .map(
         (it) =>
           `${it.cascadeId}:${it.tier || ''}:${it.workingIcon || ''}:` +
-          `${it.projectName}:${it.baseTitle}:${it.timePrefix}:${it.detailText || ''}`
+          `${it.projectName}:${it.baseTitle}:${it.timePrefix}:${it.detailText || ''}:` +
+          `${it.isLongRunning ? 1 : 0}:${it.liveProgressText || ''}`
       )
       .join('|');
     if (inboxEl.getAttribute('data-jetski-inbox-sig') !== sig) {
@@ -11609,6 +11927,527 @@
     }
   }
 
+  // Extracts active step summary and turn start timestamp from cached ConnectRPC trajectory steps
+  function extractClientTrajectoryLiveFallback(cascadeId, summary, summariesMap) {
+    const cached = singleTrajCache.get(cascadeId)?.payload;
+    const steps = Array.isArray(cached?.trajectory?.steps)
+      ? cached.trajectory.steps
+      : Array.isArray(cached?.steps)
+        ? cached.steps
+        : [];
+    let lastUiIdx = -1;
+    let turnStartedAtMs = 0;
+    for (let i = 0; i < steps.length; i++) {
+      const s = steps[i];
+      if (s && USER_INPUT_STEP_TYPES.has(s.type)) {
+        lastUiIdx = i;
+        const ts =
+          parseTimestampMs(s.metadata?.createdAt) ||
+          parseTimestampMs(s.createdAt) ||
+          parseTimestampMs(s.created_at);
+        if (ts > 0) turnStartedAtMs = ts;
+      }
+    }
+
+    let toolSummary = '';
+    for (let i = steps.length - 1; i > lastUiIdx; i--) {
+      const s = steps[i];
+      if (!s || typeof s !== 'object') continue;
+      const pr = getStepOneofPayload(s, 'plannerResponse', 'planner_response');
+      const prCalls = pr?.toolCalls || pr?.tool_calls;
+      const metaTc = s.metadata?.toolCall || s.metadata?.tool_call || s.toolCall;
+      const calls = Array.isArray(prCalls) ? prCalls : metaTc ? [metaTc] : [];
+      for (let c = calls.length - 1; c >= 0; c--) {
+        const tc = calls[c];
+        if (!tc || tc.name !== 'run_command') continue;
+        const raw = tc.argumentsJson || tc.arguments_json || tc.args;
+        try {
+          const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+          const ts = parsed?.toolSummary || parsed?.tool_summary;
+          if (ts) {
+            toolSummary = String(ts).trim();
+            break;
+          }
+        } catch {
+          // Ignore malformed tool argument JSON
+        }
+      }
+      if (toolSummary) break;
+    }
+
+    const subInfo = extractSubagentsAndKills(steps);
+    let activeSub = null;
+    for (const [subCid, role] of subInfo.subagents.entries()) {
+      if (subInfo.killedIds.has(subCid)) continue;
+      const invIdx = subInfo.invokeIndices.get(subCid) ?? -1;
+      if (invIdx <= lastUiIdx) continue;
+      const sSum = summariesMap?.[subCid];
+      if (sSum?.killed) continue;
+      const sRunning =
+        !sSum ||
+        isActiveRunStatus(sSum.status) ||
+        Boolean(sSum.notFullyIdle) ||
+        Boolean(sSum.hasRunningSubagents);
+      if (sRunning) {
+        activeSub = {
+          cid: subCid,
+          role: role || 'Subagent',
+          stepIndex: Number(sSum?.stepCount || 0),
+          toolSummary: '',
+          activeCount: 1,
+        };
+        break;
+      }
+    }
+
+    return { turnStartedAtMs, toolSummary, subagent: activeSub };
+  }
+
+  // Prunes fired alert keys when a chat goes idle or leaves blocked so new turns re-alert
+  function clearLiveAlertSigsForCascade(cascadeId, prefixKind = '') {
+    if (!cascadeId || alertedLiveSigs.size === 0) return;
+    const pfx = prefixKind ? `${prefixKind}:${cascadeId}:` : '';
+    for (const sig of [...alertedLiveSigs]) {
+      const matches = pfx
+        ? sig.startsWith(pfx)
+        : sig.startsWith(`blocked:${cascadeId}:`) || sig.startsWith(`long:${cascadeId}:`);
+      if (matches) {
+        alertedLiveSigs.delete(sig);
+      }
+    }
+  }
+
+  // Merges 0-token jetski-live-progress.json with real-time Redux and RPC trajectory state
+  function resolveLiveProgressForCascade(
+    cascadeId,
+    summary,
+    statusInfo,
+    summariesMap,
+    childIndex,
+    nowMs = Date.now()
+  ) {
+    if (!cascadeId || !summary) return null;
+    const status =
+      statusInfo ||
+      resolveConversationStatus(cascadeId, summary, '', summariesMap, childIndex);
+    if (!status || (status.bucket !== 'working' && !status.isBlocked)) {
+      firstObservedWorkingMs.delete(cascadeId);
+      clearLiveAlertSigsForCascade(cascadeId);
+      return null;
+    }
+
+    const thresholdSec = getLongRunThresholdSec();
+    const thresholdMin = Math.max(1, Math.round(thresholdSec / 60));
+    const jsonEntry = liveProgressIndexCache?.conversations?.[cascadeId] || null;
+    const clientFallback = extractClientTrajectoryLiveFallback(
+      cascadeId,
+      summary,
+      summariesMap
+    );
+
+    if (status.isBlocked) {
+      const blockedDetail =
+        status.blockedDetail || jsonEntry?.blockedDetail || 'Waiting for user input';
+      let subagent = jsonEntry?.state === 'blocked' ? jsonEntry.subagent || null : null;
+      if (!subagent && typeof status.blockedSig === 'string') {
+        if (status.blockedSig.startsWith('desc:')) {
+          const parts = status.blockedSig.split(':');
+          if (parts[1]) {
+            subagent = {
+              cid: parts[1],
+              role: 'Subagent',
+              stepIndex: Number(summariesMap?.[parts[1]]?.stepCount || 0),
+              toolSummary: '',
+              activeCount: 1,
+            };
+          }
+        }
+      }
+      const turnStart =
+        Number(jsonEntry?.turnStartedAtMs) ||
+        clientFallback.turnStartedAtMs ||
+        parseTimestampMs(summary.lastModifiedTime) ||
+        parseTimestampMs(summary.createdTime) ||
+        nowMs;
+      const elapsedSec = Math.max(0, Math.floor((nowMs - turnStart) / 1000));
+      return {
+        state: 'blocked',
+        uiState: 'blocked',
+        fromJson: Boolean(jsonEntry),
+        turnStartedAtMs: turnStart,
+        elapsedSec,
+        thresholdSec,
+        thresholdMin,
+        isLongRunning: elapsedSec >= thresholdSec,
+        summaryText: blockedDetail,
+        toolSummary: '',
+        progressLine: '',
+        subagent,
+      };
+    }
+
+    // Clear prior blocked notification keys once the user unblocks the chat back to working
+    clearLiveAlertSigsForCascade(cascadeId, 'blocked');
+    if (!firstObservedWorkingMs.has(cascadeId)) {
+      firstObservedWorkingMs.set(cascadeId, nowMs);
+    }
+    // Avoid summary.lastModifiedTime here so starting a new turn on an old chat never spikes >20m
+    const useJson = Boolean(jsonEntry && jsonEntry.state === 'running');
+    const turnStart =
+      (useJson ? Number(jsonEntry.turnStartedAtMs) : 0) ||
+      clientFallback.turnStartedAtMs ||
+      firstObservedWorkingMs.get(cascadeId) ||
+      nowMs;
+    const elapsedSec = Math.max(0, Math.floor((nowMs - turnStart) / 1000));
+    const isLongRunning = elapsedSec >= thresholdSec;
+    const uiState = isLongRunning ? 'long-running' : 'working';
+
+    const subagent = useJson
+      ? jsonEntry.subagent || null
+      : clientFallback.subagent || null;
+    const toolSummary = useJson
+      ? String(jsonEntry.toolSummary || '')
+      : clientFallback.toolSummary;
+    const progressLine = useJson ? String(jsonEntry.progressLine || '') : '';
+
+    let summaryText = useJson ? String(jsonEntry.summaryText || '') : '';
+    if (!summaryText) {
+      if (subagent) {
+        const sStep = subagent.stepIndex > 0 ? ` (step ${subagent.stepIndex})` : '';
+        summaryText = `subagent: ${subagent.role}${sStep}`;
+      } else if (toolSummary) {
+        summaryText = toolSummary;
+      } else {
+        summaryText = status.workingDetail || 'Agent turn running';
+      }
+    }
+
+    return {
+      state: 'running',
+      uiState,
+      fromJson: useJson,
+      turnStartedAtMs: turnStart,
+      elapsedSec,
+      thresholdSec,
+      thresholdMin,
+      isLongRunning,
+      summaryText,
+      toolSummary,
+      progressLine,
+      subagent,
+    };
+  }
+
+  // Fires a one-shot desktop notification if granted when a chat blocks or exceeds >20m
+  function maybeFireLiveAlertNotification(cascadeId, rawTitle, liveInfo) {
+    if (!liveInfo || typeof window.Notification !== 'function') return;
+    if (window.Notification.permission !== 'granted') return;
+    let alertKey = '';
+    let body = '';
+    if (liveInfo.uiState === 'blocked') {
+      alertKey = `blocked:${cascadeId}:${liveInfo.summaryText}`;
+      body = liveInfo.summaryText;
+    } else if (liveInfo.uiState === 'long-running') {
+      const turnKey = liveInfo.turnStartedAtMs || 0;
+      alertKey = `long:${cascadeId}:${turnKey}:${liveInfo.thresholdMin}`;
+      const extra = liveInfo.progressLine ? ` — ${liveInfo.progressLine}` : '';
+      const dur = formatElapsedCompact(liveInfo.elapsedSec);
+      body = `Working ${dur}: ${liveInfo.summaryText}${extra}`;
+    }
+    if (!alertKey || alertedLiveSigs.has(alertKey)) return;
+    alertedLiveSigs.add(alertKey);
+    try {
+      const title = cleanBaseTitle(rawTitle) || cascadeId.slice(0, 8);
+      new window.Notification(`Jetski: ${title}`, { body });
+    } catch {
+      // Ignore Notification constructor errors in restricted contexts
+    }
+  }
+
+  // Syncs compact live duration, >20m warning, and WAITING alert badges on sidebar rows
+  function syncRowLiveProgressUI(
+    rowEl,
+    cascadeId,
+    summary,
+    rawDomTitle,
+    summariesMap,
+    childIndex
+  ) {
+    if (!rowEl || !cascadeId) return;
+    const curTitle =
+      summary?.annotations?.title || summary?.summary || rawDomTitle || '';
+    const statusInfo = summary
+      ? resolveConversationStatus(
+          cascadeId,
+          summary,
+          curTitle,
+          summariesMap,
+          childIndex
+        )
+      : null;
+    const liveInfo = resolveLiveProgressForCascade(
+      cascadeId,
+      summary,
+      statusInfo,
+      summariesMap,
+      childIndex
+    );
+
+    if (!liveInfo) {
+      if (rowEl.hasAttribute('data-jetski-live-state')) {
+        rowEl.removeAttribute('data-jetski-live-state');
+      }
+      rowEl.querySelector(`.${ROW_LIVE_BADGE_CLASS}`)?.remove();
+      return;
+    }
+
+    setAttrIfChanged(rowEl, 'data-jetski-live-state', liveInfo.uiState);
+    maybeFireLiveAlertNotification(cascadeId, curTitle, liveInfo);
+
+    const shouldShowBadge =
+      liveInfo.uiState === 'blocked' ||
+      liveInfo.uiState === 'long-running' ||
+      liveInfo.fromJson ||
+      liveInfo.elapsedSec >= 60 ||
+      Boolean(liveInfo.progressLine) ||
+      Boolean(liveInfo.toolSummary);
+
+    if (!shouldShowBadge) {
+      rowEl.querySelector(`.${ROW_LIVE_BADGE_CLASS}`)?.remove();
+      return;
+    }
+
+    const durText = formatElapsedCompact(liveInfo.elapsedSec);
+    let badgeText = durText;
+    if (liveInfo.uiState === 'blocked') {
+      badgeText = liveInfo.elapsedSec >= 60 ? `⚠ ${durText}` : '⚠';
+    } else if (liveInfo.uiState === 'long-running') {
+      badgeText = `⏱ ${durText}`;
+    }
+
+    const tipParts = [];
+    if (liveInfo.uiState === 'blocked') {
+      tipParts.push(`Blocked (${durText}): ${liveInfo.summaryText}`);
+    } else if (liveInfo.uiState === 'long-running') {
+      tipParts.push(
+        `Working ${durText} (>${liveInfo.thresholdMin}m): ${liveInfo.summaryText}`
+      );
+    } else {
+      tipParts.push(`Working ${durText}: ${liveInfo.summaryText}`);
+    }
+    if (liveInfo.progressLine) {
+      tipParts.push(liveInfo.progressLine);
+    }
+    const tooltip = tipParts.join(' — ');
+
+    let badge = rowEl.querySelector(`.${ROW_LIVE_BADGE_CLASS}`);
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = ROW_LIVE_BADGE_CLASS;
+      badge.setAttribute('data-testid', 'jetski-row-live-badge');
+      bindHoverBubble(badge, () => badge.getAttribute('title') || '');
+      const anchorBtn =
+        rowEl.querySelector('[data-testid="conversation-pin-button"]') ||
+        rowEl.querySelector('[data-testid="conversation-archive-button"]');
+      const hoverBar = anchorBtn?.parentElement;
+      const statusWrapper = hoverBar?.parentElement;
+      const statusContainer =
+        statusWrapper && statusWrapper !== rowEl
+          ? Array.from(statusWrapper.children || []).find((c) => c !== hoverBar) ||
+            statusWrapper
+          : rowEl;
+      statusContainer.appendChild(badge);
+    }
+    setAttrIfChanged(badge, 'data-state', liveInfo.uiState);
+    if (badge.textContent !== badgeText) {
+      badge.textContent = badgeText;
+    }
+    setAttrIfChanged(badge, 'title', tooltip);
+    setAttrIfChanged(badge, 'aria-label', tooltip);
+  }
+
+  // Mounts or updates live progress & waiting banners above the composer in open chat views
+  function syncConversationLiveProgressBanners() {
+    const store = findReduxStore();
+    const summariesMap = store?.getState()?.trajectorySummaries?.summaries || {};
+    const childIndex = buildDescendantIndex(summariesMap);
+    const convoViews = document.querySelectorAll(
+      '[data-testid="conversation-view"][data-cascade-id]'
+    );
+
+    for (const convoViewEl of convoViews) {
+      const cid = convoViewEl.getAttribute('data-cascade-id');
+      if (!cid) continue;
+      if (convoViewEl.getAttribute('data-jetski-non-tail-locked') === 'true') {
+        convoViewEl.querySelector(`.${LIVE_BANNER_CLASS}`)?.remove();
+        continue;
+      }
+
+      const summary = summariesMap[cid];
+      const rawTitle = summary?.annotations?.title || summary?.summary || '';
+      const statusInfo = summary
+        ? resolveConversationStatus(cid, summary, rawTitle, summariesMap, childIndex)
+        : null;
+      const liveInfo = resolveLiveProgressForCascade(
+        cid,
+        summary,
+        statusInfo,
+        summariesMap,
+        childIndex
+      );
+
+      const inputBox = convoViewEl.querySelector('[data-testid="agent-input-box"]');
+      const footerInner =
+        inputBox?.parentElement ||
+        convoViewEl.querySelector('[data-testid="input-box-bottom-toolbar"]')?.parentElement ||
+        convoViewEl;
+
+      if (!liveInfo) {
+        footerInner.querySelector(`.${LIVE_BANNER_CLASS}`)?.remove();
+        continue;
+      }
+
+      maybeFireLiveAlertNotification(cid, rawTitle, liveInfo);
+
+      let banner = footerInner.querySelector(`.${LIVE_BANNER_CLASS}`);
+      if (!banner) {
+        banner = document.createElement('div');
+        banner.className = LIVE_BANNER_CLASS;
+        banner.setAttribute('data-testid', 'jetski-live-progress-banner');
+        const header = document.createElement('div');
+        header.className = 'jlpb-header';
+        header.setAttribute('data-testid', 'jetski-live-progress-header');
+        const pill = document.createElement('span');
+        pill.className = 'jlpb-pill';
+        pill.setAttribute('data-testid', 'jetski-live-progress-pill');
+        const summarySpan = document.createElement('span');
+        summarySpan.className = 'jlpb-summary';
+        summarySpan.setAttribute('data-testid', 'jetski-live-progress-summary');
+        header.appendChild(pill);
+        header.appendChild(summarySpan);
+        banner.appendChild(header);
+        if (inputBox && inputBox.parentElement === footerInner) {
+          footerInner.insertBefore(banner, inputBox);
+        } else {
+          footerInner.insertBefore(banner, footerInner.firstChild);
+        }
+      }
+
+      setAttrIfChanged(banner, 'data-cascade-id', cid);
+      setAttrIfChanged(banner, 'data-state', liveInfo.uiState);
+      setAttrIfChanged(
+        banner,
+        'data-long-running',
+        liveInfo.isLongRunning ? 'true' : 'false'
+      );
+
+      const durText = formatElapsedCompact(liveInfo.elapsedSec);
+      let pillText = `⟳ Working ${durText}`;
+      if (liveInfo.uiState === 'blocked') {
+        pillText =
+          liveInfo.elapsedSec >= 60 ? `⚠ Action required · ${durText}` : '⚠ Action required';
+      } else if (liveInfo.uiState === 'long-running') {
+        pillText = `⏱ Working ${durText} (>${liveInfo.thresholdMin}m)`;
+      }
+
+      const header = banner.querySelector('[data-testid="jetski-live-progress-header"]');
+      const pill = banner.querySelector('[data-testid="jetski-live-progress-pill"]');
+      const summarySpan = banner.querySelector('[data-testid="jetski-live-progress-summary"]');
+      if (pill && pill.textContent !== pillText) {
+        pill.textContent = pillText;
+      }
+      if (summarySpan && summarySpan.textContent !== liveInfo.summaryText) {
+        summarySpan.textContent = liveInfo.summaryText;
+      }
+      if (summarySpan) {
+        setAttrIfChanged(summarySpan, 'title', liveInfo.summaryText);
+      }
+
+      let subBtn = banner.querySelector('[data-testid="jetski-live-progress-subagent-btn"]');
+      if (liveInfo.subagent?.cid && header) {
+        if (!subBtn) {
+          subBtn = document.createElement('button');
+          subBtn.type = 'button';
+          subBtn.className = 'jlpb-subagent-btn';
+          subBtn.setAttribute('data-testid', 'jetski-live-progress-subagent-btn');
+          bindActionBtnHandlers(subBtn, () => {
+            const targetSub = subBtn.getAttribute('data-subagent-cid');
+            const sourceCid = banner.getAttribute('data-cascade-id') || cid;
+            if (targetSub) {
+              openConversation(targetSub, undefined, sourceCid);
+            }
+          });
+          header.appendChild(subBtn);
+        }
+        setAttrIfChanged(subBtn, 'data-subagent-cid', liveInfo.subagent.cid);
+        const btnLabel =
+          liveInfo.uiState === 'blocked' ? 'Open blocked subagent →' : 'Open subagent →';
+        if (subBtn.textContent !== btnLabel) {
+          subBtn.textContent = btnLabel;
+        }
+      } else if (subBtn) {
+        subBtn.remove();
+      }
+
+      let outputEl = banner.querySelector('[data-testid="jetski-live-progress-output"]');
+      if (liveInfo.progressLine) {
+        if (!outputEl) {
+          outputEl = document.createElement('div');
+          outputEl.className = 'jlpb-output';
+          outputEl.setAttribute('data-testid', 'jetski-live-progress-output');
+          banner.appendChild(outputEl);
+        }
+        const nextOut = `↳ ${liveInfo.progressLine}`;
+        if (outputEl.textContent !== nextOut) {
+          outputEl.textContent = nextOut;
+        }
+        setAttrIfChanged(outputEl, 'title', liveInfo.progressLine);
+      } else if (outputEl) {
+        outputEl.remove();
+      }
+    }
+  }
+
+  function stopLiveProgressTicker() {
+    if (liveProgressTickTimer) {
+      clearInterval(liveProgressTickTimer);
+      liveProgressTickTimer = 0;
+    }
+  }
+
+  // Runs a 2s client-side clock & JSON refresh loop only while working or blocked chats exist
+  function ensureLiveProgressTicker(hasActiveOrBlockedChats) {
+    if (!hasActiveOrBlockedChats || disposed) {
+      stopLiveProgressTicker();
+      return;
+    }
+    if (liveProgressTickTimer) return;
+    liveProgressTickTimer = setInterval(() => {
+      if (disposed) {
+        stopLiveProgressTicker();
+        return;
+      }
+      ensureLiveProgressLoaded(false, true);
+      syncConversationLiveProgressBanners();
+      ensureSidebarRowButtons();
+      ensureNeedsReactionInbox();
+    }, LIVE_PROGRESS_ACTIVE_TTL_MS);
+    if (liveProgressTickTimer && typeof liveProgressTickTimer.unref === 'function') {
+      liveProgressTickTimer.unref();
+    }
+  }
+
+  window.__jetskiLiveProgress = {
+    fetchLiveProgressIndex,
+    resolveLiveProgressForCascade,
+    getLongRunThresholdSec,
+    syncNow() {
+      syncConversationLiveProgressBanners();
+      ensureSidebarRowButtons();
+      ensureNeedsReactionInbox();
+    },
+  };
+
   // Injects or updates row action indicators; archiving stays with the native row button
   function ensureSidebarRowButtons() {
     // Read Redux summaries so each row can sync its live background-wait state
@@ -11642,6 +12481,14 @@
         childIndex
       );
       syncRowDoingRoadmapUI(rowEl, cascadeId, summariesMap[cascadeId], summariesMap);
+      syncRowLiveProgressUI(
+        rowEl,
+        cascadeId,
+        summariesMap[cascadeId],
+        fallbackDomTitle,
+        summariesMap,
+        childIndex
+      );
 
       // Inject reminder button into hover action bar if present
       const anchorBtn =
@@ -11671,10 +12518,37 @@
     }
   }
 
+  // Checks whether any non-archived chat is currently running or blocked so idle polling stays off
+  function hasAnyActiveOrBlockedConversation() {
+    const summariesMap =
+      findReduxStore()?.getState()?.trajectorySummaries?.summaries || {};
+    for (const [cid, s] of Object.entries(summariesMap)) {
+      if (!s || s.annotations?.archived || s.killed) continue;
+      // Treat active turns, background tasks, and running subagents as active
+      if (
+        isActiveRunStatus(s.status) ||
+        Boolean(s.notFullyIdle) ||
+        Boolean(s.hasRunningSubagents)
+      ) {
+        return true;
+      }
+      // Keep polling while summary waitingSteps or cached step evaluations report a block
+      const ws = s.waitingSteps || s.waiting_steps;
+      if (Array.isArray(ws) && ws.length > 0) return true;
+      const tEntry = trajectoryStatusCache.get(cid);
+      if (tEntry && (tEntry.state === 'running' || tEntry.state === 'blocked')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   function runFullSync() {
     // Refresh the cached roadmap index and update project header badges on every sync pass
+    const hasActive = hasAnyActiveOrBlockedConversation();
     ensureRoadmapIndexLoaded();
     ensureDossierIndexLoaded();
+    ensureLiveProgressLoaded(false, hasActive);
     ensureStylesInjected();
     const reduxActive = syncReduxFilter();
     syncDomRowsAndPlaceholders(reduxActive);
@@ -11687,6 +12561,8 @@
     ensureProjectRoadmapBadges();
     ensureTitlebarButtons();
     ensureSidebarRowButtons();
+    syncConversationLiveProgressBanners();
+    ensureLiveProgressTicker(hasActive);
     // Enhance native conversation navigator cards (TurnHoverCard and GroupHoverCard)
     enhanceNativeNavigatorCards();
     // Synchronize chain stars and read-only piece locks across open conversation views
@@ -11733,6 +12609,8 @@
         target.className === TITLEBAR_CONTEXT_BADGE_CLASS ||
         target.className === ROW_BG_WAIT_INDICATOR_CLASS ||
         target.className === ROW_DOING_BADGE_CLASS ||
+        target.className === ROW_LIVE_BADGE_CLASS ||
+        target.className === LIVE_BANNER_CLASS ||
         target.className === PROJECT_ROADMAP_BADGE_CLASS ||
         target.className === SEARCH_BTN_CLASS ||
         target.className === LOCATE_BTN_CLASS ||
@@ -11765,6 +12643,8 @@
             // Skip text node mutations inside the context volume pill
             target.closest(`.${TITLEBAR_CONTEXT_BADGE_CLASS}`) ||
             target.closest(`.${ROW_BG_WAIT_INDICATOR_CLASS}`) ||
+            target.closest(`.${ROW_LIVE_BADGE_CLASS}`) ||
+            target.closest(`.${LIVE_BANNER_CLASS}`) ||
             target.closest(`.${PROJECT_ROADMAP_BADGE_CLASS}`) ||
             target.closest(`.${LOCATE_BTN_CLASS}`) ||
             target.closest(`.${CHAIN_STARS_GROUP_CLASS}`) ||
@@ -11874,6 +12754,9 @@
       clearTimeout(autopilotToastTimer);
       autopilotToastTimer = 0;
     }
+    stopLiveProgressTicker();
+    firstObservedWorkingMs.clear();
+    alertedLiveSigs.clear();
     stopOpenChatPoller();
     window.removeEventListener?.('focus', markThisJetskiTabActive);
     document.removeEventListener?.('visibilitychange', markThisJetskiTabActive);
@@ -11891,6 +12774,8 @@
       `.${TITLEBAR_CONTEXT_BADGE_CLASS}`,
       `.${ROW_BG_WAIT_INDICATOR_CLASS}`,
       `.${ROW_DOING_BADGE_CLASS}`,
+      `.${ROW_LIVE_BADGE_CLASS}`,
+      `.${LIVE_BANNER_CLASS}`,
       `.${PROJECT_ROADMAP_BADGE_CLASS}`,
       `.${SEARCH_BTN_CLASS}`,
       `.${LOCATE_BTN_CLASS}`,
@@ -11938,6 +12823,9 @@
     }
     for (const el of document.querySelectorAll('[data-jetski-doing-roadmap]')) {
       el.removeAttribute('data-jetski-doing-roadmap');
+    }
+    for (const el of document.querySelectorAll('[data-jetski-live-state]')) {
+      el.removeAttribute('data-jetski-live-state');
     }
     if (locateHighlightTimer) {
       clearTimeout(locateHighlightTimer);
