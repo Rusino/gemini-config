@@ -2690,21 +2690,40 @@ def create_handoff(
     summary_file = state_file
 
   # 2. Determine base topic and new continuation title
-  if new_topic:
+  # Chain topic is invariant across handoffs; preserve established topic without drift
+  cur_base = clean_base_title(get_conversation_title(current_conv_id)) if current_conv_id else ""
+  existing_topic = ""
+  if is_valid_chat_topic(cur_base):
+    existing_topic = cur_base
+  elif current_conv_id:
+    chain = discover_conversation_chain(current_conv_id, include_descendants=False)
+    for cid in reversed(chain):
+      cand_base = clean_base_title(get_conversation_title(cid))
+      if is_valid_chat_topic(cand_base):
+        existing_topic = cand_base
+        break
+
+  if existing_topic:
+    # Chain already has a valid topic; keep it invariant and ignore any handoff --topic
+    if new_topic and clean_base_title(new_topic) != existing_topic:
+      print(
+          f"chat_lifecycle.py handoff: ignoring --topic {new_topic!r};"
+          f" preserving existing chain topic {existing_topic!r}",
+          file=sys.stderr,
+      )
+    new_topic = existing_topic
+  elif new_topic:
+    # Caller had no valid topic, accept explicit --topic override
     new_topic = validate_chat_topic(new_topic)
   else:
-    cur_title = get_conversation_title(current_conv_id)
-    cur_base = clean_base_title(cur_title)
-    if is_valid_chat_topic(cur_base):
-      new_topic = cur_base
-    else:
-      derived = derive_fallback_topic(
-          current_conv_id,
-          state_file=summary_file if in_project else "",
-          notes=notes,
-          next_step=next_step_prompt,
-      )
-      new_topic = validate_chat_topic(derived or cur_base)
+    # Derive from state file, roadmap or prompt when no piece in chain had a valid topic
+    derived = derive_fallback_topic(
+        current_conv_id,
+        state_file=summary_file if in_project else "",
+        notes=notes,
+        next_step=next_step_prompt,
+    )
+    new_topic = validate_chat_topic(derived or cur_base)
 
   time_str = get_current_time_str()
   cont_title = f"[{time_str}] {MARKER_ACTIVE} {new_topic}"

@@ -844,7 +844,9 @@ class TestChatLifecycle(unittest.TestCase):
 
   def test_create_handoff_with_topic_retitles_child_and_keeps_summary(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
-      self.write_titles(tmp_dir, {"parent-1": "[10:00] ⦿ Topic A"}, project="outside-of-project")
+      self.write_titles(
+          tmp_dir, {"parent-1": "[10:00] ⦿ Feature Alpha"}, project="outside-of-project"
+      )
       with patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]):
         # Written by the old chat via `summary-path <id>`, i.e. under its own topic
         summary_path = chat_lifecycle.get_handoff_summary_path("parent-1")
@@ -852,18 +854,49 @@ class TestChatLifecycle(unittest.TestCase):
         f.write("# real summary\n")
 
       start_mock = unittest.mock.MagicMock(return_value="child-2")
+      stderr_buf = io.StringIO()
       with contextlib.ExitStack() as stack:
         for p in self.handoff_patches(tmp_dir, start_mock):
           stack.enter_context(p)
-        res = chat_lifecycle.create_handoff(current_conv_id="parent-1", new_topic="Topic B")
+        stack.enter_context(contextlib.redirect_stderr(stderr_buf))
+        res = chat_lifecycle.create_handoff(
+            current_conv_id="parent-1", new_topic="Feature Beta"
+        )
         self.assertEqual(res["summary_file"], summary_path)
         with open(summary_path, "r", encoding="utf-8") as f:
           self.assertEqual(f.read(), "# real summary\n")
-        self.assertEqual(start_mock.call_args.args[1], "[15:45] ⦿ Topic B")
+        # Existing valid topic on parent-1 must be preserved on child-2
+        self.assertEqual(start_mock.call_args.args[1], "[15:45] ⦿ Feature Alpha")
         self.assertTrue(chat_lifecycle.is_archived("parent-1"))
-        self.assertEqual(chat_lifecycle.get_conversation_title("parent-1"), "[10:00] ⦿ Topic A")
+        self.assertEqual(
+            chat_lifecycle.get_conversation_title("parent-1"), "[10:00] ⦿ Feature Alpha"
+        )
         self.assertFalse(chat_lifecycle.is_archived("child-2"))
-        self.assertEqual(chat_lifecycle.get_conversation_title("child-2"), "[15:45] ⦿ Topic B")
+        self.assertEqual(
+            chat_lifecycle.get_conversation_title("child-2"), "[15:45] ⦿ Feature Alpha"
+        )
+        self.assertIn("ignoring --topic", stderr_buf.getvalue())
+
+  def test_create_handoff_applies_topic_when_parent_topic_invalid(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.write_titles(
+          tmp_dir, {"parent-bare": "[10:00] ⦿ cl/1412380"}, project="outside-of-project"
+      )
+      start_mock = unittest.mock.MagicMock(return_value="child-2")
+      with contextlib.ExitStack() as stack:
+        for p in self.handoff_patches(tmp_dir, start_mock):
+          stack.enter_context(p)
+        res = chat_lifecycle.create_handoff(
+            current_conv_id="parent-bare", new_topic="cl/1412380 Keep glyph offsets"
+        )
+        self.assertEqual(
+            start_mock.call_args.args[1], "[15:45] ⦿ cl/1412380 Keep glyph offsets"
+        )
+        self.assertTrue(chat_lifecycle.is_archived("parent-bare"))
+        self.assertEqual(
+            chat_lifecycle.get_conversation_title("child-2"),
+            "[15:45] ⦿ cl/1412380 Keep glyph offsets",
+        )
 
   def test_archive_conversations_with_chain(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
