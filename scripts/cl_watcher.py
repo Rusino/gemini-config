@@ -1452,6 +1452,9 @@ def _resolve_gerrit_stack_companion_parent(
       and "companion" not in subj.lower()
   ):
     return "", 0
+  # SkoreText feature CLs are never temporary review companions for external changes
+  if subj.lstrip().startswith("[SkoreText]") and "companion" not in subj.lower():
+    return "", 0
 
   has_companion_kw = "companion" in subj.lower()
   # Index commit SHAs -> (change_num, is_self, is_comp_subj, base_ps, parent_sha)
@@ -1463,8 +1466,12 @@ def _resolve_gerrit_stack_companion_parent(
     fis_self = bool(finfo.get("is_self", False))
     fis_comp = "companion" in str(finfo.get("subject") or "").lower()
     fpsha = str(finfo.get("parent_commit") or "").strip()
-    for rsha, rps in (finfo.get("revision_ps_by_sha") or {}).items():
-      if rsha:
+    f_merged = str(finfo.get("status") or "").upper() == "MERGED"
+    revs = finfo.get("revision_ps_by_sha") or {}
+    # CQ creates a new patchset on submit, so the final revision of a merged CL is main
+    last_ps = max((int(ps or 0) for ps in revs.values()), default=0) if f_merged else 0
+    for rsha, rps in revs.items():
+      if rsha and not (f_merged and int(rps or 0) == last_ps):
         sha_to_entry[str(rsha)] = (fnum, fis_self, fis_comp, int(rps or 0), fpsha)
 
   start_parent_sha = str(info.get("parent_commit") or "").strip()
@@ -1497,6 +1504,15 @@ def _resolve_gerrit_stack_companion_parent(
     )
     cis_comp = "companion" in csubj.lower()
     rev_num = int(ch.get("_revision_number") or 0)
+    c_status = str(
+        (f_override.get("status") if isinstance(f_override, dict) else None)
+        or ch.get("status")
+        or ""
+    ).upper()
+    cur_rev_num = int(ch.get("_current_revision_number") or rev_num or 0)
+    # Skip the submitted tip revision of a merged CL so main-based stacks stop walking here
+    if c_status == "MERGED" and rev_num == cur_rev_num:
+      continue
     if csha and csha not in sha_to_entry:
       sha_to_entry[csha] = (cnum, cis_self, cis_comp, rev_num, psha)
     if cnum == tid and not start_parent_sha and psha:
@@ -8149,10 +8165,25 @@ def sync_once(
       fetched_cache[comp_to] = fetch_piper_cl_status(comp_tid)
 
   # CQ submits a fresh patchset, so the final revision of a merged CL exists only on main:
-  # a CL based on it was uploaded onto main and is not a companion of the merged CL
+  # a CL or stack rooted on it was uploaded onto main and is not a companion of the merged CL
+  sha_to_parent: dict[str, str] = {}
+  for fk, finfo in fetched_cache.items():
+    if not fk.startswith("gerrit:") or not isinstance(finfo, dict):
+      continue
+    fpsha = str(finfo.get("parent_commit") or "").strip()
+    for rsha in (finfo.get("revision_ps_by_sha") or {}).keys():
+      if rsha and fpsha:
+        sha_to_parent[str(rsha)] = fpsha
   for d in active_discovered:
     comp_to = str(d.get("companion_to") or "").strip()
     if not comp_to.startswith("gerrit:"):
+      continue
+    d_info = fetched_cache.get(str(d.get("item_key") or "")) or {}
+    d_subj = str(d_info.get("subject") or d.get("title") or "").lstrip()
+    # Drop stale companion links on SkoreText feature CLs that lack explicit companion markers
+    if d_subj.startswith("[SkoreText]") and "companion" not in d_subj.lower():
+      for k in ("companion_to", "is_companion", "companion_base_ps_hint"):
+        d.pop(k, None)
       continue
     p_info = fetched_cache.get(comp_to) or {}
     if str(p_info.get("status") or "").upper() != "MERGED":
@@ -8160,11 +8191,18 @@ def sync_once(
     p_revs = p_info.get("revision_ps_by_sha") or {}
     if not p_revs:
       continue
-    d_info = fetched_cache.get(str(d.get("item_key") or "")) or {}
-    base_sha = str(d_info.get("parent_commit") or "").strip()
+    cur_sha = str(d_info.get("parent_commit") or "").strip()
+    seen_shas: set[str] = set()
+    # Walk across intermediate self-stack commits to find the root revision in the merged parent
+    for _ in range(32):
+      if not cur_sha or cur_sha in p_revs or cur_sha in seen_shas:
+        break
+      seen_shas.add(cur_sha)
+      cur_sha = sha_to_parent.get(cur_sha, "")
     last_ps = max(int(ps or 0) for ps in p_revs.values())
+    base_ps = int(p_revs.get(cur_sha) or d.get("companion_base_ps_hint") or 0)
     # A base on an older patchset was stacked before the merge, so it stays a companion
-    if base_sha and int(p_revs.get(base_sha) or 0) == last_ps:
+    if base_ps == last_ps:
       for k in ("companion_to", "is_companion", "companion_base_ps_hint"):
         d.pop(k, None)
   # Match follow-up fix CLs/PRs to broken merged CLs/PRs and share parent chats

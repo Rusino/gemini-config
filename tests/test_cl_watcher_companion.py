@@ -862,6 +862,17 @@ console.log(JSON.stringify({
                 "parent_commit": "sha_p1_ps2",
                 "companion_to": "gerrit:1400001",
             },
+            "gerrit:1410008@unchatted": {
+                "item_key": "gerrit:1410008",
+                "target_id": "1410008",
+                "kind": "gerrit",
+                "host": w.GERRIT_SKIA_HOST,
+                "is_self": True,
+                "is_wip": False,
+                "status": "NEW",
+                "parent_commit": "rev_1410007",
+                "companion_to": "gerrit:1400001",
+            },
         },
         "events": [],
     }
@@ -869,6 +880,7 @@ console.log(JSON.stringify({
         {"item_key": "gerrit:1410001", "target_id": "1410001", "kind": "gerrit"},
         {"item_key": "gerrit:1410006", "target_id": "1410006", "kind": "gerrit"},
         {"item_key": "gerrit:1410007", "target_id": "1410007", "kind": "gerrit"},
+        {"item_key": "gerrit:1410008", "target_id": "1410008", "kind": "gerrit"},
         {"item_key": "gerrit:1400002", "target_id": "1400002", "kind": "gerrit"},
         {"item_key": "gerrit:1410002", "target_id": "1410002", "kind": "gerrit"},
         {"item_key": "gerrit:1400003", "target_id": "1400003", "kind": "gerrit"},
@@ -948,10 +960,21 @@ console.log(JSON.stringify({
             "1410007",
             is_self=True,
             is_external=False,
+            in_development=True,
             role="author",
             owner_email="jlavrova@google.com",
             subject="[SkoreText] Own CL uploaded onto the merged 1400001",
             parent_commit="sha_p1_ps2",
+        ),
+        "1410008": base_info(
+            "1410008",
+            is_self=True,
+            is_external=False,
+            in_development=True,
+            role="author",
+            owner_email="jlavrova@google.com",
+            subject="[skparagraph] Second CL in stack on merged 1400001",
+            parent_commit="rev_1410007",
         ),
         "1400002": base_info(
             "1400002",
@@ -1089,6 +1112,7 @@ console.log(JSON.stringify({
     self.assertFalse(any("/1410005/abandon" in u for u in abandoned_urls))
     self.assertFalse(any("/1410006/abandon" in u for u in abandoned_urls))
     self.assertFalse(any("/1410007/abandon" in u for u in abandoned_urls))
+    self.assertFalse(any("/1410008/abandon" in u for u in abandoned_urls))
 
     items_out = out_state["items"]
     self.assertEqual(items_out["gerrit:1410001@unchatted"]["status"], "ABANDONED")
@@ -1100,6 +1124,8 @@ console.log(JSON.stringify({
     self.assertNotIn("companion_to", items_out["gerrit:1410006@unchatted"])
     self.assertEqual(items_out["gerrit:1410007@unchatted"]["status"], "NEW")
     self.assertNotIn("companion_to", items_out["gerrit:1410007@unchatted"])
+    self.assertEqual(items_out["gerrit:1410008@unchatted"]["status"], "NEW")
+    self.assertNotIn("companion_to", items_out["gerrit:1410008@unchatted"])
 
 
 if __name__ == "__main__":
