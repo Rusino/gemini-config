@@ -8739,6 +8739,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .ok { background: var(--green); }
   .wait { background: transparent; box-shadow: inset 0 0 0 1.5px var(--graphite); }
   .moving { background: var(--amber); animation: pulse 1.6s ease-in-out infinite; }
+  /* Scope to .dot so .fix-stage-head.warn keeps its transparent background */
+  .dot.warn { background: var(--amber); }
   .bad { background: var(--red); }
   @keyframes pulse { 50% { opacity: .35; } }
 
@@ -8821,9 +8823,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
 
   .path { display: flex; align-items: center; font-size: 10.5px; color: var(--graphite); }
+  /* Keep in-CQ roll dots blue so amber stays reserved for unblamed roll warnings */
+  .path .dot.moving { background: var(--blue); }
   .stop { display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 48px; }
   .stop:hover { text-decoration: none; color: var(--ink); }
   .stop .dot { width: 8px; height: 8px; }
+  .stop.is-ok span { color: var(--ink); }
+  .stop.is-moving span { color: var(--blue); font-weight: 500; }
+  .stop.is-warn span { color: var(--amber); font-weight: 600; }
   .stop.is-bad span { color: var(--red); font-weight: 600; }
   .leg {
     height: 2px; background: var(--hairline); margin-bottom: 12px;
@@ -8857,7 +8864,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   details.done[open] .chev .closed, details.done:not([open]) .chev .open { display: none; }
 
   .row {
-    display: grid; grid-template-columns: minmax(0, 1fr) 260px 150px;
+    display: grid; grid-template-columns: minmax(0, 1fr) 300px 150px;
     gap: 14px; align-items: center;
     padding: 7px 0; border-bottom: 1px solid var(--hairline);
   }
@@ -9045,12 +9052,29 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     white-space: pre-wrap; word-break: break-word; user-select: text;
   }
   .when { text-align: right; font-size: 10.5px; color: var(--graphite); }
-  .row .path { font-size: 10.5px; }
-  .row .stop { min-width: 0; }
-  .row .stop span { display: none; }
-  .row .leg { flex: 0 0 24px; min-width: 0; margin-bottom: 0; }
-  .row .fan { gap: 8px; }
-  .row .path-label { margin-left: 8px; white-space: nowrap; }
+  /* Inline roll strip uses phrasing layout so it stays valid inside summary spans */
+  .path.path-inline {
+    display: inline-flex; flex-direction: column; align-items: flex-start;
+    gap: 2px; font-size: 10.5px; line-height: 1.3;
+  }
+  .row .path.path-inline { display: flex; }
+  .path-stops {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 2px 4px;
+  }
+  .path.path-inline .stop {
+    display: inline-flex; flex-direction: row; align-items: center;
+    gap: 3px; min-width: 0; white-space: nowrap;
+  }
+  .path.path-inline .stop .dot { width: 7px; height: 7px; }
+  .path.path-inline .stop:hover span { text-decoration: underline; }
+  .path-sep { color: var(--graphite); font-size: 10px; user-select: none; }
+  .path-notes {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 1px 6px;
+    font-size: 10px; line-height: 1.25; color: var(--graphite);
+  }
+  .path-note.is-moving { color: var(--blue); }
+  .path-note.is-warn { color: var(--amber); }
+  .path-note.is-bad { color: var(--red); font-weight: 500; }
 
   .empty-note { padding: 20px 0; color: var(--graphite); font-size: 11.5px; }
   footer { margin: 40px 0 24px; font-size: 10.5px; color: var(--graphite); }
@@ -10242,32 +10266,101 @@ function laneOf(it) {
 function rollClass(state) {
   if (state === '✓') return 'ok';
   if (state === '🔄') return 'moving';
+  // Map unblamed roll failures and nearby tree flakes to amber warnings
+  if (state === '🟠' || state === '⚠️') return 'warn';
   if (state === '✗' || state === '🔴') return 'bad';
   return 'wait';
+}
+
+// Summarizes abnormal or active Skia tree and roll states below the inline stop strip
+function flightPathNotesHtml(ps, rolls) {
+  const notes = [];
+  const skiaState = ps.skia_status || '✓';
+  // Surface Skia tree incidents only when the commit is nearby or blamed
+  if (skiaState === '⚠️') {
+    const incs = Array.isArray(ps.incidents) ? ps.incidents : [];
+    const first = incs[0] || null;
+    const extra = incs.length > 1 ? ` +${incs.length - 1}` : '';
+    const botHtml = (first && first.task_name)
+      ? link(first.task_url || STATUS_SKIA_URL,
+          `${esc(compactBotName(first.task_name))}${extra}`, '', first.task_name)
+      : 'failing task';
+    notes.push(`<span class="path-note is-warn">Skia: near ${botHtml} (not blamed)</span>`);
+  } else if (skiaState === '🔴') {
+    const bots = Array.isArray(ps.broken_bots) ? ps.broken_bots : [];
+    const first = bots[0] || null;
+    const extra = bots.length > 1 ? ` +${bots.length - 1}` : '';
+    const botHtml = (first && first.task_name)
+      ? link(first.task_url || first.swarming_url || STATUS_SKIA_URL,
+          `in ${esc(compactBotName(first.task_name))}${extra}`, '', first.task_name)
+      : 'by Gardener';
+    notes.push(`<span class="path-note is-bad">Skia: blamed ${botHtml}</span>`);
+  }
+  // Omit quiet rolled/waiting stops from the second line and surface only active CQ or failures
+  for (const p of PRODUCTS) {
+    const r = rolls[p] || {};
+    const detail = String(r.detail || '');
+    const failMatch = detail.match(/failed=(\d+)/);
+    const failSuffix = failMatch ? ` (${failMatch[1]} failed)` : '';
+    const url = r.url || STATUS_SKIA_URL;
+    if (r.state === '🔄') {
+      const body = link(url, `${esc(p)}: in CQ`, '', `${p}: ${detail || 'In CQ'}`);
+      notes.push(`<span class="path-note is-moving">${body}</span>`);
+    } else if (r.state === '🟠') {
+      const label = `${esc(p)}: failing roll, not blamed${failSuffix}`;
+      const body = link(url, label, '', `${p}: ${detail}`);
+      notes.push(`<span class="path-note is-warn">${body}</span>`);
+    } else if (r.state === '🔴' || r.state === '✗') {
+      const label = `${esc(p)}: blamed in roll${failSuffix}`;
+      const body = link(url, label, '', `${p}: ${detail}`);
+      notes.push(`<span class="path-note is-bad">${body}</span>`);
+    }
+  }
+  if (!notes.length) return '';
+  return `<span class="path-notes">${notes.join('<span class="path-sep">·</span>')}</span>`;
 }
 
 function flightPath(it, withLabels) {
   const ps = it.post_submit || {};
   const rolls = ps.rolls || {};
-  const skiaBad = ps.skia_status === '🔴';
-  let html = '<div class="path">';
-  html += link(STATUS_SKIA_URL,
-    `<i class="dot ${skiaBad ? 'bad' : 'ok'}"></i><span>Skia</span>`,
-    `stop${skiaBad ? ' is-bad' : ''}`, ps.skia_status_detail || 'Skia');
-  // Rolls into the four products are independent, so they fan out instead of chaining
-  html += `<i class="leg ${skiaBad ? 'broken' : 'done'}"></i><div class="fan">`;
+  // Include nearby flake task names in the Skia tooltip when not blamed
+  const skiaState = ps.skia_status || '✓';
+  const skiaCls = rollClass(skiaState);
+  const incs = Array.isArray(ps.incidents) ? ps.incidents : [];
+  const incNames = incs.map(x => x && x.task_name).filter(Boolean).slice(0, 2);
+  const skiaBaseTip = ps.skia_status_detail || 'Clean on status.skia.org';
+  const skiaTip = (skiaState === '⚠️' && incNames.length)
+    ? `Skia: ${skiaBaseTip} (${incNames.join(', ')})`
+    : `Skia: ${skiaBaseTip}`;
+  const skiaStop = link(STATUS_SKIA_URL,
+    `<i class="dot ${skiaCls}"></i><span>Skia</span>`,
+    `stop is-${skiaCls}`, skiaTip);
+  // Use span phrasing elements so inline rows stay valid inside collapsed stack summaries
+  if (!withLabels) {
+    const prodStops = PRODUCTS.map(p => {
+      const r = rolls[p] || {};
+      const cls = rollClass(r.state);
+      return link(r.url || STATUS_SKIA_URL,
+        `<i class="dot ${cls}"></i><span>${p}</span>`,
+        `stop is-${cls}`, `${p}: ${r.detail || 'waiting'}`);
+    }).join('<span class="path-sep">·</span>');
+    const stopsHtml = `<span class="path-stops">${skiaStop}` +
+      `<span class="path-sep">→</span>${prodStops}</span>`;
+    return `<span class="path path-inline">${stopsHtml}${flightPathNotesHtml(ps, rolls)}</span>`;
+  }
+  // Rolls into the four products are independent, so they fan out instead of chaining;
+  // post-submit CLs already landed in Skia unless the tree blames them or awaits merge
+  const legCls = skiaCls === 'bad' ? 'broken' : (skiaCls === 'wait' ? '' : 'done');
+  let html = `<div class="path">${skiaStop}<i class="leg${legCls ? ' ' + legCls : ''}"></i>` +
+    '<div class="fan">';
   for (const p of PRODUCTS) {
     const r = rolls[p] || {};
+    const cls = rollClass(r.state);
     html += link(r.url || STATUS_SKIA_URL,
-      `<i class="dot ${rollClass(r.state)}"></i><span>${p}</span>`,
-      'stop', `${p}: ${r.detail || 'waiting'}`);
+      `<i class="dot ${cls}"></i><span>${p}</span>`,
+      `stop is-${cls}`, `${p}: ${r.detail || 'waiting'}`);
   }
-  html += '</div>';
-  if (!withLabels) {
-    const n = PRODUCTS.filter(p => (rolls[p] || {}).state === '✓').length;
-    html += `<span class="path-label">${n} of 4 products</span>`;
-  }
-  return html + '</div>';
+  return html + '</div></div>';
 }
 
 const INCIDENT_VERDICT_LABEL = {
