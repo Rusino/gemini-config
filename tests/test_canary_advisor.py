@@ -931,6 +931,38 @@ class TestCanaryAdvisor(unittest.TestCase):
     self.assertEqual(seen_urls[0][1], "Bearer expired-tok")
     self.assertEqual(seen_urls[1][1], "Bearer fresh-tok")
 
+  def test_not_mergeable_verdict_detects_gclient_sync_patch_ref_conflict(self):
+    # Real fixture from CL 1412381 PS 3: stacked parent CLs landed on main, so Task Scheduler's
+    # gclient.py sync --patch-ref failed cherry-picking ancestor commits before any Swarming task
+    bb_sync_conflict = {
+        "id": "8666280000000000001",
+        "createTime": "2026-11-02T13:01:20.000000Z",
+        "status": "INFRA_FAILURE",
+        "summaryMarkdown": (
+            "Failed to start Job: syncing to "
+            "skia@cf49321de4047a459c44ab3de2b842c47f7f5868:refs/changes/81/1412381/3: "
+            "Command exited with exit status 1: vpython3 -u "
+            "/mnt/task-scheduler/depot_tools/gclient.py sync "
+            "--revision skia@cf49321de4047a459c44ab3de2b842c47f7f5868 "
+            "--patch-ref skia@cf49321de4047a459c44ab3de2b842c47f7f5868:refs/changes/81/1412381/3"
+        ),
+    }
+    nm = canary_advisor._not_mergeable_verdict(bb_sync_conflict)
+    self.assertIsNotNone(nm)
+    self.assertEqual(nm["verdict"], "NOT_MERGEABLE")
+    self.assertFalse(nm["our_part_passed"])
+    self.assertIn("gclient.py sync", nm["summary"])
+    self.assertIn("rebase", nm["summary"])
+
+    asan_res = canary_advisor.triage_asan_failure(
+        1412381, 3, "Test-Ubuntu24.04-Clang-ASAN", bb_sync_conflict, [], []
+    )
+    self.assertEqual(asan_res["verdict"], "NOT_MERGEABLE")
+    g3_res = canary_advisor.triage_canary_g3_failure(
+        1412381, 3, bb_sync_conflict, [], []
+    )
+    self.assertEqual(g3_res["verdict"], "NOT_MERGEABLE")
+
 
 if __name__ == "__main__":
   unittest.main()

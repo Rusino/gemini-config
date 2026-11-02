@@ -834,12 +834,23 @@ def _build_summary_markdown(bb_build):
 # Detect Task Scheduler pre-task merge conflicts before inspecting older Swarming tasks
 def _not_mergeable_verdict(bb_build):
     summary_md = _build_summary_markdown(bb_build)
-    if "not mergeable" in summary_md.lower():
+    low = summary_md.lower()
+    if "not mergeable" in low:
         first_line = summary_md.splitlines()[0].strip()
         return {
             "verdict": "NOT_MERGEABLE",
             "our_part_passed": False,
             "summary": f"{first_line}; author must rebase onto main",
+        }
+    # Stacked parent CLs landing on main break gclient.py sync --patch-ref before Swarming runs
+    if "failed to start job: syncing" in low and "gclient.py sync" in low:
+        return {
+            "verdict": "NOT_MERGEABLE",
+            "our_part_passed": False,
+            "summary": (
+                "Task Scheduler gclient.py sync failed applying patchset "
+                "(merged stack ancestors or rebase conflict); rebase onto main"
+            ),
         }
     return None
 
