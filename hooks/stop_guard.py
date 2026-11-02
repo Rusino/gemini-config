@@ -1595,6 +1595,35 @@ def main() -> None:
     )
     return
 
+  # Block bare CL/PR/PS/draft/bug mentions lacking a clickable URL nearby once per turn
+  links_reason = ""
+  reply_for_links = str(
+      info.get("final_planner_text") or info.get("last_planner_text") or ""
+  )
+  if reply_for_links.strip():
+    try:
+      import clickable_links_guard
+
+      links_reason = clickable_links_guard.clickable_links_reason(
+          reply_for_links
+      )
+    except Exception:
+      links_reason = ""
+  if (
+      links_reason
+      and state.get("clickable_links_blocked_turn")
+      != info.get("last_user_idx", -1)
+  ):
+    state["clickable_links_blocked_turn"] = info.get("last_user_idx", -1)
+    save_state(state_path, state)
+    print(
+        json.dumps(
+            {"decision": "continue", "reason": links_reason},
+            ensure_ascii=False,
+        )
+    )
+    return
+
   spawn_background_dossier_update(conv_id, transcript_path)
   play_stop_sound(is_handoff=False)
   print("{}")

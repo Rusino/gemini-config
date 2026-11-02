@@ -83,11 +83,16 @@ description: "Global communication style, grammatical gender, and critical feedb
      an inline attribute on the parent CL/PR (`Has companion [Gerrit <M> PS<K>](<url>) (WIP)`).
      Only include a reverse link (`Companion → [Gerrit <N>](<gerrit url>)`) when replying about a
      specific companion CL ID that the user named directly.
-  4. **Correct CL link target (Gerrit is not `cl/`)**: In chat and Markdown, a bare `cl/<N>`
-     renders as http://cl/<N>, which opens a google3 Piper CL with that number. Write bare `cl/<N>`
-     only for Piper CLs. Link Gerrit changes (Skia, Dart, Chromium, ANGLE) with their full URL,
-     e.g. `[Gerrit 1409697 PS5](https://skia-review.googlesource.com/c/skia/+/1409697/5)`; this
-     overrides the Jetski "write internal shortlinks bare" instruction for Gerrit numbers.
+  4. **Clickable links on every entity mention (`rules/clickable_links.md`, Gerrit is not `cl/`)**:
+     In every chat reply, every mention of a Gerrit CL, patchset (`PS<N>`), Gerrit comment or draft
+     (`[0-9a-f]{8}_[0-9a-f]{8}`), GitHub PR or issue, Buganizer (`b/<N>`) or `crbug` issue, Piper
+     CL, or try job / CI build must be a clickable Markdown link `[label](https://...)` (enforced by
+     `hooks/stop_guard.py`). Never write `cl/<N>` for a 5–8 digit Gerrit change (`cl/<N>` opens a
+     google3 Piper CL; use `[cl/1008075988](http://cl/1008075988)` only for 9–10 digit Piper CLs).
+     Link Gerrit changes (Skia, Dart, Chromium, ANGLE) with their full URL, e.g.
+     `[Gerrit 1409697 PS5](https://skia-review.googlesource.com/c/skia/+/1409697/5)`, and link
+     comments to `/comment/<id>/` (or to the patchset URL for unpublished drafts); this overrides
+     the Jetski "write internal shortlinks bare" instruction.
   5. **Missing reviewers / approvals for submit**: Explicitly state when an open change has no
      reviewers assigned (`No reviewers assigned` / `Needs 2 reviewers`), needs additional
      reviewers to meet the repository's submit requirement (e.g., external-author Gerrit CLs

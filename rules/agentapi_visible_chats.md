@@ -25,9 +25,10 @@ echo "ID=$ID" && agentapi get-conversation-metadata "$ID" | grep -E '"sourceMeta
   `PR #194980 multi-span BiDi`, `FontCollection FaceCache thread safety`,
   `R27 Ban generic chat titles`).
   - **Strictly forbidden**: single-word titles (`Investigation`, `Debugging`, `Perf`, `Skia`),
-    bare entity IDs without a subject (`cl/1405639`, `PR #12345`), generic filler combinations
+    bare entity IDs without a subject (`Gerrit 1405639`, `cl/1008075988`, `PR #12345`), generic filler combinations
     (`Bug investigation`, `Code review`, `Fix issue`, `Task continuation`, `Исследование бага`),
-    and Cyrillic characters (chat titles must strictly be in English).
+    and Cyrillic characters (chat titles must strictly be in English). Never prefix a 5–8 digit
+    Gerrit CL with `cl/<N>` in titles (`auto-title` uses `Gerrit <N>` or `crrev/c/<N>`).
   - Commands `set-title`, `handoff`, `next-task`, and `start --title` validate `<Topic>` via
     `validate_chat_topic` and raise an error on generic/single-word or Cyrillic topics. `handoff`
     always preserves the chain's established valid topic across all continuation pieces (using

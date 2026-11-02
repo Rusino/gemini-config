@@ -237,7 +237,14 @@ class TestChatLifecycle(unittest.TestCase):
 
   def test_extract_entity_topic(self):
     cases = [
-        ("Посмотри на СЛ https://skia-review.git.corp.google.com/c/skia/+/1397896", "cl/1397896"),
+        (
+            "Посмотри на СЛ https://skia-review.git.corp.google.com/c/skia/+/1397896",
+            "Gerrit 1397896",
+        ),
+        (
+            "Check https://skia-review.googlesource.com/c/skia/+/1414016/1",
+            "Gerrit 1414016",
+        ),
         ("Check https://chromium-review.googlesource.com/c/chromium/src/+/5901234", "crrev/c/5901234"),
         (
             "@[crrev/c/8660604:[canvas] Fix PlainTextPainter sub-runs spanning multiple items]",
@@ -259,10 +266,14 @@ class TestChatLifecycle(unittest.TestCase):
         ("Bug https://buganizer.corp.google.com/u/1/issues/580403511", "b/580403511"),
         ("Bug https://issuetracker.google.com/issues/299111222", "b/299111222"),
         ("Broken in commit a1b2c3d4e5f678", "commit a1b2c3d4"),
-        ("Check cl/1397896", "cl/1397896"),
-        ("СЛ 1397896 что там происходит", "cl/1397896"),
+        ("Check Gerrit 1414016", "Gerrit 1414016"),
+        ("Check skrev/1414016", "Gerrit 1414016"),
+        ("Check cl/1397896", "Gerrit 1397896"),
+        ("Check Piper cl/1008075988", "cl/1008075988"),
+        ("CL 1008075988 roll status", "cl/1008075988"),
+        ("СЛ 1397896 что там происходит", "Gerrit 1397896"),
         ("PR #45678 review", "PR #45678"),
-        ('Проведи ревью: @[skia | 1402416:Reland "[SkContext] Forwarding"]', "cl/1402416"),
+        ('Проведи ревью: @[skia | 1402416:Reland "[SkContext] Forwarding"]', "Gerrit 1402416"),
         ("глянь @[flutter/flutter | 150000:Fix text]", None),
         ("сделай 1402416 тестов", None),
         ("Just a normal conversation without entities", None),
@@ -271,9 +282,9 @@ class TestChatLifecycle(unittest.TestCase):
             "Вот чат [18:51] ⦿ cl/1405639 Issue #195102 fontconfig запустил агента и ждет",
             None,
         ),
-        ('Why is "[18:51] ⦿ cl/1405639 Issue #195102 fontconfig" waiting?', None),
-        ("Look at [18:51] ⦿ cl/1405639, please check cl/999999", "cl/999999"),
-        ("Compare `[18:51] ⦿ cl/1405639` with cl/888888", "cl/888888"),
+        ('Why is "[18:51] ⦿ Gerrit 1405639 Issue #195102 fontconfig" waiting?', None),
+        ("Look at [18:51] ⦿ cl/1405639, please check cl/999999", "Gerrit 999999"),
+        ("Compare `[18:51] ⦿ Gerrit 1405639` with cl/1008075988", "cl/1008075988"),
     ]
     for prompt, expected in cases:
       with self.subTest(prompt=prompt):
@@ -300,12 +311,15 @@ class TestChatLifecycle(unittest.TestCase):
            patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=False), \
            patch.object(chat_lifecycle, "get_current_time_str", return_value="14:15"):
 
-        # 1. Untitled chat with entity prompt gets auto-titled
+        # 1. Untitled chat with Skia Gerrit URL gets provisional Gerrit <N> (not cl/<N>)
         res = chat_lifecycle.auto_title_conversation(
             "c1", "Посмотри на СЛ https://skia-review.git.corp.google.com/c/skia/+/1397896"
         )
-        self.assertEqual(res, "[14:15] ⦿ cl/1397896")
-        self.assertEqual(chat_lifecycle.get_conversation_title("c1"), "[14:15] ⦿ cl/1397896")
+        self.assertEqual(res, "[14:15] ⦿ Gerrit 1397896")
+        self.assertEqual(chat_lifecycle.get_conversation_title("c1"), "[14:15] ⦿ Gerrit 1397896")
+        self.assertFalse(
+            chat_lifecycle.is_valid_chat_topic(chat_lifecycle.clean_base_title(res))
+        )
 
         # 2. Already titled chat with a valid multi-word topic is never overwritten
         res2 = chat_lifecycle.auto_title_conversation("c2", "Look at PR #12345")
@@ -328,7 +342,7 @@ class TestChatLifecycle(unittest.TestCase):
             "c3",
             "Дэвид прислал мне письмо https://skia-review.googlesource.com/c/skia/+/1414016",
         )
-        self.assertEqual(res_ru, "[14:15] ⦿ cl/1414016")
+        self.assertEqual(res_ru, "[14:15] ⦿ Gerrit 1414016")
         self.assertFalse(
             chat_lifecycle.is_valid_chat_topic(chat_lifecycle.clean_base_title(res_ru))
         )
@@ -2048,6 +2062,9 @@ class TestChatLifecycle(unittest.TestCase):
         "Investigation",
         "Debugging",
         "cl/12345",
+        "Gerrit 1414016",
+        "Gerrit #1414016",
+        "Gerrit review",
         "PR #99",
         "Bug investigation",
         "Code review",
@@ -2084,6 +2101,7 @@ class TestChatLifecycle(unittest.TestCase):
         "Ban single-word and generic chat titles",
         "Audit visible chats",
         "crbug/468570189 Fontations streamToData OOM",
+        "Gerrit 1414016 Measure hit glyph",
         "Skia roll triage",
         "crbug/576664769 Skia issue",
     ]:

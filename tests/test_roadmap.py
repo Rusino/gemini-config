@@ -705,7 +705,7 @@ class TestRoadmap(unittest.TestCase):
     )
     out2 = roadmap.evaluate_vcs_baton("c1", "p1", transcript_path=tpath)
     self.assertIn("[VCS BATON: CLEAN", out2)
-    self.assertIn("cl/1409999 PS 1", out2)
+    self.assertIn("Gerrit 1409999 PS 1", out2)
     self.assertIn("uploaded", out2)
 
     # Make another commit so upload is stale -> PENDING

@@ -417,6 +417,10 @@ BARE_PROJECT_TOPIC_WORDS = frozenset({
     "dawn",
     "angle",
     "v8",
+    # Bare forge/tracker names ("Gerrit review") are not concrete topics without an ID
+    "gerrit",
+    "github",
+    "buganizer",
 })
 
 # Prepositions, conjunctions, and articles ignored when counting meaningful topic words
@@ -447,10 +451,10 @@ PROMPT_FILLER_WORDS = frozenset({
     "тут", "здесь", "сейчас", "происходит",
 })
 
-# Collapses bare entity references into one token so "PR #123" or "cl/123" counts as 1 word
+# Collapses bare entity references into one token so "PR #123" or "Gerrit 123" counts as 1 word
 _ENTITY_UNIT_RE = re.compile(
-    r"\b(?:crrev(?:\.com)?/c/\d+|cl/\d+|b/\d+|crbug(?:\.com)?/\d+)\b"
-    r"|\b(?:PR|Issue|CL|СЛ|сл|bug|баг)\s*(?:#|:|\s)\s*\d+\b"
+    r"\b(?:crrev(?:\.com)?/c/\d+|skrev(?:\.com)?/\d+|cl/\d+|b/\d+|crbug(?:\.com)?/\d+)\b"
+    r"|\b(?:Gerrit|PR|Issue|CL|СЛ|сл|bug|баг)\s*(?:#|:|\s)\s*\d+\b"
     r"|\b(?:commit|коммит|sha|rev|revision)\s*(?:#|:|\s)\s*[0-9a-f]{7,40}\b",
     re.IGNORECASE,
 )
@@ -2488,16 +2492,20 @@ _ENTITY_CRREV_MENTION_RE = re.compile(
     r"@\[(?:crrev(?:\.com)?/c/|chromium-review[^|/\]]*/c/|chromium/src/\+/)?(\d{5,8})[:\]|]"
 )
 _ENTITY_CRREV_SHORT_RE = re.compile(r"(?:^|[\s(])crrev(?:\.com)?/c/(\d{5,8})\b", re.IGNORECASE)
+_ENTITY_SKREV_SHORT_RE = re.compile(r"(?:^|[\s(])skrev(?:\.com)?/(\d{5,8})\b", re.IGNORECASE)
 _ENTITY_CL_SHORT_RE = re.compile(r"(?:^|[\s(])cl/(\d+)\b", re.IGNORECASE)
 _ENTITY_BUG_SHORT_RE = re.compile(r"(?:^|[\s(])b/(\d+)\b", re.IGNORECASE)
 _ENTITY_CRBUG_SHORT_RE = re.compile(r"(?:^|[\s(])crbug(?:\.com)?/(\d+)\b", re.IGNORECASE)
 _ENTITY_PR_TEXT_RE = re.compile(r"\bPR\s*[:#\s]*(\d+)\b", re.IGNORECASE)
-_ENTITY_CL_TEXT_RE = re.compile(r"(?:\bCL|(?:\b|\s)(?:СЛ|сл))\s*[:#\s]*(\d{5,8})\b")
+_ENTITY_GERRIT_TEXT_RE = re.compile(
+    r"\bGerrit\s*(?:CL\s*)?[:#\s]*(\d{5,8})\b", re.IGNORECASE
+)
+_ENTITY_CL_TEXT_RE = re.compile(r"(?:\bCL|(?:\b|\s)(?:СЛ|сл))\s*[:#\s]*(\d{5,10})\b")
 _ENTITY_BUG_TEXT_RE = re.compile(r"(?:\b(?:bug|баг))\s*[:#\s]*(\d{6,10})\b", re.IGNORECASE)
 _ENTITY_COMMIT_TEXT_RE = re.compile(
     r"(?:\b(?:commit|коммит|sha|rev|revision))\s*[:#\s]*([0-9a-f]{7,40})\b", re.IGNORECASE
 )
-# Matches quoted or pasted lifecycle chat titles like "[18:51] ⦿ cl/1405639 ..." so they
+# Matches quoted or pasted lifecycle chat titles like "[18:51] ⦿ Gerrit 1405639 ..." so they
 # do not hijack new chat titles with foreign CL/PR numbers
 _PASTED_LIFECYCLE_TITLE_RE = re.compile(
     r"[`\"'«“‘]?\s*\[\d{1,2}:\d{2}\]\s*(?:‹✓›|«»|⏳|[✓⦿▸«»])"
@@ -2509,7 +2517,7 @@ _PASTED_LIFECYCLE_TITLE_RE = re.compile(
 
 
 def extract_entity_topic(text: str) -> str | None:
-  """Extracts a canonical entity topic (e.g. 'cl/12345', 'PR #123') from prompt text."""
+  """Extracts a canonical entity topic (e.g. 'Gerrit 1414016', 'PR #123') from prompt text"""
   if not text:
     return None
   # Ignore quoted lifecycle chat titles so examples never hijack current topic
@@ -2525,7 +2533,12 @@ def extract_entity_topic(text: str) -> str | None:
     cl_num = m.group(2)
     if "chromium" in host or "crrev" in host:
       return f"crrev/c/{cl_num}"
-    return f"cl/{cl_num}"
+    # Use "Gerrit <N>" rather than "cl/<N>" because cl/<N> resolves to Google3 Piper
+    return f"Gerrit {cl_num}"
+
+  m = _ENTITY_SKREV_SHORT_RE.search(text) or _ENTITY_GERRIT_TEXT_RE.search(text)
+  if m:
+    return f"Gerrit {m.group(1)}"
 
   m = _ENTITY_GITHUB_PR_URL_RE.search(text)
   if m:
@@ -2544,10 +2557,15 @@ def extract_entity_topic(text: str) -> str | None:
     return f"commit {m.group(1)[:8]}"
   m = _ENTITY_GERRIT_MENTION_RE.search(text)
   if m:
-    return f"cl/{m.group(1)}"
+    # Avoid cl/<N> for Gerrit @-mentions so titles never resolve to Google3 Piper
+    return f"Gerrit {m.group(1)}"
   m = _ENTITY_CL_SHORT_RE.search(text)
   if m:
-    return f"cl/{m.group(1)}"
+    cl_num = m.group(1)
+    # 5-8 digit CL numbers belong to Gerrit; >=9 digit numbers belong to Google3 Piper
+    if 5 <= len(cl_num) <= 8:
+      return f"Gerrit {cl_num}"
+    return f"cl/{cl_num}"
   m = _ENTITY_BUG_SHORT_RE.search(text)
   if m:
     return f"b/{m.group(1)}"
@@ -2559,7 +2577,9 @@ def extract_entity_topic(text: str) -> str | None:
     return f"PR #{m.group(1)}"
   m = _ENTITY_CL_TEXT_RE.search(text)
   if m:
-    return f"cl/{m.group(1)}"
+    # Route >=9-digit prose CL numbers to Piper and 5-8 digit ones to Gerrit
+    cl_num = m.group(1)
+    return f"cl/{cl_num}" if len(cl_num) >= 9 else f"Gerrit {cl_num}"
   m = _ENTITY_BUG_TEXT_RE.search(text)
   if m:
     return f"b/{m.group(1)}"

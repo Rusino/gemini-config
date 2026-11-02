@@ -2190,6 +2190,8 @@ def run(data: dict, log: dict) -> dict:
       "auto_ship_blocked_turn",
       "auto_ship_deferred_question",
       "vcs_baton_blocked_turn",
+      # Preserve once-per-turn clickable-links stop-guard latch across context updates
+      "clickable_links_blocked_turn",
       "config_sync_notice",
       "config_sync_notice_state",
   ):

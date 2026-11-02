@@ -1559,7 +1559,8 @@ def _inspect_repo_vcs_baton(
     patchset = cfg.get(f"branch.{branch}.gerritpatchset", "").strip()
     last_upload = cfg.get(f"branch.{branch}.last-upload-hash", "").strip()
     ps_label = f" PS {patchset}" if patchset else ""
-    cl_label = f"cl/{issue}{ps_label}" if issue else ""
+    # Use "Gerrit <N>" rather than "cl/<N>" because cl/<N> opens Google3 Piper
+    cl_label = f"Gerrit {issue}{ps_label}" if issue else ""
     is_uploaded = bool(issue and ((not last_upload) or (last_upload == head_sha)))
     if issue:
       if is_uploaded:

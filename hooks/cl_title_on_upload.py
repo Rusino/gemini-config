@@ -24,8 +24,9 @@ for _d in (HOOKS_DIR, SCRIPTS_DIR):
     sys.path.insert(0, _d)
 
 UPLOAD_CMD_RE = re.compile(r"\bgit\s+cl\s+upload\b|\bgh\s+pr\s+create\b")
+# Match Skia, Chromium, Dart, ANGLE, Dawn, and PDFium Gerrit review hosts on upload
 GERRIT_URL_RE = re.compile(
-    r"https://(?:skia|chromium)-review\.(?:googlesource\.com|git\.corp\.google\.com)"
+    r"https://([a-zA-Z0-9_.-]+-review)\.(?:googlesource\.com|git\.corp\.google\.com)"
     r"/c/\S+?/\+/(\d{6,8})\b"
 )
 GITHUB_PR_URL_RE = re.compile(r"https://github\.com/flutter/flutter/pull/(\d{5,7})\b")
@@ -43,7 +44,10 @@ def topic_with_change(title: str, result: str) -> str:
     return ""
   m = GERRIT_URL_RE.search(result)
   if m:
-    tag = f"cl/{m.group(1)}"
+    # Avoid cl/<N> for Gerrit CLs so titles never point to Google3 Piper
+    host = m.group(1).lower()
+    cl_num = m.group(2)
+    tag = f"crrev/c/{cl_num}" if "chromium" in host else f"Gerrit {cl_num}"
   else:
     m = GITHUB_PR_URL_RE.search(result)
     if not m:
