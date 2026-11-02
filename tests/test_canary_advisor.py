@@ -809,6 +809,89 @@ class TestCanaryAdvisor(unittest.TestCase):
     self.assertNotIn("none found", res_now["summary"])
     self.assertIn("git cl try -i 1409696", res_now["summary"])
 
+  def test_triage_reads_build_summary_markdown_not_mergeable_before_stale_swarming_task(self):
+    # Real fixture from CL 1409696 PS 4 build 8666232682941943121: an earlier Oct 30 Canary-G3
+    # Swarming task failed with MissingApproval, then after Googler CR+1 a Nov 2 Canary-G3 build
+    # failed in 8.8s with INFRA_FAILURE and summaryMarkdown "CL is not mergeable" (no new task)
+    bb_g3_not_mergeable = {
+        "id": "8666232682941943121",
+        "builder": {"project": "skia", "bucket": "skia.primary", "builder": "Canary-G3"},
+        "createTime": "2026-11-02T15:31:32.485687809Z",
+        "startTime": "2026-11-02T15:31:35.267904411Z",
+        "endTime": "2026-11-02T15:31:44.024725222Z",
+        "status": "INFRA_FAILURE",
+        "summaryMarkdown": "Failed to start Job: CL is not mergeable (issue 1409696 patchset 4)",
+    }
+    stale_sw_tasks = [{
+        "taskId": "7ba5f448af76d610",
+        "name": "Canary-G3",
+        "createdTs": "2026-10-30T14:07:07.439462Z",
+        "completedTs": "2026-10-30T14:07:45.343393Z",
+        "state": "COMPLETED",
+    }]
+    stale_missing_stdout = (
+        "Failed to run g3 try: changes must be either owned and authored by Googlers "
+        "or approved (CR+1) by a Googler"
+    )
+    meta = {
+        "cl": 1409696,
+        "patchset": 4,
+        "subject": "[skparagraph] Add Paragraph::paintLines for painting a range of lines",
+        "owner": "wselna123@gmail.com",
+        "diff": (
+            "diff --git a/modules/skparagraph/tests/SkParagraphTest.cpp "
+            "b/modules/skparagraph/tests/SkParagraphTest.cpp\n+// test\n"
+        ),
+        "googler_cr_plus_one": True,
+    }
+    args = type("Args", (), {"cl": "1409696", "ps": "4", "save_draft": False, "json": False})()
+    buf = io.StringIO()
+    with patch.object(canary_advisor, "load_cl", return_value=meta):
+      with patch.object(
+          canary_advisor, "bb_cl_builds", return_value={"Canary-G3": bb_g3_not_mergeable}
+      ):
+        with patch.object(canary_advisor, "swarming_tasks_for_cl", return_value=stale_sw_tasks):
+          with patch.object(
+              canary_advisor, "swarming_task_stdout", return_value=stale_missing_stdout
+          ):
+            with patch.object(canary_advisor, "unapproved_g3_chain", return_value=[]):
+              with patch("sys.stdout", buf):
+                triage_out = canary_advisor.cmd_triage(args)
+
+    g3_res = triage_out["builds"]["Canary-G3"]
+    self.assertEqual(g3_res["verdict"], "NOT_MERGEABLE")
+    self.assertFalse(g3_res["our_part_passed"])
+    self.assertIn("CL is not mergeable", g3_res["summary"])
+    self.assertIn("rebase", g3_res["summary"])
+    rendered = buf.getvalue()
+    self.assertIn("- Verdict: NOT_MERGEABLE", rendered)
+    self.assertIn("- Summary: Failed to start Job: CL is not mergeable", rendered)
+    self.assertNotIn("Roll CL: http://cl/", rendered)
+    self.assertNotIn("chain is now approved", rendered)
+
+    # Also verify snake_case summary_markdown and generic pre-task failure with stale task
+    res_snake = canary_advisor.triage_canary_g3_failure(
+        1409696,
+        4,
+        {"status": "INFRA_FAILURE", "summary_markdown": "Failed to start Job: CL is not mergeable"},
+        stale_sw_tasks,
+        [],
+    )
+    self.assertEqual(res_snake["verdict"], "NOT_MERGEABLE")
+
+    bb_other_startup_err = {
+        "id": "8666232682941943999",
+        "createTime": "2026-11-02T15:31:32.485687809Z",
+        "status": "INFRA_FAILURE",
+        "summaryMarkdown": "Failed to start Job: git fetch timeout",
+    }
+    with patch.object(canary_advisor, "swarming_tasks_for_cl", return_value=stale_sw_tasks):
+      res_stale = canary_advisor.triage_canary_g3_failure(
+          1409696, 4, bb_other_startup_err, stale_sw_tasks, []
+      )
+    self.assertEqual(res_stale["verdict"], "INFRA_NO_TASK")
+    self.assertIn("git fetch timeout", res_stale["summary"])
+
 
 if __name__ == "__main__":
   unittest.main()

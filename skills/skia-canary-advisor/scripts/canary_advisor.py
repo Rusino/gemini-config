@@ -796,9 +796,70 @@ def check_google3_somepath(target, touched_files):
     return bool(lines), lines
 
 
+# Normalize Buildbucket JSON camelCase (summaryMarkdown) and snake_case (summary_markdown)
+def _build_summary_markdown(bb_build):
+    if not isinstance(bb_build, dict):
+        return ""
+    return (bb_build.get("summaryMarkdown") or bb_build.get("summary_markdown") or "").strip()
+
+
+# Detect Task Scheduler pre-task merge conflicts before inspecting older Swarming tasks
+def _not_mergeable_verdict(bb_build):
+    summary_md = _build_summary_markdown(bb_build)
+    if "not mergeable" in summary_md.lower():
+        first_line = summary_md.splitlines()[0].strip()
+        return {
+            "verdict": "NOT_MERGEABLE",
+            "our_part_passed": False,
+            "summary": f"{first_line}; author must rebase onto main",
+        }
+    return None
+
+
+# Reject Swarming tasks from earlier tryjobs created >60s before bb_build was requested
+def _task_predates_build(task, bb_build):
+    if not isinstance(task, dict) or not isinstance(bb_build, dict):
+        return False
+    bb_created = (bb_build.get("createTime") or bb_build.get("create_time") or "").strip()
+    # Deduplicated tasks still get a fresh createdTs during bb_build even when completedTs is older
+    task_created = (task.get("createdTs") or task.get("completedTs") or "").strip()
+    if len(bb_created) < 19 or len(task_created) < 19:
+        return False
+    try:
+        bb_dt = datetime.datetime.fromisoformat(bb_created[:19])
+        task_dt = datetime.datetime.fromisoformat(task_created[:19])
+    except ValueError:
+        return False
+    return (bb_dt - task_dt).total_seconds() > 60
+
+
+# Match a Swarming task for builder while ignoring stale tasks from older tryjobs on the same PS
+def _find_builder_task(cl, ps, builder, bb_build, sw_tasks):
+    task = next(
+        (t for t in sw_tasks
+         if builder in t.get("name", "") and not _task_predates_build(t, bb_build)),
+        None,
+    )
+    if not task:
+        # The shared per-CL query is capped, so a CQ dry run can push this builder out of it
+        task = next(
+            (t for t in swarming_tasks_for_cl(cl, ps, name=builder)
+             if not _task_predates_build(t, bb_build)),
+            None,
+        )
+    return task
+
+
 def triage_asan_failure(cl, ps, builder, bb_build, sw_tasks, touched_files):
+    # Task Scheduler aborts unmergeable CLs before creating any ASAN Swarming task
+    nm = _not_mergeable_verdict(bb_build)
+    if nm:
+        return {**nm, "name": builder}
     failed_tasks = []
     for t in sw_tasks:
+        # Ignore failed Swarming tasks from earlier tryjobs on the same patchset
+        if _task_predates_build(t, bb_build):
+            continue
         name = t.get("name", "")
         is_asan = "ASAN" in name or (builder and builder in name)
         if not is_asan:
@@ -809,10 +870,16 @@ def triage_asan_failure(cl, ps, builder, bb_build, sw_tasks, touched_files):
             failed_tasks.append(t)
 
     if not failed_tasks and bb_build.get("status") in ("FAILURE", "INFRA_FAILURE") and builder:
-        failed_tasks = [t for t in sw_tasks if builder in t.get("name", "")]
+        failed_tasks = [
+            t for t in sw_tasks
+            if builder in t.get("name", "") and not _task_predates_build(t, bb_build)
+        ]
         if not failed_tasks:
             # Look past the capped per-CL query: a CQ dry run creates more tasks than it returns
-            failed_tasks = swarming_tasks_for_cl(cl, ps, name=builder)
+            failed_tasks = [
+                t for t in swarming_tasks_for_cl(cl, ps, name=builder)
+                if not _task_predates_build(t, bb_build)
+            ]
 
     for t in failed_tasks:
         state = t.get("state")
@@ -879,7 +946,7 @@ def triage_asan_failure(cl, ps, builder, bb_build, sw_tasks, touched_files):
                 "summary": f"Sanitizer or test failure in {task_name}",
             }
 
-    summary_md = bb_build.get("summaryMarkdown", "")
+    summary_md = _build_summary_markdown(bb_build)
     return {
         "verdict": "FAILED_UNSPECIFIED", "task_id": target_task_id, "name": task_name or builder,
         "summary": summary_md or "ASAN tryjob failed",
@@ -887,14 +954,16 @@ def triage_asan_failure(cl, ps, builder, bb_build, sw_tasks, touched_files):
 
 
 def triage_canary_g3_failure(cl, ps, bb_build, sw_tasks, touched_files):
-    g3_task = next((t for t in sw_tasks if "Canary-G3" in t.get("name", "")), None)
-    if not g3_task:
-        # The shared per-CL query is capped, so a CQ dry run can push Canary-G3 out of it
-        g3_task = next(iter(swarming_tasks_for_cl(cl, ps, name="Canary-G3")), None)
+    # Check Buildbucket summary_markdown first so merge conflicts never fall back to old tasks
+    nm = _not_mergeable_verdict(bb_build)
+    if nm:
+        return nm
+    summary_md = _build_summary_markdown(bb_build)
+    g3_task = _find_builder_task(cl, ps, "Canary-G3", bb_build, sw_tasks)
     if not g3_task:
         return {
             "verdict": "INFRA_NO_TASK", "our_part_passed": False,
-            "summary": "Canary-G3 Swarming task not found",
+            "summary": summary_md or "Canary-G3 Swarming task not found",
         }
     tid = g3_task.get("taskId")
     stdout = swarming_task_stdout(tid)
@@ -1012,9 +1081,17 @@ def triage_canary_g3_failure(cl, ps, bb_build, sw_tasks, touched_files):
 
 
 def triage_other_canary_failure(cl, ps, builder, bb_build, sw_tasks, touched_files):
-    task = next((t for t in sw_tasks if builder in t.get("name", "")), None)
-    if not task:
-        task = next(iter(swarming_tasks_for_cl(cl, ps, name=builder)), None)
+    # Avoid classifying a pre-task merge conflict or startup error as UNRELATED_HEAD_BREAKAGE
+    nm = _not_mergeable_verdict(bb_build)
+    if nm:
+        return {**nm, "builder": builder}
+    task = _find_builder_task(cl, ps, builder, bb_build, sw_tasks)
+    summary_md = _build_summary_markdown(bb_build)
+    if not task and summary_md:
+        return {
+            "verdict": "INFRA_NO_TASK", "builder": builder, "our_part_passed": False,
+            "summary": summary_md,
+        }
     tid = task.get("taskId") if task else ""
     stdout = swarming_task_stdout(tid) if tid else ""
     stems = [os.path.splitext(os.path.basename(f))[0] for f in touched_files]
@@ -1172,7 +1249,13 @@ def _ancestor_own_canary_g3_status(cl, tested_ps):
         return True, False
     if st not in ("FAILURE", "INFRA_FAILURE"):
         return False, False
-    tasks = swarming_tasks_for_cl(cl, tested_ps, name="Canary-G3")
+    # Keep ancestor holds active on unmergeable builds or filter out stale pre-roll tasks
+    if _not_mergeable_verdict(g3_build):
+        return False, True
+    tasks = [
+        t for t in swarming_tasks_for_cl(cl, tested_ps, name="Canary-G3")
+        if not _task_predates_build(t, g3_build)
+    ]
     if not tasks:
         return False, True
     stdout = swarming_task_stdout(tasks[0].get("taskId"))
@@ -1349,6 +1432,7 @@ BLOCKING_BUILD_VERDICTS = {
     "SANITIZER_OR_TEST_FAILURE",
     "FAILED_UNSPECIFIED",
     "CL_SUSPECTED_REGRESSION",
+    "NOT_MERGEABLE",
 }
 
 
@@ -1409,11 +1493,11 @@ def cmd_triage(args):
                         cl, ps, cb, b_info, sw_tasks, touched_files)
                 results["builds"][cb] = triage_res
                 print(f"- Verdict: {triage_res['verdict']}")
-                if cb == "Canary-G3" and triage_res["verdict"] in ("MISSING_APPROVAL",
-                                                                   "INFRA_NO_TASK"):
+                # Surface summary on pre-roll verdicts (NOT_MERGEABLE, MISSING_APPROVAL, INFRA_*)
+                if triage_res.get("summary") and not triage_res.get("sanitized_draft"):
                     print(f"- Summary: {triage_res['summary']}")
-                elif cb == "Canary-G3":
-                    print(f"- Roll CL: http://cl/{triage_res.get('g3_cl', '')}")
+                if cb == "Canary-G3" and triage_res.get("g3_cl"):
+                    print(f"- Roll CL: http://cl/{triage_res['g3_cl']}")
                     print(f"- Skia Tests Ran: {triage_res.get('skia_tests_ran')}")
                     if triage_res.get("targets"):
                         print("- Failing Targets:")
@@ -1533,7 +1617,9 @@ def cmd_watch(args):
                     cmd = ["git", "cl", "try", "-i", str(cl), "-B", BUCKET, "-b", asan_builder]
                     subprocess.run(cmd, check=False, cwd=SKIA_DIR)
                     asan_retried = True
-                elif triage_res["verdict"] in ("COMPILE_FAILURE", "SANITIZER_OR_TEST_FAILURE"):
+                elif triage_res["verdict"] in (
+                    "COMPILE_FAILURE", "SANITIZER_OR_TEST_FAILURE", "NOT_MERGEABLE"
+                ):
                     print(f"\nWAKEUP_REASON: ASAN_FAILURE ({triage_res['verdict']})")
                     args.resolve_hold = False
                     cmd_triage(args)

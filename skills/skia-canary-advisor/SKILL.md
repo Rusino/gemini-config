@@ -74,6 +74,9 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
      green).
    - **On Red Canary (`CL_SUSPECTED_REGRESSION`)**: Report the failing target, `somepath` chain,
      and stack trace to the user and proceed to fix.
+   - **On Red Canary / ASAN (`NOT_MERGEABLE`)**: Build failed at Task Scheduler startup because the
+     CL has merge conflicts against `main`; ask the author to rebase (do not re-trigger on the
+     conflicting patchset).
    - **On Red ASAN (`COMPILE_FAILURE` or `SANITIZER_OR_TEST_FAILURE`)**:
      - **External / Others' CLs (`review-triage`)**: Never modify the author's CL directly.
        Create or update the `%wip` **companion CL** per `companion-cl-review` (`PS1` = failing
