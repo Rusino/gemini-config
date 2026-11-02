@@ -564,11 +564,12 @@ class ClWatcherFixForTest(unittest.TestCase):
     self.assertTrue(len(fix_rec.get("fixes_breakage_bots") or []) >= 1)
 
     # 3. UI banner formatting produces valid HTML with labels
+    # Pass DASHBOARD_HTML via stdin to stay below Linux 128 KB MAX_ARG_STRLEN
     js_code = r"""
 const assert = require('assert');
-const html = process.argv[1];
-const brokenJson = JSON.parse(process.argv[2]);
-const fixJson = JSON.parse(process.argv[3]);
+const html = require('fs').readFileSync(0, 'utf8');
+const brokenJson = JSON.parse(process.argv[1]);
+const fixJson = JSON.parse(process.argv[2]);
 const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
 assert(scriptMatch, 'Script block found');
 const scriptContent = scriptMatch[1].split('\nboot();')[0];
@@ -599,11 +600,16 @@ process.exit(0);
         "node",
         "-e",
         js_code,
-        cl_watcher.DASHBOARD_HTML,
         json.dumps(broken_rec),
         json.dumps(fix_rec),
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    res = subprocess.run(
+        cmd,
+        input=cl_watcher.DASHBOARD_HTML,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     self.assertEqual(res.returncode, 0, f"Node output: {res.stdout}\nError: {res.stderr}")
 
   def test_focus_card_prominent_fix_stages_and_open_fix_button(self) -> None:
@@ -671,10 +677,11 @@ process.exit(0);
         "fixes": [review_entry],
     }
 
+    # Pass DASHBOARD_HTML via stdin to stay below Linux 128 KB MAX_ARG_STRLEN
     js_code = r"""
 const assert = require('assert');
-const html = process.argv[1];
-const cardData = JSON.parse(process.argv[2]);
+const html = require('fs').readFileSync(0, 'utf8');
+const cardData = JSON.parse(process.argv[1]);
 const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
 assert(scriptMatch, 'Script block found');
 const scriptContent = scriptMatch[1].split('\nboot();')[0];
@@ -721,10 +728,15 @@ process.exit(0);
         "node",
         "-e",
         js_code,
-        cl_watcher.DASHBOARD_HTML,
         json.dumps(broken_card_data),
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    res = subprocess.run(
+        cmd,
+        input=cl_watcher.DASHBOARD_HTML,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     self.assertEqual(res.returncode, 0, f"Node output: {res.stdout}\nError: {res.stderr}")
 
 

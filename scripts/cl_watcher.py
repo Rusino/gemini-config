@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import glob
 import http.client
 import http.server
@@ -131,7 +131,38 @@ GERRIT_SKIA_HOST = "skia-review.googlesource.com"
 GERRIT_CHROMIUM_HOST = "chromium-review.googlesource.com"
 GERRIT_HOSTS = (GERRIT_SKIA_HOST, GERRIT_CHROMIUM_HOST)
 SELF_EMAILS = {"jlavrova@google.com", "jlavrova@gmail.com"}
+# Include @chromium.org alias so public Chromium issue comments/assignments match self
+SELF_BUG_EMAILS = {
+    "jlavrova@google.com",
+    "jlavrova@chromium.org",
+    "jlavrova@gmail.com",
+}
 SELF_GITHUB_LOGINS = {"Rusino", "jlavrova"}
+ISSUES_CLI_BIN = "/google/bin/releases/issues-cli/issues"
+REMOTE_MCP_BIN = "/google/bin/releases/gemini-cli/tools/remote_mcp"
+BUGANIZER_MCP_SERVER = "blade:devtools.buganizer.mcpservice-prod"
+BUG_SYNC_TTL_SEC = 300.0
+BUG_STALE_BACKLOG_DAYS = 60
+BUG_RECENT_CLOSED_DAYS = 14
+# Public Chromium and Skia Buganizer component roots used to pick crbug/ over b/
+PUBLIC_CRBUG_COMPONENTS = {"1457031", "1363359", "1456822", "1456190"}
+RE_BUG_TITLE_TOKEN = re.compile(
+    r"\b(?:crbug(?:\.com)?/|b/|flutter#)\d{4,10}\b",
+    re.IGNORECASE,
+)
+RE_BUGANIZER_EXPLICIT = re.compile(
+    r"(?i)(?:https?://(?:b\.corp\.google\.com|issuetracker\.google\.com)/issues/"
+    r"|https?://issues\.chromium\.org/issues/"
+    r"|\b(?:crbug(?:\.com)?/(?:[a-z0-9_-]+/)?|b/|buganizer[:/]|chromium:|skia:))"
+    r"(\d{6,10})\b"
+)
+RE_GH_FLUTTER_ISSUE_EXPLICIT = re.compile(
+    r"(?i)(?:https?://github\.com/flutter/flutter/issues/|\bflutter(?:/flutter)?#)"
+    r"(\d{4,7})\b"
+)
+RE_GH_CLOSING_KEYWORD = re.compile(
+    r"(?i)\b(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?|issue)\s+#(\d{5,7})\b"
+)
 FLUTTER_TREE_CHECK = "tree-status"
 # Cocoon aggregates Luci presubmit jobs under one umbrella check-run and exposes
 # tip-of-tree and per-commit post-submit failures on flutter-dashboard
@@ -844,9 +875,10 @@ CHAT_WAKE_GRACE_SEC = 15.0
 
 
 def overlay_live_chat_busy(state: dict[str, Any]) -> None:
-  """Refreshes `chat_busy` across cached items from the local Language Server."""
+  """Refreshes `chat_busy` across cached items and bugs from the local Language Server."""
   items = state.get("items") or {}
-  if not items:
+  bugs = state.get("bugs") or {}
+  if not items and not bugs:
     return
   summaries = cl._fetch_ls_summaries_for_audit() or {}
   if not summaries:
@@ -886,6 +918,31 @@ def overlay_live_chat_busy(state: dict[str, Any]) -> None:
               and not s.get("hasRunningSubagents")
           ):
             item["chat_busy"] = False
+  # Keep bug cards and their linked CL subtask rows synchronized with live LS chat activity
+  for bug in bugs.values():
+    if not isinstance(bug, dict):
+      continue
+    bcid = str(bug.get("conversation_id") or "")
+    bs = summaries.get(bcid)
+    # Refresh the parent bug conversation busy state and wake grace window
+    if isinstance(bs, dict):
+      ann = bs.get("annotations") or {}
+      btitle = str(ann.get("title") or bs.get("summary") or bug.get("chat_title") or "").strip()
+      bbusy = is_chat_busy(bs, "" if ann.get("archived") else btitle)
+      # Preserve busy indicator immediately after agentapi send-message before LS reports RUNNING
+      if not bbusy and now_ts - float(bug.get("chat_woken_ts") or 0.0) < CHAT_WAKE_GRACE_SEC:
+        bbusy = True
+      bug["chat_busy"] = bbusy
+    # Refresh separate subtask CL chats independently so non-shared review/CL chats stay live
+    for sub in bug.get("linked_cls") or []:
+      if not isinstance(sub, dict):
+        continue
+      scid = str(sub.get("conversation_id") or "")
+      ss = summaries.get(scid)
+      if isinstance(ss, dict):
+        sann = ss.get("annotations") or {}
+        stitle = str(sann.get("title") or ss.get("summary") or "").strip()
+        sub["chat_busy"] = is_chat_busy(ss, "" if sann.get("archived") else stitle)
 
 
 def extract_cl_ids_with_hosts(text: str) -> dict[str, str]:
@@ -994,6 +1051,96 @@ def extract_state_file_targets(
   return extra_cls, extra_prs
 
 
+def extract_bug_refs_from_text(
+    text: str, default_tracker: str = ""
+) -> list[str]:
+  """Extracts namespaced bug keys (`buganizer:<id>`, `gh_issue:flutter/flutter#<n>`)."""
+  if not text:
+    return []
+  found: list[str] = []
+
+  def _add(k: str) -> None:
+    if k and k not in found:
+      found.append(k)
+
+  for m in RE_BUGANIZER_EXPLICIT.finditer(text):
+    _add(f"buganizer:{m.group(1)}")
+  for m in RE_GH_FLUTTER_ISSUE_EXPLICIT.finditer(text):
+    _add(f"gh_issue:flutter/flutter#{m.group(1)}")
+
+  if default_tracker == "buganizer":
+    # Bare >=6-digit numbers on Gerrit/Piper Bug:/Fixed: lines refer to Buganizer/crbug
+    for tag_m in RE_BUG_TAG.finditer(text):
+      line_val = tag_m.group(1)
+      for bm in re.finditer(r"(?<![#\w/])(\d{6,10})\b", line_val):
+        _add(f"buganizer:{bm.group(1)}")
+  elif default_tracker == "github":
+    # Match closing keywords like Fixes #193731 while ignoring PR #195122 references
+    for km in RE_GH_CLOSING_KEYWORD.finditer(text):
+      _add(f"gh_issue:flutter/flutter#{km.group(1)}")
+  return found
+
+
+def discover_bug_chats(
+    include_archived: bool = False,
+) -> dict[str, dict[str, Any]]:
+  """Scans Jetski conversations for bug shortlinks (`b/`, `crbug/`, `flutter#`)."""
+  summaries = cl._fetch_ls_summaries_for_audit() or {}
+  proj_names = load_project_names()
+  candidates: list[dict[str, Any]] = []
+
+  for cid, s in summaries.items():
+    if not isinstance(s, dict):
+      continue
+    ann = s.get("annotations") or {}
+    is_archived = bool(ann.get("archived"))
+    if is_archived and not include_archived:
+      continue
+    meta = s.get("trajectoryMetadata") or {}
+    if meta.get("parentConversationId") or meta.get("isBattleModeFork"):
+      continue
+    source_meta = meta.get("sourceMetadata") or {}
+    if (
+        source_meta.get("tool")
+        or source_meta.get("hideFromConversationList")
+        or source_meta.get("hide_from_conversation_list")
+    ):
+      continue
+    title = str(ann.get("title") or s.get("summary") or "").strip()
+    if not is_archived and "⦿" not in title and "⏳" not in title:
+      continue
+    pid = str(meta.get("projectId") or "").strip()
+    pname = proj_names.get(pid, "Unassigned")
+    if pname in EXCLUDED_WATCHER_PROJECTS:
+      continue
+    bug_keys = extract_bug_refs_from_text(title)
+    if not bug_keys:
+      continue
+    chat_busy = is_chat_busy(s, "" if is_archived else title)
+    last_mod = str(meta.get("lastModifiedTime") or meta.get("createdAt") or "")
+    single_bug = len(bug_keys) == 1
+    for bkey in bug_keys:
+      candidates.append({
+          "bug_key": bkey,
+          "conversation_id": cid,
+          "title": title,
+          "project_id": pid,
+          "project_name": pname,
+          "chat_last_modified": last_mod,
+          "single_target": single_bug,
+          "chat_busy": chat_busy,
+          "chat_archived": is_archived,
+      })
+
+  best: dict[str, dict[str, Any]] = {}
+  for cand in candidates:
+    bkey = cand["bug_key"]
+    prev = best.get(bkey)
+    if prev is None or _chat_candidate_rank(cand) > _chat_candidate_rank(prev):
+      best[bkey] = cand
+  return best
+
+
 def discover_active_cl_chats(
     include_archived: bool = False,
 ) -> list[dict[str, Any]]:
@@ -1036,13 +1183,18 @@ def discover_active_cl_chats(
     cls_hosts = extract_cl_ids_with_hosts(title)
     cls_found = list(cls_hosts.keys())
     prs_found = extract_pr_ids(title)
-    if not cls_found and not prs_found:
+    # Allow bug-titled chats through so state-file fix CLs/PRs are still discovered
+    bugs_found = extract_bug_refs_from_text(title)
+    if not cls_found and not prs_found and not bugs_found:
       continue
 
     # Discover additional follow-up CLs/PRs recorded in the chat state file
     extra_cls, extra_prs = extract_state_file_targets(pid, cid)
     state_cls = {k: v for k, v in extra_cls.items() if k not in cls_hosts}
     state_prs = [p for p in extra_prs if p not in prs_found]
+    # Pure bug chats without any fix CL/PR yet belong to discover_bug_chats only
+    if not cls_found and not prs_found and not state_cls and not state_prs:
+      continue
 
     # A slash list like "PR #194466/#194475" or multiple IDs means the chat is not 1:1 with one CL
     multi_slash = bool(
@@ -1053,11 +1205,20 @@ def discover_active_cl_chats(
             re.IGNORECASE,
         )
     )
-    # Multiple targets mean the chat does not represent a single 1:1 CL
-    has_multiple = (
-        len(cls_found) + len(prs_found) + len(state_cls) + len(state_prs) > 1
+    # Multiple CL/PR targets mean the chat does not represent a single 1:1 CL;
+    # a 1-bug chat whose state file records its single fix CL/PR remains 1:1
+    total_cl_targets = (
+        len(cls_found) + len(prs_found) + len(state_cls) + len(state_prs)
     )
+    has_multiple = total_cl_targets > 1 or len(bugs_found) > 1
     single_target = not has_multiple and not multi_slash
+    state_single_target = (
+        single_target
+        and not cls_found
+        and not prs_found
+        and len(bugs_found) == 1
+        and total_cl_targets == 1
+    )
 
     for cl_id in cls_found:
       kind = "piper" if len(cl_id) >= 9 else "gerrit"
@@ -1075,7 +1236,7 @@ def discover_active_cl_chats(
           "chat_busy": chat_busy,
           "chat_archived": is_archived,
       })
-    # Append state-file CLs to discovered targets without making them single-target
+    # Append state-file CLs; keep single_target only when a 1-bug chat owns 1 fix CL
     for cl_id, s_host in state_cls.items():
       kind = "piper" if len(cl_id) >= 9 else "gerrit"
       discovered.append({
@@ -1088,7 +1249,7 @@ def discover_active_cl_chats(
           "project_id": pid,
           "project_name": pname,
           "chat_last_modified": last_mod,
-          "single_target": False,
+          "single_target": state_single_target,
           "chat_busy": chat_busy,
           "chat_archived": is_archived,
       })
@@ -1107,7 +1268,7 @@ def discover_active_cl_chats(
           "chat_busy": chat_busy,
           "chat_archived": is_archived,
       })
-    # Append state-file PRs to discovered targets without making them single-target
+    # Append state-file PRs; keep single_target only when a 1-bug chat owns 1 fix PR
     for pr_id in state_prs:
       discovered.append({
           "item_key": f"github:{pr_id}",
@@ -1119,7 +1280,7 @@ def discover_active_cl_chats(
           "project_id": pid,
           "project_name": pname,
           "chat_last_modified": last_mod,
-          "single_target": False,
+          "single_target": state_single_target,
           "chat_busy": chat_busy,
           "chat_archived": is_archived,
       })
@@ -4142,9 +4303,10 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
             # Include body so fix-for detection can parse PR bug/revert references
             "number,title,body,state,isDraft,author,mergedAt,headRefOid,headRefName,"
             "baseRefName,reviewDecision,latestReviews,reviews,comments,"
-            # Include commits so author pushes after a review update the PR timeline
+            # Include commits so author pushes after a review update the PR timeline,
+            # and closingIssuesReferences for automatic PR <-> GitHub issue linking
             "commits,statusCheckRollup,labels,url,mergeable,reviewRequests,"
-            "createdAt,updatedAt,closedAt",
+            "closingIssuesReferences,createdAt,updatedAt,closedAt",
         ],
         stderr=subprocess.STDOUT,
         text=True,
@@ -4610,6 +4772,22 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         "revision": head_sha[:10],
         # Expose PR description text under commit_message for shared fix-for extractors
         "commit_message": str(d.get("body") or ""),
+        # Combine GraphQL closingIssuesReferences with free-text Bug:/Fixes references
+        "linked_bug_keys": list(
+            dict.fromkeys([
+                *(
+                    "gh_issue:"
+                    f"{str((ci.get('repository') or {}).get('nameWithOwner') or 'flutter/flutter')}"
+                    f"#{ci.get('number')}"
+                    for ci in (d.get("closingIssuesReferences") or [])
+                    if isinstance(ci, dict) and ci.get("number")
+                ),
+                *extract_bug_refs_from_text(
+                    f"{subject}\n{str(d.get('body') or '')}",
+                    default_tracker="github",
+                ),
+            ])
+        ),
         "commit_url": (
             f"https://github.com/flutter/flutter/commit/{head_sha}" if head_sha else ""
         ),
@@ -4900,10 +5078,10 @@ def update_chat_roll_badge(conv_id: str, current_title: str, badge: str) -> None
   # cut to make room for the badge rather than dropping it
   if len(new_topic) > TITLE_TOPIC_MAX and badge:
     avail = max(12, TITLE_TOPIC_MAX - 1 - len(badge))
-    # Discovery reads the CL or PR from the title, so a cut must never split it
+    # Discovery reads CL, PR, or bug tokens from the title, so a cut must never split them
     raw_tokens = [
         m.group(0)
-        for r in (RE_CL_ID_GROUP, RE_PR_ID_GROUP)
+        for r in (RE_CL_ID_GROUP, RE_PR_ID_GROUP, RE_BUG_TITLE_TOKEN)
         for m in r.finditer(base_no_badge)
     ]
     rest = base_no_badge
@@ -4926,10 +5104,16 @@ def update_chat_roll_badge(conv_id: str, current_title: str, badge: str) -> None
 
 def _build_start_chat_topic(rec: dict[str, Any]) -> str:
   """Builds a validated <38-char chat topic naming the shortlink and change subject."""
-  kind = str(rec.get("kind") or "gerrit")
-  tid = str(rec.get("target_id") or "")
+  # Accept both CL/PR records (kind/target_id/subject) and bug records (source/id/title)
+  kind = str(rec.get("kind") or rec.get("source") or "gerrit")
+  tid = str(rec.get("target_id") or rec.get("id") or "")
   host = str(rec.get("host") or rec.get("preferred_host") or "")
-  if kind == "github":
+  fallback_noun = "patchset"
+  if kind in ("buganizer", "gh_issue", "github_issue"):
+    id_tok = str(rec.get("short_id") or (f"flutter#{tid}" if "gh" in kind else f"b/{tid}"))
+    default_sub = "Flutter" if "gh" in kind else "Skia"
+    fallback_noun = "issue"
+  elif kind == "github":
     id_tok = f"PR #{tid}"
     default_sub = "Flutter"
   elif kind == "gerrit" and host == GERRIT_CHROMIUM_HOST:
@@ -4951,7 +5135,9 @@ def _build_start_chat_topic(rec: dict[str, Any]) -> str:
       words = [text[:rem].rstrip()]
     return f"{id_tok} {' '.join(words)}"[:TITLE_TOPIC_MAX].rstrip() if words else ""
 
-  raw_subj = str(rec.get("subject") or "")
+  raw_subj = str(rec.get("subject") or rec.get("title") or "")
+  if _is_placeholder_bug_title(raw_subj):
+    raw_subj = ""
   clean_subj = re.sub(r"^(?:\[[^\]]+\]\s*)+", "", raw_subj).strip()
   unbracketed = re.sub(r"[\[\]]+", " ", raw_subj).strip()
   proj_name = str(rec.get("project_name") or "").strip()
@@ -4959,8 +5145,8 @@ def _build_start_chat_topic(rec: dict[str, Any]) -> str:
   # subjects like "[canvas] Fix bug" still pass validate_chat_topic
   sources = [clean_subj, unbracketed]
   if proj_name and proj_name not in META_PROJECT_NAMES:
-    sources.append(f"{proj_name} patchset")
-  sources.append(f"{default_sub} patchset")
+    sources.append(f"{proj_name} {fallback_noun}")
+  sources.append(f"{default_sub} {fallback_noun}")
 
   for src in sources:
     cand = _fit_words(src)
@@ -4970,7 +5156,9 @@ def _build_start_chat_topic(rec: dict[str, Any]) -> str:
       return cl.validate_chat_topic(cand)
     except cl.InvalidTopicError:
       continue
-  return cl.validate_chat_topic(f"{id_tok} {default_sub} patchset"[:TITLE_TOPIC_MAX].rstrip())
+  return cl.validate_chat_topic(
+      f"{id_tok} {default_sub} {fallback_noun}"[:TITLE_TOPIC_MAX].rstrip()
+  )
 
 
 def _lookup_state_item(
@@ -5148,13 +5336,107 @@ def _start_pinned_chat_for_record(
   }
 
 
+def _start_chat_for_bug(state: dict[str, Any], bug_key: str) -> dict[str, Any]:
+  """Reuses an existing bug or 1:1 self-CL chat, or spawns a pinned bug chat."""
+  bugs: dict[str, Any] = state.setdefault("bugs", {})
+  bug = bugs.get(bug_key)
+  if not isinstance(bug, dict):
+    return {"ok": False, "error": f"Unknown bug {bug_key}"}
+
+  bug_chats = discover_bug_chats(include_archived=True)
+  cand = bug_chats.get(bug_key)
+  active_cid = str(
+      (cand or {}).get("conversation_id") or bug.get("conversation_id") or ""
+  ).strip()
+  if not active_cid:
+    # Reuse a linked self-authored CL chat when a single fix CL already owns a chat
+    self_cl_cids = [
+        str(sub.get("conversation_id") or "").strip()
+        for sub in (bug.get("linked_cls") or [])
+        if isinstance(sub, dict)
+        and sub.get("is_self")
+        and sub.get("conversation_id")
+    ]
+    if len(set(self_cl_cids)) == 1:
+      active_cid = self_cl_cids[0]
+
+  if active_cid:
+    bug["conversation_id"] = active_cid
+    if cand:
+      bug["chat_archived"] = bool(cand.get("chat_archived"))
+    save_watcher_state(state)
+    return {
+        "ok": True,
+        "already_existed": True,
+        "conversation_id": active_cid,
+        "chat_url": f"{jetski_box_url()}/c/{active_cid}",
+    }
+
+  proj_ref = str(bug.get("project_name") or bug.get("project_id") or "").strip()
+  try:
+    project_id = (
+        cl.resolve_project_id(proj_ref)
+        if (proj_ref and proj_ref not in META_PROJECT_NAMES)
+        else "outside-of-project"
+    )
+  except ValueError:
+    project_id = str(bug.get("project_id") or "").strip() or "outside-of-project"
+
+  rec_for_topic = {
+      **bug,
+      "kind": "gh_issue" if bug_key.startswith("gh_issue:") else "buganizer",
+  }
+  topic = _build_start_chat_topic(rec_for_topic)
+  full_title = f"[{cl.get_current_time_str()}] ⦿ {topic}"
+  url = str(bug.get("url") or bug.get("short_id") or bug_key)
+  btitle = str(bug.get("title") or bug_key)
+  prompt = (
+      f"Исследуй баг {url} ('{btitle}'). Проверь актуальные детали, воспроизведение "
+      "и связанные CL/PR, оцени приоритет и предложи план действий (не вноси правки "
+      "в репозиторий без подтверждения или контрактного теста)."
+  )
+  try:
+    model_info = cl.resolve_handoff_model("", tier="pro", project_id=project_id)
+    new_cid = cl.start_conversation_exact(
+        model_enum=model_info["enum"],
+        title=full_title,
+        prompt=prompt,
+        project_id=project_id,
+    )
+  except (OSError, RuntimeError, ValueError, KeyError) as exc:
+    return {"ok": False, "error": str(exc)}
+
+  bug["conversation_id"] = new_cid
+  bug["chat_title"] = full_title
+  bug["chat_archived"] = False
+  bug["project_id"] = project_id
+  bug["chat_busy"] = True
+  bug["chat_woken_ts"] = time.time()
+  bug["chat_last_modified"] = datetime.now(timezone.utc).isoformat()
+  # Propagate newly spawned bug chat to any unchatted self CL linked to this bug
+  link_bugs_and_cls(bugs, state.setdefault("items", {}))
+  save_watcher_state(state)
+  return {
+      "ok": True,
+      "started": True,
+      "conversation_id": new_cid,
+      "title": full_title,
+      "project_id": project_id,
+      "chat_url": f"{jetski_box_url()}/c/{new_cid}",
+  }
+
+
 def start_chat_for_item(item_key: str) -> dict[str, Any]:
-  """Starts a project-pinned visible Jetski chat for an unchatted CL/PR item."""
+  """Starts a project-pinned visible Jetski chat for an unchatted CL/PR or bug item."""
   ikey = str(item_key or "").strip()
   if not ikey:
     return {"ok": False, "error": "Missing item_key"}
 
   state = load_watcher_state()
+  # Dispatch bug keys to the bug-specific chat launcher and state linker
+  if ikey.startswith(("buganizer:", "gh_issue:")):
+    return _start_chat_for_bug(state, ikey)
+
   items: dict[str, Any] = state.setdefault("items", {})
   matched_key, rec = _lookup_state_item(items, ikey)
 
@@ -6073,10 +6355,1396 @@ def compute_companion_states(
       p_rec["companions"] = active_comps
 
 
+def _is_bug_bot_author(author: str) -> bool:
+  """Returns True for automated commit/CI bots whose bug comments need no human reply."""
+  low = (author or "").strip().lower()
+  if not low:
+    return True
+  bot_tokens = (
+      "gitwatcher@",
+      "gerritcodereview",
+      "skcq-be",
+      "bugdroid",
+      "autoroll",
+      "github-actions",
+      "fluttergithubbot",
+      "dependabot",
+      "gemini-code-assist",
+  )
+  if any(tok in low for tok in bot_tokens):
+    return True
+  return low.endswith(("[bot]", "-bot", ".gserviceaccount.com"))
+
+
+def _unwrap_mcp_or_json_text(raw_text: str) -> str:
+  """Extracts plaintext payload from remote_mcp or JSON-wrapped CLI output."""
+  trimmed = (raw_text or "").strip()
+  if not trimmed.startswith("{"):
+    return raw_text or ""
+  try:
+    data = json.loads(trimmed)
+  except ValueError:
+    return raw_text or ""
+  if not isinstance(data, dict):
+    return raw_text or ""
+  if isinstance(data.get("result"), str):
+    return data["result"]
+  res_obj = data.get("result")
+  if isinstance(res_obj, dict):
+    content = res_obj.get("content")
+    if isinstance(content, list) and content and isinstance(content[0], dict):
+      if isinstance(content[0].get("text"), str):
+        return _unwrap_mcp_or_json_text(content[0]["text"])
+  return raw_text or ""
+
+
+def _is_placeholder_bug_title(title: str) -> bool:
+  """Returns True when `title` is empty, redacted, or a synthesized fallback label."""
+  t = (title or "").strip()
+  if not t or t.lower() == "[redacted]":
+    return True
+  if t.startswith("[External title redacted"):
+    return True
+  return bool(
+      re.match(r"^Bug\s+(?:\d+|buganizer:|gh_issue:)", t, re.IGNORECASE)
+  )
+
+
+def _format_redacted_fallback_title(bug: dict[str, Any]) -> str:
+  """Builds an explicit metadata label when Buganizer redacts an external issue title."""
+  tags = str(bug.get("component_tags") or "").strip()
+  rep = str(bug.get("reporter") or "").strip()
+  parts = ["[External title redacted]"]
+  if tags:
+    parts.append(f"· {tags}")
+  if rep:
+    parts.append(f"({rep})")
+  return " ".join(parts)
+
+
+def _normalize_public_gerrit_url(raw_url: str) -> str:
+  """Converts internal `.git.corp.google.com` Gerrit URLs to public `.googlesource.com`."""
+  return re.sub(
+      r"\.git\.corp\.google\.com/",
+      ".googlesource.com/",
+      (raw_url or "").strip().rstrip(",.;)"),
+      flags=re.IGNORECASE,
+  )
+
+
+def _finalize_buganizer_entry(entry: dict[str, Any]) -> dict[str, Any]:
+  """Computes canonical bug_key, tracker_flavor (b vs crbug), short_id, and URL."""
+  issue_id = str(entry.get("id") or "").strip()
+  comp_id = str(entry.get("component_id") or "").strip()
+  comp_tags = str(entry.get("component_tags") or "").strip()
+  assignee = str(entry.get("assignee") or "").strip().lower()
+  reporter = str(entry.get("reporter") or "").strip().lower()
+  gerrit_ids = list(entry.get("gerrit_cl_ids") or [])
+  # Normalize 'DUPLICATE of <id>' so closed duplicates never leak into open lanes
+  raw_status = str(entry.get("status") or "ASSIGNED").strip().upper()
+  dup_of = str(entry.get("duplicate_of") or "").strip()
+  m_dup = re.match(r"^DUPLICATE(?:\s+OF\s+(\d+))?\b", raw_status)
+  if m_dup:
+    raw_status = "DUPLICATE"
+    if m_dup.group(1) and not dup_of:
+      dup_of = m_dup.group(1)
+  is_crbug = bool(
+      comp_tags
+      or comp_id in PUBLIC_CRBUG_COMPONENTS
+      or assignee.endswith("@chromium.org")
+      or reporter.endswith("@chromium.org")
+      or gerrit_ids
+  )
+  flavor = "crbug" if is_crbug else "b"
+  short_id = f"{flavor}/{issue_id}"
+  url = (
+      f"https://issues.chromium.org/issues/{issue_id}"
+      if is_crbug
+      else f"https://b.corp.google.com/issues/{issue_id}"
+  )
+  raw_title = str(entry.get("title") or "").strip()
+  redacted = bool(entry.get("title_redacted")) or raw_title.lower() == "[redacted]"
+  if redacted:
+    raw_title = ""
+  mod_raw = str(
+      entry.get("modified_time")
+      or entry.get("major_modified_time")
+      or entry.get("created_time")
+      or ""
+  )
+  mod_et, mod_age = format_et_and_age(mod_raw)
+  return {
+      **entry,
+      "bug_key": f"buganizer:{issue_id}",
+      "source": "buganizer",
+      "id": issue_id,
+      "status": raw_status,
+      "duplicate_of": dup_of,
+      "tracker_flavor": flavor,
+      "short_id": short_id,
+      "url": url,
+      "title": raw_title,
+      "title_redacted": redacted,
+      "modified_et": mod_et,
+      "modified_age": mod_age,
+      "modified_ts": _parse_ts(mod_raw),
+  }
+
+
+RE_GERRIT_ANY_URL_ID = re.compile(
+    r"https?://(?:skia|chromium)-review"
+    r"(?:\.git\.corp\.google|\.googlesource)\.com/"
+    r"(?:c/(?:[^+\s]*/\+/)?)?(\d{6,10})\b",
+    re.IGNORECASE,
+)
+
+
+def parse_buganizer_blocks(output_text: str) -> list[dict[str, Any]]:
+  """Parses get_bugs_with_external, issues search, or batch-get output blocks."""
+  text = _unwrap_mcp_or_json_text(output_text)
+  if not text.strip():
+    return []
+
+  results: list[dict[str, Any]] = []
+  if "Issue ID:" in text:
+    blocks = re.split(r"(?=Issue ID:\s*\d+)", text)
+    for block in blocks:
+      m_id = re.search(r"Issue ID:\s*(\d+)", block)
+      if not m_id:
+        continue
+      issue_id = m_id.group(1)
+      entry: dict[str, Any] = {
+          "id": issue_id,
+          "status": "ASSIGNED",
+          "priority": "P2",
+          "severity": "",
+          "issue_type": "BUG",
+          "component_id": "",
+          "component_tags": "",
+          "assignee": "",
+          "reporter": "",
+          "title": "",
+          "created_time": "",
+          "modified_time": "",
+          "major_modified_time": "",
+          "resolved_time": "",
+          "due_date": "",
+          "slo": {},
+          "gerrit_cl_ids": [],
+          "gerrit_cl_urls": {},
+      }
+      pending_cf = ""
+      in_slo = False
+      for raw_line in block.splitlines():
+        sline = raw_line.strip()
+        if not sline or sline == "---" or sline.startswith("Note:"):
+          in_slo = False
+          continue
+        if in_slo and raw_line.startswith("  "):
+          slo_m = re.match(r"([A-Za-z ]+SLO):\s*(\S+)", sline)
+          if slo_m:
+            slo_key = slo_m.group(1).strip().lower().replace(" ", "_")
+            entry["slo"][slo_key] = slo_m.group(2).strip()
+          continue
+        in_slo = False
+        if sline == "SLO Status:":
+          in_slo = True
+          continue
+        kv = re.match(r"^([A-Za-z][A-Za-z0-9 _-]*):\s*(.*)$", sline)
+        if not kv:
+          continue
+        k, val = kv.group(1).strip(), kv.group(2).strip()
+        if k == "Title":
+          entry["title"] = val
+        elif k == "Component ID":
+          entry["component_id"] = val
+        elif k == "Assignee":
+          entry["assignee"] = val
+        elif k == "Reporter":
+          entry["reporter"] = val
+        elif k == "Status":
+          entry["status"] = val.upper()
+        elif k == "Priority":
+          entry["priority"] = val.upper()
+        elif k == "Severity":
+          entry["severity"] = val.upper()
+        elif k == "Issue Type":
+          entry["issue_type"] = val.upper()
+        elif k == "Created Time":
+          entry["created_time"] = val
+        elif k == "Modified Time":
+          entry["modified_time"] = val
+        elif k == "Major Modified Time":
+          entry["major_modified_time"] = val
+        elif k == "Resolved Time":
+          entry["resolved_time"] = val
+        elif k == "Due Date":
+          entry["due_date"] = val
+        elif k == "Gerrit changes":
+          cids: list[str] = []
+          url_map: dict[str, str] = {}
+          for m_g in RE_GERRIT_ANY_URL_ID.finditer(val):
+            gid = m_g.group(1)
+            cids.append(gid)
+            url_map.setdefault(gid, _normalize_public_gerrit_url(m_g.group(0)))
+          entry["gerrit_cl_ids"] = list(dict.fromkeys(cids))
+          entry["gerrit_cl_urls"] = url_map
+        elif k == "Custom Field":
+          pending_cf = val
+        elif k == "Custom Field Value":
+          if "Component Tags" in pending_cf and not entry["component_tags"]:
+            entry["component_tags"] = val
+          pending_cf = ""
+      results.append(_finalize_buganizer_entry(entry))
+    return results
+
+  # Parse compact `- Issue <id>: <title> [<STATUS>] (Priority: P1, Assignee: ...)` batch-get lines
+  cur: dict[str, Any] | None = None
+  for raw_line in text.splitlines():
+    m_row = re.match(
+        r"^\s*-\s*Issue\s+(\d+):\s*(.+?)\s+\[([A-Z0-9_ ]+)\]\s*\(([^)]*)\)",
+        raw_line,
+    )
+    if m_row:
+      if cur is not None:
+        results.append(_finalize_buganizer_entry(cur))
+      meta_blob = m_row.group(4)
+      m_pri = re.search(r"Priority:\s*(P\d)", meta_blob, re.IGNORECASE)
+      m_asg = re.search(r"Assignee:\s*([^,\s)]+)", meta_blob, re.IGNORECASE)
+      cur = {
+          "id": m_row.group(1),
+          "title": m_row.group(2).strip(),
+          "status": m_row.group(3).upper(),
+          "priority": m_pri.group(1).upper() if m_pri else "P2",
+          "assignee": m_asg.group(1).strip() if m_asg else "",
+          "severity": "",
+          "issue_type": "BUG",
+          "slo": {},
+          "gerrit_cl_ids": [],
+      }
+      continue
+    if cur is not None:
+      m_sev = re.search(r"Severity:\s*(S\d)", raw_line, re.IGNORECASE)
+      m_typ = re.search(r"Type:\s*([A-Z_]+)", raw_line, re.IGNORECASE)
+      if m_sev:
+        cur["severity"] = m_sev.group(1).upper()
+      if m_typ:
+        cur["issue_type"] = m_typ.group(1).upper()
+  if cur is not None:
+    results.append(_finalize_buganizer_entry(cur))
+  return results
+
+
+def parse_rendered_issue_comments(rendered_text: str) -> dict[str, Any]:
+  """Extracts latest human vs self comment metadata and CL links from rendered bug text."""
+  text = _unwrap_mcp_or_json_text(rendered_text)
+  res: dict[str, Any] = {
+      "last_human_comment_author": "",
+      "last_human_comment_at": "",
+      "last_human_comment_snippet": "",
+      "last_self_comment_at": "",
+      "comment_cl_ids": [],
+      "comment_cl_urls": {},
+  }
+  if not text:
+    return res
+
+  cl_ids: list[str] = []
+  cl_urls: dict[str, str] = {}
+  for m_g in RE_GERRIT_ANY_URL_ID.finditer(text):
+    gid = m_g.group(1)
+    cl_ids.append(gid)
+    cl_urls.setdefault(gid, _normalize_public_gerrit_url(m_g.group(0)))
+  res["comment_cl_ids"] = list(dict.fromkeys(cl_ids))
+  res["comment_cl_urls"] = cl_urls
+
+  self_lower = {e.lower() for e in SELF_BUG_EMAILS} | {
+      u.lower() for u in SELF_GITHUB_LOGINS
+  }
+  pattern = re.compile(
+      r"Comment\s+#\d+\s+by\s+(\S+)\s+at\s+([^\n]+?):\n(.*?)(?=\n---\n|\Z)",
+      re.DOTALL,
+  )
+  for m in pattern.finditer(text):
+    author = m.group(1).strip()
+    ts_raw = m.group(2).strip()
+    body = m.group(3).strip()
+    if author.lower() in self_lower:
+      res["last_self_comment_at"] = ts_raw
+    if _is_bug_bot_author(author):
+      continue
+    # Strip collapsed HTML zippy blocks before building the single-line preview
+    clean_body = re.sub(r"<details[\s\S]*?</details>", "", body)
+    clean_body = re.sub(r"\*Comment created using[^\n]*\*", "", clean_body)
+    snippet = " ".join(clean_body.split())[:180]
+    res["last_human_comment_author"] = author
+    res["last_human_comment_at"] = ts_raw
+    res["last_human_comment_snippet"] = snippet
+  return res
+
+
+def merge_bug_record_with_prev(
+    curr: dict[str, Any], prev: dict[str, Any] | None
+) -> dict[str, Any]:
+  """Merges fresh bug fields with cached state, preserving real titles across redaction."""
+  merged = dict(curr)
+  if isinstance(prev, dict):
+    prev_title = str(prev.get("title") or "").strip()
+    # Only carry over a genuine unredacted title, never a stale 'Bug <id>' placeholder
+    if (
+        (merged.get("title_redacted") or not merged.get("title"))
+        and prev_title
+        and not prev.get("title_redacted")
+        and not _is_placeholder_bug_title(prev_title)
+    ):
+      merged["title"] = prev_title
+      merged["title_redacted"] = False
+    if prev.get("tracker_flavor") == "crbug" and merged.get("tracker_flavor") != "crbug":
+      merged["tracker_flavor"] = "crbug"
+      merged["short_id"] = f"crbug/{merged['id']}"
+      merged["url"] = f"https://issues.chromium.org/issues/{merged['id']}"
+    for carry_key in (
+        "acked_ts",
+        "duplicate_of",
+        "gerrit_cl_urls",
+        "conversation_id",
+        "chat_title",
+        "chat_archived",
+        "chat_busy",
+        "chat_woken_ts",
+        "chat_last_modified",
+        "project_id",
+        "project_name",
+        "last_human_comment_author",
+        "last_human_comment_at",
+        "last_human_comment_snippet",
+        "last_self_comment_at",
+        "comment_cl_ids",
+        "comment_cl_urls",
+        "comments_checked_major_mod",
+    ):
+      if carry_key not in merged or merged.get(carry_key) in ("", None, [], {}):
+        if carry_key in prev and prev[carry_key] not in ("", None):
+          merged[carry_key] = prev[carry_key]
+  if not merged.get("title"):
+    if merged.get("title_redacted"):
+      merged["title"] = _format_redacted_fallback_title(merged)
+    else:
+      merged["title"] = f"Bug {merged.get('id') or merged.get('bug_key')}"
+  return merged
+
+
+def _extract_topic_from_bug_chat_title(chat_title: str) -> str:
+  """Extracts human topic prose from `[HH:MM] ⦿ crbug/<id> <topic>` chat titles."""
+  # Strip time prefixes, status/legacy «» markers, and compound bug+CL shortlink prefixes
+  t = re.sub(
+      r"^(?:«\s*)?(?:\[\d{1,2}:\d{2}\]\s*)?(?:[⦿⏳✓✔•◦«»]\s*)*(?:\[[^\]]*\]\s*)*",
+      "",
+      (chat_title or "").strip(),
+  )
+  t = re.sub(r"\s*»$", "", t).strip()
+  t = re.sub(
+      r"^(?:(?:crbug(?:\.com)?/|b/|cl/|crrev(?:\.com)?/c/|skrev(?:\.com)?/|"
+      r"flutter#|pr\s*#|bug\s+|issue\s+#?|#)\d+\b[:\s—–-]*)+",
+      "",
+      t,
+      flags=re.IGNORECASE,
+  ).strip()
+  if len(t) < 3 or _is_placeholder_bug_title(t):
+    return ""
+  if re.fullmatch(
+      r"(?:skia|skparagraph|skoretext|webparagraph|chromium|flutter)\s+issue",
+      t,
+      re.IGNORECASE,
+  ):
+    return ""
+  return t
+
+
+def _resolve_redacted_bug_title(
+    bug: dict[str, Any], all_bugs: dict[str, dict[str, Any]]
+) -> None:
+  """Derives a human-readable fallback title from local chat, CL, or duplicate metadata."""
+  cur_title = str(bug.get("title") or "").strip()
+  if not bug.get("title_redacted") and not _is_placeholder_bug_title(cur_title):
+    return
+
+  chat_topic = _extract_topic_from_bug_chat_title(str(bug.get("chat_title") or ""))
+  if chat_topic:
+    bug["title"] = chat_topic
+    return
+
+  linked = [
+      c
+      for c in (bug.get("linked_cls") or [])
+      if isinstance(c, dict)
+      and str(c.get("status") or "").upper() != "LINKED"
+      and str(c.get("subject") or "").strip()
+  ]
+  linked.sort(key=lambda c: 0 if c.get("is_self") else 1)
+  if linked:
+    sub = linked[0]
+    subj = str(sub.get("subject") or "").strip()
+    lbl = str(sub.get("label") or "").strip()
+    bug["title"] = f"{subj} (via {lbl})" if lbl and lbl not in subj else subj
+    return
+
+  dup_id = str(bug.get("duplicate_of") or "").strip()
+  if dup_id:
+    canon = all_bugs.get(f"buganizer:{dup_id}")
+    canon_short = (
+        str(canon.get("short_id") or "")
+        if isinstance(canon, dict)
+        else ""
+    ) or f"{bug.get('tracker_flavor') or 'b'}/{dup_id}"
+    canon_title = (
+        str(canon.get("title") or "").strip() if isinstance(canon, dict) else ""
+    )
+    if (
+        isinstance(canon, dict)
+        and canon_title
+        and not canon.get("title_redacted")
+        and not _is_placeholder_bug_title(canon_title)
+    ):
+      bug["title"] = f"Duplicate of {canon_short}: {canon_title}"
+    else:
+      bug["title"] = f"Duplicate of {canon_short}"
+    return
+
+  if bug.get("title_redacted") or _is_placeholder_bug_title(cur_title):
+    bug["title"] = _format_redacted_fallback_title(bug)
+
+
+def call_buganizer_mcp_batch(
+    calls: list[tuple[str, dict[str, Any]]], timeout_sec: float = 25.0
+) -> list[str]:
+  """Executes multiple Buganizer MCP tool calls over a single remote_mcp session."""
+  if not calls or not os.path.isfile(REMOTE_MCP_BIN):
+    return ["" for _ in calls]
+  cmd = [
+      REMOTE_MCP_BIN,
+      "--use_loas_transact_dat=True",
+      f"--mcp_server={BUGANIZER_MCP_SERVER}",
+  ]
+  proc: subprocess.Popen[str] | None = None
+  outputs = ["" for _ in calls]
+  try:
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if proc.stdin is None or proc.stdout is None:
+      return outputs
+    init_req = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "flight_deck", "version": "1.0"},
+        },
+    }
+    proc.stdin.write(json.dumps(init_req) + "\n")
+    proc.stdin.flush()
+    proc.stdout.readline()
+
+    for idx, (tool_name, args) in enumerate(calls):
+      req = {
+          "jsonrpc": "2.0",
+          "id": idx + 2,
+          "method": "tools/call",
+          "params": {"name": tool_name, "arguments": args},
+      }
+      proc.stdin.write(json.dumps(req) + "\n")
+      proc.stdin.flush()
+      line = proc.stdout.readline()
+      if line:
+        outputs[idx] = _unwrap_mcp_or_json_text(line)
+    proc.stdin.close()
+    proc.wait(timeout=min(10.0, timeout_sec))
+  except (OSError, subprocess.SubprocessError, ValueError):
+    pass
+  finally:
+    if proc is not None and proc.poll() is None:
+      try:
+        proc.kill()
+        proc.wait(timeout=3)
+      except (OSError, subprocess.SubprocessError):
+        pass
+  return outputs
+
+
+def fetch_buganizer_fallback(query: str, limit: int = 100) -> list[dict[str, Any]]:
+  """Queries issues-cli readonly search when remote_mcp is unavailable."""
+  if not os.path.isfile(ISSUES_CLI_BIN):
+    return []
+  try:
+    res = subprocess.run(
+        [
+            ISSUES_CLI_BIN,
+            "readonly",
+            "search",
+            "--query",
+            query,
+            "--limit",
+            str(limit),
+            "--verbose",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    if res.returncode == 0:
+      return parse_buganizer_blocks(res.stdout)
+  except (OSError, subprocess.SubprocessError):
+    pass
+  return []
+
+
+def fetch_github_bugs(
+    extra_issue_nums: set[str] | None = None,
+) -> list[dict[str, Any]]:
+  """Fetches open and recently closed flutter/flutter GitHub issues for Rusino."""
+  closed_since = (
+      datetime.now(timezone.utc) - timedelta(days=BUG_RECENT_CLOSED_DAYS)
+  ).strftime("%Y-%m-%d")
+  fields = (
+      "number,title,state,stateReason,author,assignees,labels,comments,"
+      "url,createdAt,updatedAt,closedAt,milestone"
+  )
+  raw_by_num: dict[str, dict[str, Any]] = {}
+  self_search_nums: set[str] = set()
+  searches = (
+      ("is:open assignee:Rusino", "100"),
+      (f"is:closed assignee:Rusino closed:>={closed_since}", "50"),
+  )
+  for sq, lim in searches:
+    try:
+      out = subprocess.check_output(
+          [
+              "gh",
+              "issue",
+              "list",
+              "--repo",
+              "flutter/flutter",
+              "--search",
+              sq,
+              "--limit",
+              lim,
+              "--json",
+              fields,
+          ],
+          stderr=subprocess.DEVNULL,
+          text=True,
+          timeout=12,
+      )
+      for item in json.loads(out) or []:
+        if isinstance(item, dict) and item.get("number"):
+          num_s = str(item["number"])
+          raw_by_num[num_s] = item
+          self_search_nums.add(num_s)
+    except (OSError, subprocess.SubprocessError, ValueError):
+      continue
+
+  for num in sorted(extra_issue_nums or set()):
+    if not num or num in raw_by_num:
+      continue
+    try:
+      out = subprocess.check_output(
+          [
+              "gh",
+              "issue",
+              "view",
+              str(num),
+              "--repo",
+              "flutter/flutter",
+              "--json",
+              fields,
+          ],
+          stderr=subprocess.DEVNULL,
+          text=True,
+          timeout=10,
+      )
+      item = json.loads(out)
+      if isinstance(item, dict) and item.get("number"):
+        raw_by_num[str(item["number"])] = item
+    except (OSError, subprocess.SubprocessError, ValueError):
+      continue
+
+  bugs: list[dict[str, Any]] = []
+  self_gh = {u.lower() for u in SELF_GITHUB_LOGINS}
+  for num, d in raw_by_num.items():
+    labels = [
+        str(lbl.get("name") or "")
+        for lbl in (d.get("labels") or [])
+        if isinstance(lbl, dict) and lbl.get("name")
+    ]
+    pri = next(
+        (
+            lbl.upper()
+            for lbl in labels
+            if lbl.upper() in ("P0", "P1", "P2", "P3", "P4")
+        ),
+        "P2",
+    )
+    last_human_author = ""
+    last_human_at = ""
+    last_human_snip = ""
+    last_self_at = ""
+    for c in d.get("comments") or []:
+      if not isinstance(c, dict):
+        continue
+      c_login = str((c.get("author") or {}).get("login") or "").strip()
+      c_at = str(c.get("createdAt") or "").strip()
+      c_body = str(c.get("body") or "").strip()
+      if c_login.lower() in self_gh:
+        last_self_at = c_at
+      if _is_bug_bot_author(c_login):
+        continue
+      last_human_author = c_login
+      last_human_at = c_at
+      last_human_snip = " ".join(c_body.split())[:180]
+
+    mod_raw = str(d.get("updatedAt") or d.get("createdAt") or "")
+    mod_et, mod_age = format_et_and_age(mod_raw)
+    assignees = [
+        str(a.get("login") or "")
+        for a in (d.get("assignees") or [])
+        if isinstance(a, dict) and a.get("login")
+    ]
+    bugs.append({
+        "bug_key": f"gh_issue:flutter/flutter#{num}",
+        "source": "github",
+        "id": num,
+        "tracker_flavor": "github",
+        "short_id": f"flutter#{num}",
+        "url": str(d.get("url") or f"https://github.com/flutter/flutter/issues/{num}"),
+        "title": str(d.get("title") or f"Flutter issue #{num}"),
+        "status": str(d.get("state") or "OPEN").upper(),
+        "state_reason": str(d.get("stateReason") or "").upper(),
+        "priority": pri,
+        "severity": "",
+        "issue_type": "BUG",
+        "assignee": ", ".join(assignees),
+        "reporter": str((d.get("author") or {}).get("login") or ""),
+        "labels": labels,
+        "created_time": str(d.get("createdAt") or ""),
+        "modified_time": mod_raw,
+        "modified_et": mod_et,
+        "modified_age": mod_age,
+        "modified_ts": _parse_ts(mod_raw),
+        "slo": {},
+        "due_date": "",
+        "gerrit_cl_ids": [],
+        "from_self_query": num in self_search_nums,
+        "last_human_comment_author": last_human_author,
+        "last_human_comment_at": last_human_at,
+        "last_human_comment_snippet": last_human_snip,
+        "last_self_comment_at": last_self_at,
+    })
+  return bugs
+
+
+def infer_project_for_bug(
+    bug: dict[str, Any], proj_names: dict[str, str]
+) -> tuple[str, str]:
+  """Maps an unchatted bug to the matching Jetski project `(project_id, project_name)`."""
+  by_name = {name.lower(): (pid, name) for pid, name in proj_names.items()}
+
+  def pick(*candidates: str) -> tuple[str, str]:
+    for cand in candidates:
+      hit = by_name.get(cand.lower())
+      if hit:
+        return hit
+    return ("", candidates[0] if candidates else "Skia")
+
+  blob = " ".join([
+      str(bug.get("title") or ""),
+      str(bug.get("component_tags") or ""),
+      " ".join(str(x) for x in (bug.get("labels") or ())),
+  ]).lower()
+  if any(k in blob for k in ("skoretext", "coretext", "ctfont", "_mac_ct")):
+    return pick("SkoreText", "Skia")
+  if "webparagraph" in blob or (
+      bug.get("source") == "github" and ("platform-web" in blob or "[web]" in blob)
+  ):
+    return pick("WebParagraph")
+  if any(k in blob for k in ("textcluster", "textmetrics", "shapedtext", "canvas2d")):
+    return pick("TextClusters API", "Chromium", "Skia")
+  if any(k in blob for k in ("skparagraph", "skunicode", "skshaper", "paragraph")):
+    return pick("SkParagraph", "Skia")
+  if bug.get("source") == "github":
+    return pick("SkParagraph", "WebParagraph")
+  return pick("Skia")
+
+
+def _summarize_cl_for_bug_subtask(rec: dict[str, Any]) -> str:
+  """Builds a compact 1-line status summary for a CL subtask row under a bug."""
+  st = str(rec.get("status") or "").upper()
+  if st == "MERGED":
+    ps = rec.get("post_submit") or {}
+    if ps.get("all_passed"):
+      return "Merged · Shipped to 4/4"
+    return "Merged"
+  if st in ("ABANDONED", "CLOSED"):
+    return st.capitalize()
+  if rec.get("merge_conflict"):
+    return "Conflict"
+  if rec.get("is_draft") or rec.get("is_wip"):
+    return str(rec.get("wip_label") or "WIP")
+  parts = [
+      str(rec.get("cr_summary") or "").strip(),
+      str(rec.get("cq_status") or "").strip(),
+      str(rec.get("reviewer_status") or "").strip(),
+  ]
+  kept = [p for p in parts if p and p != "Idle"]
+  return " · ".join(kept[:2]) if kept else "In review"
+
+
+def link_bugs_and_cls(
+    bugs_by_key: dict[str, dict[str, Any]],
+    items_by_key: dict[str, Any],
+    bug_chats: dict[str, dict[str, Any]] | None = None,
+) -> None:
+  """Cross-links bugs and CLs/PRs and unifies 1:1 shared bug/CL conversations."""
+  if bug_chats:
+    for bkey, bchat in bug_chats.items():
+      bug = bugs_by_key.get(bkey)
+      if isinstance(bug, dict) and bchat.get("conversation_id"):
+        if not bug.get("conversation_id") or bug.get("chat_archived"):
+          bug["conversation_id"] = bchat["conversation_id"]
+          bug["chat_title"] = bchat.get("title", "")
+          bug["chat_archived"] = bool(bchat.get("chat_archived"))
+          bug["chat_busy"] = bool(bchat.get("chat_busy"))
+          bug["chat_last_modified"] = bchat.get("chat_last_modified", "")
+          if bchat.get("project_name") not in META_PROJECT_NAMES:
+            bug["project_id"] = bchat.get("project_id", "")
+            bug["project_name"] = bchat.get("project_name", bug.get("project_name", ""))
+
+  # Group non-companion CL state entries by canonical item_key
+  cl_entries_by_ikey: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+  for dkey, rec in list(items_by_key.items()):
+    if not isinstance(rec, dict):
+      continue
+    if rec.get("is_companion") or rec.get("companion_to"):
+      continue
+    ikey = str(rec.get("item_key") or "").strip()
+    if not ikey and ":" in dkey:
+      ikey = dkey.split("@", 1)[0]
+    if ikey:
+      cl_entries_by_ikey.setdefault(ikey, []).append((dkey, rec))
+
+  bug_to_cls: dict[str, list[str]] = {bk: [] for bk in bugs_by_key}
+  cl_to_bugs: dict[str, list[str]] = {ik: [] for ik in cl_entries_by_ikey}
+
+  def _add_edge(bkey: str, ikey: str) -> None:
+    if bkey in bug_to_cls and ikey not in bug_to_cls[bkey]:
+      bug_to_cls[bkey].append(ikey)
+    if ikey in cl_to_bugs and bkey not in cl_to_bugs[ikey]:
+      cl_to_bugs[ikey].append(bkey)
+
+  # Collect links from Buganizer Gerrit changes and gitwatcher comment URLs
+  for bkey, bug in bugs_by_key.items():
+    if not isinstance(bug, dict):
+      continue
+    for gid in [
+        *(bug.get("gerrit_cl_ids") or []),
+        *(bug.get("comment_cl_ids") or []),
+    ]:
+      ikey = f"gerrit:{gid}"
+      _add_edge(bkey, ikey)
+
+  # Collect links from CL/PR commit messages, footers, and closingIssuesReferences
+  for ikey, pairs in cl_entries_by_ikey.items():
+    sample = pairs[0][1]
+    kind = str(sample.get("kind") or ("github" if ikey.startswith("github:") else "gerrit"))
+    default_trk = "github" if kind == "github" else "buganizer"
+    blob = "\n".join([
+        str(sample.get("subject") or ""),
+        str(sample.get("commit_message") or ""),
+        str(sample.get("topic") or ""),
+        *(str(h) for h in (sample.get("hashtags") or ())),
+    ])
+    refs = list(
+        dict.fromkeys([
+            *(str(k) for k in (sample.get("linked_bug_keys") or []) if k),
+            *extract_bug_refs_from_text(blob, default_tracker=default_trk),
+        ])
+    )
+    for bkey in refs:
+      _add_edge(bkey, ikey)
+
+  # Pass 1: Propagate an active bug chat onto unchatted self-authored fix CLs
+  for bkey, cl_ikeys in bug_to_cls.items():
+    bug = bugs_by_key.get(bkey)
+    if not isinstance(bug, dict):
+      continue
+    bcid = str(bug.get("conversation_id") or "").strip()
+    if not bcid or bug.get("chat_archived"):
+      continue
+    self_ikeys = [
+        ik
+        for ik in cl_ikeys
+        if ik in cl_entries_by_ikey
+        and cl_entries_by_ikey[ik][0][1].get("is_self")
+    ]
+    for ik in self_ikeys:
+      for dkey, rec in list(cl_entries_by_ikey[ik]):
+        if not str(rec.get("conversation_id") or "").strip():
+          _rekey_state_item_chat(
+              items_by_key, ik, dkey, rec, bcid, chat_archived=False
+          )
+          rec["single_target"] = len(self_ikeys) == 1
+          rec["chat_busy"] = bool(bug.get("chat_busy"))
+          cl_entries_by_ikey[ik] = [(f"{ik}@{bcid}", rec)]
+
+  # Pass 2: Propagate an active self-authored CL chat onto its unchatted parent bug;
+  # external reviewer chats (!is_self) remain scoped strictly to the reviewed CL subtask
+  for bkey, cl_ikeys in bug_to_cls.items():
+    bug = bugs_by_key.get(bkey)
+    if not isinstance(bug, dict):
+      continue
+    if str(bug.get("conversation_id") or "").strip() and not bug.get("chat_archived"):
+      continue
+    self_chatted: list[dict[str, Any]] = []
+    for ik in cl_ikeys:
+      for _, rec in cl_entries_by_ikey.get(ik, []):
+        if (
+            rec.get("is_self")
+            and rec.get("conversation_id")
+            and not rec.get("chat_archived")
+        ):
+          self_chatted.append(rec)
+    if self_chatted:
+      chosen = self_chatted[0]
+      bug["conversation_id"] = str(chosen["conversation_id"])
+      bug["chat_archived"] = False
+      bug["chat_busy"] = any(bool(r.get("chat_busy")) for r in self_chatted)
+      if (
+          bug.get("project_name") in ("", "Unassigned", None)
+          and chosen.get("project_name")
+          and chosen.get("project_name") not in META_PROJECT_NAMES
+      ):
+        bug["project_id"] = str(chosen.get("project_id") or "")
+        bug["project_name"] = str(chosen.get("project_name") or "")
+
+  # Populate bidirectional display lists on bugs and CL items
+  for bkey, bug in bugs_by_key.items():
+    if not isinstance(bug, dict):
+      continue
+    bcid = str(bug.get("conversation_id") or "").strip()
+    subtasks: list[dict[str, Any]] = []
+    for ik in bug_to_cls.get(bkey, []):
+      pairs = cl_entries_by_ikey.get(ik)
+      if pairs:
+        rec = pairs[0][1]
+        tid = str(rec.get("target_id") or ik.split(":", 1)[-1])
+        kind = str(rec.get("kind") or "gerrit")
+        lbl = (
+            f"PR {tid}"
+            if kind == "github"
+            else (f"cl/{tid}" if kind == "piper" else f"CL {tid}")
+        )
+        scid = str(rec.get("conversation_id") or "").strip()
+        subtasks.append({
+            "item_key": ik,
+            "kind": kind,
+            "target_id": tid,
+            "label": lbl,
+            "subject": str(rec.get("subject") or lbl),
+            "url": str(rec.get("url") or ""),
+            "status": str(rec.get("status") or "NEW").upper(),
+            "is_self": bool(rec.get("is_self")),
+            "in_needs_you": bool(
+                rec.get("in_my_attention") or (rec.get("merge_conflict") and rec.get("is_self"))
+            ),
+            "state_summary": _summarize_cl_for_bug_subtask(rec),
+            "submitted_ts": float(rec.get("submitted_ts") or 0.0),
+            "conversation_id": scid,
+            "chat_archived": bool(rec.get("chat_archived")),
+            "chat_busy": bool(rec.get("chat_busy")),
+            "shared_chat": bool(bcid and scid and bcid == scid),
+        })
+      elif ik.startswith("gerrit:"):
+        gid = ik.split(":", 1)[1]
+        known_urls = {
+            **(bug.get("comment_cl_urls") or {}),
+            **(bug.get("gerrit_cl_urls") or {}),
+        }
+        g_url = str(known_urls.get(gid) or f"https://{GERRIT_SKIA_HOST}/c/skia/+/{gid}")
+        subtasks.append({
+            "item_key": ik,
+            "kind": "gerrit",
+            "target_id": gid,
+            "label": f"CL {gid}",
+            "subject": f"Gerrit {gid}",
+            "url": g_url,
+            "status": "LINKED",
+            "is_self": False,
+            "in_needs_you": False,
+            "state_summary": "Linked in Buganizer",
+            "submitted_ts": 0.0,
+            "conversation_id": "",
+            "chat_archived": False,
+            "chat_busy": False,
+            "shared_chat": False,
+        })
+    bug["linked_cls"] = subtasks
+
+  for bug in bugs_by_key.values():
+    if isinstance(bug, dict):
+      _resolve_redacted_bug_title(bug, bugs_by_key)
+
+  for ikey, pairs in cl_entries_by_ikey.items():
+    b_badges: list[dict[str, Any]] = []
+    for bkey in cl_to_bugs.get(ikey, []):
+      bug = bugs_by_key.get(bkey)
+      if isinstance(bug, dict):
+        b_badges.append({
+            "bug_key": bkey,
+            "short_id": str(bug.get("short_id") or bkey),
+            "title": str(bug.get("title") or ""),
+            "priority": str(bug.get("priority") or ""),
+            "severity": str(bug.get("severity") or ""),
+            "status": str(bug.get("status") or ""),
+            "url": str(bug.get("url") or ""),
+        })
+      elif bkey.startswith("buganizer:"):
+        bid = bkey.split(":", 1)[1]
+        b_badges.append({
+            "bug_key": bkey,
+            "short_id": f"b/{bid}",
+            "title": "",
+            "priority": "",
+            "severity": "",
+            "status": "",
+            "url": f"https://b.corp.google.com/issues/{bid}",
+        })
+      elif bkey.startswith("gh_issue:flutter/flutter#"):
+        gnum = bkey.split("#", 1)[1]
+        b_badges.append({
+            "bug_key": bkey,
+            "short_id": f"flutter#{gnum}",
+            "title": "",
+            "priority": "",
+            "severity": "",
+            "status": "",
+            "url": f"https://github.com/flutter/flutter/issues/{gnum}",
+        })
+    for _, rec in pairs:
+      rec["linked_bugs"] = b_badges
+
+
+def classify_bug_status(
+    bug: dict[str, Any], now_ts: float | None = None
+) -> dict[str, Any]:
+  """Classifies a bug into `you` / `overdue` / `has_cl` / `assigned` / `fixed` / `closed`."""
+  cur_now = time.time() if now_ts is None else now_ts
+  status = str(bug.get("status") or "OPEN").upper()
+  source = str(bug.get("source") or "buganizer")
+  state_reason = str(bug.get("state_reason") or "").upper()
+
+  bug["is_overdue"] = False
+  bug["slo_summary"] = ""
+  bug["needs_you"] = False
+  bug["why_needs_you"] = ""
+  bug["is_stale_backlog"] = False
+
+  # Classify terminal upstream states into Fixed vs Closed (obsolete / duplicate / not planned)
+  if source == "github" and status == "CLOSED":
+    bug["lane"] = "closed" if state_reason == "NOT_PLANNED" else "fixed"
+    return bug
+  if status in ("FIXED", "VERIFIED"):
+    bug["lane"] = "fixed"
+    return bug
+  if status.startswith("DUPLICATE") or status in (
+      "OBSOLETE",
+      "NOT_REPRODUCIBLE",
+      "INFEASIBLE",
+      "INTENDED_BEHAVIOR",
+      "WONT_FIX",
+      "CLOSED",
+  ):
+    bug["lane"] = "closed"
+    return bug
+
+  # Check Due Date and active SLO deadlines; ignore Assignment SLO once already ASSIGNED
+  slo = bug.get("slo") if isinstance(bug.get("slo"), dict) else {}
+  deadlines: list[tuple[str, float, str]] = []
+  due_raw = str(bug.get("due_date") or "").strip()
+  if due_raw:
+    dts = _parse_ts(due_raw)
+    if dts > 0:
+      deadlines.append(("Due date", dts, due_raw))
+  if status == "NEW" and slo.get("assignment_slo"):
+    ats = _parse_ts(slo["assignment_slo"])
+    if ats > 0:
+      deadlines.append(("Assignment SLO", ats, str(slo["assignment_slo"])))
+  for key, label in (("response_slo", "Response SLO"), ("closure_slo", "Closure SLO")):
+    raw_s = str(slo.get(key) or "").strip()
+    if raw_s:
+      sts = _parse_ts(raw_s)
+      if sts > 0:
+        deadlines.append((label, sts, raw_s))
+
+  overdue_notes: list[str] = []
+  soon_notes: list[str] = []
+  for label, dts, raw_s in deadlines:
+    et_str, _ = format_et_and_age(raw_s)
+    if dts < cur_now:
+      overdue_days = max(1, int((cur_now - dts) // 86400)) if (cur_now - dts) >= 86400 else 0
+      age_txt = f"{overdue_days}d overdue" if overdue_days else "overdue"
+      overdue_notes.append(f"{label} {age_txt} ({et_str or raw_s})")
+    elif dts - cur_now <= 86400:
+      hrs = max(1, int((dts - cur_now) // 3600))
+      soon_notes.append(f"{label} due in {hrs}h ({et_str or raw_s})")
+
+  if overdue_notes:
+    bug["is_overdue"] = True
+    bug["slo_summary"] = overdue_notes[0]
+  elif soon_notes:
+    bug["slo_summary"] = soon_notes[0]
+
+  linked_cls = [c for c in (bug.get("linked_cls") or []) if isinstance(c, dict)]
+  has_cl = len(linked_cls) > 0
+  real_statuses = [str(c.get("status") or "").upper() for c in linked_cls]
+  all_cls_merged = has_cl and all(s == "MERGED" for s in real_statuses)
+  latest_merged_ts = max(
+      (float(c.get("submitted_ts") or 0.0) for c in linked_cls),
+      default=0.0,
+  )
+  bug["latest_cl_merged_ts"] = latest_merged_ts
+
+  acked_ts = float(bug.get("acked_ts") or 0.0)
+  self_lower = {e.lower() for e in SELF_BUG_EMAILS} | {
+      u.lower() for u in SELF_GITHUB_LOGINS
+  }
+  human_author = str(bug.get("last_human_comment_author") or "").strip()
+  human_ts = _parse_ts(bug.get("last_human_comment_at"))
+  self_ts = _parse_ts(bug.get("last_self_comment_at"))
+  unacked_comment = (
+      bool(human_author)
+      and human_author.lower() not in self_lower
+      and human_ts > max(self_ts, acked_ts)
+  )
+
+  pri = str(bug.get("priority") or "P2").upper()
+  itype = str(bug.get("issue_type") or "BUG").upper()
+  created_ts = _parse_ts(bug.get("created_time"))
+  recent_created = created_ts > 0 and (cur_now - created_ts) <= 7 * 86400
+  unacked_urgent = (
+      not has_cl
+      and acked_ts <= 0.0
+      and (pri in ("P0", "P1") or itype == "VULNERABILITY")
+      and (status == "NEW" or recent_created)
+  )
+  all_merged_unacked = all_cls_merged and acked_ts < max(latest_merged_ts, 1.0)
+
+  if unacked_comment:
+    snip = str(bug.get("last_human_comment_snippet") or "").strip()
+    bug["needs_you"] = True
+    bug["why_needs_you"] = (
+        f"New comment from {human_author}: {snip}"
+        if snip
+        else f"New comment from {human_author}"
+    )
+  elif all_merged_unacked:
+    bug["needs_you"] = True
+    bug["why_needs_you"] = "All linked CLs merged — ready to mark Fixed?"
+  elif unacked_urgent:
+    bug["needs_you"] = True
+    bug["why_needs_you"] = (
+        f"New {pri} vulnerability needs triage"
+        if itype == "VULNERABILITY"
+        else f"New {pri} issue without a CL yet"
+    )
+
+  if bug["needs_you"]:
+    bug["lane"] = "you"
+    return bug
+  if bug["is_overdue"]:
+    bug["lane"] = "overdue"
+    return bug
+  if has_cl:
+    bug["lane"] = "has_cl"
+    return bug
+
+  mod_ts = float(bug.get("modified_ts") or _parse_ts(bug.get("modified_time")) or 0.0)
+  age_days = (cur_now - mod_ts) / 86400.0 if mod_ts > 0 else 999.0
+  bug["is_stale_backlog"] = (
+      pri not in ("P0", "P1")
+      and not bool(bug.get("conversation_id"))
+      and age_days > BUG_STALE_BACKLOG_DAYS
+  )
+  bug["lane"] = "assigned"
+  return bug
+
+
+def _is_self_bug_assignee(assignee: str) -> bool:
+  """Returns True when `assignee` includes one of the user's Buganizer or GitHub identities."""
+  self_lower = {e.lower() for e in SELF_BUG_EMAILS} | {
+      u.lower() for u in SELF_GITHUB_LOGINS
+  }
+  tokens = [
+      t.strip().lower() for t in re.split(r"[,\s]+", assignee or "") if t.strip()
+  ]
+  return any(t in self_lower for t in tokens)
+
+
+def _should_retain_bug_in_view(
+    bug: dict[str, Any],
+    primary_self_bkeys: set[str],
+    merged_chats: dict[str, Any],
+) -> bool:
+  """Retains a bug in the Bugs tab only when owned, collaborated, chatted, or self-CL-linked."""
+  bkey = str(bug.get("bug_key") or "")
+  if bkey in primary_self_bkeys or bkey in merged_chats:
+    return True
+  if _is_self_bug_assignee(str(bug.get("assignee") or "")):
+    return True
+  return any(
+      isinstance(c, dict) and bool(c.get("is_self"))
+      for c in (bug.get("linked_cls") or [])
+  )
+
+
+def sync_bugs_into_state(
+    state: dict[str, Any],
+    *,
+    force: bool = False,
+    wake_chats: bool = True,
+    proj_names: dict[str, str] | None = None,
+) -> None:
+  """Polls Buganizer/crbug and GitHub issues with a 5-min TTL and links them to CLs."""
+  pnames = proj_names if proj_names is not None else load_project_names()
+  prev_bugs: dict[str, Any] = state.get("bugs") or {}
+  items: dict[str, Any] = state.setdefault("items", {})
+  events: list[dict[str, Any]] = state.setdefault("events", [])
+  bug_chats = discover_bug_chats(include_archived=False)
+  all_bug_chats = discover_bug_chats(include_archived=True)
+  merged_chats = {**all_bug_chats, **bug_chats}
+
+  now_ts = time.time()
+  last_bug_ts = float(state.get("last_bug_sync_ts") or 0.0)
+  if not force and prev_bugs and (now_ts - last_bug_ts) < BUG_SYNC_TTL_SEC:
+    # Refresh chat links, CL subtasks, and status lanes in-memory between 5-min bug polls
+    link_bugs_and_cls(prev_bugs, items, bug_chats=merged_chats)
+    for b in prev_bugs.values():
+      if isinstance(b, dict):
+        _resolve_redacted_bug_title(b, prev_bugs)
+        classify_bug_status(b, now_ts=now_ts)
+    return
+
+  # Gather external bug IDs referenced by tracked CLs/PRs or active Jetski chats
+  ref_buganizer_ids: set[str] = set()
+  ref_gh_nums: set[str] = set()
+  self_cl_bkeys: set[str] = set()
+  for bkey in merged_chats:
+    if bkey.startswith("buganizer:"):
+      ref_buganizer_ids.add(bkey.split(":", 1)[1])
+    elif bkey.startswith("gh_issue:flutter/flutter#"):
+      ref_gh_nums.add(bkey.split("#", 1)[1])
+  for rec in items.values():
+    if not isinstance(rec, dict):
+      continue
+    kind = str(rec.get("kind") or "gerrit")
+    blob = "\n".join([
+        str(rec.get("subject") or ""),
+        str(rec.get("commit_message") or ""),
+        str(rec.get("topic") or ""),
+    ])
+    for bkey in [
+        *(str(k) for k in (rec.get("linked_bug_keys") or []) if k),
+        *extract_bug_refs_from_text(
+            blob, default_tracker="github" if kind == "github" else "buganizer"
+        ),
+    ]:
+      if rec.get("is_self"):
+        self_cl_bkeys.add(bkey)
+      if bkey.startswith("buganizer:"):
+        ref_buganizer_ids.add(bkey.split(":", 1)[1])
+      elif bkey.startswith("gh_issue:flutter/flutter#"):
+        ref_gh_nums.add(bkey.split("#", 1)[1])
+
+  closed_since = (
+      datetime.now(timezone.utc) - timedelta(days=BUG_RECENT_CLOSED_DAYS)
+  ).strftime("%Y-%m-%d")
+  open_q = (
+      "(assignee:jlavrova@google.com OR assignee:jlavrova@chromium.org "
+      "OR collaborator:jlavrova@google.com) status:open"
+  )
+  closed_q = (
+      "(assignee:jlavrova@google.com OR assignee:jlavrova@chromium.org) "
+      f"-status:open modified>={closed_since}"
+  )
+  mcp_calls: list[tuple[str, dict[str, Any]]] = [
+      ("get_bugs_with_external", {"query": open_q, "maxResults": 200, "verbose": True}),
+      ("get_bugs_with_external", {"query": closed_q, "maxResults": 50, "verbose": True}),
+  ]
+  mcp_outputs = call_buganizer_mcp_batch(mcp_calls)
+  fetched_bz = parse_buganizer_blocks(mcp_outputs[0]) + parse_buganizer_blocks(
+      mcp_outputs[1]
+  )
+  if not fetched_bz:
+    fetched_bz = fetch_buganizer_fallback(open_q, limit=150)
+
+  primary_self_bkeys = {str(b.get("bug_key") or "") for b in fetched_bz}
+  seen_bz_ids = {str(b.get("id") or "") for b in fetched_bz}
+  # Reconcile previously open Buganizer issues missing from open_q + referenced external bugs
+  prev_open_ids = {
+      str(b.get("id") or "")
+      for b in prev_bugs.values()
+      if isinstance(b, dict)
+      and b.get("source") == "buganizer"
+      and str(b.get("status") or "").upper() in ("NEW", "ASSIGNED", "ACCEPTED", "OPEN")
+  }
+  missing_bz_ids = sorted((ref_buganizer_ids | prev_open_ids) - seen_bz_ids)
+  if missing_bz_ids:
+    id_q = " OR ".join(f"id:{bid}" for bid in missing_bz_ids[:40])
+    extra_out = call_buganizer_mcp_batch(
+        [("get_bugs_with_external", {"query": id_q, "maxResults": 50, "verbose": True})]
+    )
+    fetched_bz.extend(parse_buganizer_blocks(extra_out[0]))
+
+  all_bugs: dict[str, dict[str, Any]] = {}
+  to_render_ids: list[str] = []
+  recent_cutoff_ts = now_ts - 30 * 86400
+  for raw_b in fetched_bz:
+    bkey = raw_b["bug_key"]
+    merged_b = merge_bug_record_with_prev(raw_b, prev_bugs.get(bkey))
+    all_bugs[bkey] = merged_b
+    is_self_bug = (
+        bkey in primary_self_bkeys
+        or bkey in merged_chats
+        or bkey in self_cl_bkeys
+        or _is_self_bug_assignee(str(merged_b.get("assignee") or ""))
+    )
+    st = str(merged_b.get("status") or "").upper()
+    maj_mod = str(
+        merged_b.get("major_modified_time") or merged_b.get("modified_time") or ""
+    )
+    is_active_cand = (
+        is_self_bug
+        and st in ("NEW", "ASSIGNED", "ACCEPTED")
+        and (
+            str(merged_b.get("priority") or "") in ("P0", "P1")
+            or float(merged_b.get("modified_ts") or 0.0) >= recent_cutoff_ts
+            or bkey in merged_chats
+        )
+    )
+    if (
+        is_active_cand
+        and maj_mod
+        and maj_mod != str(merged_b.get("comments_checked_major_mod") or "")
+        and len(to_render_ids) < 12
+    ):
+      to_render_ids.append(merged_b["id"])
+
+  if to_render_ids:
+    render_calls = [
+        ("render_issue_with_external", {"issueId": bid}) for bid in to_render_ids
+    ]
+    rendered_outs = call_buganizer_mcp_batch(render_calls)
+    for bid, r_out in zip(to_render_ids, rendered_outs):
+      b_obj = all_bugs.get(f"buganizer:{bid}")
+      if isinstance(b_obj, dict) and r_out:
+        cinfo = parse_rendered_issue_comments(r_out)
+        b_obj.update(cinfo)
+        b_obj["comments_checked_major_mod"] = str(
+            b_obj.get("major_modified_time") or b_obj.get("modified_time") or ""
+        )
+
+  for gh_b in fetch_github_bugs(extra_issue_nums=ref_gh_nums):
+    bkey = gh_b["bug_key"]
+    if gh_b.get("from_self_query"):
+      primary_self_bkeys.add(bkey)
+    all_bugs[bkey] = merge_bug_record_with_prev(gh_b, prev_bugs.get(bkey))
+
+  # Link bugs <-> CLs BEFORE project fallback so self-CL chats propagate project & titles
+  link_bugs_and_cls(all_bugs, items, bug_chats=merged_chats)
+  for bug in all_bugs.values():
+    _resolve_redacted_bug_title(bug, all_bugs)
+    if not bug.get("project_name") or bug.get("project_name") == "Unassigned":
+      pid, pname = infer_project_for_bug(bug, pnames)
+      bug["project_id"] = pid
+      bug["project_name"] = pname
+
+  # Keep reviewer-only colleague bugs for CL chips, but exclude them from the Bugs tab
+  retained_bugs: dict[str, dict[str, Any]] = {}
+  for bkey, bug in all_bugs.items():
+    if not _should_retain_bug_in_view(bug, primary_self_bkeys, merged_chats):
+      continue
+    retained_bugs[bkey] = bug
+    prev_b = prev_bugs.get(bkey) if isinstance(prev_bugs.get(bkey), dict) else {}
+    classify_bug_status(bug, now_ts=now_ts)
+    # Wake active bug chat when a new human comment arrives upstream
+    if (
+        wake_chats
+        and bug.get("conversation_id")
+        and not bug.get("chat_archived")
+        and bug.get("needs_you")
+        and bug.get("last_human_comment_at")
+        and bug.get("last_human_comment_at") != prev_b.get("last_human_comment_at")
+        and prev_b
+    ):
+      wmsg = (
+          f"[BUG-WATCHER] 💬 Новый комментарий в {bug.get('short_id')} "
+          f"('{bug.get('title')}') от {bug.get('last_human_comment_author')}: "
+          f"{bug.get('last_human_comment_snippet')}. Проверь и предложи ответ/действия."
+      )
+      wake_conversation(str(bug["conversation_id"]), wmsg)
+      events.insert(
+          0,
+          {
+              "id": f"ev-bug-{int(now_ts * 1000)}-{bug.get('id')}",
+              "time": now_et_str(),
+              "item_key": bkey,
+              "target_id": str(bug.get("id") or ""),
+              "conversation_id": str(bug["conversation_id"]),
+              "project_name": str(bug.get("project_name") or "Skia"),
+              "critical": False,
+              "message": wmsg,
+          },
+      )
+      del events[50:]
+
+  state["bugs"] = retained_bugs
+  state["last_bug_sync_ts"] = now_ts
+
+
+def ack_bug_item(bug_key: str) -> dict[str, Any]:
+  """Marks a Needs You bug comment or merged-CL prompt as acknowledged."""
+  bkey = str(bug_key or "").strip()
+  if not bkey:
+    return {"ok": False, "error": "Missing bug_key"}
+  state = load_watcher_state()
+  bugs = state.get("bugs") or {}
+  bug = bugs.get(bkey)
+  if not isinstance(bug, dict):
+    return {"ok": False, "error": f"Unknown bug {bkey}"}
+  now_ts = time.time()
+  bug["acked_ts"] = max(
+      now_ts,
+      float(bug.get("modified_ts") or 0.0),
+      _parse_ts(bug.get("last_human_comment_at")),
+      float(bug.get("latest_cl_merged_ts") or 0.0),
+  )
+  classify_bug_status(bug, now_ts=now_ts)
+  save_watcher_state(state)
+  return {"ok": True, "bug_key": bkey, "lane": bug.get("lane", "assigned")}
+
+
 def sync_once(
     wake_chats: bool = True,
     update_titles: bool = True,
     skia_dir: str = DEFAULT_SKIA_DIR,
+    sync_bugs: bool = False,
+    force_bugs: bool = False,
 ) -> dict[str, Any]:
   """Performs one full discovery and status poll across active and unchatted CLs/PRs."""
   # Clear per-poll Gerrit /related caches so status transitions and rebases stay fresh
@@ -6830,6 +8498,19 @@ def sync_once(
       events = state["events"]
 
   triage_store.overlay_triage_on_items(new_items.values())
+  if sync_bugs:
+    sync_bugs_into_state(
+        state,
+        force=force_bugs,
+        wake_chats=wake_chats,
+        proj_names=proj_names,
+    )
+  elif state.get("bugs"):
+    # Keep in-memory bug<->CL cross-links synchronized when running fast CL-only syncs
+    link_bugs_and_cls(state["bugs"], new_items)
+    for b in state["bugs"].values():
+      if isinstance(b, dict):
+        classify_bug_status(b)
   state["last_sync"] = now_et_str()
   state["gardener_url"] = gardener_pen_url()
   state["rollers_summary"] = {
@@ -7434,12 +9115,61 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   html.embedded section.lane { margin-top: 18px; }
   html.embedded .lane-head h3, html.embedded details.done h3 { font-size: 12px; }
   html.embedded footer { margin: 28px 0 16px; font-size: 10px; }
+
+  /* Segmented [CLs | Bugs] view switch and bug-CL parent/subtask rows */
+  .view-switch {
+    display: inline-flex; align-items: center; gap: 2px; padding: 2px;
+    border-radius: 980px; background: color-mix(in srgb, var(--ink) 7%, transparent);
+  }
+  .view-tab {
+    border: 0; background: transparent; color: var(--graphite); cursor: pointer;
+    font: 600 11px var(--sans); padding: 3px 10px; border-radius: 980px;
+    display: inline-flex; align-items: center; gap: 5px;
+  }
+  .view-tab:hover { color: var(--ink); }
+  .view-tab.on {
+    background: var(--card); color: var(--ink);
+    box-shadow: 0 1px 2px rgba(0,0,0,.08);
+  }
+  .view-tab .v-count { font-weight: 500; opacity: .75; font-size: 10.5px; }
+  .view-tab .v-you {
+    display: inline-flex; align-items: center; gap: 3px;
+    color: var(--blue); font-weight: 700; font-size: 10.5px;
+  }
+  .badge.bug-link {
+    background: color-mix(in srgb, var(--blue) 12%, transparent);
+    color: var(--blue); font-family: var(--mono);
+  }
+  .badge.pri-high {
+    background: color-mix(in srgb, var(--red) 14%, transparent); color: var(--red);
+  }
+  .badge.pri-med {
+    background: color-mix(in srgb, var(--ink) 8%, transparent); color: var(--graphite);
+  }
+  .bug-subtasks { margin-top: 6px; display: grid; gap: 3px; grid-column: 1 / -1; }
+  .row .bug-subtasks { margin-top: 4px; }
+  .bug-subtask {
+    display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap;
+    padding: 3px 8px; border-radius: 7px;
+    background: color-mix(in srgb, var(--ink) 3.8%, transparent);
+    font-size: 10.5px; color: var(--graphite);
+  }
+  .bug-subtask .cl-ref { font-family: var(--mono); font-weight: 600; color: var(--blue); }
+  .bug-subtask .sub-subj { color: var(--ink); font-weight: 500; }
+  details.subtask-more > summary {
+    cursor: pointer; list-style: none; font-size: 10.5px; color: var(--blue);
+    padding: 2px 8px; user-select: none;
+  }
+  details.subtask-more > summary::-webkit-details-marker { display: none; }
+  details.subtask-more[open] > .subtask-more-body { margin-top: 3px; display: grid; gap: 3px; }
+  details.backlog { margin-top: 10px; }
 </style>
 </head>
 <body>
 <header class="bar">
   <div class="wrap">
     <div class="brand">✈️ Flight Deck</div>
+    <div class="view-switch" id="view-switch" role="tablist" aria-label="View"></div>
     <nav class="rollers" id="rollers" aria-label="Skia autorollers"></nav>
     <div class="synced" id="synced">Loading…</div>
     <button class="link-btn" id="refresh-btn" onclick="triggerRefresh()">Refresh</button>
@@ -7474,6 +9204,7 @@ let cachedData = null;
 // Tracks server script mtime to trigger page reload on daemon re-exec
 let cachedUiVersion = null;
 let selectedProject = 'ALL';
+let selectedView = 'cls';
 
 function esc(s) {
   return String(s ?? '')
@@ -9243,7 +10974,14 @@ if (typeof document !== 'undefined') {
     if (e.key === 'Escape') {
       closeTriageModal();
       closePingModal();
+      return;
     }
+    // Keyboard shortcuts 1/2/b switch between CLs and Bugs outside text inputs
+    const tag = e.target && e.target.tagName ? String(e.target.tagName).toUpperCase() : '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === '1') setView('cls');
+    else if (e.key === '2') setView('bugs');
+    else if (e.key === 'b' || e.key === 'B') setView(selectedView === 'bugs' ? 'cls' : 'bugs');
   });
 }
 
@@ -9320,6 +11058,7 @@ function focusCard(it, data) {
         ${link(it.url, clLabel(it))} · by ${authorHtml}</div>
         <h2>${cardTitle}</h2>
         <div class="why">${whyContent}</div>
+        ${parentBugsHtml(it)}
         <!-- Surface fix-for linkage on broken alert card -->
         ${fixesBreakageBannerHtml(it)}</div>
       <div class="actions">${primary}${openFixBtn}${chatBtn}</div>
@@ -9388,6 +11127,7 @@ function focusCard(it, data) {
         `${link(it.url, clLabel(it))} · PS${esc(it.patchset || 1)} · by ${authorHtml}</div>
         <h2>${cardTitle}</h2>
         <div class="why">${whyContent}</div>
+        ${parentBugsHtml(it)}
         <!-- Surface fix-for linkage on pre-submit focus cards -->
         ${brokenAndFixBannerHtml(it)}${fixesBreakageBannerHtml(it)}
         ${companionsBannerHtml(it)}
@@ -9397,13 +11137,35 @@ function focusCard(it, data) {
     </article>`;
 }
 
+// Render clickable parent bug chips on CL cards so authors see linked crbug/b/gh issues
+function parentBugsHtml(it) {
+  const bugs = Array.isArray(it.linked_bugs) ? it.linked_bugs : [];
+  if (!bugs.length) return '';
+  return '<div class="meta" style="margin-top:3px">' + bugs.map(b => {
+    const pri = b.priority ? ` · ${esc(b.priority)}` : '';
+    const tip = b.title ? `${b.short_id}: ${b.title}` : b.short_id;
+    return link(
+      b.url,
+      `<span class="badge bug-link">🐛 ${esc(b.short_id)}${pri}</span>`,
+      '',
+      tip,
+    );
+  }).join(' ') + '</div>';
+}
+
 function rowHtml(it, data) {
   const who = link(actorUrl(it, it.owner_email || it.owner_name), esc(authorLabel(it)));
   // Link CL identifier directly to review host
   const clAnchor = link(it.url, esc(clLabel(it)));
+  const bugChips = (Array.isArray(it.linked_bugs) ? it.linked_bugs : []).map(b => {
+    const pri = b.priority ? ` ${esc(b.priority)}` : '';
+    const tip = b.title ? `${b.short_id}: ${b.title}` : b.short_id;
+    return link(b.url, `<span class="badge bug-link">${esc(b.short_id)}${pri}</span>`, '', tip);
+  }).join('');
   const meta = [
     `<span class="proj-tag">${esc(it.project_name)}</span>`,
     `<span class="cl">${clAnchor}</span>`,
+    bugChips,
     who,
     chatActionHtml(it, data, true),
   ].filter(Boolean).join(' · ');
@@ -9419,6 +11181,186 @@ function rowHtml(it, data) {
       <div class="state">${stateHtml(it)}</div>
       <div class="when">${rowTime(it)}</div>
     </div>`;
+}
+
+// Deduplicates working chats by conversation_id so a shared bug+CL chat counts once
+function countUniqueBusyChats(items) {
+  const seen = new Set();
+  let unkeyed = 0;
+  for (const it of items) {
+    if (!it || !it.chat_busy) continue;
+    if (it.conversation_id) seen.add(it.conversation_id);
+    else unkeyed += 1;
+  }
+  return seen.size + unkeyed;
+}
+
+const BUG_LANES = [
+  {id: 'overdue', title: 'Overdue', hint: 'Past Response / Closure SLO or Due Date'},
+  {id: 'has_cl', title: 'Has CL', hint: 'Open bugs with active or merged CLs / PRs'},
+  {id: 'assigned', title: 'Assigned', hint: 'Open assigned bugs without a CL yet'},
+];
+
+function bugPriorityBadgeHtml(bug) {
+  const pri = String(bug.priority || 'P2').toUpperCase();
+  const sev = bug.severity ? ` ${String(bug.severity).toUpperCase()}` : '';
+  const cls = (pri === 'P0' || pri === 'P1') ? 'pri-high' : 'pri-med';
+  return `<span class="badge ${cls}">${esc(pri)}${esc(sev)}</span>`;
+}
+
+function chatAnchorHtml(cid, url, label, cls) {
+  return `<a class="${cls}" href="${esc(url)}" target="jetski-chat" ` +
+    `onclick="return openChat(${esc(JSON.stringify(cid))}, ${esc(JSON.stringify(url))}, event)">` +
+    `${label}</a>`;
+}
+
+function bugChatActionHtml(bug, data, compact) {
+  const chat = chatUrl(bug, data);
+  if (chat && bug.conversation_id) {
+    const cls = compact ? 'chat' : 'btn quiet';
+    if (bug.chat_busy) {
+      return chatAnchorHtml(
+        bug.conversation_id, chat, compact ? '⏳ working…' : '⏳ Chat working…', cls
+      );
+    }
+    const lbl = bug.chat_archived
+      ? (compact ? 'chat (archived)' : 'Open chat (archived)')
+      : (compact ? 'chat' : 'Open chat');
+    return chatAnchorHtml(bug.conversation_id, chat, lbl, cls);
+  }
+  if (!bug.bug_key) return '';
+  const cls = compact ? 'link-btn chat' : 'btn quiet';
+  return `<button class="${cls}" onclick="startChat(${esc(JSON.stringify(bug.bug_key))}, this)">` +
+    `${compact ? 'start chat' : 'Start chat'}</button>`;
+}
+
+function bugSubtasksHtml(bug, data) {
+  const subs = Array.isArray(bug.linked_cls) ? bug.linked_cls : [];
+  if (!subs.length) return '';
+  // Promote active/tracked CLs ahead of historical LINKED Buganizer references
+  const ordered = [...subs].sort((a, b) =>
+    Number(Boolean(b.in_needs_you)) - Number(Boolean(a.in_needs_you)) ||
+    Number(a.status === 'LINKED') - Number(b.status === 'LINKED')
+  );
+  const renderSub = sub => {
+    const clLink = link(sub.url, esc(sub.label || sub.item_key), 'cl-ref');
+    const cleanSubj = cleanSubject(sub.subject || '');
+    // Omit synthetic 'Gerrit <id>' placeholder when the CL number is already in clLink
+    const tid = sub.target_id || String(sub.item_key || '').split(':')[1] || '';
+    const isPlaceholderSubj = sub.status === 'LINKED' && cleanSubj === `Gerrit ${tid}`;
+    const subj = (!isPlaceholderSubj && cleanSubj)
+      ? `<span class="sub-subj">${esc(cleanSubj)}</span>` : '';
+    const st = sub.state_summary ? `<span>${esc(sub.state_summary)}</span>` : '';
+    const needBadge = sub.in_needs_you ? '<span class="badge warn">⦿ Needs you</span>' : '';
+    // Omit duplicate Open chat on subtask when CL shares the parent bug conversation
+    const cLbl = sub.chat_busy ? '⏳ working…' : (sub.is_self ? 'CL chat' : 'review chat');
+    const subChat = (!sub.shared_chat && sub.conversation_id)
+      ? chatAnchorHtml(sub.conversation_id, chatUrl(sub, data), cLbl, 'chat')
+      : '';
+    const parts = [clLink, subj, needBadge, st, subChat].filter(Boolean).join(' · ');
+    return `<div class="bug-subtask">↳ ${parts}</div>`;
+  };
+  // Fold >4 subtasks on umbrella tracking bugs so historical CL lists stay compact
+  if (ordered.length > 4) {
+    const head = ordered.slice(0, 3).map(renderSub).join('');
+    const rest = ordered.slice(3);
+    const tail = rest.map(renderSub).join('');
+    return `<div class="bug-subtasks">${head}<details class="subtask-more">` +
+      `<summary>+${rest.length} more linked CLs</summary>` +
+      `<div class="subtask-more-body">${tail}</div></details></div>`;
+  }
+  return `<div class="bug-subtasks">${ordered.map(renderSub).join('')}</div>`;
+}
+
+function bugFocusCard(bug, data) {
+  const isAlert = Boolean(bug.is_overdue || bug.issue_type === 'VULNERABILITY' ||
+    bug.priority === 'P0');
+  const busyBadge = bug.chat_busy
+    ? '<span class="busy-pill"><i class="dot moving"></i>Chat is working</span> · ' : '';
+  const typeTag = (bug.issue_type && bug.issue_type !== 'BUG') ? ` · ${esc(bug.issue_type)}` : '';
+  const sloPart = bug.slo_summary ? ` · <span class="red">${esc(bug.slo_summary)}</span>` : '';
+  const ackBtn = `<button class="btn secondary" ` +
+    `onclick="ackBug(${esc(JSON.stringify(bug.bug_key || ''))}, this)">✓ Ack</button>`;
+  return `<article class="card${isAlert ? ' alert' : ''}">` +
+    `<div><div class="eyebrow">${busyBadge}${esc(bug.project_name || 'Skia')} · ` +
+    `${link(bug.url, esc(bug.short_id || bug.bug_key))}${typeTag}</div>` +
+    `<h2>${bugPriorityBadgeHtml(bug)}${link(bug.url, esc(bug.title))}</h2>` +
+    `<div class="why">${esc(bug.why_needs_you || 'Needs triage')}${sloPart}</div></div>` +
+    `<div class="actions">${link(bug.url, 'Open issue', 'btn primary')}` +
+    `${ackBtn}${bugChatActionHtml(bug, data, false)}</div>` +
+    `${bugSubtasksHtml(bug, data)}</article>`;
+}
+
+function bugRowHtml(bug, data) {
+  const meta = [
+    `<span class="proj-tag">${esc(bug.project_name || 'Skia')}</span>`,
+    `<span class="cl">${link(bug.url, esc(bug.short_id || bug.bug_key))}</span>`,
+    bug.assignee ? esc(shortActor(bug.assignee)) : '',
+    bugChatActionHtml(bug, data, true),
+  ].filter(Boolean).join(' · ');
+  const subs = Array.isArray(bug.linked_cls) ? bug.linked_cls : [];
+  const dupId = String(bug.duplicate_of || '').trim();
+  const isDup = String(bug.status || '').toUpperCase() === 'DUPLICATE' && dupId;
+  const dupHtml = isDup ? (() => {
+    const isCr = bug.tracker_flavor === 'crbug';
+    const dupUrl = isCr
+      ? `https://issues.chromium.org/issues/${dupId}`
+      : `https://issuetracker.google.com/issues/${dupId}`;
+    return `DUPLICATE → ${link(dupUrl, esc(`${isCr ? 'crbug' : 'b'}/${dupId}`))}`;
+  })() : '';
+  const stateTxt = bug.slo_summary
+    ? `<span class="${bug.is_overdue ? 'red' : 'amber'}">${esc(bug.slo_summary)}</span>`
+    : (dupHtml || (subs.length ? `${subs.length} linked CL${subs.length > 1 ? 's' : ''}`
+      : esc(bug.status || 'ASSIGNED')));
+  const whenTxt = bug.modified_et
+    ? `${esc(bug.modified_et)}${bug.modified_age ? ` (${esc(bug.modified_age)})` : ''}` : '';
+  return `<div class="row"><div><div class="title">${bugPriorityBadgeHtml(bug)}` +
+    `${link(bug.url, esc(bug.title))}</div><div class="meta">${meta}</div>` +
+    `${bugSubtasksHtml(bug, data)}</div><div class="state">${stateTxt}</div>` +
+    `<div class="when">${whenTxt}</div></div>`;
+}
+
+function doneDisclosureHtml(title, count, bodyHtml, extraCls = '') {
+  return `<details class="done${extraCls ? ' ' + extraCls : ''}"><summary><h3>${title}</h3>` +
+    `<span class="n">${count}</span>` +
+    '<span class="chev"><span class="closed">Show</span><span class="open">Hide</span></span>' +
+    `</summary>${bodyHtml}</details>`;
+}
+
+function renderProjectChips(items, projects) {
+  const projOf = it => it.project_name || 'Unassigned';
+  const chip = (val, lbl, n) => `<button class="proj${selectedProject === val ? ' on' : ''}" ` +
+    `onclick="setProject(${esc(JSON.stringify(val))})">${esc(lbl)}` +
+    `<span class="n">${n}</span></button>`;
+  document.getElementById('projects').innerHTML = chip('ALL', 'All', items.length) +
+    projects.map(p => chip(p, p, items.filter(it => projOf(it) === p).length)).join('');
+}
+
+function renderViewSwitchHtml(clNeedYou, clTotal, bugNeedYou, bugTotal) {
+  const badge = (need, tot) => need > 0
+    ? `<span class="v-you">● ${need}</span>` : `<span class="v-count">${tot}</span>`;
+  return `<button class="view-tab${selectedView === 'cls' ? ' on' : ''}" role="tab" ` +
+    `onclick="setView('cls')">CLs ${badge(clNeedYou, clTotal)}</button>` +
+    `<button class="view-tab${selectedView === 'bugs' ? ' on' : ''}" role="tab" ` +
+    `onclick="setView('bugs')">Bugs ${badge(bugNeedYou, bugTotal)}</button>`;
+}
+
+function syncLocationHash() {
+  const parts = [];
+  if (selectedView === 'bugs') parts.push('view=bugs');
+  if (selectedProject !== 'ALL') parts.push(`project=${encodeURIComponent(selectedProject)}`);
+  history.replaceState(null, '', parts.length ? `#${parts.join('&')}` : '#');
+}
+
+function setView(v) {
+  selectedView = v === 'bugs' ? 'bugs' : 'cls';
+  try {
+    if (typeof localStorage !== 'undefined') localStorage.setItem('flight_deck_view', selectedView);
+  } catch (e) {
+    // Ignore storage quota or security errors in sandboxed iframes
+  }
+  syncLocationHash();
+  render();
 }
 
 function busyChatsSentence(busyCount) {
@@ -9457,7 +11399,7 @@ function setProject(p) {
   } catch (e) {
     // Ignore storage quota or security errors in sandboxed iframes
   }
-  history.replaceState(null, '', p === 'ALL' ? '#' : `#project=${encodeURIComponent(p)}`);
+  syncLocationHash();
   render();
 }
 
@@ -9467,16 +11409,108 @@ function render() {
   const all = visibleItemsFromData(data)
     .sort((a, b) => (b.activity_ts || 0) - (a.activity_ts || 0));
   buildStackContext(all);
-  const projects = projectsOf(all);
-  if (selectedProject !== 'ALL' && !projects.includes(selectedProject)) selectedProject = 'ALL';
+  const allBugs = Object.values(data.bugs || {})
+    .filter(b => b && typeof b === 'object')
+    .sort((a, b) => (b.modified_ts || 0) - (a.modified_ts || 0));
   const projOf = it => it.project_name || 'Unassigned';
+  const bugProjects = projectsOf(allBugs);
+  const projects = projectsOf(all);
+  // Reset stale project filter before computing top-bar counts and keep URL hash synced
+  const activeProjects = selectedView === 'bugs' ? bugProjects : projects;
+  if (selectedProject !== 'ALL' && !activeProjects.includes(selectedProject)) {
+    selectedProject = 'ALL';
+    syncLocationHash();
+  }
 
-  const chip = (value, label, n) =>
-    `<button class="proj${selectedProject === value ? ' on' : ''}" ` +
-    `onclick="setProject(${esc(JSON.stringify(value))})">` +
-    `${esc(label)}<span class="n">${n}</span></button>`;
-  document.getElementById('projects').innerHTML = chip('ALL', 'All', all.length) +
-    projects.map(p => chip(p, p, all.filter(it => projOf(it) === p).length)).join('');
+  // Compute global Needs You badges for the top-bar [CLs | Bugs] switch
+  const projFilteredCls = selectedProject === 'ALL'
+    ? all : all.filter(it => projOf(it) === selectedProject);
+  const clYouAll = projFilteredCls.filter(it => laneOf(it) === 'you');
+  const clNeedCount = clYouAll.filter(it => !it.chat_busy).length;
+  const projFilteredBugs = selectedProject === 'ALL'
+    ? allBugs : allBugs.filter(b => projOf(b) === selectedProject);
+  const bugYouAll = projFilteredBugs.filter(b => (b.lane || 'assigned') === 'you');
+  const bugNeedCount = bugYouAll.filter(b => !b.chat_busy).length;
+  const viewSwitchEl = document.getElementById('view-switch');
+  if (viewSwitchEl) {
+    viewSwitchEl.innerHTML = renderViewSwitchHtml(
+      clNeedCount, projFilteredCls.length, bugNeedCount, projFilteredBugs.length
+    );
+  }
+
+  const r = data.rollers_summary || {};
+  document.getElementById('rollers').innerHTML = PRODUCTS.map(p => {
+    const x = r[p] || {};
+    const tip = `${p}: ${x.badge || ''} · ${x.num_behind ?? '?'} commits behind`;
+    return link(x.url, `<i class="dot ${x.num_failed ? 'moving' : 'ok'}"></i>` +
+      `<span class="name">${p}</span>`, '', tip);
+  }).join('') + (data.gardener_url ? link(data.gardener_url, 'Gardener') : '');
+  document.getElementById('synced').textContent = data.last_sync || '';
+
+  // Render the Bugs tab with its own project chips, Needs You focus cards, and lanes
+  if (selectedView === 'bugs') {
+    renderProjectChips(allBugs, bugProjects);
+    const shownBugs = allBugs.filter(
+      b => selectedProject === 'ALL' || projOf(b) === selectedProject
+    );
+    const byBug = {you: [], overdue: [], has_cl: [], assigned: [], fixed: [], closed: []};
+    for (const b of shownBugs) byBug[byBug[b.lane] ? b.lane : 'assigned'].push(b);
+    // Keep idle bugs needing human action above bugs whose agent chat is already running
+    byBug.you.sort((a, b) => Number(Boolean(a.chat_busy)) - Number(Boolean(b.chat_busy)));
+    const busyBugs = countUniqueBusyChats(
+      [...shownBugs, ...shownBugs.flatMap(b => b.linked_cls || [])]
+    );
+    const needBugs = byBug.you.filter(b => !b.chat_busy).length;
+    document.getElementById('headline').innerHTML = headlineHtml(
+      needBugs, selectedProject, busyBugs
+    );
+    const bSub = BUG_LANES.filter(l => byBug[l.id].length)
+      .map(l => `${byBug[l.id].length} ${l.title.toLowerCase()}`);
+    if (byBug.fixed.length) bSub.push(`${byBug.fixed.length} fixed`);
+    if (byBug.closed.length) bSub.push(`${byBug.closed.length} closed`);
+    document.getElementById('subline').textContent = bSub.length ? `${bSub.join(' · ')}.` : '';
+    document.getElementById('focus').innerHTML = byBug.you.map(b => bugFocusCard(b, data)).join('');
+    const pingsEl = document.getElementById('pings');
+    if (pingsEl) pingsEl.innerHTML = '';
+
+    let bugLanesHtml = '';
+    for (const l of BUG_LANES) {
+      const list = byBug[l.id];
+      if (!list.length) continue;
+      // Fold >60d unchatted assigned bugs into a collapsed Backlog disclosure
+      if (l.id === 'assigned') {
+        const act = list.filter(b => !b.is_stale_backlog);
+        const stale = list.filter(b => b.is_stale_backlog);
+        const backlogBody = stale.map(b => bugRowHtml(b, data)).join('');
+        bugLanesHtml += `<section class="lane"><div class="lane-head"><h3>${l.title}</h3>` +
+          `<span class="n">${act.length}</span><span class="hint">${l.hint}</span></div>` +
+          act.map(b => bugRowHtml(b, data)).join('') +
+          (stale.length
+            ? doneDisclosureHtml('Backlog (&gt;60d)', stale.length, backlogBody, 'backlog')
+            : '') + '</section>';
+      } else {
+        bugLanesHtml += `<section class="lane"><div class="lane-head"><h3>${l.title}</h3>` +
+          `<span class="n">${list.length}</span><span class="hint">${l.hint}</span></div>` +
+          list.map(b => bugRowHtml(b, data)).join('') + '</section>';
+      }
+    }
+    // Render Fixed and Closed in separate collapsed disclosures at the bottom
+    for (const [ck, ct] of [['fixed', 'Fixed'], ['closed', 'Closed']]) {
+      if (byBug[ck].length) {
+        bugLanesHtml += '<section class="lane">' + doneDisclosureHtml(
+          ct, byBug[ck].length, byBug[ck].map(b => bugRowHtml(b, data)).join('')
+        ) + '</section>';
+      }
+    }
+    document.getElementById('lanes').innerHTML = bugLanesHtml ||
+      '<p class="empty-note">No tracked bugs in this project.</p>';
+    const projCount = bugProjects.length;
+    document.getElementById('footer').textContent =
+      `${allBugs.length} tracked bugs across ${projCount} projects · refreshes every 5 min`;
+    return;
+  }
+
+  renderProjectChips(all, projects);
 
   const shown = all.filter(it => selectedProject === 'ALL' || projOf(it) === selectedProject);
   const by = {you: [], landing: [], desk: [], waiting: [], watching: [], done: []};
@@ -9498,8 +11532,8 @@ function render() {
     (b.activity_ts || 0) - (a.activity_ts || 0)
   );
 
-  const busyYou = by.you.filter(it => it.chat_busy).length;
-  const needYou = by.you.length - busyYou;
+  const busyYou = countUniqueBusyChats(by.you);
+  const needYou = by.you.filter(it => !it.chat_busy).length;
   document.getElementById('headline').innerHTML = headlineHtml(needYou, selectedProject, busyYou);
   const sub = LANES.filter(l => by[l.id].length)
     .map(l => `${by[l.id].length} ${l.title.toLowerCase()}`);
@@ -9525,15 +11559,6 @@ function render() {
   }
   document.getElementById('lanes').innerHTML = lanes ||
     '<p class="empty-note">No open CL or PR chats in this project.</p>';
-
-  const r = data.rollers_summary || {};
-  document.getElementById('rollers').innerHTML = PRODUCTS.map(p => {
-    const x = r[p] || {};
-    const tip = `${p}: ${x.badge || ''} · ${x.num_behind ?? '?'} commits behind`;
-    return link(x.url, `<i class="dot ${x.num_failed ? 'moving' : 'ok'}"></i>` +
-      `<span class="name">${p}</span>`, '', tip);
-  }).join('') + (data.gardener_url ? link(data.gardener_url, 'Gardener') : '');
-  document.getElementById('synced').textContent = data.last_sync || '';
   document.getElementById('footer').textContent =
     `${all.length} open CL and PR chats across ${projects.length} projects · refreshes every 20 s`;
 }
@@ -9732,6 +11757,33 @@ async function abandonCompanions(itemKeys, btn) {
   }
 }
 
+async function ackBug(bugKey, btn) {
+  if (!bugKey || (btn && btn.disabled)) return;
+  const orig = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Acking…';
+  }
+  try {
+    const resp = await fetch('/api/ack_bug', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({bug_key: bugKey}),
+    });
+    const res = await resp.json();
+    if (res && res.ok) {
+      await fetchState();
+      return;
+    }
+  } catch (e) {
+    // Restore button label when the local HTTP call fails
+  }
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
+}
+
 async function triggerRefresh() {
   const btn = document.getElementById('refresh-btn');
   btn.textContent = 'Refreshing…';
@@ -9757,14 +11809,20 @@ function boot() {
     document.documentElement.classList.add('embedded');
   }
   let savedProj = 'ALL';
+  let savedView = 'cls';
   try {
     if (typeof localStorage !== 'undefined') {
       savedProj = localStorage.getItem('flight_deck_project') || 'ALL';
+      savedView = localStorage.getItem('flight_deck_view') || 'cls';
     }
   } catch (e) {
     // Ignore storage errors in sandboxed iframes
   }
-  selectedProject = new URLSearchParams(location.hash.slice(1)).get('project') || savedProj;
+  // URL hash overrides localStorage so direct #view=bugs links open on Bugs
+  const hashParams = new URLSearchParams(location.hash.slice(1));
+  selectedProject = hashParams.get('project') || savedProj;
+  const hashView = hashParams.get('view');
+  selectedView = hashView === 'bugs' ? 'bugs' : (savedView === 'bugs' ? 'bugs' : 'cls');
   fetchState();
   setInterval(fetchState, 20000);
 }
@@ -9796,7 +11854,7 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
     if parsed.path == "/api/status":
       state = load_watcher_state()
       if not state.get("items"):
-        state = sync_once(wake_chats=False, update_titles=True)
+        state = sync_once(wake_chats=False, update_titles=True, sync_bugs=True)
       else:
         overlay_live_chat_busy(state)
         triage_store.overlay_triage_on_items(
@@ -9836,8 +11894,14 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
             target=reexec_self, args=(self.server,), daemon=True
         ).start()
         return
-      state = sync_once(wake_chats=True, update_titles=True)
-      self._send_json({"ok": True, "count": len(state.get("items") or {})})
+      state = sync_once(
+          wake_chats=True, update_titles=True, sync_bugs=True, force_bugs=True
+      )
+      self._send_json({
+          "ok": True,
+          "count": len(state.get("items") or {}),
+          "bugs_count": len(state.get("bugs") or {}),
+      })
       return
 
     if parsed.path in (
@@ -9845,6 +11909,7 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
         "/api/rebase",
         "/api/open_chat",
         "/api/abandon",
+        "/api/ack_bug",
     ):
       length = int(self.headers.get("Content-Length") or 0)
       raw_body = (
@@ -9863,6 +11928,10 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
         res = open_chat_for_id(cid)
       elif parsed.path == "/api/start_chat":
         res = start_chat_for_item(str(bdict.get("item_key") or ""))
+      elif parsed.path == "/api/ack_bug":
+        res = ack_bug_item(
+            str(bdict.get("bug_key") or bdict.get("item_key") or "")
+        )
       elif parsed.path == "/api/abandon":
         raw_keys = bdict.get("item_keys")
         if isinstance(raw_keys, list):
@@ -9927,7 +11996,7 @@ def serve_forever(
       if script_changed_on_disk():
         reexec_self(server)
       try:
-        sync_once(wake_chats=True, update_titles=True)
+        sync_once(wake_chats=True, update_titles=True, sync_bugs=True)
       except Exception:
         pass
       # Poll mtime in 2-second slices so commits reload the server without waiting a full cycle
@@ -9988,9 +12057,17 @@ def main() -> int:
     return 0
 
   if args.sync_once:
-    state = sync_once(wake_chats=not args.no_wake, update_titles=True)
+    state = sync_once(
+        wake_chats=not args.no_wake,
+        update_titles=True,
+        sync_bugs=True,
+        force_bugs=True,
+    )
     count = len(state.get("items") or {})
-    print(f"Synced {count} active CL/PR chat items at {state.get('last_sync')}")
+    bcount = len(state.get("bugs") or {})
+    print(
+        f"Synced {count} CL/PR items and {bcount} bugs at {state.get('last_sync')}"
+    )
     return 0
 
   if args.serve:

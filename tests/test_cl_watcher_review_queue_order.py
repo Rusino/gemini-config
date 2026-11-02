@@ -423,9 +423,10 @@ class ReviewQueueOrderAndReadinessTest(unittest.TestCase):
       )
 
   def test_dashboard_variant_c_stack_grouping_and_blocker_banner(self):
+    # Pass DASHBOARD_HTML via stdin to stay below Linux 128 KB MAX_ARG_STRLEN
     js_code = r"""
 const assert = require('assert');
-const html = process.argv[1];
+const html = require('fs').readFileSync(0, 'utf8');
 const script = html.split('<script>')[1].split('</script>')[0].replace(/boot\(\);/g, '');
 eval(script);
 
@@ -570,8 +571,10 @@ assert(laneHtml.includes('🔗 Stack (2 of 3 CLs)'), 'Must render stack lane hea
 console.log('Variant C Dashboard JS tests passed');
 process.exit(0);
 """
-    cmd = ["node", "-e", js_code, w.DASHBOARD_HTML]
-    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    cmd = ["node", "-e", js_code]
+    res = subprocess.run(
+        cmd, input=w.DASHBOARD_HTML, capture_output=True, text=True, check=False
+    )
     self.assertEqual(
         res.returncode, 0, f"Node output: {res.stdout}\nError: {res.stderr}"
     )

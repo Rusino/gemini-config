@@ -264,9 +264,10 @@ class TestReviewerPings(unittest.TestCase):
     self.assertEqual(res.get("reviewer_pings"), [])
 
   def test_js_grouped_reviewer_ping_panel_and_clipboard_message_format(self):
+    # Pass DASHBOARD_HTML via stdin to stay below Linux 128 KB MAX_ARG_STRLEN
     js_code = r"""
 const assert = require('assert');
-const html = process.argv[1];
+const html = require('fs').readFileSync(0, 'utf8');
 const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
 assert(scriptMatch, 'Script block found');
 const scriptContent = scriptMatch[1].split('\nboot();')[0];
@@ -419,8 +420,10 @@ assert(inlineRerequested.includes('🔄 re-requested'), 'Must show re-requested 
 console.log('JS tests passed successfully');
 process.exit(0);
 """
-    cmd = ["node", "-e", js_code, w.DASHBOARD_HTML]
-    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    cmd = ["node", "-e", js_code]
+    res = subprocess.run(
+        cmd, input=w.DASHBOARD_HTML, capture_output=True, text=True, check=False
+    )
     self.assertEqual(res.returncode, 0, f"Node output: {res.stdout}\nError: {res.stderr}")
 
   def test_github_dismissed_approval_and_missing_rerequest_detected(self):
