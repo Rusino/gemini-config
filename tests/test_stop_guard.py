@@ -1224,6 +1224,56 @@ class TestStopGuard(unittest.TestCase):
       self.assertEqual(res.get("decision"), "continue")
       self.assertIn("[TITLE GUARD]", res.get("reason", ""))
 
+  # Raw LS titles with concrete words but no [HH:MM] marker do not satisfy pending_title_guard
+  def test_title_guard_blocks_raw_ls_title_lacking_lifecycle_prefix(self):
+    with tempfile.TemporaryDirectory() as tmp_dir, \
+         tempfile.NamedTemporaryFile("w+", suffix=".jsonl") as f_trans:
+      scratch_dir = os.path.join(tmp_dir, "scratch")
+      os.makedirs(scratch_dir, exist_ok=True)
+      st_file = os.path.join(scratch_dir, ".context_guard_state.json")
+      with open(st_file, "w", encoding="utf-8") as f:
+        json.dump({"pending_title_guard": True}, f)
+
+      steps = [
+          {"step_index": 1, "type": "USER_INPUT", "content": "Help with crash"},
+          {"step_index": 2, "type": "PLANNER_RESPONSE", "content": "Done."},
+      ]
+      for s in steps:
+        f_trans.write(json.dumps(s) + "\n")
+      f_trans.flush()
+
+      data = {
+          "conversationId": "c1",
+          "transcriptPath": f_trans.name,
+          "artifactDirectoryPath": tmp_dir,
+          "fullyIdle": True,
+          "terminationReason": "NO_TOOL_CALL",
+      }
+      with patch("sys.stdin", io.StringIO(json.dumps(data))), \
+           patch("sys.stdout", new_callable=io.StringIO) as mock_out, \
+           patch(
+               "chat_lifecycle.get_conversation_title",
+               return_value="Fontations Stream OOM Analysis",
+           ), \
+           patch.object(stop_guard, "play_stop_sound"):
+        stop_guard.main()
+      res = json.loads(mock_out.getvalue())
+      self.assertEqual(res.get("decision"), "continue")
+      self.assertIn("[TITLE GUARD]", res.get("reason", ""))
+
+      # Once prefixed by chat_lifecycle.py set-title, stop_guard allows turn completion
+      with open(st_file, "w", encoding="utf-8") as f:
+        json.dump({"pending_title_guard": True}, f)
+      with patch("sys.stdin", io.StringIO(json.dumps(data))), \
+           patch("sys.stdout", new_callable=io.StringIO) as mock_out2, \
+           patch(
+               "chat_lifecycle.get_conversation_title",
+               return_value="[10:08] ⦿ Fontations Stream OOM Analysis",
+           ), \
+           patch.object(stop_guard, "play_stop_sound"):
+        stop_guard.main()
+      self.assertEqual(json.loads(mock_out2.getvalue()), {})
+
   def test_macos_subagent_without_parent_field_skips_stop_guard(self):
     parent_id = "0687185b-9c27-41f8-9a0a-bfec291f51f8"
     sub_id = "b8d01615-02b4-46ed-93ee-3774ec3a473f"

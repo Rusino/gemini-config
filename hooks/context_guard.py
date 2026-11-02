@@ -1885,11 +1885,14 @@ def run(data: dict, log: dict) -> dict:
             or chat_lifecycle.get_conversation_title(conv_id)
         )
         cur_base = chat_lifecycle.clean_base_title(cur_t)
+        has_prefix = chat_lifecycle.has_lifecycle_title_prefix(cur_t)
+        valid_topic = chat_lifecycle.is_valid_chat_topic(cur_base)
         is_handoff_cont = (
             "Continuing unfinished work from previous conversation" in last_user_input
             or bool(chat_lifecycle.HANDOFF_PARENT_RE.search(last_user_input))
         )
-        if not is_handoff_cont and not chat_lifecycle.is_valid_chat_topic(cur_base):
+        # Raw Jetski LS auto-titles omit [HH:MM] <marker> and must not satisfy the title guard
+        if not is_handoff_cont and not (has_prefix and valid_topic):
           state["pending_title_guard"] = True
           if auto_title:
             state["auto_title_notice"] = (
@@ -1902,13 +1905,13 @@ def run(data: dict, log: dict) -> dict:
           else:
             state["auto_title_notice"] = (
                 f"[TITLE GUARD: CONCRETE TOPIC REQUIRED] Current chat title "
-                f"({cur_t or 'untitled'!r}) is missing, single-word, or generic. "
-                f"Before ending this turn, you MUST run "
-                f"`python3 {LIFECYCLE_CLI} set-title {conv_id} \"<Concrete 2-6 word topic>\"` "
-                f"(< 50 chars, naming the specific subsystem/bug/PR/CL and action)."
+                f"({cur_t or 'untitled'!r}) lacks a [HH:MM] lifecycle prefix or is single-word/"
+                f"generic. Before ending this turn, you MUST run "
+                f'`python3 {LIFECYCLE_CLI} set-title {conv_id} "<Concrete 2-6 word topic>"` '
+                "(< 50 chars, naming the specific subsystem/bug/PR/CL and action)."
             )
           save_state(state_path, state)
-        elif chat_lifecycle.is_valid_chat_topic(cur_base):
+        elif has_prefix and valid_topic:
           if auto_title:
             state["auto_title_notice"] = (
                 f"[TITLE GUARD] Conversation title automatically set to '{auto_title}' "

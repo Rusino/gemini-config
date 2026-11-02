@@ -264,6 +264,18 @@ GENERIC_TOPIC_WORDS = frozenset({
     "handoff",
     "summary",
     "state",
+    "request",
+    "requests",
+    "requested",
+    "triage",
+    "triaging",
+    "overview",
+    "report",
+    "reports",
+    "inquiry",
+    "inquiries",
+    "query",
+    "queries",
     "исследование",
     "исследования",
     "исследованию",
@@ -374,6 +386,37 @@ GENERIC_TOPIC_WORDS = frozenset({
     "новая",
     "новое",
     "новые",
+    "запрос",
+    "запроса",
+    "запросу",
+    "запросом",
+    "запросе",
+    "запросы",
+    "запросов",
+    "триаж",
+    "триажа",
+    "обзор",
+    "обзора",
+    "отчет",
+    "отчета",
+    "отчёт",
+    "отчёта",
+})
+
+# Top-level product/repo names cannot be the sole subject without an entity ID or module
+BARE_PROJECT_TOPIC_WORDS = frozenset({
+    "chromium",
+    "skia",
+    "flutter",
+    "google",
+    "google3",
+    "android",
+    "blink",
+    "dart",
+    "pdfium",
+    "dawn",
+    "angle",
+    "v8",
 })
 
 # Prepositions, conjunctions, and articles ignored when counting meaningful topic words
@@ -425,12 +468,30 @@ def _analyze_topic_tokens(topic: str) -> tuple[list[str], list[str], list[str]]:
   normalized = _ENTITY_UNIT_RE.sub("ENTITY_ID_TOKEN", normalized)
   tokens = _TOPIC_WORD_RE.findall(normalized)
   content = [t for t in tokens if t.lower() not in TOPIC_STOP_WORDS]
+  # Exclude conversational prompt verbs too so derive_fallback_topic rejects "Посмотри на этот баг"
   non_generic = [
       t
       for t in content
-      if t != "ENTITY_ID_TOKEN" and t.lower() not in GENERIC_TOPIC_WORDS
+      if (
+          t != "ENTITY_ID_TOKEN"
+          and t.lower() not in GENERIC_TOPIC_WORDS
+          and t.lower() not in PROMPT_FILLER_WORDS
+      )
   ]
   return tokens, content, non_generic
+
+
+# Rejects raw LS titles like "Chromium Bug Analysis Request" that pair only a top-level
+# project name with generic filler words and carry no entity ID
+def _has_concrete_topic_words(tokens: list[str], non_generic: list[str]) -> bool:
+  if not non_generic:
+    return False
+  # Preserve entity-anchored fallback topics like "crbug/576664769 Skia issue" from cl_watcher
+  if "ENTITY_ID_TOKEN" not in tokens and all(
+      t.lower() in BARE_PROJECT_TOPIC_WORDS for t in non_generic
+  ):
+    return False
+  return True
 
 
 def is_valid_chat_topic(topic: str) -> bool:
@@ -438,7 +499,7 @@ def is_valid_chat_topic(topic: str) -> bool:
   tokens, content, non_generic = _analyze_topic_tokens(topic)
   if len(tokens) < 2 or len(content) < 2:
     return False
-  return bool(non_generic)
+  return _has_concrete_topic_words(tokens, non_generic)
 
 
 def validate_chat_topic(topic: str) -> str:
@@ -452,7 +513,7 @@ def validate_chat_topic(topic: str) -> str:
         ' subsystem/feature/bug/PR/CL and action (e.g. "PR #194980 multi-span BiDi",'
         ' "FontCollection FaceCache thread safety").'
     )
-  if not non_generic:
+  if not _has_concrete_topic_words(tokens, non_generic):
     raise InvalidTopicError(
         f"Invalid chat title topic {clean!r}: overly generic title composed only of"
         " filler words. Pass a specific 2-6 word topic (< 50 chars) naming the concrete"
@@ -2080,6 +2141,11 @@ def parse_title_marker(title: str) -> str:
   return m.group(1) if m else ""
 
 
+# Distinguishes [HH:MM] <marker> lifecycle titles from raw Jetski LS auto-titles
+def has_lifecycle_title_prefix(title: str) -> bool:
+  return bool(parse_title_marker(title))
+
+
 # Reads the archived flag the LS mirrors into annotations/<id>.pbtxt
 def is_archived(conv_id: str) -> bool:
   for app_dir in find_app_data_dirs():
@@ -2169,6 +2235,11 @@ def _extract_prompt_subject_words(text: str, max_words: int = 4) -> str:
     subject_tokens.append(t)
     if len(subject_tokens) >= max_words:
       break
+  # Drop bare product names so "Check Chromium bug <url>" stays a bare entity ID for refinement
+  if subject_tokens and all(
+      t.lower() in BARE_PROJECT_TOPIC_WORDS for t in subject_tokens
+  ):
+    return ""
   res = " ".join(subject_tokens)
   return res[:32].rstrip()
 
@@ -2374,8 +2445,19 @@ _ENTITY_GERRIT_URL_RE = re.compile(
 )
 _ENTITY_GITHUB_PR_URL_RE = re.compile(r"https?://github\.com/[^/\s]+/[^/\s]+/pull/(\d+)")
 _ENTITY_GITHUB_ISSUE_URL_RE = re.compile(r"https?://github\.com/[^/\s]+/[^/\s]+/issues/(\d+)")
+# Route Chromium IssueTracker hosts (including g-issues.chromium.org and /u/N/) to crbug/<id>
+_ENTITY_CRBUG_URL_RE = re.compile(
+    r"https?://(?:(?:[a-z0-9-]+[-.])?issues\.chromium\.org/(?:u/\d+/)?issues/"
+    r"|crbug\.com/)(\d+)",
+    re.IGNORECASE,
+)
+# Match corp Buganizer, public issuetracker.google.com, issues.skia.org, and http://b/<id>
 _ENTITY_BUG_URL_RE = re.compile(
-    r"https?://(?:issues\.chromium\.org|b\.corp\.google\.com)/issues/(\d+)"
+    r"https?://(?:(?:b|buganizer|partnerissuetracker)\.corp\.google\.com"
+    r"|(?:[a-z0-9-]+[-.])?(?:issuetracker\.google\.com|issues\.skia\.org))"
+    r"/(?:u/\d+/)?issues/(\d+)"
+    r"|https?://b/(\d+)\b",
+    re.IGNORECASE,
 )
 _ENTITY_COMMIT_URL_RE = re.compile(
     r"https?://(?:github\.com/[^/\s]+/[^/\s]+/commit|"
@@ -2433,9 +2515,12 @@ def extract_entity_topic(text: str) -> str | None:
   m = _ENTITY_GITHUB_ISSUE_URL_RE.search(text)
   if m:
     return f"Issue #{m.group(1)}"
+  m = _ENTITY_CRBUG_URL_RE.search(text)
+  if m:
+    return f"crbug/{m.group(1)}"
   m = _ENTITY_BUG_URL_RE.search(text)
   if m:
-    return f"b/{m.group(1)}"
+    return f"b/{m.group(1) or m.group(2)}"
   m = _ENTITY_COMMIT_URL_RE.search(text)
   if m:
     return f"commit {m.group(1)[:8]}"
@@ -2472,16 +2557,16 @@ def auto_title_conversation(conv_id: str, prompt: str) -> str:
     return ""
   cur_title = get_conversation_title(conv_id)
   cur_base = clean_base_title(cur_title)
-  # Respect existing valid title: never overwrite a chat that already
-  # has a specific multi-word topic
-  if cur_title and TIME_PREFIX_RE.match(cur_title.strip()) and is_valid_chat_topic(cur_base):
+  # Respect existing valid lifecycle title: never overwrite a chat that already
+  # has a [HH:MM] <marker> prefix and a specific multi-word topic
+  if cur_title and has_lifecycle_title_prefix(cur_title) and is_valid_chat_topic(cur_base):
     return ""
   entity = extract_entity_topic(prompt)
   if not entity:
     return ""
   subj = _extract_prompt_subject_words(prompt, max_words=3)
   topic = f"{entity} {subj}"[:42].rstrip() if subj else entity
-  if cur_base == topic and TIME_PREFIX_RE.match((cur_title or "").strip()):
+  if cur_base == topic and has_lifecycle_title_prefix(cur_title):
     return ""
   # Use validate=False so single-word/bare-entity auto-titles set the base topic without crashing
   return set_conversation_topic(conv_id, topic, validate=False)

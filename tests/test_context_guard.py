@@ -940,6 +940,20 @@ class TestContextGuard(unittest.TestCase):
       out_rm = self.run_guard(inv=0, lastUserInput="check roadmap")
       self.assertNotIn("[CONFIG SYNC]", self.message(out_rm))
 
+  # Raw Jetski LS auto-titles lack [HH:MM] markers and must still arm pending_title_guard
+  def test_raw_ls_title_without_lifecycle_prefix_triggers_title_guard(self):
+    for raw_ls_title in (
+        "Chromium Bug Analysis Request",
+        "Google Bug Analysis",
+        "Fontations Stream OOM Crash",
+    ):
+      self.mock_db.return_value = (raw_ls_title, "proj-1")
+      with patch.object(chat_lifecycle, "auto_title_conversation", return_value=""):
+        out = self.run_guard(inv=0, lastUserInput="Help investigate this crash")
+      msg = self.message(out)
+      self.assertIn("[TITLE GUARD: CONCRETE TOPIC REQUIRED]", msg, raw_ls_title)
+      self.assertTrue(self.state().get("pending_title_guard"), raw_ls_title)
+
 
 if __name__ == "__main__":
   unittest.main()

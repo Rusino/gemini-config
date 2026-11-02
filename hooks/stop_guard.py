@@ -1151,10 +1151,18 @@ def title_guard_reason(info: dict, state: dict, conv_id: str) -> str:
   if not state.get("pending_title_guard"):
     return ""
   try:
-    from chat_lifecycle import clean_base_title, get_conversation_title, is_valid_chat_topic
+    from chat_lifecycle import (
+        clean_base_title,
+        get_conversation_title,
+        has_lifecycle_title_prefix,
+        is_valid_chat_topic,
+    )
 
     cur_title = get_conversation_title(conv_id)
-    if is_valid_chat_topic(clean_base_title(cur_title)):
+    # Require both [HH:MM] <marker> and a concrete topic so raw LS titles cannot bypass set-title
+    if has_lifecycle_title_prefix(cur_title) and is_valid_chat_topic(
+        clean_base_title(cur_title)
+    ):
       return ""
   except Exception:
     return ""

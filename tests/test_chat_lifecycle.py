@@ -243,6 +243,15 @@ class TestChatLifecycle(unittest.TestCase):
         ("Issue https://github.com/flutter/flutter/issues/99887", "Issue #99887"),
         ("Fix bug b/345678901 in layout", "b/345678901"),
         ("Inspect crbug.com/1234567", "crbug/1234567"),
+        (
+            "Посмотри на баг https://g-issues.chromium.org/issues/468570189 и скажи, что и как",
+            "crbug/468570189",
+        ),
+        ("Check https://issues.chromium.org/u/0/issues/576664769", "crbug/576664769"),
+        ("See https://crbug.com/40045539", "crbug/40045539"),
+        ("Bug https://b.corp.google.com/issues/345678901", "b/345678901"),
+        ("Bug https://buganizer.corp.google.com/u/1/issues/580403511", "b/580403511"),
+        ("Bug https://issuetracker.google.com/issues/299111222", "b/299111222"),
         ("Broken in commit a1b2c3d4e5f678", "commit a1b2c3d4"),
         ("Check cl/1397896", "cl/1397896"),
         ("СЛ 1397896 что там происходит", "cl/1397896"),
@@ -2034,6 +2043,14 @@ class TestChatLifecycle(unittest.TestCase):
         "CL",
         "cl 99",
         "General work",
+        "Chromium Bug Analysis Request",
+        "Chromium Bug Analysis",
+        "Google Bug Analysis",
+        "Skia Code Review",
+        "Flutter Issue Triage",
+        "Android Bug Report",
+        "Посмотри на этот баг",
+        "Please look at this bug",
     ]:
       self.assertFalse(chat_lifecycle.is_valid_chat_topic(bad), f"Expected '{bad}' rejected")
       with self.assertRaises(chat_lifecycle.InvalidTopicError):
@@ -2046,6 +2063,9 @@ class TestChatLifecycle(unittest.TestCase):
         "Тест № 2",
         "Ban single-word and generic chat titles",
         "Audit visible chats",
+        "crbug/468570189 Fontations streamToData OOM",
+        "Skia roll triage",
+        "crbug/576664769 Skia issue",
     ]:
       self.assertTrue(chat_lifecycle.is_valid_chat_topic(good), f"Expected '{good}' accepted")
       self.assertEqual(chat_lifecycle.validate_chat_topic(good), good)
@@ -2372,6 +2392,35 @@ class TestChatLifecycle(unittest.TestCase):
           start_body["customAgentSpec"]["cascadeConfig"]["plannerConfig"]["planModel"],
           "MODEL_PLACEHOLDER_M260",
       )
+
+  def test_has_lifecycle_title_prefix_and_raw_ls_auto_title_override(self):
+    self.assertFalse(chat_lifecycle.has_lifecycle_title_prefix(""))
+    self.assertFalse(chat_lifecycle.has_lifecycle_title_prefix("Chromium Bug Analysis Request"))
+    self.assertFalse(chat_lifecycle.has_lifecycle_title_prefix("Fontations Stream OOM Crash"))
+    self.assertTrue(
+        chat_lifecycle.has_lifecycle_title_prefix("[10:08] ⦿ crbug/468570189 Fontations OOM")
+    )
+    self.assertTrue(chat_lifecycle.has_lifecycle_title_prefix("[10:08] ⏳ Canary-G3 watch"))
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      ann_dir = os.path.join(tmp_dir, chat_lifecycle.ANNOTATIONS_DIR_NAME)
+      os.makedirs(ann_dir, exist_ok=True)
+      with open(os.path.join(ann_dir, "d717673f.pbtxt"), "w", encoding="utf-8") as f:
+        f.write('title:"Chromium Bug Analysis Request"\n')
+
+      with (
+          patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]),
+          patch.object(chat_lifecycle, "update_conversation_title_rpc", return_value=False),
+          patch.object(chat_lifecycle, "get_current_time_str", return_value="10:08"),
+      ):
+        res = chat_lifecycle.auto_title_conversation(
+            "d717673f",
+            "Посмотри на баг https://g-issues.chromium.org/issues/468570189 и скажи, что и как",
+        )
+        self.assertEqual(res, "[10:08] ⦿ crbug/468570189")
+        self.assertFalse(
+            chat_lifecycle.is_valid_chat_topic(chat_lifecycle.clean_base_title(res))
+        )
 
 
 if __name__ == "__main__":
