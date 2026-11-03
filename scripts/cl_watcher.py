@@ -34,10 +34,12 @@ import http.server
 import json
 import os
 import re
+import shutil
 import socket
 import socketserver
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any
@@ -200,6 +202,10 @@ CF_BUG_MERGE_MILESTONE = "1340419"
 CF_BUG_FIXED_BY_CODE_CHANGES = "1358989"
 CF_BUG_AUTO_CHERRY_PICK = "1419876"
 RE_MERGE_TITLE_MILESTONE = re.compile(r"^\[Merge\s+M(\d+)\]\s*(.*)$", re.IGNORECASE)
+ANTIGRAVITY_SDK_CLI = (
+    "/google/bin/releases/gemini-agents-antigravity-sdk/antigravity_sdk_cli"
+)
+CANARY_SOAK_MIN_SEC = 24 * 3600.0
 RE_CUSTOM_FIELD_ID = re.compile(r"\((\d+)\)\s*$")
 RE_CHERRY_PICKED_FROM = re.compile(
     r"\(cherry picked from commit ([0-9a-f]{10,40})\)", re.IGNORECASE
@@ -7717,9 +7723,15 @@ def parse_buganizer_blocks(output_text: str) -> list[dict[str, Any]]:
         elif k == "Custom Field Value":
           if "Component Tags" in pending_cf and not entry["component_tags"]:
             entry["component_tags"] = val
+          # Concatenate repeated Custom Field Value entries under their numeric field ID
           m_cf = RE_CUSTOM_FIELD_ID.search(pending_cf)
-          if m_cf:
-            entry["custom_fields"][m_cf.group(1)] = val
+          if m_cf and val:
+            cf_id = m_cf.group(1)
+            prev_cf = entry["custom_fields"].get(cf_id, "")
+            if not prev_cf:
+              entry["custom_fields"][cf_id] = val
+            elif val not in prev_cf:
+              entry["custom_fields"][cf_id] = f"{prev_cf}, {val}"
           pending_cf = ""
       results.append(_finalize_buganizer_entry(entry))
     return results
@@ -8950,6 +8962,1146 @@ def link_bugs_and_cls(
       rec["linked_bugs"] = b_badges
 
 
+def _is_self_bug_assignee(assignee: str) -> bool:
+  """Returns True when `assignee` includes one of the user's Buganizer or GitHub identities."""
+  self_lower = {e.lower() for e in SELF_BUG_EMAILS} | {
+      u.lower() for u in SELF_GITHUB_LOGINS
+  }
+  tokens = [
+      t.strip().lower() for t in re.split(r"[,\s]+", assignee or "") if t.strip()
+  ]
+  return any(t in self_lower for t in tokens)
+
+
+def is_security_merge_request(bug: dict[str, Any]) -> bool:
+  """Checks all 7 release-blintz predicates for an active auto-cherry-pick merge request."""
+  if str(bug.get("source") or "buganizer") != "buganizer":
+    return False
+  status = str(bug.get("status") or "").upper()
+  if status not in ("NEW", "ASSIGNED", "ACCEPTED", "OPEN"):
+    return False
+  if str(bug.get("reporter") or "").strip().lower() != SECURITY_MERGE_REPORTER:
+    return False
+  if extract_merge_milestone(str(bug.get("title") or "")) is None:
+    return False
+  if not str(bug.get("parent_issue_id") or "").strip():
+    return False
+  if str(bug.get("component_id") or "").strip() != SECURITY_MERGE_COMPONENT_ID:
+    return False
+  if bool(bug.get("is_collaborator")) or not _is_self_bug_assignee(
+      str(bug.get("assignee") or "")
+  ):
+    return False
+  cf = bug.get("custom_fields") if isinstance(bug.get("custom_fields"), dict) else {}
+  if str(cf.get(CF_BUG_MERGE) or "").strip().lower() != "pending":
+    return False
+  if str(cf.get(CF_BUG_AUTO_CHERRY_PICK) or "").strip().lower() != "yes":
+    return False
+  return True
+
+
+def _parse_gerrit_host_and_cl_urls(raw_text: str) -> list[tuple[str, str, str]]:
+  """Returns deduplicated `(host, cl_id, normalized_url)` tuples from Gerrit URL text."""
+  seen: set[tuple[str, str]] = set()
+  out: list[tuple[str, str, str]] = []
+  for m in RE_GERRIT_ANY_URL_ID.finditer(raw_text or ""):
+    norm_url = _normalize_public_gerrit_url(m.group(0))
+    parsed = urllib.parse.urlparse(norm_url)
+    host = parsed.netloc.lower() or GERRIT_SKIA_HOST
+    cid = m.group(1)
+    if (host, cid) not in seen:
+      seen.add((host, cid))
+      out.append((host, cid, norm_url))
+  return out
+
+
+def _refresh_skia_merge_refs(skia_dir: str, milestones: list[int]) -> None:
+  """Fetches origin/main and requested chrome/m<NN> milestone refs in local Skia."""
+  if not skia_dir or not os.path.isdir(skia_dir):
+    return
+  unique_ms = sorted(set(milestones))
+  refspecs = ["refs/heads/main:refs/remotes/origin/main"] + [
+      f"refs/heads/chrome/m{ms}:refs/remotes/origin/chrome/m{ms}"
+      for ms in unique_ms
+  ]
+  res = subprocess.run(
+      ["git", "-C", skia_dir, "fetch", "origin", *refspecs, "--quiet"],
+      stdout=subprocess.DEVNULL,
+      stderr=subprocess.DEVNULL,
+      timeout=25,
+      check=False,
+  )
+  # Retry per-ref when a newly requested milestone branch does not exist on origin yet
+  if res.returncode != 0:
+    for spec in refspecs:
+      subprocess.run(
+          ["git", "-C", skia_dir, "fetch", "origin", spec, "--quiet"],
+          stdout=subprocess.DEVNULL,
+          stderr=subprocess.DEVNULL,
+          timeout=12,
+          check=False,
+      )
+
+
+def _fetch_merge_cl_detail(host: str, cl_id: str) -> dict[str, Any]:
+  """Fetches Gerrit status, merged commit SHA, subject, and touched file paths for a CL."""
+  try:
+    data = _gerrit_http_get_json(
+        host,
+        f"/changes/{cl_id}?o=CURRENT_REVISION&o=CURRENT_COMMIT&o=CURRENT_FILES",
+        timeout=10,
+    )
+    if not isinstance(data, dict):
+      return {"ok": False, "cl_id": str(cl_id)}
+    project = str(data.get("project") or "")
+    if project == "skia":
+      repo = "Skia"
+    elif project == "chromium/src":
+      repo = "Chromium"
+    else:
+      repo = project.rsplit("/", 1)[-1].capitalize() or "Skia"
+    cur_rev = str(data.get("current_revision") or "")
+    rev_obj = (data.get("revisions") or {}).get(cur_rev) or {}
+    files_obj = rev_obj.get("files") if isinstance(rev_obj, dict) else {}
+    files = sorted(
+        str(p)
+        for p in (files_obj or {}).keys()
+        if str(p) and str(p) != "/COMMIT_MSG"
+    )
+    commit_obj = rev_obj.get("commit") if isinstance(rev_obj, dict) else {}
+    subject = str(
+        (commit_obj or {}).get("subject") or data.get("subject") or ""
+    ).strip()
+    url = (
+        f"https://{host}/c/{project}/+/{cl_id}"
+        if project
+        else f"https://{host}/c/{cl_id}"
+    )
+    return {
+        "ok": True,
+        "cl_id": str(cl_id),
+        "url": url,
+        "host": host,
+        "project": project,
+        "branch": str(data.get("branch") or ""),
+        "repo": repo,
+        "status": str(data.get("status") or "").upper(),
+        "sha": cur_rev,
+        "short_sha": cur_rev[:10],
+        "subject": subject,
+        "submitted": str(data.get("submitted") or data.get("updated") or ""),
+        "files": files,
+    }
+  except (OSError, urllib.error.URLError, ValueError, KeyError):
+    return {"ok": False, "cl_id": str(cl_id)}
+
+
+def _is_git_ancestor(repo_dir: str, anc_sha: str, desc_ref: str) -> bool:
+  """Returns True when `anc_sha` is an ancestor of `desc_ref` in `repo_dir`."""
+  if not repo_dir or not os.path.isdir(repo_dir) or not anc_sha or not desc_ref:
+    return False
+  try:
+    res = subprocess.run(
+        ["git", "-C", repo_dir, "merge-base", "--is-ancestor", anc_sha, desc_ref],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=8,
+        check=False,
+    )
+    return res.returncode == 0
+  except (OSError, subprocess.SubprocessError):
+    return False
+
+
+def _parse_chrome_version_tuple(ver: str) -> tuple[int, ...]:
+  parts = [p for p in (ver or "").strip().split(".") if p.isdigit()]
+  return tuple(int(p) for p in parts) if len(parts) >= 3 else ()
+
+
+def _http_get_json_direct(url: str, timeout: int = 8) -> Any:
+  req = urllib.request.Request(url, headers={"User-Agent": "CLFlightDeck/1.0"})
+  with urllib.request.urlopen(req, timeout=timeout) as resp:
+    return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+
+def _fetch_skia_roll_and_canary(
+    skia_dir: str, fix_shas: list[str], latest_submitted: str
+) -> dict[str, Any]:
+  """Finds the first Chromium Roll Skia commit containing `fix_shas` and its Canary soak start."""
+  base_ts = _parse_ts(latest_submitted) or (time.time() - 7 * 86400.0)
+  after_d = datetime.fromtimestamp(base_ts - 86400.0, tz=timezone.utc).strftime(
+      "%Y-%m-%d"
+  )
+  before_d = datetime.fromtimestamp(
+      base_ts + 14 * 86400.0, tz=timezone.utc
+  ).strftime("%Y-%m-%d")
+  q = (
+      "/changes/?q=project:chromium/src+status:merged+%22Roll+Skia+from%22"
+      f"+after:{after_d}+before:{before_d}&n=90&o=CURRENT_REVISION&o=CURRENT_COMMIT"
+  )
+  try:
+    raw_changes = _gerrit_http_get_json(GERRIT_CHROMIUM_HOST, q, timeout=12)
+  except (OSError, urllib.error.URLError, ValueError):
+    return {"rolled": False}
+  if not isinstance(raw_changes, list):
+    return {"rolled": False}
+
+  cands: list[tuple[float, dict[str, Any]]] = []
+  for ch in raw_changes:
+    if isinstance(ch, dict):
+      sub_ts = _parse_ts(ch.get("submitted") or ch.get("updated") or "")
+      if sub_ts > 0:
+        cands.append((sub_ts, ch))
+  cands.sort(key=lambda pair: pair[0])
+
+  roll_sha = ""
+  roll_cl_id = ""
+  roll_ts = 0.0
+  for sub_ts, ch in cands:
+    cur_rev = str(ch.get("current_revision") or "")
+    rev_obj = (ch.get("revisions") or {}).get(cur_rev) or {}
+    msg = str(((rev_obj.get("commit") or {}).get("message")) or "")
+    subj = str(ch.get("subject") or "")
+    m_log = re.search(r"\+log/[0-9a-f]{7,40}\.\.([0-9a-f]{7,40})\b", msg)
+    m_subj = re.search(
+        r"Roll\s+Skia\s+from\s+[0-9a-f]{7,40}\s+to\s+([0-9a-f]{7,40})\b",
+        subj,
+        re.IGNORECASE,
+    )
+    target_skia = m_log.group(1) if m_log else (m_subj.group(1) if m_subj else "")
+    if target_skia and all(
+        _is_git_ancestor(skia_dir, fsha, target_skia) for fsha in fix_shas
+    ):
+      roll_sha = cur_rev
+      roll_cl_id = str(ch.get("_number") or "")
+      roll_ts = sub_ts
+      break
+
+  if not roll_sha:
+    return {"rolled": False}
+
+  try:
+    dt_roll = datetime.fromtimestamp(roll_ts, tz=ZoneInfo("America/New_York"))
+  except (OSError, ValueError):
+    dt_roll = datetime.fromtimestamp(roll_ts, tz=timezone.utc)
+  roll_date_str = f"{dt_roll.strftime('%b')} {dt_roll.day}"
+
+  # Prefer ChromiumDash shipped Canary version and release timestamp when reachable
+  canary_ver = ""
+  canary_ts = 0.0
+  dash_reached = False
+  earliest_tuple: tuple[int, ...] = ()
+  try:
+    fc = _http_get_json_direct(
+        f"https://chromiumdash.appspot.com/fetch_commit?commit={roll_sha}",
+        timeout=8,
+    )
+    if isinstance(fc, dict):
+      dash_reached = True
+      earliest_tuple = _parse_chrome_version_tuple(str(fc.get("earliest") or ""))
+  except (OSError, urllib.error.URLError, ValueError):
+    pass
+
+  # Query Windows Canary first and Mac second because Chrome has no Linux Canary channel
+  for plat in ("Windows", "Mac"):
+    try:
+      rels = _http_get_json_direct(
+          "https://chromiumdash.appspot.com/fetch_releases"
+          f"?channel=Canary&platform={plat}&num=35",
+          timeout=8,
+      )
+    except (OSError, urllib.error.URLError, ValueError):
+      continue
+    if not isinstance(rels, list) or not rels:
+      continue
+    dash_reached = True
+    ordered = sorted(rels, key=lambda r: float((r or {}).get("time") or 0.0))
+    for rel in ordered:
+      if not isinstance(rel, dict):
+        continue
+      ver_s = str(rel.get("version") or "").strip()
+      ver_t = _parse_chrome_version_tuple(ver_s)
+      rel_skia = str(((rel.get("hashes") or {}).get("skia")) or "").strip()
+      matches_ver = bool(earliest_tuple and ver_t and ver_t >= earliest_tuple)
+      matches_skia = bool(
+          rel_skia
+          and all(_is_git_ancestor(skia_dir, fsha, rel_skia) for fsha in fix_shas)
+      )
+      if matches_ver or matches_skia:
+        canary_ver = ver_s
+        raw_ms = float(rel.get("time") or 0.0)
+        canary_ts = raw_ms / 1000.0 if raw_ms > 1e11 else raw_ms
+        break
+    if canary_ver:
+      break
+
+  return {
+      "rolled": True,
+      "roll_sha": roll_sha,
+      "roll_cl_id": roll_cl_id,
+      "roll_ts": roll_ts,
+      "roll_date_str": roll_date_str,
+      "canary_version": canary_ver,
+      "canary_ts": canary_ts,
+      # Fall back to roll_ts only when ChromiumDash is unreachable; if reachable and absent, wait
+      "in_canary": bool(canary_ver) or not dash_reached,
+  }
+
+
+def _check_skia_main_revert(
+    skia_dir: str, sha: str, subject: str
+) -> tuple[bool, str]:
+  """Checks that `sha` exists locally and has not been reverted on `origin/main`."""
+  if not skia_dir or not os.path.isdir(skia_dir):
+    return False, "Local Skia repository checkout is missing"
+  cat_res = subprocess.run(
+      ["git", "-C", skia_dir, "cat-file", "-e", f"{sha}^{{commit}}"],
+      stdout=subprocess.DEVNULL,
+      stderr=subprocess.DEVNULL,
+      timeout=8,
+      check=False,
+  )
+  if cat_res.returncode != 0:
+    return False, f"Fix commit {sha[:10]} not found in local Skia checkout"
+
+  log_res = subprocess.run(
+      [
+          "git",
+          "-C",
+          skia_dir,
+          "log",
+          "--format=%H%x1f%s%x1f%b%x1e",
+          f"{sha}..refs/remotes/origin/main",
+      ],
+      capture_output=True,
+      text=True,
+      timeout=12,
+      check=False,
+  )
+  if log_res.returncode != 0:
+    return False, "Could not inspect origin/main history in Skia checkout"
+
+  rev_pat = re.compile(
+      rf"This reverts commit {re.escape(sha[:10])}[0-9a-f]*", re.IGNORECASE
+  )
+  subj_clean = (subject or "").strip()
+  for rec in log_res.stdout.split("\x1e"):
+    rec_s = rec.strip()
+    if not rec_s:
+      continue
+    parts = rec_s.split("\x1f")
+    if len(parts) < 3:
+      continue
+    c_sha, c_subj, c_body = parts[0].strip(), parts[1].strip(), parts[2]
+    is_subj_rev = bool(
+        subj_clean and c_subj.lower() == f'revert "{subj_clean}"'.lower()
+    )
+    if rev_pat.search(c_body) or is_subj_rev:
+      msg = f"Fix {sha[:10]} was reverted on Skia main by {c_sha[:10]} ({c_subj})"
+      return False, msg
+  return True, ""
+
+
+def _trial_cherry_pick_skia(
+    skia_dir: str,
+    fix_shas: list[str],
+    milestone: int,
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+  """Runs a detached temporary worktree `git cherry-pick -x` onto `chrome/m<NN>`."""
+  if not skia_dir or not os.path.isdir(skia_dir):
+    return {
+        "ok": False,
+        "milestone": milestone,
+        "conflicts": [],
+        "reason": f"Local Skia checkout unavailable for chrome/m{milestone}",
+    }
+  tip_sha = ""
+  for ref in (
+      f"refs/remotes/origin/chrome/m{milestone}",
+      f"refs/heads/chrome/m{milestone}",
+  ):
+    rev_res = subprocess.run(
+        ["git", "-C", skia_dir, "rev-parse", "--verify", f"{ref}^{{commit}}"],
+        capture_output=True,
+        text=True,
+        timeout=8,
+        check=False,
+    )
+    if rev_res.returncode == 0 and rev_res.stdout.strip():
+      tip_sha = rev_res.stdout.strip()
+      break
+  if not tip_sha:
+    return {
+        "ok": False,
+        "milestone": milestone,
+        "conflicts": [],
+        "reason": f"Branch chrome/m{milestone} not found in Skia repository",
+    }
+
+  cache_key = f"{','.join(fix_shas)}|m{milestone}|{tip_sha}"
+  cp_cache = (
+      state.setdefault("merge_cherry_pick_cache", {})
+      if isinstance(state, dict)
+      else None
+  )
+  if isinstance(cp_cache, dict) and isinstance(cp_cache.get(cache_key), dict):
+    return dict(cp_cache[cache_key])
+
+  wt_dir = tempfile.mkdtemp(prefix=f"fd_cp_m{milestone}_")
+  try:
+    add_res = subprocess.run(
+        ["git", "-C", skia_dir, "worktree", "add", "--detach", wt_dir, tip_sha],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if add_res.returncode != 0:
+      out = {
+          "ok": False,
+          "milestone": milestone,
+          "conflicts": [],
+          "reason": f"Failed to create trial worktree for chrome/m{milestone}",
+      }
+    else:
+      cp_res = subprocess.run(
+          [
+              "git",
+              "-C",
+              wt_dir,
+              "-c",
+              "user.name=Flight Deck",
+              "-c",
+              "user.email=jlavrova@google.com",
+              "cherry-pick",
+              "-x",
+              *fix_shas,
+          ],
+          capture_output=True,
+          text=True,
+          timeout=20,
+          check=False,
+      )
+      if cp_res.returncode == 0:
+        out = {
+            "ok": True,
+            "milestone": milestone,
+            "conflicts": [],
+            "reason": "",
+        }
+      else:
+        diff_res = subprocess.run(
+            ["git", "-C", wt_dir, "diff", "--name-only", "--diff-filter=U"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        conflicts = sorted({
+            ln.strip() for ln in diff_res.stdout.splitlines() if ln.strip()
+        })
+        subprocess.run(
+            ["git", "-C", wt_dir, "cherry-pick", "--abort"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+            check=False,
+        )
+        if conflicts:
+          reason = (
+              f"Cherry-pick conflict on chrome/m{milestone}: "
+              f"{', '.join(conflicts)}"
+          )
+        else:
+          err_snip = " ".join((cp_res.stderr or cp_res.stdout or "").split())[:140]
+          reason = (
+              f"Cherry-pick failed on chrome/m{milestone}: "
+              f"{err_snip or 'non-zero exit'}"
+          )
+        out = {
+            "ok": False,
+            "milestone": milestone,
+            "conflicts": conflicts,
+            "reason": reason,
+        }
+  finally:
+    subprocess.run(
+        ["git", "-C", skia_dir, "worktree", "remove", "--force", wt_dir],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=12,
+        check=False,
+    )
+    shutil.rmtree(wt_dir, ignore_errors=True)
+    subprocess.run(
+        ["git", "-C", skia_dir, "worktree", "prune"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=8,
+        check=False,
+    )
+
+  if isinstance(cp_cache, dict):
+    if len(cp_cache) >= 256:
+      cp_cache.clear()
+    cp_cache[cache_key] = dict(out)
+  return out
+
+
+def _join_english_list(items: list[str]) -> str:
+  if not items:
+    return ""
+  if len(items) == 1:
+    return items[0]
+  if len(items) == 2:
+    return f"{items[0]} and {items[1]}"
+  return f"{', '.join(items[:-1])}, and {items[-1]}"
+
+
+def _format_merge_branches(milestones: list[int]) -> str:
+  if not milestones:
+    return "Skia release branches"
+  first = f"Skia chrome/m{milestones[0]}"
+  if len(milestones) == 1:
+    return first
+  tail = [f"m{ms}" for ms in milestones[1:]]
+  return _join_english_list([first, *tail])
+
+
+def _summarize_merge_diff_risk(
+    skia_dir: str,
+    fix_cls: list[dict[str, Any]],
+    *,
+    state: dict[str, Any] | None = None,
+    allow_llm: bool = False,
+) -> str:
+  """Drafts a concise regression-risk clause from the git diff with deterministic fallback."""
+  fix_shas = [str(c.get("sha") or "") for c in fix_cls if c.get("sha")]
+  cache_key = ",".join(fix_shas)
+  summaries = (
+      state.setdefault("merge_risk_summaries", {})
+      if isinstance(state, dict)
+      else None
+  )
+  if isinstance(summaries, dict) and summaries.get(cache_key):
+    return str(summaries[cache_key])
+
+  prod_files: list[str] = []
+  add_lines = 0
+  del_lines = 0
+  diff_chunks: list[str] = []
+  if skia_dir and os.path.isdir(skia_dir):
+    for sha in fix_shas:
+      ns_res = subprocess.run(
+          ["git", "-C", skia_dir, "show", "--numstat", "--format=", sha],
+          capture_output=True,
+          text=True,
+          timeout=8,
+          check=False,
+      )
+      for ln in ns_res.stdout.splitlines():
+        cols = ln.split("\t")
+        if len(cols) == 3:
+          fpath = cols[2].strip()
+          if not fpath.startswith("tests/"):
+            if fpath not in prod_files:
+              prod_files.append(fpath)
+            if cols[0].isdigit():
+              add_lines += int(cols[0])
+            if cols[1].isdigit():
+              del_lines += int(cols[1])
+      if allow_llm:
+        sh_res = subprocess.run(
+            ["git", "-C", skia_dir, "show", "--stat", "--unified=3", sha],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if sh_res.returncode == 0 and sh_res.stdout:
+          diff_chunks.append(sh_res.stdout[:8000])
+
+  if allow_llm and diff_chunks and os.path.isfile(ANTIGRAVITY_SDK_CLI):
+    prompt = (
+        "Complete the clause after 'Regression risk is low: ' in 12 to 25 plain "
+        "technical English words summarizing what this Skia security fix diff "
+        "changes and why regression risk is low. Output ONLY that single clause "
+        "(no 'Regression risk is low:' prefix, no quotes, no trailing period, "
+        "no markdown bullets).\n\n"
+        + "\n\n".join(diff_chunks)[:12000]
+    )
+    try:
+      sdk_res = subprocess.run(
+          [ANTIGRAVITY_SDK_CLI, "--generate", f"--prompt={prompt}"],
+          capture_output=True,
+          text=True,
+          timeout=38,
+          check=False,
+      )
+      raw_lines: list[str] = []
+      for ln in sdk_res.stdout.splitlines():
+        s_ln = ln.strip()
+        if s_ln.startswith("Logs for language server ->"):
+          log_path = s_ln.split("->", 1)[1].strip()
+          if log_path.startswith("/tmp/agy_") and os.path.isfile(log_path):
+            try:
+              os.remove(log_path)
+            except OSError:
+              pass
+          continue
+        if s_ln.startswith("If this is your first time running the language server"):
+          continue
+        if s_ln:
+          raw_lines.append(s_ln)
+      cand = " ".join(raw_lines).strip().strip("\"'")
+      cand = re.sub(
+          r"^regression\s+risk\s+is\s+low\s*:\s*", "", cand, flags=re.IGNORECASE
+      ).rstrip(".")
+      if 12 <= len(cand) <= 240:
+        if cand[0].isupper() and not cand.split(" ", 1)[0].startswith("Sk"):
+          cand = cand[0].lower() + cand[1:]
+        if isinstance(summaries, dict):
+          summaries[cache_key] = cand
+        return cand
+    except (OSError, subprocess.SubprocessError):
+      pass
+
+  if not prod_files:
+    for c in fix_cls:
+      for fpath in c.get("files") or []:
+        if not str(fpath).startswith("tests/") and str(fpath) not in prod_files:
+          prod_files.append(str(fpath))
+  target_desc = (
+      _join_english_list(prod_files[:2])
+      if prod_files
+      else "the affected Skia component"
+  )
+  if len(prod_files) > 2:
+    rem = len(prod_files) - 2
+    target_desc = f"{', '.join(prod_files[:2])}, and {rem} other file(s)"
+  delta_part = (
+      f" (+{add_lines}/-{del_lines} non-test lines)"
+      if (add_lines or del_lines)
+      else ""
+  )
+  fallback = (
+      f"the change is localized to {target_desc}{delta_part} with unit test coverage"
+  )
+  if isinstance(summaries, dict) and allow_llm:
+    summaries[cache_key] = fallback
+  return fallback
+
+
+def _normalize_os_tokens(raw_os: str) -> list[str]:
+  return sorted(
+      {tok.strip() for tok in (raw_os or "").split(",") if tok.strip()},
+      key=str.lower,
+  )
+
+
+def evaluate_security_merge_groups(
+    bugs: dict[str, dict[str, Any]],
+    *,
+    skia_dir: str = DEFAULT_SKIA_DIR,
+    now_ts: float | None = None,
+    state: dict[str, Any] | None = None,
+    parent_lookup: dict[str, dict[str, Any]] | None = None,
+    allow_llm: bool = False,
+) -> dict[str, dict[str, Any]]:
+  """Groups active Security merge requests by parent bug and evaluates all 6 merge gates."""
+  cur_now = time.time() if now_ts is None else now_ts
+  lookup = parent_lookup if isinstance(parent_lookup, dict) else bugs
+  confirmed_bugs = (
+      state.get("confirmed_merge_bugs")
+      if isinstance(state, dict)
+      and isinstance(state.get("confirmed_merge_bugs"), dict)
+      else {}
+  )
+
+  by_parent: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+  all_milestones: set[int] = set()
+  for bug in bugs.values():
+    if not isinstance(bug, dict) or not is_security_merge_request(bug):
+      continue
+    ms = extract_merge_milestone(str(bug.get("title") or ""))
+    pid = str(bug.get("parent_issue_id") or "").strip()
+    if ms is None or not pid:
+      continue
+    by_parent.setdefault(pid, []).append((ms, bug))
+    all_milestones.add(ms)
+
+  if not by_parent:
+    return {}
+
+  _refresh_skia_merge_refs(skia_dir, sorted(all_milestones))
+
+  groups: dict[str, dict[str, Any]] = {}
+  for parent_id, pairs in sorted(by_parent.items()):
+    pairs.sort(key=lambda item: (item[0], str(item[1].get("id") or "")))
+    milestones = sorted({ms for ms, _ in pairs})
+    parent = lookup.get(f"buganizer:{parent_id}") or bugs.get(
+        f"buganizer:{parent_id}"
+    )
+    parent_dict = parent if isinstance(parent, dict) else {}
+    parent_cf = (
+        parent_dict.get("custom_fields")
+        if isinstance(parent_dict.get("custom_fields"), dict)
+        else {}
+    )
+
+    first_child = pairs[0][1]
+    m_strip = RE_MERGE_TITLE_MILESTONE.match(str(first_child.get("title") or ""))
+    fallback_title = (
+        m_strip.group(2).strip()
+        if m_strip
+        else str(first_child.get("title") or "")
+    )
+    parent_title = str(parent_dict.get("title") or fallback_title).strip()
+    proj_name = str(
+        parent_dict.get("project_name")
+        or first_child.get("project_name")
+        or "Skia"
+    )
+    proj_id = str(
+        parent_dict.get("project_id") or first_child.get("project_id") or ""
+    )
+    for _, child_b in pairs:
+      child_b["is_security_merge_request"] = True
+      child_b["merge_group_parent_id"] = parent_id
+      if proj_name and proj_name != "Unassigned":
+        child_b["project_name"] = proj_name
+        child_b["project_id"] = proj_id
+
+    blocking_reasons: list[str] = []
+
+    # Require parent custom field 1358989 "Fixed By Code Changes" to list merged Skia CLs
+    raw_fixed_by = str(parent_cf.get(CF_BUG_FIXED_BY_CODE_CHANGES) or "").strip()
+    parsed_fixed = _parse_gerrit_host_and_cl_urls(raw_fixed_by)
+    fix_cls: list[dict[str, Any]] = []
+    g1_ok = True
+    g1_reason = ""
+    if not parent_dict:
+      g1_ok = False
+      g1_reason = f"Parent crbug/{parent_id} metadata could not be loaded"
+    elif not raw_fixed_by or raw_fixed_by.upper() in ("NA", "N/A"):
+      g1_ok = False
+      g1_reason = (
+          f"Parent crbug/{parent_id} custom field 'Fixed By Code Changes' "
+          "(1358989) is empty"
+      )
+    elif not parsed_fixed:
+      g1_ok = False
+      g1_reason = (
+          "Parent 'Fixed By Code Changes' has no valid Gerrit URL: "
+          f"{raw_fixed_by[:100]}"
+      )
+    else:
+      for host, cid, _ in parsed_fixed:
+        det = _fetch_merge_cl_detail(host, cid)
+        if not det.get("ok"):
+          g1_ok = False
+          g1_reason = f"Could not fetch Gerrit details for fix CL {cid}"
+          break
+        if str(det.get("status") or "").upper() != "MERGED" or not det.get("sha"):
+          g1_ok = False
+          g1_reason = (
+              f"Fix CL {cid} is not merged yet "
+              f"(status: {det.get('status') or 'UNKNOWN'})"
+          )
+          break
+        if str(det.get("project") or "") != "skia":
+          g1_ok = False
+          g1_reason = (
+              f"Fix CL {cid} belongs to {det.get('project') or host} "
+              "(automated cherry-pick supports Skia only)"
+          )
+          break
+        fix_cls.append(det)
+    if not g1_ok and g1_reason:
+      blocking_reasons.append(g1_reason)
+
+    # Require every other CL on parent Code Changes to touch only tests/ (fail closed on empty)
+    fixed_ids = {c["cl_id"] for c in fix_cls} | {cid for _, cid, _ in parsed_fixed}
+    parent_cl_ids = [
+        str(cid)
+        for cid in (parent_dict.get("gerrit_cl_ids") or [])
+        if str(cid) and str(cid) not in fixed_ids
+    ]
+    parent_urls = (
+        parent_dict.get("gerrit_cl_urls")
+        if isinstance(parent_dict.get("gerrit_cl_urls"), dict)
+        else {}
+    )
+    followup_cls: list[dict[str, Any]] = []
+    g2_ok = bool(parent_dict)
+    g2_reason = ""
+    for f_cid in parent_cl_ids:
+      raw_u = str(parent_urls.get(f_cid) or "")
+      parsed_u = _parse_gerrit_host_and_cl_urls(raw_u)
+      f_host = parsed_u[0][0] if parsed_u else GERRIT_SKIA_HOST
+      f_det = _fetch_merge_cl_detail(f_host, f_cid)
+      if not f_det.get("ok"):
+        g2_ok = False
+        g2_reason = f"Could not inspect follow-up CL {f_cid} on parent issue"
+        blocking_reasons.append(g2_reason)
+        continue
+      # Ignore release-branch cherry-picks already linked back to the parent bug
+      if str(f_det.get("branch") or "").startswith("chrome/m"):
+        continue
+      f_files = [str(p) for p in (f_det.get("files") or []) if str(p)]
+      if not f_files:
+        g2_ok = False
+        g2_reason = (
+            f"Follow-up CL {f_cid} returned an empty file list "
+            "(cannot prove tests/-only)"
+        )
+        blocking_reasons.append(g2_reason)
+        continue
+      non_test = [p for p in f_files if not p.startswith("tests/")]
+      if non_test:
+        g2_ok = False
+        g2_reason = (
+            f"Follow-up CL {f_cid} touches production files "
+            f"({', '.join(non_test[:3])}) and may also need a merge"
+        )
+        blocking_reasons.append(g2_reason)
+        continue
+      followup_cls.append(f_det)
+
+    # Require at least 24h Canary soak (ChromiumDash Canary preferred, Roll Skia fallback)
+    canary_info: dict[str, Any] = {}
+    soak_days = 0
+    soak_hours = 0.0
+    g3_ok = False
+    g3_reason = ""
+    if g1_ok and fix_cls:
+      fix_shas = [str(c["sha"]) for c in fix_cls]
+      sub_times = sorted(
+          (str(c.get("submitted") or "") for c in fix_cls),
+          key=_parse_ts,
+      )
+      latest_sub = sub_times[-1] if sub_times else ""
+      canary_info = _fetch_skia_roll_and_canary(skia_dir, fix_shas, latest_sub)
+      if not canary_info.get("rolled"):
+        g3_reason = "Fix has not rolled into Chromium main yet"
+      elif not canary_info.get("in_canary"):
+        r_date = str(canary_info.get("roll_date_str") or "recently")
+        g3_reason = f"Rolled into Chromium ({r_date}), waiting for Canary release"
+      else:
+        soak_start_ts = float(canary_info.get("canary_ts") or 0.0) or float(
+            canary_info.get("roll_ts") or 0.0
+        )
+        if soak_start_ts <= 0.0:
+          g3_reason = "Could not determine Chromium roll / Canary soak start time"
+        else:
+          soak_sec = cur_now - soak_start_ts
+          soak_hours = round(max(0.0, soak_sec) / 3600.0, 1)
+          soak_days = max(0, int(soak_sec // 86400))
+          if soak_sec < CANARY_SOAK_MIN_SEC:
+            ready_ts = soak_start_ts + CANARY_SOAK_MIN_SEC
+            try:
+              dt_ready = datetime.fromtimestamp(
+                  ready_ts, tz=ZoneInfo("America/New_York")
+              )
+              wait_str = dt_ready.strftime("%b %d, %H:%M ET")
+            except (OSError, ValueError):
+              dt_ready = datetime.fromtimestamp(ready_ts, tz=timezone.utc)
+              wait_str = dt_ready.strftime("%b %d, %H:%M UTC")
+            hrs = max(0, int(soak_sec // 3600))
+            g3_reason = f"Canary soak under 24h ({hrs}h) — wait until {wait_str}"
+          else:
+            g3_ok = True
+      if not g3_ok and g3_reason:
+        blocking_reasons.append(g3_reason)
+
+    # Verify that no fix commit was reverted on Skia origin/main
+    g4_ok = False
+    g4_reason = ""
+    if g1_ok and fix_cls:
+      g4_ok = True
+      for c in fix_cls:
+        ok_rev, rev_msg = _check_skia_main_revert(
+            skia_dir, str(c["sha"]), str(c.get("subject") or "")
+        )
+        if not ok_rev:
+          g4_ok = False
+          g4_reason = rev_msg
+          blocking_reasons.append(rev_msg)
+          break
+
+    # Verify clean trial cherry-pick -x onto every target chrome/m<NN> branch
+    cp_results: list[dict[str, Any]] = []
+    g5_ok = False
+    g5_reason = ""
+    if g1_ok and fix_cls:
+      fix_shas = [str(c["sha"]) for c in fix_cls]
+      g5_ok = True
+      for ms in milestones:
+        cp_res = _trial_cherry_pick_skia(skia_dir, fix_shas, ms, state=state)
+        cp_results.append(cp_res)
+        if not cp_res.get("ok"):
+          g5_ok = False
+          r_txt = str(cp_res.get("reason") or f"Cherry-pick failed on chrome/m{ms}")
+          if not g5_reason:
+            g5_reason = r_txt
+          blocking_reasons.append(r_txt)
+
+    # Surface OS custom field (1223084) mismatch against parent as a non-blocking warning
+    parent_os_tokens = _normalize_os_tokens(str(parent_cf.get(CF_BUG_OS) or ""))
+    os_mismatches: list[str] = []
+    requests_out: list[dict[str, Any]] = []
+    for ms, child_b in pairs:
+      c_cf = (
+          child_b.get("custom_fields")
+          if isinstance(child_b.get("custom_fields"), dict)
+          else {}
+      )
+      c_os_tokens = _normalize_os_tokens(str(c_cf.get(CF_BUG_OS) or ""))
+      if c_os_tokens != parent_os_tokens:
+        os_mismatches.append(f"M{ms} ({', '.join(c_os_tokens) or 'empty'})")
+      bid = str(child_b.get("id") or "")
+      already_done = bool(
+          _parse_ts(child_b.get("last_self_comment_at")) > 0.0
+          or bid in confirmed_bugs
+      )
+      requests_out.append({
+          "id": bid,
+          "bug_key": str(child_b.get("bug_key") or f"buganizer:{bid}"),
+          "short_id": str(child_b.get("short_id") or f"crbug/{bid}"),
+          "milestone": ms,
+          "url": str(
+              child_b.get("url") or f"https://issues.chromium.org/issues/{bid}"
+          ),
+          "os": ", ".join(c_os_tokens),
+          "already_commented": already_done,
+      })
+
+    os_match_ok = len(os_mismatches) == 0 and bool(parent_os_tokens)
+    os_warning = ""
+    if os_mismatches:
+      p_os_str = ", ".join(parent_os_tokens) or "empty"
+      os_warning = f"OS mismatch vs parent ({p_os_str}): {'; '.join(os_mismatches)}"
+    elif not parent_os_tokens and parent_dict:
+      os_warning = f"Parent crbug/{parent_id} OS field (1223084) is empty"
+
+    hard_gates_ok = bool(g1_ok and g2_ok and g3_ok and g4_ok and g5_ok)
+    comment_draft = ""
+    if hard_gates_ok:
+      fix_parts = [
+          f"{c['url']} ({c['repo']} {c['short_sha']})" for c in fix_cls
+      ]
+      sentences = [f"Fix: {', '.join(fix_parts)}."]
+      if len(followup_cls) == 1:
+        f_id = followup_cls[0]["cl_id"]
+        sentences.append(f"The test-only follow-up {f_id} does not need a merge.")
+      elif len(followup_cls) > 1:
+        f_list_str = _join_english_list([c["cl_id"] for c in followup_cls])
+        sentences.append(
+            f"The test-only follow-ups {f_list_str} do not need a merge."
+        )
+      roll_d = str(canary_info.get("roll_date_str") or "trunk")
+      day_word = "day" if soak_days == 1 else "days"
+      sentences.append(
+          f"It rolled into Chromium on {roll_d} and has soaked in Canary for "
+          f"{soak_days} {day_word} without known issues."
+      )
+      if os_match_ok:
+        sentences.append("OS list is correct.")
+      risk_clause = _summarize_merge_diff_risk(
+          skia_dir, fix_cls, state=state, allow_llm=allow_llm
+      )
+      sentences.append(f"Regression risk is low: {risk_clause}.")
+      branches_str = _format_merge_branches(milestones)
+      sentences.append(
+          f"It cherry-picks cleanly onto {branches_str}. Requesting merge approval."
+      )
+      comment_draft = " ".join(sentences)
+
+    ms_label = "/".join(f"M{ms}" for ms in milestones)
+    priorities = sorted(
+        str(b.get("priority") or "P2").upper() for _, b in pairs
+    )
+    severities = sorted(
+        str(b.get("severity") or "").upper()
+        for _, b in pairs
+        if str(b.get("severity") or "").strip()
+    )
+    groups[parent_id] = {
+        "group_key": f"merge_group:{parent_id}",
+        "parent_id": parent_id,
+        "parent_short_id": str(
+            parent_dict.get("short_id") or f"crbug/{parent_id}"
+        ),
+        "parent_url": str(
+            parent_dict.get("url")
+            or f"https://issues.chromium.org/issues/{parent_id}"
+        ),
+        "parent_title": parent_title,
+        "project_id": proj_id,
+        "project_name": proj_name,
+        "priority": priorities[0] if priorities else "P1",
+        "severity": severities[0] if severities else "",
+        "milestones": milestones,
+        "milestones_label": ms_label,
+        "button_label": f"Подтвердить merge {ms_label}",
+        "requests": requests_out,
+        "all_already_commented": all(
+            bool(r.get("already_commented")) for r in requests_out
+        ),
+        "hard_gates_ok": hard_gates_ok,
+        "blocking_reasons": blocking_reasons,
+        "os_warning": os_warning,
+        "comment_draft": comment_draft,
+        "gates": {
+            "fixed_by_cls": {
+                "ok": g1_ok,
+                "cls": [
+                    {
+                        "cl_id": c["cl_id"],
+                        "url": c["url"],
+                        "short_sha": c["short_sha"],
+                    }
+                    for c in fix_cls
+                ],
+                "reason": g1_reason,
+            },
+            "test_only_followups": {
+                "ok": g2_ok,
+                "followups": [c["cl_id"] for c in followup_cls],
+                "reason": g2_reason,
+            },
+            "canary_soak": {
+                "ok": g3_ok,
+                "rolled": bool(canary_info.get("rolled")),
+                "roll_date_str": str(canary_info.get("roll_date_str") or ""),
+                "roll_cl_id": str(canary_info.get("roll_cl_id") or ""),
+                "canary_version": str(canary_info.get("canary_version") or ""),
+                "soak_days": soak_days,
+                "soak_hours": soak_hours,
+                "reason": g3_reason,
+            },
+            "no_revert": {"ok": g4_ok, "reason": g4_reason},
+            "cherry_pick": {"ok": g5_ok, "results": cp_results, "reason": g5_reason},
+            "os_match": {
+                "ok": os_match_ok,
+                "parent_os": ", ".join(parent_os_tokens),
+                "warning": os_warning,
+            },
+        },
+    }
+  return groups
+
+
+def confirm_security_merge_group(
+    parent_id: str, comment_override: str = ""
+) -> dict[str, Any]:
+  """Posts the merge approval comment via Buganizer MCP and adds safe-cc (never reassigns)."""
+  pid = str(parent_id or "").strip().removeprefix("merge_group:")
+  if not pid:
+    return {"ok": False, "error": "Missing parent_id"}
+  state = load_watcher_state()
+  groups = state.get("merge_request_groups") or {}
+  grp = groups.get(pid)
+  if not isinstance(grp, dict):
+    return {"ok": False, "error": f"Unknown merge group {pid}"}
+  if not grp.get("hard_gates_ok"):
+    return {"ok": False, "error": "Cannot confirm merge while hard gates fail"}
+
+  comment_md = str(comment_override or grp.get("comment_draft") or "").strip()
+  if not comment_md:
+    return {"ok": False, "error": "Merge comment draft is empty"}
+
+  requests = [
+      r for r in (grp.get("requests") or []) if isinstance(r, dict) and r.get("id")
+  ]
+  if not requests:
+    return {"ok": False, "error": "No merge request issues in group"}
+
+  confirmed_map = state.setdefault("confirmed_merge_bugs", {})
+  bugs_map = state.get("bugs") or {}
+  errors: list[str] = []
+  commented_ids: list[str] = []
+  cc_ids: list[str] = []
+
+  to_comment = [r for r in requests if not r.get("already_commented")]
+  comment_ok_ids: set[str] = {
+      str(r["id"]) for r in requests if r.get("already_commented")
+  }
+  if to_comment:
+    mcp_calls = [
+        (
+            "add_buganizer_comment",
+            {"issueId": str(r["id"]), "commentMarkdown": comment_md},
+        )
+        for r in to_comment
+    ]
+    mcp_outs = call_buganizer_mcp_batch(mcp_calls, timeout_sec=30.0)
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for r, out_txt in zip(to_comment, mcp_outs):
+      bid = str(r["id"])
+      clean_out = (out_txt or "").strip()
+      if clean_out and not clean_out.lower().startswith(("error", "failed")):
+        r["already_commented"] = True
+        comment_ok_ids.add(bid)
+        commented_ids.append(bid)
+        confirmed_map[bid] = {"ts": time.time(), "parent_id": pid}
+        b_rec = bugs_map.get(f"buganizer:{bid}")
+        if isinstance(b_rec, dict):
+          b_rec["last_self_comment_at"] = now_iso
+          classify_bug_status(b_rec)
+      else:
+        snip = clean_out[:120] or "empty response"
+        errors.append(f"crbug/{bid}: MCP comment failed ({snip})")
+
+  # Only safe-cc is permitted here; reassignment runs separately on explicit user action
+  for r in requests:
+    bid = str(r["id"])
+    if bid not in comment_ok_ids:
+      continue
+    try:
+      cc_res = subprocess.run(
+          [
+              ISSUES_CLI_BIN,
+              "mutate",
+              "update",
+              "safe-cc",
+              bid,
+              "jlavrova@google.com",
+          ],
+          capture_output=True,
+          text=True,
+          timeout=15,
+          check=False,
+      )
+      if cc_res.returncode == 0:
+        cc_ids.append(bid)
+      else:
+        err_msg = (cc_res.stderr or cc_res.stdout or "").strip()[:120]
+        errors.append(
+            f"crbug/{bid}: safe-cc exited {cc_res.returncode} ({err_msg})"
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+      errors.append(f"crbug/{bid}: safe-cc error ({exc})")
+
+  grp["all_already_commented"] = all(
+      bool(r.get("already_commented")) for r in requests
+  )
+  save_watcher_state(state)
+  urls = [
+      str(r.get("url") or f"https://issues.chromium.org/issues/{r['id']}")
+      for r in requests
+  ]
+  return {
+      "ok": len(errors) == 0,
+      "parent_id": pid,
+      "urls": urls,
+      "commented_ids": commented_ids,
+      "cc_ids": cc_ids,
+      "errors": errors,
+  }
+
+
 def classify_bug_status(
     bug: dict[str, Any], now_ts: float | None = None
 ) -> dict[str, Any]:
@@ -8965,6 +10117,11 @@ def classify_bug_status(
   bug["why_needs_you"] = ""
   bug["is_stale_backlog"] = False
   bug["merge_action_phase"] = ""
+  is_sec_merge = is_security_merge_request(bug)
+  bug["is_security_merge_request"] = is_sec_merge
+  bug["merge_group_parent_id"] = (
+      str(bug.get("parent_issue_id") or "").strip() if is_sec_merge else ""
+  )
   is_merge_req = is_merge_request_bug(bug)
   bug["is_merge_request_bug"] = is_merge_req
   ms_num = _bug_merge_milestone(bug) if is_merge_req else None
@@ -9223,17 +10380,6 @@ def classify_bug_status(
   )
   bug["lane"] = "assigned"
   return bug
-
-
-def _is_self_bug_assignee(assignee: str) -> bool:
-  """Returns True when `assignee` includes one of the user's Buganizer or GitHub identities."""
-  self_lower = {e.lower() for e in SELF_BUG_EMAILS} | {
-      u.lower() for u in SELF_GITHUB_LOGINS
-  }
-  tokens = [
-      t.strip().lower() for t in re.split(r"[,\s]+", assignee or "") if t.strip()
-  ]
-  return any(t in self_lower for t in tokens)
 
 
 def should_autostart_bug_triage(bug: dict[str, Any]) -> bool:
@@ -9751,6 +10897,7 @@ def sync_bugs_into_state(
     force: bool = False,
     wake_chats: bool = True,
     proj_names: dict[str, str] | None = None,
+    skia_dir: str = DEFAULT_SKIA_DIR,
 ) -> None:
   """Polls Buganizer/crbug and GitHub issues with a 5-min TTL and links them to CLs."""
   pnames = proj_names if proj_names is not None else load_project_names()
@@ -9767,13 +10914,21 @@ def sync_bugs_into_state(
   if not force and prev_bugs and (now_ts - last_bug_ts) < BUG_SYNC_TTL_SEC:
     # Refresh chat links, CL subtasks, and prune stale non-self entries between 5-min polls
     link_bugs_and_cls(prev_bugs, items, bug_chats=merged_chats)
+    fast_merge_parents = {
+        f"buganizer:{str(b.get('parent_issue_id')).strip()}"
+        for b in prev_bugs.values()
+        if isinstance(b, dict)
+        and is_merge_request_bug(b)
+        and str(b.get("parent_issue_id") or "").strip().isdigit()
+        and _should_retain_bug_in_view(b)
+    }
     pruned_fast: dict[str, dict[str, Any]] = {}
     for bk, b in prev_bugs.items():
       if not isinstance(b, dict):
         continue
       if bk in bug_acks:
         b["acked_ts"] = max(float(b.get("acked_ts") or 0.0), float(bug_acks[bk] or 0.0))
-      if not _should_retain_bug_in_view(b):
+      if bk not in fast_merge_parents and not _should_retain_bug_in_view(b):
         continue
       pruned_fast[bk] = b
     for b in pruned_fast.values():
@@ -9781,6 +10936,16 @@ def sync_bugs_into_state(
       classify_bug_status(b, now_ts=now_ts)
     attach_merge_children_to_cls_and_bugs(pruned_fast, items)
     state["bugs"] = pruned_fast
+    active_pids = {
+        str(b.get("merge_group_parent_id") or "")
+        for b in pruned_fast.values()
+        if b.get("is_security_merge_request") and b.get("merge_group_parent_id")
+    }
+    prev_groups = state.get("merge_request_groups")
+    if isinstance(prev_groups, dict):
+      state["merge_request_groups"] = {
+          pid: grp for pid, grp in prev_groups.items() if pid in active_pids
+      }
     return
 
   # Gather external bug IDs referenced by tracked CLs/PRs (for badges and self-CL bugs)
@@ -9846,7 +11011,7 @@ def sync_bugs_into_state(
   }
   parent_bz_ids = {
       str(b.get("parent_issue_id") or "").strip()
-      for b in fetched_bz
+      for b in (*fetched_bz, *(v for v in prev_bugs.values() if isinstance(v, dict)))
       if isinstance(b, dict) and str(b.get("parent_issue_id") or "").strip().isdigit()
   }
   missing_bz_ids = sorted(
@@ -9980,6 +11145,14 @@ def sync_bugs_into_state(
 
   attach_merge_children_to_cls_and_bugs(retained_bugs, items)
   state["bugs"] = retained_bugs
+  state["merge_request_groups"] = evaluate_security_merge_groups(
+      retained_bugs,
+      skia_dir=skia_dir,
+      now_ts=now_ts,
+      state=state,
+      parent_lookup=all_bugs,
+      allow_llm=True,
+  )
 
   review_claims: dict[str, Any] = state.setdefault("review_claims", {})
   busy_cids: set[str] = set()
@@ -10003,6 +11176,9 @@ def sync_bugs_into_state(
   auto_started_bugs = 0
 
   for bkey, bug in retained_bugs.items():
+    # Security merge requests are handled via the grouped merge card, not bug-triage chats
+    if bug.get("is_security_merge_request"):
+      continue
     prev_b = prev_bugs.get(bkey) if isinstance(prev_bugs.get(bkey), dict) else {}
     # Wake active bug chat when a new human comment arrives upstream
     # Require human_ts > max(self_ts, acked_ts) so self replies or non-comment Needs Me never wake
@@ -11233,6 +12409,7 @@ def sync_once(
         force=force_bugs,
         wake_chats=wake_chats,
         proj_names=proj_names,
+        skia_dir=skia_dir,
     )
     present_ikeys = {
         str(r.get("item_key") or "")
@@ -12060,6 +13237,35 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   details.subtask-more > summary::-webkit-details-marker { display: none; }
   details.subtask-more[open] > .subtask-more-body { margin-top: 3px; display: grid; gap: 3px; }
+  .merge-gates {
+    margin-top: 5px; display: flex; flex-wrap: wrap; gap: 4px; font-size: 10.5px;
+  }
+  .merge-gate-pill {
+    display: inline-flex; align-items: center; gap: 3px; padding: 1px 6px;
+    border-radius: 6px; font-weight: 500;
+    background: color-mix(in srgb, var(--green) 14%, transparent); color: var(--green);
+  }
+  .merge-gate-pill.fail {
+    background: color-mix(in srgb, var(--red) 14%, transparent); color: var(--red);
+  }
+  .merge-warn {
+    grid-column: 1 / -1; margin-top: 5px; padding: 5px 8px; border-radius: 7px;
+    background: color-mix(in srgb, var(--amber) 14%, transparent);
+    border-left: 3px solid var(--amber); color: var(--ink); font-size: 11px;
+  }
+  .merge-blockers {
+    grid-column: 1 / -1; margin-top: 6px; padding: 6px 9px; border-radius: 8px;
+    background: color-mix(in srgb, var(--red) 11%, transparent);
+    border-left: 3px solid var(--red); color: var(--red);
+    font-size: 11px; line-height: 1.4; display: grid; gap: 3px;
+  }
+  .merge-draft-wrap { grid-column: 1 / -1; margin-top: 6px; display: grid; gap: 4px; }
+  .merge-draft-label { font-size: 10px; font-weight: 600; color: var(--graphite); }
+  .merge-comment-draft {
+    width: 100%; border: 1px solid var(--hairline); border-radius: 8px;
+    background: color-mix(in srgb, var(--ink) 3%, var(--card)); color: var(--ink);
+    padding: 7px 9px; font: 11px/1.4 var(--mono); resize: vertical;
+  }
 </style>
 </head>
 <body>
@@ -15241,10 +16447,88 @@ function collapseMergeLaneBugs(bugs, data) {
   return out;
 }
 
+function securityMergeCard(grp) {
+  const reqs = Array.isArray(grp.requests) ? grp.requests : [];
+  const reqLinks = reqs.map(r =>
+    `M${esc(r.milestone)} (${link(r.url, esc(r.short_id || ('crbug/' + r.id)))})`
+  ).join(' · ');
+  const parentShort = grp.parent_short_id || ('crbug/' + grp.parent_id);
+  const gates = grp.gates || {};
+  const cs = gates.canary_soak || {};
+  const gatePills = [];
+  if (gates.fixed_by_cls) {
+    gatePills.push(`<span class="merge-gate-pill${gates.fixed_by_cls.ok ? '' : ' fail'}">` +
+      `${gates.fixed_by_cls.ok ? '✓' : '✗'} Fixed-By CL</span>`);
+  }
+  if (gates.test_only_followups) {
+    gatePills.push(`<span class="merge-gate-pill${gates.test_only_followups.ok ? '' : ' fail'}">` +
+      `${gates.test_only_followups.ok ? '✓' : '✗'} Follow-ups test-only</span>`);
+  }
+  if (cs.canary_version || cs.soak_days !== undefined) {
+    const verTxt = cs.canary_version ? `Canary ${esc(cs.canary_version)} · ` : 'Canary ';
+    const csOk = gates.canary_soak ? Boolean(gates.canary_soak.ok) : Boolean(grp.hard_gates_ok);
+    gatePills.push(`<span class="merge-gate-pill${csOk ? '' : ' fail'}">` +
+      `${csOk ? '✓' : '⏳'} ${verTxt}${esc(cs.soak_days ?? 0)}d soak</span>`);
+  }
+  if (gates.no_revert) {
+    gatePills.push(`<span class="merge-gate-pill${gates.no_revert.ok ? '' : ' fail'}">` +
+      `${gates.no_revert.ok ? '✓' : '✗'} No main revert</span>`);
+  }
+  if (gates.cherry_pick) {
+    gatePills.push(`<span class="merge-gate-pill${gates.cherry_pick.ok ? '' : ' fail'}">` +
+      `${gates.cherry_pick.ok ? '✓' : '✗'} Clean cherry-pick</span>`);
+  }
+  const pillsHtml = gatePills.length ? `<div class="merge-gates">${gatePills.join('')}</div>` : '';
+  const warnHtml = grp.os_warning
+    ? `<div class="merge-warn">⚠️ ${esc(grp.os_warning)}</div>` : '';
+
+  const ackKey = grp.group_key || ('merge_group:' + grp.parent_id);
+  const ackBtn = `<button class="btn secondary" ` +
+    `onclick="ackBug(${esc(JSON.stringify(ackKey))}, this)">✓ Ack</button>`;
+
+  let actionsHtml = '';
+  let bodyExtraHtml = '';
+  if (!grp.hard_gates_ok) {
+    const reasons = Array.isArray(grp.blocking_reasons) && grp.blocking_reasons.length
+      ? grp.blocking_reasons : ['Merge gate check failed'];
+    bodyExtraHtml = `<div class="merge-blockers">` +
+      reasons.map(r => `<div>⛔ ${esc(r)}</div>`).join('') + `</div>`;
+    actionsHtml = `${link(grp.parent_url, 'Open parent', 'btn secondary')}${ackBtn}`;
+  } else {
+    const btnLbl = grp.button_label || `Подтвердить merge ${grp.milestones_label || ''}`.trim();
+    actionsHtml = `<button class="btn primary" ` +
+      `onclick="confirmMerge(${esc(JSON.stringify(grp.parent_id || ''))}, this)">` +
+      `${esc(btnLbl)}</button>` +
+      `${link(grp.parent_url, 'Open parent', 'btn secondary')}${ackBtn}`;
+    bodyExtraHtml = `<div class="merge-draft-wrap">` +
+      `<div class="merge-draft-label">English comment draft (editable before posting):</div>` +
+      `<textarea class="merge-comment-draft" id="merge-draft-${esc(grp.parent_id || '')}" ` +
+      `rows="3">${esc(grp.comment_draft || '')}</textarea></div>`;
+  }
+
+  const badgeBug = {priority: grp.priority || 'P1', severity: grp.severity || ''};
+  const titleTxt = `[Merge ${grp.milestones_label || ''}] ${grp.parent_title || ''}`.trim();
+  return `<article class="card alert">` +
+    `<div><div class="eyebrow">${esc(grp.project_name || 'Skia')} · ` +
+    `Security merge request · Parent ${link(grp.parent_url, esc(parentShort))}` +
+    `${reqLinks ? ` · ${reqLinks}` : ''}</div>` +
+    `<h2>${bugPriorityBadgeHtml(badgeBug)}${link(grp.parent_url, esc(titleTxt))}</h2>` +
+    `${pillsHtml}</div>` +
+    `<div class="actions">${actionsHtml}</div>` +
+    `${warnHtml}${bodyExtraHtml}</article>`;
+}
+
 function groupedMergeFocusCard(siblings, parentId, data) {
-  // Delegate Pending gate evaluation to R70's securityMergeCard when group metadata is present
+  // Delegate Pending gate evaluation to securityMergeCard before comment/reassign phases
+  const phases = new Set(siblings.map(b => String(b.merge_action_phase || '')));
   const mGrp = parentId && data && data.merge_request_groups && data.merge_request_groups[parentId];
-  if (mGrp && typeof securityMergeCard === 'function' && !mGrp.all_already_commented) {
+  if (
+    mGrp &&
+    typeof securityMergeCard === 'function' &&
+    !mGrp.all_already_commented &&
+    !phases.has('reassign') &&
+    !phases.has('manual_cherry_pick')
+  ) {
     return securityMergeCard(mGrp);
   }
   const first = siblings[0];
@@ -15268,10 +16552,9 @@ function groupedMergeFocusCard(siblings, parentId, data) {
   const bulkUrl = issueIds.length
     ? `https://issues.chromium.org/issues?q=id:(${issueIds.join('%20OR%20')})`
     : first.url;
-  const phases = new Set(siblings.map(b => String(b.merge_action_phase || '')));
   let whyTxt = '';
   let primaryBtn = '';
-  if (phases.has('reassign')) {
+  if (phases.has('reassign') || Boolean(mGrp && mGrp.all_already_commented)) {
     whyTxt = `${msJoined} merge comment posted — reassign to merges@chromium.org`;
     primaryBtn = `<button class="btn primary" onclick="reassignMerge(` +
       `${esc(JSON.stringify(issueIds))}, ${esc(JSON.stringify(parentId || ''))}, this)">` +
@@ -16233,6 +17516,39 @@ async function ackBug(bugKey, btn) {
   return ackBugs([bugKey], btn);
 }
 
+async function confirmMerge(parentId, btn) {
+  if (!parentId || (btn && btn.disabled)) return;
+  const orig = btn ? btn.textContent : '';
+  const draftEl = document.getElementById('merge-draft-' + parentId);
+  const commentTxt = draftEl && typeof draftEl.value === 'string' ? draftEl.value : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Posting & CC-ing…';
+  }
+  try {
+    const resp = await fetch('/api/confirm_merge', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({parent_id: parentId, comment: commentTxt}),
+    });
+    const res = await resp.json();
+    if (res && res.ok) {
+      await fetchState(true);
+      return;
+    }
+    if (btn && res) {
+      const errTxt = res.error || (Array.isArray(res.errors) ? res.errors.join('; ') : '');
+      if (errTxt) btn.title = errTxt;
+    }
+  } catch (e) {
+    // Restore button label when the local HTTP call fails
+  }
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
+}
+
 async function reassignMerge(issueIds, parentId, btn, commentMarkdown = '') {
   const ids = Array.isArray(issueIds) ? issueIds.filter(Boolean) : [issueIds].filter(Boolean);
   if ((!ids.length && !parentId) || (btn && btn.disabled)) return;
@@ -16510,6 +17826,7 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
         "/api/open_chat",
         "/api/abandon",
         "/api/ack_bug",
+        "/api/confirm_merge",
         "/api/add_reviewer",
         "/api/approve_review_preview",
         "/api/approve_review",
@@ -16541,6 +17858,11 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
           res = ack_bug_item(
               str(bdict.get("bug_key") or bdict.get("item_key") or "")
           )
+      elif parsed.path == "/api/confirm_merge":
+        res = confirm_security_merge_group(
+            str(bdict.get("parent_id") or ""),
+            str(bdict.get("comment") or ""),
+        )
       elif parsed.path == "/api/reassign_merge":
         raw_ids = bdict.get("issue_ids")
         ids = (
