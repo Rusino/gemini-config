@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PreToolUse hook for Jetski to prevent hallucinations, blind edits, and broken handoffs.
 
-Implements nine mechanical guards:
+Implements ten mechanical guards:
 1. Handoff Command & Post-Handoff Guard:
    - Blocks any file edits or duplicate `new-conversation` calls in a conversation
      that has already handed off in the current turn.
@@ -43,6 +43,9 @@ Implements nine mechanical guards:
      inside a workspace directory that belongs exclusively to another Jetski project,
      unless the user confirmed cross-project execution in a subsequent turn and
      `.cross_project_override.json` was written.
+10. Contextless `ask_question` Guard (`ASK_QUESTION CONTEXT GUARD`):
+   - Blocks `ask_question` when no visible context or per-option breakdown was
+     published immediately before the picker.
 """
 
 # Every gated tool call of every chat runs this file, including the calls that
@@ -57,6 +60,7 @@ import json
 import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import time
@@ -3148,6 +3152,402 @@ def cross_project_write_denial(
   )
 
 
+ASK_QUESTION_MAX_CONSECUTIVE_DENIALS = 3
+ASK_QUESTION_PROCEDURAL_MIN_CHARS = 20
+ASK_QUESTION_CHOICE_MIN_CHARS = 120
+ASK_QUESTION_CHOICE_MIN_LINES = 2
+THOUGHT_TAG_RE = re.compile(r"<thought>[\s\S]*?(?:</thought>|$)", re.IGNORECASE)
+MD_INLINE_LINK_RE = re.compile(r"\[([^\[\]\n]+)\]\([^)\n]+\)")
+VCS_BATON_OPT_RE = re.compile(
+    r"^(?:\(recommended\)\s*)?(?:commit(?:\s*\+\s*push|\s+only)?|not\s+now)$",
+    re.IGNORECASE,
+)
+SIMPLE_DEFERRAL_OPT_RE = re.compile(
+    r"^(?:\(recommended\)\s*)?(?:"
+    r"not\s+now|no\b|skip\b|cancel\b|later\b|keep\s+as[- ]is\b|do\s+nothing\b"
+    r"|пока\s+не\b|пока\s+ничего\b|не\s+сейчас\b|не\s+нужно\b|не\s+начинать\b"
+    r"|нет\b|отложить\b|оставить\s+как\s+есть\b|ничего\s+не\b|подожд\w*"
+    r"|выполнить\s+(?:в\s+этом\s+чате|здесь)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+# Normalize ask_question items across live JSON objects and stringified transcript args
+def _parse_ask_questions(tool_args: dict) -> list[dict]:
+  raw = (
+      tool_args.get("questions")
+      if "questions" in tool_args
+      else tool_args.get("Questions")
+  )
+  if isinstance(raw, str):
+    try:
+      raw = json.loads(raw)
+    except (ValueError, TypeError):
+      return []
+  if not isinstance(raw, list):
+    return []
+  return [q for q in raw if isinstance(q, dict)]
+
+
+def _question_options(question: dict) -> list[str]:
+  opts = (
+      question.get("options")
+      if "options" in question
+      else question.get("Options")
+  )
+  if isinstance(opts, str):
+    try:
+      opts = json.loads(opts)
+    except (ValueError, TypeError):
+      return []
+  if not isinstance(opts, list):
+    return []
+  return [str(o).strip() for o in opts if str(o).strip()]
+
+
+# cruxy-new skill explicitly forbids plain-text output before its starter-kit picker
+def _is_cruxy_new_starter_picker(questions: list[dict]) -> bool:
+  for q in questions:
+    for opt in _question_options(q):
+      if "(search_vibes)" in opt or "(material_genux_kit)" in opt:
+        return True
+  return False
+
+
+# Distinguish procedural yes/no or VCS-baton confirmations from multi-option choices
+def _is_procedural_ask_question(questions: list[dict]) -> bool:
+  if not questions:
+    return True
+  if len(questions) > 1:
+    return False
+  opts = _question_options(questions[0])
+  if not opts:
+    return True
+  if all(VCS_BATON_OPT_RE.match(o) for o in opts):
+    return True
+  if len(opts) <= 2 and any(SIMPLE_DEFERRAL_OPT_RE.match(o) for o in opts):
+    return True
+  return False
+
+
+def _decode_proto_varint(buf: bytes, pos: int) -> tuple[int, int, bool]:
+  val = 0
+  # Hard 10-byte varint cap guarantees termination on malformed payloads
+  for shift in range(0, 70, 7):
+    if pos >= len(buf):
+      return 0, pos, False
+    b = buf[pos]
+    pos += 1
+    val |= (b & 0x7F) << shift
+    if not (b & 0x80):
+      return val, pos, True
+  return 0, pos, False
+
+
+# Unpack CortexStepPlannerResponse (Step field 20 -> field 1 response, 3/9 thinking)
+def _extract_planner_step_from_blob(blob: bytes) -> tuple[str, str]:
+  pos = 0
+  pr_bytes = b""
+  for _ in range(len(blob) + 1):
+    if pos >= len(blob):
+      break
+    tag, pos, ok = _decode_proto_varint(blob, pos)
+    if not ok:
+      break
+    fnum, wtype = tag >> 3, tag & 7
+    if wtype == 0:
+      _, pos, ok = _decode_proto_varint(blob, pos)
+      if not ok:
+        break
+    elif wtype == 1:
+      pos += 8
+    elif wtype == 5:
+      pos += 4
+    elif wtype == 2:
+      ln, pos, ok = _decode_proto_varint(blob, pos)
+      if not ok or ln < 0 or pos + ln > len(blob):
+        break
+      if fnum == 20:
+        pr_bytes = blob[pos : pos + ln]
+        break
+      pos += ln
+    else:
+      break
+
+  resp_parts: list[str] = []
+  think_parts: list[str] = []
+  pos = 0
+  for _ in range(len(pr_bytes) + 1):
+    if pos >= len(pr_bytes):
+      break
+    tag, pos, ok = _decode_proto_varint(pr_bytes, pos)
+    if not ok:
+      break
+    fnum, wtype = tag >> 3, tag & 7
+    if wtype == 0:
+      _, pos, ok = _decode_proto_varint(pr_bytes, pos)
+      if not ok:
+        break
+    elif wtype == 1:
+      pos += 8
+    elif wtype == 5:
+      pos += 4
+    elif wtype == 2:
+      ln, pos, ok = _decode_proto_varint(pr_bytes, pos)
+      if not ok or ln < 0 or pos + ln > len(pr_bytes):
+        break
+      chunk = pr_bytes[pos : pos + ln]
+      pos += ln
+      if fnum == 1:
+        resp_parts.append(chunk.decode("utf-8", "replace"))
+      elif fnum in (3, 9):
+        think_parts.append(chunk.decode("utf-8", "replace"))
+    else:
+      break
+  return "".join(resp_parts), "".join(think_parts)
+
+
+def _resolve_conversation_db_path(conv_id: str, transcript_path: str) -> str:
+  cid = conv_id.strip()
+  norm_tp = transcript_path.strip().replace("\\", "/")
+  if not cid and "/brain/" in norm_tp:
+    after = norm_tp.split("/brain/", 1)[1]
+    cid = after.split("/", 1)[0].strip()
+  if not cid:
+    return ""
+  # Explicit env override keeps unit tests hermetic against real ~/.gemini/jetski DBs
+  env_dir = os.environ.get("JETSKI_CONVERSATIONS_DIR", "").strip()
+  if env_dir:
+    cand = os.path.join(os.path.expanduser(env_dir), f"{cid}.db")
+    return cand if os.path.isfile(cand) else ""
+  if "/brain/" in norm_tp:
+    app_root = norm_tp.split("/brain/", 1)[0]
+    cand = os.path.join(app_root, "conversations", f"{cid}.db")
+    return cand if os.path.isfile(cand) else ""
+  if transcript_path.strip():
+    return ""
+  from context_guard import APP_DATA_DIR_CANDIDATES
+
+  for app_dir in APP_DATA_DIR_CANDIDATES:
+    cand = os.path.join(os.path.expanduser(app_dir), "conversations", f"{cid}.db")
+    if os.path.isfile(cand):
+      return cand
+  return ""
+
+
+# Read an in-flight GENERATING planner step before TranscriptLogDecorator flushes DONE
+def _read_live_sqlite_planner_step(
+    db_path: str, min_exclusive_idx: int, current_step_idx: int
+) -> dict | None:
+  if not db_path or not os.path.isfile(db_path):
+    return None
+  conn = None
+  try:
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.5)
+    row = conn.execute(
+        "SELECT idx, step_format, step_payload FROM steps "
+        "WHERE step_type = 15 AND idx > ? AND (? < 0 OR idx < ?) "
+        "ORDER BY idx DESC LIMIT 1",
+        (min_exclusive_idx, current_step_idx, current_step_idx),
+    ).fetchone()
+  except sqlite3.Error:
+    return None
+  finally:
+    if conn is not None:
+      conn.close()
+  if not row:
+    return None
+  idx, step_fmt, payload = row
+  if step_fmt != 0 or not payload:
+    return None
+  resp, think = _extract_planner_step_from_blob(bytes(payload))
+  return {
+      "step_index": int(idx),
+      "type": "PLANNER_RESPONSE",
+      "content": resp,
+      "thinking": think,
+      "tool_calls": [{"name": "ask_question"}],
+  }
+
+
+# Strip hidden <thought> blocks and URL targets so link lengths do not mask stub text
+def _visible_prose_metrics(text: str) -> tuple[str, int, int]:
+  if not text:
+    return "", 0, 0
+  visible = THOUGHT_TAG_RE.sub("", text).strip()
+  if not visible:
+    return "", 0, 0
+  prose = MD_INLINE_LINK_RE.sub(r"\1", visible).strip()
+  lines = [ln.strip() for ln in prose.splitlines() if ln.strip()]
+  return visible, len(prose), len(lines)
+
+
+# Match only answered or context-denied ask_question outputs, not sibling tool denials
+def _is_completed_ask_generic(content: str, error: str = "") -> bool:
+  stripped = content.lstrip()
+  return (
+      "\nA1:" in content
+      or stripped.startswith("A1:")
+      or "[ASK_QUESTION CONTEXT GUARD]" in content
+      or "[ASK_QUESTION CONTEXT GUARD]" in error
+  )
+
+
+# Require visible explanation / options breakdown immediately before ask_question
+def ask_question_context_denial(
+    tool_args: dict,
+    conv_id: str,
+    transcript_path: str,
+    current_step_idx: int = -1,
+) -> str:
+  questions = _parse_ask_questions(tool_args)
+  if _is_cruxy_new_starter_picker(questions):
+    return ""
+
+  effective_tp = transcript_path.strip()
+  if os.path.basename(effective_tp) == "transcript.jsonl":
+    full_cand = os.path.join(os.path.dirname(effective_tp), "transcript_full.jsonl")
+    if os.path.isfile(full_cand):
+      effective_tp = full_cand
+
+  db_path = _resolve_conversation_db_path(conv_id, transcript_path)
+  has_tx = bool(effective_tp and os.path.isfile(effective_tp))
+  if not has_tx and not db_path:
+    return ""
+
+  steps = _load_transcript_steps(effective_tp, current_step_idx) if has_tx else []
+  max_tx_idx = max((int(s.get("step_index", -1)) for s in steps), default=-1)
+  if db_path:
+    live_step = _read_live_sqlite_planner_step(db_path, max_tx_idx, current_step_idx)
+    if live_step is not None:
+      steps.append(live_step)
+
+  # Cap consecutive denials in the same turn so a degraded model always terminates
+  consecutive_denials = 0
+  for st in reversed(steps):
+    st_type = st.get("type", "")
+    st_content = str(st.get("content", "") or "")
+    st_error = str(st.get("error", "") or "")
+    if st_type == "USER_INPUT":
+      break
+    if st_type == "SYSTEM_MESSAGE" and "stop hook blocked termination" not in st_content.lower():
+      break
+    if st_type == "GENERIC":
+      if "\nA1:" in st_content or st_content.lstrip().startswith("A1:"):
+        break
+      if (
+          "[ASK_QUESTION CONTEXT GUARD]" in st_content
+          or "[ASK_QUESTION CONTEXT GUARD]" in st_error
+      ):
+        consecutive_denials += 1
+    elif st_type == "PLANNER_RESPONSE":
+      vis_check, _, _ = _visible_prose_metrics(st_content)
+      if vis_check:
+        break
+  if consecutive_denials >= ASK_QUESTION_MAX_CONSECUTIVE_DENIALS:
+    return ""
+
+  # Skip sibling GENERIC tool outputs emitted earlier inside the same multi-tool step
+  start_idx = len(steps) - 1
+  if start_idx >= 0 and steps[start_idx].get("type") == "GENERIC":
+    cand_idx = start_idx
+    while cand_idx >= 0 and steps[cand_idx].get("type") == "GENERIC":
+      g_txt = str(steps[cand_idx].get("content", "") or "")
+      g_err = str(steps[cand_idx].get("error", "") or "")
+      if _is_completed_ask_generic(g_txt, g_err):
+        cand_idx = -1
+        break
+      cand_idx -= 1
+    if cand_idx >= 0 and steps[cand_idx].get("type") == "PLANNER_RESPONSE":
+      owner_tcs = steps[cand_idx].get("tool_calls") or []
+      owner_step_idx = int(steps[cand_idx].get("step_index", -1))
+      has_ask = any(tc.get("name") == "ask_question" for tc in owner_tcs)
+      within_span = (
+          len(owner_tcs) > (start_idx - cand_idx)
+          if current_step_idx < 0 or owner_step_idx < 0
+          else current_step_idx <= owner_step_idx + len(owner_tcs)
+      )
+      if has_ask and within_span:
+        start_idx = cand_idx
+
+  visible_text = ""
+  prose_len = 0
+  prose_lines = 0
+  saw_thinking_only = False
+  inspected_owner_planner = False
+
+  for i in range(start_idx, -1, -1):
+    st = steps[i]
+    st_type = st.get("type", "")
+    if st_type == "PLANNER_RESPONSE":
+      tcs = st.get("tool_calls") or []
+      # Do not cross an earlier tool-calling planner step into stale status text
+      if inspected_owner_planner and tcs:
+        break
+      vis, p_len, p_lines = _visible_prose_metrics(str(st.get("content", "") or ""))
+      if not inspected_owner_planner:
+        inspected_owner_planner = True
+        if not vis and str(st.get("thinking", "") or "").strip():
+          saw_thinking_only = True
+      if vis:
+        visible_text = vis
+        prose_len = p_len
+        prose_lines = p_lines
+        break
+      continue
+    if st_type == "EPHEMERAL_MESSAGE":
+      continue
+    if st_type == "SYSTEM_MESSAGE":
+      # Allow 2-step recovery when stop_guard asked a plain-text reply to call ask_question
+      if "stop hook blocked termination" in str(st.get("content", "") or "").lower():
+        continue
+      break
+    break
+
+  if not visible_text or prose_len == 0:
+    if saw_thinking_only:
+      return (
+          "[ASK_QUESTION CONTEXT GUARD] Calling `ask_question` with 0 bytes of "
+          "visible response text is blocked: you drafted your analysis inside "
+          "thinking/`<thought>` (hidden from the user), so the user would see ONLY "
+          "the picker card! Emit the full context and per-option breakdown in "
+          "visible Markdown response text BEFORE calling `ask_question`."
+      )
+    return (
+        "[ASK_QUESTION CONTEXT GUARD] Calling `ask_question` without visible "
+        "response text immediately above the picker is blocked (the user would "
+        "see ONLY the picker card!). Publish the full context and per-option "
+        "breakdown in visible Markdown response text in the SAME step BEFORE "
+        "calling `ask_question`."
+    )
+
+  if _is_procedural_ask_question(questions):
+    if prose_len < ASK_QUESTION_PROCEDURAL_MIN_CHARS:
+      return (
+          "[ASK_QUESTION CONTEXT GUARD] Visible text before `ask_question` is too "
+          f"brief ({prose_len} chars < {ASK_QUESTION_PROCEDURAL_MIN_CHARS}). State "
+          "clearly in visible chat text what is being confirmed BEFORE calling "
+          "`ask_question`."
+      )
+    return ""
+
+  if (
+      prose_len < ASK_QUESTION_CHOICE_MIN_CHARS
+      or prose_lines < ASK_QUESTION_CHOICE_MIN_LINES
+  ):
+    return (
+        "[ASK_QUESTION CONTEXT GUARD] Multi-option `ask_question` requires a full "
+        f"visible options breakdown BEFORE the picker (got {prose_len} prose chars "
+        f"across {prose_lines} line(s); need >= {ASK_QUESTION_CHOICE_MIN_CHARS} "
+        f"chars across >= {ASK_QUESTION_CHOICE_MIN_LINES} lines/bullets). Never "
+        "present unexplained options: write out the context, each option's "
+        "trade-offs, and why `(Recommended)` wins in visible Markdown text in the "
+        "SAME step BEFORE calling `ask_question`."
+    )
+  return ""
+
+
 def main() -> None:
   try:
     raw_input = sys.stdin.read().strip()
@@ -3811,6 +4211,22 @@ def main() -> None:
       print(
           json.dumps(
               {"decision": "deny", "reason": exp_denial}, ensure_ascii=False
+          )
+      )
+      return
+
+  # Require visible explanation / options breakdown right above ask_question
+  if tool_name == "ask_question":
+    aq_denial = ask_question_context_denial(
+        tool_args,
+        conv_id,
+        transcript_path,
+        int(data.get("stepIdx", -1)),
+    )
+    if aq_denial:
+      print(
+          json.dumps(
+              {"decision": "deny", "reason": aq_denial}, ensure_ascii=False
           )
       )
       return
