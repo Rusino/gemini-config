@@ -437,6 +437,11 @@ class R71ReviewerWakeupConcurrencyGateTest(unittest.TestCase):
            mock.patch.object(w, "fetch_gerrit_stack_order_ids", return_value=list(stack_ids)), \
            mock.patch.object(w, "fetch_gmail_status_for_id", return_value=self._empty_gmail()), \
            mock.patch.object(w, "overlay_live_chat_busy"), \
+           mock.patch.object(
+               w.audit_gate,
+               "check_audit_preflight",
+               return_value={"ok": True, "reason": ""},
+           ), \
            mock.patch.object(ts, "overlay_triage_on_items"), \
            mock.patch.object(ts, "load_triage_result", return_value=None), \
            mock.patch.object(w, "wake_conversation", return_value=True) as mock_wake:
@@ -483,6 +488,11 @@ class R71ReviewerWakeupConcurrencyGateTest(unittest.TestCase):
            mock.patch.object(w, "fetch_gerrit_stack_order_ids", return_value=list(stack_ids)), \
            mock.patch.object(w, "fetch_gmail_status_for_id", return_value=self._empty_gmail()), \
            mock.patch.object(w, "overlay_live_chat_busy"), \
+           mock.patch.object(
+               w.audit_gate,
+               "check_audit_preflight",
+               return_value={"ok": True, "reason": ""},
+           ), \
            mock.patch.object(ts, "overlay_triage_on_items"), \
            mock.patch.object(ts, "load_triage_result", side_effect=fake_load_triage), \
            mock.patch.object(w, "wake_conversation", return_value=True) as mock_wake3:
@@ -693,6 +703,11 @@ class R71ReviewerWakeupConcurrencyGateTest(unittest.TestCase):
            mock.patch.object(w, "fetch_gmail_status_for_id", return_value=self._empty_gmail()), \
            mock.patch.object(w, "send_desktop_alert"), \
            mock.patch.object(w, "overlay_live_chat_busy"), \
+           mock.patch.object(
+               w.audit_gate,
+               "check_audit_preflight",
+               return_value={"ok": True, "reason": ""},
+           ), \
            mock.patch.object(ts, "overlay_triage_on_items"), \
            mock.patch.object(w, "wake_conversation", return_value=True) as mock_wake:
         state = w.sync_once(wake_chats=True, skia_dir="/nonexistent", sync_bugs=False)
@@ -745,6 +760,11 @@ class R71ReviewerWakeupConcurrencyGateTest(unittest.TestCase):
            ), \
            mock.patch.object(w, "fetch_gmail_status_for_id", return_value=self._empty_gmail()), \
            mock.patch.object(w, "overlay_live_chat_busy"), \
+           mock.patch.object(
+               w.audit_gate,
+               "check_audit_preflight",
+               return_value={"ok": True, "reason": ""},
+           ), \
            mock.patch.object(ts, "overlay_triage_on_items"), \
            mock.patch.object(w, "wake_conversation", return_value=True) as mock_wake_busy:
         state_busy = w.sync_once(wake_chats=True, skia_dir="/nonexistent", sync_bugs=False)

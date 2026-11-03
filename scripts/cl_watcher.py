@@ -6031,12 +6031,13 @@ def _start_chat_for_bug(
       (cand or {}).get("conversation_id") or bug.get("conversation_id") or ""
   ).strip()
   if not active_cid:
-    # Reuse a linked self-authored CL chat when a single fix CL already owns a chat
+    # Reuse a linked 1:1 self-authored CL chat, ignoring multi-bug umbrella CLs
     self_cl_cids = [
         str(sub.get("conversation_id") or "").strip()
         for sub in (bug.get("linked_cls") or [])
         if isinstance(sub, dict)
         and sub.get("is_self")
+        and sub.get("shared_1_to_1", True)
         and sub.get("conversation_id")
     ]
     if len(set(self_cl_cids)) == 1:
@@ -8773,7 +8774,7 @@ def link_bugs_and_cls(
     for bkey in refs:
       _add_edge(bkey, ikey)
 
-  # Pass 1: Propagate an active bug chat onto unchatted self-authored fix CLs
+  # Pass 1: Propagate an active bug chat onto unchatted 1:1 self-authored fix CLs
   for bkey, cl_ikeys in bug_to_cls.items():
     bug = bugs_by_key.get(bkey)
     if not isinstance(bug, dict):
@@ -8786,6 +8787,7 @@ def link_bugs_and_cls(
         for ik in cl_ikeys
         if ik in cl_entries_by_ikey
         and cl_entries_by_ikey[ik][0][1].get("is_self")
+        and len(cl_to_bugs.get(ik, [])) <= 1
     ]
     for ik in self_ikeys:
       for dkey, rec in list(cl_entries_by_ikey[ik]):
@@ -8797,8 +8799,8 @@ def link_bugs_and_cls(
           rec["chat_busy"] = bool(bug.get("chat_busy"))
           cl_entries_by_ikey[ik] = [(f"{ik}@{bcid}", rec)]
 
-  # Pass 2: Propagate an active self-authored CL chat onto its unchatted parent bug;
-  # external reviewer chats (!is_self) remain scoped strictly to the reviewed CL subtask
+  # Pass 2: Propagate an active 1:1 self-authored CL chat onto its unchatted parent bug;
+  # multi-bug umbrella CLs still supply project_name without claiming the bug's conversation
   for bkey, cl_ikeys in bug_to_cls.items():
     bug = bugs_by_key.get(bkey)
     if not isinstance(bug, dict):
@@ -8809,7 +8811,7 @@ def link_bugs_and_cls(
     )
     if has_active_chat and bug.get("project_name") not in ("", "Unassigned", None):
       continue
-    self_chatted: list[dict[str, Any]] = []
+    self_chatted: list[tuple[str, dict[str, Any]]] = []
     for ik in cl_ikeys:
       for _, rec in cl_entries_by_ikey.get(ik, []):
         if (
@@ -8817,13 +8819,13 @@ def link_bugs_and_cls(
             and rec.get("conversation_id")
             and not rec.get("chat_archived")
         ):
-          self_chatted.append(rec)
+          self_chatted.append((ik, rec))
     if self_chatted:
-      chosen = self_chatted[0]
-      if not has_active_chat:
+      chosen_ik, chosen = self_chatted[0]
+      if not has_active_chat and len(cl_to_bugs.get(chosen_ik, [])) <= 1:
         bug["conversation_id"] = str(chosen["conversation_id"])
         bug["chat_archived"] = False
-        bug["chat_busy"] = any(bool(r.get("chat_busy")) for r in self_chatted)
+        bug["chat_busy"] = any(bool(r.get("chat_busy")) for _, r in self_chatted)
       if (
           bug.get("project_name") in ("", "Unassigned", None)
           and chosen.get("project_name")
@@ -8862,6 +8864,7 @@ def link_bugs_and_cls(
             "is_cherry_pick": bool(rec.get("is_cherry_pick")),
             "is_self": bool(rec.get("is_self")),
             "is_wip": bool(rec.get("is_wip") or rec.get("is_draft")),
+            "shared_1_to_1": len(cl_to_bugs.get(ik, [])) <= 1,
             "in_needs_you": bool(
                 rec.get("in_my_attention") 
                 or (rec.get("merge_conflict") and rec.get("is_self"))
@@ -8869,6 +8872,7 @@ def link_bugs_and_cls(
             ),
             "state_summary": _summarize_cl_for_bug_subtask(rec),
             "submitted_ts": float(rec.get("submitted_ts") or 0.0),
+            "activity_ts": float(rec.get("activity_ts") or 0.0),
             "conversation_id": scid,
             "chat_archived": bool(rec.get("chat_archived")),
             "chat_busy": bool(rec.get("chat_busy")),
@@ -8890,9 +8894,11 @@ def link_bugs_and_cls(
             "url": g_url,
             "status": "LINKED",
             "is_self": False,
+            "shared_1_to_1": False,
             "in_needs_you": False,
             "state_summary": "Linked in Buganizer",
             "submitted_ts": 0.0,
+            "activity_ts": 0.0,
             "conversation_id": "",
             "chat_archived": False,
             "chat_busy": False,
@@ -9100,10 +9106,41 @@ def classify_bug_status(
     return bug
   # Treat a self comment as an implicit ack across comment, urgent, and post-merge triggers
   effective_ack_ts = max(self_ts, acked_ts)
+
+  # Active or merged non-WIP self fix CLs implicitly acknowledge earlier bug comments
+  is_self_assigned = _is_self_bug_assignee(str(bug.get("assignee") or ""))
+  non_wip_self_cl_ts = max(
+      (
+          max(float(c.get("activity_ts") or 0.0), float(c.get("submitted_ts") or 0.0))
+          for c in linked_cls
+          if c.get("is_self")
+          and not c.get("is_wip")
+          and str(c.get("status") or "").upper() in ("NEW", "OPEN", "MERGED")
+      ),
+      default=0.0,
+  )
+  comment_ack_ts = max(effective_ack_ts, non_wip_self_cl_ts)
+
+  # Issues pulled in only via a CL reference require prior participation or an explicit mention
+  cl_only_bug = (
+      has_cl
+      and not is_self_assigned
+      and not is_collab
+      and not is_mentioned
+      and not bool(bug.get("from_self_query"))
+  )
+  has_mention_cue = bool(
+      re.search(
+          r"(?:@|\b)(?:rusino|jlavrova)\b",
+          str(bug.get("last_human_comment_snippet") or ""),
+          re.I,
+      )
+  )
   unacked_comment = (
       bool(human_author)
       and human_author.lower() not in self_lower
-      and human_ts > effective_ack_ts
+      and human_ts > comment_ack_ts
+      and (not cl_only_bug or self_ts > 0.0 or has_mention_cue)
   )
 
   pri = str(bug.get("priority") or "P2").upper()
@@ -9212,6 +9249,14 @@ def should_autostart_bug_triage(bug: dict[str, Any]) -> bool:
   if bug.get("conversation_id") or not bug.get("needs_you"):
     return False
   if str(bug.get("why_needs_you") or "").startswith("All linked CLs merged"):
+    return False
+  # Open non-WIP linked CLs already have an implementation in review
+  if any(
+      isinstance(c, dict)
+      and str(c.get("status") or "").upper() in ("NEW", "OPEN")
+      and not c.get("is_wip")
+      for c in (bug.get("linked_cls") or [])
+  ):
     return False
   return True
 
@@ -9937,15 +9982,24 @@ def sync_bugs_into_state(
   state["bugs"] = retained_bugs
 
   review_claims: dict[str, Any] = state.setdefault("review_claims", {})
-  busy_chats = sum(
-      1
-      for d in items.values()
-      if isinstance(d, dict) and d.get("conversation_id") and d.get("chat_busy")
-  ) + sum(
-      1
-      for b in prev_bugs.values()
-      if isinstance(b, dict) and b.get("conversation_id") and b.get("chat_busy")
-  )
+  busy_cids: set[str] = set()
+  # Count unique active reviewer and bug chats toward the 2-chat background concurrency cap
+  for d in items.values():
+    if not isinstance(d, dict) or not _is_assigned_reviewer_record(d) or d.get("chat_archived"):
+      continue
+    dcid = str(d.get("conversation_id") or "").strip()
+    woken_ts = float(d.get("chat_woken_ts") or 0.0)
+    in_grace = bool(woken_ts and now_ts - woken_ts < CHAT_WAKE_GRACE_SEC)
+    if dcid and (bool(d.get("chat_busy")) or in_grace):
+      busy_cids.add(dcid)
+  for b in retained_bugs.values():
+    if not isinstance(b, dict) or b.get("chat_archived"):
+      continue
+    bcid = str(b.get("conversation_id") or "").strip()
+    woken_ts = float(b.get("chat_woken_ts") or 0.0)
+    in_grace = bool(woken_ts and now_ts - woken_ts < CHAT_WAKE_GRACE_SEC)
+    if bcid and (bool(b.get("chat_busy")) or in_grace):
+      busy_cids.add(bcid)
   auto_started_bugs = 0
 
   for bkey, bug in retained_bugs.items():
@@ -9973,7 +10027,9 @@ def sync_bugs_into_state(
           "(~/.gemini/config/skills/bug-triage/SKILL.md), при необходимости обнови/создай "
           "WIP CL (PS1 = тест, PS2 = фикс) и подготовь черновик ответа."
       )
-      wake_conversation(str(bug["conversation_id"]), wmsg)
+      wcid = str(bug["conversation_id"])
+      wake_conversation(wcid, wmsg)
+      busy_cids.add(wcid)
       events.insert(
           0,
           {
@@ -9981,7 +10037,7 @@ def sync_bugs_into_state(
               "time": now_et_str(),
               "item_key": bkey,
               "target_id": str(bug.get("id") or ""),
-              "conversation_id": str(bug["conversation_id"]),
+              "conversation_id": wcid,
               "project_name": str(bug.get("project_name") or "Skia"),
               "critical": False,
               "message": wmsg,
@@ -9989,33 +10045,50 @@ def sync_bugs_into_state(
       )
       del events[50:]
 
-    # Auto-start bug triage for unchatted Needs You bugs (excluding merge requests & @mentions)
-    if wake_chats and should_autostart_bug_triage(bug):
-      claim_key = f"bug:{bkey}:{bug.get('last_human_comment_at') or bug.get('created_time') or 'init'}"
-      if claim_key not in review_claims and auto_started_bugs < 1 and busy_chats < 2:
-        res = _start_chat_for_bug(state, bkey, save=False)
-        if res.get("ok") and res.get("started"):
-          new_cid = str(res.get("conversation_id") or "")
-          review_claims[claim_key] = {"cid": new_cid, "ts": now_ts}
-          auto_started_bugs += 1
-          busy_chats += 1
-          events.insert(
-              0,
-              {
-                  "id": f"ev-bug-start-{int(now_ts * 1000)}-{bug.get('id')}",
-                  "time": now_et_str(),
-                  "item_key": bkey,
-                  "target_id": str(bug.get("id") or ""),
-                  "conversation_id": new_cid,
-                  "project_name": str(bug.get("project_name") or "Skia"),
-                  "critical": False,
-                  "message": (
-                      f"[BUG-WATCHER] 🔍 Auto-started bug triage for {bug.get('short_id') or bkey} "
-                      f"in chat {new_cid[:8]}."
-                  ),
-              },
-          )
-          del events[50:]
+  # Launch highest-priority unchatted Needs You bugs first (P0 -> P4, newest activity first)
+  pri_ranks = {"P0": 0, "P1": 1, "P2": 2, "P3": 3, "P4": 4}
+  autostart_cands = [
+      (bkey, bug)
+      for bkey, bug in retained_bugs.items()
+      if wake_chats and should_autostart_bug_triage(bug)
+  ]
+  autostart_cands.sort(
+      key=lambda kv: (
+          pri_ranks.get(str(kv[1].get("priority") or "P2").upper(), 2),
+          -float(kv[1].get("modified_ts") or _parse_ts(kv[1].get("modified_time")) or 0.0),
+          kv[0],
+      )
+  )
+  for bkey, bug in autostart_cands:
+    stamp = bug.get("last_human_comment_at") or bug.get("created_time") or "init"
+    claim_key = f"bug:{bkey}:{stamp}"
+    # Throttle background launches to 1 new bug chat per sync and <2 busy review/bug chats total
+    if claim_key not in review_claims and auto_started_bugs < 1 and len(busy_cids) < 2:
+      res = _start_chat_for_bug(state, bkey, save=False)
+      if res.get("ok") and res.get("started"):
+        new_cid = str(res.get("conversation_id") or "")
+        review_claims[claim_key] = {"cid": new_cid, "ts": now_ts}
+        auto_started_bugs += 1
+        if new_cid:
+          busy_cids.add(new_cid)
+        short_lbl = bug.get("short_id") or bkey
+        events.insert(
+            0,
+            {
+                "id": f"ev-bug-start-{int(now_ts * 1000)}-{bug.get('id')}",
+                "time": now_et_str(),
+                "item_key": bkey,
+                "target_id": str(bug.get("id") or ""),
+                "conversation_id": new_cid,
+                "project_name": str(bug.get("project_name") or "Skia"),
+                "critical": False,
+                "message": (
+                    f"[BUG-WATCHER] 🔍 Auto-started bug triage for {short_lbl} "
+                    f"in chat {new_cid[:8]}."
+                ),
+            },
+        )
+        del events[50:]
 
   state["last_bug_sync_ts"] = now_ts
 

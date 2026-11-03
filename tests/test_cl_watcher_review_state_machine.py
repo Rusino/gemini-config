@@ -372,6 +372,11 @@ class CodeReviewStateMachineBackendTest(unittest.TestCase):
            mock.patch.object(w, "discover_open_remote_changes", return_value=remote), \
            mock.patch.object(w, "fetch_gerrit_cl_status", side_effect=fake_status), \
            mock.patch.object(w, "fetch_gmail_status_for_id", return_value=empty_gmail), \
+           mock.patch.object(
+               w.audit_gate,
+               "check_audit_preflight",
+               return_value={"ok": True, "reason": ""},
+           ), \
            mock.patch.object(w, "wake_conversation"), \
            mock.patch.object(
                w, "_start_pinned_chat_for_record", side_effect=fake_start_pinned

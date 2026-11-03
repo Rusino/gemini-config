@@ -1722,6 +1722,295 @@ vm.runInThisContext(scriptContent + '\n' + harness);
     )
     self.assertIn("bug_sync_errors", w.DASHBOARD_HTML)
 
+  def test_cl_only_bug_old_comment_and_umbrella_cl_stay_out_of_needs_you(
+      self,
+  ) -> None:
+    now_ts = w._parse_ts("2026-11-03T18:00:00Z")
+    cl_ts = w._parse_ts("2026-10-25T10:00:00Z")
+    bugs: dict[str, dict[str, object]] = {
+        "gh_issue:flutter/flutter#130492": {
+            "bug_key": "gh_issue:flutter/flutter#130492",
+            "source": "github",
+            "id": "130492",
+            "short_id": "flutter#130492",
+            "status": "OPEN",
+            "priority": "P2",
+            "assignee": "",
+            "from_self_query": False,
+            "is_collaborator": False,
+            "is_mentioned": False,
+            "created_time": "2025-07-01T10:00:00Z",
+            "modified_time": "2026-09-10T10:00:00Z",
+            "last_human_comment_author": "external-user",
+            "last_human_comment_at": "2026-09-10T10:00:00Z",
+            "last_human_comment_snippet": "Still reproducible on master",
+            "last_self_comment_at": "",
+        },
+        "gh_issue:flutter/flutter#141080": {
+            "bug_key": "gh_issue:flutter/flutter#141080",
+            "source": "github",
+            "id": "141080",
+            "short_id": "flutter#141080",
+            "status": "OPEN",
+            "priority": "P2",
+            "assignee": "",
+            "from_self_query": False,
+            "created_time": "2025-08-01T10:00:00Z",
+            "modified_time": "2026-08-15T10:00:00Z",
+            "last_human_comment_author": "external-user",
+            "last_human_comment_at": "2026-08-15T10:00:00Z",
+            "last_human_comment_snippet": "Related to trailing spaces",
+            "last_self_comment_at": "",
+        },
+        "gh_issue:flutter/flutter#144099": {
+            "bug_key": "gh_issue:flutter/flutter#144099",
+            "source": "github",
+            "id": "144099",
+            "short_id": "flutter#144099",
+            "status": "OPEN",
+            "priority": "P2",
+            "assignee": "",
+            "from_self_query": False,
+            "created_time": "2025-08-02T10:00:00Z",
+            "modified_time": "2026-08-16T10:00:00Z",
+            "last_human_comment_author": "external-user",
+            "last_human_comment_at": "2026-08-16T10:00:00Z",
+            "last_human_comment_snippet": "Another trailing space repro",
+            "last_self_comment_at": "",
+        },
+    }
+    items: dict[str, dict[str, object]] = {
+        "gerrit:1411657@": {
+            "item_key": "gerrit:1411657",
+            "kind": "gerrit",
+            "target_id": "1411657",
+            "status": "NEW",
+            "is_self": True,
+            "is_wip": False,
+            "activity_ts": cl_ts,
+            "linked_bug_keys": ["gh_issue:flutter/flutter#130492"],
+            "project_name": "SkParagraph",
+        },
+        "gerrit:1389816@cid-umbrella": {
+            "item_key": "gerrit:1389816",
+            "kind": "gerrit",
+            "target_id": "1389816",
+            "status": "NEW",
+            "is_self": True,
+            "is_wip": True,
+            "activity_ts": cl_ts,
+            "conversation_id": "cid-umbrella",
+            "chat_archived": False,
+            "chat_busy": False,
+            "linked_bug_keys": [
+                "gh_issue:flutter/flutter#141080",
+                "gh_issue:flutter/flutter#144099",
+            ],
+            "project_name": "SkParagraph",
+        },
+    }
+    w.link_bugs_and_cls(bugs, items, bug_chats={})
+
+    b130 = bugs["gh_issue:flutter/flutter#130492"]
+    w.classify_bug_status(b130, now_ts=now_ts)
+    self.assertFalse(b130["needs_you"])
+    self.assertEqual(b130["lane"], "has_cl")
+
+    # Unrelated post-CL chatter on an unassigned CL-only issue stays in Has CL
+    b130["last_human_comment_at"] = "2026-11-01T12:00:00Z"
+    b130["last_human_comment_snippet"] = "+1 any update on stable cherry-pick?"
+    w.classify_bug_status(b130, now_ts=now_ts)
+    self.assertFalse(b130["needs_you"])
+    self.assertEqual(b130["lane"], "has_cl")
+
+    # Explicit @Rusino mention after non_wip_self_cl_ts promotes the issue to Needs You
+    b130["last_human_comment_snippet"] = "@Rusino this breaks RTL cursor movement"
+    w.classify_bug_status(b130, now_ts=now_ts)
+    self.assertTrue(b130["needs_you"])
+    self.assertEqual(b130["lane"], "you")
+
+    # Multi-bug umbrella CL propagates project_name without stamping or hijacking its chat
+    b141 = bugs["gh_issue:flutter/flutter#141080"]
+    self.assertFalse(b141.get("conversation_id"))
+    self.assertEqual(b141.get("project_name"), "SkParagraph")
+    state = {"bugs": bugs, "items": items}
+    with mock.patch.object(w, "discover_bug_chats", return_value={}), mock.patch.object(
+        w.cl, "resolve_project_id", return_value="proj-skp"
+    ), mock.patch.object(
+        w.cl, "resolve_handoff_model", return_value={"enum": "MODEL_PRO"}
+    ), mock.patch.object(
+        w.cl, "start_conversation_exact", return_value="cid-141080-own"
+    ):
+      res = w._start_chat_for_bug(state, "gh_issue:flutter/flutter#141080", save=False)
+    self.assertTrue(res.get("started"))
+    self.assertEqual(res.get("conversation_id"), "cid-141080-own")
+
+  def test_should_autostart_bug_triage_skips_active_non_wip_cl_only(self) -> None:
+    base_bug: dict[str, object] = {
+        "bug_key": "buganizer:580955594",
+        "source": "buganizer",
+        "status": "ASSIGNED",
+        "priority": "P0",
+        "assignee": "jlavrova@google.com",
+        "needs_you": True,
+        "why_needs_you": "New comment from nehete@google.com",
+        "conversation_id": "",
+    }
+    self.assertTrue(w.should_autostart_bug_triage({**base_bug, "linked_cls": []}))
+    # Historical comment CL references ("LINKED") and abandoned CLs do not block triage autostart
+    self.assertTrue(
+        w.should_autostart_bug_triage({
+            **base_bug,
+            "linked_cls": [{"item_key": "gerrit:1116616", "status": "LINKED"}],
+        })
+    )
+    self.assertTrue(
+        w.should_autostart_bug_triage({
+            **base_bug,
+            "linked_cls": [
+                {"item_key": "gerrit:1400001", "status": "ABANDONED", "is_wip": False}
+            ],
+        })
+    )
+    self.assertFalse(
+        w.should_autostart_bug_triage({
+            **base_bug,
+            "linked_cls": [
+                {"item_key": "gerrit:1414002", "status": "NEW", "is_wip": False}
+            ],
+        })
+    )
+
+  def test_sync_bugs_autostarts_p0_first_with_deduped_busy_reviewer_and_bug_chats(
+      self,
+  ) -> None:
+    state: dict[str, object] = {
+        "items": {
+            "gerrit:1415001@cid-self-1": {
+                "item_key": "gerrit:1415001",
+                "kind": "gerrit",
+                "target_id": "1415001",
+                "status": "NEW",
+                "is_self": True,
+                "conversation_id": "cid-self-1",
+                "chat_busy": True,
+            },
+            "gerrit:1415002@cid-self-2": {
+                "item_key": "gerrit:1415002",
+                "kind": "gerrit",
+                "target_id": "1415002",
+                "status": "NEW",
+                "is_self": True,
+                "conversation_id": "cid-self-2",
+                "chat_busy": True,
+            },
+            "gerrit:8663799@cid-rev-shared": {
+                "item_key": "gerrit:8663799",
+                "kind": "gerrit",
+                "target_id": "8663799",
+                "status": "NEW",
+                "is_self": False,
+                "in_my_attention": True,
+                "reviewer_emails": ["jlavrova@google.com"],
+                "conversation_id": "cid-rev-shared",
+                "chat_busy": True,
+            },
+            "gerrit:8663827@cid-rev-shared": {
+                "item_key": "gerrit:8663827",
+                "kind": "gerrit",
+                "target_id": "8663827",
+                "status": "NEW",
+                "is_self": False,
+                "in_my_attention": True,
+                "reviewer_emails": ["jlavrova@google.com"],
+                "conversation_id": "cid-rev-shared",
+                "chat_busy": True,
+            },
+        },
+        "bugs": {},
+        "review_claims": {},
+        "events": [],
+    }
+    open_out = (
+        "Issue ID: 580000222\n"
+        "Component ID: 1457031\n"
+        "Assignee: jlavrova@google.com\n"
+        "Status: ASSIGNED\n"
+        "Priority: P2\n"
+        "Issue Type: BUG\n"
+        "Title: Newer P2 ligature issue\n"
+        "Created Time: 2026-11-01T10:00:00Z\n"
+        "Modified Time: 2026-11-03T18:30:00Z\n"
+        "Major Modified Time: 2026-11-03T18:30:00Z\n\n"
+        "---\n\n"
+        "Issue ID: 580955594\n"
+        "Component ID: 1457031\n"
+        "Assignee: jlavrova@google.com\n"
+        "Status: NEW\n"
+        "Priority: P0\n"
+        "Issue Type: BUG\n"
+        "Title: Top #1 crash in SkScalerContextProxy\n"
+        "Created Time: 2026-11-02T18:39:06Z\n"
+        "Modified Time: 2026-11-03T15:00:00Z\n"
+        "Major Modified Time: 2026-11-03T15:00:00Z\n"
+    )
+    rendered_p2 = json.dumps({
+        "result": (
+            "Issue ID: 580000222\n"
+            "Comment #2 by gaaclarke@google.com at 2026-11-03T18:30:00Z:\n"
+            "Can you take a look at this ligature issue?\n"
+        )
+    })
+    rendered_p0 = json.dumps({
+        "result": (
+            "Issue ID: 580955594\n"
+            "Comment #2 by nehete@google.com at 2026-11-03T15:00:00Z:\n"
+            "Top #1 gpu-process crash on Mac canary.\n"
+        )
+    })
+
+    def fake_mcp(calls: list[tuple[str, dict[str, object]]]) -> list[str]:
+      outs: list[str] = []
+      for name, args in calls:
+        if name == "get_bugs_with_external":
+          q = str(args.get("query") or "")
+          outs.append(open_out if "status:open" in q and "-status:open" not in q else "")
+        elif name == "render_issue_with_external":
+          iid = str(args.get("issueId") or "")
+          outs.append(rendered_p2 if iid == "580000222" else rendered_p0)
+        else:
+          outs.append("")
+      return outs
+
+    started_keys: list[str] = []
+
+    def fake_start(
+        s: dict[str, object], bkey: str, *, save: bool = True
+    ) -> dict[str, object]:
+      del save
+      started_keys.append(bkey)
+      b = (s.get("bugs") or {}).get(bkey)
+      if isinstance(b, dict):
+        b["conversation_id"] = f"cid-{bkey}"
+        b["chat_busy"] = True
+      return {"ok": True, "started": True, "conversation_id": f"cid-{bkey}"}
+
+    with mock.patch.object(
+        w, "call_buganizer_mcp_batch", side_effect=fake_mcp
+    ), mock.patch.object(
+        w, "fetch_github_bugs", return_value=[]
+    ), mock.patch.object(
+        w, "discover_bug_chats", return_value={}
+    ), mock.patch.object(
+        w, "_start_chat_for_bug", side_effect=fake_start
+    ):
+      w.sync_bugs_into_state(
+          state, force=True, wake_chats=True, proj_names={"proj": "Skia"}
+      )
+
+    # Despite 2 busy self-CL chats and 2 records sharing 1 reviewer chat, P0 starts first
+    self.assertEqual(started_keys, ["buganizer:580955594"])
+
 
 if __name__ == "__main__":
   unittest.main()
