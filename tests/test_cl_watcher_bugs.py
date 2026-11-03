@@ -1356,6 +1356,131 @@ vm.runInThisContext(scriptContent + '\n' + harness);
         res.returncode, 0, f"Node stdout: {res.stdout}\nStderr: {res.stderr}"
     )
 
+  def test_bug_triage_prompt_and_wip_cl_lane_retention(self) -> None:
+    now_ts = w._parse_ts("2026-11-03T12:00:00Z")
+
+    # 1. Unacked urgent vulnerability with only WIP CLs stays in Needs You with WIP CL note
+    bug_wip = {
+        "bug_key": "buganizer:580999888",
+        "source": "buganizer",
+        "status": "NEW",
+        "priority": "P1",
+        "issue_type": "VULNERABILITY",
+        "created_time": "2026-11-03T10:00:00Z",
+        "linked_cls": [
+            {"item_key": "gerrit:1414001", "status": "NEW", "is_wip": True},
+        ],
+    }
+    w.classify_bug_status(bug_wip, now_ts=now_ts)
+    self.assertTrue(bug_wip["needs_you"])
+    self.assertEqual(bug_wip["lane"], "you")
+    self.assertIn("WIP CL ready for review", bug_wip["why_needs_you"])
+
+    # Once acknowledged, moves to has_cl
+    bug_wip["acked_ts"] = now_ts
+    w.classify_bug_status(bug_wip, now_ts=now_ts)
+    self.assertFalse(bug_wip["needs_you"])
+    self.assertEqual(bug_wip["lane"], "has_cl")
+
+    # If linked CL is not WIP, moves out of unacked_urgent directly to has_cl
+    bug_active_cl = {
+        "bug_key": "buganizer:580999889",
+        "source": "buganizer",
+        "status": "NEW",
+        "priority": "P1",
+        "issue_type": "VULNERABILITY",
+        "created_time": "2026-11-03T10:00:00Z",
+        "linked_cls": [
+            {"item_key": "gerrit:1414002", "status": "NEW", "is_wip": False},
+        ],
+    }
+    w.classify_bug_status(bug_active_cl, now_ts=now_ts)
+    self.assertFalse(bug_active_cl["needs_you"])
+    self.assertEqual(bug_active_cl["lane"], "has_cl")
+
+    # 2. _start_chat_for_bug generates bug-triage and Proof-by-WIP-CL prompt
+    state = {
+        "bugs": {
+            "buganizer:580999888": {
+                "bug_key": "buganizer:580999888",
+                "id": "580999888",
+                "title": "Crash on layout",
+                "status": "NEW",
+                "priority": "P1",
+                "issue_type": "VULNERABILITY",
+                "project_name": "Skia",
+            },
+        },
+        "items": {},
+    }
+    captured_kwargs: dict[str, object] = {}
+
+    def fake_start(**kwargs: object) -> str:
+      captured_kwargs.update(kwargs)
+      return "cid-bug-new"
+
+    with mock.patch.object(w, "discover_bug_chats", return_value={}), mock.patch.object(
+        w.cl, "start_conversation_exact", side_effect=fake_start
+    ), mock.patch.object(w.cl, "resolve_handoff_model", return_value={"enum": "MODEL_PRO"}):
+      res = w._start_chat_for_bug(state, "buganizer:580999888", save=False)
+      self.assertTrue(res["ok"])
+      self.assertTrue(res["started"])
+      prompt = str(captured_kwargs.get("prompt") or "")
+      self.assertIn("bug-triage", prompt)
+      self.assertIn("WIP CL", prompt)
+
+  def test_sync_bugs_throttled_autostart_needs_you(self) -> None:
+    now_ts = w._parse_ts("2026-11-03T12:00:00Z")
+    state: dict[str, object] = {
+        "items": {},
+        "bugs": {},
+        "review_claims": {},
+        "events": [],
+    }
+    open_out = (
+        "Issue ID: 580955594\n"
+        "Component ID: 1457031\n"
+        "Assignee: jlavrova@google.com\n"
+        "Status: NEW\n"
+        "Priority: P0\n"
+        "Issue Type: BUG\n"
+        "Title: Top #1 crash in SkScalerContextProxy\n"
+        "Created Time: 2026-11-02T18:39:06Z\n"
+        "Modified Time: 2026-11-03T10:00:00Z\n"
+    )
+    started_keys: list[str] = []
+
+    def fake_start(
+        s: dict[str, object], bkey: str, *, save: bool = True
+    ) -> dict[str, object]:
+      started_keys.append(bkey)
+      b = (s.get("bugs") or {}).get(bkey)
+      if isinstance(b, dict):
+        b["conversation_id"] = "cid-auto-bug"
+      return {"ok": True, "started": True, "conversation_id": "cid-auto-bug"}
+
+    with mock.patch.object(
+        w, "call_buganizer_mcp_batch", return_value=[open_out, ""]
+    ), mock.patch.object(
+        w, "fetch_github_bugs", return_value=[]
+    ), mock.patch.object(
+        w, "discover_bug_chats", return_value={}
+    ), mock.patch.object(
+        w, "_start_chat_for_bug", side_effect=fake_start
+    ):
+      w.sync_bugs_into_state(
+          state, force=True, wake_chats=True, proj_names={"proj": "Skia"}
+      )
+
+    self.assertEqual(len(started_keys), 1)
+    self.assertEqual(started_keys[0], "buganizer:580955594")
+    self.assertTrue(
+        any("bug:buganizer:580955594" in k for k in state["review_claims"])
+    )
+    self.assertTrue(
+        any("Auto-started bug triage" in ev["message"] for ev in state["events"])
+    )
+
 
 if __name__ == "__main__":
   unittest.main()

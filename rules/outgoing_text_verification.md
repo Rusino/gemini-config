@@ -45,9 +45,9 @@ Code has a compiler; prose documents do not, and incoming specs or code snippets
 ## 2. Incoming & Outgoing Code (`amnesia-precommit`, Corpus Gate & KEEPER Invariants)
 
 1. **Outgoing Repository Code Changes -> Run `amnesia-precommit` & Pre-Upload Flutter Corpus**:
-   - **Applies to**: Any source code modifications in a repository before committing (`git commit`), uploading/pushing (`git cl upload`, `gh pr create`, `git push`), or reporting implementation complete.
+   - **Applies to**: Any source code modifications in a repository before committing (`git commit`), uploading/pushing (`luci-auth context -- git cl upload`, `gh pr create`, `git push`), or reporting implementation complete.
    - **Required Action**: Read and execute `~/.gemini/config/skills/amnesia-precommit/SKILL.md`:
-     1. Run `audit_comments.py --diff HEAD --repo <repo>` and `ruthless_audit.py <repo> --repo <repo> --diff HEAD` (plus `SKIP_GCE_AUTH_FOR_GIT=1 git cl presubmit --force` if `PRESUBMIT.py` exists).
+     1. Run `audit_comments.py --diff HEAD --repo <repo>` and `ruthless_audit.py <repo> --repo <repo> --diff HEAD` (plus `SKIP_GCE_AUTH_FOR_GIT=1 luci-auth context -- git cl presubmit --force` if `PRESUBMIT.py` exists).
      2. For non-trivial diffs, run the clean-context Hunter (`keeper_inquisitor`) + batched `keeper_skeptic` refutation pass (`plugins/keeper/agents/keeper_skeptic.md`) + `finding_ledger.py`.
      3. **Pre-Upload / Pre-Push Flutter Corpus Gate (`CORPUS-CHECK GUARD` in `pre_tool_guard.py`)**: Before `git cl upload`, `gh pr create`, or `git push` with executable production code changes:
         - Touching `modules/{skparagraph,skunicode,skshaper}/{src,include}/` -> run `flutter-test-paragraph-engine` (`run_flutter_paragraph_tests.py`).

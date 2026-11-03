@@ -4326,7 +4326,6 @@ def fetch_gerrit_cl_status(
       if (
           status == "NEW"
           and not is_self
-          and is_external
           and self_cr_vote > 0
           and not is_wip
           and not reviewer_removed
@@ -4339,7 +4338,7 @@ def fetch_gerrit_cl_status(
             for sr in submit_reqs
         )
         # Review-Enforcement blocks external submit until a 2nd Googler is assigned
-        if missing_reviewers_to_assign > 0:
+        if is_external and missing_reviewers_to_assign > 0:
           sponsor_action = "assign_second_reviewer"
           sponsor_action_reason = "Add 2nd Googler reviewer"
         # External Skia contributors lack Commit-Queue+2 permission even after 2/2 approvals
@@ -5861,7 +5860,9 @@ def _start_pinned_chat_for_record(
   }
 
 
-def _start_chat_for_bug(state: dict[str, Any], bug_key: str) -> dict[str, Any]:
+def _start_chat_for_bug(
+    state: dict[str, Any], bug_key: str, *, save: bool = True
+) -> dict[str, Any]:
   """Reuses an existing bug or 1:1 self-CL chat, or spawns a pinned bug chat."""
   bugs: dict[str, Any] = state.setdefault("bugs", {})
   bug = bugs.get(bug_key)
@@ -5889,7 +5890,8 @@ def _start_chat_for_bug(state: dict[str, Any], bug_key: str) -> dict[str, Any]:
     bug["conversation_id"] = active_cid
     if cand:
       bug["chat_archived"] = bool(cand.get("chat_archived"))
-    save_watcher_state(state)
+    if save:
+      save_watcher_state(state)
     return {
         "ok": True,
         "already_existed": True,
@@ -5924,14 +5926,17 @@ def _start_chat_for_bug(state: dict[str, Any], bug_key: str) -> dict[str, Any]:
     owner_lbl = str(bug.get("assignee") or "коллеги")
     prompt = (
         f"Ты указана как Collaborator в баге {url} ('{btitle}', владелец: {owner_lbl}). "
-        "Проверь описание, комментарии и код, и подготовь техническое ревью и черновик "
-        "комментария/мнения для бага (не публикуй комментарий без подтверждения)."
+        "Проверь описание, комментарии и код, следуй навыку bug-triage "
+        "(~/.gemini/config/skills/bug-triage/SKILL.md), и подготовь техническое ревью, "
+        "решение/PoC (WIP CL, если уместно) и черновик комментария для бага "
+        "(не публикуй комментарий без подтверждения)."
     )
   else:
     prompt = (
-        f"Исследуй баг {url} ('{btitle}'). Проверь актуальные детали, воспроизведение "
-        "и связанные CL/PR, оцени приоритет и предложи план действий (не вноси правки "
-        "в репозиторий без подтверждения или контрактного теста)."
+        f"Исследуй баг {url} ('{btitle}'). Следуй навыку bug-triage "
+        "(~/.gemini/config/skills/bug-triage/SKILL.md): проанализируй причину, "
+        "предложи решение, при необходимости создай silent WIP CL (PS1 = failing test, "
+        "PS2 = fix) и подготовь черновик ответа для трекера (не публикуй ответ без подтверждения)."
     )
   try:
     model_info = cl.resolve_handoff_model("", tier="pro", project_id=project_id)
@@ -5953,7 +5958,8 @@ def _start_chat_for_bug(state: dict[str, Any], bug_key: str) -> dict[str, Any]:
   bug["chat_last_modified"] = datetime.now(timezone.utc).isoformat()
   # Propagate newly spawned bug chat to any unchatted self CL linked to this bug
   link_bugs_and_cls(bugs, state.setdefault("items", {}))
-  save_watcher_state(state)
+  if save:
+    save_watcher_state(state)
   return {
       "ok": True,
       "started": True,
@@ -8050,8 +8056,11 @@ def link_bugs_and_cls(
             "url": str(rec.get("url") or ""),
             "status": str(rec.get("status") or "NEW").upper(),
             "is_self": bool(rec.get("is_self")),
+            "is_wip": bool(rec.get("is_wip") or rec.get("is_draft")),
             "in_needs_you": bool(
-                rec.get("in_my_attention") or (rec.get("merge_conflict") and rec.get("is_self"))
+                rec.get("in_my_attention") 
+                or (rec.get("merge_conflict") and rec.get("is_self"))
+                or bool(rec.get("sponsor_action"))
             ),
             "state_summary": _summarize_cl_for_bug_subtask(rec),
             "submitted_ts": float(rec.get("submitted_ts") or 0.0),
@@ -8205,6 +8214,7 @@ def classify_bug_status(
 
   linked_cls = [c for c in (bug.get("linked_cls") or []) if isinstance(c, dict)]
   has_cl = len(linked_cls) > 0
+  only_wip_cls = has_cl and all(bool(c.get("is_wip")) for c in linked_cls)
   real_statuses = [str(c.get("status") or "").upper() for c in linked_cls]
   all_cls_merged = has_cl and all(s == "MERGED" for s in real_statuses)
   latest_merged_ts = max(
@@ -8235,7 +8245,7 @@ def classify_bug_status(
   # Only the assignee owns CL creation and issue closure when linked CLs merge
   unacked_urgent = (
       not is_collab
-      and not has_cl
+      and (not has_cl or only_wip_cls)
       and effective_ack_ts <= 0.0
       and (pri in ("P0", "P1") or itype == "VULNERABILITY")
       and (status == "NEW" or recent_created)
@@ -8272,11 +8282,18 @@ def classify_bug_status(
     bug["why_needs_you"] = "All linked CLs merged — ready to mark Fixed?"
   elif unacked_urgent:
     bug["needs_you"] = True
-    bug["why_needs_you"] = (
-        f"New {pri} vulnerability needs triage"
-        if itype == "VULNERABILITY"
-        else f"New {pri} issue without a CL yet"
-    )
+    if only_wip_cls:
+      bug["why_needs_you"] = (
+          f"New {pri} vulnerability — WIP CL ready for review"
+          if itype == "VULNERABILITY"
+          else f"New {pri} issue — WIP CL ready for review"
+      )
+    else:
+      bug["why_needs_you"] = (
+          f"New {pri} vulnerability needs triage"
+          if itype == "VULNERABILITY"
+          else f"New {pri} issue without a CL yet"
+      )
 
   if bug["needs_you"]:
     bug["lane"] = "you"
@@ -8507,8 +8524,24 @@ def sync_bugs_into_state(
     if not _should_retain_bug_in_view(bug, primary_self_bkeys):
       continue
     retained_bugs[bkey] = bug
-    prev_b = prev_bugs.get(bkey) if isinstance(prev_bugs.get(bkey), dict) else {}
     classify_bug_status(bug, now_ts=now_ts)
+
+  state["bugs"] = retained_bugs
+
+  review_claims: dict[str, Any] = state.setdefault("review_claims", {})
+  busy_chats = sum(
+      1
+      for d in items.values()
+      if isinstance(d, dict) and d.get("conversation_id") and d.get("chat_busy")
+  ) + sum(
+      1
+      for b in prev_bugs.values()
+      if isinstance(b, dict) and b.get("conversation_id") and b.get("chat_busy")
+  )
+  auto_started_bugs = 0
+
+  for bkey, bug in retained_bugs.items():
+    prev_b = prev_bugs.get(bkey) if isinstance(prev_bugs.get(bkey), dict) else {}
     # Wake active bug chat when a new human comment arrives upstream
     # Require human_ts > max(self_ts, acked_ts) so self replies or non-comment Needs Me never wake
     unacked_human_comment = _parse_ts(bug.get("last_human_comment_at")) > max(
@@ -8528,7 +8561,9 @@ def sync_bugs_into_state(
       wmsg = (
           f"[BUG-WATCHER] 💬 Новый комментарий в {bug.get('short_id')} "
           f"('{bug.get('title')}') от {bug.get('last_human_comment_author')}: "
-          f"{bug.get('last_human_comment_snippet')}. Проверь и предложи ответ/действия."
+          f"{bug.get('last_human_comment_snippet')}. Проведи анализ по bug-triage "
+          "(~/.gemini/config/skills/bug-triage/SKILL.md), при необходимости обнови/создай "
+          "WIP CL (PS1 = тест, PS2 = фикс) и подготовь черновик ответа."
       )
       wake_conversation(str(bug["conversation_id"]), wmsg)
       events.insert(
@@ -8546,7 +8581,39 @@ def sync_bugs_into_state(
       )
       del events[50:]
 
-  state["bugs"] = retained_bugs
+    # Auto-start bug triage for unchatted Needs You bugs (excluding merge closure prompts)
+    if (
+        wake_chats
+        and not bug.get("conversation_id")
+        and bug.get("needs_you")
+        and not str(bug.get("why_needs_you") or "").startswith("All linked CLs merged")
+    ):
+      claim_key = f"bug:{bkey}:{bug.get('last_human_comment_at') or bug.get('created_time') or 'init'}"
+      if claim_key not in review_claims and auto_started_bugs < 1 and busy_chats < 2:
+        res = _start_chat_for_bug(state, bkey, save=False)
+        if res.get("ok") and res.get("started"):
+          new_cid = str(res.get("conversation_id") or "")
+          review_claims[claim_key] = {"cid": new_cid, "ts": now_ts}
+          auto_started_bugs += 1
+          busy_chats += 1
+          events.insert(
+              0,
+              {
+                  "id": f"ev-bug-start-{int(now_ts * 1000)}-{bug.get('id')}",
+                  "time": now_et_str(),
+                  "item_key": bkey,
+                  "target_id": str(bug.get("id") or ""),
+                  "conversation_id": new_cid,
+                  "project_name": str(bug.get("project_name") or "Skia"),
+                  "critical": False,
+                  "message": (
+                      f"[BUG-WATCHER] 🔍 Auto-started bug triage for {bug.get('short_id') or bkey} "
+                      f"in chat {new_cid[:8]}."
+                  ),
+              },
+          )
+          del events[50:]
+
   state["last_bug_sync_ts"] = now_ts
 
 
@@ -10107,7 +10174,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <body>
 <header class="bar">
   <div class="wrap">
-    <div class="brand">✈️ Flight Deck</div>
+    <div class="brand" style="cursor: pointer;" onclick="window.parent.postMessage({type: 'jetski-flight-deck-close'}, '*')" title="Hide Flight Deck panel">✈️ Flight Deck</div>
     <div class="view-switch" id="view-switch" role="tablist" aria-label="View"></div>
     <nav class="rollers" id="rollers" aria-label="Skia autorollers"></nav>
     <div class="synced" id="synced">Loading…</div>
