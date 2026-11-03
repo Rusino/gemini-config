@@ -8267,6 +8267,67 @@ eval(code);
     'Already-reloaded target version must not keep pinging on lower daemon uiVersion'
   );
 
+  // Symmetric case: stale lower infoVer (15) while live daemon reports higher uiVersion (20)
+  // must NOT re-ping on every DOM mutation or loop-reload every 15s
+  postedToIframe.length = 0;
+  fakeNow += 20000;
+  mockFlightDeckJson = {
+    pen_url: 'https://8089-pen-proxy.corp.goog?v=15',
+    local_url: 'http://localhost:8089?v=15',
+    port: 8089,
+    ui_version: 15,
+  };
+  window.__jetskiFlightDeck.ensureFlightDeckUI();
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  assert.strictEqual(
+    postedToIframe.filter((m) => m && m.type === 'jetski-flight-deck-ping').length,
+    1,
+    'Initial v=15 mismatch must probe once via ping'
+  );
+  window.__jetskiFlightDeck.handleMessage({
+    data: { type: 'jetski-flight-deck-rendered', uiVersion: 20, synced: '19:09 ET' },
+  });
+  postedToIframe.length = 0;
+  // Immediate MutationObserver sync within 5s must NOT re-ping after higher ver=20 ack
+  fakeNow += 500;
+  window.__jetskiFlightDeck.ensureFlightDeckUI();
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  assert.strictEqual(
+    postedToIframe.filter((m) => m && m.type === 'jetski-flight-deck-ping').length,
+    0,
+    'Higher live uiVersion=20 ack must not clear flightDeckPendingVer=15 and re-ping on mutations'
+  );
+  fakeNow += 15000;
+  window.__jetskiFlightDeck.ensureFlightDeckUI();
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  const singleReloadV15Src = iframe.getAttribute('src');
+  assert.strictEqual(
+    singleReloadV15Src,
+    `https://8089-pen-proxy.corp.goog?v=15&embed=1&t=${fakeNow}`,
+    'Unresolved v=15 mismatch must reload at most once'
+  );
+  fakeNow += 500;
+  window.__jetskiFlightDeck.handleMessage({
+    data: { type: 'jetski-flight-deck-rendered', uiVersion: 20, synced: '19:09 ET' },
+  });
+  postedToIframe.length = 0;
+  fakeNow += 20000;
+  window.__jetskiFlightDeck.ensureFlightDeckUI();
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  fakeNow += 20000;
+  window.__jetskiFlightDeck.ensureFlightDeckUI();
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  assert.strictEqual(
+    iframe.getAttribute('src'),
+    singleReloadV15Src,
+    'Higher live uiVersion=20 must not overwrite flightDeckReloadedTargetVer=15'
+  );
+  assert.strictEqual(
+    postedToIframe.filter((m) => m && m.type === 'jetski-flight-deck-ping').length,
+    0,
+    'Already-reloaded lower target version must not keep pinging when live daemon stays on 20'
+  );
+
   global.window.location.hostname = 'localhost';
   global.window.fetch = origFetch;
   Date.now = origDateNow;

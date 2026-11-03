@@ -1600,15 +1600,14 @@ def _inspect_repo_vcs_baton(
         else f"none ({head_short} → {upstream_ref or 'local'})"
     )
     is_pending = bool(own_dirty or own_unpushed)
-    # Only main auto-ships directly; feature branches still prompt via ask_question
+    # Personal checkouts on main and their detached linked worktrees auto-ship directly
     is_auto_ship_repo = False
-    if branch == "main":
-      try:
-        import auto_ship
+    try:
+      import auto_ship
 
-        is_auto_ship_repo = auto_ship.is_personal_repo(top_level)
-      except Exception:
-        pass
+      is_auto_ship_repo = auto_ship.is_auto_ship_branch(top_level, branch)
+    except Exception:
+      pass
     if is_pending:
       if is_auto_ship_repo:
         msg_arg = ' -m "<msg>"' if own_dirty else ""

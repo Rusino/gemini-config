@@ -724,6 +724,184 @@ class TestAutoShip(unittest.TestCase):
         stop_guard.vcs_baton_guard_reason(info, "c1", self.transcript),
     )
 
+    # Detached linked worktree of a personal repo auto-ships without ask_question
+    _git(self.fx.repo, "checkout", "-q", "main")
+    wt = os.path.realpath(os.path.join(self.root, "baton_wt"))
+    _git(self.fx.repo, "worktree", "add", "-q", "--detach", wt, "origin/main")
+    wt_own = os.path.join(wt, "wt_own.py")
+    with open(wt_own, "w", encoding="utf-8") as f:
+      f.write("print(2)\n")
+    self.write_transcript([
+        {"step_index": 3, "type": "USER_INPUT", "content": "work in detached wt"},
+        _edit_step(4, wt_own),
+    ])
+    out_wt = roadmap.evaluate_vcs_baton("c1", "p1", transcript_path=self.transcript)
+    self.assertIn("[VCS BATON: PENDING", out_wt)
+    self.assertIn("auto_ship.py ship c1", out_wt)
+    self.assertNotIn("call ask_question", out_wt)
+
+  def test_post_push_linked_config_worktree_deploys_filter_and_syncs_main(self):
+    wt = os.path.realpath(os.path.join(self.root, "linked_wt"))
+    _git(self.fx.repo, "worktree", "add", "-q", "--detach", wt, "origin/main")
+    js_rel = "scripts/jetski_closed_filter.js"
+    watcher_rel = "scripts/cl_watcher.py"
+    patcher_rel = "scripts/patch_jetski_hub_binary.py"
+    marker_file = os.path.join(self.root, "synced_js_from_cwd.txt")
+    for base in (self.fx.repo, wt):
+      os.makedirs(os.path.join(base, "scripts"), exist_ok=True)
+    with open(os.path.join(wt, patcher_rel), "w", encoding="utf-8") as f:
+      f.write(
+          "import os\n"
+          f"with open({marker_file!r}, 'w', encoding='utf-8') as out:\n"
+          "  out.write(os.path.realpath(os.getcwd()))\n"
+      )
+    js_path = os.path.join(wt, js_rel)
+    watcher_path = os.path.join(wt, watcher_rel)
+    with open(js_path, "w", encoding="utf-8") as f:
+      f.write("// v1\n")
+    with open(watcher_path, "w", encoding="utf-8") as f:
+      f.write("# watcher v1\n")
+    self.write_transcript([
+        {"step_index": 1, "type": "USER_INPUT", "content": "ship from worktree"},
+        _edit_step(2, js_path),
+        _edit_step(3, watcher_path),
+        _edit_step(4, os.path.join(wt, patcher_rel)),
+    ])
+
+    real_run = auto_ship._run_cmd
+    restarted_units: list[tuple[str, str]] = []
+
+    def fake_run(cmd, timeout=None, cwd=None):
+      if cmd[:3] == ["systemctl", "--user", "cat"]:
+        return subprocess.CompletedProcess(cmd, 0, "loaded\n", "")
+      if cmd[:3] == ["systemctl", "--user", "restart"]:
+        restarted_units.append((cmd[3], os.path.realpath(cwd or "")))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+      return real_run(cmd, timeout=timeout, cwd=cwd)
+
+    out = io.StringIO()
+    with (
+        patch.dict(os.environ, {"JETSKI_CONFIG_REPO": self.fx.repo}),
+        patch.object(auto_ship, "_run_cmd", side_effect=fake_run),
+    ):
+      code = auto_ship.ship(
+          "c1",
+          self.transcript,
+          "Ship Flight Deck from linked worktree",
+          out=out,
+          run_post_push=True,
+          repo_filter=wt,
+      )
+    self.assertEqual(code, 0, out.getvalue())
+    self.assertIn("committed and pushed:", out.getvalue())
+    wt_head = _git(wt, "rev-parse", "HEAD")
+    self.assertEqual(
+        _git(self.fx.repo, "rev-parse", "HEAD"),
+        wt_head,
+        "Clean primary config checkout must fast-forward to linked worktree commit",
+    )
+    with open(marker_file, encoding="utf-8") as f:
+      self.assertEqual(
+          f.read().strip(),
+          wt,
+          "patch_jetski_hub_binary.py must run inside the linked worktree cwd",
+      )
+    self.assertIn(
+        ("cl-flight-deck.service", self.fx.repo),
+        restarted_units,
+        "Synced primary config checkout must restart cl-flight-deck.service",
+    )
+
+    # Dirty primary checkout deploys filter JS from wt while skipping stale service restart
+    restarted_units.clear()
+    self.fx.write(watcher_rel, "# foreign dirty edit\n")
+    with open(js_path, "w", encoding="utf-8") as f:
+      f.write("// v2\n")
+    with open(watcher_path, "w", encoding="utf-8") as f:
+      f.write("# watcher v2\n")
+    self.write_transcript([
+        {"step_index": 5, "type": "USER_INPUT", "content": "ship v2"},
+        _edit_step(6, js_path),
+        _edit_step(7, watcher_path),
+    ])
+    out2 = io.StringIO()
+    with (
+        patch.dict(os.environ, {"JETSKI_CONFIG_REPO": self.fx.repo}),
+        patch.object(auto_ship, "_run_cmd", side_effect=fake_run),
+    ):
+      code2 = auto_ship.ship(
+          "c1",
+          self.transcript,
+          "Ship v2 while main dirty",
+          out=out2,
+          run_post_push=True,
+          repo_filter=wt,
+      )
+    self.assertEqual(code2, 0, out2.getvalue())
+    self.assertNotIn(
+        "cl-flight-deck.service",
+        [u for u, _ in restarted_units],
+        "Dirty primary checkout must not restart stale cl-flight-deck.service",
+    )
+    self.assertIn("dirty", out2.getvalue())
+
+    # Linked worktree of skia_gardener fast-forwards primary checkout and builds/restarts there
+    gard_fx = RepoFixture(os.path.join(self.root, "gardener"))
+    gard_wt = os.path.realpath(os.path.join(self.root, "gardener_wt"))
+    _git(gard_fx.repo, "worktree", "add", "-q", "--detach", gard_wt, "origin/main")
+    go_path = os.path.join(gard_wt, "server.go")
+    with open(go_path, "w", encoding="utf-8") as f:
+      f.write("package main\n")
+    self.write_transcript([
+        {"step_index": 8, "type": "USER_INPUT", "content": "ship gardener wt"},
+        _edit_step(9, go_path),
+    ])
+    built_cmds: list[tuple[list[str], str]] = []
+    restarted_units.clear()
+
+    def fake_gard_run(cmd, timeout=None, cwd=None):
+      if cmd[:3] == ["go", "build", "-o"]:
+        built_cmds.append((list(cmd), os.path.realpath(cwd or "")))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+      return fake_run(cmd, timeout=timeout, cwd=cwd)
+
+    out3 = io.StringIO()
+    with (
+        patch.dict(
+            os.environ,
+            {
+                "JETSKI_AUTO_SHIP_REPOS": f"{self.fx.repo}:{gard_fx.repo}",
+                "JETSKI_CONFIG_REPO": self.fx.repo,
+                "JETSKI_GARDENER_REPO": gard_fx.repo,
+            },
+        ),
+        patch.object(auto_ship, "_run_cmd", side_effect=fake_gard_run),
+    ):
+      code3 = auto_ship.ship(
+          "c1",
+          self.transcript,
+          "Ship gardener from linked worktree",
+          out=out3,
+          run_post_push=True,
+          repo_filter=gard_wt,
+      )
+    self.assertEqual(code3, 0, out3.getvalue())
+    self.assertEqual(
+        _git(gard_fx.repo, "rev-parse", "HEAD"),
+        _git(gard_wt, "rev-parse", "HEAD"),
+        "Clean primary skia_gardener checkout must fast-forward to linked worktree commit",
+    )
+    self.assertIn(
+        (["go", "build", "-o", "skia-gardener", "."], gard_fx.repo),
+        built_cmds,
+        "go build must run in synced primary skia_gardener checkout",
+    )
+    self.assertIn(
+        ("skia-gardener.service", gard_fx.repo),
+        restarted_units,
+        "Synced primary skia_gardener checkout must restart skia-gardener.service",
+    )
+
 
 class TestStopGuardAutoShip(unittest.TestCase):
 

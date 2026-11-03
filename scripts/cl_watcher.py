@@ -12101,12 +12101,20 @@ const OLD_MERGED_DAYS = 3;
 const POLL_INTERVAL_MS = 60000;
 const FETCH_STATUS_TIMEOUT_MS = 10000;
 const INITIAL_RETRY_DELAY_MS = 2500;
+const CACHED_STATUS_STORAGE_KEY = 'flight_deck_cached_status_v1';
+const OPEN_DETAILS_STORAGE_KEY = 'flight_deck_open_details_v1';
+const SCROLL_Y_STORAGE_KEY = 'flight_deck_scroll_y_v1';
 let cachedData = null;
+// Distinguishes warm storage hydration from live /api/status responses for heartbeats and retries
+let hasLiveStatus = false;
 // Tracks server script mtime to trigger page reload on daemon re-exec
 let cachedUiVersion = null;
 // Stores last rendered payload signature so unchanged 60s polls skip innerHTML churn
 let lastRenderedDataSig = '';
 let pendingDeferredRender = false;
+let pendingBootScrollY = 0;
+let bootListenersBound = false;
+let pollIntervalTimer = 0;
 // Serializes overlapping poll and ping fetches and tracks fast boot retries
 let fetchInFlight = false;
 let initialRetryTimer = 0;
@@ -14696,6 +14704,7 @@ if (typeof document !== 'undefined' && typeof document.addEventListener === 'fun
       : (typeof el.hasAttribute === 'function' && el.hasAttribute('open'));
     if (isOpen) openDetailsKeys.add(k);
     else openDetailsKeys.delete(k);
+    persistOpenDetails();
   }, true);
 }
 
@@ -15523,9 +15532,102 @@ function postParentMessage(payload) {
   }
 }
 
-// Notifies the parent drawer that live dashboard state has rendered inside this iframe
+// Reads sessionStorage or localStorage without throwing inside sandboxed frames
+function readClientStorage(key, sessionFirst = true) {
+  const stores = [];
+  try {
+    if (sessionFirst && typeof sessionStorage !== 'undefined') stores.push(sessionStorage);
+  } catch (e) {}
+  try {
+    if (typeof localStorage !== 'undefined') stores.push(localStorage);
+  } catch (e) {}
+  try {
+    if (!sessionFirst && typeof sessionStorage !== 'undefined') stores.push(sessionStorage);
+  } catch (e) {}
+  for (const st of stores) {
+    try {
+      const val = st.getItem(key);
+      if (val !== null && val !== undefined) return String(val);
+    } catch (e) {}
+  }
+  return null;
+}
+
+// Writes UI state across reloads, tolerating quota or sandbox storage failures
+function writeClientStorage(key, val, includeLocal = true) {
+  const str = String(val);
+  try {
+    if (typeof sessionStorage !== 'undefined') sessionStorage.setItem(key, str);
+  } catch (e) {}
+  if (!includeLocal) return;
+  try {
+    if (typeof localStorage !== 'undefined') localStorage.setItem(key, str);
+  } catch (e) {}
+}
+
+// Caps persisted open <details> keys so storage stays small across long sessions
+function persistOpenDetails() {
+  writeClientStorage(OPEN_DETAILS_STORAGE_KEY, JSON.stringify([...openDetailsKeys].slice(-200)));
+}
+
+// Stores scroll offset in sessionStorage so each tab keeps its own viewport position
+function persistScrollPosition(y) {
+  const cleanY = Math.max(0, Math.round(Number(y) || 0));
+  writeClientStorage(SCROLL_Y_STORAGE_KEY, String(cleanY), false);
+}
+
+// Excludes transient _stack links and unused multi-hundred-KB item blobs from JSON snapshots
+function stripTransientStatusFields(k, v) {
+  return k.startsWith('_stack') ||
+    k === 'commit_message' ||
+    k === 'revision_ps_by_sha' ||
+    k === 'gmail'
+    ? undefined
+    : v;
+}
+
+// Persists compact status snapshot without ui_version to avoid warm-boot reload loops
+function persistCachedStatus(data) {
+  if (!data || typeof data !== 'object') return;
+  try {
+    const compactJson = JSON.stringify(
+      {
+        items: data.items || {},
+        bugs: data.bugs || {},
+        merge_request_groups: data.merge_request_groups || {},
+        bug_sync_errors: data.bug_sync_errors || [],
+        rollers_summary: data.rollers_summary || {},
+        gardener_url: data.gardener_url || '',
+        jetski_box_url: data.jetski_box_url || '',
+        last_sync: data.last_sync || '',
+      },
+      stripTransientStatusFields,
+    );
+    writeClientStorage(CACHED_STATUS_STORAGE_KEY, compactJson);
+  } catch (e) {}
+}
+
+// Flushes open disclosures and scroll offset before navigating or reloading the document
+function reloadDashboardPage() {
+  if (typeof location === 'undefined' || typeof location.reload !== 'function') return false;
+  syncOpenDetailsFromDom();
+  persistOpenDetails();
+  persistScrollPosition(captureScrollPosition());
+  location.reload();
+  return true;
+}
+
+// Restores either live in-page scrollY or one-shot boot scrollY after innerHTML replacement
+function applyRenderScrollPosition(savedScrollY) {
+  const targetY = savedScrollY > 0 ? savedScrollY : pendingBootScrollY;
+  pendingBootScrollY = 0;
+  restoreScrollPosition(targetY);
+  persistScrollPosition(targetY);
+}
+
+// Notifies the parent drawer only after a live /api/status payload rendered in this frame
 function notifyParentRendered(data) {
-  if (!data) return;
+  if (!data || !hasLiveStatus) return;
   const ver = Number((data && data.ui_version) || cachedUiVersion || 0);
   postParentMessage({
     type: 'jetski-flight-deck-rendered',
@@ -15534,18 +15636,20 @@ function notifyParentRendered(data) {
   });
 }
 
-// Computes a cycle-safe content fingerprint excluding transient sync wall-clock strings
+// Computes a cycle-safe content fingerprint excluding unused blobs and sync wall-clock strings
 function statusRenderSignature(data) {
   if (!data || typeof data !== 'object') return '';
   return JSON.stringify(
     {
       items: data.items || {},
       bugs: data.bugs || {},
+      merge_request_groups: data.merge_request_groups || {},
+      bug_sync_errors: data.bug_sync_errors || [],
       rollers_summary: data.rollers_summary || {},
       gardener_url: data.gardener_url || '',
       jetski_box_url: data.jetski_box_url || '',
     },
-    (k, v) => (k.startsWith('_stack') ? undefined : v),
+    stripTransientStatusFields,
   );
 }
 
@@ -15554,6 +15658,7 @@ function syncOpenDetailsFromDom() {
   if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return;
   const nodes = document.querySelectorAll('details[data-details-key]');
   if (!nodes || !nodes.length) return;
+  let changed = false;
   for (const el of nodes) {
     if (!el || typeof el.getAttribute !== 'function') continue;
     const k = el.getAttribute('data-details-key');
@@ -15561,9 +15666,15 @@ function syncOpenDetailsFromDom() {
     const isOpen = typeof el.open === 'boolean'
       ? el.open
       : (typeof el.hasAttribute === 'function' && el.hasAttribute('open'));
-    if (isOpen) openDetailsKeys.add(k);
-    else openDetailsKeys.delete(k);
+    if (isOpen && !openDetailsKeys.has(k)) {
+      openDetailsKeys.add(k);
+      changed = true;
+    } else if (!isOpen && openDetailsKeys.has(k)) {
+      openDetailsKeys.delete(k);
+      changed = true;
+    }
   }
+  if (changed) persistOpenDetails();
 }
 
 // Reads viewport vertical offset from either window or root documentElement
@@ -15645,7 +15756,10 @@ function render() {
     return link(x.url, `<i class="dot ${x.num_failed ? 'moving' : 'ok'}"></i>` +
       `<span class="name">${p}</span>`, '', tip);
   }).join('') + (data.gardener_url ? link(data.gardener_url, 'Gardener') : '');
-  document.getElementById('synced').textContent = data.last_sync || '';
+  // Keep Loading… indicator visible while showing warm-cached DOM before live fetch resolves
+  document.getElementById('synced').textContent = hasLiveStatus
+    ? (data.last_sync || '')
+    : (data.last_sync ? `Loading… · ${data.last_sync}` : 'Loading…');
 
   // Render the Bugs tab with its own project chips, Needs You focus cards, and lanes
   if (selectedView === 'bugs') {
@@ -15753,7 +15867,7 @@ function render() {
     const projCount = bugProjects.length;
     document.getElementById('footer').textContent =
       `${allBugs.length} tracked bugs across ${projCount} projects · refreshes every 5 min`;
-    restoreScrollPosition(savedScrollY);
+    applyRenderScrollPosition(savedScrollY);
     // Bugs view returns early before CL lanes, so emit rendered heartbeat here as well
     notifyParentRendered(data);
     return;
@@ -15825,7 +15939,7 @@ function render() {
     : (shown.length ? '' : '<p class="empty-note">No open CL or PR chats in this project.</p>');
   document.getElementById('footer').textContent =
     `${all.length} open CL and PR chats across ${projects.length} projects · refreshes every 60 s`;
-  restoreScrollPosition(savedScrollY);
+  applyRenderScrollPosition(savedScrollY);
   notifyParentRendered(data);
 }
 
@@ -15865,13 +15979,11 @@ async function fetchState(forceRender = false) {
     const nextVer = Number((nextData && nextData.ui_version) || 0);
     // Reload document when the server process restarted with updated HTML/JS
     if (cachedUiVersion !== null && nextVer > 0 && nextVer !== cachedUiVersion) {
-      // Trigger browser reload when new script code is active on daemon
-      if (typeof location !== 'undefined' && typeof location.reload === 'function') {
-        location.reload();
-        return;
-      }
+      if (reloadDashboardPage()) return;
     }
     if (nextVer > 0) cachedUiVersion = nextVer;
+    hasLiveStatus = true;
+    persistCachedStatus(nextData);
     const nextSig = statusRenderSignature(nextData);
     const syncedEl = document.getElementById('synced');
     const mustRender = forceRender === true || pendingDeferredRender;
@@ -15894,8 +16006,8 @@ async function fetchState(forceRender = false) {
     render();
   } catch (e) {
     document.getElementById('synced').textContent = 'Connection lost, retrying';
-    // Retry faster than the 60s poll while the initial payload has not rendered yet
-    if (!cachedData && !initialRetryTimer) {
+    // Retry faster than the 60s poll until the first live /api/status response succeeds
+    if (!hasLiveStatus && !initialRetryTimer) {
       initialRetryTimer = setTimeout(() => {
         initialRetryTimer = 0;
         void fetchState();
@@ -16226,7 +16338,7 @@ async function triggerRefresh() {
           // Keep polling across the brief re-exec socket gap
         }
       }
-      location.reload();
+      reloadDashboardPage();
       return;
     }
     await fetchState(true);
@@ -16236,37 +16348,50 @@ async function triggerRefresh() {
 }
 
 function boot() {
+  hasLiveStatus = false;
+  cachedUiVersion = null;
+  cachedData = null;
+  lastRenderedDataSig = '';
+  pendingDeferredRender = false;
+  openDetailsKeys.clear();
   const isEmbed = (window.parent && window.parent !== window) ||
     new URLSearchParams(location.search).get('embed') === '1';
   if (isEmbed) {
     document.documentElement.classList.add('embedded');
   }
-  // Answer parent drawer liveness pings when rendered, and kick off a fresh status poll
-  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  // Bind message and scroll listeners once across page boot and test re-invocations
+  if (!bootListenersBound && typeof window !== 'undefined' &&
+      typeof window.addEventListener === 'function') {
+    bootListenersBound = true;
     window.addEventListener('message', (ev) => {
       const msg = ev && ev.data;
       if (!msg || typeof msg !== 'object') return;
       if (msg.type === 'jetski-flight-deck-ping') {
-        // Ack rendered state only after initial status payload rendered so Loading stays honest
-        if (cachedData) notifyParentRendered(cachedData);
+        // Ack liveness only after live /api/status succeeded so broken backends still recover
+        if (hasLiveStatus && cachedData) notifyParentRendered(cachedData);
         void fetchState();
       }
     });
+    window.addEventListener('scroll', () => {
+      persistScrollPosition(captureScrollPosition());
+    }, {passive: true});
   }
-  let savedProj = 'ALL';
-  let savedView = 'cls';
-  let savedSecCls = null;
-  let savedSecBugs = null;
-  try {
-    if (typeof localStorage !== 'undefined') {
-      savedProj = localStorage.getItem('flight_deck_project') || 'ALL';
-      savedView = localStorage.getItem('flight_deck_view') || 'cls';
-      savedSecCls = localStorage.getItem('flight_deck_section_cls') || null;
-      savedSecBugs = localStorage.getItem('flight_deck_section_bugs') || null;
-    }
-  } catch (e) {
-    // Ignore storage errors in sandboxed iframes
+  const savedProj = readClientStorage('flight_deck_project', false) || 'ALL';
+  const savedView = readClientStorage('flight_deck_view', false) || 'cls';
+  const savedSecCls = readClientStorage('flight_deck_section_cls', false) || null;
+  const savedSecBugs = readClientStorage('flight_deck_section_bugs', false) || null;
+  const rawDetails = readClientStorage(OPEN_DETAILS_STORAGE_KEY);
+  if (rawDetails) {
+    try {
+      const parsedKeys = JSON.parse(rawDetails);
+      if (Array.isArray(parsedKeys)) {
+        for (const k of parsedKeys) {
+          if (typeof k === 'string' && k) openDetailsKeys.add(k);
+        }
+      }
+    } catch (e) {}
   }
+  pendingBootScrollY = Math.max(0, Number(readClientStorage(SCROLL_Y_STORAGE_KEY)) || 0);
   // URL hash overrides localStorage so direct #view=bugs&section=assigned links open directly
   const hashParams = new URLSearchParams(location.hash.slice(1));
   selectedProject = hashParams.get('project') || savedProj;
@@ -16277,8 +16402,20 @@ function boot() {
   if (hashSection) {
     selectedSection[selectedView === 'bugs' ? 'bugs' : 'cls'] = hashSection;
   }
+  // Hydrate last rendered snapshot immediately so cards stay visible while Loading… is shown
+  const rawCachedStatus = readClientStorage(CACHED_STATUS_STORAGE_KEY);
+  if (rawCachedStatus) {
+    try {
+      const parsedStatus = JSON.parse(rawCachedStatus);
+      if (parsedStatus && typeof parsedStatus === 'object') {
+        cachedData = parsedStatus;
+        render();
+      }
+    } catch (e) {}
+  }
   fetchState();
-  setInterval(fetchState, POLL_INTERVAL_MS);
+  if (pollIntervalTimer && typeof clearInterval === 'function') clearInterval(pollIntervalTimer);
+  pollIntervalTimer = setInterval(fetchState, POLL_INTERVAL_MS);
 }
 
 boot();
@@ -16296,12 +16433,16 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
 
   def _send_json(self, payload: Any, code: int = 200) -> None:
     raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    self.send_response(code)
-    self.send_header("Content-Type", "application/json; charset=utf-8")
-    self.send_header("Cache-Control", "no-store")
-    self.send_header("Content-Length", str(len(raw)))
-    self.end_headers()
-    self.wfile.write(raw)
+    try:
+      self.send_response(code)
+      self.send_header("Content-Type", "application/json; charset=utf-8")
+      self.send_header("Cache-Control", "no-store")
+      self.send_header("Content-Length", str(len(raw)))
+      self.end_headers()
+      self.wfile.write(raw)
+    except (BrokenPipeError, ConnectionResetError):
+      # Client or proxy closed the socket before reading the response
+      return
 
   def do_GET(self) -> None:  # pylint: disable=invalid-name
     parsed = urllib.parse.urlparse(self.path)
@@ -16321,12 +16462,16 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
       return
 
     raw = DASHBOARD_HTML.encode("utf-8")
-    self.send_response(200)
-    self.send_header("Content-Type", "text/html; charset=utf-8")
-    self.send_header("Cache-Control", "no-store")
-    self.send_header("Content-Length", str(len(raw)))
-    self.end_headers()
-    self.wfile.write(raw)
+    try:
+      self.send_response(200)
+      self.send_header("Content-Type", "text/html; charset=utf-8")
+      self.send_header("Cache-Control", "no-store")
+      self.send_header("Content-Length", str(len(raw)))
+      self.end_headers()
+      self.wfile.write(raw)
+    except (BrokenPipeError, ConnectionResetError):
+      # Client navigated away while HTML document was flushing
+      return
 
   def do_POST(self) -> None:  # pylint: disable=invalid-name
     parsed = urllib.parse.urlparse(self.path)
@@ -16541,12 +16686,16 @@ def serve_forever(
   t = threading.Thread(target=bg_loop, daemon=True)
   t.start()
 
-  export_flight_deck_info(port)
-  pen = flight_deck_pen_url(port)
-  print(
-      f"CL Flight Deck listening on http://localhost:{port} (PEN: {pen})",
-      flush=True,
-  )
+  # Resolve UberProxy PEN URL off the main thread so the HTTP socket accepts immediately
+  def export_and_announce() -> None:
+    export_flight_deck_info(port)
+    pen = flight_deck_pen_url(port)
+    print(
+        f"CL Flight Deck listening on http://localhost:{port} (PEN: {pen})",
+        flush=True,
+    )
+
+  threading.Thread(target=export_and_announce, daemon=True).start()
   server.serve_forever()
 
 

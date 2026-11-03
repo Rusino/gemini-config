@@ -70,11 +70,73 @@ def personal_repos() -> list[str]:
   return out
 
 
+# Resolve primary ~/.gemini/config checkout with optional test override
+def _config_repo_root() -> str:
+  raw = os.environ.get("JETSKI_CONFIG_REPO") or "~/.gemini/config"
+  return os.path.realpath(os.path.expanduser(raw.strip()))
+
+
+# Resolve primary skia_gardener checkout with optional test override
+def _gardener_repo_root() -> str:
+  raw = (
+      os.environ.get("JETSKI_GARDENER_REPO")
+      or "~/.gemini/jetski/scratch/skia_gardener"
+  )
+  return os.path.realpath(os.path.expanduser(raw.strip()))
+
+
+# Include explicit env overrides alongside personal_repos for worktree discovery
+def _configured_base_repos() -> list[str]:
+  bases = list(personal_repos())
+  for env_key, fn in (
+      ("JETSKI_CONFIG_REPO", _config_repo_root),
+      ("JETSKI_GARDENER_REPO", _gardener_repo_root),
+  ):
+    if env_key in os.environ:
+      root = fn()
+      if os.path.isdir(root) and root not in bases:
+        bases.append(root)
+  return bases
+
+
+# Match secondary git worktrees sharing git_common_dir with primary_repo
+def _is_linked_worktree_of(path: str, primary_repo: str) -> bool:
+  if not path or not primary_repo:
+    return False
+  rp = os.path.realpath(os.path.expanduser(path.strip()))
+  primary_rp = os.path.realpath(os.path.expanduser(primary_repo.strip()))
+  if rp == primary_rp or not os.path.isdir(rp) or not os.path.isdir(primary_rp):
+    return False
+  ginfo = _resolve_git_dirs(rp)
+  pinfo = _resolve_git_dirs(primary_rp)
+  if not ginfo or not pinfo or ginfo[0] != rp:
+    return False
+  return ginfo[2] == pinfo[2]
+
+
+# Treat both primary personal checkouts and their linked worktrees as personal repos
 def is_personal_repo(path: str) -> bool:
   if not path:
     return False
   rp = os.path.realpath(os.path.expanduser(path.strip()))
-  return rp in set(personal_repos())
+  bases = _configured_base_repos()
+  if rp in set(bases):
+    return True
+  return any(_is_linked_worktree_of(rp, b) for b in bases)
+
+
+# Primary personal checkouts auto-ship on main; linked worktrees also allow detached HEAD
+def is_auto_ship_branch(path: str, branch: str = "") -> bool:
+  if not path:
+    return False
+  rp = os.path.realpath(os.path.expanduser(path.strip()))
+  bases = _configured_base_repos()
+  br = branch if branch else _repo_branch(rp)
+  if rp in set(bases):
+    return br == "main"
+  if any(_is_linked_worktree_of(rp, b) for b in bases):
+    return br in ("main", "HEAD", "")
+  return False
 
 
 def _unquote(value) -> str:
@@ -221,22 +283,61 @@ def _repo_branch(top_level: str) -> str:
   return res.stdout.strip() if res.returncode == 0 else ""
 
 
-def plan_ship(conv_id: str, transcript_path: str = "") -> list[dict]:
+# Build per-repo auto-ship entries for dirty owned files and unpushed commits
+def plan_ship(
+    conv_id: str,
+    transcript_path: str = "",
+    extra_repos: list[str] | None = None,
+) -> list[dict]:
   import roadmap
 
   tpath = roadmap._find_transcript_path(conv_id, transcript_path)
   all_touched, turn_touched, turn_commit_repos = _collect_strict_touched(
       conv_id, tpath
   )
+  base_repos = _configured_base_repos()
+  base_common_dirs: set[str] = set()
+  for b in base_repos:
+    if os.path.isdir(b):
+      binfo = _resolve_git_dirs(b)
+      if binfo and binfo[0] == b:
+        base_common_dirs.add(binfo[2])
+
+  # Discover linked worktrees of personal repos from touched paths or explicit --repo
+  explicit_set = {
+      os.path.realpath(os.path.expanduser(r.strip()))
+      for r in (extra_repos or [])
+      if r and r.strip()
+  }
+  candidate_repos = list(base_repos)
+  probe_dirs = (
+      {os.path.dirname(p) for p in all_touched}
+      | set(turn_commit_repos)
+      | explicit_set
+  )
+  for d in sorted(probe_dirs):
+    if not d or not os.path.isdir(d):
+      continue
+    ginfo = _resolve_git_dirs(d)
+    if not ginfo:
+      continue
+    wt_top, _, wt_common = ginfo
+    if wt_common in base_common_dirs and wt_top not in candidate_repos:
+      candidate_repos.append(wt_top)
+
   entries: list[dict] = []
-  for repo in personal_repos():
+  for repo in candidate_repos:
     if not os.path.isdir(repo):
       continue
     ginfo = _resolve_git_dirs(repo)
     if not ginfo or ginfo[0] != repo:
       continue
     top_level, git_dir, git_common_dir = ginfo
-    if _repo_branch(top_level) != "main":
+    branch = _repo_branch(top_level)
+    # Primary checkouts auto-ship only on main; linked worktrees also allow detached HEAD
+    if top_level not in explicit_set and not is_auto_ship_branch(
+        top_level, branch
+    ):
       continue
     reg = _sync_repo_commits(top_level, git_common_dir)
     foreign_leased = _active_foreign_file_leases(git_dir, conv_id, tpath)
@@ -280,50 +381,56 @@ def plan_ship(conv_id: str, transcript_path: str = "") -> list[dict]:
 
 # Map committed paths in personal repos to the local build/service restart commands
 def post_push_steps(
-    repo: str, changed_rels: list[str]
+    repo: str,
+    changed_rels: list[str],
+    main_checkout_synced: bool = True,
 ) -> list[tuple[list[str], str]]:
   rp = os.path.realpath(os.path.expanduser(repo))
-  gardener = os.path.realpath(
-      os.path.expanduser("~/.gemini/jetski/scratch/skia_gardener")
-  )
-  config = os.path.realpath(os.path.expanduser("~/.gemini/config"))
+  gardener = _gardener_repo_root()
+  config = _config_repo_root()
+  changed_set = set(changed_rels)
   steps: list[tuple[list[str], str]] = []
-  if rp == gardener:
-    root_go = any(
-        (r.endswith(".go") and not r.endswith("_test.go") and "/" not in r)
-        or r in ("go.mod", "go.sum")
-        for r in changed_rels
-    )
-    if root_go:
-      steps.append((["go", "build", "-o", "skia-gardener", "."], rp))
-      steps.append(
-          (["systemctl", "--user", "restart", "skia-gardener.service"], rp)
+  if rp == gardener or _is_linked_worktree_of(rp, gardener):
+    # Services execute binaries from primary gardener checkout, so build only when synced
+    if rp == gardener or main_checkout_synced:
+      root_go = any(
+          (r.endswith(".go") and not r.endswith("_test.go") and "/" not in r)
+          or r in ("go.mod", "go.sum")
+          for r in changed_rels
       )
-    overlay_go = any(
-        r.startswith("overlay/")
-        and r.endswith(".go")
-        and not r.endswith("_test.go")
-        for r in changed_rels
-    )
-    if overlay_go:
-      steps.append(
-          (["go", "build", "-o", "overlay/skia-status-overlay", "./overlay"], rp)
+      if root_go:
+        steps.append((["go", "build", "-o", "skia-gardener", "."], gardener))
+        steps.append((
+            ["systemctl", "--user", "restart", "skia-gardener.service"],
+            gardener,
+        ))
+      overlay_go = any(
+          r.startswith("overlay/")
+          and r.endswith(".go")
+          and not r.endswith("_test.go")
+          for r in changed_rels
       )
-      steps.append((
-          ["systemctl", "--user", "restart", "skia-status-overlay.service"],
-          rp,
-      ))
-  elif rp == config:
+      if overlay_go:
+        steps.append((
+            ["go", "build", "-o", "overlay/skia-status-overlay", "./overlay"],
+            gardener,
+        ))
+        steps.append((
+            ["systemctl", "--user", "restart", "skia-status-overlay.service"],
+            gardener,
+        ))
+  elif rp == config or _is_linked_worktree_of(rp, config):
     # cl_watcher imports chat_lifecycle at daemon startup, so changes to either need a restart
-    if {"scripts/cl_watcher.py", "hooks/chat_lifecycle.py"} & set(changed_rels):
-      steps.append(
-          (["systemctl", "--user", "restart", "cl-flight-deck.service"], rp)
-      )
-    # Sync ~/.gemini/jetski/brain/jetski-closed-filter.js when the source filter script changes
-    if "scripts/jetski_closed_filter.js" in set(changed_rels):
+    if {"scripts/cl_watcher.py", "hooks/chat_lifecycle.py"} & changed_set:
+      if rp == config or main_checkout_synced:
+        steps.append(
+            (["systemctl", "--user", "restart", "cl-flight-deck.service"], config)
+        )
+    # Sync ~/.gemini/jetski/brain/jetski-closed-filter.js from the shipped tree
+    if {"scripts/jetski_closed_filter.js", "scripts/patch_jetski_hub_binary.py"} & changed_set:
       steps.append((["python3", "scripts/patch_jetski_hub_binary.py"], rp))
     # Restart hub daemon so in-memory index.html string table reloads the patched bootstrap shim
-    if {"scripts/patch_jetski_hub_binary.py"} & set(changed_rels):
+    if "scripts/patch_jetski_hub_binary.py" in changed_set:
       steps.append(
           (["systemctl", "--user", "restart", "jetski-hub.service"], rp)
       )
@@ -344,11 +451,56 @@ def _append_model_trailer(message: str, conv_id: str) -> str:
   return f"{msg}\n\n{trailer}"
 
 
+# Sync primary personal checkout when shipping from a worktree and run post-push hooks
 def _run_post_push(
-    repo: str, changed_rels: list[str], out
+    repo: str,
+    changed_rels: list[str],
+    out,
+    conv_id: str = "",
+    transcript_path: str = "",
+    head_sha: str = "",
 ) -> tuple[bool, list[str]]:
   notes: list[str] = []
-  for cmd, cwd in post_push_steps(repo, changed_rels):
+  rp = os.path.realpath(os.path.expanduser(repo))
+  config = _config_repo_root()
+  gardener = _gardener_repo_root()
+  main_synced = True
+  primary_target = ""
+  if _is_linked_worktree_of(rp, config):
+    primary_target = config
+  elif _is_linked_worktree_of(rp, gardener):
+    primary_target = gardener
+  if primary_target:
+    # Fast-forward primary checkout before building or restarting services wired to it
+    sync_res = force_sync_config_clone(
+        repo=primary_target, conv_id=conv_id, transcript_path=transcript_path
+    )
+    sync_status = str(sync_res.get("status") or "unknown")
+    prim_head = _git_head_sha(primary_target)
+    main_synced = sync_status in ("updated", "up_to_date") and (
+        not head_sha or prim_head == head_sha
+    )
+    if main_synced and sync_status == "updated":
+      notes.append(f"synced {primary_target} -> {prim_head[:7]}")
+    elif not main_synced:
+      if primary_target == config and (
+          {"scripts/cl_watcher.py", "hooks/chat_lifecycle.py"} & set(changed_rels)
+      ):
+        notes.append(
+            f"skipped cl-flight-deck.service restart ({config} is {sync_status})"
+        )
+      elif primary_target == gardener and any(
+          (r.endswith(".go") and not r.endswith("_test.go"))
+          or r in ("go.mod", "go.sum")
+          for r in changed_rels
+      ):
+        notes.append(
+            f"skipped skia-gardener rebuild/restart ({gardener} is {sync_status})"
+        )
+
+  for cmd, cwd in post_push_steps(
+      repo, changed_rels, main_checkout_synced=main_synced
+  ):
     if cmd[:2] == ["systemctl", "--user"] and len(cmd) >= 4:
       unit = cmd[3]
       probe = _run_cmd(["systemctl", "--user", "cat", unit], timeout=3.0)
@@ -377,9 +529,14 @@ def ship(
 
   out = out or sys.stdout
   tpath = roadmap._find_transcript_path(conv_id, transcript_path)
-  plan = plan_ship(conv_id, tpath)
-  if repo_filter:
-    target_rp = os.path.realpath(os.path.expanduser(repo_filter))
+  # Pass explicit --repo into plan_ship so detached linked worktrees are discovered
+  target_rp = (
+      os.path.realpath(os.path.expanduser(repo_filter)) if repo_filter else ""
+  )
+  plan = plan_ship(
+      conv_id, tpath, extra_repos=[target_rp] if target_rp else None
+  )
+  if target_rp:
     plan = [e for e in plan if e["repo"] == target_rp]
   if not plan:
     out.write("auto-ship: nothing to commit or push\n")
@@ -445,9 +602,10 @@ def ship(
         }
         _write_json_atomic(reg_path, reg)
 
+      # Allow full githooks/pre-commit test suite to complete under multi-chat CPU load
       commit_res = _run_cmd(
           ["git", "-C", repo, "commit", "-m", full_msg, "--", *files],
-          timeout=180.0,
+          timeout=600.0,
       )
       if commit_res.returncode != 0:
         reg = _read_json_file(reg_path)
@@ -473,7 +631,9 @@ def ship(
       )
       return 1
 
-    push_res = _run_cmd(["git", "-C", repo, "push", "origin", "main"], timeout=60.0)
+    # Detached or linked-worktree HEAD must push HEAD:main instead of stale local main
+    push_ref = "main" if _repo_branch(repo) == "main" else "HEAD:main"
+    push_res = _run_cmd(["git", "-C", repo, "push", "origin", push_ref], timeout=60.0)
     if push_res.returncode != 0:
       out.write(
           f"git push failed in {repo}:\n{push_res.stdout}{push_res.stderr}\n"
@@ -504,7 +664,14 @@ def ship(
         ]
 
     if run_post_push and changed_rels:
-      ok, notes = _run_post_push(repo, changed_rels, out)
+      ok, notes = _run_post_push(
+          repo,
+          changed_rels,
+          out,
+          conv_id=conv_id,
+          transcript_path=tpath,
+          head_sha=head_sha,
+      )
       if notes:
         out.write(f"post-push ({repo}): {'; '.join(notes)}\n")
       if not ok:

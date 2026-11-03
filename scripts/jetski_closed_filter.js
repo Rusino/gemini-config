@@ -10014,10 +10014,12 @@
           } else if (now - flightDeckPendingVerSince >= FLIGHT_DECK_PING_ACK_TIMEOUT_MS) {
             autoForceReload = true;
           }
-        } else if (
-          flightDeckPendingVer > 0 &&
-          (infoVer === lastFlightDeckRenderedVer || alreadyReloadedForInfoVer)
-        ) {
+        } else if (infoVer > 0 && infoVer === lastFlightDeckRenderedVer) {
+          // Clear stale reload suppression once exported infoVer catches up to live uiVersion
+          flightDeckPendingVer = 0;
+          flightDeckPendingVerSince = 0;
+          flightDeckReloadedTargetVer = 0;
+        } else if (flightDeckPendingVer > 0 && alreadyReloadedForInfoVer) {
           flightDeckPendingVer = 0;
           flightDeckPendingVerSince = 0;
         }
@@ -10276,16 +10278,16 @@
     } else if (data.type === 'jetski-flight-deck-close') {
       setFlightDeckOpen(false);
     } else if (data.type === 'jetski-flight-deck-rendered') {
-      // Clear pending ?v= bump only when the acked uiVersion caught up to the target version
+      // Clear pending or target version state only when live uiVersion matches that exact version
       lastFlightDeckRenderedAt = Date.now();
       const ver = Number(data.uiVersion) || 0;
       if (ver > 0) {
         lastFlightDeckRenderedVer = ver;
-        if (flightDeckReloadedTargetVer > 0 && ver > flightDeckReloadedTargetVer) {
-          flightDeckReloadedTargetVer = ver;
+        if (flightDeckReloadedTargetVer > 0 && ver === flightDeckReloadedTargetVer) {
+          flightDeckReloadedTargetVer = 0;
         }
       }
-      if (!flightDeckPendingVer || (ver > 0 && ver >= flightDeckPendingVer)) {
+      if (!flightDeckPendingVer || (ver > 0 && ver === flightDeckPendingVer)) {
         flightDeckPendingVer = 0;
         flightDeckPendingVerSince = 0;
       }

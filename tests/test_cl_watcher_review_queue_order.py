@@ -1079,6 +1079,353 @@ eval(
     )
     self.assertIn("REFRESH_AND_STATE_PERSISTENCE_PASSED", res.stdout)
 
+  def test_boot_preserves_rendered_dom_and_ui_state_while_loading(self):
+    js_code = r"""
+const assert = require('assert');
+const html = require('fs').readFileSync(0, 'utf8');
+const script = html.split('<script>')[1].split('</script>')[0].replace(/boot\(\);/g, '');
+
+const localMap = new Map();
+const sessionMap = new Map();
+global.localStorage = {
+  getItem(k) { return localMap.has(k) ? localMap.get(k) : null; },
+  setItem(k, v) { localMap.set(String(k), String(v)); },
+};
+global.sessionStorage = {
+  getItem(k) { return sessionMap.has(k) ? sessionMap.get(k) : null; },
+  setItem(k, v) { sessionMap.set(String(k), String(v)); },
+};
+
+let lanesWrites = 0;
+let focusWrites = 0;
+const els = new Map();
+function resetDomElements() {
+  els.clear();
+}
+function getEl(id) {
+  if (!els.has(id)) {
+    let inner = '';
+    const obj = {
+      id,
+      textContent: id === 'synced' ? 'Loading…' : '',
+      get innerHTML() { return inner; },
+      set innerHTML(v) {
+        inner = String(v);
+        if (id === 'lanes') lanesWrites++;
+        if (id === 'focus') focusWrites++;
+      },
+    };
+    els.set(id, obj);
+  }
+  return els.get(id);
+}
+
+let detailNodes = [];
+const winListeners = [];
+let reloadCalls = 0;
+global.document = {
+  documentElement: { scrollTop: 0, classList: { add() {} } },
+  getElementById: getEl,
+  addEventListener() {},
+  querySelector() { return null; },
+  querySelectorAll(sel) {
+    if (sel === 'details[data-details-key]') return detailNodes;
+    return [];
+  },
+};
+global.location = {
+  search: '?embed=1',
+  hash: '',
+  reload() { reloadCalls++; },
+};
+global.history = {
+  replaceState(_s, _t, url) { global.location.hash = String(url || ''); },
+};
+
+const parentMsgs = [];
+global.window = {
+  scrollY: 0,
+  scrollTo(_x, y) {
+    global.window.scrollY = y;
+    global.document.documentElement.scrollTop = y;
+  },
+  parent: { postMessage(msg) { parentMsgs.push(msg); } },
+  addEventListener(type, fn) {
+    if (type === 'message') winListeners.push(fn);
+  },
+};
+
+const basePayload = {
+  ui_version: 700,
+  last_sync: '12:00 ET',
+  rollers_summary: {},
+  bug_sync_errors: [],
+  merge_request_groups: {},
+  items: {
+    'gerrit:101': {
+      item_key: 'gerrit:101', kind: 'gerrit', target_id: '101',
+      project_name: 'Skia', subject: 'Persist Across Loading', status: 'NEW',
+      url: 'https://skia-review.googlesource.com/c/skia/+/101',
+      in_my_attention: true, is_self: false, role: 'reviewer', activity_ts: 20,
+      commit_message: 'Huge unused commit body '.repeat(50),
+      revision_ps_by_sha: {'deadbeef': 1},
+      gmail: {thread_id: 't1'},
+    },
+    'gerrit:200': {
+      item_key: 'gerrit:200', kind: 'gerrit', target_id: '200',
+      project_name: 'Skia', subject: 'Waiting CL', status: 'NEW',
+      url: 'https://skia-review.googlesource.com/c/skia/+/200',
+      in_my_attention: false, is_self: true, role: 'owner', activity_ts: 15,
+    },
+    'gerrit:300': {
+      item_key: 'gerrit:300', kind: 'gerrit', target_id: '300',
+      project_name: 'Skia', subject: 'Busy CL', status: 'NEW',
+      url: 'https://skia-review.googlesource.com/c/skia/+/300',
+      in_my_attention: true, chat_busy: true, conversation_id: 'cid-300',
+      is_self: false, role: 'reviewer', activity_ts: 30,
+    },
+  },
+  bugs: {},
+};
+
+let pendingStatusHandlers = [];
+let immediateStatus = true;
+global.fetch = (url) => {
+  if (url === '/api/status') {
+    if (immediateStatus) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => JSON.parse(JSON.stringify(basePayload)),
+      });
+    }
+    return new Promise((resolve, reject) => {
+      pendingStatusHandlers.push({ resolve, reject });
+    });
+  }
+  throw new Error('Unexpected fetch: ' + url);
+};
+
+const origSetInterval = global.setInterval;
+const origSetTimeout = global.setTimeout;
+global.setInterval = () => 1;
+const scheduledTimeouts = [];
+global.setTimeout = (fn, ms) => {
+  scheduledTimeouts.push({ fn, ms });
+  return scheduledTimeouts.length;
+};
+
+async function flushMicrotasks() {
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+}
+
+const runTest = async () => {
+  // Initial live load populates DOM and caches compact snapshot + UI state in storage
+  boot();
+  await flushMicrotasks();
+  toggleSection('waiting');
+  detailNodes = [{
+    open: true,
+    getAttribute(k) { return k === 'data-details-key' ? 'proc:gerrit:300' : null; },
+  }];
+  global.window.scrollY = 360;
+  global.document.documentElement.scrollTop = 360;
+  render();
+
+  // Simulate full page reload where /api/status is slow (in flight)
+  immediateStatus = false;
+  pendingStatusHandlers = [];
+  scheduledTimeouts.length = 0;
+  parentMsgs.length = 0;
+  detailNodes = [];
+  resetDomElements();
+  global.window.scrollY = 0;
+  global.document.documentElement.scrollTop = 0;
+  global.location.hash = '';
+
+  boot();
+
+  // Synchronously during Loading…, cached cards, lanes, open details, and scroll must stay visible
+  assert(
+    getEl('synced').textContent.startsWith('Loading…'),
+    'Header #synced must indicate Loading… before live fetch: ' + getEl('synced').textContent,
+  );
+  assert(
+    getEl('focus').innerHTML.includes('Persist Across Loading'),
+    'Focus cards must render immediately from cached snapshot while Loading… is shown',
+  );
+  assert(
+    getEl('lanes').innerHTML.includes('Waiting CL') &&
+      !getEl('lanes').innerHTML.includes('data-section="waiting" hidden'),
+    'Open secondary section must stay visible while Loading… is shown',
+  );
+  assert(
+    getEl('processing').innerHTML.includes('data-details-key="proc:gerrit:300" open'),
+    'Expanded <details> key must survive full page reload from storage',
+  );
+  assert.strictEqual(
+    global.window.scrollY,
+    360,
+    'Scroll position must restore synchronously after cached boot render',
+  );
+  assert.strictEqual(
+    parentMsgs.filter((m) => m.type === 'jetski-flight-deck-rendered').length,
+    0,
+    'Cached warm render must NOT emit jetski-flight-deck-rendered before live /api/status',
+  );
+  for (const fn of winListeners) {
+    fn({ data: { type: 'jetski-flight-deck-ping' } });
+  }
+  assert.strictEqual(
+    parentMsgs.filter((m) => m.type === 'jetski-flight-deck-rendered').length,
+    0,
+    'Parent ping before live /api/status must NOT falsely ack liveness from storage cache',
+  );
+
+  // Transient error on initial fetch keeps cached DOM on screen and schedules fast 2500ms retry
+  assert.strictEqual(pendingStatusHandlers.length, 1);
+  pendingStatusHandlers.shift().reject(new Error('PEN 502'));
+  await flushMicrotasks();
+  assert.strictEqual(getEl('synced').textContent, 'Connection lost, retrying');
+  assert(
+    getEl('focus').innerHTML.includes('Persist Across Loading'),
+    'Transient fetch error must NOT blank out cached focus cards',
+  );
+  const fastRetry = scheduledTimeouts.find((t) => t.ms === 2500);
+  assert(fastRetry, 'Initial fetch failure with cached DOM must still schedule 2500ms fast retry');
+
+  // Trigger fast retry and resolve with bumped ui_version=800 and unchanged data
+  fastRetry.fn();
+  assert.strictEqual(pendingStatusHandlers.length, 1);
+  const writesBeforeLiveResolve = lanesWrites;
+  const nextLive = JSON.parse(JSON.stringify(basePayload));
+  nextLive.ui_version = 800;
+  nextLive.last_sync = '12:02 ET';
+  pendingStatusHandlers.shift().resolve({
+    ok: true,
+    status: 200,
+    json: async () => nextLive,
+  });
+  await flushMicrotasks();
+
+  assert.strictEqual(
+    reloadCalls,
+    0,
+    'First live /api/status after reload must not loop-reload when ui_version differs from cache',
+  );
+  assert.strictEqual(
+    lanesWrites,
+    writesBeforeLiveResolve,
+    'Unchanged live /api/status matching warm-boot DOM must skip redundant innerHTML rebuild',
+  );
+  assert.strictEqual(getEl('synced').textContent, '12:02 ET');
+  const renderedMsgs = parentMsgs.filter((m) => m.type === 'jetski-flight-deck-rendered');
+  assert.strictEqual(renderedMsgs.length, 1, 'Live /api/status resolution must ack parent once');
+  assert.strictEqual(renderedMsgs[0].uiVersion, 800);
+
+  // Verify statusRenderSignature tracks merge_request_groups and bug_sync_errors, skips blobs
+  const sigBase = statusRenderSignature(basePayload);
+  const withUnusedDiff = JSON.parse(JSON.stringify(basePayload));
+  withUnusedDiff.items['gerrit:101'].commit_message = 'Changed body';
+  withUnusedDiff.items['gerrit:101'].revision_ps_by_sha = {'cafebabe': 2};
+  withUnusedDiff.items['gerrit:101'].gmail = {thread_id: 't2'};
+  assert.strictEqual(
+    statusRenderSignature(withUnusedDiff),
+    sigBase,
+    'Unused item blobs must not invalidate statusRenderSignature',
+  );
+  const withErrDiff = JSON.parse(JSON.stringify(basePayload));
+  withErrDiff.bug_sync_errors = ['gh issue list failed'];
+  assert.notStrictEqual(
+    statusRenderSignature(withErrDiff),
+    sigBase,
+    'bug_sync_errors must be included in statusRenderSignature',
+  );
+  const withMergeGrpDiff = JSON.parse(JSON.stringify(basePayload));
+  withMergeGrpDiff.merge_request_groups = {'500': {parent_id: '500'}};
+  assert.notStrictEqual(
+    statusRenderSignature(withMergeGrpDiff),
+    sigBase,
+    'merge_request_groups must be included in statusRenderSignature',
+  );
+
+  global.setInterval = origSetInterval;
+  global.setTimeout = origSetTimeout;
+  console.log('WARM_BOOT_LOADING_PRESERVED_PASSED');
+  process.exit(0);
+};
+
+eval(
+  script +
+    '\n;(' +
+    runTest.toString() +
+    ')().catch((err) => { console.error(err); process.exit(1); });',
+);
+"""
+    cmd = ["node", "-e", js_code]
+    res = subprocess.run(
+        cmd, input=w.DASHBOARD_HTML, capture_output=True, text=True, check=False
+    )
+    self.assertEqual(
+        res.returncode, 0, f"Node output: {res.stdout}\nError: {res.stderr}"
+    )
+    self.assertIn("WARM_BOOT_LOADING_PRESERVED_PASSED", res.stdout)
+
+  def test_serve_forever_accepts_before_pen_url_and_ignores_broken_pipe(self):
+    import threading as _th
+
+    block_export = unittest.mock.MagicMock()
+    pen_gate = _th.Event()
+    announce_done = _th.Event()
+    serve_called = _th.Event()
+
+    class FakeServer:
+
+      def serve_forever(self):
+        serve_called.set()
+
+      def server_close(self):
+        pass
+
+    def slow_pen(_port: int) -> str:
+      pen_gate.wait(timeout=2.0)
+      return "https://8089-pen.corp.goog"
+
+    with (
+        unittest.mock.patch.object(
+            w, "ThreadedHTTPServer", return_value=FakeServer()
+        ),
+        unittest.mock.patch.object(w, "export_flight_deck_info", block_export),
+        unittest.mock.patch.object(w, "flight_deck_pen_url", side_effect=slow_pen),
+        unittest.mock.patch(
+            "builtins.print", side_effect=lambda *_a, **_kw: announce_done.set()
+        ),
+    ):
+      t = _th.Thread(
+          target=w.serve_forever, args=(18089, 60, 0), daemon=True
+      )
+      t.start()
+      try:
+        self.assertTrue(
+            serve_called.wait(timeout=0.3),
+            "server.serve_forever() must start before slow flight_deck_pen_url() finishes",
+        )
+      finally:
+        pen_gate.set()
+        announce_done.wait(timeout=2.0)
+        t.join(timeout=2.0)
+
+    # Aborted client sockets must not raise BrokenPipeError from _send_json or do_GET
+    handler = w.FlightDeckHandler.__new__(w.FlightDeckHandler)
+    handler.path = "/"
+    handler.send_response = lambda *_a, **_kw: None
+    handler.send_header = lambda *_a, **_kw: None
+    handler.end_headers = lambda *_a, **_kw: None
+    handler.wfile = unittest.mock.MagicMock()
+    handler.wfile.write.side_effect = BrokenPipeError("client disconnected")
+    handler._send_json({"ok": True})
+    handler.do_GET()
+
 
 if __name__ == "__main__":
   unittest.main()
