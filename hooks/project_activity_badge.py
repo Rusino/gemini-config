@@ -100,11 +100,27 @@ def _conn_cache_path() -> str:
   return f"/tmp/jetski_ls_conn_{_uid_suffix()}.json"
 
 
-def _sync_lock_path() -> str:
+def _is_default_projects_dir(projects_dir: str) -> bool:
+  return os.path.abspath(os.path.expanduser(projects_dir)) == os.path.abspath(
+      os.path.expanduser(DEFAULT_PROJECTS_DIR)
+  )
+
+
+# Scope lock files inside custom projects_dir so unit tests never contend with the live daemon
+def _sync_lock_path(projects_dir: str = DEFAULT_PROJECTS_DIR) -> str:
+  if not _is_default_projects_dir(projects_dir):
+    return os.path.join(
+        os.path.expanduser(projects_dir), ".jetski_project_badge_sync.lock"
+    )
   return f"/tmp/jetski_project_badge_sync_{_uid_suffix()}.lock"
 
 
-def _watcher_lock_path() -> str:
+# Scope watcher singleton lock inside custom projects_dir so tests never kill the live watcher
+def _watcher_lock_path(projects_dir: str = DEFAULT_PROJECTS_DIR) -> str:
+  if not _is_default_projects_dir(projects_dir):
+    return os.path.join(
+        os.path.expanduser(projects_dir), ".jetski_project_badge_watcher.lock"
+    )
   return f"/tmp/jetski_project_badge_watcher_{_uid_suffix()}.lock"
 
 
@@ -2726,15 +2742,22 @@ def sync_once(
     force_running_cid: str = "",
     force_running_project_id: str = "",
     force_running_workspaces: list[str] | None = None,
+    non_blocking: bool = False,
 ) -> tuple[bool, int, list[tuple[str, str, str]]]:
   """Performs a single locked synchronization of project activity badges.
 
   Returns:
     `(rpc_ok, total_tracked_chats, modified_projects)`
   """
-  os.makedirs(os.path.dirname(_sync_lock_path()), exist_ok=True)
-  with open(_sync_lock_path(), "w", encoding="utf-8") as lock_f:
-    fcntl.flock(lock_f, fcntl.LOCK_EX)
+  lock_path = _sync_lock_path(projects_dir)
+  os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+  with open(lock_path, "a+", encoding="utf-8") as lock_f:
+    # Allow detached hook triggers to bail out when a sync or watcher poll already holds the lock
+    lock_flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if non_blocking else 0)
+    try:
+      fcntl.flock(lock_f, lock_flags)
+    except BlockingIOError:
+      return False, 0, []
     try:
       summaries = fetch_trajectories()
       if summaries is None:
@@ -2793,11 +2816,14 @@ def clear_all_badges(
     projects_dir: str = DEFAULT_PROJECTS_DIR,
 ) -> list[tuple[str, str, str]]:
   """Strips all activity badges from all projects in `projects_dir`."""
-  with open(_sync_lock_path(), "w", encoding="utf-8") as lock_f:
+  lock_path = _sync_lock_path(projects_dir)
+  os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+  with open(lock_path, "a+", encoding="utf-8") as lock_f:
     fcntl.flock(lock_f, fcntl.LOCK_EX)
     try:
-      # Clear live progress entries alongside project badges so stale banners unmount
-      export_live_progress_index({})
+      # Avoid wiping live jetski-live-progress.json when unit tests clear a temporary directory
+      if _is_default_projects_dir(projects_dir):
+        export_live_progress_index({})
       return apply_project_badges(projects_dir, {}, {}, {})
     finally:
       fcntl.flock(lock_f, fcntl.LOCK_UN)
@@ -2837,7 +2863,9 @@ def run_watcher_loop(projects_dir: str = DEFAULT_PROJECTS_DIR) -> None:
   script_path = os.path.abspath(__file__)
   initial_mtime_ns = _script_mtime_ns(script_path)
   # Open with a+ so contending processes never truncate the lock holder's PID/mtime
-  lock_f = open(_watcher_lock_path(), "a+", encoding="utf-8")
+  watcher_lock = _watcher_lock_path(projects_dir)
+  os.makedirs(os.path.dirname(watcher_lock), exist_ok=True)
+  lock_f = open(watcher_lock, "a+", encoding="utf-8")
   try:
     fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
   except BlockingIOError:
@@ -3014,18 +3042,24 @@ def handle_bg_trigger(
 ) -> None:
   """Runs inside the detached background child spawned by the hook."""
   if event == "PreInvocation":
+    # Skip contended syncs in hook workers so simultaneous turns never form a FIFO lock convoy
     sync_once(
         projects_dir=projects_dir,
         force_running_cid=cid,
         force_running_project_id=project_id,
         force_running_workspaces=workspace_paths,
+        non_blocking=True,
     )
     run_watcher_loop(projects_dir=projects_dir)
   elif event == "Stop":
     # Wait briefly for the Language Server to transition the stopping
     # conversation from CASCADE_RUN_STATUS_RUNNING to CASCADE_RUN_STATUS_IDLE
     time.sleep(STOP_SETTLE_DELAY_SEC)
-    _, total_tracked, _ = sync_once(projects_dir=projects_dir)
+    # Non-blocking sync prevents Stop children from queueing behind an active watcher poll
+    _, total_tracked, _ = sync_once(
+        projects_dir=projects_dir,
+        non_blocking=True,
+    )
     if total_tracked > 0:
       run_watcher_loop(projects_dir=projects_dir)
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for project_activity_badge.py."""
 
+import fcntl
 import io
 import json
 import os
@@ -1876,6 +1877,68 @@ class TestProjectActivityBadge(unittest.TestCase):
       # B1 regression: subagent cid itself is exported so opening its pane has 0-token banner data
       self.assertIn("sub-blocked", exported["conversations"])
       self.assertEqual(exported["conversations"]["sub-blocked"]["state"], "blocked")
+
+  def test_custom_projects_dir_isolates_locks_and_non_blocking_sync_skips_convoy(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      proj_dir = os.path.join(tmpdir, "projects")
+      os.makedirs(proj_dir, exist_ok=True)
+      self.assertEqual(
+          badge._sync_lock_path(),
+          f"/tmp/jetski_project_badge_sync_{badge._uid_suffix()}.lock",
+      )
+      self.assertEqual(
+          badge._sync_lock_path(proj_dir),
+          os.path.join(proj_dir, ".jetski_project_badge_sync.lock"),
+      )
+      self.assertEqual(
+          badge._watcher_lock_path(),
+          f"/tmp/jetski_project_badge_watcher_{badge._uid_suffix()}.lock",
+      )
+      self.assertEqual(
+          badge._watcher_lock_path(proj_dir),
+          os.path.join(proj_dir, ".jetski_project_badge_watcher.lock"),
+      )
+
+      with mock.patch.object(badge, "export_live_progress_index") as mock_exp:
+        badge.clear_all_badges(proj_dir)
+        mock_exp.assert_not_called()
+
+      def_lock = os.path.join(tmpdir, "default_sync.lock")
+      with (
+          mock.patch.object(badge, "_sync_lock_path", return_value=def_lock),
+          mock.patch.object(badge, "apply_project_badges", return_value=[]),
+          mock.patch.object(badge, "export_live_progress_index") as mock_exp_def,
+      ):
+        badge.clear_all_badges(badge.DEFAULT_PROJECTS_DIR)
+        mock_exp_def.assert_called_once_with({})
+
+      lock_file = badge._sync_lock_path(proj_dir)
+      with open(lock_file, "a+", encoding="utf-8") as held_lock:
+        fcntl.flock(held_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+          with mock.patch.object(badge, "fetch_trajectories") as mock_fetch:
+            res = badge.sync_once(projects_dir=proj_dir, non_blocking=True)
+          self.assertEqual(res, (False, 0, []))
+          mock_fetch.assert_not_called()
+        finally:
+          fcntl.flock(held_lock, fcntl.LOCK_UN)
+
+      with (
+          mock.patch.object(
+              badge, "sync_once", return_value=(True, 0, [])
+          ) as mock_sync,
+          mock.patch.object(badge, "run_watcher_loop") as mock_watch,
+          mock.patch("time.sleep"),
+      ):
+        badge.handle_bg_trigger("PreInvocation", "cid-1", "proj-1", [], proj_dir)
+        self.assertTrue(mock_sync.call_args.kwargs.get("non_blocking"))
+        mock_watch.assert_called_once_with(projects_dir=proj_dir)
+
+        mock_sync.reset_mock()
+        mock_watch.reset_mock()
+        badge.handle_bg_trigger("Stop", "cid-1", "proj-1", [], proj_dir)
+        self.assertTrue(mock_sync.call_args.kwargs.get("non_blocking"))
+        mock_watch.assert_not_called()
 
 
 if __name__ == "__main__":
