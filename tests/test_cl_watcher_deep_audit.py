@@ -797,7 +797,16 @@ console.log(JSON.stringify({
             )
             self.assertTrue(any(q == "is:open is:pr author:Rusino" for q in queries_seen))
             self.assertTrue(
-                any(q == "is:open is:pr involves:Rusino -author:Rusino" for q in queries_seen)
+                any(
+                    q == "is:open is:pr review-requested:Rusino -author:Rusino"
+                    for q in queries_seen
+                )
+            )
+            self.assertTrue(
+                any(
+                    q == "is:open is:pr involves:Rusino -author:Rusino org:flutter user:Rusino"
+                    for q in queries_seen
+                )
             )
             self.assertEqual(len(remote), 1)
             self.assertEqual(remote[0]["repo_slug"], "Rusino/paragraph")

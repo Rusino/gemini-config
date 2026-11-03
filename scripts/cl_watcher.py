@@ -186,6 +186,10 @@ SELF_BUG_EMAILS = {
     "jlavrova@gmail.com",
 }
 SELF_GITHUB_LOGINS = {"Rusino", "jlavrova"}
+# Primary GitHub orgs/users where passive involves:Rusino PR activity is tracked
+GITHUB_TARGET_REPO_PREFIXES = ("flutter/", "rusino/")
+GITHUB_EXTERNAL_STALE_COMMENT_DAYS = 90
+GITHUB_TRUNK_REFS = frozenset({"main", "master"})
 ISSUES_CLI_BIN = "/google/bin/releases/issues-cli/issues"
 REMOTE_MCP_BIN = "/google/bin/releases/gemini-cli/tools/remote_mcp"
 BUGANIZER_MCP_SERVER = "blade:devtools.buganizer.mcpservice-prod"
@@ -2284,24 +2288,81 @@ def _item_created_sort_key(
   return 0.0
 
 
+def _normalize_github_repo_slug(repo_slug: str = "", host: str = "") -> str:
+  """Extracts an `owner/repo` slug from `repo_slug` or a `github.com/...` host/URL."""
+  for raw in (repo_slug, host):
+    s = str(raw or "").strip()
+    for prefix in (
+        "https://github.com/",
+        "http://github.com/",
+        "github.com/",
+        "https://api.github.com/repos/",
+        "http://api.github.com/repos/",
+        "api.github.com/repos/",
+    ):
+      if s.startswith(prefix):
+        s = s[len(prefix) :]
+        break
+    parts = [p for p in s.strip("/").split("/") if p]
+    if len(parts) >= 2 and parts[0].lower() not in ("github.com", "api.github.com"):
+      return f"{parts[0]}/{parts[1]}"
+  return ""
+
+
+def _is_target_github_repo(repo_slug: str) -> bool:
+  """Returns True when `repo_slug` belongs to tracked Flutter or Rusino namespaces."""
+  norm = _normalize_github_repo_slug(repo_slug).lower()
+  return bool(norm) and norm.startswith(GITHUB_TARGET_REPO_PREFIXES)
+
+
+def _github_item_repo_key(
+    d: dict[str, Any], info: dict[str, Any] | None = None
+) -> str:
+  """Resolves a lowercase `owner/repo` key to isolate GitHub PR stack graphs per repo."""
+  info_d = info or {}
+  for cand_slug, cand_host in (
+      (info_d.get("repo_slug") or "", info_d.get("host") or ""),
+      (d.get("repo_slug") or "", d.get("preferred_host") or d.get("host") or ""),
+  ):
+    norm = _normalize_github_repo_slug(str(cand_slug), str(cand_host))
+    if norm:
+      return norm.lower()
+  return "flutter/flutter"
+
+
+def _is_stackable_github_head_ref(head_ref: str, base_ref: str = "") -> bool:
+  """Returns True when `head_ref` is a non-trunk feature branch distinct from `base_ref`."""
+  href = str(head_ref or "").strip()
+  bref = str(base_ref or "").strip()
+  if not href or href.lower() in GITHUB_TRUNK_REFS:
+    return False
+  # Cross-fork PRs with head_ref == base_ref cannot serve as upstream base branches
+  if bref and href == bref:
+    return False
+  return True
+
+
 def order_and_link_stack_changes(
     active_discovered: list[dict[str, Any]],
     fetched_cache: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
   """Computes stack ancestors, parents, and depth; orders queue bottom-up and FIFO."""
-  # Index GitHub PR items by head branch name and head commit SHA for stack linking
-  gh_head_to_item: dict[str, dict[str, Any]] = {}
-  gh_sha_to_item: dict[str, dict[str, Any]] = {}
+  # Index GitHub PR items per repository by stackable head branch name and head commit SHA
+  gh_head_to_item: dict[tuple[str, str], dict[str, Any]] = {}
+  gh_sha_to_item: dict[tuple[str, str], dict[str, Any]] = {}
   for d in active_discovered:
     if d.get("kind") == "github":
       ikey = str(d.get("item_key") or "")
       info = fetched_cache.get(ikey) or {}
+      repo_key = _github_item_repo_key(d, info)
       href = str(info.get("head_ref") or d.get("head_ref") or "").strip()
+      bref = str(info.get("base_ref") or d.get("base_ref") or "").strip()
       hsha = str(info.get("head_sha") or d.get("head_sha") or "").strip()
-      if href:
-        gh_head_to_item[href] = d
+      # Exclude trunk/self-matching head refs so unrelated PRs never share a synthetic stack root
+      if _is_stackable_github_head_ref(href, bref):
+        gh_head_to_item[(repo_key, href)] = d
       if hsha:
-        gh_sha_to_item[hsha] = d
+        gh_sha_to_item[(repo_key, hsha)] = d
 
   # Index Gerrit changes by target ID
   gerrit_by_tid: dict[str, dict[str, Any]] = {
@@ -2355,22 +2416,30 @@ def order_and_link_stack_changes(
         d["stack_depth"] = 0
 
     elif kind == "github":
+      repo_key = _github_item_repo_key(d, info)
       bref = str(info.get("base_ref") or d.get("base_ref") or "").strip()
-      gh_parent = gh_head_to_item.get(bref) if bref else None
+      # Trunk base_refs target the repository mainline rather than an open parent PR
+      gh_parent = (
+          gh_head_to_item.get((repo_key, bref))
+          if bref and bref.lower() not in GITHUB_TRUNK_REFS
+          else None
+      )
       if not gh_parent:
         commits = info.get("commit_shas") or d.get("commit_shas") or []
         for csha in commits:
-          cand = gh_sha_to_item.get(str(csha).strip())
+          cand = gh_sha_to_item.get((repo_key, str(csha).strip()))
           if cand and cand != d:
             gh_parent = cand
             break
       if gh_parent and gh_parent != d:
         p_key = str(gh_parent.get("item_key") or "")
         parent_ikey = p_key
-        # Trace ancestors bottom-up to prevent cycles
+        # Cap ancestor walk at 64 hops within the same repository to guarantee termination
         cur: dict[str, Any] | None = gh_parent
         visited: set[str] = {ikey}
-        while cur:
+        for _ in range(64):
+          if not cur:
+            break
           cur_key = str(cur.get("item_key") or "")
           if not cur_key or cur_key in visited:
             break
@@ -2380,7 +2449,11 @@ def order_and_link_stack_changes(
           next_bref = str(
               cur_info.get("base_ref") or cur.get("base_ref") or ""
           ).strip()
-          cur = gh_head_to_item.get(next_bref) if next_bref else None
+          cur = (
+              gh_head_to_item.get((repo_key, next_bref))
+              if next_bref and next_bref.lower() not in GITHUB_TRUNK_REFS
+              else None
+          )
         d["stack_depth"] = len(stack_ancestors)
       else:
         d["stack_depth"] = 0
@@ -2691,6 +2764,7 @@ def infer_project_for_change(
     files: list[str] | tuple[str, ...] = (),
     hashtags: list[str] | tuple[str, ...] = (),
     topic: str = "",
+    repo_slug: str = "",
 ) -> tuple[str, str]:
   """Maps an unchatted remote CL/PR to the matching Jetski project (id, name)."""
   by_name = {name.lower(): (pid, name) for pid, name in proj_names.items()}
@@ -2703,10 +2777,29 @@ def infer_project_for_change(
     return ("", candidates[0] if candidates else "Unassigned")
 
   subj_low = (subject or "").lower()
+  msg_low = (commit_message or "").lower()
+  files_low = [str(f).lower() for f in files]
   if kind == "github":
-    if "skparagraph" in subj_low and "web" not in subj_low:
-      return pick("SkParagraph", "WebParagraph")
-    return pick("WebParagraph")
+    eff_gh_repo = _normalize_github_repo_slug(repo_slug, host)
+    # Default to WebParagraph/SkParagraph only for Flutter/Rusino repos or legacy bare hosts
+    if not eff_gh_repo or _is_target_github_repo(eff_gh_repo):
+      if "skparagraph" in subj_low and "web" not in subj_low:
+        return pick("SkParagraph", "WebParagraph")
+      return pick("WebParagraph")
+    # External third-party GitHub repos stay Unassigned unless an explicit project keyword matches
+    gh_blob = " ".join([subj_low, msg_low, *files_low])
+    if any(kw in gh_blob for kw in ("webparagraph", "web_paragraph")):
+      return pick("WebParagraph")
+    if any(kw in gh_blob for kw in ("skoretext", "coretext")):
+      return pick("SkoreText", "Skia")
+    if any(
+        kw in gh_blob
+        for kw in ("textcluster", "textmetrics", "shapedtext", "canvas2d")
+    ):
+      return pick("TextClusters API", "Chromium")
+    if any(kw in gh_blob for kw in ("skparagraph", "skunicode", "skshaper")):
+      return pick("SkParagraph", "Skia")
+    return ("", "Unassigned")
   if host == GERRIT_CHROMIUM_HOST:
     # Canvas TextMetrics / ShapedText / TextCluster CLs belong to TextClusters API
     if any(
@@ -2716,10 +2809,8 @@ def infer_project_for_change(
       return pick("TextClusters API", "Chromium")
     return pick("Chromium", "TextClusters API")
   # CoreText / SkoreText macOS layout pipeline belongs to SkoreText
-  msg_low = (commit_message or "").lower()
   topic_low = (topic or "").lower()
   hashtags_low = {str(h).lower() for h in hashtags}
-  files_low = [str(f).lower() for f in files]
   is_skoretext = (
       any(kw in subj_low for kw in ("skoretext", "coretext"))
       or any(kw in topic_low for kw in ("skoretext", "coretext"))
@@ -2822,12 +2913,17 @@ def discover_open_remote_changes(
       pid, pname = infer_project_for_change("gerrit", host, subj, pnames)
       remote.append(_remote_item(ikey, "gerrit", num, host, pid, pname))
 
-  # GitHub Search rejects parenthesized OR across qualifiers with HTTP 422
+  # GitHub Search rejects parenthesized OR across qualifiers with HTTP 422, while multiple
+  # org:/user: owner qualifiers form a union; keep review-requested global
   gh_queries = (
-      "is:open is:pr author:Rusino",
-      "is:open is:pr involves:Rusino -author:Rusino",
+      ("author", "is:open is:pr author:Rusino"),
+      ("review_requested", "is:open is:pr review-requested:Rusino -author:Rusino"),
+      (
+          "involves_target",
+          "is:open is:pr involves:Rusino -author:Rusino org:flutter user:Rusino",
+      ),
   )
-  for gh_q in gh_queries:
+  for q_kind, gh_q in gh_queries:
     try:
       out = subprocess.check_output(
           [
@@ -2861,6 +2957,9 @@ def discover_open_remote_changes(
       repo_slug = m_repo.group(1) if m_repo else "flutter/flutter"
       if not num or num in ignored or f"{repo_slug}#{num}" in ignored:
         continue
+      # Enforce target repos on passive involves: discovery when mocks ignore query qualifiers
+      if q_kind == "involves_target" and not _is_target_github_repo(repo_slug):
+        continue
       ikey = f"github:{num}"
       if ikey in seen_keys:
         continue
@@ -2868,7 +2967,13 @@ def discover_open_remote_changes(
       if RE_AUTOROLL_SUBJECT.match(subj):
         continue
       seen_keys.add(ikey)
-      pid, pname = infer_project_for_change("github", f"github.com/{repo_slug}", subj, pnames)
+      pid, pname = infer_project_for_change(
+          "github",
+          f"github.com/{repo_slug}",
+          subj,
+          pnames,
+          repo_slug=repo_slug,
+      )
       remote.append(
           _remote_item(
               ikey,
@@ -5009,8 +5114,46 @@ def fetch_github_pr_status(
         str((c.get("author") or {}).get("login") or "")
         for c in d.get("comments") or []
     ]
-    is_reviewer = not is_self and bool(
-        set(req_logins + rev_logins + cmt_logins) & SELF_GITHUB_LOGINS
+    self_review_requested = bool(set(req_logins) & SELF_GITHUB_LOGINS)
+    stale_external_involvement = False
+    if (
+        not is_self
+        and not _is_target_github_repo(eff_repo)
+        and not self_review_requested
+        and bool(set(rev_logins + cmt_logins) & SELF_GITHUB_LOGINS)
+    ):
+      self_event_dts = [
+          parse_gerrit_or_iso_time(str(ts_raw))
+          for ts_raw in [
+              *(
+                  r.get("submittedAt")
+                  for r in (d.get("reviews") or [])
+                  if isinstance(r, dict)
+                  and str((r.get("author") or {}).get("login") or "")
+                  in SELF_GITHUB_LOGINS
+              ),
+              *(
+                  c.get("createdAt")
+                  for c in (d.get("comments") or [])
+                  if isinstance(c, dict)
+                  and str((c.get("author") or {}).get("login") or "")
+                  in SELF_GITHUB_LOGINS
+              ),
+          ]
+          if ts_raw
+      ]
+      latest_self_ts = max(
+          (dt.timestamp() for dt in self_event_dts if dt), default=0.0
+      )
+      # Historical comments on external repos without an active review request age out to watching
+      if not latest_self_ts or (
+          time.time() - latest_self_ts > GITHUB_EXTERNAL_STALE_COMMENT_DAYS * 86400
+      ):
+        stale_external_involvement = True
+    is_reviewer = (
+        not is_self
+        and not stale_external_involvement
+        and bool(set(req_logins + rev_logins + cmt_logins) & SELF_GITHUB_LOGINS)
     )
     # Keep reviewer role independent of is_watching so the author column labels colleagues
     role = "author" if is_self else ("reviewer" if is_reviewer else "watching")
@@ -5338,12 +5481,17 @@ def fetch_github_pr_status(
         and bool(last_actor)
         and last_actor not in SELF_GITHUB_LOGINS
     )
-    # Keep PRs we reviewed or approved in Waiting on others rather than passive Watching
+    # Keep PRs we reviewed or approved in Waiting on others unless external involvement aged out
     is_watching = (
         not is_self
         and not in_my_attention
-        and not self_approved
-        and self_review_state not in ("approved", "commented", "changes_requested")
+        and (
+            stale_external_involvement
+            or (
+                not self_approved
+                and self_review_state not in ("approved", "commented", "changes_requested")
+            )
+        )
     )
 
     # Map the status change date to the latest event driving the current PR phase
@@ -7218,7 +7366,7 @@ def compute_companion_states(
     # Map companion revisions so chained A -> B companions share base_ps and avoid false dedup
     comp_parent_by_sha: dict[str, str] = {}
     comp_ikey_by_sha: dict[str, str] = {}
-    comp_ikey_by_head_ref: dict[str, str] = {}
+    comp_ikey_by_head_ref: dict[tuple[str, str], str] = {}
     for cr in comp_recs:
       cr_ikey = str(cr.get("item_key") or "")
       cr_pcommit = str(cr.get("parent_commit") or "").strip()
@@ -7228,8 +7376,10 @@ def compute_companion_states(
           if cr_ikey:
             comp_ikey_by_sha[str(rev_sha)] = cr_ikey
       href = str(cr.get("head_ref") or "").strip()
-      if href and cr_ikey:
-        comp_ikey_by_head_ref[href] = cr_ikey
+      cr_bref = str(cr.get("base_ref") or "").strip()
+      # Key companion branches per repo and skip trunk/self refs to prevent cross-repo collisions
+      if cr_ikey and _is_stackable_github_head_ref(href, cr_bref):
+        comp_ikey_by_head_ref[(_github_item_repo_key(cr), href)] = cr_ikey
 
     # Map open companions by unique item_key and record parent/child companion chains
     open_comps_by_ikey: dict[str, list[dict[str, Any]]] = {}
@@ -7253,7 +7403,12 @@ def compute_companion_states(
             break
           cur_sha = comp_parent_by_sha[cur_sha]
         bref = str(r.get("base_ref") or "").strip()
-        anc_gh = comp_ikey_by_head_ref.get(bref, "") if bref else ""
+        # Match chained companion base_ref only within the same repo and outside trunk branches
+        anc_gh = (
+            comp_ikey_by_head_ref.get((_github_item_repo_key(r), bref), "")
+            if bref and bref.lower() not in GITHUB_TRUNK_REFS
+            else ""
+        )
         if anc_gh and anc_gh != r_ikey:
           comp_chain_adj.setdefault(r_ikey, set()).add(anc_gh)
           comp_chain_adj.setdefault(anc_gh, set()).add(r_ikey)
@@ -8677,7 +8832,19 @@ def infer_project_for_bug(
   if any(k in blob for k in ("skparagraph", "skunicode", "skshaper", "paragraph")):
     return pick("SkParagraph", "Skia")
   if bug.get("source") == "github":
-    return pick("SkParagraph", "WebParagraph")
+    bkey = str(bug.get("bug_key") or "")
+    raw_bug_repo = (
+        bkey[len("gh_issue:") :].split("#", 1)[0]
+        if bkey.startswith("gh_issue:") and "#" in bkey
+        else ""
+    )
+    gh_bug_repo = _normalize_github_repo_slug(
+        raw_bug_repo, str(bug.get("url") or "")
+    )
+    # Leave external GitHub issues without paragraph/web keywords Unassigned
+    if not gh_bug_repo or _is_target_github_repo(gh_bug_repo):
+      return pick("SkParagraph", "WebParagraph")
+    return ("", "Unassigned")
   return pick("Skia")
 
 
@@ -11509,6 +11676,24 @@ def sync_once(
           files=info.get("files") or (),
           hashtags=info.get("hashtags") or (),
           topic=str(info.get("topic") or ""),
+      )
+      if re_pid and re_pname:
+        d["project_id"] = re_pid
+        d["project_name"] = re_pname
+    # Re-infer unchatted Unassigned GitHub PRs once PR body and touched file paths are fetched
+    elif (
+        not d.get("conversation_id")
+        and d.get("kind") == "github"
+        and d.get("project_name") in ("", "Unassigned")
+    ):
+      re_pid, re_pname = infer_project_for_change(
+          "github",
+          str(info.get("host") or d.get("preferred_host") or ""),
+          str(info.get("subject") or d.get("title") or ""),
+          proj_names,
+          commit_message=str(info.get("commit_message") or ""),
+          files=info.get("files") or (),
+          repo_slug=str(info.get("repo_slug") or d.get("repo_slug") or ""),
       )
       if re_pid and re_pname:
         d["project_id"] = re_pid
