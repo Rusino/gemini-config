@@ -25,9 +25,12 @@ TRIAGE_RESULTS_DIR = Path(
 )
 WATCHER_STATE_FILE = Path.home() / ".gemini" / "config" / "logs" / "cl_watcher_state.json"
 
-# Production directories whose changes require Flutter or WebParagraph corpus verification
+# Production directories whose changes require Flutter, WebParagraph, or Google3 verification
 SKIA_CORPUS_PATH_RE = re.compile(
     r"(?:^|/)modules/(?:skparagraph|skunicode|skshaper)/(?:src|include)/"
+)
+G3_PARAGRAPH_EXEC_RE = re.compile(
+    r"(?:^|/)modules/(?:skparagraph|skunicode)/(?:(?:src|include)/|BUILD\.bazel$)"
 )
 WEBPARAGRAPH_CORPUS_PATH_RE = re.compile(
     r"(?:^|/)(?:engine/src/flutter/)?lib/web_ui/lib/"
@@ -52,6 +55,8 @@ INVALID_INTEGRITY_RE = re.compile(
     re.IGNORECASE,
 )
 REGRESSIONS_COUNT_RE = re.compile(r"Поломано:\s*(\d+)")
+G3_REPORT_TITLE = "# Google3 Paragraph Corpus Comparison"
+G3_REGRESSIONS_RE = re.compile(r"Новых падений \(Regressions\):\s*(\d+)")
 ATTESTATION_SHA_CELL_RE = re.compile(r"\(`([0-9a-f]{7,40})`\)")
 
 # Review outcomes that allow or encourage CR+1 and must block when corpus has not passed
@@ -70,7 +75,9 @@ PATCHSET_SCOPED_REVIEW_KEYS = (
     "corpus_tested_patchset",
     "corpus_tested_sha",
     "corpus_compare_md",
-    # Reset Google3 corpus path, addressed thread IDs, and staged draft IDs when a new PS lands
+    # Reset Google3 corpus state, addressed thread IDs, and staged draft IDs when a new PS lands
+    "g3_corpus_tested_patchset",
+    "g3_corpus_tested_sha",
     "g3_corpus_compare_md",
     "resolved_thread_ids",
     "draft_ids",
@@ -209,6 +216,9 @@ def save_triage_result(data: dict[str, Any], results_dir: Path | str | None = No
             merged["corpus_domain"] = existing.get("corpus_domain", "")
             merged["corpus_gate_authoritative"] = False
             merged["corpus_status"] = "pending"
+        if existing.get("g3_corpus_required") and "g3_corpus_required" not in data:
+            merged["g3_corpus_required"] = True
+            merged["g3_corpus_status"] = "pending"
         merged.update(data)
         if not merged.get("verdict_label"):
             merged["verdict_label"] = str(merged.get("verdict") or "SURGICAL_AUDIT").replace(
@@ -262,6 +272,8 @@ def save_triage_result(data: dict[str, Any], results_dir: Path | str | None = No
                         True,
                         "pending",
                         merged["corpus_script"],
+                        g3_corpus_required=bool(merged.get("g3_corpus_required")),
+                        g3_corpus_status=str(merged.get("g3_corpus_status") or "not_required"),
                     )
                     merged.update(lbls)
     else:
@@ -405,6 +417,16 @@ def corpus_display_name(corpus_script: str) -> str:
     return "Flutter corpus"
 
 
+# Join one or two active gate labels into a compact Flight Deck pill text
+def _join_gate_names(names: Sequence[str]) -> str:
+    if not names:
+        return "Flutter corpus"
+    if len(names) == 1:
+        return names[0]
+    short = ["Flutter" if n == "Flutter corpus" else n for n in names]
+    return " + ".join(short)
+
+
 # Format Flight Deck eyebrow, badge, and tone so gated LGTM outcomes never show green early
 def format_review_labels(
     outcome: str,
@@ -412,40 +434,53 @@ def format_review_labels(
     corpus_required: bool,
     corpus_status: str,
     corpus_script: str = "",
+    g3_corpus_required: bool = False,
+    g3_corpus_status: str = "not_required",
 ) -> dict[str, str]:
     meta = REVIEW_OUTCOME_META[outcome]
     safe_ps = int(patchset) if patchset else 1
     cname = corpus_display_name(corpus_script)
-    st = str(corpus_status or "").lower()
-    if outcome in GATED_LGTM_OUTCOMES and corpus_required:
-        # Unrun corpus requires explicit user or agent action rather than passive waiting
-        if st in ("", "pending", "required"):
-            lbl = f"⚠️ LGTM blocked: run {cname}"
-            return {
-                "verdict_label": lbl,
-                "review_outcome_label": lbl,
-                "review_eyebrow_label": lbl,
-                "verdict_tone": "corpus_blocked",
-            }
-        if st == "failed":
-            lbl = f"🔴 LGTM blocked: {cname} failed"
+    gates: list[tuple[str, str]] = []
+    if corpus_required:
+        st1 = str(corpus_status or "").lower()
+        gates.append((cname, "pending" if st1 in ("", "pending", "required") else st1))
+    if g3_corpus_required:
+        st2 = str(g3_corpus_status or "").lower()
+        gates.append(("google3 A/B", "pending" if st2 in ("", "pending", "required") else st2))
+
+    if outcome in GATED_LGTM_OUTCOMES and gates:
+        failed_names = [n for n, s in gates if s == "failed"]
+        if failed_names:
+            lbl = f"🔴 LGTM blocked: {_join_gate_names(failed_names)} failed"
             return {
                 "verdict_label": lbl,
                 "review_outcome_label": lbl,
                 "review_eyebrow_label": lbl,
                 "verdict_tone": "corpus_failed",
             }
-        if st == "waived":
+        # Unrun corpus requires explicit user or agent action rather than passive waiting
+        pending_names = [n for n, s in gates if s == "pending"]
+        if pending_names:
+            lbl = f"⚠️ LGTM blocked: run {_join_gate_names(pending_names)}"
+            return {
+                "verdict_label": lbl,
+                "review_outcome_label": lbl,
+                "review_eyebrow_label": lbl,
+                "verdict_tone": "corpus_blocked",
+            }
+        waived_names = [n for n, s in gates if s == "waived"]
+        if waived_names:
             short_map = {
                 "CLEAN": "Clean",
                 "NITS": "Minor nits",
                 "COMPANION_TESTS": "Logic OK + tests",
             }
             short = short_map.get(outcome, outcome)
+            joined = _join_gate_names(waived_names)
             return {
-                "verdict_label": f"⚠️ {short} ({cname} waived)",
-                "review_outcome_label": f"⚠️ {short} ({cname} waived)",
-                "review_eyebrow_label": f"⚠️ Review PS{safe_ps}: {short} ({cname} waived)",
+                "verdict_label": f"⚠️ {short} ({joined} waived)",
+                "review_outcome_label": f"⚠️ {short} ({joined} waived)",
+                "review_eyebrow_label": f"⚠️ Review PS{safe_ps}: {short} ({joined} waived)",
                 "verdict_tone": "corpus_blocked",
             }
     return {
@@ -454,6 +489,26 @@ def format_review_labels(
         "review_eyebrow_label": meta["eyebrow"].format(ps=safe_ps),
         "verdict_tone": outcome.lower(),
     }
+
+
+# Detect mandatory Google3 Paragraph A/B gate on Linux Cloudtop for SkParagraph/SkUnicode CLs
+def detect_g3_corpus_from_files(
+    files: Iterable[str] | None,
+    subject: str = "",
+    kind: str = "gerrit",
+    has_citc: bool | None = None,
+) -> dict[str, Any]:
+    eff_citc = os.path.isdir("/google/src/cloud") if has_citc is None else bool(has_citc)
+    if not eff_citc or kind != "gerrit" or re.search(r"^revert\b", str(subject or "").strip(), re.I):
+        return {"required": False, "files": []}
+    matched = [
+        str(f).strip().replace("\\", "/")
+        for f in (files or ())
+        if str(f).strip()
+        and not TEST_FILE_PATH_RE.search(str(f))
+        and G3_PARAGRAPH_EXEC_RE.search(str(f).strip().replace("\\", "/"))
+    ]
+    return {"required": bool(matched), "files": matched}
 
 
 # Detect mandatory corpus gate requirement from changed file paths and CL/PR subject
@@ -744,6 +799,87 @@ def find_matching_compare_md(
     return None
 
 
+# Inspect Google3 Paragraph A/B compare.md to verify Integrity Check, 0 regressions, and CL/PS
+def evaluate_g3_corpus_compare_md(
+    compare_md_path: Path | str,
+    cl_id: str = "",
+    patchset: int = 0,
+    patchset_sha: str = "",
+) -> dict[str, Any]:
+    p = Path(compare_md_path)
+    if not p.is_file():
+        return {"valid": False, "status": "missing", "reason": "file_not_found"}
+    try:
+        content = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {"valid": False, "status": "missing", "reason": "unreadable"}
+    if G3_REPORT_TITLE not in content:
+        return {"valid": False, "status": "wrong_runner", "reason": "wrong_runner"}
+
+    low = content.lower()
+    cl_tok = f"cl:{cl_id}/{int(patchset)}".lower() if (cl_id and patchset) else ""
+    short_sha = str(patchset_sha or "").strip().lower()[:7]
+    has_worktree = "`worktree`" in low
+    matches_ps = True
+    if cl_tok or len(short_sha) >= 7:
+        matches_ps = bool(
+            (cl_tok and cl_tok in low)
+            or (len(short_sha) >= 7 and short_sha in low)
+            or has_worktree
+        )
+    if not matches_ps:
+        return {
+            "valid": False,
+            "status": "stale_patchset",
+            "matches_patchset": False,
+            "compare_md": str(p),
+        }
+
+    integrity_ok = bool(
+        VALID_INTEGRITY_RE.search(content) and not INVALID_INTEGRITY_RE.search(content)
+    )
+    regs = [int(n) for n in G3_REGRESSIONS_RE.findall(content)]
+    passed = bool(integrity_ok and regs and all(n == 0 for n in regs))
+    return {
+        "valid": passed,
+        "status": "passed" if passed else "failed",
+        "matches_patchset": True,
+        "tested_sha": short_sha if (len(short_sha) >= 7 and short_sha in low) else "",
+        "compare_md": str(p),
+    }
+
+
+# Locate the newest Google3 A/B compare.md in search_dirs matching cl:<id>/<ps> or patchset SHA
+def find_matching_g3_compare_md(
+    search_dirs: Sequence[Path | str],
+    cl_id: str,
+    patchset: int,
+    patchset_sha: str = "",
+) -> dict[str, Any] | None:
+    seen: set[Path] = set()
+    candidates: list[tuple[float, Path]] = []
+    for raw_d in search_dirs:
+        d = Path(raw_d)
+        if not d.is_dir():
+            continue
+        for p in (d / "compare.md", *d.glob("g3*/compare.md"), *d.glob("*g3*/compare.md")):
+            try:
+                rp = p.resolve()
+                if rp not in seen and rp.is_file():
+                    seen.add(rp)
+                    candidates.append((rp.stat().st_mtime, rp))
+            except OSError:
+                continue
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    for _, p in candidates:
+        ev = evaluate_g3_corpus_compare_md(
+            p, cl_id=cl_id, patchset=patchset, patchset_sha=patchset_sha
+        )
+        if ev.get("status") in ("passed", "failed"):
+            return ev
+    return None
+
+
 # Read cached files, subject, and patchset SHA from cl_watcher_state.json when CLI omits them
 def _lookup_watcher_item_meta(
     kind: str,
@@ -853,6 +989,7 @@ def save_review_verdict(
     report_markdown: str = "",
     companion_id: str = "",
     corpus: str = "auto",
+    g3_corpus: str = "auto",
     compare_md: Path | str | None = None,
     g3_compare_md: Path | str | None = None,
     resolved_thread_ids: Sequence[str] | None = None,
@@ -865,11 +1002,14 @@ def save_review_verdict(
     files: Iterable[str] | None = None,
     verify_attestation: bool = False,
     compare_search_dirs: Sequence[Path | str] | None = None,
+    has_citc: bool | None = None,
     state_path: Path | str | None = None,
     results_dir: Path | str | None = None,
 ) -> Path:
     normalized_outcome = normalize_review_outcome(outcome)
     corpus_arg = normalize_corpus_arg(corpus)
+    g3_corpus_arg = normalize_corpus_arg(g3_corpus)
+    file_list = list(files) if files is not None else None
     iso_ts, et_ts = now_et_strings()
     safe_ps = int(patchset) if patchset else 1
 
@@ -898,8 +1038,8 @@ def save_review_verdict(
         corpus_script = str(rep_gate.get("script") or "")
         corpus_domain = str(rep_gate.get("domain") or "")
         corpus_auth = bool(rep_gate.get("authoritative"))
-    elif files is not None:
-        fg = detect_corpus_from_files(files, str(existing.get("subject") or ""))
+    elif file_list is not None:
+        fg = detect_corpus_from_files(file_list, str(existing.get("subject") or ""))
         corpus_req = bool(fg["required"])
         corpus_script = str(fg["script"])
         corpus_domain = str(fg["domain"])
@@ -1003,8 +1143,117 @@ def save_review_verdict(
             else:
                 corpus_status = "pending"
 
+    # Keep unit tests hermetic across Linux and macOS unless CitC or g3 flags are explicit
+    eff_has_citc = (
+        bool(has_citc)
+        if has_citc is not None
+        else (
+            os.path.isdir("/google/src/cloud")
+            if (results_dir is None or g3_corpus_arg != "auto" or g3_compare_md is not None)
+            else False
+        )
+    )
+    g3_req = False
+    if kind == "gerrit" and eff_has_citc:
+        subj_str = str(existing.get("subject") or watcher_meta.get("subject") or "")
+        if file_list is not None:
+            g3_req = bool(
+                detect_g3_corpus_from_files(file_list, subj_str, kind=kind, has_citc=True)[
+                    "required"
+                ]
+            )
+        elif (
+            int(existing.get("triaged_patchset") or 0) == safe_ps
+            and "g3_corpus_required" in existing
+        ):
+            g3_req = bool(existing.get("g3_corpus_required"))
+        elif watcher_meta.get("files"):
+            g3_req = bool(
+                detect_g3_corpus_from_files(
+                    watcher_meta["files"], subj_str, kind=kind, has_citc=True
+                )["required"]
+            )
+        elif existing.get("g3_corpus_required") or g3_compare_md is not None:
+            g3_req = True
+
+    g3_tested_ps = 0
+    g3_tested_sha = ""
+    matched_g3_md = str(g3_compare_md or "").strip()
+    if kind != "gerrit" or g3_corpus_arg == "not_required":
+        g3_req = False
+        g3_status = "not_required"
+    elif g3_corpus_arg in ("pending", "failed", "waived"):
+        g3_req = True
+        g3_status = g3_corpus_arg
+    elif g3_corpus_arg == "passed":
+        g3_req = True
+        if g3_compare_md:
+            g3_ev = evaluate_g3_corpus_compare_md(
+                g3_compare_md, cl_id=str(target_id), patchset=safe_ps, patchset_sha=eff_rev
+            )
+            if g3_ev.get("status") == "passed":
+                g3_status = "passed"
+                g3_tested_ps = safe_ps
+                g3_tested_sha = str(g3_ev.get("tested_sha") or "")
+                matched_g3_md = str(g3_compare_md)
+            elif g3_ev.get("status") == "failed":
+                g3_status = "failed"
+            else:
+                g3_status = "pending"
+        elif verify_attestation:
+            g3_ev = find_matching_g3_compare_md(
+                eff_search_dirs, str(target_id), safe_ps, patchset_sha=eff_rev
+            )
+            if g3_ev and g3_ev.get("status") == "passed":
+                g3_status = "passed"
+                g3_tested_ps = safe_ps
+                g3_tested_sha = str(g3_ev.get("tested_sha") or "")
+                matched_g3_md = str(g3_ev.get("compare_md") or "")
+            elif g3_ev and g3_ev.get("status") == "failed":
+                g3_status = "failed"
+            else:
+                g3_status = "pending"
+                print(
+                    f"Warning: --g3-corpus passed requested without valid google3 compare.md "
+                    f"for PS{safe_ps}; recording g3_corpus_status=pending.",
+                    file=sys.stderr,
+                )
+        else:
+            g3_status = "passed"
+            g3_tested_ps = safe_ps
+    else:
+        if not g3_req and not g3_compare_md:
+            g3_status = "not_required"
+        else:
+            g3_req = True
+            g3_ev = (
+                evaluate_g3_corpus_compare_md(
+                    g3_compare_md, cl_id=str(target_id), patchset=safe_ps, patchset_sha=eff_rev
+                )
+                if g3_compare_md
+                else find_matching_g3_compare_md(
+                    eff_search_dirs, str(target_id), safe_ps, patchset_sha=eff_rev
+                )
+            )
+            if g3_ev and g3_ev.get("status") == "passed":
+                g3_status = "passed"
+                g3_tested_ps = safe_ps
+                g3_tested_sha = str(g3_ev.get("tested_sha") or "")
+                matched_g3_md = str(g3_ev.get("compare_md") or g3_compare_md or "")
+            elif g3_ev and g3_ev.get("status") == "failed":
+                g3_status = "failed"
+                matched_g3_md = str(g3_ev.get("compare_md") or g3_compare_md or "")
+            else:
+                g3_status = "pending"
+
     labels = format_review_labels(
-        normalized_outcome, safe_ps, corpus_req, corpus_status, corpus_script
+        normalized_outcome,
+        safe_ps,
+        corpus_req,
+        corpus_status,
+        corpus_script,
+        g3_corpus_required=g3_req,
+        g3_corpus_status=g3_status,
     )
     # Truncate on a word boundary so card summaries never cut off mid-word
     clean_summary = truncate_summary(summary, 180)
@@ -1024,7 +1273,11 @@ def save_review_verdict(
         "corpus_tested_patchset": tested_ps,
         "corpus_tested_sha": tested_sha,
         "corpus_compare_md": matched_compare_md,
-        "g3_corpus_compare_md": str(g3_compare_md or "").strip(),
+        "g3_corpus_required": g3_req,
+        "g3_corpus_status": g3_status,
+        "g3_corpus_tested_patchset": g3_tested_ps,
+        "g3_corpus_tested_sha": g3_tested_sha,
+        "g3_corpus_compare_md": matched_g3_md,
         "resolved_thread_ids": [
             str(x).strip() for x in (resolved_thread_ids or ()) if str(x).strip()
         ],
@@ -1075,6 +1328,10 @@ def record_tier0_delta_verdict(
     prev_corpus = str(existing.get("corpus_status") or "").lower()
     if delta_kind == "commit_msg_only" and prev_corpus in ("passed", "failed", "waived"):
         corpus_mode = prev_corpus
+    g3_mode = "auto"
+    prev_g3 = str(existing.get("g3_corpus_status") or "").lower()
+    if delta_kind == "commit_msg_only" and prev_g3 in ("passed", "failed", "waived"):
+        g3_mode = prev_g3
 
     return save_review_verdict(
         target_id=target_id,
@@ -1086,6 +1343,7 @@ def record_tier0_delta_verdict(
         report_markdown=str(existing.get("report_markdown") or ""),
         companion_id=str(existing.get("companion_id") or ""),
         corpus=corpus_mode,
+        g3_corpus=g3_mode,
         revision=revision,
         delta_kind=delta_kind,
         core_hunks=existing.get("core_hunks") or [],
@@ -1093,6 +1351,7 @@ def record_tier0_delta_verdict(
         audit_state="done",
         files=files,
         verify_attestation=False,
+        has_citc=True if existing.get("g3_corpus_required") else None,
         results_dir=results_dir,
     )
 
@@ -1669,6 +1928,7 @@ def overlay_triage_on_items(
     items: Iterable[dict[str, Any]],
     results_dir: Path | str | None = None,
     ingest_tmp: bool = True,
+    has_citc: bool | None = None,
 ) -> None:
     if ingest_tmp:
         try:
@@ -1676,6 +1936,11 @@ def overlay_triage_on_items(
         except Exception:
             pass
 
+    eff_has_citc = (
+        bool(has_citc)
+        if has_citc is not None
+        else (os.path.isdir("/google/src/cloud") if results_dir is None else False)
+    )
     triage_map = load_all_triage_results(results_dir=results_dir)
     for it in items:
         if not isinstance(it, dict):
@@ -1719,9 +1984,9 @@ def overlay_triage_on_items(
             except (ValueError, TypeError):
                 pass
 
-        it_corpus = detect_corpus_from_files(
-            it.get("files") or (), str(it.get("subject") or tr.get("subject") or "")
-        )
+        subj_str = str(it.get("subject") or tr.get("subject") or "")
+        item_kind = str(it.get("kind") or tr.get("kind") or "gerrit")
+        it_corpus = detect_corpus_from_files(it.get("files") or (), subj_str)
         corpus_req = bool(tr.get("corpus_required"))
         corpus_script = str(tr.get("corpus_script") or "")
         corpus_domain = str(tr.get("corpus_domain") or "")
@@ -1731,6 +1996,7 @@ def overlay_triage_on_items(
                 corpus_script = corpus_script or str(it_corpus["script"])
                 corpus_domain = corpus_domain or str(it_corpus["domain"])
 
+        eff_ps = int(cur_ps or tr_ps or 1)
         c_status = str(tr.get("corpus_status") or "").lower()
         if not corpus_req:
             c_status = "not_required"
@@ -1743,9 +2009,8 @@ def overlay_triage_on_items(
             tested_ps = int(tr.get("corpus_tested_patchset") or tr_ps or 0)
             # Keep passed corpus on GitHub when review count bumps patchset on the same SHA
             tested_sha = str(tr.get("corpus_tested_sha") or tr_rev or "").strip().lower()
-            eff_ps = int(cur_ps or tr_ps or 1)
             gh_sha_match = (
-                it.get("kind") == "github"
+                item_kind == "github"
                 and len(cur_rev) >= 7
                 and len(tested_sha) >= 7
                 and _sha_matches(cur_rev, tested_sha)
@@ -1764,6 +2029,31 @@ def overlay_triage_on_items(
                 if ev and ev.get("status") == "passed":
                     c_status = "passed"
 
+        # Re-evaluate Google3 A/B gate on Cloudtop and reset passed status on newer patchsets
+        it_g3 = detect_g3_corpus_from_files(
+            it.get("files") or (), subj_str, kind=item_kind, has_citc=eff_has_citc
+        )
+        g3_req = (bool(tr.get("g3_corpus_required")) or bool(it_g3["required"])) and (
+            item_kind == "gerrit"
+        )
+        g3_status = str(tr.get("g3_corpus_status") or "").lower()
+        if not g3_req:
+            g3_status = "not_required"
+        elif is_stale:
+            g3_status = "pending"
+        else:
+            if g3_status in ("", "not_required", "required"):
+                g3_status = "pending"
+            g3_tested_ps = int(tr.get("g3_corpus_tested_patchset") or tr_ps or 0)
+            if g3_status == "passed" and g3_tested_ps != eff_ps:
+                g3_status = "pending"
+            if g3_status == "pending" and results_dir is None:
+                g3_ev = find_matching_g3_compare_md(
+                    [Path("/tmp")], tid, eff_ps, patchset_sha=cur_rev
+                )
+                if g3_ev and g3_ev.get("status") == "passed":
+                    g3_status = "passed"
+
         label_updates: dict[str, Any] = {}
         if tr.get("review_outcome") and not is_stale:
             label_updates = format_review_labels(
@@ -1772,6 +2062,8 @@ def overlay_triage_on_items(
                 corpus_req,
                 c_status,
                 corpus_script,
+                g3_corpus_required=g3_req,
+                g3_corpus_status=g3_status,
             )
 
         summary = str(tr.get("summary") or "")
@@ -1792,6 +2084,8 @@ def overlay_triage_on_items(
             "corpus_status": c_status,
             "corpus_script": corpus_script,
             "corpus_domain": corpus_domain,
+            "g3_corpus_required": g3_req,
+            "g3_corpus_status": g3_status,
             "summary": summary,
             "current_patchset": cur_ps,
             "is_stale": is_stale,
@@ -1829,6 +2123,12 @@ def main() -> int:
         default="auto",
         choices=["auto", "not_required", "required", "pending", "passed", "failed", "waived"],
         help="Corpus gate status (auto derives from triage_cl.py and compare.md attestation)",
+    )
+    p_rev.add_argument(
+        "--g3-corpus",
+        default="auto",
+        choices=["auto", "not_required", "required", "pending", "passed", "failed", "waived"],
+        help="Google3 Paragraph A/B corpus gate status (auto derives on Cloudtop)",
     )
     p_rev.add_argument(
         "--compare-md",
@@ -1936,6 +2236,7 @@ def main() -> int:
             report_markdown=report_text,
             companion_id=args.companion,
             corpus=args.corpus,
+            g3_corpus=args.g3_corpus,
             compare_md=args.compare_md or None,
             g3_compare_md=args.g3_compare_md or None,
             resolved_thread_ids=args.resolved_thread_id,
@@ -1951,7 +2252,10 @@ def main() -> int:
         norm_outcome = normalize_review_outcome(args.outcome)
         corpus_pending = (
             norm_outcome == "CLEAN"
-            and str(args.corpus or "").lower() in ("pending", "required")
+            and (
+                str(args.corpus or "").lower() in ("pending", "required")
+                or str(args.g3_corpus or "").lower() in ("pending", "required")
+            )
             and not draft_text.strip()
         )
         # Remind callers that save-review only updates local Flight Deck JSON, not Gerrit drafts

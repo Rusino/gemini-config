@@ -400,7 +400,14 @@ def _evaluate_g3_corpus_gate(
       return {"required": True, "status": "passed", "compare_md": str(p)}
     return {"required": True, "status": "failed", "compare_md": str(p)}
 
-  if str(triage.get("corpus_status") or "").lower() == "waived":
+  # Trust persisted g3_corpus_status on the exact patchset if /tmp compare.md was cleaned up
+  g3_status = str(triage.get("g3_corpus_status") or "").lower()
+  g3_tested_ps = int(
+      triage.get("g3_corpus_tested_patchset") or triage.get("triaged_patchset") or 0
+  )
+  if g3_status == "passed" and g3_tested_ps == cur_ps:
+    return {"required": True, "status": "passed", "compare_md": explicit}
+  if g3_status == "waived":
     return {"required": True, "status": "waived", "compare_md": ""}
   return {"required": True, "status": "pending", "compare_md": ""}
 

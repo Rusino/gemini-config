@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -963,6 +964,160 @@ LGTM. Verified mechanical churn; no unintended side effects.
     self.assertEqual(ps2["corpus_status"], "pending")
     self.assertEqual(ps2["review_eyebrow_label"], "⚠️ LGTM blocked: run Flutter corpus")
 
+  def test_g3_corpus_gate_persistence_and_combined_labels(self):
+    root = Path(self.test_dir)
+    fl_dir = root / "fl_1400176_ps3"
+    fl_cand = fl_dir / "cand"
+    fl_cand.mkdir(parents=True)
+    (fl_cand / "attestation.json").write_text(
+        json.dumps({
+            "label": "cand",
+            "git_sha": "778899aabbccddeeff00112233445566778899aa",
+            "ref": "778899aabbcc",
+            "timestamp_utc": "2026-11-03T20:00:00Z",
+        }),
+        encoding="utf-8",
+    )
+    fl_md = fl_dir / "compare.md"
+    fl_md.write_text(
+        "# Flutter Paragraph Engine Test Comparison\n\n"
+        "| Ref | Regressions | Fixed |\n| :--- | :---: | :---: |\n"
+        "| `baseline` | *(baseline)* | *(baseline)* |\n"
+        "| `cand` | 0 | 0 |\n\n"
+        "**Вердикт целостности (Integrity Check):** `VALID`\n\n"
+        "**Поломано: 0**\n",
+        encoding="utf-8",
+    )
+
+    g3_dir = root / "g3_cl_1400176"
+    g3_dir.mkdir(parents=True)
+    g3_fail_md = g3_dir / "compare_fail.md"
+    g3_fail_md.write_text(
+        "# Google3 Paragraph Corpus Comparison\n\n"
+        "| Leg | Spec |\n| :--- | :--- |\n"
+        "| `cand` | `cl:1400176/3` (`778899aabbcc`) |\n\n"
+        "**Вердикт целостности (Integrity Check):** `VALID`\n\n"
+        "Новых падений (Regressions): 2\n",
+        encoding="utf-8",
+    )
+    g3_pass_md = g3_dir / "compare.md"
+    g3_pass_md.write_text(
+        "# Google3 Paragraph Corpus Comparison\n\n"
+        "| Leg | Spec |\n| :--- | :--- |\n"
+        "| `cand` | `cl:1400176/3` (`778899aabbcc`) |\n\n"
+        "**Вердикт целостности (Integrity Check):** `VALID`\n\n"
+        "Новых падений (Regressions): 0\n",
+        encoding="utf-8",
+    )
+
+    # Both Flutter corpus and google3 A/B unrun -> combined blocked eyebrow
+    ts.save_review_verdict(
+        target_id="1400176",
+        kind="gerrit",
+        patchset=3,
+        outcome="CLEAN",
+        summary="Static audit clean",
+        revision="778899aabbccddeeff00112233445566778899aa",
+        files=["modules/skparagraph/src/ParagraphImpl.cpp"],
+        has_citc=True,
+        results_dir=self.test_dir,
+    )
+    both_pend = ts.load_triage_result("gerrit", "1400176", results_dir=self.test_dir)
+    self.assertTrue(both_pend["corpus_required"])
+    self.assertTrue(both_pend["g3_corpus_required"])
+    self.assertEqual(both_pend["corpus_status"], "pending")
+    self.assertEqual(both_pend["g3_corpus_status"], "pending")
+    self.assertEqual(
+        both_pend["review_eyebrow_label"], "⚠️ LGTM blocked: run Flutter + google3 A/B"
+    )
+
+    # Flutter corpus passed while google3 A/B is still unrun -> blocks LGTM on google3 A/B
+    ts.save_review_verdict(
+        target_id="1400176",
+        kind="gerrit",
+        patchset=3,
+        outcome="CLEAN",
+        summary="Flutter corpus passed; google3 pending",
+        revision="778899aabbccddeeff00112233445566778899aa",
+        files=["modules/skparagraph/src/ParagraphImpl.cpp"],
+        compare_md=str(fl_md),
+        has_citc=True,
+        results_dir=self.test_dir,
+    )
+    g3_pend = ts.load_triage_result("gerrit", "1400176", results_dir=self.test_dir)
+    self.assertEqual(g3_pend["corpus_status"], "passed")
+    self.assertEqual(g3_pend["g3_corpus_status"], "pending")
+    self.assertEqual(g3_pend["review_eyebrow_label"], "⚠️ LGTM blocked: run google3 A/B")
+
+    # google3 A/B regressions mark g3_corpus_status failed and block LGTM in red
+    ts.save_review_verdict(
+        target_id="1400176",
+        kind="gerrit",
+        patchset=3,
+        outcome="CLEAN",
+        summary="google3 regressed 2 targets",
+        revision="778899aabbccddeeff00112233445566778899aa",
+        files=["modules/skparagraph/src/ParagraphImpl.cpp"],
+        compare_md=str(fl_md),
+        g3_compare_md=str(g3_fail_md),
+        has_citc=True,
+        results_dir=self.test_dir,
+    )
+    g3_fail = ts.load_triage_result("gerrit", "1400176", results_dir=self.test_dir)
+    self.assertEqual(g3_fail["g3_corpus_status"], "failed")
+    self.assertEqual(g3_fail["review_eyebrow_label"], "🔴 LGTM blocked: google3 A/B failed")
+
+    # Both Flutter corpus and google3 A/B passed -> green Clean (LGTM)
+    ts.save_review_verdict(
+        target_id="1400176",
+        kind="gerrit",
+        patchset=3,
+        outcome="CLEAN",
+        summary="Both Flutter and google3 A/B clean",
+        revision="778899aabbccddeeff00112233445566778899aa",
+        files=["modules/skparagraph/src/ParagraphImpl.cpp"],
+        compare_md=str(fl_md),
+        g3_compare_md=str(g3_pass_md),
+        has_citc=True,
+        results_dir=self.test_dir,
+    )
+    both_ok = ts.load_triage_result("gerrit", "1400176", results_dir=self.test_dir)
+    self.assertEqual(both_ok["corpus_status"], "passed")
+    self.assertEqual(both_ok["g3_corpus_status"], "passed")
+    self.assertEqual(both_ok["review_eyebrow_label"], "🟢 Review PS3: Clean (LGTM)")
+
+    # Uploading PS4 resets both gates to pending in overlay_triage_on_items
+    ps4_items = [{
+        "item_key": "gerrit:1400176",
+        "kind": "gerrit",
+        "target_id": "1400176",
+        "patchset": 4,
+        "revision": "9999000011112222333344445555666677778888",
+        "files": ["modules/skparagraph/src/ParagraphImpl.cpp"],
+    }]
+    ts.overlay_triage_on_items(
+        ps4_items, results_dir=self.test_dir, ingest_tmp=False, has_citc=True
+    )
+    self.assertEqual(ps4_items[0]["triage"]["corpus_status"], "pending")
+    self.assertEqual(ps4_items[0]["triage"]["g3_corpus_status"], "pending")
+
+    # BUILD.bazel-only SkParagraph CL requires google3 A/B even without C++ Flutter corpus
+    ts.save_review_verdict(
+        target_id="1400999",
+        kind="gerrit",
+        patchset=1,
+        outcome="CLEAN",
+        summary="Bazel visibility update",
+        revision="11223344556677889900aabbccddeeff00112233",
+        files=["modules/skparagraph/BUILD.bazel"],
+        has_citc=True,
+        results_dir=self.test_dir,
+    )
+    bazel_only = ts.load_triage_result("gerrit", "1400999", results_dir=self.test_dir)
+    self.assertFalse(bazel_only["corpus_required"])
+    self.assertTrue(bazel_only["g3_corpus_required"])
+    self.assertEqual(bazel_only["review_eyebrow_label"], "⚠️ LGTM blocked: run google3 A/B")
+
 
 class FlightDeckTriageDashboardRenderingTest(unittest.TestCase):
 
@@ -1275,6 +1430,21 @@ const skpUploadedPs2 = Object.assign({}, skpPassedPs1, {
   patchset: 2,
 });
 
+const skpG3Pending = Object.assign({}, skpPassedPs1, {
+  triage: Object.assign({}, skpPassedPs1.triage, {
+    g3_corpus_required: true,
+    g3_corpus_status: 'pending',
+  })
+});
+
+const skpG3BothPassed = Object.assign({}, skpPassedPs1, {
+  triage: Object.assign({}, skpPassedPs1.triage, {
+    g3_corpus_required: true,
+    g3_corpus_status: 'passed',
+    g3_corpus_tested_patchset: 1,
+  })
+});
+
 console.log(JSON.stringify({
   skpPendingCard: focusCard(skpPending, {jetski_box_url: ''}),
   skpPendingRow: rowHtml(skpPending, {jetski_box_url: ''}),
@@ -1293,6 +1463,12 @@ console.log(JSON.stringify({
   skpPassedCard: focusCard(skpPassedPs1, {jetski_box_url: ''}),
   skpPs2Card: focusCard(skpUploadedPs2, {jetski_box_url: ''}),
   skpPs2Spine: spineStepShortState(skpUploadedPs2),
+  g3PendingCard: focusCard(skpG3Pending, {jetski_box_url: ''}),
+  g3RunningBadge: triageBadgeInfo(Object.assign({}, skpG3Pending, {chat_busy: true})),
+  g3PendingSpine: spineStepShortState(skpG3Pending),
+  g3PendingCanFinalize: canFinalizeCleanReview(skpG3Pending),
+  g3BothPassedCard: focusCard(skpG3BothPassed, {jetski_box_url: ''}),
+  g3BothPassedCanFinalize: canFinalizeCleanReview(skpG3BothPassed),
 }));
 """
     proc = subprocess.run(
@@ -1342,6 +1518,20 @@ console.log(JSON.stringify({
     self.assertNotIn("triage-clean", out["skpPs2Card"])
     self.assertIn("PS2", out["skpPs2Card"])
     self.assertNotEqual(out["skpPs2Spine"]["tone"], "spine-ok")
+
+    # Passed Flutter corpus with unrun google3 A/B stays amber-blocked and blocks finalize
+    self.assertIn("v-corpus_blocked", out["g3PendingCard"])
+    self.assertIn("⚠️ LGTM blocked: run google3 A/B", out["g3PendingCard"])
+    self.assertNotIn("v-clean", out["g3PendingCard"])
+    self.assertEqual(out["g3RunningBadge"]["label"], "⏳ Running google3 A/B…")
+    self.assertEqual(out["g3PendingSpine"]["short"], "Corpus needed")
+    self.assertFalse(out["g3PendingCanFinalize"])
+
+    # When both Flutter corpus and google3 A/B pass, card turns green and allows finalize
+    self.assertIn("v-clean", out["g3BothPassedCard"])
+    self.assertIn("🟢 Review PS1: Clean (LGTM)", out["g3BothPassedCard"])
+    self.assertIn("Flutter + google3 A/B OK", out["g3BothPassedCard"])
+    self.assertTrue(out["g3BothPassedCanFinalize"])
 
 
 if __name__ == "__main__":

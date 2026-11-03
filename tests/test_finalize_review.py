@@ -595,6 +595,45 @@ class FinalizeReviewPipelineTest(unittest.TestCase):
     self.assertFalse(rec["in_my_attention"])
     self.assertEqual(rec["companions"], [])
 
+  def test_waived_flutter_corpus_does_not_waive_pending_g3_corpus(self) -> None:
+    import finalize_review as fr
+
+    pending_g3 = fr._evaluate_g3_corpus_gate(
+        "1409697",
+        6,
+        "6e8dd008c2",
+        ["modules/skparagraph/src/ParagraphImpl.cpp"],
+        "[skparagraph] Add first-line indentation",
+        {
+            "corpus_required": True,
+            "corpus_status": "waived",
+            "g3_corpus_required": True,
+            "g3_corpus_status": "pending",
+            "triaged_patchset": 6,
+        },
+        [],
+        True,
+    )
+    self.assertEqual(pending_g3["status"], "pending")
+
+    explicitly_waived_g3 = fr._evaluate_g3_corpus_gate(
+        "1409697",
+        6,
+        "6e8dd008c2",
+        ["modules/skparagraph/src/ParagraphImpl.cpp"],
+        "[skparagraph] Add first-line indentation",
+        {
+            "corpus_required": True,
+            "corpus_status": "passed",
+            "g3_corpus_required": True,
+            "g3_corpus_status": "waived",
+            "triaged_patchset": 6,
+        },
+        [],
+        True,
+    )
+    self.assertEqual(explicitly_waived_g3["status"], "waived")
+
 
 class FlightDeckFinalizeUiTest(unittest.TestCase):
 

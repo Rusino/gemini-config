@@ -13671,16 +13671,16 @@ function upstreamBlockersOf(it, data) {
     const tr = anc.triage;
     if (tr && !anc.self_approved) {
       const v = String(tr.review_outcome || tr.verdict || '').toUpperCase();
-      const cStat = effectiveCorpusStatus(anc);
+      const gState = combinedGateState(anc);
       if (v === 'PUSHBACK' || v.includes('PUSHBACK') || v.includes('DO_NOT_LAND')) {
         reasons.push('Pushback');
       } else if (v === 'COMPANION_FIX' || v.includes('FIX')) {
         reasons.push('Companion fix');
       // Unverified or failing corpus on an unapproved parent blocks approving child CLs
-      } else if (cStat === 'failed') {
-        reasons.push(`${corpusDisplayName(tr)} failed`);
-      } else if (cStat === 'pending' && GATED_LGTM_OUTCOMES.has(v)) {
-        reasons.push(`${corpusDisplayName(tr)} not run`);
+      } else if (gState.status === 'failed') {
+        reasons.push(`${gState.activeLabel} failed`);
+      } else if (gState.status === 'pending' && GATED_LGTM_OUTCOMES.has(v)) {
+        reasons.push(`${gState.activeLabel} not run`);
       } else if (v === 'COMPANION_TESTS' || v.includes('TESTS')) {
         reasons.push('Companion tests');
       } else if (v === 'NITS' || v.includes('NITS')) {
@@ -13819,12 +13819,16 @@ function spineStepShortState(m) {
   // Stale reviews or unverified corpus gates must never mark a stack spine step green
   if (tr && tr.review_outcome && !isTriageStale(m)) {
     const out = String(tr.review_outcome).toUpperCase();
-    const cStat = effectiveCorpusStatus(m);
-    if (GATED_LGTM_OUTCOMES.has(out) && tr.corpus_required) {
-      if (cStat === 'failed') return {short: 'Corpus fail', icon: '🔴', tone: 'spine-bad'};
+    const gState = combinedGateState(m);
+    if (GATED_LGTM_OUTCOMES.has(out) && gState.anyRequired) {
+      if (gState.status === 'failed') return {short: 'Corpus fail', icon: '🔴', tone: 'spine-bad'};
       // Distinguish pending unrun gate from active background chat_busy run
-      if (cStat === 'pending') return {short: 'Corpus needed', icon: '⚠️', tone: 'spine-warn'};
-      if (cStat === 'waived') return {short: 'Corpus waived', icon: '⚠️', tone: 'spine-warn'};
+      if (gState.status === 'pending') {
+        return {short: 'Corpus needed', icon: '⚠️', tone: 'spine-warn'};
+      }
+      if (gState.status === 'waived') {
+        return {short: 'Corpus waived', icon: '⚠️', tone: 'spine-warn'};
+      }
     }
     if (out === 'CLEAN') return {short: 'Clean', icon: '🟢', tone: 'spine-ok'};
     if (out === 'NITS') return {short: 'NITS', icon: '🔵', tone: 'spine-warn'};
@@ -14833,8 +14837,10 @@ function canFinalizeCleanReview(it) {
   if (Number(it.self_cr_vote || 0) > 0 || isTriageStale(it)) return false;
   const tr = it.triage;
   if (!tr || String(tr.review_outcome || '').toUpperCase() !== 'CLEAN') return false;
-  const cStat = effectiveCorpusStatus(it);
-  return cStat === 'passed' || cStat === 'not_required' || cStat === 'waived';
+  const gState = combinedGateState(it);
+  return (
+    gState.status === 'passed' || gState.status === 'not_required' || gState.status === 'waived'
+  );
 }
 
 // Fetch a read-only Gerrit/ASAN/corpus dry-run preview before enabling Confirm CR+1 & publish
@@ -15148,6 +15154,64 @@ function effectiveCorpusStatus(it) {
   return 'pending';
 }
 
+// Evaluates Google3 Paragraph A/B gate state and resets passed to pending on newer patchsets
+function effectiveG3CorpusStatus(it) {
+  const tr = it && it.triage;
+  if (!tr || !tr.g3_corpus_required || (it && it.kind === 'github')) return 'not_required';
+  if (isTriageStale(it)) return 'pending';
+  const st = String(tr.g3_corpus_status || '').toLowerCase();
+  if (st === 'failed' || st === 'waived') return st;
+  if (st === 'passed') {
+    const curPs = Number(it.patchset || tr.triaged_patchset || 1);
+    const testedPs = Number(tr.g3_corpus_tested_patchset || tr.triaged_patchset || 0);
+    return (testedPs > 0 && curPs === testedPs) ? 'passed' : 'pending';
+  }
+  return 'pending';
+}
+
+// Shortens Flutter corpus to Flutter only when paired with google3 A/B in combined pills
+function joinGateNames(names) {
+  if (!names || !names.length) return 'Flutter corpus';
+  if (names.length === 1) return names[0];
+  return names.map(n => n === 'Flutter corpus' ? 'Flutter' : n).join(' + ');
+}
+
+// Combines Flutter/WebParagraph corpus and Google3 A/B gates so green LGTM requires both
+function combinedGateState(it) {
+  const tr = (it && it.triage) || {};
+  const gates = [];
+  if (tr.corpus_required) {
+    gates.push({name: corpusDisplayName(tr), status: effectiveCorpusStatus(it)});
+  }
+  if (tr.g3_corpus_required && (!it || it.kind !== 'github')) {
+    gates.push({name: 'google3 A/B', status: effectiveG3CorpusStatus(it)});
+  }
+  if (!gates.length) {
+    return {anyRequired: false, status: 'not_required', activeLabel: '', passedLabel: ''};
+  }
+  const passed = gates.filter(g => g.status === 'passed').map(g => g.name);
+  const passedLabel = passed.length ? joinGateNames(passed) : '';
+  const failed = gates.filter(g => g.status === 'failed').map(g => g.name);
+  if (failed.length) {
+    return {
+      anyRequired: true, status: 'failed', activeLabel: joinGateNames(failed), passedLabel,
+    };
+  }
+  const pending = gates.filter(g => g.status === 'pending').map(g => g.name);
+  if (pending.length) {
+    return {
+      anyRequired: true, status: 'pending', activeLabel: joinGateNames(pending), passedLabel,
+    };
+  }
+  const waived = gates.filter(g => g.status === 'waived').map(g => g.name);
+  if (waived.length) {
+    return {
+      anyRequired: true, status: 'waived', activeLabel: joinGateNames(waived), passedLabel,
+    };
+  }
+  return {anyRequired: true, status: 'passed', activeLabel: passedLabel, passedLabel};
+}
+
 // Computes triage badge and eyebrow labels without allowing green LGTM when corpus is blocked
 function triageBadgeInfo(it) {
   const tr = (it && it.triage) || {};
@@ -15165,9 +15229,9 @@ function triageBadgeInfo(it) {
   const revPs = Number(tr.triaged_patchset || (it && it.reviewed_ps) || (it && it.patchset) || 1);
   const curPs = Number((it && it.patchset) || 1);
   const stale = isTriageStale(it);
-  const cName = corpusDisplayName(tr);
-  const cStat = effectiveCorpusStatus(it);
-  if (GATED_LGTM_OUTCOMES.has(out) && tr.corpus_required) {
+  const gState = combinedGateState(it);
+  if (GATED_LGTM_OUTCOMES.has(out) && gState.anyRequired) {
+    const cName = gState.activeLabel;
     if (stale) {
       const busy = Boolean(it && it.chat_busy);
       const act = busy ? `running ${cName}…` : `run ${cName}`;
@@ -15181,17 +15245,17 @@ function triageBadgeInfo(it) {
         label: busy ? `⏳ Running ${cName}…` : `⚠️ LGTM blocked: run ${cName}`, eyebrow,
       };
     }
-    if (cStat === 'pending') {
+    if (gState.status === 'pending') {
       // Show hourglass only while the chat is actively running, otherwise prompt to run
       const lbl = Boolean(it && it.chat_busy)
         ? `⏳ Running ${cName}…` : `⚠️ LGTM blocked: run ${cName}`;
       return {cls: 'triage-corpus_blocked', pillCls: 'v-corpus_blocked', label: lbl, eyebrow: lbl};
     }
-    if (cStat === 'failed') {
+    if (gState.status === 'failed') {
       const lbl = `🔴 LGTM blocked: ${cName} failed`;
       return {cls: 'triage-corpus_failed', pillCls: 'v-corpus_failed', label: lbl, eyebrow: lbl};
     }
-    if (cStat === 'waived') {
+    if (gState.status === 'waived') {
       const short = (OUTCOME_BADGES[out] && OUTCOME_BADGES[out][2]) || out;
       return {
         cls: 'triage-corpus_blocked', pillCls: 'v-corpus_blocked',
@@ -15472,9 +15536,9 @@ function triageHtml(it, compact) {
         : 'Stale: new commit pushed'}</span>`
     : '';
   // Surface explicit corpus pass confirmation next to the reviewed patchset
-  const cStat = effectiveCorpusStatus(it);
-  const corpusMeta = (!isTriageStale(it) && cStat === 'passed')
-    ? ` · ${esc(corpusDisplayName(tr))} OK`
+  const gState = combinedGateState(it);
+  const corpusMeta = (!isTriageStale(it) && gState.passedLabel)
+    ? ` · ${esc(gState.passedLabel)} OK`
     : '';
   const meta = tr.triaged_patchset
     ? `<span class="triage-meta">PS${esc(revPs)}${corpusMeta} · ` +
