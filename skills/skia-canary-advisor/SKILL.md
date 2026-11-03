@@ -17,7 +17,7 @@ The script checks client-visible diff surface and selects appropriate ASAN and C
 S=~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py
 python3 $S advise --cl <change>      # Gerrit CL, own or under review
 python3 $S advise --repo <skia>      # local branch vs origin/main
-python3 $S triage --cl <change>      # triage tryjobs (ASAN + Canaries)
+python3 $S triage --cl <change>      # triage tryjobs (ASAN + Canaries + font trybots)
 python3 $S watch --cl <change> --save-draft  # watch tryjobs + triage on completion
 python3 $S health                    # OK/DEAD per canary (real verdicts in last 45 days)
 python3 $S stats                     # RAN/skipped per logged recommendation + follow rate
@@ -63,6 +63,11 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
      paths or `cl/N` numbers to public Gerrit). When woken up, the agent shows the internal triage
      table in chat and confirms the draft is saved. (No Gerrit draft is created when Canary is
      green).
+   - **Approval gate (`TRYJOBS:` line)**: `triage` (and `watch` on wakeup) ends with
+     `TRYJOBS: ALL GREEN` or `TRYJOBS: NOT GREEN (<builders>)`, covering ASAN, canaries, and
+     other trybots such as Mac `NativeFonts_Fontations` (with the dm `Failures:` block). Never
+     give LGTM / `CR+1` / a CLEAN verdict before `ALL GREEN`; if the watcher was killed, run
+     `triage` by hand. `stop_guard.py` (`[TRYJOB GATE GUARD]`) enforces this.
    - **On Red Canary (`CL_SUSPECTED_REGRESSION`)**: Report the failing target, `somepath` chain,
      and stack trace to the user and proceed to fix.
    - **On Red Canary / ASAN (`NOT_MERGEABLE`)**: Build failed at Task Scheduler startup because the

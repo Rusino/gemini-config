@@ -347,6 +347,26 @@ USER_G3_OPTOUT_RE = re.compile(
     r"(?:без\s+(?:прогона\s+)?(?:гугл\s*3|google3|g3)|skip\s+(?:the\s+)?(?:google3|g3))",
     re.IGNORECASE,
 )
+# Tryjob verdicts from `canary_advisor.py triage/watch` and `git cl try-results`
+TRYJOBS_VERDICT_RE = re.compile(r"^TRYJOBS: (ALL GREEN|NOT GREEN[^\n]*)", re.MULTILINE)
+TRY_RESULTS_TOTAL_RE = re.compile(r"^Total: (\d+) tryjobs?", re.MULTILINE)
+TRY_RESULTS_NOT_GREEN_RE = re.compile(
+    r"^(?:Failures|Infra Failures|Started|Scheduled|Canceled):\s*$", re.MULTILINE
+)
+UNVERIFIED_TRYBOTS_RE = re.compile(r"\bUNVERIFIED[_\s]+ON[_\s]+TRYBOTS\b", re.IGNORECASE)
+
+
+# Returns True / False for a green / not green tryjob report, None when text has no report
+def _tryjob_report_green(text: str):
+  verdicts = TRYJOBS_VERDICT_RE.findall(text)
+  if verdicts:
+    return verdicts[-1] == "ALL GREEN"
+  totals = TRY_RESULTS_TOTAL_RE.findall(text)
+  if totals:
+    if int(totals[-1]) == 0:
+      return False
+    return not TRY_RESULTS_NOT_GREEN_RE.search(text)
+  return None
 
 
 # A google3 compare.md counts as passed only with a VALID integrity verdict and 0 regressions
@@ -508,6 +528,7 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
   g3_required = False
   g3_passed = False
   g3_cmd = ""
+  tryjobs_green = None
   skia_review_cl = ""
   skia_cpp_detected = False
   pending_canary_advisor = False
@@ -637,17 +658,24 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
         try_bots = pending_run_cmds.pop(0)
         if try_bots and _try_output_succeeded(content, str(step.get("status") or "")):
           triggered_try_bots.update(try_bots)
+          # Scheduling new builds invalidates any earlier green tryjob verdict
+          tryjobs_green = None
       if pending_manage_try_bots:
         if _try_output_succeeded(content, str(step.get("status") or "")):
           triggered_try_bots.update(pending_manage_try_bots)
+          tryjobs_green = None
         pending_manage_try_bots = set()
 
       m_action = AGENT_ACTION_TRY_RE.search(content)
       if m_action:
         cmd_str = m_action.group(1).strip()
         required_agent_try_cmd = cmd_str
+        tryjobs_green = None
         for m in GIT_CL_TRY_BOT_RE.finditer(cmd_str):
           required_agent_bots.add(m.group(1))
+      tj = _tryjob_report_green(content)
+      if tj is not None:
+        tryjobs_green = tj
       if pending_canary_advisor:
         if G3_REQUIRED_RE.search(content):
           g3_required = True
@@ -727,6 +755,10 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
       bg_try = bg_try_tasks.get(task_id) or bg_try_tasks.get(task_id.split("/")[-1])
       if bg_try and _try_output_succeeded(content, str(step.get("status") or "")):
         triggered_try_bots.update(bg_try)
+        tryjobs_green = None
+      tj = _tryjob_report_green(content)
+      if tj is not None:
+        tryjobs_green = tj
 
       # Check subagent completion report
       cand_scripts = set(subagent_corpus.get(sender, set())) | _corpus_scripts_in_text(content)
@@ -847,6 +879,24 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
 
   # Enforce mandatory ASAN try job and external-author canary try jobs
   user_opted_out_try = any(USER_TRYJOB_OPTOUT_RE.search(u) for u in all_user_requests)
+  # A killed watcher let a red Mac trybot through on Gerrit 1400176 PS2, so approval waits
+  # for a green tryjob report after the advisor's bots were triggered
+  if (
+      not user_opted_out_try
+      and required_agent_bots
+      and required_agent_bots <= triggered_try_bots
+      and tryjobs_green is not True
+      and REVIEW_APPROVAL_RE.search(combined_review_out)
+      and not UNVERIFIED_TRYBOTS_RE.search(combined_review_out)
+  ):
+    state = "not green" if tryjobs_green is False else "never checked"
+    result["asan_canary_issues"].append(
+        f"[TRYJOB GATE GUARD] The tryjobs triggered from `canary_advisor.py` are {state}, but "
+        "your response recommends approval (`Case 1-3` / `LGTM` / `Code-Review+1`). Run "
+        "`python3 ~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py triage "
+        "--cl <N> --ps <PS>` and approve only after it prints `TRYJOBS: ALL GREEN` (or mark the "
+        "review `UNVERIFIED ON TRYBOTS`)"
+    )
   if not user_opted_out_try:
     missing_try_bots = required_agent_bots - triggered_try_bots
     if missing_try_bots:

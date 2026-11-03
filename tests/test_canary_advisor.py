@@ -880,6 +880,81 @@ class TestCanaryAdvisor(unittest.TestCase):
     self.assertIn("SSOAuthenticator: exit status 1", err_out)
     self.assertNotIn("ALL_TRYJOBS_COMPLETE", err_out)
 
+  def test_cmd_triage_reports_font_trybot_dm_failures_and_tryjobs_summary(self):
+    meta = {
+        "cl": 1400176,
+        "patchset": 2,
+        "current_patchset": 2,
+        "status": "NEW",
+        "subject": "Prefer matchFamilyStyle in FontCollection",
+        "owner": "cwei97388@gmail.com",
+        "diff": (
+            "diff --git a/modules/skparagraph/src/FontCollection.cpp "
+            "b/modules/skparagraph/src/FontCollection.cpp\n"
+        ),
+        "googler_cr_plus_one": False,
+    }
+    args = type("Args", (), {"cl": "1400176", "ps": "2", "save_draft": False, "json": False})()
+    asan_bot = "Test-Ubuntu24.04-Clang-NUC11TZi5-CPU-AVX2-x86_64-Debug-All-ASAN"
+    mac_bot = "Test-Mac14-Clang-MacMini8.1-CPU-AVX2-x86_64-Debug-All-NativeFonts_Fontations"
+    dm_log = (
+        "start unit test SkParagraph_FallbackCacheAcrossParagraphs\n"
+        "Failures:\n"
+        "\tmodules/skparagraph/tests/SkParagraphTest.cpp:12189\t"
+        "otherFontMgr->fFamilyStyleMatches <= 1 [SkParagraph_FallbackCacheAcrossParagraphs]\n"
+        "1 failure\n"
+    )
+
+    # Red Mac font trybot alongside green ASAN prints dm failure block and NOT GREEN
+    buf_red = io.StringIO()
+    with patch.object(canary_advisor, "load_cl", return_value=meta), patch.object(
+        canary_advisor,
+        "bb_cl_builds",
+        return_value={
+            asan_bot: {"id": "9001", "status": "SUCCESS"},
+            mac_bot: {"id": "9002", "status": "FAILURE"},
+        },
+    ), patch.object(
+        canary_advisor,
+        "swarming_tasks_for_cl",
+        return_value=[{"name": mac_bot, "taskId": "task9002"}],
+    ), patch.object(
+        canary_advisor, "swarming_task_result", return_value={"runId": "run9002"}
+    ), patch.object(
+        canary_advisor, "fetch_logdog_step", return_value=dm_log
+    ), patch("sys.stdout", buf_red):
+      res_red = canary_advisor.cmd_triage(args)
+
+    out_red = buf_red.getvalue()
+    self.assertEqual(res_red["builds"][mac_bot]["verdict"], "TEST_FAILURE")
+    self.assertIn("SkParagraph_FallbackCacheAcrossParagraphs", out_red)
+    self.assertIn(f"TRYJOBS: NOT GREEN ({mac_bot})", out_red)
+
+    # Empty build map must not report ALL GREEN
+    buf_empty = io.StringIO()
+    with patch.object(canary_advisor, "load_cl", return_value=meta), patch.object(
+        canary_advisor, "bb_cl_builds", return_value={}
+    ), patch.object(canary_advisor, "swarming_tasks_for_cl", return_value=[]), patch(
+        "sys.stdout", buf_empty
+    ):
+      canary_advisor.cmd_triage(args)
+    self.assertIn("TRYJOBS: NOT GREEN (no tryjobs found)", buf_empty.getvalue())
+
+    # Green ASAN + green Mac font trybot prints TRYJOBS: ALL GREEN
+    buf_ok = io.StringIO()
+    with patch.object(canary_advisor, "load_cl", return_value=meta), patch.object(
+        canary_advisor,
+        "bb_cl_builds",
+        return_value={
+            asan_bot: {"id": "9001", "status": "SUCCESS"},
+            mac_bot: {"id": "9003", "status": "SUCCESS"},
+        },
+    ), patch.object(canary_advisor, "swarming_tasks_for_cl", return_value=[]), patch(
+        "sys.stdout", buf_ok
+    ):
+      canary_advisor.cmd_triage(args)
+    self.assertIn("TRYJOBS: ALL GREEN", buf_ok.getvalue())
+
 
 if __name__ == "__main__":
   unittest.main()

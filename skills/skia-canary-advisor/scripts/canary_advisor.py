@@ -1271,6 +1271,21 @@ def triage_other_canary_failure(cl, ps, builder, bb_build, sw_tasks, touched_fil
     }
 
 
+# Extracts the dm "Failures:" block (file:line, test name, failed expression) from task stdout
+def dm_failure_lines(stdout, limit=20):
+    lines = stdout.splitlines()
+    for i, ln in enumerate(lines):
+        if ln.strip() != "Failures:":
+            continue
+        block = [ln]
+        for nxt in lines[i + 1:i + 1 + limit]:
+            block.append(nxt.rstrip())
+            if re.match(r"^\d+ failures?$", nxt.strip()):
+                break
+        return block
+    return []
+
+
 def save_gerrit_patchset_draft(cl, ps, note_text, unresolved=False):
     json_headers = {"Content-Type": "application/json; charset=UTF-8"}
     drafts_url = f"{GERRIT}/a/changes/{cl}/revisions/{ps}/drafts"
@@ -1394,6 +1409,56 @@ def cmd_triage(args):
                 print(f"- Verdict: {status}")
     else:
         print("\n## Canaries: No Canary builds found on this patchset")
+
+    # Font-backend and other non-ASAN trybots are triggered by `advise` too; a red Mac
+    # NativeFonts_Fontations job went unnoticed on Gerrit 1400176 PS2 when only ASAN was checked
+    other_builders = [b for b in builds if "ASAN" not in b and not b.startswith("Canary-")]
+    for ob in other_builders:
+        b_info = builds[ob]
+        status = b_info.get("status", "UNKNOWN")
+        print(f"\n## Trybot: {ob} [{status}]")
+        if status not in ("FAILURE", "INFRA_FAILURE"):
+            results["builds"][ob] = {"verdict": status}
+            print(f"- Verdict: {status}")
+            continue
+        # The stem heuristic in triage_other_canary_failure saw empty stdout here and called a
+        # CL-caused dm failure UNRELATED_HEAD_BREAKAGE, so read the dm step log directly instead
+        triage_res = _not_mergeable_verdict(b_info) or {}
+        failures = []
+        if not triage_res:
+            task = _find_builder_task(cl, ps, ob, b_info, sw_tasks)
+            tid = task.get("taskId", "") if task else ""
+            rid = swarming_task_result(tid).get("runId", "") if tid else ""
+            for step in ("dm", "symbolized_dm", "test_skia"):
+                failures = dm_failure_lines(fetch_logdog_step(tid, rid, step)) if tid else []
+                if failures:
+                    break
+            if not failures and tid:
+                failures = dm_failure_lines(swarming_task_stdout(tid))
+            triage_res = {
+                "verdict": "TEST_FAILURE" if failures else "FAILED_UNSPECIFIED",
+                "task_id": tid,
+                "summary": (f"dm failures in {ob}" if failures else
+                            f"{ob} failed; no dm Failures block found (task {tid or 'not found'})"),
+            }
+        if failures:
+            triage_res["failures"] = failures
+        results["builds"][ob] = triage_res
+        print(f"- Verdict: {triage_res['verdict']}")
+        print(f"- Summary: {triage_res['summary']}")
+        if failures:
+            print("```")
+            print("\n".join(failures))
+            print("```")
+
+    # Canary triage checks unrelated breakage against the roll; trybot triage cannot, so stays red
+    if not results["builds"]:
+        print("\nTRYJOBS: NOT GREEN (no tryjobs found)")
+    else:
+        red = [b for b, r in results["builds"].items()
+               if r.get("verdict") != "SUCCESS"
+               and not (b.startswith("Canary-") and r.get("verdict") == "UNRELATED_HEAD_BREAKAGE")]
+        print("\nTRYJOBS: " + (f"NOT GREEN ({', '.join(sorted(red))})" if red else "ALL GREEN"))
 
     if args.save_draft and drafts_to_save:
         combined_draft = "\n\n".join(drafts_to_save)

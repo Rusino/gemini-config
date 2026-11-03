@@ -922,10 +922,95 @@ class TestStopGuard(unittest.TestCase):
           {
               "step_index": 6,
               "type": "PLANNER_RESPONSE",
+              "content": "Triggered trybots and started background watcher.",
+          },
+      ]
+      # Stopping to wait without recommending approval satisfies ASAN/CANARY GUARD
+      self.assertEqual(self.run_discipline_stop(tmp_dir, steps), {})
+
+      # Approving before tryjobs finish is blocked by TRYJOB GATE GUARD
+      premature_steps = steps[:-1] + [{
+          "step_index": 6,
+          "type": "PLANNER_RESPONSE",
+          "content": "### Execution Ledger\n- Triage: done\n\n**Case 1: Ideal CL**",
+      }]
+      with tempfile.TemporaryDirectory() as tmp_premature:
+        res_premature = self.run_discipline_stop(tmp_premature, premature_steps)
+      self.assertEqual(res_premature.get("decision"), "continue")
+      self.assertIn("[TRYJOB GATE GUARD]", res_premature.get("reason", ""))
+      self.assertIn("never checked", res_premature.get("reason", ""))
+
+      # Approving after TRYJOBS: ALL GREEN succeeds
+      green_steps = premature_steps[:-1] + [
+          {
+              "step_index": 6,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": "Command exited with code 0.\n\nTRYJOBS: ALL GREEN\n",
+          },
+          {
+              "step_index": 7,
+              "type": "PLANNER_RESPONSE",
               "content": "### Execution Ledger\n- Triage: done\n\n**Case 1: Ideal CL**",
           },
       ]
-      self.assertEqual(self.run_discipline_stop(tmp_dir, steps), {})
+      with tempfile.TemporaryDirectory() as tmp_green:
+        self.assertEqual(self.run_discipline_stop(tmp_green, green_steps), {})
+
+      # Red font trybot blocks approval until fixed or marked UNVERIFIED ON TRYBOTS
+      red_steps = premature_steps[:-1] + [
+          {
+              "step_index": 6,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": (
+                  "Command exited with code 0.\n\n"
+                  "TRYJOBS: NOT GREEN (Test-Mac14-NativeFonts_Fontations)\n"
+              ),
+          },
+          {
+              "step_index": 7,
+              "type": "PLANNER_RESPONSE",
+              "content": "### Execution Ledger\n- Triage: done\n\n**Case 1: Ideal CL**",
+          },
+      ]
+      with tempfile.TemporaryDirectory() as tmp_red:
+        res_red = self.run_discipline_stop(tmp_red, red_steps)
+      self.assertEqual(res_red.get("decision"), "continue")
+      self.assertIn("[TRYJOB GATE GUARD]", res_red.get("reason", ""))
+      self.assertIn("not green", res_red.get("reason", ""))
+
+      # Scheduling new builds invalidates an earlier TRYJOBS: ALL GREEN verdict
+      stale_steps = green_steps[:-1] + [
+          {
+              "step_index": 7,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": (
+                          "git cl try -i 1408157 -B skia/skia.primary -b Bot-ASAN -b Canary-Flutter"
+                      )
+                  },
+              }],
+          },
+          {
+              "step_index": 8,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": "Command exited with code 0.\n",
+          },
+          {
+              "step_index": 9,
+              "type": "PLANNER_RESPONSE",
+              "content": "### Execution Ledger\n- Triage: done\n\n**Case 1: Ideal CL**",
+          },
+      ]
+      with tempfile.TemporaryDirectory() as tmp_stale:
+        res_stale = self.run_discipline_stop(tmp_stale, stale_steps)
+      self.assertEqual(res_stale.get("decision"), "continue")
+      self.assertIn("[TRYJOB GATE GUARD]", res_stale.get("reason", ""))
+      self.assertIn("never checked", res_stale.get("reason", ""))
 
   def test_asan_canary_guard_accepts_luci_auth_context_and_rejects_failed_try(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1022,7 +1107,13 @@ class TestStopGuard(unittest.TestCase):
       self.assertEqual(res_masked.get("decision"), "continue")
       self.assertIn("[ASAN/CANARY GUARD]", res_masked.get("reason", ""))
 
-      # Clean exit 0 under luci-auth context satisfies ASAN/CANARY GUARD
+      # Clean exit 0 under luci-auth context + green triage satisfies both tryjob guards
+      triage_green_step = {
+          "step_index": 75,
+          "type": "GENERIC",
+          "status": "DONE",
+          "content": "Command exited with code 0.\n\nTRYJOBS: ALL GREEN\n",
+      }
       ok_steps = failed_steps[:-1] + [
           {
               "step_index": 6,
@@ -1043,12 +1134,13 @@ class TestStopGuard(unittest.TestCase):
               "status": "DONE",
               "content": "Command exited with code 0.\n\nScheduled builds\n",
           },
-          final_step,
+          triage_green_step,
+          {**final_step, "step_index": 80},
       ]
       with tempfile.TemporaryDirectory() as tmp_ok:
         self.assertEqual(self.run_discipline_stop(tmp_ok, ok_steps), {})
 
-      # Sibling read_file output containing exit-code text must not steal pending_run_cmds[0]
+      # Sibling read_file output containing exit-code or TRYJOBS text must not spoof command output
       mixed_steps = base_steps + [
           {
               "step_index": 4,
@@ -1073,8 +1165,9 @@ class TestStopGuard(unittest.TestCase):
               "content": (
                   "Created At: 2026-11-03T16:00:00Z\n"
                   "Completed At: 2026-11-03T16:00:01Z\n"
-                  "Showing lines 1-2 of 2\n"
+                  "Showing lines 1-3 of 3\n"
                   "Command exited with code 1.\n"
+                  "TRYJOBS: ALL GREEN\n"
               ),
           },
           {
@@ -1083,10 +1176,20 @@ class TestStopGuard(unittest.TestCase):
               "status": "DONE",
               "content": "Command exited with code 0.\n\nScheduled builds\n",
           },
-          final_step,
+          {**final_step, "step_index": 80},
       ]
+      with tempfile.TemporaryDirectory() as tmp_mixed_unchecked:
+        res_mixed = self.run_discipline_stop(tmp_mixed_unchecked, mixed_steps)
+      self.assertNotIn("[ASAN/CANARY GUARD]", res_mixed.get("reason", ""))
+      self.assertIn("[TRYJOB GATE GUARD]", res_mixed.get("reason", ""))
+
       with tempfile.TemporaryDirectory() as tmp_mixed:
-        self.assertEqual(self.run_discipline_stop(tmp_mixed, mixed_steps), {})
+        self.assertEqual(
+            self.run_discipline_stop(
+                tmp_mixed, mixed_steps[:-1] + [triage_green_step, {**final_step, "step_index": 80}]
+            ),
+            {},
+        )
 
   def test_schedule_tool_call_promotes_conversation_to_waiting_state(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
