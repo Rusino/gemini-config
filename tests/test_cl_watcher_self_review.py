@@ -3,6 +3,7 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 import unittest
@@ -1003,6 +1004,120 @@ console.log(JSON.stringify({
     self.assertEqual(
         saved_snapshots[-1]["items"]["gerrit:1414016@cid1"]["sponsor_action"], ""
     )
+
+  # Verifies pre-CR+1 external Skia cards show neutral 'After your CR+1' hint without 1-click buttons
+  def test_pre_approval_external_cl_shows_neutral_after_cr1_named_hint(self):
+    pre_cr_payload = {
+        "status": "NEW",
+        "subject": "[skparagraph] Move the trailing spaces of a line to its visual end",
+        "owner": {"email": "dbebawy@gmail.com", "name": "David H Bebawy"},
+        "current_revision": "rev1",
+        "revisions": {
+            "rev1": {
+                "_number": 1,
+                "files": {"modules/skparagraph/src/TextLine.cpp": {}},
+            }
+        },
+        "attention_set": {
+            "1001": {
+                "account": {"email": "jlavrova@google.com"},
+                "reason": "Reviewer was added",
+            }
+        },
+        "reviewers": {
+            "REVIEWER": [{"email": "jlavrova@google.com", "name": "Julia Lavrova"}],
+            "CC": [],
+        },
+        "labels": {"Code-Review": {"all": []}, "Commit-Queue": {"all": []}},
+        "submit_requirements": [
+            {"name": "Review-Enforcement", "status": "UNSATISFIED"},
+            {"name": "Code-Review", "status": "UNSATISFIED"},
+        ],
+        "messages": [],
+    }
+    with mock.patch.object(
+        w.urllib.request, "urlopen", return_value=_FakeGerritResponse(pre_cr_payload)
+    ), mock.patch.object(
+        w, "gerrit_mergeable", return_value=True
+    ), mock.patch.object(
+        w, "google_account_active", return_value=True
+    ):
+      res_skia = w.fetch_gerrit_cl_status("1414416", {}, [], skia_dir="/nonexistent")
+      res_cr = w.fetch_gerrit_cl_status(
+          "7686597",
+          {},
+          [],
+          skia_dir="/nonexistent",
+          preferred_host=w.GERRIT_CHROMIUM_HOST,
+      )
+
+    self.assertEqual(res_skia["self_cr_vote"], 0)
+    self.assertEqual(res_skia["missing_reviewers_to_assign"], 1)
+    self.assertEqual(res_skia["sponsor_action"], "")
+    self.assertEqual(
+        [c["short"] for c in res_skia["suggested_second_reviewers"]],
+        ["Alexis", "Florin"],
+    )
+    self.assertEqual(res_cr["sponsor_action"], "")
+    self.assertEqual(res_cr["suggested_second_reviewers"], [])
+
+    m = re.search(r"<script>([\s\S]*?)</script>", w.DASHBOARD_HTML)
+    self.assertIsNotNone(m)
+    script = re.sub(r"\bboot\(\);\s*$", "", m.group(1))
+    skia_item = dict(res_skia, item_key="gerrit:1414416", kind="gerrit", target_id="1414416")
+    cr_item = dict(res_cr, item_key="gerrit:7686597", kind="gerrit", target_id="7686597")
+    harness = (
+        "global.document = {getElementById: () => ({textContent:'', innerHTML:''}), addEventListener: () => {},"
+        " documentElement: {classList: {add: () => {}}}};\n"
+        "global.window = {parent: null, addEventListener: () => {}};\n"
+        "global.location = {search: '', hash: ''};\n"
+        "global.localStorage = {getItem: () => null, setItem: () => {}};\n"
+        "global.fetch = async () => ({json: async () => ({})});\n"
+        "global.setInterval = () => {};\n"
+        + script
+        + f"\nconst skiaIt = {json.dumps(skia_item)};\n"
+        + f"const crIt = {json.dumps(cr_item)};\n"
+        + "const sibFlorin = Object.assign({}, skiaIt, {item_key: 'gerrit:1414017',"
+        + " assigned_reviewers: ['fmalita@google.com'], missing_reviewers_to_assign: 0});\n"
+        + "const skiaStacked = Object.assign({}, skiaIt,"
+        + " {_stackMembers: [sibFlorin, skiaIt]});\n"
+        + "const ownOneOfTwo = {item_key: 'github:195999', kind: 'github',"
+        + " target_id: '195999', status: 'OPEN', is_self: true, is_external: false,"
+        + " required_approvals: 2, approved_count: 0, assigned_reviewers_count: 1,"
+        + " missing_reviewers_to_assign: 1, missing_approvals: 2};\n"
+        + "const unassExt = Object.assign({}, skiaIt,"
+        + " {assigned_reviewers_count: 0, missing_reviewers_to_assign: 2});\n"
+        + "console.log(JSON.stringify({\n"
+        + "  skiaCard: focusCard(skiaIt, {jetski_box_url: ''}),\n"
+        + "  skiaState: stateHtml(skiaIt),\n"
+        + "  stackedGap: reviewerGapHtml(skiaStacked),\n"
+        + "  crGap: reviewerGapHtml(crIt),\n"
+        + "  ownGap: reviewerGapHtml(ownOneOfTwo),\n"
+        + "  unassGap: reviewerGapHtml(unassExt),\n"
+        + "}));\n"
+    )
+    try:
+        proc = subprocess.run(
+            ["node", "-"], input=harness, capture_output=True, text=True, check=True
+        )
+    except subprocess.CalledProcessError as e:
+        print("NODE STDERR:", e.stderr)
+        raise e
+    ui = json.loads(proc.stdout.strip())
+    expected_hint = '<span class="soft">After your CR+1: +1 Googler (Alexis / Florin)</span>'
+    self.assertIn(expected_hint, ui["skiaCard"])
+    self.assertIn(expected_hint, ui["skiaState"])
+    self.assertNotIn("Needs +1 reviewer", ui["skiaCard"])
+    self.assertNotIn("assignReviewer(", ui["skiaCard"])
+    self.assertIn('class="btn primary"', ui["skiaCard"])
+    self.assertIn("After your CR+1: +1 Googler (Alexis / Florin)", ui["stackedGap"])
+    self.assertEqual(
+        ui["crGap"], '<span class="soft">After your CR+1: +1 Googler (1/2)</span>'
+    )
+    self.assertEqual(
+        ui["ownGap"], '<span class="amber">Needs +1 reviewer (1/2)</span>'
+    )
+    self.assertEqual(ui["unassGap"], '<span class="amber">Needs 2 reviewers</span>')
 
 
 if __name__ == "__main__":

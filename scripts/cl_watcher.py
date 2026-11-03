@@ -4439,7 +4439,7 @@ def fetch_gerrit_cl_status(
       }
       suggested_second_reviewers: list[dict[str, str]] = []
       # Only Skia uses a root-wide '*' OWNERS file; Chromium enforces directory-specific OWNERS
-      if sponsor_action == "assign_second_reviewer" and host == GERRIT_SKIA_HOST:
+      if (sponsor_action == "assign_second_reviewer" or (is_external and required_approvals > 1 and assigned_reviewers_count > 0 and self_cr_vote <= 0)) and host == GERRIT_SKIA_HOST:
         # CanvasKit, sfnt, and port-only CLs fit Florin best; text modules fit Alexis first
         prefer_florin = (
             any(
@@ -4471,6 +4471,14 @@ def fetch_gerrit_cl_status(
             continue
           suggested_second_reviewers.append(dict(cand))
       project = str(d.get("project") or "")
+      if missing_reviewers_to_assign > 0 and is_external and required_approvals > 1 and assigned_reviewers_count > 0 and self_cr_vote <= 0:
+        suffix = (
+            f"({' / '.join(r['short'] for r in suggested_second_reviewers)})"
+            if suggested_second_reviewers
+            else f"({assigned_reviewers_count}/{required_approvals})"
+        )
+        reviewer_status = f"After your CR+1: +1 Googler {suffix}"
+
       # Compute reviewer ping candidates for lost +1s and missing second approvals
       reviewer_pings = compute_gerrit_reviewer_pings(
           host=host,
@@ -11049,6 +11057,13 @@ function reviewerGapHtml(it) {
     if (assigned === 0) {
       return `<span class="amber">${reqApp > 1 ? `Needs ${reqApp} reviewers` : 'No reviewers assigned'}</span>`;
     }
+    if (it.is_external && reqApp > 1 && assigned > 0 && !it.self_approved && (it.self_cr_vote || 0) <= 0) {
+      let suffix = `${assigned}/${reqApp}`;
+      if (it.suggested_second_reviewers && it.suggested_second_reviewers.length > 0) {
+        suffix = it.suggested_second_reviewers.map(r => r.short).join(' / ');
+      }
+      return `<span class="soft">After your CR+1: +1 Googler (${suffix})</span>`;
+    }
     return `<span class="amber">Needs +${missRev} reviewer${missRev > 1 ? 's' : ''} (${assigned}/${reqApp})</span>`;
   }
   const missApp = Number(it.missing_approvals || 0);
@@ -11601,8 +11616,12 @@ function isTriageStale(it) {
 }
 
 function corpusDisplayName(tr) {
-  return (tr && tr.corpus_script === 'run_webparagraph_corpus.py')
-    ? 'WebParagraph corpus' : 'Flutter corpus';
+  if (tr && tr.corpus_script === 'run_webparagraph_corpus.py') {
+    return 'WebParagraph corpus';
+  } else if (tr && tr.corpus_script === 'run_g3_paragraph_tests.py') {
+    return 'Google3 corpus';
+  }
+  return 'Flutter corpus';
 }
 
 // Evaluates corpus gate state and resets passed to pending if patchset or commit drifted
