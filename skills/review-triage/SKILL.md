@@ -255,3 +255,10 @@ named skill's `SKILL.md` was not read, when a report with a `Case 1-5` verdict l
    exact `file:line` on the current patchset (especially when tagged `[STALE]` or
    `[AUTHOR_REPLIED]`), or **`question for the user`** (policy/design call needing the user's
    decision).
+10. **Hide Answered GitHub Issues & Mentions Until New Activity**: In `run_queue_triage.py`
+    (`fetch_github_issue_updates`, section `Открытые баги и упоминания на GitHub`), hide any open
+    issue (`Mentioned`, `Assigned`, or `Notif`) when `@Rusino`'s own comment is the latest activity
+    after the mention or assignment event. Show the issue only when someone else replied after
+    `@Rusino`'s latest comment (reporting who replied and a short snippet of the reply), when
+    `@Rusino` has not commented on the issue yet, or when new external activity (reassignment or
+    reopen) occurred after her last comment.

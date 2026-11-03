@@ -402,6 +402,37 @@ def fetch_authored_github_pr_alerts(max_days, include_all, ignored_cls):
     return alerts
 
 
+# Query tail timeline items directly so long multi-year issues do not paginate from comment 1
+ISSUE_TIMELINE_GQL = """
+query($owner:String!, $name:String!, $num:Int!) {
+  repository(owner:$owner, name:$name) {
+    issue(number:$num) {
+      number title url state createdAt updatedAt lastEditedAt
+      editor { login }
+      author { login }
+      body
+      assignees(first:20) { nodes { login } }
+      timelineItems(
+        last:50,
+        itemTypes:[ISSUE_COMMENT, ASSIGNED_EVENT, REOPENED_EVENT]
+      ) {
+        nodes {
+          __typename
+          ... on IssueComment { author { login } body createdAt updatedAt }
+          ... on AssignedEvent {
+            actor { login }
+            assignee { ... on User { login } }
+            createdAt
+          }
+          ... on ReopenedEvent { actor { login } createdAt }
+        }
+      }
+    }
+  }
+}
+"""
+
+
 def is_issue_open(api_url):
     """True unless the GitHub API reports the issue as closed; unknown state counts as open."""
     try:
@@ -413,8 +444,284 @@ def is_issue_open(api_url):
     return issue.get("state") != "closed"
 
 
-def fetch_github_issue_updates(max_days, include_all):
-    """Fetch GitHub issues assigned to or mentioning @Rusino updated within max_days."""
+def _parse_graphql_issue_detail(payload):
+    issue = (((payload or {}).get("data") or {}).get("repository") or {}).get("issue")
+    if not isinstance(issue, dict):
+        return None
+
+    assignees = [
+        n.get("login")
+        for n in ((issue.get("assignees") or {}).get("nodes") or [])
+        if isinstance(n, dict) and n.get("login")
+    ]
+    comments = []
+    events = []
+    for node in ((issue.get("timelineItems") or {}).get("nodes") or []):
+        if not isinstance(node, dict):
+            continue
+        kind = node.get("__typename")
+        if kind == "IssueComment":
+            # Deleted GitHub accounts serialize as author=null rather than login="ghost"
+            login = ((node.get("author") or {}).get("login") or "ghost").strip()
+            comments.append({
+                "user": login,
+                "body": node.get("body") or "",
+                "created_at": node.get("createdAt") or "",
+                "updated_at": node.get("updatedAt") or "",
+            })
+        elif kind == "AssignedEvent":
+            events.append({
+                "event": "assigned",
+                "actor": ((node.get("actor") or {}).get("login") or "").strip(),
+                "assignee": ((node.get("assignee") or {}).get("login") or "").strip(),
+                "created_at": node.get("createdAt") or "",
+            })
+        elif kind == "ReopenedEvent":
+            events.append({
+                "event": "reopened",
+                "actor": ((node.get("actor") or {}).get("login") or "").strip(),
+                "assignee": "",
+                "created_at": node.get("createdAt") or "",
+            })
+
+    return {
+        "number": issue.get("number"),
+        "title": issue.get("title") or "",
+        "url": issue.get("url") or "",
+        "state": issue.get("state") or "OPEN",
+        "author": ((issue.get("author") or {}).get("login") or "ghost").strip(),
+        "body": issue.get("body") or "",
+        "created_at": issue.get("createdAt") or "",
+        "updated_at": issue.get("updatedAt") or "",
+        "last_edited_at": issue.get("lastEditedAt"),
+        "editor": ((issue.get("editor") or {}).get("login") or "").strip() or None,
+        "assignees": assignees,
+        "comments": comments,
+        "events": events,
+    }
+
+
+def fetch_github_issue_detail(repo_slug, issue_number):
+    if not repo_slug or "/" not in repo_slug or not str(issue_number).isdigit():
+        return None
+    owner, name = repo_slug.split("/", 1)
+    try:
+        out = subprocess.check_output(
+            [
+                "gh", "api", "graphql",
+                "-f", f"query={ISSUE_TIMELINE_GQL}",
+                "-f", f"owner={owner}",
+                "-f", f"name={name}",
+                "-F", f"num={int(issue_number)}",
+            ],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=12,
+        )
+        return _parse_graphql_issue_detail(json.loads(out))
+    except Exception:  # lint: allow-broad-except (CLI/network failures degrade to fallback)
+        return None
+
+
+def format_issue_snippet(text, max_len=90):
+    """Formats a single-line Markdown-table-safe snippet, skipping leading quote blocks."""
+    if not text:
+        return ""
+    cleaned = re.sub(r"<!--.*?-->", " ", text, flags=re.S)
+    # Email and quote-replies start with `> ...` repeating the user's own previous comment
+    non_quoted = [
+        ln for ln in cleaned.splitlines()
+        if ln.strip() and not ln.lstrip().startswith(">")
+    ]
+    source = " ".join(non_quoted) if non_quoted else cleaned
+    collapsed = re.sub(r"\s+", " ", source).strip().replace("|", "\\|")
+    if len(collapsed) > max_len:
+        return collapsed[: max_len - 1].rstrip() + "…"
+    return collapsed
+
+
+def classify_github_issue_activity(detail, github_user=GITHUB_USER):
+    """Returns the latest external reply/event after github_user's last comment, or None to hide."""
+    if not isinstance(detail, dict):
+        return None
+    if (detail.get("state") or "OPEN").upper() == "CLOSED":
+        return None
+
+    me = github_user.lower()
+    mention_re = re.compile(rf"(?<![\w-])@{re.escape(me)}\b", re.I)
+
+    raw_comments = [c for c in (detail.get("comments") or []) if isinstance(c, dict)]
+    # Preserve list index on same-second ties so sub-second replies after own comment stay ordered
+    comments = [
+        c for _, c in sorted(
+            enumerate(raw_comments),
+            key=lambda pair: (parse_iso_time(pair[1].get("created_at")), pair[0]),
+        )
+    ]
+
+    my_last_idx = -1
+    my_last_ts = None
+    issue_author = (detail.get("author") or "").strip()
+    created_ts = parse_iso_time(detail.get("created_at"))
+    if issue_author.lower() == me:
+        my_last_ts = created_ts
+    editor = (detail.get("editor") or "").strip()
+    edited_ts = (
+        parse_iso_time(detail.get("last_edited_at")) if detail.get("last_edited_at") else None
+    )
+    my_edit_ts = edited_ts if (editor.lower() == me and edited_ts) else None
+    if my_edit_ts:
+        my_last_ts = max(my_last_ts, my_edit_ts) if my_last_ts else my_edit_ts
+
+    for idx, c in enumerate(comments):
+        c_user = (c.get("user") or "").strip()
+        if c_user.lower() == me:
+            my_last_idx = idx
+            c_ts = parse_iso_time(c.get("created_at"))
+            my_last_ts = max(my_last_ts, c_ts) if my_last_ts else c_ts
+
+    newer_comments = []
+    for idx, c in enumerate(comments):
+        c_user = (c.get("user") or "").strip()
+        if not c_user or c_user.lower() == me:
+            continue
+        c_ts = parse_iso_time(c.get("created_at"))
+        u_ts = parse_iso_time(c.get("updated_at")) if c.get("updated_at") else c_ts
+        body = c.get("body") or ""
+        # Require c_ts > my_edit_ts so own body edits after old comments do not resurrect them
+        if idx > my_last_idx and (my_edit_ts is None or c_ts > my_edit_ts):
+            newer_comments.append((c_ts, idx, c_user, body))
+        elif my_last_ts is not None and u_ts > my_last_ts and mention_re.search(body):
+            newer_comments.append((u_ts, idx, c_user, body))
+
+    ext_events = []
+    for ev in detail.get("events") or []:
+        if not isinstance(ev, dict):
+            continue
+        ev_type = (ev.get("event") or "").lower()
+        actor = (ev.get("actor") or "").strip()
+        ev_ts = parse_iso_time(ev.get("created_at"))
+        if not actor or actor.lower() == me:
+            continue
+        if my_last_ts is not None and ev_ts <= my_last_ts:
+            continue
+        if ev_type == "assigned" and (ev.get("assignee") or "").lower() == me:
+            ext_events.append((ev_ts, actor, "", f"Assigned by `{actor}`"))
+        elif ev_type == "reopened":
+            ext_events.append((ev_ts, actor, "", f"Reopened by `{actor}`"))
+
+    assignees_lc = {(a or "").lower() for a in (detail.get("assignees") or [])}
+    body_text = detail.get("body") or ""
+    if edited_ts and editor and editor.lower() != me:
+        if my_last_ts is None or (
+            edited_ts > my_last_ts and (me in assignees_lc or mention_re.search(body_text))
+        ):
+            snippet = format_issue_snippet(body_text)
+            note = f"Edited by `{editor}`: {snippet}" if snippet else f"Edited by `{editor}`"
+            ext_events.append((edited_ts, editor, snippet, note))
+
+    if my_last_ts is None and issue_author and issue_author.lower() != me:
+        snippet = format_issue_snippet(body_text)
+        note = f"`{issue_author}`: {snippet}" if snippet else f"Opened by `{issue_author}`"
+        ext_events.append((created_ts, issue_author, snippet, note))
+
+    best_comment = max(newer_comments, key=lambda x: (x[0], x[1])) if newer_comments else None
+    ext_events.sort(key=lambda x: x[0])
+    best_event = ext_events[-1] if ext_events else None
+
+    if best_comment and best_event:
+        c_ts, _, replier, raw_body = best_comment
+        ev_ts, ev_actor, ev_snip, ev_note = best_event
+        # Let significantly later reopens/assignments win, while keeping simultaneous comment text
+        if (ev_ts - c_ts).total_seconds() > 300:
+            return {"ts": ev_ts, "replier": ev_actor, "snippet": ev_snip, "note": ev_note}
+        snippet = format_issue_snippet(raw_body)
+        note = f"`{replier}`: {snippet}" if snippet else f"`{replier}`"
+        return {"ts": max(c_ts, ev_ts), "replier": replier, "snippet": snippet, "note": note}
+
+    if best_comment:
+        c_ts, _, replier, raw_body = best_comment
+        snippet = format_issue_snippet(raw_body)
+        note = f"`{replier}`: {snippet}" if snippet else f"`{replier}`"
+        return {"ts": c_ts, "replier": replier, "snippet": snippet, "note": note}
+
+    if not best_event:
+        return None
+
+    ts, actor, snippet, note = best_event
+    return {"ts": ts, "replier": actor, "snippet": snippet, "note": note}
+
+
+def format_github_issues_section(github_issues, max_days):
+    if not github_issues:
+        return ""
+    lines = [
+        f"### 🐛 Открытые баги и упоминания на GitHub (`@{GITHUB_USER}`, за {max_days} дн.)",
+        "| Issue | Роль | Обновлено | Тема | Последнее событие |",
+        "|---|---|---|---|---|",
+    ]
+    for iss in github_issues:
+        iss_link = f"[{iss['repo_slug']}#{iss['number']}]({iss['url']})"
+        title_cell = (iss.get("title") or "").replace("|", "\\|")
+        note_cell = iss.get("latest_note") or "—"
+        lines.append(
+            f"| {iss_link} | `{iss['role']}` | `{iss['updated_et']}` | "
+            f"{title_cell} | {note_cell} |"
+        )
+    lines.append("\n---\n")
+    return "\n".join(lines) + "\n"
+
+
+def _evaluate_candidate_issue(
+    repo_slug, num, html_url, title, role, updated_dt, include_answered, fallback_api_url=""
+):
+    detail = fetch_github_issue_detail(repo_slug, num)
+    if detail is None:
+        if fallback_api_url and not is_issue_open(fallback_api_url):
+            return None
+        return (updated_dt, {
+            "repo_slug": repo_slug,
+            "number": str(num),
+            "url": html_url,
+            "title": title,
+            "role": role,
+            "updated_et": format_et(updated_dt),
+            "replier": "",
+            "snippet": "",
+            "latest_note": "—",
+        })
+
+    if (detail.get("state") or "OPEN").upper() == "CLOSED":
+        return None
+
+    activity = classify_github_issue_activity(detail)
+    if activity is None:
+        if not include_answered:
+            return None
+        activity = {
+            "ts": updated_dt,
+            "replier": GITHUB_USER,
+            "snippet": "",
+            "note": f"Answered by `{GITHUB_USER}`",
+        }
+
+    min_utc = datetime.min.replace(tzinfo=timezone.utc)
+    eff_dt = activity["ts"] if activity["ts"] > min_utc else updated_dt
+    return (eff_dt, {
+        "repo_slug": repo_slug,
+        "number": str(num),
+        "url": html_url,
+        "title": title or detail.get("title", ""),
+        "role": role,
+        "updated_et": format_et(eff_dt),
+        "replier": activity["replier"],
+        "snippet": activity["snippet"],
+        "latest_note": activity["note"],
+    })
+
+
+def fetch_github_issue_updates(max_days, include_all, include_answered=False):
+    """Fetch actionable open GitHub issues assigned to or mentioning @Rusino within max_days."""
     q = f"is:open is:issue involves:{GITHUB_USER}"
     items = gh_search_issues(q, per_page=15)
     now = datetime.now(timezone.utc)
@@ -433,15 +740,16 @@ def fetch_github_issue_updates(max_days, include_all):
         role = "Assigned" if GITHUB_USER in assignees else "Mentioned"
         html_url = it.get("html_url", "")
         repo_slug = extract_repo_slug(html_url)
+        num = str(it.get("number"))
+        if not repo_slug or not html_url:
+            continue
+        # Record seen_urls before filtering so hidden answered issues are not re-fetched from notifs
         seen_urls.add(html_url)
-        issues.append((updated_dt, {
-            "repo_slug": repo_slug,
-            "number": str(it.get("number")),
-            "url": html_url,
-            "title": it.get("title", ""),
-            "role": role,
-            "updated_et": format_et(updated_dt),
-        }))
+        entry = _evaluate_candidate_issue(
+            repo_slug, num, html_url, it.get("title", ""), role, updated_dt, include_answered
+        )
+        if entry is not None:
+            issues.append(entry)
 
     # Notifications also cover subscribed and team-mention issues that involves: does not match
     try:
@@ -469,18 +777,20 @@ def fetch_github_issue_updates(max_days, include_all):
             if html_url in seen_urls:
                 continue
             seen_urls.add(html_url)
-            # Notifications also fire for closed issues (bot locks, thank-you comments);
-            # the daily summary reports open issues only
-            if not is_issue_open(api_url):
-                continue
-            issues.append((updated_dt, {
-                "repo_slug": repo_slug,
-                "number": num,
-                "url": html_url,
-                "title": subj.get("title", ""),
-                "role": f"Notif ({n.get('reason', 'update')})",
-                "updated_et": format_et(updated_dt),
-            }))
+            # Notifications also fire for closed issues (bot locks, thank-you comments) and
+            # issues already answered by @Rusino; filter both through _evaluate_candidate_issue
+            entry = _evaluate_candidate_issue(
+                repo_slug,
+                num,
+                html_url,
+                subj.get("title", ""),
+                f"Notif ({n.get('reason', 'update')})",
+                updated_dt,
+                include_answered,
+                fallback_api_url=api_url,
+            )
+            if entry is not None:
+                issues.append(entry)
     except Exception:
         pass
 
@@ -587,7 +897,8 @@ def main():
     authored_pr_alerts = fetch_authored_github_pr_alerts(
         args.max_days, args.all, ignored_cls
     )
-    github_issues = fetch_github_issue_updates(args.max_days, args.all)
+    # Apply --include-answered uniformly to Gerrit CLs, GitHub PRs, and GitHub issue mentions
+    github_issues = fetch_github_issue_updates(args.max_days, args.all, args.include_answered)
 
     total_reviews = len(gerrit_changes) + len(github_reviews)
     if total_reviews == 0 and not authored_pr_alerts and not github_issues:
@@ -741,17 +1052,9 @@ def main():
             )
         print("\n---\n")
 
+    # Render shared table helper so CLI output and offline fixture tests check identical rows
     if github_issues:
-        print(
-            f"### 🐛 Открытые баги и упоминания на GitHub "
-            f"(`@{GITHUB_USER}`, за {args.max_days} дн.)"
-        )
-        print("| Issue | Роль | Обновлено | Тема |")
-        print("|---|---|---|---|")
-        for iss in github_issues:
-            iss_link = f"[{iss['repo_slug']}#{iss['number']}]({iss['url']})"
-            print(f"| {iss_link} | `{iss['role']}` | `{iss['updated_et']}` | {iss['title']} |")
-        print("\n---\n")
+        print(format_github_issues_section(github_issues, args.max_days), end="")
 
     # Detailed cards for each incoming CL/PR
     for r in triage_results:
