@@ -212,8 +212,14 @@ named skill's `SKILL.md` was not read, when a report with a `Case 1-5` verdict l
    - **Mandatory In-Place Dedup Across All Drafts (b/580882306)**: Before saving **any** Gerrit draft (`/PATCHSET_LEVEL`, inline `file:line`, or `in_reply_to` thread reply), always query `GET https://<host>/a/changes/<CL>/revisions/<PS>/drafts` (strip the 4-byte `)]}'` prefix), search `drafts_data.get(path, [])` for an existing draft matching `(item.get("line") or None, item.get("in_reply_to") or None) == (payload.get("line") or None, payload.get("in_reply_to") or None)`, and update it in place via `PUT https://<host>/a/changes/<CL>/revisions/<PS>/drafts/<existing_id>` (calling `PUT .../drafts` only when no matching draft exists; see `skills/skia-canary-advisor/scripts/canary_advisor.py`). Never run `git cl comment` or blind `PUT .../drafts`: both stack hidden duplicate drafts that Gerrit UI hides until `Reply` publishes every accumulated draft at once.
    - A follow-up after a new patchset is saved as a standalone `/PATCHSET_LEVEL` draft on the CURRENT patchset (no `in_reply_to`), containing only new text.
    - Use `in_reply_to` only for inline (`file:line`) replies or when the user explicitly asks to answer inside a thread; never include or re-quote already-published text in a draft.
-   - Never resolve substantive review threads unless the user asks; if asked, resolve via a minimal
-     "Done" reply on that comment's own revision (`revisions/{leaf_ps}/review`).
+   - Never publicly resolve review threads yourself. On a `CLEAN` follow-up review where the user's
+     own prior-patchset thread (such as a rebase request) is verified as addressed, stage an
+     **unpublished** `"Done"` (`unresolved: false`) Gerrit draft on that thread's own revision via
+     `python3 ~/.gemini/config/scripts/finalize_review.py stage-thread-drafts --cl <CL> \`
+     `--thread-id <ID>` (or `--auto-rebase`), so the user's one-click **Approve & publish** in
+     Flight Deck (or `finalize_review.py execute` after explicit user confirmation) auto-discovers
+     and publishes it atomically via `PUBLISH_ALL_REVISIONS` + `draft_ids_to_publish`. Never touch
+     other reviewers' threads.
 4. **No Auto-Submit or CQ Votes**: Never trigger CQ votes (`Commit-Queue+1`/`+2`) or merge actions.
 5. **Respect `PRESUBMIT.py` Include & Forward-Declaration Sorting**: In Skia, `PRESUBMIT.py` runs
    `python3 tools/rewrite_includes.py --dry-run` on all modified files and fails CQ
@@ -238,9 +244,12 @@ named skill's `SKILL.md` was not read, when a report with a `Case 1-5` verdict l
      --outcome <CLEAN|NITS|COMPANION_TESTS|COMPANION_FIX|PUSHBACK|REASSIGN> \
      --summary "<1-line finding summary>" \
      [--corpus auto|not_required|required|pending|passed|failed|waived] \
-     [--compare-md <path/to/compare.md>]
+     [--compare-md <path/to/compare.md>] \
+     [--g3-compare-md <path/to/g3_compare.md>] \
+     [--revision <patchset_commit_sha>]
    ```
-   (optional: `--draft "<text>"` or `--draft-file <path>`). When `Flutter Corpus Gate` or
+   (optional: `--draft "<text>"`, `--draft-file <path>`, `--resolved-thread-id <id>`,
+   `--draft-id <id>`). When `Flutter Corpus Gate` or
    `WebParagraph Corpus Gate` is required, `save-review` verifies `compare.md` Run Attestation
    (`Integrity Check: VALID`, `0` regressions) for that exact patchset: `CLEAN`, `NITS`, and
    `COMPANION_TESTS` render as amber `⏳ LGTM blocked: <Flutter|WebParagraph> corpus not run`

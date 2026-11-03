@@ -66,6 +66,10 @@ PATCHSET_SCOPED_REVIEW_KEYS = (
     "corpus_tested_patchset",
     "corpus_tested_sha",
     "corpus_compare_md",
+    # Reset Google3 corpus path, addressed thread IDs, and staged draft IDs when a new PS lands
+    "g3_corpus_compare_md",
+    "resolved_thread_ids",
+    "draft_ids",
     "triaged_revision",
 )
 
@@ -779,6 +783,9 @@ def save_review_verdict(
     companion_id: str = "",
     corpus: str = "auto",
     compare_md: Path | str | None = None,
+    g3_compare_md: Path | str | None = None,
+    resolved_thread_ids: Sequence[str] | None = None,
+    draft_ids: Sequence[str] | None = None,
     revision: str = "",
     files: Iterable[str] | None = None,
     verify_attestation: bool = False,
@@ -942,6 +949,11 @@ def save_review_verdict(
         "corpus_tested_patchset": tested_ps,
         "corpus_tested_sha": tested_sha,
         "corpus_compare_md": matched_compare_md,
+        "g3_corpus_compare_md": str(g3_compare_md or "").strip(),
+        "resolved_thread_ids": [
+            str(x).strip() for x in (resolved_thread_ids or ()) if str(x).strip()
+        ],
+        "draft_ids": [str(x).strip() for x in (draft_ids or ()) if str(x).strip()],
         "triaged_revision": eff_rev,
         "est_minutes": 0.0,
         "review_time_label": "",
@@ -1007,16 +1019,32 @@ def parse_queue_triage_markdown(
             kind = "github"
             target_id = pr_m.group(1)
 
-        url_m = re.search(r"\bhttps://[^\s)>]+/\+/(\d+)", body)
+        # Match parent target_id URL first so inline companion links never hijack card URLs
+        url_m = None
+        if kind != "github":
+            parent_url_m = (
+                re.search(rf"\bhttps://[^\s)>]+/\+/{re.escape(target_id)}(?:/\d+)?\b", body)
+                if target_id.isdigit()
+                else None
+            )
+            url_m = parent_url_m or re.search(r"\bhttps://[^\s)>]+/\+/(\d+)", body)
         if url_m:
             url = url_m.group(0)
         else:
-            url_gh = RE_GITHUB_PR_URL.search(body)
+            parent_gh_m = (
+                re.search(
+                    rf"\bhttps://github\.com/[^\s/]+/[^\s/]+/pull/{re.escape(target_id)}\b",
+                    body,
+                )
+                if target_id.isdigit()
+                else None
+            )
+            url_gh = parent_gh_m or RE_GITHUB_PR_URL.search(body)
             if url_gh:
                 kind = "github"
                 raw_u = url_gh.group(0)
                 url = raw_u if raw_u.startswith("https://") else f"https://{raw_u}"
-                if not pr_m:
+                if not pr_m and not parent_gh_m:
                     target_id = url_gh.group(2)
 
         rep_gate = detect_corpus_from_report_markdown(body)
@@ -1625,6 +1653,23 @@ def main() -> int:
         help="Path to compare.md Run Attestation report for the reviewed patchset",
     )
     p_rev.add_argument(
+        "--g3-compare-md",
+        default="",
+        help="Path to google3 A/B compare.md report for the reviewed patchset",
+    )
+    p_rev.add_argument(
+        "--resolved-thread-id",
+        action="append",
+        default=[],
+        help="Own prior-patchset comment/thread ID verified as addressed (repeatable)",
+    )
+    p_rev.add_argument(
+        "--draft-id",
+        action="append",
+        default=[],
+        help="Saved Gerrit draft ID intended for atomic publish (repeatable)",
+    )
+    p_rev.add_argument(
         "--revision",
         default="",
         help="Commit or head SHA of the reviewed patchset",
@@ -1683,6 +1728,9 @@ def main() -> int:
             companion_id=args.companion,
             corpus=args.corpus,
             compare_md=args.compare_md or None,
+            g3_compare_md=args.g3_compare_md or None,
+            resolved_thread_ids=args.resolved_thread_id,
+            draft_ids=args.draft_id,
             revision=args.revision,
             verify_attestation=True,
         )

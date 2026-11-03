@@ -63,6 +63,7 @@ CANARY_ADVISOR_DIR = os.path.normpath(
 if CANARY_ADVISOR_DIR not in sys.path:
   sys.path.insert(0, CANARY_ADVISOR_DIR)
 import canary_advisor  # pylint: disable=g-import-not-at-top
+import finalize_review  # pylint: disable=g-import-not-at-top
 
 DEFAULT_PORT = 8089
 DEFAULT_SKIA_DIR = os.path.expanduser("~/.gemini/jetski/scratch/skia_main")
@@ -6445,9 +6446,10 @@ def resolve_gerrit_companion_threads(
   if not bearer:
     return {"ok": False, "error": f"No Gerrit credential for {host}"}
 
-  # Build review payload responding to each unresolved leaf comment with unresolved: False
-  by_path: dict[str, list[dict[str, Any]]] = {}
+  # Group unresolved leaves by their own patchset because Gerrit rejects cross-PS in_reply_to
+  by_ps_and_path: dict[int, dict[str, list[dict[str, Any]]]] = {}
   for leaf in leaves:
+    leaf_ps = int(leaf.get("patch_set") or 1)
     p = str(leaf.get("path") or "/PATCHSET_LEVEL")
     comment_payload: dict[str, Any] = {
         "in_reply_to": leaf["id"],
@@ -6456,26 +6458,35 @@ def resolve_gerrit_companion_threads(
     }
     if leaf.get("line"):
       comment_payload["line"] = leaf["line"]
-    by_path.setdefault(p, []).append(comment_payload)
+    by_ps_and_path.setdefault(leaf_ps, {}).setdefault(p, []).append(comment_payload)
 
-  review_url = f"https://{host}/a/changes/{parent_cl_id}/revisions/current/review"
-  req_body = json.dumps({"comments": by_path, "notify": "NONE"}).encode("utf-8")
-  req = urllib.request.Request(
-      review_url,
-      data=req_body,
-      headers={
-          "Authorization": f"Bearer {bearer}",
-          "Content-Type": "application/json; charset=UTF-8",
-          "User-Agent": "flight-deck-cl-watcher/1.0",
-      },
-      method="POST",
-  )
-  try:
-    with urllib.request.urlopen(req, timeout=10) as resp:
-      resp.read()
-    return {"ok": True, "resolved_count": len(leaves)}
-  except (OSError, urllib.error.URLError, TimeoutError) as exc:
-    return {"ok": False, "error": str(exc), "resolved_count": 0}
+  resolved_count = 0
+  errors: list[str] = []
+  for leaf_ps in sorted(by_ps_and_path):
+    by_path = by_ps_and_path[leaf_ps]
+    ps_leaf_count = sum(len(v) for v in by_path.values())
+    review_url = f"https://{host}/a/changes/{parent_cl_id}/revisions/{leaf_ps}/review"
+    req_body = json.dumps({"comments": by_path, "notify": "NONE"}).encode("utf-8")
+    req = urllib.request.Request(
+        review_url,
+        data=req_body,
+        headers={
+            "Authorization": f"Bearer {bearer}",
+            "Content-Type": "application/json; charset=UTF-8",
+            "User-Agent": "flight-deck-cl-watcher/1.0",
+        },
+        method="POST",
+    )
+    try:
+      with urllib.request.urlopen(req, timeout=10) as resp:
+        resp.read()
+      resolved_count += ps_leaf_count
+    except (OSError, urllib.error.URLError, TimeoutError) as exc:
+      errors.append(f"PS{leaf_ps}: {exc}")
+
+  if errors:
+    return {"ok": False, "error": "; ".join(errors), "resolved_count": resolved_count}
+  return {"ok": True, "resolved_count": resolved_count}
 
 
 def abandon_companion_items(
@@ -6535,7 +6546,8 @@ def abandon_companion_items(
           if (auto and item_reason)
           else (item_reason or "Abandoning companion WIP CL.")
       )
-      body = json.dumps({"message": abandon_msg}).encode("utf-8")
+      # Suppress Gerrit abandon mail so silent %wip sandboxes never spam CC'd parent authors
+      body = json.dumps({"message": abandon_msg, "notify": "NONE"}).encode("utf-8")
       req = urllib.request.Request(
           url,
           data=body,
@@ -9958,6 +9970,40 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .triage-btn.primary {
     border-color: color-mix(in srgb, var(--blue) 35%, transparent); color: var(--blue);
   }
+  .triage-btn.approve {
+    border-color: color-mix(in srgb, var(--green) 45%, transparent);
+    background: color-mix(in srgb, var(--green) 12%, transparent);
+    color: color-mix(in srgb, var(--green) 72%, var(--ink));
+    font-weight: 600;
+  }
+  .triage-btn.approve:hover {
+    background: color-mix(in srgb, var(--green) 20%, transparent);
+  }
+  .finalize-sec {
+    margin-bottom: 12px; padding: 9px 11px; border-radius: 8px;
+    border: 1px solid var(--hairline); background: color-mix(in srgb, var(--ink) 2.5%, transparent);
+  }
+  .finalize-sec h4 {
+    font: 600 11px var(--sans); color: var(--graphite); text-transform: uppercase;
+    letter-spacing: 0.03em; margin-bottom: 6px;
+  }
+  .finalize-gates { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+  .finalize-item {
+    display: flex; align-items: flex-start; gap: 7px; padding: 5px 0;
+    border-top: 1px solid var(--hairline); font-size: 11.5px; line-height: 1.38;
+  }
+  .finalize-item:first-of-type { border-top: 0; padding-top: 2px; }
+  .finalize-warn {
+    padding: 8px 10px; border-radius: 8px; margin-bottom: 10px;
+    background: var(--red-wash); color: var(--red); font-weight: 500;
+  }
+  .finalize-ok {
+    padding: 8px 10px; border-radius: 8px; margin-bottom: 10px;
+    background: color-mix(in srgb, var(--green) 14%, transparent); color: var(--ink);
+  }
+  .finalize-foot {
+    display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 10px;
+  }
   .triage-btn.danger, .btn.danger {
     border-color: color-mix(in srgb, var(--red) 45%, transparent);
     background: color-mix(in srgb, var(--red) 12%, transparent);
@@ -11781,6 +11827,254 @@ function findItemByKey(key) {
 
 let currentTriageModalKey = null;
 let currentTriageModalTab = 'report';
+let finalizeModalState = {
+  key: null, loading: false, submitting: false, preview: null, error: '', result: null,
+  draftIds: new Set(), threadLeaves: new Set(), companionIds: new Set(), canaries: new Set(),
+};
+
+// Gate one-click finalization to open non-WIP external/colleague Gerrit CLs with green CLEAN triage
+function canFinalizeCleanReview(it) {
+  if (!it || it.kind !== 'gerrit' || it.is_self || isCompanion(it)) return false;
+  if (it.status !== 'NEW' || it.is_wip || it.self_approved) return false;
+  if (Number(it.self_cr_vote || 0) > 0 || isTriageStale(it)) return false;
+  const tr = it.triage;
+  if (!tr || String(tr.review_outcome || '').toUpperCase() !== 'CLEAN') return false;
+  const cStat = effectiveCorpusStatus(it);
+  return cStat === 'passed' || cStat === 'not_required' || cStat === 'waived';
+}
+
+// Fetch a read-only Gerrit/ASAN/corpus dry-run preview before enabling Confirm CR+1 & publish
+async function openFinalizeModal(key) {
+  const it = findItemByKey(key);
+  if (!it || !it.triage) return;
+  currentTriageModalKey = key;
+  currentTriageModalTab = 'finalize';
+  finalizeModalState = {
+    key, loading: true, submitting: false, preview: null, error: '', result: null,
+    draftIds: new Set(), threadLeaves: new Set(), companionIds: new Set(), canaries: new Set(),
+  };
+  renderTriageModal(it);
+  try {
+    const resp = await fetch('/api/approve_review_preview', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        item_key: key, target_id: it.target_id, host: it.host || '',
+      }),
+    });
+    const data = await resp.json();
+    if (finalizeModalState.key !== key) return;
+    if (!data || !data.ok) {
+      finalizeModalState.loading = false;
+      finalizeModalState.error = (data && data.error) || 'Failed to load finalize preview';
+    } else {
+      finalizeModalState.loading = false;
+      finalizeModalState.preview = data;
+      finalizeModalState.draftIds = new Set(
+        (data.drafts || []).filter(d => d.selected_by_default).map(d => String(d.id))
+      );
+      finalizeModalState.threadLeaves = new Set(
+        (data.own_unresolved_threads || [])
+          .filter(t => t.selected_by_default)
+          .map(t => String(t.leaf_id))
+      );
+      finalizeModalState.companionIds = new Set(
+        (data.companions || [])
+          .filter(c => c.action === 'abandon' && c.selected_by_default)
+          .map(c => String(c.id))
+      );
+      finalizeModalState.canaries = new Set(data.deferred_canaries || []);
+    }
+  } catch (err) {
+    if (finalizeModalState.key !== key) return;
+    finalizeModalState.loading = false;
+    finalizeModalState.error = String(err);
+  }
+  const latest = findItemByKey(key) || it;
+  renderTriageModal(latest);
+}
+
+function toggleFinalizeChoice(bucket, id, checked) {
+  const setObj = finalizeModalState[bucket];
+  if (!setObj) return;
+  if (checked) setObj.add(String(id));
+  else setObj.delete(String(id));
+}
+
+// Submit the user-checked whitelist of drafts, own threads, companions, and post-CR+1 canaries
+async function submitFinalizeReview(key) {
+  const st = finalizeModalState;
+  if (!st || st.key !== key || !st.preview || st.submitting) return;
+  st.submitting = true;
+  st.error = '';
+  const it = findItemByKey(key);
+  if (it) renderTriageModal(it);
+  try {
+    const resp = await fetch('/api/approve_review', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        item_key: key,
+        target_id: st.preview.target_id,
+        host: st.preview.host || '',
+        expected_revision: st.preview.revision || '',
+        draft_ids: Array.from(st.draftIds),
+        resolve_thread_leaf_ids: Array.from(st.threadLeaves),
+        abandon_companion_ids: Array.from(st.companionIds),
+        trigger_canaries: Array.from(st.canaries),
+      }),
+    });
+    const res = await resp.json();
+    st.submitting = false;
+    if (!res || !res.ok) {
+      st.error = (res && res.error) || 'Finalize request failed';
+    } else {
+      st.result = res;
+      await fetchState();
+    }
+  } catch (err) {
+    st.submitting = false;
+    st.error = String(err);
+  }
+  const latest = findItemByKey(key) || it;
+  if (latest) renderTriageModal(latest);
+}
+
+function renderFinalizeTabHtml(it) {
+  const key = it.item_key || it.target_id;
+  const keyJson = esc(JSON.stringify(key));
+  const st = finalizeModalState;
+  if (!st || st.key !== key || st.loading) {
+    return '<div class="finalize-sec">' +
+      'Checking live Gerrit drafts, threads, ASAN &amp; corpus…</div>';
+  }
+  if (st.result && st.result.ok) {
+    const r = st.result;
+    const parts = [`Voted Code-Review+1 on PS${esc(r.patchset)}`];
+    parts.push(`published ${esc((r.published_draft_ids || []).length)} draft(s)`);
+    if (r.resolved_threads_count) {
+      parts.push(`closed ${esc(r.resolved_threads_count)} own thread(s)`);
+    }
+    if ((r.abandoned_companion_ids || []).length) {
+      parts.push(`abandoned companion ${esc(r.abandoned_companion_ids.join(', '))}`);
+    }
+    if ((r.triggered_canaries || []).length) {
+      parts.push(`triggered ${esc(r.triggered_canaries.join(', '))}`);
+    }
+    const gerritBtn = link(r.url || it.url, 'Open in Gerrit', 'triage-btn primary');
+    return `<div class="finalize-ok"><b>✅ Review finalized:</b> ${parts.join(' · ')}.</div>` +
+      `<div class="finalize-foot">${gerritBtn}` +
+      `<button class="triage-btn" onclick="closeTriageModal()">Done</button></div>`;
+  }
+  let errBanner = st.error ? `<div class="finalize-warn">${esc(st.error)}</div>` : '';
+  const p = st.preview;
+  if (!p) {
+    return errBanner + `<div class="finalize-foot">` +
+      `<button class="triage-btn" onclick="openFinalizeModal(${keyJson})">Retry</button></div>`;
+  }
+  if ((p.blockers || []).length) {
+    errBanner += `<div class="finalize-warn"><b>Blocked:</b> ` +
+      `${p.blockers.map(esc).join(' · ')}</div>`;
+  }
+  const g = p.gates || {};
+  const fc = (g.flutter_corpus && g.flutter_corpus.status) || 'not_required';
+  const gc = (g.g3_corpus && g.g3_corpus.status) || 'not_required';
+  const ac = (g.asan && g.asan.status) || 'not_required';
+  const revShort = String(p.revision || '').slice(0, 10);
+  const gatesHtml = `<div class="finalize-gates">` +
+    `<span class="badge">PS${esc(p.patchset)} · ${esc(revShort)}</span>` +
+    `<span class="badge">Flutter corpus: ${esc(fc)}</span>` +
+    `<span class="badge">google3 A/B: ${esc(gc)}</span>` +
+    `<span class="badge">ASAN: ${esc(ac)}</span></div>`;
+
+  let draftsBody = '';
+  if ((p.drafts || []).length) {
+    draftsBody = p.drafts.map(d => {
+      const checked = st.draftIds.has(String(d.id)) ? 'checked' : '';
+      const idJson = esc(JSON.stringify(String(d.id)));
+      const warn = d.warning ? ` <span class="red">(${esc(d.warning)})</span>` : '';
+      return `<label class="finalize-item">` +
+        `<input type="checkbox" ${checked} ` +
+        `onchange="toggleFinalizeChoice('draftIds', ${idJson}, this.checked)">` +
+        `<div><b>PS${esc(d.patchset)} · ${esc(d.path)}</b> ` +
+        `<span class="triage-meta">(${esc(d.id)})</span>${warn}` +
+        `<div class="triage-pre" style="margin-top:4px;">${esc(d.message)}</div></div></label>`;
+    }).join('');
+  } else if (p.triage_draft_fallback) {
+    draftsBody = `<div class="finalize-item"><div>` +
+      `<b>PS${esc(p.patchset)} · /PATCHSET_LEVEL (from triage_store)</b>` +
+      `<div class="triage-pre" style="margin-top:4px;">${esc(p.triage_draft_fallback)}</div>` +
+      `</div></div>`;
+  } else {
+    draftsBody = `<div class="triage-meta">No pending drafts (will post bare Code-Review+1)</div>`;
+  }
+
+  let threadsBody = '';
+  if ((p.own_unresolved_threads || []).length) {
+    threadsBody = p.own_unresolved_threads.map(t => {
+      const checked = st.threadLeaves.has(String(t.leaf_id)) ? 'checked' : '';
+      const lidJson = esc(JSON.stringify(String(t.leaf_id)));
+      return `<label class="finalize-item">` +
+        `<input type="checkbox" ${checked} ` +
+        `onchange="toggleFinalizeChoice('threadLeaves', ${lidJson}, this.checked)">` +
+        `<div><b>PS${esc(t.patchset)} · ${esc(t.path)}</b> → reply <code>Done</code> ` +
+        `(resolve)<div class="triage-meta">${esc(t.root_snippet)}</div></div></label>`;
+    }).join('');
+  } else {
+    threadsBody = `<div class="triage-meta">No open own threads on prior patchsets</div>`;
+  }
+  if ((p.other_unresolved_threads || []).length) {
+    threadsBody += `<div class="triage-meta" style="margin-top:5px;">` +
+      `Note: ${esc(p.other_unresolved_threads.length)} unresolved thread(s) from other ` +
+      `reviewers remain untouched</div>`;
+  }
+
+  let compBody = '';
+  if ((p.companions || []).length) {
+    compBody = p.companions.map(c => {
+      if (c.action === 'abandon') {
+        const checked = st.companionIds.has(String(c.id)) ? 'checked' : '';
+        const cidJson = esc(JSON.stringify(String(c.id)));
+        return `<label class="finalize-item"><input type="checkbox" ${checked} ` +
+          `onchange="toggleFinalizeChoice('companionIds', ${cidJson}, this.checked)">` +
+          `<div>${link(c.url, `CL ${esc(c.id)}`)} — ${esc(c.label)}</div></label>`;
+      }
+      return `<div class="finalize-item"><span class="triage-meta">` +
+        `${link(c.url, `CL ${esc(c.id)}`)}: ${esc(c.label)}</span></div>`;
+    }).join('');
+  } else {
+    compBody = `<div class="triage-meta">No companion WIP CL linked</div>`;
+  }
+
+  let canBody = '';
+  if ((p.deferred_canaries || []).length) {
+    canBody = p.deferred_canaries.map(c => {
+      const checked = st.canaries.has(String(c)) ? 'checked' : '';
+      const cJson = esc(JSON.stringify(String(c)));
+      return `<label class="finalize-item"><input type="checkbox" ${checked} ` +
+        `onchange="toggleFinalizeChoice('canaries', ${cJson}, this.checked)">` +
+        `<div>Trigger <b>${esc(c)}</b> + background watcher after CR+1</div></label>`;
+    }).join('');
+  } else {
+    canBody = `<div class="triage-meta">None needed after CR+1</div>`;
+  }
+
+  const disabledAttr = (!p.ready || st.submitting)
+    ? 'disabled style="opacity:0.5;cursor:not-allowed;"'
+    : '';
+  const btnText = st.submitting ? 'Publishing…' : '✅ Confirm CR+1 & publish';
+  return `${errBanner}${gatesHtml}` +
+    `<div class="finalize-sec"><h4>1. Publish Drafts + Vote Code-Review+1 ` +
+    `(PUBLISH_ALL_REVISIONS whitelist)</h4>${draftsBody}</div>` +
+    `<div class="finalize-sec"><h4>2. Own Prior-Patchset Unresolved Threads</h4>` +
+    `${threadsBody}</div>` +
+    `<div class="finalize-sec"><h4>3. Companion WIP CL Cleanup</h4>${compBody}</div>` +
+    `<div class="finalize-sec"><h4>4. Post-CR+1 External Canaries</h4>${canBody}</div>` +
+    `<div class="finalize-foot">` +
+    `<button class="triage-btn" onclick="openFinalizeModal(${keyJson})">Refresh preview</button>` +
+    `<button class="triage-btn approve" ${disabledAttr} ` +
+    `onclick="submitFinalizeReview(${keyJson})">${btnText}</button></div>`;
+}
 
 function openTriageModal(key, tab) {
   const it = findItemByKey(key);
@@ -11907,10 +12201,15 @@ function renderTriageModal(it) {
   const bInfo = triageBadgeInfo(it);
   const key = it.item_key || it.target_id;
   const hasDraft = Boolean(tr.draft && tr.draft.trim());
+  const canFin = canFinalizeCleanReview(it) || currentTriageModalTab === 'finalize';
   const activeTab = currentTriageModalTab || (hasDraft ? 'draft' : 'report');
+  const isFinalizeTab = activeTab === 'finalize';
   const content = activeTab === 'draft'
     ? (tr.draft || 'No draft comment required.')
     : (tr.report_markdown || 'No report available.');
+  const bodyHtml = isFinalizeTab
+    ? renderFinalizeTabHtml(it)
+    : `<div class="triage-pre">${esc(content)}</div>`;
 
   root.innerHTML = `
     <div class="triage-modal-backdrop" onclick="if (event.target === this) closeTriageModal()">
@@ -11924,6 +12223,11 @@ function renderTriageModal(it) {
           <button class="triage-modal-close" onclick="closeTriageModal()" title="Close">✕</button>
         </div>
         <div class="triage-modal-tabs">
+          ${canFin ? `
+            <button class="triage-tab${isFinalizeTab ? ' active' : ''}"
+              onclick="openFinalizeModal(${esc(JSON.stringify(key))})">
+              Approve &amp; Publish
+            </button>` : ''}
           ${hasDraft ? `
             <button class="triage-tab${activeTab === 'draft' ? ' active' : ''}"
               onclick="currentTriageModalTab='draft'; ` +
@@ -11935,13 +12239,13 @@ function renderTriageModal(it) {
             `renderTriageModal(findItemByKey(${esc(JSON.stringify(key))}))">
             Triage Report
           </button>
-          ${hasDraft ? `
+          ${(hasDraft && !isFinalizeTab) ? `
             <button class="triage-btn primary" style="margin-left: auto; margin-bottom: 6px;"
               onclick="copyTriageDraft(${esc(JSON.stringify(key))}, this)">` +
               `Copy Draft</button>` : ''}
         </div>
         <div class="triage-modal-body">
-          <div class="triage-pre">${esc(content)}</div>
+          ${bodyHtml}
         </div>
       </div>
     </div>`;
@@ -12013,6 +12317,10 @@ function triageHtml(it, compact) {
   const hasDraft = Boolean(tr.draft && tr.draft.trim());
 
   let actions = '';
+  if (canFinalizeCleanReview(it)) {
+    actions += `<button class="triage-btn approve" ` +
+      `onclick="openFinalizeModal(${keyJson})">✅ Approve &amp; publish</button>`;
+  }
   if (hasDraft) {
     actions += `<button class="triage-btn primary" ` +
       `onclick="openTriageModal(${keyJson}, 'draft')">Draft</button>`;
@@ -13846,6 +14154,8 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
         "/api/abandon",
         "/api/ack_bug",
         "/api/add_reviewer",
+        "/api/approve_review_preview",
+        "/api/approve_review",
     ):
       length = int(self.headers.get("Content-Length") or 0)
       raw_body = (
@@ -13890,6 +14200,44 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
         res = abandon_companion_items(
             keys, reason=str(bdict.get("reason") or "")
         )
+      elif parsed.path in ("/api/approve_review_preview", "/api/approve_review"):
+        # Route dry-run preview and explicit one-click atomic review publish through finalize_review
+        raw_tid = str(bdict.get("target_id") or "").strip()
+        raw_ikey = str(bdict.get("item_key") or "").strip()
+        if not raw_tid and ":" in raw_ikey:
+          raw_tid = raw_ikey.split(":", 1)[1].split("@", 1)[0]
+        raw_host = str(bdict.get("host") or "").strip() or GERRIT_SKIA_HOST
+        try:
+          if parsed.path == "/api/approve_review_preview":
+            res = finalize_review.build_finalize_preview(raw_tid, host=raw_host)
+          else:
+            res = finalize_review.execute_finalize_review(
+                raw_tid,
+                host=raw_host,
+                expected_revision=str(bdict.get("expected_revision") or ""),
+                draft_ids=(
+                    [str(x) for x in bdict["draft_ids"]]
+                    if isinstance(bdict.get("draft_ids"), list)
+                    else None
+                ),
+                resolve_thread_leaf_ids=(
+                    [str(x) for x in bdict["resolve_thread_leaf_ids"]]
+                    if isinstance(bdict.get("resolve_thread_leaf_ids"), list)
+                    else None
+                ),
+                abandon_companion_ids=(
+                    [str(x) for x in bdict["abandon_companion_ids"]]
+                    if isinstance(bdict.get("abandon_companion_ids"), list)
+                    else None
+                ),
+                trigger_canaries=(
+                    [str(x) for x in bdict["trigger_canaries"]]
+                    if isinstance(bdict.get("trigger_canaries"), list)
+                    else None
+                ),
+            )
+        except Exception as exc:
+          res = {"ok": False, "error": str(exc)}
       else:
         res = rebase_item(str(bdict.get("item_key") or ""))
       self._send_json(res, code=200 if res.get("ok") else 400)

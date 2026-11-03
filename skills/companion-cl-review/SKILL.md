@@ -154,7 +154,11 @@ Never auto-publish the review comment to Gerrit or GitHub unless the user explic
 - **Mandatory In-Place Dedup Across All Drafts (b/580882306)**: Before saving **any** Gerrit draft (`/PATCHSET_LEVEL`, inline `file:line`, or `in_reply_to` thread reply), always query `GET https://<host>/a/changes/<CL>/revisions/<PS>/drafts` (strip the 4-byte `)]}'` prefix), search `drafts_data.get(path, [])` for an existing draft matching `(item.get("line") or None, item.get("in_reply_to") or None) == (payload.get("line") or None, payload.get("in_reply_to") or None)`, and update it in place via `PUT https://<host>/a/changes/<CL>/revisions/<PS>/drafts/<existing_id>` (calling `PUT .../drafts` only when no matching draft exists; see `skills/skia-canary-advisor/scripts/canary_advisor.py`). Never run `git cl comment` or blind `PUT .../drafts`: both stack hidden duplicate drafts that Gerrit UI hides until `Reply` publishes every accumulated draft at once.
 - A follow-up after a new patchset is saved as a standalone `/PATCHSET_LEVEL` draft on the CURRENT patchset (no `in_reply_to`), containing only new text.
 - Use `in_reply_to` only for inline (`file:line`) replies or when the user explicitly asks to answer inside a thread; never include or re-quote already-published text in a draft.
-- Never resolve the old thread unless the user asks; if asked, resolve via a minimal "Done" reply in that thread.
+- Never publicly resolve old threads yourself. When the user's own prior-patchset thread is
+  verified as addressed on a `CLEAN` follow-up patchset, stage an unpublished `"Done"`
+  (`unresolved: false`) Gerrit draft on that comment's revision via
+  `python3 ~/.gemini/config/scripts/finalize_review.py stage-thread-drafts --cl <CL> \`
+  `--thread-id <ID>` (never touch other reviewers' threads).
 - **Save Review Verdict for Flight Deck (`triage_store.py`)**:
   Always save the review outcome (Case 1 `CLEAN`, Case 2 `NITS`, Case 3 `COMPANION_TESTS`, Case 4 `PUSHBACK`, Case 5 `COMPANION_FIX`) and a concise 1-line summary via:
   ```bash
@@ -163,7 +167,9 @@ Never auto-publish the review comment to Gerrit or GitHub unless the user explic
     --outcome <CLEAN|NITS|COMPANION_TESTS|COMPANION_FIX|PUSHBACK> \
     --summary "<1-line finding summary>" \
     [--corpus auto|not_required|required|pending|passed|failed|waived] \
-    [--compare-md <path/to/compare.md>]
+    [--compare-md <path/to/compare.md>] \
+    [--g3-compare-md <path/to/g3_compare.md>] \
+    [--revision <patchset_commit_sha>]
   ```
   (passing `--draft "<draft text>"` or `--draft-file <path>`), so Flight Deck displays the verdict
   badge and summary immediately while keeping `CLEAN`/`NITS`/`COMPANION_TESTS` amber
@@ -244,5 +250,15 @@ When the user asks for a dry run (e.g., *"dry"*, *"сухой прогон"*, *"
 Once the author responds with a new patchset of their parent CL:
 
 1. **Verify the fold-in mechanically**: fetch the new patchset and check that `git diff <companion_PS2_sha> <author_new_PS_sha>` is empty and that both commits share the same parent. If the diff is not empty, review only that delta (the author may have adjusted the fix) before going further.
-2. **Recommend, do not act**: when the check passes (or the author landed an alternative fix that you reviewed), recommend `Code-Review+1` on the parent CL and abandoning the companion WIP CL. Voting and abandoning are left to the user.
-3. **Follow-up Gerrit draft**: if saving a follow-up draft in Gerrit, save it as a standalone `/PATCHSET_LEVEL` draft on the **current** patchset (no `in_reply_to`, only new text); never reply inside the old patchset's thread or resolve it unless the user explicitly asks (in which case resolve via a minimal `"Done"` reply).
+2. **Stage drafts, let the user finalize in one click**: when the check passes (or the author
+   landed an alternative fix that you reviewed and all corpus/ASAN gates pass), save the `CLEAN`
+   verdict in `triage_store.py` and stage any unpublished `"Done"` drafts on your own addressed
+   prior-patchset threads via `finalize_review.py stage-thread-drafts` (`finalize_review.py`
+   auto-discovers staged `"Done"` drafts during `preview`/`execute`). Publishing drafts, voting
+   `Code-Review+1`, idempotently abandoning the companion WIP CL (`notify: "NONE"`), and launching
+   deferred post-`CR+1` `Canary-G3` are executed only when the user clicks **Approve & publish** in
+   Flight Deck (or explicitly confirms running `finalize_review.py execute`).
+3. **Follow-up Gerrit draft**: save the follow-up review message as a standalone `/PATCHSET_LEVEL`
+   draft on the **current** patchset (no `in_reply_to`, only new text); only stage `"Done"`
+   (`unresolved: false`) drafts on prior patchsets for the user's own addressed threads, and never
+   publish or resolve any thread without explicit user confirmation.
