@@ -418,8 +418,9 @@ def format_review_labels(
     cname = corpus_display_name(corpus_script)
     st = str(corpus_status or "").lower()
     if outcome in GATED_LGTM_OUTCOMES and corpus_required:
+        # Unrun corpus requires explicit user or agent action rather than passive waiting
         if st in ("", "pending", "required"):
-            lbl = f"⏳ LGTM blocked: {cname} not run"
+            lbl = f"⚠️ LGTM blocked: run {cname}"
             return {
                 "verdict_label": lbl,
                 "review_outcome_label": lbl,
@@ -1700,6 +1701,16 @@ def overlay_triage_on_items(
         tr_rev = str(tr.get("triaged_revision") or "").strip().lower()
         if len(cur_rev) >= 7 and len(tr_rev) >= 7 and not _sha_matches(cur_rev, tr_rev):
             is_stale = True
+        elif (
+            it.get("kind") == "github"
+            and len(cur_rev) >= 7
+            and len(tr_rev) >= 7
+            and _sha_matches(cur_rev, tr_rev)
+        ):
+            # GitHub patchset is synthesized from review count while triaged_patchset
+            # defaults to 1; matching commit revision means triage is current, not stale
+            is_stale = False
+            tr_ps = cur_ps
 
         # Propagate reviewed patchset to item when review outcome is recorded
         if tr.get("review_outcome") and tr_ps is not None:
@@ -1730,8 +1741,16 @@ def overlay_triage_on_items(
             if c_status in ("", "not_required", "required"):
                 c_status = "pending"
             tested_ps = int(tr.get("corpus_tested_patchset") or tr_ps or 0)
+            # Keep passed corpus on GitHub when review count bumps patchset on the same SHA
+            tested_sha = str(tr.get("corpus_tested_sha") or tr_rev or "").strip().lower()
             eff_ps = int(cur_ps or tr_ps or 1)
-            if c_status == "passed" and tested_ps != eff_ps:
+            gh_sha_match = (
+                it.get("kind") == "github"
+                and len(cur_rev) >= 7
+                and len(tested_sha) >= 7
+                and _sha_matches(cur_rev, tested_sha)
+            )
+            if c_status == "passed" and tested_ps != eff_ps and not gh_sha_match:
                 c_status = "pending"
             # Upgrade pending to passed in production when compare.md attests this patchset
             if c_status == "pending" and results_dir is None and len(cur_rev) >= 7:

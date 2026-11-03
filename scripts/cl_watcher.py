@@ -13783,7 +13783,8 @@ function spineStepShortState(m) {
     const cStat = effectiveCorpusStatus(m);
     if (GATED_LGTM_OUTCOMES.has(out) && tr.corpus_required) {
       if (cStat === 'failed') return {short: 'Corpus fail', icon: '🔴', tone: 'spine-bad'};
-      if (cStat === 'pending') return {short: 'Corpus needed', icon: '⏳', tone: 'spine-warn'};
+      // Distinguish pending unrun gate from active background chat_busy run
+      if (cStat === 'pending') return {short: 'Corpus needed', icon: '⚠️', tone: 'spine-warn'};
       if (cStat === 'waived') return {short: 'Corpus waived', icon: '⚠️', tone: 'spine-warn'};
     }
     if (out === 'CLEAN') return {short: 'Clean', icon: '🟢', tone: 'spine-ok'};
@@ -15060,6 +15061,15 @@ function isTriageStale(it) {
   const tr = it && it.triage;
   if (!tr) return false;
   if (tr.is_stale) return true;
+  // On GitHub PRs, matching commit revision means triage is current regardless of review count
+  if (it && it.kind === 'github') {
+    const curRev = String(it.head_sha || it.revision || '').trim().toLowerCase();
+    const trRev = String(tr.triaged_revision || '').trim().toLowerCase();
+    if (curRev.length >= 7 && trRev.length >= 7 &&
+        (curRev.startsWith(trRev) || trRev.startsWith(curRev))) {
+      return false;
+    }
+  }
   const revPs = Number(tr.triaged_patchset || it.reviewed_ps || 0);
   return revPs > 0 && Number(it.patchset || 0) > revPs;
 }
@@ -15083,6 +15093,17 @@ function effectiveCorpusStatus(it) {
   if (st === 'passed') {
     const curPs = Number(it.patchset || tr.triaged_patchset || 1);
     const testedPs = Number(tr.corpus_tested_patchset || tr.triaged_patchset || 0);
+    // On GitHub PRs, matching commit revision satisfies the passed corpus gate
+    if (it && it.kind === 'github' && !isTriageStale(it)) {
+      const curRev = String(it.head_sha || it.revision || '').trim().toLowerCase();
+      const trRev = String(
+        tr.corpus_tested_sha || tr.triaged_revision || ''
+      ).trim().toLowerCase();
+      if (curRev.length >= 7 && trRev.length >= 7 &&
+          (curRev.startsWith(trRev) || trRev.startsWith(curRev))) {
+        return 'passed';
+      }
+    }
     return (testedPs > 0 && curPs === testedPs) ? 'passed' : 'pending';
   }
   return 'pending';
@@ -15109,16 +15130,22 @@ function triageBadgeInfo(it) {
   const cStat = effectiveCorpusStatus(it);
   if (GATED_LGTM_OUTCOMES.has(out) && tr.corpus_required) {
     if (stale) {
+      const busy = Boolean(it && it.chat_busy);
+      const act = busy ? `running ${cName}…` : `run ${cName}`;
+      const ico = busy ? '⏳' : '⚠️';
+      // Distinguish active background re-runs on newer revisions from idle stale gates
       const eyebrow = curPs > revPs
-        ? `⏳ Review PS${revPs} → PS${curPs} uploaded (${cName} not run)`
-        : `⏳ Review PS${revPs} stale: new commit (${cName} not run)`;
+        ? `${ico} Review PS${revPs} → PS${curPs} uploaded (${act})`
+        : `${ico} Review PS${revPs} stale: new commit (${act})`;
       return {
         cls: 'triage-corpus_blocked', pillCls: 'v-corpus_blocked',
-        label: `⏳ LGTM blocked: ${cName} not run`, eyebrow,
+        label: busy ? `⏳ Running ${cName}…` : `⚠️ LGTM blocked: run ${cName}`, eyebrow,
       };
     }
     if (cStat === 'pending') {
-      const lbl = `⏳ LGTM blocked: ${cName} not run`;
+      // Show hourglass only while the chat is actively running, otherwise prompt to run
+      const lbl = Boolean(it && it.chat_busy)
+        ? `⏳ Running ${cName}…` : `⚠️ LGTM blocked: run ${cName}`;
       return {cls: 'triage-corpus_blocked', pillCls: 'v-corpus_blocked', label: lbl, eyebrow: lbl};
     }
     if (cStat === 'failed') {

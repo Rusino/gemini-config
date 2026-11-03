@@ -112,7 +112,7 @@ LGTM pending corpus gate.
     self.assertEqual(it["review_outcome"], "CLEAN")
     self.assertTrue(it["corpus_required"])
     self.assertEqual(it["corpus_status"], "pending")
-    self.assertEqual(it["review_eyebrow_label"], "⏳ LGTM blocked: Flutter corpus not run")
+    self.assertEqual(it["review_eyebrow_label"], "⚠️ LGTM blocked: run Flutter corpus")
 
     md_clean = """
 # Deep Audit for CL 1409698
@@ -504,7 +504,7 @@ LGTM. Verified mechanical churn; no unintended side effects.
     res_req = ts.load_triage_result("gerrit", "1414017", results_dir=self.test_dir)
     self.assertTrue(res_req["corpus_required"])
     self.assertEqual(res_req["corpus_status"], "pending")
-    self.assertEqual(res_req["review_eyebrow_label"], "⏳ LGTM blocked: Flutter corpus not run")
+    self.assertEqual(res_req["review_eyebrow_label"], "⚠️ LGTM blocked: run Flutter corpus")
     self.assertEqual(res_req["verdict_tone"], "corpus_blocked")
 
     ts.save_review_verdict(
@@ -518,7 +518,7 @@ LGTM. Verified mechanical churn; no unintended side effects.
     )
     res_pend = ts.load_triage_result("gerrit", "1414018", results_dir=self.test_dir)
     self.assertEqual(res_pend["corpus_status"], "pending")
-    self.assertEqual(res_pend["review_eyebrow_label"], "⏳ LGTM blocked: Flutter corpus not run")
+    self.assertEqual(res_pend["review_eyebrow_label"], "⚠️ LGTM blocked: run Flutter corpus")
 
     # Failed corpus blocks LGTM with failed verdict
     ts.save_review_verdict(
@@ -570,7 +570,7 @@ LGTM. Verified mechanical churn; no unintended side effects.
     self.assertIn("recording corpus_status=pending", err_buf.getvalue())
     res_unatt = ts.load_triage_result("gerrit", "1414021", results_dir=self.test_dir)
     self.assertEqual(res_unatt["corpus_status"], "pending")
-    self.assertEqual(res_unatt["review_eyebrow_label"], "⏳ LGTM blocked: Flutter corpus not run")
+    self.assertEqual(res_unatt["review_eyebrow_label"], "⚠️ LGTM blocked: run Flutter corpus")
 
     # Valid compare.md Run Attestation unlocks green Clean (LGTM)
     valid_md = self._write_corpus_fixture(
@@ -646,7 +646,7 @@ LGTM. Verified mechanical churn; no unintended side effects.
     r1 = ts.load_triage_result("gerrit", "1414017", results_dir=self.test_dir)
     self.assertTrue(r1["corpus_required"])
     self.assertEqual(r1["corpus_status"], "pending")
-    self.assertEqual(r1["review_eyebrow_label"], "⏳ LGTM blocked: Flutter corpus not run")
+    self.assertEqual(r1["review_eyebrow_label"], "⚠️ LGTM blocked: run Flutter corpus")
 
     # Native Skia dm compare.md must never satisfy the Flutter corpus gate
     dm_md = self._write_corpus_fixture(
@@ -812,7 +812,7 @@ LGTM. Verified mechanical churn; no unintended side effects.
     )
     ps2_rev = ts.load_triage_result("gerrit", "1414017", results_dir=self.test_dir)
     self.assertEqual(ps2_rev["corpus_status"], "pending")
-    self.assertEqual(ps2_rev["review_eyebrow_label"], "⏳ LGTM blocked: Flutter corpus not run")
+    self.assertEqual(ps2_rev["review_eyebrow_label"], "⚠️ LGTM blocked: run Flutter corpus")
 
   def test_webparagraph_corpus_gate_on_github_pr_and_commit_push_reset(self):
     wp_files = ["engine/src/flutter/lib/web_ui/lib/src/engine/web_paragraph/paragraph.dart"]
@@ -832,7 +832,7 @@ LGTM. Verified mechanical churn; no unintended side effects.
     self.assertEqual(wp_pend["corpus_script"], "run_webparagraph_corpus.py")
     self.assertEqual(wp_pend["corpus_status"], "pending")
     self.assertEqual(
-        wp_pend["review_eyebrow_label"], "⏳ LGTM blocked: WebParagraph corpus not run"
+        wp_pend["review_eyebrow_label"], "⚠️ LGTM blocked: run WebParagraph corpus"
     )
 
     # Valid WebParagraph compare.md on exact PR head SHA unlocks Minor nits badge
@@ -858,6 +858,23 @@ LGTM. Verified mechanical churn; no unintended side effects.
     wp_ok = ts.load_triage_result("github", "195600", results_dir=self.test_dir)
     self.assertEqual(wp_ok["corpus_status"], "passed")
     self.assertEqual(wp_ok["review_eyebrow_label"], "🔵 Review PS1: Minor nits")
+
+    # Matching commit on GitHub PR keeps triage current even if patchset incremented
+    match_items = [{
+        "item_key": "github:195600",
+        "target_id": "195600",
+        "kind": "github",
+        "patchset": 3,
+        "revision": "aaaa11112222",
+        "head_sha": "aaaa111122223333444455556666777788889999",
+        "files": wp_files,
+    }]
+    ts.overlay_triage_on_items(match_items, results_dir=self.test_dir, ingest_tmp=False)
+    self.assertFalse(match_items[0]["triage"]["is_stale"])
+    self.assertEqual(match_items[0]["triage"]["corpus_status"], "passed")
+    self.assertEqual(
+        match_items[0]["triage"]["review_eyebrow_label"], "🔵 Review PS3: Minor nits"
+    )
 
     # Author pushes a new commit on GitHub (patchset stays 1 when len(reviews)==0, revision changes)
     pr_items = [{
@@ -944,7 +961,7 @@ LGTM. Verified mechanical churn; no unintended side effects.
     )
     ps2 = ts.load_triage_result("gerrit", "1414016", results_dir=self.test_dir)
     self.assertEqual(ps2["corpus_status"], "pending")
-    self.assertEqual(ps2["review_eyebrow_label"], "⏳ LGTM blocked: Flutter corpus not run")
+    self.assertEqual(ps2["review_eyebrow_label"], "⚠️ LGTM blocked: run Flutter corpus")
 
 
 class FlightDeckTriageDashboardRenderingTest(unittest.TestCase):
@@ -1262,6 +1279,14 @@ console.log(JSON.stringify({
   skpPendingCard: focusCard(skpPending, {jetski_box_url: ''}),
   skpPendingRow: rowHtml(skpPending, {jetski_box_url: ''}),
   skpPendingSpine: spineStepShortState(skpPending),
+  skpRunning: triageBadgeInfo(Object.assign({}, skpPending, {chat_busy: true})),
+  skpStaleRunning: triageBadgeInfo(Object.assign({}, skpUploadedPs2, {chat_busy: true})),
+  ghNotStale: isTriageStale({
+    kind: 'github',
+    patchset: 3,
+    revision: '11db23963c',
+    triage: {triaged_patchset: 1, triaged_revision: '11db23963c', is_stale: false},
+  }),
   wpNitsEyebrow: reviewVerdictEyebrowHtml(wpNitsPending),
   skpFailedCard: focusCard(skpFailed, {jetski_box_url: ''}),
   skpWaivedCard: focusCard(skpWaived, {jetski_box_url: ''}),
@@ -1277,17 +1302,25 @@ console.log(JSON.stringify({
 
     # Pending SkParagraph corpus renders amber blocked pill and never green LGTM
     self.assertIn("v-corpus_blocked", out["skpPendingCard"])
-    self.assertIn("⏳ LGTM blocked: Flutter corpus not run", out["skpPendingCard"])
+    self.assertIn("⚠️ LGTM blocked: run Flutter corpus", out["skpPendingCard"])
     self.assertNotIn("v-clean", out["skpPendingCard"])
     self.assertNotIn("triage-clean", out["skpPendingCard"])
     self.assertNotIn("🟢", out["skpPendingCard"])
-    self.assertIn("⏳ LGTM blocked: Flutter corpus not run", out["skpPendingRow"])
+    self.assertIn("⚠️ LGTM blocked: run Flutter corpus", out["skpPendingRow"])
     self.assertNotIn("triage-clean", out["skpPendingRow"])
     self.assertNotEqual(out["skpPendingSpine"]["tone"], "spine-ok")
 
+    # When chat_busy is true, badge shows running state on both current and stale revisions
+    self.assertEqual(out["skpRunning"]["label"], "⏳ Running Flutter corpus…")
+    self.assertEqual(out["skpStaleRunning"]["label"], "⏳ Running Flutter corpus…")
+    self.assertIn("⏳ Review PS1 → PS2 uploaded", out["skpStaleRunning"]["eyebrow"])
+
+    # GitHub revision match keeps triage current
+    self.assertFalse(out["ghNotStale"])
+
     # Pending WebParagraph corpus on NITS renders amber blocked pill
     self.assertIn("v-corpus_blocked", out["wpNitsEyebrow"])
-    self.assertIn("⏳ LGTM blocked: WebParagraph corpus not run", out["wpNitsEyebrow"])
+    self.assertIn("⚠️ LGTM blocked: run WebParagraph corpus", out["wpNitsEyebrow"])
     self.assertNotIn("v-nits", out["wpNitsEyebrow"])
 
     # Failed and waived corpus never render green
