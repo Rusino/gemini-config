@@ -35,8 +35,9 @@ def check_audit_preflight(min_remaining: str = "15m") -> dict[str, Any]:
     if not gcert_bin:
         return {"ok": True, "reason": ""}
     try:
+        # Check LOAS2 only; systemd services and hook subshells lack the CRD SSH agent socket
         res = subprocess.run(
-            [gcert_bin, f"-check_remaining={min_remaining}", "-quiet"],
+            [gcert_bin, "-check_ssh=false", f"-check_remaining={min_remaining}", "-quiet"],
             capture_output=True,
             text=True,
             timeout=4,

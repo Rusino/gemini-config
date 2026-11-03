@@ -326,6 +326,26 @@ class AuditGateTests(unittest.TestCase):
         self.assertEqual(dec_unaudited_rebase["tier"], 2)
         self.assertEqual(dec_unaudited_rebase["delta_kind"], "initial")
 
+    def test_check_audit_preflight_passes_check_ssh_false(self):
+        ok_proc = mock.Mock(returncode=0)
+        with (
+            mock.patch.object(audit_gate.shutil, "which", return_value="/usr/bin/gcertstatus"),
+            mock.patch.object(audit_gate.subprocess, "run", return_value=ok_proc) as mock_run,
+        ):
+            res = audit_gate.check_audit_preflight("15m")
+        self.assertEqual(res, {"ok": True, "reason": ""})
+        argv = mock_run.call_args[0][0]
+        self.assertIn("-check_ssh=false", argv)
+        self.assertIn("-check_remaining=15m", argv)
+
+        fail_proc = mock.Mock(returncode=1)
+        with (
+            mock.patch.object(audit_gate.shutil, "which", return_value="/usr/bin/gcertstatus"),
+            mock.patch.object(audit_gate.subprocess, "run", return_value=fail_proc),
+        ):
+            res_exp = audit_gate.check_audit_preflight("15m")
+        self.assertFalse(res_exp["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()
