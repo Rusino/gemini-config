@@ -445,9 +445,13 @@ def load_cl(cl, ps=None, include_diff=True):
     }
 
 
-# Cloudtop mounts /google/src/cloud so google3-test-paragraph can run directly in CitC
+# Local CitC mount on Linux Cloudtop, or corp gMac forwarding over SSH via corp-ssh-helper
 def has_cloudtop_citc():
-    return os.path.isdir("/google/src/cloud")
+    if os.path.isdir("/google/src/cloud"):
+        return True
+    if os.environ.get("GOOGLE3_PARAGRAPH_SSH_HOST", "").strip():
+        return True
+    return sys.platform == "darwin" and os.path.exists("/usr/local/bin/corp-ssh-helper")
 
 
 def advise(args):

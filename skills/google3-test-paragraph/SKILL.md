@@ -33,7 +33,7 @@ Why this corpus replaces `Canary-G3` for `skparagraph` / `skunicode` and complem
 
 ## Workspace & Data Layout
 
-- **CitC Client (Linux Cloudtop only)**: `/google/src/cloud/jlavrova/skia_g3_ab/google3` (auto-falls back to `skia_g3_pilot`, or creates `skia_g3_ab` when `--create-citc` is passed)
+- **CitC Client (Linux Cloudtop, or corp macOS via SSH)**: `/google/src/cloud/jlavrova/skia_g3_ab/google3` (auto-falls back to `skia_g3_pilot`, or creates `skia_g3_ab` when `--create-citc` is passed; when invoked on macOS without a local `/google/src/cloud` mount, [`run_g3_paragraph_tests.py`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/google3-test-paragraph/scripts/run_g3_paragraph_tests.py) forwards execution over multiplexed SSH `ControlPersist=8h` to `<user>-for-jetski.c.googlers.com` and pulls `compare.md` + per-leg JSON summaries back into `--out`)
 - **Mirrored Skia Root in `google3`**: `<citc>/google3/third_party/skia/HEAD` (pinned revision read from `third_party/skia/HEAD/METADATA`)
 - **Local Skia Git Checkout**: `~/.gemini/jetski/scratch/skia` (or `--skia-repo <path>`)
 - **Cached Target Lists**:
@@ -105,6 +105,8 @@ python3 ~/.gemini/config/skills/google3-test-paragraph/scripts/parse_g3_paragrap
 - `--resume` — Skip legs whose `attestation.json` and `summary.json` already exist in `--out`.
 - `--allow-stale-targets` — Proceed even if `targets_manifest.json` is older than `--max-targets-age-days` (default `30`), recording a warning in `attestation.json`.
 - `--allow-dirty-citc` — Proceed even if the CitC client already had open/modified files before staging (flagged `WARNING / INVALID` in `compare.md`).
+- `--ssh-host <host>` — Remote Linux Cloudtop host used when `/google/src/cloud` is not mounted locally (default: `$GOOGLE3_PARAGRAPH_SSH_HOST`, `~/.config/google3-test-paragraph/ssh_host`, or `<user>-for-jetski.c.googlers.com`; supports `G3_HEAD`, `cl:<change>/<ps>`, `WORKTREE`, and local commits).
+- `--no-ssh` — Disable automatic SSH forwarding when `/google/src/cloud` is not mounted locally.
 
 ---
 

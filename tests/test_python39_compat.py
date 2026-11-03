@@ -78,6 +78,18 @@ def check_python39_source_compatibility(src: str, filename: str) -> list[str]:
       errors.append(f"{filename}:{node.lineno}: `except*` requires Python 3.11+")
     if hasattr(ast, "TypeAlias") and isinstance(node, ast.TypeAlias):
       errors.append(f"{filename}:{node.lineno}: `type X = ...` requires Python 3.12+")
+    # TestCase.enterContext was added in Python 3.11 and fails on macOS Xcode Python 3.9
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+        and node.func.attr == "enterContext"
+    ):
+      errors.append(
+          f"{filename}:{node.lineno}: `self.enterContext(...)` requires Python 3.11+; "
+          "use `patcher.start()` + `self.addCleanup(patcher.stop)` on Python 3.9"
+      )
   return errors
 
 
@@ -162,6 +174,11 @@ class TestPython39Compat(unittest.TestCase):
     bad_isinstance = "isinstance(1, int | str)\n"
     self.assertEqual(
         len(check_python39_source_compatibility(bad_isinstance, "bad_rt.py")), 1
+    )
+
+    bad_enter_ctx = "class T:\n  def setUp(self):\n    self.enterContext(p)\n"
+    self.assertEqual(
+        len(check_python39_source_compatibility(bad_enter_ctx, "bad_tc.py")), 1
     )
 
   def test_workflow_top_level_await_gated_to_workflow_scripts(self) -> None:

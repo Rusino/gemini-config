@@ -7,13 +7,16 @@ from datetime import datetime, timezone
 import fcntl
 import getpass
 import hashlib
+import io
 import json
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.request
@@ -39,6 +42,7 @@ FORBIDDEN_OUT_PREFIXES = (
 DEFAULT_SKIA_REPOS = (
     pathlib.Path.home() / ".gemini/jetski/scratch/skia",
     pathlib.Path.home() / ".gemini/jetski/scratch/flutter/engine/src/flutter/third_party/skia",
+    pathlib.Path.home() / "Sources/skia",
 )
 HASHED_SUBDIRS = (
     "modules/skparagraph",
@@ -637,6 +641,302 @@ def _save_baseline_cache(
     _prune_baseline_cache(cache_root)
 
 
+# Apply pre-staged candidate files forwarded from macOS over SSH onto google3/third_party/skia/HEAD
+def apply_pre_staged_candidate(
+    staged_dir: pathlib.Path,
+    g3_root: pathlib.Path,
+    g3_skia_rev: str,
+) -> dict[str, Any]:
+    meta = json.loads((staged_dir / "_staged_meta.json").read_text(encoding="utf-8"))
+    staged_rev = str(meta.get("g3_skia_revision") or "")
+    if staged_rev != g3_skia_rev:
+        raise RuntimeError(
+            f"G3 Skia revision drifted during staging "
+            f"({staged_rev[:12]} -> {g3_skia_rev[:12]})"
+        )
+    sync_info = ar.sync_skia_tree_to_g3(
+        staged_dir / "files",
+        g3_root,
+        list(meta.get("changed_or_added") or []),
+        list(meta.get("deleted") or []),
+    )
+    return {
+        "orig_ref_spec": str(meta["orig_ref_spec"]),
+        "source_commit_sha": meta.get("source_commit_sha"),
+        "dirty_files": list(meta.get("dirty_files") or []),
+        "sync_info": sync_info,
+    }
+
+
+def resolve_default_ssh_host() -> str:
+    env_host = os.environ.get("GOOGLE3_PARAGRAPH_SSH_HOST", "").strip()
+    if env_host:
+        return env_host
+    cfg_file = pathlib.Path.home() / ".config/google3-test-paragraph/ssh_host"
+    if cfg_file.is_file():
+        saved = cfg_file.read_text(encoding="utf-8").strip()
+        if saved:
+            return saved
+    return f"{getpass.getuser()}-for-jetski.c.googlers.com"
+
+
+# Reuse one multiplexed SSH control socket for 8h to avoid repeated FIDO2 security key touches
+def _ssh_base_cmd(ssh_host: str) -> list[str]:
+    return [
+        "ssh",
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        "ControlPath=~/.ssh/cm-%C",
+        "-o",
+        "ControlPersist=8h",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "ServerAliveCountMax=20",
+        ssh_host,
+    ]
+
+
+def _raise_ssh_error(ssh_host: str, stderr_text: str, rc: int) -> None:
+    detail = stderr_text.strip()
+    if "agent refused operation" in detail:
+        raise RuntimeError(
+            f"SSH signing to {ssh_host} timed out waiting for hardware security key touch "
+            f"(touch your security key when it blinks; ControlPersist=8h caches the session):\n"
+            f"{detail}"
+        )
+    raise RuntimeError(f"Remote execution on {ssh_host} failed (rc={rc}):\n{detail}")
+
+
+def _tar_add_bytes(tf: tarfile.TarFile, arcname: str, data: bytes) -> None:
+    info = tarfile.TarInfo(name=arcname)
+    info.size = len(data)
+    info.mtime = int(time.time())
+    tf.addfile(info, io.BytesIO(data))
+
+
+# Validate tar member paths so Python 3.9 on macOS extracts safely without filter='data'
+def _safe_extract_tar_gz(raw_bytes: bytes, dest_dir: pathlib.Path) -> None:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(raw_bytes), mode="r:gz") as tf:
+        for member in tf.getmembers():
+            rel = member.name.lstrip("./")
+            if not rel:
+                continue
+            parts = pathlib.PurePosixPath(rel).parts
+            if member.name.startswith("/") or ".." in parts:
+                raise RuntimeError(f"Unsafe path in remote archive: {member.name}")
+            target = dest_dir / rel
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+            elif member.isfile():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                extracted = tf.extractfile(member)
+                if extracted is not None:
+                    target.write_bytes(extracted.read())
+
+
+def _query_remote_g3_skia_rev(
+    ssh_host: str,
+    citc_client: str | None,
+    create_citc: bool,
+) -> str:
+    py_code = (
+        "import getpass, pathlib, re, subprocess, sys\n"
+        "user = getpass.getuser()\n"
+        "base = pathlib.Path('/google/src/cloud') / user\n"
+        f"cands = {[citc_client] if citc_client else ['skia_g3_ab', 'skia_g3_pilot']!r}\n"
+        "root = next((base / n for n in cands if n and (base / n / 'google3').is_dir()), None)\n"
+        f"if root is None and {bool(create_citc)!r}:\n"
+        f"    t = {(citc_client or 'skia_g3_ab')!r}\n"
+        "    subprocess.run(['g4', 'citc', t], check=True, timeout=180)\n"
+        "    if (base / t / 'google3').is_dir(): root = base / t\n"
+        "if root is None: raise SystemExit('CitC client not found on remote host')\n"
+        "txt = (root / 'google3/third_party/skia/HEAD/METADATA').read_text(encoding='utf-8')\n"
+        "m = re.search(r'version:\\s*\"([0-9a-f]{40})\"', txt, re.I)\n"
+        "if not m: raise SystemExit('Could not parse METADATA git SHA')\n"
+        "print(m.group(1).lower())\n"
+    )
+    proc = subprocess.run(
+        [*_ssh_base_cmd(ssh_host), f"python3 -c {shlex.quote(py_code)}"],
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        _raise_ssh_error(
+            ssh_host,
+            proc.stderr.decode("utf-8", errors="replace"),
+            proc.returncode,
+        )
+    rev = proc.stdout.decode("utf-8", errors="replace").strip().splitlines()[-1].strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", rev):
+        raise RuntimeError(f"Unexpected remote METADATA revision output: {rev!r}")
+    return rev
+
+
+def run_via_ssh(
+    ssh_host: str,
+    args: argparse.Namespace,
+    out_dir: pathlib.Path,
+    parsed_specs: list[tuple[str, str]],
+) -> int:
+    local_stage_specs = [
+        (lbl, ref)
+        for lbl, ref in parsed_specs
+        if ref != "G3_HEAD" and not ref.startswith(("cl:", "staged:"))
+    ]
+    staged_payloads: dict[str, tuple[dict[str, Any], dict[str, bytes]]] = {}
+    if local_stage_specs:
+        skia_repo = resolve_skia_repo(args.skia_repo)
+        g3_skia_rev = _query_remote_g3_skia_rev(ssh_host, args.citc_client, args.create_citc)
+        for lbl, ref in local_stage_specs:
+            safe_lbl = re.sub(r"[^A-Za-z0-9_.-]", "_", lbl)
+            stage_wt = out_dir / f"_mac_stage_{safe_lbl}"
+            try:
+                staged = stage_candidate_in_worktree(
+                    ref,
+                    skia_repo,
+                    g3_skia_rev,
+                    stage_wt,
+                    args.base_ref,
+                )
+                file_blobs: dict[str, bytes] = {}
+                for rel in staged["changed_or_added"]:
+                    if ar.should_include_file(rel):
+                        file_blobs[rel] = (stage_wt / rel).read_bytes()
+                meta = {
+                    "orig_ref_spec": ref,
+                    "g3_skia_revision": g3_skia_rev,
+                    "source_commit_sha": staged["source_commit_sha"],
+                    "dirty_files": staged["dirty_files"],
+                    "changed_or_added": staged["changed_or_added"],
+                    "deleted": staged["deleted"],
+                }
+                staged_payloads[lbl] = (meta, file_blobs)
+            finally:
+                if stage_wt.exists():
+                    _run(
+                        ["git", "worktree", "remove", "--force", str(stage_wt)],
+                        cwd=skia_repo,
+                        check=False,
+                    )
+                    shutil.rmtree(stage_wt, ignore_errors=True)
+
+    tar_buf = io.BytesIO()
+    with tarfile.open(fileobj=tar_buf, mode="w:gz") as tf:
+        for script_name in (
+            "autoroller_rewrites.py",
+            "parse_g3_paragraph_tests.py",
+            "run_g3_paragraph_tests.py",
+        ):
+            src_p = SCRIPT_DIR / script_name
+            _tar_add_bytes(tf, f"_runner/scripts/{script_name}", src_p.read_bytes())
+        for data_name in ("fast_targets.txt", "slow_targets.txt", "targets_manifest.json"):
+            data_p = DATA_DIR / data_name
+            if data_p.is_file():
+                _tar_add_bytes(tf, f"_runner/data/{data_name}", data_p.read_bytes())
+        if args.targets_file is not None:
+            _tar_add_bytes(tf, "_runner/custom_targets.txt", args.targets_file.read_bytes())
+        if args.resume:
+            for lbl, _ in parsed_specs:
+                for fn in ("attestation.json", "summary.json", "targets.txt", "blaze.log"):
+                    existing = out_dir / lbl / fn
+                    if existing.is_file():
+                        _tar_add_bytes(tf, f"out/{lbl}/{fn}", existing.read_bytes())
+        for lbl, (meta, blobs) in staged_payloads.items():
+            safe_lbl = re.sub(r"[^A-Za-z0-9_.-]", "_", lbl)
+            _tar_add_bytes(
+                tf,
+                f"_staged/{safe_lbl}/_staged_meta.json",
+                (json.dumps(meta, indent=2) + "\n").encode("utf-8"),
+            )
+            for rel, raw in blobs.items():
+                _tar_add_bytes(tf, f"_staged/{safe_lbl}/files/{rel}", raw)
+
+    safe_out = re.sub(r"[^A-Za-z0-9_.-]", "_", out_dir.name or "g3_paragraph_tests")
+    mirror_name = safe_out if "g3" in safe_out.lower() else f"g3_{safe_out}"
+
+    remote_args: list[str] = [
+        "--no-ssh",
+        "--quiet-stdout",
+        "--remote-host-label",
+        ssh_host,
+        "--tier",
+        args.tier,
+        "--wait-lock-sec",
+        str(args.wait_lock_sec),
+        "--flaky-attempts",
+        str(args.flaky_attempts),
+        "--max-targets-age-days",
+        str(args.max_targets_age_days),
+    ]
+    if args.citc_client:
+        remote_args.extend(["--citc-client", args.citc_client])
+    if args.create_citc:
+        remote_args.append("--create-citc")
+    if args.allow_stale_targets:
+        remote_args.append("--allow-stale-targets")
+    if args.allow_dirty_citc:
+        remote_args.append("--allow-dirty-citc")
+    if args.no_baseline_cache:
+        remote_args.append("--no-baseline-cache")
+    if args.resume:
+        remote_args.append("--resume")
+
+    quoted_flags = " ".join(shlex.quote(a) for a in remote_args)
+    spec_tokens: list[str] = []
+    for lbl, ref in parsed_specs:
+        if lbl in staged_payloads:
+            safe_lbl = re.sub(r"[^A-Za-z0-9_.-]", "_", lbl)
+            spec_tokens.append(f"{shlex.quote(lbl + '=staged:')}\"$WORK/_staged/{safe_lbl}\"")
+        else:
+            spec_tokens.append(shlex.quote(f"{lbl}={ref}"))
+    extra_tf = ' --targets-file "$WORK/_runner/custom_targets.txt"' if args.targets_file else ""
+    joined_specs = " ".join(spec_tokens)
+
+    # Redirect runner output to stderr so stdout carries only the final gzipped result archive
+    remote_sh = (
+        "set -eu; "
+        f"WORK=\"/tmp/g3_remote_{safe_out}_$$\"; "
+        f"MIRROR=\"/tmp/{mirror_name}\"; "
+        "trap 'rm -rf \"$WORK\" \"$MIRROR.tmp_$$\"' EXIT; "
+        "mkdir -p \"$WORK\" \"$WORK/out\"; "
+        "tar -xzf - -C \"$WORK\" >&2; "
+        "python3 \"$WORK/_runner/scripts/run_g3_paragraph_tests.py\" "
+        f"--out \"$WORK/out\" {quoted_flags}{extra_tf} {joined_specs} >&2; "
+        "mkdir -p \"$MIRROR.tmp_$$\"; "
+        "tar -cf - --exclude='*/bep.json' --exclude='_skia_stage_*' -C \"$WORK/out\" . "
+        "| tar -xf - -C \"$MIRROR.tmp_$$\" >&2; "
+        "rm -rf \"$MIRROR\"; "
+        "mv \"$MIRROR.tmp_$$\" \"$MIRROR\"; "
+        "tar -czf - --exclude='*/bep.json' --exclude='_skia_stage_*' -C \"$WORK/out\" ."
+    )
+
+    proc = subprocess.run(
+        [*_ssh_base_cmd(ssh_host), remote_sh],
+        input=tar_buf.getvalue(),
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        _raise_ssh_error(
+            ssh_host,
+            proc.stderr.decode("utf-8", errors="replace"),
+            proc.returncode,
+        )
+
+    _safe_extract_tar_gz(proc.stdout, out_dir)
+    compare_path = out_dir / "compare.md"
+    if not compare_path.is_file():
+        raise RuntimeError(f"Remote run on {ssh_host} did not produce compare.md in {out_dir}")
+    if not args.quiet_stdout:
+        sys.stdout.write(compare_path.read_text(encoding="utf-8"))
+    return 0
+
+
 def run_single_leg(
     label: str,
     ref_spec: str,
@@ -653,6 +953,7 @@ def run_single_leg(
     pre_dirty: list[str],
     use_baseline_cache: bool = True,
     baseline_cache_dir: pathlib.Path = DEFAULT_BASELINE_CACHE_DIR,
+    remote_host_label: str | None = None,
 ) -> None:
     leg_dir = out_dir / label
     leg_dir.mkdir(parents=True, exist_ok=True)
@@ -665,6 +966,7 @@ def run_single_leg(
 
     stage_wt = out_dir / f"_skia_stage_{label}"
     sync_info: dict[str, list[str]] = {"written": [], "added_new": [], "deleted": []}
+    effective_ref_spec = ref_spec
     source_commit_sha: str | None = None
     skia_dirty: list[str] = []
     restored_clean = True
@@ -693,7 +995,22 @@ def run_single_leg(
                     citc_client=citc_client,
                     stale_warning=stale_warning,
                 ):
+                    if remote_host_label:
+                        att_p = leg_dir / "attestation.json"
+                        att_obj = json.loads(att_p.read_text(encoding="utf-8"))
+                        att_obj["remote_ssh_host"] = remote_host_label
+                        att_p.write_text(json.dumps(att_obj, indent=2) + "\n", encoding="utf-8")
                     return
+        elif ref_spec.startswith("staged:"):
+            applied = apply_pre_staged_candidate(
+                pathlib.Path(ref_spec[len("staged:") :]),
+                g3_root,
+                g3_skia_rev,
+            )
+            effective_ref_spec = applied["orig_ref_spec"]
+            source_commit_sha = applied["source_commit_sha"]
+            skia_dirty = applied["dirty_files"]
+            sync_info = applied["sync_info"]
         else:
             if skia_repo is None:
                 raise RuntimeError(f"skia_repo required for non-G3_HEAD spec '{ref_spec}'")
@@ -763,7 +1080,7 @@ def run_single_leg(
 
     attestation = {
         "label": label,
-        "ref_spec": ref_spec,
+        "ref_spec": effective_ref_spec,
         "skia_commit_sha": source_commit_sha,
         "skia_dirty_files": skia_dirty,
         "citc_client": citc_client,
@@ -786,6 +1103,8 @@ def run_single_leg(
         "baseline_cache_hit": False,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
     }
+    if remote_host_label:
+        attestation["remote_ssh_host"] = remote_host_label
 
     (leg_dir / "attestation.json").write_text(
         json.dumps(attestation, indent=2) + "\n", encoding="utf-8"
@@ -826,6 +1145,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--baseline-cache-dir", type=pathlib.Path, default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
+        "--ssh-host",
+        default=None,
+        help="Remote Linux Cloudtop host when /google/src/cloud is not mounted locally",
+    )
+    parser.add_argument(
+        "--no-ssh",
+        action="store_true",
+        help="Disable automatic SSH forwarding to Cloudtop when CitC is absent locally",
+    )
+    parser.add_argument("--quiet-stdout", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--remote-host-label", default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
         "specs",
         nargs="*",
         help="Run specs label=ref (default: baseline=G3_HEAD current=WORKTREE)",
@@ -835,12 +1166,6 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = args.out.expanduser()
     enforce_citc_hygiene(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    cache_dir = (
-        args.baseline_cache_dir.expanduser()
-        if args.baseline_cache_dir is not None
-        else DEFAULT_BASELINE_CACHE_DIR
-    )
-    enforce_citc_hygiene(cache_dir)
 
     raw_specs = args.specs or ["baseline=G3_HEAD", "current=WORKTREE"]
     parsed_specs: list[tuple[str, str]] = []
@@ -850,6 +1175,18 @@ def main(argv: list[str] | None = None) -> int:
         lbl, ref = item.split("=", 1)
         parsed_specs.append((lbl.strip(), ref.strip()))
 
+    local_citc_mount = pathlib.Path("/google/src/cloud") / getpass.getuser()
+    if args.ssh_host or (not local_citc_mount.exists() and not args.no_ssh):
+        ssh_host = args.ssh_host or resolve_default_ssh_host()
+        return run_via_ssh(ssh_host, args, out_dir, parsed_specs)
+
+    cache_dir = (
+        args.baseline_cache_dir.expanduser()
+        if args.baseline_cache_dir is not None
+        else DEFAULT_BASELINE_CACHE_DIR
+    )
+    enforce_citc_hygiene(cache_dir)
+
     tier_name, targets, stale_warning = load_tier_targets(
         args.tier,
         args.targets_file,
@@ -858,7 +1195,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     citc_client, citc_root = resolve_citc_root(args.citc_client, args.create_citc)
     g3_root = citc_root / "google3"
-    needs_skia_repo = any(ref != "G3_HEAD" for _, ref in parsed_specs)
+    needs_candidate_staging = any(ref != "G3_HEAD" for _, ref in parsed_specs)
+    needs_skia_repo = any(
+        ref != "G3_HEAD" and not ref.startswith("staged:") for _, ref in parsed_specs
+    )
     skia_repo = resolve_skia_repo(args.skia_repo) if needs_skia_repo else None
 
     with acquire_citc_lock(citc_client, wait_sec=args.wait_lock_sec):
@@ -867,7 +1207,7 @@ def main(argv: list[str] | None = None) -> int:
             citc_client,
             pre_dirty,
             args.allow_dirty_citc,
-            needs_skia_repo,
+            needs_candidate_staging,
         )
 
         for lbl, ref in parsed_specs:
@@ -893,13 +1233,15 @@ def main(argv: list[str] | None = None) -> int:
                 pre_dirty=pre_dirty,
                 use_baseline_cache=not args.no_baseline_cache,
                 baseline_cache_dir=cache_dir,
+                remote_host_label=args.remote_host_label,
             )
 
     runs = [(lbl, pg3.collect_run_data(str(out_dir / lbl), None)) for lbl, _ in parsed_specs]
     md = pg3.format_comparison_markdown(runs)
     compare_path = out_dir / "compare.md"
     compare_path.write_text(md, encoding="utf-8")
-    sys.stdout.write(md)
+    if not args.quiet_stdout:
+        sys.stdout.write(md)
     return 0
 
 

@@ -473,6 +473,121 @@ class Google3TestParagraphTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "git cherry-pick onto G3 Skia base"):
                 rg3._cherry_pick_onto_stage(wt, [conflict_tip], g3_rev)
 
+    def test_staged_candidate_and_macos_ssh_forwarding(self) -> None:
+        import io
+        import subprocess
+        import tarfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            staged_dir = tmp / "staged_wt"
+            (staged_dir / "files/modules/skparagraph/src").mkdir(parents=True)
+            (staged_dir / "files/modules/skparagraph/src/Run.cpp").write_text(
+                '#include "modules/skparagraph/src/Run.h"\n', encoding="utf-8"
+            )
+            g3_rev = "c733ad3e37cb68659930080c4ccc6182482780c0"
+            (staged_dir / "_staged_meta.json").write_text(
+                json.dumps(
+                    {
+                        "orig_ref_spec": "WORKTREE",
+                        "g3_skia_revision": g3_rev,
+                        "source_commit_sha": "a44003c873ba5bae90e94828780f1af208793756",
+                        "dirty_files": ["modules/skparagraph/src/Run.cpp"],
+                        "changed_or_added": ["modules/skparagraph/src/Run.cpp"],
+                        "deleted": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            g3_root = tmp / "g3"
+            (g3_root / "third_party/skia/HEAD/modules/skparagraph/src").mkdir(parents=True)
+
+            applied = rg3.apply_pre_staged_candidate(staged_dir, g3_root, g3_rev)
+            self.assertEqual(applied["orig_ref_spec"], "WORKTREE")
+            self.assertEqual(applied["dirty_files"], ["modules/skparagraph/src/Run.cpp"])
+            rewritten = (
+                g3_root / "third_party/skia/HEAD/modules/skparagraph/src/Run.cpp"
+            ).read_text(encoding="utf-8")
+            self.assertIn(
+                '#include "third_party/skia/HEAD/modules/skparagraph/src/Run.h"',
+                rewritten,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "G3 Skia revision drifted"):
+                rg3.apply_pre_staged_candidate(staged_dir, g3_root, "0" * 40)
+
+            out_buf = io.BytesIO()
+            with tarfile.open(fileobj=out_buf, mode="w:gz") as tf:
+                payloads = {
+                    "compare.md": b"# Google3 Paragraph Corpus Comparison\n",
+                    "baseline/attestation.json": b'{"ref_spec": "G3_HEAD"}\n',
+                    "baseline/summary.json": b'{"counts": {"passed": 1}}\n',
+                    "cand/attestation.json": b'{"ref_spec": "cl:1412557/6"}\n',
+                    "cand/summary.json": b'{"counts": {"passed": 1}}\n',
+                }
+                for rel_name, data in payloads.items():
+                    info = tarfile.TarInfo(name=rel_name)
+                    info.size = len(data)
+                    tf.addfile(info, io.BytesIO(data))
+            remote_tar_bytes = out_buf.getvalue()
+
+            ssh_calls: list[list[str]] = []
+
+            def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+                ssh_calls.append(list(cmd))
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout=remote_tar_bytes, stderr=b""
+                )
+
+            mac_out = tmp / "mac_out"
+            stdout_buf = io.StringIO()
+            with mock.patch("subprocess.run", side_effect=fake_run), mock.patch(
+                "sys.stdout", stdout_buf
+            ):
+                rc = rg3.main(
+                    [
+                        "--ssh-host",
+                        "jlavrova-for-jetski.c.googlers.com",
+                        "--out",
+                        str(mac_out),
+                        "--create-citc",
+                        "--tier",
+                        "all",
+                        "baseline=G3_HEAD",
+                        "cand=cl:1412557/6",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(ssh_calls), 1)
+            self.assertIn("ControlMaster=auto", " ".join(ssh_calls[0]))
+            self.assertIn("ControlPersist=8h", " ".join(ssh_calls[0]))
+            self.assertIn("--no-ssh", " ".join(ssh_calls[0]))
+            self.assertTrue((mac_out / "compare.md").is_file())
+            self.assertTrue((mac_out / "cand/attestation.json").is_file())
+            self.assertIn("# Google3 Paragraph Corpus Comparison", stdout_buf.getvalue())
+
+            def refused_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=255,
+                    stdout=b"",
+                    stderr=b"sign_and_send_pubkey: signing failed: agent refused operation\n",
+                )
+
+            with mock.patch("subprocess.run", side_effect=refused_run):
+                with self.assertRaisesRegex(RuntimeError, "security key"):
+                    rg3.main(
+                        [
+                            "--ssh-host",
+                            "jlavrova-for-jetski.c.googlers.com",
+                            "--out",
+                            str(tmp / "mac_out2"),
+                            "baseline=G3_HEAD",
+                            "cand=cl:1412557/6",
+                        ]
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

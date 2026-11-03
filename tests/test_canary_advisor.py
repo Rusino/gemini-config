@@ -955,6 +955,22 @@ class TestCanaryAdvisor(unittest.TestCase):
       canary_advisor.cmd_triage(args)
     self.assertIn("TRYJOBS: ALL GREEN", buf_ok.getvalue())
 
+  def test_has_cloudtop_citc_detects_local_mount_or_corp_mac_ssh(self):
+    with patch("os.path.isdir", return_value=True):
+      self.assertTrue(canary_advisor.has_cloudtop_citc())
+    with patch("os.path.isdir", return_value=False), patch.dict(
+        "os.environ", {"GOOGLE3_PARAGRAPH_SSH_HOST": "my-cloudtop.c.googlers.com"}, clear=False
+    ):
+      self.assertTrue(canary_advisor.has_cloudtop_citc())
+    with patch("os.path.isdir", return_value=False), patch.dict(
+        "os.environ", {"GOOGLE3_PARAGRAPH_SSH_HOST": ""}, clear=False
+    ), patch("sys.platform", "darwin"), patch("os.path.exists", return_value=True):
+      self.assertTrue(canary_advisor.has_cloudtop_citc())
+    with patch("os.path.isdir", return_value=False), patch.dict(
+        "os.environ", {"GOOGLE3_PARAGRAPH_SSH_HOST": ""}, clear=False
+    ), patch("sys.platform", "darwin"), patch("os.path.exists", return_value=False):
+      self.assertFalse(canary_advisor.has_cloudtop_citc())
+
 
 if __name__ == "__main__":
   unittest.main()

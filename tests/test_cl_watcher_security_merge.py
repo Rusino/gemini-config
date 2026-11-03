@@ -206,32 +206,29 @@ class SecurityMergeRequestTest(unittest.TestCase):
   def setUp(self) -> None:
     super().setUp()
     self.repo = self._shared_repo
-    # Block live external RPCs and state-file writes even when mutation_check negates guards
-    self.enterContext(mock.patch.object(w, "save_watcher_state"))
-    self.enterContext(
+    # Block live external RPCs and state-file writes even when mutation_check negates guards;
+    # start/addCleanup keeps compatibility with macOS Xcode Python 3.9 (no TestCase.enterContext)
+    for patcher in (
+        mock.patch.object(w, "save_watcher_state"),
         mock.patch.object(
             w,
             "call_buganizer_mcp_batch",
             side_effect=AssertionError("Unmocked live Buganizer MCP call in unit test"),
-        )
-    )
-    self.enterContext(
-        mock.patch.object(w, "ISSUES_CLI_BIN", "/nonexistent/issues_cli_in_unit_test")
-    )
-    self.enterContext(
+        ),
+        mock.patch.object(w, "ISSUES_CLI_BIN", "/nonexistent/issues_cli_in_unit_test"),
         mock.patch.object(
             w,
             "_gerrit_http_get_json",
             side_effect=AssertionError("Unmocked live Gerrit HTTP call in unit test"),
-        )
-    )
-    self.enterContext(
+        ),
         mock.patch.object(
             w,
             "_http_get_json_direct",
             side_effect=AssertionError("Unmocked live HTTP call in unit test"),
-        )
-    )
+        ),
+    ):
+      patcher.start()
+      self.addCleanup(patcher.stop)
     # 2026-11-03T16:22:00Z (~4 days after 2026-10-30T23:30:00Z)
     self.now_ts = 1793722920.0
     self.roll_ts = self.now_ts - 3.7 * 86400
