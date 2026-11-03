@@ -511,6 +511,9 @@ def advise(args):
                 "its usage cannot be searched from here")
 
     notes = []
+    # LOCAL gates print as AGENT ACTION lines: as a NOTE they were read as advice and skipped
+    # (Gerrit 1400176 review got an LGTM draft without the google3 A/B run)
+    local_actions = []
     # Route SkParagraph/SkUnicode paths on Cloudtop to the local CitC A/B corpus instead of G3 try
     if "Canary-G3" in recs and has_cloudtop_citc():
         g3_rec = recs["Canary-G3"]
@@ -541,11 +544,13 @@ def advise(args):
                     f"python3 {G3_PARAGRAPH_CORPUS_SCRIPT} --out /tmp/g3_local "
                     f"--create-citc --skia-repo {args.repo} baseline=G3_HEAD current=WORKTREE"
                 )
+            # The advisor runs right before CR+1 or upload, where the slow tier is mandatory
+            g3_local_cmd = g3_local_cmd.replace("--create-citc", "--create-citc --tier all", 1)
             notes.append(
-                "On Cloudtop, run the local google3 A/B corpus (~10-13 min, 1,139 fast targets "
-                "including skia_build_test, zero submit hold) instead of Canary-G3 for "
-                f"SkParagraph/SkUnicode paths: `{g3_local_cmd}`"
+                "On Cloudtop, the local google3 A/B corpus replaces Canary-G3 for "
+                "SkParagraph/SkUnicode paths (see AGENT ACTION below)"
             )
+            local_actions.append(("google3-test-paragraph", g3_local_cmd))
             if other_reasons:
                 other_strong = any(
                     files.get(p, {}).get("status") in ("A", "D")
@@ -581,6 +586,8 @@ def advise(args):
                      f"`{FLUTTER_FULL_CORPUS}`")
         recs["LOCAL flutter-test-paragraph-engine --full"] = {
             "tier": flutter["tier"], "reasons": {r: p for r, p in flutter["reasons"].items()}}
+        if flutter["tier"] == "STRONG":
+            local_actions.append(("flutter-test-paragraph-engine", FLUTTER_FULL_CORPUS))
     for c, h in health.items():
         if c in recs and not h["healthy"] and c != "Canary-Flutter":
             notes.append(f"{c} looks unhealthy {h['counts']}: a red result may be infra, "
@@ -682,6 +689,11 @@ def advise(args):
                 print(f"\nCanary Command (run only after user approval):")
                 print(f"  {cmd}")
     
+    for name, cmd in local_actions:
+        print(f"\nAGENT ACTION (LOCAL gate {name}: run in background now; no LGTM, CLEAN verdict, "
+              "Code-Review+1 or upload until it finishes with 0 regressions):")
+        print(f"  {cmd}")
+
     if not args.no_log:
         os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
         with open(LEDGER, "a") as fh:

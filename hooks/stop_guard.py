@@ -324,6 +324,29 @@ USER_TRYJOB_OPTOUT_RE = re.compile(
     r"(?:без\s+(?:asan|асан|try|трай|канаре|canar)|skip\s+(?:asan|try|canar)|no\s+(?:asan|try|canar))",
     re.IGNORECASE,
 )
+# canary_advisor.py output that makes the local google3 A/B corpus a gate for approval
+G3_REQUIRED_RE = re.compile(
+    r"## LOCAL google3-test-paragraph \[STRONG\]|AGENT ACTION \(LOCAL gate google3-test-paragraph"
+)
+G3_ACTION_CMD_RE = re.compile(
+    r"AGENT ACTION \(LOCAL gate google3-test-paragraph[^\n]*\n\s*(python3 [^\n]+)"
+)
+G3_REPORT_TITLE = "# Google3 Paragraph Corpus Comparison"
+G3_VALID_RE = re.compile(r"Integrity Check\):\*\*\s*`VALID")
+G3_REGRESSIONS_RE = re.compile(r"Новых падений \(Regressions\):\s*(\d+)")
+UNVERIFIED_G3_RE = re.compile(r"\bUNVERIFIED[_\s]+IN[_\s]+GOOGLE3\b", re.IGNORECASE)
+USER_G3_OPTOUT_RE = re.compile(
+    r"(?:без\s+(?:прогона\s+)?(?:гугл\s*3|google3|g3)|skip\s+(?:the\s+)?(?:google3|g3))",
+    re.IGNORECASE,
+)
+
+
+# A google3 compare.md counts as passed only with a VALID integrity verdict and 0 regressions
+def _g3_report_passed(text: str) -> bool:
+  if G3_REPORT_TITLE not in text or not G3_VALID_RE.search(text):
+    return False
+  regs = [int(n) for n in G3_REGRESSIONS_RE.findall(text)]
+  return bool(regs) and all(n == 0 for n in regs)
 
 
 # Verify that script_name is executed rather than merely inspected via grep/cat
@@ -452,6 +475,9 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
   required_agent_bots = set()
   required_agent_try_cmd = ""
   canary_advisor_invoked = False
+  g3_required = False
+  g3_passed = False
+  g3_cmd = ""
   skia_review_cl = ""
   skia_cpp_detected = False
   pending_canary_advisor = False
@@ -540,6 +566,8 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
         corpus_passed[s] = True
       for s in _check_compare_md_paths(content):
         corpus_passed[s] = True
+      if _g3_report_passed(content):
+        g3_passed = True
 
       if "\nFile Path: " in content[:200]:
         # Reset pending read path after inspecting file payload
@@ -570,6 +598,11 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
         for m in GIT_CL_TRY_BOT_RE.finditer(cmd_str):
           required_agent_bots.add(m.group(1))
       if pending_canary_advisor:
+        if G3_REQUIRED_RE.search(content):
+          g3_required = True
+          m_g3 = G3_ACTION_CMD_RE.search(content)
+          if m_g3:
+            g3_cmd = m_g3.group(1).strip()
         m_g = SKIA_GERRIT_RE.search(content)
         if m_g:
           skia_review_cl = m_g.group(1)
@@ -621,6 +654,8 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
 
     elif stype == "SYSTEM_MESSAGE":
       content = str(step.get("content", ""))
+      if _g3_report_passed(content):
+        g3_passed = True
       for s in _corpus_scripts_from_compare_report(content):
         corpus_passed[s] = True
       for s in _check_compare_md_paths(content):
@@ -729,6 +764,31 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
         "patchset in this conversation. Check out the author's patchset and run "
         f"`python3 {script_path}` before approving (or explicitly mark the review as "
         "`UNVERIFIED IN FLUTTER` if the environment prevents running it)"
+    )
+
+  # Block approval of paragraph CLs until the google3 A/B corpus reports VALID with 0 regressions
+  user_opted_out_g3 = any(
+      USER_G3_OPTOUT_RE.search(u) or USER_CORPUS_OPTOUT_RE.search(u) for u in all_user_requests
+  )
+  if (
+      g3_required
+      and not g3_passed
+      and not user_opted_out_g3
+      and REVIEW_APPROVAL_RE.search(combined_review_out)
+      and not UNVERIFIED_G3_RE.search(combined_review_out)
+  ):
+    run_hint = g3_cmd or (
+        "python3 ~/.gemini/config/skills/google3-test-paragraph/scripts/"
+        "run_g3_paragraph_tests.py --out /tmp/g3_cl_<N> --create-citc --tier all "
+        "baseline=G3_HEAD cand=cl:<N>/<PS>"
+    )
+    result["corpus_issues"].append(
+        "[GOOGLE3 GATE GUARD] `canary_advisor.py` made the local google3 A/B corpus a gate "
+        "for this SkParagraph/SkUnicode CL, and your response recommends approval (`Case 1-3` / "
+        "`LGTM` / `Code-Review+1`), but no google3 `compare.md` with a `VALID` Integrity Check "
+        "and 0 regressions was seen in this conversation. Withdraw the approval wording, run "
+        f"`{run_hint}` in the background and report `google3 A/B` as pending in the Execution "
+        "Ledger (or mark the review `UNVERIFIED IN GOOGLE3` if the environment prevents it)"
     )
 
   # Enforce mandatory ASAN try job and external-author canary try jobs

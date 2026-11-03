@@ -180,6 +180,12 @@ named skill's `SKILL.md` was not read, when a report with a `Case 1-5` verdict l
    `companion-cl-review` (Phase 0 threads, triage script, Stage 1/2 audit, Stage 2.5 skeptic,
    checkout, Gate A build/run, classification, draft) with `done` / `skipped` and the reason.
    A skipped step is never described as done anywhere else in the report or the chat reply.
+   When the CL touches executable code in `modules/{skparagraph,skunicode,skshaper}/` (or
+   `canary_advisor.py` prints a `LOCAL gate` `AGENT ACTION`), the ledger also has one separate
+   row per local gate: `Flutter corpus` and `google3 A/B` (`--tier all`, with the `compare.md`
+   path). Never fold them into `Gate A`. While either row is not `done` with 0 regressions, the
+   verdict cannot be `CLEAN` / `LGTM` and no approving draft is saved; the only exception is an
+   explicit user waiver, recorded in the row as `skipped (user waiver)`.
 2. **Every finding carries exactly one status**: `CONFIRMED` (entry -> `path:line` -> bad
    outcome, plus the `keeper_skeptic` verdict), `REFUTED` (dropped from drafts, recorded in the
    ledger), `UNPROVEN` (becomes a question for the author), or `UNVERIFIED` (no refutation pass
