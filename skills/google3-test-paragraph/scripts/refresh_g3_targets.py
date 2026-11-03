@@ -51,6 +51,11 @@ EXCLUDED_BRANCHES = frozenset(
         "//third_party/skia/HEAD:skia_build_test",
     }
 )
+# Public Skia build_test gates checked by CheckTestsSkia during autorolls
+PINNED_BUILD_TESTS = (
+    "//third_party/skia/HEAD:skia_build_test",
+    "//third_party/skia/HEAD:skia_build_test_linux",
+)
 EXCLUDED_TAG_REGEX = "manual|notap|no_presubmit"
 
 
@@ -183,24 +188,45 @@ def split_fast_and_slow(
     return final_fast, final_slow
 
 
+# Ensure public Skia build_test gates stay in fast tier unless measured slow
+def merge_pinned_build_tests(
+    fast_list: list[str],
+    slow_list: list[str],
+    pinned: tuple[str, ...] = PINNED_BUILD_TESTS,
+) -> list[str]:
+    slow_set = set(slow_list)
+    extra = [t for t in pinned if t not in slow_set]
+    return sorted(set(fast_list) | set(extra))
+
+
 def build_manifest_counts(
     fast_len: int,
     slow_len: int,
     runnable_len: int,
     manual_len: int,
     prev_counts: dict[str, int] | None = None,
+    pinned_len: int = 0,
 ) -> dict[str, int]:
     counts = {
         "fast": fast_len,
         "slow": slow_len,
-        "total_runnable": runnable_len,
+        "pinned_build_tests": pinned_len,
+        "total_runnable": fast_len + slow_len,
+        "transitive_runnable": runnable_len,
         "manual_excluded": manual_len,
     }
     # Preserve TAP Canary-G3 coverage baseline across target refreshes
-    if prev_counts and "canary_covered_runnable" in prev_counts:
-        canary_cnt = int(prev_counts["canary_covered_runnable"])
-        counts["canary_covered_runnable"] = canary_cnt
-        counts["uncovered_runnable"] = max(0, runnable_len - canary_cnt)
+    if prev_counts:
+        if "canary_covered_transitive" in prev_counts:
+            cov_trans = int(prev_counts["canary_covered_transitive"])
+        elif "canary_covered_runnable" in prev_counts:
+            cov_trans = int(prev_counts["canary_covered_runnable"])
+        else:
+            cov_trans = -1
+        if cov_trans >= 0:
+            counts["canary_covered_transitive"] = cov_trans
+            counts["canary_covered_runnable"] = cov_trans + pinned_len
+            counts["uncovered_runnable"] = max(0, runnable_len - cov_trans)
     return counts
 
 
@@ -209,6 +235,7 @@ def main(argv: list[str] | None = None) -> int:
         description="Refresh cached google3 SkParagraph/SkUnicode test target lists via Depserver"
     )
     parser.add_argument("--citc-client", default=None)
+    parser.add_argument("--wait-lock-sec", type=float, default=0.0)
     parser.add_argument("--depth", type=int, default=4)
     parser.add_argument(
         "--bep",
@@ -222,13 +249,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     rg3.enforce_citc_hygiene(args.out_dir)
-    _, citc_root = rg3.resolve_citc_root(args.citc_client, create_if_missing=False)
-    g3_root = citc_root / "google3"
-    base_cl = rg3.read_citc_base_cl(citc_root)
-    g3_skia_rev = ar.read_g3_skia_revision(g3_root / ar.G3_SKIA_REL / "METADATA")
+    citc_client, citc_root = rg3.resolve_citc_root(args.citc_client, create_if_missing=False)
+    with rg3.acquire_citc_lock(citc_client, wait_sec=args.wait_lock_sec):
+        g3_root = citc_root / "google3"
+        base_cl = rg3.read_citc_base_cl(citc_root)
+        g3_skia_rev = ar.read_g3_skia_revision(g3_root / ar.G3_SKIA_REL / "METADATA")
 
-    discovered = run_depserver_bfs(g3_root, DEFAULT_SEEDS, args.depth, EXCLUDED_BRANCHES)
-    runnable, manual = filter_runnable_tests(g3_root, discovered)
+        discovered = run_depserver_bfs(g3_root, DEFAULT_SEEDS, args.depth, EXCLUDED_BRANCHES)
+        runnable, manual = filter_runnable_tests(g3_root, discovered)
 
     existing_slow = set(pg3._read_targets_file(args.out_dir / "slow_targets.txt"))
     bep_durs: dict[str, int] = {}
@@ -242,6 +270,8 @@ def main(argv: list[str] | None = None) -> int:
         args.slow_threshold_sec,
         args.reset_slow,
     )
+    fast_list = merge_pinned_build_tests(fast_list, slow_list)
+    pinned_added = len(fast_list) + len(slow_list) - len(runnable)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = args.out_dir / "targets_manifest.json"
@@ -263,6 +293,7 @@ def main(argv: list[str] | None = None) -> int:
         "slow_threshold_sec": args.slow_threshold_sec,
         "seeds": list(DEFAULT_SEEDS),
         "excluded_branches": sorted(EXCLUDED_BRANCHES),
+        "pinned_build_tests": list(PINNED_BUILD_TESTS),
         "excluded_tag_regex": EXCLUDED_TAG_REGEX,
         "counts": build_manifest_counts(
             len(fast_list),
@@ -270,6 +301,7 @@ def main(argv: list[str] | None = None) -> int:
             len(runnable),
             len(manual),
             prev_counts,
+            pinned_added,
         ),
     }
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

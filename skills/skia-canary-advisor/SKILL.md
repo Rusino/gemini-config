@@ -18,8 +18,7 @@ S=~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py
 python3 $S advise --cl <change>      # Gerrit CL, own or under review
 python3 $S advise --repo <skia>      # local branch vs origin/main
 python3 $S triage --cl <change>      # triage tryjobs (ASAN + Canaries)
-python3 $S watch --cl <change> --save-draft  # watch + auto-resolve own Canary-G3 hold on pass
-python3 $S resolve-hold --cl <change> [--dry-run]  # resolve own Canary-G3 hold on verified stack
+python3 $S watch --cl <change> --save-draft  # watch tryjobs + triage on completion
 python3 $S health                    # OK/DEAD per canary (real verdicts in last 45 days)
 python3 $S stats                     # RAN/skipped per logged recommendation + follow rate
 ```
@@ -27,30 +26,20 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
 ## Agent steps
 
 1. Run `advise` once on the final patchset (before CR+1 or before LGTM).
-2. Execute every `AGENT TODO` line with `code_search`. A hit makes Canary-G3 STRONG.
+2. Execute every `AGENT TODO` line with `code_search`. A hit outside `skparagraph`/`skunicode` test rdeps makes `Canary-G3` STRONG.
 3. Present the result: STRONG items as "run", CONSIDER items as "only if rendering may change".
 4. **Execution Policy (Agent Actions)**:
    - **ASAN**: If an ASAN bot is recommended, YOU (the agent) MUST execute the `git cl try`
      command provided under `AGENT ACTION` immediately, without asking the author or the user.
+   - **SkParagraph / SkUnicode on Linux Cloudtop (`LOCAL google3-test-paragraph`)**: When `/google/src/cloud` is mounted, `canary_advisor.py` automatically replaces `Canary-G3` for `modules/skparagraph/` and `modules/skunicode/` paths with `LOCAL google3-test-paragraph` (~10–13 min, 1,139 fast targets including `skia_build_test`, cached `G3_HEAD` baseline, zero Piper CLs, and zero Gerrit submit hold). Run it before `CR+1` / upload instead of triggering `Canary-G3`. Lightweight `Canary-G3` remains active only for non-paragraph Skia paths (`modules/skshaper/`, `src/ports/`, core `src/`/`include/`, root `BUILD.bazel`) or when off Cloudtop.
    - **External Authors** (owner is not `@google.com`): YOU (the agent) MUST execute the
      `git cl try` command provided under `AGENT ACTION` immediately, without asking.
-     - **Canary-G3 restriction (`g3_canary.go:134`)**: Canary-G3 requires a Googler author OR a
-       Googler `Code-Review+1` approval. If the external CL has no Googler CR+1 yet,
-       `canary_advisor.py` automatically excludes Canary-G3 from `AGENT ACTION` and prints a
-       deferred command.
+     - **Canary-G3 restriction (`g3_canary.go:134`)**: For non-paragraph Skia CLs that still need `Canary-G3`, `Canary-G3` requires a Googler author OR a Googler `Code-Review+1` approval. If the external CL has no Googler `CR+1` yet, `canary_advisor.py` excludes `Canary-G3` from `AGENT ACTION` and prints the manual command to run if needed after `CR+1` (do not place unresolved submit-hold comments).
      - **Stacked CLs**: the google3 try service (`chrome/skia/autoroller/try_service.py`)
        cherry-picks every unmerged parent of the CL too, and each one needs its own Googler
-       CR+1 (or a Googler owner and author). A CR+1 on the reviewed CL alone gives
-       `MISSING_APPROVAL` after about a minute. `watch` checks the chain first and does not
-       trigger Canary-G3 while a parent lacks approval; `triage` lists the parents that block
-       it. Never vote CR+1 on unreviewed parents just to unblock Canary-G3.
-     - **External Author Submit-Hold Protocol**: Follow the submit-hold protocol below: prepare
-       a `/PATCHSET_LEVEL` draft with `unresolved: true` for the user to publish with
-       `Code-Review+1`. Never ask the user to tell you when they publish `CR+1`: both
-       `canary_advisor.py watch` and the Flight Deck `cl_watcher.py` daemon
-       (`sync_external_canary_g3`) automatically detect the published `CR+1` + submit-hold
-       comment, trigger `Canary-G3` once via `trigger_canary_g3_once`
-       (`~/.gemini/config/ledgers/canary_g3_claims.json`), and wake the CL chat on completion.
+       `CR+1` (or a Googler owner and author). A `CR+1` on the reviewed CL alone gives
+       `MISSING_APPROVAL` after about a minute; `triage` lists the parents that block it. Never
+       vote `CR+1` on unreviewed parents just to unblock `Canary-G3`.
      - Other canaries (`Canary-Chromium`, `Canary-Android`) have no such restriction and are
        triggered immediately. `Canary-Flutter` is disabled (see below): run the full local
        Flutter corpus instead.
@@ -60,15 +49,6 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
    - Immediately after triggering `git cl try`, launch
      `python3 ~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py watch --cl <CL> --save-draft`
      as a background command (`WaitMsBeforeAsync=500`, `NotificationTimeoutSeconds=5400`).
-   - For external authors needing `Canary-G3`, `watch` automatically polls Gerrit for the Googler
-     `Code-Review+1` vote, triggers `Canary-G3` the moment `CR+1` is published, and watches
-     `Canary-G3` to completion.
-   - **On Green `Canary-G3` (`SUCCESS`)**: `watch` automatically resolves **only**
-     `jlavrova@google.com`'s own `/PATCHSET_LEVEL` `Canary-G3` submit-hold thread (matching
-     `"hold the submit"` + `"Canary-G3"`, with no third-party replies and active `Code-Review+1` on
-     the tested `current_revision`) across the tested `(CL, PS)` and verified unmerged stack
-     ancestors, posting the reply on each hold comment's own revision (`revisions/{leaf_ps}/review`
-     with `drafts: KEEP`). Never resolves substantive comments or third-party threads.
    - **On Red Canary (`UNRELATED_HEAD_BREAKAGE`)**: `watch --save-draft` automatically verifies
      `CheckTestsSkia` + `blaze query somepath` for all failing targets and saves a strictly
      sanitized English `/PATCHSET_LEVEL` draft on Gerrit (never leaking internal `google3` target
@@ -91,34 +71,6 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
        voted `CR+1`), re-trigger ASAN + `watch`, and report to the user.
 6. A red canary is not automatically the CL's fault. Follow the **Canary-G3 Runtime & Triage
    Procedure** below before blaming the CL.
-
-## External Author Canary-G3 Submit-Hold Protocol
-
-When reviewing an external author's Skia CL that requires `Canary-G3`:
-1. **The Hold Mechanism**:
-   - `g3_canary.go:134` forbids running Canary-G3 for external authors until a Googler votes `Code-Review+1`.
-   - Skia Gerrit `Review-Enforcement` requires 2 approvals. A bare `Code-Review+1` vote allows a second reviewer to submit the CL while Canary-G3 is still running.
-   - An unresolved comment leaves Gerrit submit requirement `No-Unresolved-Comments` in `UNSATISFIED` state, preventing premature submission.
-2. **Drafting the Hold Comment**:
-   - The agent NEVER publishes review comments or votes automatically.
-   - The agent drafts a `/PATCHSET_LEVEL` comment (`unresolved: true`) on the current patchset:
-     > The change looks good to me (Code-Review+1). I leave this comment unresolved on purpose: it blocks the submit until the Canary-G3 try job passes. Canary-G3 builds and tests the google3 clients of Skia with this change. Skia starts it for an external author only after a Googler votes Code-Review+1, so I vote first and hold the submit with this comment. I will resolve it when Canary-G3 is green, or report the failure here. Please do not resolve or override it before that.
-3. **Execution Steps**:
-   - The user reviews and publishes `Code-Review+1` with the draft hold comment (never ask the user
-     to notify you after publishing `CR+1`).
-   - Once published, `canary_advisor.py watch` and the Flight Deck `cl_watcher.py` daemon
-     (`sync_external_canary_g3`) automatically detect `CR+1` + the unresolved submit-hold comment
-     and invoke `trigger_canary_g3_once` (`~/.gemini/config/ledgers/canary_g3_claims.json`) to run
-     `Canary-G3` exactly once per `(CL, PS)`:
-     ```bash
-     git cl try -i <CL> -B skia/skia.primary -b Canary-G3
-     ```
-   - When `Canary-G3` finishes `SUCCESS` (with no failing ASAN/Canary builds on that patchset),
-     `canary_advisor.py` (`watch` or `resolve-hold --cl <CL>`) and `cl_watcher.py` automatically
-     resolve `jlavrova@google.com`'s own `/PATCHSET_LEVEL` submit-hold thread on `<CL>` and any
-     unmerged stack ancestors whose `current_revision` matches the cherry-picked patchset and keeps
-     `jlavrova@google.com`'s `Code-Review+1`, unblocking submit and waking the CL chat. If
-     `Canary-G3` fails, the hold stays unresolved and the CL chat is woken with the triage verdict.
 
 ## Canary-G3 Runtime & Triage Procedure
 
@@ -177,16 +129,18 @@ When a Skia diff touches `include/private/chromium/`, `src/text/gpu/SkChromeRemo
    git -C /usr/local/google/home/jlavrova/chromium/src/third_party/skia checkout -- .
    ```
 
-## Local Google3 Paragraph A/B Corpus (Fast Pre-Canary Check)
+## Local Google3 Paragraph A/B Corpus (Replaces `Canary-G3` on Cloudtop)
 
 `Canary-G3` runs a fixed TAP project list (`third_party/skia/METADATA`, ~55 min) that covers only
-157 of the 1,150 runnable transitive `google3` tests depending on `skparagraph` / `skunicode`
+157 of the 1,150 transitive runnable `google3` tests depending on `skparagraph` / `skunicode`
 (leaving 993 runnable tests uncovered). On Linux Cloudtop, when a CL modifies executable code or
-`BUILD.bazel` under `modules/skparagraph/` or `modules/skunicode/`, run `google3-test-paragraph`
-fast tier (~10–13 min per leg, no Piper CL created) before or alongside `Canary-G3`:
+`BUILD.bazel` under `modules/skparagraph/` or `modules/skunicode/`, `canary_advisor.py` replaces
+`Canary-G3` with `google3-test-paragraph` fast tier (1,139 targets including `skia_build_test`,
+~10–13 min per uncached leg with cached `G3_HEAD` baseline, zero Piper CLs, and zero submit hold):
 ```bash
 python3 ~/.gemini/config/skills/google3-test-paragraph/scripts/run_g3_paragraph_tests.py \
   --out /tmp/g3_paragraph_tests \
+  --create-citc \
   baseline=G3_HEAD \
   cand=cl:<change>/<ps>
 ```

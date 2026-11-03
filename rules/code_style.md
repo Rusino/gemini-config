@@ -59,33 +59,8 @@ description: "Skia-style C++ minimalism and suppression of LLM coding reflexes."
 - **2×2 Ablation Matrix in Code Review Replies**: When a reviewer suggests an alternative or combined optimization/design (`A` vs. `B`), measure all 4 combinations (`baseline`, `A alone`, `B alone`, `A + B`) and include the exact numbers in the draft review reply
 - **Never publish review replies or resolve threads without asking**: Never publish review replies
   or comments to Gerrit or GitHub yourself, and never resolve/unresolve review threads
-  (`resolveReviewThread`) unless the user explicitly asks you to — **with one narrow exception**:
-  when `Canary-G3` finishes `SUCCESS`, `canary_advisor.py` (`watch` / `resolve-hold`) may
-  automatically resolve **only** `jlavrova@google.com`'s own `/PATCHSET_LEVEL` `Canary-G3`
-  submit-hold thread (matching `"hold the submit"` + `"Canary-G3"`, no third-party replies,
-  `Code-Review+1` active on the tested `current_revision`), never touching substantive code
-  comments or anyone else's threads. Outside that hold-release reply, only prepare / draft replies
-  for the user to publish
-- **External Author Canary-G3 Submit-Hold Protocol**: When approving an external author's Skia CL
-  that requires Canary-G3 (which runs ~55 min and requires a Googler author or Googler
-  `Code-Review+1` approval per `g3_canary.go:134`), do not vote CR+1 as a bare approval. Because
-  Gerrit submit enforcement requires 2 approvals, another reviewer could submit the CL while
-  Canary-G3 is still running. To prevent premature submit, the user publishes `Code-Review+1`
-  together with an unresolved patchset-level comment (leaving `No-Unresolved-Comments`
-  `UNSATISFIED`). The agent never votes or publishes review comments itself: prepare a
-  `/PATCHSET_LEVEL` draft (`unresolved: true`) for the user to publish:
-  > The change looks good to me (Code-Review+1). I leave this comment unresolved on purpose:
-  > it blocks the submit until the Canary-G3 try job passes. Canary-G3 builds and tests the
-  > google3 clients of Skia with this change. Skia starts it for an external author only after a
-  > Googler votes Code-Review+1, so I vote first and hold the submit with this comment. I will
-  > resolve it when Canary-G3 is green, or report the failure here. Please do not resolve or
-  > override it before that.
-  Never ask the user to notify you after publishing `CR+1`: once published with this hold comment,
-  `canary_advisor.py watch` and `cl_watcher.py` (`sync_external_canary_g3`) automatically detect
-  it and trigger `Canary-G3` once (`trigger_canary_g3_once`). When `Canary-G3` finishes `SUCCESS`,
-  they automatically resolve this own `/PATCHSET_LEVEL` submit-hold thread (including unmerged
-  stack ancestors whose `current_revision` matches the cherry-picked patchset and keeps
-  `jlavrova@google.com`'s `CR+1`) and wake the CL chat.
+  (`resolveReviewThread`) unless the user explicitly asks you to; only prepare / draft replies for
+  the user to review and publish
 - **Canary-G3 Runtime & Triage Procedure**: Canary-G3 can take ~55 minutes. If it turns red,
   extract the roll CL number from swarming stdout (`Canary roll [ http://cl/N ]`) and triage:
   1. Run `cd ~/.gemini/jetski/scratch/skia_gardener && go run . -triage-google3 -cl <CL>`

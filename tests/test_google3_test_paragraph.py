@@ -237,8 +237,11 @@ class Google3TestParagraphTests(unittest.TestCase):
     def test_cached_data_and_split_fast_slow(self) -> None:
         fast = pg3._read_targets_file(DATA_DIR / "fast_targets.txt")
         slow = pg3._read_targets_file(DATA_DIR / "slow_targets.txt")
-        self.assertEqual(len(fast), 1137)
+        self.assertEqual(len(fast), 1139)
         self.assertEqual(len(slow), 13)
+        self.assertIn("//third_party/skia/HEAD:skia_build_test", fast)
+        self.assertIn("//third_party/skia/HEAD:skia_build_test_linux", fast)
+        self.assertEqual(len(set(fast)), len(fast))
         self.assertEqual(len(set(fast) & set(slow)), 0)
 
         f_out, s_out = rf.split_fast_and_slow(
@@ -250,6 +253,105 @@ class Google3TestParagraphTests(unittest.TestCase):
         )
         self.assertEqual(f_out, ["//x:t1"])
         self.assertEqual(s_out, ["//x:t2", "//x:t3"])
+        merged = rf.merge_pinned_build_tests(f_out, s_out)
+        self.assertIn("//third_party/skia/HEAD:skia_build_test", merged)
+        self.assertIn("//third_party/skia/HEAD:skia_build_test_linux", merged)
+
+    def test_citc_lock_and_baseline_cache_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            lock_dir = tmp / "locks"
+            with rg3.acquire_citc_lock("skia_g3_ab", wait_sec=0.0, lock_dir=lock_dir):
+                with self.assertRaisesRegex(RuntimeError, "CitC client 'skia_g3_ab' is locked"):
+                    with rg3.acquire_citc_lock("skia_g3_ab", wait_sec=0.05, lock_dir=lock_dir):
+                        pass
+
+            targets = ["//a:t1", "//b:t2"]
+            key = rg3.compute_baseline_cache_key(
+                1012150572,
+                "e5ad3868b8dbc2d3b5d4048232af74041a04a595",
+                "1122334455667788",
+                targets,
+            )
+            leg_src = tmp / "src_leg"
+            leg_src.mkdir()
+            bep_lines = [
+                json.dumps(
+                    {"id": {"started": {}}, "started": {"uuid": "inv-1", "startTimeMillis": "100"}}
+                ),
+                json.dumps(
+                    {
+                        "id": {"testSummary": {"label": "//a:t1"}},
+                        "testSummary": {"overallStatus": "PASSED"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "id": {"testSummary": {"label": "//b:t2"}},
+                        "testSummary": {"overallStatus": "PASSED"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "id": {"buildMetrics": {}},
+                        "buildMetrics": {"actionSummary": {"actionsExecuted": "10"}},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "id": {"buildFinished": {}},
+                        "finished": {
+                            "finishTimeMillis": "900",
+                            "exitCode": {"code": 0, "name": "SUCCESS"},
+                        },
+                    }
+                ),
+            ]
+            bep_p = leg_src / "bep.json"
+            bep_p.write_text("\n".join(bep_lines) + "\n", encoding="utf-8")
+            (leg_src / "targets.txt").write_text("\n".join(targets) + "\n", encoding="utf-8")
+            sm = pg3.parse_bep_file(bep_p, expected_targets=targets)
+            att = {
+                "label": "baseline",
+                "ref_spec": "G3_HEAD",
+                "citc_client": "skia_g3_ab",
+                "citc_base_cl": 1012150572,
+                "citc_pre_dirty_files": [],
+                "citc_restored_clean": True,
+                "g3_skia_revision": "e5ad3868b8dbc2d3b5d4048232af74041a04a595",
+                "source_tree_sha256": "1122334455667788",
+                "rewritten_file_count": 0,
+                "tier": "fast",
+                "flaky_attempts": 1,
+                "blaze_rc": 0,
+            }
+            (leg_src / "summary.json").write_text(json.dumps(sm), encoding="utf-8")
+            (leg_src / "attestation.json").write_text(json.dumps(att), encoding="utf-8")
+
+            cache_root = tmp / "cache"
+            rg3._save_baseline_cache(cache_root, key, leg_src, att, sm)
+            self.assertTrue((cache_root / key / "bep.json").is_file())
+
+            # Dirty CitC baseline must never be cached
+            dirty_att = {**att, "citc_pre_dirty_files": ["foo/bar.cc"]}
+            rg3._save_baseline_cache(cache_root, key + "_dirty", leg_src, dirty_att, sm)
+            self.assertFalse((cache_root / (key + "_dirty")).exists())
+
+            leg_dst = tmp / "dst_leg"
+            leg_dst.mkdir()
+            hit = rg3._try_restore_baseline_cache(
+                cache_root / key,
+                leg_dst,
+                label="base_restored",
+                citc_client="skia_g3_ab",
+                stale_warning=None,
+            )
+            self.assertTrue(hit)
+            restored_run = pg3.collect_run_data(str(leg_dst), None)
+            self.assertTrue(restored_run["attestation"]["baseline_cache_hit"])
+            md = pg3.format_comparison_markdown([("base_restored", restored_run)])
+            self.assertIn("`VALID (", md)
+            self.assertIn("`cached`", md)
 
 
     def test_pattern_aborts_classify_missing_vs_starlark_error(self) -> None:

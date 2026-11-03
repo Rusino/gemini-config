@@ -1034,6 +1034,8 @@
 //third_party/sketchology/public/contrib:export_integration_test
 //third_party/sketchology/public/contrib:import_test
 //third_party/sketchology/public/contrib:skia_text_renderer_test
+//third_party/skia/HEAD:skia_build_test
+//third_party/skia/HEAD:skia_build_test_linux
 //video/common/services/editing:editlist_handler_base_test
 //video/youtube/client/modules/composition/runtime/server/api:server_composition_runtime_test
 //video/youtube/client/modules/composition/runtime/server:server_runtime_scope_test

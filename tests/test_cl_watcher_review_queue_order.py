@@ -354,81 +354,51 @@ class ReviewQueueOrderAndReadinessTest(unittest.TestCase):
     result_nums = [c[1]["_number"] for c in dated_changes]
     self.assertEqual(result_nums, [201, 202])
 
-  def test_canary_advisor_waits_for_parent_cr_plus_one(self):
-    args = mock.MagicMock()
-    args.cl = 1412377
-    args.ps = 1
-    args.poll_sec = 1
-    args.timeout_min = 1
+  def test_gerrit_reads_fallback_to_authenticated_endpoint_on_http_429(self):
+    import urllib.error
 
-    diff_text = (
-        "diff --git a/modules/skparagraph/include/Paragraph.h "
-        "b/modules/skparagraph/include/Paragraph.h\n"
-        "--- a/modules/skparagraph/include/Paragraph.h\n"
-        "+++ b/modules/skparagraph/include/Paragraph.h\n"
-        "@@ -1 +1 @@\n"
-    )
-    meta = {
-        "owner": "external@author.com",
-        "googler_cr_plus_one": True,
-        "is_wip": False,
-        "subject": "Child feature",
-        "patchset": 1,
-        "diff": diff_text,
-    }
-    missing_cycle = [[("1412376", 1)], []]
+    class _FakeHttpResp:
 
-    def fake_missing(cl, ps):
-      return missing_cycle.pop(0) if missing_cycle else []
+      def __init__(self, payload: str, status: int = 200):
+        self._payload = payload
+        self.status = status
 
-    sleep_count = 0
+      def read(self) -> bytes:
+        return self._payload.encode("utf-8")
 
-    def fake_sleep(sec):
-      nonlocal sleep_count
-      sleep_count += 1
-      if sleep_count > 4:
-        raise KeyboardInterrupt
+      def __enter__(self):
+        return self
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-      claims_file = os.path.join(tmp_dir, "claims.json")
-      with (
-          mock.patch.dict(os.environ, {"CANARY_G3_CLAIMS_FILE": claims_file}),
-          mock.patch.object(canary_advisor, "load_cl", return_value=meta),
-          mock.patch.object(
-              canary_advisor, "unapproved_g3_chain", side_effect=fake_missing
-          ),
-          mock.patch.object(canary_advisor, "bb_cl_builds", return_value={}),
-          mock.patch.object(
-              canary_advisor, "swarming_tasks_for_cl", return_value=[]
-          ),
-          mock.patch.object(canary_advisor.subprocess, "run") as mock_run,
-          mock.patch.object(canary_advisor.time, "sleep", side_effect=fake_sleep),
-      ):
-        try:
-          canary_advisor.cmd_watch(args)
-        except KeyboardInterrupt:
-          pass
+      def __exit__(self, exc_type, exc, tb):
+        return False
 
-        # Canary-G3 must have been triggered once the parent approval cleared
-        mock_run.assert_called_once()
-        call_args, call_kwargs = mock_run.call_args
-        self.assertEqual(
-            call_args[0],
-            [
-                "git",
-                "cl",
-                "try",
-                "-i",
-                "1412377",
-                "-B",
-                canary_advisor.BUCKET,
-                "-b",
-                "Canary-G3",
-            ],
+    seen = []
+
+    def fake_urlopen(req, timeout=8):
+      seen.append((req.full_url, req.headers.get("Authorization")))
+      if "/a/" not in req.full_url:
+        raise urllib.error.HTTPError(
+            req.full_url, 429, "Too Many Requests", {}, None
         )
-        self.assertEqual(call_kwargs["cwd"], canary_advisor.SKIA_DIR)
-        self.assertFalse(call_kwargs["check"])
-        self.assertEqual(call_kwargs["env"].get("SKIP_GCE_AUTH_FOR_GIT"), "1")
+      return _FakeHttpResp(
+          ")]}'\n{\"/PATCHSET_LEVEL\": [{\"id\": \"c1\", \"patch_set\": 1,"
+          " \"unresolved\": false, \"author\": {\"email\": \"jlavrova@google.com\"},"
+          " \"message\": \"Looks good to me.\"}]}"
+      )
+
+    with mock.patch.object(
+        canary_advisor, "_gerrit_luci_token", return_value="luci-tok-123"
+    ):
+      with mock.patch.object(
+          w.urllib.request, "urlopen", side_effect=fake_urlopen
+      ):
+        comments = w.fetch_gerrit_comments(w.GERRIT_SKIA_HOST, "1414017")
+
+    self.assertIn("/PATCHSET_LEVEL", comments)
+    self.assertEqual(len(seen), 2)
+    self.assertNotIn("/a/", seen[0][0])
+    self.assertIn("/a/changes/1414017/comments", seen[1][0])
+    self.assertEqual(seen[1][1], "Bearer luci-tok-123")
 
   def test_dashboard_variant_c_stack_grouping_and_blocker_banner(self):
     # Pass DASHBOARD_HTML via stdin to stay below Linux 128 KB MAX_ARG_STRLEN

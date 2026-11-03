@@ -439,6 +439,8 @@ def _evaluate_attestation(runs: list[tuple[str, dict[str, Any]]]) -> tuple[list[
         wall_s = sm.get("wall_duration_s") or att.get("wall_duration_s")
         inv_id = sm.get("invocation_id")
         act_parts: list[str] = []
+        if att.get("baseline_cache_hit"):
+            act_parts.append("`cached`")
         if act is not None:
             act_parts.append(f"`{act}` act (`{cpp_act}` C++)")
         if wall_s is not None:

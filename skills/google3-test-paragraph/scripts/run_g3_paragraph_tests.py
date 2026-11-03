@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 from datetime import datetime, timezone
+import fcntl
 import getpass
 import hashlib
 import json
@@ -12,9 +14,10 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
-from typing import Any
+from typing import Any, Iterator
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
@@ -42,6 +45,13 @@ HASHED_SUBDIRS = (
     "modules/skunicode",
     "modules/skshaper",
 )
+DEFAULT_BASELINE_CACHE_DIR = pathlib.Path(
+    os.environ.get(
+        "GOOGLE3_PARAGRAPH_CACHE_DIR",
+        str(pathlib.Path.home() / ".cache/google3-test-paragraph"),
+    )
+)
+MAX_BASELINE_CACHE_ENTRIES = 6
 
 
 def _run(
@@ -463,6 +473,170 @@ def restore_citc_skia_head(
     return set(post_dirty) <= set(pre_dirty)
 
 
+# Serialize CitC client mutations across parallel sessions without unlinking the lock inode
+@contextlib.contextmanager
+def acquire_citc_lock(
+    citc_client: str,
+    *,
+    wait_sec: float = 0.0,
+    lock_dir: pathlib.Path | None = None,
+) -> Iterator[pathlib.Path]:
+    base_dir = lock_dir or pathlib.Path(tempfile.gettempdir())
+    enforce_citc_hygiene(base_dir)
+    base_dir.mkdir(parents=True, exist_ok=True)
+    safe_client = re.sub(r"[^A-Za-z0-9_.-]", "_", citc_client)
+    lock_path = base_dir / f"jetski_citc_{getpass.getuser()}_{safe_client}.lock"
+    fh = lock_path.open("a+", encoding="utf-8")
+    acquired = False
+    deadline = time.monotonic() + max(0.0, wait_sec)
+    try:
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    fh.seek(0)
+                    holder = fh.read().strip() or "unknown holder"
+                    raise RuntimeError(
+                        f"CitC client '{citc_client}' is locked ({holder}); "
+                        f"pass --wait-lock-sec or another --citc-client"
+                    ) from exc
+                time.sleep(min(0.25, remaining))
+        fh.seek(0)
+        fh.truncate()
+        fh.write(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "citc_client": citc_client,
+                    "started_utc": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            + "\n"
+        )
+        fh.flush()
+        yield lock_path
+    finally:
+        if acquired:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        fh.close()
+
+
+def compute_baseline_cache_key(
+    citc_base_cl: int,
+    g3_skia_rev: str,
+    tree_sha: str,
+    targets: list[str],
+) -> str:
+    targets_sha = hashlib.sha256("\n".join(targets).encode("utf-8")).hexdigest()[:12]
+    return f"baseline_{citc_base_cl}_{g3_skia_rev[:12]}_{tree_sha}_{targets_sha}"
+
+
+def _is_cacheable_baseline_leg(attestation: dict[str, Any], summary: dict[str, Any]) -> bool:
+    if attestation.get("ref_spec") != "G3_HEAD":
+        return False
+    if attestation.get("citc_base_cl") is None or attestation.get("citc_pre_dirty_files"):
+        return False
+    if not attestation.get("citc_restored_clean") or attestation.get("flaky_attempts") != 1:
+        return False
+    if attestation.get("blaze_rc") not in (0, 3):
+        return False
+    counts = summary.get("counts") or {}
+    if counts.get("failed_to_build", 0) or counts.get("analysis_failure", 0):
+        return False
+    if "REMOTE_ERROR" in (summary.get("statuses") or {}).values():
+        return False
+    issues, _ = pg3._evaluate_attestation(
+        [("baseline", {"attestation": attestation, "summary": summary})]
+    )
+    return not issues
+
+
+def _try_restore_baseline_cache(
+    cache_entry_dir: pathlib.Path,
+    leg_dir: pathlib.Path,
+    *,
+    label: str,
+    citc_client: str,
+    stale_warning: str | None,
+) -> bool:
+    req_files = ("attestation.json", "summary.json", "bep.json")
+    if not all((cache_entry_dir / name).is_file() for name in req_files):
+        return False
+    try:
+        att = json.loads((cache_entry_dir / "attestation.json").read_text(encoding="utf-8"))
+        sm = json.loads((cache_entry_dir / "summary.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not _is_cacheable_baseline_leg(att, sm):
+        return False
+    shutil.copy2(cache_entry_dir / "bep.json", leg_dir / "bep.json")
+    if (cache_entry_dir / "blaze.log").is_file():
+        shutil.copy2(cache_entry_dir / "blaze.log", leg_dir / "blaze.log")
+    sm["bep_path"] = str(leg_dir / "bep.json")
+    att = {
+        **att,
+        "label": label,
+        "citc_client": citc_client,
+        "targets_stale_warning": stale_warning,
+        "baseline_cache_hit": True,
+        "baseline_cache_key": cache_entry_dir.name,
+    }
+    (leg_dir / "attestation.json").write_text(
+        json.dumps(att, indent=2) + "\n", encoding="utf-8"
+    )
+    (leg_dir / "summary.json").write_text(
+        json.dumps(sm, indent=2) + "\n", encoding="utf-8"
+    )
+    return True
+
+
+def _prune_baseline_cache(
+    cache_root: pathlib.Path, max_entries: int = MAX_BASELINE_CACHE_ENTRIES
+) -> None:
+    if not cache_root.is_dir():
+        return
+    entries = [
+        p
+        for p in cache_root.iterdir()
+        if p.is_dir() and p.name.startswith("baseline_")
+    ]
+    entries.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in entries[max_entries:]:
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def _save_baseline_cache(
+    cache_root: pathlib.Path,
+    cache_key: str,
+    leg_dir: pathlib.Path,
+    attestation: dict[str, Any],
+    summary: dict[str, Any],
+) -> None:
+    if not _is_cacheable_baseline_leg(attestation, summary):
+        return
+    enforce_citc_hygiene(cache_root)
+    cache_root.mkdir(parents=True, exist_ok=True)
+    dst_dir = cache_root / cache_key
+    tmp_dir = cache_root / f".tmp_{cache_key}_{os.getpid()}"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        for name in ("attestation.json", "summary.json", "bep.json", "targets.txt", "blaze.log"):
+            src = leg_dir / name
+            if src.is_file():
+                shutil.copy2(src, tmp_dir / name)
+        if dst_dir.exists():
+            shutil.rmtree(dst_dir, ignore_errors=True)
+        os.replace(tmp_dir, dst_dir)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    _prune_baseline_cache(cache_root)
+
+
 def run_single_leg(
     label: str,
     ref_spec: str,
@@ -477,6 +651,8 @@ def run_single_leg(
     flaky_attempts: int,
     base_ref_override: str | None,
     pre_dirty: list[str],
+    use_baseline_cache: bool = True,
+    baseline_cache_dir: pathlib.Path = DEFAULT_BASELINE_CACHE_DIR,
 ) -> None:
     leg_dir = out_dir / label
     leg_dir.mkdir(parents=True, exist_ok=True)
@@ -492,10 +668,32 @@ def run_single_leg(
     source_commit_sha: str | None = None
     skia_dirty: list[str] = []
     restored_clean = True
+    cache_eligible = (
+        ref_spec == "G3_HEAD"
+        and use_baseline_cache
+        and citc_base_cl is not None
+        and not pre_dirty
+        and flaky_attempts == 1
+        and stale_warning is None
+    )
+    cache_key: str | None = None
 
     try:
         if ref_spec == "G3_HEAD":
             restore_citc_skia_head(g3_root, [], pre_dirty)
+            if cache_eligible and citc_base_cl is not None:
+                clean_tree_sha = hash_g3_skia_tree(g3_root, [])
+                cache_key = compute_baseline_cache_key(
+                    citc_base_cl, g3_skia_rev, clean_tree_sha, targets
+                )
+                if _try_restore_baseline_cache(
+                    baseline_cache_dir / cache_key,
+                    leg_dir,
+                    label=label,
+                    citc_client=citc_client,
+                    stale_warning=stale_warning,
+                ):
+                    return
         else:
             if skia_repo is None:
                 raise RuntimeError(f"skia_repo required for non-G3_HEAD spec '{ref_spec}'")
@@ -585,6 +783,7 @@ def run_single_leg(
         "blaze_cmd": blaze_cmd,
         "blaze_rc": proc.returncode,
         "wall_duration_s": wall_s,
+        "baseline_cache_hit": False,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -594,6 +793,8 @@ def run_single_leg(
     (leg_dir / "summary.json").write_text(
         json.dumps(summary, indent=2) + "\n", encoding="utf-8"
     )
+    if cache_eligible and cache_key is not None:
+        _save_baseline_cache(baseline_cache_dir, cache_key, leg_dir, attestation, summary)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -609,12 +810,20 @@ def main(argv: list[str] | None = None) -> int:
         help="CitC client name (default: skia_g3_ab)",
     )
     parser.add_argument("--create-citc", action="store_true", help="Create CitC client if missing")
+    parser.add_argument(
+        "--wait-lock-sec",
+        type=float,
+        default=0.0,
+        help="Seconds to wait for exclusive CitC client lock (default: 0 = fail immediately)",
+    )
     parser.add_argument("--skia-repo", type=pathlib.Path, default=None, help="Local Skia git repo")
     parser.add_argument("--base-ref", default=None, help="Override Skia base ref for diffing")
     parser.add_argument("--flaky-attempts", type=int, default=1)
     parser.add_argument("--max-targets-age-days", type=int, default=30)
     parser.add_argument("--allow-stale-targets", action="store_true")
     parser.add_argument("--allow-dirty-citc", action="store_true")
+    parser.add_argument("--no-baseline-cache", action="store_true")
+    parser.add_argument("--baseline-cache-dir", type=pathlib.Path, default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "specs",
@@ -626,6 +835,12 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = args.out.expanduser()
     enforce_citc_hygiene(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = (
+        args.baseline_cache_dir.expanduser()
+        if args.baseline_cache_dir is not None
+        else DEFAULT_BASELINE_CACHE_DIR
+    )
+    enforce_citc_hygiene(cache_dir)
 
     raw_specs = args.specs or ["baseline=G3_HEAD", "current=WORKTREE"]
     parsed_specs: list[tuple[str, str]] = []
@@ -643,38 +858,42 @@ def main(argv: list[str] | None = None) -> int:
     )
     citc_client, citc_root = resolve_citc_root(args.citc_client, args.create_citc)
     g3_root = citc_root / "google3"
-    pre_dirty = list_citc_dirty_files(g3_root)
     needs_skia_repo = any(ref != "G3_HEAD" for _, ref in parsed_specs)
-    check_citc_dirty_hygiene(
-        citc_client,
-        pre_dirty,
-        args.allow_dirty_citc,
-        needs_skia_repo,
-    )
     skia_repo = resolve_skia_repo(args.skia_repo) if needs_skia_repo else None
 
-    for lbl, ref in parsed_specs:
-        leg_dir = out_dir / lbl
-        if (
-            args.resume
-            and (leg_dir / "attestation.json").exists()
-            and (leg_dir / "summary.json").exists()
-        ):
-            continue
-        run_single_leg(
-            lbl,
-            ref,
-            out_dir=out_dir,
-            citc_client=citc_client,
-            citc_root=citc_root,
-            skia_repo=skia_repo,
-            tier=tier_name,
-            targets=targets,
-            stale_warning=stale_warning,
-            flaky_attempts=args.flaky_attempts,
-            base_ref_override=args.base_ref,
-            pre_dirty=pre_dirty,
+    with acquire_citc_lock(citc_client, wait_sec=args.wait_lock_sec):
+        pre_dirty = list_citc_dirty_files(g3_root)
+        check_citc_dirty_hygiene(
+            citc_client,
+            pre_dirty,
+            args.allow_dirty_citc,
+            needs_skia_repo,
         )
+
+        for lbl, ref in parsed_specs:
+            leg_dir = out_dir / lbl
+            if (
+                args.resume
+                and (leg_dir / "attestation.json").exists()
+                and (leg_dir / "summary.json").exists()
+            ):
+                continue
+            run_single_leg(
+                lbl,
+                ref,
+                out_dir=out_dir,
+                citc_client=citc_client,
+                citc_root=citc_root,
+                skia_repo=skia_repo,
+                tier=tier_name,
+                targets=targets,
+                stale_warning=stale_warning,
+                flaky_attempts=args.flaky_attempts,
+                base_ref_override=args.base_ref,
+                pre_dirty=pre_dirty,
+                use_baseline_cache=not args.no_baseline_cache,
+                baseline_cache_dir=cache_dir,
+            )
 
     runs = [(lbl, pg3.collect_run_data(str(out_dir / lbl), None)) for lbl, _ in parsed_specs]
     md = pg3.format_comparison_markdown(runs)

@@ -29,13 +29,20 @@
     "//third_party/flutter_engine:skia",
     "//third_party/skia/HEAD:skia_build_test"
   ],
+  "pinned_build_tests": [
+    "//third_party/skia/HEAD:skia_build_test",
+    "//third_party/skia/HEAD:skia_build_test_linux"
+  ],
   "excluded_tag_regex": "manual|notap|no_presubmit",
   "counts": {
-    "fast": 1137,
+    "fast": 1139,
     "slow": 13,
-    "total_runnable": 1150,
+    "pinned_build_tests": 2,
+    "total_runnable": 1152,
+    "transitive_runnable": 1150,
     "manual_excluded": 741,
-    "canary_covered_runnable": 157,
+    "canary_covered_transitive": 157,
+    "canary_covered_runnable": 159,
     "uncovered_runnable": 993
   }
 }

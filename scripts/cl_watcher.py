@@ -4195,26 +4195,15 @@ def fetch_gerrit_cl_status(
       )
       merge_conflict = status == "NEW" and not gerrit_mergeable(host, cl_id)
 
-      # Fetch comments on approved external CLs with unsatisfied No-Unresolved-Comments to see holds
-      has_unresolved_sr = any(
-          isinstance(sr, dict)
-          and str(sr.get("name") or "") == "No-Unresolved-Comments"
-          and str(sr.get("status") or "") == "UNSATISFIED"
-          for sr in submit_reqs
-      )
       comments_by_path: dict[str, list[dict[str, Any]]] = {}
       if (
           isinstance(d.get("_comments"), dict)
           or self_comment_count > 0
           or "comment" in attention_reason.lower()
-          or (status == "NEW" and is_external and self_cr_vote > 0 and has_unresolved_sr)
       ):
         comments_by_path = fetch_gerrit_comments(
             host, cl_id, preloaded=d.get("_comments")
         )
-      has_own_canary_g3_hold = bool(
-          canary_advisor.find_unresolved_canary_g3_hold_leaves(comments_by_path)
-      )
       thread_stats = _analyze_gerrit_self_threads(
           comments_by_path, owner_email
       )
@@ -4541,7 +4530,6 @@ def fetch_gerrit_cl_status(
           "self_cr_vote": self_cr_vote,
           "self_approved": bool(self_cr_vote > 0),
           "self_approval_ps": self_approval_ps,
-          "has_own_canary_g3_hold": has_own_canary_g3_hold,
           "parent_commit": parent_commit,
           "revision_ps_by_sha": revision_ps_by_sha,
           "patchset": ps_num,
@@ -8570,261 +8558,6 @@ def ack_bug_item(bug_key: str) -> dict[str, Any]:
   return {"ok": True, "bug_key": bkey, "lane": bug.get("lane", "assigned")}
 
 
-# Trigger Canary-G3 once after CR+1 + submit hold on external Skia CLs and resolve hold on pass
-def sync_external_canary_g3(
-    items: dict[str, Any],
-    state: dict[str, Any],
-    *,
-    skia_dir: str = DEFAULT_SKIA_DIR,
-    now_ts: float | None = None,
-) -> None:
-  now = float(now_ts if now_ts is not None else time.time())
-  ledger: dict[str, Any] = state.setdefault("canary_g3_ledger", {})
-  events: list[dict[str, Any]] = state.setdefault("events", [])
-
-  # Deduplicate composite item keys per (cl, ps), preferring records attached to an active chat
-  candidates: dict[str, dict[str, Any]] = {}
-  for rec in items.values():
-    if not isinstance(rec, dict) or rec.get("kind") != "gerrit":
-      continue
-    if str(rec.get("host") or "") != GERRIT_SKIA_HOST:
-      continue
-    if str(rec.get("status") or "").upper() != "NEW":
-      continue
-    if rec.get("is_self") or rec.get("is_companion") or rec.get("is_wip"):
-      continue
-    if rec.get("reviewer_removed"):
-      continue
-    owner_email = str(rec.get("owner_email") or "")
-    is_ext = (
-        bool(rec["is_external"])
-        if "is_external" in rec
-        else (
-            not owner_email.endswith("@google.com")
-            and not owner_email.endswith("@chromium.org")
-        )
-    )
-    if not is_ext or int(rec.get("self_cr_vote") or 0) <= 0:
-      continue
-    tid_str = str(rec.get("target_id") or "").strip()
-    ps = int(rec.get("patchset") or 0)
-    if not tid_str.isdigit() or ps <= 0:
-      continue
-    key = f"{int(tid_str)}:{ps}"
-    existing_entry = ledger.get(key)
-    has_hold = bool(rec.get("has_own_canary_g3_hold"))
-    if not has_hold and not (
-        isinstance(existing_entry, dict) and not existing_entry.get("settled")
-    ):
-      continue
-    prev_cand = candidates.get(key)
-    if prev_cand is None or (
-        not prev_cand.get("conversation_id") and rec.get("conversation_id")
-    ):
-      candidates[key] = rec
-
-  terminal_statuses = ("SUCCESS", "FAILURE", "INFRA_FAILURE", "CANCELED")
-  for key, rec in sorted(candidates.items()):
-    entry = ledger.get(key)
-    if isinstance(entry, dict) and entry.get("settled"):
-      continue
-    last_poll = float((entry or {}).get("last_poll_ts") or 0.0)
-    if entry is not None and (now - last_poll) < 60.0:
-      continue
-
-    cl_num = int(rec["target_id"])
-    ps = int(rec["patchset"])
-    cid = str(rec.get("conversation_id") or "")
-    ikey = str(rec.get("item_key") or f"gerrit:{cl_num}")
-    proj = str(rec.get("project_name") or "Unassigned")
-    subj = str(rec.get("subject") or ikey)
-    entry = ledger.setdefault(
-        key,
-        {
-            "cl": cl_num,
-            "ps": ps,
-            "triggered_or_claimed": False,
-            "settled": False,
-        },
-    )
-    entry["last_poll_ts"] = now
-
-    # Isolate per-CL RPC failures so a transient Gerrit/Buildbucket error never aborts sync_once
-    try:
-      if not entry.get("triggered_or_claimed"):
-        trig = canary_advisor.trigger_canary_g3_once(
-            cl_num, ps, actor="cl_watcher", skia_dir=skia_dir
-        )
-        if not trig.get("ok"):
-          entry["last_reason"] = str(trig.get("reason") or "trigger_failed")
-          continue
-        entry["triggered_or_claimed"] = True
-        claim = trig.get("claim") or {}
-        if claim.get("superseded_build_id"):
-          entry["superseded_build_id"] = str(claim["superseded_build_id"])
-        if trig.get("triggered"):
-          events.insert(
-              0,
-              {
-                  "id": f"ev-{int(now * 1000)}-{cl_num}-g3trig",
-                  "time": now_et_str(),
-                  "item_key": ikey,
-                  "target_id": str(cl_num),
-                  "conversation_id": cid,
-                  "project_name": proj,
-                  "critical": False,
-                  "message": (
-                      f"[CL-WATCHER] 🚀 Triggered Canary-G3 on Gerrit {cl_num} PS{ps} "
-                      f"('{subj}') after CR+1 + submit hold."
-                  ),
-              },
-          )
-          state["events"] = events[:50]
-          continue
-
-      builds = canary_advisor.bb_cl_builds(cl_num, ps)
-      g3_build = builds.get("Canary-G3")
-      sup_id = str(entry.get("superseded_build_id") or "")
-      if not g3_build or (sup_id and str(g3_build.get("id") or "") == sup_id):
-        continue
-      g3_status = str(g3_build.get("status") or "")
-      build_id = str(g3_build.get("id") or "")
-      entry["build_id"] = build_id
-      entry["build_status"] = g3_status
-      if g3_status not in terminal_statuses:
-        continue
-
-      all_relevant_terminal = all(
-          b.get("status") in terminal_statuses
-          for name, b in builds.items()
-          if "ASAN" in name or name.startswith("Canary-")
-      )
-      if g3_status == "SUCCESS" and not all_relevant_terminal:
-        continue
-
-      cl_url = f"https://{GERRIT_SKIA_HOST}/c/skia/+/{cl_num}/{ps}"
-      cl_link = f"[Gerrit {cl_num} PS{ps}]({cl_url})"
-      build_link = (
-          f"[Canary-G3](https://ci.chromium.org/b/{build_id})"
-          if build_id
-          else f"[Canary-G3]({cl_url}?tab=checks)"
-      )
-
-      if g3_status == "SUCCESS":
-        relevant_ok = all(
-            b.get("status") == "SUCCESS"
-            for name, b in builds.items()
-            if "ASAN" in name or name.startswith("Canary-")
-        )
-        any_failed = any(
-            b.get("status") in ("FAILURE", "INFRA_FAILURE")
-            for b in builds.values()
-        )
-        hold_note = ""
-        if relevant_ok and not any_failed and rec.get("has_own_canary_g3_hold", True):
-          outcomes = canary_advisor.resolve_canary_g3_holds(cl_num, ps)
-          entry["hold_outcomes"] = outcomes
-          if any(o.get("error") for o in outcomes):
-            continue
-          if any(o.get("resolved") for o in outcomes):
-            hold_note = " Auto-resolved own Canary-G3 submit hold."
-            for r_item in items.values():
-              if (
-                  isinstance(r_item, dict)
-                  and str(r_item.get("target_id") or "") == str(cl_num)
-              ):
-                r_item["has_own_canary_g3_hold"] = False
-
-        entry["settled"] = True
-        entry["verdict"] = "SUCCESS"
-        events.insert(
-            0,
-            {
-                "id": f"ev-{int(now * 1000)}-{cl_num}-g3pass",
-                "time": now_et_str(),
-                "item_key": ikey,
-                "target_id": str(cl_num),
-                "conversation_id": cid,
-                "project_name": proj,
-                "critical": False,
-                "message": (
-                    f"[CL-WATCHER] ✅ Canary-G3 passed on Gerrit {cl_num} PS{ps} "
-                    f"('{subj}').{hold_note}"
-                ),
-            },
-        )
-        state["events"] = events[:50]
-        if cid:
-          if relevant_ok and not any_failed:
-            wake_conversation(
-                cid,
-                f"[CL-WATCHER] ✅ {build_link} passed on {cl_link}.{hold_note} "
-                "Check whether a 2nd Googler reviewer or CQ+2 is needed.",
-            )
-          else:
-            wake_conversation(
-                cid,
-                f"[CL-WATCHER] ⚠️ {build_link} passed on {cl_link}, but another "
-                "tryjob failed on this patchset — kept submit hold unresolved.",
-            )
-        continue
-
-      # Keep submit hold unresolved on FAILURE / INFRA_FAILURE / CANCELED
-      if g3_status in ("FAILURE", "INFRA_FAILURE"):
-        sw_tasks = canary_advisor.swarming_tasks_for_cl(cl_num, ps)
-        touched_files = list(rec.get("files") or [])
-        triage_res = canary_advisor.triage_canary_g3_failure(
-            cl_num, ps, g3_build, sw_tasks, touched_files
-        )
-        verdict = str(triage_res.get("verdict") or g3_status)
-        g3_cl = str(triage_res.get("g3_cl") or "")
-        if verdict == "UNRELATED_HEAD_BREAKAGE" and triage_res.get("sanitized_draft"):
-          canary_advisor.save_gerrit_patchset_draft(
-              cl_num, ps, triage_res["sanitized_draft"], unresolved=False
-          )
-      else:
-        verdict = g3_status
-        g3_cl = ""
-
-      entry["settled"] = True
-      entry["verdict"] = verdict
-      events.insert(
-          0,
-          {
-              "id": f"ev-{int(now * 1000)}-{cl_num}-g3fail",
-              "time": now_et_str(),
-              "item_key": ikey,
-              "target_id": str(cl_num),
-              "conversation_id": cid,
-              "project_name": proj,
-              "critical": True,
-              "message": (
-                  f"[CL-WATCHER] 🔴 Canary-G3 finished {verdict} on Gerrit {cl_num} "
-                  f"PS{ps} ('{subj}'); submit hold kept unresolved."
-              ),
-          },
-      )
-      state["events"] = events[:50]
-      if cid:
-        roll_part = f" (roll [cl/{g3_cl}](http://cl/{g3_cl}))" if g3_cl else ""
-        wake_conversation(
-            cid,
-            f"[CL-WATCHER] 🔴 {build_link} finished `{verdict}`{roll_part} on "
-            f"{cl_link}; submit hold kept unresolved. Triage and report to the user.",
-        )
-    except (
-        urllib.error.URLError,
-        OSError,
-        subprocess.SubprocessError,
-        ValueError,
-    ) as exc:
-      # Reset poll timestamp on transient RPC failure so the next sync retries this CL
-      if not entry.get("settled"):
-        entry["last_poll_ts"] = 0.0
-      entry["last_error"] = str(exc)[:200]
-      continue
-
-
 def sync_once(
     wake_chats: bool = True,
     update_titles: bool = True,
@@ -9636,10 +9369,6 @@ def sync_once(
           auto_abandon_keys.append(ikey)
     if auto_abandon_keys:
       abandon_companion_items(auto_abandon_keys, state=state, auto=True)
-      events = state["events"]
-    # Trigger and settle external-author Canary-G3 submit holds during live daemon polls
-    if skia_dir != "/nonexistent":
-      sync_external_canary_g3(new_items, state, skia_dir=skia_dir)
       events = state["events"]
 
   triage_store.overlay_triage_on_items(new_items.values())

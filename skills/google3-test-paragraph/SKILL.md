@@ -2,7 +2,7 @@
 name: google3-test-paragraph
 description: >-
   Run local google3 A/B transitive reverse-dependency tests in CitC for SkParagraph and SkUnicode
-  changes (1,137 fast targets in ~10-13 min per leg, 13 slow targets over 600s separately) with
+  changes (1,139 fast targets in ~10-13 min per leg, 13 slow targets over 600s separately) with
   autoroller include/BUILD rewrites and Run Attestation. Trigger when asked to "протестируй
   параграф в гугл3", "прогони google3 A/B для skparagraph", "проверь skparagraph в google3", or
   "test paragraph in google3".
@@ -10,13 +10,13 @@ description: >-
 
 # Testing Custom Skia / SkParagraph / SkUnicode in `google3` (`google3-test-paragraph`)
 
-This skill runs a local `google3` A/B test corpus in a CitC workspace for changes to `modules/skparagraph/` and `modules/skunicode/` without creating numbered Piper CLs or waiting ~55 minutes for `Canary-G3` (~17–20k fixed TAP targets in `third_party/skia/METADATA`).
+This skill runs a local `google3` A/B test corpus in a CitC workspace for changes to `modules/skparagraph/` and `modules/skunicode/` without creating numbered Piper CLs or waiting ~55 minutes for `Canary-G3` (~17–20k fixed TAP targets in `third_party/skia/METADATA`). On Linux Cloudtop (`/google/src/cloud/`), this corpus **replaces `Canary-G3`** for `modules/skparagraph/` and `modules/skunicode/` (running before `CR+1` with zero submit hold).
 
-Why this corpus complements `Canary-G3` and `flutter-test-paragraph-engine`:
-- Out of **1,891** transitive `google3` test targets (BFS depth 1–4 from `skparagraph` and `skunicode`, excluding `//third_party/flutter_engine:skia` and `//third_party/skia/HEAD:skia_build_test`), **741** are `manual|notap|no_presubmit` and **1,150** are runnable on Forge.
-- `Canary-G3` runs only **157** of those 1,150 runnable paragraph/unicode tests, leaving **993 runnable `google3` tests** (`926 cc_test`, `38 java_test`, `10` iOS, `6` WASM) completely uncovered until downstream teams break post-roll.
+Why this corpus replaces `Canary-G3` for `skparagraph` / `skunicode` and complements `flutter-test-paragraph-engine`:
+- Out of **1,891** transitive `google3` test targets (BFS depth 1–4 from `skparagraph` and `skunicode`, excluding `//third_party/flutter_engine:skia` and `//third_party/skia/HEAD:skia_build_test` from the BFS traversal so `skia_build_test` does not pull in non-paragraph core Skia consumers), **741** are `manual|notap|no_presubmit` and **1,150** are runnable on Forge; pinning `//third_party/skia/HEAD:skia_build_test` and `//third_party/skia/HEAD:skia_build_test_linux` directly into the fast tier gives **1,152** runnable targets.
+- `Canary-G3` runs only **157** of those 1,150 transitive runnable paragraph/unicode tests (**159** of 1,152 including the 2 pinned `skia_build_test*` gates), leaving **993 runnable `google3` tests** (`926 cc_test`, `38 java_test`, `10` iOS, `6` WASM) completely uncovered until downstream teams break post-roll.
 - Skia's own `modules/skparagraph/tests/SkParagraphTest.cpp` has **0 reverse dependencies** in `google3` (always run `skia-test-paragraph` for Skia unit tests and `flutter-test-paragraph-engine` for Flutter tests).
-- Splitting the 1,150 runnable tests at `600s` yields a **`fast` tier of 1,137 tests (~10–13 min per leg)** and a **`slow` tier of 13 tests (>600s, run separately on demand)**.
+- Splitting at `600s` yields a **`fast` tier of 1,139 targets (`1,137` transitive tests `<= 600s` + `2` pinned `skia_build_test*` gates, ~10–13 min per uncached leg)** and a **`slow` tier of 13 tests (>600s, run separately on demand)**. Clean `baseline=G3_HEAD` legs are cached automatically in `~/.cache/google3-test-paragraph/` keyed by `(citc_base_cl, g3_skia_revision, targets_sha256, flaky_attempts)` (max 6 entries), so repeated reviews at the same `google3` base run only the candidate leg (~10–13 min total).
 
 ## Contents
 - [Workspace & Data Layout](#workspace-data-layout)
@@ -36,7 +36,7 @@ Why this corpus complements `Canary-G3` and `flutter-test-paragraph-engine`:
 - **Mirrored Skia Root in `google3`**: `<citc>/google3/third_party/skia/HEAD` (pinned revision read from `third_party/skia/HEAD/METADATA`)
 - **Local Skia Git Checkout**: `~/.gemini/jetski/scratch/skia` (or `--skia-repo <path>`)
 - **Cached Target Lists**:
-  - [`fast_targets.txt`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/google3-test-paragraph/data/fast_targets.txt) (`1,137` runnable tests `<= 600s`)
+  - [`fast_targets.txt`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/google3-test-paragraph/data/fast_targets.txt) (`1,139` runnable targets: `1,137` transitive `<= 600s` + `2` pinned `skia_build_test*` gates)
   - [`slow_targets.txt`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/google3-test-paragraph/data/slow_targets.txt) (`13` runnable tests `> 600s`)
   - [`targets_manifest.json`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/google3-test-paragraph/data/targets_manifest.json) (generation timestamp, base Piper CL, `g3_skia_revision`, seeds, counts)
 
@@ -72,7 +72,7 @@ python3 ~/.gemini/config/skills/google3-test-paragraph/scripts/run_g3_paragraph_
   cand=cl:1409697/5
 ```
 
-### 3. Run the 13 slow tests (`--tier slow`) or combined 1,150 corpus (`--tier all`)
+### 3. Run the 13 slow tests (`--tier slow`) or combined 1,152 corpus (`--tier all`)
 ```bash
 python3 ~/.gemini/config/skills/google3-test-paragraph/scripts/run_g3_paragraph_tests.py \
   --out /tmp/g3_paragraph_tests_slow \
@@ -91,13 +91,16 @@ python3 ~/.gemini/config/skills/google3-test-paragraph/scripts/parse_g3_paragrap
 ```
 
 ### Useful Flags (`run_g3_paragraph_tests.py`)
-- `--tier <fast|slow|all>` — Target tier to run (default: `fast` = 1,137 targets; `slow` = 13 targets `>600s`; `all` = 1,150 targets).
+- `--tier <fast|slow|all>` — Target tier to run (default: `fast` = 1,139 targets; `slow` = 13 targets `>600s`; `all` = 1,152 targets).
 - `--targets-file <path>` — Run a custom newline-delimited list of `google3` test labels instead of a cached tier.
 - `--citc-client <name>` — CitC client name under `/google/src/cloud/<user>/` (default: auto-detects `skia_g3_ab`, then `skia_g3_pilot`).
 - `--create-citc` — Create `skia_g3_ab` via `g4 citc` if no reusable CitC client exists.
+- `--wait-lock-sec <sec>` — Seconds to wait for the exclusive per-CitC-client `flock` (`~/.cache/google3-test-paragraph/locks/citc_<client>.lock`, default: `0` = fail fast if another run holds the client).
 - `--skia-repo <path>` — Local Skia git repository used for `WORKTREE` or commit refs (default: `~/.gemini/jetski/scratch/skia`, then Flutter submodule Skia).
 - `--base-ref <git_ref>` — Override base commit when computing `WORKTREE` or branch commit range.
 - `--flaky-attempts <N>` — Pass `--flaky_test_attempts=<N>` to `blaze test` (default: `1`; unlike `Canary-G3`'s `SUBMIT_DRY_RUN` mode in `autoroller_lib.py:1433`, local `blaze test` does not deflake unless `--flaky-attempts` is set, so `compare.md` reports flips in both directions).
+- `--no-baseline-cache` — Force re-running `baseline=G3_HEAD` instead of reusing a cached baseline leg (`compare.md` marks reused legs with `` `cached` ``).
+- `--baseline-cache-dir <path>` — Override baseline cache directory outside CitC (default: `~/.cache/google3-test-paragraph`, max 6 entries).
 - `--resume` — Skip legs whose `attestation.json` and `summary.json` already exist in `--out`.
 - `--allow-stale-targets` — Proceed even if `targets_manifest.json` is older than `--max-targets-age-days` (default `30`), recording a warning in `attestation.json`.
 - `--allow-dirty-citc` — Proceed even if the CitC client already had open/modified files before staging (flagged `WARNING / INVALID` in `compare.md`).

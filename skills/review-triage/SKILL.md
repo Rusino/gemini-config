@@ -143,24 +143,22 @@ For surviving Skia CLs in `🔴 SURGICAL AUDIT` or `🟠 PUSHBACK`, run
 [`skia-canary-advisor`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/skia-canary-advisor/SKILL.md)
 (`canary_advisor.py advise --cl <N>`). Run ASAN automatically.
 
+- **SkParagraph / SkUnicode on Linux Cloudtop (`google3-test-paragraph`)**: When `/google/src/cloud`
+  is available and the CL touches `modules/skparagraph/` or `modules/skunicode/`, run
+  [`google3-test-paragraph`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/google3-test-paragraph/SKILL.md)
+  (`run_g3_paragraph_tests.py --out /tmp/g3_cl_<N> --create-citc baseline=G3_HEAD cand=cl:<N>/<PS>`,
+  1,139 fast targets including `skia_build_test`) **before** approving with `Code-Review+1` — never
+  trigger `Canary-G3` or leave an unresolved submit-hold comment for `skparagraph`/`skunicode` CLs.
 - **External Authors**: Trigger non-G3 canaries (`Canary-Chromium`, `Canary-Android`)
   automatically. Never trigger `Canary-Flutter` (disabled, R38); run the full local Flutter corpus
-  (`run_flutter_paragraph_tests.py --full`) instead. For `Canary-G3`, it requires a Googler author or Googler
-  `Code-Review+1` (`g3_canary.go:134`). Follow the **External Author Canary-G3 Submit-Hold Protocol**:
-  when approving, draft the `/PATCHSET_LEVEL` comment with `unresolved: True` holding the submit
-  until Canary-G3 passes. Never ask the user to tell you when they publish `CR+1`:
-  `canary_advisor.py watch` and `cl_watcher.py` (`sync_external_canary_g3`) automatically detect
-  the published `CR+1` + submit-hold comment, trigger `Canary-G3` once (`trigger_canary_g3_once`),
-  auto-resolve own submit-hold threads on `SUCCESS`, and wake the CL chat on completion. If
-  Canary-G3 fails, follow the triage procedure in `skia-canary-advisor`.
+  (`run_flutter_paragraph_tests.py --full`) instead. For non-paragraph Skia CLs that require
+  `Canary-G3`, `g3_canary.go:134` requires a Googler author or Googler `Code-Review+1` before
+  `Canary-G3` can start (report the deferred command if needed, without placing unresolved submit
+  holds).
 - **Internal Authors**: Suggest recommended canaries in chat; do not ask them in Gerrit comments.
 - **Background Watcher & Wakeup Protocol**: Immediately after triggering `git cl try`, launch
   `python3 ~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py watch --cl <N> --save-draft`
   in the background (`WaitMsBeforeAsync=500`, `NotificationTimeoutSeconds=5400`).
-  - **On Green `Canary-G3` (`SUCCESS`)**: `watch` automatically resolves **only**
-    `jlavrova@google.com`'s own `/PATCHSET_LEVEL` `Canary-G3` submit-hold thread (on the tested
-    `(CL, PS)` and verified unmerged stack ancestors whose `current_revision` matches the
-    cherry-picked patchset and keeps `jlavrova@google.com`'s `Code-Review+1`).
   - **On Red Canary (`UNRELATED_HEAD_BREAKAGE`)**: `watch --save-draft` automatically saves a
     sanitized Gerrit `/PATCHSET_LEVEL` draft (only when Canary is red; never when green) and wakes
     the chat.
@@ -196,13 +194,11 @@ named skill's `SKILL.md` was not read, when a report with a `Case 1-5` verdict l
 ## Review & VCS Guidelines (Strict Rules)
 1. **English-Only Review Surface**: All generated review comments, reassignment notes, and pushback messages must be strictly in English. Direct discussion with the user remains in Russian.
 2. **Never Auto-Publish or Resolve (Always Save Gerrit Drafts on the Parent CL)**: The agent must
-   NEVER publish review comments to Gerrit/GitHub or resolve threads automatically — **except**
-   `canary_advisor.py` (`watch` / `resolve-hold`) resolving `jlavrova@google.com`'s own
-   `/PATCHSET_LEVEL` `Canary-G3` submit-hold thread when `Canary-G3` finishes `SUCCESS`. For
-   targeted external Gerrit CL reviews (outside Dry Mode and Self-Review Mode), always save the
-   prepared English review comment (including the companion WIP CL link and patchset guide when a
-   companion CL is uploaded) as a `/PATCHSET_LEVEL` draft directly on the parent CL's current
-   patchset (`GET https://<host>/a/changes/<CL>/revisions/<PS>/drafts` followed by in-place
+   NEVER publish review comments to Gerrit/GitHub or resolve threads automatically. For targeted
+   external Gerrit CL reviews (outside Dry Mode and Self-Review Mode), always save the prepared
+   English review comment (including the companion WIP CL link and patchset guide when a companion
+   CL is uploaded) as a `/PATCHSET_LEVEL` draft directly on the parent CL's current patchset
+   (`GET https://<host>/a/changes/<CL>/revisions/<PS>/drafts` followed by in-place
    `PUT .../drafts/<existing_id>`, or `PUT .../drafts` only when no matching draft exists), and
    also present the draft in chat for the user to review and publish.
 3. **Gerrit Drafts & Thread Follow-ups**:
@@ -224,24 +220,10 @@ named skill's `SKILL.md` was not read, when a report with a `Case 1-5` verdict l
    implementation and measuring actual `dm` runtime, and never hold up approval asking to add doc
    comments to headers whose existing methods have no doc comments when the contract is already
    stated in the commit message.
-7. **External Author Canary-G3 Submit-Hold Protocol**: When approving an external author's Skia CL
-   that requires `Canary-G3` (`g3_canary.go:134`), do not draft a bare approval. Prepare the
-   `/PATCHSET_LEVEL` draft with `unresolved: True` containing the standard submit-hold text to prevent
-   premature submit while Canary-G3 (~55 min) runs:
-   > The change looks good to me (Code-Review+1). I leave this comment unresolved on purpose: it blocks
-   > the submit until the Canary-G3 try job passes. Canary-G3 builds and tests the google3 clients of
-   > Skia with this change. Skia starts it for an external author only after a Googler votes
-   > Code-Review+1, so I vote first and hold the submit with this comment. I will resolve it when
-   > Canary-G3 is green, or report the failure here. Please do not resolve or override it before that.
-   Once the user publishes `CR+1` with this hold comment, `canary_advisor.py watch` and
-   `cl_watcher.py` (`sync_external_canary_g3`) automatically detect it, trigger `Canary-G3` once
-   (`trigger_canary_g3_once`), auto-resolve `jlavrova@google.com`'s submit-hold thread on `SUCCESS`,
-   and wake the CL chat (never ask the user to notify you after publishing `CR+1`). If red, follow
-   the Canary-G3 triage procedure in `skia-canary-advisor`.
-8. **Daily Queue Summary Shows Open Issues Only**: In `run_queue_triage.py` summaries, never list or
+7. **Daily Queue Summary Shows Open Issues Only**: In `run_queue_triage.py` summaries, never list or
    mention GitHub issues that are already closed (including ones closed during the window or still
    receiving bot activity); report only open issues and the user's own open PRs.
-9. **Flight Deck Review Verdict & Triage Persistence (`triage_store.py`)**: At the end of every
+8. **Flight Deck Review Verdict & Triage Persistence (`triage_store.py`)**: At the end of every
    code review (interactive single-CL chat or batch workflow), save the finalized review outcome
    and 1-line finding summary for Flight Deck via:
    ```bash
@@ -259,11 +241,11 @@ named skill's `SKILL.md` was not read, when a report with a `Case 1-5` verdict l
    until the corpus passes, and reset to `pending` when a new patchset is uploaded. When running
    daily queue triage (`run_queue_triage.py`), save the pre-review audit via
    `triage_store.py save-audit --target <ID> --report-file <md>` (or `ingest-tmp`).
-10. **Explicit Per-Thread Verdict for Other Reviewers' Open Threads**: In daily queue summaries
-    (`run_queue_triage.py`) and review reports, never reduce an unresolved comment thread from
-    another reviewer (`### 🧵 Open threads`) to a one-line footnote without a verdict. Every
-    unresolved thread from another reviewer must get an explicit verdict: **`valid`** (defect or
-    concern still applies to the current patchset), **`already addressed in PS<n>`** citing the
-    exact `file:line` on the current patchset (especially when tagged `[STALE]` or
-    `[AUTHOR_REPLIED]`), or **`question for the user`** (policy/design call needing the user's
-    decision).
+9. **Explicit Per-Thread Verdict for Other Reviewers' Open Threads**: In daily queue summaries
+   (`run_queue_triage.py`) and review reports, never reduce an unresolved comment thread from
+   another reviewer (`### 🧵 Open threads`) to a one-line footnote without a verdict. Every
+   unresolved thread from another reviewer must get an explicit verdict: **`valid`** (defect or
+   concern still applies to the current patchset), **`already addressed in PS<n>`** citing the
+   exact `file:line` on the current patchset (especially when tagged `[STALE]` or
+   `[AUTHOR_REPLIED]`), or **`question for the user`** (policy/design call needing the user's
+   decision).
