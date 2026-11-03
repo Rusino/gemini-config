@@ -295,13 +295,19 @@ def clickable_links_reason(reply_text: str) -> str:
   if not unlinked:
     return ""
   shown = ", ".join(f"`{t}`" for t in unlinked[:8])
-  return (
+  # Jetski keeps the earlier step visible, so append a short postscript instead of duplicating
+  header = (
       "[CLICKABLE LINKS GUARD] Your reply contains unlinked entity or draft/patchset "
       f"mentions without a matching URL nearby: {shown}.\n"
-      "Rewrite your reply so EVERY mention of a Gerrit CL, patchset (`PS<N>`), "
-      "comment/draft (`xxxxxxxx_xxxxxxxx`), GitHub PR/issue, Buganizer/`crbug` issue, "
-      "or try job / build is a clickable Markdown link (`[label](https://...)`), e.g.:\n"
-      "- `[Gerrit 1414016 PS1](https://skia-review.googlesource.com/c/skia/+/1414016/1)` "
+      "Do NOT repeat or rewrite your earlier message (it is already rendered above in chat). "
+      "Append ONLY a compact 1-3 line links postscript (in the chat language, e.g. `**Links:**`) "
+      "with clickable Markdown links (`[label](https://...)`) for those mentions (or a 1-line "
+      "note if a token was an abstract placeholder with no concrete URL; if this turn recorded "
+      "`decision_guard` acks, retain their triage lines too), e.g.:\n"
+  )
+  return (
+      header
+      + "- `[Gerrit 1414016 PS1](https://skia-review.googlesource.com/c/skia/+/1414016/1)` "
       "(never `http://cl/<5-8 digits>`: `cl/` opens Google3 Piper, not Gerrit)\n"
       "- Published comment: "
       "`[comment](https://skia-review.googlesource.com/c/skia/+/1414016/comment/<id>/)`; "

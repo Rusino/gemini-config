@@ -148,6 +148,29 @@ class TestStopGuardClickableLinks(unittest.TestCase):
         out = self._run_reply(tmp_dir, reply, user_idx=100 * (i + 1))
         self.assertEqual(out, {}, f"Unexpected block ({out}) for: {reply}")
 
+  def test_delta_postscript_prompt_avoids_full_reply_duplication(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      out = self._run_reply(
+          tmp_dir,
+          "Подробный разбор: в Gerrit 1414016 на PS1 остался открытый вопрос.",
+          user_idx=500,
+      )
+      reason = out.get("reason", "")
+      self.assertEqual(out.get("decision"), "continue")
+      self.assertIn("`Gerrit 1414016`", reason)
+      self.assertIn("`PS1`", reason)
+      self.assertNotIn("Rewrite your reply", reason)
+      self.assertIn("Do NOT repeat or rewrite", reason)
+      self.assertIn("links postscript", reason)
+
+      # Verify a compact delta postscript on the next turn passes cleanly on its own
+      postscript = (
+          "**Ссылки к упоминаниям выше:** "
+          "[Gerrit 1414016 PS1](https://skia-review.googlesource.com/c/skia/+/1414016/1)"
+      )
+      out_delta = self._run_reply(tmp_dir, postscript, user_idx=600)
+      self.assertEqual(out_delta, {})
+
 
 if __name__ == "__main__":
   unittest.main()
