@@ -631,6 +631,10 @@
   const STEP0_BOOTSTRAP_STORAGE_KEY = 'jetski_step0_bootstrapped_models_v1';
   const DRAFT_MANUAL_PIN_TTL_MS = 30 * 60 * 1000;
   const MANUAL_MODEL_PINS_MAX_ENTRIES = 200;
+  // Morning reset fallback thresholds when quotaInfo.resetTime was unavailable at downgrade time
+  const MORNING_RESET_IDLE_MS = 6 * 60 * 60 * 1000;
+  const MORNING_RESET_QUOTA_FLOOR = 0.50;
+  const AUTOPILOT_ACTION_TOAST_MS = 9000;
   let autopilotToastTimer = 0;
   // Remembers conversations and project drafts where the user manually picked a model
   const manualPickedModels = (window.__jetskiManualPickedModels ||= new Map());
@@ -2806,12 +2810,27 @@
               deleteManualPin(pinKey);
               autoSeededTargets.delete(pinKey);
             }
-            const pin = getManualPinEntry(pinKey);
+            const convProfile = resolveProjectProfileForConversation(reduxStore, rawCid);
+            let pin = getManualPinEntry(pinKey);
+            let expiredJuniorEnum = 0;
+            // Drop expired evening downgrade pins before outgoing SendUserCascadeMessage requests
+            if (
+              pin &&
+              !pinKey.startsWith('__draft__:') &&
+              !url.includes('/StartCascade') &&
+              isTemporaryPinExpired(pin, catalog, convProfile, Date.now())
+            ) {
+              expiredJuniorEnum = pin.model;
+              deleteManualPin(pinKey);
+              pin = null;
+            }
             const isPinned = Boolean(
               entry?.enumVal && pin && pin.model === entry.enumVal
             );
             let replacement = null;
             let reason = '';
+            // Distinguishes morning primary-model restoration from quota-exhaustion failovers
+            let isQuotaRestore = false;
             const isForbiddenBon = isForbiddenBonModel(
               entry?.modelId || String(planModel),
               planModel
@@ -2822,15 +2841,12 @@
             }
             // Substitute Auto sentinel or forbidden BoN model with the project profile model
             if (isAutopilotSentinel || isForbiddenBon) {
-              const profile =
-                resolveProjectProfileForConversation(reduxStore, body.cascadeId) ||
-                'orchestrator';
+              // Reuse resolved conversation profile so draft/route fallback runs once per request
+              const profile = convProfile || 'orchestrator';
               replacement = resolveAutopilotModelForProfile(catalog, profile);
               reason = isForbiddenBon ? 'BoN disabled' : `${profile} profile`;
             } else if (entry && entry.quota < (isPinned ? EMERGENCY_PIN_FLOOR : QUOTA_HARD_FLOOR)) {
-              const profile =
-                resolveProjectProfileForConversation(reduxStore, body.cascadeId) ||
-                'orchestrator';
+              const profile = convProfile || 'orchestrator';
               replacement = resolveAutopilotModelForProfile(catalog, profile);
               reason = `${Math.round(entry.quota * 100)}% quota`;
             } else if (!isPinned) {
@@ -2838,6 +2854,24 @@
               if (shielded) {
                 replacement = shielded;
                 reason = 'WTU shield';
+              } else if (
+                !url.includes('/StartCascade') &&
+                !needsStep0ContribBypass(reduxStore, rawCid)
+              ) {
+                // Skip StartCascade so long-typed drafts keep their active composer planModel
+                const recovered = resolveProfileQuotaRecovery(
+                  catalog,
+                  convProfile,
+                  entry?.modelId,
+                  entry?.enumVal || planModel,
+                  entry?.label,
+                  expiredJuniorEnum
+                );
+                if (recovered) {
+                  replacement = recovered.replacement;
+                  reason = recovered.reason;
+                  isQuotaRestore = recovered.isQuotaRestore;
+                }
               }
             }
             // Bypass step-0 model_router_plan crash while preserving target model for turn 2+
@@ -2850,8 +2884,7 @@
               isStep0BrokenContribModel(candidateId, candidateEnum) &&
               (url.includes('/StartCascade') || needsStep0ContribBypass(reduxStore, rawCid))
             ) {
-              const profile =
-                resolveProjectProfileForConversation(reduxStore, rawCid) || 'orchestrator';
+              const profile = convProfile || 'orchestrator';
               const safeStep0 = resolveStep0SafeModel(
                 catalog,
                 profile,
@@ -2861,6 +2894,8 @@
                 replacement = safeStep0;
                 reason = reason ? `${reason}, step-0 safe bootstrap` : 'step-0 safe bootstrap';
                 isStep0Bootstrap = true;
+                // Step-0 bootstrap is a temporary router workaround, not a morning quota restore
+                isQuotaRestore = false;
               }
             }
             // Promote draft manual pin to the new cascadeId on StartCascade and free the draft slot
@@ -2870,7 +2905,17 @@
                 const nextPinModel = isStep0Bootstrap
                   ? candidateEnum
                   : replacement?.enumVal || pin.model;
-                setManualPin(body.cascadeId, nextPinModel, 1);
+                // Carry permanent/until-reset metadata from the draft pin only when model matches
+                const keepMeta =
+                  nextPinModel === pin.model
+                    ? {
+                        permanent: pin.permanent,
+                        resetAtMs: pin.resetAtMs,
+                        baselineModel: pin.baselineModel,
+                        updatedAt: pin.updatedAt,
+                      }
+                    : null;
+                setManualPin(body.cascadeId, nextPinModel, 1, keepMeta);
               }
               deleteManualPin(pinKey);
               autoSeededTargets.delete(pinKey);
@@ -2900,11 +2945,25 @@
                       : planModel);
               body.cascadeConfig.plannerConfig.planModel = nextPlanModel;
               nextInit = { ...init, body: JSON.stringify(body) };
-              showAutopilotToast(
-                entry?.label || String(planModel),
-                replacement.label,
-                reason
-              );
+              // Sync Redux dropdown and offer [Keep <Junior>] when restoring after quota reset
+              if (isQuotaRestore && rawCid) {
+                dispatchInternalModelPick(reduxStore, rawCid, replacement.enumVal);
+                const juniorEnum =
+                  expiredJuniorEnum || entry?.enumVal || resolveModelEnumValue(String(planModel));
+                showMorningQuotaRestoredToast(
+                  reduxStore,
+                  rawCid,
+                  juniorEnum,
+                  entry?.label || CURATED_ENUM_LABELS.get(juniorEnum) || String(planModel),
+                  replacement.label
+                );
+              } else {
+                showAutopilotToast(
+                  entry?.label || String(planModel),
+                  replacement.label,
+                  reason
+                );
+              }
             }
           }
         } catch {
@@ -3150,12 +3209,15 @@
         const curated = CURATED_HIDDEN_MODEL_MAP.get(mid);
         const label = curated?.label || det.displayName || humanizeModelId(mid);
         const quota = getEffectiveQuotaFraction(det.quotaInfo, curated?.tag || '', '');
+        // Capture server quota reset timestamp so evening downgrades expire right after reset
+        const resetMs = parseQuotaResetMs(det.quotaInfo?.resetTime);
         addEntry({
           modelId: mid,
           enumVal,
           enumName: det.model || '',
           label,
           quota,
+          resetMs,
         });
       }
     }
@@ -3172,6 +3234,8 @@
         const label = cfg.label || mid;
         const quota = getEffectiveQuotaFraction(cfg.quotaInfo, cfg.tagTitle, cfg.tagDescription);
         const prev = (mid && byId.get(mid.toLowerCase())) || (enumVal && byEnum.get(enumVal));
+        // Fall back to GetAvailableModels resetMs when clientModelConfigs omits resetTime
+        const resetMs = parseQuotaResetMs(cfg.quotaInfo?.resetTime) || prev?.resetMs || 0;
         const entry = {
           modelId: mid || prev?.modelId || '',
           enumVal: enumVal || prev?.enumVal || 0,
@@ -3179,6 +3243,7 @@
             prev?.enumName || (enumVal >= 1000 ? `MODEL_PLACEHOLDER_M${enumVal - 1000}` : ''),
           label,
           quota,
+          resetMs,
         };
         addEntry(entry);
       }
@@ -3265,6 +3330,128 @@
     }
 
     return catalog.byId.get('auto') || catalog.byEnum.values().next().value || null;
+  }
+
+  // Ranks model capability/cost (1 = strongest, 7 = lightest) to separate upgrades from downgrades
+  function getModelCapabilityTier(modelId, enumVal, label) {
+    const mid = String(modelId || '').trim().toLowerCase();
+    const num =
+      typeof enumVal === 'number' ? enumVal : resolveModelEnumValue(String(enumVal || ''));
+    const lbl = String(label || CURATED_ENUM_LABELS.get(num) || '').toLowerCase();
+    // Opus 5.5 Max and High sit above Medium even though dropdown order puts Max at index 3
+    if (mid === 'opus-5.5-max' || num === 1371 || lbl.includes('opus 5.5 (max)')) return 1;
+    if (mid === 'opus-5.5-high' || num === 1370 || lbl.includes('opus 5.5 (high)')) return 2;
+    if (
+      mid.includes('opus-5.5') ||
+      num === 1367 ||
+      num === 1369 ||
+      lbl.includes('opus 5.5') ||
+      mid.startsWith('fable-5.1') ||
+      (num >= 1386 && num <= 1388)
+    ) {
+      return 3;
+    }
+    if (
+      mid.includes('carbon') ||
+      mid.startsWith('gemini-launch-candidate') ||
+      num === 1427 ||
+      num === 1393 ||
+      lbl.includes('carbon') ||
+      lbl.includes('argon')
+    ) {
+      return 4;
+    }
+    if (
+      (mid.includes('flash') && mid.includes('lite')) ||
+      lbl.includes('flash lite') ||
+      mid === 'gemini-2.5-flash' ||
+      num === 312
+    ) {
+      return 7;
+    }
+    if (mid.includes('flash') || lbl.includes('flash') || num === 1422) return 6;
+    return 5;
+  }
+
+  // Ranks preference within a project profile (0 = primary default tier, >0 = fallback tier)
+  function getProfilePreferenceRank(profileName, modelId, enumVal, label) {
+    const p = String(profileName || 'orchestrator')
+      .trim()
+      .toLowerCase()
+      .replace(/^profile:/, '');
+    const mid = String(modelId || '').trim().toLowerCase();
+    const num =
+      typeof enumVal === 'number' ? enumVal : resolveModelEnumValue(String(enumVal || ''));
+    const tier = getModelCapabilityTier(mid, num, label);
+    if (p === 'cpp-core') {
+      // Treat all non-Fable Opus 5.5 variants as primary tier so High/Max never downgrade to Medium
+      const isFable = mid.startsWith('fable-5.1') || (num >= 1386 && num <= 1388);
+      if (tier <= 3 && !isFable) return 0;
+      if (mid.includes('carbon') || num === 1427) return 1;
+      if (mid.startsWith('gemini-launch-candidate') || num === 1393) return 2;
+      if (mid === 'gemini-pro-coordinator' || num === 1415) return 3;
+      if (mid === 'auto' || num === 1260) return 4;
+      if (mid === 'gemini-3.1-pro-high') return 5;
+      if (tier <= 5) return 6;
+      return 10;
+    }
+    if (p === 'triage') {
+      // Unpinned heavyweight models leaked from a draft rank below triage Flash defaults
+      if (tier >= 6) return 0;
+      if (tier === 5) return 1;
+      return 2;
+    }
+    if (mid === 'gemini-pro-coordinator' || num === 1415) return 0;
+    if (mid === 'auto' || num === 1260) return 1;
+    if (tier === 5) return 2;
+    // Manual upgrades carry isPinned=true; unpinned tier<=4 models leaked from default.model
+    if (tier <= 4) return 3;
+    return 5;
+  }
+
+  // Returns the nominal primary catalog entry for a project profile regardless of current quota
+  function resolveNominalProfileModel(catalog, profileName) {
+    if (!catalog || !profileName) return null;
+    const p = String(profileName)
+      .trim()
+      .toLowerCase()
+      .replace(/^profile:/, '');
+    const chain = WEB_MODEL_PROFILES[p] || WEB_MODEL_PROFILES.orchestrator;
+    for (const mid of chain) {
+      const hit = catalog.byId.get(mid);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  // Recovers unpinned or reset-expired chats when a higher-preference profile model has >= 30%
+  function resolveProfileQuotaRecovery(
+    catalog,
+    profile,
+    curModelId,
+    curEnumVal,
+    curLabel,
+    expiredJuniorEnum
+  ) {
+    if (!availableModelsCache || !profile) return null;
+    const best = resolveAutopilotModelForProfile(catalog, profile);
+    const curNum =
+      typeof curEnumVal === 'number'
+        ? curEnumVal
+        : resolveModelEnumValue(String(curEnumVal || ''));
+    if (!best || !best.enumVal || best.enumVal === curNum || best.quota < QUOTA_SOFT_FLOOR) {
+      return null;
+    }
+    const bestRank = getProfilePreferenceRank(profile, best.modelId, best.enumVal, best.label);
+    const curRank = getProfilePreferenceRank(profile, curModelId, curNum || curEnumVal, curLabel);
+    if (!expiredJuniorEnum && bestRank >= curRank) return null;
+    const bestTier = getModelCapabilityTier(best.modelId, best.enumVal, best.label);
+    const curTier = getModelCapabilityTier(curModelId, curNum || curEnumVal, curLabel);
+    return {
+      replacement: best,
+      reason: `${profile} profile`,
+      isQuotaRestore: Boolean(expiredJuniorEnum || (bestRank <= 0 && bestTier < curTier)),
+    };
   }
 
   // Resolves a step-0-safe replacement model from the same quota bucket as the broken router model
@@ -3383,10 +3570,31 @@
           typeof v === 'object' && v && Number.isFinite(Number(v.updatedAt))
             ? Number(v.updatedAt)
             : now;
+        // Unsent draft picks always expire after 30m even when upgraded so drafts never get stuck
         if (k.startsWith('__draft__:') && now - updatedAt > DRAFT_MANUAL_PIN_TTL_MS) {
           continue;
         }
-        manualPickedModels.set(k, { model, atStep, updatedAt });
+        // Hydrate per-chat permanent vs temporary until-reset metadata alongside model and step
+        const permanent =
+          typeof v === 'object' && v && typeof v.permanent === 'boolean'
+            ? v.permanent
+            : undefined;
+        const resetAtMs =
+          typeof v === 'object' && v && Number.isFinite(Number(v.resetAtMs))
+            ? Math.max(0, Number(v.resetAtMs))
+            : 0;
+        const baselineModel =
+          typeof v === 'object' && v && Number.isFinite(Number(v.baselineModel))
+            ? Math.max(0, Number(v.baselineModel))
+            : 0;
+        manualPickedModels.set(k, {
+          model,
+          atStep,
+          updatedAt,
+          permanent,
+          resetAtMs,
+          baselineModel,
+        });
       }
     } catch {
       // Ignore malformed localStorage state
@@ -3415,7 +3623,22 @@
           manualPickedModels.delete(k);
           continue;
         }
-        entries.push([k, { model, atStep, updatedAt }]);
+        // Persist permanent/until-reset fields so morning expiry survives browser restarts
+        const saved = { model, atStep, updatedAt };
+        if (typeof v === 'object' && typeof v.permanent === 'boolean') {
+          saved.permanent = v.permanent;
+        }
+        if (typeof v === 'object' && Number.isFinite(Number(v.resetAtMs)) && v.resetAtMs > 0) {
+          saved.resetAtMs = Number(v.resetAtMs);
+        }
+        if (
+          typeof v === 'object' &&
+          Number.isFinite(Number(v.baselineModel)) &&
+          v.baselineModel > 0
+        ) {
+          saved.baselineModel = Number(v.baselineModel);
+        }
+        entries.push([k, saved]);
       }
       const trimmed = entries.slice(-MANUAL_MODEL_PINS_MAX_ENTRIES);
       const out = {};
@@ -3431,6 +3654,7 @@
     const raw = manualPickedModels.get(key);
     if (!raw) return null;
     const now = Date.now();
+    // Normalize legacy numeric entries and structured per-chat pin metadata into one shape
     const entry =
       typeof raw === 'number'
         ? { model: raw, atStep: 0, updatedAt: now }
@@ -3438,6 +3662,13 @@
             model: Number(raw.model),
             atStep: Math.max(0, Number(raw.atStep || 0)),
             updatedAt: Number.isFinite(Number(raw.updatedAt)) ? Number(raw.updatedAt) : now,
+            permanent: typeof raw.permanent === 'boolean' ? raw.permanent : undefined,
+            resetAtMs: Number.isFinite(Number(raw.resetAtMs))
+              ? Math.max(0, Number(raw.resetAtMs))
+              : 0,
+            baselineModel: Number.isFinite(Number(raw.baselineModel))
+              ? Math.max(0, Number(raw.baselineModel))
+              : 0,
           };
     if (
       isForbiddenBonModel('', entry.model) ||
@@ -3450,12 +3681,45 @@
     return entry;
   }
 
-  function setManualPin(key, modelEnum, atStep = 0) {
+  // Writes or advances a per-chat manual pin while preserving permanent/reset metadata across turns
+  function setManualPin(key, modelEnum, atStep = 0, options = null) {
     if (!key || !modelEnum || isForbiddenBonModel('', modelEnum)) return;
+    // Inherit permanent/resetAtMs when trajectoryModelObserved advances atStep on the same pin
+    const numModel = Number(modelEnum);
+    const prev = manualPickedModels.get(key);
+    const sameModel = Boolean(prev && typeof prev === 'object' && Number(prev.model) === numModel);
+    const updatedAt =
+      options && Number.isFinite(Number(options.updatedAt))
+        ? Number(options.updatedAt)
+        : !options && sameModel && Number.isFinite(Number(prev.updatedAt))
+        ? Number(prev.updatedAt)
+        : Date.now();
+    const permanent =
+      options && typeof options.permanent === 'boolean'
+        ? options.permanent
+        : !options && sameModel
+        ? prev.permanent
+        : undefined;
+    const resetAtMs =
+      options && Number.isFinite(Number(options.resetAtMs))
+        ? Math.max(0, Number(options.resetAtMs))
+        : !options && sameModel && Number.isFinite(Number(prev.resetAtMs))
+        ? Math.max(0, Number(prev.resetAtMs))
+        : 0;
+    const baselineModel =
+      options && Number.isFinite(Number(options.baselineModel))
+        ? Math.max(0, Number(options.baselineModel))
+        : !options && sameModel && Number.isFinite(Number(prev.baselineModel))
+        ? Math.max(0, Number(prev.baselineModel))
+        : 0;
+    // Store normalized pin fields under the conversation or draft key
     manualPickedModels.set(key, {
-      model: Number(modelEnum),
+      model: numModel,
       atStep: Math.max(0, Number(atStep || 0)),
-      updatedAt: Date.now(),
+      updatedAt,
+      permanent,
+      resetAtMs,
+      baselineModel,
     });
     saveManualModelPins();
   }
@@ -3465,6 +3729,31 @@
     if (manualPickedModels.delete(key)) {
       saveManualModelPins();
     }
+  }
+
+  // Checks if a temporary evening downgrade pin passed quota reset and healthy primary recovery
+  function isTemporaryPinExpired(pin, catalog, profile, nowMs) {
+    if (!pin || pin.permanent === true || !profile || !availableModelsCache) return false;
+    const nominal = resolveNominalProfileModel(catalog, profile);
+    if (!nominal) return false;
+    const pinEntry = catalog.byEnum.get(pin.model);
+    // Legacy pins without explicit permanent=false only expire if weaker than nominal default
+    if (pin.permanent === undefined) {
+      const pinTier = getModelCapabilityTier(pinEntry?.modelId, pin.model, pinEntry?.label);
+      const nomTier = getModelCapabilityTier(nominal.modelId, nominal.enumVal, nominal.label);
+      if (pinTier <= nomTier || pin.model === nominal.enumVal) return false;
+    }
+    const best = resolveAutopilotModelForProfile(catalog, profile);
+    if (!best || best.enumVal === pin.model || best.quota < QUOTA_SOFT_FLOOR) return false;
+    const now = typeof nowMs === 'number' ? nowMs : Date.now();
+    if (pin.resetAtMs > 0) {
+      return now >= pin.resetAtMs;
+    }
+    // Fall back to a 6h overnight gap + >=50% primary quota when resetTime was missing
+    return (
+      now - pin.updatedAt >= MORNING_RESET_IDLE_MS &&
+      nominal.quota >= MORNING_RESET_QUOTA_FLOOR
+    );
   }
 
   // Hydrates step-0 bootstrap mappings so unpinned router chats still restore on F5 reload
@@ -3543,8 +3832,16 @@
   loadManualModelPins();
   loadStep0BootstrappedModels();
 
-  // Shows a transient floating notification toast when autopilot fails over a model
-  function showAutopilotToast(oldLabel, newLabel, reason) {
+  // Mounts a floating autopilot toast with an optional interactive per-chat action button
+  function showCustomAutopilotToast({
+    fromLabel = '',
+    toLabel = '',
+    text = '',
+    durationMs = 4500,
+    actionLabel = '',
+    actionId = '',
+    onAction = null,
+  }) {
     if (disposed || typeof document?.createElement !== 'function') return;
     let toast = document.getElementById(AUTOPILOT_TOAST_ID);
     if (!toast) {
@@ -3554,10 +3851,34 @@
       toast.className = 'jetski-autopilot-toast';
       document.body?.appendChild(toast);
     }
-    setAttrIfChanged(toast, 'data-from-model', String(oldLabel || ''));
-    setAttrIfChanged(toast, 'data-to-model', String(newLabel || ''));
-    const reasonText = reason ? ` (${reason})` : '';
-    toast.textContent = `⚡ Autopilot: switched model from ${oldLabel} to ${newLabel}${reasonText}`;
+    // Render an inline clickable button only when an undo/pin callback is supplied
+    setAttrIfChanged(toast, 'data-from-model', String(fromLabel));
+    setAttrIfChanged(toast, 'data-to-model', String(toLabel));
+    if (typeof onAction === 'function' && actionLabel) {
+      setAttrIfChanged(toast, 'data-interactive', 'true');
+      toast.textContent = '';
+      const msgSpan = document.createElement('span');
+      msgSpan.textContent = text;
+      const sepSpan = document.createElement('span');
+      sepSpan.textContent = ' · ';
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'jetski-autopilot-toast-btn';
+      btn.setAttribute('data-testid', 'jetski-autopilot-toast-action');
+      if (actionId) btn.setAttribute('data-action', actionId);
+      btn.textContent = actionLabel;
+      btn.addEventListener('click', (evt) => {
+        evt.preventDefault();
+        evt.stopPropagation();
+        onAction();
+      });
+      toast.appendChild(msgSpan);
+      toast.appendChild(sepSpan);
+      toast.appendChild(btn);
+    } else {
+      toast.removeAttribute('data-interactive');
+      toast.textContent = text;
+    }
     if (autopilotToastTimer) {
       clearTimeout(autopilotToastTimer);
       autopilotToastTimer = 0;
@@ -3565,7 +3886,74 @@
     autopilotToastTimer = setTimeout(() => {
       autopilotToastTimer = 0;
       toast?.remove();
-    }, 4500);
+    }, durationMs);
+  }
+
+  // Shows a transient floating notification toast when autopilot fails over a model
+  function showAutopilotToast(oldLabel, newLabel, reason) {
+    const reasonText = reason ? ` (${reason})` : '';
+    showCustomAutopilotToast({
+      fromLabel: oldLabel,
+      toLabel: newLabel,
+      text: `⚡ Autopilot: switched model from ${oldLabel} to ${newLabel}${reasonText}`,
+      durationMs: 4500,
+    });
+  }
+
+  // Dispatches a programmatic model pick in Redux without triggering the manual-pin listener
+  function dispatchInternalModelPick(store, conversationId, modelEnum) {
+    if (!store || !modelEnum) return;
+    isInternalDispatch = true;
+    try {
+      store.dispatch({
+        type: 'modelSelection/modelPicked',
+        payload: {
+          conversationId: conversationId || undefined,
+          model: modelEnum,
+          ...(conversationId ? { pick: { atStep: 999999, queuedMessageIds: [] } } : {}),
+        },
+      });
+    } finally {
+      isInternalDispatch = false;
+    }
+  }
+
+  // Re-applies a junior model with permanent=true on a single conversation after morning undo
+  function applyKeepJuniorRevert(store, cascadeId, juniorEnum, juniorLabel) {
+    if (!store || !cascadeId || !juniorEnum) return;
+    const stepCount = Number(
+      store.getState()?.trajectorySummaries?.summaries?.[cascadeId]?.stepCount ?? 0
+    );
+    setManualPin(cascadeId, juniorEnum, stepCount, {
+      permanent: true,
+      resetAtMs: 0,
+      baselineModel: 0,
+    });
+    dispatchInternalModelPick(store, cascadeId, juniorEnum);
+    showCustomAutopilotToast({
+      fromLabel: '',
+      toLabel: juniorLabel,
+      text: `📌 Kept ${juniorLabel} for this chat`,
+      durationMs: 2500,
+    });
+  }
+
+  // Shows morning quota-restoration toast with a one-click [Keep <Junior>] per-chat override
+  function showMorningQuotaRestoredToast(store, cascadeId, juniorEnum, juniorLabel, defaultLabel) {
+    const cleanJunior = juniorLabel || CURATED_ENUM_LABELS.get(juniorEnum) || String(juniorEnum);
+    showCustomAutopilotToast({
+      fromLabel: cleanJunior,
+      toLabel: defaultLabel,
+      text: `☀️ Quota restored: switched back to ${defaultLabel}`,
+      durationMs: AUTOPILOT_ACTION_TOAST_MS,
+      actionLabel: `Keep ${cleanJunior}`,
+      actionId: 'keep-junior',
+      onAction: () => {
+        if (cascadeId) {
+          applyKeepJuniorRevert(store, cascadeId, juniorEnum, cleanJunior);
+        }
+      },
+    });
   }
 
   // Synchronizes project profile defaults on drafts and fails over exhausted models in Redux
@@ -3621,35 +4009,42 @@
         }
         deleteManualPin(targetKey);
       }
-      if (!profile) return;
-      const best = resolveAutopilotModelForProfile(catalog, profile);
+      // Fall back to orchestrator on unassigned drafts so prior project draft picks never stick
+      const effectiveProfile = profile || 'orchestrator';
+      const best = resolveAutopilotModelForProfile(catalog, effectiveProfile);
       if (!best || !best.enumVal) return;
-      const seedSig = `${profile}:${best.enumVal}`;
+      const seedSig = `${effectiveProfile}:${best.enumVal}`;
       if (curModel === best.enumVal && autoSeededTargets.get(targetKey) === seedSig) {
         return;
       }
       autoSeededTargets.set(targetKey, seedSig);
-      isInternalDispatch = true;
-      try {
-        store.dispatch({
-          type: 'modelSelection/modelPicked',
-          payload: {
-            conversationId: cascadeId || undefined,
-            model: best.enumVal,
-            ...(cascadeId ? { pick: { atStep: 999999, queuedMessageIds: [] } } : {}),
-          },
-        });
-      } finally {
-        isInternalDispatch = false;
-      }
+      dispatchInternalModelPick(store, cascadeId, best.enumVal);
       return;
     }
 
-    // Look up persisted manual pin for existing conversation before evaluating quota or WTU shield
-    const pin = getManualPinEntry(cascadeId);
-    let curModel =
-      state.modelSelection.byConversation?.[cascadeId]?.model ??
-      state.modelSelection.default?.model;
+    // Expire temporary evening downgrade pins once quota resets so chats recover in the morning
+    let pin = getManualPinEntry(cascadeId);
+    let expiredJuniorEnum = 0;
+    if (pin && isTemporaryPinExpired(pin, catalog, profile, Date.now())) {
+      expiredJuniorEnum = pin.model;
+      deleteManualPin(cascadeId);
+      pin = null;
+    }
+    const convModel = state.modelSelection.byConversation?.[cascadeId]?.model;
+    // Seed unpinned chats that lack byConversation directly so draft default.model cannot leak
+    if (
+      convModel === undefined &&
+      !pin &&
+      !expiredJuniorEnum &&
+      !(step0BootstrappedModels.has(cascadeId) && needsStep0ContribBypass(store, cascadeId))
+    ) {
+      const seeded = resolveAutopilotModelForProfile(catalog, profile || 'orchestrator');
+      if (seeded && seeded.enumVal) {
+        dispatchInternalModelPick(store, cascadeId, seeded.enumVal);
+        return;
+      }
+    }
+    let curModel = convModel ?? (expiredJuniorEnum || state.modelSelection.default?.model);
     // Restore persisted manual pick after F5 reload when no newer turn has executed since the pick
     if (pin && pin.model && stepCount <= pin.atStep && curModel !== pin.model) {
       const pinEntry = catalog.byEnum.get(pin.model);
@@ -3678,6 +4073,8 @@
 
     let replacement = null;
     let reason = '';
+    // Tracks morning quota recovery so the toast offers a one-click [Keep <Junior>] revert
+    let isQuotaRestore = false;
     if (isForbiddenBon) {
       deleteManualPin(cascadeId);
       replacement = resolveAutopilotModelForProfile(
@@ -3696,28 +4093,51 @@
       if (shielded) {
         replacement = shielded;
         reason = 'WTU shield';
+      } else if (
+        !(step0BootstrappedModels.has(cascadeId) && needsStep0ContribBypass(store, cascadeId))
+      ) {
+        // Recover unpinned or reset-expired chats when a higher-preference profile model >= 30%
+        const recovered = resolveProfileQuotaRecovery(
+          catalog,
+          profile,
+          curEntry?.modelId,
+          curModel,
+          curEntry?.label,
+          expiredJuniorEnum
+        );
+        if (recovered) {
+          replacement = recovered.replacement;
+          reason = recovered.reason;
+          isQuotaRestore = recovered.isQuotaRestore;
+        }
       }
     }
 
-    if (replacement && replacement.enumVal && replacement.enumVal !== curModel) {
-      isInternalDispatch = true;
-      try {
-        store.dispatch({
-          type: 'modelSelection/modelPicked',
-          payload: {
-            conversationId: cascadeId,
-            model: replacement.enumVal,
-            pick: { atStep: 999999, queuedMessageIds: [] },
-          },
-        });
-      } finally {
-        isInternalDispatch = false;
+    // Populate byConversation explicitly when an expired pin had no per-chat Redux entry yet
+    if (
+      replacement &&
+      replacement.enumVal &&
+      (replacement.enumVal !== curModel || (expiredJuniorEnum && convModel === undefined))
+    ) {
+      dispatchInternalModelPick(store, cascadeId, replacement.enumVal);
+      // Show interactive morning restoration toast instead of generic failover toast on recovery
+      if (isQuotaRestore) {
+        const juniorEnum = expiredJuniorEnum || curModel;
+        const juniorEntry = catalog.byEnum.get(juniorEnum);
+        showMorningQuotaRestoredToast(
+          store,
+          cascadeId,
+          juniorEnum,
+          juniorEntry?.label || CURATED_ENUM_LABELS.get(juniorEnum) || String(juniorEnum),
+          replacement.label
+        );
+      } else {
+        showAutopilotToast(
+          curEntry?.label || String(curModel),
+          replacement.label,
+          reason
+        );
       }
-      showAutopilotToast(
-        curEntry?.label || String(curModel),
-        replacement.label,
-        reason
-      );
     }
   }
 
@@ -4281,7 +4701,23 @@
           const rescue = resolveAutopilotModelForProfile(catalog, profile);
           if (rescue && rescue.enumVal && rescue.enumVal !== pickedModel) {
             if (!isForbiddenBon) {
-              setManualPin(pinKey, rescue.enumVal, stepCount);
+              // Classify emergency rescue pins as temporary when weaker than nominal default
+              const nominal = resolveNominalProfileModel(catalog, profile);
+              const rescueTier = getModelCapabilityTier(
+                rescue.modelId,
+                rescue.enumVal,
+                rescue.label
+              );
+              const nomTier = nominal
+                ? getModelCapabilityTier(nominal.modelId, nominal.enumVal, nominal.label)
+                : rescueTier;
+              const isPerm =
+                !nominal || rescueTier <= nomTier || rescue.enumVal === nominal.enumVal;
+              setManualPin(pinKey, rescue.enumVal, stepCount, {
+                permanent: isPerm,
+                resetAtMs: !isPerm && nominal?.resetMs > Date.now() ? nominal.resetMs : 0,
+                baselineModel: !isPerm && nominal ? nominal.enumVal : 0,
+              });
             } else {
               deleteManualPin(pinKey);
             }
@@ -4297,7 +4733,73 @@
           }
         }
         if (pickedModel && !isForbiddenBon) {
-          setManualPin(pinKey, pickedModel, stepCount);
+          const targetCid = rawCid || activeCid;
+          const profile = resolveProjectProfileForConversation(store, targetCid);
+          const nominal = profile ? resolveNominalProfileModel(catalog, profile) : null;
+          const pickedTier = getModelCapabilityTier(entry?.modelId, pickedModel, entry?.label);
+          const nominalTier = nominal
+            ? getModelCapabilityTier(nominal.modelId, nominal.enumVal, nominal.label)
+            : pickedTier;
+          // Per-chat scope: manual upgrades stick permanently; junior downgrades reset next morning
+          const isPermanentUpgrade =
+            !profile ||
+            !nominal ||
+            pickedModel === nominal.enumVal ||
+            pickedTier <= nominalTier;
+          if (isPermanentUpgrade) {
+            setManualPin(pinKey, pickedModel, stepCount, {
+              permanent: true,
+              resetAtMs: 0,
+              baselineModel: 0,
+            });
+          } else {
+            const now = Date.now();
+            const resetAtMs = nominal.resetMs > now ? nominal.resetMs : 0;
+            setManualPin(pinKey, pickedModel, stepCount, {
+              permanent: false,
+              resetAtMs,
+              baselineModel: nominal.enumVal,
+            });
+            const pickedLabel =
+              entry?.label || CURATED_ENUM_LABELS.get(pickedModel) || String(pickedModel);
+            showCustomAutopilotToast({
+              fromLabel: nominal.label,
+              toLabel: pickedLabel,
+              text: `🌙 Switched to ${pickedLabel} until quota reset`,
+              durationMs: 8000,
+              actionLabel: '📌 Keep forever',
+              actionId: 'keep-forever',
+              onAction: () => {
+                // Resolve live key in case a draft pick was already seeded into a conversation
+                const seededCid =
+                  store.getState()?.conversation?.cascadeId ||
+                  store.getState()?.conversation?.convoState?.cascadeId ||
+                  '';
+                const liveKey = manualPickedModels.has(pinKey)
+                  ? pinKey
+                  : seededCid && manualPickedModels.has(seededCid)
+                  ? seededCid
+                  : pinKey;
+                const liveStep = liveKey.startsWith('__draft__:')
+                  ? 0
+                  : Number(
+                      store.getState()?.trajectorySummaries?.summaries?.[liveKey]?.stepCount ??
+                        stepCount
+                    );
+                setManualPin(liveKey, pickedModel, liveStep, {
+                  permanent: true,
+                  resetAtMs: 0,
+                  baselineModel: 0,
+                });
+                showCustomAutopilotToast({
+                  fromLabel: '',
+                  toLabel: pickedLabel,
+                  text: `📌 Pinned ${pickedLabel} for this chat`,
+                  durationMs: 2500,
+                });
+              },
+            });
+          }
         }
       }
       // Transfer a project draft manual pick to the newly seeded conversation and free the draft slot
@@ -4310,7 +4812,13 @@
         const draftKey = resolveDraftPinKey(store, '');
         const draftPin = getManualPinEntry(draftKey);
         if (draftPin && draftPin.model) {
-          setManualPin(action.payload.conversationId, draftPin.model, 1);
+          // Carry permanent/until-reset fields onto the newly seeded conversation ID only
+          setManualPin(action.payload.conversationId, draftPin.model, 1, {
+            permanent: draftPin.permanent,
+            resetAtMs: draftPin.resetAtMs,
+            baselineModel: draftPin.baselineModel,
+            updatedAt: draftPin.updatedAt,
+          });
           deleteManualPin(draftKey);
         }
         // Clear cached draft seed signature so the next new draft evaluates fresh autopilot state
@@ -4368,26 +4876,22 @@
           // Clear bootstrap state once turn 2+ runs on a non-bootstrap model
           deleteStep0Bootstrap(cid);
         }
-        const pin = cid ? getManualPinEntry(cid) : null;
+        // Expire temporary evening downgrade pins before trajectoryModelObserved F5 replay checks
+        const convProfile = resolveProjectProfileForConversation(store, cid);
+        let pin = cid ? getManualPinEntry(cid) : null;
+        let expiredJuniorEnum = 0;
+        if (pin && cid && isTemporaryPinExpired(pin, catalog, convProfile, Date.now())) {
+          expiredJuniorEnum = pin.model;
+          deleteManualPin(cid);
+          pin = null;
+        }
         // Preserve manual pick across F5 reload when trajectoryModelObserved replays an older turn
         if (pin && pin.model && (stepCount <= pin.atStep || execStep <= pin.atStep)) {
           const pinEntry = catalog.byEnum.get(pin.model);
           // Keep user's manual pick while catalog hydrates or as long as its quota is >= 5%
           if (!pinEntry || pinEntry.quota >= EMERGENCY_PIN_FLOOR) {
             if (obsModel !== pin.model && cid) {
-              isInternalDispatch = true;
-              try {
-                store.dispatch({
-                  type: 'modelSelection/modelPicked',
-                  payload: {
-                    conversationId: cid,
-                    model: pin.model,
-                    pick: { atStep: 999999, queuedMessageIds: [] },
-                  },
-                });
-              } finally {
-                isInternalDispatch = false;
-              }
+              dispatchInternalModelPick(store, cid, pin.model);
             }
             return origDispatch.call(this, {
               ...action,
@@ -4412,9 +4916,11 @@
         const isPinned = Boolean(activePin && activePin.model === obsModel);
         let replacement = null;
         let reason = '';
+        // Marks morning primary-model restoration so replay shows the [Keep <Junior>] action toast
+        let isQuotaRestore = false;
         if (obsEntry && obsEntry.quota < (isPinned ? EMERGENCY_PIN_FLOOR : QUOTA_HARD_FLOOR)) {
-          const profile =
-            resolveProjectProfileForConversation(store, cid) || 'orchestrator';
+          // Reuse resolved conversation profile across exhaustion and recovery branches
+          const profile = convProfile || 'orchestrator';
           replacement = resolveAutopilotModelForProfile(catalog, profile);
           reason = `${Math.round(obsEntry.quota * 100)}% quota`;
         } else if (!isPinned) {
@@ -4422,28 +4928,47 @@
           if (shielded) {
             replacement = shielded;
             reason = 'WTU shield';
+          } else {
+            // Recover unpinned or reset-expired fallback turns when primary quota >= 30%
+            const recovered = resolveProfileQuotaRecovery(
+              catalog,
+              convProfile,
+              obsEntry?.modelId,
+              obsModel,
+              obsEntry?.label || action.payload.label,
+              expiredJuniorEnum
+            );
+            if (recovered) {
+              replacement = recovered.replacement;
+              reason = recovered.reason;
+              isQuotaRestore = recovered.isQuotaRestore;
+            }
           }
         }
         if (replacement && replacement.enumVal && replacement.enumVal !== obsModel) {
-          showAutopilotToast(
-            obsEntry?.label || action.payload.label || String(obsModel),
-            replacement.label,
-            reason
-          );
+          // Offer one-click [Keep <Junior>] revert when trajectory replay triggers morning restore
+          if (isQuotaRestore && cid) {
+            const juniorEnum = expiredJuniorEnum || obsModel;
+            const juniorEntry = catalog.byEnum.get(juniorEnum);
+            showMorningQuotaRestoredToast(
+              store,
+              cid,
+              juniorEnum,
+              juniorEntry?.label ||
+                action.payload.label ||
+                CURATED_ENUM_LABELS.get(juniorEnum) ||
+                String(juniorEnum),
+              replacement.label
+            );
+          } else {
+            showAutopilotToast(
+              obsEntry?.label || action.payload.label || String(obsModel),
+              replacement.label,
+              reason
+            );
+          }
           if (cid) {
-            isInternalDispatch = true;
-            try {
-              store.dispatch({
-                type: 'modelSelection/modelPicked',
-                payload: {
-                  conversationId: cid,
-                  model: replacement.enumVal,
-                  pick: { atStep: 999999, queuedMessageIds: [] },
-                },
-              });
-            } finally {
-              isInternalDispatch = false;
-            }
+            dispatchInternalModelPick(store, cid, replacement.enumVal);
           }
           return origDispatch.call(this, {
             ...action,
@@ -5857,6 +6382,9 @@
         bottom: 24px;
         right: 24px;
         z-index: 2147483646;
+        /* Align optional [Keep forever] / [Keep <Junior>] action button inline with toast text */
+        display: inline-flex;
+        align-items: center;
         padding: 8px 14px;
         border-radius: 8px;
         background: var(--background, #1e1e1e);
@@ -5874,6 +6402,29 @@
         font-size: 12px;
         font-weight: 500;
         pointer-events: none;
+      }
+      /* Enable clicks only on action toasts so passive failover toasts remain click-through */
+      #${AUTOPILOT_TOAST_ID}[data-interactive="true"] {
+        pointer-events: auto;
+      }
+      #${AUTOPILOT_TOAST_ID} .jetski-autopilot-toast-btn {
+        pointer-events: auto;
+        cursor: pointer;
+        margin-left: 2px;
+        padding: 2px 8px;
+        border-radius: 5px;
+        border: 1px solid rgba(59, 130, 246, 0.55);
+        background: rgba(59, 130, 246, 0.14);
+        color: var(--foreground, #e8eaed);
+        font: inherit;
+        font-size: 11.5px;
+        font-weight: 600;
+        line-height: 1.3;
+        white-space: nowrap;
+      }
+      #${AUTOPILOT_TOAST_ID} .jetski-autopilot-toast-btn:hover {
+        background: rgba(59, 130, 246, 0.26);
+        border-color: rgba(59, 130, 246, 0.85);
       }
     ` +
       // Style the collapsible Needs-Reaction inbox widget above the sidebar project list

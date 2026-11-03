@@ -10157,6 +10157,798 @@ const flushAll = async () => {
     )
     self.assertIn("WORKING_TO_NEEDS_ME_LATCH_PASSED", res.stdout)
 
+  def test_morning_project_model_reset_and_per_chat_pin_scope(self) -> None:
+    node_bin = find_node_binary()
+    js_path = os.path.join(SCRIPTS_DIR, "jetski_closed_filter.js")
+
+    harness = r"""
+const fs = require('fs');
+const assert = require('assert');
+
+const scriptPath = process.argv[1];
+const code = fs.readFileSync(scriptPath, 'utf8');
+
+class FakeElement {
+  constructor(tagName) {
+    this.tagName = tagName.toUpperCase();
+    this.id = '';
+    this.className = '';
+    this.type = '';
+    this.style = {};
+    this.attributes = new Map();
+    this.children = [];
+    this.parentElement = null;
+    this.listeners = new Map();
+    this._textContent = '';
+    this._innerHTML = '';
+  }
+  get textContent() {
+    if (this.children.length > 0) {
+      return this._textContent + this.children.map((c) => c.textContent).join('');
+    }
+    return this._textContent;
+  }
+  set textContent(v) {
+    this._textContent = String(v);
+    for (const c of this.children) c.parentElement = null;
+    this.children = [];
+  }
+  get innerHTML() { return this._innerHTML; }
+  set innerHTML(v) { this._innerHTML = String(v); }
+  setAttribute(k, v) {
+    this.attributes.set(k, String(v));
+    if (k === 'id') this.id = String(v);
+    if (k === 'class') this.className = String(v);
+  }
+  getAttribute(k) {
+    if (k === 'id' && this.id) return this.id;
+    return this.attributes.has(k) ? this.attributes.get(k) : null;
+  }
+  hasAttribute(k) { return this.attributes.has(k); }
+  removeAttribute(k) { this.attributes.delete(k); }
+  appendChild(c) {
+    if (c.parentElement) c.remove();
+    c.parentElement = this;
+    this.children.push(c);
+    return c;
+  }
+  insertBefore(c, ref) {
+    if (c === ref) return c;
+    if (c.parentElement) c.remove();
+    c.parentElement = this;
+    const idx = this.children.indexOf(ref);
+    if (idx === -1) this.children.push(c);
+    else this.children.splice(idx, 0, c);
+    return c;
+  }
+  remove() {
+    if (!this.parentElement) return;
+    const i = this.parentElement.children.indexOf(this);
+    if (i !== -1) this.parentElement.children.splice(i, 1);
+    this.parentElement = null;
+  }
+  addEventListener(t, fn) {
+    if (!this.listeners.has(t)) this.listeners.set(t, []);
+    this.listeners.get(t).push(fn);
+  }
+  dispatchEvent(type, extra = {}) {
+    const evt = {
+      type,
+      target: this,
+      preventDefault() {},
+      stopPropagation() {},
+      ...extra,
+    };
+    for (const fn of (this.listeners.get(type) || [])) fn(evt);
+  }
+  closest(selector) {
+    let cur = this;
+    while (cur) {
+      if (matchesSelector(cur, selector)) return cur;
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+  querySelector(s) { return this.querySelectorAll(s)[0] || null; }
+  querySelectorAll(s) {
+    if (typeof s === 'string' && s.includes(',')) {
+      return s.split(',').flatMap((p) => this.querySelectorAll(p.trim()));
+    }
+    const out = [];
+    const visit = (n) => {
+      for (const c of n.children) {
+        if (matchesSelector(c, s)) out.push(c);
+        visit(c);
+      }
+    };
+    visit(this);
+    return out;
+  }
+}
+
+function matchesSelector(el, s) {
+  if (typeof s !== 'string') return false;
+  if (s.startsWith('#')) return el.id === s.slice(1);
+  if (s === 'button[aria-label="Display Options"]') {
+    return el.tagName === 'BUTTON' && el.getAttribute('aria-label') === 'Display Options';
+  }
+  const attrMatch = /^\[([-a-zA-Z0-9_]+)="([^"]+)"\]$/.exec(s);
+  if (attrMatch) return el.getAttribute(attrMatch[1]) === attrMatch[2];
+  return false;
+}
+
+const docEl = new FakeElement('html');
+const headEl = new FakeElement('head');
+const bodyEl = new FakeElement('body');
+docEl.appendChild(headEl);
+docEl.appendChild(bodyEl);
+const actionRow = new FakeElement('div');
+const displayOptionsBtn = new FakeElement('button');
+displayOptionsBtn.setAttribute('aria-label', 'Display Options');
+actionRow.appendChild(displayOptionsBtn);
+bodyEl.appendChild(actionRow);
+
+const protoMarker = { __isBufProto: true };
+function protoObj(typeName, fields) {
+  return Object.assign(Object.create(protoMarker), { $typeName: typeName, ...fields });
+}
+
+function makeNativeConfig(label, enumVal, modelId, remaining, resetIso) {
+  const sec = BigInt(Math.floor(Date.parse(resetIso) / 1000));
+  return protoObj('exa.codeium_common_pb.ClientModelConfig', {
+    label,
+    modelOrAlias: protoObj('exa.codeium_common_pb.ModelOrAlias', {
+      choice: { case: 'model', value: enumVal },
+    }),
+    disabled: false,
+    supportsImages: true,
+    isRecommended: true,
+    allowedTiers: [1, 2],
+    quotaInfo: protoObj('exa.codeium_common_pb.QuotaInfo', {
+      remainingFraction: remaining,
+      resetTime: protoObj('google.protobuf.Timestamp', { seconds: sec, nanos: 0 }),
+    }),
+    tagTitle: '',
+    tagDescription: '',
+    supportedMimeTypes: { 'image/png': true },
+    modelId,
+    contextWindowOptions: [],
+  });
+}
+
+let opusQuota = 0.10;
+let opusResetIso = '2026-10-30T08:30:00Z';
+let orchQuota = 0.96;
+let orchResetIso = '2026-10-30T08:30:00Z';
+
+function buildUserStatus() {
+  const nativeConfigs = [
+    makeNativeConfig('Gemini Pro Next', 1260, 'auto', 0.98, '2026-10-30T08:30:00Z'),
+    makeNativeConfig('Claude Opus 5.5 (High)', 1370, 'opus-5.5-high', opusQuota, opusResetIso),
+    makeNativeConfig('Claude Opus 5.5 (Medium)', 1369, 'opus-5.5-medium', opusQuota, opusResetIso),
+    makeNativeConfig(
+      'Gemini 3.8 Flash (High)',
+      1320,
+      'gemini-3.8-flash-high',
+      0.99,
+      '2026-10-30T08:30:00Z'
+    ),
+  ];
+  return protoObj('exa.codeium_common_pb.UserStatus', {
+    cascadeModelConfigData: protoObj('exa.codeium_common_pb.CascadeModelConfigData', {
+      clientModelConfigs: nativeConfigs,
+      clientModelSorts: [
+        protoObj('exa.codeium_common_pb.ClientModelSort', {
+          name: 'Recommended',
+          groups: [
+            protoObj('exa.codeium_common_pb.ClientModelGroup', {
+              groupName: '',
+              modelLabels: nativeConfigs.map((c) => c.label),
+            }),
+          ],
+        }),
+      ],
+      battleModeModelConfigs: [],
+      battleModeModelSorts: [],
+    }),
+  });
+}
+
+function buildAvailableModels() {
+  return {
+    response: {
+      models: {
+        'auto': {
+          displayName: 'Gemini Pro Next',
+          model: 'MODEL_PLACEHOLDER_M260',
+          supportsImages: true,
+          quotaInfo: { remainingFraction: 0.98, resetTime: '2026-10-30T08:30:00Z' },
+        },
+        'opus-5.5-high': {
+          displayName: 'Claude Opus 5.5 (High)',
+          model: 'MODEL_PLACEHOLDER_M370',
+          supportsImages: true,
+          quotaInfo: { remainingFraction: opusQuota, resetTime: opusResetIso },
+        },
+        'opus-5.5-medium': {
+          displayName: 'Claude Opus 5.5 (Medium)',
+          model: 'MODEL_PLACEHOLDER_M369',
+          supportsImages: true,
+          quotaInfo: { remainingFraction: opusQuota, resetTime: opusResetIso },
+        },
+        'opus-5.5-max': {
+          displayName: 'Claude Opus 5.5 (Max)',
+          model: 'MODEL_PLACEHOLDER_M371',
+          supportsImages: true,
+          quotaInfo: { remainingFraction: opusQuota, resetTime: opusResetIso },
+        },
+        'gemini-pro-coordinator': {
+          displayName: 'Gemini Pro Orchestrator',
+          model: 'MODEL_PLACEHOLDER_M415',
+          supportsImages: true,
+          quotaInfo: { remainingFraction: orchQuota, resetTime: orchResetIso },
+        },
+        'gemini-3.8-flash-high': {
+          displayName: 'Gemini 3.8 Flash (High)',
+          model: 'MODEL_PLACEHOLDER_M320',
+          supportsImages: true,
+          quotaInfo: { remainingFraction: 0.99, resetTime: '2026-10-30T08:30:00Z' },
+        },
+      },
+    },
+  };
+}
+
+const CPP_PROJ = '8acb67c4-2cb7-43ca-ba04-dc547b3c4788';
+const ORCH_PROJ = '5a2a0f80-96c2-4334-a58d-7631310d4f72';
+
+const storeState = {
+  trajectorySummaries: {
+    summaries: {
+      'chat-unpinned-cpp': {
+        cascadeId: 'chat-unpinned-cpp',
+        stepCount: 4,
+        status: 'CASCADE_RUN_STATUS_IDLE',
+        latestExecutorTerminationReason: 'EXECUTOR_TERMINATION_REASON_NO_TOOL_CALL',
+        trajectoryMetadata: { projectId: CPP_PROJ },
+        annotations: { title: '[22:00] ⦿ Unpinned SkParagraph chat', archived: false },
+      },
+      'chat-orch-upgrade': {
+        cascadeId: 'chat-orch-upgrade',
+        stepCount: 3,
+        status: 'CASCADE_RUN_STATUS_IDLE',
+        latestExecutorTerminationReason: 'EXECUTOR_TERMINATION_REASON_NO_TOOL_CALL',
+        trajectoryMetadata: { projectId: ORCH_PROJ },
+        annotations: { title: '[22:10] ⦿ Upgraded Flight Deck chat', archived: false },
+      },
+      'chat-orch-sibling': {
+        cascadeId: 'chat-orch-sibling',
+        stepCount: 3,
+        status: 'CASCADE_RUN_STATUS_IDLE',
+        latestExecutorTerminationReason: 'EXECUTOR_TERMINATION_REASON_NO_TOOL_CALL',
+        trajectoryMetadata: { projectId: ORCH_PROJ },
+        annotations: { title: '[22:15] ⦿ Sibling Flight Deck chat', archived: false },
+      },
+      'chat-cpp-max': {
+        cascadeId: 'chat-cpp-max',
+        stepCount: 3,
+        status: 'CASCADE_RUN_STATUS_IDLE',
+        latestExecutorTerminationReason: 'EXECUTOR_TERMINATION_REASON_NO_TOOL_CALL',
+        trajectoryMetadata: { projectId: CPP_PROJ },
+        annotations: { title: '[22:20] ⦿ Max SkParagraph chat', archived: false },
+      },
+      'chat-cpp-evening': {
+        cascadeId: 'chat-cpp-evening',
+        stepCount: 5,
+        status: 'CASCADE_RUN_STATUS_IDLE',
+        latestExecutorTerminationReason: 'EXECUTOR_TERMINATION_REASON_NO_TOOL_CALL',
+        trajectoryMetadata: { projectId: CPP_PROJ },
+        annotations: { title: '[22:30] ⦿ Evening token saver chat', archived: false },
+      },
+      'chat-cpp-keep-forever': {
+        cascadeId: 'chat-cpp-keep-forever',
+        stepCount: 5,
+        status: 'CASCADE_RUN_STATUS_IDLE',
+        latestExecutorTerminationReason: 'EXECUTOR_TERMINATION_REASON_NO_TOOL_CALL',
+        trajectoryMetadata: { projectId: CPP_PROJ },
+        annotations: { title: '[22:35] ⦿ Intentional Flash chat', archived: false },
+      },
+    },
+  },
+  modelSelection: {
+    default: { model: 1260 },
+    byConversation: {
+      'chat-unpinned-cpp': { model: 1369 },
+      'chat-orch-upgrade': { model: 1415 },
+      'chat-orch-sibling': { model: 1415 },
+      'chat-cpp-max': { model: 1369 },
+      'chat-cpp-evening': { model: 1369 },
+      'chat-cpp-keep-forever': { model: 1369 },
+    },
+    trajectorySync: {},
+  },
+  userStatus: buildUserStatus(),
+  projects: {
+    projects: [
+      { id: CPP_PROJ, name: 'SkParagraph' },
+      { id: ORCH_PROJ, name: 'Flight Deck' },
+    ],
+  },
+  conversation: { cascadeId: 'chat-unpinned-cpp' },
+};
+
+const subscribers = [];
+const reduxStore = {
+  getState() { return storeState; },
+  dispatch(action) {
+    if (action?.type === 'userStatus/setUserStatus') {
+      storeState.userStatus = action.payload;
+    } else if (action?.type === 'modelSelection/modelPicked') {
+      const { conversationId, model, pick } = action.payload || {};
+      if (conversationId) {
+        storeState.modelSelection.byConversation[conversationId] = { model };
+      } else {
+        storeState.modelSelection.default = { model };
+      }
+      if (pick) {
+        storeState.modelSelection.trajectorySync[conversationId || ''] = { pick };
+      }
+    } else if (action?.type === 'modelSelection/trajectoryModelObserved') {
+      const { conversationId, model } = action.payload || {};
+      if (conversationId) {
+        storeState.modelSelection.byConversation[conversationId] = { model };
+      }
+    }
+    for (const fn of subscribers) fn();
+    return action;
+  },
+  subscribe(fn) {
+    subscribers.push(fn);
+    return () => {};
+  },
+};
+displayOptionsBtn.__reactFiber$test = { memoizedProps: { store: reduxStore } };
+
+const realNow = Date.now;
+let fakeNow = Date.parse('2026-10-29T23:00:00Z');
+Date.now = () => fakeNow;
+
+const storage = new Map();
+let outgoingFetchCalls = [];
+global.window = {
+  innerWidth: 1280,
+  location: { pathname: '/', search: '' },
+  __APP_CONFIG__: { csrfToken: 'csrf-morning-reset' },
+  localStorage: {
+    getItem: (k) => (storage.has(k) ? storage.get(k) : null),
+    setItem: (k, v) => { storage.set(k, String(v)); },
+    removeItem: (k) => { storage.delete(k); },
+  },
+  fetch: async (url, opts) => {
+    const u = String(url);
+    if (u.includes('GetAvailableModels')) {
+      return { ok: true, json: async () => buildAvailableModels() };
+    }
+    if (u.includes('SendUserCascadeMessage') || u.includes('StartCascade')) {
+      outgoingFetchCalls.push({ url: u, body: opts?.body ? JSON.parse(opts.body) : null });
+      return { ok: true, json: async () => ({}) };
+    }
+    return { ok: false, status: 404 };
+  },
+};
+global.document = {
+  documentElement: docEl,
+  head: headEl,
+  body: bodyEl,
+  getElementById(id) { return docEl.querySelector(`#${id}`); },
+  createElement(t) { return new FakeElement(t); },
+  querySelector(s) { return docEl.querySelector(s); },
+  querySelectorAll(s) { return docEl.querySelectorAll(s); },
+  addEventListener() {},
+  removeEventListener() {},
+};
+global.MutationObserver = class { observe() {} disconnect() {} };
+global.requestAnimationFrame = (cb) => { cb(); return 1; };
+global.setTimeout = () => 1;
+global.clearTimeout = () => {};
+
+async function refreshCatalogInStore() {
+  fakeNow += 61 * 1000;
+  reduxStore.dispatch({ type: 'userStatus/setUserStatus', payload: buildUserStatus() });
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+}
+
+(async () => {
+  try {
+    eval(code);
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+
+    // Unpinned evening failover (Opus 10% -> Orchestrator 1415), then morning recovery
+    assert.strictEqual(
+      storeState.modelSelection.byConversation['chat-unpinned-cpp'].model,
+      1415,
+      'Evening exhausted Opus (10%) must fail over unpinned chat to Orchestrator (1415)'
+    );
+
+    // Next morning: Opus quota resets to 100% and resetTime rolls to next day
+    fakeNow = Date.parse('2026-10-30T13:00:00Z');
+    opusQuota = 1.0;
+    opusResetIso = '2026-10-31T08:30:00Z';
+    await refreshCatalogInStore();
+
+    assert.strictEqual(
+      storeState.modelSelection.byConversation['chat-unpinned-cpp'].model,
+      1369,
+      'Unpinned chat must automatically recover to Opus 5.5 Medium (1369) on morning quota reset'
+    );
+
+    // Hysteresis: dipping Opus to 22% (>= 15% hard floor, < 30% soft floor) keeps 1369
+    opusQuota = 0.22;
+    await refreshCatalogInStore();
+    assert.strictEqual(
+      storeState.modelSelection.byConversation['chat-unpinned-cpp'].model,
+      1369,
+      'Unpinned chat already on Opus must keep 1369 inside the 15%-30% hysteresis band'
+    );
+
+    // Restore Opus to 90% for subsequent tests
+    opusQuota = 0.90;
+    await refreshCatalogInStore();
+
+    // Manual upgrade is permanent ONLY on this cascadeId (never leaks to drafts or siblings)
+    storeState.conversation.cascadeId = 'chat-orch-upgrade';
+    reduxStore.dispatch({
+      type: 'modelSelection/modelPicked',
+      payload: { conversationId: 'chat-orch-upgrade', model: 1370 }, // Opus High in orchestrator
+    });
+    await new Promise((r) => setImmediate(r));
+
+    storeState.conversation.cascadeId = 'chat-cpp-max';
+    reduxStore.dispatch({
+      type: 'modelSelection/modelPicked',
+      payload: { conversationId: 'chat-cpp-max', model: 1371 }, // Opus Max in cpp-core
+    });
+    await new Promise((r) => setImmediate(r));
+
+    const upgPin = window.__jetskiManualPickedModels.get('chat-orch-upgrade');
+    const maxPin = window.__jetskiManualPickedModels.get('chat-cpp-max');
+    assert(upgPin && upgPin.permanent === true, 'Manual upgrade in orchestrator must be permanent');
+    assert(maxPin && maxPin.permanent === true, 'Opus Max pick in cpp-core must be permanent');
+
+    // Sibling chat in Flight Deck and fresh draft in Flight Deck remain on project default 1415
+    storeState.conversation.cascadeId = 'chat-orch-sibling';
+    reduxStore.dispatch({ type: 'NOOP' });
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(
+      storeState.modelSelection.byConversation['chat-orch-sibling'].model,
+      1415,
+      'Permanent upgrade pin on one chat must not affect sibling chats in the same project'
+    );
+
+    storeState.conversation.cascadeId = '';
+    global.window.location.search = `?section=${ORCH_PROJ}`;
+    reduxStore.dispatch({ type: 'NOOP' });
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(
+      storeState.modelSelection.default.model,
+      1415,
+      'Permanent upgrade pin on one chat must not alter default model for new project drafts'
+    );
+
+    // Picking Opus High (1370) on an unsent ORCH_PROJ draft must NOT leak to unseeded sibling chats
+    reduxStore.dispatch({
+      type: 'modelSelection/modelPicked',
+      payload: { model: 1370 },
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(storeState.modelSelection.default.model, 1370);
+    delete storeState.modelSelection.byConversation['chat-orch-sibling'];
+    storeState.conversation.cascadeId = 'chat-orch-sibling';
+    reduxStore.dispatch({ type: 'NOOP' });
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(
+      storeState.modelSelection.byConversation['chat-orch-sibling']?.model,
+      1415,
+      'Unsent draft upgrade must not leak via default.model into unseeded sibling chats'
+    );
+
+    // Switching to an unassigned draft (?section= empty) resets default.model to orchestrator 1415
+    storeState.conversation.cascadeId = '';
+    global.window.location.search = '';
+    reduxStore.dispatch({ type: 'NOOP' });
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(
+      storeState.modelSelection.default.model,
+      1415,
+      'Unsent project draft upgrade must not leak into standalone unassigned drafts'
+    );
+    window.__jetskiManualPickedModels.delete(`__draft__:${ORCH_PROJ}`);
+
+    // Evening manual downgrade defaults to temporary until-reset with [Keep forever] action
+    fakeNow = Date.parse('2026-10-30T23:15:00Z');
+    opusQuota = 0.24;
+    opusResetIso = '2026-10-31T08:30:00Z';
+    await refreshCatalogInStore();
+
+    storeState.conversation.cascadeId = 'chat-cpp-evening';
+    reduxStore.dispatch({
+      type: 'modelSelection/modelPicked',
+      payload: { conversationId: 'chat-cpp-evening', model: 1320 }, // Flash High downgrade
+    });
+    await new Promise((r) => setImmediate(r));
+
+    const evePin = window.__jetskiManualPickedModels.get('chat-cpp-evening');
+    assert(
+      evePin && evePin.permanent === false,
+      'Evening downgrade must not be permanent by default'
+    );
+    assert.strictEqual(evePin.resetAtMs, Date.parse('2026-10-31T08:30:00Z'));
+
+    let toast = global.document.getElementById('jetski-model-autopilot-toast');
+    assert(toast, 'Evening downgrade must mount notification toast');
+    assert(
+      toast.textContent.includes('until quota reset'),
+      `Expected evening until-reset toast, got: ${toast.textContent}`
+    );
+    let actionBtn = toast.querySelector('[data-testid="jetski-autopilot-toast-action"]');
+    assert(actionBtn, 'Evening downgrade toast must include [Keep forever] action button');
+    assert.strictEqual(actionBtn.getAttribute('data-action'), 'keep-forever');
+
+    // Evening turns on 1320 preserve temporary pin metadata (permanent: false, resetAtMs)
+    storeState.trajectorySummaries.summaries['chat-cpp-evening'].stepCount = 9;
+    reduxStore.dispatch({
+      type: 'modelSelection/trajectoryModelObserved',
+      payload: {
+        conversationId: 'chat-cpp-evening',
+        turnKey: 'turn-eve-2',
+        label: 'Gemini 3.8 Flash (High)',
+        model: 1320,
+        executionStartStep: 7,
+        queuedMessageIds: [],
+      },
+    });
+    await new Promise((r) => setImmediate(r));
+    const evePinAfterTurn = window.__jetskiManualPickedModels.get('chat-cpp-evening');
+    assert.strictEqual(evePinAfterTurn.permanent, false);
+    assert.strictEqual(evePinAfterTurn.resetAtMs, Date.parse('2026-10-31T08:30:00Z'));
+    assert.strictEqual(storeState.modelSelection.byConversation['chat-cpp-evening'].model, 1320);
+
+    // Downgrading chat-cpp-keep-forever and clicking [Keep forever] pins ONLY that chat permanently
+    storeState.conversation.cascadeId = 'chat-cpp-keep-forever';
+    reduxStore.dispatch({
+      type: 'modelSelection/modelPicked',
+      payload: { conversationId: 'chat-cpp-keep-forever', model: 1320 },
+    });
+    await new Promise((r) => setImmediate(r));
+    toast = global.document.getElementById('jetski-model-autopilot-toast');
+    actionBtn = toast.querySelector('[data-testid="jetski-autopilot-toast-action"]');
+    assert(actionBtn, 'Keep forever button must mount for second downgraded chat');
+    actionBtn.dispatchEvent('click');
+    assert.strictEqual(
+      window.__jetskiManualPickedModels.get('chat-cpp-keep-forever')?.permanent,
+      true,
+      'Clicking Keep forever must flip permanent=true on that chat'
+    );
+    assert.strictEqual(
+      window.__jetskiManualPickedModels.get('chat-cpp-evening')?.permanent,
+      false,
+      'Clicking Keep forever on one chat must not affect other downgraded chats'
+    );
+
+    // Next morning after quota reset -> temporary downgrade auto-restores + [Keep <Junior>]
+    fakeNow = Date.parse('2026-10-31T13:00:00Z');
+    opusQuota = 1.0;
+    opusResetIso = '2026-11-01T08:30:00Z';
+    orchResetIso = '2026-11-01T08:30:00Z';
+
+    // Permanent pins (upgrade, Max, and Keep-forever) survive morning reset untouched
+    storeState.conversation.cascadeId = 'chat-orch-upgrade';
+    await refreshCatalogInStore();
+    assert.strictEqual(
+      storeState.modelSelection.byConversation['chat-orch-upgrade'].model,
+      1370,
+      'Permanent upgraded chat must survive morning reset'
+    );
+    storeState.conversation.cascadeId = 'chat-cpp-max';
+    reduxStore.dispatch({ type: 'NOOP' });
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(
+      storeState.modelSelection.byConversation['chat-cpp-max'].model,
+      1371,
+      'Permanent Opus Max chat must survive morning reset'
+    );
+    storeState.conversation.cascadeId = 'chat-cpp-keep-forever';
+    reduxStore.dispatch({ type: 'NOOP' });
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(
+      storeState.modelSelection.byConversation['chat-cpp-keep-forever'].model,
+      1320,
+      'Keep-forever downgraded chat must survive morning reset'
+    );
+
+    // Opening chat-cpp-evening in the morning auto-restores Opus 1369 and shows [Keep <Junior>]
+    storeState.conversation.cascadeId = 'chat-cpp-evening';
+    reduxStore.dispatch({ type: 'NOOP' });
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(
+      storeState.modelSelection.byConversation['chat-cpp-evening'].model,
+      1369,
+      'Temporary evening downgrade must auto-reset to Opus 5.5 Medium (1369) in the morning'
+    );
+    assert.strictEqual(
+      window.__jetskiManualPickedModels.has('chat-cpp-evening'),
+      false,
+      'Expired temporary pin must be removed on morning reset'
+    );
+
+    toast = global.document.getElementById('jetski-model-autopilot-toast');
+    assert(toast, 'Morning auto-reset must mount notification toast');
+    assert(
+      toast.textContent.includes('Quota restored: switched back to Claude Opus 5.5 (Medium)'),
+      `Expected morning quota-restored toast, got: ${toast.textContent}`
+    );
+    actionBtn = toast.querySelector('[data-testid="jetski-autopilot-toast-action"]');
+    assert(actionBtn, 'Morning auto-reset toast must include [Keep <Junior>] action button');
+    assert.strictEqual(actionBtn.getAttribute('data-action'), 'keep-junior');
+    assert(
+      actionBtn.textContent.includes('Keep Gemini 3.8 Flash (High)'),
+      `Expected Keep Gemini 3.8 Flash (High) button label, got: ${actionBtn.textContent}`
+    );
+
+    // Clicking [Keep Gemini 3.8 Flash (High)] reverts chat-cpp-evening to 1320 with permanent=true
+    actionBtn.dispatchEvent('click');
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(
+      storeState.modelSelection.byConversation['chat-cpp-evening'].model,
+      1320,
+      'Clicking [Keep <Junior>] must revert chat to Gemini 3.8 Flash (High)'
+    );
+    assert.strictEqual(
+      window.__jetskiManualPickedModels.get('chat-cpp-evening')?.permanent,
+      true,
+      'Clicking [Keep <Junior>] must set permanent=true on this chat only'
+    );
+
+    // Another morning (+24h): chat-cpp-evening stays on 1320, while new SkParagraph draft gets 1369
+    fakeNow = Date.parse('2026-11-01T13:30:00Z');
+    opusResetIso = '2026-11-02T08:30:00Z';
+    await refreshCatalogInStore();
+    assert.strictEqual(
+      storeState.modelSelection.byConversation['chat-cpp-evening'].model,
+      1320,
+      'Chat kept via [Keep <Junior>] must remain on 1320 on subsequent mornings'
+    );
+    storeState.conversation.cascadeId = '';
+    global.window.location.search = `?section=${CPP_PROJ}`;
+    reduxStore.dispatch({ type: 'NOOP' });
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(
+      storeState.modelSelection.default.model,
+      1369,
+      'Permanent per-chat pin must never change project default for new drafts'
+    );
+
+    // Unsent draft upgrade pick still expires after 30m so abandoned drafts do not stick forever
+    reduxStore.dispatch({
+      type: 'modelSelection/modelPicked',
+      payload: { model: 1371 }, // Opus Max on unsent SkParagraph draft
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(storeState.modelSelection.default.model, 1371);
+    fakeNow += 31 * 60 * 1000;
+    reduxStore.dispatch({ type: 'NOOP' });
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(
+      storeState.modelSelection.default.model,
+      1369,
+      'Unsent draft manual pick must still expire after 30m TTL'
+    );
+    global.window.location.search = '';
+
+    // ConnectRPC fetch gate & trajectoryModelObserved recovery + 6h fallback without resetTime
+    storeState.trajectorySummaries.summaries['chat-orch-no-reset'] = {
+      cascadeId: 'chat-orch-no-reset',
+      stepCount: 4,
+      status: 'CASCADE_RUN_STATUS_IDLE',
+      latestExecutorTerminationReason: 'EXECUTOR_TERMINATION_REASON_NO_TOOL_CALL',
+      trajectoryMetadata: { projectId: ORCH_PROJ },
+      annotations: { title: '[23:00] ⦿ Orchestrator missing resetTime chat', archived: false },
+    };
+    orchResetIso = ''; // Simulate missing resetTime on primary model at downgrade time
+    orchQuota = 0.25;
+    await refreshCatalogInStore();
+
+    storeState.conversation.cascadeId = 'chat-orch-no-reset';
+    reduxStore.dispatch({
+      type: 'modelSelection/modelPicked',
+      payload: { conversationId: 'chat-orch-no-reset', model: 1320 }, // Flash High in orchestrator
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(window.__jetskiManualPickedModels.get('chat-orch-no-reset')?.resetAtMs, 0);
+
+    // After 7h overnight gap with primary quota >= 50%, SendUserCascadeMessage rewrites M320
+    fakeNow += 7 * 60 * 60 * 1000;
+    orchQuota = 0.95;
+    await refreshCatalogInStore();
+    // Simulate background send on another chat whose temporary pin expired before UI focus
+    window.__jetskiManualPickedModels.set('chat-unpinned-cpp', {
+      model: 1320,
+      atStep: 4,
+      updatedAt: fakeNow - 8 * 60 * 60 * 1000,
+      permanent: false,
+      resetAtMs: fakeNow - 60 * 1000,
+      baselineModel: 1369,
+    });
+    outgoingFetchCalls = [];
+    await global.window.fetch(
+      '/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          cascadeId: 'chat-unpinned-cpp',
+          cascadeConfig: { plannerConfig: { planModel: 'MODEL_PLACEHOLDER_M320' } },
+        }),
+      }
+    );
+    assert.strictEqual(outgoingFetchCalls.length, 1);
+    assert.strictEqual(
+      outgoingFetchCalls[0].body.cascadeConfig.plannerConfig.planModel,
+      'MODEL_PLACEHOLDER_M369',
+      'SendUserCascadeMessage must rewrite expired evening downgrade back to Opus M369'
+    );
+    assert.strictEqual(
+      storeState.modelSelection.byConversation['chat-orch-no-reset'].model,
+      1415,
+      '6h overnight fallback must restore Orchestrator (1415) when resetTime was missing'
+    );
+
+    // F5 reload trajectoryModelObserved morning replay recovers unpinned fallback turn
+    delete storeState.modelSelection.byConversation['chat-unpinned-cpp'];
+    reduxStore.dispatch({
+      type: 'modelSelection/trajectoryModelObserved',
+      payload: {
+        conversationId: 'chat-unpinned-cpp',
+        turnKey: 'turn-f5-morning',
+        label: 'Gemini 3.8 Flash (High)',
+        model: 1320,
+        executionStartStep: 3,
+        queuedMessageIds: [],
+      },
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(
+      storeState.modelSelection.byConversation['chat-unpinned-cpp'].model,
+      1369,
+      'trajectoryModelObserved replay of yesterday junior turn must recover to Opus 1369'
+    );
+
+    process.stdout.write('MORNING_MODEL_RESET_PASSED\n');
+  } finally {
+    Date.now = realNow;
+  }
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"""
+    env = os.environ.copy()
+    env["ELECTRON_RUN_AS_NODE"] = "1"
+    res = subprocess.run(
+        [node_bin, "-e", harness, js_path],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(
+        res.returncode,
+        0,
+        f"Morning model reset harness failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+    )
+    self.assertIn("MORNING_MODEL_RESET_PASSED", res.stdout)
+
 
 if __name__ == "__main__":
   unittest.main()
