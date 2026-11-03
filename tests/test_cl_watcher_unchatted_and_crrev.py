@@ -500,8 +500,9 @@ console.log(JSON.stringify({
   row: rowHtml(reviewerAfterBot, box),
 }));
 """
+    # Feed DASHBOARD_HTML harness via stdin to stay below Linux 128 KB MAX_ARG_STRLEN
     proc = subprocess.run(
-        ["node", "-e", harness], capture_output=True, text=True, check=True
+        ["node", "-"], input=harness, capture_output=True, text=True, check=True
     )
     out = json.loads(proc.stdout.strip())
     self.assertEqual(out["revStatus"], "attention")
@@ -930,8 +931,9 @@ console.log(JSON.stringify({
   compCard: focusCard(compCl, box),
 }));
 """
+    # Feed DASHBOARD_HTML harness via stdin to stay below Linux 128 KB MAX_ARG_STRLEN
     proc = subprocess.run(
-        ["node", "-e", harness], capture_output=True, text=True, check=True
+        ["node", "-"], input=harness, capture_output=True, text=True, check=True
     )
     out = json.loads(proc.stdout.strip())
     self.assertIn("Has companion CL 1410416 (WIP)", out["parentRow"])

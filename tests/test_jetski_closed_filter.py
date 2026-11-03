@@ -8080,18 +8080,88 @@ eval(code);
     return origFetch(url);
   };
   global.window.location.hostname = 'cloudtop.corp.goog';
+  const postedToIframe = [];
+  iframe.contentWindow = {
+    postMessage(msg) { postedToIframe.push(msg); },
+  };
   window.__jetskiFlightDeck.ensureFlightDeckUI();
   for (let i = 0; i < 6; i++) await Promise.resolve();
   assert.strictEqual(iframe.getAttribute('src'), 'https://8089-pen-proxy.corp.goog?v=10&embed=1');
+  window.__jetskiFlightDeck.handleMessage({
+    data: { type: 'jetski-flight-deck-rendered', uiVersion: 10, synced: '19:00 ET' },
+  });
   fakeNow += 20000;
   mockFlightDeckJson = {
     pen_url: 'http://localhost:8089?v=20',
     local_url: 'http://localhost:8089?v=20',
     port: 8089,
+    ui_version: 20,
   };
   window.__jetskiFlightDeck.ensureFlightDeckUI();
   for (let i = 0; i < 6; i++) await Promise.resolve();
   assert.strictEqual(iframe.getAttribute('src'), 'https://8089-pen-proxy.corp.goog?v=10&embed=1');
+  assert(
+    postedToIframe.some((m) => m && m.type === 'jetski-flight-deck-ping'),
+    'First observation of ?v=20 must ping the healthy iframe before forcing a reload'
+  );
+  window.__jetskiFlightDeck.handleMessage({
+    data: { type: 'jetski-flight-deck-rendered', uiVersion: 10, synced: '19:01 ET' },
+  });
+
+  // If the iframe stays on stale uiVersion 10 past timeout, parent force-reloads PEN src
+  fakeNow += 15000;
+  window.__jetskiFlightDeck.ensureFlightDeckUI();
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  const reloadedV20Src = iframe.getAttribute('src');
+  assert.strictEqual(
+    reloadedV20Src,
+    `https://8089-pen-proxy.corp.goog?v=20&embed=1&t=${fakeNow}`,
+    'Unrendered ?v=20 bump must force-reload iframe while keeping HTTPS PEN host'
+  );
+
+  // Reopening the drawer while current src has never rendered immediately reloads stuck Loading
+  window.__jetskiFlightDeck.setOpen(false);
+  fakeNow += 3000;
+  window.__jetskiFlightDeck.setOpen(true);
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  const reopenStuckSrc = iframe.getAttribute('src');
+  assert.strictEqual(
+    reopenStuckSrc,
+    `https://8089-pen-proxy.corp.goog?v=20&embed=1&t=${fakeNow}`,
+    'Reopening drawer when iframe never rendered must immediately force-reload src'
+  );
+
+  // Once rendered, reopening drawer keeps current src without flash and pings liveness
+  window.__jetskiFlightDeck.handleMessage({
+    data: { type: 'jetski-flight-deck-rendered', uiVersion: 20, synced: '19:05 ET' },
+  });
+  postedToIframe.length = 0;
+  window.__jetskiFlightDeck.setOpen(false);
+  fakeNow += 5000;
+  window.__jetskiFlightDeck.setOpen(true);
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  assert.strictEqual(
+    iframe.getAttribute('src'),
+    reopenStuckSrc,
+    'Reopening an already-rendered drawer must not flash-reload src immediately'
+  );
+  assert(
+    postedToIframe.some((m) => m && m.type === 'jetski-flight-deck-ping'),
+    'Reopening an already-rendered drawer must ping iframe liveness'
+  );
+
+  // If reopen ping receives no rendered ack (e.g. dead 502 on Mac static JSON), watchdog reloads
+  fakeNow += 20000;
+  window.__jetskiFlightDeck.ensureFlightDeckUI();
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  assert.strictEqual(
+    iframe.getAttribute('src'),
+    `https://8089-pen-proxy.corp.goog?v=20&embed=1&t=${fakeNow}`,
+    'Unanswered reopen ping must force-reload dead iframe after timeout'
+  );
+  window.__jetskiFlightDeck.handleMessage({
+    data: { type: 'jetski-flight-deck-rendered', uiVersion: 20, synced: '19:06 ET' },
+  });
   global.window.location.hostname = 'localhost';
   global.window.fetch = origFetch;
   Date.now = origDateNow;

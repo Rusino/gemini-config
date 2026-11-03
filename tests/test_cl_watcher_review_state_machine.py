@@ -21,8 +21,9 @@ class CodeReviewStateMachineFrontendTest(unittest.TestCase):
   def _eval_js(self, js_code: str) -> dict:
     script_body = w.DASHBOARD_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
     harness = script_body.split("\nboot();", 1)[0] + "\n" + js_code
+    # Feed DASHBOARD_HTML harness via stdin to stay below Linux 128 KB MAX_ARG_STRLEN
     proc = subprocess.run(
-        ["node", "-e", harness], capture_output=True, text=True, check=True
+        ["node", "-"], input=harness, capture_output=True, text=True, check=True
     )
     return json.loads(proc.stdout.strip())
 

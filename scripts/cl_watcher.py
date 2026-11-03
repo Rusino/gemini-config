@@ -789,9 +789,24 @@ _FLIGHT_DECK_PEN_URL: dict[int, str] = {}
 
 def flight_deck_pen_url(port: int = DEFAULT_PORT) -> str:
   """Returns the Flight Deck dashboard PEN URL, cached per port."""
-  if port not in _FLIGHT_DECK_PEN_URL:
-    _FLIGHT_DECK_PEN_URL[port] = get_pen_url(port)
-  return _FLIGHT_DECK_PEN_URL[port]
+  if port in _FLIGHT_DECK_PEN_URL:
+    return _FLIGHT_DECK_PEN_URL[port]
+  url = get_pen_url(port)
+  if url.startswith("https://"):
+    _FLIGHT_DECK_PEN_URL[port] = url
+    return url
+  # Avoid caching transient loopback fallbacks when pen_url.sh times out at startup
+  try:
+    if os.path.isfile(FLIGHT_DECK_INFO_FILE):
+      with open(FLIGHT_DECK_INFO_FILE, "r", encoding="utf-8") as f:
+        saved = json.load(f)
+      prev_pen = str((saved or {}).get("pen_url") or "").strip()
+      prev_base = re.sub(r"[?#].*$", "", prev_pen)
+      if prev_base.startswith("https://"):
+        return prev_base
+  except Exception:
+    pass
+  return url
 
 
 def export_flight_deck_info(port: int = DEFAULT_PORT) -> None:
@@ -10123,9 +10138,15 @@ const STATUS_SKIA_URL = 'https://status.skia.org/repo/skia';
 // Merged CLs older than this are chats left open after the work ended
 const OLD_MERGED_DAYS = 3;
 
+// Bounds /api/status sockets and retries boot quickly before the 20s steady-state interval
+const FETCH_STATUS_TIMEOUT_MS = 10000;
+const INITIAL_RETRY_DELAY_MS = 2500;
 let cachedData = null;
 // Tracks server script mtime to trigger page reload on daemon re-exec
 let cachedUiVersion = null;
+// Serializes overlapping poll and ping fetches and tracks fast boot retries
+let fetchInFlight = false;
+let initialRetryTimer = 0;
 let selectedProject = 'ALL';
 let selectedView = 'cls';
 // Preserves at most one open secondary section per view across 20s polls
@@ -12682,6 +12703,28 @@ function setProject(p) {
   render();
 }
 
+// Posts lifecycle heartbeats to the embedding Jetski drawer when framed
+function postParentMessage(payload) {
+  if (typeof window === 'undefined' || !window.parent || window.parent === window) return;
+  if (typeof window.parent.postMessage !== 'function') return;
+  try {
+    window.parent.postMessage(payload, '*');
+  } catch (e) {
+    // Ignore cross-origin frame teardown races
+  }
+}
+
+// Notifies the parent drawer that live dashboard state has rendered inside this iframe
+function notifyParentRendered(data) {
+  if (!data) return;
+  const ver = Number((data && data.ui_version) || cachedUiVersion || 0);
+  postParentMessage({
+    type: 'jetski-flight-deck-rendered',
+    uiVersion: ver,
+    synced: String((data && data.last_sync) || ''),
+  });
+}
+
 function render() {
   const data = cachedData;
   if (!data) return;
@@ -12801,6 +12844,8 @@ function render() {
     const projCount = bugProjects.length;
     document.getElementById('footer').textContent =
       `${allBugs.length} tracked bugs across ${projCount} projects · refreshes every 5 min`;
+    // Bugs view returns early before CL lanes, so emit rendered heartbeat here as well
+    notifyParentRendered(data);
     return;
   }
 
@@ -12867,11 +12912,38 @@ function render() {
     : (shown.length ? '' : '<p class="empty-note">No open CL or PR chats in this project.</p>');
   document.getElementById('footer').textContent =
     `${all.length} open CL and PR chats across ${projects.length} projects · refreshes every 20 s`;
+  notifyParentRendered(data);
+}
+
+// Bounds status fetches with an AbortSignal so stalled UberProxy sockets cannot hang Loading
+async function fetchWithTimeout(url, opts, timeoutMs) {
+  const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : 0;
+  // Unref timeout handles in Node test harnesses so completed scripts exit immediately
+  if (timer && typeof timer.unref === 'function') timer.unref();
+  try {
+    const reqOpts = Object.assign({cache: 'no-store'}, opts || {});
+    if (ctrl) reqOpts.signal = ctrl.signal;
+    return await fetch(url, reqOpts);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function fetchState() {
+  // Coalesce concurrent interval ticks and parent pings into one active /api/status request
+  if (fetchInFlight) return;
+  fetchInFlight = true;
+  if (initialRetryTimer) {
+    clearTimeout(initialRetryTimer);
+    initialRetryTimer = 0;
+  }
   try {
-    const resp = await fetch('/api/status');
+    // Reject HTTP 502/503 proxy error pages before attempting JSON deserialization
+    const resp = await fetchWithTimeout('/api/status', {}, FETCH_STATUS_TIMEOUT_MS);
+    if (!resp || !resp.ok) {
+      throw new Error(`HTTP ${resp ? resp.status : 0}`);
+    }
     const nextData = await resp.json();
     const nextVer = Number((nextData && nextData.ui_version) || 0);
     // Reload document when the server process restarted with updated HTML/JS
@@ -12887,6 +12959,18 @@ async function fetchState() {
     render();
   } catch (e) {
     document.getElementById('synced').textContent = 'Connection lost, retrying';
+    // Retry faster than the 20s poll while the initial payload has not rendered yet
+    if (!cachedData && !initialRetryTimer) {
+      initialRetryTimer = setTimeout(() => {
+        initialRetryTimer = 0;
+        void fetchState();
+      }, INITIAL_RETRY_DELAY_MS);
+      if (initialRetryTimer && typeof initialRetryTimer.unref === 'function') {
+        initialRetryTimer.unref();
+      }
+    }
+  } finally {
+    fetchInFlight = false;
   }
 }
 
@@ -13096,9 +13180,22 @@ async function triggerRefresh() {
   try {
     const resp = await fetch('/api/refresh', {method: 'POST'});
     const res = await resp.json().catch(() => null);
-    // Reload document immediately when manual refresh triggered a script re-exec
+    // Wait for the re-execed server to answer /api/status before navigating the iframe
     if (res && res.reloaded && typeof location !== 'undefined' &&
         typeof location.reload === 'function') {
+      for (let i = 0; i < 12; i++) {
+        await new Promise(r => setTimeout(r, i === 0 ? 80 : 150));
+        try {
+          const probe = await fetchWithTimeout('/api/status', {}, 2500);
+          if (probe && probe.ok) {
+            const pData = await probe.json().catch(() => null);
+            const pVer = Number((pData && pData.ui_version) || 0);
+            if (!cachedUiVersion || !pVer || pVer !== cachedUiVersion) break;
+          }
+        } catch (e) {
+          // Keep polling across the brief re-exec socket gap
+        }
+      }
       location.reload();
       return;
     }
@@ -13113,6 +13210,18 @@ function boot() {
     new URLSearchParams(location.search).get('embed') === '1';
   if (isEmbed) {
     document.documentElement.classList.add('embedded');
+  }
+  // Answer parent drawer liveness pings when rendered, and kick off a fresh status poll
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('message', (ev) => {
+      const msg = ev && ev.data;
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.type === 'jetski-flight-deck-ping') {
+        // Ack rendered state only after initial status payload rendered so Loading stays honest
+        if (cachedData) notifyParentRendered(cachedData);
+        void fetchState();
+      }
+    });
   }
   let savedProj = 'ALL';
   let savedView = 'cls';
@@ -13196,9 +13305,10 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
             "reloaded": True,
             "count": len(state.get("items") or {}),
         })
-        threading.Thread(
-            target=reexec_self, args=(self.server,), daemon=True
-        ).start()
+        # Delay re-exec briefly so BaseHTTPRequestHandler flushes the 200 JSON body
+        reexec_timer = threading.Timer(0.05, reexec_self, args=(self.server,))
+        reexec_timer.daemon = True
+        reexec_timer.start()
         return
       state = sync_once(
           wake_chats=True, update_titles=True, sync_bugs=True, force_bugs=True

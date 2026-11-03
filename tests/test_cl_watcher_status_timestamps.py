@@ -157,8 +157,9 @@ console.log(JSON.stringify({
   rollingLane: laneOf(rollingCl),
 }));
 """
+    # Feed DASHBOARD_HTML harness via stdin to stay below Linux 128 KB MAX_ARG_STRLEN
     proc = subprocess.run(
-        ["node", "-e", harness], capture_output=True, text=True, check=True
+        ["node", "-"], input=harness, capture_output=True, text=True, check=True
     )
     out = json.loads(proc.stdout.strip())
     self.assertEqual(out["closedState"], "Closed")
@@ -256,8 +257,9 @@ console.log(JSON.stringify({
   warnCard: flightPath(skiaWarnCl, true),
 }));
 """
+    # Feed DASHBOARD_HTML harness via stdin to stay below Linux 128 KB MAX_ARG_STRLEN
     proc = subprocess.run(
-        ["node", "-e", harness], capture_output=True, text=True, check=True
+        ["node", "-"], input=harness, capture_output=True, text=True, check=True
     )
     out = json.loads(proc.stdout.strip())
     self.assertEqual(

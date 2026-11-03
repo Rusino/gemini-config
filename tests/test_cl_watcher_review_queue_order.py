@@ -604,6 +604,188 @@ process.exit(0);
             self.assertIn("?v=1730510000", data.get("local_url", ""))
             self.assertIn("?v=1730510000", data.get("pen_url", ""))
 
+  def test_flight_deck_pen_url_preserves_https_on_loopback_timeout(self):
+    import json
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+      info_file = os.path.join(tmpdir, "jetski-flight-deck.json")
+      with open(info_file, "w", encoding="utf-8") as f:
+        json.dump(
+            {"pen_url": "https://8089-pen.proxy.googlers.com?v=100"}, f
+        )
+      with mock.patch.dict(w._FLIGHT_DECK_PEN_URL, {}, clear=True):
+        with mock.patch.object(w, "FLIGHT_DECK_INFO_FILE", info_file):
+          with mock.patch.object(
+              w,
+              "get_pen_url",
+              side_effect=[
+                  "http://localhost:8089",
+                  "https://8089-fresh.proxy.googlers.com",
+              ],
+          ):
+            first = w.flight_deck_pen_url(8089)
+            self.assertEqual(first, "https://8089-pen.proxy.googlers.com")
+            self.assertNotIn(8089, w._FLIGHT_DECK_PEN_URL)
+            second = w.flight_deck_pen_url(8089)
+            self.assertEqual(second, "https://8089-fresh.proxy.googlers.com")
+            self.assertEqual(
+                w._FLIGHT_DECK_PEN_URL.get(8089),
+                "https://8089-fresh.proxy.googlers.com",
+            )
+
+  def test_flight_deck_embedded_rendered_heartbeat_ping_and_refresh(self):
+    # Pass DASHBOARD_HTML via stdin to stay below Linux 128 KB MAX_ARG_STRLEN
+    js_code = r"""
+const assert = require('assert');
+const html = require('fs').readFileSync(0, 'utf8');
+const script = html.split('<script>')[1].split('</script>')[0].replace(/boot\(\);/g, '');
+
+const els = new Map();
+function getEl(id) {
+  if (!els.has(id)) {
+    els.set(id, { id, textContent: id === 'synced' ? 'Loading…' : '', innerHTML: '' });
+  }
+  return els.get(id);
+}
+const parentMsgs = [];
+const winListeners = [];
+let reloadCalls = 0;
+let statusCalls = 0;
+let statusMode = 'fail_always';
+let currentUiVer = 501;
+
+global.document = {
+  documentElement: { classList: { add() {} } },
+  getElementById: getEl,
+  addEventListener() {},
+};
+global.history = { replaceState() {} };
+global.location = {
+  search: '?embed=1',
+  hash: '',
+  reload() { reloadCalls++; },
+};
+global.window = {
+  parent: {
+    postMessage(msg) { parentMsgs.push(msg); },
+  },
+  addEventListener(type, fn) {
+    if (type === 'message') winListeners.push(fn);
+  },
+};
+global.fetch = async (url, opts) => {
+  if (url === '/api/status') {
+    statusCalls++;
+    assert(opts && opts.signal, 'fetch(/api/status) must pass an AbortSignal');
+    if (statusMode === 'fail_once') {
+      statusMode = 'ok';
+      return { ok: false, status: 502, json: async () => ({}) };
+    }
+    if (statusMode === 'fail_always') {
+      throw new Error('ECONNREFUSED');
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ui_version: currentUiVer,
+        last_sync: '19:40 ET',
+        items: {},
+        bugs: {},
+        rollers_summary: {},
+      }),
+    };
+  }
+  if (url === '/api/refresh') {
+    statusMode = 'fail_once';
+    currentUiVer = 502;
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ ok: true, reloaded: true }),
+    };
+  }
+  throw new Error('Unexpected fetch: ' + url);
+};
+
+const origSetInterval = global.setInterval;
+const origSetTimeout = global.setTimeout;
+global.setInterval = () => 0;
+
+async function flushMicrotasks() {
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+}
+
+eval(script);
+boot();
+
+(async () => {
+  await flushMicrotasks();
+  // While initial fetch fails (stuck on Loading), boot() + ping must NOT claim rendered
+  assert(winListeners.length >= 1, 'boot() must listen for parent ping messages');
+  for (const fn of winListeners) {
+    fn({ data: { type: 'jetski-flight-deck-ping' } });
+  }
+  await flushMicrotasks();
+  assert.strictEqual(
+    parentMsgs.filter((m) => m.type === 'jetski-flight-deck-rendered').length,
+    0,
+    'Unrendered iframe must not claim rendered on ping while fetch fails',
+  );
+
+  // Once /api/status recovers, a parent ping triggers fetchState() and posts rendered heartbeat
+  statusMode = 'ok';
+  for (const fn of winListeners) {
+    fn({ data: { type: 'jetski-flight-deck-ping' } });
+  }
+  await flushMicrotasks();
+  const renderedCls = parentMsgs.filter((m) => m.type === 'jetski-flight-deck-rendered');
+  assert.strictEqual(renderedCls.length, 1, 'Recovered iframe must post rendered heartbeat');
+  assert.strictEqual(renderedCls[0].uiVersion, 501);
+  assert.strictEqual(renderedCls[0].synced, '19:40 ET');
+
+  // Bugs view has its own branch in render() and must also post the rendered heartbeat
+  setView('bugs');
+  const renderedAfterBugs = parentMsgs.filter((m) => m.type === 'jetski-flight-deck-rendered');
+  assert.strictEqual(renderedAfterBugs.length, 2, 'Bugs view render() must post heartbeat');
+
+  // Parent liveness ping acks immediately when cachedData is present and refreshes status
+  const callsBeforePing = statusCalls;
+  for (const fn of winListeners) {
+    fn({ data: { type: 'jetski-flight-deck-ping' } });
+  }
+  assert.strictEqual(
+    parentMsgs.filter((m) => m.type === 'jetski-flight-deck-rendered').length,
+    3,
+    'Ping must synchronously ack rendered state when cachedData exists',
+  );
+  await flushMicrotasks();
+  assert(statusCalls > callsBeforePing, 'Ping must trigger a background status refresh');
+
+  // Manual refresh with reloaded=true waits until /api/status returns 200 before reloading
+  statusMode = 'ok';
+  global.setTimeout = (fn, ms) => (ms <= 200 ? (fn(), 0) : origSetTimeout(fn, ms));
+  await triggerRefresh();
+  global.setTimeout = origSetTimeout;
+  assert.strictEqual(reloadCalls, 1, 'triggerRefresh must reload after backend comes back');
+
+  global.setInterval = origSetInterval;
+  console.log('EMBEDDED_HEARTBEAT_TESTS_PASSED');
+  process.exit(0);
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"""
+    cmd = ["node", "-e", js_code]
+    res = subprocess.run(
+        cmd, input=w.DASHBOARD_HTML, capture_output=True, text=True, check=False
+    )
+    self.assertEqual(
+        res.returncode, 0, f"Node output: {res.stdout}\nError: {res.stderr}"
+    )
+    self.assertIn("EMBEDDED_HEARTBEAT_TESTS_PASSED", res.stdout)
+
 
 if __name__ == "__main__":
   unittest.main()

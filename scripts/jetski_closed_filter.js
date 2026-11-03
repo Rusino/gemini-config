@@ -51,6 +51,11 @@
   const FLIGHT_DECK_MIN_WIDTH_PX = 320;
   const FLIGHT_DECK_MAX_WIDTH_PX = 900;
   const FLIGHT_DECK_INFO_TTL_MS = 10000;
+  // Bounds unrendered loads, ping acks, open-drawer silence, and reload bursts
+  const FLIGHT_DECK_LOAD_TIMEOUT_MS = 12000;
+  const FLIGHT_DECK_PING_ACK_TIMEOUT_MS = 8000;
+  const FLIGHT_DECK_OPEN_IDLE_PING_MS = 45000;
+  const FLIGHT_DECK_RELOAD_COOLDOWN_MS = 15000;
   // Deterministic Cloudtop UberProxy PEN URL for port 8089 when pen_url.sh times out
   const DEFAULT_FLIGHT_DECK_PEN_URL =
     'https://b2607f8b048001000013f0f0cac12c3b11f99000000000000000001.proxy.googlers.com';
@@ -291,6 +296,15 @@
   let flightDeckInfoFetchedAt = 0;
   // Retains the last known non-loopback PEN proxy origin across transient pen_url.sh timeouts
   let lastValidFlightDeckPenBase = DEFAULT_FLIGHT_DECK_PEN_URL;
+  // Tracks iframe load, rendered heartbeat, and liveness pings to recover stuck Loading frames
+  let flightDeckLoadStartedAt = 0;
+  let flightDeckLastReloadAt = 0;
+  let lastFlightDeckRenderedAt = 0;
+  let lastFlightDeckRenderedVer = 0;
+  let flightDeckPendingVer = 0;
+  let flightDeckPendingVerSince = 0;
+  let flightDeckPingSentAt = 0;
+  let flightDeckWatchdogTimer = 0;
   let dossierIndexCache = null;
   let dossierIndexFetchedAt = 0;
   let dossierIndexInFlight = null;
@@ -902,6 +916,14 @@
   function stripFlightDeckVersionParam(url) {
     if (typeof url !== 'string' || !url) return '';
     return url.replace(/([?&])v=\d+(&|$)/g, '$1').replace(/[?&]$/, '');
+  }
+
+  // Extracts numeric script ui_version from jetski-flight-deck.json or URL query string
+  function extractFlightDeckUiVersion(info, url) {
+    const fromInfo = Number(info?.ui_version) || 0;
+    if (fromInfo > 0) return fromInfo;
+    const m = typeof url === 'string' ? /[?&]v=(\d+)/.exec(url) : null;
+    return m ? Number(m[1]) || 0 : 0;
   }
 
   // Normalizes pen_url to preserve the last known valid non-loopback UberProxy endpoint
@@ -9344,38 +9366,180 @@
     }
   }
 
-  // Fetches current Flight Deck host URL and updates embedded iframe src
+  function clearFlightDeckWatchdog() {
+    if (flightDeckWatchdogTimer) {
+      clearTimeout(flightDeckWatchdogTimer);
+      flightDeckWatchdogTimer = 0;
+    }
+  }
+
+  // Sends a lightweight postMessage probe so rendered iframes ack without reloading
+  function pingFlightDeckIframe(iframe, now = Date.now()) {
+    const win = iframe?.contentWindow;
+    if (!win || typeof win.postMessage !== 'function') return;
+    if (!flightDeckPingSentAt) {
+      flightDeckPingSentAt = now;
+    }
+    try {
+      win.postMessage({ type: 'jetski-flight-deck-ping' }, '*');
+    } catch {
+      // Ignore detached frame errors
+    }
+  }
+
+  // Schedules a background check while the drawer is open so stuck loads recover without clicks
+  function scheduleFlightDeckWatchdog() {
+    clearFlightDeckWatchdog();
+    if (!flightDeckOpen || typeof document === 'undefined') return;
+    if (!document.getElementById(FLIGHT_DECK_DRAWER_ID)) return;
+    let delayMs = FLIGHT_DECK_OPEN_IDLE_PING_MS;
+    if (flightDeckPingSentAt > 0 || flightDeckPendingVerSince > 0) {
+      delayMs = FLIGHT_DECK_PING_ACK_TIMEOUT_MS + 250;
+    } else if (
+      flightDeckLoadStartedAt > 0 &&
+      lastFlightDeckRenderedAt < flightDeckLoadStartedAt
+    ) {
+      delayMs = Math.max(FLIGHT_DECK_LOAD_TIMEOUT_MS, FLIGHT_DECK_RELOAD_COOLDOWN_MS) + 250;
+    }
+    flightDeckWatchdogTimer = setTimeout(() => {
+      flightDeckWatchdogTimer = 0;
+      if (!flightDeckOpen || typeof document === 'undefined') return;
+      const drawerEl = document.getElementById(FLIGHT_DECK_DRAWER_ID);
+      if (!drawerEl) return;
+      if (document.hidden) {
+        scheduleFlightDeckWatchdog();
+        return;
+      }
+      const now = Date.now();
+      const iframe = drawerEl.querySelector(`.${FLIGHT_DECK_IFRAME_CLASS}`);
+      // Probe open idle drawers when no heartbeat arrived across two 20s poll intervals
+      if (
+        iframe &&
+        !flightDeckPingSentAt &&
+        lastFlightDeckRenderedAt > 0 &&
+        now - lastFlightDeckRenderedAt >= FLIGHT_DECK_OPEN_IDLE_PING_MS
+      ) {
+        flightDeckInfoFetchedAt = 0;
+        pingFlightDeckIframe(iframe, now);
+      }
+      void syncFlightDeckIframeUrl(drawerEl, false);
+    }, delayMs);
+    if (flightDeckWatchdogTimer && typeof flightDeckWatchdogTimer.unref === 'function') {
+      flightDeckWatchdogTimer.unref();
+    }
+  }
+
+  // Fetches current Flight Deck host URL and updates or recovers embedded iframe src
   function syncFlightDeckIframeUrl(drawerEl, forceReload = false) {
     if (!drawerEl) return;
     const iframe = drawerEl.querySelector(`.${FLIGHT_DECK_IFRAME_CLASS}`);
     return fetchFlightDeckInfo().then((info) => {
-      if (iframe && flightDeckOpen) {
-        const embedUrl = resolveFlightDeckUrl(info, true);
-        const curBaseSrc = iframe.getAttribute('data-base-src') || '';
-        // Ignore ?v= bumps on the same origin because Flight Deck reloads itself on ui_version
-        const prevClean = stripFlightDeckVersionParam(curBaseSrc);
-        const nextClean = stripFlightDeckVersionParam(embedUrl);
-        if (forceReload || !curBaseSrc || prevClean !== nextClean) {
-          iframe.setAttribute('data-base-src', embedUrl);
-          const sep = embedUrl.includes('?') ? '&' : '?';
-          iframe.setAttribute(
-            'src',
-            forceReload ? `${embedUrl}${sep}t=${Date.now()}` : embedUrl
-          );
+      if (!iframe || !flightDeckOpen) return;
+      const now = Date.now();
+      const embedUrl = resolveFlightDeckUrl(info, true);
+      const curBaseSrc = iframe.getAttribute('data-base-src') || '';
+      const prevClean = stripFlightDeckVersionParam(curBaseSrc);
+      const nextClean = stripFlightDeckVersionParam(embedUrl);
+      const originChanged = !curBaseSrc || prevClean !== nextClean;
+      const infoVer = extractFlightDeckUiVersion(info, embedUrl);
+      const curVer = extractFlightDeckUiVersion(null, curBaseSrc);
+      const baselineVer = lastFlightDeckRenderedVer || curVer;
+
+      let autoForceReload = false;
+      if (!forceReload && !originChanged) {
+        if (infoVer > 0 && baselineVer > 0 && infoVer !== baselineVer) {
+          if (flightDeckPendingVer !== infoVer) {
+            // Probe first on a ?v= bump so healthy iframes self-reload without double navigation
+            flightDeckPendingVer = infoVer;
+            flightDeckPendingVerSince = now;
+            pingFlightDeckIframe(iframe, now);
+          } else if (now - flightDeckPendingVerSince >= FLIGHT_DECK_PING_ACK_TIMEOUT_MS) {
+            autoForceReload = true;
+          }
+        } else if (flightDeckPendingVer > 0 && infoVer === lastFlightDeckRenderedVer) {
+          flightDeckPendingVer = 0;
+          flightDeckPendingVerSince = 0;
+        }
+
+        if (
+          flightDeckPingSentAt > 0 &&
+          now - flightDeckPingSentAt >= FLIGHT_DECK_PING_ACK_TIMEOUT_MS
+        ) {
+          autoForceReload = true;
+        } else if (
+          flightDeckLoadStartedAt > 0 &&
+          lastFlightDeckRenderedAt < flightDeckLoadStartedAt &&
+          now - flightDeckLoadStartedAt >= FLIGHT_DECK_LOAD_TIMEOUT_MS
+        ) {
+          autoForceReload = true;
+        }
+
+        if (
+          autoForceReload &&
+          flightDeckLastReloadAt > 0 &&
+          now - flightDeckLastReloadAt < FLIGHT_DECK_RELOAD_COOLDOWN_MS
+        ) {
+          autoForceReload = false;
         }
       }
+
+      // Append cache-busting timestamp only on forced reloads so initial origin loads stay clean
+      if (forceReload || originChanged || autoForceReload) {
+        const bustCache = Boolean(forceReload || autoForceReload);
+        iframe.setAttribute('data-base-src', embedUrl);
+        const sep = embedUrl.includes('?') ? '&' : '?';
+        iframe.setAttribute('src', bustCache ? `${embedUrl}${sep}t=${now}` : embedUrl);
+        flightDeckLoadStartedAt = now;
+        if (bustCache) {
+          flightDeckLastReloadAt = now;
+        }
+        flightDeckPendingVer = 0;
+        flightDeckPendingVerSince = 0;
+        flightDeckPingSentAt = 0;
+      }
+      scheduleFlightDeckWatchdog();
     });
   }
 
   // Toggles or sets Flight Deck side panel open state and persists to storage
   function setFlightDeckOpen(nextOpen) {
+    // Capture prior visibility so reopening a closed drawer probes or reloads stuck frames
+    const wasOpen = flightDeckOpen;
     flightDeckOpen = Boolean(nextOpen);
     safeSetStorage(STORAGE_FLIGHT_DECK_OPEN_KEY, flightDeckOpen ? 'true' : 'false');
+    if (!flightDeckOpen) {
+      flightDeckPingSentAt = 0;
+      clearFlightDeckWatchdog();
+      ensureFlightDeckUI();
+      return;
+    }
+    if (!wasOpen) {
+      // Refresh jetski-flight-deck.json on drawer open so recent daemon restarts are picked up
+      flightDeckInfoFetchedAt = 0;
+      const drawerEl = document.getElementById(FLIGHT_DECK_DRAWER_ID);
+      const iframe = drawerEl?.querySelector(`.${FLIGHT_DECK_IFRAME_CLASS}`);
+      const hasPriorSrc = Boolean(
+        iframe?.getAttribute('data-base-src') || iframe?.getAttribute('src')
+      );
+      const currentSrcRendered =
+        hasPriorSrc &&
+        flightDeckLoadStartedAt > 0 &&
+        lastFlightDeckRenderedAt >= flightDeckLoadStartedAt;
+      if (hasPriorSrc && !currentSrcRendered) {
+        // Current iframe never rendered its payload; reload immediately on manual reopen
+        ensureFlightDeckToggle();
+        ensureFlightDeckDrawer(true);
+        return;
+      }
+      if (hasPriorSrc && currentSrcRendered && iframe) {
+        pingFlightDeckIframe(iframe, Date.now());
+      }
+    }
     ensureFlightDeckUI();
   }
 
-  // Mounts or updates the Flight Deck resizable right-hand drawer and iframe
-  function ensureFlightDeckDrawer() {
+  // Mounts or updates the Flight Deck resizable right-hand drawer and optional forced reload
+  function ensureFlightDeckDrawer(forceReload = false) {
     if (typeof document === 'undefined' || !document.body) return null;
     let drawerEl = document.getElementById(FLIGHT_DECK_DRAWER_ID);
     if (!drawerEl) {
@@ -9478,7 +9642,8 @@
       document.body.removeAttribute('data-jetski-flight-deck-open');
     }
 
-    void syncFlightDeckIframeUrl(drawerEl, false);
+    // Forward caller reload flag so manual reopen of stuck Loading forces a fresh navigation
+    void syncFlightDeckIframeUrl(drawerEl, forceReload);
     return drawerEl;
   }
 
@@ -9546,6 +9711,19 @@
       }
     } else if (data.type === 'jetski-flight-deck-close') {
       setFlightDeckOpen(false);
+    } else if (data.type === 'jetski-flight-deck-rendered') {
+      // Clear pending ?v= bump only when the acked uiVersion caught up to the target version
+      lastFlightDeckRenderedAt = Date.now();
+      const ver = Number(data.uiVersion) || 0;
+      if (ver > 0) {
+        lastFlightDeckRenderedVer = ver;
+      }
+      if (!flightDeckPendingVer || (ver > 0 && ver >= flightDeckPendingVer)) {
+        flightDeckPendingVer = 0;
+        flightDeckPendingVerSince = 0;
+      }
+      flightDeckPingSentAt = 0;
+      scheduleFlightDeckWatchdog();
     }
   }
 
@@ -13172,6 +13350,8 @@
       el.remove();
     }
     const fdDrawer = document.getElementById(FLIGHT_DECK_DRAWER_ID);
+    // Cancel open-drawer liveness timer when tearing down the injected filter instance
+    clearFlightDeckWatchdog();
     if (fdDrawer) {
       fdDrawer.remove();
     }

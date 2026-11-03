@@ -171,8 +171,8 @@ console.log(JSON.stringify({
   lostApprovalBadges: badgesHtml(lostApprovalCl)
 }));
 """
-    cmd = ["node", "-e", harness]
-    out = subprocess.check_output(cmd, encoding="utf-8")
+    # Feed DASHBOARD_HTML harness via stdin to stay below Linux 128 KB MAX_ARG_STRLEN
+    out = subprocess.check_output(["node", "-"], input=harness, encoding="utf-8")
     data = json.loads(out)
 
     self.assertEqual(data["reviewedLane"], "waiting")
@@ -313,8 +313,8 @@ console.log(JSON.stringify({
   badges: badgesHtml(cl)
 }));
 """
-    cmd = ["node", "-e", harness]
-    out = subprocess.check_output(cmd, encoding="utf-8")
+    # Feed DASHBOARD_HTML harness via stdin to stay below Linux 128 KB MAX_ARG_STRLEN
+    out = subprocess.check_output(["node", "-"], input=harness, encoding="utf-8")
     data = json.loads(out)
 
     card = data["card"]

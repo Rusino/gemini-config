@@ -361,8 +361,9 @@ console.log(JSON.stringify({
   otherWatchRow: rowHtml(otherConflictWatching, box),
 }));
 """
+    # Feed DASHBOARD_HTML harness via stdin to stay below Linux 128 KB MAX_ARG_STRLEN
     proc = subprocess.run(
-        ["node", "-e", harness], capture_output=True, text=True, check=True
+        ["node", "-"], input=harness, capture_output=True, text=True, check=True
     )
     out = json.loads(proc.stdout.strip())
     self.assertEqual(out["ownLane"], "you")
@@ -684,8 +685,9 @@ console.log(JSON.stringify({
   lane: laneOf(removedReviewerConflict),
 }));
 """
+    # Feed DASHBOARD_HTML harness via stdin to stay below Linux 128 KB MAX_ARG_STRLEN
     proc = subprocess.run(
-        ["node", "-e", harness], capture_output=True, text=True, check=True
+        ["node", "-"], input=harness, capture_output=True, text=True, check=True
     )
     out = json.loads(proc.stdout.strip())
     self.assertEqual(out["status"], "watching")
@@ -787,8 +789,9 @@ const item = {
   }));
 })();
 """
+    # Feed DASHBOARD_HTML harness via stdin to stay below Linux 128 KB MAX_ARG_STRLEN
     proc = subprocess.run(
-        ["node", "-e", harness], capture_output=True, text=True, check=True
+        ["node", "-"], input=harness, capture_output=True, text=True, check=True
     )
     out = json.loads(proc.stdout.strip())
     self.assertIn('target="jetski-chat"', out["actionHtml"])

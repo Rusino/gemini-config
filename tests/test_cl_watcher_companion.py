@@ -501,8 +501,9 @@ console.log(JSON.stringify({
   visibleKeys: visibleAll.map(x => x.item_key),
 }));
 """
+    # Feed DASHBOARD_HTML harness via stdin to stay below Linux 128 KB MAX_ARG_STRLEN
     proc = subprocess.run(
-        ["node", "-e", harness], capture_output=True, text=True, check=True
+        ["node", "-"], input=harness, capture_output=True, text=True, check=True
     )
     out = json.loads(proc.stdout.strip())
 
