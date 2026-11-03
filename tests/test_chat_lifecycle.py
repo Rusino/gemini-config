@@ -2108,6 +2108,38 @@ class TestChatLifecycle(unittest.TestCase):
       self.assertTrue(chat_lifecycle.is_valid_chat_topic(good), f"Expected '{good}' accepted")
       self.assertEqual(chat_lifecycle.validate_chat_topic(good), good)
 
+  # Rejects bare entity + generic CL-subject action verb topics that omit the domain subject
+  def test_generic_action_verbs_rejected_without_domain_subject(self):
+    for bad in [
+        "crrev/c/8664078 Add",
+        "crrev/c/8664078 Adds",
+        "crrev/c/8664078 Adding",
+        "crrev/c/8664078 Added",
+        "Gerrit 1414016 Remove",
+        "Gerrit 1414016 Move",
+        "Gerrit 1414016 Extract",
+        "PR #195122 Implement",
+        "PR #195122 Support",
+        "PR #195122 Enable",
+        "PR #195122 Disable",
+        "crrev/c/8664078 Allow",
+        "crrev/c/8664078 Drop",
+        "crrev/c/8664078 Split",
+        "crrev/c/8664078 Rename",
+        "crrev/c/8664078 Use",
+    ]:
+      self.assertFalse(chat_lifecycle.is_valid_chat_topic(bad), f"Expected '{bad}' rejected")
+      with self.assertRaises(chat_lifecycle.InvalidTopicError):
+        chat_lifecycle.validate_chat_topic(bad)
+
+    for good in [
+        "crrev/c/8664078 ShapedText/GlyphRun",
+        "crrev/c/8663799 Add WPT tests",
+        "PR #195122 Split TextLine runs",
+    ]:
+      self.assertTrue(chat_lifecycle.is_valid_chat_topic(good), f"Expected '{good}' accepted")
+      self.assertEqual(chat_lifecycle.validate_chat_topic(good), good)
+
   def test_derive_fallback_topic_from_state_file_and_prompt(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
       st_path = os.path.join(tmp_dir, "state.md")

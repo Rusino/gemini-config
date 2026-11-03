@@ -425,6 +425,100 @@ class ClWatcherUnchattedAndCrrevTest(unittest.TestCase):
       self.assertLessEqual(len(topic), w.TITLE_TOPIC_MAX)
       self.assertEqual(w.cl.validate_chat_topic(topic), topic)
 
+  # Covers crrev/c/8664078 and crrev/c/8663799 verb omission, "/" splitting, and trailing stops
+  def test_build_start_chat_topic_omits_budget_eating_verb_and_trailing_stopwords(self):
+    cases = (
+        (
+            {
+                "kind": "gerrit",
+                "target_id": "8664078",
+                "host": "chromium-review.googlesource.com",
+                "subject": "[canvas] Add ShapedText/GlyphRun Canvas text shaping APIs",
+                "project_name": "TextClusters API",
+            },
+            "crrev/c/8664078 ShapedText/GlyphRun",
+        ),
+        (
+            {
+                "kind": "gerrit",
+                "target_id": "8663799",
+                "host": "chromium-review.googlesource.com",
+                "subject": "[canvas] Add WPT tests for ShapedText/GlyphRun text shaping APIs",
+                "project_name": "TextClusters API",
+            },
+            "crrev/c/8663799 Add WPT tests",
+        ),
+        (
+            {
+                "kind": "gerrit",
+                "target_id": "8664078",
+                "host": "chromium-review.googlesource.com",
+                "subject": "[canvas] Add ShapedText/GlyphRun/TextCluster shaping APIs",
+            },
+            "crrev/c/8664078 ShapedText/GlyphRun",
+        ),
+        (
+            {
+                "kind": "gerrit",
+                "target_id": "8664078",
+                "host": "chromium-review.googlesource.com",
+                "subject": "[canvas] Add ShapedText/GlyphRunClusterIterator APIs",
+            },
+            "crrev/c/8664078 Add ShapedText",
+        ),
+        (
+            {
+                "kind": "gerrit",
+                "target_id": "8664078",
+                "host": "chromium-review.googlesource.com",
+                "subject": "[canvas] Implement CanvasShapedText/GlyphRun APIs",
+            },
+            "crrev/c/8664078 CanvasShapedText",
+        ),
+        (
+            {
+                "kind": "gerrit",
+                "target_id": "8664078",
+                "host": "chromium-review.googlesource.com",
+                "subject": "[canvas] Remove the ShapedText/GlyphRun Canvas text shaping APIs",
+            },
+            "crrev/c/8664078 ShapedText/GlyphRun",
+        ),
+        (
+            {
+                "kind": "gerrit",
+                "target_id": "8663799",
+                "host": "chromium-review.googlesource.com",
+                "subject": "[canvas] Add WPT tests in the ShapedText suite",
+            },
+            "crrev/c/8663799 Add WPT tests",
+        ),
+        (
+            {
+                "kind": "gerrit",
+                "target_id": "8664078",
+                "host": "chromium-review.googlesource.com",
+                "subject": "[canvas] Add",
+                "project_name": "TextClusters API",
+            },
+            "crrev/c/8664078 canvas Add",
+        ),
+        (
+            {
+                "kind": "gerrit",
+                "target_id": "1414016",
+                "host": "skia-review.googlesource.com",
+                "subject": "[skia] Test Fontations only",
+            },
+            "Gerrit 1414016 Test Fontations only",
+        ),
+    )
+    for rec, expected in cases:
+      topic = w._build_start_chat_topic(rec)
+      self.assertEqual(topic, expected)
+      self.assertLessEqual(len(topic), w.TITLE_TOPIC_MAX)
+      self.assertEqual(w.cl.validate_chat_topic(topic), topic)
+
     with mock.patch.object(
         w.urllib.request,
         "urlopen",

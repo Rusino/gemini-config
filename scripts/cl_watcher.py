@@ -5929,6 +5929,44 @@ def update_chat_roll_badge(conv_id: str, current_title: str, badge: str) -> None
     pass
 
 
+# Generic CL-subject verbs omitted at word 0 only when keeping them crowds out domain tokens
+_LEADING_GENERIC_TOPIC_VERBS = frozenset({
+    "add", "adds", "adding", "added",
+    "remove", "removes", "removing", "removed",
+    "move", "moves", "moving", "moved",
+    "extract", "extracts", "extracting", "extracted",
+    "implement", "implements", "implementing", "implemented",
+    "support", "supports", "supporting", "supported",
+    "enable", "enables", "enabling", "enabled",
+    "disable", "disables", "disabling", "disabled",
+    "allow", "allows", "allowing", "allowed",
+    "drop", "drops", "dropping", "dropped",
+    "split", "splits", "splitting",
+    "rename", "renames", "renaming", "renamed",
+    "use", "uses", "using", "used",
+    "fix", "fixes", "fixing", "fixed",
+    "update", "updates", "updating", "updated",
+    "refactor", "refactors", "refactoring", "refactored",
+})
+_POST_VERB_TOPIC_FILLERS = frozenset({
+    "a", "an", "the", "to", "for", "of", "on", "in", "with", "from", "into",
+})
+# Prepositions, conjunctions, and articles that cannot stand at the end even without truncation
+_ALWAYS_DANGLING_TOPIC_TAILS = frozenset({
+    "a", "an", "the", "of", "at", "to", "for", "with", "from", "by",
+    "into", "onto", "upon", "and", "or", "but", "nor", "via",
+})
+# Keep adverbial particles ("out", "up", "down", "all", "only") intact on phrasal verbs like
+# "Bail out" or "Clean up" while stripping prepositions and subordinators after truncation
+_TRUNCATED_DANGLING_TOPIC_TAILS = (
+    cl.TOPIC_STOP_WORDS - frozenset({"out", "up", "down", "all", "only"})
+) | frozenset({
+    "via", "when", "where", "while", "before", "after", "without", "within",
+    "between", "through", "across", "during", "against", "per", "vs", "vs.",
+})
+_DANGLING_CONNECTOR_TOKENS = frozenset({"-", "–", "—", "/", "&", "+", "|", ":"})
+
+
 def _build_start_chat_topic(rec: dict[str, Any]) -> str:
   """Builds a validated <38-char chat topic naming the shortlink and change subject."""
   # Accept both CL/PR records (kind/target_id/subject) and bug records (source/id/title)
@@ -5954,17 +5992,97 @@ def _build_start_chat_topic(rec: dict[str, Any]) -> str:
     id_tok = f"cl/{tid}"
     default_sub = "Skia"
 
-  def _fit_words(text: str) -> str:
+  # Fits phrase words after id_tok within TITLE_TOPIC_MAX and strips dangling tail tokens
+  def _fit_once(phrase: str) -> str:
+    raw_words = phrase.split()
+    if not raw_words:
+      return ""
     words: list[str] = []
-    for w_tok in text.split():
+    truncated = False
+    for w_tok in raw_words:
       cand = f"{id_tok} {' '.join([*words, w_tok])}"
-      if len(cand) > TITLE_TOPIC_MAX:
-        break
-      words.append(w_tok)
-    if not words and text:
+      if len(cand) <= TITLE_TOPIC_MAX:
+        words.append(w_tok)
+        continue
+      truncated = True
+      # Split compound Foo/Bar tokens at "/" when the full token exceeds TITLE_TOPIC_MAX
+      if (
+          "/" in w_tok
+          and "://" not in w_tok
+          and not w_tok.startswith("/")
+          and not re.match(r"^(?:crrev|skrev|crbug|cl|b)(?:\.com)?/", w_tok, re.IGNORECASE)
+      ):
+        slash_fit = ""
+        # Keep the longest "/"-joined prefix that still fits inside TITLE_TOPIC_MAX
+        for part in (p for p in w_tok.split("/") if p):
+          cand_part = f"{slash_fit}/{part}" if slash_fit else part
+          if len(f"{id_tok} {' '.join([*words, cand_part])}") > TITLE_TOPIC_MAX:
+            break
+          slash_fit = cand_part
+        probe = slash_fit.strip(".,;:()[]{}\"'")
+        # Reject tiny abbreviations ("I/O") or generic prefixes that add no domain signal
+        if (
+            len(probe) >= 3
+            and probe.lower() not in cl.TOPIC_STOP_WORDS
+            and probe.lower() not in cl.GENERIC_TOPIC_WORDS
+        ):
+          words.append(slash_fit)
+      break
+
+    tail_stops = (
+        _TRUNCATED_DANGLING_TOPIC_TAILS if truncated else _ALWAYS_DANGLING_TOPIC_TAILS
+    )
+    # Pop prepositions, articles, and connectors left dangling at the cut point
+    while words:
+      if truncated:
+        words[-1] = words[-1].rstrip(",;:")
+      probe = words[-1].strip(".,;:([\"'")
+      if (
+          not probe
+          or words[-1] in _DANGLING_CONNECTOR_TOKENS
+          or probe.lower() in tail_stops
+      ):
+        words.pop()
+        continue
+      break
+
+    # Fall back to slicing the first token when a single long identifier exceeds the budget
+    if not words and raw_words:
       rem = max(4, TITLE_TOPIC_MAX - 1 - len(id_tok))
-      words = [text[:rem].rstrip()]
+      sliced = raw_words[0][:rem].rstrip(".,;:-_/([\"'")
+      if sliced and sliced.lower() not in tail_stops:
+        words = [sliced]
     return f"{id_tok} {' '.join(words)}"[:TITLE_TOPIC_MAX].rstrip() if words else ""
+
+  # Retries without a leading generic verb when truncation crowded out concrete domain words
+  def _fit_words(text: str) -> str:
+    cand_full = _fit_once(text)
+    raw_words = text.split()
+    if (
+        len(raw_words) < 2
+        or len(f"{id_tok} {' '.join(raw_words)}") <= TITLE_TOPIC_MAX
+        or raw_words[0].strip(".,;:()[]{}\"'").lower() not in _LEADING_GENERIC_TOPIC_VERBS
+    ):
+      return cand_full
+    rest = raw_words[1:]
+    # Strip coordinated generic verbs ("Add and update ...") and articles ("Remove the ...")
+    while len(rest) >= 2 and rest[0].lower() in ("and", "or"):
+      if rest[1].strip(".,;:()[]{}\"'").lower() not in _LEADING_GENERIC_TOPIC_VERBS:
+        break
+      rest = rest[2:]
+    while rest and rest[0].strip(".,;:([\"'").lower() in _POST_VERB_TOPIC_FILLERS:
+      rest = rest[1:]
+    if not rest:
+      return cand_full
+    cand_stripped = _fit_once(" ".join(rest))
+    if not cand_stripped or not cl.is_valid_chat_topic(cand_stripped):
+      return cand_full
+    # Omit the leading generic verb only when its budget displaced a concrete domain token
+    if len(cl._analyze_topic_tokens(cand_stripped)[2]) > len(
+        cl._analyze_topic_tokens(cand_full)[2]
+    ):
+      return cand_stripped
+    return cand_full
 
   raw_subj = str(rec.get("subject") or rec.get("title") or "")
   if _is_placeholder_bug_title(raw_subj):
