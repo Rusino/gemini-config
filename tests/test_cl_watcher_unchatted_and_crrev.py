@@ -937,7 +937,7 @@ console.log(JSON.stringify({
     )
     out = json.loads(proc.stdout.strip())
     self.assertIn("Has companion CL 1410416 (WIP)", out["parentRow"])
-    self.assertIn("Needs +1 reviewer (1/2)", out["parentState"])
+    self.assertIn("After your CR+1: +1 Googler (1/2)", out["parentState"])
     self.assertIn('<span class="badge wip">WIP</span>', out["compRow"])
     self.assertIn("Companion → CL 1409697", out["compRow"])
     self.assertNotIn("No reviewers assigned", out["compState"])
