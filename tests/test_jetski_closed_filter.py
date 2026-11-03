@@ -2091,6 +2091,7 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(headerRight.children[0], fitBtn);
   assert.strictEqual(headerRight.children[1], toggleBtn);
   assert.strictEqual(fitBtn.getAttribute('data-fitted'), 'false');
+  assert.strictEqual(fitBtn.getAttribute('aria-disabled'), 'false');
   assert.strictEqual(fitBtn.getAttribute('data-icon'), 'fit');
   assert.strictEqual(fitBtn.getAttribute('aria-label'), 'Fit height to section (empty)');
   assert.strictEqual(fitBtn.hasAttribute('title'), false);
@@ -2102,26 +2103,30 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(inboxEl.getAttribute('data-list-height'), '24');
   assert.strictEqual(inboxEl.getAttribute('data-fitted'), 'true');
   assert.strictEqual(fitBtn.getAttribute('data-fitted'), 'true');
+  assert.strictEqual(fitBtn.getAttribute('aria-disabled'), 'true');
   assert.strictEqual(fitBtn.getAttribute('data-icon'), 'fit');
   assert.strictEqual(fitBtn.getAttribute('aria-label'), 'Fit height to section (empty)');
   assert.strictEqual(storage.get('jetski_inbox_height_v1'), '90');
 
-  // Clicking fit button again stays fitted without toggling into restore
+  // Clicking disabled fit button stays fitted and does not collapse inbox header
   advanceClock();
   fitBtn.dispatchEvent('pointerdown', { button: 0 });
   fitBtn.dispatchEvent('click', { button: 0 });
+  assert.strictEqual(inboxEl.getAttribute('data-collapsed'), 'false');
   assert.strictEqual(inboxListEl.style.height, '24px');
   assert.strictEqual(inboxEl.getAttribute('data-list-height'), '24');
   assert.strictEqual(inboxEl.getAttribute('data-fitted'), 'true');
   assert.strictEqual(fitBtn.getAttribute('data-fitted'), 'true');
+  assert.strictEqual(fitBtn.getAttribute('aria-disabled'), 'true');
   assert.strictEqual(fitBtn.getAttribute('data-icon'), 'fit');
 
-  // Double-clicking resize handle resets to 90px and clears fitted mode
+  // Double-clicking resize handle resets to 90px and re-enables fit button
   resizeHandleEl.dispatchEvent('dblclick');
   assert.strictEqual(inboxListEl.style.height, '90px');
   assert.strictEqual(inboxEl.getAttribute('data-list-height'), '90');
   assert.strictEqual(inboxEl.getAttribute('data-fitted'), 'false');
   assert.strictEqual(fitBtn.getAttribute('data-fitted'), 'false');
+  assert.strictEqual(fitBtn.getAttribute('aria-disabled'), 'false');
   assert.strictEqual(fitBtn.getAttribute('data-icon'), 'fit');
 
   // Verify the 3 tabs in headerLeft
@@ -2318,6 +2323,7 @@ const liveBucketBtn = (k) =>
   // Single-line rows (3 * 22px + 2px top padding = 68px < 90px) carry no inline detail or title
   assert.strictEqual(inboxRows[0].hasAttribute('title'), false);
   assert.strictEqual(inboxRows[0].querySelector('[data-testid="jetski-inbox-detail"]'), null);
+  assert.strictEqual(fitBtn.getAttribute('aria-disabled'), 'false');
   assert.strictEqual(fitBtn.getAttribute('aria-label'), 'Shrink height to fit 3 chats');
   advanceClock();
   fitBtn.dispatchEvent('pointerdown', { button: 0 });
@@ -2325,20 +2331,28 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(inboxListEl.style.height, '68px');
   assert.strictEqual(inboxEl.getAttribute('data-fitted'), 'true');
   assert.strictEqual(fitBtn.getAttribute('data-fitted'), 'true');
+  assert.strictEqual(fitBtn.getAttribute('aria-disabled'), 'true');
   assert.strictEqual(fitBtn.getAttribute('data-icon'), 'fit');
   assert.strictEqual(fitBtn.getAttribute('aria-label'), 'Fit height to all 3 chats');
 
-  // Switching tabs does not auto-jump height while fitted; dblclick on resize handle resets to 90px
+  // Switching to Working (2 chats = 46px != 68px) re-enables fit button without jumping height
   advanceClock();
   tabWorking.dispatchEvent('pointerdown', { button: 0 });
   tabWorking.dispatchEvent('click', { button: 0 });
   assert.strictEqual(inboxListEl.style.height, '68px');
+  assert.strictEqual(inboxEl.getAttribute('data-fitted'), 'false');
+  assert.strictEqual(fitBtn.getAttribute('data-fitted'), 'false');
+  assert.strictEqual(fitBtn.getAttribute('aria-disabled'), 'false');
   advanceClock();
   tabNeedsMe.dispatchEvent('pointerdown', { button: 0 });
   tabNeedsMe.dispatchEvent('click', { button: 0 });
+  assert.strictEqual(inboxEl.getAttribute('data-fitted'), 'true');
+  assert.strictEqual(fitBtn.getAttribute('data-fitted'), 'true');
+  assert.strictEqual(fitBtn.getAttribute('aria-disabled'), 'true');
   resizeHandleEl.dispatchEvent('dblclick');
   assert.strictEqual(inboxListEl.style.height, '90px');
   assert.strictEqual(inboxEl.getAttribute('data-fitted'), 'false');
+  assert.strictEqual(fitBtn.getAttribute('aria-disabled'), 'false');
 
   // When DOM scrollHeight exceeds 90px (e.g. 198px), fit immediately expands to 198px
   inboxListEl.scrollHeight = 198;
@@ -2348,9 +2362,10 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(inboxListEl.style.height, '198px');
   assert.strictEqual(inboxEl.getAttribute('data-list-height'), '198');
   assert.strictEqual(fitBtn.getAttribute('data-fitted'), 'true');
+  assert.strictEqual(fitBtn.getAttribute('aria-disabled'), 'true');
   assert.strictEqual(fitBtn.getAttribute('data-icon'), 'fit');
   assert.strictEqual(fitBtn.getAttribute('aria-label'), 'Fit height to all 3 chats');
-  // Re-clicking fit retains 198px; dblclick resets to default 90px
+  // Re-clicking disabled fit retains 198px; dblclick resets to default 90px and re-enables fit
   advanceClock();
   fitBtn.dispatchEvent('pointerdown', { button: 0 });
   fitBtn.dispatchEvent('click', { button: 0 });
@@ -2358,6 +2373,7 @@ const liveBucketBtn = (k) =>
   resizeHandleEl.dispatchEvent('dblclick');
   assert.strictEqual(inboxListEl.style.height, '90px');
   assert.strictEqual(fitBtn.getAttribute('data-fitted'), 'false');
+  assert.strictEqual(fitBtn.getAttribute('aria-disabled'), 'false');
   delete inboxListEl.scrollHeight;
 
   // Clicking an inbox row navigates to that conversation, but does NOT dismiss it

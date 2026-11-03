@@ -6809,15 +6809,16 @@
         flex-shrink: 0;
         transition: color 100ms ease, opacity 100ms ease, background-color 100ms ease;
       }
-      .${INBOX_FIT_BTN_CLASS}:hover {
+      .${INBOX_FIT_BTN_CLASS}:hover:not([aria-disabled="true"]) {
         color: var(--foreground, #e8eaed);
         opacity: 1;
         background: rgba(128, 134, 139, 0.16);
       }
-      .${INBOX_FIT_BTN_CLASS}[data-fitted="true"] {
-        color: #8ab4f8;
-        opacity: 0.95;
-        background: rgba(138, 180, 248, 0.14);
+      .${INBOX_FIT_BTN_CLASS}[aria-disabled="true"] {
+        color: var(--muted-foreground, #9aa0a6);
+        opacity: 0.28;
+        background: transparent;
+        cursor: default;
       }
       .${INBOX_TOGGLE_BTN_CLASS} {
         background: transparent;
@@ -10811,12 +10812,17 @@
     fitBtn.className = INBOX_FIT_BTN_CLASS;
     fitBtn.setAttribute('data-testid', 'jetski-inbox-fit-btn');
     fitBtn.setAttribute('data-fitted', 'false');
+    fitBtn.setAttribute('aria-disabled', 'false');
     fitBtn.setAttribute('data-icon', 'fit');
     fitBtn.setAttribute('aria-label', 'Fit height to section (empty)');
     fitBtn.innerHTML = INBOX_FIT_ICON_SVG;
 
     bindHoverBubble(fitBtn, () => fitBtn.getAttribute('aria-label') || 'Fit height to chats');
     bindActionBtnHandlers(fitBtn, () => {
+      // Ignore clicks when already fitted while keeping stopPropagation active over headerEl
+      if (fitBtn.getAttribute('aria-disabled') === 'true') {
+        return;
+      }
       if (inboxCollapsed) {
         inboxCollapsed = false;
         safeSetStorage(STORAGE_INBOX_COLLAPSED_KEY, 'false');
@@ -10886,6 +10892,12 @@
       const onMove = (ev) => {
         const delta = (Number(ev.clientY) || 0) - startY;
         applyInboxListHeight(el, listContainer, startHeight + delta, false);
+        // Re-enable fit button immediately during live drag once height diverges from start
+        if (inboxListHeightPx !== startHeight) {
+          setAttrIfChanged(el, 'data-fitted', 'false');
+          setAttrIfChanged(fitBtn, 'data-fitted', 'false');
+          setAttrIfChanged(fitBtn, 'aria-disabled', 'false');
+        }
       };
 
       const onEnd = () => {
@@ -11186,7 +11198,6 @@
     const currentTabItems = itemsByTab[activeInboxTab] || [];
     // Cache rendered items for on-demand height computation when clicking fitBtn
     lastRenderedInboxItems = currentTabItems;
-    setAttrIfChanged(inboxEl, 'data-fitted', inboxFitted ? 'true' : 'false');
 
     if (inboxEl.getAttribute('data-active-tab') !== activeInboxTab) {
       inboxEl.setAttribute('data-active-tab', activeInboxTab);
@@ -11296,13 +11307,15 @@
       }
     }
 
-    // Sync fit button icon and dynamic aria-label without auto-resizing on tab switch
+    // Disable fit button when expanded height already matches the active tab's chat rows
+    const previewFitH = computeInboxFitHeightPx(inboxEl, listContainer, currentTabItems);
+    const isAtFitHeight = !inboxCollapsed && inboxListHeightPx === previewFitH;
+    setAttrIfChanged(inboxEl, 'data-fitted', isAtFitHeight ? 'true' : 'false');
     const fitBtn = inboxEl.querySelector(`.${INBOX_FIT_BTN_CLASS}`);
     if (fitBtn) {
-      setAttrIfChanged(fitBtn, 'data-fitted', inboxFitted ? 'true' : 'false');
+      setAttrIfChanged(fitBtn, 'data-fitted', isAtFitHeight ? 'true' : 'false');
+      setAttrIfChanged(fitBtn, 'aria-disabled', isAtFitHeight ? 'true' : 'false');
       setAttrIfChanged(fitBtn, 'data-icon', 'fit');
-      const listContainer = inboxEl.querySelector(`.${INBOX_LIST_CLASS}`);
-      const previewFitH = computeInboxFitHeightPx(inboxEl, listContainer, currentTabItems);
       const n = currentTabItems.length;
       const noun = n === 1 ? 'chat' : 'chats';
       let fitLabel = `Fit height to all ${n} ${noun}`;
