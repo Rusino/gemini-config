@@ -705,6 +705,305 @@ console.log(JSON.stringify({
     })
     self.assertTrue(piper_title.startswith("cl/1008075988 "), piper_title)
 
+  # Verifies 1-click Skia 2nd reviewer actions, stack sibling boost, spine, and /api/add_reviewer
+  def test_assign_second_reviewer_primary_actions_stack_header_and_api(self):
+    base_payload = {
+        "status": "NEW",
+        "subject": "[skparagraph] Measure the hit glyph with its own justification shift",
+        "owner": {"email": "dbebawy@gmail.com", "name": "David H Bebawy"},
+        "current_revision": "rev1",
+        "revisions": {
+            "rev1": {
+                "_number": 1,
+                "files": {"modules/skparagraph/src/TextLine.cpp": {}},
+            }
+        },
+        "attention_set": {},
+        "reviewers": {
+            "REVIEWER": [
+                {"email": "jlavrova@google.com", "name": "Julia Lavrova"},
+                {"email": "I@YeungKC.com", "name": "KC Yeung"},
+            ],
+            "CC": [],
+        },
+        "labels": {
+            "Code-Review": {
+                "all": [
+                    {"email": "jlavrova@google.com", "value": 1},
+                    {"email": "I@YeungKC.com", "value": 1},
+                ]
+            },
+            "Commit-Queue": {"all": []},
+        },
+        "submit_requirements": [
+            {"name": "Review-Enforcement", "status": "UNSATISFIED"},
+            {"name": "Code-Review", "status": "SATISFIED"},
+            {"name": "Code-Owners", "status": "SATISFIED"},
+        ],
+        "messages": [
+            {
+                "_revision_number": 1,
+                "author": {"email": "jlavrova@google.com", "name": "Julia Lavrova"},
+                "date": "2026-11-02 20:20:00.000000000",
+                "message": "Patch Set 1: Code-Review+1",
+            }
+        ],
+    }
+    with mock.patch.object(
+        w.urllib.request, "urlopen", return_value=_FakeGerritResponse(base_payload)
+    ), mock.patch.object(w, "gerrit_mergeable", return_value=True), mock.patch.object(
+        w, "google_account_active", return_value=True
+    ):
+      res_text = w.fetch_gerrit_cl_status("1414016", {}, [], skia_dir="/nonexistent")
+
+    self.assertEqual(res_text["approved_count"], 1)
+    self.assertEqual(res_text["missing_approvals"], 1)
+    self.assertEqual(res_text["missing_reviewers_to_assign"], 1)
+    self.assertEqual(res_text["sponsor_action"], "assign_second_reviewer")
+    self.assertEqual(
+        [c["short"] for c in res_text["suggested_second_reviewers"]],
+        ["Alexis", "Florin"],
+    )
+
+    ck_payload = json.loads(json.dumps(base_payload))
+    ck_payload["revisions"]["rev1"]["files"] = {"modules/canvaskit/paragraph.js": {}}
+    ck_payload["reviewer_updates"] = [
+        {"state": "REMOVED", "reviewer": {"email": "fmalita@google.com"}}
+    ]
+    with mock.patch.object(
+        w.urllib.request, "urlopen", return_value=_FakeGerritResponse(ck_payload)
+    ), mock.patch.object(w, "gerrit_mergeable", return_value=True), mock.patch.object(
+        w, "google_account_active", return_value=True
+    ):
+      res_removed = w.fetch_gerrit_cl_status("1404496", {}, [], skia_dir="/nonexistent")
+    self.assertEqual(
+        [c["email"] for c in res_removed["suggested_second_reviewers"]],
+        ["alexisdavidc@google.com"],
+    )
+
+    ck_payload["reviewer_updates"] = []
+    with mock.patch.object(
+        w.urllib.request, "urlopen", return_value=_FakeGerritResponse(ck_payload)
+    ), mock.patch.object(w, "gerrit_mergeable", return_value=True), mock.patch.object(
+        w, "google_account_active", return_value=True
+    ):
+      res_ck = w.fetch_gerrit_cl_status("1404496", {}, [], skia_dir="/nonexistent")
+      res_cr = w.fetch_gerrit_cl_status(
+          "7686597",
+          {},
+          [],
+          skia_dir="/nonexistent",
+          preferred_host=w.GERRIT_CHROMIUM_HOST,
+      )
+    self.assertEqual(
+        [c["short"] for c in res_ck["suggested_second_reviewers"]],
+        ["Florin", "Alexis"],
+    )
+    self.assertEqual(res_cr["suggested_second_reviewers"], [])
+
+    c1 = dict(res_text)
+    c1.update({
+        "item_key": "gerrit:1414016",
+        "kind": "gerrit",
+        "target_id": "1414016",
+        "project_name": "SkParagraph",
+        "stack_ikeys": ["gerrit:1414016", "gerrit:1414017"],
+    })
+    c2 = dict(res_text)
+    c2.update({
+        "item_key": "gerrit:1414017",
+        "kind": "gerrit",
+        "target_id": "1414017",
+        "url": "https://skia-review.googlesource.com/c/1414017",
+        "subject": "[skparagraph] Shift the trailing space of an RTL run",
+        "project_name": "SkParagraph",
+        "stack_ancestors": ["gerrit:1414016"],
+        "stack_ikeys": ["gerrit:1414016", "gerrit:1414017"],
+    })
+    c_sib_parent = dict(res_text)
+    c_sib_parent.update({
+        "item_key": "gerrit:1409658",
+        "kind": "gerrit",
+        "target_id": "1409658",
+        "project_name": "SkParagraph",
+        "stack_ikeys": ["gerrit:1409658", "gerrit:1409696"],
+    })
+    c_sib_child = {
+        "item_key": "gerrit:1409696",
+        "kind": "gerrit",
+        "target_id": "1409696",
+        "status": "NEW",
+        "phase": "WAITING_ON_OTHERS",
+        "is_self": False,
+        "is_external": True,
+        "self_approved": True,
+        "self_review_state": "approved",
+        "sponsor_action": "",
+        "reviewer_pings": [{"reviewer": "fmalita@google.com", "active": True}],
+        "stack_ancestors": ["gerrit:1409658"],
+        "stack_ikeys": ["gerrit:1409658", "gerrit:1409696"],
+    }
+
+    sib_approved_payload = json.loads(json.dumps(base_payload))
+    sib_approved_payload["reviewers"]["REVIEWER"].append(
+        {"email": "fmalita@google.com", "name": "Florin Malita"}
+    )
+    sib_approved_payload["labels"]["Code-Review"]["all"].append(
+        {"email": "fmalita@google.com", "value": 1}
+    )
+    sib_approved_payload["submit_requirements"] = [
+        {"name": "Review-Enforcement", "status": "SATISFIED"},
+        {"name": "Code-Review", "status": "SATISFIED"},
+    ]
+    with mock.patch.object(
+        w.urllib.request,
+        "urlopen",
+        return_value=_FakeGerritResponse(sib_approved_payload),
+    ), mock.patch.object(w, "gerrit_mergeable", return_value=True), mock.patch.object(
+        w, "google_account_active", return_value=True
+    ):
+      c_sib_approved = w.fetch_gerrit_cl_status("1409696", {}, [], skia_dir="/nonexistent")
+    c_sib_approved.update({
+        "item_key": "gerrit:1409696",
+        "kind": "gerrit",
+        "target_id": "1409696",
+        "stack_ancestors": ["gerrit:1409658"],
+        "stack_ikeys": ["gerrit:1409658", "gerrit:1409696"],
+    })
+
+    script_body = w.DASHBOARD_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    harness = (
+        script_body.split("\nboot();", 1)[0]
+        + "\nconst c1 = "
+        + json.dumps(c1)
+        + ";\nconst c2 = "
+        + json.dumps(c2)
+        + ";\nconst p1 = "
+        + json.dumps(c_sib_parent)
+        + ";\nconst p2 = "
+        + json.dumps(c_sib_child)
+        + ";\nconst p2App = "
+        + json.dumps(c_sib_approved)
+        + ";\nconst box = {jetski_box_url: 'https://jetski.corp.google.com/box/host', items: {}};\n"
+        + "buildStackContext([c1, c2]);\n"
+        + "const card1 = focusCard(c1, box);\n"
+        + "const stackHtml = renderFocusSection([c1, c2], [c1, c2], box);\n"
+        + "buildStackContext([p1, p2]);\n"
+        + "const sibCard = focusCard(p1, box);\n"
+        + "buildStackContext([p1, p2App]);\n"
+        + "const sibApprovedCard = focusCard(p1, box);\n"
+        + "console.log(JSON.stringify({card1, stackHtml, sibCard, sibApprovedCard}));\n"
+    )
+    ui = json.loads(
+        subprocess.check_output(["node", "-"], input=harness, encoding="utf-8")
+    )
+    self.assertIn("👤 + Alexis (2nd reviewer)", ui["card1"])
+    self.assertIn("+ Florin", ui["card1"])
+    self.assertIn(
+        'class="btn secondary" href="https://skia-review.googlesource.com/c/1414016"',
+        ui["card1"],
+    )
+    self.assertIn("2 approved · need 2nd reviewer", ui["stackHtml"])
+    self.assertNotIn("2 need you, 2 approved", ui["stackHtml"])
+    self.assertIn("CR+1 · +2nd rev", ui["stackHtml"])
+    self.assertNotIn("✓ CR+1", ui["stackHtml"])
+    self.assertIn("👤 + Alexis to all 2 CLs", ui["stackHtml"])
+    self.assertIn("+ Florin to all 2 CLs", ui["stackHtml"])
+    self.assertIn("👤 + Florin (2nd reviewer)", ui["sibCard"])
+    self.assertIn("👤 + Florin (2nd reviewer)", ui["sibApprovedCard"])
+
+    seen_reqs: list[tuple[str, dict]] = []
+
+    def _fake_urlopen(req, timeout=10):
+      del timeout
+      seen_reqs.append((req.full_url, json.loads(req.data.decode("utf-8"))))
+      return _FakeGerritResponse({"reviewers": [{"email": "alexisdavidc@google.com"}]})
+
+    fake_state = {
+        "items": {
+            "gerrit:1414016@cid1": dict(c1, reviewer_pings=[], waiting_on=[]),
+            "gerrit:1414017@cid2": dict(c2, reviewer_pings=[], waiting_on=[]),
+        },
+        "events": [],
+    }
+    with mock.patch.object(
+        w, "_get_gerrit_bearer_token", return_value="tok-123"
+    ), mock.patch.object(w.urllib.request, "urlopen", side_effect=_fake_urlopen):
+      api_res = w.assign_second_reviewer_items(
+          ["gerrit:1414016", "gerrit:1414017"],
+          "alexisdavidc@google.com",
+          state=fake_state,
+      )
+
+    self.assertTrue(api_res["ok"])
+    self.assertEqual(api_res["assigned"], ["gerrit:1414016", "gerrit:1414017"])
+    self.assertEqual(
+        seen_reqs,
+        [
+            (
+                "https://skia-review.googlesource.com/a/changes/1414016/reviewers",
+                {"reviewer": "alexisdavidc@google.com"},
+            ),
+            (
+                "https://skia-review.googlesource.com/a/changes/1414017/reviewers",
+                {"reviewer": "alexisdavidc@google.com"},
+            ),
+        ],
+    )
+    for k in ("gerrit:1414016@cid1", "gerrit:1414017@cid2"):
+      rec = fake_state["items"][k]
+      self.assertEqual(rec["missing_reviewers_to_assign"], 0)
+      self.assertEqual(rec["sponsor_action"], "")
+      self.assertEqual(rec["suggested_second_reviewers"], [])
+      self.assertEqual(rec["reviewer_pings"][0]["reviewer"], "alexisdavidc@google.com")
+      self.assertEqual(rec["reviewer_pings"][0]["reason"], "needs_second_approval")
+
+    err_state = {"items": {"gerrit:1414016@cid1": dict(c1)}, "events": []}
+    with mock.patch.object(
+        w, "_get_gerrit_bearer_token", return_value="tok-123"
+    ), mock.patch.object(
+        w.urllib.request,
+        "urlopen",
+        return_value=_FakeGerritResponse({"error": "Account not found"}),
+    ):
+      err_res = w.assign_second_reviewer_items(
+          ["gerrit:1414016"], "alexisdavidc@google.com", state=err_state
+      )
+    self.assertFalse(err_res["ok"])
+    self.assertEqual(
+        err_state["items"]["gerrit:1414016@cid1"]["sponsor_action"],
+        "assign_second_reviewer",
+    )
+
+    disk_state = {
+        "items": {"gerrit:1414016@cid1": dict(c1, reviewer_pings=[], waiting_on=[])},
+        "events": [],
+    }
+    saved_snapshots: list[dict] = []
+
+    def _concurrent_urlopen(req, timeout=10):
+      del req, timeout
+      disk_state["items"]["gerrit:9999999@bg"] = {"item_key": "gerrit:9999999"}
+      return _FakeGerritResponse({"reviewers": [{"email": "alexisdavidc@google.com"}]})
+
+    with mock.patch.object(
+        w, "load_watcher_state", side_effect=lambda: json.loads(json.dumps(disk_state))
+    ), mock.patch.object(
+        w, "save_watcher_state", side_effect=saved_snapshots.append
+    ), mock.patch.object(
+        w, "_get_gerrit_bearer_token", return_value="tok-123"
+    ), mock.patch.object(
+        w.urllib.request, "urlopen", side_effect=_concurrent_urlopen
+    ):
+      race_res = w.assign_second_reviewer_items(
+          ["gerrit:1414016"], "alexisdavidc@google.com"
+      )
+    self.assertTrue(race_res["ok"])
+    self.assertIn("gerrit:9999999@bg", saved_snapshots[-1]["items"])
+    self.assertEqual(
+        saved_snapshots[-1]["items"]["gerrit:1414016@cid1"]["sponsor_action"], ""
+    )
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -137,6 +137,19 @@ PEN_URL_SH = (
 GERRIT_SKIA_HOST = "skia-review.googlesource.com"
 GERRIT_CHROMIUM_HOST = "chromium-review.googlesource.com"
 GERRIT_HOSTS = (GERRIT_SKIA_HOST, GERRIT_CHROMIUM_HOST)
+# Active Skia Googlers who provide 94% of 2nd approvals on our external Skia reviews
+SECOND_REVIEWER_CANDIDATES = (
+    {
+        "email": "alexisdavidc@google.com",
+        "name": "Alexis Cruz-Ayala",
+        "short": "Alexis",
+    },
+    {
+        "email": "fmalita@google.com",
+        "name": "Florin Malita",
+        "short": "Florin",
+    },
+)
 SELF_EMAILS = {"jlavrova@google.com", "jlavrova@gmail.com"}
 # Include @chromium.org alias so public Chromium issue comments/assignments match self
 SELF_BUG_EMAILS = {
@@ -4090,10 +4103,14 @@ def fetch_gerrit_cl_status(
       )
       # External authors on Skia and Chromium Gerrit need 2 Googler approvals (Review-Enforcement)
       required_approvals = 2 if is_external else 1
+      # External Gerrit Review-Enforcement counts only @google.com votes toward 2 approvals
       approved_emails = {
           e
           for e, v in cr_votes
-          if v > 0 and e and e != owner_email
+          if v > 0
+          and e
+          and e != owner_email
+          and (not is_external or e.lower().endswith("@google.com"))
       }
       approved_count = len(approved_emails)
       self_active_reviewer = (
@@ -4108,9 +4125,13 @@ def fetch_gerrit_cl_status(
           )
           else set()
       )
-      assigned_reviewers_count = len(
-          set(non_owner_reviewers) | approved_emails | self_active_reviewer
-      )
+      # External Gerrit Review-Enforcement counts only @google.com reviewers toward 2 approvals
+      eligible_assigned_reviewers = {
+          e
+          for e in (set(non_owner_reviewers) | approved_emails | self_active_reviewer)
+          if e and (not is_external or e.lower().endswith("@google.com"))
+      }
+      assigned_reviewers_count = len(eligible_assigned_reviewers)
       missing_reviewers_to_assign = (
           max(0, required_approvals - assigned_reviewers_count)
           if status == "NEW"
@@ -4427,6 +4448,39 @@ def fetch_gerrit_cl_status(
           for u in (d.get("reviewer_updates") or [])
           if isinstance(u, dict) and str(u.get("state") or "") == "REMOVED"
       }
+      suggested_second_reviewers: list[dict[str, str]] = []
+      # Only Skia uses a root-wide '*' OWNERS file; Chromium enforces directory-specific OWNERS
+      if sponsor_action == "assign_second_reviewer" and host == GERRIT_SKIA_HOST:
+        # CanvasKit, sfnt, and port-only CLs fit Florin best; text modules fit Alexis first
+        prefer_florin = (
+            any(
+                f.startswith(("modules/canvaskit/", "src/sfnt/", "src/ports/"))
+                for f in files
+            )
+            and not touches_my_text_dirs
+        )
+        ordered_candidates = (
+            tuple(reversed(SECOND_REVIEWER_CANDIDATES))
+            if prefer_florin
+            else SECOND_REVIEWER_CANDIDATES
+        )
+        excluded_second = {
+            e.lower()
+            for e in (
+                eligible_assigned_reviewers
+                | removed_emails
+                | {owner_email}
+                | SELF_EMAILS
+            )
+            if e
+        }
+        for cand in ordered_candidates:
+          c_email = cand["email"]
+          if c_email.lower() in excluded_second:
+            continue
+          if not google_account_active(c_email):
+            continue
+          suggested_second_reviewers.append(dict(cand))
       project = str(d.get("project") or "")
       # Compute reviewer ping candidates for lost +1s and missing second approvals
       reviewer_pings = compute_gerrit_reviewer_pings(
@@ -4475,11 +4529,13 @@ def fetch_gerrit_cl_status(
           "required_approvals": required_approvals,
           "approved_count": approved_count,
           "assigned_reviewers_count": assigned_reviewers_count,
+          "assigned_reviewers": sorted(eligible_assigned_reviewers - SELF_EMAILS),
           "missing_reviewers_to_assign": missing_reviewers_to_assign,
           "missing_approvals": missing_approvals,
           "reviewer_status": reviewer_status,
           "sponsor_action": sponsor_action,
           "sponsor_action_reason": sponsor_action_reason,
+          "suggested_second_reviewers": suggested_second_reviewers,
           # Per-reviewer ping entries for lost +1s and missing 2nd approvals
           "reviewer_pings": reviewer_pings,
           "self_cr_vote": self_cr_vote,
@@ -6541,6 +6597,200 @@ def abandon_companion_items(
   }
 
 
+def assign_second_reviewer_items(
+    item_keys: list[str],
+    reviewer_email: str,
+    *,
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+  """Adds a @google.com second reviewer on Gerrit CLs and updates cached state."""
+  rev_email = str(reviewer_email or "").strip()
+  self_lower = {e.lower() for e in SELF_EMAILS}
+  if (
+      "@" not in rev_email
+      or not rev_email.lower().endswith("@google.com")
+      or rev_email.lower() in self_lower
+  ):
+    return {
+        "ok": False,
+        "assigned": [],
+        "errors": [f"invalid Googler reviewer email: {rev_email}"],
+    }
+
+  own_state = state is None
+  lookup_state = load_watcher_state() if own_state else state
+  assert lookup_state is not None
+  lookup_items = lookup_state.get("items") or {}
+  assigned_meta: list[tuple[str, str]] = []
+  errors: list[str] = []
+  dedup_keys = list(dict.fromkeys(str(k or "").strip() for k in item_keys))
+
+  for ikey in dedup_keys:
+    if not ikey:
+      continue
+    matching_lookup = [
+        v
+        for k, v in lookup_items.items()
+        if isinstance(v, dict)
+        and (
+            v.get("item_key") == ikey
+            or k.startswith(f"{ikey}@")
+            or k == ikey
+        )
+    ]
+    if not matching_lookup:
+      errors.append(f"{ikey}: not found in state")
+      continue
+
+    rec = matching_lookup[0]
+    kind = str(rec.get("kind") or "gerrit")
+    tid = str(rec.get("target_id") or "")
+    host = str(rec.get("host") or GERRIT_SKIA_HOST)
+    if kind != "gerrit" or not tid:
+      errors.append(f"{ikey}: unsupported platform {kind}")
+      continue
+
+    bearer = _get_gerrit_bearer_token(host)
+    if not bearer:
+      errors.append(f"{ikey}: no Gerrit credential for {host}")
+      continue
+
+    url = f"https://{host}/a/changes/{tid}/reviewers"
+    body = json.dumps({"reviewer": rev_email}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {bearer}",
+            "Content-Type": "application/json; charset=UTF-8",
+            "User-Agent": "flight-deck-cl-watcher/1.0",
+        },
+        method="POST",
+    )
+    try:
+      with urllib.request.urlopen(req, timeout=10) as resp:
+        raw_resp = resp.read().decode("utf-8", errors="replace").strip()
+    except urllib.error.HTTPError as h_err:
+      errors.append(f"{ikey}: HTTP {h_err.code} add reviewer failed")
+      continue
+    except (OSError, urllib.error.URLError, TimeoutError) as exc:
+      errors.append(f"{ikey}: add reviewer request failed ({exc})")
+      continue
+
+    if raw_resp.startswith(")]}'"):
+      raw_resp = raw_resp[4:].strip()
+    # Gerrit /reviewers returns HTTP 200 with an AddReviewerResult error field on failure
+    if raw_resp:
+      try:
+        resp_obj = json.loads(raw_resp)
+      except ValueError:
+        resp_obj = None
+      if isinstance(resp_obj, dict) and resp_obj.get("error"):
+        errors.append(f"{ikey}: {resp_obj['error']}")
+        continue
+
+    assigned_meta.append((ikey, tid))
+
+  assigned = [ikey for ikey, _ in assigned_meta]
+  # Re-read watcher state after network I/O so concurrent sync_once flushes are preserved
+  if assigned_meta:
+    target_state = load_watcher_state() if own_state else state
+    assert target_state is not None
+    items = target_state.setdefault("items", {})
+    events = target_state.setdefault("events", [])
+    for ikey, tid in assigned_meta:
+      matching_entries = [
+          (k, v)
+          for k, v in items.items()
+          if isinstance(v, dict)
+          and (
+              v.get("item_key") == ikey
+              or k.startswith(f"{ikey}@")
+              or k == ikey
+          )
+      ]
+      conv_id = ""
+      proj_name = "Unassigned"
+      for _, m_rec in matching_entries:
+        conv_id = conv_id or str(m_rec.get("conversation_id") or "")
+        proj_name = str(m_rec.get("project_name") or proj_name)
+        req_app = int(m_rec.get("required_approvals") or 2)
+        prev_assigned = int(m_rec.get("assigned_reviewers_count") or 1)
+        pings = [
+            p for p in (m_rec.get("reviewer_pings") or []) if isinstance(p, dict)
+        ]
+        cur_revs = {
+            str(r) for r in (m_rec.get("assigned_reviewers") or []) if r
+        }
+        already_listed = (
+            any(
+                str(p.get("reviewer") or "").lower() == rev_email.lower()
+                for p in pings
+            )
+            or rev_email.lower() in {r.lower() for r in cur_revs}
+        )
+        cur_revs.add(rev_email)
+        m_rec["assigned_reviewers"] = sorted(cur_revs)
+        new_assigned = prev_assigned if already_listed else (prev_assigned + 1)
+        miss_rev = max(0, req_app - new_assigned)
+        m_rec["assigned_reviewers_count"] = new_assigned
+        m_rec["missing_reviewers_to_assign"] = miss_rev
+        if miss_rev == 0 and m_rec.get("sponsor_action") == "assign_second_reviewer":
+          m_rec["sponsor_action"] = ""
+          m_rec["sponsor_action_reason"] = ""
+        m_rec["suggested_second_reviewers"] = []
+        miss_app = int(m_rec.get("missing_approvals") or 1)
+        app_cnt = int(m_rec.get("approved_count") or 1)
+        if miss_rev == 0 and miss_app > 0:
+          m_rec["reviewer_status"] = (
+              f"Needs +{miss_app} CR ({app_cnt}/{req_app} approved)"
+          )
+        if not already_listed:
+          pings.append({
+              "reviewer": rev_email,
+              "reason": "needs_second_approval",
+              "active": True,
+              "in_attention_set": True,
+              "current_ps": int(m_rec.get("patchset") or 1),
+          })
+        m_rec["reviewer_pings"] = pings
+        w_on = [
+            w_entry
+            for w_entry in (m_rec.get("waiting_on") or [])
+            if isinstance(w_entry, dict)
+        ]
+        if not any(
+            str(w_entry.get("id") or "").lower() == rev_email.lower()
+            for w_entry in w_on
+        ):
+          w_on.append({"id": rev_email, "active": True})
+        m_rec["waiting_on"] = w_on
+
+      events.insert(
+          0,
+          {
+              "id": f"ev-{int(time.time() * 1000)}-{tid}",
+              "time": now_et_str(),
+              "item_key": ikey,
+              "target_id": tid,
+              "conversation_id": conv_id,
+              "project_name": proj_name,
+              "critical": False,
+              "message": f"[FLIGHT-DECK] 👤 Added 2nd reviewer {rev_email} on {ikey}.",
+          },
+      )
+    target_state["events"] = events[:50]
+    if own_state:
+      save_watcher_state(target_state)
+
+  return {
+      "ok": len(errors) == 0 and len(assigned) > 0,
+      "assigned": assigned,
+      "reviewer": rev_email,
+      "errors": errors,
+  }
+
+
 def compute_companion_states(
     new_items: dict[str, Any],
     *,
@@ -6560,8 +6810,12 @@ def compute_companion_states(
     rec["is_companion"] = True
     rec["merge_conflict"] = False
     rec["missing_reviewers_to_assign"] = 0
+    rec["assigned_reviewers"] = []
     rec["missing_approvals"] = 0
     rec["reviewer_status"] = ""
+    rec["sponsor_action"] = ""
+    rec["sponsor_action_reason"] = ""
+    rec["suggested_second_reviewers"] = []
     rec["reviewer_pings"] = []
     rec["cq_failed"] = False
     rec["cq_sync_rebase_needed"] = False
@@ -9926,12 +10180,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     border-bottom: 1px solid var(--hairline);
   }
   .stack-head-top {
-    display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   }
   .stack-head-title {
     font: 600 12.5px var(--display); letter-spacing: -.01em; color: var(--ink);
   }
   .stack-head-meta { font-size: 11px; color: var(--graphite); }
+  .stack-head-actions {
+    margin-left: auto; display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  }
   .stack-spine {
     display: flex; align-items: center; gap: 4px; overflow-x: auto;
     padding: 2px 0; -webkit-overflow-scrolling: touch;
@@ -10519,17 +10776,73 @@ function stackBlockerBannerHtml(it, data) {
     `⏸️ <b>Parent holds stack:</b> ${joined} — updating parent will rebase this CL</div>`;
 }
 
+// Orders suggested 2nd reviewers and promotes anyone already assigned on a stack sibling
+function suggestedReviewersFor(it) {
+  if (!it || it.sponsor_action !== 'assign_second_reviewer') return [];
+  const raw = (it.suggested_second_reviewers || []).filter(c => c && c.email);
+  if (raw.length <= 1) return raw;
+  const onStack = new Set();
+  for (const m of (it._stackMembers || [])) {
+    if (!m || m === it) continue;
+    for (const r of (m.assigned_reviewers || [])) {
+      if (r) onStack.add(String(r).toLowerCase());
+    }
+    for (const p of (m.reviewer_pings || [])) {
+      if (p && p.reviewer) onStack.add(String(p.reviewer).toLowerCase());
+    }
+    for (const w of (m.waiting_on || [])) {
+      if (w && w.id) onStack.add(String(w.id).toLowerCase());
+    }
+  }
+  if (!onStack.size) return raw;
+  // Keep stack siblings under one 2nd reviewer when one member already assigned them
+  return [
+    ...raw.filter(c => onStack.has(String(c.email).toLowerCase())),
+    ...raw.filter(c => !onStack.has(String(c.email).toLowerCase())),
+  ];
+}
+
+// Renders 1-click Gerrit reviewer buttons for a single card or stack batch header
+function assignReviewerButtonsHtml(itemKeys, cands, batchTarget) {
+  if (!itemKeys.length || !cands.length) return '';
+  const keysJson = esc(JSON.stringify(itemKeys));
+  return cands.map((c, idx) => {
+    const shortName = esc(c.short || c.name || shortActor(c.email));
+    const tip = esc(`Add ${c.name || c.email} (${c.email}) on Gerrit`);
+    const cls = batchTarget
+      ? (idx === 0 ? 'triage-btn primary' : 'triage-btn')
+      : (idx === 0 ? 'btn primary' : 'btn secondary');
+    const label = batchTarget
+      ? `${idx === 0 ? '👤 ' : ''}+ ${shortName} to all ${esc(batchTarget)}`
+      : (idx === 0 ? `👤 + ${shortName} (2nd reviewer)` : `+ ${shortName}`);
+    return `<button class="${cls}" title="${tip}" ` +
+      `onclick="assignReviewer(${keysJson}, ${esc(JSON.stringify(c.email))}, this)">` +
+      `${label}</button>`;
+  }).join('');
+}
+
 // Formats short status text, icon, and tone for a step in the horizontal chain spine
 function spineStepShortState(m) {
   if (m.status === 'MERGED') return {short: 'Merged', icon: '✓', tone: 'spine-merged'};
   if (m.status === 'ABANDONED' || m.status === 'CLOSED') {
     return {short: 'Closed', icon: '—', tone: 'spine-step'};
   }
-  if (m.self_approved || m.self_review_state === 'approved') {
-    return {short: 'CR+1', icon: '✓', tone: 'spine-ok'};
-  }
   if (m.cq_failed || m.phase === 'ALERT_CQ_FAILED') {
     return {short: 'CQ fail', icon: '✗', tone: 'spine-bad'};
+  }
+  // Surface pending sponsor actions before generic CR+1 so missing 2nd reviewers stand out
+  if (needsSponsorAction(m)) {
+    const act = m.sponsor_action;
+    if (act === 'assign_second_reviewer') {
+      return {short: 'CR+1 · +2nd rev', icon: '👤', tone: 'spine-you'};
+    }
+    if (act === 'submit_cq_conflict') {
+      return {short: 'CR+1 · rebase', icon: '⚠️', tone: 'spine-warn'};
+    }
+    return {short: 'Ready CQ+2', icon: '🚀', tone: 'spine-you'};
+  }
+  if (m.self_approved || m.self_review_state === 'approved') {
+    return {short: 'CR+1', icon: '✓', tone: 'spine-ok'};
   }
   if (m.merge_conflict) return {short: 'Conflict', icon: '⚠️', tone: 'spine-warn'};
   if (isPostSubmitAlert(m)) return {short: 'Alert', icon: '🔴', tone: 'spine-bad'};
@@ -10605,20 +10918,55 @@ function renderFocusSection(youItems, shownItems, data) {
     const author = authorLabel(rootItem);
     const project = esc(rootItem.project_name || 'Skia');
     const total = members.length;
-    const kindPlural = (rootItem.kind === 'github' ? 'PR' : 'CL') + (total === 1 ? '' : 's');
-    const inYou = members.filter(m => laneOf(m) === 'you').length;
+    const kindBase = rootItem.kind === 'github' ? 'PR' : 'CL';
+    const kindPlural = kindBase + (total === 1 ? '' : 's');
+    const youMembers = members.filter(m => laneOf(m) === 'you');
+    const need2nd = youMembers.filter(
+      m => needsSponsorAction(m) && m.sponsor_action === 'assign_second_reviewer'
+    );
+    const readyCq = youMembers.filter(
+      m => needsSponsorAction(m) && String(m.sponsor_action || '').startsWith('submit_cq')
+    );
+    const otherYou = youMembers.length - need2nd.length - readyCq.length;
     const approved = members.filter(
       m => m.self_approved || m.self_review_state === 'approved'
     ).length;
-    const descParts = [`${inYou} need${inYou === 1 ? 's' : ''} you`];
-    if (approved) descParts.push(`${approved} approved`);
-    const countsDesc = esc(descParts.join(', '));
+
+    // Name sponsor actions explicitly so approved stacks never say '2 need you, 2 approved'
+    const n2Label = `${need2nd.length === 1 ? 'needs' : 'need'} 2nd reviewer`;
+    let countsRaw;
+    if (!otherYou && need2nd.length && !readyCq.length) {
+      const p = need2nd.length === approved ? n2Label : `${need2nd.length} ${n2Label}`;
+      countsRaw = approved ? `${approved} approved · ${p}` : p;
+    } else if (!otherYou && readyCq.length && !need2nd.length) {
+      const p = readyCq.length === approved ? 'ready for CQ+2' : `${readyCq.length} ready for CQ+2`;
+      countsRaw = approved ? `${approved} approved · ${p}` : p;
+    } else {
+      const parts = [];
+      if (otherYou) parts.push(`${otherYou} need${otherYou === 1 ? 's' : ''} you`);
+      if (need2nd.length) parts.push(`${need2nd.length} ${n2Label}`);
+      if (readyCq.length) parts.push(`${readyCq.length} ready for CQ+2`);
+      if (approved) parts.push(`${approved} approved`);
+      countsRaw = parts.join(', ');
+    }
+    const countsDesc = esc(countsRaw);
+
+    // Offer 1-click batch assignment when >= 2 stack CLs need a 2nd Googler reviewer
+    let batchHtml = '';
+    if (need2nd.length >= 2) {
+      const keys = need2nd.map(itemKeyOf).filter(Boolean);
+      const btns = assignReviewerButtonsHtml(
+        keys, suggestedReviewersFor(need2nd[0]), `${keys.length} ${kindBase}s`
+      );
+      if (btns) batchHtml = `<span class="stack-head-actions">${btns}</span>`;
+    }
 
     const headHtml = `
       <div class="stack-head">
         <div class="stack-head-top">
           <span class="stack-head-title">🔗 Stack (${total} ${kindPlural})</span>
           <span class="stack-head-meta">${project} · by ${author} · ${countsDesc}</span>
+          ${batchHtml}
         </div>
         ${stackSpineHtml(members)}
       </div>`;
@@ -12363,7 +12711,13 @@ function focusCard(it, data) {
     const reason = esc(it.sponsor_action_reason || 'Needs Googler sponsor action');
     const conflictPrefix = it.merge_conflict ? `<span class="red">${conflictNote}</span> · ` : '';
     why = `${conflictPrefix}<b>Sponsor action</b>: ${reason} · ${formatStatusTime(it)}`;
-    actions = link(it.url, `Open ${kindWord}`, 'btn primary') + chatBtn;
+    const cands = suggestedReviewersFor(it);
+    if (cands.length && itemKeyOf(it)) {
+      actions = assignReviewerButtonsHtml([itemKeyOf(it)], cands, '') +
+        link(it.url, `Open ${kindWord}`, 'btn secondary') + chatBtn;
+    } else {
+      actions = link(it.url, `Open ${kindWord}`, 'btn primary') + chatBtn;
+    }
   } else {
     // Omit the trigger message when a current-PS review summary is already shown below
     if (hasFreshReviewWithoutNewerReply(it)) {
@@ -13174,6 +13528,37 @@ async function ackBug(bugKey, btn) {
   }
 }
 
+async function assignReviewer(itemKeys, reviewerEmail, btn) {
+  const keys = Array.isArray(itemKeys) ? itemKeys.filter(Boolean) : [itemKeys].filter(Boolean);
+  if (!keys.length || !reviewerEmail || (btn && btn.disabled)) return;
+  const orig = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = keys.length > 1 ? `Adding to ${keys.length} CLs…` : 'Adding…';
+  }
+  try {
+    const resp = await fetch('/api/add_reviewer', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({item_keys: keys, reviewer: reviewerEmail}),
+    });
+    const res = await resp.json();
+    if (res && res.ok) {
+      await fetchState();
+      return;
+    }
+    if (btn && res && Array.isArray(res.errors) && res.errors.length) {
+      btn.title = res.errors.join('; ');
+    }
+  } catch (e) {
+    // Restore button label when the local HTTP call fails
+  }
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
+}
+
 async function triggerRefresh() {
   const btn = document.getElementById('refresh-btn');
   btn.textContent = 'Refreshing…';
@@ -13326,6 +13711,7 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
         "/api/open_chat",
         "/api/abandon",
         "/api/ack_bug",
+        "/api/add_reviewer",
     ):
       length = int(self.headers.get("Content-Length") or 0)
       raw_body = (
@@ -13347,6 +13733,17 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
       elif parsed.path == "/api/ack_bug":
         res = ack_bug_item(
             str(bdict.get("bug_key") or bdict.get("item_key") or "")
+        )
+      elif parsed.path == "/api/add_reviewer":
+        raw_keys = bdict.get("item_keys")
+        if isinstance(raw_keys, list):
+          keys = [str(k) for k in raw_keys if k]
+        elif bdict.get("item_key"):
+          keys = [str(bdict.get("item_key"))]
+        else:
+          keys = []
+        res = assign_second_reviewer_items(
+            keys, str(bdict.get("reviewer") or "")
         )
       elif parsed.path == "/api/abandon":
         raw_keys = bdict.get("item_keys")
