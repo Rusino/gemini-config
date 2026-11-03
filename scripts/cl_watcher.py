@@ -171,7 +171,20 @@ BUG_SYNC_TTL_SEC = 300.0
 BUG_STALE_BACKLOG_DAYS = 60
 BUG_RECENT_CLOSED_DAYS = 14
 # Public Chromium and Skia Buganizer component roots used to pick crbug/ over b/
-PUBLIC_CRBUG_COMPONENTS = {"1457031", "1363359", "1456822", "1456190"}
+PUBLIC_CRBUG_COMPONENTS = {"1457031", "1363359", "1456822", "1456190", "1579812"}
+SECURITY_MERGE_REPORTER = "chrome-release-blintz-continuous-runner@prod.google.com"
+SECURITY_MERGE_COMPONENT_ID = "1579812"
+CF_BUG_OS = "1223084"
+CF_BUG_MERGE = "1223087"
+CF_BUG_MERGE_MILESTONE = "1340419"
+CF_BUG_FIXED_BY_CODE_CHANGES = "1358989"
+CF_BUG_AUTO_CHERRY_PICK = "1419876"
+RE_MERGE_TITLE_MILESTONE = re.compile(r"^\[Merge\s+M(\d+)\]\s*(.*)$", re.IGNORECASE)
+RE_CUSTOM_FIELD_ID = re.compile(r"\((\d+)\)\s*$")
+RE_CHERRY_PICKED_FROM = re.compile(
+    r"\(cherry picked from commit ([0-9a-f]{10,40})\)", re.IGNORECASE
+)
+RE_CHROME_MILESTONE_BRANCH = re.compile(r"(?:^|/)m(\d{2,4})\b", re.IGNORECASE)
 RE_BUG_TITLE_TOKEN = re.compile(
     r"\b(?:crbug(?:\.com)?/|b/|flutter#)\d{4,10}\b",
     re.IGNORECASE,
@@ -4012,6 +4025,13 @@ def fetch_gerrit_cl_status(
       files = sorted(str(f) for f in files_dict.keys() if f != "/COMMIT_MSG")
       hashtags = [str(h) for h in (d.get("hashtags") or []) if h]
       topic = str(d.get("topic") or "")
+      branch = re.sub(r"^refs/heads/", "", str(d.get("branch") or "").strip())
+      cherry_pick_of_change = (
+          str(d["cherry_pick_of_change"])
+          if d.get("cherry_pick_of_change")
+          else ""
+      )
+      cherry_pick_of_patch_set = int(d.get("cherry_pick_of_patch_set") or 0)
 
       att_set = [
           str((v.get("account") or {}).get("email") or "")
@@ -4576,6 +4596,9 @@ def fetch_gerrit_cl_status(
           "files": files,
           "hashtags": hashtags,
           "topic": topic,
+          "branch": branch,
+          "cherry_pick_of_change": cherry_pick_of_change,
+          "cherry_pick_of_patch_set": cherry_pick_of_patch_set,
           "commit_url": (
               f"https://{host.replace('-review', '')}/{d.get('project')}/+/{cur_sha}"
               if status == "MERGED" and d.get("project")
@@ -7216,6 +7239,45 @@ def _normalize_public_gerrit_url(raw_url: str) -> str:
   )
 
 
+def extract_merge_milestone(title: str) -> int | None:
+  """Extracts the integer milestone N from a `[Merge M<N>] ...` issue title."""
+  m = RE_MERGE_TITLE_MILESTONE.match((title or "").strip())
+  return int(m.group(1)) if m else None
+
+
+def _bug_merge_milestone(bug: dict[str, Any]) -> int | None:
+  """Resolves the target Chrome milestone from custom field 1340419 or the `[Merge M<N>]` title."""
+  cf = bug.get("custom_fields") if isinstance(bug.get("custom_fields"), dict) else {}
+  raw_ms = str(cf.get(CF_BUG_MERGE_MILESTONE) or bug.get("merge_milestone") or "").strip()
+  if raw_ms.isdigit():
+    return int(raw_ms)
+  return extract_merge_milestone(str(bug.get("title") or ""))
+
+
+def is_merge_request_bug(bug: dict[str, Any]) -> bool:
+  """Returns True when `bug` is a Chrome release `[Merge M<NN>]` child issue in any state."""
+  if not isinstance(bug, dict):
+    return False
+  if str(bug.get("source") or "buganizer") != "buganizer":
+    return False
+  if bool(bug.get("is_merge_request_bug")) or bool(bug.get("is_security_merge_request")):
+    return True
+  comp_id = str(bug.get("component_id") or "").strip()
+  reporter = str(bug.get("reporter") or "").strip().lower()
+  comp_tags = str(bug.get("component_tags") or "").strip()
+  cf = bug.get("custom_fields") if isinstance(bug.get("custom_fields"), dict) else {}
+  has_merge_origin = (
+      comp_id == SECURITY_MERGE_COMPONENT_ID
+      or reporter == SECURITY_MERGE_REPORTER
+      or "Merge Request" in comp_tags
+  )
+  has_merge_marker = (
+      extract_merge_milestone(str(bug.get("title") or "")) is not None
+      or bool(str(cf.get(CF_BUG_MERGE) or "").strip())
+  )
+  return bool(has_merge_origin and has_merge_marker)
+
+
 def _finalize_buganizer_entry(entry: dict[str, Any]) -> dict[str, Any]:
   """Computes canonical bug_key, tracker_flavor (b vs crbug), short_id, and URL."""
   issue_id = str(entry.get("id") or "").strip()
@@ -7257,7 +7319,7 @@ def _finalize_buganizer_entry(entry: dict[str, Any]) -> dict[str, Any]:
       or ""
   )
   mod_et, mod_age = format_et_and_age(mod_raw)
-  return {
+  out = {
       **entry,
       "bug_key": f"buganizer:{issue_id}",
       "source": "buganizer",
@@ -7273,6 +7335,11 @@ def _finalize_buganizer_entry(entry: dict[str, Any]) -> dict[str, Any]:
       "modified_age": mod_age,
       "modified_ts": _parse_ts(mod_raw),
   }
+  out["is_merge_request_bug"] = is_merge_request_bug(out)
+  ms_num = _bug_merge_milestone(out) if out["is_merge_request_bug"] else None
+  if ms_num is not None:
+    out["merge_milestone"] = ms_num
+  return out
 
 
 RE_GERRIT_ANY_URL_ID = re.compile(
@@ -7313,6 +7380,8 @@ def parse_buganizer_blocks(output_text: str) -> list[dict[str, Any]]:
           "major_modified_time": "",
           "resolved_time": "",
           "due_date": "",
+          "parent_issue_id": "",
+          "custom_fields": {},
           "slo": {},
           "gerrit_cl_ids": [],
           "gerrit_cl_urls": {},
@@ -7364,6 +7433,10 @@ def parse_buganizer_blocks(output_text: str) -> list[dict[str, Any]]:
           entry["resolved_time"] = val
         elif k == "Due Date":
           entry["due_date"] = val
+        elif k in ("Parent Issue IDs", "Parent Issue ID"):
+          m_parent = re.search(r"(\d+)", val)
+          if m_parent:
+            entry["parent_issue_id"] = m_parent.group(1)
         elif k == "Gerrit changes":
           cids: list[str] = []
           url_map: dict[str, str] = {}
@@ -7378,6 +7451,9 @@ def parse_buganizer_blocks(output_text: str) -> list[dict[str, Any]]:
         elif k == "Custom Field Value":
           if "Component Tags" in pending_cf and not entry["component_tags"]:
             entry["component_tags"] = val
+          m_cf = RE_CUSTOM_FIELD_ID.search(pending_cf)
+          if m_cf:
+            entry["custom_fields"][m_cf.group(1)] = val
           pending_cf = ""
       results.append(_finalize_buganizer_entry(entry))
     return results
@@ -7537,6 +7613,8 @@ def merge_bug_record_with_prev(
     for carry_key in (
         "acked_ts",
         "duplicate_of",
+        "parent_issue_id",
+        "custom_fields",
         "gerrit_cl_urls",
         "conversation_id",
         "chat_title",
@@ -8218,6 +8296,8 @@ def link_bugs_and_cls(
             "subject": str(rec.get("subject") or lbl),
             "url": str(rec.get("url") or ""),
             "status": str(rec.get("status") or "NEW").upper(),
+            "branch": str(rec.get("branch") or ""),
+            "is_cherry_pick": bool(rec.get("is_cherry_pick")),
             "is_self": bool(rec.get("is_self")),
             "is_wip": bool(rec.get("is_wip") or rec.get("is_draft")),
             "in_needs_you": bool(
@@ -8316,6 +8396,12 @@ def classify_bug_status(
   bug["needs_you"] = False
   bug["why_needs_you"] = ""
   bug["is_stale_backlog"] = False
+  bug["merge_action_phase"] = ""
+  is_merge_req = is_merge_request_bug(bug)
+  bug["is_merge_request_bug"] = is_merge_req
+  ms_num = _bug_merge_milestone(bug) if is_merge_req else None
+  if ms_num is not None:
+    bug["merge_milestone"] = ms_num
 
   # Classify terminal upstream states into Fixed vs Closed (obsolete / duplicate / not planned)
   if source == "github" and status == "CLOSED":
@@ -8393,6 +8479,59 @@ def classify_bug_status(
   human_author = str(bug.get("last_human_comment_author") or "").strip()
   human_ts = _parse_ts(bug.get("last_human_comment_at"))
   self_ts = _parse_ts(bug.get("last_self_comment_at"))
+
+  # Security merge requests carry the merged trunk CL from creation, so evaluate their
+  # confirm -> reassign -> merges@chromium.org -> manual cherry-pick lifecycle before
+  # generic collaborator or "All linked CLs merged" closure rules
+  if is_merge_req:
+    is_self_assigned = _is_self_bug_assignee(str(bug.get("assignee") or ""))
+    if not is_self_assigned:
+      bug["lane"] = "has_cl" if has_cl else "assigned"
+      return bug
+    cf = bug.get("custom_fields") if isinstance(bug.get("custom_fields"), dict) else {}
+    merge_val = str(cf.get(CF_BUG_MERGE) or bug.get("merge_status") or "").strip()
+    merge_low = merge_val.lower()
+    ms_label = f"M{ms_num}" if ms_num is not None else "Merge"
+    mod_ts_val = float(bug.get("modified_ts") or _parse_ts(bug.get("modified_time")) or 0.0)
+    explicitly_acked = acked_ts > 0.0 and acked_ts >= mod_ts_val
+    has_self_comment = bool(str(bug.get("last_self_comment_at") or "").strip()) or self_ts > 0.0
+    if not explicitly_acked:
+      if merge_low == "pending":
+        bug["needs_you"] = True
+        bug["lane"] = "you"
+        # Self-commenting does not complete the handoff while assignee is still jlavrova
+        if has_self_comment:
+          bug["merge_action_phase"] = "reassign"
+          bug["why_needs_you"] = (
+              f"{ms_label} merge comment posted — reassign to merges@chromium.org"
+          )
+        else:
+          bug["merge_action_phase"] = "confirm"
+          bug["why_needs_you"] = f"{ms_label} merge request pending — confirm"
+        return bug
+      if merge_low.startswith("approved"):
+        has_release_branch_cl = any(
+            bool(c.get("is_cherry_pick"))
+            or (
+                str(c.get("branch") or "").strip()
+                and str(c.get("branch") or "").strip().lower() not in ("main", "master")
+            )
+            for c in linked_cls
+        )
+        if not has_release_branch_cl:
+          branch_hint = f"chrome/m{ms_num}" if ms_num is not None else "release branch"
+          bug["needs_you"] = True
+          bug["lane"] = "you"
+          bug["merge_action_phase"] = "manual_cherry_pick"
+          bug["why_needs_you"] = (
+              f"{ms_label} merge approved — manual cherry-pick onto {branch_hint} needed"
+          )
+          return bug
+    if bug["is_overdue"]:
+      bug["lane"] = "overdue"
+      return bug
+    bug["lane"] = "has_cl" if has_cl else "assigned"
+    return bug
   # Treat a self comment as an implicit ack across comment, urgent, and post-merge triggers
   effective_ack_ts = max(self_ts, acked_ts)
   unacked_comment = (
@@ -8490,6 +8629,474 @@ def _is_self_bug_assignee(assignee: str) -> bool:
   return any(t in self_lower for t in tokens)
 
 
+def should_autostart_bug_triage(bug: dict[str, Any]) -> bool:
+  """Returns True when an unchatted Needs You bug should auto-launch a bug-triage chat."""
+  if not isinstance(bug, dict):
+    return False
+  # Release merge requests follow the 6-gate confirm/reassign flow rather than bug-triage
+  if is_merge_request_bug(bug) or bool(bug.get("is_security_merge_request")):
+    return False
+  if bug.get("conversation_id") or not bug.get("needs_you"):
+    return False
+  if str(bug.get("why_needs_you") or "").startswith("All linked CLs merged"):
+    return False
+  return True
+
+
+def _extract_fixed_by_gerrit_ids(bug: dict[str, Any]) -> list[str]:
+  """Extracts Gerrit CL IDs from custom field 1358989 (`Fixed By Code Changes`)."""
+  cf = bug.get("custom_fields") if isinstance(bug.get("custom_fields"), dict) else {}
+  raw = str(cf.get(CF_BUG_FIXED_BY_CODE_CHANGES) or "").strip()
+  if not raw or raw.upper() == "NA":
+    return []
+  ids = [m.group(1) for m in RE_GERRIT_ANY_URL_ID.finditer(raw)]
+  return list(dict.fromkeys(ids))
+
+
+def discover_merge_linked_gerrit_ids(bugs: dict[str, Any]) -> list[str]:
+  """Collects trunk fix CLs and cherry-pick CLs referenced by open `[Merge M<NN>]` issues."""
+  if not isinstance(bugs, dict):
+    return []
+  gids: list[str] = []
+  for bug in bugs.values():
+    if not isinstance(bug, dict) or not is_merge_request_bug(bug):
+      continue
+    st = str(bug.get("status") or "").upper()
+    if st not in ("NEW", "ASSIGNED", "ACCEPTED", "OPEN"):
+      continue
+    child_ids = [
+        *(str(x) for x in (bug.get("gerrit_cl_ids") or []) if str(x).isdigit()),
+        *(str(x) for x in (bug.get("comment_cl_ids") or []) if str(x).isdigit()),
+    ]
+    gids.extend(child_ids)
+    pid = str(bug.get("parent_issue_id") or "").strip()
+    parent = bugs.get(f"buganizer:{pid}") if pid else None
+    if isinstance(parent, dict):
+      fixed_ids = _extract_fixed_by_gerrit_ids(parent)
+      if fixed_ids:
+        gids.extend(fixed_ids)
+      elif not child_ids:
+        gids.extend(
+            str(x) for x in (parent.get("gerrit_cl_ids") or []) if str(x).isdigit()
+        )
+  return list(dict.fromkeys(gids))
+
+
+def _milestone_from_cl_record(rec: dict[str, Any]) -> int | None:
+  """Extracts milestone integer from `chrome/m<NN>` branch or `[M<NN>]` subject."""
+  m_br = RE_CHROME_MILESTONE_BRANCH.search(str(rec.get("branch") or ""))
+  if m_br:
+    return int(m_br.group(1))
+  m_subj = re.match(
+      r"^\[M(\d{2,4})\]", str(rec.get("subject") or "").strip(), re.IGNORECASE
+  )
+  return int(m_subj.group(1)) if m_subj else None
+
+
+def attach_merge_children_to_cls_and_bugs(
+    bugs: dict[str, Any], items: dict[str, Any]
+) -> None:
+  """Detects cherry-pick CLs and attaches sorted `merge_children` to parent CLs and bugs."""
+  by_ikey: dict[str, list[dict[str, Any]]] = {}
+  sha_to_ikey: dict[str, str] = {}
+  for dkey, rec in (items or {}).items():
+    if not isinstance(rec, dict):
+      continue
+    rec.pop("merge_children", None)
+    rec["has_active_merges"] = False
+    ikey = str(rec.get("item_key") or dkey.split("@", 1)[0]).strip()
+    if not ikey:
+      continue
+    by_ikey.setdefault(ikey, []).append(rec)
+    # Map trunk commit SHAs back to canonical item_key for `(cherry picked from commit ...)`
+    if ikey.startswith("gerrit:") and not str(rec.get("cherry_pick_of_change") or "").strip():
+      br_low = str(rec.get("branch") or "").strip().lower()
+      if br_low in ("", "main", "master"):
+        rev_sha = str(rec.get("revision") or "").strip().lower()
+        if rev_sha:
+          sha_to_ikey[rev_sha] = ikey
+        for rsha in (rec.get("revision_ps_by_sha") or {}).keys():
+          if rsha:
+            sha_to_ikey.setdefault(str(rsha).lower(), ikey)
+
+  for bug in (bugs or {}).values():
+    if isinstance(bug, dict):
+      bug.pop("merge_children", None)
+      bug["has_active_merges"] = False
+
+  # Mark cherry-pick CLs via Gerrit metadata or `(cherry picked from commit <sha>)` trailer
+  cp_by_parent_and_ms: dict[tuple[str, int], dict[str, Any]] = {}
+  for ikey, recs in by_ikey.items():
+    sample = recs[0]
+    parent_ikey = ""
+    cp_change = str(sample.get("cherry_pick_of_change") or "").strip()
+    if cp_change:
+      parent_ikey = f"gerrit:{cp_change}"
+    else:
+      m_cp = RE_CHERRY_PICKED_FROM.search(str(sample.get("commit_message") or ""))
+      if m_cp:
+        src_sha = m_cp.group(1).lower()
+        parent_ikey = sha_to_ikey.get(src_sha, "")
+        if not parent_ikey:
+          for full_sha, cand_ik in sha_to_ikey.items():
+            if full_sha.startswith(src_sha) or src_sha.startswith(full_sha):
+              parent_ikey = cand_ik
+              break
+    is_cp = bool(parent_ikey or cp_change or sample.get("is_cherry_pick"))
+    if is_cp:
+      ms_cl = _milestone_from_cl_record(sample)
+      for r in recs:
+        r["is_cherry_pick"] = True
+        if parent_ikey:
+          r["cherry_pick_of"] = parent_ikey
+        elif r.get("cherry_pick_of"):
+          parent_ikey = str(r["cherry_pick_of"])
+      if parent_ikey and ms_cl is not None:
+        cp_by_parent_and_ms[(parent_ikey, ms_cl)] = sample
+
+  # Group merge request bugs by parent_issue_id (or standalone bug_key when unparented)
+  merge_groups: dict[str, list[dict[str, Any]]] = {}
+  for bkey, bug in (bugs or {}).items():
+    if not isinstance(bug, dict) or not is_merge_request_bug(bug):
+      continue
+    pid = str(bug.get("parent_issue_id") or "").strip()
+    gk = pid if pid else f"solo:{bkey}"
+    merge_groups.setdefault(gk, []).append(bug)
+
+  covered_cp_ikeys: set[str] = set()
+  for gk, group_bugs in merge_groups.items():
+    parent_id = "" if gk.startswith("solo:") else gk
+    parent_bug = (bugs or {}).get(f"buganizer:{parent_id}") if parent_id else None
+    parent_ikeys: list[str] = []
+    if isinstance(parent_bug, dict):
+      parent_ikeys.extend(f"gerrit:{gid}" for gid in _extract_fixed_by_gerrit_ids(parent_bug))
+    for mb in group_bugs:
+      for gid in [*(mb.get("gerrit_cl_ids") or []), *(mb.get("comment_cl_ids") or [])]:
+        cand_ik = f"gerrit:{gid}"
+        cand_recs = by_ikey.get(cand_ik) or []
+        if cand_recs and cand_recs[0].get("is_cherry_pick") and cand_recs[0].get("cherry_pick_of"):
+          parent_ikeys.append(str(cand_recs[0]["cherry_pick_of"]))
+    if not parent_ikeys:
+      for mb in group_bugs:
+        for gid in mb.get("gerrit_cl_ids") or []:
+          cand_ik = f"gerrit:{gid}"
+          cand_recs = by_ikey.get(cand_ik) or []
+          if not cand_recs or not cand_recs[0].get("is_cherry_pick"):
+            parent_ikeys.append(cand_ik)
+    parent_ikeys = list(dict.fromkeys(parent_ikeys))
+    parent_tids = {ik.split(":", 1)[-1] for ik in parent_ikeys}
+
+    children: list[dict[str, Any]] = []
+    sorted_group_bugs = sorted(
+        group_bugs,
+        key=lambda b: (_bug_merge_milestone(b) or 9999, str(b.get("id") or "")),
+    )
+    for mb in sorted_group_bugs:
+      ms_val = _bug_merge_milestone(mb) or 0
+      bkey = str(mb.get("bug_key") or f"buganizer:{mb.get('id')}")
+      cf = mb.get("custom_fields") if isinstance(mb.get("custom_fields"), dict) else {}
+      merge_status = str(cf.get(CF_BUG_MERGE) or mb.get("merge_status") or "").strip()
+
+      cp_rec: dict[str, Any] | None = None
+      cp_ikey = ""
+      for gid in [*(mb.get("gerrit_cl_ids") or []), *(mb.get("comment_cl_ids") or [])]:
+        if str(gid) in parent_tids:
+          continue
+        cand_ik = f"gerrit:{gid}"
+        if cand_ik in by_ikey:
+          cp_rec = by_ikey[cand_ik][0]
+          cp_ikey = cand_ik
+          break
+        if not cp_ikey:
+          cp_ikey = cand_ik
+      if cp_rec is None and ms_val:
+        for pik in parent_ikeys:
+          matched = cp_by_parent_and_ms.get((pik, ms_val))
+          if matched is not None:
+            cp_rec = matched
+            cp_ikey = str(matched.get("item_key") or "")
+            break
+
+      if cp_rec is not None:
+        covered_cp_ikeys.add(cp_ikey)
+        tid = str(cp_rec.get("target_id") or cp_ikey.split(":", 1)[-1])
+        cl_label = f"CL {tid}"
+        cl_url = str(cp_rec.get("url") or f"https://{GERRIT_SKIA_HOST}/c/skia/+/{tid}")
+        cl_status = str(cp_rec.get("status") or "NEW").upper()
+        cl_summary = _summarize_cl_for_bug_subtask(cp_rec)
+        cl_needs_you = bool(
+            cp_rec.get("in_my_attention")
+            or (cp_rec.get("merge_conflict") and cp_rec.get("is_self"))
+            or str(cp_rec.get("phase") or "").startswith("ALERT_")
+        )
+      elif cp_ikey:
+        covered_cp_ikeys.add(cp_ikey)
+        tid = cp_ikey.split(":", 1)[-1]
+        known_urls = {**(mb.get("comment_cl_urls") or {}), **(mb.get("gerrit_cl_urls") or {})}
+        cl_label = f"CL {tid}"
+        cl_url = str(known_urls.get(tid) or f"https://{GERRIT_SKIA_HOST}/c/skia/+/{tid}")
+        cl_status = "LINKED"
+        cl_summary = "Linked"
+        cl_needs_you = False
+      else:
+        cl_label = ""
+        cl_url = ""
+        cl_status = ""
+        cl_summary = ""
+        cl_needs_you = False
+
+      children.append({
+          "milestone": ms_val,
+          "milestone_label": f"M{ms_val}" if ms_val else "Merge",
+          "bug_key": bkey,
+          "bug_short_id": str(mb.get("short_id") or bkey),
+          "bug_url": str(mb.get("url") or ""),
+          "bug_status": str(mb.get("status") or ""),
+          "bug_needs_you": bool(mb.get("needs_you")),
+          "merge_status": merge_status,
+          "cl_item_key": cp_ikey,
+          "cl_label": cl_label,
+          "cl_url": cl_url,
+          "cl_status": cl_status,
+          "cl_summary": cl_summary,
+          "cl_needs_you": cl_needs_you,
+      })
+
+    active = any(
+        str(c.get("bug_status") or "").upper() in ("NEW", "ASSIGNED", "ACCEPTED", "OPEN")
+        or str(c.get("cl_status") or "").upper() in ("NEW", "OPEN", "LINKED")
+        or bool(c.get("cl_needs_you"))
+        for c in children
+    )
+    if isinstance(parent_bug, dict):
+      parent_bug["merge_children"] = list(children)
+      parent_bug["has_active_merges"] = active
+    for pik in parent_ikeys:
+      for p_rec in by_ikey.get(pik, []):
+        existing = list(p_rec.get("merge_children") or [])
+        existing.extend(children)
+        existing.sort(key=lambda c: (int(c.get("milestone") or 9999), str(c.get("bug_key") or "")))
+        p_rec["merge_children"] = existing
+        p_rec["has_active_merges"] = bool(p_rec.get("has_active_merges") or active)
+
+  # Attach standalone cherry-pick CLs that have no `[Merge Mxx]` child issue
+  for ikey, recs in by_ikey.items():
+    if ikey in covered_cp_ikeys:
+      continue
+    sample = recs[0]
+    pik = str(sample.get("cherry_pick_of") or "").strip()
+    if not sample.get("is_cherry_pick") or not pik or pik not in by_ikey:
+      continue
+    ms_val = _milestone_from_cl_record(sample) or 0
+    tid = str(sample.get("target_id") or ikey.split(":", 1)[-1])
+    cl_status = str(sample.get("status") or "NEW").upper()
+    cl_needs_you = bool(
+        sample.get("in_my_attention")
+        or (sample.get("merge_conflict") and sample.get("is_self"))
+        or str(sample.get("phase") or "").startswith("ALERT_")
+    )
+    entry = {
+        "milestone": ms_val,
+        "milestone_label": f"M{ms_val}" if ms_val else (str(sample.get("branch") or "Cherry-pick")),
+        "bug_key": "",
+        "bug_short_id": "",
+        "bug_url": "",
+        "bug_status": "",
+        "bug_needs_you": False,
+        "merge_status": "",
+        "cl_item_key": ikey,
+        "cl_label": f"CL {tid}",
+        "cl_url": str(sample.get("url") or f"https://{GERRIT_SKIA_HOST}/c/skia/+/{tid}"),
+        "cl_status": cl_status,
+        "cl_summary": _summarize_cl_for_bug_subtask(sample),
+        "cl_needs_you": cl_needs_you,
+    }
+    active_cp = cl_status in ("NEW", "OPEN") or cl_needs_you
+    for p_rec in by_ikey[pik]:
+      existing = list(p_rec.get("merge_children") or [])
+      existing.append(entry)
+      existing.sort(
+          key=lambda c: (int(c.get("milestone") or 9999), str(c.get("cl_item_key") or ""))
+      )
+      p_rec["merge_children"] = existing
+      p_rec["has_active_merges"] = bool(p_rec.get("has_active_merges") or active_cp)
+
+
+def build_buganizer_bulk_query_url(issue_ids: list[str]) -> str:
+  """Builds a single Buganizer search URL covering multiple issue IDs for bulk editing."""
+  clean = [str(i).strip() for i in issue_ids if str(i).strip().isdigit()]
+  if not clean:
+    return ""
+  joined = "%20OR%20".join(clean)
+  return f"https://issues.chromium.org/issues?q=id:({joined})"
+
+
+def _mcp_mutation_succeeded(output_text: str) -> bool:
+  """Returns True when a Buganizer MCP mutation response carries no RPC failure code."""
+  txt = (output_text or "").strip()
+  if not txt:
+    return False
+  up = txt.upper()
+  return not any(
+      code in up
+      for code in (
+          "FAILED_PRECONDITION",
+          "PERMISSION_DENIED",
+          "INVALID_ARGUMENT",
+          "NOT_FOUND",
+          "UNAUTHENTICATED",
+          "INTERNAL:",
+          "ERROR:",
+      )
+  )
+
+
+def reassign_security_merge_batch(
+    bugs: dict[str, Any],
+    issue_ids: list[str],
+    comment_markdown: str = "",
+) -> dict[str, Any]:
+  """Runs sequential collaborator -> reassign -> read-back MCP batches with bulk-URL fallback."""
+  clean_ids = list(
+      dict.fromkeys(str(i).strip() for i in issue_ids if str(i).strip().isdigit())
+  )
+  if not clean_ids:
+    return {"ok": False, "error": "No valid issue_ids provided"}
+
+  # Enforce strict standing-rule scope before issuing any Buganizer write call
+  for bid in clean_ids:
+    bug = (bugs or {}).get(f"buganizer:{bid}")
+    if not isinstance(bug, dict):
+      return {"ok": False, "error": f"Unknown issue {bid}"}
+    cf = bug.get("custom_fields") if isinstance(bug.get("custom_fields"), dict) else {}
+    in_scope = (
+        str(bug.get("reporter") or "").strip().lower() == SECURITY_MERGE_REPORTER
+        and str(bug.get("component_id") or "").strip() == SECURITY_MERGE_COMPONENT_ID
+        and extract_merge_milestone(str(bug.get("title") or "")) is not None
+        and bool(str(bug.get("parent_issue_id") or "").strip())
+        and str(cf.get(CF_BUG_MERGE) or "").strip().lower() == "pending"
+        and _is_self_bug_assignee(str(bug.get("assignee") or ""))
+    )
+    if not in_scope:
+      return {
+          "ok": False,
+          "error": f"Issue {bid} is outside security merge reassign scope",
+      }
+
+  # Phase 1: Post comment (if needed) and add jlavrova@google.com to Collaborators
+  cmt = (comment_markdown or "").strip()
+  phase1_calls: list[tuple[str, dict[str, Any]]] = []
+  collab_idx_by_bid: dict[str, int] = {}
+  comment_idx_by_bid: dict[str, int] = {}
+  for bid in clean_ids:
+    bug = bugs[f"buganizer:{bid}"]
+    if cmt and not str(bug.get("last_self_comment_at") or "").strip():
+      comment_idx_by_bid[bid] = len(phase1_calls)
+      phase1_calls.append(
+          ("add_buganizer_comment", {"issueId": bid, "commentMarkdown": cmt})
+      )
+    collab_idx_by_bid[bid] = len(phase1_calls)
+    phase1_calls.append((
+        "safe_add_collaborator",
+        {"issueId": bid, "collaborator": "jlavrova@google.com"},
+    ))
+  p1_outs = call_buganizer_mcp_batch(phase1_calls)
+  now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+  errors: dict[str, str] = {}
+  collab_ok_ids: list[str] = []
+  for bid in clean_ids:
+    c_idx = comment_idx_by_bid.get(bid)
+    if c_idx is not None and c_idx < len(p1_outs) and _mcp_mutation_succeeded(p1_outs[c_idx]):
+      bugs[f"buganizer:{bid}"]["last_self_comment_at"] = now_iso
+    col_idx = collab_idx_by_bid[bid]
+    col_out = p1_outs[col_idx] if col_idx < len(p1_outs) else ""
+    if _mcp_mutation_succeeded(col_out):
+      collab_ok_ids.append(bid)
+    else:
+      errors[bid] = col_out or "safe_add_collaborator failed"
+
+  # Phase 2: Reassign to merges@chromium.org in a separate MCP session after Collaborator settles
+  p2_ok_set: set[str] = set()
+  if collab_ok_ids:
+    phase2_calls = [
+        ("safe_reassign_issue", {"issueId": bid, "assignee": "merges@chromium.org"})
+        for bid in collab_ok_ids
+    ]
+    p2_outs = call_buganizer_mcp_batch(phase2_calls)
+    for bid, out in zip(collab_ok_ids, p2_outs):
+      if _mcp_mutation_succeeded(out):
+        p2_ok_set.add(bid)
+      else:
+        errors[bid] = out or "safe_reassign_issue failed"
+
+  # Phase 3: Read back live issue state and verify writer access retention
+  id_q = " OR ".join(f"id:{bid}" for bid in clean_ids)
+  phase3_calls: list[tuple[str, dict[str, Any]]] = [
+      (
+          "get_bugs_with_external",
+          {"query": id_q, "maxResults": max(10, len(clean_ids) * 2), "verbose": True},
+      ),
+      *[("get_user_access", {"issueId": bid, "relation": "writer"}) for bid in clean_ids],
+  ]
+  p3_outs = call_buganizer_mcp_batch(phase3_calls)
+  parsed_rb = parse_buganizer_blocks(p3_outs[0]) if p3_outs else []
+  rb_by_id = {str(b.get("id") or ""): b for b in parsed_rb}
+
+  reassigned_ids: list[str] = []
+  failed_ids: list[str] = []
+  for idx, bid in enumerate(clean_ids):
+    acc_raw = p3_outs[idx + 1] if (idx + 1) < len(p3_outs) else ""
+    writer_ok = "true" in acc_raw.lower()
+    rb = rb_by_id.get(bid)
+    bug = bugs[f"buganizer:{bid}"]
+    if isinstance(rb, dict) and rb.get("assignee"):
+      bug["assignee"] = rb["assignee"]
+    rb_assignee = str((rb or bug).get("assignee") or "").strip().lower()
+    if bid in p2_ok_set and rb_assignee == "merges@chromium.org" and writer_ok:
+      bug["is_collaborator"] = True
+      reassigned_ids.append(bid)
+    else:
+      failed_ids.append(bid)
+      if bid not in errors:
+        errors[bid] = (
+            f"Read-back mismatch (assignee={rb_assignee or '?'}, writer={writer_ok})"
+        )
+    classify_bug_status(bug)
+
+  return {
+      "ok": True,
+      "reassigned_ids": reassigned_ids,
+      "failed_ids": failed_ids,
+      "bulk_reassign_url": build_buganizer_bulk_query_url(failed_ids),
+      "errors": errors,
+  }
+
+
+def reassign_security_merge_for_state(
+    issue_ids: list[str],
+    parent_id: str = "",
+    comment_markdown: str = "",
+) -> dict[str, Any]:
+  """Executes `reassign_security_merge_batch` against persisted Flight Deck state."""
+  state = load_watcher_state()
+  bugs = state.setdefault("bugs", {})
+  target_ids = [str(i).strip() for i in issue_ids if str(i).strip().isdigit()]
+  if not target_ids and parent_id:
+    for b in bugs.values():
+      if (
+          isinstance(b, dict)
+          and is_merge_request_bug(b)
+          and str(b.get("parent_issue_id") or "").strip() == str(parent_id).strip()
+          and _is_self_bug_assignee(str(b.get("assignee") or ""))
+      ):
+        target_ids.append(str(b.get("id") or ""))
+  res = reassign_security_merge_batch(bugs, target_ids, comment_markdown=comment_markdown)
+  if res.get("ok"):
+    attach_merge_children_to_cls_and_bugs(bugs, state.get("items") or {})
+    save_watcher_state(state)
+  return res
+
+
 def _should_retain_bug_in_view(
     bug: dict[str, Any],
     primary_self_bkeys: set[str] | None = None,
@@ -8537,6 +9144,7 @@ def sync_bugs_into_state(
     for b in pruned_fast.values():
       _resolve_redacted_bug_title(b, pruned_fast)
       classify_bug_status(b, now_ts=now_ts)
+    attach_merge_children_to_cls_and_bugs(pruned_fast, items)
     state["bugs"] = pruned_fast
     return
 
@@ -8601,7 +9209,14 @@ def sync_bugs_into_state(
       and b.get("source") == "buganizer"
       and str(b.get("status") or "").upper() in ("NEW", "ASSIGNED", "ACCEPTED", "OPEN")
   }
-  missing_bz_ids = sorted((ref_buganizer_ids | prev_open_ids) - seen_bz_ids)
+  parent_bz_ids = {
+      str(b.get("parent_issue_id") or "").strip()
+      for b in fetched_bz
+      if isinstance(b, dict) and str(b.get("parent_issue_id") or "").strip().isdigit()
+  }
+  missing_bz_ids = sorted(
+      (ref_buganizer_ids | prev_open_ids | parent_bz_ids) - seen_bz_ids
+  )
   if missing_bz_ids:
     id_q = " OR ".join(f"id:{bid}" for bid in missing_bz_ids[:40])
     extra_out = call_buganizer_mcp_batch(
@@ -8701,14 +9316,26 @@ def sync_bugs_into_state(
       bug["project_id"] = pid
       bug["project_name"] = pname
 
+  merge_parent_bkeys = {
+      f"buganizer:{str(b.get('parent_issue_id')).strip()}"
+      for b in all_bugs.values()
+      # Keep closed parent bugs visible while at least one child merge request stays in view
+      if isinstance(b, dict)
+      and is_merge_request_bug(b)
+      and str(b.get("parent_issue_id") or "").strip().isdigit()
+      and _should_retain_bug_in_view(b, primary_self_bkeys)
+  }
   # Keep reviewer-only colleague bugs for CL chips, but exclude them from the Bugs tab
   retained_bugs: dict[str, dict[str, Any]] = {}
   for bkey, bug in all_bugs.items():
-    if not _should_retain_bug_in_view(bug, primary_self_bkeys):
+    if bkey not in merge_parent_bkeys and not _should_retain_bug_in_view(
+        bug, primary_self_bkeys
+    ):
       continue
     retained_bugs[bkey] = bug
     classify_bug_status(bug, now_ts=now_ts)
 
+  attach_merge_children_to_cls_and_bugs(retained_bugs, items)
   state["bugs"] = retained_bugs
 
   review_claims: dict[str, Any] = state.setdefault("review_claims", {})
@@ -8764,13 +9391,8 @@ def sync_bugs_into_state(
       )
       del events[50:]
 
-    # Auto-start bug triage for unchatted Needs You bugs (excluding merge closure prompts)
-    if (
-        wake_chats
-        and not bug.get("conversation_id")
-        and bug.get("needs_you")
-        and not str(bug.get("why_needs_you") or "").startswith("All linked CLs merged")
-    ):
+    # Auto-start bug triage for unchatted Needs You bugs (excluding merge requests & closures)
+    if wake_chats and should_autostart_bug_triage(bug):
       claim_key = f"bug:{bkey}:{bug.get('last_human_comment_at') or bug.get('created_time') or 'init'}"
       if claim_key not in review_claims and auto_started_bugs < 1 and busy_chats < 2:
         res = _start_chat_for_bug(state, bkey, save=False)
@@ -8800,26 +9422,58 @@ def sync_bugs_into_state(
   state["last_bug_sync_ts"] = now_ts
 
 
+def ack_bug_items(bug_keys: list[str]) -> dict[str, Any]:
+  """Marks one or more Needs You bug keys as acknowledged in a single state update."""
+  keys = [str(k).strip() for k in bug_keys if str(k).strip()]
+  if not keys:
+    return {"ok": False, "error": "Missing bug_key"}
+  state = load_watcher_state()
+  bugs = state.get("bugs") or {}
+  now_ts = time.time()
+  acked: list[str] = []
+  last_lane = "assigned"
+  for bkey in keys:
+    # Support R70's merge_group:<parent_id> synthetic key alongside explicit bug keys
+    if bkey.startswith("merge_group:"):
+      pid = bkey.split(":", 1)[1].strip()
+      for bug in bugs.values():
+        if not isinstance(bug, dict):
+          continue
+        b_pid = str(
+            bug.get("parent_issue_id") or bug.get("merge_group_parent_id") or ""
+        ).strip()
+        if b_pid == pid:
+          bug["acked_ts"] = max(now_ts, float(bug.get("modified_ts") or 0.0))
+          classify_bug_status(bug, now_ts=now_ts)
+          last_lane = str(bug.get("lane") or "has_cl")
+          if bkey not in acked:
+            acked.append(bkey)
+      continue
+    bug = bugs.get(bkey)
+    if not isinstance(bug, dict):
+      continue
+    bug["acked_ts"] = max(
+        now_ts,
+        float(bug.get("modified_ts") or 0.0),
+        _parse_ts(bug.get("last_human_comment_at")),
+        float(bug.get("latest_cl_merged_ts") or 0.0),
+    )
+    classify_bug_status(bug, now_ts=now_ts)
+    last_lane = str(bug.get("lane") or "assigned")
+    acked.append(bkey)
+  if not acked:
+    return {"ok": False, "error": f"Unknown bug {keys[0]}"}
+  attach_merge_children_to_cls_and_bugs(bugs, state.get("items") or {})
+  save_watcher_state(state)
+  return {"ok": True, "bug_key": acked[0], "bug_keys": acked, "lane": last_lane}
+
+
 def ack_bug_item(bug_key: str) -> dict[str, Any]:
   """Marks a Needs You bug comment or merged-CL prompt as acknowledged."""
   bkey = str(bug_key or "").strip()
   if not bkey:
     return {"ok": False, "error": "Missing bug_key"}
-  state = load_watcher_state()
-  bugs = state.get("bugs") or {}
-  bug = bugs.get(bkey)
-  if not isinstance(bug, dict):
-    return {"ok": False, "error": f"Unknown bug {bkey}"}
-  now_ts = time.time()
-  bug["acked_ts"] = max(
-      now_ts,
-      float(bug.get("modified_ts") or 0.0),
-      _parse_ts(bug.get("last_human_comment_at")),
-      float(bug.get("latest_cl_merged_ts") or 0.0),
-  )
-  classify_bug_status(bug, now_ts=now_ts)
-  save_watcher_state(state)
-  return {"ok": True, "bug_key": bkey, "lane": bug.get("lane", "assigned")}
+  return ack_bug_items([bkey])
 
 
 def sync_once(
@@ -8887,8 +9541,30 @@ def sync_once(
       proj_names=proj_names,
   )
   all_chats = discover_active_cl_chats(include_archived=True)
-  attach_archived_chats_to_open_changes(remote_unchatted, all_chats=all_chats)
-  discovered = chatted + remote_unchatted
+  known_ikeys = {
+      str(d.get("item_key") or "") for d in (chatted + remote_unchatted)
+  }
+  merge_seeded: list[dict[str, Any]] = []
+  for mgid in discover_merge_linked_gerrit_ids(state.get("bugs") or {}):
+    m_ikey = f"gerrit:{mgid}"
+    # Skip CLs already discovered from active chats or open Gerrit queries
+    if m_ikey in known_ikeys:
+      continue
+    known_ikeys.add(m_ikey)
+    merge_seeded.append({
+        "item_key": m_ikey,
+        "kind": "gerrit",
+        "target_id": mgid,
+        "conversation_id": "",
+        "title": f"Gerrit {mgid}",
+        "project_id": "",
+        "project_name": "Skia",
+        "single_target": False,
+    })
+  attach_archived_chats_to_open_changes(
+      remote_unchatted + merge_seeded, all_chats=all_chats
+  )
+  discovered = chatted + remote_unchatted + merge_seeded
 
   # Cache fetched CL/PR metadata so multiple chats referencing the same CL don't re-fetch
   fetched_cache: dict[str, dict[str, Any]] = {}
@@ -9068,6 +9744,16 @@ def sync_once(
       and str((fetched_cache.get(d["item_key"]) or {}).get("status") or "").upper()
       in ("NEW", "OPEN")
   }
+  merge_retained_ikeys = {
+      f"gerrit:{gid}" for gid in discover_merge_linked_gerrit_ids(state.get("bugs") or {})
+  }
+  open_cherry_pick_parents = {
+      f"gerrit:{(fetched_cache.get(d['item_key']) or {}).get('cherry_pick_of_change')}"
+      for d in active_discovered
+      if (fetched_cache.get(d["item_key"]) or {}).get("cherry_pick_of_change")
+      and str((fetched_cache.get(d["item_key"]) or {}).get("status") or "").upper()
+      in ("NEW", "OPEN")
+  }
   kept_active: list[dict[str, Any]] = []
   for d in active_discovered:
     ikey = d["item_key"]
@@ -9082,18 +9768,22 @@ def sync_once(
       is_fix = bool(d.get("fixes_breakage_from"))
       has_fix = bool(ikey in fix_targets)
       has_open_companion = bool(ikey in open_companion_parents)
+      has_active_merge = bool(
+          ikey in merge_retained_ikeys or ikey in open_cherry_pick_parents
+      )
       # Only Skia commits have post_submit roll tracking; None means nothing is rolling
       rolling = bool(ps and (not ps.get("all_passed") or ps.get("has_alert")))
       _, prev_d = _lookup_state_item(prev_items, ikey)
       just_merged = bool(
           prev_d and str(prev_d.get("status") or "").upper() != "MERGED"
       )
-      # Keep merged change if chatted, fixing/fixed, holding an open companion, rolling, or new
+      # Keep merged change if chatted, fixing/fixed, holding an open companion/merge, or rolling
       if not (
           has_active_chat
           or is_fix
           or has_fix
           or has_open_companion
+          or has_active_merge
           or rolling
           or just_merged
       ):
@@ -9713,12 +10403,59 @@ def sync_once(
         wake_chats=wake_chats,
         proj_names=proj_names,
     )
+    present_ikeys = {
+        str(r.get("item_key") or "")
+        for r in new_items.values()
+        if isinstance(r, dict)
+    }
+    backfilled = False
+    for mgid in discover_merge_linked_gerrit_ids(state.get("bugs") or {}):
+      m_ikey = f"gerrit:{mgid}"
+      if m_ikey in present_ikeys:
+        continue
+      # Fetch status immediately when sync_bugs discovers a merge-linked CL mid-poll
+      m_info = fetch_gerrit_cl_status(
+          mgid, rollers, incidents, skia_dir=skia_dir
+      )
+      if not m_info.get("ok") or is_autoroll_change(m_info):
+        continue
+      present_ikeys.add(m_ikey)
+      backfilled = True
+      new_items[f"{m_ikey}@unchatted"] = {
+          "item_key": m_ikey,
+          "kind": "gerrit",
+          "target_id": mgid,
+          "conversation_id": "",
+          "title": f"Gerrit {mgid}",
+          "project_id": "",
+          "project_name": "Skia",
+          "single_target": False,
+          **m_info,
+          "composite_key": f"{m_ikey}@unchatted",
+          "updated_at": now_et_str(),
+          "submitted_ts": (
+              parse_gerrit_or_iso_time(m_info.get("submitted") or "")
+              or datetime.fromtimestamp(0, timezone.utc)
+          ).timestamp(),
+          "activity_ts": (
+              parse_gerrit_or_iso_time(m_info.get("status_changed_raw") or "")
+              or datetime.fromtimestamp(0, timezone.utc)
+          ).timestamp(),
+      }
+    # Recompute bug<->CL and merge_children cross-links once backfilled CLs join new_items
+    if backfilled:
+      link_bugs_and_cls(state["bugs"], new_items)
+      for b in state["bugs"].values():
+        if isinstance(b, dict):
+          classify_bug_status(b)
+      attach_merge_children_to_cls_and_bugs(state["bugs"], new_items)
   elif state.get("bugs"):
     # Keep in-memory bug<->CL cross-links synchronized when running fast CL-only syncs
     link_bugs_and_cls(state["bugs"], new_items)
     for b in state["bugs"].values():
       if isinstance(b, dict):
         classify_bug_status(b)
+    attach_merge_children_to_cls_and_bugs(state["bugs"], new_items)
   state["last_sync"] = now_et_str()
   state["gardener_url"] = gardener_pen_url()
   state["rollers_summary"] = {
@@ -10624,16 +11361,21 @@ function hasReadyCompanion(it) {
   return readyCompanionsOf(it).length > 0;
 }
 
-// Filters out standalone companion rows when their parent CL/PR is present in items
+// Filters out standalone companion and cherry-pick rows when their parent CL/PR is in items
 function visibleItemsFromData(data) {
   if (!data || !data.items) return [];
   const raw = Object.values(data.items);
   const parentKeys = new Set(
-    raw.filter(it => it && !isCompanion(it))
+    raw.filter(it => it && !isCompanion(it) && !it.is_cherry_pick)
       .map(it => it.item_key || `${it.kind || 'gerrit'}:${it.target_id}`)
   );
   return raw.filter(it => {
     if (!it) return false;
+    if (it.is_cherry_pick && it.cherry_pick_of) {
+      if (it.status === 'ABANDONED' || it.status === 'CLOSED') return false;
+      // Hide cherry-pick CLs as standalone rows when the parent CL renders a Merges strip
+      return !parentKeys.has(String(it.cherry_pick_of));
+    }
     if (!isCompanion(it)) return true;
     // Abandoned or closed companions never render as standalone rows
     if (it.status === 'ABANDONED' || it.status === 'CLOSED') return false;
@@ -11521,6 +12263,10 @@ function statusOf(it) {
   if (it.status === 'ABANDONED' || it.status === 'CLOSED') return 'abandoned';
   // Surface parent CLs in Needs You when an attached companion is ready to abandon
   if (hasReadyCompanion(it)) return 'attention';
+  // Surface parent CLs when an attached release-branch cherry-pick CL needs Gerrit action
+  if (Array.isArray(it.merge_children) && it.merge_children.some(mc => mc && mc.cl_needs_you)) {
+    return 'attention';
+  }
   // Sponsored external CLs stay out of Gerrit attention_set yet still need Googler action
   if (needsSponsorAction(it)) return 'attention';
   // Open orphan companions wait on the parent author unless marked ready to abandon
@@ -11563,10 +12309,13 @@ function laneOf(it) {
   if (st === 'attention' || st === 'conflict') return 'you';
   if (st === 'cq') return 'landing';
   if (st === 'merged') {
+    // Keep merged parent CLs visible in Landing until all release-branch merges settle
+    if (it.has_active_merges) return 'landing';
     // A merged CL without post-submit data has nothing left to track
     const ps = it.post_submit;
     return ps && !ps.all_passed ? 'landing' : 'done';
   }
+  if (st === 'old' && it.has_active_merges) return 'landing';
   if (st === 'draft' || st === 'dev') return 'desk';
   if (st === 'waiting' || st === 'tree') return 'waiting';
   if (st === 'watching') return 'watching';
@@ -13142,7 +13891,7 @@ function focusCard(it, data) {
         ${parentBugsHtml(it)}
         <!-- Surface fix-for linkage on pre-submit focus cards -->
         ${brokenAndFixBannerHtml(it)}${fixesBreakageBannerHtml(it)}
-        ${companionsBannerHtml(it)}
+        ${companionsBannerHtml(it)}${mergesBannerHtml(it)}
         ${stackBlockerBannerHtml(it, data)}</div>
       <div class="actions">${actionsWithFix}</div>
       ${triageHtml(it, false)}
@@ -13187,7 +13936,7 @@ function rowHtml(it, data) {
         <div class="meta">${meta}</div>
         <!-- Surface fix-for linkage and broken bots on lane rows -->
         ${brokenAndFixBannerHtml(it)}${fixesBreakageBannerHtml(it)}
-        ${companionsBannerHtml(it)}
+        ${companionsBannerHtml(it)}${mergesBannerHtml(it)}
         ${stackBlockerBannerHtml(it, data)}
         ${triageHtml(it, true)}</div>
       <div class="state">${stateHtml(it)}</div>
@@ -13329,7 +14078,221 @@ function processingStripItemHtml(it, data, type) {
     </details>`;
 }
 
+// Renders nested milestone merge request and cherry-pick status pills on parent CLs and bugs
+function mergesBannerHtml(entity) {
+  const list = Array.isArray(entity && entity.merge_children) ? entity.merge_children : [];
+  if (!list.length) return '';
+  const items = list.map(mc => {
+    if (!mc) return '';
+    const msLbl = mc.milestone_label || (mc.milestone ? `M${mc.milestone}` : 'Merge');
+    const bugTip = mc.bug_short_id
+      ? `${mc.bug_short_id}${mc.merge_status ? ` · ${mc.merge_status}` : ''}`
+      : msLbl;
+    const msHtml = mc.bug_url
+      ? link(mc.bug_url, `<b>${esc(msLbl)}</b>`, '', bugTip)
+      : `<b>${esc(msLbl)}</b>`;
+    const parts = [msHtml];
+    if (mc.cl_label) {
+      const clRef = mc.cl_url
+        ? link(mc.cl_url, esc(mc.cl_label), 'cl-ref', mc.cl_summary || mc.cl_status || '')
+        : `<span class="cl-ref">${esc(mc.cl_label)}</span>`;
+      const det = mc.cl_summary || mc.cl_status || '';
+      parts.push(det ? `${clRef} <span class="soft">(${esc(det)})</span>` : clRef);
+    } else if (mc.merge_status) {
+      parts.push(`<span class="soft">${esc(mc.merge_status)}</span>`);
+    }
+    if (mc.cl_needs_you) {
+      parts.push('<span class="badge warn">⦿ Needs you</span>');
+    }
+    return `<span>${parts.join(' ')}</span>`;
+  }).filter(Boolean);
+  if (!items.length) return '';
+  return `<div class="companion-banner merges-banner">` +
+    `<span><b>Merges:</b></span> ${items.join('<span class="path-sep">·</span>')}</div>`;
+}
+
+function isMergeRequestBug(bug) {
+  if (!bug) return false;
+  if (bug.is_merge_request_bug || bug.is_security_merge_request) return true;
+  return /^\[Merge\s+M\d+\]/i.test(String(bug.title || '').trim());
+}
+
+function bugMilestoneNum(bug) {
+  if (bug && Number(bug.merge_milestone) > 0) return Number(bug.merge_milestone);
+  const m = String((bug && bug.title) || '').trim().match(/^\[Merge\s+M(\d+)\]/i);
+  return m ? Number(m[1]) : 9999;
+}
+
+function mergeGroupKeyOfBug(bug) {
+  if (!isMergeRequestBug(bug)) return '';
+  const pid = String(bug.parent_issue_id || bug.merge_group_parent_id || '').trim();
+  return pid ? `merge-parent:${pid}` : '';
+}
+
+// Collapses sibling [Merge Mxx] bugs sharing parent_issue_id into one Needs Me unit
+function groupNeedYouBugUnits(bugs) {
+  const units = [];
+  const byGroup = new Map();
+  for (const b of bugs) {
+    if (!b) continue;
+    const gk = mergeGroupKeyOfBug(b);
+    if (!gk) {
+      units.push({kind: 'single', bug: b});
+      continue;
+    }
+    let bucket = byGroup.get(gk);
+    if (!bucket) {
+      bucket = {
+        kind: 'merge_group',
+        parentId: gk.slice('merge-parent:'.length),
+        bugs: [],
+      };
+      byGroup.set(gk, bucket);
+      units.push(bucket);
+    }
+    bucket.bugs.push(b);
+  }
+  for (const u of units) {
+    if (u.kind === 'merge_group') {
+      u.bugs.sort((a, b) => bugMilestoneNum(a) - bugMilestoneNum(b));
+    }
+  }
+  return units;
+}
+
+// Collapses sibling open [Merge Mxx] rows in Has CL so parent + merges do not spam 3 rows
+function collapseMergeLaneBugs(bugs, data) {
+  const out = [];
+  const byGroup = new Map();
+  for (const b of bugs) {
+    if (!b) continue;
+    const gk = mergeGroupKeyOfBug(b);
+    if (!gk) {
+      out.push({kind: 'single', bug: b});
+      continue;
+    }
+    const pid = gk.slice('merge-parent:'.length);
+    const parentBug = data && data.bugs ? data.bugs[`buganizer:${pid}`] : null;
+    if (parentBug && parentBug.lane === b.lane && Array.isArray(parentBug.merge_children) &&
+        parentBug.merge_children.length) {
+      continue;
+    }
+    let bucket = byGroup.get(gk);
+    if (!bucket) {
+      bucket = {kind: 'merge_group', parentId: pid, bugs: []};
+      byGroup.set(gk, bucket);
+      out.push(bucket);
+    }
+    bucket.bugs.push(b);
+  }
+  for (const u of out) {
+    if (u.kind === 'merge_group') {
+      u.bugs.sort((a, b) => bugMilestoneNum(a) - bugMilestoneNum(b));
+    }
+  }
+  return out;
+}
+
+function groupedMergeFocusCard(siblings, parentId, data) {
+  // Delegate Pending gate evaluation to R70's securityMergeCard when group metadata is present
+  const mGrp = parentId && data && data.merge_request_groups && data.merge_request_groups[parentId];
+  if (mGrp && typeof securityMergeCard === 'function' && !mGrp.all_already_commented) {
+    return securityMergeCard(mGrp);
+  }
+  const first = siblings[0];
+  const msLabels = siblings.map(b => {
+    const n = bugMilestoneNum(b);
+    return n < 9999 ? `M${n}` : (b.short_id || b.id || 'Merge');
+  });
+  const msJoined = msLabels.join('/');
+  const baseTitle = String(first.title || '').replace(/^\[Merge\s+M\d+\]\s*/i, '').trim() ||
+    first.title || `Merge ${msJoined}`;
+  const parentBug = (data && data.bugs && parentId) ? data.bugs[`buganizer:${parentId}`] : null;
+  const parentUrl = (parentBug && parentBug.url) ||
+    (parentId ? `https://issues.chromium.org/issues/${parentId}` : '');
+  const parentChip = parentId
+    ? ` · parent ${link(parentUrl, esc(`crbug/${parentId}`))}` : '';
+  const childLinks = siblings.map((b, i) =>
+    link(b.url, `${esc(b.short_id || b.id)} (${esc(msLabels[i])})`)
+  ).join(', ');
+  const issueIds = siblings.map(b => String(b.id || '')).filter(Boolean);
+  const bugKeys = siblings.map(b => String(b.bug_key || '')).filter(Boolean);
+  const bulkUrl = issueIds.length
+    ? `https://issues.chromium.org/issues?q=id:(${issueIds.join('%20OR%20')})`
+    : first.url;
+  const phases = new Set(siblings.map(b => String(b.merge_action_phase || '')));
+  let whyTxt = '';
+  let primaryBtn = '';
+  if (phases.has('reassign')) {
+    whyTxt = `${msJoined} merge comment posted — reassign to merges@chromium.org`;
+    primaryBtn = `<button class="btn primary" onclick="reassignMerge(` +
+      `${esc(JSON.stringify(issueIds))}, ${esc(JSON.stringify(parentId || ''))}, this)">` +
+      `Reassign ${esc(msJoined)} to merges@chromium.org</button>` +
+      link(bulkUrl, `Open ${esc(msJoined)} in Buganizer`, 'btn secondary');
+  } else if (phases.has('manual_cherry_pick')) {
+    const branches = siblings.map(b => {
+      const n = bugMilestoneNum(b);
+      return n < 9999 ? `chrome/m${n}` : 'release branch';
+    }).join(', ');
+    whyTxt = `${msJoined} merge approved — manual cherry-pick onto ${branches} needed`;
+    primaryBtn = link(bulkUrl, `Open ${esc(msJoined)}`, 'btn primary');
+  } else {
+    whyTxt = `${msJoined} merge request pending — confirm`;
+    primaryBtn = link(bulkUrl, `Open ${esc(msJoined)}`, 'btn primary');
+  }
+  const ackBtn = `<button class="btn secondary" ` +
+    `onclick="ackBugs(${esc(JSON.stringify(bugKeys))}, this)">✓ Ack</button>`;
+  const chatTarget = parentBug || first;
+  const chatBtn = bugChatActionHtml(chatTarget, data, false);
+  return `<article class="card alert">` +
+    `<div><div class="eyebrow">Security merge request · ${esc(first.project_name || 'Skia')}` +
+    `${parentChip} · ${childLinks}</div>` +
+    `<h2>${bugPriorityBadgeHtml(first)}[${esc(msJoined)}] ${link(bulkUrl, esc(baseTitle))}</h2>` +
+    `<div class="why">${esc(whyTxt)}</div>` +
+    `<div class="merge-reassign-status"></div></div>` +
+    `<div class="actions">${primaryBtn}${ackBtn}${chatBtn}</div>` +
+    `${bugSubtasksHtml(first, data)}</article>`;
+}
+
+function groupedMergeLaneRowHtml(siblings, parentId, data) {
+  if (siblings.length === 1) return bugRowHtml(siblings[0], data);
+  const first = siblings[0];
+  const msLabels = siblings.map(b => {
+    const n = bugMilestoneNum(b);
+    return n < 9999 ? `M${n}` : (b.short_id || b.id);
+  });
+  const msJoined = msLabels.join('/');
+  const baseTitle = String(first.title || '').replace(/^\[Merge\s+M\d+\]\s*/i, '').trim() ||
+    first.title;
+  const issueIds = siblings.map(b => String(b.id || '')).filter(Boolean);
+  const bulkUrl = issueIds.length
+    ? `https://issues.chromium.org/issues?q=id:(${issueIds.join('%20OR%20')})`
+    : first.url;
+  const childLinks = siblings.map((b, i) =>
+    link(b.url, `${esc(msLabels[i])}`, 'cl-ref', b.short_id || b.id)
+  ).join(' · ');
+  const ownerActor = (first.assignee && first.assignee !== 'N/A') ? shortActor(first.assignee) : '';
+  const parentUrl = parentId ? `https://issues.chromium.org/issues/${parentId}` : '';
+  const meta = [
+    `<span class="proj-tag">${esc(first.project_name || 'Skia')}</span>`,
+    childLinks,
+    parentId ? link(parentUrl, esc(`parent crbug/${parentId}`)) : '',
+    ownerActor ? `owner: ${esc(ownerActor)}` : '',
+  ].filter(Boolean).join(' · ');
+  const whenTxt = first.modified_et
+    ? `${esc(first.modified_et)}${first.modified_age ? ` (${esc(first.modified_age)})` : ''}` : '';
+  return `<div class="row"><div><div class="title">${bugPriorityBadgeHtml(first)}` +
+    `[${esc(msJoined)}] ${link(bulkUrl, esc(baseTitle))}</div>` +
+    `<div class="meta">${meta}</div></div>` +
+    `<div class="state">${siblings.length} merge requests</div>` +
+    `<div class="when">${whenTxt}</div></div>`;
+}
+
 function bugFocusCard(bug, data) {
+  if (isMergeRequestBug(bug)) {
+    const pid = String(bug.parent_issue_id || bug.merge_group_parent_id || '').trim();
+    return groupedMergeFocusCard([bug], pid, data);
+  }
   // Reserve red alert styling on P0 issues for owned bugs, not collaborator consults
   const isAlert = Boolean(bug.is_overdue || bug.issue_type === 'VULNERABILITY' ||
     (bug.priority === 'P0' && !bug.is_collaborator));
@@ -13349,7 +14312,7 @@ function bugFocusCard(bug, data) {
     `<div class="why">${esc(bug.why_needs_you || 'Needs triage')}${sloPart}</div></div>` +
     `<div class="actions">${link(bug.url, 'Open issue', 'btn primary')}` +
     `${ackBtn}${bugChatActionHtml(bug, data, false)}</div>` +
-    `${bugSubtasksHtml(bug, data)}</article>`;
+    `${bugSubtasksHtml(bug, data)}${mergesBannerHtml(bug)}</article>`;
 }
 
 function bugRowHtml(bug, data) {
@@ -13379,9 +14342,10 @@ function bugRowHtml(bug, data) {
       : esc(bug.status || 'ASSIGNED')));
   const whenTxt = bug.modified_et
     ? `${esc(bug.modified_et)}${bug.modified_age ? ` (${esc(bug.modified_age)})` : ''}` : '';
+  const subtasks = `${bugSubtasksHtml(bug, data)}${mergesBannerHtml(bug)}`;
   return `<div class="row"><div><div class="title">${bugPriorityBadgeHtml(bug)}` +
     `${link(bug.url, esc(bug.title))}</div><div class="meta">${meta}</div>` +
-    `${bugSubtasksHtml(bug, data)}</div><div class="state">${stateTxt}</div>` +
+    `${subtasks}</div><div class="state">${stateTxt}</div>` +
     `<div class="when">${whenTxt}</div></div>`;
 }
 
@@ -13627,7 +14591,7 @@ function render() {
   const projFilteredBugs = selectedProject === 'ALL'
     ? allBugs : allBugs.filter(b => projOf(b) === selectedProject);
   const bugYouAll = projFilteredBugs.filter(b => (b.lane || 'assigned') === 'you');
-  const bugNeedCount = bugYouAll.filter(b => !b.chat_busy).length;
+  const bugNeedCount = groupNeedYouBugUnits(bugYouAll.filter(b => !b.chat_busy)).length;
   const viewSwitchEl = document.getElementById('view-switch');
   if (viewSwitchEl) {
     viewSwitchEl.innerHTML = renderViewSwitchHtml(
@@ -13659,13 +14623,18 @@ function render() {
     );
     const needYouBugs = byBug.you.filter(b => !b.chat_busy);
     const busyYouBugs = byBug.you.filter(b => b.chat_busy);
-    const needBugs = needYouBugs.length;
+    const needYouUnits = groupNeedYouBugUnits(needYouBugs);
+    const needBugs = needYouUnits.length;
     document.getElementById('headline').innerHTML = headlineHtml(
       needBugs, selectedProject, busyBugs
     );
     // Secondary bug counts now appear on the .sec-tabs pills below #focus
     document.getElementById('subline').textContent = '';
-    document.getElementById('focus').innerHTML = needYouBugs.map(b => bugFocusCard(b, data)).join('');
+    document.getElementById('focus').innerHTML = needYouUnits.map(u =>
+      u.kind === 'merge_group'
+        ? groupedMergeFocusCard(u.bugs, u.parentId, data)
+        : bugFocusCard(u.bug, data)
+    ).join('');
     document.getElementById('processing').innerHTML = busyYouBugs.map(b => processingStripItemHtml(b, data, 'bug')).join('');
 
     const bugSections = [];
@@ -13690,6 +14659,22 @@ function render() {
             bodyHtml: laneSectionBodyHtml(
               'Backlog (>60d)', stale.length, 'Unchatted assigned bugs older than 60 days',
               stale.map(b => bugRowHtml(b, data)).join('')
+            ),
+          });
+        }
+      } else if (l.id === 'has_cl') {
+        // Collapse sibling [Merge Mxx] rows under the parent bug strip when present
+        const collapsed = collapseMergeLaneBugs(list, data);
+        if (collapsed.length) {
+          bugSections.push({
+            id: l.id, title: l.title, count: collapsed.length,
+            bodyHtml: laneSectionBodyHtml(
+              l.title, collapsed.length, l.hint,
+              collapsed.map(u =>
+                u.kind === 'merge_group'
+                  ? groupedMergeLaneRowHtml(u.bugs, u.parentId, data)
+                  : bugRowHtml(u.bug, data)
+              ).join('')
             ),
           });
         }
@@ -14065,8 +15050,9 @@ async function abandonCompanions(itemKeys, btn) {
   }
 }
 
-async function ackBug(bugKey, btn) {
-  if (!bugKey || (btn && btn.disabled)) return;
+async function ackBugs(bugKeys, btn) {
+  const keys = Array.isArray(bugKeys) ? bugKeys.filter(Boolean) : [bugKeys].filter(Boolean);
+  if (!keys.length || (btn && btn.disabled)) return;
   const orig = btn ? btn.textContent : '';
   if (btn) {
     btn.disabled = true;
@@ -14076,13 +15062,69 @@ async function ackBug(bugKey, btn) {
     const resp = await fetch('/api/ack_bug', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({bug_key: bugKey}),
+      body: JSON.stringify({bug_keys: keys, bug_key: keys[0]}),
     });
     const res = await resp.json();
     if (res && res.ok) {
       await fetchState(true);
       return;
     }
+  } catch (e) {
+    // Restore button label when the local HTTP call fails
+  }
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
+}
+
+async function ackBug(bugKey, btn) {
+  return ackBugs([bugKey], btn);
+}
+
+async function reassignMerge(issueIds, parentId, btn, commentMarkdown = '') {
+  const ids = Array.isArray(issueIds) ? issueIds.filter(Boolean) : [issueIds].filter(Boolean);
+  if ((!ids.length && !parentId) || (btn && btn.disabled)) return;
+  const orig = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Reassigning…';
+  }
+  try {
+    const resp = await fetch('/api/reassign_merge', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        issue_ids: ids,
+        parent_id: parentId || '',
+        comment_markdown: commentMarkdown || '',
+      }),
+    });
+    const res = await resp.json();
+    if (res && res.ok) {
+      if (res.bulk_reassign_url) {
+        if (typeof window !== 'undefined' && typeof window.open === 'function') {
+          window.open(res.bulk_reassign_url, '_blank', 'noopener');
+        }
+        const card = btn && typeof btn.closest === 'function' ? btn.closest('article') : null;
+        const statusEl = card && typeof card.querySelector === 'function'
+          ? card.querySelector('.merge-reassign-status') : null;
+        if (statusEl) {
+          const nFail = Array.isArray(res.failed_ids) ? res.failed_ids.length : ids.length;
+          statusEl.innerHTML = `<div class="fix-banner">` +
+            `SafeReassignIssue requires Web UI bulk reassign for ${nFail} issue(s): ` +
+            `${link(res.bulk_reassign_url, 'Open single bulk-reassign tab ↗')}</div>`;
+        }
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = orig;
+        }
+        return;
+      }
+      await fetchState();
+      return;
+    }
+    if (btn && res && res.error) btn.title = res.error;
   } catch (e) {
     // Restore button label when the local HTTP call fails
   }
@@ -14287,6 +15329,7 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
         "/api/add_reviewer",
         "/api/approve_review_preview",
         "/api/approve_review",
+        "/api/reassign_merge",
     ):
       length = int(self.headers.get("Content-Length") or 0)
       raw_body = (
@@ -14306,8 +15349,24 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
       elif parsed.path == "/api/start_chat":
         res = start_chat_for_item(str(bdict.get("item_key") or ""))
       elif parsed.path == "/api/ack_bug":
-        res = ack_bug_item(
-            str(bdict.get("bug_key") or bdict.get("item_key") or "")
+        raw_bkeys = bdict.get("bug_keys")
+        if isinstance(raw_bkeys, list) and raw_bkeys:
+          res = ack_bug_items([str(k) for k in raw_bkeys if k])
+        else:
+          res = ack_bug_item(
+              str(bdict.get("bug_key") or bdict.get("item_key") or "")
+          )
+      elif parsed.path == "/api/reassign_merge":
+        raw_ids = bdict.get("issue_ids")
+        ids = (
+            [str(x) for x in raw_ids if x]
+            if isinstance(raw_ids, list)
+            else []
+        )
+        res = reassign_security_merge_for_state(
+            ids,
+            parent_id=str(bdict.get("parent_id") or ""),
+            comment_markdown=str(bdict.get("comment_markdown") or ""),
         )
       elif parsed.path == "/api/add_reviewer":
         raw_keys = bdict.get("item_keys")
