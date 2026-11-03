@@ -963,6 +963,364 @@ class TestCanaryAdvisor(unittest.TestCase):
     )
     self.assertEqual(g3_res["verdict"], "NOT_MERGEABLE")
 
+  def test_luci_token_ttl_and_authed_writes_refresh_expired_token_on_400(self):
+    # Cached tokens older than 4 minutes must refresh before Google OAuth expires them
+    canary_advisor._LUCI_TOKEN_CACHE = ("stale-5m-tok", canary_advisor.time.time() - 300)
+    with patch.object(
+        canary_advisor.subprocess,
+        "run",
+        return_value=type("P", (), {"stdout": "password=refreshed-tok\n"})(),
+    ):
+      self.assertEqual(canary_advisor._gerrit_luci_token(), "refreshed-tok")
+
+    # post_gerrit_hold_resolution and save_gerrit_patchset_draft must retry on HTTP 400
+    class _FakeResp:
+
+      def __init__(self, status=200, text=")]}'\n{}"):
+        self.status = status
+        self._text = text
+
+      def read(self):
+        return self._text.encode("utf-8")
+
+      def __enter__(self):
+        return self
+
+      def __exit__(self, exc_type, exc, tb):
+        return False
+
+    seen_hold_auth = []
+
+    def fake_hold_urlopen(req, timeout=20):
+      auth = req.headers.get("Authorization")
+      seen_hold_auth.append(auth)
+      if auth == "Bearer expired-write-tok":
+        raise canary_advisor.urllib.error.HTTPError(
+            req.full_url, 400, "Bad Request", {}, None
+        )
+      return _FakeResp(200, ")]}'\n{}")
+
+    canary_advisor._LUCI_TOKEN_CACHE = ("expired-write-tok", canary_advisor.time.time())
+    with patch.object(
+        canary_advisor.subprocess,
+        "run",
+        return_value=type("P", (), {"stdout": "password=fresh-write-tok\n"})(),
+    ):
+      with patch.object(
+          canary_advisor.urllib.request, "urlopen", side_effect=fake_hold_urlopen
+      ):
+        ok, err = canary_advisor.post_gerrit_hold_resolution(
+            1414017, 1, ["068f541c_51cd2ab8"], "Canary-G3 passed; resolving submit hold."
+        )
+    self.assertTrue(ok)
+    self.assertEqual(err, "")
+    self.assertEqual(
+        seen_hold_auth, ["Bearer expired-write-tok", "Bearer fresh-write-tok"]
+    )
+
+    seen_draft_auth = []
+
+    def fake_draft_urlopen(req, timeout=15):
+      auth = req.headers.get("Authorization")
+      seen_draft_auth.append((req.get_method(), auth))
+      if auth == "Bearer expired-draft-tok":
+        raise canary_advisor.urllib.error.HTTPError(
+            req.full_url, 400, "Bad Request", {}, None
+        )
+      return _FakeResp(200, ")]}'\n{}")
+
+    canary_advisor._LUCI_TOKEN_CACHE = ("expired-draft-tok", canary_advisor.time.time())
+    with patch.object(
+        canary_advisor.subprocess,
+        "run",
+        return_value=type("P", (), {"stdout": "password=fresh-draft-tok\n"})(),
+    ):
+      with patch.object(
+          canary_advisor.urllib.request, "urlopen", side_effect=fake_draft_urlopen
+      ):
+        saved = canary_advisor.save_gerrit_patchset_draft(
+            1414017, 1, "Canary-G3 failed on unrelated targets.", unresolved=False
+        )
+    self.assertTrue(saved)
+    self.assertEqual(seen_draft_auth[0], ("GET", "Bearer expired-draft-tok"))
+    self.assertEqual(seen_draft_auth[1], ("GET", "Bearer fresh-draft-tok"))
+    self.assertEqual(seen_draft_auth[2], ("PUT", "Bearer fresh-draft-tok"))
+
+  def test_cmd_watch_waits_for_canary_g3_after_asan_and_after_trigger_before_indexing(self):
+    # Incident 2026-11-02 (Gerrit 1414017 PS1): ASAN finishes before CR+1, then right after
+    # git cl try triggers Canary-G3, bb_cl_builds still shows only ASAN SUCCESS for one poll;
+    # cmd_watch must NOT exit with ALL_TRYJOBS_COMPLETE until Canary-G3 appears and finishes
+    base_meta = {
+        "cl": 1414017,
+        "patchset": 1,
+        "current_patchset": 1,
+        "status": "NEW",
+        "subject": "[skparagraph] Shift the trailing space of an RTL run when justifying",
+        "owner": "dbebawy@gmail.com",
+        "diff": (
+            "diff --git a/modules/skparagraph/src/TextLine.cpp "
+            "b/modules/skparagraph/src/TextLine.cpp\n+// fix\n"
+        ),
+        "googler_cr_plus_one": False,
+    }
+    poll_metas = [
+        base_meta,
+        # Poll 1: ASAN done, no CR+1 yet
+        {**base_meta, "googler_cr_plus_one": False},
+        # Poll 2: CR+1 published -> triggers Canary-G3, Buildbucket has not indexed it yet
+        {**base_meta, "googler_cr_plus_one": True},
+        # Poll 3: Canary-G3 now visible as STARTED
+        {**base_meta, "googler_cr_plus_one": True},
+        # Poll 4: Canary-G3 SUCCESS -> hold resolution transiently errors on first try
+        {**base_meta, "googler_cr_plus_one": True},
+    ]
+    asan_ok = {
+        "Test-Ubuntu24.04-Clang-GCE-CPU-AVX2-x86_64-Debug-All-NativeFonts_FreeType_ASAN_Upload": {
+            "status": "SUCCESS"
+        }
+    }
+    g3_started = {**asan_ok, "Canary-G3": {"id": "86662085", "status": "STARTED"}}
+    g3_success = {**asan_ok, "Canary-G3": {"id": "86662085", "status": "SUCCESS"}}
+    bb_seq = [
+        # Poll 1
+        asan_ok,
+        # Poll 2 (inside trigger_canary_g3_once + loop body: Canary-G3 not indexed yet)
+        asan_ok,
+        asan_ok,
+        # Poll 3
+        g3_started,
+        # Poll 4
+        g3_success,
+    ]
+    bb_idx = {"i": 0}
+
+    def fake_bb(_cl, _ps):
+      idx = min(bb_idx["i"], len(bb_seq) - 1)
+      bb_idx["i"] += 1
+      return bb_seq[idx]
+
+    args = type(
+        "Args",
+        (),
+        {
+            "cl": "1414017",
+            "ps": "1",
+            "poll_sec": 0,
+            "timeout_min": 90,
+            "save_draft": True,
+            "no_resolve_hold": False,
+            "json": False,
+        },
+    )()
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+      claims_file = os.path.join(tmp, "claims.json")
+      with patch.dict(os.environ, {"CANARY_G3_CLAIMS_FILE": claims_file}):
+        with patch.object(canary_advisor, "load_cl", side_effect=poll_metas + [poll_metas[-1]]):
+          with patch.object(canary_advisor, "bb_cl_builds", side_effect=fake_bb):
+            with patch.object(canary_advisor, "unapproved_g3_chain", return_value=[]):
+              with patch.object(canary_advisor, "swarming_tasks_for_cl", return_value=[]):
+                with patch.object(
+                    canary_advisor.subprocess,
+                    "run",
+                    return_value=type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+                ) as mock_try:
+                  with patch.object(
+                      canary_advisor,
+                      "resolve_canary_g3_holds",
+                      return_value=[{"cl": 1414017, "tested_ps": 1, "error": "ps1:HTTP 503"}],
+                  ):
+                    with patch.object(canary_advisor, "cmd_triage", return_value={}) as mock_triage:
+                      with patch.object(canary_advisor.time, "sleep"):
+                        buf = io.StringIO()
+                        with patch("sys.stdout", buf):
+                          rc = canary_advisor.cmd_watch(args)
+    self.assertEqual(rc, 0)
+    self.assertEqual(mock_try.call_count, 1)
+    # Because Poll 4's resolve_canary_g3_holds had an error, holds_resolved stayed False so
+    # final cmd_triage receives args.resolve_hold == True to retry resolving the hold
+    self.assertTrue(args.resolve_hold)
+    mock_triage.assert_called_once()
+    self.assertGreaterEqual(bb_idx["i"], 5)
+
+  def test_cmd_watch_exits_cleanly_when_cl_abandoned(self):
+    init_meta = {
+        "cl": 1414017,
+        "patchset": 1,
+        "current_patchset": 1,
+        "status": "NEW",
+        "subject": "Test",
+        "owner": "ext@gmail.com",
+        "diff": "diff --git a/modules/skparagraph/src/Run.cpp b/modules/skparagraph/src/Run.cpp\n",
+        "googler_cr_plus_one": False,
+    }
+    abandoned_meta = {**init_meta, "status": "ABANDONED"}
+    args = type(
+        "Args",
+        (),
+        {
+            "cl": "1414017",
+            "ps": "1",
+            "poll_sec": 0,
+            "timeout_min": 5,
+            "save_draft": False,
+            "no_resolve_hold": False,
+            "json": False,
+        },
+    )()
+    buf = io.StringIO()
+    with patch.object(canary_advisor, "load_cl", side_effect=[init_meta, abandoned_meta]):
+      with patch("sys.stdout", buf):
+        rc = canary_advisor.cmd_watch(args)
+    self.assertEqual(rc, 0)
+    self.assertIn("WAKEUP_REASON: CL_ABANDONED", buf.getvalue())
+
+  def test_trigger_canary_g3_once_dedups_adopts_and_reruns_pre_cr_missing_approval(self):
+    import tempfile
+
+    live_meta = {
+        "cl": 1414017,
+        "patchset": 1,
+        "current_patchset": 1,
+        "status": "NEW",
+        "subject": "Test",
+        "owner": "ext@gmail.com",
+        "diff": "",
+        "googler_cr_plus_one": True,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+      claims_path = os.path.join(tmp, "claims.json")
+      with patch.object(canary_advisor, "load_cl", return_value=live_meta):
+        with patch.object(canary_advisor, "bb_cl_builds", return_value={}):
+          with patch.object(canary_advisor, "unapproved_g3_chain", return_value=[]):
+            with patch.object(
+                canary_advisor.subprocess,
+                "run",
+                return_value=type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+            ) as mock_run:
+              r1 = canary_advisor.trigger_canary_g3_once(
+                  1414017, 1, actor="watch", claims_path=claims_path
+              )
+              r2 = canary_advisor.trigger_canary_g3_once(
+                  1414017, 1, actor="cl_watcher", claims_path=claims_path
+              )
+      self.assertTrue(r1["ok"])
+      self.assertTrue(r1["triggered"])
+      self.assertTrue(r2["ok"])
+      self.assertFalse(r2["triggered"])
+      self.assertTrue(r2.get("already_claimed"))
+      self.assertEqual(mock_run.call_count, 1)
+
+      # Existing real failure (CL_SUSPECTED_REGRESSION) is adopted, never re-triggered
+      reg_build = {"Canary-G3": {"id": "86662085", "status": "FAILURE"}}
+      with patch.object(canary_advisor, "load_cl", return_value={**live_meta, "cl": 1414018}):
+        with patch.object(canary_advisor, "bb_cl_builds", return_value=reg_build):
+          with patch.object(
+              canary_advisor,
+              "swarming_tasks_for_cl",
+              return_value=[{"taskId": "t_reg", "name": "Canary-G3"}],
+          ):
+            with patch.object(
+                canary_advisor,
+                "swarming_task_stdout",
+                return_value="Canary roll [ http://cl/1012433408 ] failed",
+            ):
+              with patch.object(canary_advisor.subprocess, "run") as mock_reg_run:
+                r_adopt = canary_advisor.trigger_canary_g3_once(
+                    1414018, 1, actor="cl_watcher", claims_path=claims_path
+                )
+      self.assertTrue(r_adopt["ok"])
+      self.assertFalse(r_adopt["triggered"])
+      self.assertTrue(r_adopt["adopted"])
+      mock_reg_run.assert_not_called()
+
+      # Pre-CR+1 MISSING_APPROVAL build is superseded once chain is approved -> triggers once
+      pre_cr_build = {"Canary-G3": {"id": "86660001", "status": "FAILURE"}}
+      missing_out = (
+          "Failed to run g3 try: changes must be either owned and authored by Googlers "
+          "or approved (CR+1) by a Googler"
+      )
+      with patch.object(canary_advisor, "load_cl", return_value={**live_meta, "cl": 1409696}):
+        with patch.object(canary_advisor, "bb_cl_builds", return_value=pre_cr_build):
+          with patch.object(canary_advisor, "unapproved_g3_chain", return_value=[]):
+            with patch.object(
+                canary_advisor,
+                "swarming_tasks_for_cl",
+                return_value=[{"taskId": "t_miss", "name": "Canary-G3"}],
+            ):
+              with patch.object(canary_advisor, "swarming_task_stdout", return_value=missing_out):
+                with patch.object(
+                    canary_advisor.subprocess,
+                    "run",
+                    return_value=type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+                ) as mock_rerun:
+                  r_rerun = canary_advisor.trigger_canary_g3_once(
+                      1409696, 1, actor="cl_watcher", claims_path=claims_path
+                  )
+      self.assertTrue(r_rerun["ok"])
+      self.assertTrue(r_rerun["triggered"])
+      self.assertEqual(r_rerun["claim"].get("superseded_build_id"), "86660001")
+      self.assertEqual(mock_rerun.call_count, 1)
+
+  def test_cmd_watch_survives_transient_rpc_errors_in_poll_loop(self):
+    meta = {
+        "cl": 1414017,
+        "patchset": 1,
+        "current_patchset": 1,
+        "status": "NEW",
+        "subject": "Test",
+        "owner": "ext@gmail.com",
+        "diff": "diff --git a/modules/skparagraph/src/Run.cpp b/modules/skparagraph/src/Run.cpp\n",
+        "googler_cr_plus_one": True,
+    }
+    args = type(
+        "Args",
+        (),
+        {
+            "cl": "1414017",
+            "ps": "1",
+            "poll_sec": 0,
+            "timeout_min": 5,
+            "save_draft": False,
+            "no_resolve_hold": False,
+            "json": False,
+        },
+    )()
+    g3_ok = {"Canary-G3": {"id": "86662085", "status": "SUCCESS"}}
+    with patch.object(canary_advisor, "load_cl", return_value=meta):
+      with patch.object(
+          canary_advisor,
+          "bb_cl_builds",
+          side_effect=[canary_advisor.urllib.error.URLError("transient 503"), g3_ok, g3_ok],
+      ):
+        with patch.object(
+            canary_advisor,
+            "swarming_tasks_for_cl",
+            return_value=[],
+        ):
+          with patch.object(
+              canary_advisor,
+              "resolve_canary_g3_holds",
+              side_effect=[
+                  canary_advisor.urllib.error.URLError("gerrit 502"),
+                  [{
+                      "cl": 1414017,
+                      "tested_ps": 1,
+                      "current_ps": 1,
+                      "resolved": True,
+                      "resolved_leaf_ids": ["hold_leaf_1"],
+                      "message": "Canary-G3 passed; resolving submit hold.",
+                  }],
+              ],
+          ) as mock_resolve:
+            with patch.object(canary_advisor, "cmd_triage", return_value={}):
+              with patch.object(canary_advisor.time, "sleep"):
+                with patch("sys.stdout", io.StringIO()):
+                  rc = canary_advisor.cmd_watch(args)
+    self.assertEqual(rc, 0)
+    self.assertEqual(mock_resolve.call_count, 2)
+
 
 if __name__ == "__main__":
   unittest.main()

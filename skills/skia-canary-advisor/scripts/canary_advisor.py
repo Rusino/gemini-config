@@ -18,6 +18,7 @@ Usage:
 import argparse
 import base64
 import datetime
+import fcntl
 import heapq
 import json
 import os
@@ -25,6 +26,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -35,6 +37,8 @@ CANARIES = ["Canary-Flutter", "Canary-G3", "Canary-Chromium", "Canary-Android"]
 ME = "jlavrova@google.com"
 LEDGER = os.environ.get("CANARY_ADVISOR_LEDGER",
                         os.path.expanduser("~/.gemini/config/ledgers/canary_advisor.jsonl"))
+CANARY_G3_CLAIMS_FILE = os.path.expanduser("~/.gemini/config/ledgers/canary_g3_claims.json")
+LUCI_TOKEN_TTL_S = 240
 
 # depot_tools lives in ~/depot_tools on Linux and in ~/Sources/depot_tools on the Mac
 def _depot_tool(name):
@@ -124,12 +128,12 @@ KEYWORDS = {
 _LUCI_TOKEN_CACHE = ("", 0.0)
 
 
-# Authenticate Gerrit reads via git-credential-luci to avoid anonymous IP HTTP 429 limits
+# Authenticate Gerrit calls via git-credential-luci to avoid anonymous IP HTTP 429 limits
 def _gerrit_luci_token(force_refresh=False):
     global _LUCI_TOKEN_CACHE
     tok, ts = _LUCI_TOKEN_CACHE
-    # Reuse cached Bearer token within 20 minutes unless Gerrit rejected it on /a/
-    if not force_refresh and tok and (time.time() - ts) < 1200:
+    # Refresh cached OAuth tokens every 4 minutes before Gerrit /a/ rejects them with HTTP 400
+    if not force_refresh and tok and (time.time() - ts) < LUCI_TOKEN_TTL_S:
         return tok
     try:
         proc = subprocess.run(
@@ -145,9 +149,47 @@ def _gerrit_luci_token(force_refresh=False):
                     return tok
     except (subprocess.SubprocessError, OSError):
         pass
-    # Drop stale cached token when git-credential-luci fails so callers fall back to public reads
+    # Drop stale cached token when git-credential-luci fails so callers fall back cleanly
     _LUCI_TOKEN_CACHE = ("", 0.0)
     return ""
+
+
+# Execute an authenticated Gerrit /a/ request and retry once with a fresh token on HTTP 400/401/403
+def _gerrit_authed_urlopen(url, *, data=None, method=None, headers=None, timeout=20):
+    global _LUCI_TOKEN_CACHE
+    tok = _gerrit_luci_token()
+    if not tok:
+        return None, "missing_luci_token"
+    base_headers = {"User-Agent": "canary-advisor", **(headers or {})}
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={**base_headers, "Authorization": f"Bearer {tok}"},
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return (getattr(r, "status", 200), r.read()), ""
+    except urllib.error.HTTPError as e:
+        # Refresh cached LUCI OAuth token once when Gerrit /a/ rejects a stale Bearer token
+        if e.code in (400, 401, 403):
+            _LUCI_TOKEN_CACHE = ("", 0.0)
+            fresh = _gerrit_luci_token(force_refresh=True)
+            if fresh and fresh != tok:
+                retry_req = urllib.request.Request(
+                    url,
+                    data=data,
+                    headers={**base_headers, "Authorization": f"Bearer {fresh}"},
+                    method=method,
+                )
+                try:
+                    with urllib.request.urlopen(retry_req, timeout=timeout) as r:
+                        return (getattr(r, "status", 200), r.read()), ""
+                except (urllib.error.URLError, OSError) as e2:
+                    return None, str(e2)
+        return None, str(e)
+    except (urllib.error.URLError, OSError) as e:
+        return None, str(e)
 
 
 def http_get(url, timeout=20):
@@ -397,9 +439,30 @@ def load_cl(cl, ps=None, include_diff=True):
     )
     return {
         "cl": int(cl), "patchset": ps_num, "current_patchset": cur_rev["_number"],
+        "status": info.get("status", "NEW"),
         "subject": info["subject"], "owner": info["owner"].get("email", ""), "diff": patch,
         "googler_cr_plus_one": googler_cr_plus_one,
     }
+
+
+# Check whether touched paths require Canary-G3 via AREA_RULES or added/deleted source files
+def needs_canary_g3_for_files(files):
+    items = files.items() if isinstance(files, dict) else ((p, {}) for p in (files or ()))
+    for path, meta in items:
+        # Ignore non-buildable docs, tests, or metadata paths
+        if NO_EFFECT.search(path):
+            continue
+        # Match first area rule to mirror advise() precedence
+        for rx, canaries, _tier, _reason in AREA_RULES:
+            if re.search(rx, path):
+                if "Canary-G3" in canaries:
+                    return True
+                break
+        # Added or deleted source files require regenerating google3 BUILD.bazel
+        if isinstance(meta, dict) and meta.get("status") in ("A", "D"):
+            if re.match(r"^(src|include|modules)/", path):
+                return True
+    return False
 
 
 def advise(args):
@@ -1154,36 +1217,17 @@ def triage_other_canary_failure(cl, ps, builder, bb_build, sw_tasks, touched_fil
 
 
 def save_gerrit_patchset_draft(cl, ps, note_text, unresolved=False):
-    try:
-        proc = subprocess.run(
-            ["git-credential-luci", "get"],
-            input="protocol=https\nhost=skia-review.googlesource.com\n\n",
-            capture_output=True, text=True, timeout=10, check=True
-        )
-        token = ""
-        for line in proc.stdout.splitlines():
-            if line.startswith("password="):
-                token = line.split("=", 1)[1].strip()
-                break
-        if not token:
-            print("WARNING: git-credential-luci returned empty password, cannot save draft")
-            return False
-    except (subprocess.SubprocessError, OSError) as e:
-        print(f"WARNING: failed to get git-credential-luci token: {e}")
-        return False
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json; charset=UTF-8",
-        "User-Agent": "canary-advisor",
-    }
+    json_headers = {"Content-Type": "application/json; charset=UTF-8"}
     drafts_url = f"{GERRIT}/a/changes/{cl}/revisions/{ps}/drafts"
+    resp_pair, err = _gerrit_authed_urlopen(drafts_url, headers=json_headers, timeout=15)
+    if resp_pair is None:
+        print(f"WARNING: failed to list Gerrit drafts on CL {cl} PS {ps}: {err}")
+        return False
     try:
-        req = urllib.request.Request(drafts_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as r:
-            drafts_data = json.loads(r.read().decode("utf-8")[4:])
-    except (urllib.error.URLError, OSError) as e:
-        print(f"WARNING: failed to list Gerrit drafts on CL {cl} PS {ps}: {e}")
+        raw = resp_pair[1].decode("utf-8", "replace")
+        drafts_data = json.loads(raw[4:] if raw.startswith(")]}'") else raw)
+    except json.JSONDecodeError as e:
+        print(f"WARNING: failed to parse Gerrit drafts on CL {cl} PS {ps}: {e}")
         return False
 
     existing_ps_draft = None
@@ -1196,27 +1240,27 @@ def save_gerrit_patchset_draft(cl, ps, note_text, unresolved=False):
         if note_text in old_msg:
             return True
         new_msg = f"{old_msg}\n\n{note_text}".strip()
-        update_url = f"{drafts_url}/{existing_ps_draft['id']}"
+        target_url = f"{drafts_url}/{existing_ps_draft['id']}"
         payload = json.dumps({
             "path": "/PATCHSET_LEVEL",
             "message": new_msg,
             "unresolved": existing_ps_draft.get("unresolved", unresolved),
         }).encode("utf-8")
-        req = urllib.request.Request(update_url, data=payload, headers=headers, method="PUT")
     else:
+        target_url = drafts_url
         payload = json.dumps({
             "path": "/PATCHSET_LEVEL",
             "message": note_text,
             "unresolved": unresolved,
         }).encode("utf-8")
-        req = urllib.request.Request(drafts_url, data=payload, headers=headers, method="PUT")
 
-    try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            return r.status in (200, 201)
-    except (urllib.error.URLError, OSError) as e:
-        print(f"WARNING: failed to save Gerrit draft on CL {cl} PS {ps}: {e}")
+    put_pair, put_err = _gerrit_authed_urlopen(
+        target_url, data=payload, method="PUT", headers=json_headers, timeout=15
+    )
+    if put_pair is None:
+        print(f"WARNING: failed to save Gerrit draft on CL {cl} PS {ps}: {put_err}")
         return False
+    return put_pair[0] in (200, 201)
 
 
 # Reconstruct /PATCHSET_LEVEL threads using Gerrit's CommentThreads priority-queue order and
@@ -1308,9 +1352,6 @@ def _ancestor_own_canary_g3_status(cl, tested_ps):
 # Gerrit CommentsUtil.ensureValidInReplyTo requires posting replies on the parent comment's own
 # patchset rather than revisions/current when a newer patchset exists
 def post_gerrit_hold_resolution(cl, leaf_ps, leaf_ids, message):
-    token = _gerrit_luci_token()
-    if not token:
-        return False, "missing_luci_token"
     url = f"{GERRIT}/a/changes/{int(cl)}/revisions/{int(leaf_ps)}/review"
     payload = json.dumps({
         "drafts": "KEEP",
@@ -1328,18 +1369,160 @@ def post_gerrit_hold_resolution(cl, leaf_ps, leaf_ids, message):
             ]
         },
     }).encode("utf-8")
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json; charset=UTF-8",
-        "User-Agent": "canary-advisor",
-    }
-    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            r.read()
-            return r.status in (200, 201), ""
-    except (urllib.error.URLError, OSError) as e:
-        return False, str(e)
+    resp_pair, err = _gerrit_authed_urlopen(
+        url,
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/json; charset=UTF-8"},
+        timeout=20,
+    )
+    if resp_pair is None:
+        return False, err
+    return resp_pair[0] in (200, 201), ""
+
+
+def _write_claims_json(path, data):
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+# Coordinate single-fire Canary-G3 triggering across watch and cl_watcher via flock ledger
+def trigger_canary_g3_once(
+    cl,
+    ps,
+    *,
+    actor="watch",
+    skia_dir=None,
+    claims_path=None,
+    prefetched_builds=None,
+):
+    cl, ps = int(cl), int(ps)
+    key = f"{cl}:{ps}"
+    resolved_claims = claims_path or os.environ.get("CANARY_G3_CLAIMS_FILE")
+    if not resolved_claims:
+        if "unittest" in sys.modules:
+            resolved_claims = os.path.join(
+                tempfile.gettempdir(), f"canary_g3_claims_ut_{os.getpid()}.json"
+            )
+        else:
+            resolved_claims = CANARY_G3_CLAIMS_FILE
+    os.makedirs(os.path.dirname(resolved_claims), exist_ok=True)
+    lock_path = f"{resolved_claims}.lock"
+
+    with open(lock_path, "a+", encoding="utf-8") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        claims = {}
+        if os.path.exists(resolved_claims):
+            try:
+                with open(resolved_claims, encoding="utf-8") as fh:
+                    loaded = json.load(fh)
+                    if isinstance(loaded, dict):
+                        claims = loaded
+            except (OSError, json.JSONDecodeError):
+                claims = {}
+
+        existing = claims.get(key)
+        if isinstance(existing, dict) and existing.get("status") in ("triggered", "adopted"):
+            return {
+                "ok": True,
+                "triggered": False,
+                "already_claimed": True,
+                "claim": existing,
+            }
+
+        meta = load_cl(cl, ps=None, include_diff=False)
+        cl_status = str(meta.get("status") or "NEW").upper()
+        if cl_status != "NEW":
+            return {"ok": False, "triggered": False, "reason": f"status_{cl_status.lower()}"}
+        cur_ps = int(meta.get("current_patchset") or meta.get("patchset") or 0)
+        if cur_ps != ps:
+            return {"ok": False, "triggered": False, "reason": f"superseded_by_ps_{cur_ps}"}
+        if not str(meta.get("owner") or "").endswith("@google.com"):
+            if not meta.get("googler_cr_plus_one"):
+                return {"ok": False, "triggered": False, "reason": "missing_googler_cr_plus_one"}
+
+        builds = prefetched_builds if prefetched_builds is not None else bb_cl_builds(cl, ps)
+        g3_build = builds.get("Canary-G3")
+        superseded_build_id = ""
+        checked_missing = None
+        if g3_build:
+            # Supersede a pre-CR+1 MissingApproval build once the stack chain has Googler CR+1
+            is_pre_cr_missing = False
+            if (
+                g3_build.get("status") in ("FAILURE", "INFRA_FAILURE")
+                and not _not_mergeable_verdict(g3_build)
+            ):
+                sw_tasks = swarming_tasks_for_cl(cl, ps, name="Canary-G3")
+                g3_task = _find_builder_task(cl, ps, "Canary-G3", g3_build, sw_tasks)
+                stdout = swarming_task_stdout(g3_task.get("taskId")) if g3_task else ""
+                if "changes must be either owned and authored by Googlers" in stdout:
+                    checked_missing = unapproved_g3_chain(cl, ps)
+                    if not checked_missing:
+                        is_pre_cr_missing = True
+                        superseded_build_id = str(g3_build.get("id") or "")
+            if not is_pre_cr_missing:
+                claim = {
+                    "cl": cl,
+                    "ps": ps,
+                    "status": "adopted",
+                    "actor": actor,
+                    "build_id": str(g3_build.get("id") or ""),
+                    "build_status": str(g3_build.get("status") or ""),
+                    "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(
+                        timespec="seconds"
+                    ),
+                }
+                claims[key] = claim
+                _write_claims_json(resolved_claims, claims)
+                return {
+                    "ok": True,
+                    "triggered": False,
+                    "adopted": True,
+                    "build": g3_build,
+                    "claim": claim,
+                }
+
+        missing = checked_missing if checked_missing is not None else unapproved_g3_chain(cl, ps)
+        if missing:
+            return {
+                "ok": False,
+                "triggered": False,
+                "reason": "unapproved_parent_chain",
+                "missing": missing,
+            }
+
+        cwd = (
+            skia_dir
+            if (skia_dir and os.path.isdir(skia_dir))
+            else (SKIA_DIR if os.path.isdir(SKIA_DIR) else "/tmp")
+        )
+        env = {**os.environ, "SKIP_GCE_AUTH_FOR_GIT": "1"}
+        cmd = ["git", "cl", "try", "-i", str(cl), "-B", BUCKET, "-b", "Canary-G3"]
+        proc = subprocess.run(
+            cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=60, check=False
+        )
+        rc = getattr(proc, "returncode", 0)
+        if isinstance(rc, int) and rc != 0:
+            return {
+                "ok": False,
+                "triggered": False,
+                "reason": "git_cl_try_failed",
+                "stderr": (getattr(proc, "stderr", "") or "")[:300],
+            }
+        claim = {
+            "cl": cl,
+            "ps": ps,
+            "status": "triggered",
+            "actor": actor,
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            **({"superseded_build_id": superseded_build_id} if superseded_build_id else {}),
+        }
+        claims[key] = claim
+        _write_claims_json(resolved_claims, claims)
+        return {"ok": True, "triggered": True, "claim": claim}
 
 
 def resolve_canary_g3_holds(cl, ps, dry_run=False):
@@ -1589,18 +1772,13 @@ def cmd_watch(args):
     timeout_sec = args.timeout_min * 60
     start_time = time.time()
     canary_g3_triggered = False
+    superseded_build_id = ""
+    checked_hold_upgrade = False
 
     print(f"# Watching Tryjobs on CL {cl} PS {ps} (poll={poll_sec}s, timeout={args.timeout_min}m)")
 
     files = parse_diff(meta["diff"])
-    recs = {}
-    for path in [p for p in files if not NO_EFFECT.search(p)]:
-        for rx, canaries, tier, reason in AREA_RULES:
-            if re.search(rx, path):
-                for c in canaries:
-                    recs[c] = True
-                break
-    g3_needed = "Canary-G3" in recs
+    g3_needed = needs_canary_g3_for_files(files)
     asan_retried = False
     holds_resolved = False
     auto_resolve = not getattr(args, "no_resolve_hold", False)
@@ -1617,80 +1795,142 @@ def cmd_watch(args):
         # Keep watching across transient Gerrit rate-limit or network errors
         try:
             meta = load_cl(cl, ps=None, include_diff=False)
-        except (urllib.error.URLError, OSError) as e:
+        except (urllib.error.URLError, OSError, ValueError) as e:
             print(f"WARNING: transient Gerrit poll error on CL {cl}: {e}; retrying in {poll_sec}s")
             time.sleep(poll_sec)
             continue
-        if meta["patchset"] > ps:
-            print(f"\nWAKEUP_REASON: SUPERSEDED (PS {ps} replaced by PS {meta['patchset']})")
+        # Exit cleanly once the watched CL merges or is abandoned
+        cl_status = str(meta.get("status") or "NEW").upper()
+        if cl_status in ("MERGED", "ABANDONED"):
+            print(f"\nWAKEUP_REASON: CL_{cl_status}")
+            return 0
+        latest_ps = max(int(meta.get("patchset") or 0), int(meta.get("current_patchset") or 0))
+        if latest_ps > ps:
+            print(f"\nWAKEUP_REASON: SUPERSEDED (PS {ps} replaced by PS {latest_ps})")
             return 0
 
-        if g3_needed and not canary_g3_triggered and not meta["owner"].endswith("@google.com"):
+        is_ext = not str(meta.get("owner") or "").endswith("@google.com")
+        # Upgrade g3_needed if a Canary-G3 submit hold was left on an AGENT TODO symbol change
+        if (
+            not g3_needed
+            and is_ext
+            and meta.get("googler_cr_plus_one")
+            and not checked_hold_upgrade
+        ):
+            checked_hold_upgrade = True
+            try:
+                if find_unresolved_canary_g3_hold_leaves(gerrit_json(f"/changes/{cl}/comments")):
+                    g3_needed = True
+            except (urllib.error.URLError, OSError, ValueError):
+                pass
+
+        # Retry on the next tick if Buildbucket, Swarming, or Gerrit RPCs fail transiently
+        try:
             builds = bb_cl_builds(cl, ps)
-            if "Canary-G3" not in builds and meta["googler_cr_plus_one"]:
-                missing = unapproved_g3_chain(cl, ps)
-                if missing:
-                    listed = ", ".join(f"{c}/{p}" for c, p in missing)
-                    if listed != last_missing_parents:
-                        print(f"Googler CR+1 is on {cl}, but Canary-G3 also needs it on the "
-                              f"unmerged parents: {listed}. Waiting for parent approval...")
-                        last_missing_parents = listed
-                else:
-                    print(f"Googler CR+1 detected on external CL {cl}; triggering Canary-G3")
-                    cmd = ["git", "cl", "try", "-i", str(cl), "-B", BUCKET, "-b", "Canary-G3"]
-                    subprocess.run(cmd, check=False, cwd=SKIA_DIR)
-                    canary_g3_triggered = True
-
-        builds = bb_cl_builds(cl, ps)
-        sw_tasks = swarming_tasks_for_cl(cl, ps)
-
-        asan_builder = next((b for b in builds if "ASAN" in b), None)
-        if asan_builder:
-            b_info = builds[asan_builder]
-            status = b_info.get("status")
-            if status in ("FAILURE", "INFRA_FAILURE"):
-                touched = list(files.keys())
-                triage_res = triage_asan_failure(cl, ps, asan_builder, b_info, sw_tasks, touched)
-                if triage_res["verdict"] == "INFRA_MISHAP" and not asan_retried:
-                    print(f"ASAN infra mishap on {asan_builder}; retrying once")
-                    cmd = ["git", "cl", "try", "-i", str(cl), "-B", BUCKET, "-b", asan_builder]
-                    subprocess.run(cmd, check=False, cwd=SKIA_DIR)
-                    asan_retried = True
-                elif triage_res["verdict"] in (
-                    "COMPILE_FAILURE", "SANITIZER_OR_TEST_FAILURE", "NOT_MERGEABLE"
+            # Trigger or adopt Canary-G3 via the shared flock ledger once Googler CR+1 lands
+            if (
+                g3_needed
+                and not canary_g3_triggered
+                and is_ext
+                and meta.get("googler_cr_plus_one")
+            ):
+                g3_existing = builds.get("Canary-G3")
+                if g3_existing and g3_existing.get("status") in (
+                    "SUCCESS",
+                    "STARTED",
+                    "SCHEDULED",
                 ):
-                    print(f"\nWAKEUP_REASON: ASAN_FAILURE ({triage_res['verdict']})")
-                    args.resolve_hold = False
-                    cmd_triage(args)
-                    return 0
+                    canary_g3_triggered = True
+                else:
+                    trig = trigger_canary_g3_once(
+                        cl, ps, actor="watch", prefetched_builds=builds
+                    )
+                    claim = trig.get("claim") or {}
+                    # Track superseded pre-CR+1 build ID so all_terminal keeps waiting
+                    if claim.get("superseded_build_id"):
+                        superseded_build_id = str(claim["superseded_build_id"])
+                    if trig.get("triggered"):
+                        print(f"Googler CR+1 detected on external CL {cl}; triggered Canary-G3")
+                        canary_g3_triggered = True
+                        builds = bb_cl_builds(cl, ps)
+                    elif trig.get("adopted") or trig.get("already_claimed"):
+                        canary_g3_triggered = True
+                    elif trig.get("reason") == "unapproved_parent_chain":
+                        missing = trig.get("missing") or []
+                        listed = ", ".join(f"{c}/{p}" for c, p in missing)
+                        if listed and listed != last_missing_parents:
+                            print(
+                                f"Googler CR+1 is on {cl}, but Canary-G3 also needs it on the "
+                                f"unmerged parents: {listed}. Waiting for parent approval..."
+                            )
+                            last_missing_parents = listed
 
-        if auto_resolve and not holds_resolved:
-            g3_ok = builds.get("Canary-G3", {}).get("status") == "SUCCESS"
-            # Wait until every ASAN and Canary build on the patchset has also succeeded
-            relevant_ok = all(
-                b.get("status") == "SUCCESS"
-                for name, b in builds.items()
-                if "ASAN" in name or name.startswith("Canary-")
-            )
-            # Keep holds active if any other tryjob on the patchset has already failed
-            any_failed = any(
-                b.get("status") in ("FAILURE", "INFRA_FAILURE") for b in builds.values()
-            )
-            if g3_ok and relevant_ok and not any_failed:
-                outcomes = resolve_canary_g3_holds(cl, ps)
-                _print_hold_outcomes(outcomes)
-                holds_resolved = True
+            sw_tasks = swarming_tasks_for_cl(cl, ps)
+
+            asan_builder = next((b for b in builds if "ASAN" in b), None)
+            if asan_builder:
+                b_info = builds[asan_builder]
+                status = b_info.get("status")
+                if status in ("FAILURE", "INFRA_FAILURE"):
+                    touched = list(files.keys())
+                    triage_res = triage_asan_failure(
+                        cl, ps, asan_builder, b_info, sw_tasks, touched
+                    )
+                    if triage_res["verdict"] == "INFRA_MISHAP" and not asan_retried:
+                        print(f"ASAN infra mishap on {asan_builder}; retrying once")
+                        cmd = [
+                            "git", "cl", "try", "-i", str(cl), "-B", BUCKET, "-b", asan_builder,
+                        ]
+                        subprocess.run(cmd, check=False, cwd=SKIA_DIR)
+                        asan_retried = True
+                    elif triage_res["verdict"] in (
+                        "COMPILE_FAILURE", "SANITIZER_OR_TEST_FAILURE", "NOT_MERGEABLE"
+                    ):
+                        print(f"\nWAKEUP_REASON: ASAN_FAILURE ({triage_res['verdict']})")
+                        args.resolve_hold = False
+                        cmd_triage(args)
+                        return 0
+
+            if auto_resolve and not holds_resolved:
+                g3_ok = builds.get("Canary-G3", {}).get("status") == "SUCCESS"
+                # Wait until every ASAN and Canary build on the patchset has also succeeded
+                relevant_ok = all(
+                    b.get("status") == "SUCCESS"
+                    for name, b in builds.items()
+                    if "ASAN" in name or name.startswith("Canary-")
+                )
+                # Keep holds active if any other tryjob on the patchset has already failed
+                any_failed = any(
+                    b.get("status") in ("FAILURE", "INFRA_FAILURE") for b in builds.values()
+                )
+                if g3_ok and relevant_ok and not any_failed:
+                    outcomes = resolve_canary_g3_holds(cl, ps)
+                    _print_hold_outcomes(outcomes)
+                    # Retry hold resolution next tick if Gerrit returned a transient error
+                    holds_resolved = bool(outcomes) and not any(
+                        o.get("error") for o in outcomes
+                    )
+        except (
+            urllib.error.URLError,
+            OSError,
+            subprocess.SubprocessError,
+            ValueError,
+        ) as e:
+            print(f"WARNING: transient poll error on CL {cl}: {e}; retrying in {poll_sec}s")
+            time.sleep(poll_sec)
+            continue
 
         terminal_statuses = ("SUCCESS", "FAILURE", "INFRA_FAILURE", "CANCELED")
         if builds:
             all_terminal = all(b.get("status") in terminal_statuses for b in builds.values())
             if all_terminal:
-                if (
-                    g3_needed
-                    and not meta["owner"].endswith("@google.com")
-                    and not canary_g3_triggered
-                    and "Canary-G3" not in builds
-                ):
+                g3_now = builds.get("Canary-G3")
+                # Stay alive before CR+1 and right after triggering before Buildbucket indexes G3
+                g3_pending = g3_now is None or (
+                    bool(superseded_build_id)
+                    and str(g3_now.get("id") or "") == superseded_build_id
+                )
+                if g3_needed and is_ext and g3_pending:
                     pass
                 else:
                     print("\nWAKEUP_REASON: ALL_TRYJOBS_COMPLETE")

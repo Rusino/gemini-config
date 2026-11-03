@@ -4,6 +4,7 @@
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -388,39 +389,46 @@ class ReviewQueueOrderAndReadinessTest(unittest.TestCase):
       if sleep_count > 4:
         raise KeyboardInterrupt
 
-    with (
-        mock.patch.object(canary_advisor, "load_cl", return_value=meta),
-        mock.patch.object(
-            canary_advisor, "unapproved_g3_chain", side_effect=fake_missing
-        ),
-        mock.patch.object(canary_advisor, "bb_cl_builds", return_value={}),
-        mock.patch.object(
-            canary_advisor, "swarming_tasks_for_cl", return_value=[]
-        ),
-        mock.patch.object(canary_advisor.subprocess, "run") as mock_run,
-        mock.patch.object(canary_advisor.time, "sleep", side_effect=fake_sleep),
-    ):
-      try:
-        canary_advisor.cmd_watch(args)
-      except KeyboardInterrupt:
-        pass
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      claims_file = os.path.join(tmp_dir, "claims.json")
+      with (
+          mock.patch.dict(os.environ, {"CANARY_G3_CLAIMS_FILE": claims_file}),
+          mock.patch.object(canary_advisor, "load_cl", return_value=meta),
+          mock.patch.object(
+              canary_advisor, "unapproved_g3_chain", side_effect=fake_missing
+          ),
+          mock.patch.object(canary_advisor, "bb_cl_builds", return_value={}),
+          mock.patch.object(
+              canary_advisor, "swarming_tasks_for_cl", return_value=[]
+          ),
+          mock.patch.object(canary_advisor.subprocess, "run") as mock_run,
+          mock.patch.object(canary_advisor.time, "sleep", side_effect=fake_sleep),
+      ):
+        try:
+          canary_advisor.cmd_watch(args)
+        except KeyboardInterrupt:
+          pass
 
-      # Canary-G3 must have been triggered once the parent approval cleared
-      mock_run.assert_called_with(
-          [
-              "git",
-              "cl",
-              "try",
-              "-i",
-              "1412377",
-              "-B",
-              canary_advisor.BUCKET,
-              "-b",
-              "Canary-G3",
-          ],
-          check=False,
-          cwd=canary_advisor.SKIA_DIR,
-      )
+        # Canary-G3 must have been triggered once the parent approval cleared
+        mock_run.assert_called_once()
+        call_args, call_kwargs = mock_run.call_args
+        self.assertEqual(
+            call_args[0],
+            [
+                "git",
+                "cl",
+                "try",
+                "-i",
+                "1412377",
+                "-B",
+                canary_advisor.BUCKET,
+                "-b",
+                "Canary-G3",
+            ],
+        )
+        self.assertEqual(call_kwargs["cwd"], canary_advisor.SKIA_DIR)
+        self.assertFalse(call_kwargs["check"])
+        self.assertEqual(call_kwargs["env"].get("SKIP_GCE_AUTH_FOR_GIT"), "1")
 
   def test_dashboard_variant_c_stack_grouping_and_blocker_banner(self):
     # Pass DASHBOARD_HTML via stdin to stay below Linux 128 KB MAX_ARG_STRLEN

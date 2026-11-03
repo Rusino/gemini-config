@@ -80,10 +80,12 @@ description: "Skia-style C++ minimalism and suppression of LLM coding reflexes."
   > Googler votes Code-Review+1, so I vote first and hold the submit with this comment. I will
   > resolve it when Canary-G3 is green, or report the failure here. Please do not resolve or
   > override it before that.
-  Once the user publishes CR+1 with this hold comment, the agent immediately triggers `Canary-G3`.
-  When `Canary-G3` finishes `SUCCESS`, `canary_advisor.py` automatically resolves this own
-  `/PATCHSET_LEVEL` submit-hold thread (including unmerged stack ancestors whose `current_revision`
-  matches the cherry-picked patchset and keeps `jlavrova@google.com`'s `CR+1`).
+  Never ask the user to notify you after publishing `CR+1`: once published with this hold comment,
+  `canary_advisor.py watch` and `cl_watcher.py` (`sync_external_canary_g3`) automatically detect
+  it and trigger `Canary-G3` once (`trigger_canary_g3_once`). When `Canary-G3` finishes `SUCCESS`,
+  they automatically resolve this own `/PATCHSET_LEVEL` submit-hold thread (including unmerged
+  stack ancestors whose `current_revision` matches the cherry-picked patchset and keeps
+  `jlavrova@google.com`'s `CR+1`) and wake the CL chat.
 - **Canary-G3 Runtime & Triage Procedure**: Canary-G3 can take ~55 minutes. If it turns red,
   extract the roll CL number from swarming stdout (`Canary roll [ http://cl/N ]`) and triage:
   1. Run `cd ~/.gemini/jetski/scratch/skia_gardener && go run . -triage-google3 -cl <CL>`

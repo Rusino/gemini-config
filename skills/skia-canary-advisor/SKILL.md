@@ -46,8 +46,11 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
        it. Never vote CR+1 on unreviewed parents just to unblock Canary-G3.
      - **External Author Submit-Hold Protocol**: Follow the submit-hold protocol below: prepare
        a `/PATCHSET_LEVEL` draft with `unresolved: true` for the user to publish with
-       `Code-Review+1`. Run Canary-G3 immediately after the user publishes the approval and hold
-       comment.
+       `Code-Review+1`. Never ask the user to tell you when they publish `CR+1`: both
+       `canary_advisor.py watch` and the Flight Deck `cl_watcher.py` daemon
+       (`sync_external_canary_g3`) automatically detect the published `CR+1` + submit-hold
+       comment, trigger `Canary-G3` once via `trigger_canary_g3_once`
+       (`~/.gemini/config/ledgers/canary_g3_claims.json`), and wake the CL chat on completion.
      - Other canaries (`Canary-Chromium`, `Canary-Android`) have no such restriction and are
        triggered immediately. `Canary-Flutter` is disabled (see below): run the full local
        Flutter corpus instead.
@@ -101,15 +104,21 @@ When reviewing an external author's Skia CL that requires `Canary-G3`:
    - The agent drafts a `/PATCHSET_LEVEL` comment (`unresolved: true`) on the current patchset:
      > The change looks good to me (Code-Review+1). I leave this comment unresolved on purpose: it blocks the submit until the Canary-G3 try job passes. Canary-G3 builds and tests the google3 clients of Skia with this change. Skia starts it for an external author only after a Googler votes Code-Review+1, so I vote first and hold the submit with this comment. I will resolve it when Canary-G3 is green, or report the failure here. Please do not resolve or override it before that.
 3. **Execution Steps**:
-   - The user reviews and publishes `Code-Review+1` with the draft hold comment.
-   - Once published, the agent immediately triggers `Canary-G3`:
+   - The user reviews and publishes `Code-Review+1` with the draft hold comment (never ask the user
+     to notify you after publishing `CR+1`).
+   - Once published, `canary_advisor.py watch` and the Flight Deck `cl_watcher.py` daemon
+     (`sync_external_canary_g3`) automatically detect `CR+1` + the unresolved submit-hold comment
+     and invoke `trigger_canary_g3_once` (`~/.gemini/config/ledgers/canary_g3_claims.json`) to run
+     `Canary-G3` exactly once per `(CL, PS)`:
      ```bash
      git cl try -i <CL> -B skia/skia.primary -b Canary-G3
      ```
-   - When `Canary-G3` finishes `SUCCESS`, `canary_advisor.py` (`watch` or `resolve-hold --cl <CL>`)
-     automatically resolves `jlavrova@google.com`'s own `/PATCHSET_LEVEL` submit-hold thread on
-     `<CL>` and any unmerged stack ancestors whose `current_revision` matches the cherry-picked
-     patchset and keeps `jlavrova@google.com`'s `Code-Review+1`, unblocking submit.
+   - When `Canary-G3` finishes `SUCCESS` (with no failing ASAN/Canary builds on that patchset),
+     `canary_advisor.py` (`watch` or `resolve-hold --cl <CL>`) and `cl_watcher.py` automatically
+     resolve `jlavrova@google.com`'s own `/PATCHSET_LEVEL` submit-hold thread on `<CL>` and any
+     unmerged stack ancestors whose `current_revision` matches the cherry-picked patchset and keeps
+     `jlavrova@google.com`'s `Code-Review+1`, unblocking submit and waking the CL chat. If
+     `Canary-G3` fails, the hold stays unresolved and the CL chat is woken with the triage verdict.
 
 ## Canary-G3 Runtime & Triage Procedure
 

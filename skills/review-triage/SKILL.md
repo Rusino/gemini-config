@@ -148,8 +148,11 @@ For surviving Skia CLs in `🔴 SURGICAL AUDIT` or `🟠 PUSHBACK`, run
   (`run_flutter_paragraph_tests.py --full`) instead. For `Canary-G3`, it requires a Googler author or Googler
   `Code-Review+1` (`g3_canary.go:134`). Follow the **External Author Canary-G3 Submit-Hold Protocol**:
   when approving, draft the `/PATCHSET_LEVEL` comment with `unresolved: True` holding the submit
-  until Canary-G3 passes. Run Canary-G3 immediately after the user publishes CR+1. If Canary-G3 fails,
-  follow the triage procedure in `skia-canary-advisor`.
+  until Canary-G3 passes. Never ask the user to tell you when they publish `CR+1`:
+  `canary_advisor.py watch` and `cl_watcher.py` (`sync_external_canary_g3`) automatically detect
+  the published `CR+1` + submit-hold comment, trigger `Canary-G3` once (`trigger_canary_g3_once`),
+  auto-resolve own submit-hold threads on `SUCCESS`, and wake the CL chat on completion. If
+  Canary-G3 fails, follow the triage procedure in `skia-canary-advisor`.
 - **Internal Authors**: Suggest recommended canaries in chat; do not ask them in Gerrit comments.
 - **Background Watcher & Wakeup Protocol**: Immediately after triggering `git cl try`, launch
   `python3 ~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py watch --cl <N> --save-draft`
@@ -230,9 +233,11 @@ named skill's `SKILL.md` was not read, when a report with a `Case 1-5` verdict l
    > Skia with this change. Skia starts it for an external author only after a Googler votes
    > Code-Review+1, so I vote first and hold the submit with this comment. I will resolve it when
    > Canary-G3 is green, or report the failure here. Please do not resolve or override it before that.
-   After the user publishes CR+1 with this hold comment, immediately trigger Canary-G3 (`git cl try
-   -i <CL> -B skia/skia.primary -b Canary-G3`). If red, follow the Canary-G3 triage procedure in
-   [`skia-canary-advisor`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/skia-canary-advisor/SKILL.md).
+   Once the user publishes `CR+1` with this hold comment, `canary_advisor.py watch` and
+   `cl_watcher.py` (`sync_external_canary_g3`) automatically detect it, trigger `Canary-G3` once
+   (`trigger_canary_g3_once`), auto-resolve `jlavrova@google.com`'s submit-hold thread on `SUCCESS`,
+   and wake the CL chat (never ask the user to notify you after publishing `CR+1`). If red, follow
+   the Canary-G3 triage procedure in `skia-canary-advisor`.
 8. **Daily Queue Summary Shows Open Issues Only**: In `run_queue_triage.py` summaries, never list or
    mention GitHub issues that are already closed (including ones closed during the window or still
    receiving bot activity); report only open issues and the user's own open PRs.
