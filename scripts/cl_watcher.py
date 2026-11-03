@@ -12252,8 +12252,14 @@ def sync_once(
           int(record.get("review_target_ps") or 0),
       )
       audited_rev = str((prev_triage or {}).get("triaged_revision") or "")
-      if not audited_rev and prev and int(prev.get("patchset") or 0) == audited_ps:
-        audited_rev = str(prev.get("head_sha") or prev.get("revision") or "")
+      if not audited_rev and prev and audited_ps > 0:
+        prev_rev_cand = str(prev.get("head_sha") or prev.get("revision") or "")
+        # GitHub patchset increments on co-reviewer reviews without changing head_sha
+        if int(prev.get("patchset") or 0) == audited_ps or (
+            d["kind"] == "github"
+            and audit_gate._sha_matches(prev_rev_cand, cur_rev)
+        ):
+          audited_rev = prev_rev_cand
       delta_info = audit_gate.classify_patchset_delta(
           kind=d["kind"],
           host=str(
@@ -12287,8 +12293,13 @@ def sync_once(
           and last_author not in SELF_GITHUB_LOGINS
           and not last_author.endswith(".gserviceaccount.com")
       )
+      was_blocked_auth = (
+          str((prev_triage or {}).get("audit_state") or "") == "blocked_auth"
+      )
+      # Re-check LOAS preflight before clearing a sticky blocked_auth badge on unchanged polls
       if preflight_cache is None and (
-          delta_info["delta_kind"]
+          was_blocked_auth
+          or delta_info["delta_kind"]
           not in ("unchanged", "rebase_only", "commit_msg_only")
           or delta_info.get("upstream_module_overlap")
           or has_new_ext_msg
@@ -12327,6 +12338,9 @@ def sync_once(
               "ts": time.time(),
           }
       elif action.get("audit_state") == "blocked_auth":
+        # Pin pre-event watermark so updating last_msg_date does not swallow unread threads
+        if not record.get("audited_msg_date") and watermarked_msg_date:
+          record["audited_msg_date"] = watermarked_msg_date
         triage_store.record_audit_status(
             target_id=str(tid),
             kind=d["kind"],
@@ -12337,11 +12351,29 @@ def sync_once(
             results_dir=triage_dir,
         )
       elif tier == -1:
-        record["audited_msg_date"] = last_date
-      elif wake_chats and tier in (1, 2):
+        if was_blocked_auth and not (preflight_cache or {}).get("ok", True):
+          # Keep blocked_auth and prior watermark while LOAS remains expired
+          if not record.get("audited_msg_date") and watermarked_msg_date:
+            record["audited_msg_date"] = watermarked_msg_date
+        else:
+          record["audited_msg_date"] = last_date
+          if was_blocked_auth:
+            # Clear sticky LOAS warning once preflight passes and no audit is needed
+            triage_store.record_audit_status(
+                target_id=str(tid),
+                kind=d["kind"],
+                patchset=cur_ps,
+                revision=cur_rev,
+                audit_state="done",
+                audit_error="",
+                results_dir=triage_dir,
+            )
+      elif tier in (1, 2):
         claim_key = str(action.get("claim_key") or f"{ikey}:{cur_ps}")
+        launched_audit = False
         if (
-            claim_key not in review_claims
+            wake_chats
+            and claim_key not in review_claims
             and auto_started_count < 1
             and busy_review_chats < 2
             and not _has_unready_open_stack_parent(
@@ -12352,6 +12384,7 @@ def sync_once(
           if cid:
             woken = wake_conversation(cid, prompt)
             if woken:
+              launched_audit = True
               record["review_target_ps"] = cur_ps
               record["chat_busy"] = True
               record["chat_woken_ts"] = time.time()
@@ -12402,6 +12435,7 @@ def sync_once(
                 )
             )
             if res.get("ok"):
+              launched_audit = True
               cid = str(res.get("conversation_id") or "")
               composite_key = str(record.get("composite_key") or composite_key)
               record["audited_msg_date"] = last_date
@@ -12433,6 +12467,26 @@ def sync_once(
                   },
               )
               events = events[:50]
+        if not launched_audit:
+          # Pin pre-event watermark while a deferred audit waits on busy slots or stack parent
+          if (
+              claim_key not in review_claims
+              and not record.get("audited_msg_date")
+              and watermarked_msg_date
+          ):
+            record["audited_msg_date"] = watermarked_msg_date
+          if was_blocked_auth:
+            # Replace stale LOAS warning when auth recovered but launch is deferred or claimed
+            next_state = "done" if claim_key in review_claims else "queued"
+            triage_store.record_audit_status(
+                target_id=str(tid),
+                kind=d["kind"],
+                patchset=cur_ps,
+                revision=cur_rev,
+                audit_state=next_state,
+                audit_error="",
+                results_dir=triage_dir,
+            )
 
     # Auto-rerequest GitHub reviewers dropped from reviewRequests after author push
     if d.get("kind") == "github" and record.get("reviewer_pings"):

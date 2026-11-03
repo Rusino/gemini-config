@@ -358,7 +358,10 @@ def classify_patchset_delta(
 
     same_ps = cur_ps <= prev_ps
     same_rev = bool(prev_rev and cur_rev and _sha_matches(prev_rev, cur_rev))
-    if same_ps and (same_rev or not prev_rev or not cur_rev):
+    # GitHub cur_ps is len(reviews) + 1, so co-reviewer posts bump cur_ps without changing SHA
+    if (same_ps and (same_rev or not prev_rev or not cur_rev)) or (
+        kind == "github" and prev_ps > 0 and same_rev
+    ):
         return {
             "delta_kind": "unchanged",
             "is_code_change": False,

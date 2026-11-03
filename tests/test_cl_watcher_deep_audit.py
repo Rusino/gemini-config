@@ -970,6 +970,339 @@ console.log(JSON.stringify({
                 )
                 self.assertNotIn("gh_issue:flutter/flutter#102", reloaded["bugs"])
 
+    def test_github_fork_master_pr_does_not_stack_parent_foreign_repo_prs(self):
+        discovered = [
+            {
+                "item_key": "github:3106",
+                "kind": "github",
+                "target_id": "3106",
+                "repo_slug": "airbnb/lottie-web",
+            },
+            {
+                "item_key": "github:188900",
+                "kind": "github",
+                "target_id": "188900",
+                "repo_slug": "flutter/flutter",
+            },
+            {
+                "item_key": "github:188906",
+                "kind": "github",
+                "target_id": "188906",
+                "repo_slug": "flutter/flutter",
+            },
+            {
+                "item_key": "github:188907",
+                "kind": "github",
+                "target_id": "188907",
+                "repo_slug": "flutter/flutter",
+            },
+            {
+                "item_key": "github:190001",
+                "kind": "github",
+                "target_id": "190001",
+                "repo_slug": "flutter/flutter",
+            },
+            {
+                "item_key": "github:190002",
+                "kind": "github",
+                "target_id": "190002",
+                "repo_slug": "flutter/flutter",
+            },
+        ]
+        fetched = {
+            "github:3106": {
+                "repo_slug": "airbnb/lottie-web",
+                "head_ref": "foreign-base",
+                "base_ref": "master",
+                "head_sha": "1111111111",
+                "created": "2025-03-17T08:41:00Z",
+            },
+            "github:188900": {
+                "repo_slug": "flutter/flutter",
+                "head_ref": "master",
+                "base_ref": "master",
+                "head_sha": "0000000000",
+                "created": "2026-06-01T08:00:00Z",
+            },
+            "github:188906": {
+                "repo_slug": "flutter/flutter",
+                "head_ref": "colr-vector-color-text",
+                "base_ref": "master",
+                "head_sha": "e5f898612a",
+                "created": "2026-07-02T08:56:00Z",
+            },
+            "github:188907": {
+                "repo_slug": "flutter/flutter",
+                "head_ref": "local-child",
+                "base_ref": "foreign-base",
+                "head_sha": "4444444444",
+                "commit_shas": ["1111111111"],
+                "created": "2026-08-01T09:00:00Z",
+            },
+            "github:190001": {
+                "repo_slug": "flutter/flutter",
+                "head_ref": "feat-base",
+                "base_ref": "master",
+                "head_sha": "2222222222",
+                "created": "2026-11-01T10:00:00Z",
+            },
+            "github:190002": {
+                "repo_slug": "flutter/flutter",
+                "head_ref": "feat-child",
+                "base_ref": "feat-base",
+                "head_sha": "3333333333",
+                "created": "2026-11-01T11:00:00Z",
+            },
+        }
+        ordered = w.order_and_link_stack_changes(discovered, fetched)
+        by_key = {d["item_key"]: d for d in ordered}
+        self.assertEqual(by_key["github:188906"]["stack_ancestors"], [])
+        self.assertEqual(by_key["github:188906"]["stack_parent_ikey"], "")
+        self.assertEqual(by_key["github:188907"]["stack_ancestors"], [])
+        self.assertEqual(by_key["github:188907"]["stack_parent_ikey"], "")
+        self.assertEqual(by_key["github:190002"]["stack_ancestors"], ["github:190001"])
+        self.assertEqual(by_key["github:190002"]["stack_parent_ikey"], "github:190001")
+
+    def test_sync_once_clears_stale_blocked_auth_on_tier_minus_one_and_deferred_queue(self):
+        empty_gmail = {
+            "thread_ids": [],
+            "inbox_thread_ids": [],
+            "total_msgs": 0,
+            "inbox_msgs": 0,
+            "trash_msgs": 0,
+            "unread_msgs": 0,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = os.path.join(tmp, "cl_watcher_state.json")
+            triage_dir = os.path.join(tmp, "triage_results")
+            ts.record_audit_status(
+                target_id="188906",
+                kind="github",
+                patchset=4,
+                revision="e5f898612a",
+                audit_state="blocked_auth",
+                audit_error="LOAS expired (run gcert)",
+                results_dir=triage_dir,
+            )
+            ts.record_audit_status(
+                target_id="1415001",
+                kind="gerrit",
+                patchset=1,
+                revision="abc9999999",
+                audit_state="blocked_auth",
+                audit_error="LOAS expired (run gcert)",
+                results_dir=triage_dir,
+            )
+            seed_state = {
+                "items": {
+                    "github:188906@cid-188906": {
+                        "item_key": "github:188906",
+                        "kind": "github",
+                        "target_id": "188906",
+                        "repo_slug": "flutter/flutter",
+                        "conversation_id": "cid-188906",
+                        "project_id": "proj-wp",
+                        "project_name": "WebParagraph",
+                        "status": "OPEN",
+                        "patchset": 4,
+                        "revision": "e5f898612a",
+                        "head_sha": "e5f898612a11984e30fc7611e42eb807fbb6f2b4",
+                        "reviewed_ps": 3,
+                        "role": "reviewer",
+                        "is_self": False,
+                        "in_my_attention": True,
+                        "chat_busy": False,
+                        "last_msg_date": "2026-11-03T19:05:49Z",
+                    },
+                    "gerrit:2001@cid-b1": {
+                        "conversation_id": "cid-b1",
+                        "role": "reviewer (goog)",
+                        "is_self": False,
+                        "chat_busy": True,
+                    },
+                    "gerrit:2002@cid-b2": {
+                        "conversation_id": "cid-b2",
+                        "role": "reviewer (goog)",
+                        "is_self": False,
+                        "chat_busy": True,
+                    },
+                },
+                "review_claims": {},
+                "events": [],
+            }
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump(seed_state, f)
+
+            chatted = [
+                {
+                    "item_key": "github:188906",
+                    "kind": "github",
+                    "target_id": "188906",
+                    "repo_slug": "flutter/flutter",
+                    "conversation_id": "cid-188906",
+                    "title": "[13:16] PR #188906 Impeller COLR",
+                    "project_id": "proj-wp",
+                    "project_name": "WebParagraph",
+                    "chat_last_modified": "2026-11-03T18:09:25Z",
+                    "single_target": True,
+                    "chat_busy": False,
+                },
+                {
+                    "item_key": "gerrit:2001",
+                    "kind": "gerrit",
+                    "target_id": "2001",
+                    "conversation_id": "cid-b1",
+                    "title": "busy1",
+                    "project_id": "proj-skia",
+                    "project_name": "Skia",
+                    "chat_last_modified": "2026-11-03T18:09:25Z",
+                    "single_target": True,
+                    "chat_busy": True,
+                },
+                {
+                    "item_key": "gerrit:2002",
+                    "kind": "gerrit",
+                    "target_id": "2002",
+                    "conversation_id": "cid-b2",
+                    "title": "busy2",
+                    "project_id": "proj-skia",
+                    "project_name": "Skia",
+                    "chat_last_modified": "2026-11-03T18:09:25Z",
+                    "single_target": True,
+                    "chat_busy": True,
+                },
+            ]
+            remote = [
+                {
+                    "item_key": "gerrit:1415001",
+                    "kind": "gerrit",
+                    "target_id": "1415001",
+                    "preferred_host": "skia-review.googlesource.com",
+                    "conversation_id": "",
+                    "title": "",
+                    "project_id": "proj-skia",
+                    "project_name": "Skia",
+                    "chat_last_modified": "",
+                    "single_target": True,
+                    "chat_busy": False,
+                }
+            ]
+            gh_info = {
+                "ok": True,
+                "host": "github.com/flutter/flutter",
+                "repo_slug": "flutter/flutter",
+                "url": "https://github.com/flutter/flutter/pull/188906",
+                "status": "OPEN",
+                "phase": "NEEDS_YOUR_ACTION",
+                "subject": "[Impeller] Render COLR/CPAL color text as vector paths",
+                "owner_name": "AnasQasem",
+                "owner_email": "AnasQasem",
+                "role": "reviewer",
+                "is_self": False,
+                "is_external": True,
+                "is_draft": False,
+                "is_wip": False,
+                "in_development": False,
+                "is_watching": False,
+                "patchset": 4,
+                "revision": "e5f898612a",
+                "head_sha": "e5f898612a11984e30fc7611e42eb807fbb6f2b4",
+                "head_ref": "colr-vector-color-text",
+                "base_ref": "master",
+                "files": ["engine/src/flutter/impeller/display_list/canvas.cc"],
+                "in_my_attention": True,
+                "last_msg_author": "gaaclarke",
+                "last_msg_date": "2026-11-03T19:05:49Z",
+                "last_msg_snippet": "[CHANGES_REQUESTED] @AnasQasem please rebase",
+                "open_external_threads": 0,
+            }
+            gerrit_info = {
+                "ok": True,
+                "host": "skia-review.googlesource.com",
+                "project": "skia",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1415001",
+                "status": "NEW",
+                "phase": "NEEDS_YOUR_ACTION",
+                "subject": "[skparagraph] New CL",
+                "owner_name": "Author",
+                "owner_email": "author@example.com",
+                "role": "reviewer (ext)",
+                "is_self": False,
+                "is_external": True,
+                "is_draft": False,
+                "is_wip": False,
+                "in_development": False,
+                "is_watching": False,
+                "reviewer_removed": False,
+                "patchset": 1,
+                "revision": "abc9999999",
+                "files": ["modules/skparagraph/src/Run.cpp"],
+                "in_my_attention": True,
+                "last_msg_author": "author@example.com",
+                "last_msg_date": "2026-11-03 16:00:00.000000000",
+                "last_msg_snippet": "Uploaded patch set 1.",
+            }
+            busy_info = {
+                **gerrit_info,
+                "in_my_attention": False,
+                "phase": "WAITING_ON_OTHERS",
+            }
+
+            def fake_gerrit(cid_num, *args, **kwargs):
+                return gerrit_info if str(cid_num) == "1415001" else busy_info
+
+            with (
+                mock.patch.object(w, "STATE_FILE", state_path),
+                mock.patch.object(w, "fetch_gardener_snapshot", return_value=({}, [])),
+                mock.patch.object(w, "discover_active_cl_chats", return_value=chatted),
+                mock.patch.object(w, "discover_open_remote_changes", return_value=remote),
+                mock.patch.object(w, "fetch_github_pr_status", return_value=gh_info),
+                mock.patch.object(w, "fetch_gerrit_cl_status", side_effect=fake_gerrit),
+                mock.patch.object(w, "fetch_gmail_status_for_id", return_value=empty_gmail),
+                mock.patch.object(
+                    audit_gate,
+                    "check_audit_preflight",
+                    return_value={"ok": False, "reason": "LOAS expired (run gcert)"},
+                ),
+                mock.patch.object(w, "wake_conversation") as mock_wake,
+                mock.patch.object(w, "_start_pinned_chat_for_record") as mock_start,
+            ):
+                w.sync_once(wake_chats=True, update_titles=False, skia_dir="/nonexistent")
+
+            tr_still_blocked = ts.load_triage_result("github", "188906", results_dir=triage_dir)
+            assert tr_still_blocked is not None
+            self.assertEqual(tr_still_blocked["audit_state"], "blocked_auth")
+
+            with (
+                mock.patch.object(w, "STATE_FILE", state_path),
+                mock.patch.object(w, "fetch_gardener_snapshot", return_value=({}, [])),
+                mock.patch.object(w, "discover_active_cl_chats", return_value=chatted),
+                mock.patch.object(w, "discover_open_remote_changes", return_value=remote),
+                mock.patch.object(w, "fetch_github_pr_status", return_value=gh_info),
+                mock.patch.object(w, "fetch_gerrit_cl_status", side_effect=fake_gerrit),
+                mock.patch.object(w, "fetch_gmail_status_for_id", return_value=empty_gmail),
+                mock.patch.object(
+                    audit_gate,
+                    "check_audit_preflight",
+                    return_value={"ok": True, "reason": ""},
+                ),
+                mock.patch.object(w, "wake_conversation") as mock_wake,
+                mock.patch.object(w, "_start_pinned_chat_for_record") as mock_start,
+            ):
+                st = w.sync_once(wake_chats=True, update_titles=False, skia_dir="/nonexistent")
+
+            mock_wake.assert_not_called()
+            mock_start.assert_not_called()
+            tr_gh = ts.load_triage_result("github", "188906", results_dir=triage_dir)
+            assert tr_gh is not None
+            self.assertEqual(tr_gh["audit_state"], "done")
+            self.assertEqual(tr_gh["audit_error"], "")
+            tr_deferred = ts.load_triage_result("gerrit", "1415001", results_dir=triage_dir)
+            assert tr_deferred is not None
+            self.assertEqual(tr_deferred["audit_state"], "queued")
+            self.assertEqual(tr_deferred["audit_error"], "")
+            self.assertNotIn("gerrit:1415001:1", st["review_claims"])
+
 
 if __name__ == "__main__":
     unittest.main()

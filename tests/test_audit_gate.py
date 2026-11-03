@@ -506,6 +506,22 @@ class AuditGateTests(unittest.TestCase):
             res_exp = audit_gate.check_audit_preflight("15m")
         self.assertFalse(res_exp["ok"])
 
+    def test_github_coreviewer_review_bump_with_same_head_sha_is_unchanged(self):
+        with mock.patch("subprocess.check_output") as mock_gh:
+            delta = audit_gate.classify_patchset_delta(
+                kind="github",
+                host="github.com/flutter/flutter",
+                repo_slug="flutter/flutter",
+                target_id="188906",
+                prev_ps=3,
+                cur_ps=4,
+                prev_rev="e5f898612a",
+                cur_rev="e5f898612a11984e30fc7611e42eb807fbb6f2b4",
+            )
+            mock_gh.assert_not_called()
+        self.assertEqual(delta["delta_kind"], "unchanged")
+        self.assertFalse(delta["is_code_change"])
+
 
 if __name__ == "__main__":
     unittest.main()
