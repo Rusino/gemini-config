@@ -1021,10 +1021,12 @@ const liveBucketBtn = (k) =>
   const titlebarReminderBtn = titlebarToolbar.querySelector('.jetski-titlebar-reminder-btn');
   const titlebarSearchElem = titlebarToolbar.querySelector('.jetski-chat-search-btn');
   const titlebarLocateBtn = titlebarToolbar.querySelector('.jetski-chat-locate-btn');
+  const titlebarFdBtn = titlebarToolbar.querySelector('.jetski-titlebar-flight-deck-btn');
   const titlebarBtn = titlebarToolbar.querySelector('.jetski-titlebar-archive-btn');
   assert(titlebarContextBadge, 'Titlebar context badge must be injected leftmost');
   assert(titlebarReminderBtn, 'Titlebar Reminder button must be injected after Context badge');
   assert(titlebarLocateBtn, 'Titlebar Locate button must be injected after Search');
+  assert(titlebarFdBtn, 'Titlebar Flight Deck button must be injected after Locate');
   assert(
     !titlebarToolbar.querySelector('.jetski-titlebar-wait-btn'),
     'Titlebar must not contain Wait button'
@@ -1042,12 +1044,15 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(titlebarLocateBtn.textContent, '🎯');
   assert.strictEqual(titlebarLocateBtn.getAttribute('data-testid'), 'jetski-chat-locate-btn');
   assert.strictEqual(titlebarLocateBtn.getAttribute('data-cascade-id'), 'open-current');
+  assert.strictEqual(titlebarFdBtn.textContent, '✈️');
+  assert.strictEqual(titlebarFdBtn.getAttribute('data-testid'), 'jetski-titlebar-flight-deck-btn');
   assert.strictEqual(titlebarToolbar.children[0], titlebarContextBadge);
   assert.strictEqual(titlebarToolbar.children[1], titlebarReminderBtn);
   assert.strictEqual(titlebarToolbar.children[2], titlebarSearchElem);
   assert.strictEqual(titlebarToolbar.children[3], titlebarLocateBtn);
   assert.strictEqual(titlebarToolbar.children[4], titlebarBtn);
-  assert.strictEqual(titlebarToolbar.children[5], moreActionsBtn);
+  assert.strictEqual(titlebarToolbar.children[5], titlebarFdBtn);
+  assert.strictEqual(titlebarToolbar.children[6], moreActionsBtn);
   assert.strictEqual(titlebarBtn.textContent, '🗄');
   assert.strictEqual(titlebarBtn.getAttribute('data-testid'), 'jetski-titlebar-archive-btn');
   assert.strictEqual(titlebarBtn.getAttribute('aria-label'), 'Archive chat');

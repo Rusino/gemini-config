@@ -103,6 +103,7 @@
   const SEARCH_PANEL_ID = 'jetski-chat-search-panel';
   // Reminder button classes and floating Context Dossier popover ID
   const TITLEBAR_REMINDER_BTN_CLASS = 'jetski-titlebar-reminder-btn';
+  const TITLEBAR_FLIGHT_DECK_TOGGLE_BTN_CLASS = 'jetski-titlebar-flight-deck-btn';
   const INBOX_REMINDER_BTN_CLASS = 'jetski-inbox-reminder-btn';
   const ROW_REMINDER_BTN_CLASS = 'jetski-row-reminder-btn';
   const DOSSIER_POPOVER_ID = 'jetski-chat-dossier-popover';
@@ -12291,6 +12292,26 @@
         });
         container.insertBefore(btn, moreBtn);
       }
+      
+      let fdBtn = container.querySelector(`.${TITLEBAR_FLIGHT_DECK_TOGGLE_BTN_CLASS}`);
+      if (!fdBtn) {
+        fdBtn = document.createElement('button');
+        fdBtn.className = TITLEBAR_FLIGHT_DECK_TOGGLE_BTN_CLASS;
+        fdBtn.type = 'button';
+        fdBtn.setAttribute('data-testid', 'jetski-titlebar-flight-deck-btn');
+        fdBtn.textContent = '✈️';
+        bindHoverBubble(fdBtn, () => flightDeckOpen ? 'Hide Flight Deck panel' : 'Open Flight Deck panel');
+        bindActionBtnHandlers(fdBtn, () => {
+          setFlightDeckOpen(!flightDeckOpen);
+          const label = flightDeckOpen ? 'Hide Flight Deck panel' : 'Open Flight Deck panel';
+          fdBtn.setAttribute('aria-label', label);
+          showActionPillBubble(fdBtn, label);
+        });
+        container.insertBefore(fdBtn, moreBtn);
+      }
+      setAttrIfChanged(fdBtn, 'aria-label', flightDeckOpen ? 'Hide Flight Deck panel' : 'Open Flight Deck panel');
+      setAttrIfChanged(fdBtn, 'data-active', flightDeckOpen ? 'true' : 'false');
+
       updateTitlebarArchiveButtonUI(btn, cascadeId);
     }
   }
@@ -13332,6 +13353,7 @@
       `.${LIVE_BANNER_CLASS}`,
       `.${PROJECT_ROADMAP_BADGE_CLASS}`,
       `.${SEARCH_BTN_CLASS}`,
+      `.${TITLEBAR_FLIGHT_DECK_TOGGLE_BTN_CLASS}`,
       `.${LOCATE_BTN_CLASS}`,
       `#${SEARCH_PANEL_ID}`,
       `.${CHAIN_STARS_GROUP_CLASS}`,
