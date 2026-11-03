@@ -60,13 +60,17 @@ PATCHSET_SCOPED_REVIEW_KEYS = (
     "verdict_tone",
     "companion_id",
     "draft",
+    "audit_outcome",
+    "report_path",
+    "report_markdown",
     "corpus_tested_patchset",
     "corpus_tested_sha",
     "corpus_compare_md",
     "triaged_revision",
 )
 
-RE_GERRIT_URL_ID = re.compile(r"/c/(?:[^/]+/)?\+/(\d+)")
+# Match multi-segment Gerrit project paths such as /c/chromium/src/+/8663938
+RE_GERRIT_URL_ID = re.compile(r"/c/(?:[^\s/)]+/)*\+/(\d+)")
 RE_GITHUB_PR_URL = re.compile(r"github\.com/([^/]+/[^/]+)/pull/(\d+)")
 RE_VERDICT_BADGE = re.compile(r"\*\*Verdict:\*\*\s*(?:[^\n\[]*)\s*\[([A-Z_ /]+)\]", re.I)
 RE_WHY = re.compile(r"\*\*Why:\*\*\s*([^\n]+)", re.I)
@@ -81,9 +85,13 @@ RE_DRAFT_BLOCK = re.compile(
 RE_TIME_MIN = re.compile(r"about\s*(\d+(?:\.\d+)?)\s*min", re.I)
 
 
-# Format current local Eastern Time timestamp string for UI display
-def now_et_strings() -> tuple[str, str]:
-    now_utc = datetime.now(timezone.utc)
+# Format UTC epoch or current wall-clock time as ISO-8601 and Eastern Time display strings
+def now_et_strings(epoch_sec: float | None = None) -> tuple[str, str]:
+    now_utc = (
+        datetime.fromtimestamp(epoch_sec, tz=timezone.utc)
+        if epoch_sec is not None
+        else datetime.now(timezone.utc)
+    )
     iso_str = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
     # Convert to ET (-4 during EDT, -5 during EST)
     try:
@@ -157,9 +165,21 @@ def save_triage_result(data: dict[str, Any], results_dir: Path | str | None = No
 
     # Reset patchset-scoped review and corpus state on newer patchset or new PR commit SHA
     exist_rev = str(existing.get("triaged_revision") or "").strip().lower()
+    if kind == "github" and existing.get("report_markdown"):
+        # Recover report SHA if queue_triage backfilled a newer SHA onto an old report
+        rep_rev = extract_audit_revision(
+            str(existing["report_markdown"]), kind, target_id, existing_ps
+        )
+        if len(rep_rev) >= 7 and (not exist_rev or not _sha_matches(exist_rev, rep_rev)):
+            exist_rev = rep_rev
     new_rev = str(data.get("triaged_revision") or "").strip().lower()
+    exist_at = str(existing.get("triaged_at") or "").strip()
+    new_at = str(data.get("triaged_at") or "").strip()
+    # Ignore older /tmp/wf*.md files so historical audits never roll back a newer review SHA
+    not_older_than_existing = not (exist_at and new_at and new_at < exist_at)
     rev_drifted = (
         new_ps == existing_ps > 0
+        and not_older_than_existing
         and len(exist_rev) >= 7
         and len(new_rev) >= 7
         and not _sha_matches(exist_rev, new_rev)
@@ -179,10 +199,33 @@ def save_triage_result(data: dict[str, Any], results_dir: Path | str | None = No
                 "_", " "
             )
     elif p_exist > p_new and existing_ps >= new_ps:
+        same_rev = not exist_rev or not new_rev or _sha_matches(exist_rev, new_rev)
         # Preserve higher priority verdict, summary, review time, report, and draft
         for k, v in data.items():
+            # Never backfill a shallow GitHub PR SHA onto an older review record
+            if k == "triaged_revision" and (kind == "github" or existing_ps != new_ps):
+                continue
+            # Do not mix audit markdown from a different patchset or commit SHA
+            if k in ("audit_outcome", "report_path", "report_markdown") and (
+                existing_ps != new_ps or not same_rev
+            ):
+                continue
             if k not in merged or merged[k] in (None, "", 0):
                 merged[k] = v
+        # Refresh deep audit report metadata when a matching-PS audit lands alongside a review
+        if existing_ps == new_ps and new_source == "audit" and same_rev:
+            cur_rpath = str(merged.get("report_path") or "")
+            new_rpath = str(data.get("report_path") or "")
+            if new_rpath and (
+                not cur_rpath
+                or cur_rpath.startswith("/tmp/triage_")
+                or cur_rpath != new_rpath
+            ):
+                merged["report_path"] = new_rpath
+                if data.get("report_markdown"):
+                    merged["report_markdown"] = data["report_markdown"]
+                if data.get("audit_outcome"):
+                    merged["audit_outcome"] = data["audit_outcome"]
         # Propagate authoritative hunk-level corpus requirement onto same-PS review records
         if existing_ps == new_ps and data.get("corpus_gate_authoritative"):
             merged["corpus_required"] = bool(data.get("corpus_required"))
@@ -206,6 +249,9 @@ def save_triage_result(data: dict[str, Any], results_dir: Path | str | None = No
                     )
                     merged.update(lbls)
     else:
+        # Preserve existing revision when same-patchset update omits triaged_revision
+        if not new_rev and exist_rev and existing_ps == new_ps:
+            data = {**data, "triaged_revision": existing["triaged_revision"]}
         merged.update(data)
 
     merged["schema_version"] = 1
@@ -244,7 +290,12 @@ def load_all_triage_results(
 # Normalize raw category string to one of the 4 canonical categories
 def normalize_verdict(raw: str) -> str:
     s = raw.upper()
-    if "MECHANICAL" in s or "WAITING ON OTHERS" in s:
+    if "SURGICAL" not in s and (
+        "MECHANICAL" in s
+        or "WAITING ON OTHERS" in s
+        or "REBASE ONLY" in s
+        or "REBASE-ONLY" in s
+    ):
         return "MECHANICAL"
     if "REASSIGN" in s:
         return "REASSIGN"
@@ -913,7 +964,13 @@ def parse_queue_triage_markdown(
 ) -> list[dict[str, Any]]:
     sections = re.split(r"^### Детали по\s+(\S+)", md_text, flags=re.M)
     results: list[dict[str, Any]] = []
-    iso_ts, et_ts = now_et_strings()
+    file_mtime: float | None = None
+    if source_path and os.path.isfile(source_path):
+        try:
+            file_mtime = os.path.getmtime(source_path)
+        except OSError:
+            file_mtime = None
+    iso_ts, et_ts = now_et_strings(file_mtime)
 
     for i in range(1, len(sections), 2):
         target_id = sections[i].strip()
@@ -999,34 +1056,37 @@ def parse_queue_triage_markdown(
 
 # Extract ready-to-copy draft code block or text from deep audit report
 def extract_draft_from_audit(body: str) -> str:
-    # 1. Code block after Ready-to-copy draft or Draft
+    heading_pat = (
+        r"(?:^#{1,4}\s+|\*\*)(?:Ready-to-copy(?:\s+review)?\s+draft|"
+        r"Ready-to-post\s+Draft|Reply\s+draft|Draft)\b[^\n]*\n+"
+    )
+    # Code block immediately following a Markdown or bold Draft heading
     m = re.search(
-        r"\*\*(?:Ready-to-copy draft|Ready-to-post Draft|Draft)[^\n]*\n+"
-        r"```[a-zA-Z0-9_-]*\s*\n(.*?)\n```",
+        heading_pat + r"```[a-zA-Z0-9_-]*\s*\n(.*?)\n```",
         body,
-        re.S | re.I,
+        re.S | re.I | re.M,
     )
     if m and m.group(1).strip():
         return m.group(1).strip()
-    # 2. Blockquote after Draft heading
+    # Blockquote immediately following a Draft heading
     m_bq = re.search(
-        r"\*\*(?:Ready-to-copy draft|Ready-to-post Draft|Draft)[^\n]*\n+>\s*(.*?)(?=\n\n|\n##|\Z)",
+        heading_pat + r">\s*(.*?)(?=\n\n|\n##|\Z)",
         body,
-        re.S | re.I,
+        re.S | re.I | re.M,
     )
     if m_bq and m_bq.group(1).strip():
         val = m_bq.group(1).strip()
         if "no comment needed" in val.lower():
             return ""
         return val
-    # 3. Inline Draft: <text>
+    # Inline Draft: <text>
     m_in = re.search(r"[-*]?\s*\*\*Draft:\*\*\s*([^\n]+)", body, re.I)
     if m_in and m_in.group(1).strip():
         val = m_in.group(1).strip()
         if "no comment needed" in val.lower():
             return ""
         return val
-    # 4. Reply draft heading followed by --- fenced text
+    # Reply draft heading followed by --- fenced text
     m_fence = re.search(
         r"(?:Reply draft|Draft reply|Suggested reply)[^\n]*:\s*\n+---\s*\n(.*?)\n---",
         body,
@@ -1040,26 +1100,109 @@ def extract_draft_from_audit(body: str) -> str:
     return ""
 
 
-# Parse a single audit section from a wf312_*.md file
+# Extract triaged commit or PR head SHA for the target patchset from audit markdown
+def extract_audit_revision(
+    body: str,
+    kind: str,
+    target_id: str,
+    triaged_ps: int,
+) -> str:
+    if not body:
+        return ""
+    if kind == "gerrit" and triaged_ps > 0:
+        # Match [PS6](.../+/1409697/6) (`6e8dd008c2`) or [PS6] (`6e8dd008c2`) for this CL only
+        link_ps_re = re.compile(
+            rf"\[([^\]]*\bPS{triaged_ps}\b[^\]]*)\](?:\(([^)\n]*)\))?[^(\n]*\(\s*"
+            r"`?([0-9a-f]{7,40})`?(?:[,)\s])"
+        )
+        for m in link_ps_re.finditer(body):
+            lbl, url, sha = m.group(1), m.group(2) or "", m.group(3)
+            ids_in_ref = re.findall(r"\b(?:Gerrit|CL|cl/)\s*(\d+)", lbl, re.I)
+            url_m = RE_GERRIT_URL_ID.search(url)
+            if url_m:
+                ids_in_ref.append(url_m.group(1))
+            if target_id and any(cid != target_id for cid in ids_in_ref):
+                continue
+            return sha.lower()
+
+        plain_ps_re = re.compile(
+            rf"(?<!\[)\bPS{triaged_ps}\b(?:\*\*|\s)*\(\s*`?([0-9a-f]{{7,40}})`?(?:[,)\s])"
+        )
+        for m in plain_ps_re.finditer(body):
+            prefix = body[max(0, m.start() - 32) : m.start()]
+            other_ids = re.findall(r"\b(?:Gerrit|CL|cl/)\s*(\d+)", prefix, re.I)
+            if target_id and any(cid != target_id for cid in other_ids):
+                continue
+            return m.group(1).lower()
+
+        inline_ps_m = re.search(rf"\bPS{triaged_ps}\s+`([0-9a-f]{{7,40}})`", body)
+        if inline_ps_m:
+            return inline_ps_m.group(1).lower()
+
+    if kind == "github":
+        for pat in (
+            r"\bnew\s+head[:*\s]+`?([0-9a-f]{7,40})`?\b",
+            r"\bhead\s+`([0-9a-f]{7,40})`",
+            r"\bthe\s+head\s+is(?:\s+still|\s+now)?\s+`?([0-9a-f]{7,40})`?\b",
+        ):
+            hm = re.search(pat, body, re.I)
+            if hm:
+                return hm.group(1).lower()
+    else:
+        hm = re.search(r"\bhead\s+`([0-9a-f]{7,40})`", body, re.I)
+        if hm:
+            return hm.group(1).lower()
+    return ""
+
+
+# Parse a single audit section from a wf*.md file
 def parse_single_audit_text(
     body: str,
     source_path: str | None = None,
 ) -> dict[str, Any] | None:
-    # Target identification
-    target_m = re.search(r"\b(?:cl/|CL\s+)(\d+)", body, re.I)
-    kind = "gerrit"
-    if target_m:
-        target_id = target_m.group(1)
-    else:
-        pr_m = re.search(r"\b(?:PR\s+#|pull/)(\d+)", body, re.I)
-        if pr_m:
-            target_id = pr_m.group(1)
-            kind = "github"
-        else:
-            return None
+    # Pick whichever target reference (Gerrit CL/URL vs GitHub PR) appears first in the report
+    gerrit_candidates: list[tuple[int, str]] = []
+    m_named = re.search(r"\b(?:cl/|CL\s+|Gerrit\s+)(\d+)", body, re.I)
+    if m_named:
+        gerrit_candidates.append((m_named.start(), m_named.group(1)))
+    m_url = RE_GERRIT_URL_ID.search(body)
+    if m_url:
+        gerrit_candidates.append((m_url.start(), m_url.group(1)))
+    gerrit_hit = min(gerrit_candidates, key=lambda x: x[0]) if gerrit_candidates else None
 
-    ps_m = re.search(r"\bPS(\d+)\b", body)
-    triaged_ps = int(ps_m.group(1)) if ps_m else 1
+    pr_m = re.search(r"\b(?:PR\s+#|pull/)(\d+)", body, re.I)
+    gh_hit = (pr_m.start(), pr_m.group(1)) if pr_m else None
+
+    if gerrit_hit and (not gh_hit or gerrit_hit[0] <= gh_hit[0]):
+        kind = "gerrit"
+        target_id = gerrit_hit[1]
+    elif gh_hit:
+        kind = "github"
+        target_id = gh_hit[1]
+    else:
+        return None
+
+    triaged_ps = 1
+    if kind == "gerrit":
+        # Prefer explicit patchset attached to target_id before generic PS<N> mentions
+        ps_target = re.search(
+            rf"(?:\b(?:Gerrit|CL|cl/)\s*{re.escape(target_id)}\s+PS(\d+)\b|"
+            rf"/\+/{re.escape(target_id)}/(\d+)\b)",
+            body,
+            re.I,
+        )
+        if ps_target:
+            triaged_ps = int(ps_target.group(1) or ps_target.group(2))
+        else:
+            ps_m = re.search(r"\bPS(\d+)\b", body)
+            if ps_m:
+                triaged_ps = int(ps_m.group(1))
+    else:
+        ps_m = re.search(r"\bPS(\d+)\b", body)
+        if ps_m:
+            triaged_ps = int(ps_m.group(1))
+
+    triaged_rev = extract_audit_revision(body, kind, target_id, triaged_ps)
 
     cat_m = re.search(r"[-*]?\s*\*\*Category:\*\*\s*([^\n]+)", body, re.I)
     cat_raw = cat_m.group(1).strip() if cat_m else "Surgical audit"
@@ -1072,7 +1215,13 @@ def parse_single_audit_text(
     time_label = f"~{int(round(est_min))}m"
 
     draft = extract_draft_from_audit(body)
-    iso_ts, et_ts = now_et_strings()
+    file_mtime: float | None = None
+    if source_path and os.path.isfile(source_path):
+        try:
+            file_mtime = os.path.getmtime(source_path)
+        except OSError:
+            file_mtime = None
+    iso_ts, et_ts = now_et_strings(file_mtime)
 
     # Determine concise one-line summary
     lower_body = body.lower()
@@ -1084,7 +1233,12 @@ def parse_single_audit_text(
     elif "waiting on others" in cat_raw.lower():
         summary = "Waiting on others; no comment needed"
     elif not draft or "no comment needed" in lower_draft:
-        if "already approved" in lower_body or "+1 still stands" in lower_body:
+        if (
+            "already approved" in lower_body
+            or "+1 still stands" in lower_body
+            or "cr+1 carried over" in lower_body
+            or "cr+1 was copied over" in lower_body
+        ):
             summary = "No comment needed (already approved)"
         else:
             summary = "No comment needed"
@@ -1127,7 +1281,7 @@ def parse_single_audit_text(
             "verdict_tone": verdict.lower(),
         }
 
-    return {
+    result: dict[str, Any] = {
         "target_id": target_id,
         "item_key": f"{kind}:{target_id}",
         "kind": kind,
@@ -1150,14 +1304,17 @@ def parse_single_audit_text(
         "report_markdown": body.strip(),
         "report_path": source_path or "",
     }
+    if triaged_rev:
+        result["triaged_revision"] = triaged_rev
+    return result
 
 
-# Parse deep audit markdown files (e.g. /tmp/wf312_*.md)
+# Parse deep audit markdown files (e.g. /tmp/wf516_*.md)
 def parse_wf_audit_markdown(
     md_text: str,
     source_path: str | None = None,
 ) -> list[dict[str, Any]]:
-    # Handle multi-item files like wf312_followups.md split by **(1), **(2)
+    # Handle multi-item files split by **(1), **(2) or multiple ## CL/PR headings
     parts = re.split(r"^\*\*\(\d+\)\s+", md_text, flags=re.M)
     items: list[dict[str, Any]] = []
     if len(parts) > 1:
@@ -1165,10 +1322,27 @@ def parse_wf_audit_markdown(
             res = parse_single_audit_text(p, source_path=source_path)
             if res:
                 items.append(res)
-    else:
-        res = parse_single_audit_text(md_text, source_path=source_path)
-        if res:
-            items.append(res)
+        return items
+
+    h2_starts = [
+        m.start()
+        for m in re.finditer(
+            r"^##\s+[^\n]*(?:\bGerrit\s+\d+|\bCL\s+\d+|\bcl/\d+|/\+/\d+|\bPR\s+#\d+|pull/\d+)",
+            md_text,
+            flags=re.M | re.I,
+        )
+    ]
+    if len(h2_starts) >= 2:
+        for idx, start in enumerate(h2_starts):
+            end = h2_starts[idx + 1] if idx + 1 < len(h2_starts) else len(md_text)
+            res = parse_single_audit_text(md_text[start:end], source_path=source_path)
+            if res:
+                items.append(res)
+        return items
+
+    res = parse_single_audit_text(md_text, source_path=source_path)
+    if res:
+        items.append(res)
     return items
 
 
@@ -1194,16 +1368,20 @@ def ingest_tmp_triage_files(
         except Exception:
             pass
 
-    # Ingest deep per-CL audit files second so they override/enrich overview data
+    # Keep only the newest per-item wf*.md report so stale files never oscillate head SHAs
     wf_files = sorted(td.glob("wf*.md"), key=lambda p: p.stat().st_mtime)
+    latest_wf_by_key: dict[str, dict[str, Any]] = {}
     for wf in wf_files:
         try:
             content = wf.read_text(encoding="utf-8", errors="replace")
             for res in parse_wf_audit_markdown(content, source_path=str(wf)):
-                save_triage_result(res, results_dir=results_dir)
-                count += 1
+                ikey = str(res.get("item_key") or f"{res.get('kind')}:{res.get('target_id')}")
+                latest_wf_by_key[ikey] = res
         except Exception:
             continue
+    for res in latest_wf_by_key.values():
+        save_triage_result(res, results_dir=results_dir)
+        count += 1
     return count
 
 

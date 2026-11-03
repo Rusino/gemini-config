@@ -183,6 +183,10 @@ RE_GH_FLUTTER_ISSUE_EXPLICIT = re.compile(
 RE_GH_CLOSING_KEYWORD = re.compile(
     r"(?i)\b(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?|issue)\s+#(\d{5,7})\b"
 )
+# Non-flutter GitHub repositories use smaller issue numbers (1-7 digits)
+RE_GH_CLOSING_KEYWORD_ANY_REPO = re.compile(
+    r"(?i)\b(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?|issue)\s+#(\d{1,7})\b"
+)
 FLUTTER_TREE_CHECK = "tree-status"
 # Cocoon aggregates Luci presubmit jobs under one umbrella check-run and exposes
 # tip-of-tree and per-commit post-submit failures on flutter-dashboard
@@ -1096,9 +1100,11 @@ def extract_state_file_targets(
 
 
 def extract_bug_refs_from_text(
-    text: str, default_tracker: str = ""
+    text: str,
+    default_tracker: str = "",
+    default_repo: str = "flutter/flutter",
 ) -> list[str]:
-  """Extracts namespaced bug keys (`buganizer:<id>`, `gh_issue:flutter/flutter#<n>`)."""
+  """Extracts namespaced bug keys (`buganizer:<id>`, `gh_issue:<owner>/<repo>#<n>`)."""
   if not text:
     return []
   found: list[str] = []
@@ -1120,8 +1126,17 @@ def extract_bug_refs_from_text(
         _add(f"buganizer:{bm.group(1)}")
   elif default_tracker == "github":
     # Match closing keywords like Fixes #193731 while ignoring PR #195122 references
-    for km in RE_GH_CLOSING_KEYWORD.finditer(text):
-      _add(f"gh_issue:flutter/flutter#{km.group(1)}")
+    repo_norm = str(default_repo or "").strip()
+    if repo_norm.startswith("github.com/"):
+      repo_norm = repo_norm[len("github.com/") :]
+    repo_norm = repo_norm or "flutter/flutter"
+    kw_re = (
+        RE_GH_CLOSING_KEYWORD
+        if repo_norm == "flutter/flutter"
+        else RE_GH_CLOSING_KEYWORD_ANY_REPO
+    )
+    for km in kw_re.finditer(text):
+      _add(f"gh_issue:{repo_norm}#{km.group(1)}")
   return found
 
 
@@ -4800,8 +4815,14 @@ def partition_github_failed_checks(
   return own_failed, tree_failed
 
 
-def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
-  """Fetches Flutter GitHub PR status via `gh pr view`."""
+def fetch_github_pr_status(
+    pr_id: str,
+    repo_slug: str = "flutter/flutter",
+) -> dict[str, Any]:
+  """Fetches GitHub PR status via `gh pr view` for `repo_slug`."""
+  repo = str(repo_slug or "").strip() or "flutter/flutter"
+  if repo.startswith("github.com/"):
+    repo = repo[len("github.com/") :]
   try:
     out = subprocess.check_output(
         [
@@ -4810,15 +4831,14 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
             "view",
             str(pr_id),
             "--repo",
-            "flutter/flutter",
+            repo,
             "--json",
-            # Include body so fix-for detection can parse PR bug/revert references
+            # Include body so fix-for detection can parse PR bug/revert references;
+            # omit closingIssuesReferences because gh 2.46 rejects that field on Linux
             "number,title,body,state,isDraft,author,mergedAt,headRefOid,headRefName,"
             "baseRefName,reviewDecision,latestReviews,reviews,comments,"
-            # Include commits so author pushes after a review update the PR timeline,
-            # and closingIssuesReferences for automatic PR <-> GitHub issue linking
             "commits,statusCheckRollup,labels,url,mergeable,reviewRequests,"
-            "closingIssuesReferences,createdAt,updatedAt,closedAt,files",
+            "createdAt,updatedAt,closedAt,files",
         ],
         stderr=subprocess.STDOUT,
         text=True,
@@ -4896,15 +4916,19 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         for c in checks
         if str(c.get("conclusion") or c.get("state") or "").upper() in failing
     ]
-    # tree-status fails on every open PR while the flutter/flutter tree is red; it
-    # says nothing about this PR, so it must not raise a CQ alert
-    tree_red = FLUTTER_TREE_CHECK in failed_all
-    failed_checks = [c for c in failed_all if c != FLUTTER_TREE_CHECK]
-    # Subtract checks already failing on master or the PR's base commit so tree
-    # breakages do not trigger a false CQ failure alert on this PR
-    own_failed_checks, tree_failed_checks = partition_github_failed_checks(
-        str(pr_id), head_sha, failed_checks, failing
-    )
+    if repo == "flutter/flutter":
+      # tree-status fails on every open PR while the flutter/flutter tree is red; it
+      # says nothing about this PR, so it must not raise a CQ alert
+      tree_red = FLUTTER_TREE_CHECK in failed_all
+      failed_checks = [c for c in failed_all if c != FLUTTER_TREE_CHECK]
+      # Subtract checks already failing on master or the PR's base commit so tree
+      # breakages do not trigger a false CQ failure alert on this PR
+      own_failed_checks, tree_failed_checks = partition_github_failed_checks(
+          str(pr_id), head_sha, failed_checks, failing
+      )
+    else:
+      tree_red = False
+      own_failed_checks, tree_failed_checks = list(failed_all), []
     label_names = {
         str(lbl.get("name") or "")
         for lbl in (d.get("labels") or [])
@@ -5249,9 +5273,9 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
 
     return {
         "ok": True,
-        "host": "github.com/flutter/flutter",
+        "host": f"github.com/{repo}",
         "url": str(
-            d.get("url") or f"https://github.com/flutter/flutter/pull/{pr_id}"
+            d.get("url") or f"https://github.com/{repo}/pull/{pr_id}"
         ),
         "status": state,
         "phase": phase,
@@ -5292,12 +5316,12 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
         ),
         # Expose PR description text under commit_message for shared fix-for extractors
         "commit_message": str(d.get("body") or ""),
-        # Combine GraphQL closingIssuesReferences with free-text Bug:/Fixes references
+        # Combine optional closingIssuesReferences with free-text Bug:/Fixes references
         "linked_bug_keys": list(
             dict.fromkeys([
                 *(
                     "gh_issue:"
-                    f"{str((ci.get('repository') or {}).get('nameWithOwner') or 'flutter/flutter')}"
+                    f"{str((ci.get('repository') or {}).get('nameWithOwner') or repo)}"
                     f"#{ci.get('number')}"
                     for ci in (d.get("closingIssuesReferences") or [])
                     if isinstance(ci, dict) and ci.get("number")
@@ -5305,11 +5329,12 @@ def fetch_github_pr_status(pr_id: str) -> dict[str, Any]:
                 *extract_bug_refs_from_text(
                     f"{subject}\n{str(d.get('body') or '')}",
                     default_tracker="github",
+                    default_repo=repo,
                 ),
             ])
         ),
         "commit_url": (
-            f"https://github.com/flutter/flutter/commit/{head_sha}" if head_sha else ""
+            f"https://github.com/{repo}/commit/{head_sha}" if head_sha else ""
         ),
         "in_my_attention": phase in ("NEEDS_YOUR_ACTION", "ALERT_CQ_FAILED"),
         "cr_summary": (
@@ -6019,6 +6044,13 @@ def start_chat_for_item(item_key: str) -> dict[str, Any]:
             rec["review_target_ps"] = cur_ps
             rec["chat_busy"] = True
             rec["chat_woken_ts"] = time.time()
+            # Clear deferred wakeup watermarks and record claim once manually woken
+            rec.pop("pending_wake_from_ps", None)
+            rec.pop("pending_wake_from_msg_date", None)
+            state.setdefault("review_claims", {})[f"{ikey}:{cur_ps}"] = {
+                "cid": active_cid,
+                "ts": time.time(),
+            }
             save_watcher_state(state)
             return {
                 "ok": True,
@@ -7964,7 +7996,11 @@ def link_bugs_and_cls(
     refs = list(
         dict.fromkeys([
             *(str(k) for k in (sample.get("linked_bug_keys") or []) if k),
-            *extract_bug_refs_from_text(blob, default_tracker=default_trk),
+            *extract_bug_refs_from_text(
+                blob,
+                default_tracker=default_trk,
+                default_repo=str(sample.get("host") or ""),
+            ),
         ])
     )
     for bkey in refs:
@@ -8393,7 +8429,9 @@ def sync_bugs_into_state(
     for bkey in [
         *(str(k) for k in (rec.get("linked_bug_keys") or []) if k),
         *extract_bug_refs_from_text(
-            blob, default_tracker="github" if kind == "github" else "buganizer"
+            blob,
+            default_tracker="github" if kind == "github" else "buganizer",
+            default_repo=str(rec.get("host") or ""),
         ),
     ]:
       if rec.get("is_self"):
@@ -8659,14 +8697,6 @@ def sync_once(
   github_rerequest_ledger: dict[str, Any] = state.setdefault(
       "github_rerequest_ledger", {}
   )
-  busy_review_chats = sum(
-      1
-      for d in prev_items.values()
-      if isinstance(d, dict)
-      and d.get("conversation_id")
-      and _is_assigned_reviewer_record(d)
-      and d.get("chat_busy")
-  )
   auto_started_count = 0
 
   # Refresh skia_main git refs so merge-base checks are accurate
@@ -8682,6 +8712,31 @@ def sync_once(
   rollers, incidents = fetch_gardener_snapshot()
   proj_names = load_project_names()
   chatted = discover_active_cl_chats()
+  live_busy_by_cid = {
+      str(c["conversation_id"]): bool(c.get("chat_busy"))
+      for c in chatted
+      if isinstance(c, dict) and c.get("conversation_id")
+  }
+  now_sync_ts = time.time()
+  busy_review_cids: set[str] = set()
+  for d_prev in prev_items.values():
+    # Count only active assigned-reviewer chats toward the 2-chat concurrency cap
+    if not isinstance(d_prev, dict) or not _is_assigned_reviewer_record(d_prev):
+      continue
+    prev_cid_chk = str(d_prev.get("conversation_id") or "")
+    if not prev_cid_chk:
+      continue
+    woken_ts = float(d_prev.get("chat_woken_ts") or 0.0)
+    # Keep newly woken chats counted during the grace window before LS reports RUNNING
+    in_grace = bool(woken_ts and now_sync_ts - woken_ts < CHAT_WAKE_GRACE_SEC)
+    is_live_busy = (
+        live_busy_by_cid[prev_cid_chk]
+        if prev_cid_chk in live_busy_by_cid
+        else bool(d_prev.get("chat_busy"))
+    )
+    if in_grace or is_live_busy:
+      busy_review_cids.add(prev_cid_chk)
+  busy_review_chats = len(busy_review_cids)
   remote_unchatted = discover_open_remote_changes(
       {d["item_key"] for d in chatted},
       proj_names=proj_names,
@@ -8706,7 +8761,12 @@ def sync_once(
             preferred_host=str(d.get("preferred_host") or ""),
         )
       elif d["kind"] == "github":
-        fetched_cache[ikey] = fetch_github_pr_status(tid)
+        gh_repo = str(d.get("repo_slug") or d.get("preferred_host") or "").strip()
+        fetched_cache[ikey] = (
+            fetch_github_pr_status(tid, repo_slug=gh_repo)
+            if gh_repo
+            else fetch_github_pr_status(tid)
+        )
       else:
         fetched_cache[ikey] = fetch_piper_cl_status(tid)
     info = fetched_cache[ikey]
@@ -8795,7 +8855,12 @@ def sync_once(
           ),
       )
     elif comp_kind == "github":
-      fetched_cache[comp_to] = fetch_github_pr_status(comp_tid)
+      comp_repo = str(d.get("repo_slug") or d_info.get("host") or "").strip()
+      fetched_cache[comp_to] = (
+          fetch_github_pr_status(comp_tid, repo_slug=comp_repo)
+          if comp_repo and comp_repo not in ("github.com/flutter/flutter", "flutter/flutter")
+          else fetch_github_pr_status(comp_tid)
+      )
     elif comp_kind == "piper":
       fetched_cache[comp_to] = fetch_piper_cl_status(comp_tid)
 
@@ -9037,11 +9102,13 @@ def sync_once(
       record["chat_busy"] = True
 
     if cid and _is_assigned_reviewer_record(record) and not record.get("chat_busy"):
+      # Throttled children keep their pre-transition patchset floor until woken
+      prior_reviewed_floor = prev.get("pending_wake_from_ps", prev.get("patchset"))
       record["reviewed_ps"] = max(
           int(record.get("reviewed_ps") or 0),
           int(
               record.get("review_target_ps")
-              or prev.get("patchset")
+              or prior_reviewed_floor
               or record.get("patchset")
               or 1
           ),
@@ -9099,6 +9166,7 @@ def sync_once(
 
       transition_msg = ""
       is_critical = False
+      already_woken = False
 
       if prev_status != "MERGED" and info["status"] == "MERGED":
         # Automatically archive Gmail threads from INBOX on merge
@@ -9178,23 +9246,63 @@ def sync_once(
         )
       elif (
           info["status"] in ("NEW", "OPEN")
-          and (info["patchset"] != prev_ps or info["last_msg_date"] != prev_msg_date)
+          and (
+              info["patchset"] != prev.get("pending_wake_from_ps", prev_ps)
+              or info["last_msg_date"]
+              != prev.get("pending_wake_from_msg_date", prev_msg_date)
+          )
           and info["last_msg_author"] not in SELF_EMAILS
           and info["last_msg_author"] not in SELF_GITHUB_LOGINS
           # Ignore SkCQ dry-run bot messages so they do not wake the chat for a reply
           and not info["last_msg_author"].endswith(".gserviceaccount.com")
           and info["in_my_attention"]
       ):
-        if _is_assigned_reviewer_record(record):
-          record["review_target_ps"] = int(info.get("patchset") or 1)
-          record["chat_busy"] = True
-          record["chat_woken_ts"] = time.time()
-        transition_msg = (
+        eff_prev_ps = prev.get("pending_wake_from_ps", prev_ps)
+        eff_prev_msg_date = prev.get("pending_wake_from_msg_date", prev_msg_date)
+        cand_msg = (
             f"[CL-WATCHER] 💬 Новое обновление в {ikey} (PS{info['patchset']}) от "
             f"{info['last_msg_author']}: {info['last_msg_snippet']}. "
             f"Проведи инкрементальный триаж/анализ, подготовь черновик ответа "
             f"и запиши вердикт через triage_store.py save-review."
         )
+        if _is_assigned_reviewer_record(record):
+          # Gate reviewer wakeups with the same concurrency and stack-parent limits as auto-start
+          if cid and not info.get("is_wip") and not info.get("is_draft"):
+            cur_ps = int(info.get("patchset") or 1)
+            claim_key = (
+                f"{ikey}:{cur_ps}:{info.get('last_msg_date') or ''}"
+                if cur_ps == eff_prev_ps
+                else f"{ikey}:{cur_ps}"
+            )
+            if claim_key not in review_claims:
+              if (
+                  wake_chats
+                  and auto_started_count < 1
+                  and busy_review_chats < 2
+                  and not _has_unready_open_stack_parent(
+                      ikey, active_by_ikey, fetched_cache, new_items, prev_items
+                  )
+              ):
+                was_busy = bool(record.get("chat_busy"))
+                if wake_conversation(cid, cand_msg):
+                  record["review_target_ps"] = cur_ps
+                  record["chat_busy"] = True
+                  record["chat_woken_ts"] = time.time()
+                  review_claims[claim_key] = {"cid": cid, "ts": time.time()}
+                  auto_started_count += 1
+                  if not was_busy:
+                    busy_review_chats += 1
+                  transition_msg = cand_msg
+                  already_woken = True
+                else:
+                  record["pending_wake_from_ps"] = eff_prev_ps
+                  record["pending_wake_from_msg_date"] = eff_prev_msg_date
+              else:
+                # Preserve pre-transition baseline so throttled or deferred items wake next poll
+                record["pending_wake_from_ps"] = eff_prev_ps
+                record["pending_wake_from_msg_date"] = eff_prev_msg_date
+        else:
+          transition_msg = cand_msg
 
       if transition_msg:
         ev = {
@@ -9213,7 +9321,7 @@ def sync_once(
           send_desktop_alert(
               f"CL Alert: {ikey}", transition_msg, info.get("url", "")
           )
-        if cid and wake_chats:
+        if cid and wake_chats and not already_woken:
           wake_conversation(cid, transition_msg)
 
     if (
