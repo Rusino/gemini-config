@@ -654,7 +654,25 @@ global.window = {
             },
           },
         ],
-        'open-current': [],
+        'open-current': [
+          {
+            type: 'CORTEX_STEP_TYPE_USER_INPUT',
+            userInput: {
+              userResponse:
+                '<USER_REQUEST>\n' +
+                'Continuing unfinished work from previous conversation (conversation://step).\n' +
+                'Next immediate task: Fix missing tail turn dot & <rail>\n\n' +
+                'This prompt is auto-generated and does not set the chat language: Russian.\n' +
+                '</USER_REQUEST>',
+            },
+          },
+          {
+            type: 'CORTEX_STEP_TYPE_PLANNER_RESPONSE',
+            plannerResponse: {
+              modifiedResponse: 'Tail assistant reply preview text',
+            },
+          },
+        ],
       };
       return { ok: true, json: async () => ({ steps: stepsByCid[body.cascadeId] || [] }) };
     }
@@ -1596,24 +1614,175 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(convoSendBtn.hasAttribute('disabled'), false);
   assert(!convoFooterInner.querySelector('[data-testid="jetski-archive-piece-banner"]'));
 
-  // 5. Fallback path when conversation-navigator is unmounted (< 2 turns in ConversationNavigatorRail)
+  // 5. Fallback rail when conversation-navigator is unmounted (< 2 turns in native rail)
+  const convoScrollArea = new FakeElement('div');
+  convoScrollArea.className = 'relative self-stretch flex-grow min-h-0';
+  const convoViewport = new FakeElement('div');
+  convoViewport.className = 'h-full overflow-y-auto min-h-0 w-full scrollbar-hide pl-4';
+  convoViewport.setAttribute('data-testid', 'autoscroll-viewport');
+  convoViewport.scrollTop = 480;
+  let lastViewportScrollTo = null;
+  convoViewport.scrollTo = (opts) => {
+    lastViewportScrollTo = opts;
+    if (opts && typeof opts.top === 'number') {
+      convoViewport.scrollTop = opts.top;
+    }
+  };
+  convoScrollArea.appendChild(convoViewport);
+  convoViewEl.insertBefore(convoScrollArea, convoFooterEl);
+
+  // Verify bounded star-group height and inner flex-shrink protection in injected CSS
+  const railCss = global.document.getElementById('jetski-closed-chats-filter-style').textContent;
+  assert(
+    railCss.includes('justify-content: flex-start;') && railCss.includes('overflow-y: auto;'),
+    'Star groups must use flex-start + overflow-y:auto so overflowing top stars remain reachable'
+  );
+  assert(
+    railCss.includes('max-height: 44%;') && railCss.includes('max-height: 22%;'),
+    'Star groups must bound max-height on tail (44%) and split before/after (22%) layouts'
+  );
+  assert(
+    railCss.includes(
+      '[data-testid="conversation-navigator"] > div.relative.flex.min-h-0.flex-col'
+    ),
+    'Native turn-dot wrapper must prevent flex-shrink collapse under long star groups'
+  );
+
+  // Verify rail slot bottom clearance tracks tall composer footer height so native rail stays shown
+  convoFooterEl.offsetHeight = 320;
+  await window.__jetskiChainNav.syncConversationChainNavigators();
+  assert.strictEqual(
+    convoRailSlot.style.bottom,
+    '320px',
+    'Rail slot bottom must clear tall tail composer footer'
+  );
+  // Updating footer height while chainSig is unchanged must still refresh slot bottom clearance
+  convoFooterEl.offsetHeight = 380;
+  await window.__jetskiChainNav.syncConversationChainNavigators();
+  assert.strictEqual(convoRailSlot.style.bottom, '380px');
+
+  // Verify overflowing beforeGroup scrolls active star to bottom without scrolling page
+  const navBeforeForScroll = convoNavEl.querySelector('[data-testid="jetski-chain-stars-before"]');
+  navBeforeForScroll.scrollHeight = 450;
+  navBeforeForScroll.clientHeight = 180;
+  navBeforeForScroll.scrollTop = 0;
+  convoNavEl.removeAttribute('data-jetski-chain-sig');
+  await window.__jetskiChainNav.syncConversationChainNavigators();
+  assert.strictEqual(
+    navBeforeForScroll.scrollTop,
+    450,
+    'Overflowing beforeGroup must scroll to reveal the active star next to turn dots'
+  );
+
   convoNavEl.remove();
   await window.__jetskiChainNav.syncConversationChainNavigators();
-  const fallbackStars = convoRailSlot.querySelector('.jetski-chain-stars-fallback');
-  assert(fallbackStars, 'Fallback stars must mount in rail slot when nav is unmounted');
-  assert.strictEqual(fallbackStars.children.length, 3, 'All 3 pieces in fallback');
-  assert.strictEqual(fallbackStars.children[2].textContent, '★');
-  assert.strictEqual(fallbackStars.children[2].getAttribute('data-active'), 'true');
-  assert.strictEqual(fallbackStars.style.position, 'absolute');
-  assert.strictEqual(fallbackStars.style.left, '0');
-  assert.strictEqual(fallbackStars.style.width, '28px');
-  assert.strictEqual(fallbackStars.style.top, '50%');
-  assert.strictEqual(fallbackStars.style.transform, 'translateY(-50%)');
+  const fallbackRail = convoRailSlot.querySelector('.jetski-chain-stars-fallback');
+  assert(fallbackRail, 'Fallback rail must mount in rail slot when nav is unmounted');
+  assert.strictEqual(fallbackRail.style.position, 'absolute');
+  assert.strictEqual(fallbackRail.style.top, '0');
+  assert.strictEqual(fallbackRail.style.bottom, '0');
+  assert.strictEqual(fallbackRail.style.left, '0');
+  assert.strictEqual(fallbackRail.style.width, '28px');
 
-  // 6. Remount convoNavEl and verify sync removes fallback stars
+  const fallbackBefore = fallbackRail.querySelector('[data-testid="jetski-chain-stars-before"]');
+  assert(fallbackBefore, 'Fallback rail must render leading/current stars group');
+  assert.strictEqual(fallbackBefore.children.length, 3, 'All 3 pieces up to tail in beforeGroup');
+  assert.strictEqual(fallbackBefore.children[2].textContent, '★');
+  assert.strictEqual(fallbackBefore.children[2].getAttribute('data-active'), 'true');
+  assert.strictEqual(
+    fallbackRail.querySelector('[data-testid="jetski-chain-stars-after"]'),
+    null,
+    'Tail piece fallback rail must not render afterGroup'
+  );
+
+  const fallbackDot = fallbackRail.querySelector('[data-testid="jetski-fallback-turn-dot"]');
+  assert(fallbackDot, '1-turn tail chat must render a clickable single-turn dot in fallback rail');
+  assert.strictEqual(fallbackDot.getAttribute('data-active'), 'true');
+  assert.strictEqual(fallbackDot.getAttribute('aria-label'), 'Turn 1 of 1');
+  assert.strictEqual(
+    fallbackRail.children[0],
+    fallbackBefore,
+    'Stars beforeGroup must sit above the fallback turn dot'
+  );
+  assert(
+    fallbackRail.children[1].querySelector('[data-testid="jetski-fallback-turn-dot"]') ===
+      fallbackDot || fallbackRail.children[1] === fallbackDot,
+    'Fallback turn dot must sit immediately below beforeGroup'
+  );
+
+  // Preserve DOM instances across repeated sync passes when chain signature is unchanged
+  const savedFallbackBeforeBtn = fallbackBefore.children[0];
+  await window.__jetskiChainNav.syncConversationChainNavigators();
+  assert.strictEqual(fallbackBefore.children[0], savedFallbackBeforeBtn);
+  assert.strictEqual(
+    fallbackRail.querySelector('[data-testid="jetski-fallback-turn-dot"]'),
+    fallbackDot
+  );
+
+  // Mutations on fallback rail and fallback dot must not trigger MutationObserver feedback loops
+  while (rafCallbacks.length > 0) rafCallbacks.shift()();
+  observerCallback([{ target: fallbackRail }, { target: fallbackDot }]);
+  assert.strictEqual(rafCallbacks.length, 0, 'Fallback rail mutations must not schedule sync');
+
+  // Clicking the fallback turn dot scrolls the conversation viewport back to top (0)
+  advanceClock();
+  fallbackDot.dispatchEvent('pointerdown', { button: 0 });
+  fallbackDot.dispatchEvent('click', { button: 0 });
+  assert.strictEqual(convoViewport.scrollTop, 0, 'Fallback dot click must scroll viewport to top');
+  assert.deepStrictEqual(lastViewportScrollTo, { top: 0 });
+
+  // Hovering the fallback turn dot displays Turn 1 of 1 tooltip with cleaned prompt and preview
+  convoViewport.scrollTop = 360;
+  fallbackDot.dispatchEvent('mouseenter');
+  await new Promise((r) => setTimeout(r, 15));
+  const turnTip = global.document.getElementById('jetski-chain-star-tooltip');
+  assert(turnTip, 'Hovering fallback turn dot must mount turn preview tooltip');
+  assert.strictEqual(turnTip.getAttribute('data-visible'), 'true');
+  assert(turnTip.textContent.includes('1 of 1'), 'Turn tooltip must show 1 of 1 position');
+  assert(
+    turnTip.textContent.includes('Next immediate task: Fix missing tail turn dot & <rail>'),
+    'Turn tooltip must strip auto-handoff wrapper and show cleaned prompt text'
+  );
+  assert(
+    !turnTip.innerHTML.includes('<rail>'),
+    'Turn tooltip must escape HTML characters in prompt text'
+  );
+  assert(
+    turnTip.textContent.includes('Tail assistant reply preview text'),
+    'Turn tooltip must show assistant response preview'
+  );
+  const turnExpandBtn = turnTip.querySelector('[data-testid="jetski-turn-expand-btn"]');
+  assert(turnExpandBtn, 'Turn tooltip prompt row must carry expand chevron');
+  turnExpandBtn.dispatchEvent('click', { button: 0 });
+  assert.strictEqual(turnTip.getAttribute('data-has-expanded'), 'true');
+  const turnPromptRow = turnTip.querySelector('.jetski-chain-prompt-row');
+  assert(turnPromptRow, 'Turn tooltip must render interactive prompt row');
+  turnPromptRow.dispatchEvent('click', { button: 0 });
+  assert.strictEqual(convoViewport.scrollTop, 0, 'Clicking turn tooltip row must scroll to top');
+  assert.strictEqual(turnTip.getAttribute('data-visible'), 'false');
+
+  // Verify non-tail 1-turn piece ('open-step') puts fallback dot between before and after groups
+  convoViewEl.setAttribute('data-cascade-id', 'open-step');
+  await window.__jetskiChainNav.syncConversationChainNavigators();
+  const midFallback = convoRailSlot.querySelector('.jetski-chain-stars-fallback');
+  const midBefore = midFallback.querySelector('[data-testid="jetski-chain-stars-before"]');
+  const midAfter = midFallback.querySelector('[data-testid="jetski-chain-stars-after"]');
+  const midDot = midFallback.querySelector('[data-testid="jetski-fallback-turn-dot"]');
+  assert(midBefore && midDot && midAfter, 'Middle 1-turn piece must have before, dot, and after');
+  assert.strictEqual(midBefore.children.length, 2);
+  assert.strictEqual(midAfter.children.length, 1);
+  assert.strictEqual(midFallback.children[0], midBefore);
+  assert.strictEqual(midFallback.children[2], midAfter);
+
+  convoViewEl.setAttribute('data-cascade-id', 'open-current');
+  convoFooterEl.offsetHeight = 0;
+
+  // 6. Remount convoNavEl and verify sync removes fallback rail and resets zero footer bottom
   convoRailSlot.appendChild(convoNavEl);
   await window.__jetskiChainNav.syncConversationChainNavigators();
   assert.strictEqual(convoRailSlot.querySelector('.jetski-chain-stars-fallback'), null);
+  assert.strictEqual(convoRailSlot.querySelector('[data-testid="jetski-fallback-turn-dot"]'), null);
+  assert.strictEqual(convoRailSlot.style.bottom, '');
 
   // 7. Switch to standalone chat (chain.length === 1): all stars removed and sig cleared
   convoViewEl.setAttribute('data-cascade-id', 'solo-active');

@@ -113,6 +113,10 @@
   const CHAIN_STARS_BEFORE_TEST_ID = 'jetski-chain-stars-before';
   const CHAIN_STARS_AFTER_TEST_ID = 'jetski-chain-stars-after';
   const CHAIN_STARS_GROUP_CLASS = 'jetski-chain-stars-group';
+  const CHAIN_STARS_FALLBACK_CLASS = 'jetski-chain-stars-fallback';
+  const FALLBACK_TURN_WRAP_CLASS = 'jetski-fallback-turn-wrap';
+  const FALLBACK_TURN_DOT_CLASS = 'jetski-fallback-turn-dot';
+  const FALLBACK_TURN_DOT_TEST_ID = 'jetski-fallback-turn-dot';
   const CHAIN_STAR_BTN_CLASS = 'jetski-chain-star-btn';
   const ARCHIVE_BANNER_CLASS = 'jetski-archive-piece-banner';
   // Holds the read-only notice text so updating it does not wipe the jump button child node
@@ -6048,13 +6052,36 @@
         display: flex;
         flex-direction: column;
         align-items: center;
-        justify-content: center;
+        /* flex-start keeps top stars reachable at scrollTop 0 when long chains overflow */
+        justify-content: flex-start;
         gap: 2px;
         flex-shrink: 0;
+        overflow-y: auto;
+        overflow-x: hidden;
+        overscroll-behavior: contain;
+        scrollbar-width: none;
         pointer-events: auto;
         /* Remain visible when narrow-pane responsive rules apply invisible to nav */
         visibility: visible;
         z-index: 15;
+      }
+      .${CHAIN_STARS_GROUP_CLASS}::-webkit-scrollbar {
+        display: none;
+      }
+      /* Cap star groups so 15-40 piece chains cannot push or shrink turn dots out of the rail */
+      .jetski-chain-stars-before,
+      .jetski-chain-stars-after {
+        max-height: 22%;
+      }
+      [data-testid="conversation-navigator"]:not(:has(.jetski-chain-stars-after))
+        .jetski-chain-stars-before,
+      .${CHAIN_STARS_FALLBACK_CLASS}:not(:has(.jetski-chain-stars-after))
+        .jetski-chain-stars-before {
+        max-height: 44%;
+      }
+      /* Keep native turn-dot wrapper from collapsing when star groups fill their cap */
+      [data-testid="conversation-navigator"] > div.relative.flex.min-h-0.flex-col {
+        flex-shrink: 0;
       }
       /* Reserve vertical clearance for RailScrollButton (h-3.5) when turn list overflows */
       [data-testid="conversation-navigator"]:has(ol[data-fade="top"])
@@ -6073,15 +6100,65 @@
       .jetski-chain-stars-after::before {
         content: "";
         display: block;
+        flex-shrink: 0;
         width: 1.5px;
         height: 6px;
         background: rgba(156, 163, 175, 0.4);
         margin: 2px 0;
         border-radius: 1px;
       }
+      .${CHAIN_STARS_FALLBACK_CLASS} {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        pointer-events: none;
+        visibility: visible;
+        z-index: 15;
+      }
+      .${FALLBACK_TURN_WRAP_CLASS} {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        flex-shrink: 0;
+        pointer-events: auto;
+      }
+      /* Match native RailDot geometry (28x11 pitch, 6x6 circle, 0.55 resting opacity) */
+      .${FALLBACK_TURN_DOT_CLASS} {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 28px;
+        height: 11px;
+        padding: 0;
+        border: none;
+        background: none;
+        cursor: pointer;
+        outline: none;
+        opacity: 0.55;
+        transition: opacity 0.2s ease;
+      }
+      .${CHAIN_STARS_FALLBACK_CLASS}:hover .${FALLBACK_TURN_DOT_CLASS},
+      .${FALLBACK_TURN_DOT_CLASS}:hover,
+      .${FALLBACK_TURN_DOT_CLASS}:focus-visible {
+        opacity: 1;
+      }
+      .${FALLBACK_TURN_DOT_CLASS}-circle {
+        display: block;
+        width: 6px;
+        height: 6px;
+        border-radius: 9999px;
+        background: var(--foreground, #e8eaed);
+        transition: transform 0.2s ease, background-color 0.2s ease;
+      }
+      .${FALLBACK_TURN_DOT_CLASS}:hover .${FALLBACK_TURN_DOT_CLASS}-circle,
+      .${FALLBACK_TURN_DOT_CLASS}:focus-visible .${FALLBACK_TURN_DOT_CLASS}-circle {
+        transform: scale(1.25);
+      }
       .${CHAIN_STAR_BTN_CLASS} {
         background: none;
         border: none;
+        flex-shrink: 0;
         padding: 1px 3px;
         cursor: pointer;
         border-radius: 4px;
@@ -8892,6 +8969,58 @@
     return Boolean(sel && !sel.isCollapsed && sel.toString().trim());
   }
 
+  // Strips XML wrappers and auto-handoff headers from a user prompt without truncating it
+  function cleanUserStepPromptText(rawText) {
+    if (!rawText || typeof rawText !== 'string') return '';
+    let clean = rawText
+      .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, '')
+      .replace(/^<USER_REQUEST>[\s\r\n]*/i, '')
+      .replace(/[\s\r\n]*<\/USER_REQUEST>$/i, '')
+      .trim();
+    const contRe = new RegExp(
+      '^(?:continuing\\s+unfinished\\s+work\\s+from\\s+previous\\s+conversation[^\\n]*|' +
+        'continuing\\s+conversation:[^\\n]*|\\[handoff[^\\n]*)\\n*',
+      'i'
+    );
+    clean = clean
+      .replace(contRe, '')
+      .replace(
+        /\n*This prompt is auto-generated and does not set the chat language[^\n]*$/i,
+        ''
+      )
+      .trim();
+    return clean.startsWith('[CONTEXT GUARD') ? '' : clean;
+  }
+
+  // Jumps a conversation view to turn 0 via native navigator context when mounted, else scrollTop
+  function jumpToConversationTop(convoViewEl) {
+    if (!convoViewEl) return;
+    const viewport =
+      convoViewEl.querySelector('[data-testid="autoscroll-viewport"]') ||
+      convoViewEl.querySelector('.scrollbar-hide.overflow-y-auto');
+    if (viewport) {
+      const fiberKey = Object.keys(viewport).find(
+        (k) => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$')
+      );
+      let cur = fiberKey ? viewport[fiberKey] : null;
+      let depth = 0;
+      while (cur && depth < 40) {
+        const navVal = cur.memoizedProps?.value;
+        if (navVal && typeof navVal.jumpTo === 'function' && Array.isArray(navVal.turns)) {
+          if (navVal.jumpTo(0)) return;
+          break;
+        }
+        cur = cur.return;
+        depth++;
+      }
+    }
+    const target = viewport || convoViewEl;
+    target.scrollTop = 0;
+    if (typeof target.scrollTo === 'function') {
+      target.scrollTo({ top: 0 });
+    }
+  }
+
   // Renders all user prompts of the piece with progressive disclosure and gesture expansion
   async function showChainStarTooltip(
     btn,
@@ -8944,14 +9073,9 @@
       const steps = await fetchChainSteps(pieceCid);
       if (activeTooltipBtn !== btn || curSeq !== tooltipFetchSeq) return;
       const userQuestions = [];
-      // Strip handoff prefix and extract untruncated prompt text
       for (const s of steps) {
         if (s.type === 'CORTEX_STEP_TYPE_USER_INPUT' && s.userInput?.userResponse) {
-          let text = s.userInput.userResponse.trim();
-          text = text.replace(
-            /^(?:continuing\s+conversation:[^\n]+|\[handoff[^\n]+)\n+/i,
-            ''
-          ).trim();
+          const text = cleanUserStepPromptText(s.userInput.userResponse);
           if (text) userQuestions.push(text);
         }
       }
@@ -9056,6 +9180,228 @@
         triggerOnce(e);
       }
     });
+  }
+
+  // Shows a TurnHoverCard-equivalent preview for the single turn of a fallback rail piece
+  async function showFallbackTurnTooltip(btn, cid, convoViewEl) {
+    activeTooltipBtn = btn;
+    const tooltip = ensureChainStarTooltip();
+    if (!tooltip) return;
+    const rect =
+      typeof btn.getBoundingClientRect === 'function'
+        ? btn.getBoundingClientRect()
+        : { top: 40, right: 28, height: 11 };
+    const top = Math.max(10, (rect.top || 40) + (rect.height || 11) / 2 - 26);
+    const left = (rect.right || 28) + 12;
+    tooltip.style.top = `${top}px`;
+    tooltip.style.left = `${left}px`;
+
+    tooltip.innerHTML = '';
+    tooltip.textContent = '';
+    const previewEl = document.createElement('div');
+    previewEl.className = 'jetski-chain-steps-preview';
+    previewEl.style.fontSize = '11px';
+    previewEl.textContent = 'Loading message…';
+    tooltip.appendChild(previewEl);
+
+    const footerMetaEl = document.createElement('div');
+    footerMetaEl.style.fontSize = '10.5px';
+    footerMetaEl.style.color = 'var(--muted-foreground, #9aa0a6)';
+    footerMetaEl.style.marginTop = '4px';
+    footerMetaEl.textContent = '1 of 1';
+    tooltip.appendChild(footerMetaEl);
+    tooltip.setAttribute('data-visible', 'true');
+
+    const curSeq = ++tooltipFetchSeq;
+    try {
+      const steps = await fetchChainSteps(cid);
+      if (activeTooltipBtn !== btn || curSeq !== tooltipFetchSeq) return;
+      let promptText = '';
+      let replyPreview = '';
+      for (const s of steps) {
+        if (!promptText && s.type === 'CORTEX_STEP_TYPE_USER_INPUT') {
+          const raw =
+            s.userInput?.userResponse || s.userInput?.content || s.content || '';
+          promptText = cleanUserStepPromptText(raw);
+        } else if (s.type === 'CORTEX_STEP_TYPE_PLANNER_RESPONSE') {
+          const reply = (
+            s.plannerResponse?.modifiedResponse ||
+            s.plannerResponse?.response ||
+            s.content ||
+            ''
+          ).trim();
+          if (reply) replyPreview = reply;
+        }
+      }
+      if (previewEl.parentElement !== tooltip) return;
+      previewEl.textContent = '';
+
+      const rowEl = document.createElement('div');
+      rowEl.className = CHAIN_PROMPT_ROW_CLASS;
+      const textEl = document.createElement('span');
+      textEl.className = CHAIN_PROMPT_TEXT_CLASS;
+      textEl.textContent = promptText || 'No message text';
+      rowEl.appendChild(textEl);
+
+      const expandBtn = createTurnExpandButton('Toggle prompt expansion', () => {
+        togglePromptRowExpanded(rowEl, expandBtn, tooltip);
+      });
+      rowEl.appendChild(expandBtn);
+
+      rowEl.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        togglePromptRowExpanded(rowEl, expandBtn, tooltip);
+      });
+      rowEl.addEventListener('click', (e) => {
+        if (shouldIgnoreRowJumpClick(e, expandBtn)) return;
+        hideChainStarTooltip();
+        jumpToConversationTop(convoViewEl);
+      });
+      previewEl.appendChild(rowEl);
+
+      if (replyPreview) {
+        const replyEl = document.createElement('div');
+        replyEl.style.fontSize = '10.5px';
+        replyEl.style.color = 'var(--muted-foreground, #9aa0a6)';
+        replyEl.style.marginTop = '4px';
+        replyEl.style.wordBreak = 'break-word';
+        replyEl.textContent =
+          replyPreview.length > 220 ? `${replyPreview.slice(0, 217)}…` : replyPreview;
+        previewEl.appendChild(replyEl);
+      }
+    } catch {
+      if (activeTooltipBtn !== btn || curSeq !== tooltipFetchSeq) return;
+      if (previewEl.parentElement === tooltip) {
+        previewEl.textContent = "Couldn't load message";
+      }
+    }
+  }
+
+  function createFallbackTurnDotButton(cid, convoViewEl) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = FALLBACK_TURN_DOT_CLASS;
+    btn.setAttribute('data-testid', FALLBACK_TURN_DOT_TEST_ID);
+    btn.setAttribute('data-active', 'true');
+    btn.setAttribute('aria-label', 'Turn 1 of 1');
+    btn.setAttribute('aria-current', 'true');
+    const circle = document.createElement('span');
+    circle.className = `${FALLBACK_TURN_DOT_CLASS}-circle`;
+    circle.setAttribute('aria-hidden', 'true');
+    btn.appendChild(circle);
+
+    bindActionBtnHandlers(btn, () => {
+      hideChainStarTooltip();
+      jumpToConversationTop(convoViewEl);
+    });
+    btn.addEventListener('mouseenter', () => {
+      cancelHideChainStarTooltip();
+      void showFallbackTurnTooltip(btn, cid, convoViewEl);
+    });
+    btn.addEventListener('mouseleave', () => {
+      scheduleHideChainStarTooltip();
+    });
+    return btn;
+  }
+
+  // Keeps the rail slot above the bottom composer/banner footer so tall tail footers cannot
+  // shrink roomBelowCenter below MIN_RAIL_HEIGHT_PX and turn native turn dots invisible
+  function syncRailSlotBottomClearance(convoViewEl) {
+    const slot = convoViewEl?.querySelector(
+      '.pointer-events-none.absolute.inset-y-0.left-0.z-10.w-7'
+    );
+    if (!slot) return;
+    const anchor =
+      convoViewEl.querySelector('[data-testid="agent-input-box"]') ||
+      convoViewEl.querySelector('[data-testid="input-box-bottom-toolbar"]') ||
+      convoViewEl.querySelector(`.${ARCHIVE_BANNER_CLASS}`) ||
+      convoViewEl.querySelector('.min-h-\\[80px\\].rounded-2xl.bg-muted');
+    let footerRoot = anchor;
+    let depth = 0;
+    while (
+      footerRoot?.parentElement &&
+      footerRoot.parentElement !== convoViewEl &&
+      !footerRoot.parentElement.querySelector?.(
+        '[data-testid="autoscroll-viewport"], .scrollbar-hide.overflow-y-auto'
+      ) &&
+      depth < 16
+    ) {
+      footerRoot = footerRoot.parentElement;
+      depth++;
+    }
+    const footerH = Math.max(0, Math.round(Number(footerRoot?.offsetHeight) || 0));
+    const convoH = Number(convoViewEl.clientHeight) || 0;
+    const clampedH =
+      convoH > 0 ? Math.min(footerH, Math.max(0, convoH - 120)) : footerH;
+    const nextBottom = clampedH > 0 ? `${clampedH}px` : '';
+    if (slot.style.bottom !== nextBottom) {
+      slot.style.bottom = nextBottom;
+    }
+  }
+
+  // Renders leading/current stars before insertBeforeEl and descendant stars at container end
+  function populateChainStarGroups(containerEl, insertBeforeEl, chain, activeIdx, cid) {
+    let beforeGroup = containerEl.querySelector(`[data-testid="${CHAIN_STARS_BEFORE_TEST_ID}"]`);
+    if (!beforeGroup) {
+      beforeGroup = document.createElement('div');
+      beforeGroup.className = `${CHAIN_STARS_GROUP_CLASS} jetski-chain-stars-before`;
+      beforeGroup.setAttribute('data-testid', CHAIN_STARS_BEFORE_TEST_ID);
+    }
+    if (
+      insertBeforeEl &&
+      (beforeGroup.parentElement !== containerEl || containerEl.children?.[0] !== beforeGroup)
+    ) {
+      containerEl.insertBefore(beforeGroup, insertBeforeEl);
+    } else if (!beforeGroup.parentElement) {
+      containerEl.appendChild(beforeGroup);
+    }
+    while (beforeGroup.children?.length > 0) {
+      beforeGroup.children[0].remove();
+    }
+    for (let i = 0; i <= activeIdx; i++) {
+      const pieceCid = chain[i];
+      const isCur = i === activeIdx;
+      const isTl = i === chain.length - 1;
+      beforeGroup.appendChild(createStarButton(pieceCid, i, chain, isCur, isTl, cid));
+    }
+    // Pin the active star (last item in beforeGroup) next to turn dots when long chains overflow
+    const revealActiveStar = () => {
+      const sh = Number(beforeGroup.scrollHeight) || 0;
+      const ch = Number(beforeGroup.clientHeight) || 0;
+      if (sh > ch) {
+        beforeGroup.scrollTop = sh;
+        return true;
+      }
+      return ch > 0;
+    };
+    if (!revealActiveStar()) {
+      const timer = setTimeout(revealActiveStar, 0);
+      if (timer && typeof timer.unref === 'function') timer.unref();
+    }
+
+    const needsAfter = activeIdx < chain.length - 1;
+    let afterGroup = containerEl.querySelector(`[data-testid="${CHAIN_STARS_AFTER_TEST_ID}"]`);
+    if (needsAfter) {
+      if (!afterGroup) {
+        afterGroup = document.createElement('div');
+        afterGroup.className = `${CHAIN_STARS_GROUP_CLASS} jetski-chain-stars-after`;
+        afterGroup.setAttribute('data-testid', CHAIN_STARS_AFTER_TEST_ID);
+      }
+      if (afterGroup.parentElement !== containerEl || containerEl.lastChild !== afterGroup) {
+        containerEl.appendChild(afterGroup);
+      }
+      while (afterGroup.children?.length > 0) {
+        afterGroup.children[0].remove();
+      }
+      for (let i = activeIdx + 1; i < chain.length; i++) {
+        const pieceCid = chain[i];
+        const isTl = i === chain.length - 1;
+        afterGroup.appendChild(createStarButton(pieceCid, i, chain, false, isTl, cid));
+      }
+    } else if (afterGroup) {
+      afterGroup.remove();
+    }
   }
 
   function createStarButton(cid, idx, chain, isCurrent, isTail, sourceCid) {
@@ -9274,12 +9620,13 @@
       maybeAutoSwitchToSuccessor(cid, chainIndexCache?.redirects);
 
       syncConversationPieceLock(convoViewEl, cid, chain);
+      syncRailSlotBottomClearance(convoViewEl);
 
       if (chain.length <= 1) {
         for (const el of convoViewEl.querySelectorAll(
           `[data-testid="${CHAIN_STARS_BEFORE_TEST_ID}"], ` +
             `[data-testid="${CHAIN_STARS_AFTER_TEST_ID}"], ` +
-            '.jetski-chain-stars-fallback'
+            `.${CHAIN_STARS_FALLBACK_CLASS}`
         )) {
           el.remove();
         }
@@ -9296,12 +9643,12 @@
 
       // Key rendered star buttons by chain topology and active piece to preserve DOM identity
       const chainSig = `${chain.join(',')}@${cid}`;
+      const needsAfter = activeIdx < chain.length - 1;
       const nav = convoViewEl.querySelector('[data-testid="conversation-navigator"]');
       if (nav) {
-        convoViewEl.querySelector('.jetski-chain-stars-fallback')?.remove();
-        let beforeGroup = nav.querySelector(`[data-testid="${CHAIN_STARS_BEFORE_TEST_ID}"]`);
-        let afterGroup = nav.querySelector(`[data-testid="${CHAIN_STARS_AFTER_TEST_ID}"]`);
-        const needsAfter = activeIdx < chain.length - 1;
+        convoViewEl.querySelector(`.${CHAIN_STARS_FALLBACK_CLASS}`)?.remove();
+        const beforeGroup = nav.querySelector(`[data-testid="${CHAIN_STARS_BEFORE_TEST_ID}"]`);
+        const afterGroup = nav.querySelector(`[data-testid="${CHAIN_STARS_AFTER_TEST_ID}"]`);
         const currentSig = nav.getAttribute('data-jetski-chain-sig');
 
         // Skip re-rendering star buttons when chain structure has not changed
@@ -9315,80 +9662,56 @@
 
         nav.setAttribute('data-jetski-chain-sig', chainSig);
         const inner = nav.querySelector('.relative.flex.min-h-0.flex-col') || nav.children[0];
-
-        if (!beforeGroup) {
-          beforeGroup = document.createElement('div');
-          beforeGroup.className = `${CHAIN_STARS_GROUP_CLASS} jetski-chain-stars-before`;
-          beforeGroup.setAttribute('data-testid', CHAIN_STARS_BEFORE_TEST_ID);
-          if (inner) {
-            nav.insertBefore(beforeGroup, inner);
-          } else {
-            nav.appendChild(beforeGroup);
-          }
-        }
-        while (beforeGroup.children?.length > 0) {
-          beforeGroup.children[0].remove();
-        }
-        // Render leading and active chain pieces into the before-group container
-        for (let i = 0; i <= activeIdx; i++) {
-          const pieceCid = chain[i];
-          const isCur = i === activeIdx;
-          const isTl = i === chain.length - 1;
-          beforeGroup.appendChild(createStarButton(pieceCid, i, chain, isCur, isTl, cid));
-        }
-
-        if (needsAfter) {
-          if (!afterGroup) {
-            afterGroup = document.createElement('div');
-            afterGroup.className = `${CHAIN_STARS_GROUP_CLASS} jetski-chain-stars-after`;
-            afterGroup.setAttribute('data-testid', CHAIN_STARS_AFTER_TEST_ID);
-            nav.appendChild(afterGroup);
-          }
-          while (afterGroup.children?.length > 0) {
-            afterGroup.children[0].remove();
-          }
-          // Render descendant chain pieces into the after-group container
-          for (let i = activeIdx + 1; i < chain.length; i++) {
-            const pieceCid = chain[i];
-            const isCur = false;
-            const isTl = i === chain.length - 1;
-            afterGroup.appendChild(createStarButton(pieceCid, i, chain, isCur, isTl, cid));
-          }
-        } else if (afterGroup) {
-          afterGroup.remove();
-        }
+        populateChainStarGroups(nav, inner, chain, activeIdx, cid);
       } else {
-        convoViewEl.querySelector(`[data-testid="${CHAIN_STARS_BEFORE_TEST_ID}"]`)?.remove();
-        convoViewEl.querySelector(`[data-testid="${CHAIN_STARS_AFTER_TEST_ID}"]`)?.remove();
+        for (const orphan of convoViewEl.querySelectorAll(
+          `[data-testid="${CHAIN_STARS_BEFORE_TEST_ID}"], ` +
+            `[data-testid="${CHAIN_STARS_AFTER_TEST_ID}"]`
+        )) {
+          if (!orphan.closest?.(`.${CHAIN_STARS_FALLBACK_CLASS}`)) {
+            orphan.remove();
+          }
+        }
         const slot =
           convoViewEl.querySelector('.pointer-events-none.absolute.inset-y-0.left-0.z-10.w-7') ||
           convoViewEl;
-        let fallback = slot.querySelector('.jetski-chain-stars-fallback');
-        // Preserve fallback DOM buttons when chain signature is unchanged
-        if (fallback && fallback.getAttribute('data-jetski-chain-sig') === chainSig) {
+        let fallback = slot.querySelector(`.${CHAIN_STARS_FALLBACK_CLASS}`);
+        const fbBefore = fallback?.querySelector(`[data-testid="${CHAIN_STARS_BEFORE_TEST_ID}"]`);
+        const fbAfter = fallback?.querySelector(`[data-testid="${CHAIN_STARS_AFTER_TEST_ID}"]`);
+        const fbDot = fallback?.querySelector(`[data-testid="${FALLBACK_TURN_DOT_TEST_ID}"]`);
+        // Preserve fallback DOM buttons and single-turn dot when chain signature is unchanged
+        if (
+          fallback &&
+          fallback.getAttribute('data-jetski-chain-sig') === chainSig &&
+          fbBefore &&
+          fbDot &&
+          (needsAfter ? fbAfter : !fbAfter)
+        ) {
           continue;
         }
         if (!fallback) {
           fallback = document.createElement('div');
-          fallback.className = `${CHAIN_STARS_GROUP_CLASS} jetski-chain-stars-fallback`;
-          // Center fallback stars vertically inside the 28px rail slot when nav is unmounted
+          fallback.className = CHAIN_STARS_FALLBACK_CLASS;
+          // Span the full rail slot so star groups and the turn dot mirror native nav geometry
           fallback.style.position = 'absolute';
+          fallback.style.top = '0';
+          fallback.style.bottom = '0';
           fallback.style.left = '0';
           fallback.style.width = '28px';
-          fallback.style.top = '50%';
-          fallback.style.transform = 'translateY(-50%)';
           slot.appendChild(fallback);
         }
         fallback.setAttribute('data-jetski-chain-sig', chainSig);
-        while (fallback.children?.length > 0) {
-          fallback.children[0].remove();
+        let turnWrap = fallback.querySelector(`.${FALLBACK_TURN_WRAP_CLASS}`);
+        if (!turnWrap) {
+          turnWrap = document.createElement('div');
+          turnWrap.className = FALLBACK_TURN_WRAP_CLASS;
+          fallback.appendChild(turnWrap);
         }
-        for (let i = 0; i < chain.length; i++) {
-          const pieceCid = chain[i];
-          const isCur = i === activeIdx;
-          const isTl = i === chain.length - 1;
-          fallback.appendChild(createStarButton(pieceCid, i, chain, isCur, isTl, cid));
+        while (turnWrap.children?.length > 0) {
+          turnWrap.children[0].remove();
         }
+        turnWrap.appendChild(createFallbackTurnDotButton(cid, convoViewEl));
+        populateChainStarGroups(fallback, turnWrap, chain, activeIdx, cid);
       }
     }
   }
@@ -12083,24 +12406,8 @@
         Boolean(step.plannerResponse);
 
       if (isUser && content) {
-        let clean = content
-          .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, '')
-          .replace(/^<USER_REQUEST>[\s\r\n]*/i, '')
-          .replace(/[\s\r\n]*<\/USER_REQUEST>$/i, '')
-          .trim();
-        const contRe = new RegExp(
-          '^(?:continuing\\s+unfinished\\s+work\\s+from\\s+previous\\s+conversation[^\\n]*|' +
-            'continuing\\s+conversation:[^\\n]*|\\[handoff[^\\n]*)\\n*',
-          'i'
-        );
-        clean = clean
-          .replace(contRe, '')
-          .replace(
-            /\n*This prompt is auto-generated and does not set the chat language[^\n]*$/i,
-            ''
-          )
-          .trim();
-        if (clean && !clean.startsWith('[CONTEXT GUARD')) {
+        const clean = cleanUserStepPromptText(content);
+        if (clean) {
           userPrompts.push(clean.length > 280 ? `${clean.slice(0, 277)}...` : clean);
         }
       }
@@ -13747,6 +14054,9 @@
         target.className === SEARCH_BTN_CLASS ||
         target.className === LOCATE_BTN_CLASS ||
         target.className === CHAIN_STARS_GROUP_CLASS ||
+        target.className === CHAIN_STARS_FALLBACK_CLASS ||
+        target.className === FALLBACK_TURN_WRAP_CLASS ||
+        target.className === FALLBACK_TURN_DOT_CLASS ||
         target.className === CHAIN_STAR_BTN_CLASS ||
         // Ignore mutations on prompt list and expand buttons to avoid feedback loops
         target.className === TURN_EXPAND_BTN_CLASS ||
@@ -13780,6 +14090,8 @@
             target.closest(`.${PROJECT_ROADMAP_BADGE_CLASS}`) ||
             target.closest(`.${LOCATE_BTN_CLASS}`) ||
             target.closest(`.${CHAIN_STARS_GROUP_CLASS}`) ||
+            target.closest(`.${CHAIN_STARS_FALLBACK_CLASS}`) ||
+            target.closest(`.${FALLBACK_TURN_DOT_CLASS}`) ||
             target.closest(`.${ARCHIVE_BANNER_CLASS}`) ||
             // Skip subtree mutations inside turn cards and prompt expand controls
             target.closest(`.${TURN_EXPAND_BTN_CLASS}`) ||
@@ -13914,6 +14226,7 @@
       `.${LOCATE_BTN_CLASS}`,
       `#${SEARCH_PANEL_ID}`,
       `.${CHAIN_STARS_GROUP_CLASS}`,
+      `.${CHAIN_STARS_FALLBACK_CLASS}`,
       `.${ARCHIVE_BANNER_CLASS}`,
       `#${STAR_TOOLTIP_ID}`,
       `#${AUTOPILOT_TOAST_ID}`,
@@ -13927,6 +14240,11 @@
     ].join(', ');
     for (const el of document.querySelectorAll(cleanupSelector)) {
       el.remove();
+    }
+    for (const slot of document.querySelectorAll(
+      '.pointer-events-none.absolute.inset-y-0.left-0.z-10.w-7'
+    )) {
+      if (slot.style) slot.style.bottom = '';
     }
     const fdDrawer = document.getElementById(FLIGHT_DECK_DRAWER_ID);
     // Cancel open-drawer liveness timer when tearing down the injected filter instance
