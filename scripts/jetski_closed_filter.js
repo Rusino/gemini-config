@@ -220,15 +220,8 @@
     'stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round">' +
     '<path d="M2.5 1.75h7M2.5 10.25h7M6 3.5v5M4.25 5L6 3.25 7.75 5M4.25 7L6 8.75 7.75 7"/>' +
     '</svg>';
-  // Inward vertical arrows toward center bar for restore-saved-height state
-  const INBOX_RESTORE_ICON_SVG =
-    '<svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" ' +
-    'stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round">' +
-    '<path d="M2.5 6h7M6 1.5v3M4.25 3L6 4.75 7.75 3M6 10.5v-3M4.25 9L6 7.25 7.75 9"/>' +
-    '</svg>';
 
   let inboxFitted = false;
-  let savedInboxHeightBeforeFitPx = null;
   let lastRenderedInboxItems = [];
 
   // Computes max height when fitting inbox to content so bottom project list remains accessible
@@ -10256,19 +10249,10 @@
         inboxCollapsed = false;
         safeSetStorage(STORAGE_INBOX_COLLAPSED_KEY, 'false');
       }
-      if (!inboxFitted) {
-        // Snapshot manual height before fitting without overwriting persisted storage height
-        savedInboxHeightBeforeFitPx = inboxListHeightPx;
-        inboxFitted = true;
-        const targetH = computeInboxFitHeightPx(el, listContainer, lastRenderedInboxItems);
-        applyInboxListHeight(el, listContainer, targetH, false, true);
-      } else {
-        // Restore previous manual height and exit fitted mode
-        const restoreH = savedInboxHeightBeforeFitPx ?? loadInboxHeight();
-        inboxFitted = false;
-        savedInboxHeightBeforeFitPx = null;
-        applyInboxListHeight(el, listContainer, restoreH, true, false);
-      }
+      // Always fit height directly to content without toggling into a restore state
+      inboxFitted = true;
+      const targetH = computeInboxFitHeightPx(el, listContainer, lastRenderedInboxItems);
+      applyInboxListHeight(el, listContainer, targetH, false, true);
       ensureNeedsReactionInbox();
       const label = fitBtn.getAttribute('aria-label');
       if (label) {
@@ -10323,7 +10307,6 @@
       e.stopPropagation();
       // Manual drag resize exits fitted mode so the user's custom height takes over
       inboxFitted = false;
-      savedInboxHeightBeforeFitPx = null;
       const startY = Number(e.clientY) || 0;
       const startHeight = inboxListHeightPx;
       resizeHandle.setAttribute('data-dragging', 'true');
@@ -10368,7 +10351,6 @@
       e.stopPropagation();
       // Double-click reset returns to default 90px height and clears fitted mode
       inboxFitted = false;
-      savedInboxHeightBeforeFitPx = null;
       applyInboxListHeight(el, listContainer, INBOX_DEFAULT_HEIGHT_PX, true);
       // Re-render inbox to sync header fit-button icons and tooltip after reset
       ensureNeedsReactionInbox();
@@ -10745,35 +10727,23 @@
     // Sync fit button icon and dynamic aria-label without auto-resizing on tab switch
     const fitBtn = inboxEl.querySelector(`.${INBOX_FIT_BTN_CLASS}`);
     if (fitBtn) {
-      // Show restore state when currently fitted to content
-      if (inboxFitted) {
-        setAttrIfChanged(fitBtn, 'data-fitted', 'true');
-        setAttrIfChanged(fitBtn, 'data-icon', 'restore');
-        const prevH = savedInboxHeightBeforeFitPx ?? INBOX_DEFAULT_HEIGHT_PX;
-        setAttrIfChanged(fitBtn, 'aria-label', `Restore previous height (${prevH}px)`);
-        if (fitBtn.innerHTML !== INBOX_RESTORE_ICON_SVG) {
-          fitBtn.innerHTML = INBOX_RESTORE_ICON_SVG;
-        }
-      } else {
-        // Show fit state with preview label based on target content height
-        setAttrIfChanged(fitBtn, 'data-fitted', 'false');
-        setAttrIfChanged(fitBtn, 'data-icon', 'fit');
-        const listContainer = inboxEl.querySelector(`.${INBOX_LIST_CLASS}`);
-        const previewFitH = computeInboxFitHeightPx(inboxEl, listContainer, currentTabItems);
-        const n = currentTabItems.length;
-        const noun = n === 1 ? 'chat' : 'chats';
-        let fitLabel = `Fit height to all ${n} ${noun}`;
-        if (n === 0) {
-          fitLabel = 'Fit height to section (empty)';
-        } else if (previewFitH > inboxListHeightPx) {
-          fitLabel = `Expand height to show all ${n} ${noun}`;
-        } else if (previewFitH < inboxListHeightPx) {
-          fitLabel = `Shrink height to fit ${n} ${noun}`;
-        }
-        setAttrIfChanged(fitBtn, 'aria-label', fitLabel);
-        if (fitBtn.innerHTML !== INBOX_FIT_ICON_SVG) {
-          fitBtn.innerHTML = INBOX_FIT_ICON_SVG;
-        }
+      setAttrIfChanged(fitBtn, 'data-fitted', inboxFitted ? 'true' : 'false');
+      setAttrIfChanged(fitBtn, 'data-icon', 'fit');
+      const listContainer = inboxEl.querySelector(`.${INBOX_LIST_CLASS}`);
+      const previewFitH = computeInboxFitHeightPx(inboxEl, listContainer, currentTabItems);
+      const n = currentTabItems.length;
+      const noun = n === 1 ? 'chat' : 'chats';
+      let fitLabel = `Fit height to all ${n} ${noun}`;
+      if (n === 0) {
+        fitLabel = 'Fit height to section (empty)';
+      } else if (previewFitH > inboxListHeightPx) {
+        fitLabel = `Expand height to show all ${n} ${noun}`;
+      } else if (previewFitH < inboxListHeightPx) {
+        fitLabel = `Shrink height to fit ${n} ${noun}`;
+      }
+      setAttrIfChanged(fitBtn, 'aria-label', fitLabel);
+      if (fitBtn.innerHTML !== INBOX_FIT_ICON_SVG) {
+        fitBtn.innerHTML = INBOX_FIT_ICON_SVG;
       }
       // Clear native tooltip in favor of floating bubble
       if (fitBtn.hasAttribute('title')) {
