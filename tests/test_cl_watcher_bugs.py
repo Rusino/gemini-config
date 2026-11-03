@@ -2011,6 +2011,145 @@ vm.runInThisContext(scriptContent + '\n' + harness);
     # Despite 2 busy self-CL chats and 2 records sharing 1 reviewer chat, P0 starts first
     self.assertEqual(started_keys, ["buganizer:580955594"])
 
+  def test_skoretext_only_external_bugs_never_enter_needs_you_or_autostart_triage(
+      self,
+  ) -> None:
+    now_ts = w._parse_ts("2026-11-03T20:30:00Z")
+    cl_ts = w._parse_ts("2026-11-03T18:00:00Z")
+    items: dict[str, dict[str, object]] = {
+        "gerrit:1382196@unchatted": {
+            "item_key": "gerrit:1382196",
+            "kind": "gerrit",
+            "target_id": "1382196",
+            "status": "NEW",
+            "is_self": True,
+            "is_wip": True,
+            "activity_ts": cl_ts,
+            "subject": "[SkoreText] DO NOT SUBMIT: Add opt-in CoreText layout pipeline",
+            "linked_bug_keys": [
+                "gh_issue:flutter/flutter#109308",
+                "gh_issue:flutter/flutter#18915",
+            ],
+            "project_name": "SkoreText",
+        },
+        "gerrit:1411678@unchatted": {
+            "item_key": "gerrit:1411678",
+            "kind": "gerrit",
+            "target_id": "1411678",
+            "status": "MERGED",
+            "is_self": True,
+            "is_wip": False,
+            "submitted_ts": cl_ts,
+            "activity_ts": cl_ts,
+            "subject": "[SkoreText] Follow font size with the opsz axis in SkParagraph",
+            "linked_bug_keys": ["buganizer:524646"],
+            "project_name": "SkoreText",
+        },
+    }
+    bugs: dict[str, dict[str, object]] = {
+        "gh_issue:flutter/flutter#109308": {
+            "bug_key": "gh_issue:flutter/flutter#109308",
+            "source": "github",
+            "id": "109308",
+            "short_id": "flutter#109308",
+            "status": "OPEN",
+            "priority": "P2",
+            "assignee": "",
+            "from_self_query": False,
+            "is_collaborator": False,
+            "is_mentioned": False,
+            "created_time": "2022-08-10T13:07:40Z",
+            "modified_time": "2026-11-03T19:00:00Z",
+            "last_human_comment_author": "external-user",
+            "last_human_comment_at": "2026-11-03T19:00:00Z",
+            "last_human_comment_snippet": "@Rusino any update on variable fonts?",
+            "last_self_comment_at": "2024-05-01T10:00:00Z",
+        },
+        "gh_issue:flutter/flutter#18915": {
+            "bug_key": "gh_issue:flutter/flutter#18915",
+            "source": "github",
+            "id": "18915",
+            "short_id": "flutter#18915",
+            "status": "NEW",
+            "priority": "P1",
+            "assignee": "",
+            "from_self_query": False,
+            "is_collaborator": False,
+            "is_mentioned": False,
+            "created_time": "2026-11-02T12:00:00Z",
+            "modified_time": "2026-11-02T12:00:00Z",
+            "last_human_comment_author": "",
+            "last_human_comment_at": "",
+            "last_human_comment_snippet": "",
+            "last_self_comment_at": "",
+        },
+        "buganizer:524646": {
+            "bug_key": "buganizer:524646",
+            "source": "buganizer",
+            "id": "524646",
+            "short_id": "b/524646",
+            "status": "ASSIGNED",
+            "priority": "P2",
+            "assignee": "peterltq@google.com",
+            "is_collaborator": False,
+            "is_mentioned": False,
+            "created_time": "2024-01-10T10:00:00Z",
+            "modified_time": "2026-11-03T18:00:00Z",
+        },
+    }
+    w.link_bugs_and_cls(bugs, items, bug_chats={})
+
+    for bkey in bugs:
+      b = bugs[bkey]
+      w.classify_bug_status(b, now_ts=now_ts)
+      self.assertFalse(b["needs_you"], bkey)
+      self.assertEqual(b["lane"], "has_cl", bkey)
+      self.assertFalse(w.should_autostart_bug_triage(b), bkey)
+      # Defense in depth when should_autostart_bug_triage receives a stale needs_you=True dict
+      self.assertFalse(w.should_autostart_bug_triage({**b, "needs_you": True}), bkey)
+
+    # Assigning the issue to Rusino restores normal owner Needs You and triage autostart
+    assigned_109308 = {**bugs["gh_issue:flutter/flutter#109308"], "assignee": "Rusino"}
+    w.classify_bug_status(assigned_109308, now_ts=now_ts)
+    self.assertTrue(assigned_109308["needs_you"])
+    self.assertTrue(w.should_autostart_bug_triage(assigned_109308))
+
+    # Even with a stale pre-existing chat_id, sync_bugs_into_state never wakes SkoreText-only bugs
+    woken: list[str] = []
+    sync_state: dict[str, object] = {
+        "items": items,
+        "bugs": {
+            "gh_issue:flutter/flutter#109308": {
+                **bugs["gh_issue:flutter/flutter#109308"],
+                "conversation_id": "cid-stale-109308",
+                "chat_archived": False,
+                "last_human_comment_at": "2026-08-06T09:22:38Z",
+            }
+        },
+        "review_claims": {},
+        "events": [],
+    }
+    fresh_gh = [{
+        **bugs["gh_issue:flutter/flutter#109308"],
+        "last_human_comment_at": "2026-11-03T20:00:00Z",
+    }]
+    with mock.patch.object(
+        w, "call_buganizer_mcp_batch", return_value=["", "", ""]
+    ), mock.patch.object(
+        w, "fetch_github_bugs", return_value=fresh_gh
+    ), mock.patch.object(
+        w, "discover_bug_chats", return_value={}
+    ), mock.patch.object(
+        w, "wake_conversation", side_effect=lambda cid, _msg: woken.append(cid)
+    ):
+      w.sync_bugs_into_state(
+          sync_state,
+          force=True,
+          wake_chats=True,
+          proj_names={"proj-skore": "SkoreText", "proj-skp": "SkParagraph"},
+      )
+    self.assertEqual(woken, [])
+
 
 if __name__ == "__main__":
   unittest.main()

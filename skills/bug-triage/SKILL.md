@@ -101,4 +101,5 @@ When Outcome 1 or 2 applies:
    - Verification attestation (test results, corpus results).
 2. **Draft English Reply for the Issue**:
    - Provide a concise, professional technical reply ready to be pasted or published to Buganizer/GitHub.
+   - **Confidentiality Guard**: Never mention `SkoreText` or cite/link `[SkoreText]` Gerrit CLs in external issue trackers, GitHub issues/PRs, public Buganizer/crbug comments, or external review replies until the user explicitly lifts this restriction.
    - **Never auto-publish or post comments to the issue tracker without explicit user confirmation.**

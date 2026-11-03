@@ -72,3 +72,4 @@ Code has a compiler; prose documents do not, and incoming specs or code snippets
 - **No Paraphrased Identifiers**: Never reconstruct file paths or skill/target names from prose headings.
 - **No Unbacked Mechanism Claims**: Never state how a parser, build system, or runtime works without reading `file:line`.
 - **Zero Leftover Scaffolding**: Never leave generation placeholders (`[find link]`, `[insert ...]`, `TBD`, `TODO`, `(AI evaluation...)`, or empty markdown links) in any delivered text.
+- **No External `SkoreText` Disclosure**: Never mention `SkoreText` or link `[SkoreText]` Gerrit CLs in external trackers, GitHub issues/PRs, public Buganizer/crbug comments, or external review replies until the user explicitly lifts this restriction.

@@ -8870,6 +8870,7 @@ def link_bugs_and_cls(
             "target_id": tid,
             "label": lbl,
             "subject": str(rec.get("subject") or lbl),
+            "project_name": str(rec.get("project_name") or ""),
             "url": str(rec.get("url") or ""),
             "status": str(rec.get("status") or "NEW").upper(),
             "branch": str(rec.get("branch") or ""),
@@ -10102,6 +10103,36 @@ def confirm_security_merge_group(
   }
 
 
+def _is_skoretext_cl_entry(entry: dict[str, Any]) -> bool:
+  """Returns True when a CL record or linked_cls subtask belongs to SkoreText."""
+  if not isinstance(entry, dict):
+    return False
+  if str(entry.get("project_name") or "").strip().lower() == "skoretext":
+    return True
+  subj = str(entry.get("subject") or "").lstrip().lower()
+  return subj.startswith("[skoretext") or "[skoretext]" in subj
+
+
+def _is_skoretext_cl_only_external_bug(bug: dict[str, Any]) -> bool:
+  """Returns True when an unowned external bug is linked exclusively via SkoreText CLs."""
+  if not isinstance(bug, dict):
+    return False
+  if _is_self_bug_assignee(str(bug.get("assignee") or "")):
+    return False
+  if (
+      bool(bug.get("is_collaborator"))
+      or bool(bug.get("from_self_query"))
+      or bool(bug.get("is_mentioned"))
+  ):
+    return False
+  linked_cls = [c for c in (bug.get("linked_cls") or []) if isinstance(c, dict)]
+  if not linked_cls:
+    return False
+  self_cls = [c for c in linked_cls if bool(c.get("is_self"))]
+  relevant = self_cls if self_cls else linked_cls
+  return all(_is_skoretext_cl_entry(c) for c in relevant)
+
+
 def classify_bug_status(
     bug: dict[str, Any], now_ts: float | None = None
 ) -> dict[str, Any]:
@@ -10144,6 +10175,22 @@ def classify_bug_status(
       "CLOSED",
   ):
     bug["lane"] = "closed"
+    return bug
+
+  linked_cls = [c for c in (bug.get("linked_cls") or []) if isinstance(c, dict)]
+  has_cl = len(linked_cls) > 0
+  only_wip_cls = has_cl and all(bool(c.get("is_wip")) for c in linked_cls)
+  real_statuses = [str(c.get("status") or "").upper() for c in linked_cls]
+  all_cls_merged = has_cl and all(s == "MERGED" for s in real_statuses)
+  latest_merged_ts = max(
+      (float(c.get("submitted_ts") or 0.0) for c in linked_cls),
+      default=0.0,
+  )
+  bug["latest_cl_merged_ts"] = latest_merged_ts
+
+  # SkoreText CL Bug: trailers track coverage privately and never trigger external triage or closure
+  if not is_merge_req and _is_skoretext_cl_only_external_bug(bug):
+    bug["lane"] = "has_cl"
     return bug
 
   # Check Due Date and active SLO deadlines; ignore Assignment SLO once already ASSIGNED
@@ -10189,17 +10236,6 @@ def classify_bug_status(
       bug["slo_summary"] = overdue_notes[0]
     elif soon_notes:
       bug["slo_summary"] = soon_notes[0]
-
-  linked_cls = [c for c in (bug.get("linked_cls") or []) if isinstance(c, dict)]
-  has_cl = len(linked_cls) > 0
-  only_wip_cls = has_cl and all(bool(c.get("is_wip")) for c in linked_cls)
-  real_statuses = [str(c.get("status") or "").upper() for c in linked_cls]
-  all_cls_merged = has_cl and all(s == "MERGED" for s in real_statuses)
-  latest_merged_ts = max(
-      (float(c.get("submitted_ts") or 0.0) for c in linked_cls),
-      default=0.0,
-  )
-  bug["latest_cl_merged_ts"] = latest_merged_ts
 
   acked_ts = float(bug.get("acked_ts") or 0.0)
   self_lower = {e.lower() for e in SELF_BUG_EMAILS} | {
@@ -10391,6 +10427,9 @@ def should_autostart_bug_triage(bug: dict[str, Any]) -> bool:
     return False
   # Unassigned @Rusino GitHub mentions surface passively without spawning LLM chats
   if bool(bug.get("is_mentioned")):
+    return False
+  # Confidential SkoreText CL Bug: references never spawn external bug-triage chats
+  if _is_skoretext_cl_only_external_bug(bug):
     return False
   if bug.get("conversation_id") or not bug.get("needs_you"):
     return False
@@ -11176,8 +11215,8 @@ def sync_bugs_into_state(
   auto_started_bugs = 0
 
   for bkey, bug in retained_bugs.items():
-    # Security merge requests are handled via the grouped merge card, not bug-triage chats
-    if bug.get("is_security_merge_request"):
+    # Security merge requests and SkoreText-only external bugs skip bug-triage chat wakeups
+    if bug.get("is_security_merge_request") or _is_skoretext_cl_only_external_bug(bug):
       continue
     prev_b = prev_bugs.get(bkey) if isinstance(prev_bugs.get(bkey), dict) else {}
     # Wake active bug chat when a new human comment arrives upstream

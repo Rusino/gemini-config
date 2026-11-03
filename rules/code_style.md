@@ -38,6 +38,10 @@ description: "Skia-style C++ minimalism and suppression of LLM coding reflexes."
   `[SkoreText] [1/6] Add CoreText build flag and CoreTextIndexMap`,
   `[SkoreText] DO NOT SUBMIT: ...`). Do not apply `[SkoreText]` to companion review CLs on
   external authors' changes or to CLs in other projects
+- **`SkoreText` External Confidentiality**: Never mention, cite, or link `SkoreText` (or any
+  `[SkoreText]` Gerrit CLs, e.g., `Gerrit 1382196`, `Gerrit 1383896`, `Gerrit 1389816`,
+  `Gerrit 1411678`) in external issue trackers, GitHub issues/PRs, public Buganizer/crbug
+  comments, or external code reviews until the user explicitly lifts this restriction
 - **AI-assisted CL attribution**: Any CL, PR, or commit prepared with AI assistance (with user direction/participation) must include an `Assisted-by:` trailer in the commit summary footer, separated from the body by an empty line and placed right before `Change-Id:`:
   ```gitcommit
   Problem description and fix explanation.
