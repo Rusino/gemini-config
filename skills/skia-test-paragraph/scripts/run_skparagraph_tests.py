@@ -117,14 +117,12 @@ def parse_ninja_actions(ninja_log_path: pathlib.Path) -> str:
 
 
 def checkout_ref(repo: pathlib.Path, ref: str, worktree_patch: Optional[pathlib.Path]) -> None:
-    # Reset dirty state in monitored source subtrees before switching refs
-    for subdir in SOURCE_HASH_DIRS:
-        if (repo / subdir).exists():
-            subprocess.run(
-                ["git", "-C", str(repo), "checkout", "--", subdir],
-                capture_output=True,
-                check=False,
-            )
+    # Reset dirty state in all tracked files before switching refs
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "--", "."],
+        capture_output=True,
+        check=False,
+    )
 
     if ref == "WORKTREE":
         if worktree_patch and worktree_patch.exists() and worktree_patch.stat().st_size > 0:
