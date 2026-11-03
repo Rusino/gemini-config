@@ -24,14 +24,4 @@ close, set the field and the status together, without asking separately.
 - **No Gerrit change rolls into Chromium**: value `NA`.
 - **Scope**: field lives under component `1363614` (Chromium), so it applies to crbug issues,
   mainly Issue Type `VULNERABILITY`. Skip it on bugs where the field does not exist.
-- **How** (Buganizer MCP over LOAS, read back to confirm):
-  ```python
-  import sys; sys.path.insert(0, "/usr/local/google/home/jlavrova/.gemini/config/scripts")
-  from cl_watcher import call_buganizer_mcp_batch as call
-  print(call([
-      ("set_issue_custom_field", {"issueId": "<ID>", "customFieldId": "1358989",
-                                  "customFieldValue": "<gerrit url>"}),
-      ("update_issue_status", {"issueId": "<ID>", "status": "FIXED"}),
-      ("get_bugs_with_external", {"query": "id:<ID>", "maxResults": 1, "verbose": True}),
-  ]))
-  ```
+- **How**: Run `python3 ~/.gemini/config/scripts/bug_actions.py close_fixed <ID> <gerrit_url>`

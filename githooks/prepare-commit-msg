@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+
+# prepare-commit-msg hook to enforce SkoreText prefix and AI Assisted-by trailer
+
+COMMIT_MSG_FILE=$1
+COMMIT_SOURCE=$2
+SHA1=$3
+
+# Only modify the message if it's a new commit (no source) or a template
+if [[ -z "$COMMIT_SOURCE" || "$COMMIT_SOURCE" == "template" ]]; then
+    # 1. Add [SkoreText] prefix if in SkoreText project or specific path
+    PWD_PATH=$(pwd)
+    if [[ "$PWD_PATH" == *"/SkoreText"* || "$PWD_PATH" == *"/Users/jlavrova/Sources"* ]]; then
+        # Read the current message
+        MSG=$(cat "$COMMIT_MSG_FILE")
+        # Check if it doesn't already start with [SkoreText]
+        if [[ ! "$MSG" == "[SkoreText] "* && ! "$MSG" == "Merge "* ]]; then
+            echo "[SkoreText] $MSG" > "$COMMIT_MSG_FILE"
+        fi
+    fi
+
+    # 2. Add Assisted-by trailer
+    TRAILER=$(python3 ~/.gemini/config/hooks/chat_lifecycle.py model --trailer 2>/dev/null)
+    if [[ -n "$TRAILER" ]]; then
+        # Ensure it doesn't already exist
+        if ! grep -q "^Assisted-by:" "$COMMIT_MSG_FILE"; then
+            # We want to put it right before Change-Id: if it exists, or at the end
+            if grep -q "^Change-Id:" "$COMMIT_MSG_FILE"; then
+                sed -i -e "/^Change-Id:/i \\
+$TRAILER\\
+" "$COMMIT_MSG_FILE"
+            else
+                echo "" >> "$COMMIT_MSG_FILE"
+                echo "$TRAILER" >> "$COMMIT_MSG_FILE"
+            fi
+        fi
+    fi
+fi

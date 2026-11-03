@@ -27,16 +27,7 @@ actions and never run autonomously):
   1358989) on the parent bug is non-empty; every other CL on the parent touches only `tests/`;
   >= 24h Canary soak; no revert on `main`; clean trial `git cherry-pick -x` onto `chrome/m<NN>`;
   `OS` (field 1223084) checked against the parent).
-- **Sequential write & verification order** (`call_buganizer_mcp_batch` pipelines requests within a
-  single batch, so keep dependent mutations in separate sequential calls):
-  1. **Batch 1 (comment + collaborator)**: `add_buganizer_comment` (`issueId`, `commentMarkdown`)
-     and `safe_add_collaborator` (`issueId`, `collaborator: "jlavrova@google.com"`). Adding
-     `jlavrova@google.com` as Collaborator satisfies `SafeReassignIssue` removal checks and keeps
-     the issue in Flight Deck's `collaborator:jlavrova@google.com` query after reassignment.
-  2. **Batch 2 (reassign)**: `safe_reassign_issue` (`issueId`, `assignee: "merges@chromium.org"`).
-  3. **Batch 3 (read-back)**: `get_bugs_with_external` (`id:<ID1> OR id:<ID2>`, `verbose: True`)
-     and `get_user_access` (`issueId`, `relation: "writer"`) to confirm `Assignee` is
-     `merges@chromium.org` and `jlavrova` retains edit access.
+- **Sequential write & verification order**: Run `python3 ~/.gemini/config/scripts/bug_actions.py reassign_merge <ID>`
 - **Fallback (never bypass `SafeReassignIssue`)**: If `safe_reassign_issue` fails for any issue IDs
   (for example, if `SafeReassignIssue` rejects `merges@chromium.org` on edit-access validation),
   report the exact error and open/return a **single** Buganizer bulk-query URL

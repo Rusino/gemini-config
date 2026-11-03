@@ -75,6 +75,7 @@ DEFAULT_STATE_FILE = os.path.expanduser(
     "~/.gemini/config/logs/cl_watcher_state.json"
 )
 STATE_FILE = DEFAULT_STATE_FILE
+_SYNC_LOCK = threading.Lock()
 # Non-zero only inside serve_forever so CLI runs never clobber the live daemon's ui_version
 _SERVING_PORT = 0
 
@@ -810,26 +811,28 @@ def sweep_processed_gmail_for_record(
 
 
 def load_watcher_state() -> dict[str, Any]:
-  try:
-    if os.path.isfile(STATE_FILE):
-      with open(STATE_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-      if isinstance(data, dict):
-        return data
-  except Exception:
-    pass
-  return {"items": {}, "events": [], "last_sync": ""}
+  with _SYNC_LOCK:
+    try:
+      if os.path.isfile(STATE_FILE):
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+          data = json.load(f)
+        if isinstance(data, dict):
+          return data
+    except Exception:
+      pass
+    return {"items": {}, "events": [], "last_sync": ""}
 
 
 def save_watcher_state(state: dict[str, Any]) -> None:
-  try:
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    tmp = f"{STATE_FILE}.tmp.{os.getpid()}"
-    with open(tmp, "w", encoding="utf-8") as f:
-      json.dump(state, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, STATE_FILE)
-  except Exception:
-    pass
+  with _SYNC_LOCK:
+    try:
+      os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+      tmp = f"{STATE_FILE}.tmp.{os.getpid()}"
+      with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+      os.replace(tmp, STATE_FILE)
+    except Exception:
+      pass
   # Avoid overwriting live daemon discovery metadata from mocked tests or non-serving CLI runs
   if STATE_FILE == DEFAULT_STATE_FILE and (
       _SERVING_PORT > 0 or not os.path.isfile(FLIGHT_DECK_INFO_FILE)
@@ -7147,14 +7150,17 @@ def abandon_companion_items(
         resolved_total += int(res_comments.get("resolved_count") or 0)
 
     elif kind == "github":
+      gh_repo_slug = str(rec.get("repo_slug") or rec.get("preferred_host") or "flutter/flutter").strip()
+      if gh_repo_slug.startswith("github.com/"):
+        gh_repo_slug = gh_repo_slug[len("github.com/") :]
       cmd = [
-          "gh", "pr", "close", tid, "--repo", "flutter/flutter", "--delete-branch"
+          "gh", "pr", "close", tid, "--repo", gh_repo_slug, "--delete-branch"
       ]
       proc = subprocess.run(
           cmd, capture_output=True, text=True, timeout=15, check=False
       )
       if proc.returncode != 0:
-        cmd_fallback = ["gh", "pr", "close", tid, "--repo", "flutter/flutter"]
+        cmd_fallback = ["gh", "pr", "close", tid, "--repo", gh_repo_slug]
         proc2 = subprocess.run(
             cmd_fallback, capture_output=True, text=True, timeout=15, check=False
         )
@@ -9176,6 +9182,7 @@ def link_bugs_and_cls(
                 or bool(rec.get("sponsor_action"))
             ),
             "state_summary": _summarize_cl_for_bug_subtask(rec),
+            "created_ts": float(rec.get("created_ts") or 0.0),
             "submitted_ts": float(rec.get("submitted_ts") or 0.0),
             "activity_ts": float(rec.get("activity_ts") or 0.0),
             "conversation_id": scid,
@@ -9202,6 +9209,7 @@ def link_bugs_and_cls(
             "shared_1_to_1": False,
             "in_needs_you": False,
             "state_summary": "Linked in Buganizer",
+            "created_ts": 0.0,
             "submitted_ts": 0.0,
             "activity_ts": 0.0,
             "conversation_id": "",
@@ -10596,7 +10604,7 @@ def classify_bug_status(
   is_self_assigned = _is_self_bug_assignee(str(bug.get("assignee") or ""))
   non_wip_self_cl_ts = max(
       (
-          max(float(c.get("activity_ts") or 0.0), float(c.get("submitted_ts") or 0.0))
+          max(float(c.get("created_ts") or 0.0), float(c.get("submitted_ts") or 0.0))
           for c in linked_cls
           if c.get("is_self")
           and not c.get("is_wip")
@@ -12073,6 +12081,10 @@ def sync_once(
         "gmail": gstat,
         "composite_key": composite_key,
         "updated_at": now_et_str(),
+        "created_ts": (
+            parse_gerrit_or_iso_time(info.get("created") or "")
+            or datetime.fromtimestamp(0, timezone.utc)
+        ).timestamp(),
         "submitted_ts": (
             parse_gerrit_or_iso_time(info.get("submitted") or "")
             or datetime.fromtimestamp(0, timezone.utc)
@@ -12844,6 +12856,10 @@ def sync_once(
           **m_info,
           "composite_key": f"{m_ikey}@unchatted",
           "updated_at": now_et_str(),
+          "created_ts": (
+              parse_gerrit_or_iso_time(m_info.get("created") or "")
+              or datetime.fromtimestamp(0, timezone.utc)
+          ).timestamp(),
           "submitted_ts": (
               parse_gerrit_or_iso_time(m_info.get("submitted") or "")
               or datetime.fromtimestamp(0, timezone.utc)
@@ -13685,6 +13701,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="wrap">
     <div class="brand" style="cursor: pointer;" onclick="window.parent.postMessage({type: 'jetski-flight-deck-close'}, '*')" title="Hide Flight Deck panel">✈️ Flight Deck</div>
     <div class="view-switch" id="view-switch" role="tablist" aria-label="View"></div>
+    <input type="text" id="search-box" placeholder="Search..." oninput="updateSearchQuery(this.value)" style="margin-left: 15px; padding: 2px 8px; border: 1px solid var(--hairline); border-radius: 4px; background: var(--card); color: var(--ink); font: 11.5px var(--sans); width: 150px;">
     <nav class="rollers" id="rollers" aria-label="Skia autorollers"></nav>
     <div class="synced" id="synced">Loading…</div>
     <button class="link-btn" id="refresh-btn" onclick="triggerRefresh()">Refresh</button>
@@ -13714,6 +13731,12 @@ const FLUTTER_DASHBOARD_URL = 'https://flutter-dashboard.appspot.com/#/build';
 const STATUS_SKIA_URL = 'https://status.skia.org/repo/skia';
 // Merged CLs older than this are chats left open after the work ended
 const OLD_MERGED_DAYS = 3;
+
+let searchQuery = "";
+function updateSearchQuery(val) {
+  searchQuery = val.toLowerCase().trim();
+  render();
+}
 
 // Bounds /api/status sockets and retries boot quickly before the 60s steady-state interval
 const POLL_INTERVAL_MS = 60000;
@@ -17495,11 +17518,13 @@ function restoreScrollPosition(savedY) {
   }
 }
 
-// Checks both tracked buttons and DOM attribute so tests and inline buttons pause re-renders
+// Checks tracked buttons, DOM attribute, and active inputs to pause destructive re-renders
 function hasActiveConfirmation() {
   if (confirmingButtons.size > 0) return true;
   if (typeof document !== 'undefined' && typeof document.querySelector === 'function') {
-    return Boolean(document.querySelector('[data-confirming="1"]'));
+    if (document.querySelector('[data-confirming="1"]')) return true;
+    const ae = document.activeElement;
+    if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA') && ae.type !== 'button' && ae.type !== 'submit') return true;
   }
   return false;
 }
@@ -17512,12 +17537,19 @@ function render() {
   lastRenderedDataSig = statusRenderSignature(data);
   pendingDeferredRender = false;
   confirmingButtons.clear();
-  const all = visibleItemsFromData(data)
+  let all = visibleItemsFromData(data)
     .sort((a, b) => (b.activity_ts || 0) - (a.activity_ts || 0));
   buildStackContext(all);
-  const allBugs = Object.values(data.bugs || {})
+  let allBugs = Object.values(data.bugs || {})
     .filter(b => b && typeof b === 'object')
     .sort((a, b) => (b.modified_ts || 0) - (a.modified_ts || 0));
+
+  if (searchQuery) {
+    const q = searchQuery;
+    const match = (s) => (s || '').toString().toLowerCase().includes(q);
+    all = all.filter(it => match(it.target_id) || match(it.title));
+    allBugs = allBugs.filter(b => match(b.bug_id) || match(b.title));
+  }
   const projOf = it => it.project_name || 'Unassigned';
   const bugProjects = projectsOf(allBugs);
   const projects = projectsOf(all);
