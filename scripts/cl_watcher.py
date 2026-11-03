@@ -6130,6 +6130,23 @@ def _start_chat_for_bug(
   }
 
 
+# Canonical CLI clause so Gerrit reviewer wakeups save unpublished drafts instead of chat-only text
+GERRIT_SAVE_DRAFT_CMD = "python3 ~/.gemini/config/scripts/gerrit_draft.py save"
+
+
+def _build_review_triage_prompt(ikey: str, url: str, subj: str, ps: int) -> str:
+  draft_clause = (
+      f"сохрани неопубликованный черновик ответа в Gerrit через {GERRIT_SAVE_DRAFT_CMD}, "
+      if ikey.startswith("gerrit:")
+      else ""
+  )
+  return (
+      f"Проведи review-triage для {url} ('{subj}', PS{ps}), подготовь разбор ревью, "
+      f"{draft_clause}(никогда не публикуй комментарии ревью без моего подтверждения) "
+      "и запиши вердикт через triage_store.py save-review."
+  )
+
+
 def start_chat_for_item(item_key: str) -> dict[str, Any]:
   """Starts a project-pinned visible Jetski chat for an unchatted CL/PR or bug item."""
   ikey = str(item_key or "").strip()
@@ -6250,11 +6267,8 @@ def start_chat_for_item(item_key: str) -> dict[str, Any]:
         delta_info={"delta_kind": "initial"},
     )
   else:
-    prompt = (
-        f"Проведи review-triage для {url} ('{subj}', PS{ps}), подготовь разбор ревью "
-        "(никогда не публикуй комментарии ревью без моего подтверждения) и запиши вердикт "
-        "через triage_store.py save-review."
-    )
+    # Build Gerrit/GitHub initial review prompt with canonical unpublished Gerrit draft save
+    prompt = _build_review_triage_prompt(ikey, url, subj, ps)
 
   res = _start_pinned_chat_for_record(items, ikey, matched_key, rec, prompt)
   if res.get("ok"):
@@ -10709,10 +10723,17 @@ def sync_once(
           and not info["last_msg_author"].endswith(".gserviceaccount.com")
           and info["in_my_attention"]
       ):
+        # Instruct non-self Gerrit follow-ups to save an unpublished draft via gerrit_draft.py
+        draft_action = (
+            f"сохрани неопубликованный черновик ответа в Gerrit через {GERRIT_SAVE_DRAFT_CMD} "
+            "(не публикуй его), покажи черновик в чате "
+            if ikey.startswith("gerrit:") and not record.get("is_self")
+            else "подготовь черновик ответа "
+        )
         transition_msg = (
             f"[CL-WATCHER] 💬 Новое обновление в {ikey} (PS{info['patchset']}) от "
             f"{info['last_msg_author']}: {info['last_msg_snippet']}. "
-            f"Проведи инкрементальный триаж/анализ, подготовь черновик ответа "
+            f"Проведи инкрементальный триаж/анализ, {draft_action}"
             f"и запиши вердикт через triage_store.py save-review."
         )
 

@@ -202,18 +202,42 @@ named skill's `SKILL.md` was not read, when a report with a `Case 1-5` verdict l
 
 ## Review & VCS Guidelines (Strict Rules)
 1. **English-Only Review Surface**: All generated review comments, reassignment notes, and pushback messages must be strictly in English. Direct discussion with the user remains in Russian.
-2. **Never Auto-Publish or Resolve (Always Save Gerrit Drafts on the Parent CL)**: The agent must
-   NEVER publish review comments to Gerrit/GitHub or resolve threads automatically. For targeted
-   external Gerrit CL reviews (outside Dry Mode and Self-Review Mode), always save the prepared
-   English review comment (including the companion WIP CL link and patchset guide when a companion
-   CL is uploaded) as a `/PATCHSET_LEVEL` draft directly on the parent CL's current patchset
-   (`GET https://<host>/a/changes/<CL>/revisions/<PS>/drafts` followed by in-place
-   `PUT .../drafts/<existing_id>`, or `PUT .../drafts` only when no matching draft exists), and
-   also present the draft in chat for the user to review and publish.
-3. **Gerrit Drafts & Thread Follow-ups**:
-   - Obtain the OAuth token from `printf "protocol=https\nhost=%s\n\n" "<host>" | git-credential-luci get` and serialize the payload via Python `json.dumps({"path": "/PATCHSET_LEVEL", "message": msg, "unresolved": unresolved})` (`unresolved: True` when there are defects/questions, `False` for clean approvals; or inline `path: "<file>", line: <N>` / `in_reply_to: "<comment_id>"`), including the full review explanation and companion WIP CL link/patchset guide. If `git-credential-luci` requires reauth, warn the user and still output the full draft in chat.
-   - **Mandatory In-Place Dedup Across All Drafts (b/580882306)**: Before saving **any** Gerrit draft (`/PATCHSET_LEVEL`, inline `file:line`, or `in_reply_to` thread reply), always query `GET https://<host>/a/changes/<CL>/revisions/<PS>/drafts` (strip the 4-byte `)]}'` prefix), search `drafts_data.get(path, [])` for an existing draft matching `(item.get("line") or None, item.get("in_reply_to") or None) == (payload.get("line") or None, payload.get("in_reply_to") or None)`, and update it in place via `PUT https://<host>/a/changes/<CL>/revisions/<PS>/drafts/<existing_id>` (calling `PUT .../drafts` only when no matching draft exists; see `skills/skia-canary-advisor/scripts/canary_advisor.py`). Never run `git cl comment` or blind `PUT .../drafts`: both stack hidden duplicate drafts that Gerrit UI hides until `Reply` publishes every accumulated draft at once.
-   - A follow-up after a new patchset is saved as a standalone `/PATCHSET_LEVEL` draft on the CURRENT patchset (no `in_reply_to`), containing only new text.
+2. **Never Auto-Publish or Resolve (Always Save Gerrit Drafts via `scripts/gerrit_draft.py`)**:
+   The agent must NEVER publish review comments to Gerrit/GitHub (`/review`) or resolve threads
+   automatically. For targeted external/other-author Gerrit CL reviews (initial or incremental
+   patchset/comment follow-ups, outside Dry Mode and Self-Review Mode), **always save** the
+   prepared English review comment (including the companion WIP CL link and patchset guide when a
+   companion CL is uploaded) as an unpublished Gerrit draft via the canonical script:
+   ```bash
+   python3 ~/.gemini/config/scripts/gerrit_draft.py save \
+     --cl <CL> --ps <PS> [--unresolved|--resolved] --message-file <draft_path>
+   ```
+   and also present the draft in chat (with the clickable patchset URL from `GERRIT_DRAFT_SAVED`)
+   for the user to review and publish.
+3. **Gerrit Drafts & Thread Follow-ups (`scripts/gerrit_draft.py`)**:
+   - Use `python3 ~/.gemini/config/scripts/gerrit_draft.py save` (and `list --cl <CL>` to inspect
+     unpublished drafts across all patchsets) instead of writing ad-hoc `curl`/`urllib` scripts:
+     - Pass `--unresolved` when there are defects or open questions, `--resolved` for clean
+       approvals, `--path <file> --line <N>` for inline comments, or `--in-reply-to <comment_id>`
+       for thread replies.
+     - If `git-credential-luci` requires reauth (`missing_luci_token` / `HTTP 401`), warn the user
+       and still output the full draft in chat.
+   - **Mandatory In-Place Dedup Across All Drafts (b/580882306)**: `scripts/gerrit_draft.py save`
+     automatically queries `GET /a/changes/<CL>/revisions/<PS>/drafts`, matches existing drafts by
+     `(path, line, in_reply_to, side)`, and updates in place via `PUT .../drafts/<existing_id>`
+     (calling `PUT .../drafts` only when no matching draft exists; see also
+     `skills/skia-canary-advisor/scripts/canary_advisor.py`). Never run `git cl comment` or blind
+     `PUT .../drafts`: both stack hidden duplicate drafts that Gerrit UI hides until `Reply`
+     publishes every accumulated draft at once.
+   - **Same-Patchset Thread Reply Invariant**: Gerrit rejects `in_reply_to` drafts on a newer
+     patchset with `HTTP 400: Comment replies must be submitted on the same patchset as the parent
+     comment`. When `--in-reply-to <comment_id>` is passed, `scripts/gerrit_draft.py save` fetches
+     `GET /a/changes/<CL>/comments` and automatically places the draft on the parent comment's
+     `patch_set` and `path`/`line`.
+   - A follow-up after a new patchset is saved as a standalone `/PATCHSET_LEVEL` (or inline
+     `--path <file> --line <N>`) draft on the CURRENT patchset (no `--in-reply-to`), containing
+     only new text (`gerrit_draft.py save` resolves `current_revision` automatically when `--ps`
+     is omitted).
    - Use `in_reply_to` only for inline (`file:line`) replies or when the user explicitly asks to answer inside a thread; never include or re-quote already-published text in a draft.
    - Never publicly resolve review threads yourself. On a `CLEAN` follow-up review where the user's
      own prior-patchset thread (such as a rebase request) is verified as addressed, stage an

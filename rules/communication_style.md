@@ -50,12 +50,14 @@ description: "Global communication style, grammatical gender, and critical feedb
   - **Keep Domain Terminology in English**: When replying in Russian, always keep technical and domain-specific terms in English (e.g., `trailing spaces`, `ghost spaces`, `glyph bounds`, `grapheme cluster`, `soft wrap`, `strut`, `run`, `shaping`, `line metrics`, `baseline`, `hit-testing`) instead of translating them into ambiguous Russian words.
   - **Cyrillic Transliteration & Lowercase Input**: Because switching keyboard layouts or pressing `Shift` is physically inconvenient for the user (recovering from a left-hand injury), the user may write English terms/identifiers transliterated in Cyrillic (e.g., «глиф баундс», «трейлинг спейсы», «страт», «ран») or without capitalization. Map these directly to the exact English domain concepts and code symbols; if a Russian term could map to multiple code concepts, briefly name the exact English symbols being disambiguated.
   - **Everything that enters code review or version control** (CL/PR titles, descriptions, top comments, commit messages, inline review comments/replies, and code comments) must **strictly be in English**.
-  - **Never publish review replies or resolve threads without asking**: Never publish replies on
-    Gerrit or GitHub yourself, never vote `Code-Review+1` without confirmation, and never mark
-    published review threads as resolved unless the user explicitly asks or triggers **Approve &
-    publish** in Flight Deck (`scripts/finalize_review.py`); staging unpublished Gerrit drafts
-    (including `"Done"` drafts with `unresolved: false` on the user's own addressed prior-patchset
-    threads) is encouraged so the user can review and publish in one click.
+  - **Save unpublished Gerrit drafts by default; never publish or resolve without asking**: On
+    Gerrit CL reviews (initial and incremental follow-ups), always save the prepared English review
+    reply as an unpublished Gerrit draft via `python3 ~/.gemini/config/scripts/gerrit_draft.py save`
+    (plus any `"Done"` drafts with `unresolved: false` on the user's own addressed prior-patchset
+    threads via `finalize_review.py stage-thread-drafts`) and show it in chat; **never publish**
+    replies (`/review` on Gerrit, posting on GitHub), **never vote** `Code-Review+1` without
+    confirmation, and **never mark published review threads as resolved** unless the user explicitly
+    asks or triggers **Approve & publish** in Flight Deck (`scripts/finalize_review.py`).
   - Any CL or PR prepared with AI assistance (with user participation) must include an `Assisted-by: <Model Name>` trailer (separated by an empty line from the description body, placed right before `Change-Id:`; run `python3 ~/.gemini/config/hooks/chat_lifecycle.py model --trailer`). If the model is unknown, use `Assisted-by: AI`.
 - **Human-Readable Reports Without Internal Identifiers**: In reports, documents and summaries written for people (perf reports, design notes, status writeups), never use commit hashes, roadmap item numbers (`R12`, `R47.1`), or internal build/variant names (`c0`, `c1`, `g1`, `wpnew`); name the change in words instead ("WebParagraph with FillTextRuns", "ImageBitmap path"). Keep an identifier only where reproducibility needs it (a methodology or attestation section), and explain it in words next to it. Always prefix CL and issue numbers with their system name (`Skia CL 1366676`, `Chromium CL 8664078`, `Flutter issue #187181`), never a bare number.
 - **Questions to the User (`ask_question` Over Plain-Text Choices; Mandatory Visible Breakdown Before Picker; Never Ask Alongside Running Subagents)**:

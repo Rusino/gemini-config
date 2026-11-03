@@ -18,7 +18,11 @@ import re
 import sys
 from typing import Any, Iterable, Sequence
 
-TRIAGE_RESULTS_DIR = Path.home() / ".gemini" / "config" / "logs" / "triage_results"
+# Allow isolated unit tests to redirect verdict writes away from live Flight Deck state
+TRIAGE_RESULTS_DIR = Path(
+    os.environ.get("JETSKI_TRIAGE_RESULTS_DIR")
+    or (Path.home() / ".gemini" / "config" / "logs" / "triage_results")
+)
 WATCHER_STATE_FILE = Path.home() / ".gemini" / "config" / "logs" / "cl_watcher_state.json"
 
 # Production directories whose changes require Flutter or WebParagraph corpus verification
@@ -1925,6 +1929,20 @@ def main() -> int:
             verify_attestation=True,
         )
         print(f"Saved review verdict to {p}")
+        norm_outcome = normalize_review_outcome(args.outcome)
+        corpus_pending = (
+            norm_outcome == "CLEAN"
+            and str(args.corpus or "").lower() in ("pending", "required")
+            and not draft_text.strip()
+        )
+        # Remind callers that save-review only updates local Flight Deck JSON, not Gerrit drafts
+        if args.kind == "gerrit" and norm_outcome != "REASSIGN" and not corpus_pending:
+            print(
+                "Reminder: triage_store.py saves local Flight Deck metadata only; "
+                "ensure your unpublished Gerrit draft is saved via: "
+                f"python3 ~/.gemini/config/scripts/gerrit_draft.py save "
+                f"--cl {args.target} --ps {args.patchset} --message-file <draft_path>"
+            )
         return 0
 
     parser.print_help()

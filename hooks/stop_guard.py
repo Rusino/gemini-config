@@ -1710,6 +1710,28 @@ def main() -> None:
     )
     return
 
+  # Block turns that show a Gerrit review reply without saving an unpublished Gerrit draft
+  gd_reason = ""
+  try:
+    import gerrit_draft_guard
+
+    gd_reason = gerrit_draft_guard.gerrit_draft_guard_reason(transcript_path)
+  except Exception:  # lint: allow-broad-except (guard must never crash stop hook)
+    gd_reason = ""
+  if (
+      gd_reason
+      and state.get("gerrit_draft_blocked_turn") != info.get("last_user_idx", -1)
+  ):
+    state["gerrit_draft_blocked_turn"] = info.get("last_user_idx", -1)
+    save_state(state_path, state)
+    print(
+        json.dumps(
+            {"decision": "continue", "reason": gd_reason},
+            ensure_ascii=False,
+        )
+    )
+    return
+
   # Block bare CL/PR/PS/draft/bug mentions lacking a clickable URL nearby once per turn
   links_reason = ""
   reply_for_links = str(

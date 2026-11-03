@@ -57,13 +57,19 @@ description: "Skia-style C++ minimalism and suppression of LLM coding reflexes."
 - **Plain Technical English (UNIX / Bell Labs style)**: Write simple, declarative Subject-Verb-Object sentences in the present tense using plain words (`keep`, `give`, `get`, `make`, `run`, `call`, `has`, `same as before`, `Thus`, `Now`); never use pompous Latinate LLM vocabulary (`utilize`, `facilitate`, `subsequently`, `consequently`, `mitigate`, `invocations`, `redundantly`, `leverage`, `comprehensive`, `seamlessly`)
 - **No LLM bulleted lists**: Never generate mechanical LLM-style bulleted lists of imperative verbs (`- Add...`, `- Refactor...`, `- Update...`) that restate the diff; structured `Behavior notes` / `Assumptions` / `Thread safety` bullets in Tier 2 specs are encouraged
 - **2×2 Ablation Matrix in Code Review Replies**: When a reviewer suggests an alternative or combined optimization/design (`A` vs. `B`), measure all 4 combinations (`baseline`, `A alone`, `B alone`, `A + B`) and include the exact numbers in the draft review reply
-- **Never publish review replies or resolve threads without asking**: Never publish review replies
-  or comments to Gerrit or GitHub yourself, never vote `Code-Review+1` without confirmation, and
-  never publicly resolve/unresolve review threads (`resolveReviewThread`) unless the user
-  explicitly asks or clicks **Approve & publish** in Flight Deck (`scripts/finalize_review.py`).
-  Staging unpublished Gerrit drafts — including `"Done"` (`unresolved: false`) drafts on the user's
-  own addressed prior-patchset threads via `finalize_review.py stage-thread-drafts` — is allowed so
-  one explicit user approval publishes them atomically
+- **Save unpublished Gerrit drafts by default; never publish or resolve without asking**:
+  - For Gerrit CL reviews (both initial and incremental patchset/thread follow-ups), **always save**
+    the prepared English review reply as an **unpublished Gerrit draft** via
+    `python3 ~/.gemini/config/scripts/gerrit_draft.py save` (deduplicating in place by
+    `(path, line, in_reply_to)` and resolving `--in-reply-to` to the parent comment's `patch_set`)
+    **and** show the draft in chat. Saving an unpublished Gerrit draft — including `"Done"`
+    (`unresolved: false`) drafts on the user's own addressed prior-patchset threads via
+    `finalize_review.py stage-thread-drafts` — is safe and expected by default so one explicit user
+    approval publishes them atomically
+  - **Never publish** review replies or comments (`/review` on Gerrit, posting comments/reviews on
+    GitHub), **never vote** `Code-Review+1` without confirmation, and **never publicly
+    resolve/unresolve** review threads (`resolveReviewThread`) unless the user explicitly asks or
+    clicks **Approve & publish** in Flight Deck (`scripts/finalize_review.py`)
 - **Canary-G3 Runtime & Triage Procedure**: Canary-G3 can take ~55 minutes. If it turns red,
   extract the roll CL number from swarming stdout (`Canary roll [ http://cl/N ]`) and triage:
   1. Run `cd ~/.gemini/jetski/scratch/skia_gardener && go run . -triage-google3 -cl <CL>`

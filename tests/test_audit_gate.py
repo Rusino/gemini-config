@@ -305,7 +305,8 @@ class AuditGateTests(unittest.TestCase):
         self.assertIn("-Wshorten-64-to-32", dec_t2["prompt"])
         self.assertIn("run_webparagraph_corpus.py", dec_t2["prompt"])
         self.assertIn("НЕ заливай companion %wip CL", dec_t2["prompt"])
-        self.assertIn("НЕ сохраняй черновики в Gerrit/GitHub", dec_t2["prompt"])
+        self.assertIn("gerrit_draft.py save", dec_t2["prompt"])
+        self.assertIn("НИКОГДА не публикуй `/review`", dec_t2["prompt"])
 
         # Unaudited CL (prev_triage is None) with rebase_only/commit_msg_only must run Tier 2
         dec_unaudited_rebase = audit_gate.decide_audit_action(
