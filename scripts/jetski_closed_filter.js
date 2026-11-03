@@ -54,7 +54,7 @@
   // Bounds unrendered loads, ping acks, open-drawer silence, and reload bursts
   const FLIGHT_DECK_LOAD_TIMEOUT_MS = 12000;
   const FLIGHT_DECK_PING_ACK_TIMEOUT_MS = 8000;
-  const FLIGHT_DECK_OPEN_IDLE_PING_MS = 45000;
+  const FLIGHT_DECK_OPEN_IDLE_PING_MS = 150000;
   const FLIGHT_DECK_RELOAD_COOLDOWN_MS = 15000;
   // Deterministic Cloudtop UberProxy PEN URL for port 8089 when pen_url.sh times out
   const DEFAULT_FLIGHT_DECK_PEN_URL =
@@ -295,6 +295,7 @@
   let flightDeckLastReloadAt = 0;
   let lastFlightDeckRenderedAt = 0;
   let lastFlightDeckRenderedVer = 0;
+  let flightDeckReloadedTargetVer = 0;
   let flightDeckPendingVer = 0;
   let flightDeckPendingVerSince = 0;
   let flightDeckPingSentAt = 0;
@@ -9957,7 +9958,7 @@
       }
       const now = Date.now();
       const iframe = drawerEl.querySelector(`.${FLIGHT_DECK_IFRAME_CLASS}`);
-      // Probe open idle drawers when no heartbeat arrived across two 20s poll intervals
+      // Probe open idle drawers when no heartbeat arrived across two 60s poll intervals
       if (
         iframe &&
         !flightDeckPingSentAt &&
@@ -9989,10 +9990,21 @@
       const infoVer = extractFlightDeckUiVersion(info, embedUrl);
       const curVer = extractFlightDeckUiVersion(null, curBaseSrc);
       const baselineVer = lastFlightDeckRenderedVer || curVer;
+      // Suppress repeat reloads when target infoVer already loaded and rendered a lower live ver
+      const alreadyReloadedForInfoVer =
+        infoVer > 0 &&
+        flightDeckReloadedTargetVer === infoVer &&
+        flightDeckLoadStartedAt > 0 &&
+        lastFlightDeckRenderedAt >= flightDeckLoadStartedAt;
 
       let autoForceReload = false;
       if (!forceReload && !originChanged) {
-        if (infoVer > 0 && baselineVer > 0 && infoVer !== baselineVer) {
+        if (
+          infoVer > 0 &&
+          baselineVer > 0 &&
+          infoVer !== baselineVer &&
+          !alreadyReloadedForInfoVer
+        ) {
           if (flightDeckPendingVer !== infoVer) {
             // Probe first on a ?v= bump so healthy iframes self-reload without double navigation
             flightDeckPendingVer = infoVer;
@@ -10001,7 +10013,10 @@
           } else if (now - flightDeckPendingVerSince >= FLIGHT_DECK_PING_ACK_TIMEOUT_MS) {
             autoForceReload = true;
           }
-        } else if (flightDeckPendingVer > 0 && infoVer === lastFlightDeckRenderedVer) {
+        } else if (
+          flightDeckPendingVer > 0 &&
+          (infoVer === lastFlightDeckRenderedVer || alreadyReloadedForInfoVer)
+        ) {
           flightDeckPendingVer = 0;
           flightDeckPendingVerSince = 0;
         }
@@ -10035,6 +10050,9 @@
         const sep = embedUrl.includes('?') ? '&' : '?';
         iframe.setAttribute('src', bustCache ? `${embedUrl}${sep}t=${now}` : embedUrl);
         flightDeckLoadStartedAt = now;
+        if (infoVer > 0) {
+          flightDeckReloadedTargetVer = infoVer;
+        }
         if (bustCache) {
           flightDeckLastReloadAt = now;
         }
@@ -10262,6 +10280,9 @@
       const ver = Number(data.uiVersion) || 0;
       if (ver > 0) {
         lastFlightDeckRenderedVer = ver;
+        if (flightDeckReloadedTargetVer > 0 && ver > flightDeckReloadedTargetVer) {
+          flightDeckReloadedTargetVer = ver;
+        }
       }
       if (!flightDeckPendingVer || (ver > 0 && ver >= flightDeckPendingVer)) {
         flightDeckPendingVer = 0;

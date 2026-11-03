@@ -756,6 +756,329 @@ boot();
     )
     self.assertIn("EMBEDDED_HEARTBEAT_TESTS_PASSED", res.stdout)
 
+  def test_save_watcher_state_guards_flight_deck_info_and_rollback_mtime(self):
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      info_file = os.path.join(tmpdir, "jetski-flight-deck.json")
+      prod_state_file = os.path.join(tmpdir, "prod_state.json")
+      mock_state_file = os.path.join(tmpdir, "mock_state.json")
+      with open(info_file, "w", encoding="utf-8") as f:
+        json.dump({"ui_version": 100, "port": 8089}, f)
+
+      with (
+          mock.patch.object(w, "FLIGHT_DECK_INFO_FILE", info_file),
+          mock.patch.object(w, "DEFAULT_STATE_FILE", prod_state_file, create=True),
+          mock.patch.object(w, "_INITIAL_SCRIPT_MTIME", 200.0),
+          mock.patch.object(
+              w, "flight_deck_pen_url", return_value="https://pen.goog"
+          ),
+      ):
+        # Redirected STATE_FILE in unit tests must not overwrite FLIGHT_DECK_INFO_FILE
+        with (
+            mock.patch.object(w, "STATE_FILE", mock_state_file),
+            mock.patch.object(w, "_SERVING_PORT", 8089, create=True),
+        ):
+          w.save_watcher_state({"items": {}, "events": [], "last_sync": ""})
+        with open(info_file, "r", encoding="utf-8") as f:
+          self.assertEqual(json.load(f).get("ui_version"), 100)
+
+        # Non-daemon CLI run (_SERVING_PORT == 0) must not clobber existing daemon ui_version
+        with (
+            mock.patch.object(w, "STATE_FILE", prod_state_file),
+            mock.patch.object(w, "_SERVING_PORT", 0, create=True),
+        ):
+          w.save_watcher_state({"items": {}, "events": [], "last_sync": ""})
+        with open(info_file, "r", encoding="utf-8") as f:
+          self.assertEqual(json.load(f).get("ui_version"), 100)
+
+        # Active --serve daemon (_SERVING_PORT == 8089) updates FLIGHT_DECK_INFO_FILE
+        with (
+            mock.patch.object(w, "STATE_FILE", prod_state_file),
+            mock.patch.object(w, "_SERVING_PORT", 8089, create=True),
+        ):
+          w.save_watcher_state({"items": {}, "events": [], "last_sync": ""})
+        with open(info_file, "r", encoding="utf-8") as f:
+          self.assertEqual(json.load(f).get("ui_version"), 200)
+
+      script_file = os.path.join(tmpdir, "sample_watcher.py")
+      with open(script_file, "w", encoding="utf-8") as f:
+        f.write("x = 1\n")
+      base_mtime = os.path.getmtime(script_file)
+      os.utime(script_file, (base_mtime - 10.0, base_mtime - 10.0))
+      self.assertTrue(
+          w.script_changed_on_disk(script_file, base_mtime),
+          "Mtime rollback (git checkout) must also trigger daemon reload",
+      )
+
+  def test_dashboard_refresh_60s_noop_skip_and_ui_state_persistence(self):
+    js_code = r"""
+const assert = require('assert');
+const html = require('fs').readFileSync(0, 'utf8');
+const script = html.split('<script>')[1].split('</script>')[0].replace(/boot\(\);/g, '');
+
+const storageMap = new Map();
+global.localStorage = {
+  getItem(k) { return storageMap.has(k) ? storageMap.get(k) : null; },
+  setItem(k, v) { storageMap.set(String(k), String(v)); },
+};
+
+let lanesWrites = 0;
+let focusWrites = 0;
+const els = new Map();
+function getEl(id) {
+  if (!els.has(id)) {
+    let inner = '';
+    const obj = {
+      id,
+      textContent: id === 'synced' ? 'Loading…' : '',
+      get innerHTML() { return inner; },
+      set innerHTML(v) {
+        inner = String(v);
+        if (id === 'lanes') lanesWrites++;
+        if (id === 'focus') focusWrites++;
+      },
+    };
+    els.set(id, obj);
+  }
+  return els.get(id);
+}
+
+let detailNodes = [];
+let confirmingNode = null;
+const docListeners = new Map();
+global.document = {
+  documentElement: { scrollTop: 0, classList: { add() {} } },
+  getElementById: getEl,
+  addEventListener(type, fn) { docListeners.set(type, fn); },
+  querySelector(sel) {
+    if (sel === '[data-confirming="1"]') return confirmingNode;
+    return null;
+  },
+  querySelectorAll(sel) {
+    if (sel === 'details[data-details-key]') return detailNodes;
+    return [];
+  },
+};
+
+global.location = { search: '?embed=1', hash: '', reload() {} };
+global.history = {
+  replaceState(_s, _t, url) { global.location.hash = String(url || ''); },
+};
+
+const parentMsgs = [];
+let scrollCalls = [];
+global.window = {
+  scrollY: 0,
+  scrollTo(x, y) {
+    scrollCalls.push([x, y]);
+    global.window.scrollY = y;
+    global.document.documentElement.scrollTop = y;
+  },
+  parent: { postMessage(msg) { parentMsgs.push(msg); } },
+  addEventListener() {},
+};
+
+let statusPayload = {
+  ui_version: 700,
+  last_sync: '12:00 ET',
+  rollers_summary: {},
+  items: {
+    'gerrit:100': {
+      item_key: 'gerrit:100', kind: 'gerrit', target_id: '100',
+      project_name: 'Skia', subject: 'Root CL', status: 'NEW',
+      url: 'https://skia-review.googlesource.com/c/skia/+/100',
+      in_my_attention: false, is_self: false, role: 'reviewer',
+      stack_root_ikey: 'gerrit:100', stack_index: 1, stack_size: 2,
+      stack_ikeys: ['gerrit:100', 'gerrit:101'], activity_ts: 10,
+    },
+    'gerrit:101': {
+      item_key: 'gerrit:101', kind: 'gerrit', target_id: '101',
+      project_name: 'Skia', subject: 'Child CL', status: 'NEW',
+      url: 'https://skia-review.googlesource.com/c/skia/+/101',
+      in_my_attention: true, is_self: false, role: 'reviewer',
+      stack_root_ikey: 'gerrit:100', stack_parent_ikey: 'gerrit:100',
+      stack_ancestors: ['gerrit:100'], stack_index: 2, stack_size: 2,
+      stack_ikeys: ['gerrit:100', 'gerrit:101'], activity_ts: 20,
+    },
+    'gerrit:200': {
+      item_key: 'gerrit:200', kind: 'gerrit', target_id: '200',
+      project_name: 'Skia', subject: 'Busy CL', status: 'NEW',
+      url: 'https://skia-review.googlesource.com/c/skia/+/200',
+      in_my_attention: true, chat_busy: true, conversation_id: 'cid-200',
+      is_self: false, role: 'reviewer', activity_ts: 30,
+    },
+  },
+  bugs: {
+    'buganizer:999': {
+      bug_key: 'buganizer:999', short_id: 'b/999', issue_id: '999',
+      project_name: 'Skia', title: 'Assigned bug with subtasks',
+      url: 'https://b.corp.google.com/issues/999',
+      lane: 'assigned', status: 'ASSIGNED', priority: 'P2',
+      linked_cls: [
+        {item_key: 'gerrit:1', label: 'CL 1', url: 'https://example.com/1', status: 'NEW'},
+        {item_key: 'gerrit:2', label: 'CL 2', url: 'https://example.com/2', status: 'NEW'},
+        {item_key: 'gerrit:3', label: 'CL 3', url: 'https://example.com/3', status: 'NEW'},
+        {item_key: 'gerrit:4', label: 'CL 4', url: 'https://example.com/4', status: 'NEW'},
+        {item_key: 'gerrit:5', label: 'CL 5', url: 'https://example.com/5', status: 'NEW'},
+      ],
+    },
+  },
+};
+
+global.fetch = async (url) => {
+  if (url === '/api/status') {
+    return {
+      ok: true,
+      status: 200,
+      json: async () => JSON.parse(JSON.stringify(statusPayload)),
+    };
+  }
+  if (url === '/api/rebase') {
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ ok: true }),
+    };
+  }
+  throw new Error('Unexpected fetch: ' + url);
+};
+
+let recordedIntervals = [];
+const origSetInterval = global.setInterval;
+global.setInterval = (fn, ms) => { recordedIntervals.push(ms); return 1; };
+
+async function flushMicrotasks() {
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+}
+
+const runTest = async () => {
+  boot();
+  await flushMicrotasks();
+  assert.deepStrictEqual(recordedIntervals, [60000], 'Status poll interval must be 60000ms');
+  assert(
+    getEl('footer').textContent.includes('refreshes every 60 s'),
+    'CL footer must advertise 60 s refresh interval: ' + getEl('footer').textContent,
+  );
+  assert(
+    getEl('focus').innerHTML.includes('data-details-key="stack:gerrit:100"'),
+    'Collapsed stack sibling must include data-details-key',
+  );
+  assert(
+    getEl('processing').innerHTML.includes('data-details-key="proc:gerrit:200"'),
+    'Processing strip item must include data-details-key',
+  );
+
+  // Persist selectedSection in localStorage and location.hash across reloads
+  toggleSection('waiting');
+  assert.strictEqual(storageMap.get('flight_deck_section_cls'), 'waiting');
+  assert(global.location.hash.includes('section=waiting'), 'Hash must include section=waiting');
+
+  setView('bugs');
+  toggleSection('assigned');
+  assert.strictEqual(storageMap.get('flight_deck_section_bugs'), 'assigned');
+  assert(global.location.hash.includes('view=bugs'), 'Hash must include view=bugs');
+  assert(global.location.hash.includes('section=assigned'), 'Hash must include section=assigned');
+  assert(
+    getEl('lanes').innerHTML.includes('data-section="assigned"'),
+    'Assigned bug section must render open',
+  );
+  assert(
+    !getEl('lanes').innerHTML.includes('data-section="assigned" hidden'),
+    'Assigned bug section must not carry hidden attribute when selected',
+  );
+  assert(
+    getEl('lanes').innerHTML.includes('data-details-key="subtasks:buganizer:999"'),
+    'Bug subtask disclosure must include data-details-key',
+  );
+
+  // Simulate reload by resetting in-memory state and calling boot() with saved localStorage
+  selectedSection = {cls: null, bugs: null};
+  global.location.hash = '';
+  boot();
+  await flushMicrotasks();
+  assert.strictEqual(selectedView, 'bugs');
+  assert.strictEqual(selectedSection.cls, 'waiting');
+  assert.strictEqual(selectedSection.bugs, 'assigned');
+  assert(
+    !getEl('lanes').innerHTML.includes('data-section="assigned" hidden'),
+    'Reloaded boot() must restore open Assigned section from localStorage',
+  );
+
+  // Unchanged /api/status payload (only last_sync ticked) must skip render() but post heartbeat
+  const writesBeforeNoop = lanesWrites;
+  const msgsBeforeNoop = parentMsgs.length;
+  statusPayload.last_sync = '12:01 ET';
+  await fetchState();
+  assert.strictEqual(lanesWrites, writesBeforeNoop, 'Unchanged payload must skip render()');
+  assert.strictEqual(getEl('synced').textContent, '12:01 ET');
+  assert.strictEqual(parentMsgs.length, msgsBeforeNoop + 1, 'Skipped render must still ack parent');
+
+  // Explicit interactive action (e.g. rebaseItem) must force render() even if payload is unchanged
+  const rebaseBtn = { disabled: false, textContent: 'Rebase', title: '' };
+  const writesBeforeRebase = lanesWrites;
+  await rebaseItem('gerrit:101', rebaseBtn);
+  assert(
+    lanesWrites > writesBeforeRebase,
+    'Interactive action fetchState(true) must bypass no-op skip so mutated buttons repaint',
+  );
+
+  // Active [data-confirming="1"] button defers background render() even when payload changes
+  confirmingNode = { dataset: { confirming: '1' } };
+  statusPayload.bugs['buganizer:999'].title = 'Updated title while confirming';
+  const writesBeforeConfirm = lanesWrites;
+  await fetchState();
+  assert.strictEqual(
+    lanesWrites,
+    writesBeforeConfirm,
+    'Active confirmation button must defer background render()',
+  );
+  confirmingNode = null;
+
+  // Real data change preserves open <details> keys and scrollY across render()
+  detailNodes = [{
+    open: true,
+    getAttribute(k) { return k === 'data-details-key' ? 'subtasks:buganizer:999' : null; },
+  }];
+  global.window.scrollY = 420;
+  global.document.documentElement.scrollTop = 420;
+  scrollCalls = [];
+  statusPayload.bugs['buganizer:999'].title = 'Updated title after confirm';
+  await fetchState();
+  assert(lanesWrites > writesBeforeConfirm, 'Changed payload after confirmation must render()');
+  assert(
+    /<details class="subtask-more" data-details-key="subtasks:buganizer:999" open>/.test(
+      getEl('lanes').innerHTML,
+    ),
+    'Open <details> must retain open attribute across render()',
+  );
+  assert(
+    scrollCalls.some((c) => c[1] === 420) && global.window.scrollY === 420,
+    'render() must preserve scrollY=420 across DOM replacement',
+  );
+
+  global.setInterval = origSetInterval;
+  console.log('REFRESH_AND_STATE_PERSISTENCE_PASSED');
+  process.exit(0);
+};
+
+eval(
+  script +
+    '\n;(' +
+    runTest.toString() +
+    ')().catch((err) => { console.error(err); process.exit(1); });',
+);
+"""
+    cmd = ["node", "-e", js_code]
+    res = subprocess.run(
+        cmd, input=w.DASHBOARD_HTML, capture_output=True, text=True, check=False
+    )
+    self.assertEqual(
+        res.returncode, 0, f"Node output: {res.stdout}\nError: {res.stderr}"
+    )
+    self.assertIn("REFRESH_AND_STATE_PERSISTENCE_PASSED", res.stdout)
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -67,7 +67,12 @@ import canary_advisor  # pylint: disable=g-import-not-at-top
 DEFAULT_PORT = 8089
 DEFAULT_SKIA_DIR = os.path.expanduser("~/.gemini/jetski/scratch/skia_main")
 DEFAULT_GARDENER_URL = "http://localhost:8080"
-STATE_FILE = os.path.expanduser("~/.gemini/config/logs/cl_watcher_state.json")
+DEFAULT_STATE_FILE = os.path.expanduser(
+    "~/.gemini/config/logs/cl_watcher_state.json"
+)
+STATE_FILE = DEFAULT_STATE_FILE
+# Non-zero only inside serve_forever so CLI runs never clobber the live daemon's ui_version
+_SERVING_PORT = 0
 OPEN_CHAT_REQ_FILE = os.path.expanduser(
     "~/.gemini/jetski/brain/jetski-open-chat.json"
 )
@@ -781,7 +786,11 @@ def save_watcher_state(state: dict[str, Any]) -> None:
     os.replace(tmp, STATE_FILE)
   except Exception:
     pass
-  export_flight_deck_info()
+  # Avoid overwriting live daemon discovery metadata from mocked tests or non-serving CLI runs
+  if STATE_FILE == DEFAULT_STATE_FILE and (
+      _SERVING_PORT > 0 or not os.path.isfile(FLIGHT_DECK_INFO_FILE)
+  ):
+    export_flight_deck_info(_SERVING_PORT or DEFAULT_PORT)
 
 
 def get_pen_url(port: int) -> str:
@@ -10314,19 +10323,26 @@ const STATUS_SKIA_URL = 'https://status.skia.org/repo/skia';
 // Merged CLs older than this are chats left open after the work ended
 const OLD_MERGED_DAYS = 3;
 
-// Bounds /api/status sockets and retries boot quickly before the 20s steady-state interval
+// Bounds /api/status sockets and retries boot quickly before the 60s steady-state interval
+const POLL_INTERVAL_MS = 60000;
 const FETCH_STATUS_TIMEOUT_MS = 10000;
 const INITIAL_RETRY_DELAY_MS = 2500;
 let cachedData = null;
 // Tracks server script mtime to trigger page reload on daemon re-exec
 let cachedUiVersion = null;
+// Stores last rendered payload signature so unchanged 60s polls skip innerHTML churn
+let lastRenderedDataSig = '';
+let pendingDeferredRender = false;
 // Serializes overlapping poll and ping fetches and tracks fast boot retries
 let fetchInFlight = false;
 let initialRetryTimer = 0;
 let selectedProject = 'ALL';
 let selectedView = 'cls';
-// Preserves at most one open secondary section per view across 20s polls
+// Preserves at most one open secondary section per view across polls and reloads
 let selectedSection = {cls: null, bugs: null};
+// Retains expanded <details data-details-key> disclosures and armed confirmation buttons
+const openDetailsKeys = new Set();
+const confirmingButtons = new Set();
 
 function esc(s) {
   return String(s ?? '')
@@ -10913,8 +10929,11 @@ function renderFocusSection(youItems, shownItems, data) {
       const chatSpan = chatHtml
         ? `<span class="stack-step-chat" onclick="event.stopPropagation()">· ${chatHtml}</span>`
         : '';
+      const stackDetailsKey = `stack:${itemKeyOf(m)}`;
+      const stackOpenAttr = openDetailsKeys.has(stackDetailsKey) ? ' open' : '';
       return `
-        <details class="stack-step-collapsed">
+        <details class="stack-step-collapsed" ` +
+          `data-details-key="${esc(stackDetailsKey)}"${stackOpenAttr}>
           <summary>
             ${stepBadge}
             ${verdictPill}
@@ -12434,7 +12453,7 @@ function renderPingModal(reviewer) {
     </div>`;
 }
 
-if (typeof document !== 'undefined') {
+if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
   document.addEventListener('keydown', (e) => {
     // Escape dismisses whichever modal is open
     if (e.key === 'Escape') {
@@ -12449,6 +12468,18 @@ if (typeof document !== 'undefined') {
     else if (e.key === '2') setView('bugs');
     else if (e.key === 'b' || e.key === 'B') setView(selectedView === 'bugs' ? 'cls' : 'bugs');
   });
+  // Capture non-bubbling <details> toggle events so expanded disclosures survive re-renders
+  document.addEventListener('toggle', (e) => {
+    const el = e && e.target;
+    if (!el || typeof el.getAttribute !== 'function') return;
+    const k = el.getAttribute('data-details-key');
+    if (!k) return;
+    const isOpen = typeof el.open === 'boolean'
+      ? el.open
+      : (typeof el.hasAttribute === 'function' && el.hasAttribute('open'));
+    if (isOpen) openDetailsKeys.add(k);
+    else openDetailsKeys.delete(k);
+  }, true);
 }
 
 // Render completed code review outcome pill in focus card eyebrow
@@ -12814,7 +12845,10 @@ function bugSubtasksHtml(bug, data) {
     const head = ordered.slice(0, 3).map(renderSub).join('');
     const rest = ordered.slice(3);
     const tail = rest.map(renderSub).join('');
-    return `<div class="bug-subtasks">${head}<details class="subtask-more">` +
+    const subKey = `subtasks:${bug.bug_key || bug.short_id || ''}`;
+    const subOpen = openDetailsKeys.has(subKey) ? ' open' : '';
+    return `<div class="bug-subtasks">${head}<details class="subtask-more" ` +
+      `data-details-key="${esc(subKey)}"${subOpen}>` +
       `<summary>+${rest.length} more linked CLs</summary>` +
       `<div class="subtask-more-body">${tail}</div></details></div>`;
   }
@@ -12845,9 +12879,12 @@ function processingStripItemHtml(it, data, type) {
   const contentHtml = isBug ? bugFocusCard(it, data) : focusCard(it, data);
   const chatHtml = isBug ? bugChatActionHtml(it, data, true) : chatActionHtml(it, data, true);
   const chatSpan = chatHtml ? `<span class="stack-step-chat" onclick="event.stopPropagation()">· ${chatHtml}</span>` : '';
-  
+  const procId = isBug ? (it.bug_key || it.issue_id || '') : itemKeyOf(it);
+  const procKey = `proc:${procId}`;
+  const procOpen = openDetailsKeys.has(procKey) ? ' open' : '';
   return `
-    <details class="stack-step-collapsed processing-item">
+    <details class="stack-step-collapsed processing-item" ` +
+      `data-details-key="${esc(procKey)}"${procOpen}>
       <summary>
         <span class="badge stack-step" style="background: var(--bg-hover);">⏳ Processing</span>
         ${itemLink}
@@ -12919,6 +12956,14 @@ function bugRowHtml(bug, data) {
 function toggleSection(secId) {
   const v = selectedView === 'bugs' ? 'bugs' : 'cls';
   selectedSection[v] = selectedSection[v] === secId ? null : secId;
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(`flight_deck_section_${v}`, selectedSection[v] || '');
+    }
+  } catch (e) {
+    // Ignore storage quota or security errors in sandboxed iframes
+  }
+  syncLocationHash();
   render();
 }
 
@@ -12970,9 +13015,15 @@ function renderViewSwitchHtml(clNeedYou, clTotal, bugNeedYou, bugTotal) {
 
 function syncLocationHash() {
   const parts = [];
+  const activeKey = selectedView === 'bugs' ? 'bugs' : 'cls';
   if (selectedView === 'bugs') parts.push('view=bugs');
   if (selectedProject !== 'ALL') parts.push(`project=${encodeURIComponent(selectedProject)}`);
-  history.replaceState(null, '', parts.length ? `#${parts.join('&')}` : '#');
+  if (selectedSection[activeKey]) {
+    parts.push(`section=${encodeURIComponent(selectedSection[activeKey])}`);
+  }
+  if (typeof history !== 'undefined' && typeof history.replaceState === 'function') {
+    history.replaceState(null, '', parts.length ? `#${parts.join('&')}` : '#');
+  }
 }
 
 function setView(v) {
@@ -13048,9 +13099,78 @@ function notifyParentRendered(data) {
   });
 }
 
+// Computes a cycle-safe content fingerprint excluding transient sync wall-clock strings
+function statusRenderSignature(data) {
+  if (!data || typeof data !== 'object') return '';
+  return JSON.stringify(
+    {
+      items: data.items || {},
+      bugs: data.bugs || {},
+      rollers_summary: data.rollers_summary || {},
+      gardener_url: data.gardener_url || '',
+      jetski_box_url: data.jetski_box_url || '',
+    },
+    (k, v) => (k.startsWith('_stack') ? undefined : v),
+  );
+}
+
+// Snapshots mounted <details data-details-key> open states before innerHTML replacement
+function syncOpenDetailsFromDom() {
+  if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return;
+  const nodes = document.querySelectorAll('details[data-details-key]');
+  if (!nodes || !nodes.length) return;
+  for (const el of nodes) {
+    if (!el || typeof el.getAttribute !== 'function') continue;
+    const k = el.getAttribute('data-details-key');
+    if (!k) continue;
+    const isOpen = typeof el.open === 'boolean'
+      ? el.open
+      : (typeof el.hasAttribute === 'function' && el.hasAttribute('open'));
+    if (isOpen) openDetailsKeys.add(k);
+    else openDetailsKeys.delete(k);
+  }
+}
+
+// Reads viewport vertical offset from either window or root documentElement
+function captureScrollPosition() {
+  const winY = (typeof window !== 'undefined' && typeof window.scrollY === 'number')
+    ? window.scrollY : 0;
+  const docEl = (typeof document !== 'undefined' && document.documentElement) || null;
+  const docY = (docEl && typeof docEl.scrollTop === 'number') ? docEl.scrollTop : 0;
+  return Math.max(winY, docY);
+}
+
+// Reapplies vertical scroll offset after synchronous innerHTML replacement
+function restoreScrollPosition(savedY) {
+  if (!(savedY > 0)) return;
+  const docEl = (typeof document !== 'undefined' && document.documentElement) || null;
+  if (docEl && typeof docEl.scrollTop === 'number') {
+    docEl.scrollTop = savedY;
+  }
+  if (typeof window !== 'undefined' && typeof window.scrollTo === 'function') {
+    window.scrollTo(0, savedY);
+  } else if (typeof window !== 'undefined' && typeof window.scrollY === 'number') {
+    window.scrollY = savedY;
+  }
+}
+
+// Checks both tracked buttons and DOM attribute so tests and inline buttons pause re-renders
+function hasActiveConfirmation() {
+  if (confirmingButtons.size > 0) return true;
+  if (typeof document !== 'undefined' && typeof document.querySelector === 'function') {
+    return Boolean(document.querySelector('[data-confirming="1"]'));
+  }
+  return false;
+}
+
 function render() {
   const data = cachedData;
   if (!data) return;
+  syncOpenDetailsFromDom();
+  const savedScrollY = captureScrollPosition();
+  lastRenderedDataSig = statusRenderSignature(data);
+  pendingDeferredRender = false;
+  confirmingButtons.clear();
   const all = visibleItemsFromData(data)
     .sort((a, b) => (b.activity_ts || 0) - (a.activity_ts || 0));
   buildStackContext(all);
@@ -13170,6 +13290,7 @@ function render() {
     const projCount = bugProjects.length;
     document.getElementById('footer').textContent =
       `${allBugs.length} tracked bugs across ${projCount} projects · refreshes every 5 min`;
+    restoreScrollPosition(savedScrollY);
     // Bugs view returns early before CL lanes, so emit rendered heartbeat here as well
     notifyParentRendered(data);
     return;
@@ -13240,7 +13361,8 @@ function render() {
     ? renderSecondarySectionsHtml('cls', clSections)
     : (shown.length ? '' : '<p class="empty-note">No open CL or PR chats in this project.</p>');
   document.getElementById('footer').textContent =
-    `${all.length} open CL and PR chats across ${projects.length} projects · refreshes every 20 s`;
+    `${all.length} open CL and PR chats across ${projects.length} projects · refreshes every 60 s`;
+  restoreScrollPosition(savedScrollY);
   notifyParentRendered(data);
 }
 
@@ -13259,9 +13381,12 @@ async function fetchWithTimeout(url, opts, timeoutMs) {
   }
 }
 
-async function fetchState() {
+async function fetchState(forceRender = false) {
   // Coalesce concurrent interval ticks and parent pings into one active /api/status request
-  if (fetchInFlight) return;
+  if (fetchInFlight) {
+    if (forceRender === true) pendingDeferredRender = true;
+    return;
+  }
   fetchInFlight = true;
   if (initialRetryTimer) {
     clearTimeout(initialRetryTimer);
@@ -13284,11 +13409,29 @@ async function fetchState() {
       }
     }
     if (nextVer > 0) cachedUiVersion = nextVer;
+    const nextSig = statusRenderSignature(nextData);
+    const syncedEl = document.getElementById('synced');
+    const mustRender = forceRender === true || pendingDeferredRender;
+    // Defer destructive DOM replacement while a 2-click confirmation button is armed
+    if (cachedData && hasActiveConfirmation()) {
+      cachedData = nextData;
+      if (syncedEl) syncedEl.textContent = (nextData && nextData.last_sync) || '';
+      if (mustRender || nextSig !== lastRenderedDataSig) pendingDeferredRender = true;
+      notifyParentRendered(cachedData);
+      return;
+    }
+    // Skip redundant DOM rebuilds when status content is identical to the rendered view
+    if (!mustRender && cachedData && lastRenderedDataSig && nextSig === lastRenderedDataSig) {
+      cachedData = nextData;
+      if (syncedEl) syncedEl.textContent = (nextData && nextData.last_sync) || '';
+      notifyParentRendered(cachedData);
+      return;
+    }
     cachedData = nextData;
     render();
   } catch (e) {
     document.getElementById('synced').textContent = 'Connection lost, retrying';
-    // Retry faster than the 20s poll while the initial payload has not rendered yet
+    // Retry faster than the 60s poll while the initial payload has not rendered yet
     if (!cachedData && !initialRetryTimer) {
       initialRetryTimer = setTimeout(() => {
         initialRetryTimer = 0;
@@ -13385,7 +13528,7 @@ async function startChat(itemKey, btn) {
     const res = await resp.json();
     if (res && res.ok && res.chat_url) {
       await openChat(res.conversation_id || '', res.chat_url);
-      await fetchState();
+      await fetchState(true);
       return;
     }
   } catch (e) {
@@ -13412,7 +13555,7 @@ async function rebaseItem(itemKey, btn) {
     });
     const res = await resp.json();
     if (res && res.ok) {
-      await fetchState();
+      await fetchState(true);
       return;
     }
     if (btn && res && res.error) btn.title = res.error;
@@ -13433,6 +13576,7 @@ async function abandonCompanions(itemKeys, btn) {
     const orig = btn.textContent;
     btn.dataset.confirming = '1';
     btn.dataset.origLabel = orig;
+    confirmingButtons.add(btn);
     btn.textContent = keys.length > 1
       ? `Confirm Abandon (${keys.length})?`
       : 'Confirm Abandon?';
@@ -13440,8 +13584,13 @@ async function abandonCompanions(itemKeys, btn) {
     setTimeout(() => {
       if (btn && btn.dataset.confirming === '1') {
         delete btn.dataset.confirming;
+        confirmingButtons.delete(btn);
         btn.classList.remove('danger');
         btn.textContent = btn.dataset.origLabel || orig;
+        // Flush any status update that arrived while the 2-click confirmation was armed
+        if (pendingDeferredRender && cachedData && !hasActiveConfirmation()) {
+          render();
+        }
       }
     }, 3500);
     return;
@@ -13449,6 +13598,7 @@ async function abandonCompanions(itemKeys, btn) {
   const orig = (btn && btn.dataset.origLabel) || (btn ? btn.textContent : '');
   if (btn) {
     delete btn.dataset.confirming;
+    confirmingButtons.delete(btn);
     btn.disabled = true;
     btn.textContent = 'Abandoning…';
   }
@@ -13460,7 +13610,7 @@ async function abandonCompanions(itemKeys, btn) {
     });
     const res = await resp.json();
     if (res && res.ok) {
-      await fetchState();
+      await fetchState(true);
       return;
     }
     if (btn && res && Array.isArray(res.errors) && res.errors.length) {
@@ -13491,7 +13641,7 @@ async function ackBug(bugKey, btn) {
     });
     const res = await resp.json();
     if (res && res.ok) {
-      await fetchState();
+      await fetchState(true);
       return;
     }
   } catch (e) {
@@ -13519,7 +13669,7 @@ async function assignReviewer(itemKeys, reviewerEmail, btn) {
     });
     const res = await resp.json();
     if (res && res.ok) {
-      await fetchState();
+      await fetchState(true);
       return;
     }
     if (btn && res && Array.isArray(res.errors) && res.errors.length) {
@@ -13559,7 +13709,7 @@ async function triggerRefresh() {
       location.reload();
       return;
     }
-    await fetchState();
+    await fetchState(true);
   } finally {
     btn.textContent = 'Refresh';
   }
@@ -13585,21 +13735,30 @@ function boot() {
   }
   let savedProj = 'ALL';
   let savedView = 'cls';
+  let savedSecCls = null;
+  let savedSecBugs = null;
   try {
     if (typeof localStorage !== 'undefined') {
       savedProj = localStorage.getItem('flight_deck_project') || 'ALL';
       savedView = localStorage.getItem('flight_deck_view') || 'cls';
+      savedSecCls = localStorage.getItem('flight_deck_section_cls') || null;
+      savedSecBugs = localStorage.getItem('flight_deck_section_bugs') || null;
     }
   } catch (e) {
     // Ignore storage errors in sandboxed iframes
   }
-  // URL hash overrides localStorage so direct #view=bugs links open on Bugs
+  // URL hash overrides localStorage so direct #view=bugs&section=assigned links open directly
   const hashParams = new URLSearchParams(location.hash.slice(1));
   selectedProject = hashParams.get('project') || savedProj;
   const hashView = hashParams.get('view');
   selectedView = hashView === 'bugs' ? 'bugs' : (savedView === 'bugs' ? 'bugs' : 'cls');
+  selectedSection = {cls: savedSecCls, bugs: savedSecBugs};
+  const hashSection = hashParams.get('section');
+  if (hashSection) {
+    selectedSection[selectedView === 'bugs' ? 'bugs' : 'cls'] = hashSection;
+  }
   fetchState();
-  setInterval(fetchState, 20000);
+  setInterval(fetchState, POLL_INTERVAL_MS);
 }
 
 boot();
@@ -13747,11 +13906,12 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 def script_changed_on_disk(
     path: str = _SCRIPT_PATH, initial_mtime: float = _INITIAL_SCRIPT_MTIME
 ) -> bool:
-  """Returns True when `path` on disk is newer than `initial_mtime` and compiles."""
+  """Returns True when `path` on disk differs in mtime from `initial_mtime` and compiles."""
   if initial_mtime <= 0.0:
     return False
   try:
-    if os.path.getmtime(path) <= initial_mtime:
+    # Detect both forward edits and mtime rollbacks (e.g. git checkout)
+    if os.path.getmtime(path) == initial_mtime:
       return False
     # Verify syntax before replacing the daemon so a half-written edit cannot crash it
     with open(path, "rb") as f:
@@ -13775,6 +13935,8 @@ def serve_forever(
     port: int, poll_interval_sec: int, max_polls: int = 1000000
 ) -> None:
   """Runs the HTTP server and bounded background watcher loop."""
+  global _SERVING_PORT
+  _SERVING_PORT = port
   server = ThreadedHTTPServer(("0.0.0.0", port), FlightDeckHandler)
 
   def bg_loop() -> None:

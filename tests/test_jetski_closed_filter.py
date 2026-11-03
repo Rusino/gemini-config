@@ -8183,6 +8183,74 @@ eval(code);
   window.__jetskiFlightDeck.handleMessage({
     data: { type: 'jetski-flight-deck-rendered', uiVersion: 20, synced: '19:06 ET' },
   });
+
+  // Healthy open-drawer watchdog must use a 150s idle ping window (2.5x the 60s status poll)
+  const origSetTimeoutFd = global.setTimeout;
+  let scheduledWatchdogDelay = 0;
+  let scheduledWatchdogFn = null;
+  global.setTimeout = (fn, ms, ...rest) => {
+    scheduledWatchdogDelay = ms;
+    scheduledWatchdogFn = fn;
+    return origSetTimeoutFd(fn, ms, ...rest);
+  };
+  window.__jetskiFlightDeck.handleMessage({
+    data: { type: 'jetski-flight-deck-rendered', uiVersion: 20, synced: '19:07 ET' },
+  });
+  global.setTimeout = origSetTimeoutFd;
+  assert.strictEqual(
+    scheduledWatchdogDelay,
+    150000,
+    'Open healthy Flight Deck watchdog must schedule idle ping at 150000ms'
+  );
+  assert.strictEqual(typeof scheduledWatchdogFn, 'function');
+
+  // Desynced jetski-flight-deck.json (ui_version: 30 while live daemon reports uiVersion: 20)
+  // must reload at most once for target 30 and never loop every 15s
+  postedToIframe.length = 0;
+  fakeNow += 20000;
+  mockFlightDeckJson = {
+    pen_url: 'https://8089-pen-proxy.corp.goog?v=30',
+    local_url: 'http://localhost:8089?v=30',
+    port: 8089,
+    ui_version: 30,
+  };
+  window.__jetskiFlightDeck.ensureFlightDeckUI();
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  window.__jetskiFlightDeck.handleMessage({
+    data: { type: 'jetski-flight-deck-rendered', uiVersion: 20, synced: '19:08 ET' },
+  });
+  fakeNow += 15000;
+  window.__jetskiFlightDeck.ensureFlightDeckUI();
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  const singleReloadV30Src = iframe.getAttribute('src');
+  assert.strictEqual(
+    singleReloadV30Src,
+    `https://8089-pen-proxy.corp.goog?v=30&embed=1&t=${fakeNow}`,
+    'First unacked v=30 bump must reload once'
+  );
+  // Reloaded iframe finishes rendering and live daemon still reports lower uiVersion 20
+  fakeNow += 500;
+  window.__jetskiFlightDeck.handleMessage({
+    data: { type: 'jetski-flight-deck-rendered', uiVersion: 20, synced: '19:08 ET' },
+  });
+  postedToIframe.length = 0;
+  fakeNow += 20000;
+  window.__jetskiFlightDeck.ensureFlightDeckUI();
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  fakeNow += 20000;
+  window.__jetskiFlightDeck.ensureFlightDeckUI();
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  assert.strictEqual(
+    iframe.getAttribute('src'),
+    singleReloadV30Src,
+    'Desynced lower daemon uiVersion must not trigger a 15s infinite reload loop'
+  );
+  assert.strictEqual(
+    postedToIframe.filter((m) => m && m.type === 'jetski-flight-deck-ping').length,
+    0,
+    'Already-reloaded target version must not keep pinging on lower daemon uiVersion'
+  );
+
   global.window.location.hostname = 'localhost';
   global.window.fetch = origFetch;
   Date.now = origDateNow;
