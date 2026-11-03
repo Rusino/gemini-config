@@ -71,6 +71,14 @@ PATCHSET_SCOPED_REVIEW_KEYS = (
     "resolved_thread_ids",
     "draft_ids",
     "triaged_revision",
+    # Clear deep-audit hunks, thread verdicts, and in-flight status when a new PS arrives
+    "delta_kind",
+    "core_hunks",
+    "open_thread_verdicts",
+    "audit_state",
+    "audit_target_patchset",
+    "audit_target_revision",
+    "audit_error",
 )
 
 # Match multi-segment Gerrit project paths such as /c/chromium/src/+/8663938
@@ -771,6 +779,64 @@ def _lookup_watcher_item_meta(
     return {}
 
 
+# Fall back to 2-arg load_triage_result when unit tests mock it with positional args only
+def _load_triage_compat(
+    kind: str, tid: str, results_dir: Path | str | None
+) -> dict[str, Any] | None:
+    if results_dir is None:
+        return load_triage_result(kind, tid)
+    try:
+        return load_triage_result(kind, tid, results_dir=results_dir)
+    except TypeError:
+        return load_triage_result(kind, tid)
+
+
+# Normalize CLI or dict core hunk entries ("file:lines:note") for Flight Deck links
+def _normalize_core_hunks(
+    raw_hunks: Sequence[dict[str, Any] | str] | None,
+) -> list[dict[str, str]]:
+    hunks: list[dict[str, str]] = []
+    for item in raw_hunks or ():
+        if isinstance(item, dict):
+            fpath = str(item.get("file") or "").strip()
+            lines = str(item.get("lines") or "").strip()
+            note = str(item.get("note") or "").strip()
+            if fpath:
+                hunks.append({"file": fpath, "lines": lines, "note": note})
+        elif isinstance(item, str) and item.strip():
+            parts = item.strip().split(":", 2)
+            fpath = parts[0].strip()
+            lines = parts[1].strip() if len(parts) >= 2 else ""
+            note = parts[2].strip() if len(parts) >= 3 else ""
+            if fpath:
+                hunks.append({"file": fpath, "lines": lines, "note": note})
+    return hunks
+
+
+# Normalize CLI or dict open-thread verdicts ("author|loc|verdict|note")
+def _normalize_thread_verdicts(
+    raw_verdicts: Sequence[dict[str, Any] | str] | None,
+) -> list[dict[str, str]]:
+    verdicts: list[dict[str, str]] = []
+    for item in raw_verdicts or ():
+        if isinstance(item, dict):
+            verdicts.append({
+                "author": str(item.get("author") or "").strip(),
+                "loc": str(item.get("loc") or "").strip(),
+                "verdict": str(item.get("verdict") or "").strip(),
+                "note": str(item.get("note") or "").strip(),
+            })
+        elif isinstance(item, str) and item.strip():
+            parts = [p.strip() for p in item.strip().split("|", 3)]
+            verdicts.append({
+                "author": parts[0] if len(parts) >= 1 else "",
+                "loc": parts[1] if len(parts) >= 2 else "",
+                "verdict": parts[2] if len(parts) >= 3 else "",
+                "note": parts[3] if len(parts) >= 4 else "",
+            })
+    return verdicts
+
+
 # Persist completed code review verdict and findings for Flight Deck display
 def save_review_verdict(
     target_id: str,
@@ -787,6 +853,10 @@ def save_review_verdict(
     resolved_thread_ids: Sequence[str] | None = None,
     draft_ids: Sequence[str] | None = None,
     revision: str = "",
+    delta_kind: str = "",
+    core_hunks: Sequence[dict[str, Any] | str] | None = None,
+    open_thread_verdicts: Sequence[dict[str, Any] | str] | None = None,
+    audit_state: str = "done",
     files: Iterable[str] | None = None,
     verify_attestation: bool = False,
     compare_search_dirs: Sequence[Path | str] | None = None,
@@ -798,7 +868,7 @@ def save_review_verdict(
     iso_ts, et_ts = now_et_strings()
     safe_ps = int(patchset) if patchset else 1
 
-    existing = load_triage_result(kind, str(target_id), results_dir=results_dir) or {}
+    existing = _load_triage_compat(kind, str(target_id), results_dir) or {}
     eff_state_path = (
         state_path
         if state_path is not None
@@ -965,8 +1035,98 @@ def save_review_verdict(
         "companion_id": str(companion_id or "").strip(),
         "draft": draft.strip(),
         "report_markdown": report_markdown.strip(),
+        "delta_kind": str(delta_kind or "").strip(),
+        "core_hunks": _normalize_core_hunks(core_hunks),
+        "open_thread_verdicts": _normalize_thread_verdicts(open_thread_verdicts),
+        "audit_state": str(audit_state or "done").strip().lower(),
+        "audit_target_patchset": safe_ps,
+        "audit_target_revision": eff_rev,
+        "audit_error": "",
     }
     return save_triage_result(data, results_dir=results_dir)
+
+
+# Persist zero-token Tier 0 rebase_only or commit_msg_only outcome without waking an LLM chat
+def record_tier0_delta_verdict(
+    target_id: str,
+    kind: str = "gerrit",
+    patchset: int = 1,
+    revision: str = "",
+    delta_kind: str = "rebase_only",
+    summary: str = "",
+    draft: str = "",
+    files: Iterable[str] | None = None,
+    results_dir: Path | str | None = None,
+) -> Path:
+    existing = _load_triage_compat(kind, str(target_id), results_dir) or {}
+    prev_outcome = str(existing.get("review_outcome") or existing.get("verdict") or "CLEAN")
+    try:
+        norm_outcome = normalize_review_outcome(prev_outcome)
+    except ValueError:
+        norm_outcome = "CLEAN"
+
+    # Commit-message-only edits keep identical tree and base, so explicit corpus state stays valid
+    corpus_mode = "auto"
+    prev_corpus = str(existing.get("corpus_status") or "").lower()
+    if delta_kind == "commit_msg_only" and prev_corpus in ("passed", "failed", "waived"):
+        corpus_mode = prev_corpus
+
+    return save_review_verdict(
+        target_id=target_id,
+        kind=kind,
+        patchset=patchset,
+        outcome=norm_outcome,
+        summary=summary or str(existing.get("summary") or ""),
+        draft=draft,
+        report_markdown=str(existing.get("report_markdown") or ""),
+        companion_id=str(existing.get("companion_id") or ""),
+        corpus=corpus_mode,
+        revision=revision,
+        delta_kind=delta_kind,
+        core_hunks=existing.get("core_hunks") or [],
+        open_thread_verdicts=existing.get("open_thread_verdicts") or [],
+        audit_state="done",
+        files=files,
+        verify_attestation=False,
+        results_dir=results_dir,
+    )
+
+
+# Record live audit progress or preflight auth block without overwriting prior patchset verdict
+def record_audit_status(
+    target_id: str,
+    kind: str = "gerrit",
+    patchset: int = 1,
+    revision: str = "",
+    audit_state: str = "running",
+    audit_error: str = "",
+    results_dir: Path | str | None = None,
+) -> Path:
+    target_dir = ensure_results_dir(results_dir)
+    s_kind = str(kind or "gerrit").lower()
+    tid = str(target_id or "").strip()
+    dest_path = target_dir / canonical_filename(s_kind, tid)
+    existing = _load_triage_compat(s_kind, tid, results_dir) or {
+        "target_id": tid,
+        "item_key": f"{s_kind}:{tid}",
+        "kind": s_kind,
+        "verdict": "SURGICAL_AUDIT",
+        "verdict_label": "SURGICAL AUDIT",
+        "triaged_patchset": 0,
+        "summary": "",
+        "source": "queue_triage",
+        "schema_version": 1,
+    }
+    updated = dict(existing)
+    updated["audit_state"] = str(audit_state or "running").strip().lower()
+    updated["audit_target_patchset"] = int(patchset or 1)
+    updated["audit_target_revision"] = str(revision or "").strip()
+    updated["audit_error"] = str(audit_error or "").strip()
+    tmp_path = target_dir / f"{dest_path.name}.tmp.{os.getpid()}"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(updated, f, indent=2, ensure_ascii=False)
+    tmp_path.replace(dest_path)
+    return dest_path
 
 
 # Parse overview markdown from run_queue_triage.py (e.g. /tmp/triage_1030.md)
@@ -1674,6 +1834,32 @@ def main() -> int:
         default="",
         help="Commit or head SHA of the reviewed patchset",
     )
+    p_rev.add_argument(
+        "--delta-kind",
+        default="",
+        help=(
+            "Delta classification (initial, code_change, rebase_only, "
+            "commit_msg_only, thread_only)"
+        ),
+    )
+    p_rev.add_argument(
+        "--core-hunk",
+        action="append",
+        default=[],
+        help="Repeatable core hunk pointer formatted as file:lines:note",
+    )
+    p_rev.add_argument(
+        "--thread-verdict",
+        action="append",
+        default=[],
+        help="Repeatable open-thread verdict formatted as author|loc|verdict|note",
+    )
+    p_rev.add_argument(
+        "--audit-state",
+        default="done",
+        choices=["queued", "running", "done", "blocked_auth", "failed"],
+        help="Current audit execution state",
+    )
 
     args = parser.parse_args()
     if args.cmd == "ingest-tmp":
@@ -1732,6 +1918,10 @@ def main() -> int:
             resolved_thread_ids=args.resolved_thread_id,
             draft_ids=args.draft_id,
             revision=args.revision,
+            delta_kind=args.delta_kind,
+            core_hunks=args.core_hunk,
+            open_thread_verdicts=args.thread_verdict,
+            audit_state=args.audit_state,
             verify_attestation=True,
         )
         print(f"Saved review verdict to {p}")

@@ -55,6 +55,7 @@ import chat_lifecycle as cl  # pylint: disable=g-import-not-at-top
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPTS_DIR not in sys.path:
   sys.path.insert(0, SCRIPTS_DIR)
+import audit_gate  # pylint: disable=g-import-not-at-top
 import triage_store  # pylint: disable=g-import-not-at-top
 
 CANARY_ADVISOR_DIR = os.path.normpath(
@@ -74,6 +75,25 @@ DEFAULT_STATE_FILE = os.path.expanduser(
 STATE_FILE = DEFAULT_STATE_FILE
 # Non-zero only inside serve_forever so CLI runs never clobber the live daemon's ui_version
 _SERVING_PORT = 0
+
+
+# Redirect triage_store next to STATE_FILE when unit tests patch watcher state into a temp dir
+def _triage_results_dir() -> str | None:
+  if os.path.abspath(STATE_FILE) == os.path.abspath(DEFAULT_STATE_FILE):
+    return None
+  return os.path.join(os.path.dirname(os.path.abspath(STATE_FILE)), "triage_results")
+
+
+# Fall back to 2-arg load_triage_result call when unit tests mock it with positional args only
+def _load_triage_for_watcher(
+    kind: str, tid: str, results_dir: str | None
+) -> dict[str, Any] | None:
+  if results_dir is None:
+    return triage_store.load_triage_result(kind, tid)
+  try:
+    return triage_store.load_triage_result(kind, tid, results_dir=results_dir)
+  except TypeError:
+    return triage_store.load_triage_result(kind, tid)
 OPEN_CHAT_REQ_FILE = os.path.expanduser(
     "~/.gemini/jetski/brain/jetski-open-chat.json"
 )
@@ -2733,9 +2753,15 @@ def discover_open_remote_changes(
   remote: list[dict[str, Any]] = []
 
   def _remote_item(
-      ikey: str, kind: str, num: str, host: str, pid: str, pname: str
+      ikey: str,
+      kind: str,
+      num: str,
+      host: str,
+      pid: str,
+      pname: str,
+      repo_slug: str = "",
   ) -> dict[str, Any]:
-    return {
+    out_item: dict[str, Any] = {
         "item_key": ikey,
         "kind": kind,
         "target_id": num,
@@ -2748,6 +2774,9 @@ def discover_open_remote_changes(
         "single_target": True,
         "chat_busy": False,
     }
+    if repo_slug:
+      out_item["repo_slug"] = repo_slug
+    return out_item
 
   # Include self-authored changes merged in the last 3 days (plus reviewed Skia
   # changes where Gardener tracks post-submit tree/roll health)
@@ -2789,8 +2818,8 @@ def discover_open_remote_changes(
 
   # GitHub Search rejects parenthesized OR across qualifiers with HTTP 422
   gh_queries = (
-      "repo:flutter/flutter is:open is:pr author:Rusino",
-      "repo:flutter/flutter is:open is:pr involves:Rusino -author:Rusino",
+      "is:open is:pr author:Rusino",
+      "is:open is:pr involves:Rusino -author:Rusino",
   )
   for gh_q in gh_queries:
     try:
@@ -2819,7 +2848,12 @@ def discover_open_remote_changes(
       if not isinstance(pr, dict):
         continue
       num = str(pr.get("number") or "").strip()
-      if not num or num in ignored:
+      html_url = str(pr.get("html_url") or "")
+      m_repo = re.search(r"github\.com/([^/]+/[^/]+)/", html_url)
+      if not m_repo:
+        m_repo = re.search(r"/repos/([^/]+/[^/]+)$", str(pr.get("repository_url") or ""))
+      repo_slug = m_repo.group(1) if m_repo else "flutter/flutter"
+      if not num or num in ignored or f"{repo_slug}#{num}" in ignored:
         continue
       ikey = f"github:{num}"
       if ikey in seen_keys:
@@ -2828,8 +2862,18 @@ def discover_open_remote_changes(
       if RE_AUTOROLL_SUBJECT.match(subj):
         continue
       seen_keys.add(ikey)
-      pid, pname = infer_project_for_change("github", "", subj, pnames)
-      remote.append(_remote_item(ikey, "github", num, "", pid, pname))
+      pid, pname = infer_project_for_change("github", f"github.com/{repo_slug}", subj, pnames)
+      remote.append(
+          _remote_item(
+              ikey,
+              "github",
+              num,
+              f"github.com/{repo_slug}",
+              pid,
+              pname,
+              repo_slug=repo_slug,
+          )
+      )
 
   return remote
 
@@ -3442,6 +3486,7 @@ def compute_github_reviewer_pings(
     reviews: list[dict[str, Any]],
     commits: list[dict[str, Any]],
     req_logins: list[str] | None = None,
+    repo_slug: str = "flutter/flutter",
 ) -> list[dict[str, Any]]:
   """Detects reviewers who need to review or re-review on GitHub"""
   if state != "OPEN" or is_wip or is_draft or missing_approvals <= 0:
@@ -3456,7 +3501,8 @@ def compute_github_reviewer_pings(
     return []
 
   pings: list[dict[str, Any]] = []
-  base_pr_url = f"https://github.com/flutter/flutter/pull/{pr_id}"
+  eff_repo = str(repo_slug or "").strip() or "flutter/flutter"
+  base_pr_url = f"https://github.com/{eff_repo}/pull/{pr_id}"
   latest_commit_date = ""
   for cm in commits:
     d = str(cm.get("committedDate") or cm.get("authoredDate") or "")
@@ -3510,17 +3556,20 @@ def compute_github_reviewer_pings(
   return pings
 
 
-def rerequest_github_reviewers(pr_id: str, reviewers: list[str]) -> bool:
-  """Re-requests review on a flutter/flutter PR via the GitHub requested_reviewers API"""
+def rerequest_github_reviewers(
+    pr_id: str, reviewers: list[str], repo_slug: str = "flutter/flutter"
+) -> bool:
+  """Re-requests review on a GitHub PR via the requested_reviewers API"""
   clean = [str(u).strip() for u in reviewers if str(u).strip()]
   if not clean:
     return False
+  eff_repo = str(repo_slug or "").strip() or "flutter/flutter"
   try:
     proc = subprocess.run(
         [
             "gh",
             "api",
-            f"repos/flutter/flutter/pulls/{pr_id}/requested_reviewers",
+            f"repos/{eff_repo}/pulls/{pr_id}/requested_reviewers",
             "--method",
             "POST",
             "--input",
@@ -3544,6 +3593,7 @@ def auto_rerequest_github_reviewers(
     rerequest_ledger: dict[str, Any],
     *,
     do_request: bool = True,
+    repo_slug: str = "flutter/flutter",
 ) -> list[str]:
   """Automatically re-requests GitHub reviewers whose review was updated or dismissed on push"""
   if not pr_id or not head_sha or not pings:
@@ -3566,7 +3616,14 @@ def auto_rerequest_github_reviewers(
       to_request.append(rev)
   if not to_request:
     return []
-  if not rerequest_github_reviewers(pr_id, to_request):
+  eff_repo = str(repo_slug or "").strip() or "flutter/flutter"
+  # Omit default repo_slug keyword so 2-arg mocks on flutter/flutter keep working
+  ok_req = (
+      rerequest_github_reviewers(pr_id, to_request)
+      if eff_repo == "flutter/flutter"
+      else rerequest_github_reviewers(pr_id, to_request, repo_slug=eff_repo)
+  )
+  if not ok_req:
     return []
   now_ts = time.time()
   for rev in to_request:
@@ -3655,6 +3712,7 @@ def _analyze_gerrit_self_threads(
       "self_threads_total": 0,
       "self_threads_unresolved": 0,
       "self_threads_resolved": 0,
+      "open_external_threads": 0,
       "author_replied_to_me": False,
       "author_reply_snippet": "",
       "latest_reply_by_author": {},
@@ -3707,13 +3765,17 @@ def _analyze_gerrit_self_threads(
         if c_ts >= prev_ts:
           latest_by_author[c_email] = (c_ts, c_msg)
 
+    leaf = t[-1]
+    root_email = str(((t[0].get("author") or {}).get("email")) or "")
+    # Count unresolved threads opened by reviewers/bots other than self for Tier 1 routing
+    if root_email not in SELF_EMAILS and bool(leaf.get("unresolved", False)):
+      res["open_external_threads"] += 1
     has_self = any(
         str(((c.get("author") or {}).get("email")) or "") in SELF_EMAILS for c in t
     )
     if not has_self:
       continue
     res["self_threads_total"] += 1
-    leaf = t[-1]
     if bool(leaf.get("unresolved", False)):
       res["self_threads_unresolved"] += 1
     else:
@@ -3987,7 +4049,8 @@ def fetch_gerrit_cl_status(
   for host in hosts:
     try:
       opts = (
-          "o=CURRENT_REVISION&o=CURRENT_COMMIT&o=CURRENT_FILES&o=ALL_REVISIONS"
+          # Request ALL_COMMITS so non-current patchsets retain commit.parents for rebase diffing
+          "o=CURRENT_REVISION&o=ALL_COMMITS&o=CURRENT_FILES&o=ALL_REVISIONS"
           "&o=MESSAGES&o=DETAILED_ACCOUNTS&o=LABELS&o=SUBMIT_REQUIREMENTS"
       )
       d = _gerrit_http_get_json(
@@ -4020,6 +4083,24 @@ def fetch_gerrit_cl_status(
           for sha, r in revs.items()
           if isinstance(r, dict) and r.get("_number")
       }
+      revisions_by_ps: dict[int, dict[str, str]] = {}
+      for sha, r in revs.items():
+        # Skip malformed revision entries that lack a patchset number
+        if not isinstance(r, dict) or not r.get("_number"):
+          continue
+        r_num = int(r["_number"])
+        r_parents = ((r.get("commit") or {}).get("parents")) or []
+        # Extract first parent commit SHA to detect upstream module overlap across rebases
+        r_parent = (
+            str(r_parents[0].get("commit") or "")
+            if r_parents and isinstance(r_parents[0], dict)
+            else ""
+        )
+        revisions_by_ps[r_num] = {
+            "sha": str(sha),
+            "kind": str(r.get("kind") or ""),
+            "parent": r_parent,
+        }
       commit_msg = str(((cur_rev.get("commit") or {}).get("message")) or "")
       files_dict = cur_rev.get("files") or {}
       files = sorted(str(f) for f in files_dict.keys() if f != "/COMMIT_MSG")
@@ -4247,10 +4328,16 @@ def fetch_gerrit_cl_status(
       merge_conflict = status == "NEW" and not gerrit_mergeable(host, cl_id)
 
       comments_by_path: dict[str, list[dict[str, Any]]] = {}
+      has_any_inline_comments = any(
+          bool(RE_GERRIT_COMMENT_COUNT.search(str(m.get("message") or "")))
+          for m in messages
+          if isinstance(m, dict)
+      )
       if (
           isinstance(d.get("_comments"), dict)
           or self_comment_count > 0
           or "comment" in attention_reason.lower()
+          or (status == "NEW" and has_any_inline_comments)
       ):
         comments_by_path = fetch_gerrit_comments(
             host, cl_id, preloaded=d.get("_comments")
@@ -4588,8 +4675,10 @@ def fetch_gerrit_cl_status(
           "self_cr_vote": self_cr_vote,
           "self_approved": bool(self_cr_vote > 0),
           "self_approval_ps": self_approval_ps,
+          "project": str(d.get("project") or ""),
           "parent_commit": parent_commit,
           "revision_ps_by_sha": revision_ps_by_sha,
+          "revisions_by_ps": revisions_by_ps,
           "patchset": ps_num,
           "revision": cur_sha,
           "commit_message": commit_msg,
@@ -4631,6 +4720,7 @@ def fetch_gerrit_cl_status(
           "self_threads_total": thread_stats["self_threads_total"],
           "self_threads_unresolved": thread_stats["self_threads_unresolved"],
           "self_threads_resolved": thread_stats["self_threads_resolved"],
+          "open_external_threads": thread_stats["open_external_threads"],
           "author_replied_to_me": thread_stats["author_replied_to_me"],
           "author_reply_snippet": thread_stats["author_reply_snippet"],
           "last_msg_author": last_msg_author,
@@ -4849,13 +4939,13 @@ def partition_github_failed_checks(
 
 
 def fetch_github_pr_status(
-    pr_id: str,
-    repo_slug: str = "flutter/flutter",
+    pr_id: str, repo_slug: str = "flutter/flutter"
 ) -> dict[str, Any]:
-  """Fetches GitHub PR status via `gh pr view` for `repo_slug`."""
-  repo = str(repo_slug or "").strip() or "flutter/flutter"
-  if repo.startswith("github.com/"):
-    repo = repo[len("github.com/") :]
+  """Fetches GitHub PR status via `gh pr view` across Flutter and standalone repos."""
+  eff_repo = str(repo_slug or "").strip() or "flutter/flutter"
+  if eff_repo.startswith("github.com/"):
+    eff_repo = eff_repo[len("github.com/") :]
+  is_flutter_repo = eff_repo.lower() == "flutter/flutter"
   try:
     out = subprocess.check_output(
         [
@@ -4864,7 +4954,7 @@ def fetch_github_pr_status(
             "view",
             str(pr_id),
             "--repo",
-            repo,
+            eff_repo,
             "--json",
             # Include body so fix-for detection can parse PR bug/revert references;
             # omit closingIssuesReferences because gh 2.46 rejects that field on Linux
@@ -4949,19 +5039,19 @@ def fetch_github_pr_status(
         for c in checks
         if str(c.get("conclusion") or c.get("state") or "").upper() in failing
     ]
-    if repo == "flutter/flutter":
-      # tree-status fails on every open PR while the flutter/flutter tree is red; it
-      # says nothing about this PR, so it must not raise a CQ alert
-      tree_red = FLUTTER_TREE_CHECK in failed_all
-      failed_checks = [c for c in failed_all if c != FLUTTER_TREE_CHECK]
-      # Subtract checks already failing on master or the PR's base commit so tree
-      # breakages do not trigger a false CQ failure alert on this PR
+    # tree-status fails on every open PR while the flutter/flutter tree is red; it
+    # says nothing about this PR, so it must not raise a CQ alert
+    tree_red = is_flutter_repo and (FLUTTER_TREE_CHECK in failed_all)
+    failed_checks = [
+        c for c in failed_all if not (is_flutter_repo and c == FLUTTER_TREE_CHECK)
+    ]
+    # Subtract checks already failing on master or the PR's base commit on flutter/flutter
+    if is_flutter_repo:
       own_failed_checks, tree_failed_checks = partition_github_failed_checks(
           str(pr_id), head_sha, failed_checks, failing
       )
     else:
-      tree_red = False
-      own_failed_checks, tree_failed_checks = list(failed_all), []
+      own_failed_checks, tree_failed_checks = list(failed_checks), []
     label_names = {
         str(lbl.get("name") or "")
         for lbl in (d.get("labels") or [])
@@ -5073,8 +5163,11 @@ def fetch_github_pr_status(
     required_approvals = (
         2
         if (
-            (review_decision == "REVIEW_REQUIRED" and approved_count >= 1)
-            or is_external_contributor
+            is_flutter_repo
+            and (
+                (review_decision == "REVIEW_REQUIRED" and approved_count >= 1)
+                or is_external_contributor
+            )
         )
         else 1
     )
@@ -5302,13 +5395,15 @@ def fetch_github_pr_status(
         reviews=reviews,
         commits=d.get("commits") or [],
         req_logins=req_logins,
+        repo_slug=eff_repo,
     )
 
     return {
         "ok": True,
-        "host": f"github.com/{repo}",
+        "host": f"github.com/{eff_repo}",
+        "repo_slug": eff_repo,
         "url": str(
-            d.get("url") or f"https://github.com/{repo}/pull/{pr_id}"
+            d.get("url") or f"https://github.com/{eff_repo}/pull/{pr_id}"
         ),
         "status": state,
         "phase": phase,
@@ -5354,7 +5449,7 @@ def fetch_github_pr_status(
             dict.fromkeys([
                 *(
                     "gh_issue:"
-                    f"{str((ci.get('repository') or {}).get('nameWithOwner') or repo)}"
+                    f"{str((ci.get('repository') or {}).get('nameWithOwner') or eff_repo)}"
                     f"#{ci.get('number')}"
                     for ci in (d.get("closingIssuesReferences") or [])
                     if isinstance(ci, dict) and ci.get("number")
@@ -5362,12 +5457,12 @@ def fetch_github_pr_status(
                 *extract_bug_refs_from_text(
                     f"{subject}\n{str(d.get('body') or '')}",
                     default_tracker="github",
-                    default_repo=repo,
+                    default_repo=eff_repo,
                 ),
             ])
         ),
         "commit_url": (
-            f"https://github.com/{repo}/commit/{head_sha}" if head_sha else ""
+            f"https://github.com/{eff_repo}/commit/{head_sha}" if head_sha else ""
         ),
         "in_my_attention": phase in ("NEEDS_YOUR_ACTION", "ALERT_CQ_FAILED"),
         "cr_summary": (
@@ -5875,6 +5970,7 @@ def _start_pinned_chat_for_record(
     matched_key: str,
     rec: dict[str, Any],
     prompt: str,
+    model_tier: str = "pro",
 ) -> dict[str, Any]:
   """Creates a project-pinned visible Jetski chat for `rec` with `prompt`."""
   proj_ref = str(rec.get("project_name") or rec.get("project_id") or "").strip()
@@ -5888,7 +5984,9 @@ def _start_pinned_chat_for_record(
   topic = _build_start_chat_topic(rec)
   full_title = f"[{cl.get_current_time_str()}] ⦿ {topic}"
   try:
-    model_info = cl.resolve_handoff_model("", tier="pro", project_id=project_id)
+    model_info = cl.resolve_handoff_model(
+        "", tier=model_tier or "pro", project_id=project_id
+    )
     new_cid = cl.start_conversation_exact(
         model_enum=model_info["enum"],
         title=full_title,
@@ -5979,12 +6077,16 @@ def _start_chat_for_bug(
   full_title = f"[{cl.get_current_time_str()}] ⦿ {topic}"
   url = str(bug.get("url") or bug.get("short_id") or bug_key)
   btitle = str(bug.get("title") or bug_key)
-  # Collaborator bugs ask for domain review and a draft opinion rather than code ownership
-  if bug.get("is_collaborator"):
+  # Collaborator and mentioned bugs ask for domain review and a draft comment rather than ownership
+  if bug.get("is_collaborator") or bug.get("is_mentioned"):
     owner_lbl = str(bug.get("assignee") or "коллеги")
+    role_note = (
+        f"Тебя упомянули в баге {url} ('{btitle}')."
+        if bug.get("is_mentioned") and not bug.get("is_collaborator")
+        else f"Ты указана как Collaborator в баге {url} ('{btitle}', владелец: {owner_lbl})."
+    )
     prompt = (
-        f"Ты указана как Collaborator в баге {url} ('{btitle}', владелец: {owner_lbl}). "
-        "Проверь описание, комментарии и код, следуй навыку bug-triage "
+        f"{role_note} Проверь описание, комментарии и код, следуй навыку bug-triage "
         "(~/.gemini/config/skills/bug-triage/SKILL.md), и подготовь техническое ревью, "
         "решение/PoC (WIP CL, если уместно) и черновик комментария для бага "
         "(не публикуй комментарий без подтверждения)."
@@ -6041,6 +6143,7 @@ def start_chat_for_item(item_key: str) -> dict[str, Any]:
 
   items: dict[str, Any] = state.setdefault("items", {})
   matched_key, rec = _lookup_state_item(items, ikey)
+  triage_dir = _triage_results_dir()
 
   # Reuse an existing active, companion-parent, or archived chat before spawning a new one
   existing_cid, is_arch, comp_to = _discover_existing_chat_for_item(ikey, rec)
@@ -6059,18 +6162,22 @@ def start_chat_for_item(item_key: str) -> dict[str, Any]:
             chat_archived=True if is_arch else None,
             companion_to=comp_to,
         )
-      # Trigger incremental review if a new patchset was uploaded after previous review
+      # Trigger incremental deep audit if a new patchset was uploaded after previous review
       if _is_assigned_reviewer_record(rec) and not rec.get("chat_busy"):
         cur_ps = int(rec.get("patchset") or 1)
         rev_ps = int(rec.get("reviewed_ps") or 0)
         tgt_ps = int(rec.get("review_target_ps") or 0)
         if rev_ps > 0 and cur_ps > rev_ps and cur_ps > tgt_ps:
-          url = str(rec.get("url") or ikey)
-          subj = str(rec.get("subject") or ikey)
-          wake_msg = (
-              f"[CL-WATCHER] 💬 Новое обновление в {ikey} (PS{cur_ps}): "
-              f"'{subj}'. Проведи инкрементальный триаж/анализ, подготовь разбор ревью "
-              f"для PS{cur_ps} и запиши вердикт через triage_store.py save-review."
+          r_kind = str(rec.get("kind") or "gerrit")
+          r_tid = str(rec.get("target_id") or ikey.split(":", 1)[-1])
+          prev_tr = triage_store.load_triage_result(
+              r_kind, r_tid, results_dir=triage_dir
+          )
+          wake_msg = audit_gate.build_audit_prompt(
+              tier=2,
+              item=rec,
+              prev_triage=prev_tr,
+              delta_info={"delta_kind": "code_change"},
           )
           woken = wake_conversation(active_cid, wake_msg)
           if woken:
@@ -6080,10 +6187,19 @@ def start_chat_for_item(item_key: str) -> dict[str, Any]:
             # Clear deferred wakeup watermarks and record claim once manually woken
             rec.pop("pending_wake_from_ps", None)
             rec.pop("pending_wake_from_msg_date", None)
+            rec["audited_msg_date"] = str(rec.get("last_msg_date") or "")
             state.setdefault("review_claims", {})[f"{ikey}:{cur_ps}"] = {
                 "cid": active_cid,
                 "ts": time.time(),
             }
+            triage_store.record_audit_status(
+                r_tid,
+                kind=r_kind,
+                patchset=cur_ps,
+                revision=str(rec.get("head_sha") or rec.get("revision") or ""),
+                audit_state="running",
+                results_dir=triage_dir,
+            )
             save_watcher_state(state)
             return {
                 "ok": True,
@@ -6115,11 +6231,23 @@ def start_chat_for_item(item_key: str) -> dict[str, Any]:
   url = str(rec.get("url") or ikey)
   subj = str(rec.get("subject") or ikey)
   ps = int(rec.get("patchset") or 1)
+  r_kind = str(rec.get("kind") or "gerrit")
+  r_tid = str(rec.get("target_id") or ikey.split(":", 1)[-1])
   if rec.get("is_self"):
     prompt = (
         f"Отслеживай и помогай с моим изменением {url} ('{subj}', PS{ps}). "
         "Проверь текущий статус, комментарии ревью и проверки CI, и кратко напиши, "
         "что требует моего внимания."
+    )
+  elif _is_assigned_reviewer_record(rec):
+    prev_tr = triage_store.load_triage_result(
+        r_kind, r_tid, results_dir=triage_dir
+    )
+    prompt = audit_gate.build_audit_prompt(
+        tier=2,
+        item=rec,
+        prev_triage=prev_tr,
+        delta_info={"delta_kind": "initial"},
     )
   else:
     prompt = (
@@ -6130,8 +6258,131 @@ def start_chat_for_item(item_key: str) -> dict[str, Any]:
 
   res = _start_pinned_chat_for_record(items, ikey, matched_key, rec, prompt)
   if res.get("ok"):
+    if _is_assigned_reviewer_record(rec):
+      cur_rev = str(rec.get("head_sha") or rec.get("revision") or "")
+      claim_key = (
+          f"{ikey}:{ps}:{cur_rev[:10]}" if (r_kind == "github" and cur_rev) else f"{ikey}:{ps}"
+      )
+      state.setdefault("review_claims", {})[claim_key] = {
+          "cid": str(res.get("conversation_id") or ""),
+          "ts": time.time(),
+      }
+      triage_store.record_audit_status(
+          r_tid,
+          kind=r_kind,
+          patchset=ps,
+          revision=cur_rev,
+          audit_state="running",
+          results_dir=triage_dir,
+      )
     save_watcher_state(state)
   return res
+
+
+def save_gerrit_draft_for_item(
+    item_key: str, draft_text: str = ""
+) -> dict[str, Any]:
+  """Saves or updates a /PATCHSET_LEVEL Gerrit draft in-place on explicit user request."""
+  ikey = str(item_key or "").strip()
+  if not ikey:
+    return {"ok": False, "error": "Missing item_key"}
+  state = load_watcher_state()
+  items: dict[str, Any] = state.get("items") or {}
+  _, rec = _lookup_state_item(items, ikey)
+  rec_dict = rec if isinstance(rec, dict) else {}
+  kind = str(
+      rec_dict.get("kind") or ("github" if ikey.startswith("github:") else "gerrit")
+  )
+  tid = str(rec_dict.get("target_id") or ikey.split(":", 1)[-1]).strip()
+  # Guard endpoint to numeric Gerrit change IDs since GitHub lacks a draft comment REST equivalent
+  if kind != "gerrit" or not tid.isdigit():
+    return {"ok": False, "error": "Save to Gerrit Draft only supports Gerrit CLs"}
+
+  tr = triage_store.load_triage_result(
+      "gerrit", tid, results_dir=_triage_results_dir()
+  )
+  msg = (draft_text or str((tr or {}).get("draft") or "")).strip()
+  if not msg:
+    return {"ok": False, "error": "No review draft text available"}
+
+  host = str(
+      rec_dict.get("host") or rec_dict.get("preferred_host") or GERRIT_SKIA_HOST
+  ).strip()
+  eff_ps = int(
+      rec_dict.get("patchset") or (tr or {}).get("triaged_patchset") or 1
+  )
+  tok = canary_advisor._gerrit_luci_token()
+  if not tok:
+    return {
+        "ok": False,
+        "error": "Failed to obtain LUCI OAuth token (run luci-auth login)",
+    }
+
+  base_url = f"https://{host}/a/changes/{tid}/revisions/{eff_ps}/drafts"
+  headers = {
+      "Authorization": f"Bearer {tok}",
+      "User-Agent": "FlightDeck-Watcher",
+  }
+  # Probe existing /PATCHSET_LEVEL drafts first to update in-place rather than stacking duplicates
+  existing_id = ""
+  try:
+    get_req = urllib.request.Request(base_url, headers=headers, method="GET")
+    with urllib.request.urlopen(get_req, timeout=12) as resp:
+      raw = resp.read().decode("utf-8", errors="replace")
+      if raw.startswith(")]}'"):
+        raw = raw.split("\n", 1)[1] if "\n" in raw else raw[4:]
+      existing_map = json.loads(raw or "{}")
+      ps_drafts = (
+          existing_map.get("/PATCHSET_LEVEL")
+          if isinstance(existing_map, dict)
+          else None
+      )
+      if isinstance(ps_drafts, list):
+        for d_obj in ps_drafts:
+          if isinstance(d_obj, dict) and d_obj.get("id"):
+            existing_id = str(d_obj["id"])
+            break
+  except (OSError, ValueError, http.client.HTTPException):
+    existing_id = ""
+
+  # Target existing draft ID when present so Gerrit overwrites the single patchset-level draft
+  put_url = (
+      f"{base_url}/{urllib.parse.quote(existing_id, safe='')}"
+      if existing_id
+      else base_url
+  )
+  payload = {"path": "/PATCHSET_LEVEL", "message": msg, "unresolved": True}
+  try:
+    put_req = urllib.request.Request(
+        put_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            **headers,
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        method="PUT",
+    )
+    with urllib.request.urlopen(put_req, timeout=15) as resp:
+      raw_put = resp.read().decode("utf-8", errors="replace")
+      if raw_put.startswith(")]}'"):
+        raw_put = raw_put.split("\n", 1)[1] if "\n" in raw_put else raw_put[4:]
+      saved_obj = json.loads(raw_put or "{}")
+  except (OSError, ValueError, http.client.HTTPException) as exc:
+    return {"ok": False, "error": f"Gerrit draft PUT failed: {exc}"}
+
+  saved_id = (
+      str(saved_obj.get("id") or existing_id)
+      if isinstance(saved_obj, dict)
+      else existing_id
+  )
+  return {
+      "ok": True,
+      "item_key": f"gerrit:{tid}",
+      "patchset": eff_ps,
+      "draft_id": saved_id,
+      "updated_existing": bool(existing_id),
+      "cl_url": f"https://{host}/c/{tid}/{eff_ps}",
+  }
 
 
 def request_open_in_existing_tab(
@@ -7873,11 +8124,237 @@ def _run_gh_json(
     return None
 
 
+# Query tail timeline items directly so long multi-year issues do not paginate from comment 1
+GITHUB_ISSUE_TIMELINE_GQL = """
+query($owner:String!, $name:String!, $num:Int!) {
+  repository(owner:$owner, name:$name) {
+    issue(number:$num) {
+      number title url state createdAt updatedAt lastEditedAt
+      editor { login }
+      author { login }
+      body
+      assignees(first:20) { nodes { login } }
+      timelineItems(
+        last:50,
+        itemTypes:[ISSUE_COMMENT, ASSIGNED_EVENT, REOPENED_EVENT]
+      ) {
+        nodes {
+          __typename
+          ... on IssueComment { author { login } body createdAt updatedAt }
+          ... on AssignedEvent {
+            actor { login }
+            assignee { ... on User { login } }
+            createdAt
+          }
+          ... on ReopenedEvent { actor { login } createdAt }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+# Collapse single-line non-quoted snippet from GitHub issue or comment markdown
+def _clean_github_issue_snippet(text: str, max_len: int = 180) -> str:
+  if not text:
+    return ""
+  cleaned = re.sub(r"<!--.*?-->", " ", text, flags=re.S)
+  non_quoted = [
+      ln for ln in cleaned.splitlines()
+      if ln.strip() and not ln.lstrip().startswith(">")
+  ]
+  src = " ".join(non_quoted) if non_quoted else cleaned
+  collapsed = " ".join(src.split())
+  return collapsed[:max_len]
+
+
+# Evaluate GraphQL issue timeline and suppress non-assigned mentions when Rusino replied last
+def _evaluate_github_mention_issue(
+    repo_slug: str, issue_num: str, self_gh: set[str]
+) -> dict[str, Any] | None:
+  if not repo_slug or "/" not in repo_slug or not str(issue_num).isdigit():
+    return None
+  owner, name = repo_slug.split("/", 1)
+  try:
+    out = subprocess.check_output(
+        [
+            "gh",
+            "api",
+            "graphql",
+            "-f",
+            f"query={GITHUB_ISSUE_TIMELINE_GQL}",
+            "-f",
+            f"owner={owner}",
+            "-f",
+            f"name={name}",
+            "-F",
+            f"num={int(issue_num)}",
+        ],
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=12,
+    )
+    payload = json.loads(out)
+  except (OSError, subprocess.SubprocessError, ValueError):
+    return None
+
+  issue = (((payload or {}).get("data") or {}).get("repository") or {}).get("issue")
+  if not isinstance(issue, dict):
+    return None
+  state_str = str(issue.get("state") or "OPEN").upper()
+  if state_str == "CLOSED":
+    return None
+
+  assignees = [
+      str(n.get("login") or "")
+      for n in ((issue.get("assignees") or {}).get("nodes") or [])
+      if isinstance(n, dict) and n.get("login")
+  ]
+  issue_author = str(((issue.get("author") or {}).get("login") or "ghost")).strip()
+  created_raw = str(issue.get("createdAt") or "")
+  created_ts = _parse_ts(created_raw)
+  editor = str(((issue.get("editor") or {}).get("login") or "")).strip()
+  edited_raw = str(issue.get("lastEditedAt") or "")
+  edited_ts = _parse_ts(edited_raw) if edited_raw else 0.0
+
+  my_last_ts = 0.0
+  my_last_iso = ""
+  my_last_idx = -1
+  if issue_author.lower() in self_gh and created_ts > 0.0:
+    my_last_ts = created_ts
+    my_last_iso = created_raw
+  my_edit_ts = edited_ts if (editor.lower() in self_gh and edited_ts > 0.0) else 0.0
+  if my_edit_ts > my_last_ts:
+    my_last_ts = my_edit_ts
+    my_last_iso = edited_raw
+
+  nodes = [
+      n
+      for n in ((issue.get("timelineItems") or {}).get("nodes") or [])
+      if isinstance(n, dict)
+  ]
+  comments: list[tuple[int, str, str, str, str]] = []
+  events: list[tuple[float, str, str, str]] = []
+  for idx, node in enumerate(nodes):
+    kind = str(node.get("__typename") or "")
+    if kind == "IssueComment":
+      login = str(((node.get("author") or {}).get("login") or "ghost")).strip()
+      c_at = str(node.get("createdAt") or "")
+      u_at = str(node.get("updatedAt") or c_at)
+      body = str(node.get("body") or "")
+      if login.lower() in self_gh:
+        my_last_idx = idx
+        c_ts = _parse_ts(c_at)
+        if c_ts >= my_last_ts:
+          my_last_ts = c_ts
+          my_last_iso = c_at
+        continue
+      if _is_bug_bot_author(login):
+        continue
+      comments.append((idx, login, body, c_at, u_at))
+    elif kind in ("AssignedEvent", "ReopenedEvent"):
+      actor = str(((node.get("actor") or {}).get("login") or "")).strip()
+      ev_at = str(node.get("createdAt") or "")
+      ev_ts = _parse_ts(ev_at)
+      if not actor or actor.lower() in self_gh or _is_bug_bot_author(actor):
+        continue
+      if my_last_ts > 0.0 and ev_ts <= my_last_ts:
+        continue
+      if kind == "AssignedEvent":
+        tgt = str(((node.get("assignee") or {}).get("login") or "")).strip()
+        if tgt.lower() in self_gh:
+          events.append((ev_ts, ev_at, actor, f"Assigned by {actor}"))
+      else:
+        events.append((ev_ts, ev_at, actor, f"Reopened by {actor}"))
+
+  mention_re = re.compile(r"(?<![\w-])@rusino\b", re.I)
+  newer_human: list[tuple[float, int, str, str, str]] = []
+  for idx, login, body, c_at, u_at in comments:
+    c_ts = _parse_ts(c_at)
+    u_ts = _parse_ts(u_at) if u_at else c_ts
+    if idx > my_last_idx and (my_edit_ts <= 0.0 or c_ts > my_edit_ts):
+      newer_human.append((c_ts, idx, c_at, login, _clean_github_issue_snippet(body)))
+    elif my_last_ts > 0.0 and u_ts > my_last_ts and mention_re.search(body):
+      newer_human.append((u_ts, idx, u_at, login, _clean_github_issue_snippet(body)))
+
+  body_text = str(issue.get("body") or "")
+  if (
+      edited_ts > 0.0
+      and editor
+      and editor.lower() not in self_gh
+      and not _is_bug_bot_author(editor)
+      and (my_last_ts <= 0.0 or (edited_ts > my_last_ts and mention_re.search(body_text)))
+  ):
+    events.append((edited_ts, edited_raw, editor, _clean_github_issue_snippet(body_text)))
+  if (
+      my_last_ts <= 0.0
+      and issue_author
+      and issue_author.lower() not in self_gh
+      and not _is_bug_bot_author(issue_author)
+  ):
+    events.append((created_ts, created_raw, issue_author, _clean_github_issue_snippet(body_text)))
+
+  best_comment = max(newer_human, key=lambda x: (x[0], x[1])) if newer_human else None
+  events.sort(key=lambda x: x[0])
+  best_event = events[-1] if events else None
+  if best_comment is None and best_event is None:
+    return None
+
+  if best_comment and best_event and (best_event[0] - best_comment[0]) > 300.0:
+    _, act_iso, act_author, act_snip = best_event
+  elif best_comment:
+    _, _, act_iso, act_author, act_snip = best_comment
+  else:
+    assert best_event is not None
+    _, act_iso, act_author, act_snip = best_event
+
+  num_s = str(issue.get("number") or issue_num)
+  mod_raw = str(issue.get("updatedAt") or act_iso or created_raw)
+  mod_et, mod_age = format_et_and_age(mod_raw)
+  short_id = (
+      f"flutter#{num_s}"
+      if repo_slug.lower() == "flutter/flutter"
+      else f"{repo_slug}#{num_s}"
+  )
+  return {
+      "bug_key": f"gh_issue:{repo_slug}#{num_s}",
+      "source": "github",
+      "id": num_s,
+      "tracker_flavor": "github",
+      "short_id": short_id,
+      "url": str(issue.get("url") or f"https://github.com/{repo_slug}/issues/{num_s}"),
+      "title": str(issue.get("title") or f"{short_id}"),
+      "status": state_str,
+      "state_reason": "",
+      "priority": "P2",
+      "severity": "",
+      "issue_type": "BUG",
+      "assignee": ", ".join(assignees),
+      "reporter": issue_author,
+      "labels": [],
+      "created_time": created_raw,
+      "modified_time": mod_raw,
+      "modified_et": mod_et,
+      "modified_age": mod_age,
+      "modified_ts": _parse_ts(mod_raw),
+      "slo": {},
+      "due_date": "",
+      "gerrit_cl_ids": [],
+      "from_self_query": False,
+      "is_mentioned": True,
+      "last_human_comment_author": act_author,
+      "last_human_comment_at": act_iso,
+      "last_human_comment_snippet": act_snip,
+      "last_self_comment_at": my_last_iso,
+  }
+
+
 def fetch_github_bugs(
     extra_issue_nums: set[str] | None = None,
     errors_out: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-  """Fetches open and recently closed flutter/flutter GitHub issues for Rusino."""
+  """Fetches assigned GitHub issues and unanswered @Rusino issue mentions across repos."""
   closed_since = (
       datetime.now(timezone.utc) - timedelta(days=BUG_RECENT_CLOSED_DAYS)
   ).strftime("%Y-%m-%d")
@@ -7991,6 +8468,7 @@ def fetch_github_bugs(
       raw_by_num[c_num]["state_reason"] = r_issue["state_reason"]
 
   bugs: list[dict[str, Any]] = []
+  seen_bkeys: set[str] = set()
   self_gh = {u.lower() for u in SELF_GITHUB_LOGINS}
   for num, d in raw_by_num.items():
     labels = [
@@ -8033,8 +8511,10 @@ def fetch_github_bugs(
         for a in (d.get("assignees") or [])
         if isinstance(a, dict) and a.get("login")
     ]
+    bkey = f"gh_issue:flutter/flutter#{num}"
+    seen_bkeys.add(bkey)
     bugs.append({
-        "bug_key": f"gh_issue:flutter/flutter#{num}",
+        "bug_key": bkey,
         "source": "github",
         "id": num,
         "tracker_flavor": "github",
@@ -8065,6 +8545,74 @@ def fetch_github_bugs(
         "last_human_comment_snippet": last_human_snip,
         "last_self_comment_at": last_self_at,
     })
+
+  # Discover open non-assigned GitHub issues involving or notifying @Rusino across all repos
+  mention_candidates: list[tuple[str, str]] = []
+  seen_cand: set[tuple[str, str]] = set()
+  try:
+    out_inv = subprocess.check_output(
+        [
+            "gh",
+            "api",
+            "-X",
+            "GET",
+            "search/issues",
+            "-f",
+            "q=is:open is:issue involves:Rusino -assignee:Rusino",
+            "-f",
+            "sort=updated",
+            "-f",
+            "per_page=30",
+        ],
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=12,
+    )
+    for it in (json.loads(out_inv) or {}).get("items") or []:
+      # Ignore PRs returned by GitHub's unified issues/PR search endpoint
+      if not isinstance(it, dict) or it.get("pull_request"):
+        continue
+      m_repo = re.search(
+          r"github\.com/([^/]+/[^/]+)/issues/(\d+)", str(it.get("html_url") or "")
+      )
+      if m_repo:
+        pair = (m_repo.group(1), m_repo.group(2))
+        # Deduplicate against already-loaded assigned issues so each issue is fetched once
+        if pair not in seen_cand and f"gh_issue:{pair[0]}#{pair[1]}" not in seen_bkeys:
+          seen_cand.add(pair)
+          mention_candidates.append(pair)
+  except (OSError, subprocess.SubprocessError, ValueError):
+    pass
+
+  # Supplement search with notifications API to catch cross-repo mentions before search indexing
+  try:
+    out_notif = subprocess.check_output(
+        ["gh", "api", "notifications?all=true&per_page=30"],
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=10,
+    )
+    for n in json.loads(out_notif) or []:
+      if not isinstance(n, dict):
+        continue
+      subj_obj = n.get("subject") or {}
+      if str(subj_obj.get("type") or "") != "Issue":
+        continue
+      m_api = re.search(
+          r"/repos/([^/]+/[^/]+)/issues/(\d+)$", str(subj_obj.get("url") or "")
+      )
+      if m_api:
+        pair = (m_api.group(1), m_api.group(2))
+        if pair not in seen_cand and f"gh_issue:{pair[0]}#{pair[1]}" not in seen_bkeys:
+          seen_cand.add(pair)
+          mention_candidates.append(pair)
+  except (OSError, subprocess.SubprocessError, ValueError):
+    pass
+
+  for repo_slug, m_num in mention_candidates[:20]:
+    evaluated = _evaluate_github_mention_issue(repo_slug, m_num, self_gh)
+    if evaluated is not None:
+      bugs.append(evaluated)
   return bugs
 
 
@@ -8452,9 +9000,13 @@ def classify_bug_status(
       hrs = max(1, int((dts - cur_now) // 3600))
       soon_notes.append(f"{label} due in {hrs}h ({et_str or raw_s})")
 
-  # Collaborators are not responsible for the issue assignee's SLO deadlines
+  # Collaborators and non-assigned mentions are not responsible for the assignee's SLO deadlines
   is_collab = bool(bug.get("is_collaborator"))
-  if not is_collab:
+  is_mentioned = bool(bug.get("is_mentioned"))
+  is_non_owner = is_collab or (
+      is_mentioned and not _is_self_bug_assignee(str(bug.get("assignee") or ""))
+  )
+  if not is_non_owner:
     if overdue_notes:
       bug["is_overdue"] = True
       bug["slo_summary"] = overdue_notes[0]
@@ -8546,14 +9098,14 @@ def classify_bug_status(
   recent_created = created_ts > 0 and (cur_now - created_ts) <= 7 * 86400
   # Only the assignee owns CL creation and issue closure when linked CLs merge
   unacked_urgent = (
-      not is_collab
+      not is_non_owner
       and (not has_cl or only_wip_cls)
       and effective_ack_ts <= 0.0
       and (pri in ("P0", "P1") or itype == "VULNERABILITY")
       and (status == "NEW" or recent_created)
   )
   all_merged_unacked = (
-      not is_collab
+      not is_non_owner
       and all_cls_merged
       and (
           effective_ack_ts < latest_merged_ts
@@ -8564,7 +9116,11 @@ def classify_bug_status(
 
   if unacked_comment:
     snip = str(bug.get("last_human_comment_snippet") or "").strip()
-    prefix = "Collaborator · " if is_collab else ""
+    prefix = (
+        "Collaborator · "
+        if is_collab
+        else ("Mentioned · " if is_mentioned else "")
+    )
     bug["needs_you"] = True
     bug["why_needs_you"] = (
         f"{prefix}New comment from {human_author}: {snip}"
@@ -8635,6 +9191,9 @@ def should_autostart_bug_triage(bug: dict[str, Any]) -> bool:
     return False
   # Release merge requests follow the 6-gate confirm/reassign flow rather than bug-triage
   if is_merge_request_bug(bug) or bool(bug.get("is_security_merge_request")):
+    return False
+  # Unassigned @Rusino GitHub mentions surface passively without spawning LLM chats
+  if bool(bug.get("is_mentioned")):
     return False
   if bug.get("conversation_id") or not bug.get("needs_you"):
     return False
@@ -9101,7 +9660,7 @@ def _should_retain_bug_in_view(
     bug: dict[str, Any],
     primary_self_bkeys: set[str] | None = None,
 ) -> bool:
-  """Retains a bug in the Bugs tab only when owned, collaborated, or self-CL-linked."""
+  """Retains a bug in the Bugs tab when owned, collaborated, self-CL-linked, or unacked mention."""
   bkey = str(bug.get("bug_key") or "")
   if primary_self_bkeys is not None and bkey in primary_self_bkeys:
     return True
@@ -9109,10 +9668,22 @@ def _should_retain_bug_in_view(
     return True
   if _is_self_bug_assignee(str(bug.get("assignee") or "")):
     return True
-  return any(
+  if any(
       isinstance(c, dict) and bool(c.get("is_self"))
       for c in (bug.get("linked_cls") or [])
-  )
+  ):
+    return True
+  # Non-assigned @mentions stay visible only while unacknowledged or linked to an active chat
+  if bool(bug.get("is_mentioned")):
+    if str(bug.get("conversation_id") or "").strip() and not bug.get("chat_archived"):
+      return True
+    human_ts = _parse_ts(bug.get("last_human_comment_at"))
+    eff_ack = max(
+        _parse_ts(bug.get("last_self_comment_at")),
+        float(bug.get("acked_ts") or 0.0),
+    )
+    return human_ts > eff_ack
+  return False
 
 
 def sync_bugs_into_state(
@@ -9125,6 +9696,7 @@ def sync_bugs_into_state(
   """Polls Buganizer/crbug and GitHub issues with a 5-min TTL and links them to CLs."""
   pnames = proj_names if proj_names is not None else load_project_names()
   prev_bugs: dict[str, Any] = state.get("bugs") or {}
+  bug_acks: dict[str, Any] = state.setdefault("bug_acks", {})
   items: dict[str, Any] = state.setdefault("items", {})
   events: list[dict[str, Any]] = state.setdefault("events", [])
   bug_chats = discover_bug_chats(include_archived=False)
@@ -9138,7 +9710,11 @@ def sync_bugs_into_state(
     link_bugs_and_cls(prev_bugs, items, bug_chats=merged_chats)
     pruned_fast: dict[str, dict[str, Any]] = {}
     for bk, b in prev_bugs.items():
-      if not isinstance(b, dict) or not _should_retain_bug_in_view(b):
+      if not isinstance(b, dict):
+        continue
+      if bk in bug_acks:
+        b["acked_ts"] = max(float(b.get("acked_ts") or 0.0), float(bug_acks[bk] or 0.0))
+      if not _should_retain_bug_in_view(b):
         continue
       pruned_fast[bk] = b
     for b in pruned_fast.values():
@@ -9291,6 +9867,7 @@ def sync_bugs_into_state(
       primary_self_bkeys.add(bkey)
     merged_gh = merge_bug_record_with_prev(gh_b, prev_bugs.get(bkey))
     merged_gh["is_collaborator"] = False
+    merged_gh["is_mentioned"] = bool(gh_b.get("is_mentioned"))
     all_bugs[bkey] = merged_gh
   # Keep cached GitHub bugs across transient or partial gh CLI/auth failures
   if gh_errors:
@@ -9306,6 +9883,13 @@ def sync_bugs_into_state(
         ):
           primary_self_bkeys.add(bkey)
   state["bug_sync_errors"] = gh_errors
+
+  # Restore persistent acked_ts watermarks so pruned @mentions do not resurrect on 5-min syncs
+  for bkey, bug in all_bugs.items():
+    if bkey in bug_acks:
+      bug["acked_ts"] = max(
+          float(bug.get("acked_ts") or 0.0), float(bug_acks[bkey] or 0.0)
+      )
 
   # Link bugs <-> CLs BEFORE project fallback so self-CL chats propagate project & titles
   link_bugs_and_cls(all_bugs, items, bug_chats=merged_chats)
@@ -9391,7 +9975,7 @@ def sync_bugs_into_state(
       )
       del events[50:]
 
-    # Auto-start bug triage for unchatted Needs You bugs (excluding merge requests & closures)
+    # Auto-start bug triage for unchatted Needs You bugs (excluding merge requests & @mentions)
     if wake_chats and should_autostart_bug_triage(bug):
       claim_key = f"bug:{bkey}:{bug.get('last_human_comment_at') or bug.get('created_time') or 'init'}"
       if claim_key not in review_claims and auto_started_bugs < 1 and busy_chats < 2:
@@ -9452,14 +10036,19 @@ def ack_bug_items(bug_keys: list[str]) -> dict[str, Any]:
     bug = bugs.get(bkey)
     if not isinstance(bug, dict):
       continue
-    bug["acked_ts"] = max(
+    acked_val = max(
         now_ts,
         float(bug.get("modified_ts") or 0.0),
         _parse_ts(bug.get("last_human_comment_at")),
         float(bug.get("latest_cl_merged_ts") or 0.0),
     )
+    bug["acked_ts"] = acked_val
+    state.setdefault("bug_acks", {})[bkey] = acked_val
     classify_bug_status(bug, now_ts=now_ts)
     last_lane = str(bug.get("lane") or "assigned")
+    if not _should_retain_bug_in_view(bug):
+      bugs.pop(bkey, None)
+      last_lane = "dismissed"
     acked.append(bkey)
   if not acked:
     return {"ok": False, "error": f"Unknown bug {keys[0]}"}
@@ -9582,11 +10171,21 @@ def sync_once(
             preferred_host=str(d.get("preferred_host") or ""),
         )
       elif d["kind"] == "github":
-        gh_repo = str(d.get("repo_slug") or d.get("preferred_host") or "").strip()
+        _, prev_gh_rec = _lookup_state_item(prev_items, ikey)
+        raw_gh_repo = str(
+            d.get("repo_slug")
+            or (prev_gh_rec or {}).get("repo_slug")
+            or d.get("preferred_host")
+            or "flutter/flutter"
+        ).strip()
+        if raw_gh_repo.startswith("github.com/"):
+          raw_gh_repo = raw_gh_repo[len("github.com/") :]
+        gh_repo_slug = raw_gh_repo or "flutter/flutter"
+        # Omit default repo_slug keyword so 1-arg mocks on flutter/flutter keep working
         fetched_cache[ikey] = (
-            fetch_github_pr_status(tid, repo_slug=gh_repo)
-            if gh_repo
-            else fetch_github_pr_status(tid)
+            fetch_github_pr_status(tid)
+            if gh_repo_slug == "flutter/flutter"
+            else fetch_github_pr_status(tid, repo_slug=gh_repo_slug)
         )
       else:
         fetched_cache[ikey] = fetch_piper_cl_status(tid)
@@ -9676,11 +10275,19 @@ def sync_once(
           ),
       )
     elif comp_kind == "github":
-      comp_repo = str(d.get("repo_slug") or d_info.get("host") or "").strip()
+      raw_comp_repo = str(
+          d.get("repo_slug")
+          or d_info.get("repo_slug")
+          or d_info.get("host")
+          or "flutter/flutter"
+      ).strip()
+      if raw_comp_repo.startswith("github.com/"):
+        raw_comp_repo = raw_comp_repo[len("github.com/") :]
+      comp_repo_slug = raw_comp_repo or "flutter/flutter"
       fetched_cache[comp_to] = (
-          fetch_github_pr_status(comp_tid, repo_slug=comp_repo)
-          if comp_repo and comp_repo not in ("github.com/flutter/flutter", "flutter/flutter")
-          else fetch_github_pr_status(comp_tid)
+          fetch_github_pr_status(comp_tid)
+          if comp_repo_slug == "flutter/flutter"
+          else fetch_github_pr_status(comp_tid, repo_slug=comp_repo_slug)
       )
     elif comp_kind == "piper":
       fetched_cache[comp_to] = fetch_piper_cl_status(comp_tid)
@@ -9804,6 +10411,8 @@ def sync_once(
 
   new_items: dict[str, Any] = {}
   ls_summaries: dict[str, Any] | None = None
+  triage_dir = _triage_results_dir()
+  preflight_cache: dict[str, Any] | None = None
 
   for d in active_discovered:
     ikey = d["item_key"]
@@ -9938,16 +10547,27 @@ def sync_once(
 
     if cid and _is_assigned_reviewer_record(record) and not record.get("chat_busy"):
       # Throttled children keep their pre-transition patchset floor until woken
-      prior_reviewed_floor = prev.get("pending_wake_from_ps", prev.get("patchset"))
+      prior_reviewed_floor = (
+          prev.get("reviewed_ps")
+          or prev.get("pending_wake_from_ps")
+          or (
+              prev.get("patchset")
+              if (prev and prev.get("conversation_id") == cid and "reviewed_ps" not in prev)
+              else 0
+          )
+      )
       record["reviewed_ps"] = max(
           int(record.get("reviewed_ps") or 0),
           int(
               record.get("review_target_ps")
               or prior_reviewed_floor
-              or record.get("patchset")
-              or 1
+              or (0 if prev else (record.get("patchset") or 1))
           ),
       )
+    if prev.get("audited_msg_date"):
+      record["audited_msg_date"] = prev["audited_msg_date"]
+    elif not prev:
+      record["audited_msg_date"] = str(info.get("last_msg_date") or "")
     post = info.get("post_submit") or {}
     if post:
       # Key post-submit rolls on state changes to track duration in each status bucket
@@ -10080,64 +10700,21 @@ def sync_once(
             f"Игнорируй предыдущий CRITICAL ALERT."
         )
       elif (
-          info["status"] in ("NEW", "OPEN")
-          and (
-              info["patchset"] != prev.get("pending_wake_from_ps", prev_ps)
-              or info["last_msg_date"]
-              != prev.get("pending_wake_from_msg_date", prev_msg_date)
-          )
+          not _is_assigned_reviewer_record(record)
+          and info["status"] in ("NEW", "OPEN")
+          and (info["patchset"] != prev_ps or info["last_msg_date"] != prev_msg_date)
           and info["last_msg_author"] not in SELF_EMAILS
           and info["last_msg_author"] not in SELF_GITHUB_LOGINS
           # Ignore SkCQ dry-run bot messages so they do not wake the chat for a reply
           and not info["last_msg_author"].endswith(".gserviceaccount.com")
           and info["in_my_attention"]
       ):
-        eff_prev_ps = prev.get("pending_wake_from_ps", prev_ps)
-        eff_prev_msg_date = prev.get("pending_wake_from_msg_date", prev_msg_date)
-        cand_msg = (
+        transition_msg = (
             f"[CL-WATCHER] 💬 Новое обновление в {ikey} (PS{info['patchset']}) от "
             f"{info['last_msg_author']}: {info['last_msg_snippet']}. "
             f"Проведи инкрементальный триаж/анализ, подготовь черновик ответа "
             f"и запиши вердикт через triage_store.py save-review."
         )
-        if _is_assigned_reviewer_record(record):
-          # Gate reviewer wakeups with the same concurrency and stack-parent limits as auto-start
-          if cid and not info.get("is_wip") and not info.get("is_draft"):
-            cur_ps = int(info.get("patchset") or 1)
-            claim_key = (
-                f"{ikey}:{cur_ps}:{info.get('last_msg_date') or ''}"
-                if cur_ps == eff_prev_ps
-                else f"{ikey}:{cur_ps}"
-            )
-            if claim_key not in review_claims:
-              if (
-                  wake_chats
-                  and auto_started_count < 1
-                  and busy_review_chats < 2
-                  and not _has_unready_open_stack_parent(
-                      ikey, active_by_ikey, fetched_cache, new_items, prev_items
-                  )
-              ):
-                was_busy = bool(record.get("chat_busy"))
-                if wake_conversation(cid, cand_msg):
-                  record["review_target_ps"] = cur_ps
-                  record["chat_busy"] = True
-                  record["chat_woken_ts"] = time.time()
-                  review_claims[claim_key] = {"cid": cid, "ts": time.time()}
-                  auto_started_count += 1
-                  if not was_busy:
-                    busy_review_chats += 1
-                  transition_msg = cand_msg
-                  already_woken = True
-                else:
-                  record["pending_wake_from_ps"] = eff_prev_ps
-                  record["pending_wake_from_msg_date"] = eff_prev_msg_date
-              else:
-                # Preserve pre-transition baseline so throttled or deferred items wake next poll
-                record["pending_wake_from_ps"] = eff_prev_ps
-                record["pending_wake_from_msg_date"] = eff_prev_msg_date
-        else:
-          transition_msg = cand_msg
 
       if transition_msg:
         ev = {
@@ -10159,56 +10736,209 @@ def sync_once(
         if cid and wake_chats and not already_woken:
           wake_conversation(cid, transition_msg)
 
-    if (
-        wake_chats
-        and not cid
-        and _is_assigned_reviewer_record(record)
+    # Route assigned reviewer CLs/PRs through deterministic Tier 0/1/2 pre-gate
+    is_reviewer_candidate = (
+        _is_assigned_reviewer_record(record)
         and str(info.get("status") or "").upper() in ("NEW", "OPEN")
         and not info.get("is_wip")
         and not info.get("is_draft")
-        and info.get("in_my_attention")
-    ):
+        and bool(info.get("in_my_attention"))
+        and not record.get("chat_busy")
+        and (not cid or bool(prev))
+    )
+    if is_reviewer_candidate:
+      prev_triage = _load_triage_for_watcher(
+          d["kind"], str(tid), triage_dir
+      )
       cur_ps = int(info.get("patchset") or 1)
-      claim_key = f"{ikey}:{cur_ps}"
-      if (
-          claim_key not in review_claims
-          and auto_started_count < 1
-          and busy_review_chats < 2
-          and not _has_unready_open_stack_parent(
-              ikey, active_by_ikey, fetched_cache, new_items, prev_items
-          )
+      cur_rev = str(info.get("head_sha") or info.get("revision") or "")
+      audited_ps = max(
+          int((prev_triage or {}).get("triaged_patchset") or 0),
+          int(record.get("reviewed_ps") or 0),
+          int(record.get("review_target_ps") or 0),
+      )
+      audited_rev = str((prev_triage or {}).get("triaged_revision") or "")
+      if not audited_rev and prev and int(prev.get("patchset") or 0) == audited_ps:
+        audited_rev = str(prev.get("head_sha") or prev.get("revision") or "")
+      delta_info = audit_gate.classify_patchset_delta(
+          kind=d["kind"],
+          host=str(
+              info.get("host") or d.get("preferred_host") or GERRIT_SKIA_HOST
+          ),
+          repo_slug=str(
+              info.get("repo_slug")
+              or d.get("repo_slug")
+              or info.get("project")
+              or ("flutter/flutter" if d["kind"] == "github" else "skia")
+          ),
+          target_id=str(tid),
+          prev_ps=audited_ps,
+          cur_ps=cur_ps,
+          prev_rev=audited_rev,
+          cur_rev=cur_rev,
+          revisions_by_ps=info.get("revisions_by_ps"),
+          changed_files=info.get("files") or (),
+          skia_git_dir=skia_dir if d["kind"] == "gerrit" else "",
+      )
+      last_author = str(info.get("last_msg_author") or "")
+      last_date = str(info.get("last_msg_date") or "")
+      watermarked_msg_date = str(
+          prev.get("audited_msg_date") or prev.get("last_msg_date") or ""
+      )
+      has_new_ext_msg = bool(
+          prev
+          and last_date
+          and last_date != watermarked_msg_date
+          and last_author not in SELF_EMAILS
+          and last_author not in SELF_GITHUB_LOGINS
+          and not last_author.endswith(".gserviceaccount.com")
+      )
+      if preflight_cache is None and (
+          delta_info["delta_kind"]
+          not in ("unchanged", "rebase_only", "commit_msg_only")
+          or delta_info.get("upstream_module_overlap")
+          or has_new_ext_msg
       ):
-        prompt = (
-            f"Проведи review-triage для {info.get('url') or ikey} "
-            f"('{info.get('subject') or ikey}', PS{cur_ps}), подготовь разбор ревью "
-            "(никогда не публикуй комментарии ревью без моего подтверждения) и запиши вердикт "
-            "через triage_store.py save-review."
+        preflight_cache = audit_gate.check_audit_preflight()
+      action = audit_gate.decide_audit_action(
+          item=record,
+          prev_triage=prev_triage,
+          delta_info=delta_info,
+          has_new_external_msg=has_new_ext_msg,
+          msg_snippet=str(info.get("last_msg_snippet") or ""),
+          open_external_threads=int(info.get("open_external_threads") or 0),
+          preflight=preflight_cache,
+      )
+      tier = int(action.get("tier", -1))
+      if tier == 0:
+        triage_store.record_tier0_delta_verdict(
+            target_id=str(tid),
+            kind=d["kind"],
+            patchset=cur_ps,
+            revision=cur_rev,
+            delta_kind=str(action.get("delta_kind") or "rebase_only"),
+            summary=str(action.get("summary") or ""),
+            draft=str(action.get("draft") or ""),
+            files=info.get("files") or (),
+            results_dir=triage_dir,
         )
-        res = _start_pinned_chat_for_record(
-            new_items, ikey, composite_key, record, prompt
+        record["reviewed_ps"] = max(int(record.get("reviewed_ps") or 0), cur_ps)
+        record["review_target_ps"] = max(
+            int(record.get("review_target_ps") or 0), cur_ps
         )
-        if res.get("ok"):
-          cid = str(res.get("conversation_id") or "")
-          composite_key = str(record.get("composite_key") or composite_key)
-          review_claims[claim_key] = {"cid": cid, "ts": time.time()}
-          auto_started_count += 1
-          busy_review_chats += 1
-          events.insert(
-              0,
-              {
-                  "id": f"ev-{int(time.time() * 1000)}-{tid}",
-                  "time": now_et_str(),
-                  "item_key": ikey,
-                  "target_id": tid,
-                  "conversation_id": cid,
-                  "project_name": d["project_name"],
-                  "critical": False,
-                  "message": (
-                      f"[CL-WATCHER] 🔍 Auto-started code review for {ikey} "
-                      f"(PS{cur_ps}) in chat {cid[:8]}."
-                  ),
-              },
-          )
+        record["audited_msg_date"] = last_date
+        if action.get("claim_key"):
+          review_claims[str(action["claim_key"])] = {
+              "cid": cid or "tier0",
+              "ts": time.time(),
+          }
+      elif action.get("audit_state") == "blocked_auth":
+        triage_store.record_audit_status(
+            target_id=str(tid),
+            kind=d["kind"],
+            patchset=cur_ps,
+            revision=cur_rev,
+            audit_state="blocked_auth",
+            audit_error=str(action.get("reason") or "LOAS expired"),
+            results_dir=triage_dir,
+        )
+      elif tier == -1:
+        record["audited_msg_date"] = last_date
+      elif wake_chats and tier in (1, 2):
+        claim_key = str(action.get("claim_key") or f"{ikey}:{cur_ps}")
+        if (
+            claim_key not in review_claims
+            and auto_started_count < 1
+            and busy_review_chats < 2
+            and not _has_unready_open_stack_parent(
+                ikey, active_by_ikey, fetched_cache, new_items, prev_items
+            )
+        ):
+          prompt = str(action.get("prompt") or "")
+          if cid:
+            woken = wake_conversation(cid, prompt)
+            if woken:
+              record["review_target_ps"] = cur_ps
+              record["chat_busy"] = True
+              record["chat_woken_ts"] = time.time()
+              record["audited_msg_date"] = last_date
+              review_claims[claim_key] = {"cid": cid, "ts": time.time()}
+              auto_started_count += 1
+              busy_review_chats += 1
+              triage_store.record_audit_status(
+                  target_id=str(tid),
+                  kind=d["kind"],
+                  patchset=cur_ps,
+                  revision=cur_rev,
+                  audit_state="running",
+                  results_dir=triage_dir,
+              )
+              events.insert(
+                  0,
+                  {
+                      "id": f"ev-{int(time.time() * 1000)}-{tid}",
+                      "time": now_et_str(),
+                      "item_key": ikey,
+                      "target_id": tid,
+                      "conversation_id": cid,
+                      "project_name": d["project_name"],
+                      "critical": False,
+                      "message": (
+                          f"[CL-WATCHER] 🔍 Triggered Tier {tier} audit for "
+                          f"{ikey} (PS{cur_ps}) in chat {cid[:8]}."
+                      ),
+                  },
+              )
+              events = events[:50]
+          else:
+            m_tier = str(action.get("model_tier") or "pro")
+            # Pass model_tier only when non-default so 5-arg start mocks keep working
+            res = (
+                _start_pinned_chat_for_record(
+                    new_items, ikey, composite_key, record, prompt
+                )
+                if m_tier == "pro"
+                else _start_pinned_chat_for_record(
+                    new_items,
+                    ikey,
+                    composite_key,
+                    record,
+                    prompt,
+                    model_tier=m_tier,
+                )
+            )
+            if res.get("ok"):
+              cid = str(res.get("conversation_id") or "")
+              composite_key = str(record.get("composite_key") or composite_key)
+              record["audited_msg_date"] = last_date
+              review_claims[claim_key] = {"cid": cid, "ts": time.time()}
+              auto_started_count += 1
+              busy_review_chats += 1
+              triage_store.record_audit_status(
+                  target_id=str(tid),
+                  kind=d["kind"],
+                  patchset=cur_ps,
+                  revision=cur_rev,
+                  audit_state="running",
+                  results_dir=triage_dir,
+              )
+              events.insert(
+                  0,
+                  {
+                      "id": f"ev-{int(time.time() * 1000)}-{tid}",
+                      "time": now_et_str(),
+                      "item_key": ikey,
+                      "target_id": tid,
+                      "conversation_id": cid,
+                      "project_name": d["project_name"],
+                      "critical": False,
+                      "message": (
+                          f"[CL-WATCHER] 🔍 Auto-started code review for {ikey} "
+                          f"(PS{cur_ps}) in chat {cid[:8]}."
+                      ),
+                  },
+              )
+              events = events[:50]
 
     # Auto-rerequest GitHub reviewers dropped from reviewRequests after author push
     if d.get("kind") == "github" and record.get("reviewer_pings"):
@@ -10218,6 +10948,9 @@ def sync_once(
           record["reviewer_pings"],
           github_rerequest_ledger,
           do_request=bool(wake_chats),
+          repo_slug=str(
+              info.get("repo_slug") or d.get("repo_slug") or "flutter/flutter"
+          ),
       )
       if rereq_users:
         events.insert(
@@ -10395,7 +11128,11 @@ def sync_once(
       abandon_companion_items(auto_abandon_keys, state=state, auto=True)
       events = state["events"]
 
-  triage_store.overlay_triage_on_items(new_items.values())
+  triage_store.overlay_triage_on_items(
+      new_items.values(),
+      results_dir=triage_dir,
+      ingest_tmp=(triage_dir is None),
+  )
   if sync_bugs:
     sync_bugs_into_state(
         state,
@@ -10607,6 +11344,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .eyebrow .verdict-pill.v-reassign, .eyebrow .verdict-pill.v-stale {
     background: color-mix(in srgb, var(--ink) 8%, transparent); color: var(--graphite);
   }
+  .eyebrow .verdict-pill.v-auditing {
+    background: color-mix(in srgb, var(--blue) 15%, transparent); color: var(--blue);
+  }
+  .eyebrow .verdict-pill.v-blocked_auth {
+    background: color-mix(in srgb, var(--red) 15%, transparent); color: var(--red);
+  }
   .card.alert .eyebrow { color: var(--red); }
   .card h2 { font: 600 13px/1.25 var(--display); letter-spacing: -.01em; margin: 2px 0 3px; }
   .card .why { font-size: 11.5px; line-height: 1.35; color: var(--graphite); }
@@ -10807,6 +11550,36 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .badge.triage-corpus_failed {
     background: color-mix(in srgb, var(--red) 15%, transparent);
     color: var(--red);
+  }
+  .badge.triage-auditing {
+    background: color-mix(in srgb, var(--blue) 15%, transparent);
+    color: var(--blue);
+  }
+  .badge.triage-blocked_auth {
+    background: color-mix(in srgb, var(--red) 15%, transparent);
+    color: var(--red);
+  }
+  .badge.triage-delta {
+    background: color-mix(in srgb, var(--ink) 8%, transparent);
+    color: var(--graphite);
+  }
+  .triage-hunks, .triage-threads {
+    flex-basis: 100%; display: flex; flex-wrap: wrap; align-items: center;
+    gap: 4px 8px; font-size: 10.5px; color: var(--graphite); margin-top: 2px;
+  }
+  .triage-hunk-chip {
+    font-family: var(--mono); font-size: 10px; padding: 1px 6px; border-radius: 5px;
+    background: color-mix(in srgb, var(--blue) 10%, transparent); color: var(--blue);
+    text-decoration: none;
+  }
+  .triage-hunk-chip:hover { text-decoration: underline; }
+  .triage-modal-section {
+    margin-bottom: 10px; padding: 8px 10px; border-radius: 8px;
+    background: color-mix(in srgb, var(--ink) 3.5%, transparent); font-size: 11px;
+  }
+  .triage-modal-section h4 {
+    margin: 0 0 4px; font: 600 10.5px var(--sans); color: var(--graphite);
+    text-transform: uppercase; letter-spacing: .03em;
   }
   .card .triage-box {
     grid-column: 1 / -1; margin-top: 8px; padding: 6px 10px; border-radius: 8px;
@@ -13010,6 +13783,16 @@ function effectiveCorpusStatus(it) {
 // Computes triage badge and eyebrow labels without allowing green LGTM when corpus is blocked
 function triageBadgeInfo(it) {
   const tr = (it && it.triage) || {};
+  const auditState = String(tr.audit_state || '').toLowerCase();
+  if (auditState === 'running' && Boolean(it && it.chat_busy)) {
+    const tgtPs = Number(tr.audit_target_patchset || (it && it.patchset) || 1);
+    const lbl = `🔄 Auditing PS${tgtPs}…`;
+    return {cls: 'triage-auditing', pillCls: 'v-auditing', label: lbl, eyebrow: lbl};
+  }
+  if (auditState === 'blocked_auth') {
+    const lbl = '🔒 Audit paused: run gcert';
+    return {cls: 'triage-blocked_auth', pillCls: 'v-blocked_auth', label: lbl, eyebrow: lbl};
+  }
   const out = String(tr.review_outcome || tr.verdict || 'SURGICAL_AUDIT').toUpperCase();
   const revPs = Number(tr.triaged_patchset || (it && it.reviewed_ps) || (it && it.patchset) || 1);
   const curPs = Number((it && it.patchset) || 1);
@@ -13066,6 +13849,68 @@ function triageBadgeInfo(it) {
   };
 }
 
+function coreHunkUrl(it, hunk, ps) {
+  const baseUrl = String((it && it.url) || '').replace(/\/+$/, '');
+  const fpath = String((hunk && hunk.file) || '').replace(/^\/+/, '');
+  if (!baseUrl || !fpath) return baseUrl;
+  if (it && it.kind === 'gerrit') {
+    const mLine = String((hunk && hunk.lines) || '').match(/\d+/);
+    const anchor = mLine ? `#${mLine[0]}` : '';
+    return `${baseUrl}/${ps}/${fpath}${anchor}`;
+  }
+  return `${baseUrl}/files`;
+}
+
+// Convert URLs and CL/PR/bug references in triage report text into safe clickable anchors
+function linkifyTriageText(raw, it) {
+  const text = String(raw || '');
+  if (!text) return '';
+  const gHost = (it && it.kind === 'gerrit' && it.host)
+    ? String(it.host) : 'skia-review.googlesource.com';
+  const ghRepo = (it && it.repo_slug) ? String(it.repo_slug) : 'flutter/flutter';
+  const tokenRe = new RegExp(
+    '(https?://[^\\s<>)"\'`]+)' +
+    '|\\bGerrit\\s+(\\d{5,9})(?:\\s+PS(\\d+))?\\b' +
+    '|\\bcrrev/c/(\\d{5,9})(?:\\s+PS(\\d+))?\\b' +
+    '|\\bPR\\s+#(\\d{3,8})\\b' +
+    '|\\bb/(\\d{6,12})\\b' +
+    '|\\bcrbug(?:/|\\.com/)(\\d{5,12})\\b',
+    'g'
+  );
+  let out = '';
+  let lastIdx = 0;
+  let m;
+  while ((m = tokenRe.exec(text)) !== null) {
+    out += esc(text.slice(lastIdx, m.index));
+    let matched = m[0];
+    let trailing = '';
+    let href = '';
+    if (m[1]) {
+      while (/[.,;:!?]$/.test(matched)) {
+        trailing = matched.slice(-1) + trailing;
+        matched = matched.slice(0, -1);
+      }
+      href = matched;
+    } else if (m[2]) {
+      href = `https://${gHost}/c/${m[2]}${m[3] ? '/' + m[3] : ''}`;
+    } else if (m[4]) {
+      href = `https://chromium-review.googlesource.com/c/${m[4]}${m[5] ? '/' + m[5] : ''}`;
+    } else if (m[6]) {
+      href = `https://github.com/${ghRepo}/pull/${m[6]}`;
+    } else if (m[7]) {
+      href = `https://b.corp.google.com/issues/${m[7]}`;
+    } else if (m[8]) {
+      href = `https://issues.chromium.org/issues/${m[8]}`;
+    }
+    out += href
+      ? `<a href="${esc(href)}" target="_blank" rel="noopener">${esc(matched)}</a>${esc(trailing)}`
+      : esc(m[0]);
+    lastIdx = m.index + m[0].length;
+  }
+  out += esc(text.slice(lastIdx));
+  return out;
+}
+
 function renderTriageModal(it) {
   const root = typeof document !== 'undefined'
     ? document.getElementById('triage-modal-root') : null;
@@ -13073,6 +13918,7 @@ function renderTriageModal(it) {
   const tr = it.triage;
   const bInfo = triageBadgeInfo(it);
   const key = it.item_key || it.target_id;
+  const keyJson = esc(JSON.stringify(key));
   const hasDraft = Boolean(tr.draft && tr.draft.trim());
   const canFin = canFinalizeCleanReview(it) || currentTriageModalTab === 'finalize';
   const activeTab = currentTriageModalTab || (hasDraft ? 'draft' : 'report');
@@ -13080,9 +13926,43 @@ function renderTriageModal(it) {
   const content = activeTab === 'draft'
     ? (tr.draft || 'No draft comment required.')
     : (tr.report_markdown || 'No report available.');
+  const revPs = Number(tr.triaged_patchset || it.patchset || 1);
+  const hunks = Array.isArray(tr.core_hunks) ? tr.core_hunks : [];
+  const threads = Array.isArray(tr.open_thread_verdicts) ? tr.open_thread_verdicts : [];
+
+  let structuredHtml = '';
+  if (activeTab === 'report') {
+    if (hunks.length) {
+      const hLinks = hunks.map(h => {
+        const baseName = String(h.file || '').split('/').pop() || h.file;
+        const lbl = h.lines ? `${baseName}:${h.lines}` : baseName;
+        const note = h.note ? ` — ${esc(h.note)}` : '';
+        return `<div><a class="triage-hunk-chip" href="${esc(coreHunkUrl(it, h, revPs))}" ` +
+          `target="_blank" rel="noopener">${esc(lbl)}</a>${note}</div>`;
+      }).join('');
+      structuredHtml += `<div class="triage-modal-section"><h4>Core Hunks</h4>${hLinks}</div>`;
+    }
+    if (threads.length) {
+      const tRows = threads.map(tv => {
+        const who = tv.author ? `<b>${esc(tv.author)}</b> ` : '';
+        const loc = tv.loc ? `<code>${esc(tv.loc)}</code> ` : '';
+        const verd = tv.verdict ? `[${esc(tv.verdict)}] ` : '';
+        return `<div>${who}${loc}${verd}${esc(tv.note || '')}</div>`;
+      }).join('');
+      structuredHtml += `<div class="triage-modal-section">` +
+        `<h4>Open Thread Verdicts</h4>${tRows}</div>`;
+    }
+  }
+  const renderedContent = activeTab === 'draft'
+    ? esc(content)
+    : linkifyTriageText(content, it);
+  const saveGerritBtn = (hasDraft && it.kind === 'gerrit')
+    ? `<button class="triage-btn" style="margin-bottom: 6px;" ` +
+      `onclick="saveGerritDraft(${keyJson}, this)">Save to Gerrit Draft</button>`
+    : '';
   const bodyHtml = isFinalizeTab
     ? renderFinalizeTabHtml(it)
-    : `<div class="triage-pre">${esc(content)}</div>`;
+    : `${structuredHtml}<div class="triage-pre">${renderedContent}</div>`;
 
   root.innerHTML = `
     <div class="triage-modal-backdrop" onclick="if (event.target === this) closeTriageModal()">
@@ -13104,24 +13984,54 @@ function renderTriageModal(it) {
           ${hasDraft ? `
             <button class="triage-tab${activeTab === 'draft' ? ' active' : ''}"
               onclick="currentTriageModalTab='draft'; ` +
-              `renderTriageModal(findItemByKey(${esc(JSON.stringify(key))}))">
+              `renderTriageModal(findItemByKey(${keyJson}))">
               Review Draft
             </button>` : ''}
           <button class="triage-tab${activeTab === 'report' ? ' active' : ''}"
             onclick="currentTriageModalTab='report'; ` +
-            `renderTriageModal(findItemByKey(${esc(JSON.stringify(key))}))">
+            `renderTriageModal(findItemByKey(${keyJson}))">
             Triage Report
           </button>
           ${(hasDraft && !isFinalizeTab) ? `
-            <button class="triage-btn primary" style="margin-left: auto; margin-bottom: 6px;"
-              onclick="copyTriageDraft(${esc(JSON.stringify(key))}, this)">` +
-              `Copy Draft</button>` : ''}
+            <span style="margin-left: auto; display: inline-flex; gap: 6px;">
+              ${saveGerritBtn}
+              <button class="triage-btn primary" style="margin-bottom: 6px;"
+                onclick="copyTriageDraft(${keyJson}, this)">Copy Draft</button>
+            </span>` : ''}
         </div>
         <div class="triage-modal-body">
           ${bodyHtml}
         </div>
       </div>
     </div>`;
+}
+
+async function saveGerritDraft(key, btn) {
+  const it = findItemByKey(key);
+  if (!it || it.kind !== 'gerrit' || !it.triage || !it.triage.draft) return;
+  const orig = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Saving…';
+  }
+  try {
+    const r = await fetch('/api/save_gerrit_draft', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({item_key: key}),
+    });
+    const d = await r.json();
+    if (btn) {
+      btn.textContent = d && d.ok ? `Saved PS${d.patchset || ''} draft ✓` : 'Save failed';
+    }
+  } catch (e) {
+    if (btn) btn.textContent = 'Save failed';
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      setTimeout(() => { btn.textContent = orig; }, 2400);
+    }
+  }
 }
 
 async function copyTriageDraft(key, btn) {
@@ -13167,9 +14077,19 @@ function triageHtml(it, compact) {
   const badge = `<span class="badge ${esc(bInfo.cls)}">${esc(bInfo.label)}</span>`;
   const time = tr.review_time_label
     ? `<span class="triage-time">${esc(tr.review_time_label)}</span>` : '';
-  const summary = tr.summary
-    ? `<span class="triage-summary">${esc(tr.summary)}</span>` : '';
-  const revPs = Number(tr.triaged_patchset || 1);
+  const deltaMap = {
+    rebase_only: 'rebase-only',
+    commit_msg_only: 'msg-only',
+    thread_only: 'thread-only',
+  };
+  const deltaLbl = deltaMap[String(tr.delta_kind || '')] || '';
+  const deltaPill = deltaLbl
+    ? `<span class="badge triage-delta">${esc(deltaLbl)}</span>` : '';
+  const summaryText = (String(tr.audit_state || '') === 'blocked_auth' && tr.audit_error)
+    ? tr.audit_error : tr.summary;
+  const summary = summaryText
+    ? `<span class="triage-summary">${esc(summaryText)}</span>` : '';
+  const revPs = Number(tr.triaged_patchset || it.patchset || 1);
   const curPs = Number(it.patchset || 1);
   // GitHub PR pushes keep patchset=1 before any review, so distinguish commit drift from PS drift
   const stale = isTriageStale(it)
@@ -13182,12 +14102,26 @@ function triageHtml(it, compact) {
   const corpusMeta = (!isTriageStale(it) && cStat === 'passed')
     ? ` · ${esc(corpusDisplayName(tr))} OK`
     : '';
-  const meta = `<span class="triage-meta">PS${esc(revPs)}${corpusMeta} · ` +
-    `${esc(tr.triaged_at_et || '')}</span>`;
+  const meta = tr.triaged_patchset
+    ? `<span class="triage-meta">PS${esc(revPs)}${corpusMeta} · ` +
+      `${esc(tr.triaged_at_et || '')}</span>`
+    : '';
 
   const key = it.item_key || it.target_id;
   const keyJson = esc(JSON.stringify(key));
   const hasDraft = Boolean(tr.draft && tr.draft.trim());
+
+  let hunksHtml = '';
+  if (!compact && Array.isArray(tr.core_hunks) && tr.core_hunks.length) {
+    const chips = tr.core_hunks.map(h => {
+      const baseName = String(h.file || '').split('/').pop() || h.file;
+      const lbl = h.lines ? `${baseName}:${h.lines}` : baseName;
+      const tip = h.note ? `${h.file}:${h.lines} — ${h.note}` : `${h.file}`;
+      return `<a class="triage-hunk-chip" href="${esc(coreHunkUrl(it, h, revPs))}" ` +
+        `title="${esc(tip)}" target="_blank" rel="noopener">${esc(lbl)}</a>`;
+    }).join(' ');
+    hunksHtml = `<div class="triage-hunks">Hunks: ${chips}</div>`;
+  }
 
   let actions = '';
   if (canFinalizeCleanReview(it)) {
@@ -13199,12 +14133,20 @@ function triageHtml(it, compact) {
       `onclick="openTriageModal(${keyJson}, 'draft')">Draft</button>`;
     actions += `<button class="triage-btn" ` +
       `onclick="copyTriageDraft(${keyJson}, this)">Copy</button>`;
+    if (it.kind === 'gerrit') {
+      actions += `<button class="triage-btn" ` +
+        `onclick="saveGerritDraft(${keyJson}, this)">Save to Gerrit Draft</button>`;
+    }
   }
-  actions += `<button class="triage-btn" ` +
-    `onclick="openTriageModal(${keyJson}, 'report')">Report</button>`;
+  const hasOpenThreadVerdicts =
+    Array.isArray(tr.open_thread_verdicts) && tr.open_thread_verdicts.length > 0;
+  if (tr.report_markdown || hasOpenThreadVerdicts) {
+    actions += `<button class="triage-btn" ` +
+      `onclick="openTriageModal(${keyJson}, 'report')">Report</button>`;
+  }
 
-  return `<div class="triage-box">${badge}${time}${stale}${summary}${meta}` +
-    `<span class="triage-actions">${actions}</span></div>`;
+  return `<div class="triage-box">${badge}${deltaPill}${time}${stale}${summary}${meta}` +
+    `<span class="triage-actions">${actions}</span>${hunksHtml}</div>`;
 }
 
 // Tracks which (reviewer::item_key) pairs the user unchecked in the Reviewer Pings panel
@@ -13663,11 +14605,14 @@ if (typeof document !== 'undefined' && typeof document.addEventListener === 'fun
   }, true);
 }
 
-// Render completed code review outcome pill in focus card eyebrow
+// Render completed code review outcome or live audit status pill in focus card eyebrow
 function reviewVerdictEyebrowHtml(it) {
   // Author and watching items do not display review outcome badges
   if (!isReviewerChange(it)) return '';
-  if (it.triage && it.triage.review_outcome) {
+  const tr = it && it.triage;
+  const isAuditingLive = Boolean(tr && tr.audit_state === 'running' && it.chat_busy);
+  const isBlockedAuth = Boolean(tr && tr.audit_state === 'blocked_auth');
+  if (tr && (tr.review_outcome || isAuditingLive || isBlockedAuth)) {
     const bInfo = triageBadgeInfo(it);
     return `<span class="verdict-pill ${esc(bInfo.pillCls)}">${esc(bInfo.eyebrow)}</span> · `;
   }
@@ -15330,6 +16275,7 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
         "/api/approve_review_preview",
         "/api/approve_review",
         "/api/reassign_merge",
+        "/api/save_gerrit_draft",
     ):
       length = int(self.headers.get("Content-Length") or 0)
       raw_body = (
@@ -15367,6 +16313,11 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
             ids,
             parent_id=str(bdict.get("parent_id") or ""),
             comment_markdown=str(bdict.get("comment_markdown") or ""),
+        )
+      elif parsed.path == "/api/save_gerrit_draft":
+        res = save_gerrit_draft_for_item(
+            str(bdict.get("item_key") or ""),
+            str(bdict.get("draft") or ""),
         )
       elif parsed.path == "/api/add_reviewer":
         raw_keys = bdict.get("item_keys")
