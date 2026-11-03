@@ -1,4 +1,3 @@
-//googlex/gcam/creative_camera/video_storytelling/video_renderers/skottie_renderer:skottie_renderer_test
 //music/imagecomposition/service/listeningreview/stats/fillers/animations:stats_card_animation_filler_test
 //music/imagecomposition/service/musicanalytics:artist_recap_image_handler_test
 //music/imagecomposition/service/musicanalytics:get_analytics_image_handler_test

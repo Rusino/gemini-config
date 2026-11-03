@@ -45,8 +45,11 @@ DEFAULT_SEEDS = (
     "//third_party/skia/HEAD/modules/skunicode/include:apple_hdrs",
 )
 
+# Skip non-paragraph eternal (3600s) video-storytelling Skottie test and full engine/core trees
 EXCLUDED_BRANCHES = frozenset(
     {
+        "//googlex/gcam/creative_camera/video_storytelling/video_renderers/"
+        "skottie_renderer:skottie_renderer_test",
         "//third_party/flutter_engine:skia",
         "//third_party/skia/HEAD:skia_build_test",
     }

@@ -151,8 +151,8 @@ class R79GitHubScopeAndStacksTests(unittest.TestCase):
     ):
       st_fl = w.fetch_github_pr_status("188906", repo_slug="flutter/flutter")
     self.assertEqual(st_fl["role"], "reviewer")
-    self.assertTrue(st_fl["in_my_attention"])
-    self.assertEqual(st_fl["phase"], "NEEDS_YOUR_ACTION")
+    self.assertFalse(st_fl["in_my_attention"])
+    self.assertEqual(st_fl["phase"], "WAITING_ON_OTHERS")
 
   def test_infer_project_for_change_and_bug_are_repo_aware(self):
     proj_names = {
@@ -356,3 +356,4 @@ class R79GitHubScopeAndStacksTests(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+

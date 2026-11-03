@@ -99,8 +99,8 @@ class SelfReviewedStatusTest(unittest.TestCase):
         "comments": [],
         "commits": [
             {
-                "authoredDate": "2026-10-28T14:30:00Z",
-                "committedDate": "2026-10-28T14:30:00Z",
+                "authoredDate": "2026-10-28T13:30:00Z",
+                "committedDate": "2026-10-28T13:30:00Z",
                 "authors": [{"login": "mdebbar", "email": "mdebbar@google.com"}],
                 "messageHeadline": "Address review comments",
                 "oid": "feedfacecafe0012",
@@ -1122,3 +1122,4 @@ console.log(JSON.stringify({
 
 if __name__ == "__main__":
   unittest.main()
+

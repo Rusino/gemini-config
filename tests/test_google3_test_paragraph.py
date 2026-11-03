@@ -238,7 +238,12 @@ class Google3TestParagraphTests(unittest.TestCase):
         fast = pg3._read_targets_file(DATA_DIR / "fast_targets.txt")
         slow = pg3._read_targets_file(DATA_DIR / "slow_targets.txt")
         self.assertEqual(len(fast), 1139)
-        self.assertEqual(len(slow), 13)
+        self.assertEqual(len(slow), 12)
+        self.assertNotIn(
+            "//googlex/gcam/creative_camera/video_storytelling/video_renderers/"
+            "skottie_renderer:skottie_renderer_test",
+            slow,
+        )
         self.assertIn("//third_party/skia/HEAD:skia_build_test", fast)
         self.assertIn("//third_party/skia/HEAD:skia_build_test_linux", fast)
         self.assertEqual(len(set(fast)), len(fast))
