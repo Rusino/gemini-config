@@ -327,6 +327,32 @@ class R79GitHubScopeAndStacksTests(unittest.TestCase):
     self.assertEqual(by_key["github:195602"]["stack_root_ikey"], "github:195601")
     self.assertEqual(by_key["github:195602"]["stack_size"], 2)
 
+  def test_load_ignored_cls_preserves_repo_qualified_github_pr_keys(self):
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tf:
+      tf.write(
+          "# List of Gerrit CL and GitHub PR IDs to ignore\n"
+          "580176\n"
+          "airbnb/lottie-web#3106  # stale 2024 external PR\n"
+      )
+      tmp_path = tf.name
+    try:
+      self.assertEqual(
+          w.load_ignored_cls(tmp_path),
+          {"580176", "airbnb/lottie-web#3106"},
+      )
+    finally:
+      os.unlink(tmp_path)
+
+    repo_ignored = os.path.join(
+        REPO_ROOT, "skills", "review-triage", "ignored_cls.txt"
+    )
+    loaded_default = w.load_ignored_cls(repo_ignored)
+    self.assertIn("airbnb/lottie-web#3106", loaded_default)
+    self.assertNotIn("airbnb/lottie-web", loaded_default)
+    self.assertNotIn("3106", loaded_default)
+
 
 if __name__ == "__main__":
   unittest.main()

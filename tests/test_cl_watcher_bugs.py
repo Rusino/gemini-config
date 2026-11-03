@@ -1313,6 +1313,7 @@ assert(!lanesHtml.includes('>Landing<'), 'Empty Landing tab must be omitted');
 
 assert.strictEqual(selectedSection.cls, null, 'Default selectedSection.cls must be null');
 assert(!lanesHtml.includes('class="lane sec-panel open"'), 'No panel open by default');
+assert(!lanesHtml.includes('class="sec-close"'), 'Closed tabs must not render close mark');
 
 toggleSection('desk');
 assert.strictEqual(selectedSection.cls, 'desk');
@@ -1320,6 +1321,30 @@ const deskHtml = getEl('lanes').innerHTML;
 assert(deskHtml.includes('data-section="desk"'), 'Must have desk panel');
 assert(!deskHtml.includes('data-section="desk" hidden'), 'Desk panel must not be hidden');
 assert(deskHtml.includes('data-section="waiting" hidden'), 'Waiting panel must be hidden');
+assert(
+  deskHtml.includes('<span class="sec-close" aria-hidden="true">✕</span>'),
+  'Active tab pill must render close mark'
+);
+assert.strictEqual(
+  (deskHtml.match(/class="sec-close"/g) || []).length, 1,
+  'Only the single active tab pill may render close mark'
+);
+assert(
+  deskHtml.includes(
+    'class="link-btn sec-close-btn" onclick="toggleSection(&quot;desk&quot;)">Hide ✕</button>'
+  ),
+  'Open desk lane header must render Hide ✕ button'
+);
+
+toggleSection('pings');
+assert.strictEqual(selectedSection.cls, 'pings');
+const pingsHtml = getEl('lanes').innerHTML;
+assert(
+  pingsHtml.includes(
+    'class="link-btn sec-close-btn" onclick="toggleSection(&quot;pings&quot;)">Hide ✕</button>'
+  ),
+  'Open Reviewer Pings header must render Hide ✕ button'
+);
 
 toggleSection('waiting');
 assert.strictEqual(selectedSection.cls, 'waiting');
@@ -1342,8 +1367,19 @@ assert(bugLanes.includes('Assigned'), 'Must render Assigned tab');
 assert(bugLanes.includes('Backlog (>60d)'), 'Must render Backlog tab');
 toggleSection('backlog');
 assert.strictEqual(selectedSection.bugs, 'backlog');
-assert(!getEl('lanes').innerHTML.includes('data-section="backlog" hidden'), 'Backlog open');
-assert(getEl('lanes').innerHTML.includes('data-section="assigned" hidden'), 'Assigned hidden');
+const openBugLanes = getEl('lanes').innerHTML;
+assert(!openBugLanes.includes('data-section="backlog" hidden'), 'Backlog open');
+assert(openBugLanes.includes('data-section="assigned" hidden'), 'Assigned hidden');
+assert(
+  openBugLanes.includes('<span class="sec-close" aria-hidden="true">✕</span>'),
+  'Active bug tab pill must render close mark'
+);
+assert(
+  openBugLanes.includes(
+    'class="link-btn sec-close-btn" onclick="toggleSection(&quot;backlog&quot;)">Hide ✕</button>'
+  ),
+  'Open backlog lane header must render Hide ✕ button'
+);
 `;
 vm.runInThisContext(scriptContent + '\n' + harness);
 """

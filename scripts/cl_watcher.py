@@ -2739,14 +2739,18 @@ def _build_fix_entry(rec: dict[str, Any], fix_self_label: str) -> dict[str, Any]
 
 
 def load_ignored_cls(path: str = IGNORED_CLS_FILE) -> set[str]:
-  """Reads permanently ignored Gerrit CL IDs from review-triage's ignore list."""
+  """Reads permanently ignored Gerrit CL and GitHub PR IDs from review-triage's ignore list."""
   ignored: set[str] = set()
   if not os.path.isfile(path):
     return ignored
   try:
     with open(path, "r", encoding="utf-8") as f:
       for raw in f:
-        line = raw.split("#", 1)[0].strip()
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+          continue
+        # Strip inline `# comment` only after whitespace so `owner/repo#123` keys stay intact
+        line = re.split(r"\s+#", stripped, maxsplit=1)[0].strip()
         if line:
           ignored.add(line)
   except OSError:
@@ -13080,6 +13084,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .lane-head h3 { font: 600 12.5px var(--display); letter-spacing: -.01em; }
   .lane-head .n { color: var(--graphite); font-size: 11px; }
   .lane-head .hint { margin-left: auto; font-size: 10.5px; color: var(--graphite); }
+  /* Right-align Hide ✕ whether or not the lane header also renders a .hint span */
+  .sec-close-btn {
+    margin-left: auto; font-size: 10.5px; color: var(--graphite); white-space: nowrap;
+  }
+  .sec-close-btn:hover { color: var(--ink); text-decoration: none; }
+  .lane-head .hint + .sec-close-btn,
+  .pings-head .hint + .sec-close-btn { margin-left: 4px; }
   /* Single-select switcher bar keeps secondary sections collapsed below Needs you by default */
   .sec-tabs {
     margin-top: 22px; padding-bottom: 8px; border-bottom: 1px solid var(--hairline);
@@ -13095,6 +13106,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   .sec-tab.on { background: var(--ink); color: var(--paper); border-color: var(--ink); }
   .sec-tab .n { font-size: 10.5px; opacity: .75; }
+  .sec-tab .sec-close { font-size: 9.5px; opacity: .75; margin-left: 1px; line-height: 1; }
+  .sec-tab.on:hover .sec-close { opacity: 1; }
   section.lane.sec-panel { margin-top: 12px; }
   .sec-panel[hidden] { display: none !important; }
   .sec-panel .pings-wrap { margin-top: 0; }
@@ -16320,6 +16333,8 @@ function renderPingsSection(shownItems) {
           `${groups.length} reviewer${groups.length === 1 ? '' : 's'}</span>
         <span class="hint">Lost +1 on rebase, updated after +1, or waiting for 2nd approval — ` +
           `copy one message per reviewer</span>
+        <button type="button" class="link-btn sec-close-btn" ` +
+          `onclick="toggleSection(${esc(JSON.stringify('pings'))})">Hide ✕</button>
       </div>
       ${cards}
     </section>`;
@@ -17181,10 +17196,15 @@ function toggleSection(secId) {
   render();
 }
 
-function laneSectionBodyHtml(title, count, hint, itemsHtml) {
+// Renders secondary lane header and rows, pairing secId with an explicit Hide ✕ control
+function laneSectionBodyHtml(title, count, hint, itemsHtml, secId = '') {
   const hintHtml = hint ? `<span class="hint">${hint}</span>` : '';
+  const closeHtml = secId
+    ? `<button type="button" class="link-btn sec-close-btn" ` +
+      `onclick="toggleSection(${esc(JSON.stringify(secId))})">Hide ✕</button>`
+    : '';
   return `<div class="lane-head"><h3>${title}</h3><span class="n">${count}</span>` +
-    `${hintHtml}</div>${itemsHtml}`;
+    `${hintHtml}${closeHtml}</div>${itemsHtml}`;
 }
 
 // Renders a single-select toolbar of non-empty secondary sections with 0 or 1 open panel
@@ -17194,10 +17214,12 @@ function renderSecondarySectionsHtml(view, sections) {
   const openId = sections.some(s => s.id === activeId) ? activeId : null;
   const tabs = sections.map(s => {
     const isOn = openId === s.id;
+    const closeMark = isOn ? '<span class="sec-close" aria-hidden="true">✕</span>' : '';
+    const titleAttr = isOn ? ' title="Click to hide section"' : '';
     return `<button type="button" class="sec-tab${isOn ? ' on' : ''}" ` +
-      `aria-expanded="${isOn ? 'true' : 'false'}" ` +
+      `aria-expanded="${isOn ? 'true' : 'false'}"${titleAttr} ` +
       `onclick="toggleSection(${esc(JSON.stringify(s.id))})">` +
-      `${s.title}<span class="n">${s.count}</span></button>`;
+      `${s.title}<span class="n">${s.count}</span>${closeMark}</button>`;
   }).join('');
   const panels = sections.map(s => {
     const isOn = openId === s.id;
@@ -17572,7 +17594,7 @@ function render() {
           bugSections.push({
             id: 'assigned', title: l.title, count: act.length,
             bodyHtml: laneSectionBodyHtml(
-              l.title, act.length, l.hint, act.map(b => bugRowHtml(b, data)).join('')
+              l.title, act.length, l.hint, act.map(b => bugRowHtml(b, data)).join(''), 'assigned'
             ),
           });
         }
@@ -17581,7 +17603,7 @@ function render() {
             id: 'backlog', title: 'Backlog (>60d)', count: stale.length,
             bodyHtml: laneSectionBodyHtml(
               'Backlog (>60d)', stale.length, 'Unchatted assigned bugs older than 60 days',
-              stale.map(b => bugRowHtml(b, data)).join('')
+              stale.map(b => bugRowHtml(b, data)).join(''), 'backlog'
             ),
           });
         }
@@ -17597,7 +17619,8 @@ function render() {
                 u.kind === 'merge_group'
                   ? groupedMergeLaneRowHtml(u.bugs, u.parentId, data)
                   : bugRowHtml(u.bug, data)
-              ).join('')
+              ).join(''),
+              l.id
             ),
           });
         }
@@ -17605,7 +17628,7 @@ function render() {
         bugSections.push({
           id: l.id, title: l.title, count: list.length,
           bodyHtml: laneSectionBodyHtml(
-            l.title, list.length, l.hint, list.map(b => bugRowHtml(b, data)).join('')
+            l.title, list.length, l.hint, list.map(b => bugRowHtml(b, data)).join(''), l.id
           ),
         });
       }
@@ -17619,7 +17642,8 @@ function render() {
         bugSections.push({
           id: ck, title: ct, count: byBug[ck].length,
           bodyHtml: laneSectionBodyHtml(
-            ct, byBug[ck].length, closedHints[ck], byBug[ck].map(b => bugRowHtml(b, data)).join('')
+            ct, byBug[ck].length, closedHints[ck],
+            byBug[ck].map(b => bugRowHtml(b, data)).join(''), ck
           ),
         });
       }
@@ -17690,7 +17714,7 @@ function render() {
       clSections.push({
         id: l.id, title: l.title, count: by[l.id].length,
         bodyHtml: laneSectionBodyHtml(
-          l.title, by[l.id].length, l.hint, renderLaneItemsHtml(by[l.id], data)
+          l.title, by[l.id].length, l.hint, renderLaneItemsHtml(by[l.id], data), l.id
         ),
       });
     }
@@ -17700,7 +17724,7 @@ function render() {
       id: 'done', title: 'Done', count: by.done.length,
       bodyHtml: laneSectionBodyHtml(
         'Done', by.done.length, 'Recently merged or abandoned',
-        renderLaneItemsHtml(by.done, data)
+        renderLaneItemsHtml(by.done, data), 'done'
       ),
     });
   }

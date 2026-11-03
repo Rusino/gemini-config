@@ -1,2 +1,3 @@
-# List of Gerrit CL IDs to ignore in daily review triage
+# List of Gerrit CL and GitHub PR IDs to ignore in daily review triage
 580176
+airbnb/lottie-web#3106
