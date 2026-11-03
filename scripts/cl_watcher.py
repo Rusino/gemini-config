@@ -7513,6 +7513,14 @@ def merge_bug_record_with_prev(
     ):
       merged["title"] = prev_title
       merged["title_redacted"] = False
+    # Keep closed state_reason across transient gh api enrichment failures
+    if (
+        merged.get("status") == "CLOSED"
+        and not merged.get("state_reason")
+        and prev.get("status") == "CLOSED"
+        and prev.get("state_reason")
+    ):
+      merged["state_reason"] = str(prev["state_reason"])
     if prev.get("tracker_flavor") == "crbug" and merged.get("tracker_flavor") != "crbug":
       merged["tracker_flavor"] = "crbug"
       merged["short_id"] = f"crbug/{merged['id']}"
@@ -7738,15 +7746,66 @@ def fetch_buganizer_fallback(query: str, limit: int = 100) -> list[dict[str, Any
   return []
 
 
+def _run_gh_json(
+    cmd: list[str],
+    label: str,
+    timeout_sec: int,
+    errors_out: list[str] | None = None,
+    ignore_not_found: bool = False,
+) -> Any:
+  """Runs a `gh` JSON command, logging stderr and recording failures on error."""
+  try:
+    res = subprocess.run(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=timeout_sec,
+        check=False,
+    )
+  except (OSError, subprocess.SubprocessError) as exc:
+    msg = f"GitHub {label}: {exc}"
+    print(f"[cl_watcher] {msg}", file=sys.stderr, flush=True)
+    if errors_out is not None:
+      errors_out.append(msg)
+    return None
+  if res.returncode != 0:
+    detail = " ".join((res.stderr or res.stdout or "").split())[:200]
+    msg = (
+        f"GitHub {label} exited {res.returncode}: {detail}"
+        if detail
+        else f"GitHub {label} exited {res.returncode}"
+    )
+    print(f"[cl_watcher] {msg}", file=sys.stderr, flush=True)
+    # Deleted or non-issue numbers in PR text are expected misses, not broken syncs
+    is_missing = ignore_not_found and (
+        "could not resolve to an issue" in detail.lower()
+        or "http 404" in detail.lower()
+    )
+    if errors_out is not None and not is_missing:
+      errors_out.append(msg)
+    return None
+  try:
+    return json.loads(res.stdout or "null")
+  except ValueError as exc:
+    msg = f"GitHub {label} invalid JSON: {exc}"
+    print(f"[cl_watcher] {msg}", file=sys.stderr, flush=True)
+    if errors_out is not None:
+      errors_out.append(msg)
+    return None
+
+
 def fetch_github_bugs(
     extra_issue_nums: set[str] | None = None,
+    errors_out: list[str] | None = None,
 ) -> list[dict[str, Any]]:
   """Fetches open and recently closed flutter/flutter GitHub issues for Rusino."""
   closed_since = (
       datetime.now(timezone.utc) - timedelta(days=BUG_RECENT_CLOSED_DAYS)
   ).strftime("%Y-%m-%d")
+  # Omit stateReason from --json because Debian gh 2.46 rejects that field on Linux
   fields = (
-      "number,title,state,stateReason,author,assignees,labels,comments,"
+      "number,title,state,author,assignees,labels,comments,"
       "url,createdAt,updatedAt,closedAt,milestone"
   )
   raw_by_num: dict[str, dict[str, Any]] = {}
@@ -7756,57 +7815,102 @@ def fetch_github_bugs(
       (f"is:closed assignee:Rusino closed:>={closed_since}", "50"),
   )
   for sq, lim in searches:
-    try:
-      out = subprocess.check_output(
-          [
-              "gh",
-              "issue",
-              "list",
-              "--repo",
-              "flutter/flutter",
-              "--search",
-              sq,
-              "--limit",
-              lim,
-              "--json",
-              fields,
-          ],
-          stderr=subprocess.DEVNULL,
-          text=True,
-          timeout=12,
-      )
-      for item in json.loads(out) or []:
-        if isinstance(item, dict) and item.get("number"):
-          num_s = str(item["number"])
-          raw_by_num[num_s] = item
-          self_search_nums.add(num_s)
-    except (OSError, subprocess.SubprocessError, ValueError):
-      continue
+    items = _run_gh_json(
+        [
+            "gh",
+            "issue",
+            "list",
+            "--repo",
+            "flutter/flutter",
+            "--search",
+            sq,
+            "--limit",
+            lim,
+            "--json",
+            fields,
+        ],
+        f"issue list ({sq})",
+        12,
+        errors_out=errors_out,
+    )
+    for item in items or []:
+      if isinstance(item, dict) and item.get("number"):
+        num_s = str(item["number"])
+        raw_by_num[num_s] = item
+        self_search_nums.add(num_s)
 
   for num in sorted(extra_issue_nums or set()):
     if not num or num in raw_by_num:
       continue
-    try:
-      out = subprocess.check_output(
-          [
-              "gh",
-              "issue",
-              "view",
-              str(num),
-              "--repo",
-              "flutter/flutter",
-              "--json",
-              fields,
-          ],
-          stderr=subprocess.DEVNULL,
-          text=True,
-          timeout=10,
-      )
-      item = json.loads(out)
-      if isinstance(item, dict) and item.get("number"):
-        raw_by_num[str(item["number"])] = item
-    except (OSError, subprocess.SubprocessError, ValueError):
+    item = _run_gh_json(
+        [
+            "gh",
+            "issue",
+            "view",
+            str(num),
+            "--repo",
+            "flutter/flutter",
+            "--json",
+            fields,
+        ],
+        f"issue view #{num}",
+        10,
+        errors_out=errors_out,
+        ignore_not_found=True,
+    )
+    if isinstance(item, dict) and item.get("number"):
+      raw_by_num[str(item["number"])] = item
+
+  # Enrich closed issues with REST state_reason so NOT_PLANNED routes to Closed vs Fixed
+  closed_nums = [
+      num
+      for num, d in raw_by_num.items()
+      if str(d.get("state") or "").upper() == "CLOSED"
+      and not d.get("stateReason")
+      and not d.get("state_reason")
+  ]
+  if any(num in self_search_nums for num in closed_nums):
+    rest_closed = _run_gh_json(
+        [
+            "gh",
+            "api",
+            "-X",
+            "GET",
+            "search/issues",
+            "-f",
+            (
+                "q=repo:flutter/flutter is:issue is:closed assignee:Rusino "
+                f"closed:>={closed_since}"
+            ),
+            "-f",
+            "per_page=50",
+        ],
+        "closed issue state_reason search",
+        10,
+        errors_out=errors_out,
+    )
+    if isinstance(rest_closed, dict):
+      for r_it in rest_closed.get("items") or []:
+        if isinstance(r_it, dict) and r_it.get("number"):
+          r_num = str(r_it["number"])
+          if r_num in raw_by_num and r_it.get("state_reason"):
+            raw_by_num[r_num]["state_reason"] = r_it["state_reason"]
+  # Fall back to per-issue REST lookup for extra PR-referenced closed issues
+  for c_num in closed_nums:
+    if (
+        raw_by_num[c_num].get("state_reason")
+        or raw_by_num[c_num].get("stateReason")
+    ):
       continue
+    r_issue = _run_gh_json(
+        ["gh", "api", f"repos/flutter/flutter/issues/{c_num}"],
+        f"issue #{c_num} state_reason",
+        10,
+        errors_out=errors_out,
+        ignore_not_found=True,
+    )
+    if isinstance(r_issue, dict) and r_issue.get("state_reason"):
+      raw_by_num[c_num]["state_reason"] = r_issue["state_reason"]
 
   bugs: list[dict[str, Any]] = []
   self_gh = {u.lower() for u in SELF_GITHUB_LOGINS}
@@ -7860,7 +7964,9 @@ def fetch_github_bugs(
         "url": str(d.get("url") or f"https://github.com/flutter/flutter/issues/{num}"),
         "title": str(d.get("title") or f"Flutter issue #{num}"),
         "status": str(d.get("state") or "OPEN").upper(),
-        "state_reason": str(d.get("stateReason") or "").upper(),
+        "state_reason": str(
+            d.get("stateReason") or d.get("state_reason") or ""
+        ).upper(),
         "priority": pri,
         "severity": "",
         "issue_type": "BUG",
@@ -8560,13 +8666,31 @@ def sync_bugs_into_state(
         b_obj.update(cinfo)
         b_obj["comments_checked_major_mod"] = _bug_comments_mod_stamp(b_obj)
 
-  for gh_b in fetch_github_bugs(extra_issue_nums=ref_gh_nums):
+  gh_errors: list[str] = []
+  fetched_gh = fetch_github_bugs(
+      extra_issue_nums=ref_gh_nums, errors_out=gh_errors
+  )
+  for gh_b in fetched_gh:
     bkey = gh_b["bug_key"]
     if gh_b.get("from_self_query"):
       primary_self_bkeys.add(bkey)
     merged_gh = merge_bug_record_with_prev(gh_b, prev_bugs.get(bkey))
     merged_gh["is_collaborator"] = False
     all_bugs[bkey] = merged_gh
+  # Keep cached GitHub bugs across transient or partial gh CLI/auth failures
+  if gh_errors:
+    for bkey, prev_b in prev_bugs.items():
+      if (
+          isinstance(prev_b, dict)
+          and prev_b.get("source") == "github"
+          and bkey not in all_bugs
+      ):
+        all_bugs[bkey] = dict(prev_b)
+        if prev_b.get("from_self_query") or _is_self_bug_assignee(
+            str(prev_b.get("assignee") or "")
+        ):
+          primary_self_bkeys.add(bkey)
+  state["bug_sync_errors"] = gh_errors
 
   # Link bugs <-> CLs BEFORE project fallback so self-CL chats propagate project & titles
   link_bugs_and_cls(all_bugs, items, bug_chats=merged_chats)
@@ -13592,9 +13716,16 @@ function render() {
         });
       }
     }
-    document.getElementById('lanes').innerHTML = bugSections.length
+    // Surface upstream bug fetcher errors directly above the Bugs tab lanes
+    const bugErrBanner = Array.isArray(data.bug_sync_errors) && data.bug_sync_errors.length
+      ? data.bug_sync_errors.filter(Boolean).map(
+          e => '<div class="stack-blocker-banner"><b>⚠️ Bug sync warning:</b> ' +
+            `<span>${esc(e)}</span></div>`
+        ).join('')
+      : '';
+    document.getElementById('lanes').innerHTML = bugErrBanner + (bugSections.length
       ? renderSecondarySectionsHtml('bugs', bugSections)
-      : (shownBugs.length ? '' : '<p class="empty-note">No tracked bugs in this project.</p>');
+      : (shownBugs.length ? '' : '<p class="empty-note">No tracked bugs in this project.</p>'));
     const projCount = bugProjects.length;
     document.getElementById('footer').textContent =
       `${allBugs.length} tracked bugs across ${projCount} projects · refreshes every 5 min`;

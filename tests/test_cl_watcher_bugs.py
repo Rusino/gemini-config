@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -1480,6 +1482,245 @@ vm.runInThisContext(scriptContent + '\n' + harness);
     self.assertTrue(
         any("Auto-started bug triage" in ev["message"] for ev in state["events"])
     )
+
+  def test_fetch_github_bugs_gh_2_46_fields_and_closed_state_reason(self) -> None:
+    gh_calls: list[list[str]] = []
+
+    def fake_gh(
+        cmd: list[str], *args: object, **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+      del args, kwargs
+      gh_calls.append(list(cmd))
+      # Debian gh 2.46 rejects stateReason in gh issue list/view --json with exit 1
+      if "--json" in cmd:
+        fields_arg = cmd[cmd.index("--json") + 1]
+        if "stateReason" in fields_arg.split(","):
+          return subprocess.CompletedProcess(
+              cmd, 1, "", 'Unknown JSON field: "stateReason"\n'
+          )
+      if cmd[:3] == ["gh", "issue", "list"]:
+        sq = cmd[cmd.index("--search") + 1]
+        if "is:open" in sq:
+          payload = [{
+              "number": 194931,
+              "title": "[Windows][Impeller 3.47 SDF] CJK text rendering",
+              "state": "OPEN",
+              "author": {"login": "reporter1"},
+              "assignees": [{"login": "Rusino"}],
+              "labels": [{"name": "P2"}, {"name": "a: typography"}],
+              "comments": [
+                  {
+                      "author": {"login": "Rusino"},
+                      "createdAt": "2026-11-03T16:00:00Z",
+                      "body": "Looking into this",
+                  },
+                  {
+                      "author": {"login": "reporter1"},
+                      "createdAt": "2026-11-03T17:36:50Z",
+                      "body": "Assigned to Rusino with repro details",
+                  },
+              ],
+              "url": "https://github.com/flutter/flutter/issues/194931",
+              "createdAt": "2026-11-01T10:00:00Z",
+              "updatedAt": "2026-11-03T17:36:50Z",
+              "closedAt": None,
+              "milestone": None,
+          }]
+        else:
+          payload = [{
+              "number": 194296,
+              "title": "[WebParagraph] Duplicate issue",
+              "state": "CLOSED",
+              "author": {"login": "user2"},
+              "assignees": [{"login": "Rusino"}],
+              "labels": [],
+              "comments": [],
+              "url": "https://github.com/flutter/flutter/issues/194296",
+              "createdAt": "2026-10-25T10:00:00Z",
+              "updatedAt": "2026-10-30T10:00:00Z",
+              "closedAt": "2026-10-30T10:00:00Z",
+              "milestone": None,
+          }]
+        return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
+      if cmd[:3] == ["gh", "issue", "view"]:
+        payload_one = {
+            "number": 190001,
+            "title": "Extra referenced closed fix",
+            "state": "CLOSED",
+            "author": {"login": "user3"},
+            "assignees": [],
+            "labels": [],
+            "comments": [],
+            "url": "https://github.com/flutter/flutter/issues/190001",
+            "createdAt": "2026-10-01T10:00:00Z",
+            "updatedAt": "2026-10-28T10:00:00Z",
+            "closedAt": "2026-10-28T10:00:00Z",
+            "milestone": None,
+        }
+        return subprocess.CompletedProcess(cmd, 0, json.dumps(payload_one), "")
+      if cmd[:2] == ["gh", "api"] and "search/issues" in cmd:
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            json.dumps({
+                "items": [{"number": 194296, "state_reason": "not_planned"}]
+            }),
+            "",
+        )
+      if cmd[:2] == ["gh", "api"] and "repos/flutter/flutter/issues/190001" in cmd:
+        return subprocess.CompletedProcess(
+            cmd, 0, json.dumps({"number": 190001, "state_reason": "completed"}), ""
+        )
+      return subprocess.CompletedProcess(cmd, 1, "", "unexpected command")
+
+    def fake_check_output(cmd: list[str], *args: object, **kwargs: object) -> str:
+      res = fake_gh(cmd, *args, **kwargs)
+      if res.returncode != 0:
+        raise subprocess.CalledProcessError(
+            res.returncode, cmd, output=res.stdout, stderr=res.stderr
+        )
+      return res.stdout
+
+    errs: list[str] = []
+    with mock.patch.object(
+        w.subprocess, "run", side_effect=fake_gh
+    ), mock.patch.object(
+        w.subprocess, "check_output", side_effect=fake_check_output
+    ):
+      bugs = w.fetch_github_bugs(extra_issue_nums={"190001"}, errors_out=errs)
+
+    self.assertEqual(errs, [])
+    by_key = {b["bug_key"]: b for b in bugs}
+    self.assertIn("gh_issue:flutter/flutter#194931", by_key)
+    open_b = by_key["gh_issue:flutter/flutter#194931"]
+    self.assertTrue(open_b["from_self_query"])
+    self.assertEqual(open_b["last_human_comment_author"], "reporter1")
+    self.assertEqual(open_b["last_self_comment_at"], "2026-11-03T16:00:00Z")
+
+    not_planned = by_key["gh_issue:flutter/flutter#194296"]
+    self.assertEqual(not_planned["state_reason"], "NOT_PLANNED")
+    w.classify_bug_status(not_planned)
+    self.assertEqual(not_planned["lane"], "closed")
+
+    completed_extra = by_key["gh_issue:flutter/flutter#190001"]
+    self.assertFalse(completed_extra["from_self_query"])
+    self.assertEqual(completed_extra["state_reason"], "COMPLETED")
+    w.classify_bug_status(completed_extra)
+    self.assertEqual(completed_extra["lane"], "fixed")
+
+  def test_github_bug_fetch_failure_logs_stderr_surfaces_error_and_keeps_cache(
+      self,
+  ) -> None:
+    def failing_gh(
+        cmd: list[str], *args: object, **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+      del args, kwargs
+      # Simulate partial failure: open-issues search fails while closed search succeeds
+      if cmd[:3] == ["gh", "issue", "list"] and any("is:closed" in a for a in cmd):
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            json.dumps([{
+                "number": 194296,
+                "title": "[WebParagraph] Closed duplicate",
+                "state": "CLOSED",
+                "author": {"login": "user2"},
+                "assignees": [{"login": "Rusino"}],
+                "labels": [],
+                "comments": [],
+                "url": "https://github.com/flutter/flutter/issues/194296",
+                "createdAt": "2026-10-20T10:00:00Z",
+                "updatedAt": "2026-10-25T10:00:00Z",
+                "closedAt": "2026-10-25T10:00:00Z",
+                "milestone": None,
+            }]),
+            "",
+        )
+      return subprocess.CompletedProcess(
+          cmd, 1, "", 'Unknown JSON field: "stateReason"\n'
+      )
+
+    def failing_check_output(
+        cmd: list[str], *args: object, **kwargs: object
+    ) -> str:
+      res = failing_gh(cmd, *args, **kwargs)
+      if res.returncode != 0:
+        raise subprocess.CalledProcessError(
+            res.returncode, cmd, output=res.stdout, stderr=res.stderr
+        )
+      return res.stdout
+
+    state: dict[str, object] = {
+        "items": {},
+        "bugs": {
+            "gh_issue:flutter/flutter#194931": {
+                "bug_key": "gh_issue:flutter/flutter#194931",
+                "source": "github",
+                "id": "194931",
+                "short_id": "flutter#194931",
+                "status": "OPEN",
+                "priority": "P2",
+                "assignee": "Rusino",
+                "from_self_query": True,
+                "title": "[Windows][Impeller 3.47 SDF] CJK text rendering",
+                "created_time": "2026-11-01T10:00:00Z",
+                "modified_time": "2026-11-03T17:36:50Z",
+                "modified_ts": w._parse_ts("2026-11-03T17:36:50Z"),
+                "linked_cls": [],
+            },
+            "gh_issue:flutter/flutter#194296": {
+                "bug_key": "gh_issue:flutter/flutter#194296",
+                "source": "github",
+                "id": "194296",
+                "short_id": "flutter#194296",
+                "status": "CLOSED",
+                "state_reason": "NOT_PLANNED",
+                "priority": "P2",
+                "assignee": "Rusino",
+                "from_self_query": True,
+                "title": "[WebParagraph] Closed duplicate",
+                "created_time": "2026-10-20T10:00:00Z",
+                "modified_time": "2026-10-25T10:00:00Z",
+                "modified_ts": w._parse_ts("2026-10-25T10:00:00Z"),
+                "linked_cls": [],
+            },
+        },
+        "review_claims": {},
+        "events": [],
+    }
+    err_buf = io.StringIO()
+    with contextlib.redirect_stderr(err_buf), mock.patch.object(
+        w.subprocess, "run", side_effect=failing_gh
+    ), mock.patch.object(
+        w.subprocess, "check_output", side_effect=failing_check_output
+    ), mock.patch.object(
+        w, "call_buganizer_mcp_batch", return_value=["", ""]
+    ), mock.patch.object(
+        w, "fetch_buganizer_fallback", return_value=[]
+    ), mock.patch.object(
+        w, "discover_bug_chats", return_value={}
+    ):
+      w.sync_bugs_into_state(
+          state, force=True, wake_chats=False, proj_names={"p": "SkParagraph"}
+      )
+
+    self.assertIn("stateReason", err_buf.getvalue())
+    sync_errs = state.get("bug_sync_errors")
+    self.assertIsInstance(sync_errs, list)
+    self.assertTrue(any("stateReason" in str(e) for e in sync_errs or []))
+    bugs_after = state.get("bugs") or {}
+    # Cached open GitHub issues survive partial gh CLI failures
+    self.assertIn("gh_issue:flutter/flutter#194931", bugs_after)
+    # Closed NOT_PLANNED state_reason survives transient gh api enrichment failure
+    self.assertEqual(
+        bugs_after["gh_issue:flutter/flutter#194296"]["state_reason"],
+        "NOT_PLANNED",
+    )
+    self.assertEqual(
+        bugs_after["gh_issue:flutter/flutter#194296"]["lane"],
+        "closed",
+    )
+    self.assertIn("bug_sync_errors", w.DASHBOARD_HTML)
 
 
 if __name__ == "__main__":
