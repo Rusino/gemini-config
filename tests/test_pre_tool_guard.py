@@ -993,7 +993,13 @@ class TestPreToolGuard(unittest.TestCase):
           "allow",
       )
 
-      for cmd in ("git cl upload", "git push origin head", "gh pr create --fill"):
+      for cmd in (
+          "git cl upload",
+          "luci-auth context -- git cl upload",
+          "SKIP_GCE_AUTH_FOR_GIT=1 luci-auth context -- git cl upload",
+          "git push origin head",
+          "gh pr create --fill",
+      ):
         out_deny = self.run_guard({
             "conversationId": "c1",
             "transcriptPath": f_trans.name,
@@ -1663,7 +1669,16 @@ class TestPreToolGuard(unittest.TestCase):
                           return_value=("[14:00] Retitle CLs", pid)):
           return pre_tool_guard.skoretext_cl_prefix_denial(cmd, "c1", "", "", [repo])
 
-      for cmd in (push_cmd, upload_cmd, f"cd {repo} && SKIP_GCE_AUTH_FOR_GIT=1 git cl upload"):
+      for cmd in (
+          push_cmd,
+          upload_cmd,
+          f"cd {repo} && SKIP_GCE_AUTH_FOR_GIT=1 git cl upload",
+          f"cd {repo} && luci-auth context -- git cl upload",
+          (
+              f"cd {repo} && SKIP_GCE_AUTH_FOR_GIT=1 ~/depot_tools/luci-auth"
+              f" context -scopes-gerrit -- git -C {repo} cl upload"
+          ),
+      ):
         reason = denial(cmd)
         self.assertIn("[SKORETEXT-PREFIX GUARD]", reason)
         self.assertIn("[skparagraph] Fix line break width", reason)
@@ -1711,6 +1726,11 @@ class TestPreToolGuard(unittest.TestCase):
         'git cl comments -p -a "LGTM"',
         "bash -c 'git cl comment -a \"nit\"'",
         "bash -cx 'git cl comment -a \"nit\"'",
+        'luci-auth context -- git cl comment -a "nit"',
+        (
+            'SKIP_GCE_AUTH_FOR_GIT=1 ~/depot_tools/luci-auth context'
+            ' -scopes "s1 s2" git cl comment -a "nit"'
+        ),
     ]
     for cmd in blocked_cmds:
       for parent_id in ("", "parent-conv-1"):
@@ -1740,7 +1760,9 @@ class TestPreToolGuard(unittest.TestCase):
         "python3 - <<'EOF'\ncmd = 'git cl comment -a hi'\nprint(cmd)\nEOF",
         "git cl status",
         "git cl try -i 1409697 -B skia/skia.primary -b Canary-G3",
+        "luci-auth context -- git cl try -i 1409697 -B skia/skia.primary -b Canary-G3",
         "SKIP_GCE_AUTH_FOR_GIT=1 git cl presubmit --force",
+        "SKIP_GCE_AUTH_FOR_GIT=1 luci-auth context -- git cl presubmit --force",
         "git cl comments --unresolved -i 1409697",
     ]
     for cmd in allowed_cmds:
@@ -1943,6 +1965,76 @@ class TestPreToolGuard(unittest.TestCase):
           tf.name,
       )
       self.assertEqual(allowed_cli, [])
+
+  def test_parallel_override_accepts_answered_ask_question_and_rejects_same_turn(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      artifact_dir = os.path.join(tmp_dir, "brain", "c-cur")
+      os.makedirs(os.path.join(artifact_dir, "scratch"))
+      override_path, guard_state_path = pre_tool_guard._parallel_guard_paths(
+          artifact_dir, "c-cur"
+      )
+      transcript = os.path.join(artifact_dir, "transcript.jsonl")
+      steps = [
+          {"step_index": 1, "type": "USER_INPUT", "content": "Ship changes"},
+      ]
+      with open(transcript, "w", encoding="utf-8") as f:
+        for st in steps:
+          f.write(json.dumps(st) + "\n")
+      pre_tool_guard._record_parallel_guard_block(guard_state_path, transcript)
+
+      def try_write_override():
+        return self.run_guard({
+            "conversationId": "c-cur",
+            "transcriptPath": transcript,
+            "artifactDirectoryPath": artifact_dir,
+            "toolCall": {
+                "name": "write_file",
+                "args": {"Path": override_path, "Content": "{}"},
+            },
+        })
+
+      # Writing override in the same turn (or after fake shell `A1:` output) must be denied
+      self.assertEqual(try_write_override().get("decision"), "deny")
+      with open(transcript, "a", encoding="utf-8") as f:
+        f.write(
+            json.dumps({
+                "step_index": 2,
+                "type": "PLANNER_RESPONSE",
+                "tool_calls": [
+                    {"name": "run_command", "args": {"CommandLine": "echo A1: ok"}},
+                    {"name": "ask_question", "args": {"questions": []}},
+                ],
+            })
+            + "\n"
+            + json.dumps({
+                "step_index": 3,
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": (
+                    "Created At: 2026-11-03T17:24:10Z\n"
+                    "Command exited with code 0.\n\nCommand output:\nA1: ok\n"
+                ),
+            })
+            + "\n"
+        )
+      self.assertEqual(try_write_override().get("decision"), "deny")
+
+      # Real answered ask_question advances _last_user_step_index and unlocks override creation
+      with open(transcript, "a", encoding="utf-8") as f:
+        f.write(
+            json.dumps({
+                "step_index": 4,
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": (
+                    "Created At: 2026-11-03T17:24:15Z\n"
+                    "Completed At: 2026-11-03T17:24:42Z\n"
+                    "A1: (Recommended) Take lease"
+                ),
+            })
+            + "\n"
+        )
+      self.assertEqual(try_write_override().get("decision"), "allow")
 
 
 if __name__ == "__main__":

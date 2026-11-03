@@ -990,6 +990,85 @@ GERRIT_UPLOAD_CMD_RE = re.compile(
     r"(?:cl\s+upload\b|push\b[^;&|\n]*\brefs/for/)"
 )
 REFS_FOR_SPEC_RE = re.compile(r"^\+?([^:\s]*):refs/for/\S+$")
+LUCI_CONTEXT_VALUE_FLAGS = frozenset({
+    "-act-as-service-account",
+    "--act-as-service-account",
+    "-act-via-realm",
+    "--act-via-realm",
+    "-application-default-credentials",
+    "--application-default-credentials",
+    "-credential-helper",
+    "--credential-helper",
+    "-scopes",
+    "--scopes",
+    "-scopes-context",
+    "--scopes-context",
+    "-service-account-json",
+    "--service-account-json",
+    "-token-server-host",
+    "--token-server-host",
+})
+GIT_VALUE_FLAGS = frozenset({
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--exec-path",
+    "--super-prefix",
+    "--config-env",
+})
+
+
+# Advance past leading VAR=val, env, command/nohup/time, and `luci-auth context` wrappers
+def _advance_cmd_wrappers(tokens: list[str], idx: int, end: int) -> int:
+  j = idx
+  while j < end:
+    tok = tokens[j]
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
+      j += 1
+      continue
+    exe = _clean_cmd_token(tok)
+    if exe == "env":
+      j += 1
+      while j < end:
+        et = tokens[j]
+        if et == "--":
+          j += 1
+          break
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", et):
+          j += 1
+          continue
+        if et in ("-u", "--unset", "-C", "--chdir", "-S", "--split-string"):
+          j = min(j + 2, end)
+          continue
+        if et.startswith("-"):
+          j += 1
+          continue
+        break
+      continue
+    if exe in ("command", "nohup", "time"):
+      j += 1
+      if exe in ("command", "time") and j < end and tokens[j] == "-p":
+        j += 1
+      continue
+    if exe == "luci-auth" and j + 1 < end and tokens[j + 1] == "context":
+      j += 2
+      while j < end:
+        lt = tokens[j]
+        if lt == "--":
+          j += 1
+          break
+        if lt in LUCI_CONTEXT_VALUE_FLAGS:
+          j = min(j + 2, end)
+          continue
+        if lt.startswith("-"):
+          j += 1
+          continue
+        break
+      continue
+    break
+  return j
 
 
 # Return (is_upload, local_refs) for a real `git cl upload` (no refs) or for
@@ -998,40 +1077,37 @@ REFS_FOR_SPEC_RE = re.compile(r"^\+?([^:\s]*):refs/for/\S+$")
 # the regex fallback runs only on unbalanced quoting
 def _gerrit_upload_invocation(cmd: str) -> tuple[bool, list[str]]:
   cmd_code = strip_heredocs(cmd)
+  sep_chars = ";&|()\n"
   # Newlines separate commands like `;`, but stay literal inside quoted tokens
-  lexer = shlex.shlex(cmd_code, posix=True, punctuation_chars=";&|()\n")
+  lexer = shlex.shlex(cmd_code, posix=True, punctuation_chars=sep_chars)
   lexer.whitespace = " \t\r"
   lexer.whitespace_split = True
   try:
     tokens = list(lexer)
   except ValueError:
     return bool(GERRIT_UPLOAD_CMD_RE.search(_non_inspection_cmd_segments(cmd))), ["HEAD"]
-  at_cmd_start = True
-  for i, tok in enumerate(tokens):
-    if tok and set(tok) <= set(";&|()\n"):
-      at_cmd_start = True
+  i = 0
+  n = len(tokens)
+  while i < n:
+    if tokens[i] and set(tokens[i]) <= set(sep_chars):
+      i += 1
       continue
-    # Env prefixes such as `SKIP_GCE_AUTH_FOR_GIT=1 git cl upload` keep the command start
-    if at_cmd_start and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
-      continue
-    if not (at_cmd_start and _clean_cmd_token(tok) == "git"):
-      at_cmd_start = False
-      continue
-    at_cmd_start = False
-    j = i + 1
-    while j < len(tokens) and tokens[j].startswith("-"):
-      j += 2 if tokens[j] in ("-C", "-c") else 1
-    args = []
-    for t in tokens[j:]:
-      if t and set(t) <= set(";&|()\n"):
-        break
-      args.append(t)
-    if args[:2] == ["cl", "upload"]:
-      return True, []
-    if args[:1] == ["push"]:
-      refs = [m.group(1) or "HEAD" for m in map(REFS_FOR_SPEC_RE.match, args[1:]) if m]
-      if refs:
-        return True, refs
+    seg_end = i
+    while seg_end < n and not (tokens[seg_end] and set(tokens[seg_end]) <= set(sep_chars)):
+      seg_end += 1
+    cmd_idx = _advance_cmd_wrappers(tokens, i, seg_end)
+    if cmd_idx < seg_end and _clean_cmd_token(tokens[cmd_idx]) == "git":
+      j = cmd_idx + 1
+      while j < seg_end and tokens[j].startswith("-"):
+        j += 2 if tokens[j] in GIT_VALUE_FLAGS else 1
+      args = tokens[j:seg_end]
+      if args[:2] == ["cl", "upload"]:
+        return True, []
+      if args[:1] == ["push"]:
+        refs = [m.group(1) or "HEAD" for m in map(REFS_FOR_SPEC_RE.match, args[1:]) if m]
+        if refs:
+          return True, refs
+    i = seg_end + 1
   return False, []
 
 
@@ -1097,56 +1173,23 @@ def is_git_cl_comment_command(cmd: str, _depth: int = 0) -> bool:
   except ValueError:
     return bool(GIT_CL_COMMENT_FALLBACK_RE.search(_non_inspection_cmd_segments(cmd)))
 
-  at_cmd_start = True
-  in_env = False
-  skip_next = False
-  for i, tok in enumerate(tokens):
-    if skip_next:
-      skip_next = False
+  i = 0
+  n = len(tokens)
+  while i < n:
+    if tokens[i] and set(tokens[i]) <= set(sep_chars):
+      i += 1
       continue
-    if tok and set(tok) <= set(sep_chars):
-      at_cmd_start = True
-      in_env = False
-      continue
-    if at_cmd_start:
-      if in_env:
-        if tok == "--":
-          in_env = False
-          continue
-        if tok in ("-u", "--unset", "-C", "--chdir", "-S", "--split-string"):
-          skip_next = True
-          continue
-        if tok.startswith("-"):
-          continue
-      if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
-        continue
-      exe = _clean_cmd_token(tok)
-      if exe == "env":
-        in_env = True
-        continue
-      if exe in ("command", "nohup", "time"):
-        continue
-      at_cmd_start = False
-
-      seg = []
-      for t in tokens[i + 1 :]:
-        if t and set(t) <= set(sep_chars):
-          break
-        seg.append(t)
-
+    seg_end = i
+    while seg_end < n and not (tokens[seg_end] and set(tokens[seg_end]) <= set(sep_chars)):
+      seg_end += 1
+    cmd_idx = _advance_cmd_wrappers(tokens, i, seg_end)
+    if cmd_idx < seg_end:
+      exe = _clean_cmd_token(tokens[cmd_idx])
+      seg = tokens[cmd_idx + 1 : seg_end]
       if exe == "git":
         j = 0
         while j < len(seg):
-          if seg[j] in (
-              "-C",
-              "-c",
-              "--git-dir",
-              "--work-tree",
-              "--namespace",
-              "--exec-path",
-              "--super-prefix",
-              "--config-env",
-          ):
+          if seg[j] in GIT_VALUE_FLAGS:
             j += 2
           elif seg[j].startswith("-"):
             j += 1
@@ -1184,6 +1227,7 @@ def is_git_cl_comment_command(cmd: str, _depth: int = 0) -> bool:
               return True
             break
           k += 1
+    i = seg_end + 1
   return False
 
 
@@ -1913,13 +1957,34 @@ def roadmap_edit_denial(target_file: str, conv_id: str) -> str:
   )
 
 
-# Track the latest USER_INPUT step so self-overrides in the same turn are rejected
+ASK_QUESTION_ANSWER_RE = re.compile(
+    r"\A(?:Created At: [^\n]*\n)?(?:Completed At: [^\n]*\n)?A\d+:"
+)
+
+
+# Track the latest USER_INPUT or answered ask_question step so self-overrides are rejected
 def _last_user_step_index(transcript_path: str) -> int:
   steps = _load_transcript_steps(transcript_path)
-  for step in reversed(steps):
-    if step.get("type") == "USER_INPUT":
-      return int(step.get("step_index", 0))
-  return 0
+  last_idx = 0
+  pending_ask = False
+  for step in steps:
+    stype = step.get("type")
+    if stype == "USER_INPUT":
+      last_idx = int(step.get("step_index", 0))
+      pending_ask = False
+    elif stype == "PLANNER_RESPONSE":
+      tcs = step.get("tool_calls") or []
+      pending_ask = any(tc.get("name") == "ask_question" for tc in tcs)
+    elif (
+        stype == "GENERIC"
+        and pending_ask
+        and step.get("status") == "DONE"
+        # Require header-anchored `A1:` so run_command/read_file outputs cannot spoof an answer
+        and ASK_QUESTION_ANSWER_RE.search(str(step.get("content", "")))
+    ):
+      last_idx = int(step.get("step_index", 0))
+      pending_ask = False
+  return last_idx
 
 
 def _cross_project_paths(artifact_dir: str, conv_id: str) -> tuple[str, str]:

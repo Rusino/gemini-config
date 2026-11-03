@@ -927,6 +927,167 @@ class TestStopGuard(unittest.TestCase):
       ]
       self.assertEqual(self.run_discipline_stop(tmp_dir, steps), {})
 
+  def test_asan_canary_guard_accepts_luci_auth_context_and_rejects_failed_try(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      base_steps = [
+          {
+              "step_index": 1,
+              "type": "USER_INPUT",
+              "content": "<USER_REQUEST>review CL 1408157</USER_REQUEST>",
+          },
+          {
+              "step_index": 2,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": (
+                          "python3 ~/.gemini/config/skills/skia-canary-advisor/"
+                          "scripts/canary_advisor.py advise --cl 1408157"
+                      )
+                  },
+              }],
+          },
+          {
+              "step_index": 3,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": (
+                  "AGENT ACTION (execute this command):\n"
+                  "  luci-auth context -- git cl try -i 1408157 -B skia/skia.primary"
+                  " -b Bot-ASAN -b Canary-Chromium\n"
+              ),
+          },
+      ]
+      final_step = {
+          "step_index": 8,
+          "type": "PLANNER_RESPONSE",
+          "content": "### Execution Ledger\n- Triage: done\n\n**Case 1: Ideal CL**",
+      }
+
+      # Non-zero exit code from git cl try must NOT satisfy ASAN/CANARY GUARD
+      failed_steps = base_steps + [
+          {
+              "step_index": 4,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": (
+                          "git cl try -i 1408157 -B skia/skia.primary"
+                          " -b Bot-ASAN -b Canary-Chromium"
+                      )
+                  },
+              }],
+          },
+          {
+              "step_index": 5,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": "Command exited with code 1.\n\nSSOAuthenticator: exit status 1\n",
+          },
+          final_step,
+      ]
+      with tempfile.TemporaryDirectory() as tmp_fail:
+        res_fail = self.run_discipline_stop(tmp_fail, failed_steps)
+      self.assertEqual(res_fail.get("decision"), "continue")
+      self.assertIn("[ASAN/CANARY GUARD]", res_fail.get("reason", ""))
+      self.assertIn("Bot-ASAN", res_fail.get("reason", ""))
+
+      # Masked `|| true` failure with SSOAuthenticator error must also be rejected
+      masked_steps = base_steps + [
+          {
+              "step_index": 4,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": (
+                          "git cl try -i 1408157 -B skia/skia.primary"
+                          " -b Bot-ASAN -b Canary-Chromium || true"
+                      )
+                  },
+              }],
+          },
+          {
+              "step_index": 5,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": "Command exited with code 0.\n\nSSOAuthenticator: exit status 1\n",
+          },
+          final_step,
+      ]
+      with tempfile.TemporaryDirectory() as tmp_masked:
+        res_masked = self.run_discipline_stop(tmp_masked, masked_steps)
+      self.assertEqual(res_masked.get("decision"), "continue")
+      self.assertIn("[ASAN/CANARY GUARD]", res_masked.get("reason", ""))
+
+      # Clean exit 0 under luci-auth context satisfies ASAN/CANARY GUARD
+      ok_steps = failed_steps[:-1] + [
+          {
+              "step_index": 6,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": (
+                          "luci-auth context -- git cl try -i 1408157 -B skia/skia.primary"
+                          " -b Bot-ASAN -b Canary-Chromium"
+                      )
+                  },
+              }],
+          },
+          {
+              "step_index": 7,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": "Command exited with code 0.\n\nScheduled builds\n",
+          },
+          final_step,
+      ]
+      with tempfile.TemporaryDirectory() as tmp_ok:
+        self.assertEqual(self.run_discipline_stop(tmp_ok, ok_steps), {})
+
+      # Sibling read_file output containing exit-code text must not steal pending_run_cmds[0]
+      mixed_steps = base_steps + [
+          {
+              "step_index": 4,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [
+                  {"name": "read_file", "args": {"Path": "/tmp/notes.txt"}},
+                  {
+                      "name": "run_command",
+                      "args": {
+                          "CommandLine": (
+                              "luci-auth context -- git cl try -i 1408157 -B skia/skia.primary"
+                              " -b Bot-ASAN -b Canary-Chromium"
+                          )
+                      },
+                  },
+              ],
+          },
+          {
+              "step_index": 5,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": (
+                  "Created At: 2026-11-03T16:00:00Z\n"
+                  "Completed At: 2026-11-03T16:00:01Z\n"
+                  "Showing lines 1-2 of 2\n"
+                  "Command exited with code 1.\n"
+              ),
+          },
+          {
+              "step_index": 6,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": "Command exited with code 0.\n\nScheduled builds\n",
+          },
+          final_step,
+      ]
+      with tempfile.TemporaryDirectory() as tmp_mixed:
+        self.assertEqual(self.run_discipline_stop(tmp_mixed, mixed_steps), {})
+
   def test_schedule_tool_call_promotes_conversation_to_waiting_state(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
       transcript = os.path.join(tmp_dir, "transcript.jsonl")

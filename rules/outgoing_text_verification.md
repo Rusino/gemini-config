@@ -49,7 +49,7 @@ Code has a compiler; prose documents do not, and incoming specs or code snippets
    - **Required Action**: Read and execute `~/.gemini/config/skills/amnesia-precommit/SKILL.md`:
      1. Run `audit_comments.py --diff HEAD --repo <repo>` and `ruthless_audit.py <repo> --repo <repo> --diff HEAD` (plus `SKIP_GCE_AUTH_FOR_GIT=1 luci-auth context -- git cl presubmit --force` if `PRESUBMIT.py` exists).
      2. For non-trivial diffs, run the clean-context Hunter (`keeper_inquisitor`) + batched `keeper_skeptic` refutation pass (`plugins/keeper/agents/keeper_skeptic.md`) + `finding_ledger.py`.
-     3. **Pre-Upload / Pre-Push Flutter Corpus Gate (`CORPUS-CHECK GUARD` in `pre_tool_guard.py`)**: Before `git cl upload`, `gh pr create`, or `git push` with executable production code changes:
+     3. **Pre-Upload / Pre-Push Flutter Corpus Gate (`CORPUS-CHECK GUARD` in `pre_tool_guard.py`)**: Before `luci-auth context -- git cl upload`, `gh pr create`, or `git push` with executable production code changes:
         - Touching `modules/{skparagraph,skunicode,skshaper}/{src,include}/` -> run `flutter-test-paragraph-engine` (`run_flutter_paragraph_tests.py`).
         - Touching `lib/web_ui/lib/` -> run `webparagraph-corpus` (`run_webparagraph_corpus.py`, Part 1 `felt` + Part 2 `packages/flutter`).
 

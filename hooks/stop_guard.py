@@ -29,6 +29,7 @@ from pre_tool_guard import (
     SOURCE_FILENAMES,
     get_tool_target_file,
     is_tracked_source_file,
+    strip_heredocs,
 )
 
 NOTIFY_SELF_BIN = "/google/bin/releases/g3n-team/notify_self"
@@ -316,10 +317,17 @@ SKIA_CPP_PATH_RE = re.compile(
 SKIA_GERRIT_RE = re.compile(
     r"https?://skia-review\.googlesource\.com/(?:c/skia/\+/|changes/)?(\d{6,8})"
 )
+# Match both legacy `git cl try` and `luci-auth context -- git cl try` advisor lines
 AGENT_ACTION_TRY_RE = re.compile(
-    r"AGENT ACTION \(execute this command[^\)]*\):\s*\n\s*(git cl try[^\n]+)"
+    r"AGENT ACTION \(execute this command[^\)]*\):\s*\n\s*"
+    r"((?:(?:\S*/)?luci-auth\s+context(?:\s+[^\n]*?)?(?:\s+--)?\s+)?git\s+cl\s+try[^\n]+)"
 )
 GIT_CL_TRY_BOT_RE = re.compile(r"-b\s+([A-Za-z0-9_.-]+)")
+# Reject `git cl try` failures even when shell exit status was masked with `|| true`
+GIT_CL_TRY_ERROR_RE = re.compile(
+    r"(?:SSOAuthenticator:|^\s*ERROR:|Can't trigger tryjobs:)",
+    re.MULTILINE,
+)
 USER_TRYJOB_OPTOUT_RE = re.compile(
     r"(?:без\s+(?:asan|асан|try|трай|канаре|canar)|skip\s+(?:asan|try|canar)|no\s+(?:asan|try|canar))",
     re.IGNORECASE,
@@ -364,6 +372,28 @@ def _invokes_script_in_cmd(cmd: str, script_name: str) -> bool:
       continue
     return True
   return False
+
+
+# Extract `-b <bot>` targets from real `git cl try` shell segments outside grep/echo
+def _extract_try_bots_from_cmd(cmd: str) -> set[str]:
+  bots: set[str] = set()
+  for seg in re.split(r"&&|\|\||;|\||\n", strip_heredocs(cmd)):
+    seg = seg.strip()
+    if not seg or not re.search(r"\bgit\s+cl\s+try\b", seg):
+      continue
+    if re.match(r"^(?:grep|egrep|fgrep|rg|git\s+grep|echo|cat)\b", seg):
+      continue
+    for m in GIT_CL_TRY_BOT_RE.finditer(seg):
+      bots.add(m.group(1))
+  return bots
+
+
+# Require exit code 0 without SSOAuthenticator or depot_tools error output (even under `|| true`)
+def _try_output_succeeded(content: str, status: str = "") -> bool:
+  if status == "ERROR" or GIT_CL_TRY_ERROR_RE.search(content):
+    return False
+  m_exit = EXIT_CODE_RE.search(content)
+  return bool(m_exit and int(m_exit.group(1)) == 0)
 
 
 # Detect roadmap.py set ... done invocations outside heredocs and read-only grep/echo
@@ -486,6 +516,9 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
   triage_store_saved = False
   # Background task and subagent tracking for Flutter/WebParagraph corpus runs
   bg_corpus_tasks: dict[str, str] = {}
+  bg_try_tasks: dict[str, set[str]] = {}
+  pending_run_cmds: list[set[str]] = []
+  pending_manage_try_bots: set[str] = set()
   pending_subagent_scripts: set[str] = set()
   subagent_corpus: dict[str, set[str]] = {}
   pending_manage_task_script = ""
@@ -502,6 +535,8 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
       pending_triage = False
       pending_corpus_script = ""
       # Track corpus scripts delegated to subagents or task checks
+      pending_run_cmds = []
+      pending_manage_try_bots = set()
       pending_subagent_scripts = set()
       pending_manage_task_script = ""
       pending_read_path = ""
@@ -529,6 +564,9 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
             matched_s = bg_corpus_tasks.get(tid) or bg_corpus_tasks.get(tid.split("/")[-1])
             if matched_s:
               pending_manage_task_script = matched_s
+            matched_try = bg_try_tasks.get(tid) or bg_try_tasks.get(tid.split("/")[-1])
+            if matched_try:
+              pending_manage_try_bots = set(matched_try)
         elif tname == "run_command":
           cmd = str(targs.get("CommandLine", ""))
           read_blobs.append(cmd)
@@ -546,9 +584,8 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
           if _invokes_script_in_cmd(cmd, "canary_advisor.py"):
             canary_advisor_invoked = True
             pending_canary_advisor = True
-          if re.search(r"\bgit\s+cl\s+try\b", cmd):
-            for m in GIT_CL_TRY_BOT_RE.finditer(cmd):
-              triggered_try_bots.add(m.group(1))
+          # Defer crediting trybots until the matching GENERIC/task output exits 0 cleanly
+          pending_run_cmds.append(_extract_try_bots_from_cmd(cmd))
           for c_script in (
               "run_flutter_paragraph_tests.py",
               "run_webparagraph_corpus.py",
@@ -569,8 +606,8 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
       if _g3_report_passed(content):
         g3_passed = True
 
-      if "\nFile Path: " in content[:200]:
-        # Reset pending read path after inspecting file payload
+      # Skip view_file (`File Path:`) and read_file (`Showing lines`) payloads before command checks
+      if "\nFile Path: " in content[:200] or "\nShowing lines " in content[:200]:
         pending_read_path = ""
         continue
 
@@ -580,7 +617,7 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
         subagent_corpus[m_sub.group(1).strip()] = set(pending_subagent_scripts)
         pending_subagent_scripts = set()
 
-      # Map background task id to its corpus script
+      # Map background task id to its corpus script or tryjob invocation
       m_bg = BG_TASK_LAUNCH_RE.search(content)
       if m_bg:
         tid = m_bg.group(1).strip()
@@ -590,6 +627,20 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
         for s in bg_scripts:
           bg_corpus_tasks[tid] = s
           bg_corpus_tasks[tid.split("/")[-1]] = s
+        try_bots = pending_run_cmds.pop(0) if pending_run_cmds else set()
+        if try_bots:
+          bg_try_tasks[tid] = try_bots
+          bg_try_tasks[tid.split("/")[-1]] = try_bots
+      elif pending_run_cmds and (
+          EXIT_CODE_RE.search(content) or step.get("status") == "ERROR"
+      ):
+        try_bots = pending_run_cmds.pop(0)
+        if try_bots and _try_output_succeeded(content, str(step.get("status") or "")):
+          triggered_try_bots.update(try_bots)
+      if pending_manage_try_bots:
+        if _try_output_succeeded(content, str(step.get("status") or "")):
+          triggered_try_bots.update(pending_manage_try_bots)
+        pending_manage_try_bots = set()
 
       m_action = AGENT_ACTION_TRY_RE.search(content)
       if m_action:
@@ -673,6 +724,9 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
         m_exit = EXIT_CODE_RE.search(content)
         if m_exit and int(m_exit.group(1)) == 0:
           corpus_passed[bg_script] = True
+      bg_try = bg_try_tasks.get(task_id) or bg_try_tasks.get(task_id.split("/")[-1])
+      if bg_try and _try_output_succeeded(content, str(step.get("status") or "")):
+        triggered_try_bots.update(bg_try)
 
       # Check subagent completion report
       cand_scripts = set(subagent_corpus.get(sender, set())) | _corpus_scripts_in_text(content)
@@ -973,7 +1027,8 @@ def analyze_current_turn(transcript_path: str) -> dict:
 
     elif stype == "GENERIC" and pending_cmds:
       content = str(step.get("content", ""))
-      if "\nFile Path: " in content[:200]:
+      # Ignore view_file and read_file outputs so quoted exit-code strings never pop pending_cmds
+      if "\nFile Path: " in content[:200] or "\nShowing lines " in content[:200]:
         continue
       m = EXIT_CODE_RE.search(content)
       if m:

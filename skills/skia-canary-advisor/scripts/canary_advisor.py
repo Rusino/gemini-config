@@ -46,6 +46,7 @@ def _depot_tool(name):
 
 BB = _depot_tool("bb")
 PRPC = _depot_tool("prpc")
+LUCI_AUTH = _depot_tool("luci-auth")
 GARDENER_DIR = os.path.expanduser("~/.gemini/jetski/scratch/skia_gardener")
 GOOGLE3_DIR = "/google/src/head/depot/google3"
 # `git cl try` needs a git checkout as cwd, whatever directory the watcher was started from
@@ -657,9 +658,11 @@ def advise(args):
 
     if bots_to_run or (canary_bots and own) or (canary_bots and external):
         issue = f" -i {meta['cl']}" if meta["cl"] else ""
-        
+        # Wrap git cl in luci-auth context so depot_tools uses 7-day LOAS2 instead of 20h CorpSSO
+        try_prefix = f"luci-auth context -- git cl try{issue} -B {BUCKET}"
+
         if bots_to_run:
-            cmd = f"git cl try{issue} -B {BUCKET} " + " ".join(f"-b {b}" for b in bots_to_run)
+            cmd = f"{try_prefix} " + " ".join(f"-b {b}" for b in bots_to_run)
             print(f"\nAGENT ACTION (execute this command):")
             print(f"  {cmd}")
             if meta["cl"]:
@@ -670,18 +673,18 @@ def advise(args):
 
         # Provide the exact Canary-G3 command to run once a Googler votes CR+1
         if canary_bots and external and "Canary-G3" in canary_bots and not googler_cr_plus_one:
-            cmd = f"git cl try{issue} -B {BUCKET} -b Canary-G3"
+            cmd = f"{try_prefix} -b Canary-G3"
             print(f"\nCanary-G3 Command (run after Googler Code-Review+1 approval):")
             print(f"  {cmd}")
-            
+
         if canary_bots and not external and not own:
             # Not external, not own -> draft a comment for the author to trigger canaries
-            cmd = f"git cl try{issue} -B {BUCKET} " + " ".join(f"-b {b}" for b in canary_bots)
+            cmd = f"{try_prefix} " + " ".join(f"-b {b}" for b in canary_bots)
             print(f"\nFor the internal author (draft comment to ask them to run canaries):")
             print(f"  {cmd}")
-            
+
         if canary_bots and own:
-            cmd = f"git cl try{issue} -B {BUCKET} " + " ".join(f"-b {b}" for b in canary_bots)
+            cmd = f"{try_prefix} " + " ".join(f"-b {b}" for b in canary_bots)
             if not asan_bot:
                 print(f"\nCommand (run only after user approval):")
                 print(f"  {cmd}")
@@ -1131,8 +1134,9 @@ def triage_canary_g3_failure(cl, ps, bb_build, sw_tasks, touched_files):
         else:
             # Googler CR+1 landed after this failed tryjob ran, so Canary-G3 can be re-run now
             summary = (
-                f"Canary-G3 failed before Googler CR+1 was present, but chain is now approved; "
-                f"re-trigger: git cl try -i {int(cl)} -B {BUCKET} -b Canary-G3"
+                "Canary-G3 failed before Googler CR+1 was present, but chain is now approved; "
+                f"re-trigger: luci-auth context -- git cl try -i {int(cl)} "
+                f"-B {BUCKET} -b Canary-G3"
             )
         return {
             "verdict": "MISSING_APPROVAL", "our_part_passed": False, "task_id": tid,
@@ -1459,10 +1463,22 @@ def cmd_watch(args):
                     if triage_res["verdict"] == "INFRA_MISHAP" and not asan_retried:
                         print(f"ASAN infra mishap on {asan_builder}; retrying once")
                         cmd = [
+                            LUCI_AUTH, "context", "--",
                             "git", "cl", "try", "-i", str(cl), "-B", BUCKET, "-b", asan_builder,
                         ]
-                        subprocess.run(cmd, check=False, cwd=SKIA_DIR)
+                        proc = subprocess.run(
+                            cmd, capture_output=True, text=True, check=False, cwd=SKIA_DIR
+                        )
+                        if proc.returncode != 0:
+                            detail = (proc.stderr or proc.stdout or "").strip()
+                            print(f"ERROR: ASAN retry failed (exit {proc.returncode}): {detail}")
+                            print(f"\nWAKEUP_REASON: ASAN_RETRY_FAILED (exit {proc.returncode})")
+                            cmd_triage(args)
+                            return 1
+                        # Re-poll so terminal check sees the newly scheduled retry build
                         asan_retried = True
+                        time.sleep(poll_sec)
+                        continue
                     elif triage_res["verdict"] in (
                         "COMPILE_FAILURE", "SANITIZER_OR_TEST_FAILURE", "NOT_MERGEABLE"
                     ):

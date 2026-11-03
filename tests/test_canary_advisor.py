@@ -123,12 +123,18 @@ class TestCanaryAdvisor(unittest.TestCase):
     self.assertIn("NativeFonts_FreeType_ASAN_Upload", out)
     # Canary-G3 must NOT be in the immediate AGENT ACTION
     agent_action_line = [
-        line for line in out.splitlines() if line.strip().startswith("git cl try")
+        line
+        for line in out.splitlines()
+        if line.strip().startswith("luci-auth context -- git cl try")
     ][0]
     self.assertNotIn("Canary-G3", agent_action_line)
     self.assertNotIn("Canary-Flutter", agent_action_line)
     self.assertIn("Canary-G3 requires a Googler author or Googler Code-Review+1", out)
     self.assertIn("Canary-G3 Command (run after Googler Code-Review+1 approval):", out)
+    self.assertIn(
+        "luci-auth context -- git cl try -i 1408157 -B skia/skia.primary -b Canary-G3",
+        out,
+    )
     self.assertNotIn("submit-hold", out)
 
   def test_external_author_includes_canary_g3_when_googler_cr_plus_one_granted(self):
@@ -172,7 +178,9 @@ class TestCanaryAdvisor(unittest.TestCase):
 
     out = buf.getvalue()
     agent_action_line = [
-        line for line in out.splitlines() if line.strip().startswith("git cl try")
+        line
+        for line in out.splitlines()
+        if line.strip().startswith("luci-auth context -- git cl try")
     ][0]
     self.assertIn("Canary-G3", agent_action_line)
     self.assertNotIn("Canary-Flutter", agent_action_line)
@@ -297,7 +305,9 @@ class TestCanaryAdvisor(unittest.TestCase):
         out,
     )
     agent_action_line = [
-        line for line in out.splitlines() if line.strip().startswith("git cl try")
+        line
+        for line in out.splitlines()
+        if line.strip().startswith("luci-auth context -- git cl try")
     ][0]
     self.assertIn(
         "Test-Mac14-Clang-MacMini8.1-CPU-AVX2-x86_64-Debug-All-NativeFonts_Fontations",
@@ -507,7 +517,7 @@ class TestCanaryAdvisor(unittest.TestCase):
     self.assertEqual(res_now["missing"], [])
     self.assertTrue(res_now["now_approved"])
     self.assertNotIn("none found", res_now["summary"])
-    self.assertIn("git cl try -i 1409696", res_now["summary"])
+    self.assertIn("luci-auth context -- git cl try -i 1409696", res_now["summary"])
 
   def test_triage_reads_build_summary_markdown_not_mergeable_before_stale_swarming_task(self):
     # Real fixture from CL 1409696 PS 4 build 8666232682941943121: an earlier Oct 30 Canary-G3
@@ -789,6 +799,86 @@ class TestCanaryAdvisor(unittest.TestCase):
                 rc = canary_advisor.cmd_watch(args)
     self.assertEqual(rc, 0)
     mock_triage.assert_called_once()
+
+  def test_cmd_watch_asan_retry_uses_luci_auth_and_checks_exit_code(self):
+    meta = {
+        "cl": 1409658,
+        "patchset": 2,
+        "current_patchset": 2,
+        "status": "NEW",
+        "subject": "Fix paragraph",
+        "owner": "jlavrova@google.com",
+        "diff": "diff --git a/modules/skparagraph/src/Run.cpp b/modules/skparagraph/src/Run.cpp\n",
+        "googler_cr_plus_one": True,
+    }
+    args = type(
+        "Args",
+        (),
+        {
+            "cl": "1409658",
+            "ps": "2",
+            "poll_sec": 1,
+            "timeout_min": 5,
+            "save_draft": False,
+            "json": False,
+        },
+    )()
+    asan_bot = "Test-Ubuntu24.04-Clang-NUC11TZi5-CPU-AVX2-x86_64-Debug-All-ASAN"
+    infra_builds = {asan_bot: {"id": "8001", "status": "INFRA_FAILURE"}}
+    ok_builds = {asan_bot: {"id": "8002", "status": "SUCCESS"}}
+    mishap_verdict = {"verdict": "INFRA_MISHAP", "our_part_passed": False, "summary": "bot died"}
+
+    ok_proc = type("Proc", (), {"returncode": 0, "stdout": "Scheduled\n", "stderr": ""})()
+    buf_ok = io.StringIO()
+    with patch.object(canary_advisor, "load_cl", return_value=meta), patch.object(
+        canary_advisor, "bb_cl_builds", side_effect=[infra_builds, ok_builds]
+    ) as mock_bb, patch.object(
+        canary_advisor, "swarming_tasks_for_cl", return_value=[]
+    ), patch.object(
+        canary_advisor, "triage_asan_failure", return_value=mishap_verdict
+    ), patch.object(
+        canary_advisor.subprocess, "run", return_value=ok_proc
+    ) as mock_run, patch.object(
+        canary_advisor, "cmd_triage", return_value={}
+    ), patch.object(
+        canary_advisor.time, "sleep"
+    ), patch("sys.stdout", buf_ok):
+      rc_ok = canary_advisor.cmd_watch(args)
+
+    self.assertEqual(rc_ok, 0)
+    self.assertEqual(mock_bb.call_count, 2)
+    ran_cmd = mock_run.call_args[0][0]
+    self.assertEqual(
+        ran_cmd[:6],
+        [canary_advisor.LUCI_AUTH, "context", "--", "git", "cl", "try"],
+    )
+    self.assertIn("ALL_TRYJOBS_COMPLETE", buf_ok.getvalue())
+
+    fail_proc = type(
+        "Proc", (), {"returncode": 1, "stdout": "", "stderr": "SSOAuthenticator: exit status 1\n"}
+    )()
+    buf_err = io.StringIO()
+    with patch.object(canary_advisor, "load_cl", return_value=meta), patch.object(
+        canary_advisor, "bb_cl_builds", return_value=infra_builds
+    ), patch.object(
+        canary_advisor, "swarming_tasks_for_cl", return_value=[]
+    ), patch.object(
+        canary_advisor, "triage_asan_failure", return_value=mishap_verdict
+    ), patch.object(
+        canary_advisor.subprocess, "run", return_value=fail_proc
+    ), patch.object(
+        canary_advisor, "cmd_triage", return_value={}
+    ) as mock_err_triage, patch.object(
+        canary_advisor.time, "sleep"
+    ), patch("sys.stdout", buf_err):
+      rc_err = canary_advisor.cmd_watch(args)
+
+    self.assertEqual(rc_err, 1)
+    mock_err_triage.assert_called_once()
+    err_out = buf_err.getvalue()
+    self.assertIn("ASAN_RETRY_FAILED", err_out)
+    self.assertIn("SSOAuthenticator: exit status 1", err_out)
+    self.assertNotIn("ALL_TRYJOBS_COMPLETE", err_out)
 
 
 if __name__ == "__main__":

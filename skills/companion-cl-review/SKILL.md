@@ -98,9 +98,9 @@ For **Case 3**, **Case 4**, and **Case 5**, commit **only the test file changes*
    git push origin HEAD:refs/for/main%wip,cc=<parent_author_email>
    ```
    - **Never** add reviewers (not even the parent CL's author) to the Gerrit `Reviewers` field of the companion CL. Leaving `Reviewers` empty with `%wip` prevents notification spam to `OWNERS`/CC lists and signals that you are **not** claiming ownership of a competing CL — the companion CL exists purely as a sandbox for the author.
-   - **CC only the parent CL's author** (Gerrit; with `git cl upload` use `--no-autocc --cc <email>`). The companion then shows up in the author's own dashboard, while `%wip` still sends no mail. Do not CC the other reviewers: the reviewer list changes, and they reach the companion through the link in the review comment.
+   - **CC only the parent CL's author** (Gerrit; with `luci-auth context -- git cl upload` use `--no-autocc --cc <email>`). The companion then shows up in the author's own dashboard, while `%wip` still sends no mail. Do not CC the other reviewers: the reviewer list changes, and they reach the companion through the link in the review comment.
    - **Keep the companion public; never `private`**: the companion is evidence linked from a public review, so every reader (second reviewer, a later `git blame` or bisect) must be able to open it. LUCI service accounts may also lose access to private changes (not verified). skia-review rejects private pushes anyway (`private changes are disabled`, 2026-11-02).
-   - When re-uploading with `git cl upload`, the commit subject comes from the Gerrit description, not from the amended local commit; edit the description in Gerrit (or push with `git push ...%wip`) to change it.
+   - When re-uploading with `luci-auth context -- git cl upload`, the commit subject comes from the Gerrit description, not from the amended local commit; edit the description in Gerrit (or push with `git push ...%wip`) to change it. Always wrap `git cl upload` and `git cl try` in `luci-auth context -- git cl ...` so `depot_tools` uses 7-day `LOAS2` instead of 20-hour `CorpSSO`.
 
 ---
 
@@ -219,7 +219,7 @@ When the CL under review is owned by the user (Gerrit `owner`, not merely the up
 3. **Before reviewers are involved** (no reviewers on the CL yet, the usual case for self-review): upload freely without asking; there are no votes to reset and nobody to notify.
 4. **After reviewers are added**: prepare the patchsets locally and **ask the user before pushing**, because every upload resets copied `Code-Review` votes and notifies reviewers. Upload the intermediate failing-tests patchset with `%notify=NONE` to avoid an extra notification.
 5. **Not uploaded yet** (local branch only): use two local commits (tests, then fix) instead of patchsets; squashing before upload is the user's choice.
-6. **ASAN Gate**: Automatically trigger the ASAN try job (via `skia-canary-advisor` or `git cl try`) for the fix patchset. Never trigger CQ on any patchset unless the user explicitly asks.
+6. **ASAN Gate**: Automatically trigger the ASAN try job (via `skia-canary-advisor` or `luci-auth context -- git cl try`) for the fix patchset. Never trigger CQ on any patchset unless the user explicitly asks.
 
 ---
 

@@ -29,12 +29,19 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
 2. Execute every `AGENT TODO` line with `code_search`. A hit outside `skparagraph`/`skunicode` test rdeps makes `Canary-G3` STRONG.
 3. Present the result: STRONG items as "run", CONSIDER items as "only if rendering may change".
 4. **Execution Policy (Agent Actions)**:
-   - **ASAN**: If an ASAN bot is recommended, YOU (the agent) MUST execute the `git cl try`
-     command provided under `AGENT ACTION` immediately, without asking the author or the user.
+   - **7-Day `LOAS2` Auth Wrapper (`luci-auth context`)**: Always invoke `git cl try` via
+     `luci-auth context -- git cl try ...` (printed directly by `canary_advisor.py`) so
+     `depot_tools` selects `LuciContextAuthenticator` (talking to `luci-auth context` backed by
+     `/usr/bin/sso-cred-helper`, 7-day `LOAS2`) instead of `SSOAuthenticator` (`git-remote-sso`,
+     20-hour `CorpSSO`), and check for exit code `0` (never append `|| true`).
+   - **ASAN**: If an ASAN bot is recommended, YOU (the agent) MUST execute the
+     `luci-auth context -- git cl try` command provided under `AGENT ACTION` immediately, without
+     asking the author or the user.
    - **SkParagraph / SkUnicode on Linux Cloudtop (`LOCAL google3-test-paragraph`)**: When `/google/src/cloud` is mounted, `canary_advisor.py` automatically replaces `Canary-G3` for `modules/skparagraph/` and `modules/skunicode/` paths with `LOCAL google3-test-paragraph` (~10–13 min, 1,139 fast targets including `skia_build_test`, cached `G3_HEAD` baseline, zero Piper CLs, and zero Gerrit submit hold). Run it before `CR+1` / upload instead of triggering `Canary-G3`. Lightweight `Canary-G3` remains active only for non-paragraph Skia paths (`modules/skshaper/`, `src/ports/`, core `src/`/`include/`, root `BUILD.bazel`) or when off Cloudtop.
      - **Auto-Slow-Tier Policy**: When you run `google3-test-paragraph` automatically as the final check before granting `CR+1` (or before `amnesia-precommit` upload), you MUST append `--tier all` to cover the 13 slow tests. During intermediate/WIP checks, use the default `--tier fast`.
    - **External Authors** (owner is not `@google.com`): YOU (the agent) MUST execute the
-     `git cl try` command provided under `AGENT ACTION` immediately, without asking.
+     `luci-auth context -- git cl try` command provided under `AGENT ACTION` immediately, without
+     asking.
      - **Canary-G3 restriction (`g3_canary.go:134`)**: For non-paragraph Skia CLs that still need `Canary-G3`, `Canary-G3` requires a Googler author OR a Googler `Code-Review+1` approval. If the external CL has no Googler `CR+1` yet, `canary_advisor.py` excludes `Canary-G3` from `AGENT ACTION` and prints the manual command to run if needed after `CR+1` (do not place unresolved submit-hold comments).
      - **Stacked CLs**: the google3 try service (`chrome/skia/autoroller/try_service.py`)
        cherry-picks every unmerged parent of the CL too, and each one needs its own Googler
@@ -47,7 +54,7 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
    - **Internal Authors / Own CLs**: Show the printed `Canary Command` for canaries and run it
      ONLY after the user explicitly approves. (For ASAN, you still run it automatically).
 5. **Background Monitoring & Wakeup Protocol**:
-   - Immediately after triggering `git cl try`, launch
+   - Immediately after triggering `luci-auth context -- git cl try`, launch
      `python3 ~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py watch --cl <CL> --save-draft`
      as a background command (`WaitMsBeforeAsync=500`, `NotificationTimeoutSeconds=5400`).
    - **On Red Canary (`UNRELATED_HEAD_BREAKAGE`)**: `watch --save-draft` automatically verifies
