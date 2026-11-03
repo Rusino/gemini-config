@@ -264,9 +264,10 @@ A smoke run on the host prints the attestation line, e.g.
 
 ## Mac
 
-Validated on Nov 1 2026: MacBook Pro, Apple M5 Max (18 cores, 64 GB), macOS 26.7.1, Chrome for
-Testing 156.0.8078.73, `base,dpr2 × 6`, 36/36 runs OK on the first attempt, ~1 h, Integrity
-Check `OK` (results: `~/.gemini/jetski/scratch/wp_gallery_perf/mac/results_mac`).
+Validated on Nov 1–2 2026: MacBook Pro, Apple M5 Max (18 cores, 64 GB), macOS 26.7.1, Chrome for
+Testing 156.0.8078.73 (`base,dpr2 × 6`, 36/36 runs OK, ~1 h, Integrity Check `OK` in
+`~/.gemini/jetski/scratch/wp_gallery_perf/mac/results_mac`; and `base,dpr2,dpr3 × 6` across 4
+variants including `ImageBitmap` no-copy, 72/72 runs OK, ~2 h in `results_mac2`).
 
 Builds are plain web assets (`build/web`), so do not rebuild on the Mac: pack the Linux builds
 and the scripts on the Cloudtop and run locally on the Mac.
@@ -293,9 +294,10 @@ python3 scripts/summarize.py results_mac --wp c1 --skp skp --ab c1/c0 \
 - `--require-gpu` aborts on SwiftShader. `--headless=new` gets the hardware Metal GPU without
   `--headful` (`ANGLE (Apple, ANGLE Metal Renderer: Apple M5 Max, ...)`); keep `--headful` only
   as a fallback if `GALLERY_ATTESTATION` shows SwiftShader.
-- The Mac GPU process is lightly loaded (e.g. `resize` GPU busy ~90-145 ms vs ~465 ms on the
+- The Mac GPU process is lightly loaded (e.g. `resize` GPU busy ~85-145 ms vs ~465 ms on the
   Linux Radeon host), so WebParagraph GPU-process overhead that is invisible on Linux shows up
-  here (+10..+114% vs SkParagraph). Always report the GPU-process table and absolute ms for the
+  here (+2..+80% vs SkParagraph across DPR 1–3; +10..+114% in the first DPR 1–2 run). Always report
+  the GPU-process table and absolute ms for the
   Mac, and check one-off long frames in the trace: a 268.9 ms SkParagraph frame was a
   `CrGpuMain` task waiting 261 ms on an ANGLE worker task, not text work.
 - No `/proc`: `CPU all Chrome` stays empty (INFO in the Integrity Check); trace metrics and

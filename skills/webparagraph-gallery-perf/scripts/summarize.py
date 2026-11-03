@@ -26,7 +26,7 @@ CONFIG_TITLE = {'base': 'DPR 1', 'dpr2': 'DPR 2', 'dpr3': 'DPR 3', 'cpu2': 'CPU 
 # (column title, kind or phase selector)
 SCENARIOS = [('`open`', ('kind', 'open')), ('`reopen`', ('kind', 'reopen')),
              ('`scroll`', ('kind', 'scroll')), ('`resize`', ('kind', 'resize')),
-             ('`resize:home` (самая тяжёлая страница)', ('phase', 'resize:home'))]
+             ('`resize:home` (тяжелее всего для WebParagraph)', ('phase', 'resize:home'))]
 RT_PHASES = [('Прокрутка, главная', 'rt-scroll:home'),
              ('Изменение ширины, главная', 'rt-resize:home'),
              ('Изменение ширины, `fortnightly`', 'rt-resize:fortnightly')]
