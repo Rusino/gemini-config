@@ -1,14 +1,11 @@
 ---
 name: webparagraph-gallery-perf
 description: >-
-  Measure Flutter Web WebParagraph (WP) vs SkParagraph (SkP), or WP branch vs WP branch, on a
-  release (or profile) build of Flutter Gallery in real Chrome: build variants from commits,
-  interleaved rotated rounds with Chrome traces, paired per-round ratios with bootstrap 95% CI,
-  `compare.md` with Run Attestation and Integrity Check, and the human-readable Russian report
-  (`summarize.py` tables + report rules). Trigger when asked to "замерь производительность
-  WebParagraph", "сравни производительность веток", "прогони Gallery бенчмарк", "сделай отчёт
-  о производительности WebParagraph", "замерь на маке", "gallery perf", "WP vs SkP perf", or to
-  compare profile vs release.
+  Measure Flutter Web WebParagraph vs SkParagraph (or two branches) on Flutter Gallery in Chrome
+  with paired bootstrap 95% CI, Run Attestation, and a Russian report. Trigger when asked to
+  "замерь производительность WebParagraph", "сравни производительность веток", "прогони Gallery
+  бенчмарк", "сделай отчёт о производительности WebParagraph", "замерь на маке", "gallery perf",
+  "WP vs SkP perf", or to compare profile vs release.
 ---
 
 # WebParagraph Gallery Performance (`webparagraph-gallery-perf`)
@@ -55,8 +52,8 @@ bash $S/build_variant.sh fill_runs 05cb0c401d5 --out ~/perf/r45 --dry-run   # pr
 
 - The worktree goes to `$(dirname <base-checkout>)/flutter_perf_<name>` (or `--worktree`); the
   default `--base-checkout` is `~/.gemini/jetski/scratch/flutter_perf_method`, which must have
-  gclient deps and `engine/src/out/wasm_release`. Deps are symlinked, `out/wasm_release` is
-  copied once.
+  gclient deps and `engine/src/out/wasm_release`. Deps are symlinked, `engine/src/out/wasm_release`
+  is copied once.
 - A dirty worktree (tracked changes or untracked files other than the harness files and dep
   symlinks the script creates) is refused unless `--allow-dirty`. An existing worktree at a
   different commit is refused.
@@ -124,10 +121,11 @@ Example of the finished report (Linux, Radeon WX 3200, Nov 2026):
 Report rules (agreed with the user, keep them):
 
 - **Structure**: 1 Что сравниваем (each set of changes in words, the paint path, rejected
-  variants in one paragraph), 2 Как измеряли (scenarios, metrics, tools, overhead, machine,
-  rounds with dates and ET times, comparison, verdict rule, A/B rule), 3 Итоги (verdict per
-  scenario, 4–5 bullets, «Что не измерено»), 4 Результаты (main-thread table, GPU as one
-  sentence, 60 Hz table, then «Детали: …» sections).
+  variants in one short paragraph), 2 Как измеряли (scenarios without benchmark numbers, metrics,
+  tools, brief overhead & rounds summary, machine, comparison, verdict rule, A/B rule), 3 Итоги
+  (verdict per scenario, concise bullets, «Что не измерено»), 4 Результаты (main-thread table, GPU
+  summary/table, 60 Hz table, then «Детали: …» sections; keep «Детали: влияние трейса» to one
+  short paragraph with results and no table).
 - **Numbers, format A**: bare signed integer percents, "проценты" said once in the caption
   (`+25`, `−1`, `0`); decimal comma for milliseconds.
 - **Verdict per scenario**: the worst value over all DPRs and both metrics (main thread, GPU
