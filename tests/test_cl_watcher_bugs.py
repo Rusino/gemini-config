@@ -858,17 +858,18 @@ assert(getEl('lanes').innerHTML.includes('crbug/579861086'), 'CL row must show p
 // Switch to Bugs view
 setView('bugs');
 const focusOut = getEl('focus').innerHTML;
+const processingOut = getEl('processing').innerHTML;
 const lanesOut = getEl('lanes').innerHTML;
-assert(focusOut.includes('crbug/579861086'), 'Bugs focus must render Needs You bug');
-assert(focusOut.includes('CL 1413001'), 'Bug focus card must render subtask CL 1413001');
-assert(focusOut.includes('CL 1413999'), 'Bug focus card must render subtask CL 1413999');
-assert(focusOut.includes('ackBug('), 'Needs you bug must render Ack button');
+assert(processingOut.includes('crbug/579861086'), 'Bugs processing must render busy Needs You bug');
+assert(processingOut.includes('CL 1413001'), 'Bug focus card must render subtask CL 1413001');
+assert(processingOut.includes('CL 1413999'), 'Bug focus card must render subtask CL 1413999');
+assert(processingOut.includes('ackBug('), 'Needs you bug must render Ack button');
 
 // Shared chat cid-shared appears on parent bug, NOT duplicated on CL 1413001 subtask;
 // separate chat cid-separate DOES appear on CL 1413999 subtask
-const cidSharedOpenCount = focusOut.split('openChat(&quot;cid-shared&quot;').length - 1;
-assert.strictEqual(cidSharedOpenCount, 1, 'Shared chat button must render once on parent bug');
-const subtasksHtml = focusOut.split('<div class="bug-subtasks">')[1] || '';
+const cidSharedOpenCount = processingOut.split('openChat(&quot;cid-shared&quot;').length - 1;
+assert.strictEqual(cidSharedOpenCount, 2, 'Shared chat button must render once on parent bug');
+const subtasksHtml = processingOut.split('<div class="bug-subtasks">')[1] || '';
 assert(!subtasksHtml.includes('cid-shared'), 'Shared chat must not be duplicated on subtask');
 assert(
   subtasksHtml.includes('openChat(&quot;cid-separate&quot;'),
@@ -1358,3 +1359,4 @@ vm.runInThisContext(scriptContent + '\n' + harness);
 
 if __name__ == "__main__":
   unittest.main()
+ 

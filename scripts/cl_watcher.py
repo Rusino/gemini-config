@@ -898,6 +898,11 @@ def _chat_candidate_rank(
 
 def is_chat_busy(summary: dict[str, Any], title: str = "") -> bool:
   """Returns True when the chat is actively running a turn, subagent, task, or waiting timer."""
+  # Если чат ждет ответа от человека (WAITING), он не должен считаться busy.
+  ws = summary.get("waitingSteps") or summary.get("waiting_steps")
+  if ws:
+    return False
+
   # A parent chat awaiting subagents or background commands reports IDLE until wakeup
   if summary.get("status") == "CASCADE_RUN_STATUS_RUNNING":
     return True
@@ -954,6 +959,7 @@ def overlay_live_chat_busy(state: dict[str, Any]) -> None:
           if (
               s.get("status") == "CASCADE_RUN_STATUS_IDLE"
               and not s.get("hasRunningSubagents")
+              and not int(s.get("backgroundTaskCount") or 0) > 0
           ):
             item["chat_busy"] = False
   # Keep bug cards and their linked CL subtask rows synchronized with live LS chat activity
@@ -10116,6 +10122,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <p id="subline"></p>
   </div>
   <div class="focus" id="focus"></div>
+  <div class="processing" id="processing" style="display: grid; gap: 4px; margin-bottom: 15px;"></div>
   <div id="lanes"></div>
   <footer id="footer"></footer>
 </main>
@@ -12639,6 +12646,45 @@ function bugSubtasksHtml(bug, data) {
   return `<div class="bug-subtasks">${ordered.map(renderSub).join('')}</div>`;
 }
 
+
+function processingStripItemHtml(it, data, type) {
+  const isBug = type === 'bug';
+  const chatTitleRaw = isBug ? (it.chat_title || it.title || '') : (it.title || '');
+  const chatTitle = esc(chatTitleRaw);
+  
+  const lastModStr = it.chat_last_modified;
+  const lastModMs = lastModStr ? Date.parse(lastModStr) : Date.now();
+  const elapsedMinutes = Math.max(0, Math.floor((Date.now() - lastModMs) / 60000));
+  
+  let itemLink = '';
+  let subjText = '';
+  if (isBug) {
+    const bugText = esc(it.issue_id || '');
+    itemLink = `<a class="stack-step-cl" href="https://issuetracker.google.com/issues/${bugText}" target="_blank" onclick="event.stopPropagation()">${bugText}</a>`;
+    subjText = esc(it.title || '');
+  } else {
+    itemLink = `<a class="stack-step-cl" href="${esc(it.url || '')}" target="_blank" onclick="event.stopPropagation()">${esc(clLabel(it))}</a>`;
+    subjText = esc(cleanSubject(it.subject));
+  }
+  
+  const contentHtml = isBug ? bugFocusCard(it, data) : focusCard(it, data);
+  const chatHtml = isBug ? bugChatActionHtml(it, data, true) : chatActionHtml(it, data, true);
+  const chatSpan = chatHtml ? `<span class="stack-step-chat" onclick="event.stopPropagation()">· ${chatHtml}</span>` : '';
+  
+  return `
+    <details class="stack-step-collapsed processing-item">
+      <summary>
+        <span class="badge stack-step" style="background: var(--bg-hover);">⏳ Processing</span>
+        ${itemLink}
+        <span class="stack-step-subj">${subjText}</span>
+        <span>— ${chatTitle} (${elapsedMinutes} min)</span>
+        ${chatSpan}
+        <span class="stack-step-hint">click to expand</span>
+      </summary>
+      <div class="stack-step-expanded">${contentHtml}</div>
+    </details>`;
+}
+
 function bugFocusCard(bug, data) {
   // Reserve red alert styling on P0 issues for owned bugs, not collaborator consults
   const isAlert = Boolean(bug.is_overdue || bug.issue_type === 'VULNERABILITY' ||
@@ -12884,13 +12930,16 @@ function render() {
     const busyBugs = countUniqueBusyChats(
       [...shownBugs, ...shownBugs.flatMap(b => b.linked_cls || [])]
     );
-    const needBugs = byBug.you.filter(b => !b.chat_busy).length;
+    const needYouBugs = byBug.you.filter(b => !b.chat_busy);
+    const busyYouBugs = byBug.you.filter(b => b.chat_busy);
+    const needBugs = needYouBugs.length;
     document.getElementById('headline').innerHTML = headlineHtml(
       needBugs, selectedProject, busyBugs
     );
     // Secondary bug counts now appear on the .sec-tabs pills below #focus
     document.getElementById('subline').textContent = '';
-    document.getElementById('focus').innerHTML = byBug.you.map(b => bugFocusCard(b, data)).join('');
+    document.getElementById('focus').innerHTML = needYouBugs.map(b => bugFocusCard(b, data)).join('');
+    document.getElementById('processing').innerHTML = busyYouBugs.map(b => processingStripItemHtml(b, data, 'bug')).join('');
 
     const bugSections = [];
     for (const l of BUG_LANES) {
@@ -12974,12 +13023,15 @@ function render() {
   );
 
   const busyYou = countUniqueBusyChats(by.you);
-  const needYou = by.you.filter(it => !it.chat_busy).length;
+  const needYouItems = by.you.filter(it => !it.chat_busy);
+  const busyYouItems = by.you.filter(it => it.chat_busy);
+  const needYou = needYouItems.length;
   document.getElementById('headline').innerHTML = headlineHtml(needYou, selectedProject, busyYou);
   // Secondary lane counts now appear on the .sec-tabs pills below #focus
   document.getElementById('subline').textContent = '';
 
-  document.getElementById('focus').innerHTML = renderFocusSection(by.you, shown, data);
+  document.getElementById('focus').innerHTML = renderFocusSection(needYouItems, shown, data);
+  document.getElementById('processing').innerHTML = busyYouItems.map(it => processingStripItemHtml(it, data, 'cl')).join('');
 
   const clSections = [];
   const pingGroups = collectReviewerPingGroups(shown);
@@ -13641,3 +13693,4 @@ def main() -> int:
 
 if __name__ == "__main__":
   sys.exit(main())
+ 
