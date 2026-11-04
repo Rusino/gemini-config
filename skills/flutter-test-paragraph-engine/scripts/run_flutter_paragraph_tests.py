@@ -75,7 +75,9 @@ def file_sha256_short(path: pathlib.Path | str) -> Optional[str]:
     return h.hexdigest()[:12]
 
 
-def compute_skia_source_tree_sha256(skia_repo: pathlib.Path) -> tuple[str, int]:
+def compute_skia_source_tree_sha256(
+    skia_repo: pathlib.Path, base_rev: str
+) -> tuple[str, int]:
     h = hashlib.sha256()
     file_count = 0
     for subdir in SKIA_MONITORED_DIRS:
@@ -89,6 +91,23 @@ def compute_skia_source_tree_sha256(skia_repo: pathlib.Path) -> tuple[str, int]:
                 h.update(p.read_bytes())
                 h.update(b"\0")
                 file_count += 1
+    # WORKTREE patches and local commits may touch core headers (e.g. include/core/SkSpan.h);
+    # diffing the working tree against the DEPS base catches both, else the Integrity Check
+    # reports two different Skia trees as clones
+    dirty = subprocess.run(
+        ["git", "-C", str(skia_repo), "diff", base_rev, "--name-only"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    for rel in sorted(dirty):
+        if any(rel.startswith(d + "/") for d in SKIA_MONITORED_DIRS):
+            continue
+        p = skia_repo / rel
+        h.update(rel.encode("utf-8") + b"\0")
+        h.update(p.read_bytes() if p.is_file() else b"<deleted>")
+        h.update(b"\0")
+        file_count += 1
     return h.hexdigest()[:12], file_count
 
 
@@ -807,7 +826,7 @@ def main() -> int:
             }
             attestation.update(git_meta)
             attestation["ref"] = raw_ref
-            source_tree_sha, source_count = compute_skia_source_tree_sha256(skia_repo)
+            source_tree_sha, source_count = compute_skia_source_tree_sha256(skia_repo, skia_base_head)
             attestation["source_tree_sha256"] = source_tree_sha
             attestation["source_files_count"] = source_count
             attestation["build_dir"] = str(build_dir)
@@ -842,6 +861,12 @@ def main() -> int:
                     ninja_rc = res.returncode
                 ninja_dt = int(time.time() - t_ninja0)
                 log(f"[{label}] ninja exit={ninja_rc} ({ninja_dt}s)", driver_log)
+                # A failed build leaves the previous leg's flutter_tester in place, so any tests
+                # run now would silently measure the wrong Skia
+                if ninja_rc != 0:
+                    raise RuntimeError(
+                        f"[{label}] ninja failed with exit {ninja_rc}; see {ninja_log}"
+                    )
 
             attestation["ninja_rc"] = ninja_rc
             attestation["ninja_actions"] = parse_ninja_actions(ninja_log)
