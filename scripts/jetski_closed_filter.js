@@ -669,11 +669,8 @@
   const step0BootstrappedModels = (window.__jetskiStep0BootstrappedModels ||= new Map());
 
   const PROJECT_MODEL_PROFILES = {
-    // triage profile
-    '3f5b7a12-8e5f-47d2-a2f4-d644447c86a8': 'triage',
+    // triage profile (sidecar IDs)
     'skia-g3-roll-check': 'triage',
-    '52d8efe1-4a60-4325-b9f8-4c02156f8a25': 'triage',
-    'debug_skia_roll_issue': 'triage',
     // cpp-core profile
     '1a021a3a-e0f3-4f85-ab21-42cfba6cf4d4': 'cpp-core',
     'chromium': 'cpp-core',

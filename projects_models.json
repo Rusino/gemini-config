@@ -1,6 +1,5 @@
 {
   "skia-g3-roll-check": "triage",
-  "debug_skia_roll_issue": "triage",
   "Chromium": "cpp-core",
   "Lazy Android": "cpp-core",
   "TextClusters API": "cpp-core",

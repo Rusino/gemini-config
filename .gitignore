@@ -19,13 +19,10 @@ ledgers/
 conversation_summaries.db
 .workspace_mcp_backup.json
 
-# Local Google3 plugin symlinks
-plugins/browser
-plugins/cloudtop-use
-plugins/google_chat
-plugins/google_docs
-plugins/google_drive
-plugins/gdocs/
+# Local Google3 plugin symlinks & Marketplace-installed plugins (only plugins/keeper/ is tracked)
+plugins/*
+!plugins/keeper/
+!plugins/keeper/**
 
 # Machine-local rules (personal aliases)
 rules/local_aliases.md

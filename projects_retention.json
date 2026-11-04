@@ -1,7 +1,6 @@
 {
   "keep": {
-    "skia-g3-roll-check": 1,
-    "debug_skia_roll_issue": 3
+    "skia-g3-roll-check": 1
   },
   "triage_hard_delete_projects": {
     "skia-g3-roll-check": 30

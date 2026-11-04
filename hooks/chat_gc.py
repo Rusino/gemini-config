@@ -945,7 +945,13 @@ def run_gc(
     elif s and _is_archived(cid):
       meta_pid = str((s.get("trajectoryMetadata") or {}).get("projectId") or "")
       pid = meta_pid or (r["projectId"] if r else "")
-      if pid and pid in triage_proj_days and age >= triage_proj_days[pid]:
+      sidecar_id = cl.get_conversation_sidecar_id(cid, s)
+      matched_key = (
+          pid
+          if (pid and pid in triage_proj_days)
+          else (sidecar_id if (sidecar_id and sidecar_id in triage_proj_days) else "")
+      )
+      if matched_key and age >= triage_proj_days[matched_key]:
         reason = "routine_triage"
     elif (
         cid not in summaries

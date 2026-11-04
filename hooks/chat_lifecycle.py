@@ -36,9 +36,8 @@ DEFAULT_PROJECT_MODELS_FILE = os.path.expanduser(
     "~/.gemini/config/projects_models.json"
 )
 DEFAULT_PROJECT_MODELS: dict[str, str] = {
-    # triage profile
+    # triage profile (sidecar IDs)
     "skia-g3-roll-check": "triage",
-    "debug_skia_roll_issue": "triage",
     # cpp-core profile
     "Chromium": "cpp-core",
     "Lazy Android": "cpp-core",
@@ -150,8 +149,10 @@ UNRELIABLE_JUNIOR_ENUM_LABELS: dict[str, str] = {
     "MODEL_PLACEHOLDER_M37": "Gemini 3.1 Pro (High)",
     "MODEL_PLACEHOLDER_M136": "snowball-subagent",
     "MODEL_PLACEHOLDER_M312": "Gemini 2.5 Flash",
+    "MODEL_PLACEHOLDER_M318": "Gemini 3.8 Flash (High)",
     "MODEL_PLACEHOLDER_M319": "Gemini 3.8 Flash (Medium)",
     "MODEL_PLACEHOLDER_M320": "Gemini 3.8 Flash (High)",
+    "MODEL_PLACEHOLDER_M322": "Gemini 3.8 Flash (Tiered)",
     "MODEL_PLACEHOLDER_M333": "Gemini 3.1 Pro",
     "MODEL_PLACEHOLDER_M422": "Gemini 3.8 Flash (Router)",
     "MODEL_GOOGLE_GEMINI_2_5_FLASH": "Gemini 2.5 Flash",
@@ -1113,8 +1114,15 @@ def resolve_profile_model(
     # Prefer the highest-quota flagship candidate above the 5% emergency floor
     if candidates[0].get("quota", 0.0) >= EMERGENCY_PIN_FLOOR:
       return candidates[0]
-    if candidates[0].get("quota", 0.0) >= hard_floor:
-      return candidates[0]
+
+  # When all flagship models are exhausted (<5%), fall back to Gemini 3.8 Flash (High)
+  # rather than Gemini 3.1 Pro / snowball-subagent
+  for flash_mid in ("gemini-3.8-flash-high", "gemini-flash-next", "gemini-3.8-flash-medium"):
+    flash_hit = lookup_model(models, flash_mid)
+    if flash_hit and flash_hit.get("quota", 0.0) >= EMERGENCY_PIN_FLOOR:
+      return flash_hit
+
+  if candidates:
     return candidates[0]
 
   # Fallback to first available model in catalog
@@ -1216,6 +1224,123 @@ def get_conversation_project_id(conv_id: str) -> str:
   except Exception:
     pass
   return os.environ.get("ANTIGRAVITY_PROJECT_ID", "").strip()
+
+
+def _decode_proto_varint(data: bytes, offset: int) -> tuple[int, int]:
+  res = 0
+  shift = 0
+  while offset < len(data):
+    b = data[offset]
+    offset += 1
+    res |= (b & 0x7F) << shift
+    if not (b & 0x80):
+      return res, offset
+    shift += 7
+  raise ValueError("Truncated varint")
+
+
+def _iter_proto_length_delimited(data: bytes, target_field: int):
+  offset = 0
+  n = len(data)
+  while offset < n:
+    tag, offset = _decode_proto_varint(data, offset)
+    fn = tag >> 3
+    wt = tag & 7
+    if wt == 0:
+      _, offset = _decode_proto_varint(data, offset)
+    elif wt == 1:
+      offset += 8
+    elif wt == 2:
+      length, offset = _decode_proto_varint(data, offset)
+      val = data[offset : offset + length]
+      offset += length
+      if fn == target_field:
+        yield val
+    elif wt == 5:
+      offset += 4
+    else:
+      break
+
+
+def extract_sidecar_id_from_meta_blob(meta_bytes: bytes) -> str:
+  """Extracts source_metadata.sidecar.sidecar_id (field 12 -> 2 -> 1) from CortexTrajectoryMetadata."""
+  if not meta_bytes:
+    return ""
+  try:
+    for smeta in _iter_proto_length_delimited(meta_bytes, 12):
+      for sidecar in _iter_proto_length_delimited(smeta, 2):
+        for sid_bytes in _iter_proto_length_delimited(sidecar, 1):
+          sid = sid_bytes.decode("utf-8", errors="ignore").strip()
+          if sid:
+            return sid
+  except Exception:
+    pass
+  return ""
+
+
+def extract_sidecar_id_from_summary_blob(summary_bytes: bytes) -> str:
+  """Extracts trajectory_metadata.source_metadata.sidecar.sidecar_id (field 17 -> 12 -> 2 -> 1)."""
+  if not summary_bytes:
+    return ""
+  try:
+    for meta_bytes in _iter_proto_length_delimited(summary_bytes, 17):
+      sid = extract_sidecar_id_from_meta_blob(meta_bytes)
+      if sid:
+        return sid
+  except Exception:
+    pass
+  return ""
+
+
+def get_conversation_sidecar_id(
+    conv_id: str = "", summary: dict | None = None
+) -> str:
+  """Returns sidecar_id if the conversation was spawned by a sidecar, else ''."""
+  if isinstance(summary, dict):
+    meta = summary.get("trajectoryMetadata") or {}
+    smeta = meta.get("sourceMetadata") or meta.get("source_metadata") or {}
+    if isinstance(smeta, dict):
+      sc = smeta.get("sidecar") or {}
+      if isinstance(sc, dict):
+        sid = str(sc.get("sidecarId") or sc.get("sidecar_id") or "").strip()
+        if sid:
+          return sid
+
+  if not conv_id:
+    return ""
+
+  for app_dir in find_app_data_dirs():
+    c_db = os.path.join(app_dir, "conversations", f"{conv_id}.db")
+    if os.path.isfile(c_db):
+      try:
+        conn = sqlite3.connect(f"file:{c_db}?mode=ro", uri=True, timeout=2.0)
+        row = conn.execute(
+            'SELECT data FROM trajectory_metadata_blob WHERE id = "main"'
+        ).fetchone()
+        conn.close()
+        if row and row[0]:
+          sid = extract_sidecar_id_from_meta_blob(row[0])
+          if sid:
+            return sid
+      except Exception:
+        pass
+
+    s_db = os.path.join(app_dir, SUMMARY_DB_NAME)
+    if os.path.isfile(s_db):
+      try:
+        conn = sqlite3.connect(f"file:{s_db}?mode=ro", uri=True, timeout=2.0)
+        row = conn.execute(
+            "SELECT raw_summary FROM conversation_summaries WHERE conversation_id = ?",
+            (conv_id,),
+        ).fetchone()
+        conn.close()
+        if row and row[0]:
+          sid = extract_sidecar_id_from_summary_blob(row[0])
+          if sid:
+            return sid
+      except Exception:
+        pass
+  return ""
 
 
 def get_project_model_preference(project_id_or_name: str, projects_dir: str = "") -> str:
@@ -1401,32 +1526,38 @@ def resolve_handoff_model(
       raise RuntimeError(f"--model '{explicit}' is not available in GetAvailableModels")
     return _check_and_return(hit)
 
+  sidecar_id = get_conversation_sidecar_id(current_conv_id) if current_conv_id else ""
   pid = project_id or (get_conversation_project_id(current_conv_id) if current_conv_id else "")
-  if pid and pid != "outside-of-project":
-    proj_pref = get_project_model_preference(pid)
+  eff_pid = (
+      sidecar_id
+      if (sidecar_id and get_project_model_preference(sidecar_id))
+      else pid
+  )
+  if eff_pid and eff_pid != "outside-of-project":
+    proj_pref = get_project_model_preference(eff_pid)
     if proj_pref:
       clean_pref = proj_pref.strip().lower().removeprefix("profile:")
       # Route named profiles to their highest-remaining healthy model
       if clean_pref in MODEL_PROFILES:
         hit = resolve_profile_model(models, clean_pref)
         if hit:
-          return _check_and_return({**hit, "source": f"project:{pid}"})
+          return _check_and_return({**hit, "source": f"project:{eff_pid}"})
       elif proj_pref in AGENTAPI_TIERS:
         hit = from_tier(proj_pref)
         if hit:
-          return _check_and_return({**hit, "source": f"project:{pid}"})
+          return _check_and_return({**hit, "source": f"project:{eff_pid}"})
       else:
         # Protect against legacy project preferences pinned to expensive WTU models
         shield = reroute_wasteful_wtu_model(models, proj_pref)
         if shield:
-          return _check_and_return({**shield, "source": f"project:{pid}:wtu_shield"})
+          return _check_and_return({**shield, "source": f"project:{eff_pid}:wtu_shield"})
         hit = lookup_model(models, proj_pref)
         if hit and hit.get("quota", 1.0) >= QUOTA_SOFT_FLOOR:
-          return _check_and_return({**hit, "source": f"project:{pid}"})
+          return _check_and_return({**hit, "source": f"project:{eff_pid}"})
         elif hit:
           fallback = resolve_profile_model(models, "orchestrator")
           if fallback:
-            return _check_and_return({**fallback, "source": f"project:{pid}:quota_fallback"})
+            return _check_and_return({**fallback, "source": f"project:{eff_pid}:quota_fallback"})
 
   inherited = get_last_used_model(current_conv_id) if current_conv_id else ""
   if inherited:
@@ -3703,10 +3834,13 @@ def archive_project_conversations(
     keep: int = 1,
     projects_dir: str = "",
 ) -> dict:
-  """Archives older active conversations in a project, keeping the `keep` newest."""
-  target_project_id = resolve_project_id(
-      project_filter, projects_dir=projects_dir
-  )
+  """Archives older active conversations in a project (or sidecar scope), keeping the `keep` newest."""
+  try:
+    target_project_id = resolve_project_id(
+        project_filter, projects_dir=projects_dir
+    )
+  except ValueError:
+    target_project_id = project_filter.strip()
   summaries = _fetch_ls_summaries_for_audit()
   if summaries is None:
     return {
@@ -3732,7 +3866,8 @@ def archive_project_conversations(
           except OSError:
             pass
 
-  # Collect active top-level conversations belonging to this project
+  # Collect active top-level conversations belonging to this project or sidecar ID
+  raw_filter = project_filter.strip()
   active_chats: list[tuple[str, str]] = []
   for cid, s in summaries.items():
     if not isinstance(s, dict):
@@ -3751,7 +3886,8 @@ def archive_project_conversations(
     ):
       continue
     pid = str(meta.get("projectId") or "").strip()
-    if pid == target_project_id:
+    sidecar_id = get_conversation_sidecar_id(cid, s)
+    if pid == target_project_id or (sidecar_id and sidecar_id in (target_project_id, raw_filter)):
       created_at = str(meta.get("createdAt") or "")
       active_chats.append((created_at, cid))
 
@@ -3780,26 +3916,30 @@ def archive_project_conversations(
 
 
 def auto_archive_projects(target_cid: str = "") -> dict:
-  """Archives older conversations for projects configured with a retention policy."""
+  """Archives older conversations for projects/sidecars configured with a retention policy."""
   rules = load_retention_rules()
   results: dict[str, dict] = {}
   target_project_id = get_conversation_project_id(target_cid) if target_cid else ""
+  target_sidecar_id = get_conversation_sidecar_id(target_cid) if target_cid else ""
 
-  # Map project names/UUIDs to canonical project IDs
+  # Map project names/UUIDs (or sidecar IDs when no standalone project file exists) to retention rules
   resolved_rules: dict[str, tuple[str, int]] = {}
   for proj_key, keep in rules.items():
     try:
       pid = resolve_project_id(proj_key)
       resolved_rules[pid] = (proj_key, keep)
     except Exception:
-      pass
+      resolved_rules[proj_key] = (proj_key, keep)
 
-  # If triggered by a specific chat whose project is unassigned or not under retention, exit early
-  if target_cid and (not target_project_id or target_project_id not in resolved_rules):
+  # If triggered by a specific chat whose project and sidecar are not under retention, exit early
+  if target_cid and (
+      (not target_project_id or target_project_id not in resolved_rules)
+      and (not target_sidecar_id or target_sidecar_id not in resolved_rules)
+  ):
     return results
 
   for pid, (proj_key, keep) in resolved_rules.items():
-    if target_project_id and pid != target_project_id:
+    if target_cid and pid not in (target_project_id, target_sidecar_id):
       continue
     try:
       results[proj_key] = archive_project_conversations(pid, keep=keep)
