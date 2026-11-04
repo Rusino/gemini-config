@@ -124,6 +124,23 @@ This ensures `--nativeFonts` (CoreText, where `SkScalerContext_Mac::generateMetr
 by 1) and `--fontations` are exercised before submit, preventing font-backend-specific test
 breakages on Mac trybots (`cpp_systems_invariants.md` #10; Gerrit 1404196 -> 1411716).
 
+### Android `NativeFonts` Trybot Caveat (`--paragraph_fonts extra_fonts` Omitted)
+
+In Skia's task generator (`infra/bots/gen_tasks_logic/dm_flags.go:1811-1817` and
+`infra/bots/gen_tasks_logic/gen_tasks_logic.go:1737-1739`), `NativeFonts` bots mount the
+`extra_fonts` CIPD package (`needsFontsForParagraphTests()`) and pass `--paragraph_fonts extra_fonts`
+only when `!b.MatchOs("Android")`. On Android `NativeFonts` trybots (e.g.,
+`Test-Android-Clang-GalaxyS24-CPU-Adreno750-arm64-Release-All-Android_NativeFonts_AndroidNDKFonts`),
+`FLAGS_paragraph_fonts` is empty, so `SkParagraph` tests backed by `ResourceFontCollection` and
+guarded by `SKIP_IF_FONTS_NOT_FOUND` (`modules/skparagraph/tests/SkParagraphTest.cpp:126-128`,
+`288-294`) silently return early without executing (incident: `flutter#192891`, Gerrit 1416501 PS1).
+When `canary_advisor.py triage` inspects an Android `NativeFonts` build on a CL touching
+`modules/skparagraph/`, it prints an explicit `Note:` warning that `SKIP_IF_FONTS_NOT_FOUND` tests
+were skipped on that bot. Do not treat a green Android `NativeFonts` build as proof that a
+`ResourceFontCollection` test ran on Android; see `bug-triage` Phase 3 for target-OS font
+verification options (`GetResourceAsData` from `resources/fonts/` or a one-off `DO NOT SUBMIT`
+WIP CL pair on `GalaxyS24`).
+
 ## Local Chromium Verification (Fast Pre-Canary Check)
 
 When a Skia diff touches `include/private/chromium/`, `src/text/gpu/SkChromeRemoteGlyphCache*`,

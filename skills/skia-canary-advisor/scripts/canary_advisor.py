@@ -1416,14 +1416,31 @@ def cmd_triage(args):
 
     # Font-backend and other non-ASAN trybots are triggered by `advise` too; a red Mac
     # NativeFonts_Fontations job went unnoticed on Gerrit 1400176 PS2 when only ASAN was checked
+    touches_skparagraph = any(f.startswith("modules/skparagraph/") for f in touched_files)
     other_builders = [b for b in builds if "ASAN" not in b and not b.startswith("Canary-")]
     for ob in other_builders:
         b_info = builds[ob]
         status = b_info.get("status", "UNKNOWN")
         print(f"\n## Trybot: {ob} [{status}]")
+        # Android NativeFonts bots omit --paragraph_fonts extra_fonts (dm_flags.go:1813), so
+        # ResourceFontCollection tests guarded by SKIP_IF_FONTS_NOT_FOUND return early without
+        # running (Gerrit 1416501 PS1 on Android_NativeFonts_AndroidNDKFonts)
+        skip_note = (
+            "Android NativeFonts bots do not mount extra_fonts or pass "
+            "--paragraph_fonts extra_fonts (infra/bots/gen_tasks_logic/dm_flags.go:1813, "
+            "gen_tasks_logic.go:1737); SkParagraph ResourceFontCollection tests guarded "
+            "by SKIP_IF_FONTS_NOT_FOUND return early without running on this bot."
+            if ("Android" in ob and "NativeFonts" in ob and touches_skparagraph)
+            else ""
+        )
         if status not in ("FAILURE", "INFRA_FAILURE"):
-            results["builds"][ob] = {"verdict": status}
+            res = {"verdict": status}
+            if skip_note:
+                res["note"] = skip_note
+            results["builds"][ob] = res
             print(f"- Verdict: {status}")
+            if skip_note:
+                print(f"- Note: {skip_note}")
             continue
         # The stem heuristic in triage_other_canary_failure saw empty stdout here and called a
         # CL-caused dm failure UNRELATED_HEAD_BREAKAGE, so read the dm step log directly instead
@@ -1447,9 +1464,13 @@ def cmd_triage(args):
             }
         if failures:
             triage_res["failures"] = failures
+        if skip_note:
+            triage_res["note"] = skip_note
         results["builds"][ob] = triage_res
         print(f"- Verdict: {triage_res['verdict']}")
         print(f"- Summary: {triage_res['summary']}")
+        if skip_note:
+            print(f"- Note: {skip_note}")
         if failures:
             print("```")
             print("\n".join(failures))

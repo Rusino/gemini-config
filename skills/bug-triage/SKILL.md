@@ -64,6 +64,12 @@ When Outcome 1 or 2 applies:
    - Place the reproducer in the existing relevant test file.
    - Enforce **Timeless Test Comments**: explain *why* the contract holds; never write `"// Reproducer for b/12345"`.
    - Obey Rule 9 (public headers compile clean) and Rule 10 (no backend-specific font metric pinning in cross-platform tests).
+   - **Target-OS Font Coverage Guard (Narrow Scope: Target-OS Bugs & Cross-Platform Claims Only)**:
+     Do **not** trigger physical device trybots on routine `SkParagraph` CLs. This guard applies **only** when the bug is reported against Android (or another target OS where CI omits `--paragraph_fonts`) **or** when the draft issue reply claims the defect is not OS-specific (e.g., *"not Android-specific"*):
+     - In Skia CI, `infra/bots/gen_tasks_logic/dm_flags.go:1811-1817` (`!b.MatchOs("Android")`) and `infra/bots/gen_tasks_logic/gen_tasks_logic.go:1737-1739` (`needsFontsForParagraphTests()`) do **not** mount the `extra_fonts` CIPD package or pass `--paragraph_fonts extra_fonts` on Android `NativeFonts` bots. Consequently, `SkParagraph` tests using `ResourceFontCollection` and `SKIP_IF_FONTS_NOT_FOUND` (`modules/skparagraph/tests/SkParagraphTest.cpp:126-128`, `288-294`) return early and report a vacuous `SUCCESS` on Android (incident: `flutter#192891`, Gerrit 1416501 PS1 on `Test-Android-Clang-GalaxyS24-CPU-Adreno750-arm64-Release-All-Android_NativeFonts_AndroidNDKFonts`).
+     - To prove reproduction and fix on the target OS, either:
+       1. Register the test with `DEF_TEST` (not `UNIX_ONLY_TEST`, which expands to `DEF_TEST_DISABLED` outside `SK_BUILD_FOR_UNIX` in `tests/Test.h:306-310`) and load bundled test fonts directly from `resources/fonts/` (`GetResourceAsData` + `ToolUtils::TestFontMgr()->makeFromData`) or query the platform `SkFontMgr` (`ToolUtils::TestFontMgr()`) so the test executes without `--paragraph_fonts extra_fonts`, **or**
+       2. Run a one-off `DO NOT SUBMIT` WIP CL pair on the live target bot (e.g., `Test-Android-Clang-GalaxyS24-CPU-Adreno750-arm64-Release-All-Android_NativeFonts_AndroidNDKFonts`) proving `FAILURE` without the fix and `SUCCESS` with the fix, then immediately `abandon` the temporary WIP CL.
    - Commit and push `PS1` strictly as `%wip`:
      ```bash
      git add <test_files>
@@ -78,12 +84,25 @@ When Outcome 1 or 2 applies:
    - Verify native unit tests pass.
    - For `modules/skparagraph/`, `modules/skunicode/`, `modules/skshaper/`: run `flutter-test-paragraph-engine` and `google3-test-paragraph`. For `lib/web_ui/lib/`: run `webparagraph-corpus`.
    - Run `amnesia-precommit` checks (`audit_comments.py`, `ruthless_audit.py`).
-   - Amend commit and push `PS2`:
+   - Amend commit and push `PS2` with an explicit pre-fix test failure statement and a complete, human-readable `Tested:` matrix listing every verification gate actually executed (native unit tests with test count, Flutter targeted and full framework corpora, Google3 transitive corpus test count **without** internal `//...` target paths or `cl/` numbers, ASAN trybot, and any platform or physical device trybots on Mac, Windows, or Android). If slow gates (such as the Google3 corpus or a physical device trybot) complete after the initial `%wip` `PS2` upload, update the CL commit message so `Tested:` reflects the full verification record:
      ```bash
      git add -u
      git commit --amend -m "[<module>] Fix <topic>
 
      <Detailed problem and fix description>
+
+     Without the fix, <TestName> fails with <exact assertion, failure count, or crash>.
+
+     Tested:
+     - Skia dm --src tests --nogpu --nativeFonts --paragraph_fonts
+       extra_fonts -m SkParagraph, Debug and Release (<N>/<N> tests)
+     - Flutter paragraph engine and framework suites: targeted text suite
+       (2409/2409 tests, 0 regressions) and full framework corpus (<M>
+       passed, 0 regressions)
+     - Google3 transitive SkParagraph test corpus (1139 tests, 0 text
+       regressions)
+     - Skia trybots: <Linux ASAN / Fontations, Mac CoreText / Fontations,
+       Win11 DirectWrite, physical Android GalaxyS24 if run>
 
      Bug: b/<ID>
      Assisted-by: <Model Name>"
@@ -101,5 +120,6 @@ When Outcome 1 or 2 applies:
    - Verification attestation (test results, corpus results).
 2. **Draft English Reply for the Issue**:
    - Provide a concise, professional technical reply ready to be pasted or published to Buganizer/GitHub.
+   - **No Unexecuted Target-OS / Cross-Platform Claims**: Never cite a green Android `NativeFonts` trybot as verification of a `ResourceFontCollection` + `SKIP_IF_FONTS_NOT_FOUND` test, and never claim in a tracker reply that a bug is *"not <OS>-specific"* or verified on `<OS>` unless the reproducer test actually executed (did not early-return via `SKIP_IF_FONTS_NOT_FOUND`) on that OS's font manager/shaper or via the Phase 3 target-OS verification protocol.
    - **Confidentiality Guard**: Never mention `SkoreText` or cite/link `[SkoreText]` Gerrit CLs in external issue trackers, GitHub issues/PRs, public Buganizer/crbug comments, or external review replies until the user explicitly lifts this restriction.
    - **Never auto-publish or post comments to the issue tracker without explicit user confirmation.**

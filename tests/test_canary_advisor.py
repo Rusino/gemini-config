@@ -952,8 +952,53 @@ class TestCanaryAdvisor(unittest.TestCase):
     ), patch.object(canary_advisor, "swarming_tasks_for_cl", return_value=[]), patch(
         "sys.stdout", buf_ok
     ):
-      canary_advisor.cmd_triage(args)
+      res_ok = canary_advisor.cmd_triage(args)
     self.assertIn("TRYJOBS: ALL GREEN", buf_ok.getvalue())
+    self.assertNotIn("note", res_ok["builds"][mac_bot])
+
+    # Green Android NativeFonts trybot on an SkParagraph CL warns that extra_fonts /
+    # --paragraph_fonts extra_fonts are omitted (dm_flags.go:1813) and SKIP_IF_FONTS_NOT_FOUND
+    # tests return early without running
+    android_bot = (
+        "Test-Android-Clang-GalaxyS24-CPU-Adreno750-arm64-Release-All-"
+        "Android_NativeFonts_AndroidNDKFonts"
+    )
+    buf_android = io.StringIO()
+    with patch.object(canary_advisor, "load_cl", return_value=meta), patch.object(
+        canary_advisor,
+        "bb_cl_builds",
+        return_value={
+            asan_bot: {"id": "9001", "status": "SUCCESS"},
+            android_bot: {"id": "8666039676250874145", "status": "SUCCESS"},
+        },
+    ), patch.object(canary_advisor, "swarming_tasks_for_cl", return_value=[]), patch(
+        "sys.stdout", buf_android
+    ):
+      res_android = canary_advisor.cmd_triage(args)
+    out_android = buf_android.getvalue()
+    self.assertEqual(res_android["builds"][android_bot]["verdict"], "SUCCESS")
+    self.assertIn("note", res_android["builds"][android_bot])
+    self.assertIn("--paragraph_fonts extra_fonts", res_android["builds"][android_bot]["note"])
+    self.assertIn("SKIP_IF_FONTS_NOT_FOUND", res_android["builds"][android_bot]["note"])
+    self.assertIn("- Note: Android NativeFonts bots do not mount extra_fonts", out_android)
+    self.assertIn("dm_flags.go:1813", out_android)
+
+    # Non-SkParagraph CLs do not emit the SkParagraph SKIP_IF_FONTS_NOT_FOUND note
+    non_para_meta = {
+        **meta,
+        "diff": "diff --git a/src/core/SkPaint.cpp b/src/core/SkPaint.cpp\n+// x\n",
+    }
+    buf_non_para = io.StringIO()
+    with patch.object(canary_advisor, "load_cl", return_value=non_para_meta), patch.object(
+        canary_advisor,
+        "bb_cl_builds",
+        return_value={android_bot: {"id": "8666039676250874145", "status": "SUCCESS"}},
+    ), patch.object(canary_advisor, "swarming_tasks_for_cl", return_value=[]), patch(
+        "sys.stdout", buf_non_para
+    ):
+      res_non_para = canary_advisor.cmd_triage(args)
+    self.assertNotIn("note", res_non_para["builds"][android_bot])
+    self.assertNotIn("SKIP_IF_FONTS_NOT_FOUND", buf_non_para.getvalue())
 
   def test_has_cloudtop_citc_detects_local_mount_or_corp_mac_ssh(self):
     with patch("os.path.isdir", return_value=True):
