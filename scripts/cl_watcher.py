@@ -60,6 +60,8 @@ SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPTS_DIR not in sys.path:
   sys.path.insert(0, SCRIPTS_DIR)
 import audit_gate  # pylint: disable=g-import-not-at-top
+# Import shared backend entity state machine so state, blockers, and actions are computed once
+import entity_state
 import triage_store  # pylint: disable=g-import-not-at-top
 
 CANARY_ADVISOR_DIR = os.path.normpath(
@@ -838,6 +840,8 @@ def save_watcher_state(state: dict[str, Any]) -> None:
   # Hold exclusive flock across atomic temp-file replacement so concurrent writers never collide
   with _STATE_IO_LOCK:
     try:
+      # Persist precomputed entity_state on disk so external readers see current state fields
+      entity_state.enrich_entity_states(state)
       os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
       lock_path = f"{STATE_FILE}.lock"
       with open(lock_path, "a", encoding="utf-8") as lf:
@@ -6260,16 +6264,8 @@ def _rekey_state_item_chat(
 
 def _is_assigned_reviewer_record(rec: dict[str, Any]) -> bool:
   """Returns True if the user is an assigned reviewer on an open external CL/PR"""
-  if not isinstance(rec, dict):
-    return False
-  if rec.get("is_self") or rec.get("companion_to") or rec.get("is_companion"):
-    return False
-  if rec.get("reviewer_removed"):
-    return False
-  role = str(rec.get("role") or "").strip()
-  if role:
-    return role.startswith("reviewer")
-  return not bool(rec.get("is_watching"))
+  # Delegate reviewer classification to entity_state so backend and UI share one rule
+  return entity_state.is_reviewer_change(rec)
 
 
 def _start_pinned_chat_for_record(
@@ -14021,6 +14017,63 @@ function shortActor(raw, it) {
   return local;
 }
 
+// Builds a compact string signature of an item's own state-determining fields
+function itemCoreSig(it) {
+  if (!it || typeof it !== 'object') return '';
+  const b = v => v ? '1' : '0';
+  const n = v => {
+    const x = Number(v || 0);
+    return Number.isFinite(x) ? String(Math.trunc(x)) : '0';
+  };
+  const s = v => String(v || '');
+  const isOldMerged = s(it.status) === 'MERGED' &&
+    ((Date.now() / 1000 - Number(it.submitted_ts || 0)) / 86400 > OLD_MERGED_DAYS) ? '1' : '0';
+  const ps = it.post_submit;
+  const psPending = (ps && typeof ps === 'object' && !ps.all_passed) ? '1' : '0';
+  const comps = Array.isArray(it.companions) ? it.companions : [];
+  const compsSig = comps.filter(c => c && typeof c === 'object')
+    .map(c => `${s(c.status)}:${b(c.ready_to_abandon)}`).join(',');
+  const mcs = Array.isArray(it.merge_children) ? it.merge_children : [];
+  const mcNeeds = mcs.some(mc => mc && mc.cl_needs_you) ? '1' : '0';
+  const tr = (it.triage && typeof it.triage === 'object') ? it.triage : null;
+  const trSig = tr ? [
+    b(tr.is_stale), n(tr.triaged_patchset), s(tr.triaged_revision), s(tr.review_outcome),
+    s(tr.verdict), s(tr.verdict_label), s(tr.review_eyebrow_label), s(tr.audit_state),
+    n(tr.audit_target_patchset), b(tr.corpus_required), s(tr.corpus_status),
+    s(tr.corpus_script), n(tr.corpus_tested_patchset), s(tr.corpus_tested_sha),
+    b(tr.g3_corpus_required), s(tr.g3_corpus_status), n(tr.g3_corpus_tested_patchset),
+  ].join(':') : '';
+  return [
+    s(it.status), s(it.phase), b(it.in_my_attention), b(it.cq_failed), b(it.is_self),
+    b(it.is_draft), b(it.in_development), b(it.is_wip), b(it.is_watching),
+    b(it.reviewer_removed), s(it.role), shortActor(it.last_msg_author, it),
+    s(it.companion_to), b(it.is_companion), b(it.ready_to_abandon), b(it.merge_conflict),
+    s(it.cq_status), n(it.approved_count), n(it.missing_approvals),
+    n(it.missing_reviewers_to_assign), b(it.tree_red), b(it.has_active_merges), isOldMerged,
+    psPending, s(it.sponsor_action), b(it.self_approved), s(it.self_review_state),
+    n(it.self_cr_vote), b(it.chat_busy), b(it.conversation_id), s(it.stack_root_ikey),
+    n(it.patchset), n(it.reviewed_ps), n(it.review_target_ps), s(it.head_sha),
+    s(it.revision), s(it.kind), s(it.item_key), compsSig, mcNeeds, trSig,
+  ].join('|');
+}
+
+// Verifies whether backend-computed entity_state matches the item and its stack ancestors
+function hasFreshEntityState(it, data) {
+  const es = it && it.entity_state;
+  if (!es || typeof es !== 'object' || !es.input_sig) return false;
+  const base = itemCoreSig(it);
+  const ancs = Array.isArray(it.stack_ancestors) && it.stack_ancestors.length
+    ? it.stack_ancestors.filter(Boolean).map(String)
+    : (it.stack_parent_ikey ? [String(it.stack_parent_ikey)] : []);
+  if (!ancs.length) return es.input_sig === base;
+  const rawItems = (data && data.items) || (cachedData && cachedData.items) || {};
+  const parts = ancs.map(k => {
+    const anc = cachedStackByIkey.get(k) || rawItems[k] || null;
+    return `${k}=${anc ? itemCoreSig(anc) : ''}`;
+  });
+  return es.input_sig === `${base}||${parts.join('~')}`;
+}
+
 // Maps a Gerrit email, GitHub login, or Piper LDAP to the page that profiles that person
 function actorUrl(it, raw) {
   const s = String(raw || '');
@@ -14076,7 +14129,8 @@ function wipLabel(it) {
 }
 
 function isCompanion(it) {
-  return Boolean(it.companion_to);
+  // Match backend is_companion so explicit companion flags and parent links behave identically
+  return Boolean(it && (it.companion_to || it.is_companion));
 }
 
 // Returns active companions on a parent item that are ready to abandon
@@ -14173,6 +14227,10 @@ function itemKeyOf(it) {
 // Resolves the topological root item key for a stacked CL/PR chain
 function resolveStackRootKey(it, byIkey) {
   if (!it) return '';
+  // Reuse backend stack_root_key when item signature is fresh
+  if (hasFreshEntityState(it) && it.entity_state.stack_root_key) {
+    return String(it.entity_state.stack_root_key);
+  }
   if (it.stack_root_ikey) return String(it.stack_root_ikey);
   const ancs = Array.isArray(it.stack_ancestors) ? it.stack_ancestors : [];
   if (ancs.length && ancs[0]) return String(ancs[0]);
@@ -14259,13 +14317,21 @@ function stackStepBadgeHtml(it) {
 // Identifies unmerged upstream stack parents that hold descendants from landing or review
 function upstreamBlockersOf(it, data) {
   if (!it || isCompanion(it)) return [];
+  // Prefer backend-computed upstream_blockers when input signature matches current item state
+  const byIkey = cachedStackByIkey;
+  const rawItems = (data && data.items) || (cachedData && cachedData.items) || {};
+  if (hasFreshEntityState(it, data) && Array.isArray(it.entity_state.upstream_blockers)) {
+    return it.entity_state.upstream_blockers.map(b => {
+      const anc = byIkey.get(b.ancestor_key) || rawItems[b.ancestor_key] || null;
+      return anc ? {ancestor: anc, reasons: (b.reasons || []).slice()} : null;
+    }).filter(Boolean);
+  }
   const ancestors = Array.isArray(it.stack_ancestors) && it.stack_ancestors.length
     ? it.stack_ancestors
     : (it.stack_parent_ikey ? [it.stack_parent_ikey] : []);
   if (!ancestors.length) return [];
 
-  const byIkey = cachedStackByIkey;
-  const rawItems = (data && data.items) || {};
+  // Fallback local ancestor traversal when item fields were mutated in-memory by a test harness
   const blockers = [];
 
   for (const ancKey of ancestors) {
@@ -14400,6 +14466,10 @@ function assignReviewerButtonsHtml(itemKeys, cands, batchTarget) {
 
 // Formats short status text, icon, and tone for a step in the horizontal chain spine
 function spineStepShortState(m) {
+  // Reuse backend spine_short_state when the item signature has not drifted
+  if (hasFreshEntityState(m) && m.entity_state.spine_short_state) {
+    return m.entity_state.spine_short_state;
+  }
   if (m.status === 'MERGED') return {short: 'Merged', icon: '✓', tone: 'spine-merged'};
   if (m.status === 'ABANDONED' || m.status === 'CLOSED') {
     return {short: 'Closed', icon: '—', tone: 'spine-step'};
@@ -14948,6 +15018,8 @@ function formatStatusTime(it, fallbackEt, fallbackAge) {
 
 // One predicate drives the headline count and the focus cards
 function needsMyReply(it) {
+  // Reuse backend needs_my_reply predicate when item state is fresh
+  if (hasFreshEntityState(it)) return Boolean(it.entity_state.needs_my_reply);
   return Boolean(it.in_my_attention) && it.phase !== 'ALERT_CQ_FAILED' &&
     !(it.cq_failed && it.is_self) &&
     it.phase !== 'SUBMITTING' && !it.is_draft && !it.in_development &&
@@ -14956,16 +15028,22 @@ function needsMyReply(it) {
 }
 
 function isAlert(it) {
+  // Reuse backend is_alert predicate when item state is fresh
+  if (hasFreshEntityState(it)) return Boolean(it.entity_state.is_alert);
   return (it.phase || '').startsWith('ALERT_');
 }
 
 // A post-submit alert means a landed commit broke something; a CQ failure is still pre-submit
 function isPostSubmitAlert(it) {
+  // Reuse backend is_post_submit_alert predicate when item state is fresh
+  if (hasFreshEntityState(it)) return Boolean(it.entity_state.is_post_submit_alert);
   return isAlert(it) && it.phase !== 'ALERT_CQ_FAILED';
 }
 
 // External-author Gerrit CLs with our CR+1 need Googler action to add a 2nd reviewer or CQ+2
 function needsSponsorAction(it) {
+  // Reuse backend needs_sponsor_action predicate when item and ancestor states are fresh
+  if (hasFreshEntityState(it)) return Boolean(it.entity_state.needs_sponsor_action);
   if (!it || it.is_self || isCompanion(it)) return false;
   if (it.status !== 'NEW' && it.status !== 'OPEN') return false;
   if (it.is_wip || it.is_draft || it.reviewer_removed) return false;
@@ -14974,8 +15052,10 @@ function needsSponsorAction(it) {
   // Hold CQ+2 until unmerged stack ancestors also have all approvals and no conflict
   if (act === 'submit_cq') {
     const ancs = Array.isArray(it.stack_ancestors) ? it.stack_ancestors : [];
+    // Fall back to cachedData.items when cachedStackByIkey has not been built yet
+    const rawItems = (cachedData && cachedData.items) || {};
     for (const ancKey of ancs) {
-      const anc = cachedStackByIkey.get(ancKey);
+      const anc = cachedStackByIkey.get(ancKey) || rawItems[ancKey] || null;
       if (!anc) continue;
       const st = String(anc.status || '').toUpperCase();
       if (st === 'MERGED' || st === 'ABANDONED' || st === 'CLOSED') continue;
@@ -14990,6 +15070,8 @@ function needsSponsorAction(it) {
 
 // Alerts count as needing me even on merged CLs, since a blamed commit needs a reaction
 function statusOf(it) {
+  // Reuse backend status classification when item state is fresh
+  if (hasFreshEntityState(it) && it.entity_state.status) return it.entity_state.status;
   const preReview = Boolean(it.is_draft || it.in_development);
   // Pre-review drafts and no-reviewer changes stay out of Needs You until reviewers are added
   if (isPostSubmitAlert(it) || (!preReview && (isAlert(it) || needsMyReply(it)))) {
@@ -15040,6 +15122,8 @@ const LANES = [
 ];
 
 function laneOf(it) {
+  // Reuse backend lane routing when item state is fresh
+  if (hasFreshEntityState(it) && it.entity_state.lane) return it.entity_state.lane;
   const st = statusOf(it);
   if (st === 'attention' || st === 'conflict') return 'you';
   if (st === 'cq') return 'landing';
@@ -15339,6 +15423,8 @@ function rowTime(it) {
 
 // Assigned reviewer changes use the code review button state machine
 function isReviewerChange(it) {
+  // Reuse backend reviewer role classification when item state is fresh
+  if (hasFreshEntityState(it)) return Boolean(it.entity_state.is_reviewer_change);
   if (!it || it.is_self || isCompanion(it)) return false;
   if (it.reviewer_removed) return false;
   const role = String(it.role || '').trim();
@@ -15410,6 +15496,8 @@ function chatActionHtml(it, data, compact) {
 
 // Server-side rebase fails on conflicts, so only my own open changes wake a local chat
 function canRebase(it) {
+  // Reuse backend can_rebase check when item state is fresh
+  if (hasFreshEntityState(it)) return Boolean(it.entity_state.can_rebase);
   if (isCompanion(it)) return false;
   return Boolean(it.merge_conflict && it.is_self) &&
     (it.status === 'NEW' || it.status === 'OPEN') && Boolean(it.item_key);
@@ -15442,6 +15530,8 @@ let finalizeModalState = {
 
 // Gate one-click finalization to open non-WIP external/colleague Gerrit CLs with green CLEAN triage
 function canFinalizeCleanReview(it) {
+  // Reuse backend clean-review finalization eligibility when item state is fresh
+  if (hasFreshEntityState(it)) return Boolean(it.entity_state.can_finalize_clean_review);
   if (!it || it.kind !== 'gerrit' || it.is_self || isCompanion(it)) return false;
   if (it.status !== 'NEW' || it.is_wip || it.self_approved) return false;
   if (Number(it.self_cr_vote || 0) > 0 || isTriageStale(it)) return false;
@@ -15713,6 +15803,8 @@ const OUTCOME_BADGES = {
 };
 
 function isTriageStale(it) {
+  // Reuse backend triage staleness check when item state is fresh
+  if (hasFreshEntityState(it)) return Boolean(it.entity_state.is_triage_stale);
   const tr = it && it.triage;
   if (!tr) return false;
   if (tr.is_stale) return true;
@@ -15740,6 +15832,10 @@ function corpusDisplayName(tr) {
 
 // Evaluates corpus gate state and resets passed to pending if patchset or commit drifted
 function effectiveCorpusStatus(it) {
+  // Reuse backend effective_corpus_status when item state is fresh
+  if (hasFreshEntityState(it) && it.entity_state.effective_corpus_status) {
+    return it.entity_state.effective_corpus_status;
+  }
   const tr = it && it.triage;
   if (!tr || !tr.corpus_required) return 'not_required';
   if (isTriageStale(it)) return 'pending';
@@ -15766,6 +15862,10 @@ function effectiveCorpusStatus(it) {
 
 // Evaluates Google3 Paragraph A/B gate state and resets passed to pending on newer patchsets
 function effectiveG3CorpusStatus(it) {
+  // Reuse backend effective_g3_corpus_status when item state is fresh
+  if (hasFreshEntityState(it) && it.entity_state.effective_g3_corpus_status) {
+    return it.entity_state.effective_g3_corpus_status;
+  }
   const tr = it && it.triage;
   if (!tr || !tr.g3_corpus_required || (it && it.kind === 'github')) return 'not_required';
   if (isTriageStale(it)) return 'pending';
@@ -15788,6 +15888,10 @@ function joinGateNames(names) {
 
 // Combines Flutter/WebParagraph corpus and Google3 A/B gates so green LGTM requires both
 function combinedGateState(it) {
+  // Reuse backend combined_gate_state when item state is fresh
+  if (hasFreshEntityState(it) && it.entity_state.combined_gate_state) {
+    return it.entity_state.combined_gate_state;
+  }
   const tr = (it && it.triage) || {};
   const gates = [];
   if (tr.corpus_required) {
@@ -15824,6 +15928,10 @@ function combinedGateState(it) {
 
 // Computes triage badge and eyebrow labels without allowing green LGTM when corpus is blocked
 function triageBadgeInfo(it) {
+  // Reuse backend triage_badge_info when item state is fresh
+  if (hasFreshEntityState(it) && it.entity_state.triage_badge_info) {
+    return it.entity_state.triage_badge_info;
+  }
   const tr = (it && it.triage) || {};
   const auditState = String(tr.audit_state || '').toLowerCase();
   if (auditState === 'running' && Boolean(it && it.chat_busy)) {
@@ -18525,6 +18633,8 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
         triage_store.overlay_triage_on_items(
             (state.get("items") or {}).values()
         )
+        # Recompute entity_state after overlaying live chat_busy and triage store updates
+        entity_state.enrich_entity_states(state)
       state["jetski_box_url"] = jetski_box_url()
       # Pass daemon script mtime so client detects restarted backend
       state["ui_version"] = int(_INITIAL_SCRIPT_MTIME) if _INITIAL_SCRIPT_MTIME > 0 else 0
