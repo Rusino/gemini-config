@@ -345,8 +345,9 @@ def _evaluate_baton(doc: dict, conv_id: str, status: str) -> str:
 
   doc["baton"] = {"conv": conv_id, "item": next_todo["id"]}
   return (
-      f"[NEXT-TASK BATON: YOURS — 0 doing in project; propose next todo"
-      f" {next_todo['id']} ({next_todo['text']})]"
+      f"[NEXT-TASK BATON: HOLD — 0 doing in project (next todo is"
+      f" {next_todo['id']}); report completed work and stop without asking"
+      " or proposing next-task unless the user explicitly asks]"
   )
 
 

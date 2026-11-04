@@ -466,7 +466,7 @@ class TestRoadmap(unittest.TestCase):
     # c3 finishes R3 (last doing item -> 0 doing) -> YOURS for R4
     r3 = cli("set", "c3", "R3", "done")
     self.assertEqual(r3.returncode, 0)
-    self.assertIn("[NEXT-TASK BATON: YOURS", r3.stdout)
+    self.assertIn("[NEXT-TASK BATON: HOLD — 0 doing", r3.stdout)
     self.assertIn("R4", r3.stdout)
 
     # If another chat c0 closes an un-claimed item while c3 already holds the baton for R4 -> HOLD
