@@ -2569,6 +2569,58 @@ class TestChatLifecycle(unittest.TestCase):
     self.assertEqual(res.get("id"), "gemini-4-carbon-high")
     self.assertAlmostEqual(res.get("quota"), 0.08)
 
+  def test_handoff_propagates_root_and_latest_user_requests_across_chain(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      self.write_chain(tmp_dir, [("root-1", None), ("parent-1", "root-1")])
+      # Write root transcript with original user prompt and parent-1 transcript with follow-up
+      for cid, steps in (
+          (
+              "root-1",
+              [{
+                  "type": "USER_INPUT",
+                  "content": "<USER_REQUEST>\nFix SkParagraph BiDi caret drift\n</USER_REQUEST>",
+              }],
+          ),
+          (
+              "parent-1",
+              [
+                  {
+                      "type": "USER_INPUT",
+                      "content": "Continuing unfinished work from previous conversation (conversation://root-1).",
+                  },
+                  {
+                      "type": "USER_INPUT",
+                      "content": "<USER_REQUEST>\nAlso preserve context in final chat reply\n</USER_REQUEST>",
+                  },
+              ],
+          ),
+      ):
+        tr_dir = os.path.join(tmp_dir, "brain", cid, ".system_generated", "logs")
+        os.makedirs(tr_dir, exist_ok=True)
+        with open(os.path.join(tr_dir, "transcript.jsonl"), "w", encoding="utf-8") as f:
+          for st in steps:
+            f.write(json.dumps(st) + "\n")
+
+      start_mock = unittest.mock.MagicMock(return_value="child-2")
+      with contextlib.ExitStack() as stack:
+        for p in self.handoff_patches(tmp_dir, start_mock):
+          stack.enter_context(p)
+        chat_lifecycle.create_handoff("parent-1", next_step_prompt="Finish R125")
+        start_mock.assert_called_once()
+        prompt = start_mock.call_args.args[2]
+        self.assertIn(
+            "Original user request from root conversation (conversation://root-1): Fix SkParagraph BiDi caret drift",
+            prompt,
+        )
+        self.assertIn(
+            "Latest user request (conversation://parent-1): Also preserve context in final chat reply",
+            prompt,
+        )
+        self.assertIn(
+            "your final reply MUST be a self-contained summary of the entire chain's work",
+            prompt,
+        )
+
 
 if __name__ == "__main__":
   unittest.main()

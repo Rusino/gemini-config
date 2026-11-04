@@ -12448,6 +12448,8 @@
     const clLinks = new Set();
     const modifiedFiles = new Set();
     let lastAssistantText = '';
+    // Keep the latest substantive response so short post-task/commit stubs do not overwrite it
+    let substantiveAssistantText = '';
 
     const addModifiedPath = (rawPath) => {
       if (!rawPath || typeof rawPath !== 'string') return;
@@ -12510,13 +12512,61 @@
         Boolean(step.plannerResponse);
 
       if (isUser && content) {
-        const clean = cleanUserStepPromptText(content);
-        if (clean) {
-          userPrompts.push(clean.length > 280 ? `${clean.slice(0, 277)}...` : clean);
+        // Extract structured root/latest user requests from auto-generated continuation prompts
+        if (/Continuing\s+unfinished\s+work\s+from\s+previous\s+conversation/i.test(content)) {
+          let matchedStructured = false;
+          const origMatch = content.match(
+            /Original user request from root conversation\s*\([^)]+\):\s*([^\n]+)/i
+          );
+          if (origMatch && origMatch[1]?.trim()) {
+            const origClean = origMatch[1].trim();
+            userPrompts.push(
+              origClean.length > 280 ? `${origClean.slice(0, 277)}...` : origClean
+            );
+            matchedStructured = true;
+          }
+          const latestMatch = content.match(
+            /Latest user request\s*\([^)]+\):\s*([^\n]+)/i
+          );
+          if (latestMatch && latestMatch[1]?.trim()) {
+            const latestClean = latestMatch[1].trim();
+            if (!userPrompts.includes(latestClean)) {
+              userPrompts.push(
+                latestClean.length > 280 ? `${latestClean.slice(0, 277)}...` : latestClean
+              );
+            }
+            matchedStructured = true;
+          }
+          // Fall back to cleaned continuation prompt when structured headers are absent
+          if (!matchedStructured) {
+            const clean = cleanUserStepPromptText(content);
+            if (clean) {
+              userPrompts.push(clean.length > 280 ? `${clean.slice(0, 277)}...` : clean);
+            }
+          }
+        } else {
+          const clean = cleanUserStepPromptText(content);
+          if (clean) {
+            userPrompts.push(clean.length > 280 ? `${clean.slice(0, 277)}...` : clean);
+          }
         }
       }
       if (isAssistant && content) {
-        lastAssistantText = content.trim();
+        // Append short post-wakeup/commit stubs to an earlier substantive reply instead of replacing it
+        const trimmed = content.trim();
+        if (trimmed) {
+          if (
+            substantiveAssistantText.length >= 250 &&
+            trimmed.length < Math.max(250, Math.floor(substantiveAssistantText.length * 0.55))
+          ) {
+            lastAssistantText = `${substantiveAssistantText}\n\n${trimmed}`;
+          } else {
+            lastAssistantText = trimmed;
+            if (trimmed.length >= 250) {
+              substantiveAssistantText = trimmed;
+            }
+          }
+        }
       }
 
       const toolCalls =
@@ -13019,7 +13069,7 @@
       options.tldr ||
       '';
 
-    // Facts from trajectory steps if cached
+    // Facts from trajectory steps across the chain if cached
     const cachedEntry = singleTrajCache.get(cascadeId);
     const cachedTraj = cachedEntry?.payload || cachedEntry;
     let trajFacts = { userPrompts: [], clLinks: [], modifiedFiles: [], lastAssistantText: '' };
@@ -13039,6 +13089,38 @@
           });
         }
       });
+    }
+    // Merge cached trajectory facts across earlier chain pieces so root prompts and files stay visible
+    if (Array.isArray(chain) && chain.length > 1) {
+      const chainPrompts = [];
+      const chainCls = new Set(trajFacts.clLinks);
+      const chainFiles = new Set(trajFacts.modifiedFiles);
+      let chainSubstantiveAssistant = '';
+      for (const cid of chain) {
+        const ce = singleTrajCache.get(cid);
+        const ct = ce?.payload || ce;
+        if (!ct) continue;
+        const cf = cid === cascadeId ? trajFacts : extractTrajectoryDossierFacts(ct);
+        for (const up of cf.userPrompts || []) {
+          if (up && !chainPrompts.includes(up)) chainPrompts.push(up);
+        }
+        for (const u of cf.clLinks || []) chainCls.add(u);
+        for (const f of cf.modifiedFiles || []) chainFiles.add(f);
+        if (cid !== cascadeId && (cf.lastAssistantText || '').length >= 250) {
+          chainSubstantiveAssistant = cf.lastAssistantText;
+        }
+      }
+      trajFacts = {
+        userPrompts: (chainPrompts.length ? chainPrompts : trajFacts.userPrompts).slice(0, 10),
+        clLinks: [...chainCls].slice(0, 5),
+        modifiedFiles: [...chainFiles].slice(0, 8),
+        lastAssistantText:
+          trajFacts.lastAssistantText.length >= 250 || !chainSubstantiveAssistant
+            ? trajFacts.lastAssistantText
+            : trajFacts.lastAssistantText
+              ? `${chainSubstantiveAssistant}\n\n${trajFacts.lastAssistantText}`
+              : chainSubstantiveAssistant,
+      };
     }
 
     const rawClLinks = dossierEntry.cls?.length

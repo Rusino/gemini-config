@@ -2441,6 +2441,47 @@ def _first_user_prompt_text(conv_id: str) -> str:
   return ""
 
 
+# Returns the latest human (non-handoff) USER_INPUT text in conv_id's transcript
+def _latest_human_user_prompt_text(conv_id: str) -> str:
+  if not conv_id:
+    return ""
+  latest = ""
+  for app_dir in find_app_data_dirs():
+    tr_path = os.path.join(
+        app_dir,
+        "brain",
+        conv_id,
+        ".system_generated",
+        "logs",
+        "transcript.jsonl",
+    )
+    if os.path.isfile(tr_path):
+      try:
+        with open(tr_path, "r", encoding="utf-8") as f:
+          for line in f:
+            if '"USER_INPUT"' not in line:
+              continue
+            try:
+              obj = json.loads(line)
+            except Exception:
+              continue
+            if obj.get("type") == "USER_INPUT":
+              content = str(obj.get("content") or "")
+              m_tag = _USER_REQ_TAG_RE.search(content)
+              clean = (m_tag.group(1) if m_tag else content).strip()
+              if (
+                  not clean
+                  or HANDOFF_PARENT_RE.search(clean)
+                  or "Continuing unfinished work from previous conversation"
+                  in clean
+              ):
+                continue
+              latest = clean
+      except Exception:
+        pass
+  return latest
+
+
 def derive_fallback_topic(
     conv_id: str,
     state_file: str = "",
@@ -3026,8 +3067,48 @@ def create_handoff(
         f"and immediately continue executing from the next step recorded in the summary without asking "
         f"for confirmation (unless the summary explicitly states it is waiting for user input)."
     )
+  # Propagate root and latest human user requests across the chain so the tail chat
+  # preserves full task context without forcing the user to open earlier chain pieces
+  chain_ids = (
+      discover_conversation_chain(current_conv_id, include_descendants=False)
+      if current_conv_id
+      else []
+  ) or ([current_conv_id] if current_conv_id else [])
+  root_cid = ""
+  root_req = ""
+  for cid in chain_ids:
+    req = _first_user_prompt_text(cid) or _latest_human_user_prompt_text(cid)
+    if req:
+      root_cid = cid
+      root_req = " ".join(req.split())[:400]
+      break
+  latest_cid = ""
+  latest_req = ""
+  for cid in reversed(chain_ids):
+    req = _latest_human_user_prompt_text(cid)
+    if req:
+      latest_cid = cid
+      latest_req = " ".join(req.split())[:400]
+      break
+  if root_req:
+    prompt = (
+        f"{prompt}\n\nOriginal user request from root conversation "
+        f"(conversation://{root_cid}): {root_req}"
+    )
+  if latest_req and latest_req != root_req:
+    prompt = (
+        f"{prompt}\nLatest user request (conversation://{latest_cid}): "
+        f"{latest_req}"
+    )
   if next_step_prompt:
     prompt = f"{prompt}\n\nNext immediate task: {next_step_prompt}"
+  # Require a self-contained final chain summary when completing the task in a continuation chat
+  prompt = (
+      f"{prompt}\n\nWhen finishing the task in this continuation conversation, your final "
+      f"reply MUST be a self-contained summary of the entire chain's work (original problem, "
+      f"key changes and files across all chain pieces, verification, and commit/push status) "
+      f"so the user has full context in the last message without opening earlier chats."
+  )
   # The prompt is English for the agent; without this line new chats answer the user in
   # English, since the auto-generated prompt is the only "user" message they have seen
   prompt = (

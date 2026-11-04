@@ -1194,6 +1194,38 @@ const liveBucketBtn = (k) =>
   );
   assert.deepStrictEqual(extractedFacts.clLinks, ['https://github.com/foo/bar']);
 
+  // Verify extractTrajectoryDossierFacts preserves substantive assistant text before a short commit tail
+  // and extracts structured root/latest user requests from continuation prompts (R125)
+  const longReport = 'Detailed engineering report across the chain. '.repeat(8);
+  const shortCommitStub = 'committed and pushed: 2235dac -> origin/main';
+  const r125Facts = window.__jetskiDossier.extractTrajectoryDossierFacts([
+    {
+      type: 'CORTEX_STEP_TYPE_USER_INPUT',
+      content:
+        'Continuing unfinished work from previous conversation (conversation://c0).\n\n' +
+        'Original user request from root conversation (conversation://c0): Fix R124 model floor\n' +
+        'Latest user request (conversation://c1): Preserve context in final reply\n\n' +
+        'Next immediate task: Implement R125',
+    },
+    {
+      type: 'CORTEX_STEP_TYPE_PLANNER_RESPONSE',
+      content: longReport,
+    },
+    {
+      type: 'CORTEX_STEP_TYPE_PLANNER_RESPONSE',
+      content: shortCommitStub,
+    },
+  ]);
+  assert.deepStrictEqual(r125Facts.userPrompts, [
+    'Fix R124 model floor',
+    'Preserve context in final reply',
+  ]);
+  assert(
+    r125Facts.lastAssistantText.includes('Detailed engineering report across the chain.') &&
+      r125Facts.lastAssistantText.includes(shortCommitStub),
+    `Expected combined substantive report + commit stub, got: ${r125Facts.lastAssistantText}`
+  );
+
   // Verify generateOutOfBandDossierTldr RPC format
   rpcRequests.length = 0;
   const genTldr = await window.__jetskiDossier.generateOutOfBandDossierTldr('open-current', {

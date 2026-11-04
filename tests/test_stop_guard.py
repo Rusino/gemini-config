@@ -2203,6 +2203,56 @@ class TestStopGuard(unittest.TestCase):
     )
     self.assertEqual(reason_ok, "")
 
+  def test_final_context_preservation_guard_blocks_post_wakeup_shrink_and_short_continuation(self):
+    # 1. Substantive earlier response followed by short post-wakeup tail is blocked
+    detailed = "Подробный отчёт по задаче и всем изменённым файлам. " * 12
+    short_tail = "committed and pushed: 2235dac -> origin/main"
+    reason_shrink = stop_guard.final_context_preservation_guard_reason({
+        "pre_final_max_planner_text": detailed,
+        "last_planner_text": short_tail,
+        "is_continuation_turn": False,
+        "asked_question": False,
+        "launched_new_conv": False,
+    })
+    self.assertIn("[FINAL CONTEXT PRESERVATION GUARD]", reason_shrink)
+    self.assertIn("Earlier in this turn you wrote a detailed response", reason_shrink)
+
+    # 2. Combined self-contained final response passes
+    combined = detailed + "\n\n" + short_tail
+    self.assertEqual(
+        stop_guard.final_context_preservation_guard_reason({
+            "pre_final_max_planner_text": detailed,
+            "last_planner_text": combined,
+            "is_continuation_turn": False,
+            "asked_question": False,
+            "launched_new_conv": False,
+        }),
+        "",
+    )
+
+    # 3. Continuation turn ending with a brief stub is blocked unless handing off or asking
+    reason_cont = stop_guard.final_context_preservation_guard_reason({
+        "pre_final_max_planner_text": "",
+        "last_planner_text": "Готово, закоммитила.",
+        "is_continuation_turn": True,
+        "asked_question": False,
+        "launched_new_conv": False,
+    })
+    self.assertIn("[FINAL CONTEXT PRESERVATION GUARD]", reason_cont)
+    self.assertIn("continuation conversation in a handoff chain", reason_cont)
+
+    # 4. Handoff or ask_question turns are never blocked by final_context_preservation_guard
+    self.assertEqual(
+        stop_guard.final_context_preservation_guard_reason({
+            "pre_final_max_planner_text": detailed,
+            "last_planner_text": "Передаю в новый чат",
+            "is_continuation_turn": True,
+            "asked_question": False,
+            "launched_new_conv": True,
+        }),
+        "",
+    )
+
 
 if __name__ == "__main__":
   unittest.main()
