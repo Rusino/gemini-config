@@ -114,6 +114,66 @@ class ClWatcherFixForTest(unittest.TestCase):
     self.assertIn(MAC15_BOT, bot_names)
     self.assertIn(MAC14_BOT, bot_names)
 
+  def test_detect_fix_for_disjoint_bugs_rejected(self) -> None:
+    broken_cl = {
+        "item_key": "gerrit:1404196",
+        "kind": "gerrit",
+        "target_id": "1404196",
+        "status": "MERGED",
+        "is_self": True,
+        "owner_email": "jlavrova@google.com",
+        "subject": "Fix integer overflow and oversized glyph rasterization in SDF generation",
+        "commit_message": "Fix integer overflow\n\nBug: b/576664769\nChange-Id: I1404196",
+        "topic": "",
+        "hashtags": [],
+        "files": ["src/core/SkRemoteGlyphCache.cpp", "tests/SkRemoteGlyphCacheTest.cpp"],
+        "revision": "3d70807b95",
+        "submitted": "2026-10-30T16:08:00Z",
+        "post_submit": {
+            "has_alert": True,
+            "skia_status": "🔴",
+            "incidents": [{
+                "verdict": "blamed",
+                "task_name": MAC14_BOT,
+                "task_url": "https://task/mac14",
+                "failing_test": "SkRemoteGlyphCache_b576664769",
+            }],
+        },
+    }
+    unrelated_cl = {
+        "item_key": "gerrit:1414544",
+        "kind": "gerrit",
+        "target_id": "1414544",
+        "status": "NEW",
+        "is_self": True,
+        "owner_email": "jlavrova@google.com",
+        "subject": "[SkChromeRemoteGlyphCache] Fix Zombie Strike defect on mergeFromBuffer failure",
+        "commit_message": "[SkChromeRemoteGlyphCache] Fix defect\n\nBug: chromium:580955594\nChange-Id: I1414544",
+        "topic": "",
+        "hashtags": [],
+        "files": ["src/core/SkRemoteGlyphCache.cpp", "tests/SkRemoteGlyphCacheTest.cpp"],
+        "created": "2026-11-04T12:00:00Z",
+        "submitted": "",
+    }
+    
+    # 1. Provide disjoint bugs and no strong link signals
+    # 2. Both touch tests/SkRemoteGlyphCacheTest.cpp and broken_cl has an alert
+    # We expect them NOT to match because bugs are disjoint (penalty -200) and no other strong signal exists.
+    fix_map = cl_watcher.detect_fix_for_pairs({
+        "gerrit:1404196": broken_cl,
+        "gerrit:1414544": unrelated_cl,
+    })
+    self.assertNotIn("gerrit:1414544", fix_map, "Should reject disjoint bugs")
+
+    # If the bug was empty, it should still reject because of parent_post_submit_alert_weak (+20) + shared_test_files (+70) = 90 < 100
+    unrelated_cl_no_bug = dict(unrelated_cl)
+    unrelated_cl_no_bug["commit_message"] = "Just some test cleanup\n\nChange-Id: I1414544"
+    fix_map_empty = cl_watcher.detect_fix_for_pairs({
+        "gerrit:1404196": broken_cl,
+        "gerrit:1414544": unrelated_cl_no_bug,
+    })
+    self.assertNotIn("gerrit:1414544", fix_map_empty, "Should reject weak linkage (score < 100)")
+
   def test_detect_fix_for_real_world_gerrit_pair(self) -> None:
     broken_cl = {
         "item_key": "gerrit:1404196",

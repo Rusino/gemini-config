@@ -2185,6 +2185,10 @@ def detect_fix_for_pairs(
               or same_chat
           )
           if has_link_signal and has_breakage_signal:
+            if f_bugs and m_bugs and not shared_bugs:
+              score -= 200
+              reasons.append("disjoint_bugs")
+
             # Same chat strongly indicates a direct follow-up fix
             if same_chat:
               score += 140
@@ -2205,8 +2209,12 @@ def detect_fix_for_pairs(
               score += 150
               reasons.append("mentions_blamed_bot")
             elif m_has_alert:
-              score += 90
-              reasons.append("parent_post_submit_alert")
+              if not (same_chat or shared_bugs or shared_test_syms or shared_topic):
+                score += 20
+                reasons.append("parent_post_submit_alert_weak")
+              else:
+                score += 90
+                reasons.append("parent_post_submit_alert")
             elif f_has_bot_and_cue:
               score += 60
               reasons.append("mentions_bot_failure")
@@ -2276,6 +2284,10 @@ def link_fix_changes_to_parent_chats(
     ikey = str(d.get("item_key") or "")
     match = fix_map.get(ikey)
     if not match:
+      old_broken_key = d.get("fixes_breakage_from")
+      if old_broken_key and old_broken_key in combined_info:
+        d.pop("fixes_breakage_from", None)
+        d.pop("fixes_breakage_bots", None)
       continue
     broken_key = str(match["broken_key"])
     d["fixes_breakage_from"] = broken_key
