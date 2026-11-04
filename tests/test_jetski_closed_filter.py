@@ -2652,16 +2652,71 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(storage.get('jetski_inbox_tab_v1'), 'working');
   assert.strictEqual(inboxEl.getAttribute('data-count'), '2');
 
+  // Working rows maintain FIFO order: agent-bg-wait (14:20) precedes agent-running (14:25)
   const workingRows = inboxEl.querySelectorAll('.jetski-inbox-row');
   assert.strictEqual(workingRows.length, 2);
-  assert.strictEqual(workingRows[0].getAttribute('data-cascade-id'), 'agent-running');
-  assert.strictEqual(workingRows[0].querySelector('.jetski-inbox-tier-icon').textContent, '🤖');
-  assert.strictEqual(workingRows[1].getAttribute('data-cascade-id'), 'agent-bg-wait');
-  assert.strictEqual(workingRows[1].querySelector('.jetski-inbox-tier-icon').textContent, '⏳');
+  assert.strictEqual(workingRows[0].getAttribute('data-cascade-id'), 'agent-bg-wait');
+  assert.strictEqual(workingRows[0].querySelector('.jetski-inbox-tier-icon').textContent, '⏳');
+  assert.strictEqual(workingRows[1].getAttribute('data-cascade-id'), 'agent-running');
+  assert.strictEqual(workingRows[1].querySelector('.jetski-inbox-tier-icon').textContent, '🤖');
   // Working rows have 1 action button: reminder
   assert.strictEqual(workingRows[0].querySelector('.jetski-inbox-actions').children.length, 1);
   assert.strictEqual(workingRows[1].querySelector('.jetski-inbox-actions').children.length, 1);
   assert(workingRows[0].querySelector('.jetski-inbox-reminder-btn'));
+
+  // Updating lastModifiedTime on agent-bg-wait while working retains FIFO row order without swapping
+  reduxStore.dispatch({
+    type: 'trajectorySummaries/applyStreamBatch',
+    payload: {
+      updates: [[
+        'agent-bg-wait',
+        makeSummary('[14:20] ⦿ Waiting on background runner', 'proj-1', {}, false, {
+          status: 'CASCADE_RUN_STATUS_IDLE',
+          notFullyIdle: true,
+          lastModifiedTime: '2026-10-28T14:30:00Z',
+        }),
+      ]],
+      deletes: [],
+    },
+  });
+  while (rafCallbacks.length > 0) rafCallbacks.shift()();
+  const rowsAfterUpdate = inboxEl.querySelectorAll('.jetski-inbox-row');
+  assert.strictEqual(rowsAfterUpdate[0].getAttribute('data-cascade-id'), 'agent-bg-wait');
+  assert.strictEqual(rowsAfterUpdate[1].getAttribute('data-cascade-id'), 'agent-running');
+
+  // Advancing clock and starting a new turn appends the new chat to the bottom (FIFO)
+  advanceClock();
+  reduxStore.dispatch({
+    type: 'trajectorySummaries/applyStreamBatch',
+    payload: {
+      updates: [[
+        'agent-third-running',
+        makeSummary('[18:51] ⦿ Third running task', 'proj-1', {}, false, {
+          status: 'CASCADE_RUN_STATUS_RUNNING',
+          lastModifiedTime: '2026-10-28T12:00:00Z',
+        }),
+      ]],
+      deletes: [],
+    },
+  });
+  while (rafCallbacks.length > 0) rafCallbacks.shift()();
+  const rowsWithNewTurn = inboxEl.querySelectorAll('.jetski-inbox-row');
+  assert.strictEqual(rowsWithNewTurn.length, 3);
+  assert.strictEqual(rowsWithNewTurn[0].getAttribute('data-cascade-id'), 'agent-bg-wait');
+  assert.strictEqual(rowsWithNewTurn[1].getAttribute('data-cascade-id'), 'agent-running');
+  assert.strictEqual(rowsWithNewTurn[2].getAttribute('data-cascade-id'), 'agent-third-running');
+
+  // Removing third task preserves the original 2 working items in order
+  delete storeState.trajectorySummaries.summaries['agent-third-running'];
+  reduxStore.dispatch({
+    type: 'trajectorySummaries/applyStreamBatch',
+    payload: {
+      updates: [],
+      deletes: ['agent-third-running'],
+    },
+  });
+  while (rafCallbacks.length > 0) rafCallbacks.shift()();
+  assert.strictEqual(inboxEl.querySelectorAll('.jetski-inbox-row').length, 2);
 
   // Switch to Stale tab
   advanceClock();

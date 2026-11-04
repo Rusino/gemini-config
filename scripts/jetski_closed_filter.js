@@ -338,6 +338,8 @@
   const latchedNeedsMeModMs = (window.__jetskiLatchedNeedsMeModMs ||= new Map());
   // Tracks working chats so completion into needs-me latches even when serverLastView >= lastMod
   const observedWorkingState = (window.__jetskiObservedWorkingState ||= new Map());
+  // Monotonic sequence counter to break ties stably when multiple chats enter Working together
+  let nextWorkingEntrySeq = (window.__jetskiNextWorkingEntrySeq ||= 1);
 
   // Tracks conversations whose hideFromConversationList flag we flipped in Redux
   // so we never unhide conversations that were natively hidden by their source
@@ -11472,9 +11474,16 @@
         // Reset prior-turn latch while working so completion re-latches at the new turn timestamp
         latchedNeedsMeModMs.delete(cascadeId);
         const prevWork = observedWorkingState.get(cascadeId);
+        // Latch turn-entry time once so subsequent tool updates never reorder Working rows
+        const workingSinceMs = prevWork?.workingSinceMs ?? now;
+        const initialModTs = prevWork?.initialModTs ?? modTs;
+        const workingSeq = prevWork?.workingSeq ?? nextWorkingEntrySeq++;
         observedWorkingState.set(cascadeId, {
           confirmed: Boolean(prevWork?.confirmed || statusInfo.confirmedWorking),
           treeSig: prevWork ? prevWork.treeSig : (statusInfo.treeSig || ''),
+          workingSinceMs,
+          initialModTs,
+          workingSeq,
         });
         const isRunning = isActiveRunStatus(summary?.status);
         const workingIcon = isRunning ? '🤖' : '⏳';
@@ -11531,6 +11540,9 @@
           liveProgressText,
           isLongRunning: Boolean(liveInfo?.isLongRunning),
           modTs,
+          workingSinceMs,
+          initialModTs,
+          workingSeq,
         });
       } else {
         const prevWork = observedWorkingState.get(cascadeId);
@@ -11588,10 +11600,11 @@
       return a.cascadeId.localeCompare(b.cascadeId);
     });
 
-    // Sort Tab 2 (Working): newest modified first
+    // Sort Tab 2 (Working): FIFO by latched turn-entry timestamp so active chats never swap places
     itemsWorking.sort((a, b) => {
-      if (b.modTs !== a.modTs) return b.modTs - a.modTs;
-      if (b.timePrefix !== a.timePrefix) return b.timePrefix.localeCompare(a.timePrefix);
+      if (a.workingSinceMs !== b.workingSinceMs) return a.workingSinceMs - b.workingSinceMs;
+      if (a.initialModTs !== b.initialModTs) return a.initialModTs - b.initialModTs;
+      if (a.workingSeq !== b.workingSeq) return a.workingSeq - b.workingSeq;
       return a.cascadeId.localeCompare(b.cascadeId);
     });
 
