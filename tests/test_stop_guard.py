@@ -2183,6 +2183,26 @@ class TestStopGuard(unittest.TestCase):
       self.assertEqual(out6.get("decision"), "continue")
       self.assertIn("[ASK_QUESTION GUARD]", out6["reason"])
 
+  def test_unreliable_model_stop_guard_blocks_missing_banner_and_allows_with_banner(self):
+    state = {"unreliable_model_label": "Gemini 3.1 Pro (High)"}
+    reason = stop_guard.unreliable_model_guard_reason(
+        {"final_planner_text": "Инвариант проверен, всё ок."}, state
+    )
+    self.assertIn("[UNRELIABLE MODEL WARNING GUARD]", reason)
+    self.assertIn("Gemini 3.1 Pro (High)", reason)
+
+    # Reply starting with the warning banner passes immediately
+    reason_ok = stop_guard.unreliable_model_guard_reason(
+        {
+            "final_planner_text": (
+                "> ⚠️ **ВНИМАНИЕ: Ответ подготовлен ненадёжной младшей моделью "
+                "(Gemini 3.1 Pro (High)).**\n\nГотово."
+            )
+        },
+        state,
+    )
+    self.assertEqual(reason_ok, "")
+
 
 if __name__ == "__main__":
   unittest.main()

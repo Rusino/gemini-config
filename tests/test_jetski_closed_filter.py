@@ -11242,6 +11242,71 @@ async function refreshCatalogInStore() {
       'trajectoryModelObserved replay of yesterday junior turn must recover to Opus 1369'
     );
 
+    // R124: When Opus quota is < 20% (0.10) and Carbon/Argon has >= 5% quota, unpinned chat stuck
+    // on Gemini 3.1 Pro (1037) immediately recovers to Carbon High (1427) without waiting
+    opusQuota = 0.10;
+    orchQuota = 0.0;
+    opusResetIso = '2026-11-02T08:30:00Z';
+    orchResetIso = '2026-11-02T08:30:00Z';
+    const origBuildAvailableModels = buildAvailableModels;
+    let carbonQuota = 0.08;
+    let proNextQuota = 0.0;
+    global.window.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes('GetAvailableModels')) {
+        const base = origBuildAvailableModels();
+        base.response.models['auto'].quotaInfo.remainingFraction = proNextQuota;
+        base.response.models['auto'].quotaInfo.resetTime = '2026-11-02T08:30:00Z';
+        base.response.models['gemini-4-carbon-high'] = {
+          displayName: 'Gemini 4 Carbon (High)',
+          model: 'MODEL_PLACEHOLDER_M427',
+          supportsImages: true,
+          quotaInfo: { remainingFraction: carbonQuota, resetTime: '2026-11-02T08:30:00Z' },
+        };
+        base.response.models['gemini-3.1-pro-high'] = {
+          displayName: 'Gemini 3.1 Pro (High)',
+          model: 'MODEL_PLACEHOLDER_M37',
+          supportsImages: true,
+          quotaInfo: { remainingFraction: 0.99, resetTime: '2026-11-02T08:30:00Z' },
+        };
+        return { ok: true, json: async () => base };
+      }
+      return { ok: true, json: async () => ({}) };
+    };
+    storeState.conversation.cascadeId = 'chat-unpinned-cpp';
+    storeState.modelSelection.byConversation['chat-unpinned-cpp'] = { model: 1037 };
+    await refreshCatalogInStore();
+    assert.strictEqual(
+      storeState.modelSelection.byConversation['chat-unpinned-cpp'].model,
+      1427,
+      'Unpinned cpp-core chat on 1037 must immediately recover to Carbon High (1427) at 8% quota'
+    );
+
+    // When all flagship models are exhausted (0% quota) and chat stays on 1037, show warning toast
+    opusQuota = 0.0;
+    carbonQuota = 0.0;
+    proNextQuota = 0.0;
+    await refreshCatalogInStore();
+    for (const cfg of storeState.userStatus.cascadeModelConfigData.clientModelConfigs) {
+      if (cfg.quotaInfo) {
+        cfg.quotaInfo.remainingFraction = 0.0;
+        cfg.quotaInfo.resetTime = '2026-11-02T08:30:00Z';
+      }
+    }
+    storeState.modelSelection.byConversation['chat-unpinned-cpp'] = { model: 1037 };
+    fakeNow += 61 * 1000;
+    reduxStore.dispatch({ type: 'userStatus/setUserStatus', payload: storeState.userStatus });
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    toast = global.document.getElementById('jetski-model-autopilot-toast');
+    assert(toast, 'Unreliable junior model fallback must mount warning toast');
+    assert(
+      toast.textContent.includes(
+        'Warning: running on unreliable junior model (Gemini 3.1 Pro (High))'
+      ),
+      `Expected unreliable junior model warning toast, got: ${toast.textContent}`
+    );
+
     process.stdout.write('MORNING_MODEL_RESET_PASSED\n');
   } finally {
     Date.now = realNow;

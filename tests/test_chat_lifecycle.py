@@ -2509,7 +2509,68 @@ class TestChatLifecycle(unittest.TestCase):
             chat_lifecycle.is_valid_chat_topic(chat_lifecycle.clean_base_title(res))
         )
 
+  def test_flagship_profiles_purge_junior_models_and_use_5pct_floor(self):
+    for profile in ("cpp-core", "orchestrator"):
+      models = chat_lifecycle.MODEL_PROFILES[profile]
+      self.assertIn("gemini-4-carbon-high", models)
+      self.assertIn("gemini-launch-candidate-high", models)
+      for m_key in models:
+        self.assertFalse(
+            chat_lifecycle.is_unreliable_junior_model(m_key, m_key),
+            f"Profile {profile} must not contain unreliable junior model {m_key}",
+        )
+
+    self.assertEqual(
+        chat_lifecycle.resolve_unreliable_model_label("MODEL_PLACEHOLDER_M37"),
+        "Gemini 3.1 Pro (High)",
+    )
+    self.assertEqual(
+        chat_lifecycle.resolve_unreliable_model_label("MODEL_PLACEHOLDER_M320"),
+        "Gemini 3.8 Flash (High)",
+    )
+    self.assertEqual(
+        chat_lifecycle.resolve_unreliable_model_label("MODEL_PLACEHOLDER_M136"),
+        "snowball-subagent",
+    )
+    for flagship_enum in (
+        "MODEL_PLACEHOLDER_M369",
+        "MODEL_PLACEHOLDER_M427",
+        "MODEL_PLACEHOLDER_M392",
+        "MODEL_PLACEHOLDER_M415",
+        "MODEL_PLACEHOLDER_M260",
+    ):
+      self.assertEqual(chat_lifecycle.resolve_unreliable_model_label(flagship_enum), "")
+
+    # When Opus is below 30% (0.10) and Carbon High has 8% quota, cpp-core selects Carbon High
+    avail = {
+        "opus-5.5-medium": {
+            "model": "MODEL_PLACEHOLDER_M369",
+            "displayName": "Claude Opus 5.5 (Medium)",
+            "quotaInfo": {"remainingFraction": 0.10},
+        },
+        "opus-5.5-high": {
+            "model": "MODEL_PLACEHOLDER_M370",
+            "displayName": "Claude Opus 5.5 (High)",
+            "quotaInfo": {"remainingFraction": 0.10},
+        },
+        "gemini-4-carbon-high": {
+            "model": "MODEL_PLACEHOLDER_M427",
+            "displayName": "Gemini 4 Carbon (High)",
+            "quotaInfo": {"remainingFraction": 0.08},
+        },
+        "auto": {
+            "model": "MODEL_PLACEHOLDER_M260",
+            "displayName": "Gemini Pro Next",
+            "quotaInfo": {"remainingFraction": 0.98},
+        },
+    }
+    res = chat_lifecycle.resolve_profile_model(avail, "cpp-core")
+    self.assertEqual(res.get("enum"), "MODEL_PLACEHOLDER_M427")
+    self.assertEqual(res.get("id"), "gemini-4-carbon-high")
+    self.assertAlmostEqual(res.get("quota"), 0.08)
+
 
 if __name__ == "__main__":
   unittest.main()
+
 

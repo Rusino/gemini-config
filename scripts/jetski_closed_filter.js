@@ -568,13 +568,28 @@
     CURATED_HIDDEN_MODELS.map(([id, label, tag]) => [id, { label, tag }])
   );
   const CURATED_ENUM_LABELS = new Map([
+    [1037, 'Gemini 3.1 Pro (High)'],
+    [1136, 'snowball-subagent'],
+    [1260, 'Gemini Pro Next'],
+    [1286, 'Gemini 4 Argon (High)'],
+    [1319, 'Gemini 3.8 Flash (Medium)'],
+    [1320, 'Gemini 3.8 Flash (High)'],
+    [1333, 'Gemini 3.1 Pro'],
     [1367, 'Claude Opus 5.5 (Medium)'],
     [1369, 'Claude Opus 5.5 (Low)'],
     [1370, 'Claude Opus 5.5 (High)'],
     [1371, 'Claude Opus 5.5 (Max)'],
+    [1391, 'Gemini 4 Argon (Medium)'],
+    [1392, 'Gemini 4 Argon (Low)'],
+    [1393, 'Gemini 4 Argon (High)'],
     [1415, 'Gemini Pro Orchestrator'],
+    [1416, 'Gemini 4 Argon (High)'],
     [1422, 'Gemini 3.8 Flash Router'],
     [1427, 'Gemini 4 Carbon (High)'],
+    [1437, 'Gemini 4 Carbon (Medium)'],
+    [1438, 'Gemini 4 Carbon (Low)'],
+    [1439, 'Gemini 4 Carbon (High)'],
+    [1440, 'Gemini 4 Carbon (High)'],
   ]);
 
   // Two-threshold quota autopilot floors and floating notification toast ID (R71.2)
@@ -586,21 +601,22 @@
   const AUTOPILOT_OPTION_MODEL_ID = '__jetski_autopilot__';
   const AUTOPILOT_OPTION_LABEL = 'Auto';
   const AUTOPILOT_OPTION_ENUM = 999999;
-  // Priority ordering for Recommended dropdown: Auto first, followed by 4 flagship quota buckets
+  // Priority ordering for Recommended dropdown: Auto first, followed by flagship quota buckets
   const PREFERRED_DROPDOWN_MODEL_ORDER = [
     AUTOPILOT_OPTION_MODEL_ID,
-    // Tier 1: Flagship production models across 4 independent quota buckets
+    // Tier 1: Flagship production models across independent quota buckets
     'opus-5.5-high',
     'opus-5.5-medium',
     'opus-5.5-max',
     'gemini-4-carbon-high',
     'gemini-4-carbon-medium',
     'gemini-launch-candidate-high',
+    'gemini-launch-candidate-medium',
     'gemini-pro-coordinator',
     'auto',
-    'gemini-3.1-pro-high',
     // Tier 2: Secondary models
     'fable-5.1-dropdown',
+    'gemini-3.1-pro-high',
     // Tier 3: Flash / triage models
     'gemini-flash-next',
     'gemini-3.8-flash-high',
@@ -688,28 +704,29 @@
     'breaking chats': 'orchestrator',
   };
 
-  // Fallback chains across the 4 independent flagship quota buckets (Opus, Carbon/Argon, Orchestrator, 3.1 Pro)
+  // Flagship-only fallback chains for cpp-core and orchestrator (no Gemini 3.1 or Flash)
   const WEB_MODEL_PROFILES = {
     'cpp-core': [
       'opus-5.5-medium',
       'opus-5.5-high',
       'opus-5.5-max',
       'gemini-4-carbon-high',
+      'gemini-4-carbon-medium',
       'gemini-launch-candidate-high',
+      'gemini-launch-candidate-medium',
       'gemini-pro-coordinator',
       'auto',
-      'gemini-3.1-pro-high',
     ],
     'orchestrator': [
       'gemini-pro-coordinator',
       'auto',
       'gemini-4-carbon-high',
+      'gemini-4-carbon-medium',
       'gemini-launch-candidate-high',
-      'gemini-3.1-pro-high',
-      'gemini-flash-next',
-      'gemini-3.8-flash-high',
-      'gemini-3.8-flash-medium',
-      'gemini-2.5-flash',
+      'gemini-launch-candidate-medium',
+      'opus-5.5-medium',
+      'opus-5.5-high',
+      'opus-5.5-max',
     ],
     'triage': [
       'gemini-flash-next',
@@ -2845,12 +2862,17 @@
               autoSeededTargets.delete(pinKey);
             }
             // Substitute Auto sentinel or forbidden BoN model with the project profile model
+            const entryEnumNum = entry?.enumVal || resolveModelEnumValue(String(planModel || ''));
+            const isCarbonOrArgon =
+              CARBON_ENUM_NUMS.has(entryEnumNum) || ARGON_ENUM_NUMS.has(entryEnumNum);
+            const effectiveHardFloor =
+              isPinned || isCarbonOrArgon ? EMERGENCY_PIN_FLOOR : QUOTA_HARD_FLOOR;
             if (isAutopilotSentinel || isForbiddenBon) {
               // Reuse resolved conversation profile so draft/route fallback runs once per request
               const profile = convProfile || 'orchestrator';
               replacement = resolveAutopilotModelForProfile(catalog, profile);
               reason = isForbiddenBon ? 'BoN disabled' : `${profile} profile`;
-            } else if (entry && entry.quota < (isPinned ? EMERGENCY_PIN_FLOOR : QUOTA_HARD_FLOOR)) {
+            } else if (entry && entry.quota < effectiveHardFloor) {
               const profile = convProfile || 'orchestrator';
               replacement = resolveAutopilotModelForProfile(catalog, profile);
               reason = `${Math.round(entry.quota * 100)}% quota`;
@@ -3320,9 +3342,20 @@
     const chain = WEB_MODEL_PROFILES[p] || WEB_MODEL_PROFILES.orchestrator;
     for (const mid of chain) {
       const hit = catalog.byId.get(mid);
-      if (hit && hit.quota >= softFloor) return hit;
+      if (!hit) continue;
+      if (hit.quota >= softFloor) return hit;
+      // Carbon and Argon stay eligible in chain order down to the 5% emergency floor
+      if (
+        hit.quota >= EMERGENCY_PIN_FLOOR &&
+        (mid.includes('carbon') ||
+          mid.includes('argon') ||
+          mid.startsWith('gemini-launch-candidate'))
+      ) {
+        return hit;
+      }
     }
 
+    // Use flagship chain candidates all the way down to the 5% emergency floor
     const candidates = [];
     for (const mid of chain) {
       const hit = catalog.byId.get(mid);
@@ -3330,11 +3363,43 @@
     }
     if (candidates.length > 0) {
       candidates.sort((a, b) => (b.quota || 0) - (a.quota || 0));
+      // Pick the highest-quota flagship candidate above the 5% emergency floor
+      if (candidates[0].quota >= EMERGENCY_PIN_FLOOR) return candidates[0];
       if (candidates[0].quota >= hardFloor) return candidates[0];
       return candidates[0];
     }
 
     return catalog.byId.get('auto') || catalog.byEnum.values().next().value || null;
+  }
+
+  const CARBON_ENUM_NUMS = new Set([1427, 1437, 1438, 1439, 1440]);
+  const ARGON_ENUM_NUMS = new Set([1286, 1391, 1392, 1393, 1416]);
+  const JUNIOR_PRO_ENUM_NUMS = new Set([1037, 1136, 1333]);
+  const warnedUnreliableModels = new Map();
+
+  // Identifies junior/unreliable models (Gemini 3.1, 2.5/3.5, Flash, or internal subagent)
+  function isUnreliableJuniorModel(modelId, enumVal, label) {
+    const mid = String(modelId || '').trim().toLowerCase();
+    const num =
+      typeof enumVal === 'number' ? enumVal : resolveModelEnumValue(String(enumVal || ''));
+    const lbl = String(label || CURATED_ENUM_LABELS.get(num) || '').toLowerCase();
+    return Boolean(
+      JUNIOR_PRO_ENUM_NUMS.has(num) ||
+        num === 312 ||
+        num === 1319 ||
+        num === 1320 ||
+        num === 1422 ||
+        mid.includes('3.1') ||
+        mid.includes('2.5') ||
+        mid.includes('3.5') ||
+        mid.includes('flash') ||
+        mid.includes('subagent') ||
+        lbl.includes('3.1') ||
+        lbl.includes('2.5') ||
+        lbl.includes('3.5') ||
+        lbl.includes('flash') ||
+        lbl.includes('subagent')
+    );
   }
 
   // Ranks model capability/cost (1 = strongest, 7 = lightest) to separate upgrades from downgrades
@@ -3359,8 +3424,9 @@
     if (
       mid.includes('carbon') ||
       mid.startsWith('gemini-launch-candidate') ||
-      num === 1427 ||
-      num === 1393 ||
+      mid.includes('argon') ||
+      CARBON_ENUM_NUMS.has(num) ||
+      ARGON_ENUM_NUMS.has(num) ||
       lbl.includes('carbon') ||
       lbl.includes('argon')
     ) {
@@ -3374,7 +3440,7 @@
     ) {
       return 7;
     }
-    if (mid.includes('flash') || lbl.includes('flash') || num === 1422) return 6;
+    if (isUnreliableJuniorModel(mid, num, lbl)) return 6;
     return 5;
   }
 
@@ -3392,26 +3458,32 @@
       // Treat all non-Fable Opus 5.5 variants as primary tier so High/Max never downgrade to Medium
       const isFable = mid.startsWith('fable-5.1') || (num >= 1386 && num <= 1388);
       if (tier <= 3 && !isFable) return 0;
-      if (mid.includes('carbon') || num === 1427) return 1;
-      if (mid.startsWith('gemini-launch-candidate') || num === 1393) return 2;
+      if (mid.includes('carbon') || CARBON_ENUM_NUMS.has(num)) return 1;
+      if (
+        mid.startsWith('gemini-launch-candidate') ||
+        mid.includes('argon') ||
+        ARGON_ENUM_NUMS.has(num)
+      ) {
+        return 2;
+      }
       if (mid === 'gemini-pro-coordinator' || num === 1415) return 3;
       if (mid === 'auto' || num === 1260) return 4;
-      if (mid === 'gemini-3.1-pro-high') return 5;
-      if (tier <= 5) return 6;
+      if (tier <= 5) return 5;
       return 10;
     }
     if (p === 'triage') {
       // Unpinned heavyweight models leaked from a draft rank below triage Flash defaults
-      if (tier >= 6) return 0;
+      if (tier >= 6 && !JUNIOR_PRO_ENUM_NUMS.has(num) && !mid.includes('3.1')) return 0;
       if (tier === 5) return 1;
       return 2;
     }
     if (mid === 'gemini-pro-coordinator' || num === 1415) return 0;
     if (mid === 'auto' || num === 1260) return 1;
-    if (tier === 5) return 2;
-    // Manual upgrades carry isPinned=true; unpinned tier<=4 models leaked from default.model
-    if (tier <= 4) return 3;
-    return 5;
+    if (tier === 4) return 2;
+    // Manual upgrades carry isPinned=true; unpinned tier<=3 models leaked from default.model
+    if (tier <= 3) return 3;
+    if (tier === 5) return 4;
+    return 10;
   }
 
   // Returns the nominal primary catalog entry for a project profile regardless of current quota
@@ -3429,7 +3501,7 @@
     return null;
   }
 
-  // Recovers unpinned or reset-expired chats when a higher-preference profile model has >= 30%
+  // Recovers unpinned or reset-expired chats when a higher-preference profile model is available
   function resolveProfileQuotaRecovery(
     catalog,
     profile,
@@ -3444,14 +3516,22 @@
       typeof curEnumVal === 'number'
         ? curEnumVal
         : resolveModelEnumValue(String(curEnumVal || ''));
-    if (!best || !best.enumVal || best.enumVal === curNum || best.quota < QUOTA_SOFT_FLOOR) {
+    if (!best || !best.enumVal || best.enumVal === curNum) return null;
+    const bestTier = getModelCapabilityTier(best.modelId, best.enumVal, best.label);
+    const curTier = getModelCapabilityTier(curModelId, curNum || curEnumVal, curLabel);
+    const cleanProfile = String(profile || '')
+      .trim()
+      .toLowerCase()
+      .replace(/^profile:/, '');
+    // Rescue non-triage chats stuck on an unreliable junior model whenever a flagship is >= 5%
+    const isJuniorRescue = cleanProfile !== 'triage' && curTier >= 6 && bestTier <= 5;
+    const minRecoveryQuota = isJuniorRescue ? EMERGENCY_PIN_FLOOR : QUOTA_SOFT_FLOOR;
+    if (best.quota < minRecoveryQuota) {
       return null;
     }
     const bestRank = getProfilePreferenceRank(profile, best.modelId, best.enumVal, best.label);
     const curRank = getProfilePreferenceRank(profile, curModelId, curNum || curEnumVal, curLabel);
     if (!expiredJuniorEnum && bestRank >= curRank) return null;
-    const bestTier = getModelCapabilityTier(best.modelId, best.enumVal, best.label);
-    const curTier = getModelCapabilityTier(curModelId, curNum || curEnumVal, curLabel);
     return {
       replacement: best,
       reason: `${profile} profile`,
@@ -3486,16 +3566,17 @@
       if (hit.quota >= QUOTA_SOFT_FLOOR) return hit;
       candidates.push(hit);
     }
-    // Fall back to highest-quota preferred candidate above the 15% hard floor
+    // Fall back to highest-quota preferred candidate above the 5% emergency floor
     if (candidates.length > 0) {
       candidates.sort((a, b) => (b.quota || 0) - (a.quota || 0));
-      if (candidates[0].quota >= QUOTA_HARD_FLOOR) return candidates[0];
+      if (candidates[0].quota >= EMERGENCY_PIN_FLOOR) return candidates[0];
     }
-    // Last resort: any non-broken catalog model above the 5% emergency floor
+    // Last resort: any non-broken non-junior catalog model above the 5% emergency floor
     for (const hit of catalog.byEnum.values()) {
       if (
         hit &&
         !isStep0BrokenContribModel(hit.modelId, hit.enumVal) &&
+        (isFlash || !isUnreliableJuniorModel(hit.modelId, hit.enumVal, hit.label)) &&
         hit.quota >= EMERGENCY_PIN_FLOOR
       ) {
         return hit;
@@ -4073,8 +4154,12 @@
     if (!curModel) return;
     const curEntry = catalog.byEnum.get(curModel);
     const isForbiddenBon = isForbiddenBonModel(curEntry?.modelId || '', curModel);
-    // Pinned conversations bypass WTU shield and use the 5% emergency floor instead of 15%
+    // Pinned chats and Carbon/Argon models use the 5% emergency floor instead of 15%
     const isPinned = Boolean(!isForbiddenBon && pin && pin.model === curModel);
+    const isCarbonOrArgon =
+      CARBON_ENUM_NUMS.has(curModel) || ARGON_ENUM_NUMS.has(curModel);
+    const effectiveHardFloor =
+      isPinned || isCarbonOrArgon ? EMERGENCY_PIN_FLOOR : QUOTA_HARD_FLOOR;
 
     let replacement = null;
     let reason = '';
@@ -4087,7 +4172,7 @@
         profile || 'orchestrator'
       );
       reason = 'BoN disabled';
-    } else if (curEntry && curEntry.quota < (isPinned ? EMERGENCY_PIN_FLOOR : QUOTA_HARD_FLOOR)) {
+    } else if (curEntry && curEntry.quota < effectiveHardFloor) {
       replacement = resolveAutopilotModelForProfile(
         catalog,
         profile || 'orchestrator'
@@ -4143,6 +4228,21 @@
           reason
         );
       }
+      // Warn once per chat/model when all flagships are exhausted and a junior model stays active
+    } else if (
+      !isPinned &&
+      (profile || 'orchestrator') !== 'triage' &&
+      isUnreliableJuniorModel(curEntry?.modelId, curModel, curEntry?.label) &&
+      warnedUnreliableModels.get(cascadeId) !== curModel
+    ) {
+      warnedUnreliableModels.set(cascadeId, curModel);
+      const jrLabel = curEntry?.label || CURATED_ENUM_LABELS.get(curModel) || String(curModel);
+      showCustomAutopilotToast({
+        fromLabel: jrLabel,
+        toLabel: jrLabel,
+        text: `⚠️ Warning: running on unreliable junior model (${jrLabel})`,
+        durationMs: 8000,
+      });
     }
   }
 
@@ -4919,11 +5019,15 @@
         // Re-read active pin after step progression so WTU shield and 15% floor respect user pins
         const activePin = cid ? getManualPinEntry(cid) : null;
         const isPinned = Boolean(activePin && activePin.model === obsModel);
+        const isCarbonOrArgon =
+          CARBON_ENUM_NUMS.has(obsModel) || ARGON_ENUM_NUMS.has(obsModel);
+        const effectiveHardFloor =
+          isPinned || isCarbonOrArgon ? EMERGENCY_PIN_FLOOR : QUOTA_HARD_FLOOR;
         let replacement = null;
         let reason = '';
         // Marks morning primary-model restoration so replay shows the [Keep <Junior>] action toast
         let isQuotaRestore = false;
-        if (obsEntry && obsEntry.quota < (isPinned ? EMERGENCY_PIN_FLOOR : QUOTA_HARD_FLOOR)) {
+        if (obsEntry && obsEntry.quota < effectiveHardFloor) {
           // Reuse resolved conversation profile across exhaustion and recovery branches
           const profile = convProfile || 'orchestrator';
           replacement = resolveAutopilotModelForProfile(catalog, profile);

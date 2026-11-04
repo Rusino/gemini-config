@@ -111,28 +111,29 @@ def is_step0_broken_contrib_model(model_id: str = "", model_enum: str = "") -> b
   return mid in STEP0_BROKEN_CONTRIB_IDS or enum in STEP0_BROKEN_CONTRIB_ENUMS
 
 
-# Fallback chains across the 4 independent flagship quota buckets (Opus, Carbon/Argon, Orchestrator, 3.1 Pro)
+# Flagship-only fallback chains for cpp-core and orchestrator (no Gemini 3.1 or Flash)
 MODEL_PROFILES: dict[str, list[str]] = {
     "cpp-core": [
         "opus-5.5-medium",
         "opus-5.5-high",
         "opus-5.5-max",
         "gemini-4-carbon-high",
+        "gemini-4-carbon-medium",
         "gemini-launch-candidate-high",
+        "gemini-launch-candidate-medium",
         "gemini-pro-coordinator",
         "auto",
-        "gemini-3.1-pro-high",
     ],
     "orchestrator": [
         "gemini-pro-coordinator",
         "auto",
         "gemini-4-carbon-high",
+        "gemini-4-carbon-medium",
         "gemini-launch-candidate-high",
-        "gemini-3.1-pro-high",
-        "gemini-flash-next",
-        "gemini-3.8-flash-high",
-        "gemini-3.8-flash-medium",
-        "gemini-2.5-flash",
+        "gemini-launch-candidate-medium",
+        "opus-5.5-medium",
+        "opus-5.5-high",
+        "opus-5.5-max",
     ],
     "triage": [
         "gemini-flash-next",
@@ -144,6 +145,59 @@ MODEL_PROFILES: dict[str, list[str]] = {
         "auto",
     ],
 }
+
+UNRELIABLE_JUNIOR_ENUM_LABELS: dict[str, str] = {
+    "MODEL_PLACEHOLDER_M37": "Gemini 3.1 Pro (High)",
+    "MODEL_PLACEHOLDER_M136": "snowball-subagent",
+    "MODEL_PLACEHOLDER_M312": "Gemini 2.5 Flash",
+    "MODEL_PLACEHOLDER_M319": "Gemini 3.8 Flash (Medium)",
+    "MODEL_PLACEHOLDER_M320": "Gemini 3.8 Flash (High)",
+    "MODEL_PLACEHOLDER_M333": "Gemini 3.1 Pro",
+    "MODEL_PLACEHOLDER_M422": "Gemini 3.8 Flash (Router)",
+    "MODEL_GOOGLE_GEMINI_2_5_FLASH": "Gemini 2.5 Flash",
+}
+UNRELIABLE_JUNIOR_MODEL_RE = re.compile(
+    r"(?:gemini-(?:3\.1|2\.5|3\.5)|3\.1\s+pro|flash|subagent)", re.IGNORECASE
+)
+
+
+# Identifies junior/unreliable models (Gemini 3.1, 2.5/3.5, Flash, or internal subagent)
+def is_unreliable_junior_model(
+    model_id: str = "", model_enum: str = "", label: str = ""
+) -> bool:
+  mid = (model_id or "").strip()
+  enum = (model_enum or "").strip().upper()
+  lbl = (label or "").strip()
+  if enum in UNRELIABLE_JUNIOR_ENUM_LABELS:
+    return True
+  for text in (mid, lbl):
+    if text and UNRELIABLE_JUNIOR_MODEL_RE.search(text):
+      return True
+  return False
+
+
+# Resolves a human-readable display label when a model is an unreliable junior model
+def resolve_unreliable_model_label(
+    model_enum: str = "", model_id: str = "", label: str = ""
+) -> str:
+  enum = (model_enum or "").strip().upper()
+  mid = (model_id or "").strip()
+  lbl = (label or "").strip()
+  if enum in UNRELIABLE_JUNIOR_ENUM_LABELS:
+    return lbl or UNRELIABLE_JUNIOR_ENUM_LABELS[enum]
+  if is_unreliable_junior_model(mid, enum, lbl):
+    return lbl or mid or enum
+  if enum:
+    try:
+      models = get_available_models().get("models") or {}
+      for k_id, det in models.items():
+        if str(det.get("model") or "").strip().upper() == enum:
+          disp = str(det.get("displayName") or "").strip()
+          if is_unreliable_junior_model(k_id, enum, disp):
+            return disp or k_id
+    except Exception:  # lint: allow-broad-except (catalog lookup is best-effort)
+      pass
+  return ""
 
 # Lifecycle marker tokens: only visible chats carry one. Finished chats and handed-off
 # pieces are archived instead of re-marked
@@ -1033,13 +1087,21 @@ def resolve_profile_model(
   p = (profile_name or "").strip().lower().removeprefix("profile:")
   chain = MODEL_PROFILES.get(p) or MODEL_PROFILES["orchestrator"]
 
-  # Normal chain resolution at soft_floor
+  # Normal chain resolution at soft_floor (or 5% emergency floor for Carbon/Argon)
   for mid in chain:
     hit = lookup_model(models, mid)
-    if hit and hit.get("quota", 1.0) >= soft_floor:
+    if not hit:
+      continue
+    q = hit.get("quota", 1.0)
+    if q >= soft_floor:
+      return hit
+    # Carbon and Argon consume WTU quickly and remain usable down to 5% quota
+    if q >= EMERGENCY_PIN_FLOOR and (
+        "carbon" in mid or "argon" in mid or "launch-candidate" in mid
+    ):
       return hit
 
-  # Hard floor resolution
+  # Use flagship chain candidates all the way down to the 5% emergency floor
   candidates = []
   for mid in chain:
     hit = lookup_model(models, mid)
@@ -1048,6 +1110,9 @@ def resolve_profile_model(
 
   if candidates:
     candidates.sort(key=lambda c: c.get("quota", 0.0), reverse=True)
+    # Prefer the highest-quota flagship candidate above the 5% emergency floor
+    if candidates[0].get("quota", 0.0) >= EMERGENCY_PIN_FLOOR:
+      return candidates[0]
     if candidates[0].get("quota", 0.0) >= hard_floor:
       return candidates[0]
     return candidates[0]
@@ -1230,10 +1295,10 @@ def resolve_step0_safe_model(models: dict, broken_hit: dict | None = None) -> di
     if hit.get("quota", 1.0) >= QUOTA_SOFT_FLOOR:
       return hit
     candidates.append(hit)
-  # Fall back to the highest-quota preferred model above the 15% hard floor
+  # Fall back to the highest-quota preferred model above the 5% emergency floor
   if candidates:
     candidates.sort(key=lambda c: c.get("quota", 0.0), reverse=True)
-    if candidates[0].get("quota", 0.0) >= QUOTA_HARD_FLOOR:
+    if candidates[0].get("quota", 0.0) >= EMERGENCY_PIN_FLOOR:
       return candidates[0]
   # Last resort: any named non-broken catalog model above the 5% emergency floor
   for mid in models:
@@ -1242,6 +1307,12 @@ def resolve_step0_safe_model(models: dict, broken_hit: dict | None = None) -> di
         hit
         and hit.get("has_display_name")
         and not is_step0_broken_contrib_model(hit.get("id", ""), hit.get("enum", ""))
+        and (
+            is_flash
+            or not is_unreliable_junior_model(
+                hit.get("id", ""), hit.get("enum", ""), hit.get("label", "")
+            )
+        )
         and hit.get("quota", 0.0) >= EMERGENCY_PIN_FLOOR
     ):
       return hit
@@ -1278,8 +1349,18 @@ def resolve_handoff_model(
     # 2. Fallback to known named models if no named model in tier
     fallbacks = {
         "flash_lite": ["gemini-3.5-flash-lite", "gemini-3.8-flash-lite"],
-        "flash": ["gemini-3.8-flash-low", "gemini-3.8-flash-medium", "gemini-3.8-flash-high", "gemini-3.8-flash"],
-        "pro": ["gemini-3.8-pro", "gemini-4-argon", "gemini-3.5-pro"]
+        "flash": [
+            "gemini-3.8-flash-low",
+            "gemini-3.8-flash-medium",
+            "gemini-3.8-flash-high",
+            "gemini-3.8-flash",
+        ],
+        "pro": [
+            "gemini-4-carbon-high",
+            "gemini-launch-candidate-high",
+            "gemini-3.8-pro",
+            "gemini-4-argon",
+        ],
     }
     
     for fb in fallbacks.get(t, []):

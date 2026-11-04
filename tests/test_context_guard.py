@@ -954,6 +954,46 @@ class TestContextGuard(unittest.TestCase):
       self.assertIn("[TITLE GUARD: CONCRETE TOPIC REQUIRED]", msg, raw_ls_title)
       self.assertTrue(self.state().get("pending_title_guard"), raw_ls_title)
 
+  def test_unreliable_junior_model_warning_injected_and_saved_in_state(self):
+    with (
+        patch.object(
+            chat_lifecycle,
+            "get_conversation_project_id",
+            side_effect=lambda cid: "proj-triage" if cid == "c-triage" else "proj-cpp",
+        ),
+        patch.object(
+            chat_lifecycle,
+            "get_project_model_preference",
+            side_effect=lambda pid: (
+                "profile:triage" if pid == "proj-triage" else "profile:cpp-core"
+            ),
+        ),
+    ):
+      state = {}
+      notice, changed = context_guard.resolve_unreliable_turn_warning(
+          "c-cpp", {"model_enum": "MODEL_PLACEHOLDER_M37"}, state
+      )
+      self.assertTrue(changed)
+      self.assertIn("[UNRELIABLE MODEL WARNING GUARD]", notice)
+      self.assertEqual(state.get("unreliable_model_label"), "Gemini 3.1 Pro (High)")
+
+      # Triage conversations clear unreliable_model_label and emit no warning
+      triage_state = {"unreliable_model_label": "Gemini 3.8 Flash (High)"}
+      notice_triage, changed_triage = context_guard.resolve_unreliable_turn_warning(
+          "c-triage", {"model_enum": "MODEL_PLACEHOLDER_M320"}, triage_state
+      )
+      self.assertEqual(notice_triage, "")
+      self.assertTrue(changed_triage)
+      self.assertNotIn("unreliable_model_label", triage_state)
+
+      # Recovering to Carbon High clears unreliable_model_label
+      notice_ok, changed_ok = context_guard.resolve_unreliable_turn_warning(
+          "c-cpp", {"model_enum": "MODEL_PLACEHOLDER_M427"}, state
+      )
+      self.assertEqual(notice_ok, "")
+      self.assertTrue(changed_ok)
+      self.assertNotIn("unreliable_model_label", state)
+
 
 if __name__ == "__main__":
   unittest.main()
