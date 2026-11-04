@@ -5500,16 +5500,20 @@ def fetch_github_pr_status(
     self_comment_count = len(self_reviews) + len(self_comments)
 
     # A reviewer who already commented or requested changes is waiting for the author
-    # to reply or push, not for co-reviewers to chime in.
+    # to reply or push, not for co-reviewers to chime in. A push without a fresh review
+    # request keeps waiting too: GitHub signals "your turn" only by re-requesting review
     self_reviewed_waiting = (
         not is_self
         and bool(self_review_state)
         and not (set(req_logins) & SELF_GITHUB_LOGINS)
-        and not last_snippet.startswith("[COMMIT]")
         and (
             self_approved
             or self_approval_dismissed
-            or (self_review_state in ("commented", "changes_requested") and last_actor != author_login)
+            or last_snippet.startswith("[COMMIT]")
+            or (
+                self_review_state in ("commented", "changes_requested")
+                and last_actor != author_login
+            )
         )
     )
     in_my_attention = (
