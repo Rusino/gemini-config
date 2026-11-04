@@ -7750,8 +7750,8 @@ eval(code);
     'Style must hide tagged sidebar hiring banner wrapper'
   );
   assert(
-    styleEl.textContent.includes('[data-testid="settings-button"]'),
-    'Style must hide bottom settings button'
+    !styleEl.textContent.includes('[aria-label="Sidebar"] [data-testid="settings-button"],'),
+    'Style must keep bottom settings button visible in sidebar footer'
   );
   assert(
     styleEl.textContent.includes('[data-jetski-sidebar-footer="true"]'),
@@ -7867,8 +7867,23 @@ eval(code);
   settingsBtn.addEventListener('click', () => { settingsClicked = true; });
   window.__jetskiTopNav.setExpanded(true);
   topSettingsBtn.dispatchEvent('pointerdown');
+  assert.strictEqual(
+    settingsClicked,
+    false,
+    'pointerdown alone must not open settings while mouse button is held down'
+  );
+  assert.strictEqual(
+    window.__jetskiTopNav.isExpanded(),
+    true,
+    'Top nav must remain open during pointerdown so release does not hit modal backdrop'
+  );
+  topSettingsBtn.dispatchEvent('click');
   assert.strictEqual(settingsClicked, true, 'Proxy button must trigger click on settings button');
-  assert.strictEqual(window.__jetskiTopNav.isExpanded(), false, 'Top nav must collapse after settings click');
+  assert.strictEqual(
+    window.__jetskiTopNav.isExpanded(),
+    false,
+    'Top nav must collapse after settings click'
+  );
 
   // 3. Status dot forwarding from Automations button
   const autoDot = new FakeElement('span');
@@ -7905,8 +7920,10 @@ eval(code);
   pluginsHeader.dispatchEvent('pointerdown');
   assert.strictEqual(window.__jetskiTopNav.isExpanded(), true);
 
-  // Clicking an actionable navigation button auto-collapses top navigation
+  // Clicking an actionable navigation button auto-collapses top navigation on click release
   autoBtn.dispatchEvent('pointerdown');
+  assert.strictEqual(window.__jetskiTopNav.isExpanded(), true);
+  autoBtn.dispatchEvent('click');
   await new Promise((r) => setTimeout(r, 10));
   assert.strictEqual(window.__jetskiTopNav.isExpanded(), false);
   assert.strictEqual(sidebarEl.getAttribute('data-jetski-topnav-open'), null);
@@ -11333,8 +11350,8 @@ async function refreshCatalogInStore() {
     // on Gemini 3.1 Pro (1037) immediately recovers to Carbon High (1427) without waiting
     opusQuota = 0.10;
     orchQuota = 0.0;
-    opusResetIso = '2026-11-02T08:30:00Z';
-    orchResetIso = '2026-11-02T08:30:00Z';
+    opusResetIso = '2026-11-03T08:30:00Z';
+    orchResetIso = '2026-11-03T08:30:00Z';
     const origBuildAvailableModels = buildAvailableModels;
     let carbonQuota = 0.08;
     let proNextQuota = 0.0;
@@ -11342,19 +11359,27 @@ async function refreshCatalogInStore() {
       const u = String(url);
       if (u.includes('GetAvailableModels')) {
         const base = origBuildAvailableModels();
+        for (const [k, m] of Object.entries(base.response.models)) {
+          if (m && m.quotaInfo) {
+            m.quotaInfo.resetTime = '2026-11-03T08:30:00Z';
+            if (opusQuota === 0.0 && !k.includes('flash')) {
+              m.quotaInfo.remainingFraction = 0.0;
+            }
+          }
+        }
         base.response.models['auto'].quotaInfo.remainingFraction = proNextQuota;
-        base.response.models['auto'].quotaInfo.resetTime = '2026-11-02T08:30:00Z';
+        base.response.models['auto'].quotaInfo.resetTime = '2026-11-03T08:30:00Z';
         base.response.models['gemini-4-carbon-high'] = {
           displayName: 'Gemini 4 Carbon (High)',
           model: 'MODEL_PLACEHOLDER_M427',
           supportsImages: true,
-          quotaInfo: { remainingFraction: carbonQuota, resetTime: '2026-11-02T08:30:00Z' },
+          quotaInfo: { remainingFraction: carbonQuota, resetTime: '2026-11-03T08:30:00Z' },
         };
         base.response.models['gemini-3.1-pro-high'] = {
           displayName: 'Gemini 3.1 Pro (High)',
           model: 'MODEL_PLACEHOLDER_M37',
           supportsImages: true,
-          quotaInfo: { remainingFraction: 0.99, resetTime: '2026-11-02T08:30:00Z' },
+          quotaInfo: { remainingFraction: 0.99, resetTime: '2026-11-03T08:30:00Z' },
         };
         return { ok: true, json: async () => base };
       }
@@ -11369,27 +11394,35 @@ async function refreshCatalogInStore() {
       'Unpinned cpp-core chat on 1037 must immediately recover to Carbon High (1427) at 8% quota'
     );
 
-    // When all flagship models are exhausted (0% quota) and chat stays on 1037, show warning toast
+    // When all flagship models are exhausted (0% quota), chat on 1037 (3.1 Pro) upgrades to
+    // Gemini 3.8 Flash (High) (1320) as last-resort reserve and shows warning toast
     opusQuota = 0.0;
     carbonQuota = 0.0;
     proNextQuota = 0.0;
     await refreshCatalogInStore();
     for (const cfg of storeState.userStatus.cascadeModelConfigData.clientModelConfigs) {
       if (cfg.quotaInfo) {
-        cfg.quotaInfo.remainingFraction = 0.0;
-        cfg.quotaInfo.resetTime = '2026-11-02T08:30:00Z';
+        cfg.quotaInfo.remainingFraction =
+          cfg.modelOrAlias?.choice?.value === 1320 ? 0.95 : 0.0;
+        cfg.quotaInfo.resetTime = '2026-11-03T08:30:00Z';
       }
     }
+    storeState.conversation.cascadeId = 'chat-unpinned-cpp';
     storeState.modelSelection.byConversation['chat-unpinned-cpp'] = { model: 1037 };
     fakeNow += 61 * 1000;
     reduxStore.dispatch({ type: 'userStatus/setUserStatus', payload: storeState.userStatus });
     await new Promise((r) => setImmediate(r));
     await new Promise((r) => setImmediate(r));
+    assert.strictEqual(
+      storeState.modelSelection.byConversation['chat-unpinned-cpp'].model,
+      1320,
+      'When all flagships are at 0%, chat on 1037 (3.1 Pro) must rescue to Gemini 3.8 Flash (High) (1320)'
+    );
     toast = global.document.getElementById('jetski-model-autopilot-toast');
     assert(toast, 'Unreliable junior model fallback must mount warning toast');
     assert(
       toast.textContent.includes(
-        'Warning: running on unreliable junior model (Gemini 3.1 Pro (High))'
+        'Warning: running on unreliable junior model (Gemini 3.8 Flash (High))'
       ),
       `Expected unreliable junior model warning toast, got: ${toast.textContent}`
     );

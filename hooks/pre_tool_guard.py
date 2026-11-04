@@ -250,8 +250,9 @@ def is_agent_internal_file(file_path: str) -> bool:
   clean = os.path.abspath(os.path.expanduser(file_path.strip().strip('"').strip("'")))
   config_dir = os.path.abspath(os.path.expanduser("~/.gemini/config"))
   internal_dirs = [config_dir] + [
-      os.path.abspath(os.path.expanduser(d + "/brain"))
+      os.path.abspath(os.path.expanduser(d + sub))
       for d in APP_DATA_DIR_CANDIDATES
+      for sub in ("/brain", "/roadmaps")
   ]
   if clean.startswith("/tmp/") or any(
       clean == d or clean.startswith(d + "/") for d in internal_dirs
@@ -2749,6 +2750,7 @@ def parallel_chat_isolation_denial(
             for seg in (
                 "/.gemini/config/logs/",
                 "/.gemini/config/roadmaps/",
+                "/.gemini/jetski/roadmaps/",
                 "/.gemini/config/projects/",
             )
         )
@@ -3613,6 +3615,53 @@ def ask_question_context_denial(
   return ""
 
 
+# Check that the latest trigger is an explicit user reply confirming a Google Chat write
+def _has_explicit_gchat_write_confirmation(
+    conv_id: str, transcript_path: str = ""
+) -> bool:
+  t_path = transcript_path
+  if not t_path or not os.path.isfile(t_path):
+    try:
+      import roadmap
+
+      t_path = roadmap._find_transcript_path(conv_id, transcript_path)
+    except Exception:
+      t_path = ""
+  if not t_path:
+    return False
+  try:
+    with open(t_path, "r", encoding="utf-8", errors="replace") as f:
+      lines = f.readlines()
+  except OSError:
+    return False
+  last_trigger_type = None
+  last_user_text = ""
+  had_prior_ask_question = False
+  for raw in lines[-60:]:
+    try:
+      step = json.loads(raw)
+    except json.JSONDecodeError:
+      continue
+    stype = step.get("type", "")
+    if stype == "PLANNER_RESPONSE":
+      for tc in step.get("tool_calls") or []:
+        if tc.get("name") == "ask_question":
+          had_prior_ask_question = True
+    elif stype == "USER_INPUT":
+      last_trigger_type = "USER_INPUT"
+      last_user_text = (step.get("content") or "").lower()
+    elif stype == "SYSTEM_MESSAGE":
+      last_trigger_type = "SYSTEM_MESSAGE"
+  if last_trigger_type != "USER_INPUT":
+    return False
+  if had_prior_ask_question:
+    return True
+  return any(
+      tok in last_user_text
+      for tok in ("google chat", "gchat", "в гугл чат", "роберту в чат")
+  )
+
+
 def main() -> None:
   try:
     raw_input = sys.stdin.read().strip()
@@ -3633,8 +3682,100 @@ def main() -> None:
   tool_args = tool_call.get("args") or {}
 
   conv_id = data.get("conversationId", "")
-  parent_conv_id = data.get("parentConversationId", "")
   transcript_path = data.get("transcriptPath", "")
+  # Block unconfirmed Google Chat MCP writes before running tool calls
+  if tool_name == "call_mcp_tool":
+    mcp_server = (tool_args.get("ServerName") or "").strip()
+    mcp_tool = (tool_args.get("ToolName") or "").strip()
+    gchat_write_tools = {
+        "send_message",
+        "send_message_markdown",
+        "update_message",
+        "delete_message",
+        "add_reaction",
+        "remove_reaction",
+        "create_conversation",
+        "update_conversation",
+        "add_membership",
+        "update_membership",
+        "remove_membership",
+    }
+    if (
+        mcp_server in ("google_chat_google_chat", "chat_google_chat")
+        and mcp_tool in gchat_write_tools
+    ):
+      if not _has_explicit_gchat_write_confirmation(conv_id, transcript_path):
+        print(
+            json.dumps(
+                {
+                    "decision": "deny",
+                    "reason": (
+                        f"[GOOGLE-CHAT WRITE GUARD] Blocked `{mcp_server}.{mcp_tool}`. "
+                        "Sending, editing, deleting, or reacting to Google Chat messages on "
+                        "the user's behalf requires showing the exact recipient and message "
+                        "text in visible chat and getting explicit user confirmation via "
+                        "`ask_question` in the current turn (background `SYSTEM_MESSAGE` "
+                        "wakeups never authorize Google Chat writes, and «отправь в чат, где "
+                        "мы это разбирали» refers to a Jetski agent conversation, not Google Chat)."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
+
+
+
+  # Verify reviewer/assignee LDAP is an active Googler before upload or reassign
+  if tool_name == "run_command":
+    cmd = tool_args.get("CommandLine", "")
+    ldap_to_check = None
+    if "git cl upload" in cmd:
+      m = re.search(
+          r"--(?:cc|r|reviewer)[=\s]+([a-zA-Z0-9_-]+)(?:@(?:google\.com|chromium\.org))?",
+          cmd,
+      )
+      if m:
+        ldap_to_check = m.group(1)
+    elif (
+        "reassign_merge" in cmd
+        or "safe-reassign" in cmd
+        or "--assignee" in cmd
+    ):
+      m = re.search(
+          r"(?:reassign(?:_merge)?|safe-reassign|--assignee)[=\s]+([a-zA-Z0-9_-]+)(?:@(?:google\.com|chromium\.org))?",
+          cmd,
+      )
+      if m:
+        ldap_to_check = m.group(1)
+
+    if ldap_to_check:
+      try:
+        res = subprocess.run(
+            ["id", "-u", ldap_to_check],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        if res.returncode != 0 and "no such user" in res.stderr.lower():
+          print(
+              json.dumps(
+                  {
+                      "decision": "deny",
+                      "reason": (
+                          f"[LDAP GUARD] User {ldap_to_check} is no longer at Google "
+                          "(id -u returned no such user)."
+                      ),
+                  },
+                  ensure_ascii=False,
+              )
+          )
+          return
+      except Exception:
+        pass
+
+  parent_conv_id = data.get("parentConversationId", "")
   artifact_dir = data.get("artifactDirectoryPath", "")
   workspace_paths = data.get("workspacePaths") or []
   # macOS Antigravity omits parentConversationId in stdin; resolve it so subagents

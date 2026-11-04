@@ -716,6 +716,42 @@ class TestRoadmap(unittest.TestCase):
     self.assertIn("[VCS BATON: PENDING", out3)
     self.assertIn("stale", out3)
 
+  def test_state_save_and_legacy_roadmaps_migration(self):
+    saved = roadmap.state_save("p1", "conv-save-1", "# Chain State\n\nGoal: test")
+    self.assertTrue(os.path.isfile(saved))
+    with open(saved, "r", encoding="utf-8") as f:
+      self.assertEqual(f.read(), "# Chain State\n\nGoal: test\n")
+
+    legacy_dir = os.path.join(self.tmp.name, "legacy_roadmaps")
+    target_dir = os.path.join(self.tmp.name, "jetski_roadmaps")
+    os.makedirs(os.path.join(legacy_dir, "proj-mig", "state"), exist_ok=True)
+    with open(
+        os.path.join(legacy_dir, "proj-mig", "state", "c1.md"), "w", encoding="utf-8"
+    ) as f:
+      f.write("# Migrated\n")
+    roadmap._migrate_legacy_roadmaps_dir(target_dir, legacy_dir)
+    self.assertTrue(os.path.islink(legacy_dir))
+    self.assertTrue(
+        os.path.isfile(os.path.join(target_dir, "proj-mig", "state", "c1.md"))
+    )
+
+    # Also test when target_dir is a reverse symlink pointing to legacy_dir
+    legacy_dir2 = os.path.join(self.tmp.name, "legacy_roadmaps2")
+    target_dir2 = os.path.join(self.tmp.name, "jetski_roadmaps2")
+    os.makedirs(os.path.join(legacy_dir2, "proj-mig2", "state"), exist_ok=True)
+    with open(
+        os.path.join(legacy_dir2, "proj-mig2", "state", "c2.md"), "w", encoding="utf-8"
+    ) as f:
+      f.write("# Migrated 2\n")
+    os.symlink(legacy_dir2, target_dir2)
+    roadmap._migrate_legacy_roadmaps_dir(target_dir2, legacy_dir2)
+    self.assertFalse(os.path.islink(target_dir2))
+    self.assertTrue(os.path.isdir(target_dir2))
+    self.assertTrue(os.path.islink(legacy_dir2))
+    self.assertTrue(
+        os.path.isfile(os.path.join(target_dir2, "proj-mig2", "state", "c2.md"))
+    )
+
 
 if __name__ == "__main__":
   unittest.main()

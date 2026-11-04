@@ -666,8 +666,12 @@ def collect_project_directory(
           "active_chat": active_by_proj.get(pid),
       }
 
+  # ~/.gemini/config is shared across Improving Experience, Flight Deck, and other projects
+  config_root = os.path.abspath(os.path.expanduser("~/.gemini/config")).rstrip("/")
   exclusive_roots = {
-      rt: owners[0] for rt, owners in root_owners.items() if len(owners) == 1
+      rt: owners[0]
+      for rt, owners in root_owners.items()
+      if len(owners) == 1 and rt != config_root
   }
   return {"projects": projects, "exclusive_roots": exclusive_roots}
 
@@ -1600,6 +1604,12 @@ def load_state(state_path: str, conv_id: str = "") -> dict:
           except OSError:
             pass
           return {}
+        # Normalize legacy ~/.gemini/config/roadmaps state paths to ~/.gemini/jetski/roadmaps
+        pf = data.get("pending_handoff_file")
+        if isinstance(pf, str) and "/.gemini/config/roadmaps/" in pf:
+          data["pending_handoff_file"] = pf.replace(
+              "/.gemini/config/roadmaps/", "/.gemini/jetski/roadmaps/"
+          )
         return data
   except Exception:
     pass
@@ -1749,7 +1759,9 @@ def handoff_steps(conv_id: str, target: dict, new_title: str) -> str:
         f"1. Roadmap: `python3 {ROADMAP_CLI} set {conv_id} <ID> done|doing|todo`"
         " (`add` for new work, `edit`/`move`/`reorder` to reword or reprioritize);"
         " never edit roadmap files directly.\n"
-        f"2. Overwrite the chain state file `{target['file']}` (write_to_file):"
+        f"2. Overwrite the chain state file `{target['file']}` (write_to_file /"
+        f" write_file, or `python3 {ROADMAP_CLI} state-save {conv_id} <<'EOF'`"
+        " in Plan Mode):"
         " goal, current state with evidence (modified files, last build/test"
         " result), failed hypotheses, running subagents/background tasks and how"
         " to restart them, exact next step. It moves to the continuation as is.\n"

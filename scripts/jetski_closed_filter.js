@@ -574,8 +574,10 @@
     [1136, 'snowball-subagent'],
     [1260, 'Gemini Pro Next'],
     [1286, 'Gemini 4 Argon (High)'],
+    [1318, 'Gemini 3.8 Flash (High)'],
     [1319, 'Gemini 3.8 Flash (Medium)'],
     [1320, 'Gemini 3.8 Flash (High)'],
+    [1322, 'Gemini 3.8 Flash (Tiered)'],
     [1333, 'Gemini 3.1 Pro'],
     [1367, 'Claude Opus 5.5 (Medium)'],
     [1369, 'Claude Opus 5.5 (Low)'],
@@ -616,13 +618,13 @@
     'gemini-launch-candidate-medium',
     'gemini-pro-coordinator',
     'auto',
-    // Tier 2: Secondary models
+    // Tier 2: Secondary & modern 3.8 Flash reserve (ranked above legacy Gemini 3.1 Pro / snowball)
     'fable-5.1-dropdown',
-    'gemini-3.1-pro-high',
-    // Tier 3: Flash / triage models
     'gemini-flash-next',
     'gemini-3.8-flash-high',
     'gemini-3.8-flash-medium',
+    // Tier 3: Legacy / light models
+    'gemini-3.1-pro-high',
     'gemini-2.5-flash',
     'gemini-3.5-flash-lite',
   ];
@@ -3367,7 +3369,22 @@
       candidates.sort((a, b) => (b.quota || 0) - (a.quota || 0));
       // Pick the highest-quota flagship candidate above the 5% emergency floor
       if (candidates[0].quota >= EMERGENCY_PIN_FLOOR) return candidates[0];
-      if (candidates[0].quota >= hardFloor) return candidates[0];
+    }
+
+    // When all flagship models are exhausted (<5%), fall back to Gemini 3.8 Flash (High)
+    // rather than Gemini 3.1 Pro / snowball-subagent
+    for (const flashMid of [
+      'gemini-3.8-flash-high',
+      'gemini-flash-next',
+      'gemini-3.8-flash-medium',
+    ]) {
+      const flashHit = catalog.byId.get(flashMid);
+      if (flashHit && flashHit.quota >= EMERGENCY_PIN_FLOOR) {
+        return flashHit;
+      }
+    }
+
+    if (candidates.length > 0) {
       return candidates[0];
     }
 
@@ -3388,8 +3405,10 @@
     return Boolean(
       JUNIOR_PRO_ENUM_NUMS.has(num) ||
         num === 312 ||
+        num === 1318 ||
         num === 1319 ||
         num === 1320 ||
+        num === 1322 ||
         num === 1422 ||
         mid.includes('3.1') ||
         mid.includes('2.5') ||
@@ -3406,6 +3425,9 @@
 
   // Ranks model capability/cost (1 = strongest, 7 = lightest) to separate upgrades from downgrades
   function getModelCapabilityTier(modelId, enumVal, label) {
+    const rawNum =
+      typeof enumVal === 'number' ? enumVal : resolveModelEnumValue(String(enumVal || ''));
+    if (JUNIOR_PRO_ENUM_NUMS.has(rawNum)) return 6;
     const mid = String(modelId || '').trim().toLowerCase();
     const num =
       typeof enumVal === 'number' ? enumVal : resolveModelEnumValue(String(enumVal || ''));
@@ -3471,6 +3493,18 @@
       if (mid === 'gemini-pro-coordinator' || num === 1415) return 3;
       if (mid === 'auto' || num === 1260) return 4;
       if (tier <= 5) return 5;
+      // Rank Gemini 3.8 Flash (8) ahead of Gemini 3.1 Pro / snowball (10) as last-resort reserve
+      if (
+        !JUNIOR_PRO_ENUM_NUMS.has(num) &&
+        !mid.includes('3.1') &&
+        (mid.includes('3.8-flash') ||
+          mid === 'gemini-flash-next' ||
+          num === 1318 ||
+          num === 1319 ||
+          num === 1320)
+      ) {
+        return 8;
+      }
       return 10;
     }
     if (p === 'triage') {
@@ -3485,6 +3519,18 @@
     // Manual upgrades carry isPinned=true; unpinned tier<=3 models leaked from default.model
     if (tier <= 3) return 3;
     if (tier === 5) return 4;
+    // Rank Gemini 3.8 Flash (8) ahead of Gemini 3.1 Pro / snowball (10) in orchestrator reserve
+    if (
+      !JUNIOR_PRO_ENUM_NUMS.has(num) &&
+      !mid.includes('3.1') &&
+      (mid.includes('3.8-flash') ||
+        mid === 'gemini-flash-next' ||
+        num === 1318 ||
+        num === 1319 ||
+        num === 1320)
+    ) {
+      return 8;
+    }
     return 10;
   }
 
@@ -3525,14 +3571,17 @@
       .trim()
       .toLowerCase()
       .replace(/^profile:/, '');
-    // Rescue non-triage chats stuck on an unreliable junior model whenever a flagship is >= 5%
-    const isJuniorRescue = cleanProfile !== 'triage' && curTier >= 6 && bestTier <= 5;
+    const bestRank = getProfilePreferenceRank(profile, best.modelId, best.enumVal, best.label);
+    const curRank = getProfilePreferenceRank(profile, curModelId, curNum || curEnumVal, curLabel);
+    // Rescue non-triage chats from junior models to flagships, or from 3.1 Pro / snowball to 3.8 Flash
+    const isJuniorRescue =
+      cleanProfile !== 'triage' &&
+      ((curTier >= 6 && bestTier <= 5) ||
+        (JUNIOR_PRO_ENUM_NUMS.has(curNum) && bestRank < curRank));
     const minRecoveryQuota = isJuniorRescue ? EMERGENCY_PIN_FLOOR : QUOTA_SOFT_FLOOR;
     if (best.quota < minRecoveryQuota) {
       return null;
     }
-    const bestRank = getProfilePreferenceRank(profile, best.modelId, best.enumVal, best.label);
-    const curRank = getProfilePreferenceRank(profile, curModelId, curNum || curEnumVal, curLabel);
     if (!expiredJuniorEnum && bestRank >= curRank) return null;
     return {
       replacement: best,
@@ -6613,9 +6662,8 @@
     ` +
       // Style the collapsible Needs-Reaction inbox widget above the sidebar project list
       `
-      /* Hide redundant new conversation, settings, and bottom hiring promo banner */
+      /* Hide redundant new conversation and bottom hiring promo banner (keep bottom Settings button visible) */
       [aria-label="Sidebar"] [data-testid="new-conversation-button"],
-      [aria-label="Sidebar"] [data-testid="settings-button"],
       [aria-label="Sidebar"] [data-jetski-hiring-banner="true"],
       [aria-label="Sidebar"] div:has(> [data-testid="sidebar-hiring-link"]),
       [aria-label="Sidebar"] [data-testid="sidebar-hiring-link"],
@@ -10173,7 +10221,8 @@
           topSettingsBtn.textContent = origSettingsBtn.textContent || 'Settings';
         }
         bindHoverBubble(topSettingsBtn, () => 'Settings');
-        bindActionBtnHandlers(topSettingsBtn, () => {
+        const triggerTopSettings = (event) => {
+          event?.stopPropagation();
           const liveSettingsBtn =
             sidebarEl.querySelector('[data-testid="settings-button"]') ||
             document.querySelector('[data-testid="settings-button"]');
@@ -10186,6 +10235,14 @@
           }
           topNavExpanded = false;
           ensureTopNavToggle();
+        };
+        // Wait for click release so collapsing top nav does not drop pointerup onto modal backdrop
+        topSettingsBtn.addEventListener('click', triggerTopSettings);
+        topSettingsBtn.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            triggerTopSettings(event);
+          }
         });
         topNavList.appendChild(topSettingsBtn);
       } else if (!topSettingsBtn.innerHTML && origSettingsBtn.innerHTML) {
@@ -10270,7 +10327,12 @@
     if (!target || typeof target.closest !== 'function') return;
 
     if (target.closest(`.${TOP_NAV_TOGGLE_BTN_CLASS}`)) return;
-    if (target.closest('[data-radix-popper-content-wrapper]') || target.closest('[role="menu"]')) {
+    if (
+      target.closest('[data-radix-popper-content-wrapper]') ||
+      target.closest('[role="menu"]') ||
+      target.closest('[role="dialog"]') ||
+      target.closest('[aria-modal="true"]')
+    ) {
       return;
     }
 
@@ -10280,6 +10342,12 @@
     if (!topNavSec && !pluginsSec) {
       topNavExpanded = false;
       ensureTopNavToggle();
+      return;
+    }
+
+    // Defer internal auto-collapse until the click event finishes so hiding topNavSec on
+    // pointerdown does not swallow the synthesized click on buttons inside topNavSec
+    if (event?.type === 'pointerdown') {
       return;
     }
 
@@ -10920,6 +10988,7 @@
       document.addEventListener('pointerdown', handleSidebarSearchIntercept, true);
       document.addEventListener('click', handleSidebarSearchIntercept, true);
       document.addEventListener('pointerdown', handleTopNavOutsideClick, true);
+      document.addEventListener('click', handleTopNavOutsideClick, true);
       document.addEventListener('keydown', handleTopNavKeydown, true);
     }
   }
@@ -10933,6 +11002,7 @@
       document.removeEventListener('pointerdown', handleSidebarSearchIntercept, true);
       document.removeEventListener('click', handleSidebarSearchIntercept, true);
       document.removeEventListener('pointerdown', handleTopNavOutsideClick, true);
+      document.removeEventListener('click', handleTopNavOutsideClick, true);
       document.removeEventListener('keydown', handleTopNavKeydown, true);
     }
   }
@@ -12470,6 +12540,7 @@
       if (
         p.includes('/brain/') ||
         p.includes('/.gemini/config/roadmaps/') ||
+        p.includes('/.gemini/jetski/roadmaps/') ||
         p.includes('/.gemini/config/logs/') ||
         p.includes('/.gemini/config/projects/') ||
         p.includes('/tmp/jetski_') ||

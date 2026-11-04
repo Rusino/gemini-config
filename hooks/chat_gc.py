@@ -36,7 +36,7 @@ DEFAULT_TRIAGE_DELETE_PROJECTS = {
     "skia-g3-roll-check": 30,
 }
 DEFAULT_GC_LOG_FILE = os.path.expanduser("~/.gemini/config/logs/chat_gc.jsonl")
-DEFAULT_ROADMAPS_DIR = os.path.expanduser("~/.gemini/config/roadmaps")
+DEFAULT_ROADMAPS_DIR = os.path.expanduser("~/.gemini/jetski/roadmaps")
 
 BUILD_SUBDIRS = (
     "out",

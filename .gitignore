@@ -13,6 +13,7 @@ __pycache__/
 
 # Runtime data written by hooks (per-machine project ids)
 logs/
+roadmaps
 roadmaps/
 ledgers/
 conversation_summaries.db
