@@ -634,6 +634,41 @@ class FinalizeReviewPipelineTest(unittest.TestCase):
     )
     self.assertEqual(explicitly_waived_g3["status"], "waived")
 
+  def test_g3_waiver_overrides_failed_compare_md_only_on_its_patchset(self) -> None:
+    import finalize_review as fr
+
+    failed_md = os.path.join(self.tmp_dir, "g3_cl_1409697_failed", "compare.md")
+    os.makedirs(os.path.dirname(failed_md), exist_ok=True)
+    with open(failed_md, "w", encoding="utf-8") as fh:
+      fh.write(
+          "# Google3 Paragraph Corpus Comparison (baseline = `baseline`)\n\n"
+          "**Вердикт целостности (Integrity Check):** `VALID`\n"
+          "| `cand` | `cl:1409697/6` (`6e8dd008c2`) |\n"
+          "**Выполнено тестов: 1139 | Новых падений (Regressions): 1 | Флипов FAIL→PASS: 0**\n"
+      )
+
+    def gate(cur_ps: int, cur_sha: str, triage: dict[str, Any]) -> str:
+      return fr._evaluate_g3_corpus_gate(
+          "1409697",
+          cur_ps,
+          cur_sha,
+          ["modules/skparagraph/src/ParagraphImpl.cpp"],
+          "[skparagraph] Add first-line indentation",
+          {"g3_corpus_compare_md": failed_md, "g3_corpus_required": True, **triage},
+          [],
+          True,
+      )["status"]
+
+    waived_ps6 = {
+        "g3_corpus_status": "waived",
+        "triaged_patchset": 6,
+        "triaged_revision": "6e8dd008c2",
+    }
+    self.assertEqual(gate(6, "6e8dd008c2", waived_ps6), "waived")
+    self.assertEqual(gate(6, "6e8dd008c2", {"g3_corpus_status": "failed"}), "failed")
+    self.assertEqual(gate(6, "aaaaaaa111", waived_ps6), "failed")
+    self.assertEqual(gate(7, "6e8dd008c2", waived_ps6), "failed")
+
 
 class FlightDeckFinalizeUiTest(unittest.TestCase):
 

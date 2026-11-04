@@ -359,6 +359,20 @@ def _evaluate_g3_corpus_gate(
   if not exec_files:
     return {"required": False, "status": "not_required", "compare_md": ""}
 
+  g3_status = str(triage.get("g3_corpus_status") or "").lower()
+  g3_tested_ps = int(
+      triage.get("g3_corpus_tested_patchset") or triage.get("triaged_patchset") or 0
+  )
+  triaged_rev = str(triage.get("triaged_revision") or "").strip()
+  # A manual waiver (e.g. a flake proven on baseline) outranks the failed compare.md it
+  # explains, but only on the patchset and revision it was recorded for
+  if (
+      g3_status == "waived"
+      and g3_tested_ps == cur_ps
+      and (not triaged_rev or triage_store._sha_matches(cur_sha, triaged_rev))
+  ):
+    return {"required": True, "status": "waived", "compare_md": ""}
+
   cand_paths: list[Path] = []
   explicit = str(triage.get("g3_corpus_compare_md") or "").strip()
   if explicit:
@@ -401,14 +415,8 @@ def _evaluate_g3_corpus_gate(
     return {"required": True, "status": "failed", "compare_md": str(p)}
 
   # Trust persisted g3_corpus_status on the exact patchset if /tmp compare.md was cleaned up
-  g3_status = str(triage.get("g3_corpus_status") or "").lower()
-  g3_tested_ps = int(
-      triage.get("g3_corpus_tested_patchset") or triage.get("triaged_patchset") or 0
-  )
   if g3_status == "passed" and g3_tested_ps == cur_ps:
     return {"required": True, "status": "passed", "compare_md": explicit}
-  if g3_status == "waived":
-    return {"required": True, "status": "waived", "compare_md": ""}
   return {"required": True, "status": "pending", "compare_md": ""}
 
 
