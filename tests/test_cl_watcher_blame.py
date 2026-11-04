@@ -65,6 +65,53 @@ class IncidentVerdictTest(unittest.TestCase):
     self.assertFalse(res["has_alert"])
     self.assertEqual(res["incidents"][0]["verdict"], "flake")
 
+  def test_ios_device_launch_infra_mishap_and_flake_cleared_stay_informational(self):
+    # Reproduce Gerrit 1414546 (68d9b31eea) on Perf-iOS-Clang-iPhone8-GPU-AppleA11-arm64-Release-All-Metal
+    inc = {
+        "task": {
+            "commits": [
+                "1e88fece617e4dfb6d1078cc4aa298d482b8558d",
+                CULPRIT,
+            ],
+            "name": "Perf-iOS-Clang-iPhone8-GPU-AppleA11-arm64-Release-All-Metal",
+            "id": "KzzEk3pIgLY8RtQzeZqx",
+            "swarming_task_id": "7bc14b9470442810",
+        },
+        "affected_tasks": [
+            {
+                "name": "Perf-iOS-Clang-iPhone8-GPU-AppleA11-arm64-Release-All-Metal",
+                "id": "KzzEk3pIgLY8RtQzeZqx",
+                "status": "FAILURE",
+                "swarming_task_id": "7bc14b9470442810",
+                "bot_id": "mac-730-e505",
+                "classification": "IOS_DEVICE_LAUNCH_FAILURE",
+                "streak_count": 1,
+                "is_regression": True,
+                "flake_cleared_by_rev": "88a915d",
+                "flake_cleared_by_task_id": "7bc0f6e797612a10",
+            }
+        ],
+        "bot_count": 1,
+        "is_intermittent_flake": False,
+        "blame": {
+            "commit_hash": CULPRIT,
+            "subject": "Revive SkParagraph nanobench",
+            "gerrit_change_number": "1414546",
+            "gerrit_url": "https://skia-review.googlesource.com/c/skia/+/1414546",
+            "confidence": "High",
+            "confidence_score": 70,
+            "crash_analysis": (
+                "Autonomous Swarming/LogDog verification confirms this is an "
+                "infrastructure/host mishap (IOS_DEVICE_LAUNCH_FAILURE), not a code regression."
+            ),
+        },
+    }
+    res = w.check_skia_post_submit(CULPRIT, {}, [inc], skia_dir="/nonexistent")
+    self.assertFalse(res["has_alert"])
+    self.assertEqual(res["skia_status"], "⚠️")
+    self.assertEqual(res["incidents"][0]["verdict"], "flake")
+    self.assertEqual(res["recommended_action"], "")
+
   def test_low_confidence_single_bot_stays_informational(self):
     inc = make_incident([CULPRIT], confidence="Low", score=15)
     res = w.check_skia_post_submit(CULPRIT, {}, [inc], skia_dir="/nonexistent")

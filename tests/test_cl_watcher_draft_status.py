@@ -344,6 +344,84 @@ class DraftAndDevelopmentStatusTest(unittest.TestCase):
     self.assertTrue(res["in_my_attention"])
     self.assertEqual(res["phase"], "NEEDS_YOUR_ACTION")
 
+  def test_gerrit_self_cl_after_dry_run_and_commit_msg_upload_clears_attention_while_awaiting_cr(
+      self,
+  ):
+    payload = {
+        "status": "NEW",
+        "work_in_progress": False,
+        "subject": (
+            "[SkChromeRemoteGlyphCache] Fix Zombie Strike defect on mergeFromBuffer failure"
+        ),
+        "owner": {"email": "jlavrova@google.com", "name": "Julia Lavrova"},
+        "current_revision": "rev12",
+        "revisions": {
+            "rev11": {"_number": 11},
+            "rev12": {"_number": 12, "kind": "NO_CODE_CHANGE"},
+        },
+        "attention_set": {
+            "8956": {
+                "account": {"email": "jlavrova@google.com"},
+                "reason": "SkCQ dry run succeeded.",
+            },
+            "8341": {
+                "account": {"email": "michaelludwig@google.com"},
+                "reason": "Reviewer was added",
+            },
+            "4623515": {
+                "account": {"email": "alexisdavidc@google.com"},
+                "reason": "Reviewer was added",
+            },
+        },
+        "reviewers": {
+            "REVIEWER": [
+                {"email": "jlavrova@google.com"},
+                {"email": "michaelludwig@google.com"},
+                {"email": "alexisdavidc@google.com"},
+            ]
+        },
+        "labels": {
+            "Code-Review": {
+                "all": [
+                    {"email": "jlavrova@google.com", "value": 0},
+                    {"email": "michaelludwig@google.com", "value": 0},
+                    {"email": "alexisdavidc@google.com", "value": 0},
+                ]
+            },
+            "Commit-Queue": {
+                "all": [
+                    {"email": "jlavrova@google.com", "value": 0},
+                ]
+            },
+        },
+        "messages": [
+            {
+                "_revision_number": 11,
+                "author": {
+                    "email": "skcq-be@skia-corp.google.com.iam.gserviceaccount.com"
+                },
+                "date": "2026-11-04 18:17:25.000000000",
+                "message": "Patch Set 11: Dry run: This CL passed the SkCQ dry run.",
+            },
+            {
+                "_revision_number": 12,
+                "author": {"email": "jlavrova@google.com", "name": "Julia Lavrova"},
+                "date": "2026-11-04 19:01:32.000000000",
+                "message": "Uploaded patch set 12: Commit message was updated.",
+            },
+        ],
+    }
+    with mock.patch.object(
+        w.urllib.request, "urlopen", return_value=_FakeGerritResponse(payload)
+    ), mock.patch.object(w, "gerrit_mergeable", return_value=True):
+      res = w.fetch_gerrit_cl_status("1414544", {}, [], skia_dir="/nonexistent")
+
+    self.assertTrue(res["ok"])
+    self.assertTrue(res["is_self"])
+    self.assertEqual(res["missing_approvals"], 1)
+    self.assertFalse(res["in_my_attention"])
+    self.assertEqual(res["phase"], "WAITING_ON_OTHERS")
+
   def test_github_draft_pr_marks_is_draft(self):
     gh_json = json.dumps({
         "number": 195120,

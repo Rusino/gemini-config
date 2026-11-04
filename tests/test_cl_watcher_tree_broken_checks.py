@@ -211,6 +211,122 @@ class GitHubTreeBrokenChecksTest(unittest.TestCase):
     self.assertEqual(res_own["phase"], "ALERT_CQ_FAILED")
     self.assertTrue(res_own["in_my_attention"])
 
+  def test_github_pr_google_testing_conflict_and_unrelated_customer_testing(self):
+    # Reproduce PR #195122: Google testing has g3 merge conflict and customer_testing fails on flame
+    head_sha = "19f70f0255d3dc693221c5db2ba36835699fd92a"
+    base_sha = "0000base"
+    pr_payload = {
+        "number": 195122,
+        "title": "[web_paragraph] Avoid browser text metrics queries on re-layout",
+        "body": "Speeds up WebParagraph layout.",
+        "state": "OPEN",
+        "isDraft": False,
+        "author": {"login": "Rusino"},
+        "mergedAt": None,
+        "headRefOid": head_sha,
+        "headRefName": "relayout-perf",
+        "baseRefName": "master",
+        "reviewDecision": "APPROVED",
+        "latestReviews": [],
+        "reviews": [],
+        "comments": [],
+        "commits": [{"oid": head_sha}],
+        "statusCheckRollup": [
+            {
+                "name": "Google testing",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "detailsUrl": "http://frob/flutter/presubmit?pr=195122",
+            },
+            {
+                "name": "Linux customer_testing",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "detailsUrl": "https://cr-buildbucket.appspot.com/build/8682147800419572945",
+            },
+        ],
+        "labels": [],
+        "url": "https://github.com/flutter/flutter/pull/195122",
+        "mergeable": "MERGEABLE",
+        "reviewRequests": [],
+        "createdAt": "2026-11-01T10:00:00Z",
+        "updatedAt": "2026-11-04T20:00:00Z",
+        "closedAt": None,
+        "files": [
+            {"path": "engine/src/flutter/lib/web_ui/lib/src/engine/text_fragmenter.dart"},
+            {"path": "engine/src/flutter/lib/web_ui/test/ui/text_golden_test.dart"},
+        ],
+    }
+    head_check_runs = {
+        "check_runs": [
+            {
+                "name": "Google testing",
+                "conclusion": "failure",
+                "details_url": "http://frob/flutter/presubmit?pr=195122",
+                "output": {
+                    "title": "Merge conflicts detected",
+                    "summary": (
+                        "This PR cannot be merged cleanly into Google's internal "
+                        "repository (`g3`) at HEAD. Please rebase onto `master`."
+                    ),
+                },
+            }
+        ]
+    }
+    bb_search_resp = {
+        "builds": [
+            {
+                "id": "8682147800419572945",
+                "builder": {"builder": "Linux customer_testing"},
+                "status": "FAILURE",
+                "summaryMarkdown": (
+                    "Failing tests:\n"
+                    "- `/b/s/w/ir/x/w/rc/customer_testing/tests/flame/packages/flame/"
+                    "test/components/text_element_component_test.dart`"
+                ),
+            }
+        ]
+    }
+
+    def fake_check_output(cmd, **kwargs):
+      if cmd[:3] == ["gh", "pr", "view"]:
+        return json.dumps(pr_payload)
+      target = cmd[2] if len(cmd) > 2 else ""
+      if f"commits/{head_sha}/check-runs" in target:
+        return json.dumps(head_check_runs)
+      if target == "repos/flutter/flutter/pulls/195122":
+        return json.dumps({"base": {"sha": base_sha}})
+      if f"commits/{base_sha}/check-runs" in target:
+        return json.dumps({"check_runs": []})
+      raise AssertionError(f"Unexpected command: {cmd}")
+
+    def fake_urlopen(req, timeout=6):
+      url = req.full_url if hasattr(req, "full_url") else str(req)
+      if "SearchBuilds" in url:
+        return _FakeHttpResp(bb_search_resp)
+      return _FakeHttpResp({"builds": []})
+
+    w._GH_CHECK_DETAILS_CACHE.clear()
+    with mock.patch.object(
+        w.subprocess, "check_output", side_effect=fake_check_output
+    ), mock.patch.object(w.urllib.request, "urlopen", side_effect=fake_urlopen):
+      res = w.fetch_github_pr_status("195122")
+
+    self.assertTrue(res["ok"])
+    self.assertTrue(res["cq_failed"])
+    self.assertTrue(res["cq_sync_rebase_needed"])
+    self.assertEqual(res["cq_status"], "🔴 Rebase needed (Google testing conflict)")
+    self.assertEqual(len(res["failed_check_details"]), 2)
+    by_name = {d["name"]: d for d in res["failed_check_details"]}
+    self.assertEqual(by_name["Google testing"]["kind"], "rebase_conflict")
+    self.assertIn("Merge conflicts", by_name["Google testing"]["snippet"])
+    self.assertTrue(by_name["Linux customer_testing"]["unrelated"])
+    self.assertIn(
+        "flame: text_element_component_test.dart",
+        by_name["Linux customer_testing"]["snippet"],
+    )
+    self.assertIn("Rebase PR onto master", res["cq_advice"])
+
   def test_script_changed_on_disk_validates_mtime_and_syntax(self):
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", delete=False

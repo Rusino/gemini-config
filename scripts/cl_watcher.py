@@ -3070,6 +3070,22 @@ def _same_commit(a: str, b: str) -> bool:
   return bool(a) and bool(b) and (a.startswith(b[:10]) or b.startswith(a[:10]))
 
 
+_GARDENER_INFRA_CLASSIFICATIONS = frozenset({
+    "SWARMING_NO_RESOURCE",
+    "SWARMING_TIMED_OUT",
+    "SWARMING_BOT_DIED",
+    "SWARMING_CANCELED",
+    "SWARMING_EXPIRED",
+    "SWARMING_KILLED",
+    "RECIPE_INFRA_FAILURE",
+    "BAZEL_REPO_FETCH_FAILURE",
+    "DUT_SSH_SCP_FAILURE",
+    "IOS_DEVICE_LAUNCH_FAILURE",
+    "WINDOWS_EVENTLOG_OS_CRASH",
+    "X11_DISPLAY_UNAVAILABLE",
+})
+
+
 def classify_incident_for_commit(
     inc: dict[str, Any], merged_sha: str
 ) -> dict[str, Any] | None:
@@ -3087,9 +3103,24 @@ def classify_incident_for_commit(
   )
   if not is_culprit and not in_blamelist:
     return None
-  affected = inc.get("affected_tasks") or []
-  is_flake = bool(inc.get("is_intermittent_flake")) or any(
-      a.get("is_intermittent_flake") for a in affected
+  affected = [a for a in (inc.get("affected_tasks") or []) if isinstance(a, dict)]
+  crash_low = str(blame.get("crash_analysis") or "").lower()
+  # Treat Gardener-verified host/device mishaps and pre-cleared episodes as non-culprit flakes
+  all_infra_or_cleared = bool(affected) and all(
+      str(a.get("classification") or "") in _GARDENER_INFRA_CLASSIFICATIONS
+      or bool(a.get("flake_cleared_by_rev") or a.get("flake_cleared_by_task_id"))
+      for a in affected
+  )
+  crash_clears_regression = (
+      "not a code regression" in crash_low
+      or "infrastructure/host-level mishaps" in crash_low
+      or "infrastructure/host mishap" in crash_low
+  )
+  is_flake = (
+      bool(inc.get("is_intermittent_flake"))
+      or any(a.get("is_intermittent_flake") for a in affected)
+      or all_infra_or_cleared
+      or crash_clears_regression
   )
   is_compile = any(
       str(a.get("classification")) in ("COMPILE_ERROR", "COMPILE_FAILURE")
@@ -4105,17 +4136,108 @@ def _extract_gerrit_last_message(
 
 
 _SKIA_CQ_SYNC_CACHE: dict[tuple[str, int], bool] = {}
+_SKIA_CQ_DIAG_CACHE: dict[tuple[str, int], tuple[list[dict[str, Any]], str]] = {}
 _SKIA_CQ_SYNC_LOCK = threading.Lock()
 
 
-def check_skia_cq_sync_infra_failure(cl_id: str, ps_num: int) -> bool:
-  """Returns True when Skia tryjobs on (cl_id, ps_num) failed solely on pre-task sync/rebase"""
+def extract_luci_failure_snippet(builder_name: str, summary_md: str) -> str:
+  """Extracts a concise 1-line failure reason from a Buildbucket summaryMarkdown block"""
+  raw = str(summary_md or "").strip()
+  if not raw:
+    return ""
+  low = raw.lower()
+  if "merge conflicts detected" in low or "not mergeable" in low:
+    return "Merge conflicts with g3 HEAD — rebase needed"
+  if "failed to start job: syncing" in low and "gclient.py sync" in low:
+    return "Pre-task gclient sync failed applying patchset — rebase needed"
+  lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+  for idx, ln in enumerate(lines):
+    if ln.lower().startswith("failing tests:"):
+      for nxt in lines[idx + 1 : idx + 5]:
+        cleaned = nxt.lstrip("-*` ").rstrip("` ").strip()
+        if not cleaned:
+          continue
+        # Compress customer_testing paths to `<package>: <test_file>` for scannability
+        if "/customer_testing/tests/" in cleaned:
+          tail = cleaned.split("/customer_testing/tests/", 1)[1]
+          pkg = tail.split("/", 1)[0]
+          base = cleaned.rsplit("/", 1)[-1]
+          return f"Failing test: {pkg}: {base}"[:140]
+        parts = [p for p in cleaned.split("/") if p]
+        short_path = "/".join(parts[-2:]) if len(parts) >= 2 else cleaned
+        return f"Failing test: {short_path}"[:140]
+  for ln in lines:
+    if ln.lower().startswith("error: one or more tests from"):
+      return re.sub(r"\s+", " ", ln)[:140]
+  # Strip markdown links and HTML line breaks from the first informative summary line
+  first = re.sub(r"<br\s*/?>", " ", lines[0], flags=re.IGNORECASE)
+  first = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", first)
+  first = re.sub(r"\s+", " ", first).strip()
+  if first.lower() == str(builder_name or "").lower():
+    return ""
+  return first[:140]
+
+
+def classify_check_unrelated_to_files(
+    check_name: str, snippet: str, status: str, files: Sequence[str] = ()
+) -> tuple[bool, str]:
+  """Identifies check failures outside the subsystem touched by the CL/PR's changed files"""
+  low_name = str(check_name or "").lower()
+  low_snip = str(snippet or "").lower()
+  up_status = str(status or "").upper()
+  if up_status == "INFRA_FAILURE":
+    if any(k in low_snip for k in ("sync", "mergeable", "merge conflict", "rebase")):
+      return False, ""
+    return True, "infra failure"
+  norm_files = [str(f).strip().lstrip("/") for f in (files or []) if str(f).strip()]
+  if not norm_files:
+    return False, ""
+  only_web_ui = all(
+      f.startswith(("engine/src/flutter/lib/web_ui/", "lib/web_ui/")) for f in norm_files
+  )
+  if only_web_ui:
+    if "customer_testing" in low_name or "flame:" in low_snip:
+      return True, "external customer_testing package; PR only touches web_ui"
+    non_web_tokens = (
+        "android_emu",
+        "pixel_",
+        "_ios",
+        "mac_android",
+        "linux_android",
+        "windows_android",
+        "fuchsia",
+        "impeller",
+    )
+    if any(tok in low_name for tok in non_web_tokens) and "web" not in low_name:
+      return True, "non-web target; PR only touches web_ui"
+  only_skp = all(
+      f.startswith(("modules/skparagraph/", "modules/skunicode/", "modules/skshaper/"))
+      for f in norm_files
+  )
+  if only_skp:
+    non_skp_tokens = ("golinter", "bazel", "canvaskit", "android_framework", "dawn")
+    if any(tok in low_name for tok in non_skp_tokens) and "paragraph" not in low_snip:
+      return True, "unrelated to SkParagraph/SkUnicode files"
+  return False, ""
+
+
+def fetch_skia_cq_failure_details(
+    cl_id: str, ps_num: int, files: Sequence[str] = ()
+) -> tuple[bool, list[dict[str, Any]], str]:
+  """Fetches Buildbucket failure details and sync-conflict status for a Skia Gerrit patchset"""
   if not str(cl_id).isdigit() or ps_num <= 0:
-    return False
+    return False, [], ""
   cache_key = (str(cl_id), int(ps_num))
   with _SKIA_CQ_SYNC_LOCK:
     if cache_key in _SKIA_CQ_SYNC_CACHE:
-      return _SKIA_CQ_SYNC_CACHE[cache_key]
+      sync_val = _SKIA_CQ_SYNC_CACHE[cache_key]
+      cached_diag = _SKIA_CQ_DIAG_CACHE.get(cache_key, ([], ""))
+      adv = cached_diag[1] or (
+          "Rebase CL onto main (SkCQ pre-task sync failed applying patchset)"
+          if sync_val
+          else ""
+      )
+      return sync_val, list(cached_diag[0]), adv
   payload = json.dumps({
       "predicate": {
           "gerritChanges": [{
@@ -4126,7 +4248,7 @@ def check_skia_cq_sync_infra_failure(cl_id: str, ps_num: int) -> bool:
           }]
       },
       "pageSize": 25,
-      "fields": "builds.*.status,builds.*.summaryMarkdown",
+      "fields": "builds.*.id,builds.*.builder.builder,builds.*.status,builds.*.summaryMarkdown",
   }).encode("utf-8")
   req = urllib.request.Request(
       "https://cr-buildbucket.appspot.com/prpc/buildbucket.v2.Builds/SearchBuilds",
@@ -4144,42 +4266,81 @@ def check_skia_cq_sync_infra_failure(cl_id: str, ps_num: int) -> bool:
     if raw.startswith(")]}'"):
       raw = raw[4:].strip()
     if not raw:
-      return False
+      return False, [], ""
     data = json.loads(raw)
   except (OSError, TimeoutError, ValueError, http.client.HTTPException):
-    return False
+    return False, [], ""
   if not isinstance(data, dict):
-    return False
+    return False, [], ""
   builds = data.get("builds")
   if not isinstance(builds, list) or not builds:
-    return False
+    return False, [], ""
   has_sync_infra = False
+  has_failure = False
   has_pending = False
+  details: list[dict[str, Any]] = []
   for b in builds:
     if not isinstance(b, dict):
       continue
     st = str(b.get("status") or "")
-    # Any real compile/test FAILURE takes precedence over pre-task sync infra errors
+    bname = str(((b.get("builder") or {}).get("builder")) or "SkCQ tryjob")
+    bid = str(b.get("id") or "")
+    burl = f"https://ci.chromium.org/b/{bid}" if bid else ""
+    raw_md = str(b.get("summaryMarkdown") or b.get("summary_markdown") or "")
+    low = raw_md.lower()
     if st == "FAILURE":
-      with _SKIA_CQ_SYNC_LOCK:
-        if len(_SKIA_CQ_SYNC_CACHE) >= 512:
-          _SKIA_CQ_SYNC_CACHE.clear()
-        _SKIA_CQ_SYNC_CACHE[cache_key] = False
-      return False
-    if st in ("SCHEDULED", "STARTED"):
+      has_failure = True
+      snip = extract_luci_failure_snippet(bname, raw_md)
+      unrel, reason = classify_check_unrelated_to_files(bname, snip, st, files)
+      details.append({
+          "name": bname,
+          "url": burl,
+          "kind": "test_failure",
+          "summary": snip,
+          "unrelated": unrel,
+          "reason": reason,
+      })
+    elif st in ("SCHEDULED", "STARTED"):
       has_pending = True
     elif st == "INFRA_FAILURE":
-      low = str(b.get("summaryMarkdown") or b.get("summary_markdown") or "").lower()
-      if "not mergeable" in low or (
+      is_sync = "not mergeable" in low or (
           "failed to start job: syncing" in low and "gclient.py sync" in low
-      ):
+      )
+      if is_sync:
         has_sync_infra = True
-  if not has_pending:
+      snip = extract_luci_failure_snippet(bname, raw_md)
+      unrel, reason = classify_check_unrelated_to_files(bname, snip, st, files)
+      details.append({
+          "name": bname,
+          "url": burl,
+          "kind": "rebase_conflict" if is_sync else "infra_failure",
+          "summary": snip,
+          "unrelated": unrel,
+          "reason": reason,
+      })
+  # Any real compile/test FAILURE takes precedence over pre-task sync infra errors
+  sync_only = has_sync_infra and not has_failure
+  if sync_only:
+    advice = "Rebase CL onto main (SkCQ pre-task sync failed applying patchset)"
+  elif details and all(d.get("unrelated") for d in details):
+    advice = "Infra or unrelated tryjob failure — re-run CQ dry run or rebase"
+  elif details:
+    advice = "Inspect failing tryjob(s) or click Diagnose & fix"
+  else:
+    advice = ""
+  if not has_pending or has_failure:
     with _SKIA_CQ_SYNC_LOCK:
       if len(_SKIA_CQ_SYNC_CACHE) >= 512:
         _SKIA_CQ_SYNC_CACHE.clear()
-      _SKIA_CQ_SYNC_CACHE[cache_key] = has_sync_infra
-  return has_sync_infra
+        _SKIA_CQ_DIAG_CACHE.clear()
+      _SKIA_CQ_SYNC_CACHE[cache_key] = sync_only
+      _SKIA_CQ_DIAG_CACHE[cache_key] = (list(details), advice)
+  return sync_only, details, advice
+
+
+def check_skia_cq_sync_infra_failure(cl_id: str, ps_num: int) -> bool:
+  """Returns True when Skia tryjobs on (cl_id, ps_num) failed solely on pre-task sync/rebase"""
+  return fetch_skia_cq_failure_details(cl_id, ps_num)[0]
 
 
 def fetch_gerrit_cl_status(
@@ -4581,6 +4742,8 @@ def fetch_gerrit_cl_status(
 
       cq_failed = False
       cq_sync_rebase_needed = False
+      failed_check_details: list[dict[str, Any]] = []
+      cq_advice = ""
       cq_status = "Idle"
       cq_msg_date = ""
       if max_cq == 2:
@@ -4608,9 +4771,27 @@ def fetch_gerrit_cl_status(
           cq_msg_date = str(m.get("date") or "")
           break
       if cq_failed and host == GERRIT_SKIA_HOST and status == "NEW":
-        cq_sync_rebase_needed = check_skia_cq_sync_infra_failure(cl_id, ps_num)
+        cq_sync_rebase_needed, failed_check_details, cq_advice = (
+            fetch_skia_cq_failure_details(cl_id, ps_num, files)
+        )
         if cq_sync_rebase_needed:
           cq_status = "🔴 CQ Sync Failed (Rebase)"
+      # Dry-run completion or author uploads keep the owner in attention_set while awaiting CR+1
+      if (
+          is_self
+          and in_my_attention
+          and missing_approvals > 0
+          and min_cr >= 0
+          and not cq_failed
+          and thread_stats["open_external_threads"] == 0
+          and (
+              "dry run succeeded" in attention_reason.lower()
+              or last_msg_author in SELF_EMAILS
+              or last_msg_author == "bot"
+              or last_msg_author.endswith(".gserviceaccount.com")
+          )
+      ):
+        in_my_attention = False
 
       # External authors cannot add a 2nd Googler or vote CQ+2 without Googler sponsor action
       sponsor_action = ""
@@ -4873,6 +5054,8 @@ def fetch_gerrit_cl_status(
           "cq_status": cq_status,
           "cq_failed": cq_failed,
           "cq_sync_rebase_needed": cq_sync_rebase_needed,
+          "failed_check_details": failed_check_details,
+          "cq_advice": cq_advice,
           "attention_reason": attention_reason,
           "self_review_state": self_review_state,
           "self_review_ps": self_review_ps,
@@ -5098,6 +5281,192 @@ def partition_github_failed_checks(
   return own_failed, tree_failed
 
 
+_GH_CHECK_DETAILS_CACHE: dict[str, tuple[bool, list[dict[str, Any]], str]] = {}
+_GH_CHECK_DETAILS_LOCK = threading.Lock()
+
+
+def fetch_github_failed_check_details(
+    pr_id: str,
+    head_sha: str,
+    own_failed_checks: Sequence[str],
+    files: Sequence[str] = (),
+    rollup_checks: Sequence[dict[str, Any]] = (),
+    repo_slug: str = "flutter/flutter",
+) -> tuple[bool, list[dict[str, Any]], str]:
+  """Fetches check-run output and Buildbucket test failure snippets for failing GitHub PR checks"""
+  sha = str(head_sha or "").strip()
+  failed_names = [str(c).strip() for c in (own_failed_checks or []) if str(c).strip()]
+  if not sha or not failed_names:
+    return False, [], ""
+  cache_key = f"{repo_slug}:{pr_id}:{sha}:{','.join(sorted(failed_names))}"
+  with _GH_CHECK_DETAILS_LOCK:
+    if cache_key in _GH_CHECK_DETAILS_CACHE:
+      cached = _GH_CHECK_DETAILS_CACHE[cache_key]
+      return cached[0], list(cached[1]), cached[2]
+
+  eff_repo = str(repo_slug or "").strip() or "flutter/flutter"
+  if eff_repo.startswith("github.com/"):
+    eff_repo = eff_repo[len("github.com/") :]
+
+  # Map rollup entries by name/context so legacy status contexts still expose description/targetUrl
+  rollup_by_name: dict[str, dict[str, Any]] = {}
+  for rc in rollup_checks or []:
+    if not isinstance(rc, dict):
+      continue
+    rname = str(rc.get("name") or rc.get("context") or "").strip()
+    if rname and rname not in rollup_by_name:
+      rollup_by_name[rname] = rc
+
+  # Query GitHub check-runs for output.title / output.summary (where Google testing reports conflicts)
+  gh_runs_by_name: dict[str, dict[str, Any]] = {}
+  try:
+    out = subprocess.check_output(
+        [
+            "gh",
+            "api",
+            f"repos/{eff_repo}/commits/{sha}/check-runs?per_page=100",
+        ],
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=8,
+    )
+    runs_data = json.loads(out)
+    for cr in (runs_data.get("check_runs") or []) if isinstance(runs_data, dict) else []:
+      if not isinstance(cr, dict):
+        continue
+      cname = str(cr.get("name") or "").strip()
+      if cname and cname not in gh_runs_by_name:
+        gh_runs_by_name[cname] = cr
+  except (OSError, subprocess.SubprocessError, ValueError):
+    pass
+
+  # Query Buildbucket for Luci subjobs on Flutter PR commits to extract failing test names
+  bb_by_name: dict[str, dict[str, Any]] = {}
+  if eff_repo.lower() == "flutter/flutter":
+    payload = json.dumps({
+        "predicate": {
+            "tags": [{"key": "buildset", "value": f"sha/git/{sha}"}],
+        },
+        "pageSize": 100,
+        "fields": "builds.*.id,builds.*.builder.builder,builds.*.status,builds.*.summaryMarkdown",
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://cr-buildbucket.appspot.com/prpc/buildbucket.v2.Builds/SearchBuilds",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "CLFlightDeck/1.0",
+        },
+        method="POST",
+    )
+    try:
+      with urllib.request.urlopen(req, timeout=6) as resp:
+        raw = resp.read().decode("utf-8", errors="replace").strip()
+      if raw.startswith(")]}'"):
+        raw = raw[4:].strip()
+      bb_data = json.loads(raw) if raw else {}
+      for b in (bb_data.get("builds") or []) if isinstance(bb_data, dict) else []:
+        if not isinstance(b, dict):
+          continue
+        bname = str(((b.get("builder") or {}).get("builder")) or "").strip()
+        if bname and bname not in bb_by_name:
+          bb_by_name[bname] = b
+    except (OSError, TimeoutError, ValueError, http.client.HTTPException):
+      pass
+
+  details: list[dict[str, Any]] = []
+  has_rebase_conflict = False
+  for name in failed_names:
+    bb = bb_by_name.get(name)
+    cr = gh_runs_by_name.get(name)
+    rc = rollup_by_name.get(name) or {}
+    url = ""
+    raw_summary = ""
+    status = "FAILURE"
+    if isinstance(bb, dict):
+      bid = str(bb.get("id") or "")
+      url = f"https://ci.chromium.org/b/{bid}" if bid else ""
+      raw_summary = str(bb.get("summaryMarkdown") or bb.get("summary_markdown") or "")
+      status = str(bb.get("status") or "FAILURE")
+    if isinstance(cr, dict):
+      if not url:
+        url = str(cr.get("details_url") or cr.get("html_url") or "")
+      out_obj = cr.get("output") if isinstance(cr.get("output"), dict) else {}
+      cr_title = str(out_obj.get("title") or "").strip()
+      cr_sum = str(out_obj.get("summary") or "").strip()
+      if not raw_summary:
+        raw_summary = f"{cr_title}\n{cr_sum}".strip()
+    if not url:
+      url = str(rc.get("detailsUrl") or rc.get("targetUrl") or "")
+    if not raw_summary:
+      raw_summary = str(rc.get("description") or "")
+
+    snip = extract_luci_failure_snippet(name, raw_summary)
+    low_comb = f"{name} {raw_summary} {snip}".lower()
+    if "merge conflicts detected" in low_comb or "not mergeable" in low_comb:
+      has_rebase_conflict = True
+      kind = "rebase_conflict"
+      unrel, reason = False, ""
+      if not snip:
+        snip = "Merge conflicts with g3 HEAD — rebase needed"
+    else:
+      unrel, reason = classify_check_unrelated_to_files(name, snip, status, files)
+      kind = "unrelated_failure" if unrel else "test_failure"
+    details.append({
+        "name": name,
+        "status": status,
+        "kind": kind,
+        "snippet": snip,
+        "unrelated": unrel,
+        "unrelated_reason": reason,
+        "url": url,
+    })
+
+  # Auto-enable 🔧 Rebase when Google testing reports a merge conflict and any other failures are unrelated
+  cq_sync_rebase_needed = bool(
+      has_rebase_conflict
+      and details
+      and all(d.get("kind") == "rebase_conflict" or d.get("unrelated") for d in details)
+  )
+  rel_test_fails = [
+      d for d in details if d.get("kind") != "rebase_conflict" and not d.get("unrelated")
+  ]
+  unrel_fails = [d for d in details if d.get("unrelated")]
+  if cq_sync_rebase_needed:
+    if unrel_fails:
+      u_names = ", ".join(str(d["name"]) for d in unrel_fails[:2])
+      u_why = str(unrel_fails[0].get("unrelated_reason") or "unrelated to changed files")
+      advice = (
+          f"Rebase PR onto master to resolve Google testing merge conflict "
+          f"({u_names}: {u_why})"
+      )
+    else:
+      advice = "Rebase PR onto master to resolve Google testing merge conflict"
+  elif has_rebase_conflict and rel_test_fails:
+    r_names = ", ".join(str(d["name"]) for d in rel_test_fails[:2])
+    advice = f"Rebase PR onto master (Google testing conflict) and inspect {r_names}"
+  elif not rel_test_fails and unrel_fails:
+    u_names = ", ".join(str(d["name"]) for d in unrel_fails[:2])
+    u_why = str(unrel_fails[0].get("unrelated_reason") or "unrelated to changed files")
+    advice = f"Failing check ({u_names}) appears unrelated ({u_why}) — safe to retry or ignore"
+  elif len(rel_test_fails) == 1:
+    d0 = rel_test_fails[0]
+    snip0 = str(d0.get("snippet") or "")
+    advice = (
+        f"Inspect {d0['name']} ({snip0})" if snip0 else f"Inspect failing check {d0['name']}"
+    )
+  elif rel_test_fails:
+    names = ", ".join(str(d["name"]) for d in rel_test_fails[:2])
+    advice = f"Inspect {len(rel_test_fails)} failing checks ({names})"
+  else:
+    advice = ""
+
+  with _GH_CHECK_DETAILS_LOCK:
+    _GH_CHECK_DETAILS_CACHE[cache_key] = (cq_sync_rebase_needed, list(details), advice)
+  return cq_sync_rebase_needed, details, advice
+
+
 def fetch_github_pr_status(
     pr_id: str, repo_slug: str = "flutter/flutter"
 ) -> dict[str, Any]:
@@ -5286,9 +5655,32 @@ def fetch_github_pr_status(
         )
     )
 
+    pr_files = sorted(
+        str(f.get("path") or "").strip()
+        for f in (d.get("files") or [])
+        if isinstance(f, dict) and f.get("path")
+    )
+    cq_sync_rebase_needed = False
+    failed_check_details: list[dict[str, Any]] = []
+    cq_advice = ""
+    if own_failed_checks:
+      cq_sync_rebase_needed, failed_check_details, cq_advice = (
+          fetch_github_failed_check_details(
+              str(pr_id),
+              head_sha,
+              own_failed_checks,
+              files=pr_files,
+              rollup_checks=checks,
+              repo_slug=eff_repo,
+          )
+      )
+
     # Only PR-specific failures count as red CQ; tree-broken checks show a tree badge
     if own_failed_checks:
-      cq_status = f"🔴 {len(own_failed_checks)} check(s) failed"
+      if cq_sync_rebase_needed:
+        cq_status = "🔴 Rebase needed (Google testing conflict)"
+      else:
+        cq_status = f"🔴 {len(own_failed_checks)} check(s) failed"
     elif tree_failed_checks:
       if len(tree_failed_checks) == 1:
         cq_status = f"🌲 Tree broken ({tree_failed_checks[0]})"
@@ -5647,11 +6039,7 @@ def fetch_github_pr_status(
         "patchset": len(reviews) + 1,
         "revision": head_sha[:10],
         # Expose changed PR paths so triage_store detects lib/web_ui/lib/ corpus gates
-        "files": sorted(
-            str(f.get("path") or "").strip()
-            for f in (d.get("files") or [])
-            if isinstance(f, dict) and f.get("path")
-        ),
+        "files": pr_files,
         # Expose PR description text under commit_message for shared fix-for extractors
         "commit_message": str(d.get("body") or ""),
         # Combine optional closingIssuesReferences with free-text Bug:/Fixes references
@@ -5696,6 +6084,9 @@ def fetch_github_pr_status(
         "tree_failed_checks": tree_failed_checks,
         "tree_red": tree_red,
         "merge_conflict": merge_conflict,
+        "cq_sync_rebase_needed": cq_sync_rebase_needed,
+        "failed_check_details": failed_check_details,
+        "cq_advice": cq_advice,
         # Only my own PRs list reviewers blocking submission
         "waiting_on": (
             [
@@ -6829,7 +7220,7 @@ def rebase_item(item_key: str) -> dict[str, Any]:
     return {"ok": False, "error": f"Cannot rebase non-self change {ikey}"}
   if rec.get("status") not in ("NEW", "OPEN"):
     return {"ok": False, "error": f"Change {ikey} is not open"}
-  if not rec.get("merge_conflict"):
+  if not (rec.get("merge_conflict") or rec.get("cq_sync_rebase_needed")):
     return {"ok": False, "error": f"Change {ikey} has no merge conflict"}
 
   prompt = _build_rebase_prompt(rec)
@@ -6923,6 +7314,168 @@ def rebase_item(item_key: str) -> dict[str, Any]:
           "critical": False,
           "message": (
               f"[FLIGHT-DECK] 🔧 Dispatched rebase task for {ikey} "
+              f"('{rec.get('subject') or ikey}') to chat {target_cid[:8]}."
+          ),
+      },
+  )
+  state["events"] = events[:50]
+  save_watcher_state(state)
+  return res
+
+
+def _build_diagnose_checks_prompt(rec: dict[str, Any]) -> str:
+  """Builds the check-failure triage and repair prompt sent to the CL/PR's owning chat"""
+  url = str(rec.get("url") or rec.get("item_key") or "")
+  subj = str(rec.get("subject") or url)
+  details = [
+      d for d in (rec.get("failed_check_details") or []) if isinstance(d, dict)
+  ]
+  lines: list[str] = []
+  for d in details[:6]:
+    name = str(d.get("name") or "check")
+    snip = str(d.get("snippet") or "")
+    unrel = str(d.get("unrelated_reason") or "")
+    durl = str(d.get("url") or "")
+    item_str = f"- {name}"
+    if snip:
+      item_str += f": {snip}"
+    if unrel:
+      item_str += f" [{unrel}]"
+    if durl:
+      item_str += f" ({durl})"
+    lines.append(item_str)
+  if not lines:
+    for c in (rec.get("own_failed_checks") or [])[:6]:
+      lines.append(f"- {c}")
+  summary_block = "\n".join(lines) if lines else "- (no parsed check details)"
+  advice = str(rec.get("cq_advice") or "").strip()
+  advice_line = f"\nПредварительный диагноз Flight Deck: {advice}\n" if advice else "\n"
+  if rec.get("kind") == "github":
+    return (
+        f"[FLIGHT-DECK DIAGNOSE CHECKS] В {url} ('{subj}') упали проверки:\n"
+        f"{summary_block}{advice_line}"
+        "Разбери логи упавших проверок, определи корневую причину (регрессия от PR, "
+        "конфликт при синке с g3/master или сторонний/инфра-флейк), воспроизведи локально "
+        "при необходимости и предложи/примени точечное исправление (не мержи PR и не "
+        "включай auto-merge без подтверждения)."
+    )
+  ps = int(rec.get("patchset") or 1)
+  return (
+      f"[FLIGHT-DECK DIAGNOSE CHECKS] В {url} ('{subj}', PS{ps}) упали боты CQ/tryjobs:\n"
+      f"{summary_block}{advice_line}"
+      "Разбери логи упавших тасок, определи корневую причину (регрессия от CL, конфликт "
+      "при gclient sync или сторонний/инфра-флейк), воспроизведи локально при необходимости "
+      "и предложи/примени точечное исправление (никогда не ставь CQ+1, CQ+2 или Auto-Submit+1)."
+  )
+
+
+def diagnose_checks_item(item_key: str) -> dict[str, Any]:
+  """Wakes (or starts) the chat owning a CL/PR with failing checks to diagnose and fix them"""
+  ikey = str(item_key or "").strip()
+  if not ikey:
+    return {"ok": False, "error": "Missing item_key"}
+
+  state = load_watcher_state()
+  items: dict[str, Any] = state.setdefault("items", {})
+  events: list[dict[str, Any]] = state.setdefault("events", [])
+  matched_key, rec = _lookup_state_item(items, ikey)
+  if not isinstance(rec, dict):
+    return {"ok": False, "error": f"Unknown item {ikey}"}
+  if rec.get("status") not in ("NEW", "OPEN"):
+    return {"ok": False, "error": f"Change {ikey} is not open"}
+  if not (rec.get("cq_failed") or rec.get("phase") == "ALERT_CQ_FAILED"):
+    return {"ok": False, "error": f"Change {ikey} has no failing checks"}
+
+  prompt = _build_diagnose_checks_prompt(rec)
+  cid = str(rec.get("conversation_id") or "").strip()
+  is_arch: bool | None = None
+  comp_to = ""
+  if not cid:
+    disc_cid, disc_arch, comp_to = _discover_existing_chat_for_item(ikey, rec)
+    if disc_cid:
+      cid = disc_cid
+      is_arch = True if disc_arch else False
+
+  if cid:
+    chain = cl.discover_conversation_chain(cid, include_descendants=True)
+    target_cid = chain[-1] if chain else cid
+    summaries = cl._fetch_ls_summaries_for_audit() or {}
+    s = summaries.get(target_cid)
+    now_ts = time.time()
+    in_grace = any(
+        isinstance(it, dict)
+        and it.get("conversation_id") == target_cid
+        and now_ts - float(it.get("chat_woken_ts") or 0.0) < CHAT_WAKE_GRACE_SEC
+        for it in items.values()
+    )
+    ls_busy = False
+    target_arch = False if target_cid != cid else is_arch
+    if isinstance(s, dict):
+      ann = s.get("annotations") or {}
+      target_arch = bool(ann.get("archived"))
+      title = str(
+          ann.get("title") or s.get("summary") or rec.get("title") or ""
+      ).strip()
+      ls_busy = is_chat_busy(s, "" if target_arch else title)
+    if ls_busy or in_grace:
+      _rekey_state_item_chat(
+          items,
+          ikey,
+          matched_key,
+          rec,
+          target_cid,
+          chat_archived=target_arch,
+          companion_to=comp_to,
+      )
+      rec["chat_busy"] = True
+      save_watcher_state(state)
+      return {
+          "ok": True,
+          "already_busy": True,
+          "conversation_id": target_cid,
+          "chat_url": f"{jetski_box_url()}/c/{target_cid}",
+      }
+
+    if not wake_conversation(target_cid, prompt):
+      return {"ok": False, "error": f"Failed to wake conversation {target_cid}"}
+
+    _rekey_state_item_chat(
+        items,
+        ikey,
+        matched_key,
+        rec,
+        target_cid,
+        chat_archived=target_arch,
+        companion_to=comp_to,
+    )
+    rec["chat_busy"] = True
+    rec["chat_woken_ts"] = time.time()
+    rec["chat_last_modified"] = datetime.now(timezone.utc).isoformat()
+    res: dict[str, Any] = {
+        "ok": True,
+        "woken": True,
+        "conversation_id": target_cid,
+        "chat_url": f"{jetski_box_url()}/c/{target_cid}",
+    }
+  else:
+    res = _start_pinned_chat_for_record(items, ikey, matched_key, rec, prompt)
+    if not res.get("ok"):
+      return res
+    target_cid = str(res["conversation_id"])
+
+  tid = str(rec.get("target_id") or ikey)
+  events.insert(
+      0,
+      {
+          "id": f"ev-{int(time.time() * 1000)}-{tid}",
+          "time": now_et_str(),
+          "item_key": ikey,
+          "target_id": tid,
+          "conversation_id": target_cid,
+          "project_name": str(rec.get("project_name") or "Unassigned"),
+          "critical": False,
+          "message": (
+              f"[FLIGHT-DECK] 🔍 Dispatched check-failure diagnosis for {ikey} "
               f"('{rec.get('subject') or ikey}') to chat {target_cid[:8]}."
           ),
       },
@@ -14063,8 +14616,9 @@ function itemCoreSig(it) {
     s(it.status), s(it.phase), b(it.in_my_attention), b(it.cq_failed), b(it.is_self),
     b(it.is_draft), b(it.in_development), b(it.is_wip), b(it.is_watching),
     b(it.reviewer_removed), s(it.role), shortActor(it.last_msg_author, it),
+    s(it.attention_reason), n(it.open_external_threads),
     s(it.companion_to), b(it.is_companion), b(it.ready_to_abandon), b(it.merge_conflict),
-    s(it.cq_status), n(it.approved_count), n(it.missing_approvals),
+    b(it.cq_sync_rebase_needed), s(it.cq_status), n(it.approved_count), n(it.missing_approvals),
     n(it.missing_reviewers_to_assign), b(it.tree_red), b(it.has_active_merges), isOldMerged,
     psPending, s(it.sponsor_action), b(it.self_approved), s(it.self_review_state),
     n(it.self_cr_vote), b(it.chat_busy), b(it.conversation_id), s(it.stack_root_ikey),
@@ -15036,11 +15590,15 @@ function formatStatusTime(it, fallbackEt, fallbackAge) {
 function needsMyReply(it) {
   // Reuse backend needs_my_reply predicate when item state is fresh
   if (hasFreshEntityState(it)) return Boolean(it.entity_state.needs_my_reply);
+  const attReason = String(it.attention_reason || '').toLowerCase();
   return Boolean(it.in_my_attention) && it.phase !== 'ALERT_CQ_FAILED' &&
     !(it.cq_failed && it.is_self) &&
     it.phase !== 'SUBMITTING' && !it.is_draft && !it.in_development &&
     // On my own CL a dry-run bot note keeps me in attention_set without asking a question
-    !(it.is_self && shortActor(it.last_msg_author) === 'SkCQ');
+    !(it.is_self && (shortActor(it.last_msg_author) === 'SkCQ' ||
+      (attReason.includes('dry run succeeded') &&
+        Number(it.missing_approvals || 0) > 0 &&
+        Number(it.open_external_threads || 0) === 0)));
 }
 
 function isAlert(it) {
@@ -15515,7 +16073,7 @@ function canRebase(it) {
   // Reuse backend can_rebase check when item state is fresh
   if (hasFreshEntityState(it)) return Boolean(it.entity_state.can_rebase);
   if (isCompanion(it)) return false;
-  return Boolean(it.merge_conflict && it.is_self) &&
+  return Boolean((it.merge_conflict || it.cq_sync_rebase_needed) && it.is_self) &&
     (it.status === 'NEW' || it.status === 'OPEN') && Boolean(it.item_key);
 }
 
@@ -15526,6 +16084,39 @@ function rebaseActionHtml(it, cls) {
   const dis = it.chat_busy ? ' disabled title="Chat is already working"' : '';
   return `<button class="${btnCls}"${dis} ` +
     `onclick="rebaseItem(${esc(JSON.stringify(it.item_key))}, this)">🔧 Rebase</button>`;
+}
+
+function diagnoseChecksActionHtml(it, cls) {
+  if (!it || (it.status !== 'NEW' && it.status !== 'OPEN') || !it.item_key) return '';
+  if (!(it.cq_failed || it.phase === 'ALERT_CQ_FAILED') || canRebase(it)) return '';
+  const btnCls = cls || 'btn primary';
+  const dis = it.chat_busy ? ' disabled title="Chat is already working"' : '';
+  return `<button class="${btnCls}"${dis} ` +
+    `onclick="diagnoseChecksItem(${esc(JSON.stringify(it.item_key))}, this)">` +
+    `🔍 Diagnose &amp; fix</button>`;
+}
+
+function cqFailureDiagnosisHtml(it) {
+  const details = Array.isArray(it && it.failed_check_details) ? it.failed_check_details : [];
+  const advice = String((it && it.cq_advice) || '').trim();
+  if (!details.length && !advice) return '';
+  const rows = details.slice(0, 4).map(d => {
+    const name = esc(d.name || 'check');
+    const nameHtml = d.url ? link(d.url, name) : `<b>${name}</b>`;
+    const snip = d.snippet ? ` — ${esc(d.snippet)}` : '';
+    let badge = '';
+    if (d.kind === 'rebase_conflict') {
+      badge = ' <span class="badge warn">rebase needed</span>';
+    } else if (d.unrelated) {
+      const uWhy = d.unrelated_reason ? `: ${esc(d.unrelated_reason)}` : '';
+      badge = ` <span class="badge">unrelated${uWhy}</span>`;
+    }
+    return `<div class="why-context">• ${nameHtml}${snip}${badge}</div>`;
+  }).join('');
+  const advHtml = advice
+    ? `<div class="why-context"><b>Recommended:</b> ${esc(advice)}</div>`
+    : '';
+  return `${rows}${advHtml}`;
 }
 
 function findItemByKey(key) {
@@ -16900,7 +17491,7 @@ function focusCard(it, data) {
       adviceText = ps.recommended_action;
     }
     const adviceHtml = adviceText
-      ? `<div class="why-context"><b>Recommended:</b> ${esc(adviceText)}</div>`
+      ? ` <div class="why-context"><b>Recommended:</b> ${esc(adviceText)}</div>`
       : '';
     const whyContent = fixPrimary
       ? `${fixPrimary}<div class="why-context">${landed}${blame}</div>${adviceHtml}`
@@ -16921,7 +17512,11 @@ function focusCard(it, data) {
     </article>`;
   }
   const kindWord = it.kind === 'github' ? 'PR' : 'CL';
-  const conflictNote = it.is_self ? 'Merge conflict: rebase needed' : 'Merge conflict';
+  const conflictNote = (it.cq_sync_rebase_needed && !it.merge_conflict)
+    ? (it.kind === 'github'
+        ? 'Google testing merge conflict: rebase needed'
+        : 'SkCQ sync failed applying patchset: rebase needed')
+    : (it.is_self ? 'Merge conflict: rebase needed' : 'Merge conflict');
   let why;
   let actions;
   if (isCompanion(it) && it.ready_to_abandon) {
@@ -16945,7 +17540,8 @@ function focusCard(it, data) {
     const redConflict = `<span class="red">${conflictNote}</span>`;
     // Keep failure and comment links alongside conflict note so CQ red never masks conflict
     if (it.phase === 'ALERT_CQ_FAILED') {
-      why = `${redConflict} · ${link(checksUrl(it), 'Checks failed')} · ${formatStatusTime(it)}`;
+      why = `${redConflict} · ${link(checksUrl(it), 'Checks failed')} · ` +
+        `${formatStatusTime(it)}${cqFailureDiagnosisHtml(it)}`;
     } else if (needsMyReply(it)) {
       const msgWhy = formatMsgWhy(it);
       why = `${redConflict} · ${msgWhy}`;
@@ -16967,7 +17563,10 @@ function focusCard(it, data) {
     } else {
       why = `The commit queue failed · ${formatStatusTime(it)}`;
     }
-    actions = link(checksUrl(it), 'See checks', 'btn primary') + chatBtn;
+    why += cqFailureDiagnosisHtml(it);
+    const diagBtn = diagnoseChecksActionHtml(it, 'btn primary');
+    const checksBtnCls = diagBtn ? 'btn secondary' : 'btn primary';
+    actions = diagBtn + link(checksUrl(it), 'See checks', checksBtnCls) + chatBtn;
   } else if (needsSponsorAction(it)) {
     // Render explicit Googler sponsor callout instead of a stale comment trigger line
     const reason = esc(it.sponsor_action_reason || 'Needs Googler sponsor action');
@@ -18304,6 +18903,37 @@ async function rebaseItem(itemKey, btn) {
   }
 }
 
+async function diagnoseChecksItem(itemKey, btn) {
+  if (!itemKey || (btn && btn.disabled)) return;
+  const orig = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Waking chat…';
+  }
+  try {
+    const resp = await fetch('/api/diagnose_checks', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({item_key: itemKey}),
+    });
+    const res = await resp.json();
+    if (res && res.ok) {
+      if (res.chat_url) {
+        await openChat(res.conversation_id || '', res.chat_url);
+      }
+      await fetchState(true);
+      return;
+    }
+    if (btn && res && res.error) btn.title = res.error;
+  } catch (e) {
+    // Restore button label when the local HTTP call fails
+  }
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
+}
+
 async function abandonCompanions(itemKeys, btn) {
   const keys = Array.isArray(itemKeys) ? itemKeys.filter(Boolean) : [itemKeys].filter(Boolean);
   if (!keys.length || (btn && btn.disabled)) return;
@@ -18703,6 +19333,7 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
     if parsed.path in (
         "/api/start_chat",
         "/api/rebase",
+        "/api/diagnose_checks",
         "/api/open_chat",
         "/api/abandon",
         "/api/ack_bug",
@@ -18820,6 +19451,8 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
             )
         except Exception as exc:
           res = {"ok": False, "error": str(exc)}
+      elif parsed.path == "/api/diagnose_checks":
+        res = diagnose_checks_item(str(bdict.get("item_key") or ""))
       else:
         res = rebase_item(str(bdict.get("item_key") or ""))
       self._send_json(res, code=200 if res.get("ok") else 400)

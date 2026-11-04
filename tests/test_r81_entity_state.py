@@ -109,6 +109,21 @@ class EntityStateTest(unittest.TestCase):
     )
     self.assertEqual(
         es.status_of(
+            {
+                "status": "NEW",
+                "is_self": True,
+                "in_my_attention": True,
+                "attention_reason": "SkCQ dry run succeeded.",
+                "last_msg_author": "jlavrova@google.com",
+                "missing_approvals": 1,
+                "open_external_threads": 0,
+            },
+            now_ts=now_ts,
+        ),
+        "waiting",
+    )
+    self.assertEqual(
+        es.status_of(
             {"status": "MERGED", "submitted_ts": now_ts - 3600},
             now_ts=now_ts,
         ),
@@ -131,6 +146,31 @@ class EntityStateTest(unittest.TestCase):
             now_ts=now_ts,
         ),
         "landing",
+    )
+    self.assertTrue(
+        es.can_rebase(
+            {
+                "item_key": "github:195122",
+                "status": "OPEN",
+                "is_self": True,
+                "merge_conflict": False,
+                "cq_sync_rebase_needed": True,
+            }
+        )
+    )
+    self.assertIn(
+        "diagnose_checks",
+        es.available_actions_of(
+            {
+                "item_key": "github:195999",
+                "status": "OPEN",
+                "is_self": True,
+                "phase": "ALERT_CQ_FAILED",
+                "cq_failed": True,
+                "merge_conflict": False,
+                "cq_sync_rebase_needed": False,
+            }
+        ),
     )
 
   def test_triage_gates_and_finalize_clean_review(self) -> None:

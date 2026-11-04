@@ -440,6 +440,7 @@ def triage_badge_info(item: Mapping[str, Any] | None) -> dict[str, str]:
 def needs_my_reply(item: Mapping[str, Any] | None) -> bool:
   if not isinstance(item, Mapping):
     return False
+  att_reason = str(item.get("attention_reason") or "").lower()
   return (
       bool(item.get("in_my_attention"))
       and item.get("phase") != "ALERT_CQ_FAILED"
@@ -448,7 +449,17 @@ def needs_my_reply(item: Mapping[str, Any] | None) -> bool:
       and not item.get("is_draft")
       and not item.get("in_development")
       # On my own CL a dry-run bot note keeps me in attention_set without asking a question
-      and not (item.get("is_self") and short_actor(item.get("last_msg_author")) == "SkCQ")
+      and not (
+          item.get("is_self")
+          and (
+              short_actor(item.get("last_msg_author")) == "SkCQ"
+              or (
+                  "dry run succeeded" in att_reason
+                  and _to_int(item.get("missing_approvals") or 0) > 0
+                  and _to_int(item.get("open_external_threads") or 0) == 0
+              )
+          )
+      )
   )
 
 
@@ -604,8 +615,10 @@ def is_reviewer_change(item: Mapping[str, Any] | None) -> bool:
 def can_rebase(item: Mapping[str, Any] | None) -> bool:
   if not isinstance(item, Mapping) or is_companion(item):
     return False
+  # Allow local rebase when either VCS mergeable or Google testing / SkCQ reports conflict
+  has_conflict = bool(item.get("merge_conflict") or item.get("cq_sync_rebase_needed"))
   return (
-      bool(item.get("merge_conflict") and item.get("is_self"))
+      bool(has_conflict and item.get("is_self"))
       and item.get("status") in ("NEW", "OPEN")
       and bool(item.get("item_key"))
   )
@@ -806,6 +819,13 @@ def available_actions_of(
     actions.append("finalize_clean_review")
   if can_rebase(item):
     actions.append("rebase")
+  if (
+      (item.get("cq_failed") or item.get("phase") == "ALERT_CQ_FAILED")
+      and item.get("status") in ("NEW", "OPEN")
+      and bool(item.get("item_key"))
+      and not can_rebase(item)
+  ):
+    actions.append("diagnose_checks")
   if has_ready_companion(item) or (is_companion(item) and item.get("ready_to_abandon")):
     actions.append("abandon_companion")
   if needs_sponsor_action(item, by_ikey=by_ikey, raw_items=raw_items):
@@ -890,10 +910,13 @@ def _item_core_sig(item: Mapping[str, Any] | None, now_ts: float | None = None) 
       b(item.get("reviewer_removed")),
       s(item.get("role")),
       short_actor(item.get("last_msg_author"), item),
+      s(item.get("attention_reason")),
+      n(item.get("open_external_threads")),
       s(item.get("companion_to")),
       b(item.get("is_companion")),
       b(item.get("ready_to_abandon")),
       b(item.get("merge_conflict")),
+      b(item.get("cq_sync_rebase_needed")),
       s(item.get("cq_status")),
       n(item.get("approved_count")),
       n(item.get("missing_approvals")),

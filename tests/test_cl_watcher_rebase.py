@@ -809,6 +809,118 @@ const item = {
     sig_open = inspect.signature(w.open_chat_for_id)
     self.assertEqual(sig_open.parameters["timeout_sec"].default, 1.8)
 
+  def test_cq_sync_rebase_needed_and_diagnose_checks_action(self):
+    initial = {
+        "items": {
+            "github:195122@c-195122": {
+                "item_key": "github:195122",
+                "kind": "github",
+                "target_id": "195122",
+                "url": "https://github.com/flutter/flutter/pull/195122",
+                "subject": "[web_paragraph] Avoid browser text metrics queries on re-layout",
+                "status": "OPEN",
+                "phase": "ALERT_CQ_FAILED",
+                "cq_failed": True,
+                "is_self": True,
+                "merge_conflict": False,
+                "cq_sync_rebase_needed": True,
+                "failed_check_details": [
+                    {
+                        "name": "Google testing",
+                        "kind": "rebase_conflict",
+                        "snippet": "Merge conflicts with g3 HEAD — rebase needed",
+                        "unrelated": False,
+                        "url": "http://frob/flutter/presubmit?pr=195122",
+                    },
+                    {
+                        "name": "Linux customer_testing",
+                        "kind": "unrelated_failure",
+                        "snippet": "Failing test: flame: text_element_component_test.dart",
+                        "unrelated": True,
+                        "unrelated_reason": "external customer_testing package; PR only touches web_ui",
+                        "url": "https://ci.chromium.org/b/8682147800419572945",
+                    },
+                ],
+                "cq_advice": (
+                    "Rebase PR onto master to resolve Google testing merge conflict "
+                    "(Linux customer_testing: external customer_testing package)"
+                ),
+                "conversation_id": "c-195122",
+                "chat_busy": False,
+            },
+            "github:195999@c-195999": {
+                "item_key": "github:195999",
+                "kind": "github",
+                "target_id": "195999",
+                "url": "https://github.com/flutter/flutter/pull/195999",
+                "subject": "[web_paragraph] Real test failure PR",
+                "status": "OPEN",
+                "phase": "ALERT_CQ_FAILED",
+                "cq_failed": True,
+                "is_self": True,
+                "merge_conflict": False,
+                "cq_sync_rebase_needed": False,
+                "failed_check_details": [
+                    {
+                        "name": "Linux web_engine_framework_tests",
+                        "kind": "test_failure",
+                        "snippet": "Failing test: ui/text_golden_test.dart",
+                        "unrelated": False,
+                        "url": "https://ci.chromium.org/b/12345",
+                    }
+                ],
+                "cq_advice": "Inspect Linux web_engine_framework_tests (Failing test: ui/text_golden_test.dart)",
+                "conversation_id": "c-195999",
+                "chat_busy": False,
+            },
+        }
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+      state_path = self._write_state(tmp, initial)
+      with mock.patch.object(w, "STATE_FILE", state_path), \
+           mock.patch.object(
+               w.cl, "discover_conversation_chain", side_effect=lambda cid, **kw: [cid]
+           ), \
+           mock.patch.object(
+               w.cl, "_fetch_ls_summaries_for_audit", return_value={}
+           ), \
+           mock.patch.object(w, "wake_conversation", return_value=True) as mock_wake:
+        res_rebase = w.rebase_item("github:195122")
+        res_diag = w.diagnose_checks_item("github:195999")
+
+    self.assertTrue(res_rebase["ok"])
+    self.assertTrue(res_diag["ok"])
+    self.assertEqual(mock_wake.call_count, 2)
+    diag_prompt = mock_wake.call_args_list[1][0][1]
+    self.assertIn("[FLIGHT-DECK DIAGNOSE CHECKS]", diag_prompt)
+    self.assertIn("Linux web_engine_framework_tests", diag_prompt)
+    self.assertIn("text_golden_test.dart", diag_prompt)
+
+    script_body = w.DASHBOARD_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    harness = script_body.split("\nboot();", 1)[0] + f"""
+const data = {json.dumps(initial)};
+const pr195122 = data.items['github:195122@c-195122'];
+const pr195999 = data.items['github:195999@c-195999'];
+console.log(JSON.stringify({{
+  canRebase195122: canRebase(pr195122),
+  canRebase195999: canRebase(pr195999),
+  card195122: focusCard(pr195122, data),
+  card195999: focusCard(pr195999, data),
+}}));
+"""
+    proc = subprocess.run(
+        ["node", "-"], input=harness, capture_output=True, text=True, check=True
+    )
+    out = json.loads(proc.stdout.strip())
+    self.assertTrue(out["canRebase195122"])
+    self.assertFalse(out["canRebase195999"])
+    self.assertIn("🔧 Rebase", out["card195122"])
+    self.assertIn("Google testing merge conflict: rebase needed", out["card195122"])
+    self.assertIn("flame: text_element_component_test.dart", out["card195122"])
+    self.assertIn("Recommended:", out["card195122"])
+    self.assertIn("🔍 Diagnose &amp; fix", out["card195999"])
+    self.assertIn("ui/text_golden_test.dart", out["card195999"])
+
 
 if __name__ == "__main__":
   unittest.main()
