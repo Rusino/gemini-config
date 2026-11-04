@@ -211,6 +211,289 @@ def set_gn_unicode_backend(
         gn_args_file.write_text(new_text)
 
 
+# Restrict staleness checks to compiled module sources/headers/build files so test-only commits pass
+def _is_compiled_paragraph_module_path(rel_path: str) -> bool:
+    for sub in SKIA_MONITORED_DIRS:
+        if rel_path.startswith(f"{sub}/src/") or rel_path.startswith(f"{sub}/include/"):
+            return True
+        if rel_path.startswith(f"{sub}/") and (
+            rel_path.endswith(".gni")
+            or rel_path.endswith("/BUILD.gn")
+            or rel_path.endswith("/BUILD.bazel")
+        ):
+            parts = rel_path[len(sub) + 1 :].split("/")
+            if parts[0] not in ("tests", "bench", "gm", "slides", "utils"):
+                return True
+    return False
+
+
+# Refresh remote main best-effort and return the newest remote-tracking tip
+def _resolve_freshest_upstream_ref(
+    ext_skia_repo: pathlib.Path,
+    *,
+    fetch_remote: bool = True,
+) -> Optional[tuple[str, str]]:
+    if fetch_remote:
+        rem_proc = subprocess.run(
+            ["git", "-C", str(ext_skia_repo), "remote"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        remotes = {ln.strip() for ln in rem_proc.stdout.splitlines() if ln.strip()}
+        for rname in ("upstream", "origin"):
+            if rname in remotes:
+                try:
+                    proc = subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(ext_skia_repo),
+                            "fetch",
+                            "--quiet",
+                            rname,
+                            f"+refs/heads/main:refs/remotes/{rname}/main",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=30,
+                    )
+                except subprocess.TimeoutExpired:
+                    continue
+                if proc.returncode == 0:
+                    break
+
+    found: list[tuple[str, str]] = []
+    for ref_name in ("upstream/main", "origin/main"):
+        chk = subprocess.run(
+            ["git", "-C", str(ext_skia_repo), "rev-parse", "--verify", f"{ref_name}^{{commit}}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if chk.returncode == 0 and chk.stdout.strip():
+            found.append((ref_name, chk.stdout.strip()))
+    if not found:
+        return None
+    if len(found) == 2 and found[0][1] != found[1][1]:
+        anc = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(ext_skia_repo),
+                "merge-base",
+                "--is-ancestor",
+                found[0][1],
+                found[1][1],
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if anc.returncode == 0:
+            return found[1]
+    return found[0]
+
+
+# Reject stale ext:<ref> stacks before Ninja builds so upstream SkParagraph drift fails in <1s
+def check_external_skia_staleness(
+    ext_skia_repo: pathlib.Path,
+    ext_ref: str,
+    *,
+    label: str,
+    allow_mismatch: bool = False,
+    deps_skia_revision: Optional[str] = None,
+    skia_submodule_repo: Optional[pathlib.Path] = None,
+    fetch_remote: bool = True,
+) -> Optional[dict[str, Any]]:
+    if not ext_skia_repo.exists():
+        raise RuntimeError(
+            f"[{label}] External Skia repository not found: {ext_skia_repo} "
+            "(pass --external-skia)"
+        )
+    rev_proc = subprocess.run(
+        ["git", "-C", str(ext_skia_repo), "rev-parse", "--verify", f"{ext_ref}^{{commit}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if rev_proc.returncode != 0 or not rev_proc.stdout.strip():
+        detail = (rev_proc.stderr or rev_proc.stdout).strip()
+        raise RuntimeError(
+            f"[{label}] Cannot resolve external Skia ref '{ext_ref}' in {ext_skia_repo}: {detail}"
+        )
+    cand_sha = rev_proc.stdout.strip()
+
+    targets_to_check: list[tuple[str, str]] = []
+    up_info = _resolve_freshest_upstream_ref(ext_skia_repo, fetch_remote=fetch_remote)
+    if up_info is not None:
+        targets_to_check.append(up_info)
+    if deps_skia_revision:
+        has_deps = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(ext_skia_repo),
+                "cat-file",
+                "-e",
+                f"{deps_skia_revision}^{{commit}}",
+            ],
+            capture_output=True,
+            check=False,
+        )
+        # Import DEPS commit from local third_party/skia when ext_skia_repo has not fetched it yet
+        if (
+            has_deps.returncode != 0
+            and skia_submodule_repo is not None
+            and skia_submodule_repo.exists()
+        ):
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(ext_skia_repo),
+                    "fetch",
+                    "--quiet",
+                    str(skia_submodule_repo),
+                    deps_skia_revision,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+            has_deps = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(ext_skia_repo),
+                    "cat-file",
+                    "-e",
+                    f"{deps_skia_revision}^{{commit}}",
+                ],
+                capture_output=True,
+                check=False,
+            )
+        if has_deps.returncode == 0 and all(
+            sha != deps_skia_revision for _, sha in targets_to_check
+        ):
+            targets_to_check.append(("Flutter DEPS skia_revision", deps_skia_revision))
+        elif has_deps.returncode != 0:
+            warning = (
+                f"ref `{ext_ref}` (`{cand_sha[:12]}`) does not contain Flutter DEPS "
+                f"`skia_revision` (`{deps_skia_revision[:12]}` missing in {ext_skia_repo})"
+            )
+            skew_info = {
+                "ext_ref": ext_ref,
+                "cand_sha": cand_sha,
+                "base_sha": None,
+                "target_ref": "Flutter DEPS skia_revision",
+                "target_sha": deps_skia_revision,
+                "behind_commits": 1,
+                "overlapping_files": [],
+                "warning": warning,
+            }
+            if not allow_mismatch:
+                raise RuntimeError(
+                    f"[{label}] External Skia {warning}. Fetch and rebase onto "
+                    "Flutter DEPS skia_revision first, or pass --allow-skia-base-mismatch."
+                )
+            return skew_info
+
+    for target_label, target_sha in targets_to_check:
+        mb = subprocess.run(
+            ["git", "-C", str(ext_skia_repo), "merge-base", cand_sha, target_sha],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if mb.returncode != 0 or not mb.stdout.strip():
+            continue
+        base_sha = mb.stdout.strip()
+        if base_sha == target_sha:
+            continue
+
+        diff_proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(ext_skia_repo),
+                "diff",
+                "--name-only",
+                "--no-renames",
+                base_sha,
+                target_sha,
+                "--",
+                *SKIA_MONITORED_DIRS,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if diff_proc.returncode != 0:
+            continue
+        stale_files = sorted(
+            ln.strip()
+            for ln in diff_proc.stdout.splitlines()
+            if ln.strip() and _is_compiled_paragraph_module_path(ln.strip())
+        )
+        if not stale_files:
+            continue
+
+        cnt_proc = subprocess.run(
+            ["git", "-C", str(ext_skia_repo), "rev-list", "--count", f"{base_sha}..{target_sha}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        behind_cnt = (
+            int(cnt_proc.stdout.strip())
+            if cnt_proc.returncode == 0 and cnt_proc.stdout.strip().isdigit()
+            else 1
+        )
+        sample = ", ".join(f"`{p}`" for p in stale_files[:4])
+        if len(stale_files) > 4:
+            sample += f" +{len(stale_files) - 4} more"
+        warning = (
+            f"ref `{ext_ref}` (`{cand_sha[:12]}`, base `{base_sha[:10]}`) is {behind_cnt} "
+            f"commit(s) behind {target_label} (`{target_sha[:12]}`) across {len(stale_files)} "
+            f"paragraph/unicode/shaper file(s) ({sample})"
+        )
+        skew_info = {
+            "ext_ref": ext_ref,
+            "cand_sha": cand_sha,
+            "base_sha": base_sha,
+            "target_ref": target_label,
+            "target_sha": target_sha,
+            "behind_commits": behind_cnt,
+            "overlapping_files": stale_files,
+            "warning": warning,
+        }
+        if not allow_mismatch:
+            raise RuntimeError(
+                f"[{label}] External Skia {warning}. Rebase onto {target_label} first, "
+                "or pass --allow-skia-base-mismatch for an intentional historical ref."
+            )
+        return skew_info
+    return None
+
+
+def _parse_target_pair(pair: str, default_unicode: str) -> tuple[str, str, str, str]:
+    if "=" in pair:
+        label, raw_ref = pair.split("=", 1)
+    else:
+        label, raw_ref = pair, pair
+    target_unicode = default_unicode
+    ref = raw_ref
+    if "@" in raw_ref:
+        maybe_ref, maybe_uni = raw_ref.rsplit("@", 1)
+        if maybe_uni in ("icu", "apple", "keep"):
+            ref = maybe_ref
+            target_unicode = maybe_uni
+    return label, raw_ref, ref, target_unicode
+
+
 # The Skia revision Flutter's DEPS pins; `gclient sync -D` checks the submodule out at it
 def read_deps_skia_revision(repo: pathlib.Path) -> Optional[str]:
     deps = repo / "DEPS"
@@ -647,7 +930,10 @@ def main() -> int:
     ap.add_argument(
         "--allow-skia-base-mismatch",
         action="store_true",
-        help="Run even if the Skia submodule HEAD differs from skia_revision in Flutter DEPS",
+        help=(
+            "Run even if Skia submodule HEAD != Flutter DEPS skia_revision "
+            "or an ext:<ref> target sits on a stale Skia base"
+        ),
     )
     ap.add_argument(
         "--allow-dirty-flutter",
@@ -693,11 +979,11 @@ def main() -> int:
             "uncommitted Flutter changes intentionally."
         )
 
+    parsed_targets = [_parse_target_pair(pair, args.unicode) for pair in args.targets]
+
     # Reject leftover Skia submodule edits when no target requests WORKTREE so stale patches
     # are not silently stashed and re-applied across unrelated ext: or HEAD runs
-    uses_worktree = any(
-        pair.split("=", 1)[-1].rsplit("@", 1)[0] == "WORKTREE" for pair in args.targets
-    )
+    uses_worktree = any(ref == "WORKTREE" for _, _, ref, _ in parsed_targets)
     skia_dirty_files = list_dirty_files(skia_repo)
     if skia_dirty_files and not uses_worktree and not args.allow_dirty_skia:
         preview = ", ".join(skia_dirty_files[:5])
@@ -727,6 +1013,48 @@ def main() -> int:
         )
 
     out_dir = pathlib.Path(args.out).resolve()
+
+    # Validate Apple glue and external Skia base freshness for all legs before compiling leg 0
+    preflight_ext_staleness: dict[str, Optional[dict[str, Any]]] = {}
+    fetched_ext_once = False
+    for label, _, ref, target_unicode in parsed_targets:
+        ref_dir = out_dir / label
+        if (
+            args.resume
+            and (ref_dir / "attestation.json").exists()
+            and (ref_dir / "summary.json").exists()
+        ):
+            continue
+        if target_unicode == "apple" and sys.platform != "darwin":
+            raise RuntimeError(
+                f"[{label}] Apple Unicode backend (--unicode apple / @apple) "
+                "is only supported on macOS."
+            )
+        if target_unicode == "apple":
+            absent_glue = verify_flutter_apple_glue(engine_src)
+            if absent_glue:
+                raise RuntimeError(
+                    f"[{label}] Missing Apple Unicode glue in Flutter engine: {absent_glue}. "
+                    "It lives on branch `apple-unicode-engine-glue` in the Flutter repo; apply "
+                    "it with `git show apple-unicode-engine-glue | git apply` and revert after "
+                    "the run with `git show apple-unicode-engine-glue | git apply -R`."
+                )
+        if ref.startswith("ext:"):
+            if ext_skia_repo is None:
+                raise RuntimeError(
+                    f"[{label}] --external-skia is required for target '{ref}'."
+                )
+            preflight_ext_staleness[label] = check_external_skia_staleness(
+                ext_skia_repo,
+                ref[len("ext:") :],
+                label=label,
+                allow_mismatch=args.allow_skia_base_mismatch,
+                deps_skia_revision=deps_skia_revision,
+                skia_submodule_repo=skia_repo,
+                fetch_remote=not fetched_ext_once,
+            )
+            fetched_ext_once = True
+
     out_dir.mkdir(parents=True, exist_ok=True)
     driver_log = out_dir / "driver.log"
 
@@ -766,36 +1094,7 @@ def main() -> int:
     compare_args: list[str] = []
 
     try:
-        for pair in args.targets:
-            if "=" in pair:
-                label, raw_ref = pair.split("=", 1)
-            else:
-                label, raw_ref = pair, pair
-
-            target_unicode = args.unicode
-            ref = raw_ref
-            if "@" in raw_ref:
-                maybe_ref, maybe_uni = raw_ref.rsplit("@", 1)
-                if maybe_uni in ("icu", "apple", "keep"):
-                    ref = maybe_ref
-                    target_unicode = maybe_uni
-
-            if target_unicode == "apple" and sys.platform != "darwin":
-                raise RuntimeError(
-                    f"[{label}] Apple Unicode backend (--unicode apple / @apple) is only supported on macOS."
-                )
-
-            # Without the engine glue the build silently links ICU, producing an apple-labeled ICU run
-            if target_unicode == "apple":
-                absent_glue = verify_flutter_apple_glue(engine_src)
-                if absent_glue:
-                    raise RuntimeError(
-                        f"[{label}] Missing Apple Unicode glue in Flutter engine: {absent_glue}. "
-                        "It lives on branch `apple-unicode-engine-glue` in the Flutter repo; apply "
-                        "it with `git show apple-unicode-engine-glue | git apply` and revert after "
-                        "the run with `git show apple-unicode-engine-glue | git apply -R`."
-                    )
-
+        for label, raw_ref, ref, target_unicode in parsed_targets:
             ref_dir = out_dir / label
             ref_dir.mkdir(parents=True, exist_ok=True)
             att_path = ref_dir / "attestation.json"
@@ -823,6 +1122,7 @@ def main() -> int:
                 "skia_base_head": skia_base_head,
                 "skia_base_matches_deps": skia_base_matches_deps,
                 "flutter_dirty_files": flutter_dirty_files,
+                "ext_skia_staleness": preflight_ext_staleness.get(label),
             }
             attestation.update(git_meta)
             attestation["ref"] = raw_ref

@@ -273,6 +273,17 @@ def _evaluate_attestation(runs: list[tuple[str, dict[str, Any]]]) -> tuple[list[
             issues.append(
                 f"`{label}` ran with `{len(flutter_dirty)}` uncommitted file(s) in Flutter repo"
             )
+        # Flag bypassed Skia submodule vs Flutter DEPS skia_revision mismatches
+        if att.get("skia_base_matches_deps") is False:
+            base_head = (att.get("skia_base_head") or "unknown")[:12]
+            deps_rev = (att.get("deps_skia_revision") or "not found")[:12]
+            issues.append(
+                f"`{label}` Skia submodule HEAD `{base_head}` != Flutter DEPS "
+                f"`skia_revision` `{deps_rev}`"
+            )
+        ext_stale = att.get("ext_skia_staleness")
+        if isinstance(ext_stale, dict) and ext_stale.get("warning"):
+            issues.append(f"`{label}` external Skia base skew: {ext_stale['warning']}")
 
         unicode_backend = att.get("unicode_backend") or "—"
         requested_unicode = att.get("requested_unicode") or "keep"

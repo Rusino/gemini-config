@@ -277,13 +277,49 @@ def resolve_cl_cherry_pick_revs(
     return [tip_sha]
 
 
-# Fall back to upstream/main or g3_skia_revision when local checkouts omit origin/main
+# Refresh remote-tracking main best-effort so local skew checks catch newly landed commits
+def _refresh_local_upstream_ref(repo_dir: pathlib.Path) -> None:
+    rem_proc = _run(["git", "remote"], cwd=repo_dir, check=False)
+    remotes = {ln.strip() for ln in rem_proc.stdout.splitlines() if ln.strip()}
+    for rname in ("upstream", "origin"):
+        if rname in remotes:
+            try:
+                proc = _run(
+                    [
+                        "git",
+                        "fetch",
+                        "--quiet",
+                        rname,
+                        f"+refs/heads/main:refs/remotes/{rname}/main",
+                    ],
+                    cwd=repo_dir,
+                    check=False,
+                    timeout=30,
+                )
+            except subprocess.TimeoutExpired:
+                continue
+            if proc.returncode == 0:
+                break
+
+
+# Prefer the newer tip when both upstream/main and origin/main exist locally
 def _resolve_default_upstream_ref(repo_dir: pathlib.Path, fallback: str) -> str:
-    for ref in ("origin/main", "upstream/main"):
-        chk = _run(["git", "rev-parse", "--verify", ref], cwd=repo_dir, check=False)
-        if chk.returncode == 0:
-            return ref
-    return fallback
+    found: list[tuple[str, str]] = []
+    for ref in ("upstream/main", "origin/main"):
+        chk = _run(["git", "rev-parse", "--verify", f"{ref}^{{commit}}"], cwd=repo_dir, check=False)
+        if chk.returncode == 0 and chk.stdout.strip():
+            found.append((ref, chk.stdout.strip()))
+    if not found:
+        return fallback
+    if len(found) == 2 and found[0][1] != found[1][1]:
+        anc = _run(
+            ["git", "merge-base", "--is-ancestor", found[0][1], found[1][1]],
+            cwd=repo_dir,
+            check=False,
+        )
+        if anc.returncode == 0:
+            return found[1][0]
+    return found[0][0]
 
 
 def _resolve_parent_or_self(repo_dir: pathlib.Path, commit_sha: str) -> str:
@@ -300,13 +336,15 @@ def _is_g3_compiled_skia_path(rel_path: str) -> bool:
     return True
 
 
-# Detect intervening Skia commits between the candidate's git base and google3's METADATA revision
+# Detect intervening Skia commits between the candidate's git base and target Skia revision
 # that touch the same files or production module directories (silent cherry-pick API drift)
 def detect_stack_base_skew(
     repo_dir: pathlib.Path,
     candidate_base_sha: str | None,
     g3_skia_revision: str,
     candidate_files: list[str],
+    *,
+    target_label: str = "G3 Skia",
 ) -> dict[str, Any] | None:
     if not candidate_base_sha or candidate_base_sha == g3_skia_revision:
         return None
@@ -330,7 +368,7 @@ def detect_stack_base_skew(
     touched_modules = {
         sub
         for sub in HASHED_SUBDIRS
-        if any(f == sub or f.startswith(f"{sub}/") for f in candidate_files)
+        if any(f == sub or f.startswith(f"{sub}/") for f in cand_compiled)
     }
     direct_overlap = sorted(f for f in g3_diff_files if f in cand_compiled)
     module_overlap = sorted(
@@ -368,7 +406,7 @@ def detect_stack_base_skew(
     if behind_cnt > 0 and ahead_cnt == 0:
         direction = "behind"
         dist_desc = f"{behind_cnt} commit(s) behind"
-        remediation = "rebase candidate onto main / G3 Skia revision"
+        remediation = f"rebase candidate onto main / {target_label} revision"
         severity = "warning"
     elif ahead_cnt > 0 and behind_cnt == 0:
         direction = "ahead"
@@ -386,7 +424,7 @@ def detect_stack_base_skew(
         sample += f" +{len(overlapping) - 4} more"
     warning = (
         f"candidate base `{candidate_base_sha[:10]}` is {dist_desc} "
-        f"G3 Skia `{g3_skia_revision[:12]}` across {len(overlapping)} overlapping file(s) "
+        f"{target_label} `{g3_skia_revision[:12]}` across {len(overlapping)} overlapping file(s) "
         f"({sample}); {remediation}"
     )
     return {
@@ -396,6 +434,7 @@ def detect_stack_base_skew(
         "behind_commits": behind_cnt,
         "candidate_base_sha": candidate_base_sha,
         "g3_skia_revision": g3_skia_revision,
+        "target_label": target_label,
         "direct_overlap_files": direct_overlap,
         "overlapping_files": overlapping,
         "warning": warning,
@@ -409,8 +448,12 @@ def stage_candidate_in_worktree(
     g3_skia_revision: str,
     stage_wt: pathlib.Path,
     base_ref_override: str | None,
+    *,
+    allow_stack_base_skew: bool = False,
 ) -> dict[str, Any]:
     _ensure_commit_present(skia_repo, g3_skia_revision)
+    if not ref_spec.startswith("cl:"):
+        _refresh_local_upstream_ref(skia_repo)
     if stage_wt.exists():
         _run(["git", "worktree", "remove", "--force", str(stage_wt)], cwd=skia_repo, check=False)
         shutil.rmtree(stage_wt, ignore_errors=True)
@@ -424,6 +467,7 @@ def stage_candidate_in_worktree(
     source_commit_sha: str | None = None
     candidate_base_sha: str | None = None
     default_up = _resolve_default_upstream_ref(skia_repo, g3_skia_revision)
+    active_up_ref = default_up
 
     if ref_spec == "WORKTREE":
         head_sha = _run(["git", "rev-parse", "HEAD"], cwd=skia_repo).stdout.strip()
@@ -495,10 +539,12 @@ def stage_candidate_in_worktree(
             .returncode
             == 0
         )
+        if has_fresh_up:
+            active_up_ref = upstream_ref
         revs = resolve_cl_cherry_pick_revs(
             stage_wt,
             tip_sha,
-            upstream_ref if has_fresh_up else default_up,
+            active_up_ref,
             base_ref_override,
         )
         candidate_base_sha = _resolve_parent_or_self(stage_wt, revs[0])
@@ -558,12 +604,45 @@ def stage_candidate_in_worktree(
             + "\n  - ".join(sync_errs)
         )
 
+    cand_paths = [*changed_or_added, *deleted]
     stack_base_skew = detect_stack_base_skew(
         stage_wt,
         candidate_base_sha,
         g3_skia_revision,
-        [*changed_or_added, *deleted],
+        cand_paths,
     )
+    # Also catch stale candidates when CitC has not been synced yet (g3_skia_revision lags main)
+    if (
+        stack_base_skew is None or stack_base_skew.get("severity") != "warning"
+    ) and active_up_ref != g3_skia_revision:
+        up_chk = _run(
+            ["git", "rev-parse", "--verify", f"{active_up_ref}^{{commit}}"],
+            cwd=stage_wt,
+            check=False,
+        )
+        if up_chk.returncode == 0 and up_chk.stdout.strip():
+            up_sha = up_chk.stdout.strip()
+            # Measure divergence from merge-base(source_commit_sha, up_sha) so commits already
+            # landed on main (or parent CLs in A..B / --base-ref) do not conflict with themselves
+            up_base_sha = candidate_base_sha
+            if source_commit_sha:
+                mb_up = _run(
+                    ["git", "merge-base", source_commit_sha, up_sha],
+                    cwd=stage_wt,
+                    check=False,
+                )
+                if mb_up.returncode == 0 and mb_up.stdout.strip():
+                    up_base_sha = mb_up.stdout.strip()
+            up_skew = detect_stack_base_skew(
+                stage_wt,
+                up_base_sha,
+                up_sha,
+                cand_paths,
+                target_label=active_up_ref,
+            )
+            if up_skew is not None and up_skew.get("direction") in ("behind", "diverged"):
+                stack_base_skew = up_skew
+
     if stack_base_skew is not None:
         tag = (
             "STACK-BASE SKEW WARNING"
@@ -571,6 +650,11 @@ def stage_candidate_in_worktree(
             else "STACK-BASE SKEW NOTE"
         )
         print(f"[{tag}] {ref_spec}: {stack_base_skew['warning']}", file=sys.stderr, flush=True)
+        if stack_base_skew.get("severity") == "warning" and not allow_stack_base_skew:
+            raise RuntimeError(
+                f"Stack-base skew for '{ref_spec}': {stack_base_skew['warning']} "
+                f"(pass --allow-stack-base-skew to run anyway)"
+            )
 
     return {
         "source_commit_sha": source_commit_sha,
@@ -926,6 +1010,56 @@ def _query_remote_g3_skia_rev(
     return rev
 
 
+# Stage a candidate spec into a directory bundle so pre-flight errors surface before baseline runs
+def _stage_candidate_bundle_dir(
+    ref_spec: str,
+    skia_repo: pathlib.Path,
+    g3_skia_rev: str,
+    stage_wt: pathlib.Path,
+    bundle_dir: pathlib.Path,
+    base_ref_override: str | None,
+    *,
+    allow_stack_base_skew: bool = False,
+) -> None:
+    try:
+        staged = stage_candidate_in_worktree(
+            ref_spec,
+            skia_repo,
+            g3_skia_rev,
+            stage_wt,
+            base_ref_override,
+            allow_stack_base_skew=allow_stack_base_skew,
+        )
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        files_root = bundle_dir / "files"
+        for rel in staged["changed_or_added"]:
+            if ar.should_include_file(rel):
+                dst = files_root / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(stage_wt / rel, dst)
+        meta = {
+            "orig_ref_spec": ref_spec,
+            "g3_skia_revision": g3_skia_rev,
+            "source_commit_sha": staged["source_commit_sha"],
+            "candidate_base_sha": staged["candidate_base_sha"],
+            "stack_base_skew": staged["stack_base_skew"],
+            "dirty_files": staged["dirty_files"],
+            "changed_or_added": staged["changed_or_added"],
+            "deleted": staged["deleted"],
+        }
+        (bundle_dir / "_staged_meta.json").write_text(
+            json.dumps(meta, indent=2) + "\n", encoding="utf-8"
+        )
+    finally:
+        if stage_wt.exists():
+            _run(
+                ["git", "worktree", "remove", "--force", str(stage_wt)],
+                cwd=skia_repo,
+                check=False,
+            )
+            shutil.rmtree(stage_wt, ignore_errors=True)
+
+
 def run_via_ssh(
     ssh_host: str,
     args: argparse.Namespace,
@@ -935,7 +1069,13 @@ def run_via_ssh(
     local_stage_specs = [
         (lbl, ref)
         for lbl, ref in parsed_specs
-        if ref != "G3_HEAD" and not ref.startswith(("cl:", "staged:"))
+        if ref != "G3_HEAD"
+        and not ref.startswith(("cl:", "staged:"))
+        and not (
+            args.resume
+            and (out_dir / lbl / "attestation.json").is_file()
+            and (out_dir / lbl / "summary.json").is_file()
+        )
     ]
     staged_payloads: dict[str, tuple[dict[str, Any], dict[str, bytes]]] = {}
     if local_stage_specs:
@@ -951,6 +1091,7 @@ def run_via_ssh(
                     g3_skia_rev,
                     stage_wt,
                     args.base_ref,
+                    allow_stack_base_skew=args.allow_stack_base_skew,
                 )
                 file_blobs: dict[str, bytes] = {}
                 for rel in staged["changed_or_added"]:
@@ -1032,6 +1173,10 @@ def run_via_ssh(
         remote_args.append("--allow-stale-targets")
     if args.allow_dirty_citc:
         remote_args.append("--allow-dirty-citc")
+    if args.allow_stack_base_skew:
+        remote_args.append("--allow-stack-base-skew")
+    if args.base_ref:
+        remote_args.extend(["--base-ref", args.base_ref])
     if args.no_baseline_cache:
         remote_args.append("--no-baseline-cache")
     if args.resume:
@@ -1059,11 +1204,12 @@ def run_via_ssh(
         "python3 \"$WORK/_runner/scripts/run_g3_paragraph_tests.py\" "
         f"--out \"$WORK/out\" {quoted_flags}{extra_tf} {joined_specs} >&2; "
         "mkdir -p \"$MIRROR.tmp_$$\"; "
-        "tar -cf - --exclude='*/bep.json' --exclude='_skia_stage_*' -C \"$WORK/out\" . "
-        "| tar -xf - -C \"$MIRROR.tmp_$$\" >&2; "
+        "tar -cf - --exclude='*/bep.json' --exclude='_skia_stage_*' --exclude='_preflight_staged' "
+        "-C \"$WORK/out\" . | tar -xf - -C \"$MIRROR.tmp_$$\" >&2; "
         "rm -rf \"$MIRROR\"; "
         "mv \"$MIRROR.tmp_$$\" \"$MIRROR\"; "
-        "tar -czf - --exclude='*/bep.json' --exclude='_skia_stage_*' -C \"$WORK/out\" ."
+        "tar -czf - --exclude='*/bep.json' --exclude='_skia_stage_*' --exclude='_preflight_staged' "
+        "-C \"$WORK/out\" ."
     )
 
     proc = subprocess.run(
@@ -1105,6 +1251,7 @@ def run_single_leg(
     use_baseline_cache: bool = True,
     baseline_cache_dir: pathlib.Path = DEFAULT_BASELINE_CACHE_DIR,
     remote_host_label: str | None = None,
+    allow_stack_base_skew: bool = False,
 ) -> None:
     leg_dir = out_dir / label
     leg_dir.mkdir(parents=True, exist_ok=True)
@@ -1175,6 +1322,7 @@ def run_single_leg(
                 g3_skia_rev,
                 stage_wt,
                 base_ref_override,
+                allow_stack_base_skew=allow_stack_base_skew,
             )
             source_commit_sha = staged["source_commit_sha"]
             candidate_base_sha = staged["candidate_base_sha"]
@@ -1300,6 +1448,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-targets-age-days", type=int, default=30)
     parser.add_argument("--allow-stale-targets", action="store_true")
     parser.add_argument("--allow-dirty-citc", action="store_true")
+    parser.add_argument(
+        "--allow-stack-base-skew",
+        action="store_true",
+        help="Proceed even when a candidate sits on a stale Skia base with overlapping edits",
+    )
     parser.add_argument("--no-baseline-cache", action="store_true")
     parser.add_argument("--baseline-cache-dir", type=pathlib.Path, default=None)
     parser.add_argument("--resume", action="store_true")
@@ -1369,31 +1522,70 @@ def main(argv: list[str] | None = None) -> int:
             needs_candidate_staging,
         )
 
-        for lbl, ref in parsed_specs:
-            leg_dir = out_dir / lbl
-            if (
-                args.resume
-                and (leg_dir / "attestation.json").exists()
-                and (leg_dir / "summary.json").exists()
-            ):
-                continue
-            run_single_leg(
-                lbl,
-                ref,
-                out_dir=out_dir,
-                citc_client=citc_client,
-                citc_root=citc_root,
-                skia_repo=skia_repo,
-                tier=tier_name,
-                targets=targets,
-                stale_warning=stale_warning,
-                flaky_attempts=args.flaky_attempts,
-                base_ref_override=args.base_ref,
-                pre_dirty=pre_dirty,
-                use_baseline_cache=not args.no_baseline_cache,
-                baseline_cache_dir=cache_dir,
-                remote_host_label=args.remote_host_label,
-            )
+        # Pre-stage all candidate specs before running baseline=G3_HEAD so conflicts, BUILD.bazel
+        # drift, or stale stack bases abort in seconds instead of after a 12-minute baseline run
+        preflight_dir = out_dir / "_preflight_staged"
+        shutil.rmtree(preflight_dir, ignore_errors=True)
+        effective_specs = list(parsed_specs)
+        try:
+            to_prestage = [
+                (idx, lbl, ref)
+                for idx, (lbl, ref) in enumerate(parsed_specs)
+                if ref != "G3_HEAD"
+                and not ref.startswith("staged:")
+                and not (
+                    args.resume
+                    and (out_dir / lbl / "attestation.json").exists()
+                    and (out_dir / lbl / "summary.json").exists()
+                )
+            ]
+            if to_prestage:
+                if skia_repo is None:
+                    raise RuntimeError("skia_repo required for candidate pre-flight staging")
+                g3_skia_rev = ar.read_g3_skia_revision(g3_root / ar.G3_SKIA_REL / "METADATA")
+                for idx, lbl, ref in to_prestage:
+                    safe_lbl = re.sub(r"[^A-Za-z0-9_.-]", "_", lbl)
+                    bundle_dir = preflight_dir / f"{idx}_{safe_lbl}"
+                    stage_wt = out_dir / f"_skia_stage_{idx}_{safe_lbl}"
+                    _stage_candidate_bundle_dir(
+                        ref,
+                        skia_repo,
+                        g3_skia_rev,
+                        stage_wt,
+                        bundle_dir,
+                        args.base_ref,
+                        allow_stack_base_skew=args.allow_stack_base_skew,
+                    )
+                    effective_specs[idx] = (lbl, f"staged:{bundle_dir}")
+
+            for lbl, ref in effective_specs:
+                leg_dir = out_dir / lbl
+                if (
+                    args.resume
+                    and (leg_dir / "attestation.json").exists()
+                    and (leg_dir / "summary.json").exists()
+                ):
+                    continue
+                run_single_leg(
+                    lbl,
+                    ref,
+                    out_dir=out_dir,
+                    citc_client=citc_client,
+                    citc_root=citc_root,
+                    skia_repo=skia_repo,
+                    tier=tier_name,
+                    targets=targets,
+                    stale_warning=stale_warning,
+                    flaky_attempts=args.flaky_attempts,
+                    base_ref_override=args.base_ref,
+                    pre_dirty=pre_dirty,
+                    use_baseline_cache=not args.no_baseline_cache,
+                    baseline_cache_dir=cache_dir,
+                    remote_host_label=args.remote_host_label,
+                    allow_stack_base_skew=args.allow_stack_base_skew,
+                )
+        finally:
+            shutil.rmtree(preflight_dir, ignore_errors=True)
 
     runs = [(lbl, pg3.collect_run_data(str(out_dir / lbl), None)) for lbl, _ in parsed_specs]
     md = pg3.format_comparison_markdown(runs)

@@ -557,6 +557,9 @@ class Google3TestParagraphTests(unittest.TestCase):
                         "--out",
                         str(mac_out),
                         "--create-citc",
+                        "--allow-stack-base-skew",
+                        "--base-ref",
+                        "f326a1e25f",
                         "--tier",
                         "all",
                         "baseline=G3_HEAD",
@@ -568,6 +571,8 @@ class Google3TestParagraphTests(unittest.TestCase):
             self.assertIn("ControlMaster=auto", " ".join(ssh_calls[0]))
             self.assertIn("ControlPersist=8h", " ".join(ssh_calls[0]))
             self.assertIn("--no-ssh", " ".join(ssh_calls[0]))
+            self.assertIn("--allow-stack-base-skew", " ".join(ssh_calls[0]))
+            self.assertIn("--base-ref f326a1e25f", " ".join(ssh_calls[0]))
             self.assertTrue((mac_out / "compare.md").is_file())
             self.assertTrue((mac_out / "cand/attestation.json").is_file())
             self.assertIn("# Google3 Paragraph Corpus Comparison", stdout_buf.getvalue())
@@ -595,6 +600,7 @@ class Google3TestParagraphTests(unittest.TestCase):
 
     def test_stack_base_skew_and_build_failure_integrity_guard(self) -> None:
         import io
+        import subprocess
         from unittest import mock
 
         with tempfile.TemporaryDirectory() as td:
@@ -640,10 +646,20 @@ class Google3TestParagraphTests(unittest.TestCase):
             rg3._run(["git", "commit", "-m", "cand on stale base"], cwd=repo)
             stale_tip = rg3._run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
 
+            with self.assertRaisesRegex(RuntimeError, "Stack-base skew"):
+                rg3.stage_candidate_in_worktree(
+                    stale_tip, repo, g3_rev, tmp / "wt_stale_fail", None
+                )
+
             stderr_buf = io.StringIO()
             with mock.patch("sys.stderr", stderr_buf):
                 staged_stale = rg3.stage_candidate_in_worktree(
-                    stale_tip, repo, g3_rev, tmp / "wt_stale", None
+                    stale_tip,
+                    repo,
+                    g3_rev,
+                    tmp / "wt_stale",
+                    None,
+                    allow_stack_base_skew=True,
                 )
             self.assertEqual(staged_stale["candidate_base_sha"], stale_base)
             skew = staged_stale["stack_base_skew"]
@@ -653,6 +669,12 @@ class Google3TestParagraphTests(unittest.TestCase):
             self.assertEqual(skew["direction"], "behind")
             self.assertIn("modules/skparagraph/src/Run.h", skew["overlapping_files"])
             self.assertIn("[STACK-BASE SKEW WARNING]", stderr_buf.getvalue())
+
+            # Stale CitC (g3_rev == stale_base) must still fail when origin/main moved ahead
+            with self.assertRaisesRegex(RuntimeError, "Stack-base skew"):
+                rg3.stage_candidate_in_worktree(
+                    stale_tip, repo, stale_base, tmp / "wt_citc_also_stale", None
+                )
 
             # Candidate 2: rebased onto fresh_main (ahead of g3_rev only in src/gpu) -> no skew
             rg3._run(["git", "checkout", "-b", "rebased_cand", fresh_main], cwd=repo)
@@ -666,6 +688,135 @@ class Google3TestParagraphTests(unittest.TestCase):
             )
             self.assertEqual(staged_clean["candidate_base_sha"], fresh_main)
             self.assertIsNone(staged_clean["stack_base_skew"])
+
+            # Candidate 3: commit already on origin/main ahead of g3_rev must not self-conflict
+            rg3._run(["git", "checkout", "main"], cwd=repo)
+            (src_dir / "Run.cpp").write_text("int run_v = 2;\n", encoding="utf-8")
+            rg3._run(["git", "add", "modules/skparagraph/src/Run.cpp"], cwd=repo)
+            rg3._run(["git", "commit", "-m", "landed on main before g3 roll"], cwd=repo)
+            landed_tip = rg3._run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+            rg3._run(["git", "update-ref", "refs/remotes/origin/main", landed_tip], cwd=repo)
+
+            staged_landed = rg3.stage_candidate_in_worktree(
+                landed_tip, repo, g3_rev, tmp / "wt_landed", None
+            )
+            self.assertIsNone(staged_landed["stack_base_skew"])
+            rg3._run(["git", "update-ref", "refs/remotes/origin/main", fresh_main], cwd=repo)
+
+            # Best-effort upstream refresh must survive TimeoutExpired and fall back to origin
+            def flaky_fetch(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+                if cmd[:2] == ["git", "remote"]:
+                    return subprocess.CompletedProcess(cmd, 0, "upstream\norigin\n", "")
+                if cmd[:3] == ["git", "fetch", "--quiet"] and cmd[3] == "upstream":
+                    raise subprocess.TimeoutExpired(cmd=cmd, timeout=30)
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            with mock.patch.object(rg3, "_run", side_effect=flaky_fetch) as m_run:
+                rg3._refresh_local_upstream_ref(repo)
+            fetch_remotes = [c.args[0][3] for c in m_run.call_args_list if c.args[0][1] == "fetch"]
+            self.assertEqual(fetch_remotes, ["upstream", "origin"])
+
+            # Pre-flight in main() must reject stale candidates BEFORE running baseline=G3_HEAD
+            fake_citc = tmp / "citc_client"
+            meta_p = fake_citc / "google3/third_party/skia/HEAD/METADATA"
+            meta_p.parent.mkdir(parents=True)
+            meta_p.write_text(
+                f'third_party {{\n  identifier {{\n    version: "{g3_rev}"\n  }}\n}}\n',
+                encoding="utf-8",
+            )
+            custom_targets = tmp / "targets.txt"
+            custom_targets.write_text("//a:t1\n", encoding="utf-8")
+            leg_calls: list[tuple[str, str]] = []
+
+            def fake_single_leg(label: str, ref_spec: str, **kwargs: object) -> None:
+                leg_calls.append((label, ref_spec))
+                ldir = pathlib.Path(str(kwargs["out_dir"])) / label
+                ldir.mkdir(parents=True, exist_ok=True)
+                (ldir / "targets.txt").write_text("//a:t1\n", encoding="utf-8")
+                (ldir / "attestation.json").write_text(
+                    json.dumps(
+                        {
+                            "ref_spec": "G3_HEAD" if label == "baseline" else rebased_tip,
+                            "citc_client": "skia_g3_ab",
+                            "citc_base_cl": 100,
+                            "citc_pre_dirty_files": [],
+                            "citc_restored_clean": True,
+                            "g3_skia_revision": g3_rev,
+                            "source_tree_sha256": f"hash_{label}",
+                            "rewritten_file_count": 0 if label == "baseline" else 1,
+                            "tier": "custom",
+                            "blaze_rc": 0,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (ldir / "summary.json").write_text(
+                    json.dumps(
+                        {
+                            "saw_build_finished": True,
+                            "finished_cleanly": True,
+                            "executed_tests": 1,
+                            "counts": {
+                                "total": 1,
+                                "passed": 1,
+                                "failed": 0,
+                                "flaky": 0,
+                                "timeout": 0,
+                                "failed_to_build": 0,
+                                "analysis_failure": 0,
+                                "skipped": 0,
+                                "incomplete": 0,
+                            },
+                            "statuses": {"//a:t1": "PASSED"},
+                            "details": {},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            with mock.patch.object(
+                rg3, "resolve_citc_root", return_value=("skia_g3_ab", fake_citc)
+            ), mock.patch.object(
+                rg3, "list_citc_dirty_files", return_value=[]
+            ), mock.patch.object(
+                rg3, "run_single_leg", side_effect=fake_single_leg
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Stack-base skew"):
+                    rg3.main(
+                        [
+                            "--no-ssh",
+                            "--quiet-stdout",
+                            "--out",
+                            str(tmp / "preflight_abort"),
+                            "--skia-repo",
+                            str(repo),
+                            "--targets-file",
+                            str(custom_targets),
+                            "baseline=G3_HEAD",
+                            f"cand={stale_tip}",
+                        ]
+                    )
+                self.assertEqual(leg_calls, [])
+
+                rc_ok = rg3.main(
+                    [
+                        "--no-ssh",
+                        "--quiet-stdout",
+                        "--out",
+                        str(tmp / "preflight_ok"),
+                        "--skia-repo",
+                        str(repo),
+                        "--targets-file",
+                        str(custom_targets),
+                        "baseline=G3_HEAD",
+                        f"cand={rebased_tip}",
+                    ]
+                )
+                self.assertEqual(rc_ok, 0)
+                self.assertEqual(len(leg_calls), 2)
+                self.assertEqual(leg_calls[0], ("baseline", "G3_HEAD"))
+                self.assertTrue(leg_calls[1][1].startswith("staged:"))
+                self.assertFalse((tmp / "preflight_ok/_preflight_staged").exists())
 
             # Attestation integrity must flag both stack-base skew and new FAILED_TO_BUILD drops
             base_run = {
