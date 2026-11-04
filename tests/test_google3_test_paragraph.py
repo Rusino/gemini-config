@@ -593,6 +593,198 @@ class Google3TestParagraphTests(unittest.TestCase):
                         ]
                     )
 
+    def test_stack_base_skew_and_build_failure_integrity_guard(self) -> None:
+        import io
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            repo = tmp / "skia"
+            repo.mkdir()
+            rg3._run(["git", "init", "-b", "main"], cwd=repo)
+            rg3._run(["git", "config", "user.email", "t@example.com"], cwd=repo)
+            rg3._run(["git", "config", "user.name", "Test"], cwd=repo)
+
+            src_dir = repo / "modules/skparagraph/src"
+            gpu_dir = repo / "src/gpu"
+            src_dir.mkdir(parents=True)
+            gpu_dir.mkdir(parents=True)
+            (src_dir / "BUILD.bazel").write_text(
+                'skia_filegroup(name = "srcs", srcs = ["Run.h", "Run.cpp", "Cand.cpp"])\n',
+                encoding="utf-8",
+            )
+            (src_dir / "Run.h").write_text("struct Run { int fPositions; };\n", encoding="utf-8")
+            (src_dir / "Run.cpp").write_text("int run_v = 1;\n", encoding="utf-8")
+            (gpu_dir / "Gpu.cpp").write_text("int gpu_v = 1;\n", encoding="utf-8")
+            rg3._run(["git", "add", "."], cwd=repo)
+            rg3._run(["git", "commit", "-m", "stale base"], cwd=repo)
+            stale_base = rg3._run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+            # Upstream SkParagraph refactor already rolled into google3 (fPositions -> fGlyphData)
+            (src_dir / "Run.h").write_text("struct Run { int fGlyphData; };\n", encoding="utf-8")
+            rg3._run(["git", "add", "modules/skparagraph/src/Run.h"], cwd=repo)
+            rg3._run(["git", "commit", "-m", "upstream fGlyphData"], cwd=repo)
+            g3_rev = rg3._run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+            # Post-roll unrelated GPU commit on main must not trigger false-positive skew
+            (gpu_dir / "Gpu.cpp").write_text("int gpu_v = 2;\n", encoding="utf-8")
+            rg3._run(["git", "add", "src/gpu/Gpu.cpp"], cwd=repo)
+            rg3._run(["git", "commit", "-m", "post-roll gpu"], cwd=repo)
+            rg3._run(["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=repo)
+            fresh_main = rg3._run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+            # Candidate 1: stale branch rooted at stale_base adding Cand.cpp against old Run.h
+            rg3._run(["git", "checkout", "-b", "stale_cand", stale_base], cwd=repo)
+            (src_dir / "Cand.cpp").write_text("int cand = 1;\n", encoding="utf-8")
+            rg3._run(["git", "add", "modules/skparagraph/src/Cand.cpp"], cwd=repo)
+            rg3._run(["git", "commit", "-m", "cand on stale base"], cwd=repo)
+            stale_tip = rg3._run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+            stderr_buf = io.StringIO()
+            with mock.patch("sys.stderr", stderr_buf):
+                staged_stale = rg3.stage_candidate_in_worktree(
+                    stale_tip, repo, g3_rev, tmp / "wt_stale", None
+                )
+            self.assertEqual(staged_stale["candidate_base_sha"], stale_base)
+            skew = staged_stale["stack_base_skew"]
+            self.assertIsNotNone(skew)
+            assert skew is not None
+            self.assertEqual(skew["severity"], "warning")
+            self.assertEqual(skew["direction"], "behind")
+            self.assertIn("modules/skparagraph/src/Run.h", skew["overlapping_files"])
+            self.assertIn("[STACK-BASE SKEW WARNING]", stderr_buf.getvalue())
+
+            # Candidate 2: rebased onto fresh_main (ahead of g3_rev only in src/gpu) -> no skew
+            rg3._run(["git", "checkout", "-b", "rebased_cand", fresh_main], cwd=repo)
+            (src_dir / "Cand.cpp").write_text("int cand = 2;\n", encoding="utf-8")
+            rg3._run(["git", "add", "modules/skparagraph/src/Cand.cpp"], cwd=repo)
+            rg3._run(["git", "commit", "-m", "cand rebased"], cwd=repo)
+            rebased_tip = rg3._run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+            staged_clean = rg3.stage_candidate_in_worktree(
+                rebased_tip, repo, g3_rev, tmp / "wt_clean", None
+            )
+            self.assertEqual(staged_clean["candidate_base_sha"], fresh_main)
+            self.assertIsNone(staged_clean["stack_base_skew"])
+
+            # Attestation integrity must flag both stack-base skew and new FAILED_TO_BUILD drops
+            base_run = {
+                "attestation": {
+                    "ref_spec": "G3_HEAD",
+                    "citc_client": "skia_g3_ab",
+                    "citc_base_cl": 1012927359,
+                    "citc_pre_dirty_files": [],
+                    "citc_restored_clean": True,
+                    "g3_skia_revision": g3_rev,
+                    "source_tree_sha256": "25fa77e22be54ba5",
+                    "rewritten_file_count": 0,
+                    "tier": "all",
+                    "blaze_rc": 1,
+                },
+                "summary": {
+                    "saw_build_finished": True,
+                    "finished_cleanly": True,
+                    "executed_tests": 2,
+                    "counts": {
+                        "total": 3,
+                        "passed": 2,
+                        "failed": 0,
+                        "flaky": 0,
+                        "timeout": 0,
+                        "failed_to_build": 1,
+                        "analysis_failure": 0,
+                        "skipped": 0,
+                        "incomplete": 0,
+                    },
+                    "statuses": {
+                        "//a:t1": "PASSED",
+                        "//b:t2": "PASSED",
+                        "//pre:broken": "FAILED_TO_BUILD",
+                    },
+                    "details": {},
+                },
+            }
+            cand_skew_run = {
+                "attestation": {
+                    "ref_spec": "cl:1412557/6",
+                    "skia_commit_sha": stale_tip,
+                    "candidate_base_sha": stale_base,
+                    "stack_base_skew": skew,
+                    "citc_client": "skia_g3_ab",
+                    "citc_base_cl": 1012927359,
+                    "citc_pre_dirty_files": [],
+                    "citc_restored_clean": True,
+                    "g3_skia_revision": g3_rev,
+                    "source_tree_sha256": "ac50591cdbdaf683",
+                    "rewritten_file_count": 33,
+                    "tier": "all",
+                    "blaze_rc": 1,
+                },
+                "summary": {
+                    "saw_build_finished": True,
+                    "finished_cleanly": True,
+                    "executed_tests": 1,
+                    "counts": {
+                        "total": 3,
+                        "passed": 1,
+                        "failed": 0,
+                        "flaky": 0,
+                        "timeout": 0,
+                        "failed_to_build": 2,
+                        "analysis_failure": 0,
+                        "skipped": 0,
+                        "incomplete": 0,
+                    },
+                    "statuses": {
+                        "//a:t1": "PASSED",
+                        "//b:t2": "FAILED_TO_BUILD",
+                        "//pre:broken": "FAILED_TO_BUILD",
+                    },
+                    "details": {"//b:t2": "CppCompile returned a non-zero exit code"},
+                },
+            }
+            md_skew = pg3.format_comparison_markdown(
+                [("baseline", base_run), ("cand", cand_skew_run)]
+            )
+            self.assertIn("`WARNING / INVALID`", md_skew)
+            self.assertIn("stack-base skew:", md_skew)
+            self.assertIn("failed to build/analyze `1` target(s)", md_skew)
+            self.assertIn(f"base `{stale_base[:10]}`", md_skew)
+
+            # Even without stack_base_skew metadata, new FAILED_TO_BUILD targets invalidate run
+            cand_bep_only = {
+                **cand_skew_run,
+                "attestation": {
+                    k: v
+                    for k, v in cand_skew_run["attestation"].items()
+                    if k not in ("stack_base_skew", "candidate_base_sha")
+                },
+            }
+            md_bep_only = pg3.format_comparison_markdown(
+                [("baseline", base_run), ("cand", cand_bep_only)]
+            )
+            self.assertIn("`WARNING / INVALID`", md_bep_only)
+            self.assertIn("failed to build/analyze `1` target(s)", md_bep_only)
+
+            # Pre-existing FAILED_TO_BUILD alone with rebased candidate stays VALID
+            cand_rebased_run = {
+                **cand_skew_run,
+                "attestation": {
+                    **cand_skew_run["attestation"],
+                    "skia_commit_sha": rebased_tip,
+                    "candidate_base_sha": fresh_main,
+                    "stack_base_skew": None,
+                },
+                "summary": {
+                    **base_run["summary"],
+                },
+            }
+            md_valid = pg3.format_comparison_markdown(
+                [("baseline", base_run), ("cand", cand_rebased_run)]
+            )
+            self.assertIn("`VALID (", md_valid)
+            self.assertIn(f"base `{fresh_main[:10]}`", md_valid)
+
 
 if __name__ == "__main__":
     unittest.main()

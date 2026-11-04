@@ -363,6 +363,9 @@ def collect_run_data(spec_path: str, fallback_targets_file: pathlib.Path | None)
     return {"attestation": att, "summary": summary}
 
 
+BUILD_FAIL_STATUSES = frozenset({"FAILED_TO_BUILD", "ANALYSIS_FAILURE"})
+
+
 def _evaluate_attestation(runs: list[tuple[str, dict[str, Any]]]) -> tuple[list[str], list[str]]:
     issues: list[str] = []
     rows: list[str] = []
@@ -371,21 +374,29 @@ def _evaluate_attestation(runs: list[tuple[str, dict[str, Any]]]) -> tuple[list[
     base_total: int | None = None
     base_g3_sha: str | None = None
     base_cl: Any = None
+    base_statuses: dict[str, str] = {}
+    base_executed: int = 0
 
     for idx, (label, run) in enumerate(runs):
         att = run.get("attestation") or {}
         sm = run.get("summary") or {}
         counts = sm.get("counts") or {}
+        g3_sha = att.get("g3_skia_revision")
 
         ref_spec = att.get("ref_spec") or label
         skia_sha = att.get("skia_commit_sha")
+        cand_base = att.get("candidate_base_sha")
         dirty_cnt = len(att.get("skia_dirty_files") or [])
         spec_col = f"`{ref_spec}`"
         if skia_sha:
             spec_col += f" (`{skia_sha[:10]}`"
             if dirty_cnt:
                 spec_col += f" + `{dirty_cnt} dirty`"
+            if cand_base and g3_sha and cand_base != g3_sha:
+                spec_col += f", base `{cand_base[:10]}`"
             spec_col += ")"
+        elif cand_base and g3_sha and cand_base != g3_sha:
+            spec_col += f" (base `{cand_base[:10]}`)"
 
         citc_client = att.get("citc_client") or "—"
         citc_cl = att.get("citc_base_cl")
@@ -400,11 +411,12 @@ def _evaluate_attestation(runs: list[tuple[str, dict[str, Any]]]) -> tuple[list[
         if att.get("citc_restored_clean") is False:
             issues.append(f"`{label}` failed to restore CitC client `{citc_client}` to clean state")
 
-        g3_sha = att.get("g3_skia_revision")
         g3_col = f"`{g3_sha[:12]}`" if g3_sha else "—"
         if idx == 0:
             base_g3_sha = g3_sha
             base_cl = citc_cl
+            base_statuses = dict(sm.get("statuses") or {})
+            base_executed = int(sm.get("executed_tests", 0) or 0)
         else:
             if base_g3_sha and g3_sha and g3_sha != base_g3_sha:
                 issues.append(
@@ -475,8 +487,33 @@ def _evaluate_attestation(runs: list[tuple[str, dict[str, Any]]]) -> tuple[list[
         fl_cnt = counts.get("flaky", 0)
         tests_col = f"`+{p_cnt} -{f_cnt} ~{fl_cnt}`"
 
-        if sm.get("executed_tests", 0) == 0:
+        cand_exec = int(sm.get("executed_tests", 0) or 0)
+        if cand_exec == 0:
             issues.append(f"`{label}` executed 0 tests")
+
+        # Flag silent cherry-pick skew and candidate build-failure drops so uncompiled targets
+        # never masquerade as a clean VALID corpus run
+        if idx > 0:
+            cand_statuses = sm.get("statuses") or {}
+            new_build_fails = [
+                t_lbl
+                for t_lbl, c_st in sorted(cand_statuses.items())
+                if c_st in BUILD_FAIL_STATUSES
+                and base_statuses.get(t_lbl) not in BUILD_FAIL_STATUSES
+            ]
+            skew = att.get("stack_base_skew")
+            if isinstance(skew, dict) and skew.get("warning"):
+                if skew.get("severity", "warning") == "warning" or new_build_fails:
+                    issues.append(f"`{label}` stack-base skew: {skew['warning']}")
+            elif isinstance(skew, str) and skew:
+                issues.append(f"`{label}` stack-base skew: {skew}")
+            if new_build_fails:
+                sample_lbl = new_build_fails[0]
+                issues.append(
+                    f"`{label}` failed to build/analyze `{len(new_build_fails)}` target(s) "
+                    f"that built on baseline (`executed_tests` `{cand_exec}` vs "
+                    f"`{base_executed}`, e.g. `{sample_lbl}`)"
+                )
 
         status_parts: list[str] = []
         rc = att.get("blaze_rc")

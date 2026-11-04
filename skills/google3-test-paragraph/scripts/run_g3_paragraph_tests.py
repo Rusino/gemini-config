@@ -277,6 +277,131 @@ def resolve_cl_cherry_pick_revs(
     return [tip_sha]
 
 
+# Fall back to upstream/main or g3_skia_revision when local checkouts omit origin/main
+def _resolve_default_upstream_ref(repo_dir: pathlib.Path, fallback: str) -> str:
+    for ref in ("origin/main", "upstream/main"):
+        chk = _run(["git", "rev-parse", "--verify", ref], cwd=repo_dir, check=False)
+        if chk.returncode == 0:
+            return ref
+    return fallback
+
+
+def _resolve_parent_or_self(repo_dir: pathlib.Path, commit_sha: str) -> str:
+    chk = _run(["git", "rev-parse", "--verify", f"{commit_sha}^"], cwd=repo_dir, check=False)
+    return chk.stdout.strip() if chk.returncode == 0 else commit_sha
+
+
+# Exclude Skia unit tests under /tests/ because google3 builds only production module targets
+def _is_g3_compiled_skia_path(rel_path: str) -> bool:
+    if not ar.should_include_file(rel_path):
+        return False
+    if "/tests/" in f"/{rel_path}" and not rel_path.endswith("BUILD.bazel"):
+        return False
+    return True
+
+
+# Detect intervening Skia commits between the candidate's git base and google3's METADATA revision
+# that touch the same files or production module directories (silent cherry-pick API drift)
+def detect_stack_base_skew(
+    repo_dir: pathlib.Path,
+    candidate_base_sha: str | None,
+    g3_skia_revision: str,
+    candidate_files: list[str],
+) -> dict[str, Any] | None:
+    if not candidate_base_sha or candidate_base_sha == g3_skia_revision:
+        return None
+    diff_proc = _run(
+        ["git", "diff", "--name-only", "--no-renames", candidate_base_sha, g3_skia_revision],
+        cwd=repo_dir,
+        check=False,
+    )
+    if diff_proc.returncode != 0:
+        return None
+
+    g3_diff_files = [
+        ln.strip()
+        for ln in diff_proc.stdout.splitlines()
+        if ln.strip() and _is_g3_compiled_skia_path(ln.strip())
+    ]
+    if not g3_diff_files:
+        return None
+
+    cand_compiled = {f for f in candidate_files if _is_g3_compiled_skia_path(f)}
+    touched_modules = {
+        sub
+        for sub in HASHED_SUBDIRS
+        if any(f == sub or f.startswith(f"{sub}/") for f in candidate_files)
+    }
+    direct_overlap = sorted(f for f in g3_diff_files if f in cand_compiled)
+    module_overlap = sorted(
+        f
+        for f in g3_diff_files
+        if any(
+            f.startswith(f"{sub}/src/")
+            or f.startswith(f"{sub}/include/")
+            or (f.startswith(f"{sub}/") and f.endswith("BUILD.bazel"))
+            for sub in touched_modules
+        )
+    )
+    overlapping = sorted(set(direct_overlap) | set(module_overlap))
+    if not overlapping:
+        return None
+
+    ahead_cnt = 0
+    behind_cnt = 0
+    cnt_proc = _run(
+        [
+            "git",
+            "rev-list",
+            "--left-right",
+            "--count",
+            f"{candidate_base_sha}...{g3_skia_revision}",
+        ],
+        cwd=repo_dir,
+        check=False,
+    )
+    if cnt_proc.returncode == 0:
+        parts = cnt_proc.stdout.strip().split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            ahead_cnt, behind_cnt = int(parts[0]), int(parts[1])
+
+    if behind_cnt > 0 and ahead_cnt == 0:
+        direction = "behind"
+        dist_desc = f"{behind_cnt} commit(s) behind"
+        remediation = "rebase candidate onto main / G3 Skia revision"
+        severity = "warning"
+    elif ahead_cnt > 0 and behind_cnt == 0:
+        direction = "ahead"
+        dist_desc = f"{ahead_cnt} commit(s) ahead of"
+        remediation = "sync CitC via 'g4 sync' or wait for Skia autoroll"
+        severity = "warning" if direct_overlap else "info"
+    else:
+        direction = "diverged"
+        dist_desc = f"diverged (+{ahead_cnt}/-{behind_cnt} commits) from"
+        remediation = "rebase candidate onto main and/or sync CitC via 'g4 sync'"
+        severity = "warning"
+
+    sample = ", ".join(f"`{p}`" for p in overlapping[:4])
+    if len(overlapping) > 4:
+        sample += f" +{len(overlapping) - 4} more"
+    warning = (
+        f"candidate base `{candidate_base_sha[:10]}` is {dist_desc} "
+        f"G3 Skia `{g3_skia_revision[:12]}` across {len(overlapping)} overlapping file(s) "
+        f"({sample}); {remediation}"
+    )
+    return {
+        "severity": severity,
+        "direction": direction,
+        "ahead_commits": ahead_cnt,
+        "behind_commits": behind_cnt,
+        "candidate_base_sha": candidate_base_sha,
+        "g3_skia_revision": g3_skia_revision,
+        "direct_overlap_files": direct_overlap,
+        "overlapping_files": overlapping,
+        "warning": warning,
+    }
+
+
 # Materialize candidate Skia changes onto g3_skia_revision using 3-way git operations
 def stage_candidate_in_worktree(
     ref_spec: str,
@@ -297,6 +422,8 @@ def stage_candidate_in_worktree(
 
     dirty_files: list[str] = []
     source_commit_sha: str | None = None
+    candidate_base_sha: str | None = None
+    default_up = _resolve_default_upstream_ref(skia_repo, g3_skia_revision)
 
     if ref_spec == "WORKTREE":
         head_sha = _run(["git", "rev-parse", "HEAD"], cwd=skia_repo).stdout.strip()
@@ -305,18 +432,20 @@ def stage_candidate_in_worktree(
             base_sha = _run(["git", "rev-parse", base_ref_override], cwd=skia_repo).stdout.strip()
         else:
             mb = _run(
-                ["git", "merge-base", "HEAD", "origin/main"],
+                ["git", "merge-base", "HEAD", default_up],
                 cwd=skia_repo,
                 check=False,
             )
             base_sha = mb.stdout.strip() if mb.returncode == 0 else head_sha
 
+        candidate_base_sha = base_sha
         if base_sha != head_sha:
             revs = _run(
                 ["git", "rev-list", "--reverse", f"{base_sha}..{head_sha}"],
                 cwd=skia_repo,
             ).stdout.split()
             if revs:
+                candidate_base_sha = _resolve_parent_or_self(skia_repo, revs[0])
                 _cherry_pick_onto_stage(stage_wt, revs, g3_skia_revision)
 
         wt_diff = subprocess.run(
@@ -369,9 +498,10 @@ def stage_candidate_in_worktree(
         revs = resolve_cl_cherry_pick_revs(
             stage_wt,
             tip_sha,
-            upstream_ref if has_fresh_up else "origin/main",
+            upstream_ref if has_fresh_up else default_up,
             base_ref_override,
         )
+        candidate_base_sha = _resolve_parent_or_self(stage_wt, revs[0])
         _cherry_pick_onto_stage(stage_wt, revs, g3_skia_revision)
     else:
         if ".." in ref_spec:
@@ -388,9 +518,10 @@ def stage_candidate_in_worktree(
             revs = resolve_cl_cherry_pick_revs(
                 skia_repo,
                 tip_sha,
-                "origin/main",
+                default_up,
                 base_ref_override,
             )
+        candidate_base_sha = _resolve_parent_or_self(skia_repo, revs[0])
         _cherry_pick_onto_stage(stage_wt, revs, g3_skia_revision)
 
     _run(["git", "add", "-A"], cwd=stage_wt)
@@ -427,8 +558,24 @@ def stage_candidate_in_worktree(
             + "\n  - ".join(sync_errs)
         )
 
+    stack_base_skew = detect_stack_base_skew(
+        stage_wt,
+        candidate_base_sha,
+        g3_skia_revision,
+        [*changed_or_added, *deleted],
+    )
+    if stack_base_skew is not None:
+        tag = (
+            "STACK-BASE SKEW WARNING"
+            if stack_base_skew.get("severity") == "warning"
+            else "STACK-BASE SKEW NOTE"
+        )
+        print(f"[{tag}] {ref_spec}: {stack_base_skew['warning']}", file=sys.stderr, flush=True)
+
     return {
         "source_commit_sha": source_commit_sha,
+        "candidate_base_sha": candidate_base_sha,
+        "stack_base_skew": stack_base_skew,
         "dirty_files": dirty_files,
         "changed_or_added": changed_or_added,
         "deleted": deleted,
@@ -663,6 +810,8 @@ def apply_pre_staged_candidate(
     return {
         "orig_ref_spec": str(meta["orig_ref_spec"]),
         "source_commit_sha": meta.get("source_commit_sha"),
+        "candidate_base_sha": meta.get("candidate_base_sha"),
+        "stack_base_skew": meta.get("stack_base_skew"),
         "dirty_files": list(meta.get("dirty_files") or []),
         "sync_info": sync_info,
     }
@@ -811,6 +960,8 @@ def run_via_ssh(
                     "orig_ref_spec": ref,
                     "g3_skia_revision": g3_skia_rev,
                     "source_commit_sha": staged["source_commit_sha"],
+                    "candidate_base_sha": staged["candidate_base_sha"],
+                    "stack_base_skew": staged["stack_base_skew"],
                     "dirty_files": staged["dirty_files"],
                     "changed_or_added": staged["changed_or_added"],
                     "deleted": staged["deleted"],
@@ -968,6 +1119,8 @@ def run_single_leg(
     sync_info: dict[str, list[str]] = {"written": [], "added_new": [], "deleted": []}
     effective_ref_spec = ref_spec
     source_commit_sha: str | None = None
+    candidate_base_sha: str | None = None
+    stack_base_skew: dict[str, Any] | None = None
     skia_dirty: list[str] = []
     restored_clean = True
     cache_eligible = (
@@ -1009,6 +1162,8 @@ def run_single_leg(
             )
             effective_ref_spec = applied["orig_ref_spec"]
             source_commit_sha = applied["source_commit_sha"]
+            candidate_base_sha = applied["candidate_base_sha"]
+            stack_base_skew = applied["stack_base_skew"]
             skia_dirty = applied["dirty_files"]
             sync_info = applied["sync_info"]
         else:
@@ -1022,6 +1177,8 @@ def run_single_leg(
                 base_ref_override,
             )
             source_commit_sha = staged["source_commit_sha"]
+            candidate_base_sha = staged["candidate_base_sha"]
+            stack_base_skew = staged["stack_base_skew"]
             skia_dirty = staged["dirty_files"]
             sync_info = ar.sync_skia_tree_to_g3(
                 stage_wt,
@@ -1082,6 +1239,8 @@ def run_single_leg(
         "label": label,
         "ref_spec": effective_ref_spec,
         "skia_commit_sha": source_commit_sha,
+        "candidate_base_sha": candidate_base_sha,
+        "stack_base_skew": stack_base_skew,
         "skia_dirty_files": skia_dirty,
         "citc_client": citc_client,
         "citc_base_cl": citc_base_cl,
