@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import copy
 from datetime import datetime, timedelta, timezone
+import fcntl
 import glob
 import http.client
 import http.server
@@ -75,7 +77,9 @@ DEFAULT_STATE_FILE = os.path.expanduser(
     "~/.gemini/config/logs/cl_watcher_state.json"
 )
 STATE_FILE = DEFAULT_STATE_FILE
-_SYNC_LOCK = threading.Lock()
+# Reentrant poll lock and cross-process state file lock prevent sync/UI write races
+_SYNC_LOCK = threading.RLock()
+_STATE_IO_LOCK = threading.RLock()
 # Non-zero only inside serve_forever so CLI runs never clobber the live daemon's ui_version
 _SERVING_PORT = 0
 
@@ -811,11 +815,18 @@ def sweep_processed_gmail_for_record(
 
 
 def load_watcher_state() -> dict[str, Any]:
-  with _SYNC_LOCK:
+  # Serialize in-process state reads and take a shared flock against external helper scripts
+  with _STATE_IO_LOCK:
     try:
       if os.path.isfile(STATE_FILE):
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-          data = json.load(f)
+        lock_path = f"{STATE_FILE}.lock"
+        with open(lock_path, "a", encoding="utf-8") as lf:
+          fcntl.flock(lf.fileno(), fcntl.LOCK_SH)
+          try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+              data = json.load(f)
+          finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
         if isinstance(data, dict):
           return data
     except Exception:
@@ -824,13 +835,20 @@ def load_watcher_state() -> dict[str, Any]:
 
 
 def save_watcher_state(state: dict[str, Any]) -> None:
-  with _SYNC_LOCK:
+  # Hold exclusive flock across atomic temp-file replacement so concurrent writers never collide
+  with _STATE_IO_LOCK:
     try:
       os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-      tmp = f"{STATE_FILE}.tmp.{os.getpid()}"
-      with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
-      os.replace(tmp, STATE_FILE)
+      lock_path = f"{STATE_FILE}.lock"
+      with open(lock_path, "a", encoding="utf-8") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+          tmp = f"{STATE_FILE}.tmp.{os.getpid()}.{threading.get_ident()}"
+          with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+          os.replace(tmp, STATE_FILE)
+        finally:
+          fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
     except Exception:
       pass
   # Avoid overwriting live daemon discovery metadata from mocked tests or non-serving CLI runs
@@ -4156,9 +4174,17 @@ def fetch_gerrit_cl_status(
     preferred_host: str = "",
 ) -> dict[str, Any]:
   """Probes Skia and Chromium Gerrit for a CL."""
-  if preferred_host in GERRIT_HOSTS:
+  if cl_id.isdigit() and int(cl_id) < 4_000_000:
+    # Skia Gerrit IDs (<4M) collide with 2016-2022 Chromium CLs if 404 falls through
+    hosts = (
+        (GERRIT_CHROMIUM_HOST, GERRIT_SKIA_HOST)
+        if preferred_host == GERRIT_CHROMIUM_HOST
+        else (GERRIT_SKIA_HOST,)
+    )
+  elif preferred_host in GERRIT_HOSTS:
     hosts = (preferred_host, *[h for h in GERRIT_HOSTS if h != preferred_host])
-  elif cl_id.isdigit() and int(cl_id) >= 4_000_000:
+  # Multi-million numeric IDs without preferred_host probe Chromium Gerrit first
+  elif cl_id.isdigit():
     # Chromium Gerrit IDs are in the millions while Skia Gerrit IDs are ~1.4M
     hosts = (GERRIT_CHROMIUM_HOST, GERRIT_SKIA_HOST)
   else:
@@ -9182,7 +9208,10 @@ def link_bugs_and_cls(
                 or bool(rec.get("sponsor_action"))
             ),
             "state_summary": _summarize_cl_for_bug_subtask(rec),
-            "created_ts": float(rec.get("created_ts") or 0.0),
+            # Fall back to parsed creation timestamp when created_ts is not precomputed on rec
+            "created_ts": float(
+                rec.get("created_ts") or _parse_ts(rec.get("created")) or 0.0
+            ),
             "submitted_ts": float(rec.get("submitted_ts") or 0.0),
             "activity_ts": float(rec.get("activity_ts") or 0.0),
             "conversation_id": scid,
@@ -10604,7 +10633,10 @@ def classify_bug_status(
   is_self_assigned = _is_self_bug_assignee(str(bug.get("assignee") or ""))
   non_wip_self_cl_ts = max(
       (
-          max(float(c.get("created_ts") or 0.0), float(c.get("submitted_ts") or 0.0))
+          max(
+              float(c.get("created_ts") or c.get("activity_ts") or 0.0),
+              float(c.get("submitted_ts") or 0.0),
+          )
           for c in linked_cls
           if c.get("is_self")
           and not c.get("is_wip")
@@ -11077,7 +11109,8 @@ def reassign_security_merge_batch(
         and str(bug.get("component_id") or "").strip() == SECURITY_MERGE_COMPONENT_ID
         and extract_merge_milestone(str(bug.get("title") or "")) is not None
         and bool(str(bug.get("parent_issue_id") or "").strip())
-        and str(cf.get(CF_BUG_MERGE) or "").strip().lower() == "pending"
+        and str(cf.get(CF_BUG_MERGE) or bug.get("merge_status") or "").strip().lower()
+        == "pending"
         and _is_self_bug_assignee(str(bug.get("assignee") or ""))
     )
     if not in_scope:
@@ -11149,12 +11182,18 @@ def reassign_security_merge_batch(
   failed_ids: list[str] = []
   for idx, bid in enumerate(clean_ids):
     acc_raw = p3_outs[idx + 1] if (idx + 1) < len(p3_outs) else ""
-    writer_ok = "true" in acc_raw.lower()
     rb = rb_by_id.get(bid)
     bug = bugs[f"buganizer:{bid}"]
     if isinstance(rb, dict) and rb.get("assignee"):
       bug["assignee"] = rb["assignee"]
+    elif bid in p2_ok_set and not rb:
+      # Phase 2 safe_reassign_issue succeeded; do not report false failure on Phase 3 read-back timeout
+      bug["assignee"] = "merges@chromium.org"
     rb_assignee = str((rb or bug).get("assignee") or "").strip().lower()
+    # Trust Phase 1 collaborator + Phase 2 reassign success if Phase 3 access read-back times out
+    writer_ok = "true" in acc_raw.lower() or (
+        bid in p2_ok_set and not acc_raw.strip()
+    )
     if bid in p2_ok_set and rb_assignee == "merges@chromium.org" and writer_ok:
       bug["is_collaborator"] = True
       reassigned_ids.append(bid)
@@ -11195,8 +11234,18 @@ def reassign_security_merge_for_state(
         target_ids.append(str(b.get("id") or ""))
   res = reassign_security_merge_batch(bugs, target_ids, comment_markdown=comment_markdown)
   if res.get("ok"):
-    attach_merge_children_to_cls_and_bugs(bugs, state.get("items") or {})
-    save_watcher_state(state)
+    # Reload latest state under lock so slow MCP calls do not clobber concurrent writes
+    with _STATE_IO_LOCK:
+      latest_state = load_watcher_state()
+      latest_bugs = latest_state.setdefault("bugs", {})
+      for bid in target_ids:
+        bkey = f"buganizer:{bid}"
+        if bkey in bugs:
+          latest_bugs[bkey] = bugs[bkey]
+      attach_merge_children_to_cls_and_bugs(
+          latest_bugs, latest_state.get("items") or {}
+      )
+      save_watcher_state(latest_state)
   return res
 
 
@@ -11613,50 +11662,55 @@ def ack_bug_items(bug_keys: list[str]) -> dict[str, Any]:
   keys = [str(k).strip() for k in bug_keys if str(k).strip()]
   if not keys:
     return {"ok": False, "error": "Missing bug_key"}
-  state = load_watcher_state()
-  bugs = state.get("bugs") or {}
-  now_ts = time.time()
-  acked: list[str] = []
-  last_lane = "assigned"
-  for bkey in keys:
-    # Support R70's merge_group:<parent_id> synthetic key alongside explicit bug keys
-    if bkey.startswith("merge_group:"):
-      pid = bkey.split(":", 1)[1].strip()
-      for bug in bugs.values():
-        if not isinstance(bug, dict):
-          continue
-        b_pid = str(
-            bug.get("parent_issue_id") or bug.get("merge_group_parent_id") or ""
-        ).strip()
-        if b_pid == pid:
-          bug["acked_ts"] = max(now_ts, float(bug.get("modified_ts") or 0.0))
-          classify_bug_status(bug, now_ts=now_ts)
-          last_lane = str(bug.get("lane") or "has_cl")
-          if bkey not in acked:
-            acked.append(bkey)
-      continue
-    bug = bugs.get(bkey)
-    if not isinstance(bug, dict):
-      continue
-    acked_val = max(
-        now_ts,
-        float(bug.get("modified_ts") or 0.0),
-        _parse_ts(bug.get("last_human_comment_at")),
-        float(bug.get("latest_cl_merged_ts") or 0.0),
-    )
-    bug["acked_ts"] = acked_val
-    state.setdefault("bug_acks", {})[bkey] = acked_val
-    classify_bug_status(bug, now_ts=now_ts)
-    last_lane = str(bug.get("lane") or "assigned")
-    if not _should_retain_bug_in_view(bug):
-      bugs.pop(bkey, None)
-      last_lane = "dismissed"
-    acked.append(bkey)
-  if not acked:
-    return {"ok": False, "error": f"Unknown bug {keys[0]}"}
-  attach_merge_children_to_cls_and_bugs(bugs, state.get("items") or {})
-  save_watcher_state(state)
-  return {"ok": True, "bug_key": acked[0], "bug_keys": acked, "lane": last_lane}
+  with _STATE_IO_LOCK:
+    state = load_watcher_state()
+    bugs = state.get("bugs") or {}
+    now_ts = time.time()
+    acked: list[str] = []
+    last_lane = "assigned"
+    for bkey in keys:
+      # Support R70's merge_group:<parent_id> synthetic key alongside explicit bug keys
+      if bkey.startswith("merge_group:"):
+        pid = bkey.split(":", 1)[1].strip()
+        for bug in bugs.values():
+          if not isinstance(bug, dict):
+            continue
+          b_pid = str(
+              bug.get("parent_issue_id") or bug.get("merge_group_parent_id") or ""
+          ).strip()
+          if b_pid == pid:
+            acked_val = max(now_ts, float(bug.get("modified_ts") or 0.0))
+            bug["acked_ts"] = acked_val
+            cbkey = str(bug.get("bug_key") or "")
+            if cbkey:
+              state.setdefault("bug_acks", {})[cbkey] = acked_val
+            classify_bug_status(bug, now_ts=now_ts)
+            last_lane = str(bug.get("lane") or "has_cl")
+            if bkey not in acked:
+              acked.append(bkey)
+        continue
+      bug = bugs.get(bkey)
+      if not isinstance(bug, dict):
+        continue
+      acked_val = max(
+          now_ts,
+          float(bug.get("modified_ts") or 0.0),
+          _parse_ts(bug.get("last_human_comment_at")),
+          float(bug.get("latest_cl_merged_ts") or 0.0),
+      )
+      bug["acked_ts"] = acked_val
+      state.setdefault("bug_acks", {})[bkey] = acked_val
+      classify_bug_status(bug, now_ts=now_ts)
+      last_lane = str(bug.get("lane") or "assigned")
+      if not _should_retain_bug_in_view(bug):
+        bugs.pop(bkey, None)
+        last_lane = "dismissed"
+      acked.append(bkey)
+    if not acked:
+      return {"ok": False, "error": f"Unknown bug {keys[0]}"}
+    attach_merge_children_to_cls_and_bugs(bugs, state.get("items") or {})
+    save_watcher_state(state)
+    return {"ok": True, "bug_key": acked[0], "bug_keys": acked, "lane": last_lane}
 
 
 def ack_bug_item(bug_key: str) -> dict[str, Any]:
@@ -11667,6 +11721,135 @@ def ack_bug_item(bug_key: str) -> dict[str, Any]:
   return ack_bug_items([bkey])
 
 
+def merge_concurrent_state_mutations(
+    state: dict[str, Any],
+    baseline_state: dict[str, Any] | None = None,
+) -> None:
+  """Preserves user/UI state mutations written to STATE_FILE while sync_once was polling."""
+  disk_state = load_watcher_state()
+  if not isinstance(disk_state, dict):
+    return
+  base = baseline_state if isinstance(baseline_state, dict) else {}
+  base_items = base.get("items") if isinstance(base.get("items"), dict) else {}
+  base_bugs = base.get("bugs") if isinstance(base.get("bugs"), dict) else {}
+  base_acks = (
+      base.get("bug_acks") if isinstance(base.get("bug_acks"), dict) else {}
+  )
+
+  # 1. Union bug_acks with max timestamp and propagate newer acks into state["bugs"]
+  disk_acks = disk_state.get("bug_acks")
+  if isinstance(disk_acks, dict):
+    state_acks = state.setdefault("bug_acks", {})
+    bugs = state.get("bugs")
+    for bkey, d_ts_raw in disk_acks.items():
+      d_ts = float(d_ts_raw or 0.0)
+      b_ts = float(base_acks.get(bkey) or 0.0)
+      s_ts = float(state_acks.get(bkey) or 0.0)
+      if d_ts > s_ts:
+        state_acks[bkey] = d_ts
+      if d_ts > max(b_ts, s_ts) and isinstance(bugs, dict) and bkey in bugs:
+        bug = bugs.get(bkey)
+        if isinstance(bug, dict):
+          bug["acked_ts"] = max(float(bug.get("acked_ts") or 0.0), d_ts)
+          classify_bug_status(bug)
+          if not _should_retain_bug_in_view(bug):
+            bugs.pop(bkey, None)
+
+  # 2. Union confirmed_merge_bugs, review_claims, and github_rerequest_ledger
+  for dict_key in (
+      "confirmed_merge_bugs",
+      "review_claims",
+      "github_rerequest_ledger",
+  ):
+    d_map = disk_state.get(dict_key)
+    b_map = base.get(dict_key) if isinstance(base.get(dict_key), dict) else {}
+    if isinstance(d_map, dict):
+      s_map = state.setdefault(dict_key, {})
+      for k, v in d_map.items():
+        if k not in b_map or b_map.get(k) != v:
+          s_map[k] = v
+
+  # 3. Preserve concurrent bug mutations (ack, merge reassignment, start_chat)
+  disk_bugs = disk_state.get("bugs")
+  state_bugs = state.get("bugs")
+  if isinstance(disk_bugs, dict) and isinstance(state_bugs, dict):
+    for bkey, dbug in disk_bugs.items():
+      if not isinstance(dbug, dict) or bkey not in state_bugs:
+        continue
+      sbug = state_bugs.get(bkey)
+      bbug = base_bugs.get(bkey) if isinstance(base_bugs.get(bkey), dict) else {}
+      if not isinstance(sbug, dict):
+        continue
+      changed = False
+      d_acked = float(dbug.get("acked_ts") or 0.0)
+      b_acked = float(bbug.get("acked_ts") or 0.0)
+      if d_acked > max(b_acked, float(sbug.get("acked_ts") or 0.0)):
+        sbug["acked_ts"] = d_acked
+        changed = True
+      d_asg = str(dbug.get("assignee") or "").strip().lower()
+      b_asg = str(bbug.get("assignee") or "").strip().lower()
+      if d_asg == "merges@chromium.org" and b_asg != "merges@chromium.org":
+        sbug["assignee"] = dbug.get("assignee")
+        sbug["is_collaborator"] = bool(dbug.get("is_collaborator", True))
+        changed = True
+      if dbug.get("conversation_id") and dbug.get("conversation_id") != bbug.get(
+          "conversation_id"
+      ):
+        sbug["conversation_id"] = dbug["conversation_id"]
+        changed = True
+      if changed:
+        classify_bug_status(sbug)
+        if not _should_retain_bug_in_view(sbug):
+          state_bugs.pop(bkey, None)
+
+  # 4. Preserve concurrent CL/PR mutations (start_chat rekey, abandon, finalize_review, reviewers)
+  disk_items = disk_state.get("items")
+  state_items = state.get("items")
+  if isinstance(disk_items, dict) and isinstance(state_items, dict):
+    for ckey, ditem in disk_items.items():
+      if not isinstance(ditem, dict):
+        continue
+      bitem = (
+          base_items.get(ckey) if isinstance(base_items.get(ckey), dict) else {}
+      )
+      ik = str(ditem.get("item_key") or "")
+      d_cid = str(ditem.get("conversation_id") or "")
+      # Concurrent start_chat_for_item rekeyed <ik>@unchatted -> <ik>@<d_cid>
+      if d_cid and ckey == f"{ik}@{d_cid}" and ckey not in base_items:
+        unchatted_key = f"{ik}@unchatted"
+        if unchatted_key in state_items and ckey not in state_items:
+          rec = state_items.pop(unchatted_key)
+          rec["conversation_id"] = d_cid
+          rec["composite_key"] = ckey
+          rec["chat_busy"] = bool(ditem.get("chat_busy", True))
+          if ditem.get("title") and not rec.get("title"):
+            rec["title"] = ditem["title"]
+          state_items[ckey] = rec
+      sitem = state_items.get(ckey)
+      if not isinstance(sitem, dict):
+        continue
+      for field in (
+          "status",
+          "phase",
+          "self_approved",
+          "self_cr_vote",
+          "in_my_attention",
+          "assigned_reviewers",
+          "waiting_on",
+          "chat_busy",
+      ):
+        if field in ditem and ditem.get(field) != bitem.get(field):
+          # Preserve explicit user mutations made during the poll
+          if field == "status" and str(ditem.get("status") or "").upper() not in (
+              "ABANDONED",
+              "CLOSED",
+              "MERGED",
+              "SUBMITTED",
+          ):
+            continue
+          sitem[field] = ditem[field]
+
+
 def sync_once(
     wake_chats: bool = True,
     update_titles: bool = True,
@@ -11675,12 +11858,32 @@ def sync_once(
     force_bugs: bool = False,
 ) -> dict[str, Any]:
   """Performs one full discovery and status poll across active and unchatted CLs/PRs."""
+  # Prevent overlapping poll cycles from racing against each other
+  with _SYNC_LOCK:
+    return _sync_once_locked(
+        wake_chats=wake_chats,
+        update_titles=update_titles,
+        skia_dir=skia_dir,
+        sync_bugs=sync_bugs,
+        force_bugs=force_bugs,
+    )
+
+
+def _sync_once_locked(
+    wake_chats: bool = True,
+    update_titles: bool = True,
+    skia_dir: str = DEFAULT_SKIA_DIR,
+    sync_bugs: bool = False,
+    force_bugs: bool = False,
+) -> dict[str, Any]:
   # Clear per-poll Gerrit /related caches so status transitions and rebases stay fresh
   _RELATED_CLS_CACHE.clear()
   _RELATED_STACK_ORDER_CACHE.clear()
   _RELATED_RAW_CHANGES_CACHE.clear()
 
   state = load_watcher_state()
+  # Snapshot poll-start state to 3-way merge concurrent UI/CLI mutations before saving
+  baseline_state = copy.deepcopy(state)
   prev_items: dict[str, Any] = state.get("items") or {}
   events: list[dict[str, Any]] = state.get("events") or []
   review_claims: dict[str, Any] = state.setdefault("review_claims", {})
@@ -12876,6 +13079,14 @@ def sync_once(
         if isinstance(b, dict):
           classify_bug_status(b)
       attach_merge_children_to_cls_and_bugs(state["bugs"], new_items)
+      # Refresh merge gate evaluation after backfilled CLs attach to security merge bugs
+      if any(
+          isinstance(b, dict) and is_merge_request_bug(b)
+          for b in state["bugs"].values()
+      ):
+        state["merge_request_groups"] = evaluate_security_merge_groups(
+            state["bugs"], skia_dir=skia_dir, state=state, allow_llm=False
+        )
   elif state.get("bugs"):
     # Keep in-memory bug<->CL cross-links synchronized when running fast CL-only syncs
     link_bugs_and_cls(state["bugs"], new_items)
@@ -12883,6 +13094,14 @@ def sync_once(
       if isinstance(b, dict):
         classify_bug_status(b)
     attach_merge_children_to_cls_and_bugs(state["bugs"], new_items)
+    # Recompute merge_request_groups on fast CL-only syncs so soak/roll gates stay fresh
+    if any(
+        isinstance(b, dict) and is_merge_request_bug(b)
+        for b in state["bugs"].values()
+    ):
+      state["merge_request_groups"] = evaluate_security_merge_groups(
+          state["bugs"], skia_dir=skia_dir, state=state, allow_llm=False
+      )
   state["last_sync"] = now_et_str()
   state["gardener_url"] = gardener_pen_url()
   state["rollers_summary"] = {
@@ -12897,9 +13116,11 @@ def sync_once(
       for k, v in rollers.items()
       if k in ("Android", "Chrome", "Google3", "Flutter")
   }
-  # Overlay real-time chat busy states right before saving the snapshot
-  overlay_live_chat_busy(state)
-  save_watcher_state(state)
+  with _STATE_IO_LOCK:
+    merge_concurrent_state_mutations(state, baseline_state)
+    # Overlay real-time chat busy states right before saving the snapshot
+    overlay_live_chat_busy(state)
+    save_watcher_state(state)
   return state
 
 
@@ -13701,7 +13922,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="wrap">
     <div class="brand" style="cursor: pointer;" onclick="window.parent.postMessage({type: 'jetski-flight-deck-close'}, '*')" title="Hide Flight Deck panel">✈️ Flight Deck</div>
     <div class="view-switch" id="view-switch" role="tablist" aria-label="View"></div>
-    <input type="text" id="search-box" placeholder="Search..." oninput="updateSearchQuery(this.value)" style="margin-left: 15px; padding: 2px 8px; border: 1px solid var(--hairline); border-radius: 4px; background: var(--card); color: var(--ink); font: 11.5px var(--sans); width: 150px;">
     <nav class="rollers" id="rollers" aria-label="Skia autorollers"></nav>
     <div class="synced" id="synced">Loading…</div>
     <button class="link-btn" id="refresh-btn" onclick="triggerRefresh()">Refresh</button>
@@ -13731,12 +13951,6 @@ const FLUTTER_DASHBOARD_URL = 'https://flutter-dashboard.appspot.com/#/build';
 const STATUS_SKIA_URL = 'https://status.skia.org/repo/skia';
 // Merged CLs older than this are chats left open after the work ended
 const OLD_MERGED_DAYS = 3;
-
-let searchQuery = "";
-function updateSearchQuery(val) {
-  searchQuery = val.toLowerCase().trim();
-  render();
-}
 
 // Bounds /api/status sockets and retries boot quickly before the 60s steady-state interval
 const POLL_INTERVAL_MS = 60000;
@@ -17544,12 +17758,6 @@ function render() {
     .filter(b => b && typeof b === 'object')
     .sort((a, b) => (b.modified_ts || 0) - (a.modified_ts || 0));
 
-  if (searchQuery) {
-    const q = searchQuery;
-    const match = (s) => (s || '').toString().toLowerCase().includes(q);
-    all = all.filter(it => match(it.target_id) || match(it.title));
-    allBugs = allBugs.filter(b => match(b.bug_id) || match(b.title));
-  }
   const projOf = it => it.project_name || 'Unassigned';
   const bugProjects = projectsOf(allBugs);
   const projects = projectsOf(all);

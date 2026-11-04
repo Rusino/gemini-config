@@ -59,6 +59,10 @@ class TestJetskiClosedFilter(unittest.TestCase):
 const fs = require('fs');
 const assert = require('assert');
 
+// Pin base clock so 2026-10-28 fixture timestamps do not cross the 7-day stale cutoff after Nov 4
+let __baseClockMs = Date.parse('2026-10-29T15:00:00Z');
+Date.now = () => __baseClockMs;
+
 const scriptPath = process.argv[1];
 const code = fs.readFileSync(scriptPath, 'utf8');
 

@@ -1,38 +1,52 @@
 #!/usr/bin/env bash
-
-# prepare-commit-msg hook to enforce SkoreText prefix and AI Assisted-by trailer
+# prepare-commit-msg hook to enforce [SkoreText] prefix and Assisted-by trailer
 
 COMMIT_MSG_FILE=$1
 COMMIT_SOURCE=$2
-SHA1=$3
 
-# Only modify the message if it's a new commit (no source) or a template
-if [[ -z "$COMMIT_SOURCE" || "$COMMIT_SOURCE" == "template" ]]; then
-    # 1. Add [SkoreText] prefix if in SkoreText project or specific path
-    PWD_PATH=$(pwd)
-    if [[ "$PWD_PATH" == *"/SkoreText"* || "$PWD_PATH" == *"/Users/jlavrova/Sources"* ]]; then
-        # Read the current message
-        MSG=$(cat "$COMMIT_MSG_FILE")
-        # Check if it doesn't already start with [SkoreText]
-        if [[ ! "$MSG" == "[SkoreText] "* && ! "$MSG" == "Merge "* ]]; then
-            echo "[SkoreText] $MSG" > "$COMMIT_MSG_FILE"
-        fi
-    fi
+# Skip merge, squash, or existing commit amends that already carry headers
+if [[ "$COMMIT_SOURCE" == "merge" || "$COMMIT_SOURCE" == "squash" ]]; then
+    exit 0
+fi
 
-    # 2. Add Assisted-by trailer
-    TRAILER=$(python3 ~/.gemini/config/hooks/chat_lifecycle.py model --trailer 2>/dev/null)
-    if [[ -n "$TRAILER" ]]; then
-        # Ensure it doesn't already exist
-        if ! grep -q "^Assisted-by:" "$COMMIT_MSG_FILE"; then
-            # We want to put it right before Change-Id: if it exists, or at the end
-            if grep -q "^Change-Id:" "$COMMIT_MSG_FILE"; then
-                sed -i -e "/^Change-Id:/i \\
-$TRAILER\\
-" "$COMMIT_MSG_FILE"
-            else
-                echo "" >> "$COMMIT_MSG_FILE"
-                echo "$TRAILER" >> "$COMMIT_MSG_FILE"
-            fi
-        fi
+PWD_PATH=$(pwd)
+
+# 1. Add [SkoreText] prefix in SkoreText or /Users/jlavrova/Sources workspaces
+if [[ "$PWD_PATH" == *"/SkoreText"* || "$PWD_PATH" == *"/Users/jlavrova/Sources"* ]]; then
+    FIRST_LINE=$(head -n 1 "$COMMIT_MSG_FILE")
+    if [[ "$FIRST_LINE" != "[SkoreText] "* && "$FIRST_LINE" != "Merge "* ]]; then
+        TMP_FILE="${COMMIT_MSG_FILE}.tmp.$$"
+        {
+            printf '[SkoreText] %s\n' "$FIRST_LINE"
+            tail -n +2 "$COMMIT_MSG_FILE"
+        } > "$TMP_FILE" && mv "$TMP_FILE" "$COMMIT_MSG_FILE"
     fi
+fi
+
+# 2. Add Assisted-by trailer before Change-Id: (or at the end of the commit message)
+TRAILER=$(python3 ~/.gemini/config/hooks/chat_lifecycle.py model --trailer 2>/dev/null)
+if [[ -n "$TRAILER" ]] && ! grep -q "^Assisted-by:" "$COMMIT_MSG_FILE"; then
+    python3 - "$COMMIT_MSG_FILE" "$TRAILER" <<'PY'
+import re
+import sys
+
+path, trailer = sys.argv[1], sys.argv[2]
+with open(path, "r", encoding="utf-8") as f:
+    text = f.read()
+
+if re.search(r"^Assisted-by:", text, flags=re.M):
+    sys.exit(0)
+
+m = re.search(r"^Change-Id:", text, flags=re.M)
+if m:
+    prefix = text[:m.start()].rstrip("\n")
+    suffix = text[m.start():]
+    new_text = f"{prefix}\n\n{trailer}\n{suffix}"
+else:
+    body = text.rstrip("\n")
+    new_text = f"{body}\n\n{trailer}\n" if body else f"{trailer}\n"
+
+with open(path, "w", encoding="utf-8") as f:
+    f.write(new_text)
+PY
 fi
