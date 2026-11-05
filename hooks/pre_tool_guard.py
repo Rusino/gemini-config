@@ -713,6 +713,62 @@ def unverified_corpus_before_upload_or_push(
   return ("", "", "")
 
 
+# Skia code that SkParagraph layout runs through: daf82dad48 (SkASSERT_RELEASE in the SkSpan
+# ctor) slowed LongLayout by 21.6% from include/core/ while no paragraph file changed. The Sk
+# prefix keeps unrelated repos with their own src/core/ out of the gate
+SKIA_PERF_PATH_RE = re.compile(
+    r"(?:^|/)modules/(?:skparagraph|skunicode|skshaper)/(?:src|include)/"
+    r"|(?:^|/)(?:include/core|include/private/base|src/base|src/core)/Sk[^/]*$"
+)
+SKIA_PERF_PATHSPECS = (
+    "modules/skparagraph/src/",
+    "modules/skparagraph/include/",
+    "modules/skunicode/src/",
+    "modules/skunicode/include/",
+    "modules/skshaper/src/",
+    "modules/skshaper/include/",
+    "include/core/",
+    "include/private/base/",
+    "src/base/",
+    "src/core/",
+)
+SKIA_PERF_EXTENSIONS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".mm"}
+SKIA_PERF_SCRIPT = "skia_patch_ab.py"
+
+
+# Basename of the last C/C++ edit on the SkParagraph hot path with no skia_patch_ab.py run since
+def unverified_perf_gate_before_upload_or_push(
+    transcript_path: str, current_cmd: str = "", current_step_idx: int = -1
+) -> str:
+  last_full_path = ""
+  has_perf_run = False
+  for step in _load_transcript_steps(transcript_path, current_step_idx):
+    if step.get("type") != "PLANNER_RESPONSE":
+      continue
+    for tc in step.get("tool_calls") or []:
+      tname = tc.get("name", "")
+      targs = tc.get("args") or {}
+      if tname in EDIT_TOOLS:
+        norm_tf = get_tool_target_file(targs).strip().strip('"').strip("'").replace("\\", "/")
+        ext = os.path.splitext(norm_tf)[1].lower()
+        if (
+            ext in SKIA_PERF_EXTENSIONS
+            and SKIA_PERF_PATH_RE.search(norm_tf)
+            and is_executable_code_edit(tname, targs)
+        ):
+          last_full_path = norm_tf
+          has_perf_run = False
+      elif tname == "run_command":
+        if _invokes_script(str(targs.get("CommandLine", "")), SKIA_PERF_SCRIPT):
+          has_perf_run = True
+  if not last_full_path or has_perf_run or _invokes_script(current_cmd, SKIA_PERF_SCRIPT):
+    return ""
+  # A reverted edit leaves no diff on disk and needs no perf run
+  if _git_branch_has_executable_code_changes(last_full_path, SKIA_PERF_PATHSPECS) is False:
+    return ""
+  return os.path.basename(last_full_path)
+
+
 # Subjects that claim a speedup; a perf claim without measurements is the failure mode the
 # perf-optimization-loop skill exists to prevent
 PERF_CLAIM_RE = re.compile(
@@ -4266,6 +4322,28 @@ def main() -> None:
                         f"`python3 {req_script} --out /tmp/corpus_check`\n"
                         "(Note: comment-only, summary, or commit-message edits do not trigger "
                         "this requirement.)"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
+      # Correctness corpora do not measure speed; Skia hot-path diffs need the txt_benchmarks A/B
+      perf_file = unverified_perf_gate_before_upload_or_push(transcript_path, cmd_str, step_idx)
+      if perf_file:
+        print(
+            json.dumps(
+                {
+                    "decision": "deny",
+                    "reason": (
+                        f"[PERF-CHECK GUARD] You modified executable Skia code on the "
+                        f"SkParagraph hot path (`{perf_file}`), but have not run the "
+                        "txt_benchmarks A/B gate since the last code edit! Before "
+                        "`git cl upload`, `gh pr create`, or `git push`, run:\n"
+                        "`python3 ~/.gemini/config/skills/flutter-engine-perf-compare/scripts/"
+                        "skia_patch_ab.py --skia-repo <repo> --out /tmp/skia_patch_ab`\n"
+                        "UNAFFECTED / NEUTRAL / IMPROVEMENT pass; REGRESSION blocks until fixed "
+                        "or the user accepts it. Put the result line into the `Tested:` block."
                     ),
                 },
                 ensure_ascii=False,

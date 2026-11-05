@@ -56,3 +56,44 @@ python3 ~/.gemini/config/skills/flutter-engine-perf-compare/scripts/perf_compare
 
 ## Important Notes on Memory Tracking
 `txt_benchmarks` uses Google Benchmark. Google Benchmark tracks real/cpu time by default. It can track memory allocations if the benchmark is instrumented or run under a tool, but natively it requires the platform to support memory queries or custom counters. The script will parse whatever custom counters `txt_benchmarks` outputs. If memory isn't explicitly output by `txt_benchmarks` via counters, the script will focus on CPU time.
+
+## Skia Patch A/B Gate (`skia_patch_ab.py`)
+
+Mandatory pre-upload speed gate for Skia diffs that touch executable C/C++ code under
+`modules/{skparagraph,skunicode,skshaper}/{src,include}/`, `include/core/`,
+`include/private/base/`, `src/base/`, or `src/core/` (`amnesia-precommit` Phase 4, enforced by
+`[PERF-CHECK GUARD]` in `hooks/pre_tool_guard.py`). Correctness corpora do not measure speed:
+Skia `daf82dad48` (`SkASSERT_RELEASE` in the `SkSpan` ctor) slowed `LongLayout` by 21.6% unnoticed.
+
+```bash
+python3 ~/.gemini/config/skills/flutter-engine-perf-compare/scripts/skia_patch_ab.py \
+  --skia-repo <skia checkout or worktree with the change> --out /tmp/skia_patch_ab
+```
+
+- The patch is `git -C <skia-repo> diff --binary <base>`, so uncommitted edits count; untracked
+  files do not (the script warns). `--base` defaults to `merge-base HEAD origin/main`.
+- It builds `txt_benchmarks` twice in the shared engine checkout (`--engine-src`, default
+  `~/.gemini/jetski/scratch/flutter/engine/src`, `--build-dir out/host_release`) with the Skia
+  submodule at `<base>` and at `<base>` + patch, then always restores the submodule (also on
+  Ctrl-C/SIGTERM). It refuses a dirty submodule and waits for `run_flutter_paragraph_tests.py`
+  and other `skia_patch_ab.py` runs.
+- Rounds (`--rounds 20`) run both binaries interleaved with rotating order, pinned by `taskset`
+  to `--cpu` (default `nproc-17`). Per benchmark it reports the median per-round patch/base
+  `cpu_time` ratio and a seeded bootstrap 95% CI of that median.
+- Outputs: `<out>/report.md` (table + attestation) and `<out>/attestation.json` (base SHA, patch
+  sha256, binary sha256s, rounds, cpu, filter, load before/after).
+
+| Verdict | Meaning | Exit |
+|---|---|---|
+| `UNAFFECTED` | Empty diff, or both binaries byte-identical (change does not reach `txt_benchmarks`) | 0 |
+| `NEUTRAL` | CI overlaps `[1 - threshold, 1 + threshold]` (`--threshold 0.02`) | 0 |
+| `IMPROVEMENT` | Every benchmark has CI high `< 1 - threshold` | 0 |
+| `REGRESSION` | Any benchmark has CI low `> 1 + threshold`; blocks upload until fixed or the user accepts it | 2 |
+
+Other exits: 1 bad arguments, 3 setup/build/run error (ninja log tail printed; a `--base` far
+from the Skia revision pinned in Flutter `DEPS` may not build), 4 submodule restore failed
+(inspect `flutter/third_party/skia` by hand before anything else uses it).
+
+Runtime: two incremental `ninja` builds (a few minutes after a header change in `include/core/`)
+plus about 5–8 minutes for 20 rounds with the default filter. Put the `report.md` table rows
+into the CL `Tested:` block. Tests: `python3 -m unittest test_skia_patch_ab` in `scripts/`.

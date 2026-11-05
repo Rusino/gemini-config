@@ -1009,7 +1009,7 @@ class TestPreToolGuard(unittest.TestCase):
         self.assertIn("CORPUS-CHECK GUARD", out_deny.get("reason", ""))
         self.assertIn("run_flutter_paragraph_tests.py", out_deny.get("reason", ""))
 
-      # 3. Running run_flutter_paragraph_tests.py unlocks git cl upload / git push
+      # 3. Running run_flutter_paragraph_tests.py (plus the PERF-CHECK A/B gate) unlocks upload
       f_trans.write(
           json.dumps({
               "step_index": 5,
@@ -1017,7 +1017,7 @@ class TestPreToolGuard(unittest.TestCase):
               "tool_calls": [{
                   "name": "run_command",
                   "args": {
-                      "CommandLine": "python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py --out /tmp/out"
+                      "CommandLine": "python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py --out /tmp/out && python3 skia_patch_ab.py --skia-repo . --out /tmp/ab"
                   },
               }],
           })
@@ -1135,6 +1135,90 @@ class TestPreToolGuard(unittest.TestCase):
           }).get("decision"),
           "allow",
       )
+
+  def _perf_guard_upload(self, steps: list[dict], cmd: str = "git cl upload") -> dict:
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f_trans:
+      for s in steps:
+        f_trans.write(json.dumps(s) + "\n")
+    try:
+      return self.run_guard({
+          "conversationId": "c1",
+          "transcriptPath": f_trans.name,
+          "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}},
+      })
+    finally:
+      os.unlink(f_trans.name)
+
+  @staticmethod
+  def _perf_step(idx: int, name: str, args: dict) -> dict:
+    return {
+        "step_index": idx,
+        "type": "PLANNER_RESPONSE",
+        "tool_calls": [{"name": name, "args": args}],
+    }
+
+  def _perf_edit_and_audits(self, path: str, target: str, replacement: str) -> list[dict]:
+    return [
+        self._perf_step(1, "edit_file", {
+            "Path": path, "Target": target, "Replacement": replacement,
+        }),
+        self._perf_step(2, "run_command", {"CommandLine": (
+            "python3 audit_comments.py --diff HEAD --repo . && "
+            "python3 ruthless_audit.py . --repo . --diff HEAD"
+        )}),
+    ]
+
+  def test_perf_check_guard_triggers_for_skspan_header_outside_paragraph(self):
+    steps = self._perf_edit_and_audits(
+        "/workspace/skia/include/core/SkSpan.h",
+        "constexpr SkSpan(T* ptr, size_t size) : fPtr{ptr}, fSize{size} {}",
+        "constexpr SkSpan(T* ptr, size_t size) : fPtr{ptr}, fSize{size} {\n"
+        "  SkASSERT_RELEASE(size < kMaxSize);\n}",
+    )
+    for cmd in ("git cl upload", "git push origin main", "gh pr create --fill"):
+      out = self._perf_guard_upload(steps, cmd)
+      self.assertEqual(out.get("decision"), "deny", msg=f"{cmd}: {out}")
+      self.assertIn("PERF-CHECK GUARD", out.get("reason", ""))
+      self.assertIn("skia_patch_ab.py", out.get("reason", ""))
+      self.assertIn("SkSpan.h", out.get("reason", ""))
+    self.assertEqual(
+        self._perf_guard_upload(steps, "git commit -m 'x'").get("decision"), "allow"
+    )
+
+  def test_perf_check_guard_allows_after_skia_patch_ab_run(self):
+    steps = self._perf_edit_and_audits(
+        "/workspace/skia/src/core/SkStrikeCache.cpp", "return a;", "return a + 1;"
+    )
+    run = "python3 ~/.gemini/config/skills/flutter-engine-perf-compare/scripts/skia_patch_ab.py"
+    after = steps + [self._perf_step(3, "run_command", {
+        "CommandLine": f"{run} --skia-repo /workspace/skia --out /tmp/ab",
+    })]
+    self.assertEqual(self._perf_guard_upload(after).get("decision"), "allow")
+    self.assertEqual(
+        self._perf_guard_upload(steps, f"{run} --skia-repo . --out /tmp/ab && git cl upload")
+        .get("decision"),
+        "allow",
+    )
+    grep_only = steps + [self._perf_step(3, "run_command", {
+        "CommandLine": "grep -rn main skia_patch_ab.py",
+    })]
+    self.assertEqual(self._perf_guard_upload(grep_only).get("decision"), "deny")
+    re_edit = after + [self._perf_step(4, "edit_file", {
+        "Path": "/workspace/skia/src/core/SkStrikeCache.cpp",
+        "Target": "return a + 1;", "Replacement": "return a + 2;",
+    })]
+    self.assertEqual(self._perf_guard_upload(re_edit).get("decision"), "deny")
+
+  def test_perf_check_guard_ignores_tests_docs_and_comment_only_edits(self):
+    for path, target, repl in (
+        ("/workspace/skia/tests/SkSpanTest.cpp", "return a;", "return a + 1;"),
+        ("/workspace/skia/modules/skparagraph/README.md", "old", "new text"),
+        ("/workspace/skia/src/core/SkSpan.cpp", "// old why\nx();", "// new why\nx();"),
+        ("/workspace/other/src/core/engine.cc", "return a;", "return a + 1;"),
+    ):
+      steps = self._perf_edit_and_audits(path, target, repl)
+      out = self._perf_guard_upload(steps)
+      self.assertNotIn("PERF-CHECK GUARD", out.get("reason", ""), msg=path)
 
   def test_compound_command_inspection_prefix_does_not_bypass_mutation_guards(self):
     import pre_tool_guard
