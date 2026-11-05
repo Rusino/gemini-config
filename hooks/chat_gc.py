@@ -693,6 +693,167 @@ def _purge_conversation_storage(
       shutil.rmtree(brain_p, ignore_errors=True)
 
 
+# Walk bounded tree depth to find newest mtime so active subfiles prevent premature cleanup
+def _newest_mtime_in_tree(path: str, max_entries: int = 4096) -> float:
+  """Returns the newest mtime across a file or directory tree (bounded scan)."""
+  try:
+    newest = os.lstat(path).st_mtime
+  except OSError:
+    return 0.0
+  if not os.path.isdir(path) or os.path.islink(path):
+    return newest
+  scanned = 0
+  for root, dirs, files in os.walk(path, followlinks=False):
+    for name in (*dirs, *files):
+      scanned += 1
+      if scanned > max_entries:
+        return newest
+      try:
+        mt = os.lstat(os.path.join(root, name)).st_mtime
+        if mt > newest:
+          newest = mt
+      except OSError:
+        pass
+  return newest
+
+
+def _scan_proc_open_paths(roots: list[str]) -> set[str]:
+  """Collects paths under `roots` referenced by live user processes in /proc."""
+  referenced: set[str] = set()
+  norm_roots = [os.path.abspath(r) for r in roots if r]
+  if not norm_roots or not os.path.isdir("/proc"):
+    return referenced
+  uid = os.getuid()
+  for entry in os.listdir("/proc"):
+    if not entry.isdigit():
+      continue
+    proc_dir = os.path.join("/proc", entry)
+    try:
+      if os.stat(proc_dir).st_uid != uid:
+        continue
+    except OSError:
+      continue
+    try:
+      with open(os.path.join(proc_dir, "cmdline"), "rb") as f:
+        raw = f.read(16384).decode("utf-8", errors="ignore")
+      for token in raw.replace("\x00", " ").split():
+        for val in (token, token.split("=", 1)[-1] if "=" in token else ""):
+          if any(val.startswith(nr + "/") or val == nr for nr in norm_roots):
+            referenced.add(val)
+    except OSError:
+      pass
+    try:
+      cwd_t = os.readlink(os.path.join(proc_dir, "cwd"))
+      if any(cwd_t.startswith(nr + "/") or cwd_t == nr for nr in norm_roots):
+        referenced.add(cwd_t)
+    except OSError:
+      pass
+    fd_dir = os.path.join(proc_dir, "fd")
+    try:
+      for fd in os.listdir(fd_dir)[:128]:
+        try:
+          target = os.readlink(os.path.join(fd_dir, fd))
+          if any(target.startswith(nr + "/") or target == nr for nr in norm_roots):
+            referenced.add(target)
+        except OSError:
+          pass
+    except OSError:
+      pass
+  return referenced
+
+
+def gc_stale_test_tmp(
+    apply: bool = False,
+    now: datetime | None = None,
+    max_age_hours: float = 24.0,
+    cache_tmp_root: str | None = None,
+    sys_tmp_root: str | None = None,
+    open_paths_override: set[str] | None = None,
+) -> dict[str, Any]:
+  """Removes isolated Flutter/Chrome test temp dirs older than 24h with no live process."""
+  now_dt = now or datetime.now(timezone.utc)
+  now_ts = now_dt.timestamp()
+  min_age_sec = max_age_hours * 3600.0
+  uid = os.getuid()
+
+  eff_cache = (
+      cache_tmp_root
+      if cache_tmp_root is not None
+      else os.path.expanduser("~/.cache/flutter_test_tmp")
+  )
+  eff_sys = sys_tmp_root if sys_tmp_root is not None else "/tmp"
+
+  open_paths = (
+      set(open_paths_override)
+      if open_paths_override is not None
+      else _scan_proc_open_paths([eff_cache, eff_sys])
+  )
+
+  def _is_path_open(cand: str) -> bool:
+    ac = os.path.abspath(cand)
+    prefix = ac + os.sep
+    return any(p == ac or p.startswith(prefix) for p in open_paths)
+
+  candidates: list[str] = []
+  if eff_cache and os.path.isdir(eff_cache):
+    try:
+      for name in sorted(os.listdir(eff_cache)):
+        if name.startswith(("run_", "wp_gallery_chrome_")):
+          candidates.append(os.path.join(eff_cache, name))
+    except OSError:
+      pass
+
+  sys_prefixes = (
+      "flutter_tools.",
+      ".com.google.Chrome.",
+      ".org.chromium.Chromium.",
+      "wp_gallery_chrome_",
+  )
+  if eff_sys and os.path.isdir(eff_sys):
+    try:
+      for name in sorted(os.listdir(eff_sys)):
+        if name.startswith(sys_prefixes):
+          candidates.append(os.path.join(eff_sys, name))
+    except OSError:
+      pass
+
+  deleted: list[str] = []
+  preserved_active: list[str] = []
+  reclaimed_bytes = 0
+
+  for cand in candidates:
+    try:
+      st = os.lstat(cand)
+    except OSError:
+      continue
+    if st.st_uid != uid or os.path.islink(cand):
+      continue
+    newest_mt = _newest_mtime_in_tree(cand)
+    if (now_ts - newest_mt) < min_age_sec:
+      continue
+    if _is_path_open(cand):
+      preserved_active.append(cand)
+      continue
+    sz = _dir_size_bytes(cand)
+    if apply:
+      try:
+        if os.path.isdir(cand):
+          shutil.rmtree(cand, ignore_errors=True)
+        else:
+          os.unlink(cand)
+      except OSError:
+        continue
+    deleted.append(cand)
+    reclaimed_bytes += sz
+
+  return {
+      "count": len(deleted),
+      "bytes": reclaimed_bytes,
+      "deleted": deleted,
+      "preserved_active": preserved_active,
+  }
+
+
 def run_gc(
     apply: bool = False,
     app_dirs: list[str] | None = None,
@@ -1142,11 +1303,20 @@ def run_gc(
       tier1_cids.append(cid)
       tier1_bytes += freed
 
+  # Clean isolated Flutter/Chrome test temp directories older than 24h on real host runs
+  host_tmp_res = (
+      gc_stale_test_tmp(apply=apply, now=now_dt, max_age_hours=24.0)
+      if app_dirs is None
+      else {"count": 0, "bytes": 0, "deleted": [], "preserved_active": []}
+  )
+
   report = {
       "timestamp": now_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
       "apply": apply,
       "protected_active_count": len(proc_active),
       "protected_open_roadmap_count": len(open_rm_cids),
+      # Include 24h host test temp sweep metrics in the unified GC report
+      "host_test_tmp": host_tmp_res,
       "tier1_scratch": {
           "count": len(tier1_cids),
           "bytes": tier1_bytes,
@@ -1170,7 +1340,14 @@ def run_gc(
           "cids": tier3_cids,
           "cold_dir": eff_cold_dir,
       },
-      "total_reclaimed_bytes": tier1_bytes + task_logs_bytes + tier2_bytes + tier3_bytes,
+      # Sum reclaimed bytes across all 3 conversation tiers plus expired host test temp dirs
+      "total_reclaimed_bytes": (
+          tier1_bytes
+          + task_logs_bytes
+          + tier2_bytes
+          + tier3_bytes
+          + host_tmp_res["bytes"]
+      ),
   }
 
   if apply and eff_log_file:

@@ -626,6 +626,87 @@ class ChatGcTest(unittest.TestCase):
       )
       self.assertIn('"mock": true', buf.getvalue())
 
+  def test_gc_stale_test_tmp_respects_24h_cutoff_and_active_processes(self) -> None:
+    cache_tmp = os.path.join(self.base, "flutter_test_tmp")
+    sys_tmp = os.path.join(self.base, "sys_tmp")
+    os.makedirs(cache_tmp, exist_ok=True)
+    os.makedirs(sys_tmp, exist_ok=True)
+
+    old_ts = (self.now - timedelta(hours=25)).timestamp()
+    fresh_ts = (self.now - timedelta(hours=23)).timestamp()
+
+    # 1. Stale isolated run dir (> 24h) -> should be deleted
+    stale_run = os.path.join(cache_tmp, "run_1234_1700000000")
+    os.makedirs(stale_run, exist_ok=True)
+    stale_file = os.path.join(stale_run, "chrome_profile.dat")
+    with open(stale_file, "wb") as f:
+      f.write(b"X" * 2048)
+    os.utime(stale_file, (old_ts, old_ts))
+    os.utime(stale_run, (old_ts, old_ts))
+
+    # 2. Fresh isolated run dir (< 24h) -> must be preserved
+    fresh_run = os.path.join(cache_tmp, "run_5678_1700000001")
+    os.makedirs(fresh_run, exist_ok=True)
+    fresh_file = os.path.join(fresh_run, "chrome_profile.dat")
+    with open(fresh_file, "wb") as f:
+      f.write(b"Y" * 2048)
+    os.utime(fresh_file, (fresh_ts, fresh_ts))
+    os.utime(fresh_run, (fresh_ts, fresh_ts))
+
+    # 3. Stale top-level dir containing a recently modified file (< 24h) -> must be preserved
+    mixed_run = os.path.join(cache_tmp, "run_9999_1700000002")
+    os.makedirs(mixed_run, exist_ok=True)
+    mixed_file = os.path.join(mixed_run, "recent.log")
+    with open(mixed_file, "wb") as f:
+      f.write(b"Z" * 1024)
+    os.utime(mixed_file, (fresh_ts, fresh_ts))
+    os.utime(mixed_run, (old_ts, old_ts))
+
+    # 4. Stale dir (> 24h) referenced by a live process -> must be preserved
+    active_stale = os.path.join(sys_tmp, "flutter_tools.ACTIVE")
+    os.makedirs(active_stale, exist_ok=True)
+    active_f = os.path.join(active_stale, "lock")
+    with open(active_f, "wb") as f:
+      f.write(b"L" * 512)
+    os.utime(active_f, (old_ts, old_ts))
+    os.utime(active_stale, (old_ts, old_ts))
+
+    # 5. Stale /tmp/flutter_tools.* and /tmp/.com.google.Chrome.* (> 24h) -> should be deleted
+    stale_ft = os.path.join(sys_tmp, "flutter_tools.STALE1")
+    os.makedirs(stale_ft, exist_ok=True)
+    stale_ft_f = os.path.join(stale_ft, "dev")
+    with open(stale_ft_f, "wb") as f:
+      f.write(b"F" * 1024)
+    os.utime(stale_ft_f, (old_ts, old_ts))
+    os.utime(stale_ft, (old_ts, old_ts))
+
+    stale_chrome = os.path.join(sys_tmp, ".com.google.Chrome.STALE2")
+    with open(stale_chrome, "wb") as f:
+      f.write(b"C" * 1024)
+    os.utime(stale_chrome, (old_ts, old_ts))
+
+    # 6. Unrelated /tmp directory (> 24h) -> must never be touched
+    unrelated = os.path.join(sys_tmp, "skia_temp")
+    os.makedirs(unrelated, exist_ok=True)
+    os.utime(unrelated, (old_ts, old_ts))
+
+    res = chat_gc.gc_stale_test_tmp(
+        apply=True,
+        now=self.now,
+        max_age_hours=24.0,
+        cache_tmp_root=cache_tmp,
+        sys_tmp_root=sys_tmp,
+        open_paths_override={os.path.join(active_stale, "flutter_tools_chrome_device.XYZ")},
+    )
+    self.assertEqual(res["count"], 3)
+    self.assertFalse(os.path.exists(stale_run))
+    self.assertFalse(os.path.exists(stale_ft))
+    self.assertFalse(os.path.exists(stale_chrome))
+    self.assertTrue(os.path.exists(fresh_run))
+    self.assertTrue(os.path.exists(mixed_run))
+    self.assertTrue(os.path.exists(active_stale))
+    self.assertTrue(os.path.exists(unrelated))
+
 
 if __name__ == "__main__":
   unittest.main()

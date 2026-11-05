@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import os
 import pathlib
 import subprocess
 import sys
@@ -276,6 +277,21 @@ class TestFlutterExternalSkiaPreflight(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "behind upstream/main"):
                     rfpt.main()
             self.assertEqual(checkout_calls, [])
+
+    def test_isolated_run_tmpdir_and_process_group_kill(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = pathlib.Path(td)
+            run_tmp = rfpt.create_isolated_run_tmpdir(base)
+            self.assertTrue(run_tmp.exists())
+            self.assertEqual(run_tmp.parent, base)
+            self.assertTrue(run_tmp.name.startswith(f"run_{os.getpid()}_"))
+
+            fake_proc = mock.MagicMock()
+            fake_proc.pid = 424242
+            fake_proc.poll.return_value = None
+            with mock.patch("os.killpg") as m_killpg:
+                rfpt._kill_process_group(fake_proc)
+                m_killpg.assert_called_once_with(424242, rfpt.signal.SIGKILL)
 
 
 if __name__ == "__main__":

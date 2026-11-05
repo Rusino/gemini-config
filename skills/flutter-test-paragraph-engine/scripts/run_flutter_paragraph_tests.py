@@ -52,6 +52,49 @@ SKIA_MONITORED_DIRS = [
 ]
 
 
+# Track active child process groups so SIGINT/SIGTERM cleanup reaps all spawned tester processes
+_ACTIVE_PROCS: list[subprocess.Popen[Any]] = []
+
+
+# Create a unique per-run temp directory on the root disk (~/.cache) instead of shared /tmp tmpfs
+def create_isolated_run_tmpdir(base_root: Optional[pathlib.Path | str] = None) -> pathlib.Path:
+    root = pathlib.Path(base_root) if base_root else (pathlib.Path.home() / ".cache/flutter_test_tmp")
+    root.mkdir(parents=True, exist_ok=True)
+    run_dir = root / f"run_{os.getpid()}_{int(time.time() * 1000)}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+# Send SIGKILL to the entire child process group so child processes never survive as orphans
+def _kill_process_group(proc: subprocess.Popen[Any]) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+# Run command in a dedicated session and kill its process group on timeout
+def _run_in_pg(
+    cmd: list[str], timeout: Optional[int] = None, **kwargs: Any
+) -> subprocess.CompletedProcess[Any]:
+    p = subprocess.Popen(cmd, start_new_session=True, **kwargs)
+    _ACTIVE_PROCS.append(p)
+    try:
+        rc = p.wait(timeout=timeout)
+        return subprocess.CompletedProcess(cmd, rc)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(p)
+        raise
+    finally:
+        if p in _ACTIVE_PROCS:
+            _ACTIVE_PROCS.remove(p)
+
+
 def log(msg: str, driver_log: Optional[pathlib.Path] = None) -> None:
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     line = f"{ts} {msg}"
@@ -754,7 +797,7 @@ def run_sharded_framework_tests(
         "packages/flutter/test/rendering/paragraph_intrinsics_test.dart",
     ]
     with open(warmup_log, "w") as wf:
-        subprocess.run(
+        _run_in_pg(
             warmup_cmd,
             cwd=str(repo),
             env=flutter_env,
@@ -799,7 +842,9 @@ def run_sharded_framework_tests(
             env=flutter_env,
             stdout=lf,
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
+        _ACTIVE_PROCS.append(p)
         procs.append((idx, p, lf, time.time()))
 
     deadline = t0 + timeout
@@ -810,7 +855,9 @@ def run_sharded_framework_tests(
         now = time.time()
         if now >= deadline:
             for idx, p, lf, _ in remaining:
-                p.kill()
+                _kill_process_group(p)
+                if p in _ACTIVE_PROCS:
+                    _ACTIVE_PROCS.remove(p)
                 lf.close()
                 log(f"[{label}] Shard {idx:02d} TIMED OUT after {timeout}s", driver_log)
             worst_rc = 124
@@ -822,6 +869,8 @@ def run_sharded_framework_tests(
             if rc is None:
                 still_running.append(item)
             else:
+                if p in _ACTIVE_PROCS:
+                    _ACTIVE_PROCS.remove(p)
                 lf.close()
                 if rc != 0 and worst_rc == 0:
                     worst_rc = rc
@@ -1070,9 +1119,14 @@ def main() -> int:
     orig_cache_dills = (
         set(test_cache_dir.glob("*.cache.dill*")) if test_cache_dir.exists() else set()
     )
+    run_tmpdir = create_isolated_run_tmpdir()
 
     def cleanup() -> None:
         log("=== Cleaning up Skia submodule and args.gn state ===", driver_log)
+        for p in list(_ACTIVE_PROCS):
+            _kill_process_group(p)
+        _ACTIVE_PROCS.clear()
+        shutil.rmtree(run_tmpdir, ignore_errors=True)
         try:
             checkout_skia_ref(skia_repo, "WORKTREE", worktree_patch, ext_skia_repo, orig_branch_or_sha)
         except Exception as e:
@@ -1249,6 +1303,7 @@ def main() -> int:
                 f"--local-engine-src-path={engine_src}",
             ]
             flutter_env = os.environ.copy()
+            flutter_env["TMPDIR"] = str(run_tmpdir)
             dart_sdk_stamp = repo / "bin/cache/engine-dart-sdk.stamp"
             if "FLUTTER_PREBUILT_ENGINE_VERSION" not in flutter_env and dart_sdk_stamp.exists():
                 stamp_val = dart_sdk_stamp.read_text(errors="replace").strip()
@@ -1302,7 +1357,7 @@ def main() -> int:
                     test_commands.append(" ".join(cmd))
                     log(f"[{label}] Running Dart {b_name} ({len(b_files)} files)...", driver_log)
                     with open(b_log, "w") as lf:
-                        res = subprocess.run(
+                        res = _run_in_pg(
                             cmd,
                             cwd=str(repo),
                             env=flutter_env,

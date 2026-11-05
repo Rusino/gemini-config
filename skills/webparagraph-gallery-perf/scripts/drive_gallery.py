@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socketserver
 import subprocess
 import sys
@@ -81,7 +82,10 @@ def main():
 
     url = f'http://127.0.0.1:{args.port}/index.html' + (
         '?web_paragraph=true' if args.mode == 'wp' else '')
-    profile = tempfile.mkdtemp(prefix='wp_gallery_chrome_')
+    # Store Chrome user-data-dir on the root disk (~/.cache) so /tmp tmpfs never fills up
+    cache_tmp = os.path.expanduser('~/.cache/flutter_test_tmp')
+    os.makedirs(cache_tmp, exist_ok=True)
+    profile = tempfile.mkdtemp(prefix='wp_gallery_chrome_', dir=cache_tmp)
     cmd = [
         args.chrome, f'--user-data-dir={profile}', f'--remote-debugging-port={args.cdp_port}',
         '--enable-experimental-web-platform-features',
@@ -101,10 +105,13 @@ def main():
     failed = threading.Event()
     pat = re.compile(r'"(GALLERY_[A-Z_]+(?: .*?)?)", source')
     env = dict(os.environ)
+    # Route Chrome internal crashpad and shared-memory temp files into the per-run profile dir
+    env['TMPDIR'] = profile
     if args.no_dbus:
         env['DBUS_SESSION_BUS_ADDRESS'] = 'disabled:'
+    # Start Chrome in its own session so timeout kills all renderer/GPU child processes
     proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True,
-                            errors='replace', env=env)
+                            errors='replace', env=env, start_new_session=True)
 
 
     def handle(raw):
@@ -325,7 +332,11 @@ def main():
     try:
         proc.wait(10)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        # Kill the entire Chrome process group so renderer children do not outlive the run
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            proc.kill()
     httpd.shutdown()
     # A fresh profile per run is the point; a run leaves ~50 MB behind otherwise
     shutil.rmtree(profile, ignore_errors=True)

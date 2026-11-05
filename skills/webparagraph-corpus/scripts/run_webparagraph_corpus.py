@@ -96,13 +96,57 @@ def find_ninja(repo):
     raise RuntimeError("Could not find `ninja` binary")
 
 
-def build_env(repo):
+# Track active child process groups so SIGINT/SIGTERM cleanup reaps all spawned Chrome browsers
+_ACTIVE_PROCS = []
+
+
+# Create a unique per-run temp directory on the root disk (~/.cache) instead of shared /tmp tmpfs
+def create_isolated_run_tmpdir(base_root=None):
+    root = pathlib.Path(base_root) if base_root else (pathlib.Path.home() / ".cache/flutter_test_tmp")
+    root.mkdir(parents=True, exist_ok=True)
+    run_dir = root / f"run_{os.getpid()}_{int(time.time() * 1000)}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+# Send SIGKILL to the entire child process group so headless Chrome children never survive as orphans
+def _kill_process_group(proc):
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+# Run command in a dedicated session and kill its process group on timeout
+def _run_in_pg(cmd, timeout=None, **kwargs):
+    p = subprocess.Popen(cmd, start_new_session=True, **kwargs)
+    _ACTIVE_PROCS.append(p)
+    try:
+        rc = p.wait(timeout=timeout)
+        return subprocess.CompletedProcess(cmd, rc)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(p)
+        raise
+    finally:
+        if p in _ACTIVE_PROCS:
+            _ACTIVE_PROCS.remove(p)
+
+
+def build_env(repo, tmpdir=None):
     env = os.environ.copy()
     depot_tools = pathlib.Path.home() / ".gemini/jetski/scratch/depot_tools"
     dart_bin = repo / "engine/src/flutter/prebuilts/linux-x64/dart-sdk/bin"
     felt_bin = repo / "engine/src/flutter/lib/web_ui/dev"
     extra_paths = [str(p) for p in (depot_tools, dart_bin, felt_bin) if p.exists()]
     env["PATH"] = ":".join(extra_paths + [env.get("PATH", "")])
+    # Point Dart Directory.systemTemp and Chrome at the isolated per-run directory on /
+    if tmpdir is not None:
+        env["TMPDIR"] = str(tmpdir)
 
     stamp = repo / "bin/cache/engine-dart-sdk.stamp"
     if stamp.exists():
@@ -851,7 +895,7 @@ def run_sharded_framework_tests(repo, env, ref_dir, label, test_files, num_shard
         "test/cupertino/debug_test.dart",
     ]
     with open(warmup_log, "w") as wf:
-        subprocess.run(
+        _run_in_pg(
             warmup_cmd,
             cwd=str(fw_root),
             env=env,
@@ -893,7 +937,9 @@ def run_sharded_framework_tests(repo, env, ref_dir, label, test_files, num_shard
             env=env,
             stdout=lf,
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
+        _ACTIVE_PROCS.append(p)
         procs.append((idx, p, lf, time.time()))
 
     deadline = t0 + timeout
@@ -903,7 +949,9 @@ def run_sharded_framework_tests(repo, env, ref_dir, label, test_files, num_shard
         now = time.time()
         if now >= deadline:
             for idx, p, lf, _ in remaining:
-                p.kill()
+                _kill_process_group(p)
+                if p in _ACTIVE_PROCS:
+                    _ACTIVE_PROCS.remove(p)
                 lf.close()
                 log(f"[{label}] Shard {idx:02d} TIMED OUT after {timeout}s", driver_log)
             worst_rc = 124
@@ -915,6 +963,8 @@ def run_sharded_framework_tests(repo, env, ref_dir, label, test_files, num_shard
             if rc is None:
                 still_running.append(item)
             else:
+                if p in _ACTIVE_PROCS:
+                    _ACTIVE_PROCS.remove(p)
                 lf.close()
                 if rc != 0 and worst_rc == 0:
                     worst_rc = rc
@@ -1021,7 +1071,8 @@ def main():
     tools_stamp = repo / "bin/cache/flutter_tools.stamp"
     dart_bin = repo / "engine/src/flutter/prebuilts/linux-x64/dart-sdk/bin/dart"
     ninja_bin = find_ninja(repo)
-    env = build_env(repo)
+    run_tmpdir = create_isolated_run_tmpdir()
+    env = build_env(repo, tmpdir=run_tmpdir)
 
     out_dir = pathlib.Path(args.out).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1043,6 +1094,10 @@ def main():
 
     def cleanup():
         log("=== Cleaning up temporary harness state ===", driver_log)
+        for p in list(_ACTIVE_PROCS):
+            _kill_process_group(p)
+        _ACTIVE_PROCS.clear()
+        shutil.rmtree(run_tmpdir, ignore_errors=True)
         try:
             checkout_web_ui_ref(repo, "WORKTREE", worktree_patch)
         except Exception as e:
@@ -1198,7 +1253,7 @@ def main():
                 t0 = time.time()
                 with open(felt_log, "w") as lf:
                     try:
-                        res = subprocess.run(
+                        res = _run_in_pg(
                             felt_cmd,
                             cwd=str(web_ui),
                             env=env,
@@ -1289,7 +1344,7 @@ def main():
                     t0 = time.time()
                     with open(flutter_log, "w") as lf:
                         try:
-                            res = subprocess.run(
+                            res = _run_in_pg(
                                 flutter_cmd,
                                 cwd=str(repo / "packages/flutter"),
                                 env=env,
