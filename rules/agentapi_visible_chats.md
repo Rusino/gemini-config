@@ -1,6 +1,6 @@
 ---
 trigger: always_on
-description: "Ensure conversations created via `agentapi new-conversation` are user-visible top-level chats (not hidden tool-sourced ones), and verify it."
+description: "Create user-visible chats via agentapi and manage chat lifecycle, titles, handoffs, roadmap batons, and reopening archived chats."
 ---
 
 # Creating User-Visible Chats via `agentapi`
@@ -46,6 +46,7 @@ Use only these commands (`python3 ~/.gemini/config/hooks/chat_lifecycle.py ...`)
 | `start [--project <p>] [--title <Topic>] [--model <m>] "<prompt>"` | Starts an independent root chat atomically pinned to the project via before_send hook. |
 | `summary-path <id>` | Returns the canonical summary path before writing with `write_file`. |
 | `finalize <id>` | **Only** when the user explicitly says *"финал"* (or unambiguous equivalent): archives the chain; also archives completed sibling chats in the same project that own no open roadmap items. |
+| `reopen <leaf_id>` | **Only** after explicit user confirmation via `ask_question`: unarchives `<leaf_id>` (the chain's latest leaf from `status <id>`, never an earlier handed-off piece) as an open `⦿` chat so follow-up work can be sent there via `env -u ANTIGRAVITY_SOURCE_METADATA agentapi send-message <leaf_id> "..."`. |
 | `search "<query>" [--chain <id>]` | Before answering from memory about earlier work: `--chain` finds every user message / agent reply with the query across all pieces of `<id>`'s chain (hidden pieces included); without it, LS search over all chats (one hit per chat, symbols like `✓` never match). |
 | `status [id]` | Inspect chain structure and summary paths. |
 | `model [id] [--trailer]` | Inspect chat model or print `Assisted-by: ...` git trailer (`--trailer`). |
@@ -78,4 +79,4 @@ To move chats/chains between projects, run `python3 ~/.gemini/config/scripts/mov
   - Never drop or shrink pending `[ ]` roadmap items during handoff.
   - Label untested ideas as **`[UNVERIFIED HYPOTHESIS]`** (never `"Decided to do X"`) and record rejected approaches (`Rejected: <approach> because <reason>`).
   - On continuation start, run `roadmap.py show`, verify the state file against `git status`/tests, and check that any proposed design was proven in code.
-  - Never ask whether to finalize, never auto-unarchive archived chats, and never query SQLite or hook sources directly for lifecycle state.
+  - Never ask whether to finalize, never silently auto-unarchive archived chats, and never query SQLite or hook sources directly for lifecycle state. When the user asks to route or continue work in the chat that previously handled an item and `status <id>` shows its latest leaf `<leaf_id>` has `is_archived: true`, do **not** silently spawn a duplicate chat — ask the user via `ask_question` whether to unarchive `<leaf_id>` (`chat_lifecycle.py reopen <leaf_id>`, re-claiming/linking any roadmap item to `<leaf_id>`, then sending the message there) or start a fresh chat instead.
