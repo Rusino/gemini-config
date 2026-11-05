@@ -64,6 +64,16 @@ G3_PARAGRAPH_PATH_RE = re.compile(r"^modules/(skparagraph|skunicode)/")
 G3_PARAGRAPH_CORPUS_SCRIPT = (
     "~/.gemini/config/skills/google3-test-paragraph/scripts/run_g3_paragraph_tests.py"
 )
+# Same scope as SKIA_PERF_PATH_RE in hooks/pre_tool_guard.py. That hook only sees our own edits,
+# so reviews of other authors' CLs never ran txt_benchmarks (Gerrit 1418836 PS1 perf CL)
+PERF_GATE_PATH_RE = re.compile(
+    r"^modules/(?:skparagraph|skunicode|skshaper)/(?:src|include)/"
+    r"|^(?:include/core|include/private/base|src/base|src/core)/Sk[^/]*$"
+)
+PERF_GATE_CODE_RE = re.compile(r"\.(?:c|cc|cpp|h|hpp|inc)$")
+PERF_GATE_SCRIPT = (
+    "~/.gemini/config/skills/flutter-engine-perf-compare/scripts/skia_patch_ab.py"
+)
 
 # Client-side files that define SK_* macros; a removed guard is only dangerous if a client still
 # defines it. google3 has no single config file, so it is delegated to the agent via code_search
@@ -594,6 +604,25 @@ def advise(args):
                 }
             else:
                 recs.pop("Canary-G3")
+
+    perf_paths = [p for p in files if PERF_GATE_PATH_RE.search(p) and PERF_GATE_CODE_RE.search(p)]
+    if perf_paths:
+        recs["LOCAL flutter-engine-perf-compare (txt_benchmarks A/B)"] = {
+            "tier": "STRONG",
+            "reasons": {"SkParagraph layout speed: correctness corpora do not measure it":
+                        perf_paths},
+        }
+        if meta["cl"]:
+            # skia_patch_ab.py diffs a checkout against --base, so the CL needs its own worktree
+            wt = f"/tmp/skia_audit_{meta['cl']}"
+            perf_cmd = (
+                f"(worktree {wt} detached at the patchset) python3 {PERF_GATE_SCRIPT} "
+                f"--skia-repo {wt} --base HEAD~1 --out /tmp/skia_patch_ab_{meta['cl']}"
+            )
+        else:
+            perf_cmd = (f"python3 {PERF_GATE_SCRIPT} --skia-repo {args.repo} "
+                        "--out /tmp/skia_patch_ab")
+        local_actions.append(("flutter-engine-perf-compare", perf_cmd))
 
     health = (
         {c: canary_health(c) for c in recs if c.startswith("Canary-")}

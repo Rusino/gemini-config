@@ -67,6 +67,10 @@ description: "Skia-style C++ minimalism and suppression of LLM coding reflexes."
     `canary_advisor.py triage` prints `TESTED BLOCK: STALE` until the description lists every
     green trybot. The final chat summary carries the same per-suite environment (incident:
     Gerrit 1417397 PS1 kept only a single-test `Test:` line after all gates were green)
+  - **Name the google3 corpus plainly**: In `Tested:` blocks and review replies (including
+    external authors' CLs) write `google3 SkParagraph clients (<N> test targets): no
+    regressions`. Only `//...` paths, `cl/` numbers, sponge links and target names stay out;
+    never blur it into `Google-internal clients` (incident: Gerrit 1418836 PS1 draft)
 - **Plain Technical English (UNIX / Bell Labs style)**: Write simple, declarative Subject-Verb-Object sentences in the present tense using plain words (`keep`, `give`, `get`, `make`, `run`, `call`, `has`, `same as before`, `Thus`, `Now`); never use pompous Latinate LLM vocabulary (`utilize`, `facilitate`, `subsequently`, `consequently`, `mitigate`, `invocations`, `redundantly`, `leverage`, `comprehensive`, `seamlessly`)
 - **No LLM bulleted lists**: Never generate mechanical LLM-style bulleted lists of imperative verbs (`- Add...`, `- Refactor...`, `- Update...`) that restate the diff; structured `Behavior notes` / `Assumptions` / `Thread safety` bullets in Tier 2 specs are encouraged
 - **2×2 Ablation Matrix in Code Review Replies**: When a reviewer suggests an alternative or combined optimization/design (`A` vs. `B`), measure all 4 combinations (`baseline`, `A alone`, `B alone`, `A + B`) and include the exact numbers in the draft review reply

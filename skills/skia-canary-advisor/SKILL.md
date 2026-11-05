@@ -39,6 +39,12 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
      asking the author or the user.
    - **SkParagraph / SkUnicode on Linux Cloudtop (`LOCAL google3-test-paragraph`)**: When `/google/src/cloud` is mounted, `canary_advisor.py` automatically replaces `Canary-G3` for `modules/skparagraph/` and `modules/skunicode/` paths with `LOCAL google3-test-paragraph` (~10–13 min, 1,139 fast targets including `skia_build_test`, cached `G3_HEAD` baseline, zero Piper CLs, and zero Gerrit submit hold). Run it before `CR+1` / upload instead of triggering `Canary-G3`. Lightweight `Canary-G3` remains active only for non-paragraph Skia paths (`modules/skshaper/`, `src/ports/`, core `src/`/`include/`, root `BUILD.bazel`) or when off Cloudtop.
      - **Auto-Slow-Tier Policy**: When you run `google3-test-paragraph` automatically as the final check before granting `CR+1` (or before `amnesia-precommit` upload), you MUST append `--tier all` to cover the 13 slow tests. During intermediate/WIP checks, use the default `--tier fast`.
+   - **SkParagraph speed (`LOCAL flutter-engine-perf-compare`)**: For executable C/C++ under
+     `modules/{skparagraph,skunicode,skshaper}/{src,include}/` or `Sk*` files under
+     `include/core/`, `include/private/base/`, `src/base/`, `src/core/`, the advisor prints a
+     `txt_benchmarks A/B` `AGENT ACTION` (`skia_patch_ab.py`; for a CL, run it on a detached
+     worktree of the patchset with `--base HEAD~1`). It applies to reviews too: the
+     `[PERF-CHECK GUARD]` hook sees only our own edits. `REGRESSION` blocks `CR+1`.
    - **External Authors** (owner is not `@google.com`): YOU (the agent) MUST execute the
      `luci-auth context -- git cl try` command provided under `AGENT ACTION` immediately, without
      asking.

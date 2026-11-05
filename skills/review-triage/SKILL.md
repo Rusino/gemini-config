@@ -189,6 +189,13 @@ named skill's `SKILL.md` was not read, when a report with a `Case 1-5` verdict l
    path). Never fold them into `Gate A`. While either row is not `done` with 0 regressions, the
    verdict cannot be `CLEAN` / `LGTM` and no approving draft is saved; the only exception is an
    explicit user waiver, recorded in the row as `skipped (user waiver)`.
+   A third row, `txt_benchmarks A/B`, is required when the CL touches executable C/C++ under
+   `modules/{skparagraph,skunicode,skshaper}/{src,include}/` or `Sk*` files under `include/core/`,
+   `include/private/base/`, `src/base/`, `src/core/` (`skia_patch_ab.py --skia-repo
+   /tmp/skia_audit_<N> --base HEAD~1`, `report.md` path in the row). `REGRESSION` blocks
+   `CLEAN` / `LGTM` the same way; for CLs that claim a speedup, the draft states whether the
+   Linux numbers confirm it. `[PERF-CHECK GUARD]` sees only our own edits, so reviews of other
+   authors' CLs skipped this gate (incident: Gerrit 1418836 PS1, a perf CL approved unmeasured).
 2. **Every finding carries exactly one status**: `CONFIRMED` (entry -> `path:line` -> bad
    outcome, plus the `keeper_skeptic` verdict), `REFUTED` (dropped from drafts, recorded in the
    ledger), `UNPROVEN` (becomes a question for the author), or `UNVERIFIED` (no refutation pass
