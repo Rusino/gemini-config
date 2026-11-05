@@ -13022,11 +13022,12 @@ def _sync_once_locked(
           gstat["inbox_msgs"] = 0
           gstat["inbox_thread_ids"] = []
           gstat["inbox_messages"] = []
+        # Record merge event without waking the chat; title roll badges update deterministically
+        already_woken = True
         transition_msg = (
             f"[CL-WATCHER] ✅ {ikey} ('{info['subject']}') только что замержен "
             f"(ревизия {info['revision'][:10]}). Треды Gmail во входящих (INBOX) для "
-            f"{tid} автоматически заархивированы. Сообщи начальный статус Skia Status "
-            f"и чеклист отслеживания 4 автороллов."
+            f"{tid} автоматически заархивированы."
         )
       elif (
           info["phase"] == "ALERT_ROLL_OR_STATUS"
@@ -13072,19 +13073,20 @@ def _sync_once_locked(
           gstat["inbox_msgs"] = 0
           gstat["inbox_thread_ids"] = []
           gstat["inbox_messages"] = []
+        # Title badge already shows [✓All Rolls] and Flight Deck offers Finalize directly
+        already_woken = True
         transition_msg = (
             f"[CL-WATCHER] 🏁 Все 4 авторолла (Android, Chrome, Google3, Flutter) и "
             f"Skia Status успешно прошли для {ikey} ({info['revision'][:10]})! "
-            f"Оставшиеся треды Gmail для {tid} заархивированы из INBOX. "
-            f"Спроси пользователя, стоит ли финализировать этот чат."
+            f"Оставшиеся треды Gmail для {tid} заархивированы из INBOX."
         )
       elif (
           prev_phase == "ALERT_ROLL_OR_STATUS"
           and info["phase"] != "ALERT_ROLL_OR_STATUS"
       ):
-        # An earlier critical wakeup must be withdrawn explicitly, or the chat keeps
-        # chasing a culprit the Gardener no longer names. It sits below the all-rolls
-        # branch so that branch still archives Gmail when both happen in one sync
+        # Only wake if the chat is currently running so a sleeping chat does not burn a turn
+        if not record.get("chat_busy"):
+          already_woken = True
         transition_msg = (
             f"[CL-WATCHER] ✅ Алерт снят для {ikey} ({info['revision'][:10]}): "
             f"Skia Gardener не винит этот коммит "

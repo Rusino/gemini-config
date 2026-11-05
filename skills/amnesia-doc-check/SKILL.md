@@ -68,6 +68,7 @@ Invoke a single clean-context subagent with zero prior conversation history:
 invoke_subagent(
     TypeName="research-google",  # Use "self" if local shell commands in non-g3 git repos are needed
     Role="Amnesiac Document Fact-Checker",
+    Model="flash",
     Workspace="inherit",
     Prompt="""
 You are a hostile, clean-context technical fact-checker evaluating a document/text with zero prior chat history.
@@ -160,7 +161,7 @@ Whenever Phase 2 flags non-trivial **Mechanism Claims (`M1, M2...`)** or **Inter
 invoke_subagent(
     TypeName="keeper_skeptic",
     Role="Batched Document Verification Skeptic",
-    Model="<flash or pro per keeper_skeptic.md XFAMILY_REFUTE rules>",
+    Model="flash",
     Workspace="inherit",
     Prompt="""
 You are the Verification Skeptic (`keeper_skeptic`) for a technical document audit of `<path_to_draft>` against `<repo_paths>`.

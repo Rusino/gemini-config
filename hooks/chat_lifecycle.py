@@ -60,6 +60,9 @@ DEFAULT_PROJECT_MODELS: dict[str, str] = {
 QUOTA_SOFT_FLOOR = 0.30
 QUOTA_HARD_FLOOR = 0.15
 EMERGENCY_PIN_FLOOR = 0.05
+# Preserve 55% of 3P Claude quota when Gemini 4 Carbon/Argon has >= 20% more remaining quota
+CLAUDE_POOL_BALANCE_FLOOR = 0.55
+POOL_BALANCE_ADVANTAGE = 0.20
 
 # SERVING_TYPE_BON models are reserved for StartBattleMode (b/580403511)
 BON_MODEL_ID_RE = re.compile(r"(?:^|-)bon(?:-|$)", re.IGNORECASE)
@@ -1089,11 +1092,23 @@ def resolve_profile_model(
   chain = MODEL_PROFILES.get(p) or MODEL_PROFILES["orchestrator"]
 
   # Normal chain resolution at soft_floor (or 5% emergency floor for Carbon/Argon)
-  for mid in chain:
+  for idx, mid in enumerate(chain):
     hit = lookup_model(models, mid)
     if not hit:
       continue
     q = hit.get("quota", 1.0)
+    # Shift off 3P Claude models below 55% when a Gemini 4 Carbon/Argon pool has >= 20% more quota
+    if mid.startswith(("opus-", "fable-")) and q < CLAUDE_POOL_BALANCE_FLOOR:
+      has_healthier_gemini4 = False
+      for alt_mid in chain[idx + 1 :]:
+        if not ("carbon" in alt_mid or "argon" in alt_mid or "launch-candidate" in alt_mid):
+          continue
+        alt_hit = lookup_model(models, alt_mid)
+        if alt_hit and alt_hit.get("quota", 0.0) >= max(soft_floor, q + POOL_BALANCE_ADVANTAGE):
+          has_healthier_gemini4 = True
+          break
+      if has_healthier_gemini4:
+        continue
     if q >= soft_floor:
       return hit
     # Carbon and Argon consume WTU quickly and remain usable down to 5% quota
@@ -1566,14 +1581,25 @@ def resolve_handoff_model(
     if shield:
       return _check_and_return({**shield, "source": "inherited:wtu_shield"})
     hit = lookup_model(models, inherited)
-    if hit and hit.get("quota", 1.0) >= QUOTA_SOFT_FLOOR:
-      return _check_and_return({**hit, "source": "inherited"})
-    # Fail over when inherited model is exhausted below the 30% soft floor
     fb_profile = (
         "cpp-core"
         if (pid and "cpp-core" in get_project_model_preference(pid))
         else "orchestrator"
     )
+    if hit:
+      q = hit.get("quota", 1.0)
+      # Rebalance handoffs off depleted 3P Claude models when a healthier flagship pool exists
+      if str(hit.get("id") or "").startswith(("opus-", "fable-")) and q < CLAUDE_POOL_BALANCE_FLOOR:
+        balanced = resolve_profile_model(models, fb_profile)
+        if (
+            balanced
+            and not str(balanced.get("id") or "").startswith(("opus-", "fable-"))
+            and balanced.get("quota", 0.0) >= max(QUOTA_SOFT_FLOOR, q + POOL_BALANCE_ADVANTAGE)
+        ):
+          return _check_and_return({**balanced, "source": "inherited:pool_balance"})
+      if q >= QUOTA_SOFT_FLOOR:
+        return _check_and_return({**hit, "source": "inherited"})
+    # Fail over when inherited model is exhausted below the 30% soft floor
     fallback = resolve_profile_model(models, fb_profile)
     if fallback:
       return _check_and_return({**fallback, "source": "inherited:quota_fallback"})

@@ -178,15 +178,15 @@ Whenever Phase 2 (across all Hunter shards) produces any candidate defects in **
 B2...`)** OR any `BLOCKING_SCOPE` / non-trivial code removal in **Section 1 (`S1, S2...`)** (skip
 if Phase 2 returned `None` or only `OPTIONAL_GOLFING` `nit:` / trivial comment cleanup), spawn
 **one batched `keeper_skeptic` subagent** following the `XFAMILY_REFUTE` routing (`Model="flash"`
-default, `Model="pro"` for concurrency/BiDi/metrics/dropped guards/cross-backend), Quota Exhaustion
-Fallback Ladder (`pro` → `flash` → Phase 3 Trapsmith TDD → user escalation), and Three Iron
+default, `Model="inherit"` for concurrency/BiDi/metrics/dropped guards/cross-backend), Quota Exhaustion
+Fallback Ladder (`inherit` → `flash` → Phase 3 Trapsmith TDD → user escalation), and Three Iron
 Verification Principles in `plugins/keeper/agents/keeper_skeptic.md`:
 
 ```python
 invoke_subagent(
     TypeName="keeper_skeptic",
     Role="Batched Verification Skeptic",
-    Model="<flash or pro per keeper_skeptic.md XFAMILY_REFUTE rules>",
+    Model="<flash or inherit per keeper_skeptic.md XFAMILY_REFUTE rules>",
     Workspace="inherit",
     Prompt="""
 You are the Verification Skeptic (`keeper_skeptic`) for a pre-commit audit in `<repo_path>`.

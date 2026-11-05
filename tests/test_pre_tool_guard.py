@@ -2120,6 +2120,38 @@ class TestPreToolGuard(unittest.TestCase):
         )
       self.assertEqual(try_write_override().get("decision"), "allow")
 
+  def test_subagent_model_routing_blocks_pro_and_enforces_flash_on_runners(self):
+    self.assertIn(
+        "[SUBAGENT-MODEL GUARD]",
+        pre_tool_guard.subagent_model_routing_denial(
+            {"TypeName": "keeper_inquisitor", "Model": "pro", "Role": "Auditor"}
+        ),
+    )
+    self.assertIn(
+        "[SUBAGENT-MODEL GUARD]",
+        pre_tool_guard.subagent_model_routing_denial(
+            {"TypeName": "self", "Model": "inherit", "Role": "Flutter corpus runner"}
+        ),
+    )
+    self.assertIn(
+        "[SUBAGENT-MODEL GUARD]",
+        pre_tool_guard.subagent_model_routing_denial(
+            {"TypeName": "research-google", "Model": "inherit", "Role": "Amnesiac Document Fact-Checker"}
+        ),
+    )
+    self.assertEqual(
+        pre_tool_guard.subagent_model_routing_denial(
+            {"TypeName": "self", "Model": "flash", "Role": "Flutter corpus runner"}
+        ),
+        "",
+    )
+    self.assertEqual(
+        pre_tool_guard.subagent_model_routing_denial(
+            {"TypeName": "keeper_inquisitor", "Model": "inherit", "Role": "Amnesiac Diff Minimizer & Auditor"}
+        ),
+        "",
+    )
+
 
 if __name__ == "__main__":
   unittest.main()

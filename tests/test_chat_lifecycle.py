@@ -2569,6 +2569,44 @@ class TestChatLifecycle(unittest.TestCase):
     self.assertEqual(res.get("id"), "gemini-4-carbon-high")
     self.assertAlmostEqual(res.get("quota"), 0.08)
 
+    # When flagships are exhausted, cpp-core falls back to Gemini 3.8 Flash (High) (M318) reserve
+    avail_reserve = {
+        "opus-5.5-medium": {
+            "model": "MODEL_PLACEHOLDER_M369",
+            "displayName": "Claude Opus 5.5 (Medium)",
+            "quotaInfo": {"remainingFraction": 0.01},
+        },
+        "gemini-4-carbon-high": {
+            "model": "MODEL_PLACEHOLDER_M427",
+            "displayName": "Gemini 4 Carbon (High)",
+            "quotaInfo": {"remainingFraction": 0.02},
+        },
+        "gemini-3.8-flash-high": {
+            "model": "MODEL_PLACEHOLDER_M318",
+            "displayName": "Gemini 3.8 Flash (High)",
+            "quotaInfo": {"remainingFraction": 0.90},
+        },
+    }
+    res_reserve = chat_lifecycle.resolve_profile_model(avail_reserve, "cpp-core")
+    self.assertEqual(res_reserve.get("enum"), "MODEL_PLACEHOLDER_M318")
+    self.assertEqual(res_reserve.get("id"), "gemini-3.8-flash-high")
+
+    # Cross-pool balance shifts off Opus below 55% when Gemini 4 Carbon has >= 20% higher quota
+    avail_balance = {
+        "opus-5.5-medium": {
+            "model": "MODEL_PLACEHOLDER_M369",
+            "displayName": "Claude Opus 5.5 (Medium)",
+            "quotaInfo": {"remainingFraction": 0.40},
+        },
+        "gemini-4-carbon-high": {
+            "model": "MODEL_PLACEHOLDER_M427",
+            "displayName": "Gemini 4 Carbon (High)",
+            "quotaInfo": {"remainingFraction": 0.90},
+        },
+    }
+    res_balance = chat_lifecycle.resolve_profile_model(avail_balance, "cpp-core")
+    self.assertEqual(res_balance.get("id"), "gemini-4-carbon-high")
+
   def test_handoff_propagates_root_and_latest_user_requests_across_chain(self):
     with tempfile.TemporaryDirectory() as tmp_dir:
       self.write_chain(tmp_dir, [("root-1", None), ("parent-1", "root-1")])

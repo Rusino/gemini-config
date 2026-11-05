@@ -1703,6 +1703,42 @@ MAX_TURN_SOURCE_READ_FILES = int(
 _NON_SOURCE_READ_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf")
 
 
+# Roles that execute test/corpus/build scripts or document fact-checks and must use Flash
+_FLASH_ONLY_SUBAGENT_ROLE_RE = re.compile(
+    r"(?:\b(?:test|corpus|build|benchmark|dm|felt)\b.*\brunner\b"
+    r"|\b(?:corpus|test|build)\s+runner\b"
+    r"|\bdocument\s+(?:fact-checker|verification\s+skeptic)\b"
+    r"|\bdoc\s+fact-checker\b)",
+    re.IGNORECASE,
+)
+
+
+# Blocks invoke_subagent calls that route to Model="pro" or run script/doc jobs on flagship quota
+def subagent_model_routing_denial(tool_args: dict) -> str:
+  if not isinstance(tool_args, dict):
+    return ""
+  model = str(tool_args.get("Model") or "inherit").strip().lower()
+  role = str(tool_args.get("Role") or "").strip()
+  # Never allow Model="pro" which routes to the unreliable Gemini 3.1 Pro bucket
+  if model == "pro":
+    return (
+        "[SUBAGENT-MODEL GUARD] Passing `Model=\"pro\"` to `invoke_subagent` routes to the "
+        "deprecated `gemini-3.1-pro` bucket (forbidden by `rules/subagent_exploration.md`). "
+        "Use `Model=\"flash\"` for test/corpus/build runners, mechanical lookups, document "
+        "fact-checking, and routine `keeper_skeptic` batches, or `Model=\"inherit\"` for "
+        "deep C++/concurrency/BiDi semantic analysis."
+    )
+  # Require Model="flash" (or "flash_lite") for test/corpus/build runners and doc fact-checkers
+  if role and _FLASH_ONLY_SUBAGENT_ROLE_RE.search(role) and model not in ("flash", "flash_lite"):
+    return (
+        f"[SUBAGENT-MODEL GUARD] Subagent role `{role}` is a test/corpus/build runner or "
+        f"document fact-checker and must use `Model=\"flash\"` (got `Model=\"{model}\"`), "
+        "so it executes in the separate `gemini-flash` quota bucket without draining "
+        "flagship model quota."
+    )
+  return ""
+
+
 def exploration_circuit_breaker_denial(
     tool_name: str,
     tool_args: dict,
@@ -4511,6 +4547,17 @@ def main() -> None:
       print(
           json.dumps(
               {"decision": "deny", "reason": aq_denial}, ensure_ascii=False
+          )
+      )
+      return
+
+  # Block Model="pro" and enforce Model="flash" on script/corpus runners and doc fact-checkers
+  if tool_name == "invoke_subagent":
+    sub_denial = subagent_model_routing_denial(tool_args)
+    if sub_denial:
+      print(
+          json.dumps(
+              {"decision": "deny", "reason": sub_denial}, ensure_ascii=False
           )
       )
       return

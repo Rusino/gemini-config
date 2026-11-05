@@ -106,7 +106,7 @@ Before compiling the final report in Stage 3, pass all candidate **`HIGH` / `CRI
 invoke_subagent(
     TypeName="keeper_skeptic",
     Role="Batched Audit Verification Skeptic",
-    Model="<flash or pro per keeper_skeptic.md XFAMILY_REFUTE rules>",
+    Model="<flash or inherit per keeper_skeptic.md XFAMILY_REFUTE rules>",
     Workspace="inherit",
     Prompt="""
 You are the Verification Skeptic (`keeper_skeptic`) auditing candidate findings in `<repo_root>`.
