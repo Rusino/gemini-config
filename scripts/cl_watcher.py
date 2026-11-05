@@ -31,6 +31,7 @@ import copy
 from datetime import datetime, timedelta, timezone
 import fcntl
 import glob
+import hashlib
 import http.client
 import http.server
 import json
@@ -49,6 +50,20 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
+
+# Sample startup mtime and SHA-256 before sibling imports so reexec_self cannot race
+_SCRIPT_PATH = os.path.abspath(__file__)
+try:
+  _INITIAL_SCRIPT_MTIME = os.path.getmtime(_SCRIPT_PATH)
+  with open(_SCRIPT_PATH, "rb") as _script_f:
+    _INITIAL_SCRIPT_SHA256 = hashlib.sha256(_script_f.read()).hexdigest()
+except OSError:
+  _INITIAL_SCRIPT_MTIME = 0.0
+  _INITIAL_SCRIPT_SHA256 = ""
+# Pin to the pre-execv digest when the file on disk raced with CPython startup
+_EXEC_PINNED_SHA256 = os.environ.pop("_CL_WATCHER_EXEC_SHA256", "").strip()
+if _EXEC_PINNED_SHA256:
+  _INITIAL_SCRIPT_SHA256 = _EXEC_PINNED_SHA256
 
 HOOKS_DIR = os.path.expanduser("~/.gemini/config/hooks")
 if HOOKS_DIR not in sys.path:
@@ -348,11 +363,6 @@ _FLUTTER_TREE_CACHE: dict[str, Any] = {"tasks": set(), "expires_at": 0.0}
 _FLUTTER_BASE_CACHE: dict[str, set[str]] = {}
 _FLUTTER_TREE_LOCK = threading.Lock()
 # Cache the startup mtime so --serve can re-exec when cl_watcher.py changes on disk
-_SCRIPT_PATH = os.path.abspath(__file__)
-try:
-  _INITIAL_SCRIPT_MTIME = os.path.getmtime(_SCRIPT_PATH)
-except OSError:
-  _INITIAL_SCRIPT_MTIME = 0.0
 
 EN_MONTHS = {
     1: "Jan",
@@ -19469,30 +19479,51 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def script_changed_on_disk(
-    path: str = _SCRIPT_PATH, initial_mtime: float = _INITIAL_SCRIPT_MTIME
+    path: str = _SCRIPT_PATH,
+    initial_mtime: float = _INITIAL_SCRIPT_MTIME,
+    initial_sha256: str = "",
+    min_age_sec: float = 0.0,
 ) -> bool:
   """Returns True when `path` on disk differs in mtime from `initial_mtime` and compiles."""
-  if initial_mtime <= 0.0:
+  # Require at least one baseline watermark (mtime or content digest) to detect changes
+  if initial_mtime <= 0.0 and not initial_sha256:
     return False
   try:
+    disk_mtime = os.path.getmtime(path)
+    # Wait for transient in-place edits or Gate-A test mutations to settle before reloading
+    if min_age_sec > 0.0 and 0.0 <= (time.time() - disk_mtime) < min_age_sec:
+      return False
     # Detect both forward edits and mtime rollbacks (e.g. git checkout)
-    if os.path.getmtime(path) == initial_mtime:
+    if not initial_sha256 and disk_mtime == initial_mtime:
       return False
     # Verify syntax before replacing the daemon so a half-written edit cannot crash it
     with open(path, "rb") as f:
-      compile(f.read(), path, "exec")
+      raw = f.read()
+    # Compare content digest when provided so restored backups skip reloads and execv races recover
+    if initial_sha256 and hashlib.sha256(raw).hexdigest() == initial_sha256:
+      return False
+    compile(raw, path, "exec")
     return True
   except Exception:
     return False
 
 
-def reexec_self(server: http.server.HTTPServer | None = None) -> None:
+def reexec_self(
+    server: http.server.HTTPServer | None = None,
+    script_path: str = _SCRIPT_PATH,
+) -> None:
   """Closes the HTTP listener and replaces the process with the updated script."""
   if server is not None:
     try:
       server.server_close()
     except Exception:
       pass
+  # Pass the verified on-disk digest across execv so CPython AST compile time cannot mask a restore
+  try:
+    with open(script_path, "rb") as f:
+      os.environ["_CL_WATCHER_EXEC_SHA256"] = hashlib.sha256(f.read()).hexdigest()
+  except OSError:
+    os.environ.pop("_CL_WATCHER_EXEC_SHA256", None)
   os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
@@ -19508,7 +19539,12 @@ def serve_forever(
     wait_sec = max(30, poll_interval_sec)
     for _ in range(max_polls):
       # Replace the running daemon before polling when cl_watcher.py changed on disk
-      if script_changed_on_disk():
+      if script_changed_on_disk(
+          _SCRIPT_PATH,
+          _INITIAL_SCRIPT_MTIME,
+          _INITIAL_SCRIPT_SHA256,
+          min_age_sec=3.0,
+      ):
         reexec_self(server)
       try:
         sync_once(wake_chats=True, update_titles=True, sync_bugs=True)
@@ -19517,7 +19553,13 @@ def serve_forever(
       # Poll mtime in 2-second slices so commits reload the server without waiting a full cycle
       for _ in range(max(1, wait_sec // 2)):
         time.sleep(2)
-        if script_changed_on_disk():
+        # Re-check with 3s debounce and content digest between polls
+        if script_changed_on_disk(
+            _SCRIPT_PATH,
+            _INITIAL_SCRIPT_MTIME,
+            _INITIAL_SCRIPT_SHA256,
+            min_age_sec=3.0,
+        ):
           reexec_self(server)
 
   t = threading.Thread(target=bg_loop, daemon=True)
