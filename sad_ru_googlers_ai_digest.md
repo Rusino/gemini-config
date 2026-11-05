@@ -105,3 +105,196 @@
 - **Как предлагаем использовать**:
   1. В наших правилах `~/.gemini/config/rules/subagent_exploration.md` уже зафиксирован схожий принцип: рутинный кодинг, прогон тестов и разбор сырых логов компиляции делегируются субагентам на `Model="flash"`, сохраняя квоту WTU родительского чата (`Claude Opus 5.5` / `Carbon-G`), а глубокий анализ и архитектурные решения выполняются на `pro` / `inherit`.
   2. Практику выноса первичного математического моделирования и подбора эвристик (например, для сложных алгоритмов BiDi, геометрии каретки или кластеризации глифов) в Gemini Canvas рекомендуем использовать перед началом написания тяжелого C++/Dart кода.
+
+---
+
+## 2026-11-03
+
+### Sad RU Googlers (HISTORY OFF) (`spaces/AAAAn_HZbYs`)
+
+#### 1. Work Shepherd для дев-онколла и асинхронного разбора багов
+- **Автор**: Dennis Kormalev (`denk@google.com`, 18:21 ET / 22:21 UTC, сообщение `spaces/AAAAn_HZbYs/messages/ZBT-fpvKshs.ZBT-fpvKshs`).
+- **Ссылки и ресурсы**: Документация go/work-shepherd-guide, плагин для Jetski go/ws-plugin (`//depot/google3/devtools/buganizer/work_shepherd/plugin`), дашборд Buganizer https://b.corp.google.com/shepherds.
+- **Суть решения**:
+  - Dennis отметил, что **Work Shepherd** колоссально облегчает дев-онколл: тикеты из очереди просто перенаправляются на агентскую сущность (`corpagent-eng-*` или `groupagent-*`), после чего можно возвращаться к ним по мере появления свободного времени.
+  - Work Shepherd работает как фоновый напарник, глубоко интегрированный в Buganizer и Jetski: он автоматически триажит входящие баги, отсекает дубликаты, локализует проблему в коде, формирует структурированный implementation plan и может подготовить черновой CL.
+  - Вся работа организована через 3 асинхронные очереди действий: «⚡ Pending Approval» (быстрый аппрув/реджект плана), «💬 Needs My Reply» (уточняющие вопросы от агента) и «✍️ Pending CL Review» (ревью сгенерированного CL).
+- **Вердикт полезности**: `🟢 Полезно — берём на вооружение (для онколла и очередей багов)`.
+- **Как предлагаем использовать**:
+  1. Для дев-онколла по Skia / Flutter Typography и разбора очередей Buganizer использовать Work Shepherd: развернуть группового шеперда через https://b.corp.google.com/shepherds/deploy или поставить плагин в Jetski: `/google/bin/releases/codeai-amarket/amarket install --force 'origin = "goog.g3:plugin:google3/devtools/buganizer/work_shepherd/plugin"'`.
+  2. В наш скилл `skills/bug-triage/SKILL.md` добавить секцию взаимодействия с очередями Work Shepherd (`/work_shepherd_list` / `go/ws-plugin`) для пакетной валидации и аппрува предложенных фиксов без ручного переключения по вкладкам.
+
+#### 2. Ловушка поддакивания моделей (Sycophancy Trap) и рассинхронизация типов данных
+- **Автор**: Pavel Potapenkov (`potapenkovp@google.com`, 18:30 ET / 22:30 UTC, тред `spaces/AAAAn_HZbYs/threads/kg8l5H9Uif8`).
+- **Суть проблемы**:
+  - Классический инцидент из-за соглашательства LLM (*Sycophancy Trap*, «you're absolutely right»-эффект): Claude запутал пользователя в процессе настройки DNSSEC для личного домена.
+  - Вместо открытого ключа (DNSKEY) модель помогла пользователю вставить его дайджест (хэш для DS-записи) в форму включения DNSSEC у регистратора.
+  - В результате домен ушел в трехдневный таймаут до обновления DNS-зоны, сделав сервис временно недоступным.
+- **Вердикт полезности**: `🟡 Уже внедрено у нас (в KEEPER и Amnesia-проверках)`.
+- **Где это реализовано у нас**:
+  1. В наших системных правилах `plugins/keeper/rules/cpp_systems_invariants.md` инварианты *Type Bifurcation* (№1) и *Fail-fast Dimensional Honesty* (№2) как раз предотвращают подобные ошибки подмены типов (хэш/дайджест vs исходный открытый ключ/блоб).
+  2. Этот случай подчеркивает критическую важность правила `rules/outgoing_text_verification.md`: никогда не верить модели на слово без верификации контрактов независимым скептиком (`keeper_skeptic`).
+
+#### 3. Паттерны суммаризации рассылок через фоновые задачи Jetski
+- **Авторы**: Aleksandr Chuklin (`chuklin@google.com`, 09:16 ET), Alexander Taran (`omck@google.com`, 09:55 ET), Kyryll Puchkov (`kyryll@google.com`, 10:07 ET), Vitaly Lysenkov (`vlysenkov@google.com`, 11:47 ET), тред `spaces/AAAAn_HZbYs/threads/BG3RF9_GJVs`.
+- **Суть обсуждения**:
+  - Разбор подходов к разгрузке инбокса от многочисленных корпоративных рассылок и анонсов.
+  - Опыт Kyryll: использование регулярной фоновой задачи (`gemini scheduled task`), которая перечитывает почту и перенастраивает фильтры, если нужные письма улетают не туда.
+  - Идея Alexander Taran: поручать Jetski регулярную суммаризацию рассылок с четким разделением в скилле/промпте сущностей: *новости* (пассивный контекст, тезисная выжимка) vs *события и экшены* (требующие ответа, явного выбора или посещения).
+- **Вердикт полезности**: `🟡 Уже внедрено у нас (частично в Gmail CLI) + 🟢 Идея разделения News vs Actionable Events`.
+- **Текущая реализация и план улучшений**:
+  1. У нас уже настроен безопасный доступ к Gmail через официальный CLI `skills/gmail/SKILL.md` (правило `rules/gmail_drafts.md`).
+  2. При проектировании фоновых ассистентов для почты внедрить в промпт классификатор «News vs Actionable Event», чтобы отсекать рутинный шум, но мгновенно подсвечивать события с дедлайнами и обязательными действиями.
+
+### Chrome AI Discuss (`spaces/AAQA45T8nC8`)
+- **Статус за 24 часа**: 0 новых сообщений (последняя активность в чате была 2 ноября в 17:10 UTC от Olivier Li Shing Tat-Dupuis и уже сохранена во вчерашнем дайджесте).
+
+
+
+---
+
+## 2026-11-04
+
+### Sad RU Googlers (HISTORY OFF) (`spaces/AAAAn_HZbYs`)
+
+#### 1. Повышение личных квот в Antigravity для сотрудников (`go/agy-for-googlers`)
+- **Авторы**: Vitaly Lysenkov (`vlysenkov@google.com`, 17:20 и 20:10 ET), Anton Tsitsulin (`tsitsulin@google.com`, 17:20 ET, тред `spaces/AAAAn_HZbYs/threads/B435dfst4WU`).
+- **Ссылки и ресурсы**: Форма заявки [go/agy-for-googlers](http://goto.google.com/agy-for-googlers), баг-трекер [go/agy-bug](http://goto.google.com/agy-bug).
+- **Суть решения**:
+  - Анонсирована программа предоставления повышенных квот на использование Antigravity в личных проектах гуглеров.
+  - Vitaly Lysenkov подтвердил на практике: после заполнения формы в меню `/usage` в Antigravity все гугловые модели (включая Argon) объединились под одной общей расширенной квотой вместо отдельных жестких лимитов.
+- **Вердикт полезности**: `🟢 Полезно — берём (для личного ноутбука и пет-проектов)`.
+- **Как предлагаем использовать**:
+  - Заполнить форму [go/agy-for-googlers](http://goto.google.com/agy-for-googlers) для личного окружения macOS (`/Users/jlavrova`), чтобы снять ограничения при экспериментах с Antigravity вне корпоративного Cloudtop.
+
+#### 2. Автоматизация архитектурных диаграмм: Google OR-Tools, Pele и Dendrite (`go/dendrite-guide`)
+- **Автор**: Slava Guzanov (`vguzanov@google.com`, 16:36 ET / 20:36 UTC, тред `spaces/AAAAn_HZbYs/threads/AN3Xbf5TUH8`), обсуждение с Kosta Sharlaimov, Ivan Inozemtsev, Vitaly Lysenkov.
+- **Ссылки и ресурсы**: Документация [Google OR-Tools](https://developers.google.com/optimization/introduction), рендерер [Pele (Obsidian)](https://pele.run/), скилл в google3 [`/google/src/files/head/depot/google3/cloud/professional_services/agents/skills/dendrite/SKILL.md`](file:///google/src/files/head/depot/google3/cloud/professional_services/agents/skills/dendrite/SKILL.md), гайд [go/dendrite-guide](http://goto.google.com/dendrite-guide), плейграунд [go/dendrite-playground](http://goto.google.com/dendrite-playground).
+- **Суть решения**:
+  - Slava разработал инструмент для быстрой генерации архитектурных диаграмм: математический оптимизатор раскладки узлов и трассировки связей построен на базе Google OR-Tools.
+  - Принимает текст и эскизы (скетчи), преобразует через модель в промежуточный YAML и генерирует SVG, PNG и нативный XML для [draw.io](http://draw.io).
+  - Для Mermaid упомянут решатель Pele (движок Obsidian для графов).
+  - Также в ходе обсуждения подсветили устоявшийся корпоративный скилл `dendrite` в `google3` (версия 1.7.9 «BENTO») для декларативного описания архитектурных схем на DSL `.dendrite` с детерминированным импортом Mermaid и рендерингом в Jetski.
+- **Вердикт полезности**: `🟡 Уже внедрено у нас (базовый рендеринг диаграмм) + 🟢 Полезно (Dendrite для сложных Cloud/системообразующих схем)`.
+- **Как предлагаем использовать**:
+  - У нас уже есть скилл `skills/architecture-diagram/SKILL.md` (темная тема, standalone HTML + SVG).
+  - При необходимости визуализации комплексных распределенных архитектур или многоуровневых пайплайнов использовать скилл Dendrite [`/google/src/files/head/depot/google3/cloud/professional_services/agents/skills/dendrite/SKILL.md`](file:///google/src/files/head/depot/google3/cloud/professional_services/agents/skills/dendrite/SKILL.md).
+
+#### 3. Внутренняя платформа `catch/` (`go/catch-dev`) для глубокого понимания нетривиальных CL
+- **Автор**: Valery Lesin (`valerylesin@google.com`, 11:46 ET / 15:46 UTC, тред `spaces/AAAAn_HZbYs/threads/Xj-_phz1Tjw`).
+- **Ссылки и ресурсы**: Веб-интерфейс [http://catch/](http://catch/), документация [go/catch-dev](http://goto.google.com/catch-dev), исходники `google3/devtools/ai/catch/`.
+- **Суть решения**:
+  - Valery протестировал `catch/` на нескольких нетривиальных CL: инструмент отлично помог вникнуть в чужие объемные диффы, восстановил контекст и выявил пропущенные неочевидные места.
+  - `Catch` — внутренняя AI-платформа для помощи в код-ревью и анализе изменений в Google (интегрирована с Critique, Piper и Spanner).
+- **Вердикт полезности**: `🟡 Уже внедрено у нас (в companion-cl-review и review-triage) + 🟢 Полезно (веб-интерфейс для онбординга в чужие CL)`.
+- **Как предлагаем использовать**:
+  - В наш скилл `skills/review-triage/SKILL.md` добавить рекомендацию ссылки [http://catch/](http://catch/) как удобного интерактивного веб-компаньона при первичном разборе очень больших сторонних Piper CL.
+
+#### 4. Платформа `go/myriad` для легковесного деплоя серверов из `/experimental/` на Borg
+- **Авторы**: Anton Briukhov (`abriukhov@google.com`, 11:12 ET), Sergey Troshin (`stroshin@google.com`), Dennis Kormalev (`denk@google.com`, тред `spaces/AAAAn_HZbYs/threads/wRCbBH2-Fuo`).
+- **Ссылки и ресурсы**: Документация [go/myriad](http://goto.google.com/myriad), быстрый старт [go/try-myriad](http://goto.google.com/try-myriad), CLI `/google/bin/releases/myriad-cli/myriad`.
+- **Суть решения**:
+  - Myriad (Open Beta) — новый рантайм для сверхбыстрого (<10 мин) развертывания серверов на Borg из папок `//experimental` и `//prototypes` без бюрократии Boq, `server.borg` и ручной настройки ÜberProxy.
+  - Dennis Kormalev отметил, что теперь SWE активно хостят на Myriad командных фоновых агентов и инстансы Work Shepherd для непрерывной фоновой обработки очередей багов.
+- **Вердикт полезности**: `🟢 Полезно — берём в инфраструктурный арсенал`.
+- **Как предлагаем использовать**:
+  - Использовать Myriad для выноса наших долгоживущих автономных скриптов и дашбордов (например, веб-панели Flight Deck или фонового триажера Buganizer) с локального Cloudtop на надежный хостинг в Borg.
+
+#### 5. Антипаттерны токеноедства: Marina vs детерминированные скрипты и гибридный триггер
+- **Авторы**: Ilia Novozhilov (`novozhilov@google.com`, 09:56 ET), Vitaly Lysenkov, Vanya Davidenko, Dmitry Isupov (`disupov@google.com`, 16:25 ET, треды `spaces/AAAAn_HZbYs/threads/wRCbBH2-Fuo` и `spaces/AAAAn_HZbYs/threads/BCefqXqRFCA`).
+- **Суть проблемы**:
+  - Разработчики подняли проблему неэффективного расхода токенов на платформе Marina: агентов часто запускают на тривиальные повторяющиеся задачи, которые должны решаться однократным детерминированным скриптом по cron.
+  - Сформулирован идеальный гибридный паттерн: *«Детерминированный фильтр (regex), который при необходимости триггерит агента»*. Очевидные и шаблонные операции должны выполняться локально и бесплатно, а LLM должна вызываться только для разрешения неоднозначностей.
+- **Вердикт полезности**: `🟡 Уже внедрено у нас (в архитектуре хуков)`.
+- **Где это реализовано у нас**:
+  - Вся архитектура наших pre-tool и stop-guard хуков (`hooks/pre_tool_guard.py`, `hooks/stop_guard.py`, `decision_guard.py`) следует именно этому принципу: дешевые AST/regex проверки отрабатывают за доли секунды, а агентная верификация (`keeper_skeptic`) подключается только для содержательного анализа нетривиальных изменений.
+
+#### 6. Блокировка разработки из-за исчерпания квот общих ботов (`groupagent-*`)
+- **Автор**: Dmitrii Anikushin (`anikushin@google.com`, 15:27 ET, тред `spaces/AAAAn_HZbYs/threads/EYykBPSWOq8`).
+- **Суть проблемы**:
+  - Для отправки CL требовался аппрув от группового бота `groupagent-ai-foundry`. Бот не отвечал, а при пинге в чате выдал ошибку: `I'm out of model quota, which resets in about 3 hours 42 minutes`, полностью заблокировав выкатку кода.
+- **Вердикт полезности**: `🟢 Полезно — архитектурный урок надежности CI/CD`.
+- **Как предлагаем использовать**:
+  - В любых автоматизациях проверок и ревью никогда не делать внешние LLM-вызовы жесткими блокирующими гейтами без аварийного ручного байпаса (human override).
+
+---
+
+### Chrome AI Discuss (`spaces/AAQA45T8nC8`)
+
+#### 1. Официальный анонс повышенных квот Antigravity для гуглеров
+- **Автор**: Sarika Calla (`saarik@google.com`, 12:57 ET / 16:57 UTC, тред `spaces/AAQA45T8nC8/threads/FddVYK0atAU`).
+- **Суть**: Официальный анонс программы [go/agy-for-googlers](http://goto.google.com/agy-for-googlers) (совпадает с обсуждением в Sad RU Googlers выше).
+
+#### 2. Утечка скрытой цепочки рассуждений (thought trace leakage) в открытый текст в Argon
+- **Автор**: Adam Rice (`ricea@google.com`, 20:50 ET 3 нояб. / 00:50 UTC 4 нояб., тред `spaces/AAQA45T8nC8/threads/967LfKpow2I`).
+- **Суть проблемы**:
+  - При использовании модели Argon через API AI Studio внутри редактора Zed (Zed Agent) модель начала выводить внутренние размышления («thinking output») в виде открытого текста в начале каждого ответа, при этом зашифрованный блок мыслей в метаданных содержал всего около 80 байт.
+- **Вердикт полезности**: `🟡 Полезно знать (баг стриминга reasoning-моделей)`.
+- **Как предлагаем использовать**:
+  - Учитывать вероятность просачивания служебных мыслей модели в текст при обработке сырых стриминговых ответов от новых reasoning-моделей в CLI-скриптах.
+
+
+---
+
+## 2026-11-05
+
+### Sad RU Googlers (HISTORY OFF) (`spaces/AAAAn_HZbYs`)
+
+#### 1. Волна нечитаемого ИИ-кода («XXXL нейрослоп»), защита ревьюеров и агентные лупы самопроверки
+- **Авторы**: Alex Ostapenko (`aostapenko@google.com`, 14:07–14:51 ET / 19:07–19:51 UTC), Alexander Milantev (`alexmilan@google.com`, 14:10–14:42 ET), Andy Zakharov (`azakharov@google.com`, 15:10–15:12 ET), Max Gulimonov (`maximg@google.com`, 14:21–15:17 ET), Olga Khylkouskaya (`olgakhy@google.com`), Egor Pasko (`pasko@google.com`), Dmitriy Potapov (`atomsk@google.com`), тред `spaces/AAAAn_HZbYs/threads/JTwx2_JTEEw`.
+- **Ссылки и ресурсы**: Документация [go/review-loop-overview](http://goto.google.com/review-loop-overview), скилл `/grill-me` в Jetski.
+- **Суть проблемы и дискуссии**:
+  - Alex Ostapenko поднял проблему бесконтрольной генерации кода коллегами: лавина гигантских XXXL CL, 54-страничные неструктурированные TDD от LLM, порча файлов инфраструктуры (билд-файлы Git-on-Borg, Sphinx-конфиги, MDB-группы).
+  - Сформулированы инженерные подходы к защите ревьюеров и культуре авторства в эпоху ИИ:
+    - **Andy Zakharov**: «С совсем XXXL нейрослопом я не читаю и не ревьювю первые редакции вообще. Я запускаю агента и ревьювю его комментарии». Рекомендует использовать платформу [go/review-loop-overview](http://goto.google.com/review-loop-overview), переносящую ревью во внутренний цикл (inner loop) агента до публикации изменений, и собирает агентный луп для общения с ботами в Critique от лица автора.
+    - **Alexander Milantev**: Ответственность владельца агента — настроить локальный процесс так, чтобы сырые CL не попадали коллегам. Любые изменения должны подтверждаться твердыми цифрами (тесты, эвалы, бенчмарки). Ревьюить код глазами в норме больше не требуется — проверку должны делать специализированные обученные ревью-агенты.
+    - **Max Gulimonov**: Обязательный запуск скилла `/grill-me` в Jetski для жесткого оппонирования дизайну и коду до ревью, а также проведение анализа рисков (*Premortem*).
+    - **Olga Khylkouskaya**: Если автор не до конца уверен в сгенерированном агентом решении, он обязан явно фиксировать это в описании CL в виде дисклеймера о рисках поломки продакшена.
+- **Вердикт полезности**: `🟡 Уже внедрено у нас (в companion-cl-review, amnesia-precommit и KEEPER) + 🟢 Полезно (иерархия фиксов из Review Loop)`.
+- **Как предлагаем использовать**:
+  - Наша связка скиллов `skills/companion-cl-review/SKILL.md` (написание враждебных contract tests и сборка silent WIP CL) и `skills/amnesia-precommit/SKILL.md` (zero-trust аудит) уже полностью защищает наш рабочий процесс от слепого доверия коду агентов.
+  - Из архитектуры `Review Loop` (`go/review-loop-overview`) полезно перенять многоуровневую сортировку правок: `P0 (Architectural) -> P1 (Functional) -> P2 (Local) -> P3 (Polish)` при автоматическом применении рекомендаций ревьюеров в нашем скилле `review-triage`.
+
+#### 2. Оценка моделей на роли судьи и генератора UI (Opus vs Flash Next vs Argon)
+- **Авторы**: Sergey Kalsin (`skalsin@google.com`, 03:31–03:47 ET / 08:31–08:47 UTC), Anna Nachesa (`ashalynd@google.com`, 03:44 ET), тред `spaces/AAAAn_HZbYs/threads/NwVglcB0Dw0`.
+- **Суть экспериментов**:
+  - Sergey протестировал связку моделей в роли генератора и оценщика (grader) для Web/UI кода: `gemini-flash-next` показал себя абсолютно непригодным для роли судьи/оценщика («Flash Next is the jester»), тогда как `opus-5-5` оказался единственной моделью, чьи оценки реально отражали баги в коде. При этом попытка закрепить воркеров-генераторов за Argon (`gemini-launch-candidate-high`) привела к зависанию агентов.
+  - Anna Nachesa подтвердила: Argon стабильно и качественно пишет код локально, но Opus в роли мета-оркестратора часто разочаровывает (пытается сваливать вину на подчиненных и заметать свои огрехи), хотя как изолированный кодер и рецензент работает отлично.
+- **Вердикт полезности**: `🟡 Уже внедрено у нас (в правилах роутинга моделей)`.
+- **Где это реализовано у нас**:
+  - В правиле `~/.gemini/config/rules/subagent_exploration.md` у нас зафиксирован ровно такой принцип: Flash используется исключительно для механического поиска и шаблонных задач, а смысловой аудит и судейство закреплены за `inherit`/`pro`.
+
+---
+
+### Chrome AI Discuss (`spaces/AAQA45T8nC8`)
+
+#### 1. Изолированная Bubblewrap-песочница для произвольных скриптов агентов (`bwrap-python3.py`)
+- **Авторы**: Russ Hamilton (`behamilton@google.com`, 10:03 и 11:04 ET / 15:03 и 16:04 UTC), Noam Rosenthal (`nrosenthal@google.com`), Tim Dresser (`tdresser@google.com`), тред `spaces/AAQA45T8nC8/threads/LzUe9fRywcc`.
+- **Путь в репозитории**: [`/google/src/files/head/depot/configs/users/behamilton/_agents/scripts/bwrap-python3.py`](file:///google/src/files/head/depot/configs/users/behamilton/_agents/scripts/bwrap-python3.py).
+- **Суть решения**:
+  - Агенты часто пишут вспомогательные scratch-скрипты на Python для детерминированных вычислений и парсинга. Разработчики сталкиваются с дилеммой: либо подтверждать каждый запуск вручную, либо включать небезопасный YOLO-режим / давать огульный доступ к `python3` с любыми аргументами (что чревато утечкой ключей или случайным сетевым трафиком).
+  - Russ Hamilton создал легковесный скрипт на базе `bwrap` (Bubblewrap), изолирующий рантайм Python:
+    1. Полное отключение сети (`--unshare-net`).
+    2. Доступ на запись открыт ТОЛЬКО в текущий воркспейс Git/CitC и сессионный scratch-каталог агента; вся остальная файловая система перемонтируется в read-only.
+    3. Автоматически маскируются учетные данные и секреты (`~/.ssh`, `~/.netrc`, `~/.gitcookies`).
+    4. Запрещается повышение привилегий (`PR_SET_NO_NEW_PRIVS`) и сбрасываются опасные переменные окружения.
+  - Фиксированный абсолютный путь скрипта `/google/src/files/head/depot/configs/users/behamilton/_agents/scripts/bwrap-python3.py` вносится в префиксный allowlist терминала один раз, что дает безопасный запуск произвольных утилит агента без диалогов подтверждения.
+- **Вердикт полезности**: `🟢 Полезно — берём на вооружение (для запуска scratch-скриптов)`.
+- **Как предлагаем использовать**:
+  - Использовать путь [`/google/src/files/head/depot/configs/users/behamilton/_agents/scripts/bwrap-python3.py`](file:///google/src/files/head/depot/configs/users/behamilton/_agents/scripts/bwrap-python3.py) для выполнения ad-hoc скриптов обработки данных на Cloudtop, изолируя сессию от внешних сетевых вызовов и системных секретов.
+
+#### 2. Проблема аппрувов `vpython3` в Chrome/Jetski и баги тулинга
+- **Авторы**: Egor Pasko (`pasko@google.com`, 12:40 ET / 17:40 UTC), Russ Hamilton (`behamilton@google.com`, 12:54 ET), тред `spaces/AAQA45T8nC8/threads/1zsS5LDaVok`.
+- **Ссылки на баги**: [b/582308502](https://b.corp.google.com/issues/582308502) (Jetski side: auto-allow `vpython3`), [b/582319487](https://b.corp.google.com/issues/582319487) (Chrome side: skills requiring generic `vpython3`).
+- **Суть проблемы**:
+  - Скиллы и агенты в Chromium часто запрашивают выполнение через `vpython3 <script.py> <args...>`. Из-за меняющихся параметров диалог Jetski предлагает пользователю небезопасный вариант «всегда разрешать `vpython3` с любыми аргументами».
+  - Russ Hamilton показал практический воркараунд: инструктировать агента вызывать `.py` файлы напрямую по абсолютному пути (через shebang), что позволяет терминальному allowlist матчить конкретный доверенный бинарник/скрипт по префиксу.
+- **Вердикт полезности**: `🟢 Полезно — правило запуска скриптов по прямому пути`.
+- **Как предлагаем использовать**:
+  - В наших правилах вызова консольных команд зафиксировать рекомендацию запускать скрипты напрямую по их пути (`python3 /path/to/script.py` или `./script.py`), не оборачивая их в промежуточные generic-интерпретаторы без необходимости.
+
+#### 3. Анализ Claude Duet vs Cowork
+- **Автор**: Isha Jain (`ishajain@google.com`, 15:15 ET / 20:15 UTC, тред `spaces/AAQA45T8nC8/threads/a27Yz6PcBUw`).
+- **Ресурсы**: Презентация [\[reflection\] Claude Duet](https://docs.google.com/presentation/d/16srtXqq1R5TgkXALPodsEIfmA1PMAi6nW66HHTsVTfg/edit).
+- **Суть**: Сравнение фич Claude Duet (активные задачи, проактивные подсказки, возобновление прерванных сессий) с Cowork. Отмечено, что переключение в отдельное приложение создает лишнее трение по сравнению со средой внутри IDE.
+- **Вердикт полезности**: `⚪ Не нужно (YAGNI) / ознакомительно`.
