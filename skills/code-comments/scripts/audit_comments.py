@@ -31,6 +31,16 @@ COMMENT_LEAK_RE = re.compile(
 # Gerrit rejects truncated Change-Ids; enforce full 'I' + 40 lowercase hex SHA-1 format
 CHANGE_ID_PREFIX_RE = re.compile(r"^Change-Id:\s*(.*)$")
 VALID_CHANGE_ID_RE = re.compile(r"^I[0-9a-f]{40}$")
+# Scope disclaimers in commit messages must never hide diff-induced regressions or vanish in chat
+SCOPE_DISCLAIMER_RE = re.compile(
+    r"^(?:[-*]\s+)?(?:Not covered|Known limitations?|Non-goals?|Caveats?)\s*:",
+    re.IGNORECASE,
+)
+COMMIT_SECTION_OR_TRAILER_RE = re.compile(
+    r"^(?:Tested|Not tested|Not measured|Not profiled|Bug|Fixed|Fixes|Issue|"
+    r"Assisted-by|Signed-off-by|Co-authored-by|Reviewed-by|Reviewed-on|Commit-Queue)\s*:",
+    re.IGNORECASE,
+)
 
 
 def extract_comment_blocks(lines, line_filter=None):
@@ -145,6 +155,33 @@ def audit_commit_message(msg_text):
           f"public CL commit-message leak ('{token}' — avoid go/ or prose b/ IDs): '{stripped}'",
       ))
   return issues
+
+
+def extract_commit_disclaimers(msg_text):
+  # Collect multi-line paragraph disclaimers (e.g. 'Not covered: ...') until the next blank/trailer
+  disclaimers = []
+  lines = msg_text.splitlines()
+  idx = 0
+  while idx < len(lines):
+    stripped = lines[idx].strip()
+    if SCOPE_DISCLAIMER_RE.match(stripped):
+      start_ln = idx + 1
+      para = [stripped]
+      idx += 1
+      while idx < len(lines):
+        nxt = lines[idx].strip()
+        if not nxt or nxt.startswith("#") or CHANGE_ID_PREFIX_RE.match(nxt):
+          break
+        if SCOPE_DISCLAIMER_RE.match(nxt) or COMMIT_SECTION_OR_TRAILER_RE.match(nxt):
+          break
+        para.append(nxt)
+        idx += 1
+      end_ln = idx
+      span = f"L{start_ln}" if start_ln == end_ln else f"L{start_ln}-L{end_ln}"
+      disclaimers.append((span, " ".join(para)))
+    else:
+      idx += 1
+  return disclaimers
 
 
 def get_unpushed_head_message(repo_path):
@@ -275,12 +312,26 @@ def main():
       not args.no_cl_hygiene and ".gemini" not in repo.parts
   )
 
+  disclaimers = []
   if args.commit_msg:
+    # Accept both regular files and process-substitution FIFOs like <(git log -1 --format=%B HEAD)
     msg_path = pathlib.Path(args.commit_msg)
-    if msg_path.is_file():
-      for span, msg in audit_commit_message(msg_path.read_text(encoding="utf-8")):
-        print(f"[ISSUE] {args.commit_msg}:{span}: {msg}")
+    if not msg_path.exists():
+      print(f"[ISSUE] {args.commit_msg}:L1: commit-msg path does not exist")
+      total_issues += 1
+    else:
+      try:
+        msg_text = msg_path.read_text(encoding="utf-8")
+      except OSError as exc:
+        print(f"[ISSUE] {args.commit_msg}:L1: failed to read commit-msg ({exc})")
         total_issues += 1
+        msg_text = ""
+      if msg_text:
+        for span, msg in audit_commit_message(msg_text):
+          print(f"[ISSUE] {args.commit_msg}:{span}: {msg}")
+          total_issues += 1
+        for span, text in extract_commit_disclaimers(msg_text):
+          disclaimers.append((args.commit_msg, span, text))
 
   if args.diff:
     added_map, uncommented_hunks = parse_git_diff(repo, args.diff)
@@ -311,6 +362,8 @@ def main():
         for span, msg in audit_commit_message(head_msg):
           print(f"[ISSUE] HEAD commit-msg:{span}: {msg}")
           total_issues += 1
+        for span, text in extract_commit_disclaimers(head_msg):
+          disclaimers.append(("HEAD commit-msg", span, text))
 
     if uncommented_hunks:
       print("\n=== Uncommented Diff Hunks (Add a comment if the change is non-trivial, even 1 line) ===")
@@ -348,6 +401,14 @@ def main():
     for span, msg in issues:
       print(f"[ISSUE] {p}:{span}: {msg}")
       total_issues += 1
+
+  if disclaimers:
+    print(
+        "\n=== Commit-Message Scope Disclaimers "
+        "(Verify Pre-Existing Only & Repeat in Final User Summary) ==="
+    )
+    for src, span, text in disclaimers:
+      print(f"[DISCLAIMER {src}:{span}] {text}")
 
   if total_issues == 0:
     print("\nOK: 0 mechanical comment violations found.")
