@@ -58,6 +58,15 @@ description: "Skia-style C++ minimalism and suppression of LLM coding reflexes."
     3. **`Behavior notes` / `Assumptions` / `Thread safety`**: Edge-case invariants, leaf-lock or lock-order proof, and bounded-cache memory math (`bytes/entry × capacity = max KB`)
     4. **Empirical tables**: Compact `Before | After` benchmark tables and capacity/threshold selection sweep tables (`no cache`, `cap1`, `cap2`, `cap3`, `no limit`)
     5. **Explicit pre-fix test failure, full `Tested:` matrix & honest scope disclosures**: Exact failure of the new test before the fix (e.g., `Without the lock, the test crashes in 28 of 30 runs`), a complete human-readable `Tested:` block (all executed unit tests, Flutter and Google3 corpora with test counts and zero internal path/`cl/` leaks, ASAN, and platform or physical device trybots), and explicit `Not tested:` / `Not measured:` / `Not profiled:` lines whenever a platform or scenario was not measured (never speculate)
+  - **`Tested:` follows the latest run (both tiers)**: Each `Tested:` entry names where it ran
+    (OS/arch, build type, compiler, font/Unicode backend, or the trybot name) and ends with
+    `Not tested:`. Corpora and trybots often finish after upload: before the final summary,
+    update the description from the latest `compare.md` / `attestation.json` and tryjob triage
+    (`git commit --amend`, then `luci-auth context -- git cl upload -f --commit-description=+`;
+    a message-only patchset is `NO_CODE_CHANGE` and keeps tryjob results).
+    `canary_advisor.py triage` prints `TESTED BLOCK: STALE` until the description lists every
+    green trybot. The final chat summary carries the same per-suite environment (incident:
+    Gerrit 1417397 PS1 kept only a single-test `Test:` line after all gates were green)
 - **Plain Technical English (UNIX / Bell Labs style)**: Write simple, declarative Subject-Verb-Object sentences in the present tense using plain words (`keep`, `give`, `get`, `make`, `run`, `call`, `has`, `same as before`, `Thus`, `Now`); never use pompous Latinate LLM vocabulary (`utilize`, `facilitate`, `subsequently`, `consequently`, `mitigate`, `invocations`, `redundantly`, `leverage`, `comprehensive`, `seamlessly`)
 - **No LLM bulleted lists**: Never generate mechanical LLM-style bulleted lists of imperative verbs (`- Add...`, `- Refactor...`, `- Update...`) that restate the diff; structured `Behavior notes` / `Assumptions` / `Thread safety` bullets in Tier 2 specs are encouraged
 - **2×2 Ablation Matrix in Code Review Replies**: When a reviewer suggests an alternative or combined optimization/design (`A` vs. `B`), measure all 4 combinations (`baseline`, `A alone`, `B alone`, `A + B`) and include the exact numbers in the draft review reply

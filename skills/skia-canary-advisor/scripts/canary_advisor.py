@@ -442,7 +442,29 @@ def load_cl(cl, ps=None, include_diff=True):
         "status": info.get("status", "NEW"),
         "subject": info["subject"], "owner": info["owner"].get("email", ""), "diff": patch,
         "googler_cr_plus_one": googler_cr_plus_one,
+        "kinds": {r.get("_number"): r.get("kind", "") for r in info.get("revisions", {}).values()},
     }
+
+
+# A description-only patchset (Gerrit kind NO_CODE_CHANGE) has the same tree as its parent
+# patchset, so tryjobs from the last patchset with code still describe it
+def code_patchset(meta, ps):
+    kinds = meta.get("kinds") or {}
+    while ps > 1 and kinds.get(ps) == "NO_CODE_CHANGE":
+        ps -= 1
+    return ps
+
+
+TESTED_HEADER_RE = re.compile(r"^(?:Tested|Test):", re.MULTILINE)
+
+
+# The CL description must list every green trybot under Tested:, since corpora and trybots
+# often finish after upload (Gerrit 1417397 PS1 kept only a single-test Test: line)
+def tested_block_gaps(cl, ps, green_builders):
+    msg = gerrit_json(f"/changes/{cl}/revisions/{ps}/commit").get("message", "")
+    if not TESTED_HEADER_RE.search(msg):
+        return ["no Tested: block"]
+    return [b for b in sorted(green_builders) if b not in msg]
 
 
 # Local CitC mount on Linux Cloudtop, or corp gMac forwarding over SSH via corp-ssh-helper
@@ -1345,12 +1367,19 @@ def cmd_triage(args):
     touched_files = list(files.keys())
 
     builds = bb_cl_builds(cl, ps)
-    sw_tasks = swarming_tasks_for_cl(cl, ps)
+    build_ps = ps
+    if not builds and code_patchset(meta, ps) != ps:
+        build_ps = code_patchset(meta, ps)
+        builds = bb_cl_builds(cl, build_ps)
+    sw_tasks = swarming_tasks_for_cl(cl, build_ps)
 
     results = {"cl": cl, "patchset": ps, "builds": {}, "drafts_saved": []}
     drafts_to_save = []
 
     print(f"# Tryjob Triage: CL {cl} PS {ps} ({meta['subject']})\n")
+    if build_ps != ps:
+        print(f"Note: PS {ps} changes only the commit message (NO_CODE_CHANGE); "
+              f"using tryjobs from PS {build_ps}\n")
 
     asan_builder = next((b for b in builds if "ASAN" in b), None)
     if asan_builder:
@@ -1359,7 +1388,7 @@ def cmd_triage(args):
         print(f"## ASAN: {asan_builder} [{status}]")
         if status in ("FAILURE", "INFRA_FAILURE"):
             triage_res = triage_asan_failure(
-                cl, ps, asan_builder, b_info, sw_tasks, touched_files)
+                cl, build_ps, asan_builder, b_info, sw_tasks, touched_files)
             results["builds"][asan_builder] = triage_res
             print(f"- Verdict: {triage_res['verdict']}")
             print(f"- Summary: {triage_res['summary']}")
@@ -1388,10 +1417,10 @@ def cmd_triage(args):
             if status in ("FAILURE", "INFRA_FAILURE"):
                 if cb == "Canary-G3":
                     triage_res = triage_canary_g3_failure(
-                        cl, ps, b_info, sw_tasks, touched_files)
+                        cl, build_ps, b_info, sw_tasks, touched_files)
                 else:
                     triage_res = triage_other_canary_failure(
-                        cl, ps, cb, b_info, sw_tasks, touched_files)
+                        cl, build_ps, cb, b_info, sw_tasks, touched_files)
                 results["builds"][cb] = triage_res
                 print(f"- Verdict: {triage_res['verdict']}")
                 # Surface summary on pre-roll verdicts (NOT_MERGEABLE, MISSING_APPROVAL, INFRA_*)
@@ -1447,7 +1476,7 @@ def cmd_triage(args):
         triage_res = _not_mergeable_verdict(b_info) or {}
         failures = []
         if not triage_res:
-            task = _find_builder_task(cl, ps, ob, b_info, sw_tasks)
+            task = _find_builder_task(cl, build_ps, ob, b_info, sw_tasks)
             tid = task.get("taskId", "") if task else ""
             rid = swarming_task_result(tid).get("runId", "") if tid else ""
             for step in ("dm", "symbolized_dm", "test_skia"):
@@ -1484,6 +1513,17 @@ def cmd_triage(args):
                if r.get("verdict") != "SUCCESS"
                and not (b.startswith("Canary-") and r.get("verdict") == "UNRELATED_HEAD_BREAKAGE")]
         print("\nTRYJOBS: " + (f"NOT GREEN ({', '.join(sorted(red))})" if red else "ALL GREEN"))
+        green = [b for b, r in results["builds"].items() if r.get("verdict") == "SUCCESS"]
+        if not red and meta.get("status", "NEW") == "NEW":
+            gaps = tested_block_gaps(cl, ps, green)
+            print("TESTED BLOCK: " + (f"STALE (missing: {', '.join(gaps)})" if gaps else "OK"))
+            if gaps:
+                print("AGENT ACTION (update the CL description before the final summary): add "
+                      "the trybots and the latest local runs (suites, test counts, OS/arch, "
+                      "build type, compiler, font/Unicode backend) plus Not tested: to the "
+                      "Tested: block, then `git commit --amend` and `luci-auth context -- git cl "
+                      "upload -f --commit-description=+` (a NO_CODE_CHANGE patchset keeps these "
+                      "tryjob results)")
 
     if args.save_draft and drafts_to_save:
         combined_draft = "\n\n".join(drafts_to_save)
@@ -1511,6 +1551,8 @@ def cmd_watch(args):
 
     files = parse_diff(meta["diff"])
     asan_retried = False
+    # Description-only patchsets get no new tryjobs, so watch the last patchset with code
+    code_ps = code_patchset(meta, ps)
 
     while True:
         elapsed = time.time() - start_time
@@ -1538,8 +1580,12 @@ def cmd_watch(args):
 
         # Retry on the next tick if Buildbucket, Swarming, or Gerrit RPCs fail transiently
         try:
+            build_ps = ps
             builds = bb_cl_builds(cl, ps)
-            sw_tasks = swarming_tasks_for_cl(cl, ps)
+            if not builds and code_ps != ps:
+                build_ps = code_ps
+                builds = bb_cl_builds(cl, build_ps)
+            sw_tasks = swarming_tasks_for_cl(cl, build_ps)
 
             asan_builder = next((b for b in builds if "ASAN" in b), None)
             if asan_builder:
@@ -1548,7 +1594,7 @@ def cmd_watch(args):
                 if status in ("FAILURE", "INFRA_FAILURE"):
                     touched = list(files.keys())
                     triage_res = triage_asan_failure(
-                        cl, ps, asan_builder, b_info, sw_tasks, touched
+                        cl, build_ps, asan_builder, b_info, sw_tasks, touched
                     )
                     if triage_res["verdict"] == "INFRA_MISHAP" and not asan_retried:
                         print(f"ASAN infra mishap on {asan_builder}; retrying once")

@@ -3238,7 +3238,11 @@ def create_handoff(
       f"{prompt}\n\nWhen finishing the task in this continuation conversation, your final "
       f"reply MUST be a self-contained summary of the entire chain's work (original problem, "
       f"key changes and files across all chain pieces, verification, and commit/push status) "
-      f"so the user has full context in the last message without opening earlier chats."
+      f"so the user has full context in the last message without opening earlier chats. "
+      f"Build the verification part from the latest runs (compare.md / attestation.json, "
+      f"tryjob triage), not from older notes: each suite with its test counts and where it "
+      f"ran (OS/arch, build type, compiler, font/Unicode backend, trybot links), plus a "
+      f"Not tested line; the CL/PR description Tested: block must match it."
   )
   # The prompt is English for the agent; without this line new chats answer the user in
   # English, since the auto-generated prompt is the only "user" message they have seen

@@ -1016,6 +1016,25 @@ class TestCanaryAdvisor(unittest.TestCase):
     ), patch("sys.platform", "darwin"), patch("os.path.exists", return_value=False):
       self.assertFalse(canary_advisor.has_cloudtop_citc())
 
+  def test_code_patchset_skips_description_only_patchsets(self):
+    meta = {"kinds": {1: "REWORK", 2: "NO_CODE_CHANGE", 3: "NO_CODE_CHANGE", 4: "TRIVIAL_REBASE"}}
+    self.assertEqual(canary_advisor.code_patchset(meta, 3), 1)
+    self.assertEqual(canary_advisor.code_patchset(meta, 4), 4)
+    self.assertEqual(canary_advisor.code_patchset(meta, 1), 1)
+
+  def test_tested_block_gaps_requires_tested_block_with_green_trybots(self):
+    asan = "Test-Ubuntu24.04-Clang-GCE-CPU-AVX2-x86_64-Debug-All-ASAN"
+    cases = [
+        ("Fix.\n\nChange-Id: I1\n", ["no Tested: block"]),
+        ("Fix.\n\nTest: dm --match Foo\n\nChange-Id: I1\n", [asan]),
+        (f"Fix.\n\nTested:\n- dm on Linux\n- {asan}: green\n\nChange-Id: I1\n", []),
+    ]
+    for msg, want in cases:
+      with self.subTest(msg=msg), patch.object(
+          canary_advisor, "gerrit_json", return_value={"message": msg}
+      ):
+        self.assertEqual(canary_advisor.tested_block_gaps(1, 1, [asan]), want)
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -68,6 +68,13 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
      other trybots such as Mac `NativeFonts_Fontations` (with the dm `Failures:` block). Never
      give LGTM / `CR+1` / a CLEAN verdict before `ALL GREEN`; if the watcher was killed, run
      `triage` by hand. `stop_guard.py` (`[TRYJOB GATE GUARD]`) enforces this.
+   - **Description gate (`TESTED BLOCK:` line)**: on `ALL GREEN` for an open CL, `triage` checks
+     the current patchset's commit message and prints `TESTED BLOCK: OK` or
+     `TESTED BLOCK: STALE (missing: ...)`. On `STALE`, update the `Tested:` block from the
+     latest local runs and trybots (`rules/code_style.md` §6) and re-upload with
+     `--commit-description=+` before the final summary. A description-only patchset
+     (`NO_CODE_CHANGE`) gets no new tryjobs; `triage` and `watch` read the tryjobs of the last
+     patchset with code, so do not re-trigger ASAN for it.
    - **On Red Canary (`CL_SUSPECTED_REGRESSION`)**: Report the failing target, `somepath` chain,
      and stack trace to the user and proceed to fix.
    - **On Red Canary / ASAN (`NOT_MERGEABLE`)**: Build failed at Task Scheduler startup because the
