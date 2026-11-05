@@ -134,6 +134,13 @@ def patch_flutter_tools_for_web_corpus(repo):
             "    final File canvasKitFile = _canvasKitFile(relativePath);\n"
             "    _logger.printStatus('[CanvasKit served]: $relativePath');"
         )
+        # #195770 replaced _canvasKitFile(relativePath) with a path joined from the request URL
+        if anchor1 not in text:
+            anchor1 = "    final File canvasKitFile = _fileSystem.file(filePath);"
+            repl1 = (
+                "    final File canvasKitFile = _fileSystem.file(filePath);\n"
+                "    _logger.printStatus('[CanvasKit served]: ${request.url.path}');"
+            )
         anchor2 = '        canvasKitBaseUrl: "/canvaskit/",'
         repl2 = (
             '        canvasKitBaseUrl: "/canvaskit/",\n'
