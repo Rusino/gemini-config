@@ -776,17 +776,19 @@ def gc_stale_test_tmp(
   min_age_sec = max_age_hours * 3600.0
   uid = os.getuid()
 
-  eff_cache = (
-      cache_tmp_root
+  # Run dirs live under ~/.cache/ftt (short for the Chrome socket path limit); gallery profiles
+  # and runs from older harness versions live under ~/.cache/flutter_test_tmp
+  eff_caches = (
+      [cache_tmp_root]
       if cache_tmp_root is not None
-      else os.path.expanduser("~/.cache/flutter_test_tmp")
+      else [os.path.expanduser("~/.cache/ftt"), os.path.expanduser("~/.cache/flutter_test_tmp")]
   )
   eff_sys = sys_tmp_root if sys_tmp_root is not None else "/tmp"
 
   open_paths = (
       set(open_paths_override)
       if open_paths_override is not None
-      else _scan_proc_open_paths([eff_cache, eff_sys])
+      else _scan_proc_open_paths([*eff_caches, eff_sys])
   )
 
   def _is_path_open(cand: str) -> bool:
@@ -795,7 +797,9 @@ def gc_stale_test_tmp(
     return any(p == ac or p.startswith(prefix) for p in open_paths)
 
   candidates: list[str] = []
-  if eff_cache and os.path.isdir(eff_cache):
+  for eff_cache in eff_caches:
+    if not eff_cache or not os.path.isdir(eff_cache):
+      continue
     try:
       for name in sorted(os.listdir(eff_cache)):
         if name.startswith(("run_", "wp_gallery_chrome_")):

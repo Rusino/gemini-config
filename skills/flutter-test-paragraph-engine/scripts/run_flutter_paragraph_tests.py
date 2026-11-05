@@ -58,9 +58,13 @@ _ACTIVE_PROCS: list[subprocess.Popen[Any]] = []
 
 # Create a unique per-run temp directory on the root disk (~/.cache) instead of shared /tmp tmpfs
 def create_isolated_run_tmpdir(base_root: Optional[pathlib.Path | str] = None) -> pathlib.Path:
-    root = pathlib.Path(base_root) if base_root else (pathlib.Path.home() / ".cache/flutter_test_tmp")
+    root = pathlib.Path(base_root) if base_root else (pathlib.Path.home() / ".cache/ftt")
     root.mkdir(parents=True, exist_ok=True)
-    run_dir = root / f"run_{os.getpid()}_{int(time.time() * 1000)}"
+    # Chrome puts its SingletonSocket at $TMPDIR/org.chromium.Chromium.XXXXXX/SingletonSocket and
+    # aborts at startup when that unix socket path exceeds 107 bytes, so keep the run dir short
+    run_dir = root / f"run_{os.getpid()}_{int(time.time()) % 100000}"
+    if len(str(run_dir)) + len("/org.chromium.Chromium.XXXXXX/SingletonSocket") > 107:
+        raise RuntimeError(f"Test TMPDIR {run_dir} is too long for the Chrome singleton socket")
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
 
