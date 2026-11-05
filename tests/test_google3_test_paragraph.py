@@ -6,6 +6,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "skills/google3-test-paragraph/scripts"
@@ -20,6 +21,24 @@ import run_g3_paragraph_tests as rg3
 
 
 class Google3TestParagraphTests(unittest.TestCase):
+    # Redirect default lock and baseline cache dirs so tests never collide with live CitC runs
+    def setUp(self) -> None:
+        self._hermetic_tmp = tempfile.TemporaryDirectory()
+        hermetic_root = pathlib.Path(self._hermetic_tmp.name)
+        self._lock_patcher = mock.patch.object(
+            rg3, "DEFAULT_LOCK_DIR", hermetic_root / "default_locks"
+        )
+        self._cache_patcher = mock.patch.object(
+            rg3, "DEFAULT_BASELINE_CACHE_DIR", hermetic_root / "default_cache"
+        )
+        self._lock_patcher.start()
+        self._cache_patcher.start()
+
+    def tearDown(self) -> None:
+        self._cache_patcher.stop()
+        self._lock_patcher.stop()
+        self._hermetic_tmp.cleanup()
+
     def test_cpp_and_bazel_rewrites_match_autoroller(self) -> None:
         raw_cpp = (
             '#include "include/core/SkCanvas.h"\n'
@@ -482,7 +501,6 @@ class Google3TestParagraphTests(unittest.TestCase):
         import io
         import subprocess
         import tarfile
-        from unittest import mock
 
         with tempfile.TemporaryDirectory() as td:
             tmp = pathlib.Path(td)
@@ -601,7 +619,6 @@ class Google3TestParagraphTests(unittest.TestCase):
     def test_stack_base_skew_and_build_failure_integrity_guard(self) -> None:
         import io
         import subprocess
-        from unittest import mock
 
         with tempfile.TemporaryDirectory() as td:
             tmp = pathlib.Path(td)
@@ -780,7 +797,28 @@ class Google3TestParagraphTests(unittest.TestCase):
                 rg3, "list_citc_dirty_files", return_value=[]
             ), mock.patch.object(
                 rg3, "run_single_leg", side_effect=fake_single_leg
+            ), rg3.acquire_citc_lock(
+                "skia_g3_ab", wait_sec=0.0, lock_dir=tmp / "held_other_chat_lock"
             ):
+                with self.assertRaisesRegex(RuntimeError, "CitC client 'skia_g3_ab' is locked"):
+                    rg3.main(
+                        [
+                            "--no-ssh",
+                            "--quiet-stdout",
+                            "--out",
+                            str(tmp / "locked_abort"),
+                            "--lock-dir",
+                            str(tmp / "held_other_chat_lock"),
+                            "--skia-repo",
+                            str(repo),
+                            "--targets-file",
+                            str(custom_targets),
+                            "baseline=G3_HEAD",
+                            f"cand={rebased_tip}",
+                        ]
+                    )
+                self.assertEqual(leg_calls, [])
+
                 with self.assertRaisesRegex(RuntimeError, "Stack-base skew"):
                     rg3.main(
                         [
@@ -788,6 +826,10 @@ class Google3TestParagraphTests(unittest.TestCase):
                             "--quiet-stdout",
                             "--out",
                             str(tmp / "preflight_abort"),
+                            "--lock-dir",
+                            str(tmp / "test_locks"),
+                            "--baseline-cache-dir",
+                            str(tmp / "test_cache"),
                             "--skia-repo",
                             str(repo),
                             "--targets-file",
@@ -804,6 +846,10 @@ class Google3TestParagraphTests(unittest.TestCase):
                         "--quiet-stdout",
                         "--out",
                         str(tmp / "preflight_ok"),
+                        "--lock-dir",
+                        str(tmp / "test_locks"),
+                        "--baseline-cache-dir",
+                        str(tmp / "test_cache"),
                         "--skia-repo",
                         str(repo),
                         "--targets-file",

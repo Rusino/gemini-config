@@ -55,6 +55,10 @@ DEFAULT_BASELINE_CACHE_DIR = pathlib.Path(
         str(pathlib.Path.home() / ".cache/google3-test-paragraph"),
     )
 )
+# Allow tests and parallel runners to override the lock directory without touching /tmp
+DEFAULT_LOCK_DIR = pathlib.Path(
+    os.environ.get("GOOGLE3_PARAGRAPH_LOCK_DIR", tempfile.gettempdir())
+)
 MAX_BASELINE_CACHE_ENTRIES = 6
 
 
@@ -716,7 +720,8 @@ def acquire_citc_lock(
     wait_sec: float = 0.0,
     lock_dir: pathlib.Path | None = None,
 ) -> Iterator[pathlib.Path]:
-    base_dir = lock_dir or pathlib.Path(tempfile.gettempdir())
+    # Fall back to DEFAULT_LOCK_DIR so unit tests can redirect lock files out of /tmp
+    base_dir = lock_dir if lock_dir is not None else DEFAULT_LOCK_DIR
     enforce_citc_hygiene(base_dir)
     base_dir.mkdir(parents=True, exist_ok=True)
     safe_client = re.sub(r"[^A-Za-z0-9_.-]", "_", citc_client)
@@ -1442,6 +1447,13 @@ def main(argv: list[str] | None = None) -> int:
         default=0.0,
         help="Seconds to wait for exclusive CitC client lock (default: 0 = fail immediately)",
     )
+    # Expose --lock-dir so CLI callers and tests can isolate per-client CitC locks
+    parser.add_argument(
+        "--lock-dir",
+        type=pathlib.Path,
+        default=None,
+        help="Directory for CitC client lock files (default: /tmp)",
+    )
     parser.add_argument("--skia-repo", type=pathlib.Path, default=None, help="Local Skia git repo")
     parser.add_argument("--base-ref", default=None, help="Override Skia base ref for diffing")
     parser.add_argument("--flaky-attempts", type=int, default=1)
@@ -1513,7 +1525,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     skia_repo = resolve_skia_repo(args.skia_repo) if needs_skia_repo else None
 
-    with acquire_citc_lock(citc_client, wait_sec=args.wait_lock_sec):
+    # Forward explicit --lock-dir so pre-flight and leg runs do not contend on /tmp locks
+    lock_dir = args.lock_dir.expanduser() if args.lock_dir is not None else None
+    with acquire_citc_lock(citc_client, wait_sec=args.wait_lock_sec, lock_dir=lock_dir):
         pre_dirty = list_citc_dirty_files(g3_root)
         check_citc_dirty_hygiene(
             citc_client,
