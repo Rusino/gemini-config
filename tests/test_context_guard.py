@@ -994,6 +994,47 @@ class TestContextGuard(unittest.TestCase):
       self.assertTrue(changed_ok)
       self.assertNotIn("unreliable_model_label", state)
 
+  def test_debate_fork_notice_fires_once_and_gates_battle_by_step_count(self):
+    out_fresh = self.run_guard(
+        steps=4,
+        inv=0,
+        lastUserInput="Как лучше организовать кэширование шрифтов в FontCollection?",
+    )
+    msg_fresh = self.message(out_fresh)
+    self.assertIn("[DEBATE & /battle REMINDER]", msg_fresh)
+    self.assertIn("skills/debate/SKILL.md", msg_fresh)
+    self.assertIn("/battle", msg_fresh)
+    self.assertTrue(self.state().get("debate_fork_hint_sent"))
+
+    # Second architectural question in the same chat stays quiet
+    out_second = self.run_guard(
+        steps=10,
+        inv=0,
+        lastUserInput="Какой вариант выбрать для блокировки?",
+    )
+    self.assertNotIn("DEBATE", self.message(out_second))
+
+    # Past 20 steps, a new chat state suggests debate without /battle
+    state_late = {}
+    notice_late, changed_late = context_guard.build_debate_fork_notice(
+        "Есть две гипотезы почему падает тест", 36, state_late
+    )
+    self.assertTrue(changed_late)
+    self.assertIn("[DEBATE REMINDER]", notice_late)
+    self.assertNotIn("[DEBATE & /battle REMINDER]", notice_late)
+
+    # Explicit debate or routine prompts emit no reminder
+    for prompt in (
+        "Проведи дебаты по архитектуре кэша",
+        "/battle сравни два варианта",
+        "Запусти тесты параграфа",
+    ):
+      notice_skip, changed_skip = context_guard.build_debate_fork_notice(
+          prompt, 4, {}
+      )
+      self.assertEqual(notice_skip, "", prompt)
+      self.assertFalse(changed_skip, prompt)
+
 
 if __name__ == "__main__":
   unittest.main()

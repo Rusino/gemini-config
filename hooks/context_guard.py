@@ -1197,6 +1197,32 @@ PERF_LOOP_RE = re.compile(
 )
 
 PERF_SKILL_MD = "~/.gemini/config/skills/perf-optimization-loop/SKILL.md"
+DEBATE_SKILL_MD = "~/.gemini/config/skills/debate/SKILL.md"
+BATTLE_FRESH_MAX_STEPS = 20
+
+# Skip reminder when the user already explicitly requested debate or /battle
+DEBATE_EXPLICIT_RE = re.compile(
+    r"(?:\bдебат\w*|\bdebate\b|(?:^|\s)/(?:battle|bestofn)\b)",
+    re.IGNORECASE,
+)
+
+# Open architectural forks and ambiguous root-cause prompts where multi-model comparison pays off
+DEBATE_FORK_RE = re.compile(
+    r"(?:"
+    r"как\s+лучше\s+(?:сделать|реализовать|организовать|спроектировать|починить|решить|оформить)"
+    r"|какой\s+(?:вариант|подход|способ|путь)\s+(?:выбрать|лучше)"
+    r"|(?:два|несколько|пара)\s+(?:вариант\w*|подход\w*|гипотез\w*)"
+    r"|выбрать\s+между"
+    r"|\bархитектур\w*"
+    r"|(?:в\s+ч[её]м|какая)\s+(?:может\s+быть\s+|тут\s+)?причин\w*"
+    r"|не\s+пойму\s*,?\s*почему"
+    r"|\bгипотез\w*"
+    r"|how\s+should\s+we\s+(?:design|architect|structure)"
+    r"|which\s+(?:approach|option|design)\s+is\s+better"
+    r"|competing\s+hypothes[ei]s"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def build_perf_loop_notice(last_user_input: str) -> str:
@@ -1215,6 +1241,50 @@ def build_perf_loop_notice(last_user_input: str) -> str:
       "interleaved rounds per measurement, one optimization per commit with the `Perf:` "
       "trailers from `bench_compare.py`, and `opt_branch_audit.py` before upload. "
       "Ignore this if the mention is incidental."
+  )
+
+
+# Remind the user at most once per chat when a real design fork or root-cause split appears
+def build_debate_fork_notice(
+    last_user_input: str, steps: int, state: dict
+) -> tuple[str, bool]:
+  if (
+      not last_user_input
+      or "<SYSTEM_MESSAGE>" in last_user_input
+      or state.get("debate_fork_hint_sent")
+      or any(marker in last_user_input for marker in AUTO_PROMPT_MARKERS)
+      or DEBATE_EXPLICIT_RE.search(last_user_input)
+  ):
+    return "", False
+  if not (
+      DEBATE_FORK_RE.search(last_user_input)
+      or CRITICAL_CHALLENGE_RE.search(last_user_input)
+  ):
+    return "", False
+  state["debate_fork_hint_sent"] = True
+  if steps <= BATTLE_FRESH_MAX_STEPS:
+    return (
+        "[DEBATE & /battle REMINDER]\n"
+        "The prompt asks an open design, evaluation, or root-cause question in a fresh chat. "
+        "ONLY if your analysis reveals a genuine architectural fork or >= 2 competing root-cause "
+        "hypotheses (stay completely silent on routine single-answer questions), surface both "
+        "multi-model options at the end of your reply so the user need not remember them:\n"
+        f"1. Include a 1-click option in `ask_question` to run `{DEBATE_SKILL_MD}` "
+        '("Провести перекрёстные дебаты моделей (скилл debate)").\n'
+        "2. Add a 1-line tip noting that in this fresh chat (with 0 running background tasks) "
+        "she can also type `/battle` in the Jetski UI to compare 2 blind `BoN` arms from the "
+        "separate `BoN` quota pool (and click a winner afterwards).",
+        True,
+    )
+  return (
+      "[DEBATE REMINDER]\n"
+      "The prompt asks an open design, evaluation, or root-cause question. ONLY if your analysis "
+      "reveals a genuine architectural fork or >= 2 competing root-cause hypotheses (stay "
+      "completely silent on routine single-answer questions), include a 1-click option in "
+      f"`ask_question` to run `{DEBATE_SKILL_MD}` "
+      '("Провести перекрёстные дебаты моделей (скилл debate)") so the user need not remember '
+      "the skill name (do not suggest `/battle` past 20 steps).",
+      True,
   )
 
 
@@ -2183,6 +2253,14 @@ def run(data: dict, log: dict) -> dict:
       perf_notice = build_perf_loop_notice(last_user_input)
       if perf_notice:
         messages.append(perf_notice)
+      # Surface debate and /battle once per chat on open design or root-cause forks
+      debate_notice, debate_changed = build_debate_fork_notice(
+          last_user_input, steps, state
+      )
+      if debate_changed:
+        save_state(state_path, state)
+      if debate_notice:
+        messages.append(debate_notice)
     # Final reports often come from wakeup turns, after many English tool results
     if invocation_num == 0:
       lang_notice = build_language_notice(state.get("user_lang", ""))
@@ -2277,6 +2355,8 @@ def run(data: dict, log: dict) -> dict:
       "unreliable_model_blocked_turn",
       "config_sync_notice",
       "config_sync_notice_state",
+      # Keep once-per-chat debate/battle hint latch across handoff triggers
+      "debate_fork_hint_sent",
   ):
     if k in state:
       new_state[k] = state[k]

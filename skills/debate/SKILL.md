@@ -33,6 +33,19 @@ deterministic quote verification, per-attack rulings, and a tool-less Scribe syn
 
 ---
 
+## Interactive Battle Mode (/battle) vs. Structured `debate`
+
+| Situation | Preferred Tool | Quota & Execution Rules |
+|---|---|---|
+| **Fresh chat (`<= 20` steps, 0 active background tasks/subagents)** with a 2-way root-cause question, minimal C++ patch choice, Tier-2 review/commit phrasing, or depleted primary `Claude` quota | **Interactive Battle Mode (/battle or /bestofn) in Jetski UI** | Server-assigned `SERVING_TYPE_BON` arms draw from a separate experimental quota pool rather than the primary `Claude` / `Gemini` buckets; always click a winner in the UI after comparing both answers |
+| **Multi-round adversarial cross-examination**, verbatim `quote_in` verification, deterministic concession ledger, 3+ orthogonal lenses, or **mid-session chats (`> 20` steps / active tasks)** | **Structured `debate` skill (`Mode A` or `Mode B`)** | Uses standard enabled frontier or `flash` models; never pass `-bon-` model IDs directly (`hooks/chat_lifecycle.py` and `scripts/debate_ls_runner.py` block direct `SERVING_TYPE_BON` calls per b/580403511), and never use `advanced.best_of` to save quota (it runs $n + 1$ standard subagents on your own quota) |
+
+### Proactive User Reminder Protocol
+- **When a fork arises naturally (without the user typing `"проведи дебаты"`)**: Whenever an open architectural trade-off or `>= 2` competing root-cause hypotheses appear, include `"Провести перекрёстные дебаты моделей (скилл debate)"` as a 1-click option in `ask_question` (and if `steps <= 20` with 0 active tasks, add a 1-line tip mentioning the /battle UI command) so the user never has to remember the command or skill name on her own.
+- **When the user explicitly asks for `"проведи дебаты"`**: Run the `debate` skill directly without stalling; if the chat is fresh (`<= 20` steps) and the question is a simple 2-way comparison, include a 1-line note at the end reminding that /battle in the UI is also available for blind `BoN`-pool comparisons.
+
+---
+
 ## Two Execution Modes
 
 Both modes share the pure state machine, schemas, quote verifier, and concession ledger in [`scripts/debate_core.py`](scripts/debate_core.py).
@@ -42,7 +55,7 @@ Both modes share the pure state machine, schemas, quote verifier, and concession
 | **Mechanism** | `run_workflow` tool with stateful `agent()` | Language Server ConnectRPC (`StartCascade`) |
 | **Diversity Source** | Orthogonal engineering lenses (`Invariant Purist`, `Systems/Perf Pragmatist`, `Edge-Case Skeptic`) | Cross-provider frontier models (`Claude Opus 5.5`, `Gemini 4 Carbon`, `Claude Fable 5.1`, `GLM 5.2`) |
 | **UI Integration** | Renders live phase cards directly in the Jetski chat UI | Runs via command-line, produces clean Markdown packet |
-| **Model Selection** | Inherited tier or explicit tier (`flash`, `pro`, `flash_lite`) | Specific enabled frontier model IDs from `GetAvailableModels` |
+| **Model Selection** | Inherited tier or explicit tier (`flash`, `inherit`, `flash_lite`) | Specific enabled frontier model IDs from `GetAvailableModels` |
 
 ---
 
@@ -84,7 +97,7 @@ run_workflow(
     Args={
         "question": "How should we design thread-safe face caching in FontCollection?",
         "rounds": 1,
-        "model": "flash",  # or "pro"
+        "model": "flash",  # or "inherit"
         "scribe_model": "flash",
         "prior_context": "",
         "output_path": "/tmp/font_cache_debate.md",
