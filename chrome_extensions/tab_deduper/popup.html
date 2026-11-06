@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Safe Tab Deduper</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+        Helvetica, Arial, sans-serif;
+      font-size: 13px;
+      color: #202124;
+      background: #ffffff;
+      width: 380px;
+      padding: 12px;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid #dadce0;
+      padding-bottom: 10px;
+      margin-bottom: 12px;
+    }
+    .title-group {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .title {
+      font-size: 14px;
+      font-weight: 600;
+      color: #1a73e8;
+    }
+    .toggle-label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .pause-btn {
+      background: #f1f3f4;
+      border: 1px solid #dadce0;
+      border-radius: 4px;
+      padding: 3px 8px;
+      font-size: 11px;
+      cursor: pointer;
+      color: #3c4043;
+    }
+    .pause-btn:hover {
+      background: #e8eaed;
+    }
+    .section-title {
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      color: #5f6368;
+      margin-bottom: 6px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .tab-list {
+      max-height: 180px;
+      overflow-y: auto;
+      border: 1px solid #e8eaed;
+      border-radius: 6px;
+      margin-bottom: 10px;
+    }
+    .tab-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 8px;
+      border-bottom: 1px solid #f1f3f4;
+    }
+    .tab-row:last-child {
+      border-bottom: none;
+    }
+    .tab-info {
+      flex: 1;
+      min-width: 0;
+    }
+    .tab-name {
+      font-size: 12px;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .tab-url {
+      font-size: 11px;
+      color: #5f6368;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .badge {
+      display: inline-block;
+      font-size: 10px;
+      padding: 1px 5px;
+      border-radius: 3px;
+      background: #e8f0fe;
+      color: #1a73e8;
+      white-space: nowrap;
+    }
+    .action-btn {
+      width: 100%;
+      background: #1a73e8;
+      color: #ffffff;
+      border: none;
+      border-radius: 4px;
+      padding: 8px;
+      font-weight: 500;
+      cursor: pointer;
+      margin-bottom: 12px;
+    }
+    .action-btn:disabled {
+      background: #dadce0;
+      color: #80868b;
+      cursor: default;
+    }
+    .action-btn:not(:disabled):hover {
+      background: #1557b0;
+    }
+    .recent-list {
+      max-height: 120px;
+      overflow-y: auto;
+      font-size: 11px;
+    }
+    .recent-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      padding: 4px 0;
+      border-bottom: 1px solid #f8f9fa;
+    }
+    .recent-url {
+      flex: 1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: #3c4043;
+    }
+    .reopen-btn {
+      background: none;
+      border: 1px solid #dadce0;
+      border-radius: 3px;
+      padding: 2px 6px;
+      font-size: 10px;
+      cursor: pointer;
+      color: #1a73e8;
+    }
+    .reopen-btn:hover {
+      background: #f1f3f4;
+    }
+    .empty-state {
+      padding: 16px;
+      text-align: center;
+      color: #80868b;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="title-group">
+      <span class="title">Safe Tab Deduper</span>
+    </div>
+    <div style="display: flex; gap: 8px; align-items: center;">
+      <button id="pauseBtn" class="pause-btn">Pause 60s</button>
+    </div>
+  </header>
+
+  <div style="margin-bottom: 10px;">
+    <label class="toggle-label">
+      <input type="checkbox" id="autoDedupeToggle">
+      <span>Auto-focus existing tab on new links</span>
+    </label>
+  </div>
+
+  <div class="section-title">
+    <span>Open duplicates</span>
+    <span id="dupCountLabel" style="font-weight: normal; font-size: 11px;">0 found</span>
+  </div>
+  <div id="dupList" class="tab-list">
+    <div class="empty-state">No duplicates open</div>
+  </div>
+  <button id="closeSelectedBtn" class="action-btn" disabled>Close selected (0)</button>
+
+  <div class="section-title">
+    <span>Recent auto-switches</span>
+  </div>
+  <div id="recentList" class="recent-list">
+    <div class="empty-state" style="padding: 8px 0;">No tabs switched recently</div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
