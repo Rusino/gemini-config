@@ -366,6 +366,13 @@ def triage_badge_info(item: Mapping[str, Any] | None) -> dict[str, str]:
   )
   cur_ps = _to_int((item.get("patchset") if isinstance(item, Mapping) else None) or 1)
   stale = is_triage_stale(item)
+  if is_armed_finalize(item):
+    return {
+        "cls": "triage-clean",
+        "pillCls": "v-clean",
+        "label": "⏳ CQ Dry Run → auto CR+1 armed",
+        "eyebrow": f"⏳ Review PS{rev_ps}: CQ Dry Run running → auto CR+1",
+    }
   g_state = combined_gate_state(item)
   if out in GATED_LGTM_OUTCOMES and g_state["anyRequired"]:
     c_name = g_state["activeLabel"]
@@ -644,6 +651,98 @@ def can_finalize_clean_review(item: Mapping[str, Any] | None) -> bool:
   return g_state["status"] in ("passed", "not_required", "waived")
 
 
+def is_armed_finalize(item: Mapping[str, Any] | None) -> bool:
+  """Returns True when a CLEAN reviewer CL is armed to auto-publish CR+1 on green CQ dry run."""
+  if not isinstance(item, Mapping):
+    return False
+  armed = item.get("armed_finalize")
+  if not isinstance(armed, Mapping):
+    return False
+  if item.get("kind") != "gerrit" or item.get("is_self") or is_companion(item):
+    return False
+  if item.get("status") != "NEW" or item.get("is_wip") or item.get("self_approved"):
+    return False
+  if _to_int(item.get("self_cr_vote") or 0) > 0 or is_triage_stale(item):
+    return False
+  if item.get("cq_failed") or item.get("phase") == "ALERT_CQ_FAILED":
+    return False
+  cur_ps = _to_int(item.get("patchset") or 0)
+  armed_ps = _to_int(armed.get("patchset") or 0)
+  if cur_ps > 0 and armed_ps > 0 and cur_ps != armed_ps:
+    return False
+  cur_rev = str(item.get("revision") or "").strip()
+  armed_rev = str(armed.get("expected_revision") or "").strip()
+  if cur_rev and armed_rev and cur_rev != armed_rev:
+    return False
+  return True
+
+
+def finalize_action_info(item: Mapping[str, Any] | None) -> dict[str, Any]:
+  """Computes clear button and modal labels for pre-LGTM CQ dry run arming and finalization."""
+  if is_armed_finalize(item):
+    return {
+        "enabled": True,
+        "mode": "armed",
+        "card_label": "⏳ Armed: CQ Dry Run → CR+1",
+        "card_title": (
+            "CQ Dry Run (Commit-Queue+1) is running; CR+1 and staged drafts will publish "
+            "automatically as soon as CQ Dry Run passes on this patchset"
+        ),
+        "cancel_label": "🛑 Cancel auto CR+1",
+        "cancel_title": "Disarm automatic CR+1 publication (keeps unpublished Gerrit drafts)",
+        "modal_tab_label": "⏳ Armed: CQ → CR+1",
+    }
+  if not can_finalize_clean_review(item):
+    return {
+        "enabled": False,
+        "mode": "disabled",
+        "card_label": "",
+        "card_title": "",
+        "cancel_label": "",
+        "cancel_title": "",
+        "modal_tab_label": "",
+    }
+  cq_st = str((item or {}).get("cq_status") or "")
+  if cq_st in ("✓ Dry Run Passed", "CQ+2 (Submitting)"):
+    return {
+        "enabled": True,
+        "mode": "publish_now",
+        "card_label": "✅ Publish CR+1 (CQ ✓)",
+        "card_title": (
+            "CQ Dry Run already passed on this patchset — review staged drafts and publish "
+            "Code-Review+1 immediately"
+        ),
+        "cancel_label": "",
+        "cancel_title": "",
+        "modal_tab_label": "Publish CR+1 (CQ ✓)",
+    }
+  if cq_st == "CQ+1 (Dry Run)":
+    return {
+        "enabled": True,
+        "mode": "arm_running",
+        "card_label": "⏳ Arm auto CR+1 after CQ Dry Run",
+        "card_title": (
+            "CQ Dry Run is already running on this patchset — arm Flight Deck to auto-publish "
+            "Code-Review+1 and staged drafts when it passes"
+        ),
+        "cancel_label": "",
+        "cancel_title": "",
+        "modal_tab_label": "Arm CR+1 after CQ",
+    }
+  return {
+      "enabled": True,
+      "mode": "run_and_arm",
+      "card_label": "🧪 Run CQ Dry Run → auto CR+1",
+      "card_title": (
+          "Start a quiet Commit-Queue+1 dry run now and arm Flight Deck to auto-publish "
+          "Code-Review+1 and staged drafts as soon as CQ Dry Run passes"
+      ),
+      "cancel_label": "",
+      "cancel_title": "",
+      "modal_tab_label": "CQ Dry Run → CR+1",
+  }
+
+
 def spine_step_short_state(
     item: Mapping[str, Any] | None,
     by_ikey: Mapping[str, dict[str, Any]] | None = None,
@@ -668,6 +767,8 @@ def spine_step_short_state(
     return {"short": "Ready CQ+2", "icon": "🚀", "tone": "spine-you"}
   if item.get("self_approved") or item.get("self_review_state") == "approved":
     return {"short": "CR+1", "icon": "✓", "tone": "spine-ok"}
+  if is_armed_finalize(item):
+    return {"short": "CQ+1 → CR+1", "icon": "⏳", "tone": "spine-ok"}
   if item.get("merge_conflict"):
     return {"short": "Conflict", "icon": "⚠️", "tone": "spine-warn"}
   if is_post_submit_alert(item):
@@ -819,6 +920,8 @@ def available_actions_of(
   actions: list[str] = []
   if can_finalize_clean_review(item):
     actions.append("finalize_clean_review")
+  if is_armed_finalize(item):
+    actions.append("disarm_finalize_review")
   if can_rebase(item):
     actions.append("rebase")
   if (
@@ -904,6 +1007,12 @@ def _item_core_sig(item: Mapping[str, Any] | None, now_ts: float | None = None) 
     ])
   else:
     tr_sig = ""
+  armed = item.get("armed_finalize")
+  armed_sig = (
+      f"1:{n(armed.get('patchset'))}:{s(armed.get('expected_revision'))}"
+      if isinstance(armed, Mapping)
+      else "0"
+  )
   return "|".join([
       s(item.get("status")),
       s(item.get("phase")),
@@ -949,6 +1058,7 @@ def _item_core_sig(item: Mapping[str, Any] | None, now_ts: float | None = None) 
       comps_sig,
       mc_needs,
       tr_sig,
+      armed_sig,
   ])
 
 
@@ -1000,6 +1110,8 @@ def compute_item_entity_state(
       "is_reviewer_change": is_reviewer_change(item),
       "can_rebase": can_rebase(item),
       "can_finalize_clean_review": can_finalize_clean_review(item),
+      "is_armed_finalize": is_armed_finalize(item),
+      "finalize_action_info": finalize_action_info(item),
       "is_triage_stale": is_triage_stale(item),
       "effective_corpus_status": effective_corpus_status(item),
       "effective_g3_corpus_status": effective_g3_corpus_status(item),
