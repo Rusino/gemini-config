@@ -298,3 +298,58 @@
 - **Ресурсы**: Презентация [\[reflection\] Claude Duet](https://docs.google.com/presentation/d/16srtXqq1R5TgkXALPodsEIfmA1PMAi6nW66HHTsVTfg/edit).
 - **Суть**: Сравнение фич Claude Duet (активные задачи, проактивные подсказки, возобновление прерванных сессий) с Cowork. Отмечено, что переключение в отдельное приложение создает лишнее трение по сравнению со средой внутри IDE.
 - **Вердикт полезности**: `⚪ Не нужно (YAGNI) / ознакомительно`.
+
+
+---
+
+## 2026-11-06
+
+### Sad RU Googlers (HISTORY OFF) (`spaces/AAAAn_HZbYs`)
+
+#### 1. Запрет агентам ставить LGTM в Critique ([cl/1007219049](http://cl/1007219049)) и Author Standard (go/comment-closed)
+- **Авторы**: Dennis Kormalev (`denk@google.com`, 12:56–13:30 ET / 17:56–18:30 UTC), Alexander Milantev (`alexmilan@google.com`, 13:22–13:38 ET), Alexander Taran (`omck@google.com`), Stanislav Zholnin (`zholnin@google.com`), Vanya Davidenko (`vdvd@google.com`), тред `spaces/AAAAn_HZbYs/threads/gSBYd0QRAa8`.
+- **Ссылки и ресурсы**: Piper CL [cl/1007219049](http://cl/1007219049) (запрет агентам давать LGTM), гайдлайны go/comment-closed, go/agent-access-guidelines, go/handling-comments.
+- **Суть проблемы и обсуждения**:
+  - Alexander Milantev подсветил находящийся в разработке Piper CL [cl/1007219049](http://cl/1007219049), который запретит автоматическим агентам и сайдкарам с «грязными» учетными данными ставить LGTM в Critique (действия агента сохраняются как `reply-comment --is-human` черновики, требующие явного подтверждения человеком).
+  - Dennis Kormalev подчеркнул, что корпоративный гайдлайн `author-standard` прямо запрещает отправку неотрецензированных ответов от ИИ (unvetted AI responses), и поделился ссылкой go/comment-closed для закрытия некачественных комментариев агентов.
+  - Alexander Taran собрал себе скилл для работы с шаблонами закрытия комментариев.
+- **Вердикт полезности**: `🟡 Уже внедрено у нас (в правилах code_style.md)`.
+- **Где это реализовано у нас**:
+  - В правилах `rules/code_style.md` у нас уже действует строжайший запрет: черновики сохраняются исключительно непубличными (`gerrit_draft.py`), публикация ответов, резолв тредов и простановка голосов `Code-Review+1`, `Auto-Submit+1` или `Commit-Queue+1/2` категорически запрещены без явного подтверждения человеком через Flight Deck или команду.
+
+#### 2. Баг платформы Jetski: сайдкары не стартуют в headless-режиме `agy remote-control` ([b/582156508](https://b.corp.google.com/issues/582156508))
+- **Авторы**: Ivan Inozemtsev (`iinozemtsev@google.com`, 04:50 ET / 09:50 UTC, тред `spaces/AAAAn_HZbYs/threads/2pWIqDmJHPw`), Dmitrii Filippov (`dmfilippov@google.com`), Sergey Kalsin (`skalsin@google.com`).
+- **Ссылки и баги**: Баг [b/582156508](https://b.corp.google.com/issues/582156508) (`[AGY remote-control] Sidecar support in agy service mode?`).
+- **Суть проблемы**:
+  - Ivan Inozemtsev провел глубокий анализ исходников `language_server` (rcl=1014519266): выяснилось, почему сайдкары не запускаются в фоновом демоне `agy remote-control` на удаленных серверах. Менеджер сайдкаров инициализируется только при `SubclientType == "hub"` или наличии скрытого флага `--allow_all_sidecars`. Команда `remote-control serve` оставляет тип клиента `"cli"` и не включает `Sidecars.Enabled`.
+  - В качестве временного воркараунда Ivan использует `systemd user services` с последующим дерганием `agentapi cli`.
+- **Вердикт полезности**: `⚪ Не нужно (YAGNI) / справочно в архиве`.
+- **Как используем**:
+  - Нам запуск в headless-режиме не требуется: мы работаем на полноценном Cloudtop в среде Jetski Hub, где менеджер сайдкаров включен по умолчанию. Баг полезен как контекст устройства рантайма Jetski.
+
+#### 3. Модели-IC vs Модели-оркестраторы («Клод как чайка-менеджер»)
+- **Авторы**: Anna Nachesa (`ashalynd@google.com`, 03:35 ET / 08:35 UTC, тред `spaces/AAAAn_HZbYs/threads/7Uzfrv5W0qU`), Kosta Sharlaimov (`ksharlaimov@google.com`), Slava Guzanov (`vguzanov@google.com`).
+- **Суть дискуссии**:
+  - Anna поделилась опытом использования Claude в качестве мета-оркестратора: модель демонстрирует паттерн «чайка-менеджера» (не вникает в работу воркеров, а когда вскрываются ошибки, впадает в панику, начинает всё лихорадочно перепроверять сама и слать злобные сообщения).
+  - Kosta Sharlaimov отметил необходимость принципиально разного обучения и промптинга для моделей-IC и моделей-оркестраторов.
+- **Вердикт полезности**: `🟡 Уже внедрено у нас`.
+  - В правилах `rules/subagent_exploration.md` у нас зафиксировано жесткое шардирование задач (`<= 150 KB` / `<= 10` файлов), конкретный бриф для каждого воркера и запрет неконтролируемого мета-менеджмента.
+
+---
+
+### Chrome AI Discuss (`spaces/AAQA45T8nC8`)
+
+#### 1. Gerrit Review Poller Sidecar для Chromium (`gerrit-review-poller`)
+- **Авторы**: Dan Murphy (`dmurph@google.com`, 17:42 ET / 22:42 UTC, тред `spaces/AAQA45T8nC8/threads/qfIGFwL2DCg`), Nicolas MacBeth (`nicolasmacbeth@google.com`), Justin Donnelly (`jdonnelly@google.com`).
+- **Ссылки и ресурсы**: Документация [go/jetski-gerrit-poller](http://goto.google.com/jetski-gerrit-poller), исходники [`/google/src/files/head/depot/google3/experimental/chrome-cap-ai-workspace/sidecars/gerrit-review-poller/`](file:///google/src/files/head/depot/google3/experimental/chrome-cap-ai-workspace/sidecars/gerrit-review-poller/), промпт ревью [`ai-review-prompt-report.md`](file:///google/src/files/head/depot/google3/experimental/chrome-cap-ai-workspace/sidecars/gerrit-review-poller/prompt/ai-review-prompt-report.md).
+- **Суть решения**:
+  - Dan Murphy выкатил обновленный Jetski Sidecar `gerrit-review-poller`, автоматизирующий первичный разбор входящих ревью для Chromium (`chromium/src`):
+    1. По расписанию раз в час опрашивает attention set в Gerrit.
+    2. Для каждого CL создает изолированный Rift-воркспейс `reviewing_<cl>`.
+    3. Запускает ревью-сессию в Jetski Hub на модели `Gemini Pro Next` в режиме `report` (вывод в чат) или `draft` (подготовка непубличных черновиков).
+    4. Автоматически закрывает и удаляет воркспейс после закрытия или мерджа CL (`rift close reviewing_<cl> -f --delete-branch --clean-jetski`).
+    5. Содержит защиту от непроверенных авторов `ALLOWED_AUTHOR_DOMAINS` (`chromium.org,google.com,committers@chromium.org`) и явный инвариант **«Security & Untrusted Input Guardrail»** против prompt injection в чужих патчах (CL description, коммит-сообщения, комментарии, файлы `.agents/` / `.gemini/` / `AGENTS.md` строго трактуются как untrusted data).
+- **Вердикт полезности**: `🟢 Взято в роадмап: R38.7` (защитный инвариант от промпт-инъекций в `R38`) + `⚪ Не нужно (YAGNI)` (сам поллер воркспейсов Rift).
+- **Как предлагаем использовать**:
+  1. Сам фоновый поллер Rift-воркспейсов нам не нужен: наш фокус — Skia и Flutter Engine в изолированных git-воркспейсах, а входящие ревью мы запускаем точечно через `review-triage` и `companion-cl-review`.
+  2. Защитный инвариант **Security & Untrusted Input Guardrail** предлагаем перенести в наши скиллы `skills/review-triage/SKILL.md` и `skills/companion-cl-review/SKILL.md` (подзадача в открытом эпике `R38`): жестко запретить агентам выполнять любые инструкции или менять системный промпт при обнаружении директив в описаниях чужих CL, комментариях Gerrit или файлах `.gemini/` / `AGENTS.md`, добавленных автором патча.
