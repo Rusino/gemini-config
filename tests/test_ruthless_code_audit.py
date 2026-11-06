@@ -228,6 +228,7 @@ class TestRuthlessCodeAudit(unittest.TestCase):
         "#pragma GCC diagnostic ignored \"-Wunused-parameter\"",
         "// TODO: fix this later",
         "// TODO(KEEPER-DEBT: Invariant-3): remove fallback after migration",
+        "// TODO(jlavrova): unify UTF-8/UTF-16 index mapping",
         "void layoutParagraph(Node* ptr) {",
         "  if (!ptr) { return; }",
         "  auto* buf = new FooBuffer();",

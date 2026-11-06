@@ -130,8 +130,10 @@ WARNING_SUPPRESS_RE = re.compile(
     r"|#\[allow\()"
 )
 
+# Accept KEEPER-DEBT, issue/URL links, or Google/Skia TODO(owner) markers with a named owner
 VALID_DEBT_RE = re.compile(
-    r"(?:TODO|FIXME)\s*\(\s*(?:KEEPER-DEBT|b/\d+|#\d+|https?://|[a-zA-Z0-9_-]+:\s*(?:b/|#|\d+))",
+    r"(?:TODO|FIXME)\s*\(\s*(?:KEEPER-DEBT|b/\d+|#\d+|https?://"
+    r"|[a-zA-Z0-9_-]+(?:\s*\)|\s*:\s*(?:b/|#|\d+)))",
     re.IGNORECASE,
 )
 ANONYMOUS_DEBT_RE = re.compile(
