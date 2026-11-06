@@ -834,6 +834,11 @@ def available_actions_of(
     act = str(item.get("sponsor_action") or "")
     if act:
       actions.append(act)
+  if item.get("is_self") and any(
+      isinstance(lb, Mapping) and lb.get("needs_self_assign")
+      for lb in (item.get("linked_bugs") or [])
+  ):
+    actions.append("assign_bug")
   is_rev = is_reviewer_change(item)
   has_chat = bool(item.get("conversation_id"))
   cur_ps = _to_int(item.get("patchset") or 1)
@@ -1022,6 +1027,8 @@ def compute_bug_entity_state(bug: Mapping[str, Any]) -> dict[str, Any]:
   if (bug.get("is_security_merge_request") or bug.get("is_merge_request_bug")) and lane == "you":
     phase = str(bug.get("merge_action_phase") or "confirm")
     actions.append(f"security_merge_{phase}")
+  if bug.get("needs_self_assign"):
+    actions.append("assign_bug")
   if needs_you:
     actions.append("ack_bug")
   actions.append("open_chat" if bug.get("conversation_id") else "start_chat")

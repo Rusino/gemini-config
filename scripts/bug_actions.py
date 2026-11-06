@@ -110,6 +110,11 @@ def reassign_security_merge(issue_id: str | int) -> dict[str, Any]:
   return w.reassign_security_merge_for_state([bid])
 
 
+def assign_bug_to_self(bug_key_or_id: str | int) -> dict[str, Any]:
+  """Assigns a GitHub (`Rusino`) or Buganizer (`jlavrova@google.com`) bug and verifies read-back."""
+  return w.assign_bug_to_self_for_state([str(bug_key_or_id or "").strip()])
+
+
 def is_authorized_to_render_bug(
     issue_id: str | int, state: dict[str, Any] | None = None
 ) -> tuple[bool, str]:
@@ -171,8 +176,8 @@ def main(argv: list[str] | None = None) -> int:
   args = list(sys.argv[1:] if argv is None else argv)
   if len(args) < 2:
     print(
-        "Usage: python3 bug_actions.py <close_fixed|reassign_merge|render>"
-        " <issue_id> [gerrit_url|NA]",
+        "Usage: python3 bug_actions.py"
+        " <close_fixed|reassign_merge|assign_self|render> <issue_id> [gerrit_url|NA]",
         file=sys.stderr,
     )
     return 1
@@ -190,6 +195,8 @@ def main(argv: list[str] | None = None) -> int:
     out = close_bug_with_fixed_by(issue_id, args[2])
   elif action == "reassign_merge":
     out = reassign_security_merge(issue_id)
+  elif action == "assign_self":
+    out = assign_bug_to_self(issue_id)
   elif action == "render":
     out = render_issue_with_external_auth(issue_id)
   else:

@@ -243,7 +243,7 @@ RE_CHERRY_PICKED_FROM = re.compile(
 )
 RE_CHROME_MILESTONE_BRANCH = re.compile(r"(?:^|/)m(\d{2,4})\b", re.IGNORECASE)
 RE_BUG_TITLE_TOKEN = re.compile(
-    r"\b(?:crbug(?:\.com)?/|b/|flutter#)\d{4,10}\b",
+    r"\b(?:crbug(?:\.com)?/|b/|flutter[:#])\d{4,10}\b",
     re.IGNORECASE,
 )
 RE_BUGANIZER_EXPLICIT = re.compile(
@@ -252,10 +252,16 @@ RE_BUGANIZER_EXPLICIT = re.compile(
     r"|\b(?:crbug(?:\.com)?/(?:[a-z0-9_-]+/)?|b/|buganizer[:/]|chromium:|skia:))"
     r"(\d{6,10})\b"
 )
+# Match both flutter#110875 and malformed flutter:110875 so bug linking still resolves
 RE_GH_FLUTTER_ISSUE_EXPLICIT = re.compile(
-    r"(?i)(?:https?://github\.com/flutter/flutter/issues/|\bflutter(?:/flutter)?#)"
+    r"(?i)(?:https?://github\.com/flutter/flutter/issues/|\bflutter(?:/flutter)?[:#])"
     r"(\d{4,7})\b"
 )
+# Shorthand Flutter issue tokens on Gerrit Bug:/Fixed: lines are not linked by Gerrit
+RE_GERRIT_MALFORMED_FLUTTER_FOOTER = re.compile(
+    r"(?i)(?<!github\.com/)(?<!/)\b(flutter(?:/flutter)?[:#](\d{4,7}))\b"
+)
+RE_GERRIT_BARE_HASH_FOOTER = re.compile(r"(?<![a-zA-Z0-9_/])(#(\d{4,7}))\b")
 RE_GH_CLOSING_KEYWORD = re.compile(
     r"(?i)\b(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?|issue)\s+#(\d{5,7})\b"
 )
@@ -1229,8 +1235,9 @@ def extract_bug_refs_from_text(
   if default_tracker == "buganizer":
     # Bare >=6-digit numbers on Gerrit/Piper Bug:/Fixed: lines refer to Buganizer/crbug
     for tag_m in RE_BUG_TAG.finditer(text):
-      line_val = tag_m.group(1)
-      for bm in re.finditer(r"(?<![#\w/])(\d{6,10})\b", line_val):
+      # Strip explicit Flutter issue tokens first so flutter:110875 never matches as Buganizer
+      line_val = RE_GH_FLUTTER_ISSUE_EXPLICIT.sub(" ", tag_m.group(1))
+      for bm in re.finditer(r"(?<![#:\w/])(\d{6,10})\b", line_val):
         _add(f"buganizer:{bm.group(1)}")
   elif default_tracker == "github":
     # Match closing keywords like Fixes #193731 while ignoring PR #195122 references
@@ -1246,6 +1253,45 @@ def extract_bug_refs_from_text(
     for km in kw_re.finditer(text):
       _add(f"gh_issue:{repo_norm}#{km.group(1)}")
   return found
+
+
+def detect_malformed_bug_footers(
+    text: str, kind: str = "gerrit"
+) -> list[dict[str, str]]:
+  """Detects unlinked Gerrit Bug:/Fixed: tokens like `Bug: flutter:110875` or `Bug: #110875`."""
+  if not text or str(kind or "gerrit").lower() != "gerrit":
+    return []
+  malformed: list[dict[str, str]] = []
+  seen_raw: set[str] = set()
+  for tag_m in RE_BUG_TAG.finditer(text):
+    line_val = tag_m.group(1)
+    for fm in RE_GERRIT_MALFORMED_FLUTTER_FOOTER.finditer(line_val):
+      raw_tok = fm.group(1)
+      num = fm.group(2)
+      if raw_tok not in seen_raw:
+        seen_raw.add(raw_tok)
+        malformed.append({
+            "raw": raw_tok,
+            "suggested": f"https://github.com/flutter/flutter/issues/{num}",
+            "reason": (
+                f"Gerrit does not link `{raw_tok}`; use "
+                f"`Bug: https://github.com/flutter/flutter/issues/{num}`"
+            ),
+        })
+    for hm in RE_GERRIT_BARE_HASH_FOOTER.finditer(line_val):
+      raw_tok = hm.group(1)
+      num = hm.group(2)
+      if raw_tok not in seen_raw:
+        seen_raw.add(raw_tok)
+        malformed.append({
+            "raw": raw_tok,
+            "suggested": f"https://github.com/flutter/flutter/issues/{num}",
+            "reason": (
+                f"Gerrit does not link bare `{raw_tok}`; use "
+                f"`Bug: https://github.com/flutter/flutter/issues/{num}` or `b/<id>`"
+            ),
+        })
+  return malformed
 
 
 def discover_bug_chats(
@@ -5175,6 +5221,11 @@ def fetch_gerrit_cl_status(
           "patchset": ps_num,
           "revision": cur_sha,
           "commit_message": commit_msg,
+          "malformed_bug_footers": (
+              detect_malformed_bug_footers(commit_msg, kind="gerrit")
+              if is_self
+              else []
+          ),
           "files": files,
           "hashtags": hashtags,
           "topic": topic,
@@ -9971,6 +10022,31 @@ def link_bugs_and_cls(
             "shared_chat": False,
         })
     bug["linked_cls"] = subtasks
+    b_status = str(bug.get("status") or "OPEN").upper()
+    has_active_self_cl = any(
+        bool(c.get("is_self"))
+        and bool(c.get("shared_1_to_1", True))
+        and str(c.get("status") or "NEW").upper() not in ("ABANDONED", "CLOSED")
+        for c in subtasks
+    )
+    needs_self_assign = bool(
+        has_active_self_cl
+        and b_status in ("OPEN", "NEW", "ASSIGNED", "ACCEPTED")
+        and not is_merge_request_bug(bug)
+        and not is_security_merge_request(bug)
+        and not _is_skoretext_cl_only_external_bug(bug)
+        and not _is_self_bug_assignee(str(bug.get("assignee") or ""))
+    )
+    bug["needs_self_assign"] = needs_self_assign
+    bug["assign_target"] = (
+        (
+            "Rusino"
+            if str(bug.get("source") or "") == "github"
+            else "jlavrova@google.com"
+        )
+        if needs_self_assign
+        else ""
+    )
 
   for bug in bugs_by_key.values():
     if isinstance(bug, dict):
@@ -9989,6 +10065,9 @@ def link_bugs_and_cls(
             "severity": str(bug.get("severity") or ""),
             "status": str(bug.get("status") or ""),
             "url": str(bug.get("url") or ""),
+            "assignee": str(bug.get("assignee") or ""),
+            "needs_self_assign": bool(bug.get("needs_self_assign")),
+            "assign_target": str(bug.get("assign_target") or ""),
         })
       elif bkey.startswith("buganizer:"):
         bid = bkey.split(":", 1)[1]
@@ -10000,6 +10079,9 @@ def link_bugs_and_cls(
             "severity": "",
             "status": "",
             "url": f"https://b.corp.google.com/issues/{bid}",
+            "assignee": "",
+            "needs_self_assign": False,
+            "assign_target": "",
         })
       elif bkey.startswith("gh_issue:flutter/flutter#"):
         gnum = bkey.split("#", 1)[1]
@@ -10011,9 +10093,16 @@ def link_bugs_and_cls(
             "severity": "",
             "status": "",
             "url": f"https://github.com/flutter/flutter/issues/{gnum}",
+            "assignee": "",
+            "needs_self_assign": False,
+            "assign_target": "",
         })
     for _, rec in pairs:
       rec["linked_bugs"] = b_badges
+      if rec.get("is_self") and str(rec.get("kind") or "gerrit") == "gerrit":
+        rec["malformed_bug_footers"] = detect_malformed_bug_footers(
+            str(rec.get("commit_message") or ""), kind="gerrit"
+        )
 
 
 def _is_self_bug_assignee(assignee: str) -> bool:
@@ -11414,6 +11503,15 @@ def classify_bug_status(
       )
   )
 
+  has_chatted_1to1_self_cl = bool(
+      str(bug.get("conversation_id") or "").strip() and not bug.get("chat_archived")
+  ) or any(
+      bool(c.get("is_self"))
+      and bool(c.get("shared_1_to_1", True))
+      and bool(str(c.get("conversation_id") or "").strip())
+      and not bool(c.get("chat_archived"))
+      for c in linked_cls
+  )
   if unacked_comment:
     snip = str(bug.get("last_human_comment_snippet") or "").strip()
     prefix = (
@@ -11435,6 +11533,13 @@ def classify_bug_status(
     )
     bug["needs_you"] = True
     bug["why_needs_you"] = f"Collaborator{owner_part} — needs your review / input"
+  elif bool(bug.get("needs_self_assign")) and has_chatted_1to1_self_cl and acked_ts < 1.0:
+    short_lbl = str(bug.get("short_id") or bug.get("bug_key") or "issue")
+    target_who = str(bug.get("assign_target") or "jlavrova")
+    bug["needs_you"] = True
+    bug["why_needs_you"] = (
+        f"Linked to your fix CL — assign {short_lbl} to {target_who}?"
+    )
   elif all_merged_unacked:
     bug["needs_you"] = True
     bug["why_needs_you"] = "All linked CLs merged — ready to mark Fixed?"
@@ -11490,6 +11595,9 @@ def should_autostart_bug_triage(bug: dict[str, Any]) -> bool:
   if bug.get("conversation_id") or not bug.get("needs_you"):
     return False
   if str(bug.get("why_needs_you") or "").startswith("All linked CLs merged"):
+    return False
+  # Bugs already linked to a self fix CL only need assignment confirmation, not triage
+  if bool(bug.get("needs_self_assign")):
     return False
   # Open non-WIP linked CLs already have an implementation in review
   if any(
@@ -12021,9 +12129,44 @@ def sync_bugs_into_state(
   all_bug_chats = discover_bug_chats(include_archived=True)
   merged_chats = {**all_bug_chats, **bug_chats}
 
+  # Gather external bug IDs referenced by tracked CLs/PRs before TTL fast-return
+  ref_buganizer_ids: set[str] = set()
+  ref_gh_nums: set[str] = set()
+  self_cl_bkeys: set[str] = set()
+  for rec in items.values():
+    if not isinstance(rec, dict):
+      continue
+    kind = str(rec.get("kind") or "gerrit")
+    blob = "\n".join([
+        str(rec.get("subject") or ""),
+        str(rec.get("commit_message") or ""),
+        str(rec.get("topic") or ""),
+    ])
+    for bkey in [
+        *(str(k) for k in (rec.get("linked_bug_keys") or []) if k),
+        *extract_bug_refs_from_text(
+            blob,
+            default_tracker="github" if kind == "github" else "buganizer",
+            default_repo=str(rec.get("host") or ""),
+        ),
+    ]:
+      if rec.get("is_self"):
+        self_cl_bkeys.add(bkey)
+      if bkey.startswith("buganizer:"):
+        ref_buganizer_ids.add(bkey.split(":", 1)[1])
+      elif bkey.startswith("gh_issue:flutter/flutter#"):
+        ref_gh_nums.add(bkey.split("#", 1)[1])
+
   now_ts = time.time()
   last_bug_ts = float(state.get("last_bug_sync_ts") or 0.0)
-  if not force and prev_bugs and (now_ts - last_bug_ts) < BUG_SYNC_TTL_SEC:
+  # Bypass 5-min TTL when an own CL/PR references a bug missing from cached state
+  has_uncached_self_cl_bug = any(bkey not in prev_bugs for bkey in self_cl_bkeys)
+  if (
+      not force
+      and prev_bugs
+      and not has_uncached_self_cl_bug
+      and (now_ts - last_bug_ts) < BUG_SYNC_TTL_SEC
+  ):
     # Refresh chat links, CL subtasks, and prune stale non-self entries between 5-min polls
     link_bugs_and_cls(prev_bugs, items, bug_chats=merged_chats)
     fast_merge_parents = {
@@ -12059,34 +12202,6 @@ def sync_bugs_into_state(
           pid: grp for pid, grp in prev_groups.items() if pid in active_pids
       }
     return
-
-  # Gather external bug IDs referenced by tracked CLs/PRs (for badges and self-CL bugs)
-  ref_buganizer_ids: set[str] = set()
-  ref_gh_nums: set[str] = set()
-  self_cl_bkeys: set[str] = set()
-  for rec in items.values():
-    if not isinstance(rec, dict):
-      continue
-    kind = str(rec.get("kind") or "gerrit")
-    blob = "\n".join([
-        str(rec.get("subject") or ""),
-        str(rec.get("commit_message") or ""),
-        str(rec.get("topic") or ""),
-    ])
-    for bkey in [
-        *(str(k) for k in (rec.get("linked_bug_keys") or []) if k),
-        *extract_bug_refs_from_text(
-            blob,
-            default_tracker="github" if kind == "github" else "buganizer",
-            default_repo=str(rec.get("host") or ""),
-        ),
-    ]:
-      if rec.get("is_self"):
-        self_cl_bkeys.add(bkey)
-      if bkey.startswith("buganizer:"):
-        ref_buganizer_ids.add(bkey.split(":", 1)[1])
-      elif bkey.startswith("gh_issue:flutter/flutter#"):
-        ref_gh_nums.add(bkey.split("#", 1)[1])
 
   closed_since = (
       datetime.now(timezone.utc) - timedelta(days=BUG_RECENT_CLOSED_DAYS)
@@ -12445,6 +12560,169 @@ def ack_bug_item(bug_key: str) -> dict[str, Any]:
   return ack_bug_items([bkey])
 
 
+def normalize_bug_key(raw: str) -> str:
+  """Normalizes a shorthand or full bug reference to `gh_issue:<repo>#<n>` or `buganizer:<id>`."""
+  val = str(raw or "").strip()
+  if not val:
+    return ""
+  if val.startswith(("gh_issue:", "buganizer:")):
+    return val
+  refs = extract_bug_refs_from_text(val, default_tracker="buganizer")
+  if refs:
+    return refs[0]
+  if val.isdigit():
+    return f"buganizer:{val}"
+  return val
+
+
+def _assign_single_bug_to_self(bkey: str) -> dict[str, Any]:
+  """Assigns one GitHub (`Rusino`) or Buganizer (`jlavrova@google.com`) issue and verifies it."""
+  if bkey.startswith("gh_issue:"):
+    rest = bkey.split(":", 1)[1]
+    if "#" not in rest:
+      return {"ok": False, "bug_key": bkey, "error": f"Invalid GitHub bug key: {bkey}"}
+    repo, num = rest.split("#", 1)
+    repo = repo.strip() or "flutter/flutter"
+    num = num.strip()
+    try:
+      edit_res = subprocess.run(
+          ["gh", "issue", "edit", num, "-R", repo, "--add-assignee", "Rusino"],
+          capture_output=True,
+          text=True,
+          timeout=20,
+          check=False,
+      )
+    except (OSError, subprocess.SubprocessError) as exc:
+      return {"ok": False, "bug_key": bkey, "error": str(exc)}
+    if edit_res.returncode != 0:
+      err = (edit_res.stderr or edit_res.stdout or "gh issue edit failed").strip()
+      return {"ok": False, "bug_key": bkey, "error": err}
+    logins: list[str] = []
+    try:
+      view_res = subprocess.run(
+          ["gh", "issue", "view", num, "-R", repo, "--json", "assignees"],
+          capture_output=True,
+          text=True,
+          timeout=15,
+          check=False,
+      )
+      if view_res.returncode == 0 and view_res.stdout.strip():
+        vdata = json.loads(view_res.stdout)
+        logins = [
+            str(a.get("login") or "").strip()
+            for a in (vdata.get("assignees") or [])
+            if isinstance(a, dict) and str(a.get("login") or "").strip()
+        ]
+    except (OSError, subprocess.SubprocessError, ValueError):
+      pass
+    joined = ", ".join(logins) if logins else "Rusino"
+    if logins and not _is_self_bug_assignee(joined):
+      return {
+          "ok": False,
+          "bug_key": bkey,
+          "error": f"Read-back assignees {joined!r} did not include Rusino",
+      }
+    return {
+        "ok": True,
+        "bug_key": bkey,
+        "source": "github",
+        "id": num,
+        "assignee": joined,
+    }
+
+  if bkey.startswith("buganizer:"):
+    bid = bkey.split(":", 1)[1].strip()
+    if not bid.isdigit():
+      return {"ok": False, "bug_key": bkey, "error": f"Invalid Buganizer ID: {bid}"}
+    outs = call_buganizer_mcp_batch([
+        ("safe_reassign_issue", {"issueId": bid, "assignee": "jlavrova@google.com"}),
+        (
+            "get_bugs_with_external",
+            {"query": f"id:{bid}", "maxResults": 1, "verbose": True},
+        ),
+    ])
+    p1_out = outs[0] if outs else ""
+    rb_raw = outs[1] if len(outs) > 1 else ""
+    parsed = parse_buganizer_blocks(rb_raw) if rb_raw else []
+    rb_bug = parsed[0] if parsed else {}
+    rb_assignee = str(rb_bug.get("assignee") or "").strip()
+    rb_status = str(rb_bug.get("status") or "").strip().upper()
+    if not _is_self_bug_assignee(rb_assignee) and not (
+        _mcp_mutation_succeeded(p1_out) and not rb_raw.strip()
+    ):
+      return {
+          "ok": False,
+          "bug_key": bkey,
+          "source": "buganizer",
+          "id": bid,
+          "error": p1_out or f"Read-back assignee mismatch: {rb_assignee!r}",
+      }
+    return {
+        "ok": True,
+        "bug_key": bkey,
+        "source": "buganizer",
+        "id": bid,
+        "assignee": rb_assignee or "jlavrova@google.com",
+        "status": rb_status or "ASSIGNED",
+    }
+
+  return {"ok": False, "bug_key": bkey, "error": f"Unsupported bug key: {bkey}"}
+
+
+def assign_bug_to_self_for_state(bug_keys: list[str]) -> dict[str, Any]:
+  """Assigns one or more linked bugs to Yulia and updates `cl_watcher_state.json`."""
+  norm_keys = [
+      normalize_bug_key(k) for k in bug_keys if normalize_bug_key(k)
+  ]
+  if not norm_keys:
+    return {"ok": False, "error": "Missing bug_key"}
+  results: list[dict[str, Any]] = []
+  assigned: list[str] = []
+  failed: list[str] = []
+  for bkey in dict.fromkeys(norm_keys):
+    res = _assign_single_bug_to_self(bkey)
+    results.append(res)
+    if res.get("ok"):
+      assigned.append(bkey)
+    else:
+      failed.append(bkey)
+
+  if assigned:
+    with _STATE_IO_LOCK:
+      latest_state = load_watcher_state()
+      latest_bugs = latest_state.setdefault("bugs", {})
+      latest_items = latest_state.setdefault("items", {})
+      for res in results:
+        if not res.get("ok"):
+          continue
+        bk = str(res.get("bug_key") or "")
+        bug = latest_bugs.get(bk)
+        if isinstance(bug, dict):
+          bug["assignee"] = str(res.get("assignee") or "")
+          bug["needs_self_assign"] = False
+          bug["assign_target"] = ""
+          bug["is_collaborator"] = False
+          if res.get("status"):
+            bug["status"] = str(res["status"])
+      link_bugs_and_cls(latest_bugs, latest_items)
+      for bk in assigned:
+        if isinstance(latest_bugs.get(bk), dict):
+          classify_bug_status(latest_bugs[bk])
+      attach_merge_children_to_cls_and_bugs(latest_bugs, latest_items)
+      save_watcher_state(latest_state)
+
+  first = results[0] if results else {}
+  return {
+      "ok": bool(assigned and not failed),
+      "bug_key": str(first.get("bug_key") or norm_keys[0]),
+      "assignee": str(first.get("assignee") or ""),
+      "error": str(first.get("error") or ""),
+      "assigned": assigned,
+      "failed": failed,
+      "results": results,
+  }
+
+
 def merge_concurrent_state_mutations(
     state: dict[str, Any],
     baseline_state: dict[str, Any] | None = None,
@@ -12512,9 +12790,15 @@ def merge_concurrent_state_mutations(
         changed = True
       d_asg = str(dbug.get("assignee") or "").strip().lower()
       b_asg = str(bbug.get("assignee") or "").strip().lower()
-      if d_asg == "merges@chromium.org" and b_asg != "merges@chromium.org":
+      if (d_asg == "merges@chromium.org" and b_asg != "merges@chromium.org") or (
+          _is_self_bug_assignee(d_asg) and not _is_self_bug_assignee(b_asg)
+      ):
         sbug["assignee"] = dbug.get("assignee")
-        sbug["is_collaborator"] = bool(dbug.get("is_collaborator", True))
+        sbug["is_collaborator"] = bool(
+            dbug.get("is_collaborator", d_asg == "merges@chromium.org")
+        )
+        sbug["needs_self_assign"] = bool(dbug.get("needs_self_assign", False))
+        sbug["assign_target"] = str(dbug.get("assign_target") or "")
         changed = True
       if dbug.get("conversation_id") and dbug.get("conversation_id") != bbug.get(
           "conversation_id"
@@ -17821,17 +18105,31 @@ function focusCard(it, data) {
 // Render clickable parent bug chips on CL cards so authors see linked crbug/b/gh issues
 function parentBugsHtml(it) {
   const bugs = Array.isArray(it.linked_bugs) ? it.linked_bugs : [];
-  if (!bugs.length) return '';
-  return '<div class="meta" style="margin-top:3px">' + bugs.map(b => {
+  const malformed = (it.is_self && Array.isArray(it.malformed_bug_footers))
+    ? it.malformed_bug_footers : [];
+  if (!bugs.length && !malformed.length) return '';
+  const chips = bugs.map(b => {
     const pri = b.priority ? ` · ${esc(b.priority)}` : '';
     const tip = b.title ? `${b.short_id}: ${b.title}` : b.short_id;
-    return link(
+    const chip = link(
       b.url,
       `<span class="badge bug-link">🐛 ${esc(b.short_id)}${pri}</span>`,
       '',
       tip,
     );
-  }).join(' ') + '</div>';
+    const assignBtn = (it.is_self && b.needs_self_assign && b.bug_key)
+      ? ` <button class="triage-btn primary" style="padding:1px 7px;font-size:10.5px" ` +
+        `onclick="assignBugToSelf(${esc(JSON.stringify(b.bug_key))}, this)">` +
+        `👤 Assign ${esc(b.short_id || 'bug')} to ${esc(b.assign_target || 'me')}</button>`
+      : '';
+    return chip + assignBtn;
+  }).join(' ');
+  const warnHtml = malformed.map(m =>
+    `<div class="companion-banner" style="margin-top:4px;color:var(--amber)">` +
+    `⚠️ Malformed Bug footer <code>${esc(m.raw)}</code> — use ` +
+    `<code>Bug: ${esc(m.suggested)}</code></div>`
+  ).join('');
+  return (chips ? `<div class="meta" style="margin-top:3px">${chips}</div>` : '') + warnHtml;
 }
 
 function rowHtml(it, data) {
@@ -17841,12 +18139,24 @@ function rowHtml(it, data) {
   const bugChips = (Array.isArray(it.linked_bugs) ? it.linked_bugs : []).map(b => {
     const pri = b.priority ? ` ${esc(b.priority)}` : '';
     const tip = b.title ? `${b.short_id}: ${b.title}` : b.short_id;
-    return link(b.url, `<span class="badge bug-link">${esc(b.short_id)}${pri}</span>`, '', tip);
+    const chip = link(b.url, `<span class="badge bug-link">${esc(b.short_id)}${pri}</span>`, '', tip);
+    const assignBtn = (it.is_self && b.needs_self_assign && b.bug_key)
+      ? ` <button class="link-btn" ` +
+        `onclick="assignBugToSelf(${esc(JSON.stringify(b.bug_key))}, this)">` +
+        `👤 assign to ${esc(b.assign_target || 'me')}</button>`
+      : '';
+    return chip + assignBtn;
   }).join('');
+  const malformedWarn = (it.is_self && Array.isArray(it.malformed_bug_footers) &&
+      it.malformed_bug_footers.length)
+    ? `<span class="amber" title="${esc(it.malformed_bug_footers[0].reason || '')}">` +
+      `⚠️ Bug: ${esc(it.malformed_bug_footers[0].raw)} → use URL</span>`
+    : '';
   const meta = [
     `<span class="proj-tag">${esc(it.project_name)}</span>`,
     `<span class="cl">${clAnchor}</span>`,
     bugChips,
+    malformedWarn,
     who,
     chatActionHtml(it, data, true),
   ].filter(Boolean).join(' · ');
@@ -18302,21 +18612,32 @@ function bugFocusCard(bug, data) {
   const sloPart = bug.slo_summary ? ` · <span class="red">${esc(bug.slo_summary)}</span>` : '';
   const ackBtn = `<button class="btn secondary" ` +
     `onclick="ackBug(${esc(JSON.stringify(bug.bug_key || ''))}, this)">✓ Ack</button>`;
+  const assignBtn = bug.needs_self_assign
+    ? `<button class="btn primary" ` +
+      `onclick="assignBugToSelf(${esc(JSON.stringify(bug.bug_key || ''))}, this)">` +
+      `👤 Assign to ${esc(bug.assign_target || 'me')}</button>`
+    : '';
+  const openBtnCls = assignBtn ? 'btn secondary' : 'btn primary';
   return `<article class="card${isAlert ? ' alert' : ''}">` +
     `<div><div class="eyebrow">${busyBadge}${esc(bug.project_name || 'Skia')} · ` +
     `${link(bug.url, esc(bug.short_id || bug.bug_key))}${collabTag}${typeTag}</div>` +
     `<h2>${bugPriorityBadgeHtml(bug)}${link(bug.url, esc(bug.title))}</h2>` +
     `<div class="why">${esc(bug.why_needs_you || 'Needs triage')}${sloPart}</div></div>` +
-    `<div class="actions">${link(bug.url, 'Open issue', 'btn primary')}` +
+    `<div class="actions">${assignBtn}${link(bug.url, 'Open issue', openBtnCls)}` +
     `${ackBtn}${bugChatActionHtml(bug, data, false)}</div>` +
     `${bugSubtasksHtml(bug, data)}${mergesBannerHtml(bug)}</article>`;
 }
 
 function bugRowHtml(bug, data) {
   const ownerActor = (bug.assignee && bug.assignee !== 'N/A') ? shortActor(bug.assignee) : '';
+  const assignInline = bug.needs_self_assign
+    ? `<button class="link-btn" ` +
+      `onclick="assignBugToSelf(${esc(JSON.stringify(bug.bug_key || ''))}, this)">` +
+      `👤 assign to ${esc(bug.assign_target || 'me')}</button>`
+    : '';
   const actorMeta = bug.is_collaborator
     ? `Collaborator${ownerActor ? ` · owner: ${esc(ownerActor)}` : ''}`
-    : (ownerActor ? esc(ownerActor) : '');
+    : (ownerActor ? esc(ownerActor) : assignInline);
   const meta = [
     `<span class="proj-tag">${esc(bug.project_name || 'Skia')}</span>`,
     `<span class="cl">${link(bug.url, esc(bug.short_id || bug.bug_key))}</span>`,
@@ -19225,6 +19546,35 @@ async function ackBug(bugKey, btn) {
   return ackBugs([bugKey], btn);
 }
 
+async function assignBugToSelf(bugKeys, btn) {
+  const keys = Array.isArray(bugKeys) ? bugKeys.filter(Boolean) : [bugKeys].filter(Boolean);
+  if (!keys.length || (btn && btn.disabled)) return;
+  const orig = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Assigning…';
+  }
+  try {
+    const resp = await fetch('/api/assign_bug', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({bug_keys: keys, bug_key: keys[0]}),
+    });
+    const res = await resp.json();
+    if (res && res.ok) {
+      await fetchState(true);
+      return;
+    }
+    if (btn && res && res.error) btn.title = res.error;
+  } catch (e) {
+    // Restore button label when the local HTTP call fails
+  }
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
+}
+
 async function confirmMerge(parentId, btn) {
   if (!parentId || (btn && btn.disabled)) return;
   const orig = btn ? btn.textContent : '';
@@ -19538,6 +19888,7 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
         "/api/open_chat",
         "/api/abandon",
         "/api/ack_bug",
+        "/api/assign_bug",
         "/api/confirm_merge",
         "/api/add_reviewer",
         "/api/approve_review_preview",
@@ -19569,6 +19920,14 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
         else:
           res = ack_bug_item(
               str(bdict.get("bug_key") or bdict.get("item_key") or "")
+          )
+      elif parsed.path == "/api/assign_bug":
+        raw_bkeys = bdict.get("bug_keys")
+        if isinstance(raw_bkeys, list) and raw_bkeys:
+          res = assign_bug_to_self_for_state([str(k) for k in raw_bkeys if k])
+        else:
+          res = assign_bug_to_self_for_state(
+              [str(bdict.get("bug_key") or bdict.get("item_key") or "")]
           )
       elif parsed.path == "/api/confirm_merge":
         res = confirm_security_merge_group(
