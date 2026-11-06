@@ -100,14 +100,17 @@ def find_ninja(repo):
 _ACTIVE_PROCS = []
 
 
+CHROME_SINGLETON_SOCKET_SUFFIX = "/.org.chromium.Chromium.XXXXXX/SingletonSocket"
+
+
 # Create a unique per-run temp directory on the root disk (~/.cache) instead of shared /tmp tmpfs
 def create_isolated_run_tmpdir(base_root=None):
     root = pathlib.Path(base_root) if base_root else (pathlib.Path.home() / ".cache/ftt")
-    root.mkdir(parents=True, exist_ok=True)
-    # Chrome puts its SingletonSocket at $TMPDIR/org.chromium.Chromium.XXXXXX/SingletonSocket and
-    # aborts at startup when that unix socket path exceeds 107 bytes, so keep the run dir short
+    # Chrome puts SingletonSocket under $TMPDIR/.org.chromium.Chromium.XXXXXX and aborts at
+    # startup when the AF_UNIX path exceeds sun_path (103 bytes on macOS, 107 bytes on Linux)
+    max_sun_path = 103 if sys.platform == "darwin" else 107
     run_dir = root / f"run_{os.getpid()}_{int(time.time()) % 100000}"
-    if len(str(run_dir)) + len("/org.chromium.Chromium.XXXXXX/SingletonSocket") > 107:
+    if len(os.fsencode(str(run_dir))) + len(CHROME_SINGLETON_SOCKET_SUFFIX) > max_sun_path:
         raise RuntimeError(f"Test TMPDIR {run_dir} is too long for the Chrome singleton socket")
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir

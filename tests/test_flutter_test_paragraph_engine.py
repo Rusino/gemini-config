@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,11 +14,17 @@ FLUTTER_SKILL_DIR = (
     pathlib.Path(__file__).resolve().parent.parent
     / "skills/flutter-test-paragraph-engine/scripts"
 )
-if str(FLUTTER_SKILL_DIR) not in sys.path:
-    sys.path.insert(0, str(FLUTTER_SKILL_DIR))
+WP_SKILL_DIR = (
+    pathlib.Path(__file__).resolve().parent.parent
+    / "skills/webparagraph-corpus/scripts"
+)
+for _skill_dir in (FLUTTER_SKILL_DIR, WP_SKILL_DIR):
+    if str(_skill_dir) not in sys.path:
+        sys.path.insert(0, str(_skill_dir))
 
 import parse_flutter_paragraph_tests as pfpt
 import run_flutter_paragraph_tests as rfpt
+import run_webparagraph_corpus as rwpc
 
 
 def _git(repo: pathlib.Path, *args: str) -> str:
@@ -308,12 +315,37 @@ class TestFlutterExternalSkiaPreflight(unittest.TestCase):
             self.assertEqual(checkout_calls, [])
 
     def test_isolated_run_tmpdir_and_process_group_kill(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        # macOS sets $TMPDIR to /var/folders/.../T/ (~49 bytes), leaving no room for Chrome's
+        # 46-byte SingletonSocket suffix inside a nested TemporaryDirectory unless rooted in /tmp
+        short_tmp = "/tmp" if os.path.isdir("/tmp") and os.access("/tmp", os.W_OK) else None
+        with tempfile.TemporaryDirectory(dir=short_tmp) as td:
             base = pathlib.Path(td)
-            run_tmp = rfpt.create_isolated_run_tmpdir(base)
-            self.assertTrue(run_tmp.exists())
-            self.assertEqual(run_tmp.parent, base)
-            self.assertTrue(run_tmp.name.startswith(f"run_{os.getpid()}_"))
+            for mod in (rfpt, rwpc):
+                sub = base / mod.__name__[:4]
+                run_tmp = mod.create_isolated_run_tmpdir(sub)
+                self.assertTrue(run_tmp.exists())
+                self.assertEqual(run_tmp.parent, sub)
+                self.assertTrue(run_tmp.name.startswith(f"run_{os.getpid()}_"))
+
+                overlong = base / ("x" * 60)
+                with self.assertRaisesRegex(RuntimeError, "Chrome singleton socket"):
+                    mod.create_isolated_run_tmpdir(overlong)
+                self.assertFalse(overlong.exists())
+
+                # macOS AF_UNIX sun_path holds 103 path bytes (vs 107 on Linux); 58-byte run_dir
+                # + 46-byte suffix = 104 bytes must fail on Darwin and pass on Linux
+                with mock.patch.object(mod.os, "getpid", return_value=12345), mock.patch.object(
+                    mod.time, "time", return_value=67890.0
+                ):
+                    pad_len = 58 - len(str(base)) - 1 - len("run_12345_67890")
+                    darwin_edge = base / ("d" * pad_len)
+                    with mock.patch.object(mod.sys, "platform", "darwin"):
+                        with self.assertRaisesRegex(RuntimeError, "Chrome singleton socket"):
+                            mod.create_isolated_run_tmpdir(darwin_edge)
+                    self.assertFalse(darwin_edge.exists())
+                    with mock.patch.object(mod.sys, "platform", "linux"):
+                        self.assertTrue(mod.create_isolated_run_tmpdir(darwin_edge).exists())
+                    shutil.rmtree(darwin_edge)
 
             fake_proc = mock.MagicMock()
             fake_proc.pid = 424242
