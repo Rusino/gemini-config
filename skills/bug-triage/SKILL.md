@@ -51,6 +51,38 @@ Never upload a WIP CL blindly. Classify the bug into exactly one of the five out
 
 ---
 
+## Phase 2.5: Prediction-First Call-Graph Sparring (Familiar Text Core Only)
+
+When Outcome 1 or 2 applies to a defect in `SkParagraph`, `SkUnicode`, `SkShaper`, or `WebParagraph`, protect primary call-graph localization before revealing the code root cause:
+
+1. **Three-Level Instant Bypass & Emergency Disable (Zero Friction)**:
+   - **Automatic Emergency Bypass**: Skip Phase 2.5 automatically on active roll blockers, CI/trybot failures on an open CL, security merge requests, or whenever the user's prompt signals urgency (`"срочно"`, `"быстро"`, `"без спарринга"`, `"сразу фикс"`, `"пропусти ставку"`, `"urgent"`, `"hotfix"`).
+   - **Global Pause Toggle in `~/.gemini/config/logs/prediction_log.jsonl`**: Before running Phase 2.5, check the latest `"event": "toggle"` record in `~/.gemini/config/logs/prediction_log.jsonl`. If `"enabled": false` (or the user says `"отключи спарринг"`), skip Phase 2.5 silently across all sessions until re-enabled by appending `{"event": "toggle", "enabled": true}` to `~/.gemini/config/logs/prediction_log.jsonl` (or saying `"включи спарринг"`).
+   - **1-Click Per-Bug & Global Disable in Picker**: Every sparring picker includes 1-click options to skip for the current bug or pause globally during a crunch.
+2. **Branch A1 — Hypothesis Already Named in Prompt**:
+   - If the user's prompt already names a stage (`1..6`), mechanism, or `file:function` (including brief Cyrillic without layout switching or voice input), do **not** show a picker; proceed directly to Phase 3.
+   - Once the Phase 3 `Gate A` test proves the root cause (`file:line`), verify the user's hypothesis via counter-anchoring: if it holds, emit **0 lines of praise**; if refuted, emit a **2–3 line structural delta** showing why the invariant holds at the named node and which `file:line` call-graph edge actually breaks, and append the prediction record to `~/.gemini/config/logs/prediction_log.jsonl`.
+3. **Branch A2 — Ticket ID or Symptom Only**:
+   - **Symptom Delta Before Phase 3 (No Spoilers)**: Present **only** the symptom delta from the issue reproducer or unexposed check (`>= 3` lines: input text/style, expected vs. actual output/geometry, and public entry API/test) before exposing any Phase 3 worktree investigation. Do **not** name internal culprit files/methods, do **not** paste internal code slices, and do **not** mark any option with `(Recommended)` or option trade-offs (`rules/subagent_exploration.md` carve-out).
+   - **Fixed-Taxonomy 1-Click Picker**: Call `ask_question` with the invariant pipeline taxonomy so option wording never leaks the diagnosis:
+     1. `Itemization / Shaping / BiDi segmentation`
+     2. `Cluster & word breaking (TextWrapper)`
+     3. `Line justification / trailing & ghost spaces (TextLine)`
+     4. `Vertical metrics / strut / placeholders / ellipsis`
+     5. `Painting / selection / hit-testing / caret geometry`
+     6. `Cache / state invalidation`
+     7. `Не знаю — покажи root cause и разбор`
+     8. `Пропустить спарринг (только для этого бага) — сразу root cause`
+     9. `Отключить спарринг глобально (на время аврала)`
+   - **Immediate Picker Handling & Post-Gate-A Feedback**:
+     - **Immediate upon picker reply (before Phase 3)**: If option 9 was clicked, immediately append `{"ts": "<ISO8601>", "event": "toggle", "enabled": false}` to `~/.gemini/config/logs/prediction_log.jsonl`. If option 8 or 9 was clicked, immediately proceed to Phase 3 with `skipped: true` and **0 lines of meta-commentary**.
+     - **After Phase 3 `Gate A` proves the root cause**: If the predicted stage (`1..6`) matched `actual` (`1..6`) or `skipped: true`, emit **0 lines of meta-commentary**; if it missed (or option 7 `"unknown"` was clicked), emit **1–3 lines** contrasting the predicted stage with the actual `file:line` and call-graph edge where the invariant breaks.
+     - Append `{"ts": "<ISO8601>", "event": "prediction", "bug": "<ID>", "predicted": <1..6|"unknown"|"skipped">, "actual": <1..6>, "skipped": <bool>, "seconds_to_click": <int from Completed At - Created At>}` to `~/.gemini/config/logs/prediction_log.jsonl`.
+4. **4-Week Self-YAGNI Kill Switch**:
+   - After 4 weeks or 10 Outcome 1–2 bugs, if `skipped > 50%` or the hit rate on non-skipped predictions (`predicted == actual` over `1..6`, baseline `1/6 = 16.7%`) is indistinguishable from random guessing, delete Phase 2.5 in favor of `Status Quo`.
+
+---
+
 ## Phase 3: Worktree & %wip Upload Protocol
 
 When Outcome 1 or 2 applies:
@@ -114,7 +146,7 @@ When Outcome 1 or 2 applies:
 ## Phase 4: Chat Deliverable & Draft Bug Reply
 
 1. **Present Deliverables in Chat**:
-   - Diagnosis and root-cause mechanism.
+   - Diagnosis and root-cause mechanism (if Phase 2.5 ran, include the 1–3 line `Prediction-First` structural delta on a miss/`"unknown"`, emit 0 lines on a match/skip, and append the `"event": "prediction"` record to `~/.gemini/config/logs/prediction_log.jsonl`).
    - Clickable links to issue, WIP CL, and patchsets (`[Gerrit <N> PS1](...)`, `[Gerrit <N> PS2](...)`).
    - Full inline diff (`git diff origin/main..HEAD`).
    - Verification attestation (test results, corpus results).
