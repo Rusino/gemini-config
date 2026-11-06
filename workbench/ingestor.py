@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Mapping
+from datetime import datetime
 import fcntl
 import glob
 import json
@@ -184,6 +185,40 @@ def _is_write_step(step: Mapping[str, Any]) -> bool:
   return False
 
 
+def _parse_iso_ts(iso_str: str) -> float:
+  """Parses an ISO-8601 timestamp string into POSIX epoch seconds."""
+  s = str(iso_str or "").strip()
+  if not s:
+    return 0.0
+  try:
+    return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+  except Exception:
+    return 0.0
+
+
+def _read_first_step_ts(transcript_path: str) -> float:
+  """Extracts the creation timestamp of the earliest step in a transcript file."""
+  if not os.path.isfile(transcript_path):
+    return 0.0
+  try:
+    with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
+      for _ in range(5):
+        line = f.readline()
+        if not line:
+          break
+        line = line.strip()
+        if not line:
+          continue
+        step = json.loads(line)
+        if isinstance(step, Mapping) and step.get("created_at"):
+          ts = _parse_iso_ts(str(step.get("created_at")))
+          if ts > 0:
+            return ts
+  except Exception:
+    pass
+  return 0.0
+
+
 def _clean_user_prompt(raw: str) -> str:
   text = raw
   idx = text.find("<SYSTEM_MESSAGE>")
@@ -206,13 +241,14 @@ def _clean_user_prompt(raw: str) -> str:
         sub = (
             sub.split("\nNext immediate task:")[0]
             .split("\nWhen finishing the task")[0]
+            .split("\nThis prompt is auto-generated")[0]
             .strip()
         )
         if sub:
-          return sub[:140]
+          return work_store.clean_work_title(sub)[:140]
   if text.startswith("Continuing unfinished work from previous conversation"):
     return ""
-  return text.splitlines()[0].strip()[:140] if text else ""
+  return work_store.clean_work_title(text.splitlines()[0].strip())[:140] if text else ""
 
 
 def _extract_step_texts(step: Mapping[str, Any]) -> tuple[list[str], list[str]]:
@@ -225,7 +261,11 @@ def _extract_step_texts(step: Mapping[str, Any]) -> tuple[list[str], list[str]]:
     idx = content.find("<SYSTEM_MESSAGE>")
     if idx != -1:
       content = content[:idx]
-    if content.strip():
+    # Skip auto-generated continuation prompts so old baton text does not anchor unrelated CLs
+    cleaned_c = content.replace("<USER_REQUEST>", "").strip()
+    if cleaned_c and not cleaned_c.startswith(
+        "Continuing unfinished work from previous conversation"
+    ):
       anchor_texts.append(content)
   elif stype == "PLANNER_RESPONSE":
     content = str(step.get("content") or "")
@@ -300,6 +340,7 @@ def ingest_transcript_file(
       anchor_keys.add(akey)
 
   first_user_prompt = ""
+  first_step_ts = 0.0
   detected_root = root_cid or conv_id
   try:
     with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
@@ -313,6 +354,8 @@ def ingest_transcript_file(
           continue
         if not isinstance(step, Mapping):
           continue
+        if first_step_ts <= 0 and step.get("created_at"):
+          first_step_ts = _parse_iso_ts(str(step.get("created_at")))
         if step.get("type") == "USER_INPUT" and not first_user_prompt:
           raw_u = str(step.get("content") or "")
           m_root = RE_ROOT_CONV.search(raw_u) or RE_PREV_CONV.search(raw_u)
@@ -349,9 +392,7 @@ def ingest_transcript_file(
   if dossiers and isinstance(dossiers, Mapping) and not chat_title:
     rd = dossiers.get(detected_root) or dossiers.get(detected_root[:8]) or {}
     if isinstance(rd, Mapping):
-      raw_h = str(rd.get("title") or rd.get("heading") or "")
-      if raw_h.startswith("Chain State:"):
-        raw_h = raw_h[len("Chain State:") :].strip()
+      raw_h = work_store.clean_work_title(str(rd.get("title") or rd.get("heading") or ""))
       if raw_h:
         chat_title = raw_h
         for akey, akind, aurl in extract_artifacts_from_text(chat_title):
@@ -361,6 +402,19 @@ def ingest_transcript_file(
         project_id = str(
             rd.get("project_name") or rd.get("projectId") or rd.get("project_id") or ""
         )
+  else:
+    chat_title = work_store.clean_work_title(chat_title)
+
+  # Attribute continuation pieces to the root conversation's earliest step timestamp
+  chain_origin_ts = first_step_ts
+  if detected_root and detected_root != conv_id:
+    brain_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(transcript_path))))
+    root_tpath = os.path.join(
+        brain_root, detected_root, ".system_generated", "logs", "transcript.jsonl"
+    )
+    rts = _read_first_step_ts(root_tpath)
+    if rts > 0 and (chain_origin_ts <= 0 or rts < chain_origin_ts):
+      chain_origin_ts = rts
 
   chain_key = f"chat_chain:{detected_root}"
   if not has_write:
@@ -384,10 +438,20 @@ def ingest_transcript_file(
       for akey, akind, aurl in extracted.values()
       if akind in ("gerrit", "github_pr", "piper", "buganizer", "github_issue", "gdoc")
   ]
+  # Check stored artifact metadata so companion and hub CLs are excluded from primary anchors
+  def _is_stored_hub(akey: str) -> bool:
+    row = store.get_artifact(akey) or {}
+    raw_st = row.get("state_json")
+    try:
+      st = json.loads(raw_st) if isinstance(raw_st, str) and raw_st else {}
+    except Exception:
+      st = {}
+    return work_store.is_hub_artifact(akey, st)
+
   non_hub_primaries = [
       (akey, akind, aurl)
       for akey, akind, aurl in all_primaries
-      if not work_store.is_hub_artifact(akey)
+      if not _is_stored_hub(akey)
   ]
   title_primaries: list[tuple[str, str, str]] = []
   if chat_title:
@@ -402,7 +466,8 @@ def ingest_transcript_file(
   if chat_title:
     if title_primaries:
       primaries = title_primaries[:3]
-    elif len(anchored_primaries) == 1:
+    # Avoid promoting a single mention when a coordinator chat spans >3 distinct bugs/CLs
+    elif len(anchored_primaries) == 1 and len(non_hub_primaries) <= 3:
       primaries = anchored_primaries
     else:
       primaries = []
@@ -436,7 +501,7 @@ def ingest_transcript_file(
     if primaries:
       existing_art = store.get_artifact(primaries[0][0])
       primary_title = str((existing_art or {}).get("title") or primaries[0][0])
-    default_title = (
+    default_title = work_store.clean_work_title(
         chat_title
         or primary_title
         or first_user_prompt
@@ -445,7 +510,7 @@ def ingest_transcript_file(
     work_id = store.create_work(default_title, project_id=project_id, now=cur_now)
 
   existing_chain = store.get_artifact(chain_key) or {}
-  prev_chain_title = str(existing_chain.get("title") or "")
+  prev_chain_title = work_store.clean_work_title(str(existing_chain.get("title") or ""))
   if prev_chain_title.startswith("Chat ") or prev_chain_title.startswith("Continuing unfinished"):
     prev_chain_title = ""
   resolved_chain_title = (
@@ -454,12 +519,15 @@ def ingest_transcript_file(
       or first_user_prompt[:60]
       or f"Chat {detected_root[:8]}"
   )
+  chain_state: dict[str, Any] = {"cascade_id": conv_id, "root_cid": detected_root}
+  if chain_origin_ts > 0:
+    chain_state["origin_ts"] = chain_origin_ts
   store.upsert_artifact(
       chain_key,
       kind="chat_chain",
       title=resolved_chain_title,
       url=f"/c/{conv_id}",
-      state={"cascade_id": conv_id, "root_cid": detected_root},
+      state=chain_state,
       now=cur_now,
   )
   store.link_artifact(work_id, chain_key, role="channel", source="auto", now=cur_now)
@@ -549,8 +617,6 @@ def ingest_cl_watcher_state(
   for raw_key, item in items.items():
     if not isinstance(item, Mapping):
       continue
-    if item.get("companion_to") or item.get("is_companion") or item.get("is_cherry_pick"):
-      continue
     kind = str(item.get("kind") or "gerrit")
     tid = str(item.get("target_id") or raw_key)
     host = str(item.get("host") or "")
@@ -560,14 +626,20 @@ def ingest_cl_watcher_state(
     bug_ids = [str(b) for b in (item.get("bug_ids") or []) if b]
     cids = [str(c) for c in (item.get("conversations") or []) if c]
 
+    item_state = dict(item)
+    created_ts = float(item.get("created_ts") or 0.0)
+    if created_ts > 0:
+      item_state["origin_ts"] = created_ts
     store.upsert_artifact(
         ckey,
         kind=work_store.artifact_kind_from_key(ckey),
         title=f"{tid}: {subj}",
         url=url,
-        state=dict(item),
+        state=item_state,
         now=cur_now,
     )
+    if item.get("companion_to") or item.get("is_companion") or item.get("is_cherry_pick"):
+      continue
 
     # Check if this CL is a hub ([SkoreText] or >3 bugs); hubs never auto-merge works
     if work_store.is_hub_artifact(ckey, item, linked_bug_count=len(bug_ids)):
@@ -621,6 +693,114 @@ def ingest_cl_watcher_state(
       store.link_artifact(wid, ch_key, role="channel", source="auto", now=cur_now)
 
 
+def _clean_display_name(raw_addr: str) -> str:
+  part = str(raw_addr or "").split(",")[0].strip()
+  name = part.split("<")[0].strip().strip('"').strip("'")
+  if name:
+    return name
+  return part.strip("<> ")
+
+
+def _extract_msg_headers(msg: Mapping[str, Any]) -> dict[str, str]:
+  payload = msg.get("payload") if isinstance(msg.get("payload"), Mapping) else {}
+  headers = payload.get("headers") if isinstance(payload, Mapping) else []
+  hdrs = {
+      str(h.get("name") or "").lower(): str(h.get("value") or "")
+      for h in (headers or [])
+      if isinstance(h, Mapping) and h.get("name")
+  }
+  for k in ("from", "to", "cc", "subject"):
+    if k not in hdrs and msg.get(k):
+      hdrs[k] = str(msg.get(k) or "")
+  return hdrs
+
+
+def _fetch_gmail_thread_provenance(
+    thread_id: str,
+    thread_cache: dict[str, Any],
+    now: float,
+) -> dict[str, Any]:
+  """Fetches first-message date, sender/recipient, and reply provenance for a Gmail thread."""
+  tid = str(thread_id or "").strip()
+  if not tid:
+    return {}
+  cached = thread_cache.get(tid)
+  if isinstance(cached, Mapping) and (now - float(cached.get("fetched_at") or 0.0) < 600):
+    return dict(cached)
+  try:
+    res = subprocess.run(
+        [GMAIL_BIN, "readonly", "get-thread", tid, "--json"],
+        capture_output=True,
+        text=True,
+        timeout=6,
+        check=False,
+    )
+    if res.returncode != 0 or not res.stdout.strip():
+      return dict(cached) if isinstance(cached, Mapping) else {"thread_id": tid}
+    td = json.loads(res.stdout)
+    msgs = (
+        td.get("messages")
+        if isinstance(td, Mapping)
+        else (td if isinstance(td, list) else [])
+    ) or []
+    if not msgs or not isinstance(msgs[0], Mapping):
+      return {"thread_id": tid}
+
+    m0 = msgs[0]
+    h0 = _extract_msg_headers(m0)
+    origin_ts = float(int(m0.get("internalDate") or 0)) / 1000.0 if m0.get("internalDate") else 0.0
+    raw_subj = h0.get("subject") or ""
+    root_subj = re.sub(r"^(?:re|fwd|fw)\s*:\s*", "", raw_subj, flags=re.IGNORECASE).strip()
+    from0 = h0.get("from") or ""
+    started_by_me = "jlavrova" in from0.lower() or "julia lavrova" in from0.lower()
+    origin_from = _clean_display_name(from0)
+
+    counterparty = ""
+    counterparty_reply_ts = 0.0
+    snippets: list[str] = [root_subj] if root_subj else []
+    for m in msgs:
+      if not isinstance(m, Mapping):
+        continue
+      hm = _extract_msg_headers(m)
+      snip = str(m.get("snippet") or "")
+      if snip:
+        snippets.append(snip)
+      f_hdr = hm.get("from") or ""
+      t_hdr = hm.get("to") or ""
+      is_me = "jlavrova" in f_hdr.lower() or "julia lavrova" in f_hdr.lower()
+      if not is_me and f_hdr:
+        cand = _clean_display_name(f_hdr)
+        if cand and not counterparty:
+          counterparty = cand
+        mts = float(int(m.get("internalDate") or 0)) / 1000.0 if m.get("internalDate") else 0.0
+        if mts > counterparty_reply_ts:
+          counterparty_reply_ts = mts
+      elif is_me and t_hdr and not counterparty:
+        for addr in t_hdr.split(","):
+          if "jlavrova" not in addr.lower() and "julia lavrova" not in addr.lower():
+            cand = _clean_display_name(addr)
+            if cand:
+              counterparty = cand
+              break
+
+    prov = {
+        "thread_id": tid,
+        "origin_ts": origin_ts,
+        "root_subject": root_subj,
+        "origin_from": origin_from,
+        "started_by_me": started_by_me,
+        "counterparty": counterparty,
+        "counterparty_reply_ts": counterparty_reply_ts,
+        "message_count": len(msgs),
+        "thread_text": "\n".join(snippets),
+        "fetched_at": now,
+    }
+    thread_cache[tid] = prov
+    return dict(prov)
+  except Exception:
+    return dict(cached) if isinstance(cached, Mapping) else {"thread_id": tid}
+
+
 def ingest_gmail_drafts_and_threads(
     store: work_store.WorkStore,
     watcher_state: dict[str, Any],
@@ -631,6 +811,8 @@ def ingest_gmail_drafts_and_threads(
   unanswered: list[dict[str, Any]] = []
   if not os.path.isfile(GMAIL_BIN):
     return unanswered
+
+  thread_cache = watcher_state.setdefault("gmail_threads", {})
 
   # 1. Inspect current drafts via gmail readonly drafts --json
   active_draft_ids: set[str] = set()
@@ -664,15 +846,14 @@ def ingest_gmail_drafts_and_threads(
           d_full = json.loads(d_res.stdout)
           msg = d_full.get("message") if isinstance(d_full, Mapping) else {}
           payload = (msg or {}).get("payload") if isinstance(msg, Mapping) else {}
-          headers = (payload or {}).get("headers") if isinstance(payload, Mapping) else []
-          hdr_map = {
-              str(h.get("name") or "").lower(): str(h.get("value") or "")
-              for h in (headers or [])
-              if isinstance(h, Mapping)
-          }
+          hdr_map = _extract_msg_headers(msg if isinstance(msg, Mapping) else {})
           thread_id = str(
               (msg or {}).get("threadId")
-              or ((d_stub.get("message") or {}).get("threadId") if isinstance(d_stub.get("message"), Mapping) else "")
+              or (
+                  (d_stub.get("message") or {}).get("threadId")
+                  if isinstance(d_stub.get("message"), Mapping)
+                  else ""
+              )
               or d_stub.get("threadId")
               or ""
           ).strip()
@@ -696,10 +877,11 @@ def ingest_gmail_drafts_and_threads(
           unquoted_body = decoded_body.split("<blockquote")[0] if decoded_body else ""
           extracted = extract_artifacts_from_text(f"{subj}\n{unquoted_body}")
           d_key = f"gmail_draft:{did}"
+          to_name = _clean_display_name(to_hdr) if to_hdr else ""
           store.upsert_artifact(
               d_key,
               kind="gmail_draft",
-              title=f"Draft: {subj}" + (f" ({to_hdr.split('<')[0].strip()})" if to_hdr else ""),
+              title=f"Draft: {subj}" + (f" ({to_name})" if to_name else ""),
               url=f"https://mail.google.com/mail/u/0/#drafts/{did}",
               state={"status": "DRAFT", "thread_id": thread_id, "to": to_hdr},
               now=cur_now,
@@ -713,7 +895,9 @@ def ingest_gmail_drafts_and_threads(
             continue
           wid = store.find_work_by_artifact(d_key, roles=("primary", "channel"))
           if not wid and thread_id:
-            wid = store.find_work_by_artifact(f"gmail_thread:{thread_id}", roles=("primary", "channel"))
+            wid = store.find_work_by_artifact(
+                f"gmail_thread:{thread_id}", roles=("primary", "channel")
+            )
           if not wid:
             for akey, _, _ in primaries:
               wid = store.find_work_by_artifact(akey, roles=("primary",))
@@ -724,12 +908,23 @@ def ingest_gmail_drafts_and_threads(
           store.link_artifact(wid, d_key, role="channel", source="auto", now=cur_now)
           if thread_id:
             t_key = f"gmail_thread:{thread_id}"
+            t_prov = _fetch_gmail_thread_provenance(thread_id, thread_cache, cur_now)
+            if not t_prov.get("counterparty") and to_name:
+              t_prov["counterparty"] = to_name
+            if not t_prov.get("root_subject"):
+              t_prov["root_subject"] = re.sub(
+                  r"^(?:re|fwd|fw)\s*:\s*", "", subj, flags=re.IGNORECASE
+              ).strip()
+            t_title = str(t_prov.get("root_subject") or subj)
+            cp = str(t_prov.get("counterparty") or "")
+            if cp and cp.lower() not in t_title.lower():
+              t_title = f"{t_title} ({cp})"
             store.upsert_artifact(
                 t_key,
                 kind="gmail_thread",
-                title=subj,
+                title=t_title,
                 url=f"https://mail.google.com/mail/u/0/#inbox/{thread_id}",
-                state={"thread_id": thread_id},
+                state=t_prov,
                 now=cur_now,
             )
             store.link_artifact(wid, t_key, role="channel", source="auto", now=cur_now)
@@ -741,7 +936,9 @@ def ingest_gmail_drafts_and_threads(
             if akind == "gerrit" and "flutter" in subj.lower():
               store.add_obligation(
                   wid,
-                  description=f"Send reply in '{subj}' once {akey.split(':')[-1]} rolls into Flutter",
+                  description=(
+                      f"Send reply in '{subj}' once {akey.split(':')[-1]} rolls into Flutter"
+                  ),
                   trigger_expr=f"cl_merged({akey}) AND rolled_into(Flutter, {akey})",
                   target_artifact_key=d_key,
                   done_matcher=f"reply_sent({d_key})",
@@ -758,15 +955,18 @@ def ingest_gmail_drafts_and_threads(
       store.upsert_artifact(d_key, kind="gmail_draft", state={"status": "SENT"}, now=cur_now)
     watcher_state["active_draft_ids"] = sorted(active_draft_ids)
 
-  # 2. Check recent inbox messages for unanswered human threads
+  # 2. Link recent human correspondence threads to matching Works and collect unanswered tray
   try:
     res = subprocess.run(
         [
             GMAIL_BIN,
             "readonly",
             "search",
-            "label:INBOX newer_than:14d -from:me -from:noreply -from:gerrit -from:github.com -from:buganizer",
-            "--max-results=12",
+            (
+                "newer_than:21d -from:noreply -from:gerrit -from:github.com"
+                " -from:buganizer -from:autoroll -from:luci"
+            ),
+            "--max-results=18",
             "--json",
         ],
         capture_output=True,
@@ -780,28 +980,52 @@ def ingest_gmail_drafts_and_threads(
         msgs = msgs.get("messages") or msgs.get("threads") or []
       if isinstance(msgs, list):
         seen_tids: set[str] = set()
-        for m in msgs[:10]:
+        for m in msgs[:15]:
           if not isinstance(m, Mapping):
             continue
           tid = str(m.get("threadId") or m.get("id") or "").strip()
           if not tid or tid in seen_tids:
             continue
           seen_tids.add(tid)
-          sender = str(m.get("from") or m.get("sender") or "")
-          if any(bot in sender.lower() for bot in ("bot", "gerrit", "luci", "autoroll", "noreply")):
+          t_prov = _fetch_gmail_thread_provenance(tid, thread_cache, cur_now)
+          cp = str(t_prov.get("counterparty") or "").strip()
+          root_subj = str(t_prov.get("root_subject") or m.get("subject") or "").strip()
+          if not cp or "unsubscribe" in cp.lower() or "noreply" in cp.lower():
             continue
-          subj = str(m.get("subject") or m.get("snippet") or f"Thread {tid[:8]}")
           t_key = f"gmail_thread:{tid}"
+          t_arts = extract_artifacts_from_text(str(t_prov.get("thread_text") or root_subj))
+          t_primaries = [
+              (akey, akind, aurl)
+              for akey, akind, aurl in t_arts
+              if akind in ("gerrit", "github_pr", "buganizer", "github_issue", "gdoc")
+          ]
           bound_wid = store.find_work_by_artifact(t_key, roles=("primary", "channel"))
-          unanswered.append({
-              "artifact_key": t_key,
-              "thread_id": tid,
-              "sender": sender.split("<")[0].strip().strip('"') or sender,
-              "subject": subj,
-              "snippet": str(m.get("snippet") or "")[:140],
-              "url": f"https://mail.google.com/mail/u/0/#inbox/{tid}",
-              "bound_work_id": bound_wid or "",
-          })
+          if not bound_wid:
+            for akey, _, _ in t_primaries:
+              bound_wid = store.find_work_by_artifact(akey, roles=("primary",))
+              if bound_wid:
+                break
+          if bound_wid:
+            t_title = f"{root_subj} ({cp})" if cp.lower() not in root_subj.lower() else root_subj
+            store.upsert_artifact(
+                t_key,
+                kind="gmail_thread",
+                title=t_title or f"Thread {tid[:8]}",
+                url=f"https://mail.google.com/mail/u/0/#inbox/{tid}",
+                state=t_prov,
+                now=cur_now,
+            )
+            store.link_artifact(bound_wid, t_key, role="channel", source="auto", now=cur_now)
+          elif m.get("from") and "jlavrova" not in str(m.get("from")).lower():
+            unanswered.append({
+                "artifact_key": t_key,
+                "thread_id": tid,
+                "sender": cp,
+                "subject": root_subj or f"Thread {tid[:8]}",
+                "snippet": str(m.get("snippet") or "")[:140],
+                "url": f"https://mail.google.com/mail/u/0/#inbox/{tid}",
+                "bound_work_id": "",
+            })
   except Exception:
     pass
 

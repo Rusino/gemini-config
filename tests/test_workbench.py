@@ -455,6 +455,87 @@ class TestWorkbenchContracts(unittest.TestCase):
       srv.shutdown()
       srv.server_close()
 
+  def test_chronological_origin_resolution_and_light_theme(self) -> None:
+    import work_store
+    import workbench_server
+
+    oct_15_ts = 1760538903.0  # 2026-10-15 10:35 ET (Julia -> Renzo)
+    oct_23_reply_ts = 1761243038.0  # 2026-10-23 14:10 ET (Renzo -> Julia)
+    oct_23_chat_ts = 1761247654.0  # 2026-10-23 15:27 ET (Chat R32 started)
+    now = 1762450000.0
+
+    store = work_store.WorkStore(self.db_path)
+    # Work initially minted by downstream chat R32 before email thread is ingested
+    wid = store.create_work(
+        "Handoff State: R32 (`flutter#160251` — `letterSpacing` on zero-width clusters)",
+        project_id="flutter",
+        now=oct_23_chat_ts,
+    )
+    store.upsert_artifact(
+        "chat_chain:a98931ef",
+        kind="chat_chain",
+        title="Handoff State: R32 (`flutter#160251` — `letterSpacing` on zero-width clusters)",
+        url="/c/a98931ef",
+        state={"cascade_id": "a98931ef", "origin_ts": oct_23_chat_ts},
+        now=now,
+    )
+    store.link_artifact(wid, "chat_chain:a98931ef", role="channel", source="auto", now=now)
+    store.upsert_artifact(
+        "gerrit:skia:1404137",
+        kind="gerrit",
+        title="1404137: Do not apply letterSpacing to zero-width clusters",
+        url="https://skia-review.googlesource.com/c/skia/+/1404137",
+        state={"status": "MERGED", "origin_ts": oct_23_chat_ts + 5500},
+        now=now,
+    )
+    store.link_artifact(wid, "gerrit:skia:1404137", role="primary", source="auto", now=now)
+
+    # Later, Gmail ingestor attaches the Oct 15 correspondence thread + draft
+    store.upsert_artifact(
+        "gmail_thread:1a13c69d14fe1c3d",
+        kind="gmail_thread",
+        title="Fixed bugs in Flutter (Renzo Olivares)",
+        url="https://mail.google.com/mail/u/0/#inbox/1a13c69d14fe1c3d",
+        state={
+            "thread_id": "1a13c69d14fe1c3d",
+            "origin_ts": oct_15_ts,
+            "root_subject": "Fixed bugs in Flutter",
+            "started_by_me": True,
+            "counterparty": "Renzo Olivares",
+            "counterparty_reply_ts": oct_23_reply_ts,
+            "message_count": 6,
+        },
+        now=now,
+    )
+    store.link_artifact(wid, "gmail_thread:1a13c69d14fe1c3d", role="channel", source="auto", now=now)
+    store.upsert_artifact(
+        "gmail_draft:r2068112471352956917",
+        kind="gmail_draft",
+        title="Draft: Re: Fixed bugs in Flutter (Renzo Olivares)",
+        url="https://mail.google.com/mail/u/0/#drafts/r2068112471352956917",
+        state={"status": "DRAFT", "thread_id": "1a13c69d14fe1c3d"},
+        now=now,
+    )
+    store.link_artifact(
+        wid, "gmail_draft:r2068112471352956917", role="channel", source="auto", now=now
+    )
+
+    proj = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now)
+    card = [w for w in proj["works"] if w["work_id"] == wid][0]
+    self.assertEqual(card["title"], "Fixed bugs in Flutter — Renzo Olivares")
+    self.assertIsNotNone(card["origin"])
+    self.assertEqual(card["origin"]["artifact_key"], "gmail_thread:1a13c69d14fe1c3d")
+    self.assertIn(
+        "🌱 Origin: ✉ Fixed bugs in Flutter (Oct 15 · Julia → Renzo Olivares · reply Oct 23 · 6 msgs)",
+        card["origin"]["label"],
+    )
+
+    html = workbench_server.render_workbench_html(proj, 1)
+    self.assertIn("--bg: #fbfbfd;", html)
+    self.assertIn("--surface: #ffffff;", html)
+    self.assertIn("wb-origin", html)
+    self.assertIn("Fixed bugs in Flutter — Renzo Olivares", html)
+
 
 if __name__ == "__main__":
   unittest.main()

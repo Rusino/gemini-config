@@ -117,7 +117,10 @@ def main(argv: list[str] | None = None) -> int:
 
   if args.cmd == "new":
     wid = store.create_work(
-        args.title, project_id=args.project, roadmap_item_key=args.roadmap
+        args.title,
+        project_id=args.project,
+        roadmap_item_key=args.roadmap,
+        meta={"title_manual": True},
     )
     for pkey in args.primary:
       ck = work_store.canonicalize_artifact_key(pkey)

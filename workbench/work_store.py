@@ -68,6 +68,204 @@ def format_et_timestamp(ts: float) -> str:
   return f"{dt.strftime('%b %-d at %H:%M')} ET ({rel})"
 
 
+def format_short_et_date(ts: float) -> str:
+  if not ts or ts <= 0:
+    return ""
+  dt = datetime.fromtimestamp(ts, tz=ET_ZONE)
+  return dt.strftime("%b %-d")
+
+
+_STATE_TITLE_PREFIXES = (
+    "handoff state:",
+    "handoff summary:",
+    "chain state —",
+    "chain state -",
+    "chain state:",
+    "state:",
+)
+
+_PLACEHOLDER_KEY_PREFIXES = (
+    "gerrit:",
+    "github_pr:",
+    "github_issue:",
+    "buganizer:",
+    "piper:",
+    "gmail_thread:",
+    "gmail_draft:",
+    "gchat_thread:",
+    "chat_chain:",
+)
+
+
+def clean_work_title(raw_title: str) -> str:
+  """Strips internal baton prefixes and auto-generated continuation footers from titles."""
+  text = str(raw_title or "").strip()
+  if not text:
+    return ""
+  for marker in (
+      "\n\nThis prompt is auto-generated",
+      "\nThis prompt is auto-generated",
+      "\nNext immediate task:",
+      "\nWhen finishing the task",
+  ):
+    pos = text.find(marker)
+    if pos != -1:
+      text = text[:pos].strip()
+  text = " ".join(text.splitlines()).strip()
+  lower = text.lower()
+  for pref in _STATE_TITLE_PREFIXES:
+    if lower.startswith(pref):
+      text = text[len(pref) :].lstrip(" —-:").strip()
+      break
+  return text
+
+
+def is_placeholder_title(title: str, artifact_key: str = "") -> bool:
+  """Returns True when a title is an unexpanded artifact key or generic placeholder."""
+  t = clean_work_title(title)
+  if not t:
+    return True
+  if artifact_key and t == artifact_key:
+    return True
+  tl = t.lower()
+  if any(tl.startswith(p) for p in _PLACEHOLDER_KEY_PREFIXES):
+    return True
+  if tl in ("goal", "untitled", "work"):
+    return True
+  if re.match(r"^(?:work|chat|draft|thread)\s+[0-9a-f]{6,}$", tl):
+    return True
+  return False
+
+
+def resolve_work_origin_and_title(
+    work_row: Mapping[str, Any],
+    w_arts: list[dict[str, Any]],
+) -> tuple[str, dict[str, Any] | None]:
+  """Determines the chronological/causal origin artifact and best human title for a Work."""
+  raw_title = str(work_row.get("title") or "")
+  cleaned = clean_work_title(raw_title)
+  meta: dict[str, Any] = {}
+  raw_meta = work_row.get("meta_json")
+  if isinstance(raw_meta, str) and raw_meta:
+    try:
+      meta = json.loads(raw_meta)
+    except Exception:
+      meta = {}
+
+  # Partition linked artifacts into human correspondence vs technical entities with creation timestamps
+  correspondence_arts: list[tuple[float, dict[str, Any]]] = []
+  other_arts: list[tuple[float, dict[str, Any]]] = []
+  for a in w_arts:
+    st = a.get("state") or {}
+    ots = float(st.get("origin_ts") or st.get("created_ts") or 0.0)
+    kind = str(a.get("kind") or "")
+    # Group email and chat threads separately so correspondence can be tested as causal root
+    if kind in ("gmail_thread", "gchat_thread"):
+      correspondence_arts.append((ots, a))
+    elif ots > 0 and a.get("role") != "context_only":
+      other_arts.append((ots, a))
+
+  correspondence_arts.sort(key=lambda x: (x[0] if x[0] > 0 else float("inf")))
+  other_arts.sort(key=lambda x: x[0])
+
+  origin_art: dict[str, Any] | None = None
+  origin_ts = 0.0
+  earliest_other_ts = other_arts[0][0] if other_arts else 0.0
+  code_or_bug_count = sum(
+      1
+      for a in w_arts
+      if a.get("kind") in ("gerrit", "github_pr", "piper", "buganizer", "github_issue")
+  )
+
+  # Human correspondence predating implementation (or coordinating >=2 items) is the root cause
+  if correspondence_arts:
+    c_ts, c_art = correspondence_arts[0]
+    if (
+        (c_ts > 0 and (earliest_other_ts <= 0 or c_ts <= earliest_other_ts + 86400))
+        or code_or_bug_count >= 2
+    ):
+      origin_art = c_art
+      origin_ts = c_ts
+  # Fall back to the earliest technical or chat artifact when no correspondence predates the work
+  if origin_art is None and other_arts:
+    origin_ts, origin_art = other_arts[0]
+
+  origin_info: dict[str, Any] | None = None
+  if origin_art is not None:
+    st = origin_art.get("state") or {}
+    kind = str(origin_art.get("kind") or "")
+    dt_str = format_short_et_date(origin_ts) if origin_ts > 0 else ""
+    # Format Gmail provenance with direction (Julia <-> counterparty), latest reply date, and count
+    if kind == "gmail_thread":
+      cp = str(st.get("counterparty") or "").strip()
+      started_by_me = bool(st.get("started_by_me", True))
+      who = (
+          f"Julia → {cp}"
+          if (started_by_me and cp)
+          else (f"{cp} → Julia" if cp else str(st.get("origin_from") or ""))
+      )
+      reply_ts = float(st.get("counterparty_reply_ts") or 0.0)
+      reply_part = (
+          f" · reply {format_short_et_date(reply_ts)}"
+          if reply_ts > origin_ts + 60
+          else ""
+      )
+      msg_cnt = int(st.get("message_count") or 0)
+      cnt_part = f" · {msg_cnt} msgs" if msg_cnt > 1 else ""
+      parts = [p for p in (dt_str, who) if p]
+      detail = f" ({' · '.join(parts)}{reply_part}{cnt_part})" if parts else ""
+      label = f"🌱 Origin: ✉ {st.get('root_subject') or origin_art.get('title')}{detail}"
+    else:
+      short_id = str(origin_art.get("artifact_key") or "").split(":")[-1][:12]
+      dt_part = f" {dt_str}" if dt_str else ""
+      label = f"🌱 Origin: {origin_art.get('icon', '🔗')}{dt_part} ({short_id})"
+    origin_info = {
+        "artifact_key": origin_art.get("artifact_key", ""),
+        "kind": kind,
+        "icon": origin_art.get("icon", "🔗"),
+        "url": origin_art.get("url", ""),
+        "origin_ts": origin_ts,
+        "label": label,
+    }
+
+  # Preserve user-specified titles while still attaching computed origin provenance
+  if meta.get("title_manual"):
+    return raw_title, origin_info
+
+  # When the root cause is a correspondence thread, promote its subject + counterparty as title
+  if origin_art is not None and origin_art.get("kind") in ("gmail_thread", "gchat_thread"):
+    st = origin_art.get("state") or {}
+    root_subj = str(st.get("root_subject") or "").strip()
+    # Strip reply/forward prefixes when falling back to the raw artifact title
+    if not root_subj:
+      root_subj = re.sub(
+          r"^(?:re|fwd|fw)\s*:\s*",
+          "",
+          str(origin_art.get("title") or ""),
+          flags=re.IGNORECASE,
+      ).strip()
+    cp = str(st.get("counterparty") or "").strip()
+    # Append the counterparty name when not already present in the thread subject
+    if root_subj:
+      if cp and cp.lower() not in root_subj.lower():
+        return f"{root_subj} — {cp}", origin_info
+      return root_subj, origin_info
+
+  if not is_placeholder_title(cleaned):
+    return cleaned, origin_info
+
+  # Upgrade placeholder/raw-key work titles from rich primary, channel, or context artifacts
+  for role_filter in (("primary",), ("channel",), ("context_only",)):
+    for a in w_arts:
+      if a.get("role") not in role_filter:
+        continue
+      cand = clean_work_title(str(a.get("title") or ""))
+      if not is_placeholder_title(cand, str(a.get("artifact_key") or "")):
+        return cand, origin_info
+
+  return (cleaned or raw_title), origin_info
+
+
 def canonicalize_artifact_key(
     kind_or_key: str, target_id: str = "", host: str = ""
 ) -> str:
@@ -152,7 +350,11 @@ def is_hub_artifact(
   """Detects umbrella CLs/epics (e.g. [SkoreText] or >3 bugs) to prevent false merges."""
   st = state or {}
   subj = str(st.get("subject") or st.get("title") or "")
-  if "[SkoreText]" in subj or "SkoreText" in subj:
+  # Force umbrella [SkoreText] CLs and DO NOT SUBMIT companion probes to context_only
+  if "[SkoreText]" in subj or "SkoreText" in subj or "DO NOT SUBMIT" in subj:
+    return True
+  # Companion and cherry-pick CLs are review attributes and must not merge distinct works
+  if st.get("companion_to") or st.get("is_companion") or st.get("is_cherry_pick"):
     return True
   bug_ids = st.get("bug_ids")
   count = max(
@@ -491,8 +693,24 @@ class WorkStore:
         except Exception:
           merged_state = {}
       if state:
+        # Preserve the earliest known creation timestamp across incremental sync passes
+        prev_ots = float(merged_state.get("origin_ts") or 0.0)
+        new_ots = float(state.get("origin_ts") or 0.0)
         merged_state.update(dict(state))
-      final_title = title or (existing["title"] if existing else "") or akey
+        if prev_ots > 0 and new_ots > 0:
+          merged_state["origin_ts"] = min(prev_ots, new_ots)
+        elif prev_ots > 0:
+          merged_state["origin_ts"] = prev_ots
+      # Never overwrite a descriptive stored title with a raw artifact_key placeholder
+      existing_title = str(existing["title"] or "") if existing else ""
+      if (
+          existing_title
+          and not is_placeholder_title(existing_title, akey)
+          and is_placeholder_title(title, akey)
+      ):
+        final_title = existing_title
+      else:
+        final_title = title or existing_title or akey
       final_url = url or (existing["url"] if existing else "")
       conn.execute(
           "INSERT OR REPLACE INTO artifacts "
@@ -1085,6 +1303,7 @@ class WorkStore:
       obs_by_work.setdefault(wid, []).append(obr)
 
     cards: list[dict[str, Any]] = []
+    title_updates: list[tuple[str, str]] = []
     for w in work_rows:
       wid = str(w["work_id"])
       w_links = links_by_work.get(wid, [])
@@ -1105,17 +1324,22 @@ class WorkStore:
             "artifact_key": akey,
             "kind": kind,
             "icon": PILL_ICONS.get(kind, "🔗"),
-            "title": str(ar.get("title") or akey),
+            "title": clean_work_title(str(ar.get("title") or akey)) or akey,
             "url": str(ar.get("url") or ""),
             "role": str(wl.get("role") or "primary"),
             "source": str(wl.get("source") or "auto"),
             "state": ar.get("state") or {},
         })
       w_obs = obs_by_work.get(wid, [])
+      # Resolve causal origin and upgrade downstream/placeholder work titles
+      resolved_title, origin_info = resolve_work_origin_and_title(w, w_arts)
+      if resolved_title and resolved_title != str(w["title"]):
+        title_updates.append((resolved_title, wid))
       lane, reasons = self.compute_work_lane(w, w_arts, w_obs)
       cards.append({
           "work_id": wid,
-          "title": str(w["title"]),
+          "title": resolved_title or str(w["title"]),
+          "origin": origin_info,
           "status": str(w["status"]),
           "lane": lane,
           "reasons": reasons,
@@ -1128,6 +1352,14 @@ class WorkStore:
           "artifacts": w_arts,
           "obligations": w_obs,
       })
+
+    # Persist upgraded titles back to SQLite so CLI and subsequent reads stay consistent
+    if title_updates:
+      with self._lock, self._connect() as conn:
+        conn.executemany(
+            "UPDATE works SET title = ? WHERE work_id = ?",
+            title_updates,
+        )
 
     # Project standalone unbound CLs and bugs from cl_watcher_state in-memory (0 SQLite writes)
     cl_items = (cl_watcher_state or {}).get("items") or {}

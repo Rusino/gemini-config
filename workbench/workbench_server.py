@@ -104,6 +104,12 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     wid = _esc(w.get("work_id"))
     title = _esc(w.get("title"))
     lane = _esc(w.get("lane"))
+    origin = w.get("origin") or {}
+    origin_ssr = (
+        f'<span class="wb-origin">{_esc(origin.get("label"))}</span>'
+        if origin.get("label")
+        else ""
+    )
     obs_html = "".join(
         f'<div class="wb-ob" data-eval="{_esc(ob.get("last_eval"))}">'
         f'<span>🔔 {_esc(ob.get("description"))}</span>'
@@ -120,7 +126,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     cards_ssr.append(
         f'<article class="wb-card" data-work-id="{wid}" data-lane="{lane}">'
         f'<div class="wb-card-hdr"><span class="wb-lane-tag">{lane}</span>'
-        f'<strong class="wb-card-title">{title}</strong></div>'
+        f'<strong class="wb-card-title">{title}</strong>{origin_ssr}</div>'
         f"{obs_html}<div class='wb-pills'>{pills_html}</div></article>"
     )
   ssr_body = "\n".join(cards_ssr)
@@ -134,16 +140,17 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
 <title>Workbench</title>
 <style>
   :root {{
-    --bg: #111318;
-    --surface: #181b22;
-    --surface-hover: #1f242d;
-    --border: rgba(255, 255, 255, 0.09);
-    --text: #e8eaed;
-    --muted: #9aa0a6;
-    --accent: #8ab4f8;
-    --urgent: #f87171;
-    --ready: #34d399;
-    --warn: #fbbf24;
+    --bg: #fbfbfd;
+    --surface: #ffffff;
+    --surface-hover: #f5f5f7;
+    --border: #e5e5ea;
+    --text: #1d1d1f;
+    --muted: #86868b;
+    --accent: #0071e3;
+    --urgent: #ff3b30;
+    --ready: #15803d;
+    --warn: #b45309;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 8px 28px rgba(0, 0, 0, 0.06);
   }}
   * {{ box-sizing: border-box; }}
   body {{
@@ -154,13 +161,14 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     font-size: 12.5px;
     line-height: 1.4;
+    -webkit-font-smoothing: antialiased;
   }}
   .wb-top {{
     position: sticky;
     top: 0;
     z-index: 20;
-    background: rgba(17, 19, 24, 0.96);
-    backdrop-filter: blur(8px);
+    background: rgba(251, 251, 253, 0.92);
+    backdrop-filter: blur(10px);
     border-bottom: 1px solid var(--border);
     padding: 8px 12px;
   }}
@@ -177,6 +185,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     font-weight: 700;
     font-size: 13.5px;
     letter-spacing: -0.01em;
+    color: var(--text);
   }}
   .wb-sub {{
     color: var(--muted);
@@ -197,15 +206,17 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     padding: 3px 8px;
     font-size: 11.5px;
     font-weight: 500;
+    box-shadow: 0 1px 1px rgba(0, 0, 0, 0.02);
   }}
   .wb-btn:hover {{
     background: var(--surface-hover);
-    border-color: rgba(138, 180, 248, 0.45);
+    border-color: rgba(0, 113, 227, 0.45);
   }}
   .wb-btn-primary {{
-    background: rgba(138, 180, 248, 0.16);
-    border-color: rgba(138, 180, 248, 0.45);
+    background: rgba(0, 113, 227, 0.09);
+    border-color: rgba(0, 113, 227, 0.35);
     color: var(--accent);
+    font-weight: 600;
   }}
   .wb-kpis {{
     display: grid;
@@ -218,6 +229,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     border: 1px solid var(--border);
     border-radius: 6px;
     padding: 4px 7px;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
   }}
   .wb-kpi-val {{
     font-size: 14px;
@@ -240,16 +252,16 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   .wb-chip {{
     cursor: pointer;
     border: 1px solid var(--border);
-    background: transparent;
+    background: var(--surface);
     color: var(--muted);
     border-radius: 999px;
     padding: 2px 9px;
     font-size: 11px;
   }}
   .wb-chip[data-active="true"] {{
-    background: rgba(138, 180, 248, 0.18);
+    background: rgba(0, 113, 227, 0.10);
     color: var(--accent);
-    border-color: rgba(138, 180, 248, 0.5);
+    border-color: rgba(0, 113, 227, 0.45);
     font-weight: 600;
   }}
   .wb-search {{
@@ -271,7 +283,8 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   .wb-form {{
     display: none;
     background: var(--surface);
-    border: 1px solid rgba(138, 180, 248, 0.4);
+    border: 1px solid rgba(0, 113, 227, 0.35);
+    box-shadow: var(--shadow);
     border-radius: 8px;
     padding: 9px;
     gap: 6px;
@@ -281,7 +294,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     display: flex;
   }}
   .wb-input {{
-    background: #101217;
+    background: var(--bg);
     border: 1px solid var(--border);
     color: var(--text);
     border-radius: 5px;
@@ -290,8 +303,8 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     width: 100%;
   }}
   .wb-tray {{
-    background: rgba(251, 191, 36, 0.06);
-    border: 1px solid rgba(251, 191, 36, 0.28);
+    background: #fffbeb;
+    border: 1px solid rgba(180, 83, 9, 0.25);
     border-radius: 8px;
     padding: 7px 10px;
   }}
@@ -310,7 +323,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     justify-content: space-between;
     gap: 8px;
     padding: 5px 0;
-    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    border-top: 1px solid rgba(180, 83, 9, 0.12);
     font-size: 11.5px;
   }}
   .wb-sec-hdr {{
@@ -332,7 +345,8 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   .wb-card {{
     background: var(--surface);
     border: 1px solid var(--border);
-    border-radius: 8px;
+    box-shadow: var(--shadow);
+    border-radius: 10px;
     padding: 9px 10px;
     display: flex;
     flex-direction: column;
@@ -348,6 +362,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   }}
   .wb-card[data-lane="needs-you"] {{
     border-left: 3px solid var(--urgent);
+    background: linear-gradient(90deg, #fff2f1 0%, #ffffff 32px);
   }}
   .wb-card[data-lane="waiting"] {{
     border-left: 3px solid var(--accent);
@@ -402,6 +417,25 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     flex-wrap: wrap;
     font-size: 11px;
     color: var(--muted);
+    margin-top: 2px;
+  }}
+  .wb-origin {{
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 10.5px;
+    font-weight: 500;
+    background: #f5f5f7;
+    border: 1px solid var(--border);
+    color: #3a3a3c;
+    text-decoration: none;
+  }}
+  a.wb-origin:hover {{
+    border-color: rgba(0, 113, 227, 0.45);
+    color: var(--accent);
+    background: #eff6ff;
   }}
   .wb-badge {{
     display: inline-flex;
@@ -412,16 +446,19 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     font-weight: 600;
   }}
   .wb-badge-needs {{
-    background: rgba(248, 113, 113, 0.16);
+    background: #fff2f1;
     color: var(--urgent);
+    border: 1px solid rgba(255, 59, 48, 0.22);
   }}
   .wb-badge-wait {{
-    background: rgba(138, 180, 248, 0.14);
+    background: #eff6ff;
     color: var(--accent);
+    border: 1px solid rgba(0, 113, 227, 0.2);
   }}
   .wb-badge-multi {{
-    background: rgba(52, 211, 153, 0.14);
+    background: #f0fdf4;
     color: var(--ready);
+    border: 1px solid rgba(21, 128, 61, 0.2);
   }}
   .wb-ob {{
     display: flex;
@@ -430,23 +467,24 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     gap: 6px;
     padding: 5px 8px;
     border-radius: 6px;
-    background: rgba(255, 255, 255, 0.03);
-    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: #f8fafc;
+    border: 1px solid var(--border);
     font-size: 11.5px;
   }}
   .wb-ob[data-status="ready"] {{
-    background: rgba(52, 211, 153, 0.11);
-    border-color: rgba(52, 211, 153, 0.4);
+    background: #f0fdf4;
+    border-color: rgba(21, 128, 61, 0.35);
   }}
   .wb-ob[data-stalled="true"] {{
-    background: rgba(248, 113, 113, 0.12);
-    border-color: rgba(248, 113, 113, 0.4);
+    background: #fff2f1;
+    border-color: rgba(255, 59, 48, 0.35);
   }}
   .wb-trig {{
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 10px;
-    color: var(--muted);
-    background: rgba(0, 0, 0, 0.25);
+    color: #4b5563;
+    background: #f1f5f9;
+    border: 1px solid #e2e8f0;
     padding: 1px 5px;
     border-radius: 4px;
   }}
@@ -461,19 +499,19 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     gap: 4px;
     padding: 2px 7px;
     border-radius: 5px;
-    background: rgba(255, 255, 255, 0.05);
-    border: 1px solid rgba(255, 255, 255, 0.09);
+    background: #f8fafc;
+    border: 1px solid var(--border);
     color: var(--text);
     text-decoration: none;
     font-size: 11px;
     max-width: 100%;
   }}
   .wb-pill:hover {{
-    border-color: rgba(138, 180, 248, 0.5);
-    background: rgba(138, 180, 248, 0.1);
+    border-color: rgba(0, 113, 227, 0.45);
+    background: #eff6ff;
   }}
   .wb-pill[data-role="context_only"] {{
-    opacity: 0.6;
+    opacity: 0.65;
     border-style: dashed;
   }}
   .wb-cut {{
@@ -497,11 +535,13 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     font-size: 9.5px;
     padding: 0 3px;
     border-radius: 3px;
-    background: rgba(255, 255, 255, 0.08);
+    background: #f1f5f9;
+    border: 1px solid #e2e8f0;
     color: var(--muted);
   }}
   .wb-roll-dot[data-rolled="true"] {{
-    background: rgba(52, 211, 153, 0.2);
+    background: #dcfce7;
+    border-color: rgba(21, 128, 61, 0.3);
     color: var(--ready);
   }}
 </style>
@@ -738,6 +778,22 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
         ${{openObs.length ? `<span class="wb-badge" style="color:var(--warn)">🔔 ${{openObs.length}}</span>` : ''}}
         <span class="wb-badge" style="color:var(--muted)">📎 ${{artCount}}</span>
       `;
+      // Render clickable root-cause provenance badge in the card header meta row
+      let originHtml = '';
+      if (w.origin && w.origin.label) {{
+        const o = w.origin;
+        if (o.kind === 'chat_chain') {{
+          const ocid = String(o.artifact_key || '').split(':').pop();
+          originHtml = `<a class="wb-origin" href="#" data-open-chat="${{esc(ocid)}}">${{esc(o.label)}}</a>`;
+        }} else if (o.url) {{
+          originHtml = `<a class="wb-origin" href="${{esc(o.url)}}" target="_blank" rel="noopener">${{esc(o.label)}}</a>`;
+        }} else {{
+          originHtml = `<span class="wb-origin">${{esc(o.label)}}</span>`;
+        }}
+      }}
+      const projLabel = (w.project_id && !/^[0-9a-f]{{8}}-[0-9a-f]{{4}}-/i.test(w.project_id))
+        ? `<span>📁 ${{esc(w.project_id)}}</span>`
+        : '';
       const reasonsHtml = (w.reasons || []).map((r) => `<span>${{esc(r)}}</span>`).join(' · ');
 
       const obsHtml = openObs.map((o) => {{
@@ -791,8 +847,8 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
               <div style="min-width:0;flex:1">
                 <div class="wb-card-title">${{esc(w.title)}}</div>
                 <div class="wb-meta-row">
-                  ${{laneBadge}} ${{multiBadge}} ${{countsBadge}}
-                  ${{w.project_id ? `<span>📁 ${{esc(w.project_id)}}</span>` : ''}}
+                  ${{laneBadge}} ${{multiBadge}} ${{countsBadge}} ${{originHtml}}
+                  ${{projLabel}}
                   ${{w.roadmap_item_key ? `<span>🗺 ${{esc(w.roadmap_item_key)}}</span>` : ''}}
                   <span>${{esc(w.updated_et)}}</span>
                 </div>
@@ -1035,6 +1091,7 @@ def create_server(
             title,
             project_id=str(body.get("project_id") or ""),
             roadmap_item_key=str(body.get("roadmap_item_key") or ""),
+            meta={"title_manual": True},
         )
         for p in body.get("primaries") or []:
           ck = work_store.canonicalize_artifact_key(str(p))
