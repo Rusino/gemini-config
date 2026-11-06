@@ -66,6 +66,25 @@ export function isAutoDedupeExcluded(rawUrl, extraExcludedHosts = []) {
   return false;
 }
 
+// Normalize Gerrit host aliases so .googlesource.com and .git.corp.google.com unify
+function normalizeGerritHost(hostname) {
+  if (hostname === 'review.skia.org') return 'skia-review';
+  if (hostname.endsWith('-review.googlesource.com')) {
+    return hostname.slice(0, -'.googlesource.com'.length);
+  }
+  if (hostname.endsWith('-review.git.corp.google.com')) {
+    return hostname.slice(0, -'.git.corp.google.com'.length);
+  }
+  if (
+    hostname === 'gerrit.googlesource.com' ||
+    hostname === 'gerrit.git.corp.google.com' ||
+    hostname === 'gerrit.test'
+  ) {
+    return hostname;
+  }
+  return null;
+}
+
 export function parseResourceDescriptor(rawUrl) {
   const unwrapped = unwrapRedirectUrl(rawUrl);
   if (!unwrapped || typeof unwrapped !== 'string') {
@@ -92,39 +111,44 @@ export function parseResourceDescriptor(rawUrl) {
   }
 
   // Gerrit code review hosts keep subviews distinct on click, unify per CL in cleanup
-  const isGerritHost =
-    hostname.endsWith('-review.googlesource.com') ||
-    hostname === 'gerrit.googlesource.com' ||
-    hostname === 'gerrit.test';
-  if (isGerritHost) {
-    const commentMatch = pathname.match(
-      /^(?:\/c\/.+?)?\/\+\/(\d+)\/comment\/([0-9a-fA-F_]+)\/?$/,
+  const gerritHost = normalizeGerritHost(hostname);
+  if (gerritHost) {
+    const gerritPath =
+      pathname === '/' && url.hash.startsWith('#/c/')
+        ? url.hash.slice(1).split('?')[0]
+        : pathname;
+    const commentMatch = gerritPath.match(
+      /^(?:\/c(?:\/.+?)?)?(?:\/\+)?\/(\d+)\/comment\/([0-9a-fA-F_]+)\/?$/,
     );
     if (commentMatch) {
       const [, changeNum, commentId] = commentMatch;
       return {
         excluded: false,
         kind: 'gerrit',
-        exactKey: `gerrit-comment:${host}:${changeNum}:${commentId}`,
-        entityKey: `gerrit-entity:${host}:${changeNum}`,
+        exactKey: `gerrit-comment:${gerritHost}:${changeNum}:${commentId}`,
+        entityKey: `gerrit-entity:${gerritHost}:${changeNum}`,
         gerritInfo: null,
         viewRank: 1,
         patchsetNum: 0,
       };
     }
 
-    const clMatch = pathname.match(
-      /^(?:\/c\/.+?)?\/\+\/(\d+)(?:\/(\d+|\d+\.\.\d+)(?:\/(.+))?)?\/?$/,
-    );
+    const clMatch =
+      gerritPath.match(
+        /^(?:\/c\/.+?)?\/\+\/(\d+)(?:\/(\d+|\d+\.\.\d+)(?:\/(.+))?)?\/?$/,
+      ) ||
+      gerritPath.match(
+        /^(?:\/c)?\/(\d+)(?:\/(\d+|\d+\.\.\d+)(?:\/(.+))?)?\/?$/,
+      );
     if (clMatch) {
       const [, changeNum, patchset, filePath] = clMatch;
-      const entityKey = `gerrit-entity:${host}:${changeNum}`;
+      const entityKey = `gerrit-entity:${gerritHost}:${changeNum}`;
       const checksTab = searchParams.get('tab') === 'checks';
       if (filePath) {
         return {
           excluded: false,
           kind: 'gerrit',
-          exactKey: `gerrit-file:${host}:${changeNum}:${patchset || 'any'}:${filePath}`,
+          exactKey: `gerrit-file:${gerritHost}:${changeNum}:${patchset || 'any'}:${filePath}`,
           entityKey,
           gerritInfo: null,
           viewRank: 1,
@@ -136,7 +160,7 @@ export function parseResourceDescriptor(rawUrl) {
       return {
         excluded: false,
         kind: 'gerrit',
-        exactKey: `gerrit:${host}:${changeNum}:ps=${patchset || '*'}:checks=${
+        exactKey: `gerrit:${gerritHost}:${changeNum}:ps=${patchset || '*'}:checks=${
           checksTab ? '1' : '0'
         }`,
         entityKey,
@@ -144,7 +168,7 @@ export function parseResourceDescriptor(rawUrl) {
         gerritInfo: isRange
           ? null
           : {
-              host,
+              host: gerritHost,
               changeNum,
               patchset: patchset || null,
               checksTab,
@@ -155,21 +179,51 @@ export function parseResourceDescriptor(rawUrl) {
     }
   }
 
-  // Issue trackers unify mirrors, /u/<N>/ prefixes, and #comment deep links
+  // Code review CL subviews stay distinct on click and unify per CL in cleanup
+  if (hostname.startsWith('critique.') || hostname === 'critique.test') {
+    const clMatch = pathname.match(/^\/cl\/(\d+)(?:\/(.+?))?\/?$/);
+    if (clMatch) {
+      const [, clNum, subPath] = clMatch;
+      const queryPart = searchParams.toString();
+      return {
+        excluded: false,
+        kind: 'critique',
+        exactKey: `critique:${clNum}:${subPath || ''}:${queryPart}`,
+        entityKey: `critique-entity:${clNum}`,
+        gerritInfo: null,
+        viewRank: !subPath ? 3 : 1,
+        patchsetNum: 0,
+      };
+    }
+  }
+
+  // Issue trackers unify g-issues/b.corp mirrors, /u/<N>/ prefixes, and #comment deep links
   const isDedicatedIssueHost =
-    hostname === 'issues.chromium.org' ||
-    hostname === 'issues.skia.org' ||
+    /^(?:g-)?issues\.(?:chromium|skia|webrtc|v8|pdfium|angleproject|dawn|oss-fuzz)\.org$/.test(
+      hostname,
+    ) ||
     hostname === 'bugs.chromium.org' ||
+    hostname === 'crbug.com' ||
     hostname === 'issuetracker.google.com' ||
     hostname.startsWith('b.') ||
+    hostname.startsWith('buganizer.') ||
+    hostname.endsWith('issuetracker.corp.google.com') ||
     hostname.endsWith('.issues.test');
   const isAnyIssueHost = isDedicatedIssueHost || hostname.endsWith('.google.com');
   if (isAnyIssueHost) {
+    const monorailId =
+      isDedicatedIssueHost && /^\/p\/[^/]+\/issues\/detail\/?$/.test(pathname)
+        ? searchParams.get('id')
+        : null;
     const issueMatch =
-      pathname.match(/^(?:\/u\/\d+)?\/issues\/(\d+)\/?$/) ||
+      pathname.match(/^(?:\/u\/\d+)?\/issues\/(\d+)(?:\/.*)?$/) ||
+      pathname.match(/^(?:\/u\/\d+)?\/workspaces\/\d+\/issues\/(\d+)\/?$/) ||
       (isDedicatedIssueHost
-        ? pathname.match(/^(?:\/u\/\d+)?\/(\d{6,})\/?$/)
-        : null);
+        ? pathname.match(
+            /^(?:\/u\/\d+)?\/(?:(?:chromium|skia|v8|webrtc|dawn|pdfium)\/)?(\d{5,})\/?$/,
+          )
+        : null) ||
+      (monorailId && /^\d+$/.test(monorailId) ? [monorailId, monorailId] : null);
     if (issueMatch) {
       const [, issueId] = issueMatch;
       const key = `issue:${issueId}`;
@@ -185,12 +239,15 @@ export function parseResourceDescriptor(rawUrl) {
     }
   }
 
-  // Google Docs, Sheets, and Slides preserve published /d/e/ IDs, copy/export, tabs, and gids
-  const isDocsHost = hostname === 'docs.google.com' || hostname === 'docs.test';
-  if (isDocsHost) {
+  // Google Docs, Sheets, Slides, and Drive preserve published /d/e/ IDs, copy/export, tabs, gids
+  const isDocsOrDriveHost =
+    hostname === 'docs.google.com' ||
+    hostname === 'drive.google.com' ||
+    hostname === 'docs.test';
+  if (isDocsOrDriveHost) {
     const docsMatch = pathname.match(
       new RegExp(
-        '^/(document|spreadsheets|presentation|drawings)(?:/u/\\d+)?/d/' +
+        '^(?:/u/\\d+)?/(document|spreadsheets|presentation|drawings|file)(?:/u/\\d+)?/d/' +
           '(e/[a-zA-Z0-9_-]+|[a-zA-Z0-9_-]+)(?:/([^/?#]+))?',
       ),
     );
@@ -216,6 +273,26 @@ export function parseResourceDescriptor(rawUrl) {
         };
       }
     }
+  }
+
+  // Code Search strips semicolon matrix params (;l=..., ;bpv=...) when grouping in cleanup
+  const isCodeSearchHost =
+    hostname.startsWith('source.') ||
+    hostname.startsWith('cs.') ||
+    hostname === 'cs.opensource.google';
+  if (isCodeSearchHost && pathname.includes(';')) {
+    const basePath = pathname.split(';')[0];
+    const queryStr = searchParams.toString();
+    const qs = queryStr ? `?${queryStr}` : '';
+    return {
+      excluded: false,
+      kind: 'cs',
+      exactKey: `cs:${host}:${pathname}${qs}`,
+      entityKey: `cs-entity:${host}:${basePath}${qs}`,
+      gerritInfo: null,
+      viewRank: 2,
+      patchsetNum: 0,
+    };
   }
 
   // GitHub strips comment hashes on click, preserves distinct commits/checks, collapses in cleanup
@@ -393,16 +470,17 @@ export function planManualCleanup(tabs, extraExcludedHosts = []) {
     return {closable: [], groupsCount: 0};
   }
 
-  const isProtected = (t) => Boolean(t.pinned || t.active || t.audible);
+  const isHardProtected = (t) => Boolean(t.pinned || t.audible);
   const isGrouped = (t) => typeof t.groupId === 'number' && t.groupId !== -1;
 
   const descByTab = new Map();
   const groups = new Map();
 
   for (const tab of tabs) {
-    if (!tab.url) continue;
-    if (isAutoDedupeExcluded(tab.url, extraExcludedHosts)) continue;
-    const desc = parseResourceDescriptor(tab.url);
+    const rawUrl = tab.url || tab.pendingUrl;
+    if (!rawUrl) continue;
+    if (isAutoDedupeExcluded(rawUrl, extraExcludedHosts)) continue;
+    const desc = parseResourceDescriptor(rawUrl);
     if (desc.excluded || !desc.entityKey) continue;
     descByTab.set(tab, desc);
     if (!groups.has(desc.entityKey)) {
@@ -418,10 +496,10 @@ export function planManualCleanup(tabs, extraExcludedHosts = []) {
     if (tabList.length < 2) continue;
     groupsCount++;
 
-    // Rank survivor: protected -> main overview -> latest patchset -> grouped -> latest accessed
+    // Rank survivor: hard-protected -> active -> main overview -> latest patchset -> grouped
     const survivor = [...tabList].sort((a, b) => {
-      if (isProtected(a) !== isProtected(b)) {
-        return isProtected(a) ? -1 : 1;
+      if (isHardProtected(a) !== isHardProtected(b)) {
+        return isHardProtected(a) ? -1 : 1;
       }
       if (Boolean(a.pinned) !== Boolean(b.pinned)) {
         return a.pinned ? -1 : 1;
@@ -447,16 +525,18 @@ export function planManualCleanup(tabs, extraExcludedHosts = []) {
 
     for (const tab of tabList) {
       if (tab.id === survivor.id) continue;
-      if (isProtected(tab)) continue;
+      if (isHardProtected(tab)) continue;
 
+      const rawUrl = tab.url || tab.pendingUrl;
+      const survivorUrl = survivor.url || survivor.pendingUrl;
       closable.push({
         tabId: tab.id,
         windowId: tab.windowId,
-        title: tab.title || tab.url,
-        url: tab.url,
+        title: tab.title || rawUrl,
+        url: rawUrl,
         canonicalKey: key,
         keptTabId: survivor.id,
-        keptTitle: survivor.title || survivor.url,
+        keptTitle: survivor.title || survivorUrl,
         keptReason: survivor.pinned
           ? 'pinned'
           : survivor.active

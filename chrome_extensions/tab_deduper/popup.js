@@ -5,6 +5,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const pauseBtn = document.getElementById('pauseBtn');
   const dupList = document.getElementById('dupList');
   const dupCountLabel = document.getElementById('dupCountLabel');
+  const versionLabel = document.getElementById('versionLabel');
   const closeSelectedBtn = document.getElementById('closeSelectedBtn');
   const recentList = document.getElementById('recentList');
 
@@ -31,11 +32,13 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  function renderDuplicates(closable) {
+  function renderDuplicates(closable, totalTabs) {
     currentDuplicates = closable || [];
     selectedTabIds = new Set(currentDuplicates.map((item) => item.tabId));
 
-    dupCountLabel.textContent = `${currentDuplicates.length} found`;
+    const tabsSuffix =
+      typeof totalTabs === 'number' ? ` (${totalTabs} tabs)` : '';
+    dupCountLabel.textContent = `${currentDuplicates.length} found${tabsSuffix}`;
     if (!currentDuplicates.length) {
       dupList.innerHTML = '<div class="empty-state">No duplicates open</div>';
       closeSelectedBtn.disabled = true;
@@ -127,10 +130,14 @@ document.addEventListener('DOMContentLoaded', () => {
   function refreshState() {
     chrome.runtime.sendMessage({action: 'getState'}, (response) => {
       if (!response || response.error) return;
+      if (versionLabel && response.version) {
+        versionLabel.textContent =
+          'v' + String(response.version).replace(/\.0$/, '');
+      }
       autoDedupeToggle.checked = Boolean(response.settings?.autoDedupe);
       pauseUntilMs = Number(response.settings?.pauseUntilMs || 0);
       updatePauseButton();
-      renderDuplicates(response.duplicates?.closable || []);
+      renderDuplicates(response.duplicates?.closable || [], response.totalTabs);
       renderRecent(response.recentAutoSwitches || []);
     });
   }

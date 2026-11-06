@@ -261,7 +261,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       const allTabs = await chrome.tabs.query({});
       const duplicates = planManualCleanup(allTabs, settings.excludedHosts);
       const recentAutoSwitches = await getRecentSwitches();
-      sendResponse({settings, duplicates, recentAutoSwitches});
+      const version = chrome.runtime.getManifest?.()?.version || '1.2.0';
+      sendResponse({
+        settings,
+        duplicates,
+        recentAutoSwitches,
+        totalTabs: allTabs.length,
+        version,
+      });
       return;
     }
     if (message.action === 'updateSettings') {
@@ -278,8 +285,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       for (const id of tabIds) {
         try {
           const t = await chrome.tabs.get(id);
-          // Protect tabs that became active, pinned, or audible while popup was open
-          if (t.pinned || t.active || t.audible) {
+          // Protect tabs that became pinned or audible while popup was open
+          if (t.pinned || t.audible) {
             continue;
           }
           await chrome.tabs.remove(id);

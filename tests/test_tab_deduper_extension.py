@@ -55,8 +55,14 @@ class DedupeLogicUnitTest(unittest.TestCase):
     const clComment = 'https://skia-review.googlesource.com/c/skia/+/1414016/comment/abc_123';
     const clFile = 'https://skia-review.googlesource.com/c/skia/+/1414016/3/include/core/SkTypes.h';
 
-    // Opening CL root matches open patchset tab
+    // Opening CL root matches open patchset tab across .googlesource.com, .git.corp, and short /c/
+    const clCorp = 'https://skia-review.git.corp.google.com/c/skia/+/1414016';
+    const clShort = 'https://skia-review.googlesource.com/c/1414016';
+    const clReviewAlias = 'https://review.skia.org/1414016';
     assert.equal(urlsMatchForAutoDedupe(clRoot, clPs3), true);
+    assert.equal(urlsMatchForAutoDedupe(clCorp, clPs3), true);
+    assert.equal(urlsMatchForAutoDedupe(clShort, clPs3), true);
+    assert.equal(urlsMatchForAutoDedupe(clReviewAlias, clPs3), true);
     // Opening specific patchset matches root tab
     assert.equal(urlsMatchForAutoDedupe(clPs3, clRoot), true);
     // Identical patchsets and message anchors on the same patchset match
@@ -69,8 +75,12 @@ class DedupeLogicUnitTest(unittest.TestCase):
     assert.equal(urlsMatchForAutoDedupe(clComment, clPs3), false);
     assert.equal(urlsMatchForAutoDedupe(clFile, clPs3), false);
 
-    // Issue trackers unify mirrors, /u/<N>/ prefixes, short IDs, and #comment anchors
+    // Issue trackers unify mirrors, g-issues, /u/<N>/ prefixes, short IDs, and #comment anchors
     const issueA = 'https://issues.chromium.org/issues/576664769';
+    const issueGIssues = 'https://g-issues.chromium.org/u/0/issues/576664769#comment4';
+    const issueGSkia = 'https://g-issues.skia.org/issues/576664769';
+    const issueTaskflow = 'https://taskflow.corp.google.com/workspaces/4774097/issues/576664769';
+    const issueMonorail = 'https://bugs.chromium.org/p/chromium/issues/detail?id=576664769';
     const issueB = 'https://issuetracker.google.com/issues/576664769?pli=1';
     const issueCorpU0 = 'https://bugs.custom.google.com/u/0/issues/576664769';
     const issueSkia = 'https://issues.skia.org/issues/576664769';
@@ -82,6 +92,10 @@ class DedupeLogicUnitTest(unittest.TestCase):
       '%2Fissues%2F576664769%23comment5';
 
     assert.equal(urlsMatchForAutoDedupe(issueA, issueB), true);
+    assert.equal(urlsMatchForAutoDedupe(issueA, issueGIssues), true);
+    assert.equal(urlsMatchForAutoDedupe(issueA, issueGSkia), true);
+    assert.equal(urlsMatchForAutoDedupe(issueA, issueTaskflow), true);
+    assert.equal(urlsMatchForAutoDedupe(issueA, issueMonorail), true);
     assert.equal(urlsMatchForAutoDedupe(issueA, issueCorpU0), true);
     assert.equal(urlsMatchForAutoDedupe(issueA, issueSkia), true);
     assert.equal(urlsMatchForAutoDedupe(issueA, issueShort), true);
@@ -197,27 +211,60 @@ class DedupeLogicUnitTest(unittest.TestCase):
     ]);
     assert.equal(survivor.id, 11);
 
-    // Manual cleanup collapses entity subviews (Gerrit subviews, PR files, Tab Groups)
+    const critiqueRoot = 'https://critique.test/cl/1008075988';
+    const critiqueFile = 'https://critique.test/cl/1008075988/src/core/foo.cc';
+    const csLine10 = 'https://source.chromium.org/chromium/src/a.cc;l=10';
+    const csLine90 = 'https://source.chromium.org/chromium/src/a.cc;l=90;bpv=1';
+
+    // Manual cleanup collapses entity subviews, Critique, Code Search, and multi-window active tabs
     const plan = planManualCleanup([
-      {id: 1, url: prA, title: 'PR 1', pinned: true},
-      {id: 2, url: prFiles, title: 'PR Files', pinned: false},
+      {id: 1, url: prA, title: 'PR 1', pinned: true, active: false},
+      {id: 2, url: prFiles, title: 'PR Files', pinned: false, active: true},
       {id: 3, url: clPs3, title: 'CL PS3', active: false, lastAccessed: 100},
       {id: 4, url: clComment, title: 'CL Comment', active: false, lastAccessed: 900},
-      {id: 5, url: clRoot, title: 'CL Root', active: false, lastAccessed: 800},
+      {id: 5, url: clCorp, title: 'CL Corp Root', active: false, lastAccessed: 800},
       {id: 6, url: clPs1, title: 'CL PS1', active: false, lastAccessed: 700},
       {id: 7, url: clChecks, title: 'CL Checks', active: false, lastAccessed: 950},
       {id: 8, url: clFile, title: 'CL File', active: false, lastAccessed: 960},
-      {id: 9, url: issueCorpU0, title: 'Bug Grouped', groupId: 5, lastAccessed: 100},
-      {id: 10, url: issueComment2, title: 'Bug Loose', groupId: -1, lastAccessed: 500},
-      {id: 11, url: issueComment5, title: 'Bug Grouped Dup', groupId: 5, lastAccessed: 50},
+      {
+        id: 9,
+        url: issueGIssues,
+        title: 'Bug Grouped Win1',
+        windowId: 1,
+        active: true,
+        groupId: 5,
+        lastAccessed: 900,
+      },
+      {
+        id: 10,
+        url: issueComment2,
+        title: 'Bug Active Win2',
+        windowId: 2,
+        active: true,
+        groupId: -1,
+        lastAccessed: 500,
+      },
+      {
+        id: 11,
+        url: issueComment5,
+        title: 'Bug Grouped Dup',
+        windowId: 1,
+        active: false,
+        groupId: 5,
+        lastAccessed: 50,
+      },
       {id: 12, url: 'https://other.test/page', title: 'Other'},
       {id: 13, url: 'https://other.test/page#section2', title: 'Other Anchor'},
+      {id: 14, url: critiqueRoot, title: 'Critique Root'},
+      {id: 15, url: critiqueFile, title: 'Critique File'},
+      {id: 16, url: csLine10, title: 'CS 10', lastAccessed: 500},
+      {id: 17, url: csLine90, title: 'CS 90', lastAccessed: 100},
     ]);
-    assert.equal(plan.groupsCount, 4);
-    // Survivors: 1 (pinned PR), 3 (highest overview PS3), 9 (grouped bug), 12 (first page)
+    assert.equal(plan.groupsCount, 6);
+    // Survivors: 1 (pinned PR), 3 (PS3), 9 (Win1 active bug), 12, 14, 16
     assert.deepEqual(
       plan.closable.map((x) => x.tabId).sort((a, b) => a - b),
-      [2, 4, 5, 6, 7, 8, 10, 11, 13],
+      [2, 4, 5, 6, 7, 8, 10, 11, 13, 15, 17],
     );
 
     console.log('ALL_DEDUPE_LOGIC_TESTS_PASSED');

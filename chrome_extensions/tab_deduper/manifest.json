@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Safe Tab Deduper",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Safely avoids duplicate tabs by focusing open tabs without reloading",
   "permissions": [
     "tabs",
