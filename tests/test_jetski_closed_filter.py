@@ -8275,6 +8275,16 @@ global.window = {
         }),
       };
     }
+    if (String(url).includes('jetski-workbench.json')) {
+      return {
+        ok: true,
+        json: async () => ({
+          pen_url: 'https://8090-pen-proxy.corp.goog',
+          local_url: 'http://localhost:8090',
+          port: 8090,
+        }),
+      };
+    }
     if (String(url).includes('UpdateConversationAnnotations')) {
       return { ok: true, status: 200 };
     }
@@ -8707,10 +8717,36 @@ eval(code);
   assert.strictEqual(window.__jetskiFlightDeck.isOpen(), false);
   assert.strictEqual(drawer.getAttribute('data-open'), 'false');
 
+  // Verify Workbench 🛠️ toggle button mounts beside ✈️ and switches drawer between :8089 and :8090
+  const wbToggleBtn = headerRow.querySelector('.jetski-workbench-toggle-btn');
+  assert(wbToggleBtn, 'Workbench 🛠️ toggle button must be mounted inside sidebar header row');
+  assert.strictEqual(wbToggleBtn.getAttribute('data-testid'), 'jetski-workbench-toggle-btn');
+  assert.strictEqual(wbToggleBtn.textContent, '🛠️');
+  assert.strictEqual(wbToggleBtn.getAttribute('data-active'), 'false');
+
+  wbToggleBtn.dispatchEvent('pointerdown');
+  assert.strictEqual(window.__jetskiFlightDeck.isOpen(), true);
+  assert.strictEqual(window.__jetskiFlightDeck.getMode(), 'workbench');
+  assert.strictEqual(wbToggleBtn.getAttribute('data-active'), 'true');
+  assert.strictEqual(toggleBtn.getAttribute('data-active'), 'false');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.strictEqual(iframe.getAttribute('src'), 'http://localhost:8090?embed=1');
+
+  // Clicking ✈️ while Workbench is open switches the drawer in-place to Flight Deck (:8089)
+  await new Promise((r) => setTimeout(r, 350));
+  toggleBtn.dispatchEvent('pointerdown');
+  assert.strictEqual(window.__jetskiFlightDeck.isOpen(), true);
+  assert.strictEqual(window.__jetskiFlightDeck.getMode(), 'flight-deck');
+  assert.strictEqual(toggleBtn.getAttribute('data-active'), 'true');
+  assert.strictEqual(wbToggleBtn.getAttribute('data-active'), 'false');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.strictEqual(iframe.getAttribute('src'), 'http://localhost:8089?embed=1');
+
   window.__jetskiFlightDeck.setOpen(true);
   window.__jetskiClosedChatsFilterCleanup();
   assert.strictEqual(document.getElementById('jetski-flight-deck-drawer'), null);
   assert.strictEqual(headerRow.querySelector('.jetski-flight-deck-toggle-btn'), null);
+  assert.strictEqual(headerRow.querySelector('.jetski-workbench-toggle-btn'), null);
   assert.strictEqual(bodyEl.getAttribute('data-jetski-flight-deck-open'), null);
 
   console.log('ALL_FLIGHT_DECK_TESTS_PASSED');

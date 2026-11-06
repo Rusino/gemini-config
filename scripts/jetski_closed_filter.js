@@ -39,10 +39,12 @@
   const TOP_NAV_STATUS_DOT_CLASS = 'jetski-top-nav-status-dot';
   const TOP_NAV_SETTINGS_BTN_CLASS = 'jetski-top-nav-settings-btn';
   let topNavExpanded = false;
-  // Flight Deck embedded drawer panel, toggle button, and width bounds
+  // Flight Deck and Workbench embedded drawer panel, toggle buttons, and width bounds
   const STORAGE_FLIGHT_DECK_OPEN_KEY = 'jetski_flight_deck_open_v1';
   const STORAGE_FLIGHT_DECK_WIDTH_KEY = 'jetski_flight_deck_width_v1';
+  const STORAGE_DRAWER_MODE_KEY = 'jetski_drawer_mode_v1';
   const FLIGHT_DECK_TOGGLE_BTN_CLASS = 'jetski-flight-deck-toggle-btn';
+  const WORKBENCH_TOGGLE_BTN_CLASS = 'jetski-workbench-toggle-btn';
   const FLIGHT_DECK_DRAWER_ID = 'jetski-flight-deck-drawer';
   const FLIGHT_DECK_DRAWER_CLASS = 'jetski-flight-deck-drawer';
   const FLIGHT_DECK_RESIZE_HANDLE_CLASS = 'jetski-flight-deck-resize-handle';
@@ -56,9 +58,11 @@
   const FLIGHT_DECK_PING_ACK_TIMEOUT_MS = 8000;
   const FLIGHT_DECK_OPEN_IDLE_PING_MS = 150000;
   const FLIGHT_DECK_RELOAD_COOLDOWN_MS = 15000;
-  // Deterministic Cloudtop UberProxy PEN URL for port 8089 when pen_url.sh times out
+  // Deterministic Cloudtop UberProxy PEN URLs for ports 8089 and 8090 when pen_url.sh times out
   const DEFAULT_FLIGHT_DECK_PEN_URL =
     'https://b2607f8b048001000013f0f0cac12c3b11f99000000000000000001.proxy.googlers.com';
+  const DEFAULT_WORKBENCH_PEN_URL =
+    'https://b2607f8b048001000013f0f0cac12c3b11f9a000000000000000001.proxy.googlers.com';
   const TITLEBAR_BTN_CLASS = 'jetski-titlebar-archive-btn';
   // Live context window volume pill rendered before Search in each conversation titlebar
   const TITLEBAR_CONTEXT_BADGE_CLASS = 'jetski-titlebar-context-badge';
@@ -104,6 +108,7 @@
   // Reminder button classes and floating Context Dossier popover ID
   const TITLEBAR_REMINDER_BTN_CLASS = 'jetski-titlebar-reminder-btn';
   const TITLEBAR_FLIGHT_DECK_TOGGLE_BTN_CLASS = 'jetski-titlebar-flight-deck-btn';
+  const TITLEBAR_WORKBENCH_TOGGLE_BTN_CLASS = 'jetski-titlebar-workbench-btn';
   const INBOX_REMINDER_BTN_CLASS = 'jetski-inbox-reminder-btn';
   const ROW_REMINDER_BTN_CLASS = 'jetski-row-reminder-btn';
   const DOSSIER_POPOVER_ID = 'jetski-chat-dossier-popover';
@@ -273,6 +278,8 @@
   }
 
   let flightDeckOpen = safeGetStorage(STORAGE_FLIGHT_DECK_OPEN_KEY) === 'true';
+  let activeDrawerMode =
+    safeGetStorage(STORAGE_DRAWER_MODE_KEY) === 'workbench' ? 'workbench' : 'flight-deck';
 
   // Clamps Flight Deck drawer width between 320px and 900px
   function clampFlightDeckWidth(px) {
@@ -292,8 +299,11 @@
   let activeFlightDeckResizeCleanup = null;
   let flightDeckInfoCache = null;
   let flightDeckInfoFetchedAt = 0;
+  let workbenchInfoCache = null;
+  let workbenchInfoFetchedAt = 0;
   // Retains the last known non-loopback PEN proxy origin across transient pen_url.sh timeouts
   let lastValidFlightDeckPenBase = DEFAULT_FLIGHT_DECK_PEN_URL;
+  let lastValidWorkbenchPenBase = DEFAULT_WORKBENCH_PEN_URL;
   // Tracks iframe load, rendered heartbeat, and liveness pings to recover stuck Loading frames
   let flightDeckLoadStartedAt = 0;
   let flightDeckLastReloadAt = 0;
@@ -959,29 +969,51 @@
     return `${lastValidFlightDeckPenBase}${vSuffix}`;
   }
 
-  // Fetches jetski-flight-deck.json so the drawer loads the correct local or PEN proxy URL
-  async function fetchFlightDeckInfo() {
+  // Fetches jetski-flight-deck.json or jetski-workbench.json for the active drawer mode
+  async function fetchFlightDeckInfo(mode = activeDrawerMode) {
+    const isWb = mode === 'workbench';
     const now = Date.now();
-    if (flightDeckInfoCache && now - flightDeckInfoFetchedAt < FLIGHT_DECK_INFO_TTL_MS) {
+    if (!isWb && flightDeckInfoCache && now - flightDeckInfoFetchedAt < FLIGHT_DECK_INFO_TTL_MS) {
       return flightDeckInfoCache;
     }
+    if (isWb && workbenchInfoCache && now - workbenchInfoFetchedAt < FLIGHT_DECK_INFO_TTL_MS) {
+      return workbenchInfoCache;
+    }
+    const defaultPort = isWb ? 8090 : 8089;
+    const defaultLocal = `http://localhost:${defaultPort}`;
+    const artifactName = isWb ? 'jetski-workbench.json' : 'jetski-flight-deck.json';
     if (typeof window.fetch !== 'function') {
       // Seed pen_url from the cached UberProxy origin when fetch is unavailable
-      return (
-        flightDeckInfoCache || {
-          pen_url: lastValidFlightDeckPenBase,
-          local_url: 'http://localhost:8089',
-          port: 8089,
-        }
-      );
+      return isWb
+        ? (workbenchInfoCache || {
+            pen_url: lastValidWorkbenchPenBase,
+            local_url: defaultLocal,
+            port: defaultPort,
+          })
+        : (flightDeckInfoCache || {
+            pen_url: lastValidFlightDeckPenBase,
+            local_url: defaultLocal,
+            port: defaultPort,
+          });
     }
     try {
       const csrf = encodeURIComponent(getCsrfToken());
-      const url = resolveApiUrl(`/static/artifacts/jetski-flight-deck.json?v=${now}&csrf=${csrf}`);
+      const url = resolveApiUrl(`/static/artifacts/${artifactName}?v=${now}&csrf=${csrf}`);
       const resp = await window.fetch(url);
       if (resp && resp.ok) {
         const data = await resp.json();
         if (data && typeof data === 'object') {
+          if (isWb) {
+            const rawPen = typeof data.pen_url === 'string' ? data.pen_url.trim() : '';
+            if (rawPen && !isLoopbackFlightDeckUrl(rawPen)) {
+              lastValidWorkbenchPenBase = rawPen.replace(/[?#].*$/, '');
+            } else {
+              data.pen_url = lastValidWorkbenchPenBase;
+            }
+            workbenchInfoCache = data;
+            workbenchInfoFetchedAt = now;
+            return workbenchInfoCache;
+          }
           // Keep the last valid UberProxy origin if pen_url is empty or loopback
           data.pen_url = normalizeFlightDeckPenUrl(data.pen_url);
           flightDeckInfoCache = data;
@@ -992,13 +1024,24 @@
     } catch {
       // Fall through to cached data on network error
     }
+    if (isWb) {
+      workbenchInfoFetchedAt = now;
+      if (!workbenchInfoCache) {
+        workbenchInfoCache = {
+          pen_url: lastValidWorkbenchPenBase,
+          local_url: defaultLocal,
+          port: defaultPort,
+        };
+      }
+      return workbenchInfoCache;
+    }
     flightDeckInfoFetchedAt = now;
     if (!flightDeckInfoCache) {
       // Fall back to the cached UberProxy origin when jetski-flight-deck.json fails to load
       flightDeckInfoCache = {
         pen_url: lastValidFlightDeckPenBase,
-        local_url: 'http://localhost:8089',
-        port: 8089,
+        local_url: defaultLocal,
+        port: defaultPort,
       };
     }
     return flightDeckInfoCache;
@@ -6754,8 +6797,9 @@
         display: block;
         background: #d97706;
       }
-      /* Flight Deck side panel toggle button */
-      .${FLIGHT_DECK_TOGGLE_BTN_CLASS} {
+      /* Flight Deck and Workbench side panel toggle buttons */
+      .${FLIGHT_DECK_TOGGLE_BTN_CLASS},
+      .${WORKBENCH_TOGGLE_BTN_CLASS} {
         position: relative;
         display: inline-flex;
         align-items: center;
@@ -6774,11 +6818,13 @@
         flex-shrink: 0;
         transition: background-color 100ms ease, color 100ms ease;
       }
-      .${FLIGHT_DECK_TOGGLE_BTN_CLASS}:hover {
+      .${FLIGHT_DECK_TOGGLE_BTN_CLASS}:hover,
+      .${WORKBENCH_TOGGLE_BTN_CLASS}:hover {
         background: var(--sidebar-secondary, rgba(128, 134, 139, 0.16));
         color: var(--foreground, #e8eaed);
       }
-      .${FLIGHT_DECK_TOGGLE_BTN_CLASS}[data-active="true"] {
+      .${FLIGHT_DECK_TOGGLE_BTN_CLASS}[data-active="true"],
+      .${WORKBENCH_TOGGLE_BTN_CLASS}[data-active="true"] {
         background: var(--sidebar-secondary, rgba(128, 134, 139, 0.24));
         color: #8ab4f8;
       }
@@ -10561,6 +10607,20 @@
     });
   }
 
+  // Switches active drawer mode ('flight-deck' or 'workbench') and optionally opens the drawer
+  function setDrawerMode(nextMode, nextOpen = flightDeckOpen) {
+    const normalized = nextMode === 'workbench' ? 'workbench' : 'flight-deck';
+    const modeChanged = activeDrawerMode !== normalized;
+    activeDrawerMode = normalized;
+    safeSetStorage(STORAGE_DRAWER_MODE_KEY, activeDrawerMode);
+    if (modeChanged) {
+      flightDeckPendingVer = 0;
+      flightDeckPendingVerSince = 0;
+      flightDeckPingSentAt = 0;
+    }
+    setFlightDeckOpen(nextOpen);
+  }
+
   // Toggles or sets Flight Deck side panel open state and persists to storage
   function setFlightDeckOpen(nextOpen) {
     // Capture prior visibility so reopening a closed drawer probes or reloads stuck frames
@@ -10576,6 +10636,7 @@
     if (!wasOpen) {
       // Refresh jetski-flight-deck.json on drawer open so recent daemon restarts are picked up
       flightDeckInfoFetchedAt = 0;
+      workbenchInfoFetchedAt = 0;
       const drawerEl = document.getElementById(FLIGHT_DECK_DRAWER_ID);
       const iframe = drawerEl?.querySelector(`.${FLIGHT_DECK_IFRAME_CLASS}`);
       const hasPriorSrc = Boolean(
@@ -10707,7 +10768,7 @@
     return drawerEl;
   }
 
-  // Mounts or updates the Flight Deck toggle button in the sidebar top bar
+  // Mounts or updates the Flight Deck (✈️) and Workbench (🛠️) toggle buttons in sidebar top bar
   function ensureFlightDeckToggle() {
     const sidebarEl = document.querySelector('[aria-label="Sidebar"]');
     const searchBtn =
@@ -10727,7 +10788,11 @@
       fdBtn.textContent = '✈️';
       bindHoverBubble(fdBtn, () => fdBtn.getAttribute('aria-label') || 'Flight Deck');
       bindActionBtnHandlers(fdBtn, () => {
-        setFlightDeckOpen(!flightDeckOpen);
+        if (flightDeckOpen && activeDrawerMode === 'flight-deck') {
+          setFlightDeckOpen(false);
+        } else {
+          setDrawerMode('flight-deck', true);
+        }
         const label = fdBtn.getAttribute('aria-label');
         if (label) {
           showActionPillBubble(fdBtn, label);
@@ -10744,10 +10809,44 @@
       }
     }
 
-    setAttrIfChanged(fdBtn, 'data-active', flightDeckOpen ? 'true' : 'false');
-    const fdLabel = flightDeckOpen ? 'Hide Flight Deck panel' : 'Open Flight Deck panel';
+    let wbBtn = mountParent.querySelector(`.${WORKBENCH_TOGGLE_BTN_CLASS}`);
+    if (!wbBtn) {
+      wbBtn = document.createElement('button');
+      wbBtn.type = 'button';
+      wbBtn.className = WORKBENCH_TOGGLE_BTN_CLASS;
+      wbBtn.setAttribute('data-testid', 'jetski-workbench-toggle-btn');
+      wbBtn.textContent = '🛠️';
+      bindHoverBubble(wbBtn, () => wbBtn.getAttribute('aria-label') || 'Workbench');
+      bindActionBtnHandlers(wbBtn, () => {
+        if (flightDeckOpen && activeDrawerMode === 'workbench') {
+          setFlightDeckOpen(false);
+        } else {
+          setDrawerMode('workbench', true);
+        }
+        const label = wbBtn.getAttribute('aria-label');
+        if (label) {
+          showActionPillBubble(wbBtn, label);
+        }
+      });
+
+      if (fdBtn.nextSibling) {
+        mountParent.insertBefore(wbBtn, fdBtn.nextSibling);
+      } else {
+        mountParent.appendChild(wbBtn);
+      }
+    }
+
+    const fdActive = flightDeckOpen && activeDrawerMode === 'flight-deck';
+    const wbActive = flightDeckOpen && activeDrawerMode === 'workbench';
+    setAttrIfChanged(fdBtn, 'data-active', fdActive ? 'true' : 'false');
+    const fdLabel = fdActive ? 'Hide Flight Deck panel' : 'Open Flight Deck panel';
     setAttrIfChanged(fdBtn, 'aria-label', fdLabel);
     setAttrIfChanged(fdBtn, 'title', fdLabel);
+
+    setAttrIfChanged(wbBtn, 'data-active', wbActive ? 'true' : 'false');
+    const wbLabel = wbActive ? 'Hide Workbench panel' : 'Open Workbench panel';
+    setAttrIfChanged(wbBtn, 'aria-label', wbLabel);
+    setAttrIfChanged(wbBtn, 'title', wbLabel);
   }
 
   // Synchronizes Flight Deck toggle button and embedded drawer panel
@@ -10756,7 +10855,7 @@
     ensureFlightDeckDrawer();
   }
 
-  // Handles postMessage events from the embedded Flight Deck dashboard
+  // Handles postMessage events from the embedded Flight Deck or Workbench dashboard
   function handleFlightDeckMessage(event) {
     const data = event?.data;
     if (!data || typeof data !== 'object') return;
@@ -10771,7 +10870,10 @@
       }
     } else if (data.type === 'jetski-flight-deck-close') {
       setFlightDeckOpen(false);
-    } else if (data.type === 'jetski-flight-deck-rendered') {
+    } else if (
+      data.type === 'jetski-flight-deck-rendered' ||
+      data.type === 'jetski-workbench-rendered'
+    ) {
       // Clear pending or target version state only when live uiVersion matches that exact version
       lastFlightDeckRenderedAt = Date.now();
       const ver = Number(data.uiVersion) || 0;
@@ -10794,6 +10896,8 @@
     ensureFlightDeckUI,
     isOpen: () => flightDeckOpen,
     setOpen: setFlightDeckOpen,
+    getMode: () => activeDrawerMode,
+    setMode: setDrawerMode,
     getWidth: () => flightDeckWidthPx,
     setWidth: (px) => {
       const drawerEl = document.getElementById(FLIGHT_DECK_DRAWER_ID);
@@ -14490,6 +14594,7 @@
       `.${PROJECT_ROADMAP_BADGE_CLASS}`,
       `.${SEARCH_BTN_CLASS}`,
       `.${TITLEBAR_FLIGHT_DECK_TOGGLE_BTN_CLASS}`,
+      `.${TITLEBAR_WORKBENCH_TOGGLE_BTN_CLASS}`,
       `.${LOCATE_BTN_CLASS}`,
       `#${SEARCH_PANEL_ID}`,
       `.${CHAIN_STARS_GROUP_CLASS}`,
@@ -14500,6 +14605,7 @@
       `.${TOP_NAV_TOGGLE_BTN_CLASS}`,
       `.${TOP_NAV_SETTINGS_BTN_CLASS}`,
       `.${FLIGHT_DECK_TOGGLE_BTN_CLASS}`,
+      `.${WORKBENCH_TOGGLE_BTN_CLASS}`,
       `.${TITLEBAR_REMINDER_BTN_CLASS}`,
       `.${INBOX_REMINDER_BTN_CLASS}`,
       `.${ROW_REMINDER_BTN_CLASS}`,

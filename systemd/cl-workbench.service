@@ -1,0 +1,20 @@
+[Unit]
+Description=Workbench Work-Centric & Obligation Tracker (:8090)
+After=network.target cl-flight-deck.service
+Wants=cl-flight-deck.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment="PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/google/home/jlavrova/.local/bin:/usr/local/google/home/jlavrova/depot_tools"
+Environment="HOME=/usr/local/google/home/jlavrova"
+Environment="USER=jlavrova"
+WorkingDirectory=%h/.gemini/config/workbench
+ExecStart=/usr/bin/python3 %h/.gemini/config/workbench/workbench_server.py --port 8090 --interval 60
+Restart=always
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
