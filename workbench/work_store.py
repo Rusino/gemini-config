@@ -112,6 +112,7 @@ def clean_work_title(raw_title: str) -> str:
     if pos != -1:
       text = text[:pos].strip()
   text = " ".join(text.splitlines()).strip()
+  text = re.sub(r"^//[0-9a-f\-]{36}\)\s*:\s*", "", text, flags=re.IGNORECASE)
   lower = text.lower()
   for pref in _STATE_TITLE_PREFIXES:
     if lower.startswith(pref):
@@ -152,7 +153,7 @@ def resolve_work_origin_and_title(
     except Exception:
       meta = {}
 
-  # Partition linked artifacts into human correspondence vs technical entities with creation timestamps
+  # Partition linked artifacts into human correspondence vs technical entities with timestamps
   correspondence_arts: list[tuple[float, dict[str, Any]]] = []
   other_arts: list[tuple[float, dict[str, Any]]] = []
   for a in w_arts:
@@ -288,7 +289,10 @@ def canonicalize_artifact_key(
       if ":" in rest:
         return f"github_pr:{rest}"
       return f"github_pr:flutter/flutter:{rest.lstrip('#')}"
-    if prefix in ("github_issue", "flutter_issue", "flutter"):
+    if prefix in ("github_issue", "flutter_issue", "flutter", "gh_issue"):
+      if "#" in rest:
+        num = rest.split("#")[-1].strip()
+        return f"github_issue:flutter/flutter:{num}"
       if ":" in rest:
         return f"github_issue:{rest}"
       return f"github_issue:flutter/flutter:{rest.lstrip('#')}"
@@ -366,6 +370,353 @@ def is_hub_artifact(
   ):
     return True
   return bool(st.get("is_hub"))
+
+
+_RE_COMMIT_FLUTTER_BUG = re.compile(
+    r"(?:github\.com/flutter/flutter/issues/|\bflutter#)(\d{4,7})\b",
+    re.IGNORECASE,
+)
+_RE_COMMIT_BUGANIZER = re.compile(
+    r"(?:(?:b\.corp\.google\.com|issues\.chromium\.org)/issues/"
+    r"|\b(?:b|crbug(?:\.com)?)/)(\d{7,10})\b",
+    re.IGNORECASE,
+)
+
+
+def extract_cl_bug_keys(state: Mapping[str, Any] | None) -> list[str]:
+  """Extracts canonical bug keys linked to a CL/PR via linked_bugs, bug_ids, or commit_message."""
+  st = state or {}
+  seen: dict[str, None] = {}
+  # Respect pre-normalized linked_bug_keys stored during cl_watcher_state ingestion
+  for k in st.get("linked_bug_keys") or []:
+    if k:
+      seen[canonicalize_artifact_key(str(k))] = None
+  # Parse structured linked_bugs entries from cl_watcher_state.json
+  for lb in st.get("linked_bugs") or []:
+    if not isinstance(lb, Mapping):
+      continue
+    raw_bk = str(lb.get("bug_key") or lb.get("short_id") or "").strip()
+    if not raw_bk:
+      continue
+    if "#" in raw_bk:
+      num = raw_bk.split("#")[-1].strip()
+      if num.isdigit():
+        seen[canonicalize_artifact_key("flutter_issue", num)] = None
+    elif ":" in raw_bk or "/" in raw_bk:
+      num = re.split(r"[:/]", raw_bk)[-1].strip()
+      if num.isdigit():
+        kind = "flutter_issue" if len(num) <= 6 else "buganizer"
+        seen[canonicalize_artifact_key(kind, num)] = None
+  # Parse legacy bug_ids list when present
+  for bid in st.get("bug_ids") or []:
+    b_str = str(bid).strip()
+    if b_str.isdigit():
+      kind = "flutter_issue" if len(b_str) <= 6 else "buganizer"
+      seen[canonicalize_artifact_key(kind, b_str)] = None
+  # Parse Bug: / Part of / Fixes URLs and shortlinks from commit_message
+  cm = str(st.get("commit_message") or "")
+  if cm:
+    for m in _RE_COMMIT_FLUTTER_BUG.finditer(cm):
+      seen[canonicalize_artifact_key("flutter_issue", m.group(1))] = None
+    for m in _RE_COMMIT_BUGANIZER.finditer(cm):
+      seen[canonicalize_artifact_key("buganizer", m.group(1))] = None
+  return list(seen.keys())
+
+
+def format_short_cl_id(
+    artifact_key: str, state: Mapping[str, Any] | None = None
+) -> str:
+  """Formats a compact human-readable CL/PR label with patchset number when known."""
+  st = state or {}
+  parts = str(artifact_key or "").split(":")
+  kind = parts[0] if parts else ""
+  tid = parts[-1] if parts else str(artifact_key or "")
+  ps = int(st.get("patchset") or 0)
+  ps_part = f" PS{ps}" if ps > 0 else ""
+  if kind == "gerrit":
+    if len(parts) >= 3 and parts[1] == "chromium":
+      return f"crrev/c/{tid}{ps_part}"
+    return f"Gerrit {tid}{ps_part}"
+  if kind == "github_pr":
+    return f"PR #{tid}{ps_part}"
+  if kind == "piper":
+    return f"cl/{tid}"
+  return f"{tid}{ps_part}"
+
+
+def format_short_bug_id(artifact_key: str) -> str:
+  """Formats a canonical bug artifact_key into flutter#<N> or b/<N>."""
+  parts = str(artifact_key or "").split(":")
+  tid = parts[-1] if parts else str(artifact_key or "")
+  if str(artifact_key or "").startswith("github_issue:"):
+    return f"flutter#{tid}"
+  if str(artifact_key or "").startswith("buganizer:"):
+    return f"b/{tid}"
+  return tid
+
+
+def build_work_checklist(
+    w_arts: list[dict[str, Any]],
+    art_rows: Mapping[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], str]:
+  """Builds the per-bug CL/PR pipeline checklist and obligation progress summary."""
+  draft_mentioned_keys: set[str] = set()
+  ordered_bug_keys: list[str] = []
+  has_draft = False
+
+  # Preserve the exact bug order from the active Gmail draft when one is attached
+  for a in w_arts:
+    if a.get("kind") != "gmail_draft":
+      continue
+    st = a.get("state") or {}
+    if str(st.get("status") or "DRAFT").upper() != "DRAFT":
+      continue
+    has_draft = True
+    for mk in st.get("mentioned_keys") or []:
+      ck = canonicalize_artifact_key(str(mk))
+      draft_mentioned_keys.add(ck)
+      if ck.startswith(("github_issue:", "buganizer:")) and ck not in ordered_bug_keys:
+        ordered_bug_keys.append(ck)
+    for bk in st.get("draft_bug_keys") or []:
+      ck = canonicalize_artifact_key(str(bk))
+      draft_mentioned_keys.add(ck)
+      if ck not in ordered_bug_keys:
+        ordered_bug_keys.append(ck)
+
+  # When no draft bug list is present, build the checklist from the Work's primary bugs
+  if not ordered_bug_keys:
+    for a in w_arts:
+      if a.get("role") != "primary":
+        continue
+      if a.get("kind") in ("buganizer", "github_issue"):
+        ck = str(a.get("artifact_key") or "")
+        if ck and ck not in ordered_bug_keys:
+          ordered_bug_keys.append(ck)
+
+  if not ordered_bug_keys or (len(ordered_bug_keys) == 1 and not has_draft):
+    return [], ""
+
+  bug_set = set(ordered_bug_keys)
+  # Collect candidate CL/PR artifacts from the Work and global artifact store matching these bugs
+  cand_cls: dict[str, dict[str, Any]] = {}
+  for a in w_arts:
+    if a.get("kind") in ("gerrit", "github_pr", "piper"):
+      cand_cls[str(a["artifact_key"])] = a
+  for akey, ar in art_rows.items():
+    if akey in cand_cls:
+      continue
+    kind = str(ar.get("kind") or artifact_kind_from_key(akey))
+    if kind not in ("gerrit", "github_pr", "piper"):
+      continue
+    st = ar.get("state") or {}
+    if set(extract_cl_bug_keys(st)) & bug_set:
+      cand_cls[akey] = {
+          "artifact_key": akey,
+          "kind": kind,
+          "title": str(ar.get("title") or akey),
+          "url": str(ar.get("url") or ""),
+          "state": st,
+      }
+
+  # Map each valid CL/PR to its bug(s), propagating stacked child CLs onto their parent's bug
+  cls_by_bug: dict[str, list[tuple[str, dict[str, Any], bool]]] = {
+      bk: [] for bk in ordered_bug_keys
+  }
+  parent_to_bug: dict[str, str] = {}
+  deferred_stacked: list[tuple[str, dict[str, Any], str]] = []
+  bug_titles_from_cls: dict[str, str] = {}
+  bug_status_from_cls: dict[str, str] = {}
+
+  for ckey, c_art in cand_cls.items():
+    st = c_art.get("state") or {}
+    if not st.get("status"):
+      continue
+    if is_hub_artifact(ckey, st):
+      continue
+    for lb in st.get("linked_bugs") or []:
+      if isinstance(lb, Mapping):
+        raw_bk = str(lb.get("bug_key") or lb.get("short_id") or "")
+        if "#" in raw_bk:
+          num = raw_bk.split("#")[-1].strip()
+          b_k = canonicalize_artifact_key("flutter_issue", num) if num.isdigit() else ""
+        else:
+          num = re.split(r"[:/]", raw_bk)[-1].strip()
+          b_k = (
+              canonicalize_artifact_key(
+                  "flutter_issue" if len(num) <= 6 else "buganizer", num
+              )
+              if num.isdigit()
+              else ""
+          )
+        if b_k:
+          if lb.get("title") and not bug_titles_from_cls.get(b_k):
+            bug_titles_from_cls[b_k] = str(lb["title"]).strip()
+          if lb.get("status") and not bug_status_from_cls.get(b_k):
+            bug_status_from_cls[b_k] = str(lb["status"]).strip()
+
+    b_keys = [bk for bk in extract_cl_bug_keys(st) if bk in bug_set]
+    if b_keys:
+      for bk in b_keys:
+        cls_by_bug[bk].append((ckey, c_art, False))
+        parent_to_bug[ckey] = bk
+    elif st.get("stack_parent_ikey"):
+      p_ckey = canonicalize_artifact_key(str(st.get("stack_parent_ikey")))
+      deferred_stacked.append((ckey, c_art, p_ckey))
+
+  for ckey, c_art, p_ckey in deferred_stacked:
+    target_bk = parent_to_bug.get(p_ckey)
+    if target_bk and all(x[0] != ckey for x in cls_by_bug[target_bk]):
+      cls_by_bug[target_bk].append((ckey, c_art, True))
+
+  checklist: list[dict[str, Any]] = []
+  n_rolled = 0
+  n_merged = 0
+  n_review = 0
+  n_wip = 0
+  n_conflict = 0
+  n_outdated = 0
+
+  for bk in ordered_bug_keys:
+    b_row = art_rows.get(bk) or {}
+    b_st = b_row.get("state") or {}
+    short_id = format_short_bug_id(bk)
+    raw_b_title = str(
+        b_st.get("bug_title")
+        or bug_titles_from_cls.get(bk)
+        or b_row.get("title")
+        or ""
+    ).strip()
+    # Strip leading short_id prefix ("flutter#160251: ") so short_id and description are distinct
+    for pref in (f"{short_id}:", f"{short_id} —", f"{short_id} -", short_id, bk):
+      if raw_b_title.lower().startswith(pref.lower()):
+        raw_b_title = raw_b_title[len(pref) :].lstrip(" :—–-").strip()
+        break
+    b_url = str(b_row.get("url") or "")
+    if not b_url:
+      tid = bk.split(":")[-1]
+      b_url = (
+          f"https://github.com/flutter/flutter/issues/{tid}"
+          if bk.startswith("github_issue:")
+          else f"https://issues.chromium.org/issues/{tid}"
+      )
+    b_status = str(b_st.get("status") or bug_status_from_cls.get(bk) or "").upper()
+
+    cl_items: list[dict[str, Any]] = []
+    for ckey, c_art, is_stacked in cls_by_bug.get(bk, []):
+      st = c_art.get("state") or {}
+      c_status = str(st.get("status") or "NEW").upper()
+      is_wip = bool(st.get("is_wip") or st.get("is_draft") or st.get("wip_label"))
+      default_wip = "Draft" if st.get("is_draft") else "WIP"
+      wip_lbl = str(st.get("wip_label") or default_wip) if is_wip else ""
+      est = st.get("entity_state") or {}
+      conflict = bool(st.get("merge_conflict") or est.get("status") == "conflict")
+      rolls = st.get("rolls") if isinstance(st.get("rolls"), Mapping) else {}
+      fl_roll = rolls.get("Flutter") if isinstance(rolls, Mapping) else None
+      rolled_fl = (
+          (bool(fl_roll) if isinstance(fl_roll, bool) else bool((fl_roll or {}).get("rolled")))
+          if ckey.startswith("gerrit:")
+          else (c_status == "MERGED")
+      )
+      in_draft = (not draft_mentioned_keys) or (ckey in draft_mentioned_keys)
+      upd = str(st.get("status_changed_et") or st.get("last_msg_et") or "")
+      age = str(st.get("status_changed_age") or st.get("last_msg_age") or "")
+      upd_label = f"{upd} ({age})" if (upd and age and age not in upd) else upd
+      cl_items.append({
+          "artifact_key": ckey,
+          "label": format_short_cl_id(ckey, st),
+          "url": str(c_art.get("url") or st.get("url") or ""),
+          "subject": str(st.get("subject") or c_art.get("title") or ckey),
+          "status": c_status,
+          "is_wip": is_wip,
+          "wip_label": wip_lbl,
+          "merge_conflict": conflict,
+          "cr_summary": str(st.get("cr_summary") or ""),
+          "reviewer_status": str(st.get("reviewer_status") or ""),
+          "assigned_reviewers_count": int(st.get("assigned_reviewers_count") or 0),
+          "rolled_flutter": rolled_fl,
+          "in_draft": in_draft,
+          "is_stacked": is_stacked,
+          "updated_et": upd_label,
+          "rolls": dict(rolls) if isinstance(rolls, Mapping) else {},
+      })
+
+    draft_outdated = bool(
+        has_draft
+        and draft_mentioned_keys
+        and cl_items
+        and any(not c["in_draft"] for c in cl_items)
+    )
+    if draft_outdated:
+      n_outdated += 1
+
+    if not cl_items:
+      stage = "no_cl"
+      stage_tone = "muted"
+      stage_label = "🔍 No CL linked yet"
+    elif all(c["rolled_flutter"] for c in cl_items):
+      stage = "rolled"
+      stage_tone = "ready"
+      stage_label = "🚀 Rolled into Flutter"
+      n_rolled += 1
+    elif all(c["status"] == "MERGED" for c in cl_items):
+      stage = "merged_waiting_roll"
+      stage_tone = "ok"
+      stage_label = "⏳ Merged · waiting Flutter roll"
+      n_merged += 1
+    else:
+      has_wip = any(c["is_wip"] for c in cl_items)
+      has_conflict = any(c["merge_conflict"] for c in cl_items)
+      if has_conflict:
+        n_conflict += 1
+      if has_wip:
+        stage = "wip"
+        stage_tone = "urgent" if has_conflict else "warn"
+        parts_s = ["📝 WIP"]
+        if has_conflict:
+          parts_s.append("⚠️ Conflict")
+        if all(c["assigned_reviewers_count"] == 0 for c in cl_items):
+          parts_s.append("No reviewers")
+        stage_label = " · ".join(parts_s)
+        n_wip += 1
+      elif has_conflict:
+        stage = "conflict"
+        stage_tone = "urgent"
+        cr_s = cl_items[0].get("cr_summary") or ""
+        cr_part = f" · CR {cr_s}" if cr_s and cr_s != "0" else ""
+        stage_label = f"⚠️ Conflict (needs rebase){cr_part}"
+      else:
+        stage = "review"
+        stage_tone = "wait"
+        rev_s = cl_items[0].get("reviewer_status") or ""
+        stage_label = f"👀 In review · {rev_s}" if rev_s else "👀 In review"
+        n_review += 1
+
+    checklist.append({
+        "bug_key": bk,
+        "short_id": short_id,
+        "title": raw_b_title,
+        "url": b_url,
+        "bug_status": b_status,
+        "stage": stage,
+        "stage_tone": stage_tone,
+        "stage_label": stage_label,
+        "draft_outdated": draft_outdated,
+        "cls": cl_items,
+    })
+
+  total = len(checklist)
+  prog_parts = [f"{n_rolled}/{total} rolled"]
+  if n_merged:
+    prog_parts.append(f"{n_merged} merged")
+  if n_review:
+    prog_parts.append(f"{n_review} in review")
+  if n_wip:
+    prog_parts.append(f"{n_wip} WIP")
+  if n_conflict:
+    prog_parts.append(f"{n_conflict} conflict" if n_conflict == 1 else f"{n_conflict} conflicts")
+  if n_outdated:
+    prog_parts.append(f"{n_outdated} not in draft")
+  return checklist, " · ".join(prog_parts)
 
 
 def _eval_single_predicate(
@@ -623,7 +974,8 @@ class WorkStore:
     with self._lock, self._connect() as conn:
       conn.execute(
           "INSERT OR REPLACE INTO works "
-          "(work_id, title, status, project_id, roadmap_item_key, created_at, updated_at, meta_json) "
+          "(work_id, title, status, project_id, roadmap_item_key, "
+          "created_at, updated_at, meta_json) "
           "VALUES (?, ?, 'active', ?, ?, ?, ?, ?)",
           (
               work_id,
@@ -647,18 +999,25 @@ class WorkStore:
   def find_work_by_artifact(
       self, artifact_key: str, roles: tuple[str, ...] = ("primary", "channel")
   ) -> str | None:
+    wids = self.find_all_works_by_artifact(artifact_key, roles=roles)
+    return wids[0] if wids else None
+
+  def find_all_works_by_artifact(
+      self, artifact_key: str, roles: tuple[str, ...] = ("primary", "channel")
+  ) -> list[str]:
+    """Returns all active work_ids linked to artifact_key with any of the given roles."""
     akey = canonicalize_artifact_key(artifact_key)
     placeholders = ",".join("?" for _ in roles)
     with self._lock, self._connect() as conn:
-      row = conn.execute(
+      rows = conn.execute(
           f"SELECT wl.work_id FROM work_links wl "
           f"JOIN works w ON w.work_id = wl.work_id "
           f"WHERE wl.artifact_key = ? AND wl.role IN ({placeholders}) "
           f"AND w.status NOT IN ('done', 'archived') "
-          f"ORDER BY w.updated_at DESC LIMIT 1",
+          f"ORDER BY w.updated_at DESC",
           (akey, *roles),
-      ).fetchone()
-      return str(row["work_id"]) if row else None
+      ).fetchall()
+      return [str(r["work_id"]) for r in rows]
 
   def get_artifact(self, artifact_key: str) -> dict[str, Any] | None:
     akey = canonicalize_artifact_key(artifact_key)
@@ -757,7 +1116,8 @@ class WorkStore:
         merged_state.update(dict(state))
       conn.execute(
           "INSERT OR REPLACE INTO candidate_buffer "
-          "(artifact_key, kind, title, url, chat_chain_id, first_seen_at, last_seen_at, state_json) "
+          "(artifact_key, kind, title, url, chat_chain_id, "
+          "first_seen_at, last_seen_at, state_json) "
           "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
           (
               akey,
@@ -929,6 +1289,117 @@ class WorkStore:
       )
     self.evaluate_all_obligations(now=cur_now)
     return obligation_id
+
+  def replace_draft_obligation(
+      self,
+      work_id: str,
+      draft_key: str,
+      description: str,
+      trigger_expr: str,
+      done_matcher: str = "",
+      now: float | None = None,
+  ) -> str:
+    """Replaces stale per-CL auto obligations on a draft with one consolidated obligation."""
+    cur_now = time.time() if now is None else now
+    tkey = canonicalize_artifact_key(draft_key)
+    did_short = hashlib.sha1(f"{work_id}:{tkey}".encode("utf-8")).hexdigest()[:10]
+    ob_id = f"ob-draft-{did_short}"
+    with self._lock, self._connect() as conn:
+      # Remove legacy duplicate auto obligations targeting the same draft in this Work
+      conn.execute(
+          "DELETE FROM obligations "
+          "WHERE work_id = ? AND target_artifact_key = ? "
+          "AND obligation_id != ? AND status != 'done'",
+          (work_id, tkey, ob_id),
+      )
+      existing = conn.execute(
+          "SELECT status, created_at FROM obligations WHERE obligation_id = ?",
+          (ob_id,),
+      ).fetchone()
+      if existing and existing["status"] == "done":
+        return ob_id
+      created_ts = float(existing["created_at"]) if existing else cur_now
+      conn.execute(
+          "INSERT OR REPLACE INTO obligations "
+          "(obligation_id, work_id, target_artifact_key, kind, description, "
+          "trigger_expr, done_matcher, status, last_eval, created_at, satisfied_at) "
+          "VALUES (?, ?, ?, 'reply', ?, ?, ?, 'open', 'unknown', ?, 0)",
+          (
+              ob_id,
+              work_id,
+              tkey,
+              description.strip(),
+              trigger_expr.strip() or "always",
+              done_matcher.strip() or f"reply_sent({tkey})",
+              created_ts,
+          ),
+      )
+    self.evaluate_all_obligations(now=cur_now)
+    return ob_id
+
+  def reconcile_work_bug_cls(
+      self, work_id: str, now: float | None = None
+  ) -> list[str]:
+    """Links any stored non-hub CL/PR fixing a primary/draft bug of work_id onto work_id."""
+    cur_now = time.time() if now is None else now
+    with self._lock, self._connect() as conn:
+      wl_rows = conn.execute(
+          "SELECT artifact_key, role FROM work_links WHERE work_id = ?",
+          (work_id,),
+      ).fetchall()
+      art_rows = {
+          str(r["artifact_key"]): dict(r)
+          for r in conn.execute("SELECT * FROM artifacts").fetchall()
+      }
+
+    bug_keys: set[str] = set()
+    linked_cls: set[str] = set()
+    for r in wl_rows:
+      akey = str(r["artifact_key"])
+      role = str(r["role"])
+      if role == "primary" and akey.startswith(("github_issue:", "buganizer:")):
+        bug_keys.add(akey)
+      elif akey.startswith(("gerrit:", "github_pr:", "piper:")):
+        linked_cls.add(akey)
+      elif akey.startswith("gmail_draft:"):
+        ar = art_rows.get(akey) or {}
+        try:
+          st = json.loads(ar.get("state_json") or "{}")
+        except Exception:
+          st = {}
+        for bk in st.get("draft_bug_keys") or []:
+          bug_keys.add(canonicalize_artifact_key(str(bk)))
+
+    if not bug_keys:
+      return []
+
+    newly_linked: list[str] = []
+    # Match direct bug-fixing CLs first, then stacked child CLs whose parent matched
+    for pass_num in (0, 1):
+      for akey, ar in art_rows.items():
+        if not akey.startswith(("gerrit:", "github_pr:", "piper:")):
+          continue
+        try:
+          st = json.loads(ar.get("state_json") or "{}")
+        except Exception:
+          st = {}
+        if not st.get("status") or is_hub_artifact(akey, st):
+          continue
+        if pass_num == 0:
+          c_bugs = set(extract_cl_bug_keys(st))
+          if c_bugs & bug_keys:
+            self.link_artifact(work_id, akey, role="primary", source="auto", now=cur_now)
+            linked_cls.add(akey)
+            newly_linked.append(akey)
+        else:
+          p_raw = str(st.get("stack_parent_ikey") or "").strip()
+          if p_raw:
+            p_ckey = canonicalize_artifact_key(p_raw)
+            if p_ckey in linked_cls:
+              self.link_artifact(work_id, akey, role="primary", source="auto", now=cur_now)
+              linked_cls.add(akey)
+              newly_linked.append(akey)
+    return newly_linked
 
   def mark_obligation_done(
       self, obligation_id: str, now: float | None = None
@@ -1186,7 +1657,11 @@ class WorkStore:
       return "blocked", ["Blocked"]
 
     reasons: list[str] = []
+    gated_draft_keys: set[str] = set()
     for ob in obligations:
+      t_key = str(ob.get("target_artifact_key") or "")
+      if ob.get("status") == "open" and t_key.startswith("gmail_draft:"):
+        gated_draft_keys.add(t_key)
       if ob.get("status") == "ready":
         reasons.append(f"🔔 Ready: {ob.get('description')}")
       elif ob.get("stalled_alert"):
@@ -1195,18 +1670,35 @@ class WorkStore:
     for art in artifacts:
       if art.get("role") == "context_only":
         continue
+      akey = str(art.get("artifact_key") or "")
       kind = str(art.get("kind") or "")
       st = art.get("state") or {}
       if kind == "gmail_draft" and str(st.get("status") or "DRAFT").upper() == "DRAFT":
-        reasons.append(f"📝 Unsent draft: {art.get('title')}")
+        # Drafts gated by an open obligation are parked until the trigger becomes ready
+        if akey not in gated_draft_keys:
+          reasons.append(f"📝 Unsent draft: {art.get('title')}")
       elif kind in ("gmail_thread", "gchat_thread") and bool(st.get("unanswered_human")):
         reasons.append(f"📨 Unanswered message: {art.get('title')}")
       elif kind == "chat_chain" and str(st.get("bucket") or "") == "needs-me":
         reasons.append(f"🤖 Chat waiting on you: {art.get('title')}")
       elif kind in ("gerrit", "github_pr", "piper", "buganizer", "github_issue"):
         est = st.get("entity_state") or {}
-        if est.get("category") == "needs_me" or bool(est.get("action_required")):
-          reasons.append(str(est.get("reason") or f"Needs action: {art.get('title')}"))
+        is_wip = bool(st.get("is_wip") or st.get("is_draft") or st.get("wip_label"))
+        needs_you = (
+            est.get("category") == "needs_me"
+            or bool(est.get("action_required"))
+            or est.get("lane") == "you"
+            or (not is_wip and bool(st.get("merge_conflict")))
+        )
+        if needs_you:
+          short_cl = format_short_cl_id(akey, st)
+          if st.get("merge_conflict") or est.get("status") == "conflict":
+            reasons.append(f"⚠️ Merge conflict: {short_cl}")
+          elif est.get("reason"):
+            reasons.append(str(est.get("reason")))
+          else:
+            spine = (est.get("spine_short_state") or {}).get("short") or "Needs action"
+            reasons.append(f"{spine}: {short_cl}")
 
     if reasons:
       return "needs-you", reasons
@@ -1217,7 +1709,7 @@ class WorkStore:
         for a in artifacts
         if a.get("role") != "context_only"
         and a.get("kind") in ("gerrit", "github_pr", "piper")
-        and str((a.get("state") or {}).get("status") or "NEW").upper() == "NEW"
+        and str((a.get("state") or {}).get("status") or "NEW").upper() in ("NEW", "OPEN")
     ]
     open_bugs = [
         a
@@ -1238,7 +1730,9 @@ class WorkStore:
 
     wait_reasons: list[str] = []
     for ob in open_obs:
-      wait_reasons.append(f"⏳ Waiting: {ob.get('description')} ({ob.get('trigger_expr')})")
+      prog = str(ob.get("progress_summary") or "")
+      prog_suffix = f" ({prog})" if prog else ""
+      wait_reasons.append(f"⏳ Parked: {ob.get('description')}{prog_suffix}")
     if not wait_reasons:
       wait_reasons.append("In progress / waiting on external actors")
     return "waiting", wait_reasons
@@ -1331,6 +1825,11 @@ class WorkStore:
             "state": ar.get("state") or {},
         })
       w_obs = obs_by_work.get(wid, [])
+      checklist, prog_summary = build_work_checklist(w_arts, art_rows)
+      if prog_summary:
+        for ob in w_obs:
+          if ob.get("status") != "done":
+            ob["progress_summary"] = prog_summary
       # Resolve causal origin and upgrade downstream/placeholder work titles
       resolved_title, origin_info = resolve_work_origin_and_title(w, w_arts)
       if resolved_title and resolved_title != str(w["title"]):
@@ -1349,6 +1848,7 @@ class WorkStore:
           "updated_et": format_et_timestamp(float(w.get("updated_at") or cur_now)),
           "is_virtual": False,
           "is_multi_channel": len(kinds_seen) >= 2 or len(w_arts) >= 2 or len(w_obs) >= 1,
+          "checklist": checklist,
           "artifacts": w_arts,
           "obligations": w_obs,
       })

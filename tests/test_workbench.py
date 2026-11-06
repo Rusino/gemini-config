@@ -233,11 +233,24 @@ class TestWorkbenchContracts(unittest.TestCase):
     works = [w for w in proj["works"] if w["work_id"] == w1]
     self.assertEqual(len(works), 1)
     card = works[0]
-    # Unsent draft puts the work in needs-you, and the merged CL remains visible in artifacts
-    self.assertEqual(card["lane"], "needs-you")
+    # While obligation is open (not ready), draft is parked -> lane is 'waiting' (not 'done')
+    self.assertEqual(card["lane"], "waiting")
     art_keys = [a["artifact_key"] for a in card["artifacts"]]
     self.assertIn(cl_key, art_keys)
     self.assertIn(draft_key, art_keys)
+
+    # Once the roll into Flutter completes, obligation becomes 'ready' -> lane is 'needs-you'
+    store.upsert_artifact(
+        cl_key,
+        kind="gerrit",
+        title="Fix getRectsForRange empty lines",
+        url="https://skia-review.googlesource.com/c/skia/+/1414016",
+        state={"status": "MERGED", "rolls": {"Flutter": {"rolled": True}}},
+        now=now + 60,
+    )
+    proj_ready = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now + 60)
+    card_ready = [w for w in proj_ready["works"] if w["work_id"] == w1][0]
+    self.assertEqual(card_ready["lane"], "needs-you")
 
   def test_read_vs_write_ingestion_and_single_thread_channel_rule(self) -> None:
     import ingestor
@@ -535,6 +548,278 @@ class TestWorkbenchContracts(unittest.TestCase):
     self.assertIn("--surface: #ffffff;", html)
     self.assertIn("wb-origin", html)
     self.assertIn("Fixed bugs in Flutter — Renzo Olivares", html)
+
+  def test_renzo_five_bugs_checklist_and_consolidated_draft_obligation(self) -> None:
+    import base64
+    from unittest import mock
+    import ingestor
+    import work_store
+    import workbench_server
+
+    now = 1762450000.0
+    store = work_store.WorkStore(self.db_path)
+
+    cl_state = {
+        "items": {
+            "gerrit:1404137@c1": {
+                "item_key": "gerrit:1404137",
+                "kind": "gerrit",
+                "target_id": "1404137",
+                "host": "skia-review.googlesource.com",
+                "status": "NEW",
+                "patchset": 9,
+                "is_wip": False,
+                "merge_conflict": True,
+                "cr_summary": "+1",
+                "reviewer_status": "Ready to submit",
+                "assigned_reviewers_count": 2,
+                "subject": "[skparagraph] Do not letter-space default-ignorable clusters",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1404137",
+                "linked_bugs": [{
+                    "bug_key": "gh_issue:flutter/flutter#160251",
+                    "short_id": "flutter#160251",
+                    "title": "Zero-width character (\\u200b) does not have zero-width",
+                    "status": "OPEN",
+                    "url": "https://github.com/flutter/flutter/issues/160251",
+                }],
+                "entity_state": {
+                    "status": "conflict",
+                    "lane": "you",
+                    "spine_short_state": {"short": "Conflict", "icon": "⚠️"},
+                },
+            },
+            "gerrit:1414016@c2": {
+                "item_key": "gerrit:1414016",
+                "kind": "gerrit",
+                "target_id": "1414016",
+                "host": "skia-review.googlesource.com",
+                "status": "NEW",
+                "patchset": 1,
+                "is_wip": False,
+                "merge_conflict": False,
+                "cr_summary": "+1 (1/2)",
+                "reviewer_status": "Needs +1 CR (1/2 approved)",
+                "assigned_reviewers_count": 2,
+                "subject": "[skparagraph] Measure the hit glyph with its own justification shift",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1414016",
+                "stack_ikeys": ["gerrit:1414016", "gerrit:1414017"],
+                "linked_bugs": [{
+                    "bug_key": "gh_issue:flutter/flutter#155062",
+                    "short_id": "flutter#155062",
+                    "title": "TextPainter.getPositionForOffset doesn't return correct text position",
+                    "status": "CLOSED",
+                    "url": "https://github.com/flutter/flutter/issues/155062",
+                }],
+                "entity_state": {"status": "waiting", "lane": "waiting"},
+            },
+            "gerrit:1414017@c2": {
+                "item_key": "gerrit:1414017",
+                "kind": "gerrit",
+                "target_id": "1414017",
+                "host": "skia-review.googlesource.com",
+                "status": "NEW",
+                "patchset": 1,
+                "is_wip": False,
+                "merge_conflict": False,
+                "cr_summary": "+1 (1/2)",
+                "reviewer_status": "Needs +1 CR (1/2 approved)",
+                "assigned_reviewers_count": 2,
+                "subject": "[skparagraph] Shift the trailing space of an RTL run when justifying",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1414017",
+                "stack_parent_ikey": "gerrit:1414016",
+                "stack_ikeys": ["gerrit:1414016", "gerrit:1414017"],
+                "linked_bugs": [{
+                    "bug_key": "gh_issue:flutter/flutter#84030",
+                    "short_id": "flutter#84030",
+                    "title": "",
+                    "status": "OPEN",
+                    "url": "https://github.com/flutter/flutter/issues/84030",
+                }],
+                "entity_state": {"status": "waiting", "lane": "waiting"},
+            },
+            "gerrit:1420016@c3": {
+                "item_key": "gerrit:1420016",
+                "kind": "gerrit",
+                "target_id": "1420016",
+                "host": "skia-review.googlesource.com",
+                "status": "NEW",
+                "patchset": 5,
+                "is_wip": True,
+                "wip_label": "WIP",
+                "merge_conflict": True,
+                "cr_summary": "0",
+                "reviewer_status": "No reviewers assigned",
+                "assigned_reviewers_count": 0,
+                "subject": "[skparagraph] Unify span background height across fallback runs",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1420016",
+                "commit_message": "Part of https://github.com/flutter/flutter/issues/40936",
+                "entity_state": {"status": "draft", "lane": "desk"},
+            },
+            "github:196137@c3": {
+                "item_key": "github:196137",
+                "kind": "github",
+                "target_id": "196137",
+                "status": "OPEN",
+                "patchset": 1,
+                "is_wip": True,
+                "is_draft": True,
+                "wip_label": "Draft",
+                "merge_conflict": False,
+                "cr_summary": "0 rev",
+                "reviewer_status": "No reviewers assigned",
+                "assigned_reviewers_count": 0,
+                "subject": "Reuse matching PaintIDs in ParagraphBuilderSkia::CreatePaintID",
+                "url": "https://github.com/flutter/flutter/pull/196137",
+                "commit_message": "Fixes https://github.com/flutter/flutter/issues/40936",
+                "entity_state": {"status": "draft", "lane": "desk"},
+            },
+            "gerrit:1417037@c4": {
+                "item_key": "gerrit:1417037",
+                "kind": "gerrit",
+                "target_id": "1417037",
+                "host": "skia-review.googlesource.com",
+                "status": "NEW",
+                "patchset": 4,
+                "is_wip": True,
+                "wip_label": "WIP",
+                "merge_conflict": False,
+                "cr_summary": "0",
+                "reviewer_status": "No reviewers assigned",
+                "assigned_reviewers_count": 0,
+                "subject": "[skparagraph] Split TrueType composite glyphs across foreground styles",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1417037",
+                "linked_bugs": [{
+                    "bug_key": "gh_issue:flutter/flutter#141080",
+                    "short_id": "flutter#141080",
+                    "title": "Cannot properly apply colour to individual characters in Text.rich",
+                    "status": "OPEN",
+                    "url": "https://github.com/flutter/flutter/issues/141080",
+                }],
+                "entity_state": {"status": "draft", "lane": "desk"},
+            },
+            "gerrit:1418478@c5": {
+                "item_key": "gerrit:1418478",
+                "kind": "gerrit",
+                "target_id": "1418478",
+                "host": "skia-review.googlesource.com",
+                "status": "NEW",
+                "patchset": 6,
+                "is_wip": True,
+                "wip_label": "WIP",
+                "merge_conflict": True,
+                "cr_summary": "0",
+                "reviewer_status": "No reviewers assigned",
+                "assigned_reviewers_count": 0,
+                "subject": "[skparagraph] Keep signed span advance and cursive ligatures across styles",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1418478",
+                "commit_message": "Bug: https://github.com/flutter/flutter/issues/110875",
+                "entity_state": {"status": "draft", "lane": "desk"},
+            },
+        },
+        "bugs": {},
+    }
+
+    ingestor.ingest_cl_watcher_state(store, cl_state, now=now)
+
+    draft_html = """<div dir="ltr"><p>Hi Renzo,</p>
+    <ol>
+      <li><b><a href="https://github.com/flutter/flutter/issues/160251">#160251</a> — <i>Zero-width character (\\u200b) does not have zero-width</i></b> (<a href="https://skia-review.googlesource.com/c/skia/+/1404137">CL 1404137</a>)</li>
+      <li><b><a href="https://github.com/flutter/flutter/issues/155062">#155062</a> — <i>TextPainter.getPositionForOffset doesn't return correct text position</i></b> (<a href="https://skia-review.googlesource.com/c/skia/+/1414016">CL 1414016</a>, stacked with <a href="https://skia-review.googlesource.com/c/skia/+/1414017">CL 1414017</a>)</li>
+      <li><b><a href="https://github.com/flutter/flutter/issues/40936">#40936</a> — <i>TextSpan backgroundColor with special Arabic character are not displayed correctly</i></b> (Fix in progress)</li>
+      <li><b><a href="https://github.com/flutter/flutter/issues/141080">#141080</a> — <i>Cannot properly apply colour to individual characters in Text.rich</i></b> (<a href="https://skia-review.googlesource.com/c/skia/+/1417037">CL 1417037</a>)</li>
+      <li><b><a href="https://github.com/flutter/flutter/issues/110875">#110875</a> — <i>Arabic text having duplicate letters when having different color in RichText</i></b> (Investigation in progress, comparing with <a href="https://skia-review.googlesource.com/c/skia/+/1417037">CL 1417037</a>)</li>
+    </ol></div>"""
+    b64_body = base64.urlsafe_b64encode(draft_html.encode("utf-8")).decode("ascii")
+
+    def fake_run(cmd, *args, **kwargs):
+      del args, kwargs
+      res = subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+      if "drafts" in cmd:
+        res.stdout = json.dumps({"drafts": [{"id": "r2068112471352956917", "threadId": "1a13c69d14fe1c3d"}]})
+      elif "get-draft" in cmd:
+        res.stdout = json.dumps({
+            "id": "r2068112471352956917",
+            "message": {
+                "threadId": "1a13c69d14fe1c3d",
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "Re: Fixed bugs in Flutter"},
+                        {"name": "To", "value": "Renzo Olivares <roliv@google.com>"},
+                    ],
+                    "body": {"data": b64_body},
+                },
+            },
+        })
+      elif "get-thread" in cmd:
+        res.stdout = json.dumps({
+            "messages": [{
+                "internalDate": "1760538903000",
+                "snippet": "Hi Renzo, fixed bugs list",
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "Fixed bugs in Flutter"},
+                        {"name": "From", "value": "Julia Lavrova <jlavrova@google.com>"},
+                        {"name": "To", "value": "Renzo Olivares <roliv@google.com>"},
+                    ]
+                },
+            }]
+        })
+      elif "search" in cmd:
+        res.stdout = json.dumps({"messages": []})
+      return res
+
+    with mock.patch("os.path.isfile", return_value=True), mock.patch("subprocess.run", side_effect=fake_run):
+      ingestor.ingest_gmail_drafts_and_threads(store, {}, now=now)
+
+    proj = store.build_dashboard_projection(cl_watcher_state=cl_state, now=now)
+    renzo_cards = [w for w in proj["works"] if "Fixed bugs in Flutter" in w["title"]]
+    self.assertEqual(len(renzo_cards), 1)
+    card = renzo_cards[0]
+
+    # 1. Single consolidated obligation instead of 4 per-CL obligations
+    open_obs = [o for o in card["obligations"] if o["status"] != "done"]
+    self.assertEqual(len(open_obs), 1)
+    self.assertIn("progress_summary", open_obs[0])
+
+    # 2. All 5 bugs appear in card["checklist"] in draft order with their mapped CLs
+    checklist = card.get("checklist") or []
+    self.assertEqual(
+        [item["short_id"] for item in checklist],
+        ["flutter#160251", "flutter#155062", "flutter#40936", "flutter#141080", "flutter#110875"],
+    )
+    by_bug = {item["short_id"]: item for item in checklist}
+    self.assertEqual([c["artifact_key"] for c in by_bug["flutter#160251"]["cls"]], ["gerrit:skia:1404137"])
+    self.assertEqual(by_bug["flutter#160251"]["stage"], "conflict")
+    self.assertFalse(by_bug["flutter#160251"]["draft_outdated"])
+
+    self.assertEqual(
+        [c["artifact_key"] for c in by_bug["flutter#155062"]["cls"]],
+        ["gerrit:skia:1414016", "gerrit:skia:1414017"],
+    )
+    self.assertEqual(by_bug["flutter#155062"]["stage"], "review")
+    self.assertFalse(by_bug["flutter#155062"]["draft_outdated"])
+
+    self.assertCountEqual(
+        [c["artifact_key"] for c in by_bug["flutter#40936"]["cls"]],
+        ["gerrit:skia:1420016", "github_pr:flutter/flutter:196137"],
+    )
+    self.assertTrue(by_bug["flutter#40936"]["draft_outdated"])
+
+    self.assertEqual([c["artifact_key"] for c in by_bug["flutter#141080"]["cls"]], ["gerrit:skia:1417037"])
+    self.assertEqual(by_bug["flutter#141080"]["stage"], "wip")
+    self.assertFalse(by_bug["flutter#141080"]["draft_outdated"])
+
+    self.assertEqual([c["artifact_key"] for c in by_bug["flutter#110875"]["cls"]], ["gerrit:skia:1418478"])
+    self.assertTrue(by_bug["flutter#110875"]["draft_outdated"])
+
+    # 3. Lane is 'needs-you' due to Gerrit 1404137 conflict (not due to parked draft)
+    self.assertEqual(card["lane"], "needs-you")
+    self.assertTrue(any("1404137" in r for r in card["reasons"]))
+    self.assertFalse(any("Unsent draft" in r for r in card["reasons"]))
+
+    html = workbench_server.render_workbench_html(proj, 1)
+    self.assertIn("wb-checklist", html)
+    self.assertNotIn("eval:false", html)
 
 
 if __name__ == "__main__":

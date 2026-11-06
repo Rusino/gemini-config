@@ -110,24 +110,72 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
         if origin.get("label")
         else ""
     )
-    obs_html = "".join(
-        f'<div class="wb-ob" data-eval="{_esc(ob.get("last_eval"))}">'
-        f'<span>🔔 {_esc(ob.get("description"))}</span>'
-        f'<code class="wb-trig">{_esc(ob.get("trigger_expr"))}</code>'
-        f"</div>"
-        for ob in (w.get("obligations") or [])
-        if ob.get("status") != "done"
+    obs_parts: list[str] = []
+    for ob in w.get("obligations") or []:
+      if ob.get("status") == "done":
+        continue
+      prog = _esc(ob.get("progress_summary") or "")
+      prog_html = f'<span class="wb-ob-prog">{prog}</span>' if prog else ""
+      obs_parts.append(
+          f'<div class="wb-ob" data-status="{_esc(ob.get("status"))}">'
+          f'<span>🔔 {_esc(ob.get("description"))}</span>{prog_html}'
+          f"</div>"
+      )
+    obs_html = "".join(obs_parts)
+    chk_items = w.get("checklist") or []
+    chk_covered: set[str] = set()
+    chk_rows_ssr: list[str] = []
+    for item in chk_items:
+      chk_covered.add(str(item.get("bug_key") or ""))
+      cl_chips: list[str] = []
+      for c in item.get("cls") or []:
+        chk_covered.add(str(c.get("artifact_key") or ""))
+        cl_chips.append(
+            f'<a class="wb-cl-chip" href="{_esc(c.get("url") or "#")}" '
+            f'target="_blank" rel="noopener">{_esc(c.get("label"))}</a>'
+        )
+      cls_ssr = (
+          f'<div class="wb-chk-cls">{"".join(cl_chips)}</div>' if cl_chips else ""
+      )
+      outdated_ssr = (
+          '<span class="wb-draft-warn">📝 Not in draft yet</span>'
+          if item.get("draft_outdated")
+          else ""
+      )
+      chk_rows_ssr.append(
+          f'<div class="wb-chk-row" data-stage="{_esc(item.get("stage"))}">'
+          f'<div class="wb-chk-top">'
+          f'<a class="wb-bug-id" href="{_esc(item.get("url") or "#")}" '
+          f'target="_blank" rel="noopener">🐛 {_esc(item.get("short_id"))}</a>'
+          f'<span class="wb-bug-title">{_esc(item.get("title"))}</span>'
+          f'<span class="wb-stage-badge" '
+          f'data-tone="{_esc(item.get("stage_tone"))}">'
+          f'{_esc(item.get("stage_label"))}</span>'
+          f"{outdated_ssr}</div>{cls_ssr}</div>"
+      )
+    chk_html = (
+        f'<div class="wb-checklist">{"".join(chk_rows_ssr)}</div>'
+        if chk_rows_ssr
+        else ""
     )
+    has_chk = bool(chk_rows_ssr)
     pills_html = "".join(
         f'<span class="wb-pill" data-kind="{_esc(a.get("kind"))}">'
         f'{_esc(a.get("icon"))} {_esc(a.get("title"))}</span>'
         for a in (w.get("artifacts") or [])
+        if str(a.get("artifact_key") or "") not in chk_covered
+        and (
+            not has_chk
+            or a.get("kind")
+            in ("gmail_thread", "gmail_draft", "gchat_thread", "gdoc", "chat_chain")
+        )
     )
     cards_ssr.append(
         f'<article class="wb-card" data-work-id="{wid}" data-lane="{lane}">'
         f'<div class="wb-card-hdr"><span class="wb-lane-tag">{lane}</span>'
         f'<strong class="wb-card-title">{title}</strong>{origin_ssr}</div>'
-        f"{obs_html}<div class='wb-pills'>{pills_html}</div></article>"
+        f"{obs_html}{chk_html}"
+        f"<div class='wb-pills'>{pills_html}</div></article>"
     )
   ssr_body = "\n".join(cards_ssr)
   precision_pct = int(round(float(metrics.get("link_precision", 1.0)) * 100))
@@ -479,14 +527,135 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     background: #fff2f1;
     border-color: rgba(255, 59, 48, 0.35);
   }}
-  .wb-trig {{
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 10px;
-    color: #4b5563;
-    background: #f1f5f9;
-    border: 1px solid #e2e8f0;
-    padding: 1px 5px;
+  .wb-ob-prog {{
+    font-size: 10.5px;
+    font-weight: 600;
+    color: var(--accent);
+    background: #eff6ff;
+    border: 1px solid rgba(0, 113, 227, 0.22);
+    padding: 1px 6px;
+    border-radius: 999px;
+    margin-left: 6px;
+    white-space: nowrap;
+  }}
+  .wb-checklist {{
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: #fcfcfd;
+    overflow: hidden;
+  }}
+  .wb-chk-row {{
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 6px 8px;
+    border-top: 1px solid var(--border);
+  }}
+  .wb-chk-row:first-child {{
+    border-top: none;
+  }}
+  .wb-chk-top {{
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }}
+  .wb-bug-id {{
+    font-weight: 600;
+    font-size: 11.5px;
+    color: var(--accent);
+    text-decoration: none;
+    white-space: nowrap;
+  }}
+  .wb-bug-id:hover {{
+    text-decoration: underline;
+  }}
+  .wb-bug-title {{
+    font-size: 11.5px;
+    color: var(--text);
+    flex: 1;
+    min-width: 140px;
+  }}
+  .wb-stage-badge {{
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 6px;
     border-radius: 4px;
+    font-size: 10.5px;
+    font-weight: 600;
+    white-space: nowrap;
+  }}
+  .wb-stage-badge[data-tone="ready"] {{
+    background: #dcfce7;
+    color: var(--ready);
+    border: 1px solid rgba(21, 128, 61, 0.25);
+  }}
+  .wb-stage-badge[data-tone="ok"] {{
+    background: #e0f2fe;
+    color: #0369a1;
+    border: 1px solid rgba(3, 105, 161, 0.25);
+  }}
+  .wb-stage-badge[data-tone="wait"] {{
+    background: #eff6ff;
+    color: var(--accent);
+    border: 1px solid rgba(0, 113, 227, 0.22);
+  }}
+  .wb-stage-badge[data-tone="warn"] {{
+    background: #fffbeb;
+    color: var(--warn);
+    border: 1px solid rgba(180, 83, 9, 0.25);
+  }}
+  .wb-stage-badge[data-tone="urgent"] {{
+    background: #fff2f1;
+    color: var(--urgent);
+    border: 1px solid rgba(255, 59, 48, 0.25);
+  }}
+  .wb-stage-badge[data-tone="muted"] {{
+    background: #f5f5f7;
+    color: var(--muted);
+    border: 1px solid var(--border);
+  }}
+  .wb-draft-warn {{
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 600;
+    background: #fffbeb;
+    color: var(--warn);
+    border: 1px dashed rgba(180, 83, 9, 0.45);
+    white-space: nowrap;
+  }}
+  .wb-chk-cls {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    padding-left: 16px;
+  }}
+  .wb-cl-chip {{
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 6px;
+    border-radius: 5px;
+    background: #ffffff;
+    border: 1px solid var(--border);
+    color: var(--text);
+    text-decoration: none;
+    font-size: 11px;
+  }}
+  .wb-cl-chip:hover {{
+    border-color: rgba(0, 113, 227, 0.45);
+    background: #eff6ff;
+  }}
+  .wb-cl-tag {{
+    font-size: 9.5px;
+    padding: 0 4px;
+    border-radius: 3px;
+    font-weight: 600;
   }}
   .wb-pills {{
     display: flex;
@@ -797,21 +966,103 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       const reasonsHtml = (w.reasons || []).map((r) => `<span>${{esc(r)}}</span>`).join(' · ');
 
       const obsHtml = openObs.map((o) => {{
+        const isDraftOb = String(o.target_artifact_key || '').startsWith('gmail_draft:');
+        const waitTag = isDraftOb
+          ? '<span style="color:var(--accent);font-weight:600">⏳ Parked draft</span>'
+          : '<span style="color:var(--accent);font-weight:600">⏳ Waiting</span>';
         const statusTag = o.status === 'ready'
-          ? '<strong style="color:var(--ready)">READY</strong>'
-          : (o.stalled_alert ? '<strong style="color:var(--urgent)">STALLED &gt;7d</strong>' : `<span style="color:var(--warn)">eval:${{esc(o.last_eval)}}</span>`);
+          ? '<strong style="color:var(--ready)">🔔 READY</strong>'
+          : (o.stalled_alert
+              ? '<strong style="color:var(--urgent)">⏰ STALLED &gt;7d</strong>'
+              : waitTag);
+        const progHtml = o.progress_summary
+          ? `<span class="wb-ob-prog">${{esc(o.progress_summary)}}</span>`
+          : '';
         return `
-          <div class="wb-ob" data-status="${{esc(o.status)}}" data-stalled="${{Boolean(o.stalled_alert)}}">
+          <div class="wb-ob" data-status="${{esc(o.status)}}"
+               data-stalled="${{Boolean(o.stalled_alert)}}"
+               title="Trigger: ${{esc(o.trigger_expr)}}">
             <div style="min-width:0;flex:1">
-              🔔 ${{ statusTag }} · ${{esc(o.description)}}
-              <code class="wb-trig">${{esc(o.trigger_expr)}}</code>
+              ${{statusTag}} · ${{esc(o.description)}}${{progHtml}}
             </div>
             <button class="wb-btn" data-ob-done="${{esc(o.obligation_id)}}" type="button">✓</button>
           </div>
         `;
       }}).join('');
 
-      const pillsHtml = (w.artifacts || []).map((a) => {{
+      const chkItems = w.checklist || [];
+      const chkCovered = new Set();
+      const chkRowsHtml = chkItems.map((item) => {{
+        if (item.bug_key) chkCovered.add(item.bug_key);
+        const clChips = (item.cls || []).map((c) => {{
+          if (c.artifact_key) chkCovered.add(c.artifact_key);
+          const wipBadge = c.is_wip
+            ? `<span class="wb-cl-tag" style="background:#fffbeb;color:var(--warn)">${{esc(c.wip_label || 'WIP')}}</span>`
+            : '';
+          const stackBadge = c.is_stacked
+            ? '<span class="wb-cl-tag" style="background:#f1f5f9;color:var(--muted)">stacked</span>'
+            : '';
+          const confBadge = c.merge_conflict
+            ? '<span class="wb-cl-tag" style="background:#fff2f1;color:var(--urgent)">⚠️ conflict</span>'
+            : '';
+          const updSpan = c.updated_et
+            ? `<span style="color:var(--muted);font-size:10px">${{esc(c.updated_et)}}</span>`
+            : '';
+          const cutBtn = !w.is_virtual
+            ? `<button class="wb-cut" title="Detach from Work" data-unlink-work="${{esc(w.work_id)}}" data-unlink-key="${{esc(c.artifact_key)}}" type="button">✂</button>`
+            : '';
+          return `
+            <span class="wb-cl-chip" title="${{esc(c.subject)}}">
+              <a href="${{esc(c.url || '#')}}" target="_blank" rel="noopener"
+                 style="color:inherit;text-decoration:none;font-weight:500">${{esc(c.label)}}</a>
+              ${{wipBadge}}${{stackBadge}}${{confBadge}}
+              ${{renderRollDots({{ state: {{ rolls: c.rolls }} }})}}
+              ${{updSpan}}${{cutBtn}}
+            </span>
+          `;
+        }}).join('');
+        const clsBlock = clChips ? `<div class="wb-chk-cls">${{clChips}}</div>` : '';
+        const outdatedTag = item.draft_outdated
+          ? '<span class="wb-draft-warn">📝 Not in draft yet</span>'
+          : '';
+        return `
+          <div class="wb-chk-row" data-stage="${{esc(item.stage)}}">
+            <div class="wb-chk-top">
+              <a class="wb-bug-id" href="${{esc(item.url || '#')}}"
+                 target="_blank" rel="noopener">🐛 ${{esc(item.short_id)}}</a>
+              <span class="wb-bug-title">${{esc(item.title)}}</span>
+              <span class="wb-stage-badge"
+                    data-tone="${{esc(item.stage_tone)}}">${{esc(item.stage_label)}}</span>
+              ${{outdatedTag}}
+            </div>
+            ${{clsBlock}}
+          </div>
+        `;
+      }}).join('');
+      const checklistHtml = chkRowsHtml ? `<div class="wb-checklist">${{chkRowsHtml}}</div>` : '';
+
+      const hasChk = chkItems.length > 0;
+      let chatPillCount = 0;
+      const visiblePills = (w.artifacts || []).filter((a) => {{
+        if (chkCovered.has(a.artifact_key)) return false;
+        if (hasChk) {{
+          const isChannelKind = [
+            'gmail_thread',
+            'gmail_draft',
+            'gchat_thread',
+            'gdoc',
+            'chat_chain',
+          ].includes(a.kind);
+          if (!isChannelKind) return false;
+        }}
+        if (a.kind === 'chat_chain') {{
+          const isRawChat = /^Chat\\s+[0-9a-f]{{6,}}$/i.test(String(a.title || ''));
+          if (isRawChat && chatPillCount >= 1) return false;
+          chatPillCount += 1;
+        }}
+        return true;
+      }});
+      const pillsHtml = visiblePills.map((a) => {{
         const cutBtn = !w.is_virtual
           ? `<button class="wb-cut" title="Detach from Work (prevent auto-relink)" data-unlink-work="${{esc(w.work_id)}}" data-unlink-key="${{esc(a.artifact_key)}}" type="button">✂</button>`
           : '';
@@ -859,6 +1110,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
           <div class="wb-card-body">
             ${{reasonsHtml ? `<div style="font-size:11px;color:var(--muted)">${{reasonsHtml}}</div>` : ''}}
             ${{obsHtml}}
+            ${{checklistHtml}}
             <div class="wb-pills">${{pillsHtml}}</div>
           </div>
         </article>

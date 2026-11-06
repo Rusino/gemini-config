@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from datetime import datetime
 import fcntl
 import glob
+import html as html_lib
 import json
 import os
 import re
@@ -52,11 +53,13 @@ RE_BUGANIZER = re.compile(
     re.IGNORECASE,
 )
 RE_GMAIL_THREAD = re.compile(
-    r"(?:mail\.google\.com/mail/u/\d+/#(?:inbox|sent|all)/|\bthread:|--thread[=\s]+)([0-9a-f]{15,16})\b",
+    r"(?:mail\.google\.com/mail/u/\d+/#(?:inbox|sent|all)/"
+    r"|\bthread:|--thread[=\s]+)([0-9a-f]{15,16})\b",
     re.IGNORECASE,
 )
 RE_GMAIL_DRAFT = re.compile(
-    r"(?:mail\.google\.com/mail/u/\d+/#drafts/|\bdraft:|(?:update-draft|get-draft)\s+)(r-?\d{15,22})\b",
+    r"(?:mail\.google\.com/mail/u/\d+/#drafts/"
+    r"|\bdraft:|(?:update-draft|get-draft)\s+)(r-?\d{15,22})\b",
     re.IGNORECASE,
 )
 RE_GDOC = re.compile(
@@ -101,70 +104,130 @@ WRITE_TOOL_NAMES = frozenset({
 
 
 def extract_artifacts_from_text(text: str) -> list[tuple[str, str, str]]:
-  """Returns list of (artifact_key, kind, default_url) found in arbitrary text."""
-  found: dict[str, tuple[str, str, str]] = {}
+  """Returns list of (artifact_key, kind, default_url) in document appearance order."""
+  found: dict[str, tuple[int, tuple[str, str, str]]] = {}
   if not text:
     return []
 
+  def _add(pos: int, key: str, kind: str, url: str) -> None:
+    if key not in found or pos < found[key][0]:
+      found[key] = (pos, (key, kind, url))
+
   for m in RE_SKIA_GERRIT.finditer(text):
     num = m.group(1)
-    if num in DUMMY_IDS:
-      continue
-    key = f"gerrit:skia:{num}"
-    found[key] = (key, "gerrit", f"https://skia-review.googlesource.com/c/skia/+/{num}")
+    if num not in DUMMY_IDS:
+      _add(
+          m.start(),
+          f"gerrit:skia:{num}",
+          "gerrit",
+          f"https://skia-review.googlesource.com/c/skia/+/{num}",
+      )
 
   for m in RE_CHROMIUM_GERRIT.finditer(text):
     num = m.group(1)
-    if num in DUMMY_IDS:
-      continue
-    key = f"gerrit:chromium:{num}"
-    found[key] = (
-        key,
-        "gerrit",
-        f"https://chromium-review.googlesource.com/c/chromium/src/+/{num}",
-    )
+    if num not in DUMMY_IDS:
+      _add(
+          m.start(),
+          f"gerrit:chromium:{num}",
+          "gerrit",
+          f"https://chromium-review.googlesource.com/c/chromium/src/+/{num}",
+      )
 
   for m in RE_GITHUB_PR.finditer(text):
     num = m.group(1)
-    if num in DUMMY_IDS:
-      continue
-    key = f"github_pr:flutter/flutter:{num}"
-    found[key] = (key, "github_pr", f"https://github.com/flutter/flutter/pull/{num}")
+    if num not in DUMMY_IDS:
+      _add(
+          m.start(),
+          f"github_pr:flutter/flutter:{num}",
+          "github_pr",
+          f"https://github.com/flutter/flutter/pull/{num}",
+      )
 
   for m in RE_FLUTTER_ISSUE.finditer(text):
     num = m.group(1)
-    if num in DUMMY_IDS:
-      continue
-    key = f"github_issue:flutter/flutter:{num}"
-    found[key] = (
-        key,
-        "github_issue",
-        f"https://github.com/flutter/flutter/issues/{num}",
-    )
+    if num not in DUMMY_IDS:
+      _add(
+          m.start(),
+          f"github_issue:flutter/flutter:{num}",
+          "github_issue",
+          f"https://github.com/flutter/flutter/issues/{num}",
+      )
 
   for m in RE_BUGANIZER.finditer(text):
     num = m.group(1)
-    if num in DUMMY_IDS:
-      continue
-    key = f"buganizer:{num}"
-    found[key] = (key, "buganizer", f"https://issues.chromium.org/issues/{num}")
+    if num not in DUMMY_IDS:
+      _add(
+          m.start(),
+          f"buganizer:{num}",
+          "buganizer",
+          f"https://issues.chromium.org/issues/{num}",
+      )
 
   for m in RE_GMAIL_THREAD.finditer(text):
     tid = m.group(1).lower()
-    key = f"gmail_thread:{tid}"
-    found[key] = (key, "gmail_thread", f"https://mail.google.com/mail/u/0/#inbox/{tid}")
+    _add(
+        m.start(),
+        f"gmail_thread:{tid}",
+        "gmail_thread",
+        f"https://mail.google.com/mail/u/0/#inbox/{tid}",
+    )
 
   for m in RE_GMAIL_DRAFT.finditer(text):
     did = m.group(1)
-    key = f"gmail_draft:{did}"
-    found[key] = (key, "gmail_draft", f"https://mail.google.com/mail/u/0/#drafts/{did}")
+    _add(
+        m.start(),
+        f"gmail_draft:{did}",
+        "gmail_draft",
+        f"https://mail.google.com/mail/u/0/#drafts/{did}",
+    )
 
   for m in RE_GDOC.finditer(text):
     doc_id = m.group(1)
-    key = f"gdoc:{doc_id}"
-    found[key] = (key, "gdoc", f"https://docs.google.com/document/d/{doc_id}/edit")
+    _add(
+        m.start(),
+        f"gdoc:{doc_id}",
+        "gdoc",
+        f"https://docs.google.com/document/d/{doc_id}/edit",
+    )
 
-  return list(found.values())
+  return [item for _, item in sorted(found.values(), key=lambda x: x[0])]
+
+
+_RE_INLINE_FLUTTER_TITLE = re.compile(
+    r"(?:#|flutter#)(\d{4,7})\b\s*[—–\-:]\s*([^\n(]+)",
+    re.IGNORECASE,
+)
+_RE_INLINE_BUGANIZER_TITLE = re.compile(
+    r"\b(?:b|crbug)/(\d{7,10})\b\s*[—–\-:]\s*([^\n(]+)",
+    re.IGNORECASE,
+)
+
+
+def extract_bug_titles_from_html_or_text(raw: str) -> dict[str, str]:
+  """Extracts human bug titles from structured email/draft bullet items."""
+  if not raw:
+    return {}
+  # Convert block-level HTML breaks to newlines before stripping tags
+  norm = re.sub(r"</?(?:li|br|p|div|tr)[^>]*>", "\n", raw, flags=re.IGNORECASE)
+  norm = html_lib.unescape(re.sub(r"<[^>]+>", " ", norm))
+  titles: dict[str, str] = {}
+  for line in norm.splitlines():
+    clean_line = " ".join(line.split()).strip()
+    if not clean_line:
+      continue
+    for m in _RE_INLINE_FLUTTER_TITLE.finditer(clean_line):
+      num = m.group(1)
+      desc = m.group(2).strip(" —–-:;,.()")
+      if num not in DUMMY_IDS and len(desc) >= 6:
+        ck = work_store.canonicalize_artifact_key("flutter_issue", num)
+        titles[ck] = desc
+    for m in _RE_INLINE_BUGANIZER_TITLE.finditer(clean_line):
+      num = m.group(1)
+      desc = m.group(2).strip(" —–-:;,.()")
+      if num not in DUMMY_IDS and len(desc) >= 6:
+        ck = work_store.canonicalize_artifact_key("buganizer", num)
+        titles[ck] = desc
+  return titles
 
 
 def _is_write_step(step: Mapping[str, Any]) -> bool:
@@ -235,7 +298,12 @@ def _clean_user_prompt(raw: str) -> str:
   ):
     pos = text.find(marker)
     if pos != -1:
-      colon = text.find(":", pos)
+      paren_colon = text.find("):", pos)
+      colon = (
+          paren_colon + 1
+          if (paren_colon != -1 and paren_colon - pos < 80)
+          else text.find(":", pos)
+      )
       if colon != -1:
         sub = text[colon + 1 :].lstrip(" )").strip()
         sub = (
@@ -296,7 +364,13 @@ def _extract_step_texts(step: Mapping[str, Any]) -> tuple[list[str], list[str]]:
               anchor_texts.append(cmd)
             else:
               aux_texts.append(cmd)
-        elif tname in ("call_mcp_tool", "update_doc", "create_file", "send_message", "send_message_markdown"):
+        elif tname in (
+            "call_mcp_tool",
+            "update_doc",
+            "create_file",
+            "send_message",
+            "send_message_markdown",
+        ):
           blob = json.dumps(args, ensure_ascii=False)
           if tname in WRITE_TOOL_NAMES:
             anchor_texts.append(blob)
@@ -623,10 +697,63 @@ def ingest_cl_watcher_state(
     ckey = work_store.canonicalize_artifact_key(kind, tid, host=host)
     subj = str(item.get("subject") or item.get("title") or ckey)
     url = str(item.get("url") or "")
-    bug_ids = [str(b) for b in (item.get("bug_ids") or []) if b]
+    linked_bug_keys = work_store.extract_cl_bug_keys(item)
     cids = [str(c) for c in (item.get("conversations") or []) if c]
+    single_cid = str(item.get("conversation_id") or "").strip()
+    if single_cid and single_cid not in cids:
+      cids.append(single_cid)
+
+    # Upsert rich bug metadata from linked_bugs and commit_message references
+    lb_meta: dict[str, dict[str, str]] = {}
+    for lb in item.get("linked_bugs") or []:
+      if not isinstance(lb, Mapping):
+        continue
+      raw_bk = str(lb.get("bug_key") or lb.get("short_id") or "").strip()
+      if not raw_bk:
+        continue
+      if "#" in raw_bk:
+        num = raw_bk.split("#")[-1].strip()
+      else:
+        num = re.split(r"[:/]", raw_bk)[-1].strip()
+      if not num.isdigit():
+        continue
+      b_ck = work_store.canonicalize_artifact_key(
+          "flutter_issue" if ("#" in raw_bk or len(num) <= 6) else "buganizer",
+          num,
+      )
+      lb_meta[b_ck] = {
+          "title": str(lb.get("title") or "").strip(),
+          "status": str(lb.get("status") or "").strip(),
+          "url": str(lb.get("url") or "").strip(),
+      }
+
+    for b_ckey in linked_bug_keys:
+      meta = lb_meta.get(b_ckey) or {}
+      short_b = work_store.format_short_bug_id(b_ckey)
+      b_desc = meta.get("title") or ""
+      b_title = f"{short_b}: {b_desc}" if b_desc else short_b
+      b_num = b_ckey.split(":")[-1]
+      b_url = meta.get("url") or (
+          f"https://github.com/flutter/flutter/issues/{b_num}"
+          if b_ckey.startswith("github_issue:")
+          else f"https://issues.chromium.org/issues/{b_num}"
+      )
+      b_state: dict[str, Any] = {"short_id": short_b}
+      if b_desc:
+        b_state["bug_title"] = b_desc
+      if meta.get("status"):
+        b_state["status"] = meta["status"]
+      store.upsert_artifact(
+          b_ckey,
+          kind=work_store.artifact_kind_from_key(b_ckey),
+          title=b_title,
+          url=b_url,
+          state=b_state,
+          now=cur_now,
+      )
 
     item_state = dict(item)
+    item_state["linked_bug_keys"] = linked_bug_keys
     created_ts = float(item.get("created_ts") or 0.0)
     if created_ts > 0:
       item_state["origin_ts"] = created_ts
@@ -642,44 +769,47 @@ def ingest_cl_watcher_state(
       continue
 
     # Check if this CL is a hub ([SkoreText] or >3 bugs); hubs never auto-merge works
-    if work_store.is_hub_artifact(ckey, item, linked_bug_count=len(bug_ids)):
+    if work_store.is_hub_artifact(ckey, item_state, linked_bug_count=len(linked_bug_keys)):
       continue
 
-    # Group into a persisted Work when the item links to a bug, fix-for CL, or existing Work
-    existing_wid = store.find_work_by_artifact(ckey, roles=("primary", "channel"))
-    if not existing_wid:
-      for bid in bug_ids:
-        b_ckey = (
-            work_store.canonicalize_artifact_key("flutter_issue", bid)
-            if len(bid) <= 6
-            else work_store.canonicalize_artifact_key("buganizer", bid)
-        )
-        existing_wid = store.find_work_by_artifact(b_ckey, roles=("primary",))
-        if existing_wid:
-          break
+    # Attach this CL to all active Works that already track its bug(s) or stack parent
+    matched_wids: list[str] = []
+    for w_cand in store.find_all_works_by_artifact(ckey, roles=("primary", "channel")):
+      if w_cand not in matched_wids:
+        matched_wids.append(w_cand)
+    for b_ckey in linked_bug_keys:
+      for w_cand in store.find_all_works_by_artifact(b_ckey, roles=("primary",)):
+        if w_cand not in matched_wids:
+          matched_wids.append(w_cand)
+    stack_parent = str(item.get("stack_parent_ikey") or "").strip()
+    if stack_parent:
+      p_ckey = work_store.canonicalize_artifact_key(stack_parent)
+      for w_cand in store.find_all_works_by_artifact(p_ckey, roles=("primary",)):
+        if w_cand not in matched_wids:
+          matched_wids.append(w_cand)
 
-    has_multi_entities = bool(bug_ids) or bool(item.get("fixes_cls")) or bool(item.get("fixed_by_cls"))
-    if not existing_wid and not has_multi_entities:
-      continue
-
-    wid = existing_wid or store.create_work(
-        subj,
-        project_id=str(item.get("project") or ""),
-        now=cur_now,
+    has_multi_entities = (
+        bool(linked_bug_keys)
+        or bool(item.get("fixes_cls"))
+        or bool(item.get("fixed_by_cls"))
     )
-    store.link_artifact(wid, ckey, role="primary", source="auto", now=cur_now)
-    for bid in bug_ids:
-      if len(bid) <= 6:
-        b_ckey = work_store.canonicalize_artifact_key("flutter_issue", bid)
-        b_url = f"https://github.com/flutter/flutter/issues/{bid}"
-        b_title = f"flutter#{bid}"
-      else:
-        b_ckey = work_store.canonicalize_artifact_key("buganizer", bid)
-        b_url = f"https://issues.chromium.org/issues/{bid}"
-        b_title = f"b/{bid}"
-      store.upsert_artifact(b_ckey, title=b_title, url=b_url, now=cur_now)
-      store.link_artifact(wid, b_ckey, role="primary", source="auto", now=cur_now)
+    if not matched_wids and not has_multi_entities:
+      continue
 
+    if not matched_wids:
+      matched_wids = [
+          store.create_work(
+              subj,
+              project_id=str(item.get("project") or ""),
+              now=cur_now,
+          )
+      ]
+    for wid in matched_wids:
+      store.link_artifact(wid, ckey, role="primary", source="auto", now=cur_now)
+      for b_ckey in linked_bug_keys:
+        store.link_artifact(wid, b_ckey, role="primary", source="auto", now=cur_now)
+
+    primary_wid = matched_wids[0]
     for cid in cids[:2]:
       ch_key = f"chat_chain:{cid}"
       store.upsert_artifact(
@@ -690,7 +820,7 @@ def ingest_cl_watcher_state(
           state={"cascade_id": cid},
           now=cur_now,
       )
-      store.link_artifact(wid, ch_key, role="channel", source="auto", now=cur_now)
+      store.link_artifact(primary_wid, ch_key, role="channel", source="auto", now=cur_now)
 
 
 def _clean_display_name(raw_addr: str) -> str:
@@ -876,21 +1006,34 @@ def ingest_gmail_drafts_and_threads(
           # Strip quoted history (`<blockquote...`) before extracting draft references
           unquoted_body = decoded_body.split("<blockquote")[0] if decoded_body else ""
           extracted = extract_artifacts_from_text(f"{subj}\n{unquoted_body}")
+          inline_bug_titles = extract_bug_titles_from_html_or_text(unquoted_body)
           d_key = f"gmail_draft:{did}"
           to_name = _clean_display_name(to_hdr) if to_hdr else ""
-          store.upsert_artifact(
-              d_key,
-              kind="gmail_draft",
-              title=f"Draft: {subj}" + (f" ({to_name})" if to_name else ""),
-              url=f"https://mail.google.com/mail/u/0/#drafts/{did}",
-              state={"status": "DRAFT", "thread_id": thread_id, "to": to_hdr},
-              now=cur_now,
-          )
           primaries = [
               (akey, akind, aurl)
               for akey, akind, aurl in extracted
               if akind in ("gerrit", "github_pr", "buganizer", "github_issue", "gdoc")
           ]
+          mentioned_keys = [akey for akey, _, _ in primaries]
+          draft_bug_keys = [
+              akey
+              for akey, akind, _ in primaries
+              if akind in ("buganizer", "github_issue")
+          ]
+          store.upsert_artifact(
+              d_key,
+              kind="gmail_draft",
+              title=f"Draft: {subj}" + (f" ({to_name})" if to_name else ""),
+              url=f"https://mail.google.com/mail/u/0/#drafts/{did}",
+              state={
+                  "status": "DRAFT",
+                  "thread_id": thread_id,
+                  "to": to_hdr,
+                  "mentioned_keys": mentioned_keys,
+                  "draft_bug_keys": draft_bug_keys,
+              },
+              now=cur_now,
+          )
           if not primaries:
             continue
           wid = store.find_work_by_artifact(d_key, roles=("primary", "channel"))
@@ -928,19 +1071,61 @@ def ingest_gmail_drafts_and_threads(
                 now=cur_now,
             )
             store.link_artifact(wid, t_key, role="channel", source="auto", now=cur_now)
-          for akey, akind, aurl in primaries[:6]:
-            store.upsert_artifact(akey, kind=akind, title=akey, url=aurl, now=cur_now)
-            existing_owner = store.find_work_by_artifact(akey, roles=("primary",))
-            role = "context_only" if (existing_owner and existing_owner != wid) else "primary"
-            store.link_artifact(wid, akey, role=role, source="auto", now=cur_now)
-            if akind == "gerrit" and "flutter" in subj.lower():
-              store.add_obligation(
+          for akey, akind, aurl in primaries:
+            b_desc = inline_bug_titles.get(akey, "")
+            if b_desc:
+              short_b = work_store.format_short_bug_id(akey)
+              art_title = f"{short_b}: {b_desc}"
+              art_state: dict[str, Any] | None = {"short_id": short_b, "bug_title": b_desc}
+            else:
+              art_title = akey
+              art_state = None
+            store.upsert_artifact(
+                akey,
+                kind=akind,
+                title=art_title,
+                url=aurl,
+                state=art_state,
+                now=cur_now,
+            )
+            store.link_artifact(wid, akey, role="primary", source="auto", now=cur_now)
+
+          # Attach any CLs/PRs in the artifact store that fix the draft's primary bugs
+          store.reconcile_work_bug_cls(wid, now=cur_now)
+
+          # Build a single consolidated obligation for the draft across all linked CLs/bugs
+          if "flutter" in subj.lower() or draft_bug_keys:
+            w_roles = store.get_work_artifact_roles(wid)
+            primary_gerrit = sorted(
+                k for k, r in w_roles.items() if r == "primary" and k.startswith("gerrit:")
+            )
+            primary_prs = sorted(
+                k for k, r in w_roles.items() if r == "primary" and k.startswith("github_pr:")
+            )
+            preds: list[str] = []
+            for gk in primary_gerrit:
+              preds.append(f"cl_merged({gk}) AND rolled_into(Flutter, {gk})")
+            for pk in primary_prs:
+              preds.append(f"cl_merged({pk})")
+            if not preds and draft_bug_keys:
+              for bk in draft_bug_keys:
+                preds.append(f"bug_closed({bk})")
+            if preds:
+              if len(draft_bug_keys) >= 2:
+                ob_desc = (
+                    f"Send draft reply in '{subj}' once all {len(draft_bug_keys)} "
+                    f"bugs land & roll into Flutter"
+                )
+              elif len(primary_gerrit) == 1 and not primary_prs:
+                cl_num = primary_gerrit[0].split(":")[-1]
+                ob_desc = f"Send draft reply in '{subj}' once Gerrit {cl_num} rolls into Flutter"
+              else:
+                ob_desc = f"Send draft reply in '{subj}' once all linked CLs roll into Flutter"
+              store.replace_draft_obligation(
                   wid,
-                  description=(
-                      f"Send reply in '{subj}' once {akey.split(':')[-1]} rolls into Flutter"
-                  ),
-                  trigger_expr=f"cl_merged({akey}) AND rolled_into(Flutter, {akey})",
-                  target_artifact_key=d_key,
+                  draft_key=d_key,
+                  description=ob_desc,
+                  trigger_expr=" AND ".join(preds),
                   done_matcher=f"reply_sent({d_key})",
                   now=cur_now,
               )
