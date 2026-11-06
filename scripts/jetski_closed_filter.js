@@ -610,6 +610,9 @@
   const QUOTA_SOFT_FLOOR = 0.30;
   const QUOTA_HARD_FLOOR = 0.15;
   const EMERGENCY_PIN_FLOOR = 0.05;
+  // Pool-balance thresholds matching hooks/chat_lifecycle.py so Opus and Carbon do not ping-pong
+  const CLAUDE_POOL_BALANCE_FLOOR = 0.55;
+  const POOL_BALANCE_ADVANTAGE = 0.20;
   const AUTOPILOT_TOAST_ID = 'jetski-model-autopilot-toast';
   // Synthetic dropdown option that clears a manual model pin and restores project Autopilot
   const AUTOPILOT_OPTION_MODEL_ID = '__jetski_autopilot__';
@@ -664,8 +667,10 @@
   // Persist manual model pins across F5 reloads with a 30m TTL on unsent project drafts
   const MANUAL_MODEL_PINS_STORAGE_KEY = 'jetski_manual_model_pins_v1';
   const STEP0_BOOTSTRAP_STORAGE_KEY = 'jetski_step0_bootstrapped_models_v1';
+  const SHOWN_AUTOPILOT_TOASTS_STORAGE_KEY = 'jetski_shown_autopilot_toasts_v1';
   const DRAFT_MANUAL_PIN_TTL_MS = 30 * 60 * 1000;
   const MANUAL_MODEL_PINS_MAX_ENTRIES = 200;
+  const SHOWN_AUTOPILOT_TOASTS_MAX_ENTRIES = 200;
   // Morning reset fallback thresholds when quotaInfo.resetTime was unavailable at downgrade time
   const MORNING_RESET_IDLE_MS = 6 * 60 * 60 * 1000;
   const MORNING_RESET_QUOTA_FLOOR = 0.50;
@@ -677,6 +682,9 @@
   const autoSeededTargets = new Map();
   // Tracks conversations whose step-0 request substituted a safe model so turn 2+ restores target
   const step0BootstrappedModels = (window.__jetskiStep0BootstrappedModels ||= new Map());
+  // Deduplicates autopilot toasts per (conversationId -> stepCount:toEnum) and defers passive views
+  const shownAutopilotToasts = (window.__jetskiShownAutopilotToasts ||= new Map());
+  const pendingAutopilotToastByChat = new Map();
 
   const PROJECT_MODEL_PROFILES = {
     // triage profile (sidecar IDs)
@@ -3016,6 +3024,15 @@
                       : planModel);
               body.cascadeConfig.plannerConfig.planModel = nextPlanModel;
               nextInit = { ...init, body: JSON.stringify(body) };
+              const sendStepCount = rawCid
+                ? Number(
+                    reduxStore.getState()?.trajectorySummaries?.summaries?.[rawCid]?.stepCount ?? 0
+                  )
+                : 0;
+              if (rawCid) {
+                pendingAutopilotToastByChat.delete(rawCid);
+                recordShownAutopilotToast(rawCid, sendStepCount, replacement.enumVal);
+              }
               // Sync Redux dropdown and offer [Keep <Junior>] when restoring after quota reset
               if (isQuotaRestore && rawCid) {
                 dispatchInternalModelPick(reduxStore, rawCid, replacement.enumVal);
@@ -3035,6 +3052,9 @@
                   reason
                 );
               }
+            } else if (rawCid) {
+              // Flush any deferred passive-view model switch toast when sending a message
+              flushPendingAutopilotToast(reduxStore, rawCid);
             }
           }
         } catch {
@@ -3384,10 +3404,36 @@
     }
 
     const chain = WEB_MODEL_PROFILES[p] || WEB_MODEL_PROFILES.orchestrator;
-    for (const mid of chain) {
+    for (let idx = 0; idx < chain.length; idx++) {
+      const mid = chain[idx];
       const hit = catalog.byId.get(mid);
       if (!hit) continue;
-      if (hit.quota >= softFloor) return hit;
+      if (hit.quota >= softFloor) {
+        // Shift off depleted Claude (<55%) when a downstream Carbon/Argon pool has +20% headroom
+        if (
+          (mid.startsWith('opus-') || mid.startsWith('fable-')) &&
+          hit.quota < CLAUDE_POOL_BALANCE_FLOOR
+        ) {
+          for (let j = idx + 1; j < chain.length; j++) {
+            const altId = chain[j];
+            if (
+              !altId.includes('carbon') &&
+              !altId.includes('argon') &&
+              !altId.startsWith('gemini-launch-candidate')
+            ) {
+              continue;
+            }
+            const altHit = catalog.byId.get(altId);
+            if (
+              altHit &&
+              altHit.quota >= Math.max(softFloor, hit.quota + POOL_BALANCE_ADVANTAGE)
+            ) {
+              return altHit;
+            }
+          }
+        }
+        return hit;
+      }
       // Carbon and Argon stay eligible in chain order down to the 5% emergency floor
       if (
         hit.quota >= EMERGENCY_PIN_FLOOR &&
@@ -3553,8 +3599,16 @@
       if (tier === 5) return 1;
       return 2;
     }
-    if (mid === 'gemini-pro-coordinator' || num === 1415) return 0;
-    if (mid === 'auto' || num === 1260) return 1;
+    // Both Gemini Pro Orchestrator (1415) and Gemini Pro Next (1260) are primary tier in
+    // orchestrator so CLI/watcher chats started on 1260 do not churn when opened in the UI
+    if (
+      mid === 'gemini-pro-coordinator' ||
+      num === 1415 ||
+      mid === 'auto' ||
+      num === 1260
+    ) {
+      return 0;
+    }
     if (tier === 4) return 2;
     // Manual upgrades carry isPinned=true; unpinned tier<=3 models leaked from default.model
     if (tier <= 3) return 3;
@@ -3618,7 +3672,17 @@
       cleanProfile !== 'triage' &&
       ((curTier >= 6 && bestTier <= 5) ||
         (JUNIOR_PRO_ENUM_NUMS.has(curNum) && bestRank < curRank));
-    const minRecoveryQuota = isJuniorRescue ? EMERGENCY_PIN_FLOOR : QUOTA_SOFT_FLOOR;
+    // Keep Carbon/Argon chats on their pool until Claude recovers to the 55% balance floor
+    const bestMid = String(best.modelId || '').toLowerCase();
+    const isPoolBalancedCarbon =
+      !expiredJuniorEnum &&
+      curTier === 4 &&
+      (bestMid.startsWith('opus-') || bestMid.startsWith('fable-'));
+    const minRecoveryQuota = isJuniorRescue
+      ? EMERGENCY_PIN_FLOOR
+      : isPoolBalancedCarbon
+      ? CLAUDE_POOL_BALANCE_FLOOR
+      : QUOTA_SOFT_FLOOR;
     if (best.quota < minRecoveryQuota) {
       return null;
     }
@@ -3676,10 +3740,22 @@
     return null;
   }
 
-  // Finds project profile ('cpp-core', 'triage', 'orchestrator') for a conversation or route
+  // Finds project profile ('cpp-core', 'triage', 'orchestrator', or '' if unmapped)
   function resolveProjectProfileForConversation(store, cascadeId) {
     const summariesMap = store?.getState()?.trajectorySummaries?.summaries;
-    let projectId = cascadeId && summariesMap?.[cascadeId]?.trajectoryMetadata?.projectId;
+    const summary = cascadeId ? summariesMap?.[cascadeId] : null;
+    // Match sidecarId before projectId so skia-g3-roll-check chats inside Skia Gardener use triage
+    const sidecarId =
+      summary?.trajectoryMetadata?.sourceMetadata?.sidecar?.sidecarId ||
+      summary?.trajectoryMetadata?.source_metadata?.sidecar?.sidecar_id ||
+      '';
+    if (sidecarId) {
+      const cleanSidecar = String(sidecarId).trim().toLowerCase();
+      if (PROJECT_MODEL_PROFILES[cleanSidecar]) {
+        return PROJECT_MODEL_PROFILES[cleanSidecar];
+      }
+    }
+    let projectId = summary?.trajectoryMetadata?.projectId;
 
     if (!projectId) {
       const search = window.location?.search || '';
@@ -3713,7 +3789,8 @@
         }
       }
     }
-    return projectId ? 'orchestrator' : '';
+    // Unmapped projects keep their native/chosen chat model unless exhausted (<15%)
+    return '';
   }
 
   // Computes a project-scoped pin key for drafts so manual draft picks do not leak across projects
@@ -4006,8 +4083,63 @@
     }
   }
 
+  // Hydrates shown autopilot toast signatures so F5 reloads do not re-pop seen switch toasts
+  function loadShownAutopilotToasts() {
+    try {
+      const raw = window.localStorage?.getItem(SHOWN_AUTOPILOT_TOASTS_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return;
+      for (const [k, sig] of Object.entries(parsed).slice(-SHOWN_AUTOPILOT_TOASTS_MAX_ENTRIES)) {
+        if (k && typeof sig === 'string' && sig) {
+          shownAutopilotToasts.set(k, sig);
+        }
+      }
+    } catch {
+      // Ignore malformed localStorage state
+    }
+  }
+
+  // Persists bounded shown autopilot toast signatures to localStorage
+  function saveShownAutopilotToasts() {
+    try {
+      if (typeof window.localStorage?.setItem !== 'function') return;
+      const out = {};
+      const entries = Array.from(shownAutopilotToasts.entries()).slice(
+        -SHOWN_AUTOPILOT_TOASTS_MAX_ENTRIES
+      );
+      for (const [k, sig] of entries) {
+        if (k && typeof sig === 'string' && sig) out[k] = sig;
+      }
+      window.localStorage.setItem(SHOWN_AUTOPILOT_TOASTS_STORAGE_KEY, JSON.stringify(out));
+    } catch {
+      // Ignore storage quota errors
+    }
+  }
+
+  // Records a shown autopilot toast signature for a conversation and evicts oldest at capacity
+  function recordShownAutopilotToast(cascadeId, stepCount, toEnum) {
+    if (!cascadeId || !toEnum) return;
+    const sig = `${Math.max(0, Number(stepCount || 0))}:${Number(toEnum)}`;
+    if (shownAutopilotToasts.has(cascadeId)) {
+      shownAutopilotToasts.delete(cascadeId);
+    } else if (shownAutopilotToasts.size >= SHOWN_AUTOPILOT_TOASTS_MAX_ENTRIES) {
+      const oldestKey = shownAutopilotToasts.keys().next().value;
+      if (oldestKey !== undefined) shownAutopilotToasts.delete(oldestKey);
+    }
+    shownAutopilotToasts.set(cascadeId, sig);
+    saveShownAutopilotToasts();
+  }
+
+  function clearShownAutopilotToast(cascadeId) {
+    if (cascadeId && shownAutopilotToasts.delete(cascadeId)) {
+      saveShownAutopilotToasts();
+    }
+  }
+
   loadManualModelPins();
   loadStep0BootstrappedModels();
+  loadShownAutopilotToasts();
 
   // Mounts a floating autopilot toast with an optional interactive per-chat action button
   function showCustomAutopilotToast({
@@ -4101,6 +4233,8 @@
     const stepCount = Number(
       store.getState()?.trajectorySummaries?.summaries?.[cascadeId]?.stepCount ?? 0
     );
+    pendingAutopilotToastByChat.delete(cascadeId);
+    clearShownAutopilotToast(cascadeId);
     setManualPin(cascadeId, juniorEnum, stepCount, {
       permanent: true,
       resetAtMs: 0,
@@ -4131,6 +4265,130 @@
         }
       },
     });
+  }
+
+  // Resolves the currently focused conversation ID across single-pane and split-pane layouts
+  function getFocusedConversationId(store) {
+    const state = store?.getState();
+    const layoutState = state?.multiConvoLayout;
+    const focusedPaneId = layoutState?.focusedPaneId;
+    if (focusedPaneId && layoutState?.rootNode) {
+      const findFocusedPane = (node) => {
+        if (!node) return null;
+        if (node.type === 'pane') {
+          return node.id === focusedPaneId || node.cascadeId === focusedPaneId ? node : null;
+        }
+        if (Array.isArray(node.children)) {
+          for (const child of node.children) {
+            const hit = findFocusedPane(child);
+            if (hit) return hit;
+          }
+        }
+        return null;
+      };
+      const hitPane = findFocusedPane(layoutState.rootNode);
+      if (hitPane?.cascadeId) return hitPane.cascadeId;
+    }
+    if (focusedPaneId && state?.trajectorySummaries?.summaries?.[focusedPaneId]) {
+      return focusedPaneId;
+    }
+    const convCid =
+      state?.conversation?.cascadeId || state?.conversation?.convoState?.cascadeId || '';
+    if (convCid) return convCid;
+    const path = window.location?.pathname || '';
+    const m = /\/(?:c|cascade|conversation)\/([a-zA-Z0-9_-]+)/.exec(path);
+    return m ? m[1] : '';
+  }
+
+  function isConversationFocused(store, cascadeId) {
+    if (!cascadeId) return false;
+    return getFocusedConversationId(store) === cascadeId;
+  }
+
+  // Returns true when document.activeElement is inside the prompt composer for cascadeId
+  function isComposerFocusedForConversation(cascadeId) {
+    if (!cascadeId || typeof document === 'undefined') return false;
+    const activeEl = document.activeElement;
+    if (!activeEl || typeof activeEl.closest !== 'function') return false;
+    const inputBox = activeEl.closest('[data-testid="agent-input-box"]');
+    if (!inputBox) return false;
+    return findCascadeIdFromElement(inputBox) === cascadeId;
+  }
+
+  // Shows an autopilot switch toast immediately on active interaction/expiry, or defers on passive view
+  function queueOrShowAutopilotSwitchToast(store, cascadeId, info, options = null) {
+    if (!info || !info.toEnum) return;
+    const stepNum = Math.max(0, Number(info.stepCount || 0));
+    const sig = `${stepNum}:${Number(info.toEnum)}`;
+    if (cascadeId && shownAutopilotToasts.get(cascadeId) === sig) {
+      pendingAutopilotToastByChat.delete(cascadeId);
+      return;
+    }
+    const immediate = Boolean(
+      options?.immediate ||
+        (cascadeId &&
+          isConversationFocused(store, cascadeId) &&
+          isComposerFocusedForConversation(cascadeId))
+    );
+    if (!immediate && cascadeId) {
+      const prevPending = pendingAutopilotToastByChat.get(cascadeId);
+      // Preserve an earlier quota-restore flag when trajectoryModelObserved replays the same target
+      const mergedQuotaRestore = Boolean(
+        info.isQuotaRestore ||
+          (prevPending &&
+            prevPending.stepCount === stepNum &&
+            prevPending.toEnum === info.toEnum &&
+            prevPending.isQuotaRestore)
+      );
+      pendingAutopilotToastByChat.set(cascadeId, {
+        ...info,
+        stepCount: stepNum,
+        isQuotaRestore: mergedQuotaRestore,
+      });
+      return;
+    }
+    if (cascadeId) {
+      pendingAutopilotToastByChat.delete(cascadeId);
+      recordShownAutopilotToast(cascadeId, stepNum, info.toEnum);
+    }
+    if (info.isQuotaRestore && cascadeId) {
+      showMorningQuotaRestoredToast(
+        store,
+        cascadeId,
+        info.juniorEnum || info.fromEnum,
+        info.fromLabel,
+        info.toLabel
+      );
+    } else {
+      showAutopilotToast(info.fromLabel, info.toLabel, info.reason);
+    }
+  }
+
+  // Mounts a deferred passive-view autopilot switch toast once the user focuses composer or sends
+  function flushPendingAutopilotToast(store, cascadeId) {
+    if (!cascadeId) return;
+    const pending = pendingAutopilotToastByChat.get(cascadeId);
+    if (!pending) return;
+    pendingAutopilotToastByChat.delete(cascadeId);
+    const pin = getManualPinEntry(cascadeId);
+    if (pin && pin.model && pin.model !== pending.toEnum) return;
+    const curConvModel = store?.getState()?.modelSelection?.byConversation?.[cascadeId]?.model;
+    if (curConvModel !== undefined && curConvModel !== pending.toEnum) return;
+    const stepNum = Math.max(0, Number(pending.stepCount || 0));
+    const sig = `${stepNum}:${Number(pending.toEnum)}`;
+    if (shownAutopilotToasts.get(cascadeId) === sig) return;
+    recordShownAutopilotToast(cascadeId, stepNum, pending.toEnum);
+    if (pending.isQuotaRestore) {
+      showMorningQuotaRestoredToast(
+        store,
+        cascadeId,
+        pending.juniorEnum || pending.fromEnum,
+        pending.fromLabel,
+        pending.toLabel
+      );
+    } else {
+      showAutopilotToast(pending.fromLabel, pending.toLabel, pending.reason);
+    }
   }
 
   // Synchronizes project profile defaults on drafts and fails over exhausted models in Redux
@@ -4208,14 +4466,15 @@
       pin = null;
     }
     const convModel = state.modelSelection.byConversation?.[cascadeId]?.model;
-    // Seed unpinned chats that lack byConversation directly so draft default.model cannot leak
+    // Seed unpinned chats in mapped profiles that lack byConversation so draft defaults cannot leak
     if (
+      profile &&
       convModel === undefined &&
       !pin &&
       !expiredJuniorEnum &&
       !(step0BootstrappedModels.has(cascadeId) && needsStep0ContribBypass(store, cascadeId))
     ) {
-      const seeded = resolveAutopilotModelForProfile(catalog, profile || 'orchestrator');
+      const seeded = resolveAutopilotModelForProfile(catalog, profile);
       if (seeded && seeded.enumVal) {
         dispatchInternalModelPick(store, cascadeId, seeded.enumVal);
         return;
@@ -4301,24 +4560,27 @@
       (replacement.enumVal !== curModel || (expiredJuniorEnum && convModel === undefined))
     ) {
       dispatchInternalModelPick(store, cascadeId, replacement.enumVal);
-      // Show interactive morning restoration toast instead of generic failover toast on recovery
-      if (isQuotaRestore) {
-        const juniorEnum = expiredJuniorEnum || curModel;
-        const juniorEntry = catalog.byEnum.get(juniorEnum);
-        showMorningQuotaRestoredToast(
-          store,
-          cascadeId,
+      const juniorEnum = expiredJuniorEnum || curModel;
+      const juniorEntry = catalog.byEnum.get(juniorEnum);
+      const fromLabel = isQuotaRestore
+        ? juniorEntry?.label || CURATED_ENUM_LABELS.get(juniorEnum) || String(juniorEnum)
+        : curEntry?.label || CURATED_ENUM_LABELS.get(curModel) || String(curModel);
+      // Show morning pin-expiry toast immediately on the focused chat; defer passive switches
+      queueOrShowAutopilotSwitchToast(
+        store,
+        cascadeId,
+        {
+          stepCount,
+          fromEnum: juniorEnum,
+          fromLabel,
+          toEnum: replacement.enumVal,
+          toLabel: replacement.label,
+          reason,
+          isQuotaRestore,
           juniorEnum,
-          juniorEntry?.label || CURATED_ENUM_LABELS.get(juniorEnum) || String(juniorEnum),
-          replacement.label
-        );
-      } else {
-        showAutopilotToast(
-          curEntry?.label || String(curModel),
-          replacement.label,
-          reason
-        );
-      }
+        },
+        { immediate: Boolean(expiredJuniorEnum && isConversationFocused(store, cascadeId)) }
+      );
       // Warn once per chat/model when all flagships are exhausted and a junior model stays active
     } else if (
       !isPinned &&
@@ -4437,6 +4699,70 @@
     return availableModelsFetching;
   }
 
+  // Compares two enriched UserStatus payloads so unchanged 60s polls do not re-dispatch Redux
+  function isEnrichedUserStatusEquivalent(prevStatus, nextStatus) {
+    if (prevStatus === nextStatus) return true;
+    const prevData = prevStatus?.cascadeModelConfigData;
+    const nextData = nextStatus?.cascadeModelConfigData;
+    const prevConfigs = prevData?.clientModelConfigs;
+    const nextConfigs = nextData?.clientModelConfigs;
+    if (!Array.isArray(prevConfigs) || !Array.isArray(nextConfigs)) return false;
+    if (prevConfigs.length !== nextConfigs.length) return false;
+    for (let i = 0; i < prevConfigs.length; i++) {
+      const a = prevConfigs[i];
+      const b = nextConfigs[i];
+      if (!a || !b) {
+        if (a !== b) return false;
+        continue;
+      }
+      if (
+        (a.modelId || '') !== (b.modelId || '') ||
+        (a.label || '') !== (b.label || '') ||
+        Boolean(a.disabled) !== Boolean(b.disabled) ||
+        (a.tagTitle || '') !== (b.tagTitle || '') ||
+        Boolean((a.tagDescription || '').includes('quota left')) !==
+          Boolean((b.tagDescription || '').includes('quota left')) ||
+        (a.modelOrAlias?.choice?.value || 0) !== (b.modelOrAlias?.choice?.value || 0) ||
+        parseQuotaResetMs(a.quotaInfo?.resetTime) !== parseQuotaResetMs(b.quotaInfo?.resetTime)
+      ) {
+        return false;
+      }
+      const aFrac =
+        a.quotaInfo?.remainingFraction !== undefined && a.quotaInfo?.remainingFraction !== null
+          ? Number(a.quotaInfo.remainingFraction)
+          : -1;
+      const bFrac =
+        b.quotaInfo?.remainingFraction !== undefined && b.quotaInfo?.remainingFraction !== null
+          ? Number(b.quotaInfo.remainingFraction)
+          : -1;
+      if (Math.abs(aFrac - bFrac) > 1e-6) return false;
+    }
+    const prevSorts = prevData?.clientModelSorts;
+    const nextSorts = nextData?.clientModelSorts;
+    if (Array.isArray(prevSorts) !== Array.isArray(nextSorts)) return false;
+    if (Array.isArray(prevSorts)) {
+      if (prevSorts.length !== nextSorts.length) return false;
+      for (let i = 0; i < prevSorts.length; i++) {
+        const gA = prevSorts[i]?.groups;
+        const gB = nextSorts[i]?.groups;
+        if (Array.isArray(gA) !== Array.isArray(gB)) return false;
+        if (!Array.isArray(gA)) continue;
+        if (gA.length !== gB.length) return false;
+        for (let j = 0; j < gA.length; j++) {
+          const lA = gA[j]?.modelLabels;
+          const lB = gB[j]?.modelLabels;
+          if (Array.isArray(lA) !== Array.isArray(lB)) return false;
+          if (!Array.isArray(lA)) continue;
+          if (lA.length !== lB.length) return false;
+          for (let k = 0; k < lA.length; k++) {
+            if (lA[k] !== lB[k]) return false;
+          }
+        }
+      }
+    }
+    return true;
+  }
+
   // Appends hidden executable models from GetAvailableModels and enriches quota tags
   function enrichUserStatusWithHiddenModels(userStatus, availablePayload) {
     const baseStatus = stripUnlockedModels(userStatus);
@@ -4502,11 +4828,14 @@
     // When GetAvailableModels is still loading or failed, return native quota updates
     if (!modelsMap) {
       if (!nativeModified) return baseStatus;
-      return cloneWithProto(baseStatus, {
+      const nextNativeOnly = cloneWithProto(baseStatus, {
         cascadeModelConfigData: cloneWithProto(data, {
           clientModelConfigs: enrichedNativeConfigs,
         }),
       });
+      return isEnrichedUserStatusEquivalent(userStatus, nextNativeOnly)
+        ? userStatus
+        : nextNativeOnly;
     }
 
     // Exclude FIM tab autocomplete, image generation, audio transcription, and deprecated arms
@@ -4674,11 +5003,14 @@
 
     if (unlockedConfigs.length === 0) {
       if (!nativeModified) return baseStatus;
-      return cloneWithProto(baseStatus, {
+      const nextNativeOnly = cloneWithProto(baseStatus, {
         cascadeModelConfigData: cloneWithProto(data, {
           clientModelConfigs: enrichedNativeConfigs,
         }),
       });
+      return isEnrichedUserStatusEquivalent(userStatus, nextNativeOnly)
+        ? userStatus
+        : nextNativeOnly;
     }
 
     const allConfigs = [...enrichedNativeConfigs, ...unlockedConfigs];
@@ -4724,12 +5056,15 @@
         })
       : data.clientModelSorts;
 
-    return cloneWithProto(baseStatus, {
+    const candidateStatus = cloneWithProto(baseStatus, {
       cascadeModelConfigData: cloneWithProto(data, {
         clientModelConfigs: [...enrichedNativeConfigs, ...unlockedConfigs],
         clientModelSorts: nextSorts,
       }),
     });
+    return isEnrichedUserStatusEquivalent(userStatus, candidateStatus)
+      ? userStatus
+      : candidateStatus;
   }
 
   // Ensures the hydrated Redux userStatus slice includes unlocked models from GetAvailableModels
@@ -4759,11 +5094,11 @@
     }
 
     const enriched = enrichUserStatusWithHiddenModels(latestStatus, payload);
+    lastAppliedModelsFetchedAt = availableModelsFetchedAt;
     if (enriched === latestStatus) {
       syncModelAutopilotInStore(store);
       return;
     }
-    lastAppliedModelsFetchedAt = availableModelsFetchedAt;
 
     isInternalDispatch = true;
     try {
@@ -4822,9 +5157,17 @@
           store.getState()?.conversation?.convoState?.cascadeId ||
           '';
         const pinKey = resolveDraftPinKey(store, rawCid);
-        // Explicit user pick supersedes any pending step-0 bootstrap restoration
-        if (rawCid) deleteStep0Bootstrap(rawCid);
-        if (activeCid) deleteStep0Bootstrap(activeCid);
+        // Explicit user pick supersedes any pending step-0 bootstrap restoration or deferred toast
+        if (rawCid) {
+          deleteStep0Bootstrap(rawCid);
+          pendingAutopilotToastByChat.delete(rawCid);
+          clearShownAutopilotToast(rawCid);
+        }
+        if (activeCid) {
+          deleteStep0Bootstrap(activeCid);
+          pendingAutopilotToastByChat.delete(activeCid);
+          clearShownAutopilotToast(activeCid);
+        }
         const stepCount = rawCid
           ? Number(store.getState()?.trajectorySummaries?.summaries?.[rawCid]?.stepCount ?? 0)
           : 0;
@@ -5146,28 +5489,37 @@
           }
         }
         if (replacement && replacement.enumVal && replacement.enumVal !== obsModel) {
-          // Offer one-click [Keep <Junior>] revert when trajectory replay triggers morning restore
-          if (isQuotaRestore && cid) {
-            const juniorEnum = expiredJuniorEnum || obsModel;
-            const juniorEntry = catalog.byEnum.get(juniorEnum);
-            showMorningQuotaRestoredToast(
-              store,
-              cid,
+          const prevConvModel = cid
+            ? store.getState()?.modelSelection?.byConversation?.[cid]?.model
+            : undefined;
+          const juniorEnum = expiredJuniorEnum || obsModel;
+          const juniorEntry = catalog.byEnum.get(juniorEnum);
+          const fromLabel = isQuotaRestore
+            ? juniorEntry?.label ||
+              action.payload.label ||
+              CURATED_ENUM_LABELS.get(juniorEnum) ||
+              String(juniorEnum)
+            : obsEntry?.label ||
+              action.payload.label ||
+              CURATED_ENUM_LABELS.get(obsModel) ||
+              String(obsModel);
+          // Show morning pin-expiry toast immediately on the focused chat; defer passive switches
+          queueOrShowAutopilotSwitchToast(
+            store,
+            cid,
+            {
+              stepCount,
+              fromEnum: juniorEnum,
+              fromLabel,
+              toEnum: replacement.enumVal,
+              toLabel: replacement.label,
+              reason,
+              isQuotaRestore,
               juniorEnum,
-              juniorEntry?.label ||
-                action.payload.label ||
-                CURATED_ENUM_LABELS.get(juniorEnum) ||
-                String(juniorEnum),
-              replacement.label
-            );
-          } else {
-            showAutopilotToast(
-              obsEntry?.label || action.payload.label || String(obsModel),
-              replacement.label,
-              reason
-            );
-          }
-          if (cid) {
+            },
+            { immediate: Boolean(expiredJuniorEnum && isConversationFocused(store, cid)) }
+          );
+          if (cid && prevConvModel !== replacement.enumVal) {
             dispatchInternalModelPick(store, cid, replacement.enumVal);
           }
           return origDispatch.call(this, {
@@ -11030,6 +11382,8 @@
     if (!inputBox) return;
     const cid = findCascadeIdFromElement(inputBox);
     if (!cid) return;
+    // Flush any deferred passive-view model switch toast when focusing or typing in the composer
+    flushPendingAutopilotToast(findReduxStore(), cid);
     if (latchedNeedsMeModMs.has(cid)) {
       markConversationSeen(cid);
     } else {
@@ -14577,6 +14931,8 @@
     document.removeEventListener?.('visibilitychange', markThisJetskiTabActive);
     manualPickedModels.clear();
     autoSeededTargets.clear();
+    shownAutopilotToasts.clear();
+    pendingAutopilotToastByChat.clear();
     // Remove all injected filter buttons, search panels, and chain stars on reload
     const cleanupSelector = [
       `.${BAR_CLASS}`,

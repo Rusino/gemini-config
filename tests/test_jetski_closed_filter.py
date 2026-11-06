@@ -3226,17 +3226,42 @@ global.window = {
     return { ok: false, status: 404 };
   },
 };
+const docListeners = new Map();
 global.document = {
   documentElement: docEl,
   head: headEl,
   body: bodyEl,
+  activeElement: null,
   getElementById(id) { return docEl.querySelector(`#${id}`); },
   createElement(t) { return new FakeElement(t); },
   querySelector(s) { return docEl.querySelector(s); },
   querySelectorAll(s) { return docEl.querySelectorAll(s); },
-  addEventListener() {},
-  removeEventListener() {},
+  addEventListener(type, fn) {
+    if (!docListeners.has(type)) docListeners.set(type, []);
+    docListeners.get(type).push(fn);
+  },
+  removeEventListener(type, fn) {
+    if (!docListeners.has(type)) return;
+    const arr = docListeners.get(type);
+    const idx = arr.indexOf(fn);
+    if (idx !== -1) arr.splice(idx, 1);
+  },
+  dispatchEvent(evt) {
+    const type = typeof evt === 'string' ? evt : evt?.type;
+    const eventObj = typeof evt === 'string' ? { type: evt, target: docEl } : evt;
+    for (const fn of (docListeners.get(type) || [])) {
+      fn(eventObj);
+    }
+    return eventObj;
+  },
 };
+const cppConvoView = new FakeElement('div');
+cppConvoView.setAttribute('data-testid', 'conversation-view');
+cppConvoView.setAttribute('data-cascade-id', 'chat-cpp-1');
+const cppInputBox = new FakeElement('div');
+cppInputBox.setAttribute('data-testid', 'agent-input-box');
+cppConvoView.appendChild(cppInputBox);
+bodyEl.appendChild(cppConvoView);
 global.MutationObserver = class { observe() {} disconnect() {} };
 global.requestAnimationFrame = () => 1;
 
@@ -6245,10 +6270,28 @@ class FakeElement {
     if (!this.listeners.has(t)) this.listeners.set(t, []);
     this.listeners.get(t).push(fn);
   }
+  dispatchEvent(type, eventInit = {}) {
+    const evt = {
+      type,
+      target: this,
+      ...eventInit,
+      preventDefault() {},
+      stopPropagation() {},
+    };
+    for (const fn of (this.listeners.get(type) || [])) fn(evt);
+    if (global.document && typeof global.document.dispatchEvent === 'function') {
+      global.document.dispatchEvent(evt);
+    }
+    return evt;
+  }
   closest(selector) {
     let cur = this;
     while (cur) {
       if (typeof selector === 'string' && selector.startsWith('#') && cur.id === selector.slice(1)) {
+        return cur;
+      }
+      const attrEq = /^\[([-a-zA-Z0-9_]+)="([^"]+)"\]$/.exec(selector || '');
+      if (attrEq && cur.getAttribute(attrEq[1]) === attrEq[2]) {
         return cur;
       }
       cur = cur.parentElement;
@@ -6566,17 +6609,42 @@ global.window = {
     return { ok: false, status: 404 };
   },
 };
+const docListeners = new Map();
 global.document = {
   documentElement: docEl,
   head: headEl,
   body: bodyEl,
+  activeElement: null,
   getElementById(id) { return docEl.querySelector(`#${id}`); },
   createElement(t) { return new FakeElement(t); },
   querySelector(s) { return docEl.querySelector(s); },
   querySelectorAll(s) { return docEl.querySelectorAll(s); },
-  addEventListener() {},
-  removeEventListener() {},
+  addEventListener(type, fn) {
+    if (!docListeners.has(type)) docListeners.set(type, []);
+    docListeners.get(type).push(fn);
+  },
+  removeEventListener(type, fn) {
+    if (!docListeners.has(type)) return;
+    const arr = docListeners.get(type);
+    const idx = arr.indexOf(fn);
+    if (idx !== -1) arr.splice(idx, 1);
+  },
+  dispatchEvent(evt) {
+    const type = typeof evt === 'string' ? evt : evt?.type;
+    const eventObj = typeof evt === 'string' ? { type: evt, target: docEl } : evt;
+    for (const fn of (docListeners.get(type) || [])) {
+      fn(eventObj);
+    }
+    return eventObj;
+  },
 };
+const cppConvoView = new FakeElement('div');
+cppConvoView.setAttribute('data-testid', 'conversation-view');
+cppConvoView.setAttribute('data-cascade-id', 'chat-cpp-1');
+const cppInputBox = new FakeElement('div');
+cppInputBox.setAttribute('data-testid', 'agent-input-box');
+cppConvoView.appendChild(cppInputBox);
+bodyEl.appendChild(cppConvoView);
 global.MutationObserver = class { observe() {} disconnect() {} };
 global.requestAnimationFrame = (cb) => { cb(); return 1; };
 let pendingTimers = new Map();
@@ -6659,17 +6727,115 @@ global.clearTimeout = (id) => {
   });
   await new Promise((r) => setImmediate(r));
 
-  // Must fail over to cpp-core healthy Opus 5.5 Medium (1369)
+  // Must fail over to cpp-core healthy Opus 5.5 Medium (1369) silently on passive view
   assert.strictEqual(
     storeState.modelSelection.byConversation['chat-cpp-1'].model,
     1369,
     `Exhausted Argon model must fail over to healthy Opus 1369, got: ${storeState.modelSelection.byConversation['chat-cpp-1']?.model}`
   );
+  assert.strictEqual(
+    global.document.getElementById('jetski-model-autopilot-toast'),
+    null,
+    'Passive chat switch must not mount autopilot toast before composer focus'
+  );
 
-  // Floating toast must mount
+  // Focusing the composer flushes the deferred autopilot toast once
+  cppInputBox.dispatchEvent('focusin');
   const toast = global.document.getElementById('jetski-model-autopilot-toast');
-  assert(toast, 'Autopilot floating toast must mount on failover');
+  assert(toast, 'Autopilot floating toast must mount when composer is focused');
   assert.strictEqual(toast.getAttribute('data-to-model'), 'Claude Opus 5.5 (Medium)');
+  toast.remove();
+
+  // Replaying trajectoryModelObserved (Chat A -> Chat B -> Chat A) or refocusing must not re-pop
+  reduxStore.dispatch({
+    type: 'modelSelection/trajectoryModelObserved',
+    payload: {
+      conversationId: 'chat-cpp-1',
+      turnKey: 'turn-1',
+      label: 'Gemini 4 Argon (High)',
+      model: 1393,
+      executionStartStep: 0,
+      queuedMessageIds: [],
+    },
+  });
+  cppInputBox.dispatchEvent('focusin');
+  assert.strictEqual(
+    global.document.getElementById('jetski-model-autopilot-toast'),
+    null,
+    'Already-shown (stepCount, toEnum) toast must not re-mount on tab revisit'
+  );
+
+  // R131 routing parity: sidecarId skia-g3-roll-check inside Skia Gardener, unmapped project,
+  // and CLI orchestrator chat on 1260 must not churn or recover spuriously
+  storeState.trajectorySummaries.summaries['chat-sidecar-triage'] = {
+    cascadeId: 'chat-sidecar-triage',
+    stepCount: 4,
+    trajectoryMetadata: {
+      projectId: 'e914e1c4-006a-433c-8270-52eff8775667',
+      sourceMetadata: { sidecar: { sidecarId: 'skia-g3-roll-check' } },
+    },
+    annotations: { title: '[14:10] ⦿ Roll triage', archived: false },
+  };
+  storeState.trajectorySummaries.summaries['chat-unmapped-proj'] = {
+    cascadeId: 'chat-unmapped-proj',
+    stepCount: 4,
+    trajectoryMetadata: { projectId: 'unmapped-my-work-uuid' },
+    annotations: { title: '[14:12] ⦿ My Work chat', archived: false },
+  };
+  storeState.trajectorySummaries.summaries['chat-orch-1260'] = {
+    cascadeId: 'chat-orch-1260',
+    stepCount: 4,
+    trajectoryMetadata: { projectId: '04508c43-54a0-4003-8051-7129cd997b88' },
+    annotations: { title: '[14:15] ⦿ Improving Experience 1260', archived: false },
+  };
+  reduxStore.dispatch({
+    type: 'modelSelection/trajectoryModelObserved',
+    payload: {
+      conversationId: 'chat-sidecar-triage',
+      turnKey: 't-sidecar',
+      label: 'Gemini 3.8 Flash (High)',
+      model: 1320,
+      executionStartStep: 2,
+      queuedMessageIds: [],
+    },
+  });
+  reduxStore.dispatch({
+    type: 'modelSelection/trajectoryModelObserved',
+    payload: {
+      conversationId: 'chat-unmapped-proj',
+      turnKey: 't-unmapped',
+      label: 'Gemini Pro Next',
+      model: 1260,
+      executionStartStep: 2,
+      queuedMessageIds: [],
+    },
+  });
+  reduxStore.dispatch({
+    type: 'modelSelection/trajectoryModelObserved',
+    payload: {
+      conversationId: 'chat-orch-1260',
+      turnKey: 't-orch-1260',
+      label: 'Gemini Pro Next',
+      model: 1260,
+      executionStartStep: 2,
+      queuedMessageIds: [],
+    },
+  });
+  assert.strictEqual(
+    storeState.modelSelection.byConversation['chat-sidecar-triage'].model,
+    1320,
+    'skia-g3-roll-check sidecar chat in Skia Gardener must resolve to triage and keep 1320'
+  );
+  assert.strictEqual(
+    storeState.modelSelection.byConversation['chat-unmapped-proj'].model,
+    1260,
+    'Unmapped project chat must keep its chosen model 1260'
+  );
+  assert.strictEqual(
+    storeState.modelSelection.byConversation['chat-orch-1260'].model,
+    1260,
+    'CLI orchestrator chat on 1260 without step0BootstrappedModels must stay on 1260'
+  );
 
   // 5. Existing conversation mid-chat failover: wasteful WTU model (Fable 5.1 -> Opus 5.5)
   reduxStore.dispatch({
@@ -9990,17 +10156,42 @@ global.window = {
   localStorage: { getItem: () => null, setItem: () => {} },
   fetch: async () => ({ ok: false, status: 404 }),
 };
+const docListeners = new Map();
 global.document = {
   documentElement: docEl,
   head: headEl,
   body: bodyEl,
+  activeElement: null,
   getElementById(id) { return docEl.querySelector(`#${id}`); },
   createElement(t) { return new FakeElement(t); },
   querySelector(s) { return docEl.querySelector(s); },
   querySelectorAll(s) { return docEl.querySelectorAll(s); },
-  addEventListener() {},
-  removeEventListener() {},
+  addEventListener(type, fn) {
+    if (!docListeners.has(type)) docListeners.set(type, []);
+    docListeners.get(type).push(fn);
+  },
+  removeEventListener(type, fn) {
+    if (!docListeners.has(type)) return;
+    const arr = docListeners.get(type);
+    const idx = arr.indexOf(fn);
+    if (idx !== -1) arr.splice(idx, 1);
+  },
+  dispatchEvent(evt) {
+    const type = typeof evt === 'string' ? evt : evt?.type;
+    const eventObj = typeof evt === 'string' ? { type: evt, target: docEl } : evt;
+    for (const fn of (docListeners.get(type) || [])) {
+      fn(eventObj);
+    }
+    return eventObj;
+  },
 };
+const cppConvoView = new FakeElement('div');
+cppConvoView.setAttribute('data-testid', 'conversation-view');
+cppConvoView.setAttribute('data-cascade-id', 'chat-cpp-1');
+const cppInputBox = new FakeElement('div');
+cppInputBox.setAttribute('data-testid', 'agent-input-box');
+cppConvoView.appendChild(cppInputBox);
+bodyEl.appendChild(cppConvoView);
 global.MutationObserver = class { observe() {} disconnect() {} };
 global.requestAnimationFrame = () => 1;
 
@@ -10994,17 +11185,42 @@ global.window = {
     return { ok: false, status: 404 };
   },
 };
+const docListeners = new Map();
 global.document = {
   documentElement: docEl,
   head: headEl,
   body: bodyEl,
+  activeElement: null,
   getElementById(id) { return docEl.querySelector(`#${id}`); },
   createElement(t) { return new FakeElement(t); },
   querySelector(s) { return docEl.querySelector(s); },
   querySelectorAll(s) { return docEl.querySelectorAll(s); },
-  addEventListener() {},
-  removeEventListener() {},
+  addEventListener(type, fn) {
+    if (!docListeners.has(type)) docListeners.set(type, []);
+    docListeners.get(type).push(fn);
+  },
+  removeEventListener(type, fn) {
+    if (!docListeners.has(type)) return;
+    const arr = docListeners.get(type);
+    const idx = arr.indexOf(fn);
+    if (idx !== -1) arr.splice(idx, 1);
+  },
+  dispatchEvent(evt) {
+    const type = typeof evt === 'string' ? evt : evt?.type;
+    const eventObj = typeof evt === 'string' ? { type: evt, target: docEl } : evt;
+    for (const fn of (docListeners.get(type) || [])) {
+      fn(eventObj);
+    }
+    return eventObj;
+  },
 };
+const cppConvoView = new FakeElement('div');
+cppConvoView.setAttribute('data-testid', 'conversation-view');
+cppConvoView.setAttribute('data-cascade-id', 'chat-cpp-1');
+const cppInputBox = new FakeElement('div');
+cppInputBox.setAttribute('data-testid', 'agent-input-box');
+cppConvoView.appendChild(cppInputBox);
+bodyEl.appendChild(cppConvoView);
 global.MutationObserver = class { observe() {} disconnect() {} };
 global.requestAnimationFrame = (cb) => { cb(); return 1; };
 global.setTimeout = () => 1;
@@ -11429,6 +11645,46 @@ async function refreshCatalogInStore() {
       1427,
       'Unpinned cpp-core chat on 1037 must immediately recover to Carbon High (1427) at 8% quota'
     );
+
+    // R131 pool-balance parity: when Opus is 40% (<55%) and Carbon High is 75% (>=60%),
+    // cpp-core selects Carbon High (1427) and does not bounce 1427 back to Opus
+    opusQuota = 0.40;
+    carbonQuota = 0.75;
+    await refreshCatalogInStore();
+    reduxStore.dispatch({
+      type: 'modelSelection/trajectoryModelObserved',
+      payload: {
+        conversationId: 'chat-unpinned-cpp',
+        turnKey: 'turn-carbon-balanced',
+        label: 'Gemini 4 Carbon (High)',
+        model: 1427,
+        executionStartStep: 3,
+        queuedMessageIds: [],
+      },
+    });
+    assert.strictEqual(
+      storeState.modelSelection.byConversation['chat-unpinned-cpp'].model,
+      1427,
+      'Pool-balanced Carbon High (1427) chat must not bounce back to depleted 40% Opus'
+    );
+
+    // Unchanged 60s GetAvailableModels poll must not re-dispatch userStatus/setUserStatus
+    let userStatusDispatches = 0;
+    const prevStatusRef = storeState.userStatus;
+    const origSub = subscribers.slice();
+    subscribers.push(() => {
+      if (storeState.userStatus !== prevStatusRef) userStatusDispatches++;
+    });
+    fakeNow += 61 * 1000;
+    reduxStore.dispatch({ type: 'NOOP' });
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(
+      userStatusDispatches,
+      0,
+      'Unchanged 60s GetAvailableModels poll must not replace storeState.userStatus'
+    );
+    subscribers.length = origSub.length;
 
     // When all flagship models are exhausted (0% quota), chat on 1037 (3.1 Pro) upgrades to
     // Gemini 3.8 Flash (High) (1320) as last-resort reserve and shows warning toast
