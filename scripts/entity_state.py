@@ -1028,6 +1028,8 @@ def compute_bug_entity_state(bug: Mapping[str, Any]) -> dict[str, Any]:
     phase = str(bug.get("merge_action_phase") or "confirm")
     actions.append(f"security_merge_{phase}")
   if bug.get("needs_self_assign"):
+    if bug.get("self_assign_conflict"):
+      actions.append("add_bug_collaborator")
     actions.append("assign_bug")
   if needs_you:
     actions.append("ack_bug")

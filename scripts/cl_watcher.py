@@ -10023,27 +10023,92 @@ def link_bugs_and_cls(
         })
     bug["linked_cls"] = subtasks
     b_status = str(bug.get("status") or "OPEN").upper()
-    has_active_self_cl = any(
-        bool(c.get("is_self"))
-        and bool(c.get("shared_1_to_1", True))
-        and str(c.get("status") or "NEW").upper() not in ("ABANDONED", "CLOSED")
+    b_source = str(bug.get("source") or "buganizer").lower()
+    b_state_reason = str(bug.get("state_reason") or "").upper()
+    merged_1to1_self_cls = [
+        c
         for c in subtasks
+        if bool(c.get("is_self"))
+        and bool(c.get("shared_1_to_1", True))
+        and str(c.get("status") or "").upper() in ("MERGED", "SUBMITTED")
+    ]
+    has_merged_self_cl = len(merged_1to1_self_cls) > 0
+    latest_self_merged_ts = max(
+        (
+            max(
+                float(c.get("submitted_ts") or 0.0),
+                float(c.get("activity_ts") or 0.0),
+                float(c.get("created_ts") or 0.0),
+            )
+            for c in merged_1to1_self_cls
+        ),
+        default=0.0,
     )
+    bug["latest_self_merged_ts"] = latest_self_merged_ts
+    raw_assignee = str(bug.get("assignee") or "").strip()
+    has_other_owner = (
+        bool(raw_assignee)
+        and raw_assignee.upper() not in ("N/A", "NONE", "-")
+        and not _is_self_bug_assignee(raw_assignee)
+    )
+    foreign_cls = [
+        c
+        for c in subtasks
+        if not bool(c.get("is_self"))
+        and str(c.get("status") or "").upper() not in ("ABANDONED", "CLOSED")
+    ]
+    has_foreign_cl = len(foreign_cls) > 0
+    self_assign_conflict = bool(has_other_owner or has_foreign_cl)
+    eligible_assign_status = b_status in (
+        "OPEN",
+        "NEW",
+        "ASSIGNED",
+        "ACCEPTED",
+        "FIXED",
+        "VERIFIED",
+    ) or (
+        b_source == "github"
+        and b_status == "CLOSED"
+        and b_state_reason != "NOT_PLANNED"
+    )
+    acked_ts = float(bug.get("acked_ts") or 0.0)
+    acked_after_self_merge = acked_ts >= max(1.0, latest_self_merged_ts)
+    # Trigger self-assignment only after a 1:1 own fix CL has merged, never while WIP or open
     needs_self_assign = bool(
-        has_active_self_cl
-        and b_status in ("OPEN", "NEW", "ASSIGNED", "ACCEPTED")
+        has_merged_self_cl
+        and eligible_assign_status
         and not is_merge_request_bug(bug)
         and not is_security_merge_request(bug)
         and not _is_skoretext_cl_only_external_bug(bug)
-        and not _is_self_bug_assignee(str(bug.get("assignee") or ""))
+        and not _is_self_bug_assignee(raw_assignee)
+        and not (b_source == "buganizer" and bool(bug.get("is_collaborator")))
+        and not acked_after_self_merge
     )
     bug["needs_self_assign"] = needs_self_assign
+    bug["self_assign_conflict"] = bool(needs_self_assign and self_assign_conflict)
+    owner_short = raw_assignee.split("@", 1)[0] if has_other_owner else ""
+    foreign_lbls = ", ".join(
+        str(c.get("label") or c.get("item_key")) for c in foreign_cls[:2]
+    )
+    conflict_parts = [
+        *(
+            [f"owner: {owner_short}"]
+            if owner_short
+            else []
+        ),
+        *(
+            [f"other CLs: {foreign_lbls}"]
+            if foreign_lbls
+            else []
+        ),
+    ]
+    bug["self_assign_conflict_reason"] = (
+        " · ".join(conflict_parts)
+        if needs_self_assign and self_assign_conflict
+        else ""
+    )
     bug["assign_target"] = (
-        (
-            "Rusino"
-            if str(bug.get("source") or "") == "github"
-            else "jlavrova@google.com"
-        )
+        ("Rusino" if b_source == "github" else "jlavrova@google.com")
         if needs_self_assign
         else ""
     )
@@ -10067,6 +10132,7 @@ def link_bugs_and_cls(
             "url": str(bug.get("url") or ""),
             "assignee": str(bug.get("assignee") or ""),
             "needs_self_assign": bool(bug.get("needs_self_assign")),
+            "self_assign_conflict": bool(bug.get("self_assign_conflict")),
             "assign_target": str(bug.get("assign_target") or ""),
         })
       elif bkey.startswith("buganizer:"):
@@ -10081,6 +10147,7 @@ def link_bugs_and_cls(
             "url": f"https://b.corp.google.com/issues/{bid}",
             "assignee": "",
             "needs_self_assign": False,
+            "self_assign_conflict": False,
             "assign_target": "",
         })
       elif bkey.startswith("gh_issue:flutter/flutter#"):
@@ -10095,6 +10162,7 @@ def link_bugs_and_cls(
             "url": f"https://github.com/flutter/flutter/issues/{gnum}",
             "assignee": "",
             "needs_self_assign": False,
+            "self_assign_conflict": False,
             "assign_target": "",
         })
     for _, rec in pairs:
@@ -11301,11 +11369,20 @@ def classify_bug_status(
   if ms_num is not None:
     bug["merge_milestone"] = ms_num
 
-  # Classify terminal upstream states into Fixed vs Closed (obsolete / duplicate / not planned)
+  acked_ts = float(bug.get("acked_ts") or 0.0)
+  latest_self_merged_ts = float(bug.get("latest_self_merged_ts") or 0.0)
+  pending_self_assign = bool(bug.get("needs_self_assign")) and acked_ts < max(
+      1.0, latest_self_merged_ts
+  )
+  # Classify terminal upstream states into Fixed vs Closed unless post-merge assignment is pending
   if source == "github" and status == "CLOSED":
-    bug["lane"] = "closed" if state_reason == "NOT_PLANNED" else "fixed"
-    return bug
-  if status in ("FIXED", "VERIFIED"):
+    if state_reason == "NOT_PLANNED":
+      bug["lane"] = "closed"
+      return bug
+    if not pending_self_assign:
+      bug["lane"] = "fixed"
+      return bug
+  if status in ("FIXED", "VERIFIED") and not pending_self_assign:
     bug["lane"] = "fixed"
     return bug
   if status.startswith("DUPLICATE") or status in (
@@ -11316,8 +11393,9 @@ def classify_bug_status(
       "WONT_FIX",
       "CLOSED",
   ):
-    bug["lane"] = "closed"
-    return bug
+    if not (source == "github" and status == "CLOSED" and pending_self_assign):
+      bug["lane"] = "closed"
+      return bug
 
   linked_cls = [c for c in (bug.get("linked_cls") or []) if isinstance(c, dict)]
   has_cl = len(linked_cls) > 0
@@ -11503,15 +11581,6 @@ def classify_bug_status(
       )
   )
 
-  has_chatted_1to1_self_cl = bool(
-      str(bug.get("conversation_id") or "").strip() and not bug.get("chat_archived")
-  ) or any(
-      bool(c.get("is_self"))
-      and bool(c.get("shared_1_to_1", True))
-      and bool(str(c.get("conversation_id") or "").strip())
-      and not bool(c.get("chat_archived"))
-      for c in linked_cls
-  )
   if unacked_comment:
     snip = str(bug.get("last_human_comment_snippet") or "").strip()
     prefix = (
@@ -11533,13 +11602,27 @@ def classify_bug_status(
     )
     bug["needs_you"] = True
     bug["why_needs_you"] = f"Collaborator{owner_part} — needs your review / input"
-  elif bool(bug.get("needs_self_assign")) and has_chatted_1to1_self_cl and acked_ts < 1.0:
+  elif pending_self_assign:
     short_lbl = str(bug.get("short_id") or bug.get("bug_key") or "issue")
     target_who = str(bug.get("assign_target") or "jlavrova")
+    conflict_reason = str(bug.get("self_assign_conflict_reason") or "").strip()
     bug["needs_you"] = True
-    bug["why_needs_you"] = (
-        f"Linked to your fix CL — assign {short_lbl} to {target_who}?"
-    )
+    if bug.get("self_assign_conflict"):
+      reason_part = f" ({conflict_reason})" if conflict_reason else ""
+      if source == "github":
+        bug["why_needs_you"] = (
+            f"Your fix CL merged on shared issue {short_lbl}{reason_part} — "
+            f"add {target_who} as co-assignee or Ack?"
+        )
+      else:
+        bug["why_needs_you"] = (
+            f"Your fix CL merged on shared bug {short_lbl}{reason_part} — "
+            "add as Collaborator, take Assignee, or Ack?"
+        )
+    else:
+      bug["why_needs_you"] = (
+          f"Your fix CL merged — assign {short_lbl} to {target_who}?"
+      )
   elif all_merged_unacked:
     bug["needs_you"] = True
     bug["why_needs_you"] = "All linked CLs merged — ready to mark Fixed?"
@@ -11560,6 +11643,9 @@ def classify_bug_status(
 
   if bug["needs_you"]:
     bug["lane"] = "you"
+    return bug
+  if status in ("CLOSED", "FIXED", "VERIFIED"):
+    bug["lane"] = "fixed"
     return bug
   if bug["is_overdue"]:
     bug["lane"] = "overdue"
@@ -12169,6 +12255,7 @@ def sync_bugs_into_state(
   ):
     # Refresh chat links, CL subtasks, and prune stale non-self entries between 5-min polls
     link_bugs_and_cls(prev_bugs, items, bug_chats=merged_chats)
+    _auto_assign_merged_self_cl_bugs(prev_bugs, items, state, now_ts=now_ts)
     fast_merge_parents = {
         f"buganizer:{str(b.get('parent_issue_id')).strip()}"
         for b in prev_bugs.values()
@@ -12344,6 +12431,7 @@ def sync_bugs_into_state(
 
   # Link bugs <-> CLs BEFORE project fallback so self-CL chats propagate project & titles
   link_bugs_and_cls(all_bugs, items, bug_chats=merged_chats)
+  _auto_assign_merged_self_cl_bugs(all_bugs, items, state, now_ts=now_ts)
   for bug in all_bugs.values():
     _resolve_redacted_bug_title(bug, all_bugs)
     if not bug.get("project_name") or bug.get("project_name") == "Unassigned":
@@ -12533,11 +12621,17 @@ def ack_bug_items(bug_keys: list[str]) -> dict[str, Any]:
         continue
       acked_val = max(
           now_ts,
+          1.0,
           float(bug.get("modified_ts") or 0.0),
           _parse_ts(bug.get("last_human_comment_at")),
           float(bug.get("latest_cl_merged_ts") or 0.0),
+          float(bug.get("latest_self_merged_ts") or 0.0),
       )
       bug["acked_ts"] = acked_val
+      bug["needs_self_assign"] = False
+      bug["self_assign_conflict"] = False
+      bug["self_assign_conflict_reason"] = ""
+      bug["assign_target"] = ""
       state.setdefault("bug_acks", {})[bkey] = acked_val
       classify_bug_status(bug, now_ts=now_ts)
       last_lane = str(bug.get("lane") or "assigned")
@@ -12547,6 +12641,7 @@ def ack_bug_items(bug_keys: list[str]) -> dict[str, Any]:
       acked.append(bkey)
     if not acked:
       return {"ok": False, "error": f"Unknown bug {keys[0]}"}
+    link_bugs_and_cls(bugs, state.get("items") or {})
     attach_merge_children_to_cls_and_bugs(bugs, state.get("items") or {})
     save_watcher_state(state)
     return {"ok": True, "bug_key": acked[0], "bug_keys": acked, "lane": last_lane}
@@ -12575,8 +12670,11 @@ def normalize_bug_key(raw: str) -> str:
   return val
 
 
-def _assign_single_bug_to_self(bkey: str) -> dict[str, Any]:
-  """Assigns one GitHub (`Rusino`) or Buganizer (`jlavrova@google.com`) issue and verifies it."""
+def _assign_single_bug_to_self(
+    bkey: str, mode: str = "assignee"
+) -> dict[str, Any]:
+  """Assigns or adds Collaborator on one GitHub (`Rusino`) or Buganizer (`jlavrova@google.com`) bug."""
+  norm_mode = "collaborator" if str(mode or "").strip().lower() == "collaborator" else "assignee"
   if bkey.startswith("gh_issue:"):
     rest = bkey.split(":", 1)[1]
     if "#" not in rest:
@@ -12627,6 +12725,7 @@ def _assign_single_bug_to_self(bkey: str) -> dict[str, Any]:
         "bug_key": bkey,
         "source": "github",
         "id": num,
+        "mode": norm_mode,
         "assignee": joined,
     }
 
@@ -12634,6 +12733,32 @@ def _assign_single_bug_to_self(bkey: str) -> dict[str, Any]:
     bid = bkey.split(":", 1)[1].strip()
     if not bid.isdigit():
       return {"ok": False, "bug_key": bkey, "error": f"Invalid Buganizer ID: {bid}"}
+    if norm_mode == "collaborator":
+      outs = call_buganizer_mcp_batch([
+          (
+              "safe_add_collaborator",
+              {"issueId": bid, "collaborator": "jlavrova@google.com"},
+          ),
+      ])
+      c_out = outs[0] if outs else ""
+      if not _mcp_mutation_succeeded(c_out):
+        return {
+            "ok": False,
+            "bug_key": bkey,
+            "source": "buganizer",
+            "id": bid,
+            "mode": "collaborator",
+            "error": c_out or "safe_add_collaborator failed",
+        }
+      return {
+          "ok": True,
+          "bug_key": bkey,
+          "source": "buganizer",
+          "id": bid,
+          "mode": "collaborator",
+          "is_collaborator": True,
+      }
+
     outs = call_buganizer_mcp_batch([
         ("safe_reassign_issue", {"issueId": bid, "assignee": "jlavrova@google.com"}),
         (
@@ -12655,6 +12780,7 @@ def _assign_single_bug_to_self(bkey: str) -> dict[str, Any]:
           "bug_key": bkey,
           "source": "buganizer",
           "id": bid,
+          "mode": "assignee",
           "error": p1_out or f"Read-back assignee mismatch: {rb_assignee!r}",
       }
     return {
@@ -12662,6 +12788,7 @@ def _assign_single_bug_to_self(bkey: str) -> dict[str, Any]:
         "bug_key": bkey,
         "source": "buganizer",
         "id": bid,
+        "mode": "assignee",
         "assignee": rb_assignee or "jlavrova@google.com",
         "status": rb_status or "ASSIGNED",
     }
@@ -12669,18 +12796,87 @@ def _assign_single_bug_to_self(bkey: str) -> dict[str, Any]:
   return {"ok": False, "bug_key": bkey, "error": f"Unsupported bug key: {bkey}"}
 
 
-def assign_bug_to_self_for_state(bug_keys: list[str]) -> dict[str, Any]:
-  """Assigns one or more linked bugs to Yulia and updates `cl_watcher_state.json`."""
+def _auto_assign_merged_self_cl_bugs(
+    bugs_by_key: dict[str, dict[str, Any]],
+    items_by_key: dict[str, dict[str, Any]],
+    state: dict[str, Any],
+    now_ts: float | None = None,
+) -> None:
+  """Auto-assigns unowned bugs with no foreign CLs once a 1:1 self fix CL merges."""
+  cur_now = time.time() if now_ts is None else now_ts
+  ledger = state.setdefault("auto_assigned_bugs", {})
+  events = state.setdefault("events", [])
+  changed = False
+  for bkey, bug in list(bugs_by_key.items()):
+    if not isinstance(bug, dict):
+      continue
+    if not bug.get("needs_self_assign") or bug.get("self_assign_conflict"):
+      continue
+    if bkey in ledger:
+      continue
+    res = _assign_single_bug_to_self(bkey, mode="assignee")
+    if res.get("ok"):
+      asg = str(res.get("assignee") or bug.get("assign_target") or "")
+      ledger[bkey] = {"ts": cur_now, "assignee": asg, "ok": True}
+      bug["assignee"] = asg
+      bug["needs_self_assign"] = False
+      bug["self_assign_conflict"] = False
+      bug["self_assign_conflict_reason"] = ""
+      bug["assign_target"] = ""
+      if res.get("status"):
+        bug["status"] = str(res["status"])
+      changed = True
+      merged_self_lbls = [
+          str(c.get("label") or c.get("item_key") or "CL")
+          for c in (bug.get("linked_cls") or [])
+          if isinstance(c, dict)
+          and bool(c.get("is_self"))
+          and str(c.get("status") or "").upper() in ("MERGED", "SUBMITTED")
+      ]
+      cl_lbl = merged_self_lbls[0] if merged_self_lbls else "fix CL"
+      short_lbl = str(bug.get("short_id") or bkey)
+      events.insert(
+          0,
+          {
+              "id": f"ev-bug-assign-{int(cur_now * 1000)}-{bug.get('id') or bkey}",
+              "time": now_et_str(),
+              "item_key": bkey,
+              "target_id": str(bug.get("id") or ""),
+              "conversation_id": str(bug.get("conversation_id") or ""),
+              "project_name": str(bug.get("project_name") or "Skia"),
+              "critical": False,
+              "message": (
+                  f"[BUG-WATCHER] 👤 Auto-assigned {short_lbl} to {asg} "
+                  f"after {cl_lbl} merged."
+              ),
+          },
+      )
+      del events[50:]
+    else:
+      ledger[bkey] = {
+          "ts": cur_now,
+          "ok": False,
+          "error": str(res.get("error") or ""),
+      }
+  if changed:
+    link_bugs_and_cls(bugs_by_key, items_by_key)
+
+
+def assign_bug_to_self_for_state(
+    bug_keys: list[str], mode: str = "assignee"
+) -> dict[str, Any]:
+  """Assigns or adds Collaborator on one or more linked bugs and updates `cl_watcher_state.json`."""
   norm_keys = [
       normalize_bug_key(k) for k in bug_keys if normalize_bug_key(k)
   ]
   if not norm_keys:
     return {"ok": False, "error": "Missing bug_key"}
+  norm_mode = "collaborator" if str(mode or "").strip().lower() == "collaborator" else "assignee"
   results: list[dict[str, Any]] = []
   assigned: list[str] = []
   failed: list[str] = []
   for bkey in dict.fromkeys(norm_keys):
-    res = _assign_single_bug_to_self(bkey)
+    res = _assign_single_bug_to_self(bkey, mode=norm_mode)
     results.append(res)
     if res.get("ok"):
       assigned.append(bkey)
@@ -12688,6 +12884,7 @@ def assign_bug_to_self_for_state(bug_keys: list[str]) -> dict[str, Any]:
       failed.append(bkey)
 
   if assigned:
+    now_ts = time.time()
     with _STATE_IO_LOCK:
       latest_state = load_watcher_state()
       latest_bugs = latest_state.setdefault("bugs", {})
@@ -12698,16 +12895,29 @@ def assign_bug_to_self_for_state(bug_keys: list[str]) -> dict[str, Any]:
         bk = str(res.get("bug_key") or "")
         bug = latest_bugs.get(bk)
         if isinstance(bug, dict):
-          bug["assignee"] = str(res.get("assignee") or "")
+          if res.get("mode") == "collaborator" and res.get("source") == "buganizer":
+            bug["is_collaborator"] = True
+            acked_val = max(
+                now_ts,
+                1.0,
+                float(bug.get("modified_ts") or 0.0),
+                float(bug.get("latest_self_merged_ts") or 0.0),
+            )
+            bug["acked_ts"] = acked_val
+            latest_state.setdefault("bug_acks", {})[bk] = acked_val
+          else:
+            bug["assignee"] = str(res.get("assignee") or "")
+            bug["is_collaborator"] = False
+            if res.get("status"):
+              bug["status"] = str(res["status"])
           bug["needs_self_assign"] = False
+          bug["self_assign_conflict"] = False
+          bug["self_assign_conflict_reason"] = ""
           bug["assign_target"] = ""
-          bug["is_collaborator"] = False
-          if res.get("status"):
-            bug["status"] = str(res["status"])
       link_bugs_and_cls(latest_bugs, latest_items)
       for bk in assigned:
         if isinstance(latest_bugs.get(bk), dict):
-          classify_bug_status(latest_bugs[bk])
+          classify_bug_status(latest_bugs[bk], now_ts=now_ts)
       attach_merge_children_to_cls_and_bugs(latest_bugs, latest_items)
       save_watcher_state(latest_state)
 
@@ -12715,7 +12925,9 @@ def assign_bug_to_self_for_state(bug_keys: list[str]) -> dict[str, Any]:
   return {
       "ok": bool(assigned and not failed),
       "bug_key": str(first.get("bug_key") or norm_keys[0]),
+      "mode": norm_mode,
       "assignee": str(first.get("assignee") or ""),
+      "is_collaborator": bool(first.get("is_collaborator")),
       "error": str(first.get("error") or ""),
       "assigned": assigned,
       "failed": failed,
@@ -12757,9 +12969,10 @@ def merge_concurrent_state_mutations(
           if not _should_retain_bug_in_view(bug):
             bugs.pop(bkey, None)
 
-  # 2. Union confirmed_merge_bugs, review_claims, and github_rerequest_ledger
+  # 2. Union confirmed_merge_bugs, auto_assigned_bugs, review_claims, and github_rerequest_ledger
   for dict_key in (
       "confirmed_merge_bugs",
+      "auto_assigned_bugs",
       "review_claims",
       "github_rerequest_ledger",
   ):
@@ -12771,7 +12984,7 @@ def merge_concurrent_state_mutations(
         if k not in b_map or b_map.get(k) != v:
           s_map[k] = v
 
-  # 3. Preserve concurrent bug mutations (ack, merge reassignment, start_chat)
+  # 3. Preserve concurrent bug mutations (ack, merge reassignment, collaborator, start_chat)
   disk_bugs = disk_state.get("bugs")
   state_bugs = state.get("bugs")
   if isinstance(disk_bugs, dict) and isinstance(state_bugs, dict):
@@ -12787,17 +13000,31 @@ def merge_concurrent_state_mutations(
       b_acked = float(bbug.get("acked_ts") or 0.0)
       if d_acked > max(b_acked, float(sbug.get("acked_ts") or 0.0)):
         sbug["acked_ts"] = d_acked
+        if not dbug.get("needs_self_assign"):
+          sbug["needs_self_assign"] = False
+          sbug["self_assign_conflict"] = False
+          sbug["self_assign_conflict_reason"] = ""
+          sbug["assign_target"] = ""
         changed = True
       d_asg = str(dbug.get("assignee") or "").strip().lower()
       b_asg = str(bbug.get("assignee") or "").strip().lower()
-      if (d_asg == "merges@chromium.org" and b_asg != "merges@chromium.org") or (
-          _is_self_bug_assignee(d_asg) and not _is_self_bug_assignee(b_asg)
+      d_collab = bool(dbug.get("is_collaborator"))
+      b_collab = bool(bbug.get("is_collaborator"))
+      if (
+          (d_asg == "merges@chromium.org" and b_asg != "merges@chromium.org")
+          or (_is_self_bug_assignee(d_asg) and not _is_self_bug_assignee(b_asg))
+          or (d_collab and not b_collab)
       ):
-        sbug["assignee"] = dbug.get("assignee")
+        if dbug.get("assignee"):
+          sbug["assignee"] = dbug.get("assignee")
         sbug["is_collaborator"] = bool(
             dbug.get("is_collaborator", d_asg == "merges@chromium.org")
         )
         sbug["needs_self_assign"] = bool(dbug.get("needs_self_assign", False))
+        sbug["self_assign_conflict"] = bool(dbug.get("self_assign_conflict", False))
+        sbug["self_assign_conflict_reason"] = str(
+            dbug.get("self_assign_conflict_reason") or ""
+        )
         sbug["assign_target"] = str(dbug.get("assign_target") or "")
         changed = True
       if dbug.get("conversation_id") and dbug.get("conversation_id") != bbug.get(
@@ -18613,9 +18840,20 @@ function bugFocusCard(bug, data) {
   const ackBtn = `<button class="btn secondary" ` +
     `onclick="ackBug(${esc(JSON.stringify(bug.bug_key || ''))}, this)">✓ Ack</button>`;
   const assignBtn = bug.needs_self_assign
-    ? `<button class="btn primary" ` +
-      `onclick="assignBugToSelf(${esc(JSON.stringify(bug.bug_key || ''))}, this)">` +
-      `👤 Assign to ${esc(bug.assign_target || 'me')}</button>`
+    ? (bug.self_assign_conflict
+      ? (bug.source === 'github'
+        ? `<button class="btn primary" ` +
+          `onclick="assignBugToSelf(${esc(JSON.stringify(bug.bug_key || ''))}, this, 'collaborator')">` +
+          `👥 Add ${esc(bug.assign_target || 'Rusino')} as co-assignee</button>`
+        : `<button class="btn primary" ` +
+          `onclick="assignBugToSelf(${esc(JSON.stringify(bug.bug_key || ''))}, this, 'collaborator')">` +
+          `👥 Add me as Collaborator</button>` +
+          `<button class="btn secondary" ` +
+          `onclick="assignBugToSelf(${esc(JSON.stringify(bug.bug_key || ''))}, this, 'assignee')">` +
+          `👤 Take Assignee</button>`)
+      : `<button class="btn primary" ` +
+        `onclick="assignBugToSelf(${esc(JSON.stringify(bug.bug_key || ''))}, this, 'assignee')">` +
+        `👤 Assign to ${esc(bug.assign_target || 'me')}</button>`)
     : '';
   const openBtnCls = assignBtn ? 'btn secondary' : 'btn primary';
   return `<article class="card${isAlert ? ' alert' : ''}">` +
@@ -18631,13 +18869,19 @@ function bugFocusCard(bug, data) {
 function bugRowHtml(bug, data) {
   const ownerActor = (bug.assignee && bug.assignee !== 'N/A') ? shortActor(bug.assignee) : '';
   const assignInline = bug.needs_self_assign
-    ? `<button class="link-btn" ` +
-      `onclick="assignBugToSelf(${esc(JSON.stringify(bug.bug_key || ''))}, this)">` +
-      `👤 assign to ${esc(bug.assign_target || 'me')}</button>`
+    ? (bug.self_assign_conflict
+      ? `<button class="link-btn" ` +
+        `onclick="assignBugToSelf(${esc(JSON.stringify(bug.bug_key || ''))}, this, 'collaborator')">` +
+        `👥 ${bug.source === 'github' ? 'add co-assignee' : 'add Collaborator'}</button>`
+      : `<button class="link-btn" ` +
+        `onclick="assignBugToSelf(${esc(JSON.stringify(bug.bug_key || ''))}, this, 'assignee')">` +
+        `👤 assign to ${esc(bug.assign_target || 'me')}</button>`)
     : '';
   const actorMeta = bug.is_collaborator
     ? `Collaborator${ownerActor ? ` · owner: ${esc(ownerActor)}` : ''}`
-    : (ownerActor ? esc(ownerActor) : assignInline);
+    : (ownerActor
+      ? (assignInline ? `${esc(ownerActor)} · ${assignInline}` : esc(ownerActor))
+      : assignInline);
   const meta = [
     `<span class="proj-tag">${esc(bug.project_name || 'Skia')}</span>`,
     `<span class="cl">${link(bug.url, esc(bug.short_id || bug.bug_key))}</span>`,
@@ -19546,19 +19790,19 @@ async function ackBug(bugKey, btn) {
   return ackBugs([bugKey], btn);
 }
 
-async function assignBugToSelf(bugKeys, btn) {
+async function assignBugToSelf(bugKeys, btn, mode = 'assignee') {
   const keys = Array.isArray(bugKeys) ? bugKeys.filter(Boolean) : [bugKeys].filter(Boolean);
   if (!keys.length || (btn && btn.disabled)) return;
   const orig = btn ? btn.textContent : '';
   if (btn) {
     btn.disabled = true;
-    btn.textContent = 'Assigning…';
+    btn.textContent = mode === 'collaborator' ? 'Adding…' : 'Assigning…';
   }
   try {
     const resp = await fetch('/api/assign_bug', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({bug_keys: keys, bug_key: keys[0]}),
+      body: JSON.stringify({bug_keys: keys, bug_key: keys[0], mode: mode || 'assignee'}),
     });
     const res = await resp.json();
     if (res && res.ok) {
@@ -19923,11 +20167,15 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
           )
       elif parsed.path == "/api/assign_bug":
         raw_bkeys = bdict.get("bug_keys")
+        req_mode = str(bdict.get("mode") or "assignee")
         if isinstance(raw_bkeys, list) and raw_bkeys:
-          res = assign_bug_to_self_for_state([str(k) for k in raw_bkeys if k])
+          res = assign_bug_to_self_for_state(
+              [str(k) for k in raw_bkeys if k], mode=req_mode
+          )
         else:
           res = assign_bug_to_self_for_state(
-              [str(bdict.get("bug_key") or bdict.get("item_key") or "")]
+              [str(bdict.get("bug_key") or bdict.get("item_key") or "")],
+              mode=req_mode,
           )
       elif parsed.path == "/api/confirm_merge":
         res = confirm_security_merge_group(

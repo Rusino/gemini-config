@@ -110,9 +110,13 @@ def reassign_security_merge(issue_id: str | int) -> dict[str, Any]:
   return w.reassign_security_merge_for_state([bid])
 
 
-def assign_bug_to_self(bug_key_or_id: str | int) -> dict[str, Any]:
-  """Assigns a GitHub (`Rusino`) or Buganizer (`jlavrova@google.com`) bug and verifies read-back."""
-  return w.assign_bug_to_self_for_state([str(bug_key_or_id or "").strip()])
+def assign_bug_to_self(
+    bug_key_or_id: str | int, mode: str = "assignee"
+) -> dict[str, Any]:
+  """Assigns or adds Collaborator on a GitHub (`Rusino`) or Buganizer (`jlavrova@google.com`) bug."""
+  return w.assign_bug_to_self_for_state(
+      [str(bug_key_or_id or "").strip()], mode=mode
+  )
 
 
 def is_authorized_to_render_bug(
@@ -196,7 +200,12 @@ def main(argv: list[str] | None = None) -> int:
   elif action == "reassign_merge":
     out = reassign_security_merge(issue_id)
   elif action == "assign_self":
-    out = assign_bug_to_self(issue_id)
+    mode = (
+        "collaborator"
+        if any(a in ("--collaborator", "collaborator") for a in args[2:])
+        else "assignee"
+    )
+    out = assign_bug_to_self(issue_id, mode=mode)
   elif action == "render":
     out = render_issue_with_external_auth(issue_id)
   else:
