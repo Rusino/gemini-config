@@ -675,7 +675,8 @@ def spine_step_short_state(
   if item.get("chat_busy"):
     return {"short": "Working", "icon": "⏳", "tone": "spine-you"}
 
-  tr = item.get("triage")
+  # Review triage outcomes apply only to changes where we act as reviewer, never our own CLs
+  tr = item.get("triage") if is_reviewer_change(item) else None
   if isinstance(tr, Mapping) and tr.get("review_outcome") and not is_triage_stale(item):
     out = str(tr["review_outcome"]).upper()
     g_state = combined_gate_state(item)
@@ -751,7 +752,8 @@ def upstream_blockers_of(
     if anc.get("cq_failed") or anc.get("phase") == "ALERT_CQ_FAILED":
       reasons.append("CQ failed")
 
-    tr = anc.get("triage")
+    # Only reviewer ancestors can hold descendants on review-triage outcomes
+    tr = anc.get("triage") if is_reviewer_change(anc) else None
     if isinstance(tr, Mapping) and not anc.get("self_approved"):
       v = str(tr.get("review_outcome") or tr.get("verdict") or "").upper()
       g_state = combined_gate_state(anc)

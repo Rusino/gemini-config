@@ -1945,6 +1945,10 @@ def overlay_triage_on_items(
     for it in items:
         if not isinstance(it, dict):
             continue
+        # Self-authored changes are not reviewer targets and must not carry review-triage state
+        if it.get("is_self"):
+            it.pop("triage", None)
+            continue
         ikey = str(it.get("item_key") or "")
         tid = str(it.get("target_id") or "")
 

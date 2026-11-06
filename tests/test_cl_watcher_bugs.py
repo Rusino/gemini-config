@@ -2186,6 +2186,94 @@ vm.runInThisContext(scriptContent + '\n' + harness);
       )
     self.assertEqual(woken, [])
 
+  def test_link_bug_chats_to_unchatted_self_cls_and_active_leaf_supersedes_stale_bug_chat(
+      self,
+  ) -> None:
+    active_discovered = [{
+        "item_key": "gerrit:1418376",
+        "kind": "gerrit",
+        "target_id": "1418376",
+        "conversation_id": "",
+        "title": "[skparagraph] Cap letter spacing line shift",
+        "project_id": "",
+        "project_name": "Skia",
+        "single_target": True,
+    }]
+    fetched_cache = {
+        "gerrit:1418376": {
+            "ok": True,
+            "is_self": True,
+            "subject": "[skparagraph] Cap letter spacing line shift",
+            "commit_message": (
+                "[skparagraph] Cap letter spacing line shift\n\n"
+                "Bug: https://github.com/flutter/flutter/issues/184815\n"
+            ),
+            "host": w.GERRIT_SKIA_HOST,
+        }
+    }
+    bug_chats = {
+        "gh_issue:flutter/flutter#184815": {
+            "bug_key": "gh_issue:flutter/flutter#184815",
+            "conversation_id": "16842a70-84ac-4cbf-8490-17d675287052",
+            "title": "[14:51] ⏳ [SkParagraph] flutter#184815: Cap letter-spacing shift on RTL",
+            "project_id": "proj-skp",
+            "project_name": "SkParagraph",
+            "chat_last_modified": "2026-11-05T19:51:44Z",
+            "single_target": True,
+            "chat_busy": False,
+            "chat_archived": False,
+        }
+    }
+    w.link_bug_chats_to_unchatted_self_cls(
+        active_discovered, fetched_cache, bug_chats=bug_chats
+    )
+    self.assertEqual(
+        active_discovered[0]["conversation_id"],
+        "16842a70-84ac-4cbf-8490-17d675287052",
+    )
+    self.assertEqual(active_discovered[0]["project_name"], "SkParagraph")
+
+    # Active handoff leaf supersedes an older cached conversation_id on the bug and rekeys a
+    # fix-link-misrouted CL record
+    bugs = {
+        "gh_issue:flutter/flutter#184815": {
+            "bug_key": "gh_issue:flutter/flutter#184815",
+            "source": "github",
+            "id": "184815",
+            "short_id": "flutter#184815",
+            "title": "RTL letter spacing cursor offset",
+            "status": "OPEN",
+            "conversation_id": "3d1e2bf2-1774-4569-943b-e63865282c81",
+            "chat_archived": False,
+            "chat_last_modified": "2026-11-05T18:10:00Z",
+        }
+    }
+    items = {
+        "gerrit:1418376@68fead9a": {
+            "item_key": "gerrit:1418376",
+            "kind": "gerrit",
+            "target_id": "1418376",
+            "is_self": True,
+            "status": "NEW",
+            "subject": "[skparagraph] Cap letter spacing line shift",
+            "commit_message": "Bug: https://github.com/flutter/flutter/issues/184815",
+            "conversation_id": "68fead9a",
+            "chat_from_fix_link": True,
+            "chat_archived": False,
+        }
+    }
+    w.link_bugs_and_cls(bugs, items, bug_chats=bug_chats)
+    self.assertEqual(
+        bugs["gh_issue:flutter/flutter#184815"]["conversation_id"],
+        "16842a70-84ac-4cbf-8490-17d675287052",
+    )
+    self.assertIn(
+        "gerrit:1418376@16842a70-84ac-4cbf-8490-17d675287052", items
+    )
+    self.assertTrue(
+        bugs["gh_issue:flutter/flutter#184815"]["linked_cls"][0]["shared_chat"]
+    )
+
 
 if __name__ == "__main__":
   unittest.main()

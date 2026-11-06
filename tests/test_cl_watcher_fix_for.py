@@ -799,6 +799,95 @@ process.exit(0);
     )
     self.assertEqual(res.returncode, 0, f"Node output: {res.stdout}\nError: {res.stderr}")
 
+  def test_gerrit_1418376_tested_block_and_postmortem_state_do_not_false_link_fix_for(
+      self,
+  ) -> None:
+    msg_1418376 = (
+        "[skparagraph] Cap letter spacing line shift\n\n"
+        "Bug: https://github.com/flutter/flutter/issues/184815\n\n"
+        "Tested:\n"
+        "- Trybot Test-Ubuntu24.04-Clang-GCE-CPU-AVX2-x86_64-Debug-All-FreeType_ASAN (passed)\n"
+        "Change-Id: I1418376\n"
+    )
+    _, syms = cl_watcher.extract_test_identifiers(
+        "[skparagraph] Cap letter spacing line shift",
+        msg_1418376,
+        ["modules/skparagraph/src/TextLine.cpp", "modules/skparagraph/tests/SkParagraphTest.cpp"],
+    )
+    self.assertNotIn("Test", syms)
+
+    full_bots, pairs, has_cue = cl_watcher.extract_bot_mentions_and_failure_cues(
+        "[skparagraph] Cap letter spacing line shift",
+        msg_1418376,
+    )
+    self.assertEqual(full_bots, set())
+    self.assertEqual(pairs, set())
+    self.assertFalse(has_cue)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      pid = "proj-skp"
+      cid = "68fead9a-56d3-4026-bc05-fb512ef128fe"
+      sdir = os.path.join(tmpdir, pid, "state")
+      os.makedirs(sdir, exist_ok=True)
+      with open(os.path.join(sdir, f"{cid}.md"), "w", encoding="utf-8") as f:
+        f.write(
+            "# Chain State: Gerrit 1414546 / Post-Mortem & Safeguards Shipped "
+            "for Gerrit 1418376 RTL Bug\n\n"
+            "## Follow-up Fix CLs\n"
+            "- Post-Mortem for Gerrit 1418376\n"
+        )
+      with mock.patch.object(cl_watcher, "ROADMAPS_DIR", tmpdir):
+        extra_cls, _ = cl_watcher.extract_state_file_targets(pid, cid)
+      self.assertIn("1414546", extra_cls)
+      self.assertNotIn("1418376", extra_cls)
+
+    merged_1414546 = {
+        "item_key": "gerrit:1414546",
+        "kind": "gerrit",
+        "target_id": "1414546",
+        "status": "MERGED",
+        "is_self": True,
+        "owner_email": "jlavrova@google.com",
+        "subject": "[skparagraph] Apply letter spacing inside each run",
+        "commit_message": msg_1418376.replace("I1418376", "I1414546"),
+        "files": [
+            "modules/skparagraph/src/TextLine.cpp",
+            "modules/skparagraph/tests/SkParagraphTest.cpp",
+        ],
+        "submitted": "2026-11-05T15:52:41Z",
+        "conversation_id": "68fead9a-56d3-4026-bc05-fb512ef128fe",
+        "post_submit": {"has_alert": False, "broken_bots": [], "incidents": []},
+    }
+    open_1418376 = {
+        "item_key": "gerrit:1418376",
+        "kind": "gerrit",
+        "target_id": "1418376",
+        "status": "NEW",
+        "is_self": True,
+        "owner_email": "jlavrova@google.com",
+        "subject": "[skparagraph] Cap letter spacing line shift",
+        "commit_message": msg_1418376,
+        "files": [
+            "modules/skparagraph/src/TextLine.cpp",
+            "modules/skparagraph/tests/SkParagraphTest.cpp",
+        ],
+        "created": "2026-11-05T18:54:40Z",
+        "conversation_id": "68fead9a-56d3-4026-bc05-fb512ef128fe",
+        "chat_from_fix_link": True,
+        "fixes_breakage_from": "gerrit:1414546",
+        "fixes_breakage_bots": [{"task_name": "Perf-iOS18", "task_url": "", "swarming_url": ""}],
+    }
+    active = [dict(merged_1414546), dict(open_1418376)]
+    fetched = {
+        "gerrit:1414546": {"ok": True, **merged_1414546},
+        "gerrit:1418376": {"ok": True, **open_1418376},
+    }
+    cl_watcher.link_fix_changes_to_parent_chats(active, fetched)
+    rec_1418376 = active[1]
+    self.assertNotIn("fixes_breakage_from", rec_1418376)
+    self.assertNotIn("fixes_breakage_bots", rec_1418376)
+    self.assertEqual(rec_1418376["conversation_id"], "")
+
 
 if __name__ == "__main__":
   unittest.main()

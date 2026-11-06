@@ -1119,6 +1119,65 @@ console.log(JSON.stringify({
     )
     self.assertEqual(ui["unassGap"], '<span class="amber">Needs 2 reviewers</span>')
 
+  def test_self_authored_cl_suppresses_triage_overlay_and_lgtm_blocked_badge(self):
+    import tempfile
+    import entity_state
+    import triage_store
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      triage_store.save_triage_result(
+          {
+              "item_key": "gerrit:1418376",
+              "kind": "gerrit",
+              "target_id": "1418376",
+              "review_outcome": "CLEAN",
+              "summary": "Comment reply ready",
+              "triaged_patchset": 1,
+          },
+          results_dir=tmpdir,
+      )
+      self_item = {
+          "item_key": "gerrit:1418376",
+          "kind": "gerrit",
+          "target_id": "1418376",
+          "status": "NEW",
+          "is_self": True,
+          "role": "author",
+          "patchset": 1,
+          "triage": {"review_outcome": "CLEAN", "has_unresolved_comments": True},
+      }
+      triage_store.overlay_triage_on_items(
+          [self_item], results_dir=tmpdir, ingest_tmp=False
+      )
+      self.assertNotIn("triage", self_item)
+
+    stale_self_with_triage = {
+        "item_key": "gerrit:1418376",
+        "kind": "gerrit",
+        "target_id": "1418376",
+        "status": "NEW",
+        "is_self": True,
+        "role": "author",
+        "patchset": 1,
+        "in_my_attention": True,
+        "triage": {
+            "review_outcome": "PUSHBACK",
+            "has_unresolved_comments": True,
+            "triaged_patchset": 1,
+        },
+    }
+    step_state = entity_state.spine_step_short_state(stale_self_with_triage)
+    self.assertNotEqual(step_state["short"], "Pushback")
+
+    script_body = w.DASHBOARD_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+    harness = (
+        script_body.split("\nboot();", 1)[0]
+        + f"\nconst it = {json.dumps(stale_self_with_triage)};\n"
+        + "console.log(JSON.stringify({triage: triageHtml(it, false)}));\n"
+    )
+    out = subprocess.check_output(["node", "-"], input=harness, encoding="utf-8")
+    self.assertEqual(json.loads(out)["triage"], "")
+
 
 if __name__ == "__main__":
   unittest.main()

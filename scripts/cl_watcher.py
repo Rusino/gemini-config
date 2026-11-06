@@ -173,8 +173,13 @@ RE_FAILURE_CUE = re.compile(
     r"|fix(?:es|ed)?\s+(?:the\s+)?(?:build|test|bot|failure|breakage"
     r"|regression|crash|asan|msan|tsan|ubsan)|broke\b|broken\s+on\b)"
 )
+# Require a real test identifier prefix/suffix and reject hyphenated bot names like Test-Ubuntu
 RE_TEST_SYMBOL = re.compile(
-    r"\b([A-Za-z0-9_]*(?:_[bB]\d{5,}|Test[A-Za-z0-9_]*))\b"
+    r"(?<![A-Za-z0-9_-])("
+    r"[A-Za-z0-9_]+_[bB]\d{5,}[A-Za-z0-9_]*"
+    r"|[A-Za-z0-9_]+Test(?:[A-Z0-9_][A-Za-z0-9_]*)?"
+    r"|Test_[A-Za-z0-9_]+"
+    r")(?![A-Za-z0-9_-])"
 )
 RE_FAILING_TEST_REASON = re.compile(r"matching failing test '([^']+)'")
 RE_CRASH_TEST_NAME = re.compile(r"\[([A-Za-z0-9_]+)\]:")
@@ -1146,12 +1151,17 @@ def extract_state_file_targets(
         line = raw_line.strip()
         if not line:
           continue
-        # Extract from main H1 header (e.g. "# State: ... fix CL 1411716")
+        # Extract from main H1 header while ignoring trailing post-mortem/incident clauses
         if line.startswith("# ") and not line.startswith("##"):
-          for cid_str, h in extract_cl_ids_with_hosts(line).items():
+          # Strip post-mortem or spin-off suffix so incident notes do not claim unrelated CLs
+          head_clause = re.split(
+              r"(?i)\b(?:post[- ]?mortem\b|incident\b|spin[- ]?off\b)", line
+          )[0]
+          for cid_str, h in extract_cl_ids_with_hosts(head_clause).items():
             if cid_str not in extra_cls or (h and not extra_cls[cid_str]):
               extra_cls[cid_str] = h
-          for pr_str in extract_pr_ids(line):
+          # Restrict PR extraction to the primary H1 clause before any post-mortem note
+          for pr_str in extract_pr_ids(head_clause):
             if pr_str not in extra_prs:
               extra_prs.append(pr_str)
           continue
@@ -1169,7 +1179,17 @@ def extract_state_file_targets(
         # Extract bullet points naming fix CLs or PRs while inside the fix section
         if in_fix_section and (line.startswith("-") or line.startswith("*")):
           low = line.lower()
-          if any(k in low for k in ("incident:", "spin-off", "conversation://")):
+          # Skip incident and post-mortem bullets that cite historical CLs for context
+          if any(
+              k in low
+              for k in (
+                  "incident:",
+                  "spin-off",
+                  "post-mortem",
+                  "postmortem",
+                  "conversation://",
+              )
+          ):
             continue
           for cid_str, h in extract_cl_ids_with_hosts(line).items():
             if cid_str not in extra_cls or (h and not extra_cls[cid_str]):
@@ -1942,7 +1962,11 @@ def extract_bot_mentions_and_failure_cues(
     subject: str, commit_message: str = ""
 ) -> tuple[set[str], set[tuple[str, str]], bool]:
   """Extracts full Skia bot names, abbreviated bot pairs, and failure cues from text."""
-  blob = f"{subject or ''}\n{commit_message or ''}"
+  # Exclude the Tested:/Test: verification block so green trybots are not treated as broken bots
+  body_without_tested = re.split(
+      r"(?im)^\s*Test(?:ed|s)?\s*:", commit_message or ""
+  )[0]
+  blob = f"{subject or ''}\n{body_without_tested}"
   full_bots = {m.group(1).rstrip(".,;:") for m in RE_SKIA_BOT_NAME.finditer(blob)}
   pairs: set[tuple[str, str]] = set()
   # Expand shorthand like "Test-Mac14 and Test-Mac15 ...-Debug-All-NativeFonts_Fontations"
@@ -2175,9 +2199,10 @@ def detect_fix_for_pairs(
               and f_has_cue
           )
 
-          # Follow-up CL produced in the same conversation as the broken CL
+          # Follow-up CL produced in the same conversation as the broken CL (excluding synthetic fix links)
           same_chat = bool(
               f_item.get("conversation_id")
+              and not f_item.get("chat_from_fix_link")
               and f_item.get("conversation_id") == m_item.get("conversation_id")
           )
           has_link_signal = bool(
@@ -2187,12 +2212,13 @@ def detect_fix_for_pairs(
               or shared_test_files
               or same_chat
           )
+          # Require a failure cue when relying on shared chat alone without a post-submit alert
           has_breakage_signal = bool(
               f_mentions_m_bot
               or m_has_alert
               or f_has_bot_and_cue
               or f_test_only_followup
-              or same_chat
+              or (same_chat and f_has_cue)
           )
           if has_link_signal and has_breakage_signal:
             if f_bugs and m_bugs and not shared_bugs:
@@ -2235,25 +2261,27 @@ def detect_fix_for_pairs(
         best_reasons = reasons
         matched_bots = list(m_broken_bots)
         seen_bnames = {b["task_name"] for b in matched_bots}
-        for fb in sorted(f_full_bots):
-          if (
-              len(fb) > 12
-              and fb not in seen_bnames
-              and not any(bn.startswith(fb) for bn in seen_bnames)
-          ):
-            seen_bnames.add(fb)
-            matched_bots.append(
-                {"task_name": fb, "task_url": "", "swarming_url": ""}
-            )
-        for pref, suf in sorted(f_bot_pairs):
-          if not any(
-              bn.startswith(pref) and bn.endswith(suf) for bn in seen_bnames
-          ):
-            synth = f"{pref}...{suf}"
-            seen_bnames.add(synth)
-            matched_bots.append(
-                {"task_name": synth, "task_url": "", "swarming_url": ""}
-            )
+        # Only append bots mentioned in the fix CL when its message carries a failure cue
+        if f_has_cue:
+          for fb in sorted(f_full_bots):
+            if (
+                len(fb) > 12
+                and fb not in seen_bnames
+                and not any(bn.startswith(fb) for bn in seen_bnames)
+            ):
+              seen_bnames.add(fb)
+              matched_bots.append(
+                  {"task_name": fb, "task_url": "", "swarming_url": ""}
+              )
+          for pref, suf in sorted(f_bot_pairs):
+            if not any(
+                bn.startswith(pref) and bn.endswith(suf) for bn in seen_bnames
+            ):
+              synth = f"{pref}...{suf}"
+              seen_bnames.add(synth)
+              matched_bots.append(
+                  {"task_name": synth, "task_url": "", "swarming_url": ""}
+              )
         best_bots = matched_bots
 
     if best_m_key and best_score >= 100:
@@ -2263,6 +2291,115 @@ def detect_fix_for_pairs(
           "matched_bots": best_bots,
       }
   return fix_map
+
+
+# Propagate active 1:1 bug chats onto unchatted self Bug: CLs before fix-linking and wakeups
+def link_bug_chats_to_unchatted_self_cls(
+    active_discovered: list[dict[str, Any]],
+    fetched_cache: dict[str, dict[str, Any]],
+    bug_chats: dict[str, dict[str, Any]] | None = None,
+    state_bugs: dict[str, dict[str, Any]] | None = None,
+) -> None:
+  """Propagates active 1:1 bug chats to unchatted self-authored CLs before fix-link & wakeups."""
+  by_bug: dict[str, list[dict[str, Any]]] = {}
+  needs_lookup = False
+  # Collect non-companion self-authored changes that reference exactly one bug
+  for d in active_discovered:
+    if not isinstance(d, dict) or d.get("is_companion") or d.get("companion_to"):
+      continue
+    ikey = str(d.get("item_key") or "")
+    info = fetched_cache.get(ikey) or {}
+    if not info.get("is_self"):
+      continue
+    kind = str(d.get("kind") or ("github" if ikey.startswith("github:") else "gerrit"))
+    default_trk = "github" if kind == "github" else "buganizer"
+    blob = "\n".join([
+        str(info.get("subject") or d.get("title") or ""),
+        str(info.get("commit_message") or ""),
+        str(info.get("topic") or ""),
+        *(str(h) for h in (info.get("hashtags") or ())),
+    ])
+    refs = list(
+        dict.fromkeys([
+            *(str(k) for k in (info.get("linked_bug_keys") or []) if k),
+            *extract_bug_refs_from_text(
+                blob,
+                default_tracker=default_trk,
+                default_repo=str(
+                    info.get("host") or d.get("preferred_host") or ""
+                ),
+            ),
+        ])
+    )
+    if len(refs) != 1:
+      continue
+    by_bug.setdefault(refs[0], []).append(d)
+    if (
+        not str(d.get("conversation_id") or "").strip()
+        or d.get("chat_archived")
+        or d.get("chat_from_fix_link")
+    ):
+      needs_lookup = True
+
+  if not needs_lookup:
+    return
+
+  resolved_chats: dict[str, dict[str, Any]] = {}
+  # Seed fallback bug chats from persisted state before overlaying live LS bug chats
+  if isinstance(state_bugs, dict):
+    for bkey, b in state_bugs.items():
+      if (
+          isinstance(b, dict)
+          and b.get("conversation_id")
+          and not b.get("chat_archived")
+      ):
+        resolved_chats[bkey] = {
+            "conversation_id": b["conversation_id"],
+            "title": b.get("chat_title") or b.get("title") or "",
+            "project_id": b.get("project_id") or "",
+            "project_name": b.get("project_name") or "",
+            "chat_last_modified": b.get("chat_last_modified") or "",
+            "chat_busy": bool(b.get("chat_busy")),
+            "chat_archived": False,
+            "single_target": True,
+        }
+  live_bug_chats = (
+      bug_chats
+      if bug_chats is not None
+      else discover_bug_chats(include_archived=False)
+  )
+  # Prefer freshly discovered active bug chats so handoff leaves supersede older state
+  for bkey, bchat in (live_bug_chats or {}).items():
+    if (
+        isinstance(bchat, dict)
+        and bchat.get("conversation_id")
+        and not bchat.get("chat_archived")
+    ):
+      resolved_chats[bkey] = bchat
+
+  # Bind unchatted or fix-link-borrowed CL records to their active 1:1 bug conversation
+  for bkey, cl_list in by_bug.items():
+    bchat = resolved_chats.get(bkey)
+    if not bchat or not bchat.get("single_target", True):
+      continue
+    for d in cl_list:
+      if (
+          not str(d.get("conversation_id") or "").strip()
+          or d.get("chat_archived")
+          or d.get("chat_from_fix_link")
+      ):
+        d["conversation_id"] = str(bchat["conversation_id"])
+        d.pop("chat_from_fix_link", None)
+        if bchat.get("title"):
+          d["title"] = str(bchat["title"])
+        pname = str(bchat.get("project_name") or "")
+        if pname and pname != "Unassigned" and pname not in META_PROJECT_NAMES:
+          d["project_id"] = str(bchat.get("project_id") or "")
+          d["project_name"] = pname
+        d["chat_last_modified"] = str(bchat.get("chat_last_modified") or "")
+        d["chat_busy"] = bool(bchat.get("chat_busy"))
+        d["chat_archived"] = False
+        d["single_target"] = len(cl_list) == 1
 
 
 def link_fix_changes_to_parent_chats(
@@ -2298,6 +2435,9 @@ def link_fix_changes_to_parent_chats(
       if old_broken_key and old_broken_key in combined_info:
         d.pop("fixes_breakage_from", None)
         d.pop("fixes_breakage_bots", None)
+      # Clear conversation_id when it was borrowed solely from a now-invalidated fix link
+      if d.pop("chat_from_fix_link", False):
+        d["conversation_id"] = ""
       continue
     broken_key = str(match["broken_key"])
     d["fixes_breakage_from"] = broken_key
@@ -2306,6 +2446,8 @@ def link_fix_changes_to_parent_chats(
     if parent and parent.get("conversation_id"):
       if not d.get("conversation_id"):
         d["conversation_id"] = parent["conversation_id"]
+        # Mark chat_from_fix_link so false-positive fix links can be cleanly unwound later
+        d["chat_from_fix_link"] = True
         d["title"] = parent.get("title", "")
         d["project_id"] = parent.get("project_id", "")
         d["project_name"] = parent.get("project_name", "")
@@ -9613,10 +9755,11 @@ def link_bugs_and_cls(
     for bkey, bchat in bug_chats.items():
       bug = bugs_by_key.get(bkey)
       if isinstance(bug, dict) and bchat.get("conversation_id"):
-        # Refresh matching chat metadata so moved or newly archived bug chats update project
+        # Refresh matching chat metadata and let an active handoff leaf supersede a stale chat ID
         if (
             not bug.get("conversation_id")
             or bug.get("chat_archived")
+            or not bchat.get("chat_archived")
             or bug.get("conversation_id") == bchat["conversation_id"]
         ):
           bug["conversation_id"] = bchat["conversation_id"]
@@ -9702,7 +9845,13 @@ def link_bugs_and_cls(
     ]
     for ik in self_ikeys:
       for dkey, rec in list(cl_entries_by_ikey[ik]):
-        if not str(rec.get("conversation_id") or "").strip():
+        # Rekey unchatted, archived-chat, or fix-link-borrowed CLs onto their active bug chat
+        if (
+            not str(rec.get("conversation_id") or "").strip()
+            or rec.get("chat_archived")
+            or rec.get("chat_from_fix_link")
+        ):
+          rec.pop("chat_from_fix_link", None)
           _rekey_state_item_chat(
               items_by_key, ik, dkey, rec, bcid, chat_archived=False
           )
@@ -12612,9 +12761,29 @@ def _sync_once_locked(
     # Seed historical breakage and fix linkage from previous items if present
     _, prev_d = _lookup_state_item(prev_items, ikey)
     if prev_d:
+      ps_now = info.get("post_submit") if isinstance(info.get("post_submit"), dict) else None
+      prev_has_merged_fix = any(
+          isinstance(fx, dict)
+          and (fx.get("status") == "MERGED" or fx.get("stage") == "merged")
+          for fx in (prev_d.get("fixes") or [])
+      )
+      # Drop stale broken_bots when a live post_submit check cleared without any merged fix CL
+      ps_cleared_false_alarm = bool(
+          ps_now is not None
+          and not ps_now.get("has_alert")
+          and not ps_now.get("broken_bots")
+          and not prev_has_merged_fix
+      )
       # Carry forward known broken bots when the live record has not re-queried them yet
-      if not d.get("broken_bots") and prev_d.get("broken_bots"):
+      if (
+          not d.get("broken_bots")
+          and prev_d.get("broken_bots")
+          and not ps_cleared_false_alarm
+      ):
         d["broken_bots"] = list(prev_d["broken_bots"])
+      # Preserve chat_from_fix_link provenance so invalidated fix links can clear borrowed chats
+      if prev_d.get("chat_from_fix_link"):
+        d["chat_from_fix_link"] = True
       # Preserve existing upstream breakage pointer across sync iterations
       if not d.get("fixes_breakage_from") and prev_d.get("fixes_breakage_from"):
         d["fixes_breakage_from"] = prev_d["fixes_breakage_from"]
@@ -12731,6 +12900,12 @@ def _sync_once_locked(
     if base_ps == last_ps:
       for k in ("companion_to", "is_companion", "companion_base_ps_hint"):
         d.pop(k, None)
+  # Inherit active 1:1 bug chats onto unchatted self Bug: CLs before fix-linking and wakeups
+  link_bug_chats_to_unchatted_self_cls(
+      active_discovered,
+      fetched_cache,
+      state_bugs=state.get("bugs") if isinstance(state.get("bugs"), dict) else None,
+  )
   # Match follow-up fix CLs/PRs to broken merged CLs/PRs and share parent chats
   link_fix_changes_to_parent_chats(
       active_discovered, fetched_cache, all_chat_candidates=all_chats
@@ -13113,19 +13288,32 @@ def _sync_once_locked(
           and not info["last_msg_author"].endswith(".gserviceaccount.com")
           and info["in_my_attention"]
       ):
-        # Instruct non-self Gerrit follow-ups to save an unpublished draft via gerrit_draft.py
-        draft_action = (
-            f"сохрани неопубликованный черновик ответа в Gerrit через {GERRIT_SAVE_DRAFT_CMD} "
-            "(не публикуй его), покажи черновик в чате "
-            if ikey.startswith("gerrit:") and not record.get("is_self")
-            else "подготовь черновик ответа "
-        )
-        transition_msg = (
-            f"[CL-WATCHER] 💬 Новое обновление в {ikey} (PS{info['patchset']}) от "
-            f"{info['last_msg_author']}: {info['last_msg_snippet']}. "
-            f"Проведи инкрементальный триаж/анализ, {draft_action}"
-            f"и запиши вердикт через triage_store.py save-review."
-        )
+        if record.get("is_self"):
+          draft_step = (
+              f"сохрани неопубликованный черновик ответа в Gerrit через {GERRIT_SAVE_DRAFT_CMD} "
+              "(не публикуй его) и покажи черновик в чате."
+              if ikey.startswith("gerrit:")
+              else "подготовь черновик ответа и покажи его в чате."
+          )
+          transition_msg = (
+              f"[CL-WATCHER] 💬 Новое обновление в твоём СЛ {ikey} (PS{info['patchset']}) от "
+              f"{info['last_msg_author']}: {info['last_msg_snippet']}. "
+              f"Проанализируй комментарий ревьюера, {draft_step}"
+          )
+        else:
+          # Instruct non-self Gerrit follow-ups to save an unpublished draft via gerrit_draft.py
+          draft_action = (
+              f"сохрани неопубликованный черновик ответа в Gerrit через {GERRIT_SAVE_DRAFT_CMD} "
+              "(не публикуй его), покажи черновик в чате "
+              if ikey.startswith("gerrit:")
+              else "подготовь черновик ответа "
+          )
+          transition_msg = (
+              f"[CL-WATCHER] 💬 Новое обновление в {ikey} (PS{info['patchset']}) от "
+              f"{info['last_msg_author']}: {info['last_msg_snippet']}. "
+              f"Проведи инкрементальный триаж/анализ, {draft_action}"
+              f"и запиши вердикт через triage_store.py save-review."
+          )
 
       if transition_msg:
         ev = {
@@ -16845,7 +17033,8 @@ async function copyTriageDraft(key, btn) {
 }
 
 function triageHtml(it, compact) {
-  if (!it || !it.triage) return '';
+  // Suppress reviewer triage badges and LGTM-blocked banners on self-authored CLs
+  if (!it || !it.triage || !isReviewerChange(it)) return '';
   if (it.status === 'MERGED' || it.status === 'ABANDONED' || it.status === 'CLOSED') return '';
   const tr = it.triage;
   const bInfo = triageBadgeInfo(it);
