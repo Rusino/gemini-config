@@ -1790,6 +1790,169 @@ class TestPreToolGuard(unittest.TestCase):
       self.assertEqual(denial(push_cmd), "")
       self.assertEqual(denial(upload_cmd), "")
 
+  def test_git_commit_tree_guard(self):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      script = os.path.join(tmp_dir, "retitle.py")
+      with open(script, "w", encoding="utf-8") as f:
+        f.write('import subprocess\nsubprocess.run(["git", "commit-tree", "T", "-p", "P"])\n')
+      clean_script = os.path.join(tmp_dir, "clean.py")
+      with open(clean_script, "w", encoding="utf-8") as f:
+        f.write('import subprocess\nsubprocess.run(["git", "commit", "--amend"])\n')
+      blocked = [
+          "git commit-tree abc^{tree} -p upstream/main -m msg",
+          "git -C /tmp/r commit-tree T -p P",
+          "cd /tmp && NEW=$(git commit-tree T -p P -F msg.txt)",
+          "bash -c 'git commit-tree T -p P'",
+          "python3 -c 'import subprocess; subprocess.run([\"git\", \"commit-tree\", \"T\"])'",
+          "python3 - <<'EOF'\nimport subprocess\ngit('commit-tree', t, '-p', p)\nEOF",
+          f"python3 {script}",
+          f"cd {tmp_dir} && python3 retitle.py",
+          f"cd {os.path.dirname(tmp_dir)} && cd {os.path.basename(tmp_dir)} && python3 retitle.py",
+          f"python3 -W ignore {script}",
+      ]
+      allowed = [
+          "grep -n 'commit-tree' hooks/pre_tool_guard.py",
+          "rg commit-tree ~/.gemini/config",
+          "git commit-tree --help",
+          "git commit --amend -m 'Use rebase instead of commit-tree'",
+          "cat > /tmp/notes.md <<'EOF'\nnever use git commit-tree\nEOF",
+          f"python3 {clean_script}",
+          "git log --oneline -3",
+      ]
+      for cmd in blocked:
+        with self.subTest(cmd=cmd):
+          reason = pre_tool_guard.git_commit_tree_denial(cmd, [tmp_dir])
+          self.assertIn("[COMMIT-TREE GUARD]", reason)
+      for cmd in allowed:
+        with self.subTest(cmd=cmd):
+          self.assertEqual(pre_tool_guard.git_commit_tree_denial(cmd, [tmp_dir]), "")
+      out = self.run_guard({
+          "conversationId": "c1",
+          "toolCall": {"name": "run_command", "args": {"CommandLine": blocked[0]}},
+      })
+      self.assertEqual(out.get("decision"), "deny", out)
+      out = self.run_guard({
+          "conversationId": "c1",
+          "workspacePaths": [os.path.dirname(tmp_dir)],
+          "toolCall": {
+              "name": "run_command",
+              "args": {"CommandLine": "python3 retitle.py", "Cwd": tmp_dir},
+          },
+      })
+      self.assertEqual(out.get("decision"), "deny", out)
+
+  def test_gerrit_upload_scope_guard(self):
+    import context_guard
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      origin = os.path.join(tmp_dir, "origin.git")
+      repo = os.path.join(tmp_dir, "skia")
+      proj_root = os.path.join(tmp_dir, "projects")
+      os.makedirs(proj_root)
+      for pid, name in (("p-sk", "SkoreText · CoreText"), ("p-other", "SkParagraph")):
+        with open(os.path.join(proj_root, f"{pid}.json"), "w", encoding="utf-8") as f:
+          json.dump({"name": name}, f)
+
+      def git(*args):
+        return subprocess.run(
+            ["git", "-C", repo, *args], check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+      def write(rel, text):
+        p = os.path.join(repo, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+          f.write(text)
+        git("add", rel)
+
+      subprocess.run(["git", "init", "--bare", "-b", "main", origin], check=True,
+                     capture_output=True)
+      subprocess.run(["git", "init", "-b", "main", repo], check=True, capture_output=True)
+      git("config", "user.email", "t@example.com")
+      git("config", "user.name", "Test")
+      git("remote", "add", "upstream", origin)
+      write("DEPS", "rev = 1\n")
+      write("src/sksl/SkSL.cpp", "int v = 1;\n")
+      write("modules/skunicode/src/SkUnicode_apple.cpp", "int a = 1;\n")
+      git("commit", "-m", "Upstream base")
+      git("push", "upstream", "main")
+      git("fetch", "upstream")
+      git("checkout", "-b", "stack", "upstream/main")
+      write("modules/skunicode/src/SkUnicode_apple.cpp", "int a = 2;\n")
+      git("commit", "-m", "[SkoreText] Keep a leading U+FEFF")
+      old_tree = git("rev-parse", "HEAD^{tree}")
+
+      # Upstream moves on while the stack keeps its old base
+      git("checkout", "-q", "upstream/main")
+      write("DEPS", "rev = 2\n")
+      git("commit", "-m", "Roll vulkan-deps")
+      write("src/sksl/SkSL.cpp", "int v = 2;\n")
+      write("src/sksl/SkSLShuffle.cpp", "int s = 1;\n")
+      git("commit", "-m", "[sksl] Add subgroupShuffle")
+      git("push", "upstream", "HEAD:main")
+      git("fetch", "upstream")
+      git("checkout", "-q", "stack")
+
+      def denial(cmd, pid="p-sk", paths=None, cwd=""):
+        with patch.object(context_guard, "projects_root", return_value=proj_root), \
+             patch.object(context_guard, "get_conversation_db_info",
+                          return_value=("[14:00] Stack upload", pid)):
+          return pre_tool_guard.gerrit_upload_scope_denial(
+              cmd, "c1", "", "", paths or [repo], cwd
+          )
+
+      push_cmd = f"git -C {repo} push upstream HEAD:refs/for/main"
+      self.assertEqual(denial(push_cmd), "")
+      git("rebase", "-q", "upstream/main")
+      self.assertEqual(denial(push_cmd), "")
+
+      bad = git("commit-tree", old_tree, "-p", "upstream/main", "-m",
+                "[SkoreText] Keep a leading U+FEFF")
+      git("reset", "-q", "--hard", bad)
+      for pid in ("p-sk", "p-other"):
+        reason = denial(push_cmd, pid)
+        self.assertIn("[STACK-SCOPE GUARD]", reason)
+        self.assertIn("src/sksl/SkSL.cpp", reason)
+        self.assertIn("src/sksl/SkSLShuffle.cpp", reason)
+        self.assertIn("DEPS", reason)
+        self.assertIn("Add subgroupShuffle", reason)
+      self.assertEqual(denial(f"git -C {repo} push upstream HEAD:refs/heads/main"), "")
+      # run_command Cwd names the repo when the command has no cd / -C
+      self.assertIn(
+          "[STACK-SCOPE GUARD]",
+          denial("git push upstream HEAD:refs/for/main", paths=[tmp_dir], cwd=repo),
+      )
+
+      # An intentional revert may carry a project prefix before the keyword
+      git("reset", "-q", "--hard", "upstream/main")
+      write("DEPS", "rev = 1\n")
+      git("commit", "-m", '[SkoreText] Revert "Roll vulkan-deps"')
+      self.assertEqual(denial(f"ALLOW_OUT_OF_SCOPE_FILES=1 {push_cmd}"), "")
+
+      # A stale upstream/main must not pull my own landed upstream commits into the stack
+      git("reset", "-q", "--hard", "upstream/main")
+      stale = git("rev-parse", "upstream/main")
+      write("src/core/SkLanded.cpp", "int l = 1;\n")
+      git("commit", "-m", "Land core change upstream")
+      git("push", "upstream", "HEAD:main")
+      git("remote", "add", "origin", origin)
+      git("fetch", "origin")
+      git("update-ref", "refs/remotes/upstream/main", stale)
+      write("modules/skunicode/src/SkUnicode_apple.cpp", "int a = 4;\n")
+      git("commit", "-m", "[SkoreText] Stack on fresh main")
+      self.assertEqual(denial(push_cmd), "")
+
+      git("reset", "-q", "--hard", "upstream/main")
+      write("modules/skunicode/src/SkUnicode_apple.cpp", "int a = 3;\n")
+      write("src/core/SkFont.cpp", "int f = 1;\n")
+      git("commit", "-m", "[SkoreText] Touch core")
+      reason = denial(push_cmd)
+      self.assertIn("SkoreText commits touch files outside", reason)
+      self.assertIn("src/core/SkFont.cpp", reason)
+      self.assertNotIn("undoes upstream", reason)
+      self.assertEqual(denial(push_cmd, pid="p-other"), "")
+      self.assertEqual(denial(f"ALLOW_OUT_OF_SCOPE_FILES=1 {push_cmd}"), "")
+
   # Verify b/580882306 guard blocks direct git cl comment calls while ignoring quoted/heredoc text
   def test_git_cl_comment_guard_b580882306(self):
     blocked_cmds = [

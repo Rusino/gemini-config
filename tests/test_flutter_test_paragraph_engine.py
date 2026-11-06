@@ -30,6 +30,34 @@ def _git(repo: pathlib.Path, *args: str) -> str:
 
 
 class TestFlutterExternalSkiaPreflight(unittest.TestCase):
+    def test_upstream_fetch_never_moves_remote_tracking_main(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            origin = tmp / "origin.git"
+            repo = tmp / "skia"
+            subprocess.run(["git", "init", "--bare", "-b", "main", str(origin)], check=True,
+                           capture_output=True)
+            repo.mkdir()
+            _git(repo, "init", "-b", "main")
+            _git(repo, "config", "user.email", "t@example.com")
+            _git(repo, "config", "user.name", "Test")
+            _git(repo, "remote", "add", "upstream", str(origin))
+            _git(repo, "commit", "--allow-empty", "-m", "base")
+            _git(repo, "push", "upstream", "main")
+            _git(repo, "fetch", "upstream")
+            old_tip = _git(repo, "rev-parse", "upstream/main")
+            _git(repo, "commit", "--allow-empty", "-m", "landed upstream")
+            new_tip = _git(repo, "rev-parse", "HEAD")
+            _git(repo, "push", "upstream", "main")
+            # Push moves the tracking ref too; put it back to model a stale local upstream/main
+            _git(repo, "update-ref", "refs/remotes/upstream/main", old_tip)
+            _git(repo, "reset", "-q", "--hard", old_tip)
+
+            ref_name, sha = rfpt._resolve_freshest_upstream_ref(repo, fetch_remote=True)
+            self.assertEqual(sha, new_tip)
+            self.assertEqual(ref_name, "upstream/main (fresh tip: run `git fetch upstream` first)")
+            self.assertEqual(_git(repo, "rev-parse", "upstream/main"), old_tip)
+
     def test_external_skia_staleness_and_preflight_order(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tmp = pathlib.Path(td)
@@ -189,18 +217,19 @@ class TestFlutterExternalSkiaPreflight(unittest.TestCase):
             self.assertTrue(any("DEPS" in iss or "skia_revision" in iss for iss in sub_issues))
 
             # Offline TimeoutExpired on upstream fetch must fall back to origin without crashing
+            # The remote name always sits right before the refspec, after any fetch flags
             def flaky_subproc(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
                 if cmd[3:] == ["remote"]:
                     return subprocess.CompletedProcess(cmd, 0, "upstream\norigin\n", "")
-                if len(cmd) >= 5 and cmd[3] == "fetch" and cmd[5] == "upstream":
+                if len(cmd) >= 5 and cmd[3] == "fetch" and cmd[-2] == "upstream":
                     raise subprocess.TimeoutExpired(cmd=cmd, timeout=30)
-                if len(cmd) >= 5 and cmd[3] == "fetch" and cmd[5] == "origin":
+                if len(cmd) >= 5 and cmd[3] == "fetch" and cmd[-2] == "origin":
                     return subprocess.CompletedProcess(cmd, 0, "", "")
                 return subprocess.CompletedProcess(cmd, 1, "", "")
 
             with mock.patch("subprocess.run", side_effect=flaky_subproc) as m_sub:
                 rfpt._resolve_freshest_upstream_ref(ext_repo, fetch_remote=True)
-            fetched = [c.args[0][5] for c in m_sub.call_args_list if c.args[0][3] == "fetch"]
+            fetched = [c.args[0][-2] for c in m_sub.call_args_list if c.args[0][3] == "fetch"]
             self.assertEqual(fetched, ["upstream", "origin"])
 
             # Missing deps_skia_revision in ext_repo is fetched from submodule to detect skew

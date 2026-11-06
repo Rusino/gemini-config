@@ -45,6 +45,10 @@ BATCH_3_FILES = [
     "packages/flutter/test/services/text_editing_delta_test.dart",
 ]
 
+# Pre-flight fetches land here, never in refs/remotes/*: moving upstream/main under a live
+# stack let a later rewrite attach old trees to the new tip and revert upstream commits (R83)
+PREFLIGHT_REF_PREFIX = "refs/preflight"
+
 SKIA_MONITORED_DIRS = [
     "modules/skparagraph",
     "modules/skshaper",
@@ -274,7 +278,7 @@ def _is_compiled_paragraph_module_path(rel_path: str) -> bool:
     return False
 
 
-# Refresh remote main best-effort and return the newest remote-tracking tip
+# Fetch remote main into refs/preflight best-effort and return the newest known main tip
 def _resolve_freshest_upstream_ref(
     ext_skia_repo: pathlib.Path,
     *,
@@ -298,8 +302,10 @@ def _resolve_freshest_upstream_ref(
                             str(ext_skia_repo),
                             "fetch",
                             "--quiet",
+                            # Empty refmap stops git from also updating refs/remotes/<rname>/*
+                            "--refmap=",
                             rname,
-                            f"+refs/heads/main:refs/remotes/{rname}/main",
+                            f"+refs/heads/main:{PREFLIGHT_REF_PREFIX}/{rname}/main",
                         ],
                         capture_output=True,
                         text=True,
@@ -312,18 +318,38 @@ def _resolve_freshest_upstream_ref(
                     break
 
     found: list[tuple[str, str]] = []
-    for ref_name in ("upstream/main", "origin/main"):
-        chk = subprocess.run(
-            ["git", "-C", str(ext_skia_repo), "rev-parse", "--verify", f"{ref_name}^{{commit}}"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if chk.returncode == 0 and chk.stdout.strip():
-            found.append((ref_name, chk.stdout.strip()))
+    # Full ref names so a local branch named `upstream/main` never shadows the remote ref;
+    # pre-flight refs get a label that tells the user to fetch before rebasing
+    for rname in ("upstream", "origin"):
+        for ref_name, ref_label in (
+            (f"refs/remotes/{rname}/main", f"{rname}/main"),
+            (
+                f"{PREFLIGHT_REF_PREFIX}/{rname}/main",
+                f"{rname}/main (fresh tip: run `git fetch {rname}` first)",
+            ),
+        ):
+            chk = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(ext_skia_repo),
+                    "rev-parse",
+                    "--verify",
+                    f"{ref_name}^{{commit}}",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if chk.returncode == 0 and chk.stdout.strip():
+                found.append((ref_label, chk.stdout.strip()))
     if not found:
         return None
-    if len(found) == 2 and found[0][1] != found[1][1]:
+    # Keep the first ref unless a later one descends from it (diverged refs keep the first)
+    best = found[0]
+    for cand in found[1:]:
+        if cand[1] == best[1]:
+            continue
         anc = subprocess.run(
             [
                 "git",
@@ -331,16 +357,16 @@ def _resolve_freshest_upstream_ref(
                 str(ext_skia_repo),
                 "merge-base",
                 "--is-ancestor",
-                found[0][1],
-                found[1][1],
+                best[1],
+                cand[1],
             ],
             capture_output=True,
             text=True,
             check=False,
         )
         if anc.returncode == 0:
-            return found[1]
-    return found[0]
+            best = cand
+    return best
 
 
 # Reject stale ext:<ref> stacks before Ninja builds so upstream SkParagraph drift fails in <1s

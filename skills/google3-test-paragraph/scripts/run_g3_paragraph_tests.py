@@ -33,6 +33,9 @@ import parse_g3_paragraph_tests as pg3
 
 SKIA_GERRIT_GIT_URL = "https://skia.googlesource.com/skia.git"
 SKIA_GERRIT_API_URL = "https://skia-review.googlesource.com/changes"
+# Pre-flight fetches land here, never in refs/remotes/*: moving upstream/main under a live
+# stack let a later rewrite attach old trees to the new tip and revert upstream commits (R83)
+PREFLIGHT_REF_PREFIX = "refs/preflight"
 CITC_CHANGE_RE = re.compile(r"\bchange:\s*(\d+)\b")
 FORBIDDEN_OUT_PREFIXES = (
     "/google/src/cloud/",
@@ -281,7 +284,8 @@ def resolve_cl_cherry_pick_revs(
     return [tip_sha]
 
 
-# Refresh remote-tracking main best-effort so local skew checks catch newly landed commits
+# Fetch remote main into refs/preflight best-effort so skew checks see newly landed commits
+# without moving refs/remotes/*/main under a live stack
 def _refresh_local_upstream_ref(repo_dir: pathlib.Path) -> None:
     rem_proc = _run(["git", "remote"], cwd=repo_dir, check=False)
     remotes = {ln.strip() for ln in rem_proc.stdout.splitlines() if ln.strip()}
@@ -293,8 +297,10 @@ def _refresh_local_upstream_ref(repo_dir: pathlib.Path) -> None:
                         "git",
                         "fetch",
                         "--quiet",
+                        # Empty refmap stops git from also updating refs/remotes/<rname>/*
+                        "--refmap=",
                         rname,
-                        f"+refs/heads/main:refs/remotes/{rname}/main",
+                        f"+refs/heads/main:{PREFLIGHT_REF_PREFIX}/{rname}/main",
                     ],
                     cwd=repo_dir,
                     check=False,
@@ -306,24 +312,34 @@ def _refresh_local_upstream_ref(repo_dir: pathlib.Path) -> None:
                 break
 
 
-# Prefer the newer tip when both upstream/main and origin/main exist locally
+# Prefer the newest tip among local remote-tracking and pre-flight main refs
 def _resolve_default_upstream_ref(repo_dir: pathlib.Path, fallback: str) -> str:
     found: list[tuple[str, str]] = []
-    for ref in ("upstream/main", "origin/main"):
+    # Full ref names so a local branch named `upstream/main` never shadows the remote ref
+    for ref in (
+        "refs/remotes/upstream/main",
+        f"{PREFLIGHT_REF_PREFIX}/upstream/main",
+        "refs/remotes/origin/main",
+        f"{PREFLIGHT_REF_PREFIX}/origin/main",
+    ):
         chk = _run(["git", "rev-parse", "--verify", f"{ref}^{{commit}}"], cwd=repo_dir, check=False)
         if chk.returncode == 0 and chk.stdout.strip():
             found.append((ref, chk.stdout.strip()))
     if not found:
         return fallback
-    if len(found) == 2 and found[0][1] != found[1][1]:
+    # Keep the first ref unless a later one descends from it (diverged refs keep the first)
+    best = found[0]
+    for cand in found[1:]:
+        if cand[1] == best[1]:
+            continue
         anc = _run(
-            ["git", "merge-base", "--is-ancestor", found[0][1], found[1][1]],
+            ["git", "merge-base", "--is-ancestor", best[1], cand[1]],
             cwd=repo_dir,
             check=False,
         )
         if anc.returncode == 0:
-            return found[1][0]
-    return found[0][0]
+            best = cand
+    return best[0]
 
 
 def _resolve_parent_or_self(repo_dir: pathlib.Path, commit_sha: str) -> str:
@@ -528,7 +544,7 @@ def stage_candidate_in_worktree(
         dirty_files = [ln[3:].strip() for ln in porcelain if ln.strip()]
     elif ref_spec.startswith("cl:"):
         _, _, patch_ref = _resolve_gerrit_patch_ref(ref_spec)
-        upstream_ref = "refs/remotes/g3_upstream/main"
+        upstream_ref = f"{PREFLIGHT_REF_PREFIX}/g3/main"
         _run(
             ["git", "fetch", SKIA_GERRIT_GIT_URL, f"+refs/heads/main:{upstream_ref}"],
             cwd=stage_wt,

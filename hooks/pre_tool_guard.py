@@ -1346,6 +1346,11 @@ def gerrit_cl_comment_denial(cmd: str) -> str:
   )
 
 
+# run_command Cwd is where a command without `cd` runs; workspace_paths[0] may not be a repo
+def _with_cwd(cwd: str, workspace_paths: list[str]) -> list[str]:
+  return [cwd, *workspace_paths] if cwd else workspace_paths
+
+
 def _upload_repo_root(cmd: str, workspace_paths: list[str]) -> str:
   cmd_code = strip_heredocs(cmd)
   explicit = re.search(r"(?:^|[\s;&|(`])cd\s+|\bgit\s+-C\s+", cmd_code)
@@ -1392,6 +1397,7 @@ def skoretext_cl_prefix_denial(
     parent_conv_id: str,
     transcript_path: str,
     workspace_paths: list[str],
+    cwd: str = "",
 ) -> str:
   is_upload, push_refs = _gerrit_upload_invocation(cmd)
   if not is_upload:
@@ -1400,7 +1406,7 @@ def skoretext_cl_prefix_denial(
       conv_id, parent_conv_id, transcript_path, workspace_paths
   ):
     return ""
-  root = _upload_repo_root(cmd, workspace_paths)
+  root = _upload_repo_root(cmd, _with_cwd(cwd, workspace_paths))
   if not root:
     return ""
   # For refs/for/ stack pushes check every own commit above remote main; for git cl
@@ -1454,6 +1460,289 @@ def skoretext_cl_prefix_denial(
       f"must start its commit subject with `[SkoreText] ` (missing prefix on: {listed}). "
       "Reword the commit subject to start with `[SkoreText] ` before uploading."
   )
+
+
+SCRIPT_INTERPRETERS = ("python", "bash", "sh", "zsh", "node", "perl", "ruby")
+COMMIT_TREE_RE = re.compile(r"\bcommit-tree\b")
+
+
+def _is_script_interpreter(exe: str) -> bool:
+  return any(exe == i or (exe.startswith(i) and exe[len(i):][:1] in ("", "2", "3")) for i in
+             SCRIPT_INTERPRETERS)
+
+
+def _script_file_calls_commit_tree(path: str, cwd_hint: str) -> bool:
+  p = os.path.expanduser(path)
+  if not os.path.isabs(p) and cwd_hint:
+    p = os.path.join(cwd_hint, p)
+  # Reviewed config tooling (this guard and its tests) names commit-tree as data; the risk is
+  # ad-hoc scratch scripts that rewrite a stack
+  config_dir = os.path.realpath(os.path.expanduser("~/.gemini/config"))
+  if os.path.realpath(p).startswith(config_dir + os.sep):
+    return False
+  try:
+    if not os.path.isfile(p) or os.path.getsize(p) > 2_000_000:
+      return False
+    with open(p, "r", encoding="utf-8", errors="replace") as f:
+      return bool(COMMIT_TREE_RE.search(f.read()))
+  except OSError:
+    return False
+
+
+# True when the command runs `git commit-tree` directly, via `bash -c` / `python -c`, from an
+# interpreter heredoc, or from a local script file the command executes
+def is_git_commit_tree_command(cmd: str, cwd_hint: str = "", _depth: int = 0) -> bool:
+  if _depth > 2 or not cmd:
+    return False
+  # Script files may call commit-tree even when the command line never names it
+  if "commit-tree" not in cmd and not re.search(r"\.(?:py|sh|bash|zsh|js|pl|rb)\b", cmd):
+    return False
+  for m in HEREDOC_RE.finditer(cmd):
+    line_start = cmd.rfind("\n", 0, m.start()) + 1
+    head = re.split(r"&&|\|\||;|\|", cmd[line_start:m.start()])[-1].split()
+    head = [t for t in head if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t)]
+    if head and _is_script_interpreter(_clean_cmd_token(head[0])):
+      if COMMIT_TREE_RE.search(m.group(0)):
+        return True
+  cmd_code = strip_heredocs(cmd)
+  sep_chars = ";&|()\n`"
+  lexer = shlex.shlex(cmd_code, posix=True, punctuation_chars=sep_chars)
+  lexer.whitespace = " \t\r"
+  lexer.whitespace_split = True
+  try:
+    tokens = list(lexer)
+  except ValueError:
+    return bool(re.search(r"\bgit\b[^;&|\n]*\scommit-tree\b", _non_inspection_cmd_segments(cmd)))
+  cwd = cwd_hint
+  i = 0
+  n = len(tokens)
+  while i < n:
+    if tokens[i] and set(tokens[i]) <= set(sep_chars):
+      i += 1
+      continue
+    seg_end = i
+    while seg_end < n and not (tokens[seg_end] and set(tokens[seg_end]) <= set(sep_chars)):
+      seg_end += 1
+    cmd_idx = _advance_cmd_wrappers(tokens, i, seg_end)
+    if cmd_idx < seg_end:
+      exe = _clean_cmd_token(tokens[cmd_idx])
+      seg = tokens[cmd_idx + 1 : seg_end]
+      if exe == "cd" and seg:
+        cwd = os.path.join(cwd, os.path.expanduser(seg[0]))
+      elif exe == "git":
+        j = 0
+        while j < len(seg) and seg[j].startswith("-"):
+          j += 2 if seg[j] in GIT_VALUE_FLAGS else 1
+        if j < len(seg) and seg[j] == "commit-tree":
+          if not any(a in ("-h", "--help") for a in seg[j + 1 :]):
+            return True
+      elif exe == "git-commit-tree":
+        return True
+      elif _is_script_interpreter(exe):
+        skip_value = False
+        for k, tok in enumerate(seg):
+          if skip_value:
+            skip_value = False
+            continue
+          if tok in ("-c", "-e") or (
+              exe in ("bash", "sh", "zsh") and re.match(r"^-[a-z]*c[a-z]*$", tok)
+          ):
+            body = seg[k + 1] if k + 1 < len(seg) else ""
+            if exe in ("bash", "sh", "zsh"):
+              if is_git_commit_tree_command(body, cwd, _depth + 1):
+                return True
+            elif COMMIT_TREE_RE.search(body):
+              return True
+            break
+          if tok == "-m":
+            break
+          # Interpreter options with a separate value: the value is not the script path
+          if tok in ("-W", "-X", "-o", "+o", "-O"):
+            skip_value = True
+            continue
+          if not tok.startswith("-"):
+            if _script_file_calls_commit_tree(tok, cwd):
+              return True
+            break
+      elif re.search(r"\.(?:py|sh)$", exe) and "/" in tokens[cmd_idx]:
+        if _script_file_calls_commit_tree(tokens[cmd_idx], cwd):
+          return True
+    i = seg_end + 1
+  return False
+
+
+# Deny `git commit-tree`: it pairs a saved ^{tree} with any parent, so a moved base ref makes
+# the new commit silently revert every upstream commit between the old and new base
+def git_commit_tree_denial(cmd: str, workspace_paths: list[str]) -> str:
+  cwd_hint = next((os.path.expanduser(wp) for wp in workspace_paths if wp), "")
+  if not is_git_commit_tree_command(cmd, cwd_hint):
+    return ""
+  return (
+      "[COMMIT-TREE GUARD] `git commit-tree` is blocked (directly, in `python -c` / heredoc "
+      "scripts, or in an executed script file). It attaches a saved `^{tree}` to whatever "
+      "parent you pass, so when the base ref has moved (e.g. a test runner fetched "
+      "`upstream/main`) the new commit silently reverts every upstream commit in between: "
+      "Gerrit 1412556 PS4 shipped a revert of `[sksl] Add subgroupShuffle` this way. "
+      "Reword commits with `git commit --amend` / `git rebase -i --exec \"git commit --amend "
+      "...\"`, and move a stack with `git rebase --onto <new-base> <old-base>`, which replays "
+      "diffs instead of copying trees."
+  )
+
+
+SKORETEXT_SCOPE_PREFIXES = (
+    "modules/skparagraph/",
+    "modules/skunicode/",
+    "modules/skshaper/",
+    "experimental/skoretext/",
+)
+UPSTREAM_REVERT_WINDOW = 100
+# Revert/reland commits undo upstream on purpose; project prefixes like `[SkoreText] ` may
+# precede the keyword
+REVERT_SUBJECT_RE = re.compile(
+    r"^(?:\[[^\]]*\]\s*)*(?:Revert|Reland|Re-land|Reapply)\b", re.IGNORECASE
+)
+ZERO_BLOB = "0" * 40
+
+
+# A stale ref (old upstream/main) gives an older merge-base whose range pulls other people's
+# upstream commits into the stack; the newest base keeps only the commits being uploaded
+def _newest_merge_base(root: str, target_sha: str, candidates: tuple[str, ...]) -> str:
+  bases: list[str] = []
+  for c in candidates:
+    b = _git_out(root, "merge-base", target_sha, c)
+    if b and b != target_sha and b not in bases:
+      bases.append(b)
+  if len(bases) < 2:
+    return bases[0] if bases else ""
+  tips = _git_out(root, "merge-base", "--independent", *bases).split()
+  # Diverged candidates have no single newest base; keep the first-priority one
+  return tips[0] if len(tips) == 1 else bases[0]
+
+
+def _git_out_slow(root: str, *args: str) -> str:
+  try:
+    res = subprocess.run(["git", "-C", root, *args], capture_output=True, text=True,
+                         timeout=8.0, check=False)
+  except Exception:
+    return ""
+  return res.stdout if res.returncode == 0 else ""
+
+
+# Parse `git log --raw --format=@%H%x00%ae%x00%s` into [(sha, email, subject, raw_lines)]
+def _parse_raw_log(raw: str) -> list[tuple[str, str, str, list[tuple[str, str, str]]]]:
+  out: list[tuple[str, str, str, list[tuple[str, str, str]]]] = []
+  for line in raw.splitlines():
+    if line.startswith("@"):
+      parts = line[1:].split("\x00")
+      parts += [""] * (3 - len(parts))
+      out.append((parts[0], parts[1], parts[2], []))
+    elif line.startswith(":") and out and "\t" in line:
+      meta, path = line.split("\t", 1)
+      fields = meta.split()
+      if len(fields) >= 5:
+        out[-1][3].append((path, fields[2], fields[3]))
+  return out
+
+
+# Deny a Gerrit upload when a stack commit restores files to the state before a recent
+# upstream commit (tree copied onto a moved base), or when a SkoreText commit touches files
+# outside the SkoreText modules
+def gerrit_upload_scope_denial(
+    cmd: str,
+    conv_id: str,
+    parent_conv_id: str,
+    transcript_path: str,
+    workspace_paths: list[str],
+    cwd: str = "",
+) -> str:
+  is_upload, push_refs = _gerrit_upload_invocation(cmd)
+  if not is_upload:
+    return ""
+  root = _upload_repo_root(cmd, _with_cwd(cwd, workspace_paths))
+  if not root:
+    return ""
+  base_candidates = (
+      ("upstream/main", "upstream/master", "origin/main", "origin/master")
+      if push_refs
+      else ("@{u}", "upstream/main", "upstream/master", "origin/main", "origin/master")
+  )
+  m = re.search(r"<([^>]+)>", _git_out(root, "var", "GIT_AUTHOR_IDENT"))
+  my_email = m.group(1) if m else ""
+  skoretext = None
+  allow_scope = bool(re.search(r"(?:^|\s)ALLOW_OUT_OF_SCOPE_FILES=1\b", strip_heredocs(cmd)))
+  reverts: list[str] = []
+  out_of_scope: list[str] = []
+  for ref in push_refs or ["HEAD"]:
+    target_sha = _git_out(root, "rev-parse", "--verify", ref)
+    if not target_sha:
+      continue
+    base = _newest_merge_base(root, target_sha, base_candidates)
+    if not base:
+      continue
+    raw_fmt = "--format=@%H%x00%ae%x00%s"
+    stack = _parse_raw_log(_git_out_slow(
+        root, "log", "--raw", "-r", "--no-renames", "--no-abbrev", raw_fmt, "-n", "50",
+        f"{base}..{target_sha}",
+    ))
+    if not stack:
+      continue
+    upstream = _parse_raw_log(_git_out_slow(
+        root, "log", "--raw", "-r", "--no-renames", "--no-abbrev", "--first-parent", raw_fmt,
+        "-n", str(UPSTREAM_REVERT_WINDOW), base,
+    ))
+    # Key = (path, blob after U, blob before U); a stack commit with the same pair reversed
+    # undoes U on that file
+    undo_index: dict[tuple[str, str, str], str] = {}
+    restore_index: dict[tuple[str, str], str] = {}
+    for u_sha, _, u_subj, u_files in upstream:
+      for path, old, new in u_files:
+        undo_index.setdefault((path, new, old), f"{u_sha[:10]} `{u_subj[:60]}`")
+        if old != ZERO_BLOB:
+          restore_index.setdefault((path, old), f"{u_sha[:10]} `{u_subj[:60]}`")
+    for c_sha, c_email, c_subj, c_files in stack:
+      # Other authors' commits in the range are upstream history, not part of this upload
+      if (my_email and c_email != my_email) or REVERT_SUBJECT_RE.match(c_subj):
+        continue
+      for path, old, new in c_files:
+        hit = undo_index.get((path, old, new)) or (
+            restore_index.get((path, new)) if new != old else None
+        )
+        if hit:
+          entry = f"{c_sha[:10]} `{c_subj[:50]}`: `{path}` undoes upstream {hit}"
+          if entry not in reverts:
+            reverts.append(entry)
+      if allow_scope or "companion" in c_subj.lower():
+        continue
+      stray = [p for p, _, _ in c_files if not p.startswith(SKORETEXT_SCOPE_PREFIXES)]
+      if not stray:
+        continue
+      if skoretext is None:
+        skoretext = _is_skoretext_project_context(
+            conv_id, parent_conv_id, transcript_path, workspace_paths
+        )
+      if skoretext:
+        shown = ", ".join(f"`{p}`" for p in stray[:4])
+        more = f" +{len(stray) - 4} more" if len(stray) > 4 else ""
+        out_of_scope.append(f"{c_sha[:10]} `{c_subj[:50]}`: {shown}{more}")
+  if not reverts and not out_of_scope:
+    return ""
+  parts = ["[STACK-SCOPE GUARD] Gerrit upload blocked."]
+  if reverts:
+    parts.append(
+        f"Stack commits restore files to their state before recent upstream commits (a tree "
+        f"copied onto a moved base, as in Gerrit 1412556 PS4): {'; '.join(reverts[:6])}"
+        f"{f' (+{len(reverts) - 6} more)' if len(reverts) > 6 else ''}. Rebuild the stack "
+        "with `git rebase --onto <base> <old-base>` so each commit only carries its own diff, "
+        "then check `git diff-tree --name-only -r <commit>^ <commit>` per commit."
+    )
+  if out_of_scope:
+    parts.append(
+        "SkoreText commits touch files outside "
+        f"{', '.join(f'`{p}`' for p in SKORETEXT_SCOPE_PREFIXES)}: "
+        f"{'; '.join(out_of_scope[:6])}. Drop the stray files, or, only after the user "
+        "explicitly confirms them, prefix the upload with `ALLOW_OUT_OF_SCOPE_FILES=1`."
+    )
+  return " ".join(parts)
 
 
 def was_doc_grounding_run_in_chat(
@@ -4332,6 +4621,13 @@ def main() -> None:
           )
       )
       return
+    # Block commit-tree everywhere: tree copies onto a moved base silently revert upstream
+    commit_tree_denial = git_commit_tree_denial(
+        cmd_str, _with_cwd(str(tool_args.get("Cwd") or ""), workspace_paths)
+    )
+    if commit_tree_denial:
+      print(json.dumps({"decision": "deny", "reason": commit_tree_denial}, ensure_ascii=False))
+      return
     # Require fast Phase 1 lint/audit scripts on every commit, upload, PR creation, or push
     is_auto_ship_cmd = _invokes_script(cmd_str, "auto_ship.py") and bool(
         re.search(r"\bauto_ship\.py\s+ship\b", cmd_str)
@@ -4459,10 +4755,19 @@ def main() -> None:
         return
       # SkoreText CLs must carry the [SkoreText] subject prefix before they reach Gerrit
       skoretext_denial = skoretext_cl_prefix_denial(
-          cmd_str, conv_id, parent_conv_id, transcript_path, workspace_paths
+          cmd_str, conv_id, parent_conv_id, transcript_path, workspace_paths,
+          str(tool_args.get("Cwd") or ""),
       )
       if skoretext_denial:
         print(json.dumps({"decision": "deny", "reason": skoretext_denial}, ensure_ascii=False))
+        return
+      # Every uploaded commit carries only its own diff: no upstream reverts, no stray files
+      scope_denial = gerrit_upload_scope_denial(
+          cmd_str, conv_id, parent_conv_id, transcript_path, workspace_paths,
+          str(tool_args.get("Cwd") or ""),
+      )
+      if scope_denial:
+        print(json.dumps({"decision": "deny", "reason": scope_denial}, ensure_ascii=False))
         return
 
   # Guard 8: Google Docs update_doc grounding check (amnesia-doc-check Phase 1)

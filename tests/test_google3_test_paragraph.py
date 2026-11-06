@@ -39,6 +39,39 @@ class Google3TestParagraphTests(unittest.TestCase):
         self._lock_patcher.stop()
         self._hermetic_tmp.cleanup()
 
+    def test_upstream_refresh_never_moves_remote_tracking_main(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            origin = tmp / "origin.git"
+            repo = tmp / "skia"
+            rg3._run(["git", "init", "--bare", "-b", "main", str(origin)], cwd=tmp)
+            repo.mkdir()
+            for cmd in (
+                ["git", "init", "-b", "main"],
+                ["git", "config", "user.email", "t@example.com"],
+                ["git", "config", "user.name", "Test"],
+                ["git", "remote", "add", "upstream", str(origin)],
+                ["git", "commit", "--allow-empty", "-m", "base"],
+                ["git", "push", "upstream", "main"],
+                ["git", "fetch", "upstream"],
+            ):
+                rg3._run(cmd, cwd=repo)
+            old_tip = rg3._run(["git", "rev-parse", "upstream/main"], cwd=repo).stdout.strip()
+            rg3._run(["git", "commit", "--allow-empty", "-m", "landed upstream"], cwd=repo)
+            rg3._run(["git", "push", "upstream", "main"], cwd=repo)
+            # Push moves the tracking ref too; put it back to model a stale local upstream/main
+            rg3._run(["git", "update-ref", "refs/remotes/upstream/main", old_tip], cwd=repo)
+            rg3._run(["git", "reset", "-q", "--hard", old_tip], cwd=repo)
+
+            rg3._refresh_local_upstream_ref(repo)
+            self.assertEqual(
+                rg3._run(["git", "rev-parse", "upstream/main"], cwd=repo).stdout.strip(), old_tip
+            )
+            self.assertEqual(
+                rg3._resolve_default_upstream_ref(repo, old_tip),
+                f"{rg3.PREFLIGHT_REF_PREFIX}/upstream/main",
+            )
+
     def test_cpp_and_bazel_rewrites_match_autoroller(self) -> None:
         raw_cpp = (
             '#include "include/core/SkCanvas.h"\n'
@@ -721,16 +754,17 @@ class Google3TestParagraphTests(unittest.TestCase):
             rg3._run(["git", "update-ref", "refs/remotes/origin/main", fresh_main], cwd=repo)
 
             # Best-effort upstream refresh must survive TimeoutExpired and fall back to origin
+            # The remote name always sits right before the refspec, after any fetch flags
             def flaky_fetch(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
                 if cmd[:2] == ["git", "remote"]:
                     return subprocess.CompletedProcess(cmd, 0, "upstream\norigin\n", "")
-                if cmd[:3] == ["git", "fetch", "--quiet"] and cmd[3] == "upstream":
+                if cmd[:3] == ["git", "fetch", "--quiet"] and cmd[-2] == "upstream":
                     raise subprocess.TimeoutExpired(cmd=cmd, timeout=30)
                 return subprocess.CompletedProcess(cmd, 0, "", "")
 
             with mock.patch.object(rg3, "_run", side_effect=flaky_fetch) as m_run:
                 rg3._refresh_local_upstream_ref(repo)
-            fetch_remotes = [c.args[0][3] for c in m_run.call_args_list if c.args[0][1] == "fetch"]
+            fetch_remotes = [c.args[0][-2] for c in m_run.call_args_list if c.args[0][1] == "fetch"]
             self.assertEqual(fetch_remotes, ["upstream", "origin"])
 
             # Pre-flight in main() must reject stale candidates BEFORE running baseline=G3_HEAD
