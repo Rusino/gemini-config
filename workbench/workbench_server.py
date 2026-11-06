@@ -106,7 +106,8 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     lane = _esc(w.get("lane"))
     origin = w.get("origin") or {}
     origin_ssr = (
-        f'<span class="wb-origin">{_esc(origin.get("label"))}</span>'
+        f'<div class="wb-origin-row"><span class="wb-origin">'
+        f'{_esc(origin.get("label"))}</span></div>'
         if origin.get("label")
         else ""
     )
@@ -115,11 +116,11 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       if ob.get("status") == "done":
         continue
       prog = _esc(ob.get("progress_summary") or "")
-      prog_html = f'<span class="wb-ob-prog">{prog}</span>' if prog else ""
+      prog_html = f'<div class="wb-ob-prog">{prog}</div>' if prog else ""
       obs_parts.append(
           f'<div class="wb-ob" data-status="{_esc(ob.get("status"))}">'
-          f'<span>🔔 {_esc(ob.get("description"))}</span>{prog_html}'
-          f"</div>"
+          f'<div class="wb-ob-main"><span>🔔 {_esc(ob.get("description"))}</span>'
+          f"{prog_html}</div></div>"
       )
     obs_html = "".join(obs_parts)
     chk_items = w.get("checklist") or []
@@ -131,8 +132,9 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       for c in item.get("cls") or []:
         chk_covered.add(str(c.get("artifact_key") or ""))
         cl_chips.append(
-            f'<a class="wb-cl-chip" href="{_esc(c.get("url") or "#")}" '
-            f'target="_blank" rel="noopener">{_esc(c.get("label"))}</a>'
+            f'<div class="wb-cl-chip">'
+            f'<a href="{_esc(c.get("url") or "#")}" '
+            f'target="_blank" rel="noopener">{_esc(c.get("label"))}</a></div>'
         )
       cls_ssr = (
           f'<div class="wb-chk-cls">{"".join(cl_chips)}</div>' if cl_chips else ""
@@ -144,14 +146,15 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       )
       chk_rows_ssr.append(
           f'<div class="wb-chk-row" data-stage="{_esc(item.get("stage"))}">'
-          f'<div class="wb-chk-top">'
+          f'<div class="wb-chk-bug">'
           f'<a class="wb-bug-id" href="{_esc(item.get("url") or "#")}" '
           f'target="_blank" rel="noopener">🐛 {_esc(item.get("short_id"))}</a>'
-          f'<span class="wb-bug-title">{_esc(item.get("title"))}</span>'
+          f'<span class="wb-bug-title">{_esc(item.get("title"))}</span></div>'
+          f'<div class="wb-chk-status">'
           f'<span class="wb-stage-badge" '
           f'data-tone="{_esc(item.get("stage_tone"))}">'
-          f'{_esc(item.get("stage_label"))}</span>'
-          f"{outdated_ssr}</div>{cls_ssr}</div>"
+          f'{_esc(item.get("stage_label"))}</span>{outdated_ssr}</div>'
+          f"{cls_ssr}</div>"
       )
     chk_html = (
         f'<div class="wb-checklist">{"".join(chk_rows_ssr)}</div>'
@@ -160,8 +163,8 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     )
     has_chk = bool(chk_rows_ssr)
     pills_html = "".join(
-        f'<span class="wb-pill" data-kind="{_esc(a.get("kind"))}">'
-        f'{_esc(a.get("icon"))} {_esc(a.get("title"))}</span>'
+        f'<div class="wb-pill" data-kind="{_esc(a.get("kind"))}">'
+        f'{_esc(a.get("icon"))} {_esc(a.get("title"))}</div>'
         for a in (w.get("artifacts") or [])
         if str(a.get("artifact_key") or "") not in chk_covered
         and (
@@ -172,10 +175,12 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     )
     cards_ssr.append(
         f'<article class="wb-card" data-work-id="{wid}" data-lane="{lane}">'
-        f'<div class="wb-card-hdr"><span class="wb-lane-tag">{lane}</span>'
-        f'<strong class="wb-card-title">{title}</strong>{origin_ssr}</div>'
-        f"{obs_html}{chk_html}"
-        f"<div class='wb-pills'>{pills_html}</div></article>"
+        f'<div class="wb-card-hdr"><div class="wb-hdr-stack">'
+        f'<strong class="wb-card-title">{title}</strong>'
+        f'<div class="wb-meta-row"><span class="wb-lane-tag">{lane}</span></div>'
+        f"{origin_ssr}</div></div>"
+        f'<div class="wb-card-body">{obs_html}{chk_html}'
+        f"<div class='wb-pills'>{pills_html}</div></div></article>"
     )
   ssr_body = "\n".join(cards_ssr)
   precision_pct = int(round(float(metrics.get("link_precision", 1.0)) * 100))
@@ -452,6 +457,14 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   .wb-card[data-collapsed="true"] .wb-card-body {{
     display: none;
   }}
+  .wb-hdr-stack {{
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+    min-width: 0;
+    flex: 1;
+  }}
   .wb-card-title {{
     font-weight: 600;
     font-size: 13px;
@@ -465,13 +478,18 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     flex-wrap: wrap;
     font-size: 11px;
     color: var(--muted);
-    margin-top: 2px;
+  }}
+  .wb-origin-row {{
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    max-width: 100%;
   }}
   .wb-origin {{
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    padding: 1px 6px;
+    padding: 2px 6px;
     border-radius: 4px;
     font-size: 10.5px;
     font-weight: 500;
@@ -479,6 +497,21 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     border: 1px solid var(--border);
     color: #3a3a3c;
     text-decoration: none;
+    max-width: 100%;
+    word-break: break-word;
+  }}
+  .wb-reasons {{
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    font-size: 11px;
+    color: var(--muted);
+  }}
+  .wb-obs {{
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
   }}
   a.wb-origin:hover {{
     border-color: rgba(0, 113, 227, 0.45);
@@ -510,14 +543,22 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   }}
   .wb-ob {{
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: space-between;
-    gap: 6px;
-    padding: 5px 8px;
+    gap: 8px;
+    padding: 6px 8px;
     border-radius: 6px;
     background: #f8fafc;
     border: 1px solid var(--border);
     font-size: 11.5px;
+  }}
+  .wb-ob-main {{
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+    min-width: 0;
+    flex: 1;
   }}
   .wb-ob[data-status="ready"] {{
     background: #f0fdf4;
@@ -533,10 +574,8 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     color: var(--accent);
     background: #eff6ff;
     border: 1px solid rgba(0, 113, 227, 0.22);
-    padding: 1px 6px;
+    padding: 1px 7px;
     border-radius: 999px;
-    margin-left: 6px;
-    white-space: nowrap;
   }}
   .wb-checklist {{
     display: flex;
@@ -549,18 +588,26 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   .wb-chk-row {{
     display: flex;
     flex-direction: column;
+    align-items: flex-start;
     gap: 4px;
-    padding: 6px 8px;
+    padding: 7px 9px;
     border-top: 1px solid var(--border);
   }}
   .wb-chk-row:first-child {{
     border-top: none;
   }}
-  .wb-chk-top {{
+  .wb-chk-bug {{
     display: flex;
-    align-items: center;
+    align-items: baseline;
     gap: 6px;
-    flex-wrap: wrap;
+    max-width: 100%;
+  }}
+  .wb-chk-status {{
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 3px;
+    padding-left: 18px;
   }}
   .wb-bug-id {{
     font-weight: 600;
@@ -575,8 +622,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   .wb-bug-title {{
     font-size: 11.5px;
     color: var(--text);
-    flex: 1;
-    min-width: 140px;
+    word-break: break-word;
   }}
   .wb-stage-badge {{
     display: inline-flex;
@@ -631,25 +677,33 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   }}
   .wb-chk-cls {{
     display: flex;
-    flex-wrap: wrap;
-    gap: 5px;
-    padding-left: 16px;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+    padding-left: 18px;
+    width: 100%;
   }}
   .wb-cl-chip {{
     display: inline-flex;
     align-items: center;
-    gap: 4px;
-    padding: 2px 6px;
+    flex-wrap: wrap;
+    gap: 5px;
+    padding: 2px 7px;
     border-radius: 5px;
     background: #ffffff;
     border: 1px solid var(--border);
     color: var(--text);
     text-decoration: none;
     font-size: 11px;
+    max-width: 100%;
   }}
   .wb-cl-chip:hover {{
     border-color: rgba(0, 113, 227, 0.45);
     background: #eff6ff;
+  }}
+  .wb-cl-subj {{
+    color: #4b5563;
+    font-size: 11px;
   }}
   .wb-cl-tag {{
     font-size: 9.5px;
@@ -659,14 +713,16 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   }}
   .wb-pills {{
     display: flex;
-    flex-wrap: wrap;
-    gap: 5px;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
   }}
   .wb-pill {{
     display: inline-flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 4px;
-    padding: 2px 7px;
+    padding: 3px 8px;
     border-radius: 5px;
     background: #f8fafc;
     border: 1px solid var(--border);
@@ -947,25 +1003,29 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
         ${{openObs.length ? `<span class="wb-badge" style="color:var(--warn)">🔔 ${{openObs.length}}</span>` : ''}}
         <span class="wb-badge" style="color:var(--muted)">📎 ${{artCount}}</span>
       `;
-      // Render clickable root-cause provenance badge in the card header meta row
-      let originHtml = '';
+      // Render clickable root-cause provenance badge on its own vertical row in the header
+      let originRowHtml = '';
       if (w.origin && w.origin.label) {{
         const o = w.origin;
+        let inner = '';
         if (o.kind === 'chat_chain') {{
           const ocid = String(o.artifact_key || '').split(':').pop();
-          originHtml = `<a class="wb-origin" href="#" data-open-chat="${{esc(ocid)}}">${{esc(o.label)}}</a>`;
+          inner = `<a class="wb-origin" href="#" data-open-chat="${{esc(ocid)}}">${{esc(o.label)}}</a>`;
         }} else if (o.url) {{
-          originHtml = `<a class="wb-origin" href="${{esc(o.url)}}" target="_blank" rel="noopener">${{esc(o.label)}}</a>`;
+          inner = `<a class="wb-origin" href="${{esc(o.url)}}" target="_blank" rel="noopener">${{esc(o.label)}}</a>`;
         }} else {{
-          originHtml = `<span class="wb-origin">${{esc(o.label)}}</span>`;
+          inner = `<span class="wb-origin">${{esc(o.label)}}</span>`;
         }}
+        originRowHtml = `<div class="wb-origin-row">${{inner}}</div>`;
       }}
       const projLabel = (w.project_id && !/^[0-9a-f]{{8}}-[0-9a-f]{{4}}-/i.test(w.project_id))
         ? `<span>📁 ${{esc(w.project_id)}}</span>`
         : '';
-      const reasonsHtml = (w.reasons || []).map((r) => `<span>${{esc(r)}}</span>`).join(' · ');
+      const reasonsHtml = (w.reasons || [])
+        .map((r) => `<div class="wb-reason-row">${{esc(r)}}</div>`)
+        .join('');
 
-      const obsHtml = openObs.map((o) => {{
+      const obsItemsHtml = openObs.map((o) => {{
         const isDraftOb = String(o.target_artifact_key || '').startsWith('gmail_draft:');
         const waitTag = isDraftOb
           ? '<span style="color:var(--accent);font-weight:600">⏳ Parked draft</span>'
@@ -976,19 +1036,21 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
               ? '<strong style="color:var(--urgent)">⏰ STALLED &gt;7d</strong>'
               : waitTag);
         const progHtml = o.progress_summary
-          ? `<span class="wb-ob-prog">${{esc(o.progress_summary)}}</span>`
+          ? `<div class="wb-ob-prog">${{esc(o.progress_summary)}}</div>`
           : '';
         return `
           <div class="wb-ob" data-status="${{esc(o.status)}}"
                data-stalled="${{Boolean(o.stalled_alert)}}"
                title="Trigger: ${{esc(o.trigger_expr)}}">
-            <div style="min-width:0;flex:1">
-              ${{statusTag}} · ${{esc(o.description)}}${{progHtml}}
+            <div class="wb-ob-main">
+              <div>${{statusTag}} · ${{esc(o.description)}}</div>
+              ${{progHtml}}
             </div>
             <button class="wb-btn" data-ob-done="${{esc(o.obligation_id)}}" type="button">✓</button>
           </div>
         `;
       }}).join('');
+      const obsHtml = obsItemsHtml ? `<div class="wb-obs">${{obsItemsHtml}}</div>` : '';
 
       const chkItems = w.checklist || [];
       const chkCovered = new Set();
@@ -1005,6 +1067,10 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
           const confBadge = c.merge_conflict
             ? '<span class="wb-cl-tag" style="background:#fff2f1;color:var(--urgent)">⚠️ conflict</span>'
             : '';
+          const rawSubj = String(c.subject || '').replace(/^\\d+:\\s*/, '').trim();
+          const subjSpan = (rawSubj && rawSubj !== c.artifact_key && rawSubj !== c.label)
+            ? `<span class="wb-cl-subj">— ${{esc(rawSubj)}}</span>`
+            : '';
           const updSpan = c.updated_et
             ? `<span style="color:var(--muted);font-size:10px">${{esc(c.updated_et)}}</span>`
             : '';
@@ -1012,13 +1078,14 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
             ? `<button class="wb-cut" title="Detach from Work" data-unlink-work="${{esc(w.work_id)}}" data-unlink-key="${{esc(c.artifact_key)}}" type="button">✂</button>`
             : '';
           return `
-            <span class="wb-cl-chip" title="${{esc(c.subject)}}">
+            <div class="wb-cl-chip">
               <a href="${{esc(c.url || '#')}}" target="_blank" rel="noopener"
-                 style="color:inherit;text-decoration:none;font-weight:500">${{esc(c.label)}}</a>
+                 style="color:var(--accent);text-decoration:none;font-weight:600">${{esc(c.label)}}</a>
+              ${{subjSpan}}
               ${{wipBadge}}${{stackBadge}}${{confBadge}}
               ${{renderRollDots({{ state: {{ rolls: c.rolls }} }})}}
               ${{updSpan}}${{cutBtn}}
-            </span>
+            </div>
           `;
         }}).join('');
         const clsBlock = clChips ? `<div class="wb-chk-cls">${{clChips}}</div>` : '';
@@ -1027,10 +1094,12 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
           : '';
         return `
           <div class="wb-chk-row" data-stage="${{esc(item.stage)}}">
-            <div class="wb-chk-top">
+            <div class="wb-chk-bug">
               <a class="wb-bug-id" href="${{esc(item.url || '#')}}"
                  target="_blank" rel="noopener">🐛 ${{esc(item.short_id)}}</a>
               <span class="wb-bug-title">${{esc(item.title)}}</span>
+            </div>
+            <div class="wb-chk-status">
               <span class="wb-stage-badge"
                     data-tone="${{esc(item.stage_tone)}}">${{esc(item.stage_label)}}</span>
               ${{outdatedTag}}
@@ -1073,12 +1142,12 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
           : `href="${{esc(a.url || '#')}}" target="_blank" rel="noopener"`;
         const stBadge = (a.state && a.state.status) ? `<span style="color:var(--muted);font-size:10px">[${{esc(a.state.status)}}]</span>` : '';
         return `
-          <span class="wb-pill" data-kind="${{esc(a.kind)}}" data-role="${{esc(a.role)}}">
+          <div class="wb-pill" data-kind="${{esc(a.kind)}}" data-role="${{esc(a.role)}}">
             <a ${{linkAttrs}} style="color:inherit;text-decoration:none">${{esc(a.icon)}} ${{esc(a.title)}}</a>
             ${{stBadge}}
             ${{renderRollDots(a)}}
             ${{cutBtn}}
-          </span>
+          </div>
         `;
       }}).join('');
 
@@ -1095,23 +1164,24 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
           <div class="wb-card-hdr" data-toggle-card="${{esc(w.work_id)}}">
             <div class="wb-card-hdr-main">
               <span class="wb-chevron" aria-hidden="true">${{chevron}}</span>
-              <div style="min-width:0;flex:1">
+              <div class="wb-hdr-stack">
                 <div class="wb-card-title">${{esc(w.title)}}</div>
                 <div class="wb-meta-row">
-                  ${{laneBadge}} ${{multiBadge}} ${{countsBadge}} ${{originHtml}}
+                  ${{laneBadge}} ${{multiBadge}} ${{countsBadge}}
                   ${{projLabel}}
                   ${{w.roadmap_item_key ? `<span>🗺 ${{esc(w.roadmap_item_key)}}</span>` : ''}}
                   <span>${{esc(w.updated_et)}}</span>
                 </div>
+                ${{originRowHtml}}
               </div>
             </div>
-            ${{cardActions}}
           </div>
           <div class="wb-card-body">
-            ${{reasonsHtml ? `<div style="font-size:11px;color:var(--muted)">${{reasonsHtml}}</div>` : ''}}
+            ${{reasonsHtml ? `<div class="wb-reasons">${{reasonsHtml}}</div>` : ''}}
             ${{obsHtml}}
             ${{checklistHtml}}
-            <div class="wb-pills">${{pillsHtml}}</div>
+            ${{pillsHtml ? `<div class="wb-pills">${{pillsHtml}}</div>` : ''}}
+            ${{cardActions}}
           </div>
         </article>
       `;

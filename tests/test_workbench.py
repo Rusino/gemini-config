@@ -819,6 +819,10 @@ class TestWorkbenchContracts(unittest.TestCase):
 
     html = workbench_server.render_workbench_html(proj, 1)
     self.assertIn("wb-checklist", html)
+    self.assertIn("wb-hdr-stack", html)
+    self.assertIn("wb-origin-row", html)
+    self.assertRegex(html, r"\.wb-pills\s*\{[^}]*flex-direction:\s*column")
+    self.assertRegex(html, r"\.wb-chk-cls\s*\{[^}]*flex-direction:\s*column")
     self.assertNotIn("eval:false", html)
 
 
