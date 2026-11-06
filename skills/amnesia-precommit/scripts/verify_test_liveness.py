@@ -139,11 +139,27 @@ def _font_metric_pins(body: str, offset: int, full: str) -> list[str]:
   return issues
 
 
-TEST_FILE_RE = re.compile(r"(^|/)(tests?|testing)/|(^|/)test_[^/]*$|_test\.\w+$|Test\.\w+$")
+TEST_FILE_RE = re.compile(
+    r"(^|/)(tests?|testing)/|(^|/)test_[^/]*$|_(?:unit)?test\.\w+$|Test\.\w+$"
+)
+BUILD_FILE_RE = re.compile(
+    r"(?:\.gni|\.gn|BUILD|BUILD\.bazel|CMakeLists\.txt|\.cmake|\.gyp|DEPS)$"
+)
 # Skia DEF_TEST(Name, ...), gtest TEST(Suite, Name), Python `def test_x`
 TEST_DEF_RE = re.compile(
     r"\b(?:DEF_\w*TEST\w*\(\s*(\w+)|TEST(?:_F|_P)?\(\s*(\w+)\s*,\s*(\w+)|def\s+(test_\w+))"
 )
+
+
+def discover_changed_prod_files(repo: str, rev: str) -> set[str]:
+  files = subprocess.run(
+      ["git", "-C", repo, "diff", "--name-only", "--diff-filter=AM", rev],
+      capture_output=True, text=True, check=True,
+  ).stdout.split()
+  return {
+      rel for rel in files
+      if not TEST_FILE_RE.search(rel) and not BUILD_FILE_RE.search(rel)
+  }
 
 
 def discover_changed_tests(repo: str, rev: str) -> dict[str, list[str]]:
@@ -174,7 +190,9 @@ def discover_changed_tests(repo: str, rev: str) -> dict[str, list[str]]:
   return found
 
 
-def _attestation_errors(repo: str, test_file: str, name: str) -> list[str]:
+def _attestation_errors(
+    repo: str, test_file: str, name: str, changed_prod_files: set[str]
+) -> list[str]:
   path = mutation_check.attestation_path(repo, name)
   hint = "run mutation_check.py --test-file {} --test-name {} with a mutation of the covered code"
   if not os.path.exists(path):
@@ -187,10 +205,21 @@ def _attestation_errors(repo: str, test_file: str, name: str) -> list[str]:
       os.path.join(repo, test_file)
   ):
     return [f"[STALE MUTATION ATTESTATION] `{name}`: test file changed since {path}; rerun"]
+  # When a diff modifies production files, every test in the diff must fail under a mutation
+  # of one of those modified production files, never an untouched bystander file
+  prod_file = att.get("prod_file", "")
+  if changed_prod_files and prod_file not in changed_prod_files:
+    allowed = ", ".join(sorted(changed_prod_files))
+    return [
+        f"[WRONG MUTATION TARGET] `{name}`: attestation mutated `{prod_file}`, which is not "
+        f"in the diff's modified production files ({allowed}); mutate the fix itself"
+    ]
   return []
 
 
-def check(repo: str, test_file: str, names: list[str], args) -> list[str]:
+def check(
+    repo: str, test_file: str, names: list[str], args, changed_prod_files: set[str]
+) -> list[str]:
   errors = []
   test_path = os.path.join(repo, test_file)
   code = open(test_path, encoding="utf-8", errors="replace").read()
@@ -232,7 +261,7 @@ def check(repo: str, test_file: str, names: list[str], args) -> list[str]:
     if not args.allow_font_metric_pins:
       for issue in _font_metric_pins(body, offset, code):
         errors.append(f"[FONT-BACKEND PIN] {test_file}:{issue}")
-    errors += _attestation_errors(repo, test_file, name)
+    errors += _attestation_errors(repo, test_file, name, changed_prod_files)
   return errors
 
 
@@ -268,8 +297,10 @@ def main() -> int:
   repo = os.path.abspath(args.repo)
 
   targets: dict[str, list[str]] = {}
+  changed_prod_files: set[str] = set()
   if args.diff:
     targets = discover_changed_tests(repo, args.diff)
+    changed_prod_files = discover_changed_prod_files(repo, args.diff)
   if args.test_file:
     targets.setdefault(args.test_file, []).extend(args.test_name)
   if not args.diff and not any(targets.values()):
@@ -281,7 +312,7 @@ def main() -> int:
   errors = log_warning_errors(args)
   for test_file, names in sorted(targets.items()):
     print(f"[checking] {test_file}: {', '.join(names)}")
-    errors += check(repo, test_file, sorted(set(names)), args)
+    errors += check(repo, test_file, sorted(set(names)), args, changed_prod_files)
   for e in errors:
     print(e)
   if errors:

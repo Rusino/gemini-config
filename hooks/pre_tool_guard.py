@@ -769,6 +769,47 @@ def unverified_perf_gate_before_upload_or_push(
   return os.path.basename(last_full_path)
 
 
+TEST_SOURCE_FILE_RE = re.compile(
+    r"(?:^|/)(?:tests?|testing)/|(?:^|/)test_[^/]*$|_(?:unit)?test\.\w+$|Test\.\w+$"
+)
+
+
+# Basename of the last C/C++ test file edit with no verify_test_liveness.py run since
+def unverified_test_liveness_before_upload_or_push(
+    transcript_path: str, current_cmd: str = "", current_step_idx: int = -1
+) -> str:
+  last_full_path = ""
+  has_liveness_run = False
+  for step in _load_transcript_steps(transcript_path, current_step_idx):
+    if step.get("type") != "PLANNER_RESPONSE":
+      continue
+    for tc in step.get("tool_calls") or []:
+      tname = tc.get("name", "")
+      targs = tc.get("args") or {}
+      if tname in EDIT_TOOLS:
+        norm_tf = get_tool_target_file(targs).strip().strip('"').strip("'").replace("\\", "/")
+        ext = os.path.splitext(norm_tf)[1].lower()
+        if (
+            ext in SKIA_PERF_EXTENSIONS
+            and TEST_SOURCE_FILE_RE.search(norm_tf)
+            and is_executable_code_edit(tname, targs)
+        ):
+          last_full_path = norm_tf
+          has_liveness_run = False
+      elif tname == "run_command":
+        if _invokes_script(str(targs.get("CommandLine", "")), "verify_test_liveness.py"):
+          has_liveness_run = True
+  if (
+      not last_full_path
+      or has_liveness_run
+      or _invokes_script(current_cmd, "verify_test_liveness.py")
+  ):
+    return ""
+  if _git_branch_has_executable_code_changes(last_full_path, last_full_path) is False:
+    return ""
+  return os.path.basename(last_full_path)
+
+
 # Subjects that claim a speedup; a perf claim without measurements is the failure mode the
 # perf-optimization-loop skill exists to prevent
 PERF_CLAIM_RE = re.compile(
@@ -4390,6 +4431,31 @@ def main() -> None:
       perf_audit = perf_audit_before_upload_denial(cmd_str, workspace_paths)
       if perf_audit:
         print(json.dumps({"decision": "deny", "reason": perf_audit}, ensure_ascii=False))
+        return
+      # Every added or edited C/C++ test must pass verify_test_liveness.py + mutation_check.py
+      unverified_test = unverified_test_liveness_before_upload_or_push(
+          transcript_path, cmd_str, step_idx
+      )
+      if unverified_test:
+        print(
+            json.dumps(
+                {
+                    "decision": "deny",
+                    "reason": (
+                        f"[TEST-LIVENESS GUARD] You modified C/C++ test code (`{unverified_test}`) "
+                        "without running `verify_test_liveness.py` since the last test edit! "
+                        "Every added or modified test (including follow-up patchsets) must fail "
+                        "when a production file modified in the diff is mutated:\n"
+                        "1. Run `python3 ~/.gemini/config/skills/amnesia-precommit/scripts/"
+                        "mutation_check.py ...` for each changed test against a production file "
+                        "in `git diff --name-only <base>`.\n"
+                        "2. Run `python3 ~/.gemini/config/skills/amnesia-precommit/scripts/"
+                        "verify_test_liveness.py --repo <repo> --diff <base> --log <log>`."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )
         return
       # SkoreText CLs must carry the [SkoreText] subject prefix before they reach Gerrit
       skoretext_denial = skoretext_cl_prefix_denial(
