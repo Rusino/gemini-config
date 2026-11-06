@@ -30,6 +30,7 @@ class DedupeLogicUnitTest(unittest.TestCase):
       isAutoDedupeExcluded,
       parseResourceDescriptor,
       urlsMatchForAutoDedupe,
+      buildSameDocumentHashUrl,
       shouldSkipIntentionalDuplicate,
       pickSurvivorTab,
       planManualCleanup,
@@ -47,7 +48,9 @@ class DedupeLogicUnitTest(unittest.TestCase):
     // Gerrit review URL matching
     const clRoot = 'https://skia-review.googlesource.com/c/skia/+/1414016';
     const clPs3 = 'https://skia-review.googlesource.com/c/skia/+/1414016/3';
+    const clPs3Msg = 'https://skia-review.googlesource.com/c/skia/+/1414016/3#message-abc';
     const clPs1 = 'https://skia-review.googlesource.com/c/skia/+/1414016/1';
+    const clRange = 'https://skia-review.googlesource.com/c/skia/+/1414016/1..3';
     const clChecks = 'https://skia-review.googlesource.com/c/skia/+/1414016/3?tab=checks';
     const clComment = 'https://skia-review.googlesource.com/c/skia/+/1414016/comment/abc_123';
     const clFile = 'https://skia-review.googlesource.com/c/skia/+/1414016/3/include/core/SkTypes.h';
@@ -56,48 +59,108 @@ class DedupeLogicUnitTest(unittest.TestCase):
     assert.equal(urlsMatchForAutoDedupe(clRoot, clPs3), true);
     // Opening specific patchset matches root tab
     assert.equal(urlsMatchForAutoDedupe(clPs3, clRoot), true);
-    // Opening identical patchsets match
+    // Identical patchsets and message anchors on the same patchset match
     assert.equal(urlsMatchForAutoDedupe(clPs3, clPs3), true);
-    // Opening DIFFERENT explicit patchsets must NOT match (preserves comparison)
+    assert.equal(urlsMatchForAutoDedupe(clPs3Msg, clPs3), true);
+    // Explicit patchset/range/checks/comment/file subviews stay distinct in auto-mode
     assert.equal(urlsMatchForAutoDedupe(clPs1, clPs3), false);
-    // Checks view must not be swallowed by diff overview
+    assert.equal(urlsMatchForAutoDedupe(clRange, clPs3), false);
     assert.equal(urlsMatchForAutoDedupe(clChecks, clPs3), false);
-    // Comment link must not be swallowed by CL overview
     assert.equal(urlsMatchForAutoDedupe(clComment, clPs3), false);
-    // Specific file diff must not be swallowed by CL overview
     assert.equal(urlsMatchForAutoDedupe(clFile, clPs3), false);
 
-    // Issue trackers across mirrors
+    // Issue trackers unify mirrors, /u/<N>/ prefixes, short IDs, and #comment anchors
     const issueA = 'https://issues.chromium.org/issues/576664769';
     const issueB = 'https://issuetracker.google.com/issues/576664769?pli=1';
-    const issueC = 'https://bugs.custom.google.com/issues/576664769';
+    const issueCorpU0 = 'https://bugs.custom.google.com/u/0/issues/576664769';
+    const issueSkia = 'https://issues.skia.org/issues/576664769';
+    const issueShort = 'https://issues.chromium.org/576664769';
     const issueComment2 = 'https://issues.chromium.org/issues/576664769#comment2';
     const issueComment5 = 'https://issues.chromium.org/issues/576664769#comment5';
+    const redirectIssue =
+      'https://www.google.com/url?q=https%3A%2F%2Fissues.chromium.org' +
+      '%2Fissues%2F576664769%23comment5';
 
     assert.equal(urlsMatchForAutoDedupe(issueA, issueB), true);
-    assert.equal(urlsMatchForAutoDedupe(issueA, issueC), true);
-    // Explicit comment hash deep links must stay distinct
-    assert.equal(urlsMatchForAutoDedupe(issueComment2, issueComment5), false);
+    assert.equal(urlsMatchForAutoDedupe(issueA, issueCorpU0), true);
+    assert.equal(urlsMatchForAutoDedupe(issueA, issueSkia), true);
+    assert.equal(urlsMatchForAutoDedupe(issueA, issueShort), true);
+    assert.equal(urlsMatchForAutoDedupe(issueA, issueComment2), true);
+    assert.equal(urlsMatchForAutoDedupe(issueComment2, issueComment5), true);
+    assert.equal(urlsMatchForAutoDedupe(redirectIssue, issueCorpU0), true);
 
-    // Google Docs and Sheets sub-tabs
+    // Same-document hash scroll builder preserves survivor origin/path/query across mirrors
+    assert.equal(
+      buildSameDocumentHashUrl(issueCorpU0, issueComment5),
+      'https://bugs.custom.google.com/u/0/issues/576664769#comment5',
+    );
+    assert.equal(buildSameDocumentHashUrl(clPs3, clComment), null);
+    assert.equal(buildSameDocumentHashUrl(clPs3, clPs3Msg), clPs3Msg);
+    assert.equal(
+      buildSameDocumentHashUrl(
+        clPs3,
+        'https://skia-review.googlesource.com/c/skia/+/1414016#message-abc',
+      ),
+      clPs3Msg,
+    );
+    assert.equal(
+      buildSameDocumentHashUrl(
+        'https://other.test/docs/guide/?utm_source=chat',
+        'https://other.test/docs/guide#sec2',
+      ),
+      'https://other.test/docs/guide/?utm_source=chat#sec2',
+    );
+
+    // Google Docs and Sheets sub-tabs, published /d/e/ docs, and /copy or /export actions
     const docA = 'https://docs.google.com/document/u/0/d/123456789/edit?pli=1&tab=t.0';
-    const docB = 'https://docs.google.com/document/u/1/d/123456789/edit';
+    const docHeading = 'https://docs.google.com/document/d/123456789/edit#heading=h.abc';
     const docTabX = 'https://docs.google.com/document/d/123456789/edit?tab=t.xyz';
+    const docCopy = 'https://docs.google.com/document/d/123456789/copy';
+    const docExport = 'https://docs.google.com/document/d/123456789/export?format=pdf';
+    const pubDoc1 = 'https://docs.google.com/document/d/e/2PACX-1vFirstDoc/pub';
+    const pubDoc2 = 'https://docs.google.com/document/d/e/2PACX-1vSecondDoc/pub';
     const sheetGid0 = 'https://docs.google.com/spreadsheets/d/abc/edit#gid=0';
     const sheetDefault = 'https://docs.google.com/spreadsheets/d/abc/edit';
     const sheetGid99 = 'https://docs.google.com/spreadsheets/d/abc/edit#gid=99';
 
-    assert.equal(urlsMatchForAutoDedupe(docA, docB), true);
+    assert.equal(urlsMatchForAutoDedupe(docA, docHeading), true);
     assert.equal(urlsMatchForAutoDedupe(docA, docTabX), false);
+    assert.equal(urlsMatchForAutoDedupe(docA, docCopy), false);
+    assert.equal(urlsMatchForAutoDedupe(docA, docExport), false);
+    assert.equal(urlsMatchForAutoDedupe(pubDoc1, pubDoc2), false);
+    assert.equal(urlsMatchForAutoDedupe(pubDoc1, pubDoc1), true);
     assert.equal(urlsMatchForAutoDedupe(sheetGid0, sheetDefault), true);
     assert.equal(urlsMatchForAutoDedupe(sheetGid0, sheetGid99), false);
 
-    // GitHub PRs and issues
+    // GitHub unifies comment hashes in auto-mode, keeps distinct commits/check runs open
     const prA = 'https://github.com/flutter/flutter/pull/194980';
-    const prB = 'https://github.com/flutter/flutter/pull/194980/';
+    const prComment = 'https://github.com/flutter/flutter/pull/194980#issuecomment-42';
     const prFiles = 'https://github.com/flutter/flutter/pull/194980/files';
-    assert.equal(urlsMatchForAutoDedupe(prA, prB), true);
+    const prCommit1 = 'https://github.com/flutter/flutter/pull/194980/commits/1111111';
+    const prCommit2 = 'https://github.com/flutter/flutter/pull/194980/commits/2222222';
+    const prCheck1 = 'https://github.com/flutter/flutter/pull/194980/checks?check_run_id=100';
+    const prCheck2 = 'https://github.com/flutter/flutter/pull/194980/checks?check_run_id=200';
+    assert.equal(urlsMatchForAutoDedupe(prA, prComment), true);
     assert.equal(urlsMatchForAutoDedupe(prA, prFiles), false);
+    assert.equal(urlsMatchForAutoDedupe(prCommit1, prCommit2), false);
+    assert.equal(urlsMatchForAutoDedupe(prCheck1, prCheck2), false);
+    assert.equal(
+      buildSameDocumentHashUrl(
+        prCommit1,
+        'https://github.com/flutter/flutter/pull/194980/commits/2222222#diff-abcR10',
+      ),
+      null,
+    );
+
+    // General web pages unify #section anchors while preserving #/ SPA routes
+    assert.equal(
+      urlsMatchForAutoDedupe('https://other.test/docs/guide', 'https://other.test/docs/guide#sec2'),
+      true,
+    );
+    assert.equal(
+      urlsMatchForAutoDedupe('https://app.test/#/inbox', 'https://app.test/#/sent'),
+      false,
+    );
 
     // Intentional duplicate guards (both scalar and {currentTabId, prevTabId} state)
     assert.equal(
@@ -134,18 +197,28 @@ class DedupeLogicUnitTest(unittest.TestCase):
     ]);
     assert.equal(survivor.id, 11);
 
+    // Manual cleanup collapses entity subviews (Gerrit subviews, PR files, Tab Groups)
     const plan = planManualCleanup([
       {id: 1, url: prA, title: 'PR 1', pinned: true},
-      {id: 2, url: prB, title: 'PR 2', pinned: false},
-      {id: 3, url: clPs3, title: 'CL 3', active: true},
-      {id: 4, url: clPs3, title: 'CL 4', active: false},
-      {id: 5, url: clRoot, title: 'CL Root', active: false},
-      {id: 6, url: clPs1, title: 'CL PS1', active: false},
-      {id: 7, url: 'https://other.test/page', title: 'Other'},
+      {id: 2, url: prFiles, title: 'PR Files', pinned: false},
+      {id: 3, url: clPs3, title: 'CL PS3', active: false, lastAccessed: 100},
+      {id: 4, url: clComment, title: 'CL Comment', active: false, lastAccessed: 900},
+      {id: 5, url: clRoot, title: 'CL Root', active: false, lastAccessed: 800},
+      {id: 6, url: clPs1, title: 'CL PS1', active: false, lastAccessed: 700},
+      {id: 7, url: clChecks, title: 'CL Checks', active: false, lastAccessed: 950},
+      {id: 8, url: clFile, title: 'CL File', active: false, lastAccessed: 960},
+      {id: 9, url: issueCorpU0, title: 'Bug Grouped', groupId: 5, lastAccessed: 100},
+      {id: 10, url: issueComment2, title: 'Bug Loose', groupId: -1, lastAccessed: 500},
+      {id: 11, url: issueComment5, title: 'Bug Grouped Dup', groupId: 5, lastAccessed: 50},
+      {id: 12, url: 'https://other.test/page', title: 'Other'},
+      {id: 13, url: 'https://other.test/page#section2', title: 'Other Anchor'},
     ]);
-    assert.equal(plan.groupsCount, 2);
-    // Pinned (1), active (3), and PS1 (6) stay open; PR dup (2), PS3 dup (4), and Root (5) close
-    assert.deepEqual(plan.closable.map(x => x.tabId).sort((a, b) => a - b), [2, 4, 5]);
+    assert.equal(plan.groupsCount, 4);
+    // Survivors: 1 (pinned PR), 3 (highest overview PS3), 9 (grouped bug), 12 (first page)
+    assert.deepEqual(
+      plan.closable.map((x) => x.tabId).sort((a, b) => a - b),
+      [2, 4, 5, 6, 7, 8, 10, 11, 13],
+    );
 
     console.log('ALL_DEDUPE_LOGIC_TESTS_PASSED');
     """
@@ -175,6 +248,21 @@ class MockServerHandler(BaseHTTPRequestHandler):
       html = f"""<!DOCTYPE html><html><body>
         <h1>Review Page: {self.path}</h1>
         <textarea id="draft">initial</textarea>
+      </body></html>"""
+      self.send_response(200)
+      self.send_header("Content-Type", "text/html; charset=utf-8")
+      self.end_headers()
+      self.wfile.write(html.encode("utf-8"))
+      return
+
+    if self.path.startswith("/issues/576664769") or self.path.startswith(
+        "/u/0/issues/576664769"
+    ):
+      html = """<!DOCTYPE html><html><body>
+        <textarea id="bugdraft">initial</textarea>
+        <div style="height: 2200px">spacer</div>
+        <div id="comment9">Comment 9 body</div>
+        <div style="height: 2200px">spacer2</div>
       </body></html>"""
       self.send_response(200)
       self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -441,6 +529,137 @@ class LiveChromeExtensionE2ETest(unittest.TestCase):
               dup_present,
               f"Intentional native chrome.tabs.duplicate tab was closed: {open_tabs_dup}",
           )
+
+          # Bug tab on /u/0/issues/... receives #comment9 link -> scrolls without reload
+          bug_base = f"http://corp.issues.test:{self.server_port}"
+          bug_u0 = f"{bug_base}/u/0/issues/576664769"
+          bug_c9 = f"http://pub.issues.test:{self.server_port}/issues/576664769#comment9"
+          bug_tab = await eval_sw(
+              f'chrome.tabs.create({{url: "{bug_u0}", active: true}})'
+          )
+          bug_tab_id = bug_tab["id"]
+          await asyncio.sleep(0.6)
+
+          targets_bug = (await send_cmd("Target.getTargets")).get("targetInfos", [])
+          page_bug = next(
+              t
+              for t in targets_bug
+              if t.get("type") == "page" and "/u/0/issues/576664769" in t["url"]
+          )
+          session_bug = (
+              await send_cmd(
+                  "Target.attachToTarget",
+                  {"targetId": page_bug["targetId"], "flatten": True},
+              )
+          )["sessionId"]
+          await send_cmd(
+              "Runtime.evaluate",
+              {
+                  "expression": (
+                      'document.getElementById("bugdraft").value = "unsaved bug reply";'
+                      "window.__bugMarker = 77;"
+                  ),
+                  "returnByValue": True,
+              },
+              session_id=session_bug,
+          )
+
+          # Create blank tab, add it to Tab Group first, then navigate to #comment9
+          group_id = await eval_sw(
+              f"chrome.tabs.group({{tabIds: [{bug_tab_id}]}})"
+          )
+          dup_in_group = await eval_sw(
+              'chrome.tabs.create({url: "about:blank", active: true})'
+          )
+          dup_gid = dup_in_group["id"]
+          assigned_gid = await eval_sw(
+              f"chrome.tabs.group({{groupId: {group_id}, tabIds: [{dup_gid}]}})"
+          )
+          self.assertEqual(assigned_gid, group_id)
+          await eval_sw(
+              f'chrome.tabs.update({dup_gid}, {{url: "{bug_c9}", active: true}})'
+          )
+          await asyncio.sleep(1.0)
+
+          tabs_after_grouped_nav = await eval_sw(
+              "chrome.tabs.query({}).then(ts => ts.map(t => t.id))"
+          )
+          self.assertNotIn(dup_gid, tabs_after_grouped_nav)
+
+          bug_state = (
+              await send_cmd(
+                  "Runtime.evaluate",
+                  {
+                      "expression": (
+                          'JSON.stringify({draft: document.getElementById("bugdraft").value,'
+                          " marker: window.__bugMarker, hash: location.hash,"
+                          " scrollY: Math.round(window.scrollY)})"
+                      ),
+                      "returnByValue": True,
+                  },
+                  session_id=session_bug,
+              )
+          )["result"]["value"]
+          parsed_bug_state = json.loads(bug_state)
+          self.assertEqual(parsed_bug_state["draft"], "unsaved bug reply")
+          self.assertEqual(parsed_bug_state["marker"], 77)
+          self.assertEqual(parsed_bug_state["hash"], "#comment9")
+          self.assertGreater(parsed_bug_state["scrollY"], 500)
+
+          # Open Gerrit comment subview + grouped duplicate, then run popup manual cleanup
+          cl_comment_url = f"{base_url}/c/skia/+/1414016/comment/abc_123"
+          await eval_sw(
+              f'chrome.tabs.create({{url: "{cl_comment_url}", active: false}})'
+          )
+          await eval_sw(
+              f"chrome.tabs.group({{groupId: {group_id}, tabIds: [{dup_tab_id}]}})"
+          )
+          await asyncio.sleep(0.6)
+
+          ext_id = sw_target["url"].split("/")[2]
+          popup_url = f"chrome-extension://{ext_id}/popup.html"
+          await eval_sw(f'chrome.tabs.create({{url: "{popup_url}", active: true}})')
+          await asyncio.sleep(0.6)
+
+          targets_popup = (await send_cmd("Target.getTargets")).get("targetInfos", [])
+          page_popup = next(
+              t for t in targets_popup if popup_url in t.get("url", "")
+          )
+          session_popup = (
+              await send_cmd(
+                  "Target.attachToTarget",
+                  {"targetId": page_popup["targetId"], "flatten": True},
+              )
+          )["sessionId"]
+
+          cleanup_res = (
+              await send_cmd(
+                  "Runtime.evaluate",
+                  {
+                      "expression": """(async () => {
+                        const st = await chrome.runtime.sendMessage({action: 'getState'});
+                        const ids = st.duplicates.closable.map(x => x.tabId);
+                        const cl = await chrome.runtime.sendMessage({
+                          action: 'closeSelectedDuplicates',
+                          tabIds: ids,
+                        });
+                        return {closableCount: ids.length, closedCount: cl.closedCount};
+                      })()""",
+                      "awaitPromise": True,
+                      "returnByValue": True,
+                  },
+                  session_id=session_popup,
+              )
+          )["result"]["value"]
+          # Tab A (PS2), PS1, dup_tab (grouped PS2), and comment subview collapse to 1 CL tab
+          self.assertEqual(cleanup_res["closableCount"], 3)
+          self.assertEqual(cleanup_res["closedCount"], 3)
+
+          remaining_cl = await eval_sw(
+              "chrome.tabs.query({}).then("
+              "ts => ts.filter(t => (t.url || '').includes('/c/skia/+/1414016')).length)"
+          )
+          self.assertEqual(remaining_cl, 1)
 
           # Verify recentAutoSwitches was recorded in session storage
           switches = await eval_sw(

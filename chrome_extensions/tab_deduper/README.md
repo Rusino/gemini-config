@@ -7,16 +7,23 @@ tabs by focusing open tabs without reloading, preserving form inputs, scroll pos
 
 - **Auto-focus existing tabs**: When clicking a link that is already open in another tab,
   the extension brings the existing tab to the foreground and removes the newly opened clone.
-- **Zero DOM reload / draft preservation**: The existing tab is never reloaded (`url` is never
-  passed to `chrome.tabs.update`), so unsaved text, scroll position, and DevTools stay intact.
+- **Zero DOM reload / draft preservation**: The existing tab is never reloaded (`url` is only
+  passed to `chrome.tabs.update` for same-document `#anchor` / `#comment` fragment scrolls on
+  the survivor's exact `origin + pathname + search`), so unsaved text, scroll position, and
+  DevTools stay intact.
 - **Smart Gerrit matching**: Opening CL overview (`+/1414016`) switches to any open patchset
-  of that CL (`+/1414016/3`), but opening two different explicit patchsets (`ps 1` and `ps 2`)
-  or the `?tab=checks` view keeps both tabs open side-by-side for comparison.
-- **Smart Docs & Sheets matching**: Strips user index (`u/0`) and redirect params, but
-  keeps different document tabs (`?tab=t.<id>`) and sheet tabs (`#gid=<id>`) distinct.
-- **Smart Issue Tracker matching**: Unifies issue links while preserving specific comment hashes.
-- **Protected tabs**: Pinned tabs, audible (playing audio) tabs, and tabs inside tab groups
-  are never closed.
+  of that CL (`+/1414016/3`), while keeping explicit patchset comparisons, `?tab=checks`,
+  per-file diffs, and inline comment links open on click; manual cleanup collapses all subviews
+  of the same CL into one main overview tab.
+- **Smart Docs & Sheets matching**: Strips user index (`u/0`), Google redirect wrappers, and
+  heading hashes, while keeping different document tabs (`?tab=t.<id>`) and sheet tabs
+  (`#gid=<id>`) distinct.
+- **Smart Issue Tracker & GitHub matching**: Unifies issue mirrors, `u/0` prefixes, and
+  `#comment` / `#issuecomment` anchors (scrolling the open tab to the anchor without reload),
+  and collapses GitHub PR subviews (`pull/<N>/files`, `commits`, `checks`) during manual cleanup.
+- **Protected tabs**: Pinned tabs and audible (playing audio) tabs are never closed; manual
+  cleanup also deduplicates redundant copies inside Chrome Tab Groups (preferring grouped
+  survivors over loose copies).
 - **Safe duplicate detection**: Native `Right-click -> Duplicate` and intentional same-page
   clones are detected and kept open.
 - **Popup dashboard**:

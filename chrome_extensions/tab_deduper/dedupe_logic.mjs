@@ -22,11 +22,37 @@ const TRACKING_QUERY_PARAMS = new Set([
   'usp',
 ]);
 
+// Unwrap single-hop Google redirect wrappers before parsing target resources
+export function unwrapRedirectUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return rawUrl;
+  try {
+    const outer = new URL(rawUrl);
+    const host = outer.hostname.toLowerCase();
+    if (
+      (host === 'www.google.com' || host === 'google.com') &&
+      outer.pathname === '/url'
+    ) {
+      const target =
+        outer.searchParams.get('q') || outer.searchParams.get('url');
+      if (target) {
+        const inner = new URL(target);
+        if (inner.protocol === 'http:' || inner.protocol === 'https:') {
+          return inner.href;
+        }
+      }
+    }
+  } catch {
+    return rawUrl;
+  }
+  return rawUrl;
+}
+
 export function isAutoDedupeExcluded(rawUrl, extraExcludedHosts = []) {
-  if (!rawUrl || typeof rawUrl !== 'string') return true;
+  const unwrapped = unwrapRedirectUrl(rawUrl);
+  if (!unwrapped || typeof unwrapped !== 'string') return true;
   let parsed;
   try {
-    parsed = new URL(rawUrl);
+    parsed = new URL(unwrapped);
   } catch {
     return true;
   }
@@ -41,17 +67,18 @@ export function isAutoDedupeExcluded(rawUrl, extraExcludedHosts = []) {
 }
 
 export function parseResourceDescriptor(rawUrl) {
-  if (!rawUrl || typeof rawUrl !== 'string') {
-    return {excluded: true, exactKey: null, gerritInfo: null};
+  const unwrapped = unwrapRedirectUrl(rawUrl);
+  if (!unwrapped || typeof unwrapped !== 'string') {
+    return {excluded: true, exactKey: null, entityKey: null, gerritInfo: null};
   }
   let url;
   try {
-    url = new URL(rawUrl);
+    url = new URL(unwrapped);
   } catch {
-    return {excluded: true, exactKey: null, gerritInfo: null};
+    return {excluded: true, exactKey: null, entityKey: null, gerritInfo: null};
   }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    return {excluded: true, exactKey: null, gerritInfo: null};
+    return {excluded: true, exactKey: null, entityKey: null, gerritInfo: null};
   }
 
   const host = url.host.toLowerCase();
@@ -64,118 +91,162 @@ export function parseResourceDescriptor(rawUrl) {
     searchParams.delete(p);
   }
 
-  // Rule A: Gerrit code review
+  // Gerrit code review hosts keep subviews distinct on click, unify per CL in cleanup
   const isGerritHost =
     hostname.endsWith('-review.googlesource.com') ||
     hostname === 'gerrit.googlesource.com' ||
     hostname === 'gerrit.test';
   if (isGerritHost) {
-    // Comment link check: /c/<project>/+/<changeNum>/comment/<commentId>
     const commentMatch = pathname.match(
-      /^\/c\/(.+?)\/\+\/(\d+)\/comment\/([0-9a-fA-F_]+)\/?$/,
+      /^(?:\/c\/.+?)?\/\+\/(\d+)\/comment\/([0-9a-fA-F_]+)\/?$/,
     );
     if (commentMatch) {
-      const [, project, changeNum, commentId] = commentMatch;
+      const [, changeNum, commentId] = commentMatch;
       return {
         excluded: false,
-        exactKey: `gerrit-comment:${host}:${project}:${changeNum}:${commentId}`,
+        kind: 'gerrit',
+        exactKey: `gerrit-comment:${host}:${changeNum}:${commentId}`,
+        entityKey: `gerrit-entity:${host}:${changeNum}`,
         gerritInfo: null,
+        viewRank: 1,
+        patchsetNum: 0,
       };
     }
 
-    // CL overview or patchset or file diff view
     const clMatch = pathname.match(
-      /^\/c\/(.+?)\/\+\/(\d+)(?:\/(\d+)(?:\/(.+))?)?\/?$/,
+      /^(?:\/c\/.+?)?\/\+\/(\d+)(?:\/(\d+|\d+\.\.\d+)(?:\/(.+))?)?\/?$/,
     );
     if (clMatch) {
-      const [, project, changeNum, patchset, filePath] = clMatch;
+      const [, changeNum, patchset, filePath] = clMatch;
+      const entityKey = `gerrit-entity:${host}:${changeNum}`;
       const checksTab = searchParams.get('tab') === 'checks';
       if (filePath) {
         return {
           excluded: false,
-          exactKey: `gerrit-file:${host}:${project}:${changeNum}:${patchset || 'any'}:${filePath}`,
+          kind: 'gerrit',
+          exactKey: `gerrit-file:${host}:${changeNum}:${patchset || 'any'}:${filePath}`,
+          entityKey,
           gerritInfo: null,
+          viewRank: 1,
+          patchsetNum: 0,
         };
       }
+      const isRange = Boolean(patchset && patchset.includes('..'));
+      const numericPs = !isRange && patchset ? Number(patchset) || 0 : 0;
       return {
         excluded: false,
-        exactKey: `gerrit:${host}:${project}:${changeNum}:ps=${patchset || '*'}:checks=${
+        kind: 'gerrit',
+        exactKey: `gerrit:${host}:${changeNum}:ps=${patchset || '*'}:checks=${
           checksTab ? '1' : '0'
         }`,
-        gerritInfo: {
-          host,
-          project,
-          changeNum,
-          patchset: patchset || null,
-          filePath: null,
-          checksTab,
-          commentId: null,
-        },
+        entityKey,
+        // Inter-patchset range diffs stay distinct from unversioned CL root on auto-click
+        gerritInfo: isRange
+          ? null
+          : {
+              host,
+              changeNum,
+              patchset: patchset || null,
+              checksTab,
+            },
+        viewRank: !checksTab && !isRange ? 3 : 1,
+        patchsetNum: !checksTab && !isRange ? numericPs : 0,
       };
     }
   }
 
-  // Rule B: Issue Trackers
-  const isIssueHost =
+  // Issue trackers unify mirrors, /u/<N>/ prefixes, and #comment deep links
+  const isDedicatedIssueHost =
     hostname === 'issues.chromium.org' ||
+    hostname === 'issues.skia.org' ||
+    hostname === 'bugs.chromium.org' ||
     hostname === 'issuetracker.google.com' ||
-    hostname.endsWith('.google.com') ||
+    hostname.startsWith('b.') ||
     hostname.endsWith('.issues.test');
-  if (isIssueHost) {
-    const issueMatch = pathname.match(/^\/issues\/(\d+)\/?$/);
+  const isAnyIssueHost = isDedicatedIssueHost || hostname.endsWith('.google.com');
+  if (isAnyIssueHost) {
+    const issueMatch =
+      pathname.match(/^(?:\/u\/\d+)?\/issues\/(\d+)\/?$/) ||
+      (isDedicatedIssueHost
+        ? pathname.match(/^(?:\/u\/\d+)?\/(\d{6,})\/?$/)
+        : null);
     if (issueMatch) {
       const [, issueId] = issueMatch;
-      const commentHash = url.hash.startsWith('#comment') ? url.hash : '';
+      const key = `issue:${issueId}`;
       return {
         excluded: false,
-        exactKey: `issue:${issueId}${commentHash ? ':' + commentHash : ''}`,
+        kind: 'issue',
+        exactKey: key,
+        entityKey: key,
         gerritInfo: null,
+        viewRank: 2,
+        patchsetNum: 0,
       };
     }
   }
 
-  // Rule C: Google Docs, Sheets, Slides
+  // Google Docs, Sheets, and Slides preserve published /d/e/ IDs, copy/export, tabs, and gids
   const isDocsHost = hostname === 'docs.google.com' || hostname === 'docs.test';
   if (isDocsHost) {
     const docsMatch = pathname.match(
-      /^\/(document|spreadsheets|presentation|drawings)(?:\/u\/\d+)?\/d\/([a-zA-Z0-9_-]+)(?:\/|$)/,
+      new RegExp(
+        '^/(document|spreadsheets|presentation|drawings)(?:/u/\\d+)?/d/' +
+          '(e/[a-zA-Z0-9_-]+|[a-zA-Z0-9_-]+)(?:/([^/?#]+))?',
+      ),
     );
     if (docsMatch) {
-      const [, docType, docId] = docsMatch;
-      const rawTab = searchParams.get('tab');
-      const docTab = !rawTab || rawTab === 't.0' ? 't.0' : rawTab;
-      let gid = 'none';
-      if (docType === 'spreadsheets') {
-        const hashGid = url.hash.match(/#gid=(\d+)/);
-        gid = !hashGid || hashGid[1] === '0' ? 'gid=0' : `gid=${hashGid[1]}`;
+      const [, docType, docId, docAction] = docsMatch;
+      if (docAction !== 'copy' && docAction !== 'export') {
+        const rawTab = searchParams.get('tab');
+        const docTab = !rawTab || rawTab === 't.0' ? 't.0' : rawTab;
+        let gid = 'none';
+        if (docType === 'spreadsheets') {
+          const hashGid = url.hash.match(/#gid=(\d+)/);
+          gid = !hashGid || hashGid[1] === '0' ? 'gid=0' : `gid=${hashGid[1]}`;
+        }
+        const key = `gdoc:${docType}:${docId}:tab=${docTab}:${gid}`;
+        return {
+          excluded: false,
+          kind: 'gdoc',
+          exactKey: key,
+          entityKey: key,
+          gerritInfo: null,
+          viewRank: 2,
+          patchsetNum: 0,
+        };
       }
-      return {
-        excluded: false,
-        exactKey: `gdoc:${docType}:${docId}:tab=${docTab}:${gid}`,
-        gerritInfo: null,
-      };
     }
   }
 
-  // Rule D: GitHub pull requests and issues
+  // GitHub strips comment hashes on click, preserves distinct commits/checks, collapses in cleanup
   const isGithubHost = hostname === 'github.com' || hostname === 'github.test';
   if (isGithubHost) {
     const ghMatch = pathname.match(
-      /^\/([^/]+)\/([^/]+)\/(pull|issues)\/(\d+)(?:\/(files|commits|checks))?\/?$/,
+      new RegExp(
+        '^/([^/]+)/([^/]+)/(pull|issues)/(\\d+)' +
+          '(?:/(files|changes|commits|checks)(?:/([^/?#]+))?)?/?$',
+      ),
     );
     if (ghMatch) {
-      const [, owner, repo, kind, num, subview] = ghMatch;
+      const [, owner, repo, kind, num, rawSubview, subDetail] = ghMatch;
+      const subview =
+        rawSubview === 'changes' ? 'files' : rawSubview || 'overview';
+      const checkRun =
+        subview === 'checks' ? searchParams.get('check_run_id') || '' : '';
+      const repoSlug = `${owner.toLowerCase()}/${repo.toLowerCase()}`;
       return {
         excluded: false,
-        exactKey: `gh:${owner.toLowerCase()}/${repo.toLowerCase()}:${kind}:${num}:${
-          subview || 'overview'
-        }${url.hash || ''}`,
+        kind: 'gh',
+        exactKey: `gh:${repoSlug}:${kind}:${num}:${subview}:${subDetail || ''}:${checkRun}`,
+        entityKey: `gh-entity:${repoSlug}:${kind}:${num}`,
         gerritInfo: null,
+        viewRank: subview === 'overview' ? 2 : 1,
+        patchsetNum: 0,
       };
     }
   }
 
-  // Rule E: General HTTP(S) canonical representation
+  // General HTTP(S) strips in-page #anchors while preserving #/ client-side SPA routes
   const sortedParams = [...searchParams.entries()].sort(([a], [b]) =>
     a.localeCompare(b),
   );
@@ -186,12 +257,18 @@ export function parseResourceDescriptor(rawUrl) {
     pathname.length > 1 && pathname.endsWith('/')
       ? pathname.slice(0, -1)
       : pathname;
-  const hashStr = url.hash && url.hash !== '#' ? url.hash : '';
+  const spaRouteHash =
+    url.hash.startsWith('#/') || url.hash.startsWith('#!/') ? url.hash : '';
+  const key = `url:${url.protocol}//${host}${cleanPath}${searchStr}${spaRouteHash}`;
 
   return {
     excluded: false,
-    exactKey: `url:${url.protocol}//${host}${cleanPath}${searchStr}${hashStr}`,
+    kind: 'url',
+    exactKey: key,
+    entityKey: key,
     gerritInfo: null,
+    viewRank: 2,
+    patchsetNum: 0,
   };
 }
 
@@ -211,24 +288,59 @@ export function urlsMatchForAutoDedupe(
   const b = parseResourceDescriptor(existingUrl);
   if (a.excluded || b.excluded) return false;
 
-  // Gerrit reviews: allow CL root to focus an explicit patchset, but keep different patchsets open
+  // Gerrit reviews allow CL root to focus an explicit patchset while keeping two patchsets open
   if (a.gerritInfo && b.gerritInfo) {
     if (
       a.gerritInfo.host !== b.gerritInfo.host ||
-      a.gerritInfo.project !== b.gerritInfo.project ||
       a.gerritInfo.changeNum !== b.gerritInfo.changeNum ||
       a.gerritInfo.checksTab !== b.gerritInfo.checksTab
     ) {
       return false;
     }
-    // Opening root (/+/123) matches any open patchset (/+/123/2)
     if (a.gerritInfo.patchset === null) return true;
-    // Opening specific patchset (/+/123/2) matches root or exact patchset, but not another patchset
     if (b.gerritInfo.patchset === null) return true;
     return a.gerritInfo.patchset === b.gerritInfo.patchset;
   }
 
   return a.exactKey !== null && a.exactKey === b.exactKey;
+}
+
+// Build a fragment-only update URL on survivor's exact origin+path+query to scroll without reload
+export function buildSameDocumentHashUrl(existingUrl, incomingRawUrl) {
+  if (!existingUrl || !incomingRawUrl) return null;
+  try {
+    const existing = new URL(existingUrl);
+    const incoming = new URL(unwrapRedirectUrl(incomingRawUrl));
+    if (
+      !incoming.hash ||
+      incoming.hash === '#' ||
+      incoming.hash.startsWith('#/') ||
+      incoming.hash.startsWith('#!/')
+    ) {
+      return null;
+    }
+    const existingHost = existing.hostname.toLowerCase();
+    if (
+      (existingHost === 'docs.google.com' || existingHost === 'docs.test') &&
+      existing.pathname.startsWith('/spreadsheets/') &&
+      incoming.hash.startsWith('#gid=')
+    ) {
+      return null;
+    }
+
+    const sameBase =
+      existing.origin === incoming.origin &&
+      existing.pathname === incoming.pathname &&
+      existing.search === incoming.search;
+    if (!sameBase && !urlsMatchForAutoDedupe(incoming.href, existingUrl)) {
+      return null;
+    }
+
+    const target = `${existing.origin}${existing.pathname}${existing.search}${incoming.hash}`;
+    return target === existing.href ? null : target;
+  } catch {
+    return null;
+  }
 }
 
 export function shouldSkipIntentionalDuplicate({
@@ -237,7 +349,7 @@ export function shouldSkipIntentionalDuplicate({
   prevActiveTabIdByWindow,
 }) {
   if (!newTab || !targetTab) return false;
-  // Redirects or CL-root-to-patchset canonical matches have distinct raw URLs
+  // Redirects, anchors, or CL-root-to-patchset matches have distinct raw URLs
   const sameRawUrl =
     !newTab.url || !targetTab.url || newTab.url === targetTab.url;
   if (!sameRawUrl) return false;
@@ -276,64 +388,27 @@ export function pickSurvivorTab(candidates) {
   })[0];
 }
 
-function getGerritBaseGroupKey(gerritInfo) {
-  return `gerrit-base:${gerritInfo.host}:${gerritInfo.project}:${
-    gerritInfo.changeNum
-  }:checks=${gerritInfo.checksTab ? '1' : '0'}`;
-}
-
 export function planManualCleanup(tabs, extraExcludedHosts = []) {
   if (!tabs || !Array.isArray(tabs)) {
     return {closable: [], groupsCount: 0};
   }
 
-  const isProtected = (t) =>
-    Boolean(
-      t.pinned ||
-        t.active ||
-        t.audible ||
-        (typeof t.groupId === 'number' && t.groupId !== -1),
-    );
+  const isProtected = (t) => Boolean(t.pinned || t.active || t.audible);
+  const isGrouped = (t) => typeof t.groupId === 'number' && t.groupId !== -1;
 
   const descByTab = new Map();
-  const explicitGerritByBase = new Map();
+  const groups = new Map();
 
   for (const tab of tabs) {
     if (!tab.url) continue;
     if (isAutoDedupeExcluded(tab.url, extraExcludedHosts)) continue;
     const desc = parseResourceDescriptor(tab.url);
-    if (desc.excluded || !desc.exactKey) continue;
+    if (desc.excluded || !desc.entityKey) continue;
     descByTab.set(tab, desc);
-
-    // Track highest explicit patchset per CL so unversioned root tabs merge into it
-    if (desc.gerritInfo && desc.gerritInfo.patchset !== null) {
-      const baseKey = getGerritBaseGroupKey(desc.gerritInfo);
-      const psNum = Number(desc.gerritInfo.patchset) || 0;
-      const existing = explicitGerritByBase.get(baseKey);
-      if (!existing || psNum > existing.psNum) {
-        explicitGerritByBase.set(baseKey, {
-          exactKey: desc.exactKey,
-          psNum,
-        });
-      }
+    if (!groups.has(desc.entityKey)) {
+      groups.set(desc.entityKey, []);
     }
-  }
-
-  // Group tabs by canonical key, merging Gerrit CL root tabs into explicit patchsets
-  const groups = new Map();
-  for (const [tab, desc] of descByTab.entries()) {
-    let key = desc.exactKey;
-    if (desc.gerritInfo && desc.gerritInfo.patchset === null) {
-      const baseKey = getGerritBaseGroupKey(desc.gerritInfo);
-      const explicitTarget = explicitGerritByBase.get(baseKey);
-      if (explicitTarget) {
-        key = explicitTarget.exactKey;
-      }
-    }
-    if (!groups.has(key)) {
-      groups.set(key, []);
-    }
-    groups.get(key).push(tab);
+    groups.get(desc.entityKey).push(tab);
   }
 
   const closable = [];
@@ -343,21 +418,35 @@ export function planManualCleanup(tabs, extraExcludedHosts = []) {
     if (tabList.length < 2) continue;
     groupsCount++;
 
-    // Pick survivor tab: protected first, then explicit patchset over CL root, then latest accessed
-    let survivor = tabList.find(isProtected);
-    if (!survivor) {
-      const explicitPatchsetTabs = tabList.filter((t) => {
-        const info = descByTab.get(t)?.gerritInfo;
-        return info && info.patchset !== null;
-      });
-      survivor = pickSurvivorTab(
-        explicitPatchsetTabs.length ? explicitPatchsetTabs : tabList,
-      );
-    }
+    // Rank survivor: protected -> main overview -> latest patchset -> grouped -> latest accessed
+    const survivor = [...tabList].sort((a, b) => {
+      if (isProtected(a) !== isProtected(b)) {
+        return isProtected(a) ? -1 : 1;
+      }
+      if (Boolean(a.pinned) !== Boolean(b.pinned)) {
+        return a.pinned ? -1 : 1;
+      }
+      if (Boolean(a.active) !== Boolean(b.active)) {
+        return a.active ? -1 : 1;
+      }
+      const da = descByTab.get(a);
+      const db = descByTab.get(b);
+      if ((da?.viewRank || 0) !== (db?.viewRank || 0)) {
+        return (db?.viewRank || 0) - (da?.viewRank || 0);
+      }
+      if ((da?.patchsetNum || 0) !== (db?.patchsetNum || 0)) {
+        return (db?.patchsetNum || 0) - (da?.patchsetNum || 0);
+      }
+      if (isGrouped(a) !== isGrouped(b)) {
+        return isGrouped(a) ? -1 : 1;
+      }
+      const accessDiff = (b.lastAccessed || 0) - (a.lastAccessed || 0);
+      if (accessDiff !== 0) return accessDiff;
+      return (a.id || 0) - (b.id || 0);
+    })[0];
 
     for (const tab of tabList) {
       if (tab.id === survivor.id) continue;
-      // Protected tabs never get closed in batch cleanup
       if (isProtected(tab)) continue;
 
       closable.push({
@@ -374,6 +463,8 @@ export function planManualCleanup(tabs, extraExcludedHosts = []) {
           ? 'active'
           : survivor.audible
           ? 'audible'
+          : isGrouped(survivor)
+          ? 'grouped'
           : 'kept',
       });
     }

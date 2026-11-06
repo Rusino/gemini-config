@@ -1,6 +1,7 @@
 // Background service worker for Safe Tab Deduper
 
 import {
+  buildSameDocumentHashUrl,
   isAutoDedupeExcluded,
   pickSurvivorTab,
   planManualCleanup,
@@ -88,7 +89,7 @@ async function updateBadge() {
   await chrome.action.setBadgeBackgroundColor({color: '#1a73e8'});
 }
 
-async function handleTabNavigation(tabId, url, triggerEvent) {
+async function handleTabNavigation(tabId, url) {
   if (!url || typeof url !== 'string') return;
   if (bypassTabIds.has(tabId) || inFlightTabIds.has(tabId)) return;
 
@@ -118,12 +119,8 @@ async function handleTabNavigation(tabId, url, triggerEvent) {
   try {
     const currentTab = await chrome.tabs.get(tabId).catch(() => null);
     if (!currentTab) return;
-    // Pinned, audible, or grouped tabs must remain untouched
-    if (
-      currentTab.pinned ||
-      currentTab.audible ||
-      (typeof currentTab.groupId === 'number' && currentTab.groupId !== -1)
-    ) {
+    // Pinned or audible tabs must remain untouched while child tabs inside groups can dedupe
+    if (currentTab.pinned || currentTab.audible) {
       return;
     }
 
@@ -155,9 +152,14 @@ async function handleTabNavigation(tabId, url, triggerEvent) {
       return;
     }
 
-    // Switch focus to existing tab without reloading to preserve drafts and scroll
+    // Mark survivor established and scroll in-place without reload when only #hash differs
+    bornTabs.delete(survivor.id);
+    const hashUrl = buildSameDocumentHashUrl(survivor.url, url);
     await chrome.windows.update(survivor.windowId, {focused: true});
-    await chrome.tabs.update(survivor.id, {active: true});
+    await chrome.tabs.update(
+      survivor.id,
+      hashUrl ? {active: true, url: hashUrl} : {active: true},
+    );
 
     // Close newly opened redundant tab only after focus successfully transferred
     await chrome.tabs.remove(tabId);
@@ -191,12 +193,9 @@ chrome.tabs.onCreated.addListener((tab) => {
       completedCount: 0,
       initialUrl:
         rawBirthUrl && rawBirthUrl !== 'about:blank' ? rawBirthUrl : null,
-      openerTabId: tab.openerTabId || null,
-      indexAtBirth: tab.index,
-      windowIdAtBirth: tab.windowId,
     });
     if (tab.url) {
-      handleTabNavigation(tab.id, tab.url, 'onCreated');
+      handleTabNavigation(tab.id, tab.url);
     }
   }
   scheduleBadgeUpdate();
@@ -222,7 +221,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   }
   const effectiveUrl = changeInfo.url || tab.url;
   if (effectiveUrl) {
-    handleTabNavigation(tabId, effectiveUrl, 'onUpdated');
+    handleTabNavigation(tabId, effectiveUrl);
   }
   scheduleBadgeUpdate();
 });
@@ -279,13 +278,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       for (const id of tabIds) {
         try {
           const t = await chrome.tabs.get(id);
-          // Protect tabs that became active or pinned while popup was open
-          if (
-            t.pinned ||
-            t.active ||
-            t.audible ||
-            (typeof t.groupId === 'number' && t.groupId !== -1)
-          ) {
+          // Protect tabs that became active, pinned, or audible while popup was open
+          if (t.pinned || t.active || t.audible) {
             continue;
           }
           await chrome.tabs.remove(id);
