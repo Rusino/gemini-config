@@ -445,6 +445,12 @@ class TestWorkbenchContracts(unittest.TestCase):
       self.assertIn("Workbench", html)
       self.assertIn("TextClusters investigation", html)
       self.assertIn("Send summary doc to Florin", html)
+      self.assertIn("wb-expand-all", html)
+      self.assertIn("wb-collapse-all", html)
+      self.assertIn("data-toggle-card", html)
+
+      with urllib.request.urlopen(f"http://127.0.0.1:{port}/favicon.ico", timeout=5) as resp:
+        self.assertEqual(resp.status, 204)
     finally:
       srv.shutdown()
       srv.server_close()

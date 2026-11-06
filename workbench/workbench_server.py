@@ -324,6 +324,11 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     color: var(--muted);
     margin: 4px 0 2px;
   }}
+  #wb-cards-container {{
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }}
   .wb-card {{
     background: var(--surface);
     border: 1px solid var(--border);
@@ -332,6 +337,14 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     display: flex;
     flex-direction: column;
     gap: 6px;
+    transition: border-color 0.12s ease, background 0.12s ease;
+  }}
+  .wb-card[data-collapsed="true"] {{
+    padding: 7px 10px;
+    gap: 0;
+  }}
+  .wb-card[data-collapsed="true"]:hover {{
+    background: var(--surface-hover);
   }}
   .wb-card[data-lane="needs-you"] {{
     border-left: 3px solid var(--urgent);
@@ -347,6 +360,34 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     align-items: flex-start;
     justify-content: space-between;
     gap: 8px;
+    cursor: pointer;
+  }}
+  .wb-card-hdr-main {{
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    min-width: 0;
+    flex: 1;
+  }}
+  .wb-chevron {{
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.45;
+    width: 12px;
+    flex-shrink: 0;
+    user-select: none;
+  }}
+  .wb-card-hdr:hover .wb-chevron {{
+    color: var(--accent);
+  }}
+  .wb-card-body {{
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-left: 18px;
+  }}
+  .wb-card[data-collapsed="true"] .wb-card-body {{
+    display: none;
   }}
   .wb-card-title {{
     font-weight: 600;
@@ -505,6 +546,8 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       <button class="wb-chip" data-filter="multi" type="button">🔗 Multi-channel</button>
       <button class="wb-chip" data-filter="obligations" type="button">🔔 Obligations</button>
       <button class="wb-chip" data-filter="done" type="button">✅ Done</button>
+      <button class="wb-btn" id="wb-expand-all" type="button" title="Expand all visible cards">▾ Expand all</button>
+      <button class="wb-btn" id="wb-collapse-all" type="button" title="Collapse all visible cards">▸ Collapse all</button>
       <input class="wb-search" id="wb-search" type="search" placeholder="Filter works, CLs, bugs...">
     </div>
   </header>
@@ -529,9 +572,42 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
 <script>
 (() => {{
   const UI_VERSION = {int(ui_version)};
+  const COLLAPSE_STORAGE_KEY = 'wb_collapsed_v1';
   let state = {initial_json};
   let activeFilter = 'all';
   let searchQuery = '';
+  let collapsedOverrides = {{}};
+  let bulkCollapseMode = null;
+  try {{
+    const raw = localStorage.getItem(COLLAPSE_STORAGE_KEY);
+    if (raw) {{
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {{
+        collapsedOverrides = parsed.overrides || {{}};
+        bulkCollapseMode = parsed.bulk ?? null;
+      }}
+    }}
+  }} catch {{}}
+
+  function saveCollapsePrefs() {{
+    try {{
+      localStorage.setItem(
+        COLLAPSE_STORAGE_KEY,
+        JSON.stringify({{ overrides: collapsedOverrides, bulk: bulkCollapseMode }})
+      );
+    }} catch {{}}
+  }}
+
+  function isCardCollapsed(w) {{
+    const wid = String((w && w.work_id) || '');
+    if (wid && Object.prototype.hasOwnProperty.call(collapsedOverrides, wid)) {{
+      return Boolean(collapsedOverrides[wid]);
+    }}
+    if (bulkCollapseMode !== null) {{
+      return Boolean(bulkCollapseMode);
+    }}
+    return w.lane !== 'needs-you';
+  }}
 
   function notifyParentRendered() {{
     try {{
@@ -648,15 +724,23 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     }}
 
     container.innerHTML = works.map((w) => {{
+      const collapsed = isCardCollapsed(w);
+      const chevron = collapsed ? '▸' : '▾';
+      const openObs = (w.obligations || []).filter((o) => o.status !== 'done');
+      const artCount = (w.artifacts || []).length;
       const laneBadge = w.lane === 'needs-you'
         ? '<span class="wb-badge wb-badge-needs">🚨 Needs You</span>'
         : '<span class="wb-badge wb-badge-wait">⏳ Waiting</span>';
       const multiBadge = w.is_multi_channel
         ? '<span class="wb-badge wb-badge-multi">Multi-channel</span>'
         : '<span class="wb-badge" style="color:var(--muted)">Single item</span>';
+      const countsBadge = `
+        ${{openObs.length ? `<span class="wb-badge" style="color:var(--warn)">🔔 ${{openObs.length}}</span>` : ''}}
+        <span class="wb-badge" style="color:var(--muted)">📎 ${{artCount}}</span>
+      `;
       const reasonsHtml = (w.reasons || []).map((r) => `<span>${{esc(r)}}</span>`).join(' · ');
 
-      const obsHtml = (w.obligations || []).filter((o) => o.status !== 'done').map((o) => {{
+      const obsHtml = openObs.map((o) => {{
         const statusTag = o.status === 'ready'
           ? '<strong style="color:var(--ready)">READY</strong>'
           : (o.stalled_alert ? '<strong style="color:var(--urgent)">STALLED &gt;7d</strong>' : `<span style="color:var(--warn)">eval:${{esc(o.last_eval)}}</span>`);
@@ -700,22 +784,27 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
         : '';
 
       return `
-        <article class="wb-card" data-work-id="${{esc(w.work_id)}}" data-lane="${{esc(w.lane)}}">
-          <div class="wb-card-hdr">
-            <div>
-              <div class="wb-card-title">${{esc(w.title)}}</div>
-              <div class="wb-meta-row">
-                ${{laneBadge}} ${{multiBadge}}
-                ${{w.project_id ? `<span>📁 ${{esc(w.project_id)}}</span>` : ''}}
-                ${{w.roadmap_item_key ? `<span>🗺 ${{esc(w.roadmap_item_key)}}</span>` : ''}}
-                <span>${{esc(w.updated_et)}}</span>
+        <article class="wb-card" data-work-id="${{esc(w.work_id)}}" data-lane="${{esc(w.lane)}}" data-collapsed="${{collapsed}}">
+          <div class="wb-card-hdr" data-toggle-card="${{esc(w.work_id)}}">
+            <div class="wb-card-hdr-main">
+              <span class="wb-chevron" aria-hidden="true">${{chevron}}</span>
+              <div style="min-width:0;flex:1">
+                <div class="wb-card-title">${{esc(w.title)}}</div>
+                <div class="wb-meta-row">
+                  ${{laneBadge}} ${{multiBadge}} ${{countsBadge}}
+                  ${{w.project_id ? `<span>📁 ${{esc(w.project_id)}}</span>` : ''}}
+                  ${{w.roadmap_item_key ? `<span>🗺 ${{esc(w.roadmap_item_key)}}</span>` : ''}}
+                  <span>${{esc(w.updated_et)}}</span>
+                </div>
               </div>
             </div>
             ${{cardActions}}
           </div>
-          ${{reasonsHtml ? `<div style="font-size:11px;color:var(--muted)">${{reasonsHtml}}</div>` : ''}}
-          ${{obsHtml}}
-          <div class="wb-pills">${{pillsHtml}}</div>
+          <div class="wb-card-body">
+            ${{reasonsHtml ? `<div style="font-size:11px;color:var(--muted)">${{reasonsHtml}}</div>` : ''}}
+            ${{obsHtml}}
+            <div class="wb-pills">${{pillsHtml}}</div>
+          </div>
         </article>
       `;
     }}).join('');
@@ -753,14 +842,41 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     }});
   }}
 
+  document.getElementById('wb-expand-all').addEventListener('click', () => {{
+    bulkCollapseMode = false;
+    collapsedOverrides = {{}};
+    saveCollapsePrefs();
+    render();
+  }});
+
+  document.getElementById('wb-collapse-all').addEventListener('click', () => {{
+    bulkCollapseMode = true;
+    collapsedOverrides = {{}};
+    saveCollapsePrefs();
+    render();
+  }});
+
   document.getElementById('wb-search').addEventListener('input', (e) => {{
     searchQuery = e.target.value || '';
     render();
   }});
 
   document.body.addEventListener('click', (e) => {{
-    const target = e.target.closest('button, a');
-    if (!target) return;
+    const target = e.target.closest('button, a, input');
+    if (!target) {{
+      const sel = window.getSelection ? String(window.getSelection()) : '';
+      if (sel) return;
+      const hdr = e.target.closest('[data-toggle-card]');
+      if (hdr) {{
+        const wid = hdr.getAttribute('data-toggle-card');
+        const cardEl = hdr.closest('.wb-card');
+        const cur = cardEl ? cardEl.getAttribute('data-collapsed') === 'true' : false;
+        collapsedOverrides[wid] = !cur;
+        saveCollapsePrefs();
+        render();
+      }}
+      return;
+    }}
     if (target.hasAttribute('data-open-chat')) {{
       e.preventDefault();
       const cid = target.getAttribute('data-open-chat');
@@ -894,6 +1010,10 @@ def create_server(
       if parsed.path == "/api/state":
         self._send_json(current_projection())
         return
+      if parsed.path == "/favicon.ico":
+        self.send_response(204)
+        self.end_headers()
+        return
       if parsed.path in ("/", "/index.html"):
         proj = current_projection()
         self._send_html(render_workbench_html(proj, _INITIAL_MTIME))
@@ -1007,14 +1127,20 @@ def main(argv: list[str] | None = None) -> int:
   args = parser.parse_args(argv)
 
   store = work_store.WorkStore()
-  ingestor.run_sync_cycle(store)
   if args.once:
+    ingestor.run_sync_cycle(store)
     export_workbench_info(args.port)
     return 0
 
+  srv = create_server(host=args.host, port=args.port, store=store)
   stop_event = threading.Event()
 
   def bg_loop() -> None:
+    try:
+      ingestor.run_sync_cycle(store)
+      export_workbench_info(args.port)
+    except Exception:
+      pass
     while not stop_event.wait(max(10, args.interval)):
       try:
         ingestor.run_sync_cycle(store)
@@ -1024,7 +1150,6 @@ def main(argv: list[str] | None = None) -> int:
 
   t = threading.Thread(target=bg_loop, daemon=True)
   t.start()
-  srv = create_server(host=args.host, port=args.port, store=store)
   try:
     srv.serve_forever()
   except KeyboardInterrupt:
