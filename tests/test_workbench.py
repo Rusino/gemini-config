@@ -376,6 +376,7 @@ class TestWorkbenchContracts(unittest.TestCase):
     )
     self.assertEqual(written_back, [("61f270de", "R2")])
 
+
   def test_workctl_cli_and_http_server_endpoints(self) -> None:
     import work_store
     import workbench_server
@@ -824,6 +825,187 @@ class TestWorkbenchContracts(unittest.TestCase):
     self.assertRegex(html, r"\.wb-pills\s*\{[^}]*flex-direction:\s*column")
     self.assertRegex(html, r"\.wb-chk-cls\s*\{[^}]*flex-direction:\s*column")
     self.assertNotIn("eval:false", html)
+
+  def test_exclude_config_works_and_config_artifacts_from_cards(self) -> None:
+    import ingestor
+    import work_store
+
+    now = 1762450000.0
+    self.assertTrue(work_store.is_config_project("04508c43-54a0-4003-8051-7129cd997b88"))
+    self.assertTrue(work_store.is_config_project("5a2a0f80"))
+    self.assertTrue(work_store.is_config_project("Improving Experience"))
+    self.assertTrue(work_store.is_config_project("Flight Deck"))
+    self.assertTrue(work_store.is_config_project("My Work"))
+    self.assertFalse(work_store.is_config_project("skia"))
+    self.assertFalse(work_store.is_config_project("8acb67c4-2cb7-43ca-ba04-dc547b3c4788"))
+
+    self.assertTrue(work_store.is_config_text("Задача R16 в проекте Improving Experience"))
+    self.assertTrue(work_store.is_config_text("R112 Clickable links and Gerrit auto-title"))
+    self.assertTrue(work_store.is_config_text("Flight Deck section collapse vs tabs (R62)"))
+    self.assertTrue(
+        work_store.is_config_text("Почини генерацию заголовков ревью-чатов в Flight Deck")
+    )
+    self.assertTrue(
+        work_store.is_config_text(
+            "Используй скилл ui-variants (/usr/local/google/home/jlavrova/.gemini/config)"
+        )
+    )
+    self.assertFalse(
+        work_store.is_config_text(
+            "[FLIGHT-DECK AUDIT: Gerrit 1420017 PS2] Measure hit glyph"
+        )
+    )
+    self.assertFalse(
+        work_store.is_config_text("Flight-Deck Tier 2 Audit: Gerrit 1414017 PS1")
+    )
+
+    store = work_store.WorkStore(self.db_path)
+    # 1. Existing product Work for Gerrit 1414016
+    w_prod = store.create_work(
+        "1414016: [skparagraph] Measure the hit glyph with its own justification shift",
+        project_id="skia",
+        now=now,
+    )
+    store.upsert_artifact(
+        "gerrit:skia:1414016",
+        kind="gerrit",
+        title="1414016: [skparagraph] Measure the hit glyph with its own justification shift",
+        url="https://skia-review.googlesource.com/c/skia/+/1414016",
+        state={"status": "NEW"},
+        now=now,
+    )
+    store.link_artifact(w_prod, "gerrit:skia:1414016", role="primary", source="auto", now=now)
+
+    # 2. Config transcript in project 'Improving Experience' citing Gerrit 1414016 must be ignored
+    cfg_transcript = os.path.join(self.tmp_dir.name, "cfg_conv.jsonl")
+    with open(cfg_transcript, "w", encoding="utf-8") as f:
+      f.write(
+          json.dumps({
+              "type": "USER_INPUT",
+              "content": "В R112 проверим авто-заголовок на примере Gerrit 1414016",
+          })
+          + "\n"
+      )
+      f.write(
+          json.dumps({
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "edit_file",
+                  "args": {
+                      "Path": "/usr/local/google/home/jlavrova/.gemini/config/hooks/stop_guard.py"
+                  },
+              }],
+          })
+          + "\n"
+      )
+    ingested_cfg = ingestor.ingest_transcript_file(
+        store,
+        conv_id="bb4e75ac-5396-4d7c-a095-19bd161047d3",
+        root_cid="bb4e75ac-5396-4d7c-a095-19bd161047d3",
+        transcript_path=cfg_transcript,
+        cursors={},
+        chat_title="R112 Clickable links and Gerrit auto-title",
+        project_id="04508c43-54a0-4003-8051-7129cd997b88",
+        now=now,
+    )
+    self.assertFalse(ingested_cfg)
+    self.assertNotIn(
+        "chat_chain:bb4e75ac-5396-4d7c-a095-19bd161047d3",
+        store.get_work_artifact_keys(w_prod),
+    )
+
+    # 3. Auto-linking a config chat to a product Work is blocked at link_artifact gate
+    store.upsert_artifact(
+        "chat_chain:ea2b5a0f-4a39-4bd6-a6aa-3cc940b6aa3c",
+        kind="chat_chain",
+        title="Задача R16 в проекте Improving Experience",
+        url="/c/ea2b5a0f-4a39-4bd6-a6aa-3cc940b6aa3c",
+        now=now,
+    )
+    self.assertIsNone(
+        store.link_artifact(
+            w_prod,
+            "chat_chain:ea2b5a0f-4a39-4bd6-a6aa-3cc940b6aa3c",
+            role="channel",
+            source="auto",
+            now=now,
+        )
+    )
+
+    # 4. Pre-existing legacy DB pollution cleanup via purge_config_artifacts_and_works
+    w_cfg_only = store.create_work(
+        "Flight Deck section collapse vs tabs (R62)",
+        project_id="5a2a0f80-96c2-4334-a58d-7631310d4f72",
+        now=now,
+    )
+    store.upsert_artifact(
+        "chat_chain:5fa30fcf-89ad-4fc8-8fb4-1990acbc9041",
+        kind="chat_chain",
+        title="Flight Deck section collapse vs tabs (R62)",
+        url="/c/5fa30fcf-89ad-4fc8-8fb4-1990acbc9041",
+        now=now,
+    )
+    w_polluted = store.create_work(
+        "R112 Clickable links and Gerrit auto-title",
+        project_id="04508c43-54a0-4003-8051-7129cd997b88",
+        now=now,
+    )
+    store.upsert_artifact(
+        "github_pr:flutter/flutter:195122",
+        kind="github_pr",
+        title="195122: [web_paragraph] Avoid browser text metrics queries on re-layout",
+        url="https://github.com/flutter/flutter/pull/195122",
+        state={"status": "OPEN"},
+        now=now,
+    )
+    store.upsert_artifact(
+        "chat_chain:489a12df-4f26-4261-a4a9-171080ad3b1a",
+        kind="chat_chain",
+        title="Review PR #195122 web_paragraph metrics",
+        url="/c/489a12df-4f26-4261-a4a9-171080ad3b1a",
+        now=now,
+    )
+    store.link_artifact(
+        w_polluted, "github_pr:flutter/flutter:195122", role="primary", source="auto", now=now
+    )
+    store.link_artifact(
+        w_polluted,
+        "chat_chain:489a12df-4f26-4261-a4a9-171080ad3b1a",
+        role="channel",
+        source="auto",
+        now=now,
+    )
+    # Simulate pre-R6 legacy links already stored in work_links before the gate existed
+    with store._connect() as conn:
+      conn.execute(
+          "INSERT INTO work_links (work_id, artifact_key, role, source, confidence, created_at) "
+          "VALUES (?, ?, 'channel', 'auto', 1.0, ?), (?, ?, 'channel', 'auto', 1.0, ?)",
+          (
+              w_cfg_only,
+              "chat_chain:5fa30fcf-89ad-4fc8-8fb4-1990acbc9041",
+              now,
+              w_polluted,
+              "chat_chain:ea2b5a0f-4a39-4bd6-a6aa-3cc940b6aa3c",
+              now,
+          ),
+      )
+
+    purged = store.purge_config_artifacts_and_works(now=now)
+    self.assertGreaterEqual(purged["works_archived"], 1)
+    self.assertGreaterEqual(purged["links_removed"], 2)
+    self.assertGreaterEqual(purged["works_repaired"], 1)
+
+    proj = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now)
+    wids = {w["work_id"] for w in proj["works"]}
+    self.assertNotIn(w_cfg_only, wids)
+    self.assertIn(w_polluted, wids)
+    repaired = [w for w in proj["works"] if w["work_id"] == w_polluted][0]
+    self.assertEqual(repaired["project_id"], "")
+    self.assertNotIn("R112", repaired["title"])
+    self.assertIn("195122", repaired["title"])
+    art_keys = [a["artifact_key"] for a in repaired["artifacts"]]
+    self.assertNotIn("chat_chain:ea2b5a0f-4a39-4bd6-a6aa-3cc940b6aa3c", art_keys)
+    self.assertIn("chat_chain:489a12df-4f26-4261-a4a9-171080ad3b1a", art_keys)
 
 
 if __name__ == "__main__":

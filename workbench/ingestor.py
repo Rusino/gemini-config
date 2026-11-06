@@ -98,7 +98,6 @@ WRITE_CMD_PATTERNS = (
 WRITE_TOOL_NAMES = frozenset({
     "update_doc",
     "create_file",
-    "send_message",
     "send_message_markdown",
 })
 
@@ -242,6 +241,19 @@ def _is_write_step(step: Mapping[str, Any]) -> bool:
       return True
     args = tc.get("args") or tc.get("arguments") or {}
     if isinstance(args, Mapping):
+      if tname in ("edit_file", "write_file"):
+        p = str(args.get("Path") or "")
+        if p and not any(
+            x in p
+            for x in (
+                "/.gemini/config/",
+                "/.gemini/jetski/brain/",
+                "/.gemini/jetski/roadmaps/",
+                "/tmp/",
+                "/var/",
+            )
+        ):
+          return True
       cmd = str(args.get("CommandLine") or "")
       if any(pat in cmd for pat in WRITE_CMD_PATTERNS):
         return True
@@ -491,6 +503,20 @@ def ingest_transcript_file(
       chain_origin_ts = rts
 
   chain_key = f"chat_chain:{detected_root}"
+  if (
+      work_store.is_config_project(project_id)
+      or work_store.is_config_text(chat_title)
+      or work_store.is_config_text(first_user_prompt)
+      or work_store.is_config_artifact(
+          chain_key,
+          title=chat_title,
+          state={"cascade_id": conv_id, "root_cid": detected_root},
+          project_id=project_id,
+      )
+      or work_store.is_transcript_config_only(transcript_path)
+  ):
+    return False
+
   if not has_write:
     # Read-only session: never mint a Work card; store artifacts in 7-day candidate buffer
     for akey, akind, aurl in extracted.values():
@@ -569,7 +595,7 @@ def ingest_transcript_file(
     work_id = store.find_work_by_artifact(channels[0][0], roles=("primary", "channel"))
 
   if not work_id:
-    if not primaries and not context_primaries and not channels:
+    if not primaries and not channels:
       return False
     primary_title = ""
     if primaries:
@@ -812,10 +838,17 @@ def ingest_cl_watcher_state(
     primary_wid = matched_wids[0]
     for cid in cids[:2]:
       ch_key = f"chat_chain:{cid}"
+      ch_title = str(item.get("chat_title") or f"Chat {cid[:8]}")
+      if work_store.is_config_artifact(
+          ch_key,
+          title=ch_title,
+          state={"cascade_id": cid},
+      ):
+        continue
       store.upsert_artifact(
           ch_key,
           kind="chat_chain",
-          title=str(item.get("chat_title") or f"Chat {cid[:8]}"),
+          title=ch_title,
           url=f"/c/{cid}",
           state={"cascade_id": cid},
           now=cur_now,
@@ -1300,6 +1333,7 @@ def run_sync_cycle(
     w_state["unanswered_tray"] = unanswered
     w_state["last_gmail_sync"] = cur_now
 
+  store.purge_config_artifacts_and_works(now=cur_now)
   w_state["last_sync"] = cur_now
   try:
     os.makedirs(os.path.dirname(watcher_state_path), exist_ok=True)

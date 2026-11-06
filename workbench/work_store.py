@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping
 import contextlib
 from datetime import datetime
+import glob
 import hashlib
 import json
 import os
@@ -19,10 +20,343 @@ from zoneinfo import ZoneInfo
 DEFAULT_DB_PATH = os.path.expanduser(
     "~/.gemini/config/logs/workbench/work_graph.db"
 )
+DEFAULT_PROJECTS_GLOB = os.path.expanduser("~/.gemini/config/projects/*.json")
+DEFAULT_ROADMAPS_GLOB = os.path.expanduser("~/.gemini/jetski/roadmaps/*/state/*.md")
+DEFAULT_DOSSIERS_PATH = os.path.expanduser("~/.gemini/jetski/brain/jetski-dossiers.json")
+DEFAULT_SUMMARIES_DB = os.path.expanduser("~/.gemini/jetski/conversation_summaries.db")
+DEFAULT_BRAIN_ROOT = os.path.expanduser("~/.gemini/jetski/brain")
 ET_ZONE = ZoneInfo("America/New_York")
 STALLED_OBLIGATION_DAYS = 7
 CANDIDATE_TTL_DAYS = 7
 HUB_BUG_COUNT_THRESHOLD = 3
+
+CONFIG_PROJECT_IDS = frozenset({
+    "04508c43-54a0-4003-8051-7129cd997b88",  # Improving Experience
+    "5a2a0f80-96c2-4334-a58d-7631310d4f72",  # Flight Deck
+    "61f270de-563d-45a4-b9eb-1c0bccf80cc9",  # My Work
+    "a29f214d-9fb4-46fd-a8f6-7d60a7e2aaa3",  # Breaking Chats
+    "1c95149f-2787-4209-976d-350eb2a6532c",  # Code Review organizer
+    "601195ef-244b-4030-b288-efe5e738cb44",  # Partnership with AI
+    "e914e1c4-006a-433c-8270-52eff8775667",  # Skia Gardener
+})
+CONFIG_PROJECT_PREFIXES = frozenset(pid[:8] for pid in CONFIG_PROJECT_IDS)
+CONFIG_PROJECT_NAMES = frozenset({
+    "improving experience",
+    "flight deck",
+    "my work",
+    "breaking chats",
+    "code review organizer",
+    "partnership with ai",
+    "skia gardener",
+    "gemini-config",
+    ".gemini/config",
+    "workbench",
+})
+
+_RE_AUDIT_PREFIX = re.compile(
+    r"\[?flight[\s\-]deck\s+(?:tier\s+\d+\s+)?(?:incremental\s+)?audit[^\]]*\]?:?",
+    re.IGNORECASE,
+)
+_RE_PRODUCT_HEAD = re.compile(
+    r"^(?:review(?:-triage)?\s+|companion\s+draft\s+pr\s+for\s+)?"
+    r"(?:pr\s+#\d+|gerrit\s+\d+|crrev/c/\d+|\d{6,8}:\s+\[)",
+    re.IGNORECASE,
+)
+_CONFIG_TEXT_PATTERNS = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\.gemini/config",
+        r"\bgemini-config\b",
+        r"\bimproving experience\b",
+        r"\bbreaking chats\b",
+        r"\bcode review organizer\b",
+        r"\bpartnership with ai\b",
+        r"\bskia[\s_]gardener\b",
+        r"\bworkbench\b",
+        r"\bflight[\s\-]deck\b",
+        r"\bui-variants\b",
+        r"\[title guard\]",
+        r"clickable links and gerrit auto-title",
+        r"gerrit review draft save enforcement",
+        r"false skia blame in flutter roll",
+        r"notice of jetski best-of-n policy",
+        r"\bskill\.md\b",
+        r"\b(?:check_doc_grounding|pre_tool_guard|stop_guard|decision_guard"
+        r"|chat_lifecycle|cl_watcher|auto_ship)\.py\b",
+        r"веб-страниц\w*\s+мониторинга\s+активных\s+слей",
+        r"генераци\w*\s+заголовков\s+ревью-чатов",
+        r"пропускаем\s+полный\s+корпус\s+тестов\s+флаттера",
+        r"правила\s+именования\s+чатов",
+        r"промпты\s+субагентов\s+в\s+плагине\s+keeper",
+        r"воркфлоу\s+в\s+наших\s+скиллах",
+        r"перед\s+тем,\s+как\s+я\s+выставлю\s+\+1\s+код\s+ревью",
+    )
+)
+
+
+def is_config_project(project_id: str) -> bool:
+  """Returns True when project_id identifies a ~/.gemini/config or tooling project."""
+  p = str(project_id or "").strip().lower()
+  if not p:
+    return False
+  if (
+      p in CONFIG_PROJECT_IDS
+      or (len(p) >= 8 and p[:8] in CONFIG_PROJECT_PREFIXES)
+      or p in CONFIG_PROJECT_NAMES
+  ):
+    return True
+  return ".gemini/config" in p or "gemini-config" in p
+
+
+def is_config_text(text: str) -> bool:
+  """Returns True when a Work or chat title describes ~/.gemini/config or tooling work."""
+  raw = str(text or "").strip()
+  if not raw:
+    return False
+  # Preserve product CL/PR audit titles stamped by Flight Deck's review launcher
+  stripped = _RE_AUDIT_PREFIX.sub("", raw).strip()
+  if not stripped:
+    return False
+  if _RE_PRODUCT_HEAD.match(stripped) and "lgtm blocked status" not in stripped.lower():
+    return False
+  return any(rx.search(stripped) for rx in _CONFIG_TEXT_PATTERNS)
+
+
+_CHAT_CLASS_CACHE: dict[str, Any] = {
+    "ts": 0.0,
+    "config_cids": set(),
+    "product_cids": set(),
+    "subagent_cids": set(),
+}
+
+
+def get_local_chat_classification(
+    now: float | None = None,
+) -> tuple[set[str], set[str], set[str]]:
+  """Returns cached (config_cids, product_cids, subagent_cids) from local metadata."""
+  cur_now = time.time() if now is None else now
+  if (
+      cur_now - float(_CHAT_CLASS_CACHE.get("ts") or 0.0) < 30.0
+      and _CHAT_CLASS_CACHE["config_cids"]
+  ):
+    return (
+        _CHAT_CLASS_CACHE["config_cids"],
+        _CHAT_CLASS_CACHE["product_cids"],
+        _CHAT_CLASS_CACHE["subagent_cids"],
+    )
+
+  config_cids: set[str] = set()
+  product_cids: set[str] = set()
+  subagent_cids: set[str] = set()
+
+  for pfile in glob.glob(DEFAULT_PROJECTS_GLOB):
+    try:
+      with open(pfile, "r", encoding="utf-8") as f:
+        pdata = json.load(f)
+      pid = str(pdata.get("id") or "")
+      pname = str(pdata.get("name") or "")
+      target_set = (
+          config_cids
+          if (is_config_project(pid) or is_config_project(pname))
+          else product_cids
+      )
+      for c in pdata.get("conversations") or []:
+        cid = str(c.get("id") if isinstance(c, Mapping) else c).strip()
+        if cid:
+          target_set.add(cid)
+          target_set.add(cid[:8])
+    except Exception:
+      pass
+
+  for sfile in glob.glob(DEFAULT_ROADMAPS_GLOB):
+    parts = sfile.split(os.sep)
+    if len(parts) >= 3:
+      pid = parts[-3]
+      cid = os.path.splitext(parts[-1])[0]
+      if cid:
+        target_set = config_cids if is_config_project(pid) else product_cids
+        target_set.add(cid)
+        target_set.add(cid[:8])
+
+  if os.path.isfile(DEFAULT_DOSSIERS_PATH):
+    try:
+      with open(DEFAULT_DOSSIERS_PATH, "r", encoding="utf-8") as f:
+        raw_d = json.load(f) or {}
+      dossiers = raw_d.get("items") or raw_d.get("dossiers") or {}
+      if isinstance(dossiers, Mapping):
+        for cid, d in dossiers.items():
+          if not isinstance(d, Mapping):
+            continue
+          pid = str(
+              d.get("projectId") or d.get("project_id") or d.get("project_name") or ""
+          )
+          title = str(d.get("title") or d.get("heading") or "")
+          rcid = str(d.get("root_id") or "")
+          if is_config_project(pid) or is_config_text(title):
+            config_cids.add(str(cid))
+            config_cids.add(str(cid)[:8])
+            if rcid:
+              config_cids.add(rcid)
+              config_cids.add(rcid[:8])
+          elif pid:
+            product_cids.add(str(cid))
+            product_cids.add(str(cid)[:8])
+            if rcid:
+              product_cids.add(rcid)
+              product_cids.add(rcid[:8])
+    except Exception:
+      pass
+
+  if os.path.isfile(DEFAULT_SUMMARIES_DB):
+    try:
+      sconn = sqlite3.connect(DEFAULT_SUMMARIES_DB, timeout=2.0)
+      sconn.row_factory = sqlite3.Row
+      try:
+        tables = [
+            str(r[0])
+            for r in sconn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        ]
+        for tname in tables:
+          cols = {
+              str(r[1])
+              for r in sconn.execute(f"PRAGMA table_info({tname})").fetchall()
+          }
+          if "conversation_id" in cols and "parent_conversation_id" in cols:
+            for r in sconn.execute(
+                f"SELECT conversation_id FROM {tname} "
+                f"WHERE (parent_conversation_id IS NOT NULL AND parent_conversation_id != '') "
+                f"OR COALESCE(nesting_depth, 0) > 0 "
+                f"OR (agent_name IS NOT NULL AND agent_name != '')"
+            ):
+              cid = str(r["conversation_id"] or "")
+              if cid:
+                subagent_cids.add(cid)
+                subagent_cids.add(cid[:8])
+      finally:
+        sconn.close()
+    except Exception:
+      pass
+
+  _CHAT_CLASS_CACHE["ts"] = cur_now
+  _CHAT_CLASS_CACHE["config_cids"] = config_cids
+  _CHAT_CLASS_CACHE["product_cids"] = product_cids
+  _CHAT_CLASS_CACHE["subagent_cids"] = subagent_cids
+  return config_cids, product_cids, subagent_cids
+
+
+_PROD_WRITE_CMDS = (
+    "gerrit_draft.py save",
+    "finalize_review.py",
+    "git cl upload",
+    "gh pr create",
+    "gh pr edit",
+    "git push",
+    "create-draft",
+    "update-draft",
+    "gmail mutate send",
+    "gmail mutate reply",
+    "bug_actions.py close_fixed",
+    "bug_actions.py reassign_merge",
+)
+_NON_PRODUCT_PATHS = (
+    "/.gemini/config/",
+    "/.gemini/jetski/brain/",
+    "/.gemini/jetski/roadmaps/",
+    "/tmp/",
+    "/var/",
+)
+
+
+def is_transcript_config_only(transcript_path: str) -> bool:
+  """Returns True when a transcript edits ~/.gemini/config without any product repo writes."""
+  if not transcript_path or not os.path.isfile(transcript_path):
+    return False
+  has_prod_write = False
+  has_cfg_edit = False
+  try:
+    with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
+      for line in f:
+        if not line.strip():
+          continue
+        try:
+          step = json.loads(line)
+        except Exception:
+          continue
+        if not isinstance(step, Mapping):
+          continue
+        for tc in step.get("tool_calls") or []:
+          if not isinstance(tc, Mapping):
+            continue
+          tname = str(tc.get("name") or "")
+          args = tc.get("args") or tc.get("arguments") or {}
+          if not isinstance(args, Mapping):
+            continue
+          if tname in ("edit_file", "write_file"):
+            p = str(args.get("Path") or "")
+            if "/.gemini/config/" in p:
+              has_cfg_edit = True
+            elif p and not any(x in p for x in _NON_PRODUCT_PATHS):
+              has_prod_write = True
+          elif tname == "run_command":
+            cmd = str(args.get("CommandLine") or "")
+            if any(pat in cmd for pat in _PROD_WRITE_CMDS):
+              has_prod_write = True
+            if (
+                "auto_ship.py" in cmd
+                or "patch_pre_tool_guard" in cmd
+                or "fix_pre_tool" in cmd
+                or ("/.gemini/config/" in cmd and any(w in cmd for w in ("sed ", "cat <<")))
+            ):
+              has_cfg_edit = True
+          elif tname in ("update_doc", "send_message_markdown"):
+            has_prod_write = True
+  except OSError:
+    return False
+  return has_cfg_edit and not has_prod_write
+
+
+def is_config_artifact(
+    artifact_key: str,
+    title: str = "",
+    state: Mapping[str, Any] | None = None,
+    project_id: str = "",
+) -> bool:
+  """Returns True when an artifact represents a config/subagent chat or config roadmap item."""
+  st = state or {}
+  if is_config_project(project_id) or is_config_project(
+      str(st.get("project_id") or st.get("project") or "")
+  ):
+    return True
+  if is_config_text(title) or is_config_text(str(st.get("subject") or "")):
+    return True
+  akey = str(artifact_key or "")
+  if akey.startswith("roadmap_item:"):
+    r_proj = akey.split(":", 2)[1] if akey.count(":") >= 2 else ""
+    if is_config_project(r_proj):
+      return True
+  if akey.startswith("chat_chain:"):
+    cid = akey.split(":", 1)[-1]
+    casc = str(st.get("cascade_id") or cid)
+    rcid = str(st.get("root_cid") or cid)
+    config_cids, product_cids, subagent_cids = get_local_chat_classification()
+    for cand in (cid, casc, rcid, cid[:8], casc[:8], rcid[:8]):
+      if cand and (cand in config_cids or cand in subagent_cids):
+        return True
+    for cand in (cid, casc, rcid, cid[:8], casc[:8], rcid[:8]):
+      if cand and cand in product_cids:
+        return False
+    for check_cid in {cid, casc, rcid}:
+      if len(check_cid) >= 32:
+        tpath = os.path.join(
+            DEFAULT_BRAIN_ROOT, check_cid, ".system_generated", "logs", "transcript.jsonl"
+        )
+        if is_transcript_config_only(tpath):
+          config_cids.add(check_cid)
+          config_cids.add(check_cid[:8])
+          return True
+  return False
 
 CLOSED_BUG_STATUSES = frozenset({
     "FIXED",
@@ -252,16 +586,18 @@ def resolve_work_origin_and_title(
         return f"{root_subj} — {cp}", origin_info
       return root_subj, origin_info
 
-  if not is_placeholder_title(cleaned):
+  if not is_placeholder_title(cleaned) and not is_config_text(cleaned):
     return cleaned, origin_info
 
-  # Upgrade placeholder/raw-key work titles from rich primary, channel, or context artifacts
+  # Upgrade placeholder/raw-key or config-polluted work titles from rich primary/channel artifacts
   for role_filter in (("primary",), ("channel",), ("context_only",)):
     for a in w_arts:
       if a.get("role") not in role_filter:
         continue
       cand = clean_work_title(str(a.get("title") or ""))
-      if not is_placeholder_title(cand, str(a.get("artifact_key") or "")):
+      if not is_placeholder_title(cand, str(a.get("artifact_key") or "")) and not is_config_text(
+          cand
+      ):
         return cand, origin_info
 
   return (cleaned or raw_title), origin_info
@@ -1166,15 +1502,18 @@ class WorkStore:
         )
 
       art_row = conn.execute(
-          "SELECT state_json FROM artifacts WHERE artifact_key = ?",
+          "SELECT title, state_json FROM artifacts WHERE artifact_key = ?",
           (akey,),
       ).fetchone()
+      art_title = str(art_row["title"] or "") if art_row else ""
       art_state: dict[str, Any] = {}
       if art_row and art_row["state_json"]:
         try:
           art_state = json.loads(art_row["state_json"])
         except Exception:
           art_state = {}
+      if source != "manual" and is_config_artifact(akey, title=art_title, state=art_state):
+        return None
       effective_role = role
       if is_hub_artifact(akey, art_state) and source != "manual":
         effective_role = "context_only"
@@ -1737,6 +2076,98 @@ class WorkStore:
       wait_reasons.append("In progress / waiting on external actors")
     return "waiting", wait_reasons
 
+  def purge_config_artifacts_and_works(
+      self, now: float | None = None
+  ) -> dict[str, int]:
+    """Removes config/subagent artifacts and archives Works that only tracked config activity."""
+    cur_now = time.time() if now is None else now
+    links_removed = 0
+    works_archived = 0
+    works_repaired = 0
+    with self._lock, self._connect() as conn:
+      art_rows = {
+          str(r["artifact_key"]): dict(r)
+          for r in conn.execute("SELECT * FROM artifacts").fetchall()
+      }
+      bad_art_keys: set[str] = set()
+      for akey, ar in art_rows.items():
+        try:
+          st = json.loads(ar.get("state_json") or "{}")
+        except Exception:
+          st = {}
+        if is_config_artifact(akey, title=str(ar.get("title") or ""), state=st):
+          bad_art_keys.add(akey)
+
+      for r in conn.execute("SELECT DISTINCT artifact_key FROM work_links").fetchall():
+        akey = str(r["artifact_key"])
+        if akey not in bad_art_keys and is_config_artifact(akey):
+          bad_art_keys.add(akey)
+
+      for akey in bad_art_keys:
+        cur = conn.execute("DELETE FROM work_links WHERE artifact_key = ?", (akey,))
+        links_removed += int(cur.rowcount or 0)
+        conn.execute("DELETE FROM candidate_buffer WHERE artifact_key = ?", (akey,))
+        if akey.startswith(("chat_chain:", "roadmap_item:")):
+          conn.execute("DELETE FROM artifacts WHERE artifact_key = ?", (akey,))
+
+      work_rows = [
+          dict(r)
+          for r in conn.execute(
+              "SELECT * FROM works WHERE status != 'archived'"
+          ).fetchall()
+      ]
+      for w in work_rows:
+        wid = str(w["work_id"])
+        w_links = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM work_links WHERE work_id = ? ORDER BY created_at ASC",
+                (wid,),
+            ).fetchall()
+        ]
+        primaries = [l for l in w_links if l["role"] == "primary"]
+        channels = [l for l in w_links if l["role"] == "channel"]
+        cfg_proj = is_config_project(str(w.get("project_id") or ""))
+        cfg_title = is_config_text(str(w.get("title") or ""))
+        placeholder_only = is_placeholder_title(str(w.get("title") or "")) and not channels
+        if not primaries or placeholder_only or ((cfg_proj or cfg_title) and not channels):
+          conn.execute(
+              "UPDATE works SET status = 'archived', updated_at = ? WHERE work_id = ?",
+              (cur_now, wid),
+          )
+          conn.execute("DELETE FROM work_links WHERE work_id = ?", (wid,))
+          works_archived += 1
+          continue
+        if cfg_proj or cfg_title:
+          w_arts: list[dict[str, Any]] = []
+          for wl in w_links:
+            ak = str(wl["artifact_key"])
+            ar = art_rows.get(ak) or {}
+            try:
+              st = json.loads(ar.get("state_json") or "{}")
+            except Exception:
+              st = {}
+            w_arts.append({
+                "artifact_key": ak,
+                "kind": str(ar.get("kind") or artifact_kind_from_key(ak)),
+                "title": clean_work_title(str(ar.get("title") or ak)) or ak,
+                "url": str(ar.get("url") or ""),
+                "role": str(wl.get("role") or "primary"),
+                "state": st,
+            })
+          new_proj = "" if cfg_proj else str(w.get("project_id") or "")
+          new_title, _ = resolve_work_origin_and_title(w, w_arts)
+          conn.execute(
+              "UPDATE works SET project_id = ?, title = ?, updated_at = ? WHERE work_id = ?",
+              (new_proj, new_title or str(w["title"]), cur_now, wid),
+          )
+          works_repaired += 1
+    return {
+        "links_removed": links_removed,
+        "works_archived": works_archived,
+        "works_repaired": works_repaired,
+    }
+
   def build_dashboard_projection(
       self,
       cl_watcher_state: Mapping[str, Any] | None = None,
@@ -1800,6 +2231,8 @@ class WorkStore:
     title_updates: list[tuple[str, str]] = []
     for w in work_rows:
       wid = str(w["work_id"])
+      raw_proj = str(w.get("project_id") or "")
+      raw_w_title = str(w.get("title") or "")
       w_links = links_by_work.get(wid, [])
       w_arts: list[dict[str, Any]] = []
       kinds_seen: set[str] = set()
@@ -1812,6 +2245,12 @@ class WorkStore:
             "url": "",
             "state": {},
         })
+        if is_config_artifact(
+            akey,
+            title=str(ar.get("title") or ""),
+            state=ar.get("state") or {},
+        ):
+          continue
         kind = str(ar.get("kind") or artifact_kind_from_key(akey))
         kinds_seen.add(kind)
         w_arts.append({
@@ -1824,6 +2263,15 @@ class WorkStore:
             "source": str(wl.get("source") or "auto"),
             "state": ar.get("state") or {},
         })
+      has_primary = any(a.get("role") == "primary" for a in w_arts)
+      has_channel = any(a.get("role") == "channel" for a in w_arts)
+      if (is_config_project(raw_proj) or is_config_text(raw_w_title)) and not (
+          has_primary and has_channel
+      ):
+        continue
+      if not w_arts and (is_config_project(raw_proj) or is_config_text(raw_w_title)):
+        continue
+      effective_proj = "" if is_config_project(raw_proj) else raw_proj
       w_obs = obs_by_work.get(wid, [])
       checklist, prog_summary = build_work_checklist(w_arts, art_rows)
       if prog_summary:
@@ -1842,7 +2290,7 @@ class WorkStore:
           "status": str(w["status"]),
           "lane": lane,
           "reasons": reasons,
-          "project_id": str(w.get("project_id") or ""),
+          "project_id": effective_proj,
           "roadmap_item_key": str(w.get("roadmap_item_key") or ""),
           "updated_at": float(w.get("updated_at") or cur_now),
           "updated_et": format_et_timestamp(float(w.get("updated_at") or cur_now)),
