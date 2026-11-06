@@ -4,14 +4,19 @@
 COMMIT_MSG_FILE=$1
 COMMIT_SOURCE=$2
 
-# Skip merge, squash, or existing commit amends that already carry headers
+# Skip merge and squash commits; normal commits and amends normalize headers
 if [[ "$COMMIT_SOURCE" == "merge" || "$COMMIT_SOURCE" == "squash" ]]; then
     exit 0
 fi
 
 PWD_PATH=$(pwd)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CHAT_LIFECYCLE_PY="${SCRIPT_DIR}/../hooks/chat_lifecycle.py"
+if [[ ! -f "$CHAT_LIFECYCLE_PY" ]]; then
+    CHAT_LIFECYCLE_PY="$HOME/.gemini/config/hooks/chat_lifecycle.py"
+fi
 
-# 1. Add [SkoreText] prefix in SkoreText or /Users/jlavrova/Sources workspaces
+# Add [SkoreText] prefix in SkoreText or /Users/jlavrova/Sources workspaces
 if [[ "$PWD_PATH" == *"/SkoreText"* || "$PWD_PATH" == *"/Users/jlavrova/Sources"* ]]; then
     FIRST_LINE=$(head -n 1 "$COMMIT_MSG_FILE")
     if [[ "$FIRST_LINE" != "[SkoreText] "* && "$FIRST_LINE" != "Merge "* ]]; then
@@ -23,30 +28,73 @@ if [[ "$PWD_PATH" == *"/SkoreText"* || "$PWD_PATH" == *"/Users/jlavrova/Sources"
     fi
 fi
 
-# 2. Add Assisted-by trailer before Change-Id: (or at the end of the commit message)
-TRAILER=$(python3 ~/.gemini/config/hooks/chat_lifecycle.py model --trailer 2>/dev/null)
-if [[ -n "$TRAILER" ]] && ! grep -q "^Assisted-by:" "$COMMIT_MSG_FILE"; then
-    python3 - "$COMMIT_MSG_FILE" "$TRAILER" <<'PY'
+# Enforce a single Assisted-by trailer (only the latest model) before Change-Id:
+TRAILER=$(python3 "$CHAT_LIFECYCLE_PY" model --trailer 2>/dev/null)
+if [[ -n "$TRAILER" ]] || grep -Eqi '^Assisted-by[[:space:]]*:' "$COMMIT_MSG_FILE"; then
+    python3 - "$COMMIT_MSG_FILE" "$TRAILER" "$COMMIT_SOURCE" <<'PY'
 import re
 import sys
 
-path, trailer = sys.argv[1], sys.argv[2]
+path, trailer, commit_source = sys.argv[1], sys.argv[2].strip(), sys.argv[3]
 with open(path, "r", encoding="utf-8") as f:
     text = f.read()
 
-if re.search(r"^Assisted-by:", text, flags=re.M):
+# Split before Git's scissors diff or trailing #-comment template so we never touch diffs
+scissors_m = re.search(r"^# -+ >8 -+\r?$", text, flags=re.M)
+if scissors_m:
+    msg_part, tail_part = text[:scissors_m.start()], text[scissors_m.start():]
+else:
+    lines = text.splitlines(keepends=True)
+    cut = len(lines)
+    while cut > 0 and (not lines[cut - 1].strip() or lines[cut - 1].lstrip().startswith("#")):
+        if lines[cut - 1].lstrip().startswith("#"):
+            cut -= 1
+            while cut > 0 and not lines[cut - 1].strip():
+                cut -= 1
+            continue
+        break
+    msg_part, tail_part = "".join(lines[:cut]), "".join(lines[cut:])
+
+# Leave empty editor buffers untouched so Git aborts empty interactive commits cleanly
+has_body = any(ln.strip() and not ln.lstrip().startswith("#") for ln in msg_part.splitlines())
+if not has_body and not commit_source:
     sys.exit(0)
 
-m = re.search(r"^Change-Id:", text, flags=re.M)
-if m:
-    prefix = text[:m.start()].rstrip("\n")
-    suffix = text[m.start():]
-    new_text = f"{prefix}\n\n{trailer}\n{suffix}"
+# Match only column-0 trailers so indented prose examples quoting Assisted-by stay intact
+existing = [
+    m.group(0).strip()
+    for m in re.finditer(r"^Assisted-by\s*:.*$", msg_part, flags=re.M | re.I)
+]
+if trailer and trailer != "Assisted-by: AI":
+    chosen = trailer
+elif existing:
+    chosen = existing[-1]
+elif trailer:
+    chosen = trailer
 else:
-    body = text.rstrip("\n")
-    new_text = f"{body}\n\n{trailer}\n" if body else f"{trailer}\n"
+    sys.exit(0)
 
-with open(path, "w", encoding="utf-8") as f:
-    f.write(new_text)
+# Strip all prior column-0 Assisted-by lines so commits never stack multiple model trailers
+cleaned = re.sub(r"^Assisted-by\s*:[^\n]*\n?", "", msg_part, flags=re.M | re.I)
+cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+trailer_line_re = re.compile(r"^[A-Za-z][A-Za-z0-9-]*\s*:")
+
+m = re.search(r"^Change-Id:", cleaned, flags=re.M)
+if m:
+    prefix = cleaned[:m.start()].rstrip("\n")
+    suffix = cleaned[m.start():]
+    last_line = prefix.splitlines()[-1].strip() if prefix.strip() else ""
+    sep = "\n" if trailer_line_re.match(last_line) else "\n\n"
+    rebuilt = f"{prefix}{sep}{chosen}\n{suffix}" if prefix else f"{chosen}\n{suffix}"
+else:
+    body = cleaned.rstrip("\n")
+    last_line = body.splitlines()[-1].strip() if body.strip() else ""
+    sep = "\n" if trailer_line_re.match(last_line) else "\n\n"
+    rebuilt = f"{body}{sep}{chosen}\n" if body else f"{chosen}\n"
+
+new_text = f"{rebuilt}\n{tail_part.lstrip(chr(10))}" if tail_part.strip() else rebuilt
+if new_text != text:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(new_text)
 PY
 fi

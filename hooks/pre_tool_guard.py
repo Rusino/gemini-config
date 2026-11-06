@@ -1390,6 +1390,159 @@ def _is_skoretext_project_context(
   return base_name.lower() == "skoretext"
 
 
+# Tokenize first command segment starting at offset while keeping quoted newlines intact
+def _first_cmd_tokens(cmd: str, start: int) -> tuple[str, list[str]]:
+  tail = strip_heredocs(cmd[start:])
+  sep_chars = ";&|()\n"
+  lexer = shlex.shlex(tail, posix=True, punctuation_chars=sep_chars)
+  lexer.whitespace = " \t\r"
+  lexer.whitespace_split = True
+  try:
+    raw_tokens = list(lexer)
+  except ValueError:
+    return tail.split("\n", 1)[0], []
+  out: list[str] = []
+  for tok in raw_tokens:
+    if tok and set(tok) <= set(sep_chars):
+      break
+    out.append(tok)
+  return tail, out
+
+
+# Extract --body / -b / --body-file / -F payload from gh pr create|edit invocations
+def _gh_pr_body_from_cmd(cmd: str) -> str:
+  spans = [(m.start(), m.end()) for m in HEREDOC_RE.finditer(cmd)]
+  gh_re = re.compile(r"(?:^|(?<=[\s;&|(`]))gh\s+pr\s+(?:create|edit)\b")
+  start = next(
+      (m.start() for m in gh_re.finditer(cmd) if not any(s <= m.start() < e for s, e in spans)),
+      -1,
+  )
+  if start < 0:
+    return ""
+  tail, tokens = _first_cmd_tokens(cmd, start)
+  if re.search(r"(?:-F|--body-file)(?:\s+|=)-(?:\s|$)|\$\(\s*cat\s+<<", tail):
+    m = next((h for h in HEREDOC_RE.finditer(cmd) if h.start() >= start), None)
+    if m:
+      body = m.group(0).split("\n", 1)[1] if "\n" in m.group(0) else ""
+      return body.rsplit("\n", 1)[0]
+    return ""
+  parts: list[str] = []
+  for i, tok in enumerate(tokens):
+    nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
+    if tok in ("-b", "--body"):
+      parts.append(nxt)
+    elif tok.startswith("--body="):
+      parts.append(tok.split("=", 1)[1])
+    elif tok in ("-F", "--body-file") and os.path.isabs(os.path.expanduser(nxt)):
+      try:
+        with open(os.path.expanduser(nxt), encoding="utf-8", errors="replace") as f:
+          parts.append(f.read())
+      except OSError:
+        pass
+  return "\n\n".join(p for p in parts if p)
+
+
+# Extract commit message from git commit (-m / --message / -F / heredoc), keeping quoted newlines
+def _git_commit_body_for_ab(cmd: str) -> str:
+  msg = _commit_message_from_cmd(cmd)
+  if msg:
+    return msg
+  spans = [(m.start(), m.end()) for m in HEREDOC_RE.finditer(cmd)]
+  start = next(
+      (
+          m.start()
+          for m in GIT_COMMIT_AT_RE.finditer(cmd)
+          if not any(s <= m.start() < e for s, e in spans)
+      ),
+      -1,
+  )
+  if start < 0:
+    return ""
+  _, tokens = _first_cmd_tokens(cmd, start)
+  parts: list[str] = []
+  for i, tok in enumerate(tokens):
+    nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
+    if re.fullmatch(r"-[a-zA-Z]*m", tok) or tok == "--message":
+      parts.append(nxt)
+    elif tok.startswith("--message="):
+      parts.append(tok.split("=", 1)[1])
+  return "\n\n".join(p for p in parts if p)
+
+
+# Count column-0 Assisted-by trailers before Git's scissors line so prose quotes are ignored
+def _count_column0_assisted_by(msg: str) -> int:
+  scissors = re.search(r"^# -+ >8 -+\r?$", msg, flags=re.M)
+  head = msg[: scissors.start()] if scissors else msg
+  return len(re.findall(r"^Assisted-by\s*:[^\n]*", head, re.MULTILINE | re.IGNORECASE))
+
+
+# Reject commits, PRs, or uploads carrying stacked Assisted-by trailers; only latest model stays
+def duplicate_assisted_by_denial(
+    cmd: str,
+    workspace_paths: list[str],
+    cwd: str = "",
+) -> str:
+  for msg in (_git_commit_body_for_ab(cmd), _gh_pr_body_from_cmd(cmd)):
+    if msg:
+      cnt = _count_column0_assisted_by(msg)
+      if cnt > 1:
+        return (
+            f"[ASSISTED-BY GUARD] Message carries {cnt} `Assisted-by:` trailers; "
+            "keep only one — the latest model (replace prior `Assisted-by:` lines instead of "
+            "stacking multiple)."
+        )
+  # Also scan every own commit in the uploaded/pushed stack on git cl upload, git push, or gh pr
+  is_gerrit, push_refs = _gerrit_upload_invocation(cmd)
+  if not is_gerrit and not is_git_upload_or_push_command(cmd):
+    return ""
+  if not is_gerrit and re.search(r"(?:^|\s)(?:-n|--dry-run)(?:\s|$)", strip_heredocs(cmd)):
+    return ""
+  root = _upload_repo_root(cmd, _with_cwd(cwd, workspace_paths))
+  if not root:
+    return ""
+  # Explicit refs/for/* push specs skip @{u} so stacked feature branches compare against main
+  base_candidates = (
+      ("upstream/main", "upstream/master", "origin/main", "origin/master")
+      if push_refs
+      else ("@{u}", "upstream/main", "upstream/master", "origin/main", "origin/master")
+  )
+  m = re.search(r"<([^>]+)>", _git_out(root, "var", "GIT_AUTHOR_IDENT"))
+  author_arg = [f"--author={m.group(1)}"] if m else []
+  bad: list[str] = []
+  # Restrict stack inspection to the current author so companion CLs ignore external base commits
+  for ref in push_refs or ["HEAD"]:
+    target_sha = _git_out(root, "rev-parse", "--verify", ref)
+    if not target_sha:
+      continue
+    base = _newest_merge_base(root, target_sha, base_candidates)
+    log_args = (
+        ["log", "-n", "30", *author_arg, "--format=%h%x00%B%x01", f"{base}..{target_sha}"]
+        if base
+        else ["log", "-n", "1", *author_arg, "--format=%h%x00%B%x01", target_sha]
+    )
+    raw = _git_out(root, *log_args)
+    # Delimit records by SOH/NUL so multi-paragraph commit bodies parse without line splitting
+    for rec in raw.split("\x01"):
+      if "\x00" not in rec:
+        continue
+      sha, body = rec.strip("\n").split("\x00", 1)
+      cnt = _count_column0_assisted_by(body)
+      if cnt > 1:
+        subject = body.strip().splitlines()[0] if body.strip() else ""
+        entry = f"{sha} (`{subject[:55]}`, {cnt} lines)"
+        # Deduplicate commits reachable from multiple refs in a multi-ref push
+        if entry not in bad:
+          bad.append(entry)
+  if not bad:
+    return ""
+  return (
+      "[ASSISTED-BY GUARD] Every commit / CL must carry at most one `Assisted-by:` trailer "
+      f"(always only the latest model). Found multiple `Assisted-by:` lines on: "
+      f"{', '.join(bad[:5])}. Collapse them to only the last `Assisted-by:` trailer before "
+      "uploading."
+  )
+
+
 # Enforce the [SkoreText] subject prefix on every Gerrit CL uploaded from SkoreText
 def skoretext_cl_prefix_denial(
     cmd: str,
@@ -4673,6 +4826,14 @@ def main() -> None:
     )
     if decision_denial:
       print(json.dumps({"decision": "deny", "reason": decision_denial}, ensure_ascii=False))
+      return
+
+    # Never upload or create commits/PRs with stacked Assisted-by trailers
+    ab_denial = duplicate_assisted_by_denial(
+        cmd_str, workspace_paths, str(tool_args.get("Cwd") or "")
+    )
+    if ab_denial:
+      print(json.dumps({"decision": "deny", "reason": ab_denial}, ensure_ascii=False))
       return
 
     # Require the full Flutter test corpus only on upload/push/PR when executable code changed

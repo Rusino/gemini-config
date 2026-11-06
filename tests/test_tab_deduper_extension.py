@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Contract and live Chrome E2E tests for Safe Tab Deduper extension."""
 
+from __future__ import annotations
+
 import asyncio
+import glob
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -15,9 +18,44 @@ import websockets
 
 CONFIG_ROOT = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 EXT_DIR = os.path.join(CONFIG_ROOT, "chrome_extensions", "tab_deduper")
-NODE_BIN = os.path.expanduser("~/.gemini/jetski/bin/node")
-CHROME_BIN = os.path.expanduser(
-    "~/.cache/puppeteer/chrome/linux-148.0.7778.97/chrome-linux64/chrome"
+
+
+# Resolve Node and Chrome for Testing across Linux and macOS workstations
+def _find_first_executable(
+    candidates: list[str],
+    glob_patterns: list[str] | None = None,
+    which_name: str = "",
+    env_var: str = "",
+) -> str:
+  env_val = os.environ.get(env_var, "").strip() if env_var else ""
+  search = ([env_val] if env_val else []) + list(candidates)
+  for pat in glob_patterns or []:
+    search.extend(sorted(glob.glob(os.path.expanduser(pat)), reverse=True))
+  for raw in search:
+    p = os.path.expanduser(raw)
+    if os.path.isfile(p) and os.access(p, os.X_OK):
+      return p
+  return (shutil.which(which_name) or candidates[0]) if which_name else candidates[0]
+
+
+NODE_BIN = _find_first_executable(
+    ["~/.gemini/jetski/bin/node", "/usr/local/bin/node", "/opt/homebrew/bin/node"],
+    which_name="node",
+    env_var="NODE_BIN",
+)
+CHROME_BIN = _find_first_executable(
+    [
+        "~/.cache/puppeteer/chrome/linux-148.0.7778.97/chrome-linux64/chrome",
+        "~/cft/chrome-mac-arm64/Google Chrome for Testing.app"
+        "/Contents/MacOS/Google Chrome for Testing",
+    ],
+    glob_patterns=[
+        "~/.cache/puppeteer/chrome/*/chrome-*/chrome",
+        "~/cft/chrome-mac-*/Google Chrome for Testing.app"
+        "/Contents/MacOS/Google Chrome for Testing",
+    ],
+    which_name="google-chrome",
+    env_var="CHROME_BIN",
 )
 
 
@@ -399,29 +437,55 @@ class LiveChromeExtensionE2ETest(unittest.TestCase):
                 return msg.get("result", {})
 
           await send_cmd("Target.setDiscoverTargets", {"discover": True})
-          await asyncio.sleep(0.5)
 
-          targets_resp = await send_cmd("Target.getTargets")
-          targets = targets_resp.get("targetInfos", [])
-          sw_target = next(
-              (
-                  t
-                  for t in targets
-                  if t.get("type") == "service_worker"
-                  and "background.js" in t.get("url", "")
-              ),
-              None,
-          )
+          # Poll for Safe Tab Deduper MV3 worker while skipping Chrome 156 component workers
+          sw_target = None
+          sw_sid = None
+          for _ in range(50):
+            targets_resp = await send_cmd("Target.getTargets")
+            targets = targets_resp.get("targetInfos", [])
+            for cand in targets:
+              cand_url = cand.get("url", "")
+              if cand.get("type") != "service_worker":
+                continue
+              if not cand_url.startswith("chrome-extension://") or "background.js" not in cand_url:
+                continue
+              cand_sid = None
+              try:
+                attach_cand = await send_cmd(
+                    "Target.attachToTarget",
+                    {"targetId": cand["targetId"], "flatten": True},
+                )
+                cand_sid = attach_cand["sessionId"]
+                manifest_res = await send_cmd(
+                    "Runtime.evaluate",
+                    {
+                        "expression": (
+                            'typeof chrome !== "undefined"'
+                            " && chrome.runtime?.getManifest?.()?.name"
+                        ),
+                        "returnByValue": True,
+                    },
+                    session_id=cand_sid,
+                )
+                if manifest_res.get("result", {}).get("value") == "Safe Tab Deduper":
+                  sw_target = cand
+                  sw_sid = cand_sid
+                  break
+                await send_cmd("Target.detachFromTarget", {"sessionId": cand_sid})
+              except RuntimeError:
+                if cand_sid:
+                  try:
+                    await send_cmd("Target.detachFromTarget", {"sessionId": cand_sid})
+                  except RuntimeError:
+                    pass
+            if sw_target is not None:
+              break
+            await asyncio.sleep(0.1)
           self.assertIsNotNone(
               sw_target,
               "Safe Tab Deduper background service worker not found in Chrome",
           )
-
-          attach_sw = await send_cmd(
-              "Target.attachToTarget",
-              {"targetId": sw_target["targetId"], "flatten": True},
-          )
-          sw_sid = attach_sw["sessionId"]
 
           async def eval_sw(expression):
             res = await send_cmd(

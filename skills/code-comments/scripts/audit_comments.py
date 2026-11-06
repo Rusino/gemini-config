@@ -125,10 +125,17 @@ def audit_added_code_leaks(lines, added_lines):
 
 def audit_commit_message(msg_text):
   issues = []
+  assisted_by_lines = []
   for idx, raw in enumerate(msg_text.splitlines(), start=1):
+    # Stop before Git's verbose commit diff scissors so diff context lines are never audited
+    if re.match(r"^# -+ >8 -+\s*$", raw):
+      break
     stripped = raw.strip()
     if not stripped or stripped.startswith("#"):
       continue
+    # Match column-0 trailers only so indented prose quotations in the body do not false-positive
+    if re.match(r"^Assisted-by\s*:", raw, re.IGNORECASE):
+      assisted_by_lines.append(idx)
     m_cid = CHANGE_ID_PREFIX_RE.match(stripped)
     if m_cid:
       cid_val = m_cid.group(1).strip()
@@ -154,6 +161,13 @@ def audit_commit_message(msg_text):
           f"L{idx}",
           f"public CL commit-message leak ('{token}' — avoid go/ or prose b/ IDs): '{stripped}'",
       ))
+  # Commits carry only the latest model trailer so amends never accumulate history
+  if len(assisted_by_lines) > 1:
+    issues.append((
+        f"L{assisted_by_lines[1]}",
+        f"multiple Assisted-by trailers ({len(assisted_by_lines)} found; "
+        "keep only one — the latest model)",
+    ))
   return issues
 
 
@@ -185,14 +199,18 @@ def extract_commit_disclaimers(msg_text):
 
 
 def get_unpushed_head_message(repo_path):
-  # Check if HEAD is ahead of upstream; if so, audit HEAD's commit message
-  res = subprocess.run(
-      ["git", "-C", str(repo_path), "rev-list", "--count", "@{u}..HEAD"],
-      capture_output=True,
-      text=True,
-      check=False,
-  )
-  is_ahead = res.returncode == 0 and int(res.stdout.strip() or "0") > 0
+  # Check if HEAD is ahead of upstream or main; if so, audit HEAD's commit message
+  is_ahead = False
+  for base_ref in ("@{u}", "upstream/main", "origin/main", "origin/master"):
+    res = subprocess.run(
+        ["git", "-C", str(repo_path), "rev-list", "--count", f"{base_ref}..HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if res.returncode == 0:
+      is_ahead = int(res.stdout.strip() or "0") > 0
+      break
   if not is_ahead:
     return None
   msg = subprocess.run(

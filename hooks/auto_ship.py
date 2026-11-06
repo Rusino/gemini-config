@@ -439,8 +439,10 @@ def post_push_steps(
 
 def _append_model_trailer(message: str, conv_id: str) -> str:
   msg = message.strip()
-  if "Assisted-by:" in msg:
-    return msg
+  existing = [
+      m.group(0).strip()
+      for m in re.finditer(r"^Assisted-by\s*:.*$", msg, flags=re.M | re.I)
+  ]
   trailer = "Assisted-by: AI"
   try:
     import chat_lifecycle
@@ -448,7 +450,24 @@ def _append_model_trailer(message: str, conv_id: str) -> str:
     trailer = chat_lifecycle.get_model_trailer(conv_id)
   except Exception:
     pass
-  return f"{msg}\n\n{trailer}"
+  # Keep a single Assisted-by line (latest model), preserving a specific label over fallback AI
+  chosen = existing[-1] if (trailer == "Assisted-by: AI" and existing) else trailer
+  cleaned = re.sub(r"^Assisted-by\s*:[^\n]*\n?", "", msg, flags=re.M | re.I)
+  cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+  if not cleaned:
+    return chosen
+  trailer_re = re.compile(r"^[A-Za-z][A-Za-z0-9-]*\s*:")
+  m = re.search(r"^Change-Id:", cleaned, flags=re.M)
+  # Keep Gerrit's Change-Id footer last when present
+  if m:
+    prefix = cleaned[: m.start()].rstrip("\n")
+    suffix = cleaned[m.start() :]
+    last_ln = prefix.splitlines()[-1].strip() if prefix.strip() else ""
+    sep = "\n" if trailer_re.match(last_ln) else "\n\n"
+    return f"{prefix}{sep}{chosen}\n{suffix}" if prefix else f"{chosen}\n{suffix}"
+  last_ln = cleaned.splitlines()[-1].strip()
+  sep = "\n" if trailer_re.match(last_ln) else "\n\n"
+  return f"{cleaned}{sep}{chosen}"
 
 
 # Sync primary personal checkout when shipping from a worktree and run post-push hooks

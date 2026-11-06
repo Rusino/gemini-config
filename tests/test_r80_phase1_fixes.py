@@ -318,9 +318,8 @@ class R80Phase1FixesTest(unittest.TestCase):
     self.assertIn("Pre-gates not satisfied", blocked["error"])
 
   def test_prepare_commit_msg_hook_inserts_assisted_by_before_change_id(self):
-    hook_path = os.path.expanduser(
-        "~/.gemini/config/githooks/prepare-commit-msg"
-    )
+    root = os.path.abspath(os.path.join(SCRIPTS_DIR, ".."))
+    hook_path = os.path.join(root, "githooks", "prepare-commit-msg")
     with tempfile.TemporaryDirectory() as tmp:
       msg_file = os.path.join(tmp, "COMMIT_EDITMSG")
       with open(msg_file, "w", encoding="utf-8") as f:
@@ -332,6 +331,115 @@ class R80Phase1FixesTest(unittest.TestCase):
         out = f.read()
     self.assertIn("Assisted-by:", out)
     self.assertLess(out.index("Assisted-by:"), out.index("Change-Id:"))
+
+  def test_single_latest_assisted_by_across_hooks_and_guards(self):
+    import io  # pylint: disable=g-import-not-at-top
+    root = os.path.abspath(os.path.join(SCRIPTS_DIR, ".."))
+    hooks_dir = os.path.join(root, "hooks")
+    comments_dir = os.path.join(root, "skills", "code-comments", "scripts")
+    for p in (hooks_dir, comments_dir):
+      if p not in sys.path:
+        sys.path.insert(0, p)
+    import audit_comments  # pylint: disable=g-import-not-at-top
+    import auto_ship  # pylint: disable=g-import-not-at-top
+    import chat_lifecycle  # pylint: disable=g-import-not-at-top
+    import pre_tool_guard  # pylint: disable=g-import-not-at-top
+
+    hook_path = os.path.join(root, "githooks", "prepare-commit-msg")
+    stacked = (
+        "[SkoreText] Fix edge case\n\n"
+        "Body quotes old lines:\n"
+        "  Assisted-by: Quoted Example 1\n"
+        "  Assisted-by: Quoted Example 2\n\n"
+        "Perf: +1.2%\n"
+        "Assisted-by: Claude Fable 5.1 (Max)\n"
+        "Assisted-by: Gemini 4 Argon (High)\n"
+        "Assisted-by: Claude Opus 5.5 (Medium)\n"
+        "Change-Id: I1234567890abcdef1234567890abcdef12345678\n"
+        "# ------------------------ >8 ------------------------\n"
+        " Assisted-by: Diff Context Line\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+      msg_file = os.path.join(tmp, "COMMIT_EDITMSG")
+      with open(msg_file, "w", encoding="utf-8") as f:
+        f.write(stacked)
+      env = dict(os.environ, CONVERSATION_ID="", ANTIGRAVITY_CONVERSATION_ID="")
+      subprocess.run([hook_path, msg_file, "commit"], cwd=tmp, env=env, check=True)
+      with open(msg_file, "r", encoding="utf-8") as f:
+        out = f.read()
+
+      # Also verify active model replacement via a shim chat_lifecycle.py in a snapshot copy
+      snap_hooks = os.path.join(tmp, "hooks")
+      snap_githooks = os.path.join(tmp, "githooks")
+      os.makedirs(snap_hooks)
+      os.makedirs(snap_githooks)
+      with open(os.path.join(snap_hooks, "chat_lifecycle.py"), "w", encoding="utf-8") as f:
+        f.write('print("Assisted-by: Gemini 4 Carbon (High)")\n')
+      snap_hook = os.path.join(snap_githooks, "prepare-commit-msg")
+      with open(hook_path, "r", encoding="utf-8") as src, open(
+          snap_hook, "w", encoding="utf-8"
+      ) as dst:
+        dst.write(src.read())
+      os.chmod(snap_hook, 0o755)
+      msg_active = os.path.join(tmp, "COMMIT_ACTIVE")
+      with open(msg_active, "w", encoding="utf-8") as f:
+        f.write(stacked)
+      subprocess.run([snap_hook, msg_active, "commit"], cwd=tmp, env=env, check=True)
+      with open(msg_active, "r", encoding="utf-8") as f:
+        out_active = f.read()
+
+    head_part = out.split("# ------------------------ >8 ------------------------")[0]
+    ab_lines = [l for l in head_part.splitlines() if l.startswith("Assisted-by:")]
+    self.assertEqual(ab_lines, ["Assisted-by: Claude Opus 5.5 (Medium)"])
+    self.assertIn("  Assisted-by: Quoted Example 1", head_part)
+    self.assertIn("Perf: +1.2%\nAssisted-by: Claude Opus 5.5 (Medium)\nChange-Id:", head_part)
+    active_head = out_active.split("# ------------------------ >8 ------------------------")[0]
+    self.assertEqual(
+        [l for l in active_head.splitlines() if l.startswith("Assisted-by:")],
+        ["Assisted-by: Gemini 4 Carbon (High)"],
+    )
+
+    issues = audit_comments.audit_commit_message(stacked)
+    self.assertTrue(any("multiple Assisted-by trailers" in m for _, m in issues))
+    self.assertEqual(audit_comments.audit_commit_message(out), [])
+
+    with mock.patch.object(
+        chat_lifecycle, "get_model_trailer", return_value="Assisted-by: Gemini 4 Carbon (High)"
+    ):
+      replaced = auto_ship._append_model_trailer(
+          "Fix bug\n\nAssisted-by: Old 1\nAssisted-by: Old 2\nChange-Id: Iabc", "cid-1"
+      )
+    self.assertEqual(
+        [l for l in replaced.splitlines() if l.startswith("Assisted-by:")],
+        ["Assisted-by: Gemini 4 Carbon (High)"],
+    )
+    self.assertLess(replaced.index("Assisted-by:"), replaced.index("Change-Id:"))
+
+    def run_guard_cmd(command_line: str) -> str:
+      payload = json.dumps({
+          "toolCall": {"name": "run_command", "args": {"CommandLine": command_line}}
+      })
+      buf = io.StringIO()
+      with mock.patch.object(sys, "stdin", io.StringIO(payload)), mock.patch.object(
+          sys, "stdout", buf
+      ):
+        pre_tool_guard.main()
+      return buf.getvalue().strip()
+
+    for bad_cmd in (
+        'git -C /tmp/r commit -m "Subj" -m "Assisted-by: A" -m "Assisted-by: B"',
+        'gh pr edit 42 --body "Body\n\nAssisted-by: A\nAssisted-by: B"',
+    ):
+      raw_out = run_guard_cmd(bad_cmd)
+      self.assertIn("[ASSISTED-BY GUARD]", raw_out)
+      self.assertEqual(json.loads(raw_out)["decision"], "deny")
+
+    # Indented prose examples and non-commit heredoc test fixtures must not self-block
+    for ok_cmd in (
+        'git commit -m "Subj\n\n  Assisted-by: Q1\n  Assisted-by: Q2\n\nAssisted-by: B"',
+        "cat <<'EOF' > /tmp/fixture.txt\ngit commit\nAssisted-by: A\nAssisted-by: B\nEOF",
+    ):
+      self.assertNotIn("[ASSISTED-BY GUARD]", run_guard_cmd(ok_cmd))
 
 
 if __name__ == "__main__":

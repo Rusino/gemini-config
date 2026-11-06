@@ -42,14 +42,14 @@ description: "Skia-style C++ minimalism and suppression of LLM coding reflexes."
   `[SkoreText]` Gerrit CLs, e.g., `Gerrit 1382196`, `Gerrit 1383896`, `Gerrit 1389816`,
   `Gerrit 1411678`) in external issue trackers, GitHub issues/PRs, public Buganizer/crbug
   comments, or external code reviews until the user explicitly lifts this restriction
-- **AI-assisted CL attribution**: Any CL, PR, or commit prepared with AI assistance (with user direction/participation) must include an `Assisted-by:` trailer in the commit summary footer, separated from the body by an empty line and placed right before `Change-Id:`:
+- **AI-assisted CL attribution**: Any CL, PR, or commit prepared with AI assistance (with user direction/participation) must include **exactly one** `Assisted-by:` trailer in the commit summary footer — **always only the latest model**, separated from the body by an empty line and placed right before `Change-Id:`:
   ```gitcommit
   Problem description and fix explanation.
 
   Assisted-by: <Model Name>
   Change-Id: I...
   ```
-  Run `python3 ~/.gemini/config/hooks/chat_lifecycle.py model --trailer` to obtain the trailer (e.g. `Assisted-by: Gemini 3.8 Flash (High)` or `Assisted-by: Gemini 3.8 Pro`). If the model cannot be determined, use `Assisted-by: AI`
+  Run `python3 ~/.gemini/config/hooks/chat_lifecycle.py model --trailer` to obtain the trailer (e.g. `Assisted-by: Gemini 3.8 Flash (High)` or `Assisted-by: Gemini 3.8 Pro`). If the model cannot be determined, use `Assisted-by: AI`. When amending or updating an existing commit, CL, or PR, **replace** all prior `Assisted-by:` lines so only the single latest one remains (and propagate the updated summary to Gerrit via `--commit-description=+` or GitHub via `gh pr edit --body`) — never stack multiple `Assisted-by:` lines
 - **Two-Tier Commit / PR Description Scaling**:
   - **Tier 1 (Simple / localized bug fixes & small refactors)**: Write concise, direct prose (1–3 sentences explaining the problem and the fix), plus 1 explicit line stating how the new test fails without the fix (exact assertion, call count, or crash), and a complete, human-readable `Tested:` block listing all executed unit test suites, corpora (Flutter targeted/full suites and Google3 transitive corpus with test counts, never leaking internal `//...` paths or `cl/` numbers), and trybots (ASAN, Mac, Windows, Android) in terms meaningful to an external reviewer without referencing local skill names.
   - **Tier 2 (Algorithmic, caching, concurrency, or performance CLs/PRs)**: Write a structured engineering specification containing:
