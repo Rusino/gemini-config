@@ -162,16 +162,53 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
         else ""
     )
     has_chk = bool(chk_rows_ssr)
-    pills_html = "".join(
-        f'<div class="wb-pill" data-kind="{_esc(a.get("kind"))}">'
-        f'{_esc(a.get("icon"))} {_esc(a.get("title"))}</div>'
+    main_arts_ssr = [
+        a
         for a in (w.get("artifacts") or [])
-        if str(a.get("artifact_key") or "") not in chk_covered
+        if a.get("role") != "context_only"
+        and str(a.get("artifact_key") or "") not in chk_covered
         and (
             not has_chk
             or a.get("kind")
             in ("gmail_thread", "gmail_draft", "gchat_thread", "gdoc", "chat_chain")
         )
+    ]
+    mention_arts_ssr = [
+        a
+        for a in (w.get("artifacts") or [])
+        if a.get("role") == "context_only"
+        and str(a.get("artifact_key") or "") not in chk_covered
+    ]
+    pills_html = "".join(
+        f'<div class="wb-pill" data-kind="{_esc(a.get("kind"))}" '
+        f'title="{_esc(a.get("why_tooltip") or "")}">'
+        f'{_esc(a.get("icon"))} {_esc(a.get("title"))}'
+        + (
+            f' <span class="wb-why">· {_esc(a.get("why_badge"))}</span>'
+            if a.get("why_badge")
+            else ""
+        )
+        + "</div>"
+        for a in main_arts_ssr
+    )
+    mentions_inner_ssr = "".join(
+        f'<div class="wb-pill" data-kind="{_esc(a.get("kind"))}" data-role="context_only" '
+        f'title="{_esc(a.get("why_tooltip") or "")}">'
+        f'{_esc(a.get("icon"))} {_esc(a.get("title"))}'
+        + (
+            f' <span class="wb-why">· {_esc(a.get("why_badge"))}</span>'
+            if a.get("why_badge")
+            else ""
+        )
+        + "</div>"
+        for a in mention_arts_ssr
+    )
+    mentions_ssr = (
+        f'<details class="wb-mentions">'
+        f"<summary>📎 Упомянуто в чате ({len(mention_arts_ssr)})</summary>"
+        f'<div class="wb-mentions-list">{mentions_inner_ssr}</div></details>'
+        if mention_arts_ssr
+        else ""
     )
     cards_ssr.append(
         f'<article class="wb-card" data-work-id="{wid}" data-lane="{lane}">'
@@ -180,7 +217,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
         f'<div class="wb-meta-row"><span class="wb-lane-tag">{lane}</span></div>'
         f"{origin_ssr}</div></div>"
         f'<div class="wb-card-body">{obs_html}{chk_html}'
-        f"<div class='wb-pills'>{pills_html}</div></div></article>"
+        f"<div class='wb-pills'>{pills_html}</div>{mentions_ssr}</div></article>"
     )
   ssr_body = "\n".join(cards_ssr)
   precision_pct = int(round(float(metrics.get("link_precision", 1.0)) * 100))
@@ -736,8 +773,36 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     background: #eff6ff;
   }}
   .wb-pill[data-role="context_only"] {{
-    opacity: 0.65;
+    opacity: 0.78;
     border-style: dashed;
+  }}
+  .wb-why {{
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 500;
+  }}
+  .wb-mentions {{
+    margin-top: 2px;
+    font-size: 11px;
+    color: var(--muted);
+  }}
+  .wb-mentions summary {{
+    cursor: pointer;
+    user-select: none;
+    font-size: 10.5px;
+    color: var(--muted);
+    padding: 2px 0;
+  }}
+  .wb-mentions summary:hover {{
+    color: var(--accent);
+  }}
+  .wb-mentions-list {{
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+    margin-top: 4px;
+    padding-left: 8px;
   }}
   .wb-cut {{
     cursor: pointer;
@@ -1113,6 +1178,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       const hasChk = chkItems.length > 0;
       let chatPillCount = 0;
       const visiblePills = (w.artifacts || []).filter((a) => {{
+        if (a.role === 'context_only') return false;
         if (chkCovered.has(a.artifact_key)) return false;
         if (hasChk) {{
           const isChannelKind = [
@@ -1131,7 +1197,12 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
         }}
         return true;
       }});
-      const pillsHtml = visiblePills.map((a) => {{
+      const mentionPills = (w.artifacts || []).filter((a) => {{
+        if (a.role !== 'context_only') return false;
+        if (chkCovered.has(a.artifact_key)) return false;
+        return true;
+      }});
+      const renderPillItem = (a) => {{
         const cutBtn = !w.is_virtual
           ? `<button class="wb-cut" title="Detach from Work (prevent auto-relink)" data-unlink-work="${{esc(w.work_id)}}" data-unlink-key="${{esc(a.artifact_key)}}" type="button">✂</button>`
           : '';
@@ -1141,15 +1212,25 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
           ? `href="#" data-open-chat="${{esc(chatCid)}}"`
           : `href="${{esc(a.url || '#')}}" target="_blank" rel="noopener"`;
         const stBadge = (a.state && a.state.status) ? `<span style="color:var(--muted);font-size:10px">[${{esc(a.state.status)}}]</span>` : '';
+        const whySpan = a.why_badge ? `<span class="wb-why">· ${{esc(a.why_badge)}}</span>` : '';
+        const tipAttr = a.why_tooltip ? `title="${{esc(a.why_tooltip)}}"` : '';
         return `
-          <div class="wb-pill" data-kind="${{esc(a.kind)}}" data-role="${{esc(a.role)}}">
+          <div class="wb-pill" data-kind="${{esc(a.kind)}}" data-role="${{esc(a.role)}}" ${{tipAttr}}>
             <a ${{linkAttrs}} style="color:inherit;text-decoration:none">${{esc(a.icon)}} ${{esc(a.title)}}</a>
+            ${{whySpan}}
             ${{stBadge}}
             ${{renderRollDots(a)}}
             ${{cutBtn}}
           </div>
         `;
-      }}).join('');
+      }};
+      const pillsHtml = visiblePills.map(renderPillItem).join('');
+      const mentionsHtml = mentionPills.length
+        ? `<details class="wb-mentions">
+             <summary>📎 Упомянуто в чате (${{mentionPills.length}})</summary>
+             <div class="wb-mentions-list">${{mentionPills.map(renderPillItem).join('')}}</div>
+           </details>`
+        : '';
 
       const cardActions = !w.is_virtual
         ? `<div class="wb-actions">
@@ -1181,6 +1262,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
             ${{obsHtml}}
             ${{checklistHtml}}
             ${{pillsHtml ? `<div class="wb-pills">${{pillsHtml}}</div>` : ''}}
+            ${{mentionsHtml}}
             ${{cardActions}}
           </div>
         </article>

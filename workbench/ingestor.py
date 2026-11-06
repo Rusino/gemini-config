@@ -331,7 +331,9 @@ def _clean_user_prompt(raw: str) -> str:
   return work_store.clean_work_title(text.splitlines()[0].strip())[:140] if text else ""
 
 
-def _extract_step_texts(step: Mapping[str, Any]) -> tuple[list[str], list[str]]:
+def _extract_step_texts(
+    step: Mapping[str, Any], is_first_user_turn: bool = False
+) -> tuple[list[str], list[str]]:
   """Returns (anchor_texts, aux_texts) from a transcript step."""
   anchor_texts: list[str] = []
   aux_texts: list[str] = []
@@ -346,7 +348,10 @@ def _extract_step_texts(step: Mapping[str, Any]) -> tuple[list[str], list[str]]:
     if cleaned_c and not cleaned_c.startswith(
         "Continuing unfinished work from previous conversation"
     ):
-      anchor_texts.append(content)
+      if is_first_user_turn:
+        anchor_texts.append(content)
+      else:
+        aux_texts.append(content)
   elif stype == "PLANNER_RESPONSE":
     content = str(step.get("content") or "")
     if content.strip():
@@ -420,14 +425,23 @@ def ingest_transcript_file(
   has_write = bool(prev.get("has_write"))
   extracted: dict[str, tuple[str, str, str]] = {}
   anchor_keys: set[str] = set()
+  companion_cls: dict[str, str] = {}
+  mention_steps: dict[str, int] = {}
   if chat_title:
     for akey, akind, aurl in extract_artifacts_from_text(chat_title):
       extracted[akey] = (akey, akind, aurl)
       anchor_keys.add(akey)
 
   first_user_prompt = ""
+  first_user_step_seen = False
   first_step_ts = 0.0
   detected_root = root_cid or conv_id
+  re_comp = re.compile(
+      r"(?:companion\s+WIP(?:\s+CL)?|WIP[-\s]компаньон)[^0-9\n]{0,80}?"
+      r"(?:skia-review\.googlesource\.com/c/skia/\+/|\bGerrit\s+)(\d{6,8})\b"
+      r"(?:\s*\(([^)\n]{3,80})\))?",
+      re.IGNORECASE,
+  )
   try:
     with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
       for line in f:
@@ -440,30 +454,57 @@ def ingest_transcript_file(
           continue
         if not isinstance(step, Mapping):
           continue
+        step_idx = int(step.get("step_index") or 0)
         if first_step_ts <= 0 and step.get("created_at"):
           first_step_ts = _parse_iso_ts(str(step.get("created_at")))
-        if step.get("type") == "USER_INPUT" and not first_user_prompt:
+        is_first_u = False
+        if step.get("type") == "USER_INPUT":
           raw_u = str(step.get("content") or "")
-          m_root = RE_ROOT_CONV.search(raw_u) or RE_PREV_CONV.search(raw_u)
-          if m_root and (not root_cid or root_cid == conv_id):
-            detected_root = m_root.group(1)
-          first_user_prompt = _clean_user_prompt(raw_u)
+          if not first_user_prompt:
+            m_root = RE_ROOT_CONV.search(raw_u) or RE_PREV_CONV.search(raw_u)
+            if m_root and (not root_cid or root_cid == conv_id):
+              detected_root = m_root.group(1)
+            first_user_prompt = _clean_user_prompt(raw_u)
+          if not first_user_step_seen:
+            first_user_step_seen = True
+            is_first_u = True
+            # If step 0 is an auto-generated continuation prompt, anchor on the extracted user request
+            if first_user_prompt:
+              for akey, akind, aurl in extract_artifacts_from_text(first_user_prompt):
+                extracted[akey] = (akey, akind, aurl)
+                anchor_keys.add(akey)
+        elif step.get("type") == "PLANNER_RESPONSE":
+          p_text = str(step.get("content") or "")
+          for m_c in re_comp.finditer(p_text):
+            c_num = m_c.group(1)
+            c_lbl = (m_c.group(2) or "").strip()
+            c_akey = work_store.canonicalize_artifact_key("gerrit", c_num)
+            companion_cls[c_akey] = c_lbl
+            extracted[c_akey] = (
+                c_akey,
+                "gerrit",
+                f"https://skia-review.googlesource.com/c/skia/+/{c_num}",
+            )
+            mention_steps.setdefault(c_akey, step_idx)
         if _is_write_step(step):
           has_write = True
-        anc_snippets, aux_snippets = _extract_step_texts(step)
+        anc_snippets, aux_snippets = _extract_step_texts(step, is_first_user_turn=is_first_u)
         for snippet in anc_snippets:
           step_arts = extract_artifacts_from_text(snippet)
           if len(step_arts) > 5:
             continue
           for akey, akind, aurl in step_arts:
             extracted[akey] = (akey, akind, aurl)
-            anchor_keys.add(akey)
+            if akey not in companion_cls:
+              anchor_keys.add(akey)
+            mention_steps.setdefault(akey, step_idx)
         for snippet in aux_snippets:
           step_arts = extract_artifacts_from_text(snippet)
           if len(step_arts) > 4:
             continue
           for akey, akind, aurl in step_arts:
             extracted[akey] = (akey, akind, aurl)
+            mention_steps.setdefault(akey, step_idx)
   except OSError:
     return False
 
@@ -551,7 +592,7 @@ def ingest_transcript_file(
   non_hub_primaries = [
       (akey, akind, aurl)
       for akey, akind, aurl in all_primaries
-      if not _is_stored_hub(akey)
+      if akey not in companion_cls and not _is_stored_hub(akey)
   ]
   title_primaries: list[tuple[str, str, str]] = []
   if chat_title:
@@ -566,18 +607,20 @@ def ingest_transcript_file(
   if chat_title:
     if title_primaries:
       primaries = title_primaries[:3]
-    # Avoid promoting a single mention when a coordinator chat spans >3 distinct bugs/CLs
-    elif len(anchored_primaries) == 1 and len(non_hub_primaries) <= 3:
-      primaries = anchored_primaries
+    elif len(anchored_primaries) <= 2 and len(non_hub_primaries) <= 4:
+      primaries = anchored_primaries[:2]
     else:
       primaries = []
   elif anchored_primaries:
     primaries = anchored_primaries[:2] if len(anchored_primaries) <= 2 else []
   else:
-    primaries = non_hub_primaries[:2] if len(non_hub_primaries) <= 2 else []
+    # Mid-chat mentions (step > 0) without a step-0/title/write anchor never become primary
+    primaries = []
 
   prim_set = {x[0] for x in primaries}
-  context_primaries = [p for p in all_primaries if p[0] not in prim_set]
+  context_primaries = [
+      p for p in all_primaries if p[0] not in prim_set and p[0] not in companion_cls
+  ]
 
   channels = [
       (akey, akind, aurl)
@@ -630,19 +673,97 @@ def ingest_transcript_file(
       state=chain_state,
       now=cur_now,
   )
-  store.link_artifact(work_id, chain_key, role="channel", source="auto", now=cur_now)
+  linked_ch = store.link_artifact(
+      work_id,
+      chain_key,
+      role="channel",
+      source="auto",
+      link_reason="chat_topic",
+      link_detail=f"Рабочий чат {detected_root[:8]} по этой задаче",
+      now=cur_now,
+  )
+  if linked_ch is None:
+    return False
 
+  reviewed_cl_key = ""
   for akey, akind, aurl in primaries:
+    if akind in ("gerrit", "github_pr", "piper") and not reviewed_cl_key:
+      reviewed_cl_key = akey
     store.upsert_artifact(akey, kind=akind, title=akey, url=aurl, now=cur_now)
     existing_owner = store.find_work_by_artifact(akey, roles=("primary",))
     if existing_owner and existing_owner != work_id:
-      store.link_artifact(work_id, akey, role="context_only", source="auto", now=cur_now)
+      s_idx = mention_steps.get(akey, 0)
+      store.link_artifact(
+          work_id,
+          akey,
+          role="context_only",
+          source="auto",
+          link_reason="chat_mention",
+          link_detail=f"Попутно упомянут в чате {detected_root[:8]} (шаг {s_idx})",
+          now=cur_now,
+      )
     else:
-      store.link_artifact(work_id, akey, role="primary", source="auto", now=cur_now)
+      store.link_artifact(
+          work_id,
+          akey,
+          role="primary",
+          source="auto",
+          link_reason="chat_topic",
+          link_detail=f"Целевой артефакт чата {detected_root[:8]} (из заголовка или шага 0)",
+          now=cur_now,
+      )
+
+  for comp_akey, comp_lbl in companion_cls.items():
+    comp_num = comp_akey.split(":")[-1]
+    parent_num = reviewed_cl_key.split(":")[-1] if reviewed_cl_key else ""
+    comp_title = (
+        f"{comp_num}: [companion WIP] {comp_lbl}"
+        if comp_lbl
+        else f"{comp_num}: [companion WIP]"
+    )
+    comp_state: dict[str, Any] = {
+        "is_companion": True,
+        "is_wip": True,
+        "wip_label": "companion WIP",
+    }
+    if reviewed_cl_key:
+      comp_state["companion_to"] = reviewed_cl_key
+    store.upsert_artifact(
+        comp_akey,
+        kind="gerrit",
+        title=comp_title,
+        url=f"https://skia-review.googlesource.com/c/skia/+/{comp_num}",
+        state=comp_state,
+        now=cur_now,
+    )
+    s_idx = mention_steps.get(comp_akey, 0)
+    detail_str = (
+        f"Тестовый companion WIP СЛ к ревью {parent_num} (чат {detected_root[:8]}, шаг {s_idx})"
+        if parent_num
+        else f"Тестовый companion WIP СЛ (чат {detected_root[:8]}, шаг {s_idx})"
+    )
+    store.link_artifact(
+        work_id,
+        comp_akey,
+        role="primary",
+        source="auto",
+        link_reason="companion_wip",
+        link_detail=detail_str,
+        now=cur_now,
+    )
 
   for akey, akind, aurl in context_primaries:
+    s_idx = mention_steps.get(akey, 0)
     store.upsert_artifact(akey, kind=akind, title=akey, url=aurl, now=cur_now)
-    store.link_artifact(work_id, akey, role="context_only", source="auto", now=cur_now)
+    store.link_artifact(
+        work_id,
+        akey,
+        role="context_only",
+        source="auto",
+        link_reason="chat_mention",
+        link_detail=f"Попутно упомянут в чате {detected_root[:8]} (шаг {s_idx})",
+        now=cur_now,
+    )
 
   # Single human thread in write session attaches as channel; multiple go to candidate buffer
   if len(channels) == 1:
@@ -831,9 +952,35 @@ def ingest_cl_watcher_state(
           )
       ]
     for wid in matched_wids:
-      store.link_artifact(wid, ckey, role="primary", source="auto", now=cur_now)
+      if linked_bug_keys:
+        b_shorts = ", ".join(work_store.format_short_bug_id(b) for b in linked_bug_keys[:2])
+        c_reason = "bug_trailer"
+        c_detail = f"В описании СЛ {tid} указан баг {b_shorts}"
+      elif stack_parent:
+        c_reason = "stack_child"
+        c_detail = f"Дочерний СЛ в стеке Gerrit поверх {stack_parent.split(':')[-1]}"
+      else:
+        c_reason = "cl_watcher"
+        c_detail = f"Отслеживается в активных СЛ ({tid})"
+      store.link_artifact(
+          wid,
+          ckey,
+          role="primary",
+          source="auto",
+          link_reason=c_reason,
+          link_detail=c_detail,
+          now=cur_now,
+      )
       for b_ckey in linked_bug_keys:
-        store.link_artifact(wid, b_ckey, role="primary", source="auto", now=cur_now)
+        store.link_artifact(
+            wid,
+            b_ckey,
+            role="primary",
+            source="auto",
+            link_reason="bug_trailer",
+            link_detail=f"Указан в описании СЛ {tid} ({work_store.format_short_bug_id(b_ckey)})",
+            now=cur_now,
+        )
 
     primary_wid = matched_wids[0]
     for cid in cids[:2]:
@@ -853,7 +1000,15 @@ def ingest_cl_watcher_state(
           state={"cascade_id": cid},
           now=cur_now,
       )
-      store.link_artifact(primary_wid, ch_key, role="channel", source="auto", now=cur_now)
+      store.link_artifact(
+          primary_wid,
+          ch_key,
+          role="channel",
+          source="auto",
+          link_reason="cl_watcher_chat",
+          link_detail=f"Рабочий чат по СЛ {tid}",
+          now=cur_now,
+      )
 
 
 def _clean_display_name(raw_addr: str) -> str:

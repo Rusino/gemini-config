@@ -173,10 +173,23 @@ def get_local_chat_classification(
     if len(parts) >= 3:
       pid = parts[-3]
       cid = os.path.splitext(parts[-1])[0]
+      target_set = config_cids if is_config_project(pid) else product_cids
       if cid:
-        target_set = config_cids if is_config_project(pid) else product_cids
         target_set.add(cid)
         target_set.add(cid[:8])
+      try:
+        with open(sfile, "r", encoding="utf-8", errors="replace") as sf:
+          stext = sf.read(16384)
+        for m_c in re.finditer(
+            r"conversation://([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+            stext,
+            re.IGNORECASE,
+        ):
+          rc = m_c.group(1)
+          target_set.add(rc)
+          target_set.add(rc[:8])
+      except OSError:
+        pass
 
   if os.path.isfile(DEFAULT_DOSSIERS_PATH):
     try:
@@ -791,6 +804,139 @@ def format_short_bug_id(artifact_key: str) -> str:
   return tid
 
 
+def compute_artifact_provenance(
+    art: Mapping[str, Any],
+    w_arts: list[dict[str, Any]],
+) -> tuple[str, str]:
+  """Returns (why_badge, why_tooltip) explaining how an artifact is connected to its Work."""
+  akey = str(art.get("artifact_key") or "")
+  kind = str(art.get("kind") or "")
+  role = str(art.get("role") or "primary")
+  source = str(art.get("source") or "auto")
+  reason = str(art.get("link_reason") or "").strip()
+  detail = str(art.get("link_detail") or "").strip()
+  st = art.get("state") if isinstance(art.get("state"), Mapping) else {}
+
+  primary_cls = [
+      a
+      for a in w_arts
+      if a.get("role") == "primary"
+      and a.get("kind") in ("gerrit", "github_pr", "piper")
+      and not (a.get("state") or {}).get("is_companion")
+      and not (a.get("state") or {}).get("companion_to")
+  ]
+  primary_bugs = [
+      a
+      for a in w_arts
+      if a.get("role") == "primary" and a.get("kind") in ("buganizer", "github_issue")
+  ]
+  has_draft = any(a.get("kind") == "gmail_draft" for a in w_arts)
+  has_email = any(a.get("kind") == "gmail_thread" for a in w_arts)
+
+  if source == "manual" or reason == "manual":
+    return "вручную", detail or "Привязано к карточке вручную пользователем"
+
+  if (
+      reason == "companion_wip"
+      or st.get("is_companion")
+      or st.get("companion_to")
+      or "[companion WIP]" in str(art.get("title") or "")
+  ):
+    comp_to = str(st.get("companion_to") or "").strip()
+    parent_num = comp_to.split(":")[-1] if comp_to else ""
+    if not parent_num and primary_cls:
+      parent_num = str(primary_cls[0].get("artifact_key") or "").split(":")[-1]
+    badge = f"companion WIP к {parent_num}" if parent_num else "companion WIP"
+    tip = detail or (
+        f"Тестовый/проверочный companion WIP СЛ к ревью {parent_num}"
+        if parent_num
+        else "Тестовый/проверочный companion WIP СЛ"
+    )
+    return badge, tip
+
+  if role == "context_only" or reason == "chat_mention":
+    badge = "упомянут в чате"
+    for a in w_arts:
+      if a.get("kind") == "chat_chain":
+        cid_short = str(a.get("artifact_key") or "").split(":")[-1][:8]
+        if cid_short and cid_short in detail:
+          badge = f"упомянут в чате {cid_short}"
+          break
+    tip = detail or "Попутно упомянут по ходу обсуждения в чате (не склеивает карточки)"
+    return badge, tip
+
+  if kind in ("gerrit", "github_pr", "piper"):
+    cl_bugs = [
+        bk
+        for bk in extract_cl_bug_keys(st)
+        if any(b.get("artifact_key") == bk for b in w_arts)
+    ]
+    if cl_bugs or reason == "bug_trailer":
+      b_labels = [format_short_bug_id(bk) for bk in cl_bugs[:2]]
+      if not b_labels and primary_bugs:
+        b_labels = [format_short_bug_id(str(primary_bugs[0].get("artifact_key")))]
+      b_str = ", ".join(b_labels)
+      badge = f"фикс {b_str}" if b_str else "по багу"
+      tip = detail or (f"В описании СЛ указан баг {b_str}" if b_str else "Связан через Bug: в описании СЛ")
+      return badge, tip
+    stack_p = str(st.get("stack_parent_ikey") or "").strip()
+    if stack_p or reason == "stack_child":
+      p_num = stack_p.split(":")[-1] if stack_p else ""
+      badge = f"стек от {p_num}" if p_num else "в стеке Gerrit"
+      tip = detail or (f"Дочерний СЛ в стеке Gerrit поверх {p_num}" if p_num else "Связан общим стеком Gerrit")
+      return badge, tip
+    if any(
+        "ревью" in str(c.get("title") or "").lower()
+        or "review" in str(c.get("title") or "").lower()
+        for c in w_arts
+        if c.get("kind") == "chat_chain"
+    ):
+      return "тема ревью", detail or "Целевой СЛ на код-ревью из заголовка/первого сообщения чата"
+    return "основной СЛ", detail or "Главный СЛ этой задачи"
+
+  if kind in ("buganizer", "github_issue"):
+    referencing_cls = []
+    for c in w_arts:
+      if c.get("kind") in ("gerrit", "github_pr", "piper"):
+        c_st = c.get("state") if isinstance(c.get("state"), Mapping) else {}
+        if akey in extract_cl_bug_keys(c_st):
+          referencing_cls.append(str(c.get("artifact_key") or "").split(":")[-1])
+    if referencing_cls:
+      c_str = ", ".join(referencing_cls[:2])
+      return (
+          f"в описании {c_str}",
+          detail or f"Указан в Bug: трейлере описания СЛ {c_str}",
+      )
+    if reason == "gmail_draft_ref" or has_draft:
+      return "из черновика письма", detail or "Упомянут в черновике письма Gmail"
+    if reason == "gmail_thread_ref" or has_email:
+      return "из письма", detail or "Упомянут в цепочке писем Gmail"
+    return "тема чата", detail or "Целевой баг из первого сообщения или заголовка чата"
+
+  if kind == "gmail_draft":
+    return "черновик ответа", detail or "Черновик письма в Gmail со ссылками на артефакты задачи"
+
+  if kind == "gmail_thread":
+    return "переписка по задаче", detail or "Цепочка писем в Gmail, связанная с артефактами задачи"
+
+  if kind == "chat_chain":
+    t_lower = str(art.get("title") or "").lower()
+    is_rev = "ревью" in t_lower or "review" in t_lower
+    if primary_cls:
+      cl_num = str(primary_cls[0].get("artifact_key") or "").split(":")[-1]
+      badge = f"ревью {cl_num}" if is_rev else f"чат по {cl_num}"
+      tip = detail or f"Рабочий чат по СЛ {cl_num}"
+      return badge, tip
+    if primary_bugs:
+      b_short = format_short_bug_id(str(primary_bugs[0].get("artifact_key") or ""))
+      badge = f"чат по {b_short}"
+      tip = detail or f"Рабочий чат по багу {b_short}"
+      return badge, tip
+    return "чат задачи", detail or "Рабочий чат этой задачи"
+
+  return reason or "связано", detail or "Связанный артефакт задачи"
+
+
 def build_work_checklist(
     w_arts: list[dict[str, Any]],
     art_rows: Mapping[str, dict[str, Any]],
@@ -1237,6 +1383,8 @@ class WorkStore:
           source TEXT NOT NULL DEFAULT 'auto',
           confidence REAL DEFAULT 1.0,
           created_at REAL NOT NULL,
+          link_reason TEXT DEFAULT '',
+          link_detail TEXT DEFAULT '',
           PRIMARY KEY (work_id, artifact_key)
         );
         CREATE TABLE IF NOT EXISTS negative_links (
@@ -1277,6 +1425,14 @@ class WorkStore:
           payload_json TEXT DEFAULT '{}'
         );
       """)
+      wl_cols = {
+          str(r[1])
+          for r in conn.execute("PRAGMA table_info(work_links)").fetchall()
+      }
+      if "link_reason" not in wl_cols:
+        conn.execute("ALTER TABLE work_links ADD COLUMN link_reason TEXT DEFAULT ''")
+      if "link_detail" not in wl_cols:
+        conn.execute("ALTER TABLE work_links ADD COLUMN link_detail TEXT DEFAULT ''")
 
   def _log_event(
       self,
@@ -1484,6 +1640,8 @@ class WorkStore:
       role: str = "primary",
       source: str = "auto",
       confidence: float = 1.0,
+      link_reason: str = "",
+      link_detail: str = "",
       now: float | None = None,
   ) -> str | None:
     cur_now = time.time() if now is None else now
@@ -1514,15 +1672,50 @@ class WorkStore:
           art_state = {}
       if source != "manual" and is_config_artifact(akey, title=art_title, state=art_state):
         return None
+
+      existing_link = conn.execute(
+          "SELECT role, link_reason, link_detail, created_at "
+          "FROM work_links WHERE work_id = ? AND artifact_key = ?",
+          (work_id, akey),
+      ).fetchone()
+      prev_reason = str(existing_link["link_reason"] or "") if existing_link else ""
+      prev_detail = str(existing_link["link_detail"] or "") if existing_link else ""
+      created_ts = float(existing_link["created_at"]) if existing_link else cur_now
+
+      final_reason = link_reason.strip() or prev_reason or ("manual" if source == "manual" else "")
+      final_detail = link_detail.strip() or prev_detail
+
       effective_role = role
-      if is_hub_artifact(akey, art_state) and source != "manual":
+      if (
+          is_hub_artifact(akey, art_state)
+          and source != "manual"
+          and final_reason != "companion_wip"
+      ):
+        effective_role = "context_only"
+      # Never promote a mid-chat mention to primary without an explicit structural link_reason
+      if (
+          existing_link
+          and str(existing_link["role"]) == "context_only"
+          and prev_reason == "chat_mention"
+          and source != "manual"
+          and link_reason.strip() in ("", "chat_mention")
+      ):
         effective_role = "context_only"
 
       conn.execute(
           "INSERT OR REPLACE INTO work_links "
-          "(work_id, artifact_key, role, source, confidence, created_at) "
-          "VALUES (?, ?, ?, ?, ?, ?)",
-          (work_id, akey, effective_role, source, confidence, cur_now),
+          "(work_id, artifact_key, role, source, confidence, created_at, link_reason, link_detail) "
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          (
+              work_id,
+              akey,
+              effective_role,
+              source,
+              confidence,
+              created_ts,
+              final_reason,
+              final_detail,
+          ),
       )
       conn.execute(
           "UPDATE works SET updated_at = ? WHERE work_id = ?",
@@ -1533,7 +1726,11 @@ class WorkStore:
           "link_added",
           work_id=work_id,
           artifact_key=akey,
-          payload={"role": effective_role, "source": source},
+          payload={
+              "role": effective_role,
+              "source": source,
+              "link_reason": final_reason,
+          },
           now=cur_now,
       )
       return effective_role
@@ -1726,8 +1923,18 @@ class WorkStore:
           continue
         if pass_num == 0:
           c_bugs = set(extract_cl_bug_keys(st))
-          if c_bugs & bug_keys:
-            self.link_artifact(work_id, akey, role="primary", source="auto", now=cur_now)
+          matched_bugs = sorted(c_bugs & bug_keys)
+          if matched_bugs:
+            b_short = ", ".join(format_short_bug_id(b) for b in matched_bugs[:2])
+            self.link_artifact(
+                work_id,
+                akey,
+                role="primary",
+                source="auto",
+                link_reason="bug_trailer",
+                link_detail=f"В описании СЛ указан баг {b_short}",
+                now=cur_now,
+            )
             linked_cls.add(akey)
             newly_linked.append(akey)
         else:
@@ -1735,7 +1942,16 @@ class WorkStore:
           if p_raw:
             p_ckey = canonicalize_artifact_key(p_raw)
             if p_ckey in linked_cls:
-              self.link_artifact(work_id, akey, role="primary", source="auto", now=cur_now)
+              p_num = p_ckey.split(":")[-1]
+              self.link_artifact(
+                  work_id,
+                  akey,
+                  role="primary",
+                  source="auto",
+                  link_reason="stack_child",
+                  link_detail=f"Дочерний СЛ в стеке Gerrit поверх {p_num}",
+                  now=cur_now,
+              )
               linked_cls.add(akey)
               newly_linked.append(akey)
     return newly_linked
@@ -2110,6 +2326,11 @@ class WorkStore:
         if akey.startswith(("chat_chain:", "roadmap_item:")):
           conn.execute("DELETE FROM artifacts WHERE artifact_key = ?", (akey,))
 
+      for r in conn.execute("SELECT DISTINCT chat_chain_id FROM candidate_buffer").fetchall():
+        cid = str(r["chat_chain_id"] or "").strip()
+        if cid and is_config_artifact(f"chat_chain:{cid}"):
+          conn.execute("DELETE FROM candidate_buffer WHERE chat_chain_id = ?", (cid,))
+
       work_rows = [
           dict(r)
           for r in conn.execute(
@@ -2162,6 +2383,135 @@ class WorkStore:
               (new_proj, new_title or str(w["title"]), cur_now, wid),
           )
           works_repaired += 1
+
+      # Repair companion WIP metadata and split false mid-chat co-occurrence merges (e.g. 1408158 vs flutter#90063)
+      comp_1406080 = art_rows.get("gerrit:skia:1406080")
+      if comp_1406080:
+        try:
+          st_6080 = json.loads(comp_1406080.get("state_json") or "{}")
+        except Exception:
+          st_6080 = {}
+        if not st_6080.get("is_companion"):
+          st_6080.update({
+              "is_companion": True,
+              "companion_to": "gerrit:skia:1408158",
+              "is_wip": True,
+              "wip_label": "companion WIP",
+          })
+          conn.execute(
+              "UPDATE artifacts SET title = ?, url = ?, state_json = ?, updated_at = ? "
+              "WHERE artifact_key = 'gerrit:skia:1406080'",
+              (
+                  "1406080: [companion WIP] SkParagraph_BuilderResetKeepsBuiltText",
+                  "https://skia-review.googlesource.com/c/skia/+/1406080",
+                  json.dumps(st_6080),
+                  cur_now,
+              ),
+          )
+          conn.execute(
+              "UPDATE work_links SET link_reason = 'companion_wip', "
+              "link_detail = 'Тестовый companion WIP СЛ к ревью Gerrit 1408158 (чат b771ef3c, шаг 97)' "
+              "WHERE artifact_key = 'gerrit:skia:1406080'",
+          )
+
+      for w in work_rows:
+        wid = str(w["work_id"])
+        w_links = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM work_links WHERE work_id = ?",
+                (wid,),
+            ).fetchall()
+        ]
+        l_map = {str(r["artifact_key"]): r for r in w_links}
+        if (
+            "gerrit:skia:1408158" in l_map
+            and l_map["gerrit:skia:1408158"].get("role") == "primary"
+            and "github_issue:flutter/flutter:90063" in l_map
+            and l_map["github_issue:flutter/flutter:90063"].get("role") == "primary"
+        ):
+          # Split flutter#90063 + Gerrit 1407016 + chats cfdcb811/9db15645 into their own Work
+          split_wid = "work-90063-r42"
+          conn.execute(
+              "INSERT OR REPLACE INTO works "
+              "(work_id, title, status, project_id, roadmap_item_key, created_at, updated_at, meta_json) "
+              "VALUES (?, ?, 'active', '', '', ?, ?, '{}')",
+              (
+                  split_wid,
+                  "1407016: [skparagraph] Keep line breaking of long words linear (flutter#90063)",
+                  cur_now,
+                  cur_now,
+              ),
+          )
+          move_specs = [
+              (
+                  "github_issue:flutter/flutter:90063",
+                  "primary",
+                  "bug_trailer",
+                  "Целевой баг из первого сообщения чата cfdcb811 и описания СЛ 1407016",
+              ),
+              (
+                  "gerrit:skia:1407016",
+                  "primary",
+                  "bug_trailer",
+                  "В описании СЛ 1407016 указан баг flutter#90063",
+              ),
+              (
+                  "chat_chain:cfdcb811-6aca-4ae3-ba88-cbadbb3162a7",
+                  "channel",
+                  "chat_topic",
+                  "Планировочный чат по багу flutter#90063 (R42)",
+              ),
+              (
+                  "chat_chain:9db15645-df20-4126-aec2-c753c45eefe1",
+                  "channel",
+                  "cl_watcher_chat",
+                  "Чат разработки СЛ 1407016 (flutter#90063)",
+              ),
+              (
+                  "gerrit:skia:1409696",
+                  "context_only",
+                  "chat_mention",
+                  "Попутно упомянут в чате cfdcb811 (шаг 33)",
+              ),
+          ]
+          for ak, r_role, r_reason, r_detail in move_specs:
+            if ak in l_map:
+              conn.execute(
+                  "DELETE FROM work_links WHERE work_id = ? AND artifact_key = ?",
+                  (wid, ak),
+              )
+              conn.execute(
+                  "INSERT OR REPLACE INTO work_links "
+                  "(work_id, artifact_key, role, source, confidence, created_at, link_reason, link_detail) "
+                  "VALUES (?, ?, ?, 'auto', 1.0, ?, ?, ?)",
+                  (split_wid, ak, r_role, cur_now, r_reason, r_detail),
+              )
+          # Also record 1408158 on split_wid as a context_only mid-chat mention from step 339 of cfdcb811
+          conn.execute(
+              "INSERT OR REPLACE INTO work_links "
+              "(work_id, artifact_key, role, source, confidence, created_at, link_reason, link_detail) "
+              "VALUES (?, 'gerrit:skia:1408158', 'context_only', 'auto', 1.0, ?, 'chat_mention', ?)",
+              (
+                  split_wid,
+                  cur_now,
+                  "Попутно упомянут в чате cfdcb811 (шаг 339)",
+              ),
+          )
+          conn.execute(
+              "UPDATE work_links SET link_reason = 'chat_topic', "
+              "link_detail = 'Целевой СЛ на ревью в чате b771ef3c (шаг 0)' "
+              "WHERE work_id = ? AND artifact_key = 'gerrit:skia:1408158'",
+              (wid,),
+          )
+          conn.execute(
+              "UPDATE work_links SET link_reason = 'chat_topic', "
+              "link_detail = 'Ревью-чат по СЛ 1408158' "
+              "WHERE work_id = ? AND artifact_key = 'chat_chain:b771ef3c-b77f-4c91-a6ce-09209da6fd95'",
+              (wid,),
+          )
+          works_repaired += 1
+
     return {
         "links_removed": links_removed,
         "works_archived": works_archived,
@@ -2261,8 +2611,21 @@ class WorkStore:
             "url": str(ar.get("url") or ""),
             "role": str(wl.get("role") or "primary"),
             "source": str(wl.get("source") or "auto"),
+            "link_reason": str(wl.get("link_reason") or ""),
+            "link_detail": str(wl.get("link_detail") or ""),
             "state": ar.get("state") or {},
         })
+      for art_item in w_arts:
+        why_badge, why_tooltip = compute_artifact_provenance(art_item, w_arts)
+        art_item["why_badge"] = why_badge
+        art_item["why_tooltip"] = why_tooltip
+        if not art_item["link_reason"]:
+          if art_item["role"] == "context_only":
+            art_item["link_reason"] = "chat_mention"
+          elif (art_item.get("state") or {}).get("is_companion"):
+            art_item["link_reason"] = "companion_wip"
+          else:
+            art_item["link_reason"] = "auto"
       has_primary = any(a.get("role") == "primary" for a in w_arts)
       has_channel = any(a.get("role") == "channel" for a in w_arts)
       if (is_config_project(raw_proj) or is_config_text(raw_w_title)) and not (

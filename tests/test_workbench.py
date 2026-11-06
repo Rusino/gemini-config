@@ -1007,6 +1007,198 @@ class TestWorkbenchContracts(unittest.TestCase):
     self.assertNotIn("chat_chain:ea2b5a0f-4a39-4bd6-a6aa-3cc940b6aa3c", art_keys)
     self.assertIn("chat_chain:489a12df-4f26-4261-a4a9-171080ad3b1a", art_keys)
 
+  def test_link_provenance_and_no_mid_chat_cooccurrence_bridging(self) -> None:
+    import ingestor
+    import work_store
+    import workbench_server
+
+    store = work_store.WorkStore(db_path=self.db_path)
+    now = 1794010000.0
+    cursors: dict[str, dict[str, float | int]] = {}
+
+    # 1. Review chat b771ef3c on Gerrit 1408158 that uploads companion WIP CL 1406080 in step 1
+    cid_review = "b771ef3c-b77f-4c91-a6ce-09209da6fd95"
+    tpath_review = os.path.join(
+        self.tmp_dir.name, cid_review, ".system_generated", "logs", "transcript.jsonl"
+    )
+    os.makedirs(os.path.dirname(tpath_review), exist_ok=True)
+    with open(tpath_review, "w", encoding="utf-8") as f:
+      f.write(
+          json.dumps({
+              "step_index": 0,
+              "type": "USER_INPUT",
+              "created_at": "2026-10-28T14:00:00Z",
+              "content": (
+                  "Код ревью @[skia | 1408158]"
+                  "(https://skia-review.googlesource.com/c/skia/+/1408158)"
+              ),
+          })
+          + "\n"
+      )
+      f.write(
+          json.dumps({
+              "step_index": 1,
+              "type": "PLANNER_RESPONSE",
+              "created_at": "2026-10-28T14:10:00Z",
+              "content": (
+                  "Я загрузила companion WIP CL: "
+                  "https://skia-review.googlesource.com/c/skia/+/1406080 "
+                  "(SkParagraph_BuilderResetKeepsBuiltText)"
+              ),
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": (
+                          "python3 ~/.gemini/config/scripts/gerrit_draft.py "
+                          "save --change 1408158 --message 'LGTM'"
+                      )
+                  },
+              }],
+          })
+          + "\n"
+      )
+
+    ingestor.ingest_transcript_file(
+        store,
+        conv_id=cid_review,
+        root_cid=cid_review,
+        transcript_path=tpath_review,
+        cursors=cursors,
+        chat_title="Код ревью @[skia | 1408158:[skparagraph] Use std::string for the builder text]",
+        now=now,
+    )
+
+    # 2. Planning chat cfdcb811 on flutter#90063 that mentions 1409696 in planner text
+    # and asks about 1408158 in a later user turn (step 2 > 0)
+    cid_plan = "cfdcb811-6aca-4ae3-ba88-cbadbb3162a7"
+    tpath_plan = os.path.join(
+        self.tmp_dir.name, cid_plan, ".system_generated", "logs", "transcript.jsonl"
+    )
+    os.makedirs(os.path.dirname(tpath_plan), exist_ok=True)
+    with open(tpath_plan, "w", encoding="utf-8") as f:
+      f.write(
+          json.dumps({
+              "step_index": 0,
+              "type": "USER_INPUT",
+              "created_at": "2026-10-30T10:00:00Z",
+              "content": (
+                  "Задача R42 из roadmap проекта SkParagraph: "
+                  "составить ПОДРОБНЫЙ ПЛАН (flutter#90063)"
+              ),
+          })
+          + "\n"
+      )
+      f.write(
+          json.dumps({
+              "step_index": 1,
+              "type": "PLANNER_RESPONSE",
+              "created_at": "2026-10-30T10:05:00Z",
+              "content": (
+                  "Для справки см. соседний CL "
+                  "https://skia-review.googlesource.com/c/skia/+/1409696"
+              ),
+              "tool_calls": [{
+                  "name": "write_file",
+                  "args": {"Path": "/work/skia/modules/skparagraph/src/ParagraphImpl.cpp"},
+              }],
+          })
+          + "\n"
+      )
+      f.write(
+          json.dumps({
+              "step_index": 2,
+              "type": "USER_INPUT",
+              "created_at": "2026-10-30T11:00:00Z",
+              "content": (
+                  "И что ты в результате сделала, если уже есть "
+                  "[skia | 1408158](https://skia-review.googlesource.com/c/skia/+/1408158) "
+                  "от YeungKC?"
+              ),
+          })
+          + "\n"
+      )
+
+    ingestor.ingest_transcript_file(
+        store,
+        conv_id=cid_plan,
+        root_cid=cid_plan,
+        transcript_path=tpath_plan,
+        cursors=cursors,
+        chat_title="",
+        now=now + 10,
+    )
+
+    # 3. cl_watcher_state brings in Gerrit 1407016 linked to flutter#90063 and Gerrit 1408158
+    cl_state = {
+        "items": {
+            "gerrit:1408158": {
+                "kind": "gerrit",
+                "target_id": "1408158",
+                "host": "skia-review.googlesource.com",
+                "status": "NEW",
+                "subject": "[skparagraph] Use std::string for the builder text",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1408158",
+                "conversation_id": cid_review,
+            },
+            "gerrit:1407016": {
+                "kind": "gerrit",
+                "target_id": "1407016",
+                "host": "skia-review.googlesource.com",
+                "status": "MERGED",
+                "subject": "[skparagraph] Keep line breaking of long words linear",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1407016",
+                "conversation_id": "9db15645-df20-4126-aec2-c753c45eefe1",
+                "linked_bugs": [{
+                    "bug_key": "gh_issue:flutter/flutter#90063",
+                    "short_id": "flutter#90063",
+                    "title": "Long line breaking O(N^2) hang",
+                    "status": "OPEN",
+                    "url": "https://github.com/flutter/flutter/issues/90063",
+                }],
+            },
+        }
+    }
+    ingestor.ingest_cl_watcher_state(store, cl_state, now=now + 20)
+
+    proj = store.build_dashboard_projection(cl_watcher_state=cl_state, now=now + 30)
+    works_by_primary: dict[str, dict[str, Any]] = {}
+    for w in proj["works"]:
+      for a in w["artifacts"]:
+        if a["role"] == "primary":
+          works_by_primary[a["artifact_key"]] = w
+
+    self.assertIn("gerrit:skia:1408158", works_by_primary)
+    self.assertIn("github_issue:flutter/flutter:90063", works_by_primary)
+    w_1408158 = works_by_primary["gerrit:skia:1408158"]
+    w_90063 = works_by_primary["github_issue:flutter/flutter:90063"]
+
+    # Crucial invariant: mid-chat mention of 1408158 at step 2 of cfdcb811 must NOT merge the two works
+    self.assertNotEqual(w_1408158["work_id"], w_90063["work_id"])
+
+    arts_1408158 = {a["artifact_key"]: a for a in w_1408158["artifacts"]}
+    self.assertIn("gerrit:skia:1406080", arts_1408158)
+    self.assertNotIn("gerrit:skia:1407016", arts_1408158)
+    self.assertNotIn("github_issue:flutter/flutter:90063", arts_1408158)
+    self.assertEqual(arts_1408158["gerrit:skia:1406080"]["link_reason"], "companion_wip")
+    self.assertIn("1408158", arts_1408158["gerrit:skia:1406080"]["why_badge"])
+
+    arts_90063 = {a["artifact_key"]: a for a in w_90063["artifacts"]}
+    self.assertIn("gerrit:skia:1407016", arts_90063)
+    self.assertEqual(arts_90063["gerrit:skia:1407016"]["role"], "primary")
+    self.assertIn("90063", arts_90063["gerrit:skia:1407016"]["why_badge"])
+    # Both 1408158 and 1409696 are stored as context_only chat mentions on w_90063
+    self.assertEqual(arts_90063["gerrit:skia:1408158"]["role"], "context_only")
+    self.assertEqual(arts_90063["gerrit:skia:1408158"]["link_reason"], "chat_mention")
+    self.assertEqual(arts_90063["gerrit:skia:1409696"]["role"], "context_only")
+    self.assertEqual(arts_90063["gerrit:skia:1409696"]["link_reason"], "chat_mention")
+
+    # Verify HTML rendering includes .wb-why badges and collapsible <details class="wb-mentions">
+    html_out = workbench_server.render_workbench_html(proj, ui_version=1)
+    self.assertIn("wb-why", html_out)
+    self.assertIn("companion WIP к 1408158", html_out)
+    self.assertIn("wb-mentions", html_out)
+    self.assertIn("📎 Упомянуто в чате (2)", html_out)
+
 
 if __name__ == "__main__":
   unittest.main()
