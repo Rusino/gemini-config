@@ -220,7 +220,23 @@ def parse_git_diff(repo_path, diff_ref):
   hunk_deleted = []
 
   branch_re = re.compile(r"^\s*(?:if|else\s+if|while|for|switch|case)\b")
+  # Count local structs/classes and helper lambdas alongside branches when checking body density
+  body_landmark_re = re.compile(
+      r"^\s*(?:(?:if|else\s+if|while|for|switch|case)\b|"
+      r"(?:struct|class)\s+\w+\s*\{|"
+      r"auto\s+\w+\s*=\s*\[[^\]]*\]\s*\()"
+  )
   test_file_re = re.compile(r"(?:^|/)(?:test|tests|testing)/|(?:\.|_)(?:test|unittest|tests)\.")
+
+  # Flag multi-branch stretches inside a commented method body that went >=20 lines (or >=4
+  # control-flow/helper landmarks in >=14 lines) without a targeted rationale comment
+  def flush_sparse_stretch(start_rel: int, code_count: int, landmarks: list[str]):
+    if (code_count >= 20 and len(landmarks) >= 2) or (code_count >= 14 and len(landmarks) >= 4):
+      tag = (
+          f"[SPARSE_BODY: {len(landmarks)} uncommented branches/helpers "
+          f"across {code_count} code lines]"
+      )
+      uncommented_hunks.append((cur_file, hunk_start + start_rel, [tag] + landmarks, []))
 
   def flush_hunk():
     nonlocal hunk_added, hunk_deleted
@@ -257,6 +273,25 @@ def parse_git_diff(repo_path, diff_ref):
               [tag] + body_branches,
               [],
           ))
+        elif has_body_comment:
+          # One comment inside a large method body must not silence long uncommented stretches of
+          # loops, branches, local structs, or helper lambdas elsewhere in the same hunk
+          stretch_code = 0
+          stretch_landmarks = []
+          stretch_start = first_brace_idx + 1
+          for rel_idx, line_s in enumerate(body_lines, start=first_brace_idx + 1):
+            if is_comment(line_s):
+              flush_sparse_stretch(stretch_start, stretch_code, stretch_landmarks)
+              stretch_code = 0
+              stretch_landmarks = []
+              stretch_start = rel_idx + 1
+            elif line_s.strip():
+              if stretch_code == 0:
+                stretch_start = rel_idx
+              stretch_code += 1
+              if body_landmark_re.match(line_s):
+                stretch_landmarks.append(line_s.strip())
+          flush_sparse_stretch(stretch_start, stretch_code, stretch_landmarks)
     hunk_added = []
     hunk_deleted = []
 
