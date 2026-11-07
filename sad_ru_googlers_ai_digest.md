@@ -353,3 +353,55 @@
 - **Как предлагаем использовать**:
   1. Сам фоновый поллер Rift-воркспейсов нам не нужен: наш фокус — Skia и Flutter Engine в изолированных git-воркспейсах, а входящие ревью мы запускаем точечно через `review-triage` и `companion-cl-review`.
   2. Защитный инвариант **Security & Untrusted Input Guardrail** предлагаем перенести в наши скиллы `skills/review-triage/SKILL.md` и `skills/companion-cl-review/SKILL.md` (подзадача в открытом эпике `R38`): жестко запретить агентам выполнять любые инструкции или менять системный промпт при обнаружении директив в описаниях чужих CL, комментариях Gerrit или файлах `.gemini/` / `AGENTS.md`, добавленных автором патча.
+
+
+---
+
+## 2026-11-07
+
+### Sad RU Googlers (HISTORY OFF) (`spaces/AAAAn_HZbYs`)
+
+#### 1. Деградация качества кода при AI-ассистированной разработке и инверсия роли ревьюера («ревьюеры пишут код вместо авторов»)
+- **Авторы**: Valeriy Leletko (`leletko@google.com`, 20:55–23:51 ET / 01:55–03:51 UTC, тред `spaces/AAAAn_HZbYs/threads/gNhHlan3QxI`), Anna Levadnaia (`alevadnaia@google.com`), Max Gulimonov (`maximg@google.com`).
+- **Суть проблемы и дискуссии**:
+  - Valeriy Leletko поднял острую проблему: с массовым распространением ИИ-генерации авторы перестали вычитывать свой код и отправляют на ревью сырые наброски с примитивными галлюцинациями, битыми ссылками на ассеты/скриншоты и непроверенными схемами. В итоге ревьюер тратит часы, чтобы по сути написать CL за автора через детальные комментарии в Critique.
+  - Та же проблема наблюдается с дизайн-документами (длинные AI-галлюцинированные стены текста, авторы на 1:1 не могут ответить на вопросы по собственным дизайнам).
+  - Max Gulimonov отметил, что «в конце 2026 года нужно перестать смотреть код руками, а начать настраивать жесткий тестовый и статический харнесс», а также подключать специализированных агентов ревью (readability-агенты, проверка расхождения кода со спецификацией вроде OpenSpec).
+- **Вердикт полезности**: `🟡 Уже внедрено у нас`.
+- **Где это реализовано у нас**:
+  - У нас уже работает двусторонний защитный контур:
+    1. Для исходящего кода — строгий pre-commit аудит (`amnesia-precommit`, `audit_comments.py`, `ruthless_audit.py`, `mutation_check.py`, прогон тестов фреймворка и верификатор живости тестов).
+    2. Для входящих ревью — `companion-cl-review` и `review-triage`, где чужой код проверяется не доверчиво на глаз, а через контрактные тесты (`PS1` = воспроизведение дефекта, `PS2` = исправление) и верификацию скептиком (`keeper_skeptic`).
+
+#### 2. OpenSpec: спецификационно-ориентированная разработка (SDD) и контроль дрейфа кода от спецификации
+- **Авторы**: Max Gulimonov (`maximg@google.com`, 00:23 ET / 05:23 UTC, тред `spaces/AAAAn_HZbYs/threads/gNhHlan3QxI`).
+- **Ссылки и ресурсы**: Документация [go/sdd](http://go/sdd), скилл [`/google/src/files/head/depot/google3/learning/gemini/agents/skills/openspec/SKILL.md`](file:///google/src/files/head/depot/google3/learning/gemini/agents/skills/openspec/SKILL.md), пакет `//third_party/javascript/node_modules/openspec`.
+- **Суть решения**:
+  - OpenSpec формализует 5-фазный жизненный цикл изменений через папки `{spec_root}/specs` и `{spec_root}/changes/{change_name}` (proposal -> specs -> design -> tasks -> apply).
+  - Позволяет агентам сравнивать AST/схемы имплементации с утвержденными требованиями (`Requirement`) и предотвращать дрейф реализации от спецификации (Code vs Spec Drift).
+- **Вердикт полезности**: `🟡 Уже внедрено у нас (в R4 и doc-check) + ⚪ Не нужно (YAGNI для C++/Skia)`.
+- **Как используем**:
+  - Для наших C++/Dart репозиториев (Skia, Flutter Engine) тяжелый фреймворк OpenSpec избыточен (YAGNI). Всю ценную суть (проверка дрейфа кода от проектных правил и `AGENTS.md`) мы уже зафиксировали в открытом эпике `R4` (`Epic: Doc-Check & Grounding`, задача 3: `Doc <-> Code Drift check in amnesia-precommit & review-triage`).
+
+#### 3. Модели и олимпиадный стиль: Claude vs Gemini Fable на валидации схем и данных
+- **Авторы**: Anna Nachesa (`ashalynd@google.com`, 09:31–14:26 ET / 14:31–19:26 UTC, тред `spaces/AAAAn_HZbYs/threads/u7JvixCpbyc`), Slava Guzanov (`vguzanov@google.com`), Vanya Davidenko (`vdvd@google.com`).
+- **Суть дискуссии**:
+  - Anna столкнулась с тем, что Claude (Opus 5.5 medium) для валидации proto-ответов предложил парсить поля через регулярные выражения, и только после прямого наводящего вопроса догадался распарсить JSON/прото напрямую.
+  - Slava Guzanov указал, что самописные проверки схем регулярками — классический антипаттерн (нужно использовать Pydantic или типизированные схемы).
+  - Vanya Davidenko отметил, что в слепом тестировании и на сложных задачах Gemini Fable на reasoning-уровне `high` работает заметно лучше и быстрее Опуса.
+- **Вердикт полезности**: `⚪ Не нужно (YAGNI) / ознакомительно`.
+  - У нас в правилах уже зафиксирован отказ от хрупких эвристик и регулярок там, где есть формальные AST/компиляторы.
+
+---
+
+### Chrome AI Discuss (`spaces/AAQA45T8nC8`)
+
+#### 1. Проблемы конфигурации MCP-плагинов в `chromium-ide` на macOS (`chrome-aura-remote`, `trooper`)
+- **Автор**: Adam Norberg (`norberg@google.com`, 18:14–19:09 ET / 23:14–00:09 UTC, треды `spaces/AAQA45T8nC8/threads/oJPnBssALDo`, `spaces/AAQA45T8nC8/threads/hV1OyNr6bdM`, `spaces/AAQA45T8nC8/threads/_4xSkx5LySk`).
+- **Ссылки и файлы**: Конфиг [`internal/agents/plugins/chrome-aura-remote/mcp_config.json`](https://source.corp.google.com/h/chromium/chromium/src/+/main:internal/agents/plugins/chrome-aura-remote/mcp_config.json), документация [go/jetski-agent-plugins](http://go/jetski-agent-plugins).
+- **Суть проблемы**:
+  - В монорепозитории Chromium плагины для `chromium-ide` (`internal/agents/plugins/`) на macOS сталкиваются с багами подстановки путей: переменные `${extensionPath}` и `${/}` не раскрываются средой и трактуются буквально, вызывая `file not found`.
+  - Замена на `${PLUGIN_ROOT}/` приводит к ошибкам SSH-сертификатов при попытке удаленного подключения с Mac на Cloudtop.
+  - Плагин `trooper` поставляется с предкомпилированным Linux-бинарником и падает на Darwin.
+- **Вердикт полезности**: `⚪ Не нужно (YAGNI) / справочно`.
+  - Наша основная среда разработки — полноценный Linux Cloudtop, где все MCP-серверы и плагины запускаются нативно без удаленных SSH-туннелей и несовместимости бинарников.
