@@ -38,18 +38,18 @@ DEFAULT_PROJECT_MODELS_FILE = os.path.expanduser(
 DEFAULT_PROJECT_MODELS: dict[str, str] = {
     # triage profile (sidecar IDs)
     "skia-g3-roll-check": "triage",
-    # cpp-core profile
-    "Chromium": "cpp-core",
-    "Lazy Android": "cpp-core",
-    "TextClusters API": "cpp-core",
+    # cpp-core profile (only SkParagraph, Skia, and SkoreText start immediately on Opus 5.5)
     "SkParagraph": "cpp-core",
     "Skia": "cpp-core",
     "SkoreText": "cpp-core",
-    "SkGlyphID to 32 bits": "cpp-core",
-    "Typescript WebParagraph": "cpp-core",
-    "WebParagraph": "cpp-core",
-    "Text Editor": "cpp-core",
-    # orchestrator profile
+    # orchestrator profile (drains flat gemini-next bucket first unless manually pinned)
+    "Chromium": "orchestrator",
+    "Lazy Android": "orchestrator",
+    "TextClusters API": "orchestrator",
+    "SkGlyphID to 32 bits": "orchestrator",
+    "Typescript WebParagraph": "orchestrator",
+    "WebParagraph": "orchestrator",
+    "Text Editor": "orchestrator",
     "Improving Experience": "orchestrator",
     "Flight Deck": "orchestrator",
     "Code Review organizer": "orchestrator",
