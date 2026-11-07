@@ -83,8 +83,10 @@ def get_profile_quota_state(
     hit = cl.lookup_model(models, mid)
     if not hit:
       continue
-    hits.append(hit)
     raw_det = models.get(hit["id"]) or {}
+    # lookup_model reads the wall clock; quota and reset candidates must use the same `now`
+    hit = {**hit, "quota": cl.get_model_quota_fraction(raw_det, now_ts=now)}
+    hits.append(hit)
     qinfo = raw_det.get("quotaInfo") if isinstance(raw_det, dict) else {}
     r_iso = str((qinfo or {}).get("resetTime") or "").strip()
     r_ts = cl.parse_iso_reset_ts(r_iso) if r_iso else 0.0

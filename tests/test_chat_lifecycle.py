@@ -2718,6 +2718,8 @@ class TestChatLifecycle(unittest.TestCase):
           ),
           patch.object(chat_lifecycle, "set_conversation_wait_state", return_value=True),
           patch.object(chat_lifecycle, "ls_rpc", return_value={}) as rpc_mock,
+          # Guards without a now_ts argument read the clock; pin it before the fixed reset times
+          patch.object(chat_lifecycle, "_now_ts", return_value=now_before + 30),
       ):
         # PreInvocation guard enqueues 0%-quota chat and returns [QUOTA HOLD GUARD]
         notice = context_guard.resolve_quota_exhaustion_hold_notice(
