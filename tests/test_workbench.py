@@ -459,8 +459,9 @@ class TestWorkbenchContracts(unittest.TestCase):
       self.assertIn("Workbench", html)
       self.assertIn("TextClusters investigation", html)
       self.assertIn("Send summary doc to Florin", html)
-      self.assertIn("wb-expand-all", html)
-      self.assertIn("wb-collapse-all", html)
+      self.assertIn("wb-toggle-collapse", html)
+      self.assertNotIn("wb-expand-all", html)
+      self.assertNotIn("wb-collapse-all", html)
       self.assertIn("data-toggle-card", html)
 
       with urllib.request.urlopen(f"http://127.0.0.1:{port}/favicon.ico", timeout=5) as resp:
@@ -2078,6 +2079,299 @@ class TestWorkbenchContracts(unittest.TestCase):
     finally:
       srv.shutdown()
       srv.server_close()
+
+  def test_collapse_first_toggle_search_auto_expand_and_alt_click(self) -> None:
+    import re
+    import workbench_server
+
+    proj = {
+        "synced_et": "Nov 07 17:15 ET",
+        "counts": {"needs_you": 1, "waiting": 2, "obligations_open": 0, "unanswered": 0},
+        "metrics": {"link_precision": 1.0},
+        "unanswered_tray": [],
+        "works": [
+            {
+                "work_id": "w_needs",
+                "title": "Needs Attention Work",
+                "lane": "needs-you",
+                "is_multi_channel": False,
+                "obligations": [],
+                "artifacts": [],
+                "checklist": [],
+                "reasons": ["Review requested"],
+                "updated_et": "17:00 ET",
+            },
+            {
+                "work_id": "w_wait1",
+                "title": "Wait Alpha Florin",
+                "lane": "waiting",
+                "is_multi_channel": False,
+                "obligations": [],
+                "artifacts": [],
+                "checklist": [],
+                "reasons": [],
+                "updated_et": "16:00 ET",
+            },
+            {
+                "work_id": "w_wait2",
+                "title": "Wait Beta",
+                "lane": "waiting",
+                "is_multi_channel": False,
+                "obligations": [],
+                "artifacts": [],
+                "checklist": [],
+                "reasons": [],
+                "updated_et": "15:00 ET",
+            },
+            {
+                "work_id": "w_done",
+                "title": "Done Gamma",
+                "lane": "done",
+                "is_multi_channel": False,
+                "obligations": [],
+                "artifacts": [],
+                "checklist": [],
+                "reasons": [],
+                "updated_et": "14:00 ET",
+            },
+        ],
+    }
+    html_out = workbench_server.render_workbench_html(proj, ui_version=1)
+    self.assertIn('id="wb-toggle-collapse"', html_out)
+    self.assertNotIn("wb-expand-all", html_out)
+    self.assertNotIn("wb-collapse-all", html_out)
+
+    match = re.search(r"<script>\n(.*?)\n</script>", html_out, re.DOTALL)
+    self.assertIsNotNone(match, "Inline script must exist in rendered Workbench HTML")
+    script_js = match.group(1)
+
+    node_harness = """
+const assert = require('assert');
+const storage = new Map();
+storage.set('wb_collapsed_v1', JSON.stringify({ overrides: {}, bulk: true }));
+
+function makeEl(id, extra = {}) {
+  const attrs = Object.assign({}, extra.attrs || {});
+  const listeners = {};
+  return Object.assign({
+    id,
+    value: '',
+    textContent: '',
+    innerHTML: '',
+    disabled: false,
+    getAttribute(k) {
+      return Object.prototype.hasOwnProperty.call(attrs, k) ? attrs[k] : null;
+    },
+    setAttribute(k, v) { attrs[k] = String(v); },
+    addEventListener(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); },
+    dispatch(ev, evtObj) {
+      for (const fn of (listeners[ev] || [])) fn(evtObj || {});
+    },
+  }, extra.props || {});
+}
+
+const els = {
+  'wb-synced': makeEl('wb-synced'),
+  'kpi-needs': makeEl('kpi-needs'),
+  'kpi-wait': makeEl('kpi-wait'),
+  'kpi-obs': makeEl('kpi-obs'),
+  'kpi-tray': makeEl('kpi-tray'),
+  'kpi-prec': makeEl('kpi-prec'),
+  'wb-tray-container': makeEl('wb-tray-container'),
+  'wb-cards-container': makeEl('wb-cards-container'),
+  'wb-new-btn': makeEl('wb-new-btn'),
+  'wb-cancel-new': makeEl('wb-cancel-new'),
+  'wb-new-form': makeEl('wb-new-form', { props: { reset() {} } }),
+  'wb-new-title': makeEl('wb-new-title'),
+  'wb-new-primary': makeEl('wb-new-primary'),
+  'wb-new-channel': makeEl('wb-new-channel'),
+  'wb-new-oblige': makeEl('wb-new-oblige'),
+  'wb-new-when': makeEl('wb-new-when'),
+  'wb-sync-btn': makeEl('wb-sync-btn'),
+  'wb-toggle-collapse': makeEl('wb-toggle-collapse', {
+    attrs: { 'data-action': 'collapse' },
+  }),
+  'wb-search': makeEl('wb-search'),
+};
+const chips = ['all', 'needs-you', 'multi', 'obligations', 'done'].map((f, idx) =>
+  makeEl('chip-' + f, {
+    attrs: { 'data-filter': f, 'data-active': idx === 0 ? 'true' : 'false' },
+  })
+);
+const bodyListeners = {};
+global.localStorage = {
+  getItem: (k) => (storage.has(k) ? storage.get(k) : null),
+  setItem: (k, v) => { storage.set(k, String(v)); },
+};
+global.window = {
+  addEventListener: () => {},
+  getSelection: () => '',
+  prompt: () => '',
+};
+global.setInterval = () => 0;
+global.fetch = async () => ({ ok: false });
+global.document = {
+  getElementById: (id) => els[id] || makeEl(id),
+  querySelectorAll: (sel) => (sel === '.wb-chip' ? chips : []),
+  createElement: () => {
+    let txt = '';
+    return {
+      set textContent(v) { txt = String(v || ''); },
+      get innerHTML() {
+        return txt.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      },
+    };
+  },
+  body: {
+    addEventListener(ev, fn) { (bodyListeners[ev] = bodyListeners[ev] || []).push(fn); },
+    dispatch(ev, evtObj) { for (const fn of (bodyListeners[ev] || [])) fn(evtObj); },
+  },
+};
+
+""" + script_js + """
+
+function parseCards() {
+  const re = new RegExp(
+    '<article class="wb-card" data-work-id="([^"]+)" ' +
+    'data-lane="([^"]+)" data-collapsed="(true|false)">',
+    'g'
+  );
+  const out = {};
+  let m;
+  while ((m = re.exec(els['wb-cards-container'].innerHTML)) !== null) {
+    out[m[1]] = { lane: m[2], collapsed: m[3] === 'true' };
+  }
+  return out;
+}
+
+function clickCardHeader(wid, altKey) {
+  const cards = parseCards();
+  assert(cards[wid], 'Expected visible card ' + wid);
+  const hdrObj = {
+    getAttribute: (k) => (k === 'data-toggle-card' ? wid : null),
+    closest: (sel) => (sel === '.wb-card' ? {
+      getAttribute: (k) => (k === 'data-collapsed' ? String(cards[wid].collapsed) : null),
+    } : null),
+  };
+  document.body.dispatch('click', {
+    altKey: Boolean(altKey),
+    preventDefault: () => {},
+    target: {
+      closest: (sel) => {
+        if (sel === 'button, a, input') return null;
+        if (sel === '[data-toggle-card]') return hdrObj;
+        return null;
+      },
+    },
+  });
+}
+
+const toggleBtn = els['wb-toggle-collapse'];
+const searchInput = els['wb-search'];
+
+let cards = parseCards();
+assert.deepStrictEqual(Object.keys(cards), ['w_needs', 'w_wait1', 'w_wait2']);
+assert.strictEqual(cards.w_needs.collapsed, false);
+assert.strictEqual(cards.w_wait1.collapsed, true);
+assert.strictEqual(cards.w_wait2.collapsed, true);
+assert.strictEqual(toggleBtn.textContent, '⇈');
+assert.strictEqual(toggleBtn.getAttribute('data-action'), 'collapse');
+assert.strictEqual(toggleBtn.getAttribute('data-expanded-count'), '1');
+assert.strictEqual(toggleBtn.getAttribute('data-collapsed-count'), '2');
+assert.strictEqual(toggleBtn.disabled, false);
+
+toggleBtn.dispatch('click');
+cards = parseCards();
+assert.strictEqual(cards.w_needs.collapsed, true);
+assert.strictEqual(cards.w_wait1.collapsed, true);
+assert.strictEqual(cards.w_wait2.collapsed, true);
+assert.strictEqual(toggleBtn.textContent, '⇊');
+assert.strictEqual(toggleBtn.getAttribute('data-action'), 'expand');
+assert.strictEqual(toggleBtn.getAttribute('data-collapsed-count'), '3');
+const saved1 = JSON.parse(storage.get('wb_collapsed_v2'));
+assert.deepStrictEqual(saved1, { overrides: { w_needs: true } });
+assert.strictEqual('bulk' in saved1, false);
+
+toggleBtn.dispatch('click');
+cards = parseCards();
+assert.strictEqual(cards.w_needs.collapsed, false);
+assert.strictEqual(cards.w_wait1.collapsed, false);
+assert.strictEqual(cards.w_wait2.collapsed, false);
+assert.strictEqual(toggleBtn.textContent, '⇈');
+assert.strictEqual(toggleBtn.getAttribute('data-expanded-count'), '3');
+const saved2 = JSON.parse(storage.get('wb_collapsed_v2'));
+assert.deepStrictEqual(saved2, { overrides: { w_wait1: false, w_wait2: false } });
+
+chips[4].dispatch('click');
+cards = parseCards();
+assert.deepStrictEqual(Object.keys(cards), ['w_done']);
+assert.strictEqual(cards.w_done.collapsed, true);
+assert.strictEqual(toggleBtn.textContent, '⇊');
+assert.strictEqual(toggleBtn.getAttribute('data-collapsed-count'), '1');
+
+chips[0].dispatch('click');
+toggleBtn.dispatch('click');
+const savedBeforeSearch = JSON.parse(storage.get('wb_collapsed_v2'));
+assert.deepStrictEqual(savedBeforeSearch, { overrides: { w_needs: true } });
+clickCardHeader('w_needs', false);
+assert.deepStrictEqual(JSON.parse(storage.get('wb_collapsed_v2')), { overrides: {} });
+storage.delete('wb_collapsed_v2');
+
+searchInput.value = 'Florin';
+searchInput.dispatch('input', { target: searchInput });
+cards = parseCards();
+assert.deepStrictEqual(Object.keys(cards), ['w_wait1']);
+assert.strictEqual(cards.w_wait1.collapsed, false);
+assert.strictEqual(toggleBtn.textContent, '⇈');
+assert.strictEqual(toggleBtn.getAttribute('data-expanded-count'), '1');
+assert.strictEqual(storage.has('wb_collapsed_v2'), false);
+
+toggleBtn.dispatch('click');
+cards = parseCards();
+assert.strictEqual(cards.w_wait1.collapsed, true);
+assert.strictEqual(toggleBtn.textContent, '⇊');
+assert.strictEqual(storage.has('wb_collapsed_v2'), false);
+
+searchInput.value = 'no-such-item-xyz';
+searchInput.dispatch('input', { target: searchInput });
+cards = parseCards();
+assert.deepStrictEqual(Object.keys(cards), []);
+assert.strictEqual(toggleBtn.disabled, true);
+assert.strictEqual(toggleBtn.getAttribute('data-expanded-count'), '0');
+assert.strictEqual(toggleBtn.getAttribute('data-collapsed-count'), '0');
+
+searchInput.value = '';
+searchInput.dispatch('input', { target: searchInput });
+cards = parseCards();
+assert.deepStrictEqual(Object.keys(cards), ['w_needs', 'w_wait1', 'w_wait2']);
+assert.strictEqual(cards.w_needs.collapsed, false);
+assert.strictEqual(cards.w_wait1.collapsed, true);
+assert.strictEqual(cards.w_wait2.collapsed, true);
+assert.strictEqual(toggleBtn.disabled, false);
+
+clickCardHeader('w_wait1', true);
+cards = parseCards();
+assert.strictEqual(cards.w_needs.collapsed, false);
+assert.strictEqual(cards.w_wait1.collapsed, false);
+assert.strictEqual(cards.w_wait2.collapsed, false);
+
+clickCardHeader('w_needs', true);
+cards = parseCards();
+assert.strictEqual(cards.w_needs.collapsed, true);
+assert.strictEqual(cards.w_wait1.collapsed, true);
+assert.strictEqual(cards.w_wait2.collapsed, true);
+"""
+    res = subprocess.run(
+        ["node", "-e", node_harness],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(
+        res.returncode,
+        0,
+        f"Node behavioral check failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+    )
 
 
 if __name__ == "__main__":

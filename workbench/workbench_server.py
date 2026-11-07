@@ -372,8 +372,33 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     border-color: rgba(0, 113, 227, 0.45);
     font-weight: 600;
   }}
-  .wb-search {{
+  .wb-filter-tools {{
     margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }}
+  .wb-btn-icon {{
+    width: 26px;
+    height: 24px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    line-height: 1;
+    color: var(--muted);
+    flex-shrink: 0;
+  }}
+  .wb-btn-icon:hover {{
+    color: var(--accent);
+  }}
+  .wb-btn-icon:disabled {{
+    opacity: 0.4;
+    cursor: default;
+    pointer-events: none;
+  }}
+  .wb-search {{
     background: var(--surface);
     border: 1px solid var(--border);
     color: var(--text);
@@ -919,9 +944,13 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       <button class="wb-chip" data-filter="multi" type="button">🔗 Multi-channel</button>
       <button class="wb-chip" data-filter="obligations" type="button">🔔 Obligations</button>
       <button class="wb-chip" data-filter="done" type="button">✅ Done</button>
-      <button class="wb-btn" id="wb-expand-all" type="button" title="Expand all visible cards">▾ Expand all</button>
-      <button class="wb-btn" id="wb-collapse-all" type="button" title="Collapse all visible cards">▸ Collapse all</button>
-      <input class="wb-search" id="wb-search" type="search" placeholder="Filter works, CLs, bugs...">
+      <div class="wb-filter-tools">
+        <button class="wb-btn wb-btn-icon" id="wb-toggle-collapse" type="button"
+                data-action="collapse" aria-label="⇈ Collapse visible cards"
+                title="⇈ Collapse visible cards">⇈</button>
+        <input class="wb-search" id="wb-search" type="search"
+               placeholder="Filter works, CLs, bugs...">
+      </div>
     </div>
   </header>
 
@@ -945,19 +974,20 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
 <script>
 (() => {{
   const UI_VERSION = {int(ui_version)};
-  const COLLAPSE_STORAGE_KEY = 'wb_collapsed_v1';
+  // Bump storage key to v2 so legacy v1 global bulk flags cannot overwrite lane defaults
+  const COLLAPSE_STORAGE_KEY = 'wb_collapsed_v2';
   let state = {initial_json};
   let activeFilter = 'all';
   let searchQuery = '';
   let collapsedOverrides = {{}};
-  let bulkCollapseMode = null;
+  // Keep search-time toggles in memory so clearing search restores saved card states
+  let searchCollapsedOverrides = {{}};
   try {{
     const raw = localStorage.getItem(COLLAPSE_STORAGE_KEY);
     if (raw) {{
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed === 'object') {{
         collapsedOverrides = parsed.overrides || {{}};
-        bulkCollapseMode = parsed.bulk ?? null;
       }}
     }}
   }} catch {{}}
@@ -966,20 +996,107 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     try {{
       localStorage.setItem(
         COLLAPSE_STORAGE_KEY,
-        JSON.stringify({{ overrides: collapsedOverrides, bulk: bulkCollapseMode }})
+        JSON.stringify({{ overrides: collapsedOverrides }})
       );
     }} catch {{}}
   }}
 
+  function isSearchActive() {{
+    return Boolean(searchQuery && searchQuery.trim());
+  }}
+
+  function defaultCardCollapsed(w) {{
+    return (w && w.lane) !== 'needs-you';
+  }}
+
   function isCardCollapsed(w) {{
     const wid = String((w && w.work_id) || '');
+    if (isSearchActive()) {{
+      if (wid && Object.prototype.hasOwnProperty.call(searchCollapsedOverrides, wid)) {{
+        return Boolean(searchCollapsedOverrides[wid]);
+      }}
+      // Auto-expand search hits so matched fields in Waiting/Done are visible immediately
+      return false;
+    }}
     if (wid && Object.prototype.hasOwnProperty.call(collapsedOverrides, wid)) {{
       return Boolean(collapsedOverrides[wid]);
     }}
-    if (bulkCollapseMode !== null) {{
-      return Boolean(bulkCollapseMode);
+    return defaultCardCollapsed(w);
+  }}
+
+  function setCardCollapsed(w, collapsed) {{
+    const wid = String((w && w.work_id) || '');
+    if (!wid) return;
+    const next = Boolean(collapsed);
+    if (isSearchActive()) {{
+      if (!next) {{
+        delete searchCollapsedOverrides[wid];
+      }} else {{
+        searchCollapsedOverrides[wid] = true;
+      }}
+      return;
     }}
-    return w.lane !== 'needs-you';
+    // Drop redundant entries matching lane defaults so smart defaults stay intact
+    if (next === defaultCardCollapsed(w)) {{
+      delete collapsedOverrides[wid];
+    }} else {{
+      collapsedOverrides[wid] = next;
+    }}
+  }}
+
+  // Return the visible cards matching the active filter chip and search input
+  function getVisibleWorks() {{
+    const q = searchQuery ? searchQuery.trim().toLowerCase() : '';
+    return ((state && state.works) || []).filter((w) => {{
+      if (activeFilter === 'needs-you' && w.lane !== 'needs-you') return false;
+      if (activeFilter === 'multi' && !w.is_multi_channel) return false;
+      if (
+        activeFilter === 'obligations' &&
+        !(w.obligations && w.obligations.length > 0)
+      ) {{
+        return false;
+      }}
+      // Hide completed works outside the Done tab so active lanes stay focused
+      if (activeFilter === 'done' && w.lane !== 'done') return false;
+      if (activeFilter !== 'done' && w.lane === 'done') return false;
+      if (q) {{
+        const hay = JSON.stringify(w).toLowerCase();
+        if (!hay.includes(q)) return false;
+      }}
+      return true;
+    }});
+  }}
+
+  function updateCollapseToggleUI(works) {{
+    const btn = document.getElementById('wb-toggle-collapse');
+    if (!btn) return;
+    let expandedCount = 0;
+    let collapsedCount = 0;
+    for (const w of works) {{
+      if (isCardCollapsed(w)) {{
+        collapsedCount += 1;
+      }} else {{
+        expandedCount += 1;
+      }}
+    }}
+    const totalCount = expandedCount + collapsedCount;
+    // Collapse-first: collapse whenever any visible card is open
+    const shouldCollapse = totalCount === 0 || expandedCount > 0;
+    const action = shouldCollapse ? 'collapse' : 'expand';
+    const icon = shouldCollapse ? '⇈' : '⇊';
+    let label = '⇈ Collapse visible cards';
+    if (totalCount > 0) {{
+      label = shouldCollapse
+        ? `⇈ Collapse visible cards (${{expandedCount}}/${{totalCount}} open)`
+        : `⇊ Expand visible cards (${{collapsedCount}} collapsed)`;
+    }}
+    btn.disabled = totalCount === 0;
+    btn.setAttribute('data-action', action);
+    btn.setAttribute('data-expanded-count', String(expandedCount));
+    btn.setAttribute('data-collapsed-count', String(collapsedCount));
+    btn.setAttribute('aria-label', label);
+    btn.setAttribute('title', label);
+    if (btn.textContent !== icon) btn.textContent = icon;
   }}
 
   function notifyParentRendered() {{
@@ -1086,18 +1203,8 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       `;
     }}
 
-    const works = ((state && state.works) || []).filter((w) => {{
-      if (activeFilter === 'needs-you' && w.lane !== 'needs-you') return false;
-      if (activeFilter === 'multi' && !w.is_multi_channel) return false;
-      if (activeFilter === 'obligations' && !(w.obligations && w.obligations.length > 0)) return false;
-      if (activeFilter === 'done' && w.lane !== 'done') return false;
-      if (activeFilter !== 'done' && w.lane === 'done') return false;
-      if (searchQuery) {{
-        const hay = JSON.stringify(w).toLowerCase();
-        if (!hay.includes(searchQuery.toLowerCase())) return false;
-      }}
-      return true;
-    }});
+    const works = getVisibleWorks();
+    updateCollapseToggleUI(works);
 
     const container = document.getElementById('wb-cards-container');
     if (works.length === 0) {{
@@ -1293,7 +1400,9 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
         <article class="wb-card" data-work-id="${{esc(w.work_id)}}" data-lane="${{esc(w.lane)}}" data-collapsed="${{collapsed}}">
           <div class="wb-card-hdr" data-toggle-card="${{esc(w.work_id)}}">
             <div class="wb-card-hdr-main">
-              <span class="wb-chevron" aria-hidden="true">${{chevron}}</span>
+              <span class="wb-chevron" aria-hidden="true"
+                    title="Click to toggle · Alt-click to toggle all visible cards"
+                    >${{chevron}}</span>
               <div class="wb-hdr-stack">
                 <div class="wb-card-title">${{esc(w.title)}}</div>
                 <div class="wb-meta-row">
@@ -1352,22 +1461,19 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     }});
   }}
 
-  document.getElementById('wb-expand-all').addEventListener('click', () => {{
-    bulkCollapseMode = false;
-    collapsedOverrides = {{}};
-    saveCollapsePrefs();
-    render();
-  }});
-
-  document.getElementById('wb-collapse-all').addEventListener('click', () => {{
-    bulkCollapseMode = true;
-    collapsedOverrides = {{}};
-    saveCollapsePrefs();
+  // Scope toolbar toggle to currently visible cards without touching hidden tabs
+  document.getElementById('wb-toggle-collapse').addEventListener('click', () => {{
+    const works = getVisibleWorks();
+    const targetCollapsed = works.some((w) => !isCardCollapsed(w));
+    for (const w of works) setCardCollapsed(w, targetCollapsed);
+    if (!isSearchActive()) saveCollapsePrefs();
     render();
   }});
 
   document.getElementById('wb-search').addEventListener('input', (e) => {{
     searchQuery = e.target.value || '';
+    // Clear transient search collapse state on every new query
+    searchCollapsedOverrides = {{}};
     render();
   }});
 
@@ -1375,14 +1481,27 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     const target = e.target.closest('button, a, input');
     if (!target) {{
       const sel = window.getSelection ? String(window.getSelection()) : '';
-      if (sel) return;
+      // Skip collapse when selecting header text unless Alt-click explicitly requests bulk toggle
+      if (!e.altKey && sel) return;
       const hdr = e.target.closest('[data-toggle-card]');
       if (hdr) {{
         const wid = hdr.getAttribute('data-toggle-card');
         const cardEl = hdr.closest('.wb-card');
         const cur = cardEl ? cardEl.getAttribute('data-collapsed') === 'true' : false;
-        collapsedOverrides[wid] = !cur;
-        saveCollapsePrefs();
+        const works = getVisibleWorks();
+        if (e.altKey) {{
+          e.preventDefault();
+          const nextCollapsed = !cur;
+          for (const w of works) setCardCollapsed(w, nextCollapsed);
+        }} else {{
+          const clicked = works.find((w) => String(w.work_id) === String(wid));
+          if (clicked) {{
+            setCardCollapsed(clicked, !cur);
+          }} else if (!isSearchActive()) {{
+            collapsedOverrides[wid] = !cur;
+          }}
+        }}
+        if (!isSearchActive()) saveCollapsePrefs();
         render();
       }}
       return;
