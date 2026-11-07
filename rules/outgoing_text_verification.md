@@ -51,6 +51,7 @@ Code has a compiler; prose documents do not, and incoming specs or code snippets
      2. For non-trivial diffs, run the clean-context Hunter (`keeper_inquisitor`) + batched `keeper_skeptic` refutation pass (`plugins/keeper/agents/keeper_skeptic.md`) + `finding_ledger.py`.
      3. **Pre-Upload / Pre-Push Flutter Corpus Gate (`CORPUS-CHECK GUARD` in `pre_tool_guard.py`)**: Before `luci-auth context -- git cl upload`, `gh pr create`, or `git push` with executable production code changes:
         - Touching `modules/{skparagraph,skunicode,skshaper}/{src,include}/` -> run `flutter-test-paragraph-engine` (`run_flutter_paragraph_tests.py`).
+        - Touching `modules/{skparagraph,skunicode}/` -> also run the Flutter web CanvasKit suite `felt test --suite chrome-dart2js-canvaskit-canvaskit` (`engine/src/flutter/lib/web_ui`, CanvasKit rebuilt from the patched Skia submodule) on baseline and patched Skia. Its `canvaskit_api_test.dart` pins SkParagraph metrics that native and framework corpora never check (incident: Gerrit 1418376 broke the Flutter roll PR 196144 on `SkParagraph kitchensink`, `LineMetrics.left` 2.5 -> 0, and was reverted in Gerrit 1420816).
         - Touching `lib/web_ui/lib/` -> run `webparagraph-corpus` (`run_webparagraph_corpus.py`, Part 1 `felt` + Part 2 `packages/flutter`).
 
 2. **Bug Triage & Fixes -> Single-Bug Intake Gate (`paragraph-bug-prioritization`), Failing-Then-Passing Contract Test, and On-Demand `dual-version-bug-slide`**:
