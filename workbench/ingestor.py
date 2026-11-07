@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 from collections.abc import Mapping
 from datetime import datetime
+from email.utils import getaddresses
 import fcntl
 import glob
 import html as html_lib
@@ -29,6 +30,28 @@ DEFAULT_DOSSIERS_FILE = os.path.expanduser(
     "~/.gemini/jetski/brain/jetski-dossiers.json"
 )
 GMAIL_BIN = "/google/bin/releases/gemini-agents-gmail/gmail"
+# Cap small-group human threads above typical colleague CC lists while cutting 39-person blasts
+MAX_HUMAN_GROUP_RECIPIENTS = 8
+
+_NON_PERSONAL_CATEGORIES = frozenset({
+    "CATEGORY_PROMOTIONS",
+    "CATEGORY_UPDATES",
+    "CATEGORY_FORUMS",
+    "CATEGORY_SOCIAL",
+})
+_RE_AUTOMATED_SENDER_ADDR = re.compile(
+    r"(?:noreply|no-reply|donotreply|do-not-reply|calendar-notification"
+    r"|gemini-notes@google\.com|e-training@google\.com"
+    r"|peopleops-help@google\.com|\.appspotmail\.com"
+    r"|\.gserviceaccount\.com|\bmdb\.[^@\s]+@|\b(?:organizers|unsubscribe)@)",
+    re.IGNORECASE,
+)
+_RE_CALENDAR_SUBJECT = re.compile(
+    r"^(?:Accepted|Declined|Tentative|Invitation|Updated invitation|Canceled event)"
+    r"(?:\s+with\s+note)?:",
+    re.IGNORECASE,
+)
+_RE_MEETING_NOTES_SUBJECT = re.compile(r"^Notes:\s*[“\"']", re.IGNORECASE)
 
 RE_SKIA_GERRIT = re.compile(
     r"(?:skia-review\.googlesource\.com/c/skia/\+/|\bGerrit\s+|\b--change[=\s]+)(\d{6,8})\b",
@@ -1123,6 +1146,51 @@ def _is_me_sender(addr: str) -> bool:
   return disp in ("rusino", "jlavrova", "julia lavrova")
 
 
+def _extract_recipient_info(
+    headers_list: list[Mapping[str, str]],
+) -> tuple[bool, int]:
+  """Returns (me_addressed_in_to_or_cc, max_unique_recipient_count) across message headers."""
+  me_addressed = False
+  max_recipients = 0
+  for hdrs in headers_list:
+    raw_to = hdrs.get("to") or ""
+    raw_cc = hdrs.get("cc") or ""
+    parsed = getaddresses([raw_to, raw_cc])
+    uniq_addrs: set[str] = set()
+    for name, addr in parsed:
+      norm_addr = addr.strip().lower()
+      norm_name = name.strip().lower()
+      if norm_addr:
+        uniq_addrs.add(norm_addr)
+      elif norm_name:
+        uniq_addrs.add(norm_name)
+      if _is_me_sender(f"{name} <{addr}>"):
+        me_addressed = True
+    if len(uniq_addrs) > max_recipients:
+      max_recipients = len(uniq_addrs)
+  return me_addressed, max_recipients
+
+
+def _is_eligible_inbound_human_thread(prov: Mapping[str, Any]) -> bool:
+  """Returns True when an un-replied inbound thread is small-group personal mail to me."""
+  if prov.get("is_automated") or prov.get("is_drive_share"):
+    return False
+  if prov.get("in_trash_or_spam"):
+    return False
+  if not bool(prov.get("in_inbox", True)):
+    return False
+  if not bool(prov.get("has_personal_category", True)):
+    return False
+  if prov.get("has_non_personal_category"):
+    return False
+  if prov.get("is_bulk_or_list"):
+    return False
+  if not bool(prov.get("me_addressed")):
+    return False
+  rec_cnt = int(prov.get("recipient_count") or 0)
+  return 1 <= rec_cnt <= MAX_HUMAN_GROUP_RECIPIENTS
+
+
 def _fetch_gmail_thread_provenance(
     thread_id: str,
     thread_cache: dict[str, Any],
@@ -1135,7 +1203,7 @@ def _fetch_gmail_thread_provenance(
   cached = thread_cache.get(tid)
   if (
       isinstance(cached, Mapping)
-      and int(cached.get("schema_ver") or 0) == 2
+      and int(cached.get("schema_ver") or 0) == 4
       and (now - float(cached.get("fetched_at") or 0.0) < 600)
   ):
     return dict(cached)
@@ -1172,17 +1240,17 @@ def _fetch_gmail_thread_provenance(
     is_gh_issue = "notifications@github.com" in from0.lower() and bool(
         re.search(r"\(Issue\s+#\d+\)", raw_subj, flags=re.IGNORECASE)
     )
+    is_drive_share = bool(
+        re.search(r"\(via\s+google\s+(?:docs|slides|sheets|drive)\)", from0, flags=re.IGNORECASE)
+        or root_subj.lower().startswith(
+            ("document shared with you:", "presentation shared", "spreadsheet shared")
+        )
+    )
     is_automated = (
         bool(re.match(r"^CL\s+\d{8,10}\s+\((?:XS|S|M|L|XL)\)$", root_subj))
-        or "forms-receipts-noreply" in from0.lower()
-        or "calendar-notification" in from0.lower()
-        or bool(
-            re.match(
-                r"^(?:Accepted|Declined|Tentative|Invitation|Updated invitation|Canceled event):",
-                raw_subj,
-                flags=re.IGNORECASE,
-            )
-        )
+        or bool(_RE_AUTOMATED_SENDER_ADDR.search(from0))
+        or bool(_RE_CALENDAR_SUBJECT.match(raw_subj))
+        or bool(_RE_MEETING_NOTES_SUBJECT.match(root_subj))
         or "committers@chromium.org" in to0.lower()
     )
 
@@ -1194,10 +1262,26 @@ def _fetch_gmail_thread_provenance(
     non_bot_human_count = 0
     last_snippet = ""
     text_blocks: list[str] = [raw_subj] if raw_subj else []
+    # Preserve INBOX/TRASH/CATEGORY_PERSONAL only from Gmail labelIds across messages
+    has_labels_meta = False
+    in_inbox = False
+    all_trash_or_spam = True
+    last_labels: set[str] = set()
+    seen_personal_cat = False
+    seen_non_personal_cat = False
+    is_bulk_or_list = False
+    inbound_hdrs: list[dict[str, str]] = []
     for m in msgs:
       if not isinstance(m, Mapping):
         continue
       hm = _extract_msg_headers(m)
+      m_labels = set(m.get("labelIds") or [])
+      if "labelIds" in m:
+        has_labels_meta = True
+        if "INBOX" in m_labels and not ({"TRASH", "SPAM"} & m_labels):
+          in_inbox = True
+        if not ({"TRASH", "SPAM"} & m_labels):
+          all_trash_or_spam = False
       snip = str(m.get("snippet") or "")
       if snip:
         last_snippet = snip
@@ -1213,11 +1297,37 @@ def _fetch_gmail_thread_provenance(
       is_me = _is_me_sender(f_hdr)
       if is_me:
         sent_by_me = True
+      else:
+        inbound_hdrs.append(hm)
+        if _RE_AUTOMATED_SENDER_ADDR.search(f_hdr):
+          is_automated = True
+        if "CATEGORY_PERSONAL" in m_labels:
+          seen_personal_cat = True
+        if _NON_PERSONAL_CATEGORIES & m_labels:
+          seen_non_personal_cat = True
+        # GitHub @mention notifications intentionally carry List-Id/Precedence: list headers
+        if not is_gh_issue:
+          prec = str(hm.get("precedence") or "").strip().lower()
+          auto_sub = str(hm.get("auto-submitted") or "").strip().lower()
+          if (
+              hm.get("list-id")
+              or hm.get("list-unsubscribe")
+              or hm.get("x-google-group-id")
+              or hm.get("x-mailing-list")
+              or hm.get("feedback-id")
+              or prec in ("bulk", "list", "junk")
+              or auto_sub not in ("", "no")
+          ):
+            is_bulk_or_list = True
       if mts >= last_message_ts:
         last_message_ts = mts
         last_from_me = is_me
+        last_labels = m_labels
       cand_sender = _clean_display_name(f_hdr)
-      is_bot = "[bot]" in cand_sender.lower() or "noreply" in cand_sender.lower()
+      is_bot = (
+          "[bot]" in cand_sender.lower()
+          or bool(_RE_AUTOMATED_SENDER_ADDR.search(f_hdr))
+      )
       if not is_bot and cand_sender:
         non_bot_human_count += 1
       if not is_me and f_hdr and not is_bot:
@@ -1234,8 +1344,19 @@ def _fetch_gmail_thread_provenance(
               counterparty = cand
               break
 
+    in_trash_or_spam = bool({"TRASH", "SPAM"} & last_labels) or (
+        has_labels_meta and all_trash_or_spam
+    )
+    if not has_labels_meta:
+      in_inbox = True
+    has_personal_category = (not has_labels_meta) or (
+        seen_personal_cat and not seen_non_personal_cat
+    )
+    has_non_personal_category = seen_non_personal_cat
+    me_addressed, recipient_count = _extract_recipient_info(inbound_hdrs)
+
     prov = {
-        "schema_ver": 2,
+        "schema_ver": 4,
         "thread_id": tid,
         "origin_ts": origin_ts,
         "root_subject": root_subj,
@@ -1251,6 +1372,14 @@ def _fetch_gmail_thread_provenance(
         "non_bot_human_count": non_bot_human_count,
         "is_github_issue_thread": is_gh_issue,
         "is_automated": is_automated,
+        "is_drive_share": is_drive_share,
+        "in_inbox": in_inbox,
+        "in_trash_or_spam": in_trash_or_spam,
+        "has_personal_category": has_personal_category,
+        "has_non_personal_category": has_non_personal_category,
+        "is_bulk_or_list": is_bulk_or_list,
+        "me_addressed": me_addressed,
+        "recipient_count": recipient_count,
         "thread_text": "\n".join(text_blocks),
         "fetched_at": now,
     }
@@ -1285,6 +1414,8 @@ def ingest_gmail_drafts_and_threads(
     return unanswered
 
   thread_cache = watcher_state.setdefault("gmail_threads", {})
+  dismissed_keys = store.list_dismissed_tray_keys()
+  completed_thread_ts = store.list_completed_thread_timestamps()
 
   # 1. Inspect current drafts via gmail readonly drafts --json
   active_draft_ids: set[str] = set()
@@ -1492,10 +1623,13 @@ def ingest_gmail_drafts_and_threads(
       (
           "inbound",
           (
-              "newer_than:21d -from:noreply -from:gerrit -from:github.com"
+              "in:inbox category:personal newer_than:21d"
+              " -from:noreply -from:no-reply -from:donotreply -from:gerrit -from:github.com"
               " -from:buganizer -from:autoroll -from:luci"
               " -from:accounts@chromium.org -to:committers@chromium.org"
               " -from:forms-receipts-noreply@google.com"
+              " -from:calendar-notification@google.com"
+              " -from:gemini-notes@google.com -from:e-training@google.com"
           ),
           "30",
       ),
@@ -1538,7 +1672,7 @@ def ingest_gmail_drafts_and_threads(
         root_subj = str(t_prov.get("root_subject") or m.get("subject") or "").strip()
         if not root_subj or not cp:
           continue
-        if "unsubscribe" in cp.lower() or "noreply" in cp.lower():
+        if any(tok in cp.lower() for tok in ("unsubscribe", "noreply", "organizers")):
           continue
         if pass_kind == "gh_issue":
           if not t_prov.get("is_github_issue_thread"):
@@ -1546,6 +1680,10 @@ def ingest_gmail_drafts_and_threads(
           if int(t_prov.get("non_bot_human_count") or 0) < 1:
             continue
         elif t_prov.get("is_automated") and not t_prov.get("sent_by_me"):
+          if store.get_artifact(f"gmail_thread:{tid}") is not None:
+            store.upsert_artifact(
+                f"gmail_thread:{tid}", kind="gmail_thread", state=t_prov, now=cur_now
+            )
           continue
 
         t_key = f"gmail_thread:{tid}"
@@ -1559,11 +1697,19 @@ def ingest_gmail_drafts_and_threads(
             for akey, akind, aurl in t_arts
             if akind in ("gerrit", "github_pr", "piper", "buganizer", "github_issue", "gdoc")
         ]
+        tech_primaries = [x for x in raw_primaries if x[1] != "gdoc"]
+        is_drive_share = bool(
+            t_prov.get("is_drive_share")
+            or root_subj.lower().startswith(
+                ("document shared with you:", "presentation shared", "spreadsheet shared")
+            )
+        )
         # Skip automated/Drive share notifications that reference zero technical artifacts
-        if not raw_primaries and (
-            t_prov.get("is_automated")
-            or root_subj.lower().startswith(("document shared with you:", "presentation shared"))
-        ):
+        if not tech_primaries and (t_prov.get("is_automated") or is_drive_share):
+          if store.get_artifact(t_key) is not None:
+            store.upsert_artifact(
+                t_key, kind="gmail_thread", title=t_title, url=t_url, state=t_prov, now=cur_now
+            )
           continue
 
         # Separate passing CL citations in the email body from focused primary targets
@@ -1643,6 +1789,35 @@ def ingest_gmail_drafts_and_threads(
           if w_match and w_match not in matched_wids:
             matched_wids.append(w_match)
 
+        # Skip dismissed, completed, or ineligible bulk/list/promotional inbound mail
+        done_ts = completed_thread_ts.get(t_key)
+        if (
+            done_ts is not None
+            and not existing_tid_wid
+            and float(t_prov.get("last_message_ts") or 0.0) <= done_ts
+        ):
+          continue
+        if t_key in dismissed_keys and not t_prov.get("sent_by_me"):
+          if existing_tid_wid:
+            store.upsert_artifact(
+                t_key, kind="gmail_thread", title=t_title, url=t_url, state=t_prov, now=cur_now
+            )
+          continue
+        if not t_prov.get("sent_by_me") and not t_prov.get("is_github_issue_thread"):
+          ineligible_inbound = (
+              (t_prov.get("is_automated") and (not matched_wids or t_prov.get("is_bulk_or_list")))
+              or (
+                  not t_prov.get("is_automated")
+                  and not _is_eligible_inbound_human_thread(t_prov)
+              )
+          )
+          if ineligible_inbound:
+            if existing_tid_wid:
+              store.upsert_artifact(
+                  t_key, kind="gmail_thread", title=t_title, url=t_url, state=t_prov, now=cur_now
+              )
+            continue
+
         bug_refs = [
             akey for akey, akind, _ in t_primaries if akind in ("buganizer", "github_issue")
         ]
@@ -1659,8 +1834,14 @@ def ingest_gmail_drafts_and_threads(
             or open_review_works >= 2
         )
 
-        # Case 1: Zero-artifact human correspondence
-        if not t_primaries:
+        # Case 1: Zero-artifact human correspondence (or un-replied doc-only inbound mail)
+        if not t_primaries or (
+            not tech_primaries
+            and not t_prov.get("sent_by_me")
+            and not existing_tid_wid
+            and not matched_wids
+            and not t_prov.get("is_github_issue_thread")
+        ):
           if existing_tid_wid or t_prov.get("sent_by_me"):
             target_wid = existing_tid_wid or store.create_work(root_subj, now=cur_now)
             store.upsert_artifact(
@@ -1694,6 +1875,7 @@ def ingest_gmail_drafts_and_threads(
                 "subject": root_subj,
                 "snippet": str(t_prov.get("last_snippet") or m.get("snippet") or "")[:140],
                 "url": t_url,
+                "last_message_ts": float(t_prov.get("last_message_ts") or 0.0),
                 "bound_work_id": "",
             })
           continue
@@ -1955,10 +2137,14 @@ def run_sync_cycle(
           now=cur_now,
       )
 
+  if int(w_state.get("unanswered_tray_schema") or 0) < 4:
+    w_state["unanswered_tray"] = []
+    w_state["unanswered_tray_schema"] = 4
   unanswered = w_state.get("unanswered_tray") or []
   if include_gmail and (cur_now - float(w_state.get("last_gmail_sync") or 0.0) >= 90):
     unanswered = ingest_gmail_drafts_and_threads(store, w_state, now=cur_now)
     w_state["unanswered_tray"] = unanswered
+    w_state["unanswered_tray_schema"] = 4
     w_state["last_gmail_sync"] = cur_now
 
   store.purge_config_artifacts_and_works(now=cur_now)

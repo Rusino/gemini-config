@@ -1555,6 +1555,530 @@ class TestWorkbenchContracts(unittest.TestCase):
     self.assertGreater(corr_pos, 0)
     self.assertGreater(chk_pos, corr_pos)
 
+  def test_unanswered_tray_structural_filter_and_dismiss(self) -> None:
+    import base64
+    from unittest import mock
+    import ingestor
+    import work_store
+    import workbench_server
+
+    store = work_store.WorkStore(self.db_path)
+    now = 1762400000.0
+
+    def _b64(s: str) -> str:
+      return base64.urlsafe_b64encode(s.encode("utf-8")).decode("ascii")
+
+    mass_to_9 = (
+        ", ".join(f"eng{i}@google.com" for i in range(8))
+        + ", Julia Lavrova <jlavrova@google.com>"
+    )
+    ok_cc_8 = ", ".join(f"col{i}@google.com" for i in range(6)) + ", jlavrova@google.com"
+    threads_data = {
+        "t_promo": {
+            "messages": [{
+                "internalDate": str(int((now - 1000) * 1000)),
+                "labelIds": ["CATEGORY_PROMOTIONS", "IMPORTANT"],
+                "snippet": "Early Black Friday Access: 10% Off Sitewide",
+                "payload": {
+                    "headers": [
+                        {
+                            "name": "Subject",
+                            "value": "Early Black Friday Access: 10% Off Sitewide",
+                        },
+                        {
+                            "name": "From",
+                            "value": "Bokksu Boutique <hello@mail.bokksuboutique.com>",
+                        },
+                        {"name": "To", "value": "<jlavrova@google.com>"},
+                        {
+                            "name": "List-Unsubscribe",
+                            "value": "<https://click.bokksuboutique.com/ocu/x>",
+                        },
+                        {"name": "Precedence", "value": "bulk"},
+                    ],
+                    "body": {"data": _b64("10% off")},
+                },
+            }]
+        },
+        "t_list_doc": {
+            "messages": [{
+                "internalDate": str(int((now - 1100) * 1000)),
+                "labelIds": ["INBOX", "CATEGORY_FORUMS", "IMPORTANT"],
+                "snippet": "Document shared with chrome-eng",
+                "payload": {
+                    "headers": [
+                        {
+                            "name": "Subject",
+                            "value": 'Document shared with you: "One-pager: Chrome Spoofer"',
+                        },
+                        {"name": "From", "value": "Terry Shi (via Google Docs) <tshi@google.com>"},
+                        {"name": "To", "value": "chrome-eng@google.com"},
+                        {"name": "List-Id", "value": "<chrome-eng.google.com>"},
+                        {"name": "Precedence", "value": "list"},
+                    ],
+                    "body": {
+                        "data": _b64(
+                            '<a href="https://docs.google.com/document/d/'
+                            '1abcDefGhiJklMnOpQrStUvWxYz0123456789/edit">Open doc</a>'
+                        )
+                    },
+                },
+            }]
+        },
+        "t_personal_doc_share": {
+            "messages": [{
+                "internalDate": str(int((now - 1120) * 1000)),
+                "labelIds": ["INBOX", "CATEGORY_PERSONAL", "IMPORTANT"],
+                "snippet": "Terry Shi shared a document with you",
+                "payload": {
+                    "headers": [
+                        {
+                            "name": "Subject",
+                            "value": 'Document shared with you: "Direct Doc Share Note"',
+                        },
+                        {"name": "From", "value": "Terry Shi (via Google Docs) <tshi@google.com>"},
+                        {"name": "To", "value": "jlavrova@google.com"},
+                    ],
+                    "body": {
+                        "data": _b64(
+                            '<a href="https://docs.google.com/document/d/'
+                            '1DirectShareDocIdWith44Characters0123456789/edit">Open</a>'
+                        )
+                    },
+                },
+            }]
+        },
+        "t_mass": {
+            "messages": [{
+                "internalDate": str(int((now - 1200) * 1000)),
+                "labelIds": ["INBOX", "CATEGORY_PERSONAL", "IMPORTANT"],
+                "snippet": "Please add monthly updates in Taskflow",
+                "payload": {
+                    "headers": [
+                        {
+                            "name": "Subject",
+                            "value": "October updates on H2 projects in Taskflow",
+                        },
+                        {"name": "From", "value": "Rakshit Sharma <sharaks@google.com>"},
+                        {"name": "To", "value": mass_to_9},
+                    ],
+                    "body": {"data": _b64("Hi everyone, please update Taskflow.")},
+                },
+            }]
+        },
+        "t_crstatus": {
+            "messages": [{
+                "internalDate": str(int((now - 1300) * 1000)),
+                "labelIds": ["INBOX", "CATEGORY_UPDATES", "IMPORTANT"],
+                "snippet": "Verify shipping feature",
+                "payload": {
+                    "headers": [
+                        {
+                            "name": "Subject",
+                            "value": "[Action required] Verify shipping feature",
+                        },
+                        {
+                            "name": "From",
+                            "value": "Chromestatus <admin@cr-status.appspotmail.com>",
+                        },
+                        {"name": "To", "value": "jlavrova@google.com"},
+                    ],
+                    "body": {"data": _b64("Please verify your M159 feature.")},
+                },
+            }]
+        },
+        "t_notes": {
+            "messages": [{
+                "internalDate": str(int((now - 1400) * 1000)),
+                "labelIds": ["INBOX", "CATEGORY_PERSONAL", "IMPORTANT"],
+                "snippet": "Meeting notes summary",
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": 'Notes: "SkoreText/Flutter Sync"'},
+                        {"name": "From", "value": "Gemini <gemini-notes@google.com>"},
+                        {"name": "To", "value": "jlavrova@google.com"},
+                    ],
+                    "body": {"data": _b64("Summary of meeting notes.")},
+                },
+            }]
+        },
+        "t_calnote": {
+            "messages": [{
+                "internalDate": str(int((now - 1500) * 1000)),
+                "labelIds": ["INBOX", "CATEGORY_PERSONAL", "IMPORTANT"],
+                "snippet": "Updated invitation with note",
+                "payload": {
+                    "headers": [
+                        {
+                            "name": "Subject",
+                            "value": "Updated invitation with note: Mouad / Julia @ Wed 2:30pm",
+                        },
+                        {"name": "From", "value": "Mouad Debbar <mdebbar@google.com>"},
+                        {"name": "To", "value": "jlavrova@google.com"},
+                    ],
+                    "body": {"data": _b64("Moving 30 mins later.")},
+                },
+            }]
+        },
+        "t_calcanceled": {
+            "messages": [{
+                "internalDate": str(int((now - 1510) * 1000)),
+                "labelIds": ["INBOX", "CATEGORY_PERSONAL"],
+                "snippet": "Canceled event with note",
+                "payload": {
+                    "headers": [
+                        {
+                            "name": "Subject",
+                            "value": "Canceled event with note: Weekly Sync",
+                        },
+                        {"name": "From", "value": "Mouad Debbar <mdebbar@google.com>"},
+                        {"name": "To", "value": "jlavrova@google.com"},
+                    ],
+                    "body": {"data": _b64("Rescheduling to next week.")},
+                },
+            }]
+        },
+        "t_no_category": {
+            "messages": [{
+                "internalDate": str(int((now - 1520) * 1000)),
+                "labelIds": ["INBOX", "IMPORTANT"],
+                "snippet": "Missing CATEGORY_PERSONAL label",
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "System alert without category"},
+                        {"name": "From", "value": "Team Bot <team@google.com>"},
+                        {"name": "To", "value": "jlavrova@google.com"},
+                    ],
+                    "body": {"data": _b64("Uncategorized system alert.")},
+                },
+            }]
+        },
+        "t_mixed_cat": {
+            "messages": [
+                {
+                    "internalDate": str(int((now - 1540) * 1000)),
+                    "labelIds": ["INBOX", "CATEGORY_PERSONAL"],
+                    "snippet": "Initial personal ping",
+                    "payload": {
+                        "headers": [
+                            {"name": "Subject", "value": "Mixed category thread"},
+                            {"name": "From", "value": "Alex <alex@google.com>"},
+                            {"name": "To", "value": "jlavrova@google.com"},
+                        ],
+                        "body": {"data": _b64("Initial message")},
+                    },
+                },
+                {
+                    "internalDate": str(int((now - 1530) * 1000)),
+                    "labelIds": ["INBOX", "CATEGORY_UPDATES"],
+                    "snippet": "Follow-up update",
+                    "payload": {
+                        "headers": [
+                            {"name": "Subject", "value": "Re: Mixed category thread"},
+                            {"name": "From", "value": "Tracker <updates@example.com>"},
+                            {"name": "To", "value": "jlavrova@google.com"},
+                        ],
+                        "body": {"data": _b64("Automated update")},
+                    },
+                },
+            ]
+        },
+        "t_organizers": {
+            "messages": [{
+                "internalDate": str(int((now - 1550) * 1000)),
+                "labelIds": ["INBOX", "CATEGORY_PERSONAL"],
+                "snippet": "Conference logistics",
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "BlinkOn logistics"},
+                        {"name": "From", "value": "BlinkOn <organizers@example.com>"},
+                        {"name": "To", "value": "jlavrova@google.com"},
+                    ],
+                    "body": {"data": _b64("Welcome to BlinkOn.")},
+                },
+            }]
+        },
+        "t_not_to_me": {
+            "messages": [{
+                "internalDate": str(int((now - 1560) * 1000)),
+                "labelIds": ["INBOX", "CATEGORY_PERSONAL"],
+                "snippet": "Delivered via BCC/alias without me in To/Cc",
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "FYI alias blast"},
+                        {"name": "From", "value": "Peer <peer@google.com>"},
+                        {"name": "To", "value": "skia-team-alias@google.com"},
+                    ],
+                    "body": {"data": _b64("Team announcement.")},
+                },
+            }]
+        },
+        "t_role_headers": {
+            "messages": [{
+                "internalDate": str(int((now - 1570) * 1000)),
+                "labelIds": ["INBOX", "CATEGORY_PERSONAL"],
+                "snippet": "Auto-submitted message",
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "Training reminder"},
+                        {"name": "From", "value": "Ops <peopleops-help@google.com>"},
+                        {"name": "To", "value": "jlavrova@google.com"},
+                        {"name": "Auto-Submitted", "value": "auto-generated"},
+                    ],
+                    "body": {"data": _b64("Complete training.")},
+                },
+            }]
+        },
+        "t_archived": {
+            "messages": [{
+                "internalDate": str(int((now - 1600) * 1000)),
+                "labelIds": ["CATEGORY_PERSONAL", "IMPORTANT"],
+                "snippet": "Already archived personal note",
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "Old archived question"},
+                        {"name": "From", "value": "Greg Daniel <egdaniel@google.com>"},
+                        {"name": "To", "value": "jlavrova@google.com"},
+                    ],
+                    "body": {"data": _b64("Quick archived question")},
+                },
+            }]
+        },
+        "t_human_ok": {
+            "messages": [{
+                "internalDate": str(int((now - 500) * 1000)),
+                "labelIds": ["INBOX", "CATEGORY_PERSONAL", "IMPORTANT"],
+                "snippet": "Can we align on TextClusters API tomorrow?",
+                "payload": {
+                    "headers": [
+                        {
+                            "name": "Subject",
+                            "value": 'Re: "TextClusters" API" onmouseover="alert(1)',
+                        },
+                        {"name": "From", "value": "Florin Malita <fmalita@google.com>"},
+                        {
+                            "name": "To",
+                            "value": (
+                                "Mouad Debbar <mdebbar@google.com>, "
+                                "Julia Lavrova <jlavrova@google.com>"
+                            ),
+                        },
+                    ],
+                    "body": {"data": _b64("Can we align on TextClusters API tomorrow?")},
+                },
+            }]
+        },
+        "t_human_cc8": {
+            "messages": [{
+                "internalDate": str(int((now - 550) * 1000)),
+                "labelIds": ["INBOX", "CATEGORY_PERSONAL"],
+                "snippet": "Fontations small-group thread at 8 recipients",
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "Fontations rollout question"},
+                        {"name": "From", "value": "Dominik Röttsches <drott@chromium.org>"},
+                        {"name": "To", "value": "bungeman@google.com"},
+                        {"name": "Cc", "value": ok_cc_8},
+                    ],
+                    "body": {"data": _b64("Quick question about Fontations.")},
+                },
+            }]
+        },
+        "t_human_dismiss_me": {
+            "messages": [{
+                "internalDate": str(int((now - 600) * 1000)),
+                "labelIds": ["INBOX", "CATEGORY_PERSONAL", "IMPORTANT"],
+                "snippet": "Coffee chat next week?",
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "Coffee chat next week?"},
+                        {"name": "From", "value": "Heather Miller <hcm@google.com>"},
+                        {"name": "To", "value": "Julia Lavrova <jlavrova@google.com>"},
+                    ],
+                    "body": {"data": _b64("Want to grab coffee next week?")},
+                },
+            }]
+        },
+    }
+
+    # Pre-seed an old auto-leaked standalone un-replied promo Work (B6 regression check)
+    leaked_wid = store.create_work("Early Black Friday Access: 10% Off Sitewide", now=now - 2000)
+    store.upsert_artifact(
+        "gmail_thread:t_promo",
+        kind="gmail_thread",
+        title="Early Black Friday Access",
+        url="https://mail.google.com/mail/u/0/#all/t_promo",
+        state={"sent_by_me": False},
+        now=now - 2000,
+    )
+    store.link_artifact(
+        leaked_wid,
+        "gmail_thread:t_promo",
+        role="primary",
+        source="auto",
+        link_reason="gmail_root",
+        now=now - 2000,
+    )
+
+    inbound_queries: list[str] = []
+
+    def fake_gmail_run(cmd, *args, **kwargs):
+      del args, kwargs
+      res = subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+      if "drafts" in cmd:
+        res.stdout = json.dumps({"drafts": []})
+      elif "search" in cmd:
+        q = " ".join(cmd)
+        if "category:personal" in q or "newer_than:21d -from:noreply" in q:
+          inbound_queries.append(q)
+          res.stdout = json.dumps({
+              "messages": [
+                  {"id": f"m_{tid}", "threadId": tid} for tid in threads_data
+              ]
+          })
+        else:
+          res.stdout = json.dumps({"messages": []})
+      elif "get-thread" in cmd:
+        tid = cmd[cmd.index("get-thread") + 1]
+        res.stdout = json.dumps(threads_data.get(tid, {"messages": []}))
+      return res
+
+    w_state: dict[str, Any] = {}
+    with mock.patch("os.path.isfile", return_value=True), mock.patch(
+        "subprocess.run", side_effect=fake_gmail_run
+    ):
+      tray = ingestor.ingest_gmail_drafts_and_threads(store, w_state, now=now)
+
+    # 1. Inbound query enforces Inbox + Personal category
+    self.assertTrue(inbound_queries)
+    self.assertIn("in:inbox", inbound_queries[0])
+    self.assertIn("category:personal", inbound_queries[0])
+
+    # 2. Only the 3 genuine <=8-recipient INBOX/CATEGORY_PERSONAL human threads survive
+    tray_tids = {t["thread_id"] for t in tray}
+    self.assertEqual(tray_tids, {"t_human_ok", "t_human_cc8", "t_human_dismiss_me"})
+
+    # 3. Drive shares & pre-existing ineligible standalone email Works must NOT stay in Works
+    store.purge_config_artifacts_and_works(now=now)
+    work_titles = [w["title"] for w in store.list_works()]
+    self.assertFalse(
+        any("Chrome Spoofer" in wt or "Direct Doc Share" in wt for wt in work_titles),
+        f"Drive share thread leaked into Works: {work_titles}",
+    )
+    self.assertFalse(
+        any("Black Friday" in wt for wt in work_titles),
+        f"Pre-existing promo Work survived purge: {work_titles}",
+    )
+
+    # 4. workctl.py dismiss with a bare hex thread ID must normalize to gmail_thread:<tid>
+    workctl_py = os.path.join(WORKBENCH_DIR, "workctl.py")
+    cli_env = os.environ.copy()
+    cli_env["WORKBENCH_DB_PATH"] = self.db_path
+    subprocess.run(
+        [sys.executable, workctl_py, "dismiss", "deadbeef00001111"],
+        env=cli_env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    self.assertIn("gmail_thread:deadbeef00001111", store.list_dismissed_tray_keys())
+
+    # 5. Dismissing via API immediately filters projection and survives re-sync
+    w_state["unanswered_tray"] = tray
+    with open(self.state_path, "w", encoding="utf-8") as f:
+      json.dump(w_state, f)
+    with open(self.cl_state_path, "w", encoding="utf-8") as f:
+      json.dump({"items": {}, "bugs": {}}, f)
+
+    srv = workbench_server.create_server(
+        host="127.0.0.1",
+        port=0,
+        store=store,
+        cl_state_path=self.cl_state_path,
+        watcher_state_path=self.state_path,
+        info_path=self.info_path,
+    )
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+      req = urllib.request.Request(
+          f"http://127.0.0.1:{port}/api/tray/dismiss",
+          data=json.dumps({"artifact_key": "gmail_thread:t_human_dismiss_me"}).encode("utf-8"),
+          headers={"Content-Type": "application/json"},
+          method="POST",
+      )
+      with urllib.request.urlopen(req, timeout=5) as resp:
+        self.assertEqual(resp.status, 200)
+        after_dismiss = json.loads(resp.read().decode("utf-8"))
+
+      self.assertEqual(
+          {x["thread_id"] for x in after_dismiss["unanswered_tray"]},
+          {"t_human_ok", "t_human_cc8"},
+      )
+      self.assertEqual(after_dismiss["counts"]["unanswered"], 2)
+
+      # Re-sync must not re-introduce the dismissed thread
+      with mock.patch("os.path.isfile", return_value=True), mock.patch(
+          "subprocess.run", side_effect=fake_gmail_run
+      ):
+        tray_after = ingestor.ingest_gmail_drafts_and_threads(store, w_state, now=now + 60)
+      self.assertEqual(
+          {x["thread_id"] for x in tray_after},
+          {"t_human_ok", "t_human_cc8"},
+      )
+
+      # Promoting t_human_ok hides it immediately, and completing it keeps it hidden (N2)
+      req_prom = urllib.request.Request(
+          f"http://127.0.0.1:{port}/api/work/create",
+          data=json.dumps({
+              "title": "TextClusters API alignment",
+              "primaries": [],
+              "channels": ["gmail_thread:t_human_ok"],
+          }).encode("utf-8"),
+          headers={"Content-Type": "application/json"},
+          method="POST",
+      )
+      with urllib.request.urlopen(req_prom, timeout=5) as resp:
+        after_promote = json.loads(resp.read().decode("utf-8"))
+      self.assertEqual(
+          [x["thread_id"] for x in after_promote["unanswered_tray"]],
+          ["t_human_cc8"],
+      )
+      prom_wid = [
+          w["work_id"] for w in after_promote["works"] if w["title"] == "TextClusters API alignment"
+      ][0]
+      req_done = urllib.request.Request(
+          f"http://127.0.0.1:{port}/api/work/done",
+          data=json.dumps({"work_id": prom_wid}).encode("utf-8"),
+          headers={"Content-Type": "application/json"},
+          method="POST",
+      )
+      with urllib.request.urlopen(req_done, timeout=5) as resp:
+        after_done = json.loads(resp.read().decode("utf-8"))
+      self.assertEqual(
+          [x["thread_id"] for x in after_done["unanswered_tray"]],
+          ["t_human_cc8"],
+      )
+      with mock.patch("os.path.isfile", return_value=True), mock.patch(
+          "subprocess.run", side_effect=fake_gmail_run
+      ):
+        tray_after_done = ingestor.ingest_gmail_drafts_and_threads(store, w_state, now=now + 120)
+      self.assertEqual(
+          [x["thread_id"] for x in tray_after_done],
+          ["t_human_cc8"],
+      )
+
+      html_out = workbench_server.render_workbench_html(after_dismiss, ui_version=1)
+      self.assertIn("data-dismiss-thread", html_out)
+      self.assertIn("data-promote-thread", html_out)
+      self.assertIn('rel="noopener"', html_out)
+      # JS esc() must escape double/single quotes to prevent attribute breakout in tray rows
+      self.assertIn("&quot;", html_out)
+    finally:
+      srv.shutdown()
+      srv.server_close()
+
 
 if __name__ == "__main__":
   unittest.main()

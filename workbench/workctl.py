@@ -112,6 +112,9 @@ def main(argv: list[str] | None = None) -> int:
   p_metrics.add_argument("--days", type=int, default=14)
   p_metrics.add_argument("--json", action="store_true")
 
+  p_dismiss = sub.add_parser("dismiss", help="Dismiss a thread from Unanswered Human Threads")
+  p_dismiss.add_argument("artifact_key")
+
   args = parser.parse_args(argv)
   store = work_store.WorkStore(args.db or None)
 
@@ -200,6 +203,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
       for k, v in m.items():
         print(f"{k}: {v}")
+    return 0
+
+  if args.cmd == "dismiss":
+    print(store.dismiss_tray_thread(args.artifact_key))
     return 0
 
   return 0

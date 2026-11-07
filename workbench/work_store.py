@@ -1570,6 +1570,70 @@ class WorkStore:
         d["state"] = {}
       return d
 
+  def dismiss_tray_thread(self, artifact_key: str, now: float | None = None) -> str:
+    """Marks a Gmail/Chat thread artifact as dismissed from the Unanswered Human Threads tray."""
+    cur_now = time.time() if now is None else now
+    raw = str(artifact_key or "").strip()
+    if not raw:
+      raise ValueError("Empty tray thread artifact_key")
+    if raw.lower().startswith("thread:"):
+      raw = "gmail_thread:" + raw.split(":", 1)[1].strip()
+    elif ":" not in raw and re.fullmatch(r"[0-9a-f]{15,16}", raw, flags=re.IGNORECASE):
+      raw = f"gmail_thread:{raw.lower()}"
+    akey = canonicalize_artifact_key(raw)
+    akind = artifact_kind_from_key(akey)
+    if akind not in ("gmail_thread", "gchat_thread"):
+      raise ValueError(f"Unsupported tray thread artifact_key: {artifact_key}")
+    self.upsert_artifact(
+        akey,
+        kind=akind,
+        state={"tray_dismissed": True, "tray_dismissed_at": cur_now},
+        now=cur_now,
+    )
+    with self._lock, self._connect() as conn:
+      self._log_event(
+          conn,
+          "tray_dismissed",
+          artifact_key=akey,
+          payload={"dismissed_at": cur_now},
+          now=cur_now,
+      )
+    return akey
+
+  def list_dismissed_tray_keys(self) -> set[str]:
+    """Returns canonical artifact_keys dismissed from the Unanswered Human Threads tray."""
+    dismissed: set[str] = set()
+    with self._lock, self._connect() as conn:
+      rows = conn.execute(
+          "SELECT artifact_key, state_json FROM artifacts "
+          "WHERE kind IN ('gmail_thread', 'gchat_thread') "
+          "AND state_json LIKE '%tray_dismissed%'"
+      ).fetchall()
+    for r in rows:
+      try:
+        st = json.loads(r["state_json"] or "{}")
+      except Exception:
+        st = {}
+      if isinstance(st, Mapping) and bool(st.get("tray_dismissed")):
+        dismissed.add(canonicalize_artifact_key(str(r["artifact_key"])))
+    return dismissed
+
+  def list_completed_thread_timestamps(self) -> dict[str, float]:
+    """Returns max completion timestamp per thread linked to a completed Work."""
+    completed: dict[str, float] = {}
+    with self._lock, self._connect() as conn:
+      rows = conn.execute(
+          "SELECT wl.artifact_key, MAX(w.updated_at) AS done_ts "
+          "FROM work_links wl JOIN works w ON w.work_id = wl.work_id "
+          "WHERE w.status = 'done' AND wl.role IN ('primary', 'channel') "
+          "GROUP BY wl.artifact_key"
+      ).fetchall()
+    for r in rows:
+      akey = canonicalize_artifact_key(str(r["artifact_key"] or ""))
+      if akey.startswith(("gmail_thread:", "gchat_thread:")):
+        completed[akey] = float(r["done_ts"] or 0.0)
+    return completed
+
   def upsert_artifact(
       self,
       artifact_key: str,
@@ -2408,7 +2472,51 @@ class WorkStore:
         channels = [l for l in w_links if l["role"] == "channel"]
         cfg_proj = is_config_project(str(w.get("project_id") or ""))
         cfg_title = is_config_text(str(w.get("title") or ""))
-        if not primaries or ((cfg_proj or cfg_title) and not channels):
+        try:
+          w_meta = json.loads(w.get("meta_json") or "{}")
+        except Exception:
+          w_meta = {}
+        is_manual_work = bool(w_meta.get("title_manual")) or any(
+            str(l.get("source") or "") == "manual" for l in w_links
+        )
+        non_ctx_keys = [str(l["artifact_key"]) for l in primaries + channels]
+        gmail_keys = [k for k in non_ctx_keys if k.startswith("gmail_thread:")]
+        only_email_or_doc = bool(gmail_keys) and all(
+            k.startswith(("gmail_thread:", "gdoc:")) for k in non_ctx_keys
+        )
+        ineligible_standalone_email = False
+        if not is_manual_work and only_email_or_doc:
+          ineligible_standalone_email = True
+          for gk in gmail_keys:
+            ar_g = art_rows.get(gk) or {}
+            try:
+              st_g = json.loads(ar_g.get("state_json") or "{}")
+            except Exception:
+              st_g = {}
+            if st_g.get("sent_by_me") or st_g.get("is_github_issue_thread"):
+              ineligible_standalone_email = False
+              break
+            if st_g.get("tray_dismissed"):
+              continue
+            if int(st_g.get("schema_ver") or 0) >= 4 and (
+                st_g.get("is_automated")
+                or st_g.get("is_drive_share")
+                or st_g.get("in_trash_or_spam")
+                or not bool(st_g.get("in_inbox", True))
+                or not bool(st_g.get("has_personal_category", True))
+                or st_g.get("has_non_personal_category")
+                or st_g.get("is_bulk_or_list")
+                or not bool(st_g.get("me_addressed"))
+                or not (1 <= int(st_g.get("recipient_count") or 0) <= 8)
+            ):
+              continue
+            ineligible_standalone_email = False
+            break
+        if (
+            not primaries
+            or ((cfg_proj or cfg_title) and not channels)
+            or ineligible_standalone_email
+        ):
           conn.execute(
               "UPDATE works SET status = 'archived', updated_at = ? WHERE work_id = ?",
               (cur_now, wid),
@@ -2808,7 +2916,27 @@ class WorkStore:
             -float(c.get("updated_at") or 0.0),
         )
     )
-    tray = list(unanswered_threads or [])
+    # Exclude dismissed threads, active linked threads, and completed threads without newer replies
+    dismissed_keys = self.list_dismissed_tray_keys()
+    completed_thread_ts = self.list_completed_thread_timestamps()
+    with self._lock, self._connect() as conn:
+      active_linked_keys = {
+          canonicalize_artifact_key(str(r["artifact_key"]))
+          for r in conn.execute(
+              "SELECT wl.artifact_key FROM work_links wl "
+              "JOIN works w ON w.work_id = wl.work_id "
+              "WHERE w.status NOT IN ('done', 'archived')"
+          ).fetchall()
+      }
+    tray: list[dict[str, Any]] = []
+    for t in unanswered_threads or []:
+      t_akey = canonicalize_artifact_key(str(t.get("artifact_key") or ""))
+      if t_akey in dismissed_keys or t_akey in active_linked_keys:
+        continue
+      done_ts = completed_thread_ts.get(t_akey)
+      if done_ts is not None and float(t.get("last_message_ts") or 0.0) <= done_ts:
+        continue
+      tray.append(t)
     counts = {
         "needs_you": sum(1 for c in cards if c["lane"] == "needs-you"),
         "waiting": sum(1 for c in cards if c["lane"] == "waiting"),

@@ -434,6 +434,21 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     border-top: 1px solid rgba(180, 83, 9, 0.12);
     font-size: 11.5px;
   }}
+  .wb-tray-btns {{
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+  }}
+  .wb-btn-dismiss {{
+    padding: 3px 6px;
+    color: var(--muted);
+  }}
+  .wb-btn-dismiss:hover {{
+    color: var(--urgent);
+    border-color: rgba(217, 48, 37, 0.45);
+    background: rgba(217, 48, 37, 0.06);
+  }}
   .wb-sec-hdr {{
     display: flex;
     align-items: center;
@@ -993,7 +1008,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   function esc(s) {{
     const d = document.createElement('div');
     d.textContent = String(s || '');
-    return d.innerHTML;
+    return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }}
 
   async function postJson(url, body) {{
@@ -1045,15 +1060,24 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     if (tray.length === 0) {{
       trayEl.innerHTML = '';
     }} else {{
-      const rows = tray.map((t) => `
+      const rows = tray.map((t) => {{
+        const safeUrl = /^https?:\\/\\//i.test(String(t.url || '')) ? esc(t.url) : '#';
+        return `
         <div class="wb-tray-row">
           <div style="min-width:0;flex:1">
             <strong>${{esc(t.sender)}}</strong> ·
-            <a href="${{esc(t.url)}}" target="_blank" style="color:var(--text)">${{esc(t.subject)}}</a>
+            <a href="${{safeUrl}}" target="_blank" rel="noopener"
+               style="color:var(--text)">${{esc(t.subject)}}</a>
           </div>
-          <button class="wb-btn" data-promote-thread="${{esc(t.artifact_key)}}" data-promote-subj="${{esc(t.subject)}}" type="button">+ Work</button>
+          <div class="wb-tray-btns">
+            <button class="wb-btn" data-promote-thread="${{esc(t.artifact_key)}}"
+                    data-promote-subj="${{esc(t.subject)}}" type="button">+ Work</button>
+            <button class="wb-btn wb-btn-dismiss" data-dismiss-thread="${{esc(t.artifact_key)}}"
+                    title="Dismiss thread" aria-label="Dismiss thread" type="button">✕</button>
+          </div>
         </div>
-      `).join('');
+      `;
+      }}).join('');
       trayEl.innerHTML = `
         <div class="wb-tray">
           <div class="wb-tray-hdr"><span>📨 Unanswered Human Threads (${{tray.length}})</span></div>
@@ -1400,6 +1424,11 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       }});
       return;
     }}
+    if (target.hasAttribute('data-dismiss-thread')) {{
+      const akey = target.getAttribute('data-dismiss-thread');
+      void postJson('/api/tray/dismiss', {{ artifact_key: akey }});
+      return;
+    }}
     if (target.hasAttribute('data-add-ob')) {{
       const wid = target.getAttribute('data-add-ob');
       const desc = window.prompt('Obligation description (e.g. Reply to Renzo once rolled):');
@@ -1584,6 +1613,17 @@ def create_server(
         ob_id = str(body.get("obligation_id") or "")
         if ob_id:
           active_store.mark_obligation_done(ob_id)
+        self._send_json(current_projection())
+        return
+
+      if parsed.path == "/api/tray/dismiss":
+        akey = str(body.get("artifact_key") or "").strip()
+        if akey:
+          try:
+            active_store.dismiss_tray_thread(akey)
+          except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
         self._send_json(current_projection())
         return
 
