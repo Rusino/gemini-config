@@ -1199,6 +1199,362 @@ class TestWorkbenchContracts(unittest.TestCase):
     self.assertIn("wb-mentions", html_out)
     self.assertIn("📎 Упомянуто в чате (2)", html_out)
 
+  def test_hybrid_correspondence_first_cards_and_full_body_ingestor(self) -> None:
+    import base64
+    from unittest import mock
+    import ingestor
+    import work_store
+    import workbench_server
+
+    now = 1762475000.0
+    store = work_store.WorkStore(db_path=self.db_path)
+
+    extracted = ingestor.extract_artifacts_from_text(
+        "See http://cl/829409333 and CL 785449435 "
+        "and gmail readonly get-thread 1a1acda5f4631fb4 --json"
+    )
+    ext_keys = [k for k, _, _ in extracted]
+    self.assertIn("piper:829409333", ext_keys)
+    self.assertIn("piper:785449435", ext_keys)
+    self.assertIn("gmail_thread:1a1acda5f4631fb4", ext_keys)
+
+    w_issue_only = store.create_work("github_issue:flutter/flutter:185368", now=now - 3600)
+    store.upsert_artifact(
+        "github_issue:flutter/flutter:185368",
+        kind="github_issue",
+        title="flutter#185368: Engine benchmarks are no longer running after monorepo",
+        url="https://github.com/flutter/flutter/issues/185368",
+        state={"status": "OPEN"},
+        now=now - 3600,
+    )
+    store.link_artifact(
+        w_issue_only,
+        "github_issue:flutter/flutter:185368",
+        role="primary",
+        source="auto",
+        now=now - 3600,
+    )
+    store.purge_config_artifacts_and_works(now=now - 3500)
+    active_wids = {w["work_id"] for w in store.list_works()}
+    self.assertIn(w_issue_only, active_wids)
+
+    w_span = store.create_work(
+        "1414543: [core] Make SkSpan ctor checks debug-only", now=now - 7200
+    )
+    store.upsert_artifact(
+        "gerrit:skia:1414543",
+        kind="gerrit",
+        title="1414543: [core] Make SkSpan ctor checks debug-only",
+        url="https://skia-review.googlesource.com/c/skia/+/1414543",
+        state={"status": "MERGED", "origin_ts": now - 7200},
+        now=now - 7200,
+    )
+    store.link_artifact(
+        w_span, "gerrit:skia:1414543", role="primary", source="auto", now=now - 7200
+    )
+
+    w_nano = store.create_work(
+        "1414546: [skparagraph] Revive SkParagraph nanobench", now=now - 7000
+    )
+    store.upsert_artifact(
+        "gerrit:skia:1414546",
+        kind="gerrit",
+        title="1414546: [skparagraph] Revive SkParagraph nanobench",
+        url="https://skia-review.googlesource.com/c/skia/+/1414546",
+        state={"status": "MERGED", "origin_ts": now - 7000},
+        now=now - 7000,
+    )
+    store.link_artifact(
+        w_nano, "gerrit:skia:1414546", role="primary", source="auto", now=now - 7000
+    )
+
+    w_open1 = store.create_work("1414016: Measure hit glyph", now=now - 80000)
+    store.upsert_artifact(
+        "gerrit:skia:1414016",
+        kind="gerrit",
+        title="1414016: Measure hit glyph",
+        url="https://skia-review.googlesource.com/c/skia/+/1414016",
+        state={"status": "NEW", "origin_ts": now - 80000},
+        now=now - 80000,
+    )
+    store.link_artifact(
+        w_open1, "gerrit:skia:1414016", role="primary", source="auto", now=now - 80000
+    )
+
+    w_open2 = store.create_work("1420016: Unify span background height", now=now - 75000)
+    store.upsert_artifact(
+        "gerrit:skia:1420016",
+        kind="gerrit",
+        title="1420016: Unify span background height",
+        url="https://skia-review.googlesource.com/c/skia/+/1420016",
+        state={"status": "NEW", "origin_ts": now - 75000},
+        now=now - 75000,
+    )
+    store.link_artifact(
+        w_open2, "gerrit:skia:1420016", role="primary", source="auto", now=now - 75000
+    )
+
+    def _b64(s: str) -> str:
+      return base64.urlsafe_b64encode(s.encode("utf-8")).decode("ascii")
+
+    # Multipart HTML body where links exist only in the decoded HTML part, not the snippet
+    skspan_msg1_html = (
+        '<p>We filed <a href="https://github.com/flutter/flutter/issues/185368">'
+        "flutter#185368</a> and landed "
+        '<a href="https://skia-review.googlesource.com/c/skia/+/1414543">1414543</a>.</p>'
+    )
+    skspan_msg3_html = (
+        '<p>Also revived nanobench in '
+        '<a href="https://skia-review.googlesource.com/c/skia/+/1414546">1414546</a>.</p>'
+        "<blockquote>On Nov 5 Aaron wrote: old quote with Gerrit 9999999</blockquote>"
+    )
+    gh_issue_msg_html = (
+        "<p>@Rusino Actually one thing that is preventing running these is Firebase TestLab.</p>"
+        '<p><a href="https://github.com/flutter/flutter/issues/185368#issuecomment-6694545581">'
+        "View it on GitHub</a></p>"
+    )
+    digest_msg_html = (
+        "<p>Summary of 4 bugs and 2 open CLs: "
+        "flutter#160251, flutter#155062, flutter#40936, flutter#141080, "
+        "Gerrit 1414016, Gerrit 1420016.</p>"
+    )
+
+    seen_cmds: list[list[str]] = []
+
+    def fake_gmail_run(cmd, *args, **kwargs):
+      del args, kwargs
+      seen_cmds.append(list(cmd))
+      # Guard against invalid --max-results flag
+      for token in cmd:
+        if token.startswith("--max-results"):
+          return subprocess.CompletedProcess(
+              cmd, 1, stdout="", stderr="unknown flag --max-results"
+          )
+      res = subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+      if "drafts" in cmd:
+        res.stdout = json.dumps({"drafts": []})
+      elif "search" in cmd:
+        q = " ".join(cmd)
+        if "from:me" in q:
+          res.stdout = json.dumps({
+              "messages": [
+                  {"id": "m1", "threadId": "1a1acda5f4631fb4"},
+                  {"id": "m2", "threadId": "1a19f47b74ee2fb4"},
+                  {"id": "m3", "threadId": "1a1aa99999999999"},
+              ]
+          })
+        elif "notifications@github.com" in q:
+          res.stdout = json.dumps({
+              "messages": [
+                  {"id": "m4", "threadId": "1a1adc4087cc656b"},
+              ]
+          })
+        else:
+          res.stdout = json.dumps({"messages": []})
+      elif "get-thread" in cmd:
+        tid = cmd[cmd.index("get-thread") + 1]
+        if tid == "1a1acda5f4631fb4":
+          res.stdout = json.dumps({
+              "messages": [
+                  {
+                      "internalDate": str(int((now - 10000) * 1000)),
+                      "snippet": "Short 160-char snippet with no URLs at all",
+                      "payload": {
+                          "mimeType": "multipart/alternative",
+                          "headers": [
+                              {
+                                  "name": "Subject",
+                                  "value": (
+                                      "Engine benchmarks (txt_benchmarks) never reach the Perf "
+                                      "dashboard: a 20% SkParagraph regression went unnoticed"
+                                  ),
+                              },
+                              {"name": "From", "value": "Julia Lavrova <jlavrova@google.com>"},
+                              {
+                                  "name": "To",
+                                  "value": (
+                                      "Casey Hillers <codefu@google.com>, "
+                                      "Jim Graham <jimgraham@google.com>"
+                                  ),
+                              },
+                          ],
+                          "parts": [
+                              {"mimeType": "text/html", "body": {"data": _b64(skspan_msg1_html)}}
+                          ],
+                      },
+                  },
+                  {
+                      "internalDate": str(int((now - 9500) * 1000)),
+                      "snippet": "Thanks for flagging this",
+                      "payload": {
+                          "mimeType": "text/plain",
+                          "headers": [
+                              {
+                                  "name": "Subject",
+                                  "value": "Re: Engine benchmarks (txt_benchmarks)",
+                              },
+                              {"name": "From", "value": "Aaron Clarke <aaclarke@google.com>"},
+                              {"name": "To", "value": "Julia Lavrova <jlavrova@google.com>"},
+                          ],
+                          "body": {"data": _b64("Thanks for flagging this")},
+                      },
+                  },
+                  {
+                      "internalDate": str(int((now - 9000) * 1000)),
+                      "snippet": "Short snippet without 1414546",
+                      "payload": {
+                          "mimeType": "multipart/alternative",
+                          "headers": [
+                              {
+                                  "name": "Subject",
+                                  "value": "Re: Engine benchmarks (txt_benchmarks)",
+                              },
+                              {"name": "From", "value": "Julia Lavrova <jlavrova@google.com>"},
+                              {"name": "To", "value": "Aaron Clarke <aaclarke@google.com>"},
+                          ],
+                          "parts": [
+                              {"mimeType": "text/html", "body": {"data": _b64(skspan_msg3_html)}}
+                          ],
+                      },
+                  },
+              ]
+          })
+        elif tid == "1a1adc4087cc656b":
+          res.stdout = json.dumps({
+              "messages": [
+                  {
+                      "internalDate": str(int((now - 600) * 1000)),
+                      "snippet": "Jim Graham commented on #185368",
+                      "payload": {
+                          "mimeType": "text/html",
+                          "headers": [
+                              {
+                                  "name": "Subject",
+                                  "value": (
+                                      "Re: [flutter/flutter] Engine benchmarks are no longer "
+                                      "running after monorepo (Issue #185368)"
+                                  ),
+                              },
+                              {"name": "From", "value": "Jim Graham <notifications@github.com>"},
+                              {
+                                  "name": "To",
+                                  "value": "flutter/flutter <flutter@noreply.github.com>",
+                              },
+                              {
+                                  "name": "Cc",
+                                  "value": (
+                                      "Rusino <jlavrova@google.com>, "
+                                      "Mention <mention@noreply.github.com>"
+                                  ),
+                              },
+                          ],
+                          "body": {"data": _b64(gh_issue_msg_html)},
+                      },
+                  }
+              ]
+          })
+        elif tid == "1a19f47b74ee2fb4":
+          res.stdout = json.dumps({
+              "messages": [
+                  {
+                      "internalDate": str(int((now - 50000) * 1000)),
+                      "snippet": "Hi Kaylee, here are my thoughts on ShapedText API",
+                      "payload": {
+                          "mimeType": "text/plain",
+                          "headers": [
+                              {"name": "Subject", "value": "Re: ShapedText"},
+                              {"name": "From", "value": "Julia Lavrova <jlavrova@google.com>"},
+                              {"name": "To", "value": "Kaylee Lubick <kjlubick@google.com>"},
+                          ],
+                          "body": {
+                              "data": _b64("Hi Kaylee, here are my thoughts on ShapedText API.")
+                          },
+                      },
+                  }
+              ]
+          })
+        elif tid == "1a1aa99999999999":
+          res.stdout = json.dumps({
+              "messages": [
+                  {
+                      "internalDate": str(int((now - 1000) * 1000)),
+                      "snippet": "Weekly status digest",
+                      "payload": {
+                          "mimeType": "text/html",
+                          "headers": [
+                              {"name": "Subject", "value": "Weekly status digest"},
+                              {"name": "From", "value": "Julia Lavrova <jlavrova@google.com>"},
+                              {"name": "To", "value": "Renzo Olivares <roliv@google.com>"},
+                          ],
+                          "body": {"data": _b64(digest_msg_html)},
+                      },
+                  }
+              ]
+          })
+      return res
+
+    w_state: dict[str, Any] = {"active_draft_ids": ["r999999999999999999"]}
+    store.upsert_artifact(
+        "gmail_draft:r999999999999999999",
+        kind="gmail_draft",
+        title="Draft: Old draft",
+        state={"status": "DRAFT"},
+        now=now - 100,
+    )
+    with mock.patch("os.path.isfile", return_value=True), mock.patch(
+        "subprocess.run", side_effect=fake_gmail_run
+    ):
+      ingestor.ingest_gmail_drafts_and_threads(store, w_state, now=now)
+
+    # Last disappearing draft must be marked SENT even when active_draft_ids is now empty
+    gone_draft = store.get_artifact("gmail_draft:r999999999999999999")
+    self.assertIsNotNone(gone_draft)
+    self.assertEqual((gone_draft or {}).get("state", {}).get("status"), "SENT")
+
+    proj = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now)
+
+    skspan_cards = [
+        w
+        for w in proj["works"]
+        if any(a["artifact_key"] == "gerrit:skia:1414543" for a in w["artifacts"])
+    ]
+    self.assertEqual(len(skspan_cards), 1)
+    sk_card = skspan_cards[0]
+    self.assertIn("Engine benchmarks (txt_benchmarks)", sk_card["title"])
+    sk_arts = {a["artifact_key"]: a for a in sk_card["artifacts"]}
+    self.assertIn("gmail_thread:1a1acda5f4631fb4", sk_arts)
+    self.assertIn("gmail_thread:1a1adc4087cc656b", sk_arts)
+    self.assertIn("github_issue:flutter/flutter:185368", sk_arts)
+    self.assertIn("gerrit:skia:1414543", sk_arts)
+    self.assertIn("gerrit:skia:1414546", sk_arts)
+    self.assertNotIn("gerrit:skia:9999999", sk_arts)
+    self.assertEqual(sk_card["lane"], "needs-you")
+
+    shaped_cards = [w for w in proj["works"] if "ShapedText" in w["title"]]
+    self.assertEqual(len(shaped_cards), 1)
+    self.assertEqual(
+        shaped_cards[0]["artifacts"][0]["artifact_key"], "gmail_thread:1a19f47b74ee2fb4"
+    )
+    self.assertEqual(shaped_cards[0]["artifacts"][0]["why_badge"], "основа карточки")
+
+    open1_card = [w for w in proj["works"] if w["work_id"] == w_open1][0]
+    open2_card = [w for w in proj["works"] if w["work_id"] == w_open2][0]
+    self.assertNotEqual(open1_card["work_id"], open2_card["work_id"])
+    self.assertEqual(open1_card["title"], "1414016: Measure hit glyph")
+    self.assertEqual(open2_card["title"], "1420016: Unify span background height")
+    open1_arts = {a["artifact_key"]: a for a in open1_card["artifacts"]}
+    self.assertIn("gmail_thread:1a1aa99999999999", open1_arts)
+    self.assertEqual(open1_arts["gmail_thread:1a1aa99999999999"]["role"], "context_only")
+    self.assertEqual(open1_arts["gmail_thread:1a1aa99999999999"]["why_badge"], "упомянуто в сводке")
+
+    html_out = workbench_server.render_workbench_html(proj, ui_version=1)
+    self.assertIn("wb-correspondence", html_out)
+    self.assertIn("1414546", html_out)
+    corr_pos = html_out.find("wb-correspondence")
+    chk_pos = html_out.find("wb-checklist")
+    self.assertGreater(corr_pos, 0)
+    self.assertGreater(chk_pos, corr_pos)
+
 
 if __name__ == "__main__":
   unittest.main()

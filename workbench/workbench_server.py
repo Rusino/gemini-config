@@ -161,17 +161,18 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
         if chk_rows_ssr
         else ""
     )
-    has_chk = bool(chk_rows_ssr)
+    corr_arts_ssr = [
+        a
+        for a in (w.get("artifacts") or [])
+        if a.get("role") != "context_only"
+        and a.get("kind") in ("gmail_thread", "gmail_draft", "gchat_thread")
+    ]
     main_arts_ssr = [
         a
         for a in (w.get("artifacts") or [])
         if a.get("role") != "context_only"
         and str(a.get("artifact_key") or "") not in chk_covered
-        and (
-            not has_chk
-            or a.get("kind")
-            in ("gmail_thread", "gmail_draft", "gchat_thread", "gdoc", "chat_chain")
-        )
+        and a.get("kind") not in ("gmail_thread", "gmail_draft", "gchat_thread")
     ]
     mention_arts_ssr = [
         a
@@ -179,6 +180,23 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
         if a.get("role") == "context_only"
         and str(a.get("artifact_key") or "") not in chk_covered
     ]
+    corr_pills_ssr = "".join(
+        f'<div class="wb-pill" data-kind="{_esc(a.get("kind"))}" '
+        f'title="{_esc(a.get("why_tooltip") or "")}">'
+        f'{_esc(a.get("icon"))} {_esc(a.get("title"))}'
+        + (
+            f' <span class="wb-why">· {_esc(a.get("why_badge"))}</span>'
+            if a.get("why_badge")
+            else ""
+        )
+        + "</div>"
+        for a in corr_arts_ssr
+    )
+    corr_html = (
+        f'<div class="wb-correspondence">{corr_pills_ssr}</div>'
+        if corr_arts_ssr
+        else ""
+    )
     pills_html = "".join(
         f'<div class="wb-pill" data-kind="{_esc(a.get("kind"))}" '
         f'title="{_esc(a.get("why_tooltip") or "")}">'
@@ -216,7 +234,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
         f'<strong class="wb-card-title">{title}</strong>'
         f'<div class="wb-meta-row"><span class="wb-lane-tag">{lane}</span></div>'
         f"{origin_ssr}</div></div>"
-        f'<div class="wb-card-body">{obs_html}{chk_html}'
+        f'<div class="wb-card-body">{corr_html}{obs_html}{chk_html}'
         f"<div class='wb-pills'>{pills_html}</div>{mentions_ssr}</div></article>"
     )
   ssr_body = "\n".join(cards_ssr)
@@ -613,6 +631,16 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     border: 1px solid rgba(0, 113, 227, 0.22);
     padding: 1px 7px;
     border-radius: 999px;
+  }}
+  .wb-correspondence {{
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+    padding: 6px 8px;
+    border-radius: 7px;
+    background: #f8fafc;
+    border: 1px solid rgba(0, 113, 227, 0.18);
   }}
   .wb-checklist {{
     display: flex;
@@ -1175,21 +1203,15 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       }}).join('');
       const checklistHtml = chkRowsHtml ? `<div class="wb-checklist">${{chkRowsHtml}}</div>` : '';
 
-      const hasChk = chkItems.length > 0;
+      const corrPills = (w.artifacts || []).filter((a) => {{
+        if (a.role === 'context_only') return false;
+        return ['gmail_thread', 'gmail_draft', 'gchat_thread'].includes(a.kind);
+      }});
       let chatPillCount = 0;
       const visiblePills = (w.artifacts || []).filter((a) => {{
         if (a.role === 'context_only') return false;
         if (chkCovered.has(a.artifact_key)) return false;
-        if (hasChk) {{
-          const isChannelKind = [
-            'gmail_thread',
-            'gmail_draft',
-            'gchat_thread',
-            'gdoc',
-            'chat_chain',
-          ].includes(a.kind);
-          if (!isChannelKind) return false;
-        }}
+        if (['gmail_thread', 'gmail_draft', 'gchat_thread'].includes(a.kind)) return false;
         if (a.kind === 'chat_chain') {{
           const isRawChat = /^Chat\\s+[0-9a-f]{{6,}}$/i.test(String(a.title || ''));
           if (isRawChat && chatPillCount >= 1) return false;
@@ -1224,6 +1246,9 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
           </div>
         `;
       }};
+      const corrHtml = corrPills.length
+        ? `<div class="wb-correspondence">${{corrPills.map(renderPillItem).join('')}}</div>`
+        : '';
       const pillsHtml = visiblePills.map(renderPillItem).join('');
       const mentionsHtml = mentionPills.length
         ? `<details class="wb-mentions">
@@ -1259,6 +1284,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
           </div>
           <div class="wb-card-body">
             ${{reasonsHtml ? `<div class="wb-reasons">${{reasonsHtml}}</div>` : ''}}
+            ${{corrHtml}}
             ${{obsHtml}}
             ${{checklistHtml}}
             ${{pillsHtml ? `<div class="wb-pills">${{pillsHtml}}</div>` : ''}}
@@ -1566,7 +1592,7 @@ def create_server(
             active_store,
             cl_state_path=cl_state_path,
             watcher_state_path=watcher_state_path,
-            include_gmail=False,
+            include_gmail=True,
         )
         self._send_json(current_projection())
         return

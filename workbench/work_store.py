@@ -29,6 +29,7 @@ ET_ZONE = ZoneInfo("America/New_York")
 STALLED_OBLIGATION_DAYS = 7
 CANDIDATE_TTL_DAYS = 7
 HUB_BUG_COUNT_THRESHOLD = 3
+HUB_CORRESPONDENCE_TASK_THRESHOLD = 3
 
 CONFIG_PROJECT_IDS = frozenset({
     "04508c43-54a0-4003-8051-7129cd997b88",  # Improving Experience
@@ -507,30 +508,45 @@ def resolve_work_origin_and_title(
     st = a.get("state") or {}
     ots = float(st.get("origin_ts") or st.get("created_ts") or 0.0)
     kind = str(a.get("kind") or "")
-    # Group email and chat threads separately so correspondence can be tested as causal root
+    # Group non-context human correspondence separately so it can act as causal root
     if kind in ("gmail_thread", "gchat_thread"):
-      correspondence_arts.append((ots, a))
+      if a.get("role") != "context_only" and not st.get("is_automated"):
+        correspondence_arts.append((ots, a))
     elif ots > 0 and a.get("role") != "context_only":
       other_arts.append((ots, a))
 
-  correspondence_arts.sort(key=lambda x: (x[0] if x[0] > 0 else float("inf")))
+  # Prefer primary non-issue email threads first, then earlier timestamps
+  correspondence_arts.sort(
+      key=lambda x: (
+          0
+          if (
+              x[1].get("role") == "primary"
+              and not (x[1].get("state") or {}).get("is_github_issue_thread")
+          )
+          else (1 if x[1].get("role") == "primary" else 2),
+          x[0] if x[0] > 0 else float("inf"),
+      )
+  )
   other_arts.sort(key=lambda x: x[0])
 
   origin_art: dict[str, Any] | None = None
   origin_ts = 0.0
   earliest_other_ts = other_arts[0][0] if other_arts else 0.0
-  code_or_bug_count = sum(
-      1
+  has_active_draft = any(
+      a.get("kind") == "gmail_draft"
+      and a.get("role") != "context_only"
+      and str((a.get("state") or {}).get("status") or "DRAFT").upper() == "DRAFT"
       for a in w_arts
-      if a.get("kind") in ("gerrit", "github_pr", "piper", "buganizer", "github_issue")
   )
 
-  # Human correspondence predating implementation (or coordinating >=2 items) is the root cause
+  # Primary correspondence root, active draft thread, or correspondence predating work wins
   if correspondence_arts:
     c_ts, c_art = correspondence_arts[0]
     if (
-        (c_ts > 0 and (earliest_other_ts <= 0 or c_ts <= earliest_other_ts + 86400))
-        or code_or_bug_count >= 2
+        c_art.get("role") == "primary"
+        or c_art.get("link_reason") == "gmail_root"
+        or has_active_draft
+        or (c_ts > 0 and (earliest_other_ts <= 0 or c_ts <= earliest_other_ts + 86400))
     ):
       origin_art = c_art
       origin_ts = c_ts
@@ -599,7 +615,24 @@ def resolve_work_origin_and_title(
         return f"{root_subj} — {cp}", origin_info
       return root_subj, origin_info
 
-  if not is_placeholder_title(cleaned) and not is_config_text(cleaned):
+  # Discard cached titles that came from a context_only digest thread
+  is_stale_context_corr_title = False
+  for a in w_arts:
+    if a.get("role") == "context_only" and a.get("kind") in (
+        "gmail_thread",
+        "gchat_thread",
+    ):
+      st_a = a.get("state") or {}
+      r_subj = str(st_a.get("root_subject") or "").strip()
+      if r_subj and cleaned.lower().startswith(r_subj.lower()):
+        is_stale_context_corr_title = True
+        break
+
+  if (
+      not is_placeholder_title(cleaned)
+      and not is_config_text(cleaned)
+      and not is_stale_context_corr_title
+  ):
     return cleaned, origin_info
 
   # Upgrade placeholder/raw-key or config-polluted work titles from rich primary/channel artifacts
@@ -854,6 +887,12 @@ def compute_artifact_provenance(
     )
     return badge, tip
 
+  if reason == "gmail_digest_ref":
+    return (
+        "упомянуто в сводке",
+        detail or "Упомянуто в сводном письме (открытые карточки не слиты)",
+    )
+
   if role == "context_only" or reason == "chat_mention":
     badge = "упомянут в чате"
     for a in w_arts:
@@ -917,6 +956,10 @@ def compute_artifact_provenance(
     return "черновик ответа", detail or "Черновик письма в Gmail со ссылками на артефакты задачи"
 
   if kind == "gmail_thread":
+    if st.get("is_github_issue_thread") or reason == "github_issue_thread":
+      return "дискуссия в issue", detail or "Живое обсуждение в комментариях GitHub Issue"
+    if role == "primary" or reason == "gmail_root":
+      return "основа карточки", detail or "Корневая переписка, объединяющая артефакты задачи"
     return "переписка по задаче", detail or "Цепочка писем в Gmail, связанная с артефактами задачи"
 
   if kind == "chat_chain":
@@ -1518,7 +1561,14 @@ class WorkStore:
           "SELECT * FROM artifacts WHERE artifact_key = ?",
           (akey,),
       ).fetchone()
-      return dict(row) if row else None
+      if not row:
+        return None
+      d = dict(row)
+      try:
+        d["state"] = json.loads(d.get("state_json") or "{}")
+      except Exception:
+        d["state"] = {}
+      return d
 
   def upsert_artifact(
       self,
@@ -2062,7 +2112,11 @@ class WorkStore:
             )
 
   def merge_works(
-      self, target_work_id: str, source_work_id: str, now: float | None = None
+      self,
+      target_work_id: str,
+      source_work_id: str,
+      source: str = "manual",
+      now: float | None = None,
   ) -> None:
     if target_work_id == source_work_id:
       return
@@ -2070,10 +2124,13 @@ class WorkStore:
     with self._lock, self._connect() as conn:
       conn.execute(
           "INSERT OR IGNORE INTO work_links "
-          "(work_id, artifact_key, role, source, confidence, created_at) "
-          "SELECT ?, artifact_key, role, 'manual', confidence, ? "
-          "FROM work_links WHERE work_id = ?",
-          (target_work_id, cur_now, source_work_id),
+          "(work_id, artifact_key, role, source, confidence, created_at, link_reason, link_detail) "
+          "SELECT ?, artifact_key, role, ?, confidence, ?, link_reason, link_detail "
+          "FROM work_links WHERE work_id = ? "
+          "AND (? = 'manual' OR artifact_key NOT IN ("
+          "  SELECT artifact_key FROM negative_links WHERE work_id = ?"
+          "))",
+          (target_work_id, source, cur_now, source_work_id, source, target_work_id),
       )
       conn.execute(
           "UPDATE obligations SET work_id = ? WHERE work_id = ?",
@@ -2277,7 +2334,8 @@ class WorkStore:
     if not open_obs and not active_cls and not open_bugs and artifacts:
       # Check if all primary CLs are merged and there are no unsent drafts
       has_merged = any(
-          str((a.get("state") or {}).get("status") or "").upper() == "MERGED"
+          a.get("role") != "context_only"
+          and str((a.get("state") or {}).get("status") or "").upper() == "MERGED"
           for a in artifacts
       )
       if has_merged:
@@ -2350,8 +2408,7 @@ class WorkStore:
         channels = [l for l in w_links if l["role"] == "channel"]
         cfg_proj = is_config_project(str(w.get("project_id") or ""))
         cfg_title = is_config_text(str(w.get("title") or ""))
-        placeholder_only = is_placeholder_title(str(w.get("title") or "")) and not channels
-        if not primaries or placeholder_only or ((cfg_proj or cfg_title) and not channels):
+        if not primaries or ((cfg_proj or cfg_title) and not channels):
           conn.execute(
               "UPDATE works SET status = 'archived', updated_at = ? WHERE work_id = ?",
               (cur_now, wid),
@@ -2359,7 +2416,7 @@ class WorkStore:
           conn.execute("DELETE FROM work_links WHERE work_id = ?", (wid,))
           works_archived += 1
           continue
-        if cfg_proj or cfg_title:
+        if cfg_proj or cfg_title or is_placeholder_title(str(w.get("title") or "")):
           w_arts: list[dict[str, Any]] = []
           for wl in w_links:
             ak = str(wl["artifact_key"])
@@ -2626,6 +2683,25 @@ class WorkStore:
             art_item["link_reason"] = "companion_wip"
           else:
             art_item["link_reason"] = "auto"
+      # Order non-context correspondence first so cards and API consumers lead with correspondence
+      w_arts.sort(
+          key=lambda a: (
+              0
+              if (
+                  a.get("role") != "context_only"
+                  and a.get("kind") in ("gmail_thread", "gmail_draft", "gchat_thread")
+                  and a.get("role") == "primary"
+              )
+              else (
+                  1
+                  if (
+                      a.get("role") != "context_only"
+                      and a.get("kind") in ("gmail_thread", "gmail_draft", "gchat_thread")
+                  )
+                  else (2 if a.get("role") != "context_only" else 3)
+              )
+          )
+      )
       has_primary = any(a.get("role") == "primary" for a in w_arts)
       has_channel = any(a.get("role") == "channel" for a in w_arts)
       if (is_config_project(raw_proj) or is_config_text(raw_w_title)) and not (
