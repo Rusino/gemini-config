@@ -6892,7 +6892,7 @@ global.clearTimeout = (id) => {
     'Forbidden BoN model pick must auto-migrate to non-BoN profile model'
   );
 
-  // If user picks 0% dead model (1393), emergency floor (< 5%) rescues it
+  // R132: If user manually picks a 0% senior model (1393), preserve the manual pin without overriding
   reduxStore.dispatch({
     type: 'modelSelection/modelPicked',
     payload: {
@@ -6901,13 +6901,14 @@ global.clearTimeout = (id) => {
     },
   });
   await new Promise((r) => setImmediate(r));
-  assert.notStrictEqual(
+  assert.strictEqual(
     storeState.modelSelection.byConversation['chat-cpp-1'].model,
     1393,
-    '0% model pick must trigger emergency rescue'
+    'R132: manual user pick of 0% model must be preserved without automatic downgrade'
   );
+  window.__jetskiManualPickedModels.delete('chat-cpp-1');
 
-  // 7. ConnectRPC fetch gate: outgoing SendUserCascadeMessage with 0% planModel rewritten
+  // 7. ConnectRPC fetch gate: outgoing SendUserCascadeMessage with unpinned 0% planModel rewritten
   outgoingFetchCalls = [];
   await global.window.fetch(
     '/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage',
@@ -10967,6 +10968,7 @@ function makeNativeConfig(label, enumVal, modelId, remaining, resetIso) {
 
 let opusQuota = 0.10;
 let opusResetIso = '2026-10-30T08:30:00Z';
+let carbonPoolQuota = 0.85;
 let orchQuota = 0.96;
 let orchResetIso = '2026-10-30T08:30:00Z';
 
@@ -10975,6 +10977,13 @@ function buildUserStatus() {
     makeNativeConfig('Gemini Pro Next', 1260, 'auto', 0.98, '2026-10-30T08:30:00Z'),
     makeNativeConfig('Claude Opus 5.5 (High)', 1370, 'opus-5.5-high', opusQuota, opusResetIso),
     makeNativeConfig('Claude Opus 5.5 (Medium)', 1369, 'opus-5.5-medium', opusQuota, opusResetIso),
+    makeNativeConfig(
+      'Gemini 4 Carbon (High)',
+      1427,
+      'gemini-4-carbon-high',
+      carbonPoolQuota,
+      opusResetIso
+    ),
     makeNativeConfig(
       'Gemini 3.8 Flash (High)',
       1320,
@@ -11030,6 +11039,12 @@ function buildAvailableModels() {
           model: 'MODEL_PLACEHOLDER_M371',
           supportsImages: true,
           quotaInfo: { remainingFraction: opusQuota, resetTime: opusResetIso },
+        },
+        'gemini-4-carbon-high': {
+          displayName: 'Gemini 4 Carbon (High)',
+          model: 'MODEL_PLACEHOLDER_M427',
+          supportsImages: true,
+          quotaInfo: { remainingFraction: carbonPoolQuota, resetTime: orchResetIso },
         },
         'gemini-pro-coordinator': {
           displayName: 'Gemini Pro Orchestrator',
@@ -11239,11 +11254,11 @@ async function refreshCatalogInStore() {
     await new Promise((r) => setImmediate(r));
     await new Promise((r) => setImmediate(r));
 
-    // Unpinned evening failover (Opus 10% -> Orchestrator 1415), then morning recovery
+    // Unpinned evening failover (Opus 10% -> Carbon High 1427), then morning recovery
     assert.strictEqual(
       storeState.modelSelection.byConversation['chat-unpinned-cpp'].model,
-      1415,
-      'Evening exhausted Opus (10%) must fail over unpinned chat to Orchestrator (1415)'
+      1427,
+      'Evening exhausted Opus (10%) must fail over unpinned cpp-core chat to Carbon High (1427)'
     );
 
     // Next morning: Opus quota resets to 100% and resetTime rolls to next day
@@ -11258,8 +11273,9 @@ async function refreshCatalogInStore() {
       'Unpinned chat must automatically recover to Opus 5.5 Medium (1369) on morning quota reset'
     );
 
-    // Hysteresis: dipping Opus to 22% (>= 15% hard floor, < 30% soft floor) keeps 1369
+    // Hysteresis: dipping Opus to 22% (>= 15% hard floor, < 30% soft floor) when Carbon is < 42% keeps 1369
     opusQuota = 0.22;
+    carbonPoolQuota = 0.35;
     await refreshCatalogInStore();
     assert.strictEqual(
       storeState.modelSelection.byConversation['chat-unpinned-cpp'].model,
@@ -11267,8 +11283,9 @@ async function refreshCatalogInStore() {
       'Unpinned chat already on Opus must keep 1369 inside the 15%-30% hysteresis band'
     );
 
-    // Restore Opus to 90% for subsequent tests
+    // Restore Opus to 90% and Carbon to 85% for subsequent tests
     opusQuota = 0.90;
+    carbonPoolQuota = 0.85;
     await refreshCatalogInStore();
 
     // Manual upgrade is permanent ONLY on this cascadeId (never leaks to drafts or siblings)
@@ -11686,8 +11703,9 @@ async function refreshCatalogInStore() {
     );
     subscribers.length = origSub.length;
 
-    // When all flagship models are exhausted (0% quota), chat on 1037 (3.1 Pro) upgrades to
-    // Gemini 3.8 Flash (High) (1320) as last-resort reserve and shows warning toast
+    // R132: When all flagship models are exhausted (0% quota), chat on 1037 (3.1 Pro) rescues to
+    // nominal senior model Opus 5.5 Medium (1369) to wait for quota reset (never Flash 1320),
+    // and manual senior pins at 0% quota are preserved without downgrade
     opusQuota = 0.0;
     carbonQuota = 0.0;
     proNextQuota = 0.0;
@@ -11707,16 +11725,25 @@ async function refreshCatalogInStore() {
     await new Promise((r) => setImmediate(r));
     assert.strictEqual(
       storeState.modelSelection.byConversation['chat-unpinned-cpp'].model,
-      1320,
-      'When all flagships are at 0%, chat on 1037 (3.1 Pro) must rescue to Gemini 3.8 Flash (High) (1320)'
+      1369,
+      'When all flagships are at 0%, chat on 1037 (3.1 Pro) must rescue to Opus 5.5 Medium (1369), never Flash (1320)'
     );
-    toast = global.document.getElementById('jetski-model-autopilot-toast');
-    assert(toast, 'Unreliable junior model fallback must mount warning toast');
-    assert(
-      toast.textContent.includes(
-        'Warning: running on unreliable junior model (Gemini 3.8 Flash (High))'
-      ),
-      `Expected unreliable junior model warning toast, got: ${toast.textContent}`
+
+    // Manually picking Opus High (1370) at 0% quota keeps 1370 pinned instead of downgrading
+    reduxStore.dispatch({
+      type: 'modelSelection/modelPicked',
+      payload: { conversationId: 'chat-unpinned-cpp', model: 1370 },
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(
+      storeState.modelSelection.byConversation['chat-unpinned-cpp'].model,
+      1370,
+      'Manual user pick of Opus High (1370) at 0% quota must not be overridden'
+    );
+    assert.strictEqual(
+      window.__jetskiManualPickedModels.get('chat-unpinned-cpp')?.model,
+      1370,
+      'Manual user pick of Opus High (1370) at 0% quota must stay persisted in manual pins'
     );
 
     process.stdout.write('MORNING_MODEL_RESET_PASSED\n');

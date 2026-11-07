@@ -70,6 +70,8 @@ if HOOKS_DIR not in sys.path:
   sys.path.insert(0, HOOKS_DIR)
 
 import chat_lifecycle as cl  # pylint: disable=g-import-not-at-top
+# Import quota hold queue to defer wakeups and auto-starts below 5% senior quota
+import quota_hold  # pylint: disable=g-import-not-at-top
 
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPTS_DIR not in sys.path:
@@ -6500,10 +6502,66 @@ def send_desktop_alert(title: str, message: str, url: str = "") -> None:
     pass
 
 
-def wake_conversation(conv_id: str, message: str) -> bool:
+# Resolves the model profile for a watcher record or conversation ID
+def _resolve_record_profile(rec_or_cid: dict[str, Any] | str) -> str:
+  if isinstance(rec_or_cid, str):
+    return quota_hold.resolve_conversation_profile(conv_id=rec_or_cid)
+  if isinstance(rec_or_cid, dict):
+    cid = str(rec_or_cid.get("conversation_id") or "").strip()
+    proj_ref = str(
+        rec_or_cid.get("project_id") or rec_or_cid.get("project_name") or ""
+    ).strip()
+    pid = ""
+    if proj_ref:
+      try:
+        pid = cl.resolve_project_id(proj_ref)
+      except Exception:  # lint: allow-broad-except (project lookup fallback)
+        pid = proj_ref
+    return quota_hold.resolve_conversation_profile(conv_id=cid, project_id=pid)
+  return "orchestrator"
+
+
+# Checks whether all senior models for a profile are currently below the 5% emergency floor
+def _check_profile_quota_hold(profile: str) -> tuple[bool, dict[str, Any]]:
+  try:
+    avail_models = (cl.get_available_models() or {}).get("models") or {}
+    qstate = quota_hold.get_profile_quota_state(avail_models, profile)
+    return bool(
+        qstate.get("found_any") and qstate.get("below_emergency_floor")
+    ), qstate
+  except Exception:  # lint: allow-broad-except (quota lookup must never crash watcher)
+    return False, {}
+
+
+def wake_conversation(
+    conv_id: str,
+    message: str,
+    *,
+    item_key: str = "",
+    allow_hold: bool | None = None,
+) -> bool:
   """Sends a wakeup message to a Jetski conversation via LS RPC with agentapi fallback"""
   if not conv_id or not message:
     return False
+  # Queue background item wakeups for post-reset resume when senior profile quota is below 5%
+  should_hold = bool(item_key) if allow_hold is None else allow_hold
+  if should_hold:
+    profile = _resolve_record_profile(conv_id)
+    is_held, qstate = _check_profile_quota_hold(profile)
+    if is_held:
+      best = qstate.get("best_model") or {}
+      quota_hold.enqueue_quota_hold(
+          kind="cl_watcher_wakeup",
+          profile=profile,
+          conversation_id=conv_id,
+          item_key=item_key,
+          message=message,
+          model_enum=str(best.get("enum") or ""),
+          model_id=str(best.get("id") or ""),
+          reset_ts=float(qstate.get("reset_ts") or 0.0),
+          reset_time=str(qstate.get("reset_time") or ""),
+      )
+      return False
   try:
     resp = cl.ls_rpc(
         "SendUserCascadeMessage",
@@ -12562,8 +12620,9 @@ def sync_bugs_into_state(
           "WIP CL (PS1 = тест, PS2 = фикс) и подготовь черновик ответа."
       )
       wcid = str(bug["conversation_id"])
-      wake_conversation(wcid, wmsg)
-      busy_cids.add(wcid)
+      # Only mark the chat busy when wake_conversation actually sent the message (not quota-held)
+      if wake_conversation(wcid, wmsg, item_key=bkey):
+        busy_cids.add(wcid)
       events.insert(
           0,
           {
@@ -12596,6 +12655,9 @@ def sync_bugs_into_state(
   for bkey, bug in autostart_cands:
     stamp = bug.get("last_human_comment_at") or bug.get("created_time") or "init"
     claim_key = f"bug:{bkey}:{stamp}"
+    # Defer background bug chat launches while the target project's senior quota is <5%
+    if _check_profile_quota_hold(_resolve_record_profile(bug))[0]:
+      continue
     # Throttle background launches to 1 new bug chat per sync and <2 busy review/bug chats total
     if claim_key not in review_claims and auto_started_bugs < 1 and len(busy_cids) < 2:
       res = _start_chat_for_bug(state, bkey, save=False)
@@ -14037,7 +14099,8 @@ def _sync_once_locked(
               f"CL Alert: {ikey}", transition_msg, info.get("url", "")
           )
         if cid and wake_chats and not already_woken:
-          wake_conversation(cid, transition_msg)
+          # Pass item_key so quota-held transition wakeups retain their CL association
+          wake_conversation(cid, transition_msg, item_key=ikey)
 
     # Route assigned reviewer CLs/PRs through deterministic Tier 0/1/2 pre-gate
     is_reviewer_candidate = (
@@ -14193,7 +14256,8 @@ def _sync_once_locked(
         ):
           prompt = str(action.get("prompt") or "")
           if cid:
-            woken = wake_conversation(cid, prompt)
+            # Pass item_key so quota-held Tier 1/2 review wakeups retain their CL association
+            woken = wake_conversation(cid, prompt, item_key=ikey)
             if woken:
               launched_audit = True
               record["review_target_ps"] = cur_ps
@@ -14230,19 +14294,28 @@ def _sync_once_locked(
               events = events[:50]
           else:
             m_tier = str(action.get("model_tier") or "pro")
+            # Defer launching new pro-tier review chats while the target profile's senior quota is <5%
+            is_quota_held = (
+                m_tier != "flash"
+                and _check_profile_quota_hold(_resolve_record_profile(record))[0]
+            )
             # Pass model_tier only when non-default so 5-arg start mocks keep working
             res = (
-                _start_pinned_chat_for_record(
-                    new_items, ikey, composite_key, record, prompt
-                )
-                if m_tier == "pro"
-                else _start_pinned_chat_for_record(
-                    new_items,
-                    ikey,
-                    composite_key,
-                    record,
-                    prompt,
-                    model_tier=m_tier,
+                {"ok": False, "quota_held": True}
+                if is_quota_held
+                else (
+                    _start_pinned_chat_for_record(
+                        new_items, ikey, composite_key, record, prompt
+                    )
+                    if m_tier == "pro"
+                    else _start_pinned_chat_for_record(
+                        new_items,
+                        ikey,
+                        composite_key,
+                        record,
+                        prompt,
+                        model_tier=m_tier,
+                    )
                 )
             )
             if res.get("ok"):
@@ -14573,6 +14646,39 @@ def _sync_once_locked(
       state["merge_request_groups"] = evaluate_security_merge_groups(
           state["bugs"], skia_dir=skia_dir, state=state, allow_llm=False
       )
+  # Enqueue mid-turn QUOTA_EXHAUSTED chats and resume held chats once senior quota resets
+  if wake_chats:
+    try:
+      quota_hold.scan_and_enqueue_halted_chats()
+      resumed_holds = quota_hold.flush_ready_quota_holds(
+          wake_fn=lambda r_cid, r_msg: wake_conversation(
+              r_cid, r_msg, allow_hold=False
+          ),
+          max_resumes=2,
+      )
+      for r_item in resumed_holds:
+        r_cid = str(r_item.get("conversation_id") or "")
+        r_ikey = str(r_item.get("item_key") or r_cid[:8])
+        r_mod = str((r_item.get("resumed_model") or {}).get("display") or "")
+        events.insert(
+            0,
+            {
+                "id": f"ev-qresume-{int(time.time() * 1000)}-{r_cid[:8]}",
+                "time": now_et_str(),
+                "item_key": r_ikey,
+                "target_id": r_ikey,
+                "conversation_id": r_cid,
+                "project_name": str(r_item.get("profile") or "orchestrator"),
+                "critical": False,
+                "message": (
+                    f"[QUOTA-HOLD] 🌅 Resumed chat {r_cid[:8]} on {r_mod} after"
+                    " senior quota reset."
+                ),
+            },
+        )
+      del events[50:]
+    except Exception:  # lint: allow-broad-except (quota queue flush is best-effort)
+      pass
   state["last_sync"] = now_et_str()
   state["gardener_url"] = gardener_pen_url()
   state["rollers_summary"] = {

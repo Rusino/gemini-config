@@ -725,6 +725,7 @@
 
   // Flagship-only fallback chains for cpp-core and orchestrator (no Gemini 3.1 or Flash)
   const WEB_MODEL_PROFILES = {
+    // Restrict cpp-core strictly to Opus 5.5 and Gemini 4 Carbon/Argon (no coordinator/auto)
     'cpp-core': [
       'opus-5.5-medium',
       'opus-5.5-high',
@@ -733,8 +734,6 @@
       'gemini-4-carbon-medium',
       'gemini-launch-candidate-high',
       'gemini-launch-candidate-medium',
-      'gemini-pro-coordinator',
-      'auto',
     ],
     'orchestrator': [
       'gemini-pro-coordinator',
@@ -2924,10 +2923,19 @@
               const profile = convProfile || 'orchestrator';
               replacement = resolveAutopilotModelForProfile(catalog, profile);
               reason = isForbiddenBon ? 'BoN disabled' : `${profile} profile`;
-            } else if (entry && entry.quota < effectiveHardFloor) {
+            // Preserve manual user pins even below 5% so pinned models wait for reset instead of switching
+            } else if (!isPinned && entry && entry.quota < effectiveHardFloor) {
               const profile = convProfile || 'orchestrator';
-              replacement = resolveAutopilotModelForProfile(catalog, profile);
-              reason = `${Math.round(entry.quota * 100)}% quota`;
+              const candidate = resolveAutopilotModelForProfile(catalog, profile);
+              // Switch only when an alternative senior pool has >=5% quota or when rescuing a junior model
+              if (
+                candidate &&
+                (candidate.quota >= EMERGENCY_PIN_FLOOR ||
+                  isUnreliableJuniorModel(entry?.modelId, entryEnumNum, entry?.label))
+              ) {
+                replacement = candidate;
+                reason = `${Math.round(entry.quota * 100)}% quota`;
+              }
             } else if (!isPinned) {
               const shielded = rerouteWastefulWtuModelInUi(catalog, planModel, QUOTA_SOFT_FLOOR);
               if (shielded) {
@@ -3452,25 +3460,9 @@
       if (hit) candidates.push(hit);
     }
     if (candidates.length > 0) {
+      // Sort stable by quota descending so exhausted (<5%) profiles stay on their nominal senior model
+      // and wait for quota reset instead of downgrading to Flash or Gemini 3.1 Pro
       candidates.sort((a, b) => (b.quota || 0) - (a.quota || 0));
-      // Pick the highest-quota flagship candidate above the 5% emergency floor
-      if (candidates[0].quota >= EMERGENCY_PIN_FLOOR) return candidates[0];
-    }
-
-    // When all flagship models are exhausted (<5%), fall back to Gemini 3.8 Flash (High)
-    // rather than Gemini 3.1 Pro / snowball-subagent
-    for (const flashMid of [
-      'gemini-3.8-flash-high',
-      'gemini-flash-next',
-      'gemini-3.8-flash-medium',
-    ]) {
-      const flashHit = catalog.byId.get(flashMid);
-      if (flashHit && flashHit.quota >= EMERGENCY_PIN_FLOOR) {
-        return flashHit;
-      }
-    }
-
-    if (candidates.length > 0) {
       return candidates[0];
     }
 
@@ -3576,21 +3568,8 @@
       ) {
         return 2;
       }
-      if (mid === 'gemini-pro-coordinator' || num === 1415) return 3;
-      if (mid === 'auto' || num === 1260) return 4;
-      if (tier <= 5) return 5;
-      // Rank Gemini 3.8 Flash (8) ahead of Gemini 3.1 Pro / snowball (10) as last-resort reserve
-      if (
-        !JUNIOR_PRO_ENUM_NUMS.has(num) &&
-        !mid.includes('3.1') &&
-        (mid.includes('3.8-flash') ||
-          mid === 'gemini-flash-next' ||
-          num === 1318 ||
-          num === 1319 ||
-          num === 1320)
-      ) {
-        return 8;
-      }
+      // Rank non-allowed senior models (such as gemini-pro-coordinator / auto) below Carbon/Argon
+      if (tier <= 5) return 6;
       return 10;
     }
     if (p === 'triage') {
@@ -3612,19 +3591,8 @@
     if (tier === 4) return 2;
     // Manual upgrades carry isPinned=true; unpinned tier<=3 models leaked from default.model
     if (tier <= 3) return 3;
+    // Rank other senior Pro models above junior models (rank 10)
     if (tier === 5) return 4;
-    // Rank Gemini 3.8 Flash (8) ahead of Gemini 3.1 Pro / snowball (10) in orchestrator reserve
-    if (
-      !JUNIOR_PRO_ENUM_NUMS.has(num) &&
-      !mid.includes('3.1') &&
-      (mid.includes('3.8-flash') ||
-        mid === 'gemini-flash-next' ||
-        num === 1318 ||
-        num === 1319 ||
-        num === 1320)
-    ) {
-      return 8;
-    }
     return 10;
   }
 
@@ -3667,7 +3635,7 @@
       .replace(/^profile:/, '');
     const bestRank = getProfilePreferenceRank(profile, best.modelId, best.enumVal, best.label);
     const curRank = getProfilePreferenceRank(profile, curModelId, curNum || curEnumVal, curLabel);
-    // Rescue non-triage chats from junior models to flagships, or from 3.1 Pro / snowball to 3.8 Flash
+    // Rescue non-triage chats from junior models even at 0% so they wait on their senior model
     const isJuniorRescue =
       cleanProfile !== 'triage' &&
       ((curTier >= 6 && bestTier <= 5) ||
@@ -3678,8 +3646,9 @@
       !expiredJuniorEnum &&
       curTier === 4 &&
       (bestMid.startsWith('opus-') || bestMid.startsWith('fable-'));
+    // Allow junior rescue even at 0% quota so non-triage chats move back to a senior model to wait
     const minRecoveryQuota = isJuniorRescue
-      ? EMERGENCY_PIN_FLOOR
+      ? 0
       : isPoolBalancedCarbon
       ? CLAUDE_POOL_BALANCE_FLOOR
       : QUOTA_SOFT_FLOOR;
@@ -4422,27 +4391,23 @@
         : state.modelSelection.default?.model;
       const draftPin = getManualPinEntry(targetKey);
       if (draftPin && draftPin.model) {
-        const pinEntry = catalog.byEnum.get(draftPin.model);
-        // Keep manual picks while GetAvailableModels is still hydrating (!pinEntry) or quota >= 5%
-        if (!pinEntry || pinEntry.quota >= EMERGENCY_PIN_FLOOR) {
-          if (curModel !== draftPin.model) {
-            isInternalDispatch = true;
-            try {
-              store.dispatch({
-                type: 'modelSelection/modelPicked',
-                payload: {
-                  conversationId: cascadeId || undefined,
-                  model: draftPin.model,
-                  ...(cascadeId ? { pick: { atStep: 999999, queuedMessageIds: [] } } : {}),
-                },
-              });
-            } finally {
-              isInternalDispatch = false;
-            }
+        // Always respect explicit user manual picks regardless of remaining quota
+        if (curModel !== draftPin.model) {
+          isInternalDispatch = true;
+          try {
+            store.dispatch({
+              type: 'modelSelection/modelPicked',
+              payload: {
+                conversationId: cascadeId || undefined,
+                model: draftPin.model,
+                ...(cascadeId ? { pick: { atStep: 999999, queuedMessageIds: [] } } : {}),
+              },
+            });
+          } finally {
+            isInternalDispatch = false;
           }
-          return;
         }
-        deleteManualPin(targetKey);
+        return;
       }
       // Fall back to orchestrator on unassigned drafts so prior project draft picks never stick
       const effectiveProfile = profile || 'orchestrator';
@@ -4483,28 +4448,25 @@
     let curModel = convModel ?? (expiredJuniorEnum || state.modelSelection.default?.model);
     // Restore persisted manual pick after F5 reload when no newer turn has executed since the pick
     if (pin && pin.model && stepCount <= pin.atStep && curModel !== pin.model) {
-      const pinEntry = catalog.byEnum.get(pin.model);
-      if (!pinEntry || pinEntry.quota >= EMERGENCY_PIN_FLOOR) {
-        isInternalDispatch = true;
-        try {
-          store.dispatch({
-            type: 'modelSelection/modelPicked',
-            payload: {
-              conversationId: cascadeId,
-              model: pin.model,
-              pick: { atStep: 999999, queuedMessageIds: [] },
-            },
-          });
-        } finally {
-          isInternalDispatch = false;
-        }
-        curModel = pin.model;
+      isInternalDispatch = true;
+      try {
+        store.dispatch({
+          type: 'modelSelection/modelPicked',
+          payload: {
+            conversationId: cascadeId,
+            model: pin.model,
+            pick: { atStep: 999999, queuedMessageIds: [] },
+          },
+        });
+      } finally {
+        isInternalDispatch = false;
       }
+      curModel = pin.model;
     }
     if (!curModel) return;
     const curEntry = catalog.byEnum.get(curModel);
     const isForbiddenBon = isForbiddenBonModel(curEntry?.modelId || '', curModel);
-    // Pinned chats and Carbon/Argon models use the 5% emergency floor instead of 15%
+    // Pinned chats never auto-downgrade; Carbon/Argon models use the 5% emergency floor
     const isPinned = Boolean(!isForbiddenBon && pin && pin.model === curModel);
     const isCarbonOrArgon =
       CARBON_ENUM_NUMS.has(curModel) || ARGON_ENUM_NUMS.has(curModel);
@@ -4522,12 +4484,19 @@
         profile || 'orchestrator'
       );
       reason = 'BoN disabled';
-    } else if (curEntry && curEntry.quota < effectiveHardFloor) {
-      replacement = resolveAutopilotModelForProfile(
+    } else if (!isPinned && curEntry && curEntry.quota < effectiveHardFloor) {
+      const candidate = resolveAutopilotModelForProfile(
         catalog,
         profile || 'orchestrator'
       );
-      reason = `${Math.round(curEntry.quota * 100)}% quota`;
+      if (
+        candidate &&
+        (candidate.quota >= EMERGENCY_PIN_FLOOR ||
+          isUnreliableJuniorModel(curEntry?.modelId, curModel, curEntry?.label))
+      ) {
+        replacement = candidate;
+        reason = `${Math.round(curEntry.quota * 100)}% quota`;
+      }
     } else if (!isPinned) {
       const shielded = rerouteWastefulWtuModelInUi(catalog, curModel, QUOTA_SOFT_FLOOR);
       if (shielded) {
@@ -5233,37 +5202,18 @@
 
         const entry = catalog.byEnum.get(pickedModel);
         const isForbiddenBon = isForbiddenBonModel(entry?.modelId || '', pickedModel);
-        if (isForbiddenBon || (entry && entry.quota < EMERGENCY_PIN_FLOOR)) {
+        // Only rescue forbidden BoN picks; never override a user's manual model choice on low quota
+        if (isForbiddenBon) {
           const profile =
             resolveProjectProfileForConversation(store, action.payload.conversationId) ||
             'orchestrator';
           const rescue = resolveAutopilotModelForProfile(catalog, profile);
           if (rescue && rescue.enumVal && rescue.enumVal !== pickedModel) {
-            if (!isForbiddenBon) {
-              // Classify emergency rescue pins as temporary when weaker than nominal default
-              const nominal = resolveNominalProfileModel(catalog, profile);
-              const rescueTier = getModelCapabilityTier(
-                rescue.modelId,
-                rescue.enumVal,
-                rescue.label
-              );
-              const nomTier = nominal
-                ? getModelCapabilityTier(nominal.modelId, nominal.enumVal, nominal.label)
-                : rescueTier;
-              const isPerm =
-                !nominal || rescueTier <= nomTier || rescue.enumVal === nominal.enumVal;
-              setManualPin(pinKey, rescue.enumVal, stepCount, {
-                permanent: isPerm,
-                resetAtMs: !isPerm && nominal?.resetMs > Date.now() ? nominal.resetMs : 0,
-                baselineModel: !isPerm && nominal ? nominal.enumVal : 0,
-              });
-            } else {
-              deleteManualPin(pinKey);
-            }
+            deleteManualPin(pinKey);
             showAutopilotToast(
               entry?.label || String(pickedModel),
               rescue.label,
-              isForbiddenBon ? 'BoN disabled' : `${Math.round(entry.quota * 100)}% exhausted`
+              'BoN disabled'
             );
             return origDispatch.call(this, {
               ...action,
@@ -5427,20 +5377,17 @@
         // Preserve manual pick across F5 reload when trajectoryModelObserved replays an older turn
         if (pin && pin.model && (stepCount <= pin.atStep || execStep <= pin.atStep)) {
           const pinEntry = catalog.byEnum.get(pin.model);
-          // Keep user's manual pick while catalog hydrates or as long as its quota is >= 5%
-          if (!pinEntry || pinEntry.quota >= EMERGENCY_PIN_FLOOR) {
-            if (obsModel !== pin.model && cid) {
-              dispatchInternalModelPick(store, cid, pin.model);
-            }
-            return origDispatch.call(this, {
-              ...action,
-              payload: {
-                ...action.payload,
-                model: pin.model,
-                label: pinEntry?.label || action.payload.label,
-              },
-            });
+          if (obsModel !== pin.model && cid) {
+            dispatchInternalModelPick(store, cid, pin.model);
           }
+          return origDispatch.call(this, {
+            ...action,
+            payload: {
+              ...action.payload,
+              model: pin.model,
+              label: pinEntry?.label || action.payload.label,
+            },
+          });
         } else if (pin && cid && stepCount > pin.atStep && execStep > pin.atStep) {
           // Advance pin step when a newer turn runs on the pinned model, or clear if switched
           if (obsModel === pin.model) {
@@ -5461,11 +5408,18 @@
         let reason = '';
         // Marks morning primary-model restoration so replay shows the [Keep <Junior>] action toast
         let isQuotaRestore = false;
-        if (obsEntry && obsEntry.quota < effectiveHardFloor) {
+        if (!isPinned && obsEntry && obsEntry.quota < effectiveHardFloor) {
           // Reuse resolved conversation profile across exhaustion and recovery branches
           const profile = convProfile || 'orchestrator';
-          replacement = resolveAutopilotModelForProfile(catalog, profile);
-          reason = `${Math.round(obsEntry.quota * 100)}% quota`;
+          const candidate = resolveAutopilotModelForProfile(catalog, profile);
+          if (
+            candidate &&
+            (candidate.quota >= EMERGENCY_PIN_FLOOR ||
+              isUnreliableJuniorModel(obsEntry?.modelId, obsModel, obsEntry?.label))
+          ) {
+            replacement = candidate;
+            reason = `${Math.round(obsEntry.quota * 100)}% quota`;
+          }
         } else if (!isPinned) {
           const shielded = rerouteWastefulWtuModelInUi(catalog, obsModel, QUOTA_SOFT_FLOOR);
           if (shielded) {

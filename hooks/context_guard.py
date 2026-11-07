@@ -1906,6 +1906,61 @@ def resolve_unreliable_turn_warning(
   return notice, changed
 
 
+# Enqueues non-triage conversations when all allowed senior models are exhausted
+def resolve_quota_exhaustion_hold_notice(conv_id: str, m: dict, state: dict) -> str:
+  model_enum = str((m or {}).get("model_enum") or "").strip()
+  # Skip SQLite and LS quota RPCs on the fast path when generatorMetadata has no model enum
+  if not conv_id or not model_enum:
+    return ""
+  try:
+    import chat_lifecycle
+    import quota_hold
+
+    profile = quota_hold.resolve_conversation_profile(conv_id=conv_id)
+    if profile == "triage":
+      return ""
+    avail_models = (chat_lifecycle.get_available_models() or {}).get("models") or {}
+    qstate = quota_hold.get_profile_quota_state(avail_models, profile)
+    if not qstate.get("found_any"):
+      return ""
+    unreliable_label = str(state.get("unreliable_model_label") or "")
+    # Hold when all senior models hit 0% or when an unpinned turn falls onto a junior model at <5%
+    should_hold = bool(
+        qstate.get("all_zero")
+        or (unreliable_label and qstate.get("below_emergency_floor"))
+    )
+    if not should_hold:
+      return ""
+    best = qstate.get("best_model") or {}
+    nominal_id = str(best.get("id") or "")
+    nominal_enum = str(best.get("enum") or "")
+    nominal_lbl = str(best.get("display") or nominal_id or profile)
+    reset_time = str(qstate.get("reset_time") or "")
+    reset_disp = str(qstate.get("reset_display") or reset_time)
+    reset_ts = float(qstate.get("reset_ts") or 0.0)
+    max_pct = round(float(qstate.get("max_quota") or 0.0) * 100)
+    quota_hold.enqueue_quota_hold(
+        kind="pre_invocation_quota_hold",
+        profile=profile,
+        conversation_id=conv_id,
+        model_enum=nominal_enum,
+        model_id=nominal_id,
+        reset_ts=reset_ts,
+        reset_time=reset_time,
+    )
+    reset_str = f" (reset at `{reset_disp}`)" if reset_disp else ""
+    return (
+        f"[QUOTA HOLD GUARD] All allowed senior models for profile `{profile}` are"
+        f" exhausted (max remaining quota `{max_pct}%`{reset_str}). Do NOT execute"
+        " tools or continue work on a junior model. Output a short message"
+        " informing the user that this chat is paused in"
+        " `~/.gemini/jetski/quota_hold_queue.json` and will automatically resume"
+        f" on `{nominal_lbl}` after quota reset{reset_str}, then stop calling tools."
+    )
+  except Exception:  # lint: allow-broad-except (guard must never crash hook)
+    return ""
+
+
 def _usage_str(m: dict) -> str:
   est = ", estimated from transcript size" if m["fallback"] else ""
   return (
@@ -2273,6 +2328,10 @@ def run(data: dict, log: dict) -> dict:
       save_state(state_path, state)
     if unreliable_notice and (is_turn_start or invocation_num == 0 or unreliable_changed):
       messages.append(unreliable_notice)
+    # Enqueue and warn when all senior models in the chat's profile are at 0% quota
+    quota_hold_notice = resolve_quota_exhaustion_hold_notice(conv_id, m, state)
+    if quota_hold_notice:
+      messages.append(quota_hold_notice)
     soft_due = steps - int(
         state.get("soft_last_steps", -SOFT_REMIND_EVERY_STEPS)
     ) >= SOFT_REMIND_EVERY_STEPS

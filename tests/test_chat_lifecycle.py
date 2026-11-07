@@ -2240,6 +2240,11 @@ class TestChatLifecycle(unittest.TestCase):
             "displayName": "Claude Opus 5.5 (High)",
             "quotaInfo": {"remainingFraction": 0.75, "resetTime": "2027-01-15T12:00:00Z"},
         },
+        "gemini-4-carbon-high": {
+            "model": "MODEL_PLACEHOLDER_M427",
+            "displayName": "Gemini 4 Carbon (High)",
+            "quotaInfo": {"remainingFraction": 0.70, "resetTime": "2027-01-15T12:00:00Z"},
+        },
         "gemini-pro-coordinator": {
             "model": "MODEL_PLACEHOLDER_M415",
             "displayName": "Gemini Pro Orchestrator",
@@ -2262,10 +2267,10 @@ class TestChatLifecycle(unittest.TestCase):
       res_high = chat_lifecycle.resolve_profile_model(catalog, "cpp-core")
       self.assertEqual(res_high["id"], "opus-5.5-high")
 
-      # When both Opus models are exhausted, fall back to gemini-pro-coordinator
+      # When both Opus models are exhausted, fail over to gemini-4-carbon-high (never coordinator)
       catalog["opus-5.5-high"]["quotaInfo"]["remainingFraction"] = 0.10
       res_fallback = chat_lifecycle.resolve_profile_model(catalog, "cpp-core")
-      self.assertEqual(res_fallback["id"], "gemini-pro-coordinator")
+      self.assertEqual(res_fallback["id"], "gemini-4-carbon-high")
 
   def test_reroute_wasteful_wtu_models_proactively(self):
     catalog = {
@@ -2569,7 +2574,8 @@ class TestChatLifecycle(unittest.TestCase):
     self.assertEqual(res.get("id"), "gemini-4-carbon-high")
     self.assertAlmostEqual(res.get("quota"), 0.08)
 
-    # When flagships are exhausted, cpp-core falls back to Gemini 3.8 Flash (High) (M318) reserve
+    # When all senior models are exhausted (<5%), cpp-core stays on its senior model to wait for
+    # quota reset instead of downgrading to Gemini 3.8 Flash (High)
     avail_reserve = {
         "opus-5.5-medium": {
             "model": "MODEL_PLACEHOLDER_M369",
@@ -2588,8 +2594,8 @@ class TestChatLifecycle(unittest.TestCase):
         },
     }
     res_reserve = chat_lifecycle.resolve_profile_model(avail_reserve, "cpp-core")
-    self.assertEqual(res_reserve.get("enum"), "MODEL_PLACEHOLDER_M318")
-    self.assertEqual(res_reserve.get("id"), "gemini-3.8-flash-high")
+    self.assertEqual(res_reserve.get("enum"), "MODEL_PLACEHOLDER_M427")
+    self.assertEqual(res_reserve.get("id"), "gemini-4-carbon-high")
 
     # Cross-pool balance shifts off Opus below 55% when Gemini 4 Carbon has >= 20% higher quota
     avail_balance = {
@@ -2658,6 +2664,106 @@ class TestChatLifecycle(unittest.TestCase):
             "your final reply MUST be a self-contained summary of the entire chain's work",
             prompt,
         )
+
+  def test_r132_quota_hold_queue_and_post_reset_resume(self):
+    import copy
+    scripts_dir = os.path.expanduser("~/.gemini/config/scripts")
+    if scripts_dir not in sys.path:
+      sys.path.insert(0, scripts_dir)
+    import context_guard
+    import quota_hold
+    import cl_watcher
+
+    self.assertNotIn("gemini-pro-coordinator", chat_lifecycle.MODEL_PROFILES["cpp-core"])
+    self.assertNotIn("auto", chat_lifecycle.MODEL_PROFILES["cpp-core"])
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      qpath = os.path.join(tmp_dir, "quota_hold_queue.json")
+      exhausted_models = {
+          "opus-5.5-medium": {
+              "model": "MODEL_PLACEHOLDER_M369",
+              "displayName": "Claude Opus 5.5 (Medium)",
+              "quotaInfo": {
+                  "remainingFraction": 0.0,
+                  "resetTime": "2026-11-07T13:00:00Z",
+              },
+          },
+          "gemini-4-carbon-high": {
+              "model": "MODEL_PLACEHOLDER_M427",
+              "displayName": "Gemini 4 Carbon (High)",
+              "quotaInfo": {
+                  "remainingFraction": 0.0,
+                  "resetTime": "2026-11-07T12:00:00Z",
+              },
+          },
+      }
+      now_before = chat_lifecycle.parse_iso_reset_ts("2026-11-07T02:00:00Z")
+      qstate = quota_hold.get_profile_quota_state(
+          exhausted_models, "cpp-core", now_ts=now_before
+      )
+      self.assertTrue(qstate["found_any"])
+      self.assertTrue(qstate["below_emergency_floor"])
+      self.assertTrue(qstate["all_zero"])
+      self.assertEqual(qstate["reset_time"], "2026-11-07T12:00:00Z")
+
+      with (
+          patch.dict(os.environ, {"JETSKI_QUOTA_HOLD_QUEUE_FILE": qpath}),
+          patch.object(
+              chat_lifecycle,
+              "get_available_models",
+              return_value={"models": exhausted_models},
+          ),
+          patch.object(
+              quota_hold, "resolve_conversation_profile", return_value="cpp-core"
+          ),
+          patch.object(chat_lifecycle, "set_conversation_wait_state", return_value=True),
+          patch.object(chat_lifecycle, "ls_rpc", return_value={}) as rpc_mock,
+      ):
+        # PreInvocation guard enqueues 0%-quota chat and returns [QUOTA HOLD GUARD]
+        notice = context_guard.resolve_quota_exhaustion_hold_notice(
+            "conv-cpp-zero", {"model_enum": "MODEL_PLACEHOLDER_M318"}, {}
+        )
+        self.assertIn("[QUOTA HOLD GUARD]", notice)
+        queued = quota_hold.load_hold_queue(qpath)
+        self.assertIn("conv:conv-cpp-zero", queued)
+
+        # cl_watcher.wake_conversation holds wakeup message when senior quota < 5%
+        woken = cl_watcher.wake_conversation(
+            "conv-cpp-wake", "[CL-WATCHER] New review comment", item_key="skia:123"
+        )
+        self.assertFalse(woken)
+        rpc_mock.assert_not_called()
+        queued = quota_hold.load_hold_queue(qpath)
+        self.assertEqual(
+            queued["conv:conv-cpp-wake"]["message"],
+            "[CL-WATCHER] New review comment",
+        )
+
+        # Before reset_ts with 0% quota, flush_ready_quota_holds resumes nothing
+        woken_calls = []
+        res_early = quota_hold.flush_ready_quota_holds(
+            models=exhausted_models,
+            wake_fn=lambda c, m: (woken_calls.append((c, m)) or True),
+            now_ts=now_before + 60,
+            queue_path=qpath,
+        )
+        self.assertEqual(res_early, [])
+        self.assertEqual(woken_calls, [])
+
+        # After reset_ts with Carbon recovered to 0.80, flush_ready_quota_holds wakes both chats
+        recovered_models = copy.deepcopy(exhausted_models)
+        recovered_models["gemini-4-carbon-high"]["quotaInfo"]["remainingFraction"] = 0.80
+        now_after = chat_lifecycle.parse_iso_reset_ts("2026-11-07T12:05:00Z")
+        res_after = quota_hold.flush_ready_quota_holds(
+            models=recovered_models,
+            wake_fn=lambda c, m: (woken_calls.append((c, m)) or True),
+            now_ts=now_after,
+            max_resumes=2,
+            queue_path=qpath,
+        )
+        self.assertEqual(len(res_after), 2)
+        self.assertEqual(len(woken_calls), 2)
+        self.assertEqual(quota_hold.load_hold_queue(qpath), {})
 
 
 if __name__ == "__main__":

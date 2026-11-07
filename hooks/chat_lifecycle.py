@@ -115,6 +115,7 @@ def is_step0_broken_contrib_model(model_id: str = "", model_enum: str = "") -> b
 
 # Flagship-only fallback chains for cpp-core and orchestrator (no Gemini 3.1 or Flash)
 MODEL_PROFILES: dict[str, list[str]] = {
+    # Restrict cpp-core strictly to Opus 5.5 and Gemini 4 Carbon/Argon (no coordinator/auto)
     "cpp-core": [
         "opus-5.5-medium",
         "opus-5.5-high",
@@ -123,8 +124,6 @@ MODEL_PROFILES: dict[str, list[str]] = {
         "gemini-4-carbon-medium",
         "gemini-launch-candidate-high",
         "gemini-launch-candidate-medium",
-        "gemini-pro-coordinator",
-        "auto",
     ],
     "orchestrator": [
         "gemini-pro-coordinator",
@@ -1125,26 +1124,22 @@ def resolve_profile_model(
       candidates.append(hit)
 
   if candidates:
+    # Sort stable by quota descending so exhausted (<5%) profiles stay on their nominal senior model
+    # and wait for quota reset instead of downgrading to Flash or Gemini 3.1 Pro
     candidates.sort(key=lambda c: c.get("quota", 0.0), reverse=True)
-    # Prefer the highest-quota flagship candidate above the 5% emergency floor
-    if candidates[0].get("quota", 0.0) >= EMERGENCY_PIN_FLOOR:
-      return candidates[0]
-
-  # When all flagship models are exhausted (<5%), fall back to Gemini 3.8 Flash (High)
-  # rather than Gemini 3.1 Pro / snowball-subagent
-  for flash_mid in ("gemini-3.8-flash-high", "gemini-flash-next", "gemini-3.8-flash-medium"):
-    flash_hit = lookup_model(models, flash_mid)
-    if flash_hit and flash_hit.get("quota", 0.0) >= EMERGENCY_PIN_FLOOR:
-      return flash_hit
-
-  if candidates:
     return candidates[0]
 
-  # Fallback to first available model in catalog
+  # Fallback to first available senior model in catalog
   for mid in models:
     hit = lookup_model(models, mid)
-    if hit and hit.get("has_display_name"):
-      return hit
+    # Skip nameless and junior catalog entries for non-triage profiles
+    if not hit or not hit.get("has_display_name"):
+      continue
+    if profile != "triage" and is_unreliable_junior_model(
+        hit.get("id", ""), hit.get("display", "")
+    ):
+      continue
+    return hit
   return {}
 
 
