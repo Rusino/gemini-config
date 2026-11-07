@@ -17,6 +17,7 @@ The script checks client-visible diff surface and selects appropriate ASAN and C
 S=~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py
 python3 $S advise --cl <change>      # Gerrit CL, own or under review
 python3 $S advise --repo <skia>      # local branch vs origin/main
+python3 $S try --cl <change> -b <builder>  # git cl try + Buildbucket check, ends with TRIGGER:
 python3 $S triage --cl <change>      # triage tryjobs (ASAN + Canaries + font trybots)
 python3 $S watch --cl <change> --save-draft  # watch tryjobs + triage on completion
 python3 $S health                    # OK/DEAD per canary (real verdicts in last 45 days)
@@ -29,14 +30,17 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
 2. Execute every `AGENT TODO` line with `code_search`. A hit outside `skparagraph`/`skunicode` test rdeps makes `Canary-G3` STRONG.
 3. Present the result: STRONG items as "run", CONSIDER items as "only if rendering may change".
 4. **Execution Policy (Agent Actions)**:
-   - **7-Day `LOAS2` Auth Wrapper (`luci-auth context`)**: Always invoke `git cl try` via
-     `luci-auth context -- git cl try ...` (printed directly by `canary_advisor.py`) so
-     `depot_tools` selects `LuciContextAuthenticator` (talking to `luci-auth context` backed by
-     `/usr/bin/sso-cred-helper`, 7-day `LOAS2`) instead of `SSOAuthenticator` (`git-remote-sso`,
-     20-hour `CorpSSO`), and check for exit code `0` (never append `|| true`).
-   - **ASAN**: If an ASAN bot is recommended, YOU (the agent) MUST execute the
-     `luci-auth context -- git cl try` command provided under `AGENT ACTION` immediately, without
-     asking the author or the user.
+   - **Trigger only through `try`, report only `TRIGGER: VERIFIED`**: run the `canary_advisor.py
+     try --cl <CL> -b <builder> ...` command printed under `AGENT ACTION`, never a bare
+     `git cl try`. It wraps `git cl try` in `luci-auth context` (7-day `LOAS2`) and falls back to
+     plain `git cl` where `luci-auth` is not logged in (the Mac), then polls Buildbucket and ends
+     with `TRIGGER: VERIFIED` or `TRIGGER: FAILED (...)`. Tell the user a bot is triggered or
+     running only after `TRIGGER: VERIFIED`; on `FAILED`, report the printed error. Incident
+     (Gerrit 1407718 PS18, 2026-11-07): `git cl try` exited 1 with `Unable to determine default
+     branch` from a worktree branch without upstream, the agent read only the depot_tools warning
+     tail, reported ASAN as running, and the watcher waited an hour for a build that did not exist.
+   - **ASAN**: If an ASAN bot is recommended, YOU (the agent) MUST execute the `try` command
+     provided under `AGENT ACTION` immediately, without asking the author or the user.
    - **SkParagraph / SkUnicode on Linux Cloudtop (`LOCAL google3-test-paragraph`)**: When `/google/src/cloud` is mounted, `canary_advisor.py` automatically replaces `Canary-G3` for `modules/skparagraph/` and `modules/skunicode/` paths with `LOCAL google3-test-paragraph` (~10–13 min, 1,139 fast targets including `skia_build_test`, cached `G3_HEAD` baseline, zero Piper CLs, and zero Gerrit submit hold). Run it before `CR+1` / upload instead of triggering `Canary-G3`. Lightweight `Canary-G3` remains active only for non-paragraph Skia paths (`modules/skshaper/`, `src/ports/`, core `src/`/`include/`, root `BUILD.bazel`) or when off Cloudtop.
      - **Auto-Slow-Tier Policy**: When you run `google3-test-paragraph` automatically as the final check before granting `CR+1` (or before `amnesia-precommit` upload), you MUST append `--tier all` to cover the 13 slow tests. During intermediate/WIP checks, use the default `--tier fast`.
    - **SkParagraph speed (`LOCAL flutter-engine-perf-compare`)**: For executable C/C++ under
@@ -45,9 +49,8 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
      `txt_benchmarks A/B` `AGENT ACTION` (`skia_patch_ab.py`; for a CL, run it on a detached
      worktree of the patchset with `--base HEAD~1`). It applies to reviews too: the
      `[PERF-CHECK GUARD]` hook sees only our own edits. `REGRESSION` blocks `CR+1`.
-   - **External Authors** (owner is not `@google.com`): YOU (the agent) MUST execute the
-     `luci-auth context -- git cl try` command provided under `AGENT ACTION` immediately, without
-     asking.
+   - **External Authors** (owner is not `@google.com`): YOU (the agent) MUST execute the `try`
+     command provided under `AGENT ACTION` immediately, without asking.
      - **Canary-G3 restriction (`g3_canary.go:134`)**: For non-paragraph Skia CLs that still need `Canary-G3`, `Canary-G3` requires a Googler author OR a Googler `Code-Review+1` approval. If the external CL has no Googler `CR+1` yet, `canary_advisor.py` excludes `Canary-G3` from `AGENT ACTION` and prints the manual command to run if needed after `CR+1` (do not place unresolved submit-hold comments).
      - **Stacked CLs**: the google3 try service (`chrome/skia/autoroller/try_service.py`)
        cherry-picks every unmerged parent of the CL too, and each one needs its own Googler
@@ -60,9 +63,11 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
    - **Internal Authors / Own CLs**: Show the printed `Canary Command` for canaries and run it
      ONLY after the user explicitly approves. (For ASAN, you still run it automatically).
 5. **Background Monitoring & Wakeup Protocol**:
-   - Immediately after triggering `luci-auth context -- git cl try`, launch
+   - Immediately after `TRIGGER: VERIFIED`, launch
      `python3 ~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py watch --cl <CL> --save-draft`
-     as a background command (`WaitMsBeforeAsync=500`, `NotificationTimeoutSeconds=5400`).
+     as a background command (`WaitMsBeforeAsync=500`, `NotificationTimeoutSeconds=5400`). The
+     watcher exits with `WAKEUP_REASON: NO_TRYJOBS` when the patchset still has no build after
+     `--no-builds-min` (10) minutes; treat that as a failed trigger, not as a slow bot.
    - **On Red Canary (`UNRELATED_HEAD_BREAKAGE`)**: `watch --save-draft` automatically verifies
      `CheckTestsSkia` + `blaze query somepath` for all failing targets and saves a strictly
      sanitized English `/PATCHSET_LEVEL` draft on Gerrit (never leaking internal `google3` target

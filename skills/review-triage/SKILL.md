@@ -156,10 +156,10 @@ For surviving Skia CLs in `🔴 SURGICAL AUDIT` or `🟠 PUSHBACK`, run
   `Canary-G3` can start (report the deferred command if needed, without placing unresolved submit
   holds).
 - **Internal Authors**: Suggest recommended canaries in chat; do not ask them in Gerrit comments.
-- **Background Watcher & Wakeup Protocol**: Always execute `git cl try` under 7-day `LOAS2` via
-  `luci-auth context -- git cl try ...` (never bare `git cl try`, which hits 20-hour `CorpSSO`,
-  and never append `|| true`). Immediately after triggering `luci-auth context -- git cl try` with
-  exit code `0`, launch
+- **Background Watcher & Wakeup Protocol**: Trigger tryjobs only with the
+  `canary_advisor.py try --cl <N> -b <builder> ...` command printed under `AGENT ACTION` (it runs
+  `git cl try` under `luci-auth context` where logged in and confirms each build in
+  Buildbucket). Only after it prints `TRIGGER: VERIFIED`, launch
   `python3 ~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py watch --cl <N> --save-draft`
   in the background (`WaitMsBeforeAsync=500`, `NotificationTimeoutSeconds=5400`).
   - **On Red Canary (`UNRELATED_HEAD_BREAKAGE`)**: `watch --save-draft` automatically saves a

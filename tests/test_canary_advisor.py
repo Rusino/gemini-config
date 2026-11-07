@@ -125,7 +125,7 @@ class TestCanaryAdvisor(unittest.TestCase):
     agent_action_line = [
         line
         for line in out.splitlines()
-        if line.strip().startswith("luci-auth context -- git cl try")
+        if "canary_advisor.py try --cl" in line
     ][0]
     self.assertNotIn("Canary-G3", agent_action_line)
     self.assertNotIn("Canary-Flutter", agent_action_line)
@@ -180,7 +180,7 @@ class TestCanaryAdvisor(unittest.TestCase):
     agent_action_line = [
         line
         for line in out.splitlines()
-        if line.strip().startswith("luci-auth context -- git cl try")
+        if "canary_advisor.py try --cl" in line
     ][0]
     self.assertIn("Canary-G3", agent_action_line)
     self.assertNotIn("Canary-Flutter", agent_action_line)
@@ -307,7 +307,7 @@ class TestCanaryAdvisor(unittest.TestCase):
     agent_action_line = [
         line
         for line in out.splitlines()
-        if line.strip().startswith("luci-auth context -- git cl try")
+        if "canary_advisor.py try --cl" in line
     ][0]
     self.assertIn(
         "Test-Mac14-Clang-MacMini8.1-CPU-AVX2-x86_64-Debug-All-NativeFonts_Fontations",

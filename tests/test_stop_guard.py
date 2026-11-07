@@ -908,7 +908,8 @@ class TestStopGuard(unittest.TestCase):
                   "name": "run_command",
                   "args": {
                       "CommandLine": (
-                          "git cl try -i 1408157 -B skia/skia.primary -b Bot-ASAN -b Canary-Flutter"
+                          "python3 ~/.gemini/config/skills/skia-canary-advisor/scripts/"
+                          "canary_advisor.py try --cl 1408157 -b Bot-ASAN -b Canary-Flutter"
                       )
                   },
               }],
@@ -917,7 +918,7 @@ class TestStopGuard(unittest.TestCase):
               "step_index": 5,
               "type": "GENERIC",
               "status": "DONE",
-              "content": "The command exited with code 0.\n",
+              "content": "The command exited with code 0.\n\nTRIGGER: VERIFIED (CL 1408157 PS 2)\n",
           },
           {
               "step_index": 6,
@@ -989,7 +990,8 @@ class TestStopGuard(unittest.TestCase):
                   "name": "run_command",
                   "args": {
                       "CommandLine": (
-                          "git cl try -i 1408157 -B skia/skia.primary -b Bot-ASAN -b Canary-Flutter"
+                          "python3 ~/.gemini/config/skills/skia-canary-advisor/scripts/"
+                          "canary_advisor.py try --cl 1408157 -b Bot-ASAN -b Canary-Flutter"
                       )
                   },
               }],
@@ -998,7 +1000,7 @@ class TestStopGuard(unittest.TestCase):
               "step_index": 8,
               "type": "GENERIC",
               "status": "DONE",
-              "content": "Command exited with code 0.\n",
+              "content": "Command exited with code 0.\n\nTRIGGER: VERIFIED (CL 1408157 PS 2)\n",
           },
           {
               "step_index": 9,
@@ -1123,7 +1125,7 @@ class TestStopGuard(unittest.TestCase):
                   "args": {
                       "CommandLine": (
                           "luci-auth context -- git cl try -i 1408157 -B skia/skia.primary"
-                          " -b Bot-ASAN -b Canary-Chromium"
+                          " -b Bot-ASAN -b Canary-Chromium | tail -3"
                       )
                   },
               }],
@@ -1133,6 +1135,36 @@ class TestStopGuard(unittest.TestCase):
               "type": "GENERIC",
               "status": "DONE",
               "content": "Command exited with code 0.\n\nScheduled builds\n",
+          },
+          {**final_step, "step_index": 80},
+      ]
+      # Exit 0 from a piped `git cl try` proves no build exists (Gerrit 1407718 PS18)
+      with tempfile.TemporaryDirectory() as tmp_unverified:
+        res_unverified = self.run_discipline_stop(tmp_unverified, ok_steps)
+      self.assertEqual(res_unverified.get("decision"), "continue")
+      self.assertIn("[ASAN/CANARY GUARD]", res_unverified.get("reason", ""))
+      self.assertIn("TRIGGER: VERIFIED", res_unverified.get("reason", ""))
+
+      # `canary_advisor.py try` with TRIGGER: VERIFIED + green triage satisfies both guards
+      ok_steps = failed_steps[:-1] + [
+          {
+              "step_index": 6,
+              "type": "PLANNER_RESPONSE",
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": (
+                          "python3 ~/.gemini/config/skills/skia-canary-advisor/scripts/"
+                          "canary_advisor.py try --cl 1408157 -b Bot-ASAN -b Canary-Chromium"
+                      )
+                  },
+              }],
+          },
+          {
+              "step_index": 7,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": "Command exited with code 0.\n\nTRIGGER: VERIFIED (CL 1408157 PS 2)\n",
           },
           triage_green_step,
           {**final_step, "step_index": 80},
@@ -1151,8 +1183,8 @@ class TestStopGuard(unittest.TestCase):
                       "name": "run_command",
                       "args": {
                           "CommandLine": (
-                              "luci-auth context -- git cl try -i 1408157 -B skia/skia.primary"
-                              " -b Bot-ASAN -b Canary-Chromium"
+                              "python3 ~/.gemini/config/skills/skia-canary-advisor/scripts/"
+                              "canary_advisor.py try --cl 1408157 -b Bot-ASAN -b Canary-Chromium"
                           )
                       },
                   },
@@ -1174,7 +1206,7 @@ class TestStopGuard(unittest.TestCase):
               "step_index": 6,
               "type": "GENERIC",
               "status": "DONE",
-              "content": "Command exited with code 0.\n\nScheduled builds\n",
+              "content": "Command exited with code 0.\n\nTRIGGER: VERIFIED (CL 1408157 PS 2)\n",
           },
           {**final_step, "step_index": 80},
       ]

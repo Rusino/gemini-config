@@ -1047,7 +1047,8 @@ def generate_report(cl_data, analysis, files):
             f"> **🛡️ Mandatory ASAN & Canary Gate (`[ASAN/CANARY GUARD]`):**\n"
             f"> Run `python3 {advisor_py} advise --cl {cl_data['id']}`\n"
             "> and execute the printed `AGENT ACTION` command"
-            " (`luci-auth context -- git cl try ...`) to auto-trigger ASAN and"
+            " (`canary_advisor.py try ...`, which must end with `TRIGGER: VERIFIED`)"
+            " to auto-trigger ASAN and"
             " external canaries.\n"
         )
 

@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Recommend Skia Canary try jobs (Flutter, G3, Chromium, Android) for a Skia diff or Gerrit CL.
 
-Recommendation-only: prints reasons and a ready `git cl try` command, never triggers builds.
+`advise` only recommends and prints commands; `try` is the one subcommand that triggers builds.
 Every run is logged to ~/.gemini/config/ledgers/canary_advisor.jsonl so that `stats` can later
 measure how often the recommendation was actually followed.
 
 Usage:
   canary_advisor.py advise --cl 1402416            # Gerrit CL (own or under review)
   canary_advisor.py advise --repo ~/skia [--base origin/main]
+  canary_advisor.py try --cl 1402416 -b <builder>  # git cl try + Buildbucket check (TRIGGER:)
   canary_advisor.py triage --cl 1402416 [--ps 3]   # triage tryjobs (ASAN + Canaries)
   canary_advisor.py watch --cl 1402416             # watch tryjobs + triage on completion
   canary_advisor.py health                         # per-canary health from Buildbucket
@@ -49,8 +50,11 @@ PRPC = _depot_tool("prpc")
 LUCI_AUTH = _depot_tool("luci-auth")
 GARDENER_DIR = os.path.expanduser("~/.gemini/jetski/scratch/skia_gardener")
 GOOGLE3_DIR = "/google/src/head/depot/google3"
-# `git cl try` needs a git checkout as cwd, whatever directory the watcher was started from
-SKIA_DIR = os.path.expanduser("~/.gemini/jetski/scratch/skia")
+# `git cl try` needs a git checkout as cwd, whatever directory the watcher was started from.
+# The Mac has no Jetski scratch clone, only ~/Sources/skia
+SKIA_DIR = next((p for p in (os.path.expanduser("~/.gemini/jetski/scratch/skia"),
+                             os.path.expanduser("~/Sources/skia")) if os.path.isdir(p)),
+                os.path.expanduser("~/.gemini/jetski/scratch/skia"))
 HEALTH_WINDOW_DAYS = 45
 
 # Canaries that must never be triggered: they run but give no verdict. Remove an entry only after
@@ -718,11 +722,16 @@ def advise(args):
 
         if bots_to_run:
             cmd = f"{try_prefix} " + " ".join(f"-b {b}" for b in bots_to_run)
+            if meta["cl"]:
+                # The `try` subcommand prints TRIGGER: VERIFIED only once Buildbucket lists the
+                # builds, so a failed `git cl try` can no longer pass for a running bot
+                cmd = (f"python3 {os.path.abspath(__file__)} try --cl {meta['cl']} "
+                       + " ".join(f"-b {b}" for b in bots_to_run))
             print(f"\nAGENT ACTION (execute this command):")
             print(f"  {cmd}")
             if meta["cl"]:
                 script_path = os.path.abspath(__file__)
-                print(f"\nAGENT WATCH (launch in background after git cl try, "
+                print(f"\nAGENT WATCH (launch in background after TRIGGER: VERIFIED, "
                       f"WaitMsBeforeAsync=500, NotificationTimeoutSeconds=5400):")
                 print(f"  python3 {script_path} watch --cl {meta['cl']} --save-draft")
 
@@ -1568,6 +1577,61 @@ def cmd_triage(args):
     return results
 
 
+def git_cl_try(cl, builders):
+    """Run `git cl try` for builders; returns (exit code, combined output)."""
+    git_cl = ["git", "cl", "try", "-i", str(cl), "-B", BUCKET]
+    for b in builders:
+        git_cl += ["-b", b]
+    # luci-auth context gives depot_tools the 7-day LOAS2 credential on Cloudtop. The Mac has no
+    # luci-auth login, and there git cl falls back to its own credentials
+    attempts = [[LUCI_AUTH, "context", "--"] + git_cl, git_cl]
+    for cmd in attempts:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, cwd=SKIA_DIR,
+                              timeout=300)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        if proc.returncode != 0 and "Not logged in" in out and cmd is attempts[0]:
+            continue
+        return proc.returncode, out
+    return proc.returncode, out
+
+
+def cmd_try(args):
+    """Trigger tryjobs and report success only after Buildbucket lists every one of them.
+
+    Incident (Gerrit 1407718 PS18, 2026-11-07): `git cl try` exited 1 with "Unable to determine
+    default branch" from a worktree branch without upstream, only depot_tools warnings were shown,
+    and the agent reported ASAN as running while no build existed for an hour.
+    """
+    meta = load_cl(args.cl, ps=args.ps, include_diff=False)
+    ps = meta["patchset"]
+    # Buildbucket createTime is UTC ISO-8601; a minute of slack covers clock skew
+    started = (datetime.datetime.now(datetime.timezone.utc)
+               - datetime.timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%S")
+    rc, out = git_cl_try(args.cl, args.builders)
+    if rc != 0:
+        lines = [l for l in out.splitlines()
+                 if l.strip() and not l.startswith(("|", "+=", "!!!", "---"))]
+        print("\n".join(lines[-25:]))
+        print(f"\nTRIGGER: FAILED (git cl try exit {rc}; cwd {SKIA_DIR})")
+        return 1
+    deadline = time.time() + args.verify_sec
+    while True:
+        builds = bb_cl_builds(args.cl, ps)
+        missing = [b for b in args.builders
+                   if b not in builds or builds[b].get("createTime", "") < started]
+        if not missing:
+            for b in args.builders:
+                print(f"{b}: {builds[b].get('status')} "
+                      f"(https://cr-buildbucket.appspot.com/build/{builds[b].get('id')})")
+            print(f"\nTRIGGER: VERIFIED (CL {args.cl} PS {ps}: {len(args.builders)} build(s))")
+            return 0
+        if time.time() > deadline:
+            print(f"\nTRIGGER: FAILED (git cl try exit 0, but Buildbucket has no new build for "
+                  f"{', '.join(missing)} on CL {args.cl} PS {ps} after {args.verify_sec}s)")
+            return 1
+        time.sleep(10)
+
+
 def cmd_watch(args):
     cl = args.cl
     meta = load_cl(cl, ps=args.ps)
@@ -1627,17 +1691,10 @@ def cmd_watch(args):
                     )
                     if triage_res["verdict"] == "INFRA_MISHAP" and not asan_retried:
                         print(f"ASAN infra mishap on {asan_builder}; retrying once")
-                        cmd = [
-                            LUCI_AUTH, "context", "--",
-                            "git", "cl", "try", "-i", str(cl), "-B", BUCKET, "-b", asan_builder,
-                        ]
-                        proc = subprocess.run(
-                            cmd, capture_output=True, text=True, check=False, cwd=SKIA_DIR
-                        )
-                        if proc.returncode != 0:
-                            detail = (proc.stderr or proc.stdout or "").strip()
-                            print(f"ERROR: ASAN retry failed (exit {proc.returncode}): {detail}")
-                            print(f"\nWAKEUP_REASON: ASAN_RETRY_FAILED (exit {proc.returncode})")
+                        rc, detail = git_cl_try(cl, [asan_builder])
+                        if rc != 0:
+                            print(f"ERROR: ASAN retry failed (exit {rc}): {detail.strip()}")
+                            print(f"\nWAKEUP_REASON: ASAN_RETRY_FAILED (exit {rc})")
                             cmd_triage(args)
                             return 1
                         # Re-poll so terminal check sees the newly scheduled retry build
@@ -1667,6 +1724,12 @@ def cmd_watch(args):
                 print("\nWAKEUP_REASON: ALL_TRYJOBS_COMPLETE")
                 cmd_triage(args)
                 return 0
+        # A failed trigger leaves nothing to wait for; without this the watcher sat out its whole
+        # 90-minute timeout on Gerrit 1407718 PS18
+        elif elapsed > args.no_builds_min * 60:
+            print(f"\nWAKEUP_REASON: NO_TRYJOBS (none on PS {ps} after {args.no_builds_min}m; "
+                  "the trigger failed, re-run `try` and read its TRIGGER: line)")
+            return 1
 
         time.sleep(poll_sec)
 
@@ -1698,10 +1761,19 @@ def main():
     w.add_argument("--ps", help="Patchset number (defaults to current)")
     w.add_argument("--poll-sec", type=int, default=60, help="Poll interval in seconds")
     w.add_argument("--timeout-min", type=int, default=90, help="Maximum watch time in minutes")
+    w.add_argument("--no-builds-min", type=int, default=10,
+                   help="exit with NO_TRYJOBS when the patchset has no build after this long")
     w.add_argument("--save-draft", action="store_true",
                    help="save sanitized draft to Gerrit on completion if Canary is red")
     w.add_argument("--json", action="store_true", help="output JSON results")
     w.set_defaults(fn=cmd_watch)
+    tr = sub.add_parser("try", help="trigger tryjobs and verify them in Buildbucket")
+    tr.add_argument("--cl", required=True, help="Skia Gerrit change number")
+    tr.add_argument("--ps", help="Patchset number (defaults to current)")
+    tr.add_argument("-b", "--builder", dest="builders", action="append", required=True)
+    tr.add_argument("--verify-sec", type=int, default=120,
+                    help="how long to wait for Buildbucket to list the new builds")
+    tr.set_defaults(fn=cmd_try)
     args = p.parse_args()
     # Subcommands like cmd_triage return result dicts for library callers, not process exit codes
     res = args.fn(args)

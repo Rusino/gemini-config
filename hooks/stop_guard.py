@@ -317,17 +317,22 @@ SKIA_CPP_PATH_RE = re.compile(
 SKIA_GERRIT_RE = re.compile(
     r"https?://skia-review\.googlesource\.com/(?:c/skia/\+/|changes/)?(\d{6,8})"
 )
-# Match both legacy `git cl try` and `luci-auth context -- git cl try` advisor lines
+# Match `canary_advisor.py try` advisor lines plus legacy `git cl try` and
+# `luci-auth context -- git cl try` ones
 AGENT_ACTION_TRY_RE = re.compile(
     r"AGENT ACTION \(execute this command[^\)]*\):\s*\n\s*"
-    r"((?:(?:\S*/)?luci-auth\s+context(?:\s+[^\n]*?)?(?:\s+--)?\s+)?git\s+cl\s+try[^\n]+)"
+    r"((?:(?:\S*/)?luci-auth\s+context(?:\s+[^\n]*?)?(?:\s+--)?\s+)?git\s+cl\s+try[^\n]+"
+    r"|python3\s+\S*canary_advisor\.py\s+try\b[^\n]+)"
 )
 GIT_CL_TRY_BOT_RE = re.compile(r"-b\s+([A-Za-z0-9_.-]+)")
 # Reject `git cl try` failures even when shell exit status was masked with `|| true`
 GIT_CL_TRY_ERROR_RE = re.compile(
-    r"(?:SSOAuthenticator:|^\s*ERROR:|Can't trigger tryjobs:)",
+    r"(?:SSOAuthenticator:|^\s*ERROR:|Can't trigger tryjobs:|^TRIGGER: FAILED)",
     re.MULTILINE,
 )
+# Only `canary_advisor.py try` prints this, after Buildbucket lists every requested build.
+# Exit 0 alone is no proof: on Gerrit 1407718 PS18 a `git cl try` failure hid behind a pipe
+TRIGGER_VERIFIED_RE = re.compile(r"^TRIGGER: VERIFIED\b", re.MULTILINE)
 USER_TRYJOB_OPTOUT_RE = re.compile(
     r"(?:без\s+(?:asan|асан|try|трай|канаре|canar)|skip\s+(?:asan|try|canar)|no\s+(?:asan|try|canar))",
     re.IGNORECASE,
@@ -394,12 +399,13 @@ def _invokes_script_in_cmd(cmd: str, script_name: str) -> bool:
   return False
 
 
-# Extract `-b <bot>` targets from real `git cl try` shell segments outside grep/echo
+# Extract `-b <bot>` targets from real `git cl try` / `canary_advisor.py try` shell segments
+# outside grep/echo
 def _extract_try_bots_from_cmd(cmd: str) -> set[str]:
   bots: set[str] = set()
   for seg in re.split(r"&&|\|\||;|\||\n", strip_heredocs(cmd)):
     seg = seg.strip()
-    if not seg or not re.search(r"\bgit\s+cl\s+try\b", seg):
+    if not seg or not re.search(r"\bgit\s+cl\s+try\b|canary_advisor\.py\s+try\b", seg):
       continue
     if re.match(r"^(?:grep|egrep|fgrep|rg|git\s+grep|echo|cat)\b", seg):
       continue
@@ -408,9 +414,12 @@ def _extract_try_bots_from_cmd(cmd: str) -> set[str]:
   return bots
 
 
-# Require exit code 0 without SSOAuthenticator or depot_tools error output (even under `|| true`)
+# Require exit code 0, no depot_tools error output (even under `|| true`), and the Buildbucket
+# confirmation that only `canary_advisor.py try` prints
 def _try_output_succeeded(content: str, status: str = "") -> bool:
   if status == "ERROR" or GIT_CL_TRY_ERROR_RE.search(content):
+    return False
+  if not TRIGGER_VERIFIED_RE.search(content):
     return False
   m_exit = EXIT_CODE_RE.search(content)
   return bool(m_exit and int(m_exit.group(1)) == 0)
@@ -902,7 +911,8 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
     if missing_try_bots:
       result["asan_canary_issues"].append(
           "[ASAN/CANARY GUARD] `skia-canary-advisor` specified required try job(s) for the agent to run, "
-          f"but the following bot(s) were not triggered via `git cl try`: {', '.join(sorted(missing_try_bots))}. "
+          f"but the following bot(s) were not confirmed by `canary_advisor.py try` "
+          f"(`TRIGGER: VERIFIED`): {', '.join(sorted(missing_try_bots))}. "
           f"Execute this command now:\n  {required_agent_try_cmd}"
       )
     elif (
