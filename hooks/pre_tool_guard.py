@@ -614,7 +614,9 @@ def _git_branch_has_executable_code_changes(
       return None
     repo_root = top.stdout.strip()
     base_ref = "HEAD~1"
-    for cand in ("@{u}", "origin/main", "origin/master"):
+    # Skia checkouts name the remote `upstream`; without it the HEAD~1 fallback judged a 13-CL
+    # stack push by its top commit alone (Gerrit 1407718 PS18)
+    for cand in ("@{u}", "origin/main", "origin/master", "upstream/main"):
       mb = subprocess.run(
           ["git", "-C", repo_root, "merge-base", "HEAD", cand],
           capture_output=True,
@@ -640,9 +642,32 @@ def _git_branch_has_executable_code_changes(
     return None
 
 
+# A corpus report seen in the chat (pasted by a subagent or read from compare.md) counts as a
+# corpus run: the skills route long corpus runs to subagents, whose commands this hook never sees
+SKIA_CORPUS_REPORT_RE = re.compile(r"`VALID \(все пакеты тестов")
+WP_CORPUS_REPORT_RE = re.compile(r"`VALID \(все сьюты завершены")
+CORPUS_ZERO_REGRESSIONS_RE = re.compile(r"Поломано: 0\b")
+
+
+# True only when every repo the command targets differs from the repo of edited_path, so a push
+# of ~/.gemini/config is not held by a Skia edit. Unresolved targets keep the gate
+def _push_targets_other_repo(edited_path: str, cmd: str, workspace_paths: list[str]) -> bool:
+  edited = _resolve_git_dirs(os.path.dirname(edited_path))
+  if not edited:
+    return False
+  dirs = _extract_cmd_target_dirs(cmd, workspace_paths)
+  targets = [_resolve_git_dirs(d) for d in dirs]
+  if not targets or any(t is None for t in targets):
+    return False
+  return all(t[2] != edited[2] for t in targets)
+
+
 # Track whether executable production code in SkParagraph or WebParagraph changed since the last corpus run
 def unverified_corpus_before_upload_or_push(
-    transcript_path: str, current_cmd: str = "", current_step_idx: int = -1
+    transcript_path: str,
+    current_cmd: str = "",
+    current_step_idx: int = -1,
+    workspace_paths: list[str] | None = None,
 ) -> tuple[str, str, str]:
   steps = _load_transcript_steps(transcript_path, current_step_idx)
   if not steps:
@@ -655,6 +680,13 @@ def unverified_corpus_before_upload_or_push(
   has_wp_corpus = False
 
   for step in steps:
+    content = str(step.get("content") or "")
+    # Only tool output and agent messages count; the agent's own reply text could quote a report
+    if step.get("type") != "PLANNER_RESPONSE" and CORPUS_ZERO_REGRESSIONS_RE.search(content):
+      if SKIA_CORPUS_REPORT_RE.search(content):
+        has_skia_corpus = True
+      if WP_CORPUS_REPORT_RE.search(content):
+        has_wp_corpus = True
     if step.get("type") != "PLANNER_RESPONSE":
       continue
     for tc in step.get("tool_calls") or []:
@@ -687,7 +719,12 @@ def unverified_corpus_before_upload_or_push(
   if _invokes_script(current_cmd, "run_webparagraph_corpus.py"):
     has_wp_corpus = True
 
-  if last_skia_file and not has_skia_corpus:
+  ws = workspace_paths or []
+  if (
+      last_skia_file
+      and not has_skia_corpus
+      and not _push_targets_other_repo(last_skia_full_path, current_cmd, ws)
+  ):
     git_has_code = _git_branch_has_executable_code_changes(
         last_skia_full_path, "modules/"
     )
@@ -698,7 +735,11 @@ def unverified_corpus_before_upload_or_push(
           "~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py",
       )
 
-  if last_wp_file and not has_wp_corpus:
+  if (
+      last_wp_file
+      and not has_wp_corpus
+      and not _push_targets_other_repo(last_wp_full_path, current_cmd, ws)
+  ):
     git_has_code = _git_branch_has_executable_code_changes(
         last_wp_full_path,
         ("engine/src/flutter/lib/web_ui/lib/", "lib/web_ui/lib/"),
@@ -734,15 +775,26 @@ SKIA_PERF_PATHSPECS = (
 )
 SKIA_PERF_EXTENSIONS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".mm"}
 SKIA_PERF_SCRIPT = "skia_patch_ab.py"
+PERF_PASS_REPORT_RE = re.compile(
+    r"Skia patch A/B on txt_benchmarks: \*\*(?:UNAFFECTED|NEUTRAL|IMPROVEMENT)\*\*"
+)
 
 
 # Basename of the last C/C++ edit on the SkParagraph hot path with no skia_patch_ab.py run since
 def unverified_perf_gate_before_upload_or_push(
-    transcript_path: str, current_cmd: str = "", current_step_idx: int = -1
+    transcript_path: str,
+    current_cmd: str = "",
+    current_step_idx: int = -1,
+    workspace_paths: list[str] | None = None,
 ) -> str:
   last_full_path = ""
   has_perf_run = False
   for step in _load_transcript_steps(transcript_path, current_step_idx):
+    # A passing report.md seen in tool output or an agent message counts as the A/B run
+    if step.get("type") != "PLANNER_RESPONSE" and PERF_PASS_REPORT_RE.search(
+        str(step.get("content") or "")
+    ):
+      has_perf_run = True
     if step.get("type") != "PLANNER_RESPONSE":
       continue
     for tc in step.get("tool_calls") or []:
@@ -763,6 +815,8 @@ def unverified_perf_gate_before_upload_or_push(
           has_perf_run = True
   if not last_full_path or has_perf_run or _invokes_script(current_cmd, SKIA_PERF_SCRIPT):
     return ""
+  if _push_targets_other_repo(last_full_path, current_cmd, workspace_paths or []):
+    return ""
   # A reverted edit leaves no diff on disk and needs no perf run
   if _git_branch_has_executable_code_changes(last_full_path, SKIA_PERF_PATHSPECS) is False:
     return ""
@@ -776,7 +830,10 @@ TEST_SOURCE_FILE_RE = re.compile(
 
 # Basename of the last C/C++ test file edit with no verify_test_liveness.py run since
 def unverified_test_liveness_before_upload_or_push(
-    transcript_path: str, current_cmd: str = "", current_step_idx: int = -1
+    transcript_path: str,
+    current_cmd: str = "",
+    current_step_idx: int = -1,
+    workspace_paths: list[str] | None = None,
 ) -> str:
   last_full_path = ""
   has_liveness_run = False
@@ -803,6 +860,7 @@ def unverified_test_liveness_before_upload_or_push(
       not last_full_path
       or has_liveness_run
       or _invokes_script(current_cmd, "verify_test_liveness.py")
+      or _push_targets_other_repo(last_full_path, current_cmd, workspace_paths or [])
   ):
     return ""
   if _git_branch_has_executable_code_changes(last_full_path, last_full_path) is False:
@@ -4840,7 +4898,7 @@ def main() -> None:
     if is_git_upload_or_push_command(cmd_str):
       subsys, edited_code_file, req_script = (
           unverified_corpus_before_upload_or_push(
-              transcript_path, cmd_str, step_idx
+              transcript_path, cmd_str, step_idx, workspace_paths
           )
       )
       if edited_code_file:
@@ -4863,7 +4921,9 @@ def main() -> None:
         )
         return
       # Correctness corpora do not measure speed; Skia hot-path diffs need the txt_benchmarks A/B
-      perf_file = unverified_perf_gate_before_upload_or_push(transcript_path, cmd_str, step_idx)
+      perf_file = unverified_perf_gate_before_upload_or_push(
+          transcript_path, cmd_str, step_idx, workspace_paths
+      )
       if perf_file:
         print(
             json.dumps(
@@ -4891,7 +4951,7 @@ def main() -> None:
         return
       # Every added or edited C/C++ test must pass verify_test_liveness.py + mutation_check.py
       unverified_test = unverified_test_liveness_before_upload_or_push(
-          transcript_path, cmd_str, step_idx
+          transcript_path, cmd_str, step_idx, workspace_paths
       )
       if unverified_test:
         print(

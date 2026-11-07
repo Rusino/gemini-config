@@ -906,6 +906,78 @@ class TestPreToolGuard(unittest.TestCase):
             "allow",
         )
 
+  def test_corpus_check_guard_scopes_to_push_repo_and_accepts_subagent_report(self):
+    with tempfile.TemporaryDirectory() as skia, tempfile.TemporaryDirectory() as config, \
+         tempfile.NamedTemporaryFile("w", suffix=".jsonl") as f_trans:
+      for repo in (skia, config):
+        subprocess.run(["git", "init", "-q", repo], check=True)
+      src = os.path.join(skia, "modules", "skparagraph", "src", "CoreTextIndexMap.cpp")
+      os.makedirs(os.path.dirname(src))
+      edit = {
+          "step_index": 1,
+          "type": "PLANNER_RESPONSE",
+          "tool_calls": [{
+              "name": "edit_file",
+              "args": {"Path": src, "Target": "return 0;", "Replacement": "return 1;"},
+          }],
+      }
+      audits = {
+          "step_index": 2,
+          "type": "PLANNER_RESPONSE",
+          "tool_calls": [{
+              "name": "run_command",
+              "args": {"CommandLine": "python3 audit_comments.py && python3 ruthless_audit.py"},
+          }],
+      }
+      report = (
+          "**Вердикт целостности (Integrity Check):** `VALID (все пакеты тестов завершены "
+          "штатно, бинарники проверены, подмены исходников нет)`\n"
+          "**Выполнено тестов: 2398 | Было фейлов: 0 | Починено: 0 | Поломано: {n} | "
+          "Стало фейлов: 0**\n"
+          "# Skia patch A/B on txt_benchmarks: **NEUTRAL**\n"
+      )
+
+      def guard(extra_steps, cmd):
+        f_trans.seek(0)
+        f_trans.truncate()
+        for s in [edit, audits] + extra_steps:
+          f_trans.write(json.dumps(s) + "\n")
+        f_trans.flush()
+        return self.run_guard({
+            "conversationId": "c1",
+            "transcriptPath": f_trans.name,
+            "workspacePaths": [skia],
+            "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}},
+        })
+
+      # Pushing another repo does not ship the Skia edit (incident: ~/.gemini/config push)
+      self.assertEqual(guard([], f"cd {config} && git push origin main")["decision"], "allow")
+      self.assertEqual(guard([], f"git -C {config} push origin main")["decision"], "allow")
+      self.assertEqual(guard([], f"cd {skia} && git push origin main")["decision"], "deny")
+
+      # Subagent reports (compare.md with 0 regressions, passing perf report.md) count as runs
+      sub_ok = {"step_index": 3, "type": "SYSTEM_MESSAGE", "content": report.format(n=0)}
+      self.assertEqual(guard([sub_ok], f"cd {skia} && git push origin main")["decision"],
+                       "allow")
+      sub_bad = {**sub_ok, "content": report.format(n=3)}
+      res_bad = guard([sub_bad], f"cd {skia} && git push origin main")
+      self.assertEqual(res_bad["decision"], "deny")
+      self.assertIn("CORPUS-CHECK GUARD", res_bad["reason"])
+      no_perf = {**sub_ok, "content": report.format(n=0).replace("**NEUTRAL**", "**REGRESSION**")}
+      res_perf = guard([no_perf], f"cd {skia} && git push origin main")
+      self.assertEqual(res_perf["decision"], "deny")
+      self.assertIn("PERF-CHECK GUARD", res_perf["reason"])
+      # The agent quoting a report in its own reply is no evidence
+      own = {"step_index": 3, "type": "PLANNER_RESPONSE", "content": report.format(n=0)}
+      self.assertEqual(guard([own], f"cd {skia} && git push origin main")["decision"], "deny")
+      # An edit after the report needs a new run
+      later_edit = {**edit, "step_index": 4}
+      self.assertEqual(
+          guard([sub_ok, later_edit, {**audits, "step_index": 5}],
+                f"cd {skia} && git push origin main")["decision"],
+          "deny",
+      )
+
   def test_corpus_check_guard_requires_flutter_corpus_only_for_executable_code_edits(self):
     skia_src = "/workspace/skia/modules/skparagraph/src/ParagraphImpl.cpp"
     wp_src = "/workspace/flutter/engine/src/flutter/lib/web_ui/lib/src/engine/text_fragmenter.dart"
