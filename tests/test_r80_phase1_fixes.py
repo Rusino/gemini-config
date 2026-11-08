@@ -276,15 +276,17 @@ class R80Phase1FixesTest(unittest.TestCase):
     self.assertTrue(ok_close["ok"])
     self.assertEqual(ok_close["status"], "FIXED")
 
-    # 2. render enforces authorization scope and wraps in <untrusted_bug_content>
+    # 2. render reads any redacted issue under standing auth and wraps in <untrusted_bug_content>
     with mock.patch.object(
-        w, "call_buganizer_mcp_batch", return_value=["assignee: someone@else.com"]
+        w, "call_buganizer_mcp_batch", return_value=["Foreign public bug description"]
     ):
-      denied = bug_actions.render_issue_with_external_auth(
+      foreign = bug_actions.render_issue_with_external_auth(
           "999999", state={"bugs": {}}
       )
-    self.assertFalse(denied["ok"])
-    self.assertIn("not in Flight Deck state", denied["error"])
+    self.assertTrue(foreign["ok"])
+    self.assertEqual(foreign["auth_scope"], "standing_authorization")
+    self.assertIn("<untrusted_bug_content", foreign["content"])
+    self.assertIn("Foreign public bug description", foreign["content"])
 
     with mock.patch.object(
         w, "call_buganizer_mcp_batch", return_value=["Public bug description"]
@@ -296,6 +298,24 @@ class R80Phase1FixesTest(unittest.TestCase):
     self.assertTrue(allowed["ok"])
     self.assertIn("<untrusted_bug_content", allowed["content"])
     self.assertIn("Public bug description", allowed["content"])
+
+    # 2b. search queries get_bugs_with_external read-only and wraps in <untrusted_bug_content>
+    with mock.patch.object(
+        w, "call_buganizer_mcp_batch", return_value=["Issue 12345: search hit"]
+    ) as m_search:
+      searched = bug_actions.search_bugs_with_external_auth(
+          "componentid:1457031", max_results=5
+      )
+    self.assertTrue(searched["ok"])
+    self.assertEqual(searched["max_results"], 5)
+    self.assertIn("<untrusted_bug_content", searched["content"])
+    self.assertIn("Issue 12345: search hit", searched["content"])
+    m_search.assert_called_once_with([
+        (
+            "get_bugs_with_external",
+            {"query": "componentid:1457031", "maxResults": 5, "verbose": True},
+        )
+    ])
 
     # 3. reassign_merge blocks when merge_request_groups gates failed
     fake_state = {
