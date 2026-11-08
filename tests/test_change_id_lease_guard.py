@@ -108,9 +108,6 @@ class ChangeIdLeaseGuardTest(unittest.TestCase):
                       f"`{TITLES['c1']}` (conversation://c1, active 1m ago, branch `stack`", reason)
         self.assertIn(f"git diff > {self.art('c2')}/scratch/<name>.patch", reason)
         self.assertIn("the owner sets its roadmap item todo/done", reason)
-    self.git(self.wt2, "checkout", "-q", "-B", "side", "refs/remotes/origin/main")
-    self.assertIn("CHANGE-ID LEASE GUARD",
-                  self.denial(f"git -C {self.wt2} cherry-pick {self.stack_sha}", "c2"))
     # Unrelated work stays free: a new commit with its own Change-Id
     self.assertEqual(self.denial(f"git -C {self.wt2} commit -m x -m 'Change-Id: {OTHER_ID}'",
                                  "c2"), "")
@@ -141,13 +138,19 @@ class ChangeIdLeaseGuardTest(unittest.TestCase):
     self.assertIn("CHANGE-ID LEASE GUARD",
                   self.denial(f"cd {self.repo} && git commit --amend --no-edit", "c2"))
 
-  # A no-commit cherry-pick for a local A/B is checked but never takes over a stale lease, and
-  # option values such as -m 1 are not read as revisions
-  def test_no_commit_cherry_pick_does_not_claim(self):
-    self.set_lease_ts(time.time() - 2 * pre_tool_guard.WORKTREE_LEASE_TTL_S)
-    cmd = f"git -C {self.wt2} cherry-pick -n -m 1 {self.stack_sha}"
+  # Copying a leased CL into one's own branch for an A/B is free and claims nothing, but the
+  # copy cannot be amended, rebased or uploaded, so it never reaches Gerrit
+  def test_cherry_pick_copy_is_free_but_cannot_be_pushed(self):
+    self.set_lease_ts(time.time())
+    self.git(self.wt2, "checkout", "-q", "-B", "side", "refs/remotes/origin/main")
+    cmd = f"git -C {self.wt2} cherry-pick {self.stack_sha}"
     self.assertEqual(self.denial(cmd, "c2"), "")
     self.assertEqual(self.leases()[CHANGE_ID]["conv_id"], "c1")
+    self.git(self.wt2, "cherry-pick", self.stack_sha)
+    for cmd in (f"git -C {self.wt2} commit --amend --no-edit", f"git -C {self.wt2} cl upload",
+                f"git -C {self.wt2} rebase origin/main"):
+      with self.subTest(cmd=cmd):
+        self.assertIn("CHANGE-ID LEASE GUARD", self.denial(cmd, "c2"))
 
   # Subagents act for their parent, so they never collide with the parent's own leases
   def test_subagent_counts_as_parent(self):

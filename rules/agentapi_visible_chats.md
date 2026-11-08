@@ -127,10 +127,11 @@ To move chats/chains between projects, run `python3
     only your own files with explicit pathspecs (`git add -- <files> && git commit -m "..." --
     <files>`), and never `git push` when `@{u}..HEAD` contains another active chat's commits
     (`[FOREIGN-COMMIT PUSH GUARD]`). One deliverable document lives at one canonical path.
-  - **CL stacks (`[CHANGE-ID LEASE GUARD]`)**: amend, rebase, cherry-pick and upload lease the
-    Change-Ids they rewrite to the chat (subagents count as their parent) in all worktrees, until it
-    goes idle. A second chat may read, review, benchmark and write patch files for that stack, not
-    commit to it. Hand-over: the owner sets any roadmap item todo/done (releases all its stacks).
+  - **CL stacks (`[CHANGE-ID LEASE GUARD]`)**: amend, rebase and upload lease the Change-Ids they
+    rewrite to the chat (subagents count as their parent) in all worktrees, until it goes idle. A
+    second chat may read, review, benchmark (cherry-pick into its own branch) and write patch files
+    for that stack, not amend, rebase or upload it. Hand-over: the owner sets any roadmap item
+    todo/done, which releases all its stacks; it marks its item done only after the upload ends.
 - **Wrong-Chat / Cross-Project Scope Guard**:
   - If `[SCOPE GUARD: WRONG-CHAT / WRONG-PROJECT RADAR]` shows a new user request belongs to another
     project or foreign workspace (never a sibling chat in the same project), **do not** start

@@ -3677,10 +3677,12 @@ CHANGE_LEASE_FILE = "jetski_change_leases.json"
 # Entries untouched for a week are dropped on write; liveness itself comes from activity checks
 CHANGE_LEASE_PRUNE_S = 7 * 86400
 CHANGE_LEASE_BASES = ("@{u}", "upstream/main", "upstream/master", "origin/main", "origin/master")
-# Option values that are not revisions in rebase / cherry-pick argument lists
+# Option values that are not revisions in rebase argument lists
 REBASE_VALUE_FLAGS = frozenset({"--onto", "-s", "--strategy", "-X", "--strategy-option", "-x",
-                                "--exec", "-m", "--mainline"})
-STACK_SUBCOMMANDS = ("commit", "rebase", "cherry-pick", "cl", "push")
+                                "--exec"})
+# cherry-pick is absent on purpose: copying leased CLs into one's own branch for an A/B is
+# allowed and claims nothing, while amend/rebase/upload of the copies stay guarded
+STACK_SUBCOMMANDS = ("commit", "rebase", "cl", "push")
 
 
 # Return who holds owner_cid's stack after since_ts per the owner's roadmap journal: owner_cid
@@ -3757,8 +3759,8 @@ def _change_ids_in_log(root: str, *args: str) -> list[str]:
 
 # Return (Change-Ids, claim) for the commits that the git invocations (sub, args) create,
 # rewrite or upload in root. Only what each command really rewrites counts, so a chat can
-# amend or rebase its own CL on top of another chat's stack. claim is False when nothing is
-# committed (cherry-pick -n, upload --dry-run): those are checked but never take a lease
+# amend or rebase its own CL on top of another chat's stack. claim is False for a dry-run
+# upload, which is checked but never takes a lease
 def _change_ids_touched(
     root: str, invocations: list[tuple[str, list[str]]], cmd: str
 ) -> tuple[list[str], bool]:
@@ -3789,13 +3791,6 @@ def _change_ids_touched(
         ids += _change_ids_in_log(root, f"{positional[0]}..HEAD")
       else:
         stack_refs.append("HEAD")
-    elif sub == "cherry-pick" and not any(a in ("--abort", "--quit", "--skip") for a in args):
-      if "--continue" in args:
-        stack_refs.append("HEAD")
-      claim = claim and not ({"-n", "--no-commit"} & set(args))
-      # Picked commits keep their Change-Ids, so picking a leased CL is working on it
-      for rev in positional:
-        ids += _change_ids_in_log(root, *([rev] if ".." in rev else ["-1", rev]))
     elif (sub == "cl" and args[:1] == ["upload"]) or (
         sub == "push" and any(REFS_FOR_SPEC_RE.match(a) for a in args)):
       claim = claim and "--dry-run" not in args and "-n" not in args
@@ -3888,7 +3883,7 @@ def _check_and_claim_change_leases(
     os.close(fd)
 
 
-# Deny commit/amend/rebase/cherry-pick/upload commands on Change-Ids leased by another live
+# Deny commit/amend/rebase/upload commands on Change-Ids leased by another live
 # chat, else lease them to this chat (subagents count as their parent). Leases live in the git
 # common dir, so every worktree of a repo sees them; the user-confirmed
 # .parallel_chat_override.json of the worktree lease guard lifts the check
