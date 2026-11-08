@@ -16,6 +16,7 @@ import re
 import subprocess
 import time
 from typing import Any
+import urllib.parse
 
 import work_store
 
@@ -127,8 +128,59 @@ WRITE_CMD_PATTERNS = (
 WRITE_TOOL_NAMES = frozenset({
     "update_doc",
     "create_file",
+    "add_comment_reply",
+    "resolve_comment_thread",
+    "send_message",
     "send_message_markdown",
 })
+
+# Match markdown links and MCP Drive/Docs JSON payloads so read-only specs get real doc titles
+_RE_MD_GDOC_LINK = re.compile(
+    r"\[([^\]\n]{3,160})\]\(\s*https?://docs\.google\.com/document/d/"
+    r"([A-Za-z0-9_\-]{20,64})[^)]*\)",
+    re.IGNORECASE,
+)
+_RE_JSON_GDOC_ID_TITLE = re.compile(
+    r'"(?:id|fileId|documentId)"\s*:\s*"([A-Za-z0-9_\-]{20,64})"[^{}]{0,400}?'
+    r'"(?:title|name)"\s*:\s*"([^"\\\n]{3,160})"',
+)
+_RE_JSON_GDOC_TITLE_ID = re.compile(
+    r'"(?:title|name)"\s*:\s*"([^"\\\n]{3,160})"[^{}]{0,400}?'
+    r'"(?:id|fileId|documentId)"\s*:\s*"([A-Za-z0-9_\-]{20,64})"',
+)
+_RE_GDOC_DISCO_URL = re.compile(
+    r"docs\.google\.com/document/d/([A-Za-z0-9_\-]{20,64})/"
+    r"[^\s)\"']*?[?#&]disco=([A-Za-z0-9._\-]+)",
+    re.IGNORECASE,
+)
+_RE_GDOC_NOTIFY_TITLE = re.compile(
+    r"docos/notify\?(?:[^)\s\"']*?[?&])?title=([^&\"'\s)]+)",
+    re.IGNORECASE,
+)
+_RE_GDOC_FOLLOWING_DOC = re.compile(
+    r"following\s+document\s*\r?\n\s*([^\r\n(]{3,180})",
+    re.IGNORECASE,
+)
+_RE_GDOC_SHARE_SUBJECT = re.compile(
+    r"^(?:document|presentation|spreadsheet)\s+shared\s+with\s+you:\s*[\"“']?(.+?)[\"”']?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_mcp_call_args(args: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+  """Extracts (ToolName, decoded Arguments dict) from a call_mcp_tool invocation."""
+  tool_name = str(args.get("ToolName") or "").strip()
+  raw_inner = args.get("Arguments")
+  if isinstance(raw_inner, Mapping):
+    return tool_name, dict(raw_inner)
+  if isinstance(raw_inner, str) and raw_inner.strip():
+    try:
+      parsed = json.loads(raw_inner)
+      if isinstance(parsed, Mapping):
+        return tool_name, dict(parsed)
+    except Exception:
+      pass
+  return tool_name, {}
 
 
 # GitHub PR notification emails embed /issues/<N> inside pull_request hovercard attributes
@@ -307,6 +359,10 @@ def _is_write_step(step: Mapping[str, Any]) -> bool:
       return True
     args = tc.get("args") or tc.get("arguments") or {}
     if isinstance(args, Mapping):
+      if tname == "call_mcp_tool":
+        mcp_tool, _ = _parse_mcp_call_args(args)
+        if mcp_tool in WRITE_TOOL_NAMES:
+          return True
       if tname in ("edit_file", "write_file"):
         p = str(args.get("Path") or "")
         if p and not any(
@@ -455,11 +511,181 @@ def _extract_step_texts(
             "send_message_markdown",
         ):
           blob = json.dumps(args, ensure_ascii=False)
-          if tname in WRITE_TOOL_NAMES:
+          is_mcp_write = tname in WRITE_TOOL_NAMES
+          if tname == "call_mcp_tool":
+            mcp_tool, mcp_args = _parse_mcp_call_args(args)
+            if mcp_tool in WRITE_TOOL_NAMES:
+              is_mcp_write = True
+            fid = str(mcp_args.get("fileId") or mcp_args.get("documentId") or "").strip()
+            if re.fullmatch(r"[A-Za-z0-9_\-]{20,64}", fid):
+              blob = f"https://docs.google.com/document/d/{fid}/edit {blob}"
+          if is_mcp_write:
             anchor_texts.append(blob)
           else:
             aux_texts.append(blob)
   return anchor_texts, aux_texts
+
+
+def _collect_gdoc_metadata_from_step(
+    step: Mapping[str, Any],
+    gdoc_titles: dict[str, str],
+    gdoc_comment_ops: list[tuple[str, str, str, float]],
+    fallback_ts: float,
+) -> None:
+  """Extracts GDoc human titles and MCP comment reply/resolve actions from a step."""
+  def _record_title(doc_id: str, raw_title: str) -> None:
+    did = str(doc_id or "").strip()
+    t_clean = work_store.clean_work_title(str(raw_title or "").strip())
+    if (
+        re.fullmatch(r"[A-Za-z0-9_\-]{20,64}", did)
+        and len(t_clean) >= 3
+        and "http://" not in t_clean.lower()
+        and "https://" not in t_clean.lower()
+        and not work_store.is_placeholder_title(t_clean, f"gdoc:{did}")
+    ):
+      gdoc_titles[did] = t_clean
+
+  content = str(step.get("content") or "")
+  if content:
+    for m_md in _RE_MD_GDOC_LINK.finditer(content):
+      _record_title(m_md.group(2), m_md.group(1))
+    stripped = content.strip()
+    parsed_json_ok = False
+    if stripped.startswith(("{", "[")):
+      try:
+        parsed = json.loads(stripped)
+        parsed_json_ok = True
+        objs: list[Mapping[str, Any]] = []
+        if isinstance(parsed, Mapping):
+          objs.append(parsed)
+          if isinstance(parsed.get("files"), list):
+            objs.extend(x for x in parsed["files"] if isinstance(x, Mapping))
+        elif isinstance(parsed, list):
+          objs.extend(x for x in parsed if isinstance(x, Mapping))
+        for obj in objs:
+          fid = str(obj.get("id") or obj.get("fileId") or obj.get("documentId") or "")
+          ftitle = str(obj.get("title") or obj.get("name") or "")
+          if fid and ftitle:
+            _record_title(fid, ftitle)
+      except Exception:
+        pass
+    if not parsed_json_ok:
+      for m_jt in _RE_JSON_GDOC_ID_TITLE.finditer(content):
+        _record_title(m_jt.group(1), m_jt.group(2))
+      for m_tj in _RE_JSON_GDOC_TITLE_ID.finditer(content):
+        _record_title(m_tj.group(2), m_tj.group(1))
+
+  step_ts = _parse_iso_ts(str(step.get("created_at") or "")) or fallback_ts
+  for tc in step.get("tool_calls") or []:
+    if not isinstance(tc, Mapping):
+      continue
+    if str(tc.get("name") or "") != "call_mcp_tool":
+      continue
+    args = tc.get("args") or tc.get("arguments") or {}
+    if not isinstance(args, Mapping):
+      continue
+    mcp_tool, mcp_args = _parse_mcp_call_args(args)
+    if mcp_tool in ("add_comment_reply", "resolve_comment_thread"):
+      fid = str(mcp_args.get("fileId") or mcp_args.get("documentId") or "").strip()
+      cid_c = str(mcp_args.get("commentId") or "").strip()
+      if fid and cid_c:
+        gdoc_comment_ops.append((mcp_tool, fid, cid_c, step_ts))
+
+
+def _apply_transcript_gdoc_comment_ops(
+    store: work_store.WorkStore,
+    gdoc_comment_ops: list[tuple[str, str, str, float]],
+    gdoc_titles: Mapping[str, str],
+    fallback_work_id: str,
+    cur_now: float,
+) -> set[str]:
+  """Applies MCP comment reply/resolve ops onto #disco threads owned by each doc's Work."""
+  touched_wids: set[str] = set()
+  for op_name, fid, cid_c, op_ts in gdoc_comment_ops:
+    cand_gt = f"gdoc_thread:{fid}:{cid_c}"
+    # Drive API commentId omits the "doco." prefix emitted in Gmail ?disco= notification links
+    if store.get_artifact(cand_gt) is None and not cid_c.startswith("doco."):
+      alt_gt = f"gdoc_thread:{fid}:doco.{cid_c}"
+      if store.get_artifact(alt_gt) is not None:
+        cand_gt = alt_gt
+    disco_part = cand_gt.split(":", 2)[2]
+    gt_art = store.get_artifact(cand_gt) or {}
+    gt_prev_st = gt_art.get("state") if isinstance(gt_art.get("state"), Mapping) else {}
+    prev_msg_ts = float(gt_prev_st.get("last_message_ts") or 0.0)
+    doc_key = f"gdoc:{fid}"
+    doc_t = str(
+        gt_prev_st.get("doc_title")
+        or gdoc_titles.get(fid)
+        or (store.get_artifact(doc_key) or {}).get("title")
+        or cand_gt
+    )
+    gt_url = f"https://docs.google.com/document/d/{fid}/edit?disco={disco_part}"
+    # Interim MCP reply moves obligation to Waiting; explicit MCP resolve closes the thread
+    if op_name == "add_comment_reply":
+      op_state: dict[str, Any] = {
+          "doc_id": fid,
+          "disco_id": disco_part,
+          "doc_title": doc_t,
+          "sent_by_me": True,
+          "last_from_me": True,
+          "mcp_reply_ts": op_ts,
+          "last_message_ts": max(prev_msg_ts, op_ts),
+          "is_active_correspondence": True,
+          "unanswered_human": False,
+      }
+    else:
+      op_state = {
+          "doc_id": fid,
+          "disco_id": disco_part,
+          "doc_title": doc_t,
+          "resolved": True,
+          "resolved_by_me": True,
+          "resolved_at": op_ts,
+          "unanswered_human": False,
+      }
+    store.upsert_artifact(
+        cand_gt,
+        kind="gdoc_thread",
+        title=str(gt_art.get("title") or doc_t),
+        url=gt_url,
+        state=op_state,
+        now=cur_now,
+    )
+    # Attach to the doc's existing Work before falling back to a multi-CL chat Work
+    target_wid = (
+        store.find_work_by_artifact(cand_gt, roles=("primary", "channel"))
+        or store.find_work_by_artifact(doc_key, roles=("primary", "channel"))
+        or fallback_work_id
+    )
+    if not target_wid:
+      target_wid = store.create_work(doc_t, now=cur_now)
+      store.upsert_artifact(
+          doc_key,
+          kind="gdoc",
+          title=doc_t,
+          url=f"https://docs.google.com/document/d/{fid}/edit",
+          now=cur_now,
+      )
+      store.link_artifact(
+          target_wid,
+          doc_key,
+          role="primary",
+          source="auto",
+          link_reason="gdoc_comment",
+          now=cur_now,
+      )
+    store.link_artifact(
+        target_wid,
+        cand_gt,
+        role="channel",
+        source="auto",
+        link_reason="gdoc_comment",
+        now=cur_now,
+    )
+    touched_wids.add(target_wid)
+  for tw in touched_wids:
+    store.reconcile_correspondence_obligations(tw, now=cur_now)
+  return touched_wids
 
 
 def ingest_transcript_file(
@@ -494,6 +720,8 @@ def ingest_transcript_file(
   # Track (label, kind, url) for companion probes created during review sessions
   companion_cls: dict[str, tuple[str, str, str]] = {}
   mention_steps: dict[str, int] = {}
+  gdoc_titles: dict[str, str] = {}
+  gdoc_comment_ops: list[tuple[str, str, str, float]] = []
   if chat_title:
     for akey, akind, aurl in extract_artifacts_from_text(chat_title):
       extracted[akey] = (akey, akind, aurl)
@@ -587,6 +815,7 @@ def ingest_transcript_file(
             mention_steps.setdefault(c_akey, step_idx)
         if _is_write_step(step):
           has_write = True
+        _collect_gdoc_metadata_from_step(step, gdoc_titles, gdoc_comment_ops, cur_now)
         anc_snippets, aux_snippets = _extract_step_texts(step, is_first_user_turn=is_first_u)
         for snippet in anc_snippets:
           step_arts = extract_artifacts_from_text(snippet)
@@ -657,15 +886,31 @@ def ingest_transcript_file(
   ):
     return False
 
+  # Upgrade human titles on stored Google Docs even when the transcript itself is read-only
+  for doc_id, doc_title in gdoc_titles.items():
+    doc_key = f"gdoc:{doc_id}"
+    if store.get_artifact(doc_key) is not None:
+      store.upsert_artifact(
+          doc_key,
+          kind="gdoc",
+          title=doc_title,
+          url=f"https://docs.google.com/document/d/{doc_id}/edit",
+          state={"doc_title": doc_title},
+          now=cur_now,
+      )
+
   if not has_write:
     # Read-only session: never mint a Work card; store artifacts in 7-day candidate buffer
     for akey, akind, aurl in extracted.values():
       if akind == "gmail_draft":
         continue
+      cand_title = (
+          gdoc_titles.get(akey.split(":", 1)[-1], akey) if akind == "gdoc" else akey
+      )
       store.record_candidate(
           akey,
           kind=akind,
-          title=akey,
+          title=cand_title,
           url=aurl,
           chat_chain_id=detected_root,
           now=cur_now,
@@ -738,6 +983,12 @@ def ingest_transcript_file(
 
   if not work_id:
     if not primaries and not channels:
+      # Still apply MCP comment replies/resolves when an investigation chat inspected >4 CLs
+      if gdoc_comment_ops:
+        _apply_transcript_gdoc_comment_ops(
+            store, gdoc_comment_ops, gdoc_titles, "", cur_now
+        )
+        return True
       return False
     primary_title = ""
     if primaries:
@@ -799,7 +1050,15 @@ def ingest_transcript_file(
   for akey, akind, aurl in primaries:
     if akind in ("gerrit", "github_pr", "piper") and not reviewed_cl_key:
       reviewed_cl_key = akey
-    store.upsert_artifact(akey, kind=akind, title=akey, url=aurl, now=cur_now)
+    prim_title = (
+        gdoc_titles.get(akey.split(":", 1)[-1], akey) if akind == "gdoc" else akey
+    )
+    prim_state = (
+        {"doc_title": prim_title} if (akind == "gdoc" and prim_title != akey) else None
+    )
+    store.upsert_artifact(
+        akey, kind=akind, title=prim_title, url=aurl, state=prim_state, now=cur_now
+    )
     existing_owner = store.find_work_by_artifact(akey, roles=("primary",))
     if existing_owner and existing_owner != work_id:
       s_idx = mention_steps.get(akey, 0)
@@ -911,6 +1170,12 @@ def ingest_transcript_file(
           chat_chain_id=detected_root,
           now=cur_now,
       )
+
+  touched_wids = _apply_transcript_gdoc_comment_ops(
+      store, gdoc_comment_ops, gdoc_titles, work_id, cur_now
+  )
+  if work_id not in touched_wids:
+    store.reconcile_correspondence_obligations(work_id, now=cur_now)
   return True
 
 
@@ -1191,6 +1456,13 @@ def ingest_cl_watcher_state(
 def _clean_display_name(raw_addr: str) -> str:
   part = str(raw_addr or "").split(",")[0].strip()
   name = part.split("<")[0].strip().strip('"').strip("'")
+  # Strip Google Docs/Drive sender wrappers so human colleague names match across channels
+  name = re.sub(
+      r"\s*\((?:via\s+)?google\s+(?:docs|slides|sheets|drive)\)\s*$",
+      "",
+      name,
+      flags=re.IGNORECASE,
+  ).strip()
   if name:
     return name
   return part.strip("<> ")
@@ -1315,7 +1587,7 @@ def _fetch_gmail_thread_provenance(
   cached = thread_cache.get(tid)
   if (
       isinstance(cached, Mapping)
-      and int(cached.get("schema_ver") or 0) == 4
+      and int(cached.get("schema_ver") or 0) == 5
       and (now - float(cached.get("fetched_at") or 0.0) < 600)
   ):
     return dict(cached)
@@ -1352,8 +1624,12 @@ def _fetch_gmail_thread_provenance(
     is_gh_issue = "notifications@github.com" in from0.lower() and bool(
         re.search(r"\(Issue\s+#\d+\)", raw_subj, flags=re.IGNORECASE)
     )
+    is_gdoc_comment = "comments-noreply@docs.google.com" in from0.lower()
     is_drive_share = bool(
-        re.search(r"\(via\s+google\s+(?:docs|slides|sheets|drive)\)", from0, flags=re.IGNORECASE)
+        "drive-shares-dm-noreply@google.com" in from0.lower()
+        or re.search(
+            r"\(via\s+google\s+(?:docs|slides|sheets|drive)\)", from0, flags=re.IGNORECASE
+        )
         or root_subj.lower().startswith(
             ("document shared with you:", "presentation shared", "spreadsheet shared")
         )
@@ -1369,10 +1645,12 @@ def _fetch_gmail_thread_provenance(
     counterparty = ""
     counterparty_reply_ts = 0.0
     last_message_ts = origin_ts
+    last_message_id = str(m0.get("id") or "")
     last_from_me = started_by_me
     sent_by_me = started_by_me
     non_bot_human_count = 0
     last_snippet = ""
+    last_unquoted_text = ""
     text_blocks: list[str] = [raw_subj] if raw_subj else []
     # Preserve INBOX/TRASH/CATEGORY_PERSONAL only from Gmail labelIds across messages
     has_labels_meta = False
@@ -1405,8 +1683,21 @@ def _fetch_gmail_thread_provenance(
         text_blocks.append(snip)
       f_hdr = hm.get("from") or ""
       t_hdr = hm.get("to") or ""
+      if "comments-noreply@docs.google.com" in f_hdr.lower():
+        is_gdoc_comment = True
+      if "drive-shares-dm-noreply@google.com" in f_hdr.lower():
+        is_drive_share = True
       mts = float(int(m.get("internalDate") or 0)) / 1000.0 if m.get("internalDate") else 0.0
       is_me = _is_me_sender(f_hdr)
+      cand_sender = _clean_display_name(f_hdr)
+      is_gdoc_human_proxy = (
+          ("comments-noreply@docs.google.com" in f_hdr.lower())
+          or ("drive-shares-dm-noreply@google.com" in f_hdr.lower())
+      ) and bool(cand_sender) and cand_sender.lower() not in ("google docs", "google drive")
+      is_bot = (
+          "[bot]" in cand_sender.lower()
+          or (not is_gdoc_human_proxy and bool(_RE_AUTOMATED_SENDER_ADDR.search(f_hdr)))
+      )
       if is_me:
         sent_by_me = True
       else:
@@ -1418,7 +1709,7 @@ def _fetch_gmail_thread_provenance(
         if _NON_PERSONAL_CATEGORIES & m_labels:
           seen_non_personal_cat = True
         # GitHub @mention notifications intentionally carry List-Id/Precedence: list headers
-        if not is_gh_issue:
+        if not is_gh_issue and not is_gdoc_comment:
           prec = str(hm.get("precedence") or "").strip().lower()
           auto_sub = str(hm.get("auto-submitted") or "").strip().lower()
           if (
@@ -1431,20 +1722,18 @@ def _fetch_gmail_thread_provenance(
               or auto_sub not in ("", "no")
           ):
             is_bulk_or_list = True
-      if mts >= last_message_ts:
+      if mts >= last_message_ts and not (is_gh_issue and "[bot]" in cand_sender.lower()):
         last_message_ts = mts
         last_from_me = is_me
         last_labels = m_labels
-      cand_sender = _clean_display_name(f_hdr)
-      is_bot = (
-          "[bot]" in cand_sender.lower()
-          or bool(_RE_AUTOMATED_SENDER_ADDR.search(f_hdr))
-      )
+        if m.get("id"):
+          last_message_id = str(m.get("id"))
+        last_unquoted_text = (body_txt.strip() if body_txt else snip)[:400]
       if not is_bot and cand_sender:
         non_bot_human_count += 1
       if not is_me and f_hdr and not is_bot:
         if cand_sender:
-          if not counterparty or is_gh_issue:
+          if not counterparty or is_gh_issue or is_gdoc_comment:
             counterparty = cand_sender
         if mts > counterparty_reply_ts:
           counterparty_reply_ts = mts
@@ -1466,9 +1755,52 @@ def _fetch_gmail_thread_provenance(
     )
     has_non_personal_category = seen_non_personal_cat
     me_addressed, recipient_count = _extract_recipient_info(inbound_hdrs)
+    full_thread_text = "\n".join(text_blocks)
+
+    gdoc_id = ""
+    disco_id = ""
+    doc_title = ""
+    gdoc_me_engaged = False
+    gdoc_resolved = False
+    gdoc_resolved_by_me = False
+    if is_gdoc_comment or is_drive_share:
+      m_disco = _RE_GDOC_DISCO_URL.search(full_thread_text)
+      if m_disco:
+        gdoc_id = m_disco.group(1)
+        disco_id = m_disco.group(2)
+      else:
+        m_doc_any = RE_GDOC.search(full_thread_text)
+        if m_doc_any:
+          gdoc_id = m_doc_any.group(1)
+        m_d_only = re.search(r"[?#&]disco=([A-Za-z0-9._\-]+)", full_thread_text)
+        if m_d_only:
+          disco_id = m_d_only.group(1)
+      m_nt = _RE_GDOC_NOTIFY_TITLE.search(full_thread_text)
+      if m_nt:
+        doc_title = urllib.parse.unquote_plus(m_nt.group(1)).strip()
+      if not doc_title:
+        m_sh = _RE_GDOC_SHARE_SUBJECT.match(root_subj)
+        if m_sh:
+          doc_title = m_sh.group(1).strip()
+      if not doc_title:
+        m_fd = _RE_GDOC_FOLLOWING_DOC.search(full_thread_text)
+        if m_fd:
+          doc_title = m_fd.group(1).strip()
+      if is_gdoc_comment:
+        if re.search(r"(?:^|\n)\s*(?:Julia Lavrova|jlavrova)\s*\r?\n", full_thread_text, re.I):
+          sent_by_me = True
+        if re.search(
+            r"mentioned\s+you\s+in\s+a\s+comment|assigned\s+to\s+you|@jlavrova|\+jlavrova",
+            full_thread_text,
+            re.IGNORECASE,
+        ):
+          gdoc_me_engaged = True
+        if re.search(r"\bmarked\s+as\s+resolved\b", last_unquoted_text or full_thread_text, re.I):
+          gdoc_resolved = True
+          gdoc_resolved_by_me = bool(last_from_me)
 
     prov = {
-        "schema_ver": 4,
+        "schema_ver": 5,
         "thread_id": tid,
         "origin_ts": origin_ts,
         "root_subject": root_subj,
@@ -1477,14 +1809,23 @@ def _fetch_gmail_thread_provenance(
         "sent_by_me": sent_by_me,
         "last_from_me": last_from_me,
         "last_message_ts": last_message_ts,
+        "last_message_id": last_message_id,
         "last_snippet": last_snippet[:160],
+        "last_unquoted_text": last_unquoted_text,
         "counterparty": counterparty,
         "counterparty_reply_ts": counterparty_reply_ts,
         "message_count": len(msgs),
         "non_bot_human_count": non_bot_human_count,
         "is_github_issue_thread": is_gh_issue,
+        "is_gdoc_comment": is_gdoc_comment,
         "is_automated": is_automated,
         "is_drive_share": is_drive_share,
+        "gdoc_id": gdoc_id,
+        "disco_id": disco_id,
+        "doc_title": doc_title,
+        "gdoc_me_engaged": gdoc_me_engaged,
+        "gdoc_resolved": gdoc_resolved,
+        "gdoc_resolved_by_me": gdoc_resolved_by_me,
         "in_inbox": in_inbox,
         "in_trash_or_spam": in_trash_or_spam,
         "has_personal_category": has_personal_category,
@@ -1492,13 +1833,210 @@ def _fetch_gmail_thread_provenance(
         "is_bulk_or_list": is_bulk_or_list,
         "me_addressed": me_addressed,
         "recipient_count": recipient_count,
-        "thread_text": "\n".join(text_blocks),
+        "thread_text": full_thread_text,
         "fetched_at": now,
     }
     thread_cache[tid] = prov
     return dict(prov)
   except Exception:
     return dict(cached) if isinstance(cached, Mapping) else {"thread_id": tid}
+
+
+def _ingest_gdoc_gmail_thread(
+    store: work_store.WorkStore,
+    t_prov: Mapping[str, Any],
+    draft_thread_ids: set[str],
+    dismissed_keys: set[str],
+    completed_thread_ts: Mapping[str, float],
+    cur_now: float,
+) -> bool:
+  """Ingests a Google Docs comment thread or direct share email; returns True when handled."""
+  is_comment = bool(t_prov.get("is_gdoc_comment"))
+  is_share = bool(t_prov.get("is_drive_share"))
+  if not is_comment and not is_share:
+    return False
+  if bool(t_prov.get("in_trash_or_spam")):
+    return True
+  gdoc_id = str(t_prov.get("gdoc_id") or "").strip()
+  if not gdoc_id:
+    return True
+
+  tid = str(t_prov.get("thread_id") or "").strip()
+  t_key = f"gmail_thread:{tid}" if tid else ""
+  cp = str(t_prov.get("counterparty") or "").strip()
+  doc_title = str(t_prov.get("doc_title") or "").strip()
+  root_subj = str(t_prov.get("root_subject") or "").strip()
+  last_msg_ts = float(t_prov.get("last_message_ts") or 0.0)
+  doc_key = f"gdoc:{gdoc_id}"
+  doc_url = f"https://docs.google.com/document/d/{gdoc_id}/edit"
+
+  if is_comment:
+    # Ignore bystander comment digests on uninvolved docs where user was never mentioned
+    existing_doc_wid = store.find_work_by_artifact(doc_key, roles=("primary", "channel"))
+    eligible = (
+        bool(t_prov.get("sent_by_me"))
+        or bool(t_prov.get("me_addressed"))
+        or bool(t_prov.get("gdoc_me_engaged"))
+        or bool(existing_doc_wid)
+    )
+    if not eligible:
+      return True
+
+    # Fall back to Gmail thread ID when older notification templates omit ?disco=
+    disco_id = str(t_prov.get("disco_id") or "").strip() or f"thread-{tid}"
+    gt_key = f"gdoc_thread:{gdoc_id}:{disco_id}"
+    # Merge earlier transcript-created Drive commentId artifact lacking the "doco." prefix
+    if disco_id.startswith("doco."):
+      bare_gt = f"gdoc_thread:{gdoc_id}:{disco_id[5:]}"
+      if store.get_artifact(bare_gt) is not None:
+        store.rekey_gdoc_thread_artifact(bare_gt, gt_key, now=cur_now)
+    if gt_key in dismissed_keys and not bool(t_prov.get("sent_by_me")):
+      return True
+    existing_gt_wid = store.find_work_by_artifact(gt_key, roles=("primary", "channel"))
+    done_ts_gt = max(
+        float(completed_thread_ts.get(gt_key) or 0.0),
+        float(completed_thread_ts.get(doc_key) or 0.0),
+    )
+    if (
+        not existing_gt_wid
+        and not existing_doc_wid
+        and done_ts_gt > 0
+        and last_msg_ts <= done_ts_gt
+    ):
+      return True
+
+    if doc_title:
+      store.upsert_artifact(
+          doc_key,
+          kind="gdoc",
+          title=doc_title,
+          url=doc_url,
+          state={"doc_title": doc_title},
+          now=cur_now,
+      )
+    elif store.get_artifact(doc_key) is None:
+      store.upsert_artifact(doc_key, kind="gdoc", title=doc_key, url=doc_url, now=cur_now)
+
+    gt_url = (
+        f"https://docs.google.com/document/d/{gdoc_id}/edit?disco={disco_id}"
+        if t_prov.get("disco_id")
+        else doc_url
+    )
+    base_lbl = doc_title or root_subj or doc_key
+    gt_title = f"{base_lbl} ({cp})" if cp and cp.lower() not in base_lbl.lower() else base_lbl
+    wid = (
+        existing_gt_wid
+        or existing_doc_wid
+        or (store.find_work_by_artifact(t_key, roles=("primary", "channel")) if t_key else None)
+        or store.create_work(doc_title or root_subj or doc_key, now=cur_now)
+    )
+    prev_gt = store.get_artifact(gt_key) or {}
+    prev_gt_st = prev_gt.get("state") if isinstance(prev_gt.get("state"), Mapping) else {}
+    prev_resolved_ts = float(prev_gt_st.get("resolved_at") or 0.0)
+    gt_state: dict[str, Any] = {
+        "doc_id": gdoc_id,
+        "disco_id": disco_id,
+        "doc_title": doc_title,
+        "thread_id": tid,
+        "origin_ts": float(t_prov.get("origin_ts") or 0.0),
+        "started_by_me": bool(t_prov.get("started_by_me")),
+        "sent_by_me": bool(t_prov.get("sent_by_me")),
+        "last_from_me": bool(t_prov.get("last_from_me")),
+        "last_message_ts": last_msg_ts,
+        "last_message_id": str(t_prov.get("last_message_id") or ""),
+        "last_snippet": str(t_prov.get("last_snippet") or ""),
+        "last_unquoted_text": str(t_prov.get("last_unquoted_text") or ""),
+        "message_count": int(t_prov.get("message_count") or 1),
+        "counterparty": cp,
+        "is_active_correspondence": True,
+        "unanswered_human": (
+            not bool(t_prov.get("last_from_me")) and tid not in draft_thread_ids
+        ),
+    }
+    # External resolves trigger a 1-click confirmation bar instead of silently closing the card
+    if bool(t_prov.get("gdoc_resolved")):
+      gt_state["resolved"] = True
+      if bool(t_prov.get("gdoc_resolved_by_me")):
+        gt_state["resolved_by_me"] = True
+      else:
+        gt_state["resolved_externally"] = True
+    elif prev_resolved_ts <= 0 or last_msg_ts > prev_resolved_ts:
+      gt_state["resolved"] = False
+      gt_state["resolved_by_me"] = False
+      gt_state["resolved_externally"] = False
+    store.upsert_artifact(
+        gt_key, kind="gdoc_thread", title=gt_title, url=gt_url, state=gt_state, now=cur_now
+    )
+    if t_key and store.get_artifact(t_key) is not None:
+      store.upsert_artifact(
+          t_key,
+          kind="gmail_thread",
+          state={**dict(t_prov), "gdoc_thread_key": gt_key},
+          now=cur_now,
+      )
+    store.link_artifact(
+        wid, doc_key, role="primary", source="auto", link_reason="gdoc_comment", now=cur_now
+    )
+    store.link_artifact(
+        wid, gt_key, role="channel", source="auto", link_reason="gdoc_comment", now=cur_now
+    )
+    return True
+
+  # Outbound shares mint/update Works; cold inbound shares only attach to already-tracked docs
+  is_outbound_share = bool(t_prov.get("started_by_me") or t_prov.get("sent_by_me"))
+  rec_cnt = int(t_prov.get("recipient_count") or 0)
+  is_direct_inbound_share = (
+      bool(t_prov.get("me_addressed"))
+      and 1 <= rec_cnt <= MAX_HUMAN_GROUP_RECIPIENTS
+      and not bool(t_prov.get("is_bulk_or_list"))
+  )
+  existing_share_wid = store.find_work_by_artifact(doc_key, roles=("primary", "channel"))
+  if not is_outbound_share and not (is_direct_inbound_share and existing_share_wid):
+    return True
+  done_ts_doc = float(completed_thread_ts.get(doc_key) or 0.0)
+  if not existing_share_wid and done_ts_doc > 0 and last_msg_ts <= done_ts_doc:
+    return True
+  wid = (
+      existing_share_wid
+      or (store.find_work_by_artifact(t_key, roles=("primary", "channel")) if t_key else None)
+      or store.create_work(doc_title or root_subj or doc_key, now=cur_now)
+  )
+  share_state: dict[str, Any] = {
+      "doc_id": gdoc_id,
+      "doc_title": doc_title,
+      "share_thread_id": tid,
+      "origin_ts": float(t_prov.get("origin_ts") or 0.0),
+      "started_by_me": bool(t_prov.get("started_by_me")),
+      "sent_by_me": bool(t_prov.get("sent_by_me")),
+      "last_from_me": bool(t_prov.get("last_from_me")),
+      "last_message_ts": last_msg_ts,
+      "last_message_id": str(t_prov.get("last_message_id") or ""),
+      "last_snippet": str(t_prov.get("last_snippet") or ""),
+      "last_unquoted_text": str(t_prov.get("last_unquoted_text") or ""),
+      "message_count": int(t_prov.get("message_count") or 1),
+      "counterparty": cp,
+      "is_drive_share": True,
+      "is_active_correspondence": True,
+  }
+  store.upsert_artifact(
+      doc_key,
+      kind="gdoc",
+      title=doc_title or doc_key,
+      url=doc_url,
+      state=share_state,
+      now=cur_now,
+  )
+  if t_key and store.get_artifact(t_key) is not None:
+    store.upsert_artifact(
+        t_key,
+        kind="gmail_thread",
+        state={**dict(t_prov), "shared_doc_key": doc_key},
+        now=cur_now,
+    )
+  store.link_artifact(
+      wid, doc_key, role="primary", source="auto", link_reason="gdoc_share", now=cur_now
+  )
+  return True
 
 
 def _work_has_open_cl(store: work_store.WorkStore, work_id: str) -> bool:
@@ -1739,7 +2277,7 @@ def ingest_gmail_drafts_and_threads(
     store.upsert_artifact(d_key, kind="gmail_draft", state={"status": "SENT"}, now=cur_now)
   watcher_state["active_draft_ids"] = sorted(active_draft_ids)
 
-  # 2. Run 3 targeted Gmail search passes (--max <N>) and link via hybrid correspondence rules
+  # Run targeted Gmail search passes and link via hybrid correspondence & GDoc rules
   search_passes = (
       (
           "sent",
@@ -1766,6 +2304,14 @@ def ingest_gmail_drafts_and_threads(
               ' (cc:mention@noreply.github.com OR cc:comment@noreply.github.com OR "@Rusino")'
           ),
           "20",
+      ),
+      (
+          "gdoc",
+          (
+              "newer_than:21d from:(comments-noreply@docs.google.com"
+              " OR drive-shares-dm-noreply@google.com)"
+          ),
+          "25",
       ),
   )
 
@@ -1794,6 +2340,19 @@ def ingest_gmail_drafts_and_threads(
           continue
         seen_tids.add(tid)
         t_prov = _fetch_gmail_thread_provenance(tid, thread_cache, cur_now)
+        if t_prov.get("is_gdoc_comment") or (
+            t_prov.get("is_drive_share")
+            and (pass_kind == "gdoc" or bool(t_prov.get("gdoc_id")))
+        ):
+          _ingest_gdoc_gmail_thread(
+              store,
+              t_prov,
+              draft_thread_ids,
+              dismissed_keys,
+              completed_thread_ts,
+              cur_now,
+          )
+          continue
         cp = str(t_prov.get("counterparty") or "").strip()
         root_subj = str(t_prov.get("root_subject") or m.get("subject") or "").strip()
         if not root_subj or not cp:
@@ -1897,15 +2456,6 @@ def ingest_gmail_drafts_and_threads(
                 continue
           t_primaries.append((akey, akind, aurl))
 
-        is_recent_reply = (cur_now - float(t_prov.get("last_message_ts") or 0.0)) <= 14 * 86400
-        t_prov["unanswered_human"] = bool(
-            not t_prov.get("last_from_me", True)
-            and not t_prov.get("is_automated")
-            and tid not in draft_thread_ids
-            and is_recent_reply
-            and (t_prov.get("sent_by_me") or t_prov.get("is_github_issue_thread"))
-        )
-
         matched_wids: list[str] = []
         existing_tid_wid = store.find_work_by_artifact(t_key, roles=("primary", "channel"))
         if existing_tid_wid:
@@ -1914,6 +2464,19 @@ def ingest_gmail_drafts_and_threads(
           w_match = store.find_work_by_artifact(akey, roles=("primary",))
           if w_match and w_match not in matched_wids:
             matched_wids.append(w_match)
+
+        is_recent_reply = (cur_now - float(t_prov.get("last_message_ts") or 0.0)) <= 14 * 86400
+        t_prov["unanswered_human"] = bool(
+            not t_prov.get("last_from_me", True)
+            and not t_prov.get("is_automated")
+            and tid not in draft_thread_ids
+            and is_recent_reply
+            and (
+                t_prov.get("sent_by_me")
+                or t_prov.get("is_github_issue_thread")
+                or bool(existing_tid_wid)
+            )
+        )
 
         # Skip dismissed, completed, or ineligible bulk/list/promotional inbound mail
         done_ts = completed_thread_ts.get(t_key)
@@ -1994,6 +2557,10 @@ def ingest_gmail_drafts_and_threads(
                   now=cur_now,
               )
           elif not t_prov.get("last_from_me", True):
+            # Persist cold inbound metadata so promoting via + Work starts in Needs You
+            store.upsert_artifact(
+                t_key, kind="gmail_thread", title=t_title, url=t_url, state=t_prov, now=cur_now
+            )
             unanswered.append({
                 "artifact_key": t_key,
                 "thread_id": tid,
@@ -2183,6 +2750,7 @@ def ingest_gmail_drafts_and_threads(
     except Exception:
       pass
 
+  store.reconcile_correspondence_obligations(now=cur_now)
   return unanswered
 
 
@@ -2263,17 +2831,18 @@ def run_sync_cycle(
           now=cur_now,
       )
 
-  if int(w_state.get("unanswered_tray_schema") or 0) < 4:
+  if int(w_state.get("unanswered_tray_schema") or 0) < 5:
     w_state["unanswered_tray"] = []
-    w_state["unanswered_tray_schema"] = 4
+    w_state["unanswered_tray_schema"] = 5
   unanswered = w_state.get("unanswered_tray") or []
   if include_gmail and (cur_now - float(w_state.get("last_gmail_sync") or 0.0) >= 90):
     unanswered = ingest_gmail_drafts_and_threads(store, w_state, now=cur_now)
     w_state["unanswered_tray"] = unanswered
-    w_state["unanswered_tray_schema"] = 4
+    w_state["unanswered_tray_schema"] = 5
     w_state["last_gmail_sync"] = cur_now
 
   store.purge_config_artifacts_and_works(now=cur_now)
+  store.reconcile_correspondence_obligations(now=cur_now)
   w_state["last_sync"] = cur_now
   try:
     os.makedirs(os.path.dirname(watcher_state_path), exist_ok=True)

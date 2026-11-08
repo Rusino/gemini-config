@@ -2939,6 +2939,1167 @@ assert.strictEqual(cards.w_wait2.collapsed, true);
         "github_pr:flutter/flutter:195366",
     )
 
+  def test_r12_correspondence_end_to_end_ownership_and_interim_reply_safety(self) -> None:
+    import base64
+    from unittest import mock
+    import ingestor
+    import work_store
+    import workbench_server
+
+    now = time.time()
+    store = work_store.WorkStore(self.db_path)
+
+    def _b64(text: str) -> str:
+      return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii").rstrip("=")
+
+    inbound_state = {"reply_sent": False, "followup_inbound": False}
+
+    def fake_gmail_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+      res = subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+      if "drafts" in cmd and "get-draft" not in cmd:
+        res.stdout = "[]"
+      elif "search" in cmd:
+        q = cmd[cmd.index("search") + 1]
+        if "from:me" in q:
+          res.stdout = json.dumps([{"threadId": "1a19mouad0000001"}])
+        elif "in:inbox" in q:
+          res.stdout = json.dumps([{"threadId": "1a19coldinbound1"}])
+      elif "get-thread" in cmd:
+        tid = cmd[cmd.index("get-thread") + 1]
+        if tid == "1a19coldinbound1":
+          msgs = [{
+              "id": "m_cold_1",
+              "internalDate": str(int((now - 1800) * 1000)),
+              "labelIds": ["INBOX", "CATEGORY_PERSONAL"],
+              "snippet": "Could you check TextPainter line metrics on empty lines?",
+              "payload": {
+                  "mimeType": "text/plain",
+                  "headers": [
+                      {"name": "Subject", "value": "TextPainter empty line metrics"},
+                      {"name": "From", "value": "Marcel Garus <mgarus@google.com>"},
+                      {"name": "To", "value": "Julia Lavrova <jlavrova@google.com>"},
+                  ],
+                  "body": {
+                      "data": _b64("Hi Julia, could you check TextPainter empty line metrics?")
+                  },
+              },
+          }]
+          if inbound_state["reply_sent"]:
+            msgs.append({
+                "id": "m_cold_2",
+                "internalDate": str(int((now + 120) * 1000)),
+                "labelIds": ["SENT"],
+                "snippet": "Looking into this now, I will send numbers tomorrow.",
+                "payload": {
+                    "mimeType": "text/plain",
+                    "headers": [
+                        {"name": "Subject", "value": "Re: TextPainter empty line metrics"},
+                        {"name": "From", "value": "Julia Lavrova <jlavrova@google.com>"},
+                        {"name": "To", "value": "Marcel Garus <mgarus@google.com>"},
+                    ],
+                    "body": {
+                        "data": _b64("Looking into this now, I will send numbers tomorrow.")
+                    },
+                },
+            })
+          if inbound_state["followup_inbound"]:
+            msgs.append({
+                "id": "m_cold_3",
+                "internalDate": str(int((now + 3600) * 1000)),
+                "labelIds": ["INBOX", "CATEGORY_PERSONAL"],
+                "snippet": "Here is a minimal repro case as well.",
+                "payload": {
+                    "mimeType": "text/plain",
+                    "headers": [
+                        {"name": "Subject", "value": "Re: TextPainter empty line metrics"},
+                        {"name": "From", "value": "Marcel Garus <mgarus@google.com>"},
+                        {"name": "To", "value": "Julia Lavrova <jlavrova@google.com>"},
+                    ],
+                    "body": {"data": _b64("Here is a minimal repro case as well.")},
+                },
+            })
+          res.stdout = json.dumps({"messages": msgs})
+        elif tid == "1a19mouad0000001":
+          res.stdout = json.dumps({
+              "messages": [{
+                  "id": "m_mouad_1",
+                  "internalDate": str(int((now - 600) * 1000)),
+                  "labelIds": ["SENT"],
+                  "snippet": "Hi Mouad, attached are the Gallery WebParagraph benchmark numbers.",
+                  "payload": {
+                      "mimeType": "text/plain",
+                      "headers": [
+                          {"name": "Subject", "value": "Gallery WebParagraph benchmark report"},
+                          {"name": "From", "value": "Julia Lavrova <jlavrova@google.com>"},
+                          {"name": "To", "value": "Mouad Debbar <mdebbar@google.com>"},
+                      ],
+                      "body": {
+                          "data": _b64(
+                              "Hi Mouad, attached are the Gallery WebParagraph benchmark numbers."
+                          )
+                      },
+                  },
+              }]
+          })
+      return res
+
+    w_state: dict[str, object] = {}
+    with mock.patch("os.path.isfile", return_value=True), mock.patch(
+        "subprocess.run", side_effect=fake_gmail_run
+    ):
+      tray = ingestor.ingest_gmail_drafts_and_threads(store, w_state, now=now)
+
+    self.assertEqual([t["thread_id"] for t in tray], ["1a19coldinbound1"])
+
+    proj0 = store.build_dashboard_projection(
+        cl_watcher_state={"items": {}}, unanswered_threads=tray, now=now
+    )
+    mouad_card = [w for w in proj0["works"] if "Gallery WebParagraph" in w["title"]][0]
+    self.assertEqual(mouad_card["lane"], "waiting")
+    mouad_obs = [o for o in mouad_card["obligations"] if o["status"] != "done"]
+    self.assertEqual(len(mouad_obs), 1)
+    self.assertEqual(mouad_obs[0]["status"], "open")
+    self.assertGreaterEqual(proj0["counts"]["obligations_open"], 1)
+
+    # After 7 days of silence without a reply, outbound obligation wakes into Needs You
+    proj_7d = store.build_dashboard_projection(
+        cl_watcher_state={"items": {}}, now=now + 7 * 86400 + 60
+    )
+    mouad_7d = [w for w in proj_7d["works"] if w["work_id"] == mouad_card["work_id"]][0]
+    self.assertEqual(mouad_7d["lane"], "needs-you")
+    self.assertEqual(
+        [o for o in mouad_7d["obligations"] if o["status"] != "done"][0]["status"], "ready"
+    )
+
+    # Promoting cold inbound thread via + Work lands directly in Needs You with ready obligation
+    w_state["unanswered_tray"] = tray
+    with open(self.state_path, "w", encoding="utf-8") as f:
+      json.dump(w_state, f)
+    with open(self.cl_state_path, "w", encoding="utf-8") as f:
+      json.dump({"items": {}, "bugs": {}}, f)
+
+    srv = workbench_server.create_server(
+        host="127.0.0.1",
+        port=0,
+        store=store,
+        cl_state_path=self.cl_state_path,
+        watcher_state_path=self.state_path,
+        info_path=self.info_path,
+    )
+    port = srv.server_address[1]
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+      req_prom = urllib.request.Request(
+          f"http://127.0.0.1:{port}/api/work/create",
+          data=json.dumps({
+              "title": "TextPainter empty line metrics",
+              "primaries": [],
+              "channels": ["gmail_thread:1a19coldinbound1"],
+          }).encode("utf-8"),
+          headers={"Content-Type": "application/json"},
+          method="POST",
+      )
+      with urllib.request.urlopen(req_prom, timeout=5) as resp:
+        after_prom = json.loads(resp.read().decode("utf-8"))
+    finally:
+      srv.shutdown()
+      srv.server_close()
+
+    marcel_card = [w for w in after_prom["works"] if "TextPainter empty line" in w["title"]][0]
+    self.assertEqual(marcel_card["lane"], "needs-you")
+    marcel_obs = [o for o in marcel_card["obligations"] if o["status"] != "done"]
+    self.assertEqual(len(marcel_obs), 1)
+    self.assertEqual(marcel_obs[0]["status"], "ready")
+
+    # Interim reply (last_from_me=True) flips ready -> open (Waiting) without deleting obligation
+    inbound_state["reply_sent"] = True
+    w_state["gmail_threads"] = {}
+    with mock.patch("os.path.isfile", return_value=True), mock.patch(
+        "subprocess.run", side_effect=fake_gmail_run
+    ):
+      ingestor.ingest_gmail_drafts_and_threads(store, w_state, now=now + 180)
+    proj_interim = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now + 180)
+    marcel_interim = [w for w in proj_interim["works"] if w["work_id"] == marcel_card["work_id"]][0]
+    self.assertEqual(marcel_interim["lane"], "waiting")
+    interim_obs = [o for o in marcel_interim["obligations"] if o["status"] != "done"]
+    self.assertEqual(len(interim_obs), 1)
+    self.assertEqual(interim_obs[0]["status"], "open")
+
+    # Subsequent counterparty reply wakes the same obligation right back into Needs You
+    inbound_state["followup_inbound"] = True
+    w_state["gmail_threads"] = {}
+    with mock.patch("os.path.isfile", return_value=True), mock.patch(
+        "subprocess.run", side_effect=fake_gmail_run
+    ):
+      ingestor.ingest_gmail_drafts_and_threads(store, w_state, now=now + 3700)
+    proj_re = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now + 3700)
+    marcel_re = [w for w in proj_re["works"] if w["work_id"] == marcel_card["work_id"]][0]
+    self.assertEqual(marcel_re["lane"], "needs-you")
+    self.assertEqual(
+        [o for o in marcel_re["obligations"] if o["status"] != "done"][0]["status"], "ready"
+    )
+
+    # Specific roll-gated obligation: interim reply before trigger fires must not satisfy it,
+    # and specific promise supersedes generic umbrella on that card
+    cl_key = "gerrit:skia:1490001"
+    store.upsert_artifact(
+        cl_key,
+        kind="gerrit",
+        title="1490001: Fix empty line metrics",
+        state={"status": "NEW", "rolls": {}},
+        now=now + 3800,
+    )
+    store.link_artifact(marcel_card["work_id"], cl_key, role="primary", now=now + 3800)
+    spec_ob = store.add_obligation(
+        marcel_card["work_id"],
+        description="Send final confirmation once 1490001 rolls into Flutter",
+        trigger_expr=f"cl_merged({cl_key}) AND rolled_into(Flutter, {cl_key})",
+        target_artifact_key="gmail_thread:1a19coldinbound1",
+        done_matcher="reply_sent(gmail_thread:1a19coldinbound1)",
+        now=now + 3800,
+    )
+    store.upsert_artifact(
+        "gmail_thread:1a19coldinbound1",
+        kind="gmail_thread",
+        state={"last_from_me": True, "last_message_ts": now + 3900, "unanswered_human": False},
+        now=now + 3900,
+    )
+    store.reconcile_correspondence_obligations(marcel_card["work_id"], now=now + 3900)
+    proj_spec = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now + 3900)
+    marcel_spec = [w for w in proj_spec["works"] if w["work_id"] == marcel_card["work_id"]][0]
+    open_spec_obs = [o for o in marcel_spec["obligations"] if o["status"] != "done"]
+    self.assertEqual([o["obligation_id"] for o in open_spec_obs], [spec_ob])
+    self.assertEqual(open_spec_obs[0]["status"], "open")
+
+    # When 1490001 rolls at now+5000, the earlier interim reply (now+3900) does not auto-close it
+    store.upsert_artifact(
+        cl_key,
+        kind="gerrit",
+        state={"status": "MERGED", "rolls": {"Flutter": {"rolled": True}}},
+        now=now + 5000,
+    )
+    store.evaluate_all_obligations(now=now + 5000)
+    self.assertEqual((store.get_obligation(spec_ob, now=now + 5000) or {})["status"], "ready")
+
+    # Post-ready reply at now+5100 satisfies the roll-gated obligation
+    store.upsert_artifact(
+        "gmail_thread:1a19coldinbound1",
+        kind="gmail_thread",
+        state={"last_from_me": True, "last_message_ts": now + 5100},
+        now=now + 5100,
+    )
+    store.evaluate_all_obligations(now=now + 5100)
+    self.assertEqual((store.get_obligation(spec_ob, now=now + 5100) or {})["status"], "done")
+
+  def test_r12_ambiguity_prompt_manual_wait_and_verbal_close(self) -> None:
+    import work_store
+    import workbench_server
+
+    now = time.time()
+    store = work_store.WorkStore(self.db_path)
+
+    w_tyler = store.create_work("Open Skia PDF Bugs — Tyler Denniston", now=now)
+    t_key = "gmail_thread:1a17f55bb4012bd2"
+    store.upsert_artifact(
+        t_key,
+        kind="gmail_thread",
+        title="Open Skia PDF Bugs (Tyler Denniston)",
+        url="https://mail.google.com/mail/u/0/#all/1a17f55bb4012bd2",
+        state={
+            "thread_id": "1a17f55bb4012bd2",
+            "root_subject": "Open Skia PDF Bugs",
+            "counterparty": "Tyler Denniston",
+            "started_by_me": True,
+            "sent_by_me": True,
+            "last_from_me": False,
+            "last_message_ts": now - 300,
+            "last_message_id": "msg_thanks_1",
+            "last_snippet": "Got it, thank you Julia!",
+            "unanswered_human": True,
+        },
+        now=now,
+    )
+    store.link_artifact(w_tyler, t_key, role="primary", source="auto", now=now)
+    store.reconcile_correspondence_obligations(w_tyler, now=now)
+
+    with open(self.state_path, "w", encoding="utf-8") as f:
+      json.dump({}, f)
+    with open(self.cl_state_path, "w", encoding="utf-8") as f:
+      json.dump({"items": {}, "bugs": {}}, f)
+
+    proj = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now)
+    card = [w for w in proj["works"] if w["work_id"] == w_tyler][0]
+    open_obs = [o for o in card["obligations"] if o["status"] != "done"]
+    self.assertEqual(len(open_obs), 1)
+    ob_id = open_obs[0]["obligation_id"]
+    self.assertTrue(bool(open_obs[0].get("ambiguity_prompt")))
+    self.assertEqual(open_obs[0].get("ambiguity_event_key"), "msg_thanks_1")
+
+    html = workbench_server.render_workbench_html(proj, ui_version=1)
+    self.assertIn("data-ob-keep", html)
+    self.assertIn("data-ob-close-topic", html)
+    self.assertIn("data-ob-wait", html)
+
+    srv = workbench_server.create_server(
+        host="127.0.0.1",
+        port=0,
+        store=store,
+        cl_state_path=self.cl_state_path,
+        watcher_state_path=self.state_path,
+        info_path=self.info_path,
+    )
+    port = srv.server_address[1]
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+      def _post(path: str, payload: dict[str, object]) -> dict[str, object]:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+          self.assertEqual(resp.status, 200)
+          return json.loads(resp.read().decode("utf-8"))
+
+      # Keep obligation -> prompt disappears and does not re-appear for msg_thanks_1
+      after_keep = _post(
+          "/api/obligation/resolve_ambiguity",
+          {"obligation_id": ob_id, "decision": "keep", "event_key": "msg_thanks_1"},
+      )
+      c_keep = [w for w in after_keep["works"] if w["work_id"] == w_tyler][0]
+      ob_keep = [o for o in c_keep["obligations"] if o["status"] != "done"][0]
+      self.assertFalse(bool(ob_keep.get("ambiguity_prompt")))
+
+      # Clicking [Ответила -> жду] flips ready -> open (Waiting) with fresh 7d silence timer
+      after_wait = _post("/api/obligation/wait", {"obligation_id": ob_id})
+      c_wait = [w for w in after_wait["works"] if w["work_id"] == w_tyler][0]
+      self.assertEqual(c_wait["lane"], "waiting")
+      self.assertEqual(
+          [o for o in c_wait["obligations"] if o["status"] != "done"][0]["status"], "open"
+      )
+
+      # Newer courtesy message triggers ambiguity prompt once for msg_thanks_2; closing completes
+      t2 = time.time() + 100
+      store.upsert_artifact(
+          t_key,
+          kind="gmail_thread",
+          state={
+              "last_from_me": False,
+              "last_message_ts": t2,
+              "last_message_id": "msg_thanks_2",
+              "last_snippet": "Sounds good, thanks!",
+              "unanswered_human": True,
+          },
+          now=t2,
+      )
+      store.reconcile_correspondence_obligations(w_tyler, now=t2)
+      after_close = _post(
+          "/api/obligation/resolve_ambiguity",
+          {"obligation_id": ob_id, "decision": "close", "event_key": "msg_thanks_2"},
+      )
+      c_closed = [w for w in after_close["works"] if w["work_id"] == w_tyler][0]
+      self.assertEqual(c_closed["lane"], "done")
+    finally:
+      srv.shutdown()
+      srv.server_close()
+
+  def test_r12_gdoc_comments_direct_shares_and_transcript_reconciliation(self) -> None:
+    import base64
+    from datetime import datetime, timezone
+    from unittest import mock
+    import ingestor
+    import work_store
+    import workbench_server
+
+    now = 1762450000.0
+    store = work_store.WorkStore(self.db_path)
+
+    def _b64(text: str) -> str:
+      return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii").rstrip("=")
+
+    doc_active = "1v9KDb3WgPWQQGoMdS88qqTWF_l-rhFa2cjvxZHC4yh0"
+    doc_shared_out = "1GA7uMBIOEzgiUAk3-OQD08JMRVkBy2cv-wwFNSatQ3o"
+    doc_passive = "18aNyOgR4VUG0VzounQ_7IZyD_Uia5ynM5nXhJ5WxIh8"
+    doc_org_blast = "1zzzzOrgWideBlastDocId0000000000000000000000"
+
+    # Existing work holds bare gdoc placeholder + passive reference doc on another work
+    w_font = store.create_work("Skia Font Manager optimization", project_id="skia", now=now - 7200)
+    store.upsert_artifact(
+        f"gdoc:{doc_active}",
+        kind="gdoc",
+        title=f"gdoc:{doc_active}",
+        url=f"https://docs.google.com/document/d/{doc_active}/edit",
+        now=now - 7200,
+    )
+    store.link_artifact(w_font, f"gdoc:{doc_active}", role="primary", now=now - 7200)
+
+    w_passive = store.create_work("1419999: Passive reference doc CL", project_id="skia", now=now)
+    store.upsert_artifact(
+        "gerrit:skia:1419999",
+        kind="gerrit",
+        title="1419999: Passive reference doc CL",
+        state={"status": "NEW"},
+        now=now,
+    )
+    store.upsert_artifact(
+        f"gdoc:{doc_passive}",
+        kind="gdoc",
+        title=f"gdoc:{doc_passive}",
+        url=f"https://docs.google.com/document/d/{doc_passive}/edit",
+        now=now,
+    )
+    store.link_artifact(w_passive, "gerrit:skia:1419999", role="primary", now=now)
+    store.link_artifact(w_passive, f"gdoc:{doc_passive}", role="primary", now=now)
+
+    comment_plain = (
+        "Kenneth Koh (kennethkohmk@google.com) mentioned you in a comment in the\n"
+        "following document\n"
+        'Skia response to "Flutter & Skia Font Manager Optimization"\n'
+        f"(https://docs.google.com/document/d/{doc_active}/edit"
+        "?disco=doco.BMSJgpkZmEwW7S-9CIjiIg&usp=comment_email_document)\n\n"
+        "Matt Boetger\nWe do not have a plan right now to move to Fontations.\n\n"
+        "Change what Google sends you "
+        "(https://docs.google.com/document/u/1/docos/notify?"
+        f"id={doc_active}&title=Skia+response+to+%22Flutter+%26+Skia+Font+Manager+Optimization%22)"
+    )
+
+    def fake_gmail_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+      res = subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+      if "search" in cmd:
+        q = cmd[cmd.index("search") + 1]
+        if "comments-noreply@docs.google.com" in q:
+          res.stdout = json.dumps([
+              {"threadId": "1a181b7efb9b1211"},
+              {"threadId": "1a17edabfd5cd6bc"},
+              {"threadId": "1a1a3c43a8936d02"},
+          ])
+      elif "get-thread" in cmd:
+        tid = cmd[cmd.index("get-thread") + 1]
+        if tid == "1a181b7efb9b1211":
+          res.stdout = json.dumps({
+              "messages": [{
+                  "id": "m_doc_comment_1",
+                  "internalDate": str(int((now - 900) * 1000)),
+                  "labelIds": ["INBOX", "CATEGORY_UPDATES"],
+                  "snippet": "Kenneth Koh mentioned you in a comment",
+                  "payload": {
+                      "mimeType": "text/plain",
+                      "headers": [
+                          {
+                              "name": "Subject",
+                              "value": "Skia response to ... - Thank you for the concrete steps...",
+                          },
+                          {
+                              "name": "From",
+                              "value": (
+                                  '"Matt Boetger (Google Docs)" '
+                                  "<comments-noreply@docs.google.com>"
+                              ),
+                          },
+                          {"name": "To", "value": "jlavrova@google.com"},
+                      ],
+                      "body": {"data": _b64(comment_plain)},
+                  },
+              }]
+          })
+        elif tid == "1a17edabfd5cd6bc":
+          res.stdout = json.dumps({
+              "messages": [{
+                  "id": "m_doc_share_out",
+                  "internalDate": str(int((now - 1200) * 1000)),
+                  "labelIds": ["SENT"],
+                  "snippet": "Julia Lavrova has invited you to comment on the following document",
+                  "payload": {
+                      "mimeType": "text/plain",
+                      "headers": [
+                          {
+                              "name": "Subject",
+                              "value": (
+                                  'Document shared with you: "Eliminating ICU from Flutter on '
+                                  'Apple Platforms"'
+                              ),
+                          },
+                          {
+                              "name": "From",
+                              "value": (
+                                  '"Julia Lavrova (via Google Docs)" '
+                                  "<drive-shares-dm-noreply@google.com>"
+                              ),
+                          },
+                          {"name": "To", "value": "Renzo Olivares <roliv@google.com>"},
+                      ],
+                      "body": {
+                          "data": _b64(
+                              "Julia Lavrova invited you to comment: "
+                              f"https://docs.google.com/document/d/{doc_shared_out}/edit"
+                          )
+                      },
+                  },
+              }]
+          })
+        elif tid == "1a1a3c43a8936d02":
+          res.stdout = json.dumps({
+              "messages": [{
+                  "id": "m_doc_blast",
+                  "internalDate": str(int((now - 500) * 1000)),
+                  "labelIds": ["INBOX", "CATEGORY_UPDATES"],
+                  "snippet": "Terry Shi shared a document with chrome-eng@google.com",
+                  "payload": {
+                      "mimeType": "text/plain",
+                      "headers": [
+                          {
+                              "name": "Subject",
+                              "value": 'Document shared with you: "Chrome Spoofer Identification"',
+                          },
+                          {
+                              "name": "From",
+                              "value": (
+                                  '"Terry Shi (via Google Docs)" '
+                                  "<drive-shares-dm-noreply@google.com>"
+                              ),
+                          },
+                          {"name": "To", "value": "chrome-eng@google.com"},
+                      ],
+                      "body": {
+                          "data": _b64(
+                              f"https://docs.google.com/document/d/{doc_org_blast}/edit"
+                          )
+                      },
+                  },
+              }]
+          })
+      return res
+
+    w_state: dict[str, object] = {}
+    with mock.patch("os.path.isfile", return_value=True), mock.patch(
+        "subprocess.run", side_effect=fake_gmail_run
+    ):
+      ingestor.ingest_gmail_drafts_and_threads(store, w_state, now=now)
+
+    # Read-only transcript upgrades passive doc's human title without minting a Work or obligation
+    ro_iso = datetime.fromtimestamp(now + 10, tz=timezone.utc).isoformat()
+    ro_transcript = os.path.join(self.tmp_dir.name, "ro_gdoc.jsonl")
+    with open(ro_transcript, "w", encoding="utf-8") as f:
+      f.write(
+          json.dumps({
+              "type": "USER_INPUT",
+              "created_at": ro_iso,
+              "content": f"Прочитай спек https://docs.google.com/document/d/{doc_passive}/edit",
+          })
+          + "\n"
+      )
+      f.write(
+          json.dumps({
+              "type": "PLANNER_RESPONSE",
+              "created_at": ro_iso,
+              "tool_calls": [{
+                  "name": "call_mcp_tool",
+                  "args": {
+                      "ServerName": "google_drive_google_drive",
+                      "ToolName": "read_file_content",
+                      "Arguments": json.dumps({"fileId": doc_passive, "includeComments": True}),
+                  },
+              }],
+          })
+          + "\n"
+      )
+      f.write(
+          json.dumps({
+              "type": "GENERIC",
+              "created_at": ro_iso,
+              "content": json.dumps({
+                  "id": doc_passive,
+                  "title": "Paragraph Line Metrics Reference Spec",
+              }),
+          })
+          + "\n"
+      )
+    ingestor.ingest_transcript_file(
+        store,
+        conv_id="conv-ro-gdoc-1",
+        root_cid="conv-ro-gdoc-1",
+        transcript_path=ro_transcript,
+        cursors={},
+        now=now + 10,
+    )
+
+    proj = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now + 20)
+    self.assertFalse(
+        any(
+            a["artifact_key"] == f"gdoc:{doc_org_blast}"
+            for w in proj["works"]
+            for a in w["artifacts"]
+        )
+    )
+
+    # Passive reference GDoc got its real human title, but has ZERO obligations
+    passive_card = [w for w in proj["works"] if w["work_id"] == w_passive][0]
+    passive_doc_art = [
+        a for a in passive_card["artifacts"] if a["artifact_key"] == f"gdoc:{doc_passive}"
+    ][0]
+    self.assertEqual(passive_doc_art["title"], "Paragraph Line Metrics Reference Spec")
+    self.assertEqual([o for o in passive_card["obligations"] if o["status"] != "done"], [])
+
+    # Active GDoc comment thread upgraded doc title, attached #disco thread, and woke Needs You
+    font_card = [w for w in proj["works"] if w["work_id"] == w_font][0]
+    self.assertEqual(font_card["lane"], "needs-you")
+    font_arts = {a["artifact_key"]: a for a in font_card["artifacts"]}
+    self.assertEqual(
+        font_arts[f"gdoc:{doc_active}"]["title"],
+        'Skia response to "Flutter & Skia Font Manager Optimization"',
+    )
+    gt_key = f"gdoc_thread:{doc_active}:doco.BMSJgpkZmEwW7S-9CIjiIg"
+    self.assertIn(gt_key, font_arts)
+    self.assertIn("disco=doco.BMSJgpkZmEwW7S-9CIjiIg", font_arts[gt_key]["url"])
+    self.assertEqual(
+        [o for o in font_card["obligations"] if o["status"] != "done"][0]["status"], "ready"
+    )
+
+    # Outbound GDoc share by Julia created an open obligation in Waiting
+    shared_cards = [
+        w for w in proj["works"] if "Eliminating ICU from Flutter on Apple Platforms" in w["title"]
+    ]
+    self.assertEqual(len(shared_cards), 1)
+    self.assertEqual(shared_cards[0]["lane"], "waiting")
+    self.assertEqual(
+        [o for o in shared_cards[0]["obligations"] if o["status"] != "done"][0]["status"], "open"
+    )
+
+    html = workbench_server.render_workbench_html(proj, ui_version=1)
+    self.assertIn('data-kind="gdoc_thread"', html)
+
+    # Replying via Jetski MCP add_comment_reply flips GDoc thread ready -> open (Waiting)
+    reply_iso = datetime.fromtimestamp(now + 60, tz=timezone.utc).isoformat()
+    reply_transcript = os.path.join(self.tmp_dir.name, "reply_gdoc.jsonl")
+    with open(reply_transcript, "w", encoding="utf-8") as f:
+      f.write(
+          json.dumps({
+              "type": "USER_INPUT",
+              "created_at": reply_iso,
+              "content": (
+                  f"Ответь Мэтту в доке https://docs.google.com/document/d/{doc_active}/edit"
+              ),
+          })
+          + "\n"
+      )
+      f.write(
+          json.dumps({
+              "type": "PLANNER_RESPONSE",
+              "created_at": reply_iso,
+              "tool_calls": [{
+                  "name": "call_mcp_tool",
+                  "args": {
+                      "ServerName": "google_drive_google_drive",
+                      "ToolName": "add_comment_reply",
+                      "Arguments": json.dumps({
+                          "fileId": doc_active,
+                          "commentId": "BMSJgpkZmEwW7S-9CIjiIg",
+                          "content": "Sounds good, parked until Fontations is revisited.",
+                      }),
+                  },
+              }],
+          })
+          + "\n"
+      )
+    cursors: dict[str, dict[str, float | int]] = {}
+    ingestor.ingest_transcript_file(
+        store,
+        conv_id="conv-reply-gdoc-1",
+        root_cid="conv-reply-gdoc-1",
+        transcript_path=reply_transcript,
+        cursors=cursors,
+        now=now + 60,
+    )
+    proj_after_reply = store.build_dashboard_projection(
+        cl_watcher_state={"items": {}}, now=now + 60
+    )
+    font_after_reply = [w for w in proj_after_reply["works"] if w["work_id"] == w_font][0]
+    self.assertEqual(font_after_reply["lane"], "waiting")
+    self.assertEqual(
+        [o for o in font_after_reply["obligations"] if o["status"] != "done"][0]["status"], "open"
+    )
+
+    # Resolving the comment thread via MCP resolve_comment_thread closes its obligation
+    resolve_iso = datetime.fromtimestamp(now + 120, tz=timezone.utc).isoformat()
+    with open(reply_transcript, "a", encoding="utf-8") as f:
+      f.write(
+          json.dumps({
+              "type": "PLANNER_RESPONSE",
+              "created_at": resolve_iso,
+              "tool_calls": [{
+                  "name": "call_mcp_tool",
+                  "args": {
+                      "ServerName": "google_drive_google_drive",
+                      "ToolName": "resolve_comment_thread",
+                      "Arguments": json.dumps({
+                          "fileId": doc_active,
+                          "commentId": "BMSJgpkZmEwW7S-9CIjiIg",
+                      }),
+                  },
+              }],
+          })
+          + "\n"
+      )
+    ingestor.ingest_transcript_file(
+        store,
+        conv_id="conv-reply-gdoc-1",
+        root_cid="conv-reply-gdoc-1",
+        transcript_path=reply_transcript,
+        cursors=cursors,
+        now=now + 120,
+    )
+    proj_resolved = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now + 120)
+    font_resolved = [w for w in proj_resolved["works"] if w["work_id"] == w_font][0]
+    self.assertEqual([o for o in font_resolved["obligations"] if o["status"] != "done"], [])
+
+  def test_r12_reconciliation_and_sync_invariants(self) -> None:
+    import base64
+    from datetime import datetime, timezone
+    from unittest import mock
+    import ingestor
+    import work_store
+    import workctl
+
+    now = 1762500000.0
+    store = work_store.WorkStore(self.db_path)
+
+    def _b64(text: str) -> str:
+      return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii").rstrip("=")
+
+    # B5_S1: 1-message inbound opener ending with "Thanks, Alice" is NOT a thread closure
+    self.assertEqual(
+        work_store.detect_borderline_correspondence_closure(
+            "gmail_thread",
+            {
+                "last_message_id": "m_open_1",
+                "last_message_ts": now - 60,
+                "last_from_me": False,
+                "sent_by_me": False,
+                "message_count": 1,
+                "last_unquoted_text": (
+                    "Hi Julia, SkParagraph crashes on RTL ellipsis in b/399999999. Thanks, Alice"
+                ),
+            },
+        ),
+        ("", ""),
+    )
+
+    # B1_S1 + B3_S1: idempotent ready_at on draft obligations; sent draft keeps 7d Waiting umbrella
+    w_draft = store.create_work("1414545: Draft follow-up", project_id="skia", now=now)
+    store.upsert_artifact(
+        "gerrit:skia:1414545",
+        kind="gerrit",
+        title="1414545: Fix strut metrics",
+        state={"status": "MERGED"},
+        now=now,
+    )
+    store.upsert_artifact(
+        "gmail_thread:1a19draftthread1",
+        kind="gmail_thread",
+        title="Strut metrics report",
+        state={
+            "thread_id": "1a19draftthread1",
+            "started_by_me": True,
+            "sent_by_me": True,
+            "last_from_me": True,
+            "last_message_ts": now - 600,
+        },
+        now=now,
+    )
+    store.upsert_artifact(
+        "gmail_draft:r_draft_1",
+        kind="gmail_draft",
+        title="Draft: Strut metrics report",
+        state={"status": "DRAFT", "thread_id": "1a19draftthread1"},
+        now=now,
+    )
+    store.link_artifact(w_draft, "gerrit:skia:1414545", role="primary", now=now)
+    store.link_artifact(w_draft, "gmail_thread:1a19draftthread1", role="channel", now=now)
+    store.reconcile_correspondence_obligations(w_draft, now=now)
+    store.link_artifact(w_draft, "gmail_draft:r_draft_1", role="channel", now=now)
+    ob_draft = store.replace_draft_obligation(
+        w_draft,
+        "gmail_draft:r_draft_1",
+        "Send draft",
+        "cl_merged(gerrit:skia:1414545)",
+        done_matcher="draft_sent(gmail_draft:r_draft_1)",
+        now=now,
+    )
+    store.replace_draft_obligation(
+        w_draft,
+        "gmail_draft:r_draft_1",
+        "Send draft",
+        "cl_merged(gerrit:skia:1414545)",
+        done_matcher="draft_sent(gmail_draft:r_draft_1)",
+        now=now + 90,
+    )
+    ob_draft_row = store.get_obligation(ob_draft, now=now + 90) or {}
+    self.assertEqual(json.loads(ob_draft_row.get("meta_json") or "{}").get("ready_at"), now)
+
+    store.upsert_artifact("gmail_draft:r_draft_1", state={"status": "SENT"}, now=now + 200)
+    store.upsert_artifact(
+        "gmail_thread:1a19draftthread1",
+        state={"sent_by_me": True, "last_from_me": True, "last_message_ts": now + 200},
+        now=now + 200,
+    )
+    store.reconcile_correspondence_obligations(w_draft, now=now + 200)
+    proj_sent = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now + 201)
+    d_card = [w for w in proj_sent["works"] if w["work_id"] == w_draft][0]
+    self.assertEqual(d_card["lane"], "waiting")
+    self.assertEqual(
+        [o for o in d_card["obligations"] if o["status"] != "done"][0]["status"], "open"
+    )
+    proj_sent_8d = store.build_dashboard_projection(
+        cl_watcher_state={"items": {}}, now=now + 200 + 8 * 86400
+    )
+    d_card_8d = [w for w in proj_sent_8d["works"] if w["work_id"] == w_draft][0]
+    self.assertEqual(d_card_8d["lane"], "needs-you")
+
+    # B1_S1b + B2_S1 + B6_S1: unrelated CL obligation, unlink pruning, merge, clock skew
+    w_mix = store.create_work("Mixed CL + GDoc channel", project_id="skia", now=now)
+    store.upsert_artifact(
+        "gerrit:skia:1415000", kind="gerrit", state={"status": "NEW"}, now=now
+    )
+    gt_mix = "gdoc_thread:1DocMix000000000000000000:doco.c1"
+    store.upsert_artifact(
+        gt_mix,
+        kind="gdoc_thread",
+        state={
+            "doc_id": "1DocMix000000000000000000",
+            "disco_id": "doco.c1",
+            "last_from_me": False,
+            "last_message_ts": now + 50,
+            "unanswered_human": True,
+            "is_active_correspondence": True,
+        },
+        now=now,
+    )
+    store.link_artifact(w_mix, "gerrit:skia:1415000", role="primary", now=now)
+    store.link_artifact(w_mix, gt_mix, role="channel", now=now)
+    store.reconcile_correspondence_obligations(w_mix, now=now)
+    store.add_obligation(
+        w_mix,
+        description="Verify perf after 1415000 merges",
+        trigger_expr="cl_merged(gerrit:skia:1415000)",
+        target_artifact_key="gerrit:skia:1415000",
+        now=now + 5,
+    )
+    def _work_obs(wid: str, ts: float) -> list[dict[str, object]]:
+      p_cur = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=ts)
+      return [w for w in p_cur["works"] if w["work_id"] == wid][0]["obligations"]
+
+    mix_obs = [
+        o
+        for o in _work_obs(w_mix, now + 5)
+        if o["kind"] == "correspondence" and o["status"] != "done"
+    ]
+    self.assertEqual(len(mix_obs), 1)
+    self.assertEqual(mix_obs[0]["status"], "ready")
+
+    # B6_S1: closing when last_message_ts (now+50) > cur_now (now+10) must not reopen on next sync
+    store.mark_obligation_done(str(mix_obs[0]["obligation_id"]), now=now + 10)
+    store.reconcile_correspondence_obligations(w_mix, now=now + 15)
+    self.assertEqual(
+        (store.get_obligation(str(mix_obs[0]["obligation_id"]), now=now + 15) or {})["status"],
+        "done",
+    )
+
+    # B2_S1: unlink closes orphaned correspondence obligation; merge_works deduplicates umbrellas
+    w_src = store.create_work("Source mail work", now=now)
+    store.upsert_artifact(
+        "gmail_thread:1a19mergethr0001",
+        kind="gmail_thread",
+        state={"last_from_me": False, "last_message_ts": now, "unanswered_human": True},
+        now=now,
+    )
+    store.link_artifact(w_src, "gmail_thread:1a19mergethr0001", role="channel", now=now)
+    store.reconcile_correspondence_obligations(w_src, now=now)
+    store.merge_works(w_mix, w_src, now=now + 20)
+    store.reconcile_correspondence_obligations(w_mix, now=now + 20)
+    merged_corr = [
+        o
+        for o in _work_obs(w_mix, now + 20)
+        if o["target_artifact_key"] == "gmail_thread:1a19mergethr0001" and o["status"] != "done"
+    ]
+    self.assertEqual(len(merged_corr), 1)
+    store.unlink_artifact(w_mix, "gmail_thread:1a19mergethr0001", now=now + 25)
+    after_unlink = [
+        o
+        for o in _work_obs(w_mix, now + 25)
+        if o["target_artifact_key"] == "gmail_thread:1a19mergethr0001" and o["status"] != "done"
+    ]
+    self.assertEqual(after_unlink, [])
+
+    # B7_S1 + B5_S2: workctl new --channel gdoc:<id> & run_sync_cycle(include_gmail=False)
+    rc = workctl.main([
+        "--db",
+        self.db_path,
+        "new",
+        "Discuss Fontations rollout doc",
+        "--channel",
+        "gdoc:1ManualDocChannel000000000",
+    ])
+    self.assertEqual(rc, 0)
+    empty_brain = os.path.join(self.tmp_dir.name, "empty_brain")
+    os.makedirs(empty_brain, exist_ok=True)
+    with open(self.cl_state_path, "w", encoding="utf-8") as f:
+      json.dump({"items": {}, "bugs": {}}, f)
+    with open(self.state_path, "w", encoding="utf-8") as f:
+      json.dump({"last_gmail_sync": now}, f)
+    proj_nogmail = ingestor.run_sync_cycle(
+        store,
+        cl_state_path=self.cl_state_path,
+        watcher_state_path=self.state_path,
+        brain_dir=empty_brain,
+        include_gmail=False,
+        now=now + 30,
+    )
+    manual_card = [
+        w for w in proj_nogmail["works"] if "Discuss Fontations rollout doc" in w["title"]
+    ][0]
+    self.assertEqual(
+        len([o for o in manual_card["obligations"] if o["status"] != "done"]), 1
+    )
+
+    # B1_S2 + B2_S2 + B3_S2 + B4_S1/S2 + B6_S2: transcript-before-gmail without "doco.",
+    # direct MCP resolve surviving Gmail re-sync, reopening on new comment, >4 CL transcript,
+    # notify?title= first param, courtesy reply on outbound share, and dismiss_tray_thread
+    self.assertEqual(
+        store.dismiss_tray_thread("gdoc_thread:1DismissDoc000000000000:doco.x1", now=now),
+        "gdoc_thread:1DismissDoc000000000000:doco.x1",
+    )
+    self.assertIn(
+        "gdoc_thread:1DismissDoc000000000000:doco.x1", store.list_dismissed_tray_keys()
+    )
+
+    doc_order = "1OrderDoc0000000000000000000000000000000000"
+    doc_share2 = "1ShareCourtesy00000000000000000000000000000"
+    w_order = store.create_work("Order test doc", project_id="skia", now=now)
+    store.upsert_artifact(f"gdoc:{doc_order}", kind="gdoc", title=f"gdoc:{doc_order}", now=now)
+    store.link_artifact(w_order, f"gdoc:{doc_order}", role="primary", now=now)
+    # Also pre-link transport gmail_thread to verify B4_S1a superseding
+    store.upsert_artifact("gmail_thread:1a19gdocorder001", kind="gmail_thread", now=now)
+    store.link_artifact(w_order, "gmail_thread:1a19gdocorder001", role="channel", now=now)
+
+    # Step 1: transcript (>4 non-hub CLs!) calls resolve_comment_thread WITHOUT "doco." BEFORE Gmail
+    multi_cl_tpath = os.path.join(self.tmp_dir.name, "multi_cl_resolve.jsonl")
+    ts_res_iso = datetime.fromtimestamp(now + 40, tz=timezone.utc).isoformat()
+    with open(multi_cl_tpath, "w", encoding="utf-8") as f:
+      f.write(
+          json.dumps({
+              "type": "PLANNER_RESPONSE",
+              "created_at": ts_res_iso,
+              "tool_calls": [
+                  {
+                      "name": "run_command",
+                      "args": {
+                          "CommandLine": (
+                              "echo https://skia-review.googlesource.com/c/skia/+/1400001 "
+                              "https://skia-review.googlesource.com/c/skia/+/1400002 "
+                              "https://skia-review.googlesource.com/c/skia/+/1400003 "
+                              "https://skia-review.googlesource.com/c/skia/+/1400004 "
+                              "https://skia-review.googlesource.com/c/skia/+/1400005"
+                          )
+                      },
+                  },
+                  {
+                      "name": "call_mcp_tool",
+                      "args": {
+                          "ServerName": "google_drive_google_drive",
+                          "ToolName": "resolve_comment_thread",
+                          "Arguments": json.dumps({
+                              "fileId": doc_order,
+                              "commentId": "C_ORDER_1",
+                          }),
+                      },
+                  },
+              ],
+          })
+          + "\n"
+      )
+    ingestor.ingest_transcript_file(
+        store,
+        conv_id="conv-multi-cl-1",
+        root_cid="conv-multi-cl-1",
+        transcript_path=multi_cl_tpath,
+        cursors={},
+        chat_title="Investigate comment across CLs",
+        now=now + 40,
+    )
+
+    # Step 2: Gmail sync arrives with older comment email (now - 300) using ?disco=doco.C_ORDER_1
+    # and notify?title=First+Param+Title, plus outbound share with courtesy reply
+    gdoc_state = {"reopened": False}
+
+    def fake_gmail_edge(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+      res = subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+      if "search" in cmd:
+        q = cmd[cmd.index("search") + 1]
+        if "comments-noreply@docs.google.com" in q:
+          res.stdout = json.dumps([
+              {"threadId": "1a19gdocorder001"},
+              {"threadId": "1a19sharecourtesy"},
+          ])
+      elif "get-thread" in cmd:
+        tid = cmd[cmd.index("get-thread") + 1]
+        if tid == "1a19gdocorder001":
+          html_body = (
+              f'<a href="https://docs.google.com/document/d/{doc_order}/edit'
+              '?disco=doco.C_ORDER_1">Open</a> '
+              '<a href="https://docs.google.com/document/u/0/docos/notify'
+              f'?title=First+Param+Title&id={doc_order}">Notify</a>'
+          )
+          msgs = [{
+              "id": "m_ord_1",
+              "internalDate": str(int((now - 300) * 1000)),
+              "labelIds": ["INBOX", "CATEGORY_UPDATES"],
+              "snippet": "Ben mentioned you in a comment",
+              "payload": {
+                  "mimeType": "text/html",
+                  "headers": [
+                      {"name": "Subject", "value": "Comment notification"},
+                      {
+                          "name": "From",
+                          "value": '"Ben Wagner (Google Docs)" <comments-noreply@docs.google.com>',
+                      },
+                      {"name": "To", "value": "jlavrova@google.com"},
+                  ],
+                  "body": {"data": _b64(html_body)},
+              },
+          }]
+          if gdoc_state["reopened"]:
+            msgs.append({
+                "id": "m_ord_2",
+                "internalDate": str(int((now + 300) * 1000)),
+                "labelIds": ["INBOX", "CATEGORY_UPDATES"],
+                "snippet": "Wait, what about CoreText?",
+                "payload": {
+                    "mimeType": "text/plain",
+                    "headers": [
+                        {"name": "Subject", "value": "Comment notification"},
+                        {
+                            "name": "From",
+                            "value": (
+                                '"Ben Wagner (Google Docs)" <comments-noreply@docs.google.com>'
+                            ),
+                        },
+                        {"name": "To", "value": "jlavrova@google.com"},
+                    ],
+                    "body": {
+                        "data": _b64(
+                            f"https://docs.google.com/document/d/{doc_order}/edit"
+                            "?disco=doco.C_ORDER_1\n\nWait, what about CoreText?"
+                        )
+                    },
+                },
+            })
+          res.stdout = json.dumps({"messages": msgs})
+        elif tid == "1a19sharecourtesy":
+          res.stdout = json.dumps({
+              "messages": [
+                  {
+                      "id": "m_sh_1",
+                      "internalDate": str(int((now - 600) * 1000)),
+                      "labelIds": ["SENT"],
+                      "snippet": "Shared doc",
+                      "payload": {
+                          "mimeType": "text/plain",
+                          "headers": [
+                              {"name": "Subject", "value": 'Document shared with you: "Perf Spec"'},
+                              {
+                                  "name": "From",
+                                  "value": (
+                                      '"Julia Lavrova (via Google Docs)" '
+                                      "<drive-shares-dm-noreply@google.com>"
+                                  ),
+                              },
+                              {"name": "To", "value": "Renzo Olivares <roliv@google.com>"},
+                          ],
+                          "body": {
+                              "data": _b64(
+                                  f"https://docs.google.com/document/d/{doc_share2}/edit"
+                              )
+                          },
+                      },
+                  },
+                  {
+                      "id": "m_sh_2",
+                      "internalDate": str(int((now - 100) * 1000)),
+                      "labelIds": ["INBOX"],
+                      "snippet": "Looks great, thanks Julia!",
+                      "payload": {
+                          "mimeType": "text/plain",
+                          "headers": [
+                              {
+                                  "name": "Subject",
+                                  "value": 'Re: Document shared with you: "Perf Spec"',
+                              },
+                              {"name": "From", "value": "Renzo Olivares <roliv@google.com>"},
+                              {"name": "To", "value": "jlavrova@google.com"},
+                          ],
+                          "body": {"data": _b64("Looks great, thanks Julia!")},
+                      },
+                  },
+              ]
+          })
+      return res
+
+    ws_edge: dict[str, object] = {}
+    with mock.patch("os.path.isfile", return_value=True), mock.patch(
+        "subprocess.run", side_effect=fake_gmail_edge
+    ):
+      ingestor.ingest_gmail_drafts_and_threads(store, ws_edge, now=now + 60)
+
+    proj_edge = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now + 60)
+    ord_card = [w for w in proj_edge["works"] if w["work_id"] == w_order][0]
+    ord_gthreads = [a for a in ord_card["artifacts"] if a["kind"] == "gdoc_thread"]
+    self.assertEqual(len(ord_gthreads), 1)
+    ord_docs = [a for a in ord_card["artifacts"] if a["kind"] == "gdoc"]
+    self.assertEqual(ord_docs[0]["title"], "First Param Title")
+    self.assertNotEqual(ord_card["lane"], "needs-you")
+    self.assertEqual([o for o in ord_card["obligations"] if o["status"] != "done"], [])
+
+    # Courtesy reply on outbound shared doc surfaces ambiguity prompt
+    sh_card = [w for w in proj_edge["works"] if "Perf Spec" in w["title"]][0]
+    sh_obs = [o for o in sh_card["obligations"] if o["status"] != "done"]
+    self.assertTrue(bool(sh_obs[0].get("ambiguity_prompt")))
+
+    # Completing sh_card must NOT re-mint a duplicate active Work on the next Gmail sync
+    store.complete_work(sh_card["work_id"], now=now + 70)
+    ws_edge["gmail_threads"] = {}
+    with mock.patch("os.path.isfile", return_value=True), mock.patch(
+        "subprocess.run", side_effect=fake_gmail_edge
+    ):
+      ingestor.ingest_gmail_drafts_and_threads(store, ws_edge, now=now + 80)
+    proj_after_done = store.build_dashboard_projection(
+        cl_watcher_state={"items": {}}, now=now + 80
+    )
+    self.assertEqual(
+        [
+            w
+            for w in proj_after_done["works"]
+            if "Perf Spec" in w["title"] and w["lane"] != "done"
+        ],
+        [],
+    )
+
+    # Step 3: Newer colleague comment at now+300 reopens the resolved #disco thread into Needs You
+    gdoc_state["reopened"] = True
+    ws_edge["gmail_threads"] = {}
+    with mock.patch("os.path.isfile", return_value=True), mock.patch(
+        "subprocess.run", side_effect=fake_gmail_edge
+    ):
+      ingestor.ingest_gmail_drafts_and_threads(store, ws_edge, now=now + 310)
+    proj_reopen = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now + 310)
+    ord_reopen = [w for w in proj_reopen["works"] if w["work_id"] == w_order][0]
+    self.assertEqual(ord_reopen["lane"], "needs-you")
+    self.assertEqual(
+        [o for o in ord_reopen["obligations"] if o["status"] != "done"][0]["status"], "ready"
+    )
+
 
 if __name__ == "__main__":
   unittest.main()

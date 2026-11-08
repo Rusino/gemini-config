@@ -99,6 +99,13 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   synced_et = _esc(projection.get("synced_et") or "")
   initial_json = json.dumps(projection, ensure_ascii=False).replace("</", "<\\/")
 
+  def _is_ssr_corr(a_item: dict[str, Any]) -> bool:
+    ak = str(a_item.get("kind") or "")
+    ast = a_item.get("state") or {}
+    if ak in ("gmail_thread", "gmail_draft", "gchat_thread", "gdoc_thread"):
+      return True
+    return ak == "gdoc" and bool(ast.get("is_active_correspondence"))
+
   cards_ssr: list[str] = []
   for w in works[:40]:
     wid = _esc(w.get("work_id"))
@@ -115,12 +122,35 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     for ob in w.get("obligations") or []:
       if ob.get("status") == "done":
         continue
+      ob_id_esc = _esc(ob.get("obligation_id"))
       prog = _esc(ob.get("progress_summary") or "")
       prog_html = f'<div class="wb-ob-prog">{prog}</div>' if prog else ""
+      ambig_p = _esc(ob.get("ambiguity_prompt") or "")
+      ambig_ev = _esc(ob.get("ambiguity_event_key") or "")
+      ambig_ssr = (
+          f'<div class="wb-ob-ambig"><span>⚖️ {ambig_p}</span>'
+          f'<div class="wb-ob-btns">'
+          f'<button class="wb-btn" data-ob-keep="{ob_id_esc}" '
+          f'data-ob-event="{ambig_ev}" type="button">Оставить обязательство</button>'
+          f'<button class="wb-btn" data-ob-close-topic="{ob_id_esc}" '
+          f'data-ob-event="{ambig_ev}" type="button">Тема закрыта ✓</button>'
+          f"</div></div>"
+          if ambig_p
+          else ""
+      )
+      wait_btn_ssr = (
+          f'<button class="wb-btn" data-ob-wait="{ob_id_esc}" type="button">'
+          f"Ответила → жду</button>"
+          if ob.get("kind") == "correspondence" and ob.get("status") == "ready"
+          else ""
+      )
       obs_parts.append(
           f'<div class="wb-ob" data-status="{_esc(ob.get("status"))}">'
           f'<div class="wb-ob-main"><span>🔔 {_esc(ob.get("description"))}</span>'
-          f"{prog_html}</div></div>"
+          f"{prog_html}{ambig_ssr}</div>"
+          f'<div class="wb-ob-btns">{wait_btn_ssr}'
+          f'<button class="wb-btn" data-ob-done="{ob_id_esc}" type="button">✓</button>'
+          f"</div></div>"
       )
     obs_html = "".join(obs_parts)
     chk_items = w.get("checklist") or []
@@ -164,15 +194,14 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     corr_arts_ssr = [
         a
         for a in (w.get("artifacts") or [])
-        if a.get("role") != "context_only"
-        and a.get("kind") in ("gmail_thread", "gmail_draft", "gchat_thread")
+        if a.get("role") != "context_only" and _is_ssr_corr(a)
     ]
     main_arts_ssr = [
         a
         for a in (w.get("artifacts") or [])
         if a.get("role") != "context_only"
         and str(a.get("artifact_key") or "") not in chk_covered
-        and a.get("kind") not in ("gmail_thread", "gmail_draft", "gchat_thread")
+        and not _is_ssr_corr(a)
     ]
     mention_arts_ssr = [
         a
@@ -672,6 +701,28 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     padding: 1px 7px;
     border-radius: 999px;
   }}
+  .wb-ob-btns {{
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+    flex-shrink: 0;
+  }}
+  .wb-ob-ambig {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    flex-wrap: wrap;
+    width: 100%;
+    margin-top: 2px;
+    padding: 4px 7px;
+    border-radius: 5px;
+    background: #fffbeb;
+    border: 1px solid rgba(180, 83, 9, 0.28);
+    color: var(--warn);
+    font-size: 11px;
+  }}
   .wb-correspondence {{
     display: flex;
     flex-direction: column;
@@ -1052,7 +1103,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       if (activeFilter === 'multi' && !w.is_multi_channel) return false;
       if (
         activeFilter === 'obligations' &&
-        !(w.obligations && w.obligations.length > 0)
+        !(w.obligations && w.obligations.some((o) => o.status !== 'done'))
       ) {{
         return false;
       }}
@@ -1262,6 +1313,24 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
         const progHtml = o.progress_summary
           ? `<div class="wb-ob-prog">${{esc(o.progress_summary)}}</div>`
           : '';
+        const ambigHtml = o.ambiguity_prompt
+          ? `<div class="wb-ob-ambig">
+               <span>⚖️ ${{esc(o.ambiguity_prompt)}}</span>
+               <div class="wb-ob-btns">
+                 <button class="wb-btn" data-ob-keep="${{esc(o.obligation_id)}}"
+                         data-ob-event="${{esc(o.ambiguity_event_key || '')}}"
+                         type="button">Оставить обязательство</button>
+                 <button class="wb-btn" data-ob-close-topic="${{esc(o.obligation_id)}}"
+                         data-ob-event="${{esc(o.ambiguity_event_key || '')}}"
+                         type="button">Тема закрыта ✓</button>
+               </div>
+             </div>`
+          : '';
+        const waitBtnHtml = (o.kind === 'correspondence' && o.status === 'ready')
+          ? `<button class="wb-btn" data-ob-wait="${{esc(o.obligation_id)}}"
+                     title="Ответила устно / в другом канале — перевести в ожидание (7д)"
+                     type="button">Ответила → жду</button>`
+          : '';
         return `
           <div class="wb-ob" data-status="${{esc(o.status)}}"
                data-stalled="${{Boolean(o.stalled_alert)}}"
@@ -1269,8 +1338,13 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
             <div class="wb-ob-main">
               <div>${{statusTag}} · ${{esc(o.description)}}</div>
               ${{progHtml}}
+              ${{ambigHtml}}
             </div>
-            <button class="wb-btn" data-ob-done="${{esc(o.obligation_id)}}" type="button">✓</button>
+            <div class="wb-ob-btns">
+              ${{waitBtnHtml}}
+              <button class="wb-btn" data-ob-done="${{esc(o.obligation_id)}}"
+                      type="button">✓</button>
+            </div>
           </div>
         `;
       }}).join('');
@@ -1334,15 +1408,22 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       }}).join('');
       const checklistHtml = chkRowsHtml ? `<div class="wb-checklist">${{chkRowsHtml}}</div>` : '';
 
+      const isCorrArt = (a) => {{
+        if (!a) return false;
+        if (['gmail_thread', 'gmail_draft', 'gchat_thread', 'gdoc_thread'].includes(a.kind)) {{
+          return true;
+        }}
+        return a.kind === 'gdoc' && Boolean(a.state && a.state.is_active_correspondence);
+      }};
       const corrPills = (w.artifacts || []).filter((a) => {{
         if (a.role === 'context_only') return false;
-        return ['gmail_thread', 'gmail_draft', 'gchat_thread'].includes(a.kind);
+        return isCorrArt(a);
       }});
       let chatPillCount = 0;
       const visiblePills = (w.artifacts || []).filter((a) => {{
         if (a.role === 'context_only') return false;
         if (chkCovered.has(a.artifact_key)) return false;
-        if (['gmail_thread', 'gmail_draft', 'gchat_thread'].includes(a.kind)) return false;
+        if (isCorrArt(a)) return false;
         if (a.kind === 'chat_chain') {{
           const isRawChat = /^Chat\\s+[0-9a-f]{{6,}}$/i.test(String(a.title || ''));
           if (isRawChat && chatPillCount >= 1) return false;
@@ -1527,6 +1608,28 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       }});
       return;
     }}
+    if (target.hasAttribute('data-ob-wait')) {{
+      void postJson('/api/obligation/wait', {{
+        obligation_id: target.getAttribute('data-ob-wait'),
+      }});
+      return;
+    }}
+    if (target.hasAttribute('data-ob-keep')) {{
+      void postJson('/api/obligation/resolve_ambiguity', {{
+        obligation_id: target.getAttribute('data-ob-keep'),
+        decision: 'keep',
+        event_key: target.getAttribute('data-ob-event') || '',
+      }});
+      return;
+    }}
+    if (target.hasAttribute('data-ob-close-topic')) {{
+      void postJson('/api/obligation/resolve_ambiguity', {{
+        obligation_id: target.getAttribute('data-ob-close-topic'),
+        decision: 'close',
+        event_key: target.getAttribute('data-ob-event') || '',
+      }});
+      return;
+    }}
     if (target.hasAttribute('data-work-done')) {{
       void postJson('/api/work/done', {{
         work_id: target.getAttribute('data-work-done'),
@@ -1671,14 +1774,25 @@ def create_server(
             roadmap_item_key=str(body.get("roadmap_item_key") or ""),
             meta={"title_manual": True},
         )
-        for p in body.get("primaries") or []:
-          ck = work_store.canonicalize_artifact_key(str(p))
+        primaries_in = [str(p) for p in (body.get("primaries") or []) if str(p).strip()]
+        channels_in = [str(ch) for ch in (body.get("channels") or []) if str(ch).strip()]
+        for p in primaries_in:
+          ck = work_store.canonicalize_artifact_key(p)
           active_store.upsert_artifact(ck, title=ck, url=workctl._default_url_for_key(ck))
           active_store.link_artifact(wid, ck, role="primary", source="manual")
-        for ch in body.get("channels") or []:
-          ck = work_store.canonicalize_artifact_key(str(ch))
-          active_store.upsert_artifact(ck, title=ck, url=workctl._default_url_for_key(ck))
-          active_store.link_artifact(wid, ck, role="channel", source="manual")
+        for idx, ch in enumerate(channels_in):
+          ck = work_store.canonicalize_artifact_key(ch)
+          existing_art = active_store.get_artifact(ck)
+          existing_st = (existing_art or {}).get("state") or {}
+          extra_st = work_store.manual_correspondence_state(
+              ck, existing_st, is_channel_slot=True
+          )
+          ch_title = title if (not primaries_in and idx == 0 and not existing_art) else ck
+          active_store.upsert_artifact(
+              ck, title=ch_title, url=workctl._default_url_for_key(ck), state=extra_st
+          )
+          ch_role = "primary" if (not primaries_in and idx == 0) else "channel"
+          active_store.link_artifact(wid, ck, role=ch_role, source="manual")
         ob_desc = str(body.get("obligation") or "").strip()
         if ob_desc:
           active_store.add_obligation(
@@ -1686,6 +1800,7 @@ def create_server(
               description=ob_desc,
               trigger_expr=str(body.get("trigger") or "always"),
           )
+        active_store.reconcile_correspondence_obligations(wid)
         self._send_json(current_projection())
         return
 
@@ -1693,10 +1808,17 @@ def create_server(
         wid = str(body.get("work_id") or "")
         ck = work_store.canonicalize_artifact_key(str(body.get("artifact_key") or ""))
         if wid and ck:
-          active_store.upsert_artifact(ck, title=ck, url=workctl._default_url_for_key(ck))
-          active_store.link_artifact(
-              wid, ck, role=str(body.get("role") or "primary"), source="manual"
+          role_val = str(body.get("role") or "primary")
+          existing_art = active_store.get_artifact(ck)
+          existing_st = (existing_art or {}).get("state") or {}
+          extra_st = work_store.manual_correspondence_state(
+              ck, existing_st, is_channel_slot=(role_val == "channel")
           )
+          active_store.upsert_artifact(
+              ck, title=ck, url=workctl._default_url_for_key(ck), state=extra_st
+          )
+          active_store.link_artifact(wid, ck, role=role_val, source="manual")
+          active_store.reconcile_correspondence_obligations(wid)
         self._send_json(current_projection())
         return
 
@@ -1732,6 +1854,24 @@ def create_server(
         ob_id = str(body.get("obligation_id") or "")
         if ob_id:
           active_store.mark_obligation_done(ob_id)
+        self._send_json(current_projection())
+        return
+
+      if parsed.path == "/api/obligation/wait":
+        ob_id = str(body.get("obligation_id") or "").strip()
+        if ob_id:
+          active_store.mark_obligation_waiting(ob_id)
+        self._send_json(current_projection())
+        return
+
+      if parsed.path == "/api/obligation/resolve_ambiguity":
+        ob_id = str(body.get("obligation_id") or "").strip()
+        decision = str(body.get("decision") or "").strip()
+        event_key = str(body.get("event_key") or "").strip()
+        if ob_id and decision in ("keep", "close"):
+          active_store.resolve_obligation_ambiguity(
+              ob_id, decision=decision, event_key=event_key
+          )
         self._send_json(current_projection())
         return
 

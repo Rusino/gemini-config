@@ -20,28 +20,7 @@ ROADMAP_SCRIPT = os.path.expanduser("~/.gemini/config/hooks/roadmap.py")
 
 def _default_url_for_key(akey: str) -> str:
   c_key = work_store.canonicalize_artifact_key(akey)
-  parts = c_key.split(":")
-  kind = parts[0]
-  tid = parts[-1]
-  if kind == "gerrit":
-    if len(parts) >= 3 and parts[1] == "chromium":
-      return f"https://chromium-review.googlesource.com/c/chromium/src/+/{tid}"
-    return f"https://skia-review.googlesource.com/c/skia/+/{tid}"
-  if kind == "github_pr":
-    return f"https://github.com/flutter/flutter/pull/{tid}"
-  if kind == "github_issue":
-    return f"https://github.com/flutter/flutter/issues/{tid}"
-  if kind == "buganizer":
-    return f"https://issues.chromium.org/issues/{tid}"
-  if kind == "gmail_thread":
-    return f"https://mail.google.com/mail/u/0/#inbox/{tid}"
-  if kind == "gmail_draft":
-    return f"https://mail.google.com/mail/u/0/#drafts/{tid}"
-  if kind == "gdoc":
-    return f"https://docs.google.com/document/d/{tid}/edit"
-  if kind == "chat_chain":
-    return f"/c/{tid}"
-  return ""
+  return work_store._default_artifact_url(c_key)
 
 
 def _roadmap_writeback(proj_id: str, item_id: str) -> None:
@@ -115,6 +94,14 @@ def main(argv: list[str] | None = None) -> int:
   p_dismiss = sub.add_parser("dismiss", help="Dismiss a thread from Unanswered Human Threads")
   p_dismiss.add_argument("artifact_key")
 
+  p_wait = sub.add_parser("wait", help="Mark a correspondence obligation answered & waiting")
+  p_wait.add_argument("obligation_id")
+
+  p_ambig = sub.add_parser("resolve-ambiguity", help="Resolve borderline obligation closure")
+  p_ambig.add_argument("obligation_id")
+  p_ambig.add_argument("decision", choices=["keep", "close"])
+  p_ambig.add_argument("--event-key", default="")
+
   args = parser.parse_args(argv)
   store = work_store.WorkStore(args.db or None)
 
@@ -129,10 +116,20 @@ def main(argv: list[str] | None = None) -> int:
       ck = work_store.canonicalize_artifact_key(pkey)
       store.upsert_artifact(ck, title=ck, url=_default_url_for_key(ck))
       store.link_artifact(wid, ck, role="primary", source="manual")
-    for chkey in args.channel:
+    for idx, chkey in enumerate(args.channel):
       ck = work_store.canonicalize_artifact_key(chkey)
-      store.upsert_artifact(ck, title=ck, url=_default_url_for_key(ck))
-      store.link_artifact(wid, ck, role="channel", source="manual")
+      ex_art = store.get_artifact(ck)
+      ex_st = (ex_art or {}).get("state") or {}
+      extra_st = work_store.manual_correspondence_state(
+          ck, ex_st, is_channel_slot=True
+      )
+      ch_title = args.title if (not args.primary and idx == 0 and not ex_art) else ck
+      ch_role = "primary" if (not args.primary and idx == 0) else "channel"
+      store.upsert_artifact(
+          ck, title=ch_title, url=_default_url_for_key(ck), state=extra_st
+      )
+      store.link_artifact(wid, ck, role=ch_role, source="manual")
+    store.reconcile_correspondence_obligations(wid)
     print(wid)
     return 0
 
@@ -149,10 +146,18 @@ def main(argv: list[str] | None = None) -> int:
 
   if args.cmd == "link":
     ck = work_store.canonicalize_artifact_key(args.artifact_key)
+    ex_st = ((store.get_artifact(ck) or {}).get("state")) or {}
+    extra_st = work_store.manual_correspondence_state(
+        ck, ex_st, is_channel_slot=(args.role == "channel")
+    )
     store.upsert_artifact(
-        ck, title=args.title or ck, url=args.url or _default_url_for_key(ck)
+        ck,
+        title=args.title or ck,
+        url=args.url or _default_url_for_key(ck),
+        state=extra_st,
     )
     store.link_artifact(args.work_id, ck, role=args.role, source="manual")
+    store.reconcile_correspondence_obligations(args.work_id)
     print(ck)
     return 0
 
@@ -207,6 +212,18 @@ def main(argv: list[str] | None = None) -> int:
 
   if args.cmd == "dismiss":
     print(store.dismiss_tray_thread(args.artifact_key))
+    return 0
+
+  if args.cmd == "wait":
+    store.mark_obligation_waiting(args.obligation_id)
+    return 0
+
+  if args.cmd == "resolve-ambiguity":
+    store.resolve_obligation_ambiguity(
+        args.obligation_id,
+        decision=args.decision,
+        event_key=args.event_key,
+    )
     return 0
 
   return 0

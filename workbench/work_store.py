@@ -326,6 +326,17 @@ def is_transcript_config_only(transcript_path: str) -> bool:
               has_cfg_edit = True
           elif tname in ("update_doc", "send_message_markdown"):
             has_prod_write = True
+          elif tname == "call_mcp_tool":
+            t_mcp = str(args.get("ToolName") or "")
+            if t_mcp in (
+                "update_doc",
+                "create_file",
+                "add_comment_reply",
+                "resolve_comment_thread",
+                "send_message",
+                "send_message_markdown",
+            ):
+              has_prod_write = True
   except OSError:
     return False
   return has_cfg_edit and not has_prod_write
@@ -401,6 +412,7 @@ PILL_ICONS: dict[str, str] = {
     "gmail_draft": "📝",
     "gchat_thread": "💬",
     "gdoc": "📄",
+    "gdoc_thread": "🗨",
     "buganizer": "🐞",
     "github_issue": "🐞",
     "gerrit": "🔧",
@@ -455,8 +467,88 @@ _PLACEHOLDER_KEY_PREFIXES = (
     "gmail_thread:",
     "gmail_draft:",
     "gchat_thread:",
+    "gdoc:",
+    "gdoc_thread:",
     "chat_chain:",
 )
+
+_RE_COURTESY_CLOSE = re.compile(
+    r"\b(?:thank\s+you|thanks|got\s+it|sounds\s+good|sgtm|lgtm"
+    r"|i\s+agree\s+with\s+you|do\s+whatever\s+you\s+want|no\s+worries|all\s+set|reverted)\b",
+    re.IGNORECASE,
+)
+_RE_OPEN_ACTION_CUES = re.compile(
+    r"\b(?:ptal|please\s+(?:check|review|advise|take)|could\s+you|can\s+you|would\s+you"
+    r"|wdyt|let\s+me\s+know|tomorrow|looking\s+into|will\s+send|follow\s+up)\b",
+    re.IGNORECASE,
+)
+
+
+# Exclude passive reference GDocs and bot notifications from active correspondence ownership
+def is_active_correspondence_artifact(
+    kind: str, state: Mapping[str, Any] | None = None
+) -> bool:
+  st = state or {}
+  if kind == "gchat_thread":
+    return True
+  if kind == "gdoc_thread":
+    return True
+  if kind == "gdoc":
+    return bool(st.get("is_active_correspondence"))
+  if kind == "gmail_thread":
+    if st.get("is_github_issue_thread") or st.get("is_gdoc_comment"):
+      return True
+    if st.get("is_drive_share"):
+      return bool(st.get("started_by_me") or st.get("is_active_correspondence"))
+    return not bool(st.get("is_automated"))
+  return False
+
+
+# Flag courtesy sign-offs, external GDoc resolves, and direct inbound shares once per message_id
+def detect_borderline_correspondence_closure(
+    kind: str, state: Mapping[str, Any] | None = None
+) -> tuple[str, str]:
+  st = state or {}
+  last_ts = float(st.get("last_message_ts") or 0.0)
+  # Key decisions per message so a later reply on the same thread can ask again if needed
+  event_key = str(st.get("last_message_id") or "").strip()
+  if not event_key and last_ts > 0:
+    event_key = f"ts:{int(last_ts)}"
+  if not event_key:
+    return "", ""
+  decisions = st.get("ambiguity_decisions")
+  if isinstance(decisions, Mapping) and event_key in decisions:
+    return "", ""
+  if kind == "gdoc_thread" and bool(st.get("resolved_externally")):
+    return "Ветка комментариев в Google Doc помечена решённой — обязательство закрыто?", event_key
+  if (kind == "gdoc" or bool(st.get("is_drive_share"))) and not bool(
+      st.get("started_by_me", True)
+  ):
+    return (
+        "Документ расшарен напрямую — нужно ответить/отревьюить или закрыть обязательство?",
+        event_key,
+    )
+  raw_snip = str(st.get("last_unquoted_text") or st.get("last_snippet") or "").strip()
+  if not raw_snip:
+    return "", ""
+  # Strip inline Gmail attribution tails ("On Mon, ...") and reject questions or action cues
+  snip = re.split(
+      r"\bOn\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun|[A-Z][a-z]{2},\s)", raw_snip, maxsplit=1
+  )[0].strip()
+  if not snip or len(snip) > 220 or "?" in snip:
+    return "", ""
+  if _RE_OPEN_ACTION_CUES.search(snip):
+    return "", ""
+  # Outbound single-message openers ending with "Thanks!" are initial asks, not thread closures
+  if _RE_COURTESY_CLOSE.search(snip):
+    msg_cnt = int(st.get("message_count") or 1)
+    # Multi-turn history is guaranteed when msg_cnt >= 2 or an inbound reply follows our message
+    is_multi_turn = msg_cnt >= 2 or (
+        bool(st.get("sent_by_me")) and not bool(st.get("last_from_me"))
+    )
+    if is_multi_turn or "i agree with you" in snip.lower():
+      return "Похоже на завершающую реплику — тема закрыта или остаётся обязательство?", event_key
+  return "", ""
 
 
 def clean_work_title(raw_title: str) -> str:
@@ -549,9 +641,8 @@ def resolve_work_origin_and_title(
     ots = float(st.get("origin_ts") or st.get("created_ts") or 0.0)
     kind = str(a.get("kind") or "")
     # Group non-context human correspondence separately so it can act as causal root
-    if kind in ("gmail_thread", "gchat_thread"):
-      if a.get("role") != "context_only" and not st.get("is_automated"):
-        correspondence_arts.append((ots, a))
+    if a.get("role") != "context_only" and is_active_correspondence_artifact(kind, st):
+      correspondence_arts.append((ots, a))
     elif ots > 0 and a.get("role") != "context_only":
       # Keep companion probes behind real parent artifacts when resolving causal origin
       is_comp = is_companion_artifact(
@@ -627,6 +718,12 @@ def resolve_work_origin_and_title(
       parts = [p for p in (dt_str, who) if p]
       detail = f" ({' · '.join(parts)}{reply_part}{cnt_part})" if parts else ""
       label = f"🌱 Origin: ✉ {st.get('root_subject') or origin_art.get('title')}{detail}"
+    elif kind in ("gdoc_thread", "gdoc"):
+      cp = str(st.get("counterparty") or "").strip()
+      doc_t = str(st.get("doc_title") or origin_art.get("title") or "").strip()
+      parts = [p for p in (dt_str, cp) if p]
+      detail = f" ({' · '.join(parts)})" if parts else ""
+      label = f"🌱 Origin: 📄 {doc_t}{detail}"
     else:
       short_id = str(origin_art.get("artifact_key") or "").split(":")[-1][:12]
       dt_part = f" {dt_str}" if dt_str else ""
@@ -645,11 +742,23 @@ def resolve_work_origin_and_title(
     return raw_title, origin_info
 
   # When the root cause is a correspondence thread, promote its subject + counterparty as title
-  if origin_art is not None and origin_art.get("kind") in ("gmail_thread", "gchat_thread"):
+  if origin_art is not None and origin_art.get("kind") in (
+      "gmail_thread",
+      "gchat_thread",
+      "gdoc_thread",
+      "gdoc",
+  ):
     st = origin_art.get("state") or {}
-    root_subj = str(st.get("root_subject") or "").strip()
+    if origin_art.get("kind") in ("gdoc_thread", "gdoc"):
+      root_subj = str(st.get("doc_title") or "").strip()
+      if not root_subj:
+        cand_t = clean_work_title(str(origin_art.get("title") or ""))
+        if not is_placeholder_title(cand_t, str(origin_art.get("artifact_key") or "")):
+          root_subj = cand_t
+    else:
+      root_subj = str(st.get("root_subject") or "").strip()
     # Strip reply/forward prefixes when falling back to the raw artifact title
-    if not root_subj:
+    if not root_subj and origin_art.get("kind") in ("gmail_thread", "gchat_thread"):
       root_subj = re.sub(
           r"^(?:re|fwd|fw)\s*:\s*",
           "",
@@ -658,7 +767,7 @@ def resolve_work_origin_and_title(
       ).strip()
     cp = str(st.get("counterparty") or "").strip()
     # Append the counterparty name when not already present in the thread subject
-    if root_subj:
+    if root_subj and not is_placeholder_title(root_subj):
       if cp and cp.lower() not in root_subj.lower():
         return f"{root_subj} — {cp}", origin_info
       return root_subj, origin_info
@@ -747,6 +856,7 @@ def canonicalize_artifact_key(
         "gmail_draft",
         "gchat_thread",
         "gdoc",
+        "gdoc_thread",
         "chat_chain",
         "roadmap_item",
     ):
@@ -775,6 +885,7 @@ def canonicalize_artifact_key(
       "gmail_draft",
       "gchat_thread",
       "gdoc",
+      "gdoc_thread",
       "chat_chain",
       "roadmap_item",
   ):
@@ -1004,7 +1115,40 @@ def _default_artifact_url(artifact_key: str) -> str:
     return f"http://cl/{num}"
   if akey.startswith("buganizer:"):
     return f"https://issues.chromium.org/issues/{num}"
+  if akey.startswith("gmail_thread:"):
+    return f"https://mail.google.com/mail/u/0/#inbox/{num}"
+  if akey.startswith("gmail_draft:"):
+    return f"https://mail.google.com/mail/u/0/#drafts/{num}"
+  if akey.startswith("gdoc_thread:"):
+    parts = akey.split(":", 2)
+    if len(parts) == 3:
+      return f"https://docs.google.com/document/d/{parts[1]}/edit?disco={parts[2]}"
+  if akey.startswith("gdoc:"):
+    doc_id = akey.split(":", 1)[1]
+    return f"https://docs.google.com/document/d/{doc_id}/edit"
+  if akey.startswith("chat_chain:"):
+    return f"/c/{num}"
   return ""
+
+
+# Build correspondence channel activation metadata for manual UI/CLI create and link paths
+def manual_correspondence_state(
+    artifact_key: str,
+    existing_state: Mapping[str, Any] | None = None,
+    *,
+    is_channel_slot: bool = False,
+) -> dict[str, Any] | None:
+  ck = str(artifact_key or "")
+  if not (
+      ck.startswith(("gmail_thread:", "gchat_thread:", "gdoc_thread:"))
+      or (is_channel_slot and ck.startswith("gdoc:"))
+  ):
+    return None
+  st = existing_state or {}
+  extra: dict[str, Any] = {"is_active_correspondence": True}
+  if "last_from_me" not in st:
+    extra["promoted_inbound"] = True
+  return extra
 
 
 def _is_own_cl(st: Mapping[str, Any], est: Mapping[str, Any]) -> bool:
@@ -1218,6 +1362,15 @@ def compute_artifact_provenance(
     if role == "primary" or reason == "gmail_root":
       return "основа карточки", detail or "Корневая переписка, объединяющая артефакты задачи"
     return "переписка по задаче", detail or "Цепочка писем в Gmail, связанная с артефактами задачи"
+
+  if kind == "gdoc_thread":
+    return "комментарий в доке", detail or "Живая ветка комментариев в Google Doc"
+
+  if kind == "gdoc":
+    if st.get("is_active_correspondence"):
+      badge = "основа карточки" if role == "primary" else "переписка в доке"
+      return badge, detail or "Расшаренный для обсуждения документ Google Docs"
+    return "документ задачи", detail or "Связанный документ Google Docs"
 
   if kind == "chat_chain":
     t_lower = str(art.get("title") or "").lower()
@@ -1575,6 +1728,42 @@ def _eval_single_predicate(
       return "unknown"
     return "true" if (now - updated_at) >= days * 86400 else "false"
 
+  m_corr = re.match(
+      r"^correspondence_turn\(\s*([^,)]+?)(?:\s*,\s*(\d+))?\s*\)$",
+      expr,
+      re.IGNORECASE,
+  )
+  if m_corr:
+    akey = canonicalize_artifact_key(m_corr.group(1))
+    silence_days = int(m_corr.group(2) or STALLED_OBLIGATION_DAYS)
+    art = artifacts_by_key.get(akey)
+    if not art:
+      return "unknown"
+    st = art.get("state") or {}
+    if bool(st.get("resolved")) and bool(st.get("resolved_by_me")):
+      return "false"
+    last_ts = float(st.get("last_message_ts") or st.get("origin_ts") or 0.0)
+    override_ts = max(
+        float(st.get("manual_wait_ts") or 0.0),
+        float(st.get("mcp_reply_ts") or 0.0),
+        float(st.get("ack_message_ts") or 0.0),
+    )
+    if "last_from_me" in st:
+      from_me = bool(st.get("last_from_me"))
+    else:
+      from_me = not bool(st.get("promoted_inbound"))
+    # Verbal wait or MCP comment reply newer than the latest Gmail pull flips turn to external wait
+    if not from_me and override_ts > 0 and override_ts >= last_ts:
+      from_me = True
+    if not from_me:
+      return "true"
+    anchor_ts = max(last_ts, override_ts)
+    if anchor_ts <= 0:
+      anchor_ts = float(work_row.get("created_at") or 0.0)
+    if anchor_ts <= 0:
+      return "false"
+    return "true" if (now - anchor_ts) >= silence_days * 86400 else "false"
+
   return "unknown"
 
 
@@ -1603,11 +1792,24 @@ def evaluate_trigger(
 def _is_done_matched(
     obligation: Mapping[str, Any],
     artifacts_by_key: Mapping[str, Mapping[str, Any]],
+    trigger_eval: str = "true",
+    ready_at: float = 0.0,
 ) -> bool:
-  """Checks whether a post-creation reply or draft send satisfies the obligation."""
+  """Checks whether a post-ready reply, draft send, or GDoc resolve satisfies the obligation."""
   created_at = float(obligation.get("created_at") or 0.0)
   target_key = str(obligation.get("target_artifact_key") or "").strip()
   matcher = str(obligation.get("done_matcher") or "").strip()
+  ob_kind = str(obligation.get("kind") or "reply").strip()
+
+  # End-to-end correspondence umbrellas never auto-close on interim replies, only explicit resolve
+  if ob_kind == "correspondence":
+    if not target_key:
+      return False
+    art = artifacts_by_key.get(canonicalize_artifact_key(target_key))
+    if not art:
+      return False
+    st = art.get("state") or {}
+    return bool(st.get("resolved")) and bool(st.get("resolved_by_me"))
 
   m_reply = re.match(r"^reply_sent\(\s*([^)]+?)\s*\)$", matcher, re.IGNORECASE)
   check_key = canonicalize_artifact_key(m_reply.group(1)) if m_reply else target_key
@@ -1620,10 +1822,14 @@ def _is_done_matched(
   kind = str(art.get("kind") or "")
   if kind == "gmail_draft" and str(st.get("status") or "").upper() == "SENT":
     return True
-  if kind in ("gmail_thread", "gchat_thread"):
+  # Require the obligation trigger to have fired before counting a reply as satisfying the promise
+  if trigger_eval != "true":
+    return False
+  if kind in ("gmail_thread", "gchat_thread", "gdoc_thread"):
     last_from_me = bool(st.get("last_from_me"))
     last_ts = float(st.get("last_message_ts") or 0.0)
-    if last_from_me and last_ts > created_at:
+    floor_ts = max(created_at, ready_at)
+    if last_from_me and last_ts > floor_ts:
       return True
   return False
 
@@ -1704,7 +1910,8 @@ class WorkStore:
           status TEXT NOT NULL DEFAULT 'open',
           last_eval TEXT NOT NULL DEFAULT 'unknown',
           created_at REAL NOT NULL,
-          satisfied_at REAL DEFAULT 0
+          satisfied_at REAL DEFAULT 0,
+          meta_json TEXT DEFAULT '{}'
         );
         CREATE TABLE IF NOT EXISTS candidate_buffer (
           artifact_key TEXT PRIMARY KEY,
@@ -1733,6 +1940,12 @@ class WorkStore:
         conn.execute("ALTER TABLE work_links ADD COLUMN link_reason TEXT DEFAULT ''")
       if "link_detail" not in wl_cols:
         conn.execute("ALTER TABLE work_links ADD COLUMN link_detail TEXT DEFAULT ''")
+      ob_cols = {
+          str(r[1])
+          for r in conn.execute("PRAGMA table_info(obligations)").fetchall()
+      }
+      if "meta_json" not in ob_cols:
+        conn.execute("ALTER TABLE obligations ADD COLUMN meta_json TEXT DEFAULT '{}'")
 
   def _log_event(
       self,
@@ -1839,7 +2052,7 @@ class WorkStore:
       raw = f"gmail_thread:{raw.lower()}"
     akey = canonicalize_artifact_key(raw)
     akind = artifact_kind_from_key(akey)
-    if akind not in ("gmail_thread", "gchat_thread"):
+    if akind not in ("gmail_thread", "gchat_thread", "gdoc_thread"):
       raise ValueError(f"Unsupported tray thread artifact_key: {artifact_key}")
     self.upsert_artifact(
         akey,
@@ -1863,7 +2076,7 @@ class WorkStore:
     with self._lock, self._connect() as conn:
       rows = conn.execute(
           "SELECT artifact_key, state_json FROM artifacts "
-          "WHERE kind IN ('gmail_thread', 'gchat_thread') "
+          "WHERE kind IN ('gmail_thread', 'gchat_thread', 'gdoc_thread') "
           "AND state_json LIKE '%tray_dismissed%'"
       ).fetchall()
     for r in rows:
@@ -1887,9 +2100,57 @@ class WorkStore:
       ).fetchall()
     for r in rows:
       akey = canonicalize_artifact_key(str(r["artifact_key"] or ""))
-      if akey.startswith(("gmail_thread:", "gchat_thread:")):
+      if akey.startswith(("gmail_thread:", "gchat_thread:", "gdoc_thread:", "gdoc:")):
         completed[akey] = float(r["done_ts"] or 0.0)
     return completed
+
+  def rekey_gdoc_thread_artifact(
+      self, old_key: str, new_key: str, now: float | None = None
+  ) -> dict[str, Any]:
+    """Migrates a Drive-ID gdoc_thread row to its canonical ?disco=doco.<id> key."""
+    cur_now = time.time() if now is None else now
+    if not old_key or not new_key or old_key == new_key:
+      return {}
+    with self._lock, self._connect() as conn:
+      old_row = conn.execute(
+          "SELECT * FROM artifacts WHERE artifact_key = ?", (old_key,)
+      ).fetchone()
+      if not old_row:
+        return {}
+      try:
+        old_st = json.loads(old_row["state_json"] or "{}")
+      except Exception:
+        old_st = {}
+      new_row = conn.execute(
+          "SELECT * FROM artifacts WHERE artifact_key = ?", (new_key,)
+      ).fetchone()
+      if not new_row:
+        conn.execute(
+            "INSERT INTO artifacts (artifact_key, kind, title, url, state_json, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                new_key,
+                str(old_row["kind"] or "gdoc_thread"),
+                str(old_row["title"] or new_key),
+                str(old_row["url"] or ""),
+                json.dumps(old_st),
+                cur_now,
+            ),
+        )
+      conn.execute(
+          "INSERT OR IGNORE INTO work_links "
+          "(work_id, artifact_key, role, source, confidence, created_at, link_reason, link_detail) "
+          "SELECT work_id, ?, role, source, confidence, created_at, link_reason, link_detail "
+          "FROM work_links WHERE artifact_key = ?",
+          (new_key, old_key),
+      )
+      conn.execute("DELETE FROM work_links WHERE artifact_key = ?", (old_key,))
+      conn.execute(
+          "UPDATE obligations SET target_artifact_key = ? WHERE target_artifact_key = ?",
+          (new_key, old_key),
+      )
+      conn.execute("DELETE FROM artifacts WHERE artifact_key = ?", (old_key,))
+      return old_st
 
   def upsert_artifact(
       self,
@@ -1918,11 +2179,34 @@ class WorkStore:
         # Preserve the earliest known creation timestamp across incremental sync passes
         prev_ots = float(merged_state.get("origin_ts") or 0.0)
         new_ots = float(state.get("origin_ts") or 0.0)
+        prev_last_ts = float(merged_state.get("last_message_ts") or 0.0)
         merged_state.update(dict(state))
         if prev_ots > 0 and new_ots > 0:
           merged_state["origin_ts"] = min(prev_ots, new_ots)
         elif prev_ots > 0:
           merged_state["origin_ts"] = prev_ots
+        # Keep monotonic message timestamps and user/MCP acknowledgement overrides across syncs
+        mcp_ts = float(merged_state.get("mcp_reply_ts") or 0.0)
+        resolved_ts = float(merged_state.get("resolved_at") or 0.0)
+        cur_msg_ts = float(merged_state.get("last_message_ts") or 0.0)
+        if prev_last_ts > cur_msg_ts and max(mcp_ts, resolved_ts) >= prev_last_ts:
+          merged_state["last_message_ts"] = prev_last_ts
+          cur_msg_ts = prev_last_ts
+        if mcp_ts > 0 and cur_msg_ts <= mcp_ts:
+          merged_state["last_from_me"] = True
+        ack_floor = max(
+            float(merged_state.get("ack_message_ts") or 0.0),
+            float(merged_state.get("manual_wait_ts") or 0.0),
+            mcp_ts,
+            resolved_ts,
+        )
+        if ack_floor > 0 and cur_msg_ts <= ack_floor:
+          merged_state["unanswered_human"] = False
+        # Clear sticky MCP resolve flags when a newer comment reopens the #disco thread
+        if resolved_ts > 0 and "resolved" not in state and cur_msg_ts > resolved_ts:
+          merged_state["resolved"] = False
+          merged_state["resolved_by_me"] = False
+          merged_state["resolved_externally"] = False
       # Never overwrite a descriptive stored title with a raw artifact_key placeholder
       existing_title = str(existing["title"] or "") if existing else ""
       if (
@@ -2116,6 +2400,13 @@ class WorkStore:
           "DELETE FROM work_links WHERE work_id = ? AND artifact_key = ?",
           (work_id, akey),
       )
+      # Close correspondence umbrellas when their underlying channel is detached from the Work
+      conn.execute(
+          "UPDATE obligations SET status = 'done', satisfied_at = ? "
+          "WHERE work_id = ? AND target_artifact_key = ? "
+          "AND kind = 'correspondence' AND status IN ('open', 'ready')",
+          (cur_now, work_id, akey),
+      )
       conn.execute(
           "INSERT OR REPLACE INTO negative_links (work_id, artifact_key, created_at) "
           "VALUES (?, ?, ?)",
@@ -2170,30 +2461,45 @@ class WorkStore:
       ).fetchone()
       if existing and existing["status"] == "done":
         return obligation_id
-      conn.execute(
-          "INSERT OR REPLACE INTO obligations "
-          "(obligation_id, work_id, target_artifact_key, kind, description, "
-          "trigger_expr, done_matcher, status, last_eval, created_at, satisfied_at) "
-          "VALUES (?, ?, ?, ?, ?, ?, ?, 'open', 'unknown', ?, 0)",
-          (
-              obligation_id,
-              work_id,
-              tkey,
-              kind,
-              description.strip(),
-              trigger_expr.strip() or "always",
-              done_matcher.strip(),
-              cur_now,
-          ),
-      )
-      self._log_event(
-          conn,
-          "obligation_created",
-          work_id=work_id,
-          artifact_key=tkey,
-          payload={"obligation_id": obligation_id, "trigger_expr": trigger_expr},
-          now=cur_now,
-      )
+      # Preserve existing status and ready_at meta_json when re-adding an active obligation
+      if existing:
+        conn.execute(
+            "UPDATE obligations SET description = ?, trigger_expr = ?, done_matcher = ? "
+            "WHERE obligation_id = ?",
+            (
+                description.strip(),
+                trigger_expr.strip() or "always",
+                done_matcher.strip(),
+                obligation_id,
+            ),
+        )
+      else:
+        conn.execute(
+            "INSERT INTO obligations "
+            "(obligation_id, work_id, target_artifact_key, kind, description, "
+            "trigger_expr, done_matcher, status, last_eval, created_at, satisfied_at, meta_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'open', 'unknown', ?, 0, '{}')",
+            (
+                obligation_id,
+                work_id,
+                tkey,
+                kind,
+                description.strip(),
+                trigger_expr.strip() or "always",
+                done_matcher.strip(),
+                cur_now,
+            ),
+        )
+        self._log_event(
+            conn,
+            "obligation_created",
+            work_id=work_id,
+            artifact_key=tkey,
+            payload={"obligation_id": obligation_id, "trigger_expr": trigger_expr},
+            now=cur_now,
+        )
+    if kind != "correspondence":
+      self.reconcile_correspondence_obligations(work_id, now=cur_now)
     self.evaluate_all_obligations(now=cur_now)
     return obligation_id
 
@@ -2225,22 +2531,25 @@ class WorkStore:
       ).fetchone()
       if existing and existing["status"] == "done":
         return ob_id
-      created_ts = float(existing["created_at"]) if existing else cur_now
-      conn.execute(
-          "INSERT OR REPLACE INTO obligations "
-          "(obligation_id, work_id, target_artifact_key, kind, description, "
-          "trigger_expr, done_matcher, status, last_eval, created_at, satisfied_at) "
-          "VALUES (?, ?, ?, 'reply', ?, ?, ?, 'open', 'unknown', ?, 0)",
-          (
-              ob_id,
-              work_id,
-              tkey,
-              description.strip(),
-              trigger_expr.strip() or "always",
-              done_matcher.strip() or f"reply_sent({tkey})",
-              created_ts,
-          ),
-      )
+      final_desc = description.strip()
+      final_trig = trigger_expr.strip() or "always"
+      final_done = done_matcher.strip() or f"reply_sent({tkey})"
+      # Update in place so 90s Gmail syncs preserve ready_at and never emit duplicate ready events
+      if existing:
+        conn.execute(
+            "UPDATE obligations SET description = ?, trigger_expr = ?, done_matcher = ? "
+            "WHERE obligation_id = ?",
+            (final_desc, final_trig, final_done, ob_id),
+        )
+      else:
+        conn.execute(
+            "INSERT INTO obligations "
+            "(obligation_id, work_id, target_artifact_key, kind, description, "
+            "trigger_expr, done_matcher, status, last_eval, created_at, satisfied_at, meta_json) "
+            "VALUES (?, ?, ?, 'reply', ?, ?, ?, 'open', 'unknown', ?, 0, '{}')",
+            (ob_id, work_id, tkey, final_desc, final_trig, final_done, cur_now),
+        )
+    self.reconcile_correspondence_obligations(work_id, now=cur_now)
     self.evaluate_all_obligations(now=cur_now)
     return ob_id
 
@@ -2333,22 +2642,395 @@ class WorkStore:
     cur_now = time.time() if now is None else now
     with self._lock, self._connect() as conn:
       row = conn.execute(
-          "SELECT work_id, target_artifact_key FROM obligations WHERE obligation_id = ?",
+          "SELECT work_id, target_artifact_key, meta_json "
+          "FROM obligations WHERE obligation_id = ?",
           (obligation_id,),
       ).fetchone()
-      conn.execute(
-          "UPDATE obligations SET status = 'done', satisfied_at = ? WHERE obligation_id = ?",
-          (cur_now, obligation_id),
-      )
+      ack_ts = cur_now
       if row:
+        tkey = str(row["target_artifact_key"] or "").strip()
+        try:
+          ob_meta = json.loads(row["meta_json"] or "{}")
+        except Exception:
+          ob_meta = {}
+        ob_meta.pop("superseded_by_specific", None)
+        if tkey:
+          ar = conn.execute(
+              "SELECT state_json FROM artifacts WHERE artifact_key = ?", (tkey,)
+          ).fetchone()
+          if ar:
+            try:
+              st = json.loads(ar["state_json"] or "{}")
+            except Exception:
+              st = {}
+            msg_ts = float(st.get("last_message_ts") or 0.0)
+            ack_ts = max(cur_now, msg_ts)
+            st["ack_message_ts"] = ack_ts
+            st["unanswered_human"] = False
+            conn.execute(
+                "UPDATE artifacts SET state_json = ?, updated_at = ? WHERE artifact_key = ?",
+                (json.dumps(st), cur_now, tkey),
+            )
+        conn.execute(
+            "UPDATE obligations SET status = 'done', satisfied_at = ?, meta_json = ? "
+            "WHERE obligation_id = ?",
+            (ack_ts, json.dumps(ob_meta), obligation_id),
+        )
         self._log_event(
             conn,
             "obligation_done",
             work_id=str(row["work_id"]),
-            artifact_key=str(row["target_artifact_key"] or ""),
+            artifact_key=tkey,
             payload={"obligation_id": obligation_id},
             now=cur_now,
         )
+      else:
+        conn.execute(
+            "UPDATE obligations SET status = 'done', satisfied_at = ? WHERE obligation_id = ?",
+            (cur_now, obligation_id),
+        )
+
+  def mark_obligation_waiting(
+      self, obligation_id: str, now: float | None = None
+  ) -> None:
+    """Moves a correspondence obligation to open/Waiting after an out-of-band or verbal reply."""
+    cur_now = time.time() if now is None else now
+    with self._lock, self._connect() as conn:
+      row = conn.execute(
+          "SELECT work_id, target_artifact_key, meta_json "
+          "FROM obligations WHERE obligation_id = ?",
+          (obligation_id,),
+      ).fetchone()
+      if not row:
+        return
+      wid = str(row["work_id"] or "")
+      tkey = str(row["target_artifact_key"] or "").strip()
+      try:
+        ob_meta = json.loads(row["meta_json"] or "{}")
+      except Exception:
+        ob_meta = {}
+      ob_meta.pop("ready_at", None)
+      # Advance manual_wait_ts past last_message_ts to start a fresh 7d silence window
+      if tkey:
+        ar = conn.execute(
+            "SELECT state_json FROM artifacts WHERE artifact_key = ?", (tkey,)
+        ).fetchone()
+        if ar:
+          try:
+            st = json.loads(ar["state_json"] or "{}")
+          except Exception:
+            st = {}
+          msg_ts = float(st.get("last_message_ts") or 0.0)
+          st["manual_wait_ts"] = max(cur_now, msg_ts)
+          st["unanswered_human"] = False
+          conn.execute(
+              "UPDATE artifacts SET state_json = ?, updated_at = ? WHERE artifact_key = ?",
+              (json.dumps(st), cur_now, tkey),
+          )
+      conn.execute(
+          "UPDATE obligations SET status = 'open', last_eval = 'false', meta_json = ? "
+          "WHERE obligation_id = ?",
+          (json.dumps(ob_meta), obligation_id),
+      )
+      self._log_event(
+          conn,
+          "obligation_waiting",
+          work_id=wid,
+          artifact_key=tkey,
+          payload={"obligation_id": obligation_id},
+          now=cur_now,
+      )
+    self.evaluate_all_obligations(now=cur_now)
+
+  def resolve_obligation_ambiguity(
+      self,
+      obligation_id: str,
+      decision: str,
+      event_key: str = "",
+      now: float | None = None,
+  ) -> None:
+    """Records a 1-click user ruling ('keep' or 'close') for a borderline closure message."""
+    cur_now = time.time() if now is None else now
+    dec = str(decision or "").strip().lower()
+    if dec not in ("keep", "close"):
+      return
+    tkey = ""
+    wid = ""
+    with self._lock, self._connect() as conn:
+      row = conn.execute(
+          "SELECT work_id, target_artifact_key FROM obligations WHERE obligation_id = ?",
+          (obligation_id,),
+      ).fetchone()
+      if not row:
+        return
+      wid = str(row["work_id"] or "")
+      tkey = str(row["target_artifact_key"] or "").strip()
+      # Persist ruling under event_key on the target artifact so syncs never re-prompt
+      resolved_ev = str(event_key or "").strip()
+      if tkey:
+        ar = conn.execute(
+            "SELECT kind, state_json FROM artifacts WHERE artifact_key = ?", (tkey,)
+        ).fetchone()
+        if ar:
+          try:
+            st = json.loads(ar["state_json"] or "{}")
+          except Exception:
+            st = {}
+          if not resolved_ev:
+            _, resolved_ev = detect_borderline_correspondence_closure(
+                str(ar["kind"] or ""), st
+            )
+          if not resolved_ev:
+            resolved_ev = str(st.get("last_message_id") or "").strip()
+          if resolved_ev:
+            decisions = dict(st.get("ambiguity_decisions") or {})
+            decisions[resolved_ev] = dec
+            st["ambiguity_decisions"] = decisions
+            conn.execute(
+                "UPDATE artifacts SET state_json = ?, updated_at = ? WHERE artifact_key = ?",
+                (json.dumps(st), cur_now, tkey),
+            )
+      self._log_event(
+          conn,
+          "obligation_ambiguity_resolved",
+          work_id=wid,
+          artifact_key=tkey,
+          payload={"obligation_id": obligation_id, "decision": dec, "event_key": resolved_ev},
+          now=cur_now,
+      )
+    if dec == "close":
+      self.mark_obligation_done(obligation_id, now=cur_now)
+    else:
+      self.evaluate_all_obligations(now=cur_now)
+
+  def reconcile_correspondence_obligations(
+      self, work_id: str | None = None, now: float | None = None
+  ) -> None:
+    """Ensures active correspondence channels carry end-to-end ownership umbrellas."""
+    cur_now = time.time() if now is None else now
+    # Evaluate sent drafts and replies first so satisfied promises hand off to 7d Waiting
+    self.evaluate_all_obligations(now=cur_now)
+    with self._lock, self._connect() as conn:
+      if work_id:
+        w_rows = conn.execute(
+            "SELECT * FROM works WHERE work_id = ? AND status NOT IN ('done', 'archived')",
+            (work_id,),
+        ).fetchall()
+      else:
+        w_rows = conn.execute(
+            "SELECT * FROM works WHERE status NOT IN ('done', 'archived')"
+        ).fetchall()
+      if not w_rows:
+        return
+      art_rows = {
+          str(r["artifact_key"]): dict(r)
+          for r in conn.execute("SELECT * FROM artifacts").fetchall()
+      }
+      for ar in art_rows.values():
+        try:
+          ar["state"] = json.loads(ar.get("state_json") or "{}")
+        except Exception:
+          ar["state"] = {}
+
+      for wr in w_rows:
+        wid = str(wr["work_id"])
+        wl_rows = conn.execute(
+            "SELECT artifact_key, role FROM work_links "
+            "WHERE work_id = ? AND role IN ('primary', 'channel') "
+            "ORDER BY created_at ASC",
+            (wid,),
+        ).fetchall()
+        ob_rows = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM obligations WHERE work_id = ?", (wid,)
+            ).fetchall()
+        ]
+        linked_keys = [str(r["artifact_key"]) for r in wl_rows]
+        linked_set = set(linked_keys)
+        gmail_channels = [k for k in linked_keys if k.startswith("gmail_thread:")]
+        gdoc_ids_with_threads = {
+            k.split(":", 2)[1]
+            for k in linked_keys
+            if k.startswith("gdoc_thread:") and k.count(":") >= 2
+        }
+
+        # Close orphaned umbrellas and canonicalize migrated ob-corr IDs after merge/split
+        existing_corr_by_target: dict[str, dict[str, Any]] = {}
+        for o in ob_rows:
+          if str(o.get("kind") or "") != "correspondence":
+            continue
+          t_ak = str(o.get("target_artifact_key") or "").strip()
+          cur_oid = str(o.get("obligation_id") or "")
+          if not t_ak or t_ak not in linked_set:
+            if str(o.get("status") or "") in ("open", "ready"):
+              conn.execute(
+                  "UPDATE obligations SET status = 'done', satisfied_at = ? "
+                  "WHERE obligation_id = ?",
+                  (cur_now, cur_oid),
+              )
+            continue
+          canon_oid = f"ob-corr-{hashlib.sha1(f'{wid}:{t_ak}'.encode('utf-8')).hexdigest()[:10]}"
+          if cur_oid != canon_oid:
+            if any(str(x.get("obligation_id") or "") == canon_oid for x in ob_rows):
+              conn.execute("DELETE FROM obligations WHERE obligation_id = ?", (cur_oid,))
+              continue
+            conn.execute(
+                "UPDATE obligations SET obligation_id = ? WHERE obligation_id = ?",
+                (canon_oid, cur_oid),
+            )
+            o["obligation_id"] = canon_oid
+          if t_ak in existing_corr_by_target:
+            conn.execute(
+                "DELETE FROM obligations WHERE obligation_id = ?", (o["obligation_id"],)
+            )
+            continue
+          existing_corr_by_target[t_ak] = o
+
+        # Collect per-channel specific obligations so CL/bug obligations leave other channels live
+        superseded_targets: set[str] = set()
+        has_untargeted_reply = False
+        for o in ob_rows:
+          if str(o.get("kind") or "") == "correspondence":
+            continue
+          if str(o.get("status") or "") not in ("open", "ready"):
+            continue
+          o_tkey = str(o.get("target_artifact_key") or "").strip()
+          if not o_tkey:
+            if str(o.get("kind") or "") == "reply":
+              has_untargeted_reply = True
+            continue
+          superseded_targets.add(o_tkey)
+          if o_tkey.startswith("gmail_draft:"):
+            d_st = (art_rows.get(o_tkey) or {}).get("state") or {}
+            d_tid = str(d_st.get("thread_id") or "").strip()
+            if d_tid:
+              superseded_targets.add(f"gmail_thread:{d_tid}")
+            elif len(gmail_channels) == 1:
+              superseded_targets.add(gmail_channels[0])
+
+        for akey in linked_keys:
+          ar = art_rows.get(akey)
+          if not ar:
+            continue
+          akind = str(ar.get("kind") or artifact_kind_from_key(akey))
+          st = ar.get("state") if isinstance(ar.get("state"), Mapping) else {}
+          if is_config_artifact(akey, title=str(ar.get("title") or ""), state=st):
+            continue
+          if not is_active_correspondence_artifact(akind, st):
+            continue
+
+          # Concrete #disco threads supersede doc-level umbrellas and notification transport threads
+          is_superseded_transport = False
+          if akind == "gdoc":
+            doc_id = akey.split(":", 1)[1] if ":" in akey else ""
+            is_superseded_transport = doc_id in gdoc_ids_with_threads
+          elif akind == "gmail_thread":
+            gt_ref = str(st.get("gdoc_thread_key") or "")
+            sd_ref = str(st.get("shared_doc_key") or "")
+            gd_id = str(st.get("gdoc_id") or "")
+            is_superseded_transport = (
+                bool(gt_ref and gt_ref in linked_set)
+                or bool(sd_ref and sd_ref in linked_set)
+                or (
+                    bool(st.get("is_gdoc_comment") or st.get("is_drive_share"))
+                    and bool(gd_id)
+                    and (f"gdoc:{gd_id}" in linked_set or gd_id in gdoc_ids_with_threads)
+                )
+            )
+          if is_superseded_transport:
+            conn.execute(
+                "UPDATE obligations SET status = 'done', satisfied_at = ? "
+                "WHERE work_id = ? AND kind = 'correspondence' "
+                "AND target_artifact_key = ? AND status IN ('open', 'ready')",
+                (cur_now, wid, akey),
+            )
+            continue
+
+          if akey in superseded_targets or has_untargeted_reply:
+            prev_sup = existing_corr_by_target.get(akey)
+            if prev_sup is not None and str(prev_sup.get("status") or "") in ("open", "ready"):
+              try:
+                p_meta = json.loads(prev_sup.get("meta_json") or "{}")
+              except Exception:
+                p_meta = {}
+              p_meta["superseded_by_specific"] = True
+              conn.execute(
+                  "UPDATE obligations SET status = 'done', satisfied_at = ?, meta_json = ? "
+                  "WHERE obligation_id = ?",
+                  (cur_now, json.dumps(p_meta), prev_sup["obligation_id"]),
+              )
+            continue
+
+          # Deterministic ID per (work_id, artifact_key) preserves obligation history across syncs
+          digest = hashlib.sha1(f"{wid}:{akey}".encode("utf-8")).hexdigest()[:10]
+          ob_id = f"ob-corr-{digest}"
+          cp = str(st.get("counterparty") or "").strip()
+          if akind == "gdoc_thread":
+            doc_t = str(st.get("doc_title") or ar.get("title") or akey).strip()
+            cp_part = f" ({cp})" if cp and cp.lower() not in doc_t.lower() else ""
+            desc = f"Follow up / resolve comment in '{doc_t}'{cp_part}"
+          elif akind == "gdoc":
+            doc_t = str(st.get("doc_title") or ar.get("title") or akey).strip()
+            cp_part = f" ({cp})" if cp and cp.lower() not in doc_t.lower() else ""
+            desc = f"Follow up on shared doc '{doc_t}'{cp_part}"
+          else:
+            subj = str(st.get("root_subject") or ar.get("title") or akey).strip()
+            cp_part = f" ({cp})" if cp and cp.lower() not in subj.lower() else ""
+            desc = f"Close loop in '{subj}'{cp_part}"
+          trig = f"correspondence_turn({akey}, {STALLED_OBLIGATION_DAYS})"
+
+          prev_ob = existing_corr_by_target.get(akey)
+          last_ts = float(st.get("last_message_ts") or 0.0)
+          from_me = bool(st.get("last_from_me"))
+          is_self_resolved = bool(st.get("resolved")) and bool(st.get("resolved_by_me"))
+          # Reopen when a specific draft/reply finished or a newer counterparty message arrived
+          if prev_ob is not None:
+            if str(prev_ob.get("status") or "") == "done":
+              try:
+                prev_meta = json.loads(prev_ob.get("meta_json") or "{}")
+              except Exception:
+                prev_meta = {}
+              was_superseded = bool(prev_meta.pop("superseded_by_specific", False))
+              done_floor = max(
+                  float(prev_ob.get("satisfied_at") or 0.0),
+                  float(st.get("ack_message_ts") or 0.0),
+                  float(st.get("resolved_at") or 0.0),
+              )
+              should_reopen = was_superseded or (not from_me and last_ts > done_floor)
+              if should_reopen and not is_self_resolved:
+                conn.execute(
+                    "UPDATE obligations SET status = 'open', last_eval = 'unknown', "
+                    "satisfied_at = 0, description = ?, trigger_expr = ?, meta_json = ? "
+                    "WHERE obligation_id = ?",
+                    (desc, trig, json.dumps(prev_meta), ob_id),
+                )
+            else:
+              conn.execute(
+                  "UPDATE obligations SET description = ?, trigger_expr = ? "
+                  "WHERE obligation_id = ?",
+                  (desc, trig, ob_id),
+              )
+            continue
+
+          if is_self_resolved:
+            continue
+          conn.execute(
+              "INSERT INTO obligations "
+              "(obligation_id, work_id, target_artifact_key, kind, description, "
+              "trigger_expr, done_matcher, status, last_eval, created_at, satisfied_at, meta_json) "
+              "VALUES (?, ?, ?, 'correspondence', ?, ?, '', 'open', 'unknown', ?, 0, '{}')",
+              (ob_id, wid, akey, desc, trig, cur_now),
+          )
+          self._log_event(
+              conn,
+              "obligation_created",
+              work_id=wid,
+              artifact_key=akey,
+              payload={"obligation_id": ob_id, "trigger_expr": trig, "auto_correspondence": True},
+              now=cur_now,
+          )
+    self.evaluate_all_obligations(now=cur_now)
 
   def get_obligation(
       self, obligation_id: str, now: float | None = None
@@ -2364,7 +3046,8 @@ class WorkStore:
       d = dict(row)
       age_s = cur_now - float(d.get("created_at") or cur_now)
       d["stalled_alert"] = (
-          d.get("status") == "open"
+          d.get("kind") != "correspondence"
+          and d.get("status") == "open"
           and d.get("last_eval") in ("false", "unknown")
           and age_s >= STALLED_OBLIGATION_DAYS * 86400
       )
@@ -2394,11 +3077,32 @@ class WorkStore:
         ob = dict(obr)
         ob_id = str(ob["obligation_id"])
         w_row = work_rows.get(str(ob["work_id"]), {})
-        if _is_done_matched(ob, artifacts_by_key):
+        try:
+          ob_meta = json.loads(ob.get("meta_json") or "{}")
+        except Exception:
+          ob_meta = {}
+
+        res = evaluate_trigger(
+            str(ob.get("trigger_expr") or "always"),
+            artifacts_by_key,
+            w_row,
+            now=cur_now,
+        )
+        new_status = "ready" if res == "true" else "open"
+        meta_changed = False
+        if new_status == "ready" and ob.get("status") != "ready":
+          ob_meta["ready_at"] = cur_now
+          meta_changed = True
+        elif new_status != "ready" and "ready_at" in ob_meta:
+          ob_meta.pop("ready_at", None)
+          meta_changed = True
+
+        ready_at = float(ob_meta.get("ready_at") or 0.0)
+        if _is_done_matched(ob, artifacts_by_key, trigger_eval=res, ready_at=ready_at):
           conn.execute(
-              "UPDATE obligations SET status = 'done', satisfied_at = ? "
+              "UPDATE obligations SET status = 'done', satisfied_at = ?, meta_json = ? "
               "WHERE obligation_id = ?",
-              (cur_now, ob_id),
+              (cur_now, json.dumps(ob_meta), ob_id),
           )
           self._log_event(
               conn,
@@ -2410,17 +3114,11 @@ class WorkStore:
           )
           continue
 
-        res = evaluate_trigger(
-            str(ob.get("trigger_expr") or "always"),
-            artifacts_by_key,
-            w_row,
-            now=cur_now,
-        )
-        new_status = "ready" if res == "true" else "open"
-        if new_status != ob.get("status") or res != ob.get("last_eval"):
+        if new_status != ob.get("status") or res != ob.get("last_eval") or meta_changed:
           conn.execute(
-              "UPDATE obligations SET status = ?, last_eval = ? WHERE obligation_id = ?",
-              (new_status, res, ob_id),
+              "UPDATE obligations SET status = ?, last_eval = ?, meta_json = ? "
+              "WHERE obligation_id = ?",
+              (new_status, res, json.dumps(ob_meta), ob_id),
           )
           if new_status == "ready" and ob.get("status") != "ready":
             self._log_event(
@@ -2591,21 +3289,29 @@ class WorkStore:
 
     reasons: list[str] = []
     gated_draft_keys: set[str] = set()
+    ready_target_keys: set[str] = set()
     for ob in obligations:
       t_key = str(ob.get("target_artifact_key") or "")
       if ob.get("status") == "open" and t_key.startswith("gmail_draft:"):
         gated_draft_keys.add(t_key)
       if ob.get("status") == "ready":
+        if t_key:
+          ready_target_keys.add(t_key)
         reasons.append(f"🔔 Ready: {ob.get('description')}")
       elif ob.get("stalled_alert"):
         reasons.append(f"⚠️ Stalled >7d: {ob.get('description')}")
 
-    # Index non-companion primary CLs/PRs so nested companions inherit parent lifecycle context
+    # Index non-companion primary CLs/PRs and linked GDoc keys for transport-thread dedup
     parent_cls_by_key: dict[str, dict[str, Any]] = {}
+    linked_non_ctx_keys: set[str] = set()
+    linked_gdoc_thread_docs: set[str] = set()
     for art in artifacts:
       if art.get("role") == "context_only":
         continue
       akey = str(art.get("artifact_key") or "")
+      linked_non_ctx_keys.add(akey)
+      if akey.startswith("gdoc_thread:") and akey.count(":") >= 2:
+        linked_gdoc_thread_docs.add(akey.split(":", 2)[1])
       kind = str(art.get("kind") or "")
       st = art.get("state") if isinstance(art.get("state"), Mapping) else {}
       if kind in ("gerrit", "github_pr", "piper") and not is_companion_artifact(
@@ -2623,7 +3329,29 @@ class WorkStore:
         # Drafts gated by an open obligation are parked until the trigger becomes ready
         if akey not in gated_draft_keys:
           reasons.append(f"📝 Unsent draft: {art.get('title')}")
-      elif kind in ("gmail_thread", "gchat_thread") and bool(st.get("unanswered_human")):
+      elif (
+          kind in ("gmail_thread", "gchat_thread", "gdoc_thread")
+          and bool(st.get("unanswered_human"))
+          and akey not in ready_target_keys
+      ):
+        # Skip raw notification transport threads superseded by a linked #disco or gdoc artifact
+        if kind == "gmail_thread":
+          gt_ref = str(st.get("gdoc_thread_key") or "")
+          sd_ref = str(st.get("shared_doc_key") or "")
+          gd_id = str(st.get("gdoc_id") or "")
+          if (
+              (gt_ref and gt_ref in linked_non_ctx_keys)
+              or (sd_ref and sd_ref in linked_non_ctx_keys)
+              or (
+                  bool(st.get("is_gdoc_comment") or st.get("is_drive_share"))
+                  and bool(gd_id)
+                  and (
+                      f"gdoc:{gd_id}" in linked_non_ctx_keys
+                      or gd_id in linked_gdoc_thread_docs
+                  )
+              )
+          ):
+            continue
         reasons.append(f"📨 Unanswered message: {art.get('title')}")
       elif kind == "chat_chain" and str(st.get("bucket") or "") == "needs-me":
         reasons.append(f"🤖 Chat waiting on you: {art.get('title')}")
@@ -2685,6 +3413,9 @@ class WorkStore:
             else "All CLs closed and obligations satisfied"
         )
         return "done", [done_msg]
+      # Complete pure-correspondence cards once all tracked obligations are satisfied
+      if not non_comp_cls and obligations:
+        return "done", ["All obligations satisfied"]
 
     wait_reasons: list[str] = []
     for ob in open_obs:
@@ -3035,14 +3766,27 @@ class WorkStore:
         non_ctx_keys = [str(l["artifact_key"]) for l in primaries + channels]
         gmail_keys = [k for k in non_ctx_keys if k.startswith("gmail_thread:")]
         only_email_or_doc = bool(gmail_keys) and all(
-            k.startswith(("gmail_thread:", "gdoc:")) for k in non_ctx_keys
+            k.startswith(("gmail_thread:", "gdoc:", "gdoc_thread:")) for k in non_ctx_keys
         )
         ineligible_standalone_email = False
         if not is_manual_work and only_email_or_doc:
           ineligible_standalone_email = True
+          if any(
+              k.startswith("gdoc_thread:")
+              or bool(_parse_art_state(art_rows.get(k)).get("is_active_correspondence"))
+              for k in non_ctx_keys
+          ):
+            ineligible_standalone_email = False
           for gk in gmail_keys:
+            if not ineligible_standalone_email:
+              break
             st_g = _parse_art_state(art_rows.get(gk))
-            if st_g.get("sent_by_me") or st_g.get("is_github_issue_thread"):
+            if (
+                st_g.get("sent_by_me")
+                or st_g.get("is_github_issue_thread")
+                or st_g.get("is_gdoc_comment")
+                or st_g.get("is_active_correspondence")
+            ):
               ineligible_standalone_email = False
               break
             if st_g.get("tray_dismissed"):
@@ -3062,7 +3806,7 @@ class WorkStore:
             ineligible_standalone_email = False
             break
         if (
-            not primaries
+            (not primaries and not (is_manual_work and channels))
             or ((cfg_proj or cfg_title) and not channels)
             or ineligible_standalone_email
         ):
@@ -3256,7 +4000,8 @@ class WorkStore:
       wid = str(obr["work_id"])
       age_s = cur_now - float(obr.get("created_at") or cur_now)
       obr["stalled_alert"] = (
-          obr.get("status") == "open"
+          obr.get("kind") != "correspondence"
+          and obr.get("status") == "open"
           and obr.get("last_eval") in ("false", "unknown")
           and age_s >= STALLED_OBLIGATION_DAYS * 86400
       )
@@ -3316,19 +4061,18 @@ class WorkStore:
           else:
             art_item["link_reason"] = "auto"
       # Order correspondence first, then parent CLs/bugs, then nested companions, then mentions
+      def _is_corr_item(item_a: Mapping[str, Any]) -> bool:
+        k_a = str(item_a.get("kind") or "")
+        st_a = item_a.get("state") if isinstance(item_a.get("state"), Mapping) else None
+        return k_a == "gmail_draft" or is_active_correspondence_artifact(k_a, st_a)
+
       w_arts.sort(
           key=lambda a: (
               0
-              if (
-                  a.get("role") == "primary"
-                  and a.get("kind") in ("gmail_thread", "gmail_draft", "gchat_thread")
-              )
+              if (a.get("role") == "primary" and _is_corr_item(a))
               else (
                   1
-                  if (
-                      a.get("role") != "context_only"
-                      and a.get("kind") in ("gmail_thread", "gmail_draft", "gchat_thread")
-                  )
+                  if (a.get("role") != "context_only" and _is_corr_item(a))
                   else (
                       2
                       if (
@@ -3356,10 +4100,21 @@ class WorkStore:
       effective_proj = "" if is_config_project(raw_proj) else raw_proj
       w_obs = obs_by_work.get(wid, [])
       checklist, prog_summary = build_work_checklist(w_arts, art_rows)
-      if prog_summary:
-        for ob in w_obs:
-          if ob.get("status") != "done":
-            ob["progress_summary"] = prog_summary
+      for ob in w_obs:
+        if ob.get("status") == "done":
+          continue
+        if prog_summary:
+          ob["progress_summary"] = prog_summary
+        t_ob_key = str(ob.get("target_artifact_key") or "").strip()
+        if t_ob_key and t_ob_key in art_rows:
+          t_ar = art_rows[t_ob_key]
+          p_txt, ev_k = detect_borderline_correspondence_closure(
+              str(t_ar.get("kind") or artifact_kind_from_key(t_ob_key)),
+              t_ar.get("state") if isinstance(t_ar.get("state"), Mapping) else None,
+          )
+          if p_txt and ev_k:
+            ob["ambiguity_prompt"] = p_txt
+            ob["ambiguity_event_key"] = ev_k
       # Resolve causal origin and upgrade downstream/placeholder work titles
       resolved_title, origin_info = resolve_work_origin_and_title(w, w_arts)
       if resolved_title and resolved_title != str(w["title"]):
