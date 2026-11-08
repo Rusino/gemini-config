@@ -592,5 +592,33 @@
     "known": "R16",
     "repro": "",
     "note": ""
+  },
+  {
+    "id": "SKP-ZALGO-1",
+    "what": "SkParagraph: per-style mark colors land on wrong glyphs when HarfBuzz reorders marks by ccc (isolateClusterGlyphs pairs k-th code point with k-th glyph)",
+    "S": 1,
+    "features": [
+      "F06",
+      "F21"
+    ],
+    "reach_feature": null,
+    "P": 0.01,
+    "release_verified": false,
+    "known": "",
+    "repro": "x+U+0301(red)+U+0323(blue)+U+031B(green)+U+0358+U+0318+U+0351: horn drawn red"
+  },
+  {
+    "id": "SKP-ZALGO-2",
+    "what": "SkParagraph: cluster with partly precomposed marks (glyphs < code points) paints all marks in first style color",
+    "S": 1,
+    "features": [
+      "F06",
+      "F21"
+    ],
+    "reach_feature": null,
+    "P": 0.01,
+    "release_verified": false,
+    "known": "",
+    "repro": "Roboto A+U+0301+U+0323+U+0330 -> uni1EA0+acute+tildebelow, each mark own color: all one color"
   }
 ]
