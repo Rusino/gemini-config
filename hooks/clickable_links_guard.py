@@ -307,7 +307,7 @@ def clickable_links_reason(reply_text: str) -> str:
   )
   return (
       header
-      + "- `[Gerrit 1414016 PS1](https://skia-review.googlesource.com/c/skia/+/1414016/1)` "
+      + "- `[Skia CL 1414016 PS1](https://skia-review.googlesource.com/c/skia/+/1414016/1)` "
       "(never `http://cl/<5-8 digits>`: `cl/` opens Google3 Piper, not Gerrit)\n"
       "- Published comment: "
       "`[comment](https://skia-review.googlesource.com/c/skia/+/1414016/comment/<id>/)`; "

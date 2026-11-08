@@ -567,9 +567,13 @@ PROMPT_FILLER_WORDS = frozenset({
 
 # Collapses bare entity references into one token so "PR #123" or "Gerrit 123" counts as 1 word
 _ENTITY_UNIT_RE = re.compile(
-    r"\b(?:crrev(?:\.com)?/c/\d+|skrev(?:\.com)?/\d+|cl/\d+|b/\d+|crbug(?:\.com)?/\d+)\b"
-    r"|\b(?:Gerrit|PR|Issue|CL|СЛ|сл|bug|баг)\s*(?:#|:|\s)\s*\d+\b"
-    r"|\b(?:commit|коммит|sha|rev|revision)\s*(?:#|:|\s)\s*[0-9a-f]{7,40}\b",
+    # Fold optional project prefixes into ENTITY_ID_TOKEN so "Skia CL 1414016" is a bare entity ID
+    r"\b(?:(?:Skia|Chromium|Flutter|Dart|ANGLE|Dawn|PDFium|Android|Blink|V8)\s+)?"
+    r"(?:"
+    r"(?:crrev(?:\.com)?/c/\d+|skrev(?:\.com)?/\d+|cl/\d+|b/\d+|crbug(?:\.com)?/\d+)\b"
+    r"|(?:Gerrit|PR|Issue|CL|СЛ|сл|bug|баг)\s*(?:#|:|\s)\s*\d+\b"
+    r"|(?:commit|коммит|sha|rev|revision)\s*(?:#|:|\s)\s*[0-9a-f]{7,40}\b"
+    r")",
     re.IGNORECASE,
 )
 _TOPIC_WORD_RE = re.compile(

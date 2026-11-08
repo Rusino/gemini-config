@@ -2089,6 +2089,12 @@ class TestChatLifecycle(unittest.TestCase):
         "cl/1414016 Дэвид прислал мне",
         "PR #123 разбор бага",
         "David email: тест",
+        "Skia CL 1414016",
+        "Chromium CL 8663938",
+        "Skia b/576664769",
+        "Flutter PR #194980",
+        "Flutter issue #187181",
+        "Skia commit e62ca1d",
     ]:
       self.assertFalse(chat_lifecycle.is_valid_chat_topic(bad), f"Expected '{bad}' rejected")
       with self.assertRaises(chat_lifecycle.InvalidTopicError):
@@ -2102,6 +2108,7 @@ class TestChatLifecycle(unittest.TestCase):
         "Audit visible chats",
         "crbug/468570189 Fontations streamToData OOM",
         "Gerrit 1414016 Measure hit glyph",
+        "Skia CL 1414016 Measure hit glyph",
         "Skia roll triage",
         "crbug/576664769 Skia issue",
     ]:
