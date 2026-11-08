@@ -331,6 +331,16 @@ def is_transcript_config_only(transcript_path: str) -> bool:
   return has_cfg_edit and not has_prod_write
 
 
+# Product tracker prefixes exempt from config-project purging when cited in diagnostic chats
+_PRODUCT_ENTITY_PREFIXES = (
+    "gerrit:",
+    "github_pr:",
+    "piper:",
+    "buganizer:",
+    "github_issue:",
+)
+
+
 def is_config_artifact(
     artifact_key: str,
     title: str = "",
@@ -338,18 +348,12 @@ def is_config_artifact(
     project_id: str = "",
 ) -> bool:
   """Returns True when an artifact represents a config/subagent chat or config roadmap item."""
-  st = state or {}
-  if is_config_project(project_id) or is_config_project(
-      str(st.get("project_id") or st.get("project") or "")
-  ):
-    return True
-  if is_config_text(title) or is_config_text(str(st.get("subject") or "")):
-    return True
   akey = str(artifact_key or "")
-  if akey.startswith("roadmap_item:"):
-    r_proj = akey.split(":", 2)[1] if akey.count(":") >= 2 else ""
-    if is_config_project(r_proj):
-      return True
+  # External tracker entities remain product artifacts even when discussed in a config project
+  if akey.startswith(_PRODUCT_ENTITY_PREFIXES):
+    return False
+  st = state or {}
+  # Classify chat_chain artifacts by their own transcript edits before falling back to project_id
   if akey.startswith("chat_chain:"):
     cid = akey.split(":", 1)[-1]
     casc = str(st.get("cascade_id") or cid)
@@ -370,6 +374,16 @@ def is_config_artifact(
           config_cids.add(check_cid)
           config_cids.add(check_cid[:8])
           return True
+  if is_config_project(project_id) or is_config_project(
+      str(st.get("project_id") or st.get("project") or "")
+  ):
+    return True
+  if is_config_text(title) or is_config_text(str(st.get("subject") or "")):
+    return True
+  if akey.startswith("roadmap_item:"):
+    r_proj = akey.split(":", 2)[1] if akey.count(":") >= 2 else ""
+    if is_config_project(r_proj):
+      return True
   return False
 
 CLOSED_BUG_STATUSES = frozenset({
@@ -469,6 +483,23 @@ def clean_work_title(raw_title: str) -> str:
   return text
 
 
+# Match companion probe subjects and companion-creation chat titles across Gerrit and GitHub
+_RE_COMPANION_TITLE = re.compile(
+    r"(?:\[companion\s+(?:wip|draft)\]"
+    r"|\bcompanion\s+(?:wip|draft(?:\s+pr)?|cls?|prs?|fixes|fix|tests?|changes?|for|to)\b"
+    r"|\[do\s+not\s+submit\].*(?:crrev|gerrit|pr\s*#|companion|hypothes))",
+    re.IGNORECASE,
+)
+
+
+def is_companion_title(title: str) -> bool:
+  """Returns True when a Work or artifact title names a companion probe or companion chat."""
+  t = clean_work_title(title)
+  if not t:
+    return False
+  return bool(_RE_COMPANION_TITLE.search(t))
+
+
 def is_placeholder_title(title: str, artifact_key: str = "") -> bool:
   """Returns True when a title is an unexpanded artifact key or generic placeholder."""
   t = clean_work_title(title)
@@ -482,6 +513,15 @@ def is_placeholder_title(title: str, artifact_key: str = "") -> bool:
   if tl in ("goal", "untitled", "work"):
     return True
   if re.match(r"^(?:work|chat|draft|thread)\s+[0-9a-f]{6,}$", tl):
+    return True
+  # Treat bare tracker IDs and unlabelled companion tags as placeholders so real subjects win
+  if re.match(
+      r"^(?:flutter#\d+|(?:b|crbug)/\d+|pr\s*#?\d+|gerrit\s+\d+"
+      r"|crrev(?:\.com)?/c/\d+|cl/\d+)$",
+      tl,
+  ):
+    return True
+  if re.match(r"^(?:\d+:\s*)?\[companion\s+(?:wip|draft)\]$", tl):
     return True
   return False
 
@@ -513,7 +553,15 @@ def resolve_work_origin_and_title(
       if a.get("role") != "context_only" and not st.get("is_automated"):
         correspondence_arts.append((ots, a))
     elif ots > 0 and a.get("role") != "context_only":
-      other_arts.append((ots, a))
+      # Keep companion probes behind real parent artifacts when resolving causal origin
+      is_comp = is_companion_artifact(
+          str(a.get("artifact_key") or ""),
+          st if isinstance(st, Mapping) else None,
+          str(a.get("title") or ""),
+          str(a.get("link_reason") or ""),
+      ) or is_companion_title(str(a.get("title") or ""))
+      if not is_comp:
+        other_arts.append((ots, a))
 
   # Prefer primary non-issue email threads first, then earlier timestamps
   correspondence_arts.sort(
@@ -628,21 +676,34 @@ def resolve_work_origin_and_title(
         is_stale_context_corr_title = True
         break
 
+  # Never let a companion creation chat or probe title stand in for the parent change's title
   if (
       not is_placeholder_title(cleaned)
       and not is_config_text(cleaned)
+      and not is_companion_title(cleaned)
       and not is_stale_context_corr_title
   ):
     return cleaned, origin_info
 
-  # Upgrade placeholder/raw-key or config-polluted work titles from rich primary/channel artifacts
+  # Upgrade placeholder/raw-key, companion, or config-polluted titles from non-companion artifacts
   for role_filter in (("primary",), ("channel",), ("context_only",)):
     for a in w_arts:
       if a.get("role") not in role_filter:
         continue
+      a_st = a.get("state") if isinstance(a.get("state"), Mapping) else None
+      # Skip companion artifacts so the parent CL/PR or correspondence subject wins
+      if is_companion_artifact(
+          str(a.get("artifact_key") or ""),
+          a_st,
+          str(a.get("title") or ""),
+          str(a.get("link_reason") or ""),
+      ):
+        continue
       cand = clean_work_title(str(a.get("title") or ""))
-      if not is_placeholder_title(cand, str(a.get("artifact_key") or "")) and not is_config_text(
-          cand
+      if (
+          not is_placeholder_title(cand, str(a.get("artifact_key") or ""))
+          and not is_config_text(cand)
+          and not is_companion_title(cand)
       ):
         return cand, origin_info
 
@@ -728,6 +789,96 @@ def artifact_kind_from_key(artifact_key: str) -> str:
   return "gerrit"
 
 
+def canonicalize_companion_parent(
+    artifact_key: str,
+    state: Mapping[str, Any] | None = None,
+    title: str = "",
+) -> str:
+  """Resolves a companion CL/PR's canonical parent artifact_key across Skia/Chromium/GitHub."""
+  st = state or {}
+  child_key = canonicalize_artifact_key(
+      artifact_key, host=str(st.get("host") or "")
+  )
+  # Inherit the child's Chromium Gerrit host when companion_to omits the repo (e.g. gerrit:8595771)
+  inferred_host = str(st.get("host") or "")
+  if not inferred_host and child_key.startswith("gerrit:chromium:"):
+    inferred_host = "chromium"
+
+  raw_parent = str(st.get("companion_to") or "").strip()
+  if raw_parent:
+    if ":" in raw_parent:
+      cand = canonicalize_artifact_key(raw_parent, host=inferred_host)
+    else:
+      inferred_kind = "github_pr" if child_key.startswith("github_pr:") else "gerrit"
+      cand = canonicalize_artifact_key(
+          inferred_kind, raw_parent.lstrip("#"), host=inferred_host
+      )
+    return cand if cand != child_key else ""
+
+  # Search subject and fallback title together so parent IDs in either field are discovered
+  subj = " | ".join(
+      s
+      for s in (
+          str(st.get("subject") or "").strip(),
+          str(st.get("title") or "").strip(),
+          str(title or "").strip(),
+      )
+      if s
+  )
+  if not (st.get("is_companion") or is_companion_title(subj)):
+    return ""
+  m_cr = re.search(r"\bcrrev(?:\.com)?/c/(\d{6,8})\b", subj, re.IGNORECASE)
+  if m_cr:
+    cand = f"gerrit:chromium:{m_cr.group(1)}"
+    if cand != child_key:
+      return cand
+  m_sk = re.search(
+      r"(?:skia-review\.googlesource\.com/c/skia/\+/|\bGerrit\s+)(\d{6,8})\b",
+      subj,
+      re.IGNORECASE,
+  )
+  if m_sk:
+    cand = f"gerrit:skia:{m_sk.group(1)}"
+    if cand != child_key:
+      return cand
+  # Match parent (#N) / PR #N in GitHub companion Draft PR titles while skipping self-references
+  if child_key.startswith("github_pr:"):
+    for m_gh in re.finditer(r"(?:#|PR\s*#|pull/)(\d{4,7})\b", subj, re.IGNORECASE):
+      cand = f"github_pr:flutter/flutter:{m_gh.group(1)}"
+      if cand != child_key:
+        return cand
+  elif child_key.startswith("gerrit:"):
+    m_for = re.search(r"\b(?:for|on)\s+(\d{6,8})\b", subj, re.IGNORECASE)
+    if m_for:
+      cand = canonicalize_artifact_key("gerrit", m_for.group(1), host=inferred_host)
+      if cand != child_key:
+        return cand
+  return ""
+
+
+def is_companion_artifact(
+    artifact_key: str,
+    state: Mapping[str, Any] | None = None,
+    title: str = "",
+    link_reason: str = "",
+) -> bool:
+  """Returns True when a CL/PR artifact is a review/probe companion rather than a standalone CL."""
+  akey = str(artifact_key or "")
+  if akey and not akey.startswith(("gerrit:", "github_pr:", "piper:", "github:", "cl:", "pr:")):
+    return False
+  st = state or {}
+  est = st.get("entity_state") if isinstance(st.get("entity_state"), Mapping) else {}
+  if (
+      st.get("is_companion")
+      or st.get("companion_to")
+      or est.get("is_companion")
+      or link_reason == "companion_wip"
+  ):
+    return True
+  subj = str(st.get("subject") or st.get("title") or "")
+  return is_companion_title(subj) or is_companion_title(title)
+
+
 def is_hub_artifact(
     artifact_key: str,
     state: Mapping[str, Any] | None = None,
@@ -740,7 +891,7 @@ def is_hub_artifact(
   if "[SkoreText]" in subj or "SkoreText" in subj or "DO NOT SUBMIT" in subj:
     return True
   # Companion and cherry-pick CLs are review attributes and must not merge distinct works
-  if st.get("companion_to") or st.get("is_companion") or st.get("is_cherry_pick"):
+  if is_companion_artifact(artifact_key, st, subj) or st.get("is_cherry_pick"):
     return True
   bug_ids = st.get("bug_ids")
   count = max(
@@ -837,6 +988,112 @@ def format_short_bug_id(artifact_key: str) -> str:
   return tid
 
 
+def _default_artifact_url(artifact_key: str) -> str:
+  """Builds the canonical web URL for an external tracker artifact_key."""
+  akey = str(artifact_key or "")
+  num = akey.split(":")[-1]
+  if akey.startswith("gerrit:chromium:"):
+    return f"https://chromium-review.googlesource.com/c/chromium/src/+/{num}"
+  if akey.startswith("gerrit:"):
+    return f"https://skia-review.googlesource.com/c/skia/+/{num}"
+  if akey.startswith("github_pr:"):
+    return f"https://github.com/flutter/flutter/pull/{num}"
+  if akey.startswith("github_issue:"):
+    return f"https://github.com/flutter/flutter/issues/{num}"
+  if akey.startswith("piper:"):
+    return f"http://cl/{num}"
+  if akey.startswith("buganizer:"):
+    return f"https://issues.chromium.org/issues/{num}"
+  return ""
+
+
+def _is_own_cl(st: Mapping[str, Any], est: Mapping[str, Any]) -> bool:
+  """Returns True when a CL/PR belongs to Julia rather than an external reviewee."""
+  role_l = str(st.get("role") or "").strip().lower()
+  return (
+      bool(st.get("is_self"))
+      or bool(st.get("is_mine"))
+      or role_l == "author"
+      or (
+          "is_self" not in st
+          and "is_mine" not in st
+          and not role_l
+          and not bool(st.get("is_external"))
+          and not bool(est.get("is_reviewer_change"))
+      )
+  )
+
+
+def _evaluate_companion_alerts(
+    akey: str,
+    st: Mapping[str, Any],
+    parent_key: str = "",
+    parent_st: Mapping[str, Any] | None = None,
+) -> tuple[list[str], list[str]]:
+  """Returns (orphan_reasons, comment_reasons) for a companion probe relative to its parent."""
+  orphan_reasons: list[str] = []
+  comment_reasons: list[str] = []
+  est = st.get("entity_state") if isinstance(st.get("entity_state"), Mapping) else {}
+  comp_status = str(st.get("status") or "").strip().upper()
+  short_comp = format_short_cl_id(akey, st)
+  # Surface the parent card when an external human comments on a non-closed companion
+  if comp_status not in ("ABANDONED", "CLOSED", "MERGED"):
+    has_human_comment = (
+        int(st.get("open_external_threads") or 0) > 0
+        or bool(st.get("author_replied_to_me"))
+        or bool(st.get("unanswered_human"))
+        or bool(est.get("needs_my_reply"))
+    )
+    if has_human_comment:
+      comment_reasons.append(f"💬 Comment on companion: {short_comp}")
+  # Require explicit NEW/OPEN status so aged-out transcript stubs do not fire false alerts
+  if comp_status in ("NEW", "OPEN"):
+    p_status = str((parent_st or {}).get("status") or "").strip().upper()
+    parent_terminal = p_status in ("MERGED", "CLOSED", "ABANDONED")
+    if parent_terminal or bool(st.get("ready_to_abandon")):
+      if parent_key:
+        short_parent = format_short_cl_id(parent_key, parent_st)
+        state_lbl = p_status.lower() if parent_terminal else "closed"
+        p_desc = f"{short_parent} {state_lbl}"
+      else:
+        p_desc = "parent closed"
+      orphan_reasons.append(f"🧹 Close orphaned companion: {short_comp} ({p_desc})")
+  return orphan_reasons, comment_reasons
+
+
+def _evaluate_cl_needs_you(akey: str, st: Mapping[str, Any]) -> str:
+  """Returns the Needs You reason for a non-companion CL/PR/bug, or '' when waiting/done."""
+  est = st.get("entity_state") if isinstance(st.get("entity_state"), Mapping) else {}
+  is_wip = bool(st.get("is_wip") or st.get("is_draft") or st.get("wip_label"))
+  is_own = _is_own_cl(st, est)
+  own_conflict = is_own and not is_wip and bool(st.get("merge_conflict"))
+  # Ignore synthetic conflict status on foreign PRs while honoring real review/alert lanes
+  est_lane_you = est.get("lane") == "you" and (is_own or est.get("status") != "conflict")
+  needs_you = (
+      est.get("category") == "needs_me"
+      or bool(est.get("action_required"))
+      or est_lane_you
+      or bool(est.get("is_post_submit_alert"))
+      or own_conflict
+  )
+  if not needs_you:
+    return ""
+  short_cl = format_short_cl_id(akey, st)
+  if own_conflict or (is_own and est.get("status") == "conflict"):
+    return f"⚠️ Merge conflict: {short_cl}"
+  # Read both explicit entity_state.reason and cl_watcher's item-level attention_reason
+  explicit_reason = str(est.get("reason") or st.get("attention_reason") or "").strip()
+  if explicit_reason and (is_own or "conflict" not in explicit_reason.lower()):
+    return explicit_reason
+  # Suppress spine_short_state 'Conflict' leaked by entity_state.py on foreign PRs
+  spine = str((est.get("spine_short_state") or {}).get("short") or "").strip()
+  if spine and (is_own or "conflict" not in spine.lower()):
+    return f"{spine}: {short_cl}"
+  if not is_own and (bool(est.get("is_reviewer_change")) or st.get("role") == "reviewer"):
+    return f"Needs review: {short_cl}"
+  return f"Needs action: {short_cl}"
+
+
 def compute_artifact_provenance(
     art: Mapping[str, Any],
     w_arts: list[dict[str, Any]],
@@ -855,8 +1112,12 @@ def compute_artifact_provenance(
       for a in w_arts
       if a.get("role") == "primary"
       and a.get("kind") in ("gerrit", "github_pr", "piper")
-      and not (a.get("state") or {}).get("is_companion")
-      and not (a.get("state") or {}).get("companion_to")
+      and not is_companion_artifact(
+          str(a.get("artifact_key") or ""),
+          a.get("state") if isinstance(a.get("state"), Mapping) else None,
+          str(a.get("title") or ""),
+          str(a.get("link_reason") or ""),
+      )
   ]
   primary_bugs = [
       a
@@ -869,14 +1130,10 @@ def compute_artifact_provenance(
   if source == "manual" or reason == "manual":
     return "вручную", detail or "Привязано к карточке вручную пользователем"
 
-  if (
-      reason == "companion_wip"
-      or st.get("is_companion")
-      or st.get("companion_to")
-      or "[companion WIP]" in str(art.get("title") or "")
-  ):
-    comp_to = str(st.get("companion_to") or "").strip()
-    parent_num = comp_to.split(":")[-1] if comp_to else ""
+  # Label companion probes as subordinate to their parent CL/PR rather than standalone deliverables
+  if is_companion_artifact(akey, st, str(art.get("title") or ""), reason):
+    comp_parent = canonicalize_companion_parent(akey, st, str(art.get("title") or ""))
+    parent_num = comp_parent.split(":")[-1] if comp_parent else ""
     if not parent_num and primary_cls:
       parent_num = str(primary_cls[0].get("artifact_key") or "").split(":")[-1]
     badge = f"companion WIP к {parent_num}" if parent_num else "companion WIP"
@@ -2343,12 +2600,25 @@ class WorkStore:
       elif ob.get("stalled_alert"):
         reasons.append(f"⚠️ Stalled >7d: {ob.get('description')}")
 
+    # Index non-companion primary CLs/PRs so nested companions inherit parent lifecycle context
+    parent_cls_by_key: dict[str, dict[str, Any]] = {}
     for art in artifacts:
       if art.get("role") == "context_only":
         continue
       akey = str(art.get("artifact_key") or "")
       kind = str(art.get("kind") or "")
-      st = art.get("state") or {}
+      st = art.get("state") if isinstance(art.get("state"), Mapping) else {}
+      if kind in ("gerrit", "github_pr", "piper") and not is_companion_artifact(
+          akey, st, str(art.get("title") or ""), str(art.get("link_reason") or "")
+      ):
+        parent_cls_by_key[akey] = art
+
+    for art in artifacts:
+      if art.get("role") == "context_only":
+        continue
+      akey = str(art.get("artifact_key") or "")
+      kind = str(art.get("kind") or "")
+      st = art.get("state") if isinstance(art.get("state"), Mapping) else {}
       if kind == "gmail_draft" and str(st.get("status") or "DRAFT").upper() == "DRAFT":
         # Drafts gated by an open obligation are parked until the trigger becomes ready
         if akey not in gated_draft_keys:
@@ -2357,35 +2627,37 @@ class WorkStore:
         reasons.append(f"📨 Unanswered message: {art.get('title')}")
       elif kind == "chat_chain" and str(st.get("bucket") or "") == "needs-me":
         reasons.append(f"🤖 Chat waiting on you: {art.get('title')}")
-      elif kind in ("gerrit", "github_pr", "piper", "buganizer", "github_issue"):
-        est = st.get("entity_state") or {}
-        is_wip = bool(st.get("is_wip") or st.get("is_draft") or st.get("wip_label"))
-        needs_you = (
-            est.get("category") == "needs_me"
-            or bool(est.get("action_required"))
-            or est.get("lane") == "you"
-            or (not is_wip and bool(st.get("merge_conflict")))
+      elif kind in ("gerrit", "github_pr", "piper") and is_companion_artifact(
+          akey, st, str(art.get("title") or ""), str(art.get("link_reason") or "")
+      ):
+        # Resolve parent CL state so companion comments and orphaned cleanup roll up onto the Work
+        p_key = canonicalize_companion_parent(akey, st, str(art.get("title") or ""))
+        p_art = parent_cls_by_key.get(p_key) if p_key else None
+        if p_art is None and not p_key and len(parent_cls_by_key) == 1:
+          p_key, p_art = next(iter(parent_cls_by_key.items()))
+        p_st = (
+            p_art.get("state")
+            if (p_art is not None and isinstance(p_art.get("state"), Mapping))
+            else None
         )
-        if needs_you:
-          short_cl = format_short_cl_id(akey, st)
-          if st.get("merge_conflict") or est.get("status") == "conflict":
-            reasons.append(f"⚠️ Merge conflict: {short_cl}")
-          elif est.get("reason"):
-            reasons.append(str(est.get("reason")))
-          else:
-            spine = (est.get("spine_short_state") or {}).get("short") or "Needs action"
-            reasons.append(f"{spine}: {short_cl}")
+        orphan_r, comment_r = _evaluate_companion_alerts(akey, st, p_key, p_st)
+        reasons.extend(orphan_r)
+        reasons.extend(comment_r)
+      elif kind in ("gerrit", "github_pr", "piper", "buganizer", "github_issue"):
+        cl_reason = _evaluate_cl_needs_you(akey, st)
+        if cl_reason:
+          reasons.append(cl_reason)
 
     if reasons:
       return "needs-you", reasons
 
     open_obs = [ob for ob in obligations if ob.get("status") in ("open", "ready")]
+    # Exclude companion probes from active_cls so open companions do not block terminal parents
+    non_comp_cls = list(parent_cls_by_key.values())
     active_cls = [
         a
-        for a in artifacts
-        if a.get("role") != "context_only"
-        and a.get("kind") in ("gerrit", "github_pr", "piper")
-        and str((a.get("state") or {}).get("status") or "NEW").upper() in ("NEW", "OPEN")
+        for a in non_comp_cls
+        if str((a.get("state") or {}).get("status") or "NEW").upper() in ("NEW", "OPEN")
     ]
     open_bugs = [
         a
@@ -2396,14 +2668,23 @@ class WorkStore:
         not in CLOSED_BUG_STATUSES
     ]
     if not open_obs and not active_cls and not open_bugs and artifacts:
-      # Check if all primary CLs are merged and there are no unsent drafts
-      has_merged = any(
-          a.get("role") != "context_only"
-          and str((a.get("state") or {}).get("status") or "").upper() == "MERGED"
-          for a in artifacts
+      # Complete the Work once all primary non-companion CLs reached a terminal state
+      has_terminal_cl = bool(non_comp_cls) and all(
+          str((a.get("state") or {}).get("status") or "").upper()
+          in ("MERGED", "CLOSED", "ABANDONED")
+          for a in non_comp_cls
       )
-      if has_merged:
-        return "done", ["All CLs merged and obligations satisfied"]
+      if has_terminal_cl:
+        all_merged = all(
+            str((a.get("state") or {}).get("status") or "").upper() == "MERGED"
+            for a in non_comp_cls
+        )
+        done_msg = (
+            "All CLs merged and obligations satisfied"
+            if all_merged
+            else "All CLs closed and obligations satisfied"
+        )
+        return "done", [done_msg]
 
     wait_reasons: list[str] = []
     for ob in open_obs:
@@ -2427,12 +2708,136 @@ class WorkStore:
           str(r["artifact_key"]): dict(r)
           for r in conn.execute("SELECT * FROM artifacts").fetchall()
       }
+
+      # Safely decode JSON state dicts when repairing or filtering SQLite artifact rows
+      def _parse_art_state(ar: Mapping[str, Any] | None) -> dict[str, Any]:
+        if not ar:
+          return {}
+        try:
+          st_val = json.loads(str(ar.get("state_json") or "{}"))
+          return dict(st_val) if isinstance(st_val, Mapping) else {}
+        except Exception:
+          return {}
+
+      # Normalize companion_to pointers and link_reason across all stored companion artifacts
+      for akey, ar in list(art_rows.items()):
+        st = _parse_art_state(ar)
+        if not is_companion_artifact(akey, st, str(ar.get("title") or "")):
+          continue
+        norm_parent = canonicalize_companion_parent(akey, st, str(ar.get("title") or ""))
+        if not st.get("is_companion") or (norm_parent and st.get("companion_to") != norm_parent):
+          st["is_companion"] = True
+          if norm_parent:
+            st["companion_to"] = norm_parent
+          s_json = json.dumps(st)
+          conn.execute(
+              "UPDATE artifacts SET state_json = ?, updated_at = ? WHERE artifact_key = ?",
+              (s_json, cur_now, akey),
+          )
+          ar["state_json"] = s_json
+        conn.execute(
+            "UPDATE work_links SET link_reason = 'companion_wip' "
+            "WHERE artifact_key = ? AND role = 'primary' AND source != 'manual' "
+            "AND (link_reason IS NULL OR link_reason = '' OR link_reason = 'chat_mention')",
+            (akey,),
+        )
+
+      # Deduplicate GitHub's shared PR/Issue counter when HTML hovercards minted placeholders
+      gh_pr_nums = {
+          k.split(":")[-1]
+          for k in art_rows
+          if k.startswith("github_pr:flutter/flutter:")
+      }
+      gh_issue_nums = {
+          k.split(":")[-1]
+          for k in art_rows
+          if k.startswith("github_issue:flutter/flutter:")
+      }
+      # Inspect colliding numbers and drop only the unexpanded placeholder side
+      for num in sorted(gh_pr_nums & gh_issue_nums):
+        p_key = f"github_pr:flutter/flutter:{num}"
+        i_key = f"github_issue:flutter/flutter:{num}"
+        p_row = art_rows.get(p_key) or {}
+        i_row = art_rows.get(i_key) or {}
+        p_st = _parse_art_state(p_row)
+        i_st = _parse_art_state(i_row)
+        p_is_ph = is_placeholder_title(str(p_row.get("title") or ""), p_key) and not p_st
+        i_is_ph = (
+            is_placeholder_title(str(i_row.get("title") or ""), i_key)
+            and not i_st.get("bug_title")
+        )
+        # Explicit /pull/<N> or PR #<N> wins whenever the issue side has no real bug_title
+        if i_is_ph:
+          # Promote subject/companion PRs onto Works that held the mis-extracted issue key
+          i_links = conn.execute(
+              "SELECT work_id, role FROM work_links WHERE artifact_key = ?", (i_key,)
+          ).fetchall()
+          for il in i_links:
+            wid_i = str(il["work_id"])
+            neg_p = conn.execute(
+                "SELECT 1 FROM negative_links WHERE work_id = ? AND artifact_key = ?",
+                (wid_i, p_key),
+            ).fetchone()
+            # Respect explicit user unlink tombstones on p_key
+            if neg_p is not None:
+              continue
+            other_prim_cnt = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS c FROM work_links "
+                    "WHERE work_id = ? AND role = 'primary' AND artifact_key != ?",
+                    (wid_i, i_key),
+                ).fetchone()["c"]
+            )
+            w_r = conn.execute(
+                "SELECT title FROM works WHERE work_id = ?", (wid_i,)
+            ).fetchone()
+            w_t = str(w_r["title"] or "") if w_r else ""
+            mail_rows = conn.execute(
+                "SELECT a.title FROM work_links wl JOIN artifacts a "
+                "ON a.artifact_key = wl.artifact_key "
+                "WHERE wl.work_id = ? AND wl.role != 'context_only' "
+                "AND (wl.artifact_key LIKE 'gmail_thread:%' "
+                "OR wl.artifact_key LIKE 'gmail_draft:%' "
+                "OR wl.artifact_key LIKE 'gchat_thread:%')",
+                (wid_i,),
+            ).fetchall()
+            mail_blob = " ".join([w_t, *(str(mr["title"] or "") for mr in mail_rows)])
+            # Re-link companion PRs, subject-referenced PRs, or sole-primary Draft/Email Works
+            if is_companion_artifact(p_key, p_st, str(p_row.get("title") or "")):
+              conn.execute(
+                  "INSERT OR REPLACE INTO work_links "
+                  "(work_id, artifact_key, role, source, confidence, created_at, "
+                  "link_reason, link_detail) VALUES (?, ?, 'primary', 'auto', 1.0, ?, "
+                  "'companion_wip', ?)",
+                  (wid_i, p_key, cur_now, f"Companion PR #{num}"),
+              )
+            elif (
+                re.search(rf"(?:PR\s*#|pull/|#){re.escape(num)}\b", mail_blob, re.IGNORECASE)
+                or (il["role"] == "primary" and other_prim_cnt == 0)
+            ):
+              conn.execute(
+                  "INSERT OR IGNORE INTO work_links "
+                  "(work_id, artifact_key, role, source, confidence, created_at, "
+                  "link_reason, link_detail) VALUES (?, ?, 'primary', 'auto', 1.0, ?, "
+                  "'gmail_thread_ref', ?)",
+                  (wid_i, p_key, cur_now, f"PR #{num} from correspondence subject"),
+              )
+          cur = conn.execute("DELETE FROM work_links WHERE artifact_key = ?", (i_key,))
+          links_removed += int(cur.rowcount or 0)
+          conn.execute("DELETE FROM candidate_buffer WHERE artifact_key = ?", (i_key,))
+          conn.execute("DELETE FROM artifacts WHERE artifact_key = ?", (i_key,))
+          art_rows.pop(i_key, None)
+        elif p_is_ph and not i_is_ph:
+          # Real GitHub issue with bug_title wins over an empty placeholder PR row
+          cur = conn.execute("DELETE FROM work_links WHERE artifact_key = ?", (p_key,))
+          links_removed += int(cur.rowcount or 0)
+          conn.execute("DELETE FROM candidate_buffer WHERE artifact_key = ?", (p_key,))
+          conn.execute("DELETE FROM artifacts WHERE artifact_key = ?", (p_key,))
+          art_rows.pop(p_key, None)
+
       bad_art_keys: set[str] = set()
       for akey, ar in art_rows.items():
-        try:
-          st = json.loads(ar.get("state_json") or "{}")
-        except Exception:
-          st = {}
+        st = _parse_art_state(ar)
         if is_config_artifact(akey, title=str(ar.get("title") or ""), state=st):
           bad_art_keys.add(akey)
 
@@ -2447,11 +2852,157 @@ class WorkStore:
         conn.execute("DELETE FROM candidate_buffer WHERE artifact_key = ?", (akey,))
         if akey.startswith(("chat_chain:", "roadmap_item:")):
           conn.execute("DELETE FROM artifacts WHERE artifact_key = ?", (akey,))
+          art_rows.pop(akey, None)
 
       for r in conn.execute("SELECT DISTINCT chat_chain_id FROM candidate_buffer").fetchall():
         cid = str(r["chat_chain_id"] or "").strip()
         if cid and is_config_artifact(f"chat_chain:{cid}"):
           conn.execute("DELETE FROM candidate_buffer WHERE chat_chain_id = ?", (cid,))
+
+      # Sort active non-companion Works ahead of done and companion-titled Works
+      pre_work_rows = [
+          dict(r)
+          for r in conn.execute(
+              "SELECT * FROM works WHERE status != 'archived' ORDER BY updated_at DESC"
+          ).fetchall()
+      ]
+      pre_work_rows.sort(
+          key=lambda r: (
+              1 if str(r.get("status") or "") == "done" else 0,
+              1 if is_companion_title(str(r.get("title") or "")) else 0,
+          )
+      )
+      # Map each primary non-companion CL/PR to its canonical owning Work
+      primary_cl_owner: dict[str, str] = {}
+      for w in pre_work_rows:
+        wid = str(w["work_id"])
+        for lr in conn.execute(
+            "SELECT artifact_key, role, link_reason FROM work_links WHERE work_id = ?",
+            (wid,),
+        ).fetchall():
+          ak = str(lr["artifact_key"])
+          if lr["role"] != "primary" or not ak.startswith(("gerrit:", "github_pr:", "piper:")):
+            continue
+          ar = art_rows.get(ak) or {}
+          if not is_companion_artifact(
+              ak, _parse_art_state(ar), str(ar.get("title") or ""), str(lr["link_reason"] or "")
+          ):
+            primary_cl_owner.setdefault(ak, wid)
+
+      # Reconcile split companion cards and companion-only Works onto their parent CL/PR
+      for w in pre_work_rows:
+        wid = str(w["work_id"])
+        w_is_comp_titled = is_companion_title(str(w.get("title") or ""))
+        w_links = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM work_links WHERE work_id = ? ORDER BY created_at ASC",
+                (wid,),
+            ).fetchall()
+        ]
+        if not w_links:
+          continue
+        non_comp_prim_cls: set[str] = set()
+        comp_parents: list[tuple[str, str]] = []
+        # Partition linked CLs/PRs into companion probes vs standalone primary changes
+        for lr in w_links:
+          ak = str(lr["artifact_key"])
+          if not ak.startswith(("gerrit:", "github_pr:", "piper:")):
+            continue
+          ar = art_rows.get(ak) or {}
+          st = _parse_art_state(ar)
+          t_str = str(ar.get("title") or "")
+          l_rsn = str(lr.get("link_reason") or "")
+          if is_companion_artifact(ak, st, t_str, l_rsn):
+            p_k = canonicalize_companion_parent(ak, st, t_str)
+            if p_k:
+              comp_parents.append((ak, p_k))
+          elif lr["role"] == "primary":
+            non_comp_prim_cls.add(ak)
+
+        # Ensure companions sitting alongside their primary parent carry companion_wip provenance
+        for comp_ak, p_k in comp_parents:
+          if p_k in non_comp_prim_cls:
+            conn.execute(
+                "UPDATE work_links SET role = 'primary', link_reason = 'companion_wip' "
+                "WHERE work_id = ? AND artifact_key = ? AND source != 'manual'",
+                (wid, comp_ak),
+            )
+
+        # Merge duplicate companion-titled Works when another Work already owns their parent CL/PR
+        merge_owner_wid = ""
+        if comp_parents:
+          for _, p_k in comp_parents:
+            cand_owner = primary_cl_owner.get(p_k, "")
+            if cand_owner and cand_owner != wid and (not non_comp_prim_cls or w_is_comp_titled):
+              merge_owner_wid = cand_owner
+              break
+        elif w_is_comp_titled and len(non_comp_prim_cls) == 1:
+          sole_p = next(iter(non_comp_prim_cls))
+          cand_owner = primary_cl_owner.get(sole_p, "")
+          if cand_owner and cand_owner != wid:
+            merge_owner_wid = cand_owner
+
+        # Transfer links and obligations to the real parent Work while respecting negative_links
+        if merge_owner_wid:
+          conn.execute(
+              "INSERT OR IGNORE INTO work_links "
+              "(work_id, artifact_key, role, source, confidence, created_at, "
+              "link_reason, link_detail) "
+              "SELECT ?, artifact_key, role, 'auto', confidence, ?, link_reason, link_detail "
+              "FROM work_links WHERE work_id = ? "
+              "AND artifact_key NOT IN ("
+              "  SELECT artifact_key FROM negative_links WHERE work_id = ?"
+              ")",
+              (merge_owner_wid, cur_now, wid, merge_owner_wid),
+          )
+          for comp_ak, _ in comp_parents:
+            conn.execute(
+                "UPDATE work_links SET role = 'primary', link_reason = 'companion_wip' "
+                "WHERE work_id = ? AND artifact_key = ? AND source != 'manual'",
+                (merge_owner_wid, comp_ak),
+            )
+          conn.execute(
+              "UPDATE obligations SET work_id = ? WHERE work_id = ?",
+              (merge_owner_wid, wid),
+          )
+          conn.execute("DELETE FROM work_links WHERE work_id = ?", (wid,))
+          conn.execute(
+              "UPDATE works SET status = 'archived', updated_at = ? WHERE work_id = ?",
+              (cur_now, wid),
+          )
+          works_archived += 1
+          works_repaired += 1
+          continue
+
+        # Promote the missing parent CL/PR to primary when a Work only had a companion primary
+        if non_comp_prim_cls or not comp_parents:
+          continue
+        comp_ak, p_k = comp_parents[0]
+        if p_k not in art_rows:
+          p_kind = artifact_kind_from_key(p_k)
+          conn.execute(
+              "INSERT OR IGNORE INTO artifacts "
+              "(artifact_key, kind, title, url, state_json, updated_at) "
+              "VALUES (?, ?, ?, '', '{}', ?)",
+              (p_k, p_kind, p_k, cur_now),
+          )
+          art_rows[p_k] = {
+              "artifact_key": p_k,
+              "kind": p_kind,
+              "title": p_k,
+              "url": "",
+              "state_json": "{}",
+          }
+        conn.execute(
+            "INSERT OR REPLACE INTO work_links "
+            "(work_id, artifact_key, role, source, confidence, created_at, "
+            "link_reason, link_detail) VALUES (?, ?, 'primary', 'auto', 1.0, ?, "
+            "'chat_topic', ?)",
+            (wid, p_k, cur_now, f"Parent of companion {comp_ak.split(':')[-1]}"),
+        )
+        primary_cl_owner[p_k] = wid
+        works_repaired += 1
 
       work_rows = [
           dict(r)
@@ -2470,8 +3021,10 @@ class WorkStore:
         ]
         primaries = [l for l in w_links if l["role"] == "primary"]
         channels = [l for l in w_links if l["role"] == "channel"]
+        w_title_str = str(w.get("title") or "")
         cfg_proj = is_config_project(str(w.get("project_id") or ""))
-        cfg_title = is_config_text(str(w.get("title") or ""))
+        cfg_title = is_config_text(w_title_str)
+        comp_title = is_companion_title(w_title_str)
         try:
           w_meta = json.loads(w.get("meta_json") or "{}")
         except Exception:
@@ -2488,11 +3041,7 @@ class WorkStore:
         if not is_manual_work and only_email_or_doc:
           ineligible_standalone_email = True
           for gk in gmail_keys:
-            ar_g = art_rows.get(gk) or {}
-            try:
-              st_g = json.loads(ar_g.get("state_json") or "{}")
-            except Exception:
-              st_g = {}
+            st_g = _parse_art_state(art_rows.get(gk))
             if st_g.get("sent_by_me") or st_g.get("is_github_issue_thread"):
               ineligible_standalone_email = False
               break
@@ -2524,60 +3073,28 @@ class WorkStore:
           conn.execute("DELETE FROM work_links WHERE work_id = ?", (wid,))
           works_archived += 1
           continue
-        if cfg_proj or cfg_title or is_placeholder_title(str(w.get("title") or "")):
+        if cfg_proj or cfg_title or comp_title or is_placeholder_title(w_title_str):
           w_arts: list[dict[str, Any]] = []
           for wl in w_links:
             ak = str(wl["artifact_key"])
             ar = art_rows.get(ak) or {}
-            try:
-              st = json.loads(ar.get("state_json") or "{}")
-            except Exception:
-              st = {}
+            st = _parse_art_state(ar)
             w_arts.append({
                 "artifact_key": ak,
                 "kind": str(ar.get("kind") or artifact_kind_from_key(ak)),
                 "title": clean_work_title(str(ar.get("title") or ak)) or ak,
                 "url": str(ar.get("url") or ""),
                 "role": str(wl.get("role") or "primary"),
+                "link_reason": str(wl.get("link_reason") or ""),
                 "state": st,
             })
           new_proj = "" if cfg_proj else str(w.get("project_id") or "")
           new_title, _ = resolve_work_origin_and_title(w, w_arts)
           conn.execute(
               "UPDATE works SET project_id = ?, title = ?, updated_at = ? WHERE work_id = ?",
-              (new_proj, new_title or str(w["title"]), cur_now, wid),
+              (new_proj, new_title or w_title_str, cur_now, wid),
           )
           works_repaired += 1
-
-      # Repair companion WIP metadata and split false mid-chat co-occurrence merges (e.g. 1408158 vs flutter#90063)
-      comp_1406080 = art_rows.get("gerrit:skia:1406080")
-      if comp_1406080:
-        try:
-          st_6080 = json.loads(comp_1406080.get("state_json") or "{}")
-        except Exception:
-          st_6080 = {}
-        if not st_6080.get("is_companion"):
-          st_6080.update({
-              "is_companion": True,
-              "companion_to": "gerrit:skia:1408158",
-              "is_wip": True,
-              "wip_label": "companion WIP",
-          })
-          conn.execute(
-              "UPDATE artifacts SET title = ?, url = ?, state_json = ?, updated_at = ? "
-              "WHERE artifact_key = 'gerrit:skia:1406080'",
-              (
-                  "1406080: [companion WIP] SkParagraph_BuilderResetKeepsBuiltText",
-                  "https://skia-review.googlesource.com/c/skia/+/1406080",
-                  json.dumps(st_6080),
-                  cur_now,
-              ),
-          )
-          conn.execute(
-              "UPDATE work_links SET link_reason = 'companion_wip', "
-              "link_detail = 'Тестовый companion WIP СЛ к ревью Gerrit 1408158 (чат b771ef3c, шаг 97)' "
-              "WHERE artifact_key = 'gerrit:skia:1406080'",
-          )
 
       for w in work_rows:
         wid = str(w["work_id"])
@@ -2723,12 +3240,15 @@ class WorkStore:
           ).fetchall()
       ]
 
+    active_work_ids = {str(w["work_id"]) for w in work_rows}
     links_by_work: dict[str, list[dict[str, Any]]] = {}
+    # Passing context_only mentions never suppress standalone virtual cards in cl_watcher_state
     bound_artifact_keys: set[str] = set()
     for lr in link_rows:
       wid = str(lr["work_id"])
       akey = str(lr["artifact_key"])
-      bound_artifact_keys.add(akey)
+      if wid in active_work_ids and str(lr.get("role") or "") != "context_only":
+        bound_artifact_keys.add(akey)
       links_by_work.setdefault(wid, []).append(lr)
 
     obs_by_work: dict[str, list[dict[str, Any]]] = {}
@@ -2787,18 +3307,21 @@ class WorkStore:
         if not art_item["link_reason"]:
           if art_item["role"] == "context_only":
             art_item["link_reason"] = "chat_mention"
-          elif (art_item.get("state") or {}).get("is_companion"):
+          elif is_companion_artifact(
+              str(art_item.get("artifact_key") or ""),
+              art_item.get("state") if isinstance(art_item.get("state"), Mapping) else None,
+              str(art_item.get("title") or ""),
+          ):
             art_item["link_reason"] = "companion_wip"
           else:
             art_item["link_reason"] = "auto"
-      # Order non-context correspondence first so cards and API consumers lead with correspondence
+      # Order correspondence first, then parent CLs/bugs, then nested companions, then mentions
       w_arts.sort(
           key=lambda a: (
               0
               if (
-                  a.get("role") != "context_only"
+                  a.get("role") == "primary"
                   and a.get("kind") in ("gmail_thread", "gmail_draft", "gchat_thread")
-                  and a.get("role") == "primary"
               )
               else (
                   1
@@ -2806,7 +3329,19 @@ class WorkStore:
                       a.get("role") != "context_only"
                       and a.get("kind") in ("gmail_thread", "gmail_draft", "gchat_thread")
                   )
-                  else (2 if a.get("role") != "context_only" else 3)
+                  else (
+                      2
+                      if (
+                          a.get("role") != "context_only"
+                          and not is_companion_artifact(
+                              str(a.get("artifact_key") or ""),
+                              a.get("state") if isinstance(a.get("state"), Mapping) else None,
+                              str(a.get("title") or ""),
+                              str(a.get("link_reason") or ""),
+                          )
+                      )
+                      else (3 if a.get("role") != "context_only" else 4)
+                  )
               )
           )
       )
@@ -2859,52 +3394,129 @@ class WorkStore:
     # Project standalone unbound CLs and bugs from cl_watcher_state in-memory (0 SQLite writes)
     cl_items = (cl_watcher_state or {}).get("items") or {}
     if isinstance(cl_items, Mapping):
+      # Group unbound companions under their virtual parent CL/PR instead of standalone cards
+      non_comp_virtuals: dict[str, Mapping[str, Any]] = {}
+      unbound_companions_by_parent: dict[str, list[tuple[str, Mapping[str, Any]]]] = {}
       for raw_key, item in cl_items.items():
         if not isinstance(item, Mapping):
-          continue
-        if item.get("companion_to") or item.get("is_companion") or item.get("is_cherry_pick"):
-          continue
-        status = str(item.get("status") or "NEW").upper()
-        if status in ("ABANDONED", "CLOSED"):
           continue
         kind = str(item.get("kind") or "gerrit")
         tid = str(item.get("target_id") or raw_key)
         host = str(item.get("host") or "")
         c_key = canonicalize_artifact_key(kind, tid, host=host)
-        if c_key in bound_artifact_keys:
+        subj_s = str(item.get("subject") or item.get("title") or "")
+        if is_companion_artifact(c_key, item, subj_s) or item.get("is_cherry_pick"):
+          if is_companion_artifact(c_key, item, subj_s) and c_key not in bound_artifact_keys:
+            p_key = canonicalize_companion_parent(c_key, item, subj_s)
+            if p_key and p_key not in bound_artifact_keys:
+              unbound_companions_by_parent.setdefault(p_key, []).append((c_key, item))
           continue
-        est = item.get("entity_state") or {}
-        if status == "MERGED" and not est.get("action_required"):
+        if c_key not in bound_artifact_keys:
+          non_comp_virtuals[c_key] = item
+
+      # Synthesize or hydrate aged-out parents referenced by unbound open companions
+      for p_key, p_comps in unbound_companions_by_parent.items():
+        if p_key not in non_comp_virtuals and p_key not in bound_artifact_keys:
+          stored_p = art_rows.get(p_key) or {}
+          stored_st = (
+              dict(stored_p.get("state"))
+              if isinstance(stored_p.get("state"), Mapping)
+              else {}
+          )
+          if not stored_st.get("status") and any(
+              bool(c_item.get("ready_to_abandon")) for _, c_item in p_comps
+          ):
+            stored_st["status"] = "CLOSED"
+          stored_t = clean_work_title(str(stored_p.get("title") or ""))
+          if not stored_st.get("subject") and not is_placeholder_title(stored_t, p_key):
+            stored_st["subject"] = stored_t
+          if not stored_st.get("url"):
+            stored_st["url"] = str(stored_p.get("url") or "") or _default_artifact_url(p_key)
+          stored_st.setdefault("is_external", True)
+          non_comp_virtuals[p_key] = stored_st
+
+      for c_key, item in non_comp_virtuals.items():
+        status = str(item.get("status") or "NEW").upper()
+        est = item.get("entity_state") if isinstance(item.get("entity_state"), Mapping) else {}
+        attached_comps = unbound_companions_by_parent.get(c_key, [])
+        orphan_reasons: list[str] = []
+        comp_comment_reasons: list[str] = []
+        comp_pills: list[dict[str, Any]] = []
+        # Roll companion human comments and orphaned-companion cleanup up onto the virtual parent
+        for comp_key, comp_item in attached_comps:
+          o_r, c_r = _evaluate_companion_alerts(comp_key, comp_item, c_key, item)
+          orphan_reasons.extend(o_r)
+          comp_comment_reasons.extend(c_r)
+          comp_pills.append({
+              "artifact_key": comp_key,
+              "kind": artifact_kind_from_key(comp_key),
+              "icon": PILL_ICONS.get(artifact_kind_from_key(comp_key), "🔧"),
+              "title": f"{comp_key.split(':')[-1]} · {comp_item.get('subject') or ''}".strip(" ·"),
+              "url": str(comp_item.get("url") or ""),
+              "role": "primary",
+              "source": "virtual",
+              "link_reason": "companion_wip",
+              "why_badge": f"companion WIP к {c_key.split(':')[-1]}",
+              "state": dict(comp_item),
+          })
+
+        comp_alerts = bool(orphan_reasons or comp_comment_reasons)
+        # Keep terminal virtual parents visible only when a post-submit or companion alert is live
+        if status in ("ABANDONED", "CLOSED") and not comp_alerts:
           continue
-        lane = (
-            "needs-you"
-            if (est.get("category") == "needs_me" or est.get("action_required"))
-            else "waiting"
-        )
-        reason = str(est.get("reason") or status)
+        if (
+            status == "MERGED"
+            and not (
+                est.get("action_required")
+                or est.get("lane") == "you"
+                or est.get("is_post_submit_alert")
+            )
+            and not comp_alerts
+        ):
+          continue
+
+        v_reasons: list[str] = [*orphan_reasons, *comp_comment_reasons]
+        if status not in ("ABANDONED", "CLOSED"):
+          cl_v_reason = _evaluate_cl_needs_you(c_key, item)
+          if cl_v_reason:
+            v_reasons.append(cl_v_reason)
+        lane = "needs-you" if v_reasons else "waiting"
+        if not v_reasons:
+          fallback_r = str(
+              est.get("reason") or item.get("attention_reason") or status
+          )
+          if fallback_r:
+            v_reasons.append(fallback_r)
         updated_ts = float(item.get("updated_ts") or cur_now)
+        # Strip config project stamps from virtual cards when discussed in a config conversation
+        raw_v_proj = str(item.get("project") or "")
+        v_proj = "" if is_config_project(raw_v_proj) else raw_v_proj
+        v_title = str(item.get("subject") or item.get("title") or format_short_cl_id(c_key, item))
         cards.append({
             "work_id": f"virt-{c_key}",
-            "title": str(item.get("subject") or item.get("title") or c_key),
+            "title": v_title,
             "status": "active",
             "lane": lane,
-            "reasons": [reason] if reason else [],
-            "project_id": str(item.get("project") or ""),
+            "reasons": v_reasons,
+            "project_id": v_proj,
             "roadmap_item_key": "",
             "updated_at": updated_ts,
             "updated_et": format_et_timestamp(updated_ts),
             "is_virtual": True,
-            "is_multi_channel": False,
-            "artifacts": [{
-                "artifact_key": c_key,
-                "kind": artifact_kind_from_key(c_key),
-                "icon": PILL_ICONS.get(artifact_kind_from_key(c_key), "🔧"),
-                "title": f"{c_key.split(':')[-1]} · {item.get('subject') or ''}".strip(" ·"),
-                "url": str(item.get("url") or ""),
-                "role": "primary",
-                "source": "virtual",
-                "state": dict(item),
-            }],
+            "is_multi_channel": bool(comp_pills),
+            "artifacts": [
+                {
+                    "artifact_key": c_key,
+                    "kind": artifact_kind_from_key(c_key),
+                    "icon": PILL_ICONS.get(artifact_kind_from_key(c_key), "🔧"),
+                    "title": f"{c_key.split(':')[-1]} · {item.get('subject') or ''}".strip(" ·"),
+                    "url": str(item.get("url") or ""),
+                    "role": "primary",
+                    "source": "virtual",
+                    "state": dict(item),
+                },
+                *comp_pills,
+            ],
             "obligations": [],
         })
 

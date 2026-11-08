@@ -131,11 +131,24 @@ WRITE_TOOL_NAMES = frozenset({
 })
 
 
+# GitHub PR notification emails embed /issues/<N> inside pull_request hovercard attributes
+_RE_GH_HOVERCARD_DATA_ATTR = re.compile(
+    r'data-(?:url|hydro-click)=(["\'])(?:(?!\1).)*?'
+    r"github\.com/flutter/flutter/issues/\d+(?:(?!\1).)*?\1",
+    re.IGNORECASE,
+)
+
+
 def extract_artifacts_from_text(text: str) -> list[tuple[str, str, str]]:
   """Returns list of (artifact_key, kind, default_url) in document appearance order."""
   found: dict[str, tuple[int, tuple[str, str, str]]] = {}
   if not text:
     return []
+
+  # Mask GitHub PR hovercard data-url="/issues/<N>" attributes while keeping character offsets
+  issue_scan_text = _RE_GH_HOVERCARD_DATA_ATTR.sub(
+      lambda m: " " * len(m.group(0)), text
+  )
 
   def _add(pos: int, key: str, kind: str, url: str) -> None:
     if key not in found or pos < found[key][0]:
@@ -171,9 +184,10 @@ def extract_artifacts_from_text(text: str) -> list[tuple[str, str, str]]:
           f"https://github.com/flutter/flutter/pull/{num}",
       )
 
-  for m in RE_FLUTTER_ISSUE.finditer(text):
+  # GitHub PRs and issues share one counter per repo; suppress PR numbers in (flutter/flutter#N)
+  for m in RE_FLUTTER_ISSUE.finditer(issue_scan_text):
     num = m.group(1)
-    if num not in DUMMY_IDS:
+    if num not in DUMMY_IDS and f"github_pr:flutter/flutter:{num}" not in found:
       _add(
           m.start(),
           f"github_issue:flutter/flutter:{num}",
@@ -231,8 +245,9 @@ def extract_artifacts_from_text(text: str) -> list[tuple[str, str, str]]:
   return [item for _, item in sorted(found.values(), key=lambda x: x[0])]
 
 
+# Capture optional PR/pull prefix so PR bullets are never misread as GitHub issue bug_titles
 _RE_INLINE_FLUTTER_TITLE = re.compile(
-    r"(?:#|flutter#)(\d{4,7})\b\s*[—–\-:]\s*([^\n(]+)",
+    r"(?P<pr_prefix>\bPR\s*|\bpull/)?(?:#|flutter#)(\d{4,7})\b\s*[—–\-:]\s*([^\n(]+)",
     re.IGNORECASE,
 )
 _RE_GH_NOTIF_ISSUE_TITLE = re.compile(
@@ -264,8 +279,10 @@ def extract_bug_titles_from_html_or_text(raw: str) -> dict[str, str]:
         ck = work_store.canonicalize_artifact_key("flutter_issue", num)
         titles[ck] = desc
     for m in _RE_INLINE_FLUTTER_TITLE.finditer(clean_line):
-      num = m.group(1)
-      desc = m.group(2).strip(" —–-:;,.()")
+      if m.group("pr_prefix"):
+        continue
+      num = m.group(2)
+      desc = m.group(3).strip(" —–-:;,.()")
       if num not in DUMMY_IDS and len(desc) >= 6:
         ck = work_store.canonicalize_artifact_key("flutter_issue", num)
         titles[ck] = desc
@@ -474,7 +491,8 @@ def ingest_transcript_file(
   has_write = bool(prev.get("has_write"))
   extracted: dict[str, tuple[str, str, str]] = {}
   anchor_keys: set[str] = set()
-  companion_cls: dict[str, str] = {}
+  # Track (label, kind, url) for companion probes created during review sessions
+  companion_cls: dict[str, tuple[str, str, str]] = {}
   mention_steps: dict[str, int] = {}
   if chat_title:
     for akey, akind, aurl in extract_artifacts_from_text(chat_title):
@@ -485,10 +503,26 @@ def ingest_transcript_file(
   first_user_step_seen = False
   first_step_ts = 0.0
   detected_root = root_cid or conv_id
+  # Match plain and Markdown-linked companion probes across Skia/Chromium Gerrit and GitHub PRs
   re_comp = re.compile(
-      r"(?:companion\s+WIP(?:\s+CL)?|WIP[-\s]компаньон)[^0-9\n]{0,80}?"
-      r"(?:skia-review\.googlesource\.com/c/skia/\+/|\bGerrit\s+)(\d{6,8})\b"
-      r"(?:\s*\(([^)\n]{3,80})\))?",
+      r"(?:companion\s+(?:WIP|Draft)(?:\s+(?:CL|PR))?|WIP[-\s]компаньон|компаньон[-\s](?:ПР|СЛ))"
+      r"(?P<gap>[^0-9\[\n]{0,80}?)"
+      r"(?:\[[^\]\n]{1,80}\]\(\s*)?"
+      r"(?:"
+      r"(?:https?://)?skia-review\.googlesource\.com/c/skia/\+/(?P<skia_u>\d{6,8})"
+      r"|\b(?:Skia\s+CL|Gerrit)\s+(?P<skia_t>\d{6,8})"
+      r"|(?:https?://)?chromium-review\.googlesource\.com/c/chromium/src/\+/(?P<chrom_u>\d{6,8})"
+      r"|\b(?:Chromium\s+CL|crrev(?:\.com)?/c/)\s*(?P<chrom_t>\d{6,8})"
+      r"|(?:https?://)?github\.com/flutter/flutter/pull/(?P<gh_u>\d{4,7})"
+      r"|\bPR\s+#?(?P<gh_t>\d{4,7})"
+      r")"
+      r"(?:/\d+)?\)?"
+      r"(?:\s*\((?P<lbl>[^)\n]{3,80})\))?",
+      re.IGNORECASE,
+  )
+  # Reject prepositions like "companion PR for PR #195366" where the number names the parent PR
+  re_parent_prep = re.compile(
+      r"\b(?:for|on|to|of|against|к|для|поверх|базе)\b",
       re.IGNORECASE,
   )
   try:
@@ -525,15 +559,31 @@ def ingest_transcript_file(
         elif step.get("type") == "PLANNER_RESPONSE":
           p_text = str(step.get("content") or "")
           for m_c in re_comp.finditer(p_text):
-            c_num = m_c.group(1)
-            c_lbl = (m_c.group(2) or "").strip()
-            c_akey = work_store.canonicalize_artifact_key("gerrit", c_num)
-            companion_cls[c_akey] = c_lbl
-            extracted[c_akey] = (
-                c_akey,
-                "gerrit",
-                f"https://skia-review.googlesource.com/c/skia/+/{c_num}",
-            )
+            if re_parent_prep.search(m_c.group("gap") or ""):
+              continue
+            c_lbl = (m_c.group("lbl") or "").strip()
+            skia_m = m_c.group("skia_u") or m_c.group("skia_t")
+            chrom_m = m_c.group("chrom_u") or m_c.group("chrom_t")
+            if skia_m:
+              c_num = skia_m
+              c_akey = f"gerrit:skia:{c_num}"
+              c_kind = "gerrit"
+              c_url = f"https://skia-review.googlesource.com/c/skia/+/{c_num}"
+            elif chrom_m:
+              c_num = chrom_m
+              c_akey = f"gerrit:chromium:{c_num}"
+              c_kind = "gerrit"
+              c_url = f"https://chromium-review.googlesource.com/c/chromium/src/+/{c_num}"
+            else:
+              c_num = m_c.group("gh_u") or m_c.group("gh_t")
+              c_akey = f"github_pr:flutter/flutter:{c_num}"
+              c_kind = "github_pr"
+              c_url = f"https://github.com/flutter/flutter/pull/{c_num}"
+            # Never reclassify the reviewed parent CL/PR anchored in step 0 or title as companion
+            if c_akey in anchor_keys:
+              continue
+            companion_cls[c_akey] = (c_lbl, c_kind, c_url)
+            extracted[c_akey] = (c_akey, c_kind, c_url)
             mention_steps.setdefault(c_akey, step_idx)
         if _is_write_step(step):
           has_write = True
@@ -693,8 +743,19 @@ def ingest_transcript_file(
     if primaries:
       existing_art = store.get_artifact(primaries[0][0])
       primary_title = str((existing_art or {}).get("title") or primaries[0][0])
+    # Prefer the real parent CL/PR subject when the chat was titled after creating a companion
+    non_ph_primary_title = (
+        primary_title
+        if (primaries and not work_store.is_placeholder_title(primary_title, primaries[0][0]))
+        else ""
+    )
+    preferred_chat_title = (
+        "" if (work_store.is_companion_title(chat_title) and non_ph_primary_title) else chat_title
+    )
     default_title = work_store.clean_work_title(
-        chat_title
+        preferred_chat_title
+        or non_ph_primary_title
+        or chat_title
         or primary_title
         or first_user_prompt
         or f"Work {conv_id[:8]}"
@@ -762,34 +823,39 @@ def ingest_transcript_file(
           now=cur_now,
       )
 
-  for comp_akey, comp_lbl in companion_cls.items():
+  # Persist companion probes with tracker-specific draft/WIP state nested under the reviewed parent
+  for comp_akey, (comp_lbl, comp_kind, comp_url) in companion_cls.items():
     comp_num = comp_akey.split(":")[-1]
     parent_num = reviewed_cl_key.split(":")[-1] if reviewed_cl_key else ""
+    comp_tag = "companion Draft" if comp_kind == "github_pr" else "companion WIP"
     comp_title = (
-        f"{comp_num}: [companion WIP] {comp_lbl}"
+        f"{comp_num}: [{comp_tag}] {comp_lbl}"
         if comp_lbl
-        else f"{comp_num}: [companion WIP]"
+        else f"{comp_num}: [{comp_tag}]"
     )
     comp_state: dict[str, Any] = {
         "is_companion": True,
         "is_wip": True,
-        "wip_label": "companion WIP",
+        "wip_label": comp_tag,
     }
+    # GitHub companions are uploaded as Draft PRs rather than Gerrit WIP patchsets
+    if comp_kind == "github_pr":
+      comp_state["is_draft"] = True
     if reviewed_cl_key:
       comp_state["companion_to"] = reviewed_cl_key
     store.upsert_artifact(
         comp_akey,
-        kind="gerrit",
+        kind=comp_kind,
         title=comp_title,
-        url=f"https://skia-review.googlesource.com/c/skia/+/{comp_num}",
+        url=comp_url,
         state=comp_state,
         now=cur_now,
     )
     s_idx = mention_steps.get(comp_akey, 0)
     detail_str = (
-        f"Тестовый companion WIP СЛ к ревью {parent_num} (чат {detected_root[:8]}, шаг {s_idx})"
+        f"Тестовый {comp_tag} к ревью {parent_num} (чат {detected_root[:8]}, шаг {s_idx})"
         if parent_num
-        else f"Тестовый companion WIP СЛ (чат {detected_root[:8]}, шаг {s_idx})"
+        else f"Тестовый {comp_tag} (чат {detected_root[:8]}, шаг {s_idx})"
     )
     store.link_artifact(
         work_id,
@@ -900,6 +966,8 @@ def ingest_cl_watcher_state(
           now=cur_now,
       )
 
+  # Defer companion attachment until all parent CL/PR Works in this batch are created or matched
+  deferred_companions: list[tuple[str, str]] = []
   for raw_key, item in items.items():
     if not isinstance(item, Mapping):
       continue
@@ -964,11 +1032,30 @@ def ingest_cl_watcher_state(
           now=cur_now,
       )
 
+    # Preserve raw project metadata for chat_chain filtering before sanitizing product CL state
+    raw_item_proj = str(
+        item.get("project_id") or item.get("project_name") or item.get("project") or ""
+    )
     item_state = dict(item)
+    # Strip config project stamps from product CL/PR state when discussed in a config chat
+    if work_store.is_config_project(str(item_state.get("project_id") or "")):
+      item_state["project_id"] = ""
+    if work_store.is_config_project(str(item_state.get("project_name") or "")):
+      item_state["project_name"] = ""
+    if work_store.is_config_project(str(item_state.get("project") or "")):
+      item_state["project"] = ""
     item_state["linked_bug_keys"] = linked_bug_keys
     created_ts = float(item.get("created_ts") or 0.0)
     if created_ts > 0:
       item_state["origin_ts"] = created_ts
+    # Canonicalize companion_to and skip standalone Work creation for companion probes
+    is_comp = work_store.is_companion_artifact(ckey, item_state, subj)
+    if is_comp:
+      parent_ckey = work_store.canonicalize_companion_parent(ckey, item_state, subj)
+      item_state["is_companion"] = True
+      if parent_ckey:
+        item_state["companion_to"] = parent_ckey
+        deferred_companions.append((ckey, parent_ckey))
     store.upsert_artifact(
         ckey,
         kind=work_store.artifact_kind_from_key(ckey),
@@ -977,7 +1064,8 @@ def ingest_cl_watcher_state(
         state=item_state,
         now=cur_now,
     )
-    if item.get("companion_to") or item.get("is_companion") or item.get("is_cherry_pick"):
+    # Companion probes and cherry-picks never mint standalone Works of their own
+    if is_comp or item.get("is_cherry_pick"):
       continue
 
     # Check if this CL is a hub ([SkoreText] or >3 bugs); hubs never auto-merge works
@@ -1008,11 +1096,14 @@ def ingest_cl_watcher_state(
     if not matched_wids and not has_multi_entities:
       continue
 
+    # Never propagate a config project ID onto a newly created product Work
+    raw_proj_field = str(item.get("project") or "")
+    clean_proj = "" if work_store.is_config_project(raw_proj_field) else raw_proj_field
     if not matched_wids:
       matched_wids = [
           store.create_work(
               subj,
-              project_id=str(item.get("project") or ""),
+              project_id=clean_proj,
               now=cur_now,
           )
       ]
@@ -1050,11 +1141,18 @@ def ingest_cl_watcher_state(
     primary_wid = matched_wids[0]
     for cid in cids[:2]:
       ch_key = f"chat_chain:{cid}"
-      ch_title = str(item.get("chat_title") or f"Chat {cid[:8]}")
+      # Apply item-level project_id only to item.conversation_id so sibling product chats survive
+      cid_proj = raw_item_proj if cid == single_cid else ""
+      ch_title = (
+          str(item.get("chat_title") or f"Chat {cid[:8]}")
+          if cid == single_cid
+          else f"Chat {cid[:8]}"
+      )
       if work_store.is_config_artifact(
           ch_key,
           title=ch_title,
           state={"cascade_id": cid},
+          project_id=cid_proj,
       ):
         continue
       store.upsert_artifact(
@@ -1072,6 +1170,20 @@ def ingest_cl_watcher_state(
           source="auto",
           link_reason="cl_watcher_chat",
           link_detail=f"Рабочий чат по СЛ {tid}",
+          now=cur_now,
+      )
+
+  # Nest active companions inside any persisted Work that tracks their parent CL/PR
+  for comp_ckey, parent_ckey in deferred_companions:
+    parent_num = parent_ckey.split(":")[-1]
+    for p_wid in store.find_all_works_by_artifact(parent_ckey, roles=("primary",)):
+      store.link_artifact(
+          p_wid,
+          comp_ckey,
+          role="primary",
+          source="auto",
+          link_reason="companion_wip",
+          link_detail=f"Тестовый companion к {parent_num}",
           now=cur_now,
       )
 
@@ -1397,6 +1509,9 @@ def _work_has_open_cl(store: work_store.WorkStore, work_id: str) -> bool:
     if akey.startswith(("gerrit:", "github_pr:", "piper:")):
       ar = store.get_artifact(akey) or {}
       st = ar.get("state") if isinstance(ar.get("state"), Mapping) else {}
+      # Companion probes are review scratchpads and do not count as active deliverable CLs
+      if work_store.is_companion_artifact(akey, st, str(ar.get("title") or "")):
+        continue
       if str(st.get("status") or "NEW").upper() in ("NEW", "OPEN"):
         return True
   return False
@@ -1567,14 +1682,25 @@ def ingest_gmail_drafts_and_threads(
           # Attach any CLs/PRs in the artifact store that fix the draft's primary bugs
           store.reconcile_work_bug_cls(wid, now=cur_now)
 
-          # Build a single consolidated obligation for the draft across all linked CLs/bugs
+          # Build a single consolidated obligation for the draft across non-companion CLs/bugs
           if "flutter" in subj.lower() or draft_bug_keys:
             w_roles = store.get_work_artifact_roles(wid)
+
+            # Companion probes are abandoned/closed rather than merged, so never gate draft sending
+            def _is_comp_cl(k: str) -> bool:
+              ar = store.get_artifact(k) or {}
+              st = ar.get("state") if isinstance(ar.get("state"), Mapping) else {}
+              return work_store.is_companion_artifact(k, st, str(ar.get("title") or ""))
+
             primary_gerrit = sorted(
-                k for k, r in w_roles.items() if r == "primary" and k.startswith("gerrit:")
+                k
+                for k, r in w_roles.items()
+                if r == "primary" and k.startswith("gerrit:") and not _is_comp_cl(k)
             )
             primary_prs = sorted(
-                k for k, r in w_roles.items() if r == "primary" and k.startswith("github_pr:")
+                k
+                for k, r in w_roles.items()
+                if r == "primary" and k.startswith("github_pr:") and not _is_comp_cl(k)
             )
             preds: list[str] = []
             for gk in primary_gerrit:

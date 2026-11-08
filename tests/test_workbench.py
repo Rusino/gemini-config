@@ -2373,6 +2373,572 @@ assert.strictEqual(cards.w_wait2.collapsed, true);
         f"Node behavioral check failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
     )
 
+  def test_companion_policy_foreign_conflict_and_config_product_pr_protection(self) -> None:
+    import ingestor
+    import work_store
+
+    now = 1794170000.0
+    store = work_store.WorkStore(self.db_path)
+
+    # GitHub PR notification HTML puts data-url="/issues/<N>" on pull_request hovercards
+    gh_pr_html = (
+        'dbebawy left a comment <a href="https://github.com/flutter/flutter/pull/195366">'
+        "(flutter/flutter#195366)</a> referencing "
+        '<a data-url="https://github.com/flutter/flutter/issues/195122" '
+        'data-hovercard-type="pull_request" '
+        'href="https://github.com/flutter/flutter/pull/195122">#195122</a> '
+        "and Fixes https://github.com/flutter/flutter/issues/193506."
+    )
+    ext = ingestor.extract_artifacts_from_text(gh_pr_html)
+    ext_keys = [k for k, _, _ in ext]
+    self.assertIn("github_pr:flutter/flutter:195366", ext_keys)
+    self.assertIn("github_pr:flutter/flutter:195122", ext_keys)
+    self.assertIn("github_issue:flutter/flutter:193506", ext_keys)
+    self.assertNotIn("github_issue:flutter/flutter:195366", ext_keys)
+    self.assertNotIn("github_issue:flutter/flutter:195122", ext_keys)
+
+    # Chromium Gerrit companion_to without explicit host inherits the child's Gerrit repo
+    self.assertEqual(
+        work_store.canonicalize_companion_parent(
+            "gerrit:chromium:8635030", {"companion_to": "gerrit:8595771"}
+        ),
+        "gerrit:chromium:8595771",
+    )
+
+    # Companion creation chat on PR #195366 publishing Draft PR #195377
+    cid_comp = "2a40bfdd-b05c-4cbd-ad67-178961b3b72b"
+    tpath_comp = os.path.join(
+        self.tmp_dir.name, cid_comp, ".system_generated", "logs", "transcript.jsonl"
+    )
+    os.makedirs(os.path.dirname(tpath_comp), exist_ok=True)
+    with open(tpath_comp, "w", encoding="utf-8") as f:
+      f.write(
+          json.dumps({
+              "step_index": 0,
+              "type": "USER_INPUT",
+              "created_at": "2026-10-26T22:00:00Z",
+              "content": (
+                  "Оформи компаньон ПР на базе "
+                  "https://github.com/flutter/flutter/pull/195366 как драфт"
+              ),
+          })
+          + "\n"
+      )
+      f.write(
+          json.dumps({
+              "step_index": 1,
+              "type": "PLANNER_RESPONSE",
+              "created_at": "2026-10-26T22:20:00Z",
+              "content": (
+                  "Я создала companion Draft PR "
+                  "https://github.com/flutter/flutter/pull/195377 "
+                  "([web_paragraph] Companion fixes and tests for soft hyphens)"
+              ),
+              "tool_calls": [{
+                  "name": "run_command",
+                  "args": {
+                      "CommandLine": (
+                          "gh pr create --draft --title "
+                          "'[web_paragraph] Companion fixes and tests for soft hyphens (#195366)'"
+                      )
+                  },
+              }],
+          })
+          + "\n"
+      )
+
+    cursors: dict[str, dict[str, float | int]] = {}
+    ingestor.ingest_transcript_file(
+        store,
+        conv_id=cid_comp,
+        root_cid=cid_comp,
+        transcript_path=tpath_comp,
+        cursors=cursors,
+        chat_title="Companion Draft PR for PR #195366 (`[web_paragraph] Render soft hyphens`)",
+        now=now,
+    )
+
+    # External PR #195366 stamped with My Work project_id and foreign merge_conflict=True;
+    # own non-WIP CL 1398679 with merge_conflict=True; active open companion PR #195377
+    my_work_pid = "61f270de-563d-45a4-b9eb-1c0bccf80cc9"
+    cfg_cid = "3531f6cd-c086-4609-8e85-4afecac6fa61"
+    cl_state: dict[str, Any] = {
+        "items": {
+            f"github:195366@{cfg_cid}": {
+                "item_key": "github:195366",
+                "kind": "github",
+                "target_id": "195366",
+                "status": "OPEN",
+                "is_self": False,
+                "role": "reviewer",
+                "is_wip": False,
+                "is_draft": False,
+                "merge_conflict": True,
+                "project_id": my_work_pid,
+                "conversation_id": cfg_cid,
+                "subject": "[web_paragraph] Render soft hyphens",
+                "url": "https://github.com/flutter/flutter/pull/195366",
+                "entity_state": {"status": "waiting", "lane": "waiting"},
+            },
+            "github:195377@comp": {
+                "item_key": "github:195377",
+                "kind": "github",
+                "target_id": "195377",
+                "status": "OPEN",
+                "is_self": True,
+                "role": "author",
+                "is_wip": True,
+                "is_draft": True,
+                "merge_conflict": True,
+                "cq_failed": True,
+                "is_companion": True,
+                "companion_to": "github:195366",
+                "subject": "[web_paragraph] Companion fixes and tests for soft hyphens (#195366)",
+                "url": "https://github.com/flutter/flutter/pull/195377",
+                "entity_state": {
+                    "status": "conflict",
+                    "lane": "you",
+                    "action_required": True,
+                },
+            },
+            "gerrit:1398679@own": {
+                "item_key": "gerrit:1398679",
+                "kind": "gerrit",
+                "target_id": "1398679",
+                "host": "skia-review.googlesource.com",
+                "status": "NEW",
+                "is_self": True,
+                "role": "author",
+                "is_wip": False,
+                "merge_conflict": True,
+                "subject": "[skparagraph] Fix baselineShift in extendedVisit",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1398679",
+                "linked_bugs": [{
+                    "bug_key": "b/400000001",
+                    "short_id": "b/400000001",
+                    "title": "baselineShift offset mismatch",
+                    "status": "OPEN",
+                }],
+                "entity_state": {"status": "waiting", "lane": "desk"},
+            },
+        },
+        "bugs": {},
+    }
+    ingestor.ingest_cl_watcher_state(store, cl_state, now=now + 10)
+    store.purge_config_artifacts_and_works(now=now + 15)
+
+    self.assertFalse(
+        work_store.is_config_artifact(
+            "github_pr:flutter/flutter:195366",
+            title="195366: [web_paragraph] Render soft hyphens",
+            state=cl_state["items"][f"github:195366@{cfg_cid}"],
+            project_id=my_work_pid,
+        )
+    )
+
+    proj = store.build_dashboard_projection(cl_watcher_state=cl_state, now=now + 20)
+    cards_195366 = [
+        w
+        for w in proj["works"]
+        if any(a["artifact_key"] == "github_pr:flutter/flutter:195366" for a in w["artifacts"])
+    ]
+    self.assertEqual(len(cards_195366), 1)
+    card_soft = cards_195366[0]
+    self.assertFalse(card_soft["is_virtual"])
+    self.assertNotIn("Companion Draft PR", card_soft["title"])
+    self.assertIn("Render soft hyphens", card_soft["title"])
+
+    soft_arts = {a["artifact_key"]: a for a in card_soft["artifacts"]}
+    self.assertIn("github_pr:flutter/flutter:195377", soft_arts)
+    self.assertNotIn(f"chat_chain:{cfg_cid}", soft_arts)
+    self.assertEqual(card_soft["lane"], "waiting")
+
+    # Own non-WIP CL with merge_conflict still triggers needs-you
+    own_card = [
+        w
+        for w in proj["works"]
+        if any(a["artifact_key"] == "gerrit:skia:1398679" for a in w["artifacts"])
+    ][0]
+    self.assertEqual(own_card["lane"], "needs-you")
+    self.assertTrue(any("Merge conflict" in r for r in own_card["reasons"]))
+
+    # External reviewer PR needing review with merge_conflict keeps its review reason
+    cl_state["items"][f"github:195366@{cfg_cid}"]["entity_state"] = {
+        "category": "needs_me",
+        "reason": "Review requested by dbebawy",
+        "lane": "you",
+    }
+    ingestor.ingest_cl_watcher_state(store, cl_state, now=now + 25)
+    proj_rev = store.build_dashboard_projection(cl_watcher_state=cl_state, now=now + 26)
+    card_rev = [w for w in proj_rev["works"] if w["work_id"] == card_soft["work_id"]][0]
+    self.assertEqual(card_rev["lane"], "needs-you")
+    self.assertIn("Review requested by dbebawy", card_rev["reasons"])
+    self.assertFalse(any("Merge conflict" in r for r in card_rev["reasons"]))
+
+    # Live external human comment on the companion wakes the parent's Work card
+    cl_state["items"][f"github:195366@{cfg_cid}"]["entity_state"] = {
+        "status": "waiting",
+        "lane": "waiting",
+    }
+    cl_state["items"]["github:195377@comp"]["open_external_threads"] = 1
+    ingestor.ingest_cl_watcher_state(store, cl_state, now=now + 30)
+    proj_comment = store.build_dashboard_projection(cl_watcher_state=cl_state, now=now + 31)
+    card_comment = [w for w in proj_comment["works"] if w["work_id"] == card_soft["work_id"]][0]
+    self.assertEqual(card_comment["lane"], "needs-you")
+    self.assertTrue(any("195377" in r for r in card_comment["reasons"]))
+
+    # Parent merges while companion stays OPEN -> orphaned companion cleanup alert
+    cl_state["items"]["github:195377@comp"]["open_external_threads"] = 0
+    cl_state["items"][f"github:195366@{cfg_cid}"]["status"] = "MERGED"
+    ingestor.ingest_cl_watcher_state(store, cl_state, now=now + 40)
+    proj_orphan = store.build_dashboard_projection(cl_watcher_state=cl_state, now=now + 41)
+    card_orphan = [w for w in proj_orphan["works"] if w["work_id"] == card_soft["work_id"]][0]
+    self.assertEqual(card_orphan["lane"], "needs-you")
+    self.assertTrue(any("orphaned companion" in r.lower() for r in card_orphan["reasons"]))
+
+    # Closing the companion transitions the Work cleanly to done (both MERGED and CLOSED parent)
+    cl_state["items"]["github:195377@comp"]["status"] = "CLOSED"
+    ingestor.ingest_cl_watcher_state(store, cl_state, now=now + 50)
+    proj_done = store.build_dashboard_projection(cl_watcher_state=cl_state, now=now + 51)
+    card_done = [w for w in proj_done["works"] if w["work_id"] == card_soft["work_id"]][0]
+    self.assertEqual(card_done["lane"], "done")
+
+    cl_state["items"][f"github:195366@{cfg_cid}"]["status"] = "CLOSED"
+    ingestor.ingest_cl_watcher_state(store, cl_state, now=now + 55)
+    proj_closed = store.build_dashboard_projection(cl_watcher_state=cl_state, now=now + 56)
+    card_closed = [w for w in proj_closed["works"] if w["work_id"] == card_soft["work_id"]][0]
+    self.assertEqual(card_closed["lane"], "done")
+
+    # Unbound open companion in cl_watcher_state whose virtual parent is ABANDONED surfaces cleanup
+    cl_state["items"]["gerrit:1499998@virt"] = {
+        "item_key": "gerrit:1499998",
+        "kind": "gerrit",
+        "target_id": "1499998",
+        "host": "skia-review.googlesource.com",
+        "status": "ABANDONED",
+        "is_self": False,
+        "role": "reviewer",
+        "subject": "[skparagraph] Abandoned external change",
+        "url": "https://skia-review.googlesource.com/c/skia/+/1499998",
+        "entity_state": {"status": "abandoned", "lane": "done"},
+    }
+    cl_state["items"]["gerrit:1499999@virt"] = {
+        "item_key": "gerrit:1499999",
+        "kind": "gerrit",
+        "target_id": "1499999",
+        "host": "skia-review.googlesource.com",
+        "status": "NEW",
+        "is_self": True,
+        "role": "author",
+        "is_wip": True,
+        "is_companion": True,
+        "companion_to": "gerrit:1499998",
+        "subject": "[companion WIP] Contract tests for 1499998",
+        "url": "https://skia-review.googlesource.com/c/skia/+/1499999",
+        "entity_state": {"status": "draft", "lane": "desk"},
+    }
+    proj_virt_orphan = store.build_dashboard_projection(cl_watcher_state=cl_state, now=now + 60)
+    virt_cards = [
+        w for w in proj_virt_orphan["works"] if w["work_id"] == "virt-gerrit:skia:1499998"
+    ]
+    self.assertEqual(len(virt_cards), 1)
+    self.assertEqual(virt_cards[0]["lane"], "needs-you")
+    self.assertTrue(any("orphaned companion" in r.lower() for r in virt_cards[0]["reasons"]))
+    self.assertFalse(
+        any(w["work_id"] == "virt-gerrit:skia:1499999" for w in proj_virt_orphan["works"])
+    )
+
+    # Structural repair: companion-only primary promotes its parent CL to primary,
+    # and companion chat titles on Works upgrade to the parent CL's real subject
+    w_comp_only = store.create_work(
+        "1408158: [skparagraph] Use std::string for the builder text", now=now + 65
+    )
+    store.upsert_artifact(
+        "gerrit:skia:1408158",
+        kind="gerrit",
+        title="1408158: [skparagraph] Use std::string for the builder text",
+        url="https://skia-review.googlesource.com/c/skia/+/1408158",
+        state={"status": "NEW"},
+        now=now + 65,
+    )
+    store.upsert_artifact(
+        "gerrit:skia:1406080",
+        kind="gerrit",
+        title="1406080: [companion WIP]",
+        url="https://skia-review.googlesource.com/c/skia/+/1406080",
+        state={"is_companion": True, "companion_to": "gerrit:skia:1408158", "is_wip": True},
+        now=now + 65,
+    )
+    store.link_artifact(
+        w_comp_only,
+        "gerrit:skia:1408158",
+        role="context_only",
+        source="auto",
+        link_reason="chat_mention",
+        now=now + 65,
+    )
+    store.link_artifact(
+        w_comp_only,
+        "gerrit:skia:1406080",
+        role="primary",
+        source="auto",
+        link_reason="companion_wip",
+        now=now + 65,
+    )
+    w_glyph = store.create_work(
+        "GlyphRun companion CLs on crrev/c/8690001 PS19", now=now + 65
+    )
+    store.upsert_artifact(
+        "gerrit:chromium:8690001",
+        kind="gerrit",
+        title="8690001: [canvas] Draw GlyphRuns with the direction captured by shapeText()",
+        url="https://chromium-review.googlesource.com/c/chromium/src/+/8690001",
+        state={
+            "status": "MERGED",
+            "subject": "[canvas] Draw GlyphRuns with the direction captured by shapeText()",
+        },
+        now=now + 65,
+    )
+    store.link_artifact(
+        w_glyph,
+        "gerrit:chromium:8690001",
+        role="primary",
+        source="auto",
+        link_reason="chat_topic",
+        now=now + 65,
+    )
+    # Duplicate companion-titled card sharing its parent PR with a real correspondence Work merges
+    w_real_parent = store.create_work(
+        "[flutter/flutter] Render soft hyphens (PR #198001) — David Bebawy", now=now + 65
+    )
+    w_dup_comp = store.create_work(
+        "Companion Draft PR for PR #198001 (`Render soft hyphens`)", now=now + 65
+    )
+    store.upsert_artifact(
+        "github_pr:flutter/flutter:198001",
+        kind="github_pr",
+        title="198001: Render soft hyphens",
+        state={"status": "OPEN"},
+        now=now + 65,
+    )
+    store.upsert_artifact(
+        "github_pr:flutter/flutter:198002",
+        kind="github_pr",
+        title="198002: Companion fixes (#198001)",
+        state={"is_companion": True, "companion_to": "github_pr:flutter/flutter:198001"},
+        now=now + 65,
+    )
+    store.link_artifact(
+        w_real_parent, "github_pr:flutter/flutter:198001", role="primary", now=now + 65
+    )
+    store.link_artifact(
+        w_dup_comp, "github_pr:flutter/flutter:198001", role="primary", now=now + 65
+    )
+    store.link_artifact(
+        w_dup_comp, "github_pr:flutter/flutter:198002", role="context_only", now=now + 65
+    )
+    store.purge_config_artifacts_and_works(now=now + 70)
+    self.assertEqual(
+        store.get_work_artifact_roles(w_comp_only).get("gerrit:skia:1408158"), "primary"
+    )
+    self.assertEqual(
+        store.get_work_artifact_roles(w_real_parent).get("github_pr:flutter/flutter:198002"),
+        "primary",
+    )
+    proj_repaired = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now + 71)
+    self.assertFalse(any(w["work_id"] == w_dup_comp for w in proj_repaired["works"]))
+    glyph_card = [w for w in proj_repaired["works"] if w["work_id"] == w_glyph][0]
+    self.assertNotIn("companion CLs", glyph_card["title"])
+    self.assertIn("Draw GlyphRuns with the direction captured by shapeText()", glyph_card["title"])
+    self.assertEqual(glyph_card["lane"], "done")
+
+    # B1: Real entity_state from entity_state.py uses lane="you", attention_reason on item,
+    # and spine_short_state.short="Conflict" even on foreign PRs
+    real_est_state: dict[str, Any] = {
+        "items": {
+            "github:196100@rev": {
+                "item_key": "github:196100",
+                "kind": "github",
+                "target_id": "196100",
+                "status": "OPEN",
+                "is_self": False,
+                "role": "reviewer",
+                "merge_conflict": True,
+                "in_my_attention": True,
+                "attention_reason": "Review requested by contributor",
+                "subject": "[web_paragraph] External review with conflict",
+                "url": "https://github.com/flutter/flutter/pull/196100",
+                "entity_state": {
+                    "status": "attention",
+                    "lane": "you",
+                    "is_reviewer_change": True,
+                    "needs_my_reply": True,
+                    "spine_short_state": {
+                        "short": "Conflict",
+                        "icon": "⚠️",
+                        "tone": "spine-warn",
+                    },
+                },
+            }
+        }
+    }
+    proj_b1_v = store.build_dashboard_projection(cl_watcher_state=real_est_state, now=now + 75)
+    vc_b1 = [
+        w for w in proj_b1_v["works"] if w["work_id"] == "virt-github_pr:flutter/flutter:196100"
+    ]
+    self.assertEqual(len(vc_b1), 1)
+    self.assertEqual(vc_b1[0]["lane"], "needs-you")
+    self.assertIn("Review requested by contributor", vc_b1[0]["reasons"])
+    self.assertFalse(any("conflict" in r.lower() for r in vc_b1[0]["reasons"]))
+    w_b1 = store.create_work("External review with conflict", now=now + 76)
+    ingestor.ingest_cl_watcher_state(store, real_est_state, now=now + 76)
+    store.link_artifact(w_b1, "github_pr:flutter/flutter:196100", role="primary", now=now + 76)
+    proj_b1_p = store.build_dashboard_projection(cl_watcher_state=real_est_state, now=now + 77)
+    pc_b1 = [w for w in proj_b1_p["works"] if w["work_id"] == w_b1][0]
+    self.assertEqual(pc_b1["lane"], "needs-you")
+    self.assertIn("Review requested by contributor", pc_b1["reasons"])
+    self.assertFalse(any("conflict" in r.lower() for r in pc_b1["reasons"]))
+
+    # B2 & B3: Markdown clickable companion links without trailing (lbl) are detected as
+    # companions and never clobber an already-stored descriptive companion subject
+    store.upsert_artifact(
+        "gerrit:skia:1490010",
+        kind="gerrit",
+        title="1490010: [skparagraph] Companion contract test for 1490001",
+        state={"is_companion": True, "companion_to": "gerrit:skia:1490001"},
+        now=now + 80,
+    )
+    cid_md = "77777777-8888-4999-aaaa-bbbbbbbbbbbb"
+    tpath_md = os.path.join(
+        self.tmp_dir.name, cid_md, ".system_generated", "logs", "transcript.jsonl"
+    )
+    os.makedirs(os.path.dirname(tpath_md), exist_ok=True)
+    with open(tpath_md, "w", encoding="utf-8") as f:
+      f.write(
+          json.dumps({
+              "step_index": 0,
+              "type": "USER_INPUT",
+              "created_at": "2026-10-28T12:00:00Z",
+              "content": "Review https://skia-review.googlesource.com/c/skia/+/1490001",
+          })
+          + "\n"
+      )
+      f.write(
+          json.dumps({
+              "step_index": 1,
+              "type": "PLANNER_RESPONSE",
+              "created_at": "2026-10-28T12:15:00Z",
+              "content": (
+                  "Uploaded companion WIP CL "
+                  "[Skia CL 1490010 PS1](https://skia-review.googlesource.com/c/skia/+/1490010/1) "
+                  "and Chromium companion WIP CL "
+                  "[Chromium CL 8700010 PS1]"
+                  "(https://chromium-review.googlesource.com/c/chromium/src/+/8700010/1)"
+              ),
+              "tool_calls": [{"name": "run_command", "args": {"CommandLine": "git cl upload"}}],
+          })
+          + "\n"
+      )
+    ingestor.ingest_transcript_file(store, cid_md, cid_md, tpath_md, {}, now=now + 81)
+    art_sk_md = store.get_artifact("gerrit:skia:1490010") or {}
+    art_cr_md = store.get_artifact("gerrit:chromium:8700010") or {}
+    self.assertIn("Companion contract test", str(art_sk_md.get("title") or ""))
+    self.assertTrue(json.loads(art_cr_md.get("state_json") or "{}").get("is_companion"))
+
+    # B4: Unbound open companion whose closed parent aged out of cl_watcher_state (or was only
+    # context_only on another Work) still surfaces orphaned cleanup + human comment on virt parent
+    w_unrelated = store.create_work("Unrelated task", now=now + 85)
+    store.upsert_artifact(
+        "buganizer:400000999", kind="buganizer", title="b/400000999", now=now + 85
+    )
+    store.link_artifact(w_unrelated, "buganizer:400000999", role="primary", now=now + 85)
+    store.link_artifact(
+        w_unrelated, "github_pr:flutter/flutter:195000", role="context_only", now=now + 85
+    )
+    aged_parent_state: dict[str, Any] = {
+        "items": {
+            "github:195099@comp": {
+                "item_key": "github:195099",
+                "kind": "github",
+                "target_id": "195099",
+                "status": "OPEN",
+                "is_self": True,
+                "is_draft": True,
+                "is_companion": True,
+                "companion_to": "github:195000",
+                "ready_to_abandon": True,
+                "open_external_threads": 1,
+                "subject": "[web_paragraph] Companion tests for #195000",
+                "url": "https://github.com/flutter/flutter/pull/195099",
+            }
+        }
+    }
+    proj_b4 = store.build_dashboard_projection(cl_watcher_state=aged_parent_state, now=now + 86)
+    p_b4 = [w for w in proj_b4["works"] if w["work_id"] == "virt-github_pr:flutter/flutter:195000"]
+    self.assertEqual(len(p_b4), 1)
+    self.assertEqual(p_b4[0]["lane"], "needs-you")
+    self.assertTrue(any("comment on companion" in r.lower() for r in p_b4[0]["reasons"]))
+    self.assertTrue(any("orphaned companion" in r.lower() for r in p_b4[0]["reasons"]))
+
+    # B5: Inline PR bullet never stamps bug_title, single-quoted JSON hovercard masks /issues/<N>,
+    # and Draft Work with 'flutter#N' stub swaps to p_key without bypassing negative_links
+    self.assertEqual(
+        ingestor.extract_bug_titles_from_html_or_text("<li>PR #197777 — Render soft hyphens</li>"),
+        {},
+    )
+    hq_html = (
+        '<a data-hydro-click=\'{"url":"https://github.com/flutter/flutter/issues/197778"}\' '
+        'href="https://github.com/flutter/flutter/pull/197778">#197778</a>'
+    )
+    self.assertEqual(
+        [k for k, _, _ in ingestor.extract_artifacts_from_text(hq_html)],
+        ["github_pr:flutter/flutter:197778"],
+    )
+    w_draft_pr = store.create_work("Re: PR #197779 Soft hyphens", now=now + 90)
+    store.upsert_artifact(
+        "gmail_draft:d99", kind="gmail_draft", state={"status": "DRAFT"}, now=now + 90
+    )
+    store.link_artifact(w_draft_pr, "gmail_draft:d99", role="channel", now=now + 90)
+    store.upsert_artifact(
+        "github_issue:flutter/flutter:197779", title="flutter#197779", now=now + 90
+    )
+    store.link_artifact(
+        w_draft_pr, "github_issue:flutter/flutter:197779", role="primary", now=now + 90
+    )
+    store.upsert_artifact(
+        "github_pr:flutter/flutter:197779",
+        title="197779: Render soft hyphens",
+        state={"status": "OPEN"},
+        now=now + 90,
+    )
+    store.purge_config_artifacts_and_works(now=now + 91)
+    self.assertIn(w_draft_pr, {w["work_id"] for w in store.list_works()})
+    self.assertEqual(
+        store.get_work_artifact_roles(w_draft_pr).get("github_pr:flutter/flutter:197779"), "primary"
+    )
+    # Aged-out PR placeholder also beats an empty 'flutter#N' issue stub without bug_title
+    store.upsert_artifact(
+        "github_pr:flutter/flutter:197780", title="github_pr:flutter/flutter:197780", now=now + 92
+    )
+    store.upsert_artifact(
+        "github_issue:flutter/flutter:197780", title="flutter#197780", now=now + 92
+    )
+    store.purge_config_artifacts_and_works(now=now + 93)
+    self.assertIsNone(store.get_artifact("github_issue:flutter/flutter:197780"))
+    self.assertIsNotNone(store.get_artifact("github_pr:flutter/flutter:197780"))
+
+    # B6: Non-anchored 'Companion for/to' & singular 'companion fix' titles + title fallback
+    self.assertTrue(work_store.is_companion_title("195377: [web_paragraph] Companion for #195366"))
+    self.assertTrue(work_store.is_companion_title("[skparagraph] Companion fix to CL 1408158"))
+    self.assertEqual(
+        work_store.canonicalize_companion_parent(
+            "github_pr:flutter/flutter:195377",
+            state={"subject": "Soft hyphens tests"},
+            title="195377: Companion for #195366",
+        ),
+        "github_pr:flutter/flutter:195366",
+    )
+
 
 if __name__ == "__main__":
   unittest.main()
