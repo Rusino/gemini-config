@@ -3208,7 +3208,8 @@ def _is_worktree_lease_unexpired(
 
     _, pid = get_conversation_db_info(owner_cid, transcript_path)
     if pid and pid != "outside-of-project":
-      rdata = _read_json_file(roadmap.roadmap_path(pid))
+      # roadmap.json sits in the project dir; roadmap.py has no per-file path helper
+      rdata = _read_json_file(os.path.join(roadmap.project_dir(pid), "roadmap.json"))
       for it in rdata.get("items") or []:
         if (
             isinstance(it, dict)
@@ -3638,10 +3639,22 @@ def _check_and_claim_worktree_lease(
         _record_parallel_guard_block(guard_state_path, transcript_path)
         owner_label = db_title or existing.get("title") or owner_cid[:8]
         age_m = int(max(1, (now - eff_ts) // 60))
-        return (
+        head = (
             f"[WORKTREE LEASE GUARD] Worktree `{top_level}` is currently leased by "
             f"another active conversation (`{owner_label}` -> `conversation://{owner_cid}`, "
-            f"active {age_m}m ago). Sharing a single code worktree or `out/` build directory "
+            f"active {age_m}m ago). "
+        )
+        # A new worktree on an owned stack would only move the collision to the Change-Ids
+        if _worktree_holds_owned_stack(top_level, owner_cid):
+          return head + (
+              "Its branch carries a CL stack owned by that chat: do not work on the stack "
+              "here or in a new worktree. Send your change to that chat as a patch file or "
+              "ask the user to hand the stack over (the owner sets its roadmap item "
+              "todo/done). Only after the user "
+              f"explicitly confirms in a subsequent turn may you write `{override_path}`."
+          )
+        return head + (
+            "Sharing a single code worktree or `out/` build directory "
             f"between concurrent chats causes branch, build, and test collisions! "
             f"Create and use a separate git worktree (e.g. "
             f"`git -C {top_level} worktree add {top_level}_wt_{effective_cid[:6]} -b <branch>`) "
@@ -3658,6 +3671,271 @@ def _check_and_claim_worktree_lease(
       },
   )
   return ""
+
+
+CHANGE_LEASE_FILE = "jetski_change_leases.json"
+# Entries untouched for a week are dropped on write; liveness itself comes from activity checks
+CHANGE_LEASE_PRUNE_S = 7 * 86400
+CHANGE_LEASE_BASES = ("@{u}", "upstream/main", "upstream/master", "origin/main", "origin/master")
+# Option values that are not revisions in rebase / cherry-pick argument lists
+REBASE_VALUE_FLAGS = frozenset({"--onto", "-s", "--strategy", "-X", "--strategy-option", "-x",
+                                "--exec", "-m", "--mainline"})
+STACK_SUBCOMMANDS = ("commit", "rebase", "cherry-pick", "cl", "push")
+
+
+# Return who holds owner_cid's stack after since_ts per the owner's roadmap journal: owner_cid
+# when nothing happened, the target of a `state-move`, or "" once the holder sets any item to
+# todo/done (a hand-over). Missing project or journal keeps owner_cid
+def _roadmap_lease_holder(owner_cid: str, since_ts: float, transcript_path: str) -> str:
+  import collections
+
+  try:
+    from context_guard import get_conversation_db_info
+    import roadmap
+
+    _, pid = get_conversation_db_info(owner_cid, transcript_path)
+    if not pid or pid == "outside-of-project":
+      return owner_cid
+    with open(os.path.join(roadmap.project_dir(pid), "journal.jsonl"), encoding="utf-8") as f:
+      lines = collections.deque(f, 500)
+  except Exception:  # pylint: disable=broad-except
+    return owner_cid
+  # Journal stamps are fixed-width UTC, so string order is time order
+  since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since_ts))
+  holder = owner_cid
+  released = False
+  for line in lines:
+    try:
+      rec = json.loads(line)
+    except ValueError:
+      continue
+    if str(rec.get("ts")) < since or rec.get("conv") != holder:
+      continue
+    # A state-move passes the stack on, whatever the old chat released before
+    if rec.get("op") == "state-move" and rec.get("to"):
+      holder = str(rec["to"])
+      released = False
+    elif rec.get("op") == "set":
+      # Taking an item again after a release re-establishes the holder
+      released = rec.get("status") in ("todo", "done")
+  return "" if released else holder
+
+
+# Split cmd into git invocations with the directory each runs in: [(dir, subcommand, args)].
+# dir comes from the invocation's own -C, else the latest `cd` in the line, else ""; heredoc
+# bodies and unparsable segments are skipped
+def _git_invocations_with_dir(cmd: str) -> list[tuple[str, str, list[str]]]:
+  out: list[tuple[str, str, list[str]]] = []
+  cwd = ""
+  for seg in re.split(r"&&|\|\||;|\n", strip_heredocs(cmd)):
+    try:
+      tokens = shlex.split(seg.strip(), posix=True)
+    except ValueError:
+      continue
+    j = _advance_cmd_wrappers(tokens, 0, len(tokens))
+    if j < len(tokens) and tokens[j] == "cd" and j + 1 < len(tokens):
+      cwd = os.path.join(cwd, os.path.expanduser(tokens[j + 1]))
+      continue
+    if j >= len(tokens) or _clean_cmd_token(tokens[j]) != "git":
+      continue
+    run_dir = cwd
+    k = j + 1
+    while k < len(tokens) and tokens[k].startswith("-"):
+      if tokens[k] == "-C" and k + 1 < len(tokens):
+        run_dir = os.path.join(run_dir, os.path.expanduser(tokens[k + 1]))
+      k += 2 if tokens[k] in GIT_VALUE_FLAGS else 1
+    if k < len(tokens):
+      out.append((run_dir, tokens[k], tokens[k + 1:]))
+  return out
+
+
+# Return the Change-Ids in the commit messages of `git log <args>`, at most 30 commits
+def _change_ids_in_log(root: str, *args: str) -> list[str]:
+  raw = _git_out(root, "log", "-n", "30", "--format=%B%x01", *args)
+  return [ids[-1] for ids in map(CHANGE_ID_TRAILER_RE.findall, raw.split("\x01")) if ids]
+
+
+# Return (Change-Ids, claim) for the commits that the git invocations (sub, args) create,
+# rewrite or upload in root. Only what each command really rewrites counts, so a chat can
+# amend or rebase its own CL on top of another chat's stack. claim is False when nothing is
+# committed (cherry-pick -n, upload --dry-run): those are checked but never take a lease
+def _change_ids_touched(
+    root: str, invocations: list[tuple[str, list[str]]], cmd: str
+) -> tuple[list[str], bool]:
+  ids: list[str] = []
+  stack_refs: list[str] = []
+  claim = True
+  for sub, args in invocations:
+    positional: list[str] = []
+    k = 0
+    while k < len(args):
+      if args[k] in REBASE_VALUE_FLAGS:
+        k += 2
+        continue
+      if not args[k].startswith("-"):
+        positional.append(args[k])
+      k += 1
+    if sub == "commit" and "--help" not in args:
+      # --amend rewrites HEAD only; a new commit is known only by the trailer in its message
+      if "--amend" in args:
+        ids += _change_ids_in_log(root, "-1", "HEAD")
+      else:
+        ids += CHANGE_ID_TRAILER_RE.findall(_commit_message_from_cmd(cmd))[-1:]
+    elif sub == "rebase" and not any(a in ("--abort", "--quit", "--help", "--edit-todo",
+                                           "--show-current-patch") for a in args):
+      # An explicit upstream bounds the rewrite to upstream..HEAD; --root, a bare rebase and
+      # --continue rewrite the whole own stack
+      if positional and "--root" not in args:
+        ids += _change_ids_in_log(root, f"{positional[0]}..HEAD")
+      else:
+        stack_refs.append("HEAD")
+    elif sub == "cherry-pick" and not any(a in ("--abort", "--quit", "--skip") for a in args):
+      if "--continue" in args:
+        stack_refs.append("HEAD")
+      claim = claim and not ({"-n", "--no-commit"} & set(args))
+      # Picked commits keep their Change-Ids, so picking a leased CL is working on it
+      for rev in positional:
+        ids += _change_ids_in_log(root, *([rev] if ".." in rev else ["-1", rev]))
+    elif (sub == "cl" and args[:1] == ["upload"]) or (
+        sub == "push" and any(REFS_FOR_SPEC_RE.match(a) for a in args)):
+      claim = claim and "--dry-run" not in args and "-n" not in args
+      refs = [m.group(1) or "HEAD" for m in map(REFS_FOR_SPEC_RE.match, args) if m]
+      stack_refs += refs or ["HEAD"]
+  if stack_refs:
+    stack = _own_stack_change_ids(root, list(dict.fromkeys(stack_refs)), CHANGE_LEASE_BASES)
+    ids += [c for _, c in stack]
+  return list(dict.fromkeys(ids)), claim
+
+
+# Return (holder, title, last activity ts) when the lease entry belongs to another live chat,
+# else None. Same liveness as worktree leases: not archived or handed off, and active within
+# WORKTREE_LEASE_TTL_S (longer with a roadmap doing item); roadmap releases end it early
+def _active_foreign_change_lease(
+    entry: dict, effective_cid: str, top_level: str, transcript_path: str, now: float
+) -> tuple[str, str, float] | None:
+  ts = float(entry.get("ts") or 0.0)
+  holder = _roadmap_lease_holder(str(entry.get("conv_id") or ""), ts, transcript_path)
+  if not holder or holder == effective_cid:
+    return None
+  still_active, title = _is_conv_still_active_tip(holder, effective_cid, transcript_path)
+  if not still_active:
+    return None
+  unexpired, eff_ts = _is_worktree_lease_unexpired(holder, ts, top_level, transcript_path, now)
+  return (holder, title or str(entry.get("title") or ""), eff_ts) if unexpired else None
+
+
+# Check and update one repo's Change-Id leases under an flock on the common dir, so two hooks
+# cannot both claim a free stack or drop each other's entries. Returns the denial text or ""
+def _check_and_claim_change_leases(
+    root: str, ids: list[str], claim: bool, effective_cid: str, transcript_path: str,
+    artifact_dir: str,
+) -> str:
+  import fcntl
+
+  info = _resolve_git_dirs(root)
+  if not info:
+    return ""
+  top_level, _, common_dir = info
+  lease_file = os.path.join(common_dir, CHANGE_LEASE_FILE)
+  override_path, guard_state_path = _parallel_guard_paths(artifact_dir, effective_cid)
+  now = time.time()
+  fd = os.open(lease_file + ".lock", os.O_RDWR | os.O_CREAT, 0o644)
+  try:
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    data = _read_json_file(lease_file)
+    changes = data.get("changes") if isinstance(data.get("changes"), dict) else {}
+    # Liveness reads transcripts and the DB, so each foreign owner is evaluated once
+    verdicts: dict[str, tuple[str, str, float] | None] = {}
+    for change_id in ids if not os.path.exists(override_path) else []:
+      entry = changes.get(change_id)
+      owner = entry.get("conv_id") if isinstance(entry, dict) else ""
+      if not owner or owner == effective_cid:
+        continue
+      key = f"{owner}@{entry.get('ts')}"
+      if key not in verdicts:
+        verdicts[key] = _active_foreign_change_lease(
+            entry, effective_cid, top_level, transcript_path, now)
+      if not verdicts[key]:
+        continue
+      holder, title, eff_ts = verdicts[key]
+      _record_parallel_guard_block(guard_state_path, transcript_path)
+      age_m = int(max(1, (now - eff_ts) // 60))
+      where = f"branch `{entry.get('branch') or '?'}` in `{entry.get('worktree') or '?'}`"
+      return (
+          f"[CHANGE-ID LEASE GUARD] CL `{change_id}` is owned by `{title or holder[:8]}` "
+          f"(conversation://{holder}, active {age_m}m ago, {where}). Do not commit, amend, "
+          "rebase or upload it here. Send your change to that chat as a patch file (`git diff "
+          f"> {os.path.join(artifact_dir or '/tmp', 'scratch')}/<name>.patch`) or ask the user "
+          "to hand the stack over: the owner sets its roadmap item todo/done, then this chat "
+          "claims it. Only after the user explicitly confirms in a subsequent turn may you "
+          f"write `{override_path}`."
+      )
+    if not claim:
+      return ""
+    from context_guard import get_conversation_db_info
+
+    title, _ = get_conversation_db_info(effective_cid, transcript_path)
+    # Claiming refreshes ts, which also re-establishes a lease after a roadmap release
+    kept = {k: v for k, v in changes.items()
+            if isinstance(v, dict) and now - float(v.get("ts") or 0.0) < CHANGE_LEASE_PRUNE_S}
+    branch = _git_out(root, "symbolic-ref", "--short", "-q", "HEAD")
+    for change_id in ids:
+      kept[change_id] = {"conv_id": effective_cid, "title": title, "ts": now,
+                         "worktree": top_level, "branch": branch}
+    _write_json_atomic(lease_file, {"changes": kept})
+    return ""
+  finally:
+    os.close(fd)
+
+
+# Deny commit/amend/rebase/cherry-pick/upload commands on Change-Ids leased by another live
+# chat, else lease them to this chat (subagents count as their parent). Leases live in the git
+# common dir, so every worktree of a repo sees them; the user-confirmed
+# .parallel_chat_override.json of the worktree lease guard lifts the check
+def change_id_lease_denial(
+    cmd: str,
+    conv_id: str,
+    parent_conv_id: str,
+    transcript_path: str,
+    artifact_dir: str,
+    workspace_paths: list[str],
+    cwd: str = "",
+) -> str:
+  effective_cid = parent_conv_id or conv_id
+  # Parse before any git call: most run_command lines touch no stack and must stay free
+  invocations = [(d, sub, args) for d, sub, args in _git_invocations_with_dir(cmd)
+                 if sub in STACK_SUBCOMMANDS]
+  if not effective_cid or not invocations:
+    return ""
+  # Invocations without -C or cd run where the command runs (Cwd, else the workspace)
+  fallback = "" if all(d for d, _, _ in invocations) else _upload_repo_root(
+      cmd, _with_cwd(cwd, workspace_paths))
+  by_root: dict[str, list[tuple[str, list[str]]]] = {}
+  for run_dir, sub, args in invocations:
+    if run_dir and not os.path.isabs(run_dir):
+      run_dir = os.path.join(cwd or "", run_dir)
+    root = _git_out(run_dir, "rev-parse", "--show-toplevel") if run_dir else fallback
+    if root and not _is_shared_config_repo(root):
+      by_root.setdefault(root, []).append((sub, args))
+  for root, root_invocations in by_root.items():
+    ids, claim = _change_ids_touched(root, root_invocations, cmd)
+    denial = _check_and_claim_change_leases(
+        root, ids, claim, effective_cid, transcript_path, artifact_dir) if ids else ""
+    if denial:
+      return denial
+  return ""
+
+
+# Return True when top_level's own stack carries a Change-Id that owner_cid leases, i.e. the
+# worktree holds a stack owned by that chat rather than unrelated work
+def _worktree_holds_owned_stack(top_level: str, owner_cid: str) -> bool:
+  info = _resolve_git_dirs(top_level)
+  if not info:
+    return False
+  changes = _read_json_file(os.path.join(info[2], CHANGE_LEASE_FILE)).get("changes") or {}
+  owned = {k for k, v in changes.items() if isinstance(v, dict) and v.get("conv_id") == owner_cid}
+  return bool(owned) and any(
+      c in owned for _, c in _own_stack_change_ids(top_level, ["HEAD"], CHANGE_LEASE_BASES))
 
 
 def parallel_chat_isolation_denial(
@@ -5448,6 +5726,15 @@ def main() -> None:
           )
       )
       return
+    # Worktree leases do not cover a stack shared by several worktrees of one repo
+    if tool_name == "run_command":
+      lease_denial = change_id_lease_denial(
+          str(tool_args.get("CommandLine", "")), conv_id, parent_conv_id, transcript_path,
+          artifact_dir, workspace_paths, str(tool_args.get("Cwd") or ""),
+      )
+      if lease_denial:
+        print(json.dumps({"decision": "deny", "reason": lease_denial}, ensure_ascii=False))
+        return
 
   # Require subagent delegation when main-chat source-file reads exceed the turn cap
   if tool_name in READ_TOOLS:

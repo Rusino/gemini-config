@@ -123,10 +123,14 @@ To move chats/chains between projects, run `python3
     report the owner and wait, otherwise claim it with `roadmap.py set <id> <item> doing`.
   - **Worktree & shared-checkout guards (`hooks/pre_tool_guard.py`)**: If a code worktree is leased
     by another active chat (`[WORKTREE LEASE GUARD]`), create a separate linked worktree (`git
-    worktree add`). In shared checkouts (`~/.gemini/config`), stage and commit only your own files
-    with explicit pathspecs (`git add -- <files> && git commit -m "..." -- <files>`), and never `git
-    push` when `@{u}..HEAD` contains another active chat's commits (`[FOREIGN-COMMIT PUSH GUARD]`).
-    One deliverable document lives at one canonical path.
+    worktree add`) for unrelated work. In shared checkouts (`~/.gemini/config`), stage and commit
+    only your own files with explicit pathspecs (`git add -- <files> && git commit -m "..." --
+    <files>`), and never `git push` when `@{u}..HEAD` contains another active chat's commits
+    (`[FOREIGN-COMMIT PUSH GUARD]`). One deliverable document lives at one canonical path.
+  - **CL stacks (`[CHANGE-ID LEASE GUARD]`)**: amend, rebase, cherry-pick and upload lease the
+    Change-Ids they rewrite to the chat (subagents count as their parent) in all worktrees, until it
+    goes idle. A second chat may read, review, benchmark and write patch files for that stack, not
+    commit to it. Hand-over: the owner sets any roadmap item todo/done (releases all its stacks).
 - **Wrong-Chat / Cross-Project Scope Guard**:
   - If `[SCOPE GUARD: WRONG-CHAT / WRONG-PROJECT RADAR]` shows a new user request belongs to another
     project or foreign workspace (never a sibling chat in the same project), **do not** start
