@@ -33,6 +33,9 @@ description: "When editing source code or tests, writing code comments, commit m
 - Root-cause fixes only: no special-case branch for the failing input; keep layout, hit-testing,
   caret, selection and rendering consistent
 - Tests: no narrative comment before every assert; test domain edges, not C++ mechanics
+- Tests check behavior through the public API (`Paragraph`, `TextLine` visitors); internal state
+  (`runs()`, `clusters()`, run counts) only with a why-comment when that structure is the
+  contract, never as a precondition for reading glyphs
 - Hard limit of 100 columns for every line (`clang-format -style=file`)
 
 ## Commit messages, CL/PR descriptions, review replies
