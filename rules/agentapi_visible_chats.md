@@ -1,11 +1,14 @@
 ---
-trigger: always_on
-description: "Create user-visible chats via agentapi and manage chat lifecycle, titles, handoffs, roadmap batons, and reopening archived chats."
+trigger: model_decision
+description: "When creating or titling chats, handoff/continuation, next-task, finalize, reopening archived chats, roadmap.py actions, finishing a roadmap item (VCS baton, auto-ship), or moving chats between projects, backlog requests (в бэклог), starting a new non-trivial task."
 ---
 
 # Creating User-Visible Chats via `agentapi`
 
-When `agentapi new-conversation` runs from `run_command`, it inherits `ANTIGRAVITY_SOURCE_METADATA`, causing the server to mark `sourceMetadata.tool` and hide the chat from the sidebar. Always unset `ANTIGRAVITY_SOURCE_METADATA` (while preserving `ANTIGRAVITY_PROJECT_ID`), capture the output once into `OUT=$(...)`, and verify `"sourceMetadata": null` in the same command:
+When `agentapi new-conversation` runs from `run_command`, it inherits `ANTIGRAVITY_SOURCE_METADATA`,
+causing the server to mark `sourceMetadata.tool` and hide the chat from the sidebar. Always unset
+`ANTIGRAVITY_SOURCE_METADATA` (while preserving `ANTIGRAVITY_PROJECT_ID`), capture the output once
+into `OUT=$(...)`, and verify `"sourceMetadata": null` in the same command:
 
 ```bash
 OUT=$(env -u ANTIGRAVITY_SOURCE_METADATA agentapi new-conversation --title="..." "...") && \
@@ -13,19 +16,29 @@ ID=$(printf '%s' "$OUT" | grep -o '"conversationId": *"[^"]*"' | cut -d'"' -f4) 
 echo "ID=$ID" && agentapi get-conversation-metadata "$ID" | grep -E '"sourceMetadata"'
 ```
 
-- Never call `agentapi new-conversation` inside `$()` to extract the ID directly (avoid double execution).
-- On failed verification (`sourceMetadata != null`), stop and report `$ID` — do not blindly re-create duplicates. Before bulk creation, create and verify one chat first.
+- Never call `agentapi new-conversation` inside `$()` to extract the ID directly (avoid double
+  execution).
+- On failed verification (`sourceMetadata != null`), stop and report `$ID` — do not blindly
+  re-create duplicates. Before bulk creation, create and verify one chat first.
 
 ## Conversation Titles (`--title`) & Lifecycle
 
-- **One project = one task.** Every non-trivial task lives in its own project; all its chats (including handoff continuations) stay inside that project (`ANTIGRAVITY_PROJECT_ID` is inherited automatically by `handoff`). A project is only a grouping — do not clone or re-sync repositories per task.
-- **Format**: `[HH:MM] <marker> <Topic>` — strictly under 50 chars, plain text only, no project prefix, include short PR/CL/bug/commit ID when applicable. The time prefix and marker (`⦿` needs the user, `⏳` waiting) are mechanical side effects of `chat_lifecycle.py` — **never type or choose markers yourself**. Finished chats and handed-off chain pieces carry no special marker: they are archived (hidden from the sidebar, still found by search and opened by `conversation://`).
+- **One project = one task.** Every non-trivial task lives in its own project; all its chats
+  (including handoff continuations) stay inside that project (`ANTIGRAVITY_PROJECT_ID` is inherited
+  automatically by `handoff`). A project is only a grouping — do not clone or re-sync repositories
+  per task.
+- **Format**: `[HH:MM] <marker> <Topic>` — strictly under 50 chars, plain text only, no project
+  prefix, include short PR/CL/bug/commit ID when applicable. The time prefix and marker (`⦿` needs
+  the user, `⏳` waiting) are mechanical side effects of `chat_lifecycle.py` — **never type or choose
+  markers yourself**. Finished chats and handed-off chain pieces carry no special marker: they are
+  archived (hidden from the sidebar, still found by search and opened by `conversation://`).
 - **Concrete 2–6 word topics required (< 50 chars)**: `<Topic>` must consist of 2–6 specific
   words naming the concrete subsystem/component/bug/CL/PR and problem or action (e.g.
   `PR #194980 multi-span BiDi`, `FontCollection FaceCache thread safety`,
   `R27 Ban generic chat titles`).
   - **Strictly forbidden**: single-word titles (`Investigation`, `Debugging`, `Perf`, `Skia`),
-    bare entity IDs without a subject (`Gerrit 1405639`, `cl/1008075988`, `PR #12345`), generic filler combinations
+    bare entity IDs without a subject (`Gerrit 1405639`, `cl/1008075988`, `PR #12345`), generic
+    filler combinations
     (`Bug investigation`, `Code review`, `Fix issue`, `Task continuation`, `Исследование бага`),
     and Cyrillic characters (chat titles must strictly be in English). Never prefix a 5–8 digit
     Gerrit CL with `cl/<N>` in titles (`auto-title` uses `Gerrit <N>` or `crrev/c/<N>`).
@@ -55,28 +68,83 @@ Use only these commands (`python3 ~/.gemini/config/hooks/chat_lifecycle.py ...`)
 | `archive [<id...>] [--chain] [--project <p>] [--keep <N>]` | Archive chats/chains via LS RPC and `.pbtxt`, or prune project `<p>` keeping `<N>` newest. |
 | `auto-archive [--hook]` | Prune older chats across projects with retention policies. |
 
-To move chats/chains between projects, run `python3 ~/.gemini/config/scripts/move_chats_to_project.py --project "<name_or_id>" [--chain] --restart <id...>` or `--list-unassigned`.
+To move chats/chains between projects, run `python3
+~/.gemini/config/scripts/move_chats_to_project.py --project "<name_or_id>" [--chain] --restart
+<id...>` or `--list-unassigned`.
 
 ## Backlog & Scope Invariants across Handoff Chains
 
-- **In-project chats: Epic Roadmap via `roadmap.py` only**: Manage the project roadmap exclusively via `python3 ~/.gemini/config/hooks/roadmap.py add|set|link|show|edit|reorder|move ...` (never edit `~/.gemini/config/roadmaps/` files directly, except the chain state file from `roadmap.py state-path <id>`).
-  - **Backlog requests ("в бэклог: X")**: run `roadmap.py add <id> "X"`, confirm on one line (or bulleted list separated by blank lines for multiple items), then continue current work.
+- **In-project chats: Epic Roadmap via `roadmap.py` only**: Manage the project roadmap exclusively
+  via `python3 ~/.gemini/config/hooks/roadmap.py add|set|link|show|edit|reorder|move ...` (never
+  edit `~/.gemini/config/roadmaps/` files directly, except the chain state file from `roadmap.py
+  state-path <id>`).
+  - **Backlog requests ("в бэклог: X")**: run `roadmap.py add <id> "X"`, confirm on one line (or
+    bulleted list separated by blank lines for multiple items), then continue current work.
   - **Finishing a task (no automatic `next-task` proposals)**:
-    - Once the current roadmap item is completed and marked `done` (`roadmap.py set <id> <R_prev> done`), obey the `[VCS BATON: ...]` line printed by `roadmap.py` and **never** ask the user which roadmap item to take next (`"Какую задачу из роадмапа берём в работу следующей?"`) or propose `next-task` unless the user explicitly asks what is next in the roadmap:
+    - Once the current roadmap item is completed and marked `done` (`roadmap.py set <id> <R_prev>
+      done`), obey the `[VCS BATON: ...]` line printed by `roadmap.py` and **never** ask the user
+      which roadmap item to take next (`"Какую задачу из роадмапа берём в работу следующей?"`) or
+      propose `next-task` unless the user explicitly asks what is next in the roadmap:
       - **`[VCS BATON: PENDING ...]`**:
-        - **Personal repos on `main` (`~/.gemini/config`, `~/.gemini/jetski/scratch/skia_gardener`)**: auto-ship directly without `ask_question` via `python3 ~/.gemini/config/hooks/auto_ship.py ship <id> --repo <repo> -m "<English commit message>"` (commits only `own_dirty` pathspecs, respects `[FOREIGN-COMMIT PUSH GUARD]`, runs post-push rebuild/restart for Gardener & Flight Deck, and syncs clean Mac clones via `context_guard.py`) and include the printed `committed and pushed: <sha> -> origin/main` line in your reply (`stop_guard.py` emits `[AUTO-SHIP]` if skipped; honor user opt-outs like *"не коммить"* / *"not now"*).
-        - **Gerrit, GitHub PR repos, or non-`main` branches**: call `ask_question` with options `(Recommended) Commit + push`, `Commit only`, `Not now`. Stage and commit ONLY `own_dirty` files using explicit pathspecs (`git add -- <files> && git commit -m "..." -- <files>`), never `foreign_dirty` files. For Gerrit repos, `Commit + push` runs `amnesia-precommit` + mandatory corpus gate when touching `modules/{skparagraph,skunicode,skshaper}/` or `lib/web_ui/lib/` (`run_flutter_paragraph_tests.py` / `run_webparagraph_corpus.py`) + `git cl upload`, never setting CQ (`CQ+1`/`CQ+2`) or `Auto-Submit+1`. `stop_guard` blocks turn end if `done` was marked in the current turn while a non-personal VCS baton is `PENDING` without calling `ask_question`. Once the user chooses an action, execute it and explicitly confirm in plain text that commit and push (or commit only) have been completed.
-      - **`[VCS BATON: CLEAN ...]`**: Explicitly state in plain text that changes are already committed and pushed (e.g. `Изменения закоммичены и запушены: <sha> → origin/main`) or uploaded to Gerrit (`[Gerrit <N> PS <M>](<gerrit url>)`, never bare `cl/<N>`: that opens a google3 Piper CL) without asking, leaving zero doubt for the user. Never output an ambiguous bare SHA without stating that it is already committed and pushed.
-      - **After reporting the completed work and VCS status**: **stop cleanly without proposing `next-task` or asking what roadmap item to work on next**. Also, in a continuation chat (`Piece #2+` of a handoff chain), always include a self-contained summary of the original problem/request and all changes made across the chain so the user does not have to open archived predecessor chats to see what was done.
+        - **Personal repos on `main` (`~/.gemini/config`,
+          `~/.gemini/jetski/scratch/skia_gardener`)**: auto-ship directly without `ask_question` via
+          `python3 ~/.gemini/config/hooks/auto_ship.py ship <id> --repo <repo> -m "<English commit
+          message>"` (commits only `own_dirty` pathspecs, respects `[FOREIGN-COMMIT PUSH GUARD]`,
+          runs post-push rebuild/restart for Gardener & Flight Deck, and syncs clean Mac clones via
+          `context_guard.py`) and include the printed `committed and pushed: <sha> -> origin/main`
+          line in your reply (`stop_guard.py` emits `[AUTO-SHIP]` if skipped; honor user opt-outs
+          like *"не коммить"* / *"not now"*).
+        - **Gerrit, GitHub PR repos, or non-`main` branches**: call `ask_question` with options
+          `(Recommended) Commit + push`, `Commit only`, `Not now`. Stage and commit ONLY `own_dirty`
+          files using explicit pathspecs (`git add -- <files> && git commit -m "..." -- <files>`),
+          never `foreign_dirty` files. For Gerrit repos, `Commit + push` runs `amnesia-precommit` +
+          mandatory corpus gate when touching `modules/{skparagraph,skunicode,skshaper}/` or
+          `lib/web_ui/lib/` (`run_flutter_paragraph_tests.py` / `run_webparagraph_corpus.py`) + `git
+          cl upload`, never setting CQ (`CQ+1`/`CQ+2`) or `Auto-Submit+1`. `stop_guard` blocks turn
+          end if `done` was marked in the current turn while a non-personal VCS baton is `PENDING`
+          without calling `ask_question`. Once the user chooses an action, execute it and explicitly
+          confirm in plain text that commit and push (or commit only) have been completed.
+      - **`[VCS BATON: CLEAN ...]`**: Explicitly state in plain text that changes are already
+        committed and pushed (e.g. `Изменения закоммичены и запушены: <sha> → origin/main`) or
+        uploaded to Gerrit (`[Skia CL <N> PS<M>](<gerrit url>)`, never bare `cl/<N>`: that opens a
+        google3 Piper CL) without asking, leaving zero doubt for the user. Never output an ambiguous
+        bare SHA without stating that it is already committed and pushed.
+      - **After reporting the completed work and VCS status**: **stop cleanly without proposing
+        `next-task` or asking what roadmap item to work on next**. Also, in a continuation chat
+        (`Piece #2+` of a handoff chain), always include a self-contained summary of the original
+        problem/request and all changes made across the chain so the user does not have to open
+        archived predecessor chats to see what was done.
   - **Spin-offs**: run `roadmap.py link <id> <item ID> <new_chat_id>`.
-  - **At handoff / `next-task`**: give a 1-line handoff summary alongside `[👉 <Title>](conversation://<new_conversation_id>)`; never dump the roadmap into the final message (the open view auto-switches to the new chat).
+  - **At handoff / `next-task`**: give a 1-line handoff summary alongside `[👉
+    <Title>](conversation://<new_conversation_id>)`; never dump the roadmap into the final message
+    (the open view auto-switches to the new chat).
 - **Parallel chats in one project share resources — claim before touching**:
-  - Run `roadmap.py show` before editing or building; if an item is `doing` in another live chat, report the owner and wait, otherwise claim it with `roadmap.py set <id> <item> doing`.
-  - **Worktree & shared-checkout guards (`hooks/pre_tool_guard.py`)**: If a code worktree is leased by another active chat (`[WORKTREE LEASE GUARD]`), create a separate linked worktree (`git worktree add`). In shared checkouts (`~/.gemini/config`), stage and commit only your own files with explicit pathspecs (`git add -- <files> && git commit -m "..." -- <files>`), and never `git push` when `@{u}..HEAD` contains another active chat's commits (`[FOREIGN-COMMIT PUSH GUARD]`). One deliverable document lives at one canonical path.
+  - Run `roadmap.py show` before editing or building; if an item is `doing` in another live chat,
+    report the owner and wait, otherwise claim it with `roadmap.py set <id> <item> doing`.
+  - **Worktree & shared-checkout guards (`hooks/pre_tool_guard.py`)**: If a code worktree is leased
+    by another active chat (`[WORKTREE LEASE GUARD]`), create a separate linked worktree (`git
+    worktree add`). In shared checkouts (`~/.gemini/config`), stage and commit only your own files
+    with explicit pathspecs (`git add -- <files> && git commit -m "..." -- <files>`), and never `git
+    push` when `@{u}..HEAD` contains another active chat's commits (`[FOREIGN-COMMIT PUSH GUARD]`).
+    One deliverable document lives at one canonical path.
 - **Wrong-Chat / Cross-Project Scope Guard**:
-  - If `[SCOPE GUARD: WRONG-CHAT / WRONG-PROJECT RADAR]` shows a new user request belongs to another project or foreign workspace (never a sibling chat in the same project), **do not** start investigating or running commands — warn the user with `[👉 <Title>](conversation://<target_conv_id>)` and offer `env -u ANTIGRAVITY_SOURCE_METADATA agentapi send-message <target_conv_id> "<user message>"`. `pre_tool_guard.py` blocks cross-project edits/commits unless the user explicitly confirms in a subsequent turn (`.cross_project_override.json` / `.parallel_chat_override.json`).
+  - If `[SCOPE GUARD: WRONG-CHAT / WRONG-PROJECT RADAR]` shows a new user request belongs to another
+    project or foreign workspace (never a sibling chat in the same project), **do not** start
+    investigating or running commands — warn the user with `[👉
+    <Title>](conversation://<target_conv_id>)` and offer `env -u ANTIGRAVITY_SOURCE_METADATA
+    agentapi send-message <target_conv_id> "<user message>"`. `pre_tool_guard.py` blocks
+    cross-project edits/commits unless the user explicitly confirms in a subsequent turn
+    (`.cross_project_override.json` / `.parallel_chat_override.json`).
 - **Handoff Integrity (`Epic Roadmap` + `Immediate Next Step`)**:
   - Never drop or shrink pending `[ ]` roadmap items during handoff.
-  - Label untested ideas as **`[UNVERIFIED HYPOTHESIS]`** (never `"Decided to do X"`) and record rejected approaches (`Rejected: <approach> because <reason>`).
-  - On continuation start, run `roadmap.py show`, verify the state file against `git status`/tests, and check that any proposed design was proven in code.
-  - Never ask whether to finalize, never silently auto-unarchive archived chats, and never query SQLite or hook sources directly for lifecycle state. When the user asks to route or continue work in the chat that previously handled an item and `status <id>` shows its latest leaf `<leaf_id>` has `is_archived: true`, do **not** silently spawn a duplicate chat — ask the user via `ask_question` whether to unarchive `<leaf_id>` (`chat_lifecycle.py reopen <leaf_id>`, re-claiming/linking any roadmap item to `<leaf_id>`, then sending the message there) or start a fresh chat instead.
+  - Label untested ideas as **`[UNVERIFIED HYPOTHESIS]`** (never `"Decided to do X"`) and record
+    rejected approaches (`Rejected: <approach> because <reason>`).
+  - On continuation start, run `roadmap.py show`, verify the state file against `git status`/tests,
+    and check that any proposed design was proven in code.
+  - Never ask whether to finalize, never silently auto-unarchive archived chats, and never query
+    SQLite or hook sources directly for lifecycle state. When the user asks to route or continue
+    work in the chat that previously handled an item and `status <id>` shows its latest leaf
+    `<leaf_id>` has `is_archived: true`, do **not** silently spawn a duplicate chat — ask the user
+    via `ask_question` whether to unarchive `<leaf_id>` (`chat_lifecycle.py reopen <leaf_id>`,
+    re-claiming/linking any roadmap item to `<leaf_id>`, then sending the message there) or start a
+    fresh chat instead.

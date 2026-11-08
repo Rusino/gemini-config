@@ -1,16 +1,20 @@
 ---
-description: C++ systems programming invariants (RAII, zero-allocation hot paths, type bifurcation, loop guards, ABI stability).
 trigger: always_on
+description: "C++ systems invariants for all Skia and engine code."
 ---
+
 # C++ Systems Invariants
 
-1. **Type Bifurcation:** Ensure clear separation between types meant for physical representation versus those meant for logic or temporary structures.
-2. **Fail-fast Dimensional Honesty:** Dimensions and boundaries must be strictly validated at the earliest possible point. Fail fast rather than silently corrupting state.
-3. **Zero-allocation Hot Paths:** Hot paths (e.g., layout, rendering loops) must absolutely not perform dynamic memory allocations (no `new`, `malloc`, or implicit allocations like `std::string` copies or growing `std::vector`s). 
-4. **Loop Guards:** All loops MUST have guaranteed termination. Use loop guards or static analysis invariants to prove termination.
-5. **No Compiler Warnings Suppression:** Do not suppress compiler warnings (e.g. via `#pragma GCC diagnostic ignored`). Warnings are errors and must be fixed at the source.
-6. **KEEPER-DEBT Markers:** Use explicit `// KEEPER-DEBT:` comments when introducing intentional temporary technical debt, specifying why and a condition for removal.
-7. **Frozen ABI Stability:** For exposed APIs and structures, the Application Binary Interface (ABI) is frozen. Changes must not alter existing structure layouts, virtual table orders, or exported symbols in ways that break backwards compatibility.
-8. **Contract Honesty:** Never invert, negate, or loosen test assertions to make tests pass against unfixed code. Tests must assert required contract behavior, never character-pin accidental failures.
-9. **Public Headers Compile Clean Under Clang Header Warnings:** Skia compiles every public header (`include/`, `modules/*/include/`) via `tools/public_headers_warnings_check.cpp` with config `warnings_for_public_headers` (`gn/skia/BUILD.gn`): `-Wunused-parameter -Wsign-conversion -Wshorten-64-to-32` plus `-Werror`, clang only. Any inline body in a public header (virtual defaults, stubs, forwarding overloads), including code suggested in companion CLs and review comments, must leave unused parameters unnamed (`SkScalar /*firstLineIndent*/`, as in `include/core/SkStream.h`) and avoid implicit sign or 64->32 conversions. A local `out/Debug` with empty `args.gn` builds with GCC (`is_clang=false`) and skips these flags, so a green local `dm` proves nothing here. Before proposing or uploading a public-header change, run from the Skia checkout root: `printf '#include "<header>"\n' > /tmp/ph_check.cpp && ~/.gemini/jetski/scratch/clang_linux/bin/clang++ -std=c++20 -fsyntax-only -I. -Werror -Wunused-parameter -Wsign-conversion -Wshorten-64-to-32 /tmp/ph_check.cpp`. Incident: Gerrit 1409697 PS4 (https://skia-review.googlesource.com/c/skia/+/1409697/4) broke `Build-Ubuntu24.04-Clang-x86_64-Debug-FreeType_ASAN` with `unused parameter 'firstLineIndent'` in `Paragraph.h`.
-10. **No Backend-Specific Font Metric Pinning in Cross-Platform Tests:** Cross-platform tests (Mac, Windows, Linux, Android, iOS across FreeType, Fontations, CoreText, DirectWrite, GDI, Android NDK) must never compare font-derived outputs (`glyph.width()`, `glyph.height()`, `getBounds()`, advances, `SkFontMetrics`, mask dimensions, or system-font `SkGlyphID`s) against hardcoded non-zero numbers. Note that `--fontations` only switches `ToolUtils::TestFontScanner()`, while `--nativeFonts` makes `ToolUtils::TestFontMgr()` (`tools/fonts/FontToolUtils.cpp`) return the platform font manager (e.g. CoreText on Mac `NativeFonts_Fontations` bots, where `SkScalerContext_Mac::generateMetrics` in `src/ports/SkScalerContext_mac_ct.cpp` calls `mx.bounds.outset(1, 1)`). Allowed assertions: (a) backend-independent invariants or the exact predicate under test (e.g. `SkComputeDistanceFieldSize(glyph.width(), glyph.height()) == 0`, inequalities, relative ordering), (b) values computed by the same backend in the same test, or (c) explicit backend/platform guards (`#if`, specific `SkFontMgr_New_*`, or font manager type check) with a comment explaining why. Before uploading or submitting a font-backed test, verify which bots and font managers run it (`--nativeFonts`, `--fontations`, `TestFontMgr()`) and trigger trybots covering those backends (specifically Mac `NativeFonts` / `NativeFonts_Fontations`). Incident: Gerrit 1404196 (https://skia-review.googlesource.com/c/skia/+/1404196, `3d70807b95`) pinned FreeType bounds `4071x65527` in `SkRemoteGlyphCache_b576664769`, passed Linux/Windows trybots, broke Mac14/Mac15 `NativeFonts_Fontations` post-submit, and was fixed in Gerrit 1411716 (https://skia-review.googlesource.com/c/skia/+/1411716).
+1. **Type bifurcation:** keep types for physical representation apart from logic or temporary types
+2. **Fail-fast dimensional honesty:** validate dimensions and bounds at the earliest point; fail
+   fast instead of corrupting state
+3. **Zero-allocation hot paths:** no `new`, `malloc`, `std::string` copies or growing vectors in
+   layout and rendering loops
+4. **Loop guards:** every loop provably terminates
+5. **No warning suppression:** never `#pragma ... diagnostic ignored`; fix the source
+6. **`// KEEPER-DEBT:`** marks intentional temporary debt, with the reason and removal condition
+7. **Frozen ABI:** never change existing public struct layouts, vtable order or exported symbols
+   in ways that break backward compatibility
+8. **Contract Honesty:** never invert, negate or loosen asserts to make tests pass against unfixed
+   code; tests assert the required contract, not accidental behavior
+9. Public headers and font-backed tests: see `skia_headers_and_font_tests.md`

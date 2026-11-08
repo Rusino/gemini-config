@@ -1,0 +1,125 @@
+[
+ {
+  "name": "informal ты",
+  "regex": "ты"
+ },
+ {
+  "name": "feminine gender",
+  "regex": "feminine"
+ },
+ {
+  "name": "no flattery",
+  "regex": "flatter"
+ },
+ {
+  "name": "falsify user hypotheses",
+  "regex": "falsif"
+ },
+ {
+  "name": "no capitulation without evidence",
+  "regex": "capitulat|new (technical )?evidence"
+ },
+ {
+  "name": "reply language = user's last message",
+  "regex": "language of the user"
+ },
+ {
+  "name": "domain terms in English",
+  "regex": "terms? in English"
+ },
+ {
+  "name": "Cyrillic transliteration",
+  "regex": "translit"
+ },
+ {
+  "name": "blank lines between items",
+  "regex": "blank line"
+ },
+ {
+  "name": "ET time zone",
+  "regex": "New York|\\bET\\b"
+ },
+ {
+  "name": "clickable links",
+  "regex": "\\[label\\]\\(https?://"
+ },
+ {
+  "name": "Gerrit is not cl/",
+  "regex": "cl/<N>"
+ },
+ {
+  "name": "English in review and VCS",
+  "regex": "English"
+ },
+ {
+  "name": "never publish or resolve without asking",
+  "regex": "never publish"
+ },
+ {
+  "name": "no CQ / Auto-Submit votes",
+  "regex": "Commit-Queue|CQ"
+ },
+ {
+  "name": "one Assisted-by trailer",
+  "regex": "Assisted-by"
+ },
+ {
+  "name": "SkoreText confidentiality",
+  "regex": "SkoreText"
+ },
+ {
+  "name": "100 columns",
+  "regex": "100 c(ol|har)",
+  "scope": "any"
+ },
+ {
+  "name": "comment style why-not-what",
+  "regex": "why",
+  "scope": "any"
+ },
+ {
+  "name": "CanvasKit felt suite (not hook-enforced)",
+  "regex": "CanvasKit"
+ },
+ {
+  "name": "ask_question for choices",
+  "regex": "ask_question"
+ },
+ {
+  "name": "no next-task proposal",
+  "regex": "next-task"
+ },
+ {
+  "name": "never Model=pro",
+  "regex": "pro\\b"
+ },
+ {
+  "name": "read definitions before calls",
+  "regex": "declaration|definition"
+ },
+ {
+  "name": "zero-allocation hot paths",
+  "regex": "allocat",
+  "scope": "any"
+ },
+ {
+  "name": "contract honesty",
+  "regex": "Contract Honesty|loosen"
+ },
+ {
+  "name": "decision guard policy triage",
+  "regex": "policy"
+ },
+ {
+  "name": "active reviewer check",
+  "regex": "id -u"
+ },
+ {
+  "name": "untrusted bug text",
+  "regex": "untrusted"
+ },
+ {
+  "name": "MCP server names google_*_google_*",
+  "regex": "google_chat_google_chat"
+ }
+]

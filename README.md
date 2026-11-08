@@ -4,12 +4,19 @@ Personal global rules, lifecycle hooks, and configuration for Jetski (`~/.gemini
 
 ## Contents
 
-- `rules/` — Global agent rules:
-  - `agentapi_visible_chats.md` — Creating user-visible chats via `agentapi`, `chat_lifecycle.py` title/handoff management, and `roadmap.py` epic backlog invariants.
-  - `code_style.md` — Code style, comment invariants, YAGNI, `SkASSERT` contracts, `<= 100` column limit, and English-only review surface.
-  - `communication_style.md` — Communication and collaboration preferences (informal address, grammatical gender, critical & objective evaluation without sycophancy, Open Source / Git workflow).
-  - `outgoing_text_verification.md` — Zero-trust verification across all incoming and outgoing documents/texts (`amnesia-doc-check`) and code changes/snippets (`amnesia-precommit`).
-  - `subagent_exploration.md` — Context hygiene (delegating broad codebase exploration to subagents), gating batch workflows with `advanced.verify`, and reading API definitions before writing calls.
+- `rules/` — Global agent rules. `always_on` rules are injected into every turn and stay under
+  20 KB (`python3 scripts/context_budget.py` measures size, duplicates and required phrases;
+  Jetski demotes rules above 20,000 tokens). `model_decision` rules load when their description
+  matches the task. Why each rule exists: `INCIDENTS.md`.
+  - Always on: `communication_style.md` (core: address, language, pushback, links, review/VCS
+    boundaries), `clickable_links.md`, `code_style.md`, `outgoing_text_verification.md`,
+    `subagent_exploration.md`, `decision_guard.md`, `reviewer_selection.md`, plus
+    `plugins/keeper/rules/cpp_systems_invariants.md`.
+  - On demand: `agentapi_visible_chats.md`, `reports_and_cl_lists.md`, `test_runs.md`,
+    `gmail_drafts.md`, `bug_reading_authorization.md`, `bug_closing_fixed_by.md`,
+    `security_merge_reassign.md`, plus `plugins/keeper/rules/{text_domain_invariants,
+    skia_headers_and_font_tests}.md`. Commit message format lives in
+    `skills/amnesia-precommit/references/commit_message.md`.
 - `hooks.json` and `hooks/` — Lifecycle guard hooks:
   - `context_guard.py` — Monitors conversation context size and turn iteration limits, triggers automatic continuation handoffs (with timezone-aware `[HH:MM]` prefixes via `JETSKI_TIMEZONE`), and enforces the Two-Strike Debug Guard on consecutive command failures.
   - `pre_tool_guard.py` — Prevents blind edits without reading (`view_file` / `read_file`), blocks edits to generated/gitignored build caches, blocks direct roadmap edits outside `roadmap.py`, gates batch agent workflows on `advanced.verify`, gates `git commit` / `git cl upload` / `gh pr create` after source edits on `amnesia-precommit` audit scripts (`CODE-CHECK GUARD`), gates Google Docs `update_doc` calls on `check_doc_grounding.py` (`DOC-CHECK GUARD`), blocks infinite `tail -f` background daemons, verifies that handoff summaries exist before launching continuations, auto-enriches handoff snapshots, and cleans up orphaned task log processes on handoff.

@@ -9,7 +9,7 @@ description: >-
 
 # Code Comment Curator (`code-comments`)
 
-Curate code comments so that every remaining or newly added comment earns its place by explaining **why** — never **what** — in clear, compact English, enforcing all comment and ownership rules from [`rules/code_style.md` Section 1](file:///usr/local/google/home/jlavrova/.gemini/config/rules/code_style.md#L5-L17).
+Curate code comments so that every remaining or newly added comment earns its place by explaining **why** — never **what** — in clear, compact English, enforcing all comment and ownership rules from [`rules/code_style.md` Comments](file:///usr/local/google/home/jlavrova/.gemini/config/rules/code_style.md#L6-L15).
 
 ## 1. Comment Taxonomy: Add, Rewrite, or Delete
 

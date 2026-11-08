@@ -82,8 +82,8 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
    - **Description gate (`TESTED BLOCK:` line)**: on `ALL GREEN` for an open CL, `triage` checks
      the current patchset's commit message and prints `TESTED BLOCK: OK` or
      `TESTED BLOCK: STALE (missing: ...)`. On `STALE`, update the `Tested:` block from the
-     latest local runs and trybots (`rules/code_style.md` §6) and re-upload with
-     `--commit-description=+` before the final summary. A description-only patchset
+     latest local runs and trybots (`skills/amnesia-precommit/references/commit_message.md`)
+     and re-upload with `--commit-description=+` before the final summary. A description-only patchset
      (`NO_CODE_CHANGE`) gets no new tryjobs; `triage` and `watch` read the tryjobs of the last
      patchset with code, so do not re-trigger ASAN for it.
    - **On Red Canary (`CL_SUSPECTED_REGRESSION`)**: Report the failing target, `somepath` chain,
@@ -140,7 +140,7 @@ In addition, when a diff adds or modifies C++ tests using `TestFontMgr()`, `Defa
 `Test-Mac14-Clang-MacMini8.1-CPU-AVX2-x86_64-Debug-All-NativeFonts_Fontations` (`[ALWAYS_RUN]`).
 This ensures `--nativeFonts` (CoreText, where `SkScalerContext_Mac::generateMetrics` outsets bounds
 by 1) and `--fontations` are exercised before submit, preventing font-backend-specific test
-breakages on Mac trybots (`cpp_systems_invariants.md` #10; Gerrit 1404196 -> 1411716).
+breakages on Mac trybots (`skia_headers_and_font_tests.md`; Gerrit 1404196 -> 1411716).
 
 ### Android `NativeFonts` Trybot Caveat (`--paragraph_fonts extra_fonts` Omitted)
 

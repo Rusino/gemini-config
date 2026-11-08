@@ -1,33 +1,28 @@
 ---
 trigger: always_on
-description: "Prevent context pollution, optimize test-running model costs, gate batch workflows with advanced.verify, and read headers before writing code."
+description: "Context hygiene: when to delegate to subagents, which model, and grounding API calls."
 ---
 
-# Context Hygiene, Batch Verification & API Grounding
+# Context Hygiene and Delegation
 
-- **Task Sizing & Subagent Model Routing (`invoke_subagent`)**:
-  - **`< 3` tool calls** (targeted file read, single `code_search` / `git grep`): Execute directly in the main conversation (0 subagents).
-  - **`3–15` tool calls** (subsystem exploration, tracing call graphs across >3–4 files, or clean-context Hunter/Skeptic audit): Delegate to an isolated subagent (`invoke_subagent`).
-    - **Model routing for `research-google`**: Restrict `Model="flash"` strictly to mechanical path, symbol, or file-existence lookups. Route all non-trivial semantic code research, call-graph tracing, root-cause bug investigation, and cross-layer invariant analysis to `Model="inherit"` (never `Model="pro"`, which routes to the unreliable `gemini-3.1-pro` bucket).
-    - **Model routing for `keeper_inquisitor` and `keeper_skeptic`**: Default routine `keeper_skeptic` batches to `Model="flash"`; route `keeper_inquisitor` and escalate `keeper_skeptic` to `Model="inherit"` (never `Model="pro"`) for deep concurrency, BiDi/UTF-8/UTF-16/grapheme math, dropped historical guards (`git log -S`), or cross-backend symmetry (`XFAMILY_REFUTE`).
-  - **`> 15` tool calls or multi-item fan-outs**: Use `run_workflow` (`parallel` / `pipeline`) or partitioned subagents so the main context stays clean.
-  - **Subagent Corpus Sharding (`<= 150 KB` or `<= 10` files per turn)**: Never dump expansive document or source directories (`references/`, `g3doc/`, full module trees) into a single subagent context. Shard inputs so each subagent processes at most `150 KB` or `10` files per turn.
-  - **Statutory Deference / Goodhart's Law Guard**: When evaluating code health, contracts, or invariants, never defer to a broken local pattern or withdraw a valid critique merely because an existing file or local comment codifies the degraded pattern. Evaluate findings against core C++/text domain and harness invariants (`cpp_systems_invariants.md`, `text_domain_invariants.md`, `code_style.md`).
-- **Test-Running & Roll-Triage Skills Model Routing (`exit_plan_mode` vs. `Model="flash"`)**:
-  - **Direct test runs in Plan Mode (`skia-test-paragraph`, `flutter-test-paragraph-engine`, `webparagraph-corpus`)**: Do not execute the build/test orchestrator on the planning model (overriding the default Plan Mode rule that allows read-only build/test commands). Immediately call `exit_plan_mode` with a 1-step plan specifying: (1) the exact script command line, (2) a strict ban on adding unrequested bypass flags (`--allow-dirty-flutter`, `--allow-dirty-skia`, `--allow-skia-base-mismatch`, `--skip-build`, `--skip-cpp`, `--skip-analyze`, `--no-force-test-fonts`), (3) the mandatory requirement to paste `<out>/compare.md` (including `Паспорт прогона (Run Attestation)` and `Вердикт целостности (Integrity Check)`) verbatim without column/row truncation, and (4) `Re-plan if: pre-flight/build fails, Integrity Check is WARNING / INVALID, or test regressions are detected`.
-  - **Direct roll triage in Plan Mode (`skia-roll-triage`)**: Immediately call `exit_plan_mode` with `cd /usr/local/google/home/jlavrova/.gemini/jetski/scratch/skia_gardener && go run . -triage-google3` to output the stdout Markdown triage report directly on the execution model (`Re-plan if:` the verdict is `SKIA_REGRESSION` or a failing dependent target cites Skia symbols and requires bisecting or source inspection).
-  - **In-workflow test gates & failure-log extraction (`amnesia-precommit` Corpus Gate, `perf-optimization-loop`, or multi-step debugging outside Plan Mode)**: Delegate orchestrator execution and raw failure-log triage (`ninja.log`, `dm.log`, `txt_unittests.log`, `ui_unittests.log`, `batch*.log`, `shards/shard_*.log`, `analyze.log`, `felt.log`, `flutter.log`) to `invoke_subagent(TypeName="self", Model="flash")` so multi-thousand-line compiler/test logs stay out of the main context window. Instruct the subagent via prompt to return the `<out>/compare.md` path, exit status, and extracted stack traces / failing assertions, then read `<out>/compare.md` directly when presenting the verbatim attestation table to the user.
-- **Gate Batch Agent Workflows with `advanced.verify` (`run_workflow`)**:
-  - Whenever orchestrating a batch task via `run_workflow` that spawns multiple agents (`parallel` or `pipeline` with `agent(...)`) to port commits, edit files, triage bugs, or audit modules, always import `from advanced import parallel, verify` and gate each item's output (or the aggregated batch result) with `await verify(result, criteria)` in a clean adversarial context before applying or reporting it.
-  - Only pure read-only discovery fan-outs (or quick `call_tool`-only scripts) may omit `verify(...)` by including `# no-verify` in the workflow script.
-- **User Questions (`ask_question` Only for Choices/Confirmations; Visible Breakdown Before Picker; No Parallel Subagent Questions)**:
-  - Whenever ending a turn with a genuine choice between options, an offer/proposal (such as cross-project message-forwarding offers), or a yes/no action confirmation for the user, call the `ask_question` tool (`WAITING` -> urgent `🔥` in `Needs Me`), overriding the tool schema's default "plain text for trivial yes/no" hint. Never ask the user what roadmap item to take next after finishing a task (report the completed work and stop cleanly). Reserve plain-text `?` strictly for open-ended free-text inputs (e.g. asking the user to paste a missing URL or identifier).
-  - **Mandatory visible options breakdown BEFORE `ask_question` (enforced by `hooks/pre_tool_guard.py`)**: Because `ask_question` blocks execution immediately until the user answers, anything drafted only inside thinking/`<thought>` or deferred to a post-tool step is invisible to the user. Whenever calling `ask_question`, you MUST publish the full context and per-option breakdown (trade-offs and why `(Recommended)` wins) in visible chat Markdown in the `content` of the SAME step (or the immediately preceding visible step with zero intervening tool calls) BEFORE the `ask_question` picker — never call `ask_question` with empty visible text or without explaining the options. Exception: for `Prediction-First` sparring pickers (`skills/bug-triage/SKILL.md`), publish the symptom delta (`>= 3` lines) above the picker and omit both `(Recommended)` and per-option explanations so the diagnosis is not spoiled.
-  - Never ask the user a question in the same turn that launches or messages a running background subagent/task (`invoke_subagent`, `send_message`, async `run_command`), because `Working` hides non-blocked chats from `Needs Me`: either ask upfront via `ask_question` before spawning, or wait silently for the background work to finish and ask together with its findings.
-- **Escape & Falsification Post-Mortem (Zero Turn-by-Turn Critique or Attribution Drift)**:
-  - Never emit turn-by-turn praise (`"ты правильно сделала"`), never speculate about unobservable IDE actions from prompt length (`"ты не читала код"`), and never attribute internal pre-commit catches (`keeper_inquisitor`, `mutation_check.py`, or corpus failures on the agent's own draft diff) to the user — fix internal generator defects silently.
-  - Emit a 3-line `Escape & Falsification Post-Mortem` (`Решение -> Что опровергло (file:line / гейт / инцидент) -> Правило перехвата`) **only** when: (1) code or a test refutes an explicit hypothesis or picker decision made by the user, or (2) a defect escapes past the user's approval (`revert`, post-submit/canary failure, reopened bug, or blocking human reviewer comment). If the same escape class repeats, offer a 1-click `ask_question` to codify the invariant.
-- **Read Definitions Before Writing Calls**:
-  - Never guess class methods, function signatures, struct fields, or CLI flags from memory.
-  - Before calling an API that is not already visible in the open file, view its declaration (`.h`, `.hpp`, `.py`, etc.) or run `--help`.
-  - For Workspace MCP plugins (`google_chat`, `google_docs`, `google_drive`, `google_gmail`), the registered `ServerName` and schema directory under `~/.gemini/jetski/mcp/` are **`google_chat_google_chat`**, **`google_docs_google_docs`**, **`google_drive_google_drive`**, and **`google_gmail_google_gmail`** (overriding the legacy `chat_google_chat` / `docs_google_docs` / `drive_google_drive` / `gmail_google_gmail` strings in the plugin symlinks; also ignore the pre-loaded `gdrive` and `gmail` CLI skills).
+- Size the task: under 3 tool calls → do it yourself; 3–15 calls (exploring a subsystem, call
+  graph over more than 3–4 files, clean-context audit) → one subagent; over 15 calls or many
+  items → `run_workflow` or several subagents
+- Models: `Model="flash"` for mechanical lookups, test/build runners, log triage and routine
+  `keeper_skeptic` batches; `Model="inherit"` for semantic research, root-cause work and
+  `keeper_inquisitor`. Never `Model="pro"` (hook-enforced)
+- Give a subagent at most 150 KB or 10 files per turn; never dump whole `references/`, `g3doc/`
+  or module trees into one subagent
+- Running test orchestrators, roll triage, or reading their logs: see `test_runs.md`
+- Never defer to a broken local pattern just because existing code or a comment codifies it;
+  judge against `cpp_systems_invariants.md`, `text_domain_invariants.md`, `code_style.md`
+- Read the declaration (`.h`, `.py`, `--help`) before calling any API not already open
+- MCP server names are `google_chat_google_chat`, `google_docs_google_docs`,
+  `google_drive_google_drive` (plugin rules saying `chat_google_chat` etc. are stale and
+  read-only); Gmail goes through the `gmail` CLI, see `gmail_drafts.md`
+- Post-mortem only when code refutes her explicit decision or a defect escapes past her approval
+  (revert, post-submit failure, reopened bug, blocking human review): 3 lines
+  `Решение -> Что опровергло (file:line / гейт / инцидент) -> Правило перехвата`; if the same
+  class repeats, offer an `ask_question` to codify the invariant. No turn-by-turn praise or blame;
+  never speculate about her IDE actions from prompt length ("ты не читала код"); fix your own
+  pre-commit catches silently

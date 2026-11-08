@@ -1,14 +1,13 @@
 ---
-trigger: always_on
-description: When closing a crbug issue, fill "Fixed By Code Changes" with only the fixing CLs
+trigger: model_decision
+description: "When proposing to close or closing a crbug/Buganizer issue as Fixed (Flight Deck, BUG-WATCHER)."
 ---
 
 # Closing Bugs: Always Fill "Fixed By Code Changes"
 
 Chrome Security bots (`chrome-security-blintz-continuous-runner@prod.google.com`) reopen a Fixed
 bug when the "Code changes" list holds more than one CL and custom field `1358989`
-"Fixed By Code Changes" is empty. Incident: crbug/576664769 was reopened on 2026-11-02 because it
-listed both the fix (Gerrit 1404196) and a test-only follow-up (Gerrit 1411716).
+"Fixed By Code Changes" is empty. See `INCIDENTS.md`.
 
 The user gave standing authorization (2026-11-02): whenever you propose to close a bug (Flight
 Deck "All linked CLs merged — ready to mark Fixed?", `[BUG-WATCHER]` prompts, or your own

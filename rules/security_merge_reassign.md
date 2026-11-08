@@ -1,8 +1,6 @@
 ---
-trigger: always_on
-description: >-
-  Reassign bot-filed Chrome [Merge Mxx] requests via safe_add_collaborator and
-  safe_reassign_issue after one batch confirmation
+trigger: model_decision
+description: "When handling bot-filed Chrome [Merge Mxx] requests or reassigning them to merges@chromium.org."
 ---
 
 # Reassigning Chrome Security Merge Requests to `merges@chromium.org`
@@ -27,7 +25,8 @@ actions and never run autonomously):
   1358989) on the parent bug is non-empty; every other CL on the parent touches only `tests/`;
   >= 24h Canary soak; no revert on `main`; clean trial `git cherry-pick -x` onto `chrome/m<NN>`;
   `OS` (field 1223084) checked against the parent).
-- **Sequential write & verification order**: Run `python3 ~/.gemini/config/scripts/bug_actions.py reassign_merge <ID>`
+- **Sequential write & verification order**: Run
+  `python3 ~/.gemini/config/scripts/bug_actions.py reassign_merge <ID>`
 - **Fallback (never bypass `SafeReassignIssue`)**: If `safe_reassign_issue` fails for any issue IDs
   (for example, if `SafeReassignIssue` rejects `merges@chromium.org` on edit-access validation),
   report the exact error and open/return a **single** Buganizer bulk-query URL

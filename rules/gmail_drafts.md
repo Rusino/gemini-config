@@ -1,20 +1,16 @@
 ---
-trigger: always_on
-description: "Gmail: use gmail Go CLI for clean links, format drafts as HTML, verify stored links."
+trigger: model_decision
+description: "When reading, drafting, replying to or sending email (Gmail drafts, messages with links)."
 ---
 
 # Gmail & Drafts: Use `gmail` Go CLI for Clean Direct Links
 
-Incident (2026-10-30 & 2026-11-02): the `google_gmail` MCP server (`gmailmcp.googleapis.com`)
-rewrote every URL in outgoing drafts (`<a href>`, bare URL, `<pre>`, `<code>`) into an expiring
-24h `https://www.google.com/url?q=...&ust=...` redirect, and three MCP `update_draft` calls while
-a reply was open in Gmail left three draft versions visible in the UI.
+Why: the `google_gmail` MCP rewrites URLs into expiring redirects (see `INCIDENTS.md`).
 
 - **Use `gmail` Go CLI, keep `google_gmail` MCP disabled**: Always run
   `/google/bin/releases/gemini-agents-gmail/gmail` (`~/.gemini/config/skills/gmail/SKILL.md`),
-  which calls `gmail.googleapis.com` directly over LOAS and preserves clean `https://...` URLs
-  (verified 2026-11-02 in raw MIME and Gmail Web UI; overrides the legacy `google_gmail` / `gmail`
-  note in `rules/subagent_exploration.md`). Keep the `google_gmail` plugin disabled
+  which calls `gmail.googleapis.com` directly over LOAS and preserves clean `https://...` URLs.
+  Keep the `google_gmail` plugin disabled
   (`enabled: false`); leave `~/.gemini/jetski/mcp_oauth_tokens.json` on disk only for
   `scripts/cl_watcher.py`
 - **Format bodies with `--html` (explicit `<a href>` and `<pre>`)**: Pass `--html` (using

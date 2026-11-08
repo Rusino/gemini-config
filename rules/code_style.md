@@ -1,109 +1,43 @@
 ---
 trigger: always_on
-description: "Skia-style C++ minimalism and suppression of LLM coding reflexes."
+description: "When editing source code or tests, writing code comments, commit messages, CL/PR descriptions, or code review replies."
 ---
 
-# Code Style & Anti-Slop Rules
+# Code Style
 
-## 1. Comments (No Trailing Periods outside Dart, No Noise)
-- **Punctuation & length**: Keep comments to 1–4 lines in English; periods (`.`) are allowed between sentences inside a multi-line block, but **never** at the end of a single-line comment or the end of a comment block
-- **Dart exception**: In `.dart` files (Flutter framework, engine `web_ui`, tooling, tests) every `//` and `///` comment **must** end with a period (Effective Dart, enforced by flutter/flutter review bots). This overrides the no-trailing-period rule above for Dart only; all other comment rules still apply
-- **Never restate syntax**: Do not write comments that describe *what* the next line of code does (e.g., `// Populate the cache`, `// Check for null`, `// Increment counter`)
-- **No tutorial markers**: Never use numbered step comments (`// 1. Setup`, `// 2. Execute`) or markdown emphasis (`*word*`, `--`) in code comments
-- **Why over What (Timeless Invariants)**: Write comments only to state non-obvious domain invariants, contracts, hardware/API quirks, or why a check/call must not happen here (never diff-style `// Removed...` or `// Fixed...`). Even a 1-line non-trivial addition, modification, or deletion must get a comment explaining why
-- **Method Header vs. Targeted Branch Placement (No Umbrella Blocks)**: Above a method signature, write a concise comment describing the method's contract/purpose without implementation details; inside the body, place short, focused comments directly above each non-trivial branch, condition, loop, or field. Never use a multi-sentence summary block at the top of a method, hunk, or `switch` as a substitute for commenting the branches inside
-- **Comment ownership**: Only rewrite or delete comments that you (the AI) added and explicitly remember adding; always ask before modifying or removing any pre-existing or user-written comment
+## Comments
+- English, 1–4 lines. No trailing period at the end of a comment outside Dart; in `.dart` files
+  every `//` and `///` comment ends with a period (Effective Dart)
+- Every non-trivial change, even one line, gets a why-comment. Why, not what: state invariants,
+  contracts, API quirks, or why something must not happen here.
+  Never restate the next line, never write `// Removed...` / `// Fixed...` diff-style notes
+- A short contract comment above a method; focused comments above non-trivial branches, never one
+  umbrella block at the top of a method or `switch`
+- No numbered step comments, no markdown emphasis in comments
+- Rewrite or delete only comments you added; ask before touching pre-existing ones
 
-## 2. Zero Speculative API Surface (Strict YAGNI)
-- **No uncalled methods**: Never add helper methods, const/non-const overloads, `begin()`/`end()` iterators, `empty()`/`size()` wrappers, or `std::ranges` `static_assert` checks unless they have a direct caller in the current change
-- **Data is just data**: For private/internal state in Skia style, use plain structs with `fMember` fields rather than classes with trivial getters and setters
+## Code
+- Strict YAGNI: no helpers, overloads, iterators or wrappers without a caller in this change.
+  Private state is a plain struct with `fMember` fields
+- `SkASSERT` invariants at boundaries; no defensive `if (!ptr) return;` along internal call chains
+- Root-cause fixes only: no special-case branch for the failing input; keep layout, hit-testing,
+  caret, selection and rendering consistent
+- Tests: no narrative comment before every assert; test domain edges, not C++ mechanics
+- Hard limit of 100 columns for every line (`clang-format -style=file`)
 
-## 3. Contracts (`SkASSERT`) Over Defensive Paranoia
-- **Assert invariants, don't mask bugs**: Validate preconditions at API boundaries or via `SkASSERT`
-- **No redundant null/bounds checks**: Never scatter defensive `if (!ptr) return;` checks across internal call chains where the invariant is already guaranteed by the caller or data model
-
-## 4. Root-Cause Fixes Only (No Symptomatic Branching)
-- **No test-fitting `if`s**: When fixing a bug, never append a special-case branch tailored to the failing input
-- **Cross-pipeline consistency**: Trace the bug to the broken invariant in the data model so all consumers (layout, hit-testing, caret geometry, selection, rendering) remain consistent
-
-## 5. Test Minimalism
-- **No narrative headers**: Do not put full-sentence comments before every `REPORTER_ASSERT` block in unit tests
-- **Test domain edges, not C++ mechanics**: Do not write exhaustive boilerplate tests for trivial language mechanics (e.g., testing move-construction + move-assignment with repeated `NOLINT` comments); focus tests on domain invariants and boundary conditions
-
-## 6. Human Commit Messages & Code Review Surface
-- **English-only review surface**: Everything that enters code review (commit messages, CL/PR descriptions, top comments, inline comments, review replies) must strictly be written in English
-- **`[SkoreText]` CL Subject Prefix**: Start every Gerrit CL subject produced in the `SkoreText`
-  project (or from the macOS `/Users/jlavrova/Sources` workspace) with the exact case-sensitive
-  prefix `[SkoreText] ` (e.g., `[SkoreText] Add CoreTextLineShaper`,
-  `[SkoreText] [1/6] Add CoreText build flag and CoreTextIndexMap`,
-  `[SkoreText] DO NOT SUBMIT: ...`). Do not apply `[SkoreText]` to companion review CLs on
-  external authors' changes or to CLs in other projects
-- **`SkoreText` External Confidentiality**: Never mention, cite, or link `SkoreText` (or any
-  `[SkoreText]` Gerrit CLs, e.g., `Gerrit 1382196`, `Gerrit 1383896`, `Gerrit 1389816`,
-  `Gerrit 1411678`) in external issue trackers, GitHub issues/PRs, public Buganizer/crbug
-  comments, or external code reviews until the user explicitly lifts this restriction
-- **AI-assisted CL attribution**: Any CL, PR, or commit prepared with AI assistance (with user direction/participation) must include **exactly one** `Assisted-by:` trailer in the commit summary footer — **always only the latest model**, separated from the body by an empty line and placed right before `Change-Id:`:
-  ```gitcommit
-  Problem description and fix explanation.
-
-  Assisted-by: <Model Name>
-  Change-Id: I...
-  ```
-  Run `python3 ~/.gemini/config/hooks/chat_lifecycle.py model --trailer` to obtain the trailer (e.g. `Assisted-by: Gemini 3.8 Flash (High)` or `Assisted-by: Gemini 3.8 Pro`). If the model cannot be determined, use `Assisted-by: AI`. When amending or updating an existing commit, CL, or PR, **replace** all prior `Assisted-by:` lines so only the single latest one remains (and propagate the updated summary to Gerrit via `--commit-description=+` or GitHub via `gh pr edit --body`) — never stack multiple `Assisted-by:` lines
-- **Two-Tier Commit / PR Description Scaling**:
-  - **Tier 1 (Simple / localized bug fixes & small refactors)**: Write concise, direct prose (1–3 sentences explaining the problem and the fix), plus 1 explicit line stating how the new test fails without the fix (exact assertion, call count, or crash), and a complete, human-readable `Tested:` block listing all executed unit test suites, corpora (Flutter targeted/full suites and Google3 transitive corpus with test counts, never leaking internal `//...` paths or `cl/` numbers), and trybots (ASAN, Mac, Windows, Android) in terms meaningful to an external reviewer without referencing local skill names.
-  - **Tier 2 (Algorithmic, caching, concurrency, or performance CLs/PRs)**: Write a structured engineering specification containing:
-    1. **Problem & per-call cost**: Concrete mechanics and cost of the current code path
-    2. **Equivalence proof**: Why the new path produces the exact same result as the old path (and the input generator corpus size tested)
-    3. **`Behavior notes` / `Assumptions` / `Thread safety`**: Edge-case invariants, leaf-lock or lock-order proof, and bounded-cache memory math (`bytes/entry × capacity = max KB`)
-    4. **Empirical tables**: Compact `Before | After` benchmark tables and capacity/threshold selection sweep tables (`no cache`, `cap1`, `cap2`, `cap3`, `no limit`)
-    5. **Explicit pre-fix test failure, full `Tested:` matrix & honest scope disclosures**: Exact failure of the new test before the fix (e.g., `Without the lock, the test crashes in 28 of 30 runs`), a complete human-readable `Tested:` block (all executed unit tests, Flutter and Google3 corpora with test counts and zero internal path/`cl/` leaks, ASAN, and platform or physical device trybots), and explicit `Not tested:` / `Not measured:` / `Not profiled:` lines whenever a platform or scenario was not measured (never speculate)
-  - **`Tested:` follows the latest run (both tiers)**: Each `Tested:` entry names where it ran
-    (OS/arch, build type, compiler, font/Unicode backend, or the trybot name) and ends with
-    `Not tested:`. Corpora and trybots often finish after upload: before the final summary,
-    update the description from the latest `compare.md` / `attestation.json` and tryjob triage
-    (`git commit --amend`, then `luci-auth context -- git cl upload -f --commit-description=+`;
-    a message-only patchset is `NO_CODE_CHANGE` and keeps tryjob results).
-    `canary_advisor.py triage` prints `TESTED BLOCK: STALE` until the description lists every
-    green trybot. The final chat summary carries the same per-suite environment (incident:
-    Gerrit 1417397 PS1 kept only a single-test `Test:` line after all gates were green)
-  - **Name the google3 corpus plainly**: In `Tested:` blocks and review replies (including
-    external authors' CLs) write `google3 SkParagraph clients (<N> test targets): no
-    regressions`. Only `//...` paths, `cl/` numbers, sponge links and target names stay out;
-    never blur it into `Google-internal clients` (incident: Gerrit 1418836 PS1 draft)
-- **Plain Technical English (UNIX / Bell Labs style)**: Write simple, declarative Subject-Verb-Object sentences in the present tense using plain words (`keep`, `give`, `get`, `make`, `run`, `call`, `has`, `same as before`, `Thus`, `Now`); never use pompous Latinate LLM vocabulary (`utilize`, `facilitate`, `subsequently`, `consequently`, `mitigate`, `invocations`, `redundantly`, `leverage`, `comprehensive`, `seamlessly`)
-- **No LLM bulleted lists**: Never generate mechanical LLM-style bulleted lists of imperative verbs (`- Add...`, `- Refactor...`, `- Update...`) that restate the diff; structured `Behavior notes` / `Assumptions` / `Thread safety` bullets in Tier 2 specs are encouraged
-- **2×2 Ablation Matrix in Code Review Replies**: When a reviewer suggests an alternative or combined optimization/design (`A` vs. `B`), measure all 4 combinations (`baseline`, `A alone`, `B alone`, `A + B`) and include the exact numbers in the draft review reply
-- **Save unpublished Gerrit drafts by default; never publish or resolve without asking**:
-  - For Gerrit CL reviews (both initial and incremental patchset/thread follow-ups), **always save**
-    the prepared English review reply as an **unpublished Gerrit draft** via
-    `python3 ~/.gemini/config/scripts/gerrit_draft.py save` (deduplicating in place by
-    `(path, line, in_reply_to)` and resolving `--in-reply-to` to the parent comment's `patch_set`)
-    **and** show the draft in chat. Saving an unpublished Gerrit draft — including `"Done"`
-    (`unresolved: false`) drafts on the user's own addressed prior-patchset threads via
-    `finalize_review.py stage-thread-drafts` — is safe and expected by default so one explicit user
-    approval publishes them atomically
-  - **Never publish** review replies or comments (`/review` on Gerrit, posting comments/reviews on
-    GitHub), **never vote** `Code-Review+1` without confirmation, and **never publicly
-    resolve/unresolve** review threads (`resolveReviewThread`) unless the user explicitly asks or
-    clicks **Approve & publish** in Flight Deck (`scripts/finalize_review.py`)
-- **Canary-G3 Runtime & Triage Procedure**: Canary-G3 can take ~55 minutes. If it turns red,
-  extract the roll CL number from swarming stdout (`Canary roll [ http://cl/N ]`) and triage:
-  1. Run `cd ~/.gemini/jetski/scratch/skia_gardener && go run . -triage-google3 -cl <CL>`
-  2. For each failing target:
-     - Transitive Dependency Check: Never assume a target does not use Skia/SkParagraph based on
-       local dir code search. Verify transitive paths from `/google/src/head/depot/google3`:
-       `blaze query "somepath(<target>, //third_party/skia/HEAD/<path to changed file>)"`
-     - Flakiness & HEAD Status: Check target status with
-       `/google/bin/releases/gemini-agents-auto-repair-cli/autorepair target-status <target>`
-     - Stack Trace Inspection: Inspect crash logs via
-       `autorepair readonly investigate --sponge_id=<id> --test_target=<target>`
-       to check whether Skia frames appear in the crash stack
-- **No Auto-Submit or Automated CQ Votes**: Never vote `Auto-Submit+1`, `Commit-Queue+1` (dry run),
-  or `Commit-Queue+2` on Gerrit CLs, and never auto-merge GitHub PRs, unless the user explicitly
-  asks for it (Try jobs, such as ASAN or Canaries triggered via `git cl try`, are NOT CQ votes and CAN be triggered automatically when rules require it). Do not trigger full CI submission automatically
-
-## 7. Strict Line Length (<= 100 Columns)
-- **Hard 100-character limit**: Every source line, test line, and code comment must strictly stay
-  within 100 characters (Skia column limit). Never commit or push any line exceeding 100
-  characters; always reformat or wrap with `clang-format -style=file`
+## Commit messages, CL/PR descriptions, review replies
+- English only; plain declarative sentences, present tense, plain words (`keep`, `get`, `run`,
+  `same as before`), no `utilize`, `facilitate`,
+  `subsequently`, `consequently`, `mitigate`, `invocations`, `redundantly`, `leverage`,
+  `comprehensive`, `seamlessly`
+- No bulleted lists of imperative verbs that restate the diff
+- Format (Tier 1 / Tier 2, `Tested:` block, google3 corpus wording): read
+  `skills/amnesia-precommit/references/commit_message.md` before writing or amending a description
+- `[SkoreText] ` subject prefix for SkoreText CLs and CLs from the macOS `/Users/jlavrova/Sources`
+  workspace (the hook checks only the project name); never on other projects' CLs or on
+  companion review CLs on external authors' changes
+- When a reviewer suggests an alternative, measure all four combinations (baseline, A, B, A+B)
+  and put the numbers in the reply
+- Gerrit drafts: `scripts/gerrit_draft.py save` dedups in place by `(path, line, in_reply_to)`;
+  `"Done"` drafts on her own addressed threads come from `finalize_review.py stage-thread-drafts`
+- Canary-G3 triage: see `skills/skia-canary-advisor/SKILL.md`

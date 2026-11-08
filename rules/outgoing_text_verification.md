@@ -1,76 +1,37 @@
 ---
 trigger: always_on
-description: Mandatory zero-trust verification for all incoming and outgoing documents, technical texts, and code changes/snippets.
+description: "Zero-trust verification of incoming and outgoing documents and code."
 ---
 
-# Incoming & Outgoing Document and Code Verification
+# Verify What Comes In and What Goes Out
 
-Code has a compiler; prose documents do not, and incoming specs or code snippets often contain stale paths, broken contracts, or unverified assumptions. Apply zero-trust verification across all four boundaries (Incoming/Outgoing × Documents/Code), while keeping normal conversational chat lightweight.
+| Boundary | Action |
+|---|---|
+| Outgoing doc or substantive writeup (Google Doc, design doc, report, slides, README, SKILL.md, rule file, multi-paragraph CL/PR/bug text with tables or code citations) | `skills/amnesia-doc-check` before sharing (hook-enforced for `update_doc`) |
+| Incoming doc, spec, or bug report to read, review, analyze or implement from | `check_doc_grounding.py` (+ Hunter and `keeper_skeptic` for substantive specs); put `Grounding OK` or the exact discrepancies at the top of the reply |
+| Outgoing code (commit, upload, push, "done") | `skills/amnesia-precommit`; its Phase 4 lists the corpus gates per path |
+| Incoming external CL/PR, branch, diff, commit or snippet over 5 lines she asks to read, explain or integrate | `audit_comments.py` + `ruthless_audit.py --diff`, check against the invariants |
+| Full CL/PR review | `review-triage` + `companion-cl-review` by default ("без компаньона" / "только текстом" opts out) |
 
-## 1. Documents & Technical Prose (`amnesia-doc-check`)
+- Short replies: type every path, symbol, flag, skill name and SHA character-for-character from a
+  source open in this turn, never from memory or a heading
+- Code snippets over 5 lines in chat: read the real declaration first; check against
+  `cpp_systems_invariants.md`, `text_domain_invariants.md`, `code_style.md`
+- Edited a document she already saw (more than 1 line or 15 words): run `skills/redline` without
+  being asked and link `<stem>_diff.html`
+- Google Docs: after `create_file` / `copy_file`, and whenever a Docs/Drive link goes into mail,
+  Chat, a Buganizer comment or a Gerrit CL, run `get_file_permissions` and give the Alphabet
+  audience commenter access (`share_file`, `permissionId="10969126254235447854"`, or the ID from
+  `get_audience_recommendations` if it differs). Named mail/Chat recipients also get writer
+  access. The `DOC-SHARE` hook checks only mail and Chat
+- Touching `modules/{skparagraph,skunicode}/`: also run the Flutter web CanvasKit suite
+  `felt test --suite chrome-dart2js-canvaskit-canvaskit` on baseline and patched Skia. The upload
+  hook does not check this one
+- Bugs: new side-bug on `master` or external issue → `paragraph-bug-prioritization` intake first;
+  every fix starts with a failing contract test (run `mutation_check.py` and
+  `verify_test_liveness.py`; the `TEST-LIVENESS` hook blocks upload until they pass); never
+  present a post-fix-only run as proof the bug is fixed unless it failed before the fix, and say
+  explicitly when an auxiliary fuzzer or corpus run only checks the new code for regressions
 
-1. **Outgoing Documents & Substantive Technical Writeups -> Full `amnesia-doc-check`**:
-   - **Applies to**: Standalone docs/presentations (`update_doc`, `create_file`, design docs, postmortems, audit/benchmark reports, slide decks, `README.md`, `SKILL.md`, rule files) and multi-paragraph outgoing technical texts (CL/PR descriptions, Buganizer/GitHub writeups, design review comments, team chat posts) with tables or code/path/symbol/CLI citations.
-   - **Required Action**: Before sharing externally or updating a Google Doc, read and execute `~/.gemini/config/skills/amnesia-doc-check/SKILL.md` (`check_doc_grounding.py` + clean-context Hunter + batched `keeper_skeptic` refutation + `finding_ledger.py`).
-
-2. **Incoming Documents & Specs -> Verify Before Trusting (`amnesia-doc-check` on Read)**:
-   - **Applies to**: Any Google Doc (`read_file_content`, `read_doc`), local `.md` design doc/spec, bug report, or multi-paragraph technical text the user asks you to read, review, analyze, or implement from.
-   - **Required Action**: Run `check_doc_grounding.py` and verify cited paths, symbols, flags, `file:line` claims, and self-consistency against actual source files (using Hunter + `keeper_skeptic` for substantive specs). Surface a concise grounding verdict (`Grounding OK` or exact discrepancies) at the top of your response before implementing.
-
-3. **Short Replies & Trivial Commit Messages -> Inline Grounding (0 Subagents)**:
-   - **Applies to**: Short 1–3 sentence chat replies, brief inline review comments, or small single-hunk commit messages where all referenced lines are already open in the current turn's context.
-   - **Required Action**: Never type a file path, directory name, skill/target name, class/function identifier, CLI flag, or commit SHA from memory or by paraphrasing headings; match repository identifiers character-for-character.
-
-4. **Automatic Redline on Document Updates (`redline`)**:
-   - **Applies to**: Any edit, shortening, translation, or restructuring (>1 line or >15 words) of an existing document/artifact/spec that the user has already seen in earlier turns.
-   - **Required Action**: Automatically run `python3 ~/.gemini/config/skills/redline/scripts/redline.py` against the last version the user saw, verify `<stem>_diff.html` via headless browser screenshot (`~/.gemini/config/skills/redline/SKILL.md`), and link `<stem>_diff.html` alongside the updated document without waiting to be asked.
-
-5. **Google Docs Sharing on Creation & Linking (`google_drive_google_drive` -> `share_file`)**:
-   - **Applies to**: Every Google Doc created or copied (`create_file`, `copy_file`), and every
-     time a `docs.google.com` or `drive.google.com` link is inserted into an outgoing email
-     draft (`create_draft`), Google Chat message (`send_message`, `send_message_markdown`),
-     Buganizer comment, or Gerrit CL.
-   - **Required Action**:
-     1. Inspect current permissions via `google_drive_google_drive` ->
-        `get_file_permissions(fileId)`.
-     2. Ensure the **Alphabet** (`google.com`) target audience has `role: "commenter"` via
-        `share_file(fileId=..., permissionId="10969126254235447854", role="commenter")`
-        (use `get_audience_recommendations(fileId)` if the `permissionId` differs) so any Googler
-        opening or forwarding the link can view and comment without access requests.
-     3. When inserting the link into an email draft or Chat message addressed to specific
-        recipients (`To:`, `CC:`, or direct Chat recipients), also grant each recipient
-        `role: "writer"` via `share_file(fileId=..., emailAddress="<recipient>@google.com",`
-        `role="writer")` so they can edit directly and see the document in `Shared with me`.
-
-## 2. Incoming & Outgoing Code (`amnesia-precommit`, Corpus Gate & KEEPER Invariants)
-
-1. **Outgoing Repository Code Changes -> Run `amnesia-precommit` & Pre-Upload Flutter Corpus**:
-   - **Applies to**: Any source code modifications in a repository before committing (`git commit`), uploading/pushing (`luci-auth context -- git cl upload`, `gh pr create`, `git push`), or reporting implementation complete.
-   - **Required Action**: Read and execute `~/.gemini/config/skills/amnesia-precommit/SKILL.md`:
-     1. Run `audit_comments.py --diff HEAD --repo <repo>` and `ruthless_audit.py <repo> --repo <repo> --diff HEAD` (plus `SKIP_GCE_AUTH_FOR_GIT=1 luci-auth context -- git cl presubmit --force` if `PRESUBMIT.py` exists).
-     2. For non-trivial diffs, run the clean-context Hunter (`keeper_inquisitor`) + batched `keeper_skeptic` refutation pass (`plugins/keeper/agents/keeper_skeptic.md`) + `finding_ledger.py`.
-     3. **Pre-Upload / Pre-Push Flutter Corpus Gate (`CORPUS-CHECK GUARD` in `pre_tool_guard.py`)**: Before `luci-auth context -- git cl upload`, `gh pr create`, or `git push` with executable production code changes:
-        - Touching `modules/{skparagraph,skunicode,skshaper}/{src,include}/` -> run `flutter-test-paragraph-engine` (`run_flutter_paragraph_tests.py`).
-        - Touching `modules/{skparagraph,skunicode}/` -> also run the Flutter web CanvasKit suite `felt test --suite chrome-dart2js-canvaskit-canvaskit` (`engine/src/flutter/lib/web_ui`, CanvasKit rebuilt from the patched Skia submodule) on baseline and patched Skia. Its `canvaskit_api_test.dart` pins SkParagraph metrics that native and framework corpora never check (incident: Gerrit 1418376 broke the Flutter roll PR 196144 on `SkParagraph kitchensink`, `LineMetrics.left` 2.5 -> 0, and was reverted in Gerrit 1420816).
-        - Touching `lib/web_ui/lib/` -> run `webparagraph-corpus` (`run_webparagraph_corpus.py`, Part 1 `felt` + Part 2 `packages/flutter`).
-
-2. **Bug Triage & Fixes -> Single-Bug Intake Gate (`paragraph-bug-prioritization`), Failing-Then-Passing Contract Test, and On-Demand `dual-version-bug-slide`**:
-   - **Applies to**: Any bug report, newly discovered pre-existing side-bug on `master`, or regression in `SkParagraph`, `SkUnicode`, `SkShaper`, `WebParagraph`, or `Skia`.
-   - **Required Action**:
-     1. **Automatic Single-Bug Intake Gate (`score_and_rank.py --intake-id ...`)**: Whenever you discover a pre-existing side-bug on `master` (outside the scope of the current PR/CL) or triage an externally filed GitHub/Buganizer issue, run `~/.gemini/config/skills/paragraph-bug-prioritization/scripts/score_and_rank.py --intake-id <ID> --intake-S <0..5> --intake-features <F_ids> --intake-P <P>` (plus `scan_reach.py zoom` if `[NEEDS_ZOOM_SCAN]` triggers) before starting a fix or adding an unranked roadmap item. If `score_nl >= cutoff` (`1.09` for `R42`), insert into the active top Epic at its exact rank; if `score_nl < cutoff`, record in `roadmap.py` as `[FROZEN, rank #K, score X]` and do not divert focus from the active Epic. **Two explicit exemptions** (fix immediately without freezing): (a) in-flight regressions introduced by our own uncommitted/unmerged PR/CL or active roll blockers (`Skia -> Flutter` / `Skia -> google3`), and (b) direct production blockers filed by a named live `google3` client team whose app is already broken in production.
-     2. **Failing-Then-Passing Contract Test & Mechanical Liveness Gate (`TEST-LIVENESS GUARD`)**: Author a failing-then-passing contract unit test before fixing production code, and on every patchset that adds or modifies C/C++ tests (including follow-up patchsets PS2, PS3...), run `mutation_check.py` (mutating a production file modified in the diff) + `verify_test_liveness.py --repo <repo> --diff <base> --log <log>`. Never present a post-fix-only fuzzer or corpus run as proof that the bug itself is fixed unless it failed on the pre-fix code; state explicitly when an auxiliary run only checks for regressions in the new code. When the user asks for a visual before/after comparison or slide, run `~/.gemini/config/skills/dual-version-bug-slide/SKILL.md`.
-
-3. **Outgoing Code Snippets in Chat (>5 Lines) -> Inline Invariant Check (0 Subagents)**:
-   - **Applies to**: Any non-trivial code block or patch (>5 lines) proposed in chat.
-   - **Required Action**: Read the actual header/definition before calling any API, and verify against `cpp_systems_invariants.md`, `text_domain_invariants.md`, and `code_style.md` (no trailing periods in non-Dart comments, `<= 100` cols, zero-allocation hot paths, loop guards, `SkASSERT` over defensive `if (!ptr) return;`).
-
-4. **Incoming Code (CLs, PRs, Commits, Patches, or User-Pasted Snippets >5 Lines) -> Zero-Trust Audit on Read**:
-   - **Applies to**: Any external CL/PR, commit, branch, diff, or code snippet (>5 lines) the user asks you to read, explain, review, or integrate.
-   - **Required Action**: Run `audit_comments.py` and `ruthless_audit.py --diff` (and use `review-triage` + `companion-cl-review` by default for full CL/PR reviews unless the user opts out with "без компаньона" / "только текстом"), and audit against `cpp_systems_invariants.md`, `text_domain_invariants.md`, and `code_style.md`.
-
-## 3. Hard Prohibitions
-
-- **No Paraphrased Identifiers**: Never reconstruct file paths or skill/target names from prose headings.
-- **No Unbacked Mechanism Claims**: Never state how a parser, build system, or runtime works without reading `file:line`.
-- **Zero Leftover Scaffolding**: Never leave generation placeholders (`[find link]`, `[insert ...]`, `TBD`, `TODO`, `(AI evaluation...)`, or empty markdown links) in any delivered text.
-- **No External `SkoreText` Disclosure**: Never mention `SkoreText` or link `[SkoreText]` Gerrit CLs in external trackers, GitHub issues/PRs, public Buganizer/crbug comments, or external review replies until the user explicitly lifts this restriction.
+Never: paraphrase identifiers; claim how a parser, build or runtime works without `file:line`;
+leave placeholders (`TBD`, `TODO`, `[insert ...]`, empty links) in delivered text.
