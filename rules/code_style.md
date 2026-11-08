@@ -12,9 +12,9 @@ description: "When editing source code or tests, writing code comments, commit m
   contracts, API quirks, or why something must not happen here.
   Never restate the next line, never write `// Removed...` / `// Fixed...` diff-style notes
 - Every new or changed function, method or template, private ones too, gets a contract comment
-  above it: what it does, inputs, outputs, side effects. A function that does several things
-  names each of them. Focused comments go above non-trivial branches, never one umbrella block
-  at the top of a method or `switch`
+  above it (a docstring in Python): what it does, inputs, outputs, side effects. A function that
+  does several things names each of them. Focused comments go above non-trivial branches, never
+  one umbrella block at the top of a method or `switch`
 - Every new test (`DEF_TEST`, `UNIX_ONLY_TEST`, `TEST`, `test(...)`) gets a 1–2 line header:
   which contract it checks and why that edge matters
 - No numbered step comments, no markdown emphasis in comments
@@ -32,8 +32,7 @@ description: "When editing source code or tests, writing code comments, commit m
 - `SkASSERT` invariants at boundaries; no defensive `if (!ptr) return;` along internal call chains
 - Root-cause fixes only: no special-case branch for the failing input; keep layout, hit-testing,
   caret, selection and rendering consistent
-- Tests: a header per test, but no narrative comment before every assert; test domain edges,
-  not C++ mechanics
+- Tests: no narrative comment before every assert; test domain edges, not C++ mechanics
 - Hard limit of 100 columns for every line (`clang-format -style=file`)
 
 ## Commit messages, CL/PR descriptions, review replies
