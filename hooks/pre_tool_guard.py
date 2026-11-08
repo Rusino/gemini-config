@@ -1956,6 +1956,314 @@ def gerrit_upload_scope_denial(
   return " ".join(parts)
 
 
+CHANGE_ID_TRAILER_RE = re.compile(r"^Change-Id:\s*(I[0-9a-f]{40})\s*$", re.MULTILINE)
+# hooks.json gives the whole PreToolUse hook 5 s, so all Gerrit queries run in parallel on
+# daemon threads and share one budget; a stalled query is abandoned, never joined at exit
+GERRIT_QUERY_TIMEOUT_S = 2.5
+STALE_PS_BUDGET_S = 3.0
+STALE_PS_MAX_COMMITS = 16
+# How many older patchsets to try when naming the one a stale local commit is built on
+STALE_PS_BASE_WALK = 6
+
+
+# GET a Gerrit REST URL anonymously and return the decoded JSON; raises on network errors
+def _gerrit_get_json(url: str):
+  import urllib.request
+
+  req = urllib.request.Request(url, headers={"User-Agent": "jetski-pre-tool-guard"})
+  with urllib.request.urlopen(req, timeout=GERRIT_QUERY_TIMEOUT_S) as resp:
+    raw = resp.read().decode("utf-8", errors="replace")
+  # Gerrit prefixes JSON with the XSSI guard `)]}'`
+  if raw.startswith(")]}'"):
+    raw = raw[4:]
+  return json.loads(raw)
+
+
+# Return (review_host, project, remote) for the checked-out branch, from the git cl branch
+# config or the remote URL (`X.googlesource.com` -> `X-review.googlesource.com`); host is ""
+# outside googlesource repos, which turns every STALE-PATCHSET check off
+def _gerrit_target(root: str) -> tuple[str, str, str]:
+  branch = _git_out(root, "symbolic-ref", "--short", "-q", "HEAD")
+  remote = (_git_out(root, "config", f"branch.{branch}.remote") if branch else "") or "origin"
+  if remote == ".":
+    remote = "origin"
+  url = _git_out(root, "config", f"remote.{remote}.url")
+  server = _git_out(root, "config", f"branch.{branch}.gerritserver") if branch else ""
+  host = re.sub(r"^https?://", "", server).strip("/")
+  m = re.match(r"^(?:https?|sso|rpc)://([\w.-]+?)(?:-review)?\.googlesource\.com/(?:a/)?(.+?)"
+               r"(?:\.git)?/?$", url)
+  if not host and m:
+    host = f"{m.group(1)}-review.googlesource.com"
+  project = m.group(2) if m else ""
+  return host, project, remote
+
+
+# Return [(sha, change_id)] for the current author's commits in <newest base>..ref for each
+# ref (or just ref when no base is found), newest first and without duplicates
+def _own_stack_change_ids(
+    root: str, refs: list[str], base_candidates: tuple[str, ...]
+) -> list[tuple[str, str]]:
+  # Other authors' commits below the stack are upstream history, not CLs being reworked
+  m = re.search(r"<([^>]+)>", _git_out(root, "var", "GIT_AUTHOR_IDENT"))
+  author_arg = [f"--author={m.group(1)}"] if m else []
+  commits: list[tuple[str, str]] = []
+  for ref in refs:
+    target_sha = _git_out(root, "rev-parse", "--verify", f"{ref}^{{commit}}")
+    if not target_sha:
+      continue
+    base = _newest_merge_base(root, target_sha, base_candidates)
+    rng = [f"{base}..{target_sha}"] if base else ["-n", "1", target_sha]
+    raw = _git_out(root, "log", "-n", "30", *author_arg, "--format=%H%x00%B%x01", *rng)
+    for rec in raw.split("\x01"):
+      if "\x00" not in rec:
+        continue
+      sha, body = rec.strip("\n").split("\x00", 1)
+      ids = CHANGE_ID_TRAILER_RE.findall(body)
+      if ids and (sha, ids[-1]) not in commits:
+        commits.append((sha, ids[-1]))
+  return commits[:STALE_PS_MAX_COMMITS]
+
+
+# Query Gerrit for every Change-Id at once; returns ({change_id: changes list}, errors).
+# Ids whose query failed or ran past STALE_PS_BUDGET_S are missing from the dict
+def _query_gerrit_changes(
+    host: str, project: str, change_ids: list[str]
+) -> tuple[dict[str, list], list[str]]:
+  import threading
+
+  suffix = f"+project:{project}" if project else ""
+  answers: dict[str, list] = {}
+  failures: list[str] = []
+
+  # Runs one query; writes into answers or failures, never raises
+  def run(cid: str) -> None:
+    try:
+      answers[cid] = _gerrit_get_json(
+          f"https://{host}/changes/?q=change:{cid}{suffix}&o=ALL_REVISIONS") or []
+    except Exception as exc:  # pylint: disable=broad-except
+      failures.append(f"{cid}: {exc}")
+
+  # Daemon threads: urlopen timeouts do not cover DNS, and interpreter exit joins
+  # non-daemon (ThreadPoolExecutor) workers, which would outlive the hook timeout
+  threads = [threading.Thread(target=run, args=(cid,), daemon=True) for cid in change_ids]
+  for t in threads:
+    t.start()
+  deadline = time.time() + STALE_PS_BUDGET_S
+  for t in threads:
+    t.join(max(0.0, deadline - time.time()))
+  late = {cid for cid, t in zip(change_ids, threads) if t.is_alive()}
+  results = {cid: answers[cid] for cid in change_ids if cid in answers and cid not in late}
+  errors = list(failures) + [f"{cid}: no answer in {STALE_PS_BUDGET_S}s" for cid in sorted(late)]
+  return results, errors
+
+
+# Return the paths where replaying the base -> rev delta onto sha would still change sha,
+# or None when git merge-tree fails. Conflicted paths do not count: a conflict means sha
+# rewrote lines that rev changed, which is how an amend of rev looks
+def _paths_missing_from(root: str, sha: str, base: str, rev: str) -> list[str] | None:
+  try:
+    res = subprocess.run(
+        ["git", "-C", root, "merge-tree", "--write-tree", "--name-only",
+         f"--merge-base={base}", sha, rev],
+        capture_output=True, text=True, timeout=2.0, check=False,
+    )
+  except Exception:  # pylint: disable=broad-except
+    return None
+  if res.returncode not in (0, 1):
+    return None
+  out_lines = res.stdout.split("\n")
+  conflicted = set()
+  # Exit 1 lists conflicted paths after the tree id, up to a blank line
+  if res.returncode == 1:
+    for line in out_lines[1:]:
+      if not line.strip():
+        break
+      conflicted.add(line.strip())
+  changed = _git_out(root, "diff", "--name-only", sha, out_lines[0].strip()).splitlines()
+  return [p for p in changed if p not in conflicted]
+
+
+# Return the delta base of patchset n: the local previous patchset, else n's own parent
+def _ps_delta_base(root: str, by_number: dict[int, str], n: int) -> str:
+  prev = by_number.get(n - 1, "")
+  if prev and _git_out(root, "cat-file", "-t", prev) == "commit":
+    return prev
+  return _git_out(root, "rev-parse", f"{by_number[n]}^")
+
+
+# Return the files of patchset n's own change that sha still lacks, or None when git fails
+def _ps_paths_missing(root: str, sha: str, by_number: dict[int, str], n: int) -> list[str] | None:
+  rev = by_number[n]
+  base = _ps_delta_base(root, by_number, n)
+  missing = _paths_missing_from(root, sha, base, rev) if base else None
+  if missing is None:
+    return None
+  # Upstream files moved by a Gerrit rebase between patchsets are not the CL's changes
+  own = set(_git_out(root, "diff", "--name-only", f"{rev}^", rev).splitlines())
+  if base != _git_out(root, "rev-parse", f"{rev}^"):
+    own |= set(_git_out(root, "diff", "--name-only", f"{base}^", base).splitlines())
+  return [p for p in missing if p in own]
+
+
+# Compare each own stack commit of refs with the latest Gerrit patchset of its change.
+# Returns (findings, query errors); a finding is a dict with kind "missing" (latest PS not in
+# the local repo) or "stale" (the commit lacks the latest PS delta in `files`), plus sha,
+# num, latest_ps, link, fetch_ref, remote and built_on (newest PS fully in sha, 0 if unknown)
+def stale_patchset_findings(
+    root: str, refs: list[str], base_candidates: tuple[str, ...]
+) -> tuple[list[dict], list[str]]:
+  host, project, remote = _gerrit_target(root)
+  if not host:
+    return [], []
+  commits = _own_stack_change_ids(root, refs, base_candidates)
+  changes, errors = _query_gerrit_changes(host, project, sorted({c for _, c in commits}))
+  findings: list[dict] = []
+  for sha, change_id in commits:
+    live = [c for c in changes.get(change_id) or [] if c.get("status") == "NEW"]
+    if len(live) != 1:
+      continue
+    change = live[0]
+    revs = change.get("revisions") or {}
+    latest = change.get("current_revision") or ""
+    if not latest or latest == sha or latest not in revs:
+      continue
+    by_number = {int(r.get("_number") or 0): s for s, r in revs.items()}
+    latest_ps = int(revs[latest].get("_number") or 0)
+    num = change.get("_number")
+    finding = {
+        "sha": sha,
+        "num": num,
+        "latest_ps": latest_ps,
+        "link": f"https://{host}/c/{change.get('project') or project}/+/{num}/{latest_ps}",
+        "fetch_ref": revs[latest].get("ref") or f"refs/changes/{int(num) % 100:02d}/{num}/"
+                                                 f"{latest_ps}",
+        "remote": remote,
+        "built_on": 0,
+        "files": [],
+    }
+    if _git_out(root, "cat-file", "-t", latest) != "commit":
+      findings.append({**finding, "kind": "missing"})
+      continue
+    if _git_out(root, "rev-parse", f"{sha}^{{tree}}") == _git_out(
+        root, "rev-parse", f"{latest}^{{tree}}"):
+      continue
+    missing = _ps_paths_missing(root, sha, by_number, latest_ps)
+    # A local git failure must not pass as "nothing missing"
+    if missing is None:
+      errors.append(f"{sha[:10]}: git merge-tree failed, not checked")
+      continue
+    if not missing:
+      continue
+    # The newest older patchset whose own delta is already in sha is the one it was built on
+    for n in range(latest_ps - 1, max(0, latest_ps - 1 - STALE_PS_BASE_WALK), -1):
+      rev = by_number.get(n)
+      if not rev or _git_out(root, "cat-file", "-t", rev) != "commit":
+        continue
+      if _ps_paths_missing(root, sha, by_number, n) == []:
+        finding["built_on"] = n
+        break
+    findings.append({**finding, "kind": "stale", "files": missing})
+  return findings, errors
+
+
+# Render one finding as a sentence naming the local commit, the CL and both patchsets
+def _describe_stale_finding(f: dict) -> str:
+  built = f"PS{f['built_on']}" if f["built_on"] else "an older patchset"
+  head = f"local commit {f['sha'][:10]} of CL {f['num']}"
+  latest = f"PS{f['latest_ps']} ({f['link']})"
+  if f["kind"] == "missing":
+    return (f"{head}: Gerrit has {latest}, which is not in the local repo; run "
+            f"`git fetch {f['remote']} {f['fetch_ref']}` and compare")
+  shown = ", ".join(f"`{p}`" for p in f["files"][:4]) + (
+      f" +{len(f['files']) - 4} more" if len(f["files"]) > 4 else "")
+  return f"{head} is built on {built} but Gerrit has {latest}; it lacks its changes in {shown}"
+
+
+# Deny a Gerrit upload whose commit would replace a newer patchset without carrying its
+# changes, as when Skia CL 1406897 PS15 was built on PS13 and dropped PS14's fix
+def stale_patchset_upload_denial(
+    cmd: str, workspace_paths: list[str], cwd: str = ""
+) -> str:
+  is_upload, push_refs = _gerrit_upload_invocation(cmd)
+  if not is_upload:
+    return ""
+  if re.search(r"(?:^|\s)ALLOW_PATCHSET_OVERWRITE=1\b", strip_heredocs(cmd)):
+    return ""
+  root = _upload_repo_root(cmd, _with_cwd(cwd, workspace_paths))
+  if not root:
+    return ""
+  base_candidates = (
+      ("upstream/main", "upstream/master", "origin/main", "origin/master")
+      if push_refs
+      else ("@{u}", "upstream/main", "upstream/master", "origin/main", "origin/master")
+  )
+  findings, errors = stale_patchset_findings(root, push_refs or ["HEAD"], base_candidates)
+  # Gerrit outages must never block uploads; the guard only adds a check on top
+  for err in errors:
+    sys.stderr.write(f"[STALE-PATCHSET GUARD] Gerrit query failed, not checked: {err}\n")
+  if not findings:
+    return ""
+  return (
+      "[STALE-PATCHSET GUARD] Gerrit upload blocked: it would replace the latest patchset "
+      f"and drop its changes: {'; '.join(_describe_stale_finding(f) for f in findings[:6])}. "
+      "Rebase the local commit onto the latest patchset (or cherry-pick its changes) before "
+      "uploading; never treat the latest Gerrit patchset as 'old'. Only if the user explicitly "
+      "confirms dropping that patchset's changes, prefix the upload with "
+      "`ALLOW_PATCHSET_OVERWRITE=1`."
+  )
+
+
+WORKTREE_ADD_VALUE_FLAGS = frozenset({"-b", "-B", "--reason"})
+
+
+# Return the commit-ish that `git worktree <args>` (args[0] == "add") checks out, HEAD by default
+def _worktree_add_commitish(args: list[str]) -> str:
+  positional: list[str] = []
+  k = 1
+  while k < len(args):
+    if args[k] in WORKTREE_ADD_VALUE_FLAGS:
+      k += 2
+      continue
+    if not args[k].startswith("-"):
+      positional.append(args[k])
+    k += 1
+  return positional[1] if len(positional) > 1 else "HEAD"
+
+
+# Non-blocking twin of the upload guard for `git commit` (HEAD's stack) and
+# `git worktree add` (the checked-out commit-ish's stack): returns warning text or "".
+# Query errors stay silent, since nothing is published here
+def stale_patchset_warning(cmd: str, workspace_paths: list[str], cwd: str = "") -> str:
+  # An upload in the same command already ran the blocking check on these commits
+  if _gerrit_upload_invocation(cmd)[0]:
+    return ""
+  # A commit (or --amend) builds on HEAD, a worktree on the commit-ish it checks out
+  refs = ["HEAD" for args in _parse_git_subcommand_invocations(cmd, "commit")
+          if "--help" not in args]
+  refs += [_worktree_add_commitish(args)
+           for args in _parse_git_subcommand_invocations(cmd, "worktree") if args[:1] == ["add"]]
+  if not refs:
+    return ""
+  root = _upload_repo_root(cmd, _with_cwd(cwd, workspace_paths))
+  if not root:
+    return ""
+  base_candidates = ("upstream/main", "upstream/master", "origin/main", "origin/master")
+  findings, _ = stale_patchset_findings(root, list(dict.fromkeys(refs)), base_candidates)
+  if not findings:
+    return ""
+  return (
+      f"[STALE-PATCHSET WARNING] {'; '.join(_describe_stale_finding(f) for f in findings[:6])}. "
+      "Rebase onto the latest patchset before working; never treat the latest Gerrit "
+      "patchset as old."
+  )
+
+
+# Prefix a run_command line with a stderr echo of notice, so a non-blocking hook warning
+# shows up in the tool output (PreToolUse output has no injectSteps)
+def _with_stderr_notice(cmd: str, notice: str) -> str:
+  return f"printf '%s\\n' {shlex.quote(notice)} >&2; {cmd}"
+
+
 def was_doc_grounding_run_in_chat(
     transcript_path: str, current_step_idx: int = -1
 ) -> bool:
@@ -4990,6 +5298,13 @@ def main() -> None:
       if scope_denial:
         print(json.dumps({"decision": "deny", "reason": scope_denial}, ensure_ascii=False))
         return
+      # A new patchset must carry the latest one's changes, or reviewer-requested fixes vanish
+      stale_denial = stale_patchset_upload_denial(
+          cmd_str, workspace_paths, str(tool_args.get("Cwd") or "")
+      )
+      if stale_denial:
+        print(json.dumps({"decision": "deny", "reason": stale_denial}, ensure_ascii=False))
+        return
 
   # Guard 8: Google Docs update_doc grounding check (amnesia-doc-check Phase 1)
   if (
@@ -5154,6 +5469,16 @@ def main() -> None:
       )
       return
 
+  # Commit and worktree checks only warn; the upload guard above is the one that blocks
+  if tool_name == "run_command":
+    cmd_w = str(tool_args.get("CommandLine", ""))
+    warning = stale_patchset_warning(cmd_w, workspace_paths, str(tool_args.get("Cwd") or ""))
+    if warning:
+      rewritten = _with_stderr_notice(cmd_w, warning)
+      print(json.dumps(
+          {"decision": "allow", "overwrite": {"CommandLine": rewritten}}, ensure_ascii=False
+      ))
+      return
   print('{"decision": "allow"}')
 
 

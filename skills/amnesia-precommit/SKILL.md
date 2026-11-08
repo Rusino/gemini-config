@@ -35,6 +35,7 @@ Execute a strict pre-commit audit and diff minimization workflow before uploadin
    python3 ~/.gemini/config/skills/ruthless-code-audit/scripts/ruthless_audit.py . --repo . --diff HEAD
    if [ -f PRESUBMIT.py ]; then SKIP_GCE_AUTH_FOR_GIT=1 luci-auth context -- git cl presubmit --force; fi
    ```
+   `audit_comments.py` also blocks on added C++/Dart-test lines: `WHOLE_FILE_IFDEF`, `TEMPLATE_NO_WHY`, `FUNC_NO_CONTRACT` (headers), `TEST_NO_HEADER`; `--commit <sha>` audits a committed CL read-only.
 3. **Apply Mechanical Fixes**:
    - Fix trailing periods, missing "why" comments on non-trivial 1-line changes, and line length violations (`<= 100` cols).
    - Strip leaked internal corporate markers (`go/`, `goto.google.com`, `cl/`, `cr/`, depot/CitC paths, machine-local home paths, `sponge`, `critique`), code-comment `b/<id>` references (replace with `crbug.com/` or `skia:`), and malformed Gerrit `Change-Id` lines (must be `I` + 40 lowercase hex chars).

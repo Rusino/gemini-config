@@ -43,6 +43,205 @@ COMMIT_SECTION_OR_TRAILER_RE = re.compile(
 )
 
 
+CPP_SUFFIXES = (".h", ".hpp", ".cpp", ".cc", ".mm")
+PP_COND_OPEN_RE = re.compile(r"^\s*#\s*if(?:n?def)?\b")
+PP_ENDIF_RE = re.compile(r"^\s*#\s*endif\b")
+SK_COND_RE = re.compile(r"^\s*#\s*if(?:def)?\b.*\bSK_\w+")
+TEMPLATE_RE = re.compile(r"^\s*template\s*<(?!\s*>)")
+TEMPLATE_ANY_RE = re.compile(r"^\s*template\s*<")
+DECL_QUALIFIER_RE = re.compile(
+    r"^(?:(?:static|virtual|inline|constexpr|explicit|friend|extern|SK_API|\[\[nodiscard\]\])\s+)*"
+)
+# Return type tokens, then an unqualified name, then one-line params; ctors have no return type
+FUNC_DECL_RE = re.compile(
+    r"^(?P<type>[A-Za-z_][\w:<>,\s*&]*?[\w>*&])\s+[*&]*(?P<name>[A-Za-z_]\w*)\s*\("
+    r"[^;{}=]*\)\s*(?P<tail>(?:const|noexcept|override|final|\s)*)(?:=\s*0\s*)?(?:;|\{)\s*$"
+)
+DECL_NON_TYPE_WORDS = {"return", "else", "delete", "new", "throw", "case", "goto", "using",
+                       "typedef", "co_return", "co_yield"}
+SCOPE_OPENER_RE = re.compile(
+    r"^\s*(?:template\s*<.*>\s*)?(?:class|struct|union|namespace)\b|^\s*extern\s+\"C\""
+)
+CPP_TEST_RE = re.compile(
+    r"^\s*(?:DEF_TEST|UNIX_ONLY_TEST|DEF_GANESH_TEST\w*|DEF_GRAPHITE_TEST\w*"
+    r"|TEST|TEST_F|TEST_P)\s*\("
+)
+DART_TEST_RE = re.compile(r"^\s*(?:test|testWidgets)\s*\(")
+WHOLE_FILE_IFDEF_MSG = (
+    "WHOLE_FILE_IFDEF: file is wrapped in a whole-file '{cond}'; platform/backend files are "
+    "selected by the build (own gni/Bazel source list + `sources +=` under the gn flag, like "
+    "skunicode/skshaper), not by a whole-file #if"
+)
+TEMPLATE_NO_WHY_MSG = (
+    "TEMPLATE_NO_WHY: template with no comment above; a template needs a why-comment, and a "
+    "callback template a measured cost or a precedent over a plain function parameter "
+    "(std::function or function pointer; code_style.md)"
+)
+FUNC_NO_CONTRACT_MSG = (
+    "FUNC_NO_CONTRACT: new function '{name}' has no contract comment above it (what it does, "
+    "inputs, outputs, side effects; code_style.md)"
+)
+TEST_NO_HEADER_MSG = (
+    "TEST_NO_HEADER: new test has no 1-2 line header comment above it (which contract it checks "
+    "and why that edge matters; code_style.md)"
+)
+
+
+def _comment_line_indices(lines):
+  """Return the 0-based indices of // lines and of every line of a /* ... */ block.
+
+  Doxygen blocks often close `*/` on a prose line with no leading `*`, so a line-local regex
+  cannot tell them from code.
+  """
+  out = set()
+  in_block = False
+  for idx, raw in enumerate(lines):
+    s = raw.strip()
+    if in_block:
+      out.add(idx)
+      in_block = "*/" not in s
+    elif s.startswith("//"):
+      out.add(idx)
+    elif s.startswith("/*"):
+      out.add(idx)
+      in_block = "*/" not in s[2:]
+  return out
+
+
+def _has_comment_above(comment_lines, idx):
+  """Return True when the 0-based line idx has a comment line directly above (no blank gap)."""
+  return idx - 1 in comment_lines
+
+
+def _skip_template_header(lines, idx):
+  """Return the 0-based index of the `template <...>` line heading idx, or idx itself."""
+  if idx > 0 and TEMPLATE_ANY_RE.match(lines[idx - 1]):
+    return idx - 1
+  return idx
+
+
+def _whole_file_ifdef(lines):
+  """Return the SK_ condition wrapping all code of the file, or None.
+
+  Ignores license comments, the include guard, #include/#import and #pragma once around it.
+  """
+  sig = []
+  in_block_comment = False
+  for idx, raw in enumerate(lines):
+    s = raw.strip()
+    if in_block_comment:
+      in_block_comment = "*/" not in s
+      continue
+    if not s or s.startswith("//"):
+      continue
+    if s.startswith("/*"):
+      in_block_comment = "*/" not in s
+      continue
+    sig.append((idx, s))
+  # Strip the include guard so its #endif does not count as code after the wrapper
+  if (len(sig) >= 3 and re.match(r"#\s*ifndef\s+(\w+)", sig[0][1])
+      and re.match(r"#\s*define\s+" + re.escape(sig[0][1].split()[-1]) + r"\b", sig[1][1])
+      and PP_ENDIF_RE.match(sig[-1][1])):
+    sig = sig[2:-1]
+  # Only includes may come before the wrapper; any code there means the #if is local
+  pos = 0
+  while pos < len(sig) and re.match(r"#\s*(?:include|import|pragma\s+once)\b", sig[pos][1]):
+    pos += 1
+  if pos >= len(sig) or not SK_COND_RE.match(sig[pos][1]):
+    return None
+  # The wrapper's matching #endif must be the last code line for the #if to cover the file
+  depth = 0
+  for j in range(pos, len(sig)):
+    if PP_COND_OPEN_RE.match(sig[j][1]):
+      depth += 1
+    elif PP_ENDIF_RE.match(sig[j][1]):
+      depth -= 1
+      if depth == 0:
+        return sig[pos][1] if j == len(sig) - 1 else None
+  return None
+
+
+def audit_cpp_structure(rel_path, lines, added_lines, is_new_file):
+  """Run the WHOLE_FILE_IFDEF, TEMPLATE_NO_WHY, FUNC_NO_CONTRACT and TEST_NO_HEADER checks.
+
+  lines is the full new file content, added_lines the 1-based added line numbers and
+  is_new_file whether the diff creates the file. Returns (span, message) issues; .dart test files
+  get only TEST_NO_HEADER.
+  """
+  issues = []
+  is_cpp = rel_path.endswith(CPP_SUFFIXES)
+  is_dart_test = rel_path.endswith("_test.dart")
+  if not (is_cpp or is_dart_test):
+    return issues
+  test_re = CPP_TEST_RE if is_cpp else DART_TEST_RE
+  comment_lines = _comment_line_indices(lines)
+  for ln in sorted(added_lines):
+    idx = ln - 1
+    if (0 <= idx < len(lines) and test_re.match(lines[idx])
+        and not _has_comment_above(comment_lines, idx)):
+      issues.append((f"L{ln}", TEST_NO_HEADER_MSG))
+  if not is_cpp:
+    return issues
+
+  # Existing files keep their layout; the rule covers files this change creates
+  if is_new_file:
+    cond = _whole_file_ifdef(lines)
+    if cond:
+      issues.append(("L1", WHOLE_FILE_IFDEF_MSG.format(cond=cond)))
+
+  for ln in sorted(added_lines):
+    idx = ln - 1
+    if 0 <= idx < len(lines) and TEMPLATE_RE.match(lines[idx]):
+      if not _has_comment_above(comment_lines, idx):
+        issues.append((f"L{ln}", TEMPLATE_NO_WHY_MSG))
+
+  if not rel_path.endswith((".h", ".hpp")):
+    return issues
+  # Track brace scopes so statements inside inline bodies never count as declarations
+  scope_stack = []
+  prev_code = ""
+  for idx, raw in enumerate(lines):
+    code = raw.split("//", 1)[0]
+    ln = idx + 1
+    if idx in comment_lines:
+      continue
+    at_decl_scope = all(kind == "scope" for kind in scope_stack)
+    # A one-line `template <...> T f();` is already reported as TEMPLATE_NO_WHY
+    if at_decl_scope and ln in added_lines and not TEMPLATE_ANY_RE.match(code):
+      name = _function_decl_name(code)
+      if name:
+        head = _skip_template_header(lines, idx)
+        if not _has_comment_above(comment_lines, head):
+          issues.append((f"L{ln}", FUNC_NO_CONTRACT_MSG.format(name=name)))
+    for ch in code:
+      if ch == "{":
+        # A brace alone on its line belongs to the class/namespace header above it
+        opener = code if code.strip() != "{" else prev_code
+        scope_stack.append("scope" if SCOPE_OPENER_RE.match(opener) else "body")
+      elif ch == "}" and scope_stack:
+        scope_stack.pop()
+    if code.strip():
+      prev_code = code
+  return issues
+
+
+def _function_decl_name(code):
+  """Return the function name when code is a one-line new-function declaration, else None.
+
+  Skips ctors/dtors (no return type), operators, override, `= default` and `= delete`.
+  """
+  s = DECL_QUALIFIER_RE.sub("", code.strip())
+  if "operator" in s or "= default" in s or "= delete" in s or s.startswith("#"):
+    return None
+  m = FUNC_DECL_RE.match(s)
+  if not m or "override" in m.group("tail"):
+    return None
+  first_word = m.group("type").split()[0].split("<")[0]
+  if first_word in DECL_NON_TYPE_WORDS or m.group("name") in DECL_NON_TYPE_WORDS:
+    return None
+  return m.group("name")
+
+
 def extract_comment_blocks(lines, line_filter=None):
   """Group consecutive single-line // comments (excluding /// and //!) into blocks."""
   blocks = []
@@ -335,10 +534,52 @@ def parse_git_diff(repo_path, diff_ref):
   return files_added_lines, uncommented_hunks
 
 
+def new_files_in_diff(repo_path, diff_ref):
+  """Return the set of paths the diff creates (git --diff-filter=A)."""
+  res = subprocess.run(
+      ["git", "-C", str(repo_path), "diff", "--name-only", "--diff-filter=A", diff_ref],
+      capture_output=True,
+      text=True,
+      check=False,
+  )
+  return set(res.stdout.split()) if res.returncode == 0 else set()
+
+
+def read_diff_side_lines(repo_path, rel_path, rev):
+  """Return the new-side lines of rel_path: the working tree file, or the blob at rev.
+
+  Returns None for missing, deleted or non-UTF-8 files.
+  """
+  if rev is None:
+    full_path = pathlib.Path(repo_path) / rel_path
+    if not full_path.is_file():
+      return None
+    try:
+      return full_path.read_text(encoding="utf-8").splitlines()
+    except UnicodeDecodeError:
+      return None
+  res = subprocess.run(
+      ["git", "-C", str(repo_path), "show", f"{rev}:{rel_path}"],
+      capture_output=True,
+      check=False,
+  )
+  if res.returncode != 0:
+    return None
+  try:
+    return res.stdout.decode("utf-8").splitlines()
+  except UnicodeDecodeError:
+    return None
+
+
 def main():
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("files", nargs="*", help="Files to audit")
   parser.add_argument("--diff", metavar="REF", help="Git ref to diff against (e.g., HEAD, origin/master)")
+  parser.add_argument(
+      "--commit",
+      metavar="REV",
+      help="Audit one commit (diff REV^!, contents and message read from REV, no checkout)",
+  )
   parser.add_argument("--repo", default=".", help="Repository path for --diff")
   parser.add_argument("--max-lines", type=int, default=4, help="Max lines per comment block")
   parser.add_argument(
@@ -386,16 +627,21 @@ def main():
         for span, text in extract_commit_disclaimers(msg_text):
           disclaimers.append((args.commit_msg, span, text))
 
+  # --commit audits a past commit read-only, so blobs come from REV instead of the working tree
+  content_rev = args.commit
+  if args.commit:
+    args.diff = f"{args.commit}^!"
+
   if args.diff:
     added_map, uncommented_hunks = parse_git_diff(repo, args.diff)
+    new_files = new_files_in_diff(repo, args.diff)
     for rel_path, added_lines in sorted(added_map.items()):
+      if not added_lines:
+        continue
+      lines = read_diff_side_lines(repo, rel_path, content_rev)
+      if lines is None:
+        continue
       full_path = repo / rel_path
-      if not full_path.is_file() or not added_lines:
-        continue
-      try:
-        lines = full_path.read_text(encoding="utf-8").splitlines()
-      except UnicodeDecodeError:
-        continue
       blocks = [] if full_path.suffix == ".py" else extract_comment_blocks(lines, line_filter=added_lines)
       issues = audit_blocks(
           blocks,
@@ -405,12 +651,21 @@ def main():
       )
       if check_cl_hygiene:
         issues.extend(audit_added_code_leaks(lines, added_lines))
+      issues.extend(audit_cpp_structure(rel_path, lines, added_lines, rel_path in new_files))
       for span, msg in issues:
         print(f"[ISSUE] {rel_path}:{span}: {msg}")
         total_issues += 1
 
     if check_cl_hygiene and not args.commit_msg:
-      head_msg = get_unpushed_head_message(repo)
+      if args.commit:
+        head_msg = subprocess.run(
+            ["git", "-C", str(repo), "log", "-1", "--format=%B", args.commit],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+      else:
+        head_msg = get_unpushed_head_message(repo)
       if head_msg:
         for span, msg in audit_commit_message(head_msg):
           print(f"[ISSUE] HEAD commit-msg:{span}: {msg}")

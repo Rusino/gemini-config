@@ -52,6 +52,7 @@ description: "Core rules for every turn: address, language, pushback, links, rev
   never publish, vote, or resolve threads unless she asks or clicks Approve & publish
 - After any commit, push or upload, say plainly what state it is in (`committed and pushed:
   <sha> -> origin/main`, uploaded as a linked patchset); never a bare SHA
+- Latest Gerrit patchset beats the local branch: stop, ask, never call it old (STALE-PATCHSET GUARD)
 - Never vote `Commit-Queue` (CQ) or `Auto-Submit`, never auto-merge PRs; try jobs are fine
 - Exactly one `Assisted-by:` trailer, the latest model
   (`python3 ~/.gemini/config/hooks/chat_lifecycle.py model --trailer`); the hook blocks
