@@ -1979,23 +1979,44 @@ def _gerrit_get_json(url: str):
   return json.loads(raw)
 
 
-# Return (review_host, project, remote) for the checked-out branch, from the git cl branch
-# config or the remote URL (`X.googlesource.com` -> `X-review.googlesource.com`); host is ""
-# outside googlesource repos, which turns every STALE-PATCHSET check off
-def _gerrit_target(root: str) -> tuple[str, str, str]:
+GOOGLESOURCE_URL_RE = re.compile(
+    r"^(?:https?|sso|rpc)://([\w.-]+?)(?:-review)?\.googlesource\.com/(?:a/)?(.+?)(?:\.git)?/?$"
+)
+
+
+# Return (review_host, project, remote) for the upload target; host is "" when nothing points
+# to googlesource, which turns every STALE-PATCHSET check off. The remote is the branch's
+# tracking remote, else push_remote from the command, else the repo's only googlesource
+# remote: fresh worktree branches have no tracking and caused the Nov 7 overwrite
+def _gerrit_target(root: str, push_remote: str = "") -> tuple[str, str, str]:
   branch = _git_out(root, "symbolic-ref", "--short", "-q", "HEAD")
-  remote = (_git_out(root, "config", f"branch.{branch}.remote") if branch else "") or "origin"
-  if remote == ".":
-    remote = "origin"
-  url = _git_out(root, "config", f"remote.{remote}.url")
+  tracking = _git_out(root, "config", f"branch.{branch}.remote") if branch else ""
+  remote = ""
+  for cand in (tracking if tracking != "." else "", push_remote):
+    if cand and _git_out(root, "config", f"remote.{cand}.url"):
+      remote = cand
+      break
+  if not remote:
+    gs = [r for r in _git_out(root, "remote").split()
+          if GOOGLESOURCE_URL_RE.match(_git_out(root, "config", f"remote.{r}.url"))]
+    remote = gs[0] if len(gs) == 1 else ""
+  url = _git_out(root, "config", f"remote.{remote}.url") if remote else ""
+  m = GOOGLESOURCE_URL_RE.match(url)
   server = _git_out(root, "config", f"branch.{branch}.gerritserver") if branch else ""
   host = re.sub(r"^https?://", "", server).strip("/")
-  m = re.match(r"^(?:https?|sso|rpc)://([\w.-]+?)(?:-review)?\.googlesource\.com/(?:a/)?(.+?)"
-               r"(?:\.git)?/?$", url)
   if not host and m:
     host = f"{m.group(1)}-review.googlesource.com"
-  project = m.group(2) if m else ""
-  return host, project, remote
+  return host, (m.group(2) if m else ""), remote or "origin"
+
+
+# Return the remote named by the first `git push <remote> ...` in cmd, or "" when the push
+# names only refspecs or a URL
+def _push_remote_from_cmd(cmd: str) -> str:
+  for args in _parse_git_subcommand_invocations(cmd, "push"):
+    positional = [a for a in args if not a.startswith("-")]
+    if positional and ":" not in positional[0] and "/" not in positional[0]:
+      return positional[0]
+  return ""
 
 
 # Return [(sha, change_id)] for the current author's commits in <newest base>..ref for each
@@ -2108,11 +2129,12 @@ def _ps_paths_missing(root: str, sha: str, by_number: dict[int, str], n: int) ->
 # Compare each own stack commit of refs with the latest Gerrit patchset of its change.
 # Returns (findings, query errors); a finding is a dict with kind "missing" (latest PS not in
 # the local repo) or "stale" (the commit lacks the latest PS delta in `files`), plus sha,
-# num, latest_ps, link, fetch_ref, remote and built_on (newest PS fully in sha, 0 if unknown)
+# num, latest_ps, link, fetch_ref, remote and built_on (newest PS fully in sha, 0 if unknown);
+# push_remote is the remote a `git push` command names, used when the branch has no tracking
 def stale_patchset_findings(
-    root: str, refs: list[str], base_candidates: tuple[str, ...]
+    root: str, refs: list[str], base_candidates: tuple[str, ...], push_remote: str = ""
 ) -> tuple[list[dict], list[str]]:
-  host, project, remote = _gerrit_target(root)
+  host, project, remote = _gerrit_target(root, push_remote)
   if not host:
     return [], []
   commits = _own_stack_change_ids(root, refs, base_candidates)
@@ -2197,7 +2219,9 @@ def stale_patchset_upload_denial(
       if push_refs
       else ("@{u}", "upstream/main", "upstream/master", "origin/main", "origin/master")
   )
-  findings, errors = stale_patchset_findings(root, push_refs or ["HEAD"], base_candidates)
+  findings, errors = stale_patchset_findings(
+      root, push_refs or ["HEAD"], base_candidates, _push_remote_from_cmd(cmd)
+  )
   # Gerrit outages must never block uploads; the guard only adds a check on top
   for err in errors:
     sys.stderr.write(f"[STALE-PATCHSET GUARD] Gerrit query failed, not checked: {err}\n")

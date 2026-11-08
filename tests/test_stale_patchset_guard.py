@@ -162,6 +162,40 @@ class StalePatchsetGuardTest(unittest.TestCase):
             if t is not threading.main_thread() and not t.daemon and t.is_alive()]
     self.assertEqual(live, [])
 
+  def use_remotes(self, remotes):
+    self.git("remote", "remove", "origin")
+    for name, url in remotes:
+      self.git("remote", "add", name, url)
+
+  # A fresh worktree branch has no tracking: the remote named by `git push` picks the host,
+  # even when another googlesource remote exists
+  def test_push_remote_resolves_host_without_tracking(self):
+    self.use_remotes([("origin", "https://chromium.googlesource.com/chromium/src"),
+                      ("upstream", "https://skia.googlesource.com/skia")])
+    self.amend_from(self.ps13, "src/Shared.cpp", "int shared = 2;\n")
+    reason, get = self.denial(cmd=f"git -C {self.repo} push upstream HEAD:refs/for/main",
+                              response=self.gerrit_change())
+    self.assertIn("[STALE-PATCHSET GUARD]", reason)
+    url = get.call_args[0][0]
+    self.assertTrue(url.startswith("https://skia-review.googlesource.com/changes/"), url)
+    self.assertIn("project:skia&", url)
+    # Two googlesource remotes and no hint in the command: no guess, no query
+    reason, get = self.denial(response=self.gerrit_change())
+    self.assertEqual(reason, "")
+    get.assert_not_called()
+
+  # git cl upload without tracking falls back to the repo's only googlesource remote
+  def test_single_googlesource_remote_resolves_host(self):
+    self.use_remotes([("upstream", "https://skia.googlesource.com/skia"),
+                      ("fork", "https://github.com/someone/skia")])
+    self.amend_from(self.ps13, "src/Shared.cpp", "int shared = 2;\n")
+    reason, get = self.denial(response=self.gerrit_change())
+    self.assertIn("[STALE-PATCHSET GUARD]", reason)
+    url = get.call_args[0][0]
+    missing, _ = self.denial(response=self.gerrit_change(current="f" * 40))
+    self.assertIn("git fetch upstream refs/changes/97/1406897/14", missing)
+    self.assertTrue(url.startswith("https://skia-review.googlesource.com/changes/"), url)
+
   # Commit plus upload in one command queries Gerrit once: the upload guard covers it
   def test_commit_and_upload_skip_the_warning(self):
     self.amend_from(self.ps14, "src/Shared.cpp", "int shared = 2;\n")
