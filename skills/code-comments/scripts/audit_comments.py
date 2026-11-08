@@ -47,6 +47,8 @@ CPP_SUFFIXES = (".h", ".hpp", ".cpp", ".cc", ".mm")
 PP_COND_OPEN_RE = re.compile(r"^\s*#\s*if(?:n?def)?\b")
 PP_ENDIF_RE = re.compile(r"^\s*#\s*endif\b")
 SK_COND_RE = re.compile(r"^\s*#\s*if(?:def)?\b.*\bSK_\w+")
+# Build-mode and API-staging macros guard debug code or legacy API, not a platform backend
+NON_BACKEND_SK_MACRO_RE = re.compile(r"^SK_(?:DEBUG|RELEASE|SUPPORT_LEGACY_\w+)$")
 TEMPLATE_RE = re.compile(r"^\s*template\s*<(?!\s*>)")
 TEMPLATE_ANY_RE = re.compile(r"^\s*template\s*<")
 DECL_QUALIFIER_RE = re.compile(
@@ -148,6 +150,9 @@ def _whole_file_ifdef(lines):
   while pos < len(sig) and re.match(r"#\s*(?:include|import|pragma\s+once)\b", sig[pos][1]):
     pos += 1
   if pos >= len(sig) or not SK_COND_RE.match(sig[pos][1]):
+    return None
+  # A wrapper made only of SK_DEBUG / SK_RELEASE / SK_SUPPORT_LEGACY_* is not backend selection
+  if all(NON_BACKEND_SK_MACRO_RE.match(m) for m in re.findall(r"\bSK_\w+", sig[pos][1])):
     return None
   # The wrapper's matching #endif must be the last code line for the #if to cover the file
   depth = 0

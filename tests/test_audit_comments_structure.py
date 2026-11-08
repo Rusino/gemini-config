@@ -116,6 +116,17 @@ class AuditCppStructureTest(unittest.TestCase):
     issues = audit_comments.audit_cpp_structure("src/Map.cpp", lines, added, True)
     self.assertEqual(_ids(issues), [("L1", "WHOLE_FILE_IFDEF")])
 
+  # Debug-only and legacy-API staging files are wrapped for another reason than backend choice;
+  # a backend macro mixed into the same condition still fires
+  def test_debug_and_legacy_wrappers_are_not_backend_selection(self):
+    for cond, fires in (("#ifdef SK_DEBUG", False), ("#if defined(SK_RELEASE)", False),
+                        ("#if defined(SK_SUPPORT_LEGACY_FOO)", False),
+                        ("#if defined(SK_DEBUG) && defined(SK_PARAGRAPH_NATIVE_CORETEXT)", True)):
+      cpp = "#include \"Map.h\"\n\n" + cond + "\nint a = 1;\n#endif\n"
+      lines, added = _all(cpp)
+      issues = audit_comments.audit_cpp_structure("src/Map.cpp", lines, added, True)
+      self.assertEqual("WHOLE_FILE_IFDEF" in str(issues), fires, cond)
+
   # Only added lines count, so untouched declarations in an edited header stay silent
   def test_only_added_lines_are_checked(self):
     lines, _ = _all(WRAPPED_HEADER)
