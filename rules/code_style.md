@@ -23,6 +23,9 @@ description: "When editing source code or tests, writing code comments, commit m
 ## Code
 - Strict YAGNI: no helpers, overloads, iterators or wrappers without a caller in this change.
   Private state is a plain struct with `fMember` fields
+- Keep each function and loop body at one level of abstraction: extract a self-contained domain
+  step with its own local state (e.g. building a font cascade, feature list, or variation map) into
+  a helper that returns a value; never slice an algorithm arbitrarily or add trivial wrappers
 - Platform or backend code is picked by the build, as in `skunicode` and `skshaper`: its own
   source list in gni/Bazel, `sources +=` under the gn flag. Never wrap a whole `.h`/`.cpp` in
   `#if`; `#if` stays only at call sites in shared code that choose a backend
