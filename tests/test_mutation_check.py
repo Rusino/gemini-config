@@ -11,6 +11,9 @@ import unittest
 SCRIPT = os.path.abspath(os.path.join(
     os.path.dirname(__file__), "..", "skills", "amnesia-precommit", "scripts", "mutation_check.py",
 ))
+RAZOR_SCRIPT = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "skills", "amnesia-precommit", "scripts", "precommit_razor.py",
+))
 
 PROD = "def style(xml_style, scanned):\n    return xml_style or scanned\n"
 LIVE_TEST = "from prod import style\nassert style(None, 'Normal') == 'Normal'\n"
@@ -82,6 +85,16 @@ class TestMutationCheck(unittest.TestCase):
       self.assertEqual(res.returncode, 1, res.stdout)
       self.assertIn("does not compile", res.stdout)
       self.assert_clean(tmp)
+
+  def test_precommit_razor_verdict(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      self.make_repo(tmp, LIVE_TEST)
+      res = subprocess.run(
+          [sys.executable, RAZOR_SCRIPT, "--repo", tmp],
+          capture_output=True, text=True, check=False,
+      )
+      self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+      self.assertIn("[PRECOMMIT-RAZOR] Verdict: PASS", res.stdout)
 
 
 if __name__ == "__main__":

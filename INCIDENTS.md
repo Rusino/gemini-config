@@ -15,4 +15,6 @@ Why each rule exists. Not loaded into context; read when a rule looks odd or bef
 | — | `rules/outgoing_text_verification.md` (CanvasKit suite) | Skia CL 1418376 broke the Flutter roll PR 196144 on `SkParagraph kitchensink` (`LineMetrics.left` 2.5 → 0) and was reverted in Skia CL 1420816 |
 | — | `skills/amnesia-precommit/references/commit_message.md` (`Tested:`) | Skia CL 1417397 PS1 kept only a single-test `Test:` line after all gates were green |
 | — | `skills/amnesia-precommit/references/commit_message.md` (google3 wording) | A draft on Skia CL 1418836 PS1 blurred the google3 corpus into "Google-internal clients" |
+| — | `skills/amnesia-precommit/SKILL.md` (no silent `Not covered:` demotion) | On Skia CL 1418376 PS2–PS6, Stage A caught `B3` visual-vs-logical RTL shift loss and the host agent silently skipped `keeper_skeptic` and wrote `"Not covered: ... for bidi lines"` |
+| — | `skills/amnesia-precommit/references/gates.md` (SkParagraph perf gate) | Skia `daf82dad48` (`SkASSERT_RELEASE` in the `SkSpan` ctor, `include/core/`) slowed `LongLayout` by 21.6% and no gate noticed |
 | 2026-11-07 | rules budget | `communication_style.md` and `agentapi_visible_chats.md` exceeded the rules token budget and were silently not injected; always-on rules were ~83 KB |
