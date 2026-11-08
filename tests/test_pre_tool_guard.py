@@ -907,7 +907,11 @@ class TestPreToolGuard(unittest.TestCase):
         )
 
   def test_corpus_check_guard_scopes_to_push_repo_and_accepts_subagent_report(self):
-    with tempfile.TemporaryDirectory() as skia, tempfile.TemporaryDirectory() as config, \
+    # The guard treats /tmp paths as agent files and never gates them, so on Linux the fake
+    # checkouts live under $HOME (macOS temp dirs are under /var/folders and passed already)
+    home = os.path.expanduser("~")
+    with tempfile.TemporaryDirectory(dir=home, prefix=".ptg_skia_") as skia, \
+         tempfile.TemporaryDirectory(dir=home, prefix=".ptg_config_") as config, \
          tempfile.NamedTemporaryFile("w", suffix=".jsonl") as f_trans:
       for repo in (skia, config):
         subprocess.run(["git", "init", "-q", repo], check=True)
