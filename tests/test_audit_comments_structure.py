@@ -148,6 +148,24 @@ class AuditCppStructureTest(unittest.TestCase):
     issues = audit_comments.audit_cpp_structure("src/Map.h", lines, added, True)
     self.assertEqual(_ids(issues), [("L3", "TEMPLATE_NO_WHY")])
 
+  # Test headers that name a contract ID or a bug pass; others get a non-blocking advisory, and
+  # tests with no header are left to TEST_NO_HEADER
+  def test_contract_or_bug_advisory(self):
+    cpp = ("// CT12: getLineMetrics ascent matches the strut\nDEF_TEST(A, r) {}\n"
+           "// Pins Flutter issue 187181\nDEF_TEST(B, r) {}\n"
+           "// Keeps utf8 offsets in range\nDEF_TEST(C, r) {}\n"
+           "DEF_TEST(D, r) {}\n"
+           "/** See crbug/576664769. */\nDEF_TEST(E, r) {}\n"
+           "// R88 restore: checks the newline contract\nDEF_TEST(F, r) {}\n")
+    lines, added = _all(cpp)
+    out = audit_comments.advisory_test_references("tests/ATest.cpp", lines, added)
+    self.assertEqual(_ids(out), [("L6", "TEST_NO_CONTRACT_OR_BUG")])
+    dart = "void main() {\n  // Wraps long words.\n  test('a', () {});\n}\n"
+    lines, added = _all(dart)
+    self.assertEqual(
+        _ids(audit_comments.advisory_test_references("test/a_test.dart", lines, added)),
+        [("L3", "TEST_NO_CONTRACT_OR_BUG")])
+
   # Test macros need a header comment in C++ and Dart test files; .cpp skips FUNC_NO_CONTRACT
   def test_test_headers(self):
     cpp = ("#include \"tests/Test.h\"\n\nDEF_TEST(A, r) {\n}\n\n"
@@ -203,6 +221,13 @@ class AuditCommentsCliTest(unittest.TestCase):
     self.assertEqual(res.returncode, 1, res.stdout)
     self.assertIn("[ISSUE] src/Map.h:L1: WHOLE_FILE_IFDEF", res.stdout)
     self.assertIn("[ISSUE] src/Map.h:L31: TEMPLATE_NO_WHY", res.stdout)
+
+  # The contract/bug advisory is printed but never fails the audit (trial rule)
+  def test_contract_advisory_does_not_fail_audit(self):
+    self.write("tests/ATest.cpp", "// Wraps long words\nDEF_TEST(A, r) {}\n")
+    res = self.run_audit("--diff", "HEAD")
+    self.assertEqual(res.returncode, 0, res.stdout)
+    self.assertIn("[ADVISORY tests/ATest.cpp:L2] TEST_NO_CONTRACT_OR_BUG", res.stdout)
 
   # --commit reads a past commit without checkout, even after the tree moved on
   def test_commit_mode_reads_blobs_from_revision(self):

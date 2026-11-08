@@ -87,6 +87,17 @@ TEST_NO_HEADER_MSG = (
     "TEST_NO_HEADER: new test has no 1-2 line header comment above it (which contract it checks "
     "and why that edge matters; code_style.md)"
 )
+# Contract IDs (CT12, SEL3) or the word contract, and bug or roadmap references (#123, b/123,
+# crbug/123, issues.skia.org, GitHub issues, "Flutter issue", R88)
+# IDs stay case-sensitive so words such as utf8 do not pass for a contract ID
+CONTRACT_OR_BUG_RE = re.compile(
+    r"\b[A-Z]{2,3}\d{1,3}\b|(?i:contract|flutter issue)|#\d+|\bb/\d+|crbug(?:\.com)?/\d+"
+    r"|issues\.skia\.org|skia:\d+|github\.com/\S+/issues/\d+|\bR\d+\b"
+)
+TEST_NO_CONTRACT_OR_BUG_MSG = (
+    "TEST_NO_CONTRACT_OR_BUG: test header names neither a contract ID nor a bug "
+    "(rules/contract_first.md trial)"
+)
 
 
 def _comment_line_indices(lines):
@@ -164,6 +175,32 @@ def _whole_file_ifdef(lines):
       if depth == 0:
         return sig[pos][1] if j == len(sig) - 1 else None
   return None
+
+
+def advisory_test_references(rel_path, lines, added_lines):
+  """Return (span, message) advisories for new tests whose header names no contract or bug.
+
+  Tests without any header are left to the blocking TEST_NO_HEADER check. Advisory only: the
+  contract-first workflow is a trial, so these never fail the audit.
+  """
+  is_cpp = rel_path.endswith(CPP_SUFFIXES)
+  if not (is_cpp or rel_path.endswith("_test.dart")):
+    return []
+  test_re = CPP_TEST_RE if is_cpp else DART_TEST_RE
+  comment_lines = _comment_line_indices(lines)
+  out = []
+  for ln in sorted(added_lines):
+    idx = ln - 1
+    if not (0 <= idx < len(lines) and test_re.match(lines[idx])):
+      continue
+    # The header is the whole comment block directly above the test line
+    start = idx
+    while start - 1 in comment_lines:
+      start -= 1
+    header = "\n".join(lines[start:idx])
+    if header and not CONTRACT_OR_BUG_RE.search(header):
+      out.append((f"L{ln}", TEST_NO_CONTRACT_OR_BUG_MSG))
+  return out
 
 
 def audit_cpp_structure(rel_path, lines, added_lines, is_new_file):
@@ -637,6 +674,8 @@ def main():
   if args.commit:
     args.diff = f"{args.commit}^!"
 
+  # Trial checks collect here and never count toward the exit code
+  advisories = []
   if args.diff:
     added_map, uncommented_hunks = parse_git_diff(repo, args.diff)
     new_files = new_files_in_diff(repo, args.diff)
@@ -657,6 +696,8 @@ def main():
       if check_cl_hygiene:
         issues.extend(audit_added_code_leaks(lines, added_lines))
       issues.extend(audit_cpp_structure(rel_path, lines, added_lines, rel_path in new_files))
+      advisories += [(rel_path, span, msg)
+                     for span, msg in advisory_test_references(rel_path, lines, added_lines)]
       for span, msg in issues:
         print(f"[ISSUE] {rel_path}:{span}: {msg}")
         total_issues += 1
@@ -677,6 +718,12 @@ def main():
           total_issues += 1
         for span, text in extract_commit_disclaimers(head_msg):
           disclaimers.append(("HEAD commit-msg", span, text))
+
+    # Printed like the uncommented-hunk list: shown to the agent, not counted as violations
+    if advisories:
+      print("\n=== Tests Without a Contract or Bug Reference (advisory) ===")
+      for rel_path, span, msg in advisories:
+        print(f"[ADVISORY {rel_path}:{span}] {msg}")
 
     if uncommented_hunks:
       print("\n=== Uncommented Diff Hunks (Add a comment if the change is non-trivial, even 1 line) ===")

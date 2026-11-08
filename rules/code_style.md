@@ -36,6 +36,7 @@ description: "When editing source code or tests, writing code comments, commit m
 - Tests check behavior through the public API (`Paragraph`, `TextLine` visitors); internal state
   (`runs()`, `clusters()`, run counts) only with a why-comment when that structure is the
   contract, never as a precondition for reading glyphs
+- New features start from a contract catalog (`rules/contract_first.md`)
 - Hard limit of 100 columns for every line (`clang-format -style=file`)
 
 ## Commit messages, CL/PR descriptions, review replies
