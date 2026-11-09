@@ -2584,14 +2584,303 @@ _FLASH_ONLY_SUBAGENT_ROLE_RE = re.compile(
     r"|\bdoc\s+fact-checker\b)",
     re.IGNORECASE,
 )
+# Mechanical lookup and verification subagent types that must never inherit Claude/Opus
+_FLASH_ONLY_SUBAGENT_TYPES = frozenset({
+    "research-google",
+    "jetski-guide",
+    "keeper_skeptic",
+})
+_POLLING_PROMPT_RE = re.compile(
+    r"\b(?:poll\w*|check\w*|status|progress|wait\w*|complet\w*|finish\w*"
+    r"|running|task\w*|subagent\w*|build\w*|test\w*|tryjob\w*|canar\w*|roll\w*|leg\b)"
+    r"|(?:провер|статус|задач|субагент|готов|заверш|прогон|сборк)",
+    re.IGNORECASE,
+)
+_REACTIVE_TASK_MSG_RE = re.compile(
+    r'Task id\s+"[^"]+"\s+(?:finished|was canceled)\s+with result:'
+    r"|Background command is still running after\s+\d+s"
+    r"|\(iteration\s+\d+\)"
+)
+_SYS_SENDER_RE = re.compile(r"\bsender=([^\s>\"']+)")
+_BG_LAUNCH_RE = re.compile(
+    r"Tool is running as a background task with task id:\s*(\S+)"
+)
+_SUBAGENT_LAUNCH_RE = re.compile(r'"conversationId":\s*"([^"]+)"')
 
 
-# Blocks invoke_subagent calls that route to Model="pro" or run script/doc jobs on flagship quota
-def subagent_model_routing_denial(tool_args: dict) -> str:
+def _unquote_arg_str(val: object) -> str:
+  return str(val if val is not None else "").strip().strip('"').strip("'")
+
+
+def run_command_wait_denial(tool_args: dict) -> str:
+  """Blocks intermediate WaitMsBeforeAsync (1000..9999) and un-notified 500ms non-daemon calls."""
+  if not isinstance(tool_args, dict) or "WaitMsBeforeAsync" not in tool_args:
+    return ""
+  raw_wait = _unquote_arg_str(tool_args.get("WaitMsBeforeAsync"))
+  if not raw_wait:
+    return ""
+  try:
+    wait_ms = int(raw_wait)
+  except ValueError:
+    return ""
+
+  raw_daemon = tool_args.get("IsDaemon")
+  is_daemon = (
+      raw_daemon is True or _unquote_arg_str(raw_daemon).lower() == "true"
+  )
+  raw_notif = _unquote_arg_str(tool_args.get("NotificationTimeoutSeconds"))
+  notif_s: int | None = None
+  if raw_notif:
+    try:
+      notif_s = int(raw_notif)
+    except ValueError:
+      notif_s = None
+
+  # Intermediate wait windows (e.g. 5000ms) prematurely background 5-9s commands
+  if 1000 <= wait_ms <= 9999:
+    return (
+        f"[WAIT-MS GUARD] Intermediate `WaitMsBeforeAsync={wait_ms}` (1000..9999 ms) is "
+        "blocked because commands taking a few seconds background prematurely and trigger "
+        "wasteful `bg_task_notification` wakeups. Pass `WaitMsBeforeAsync=10000` for "
+        "synchronous commands, or `WaitMsBeforeAsync=500` paired with "
+        "`NotificationTimeoutSeconds` (e.g. `300`-`5400`) for genuinely long background "
+        "builds/tests (or `IsDaemon=true` for indefinite daemons)."
+    )
+  if wait_ms < 1000:
+    if wait_ms != 500:
+      return (
+          f"[WAIT-MS GUARD] `WaitMsBeforeAsync={wait_ms}` is invalid. Use either "
+          "`WaitMsBeforeAsync=10000` for synchronous commands or `WaitMsBeforeAsync=500` "
+          "paired with `NotificationTimeoutSeconds` for long background builds/tests."
+      )
+    if not is_daemon and (notif_s is None or notif_s <= 0):
+      return (
+          "[WAIT-MS GUARD] `WaitMsBeforeAsync=500` on a non-daemon command requires a "
+          "positive `NotificationTimeoutSeconds` (e.g. `300`-`5400`) so the runtime wakes "
+          "you without manual polling (pass `IsDaemon=true` only for indefinite servers, "
+          "or `WaitMsBeforeAsync=10000` for synchronous commands)."
+      )
+  return ""
+
+
+def _polling_call_label(
+    tool_name: str, tool_args: dict, has_active_async: bool, prior_polls: int
+) -> str:
+  """Returns a diagnostic label if `(tool_name, tool_args)` is a manual polling call, else ''."""
   if not isinstance(tool_args, dict):
     return ""
-  model = str(tool_args.get("Model") or "inherit").strip().lower()
-  role = str(tool_args.get("Role") or "").strip()
+  if tool_name == "manage_task":
+    action = _unquote_arg_str(tool_args.get("Action")).lower()
+    if action in ("status", "list"):
+      return f'manage_task(Action="{action}")'
+    return ""
+  if tool_name == "manage_subagents":
+    action = _unquote_arg_str(tool_args.get("Action")).lower()
+    if action == "list":
+      return 'manage_subagents(Action="list")'
+    return ""
+  if tool_name == "schedule":
+    if _unquote_arg_str(tool_args.get("CronExpression")):
+      return ""
+    cond = _unquote_arg_str(tool_args.get("TimerCondition")).lower()
+    prompt = _unquote_arg_str(tool_args.get("Prompt"))
+    if (
+        (cond and cond != "never")
+        or has_active_async
+        or prior_polls > 0
+        or bool(_POLLING_PROMPT_RE.search(prompt))
+    ):
+      return "schedule(DurationSeconds)"
+  return ""
+
+
+def _load_ordered_transcript_steps(
+    transcript_path: str, current_step_idx: int = -1
+) -> list[dict]:
+  """Loads JSONL transcript steps prior to `current_step_idx`, supporting unindexed fixtures."""
+  if not transcript_path or not os.path.isfile(transcript_path):
+    return []
+  indexed: dict[int, dict] = {}
+  unindexed: list[dict] = []
+  try:
+    with open(transcript_path, "r", encoding="utf-8", errors="ignore") as f:
+      for raw in f:
+        line = raw.strip()
+        if not line:
+          continue
+        try:
+          obj = json.loads(line)
+        except ValueError:
+          continue
+        if not isinstance(obj, dict):
+          continue
+        idx = obj.get("step_index")
+        if idx is not None:
+          i_val = int(idx)
+          if current_step_idx < 0 or i_val < current_step_idx:
+            indexed[i_val] = obj
+        else:
+          unindexed.append(obj)
+  except (OSError, ValueError, TypeError):
+    return []
+  ordered = [indexed[k] for k in sorted(indexed.keys())]
+  ordered.extend(unindexed)
+  return ordered
+
+
+def polling_loop_denial(
+    tool_name: str,
+    tool_args: dict,
+    transcript_path: str,
+    current_step_idx: int = -1,
+) -> str:
+  """Allows at most 1 task/subagent/timer status check per user turn or reactive wakeup window."""
+  if tool_name not in ("manage_task", "manage_subagents", "schedule"):
+    return ""
+  steps = _load_ordered_transcript_steps(transcript_path, current_step_idx)
+  prior_polls = 0
+  active_bg_tasks: set[str] = set()
+  active_subagents: set[str] = set()
+  pending_kinds: list[str] = []
+
+  for i, step in enumerate(steps):
+    stype = step.get("type", "")
+    s_idx = step.get("step_index")
+    if stype == "USER_INPUT":
+      prior_polls = 0
+      pending_kinds.clear()
+    elif stype == "SYSTEM_MESSAGE":
+      pending_kinds.clear()
+      content = str(step.get("content") or "")
+      if "stop hook blocked termination" in content.lower():
+        continue
+      if i == 0 and s_idx in (None, 0):
+        prior_polls = 0
+        continue
+      m_done = re.search(
+          r'Task id\s+"([^"]+)"\s+(?:finished|was canceled)\s+with result:',
+          content,
+      )
+      m_snd = _SYS_SENDER_RE.search(content)
+      sender = m_snd.group(1).strip() if m_snd else ""
+      if m_done:
+        tid = m_done.group(1).strip()
+        active_bg_tasks.discard(tid)
+        active_bg_tasks.discard(tid.split("/")[-1])
+        prior_polls = 0
+      elif _REACTIVE_TASK_MSG_RE.search(content):
+        prior_polls = 0
+      elif sender and "/task-" not in sender:
+        active_subagents.discard(sender)
+        prior_polls = 0
+      # One-shot schedule timer wakeups (sender=<conv>/task-<N>) do not reset prior_polls
+    elif stype == "PLANNER_RESPONSE":
+      tcs = step.get("tool_calls") or []
+      limit = len(tcs)
+      if i == len(steps) - 1 and current_step_idx >= 0 and s_idx is not None:
+        s_i = int(s_idx)
+        if s_i < current_step_idx <= s_i + len(tcs):
+          limit = current_step_idx - s_i - 1
+      pending_kinds = []
+      for tc in tcs[:limit]:
+        tn = tc.get("name", "")
+        ta = tc.get("args") or {}
+        if _polling_call_label(
+            tn, ta, bool(active_bg_tasks or active_subagents), prior_polls
+        ):
+          prior_polls += 1
+        if tn == "run_command":
+          raw_d = ta.get("IsDaemon")
+          is_d = raw_d is True or _unquote_arg_str(raw_d).lower() == "true"
+          pending_kinds.append("daemon" if is_d else "cmd")
+        elif tn == "schedule":
+          pending_kinds.append("schedule")
+        elif tn == "invoke_subagent":
+          pending_kinds.append("subagent")
+        elif (
+            tn == "manage_task"
+            and _unquote_arg_str(ta.get("Action")).lower() == "kill"
+        ):
+          tid = _unquote_arg_str(ta.get("TaskId"))
+          active_bg_tasks.discard(tid)
+          active_bg_tasks.discard(tid.split("/")[-1])
+        elif tn == "manage_subagents":
+          act = _unquote_arg_str(ta.get("Action")).lower()
+          if act == "kill_all":
+            active_subagents.clear()
+          elif act == "kill":
+            for cid in ta.get("ConversationIds") or []:
+              active_subagents.discard(_unquote_arg_str(cid))
+    elif stype == "GENERIC":
+      content = str(step.get("content") or "")
+      m_bg = _BG_LAUNCH_RE.search(content)
+      m_sub = _SUBAGENT_LAUNCH_RE.search(content)
+      if m_bg:
+        kind = pending_kinds.pop(0) if pending_kinds else "cmd"
+        if kind == "cmd":
+          tid = m_bg.group(1).strip()
+          active_bg_tasks.add(tid)
+          active_bg_tasks.add(tid.split("/")[-1])
+      elif m_sub and "subagent" in pending_kinds:
+        pending_kinds.remove("subagent")
+        active_subagents.add(m_sub.group(1).strip())
+      elif pending_kinds and (
+          "exited with code" in content.lower()
+          or "No output from the command" in content
+      ):
+        pending_kinds.pop(0)
+
+  cur_label = _polling_call_label(
+      tool_name,
+      tool_args,
+      bool(active_bg_tasks or active_subagents),
+      prior_polls,
+  )
+  if not cur_label or prior_polls < 1:
+    return ""
+  return (
+      f"[POLLING GUARD] Repeated manual polling (`{cur_label}`) in the same execution "
+      "window is blocked (at most 1 status check is allowed per turn or reactive wakeup). "
+      "Do NOT poll background tasks or subagents in a loop or via one-shot `schedule` "
+      "timers: end your turn now (call 0 tools) and wait for the reactive "
+      "`SYSTEM_MESSAGE` wakeup."
+  )
+
+
+def subagent_step_budget_denial(
+    tool_name: str,
+    parent_conv_id: str,
+    transcript_path: str,
+    current_step_idx: int = -1,
+) -> str:
+  """Hard-blocks all subagent tool calls except `send_message` at >= 60 planner steps."""
+  if not parent_conv_id or tool_name == "send_message":
+    return ""
+  from context_guard import (
+      SUBAGENT_HARD_PLANNER_STEPS,
+      count_subagent_planner_steps,
+  )
+
+  planner_steps = count_subagent_planner_steps(transcript_path, current_step_idx)
+  if planner_steps < SUBAGENT_HARD_PLANNER_STEPS:
+    return ""
+  return (
+      f"[SUBAGENT STEP BUDGET GUARD] Subagent has reached {planner_steps} "
+      f"`PLANNER_RESPONSE` steps (hard limit: {SUBAGENT_HARD_PLANNER_STEPS}), so `{tool_name}` "
+      "is blocked to prevent runaway 200K+ context burn. Call ONLY `send_message` to "
+      f"report your current findings and remaining work to parent `{parent_conv_id}`, "
+      "or finish your turn immediately with 0 tool calls."
+  )
+
+
+def subagent_model_routing_denial(tool_args: dict) -> str:
+  """Blocks Model='pro' and enforces explicit Model='flash' on lookup/skeptic/runner subagents."""
+  if not isinstance(tool_args, dict):
+    return ""
+  raw_model = _unquote_arg_str(tool_args.get("Model")).lower()
+  model = raw_model or "inherit"
+  type_name = _unquote_arg_str(tool_args.get("TypeName"))
+  role = _unquote_arg_str(tool_args.get("Role"))
   # Never allow Model="pro" which routes to the unreliable Gemini 3.1 Pro bucket
   if model == "pro":
     return (
@@ -2600,6 +2889,18 @@ def subagent_model_routing_denial(tool_args: dict) -> str:
         "Use `Model=\"flash\"` for test/corpus/build runners, mechanical lookups, document "
         "fact-checking, and routine `keeper_skeptic` batches, or `Model=\"inherit\"` for "
         "deep C++/concurrency/BiDi semantic analysis."
+    )
+  # Mechanical/lookup/skeptic subagent types must not inherit Claude/Opus at 2.75x cost/call
+  if type_name.lower() in _FLASH_ONLY_SUBAGENT_TYPES and model not in (
+      "flash",
+      "flash_lite",
+  ):
+    shown_model = raw_model or "<omitted -> inherit>"
+    return (
+        f"[SUBAGENT-MODEL GUARD] Subagent `TypeName=\"{type_name}\"` must specify explicit "
+        f"`Model=\"flash\"` (got `Model=\"{shown_model}\"`), so parent Claude/Opus sessions "
+        "do not accidentally run mechanical lookup or skeptic subagents on flagship models "
+        "at 2.75x cost/call."
     )
   # Require Model="flash" (or "flash_lite") for test/corpus/build runners and doc fact-checkers
   if role and _FLASH_ONLY_SUBAGENT_ROLE_RE.search(role) and model not in ("flash", "flash_lite"):
@@ -5016,12 +5317,47 @@ def main() -> None:
   parent_conv_id = data.get("parentConversationId", "")
   artifact_dir = data.get("artifactDirectoryPath", "")
   workspace_paths = data.get("workspacePaths") or []
-  # macOS Antigravity omits parentConversationId in stdin; resolve it so subagents
-  # share their parent's worktree leases and skip top-level handoff/exploration guards
-  if not parent_conv_id and conv_id:
-    from context_guard import resolve_parent_conversation_id
+  # macOS Antigravity and transcript-only fixtures omit parentConversationId in stdin;
+  # resolve it so subagents share leases, skip root handoffs, and enforce step budgets
+  if not parent_conv_id and (conv_id or transcript_path):
+    from context_guard import detect_subagent_parent
 
-    parent_conv_id = resolve_parent_conversation_id(data)
+    parent_conv_id = detect_subagent_parent(data)
+
+  step_idx_val = int(data.get("stepIdx", -1))
+  if parent_conv_id:
+    budget_denial = subagent_step_budget_denial(
+        tool_name, parent_conv_id, transcript_path, step_idx_val
+    )
+    if budget_denial:
+      print(
+          json.dumps(
+              {"decision": "deny", "reason": budget_denial}, ensure_ascii=False
+          )
+      )
+      return
+
+  if tool_name == "run_command":
+    wait_denial = run_command_wait_denial(tool_args)
+    if wait_denial:
+      print(
+          json.dumps(
+              {"decision": "deny", "reason": wait_denial}, ensure_ascii=False
+          )
+      )
+      return
+
+  if tool_name in ("manage_task", "manage_subagents", "schedule"):
+    poll_denial = polling_loop_denial(
+        tool_name, tool_args, transcript_path, step_idx_val
+    )
+    if poll_denial:
+      print(
+          json.dumps(
+              {"decision": "deny", "reason": poll_denial}, ensure_ascii=False
+          )
+      )
+      return
 
   if tool_name in EDIT_TOOLS:
     denial = roadmap_edit_denial(get_tool_target_file(tool_args), conv_id)

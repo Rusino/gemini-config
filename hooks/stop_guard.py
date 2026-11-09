@@ -1021,6 +1021,8 @@ def analyze_current_turn(transcript_path: str) -> dict:
   planner_texts_since_ask: list[str] = []
   # Track latest wakeup index so parallel-subagent question blocks key per wakeup
   last_wakeup_idx = -1
+  # Exempt compact [CLICKABLE LINKS GUARD] postscripts from final_context_preservation_guard
+  is_links_postscript_step = False
 
   for idx in ordered_indices:
     if idx <= last_user_idx:
@@ -1035,8 +1037,11 @@ def analyze_current_turn(transcript_path: str) -> dict:
       has_ask = any(tc.get("name") == "ask_question" for tc in tool_calls)
       if has_ask:
         planner_texts_since_ask.clear()
+        is_links_postscript_step = False
       elif step_text.strip():
         planner_texts_since_ask.append(step_text.strip())
+      if tool_calls:
+        is_links_postscript_step = False
       if step_text.strip():
         last_planner_text = step_text
       # Keep asked_question scoped to the latest non-empty or tool-calling step
@@ -1148,6 +1153,9 @@ def analyze_current_turn(transcript_path: str) -> dict:
       last_wakeup_idx = idx
       # Inspect system message body for timer recurrence or background completion
       content = str(step.get("content", ""))
+      is_links_postscript_step = "[CLICKABLE LINKS GUARD]" in content and (
+          "stop hook blocked termination" in content.lower()
+      )
       if CRON_WAKEUP_RE.search(content):
         scheduled_timer = True
       m_exit = EXIT_CODE_RE.search(content)
@@ -1223,6 +1231,7 @@ def analyze_current_turn(transcript_path: str) -> dict:
       "is_continuation_turn": is_continuation_turn,
       # Expose wakeup boundary to parallel-subagent question guard
       "last_wakeup_idx": last_wakeup_idx,
+      "is_links_postscript_step": is_links_postscript_step,
   }
 
 
@@ -1540,7 +1549,11 @@ def unreliable_model_guard_reason(info: dict, state: dict) -> str:
 
 # Prevents context loss when a post-wakeup/post-ship tail or continuation reply drops the full report
 def final_context_preservation_guard_reason(info: dict) -> str:
-  if info.get("asked_question") or info.get("launched_new_conv"):
+  if (
+      info.get("asked_question")
+      or info.get("launched_new_conv")
+      or info.get("is_links_postscript_step")
+  ):
     return ""
   last_text = str(
       info.get("final_planner_text") or info.get("last_planner_text") or ""
@@ -1886,7 +1899,8 @@ def main() -> None:
     )
     return
 
-  # Block bare CL/PR/PS/draft/bug mentions lacking a clickable URL nearby once per turn
+  # Require every mentioned entity to be linked at least once (and in tables/lists) without
+  # forcing regeneration when later prose paragraphs name an already-linked entity
   links_reason = ""
   reply_for_links = str(
       info.get("final_planner_text") or info.get("last_planner_text") or ""

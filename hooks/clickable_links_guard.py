@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""clickable_links_guard.py — block chat replies containing bare unlinked entity IDs.
+"""clickable_links_guard.py — block chat replies containing unlinked entity mentions.
 
-Checks the final planner reply in stop_guard.py for bare mentions of Gerrit CLs,
-Piper CLs, patchsets (PS<N>), Gerrit comment/draft hex IDs (xxxxxxxx_xxxxxxxx),
-GitHub PRs/issues, Buganizer/crbug issues, and Buildbucket build IDs that lack a
-clickable URL for that object nearby.
+Requires every mentioned Gerrit CL, Piper CL, patchset (PS<N>), GitHub PR/issue,
+Buganizer/crbug issue, or CI build in stop_guard.py to be formatted as a clickable
+[label](https://...) link at least once in the reply and in every table row or list
+item, while strictly banning 5-8 digit cl/<N> Gerrit typos and bare xxxxxxxx_xxxxxxxx
+comment/draft IDs anywhere in the reply.
 """
 
 from __future__ import annotations
@@ -35,7 +36,10 @@ CLI_OR_PATH_SPAN_RE = re.compile(
     r"|\s--[A-Za-z0-9_-]+"
     r"|\.(?:py|sh|js|ts|cpp|cc|h|dart|json|jsonl|md)\b"
 )
-BLOCK_BOUNDARY_RE = re.compile(r"\n\s*\n|\n\s*(?:[-*+]|\d+\.)\s|\n#")
+LIST_ITEM_START_RE = re.compile(r"^\s*(?:[-*+•]|\d+[.)])\s+")
+HEADING_START_RE = re.compile(r"^\s*#+\s")
+TABLE_ROW_START_RE = re.compile(r"^\s*\|")
+BARE_GERRIT_CL_SHORTLINK_RE = re.compile(r"^cl/\d{5,8}$", re.IGNORECASE)
 
 GERRIT_HOST_URL_RE = re.compile(
     r"^https?://(?:[a-z0-9.-]*-review\.(?:googlesource|git\.corp\.google)\.com"
@@ -108,8 +112,6 @@ ENTITY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(r"(?<![/\w.-])build\s+#?(8\d{18})\b", re.IGNORECASE),
     ),
 )
-
-NEARBY_CHAR_WINDOW = 220
 
 
 def _mask_span(buf: list[str], start: int, end: int) -> None:
@@ -193,8 +195,70 @@ def _url_matches_entity(
   return False
 
 
+def _segment_markdown_blocks(text: str) -> list[tuple[str, int, int]]:
+  """Splits `text` into ('table_row' | 'list_item' | 'prose', start, end) blocks."""
+  blocks: list[tuple[str, int, int]] = []
+  pos = 0
+  cur_kind = ""
+  cur_start = 0
+  for raw_line in text.splitlines(keepends=True):
+    line_start = pos
+    line_end = pos + len(raw_line)
+    pos = line_end
+    stripped = raw_line.strip()
+    if not stripped:
+      if cur_kind:
+        blocks.append((cur_kind, cur_start, line_start))
+        cur_kind = ""
+      continue
+    if TABLE_ROW_START_RE.match(raw_line):
+      if cur_kind:
+        blocks.append((cur_kind, cur_start, line_start))
+        cur_kind = ""
+      blocks.append(("table_row", line_start, line_end))
+      continue
+    if HEADING_START_RE.match(raw_line):
+      if cur_kind:
+        blocks.append((cur_kind, cur_start, line_start))
+        cur_kind = ""
+      blocks.append(("prose", line_start, line_end))
+      continue
+    if LIST_ITEM_START_RE.match(raw_line):
+      if cur_kind:
+        blocks.append((cur_kind, cur_start, line_start))
+      cur_kind = "list_item"
+      cur_start = line_start
+      continue
+    if not cur_kind:
+      cur_kind = "prose"
+      cur_start = line_start
+  if cur_kind:
+    blocks.append((cur_kind, cur_start, len(text)))
+  return blocks
+
+
+def _url_matches_patchset_for_cls(
+    url: str, ps_ident: str, gerrit_cls: set[str]
+) -> bool:
+  """Verifies a patchset link matches `ps_ident` and, when present, a CL in `gerrit_cls`."""
+  if not _url_matches_entity(url, "patchset", ps_ident, in_md_link=True):
+    return False
+  if not gerrit_cls or PIPER_HOST_URL_RE.match(url.rstrip(".,;:!?)")):
+    return True
+  u = url.rstrip(".,;:!?)")
+  return any(
+      bool(
+          re.search(
+              rf"/{re.escape(cl_id)}/(?:\d+\.\.)?{re.escape(ps_ident)}(?:[/?#]|$)",
+              u,
+          )
+      )
+      for cl_id in gerrit_cls
+  )
+
+
 def find_unlinked_entities(text: str) -> list[str]:
-  """Returns bare entity tokens in `text` that have no matching URL nearby"""
+  """Returns entity mentions violating response-level or table/list link invariants."""
   if not text or not text.strip():
     return []
 
@@ -207,7 +271,8 @@ def find_unlinked_entities(text: str) -> list[str]:
   url_spans = [
       (m.start(), m.end(), m.group(0)) for m in HTTP_URL_RE.finditer(clean_base)
   ]
-  md_links: list[tuple[int, int, str]] = []
+  # Store (link_start, label_start, label_end, link_end, target) for Markdown links
+  md_links: list[tuple[int, int, int, int, str]] = []
   scan_buf = list(clean_base)
 
   if ATTESTATION_MARKER_RE.search(clean_base):
@@ -221,7 +286,7 @@ def find_unlinked_entities(text: str) -> list[str]:
     if target.startswith(("conversation://", "file://")):
       _mask_span(scan_buf, m.start(), m.end())
     else:
-      md_links.append((label_start, label_end, target))
+      md_links.append((m.start(), label_start, label_end, m.end(), target))
       # Mask only the (target) tail so entities inside [label] are validated against target
       _mask_span(scan_buf, label_end, m.end())
 
@@ -239,23 +304,24 @@ def find_unlinked_entities(text: str) -> list[str]:
       _mask_span(scan_buf, m.start(), m.end())
 
   scan_text = "".join(scan_buf)
+  blocks = _segment_markdown_blocks(clean_base)
 
-  # Precompute paragraph/bullet block boundaries so nearby URLs never cross bullets or paragraphs
-  boundaries = [0]
-  for m in BLOCK_BOUNDARY_RE.finditer(clean_base):
-    boundaries.append(m.start())
-    boundaries.append(m.end())
-  boundaries.append(len(clean_base))
+  def _find_block(pos: int) -> tuple[str, int, int]:
+    for b_kind, b_lo, b_hi in blocks:
+      if b_lo <= pos < b_hi:
+        return b_kind, b_lo, b_hi
+    return "prose", 0, len(clean_base)
 
-  def _block_bounds(pos: int) -> tuple[int, int]:
-    lo, hi = 0, len(clean_base)
-    for b in boundaries:
-      if b <= pos:
-        lo = b
-      elif b > pos:
-        hi = b
-        break
-    return lo, hi
+  # Index Gerrit CL IDs mentioned in each block so `CL 1414017 PS1` checks 1414017's PS1 URL
+  block_gerrit_cls: dict[tuple[int, int], set[str]] = {}
+  for kind, pat in ENTITY_PATTERNS:
+    if kind not in ("gerrit_cl", "gerrit_cl_cs"):
+      continue
+    for m in pat.finditer(scan_text):
+      ident = next((g for g in m.groups() if g is not None), "")
+      if ident:
+        _, b_lo, b_hi = _find_block(m.start())
+        block_gerrit_cls.setdefault((b_lo, b_hi), set()).add(ident)
 
   missing: list[tuple[int, str]] = []
   for kind, pat in ENTITY_PATTERNS:
@@ -263,10 +329,16 @@ def find_unlinked_entities(text: str) -> list[str]:
       ident = next((g for g in m.groups() if g is not None), "")
       if not ident:
         continue
+      raw_tok = m.group(0).strip()
       m_start, m_end = m.start(), m.end()
-      matched_link = False
 
-      for l_start, l_end, target in md_links:
+      # 5-8 digit cl/<N> opens Google3 Piper, not Gerrit; ban it everywhere in the reply
+      if kind == "gerrit_cl" and BARE_GERRIT_CL_SHORTLINK_RE.match(raw_tok):
+        missing.append((m_start, raw_tok))
+        continue
+
+      matched_link = False
+      for _, l_start, l_end, _, target in md_links:
         if l_start <= m_start and m_end <= l_end:
           if _url_matches_entity(target, kind, ident, in_md_link=True):
             matched_link = True
@@ -274,31 +346,56 @@ def find_unlinked_entities(text: str) -> list[str]:
       if matched_link:
         continue
 
-      b_lo, b_hi = _block_bounds(m_start)
-      win_lo = max(b_lo, m_start - NEARBY_CHAR_WINDOW)
-      win_hi = min(b_hi, m_end + NEARBY_CHAR_WINDOW)
-      for u_start, u_end, u_str in url_spans:
-        if u_end >= win_lo and u_start <= win_hi:
-          if _url_matches_entity(u_str, kind, ident):
+      # Raw xxxxxxxx_xxxxxxxx comment/draft IDs outside [label](https://...) are banned everywhere
+      if kind == "comment_id":
+        missing.append((m_start, raw_tok))
+        continue
+
+      b_kind, b_lo, b_hi = _find_block(m_start)
+      cls_in_block = block_gerrit_cls.get((b_lo, b_hi), set())
+
+      # Check clickable [label](https://...) links within the current table row / list item / block
+      for mk_start, _, _, mk_end, target in md_links:
+        if mk_start >= b_lo and mk_end <= b_hi:
+          if kind == "patchset":
+            if _url_matches_patchset_for_cls(target, ident, cls_in_block):
+              matched_link = True
+              break
+          elif _url_matches_entity(target, kind, ident, in_md_link=True):
             matched_link = True
             break
+
+      # Prose paragraphs may refer by name to an entity already linked [label](https://...)
+      # at least once anywhere in the response (table rows and list items must link locally)
+      if not matched_link and b_kind == "prose":
+        for _, _, _, _, target in md_links:
+          if kind == "patchset":
+            if _url_matches_patchset_for_cls(target, ident, cls_in_block):
+              matched_link = True
+              break
+          elif _url_matches_entity(target, kind, ident, in_md_link=True):
+            matched_link = True
+            break
+
       if not matched_link:
-        missing.append((m_start, m.group(0).strip()))
+        missing.append((m_start, raw_tok))
 
   missing.sort(key=lambda x: x[0])
   return list(dict.fromkeys(tok for _, tok in missing))
 
 
 def clickable_links_reason(reply_text: str) -> str:
-  """Formats the [CLICKABLE LINKS GUARD] block message if bare entities are present"""
+  """Formats the [CLICKABLE LINKS GUARD] block message if unlinked entities are present"""
   unlinked = find_unlinked_entities(reply_text)
   if not unlinked:
     return ""
   shown = ", ".join(f"`{t}`" for t in unlinked[:8])
   # Jetski keeps the earlier step visible, so append a short postscript instead of duplicating
   header = (
-      "[CLICKABLE LINKS GUARD] Your reply contains unlinked entity or draft/patchset "
-      f"mentions without a matching URL nearby: {shown}.\n"
+      "[CLICKABLE LINKS GUARD] Your reply contains entity mentions that were never "
+      "formatted as a clickable `[label](https://...)` link in this response (or are "
+      "unlinked inside a table row / list item, or use banned `cl/<5-8 digits>` / bare "
+      f"`xxxxxxxx_xxxxxxxx` comment IDs): {shown}.\n"
       "Do NOT repeat or rewrite your earlier message (it is already rendered above in chat). "
       "Append ONLY a compact 1-3 line links postscript (in the chat language, e.g. `**Links:**`) "
       "with clickable Markdown links (`[label](https://...)`) for those mentions (or a 1-line "
@@ -308,7 +405,7 @@ def clickable_links_reason(reply_text: str) -> str:
   return (
       header
       + "- `[Skia CL 1414016 PS1](https://skia-review.googlesource.com/c/skia/+/1414016/1)` "
-      "(never `http://cl/<5-8 digits>`: `cl/` opens Google3 Piper, not Gerrit)\n"
+      "(never `cl/<5-8 digits>`: `cl/` opens Google3 Piper, not Gerrit)\n"
       "- Published comment: "
       "`[comment](https://skia-review.googlesource.com/c/skia/+/1414016/comment/<id>/)`; "
       "unpublished draft: link to the patchset URL (never output a bare hex draft ID)\n"

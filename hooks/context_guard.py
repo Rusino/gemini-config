@@ -49,6 +49,13 @@ SOFT_REMIND_EVERY_STEPS = 20
 MAX_TURN_INVOCATIONS = int(os.environ.get("JETSKI_MAX_TURN_INVOCATIONS", "40"))
 # Lets the agent finish the handoff tool calls without re-tripping the breaker
 SNOOZE_TURN_INVOCATIONS = 25
+# Subagents cannot hand off via chat_lifecycle; bound their planner steps directly
+SUBAGENT_WARN_PLANNER_STEPS = int(
+    os.environ.get("JETSKI_SUBAGENT_WARN_STEPS", "45")
+)
+SUBAGENT_HARD_PLANNER_STEPS = int(
+    os.environ.get("JETSKI_SUBAGENT_HARD_STEPS", "60")
+)
 
 DEFAULT_LOG_PATH = "~/.gemini/config/logs/context_guard.jsonl"
 LOG_MAX_BYTES = 1_000_000
@@ -263,6 +270,7 @@ _SUBAGENT_SENDER_RE = re.compile(
     r"\[Message\]\s+timestamp=\S+\s+sender="
     r"([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})(?=\s|$)"
 )
+_SUBAGENT_STEP0_SENDER_RE = re.compile(r"\bsender=([^\s>\"']+)")
 
 
 # Resolves a subagent's parent conversation ID across Linux and macOS hook payloads
@@ -317,6 +325,73 @@ def resolve_parent_conversation_id(data: dict) -> str:
       parent = str(row[0] or "").strip()
       return parent if parent != conv_id else ""
   return ""
+
+
+def detect_subagent_parent(data: dict) -> str:
+  """Returns parent conversation ID when `data` belongs to a subagent, else ''."""
+  parent = resolve_parent_conversation_id(data)
+  if parent:
+    return parent
+  transcript_path = str(data.get("transcriptPath") or "").strip()
+  conv_id = str(data.get("conversationId") or "").strip()
+  if not transcript_path or not os.path.isfile(transcript_path):
+    return ""
+  try:
+    with open(transcript_path, "r", encoding="utf-8", errors="ignore") as f:
+      for raw in f:
+        line = raw.strip()
+        if not line:
+          continue
+        step0 = json.loads(line)
+        if (
+            isinstance(step0, dict)
+            and step0.get("step_index") in (None, 0)
+            and step0.get("type") == "SYSTEM_MESSAGE"
+        ):
+          m = _SUBAGENT_STEP0_SENDER_RE.search(str(step0.get("content") or ""))
+          if m:
+            sender = m.group(1).strip()
+            # Background task/timer senders contain /task-; subagent senders name the parent chat
+            if sender and "/task-" not in sender and sender != conv_id:
+              return sender
+        break
+  except (OSError, ValueError, TypeError):
+    return ""
+  return ""
+
+
+def count_subagent_planner_steps(
+    transcript_path: str, current_step_idx: int = -1
+) -> int:
+  """Counts distinct PLANNER_RESPONSE steps in `transcript_path` prior to `current_step_idx`."""
+  if not transcript_path or not os.path.isfile(transcript_path):
+    return 0
+  planner_indices: set[int] = set()
+  fallback_seq = -1_000_000
+  try:
+    with open(transcript_path, "r", encoding="utf-8", errors="ignore") as f:
+      for raw in f:
+        line = raw.strip()
+        if not line or "PLANNER_RESPONSE" not in line:
+          continue
+        try:
+          obj = json.loads(line)
+        except ValueError:
+          continue
+        if not isinstance(obj, dict) or obj.get("type") != "PLANNER_RESPONSE":
+          continue
+        raw_idx = obj.get("step_index")
+        if raw_idx is not None:
+          idx = int(raw_idx)
+          if current_step_idx >= 0 and idx >= current_step_idx:
+            continue
+          planner_indices.add(idx)
+        else:
+          fallback_seq += 1
+          planner_indices.add(fallback_seq)
+  except (OSError, ValueError, TypeError):
+    return 0
+  return len(planner_indices)
 
 
 def get_conversation_db_info(
@@ -1991,10 +2066,42 @@ def append_log(record: dict) -> None:
 
 def run(data: dict, log: dict) -> dict:
   """Decides the hook output for one PreInvocation event and fills `log`."""
-  # Skip battle mode forks and subagents (resolving parent ID via DB/transcript on macOS)
-  if data.get("isBattleMode") or resolve_parent_conversation_id(data):
+  if data.get("isBattleMode"):
     log["level"] = "skip"
     return {}
+
+  # Subagents skip root-chat handoffs, but enforce a 45/60-step planner budget
+  sub_parent = detect_subagent_parent(data)
+  if sub_parent:
+    sub_tp = str(data.get("transcriptPath") or "")
+    planner_steps = count_subagent_planner_steps(sub_tp)
+    if planner_steps < SUBAGENT_WARN_PLANNER_STEPS:
+      log["level"] = "skip"
+      return {}
+    log.update(
+        conv=data.get("conversationId", ""),
+        parent=sub_parent,
+        planner_steps=planner_steps,
+    )
+    if planner_steps >= SUBAGENT_HARD_PLANNER_STEPS:
+      log["level"] = "subagent_hard"
+      return _inject(
+          f"[SUBAGENT STEP BUDGET EXCEEDED] Subagent has reached {planner_steps}"
+          f" PLANNER_RESPONSE steps (hard limit: {SUBAGENT_HARD_PLANNER_STEPS})."
+          " All tool calls except `send_message` are now blocked by"
+          " `pre_tool_guard.py`. Immediately report your consolidated findings"
+          f" and any remaining work back to your parent agent (`{sub_parent}`)"
+          " via `send_message` or finish your turn now."
+      )
+    log["level"] = "subagent_warn"
+    return _inject(
+        f"[SUBAGENT STEP BUDGET WARNING] Subagent has reached"
+        f" {planner_steps}/{SUBAGENT_HARD_PLANNER_STEPS} PLANNER_RESPONSE steps"
+        f" (warning threshold: {SUBAGENT_WARN_PLANNER_STEPS}). Wrap up your"
+        " current check now and report your findings and any remaining work"
+        f" back to your parent agent (`{sub_parent}`) before hitting the"
+        f" {SUBAGENT_HARD_PLANNER_STEPS}-step hard tool block."
+    )
 
   conv_id = data.get("conversationId", "")
   transcript_path = data.get("transcriptPath", "")
