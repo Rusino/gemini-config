@@ -4362,6 +4362,32 @@ eval(code);
   assert(bubble.innerHTML.includes('Gemini Pro Orchestrator · Pinned'));
   activeBadge.dispatchEvent('mouseleave');
 
+  // R134: 512k/1M windows cap badge denominator at 256k to match context_guard.py thresholds
+  activeGmList.push(makeEntry(170000, 1000000, -1));
+  fakeNow += 2000;
+  bumpActiveSummary(14);
+  await flushAsync();
+  assert.strictEqual(activeBadge.getAttribute('data-level'), 'turn-start');
+  assert.strictEqual(activeBadge.getAttribute('data-compacted'), 'false');
+  assert.strictEqual(activeBadge.textContent, 'Opus 5.5 (Med) · 170k / 256k · 66%');
+  activeBadge.dispatchEvent('mouseenter');
+  assert(bubble.innerHTML.includes('170,000 / 256,000 tokens (capped from 1M)'));
+  assert(bubble.innerHTML.includes('86,000 free'));
+  assert(bubble.innerHTML.includes('Status: Turn-start limit (&gt;= 65%)'));
+  activeBadge.dispatchEvent('mouseleave');
+
+  // Smaller windows (< 256k) preserve their exact denominator without cap suffix
+  activeGmList.push(makeEntry(78080, 128000, -1));
+  fakeNow += 2000;
+  bumpActiveSummary(15);
+  await flushAsync();
+  assert.strictEqual(activeBadge.getAttribute('data-level'), 'soft');
+  assert.strictEqual(activeBadge.textContent, '78k / 128k · 61%');
+  activeBadge.dispatchEvent('mouseenter');
+  assert(bubble.innerHTML.includes('78,080 / 128,000 tokens · 49,920 free'));
+  assert(!bubble.innerHTML.includes('capped from'));
+  activeBadge.dispatchEvent('mouseleave');
+
   // Cleanup cancels any pending throttle timer and removes all context badges
   fakeNow += 100;
   bumpActiveSummary(3);

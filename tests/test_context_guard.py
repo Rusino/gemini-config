@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -39,6 +40,7 @@ class TestContextGuard(unittest.TestCase):
         "JETSKI_ROADMAPS_DIR": os.path.join(self.tmp.name, "roadmaps"),
         # Isolate project metadata so existing tests do not read live projects/*.json
         "JETSKI_PROJECTS_DIR": os.path.join(self.tmp.name, "projects"),
+        "JETSKI_CONTEXT_MAX_CAP": "",
     })
     self.env.start()
     self.db_info = patch.object(
@@ -1034,6 +1036,89 @@ class TestContextGuard(unittest.TestCase):
       )
       self.assertEqual(notice_skip, "", prompt)
       self.assertFalse(changed_skip, prompt)
+
+  # R134: caps handoff denominator at 256k on 512k/1M windows while keeping smaller caps
+  def test_large_context_window_caps_handoff_denominator_at_256k(self):
+    # 170k on a 512k model must evaluate as 170k / 256k = 66.4% (soft mid-turn, hard at turn start)
+    self.mock_rpc.return_value = gm_response(170000, cap=512000)
+    msg_mid = self.message(self.run_guard(inv=2, steps=100))
+    self.assertIn("SOFT LIMIT", msg_mid)
+    self.assertIn("170k/256k tokens, capped from 512k", msg_mid)
+    log_mid = self.last_log()
+    self.assertEqual(
+        (log_mid["level"], log_mid["pct"], log_mid["max"], log_mid["raw_max"]),
+        ("soft", 66.4, 256000, 512000),
+    )
+
+    # 170k on a 1M model at turn start triggers HANDOFF REQUIRED (>= 65%)
+    self.mock_rpc.return_value = gm_response(170000, cap=1000000)
+    msg_start = self.message(self.run_guard(inv=0, steps=110))
+    self.assertIn("HANDOFF REQUIRED", msg_start)
+    self.assertIn("170k/256k tokens, capped from 1000k", msg_start)
+    log_start = self.last_log()
+    self.assertEqual(
+        (log_start["level"], log_start["pct"], log_start["max"], log_start["raw_max"]),
+        ("hard", 66.4, 256000, 1000000),
+    )
+
+    # Smaller context windows (< 256k) keep their true denominator without raw_max noise
+    context_guard.save_state(
+        os.path.join(self.artifact_dir, "scratch", ".context_guard_state.json"), {}
+    )
+    self.mock_rpc.return_value = gm_response(80000, cap=128000)
+    msg_small = self.message(self.run_guard(inv=2, steps=140))
+    self.assertIn("SOFT LIMIT", msg_small)
+    self.assertIn("80k/128k tokens)", msg_small)
+    log_small = self.last_log()
+    self.assertEqual(
+        (log_small["level"], log_small["pct"], log_small["max"]),
+        ("soft", 62.5, 128000),
+    )
+    self.assertNotIn("raw_max", log_small)
+
+    # JETSKI_CONTEXT_MAX_CAP env override lowers or disables (0) the cap dynamically
+    with patch.dict(os.environ, {"JETSKI_CONTEXT_MAX_CAP": "200000"}):
+      self.mock_rpc.return_value = gm_response(135000, cap=512000)
+      msg_env = self.message(self.run_guard(inv=0, steps=160))
+      self.assertIn("HANDOFF REQUIRED", msg_env)
+      self.assertIn("135k/200k tokens, capped from 512k", msg_env)
+      self.assertEqual(self.last_log()["pct"], 67.5)
+
+    context_guard.save_state(
+        os.path.join(self.artifact_dir, "scratch", ".context_guard_state.json"), {}
+    )
+    with patch.dict(os.environ, {"JETSKI_CONTEXT_MAX_CAP": "0"}):
+      self.mock_rpc.return_value = gm_response(170000, cap=512000)
+      self.assertEqual(self.run_guard(inv=2, steps=180), {})
+      self.assertEqual((self.last_log()["level"], self.last_log()["pct"]), ("none", 33.2))
+
+    # Malformed or pre-import JETSKI_CONTEXT_MAX_CAP must never crash CLI import or poison 256k
+    hook_py = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "hooks", "context_guard.py")
+    )
+    proc_bad = subprocess.run(
+        [sys.executable, hook_py],
+        input=json.dumps({
+            "conversationId": "c-cli-bad-cap",
+            "invocationNum": 2,
+            "initialNumSteps": 100,
+            "transcriptPath": self.transcript,
+            "artifactDirectoryPath": self.artifact_dir,
+        }),
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "JETSKI_CONTEXT_MAX_CAP": "256k",
+            "JETSKI_CONTEXT_GUARD_LOG": self.log_path,
+            "JETSKI_ROADMAPS_DIR": os.path.join(self.tmp.name, "roadmaps"),
+            "JETSKI_PROJECTS_DIR": os.path.join(self.tmp.name, "projects"),
+        },
+        check=False,
+    )
+    self.assertEqual(proc_bad.returncode, 0, proc_bad.stderr)
+    self.assertIsInstance(json.loads(proc_bad.stdout), dict)
+    self.assertEqual(self.last_log()["max"], 256000)
 
 
 if __name__ == "__main__":

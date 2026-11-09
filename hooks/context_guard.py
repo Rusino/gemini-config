@@ -36,6 +36,8 @@ DEFAULT_TIMEZONE = os.environ.get("JETSKI_TIMEZONE", "America/New_York")
 SOFT_PCT = float(os.environ.get("JETSKI_CONTEXT_SOFT_PCT", "60"))
 TURN_START_PCT = float(os.environ.get("JETSKI_CONTEXT_TURN_START_PCT", "65"))
 HARD_PCT = float(os.environ.get("JETSKI_CONTEXT_HARD_PCT", "80"))
+# Cap the handoff denominator so 512K/1M models still hand off around 154K/166K/205K
+MAX_CONTEXT_CAP = 256000
 RPC_TIMEOUT_S = 1.5
 # Fallback when the RPC fails: real transcripts average ~2 bytes per token
 # (a 360 KB transcript_full.jsonl was 176k tokens), not the ~4 often assumed
@@ -1776,12 +1778,19 @@ def save_state(state_path: str, state: dict, conv_id: str = "") -> None:
 def measure_context(conv_id: str, transcript_path: str, gm_count_hint: int) -> dict:
   """Context usage of the last model call via the LS RPC, else a KB estimate.
 
-  Returns pct/tokens/max/ckpt plus `fallback`, `err` and `gm_count` (number of
-  generator metadata entries). The count is reused as the next offset because
-  every entry embeds the full system prompt, so an unpaged response grows by
-  ~8 KB per model call.
+  Returns pct/tokens/max/raw_max/ckpt plus `fallback`, `err` and `gm_count`
+  (number of generator metadata entries), capping `max` at `MAX_CONTEXT_CAP`
+  (unless `JETSKI_CONTEXT_MAX_CAP` is `0`) so 512K/1M models do not drift past
+  200K. The count is reused as the next offset because every entry embeds the
+  full system prompt, so an unpaged response grows by ~8 KB per model call.
   """
   m = {"fallback": False, "err": "", "gm_count": gm_count_hint}
+  # Read JETSKI_CONTEXT_MAX_CAP dynamically so env overrides apply without reload
+  env_cap = (os.environ.get("JETSKI_CONTEXT_MAX_CAP") or "").strip()
+  try:
+    max_cap = int(env_cap) if env_cap else MAX_CONTEXT_CAP
+  except ValueError:
+    max_cap = MAX_CONTEXT_CAP
   t0 = time.monotonic()
   try:
     import chat_lifecycle
@@ -1819,11 +1828,14 @@ def measure_context(conv_id: str, transcript_path: str, gm_count_hint: int) -> d
       cwm = csm.get("contextWindowMetadata") or {}
       if "estimatedTokensUsed" in cwm and int(cwm.get("maxContextTokens") or 0) > 0:
         used = int(cwm["estimatedTokensUsed"])
-        cap = int(cwm["maxContextTokens"])
+        raw_cap = int(cwm["maxContextTokens"])
+        # Keep 60%/65%/80% thresholds anchored near 154k/166k/205k on 512k/1M windows
+        cap = min(raw_cap, max_cap) if max_cap > 0 else raw_cap
         m.update(
             pct=100.0 * used / cap,
             tokens=used,
             max=cap,
+            raw_max=raw_cap,
             # The LS sends -1 until the first compaction and then omits the
             # field, because proto3 JSON drops the zero value of checkpoint #0
             ckpt=int(csm.get("checkpointIndex", 0)),
@@ -1835,10 +1847,14 @@ def measure_context(conv_id: str, transcript_path: str, gm_count_hint: int) -> d
   tokens = int(
       get_transcript_size_kb(transcript_path) * 1024 / FALLBACK_BYTES_PER_TOKEN
   )
+  fallback_cap = (
+      min(FALLBACK_MAX_TOKENS, max_cap) if max_cap > 0 else FALLBACK_MAX_TOKENS
+  )
   m.update(
-      pct=100.0 * tokens / FALLBACK_MAX_TOKENS,
+      pct=100.0 * tokens / fallback_cap,
       tokens=tokens,
-      max=FALLBACK_MAX_TOKENS,
+      max=fallback_cap,
+      raw_max=FALLBACK_MAX_TOKENS,
       ckpt=-1,
       fallback=True,
   )
@@ -2037,10 +2053,13 @@ def resolve_quota_exhaustion_hold_notice(conv_id: str, m: dict, state: dict) -> 
 
 
 def _usage_str(m: dict) -> str:
+  """Formats the context usage dict from measure_context for guard prompts."""
   est = ", estimated from transcript size" if m["fallback"] else ""
+  raw_max = int(m.get("raw_max") or m["max"])
+  cap_note = f", capped from {raw_max // 1000}k" if raw_max > m["max"] else ""
   return (
       f"{m['pct']:.0f}% of the context window"
-      f" ({m['tokens'] // 1000}k/{m['max'] // 1000}k tokens{est})"
+      f" ({m['tokens'] // 1000}k/{m['max'] // 1000}k tokens{cap_note}{est})"
   )
 
 
@@ -2348,6 +2367,9 @@ def run(data: dict, log: dict) -> dict:
       ckpt=m["ckpt"],
       fallback=m["fallback"],
   )
+  # Preserve the model's reported window in JSONL telemetry when capped at MAX_CONTEXT_CAP
+  if int(m.get("raw_max") or m["max"]) > m["max"]:
+    log["raw_max"] = int(m["raw_max"])
   if m["err"]:
     log["err"] = m["err"]
   if m["gm_count"] != state.get("gm_count", 0):

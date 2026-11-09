@@ -69,6 +69,8 @@
   const CONTEXT_SOFT_PCT = 60;
   const CONTEXT_TURN_START_PCT = 65;
   const CONTEXT_HARD_PCT = 80;
+  // Cap effective handoff denominator at 256k on 512k/1M models to match context_guard.py
+  const CONTEXT_MAX_CAP = 256000;
   const CONTEXT_MIN_FETCH_INTERVAL_MS = 1200;
   const CONTEXT_RUNNING_POLL_MS = 4000;
   const CONTEXT_CACHE_MAX_ENTRIES = 64;
@@ -12534,13 +12536,15 @@
     for (let i = gm.length - 1; i >= 0; i--) {
       const csm = gm[i]?.chatModel?.chatStartMetadata;
       const cwm = csm?.contextWindowMetadata;
-      const maxTokens = Math.round(Number(cwm?.maxContextTokens) || 0);
+      const rawMaxTokens = Math.round(Number(cwm?.maxContextTokens) || 0);
       if (
-        maxTokens <= 0 ||
+        rawMaxTokens <= 0 ||
         (cwm?.estimatedTokensUsed == null && cwm?.tokenBreakdown?.totalTokens == null)
       ) {
         continue;
       }
+      // Cap denominator at 256k so 60%/65%/80% badge states match context_guard.py on 512k/1M
+      const maxTokens = Math.min(rawMaxTokens, CONTEXT_MAX_CAP);
       const usedTokens = Math.max(
         0,
         Math.round(
@@ -12582,6 +12586,7 @@
         matchedIndex: i,
         usedTokens,
         maxTokens,
+        rawMaxTokens,
         freeTokens,
         pct,
         ckpt: Number.isFinite(ckpt) ? ckpt : -1,
@@ -12687,6 +12692,7 @@
     return false;
   }
 
+  // Fetches paged generatorMetadata for cascadeId, updates contextUsageCache, and schedules UI sync
   async function triggerContextUsageFetch(cascadeId) {
     if (disposed || !cascadeId) return;
     const entry = getOrCreateContextCacheEntry(cascadeId);
@@ -12712,14 +12718,11 @@
       if (!disposed && res.ok) {
         entry.summarySig = reqSig;
         entry.lastValidIndex = parsed ? usedOffset + parsed.matchedIndex : 0;
-        const prevSig = entry.info
-          ? `${entry.info.usedTokens}:${entry.info.maxTokens}:${entry.info.ckpt}:${entry.info.badgeText}`
-          : '';
+        const infoSig = (x) =>
+          x ? `${x.usedTokens}:${x.maxTokens}:${x.rawMaxTokens}:${x.ckpt}:${x.badgeText}` : '';
+        const prevSig = infoSig(entry.info);
         entry.info = parsed;
-        const nextSig = parsed
-          ? `${parsed.usedTokens}:${parsed.maxTokens}:${parsed.ckpt}:${parsed.badgeText}`
-          : '';
-        if (prevSig !== nextSig) {
+        if (prevSig !== infoSig(parsed)) {
           scheduleSync();
         }
       }
@@ -12794,6 +12797,7 @@
     void triggerContextUsageFetch(cascadeId);
   }
 
+  // Renders hover tooltip HTML from parsed context metadata and conversation ID
   function buildContextBubbleHtml(info, cascadeId) {
     const dotColors = {
       ok: '#8ab4f8',
@@ -12858,6 +12862,10 @@
     } else if (info.level === 'soft') {
       statusNote = 'Status: Soft warning (>= 60%) — handoff at micro-boundary';
     }
+    const capSuffix =
+      info.rawMaxTokens > info.maxTokens
+        ? ` (capped from ${formatCompactTokens(info.rawMaxTokens)})`
+        : '';
     return (
       `<div class="jcfb-header">` +
       `<span class="jcfb-header-left">` +
@@ -12867,8 +12875,8 @@
       `<span>${info.pct.toFixed(1)}%${escapeHtml(compactTag)}</span>` +
       `</div>` +
       `<div class="jcfb-desc">` +
-      `${formatExactInt(info.usedTokens)} / ${formatExactInt(info.maxTokens)} tokens · ` +
-      `${formatExactInt(info.freeTokens)} free` +
+      `${formatExactInt(info.usedTokens)} / ${formatExactInt(info.maxTokens)} tokens` +
+      `${escapeHtml(capSuffix)} · ${formatExactInt(info.freeTokens)} free` +
       `</div>` +
       modelBlock +
       breakdownBlock +
