@@ -5696,6 +5696,759 @@ assert.deepStrictEqual(JSON.parse(storage.get('wb_sort_v1')), { mode: 'age', dir
         f"Node sort check failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
     )
 
+  def test_r15_gh_issue_canonicalization_my_bugs_clean_review_and_multichannel(self) -> None:
+    # Verify gh_issue canonicalization, fresh My Bugs projection, clean-review promotion,
+    # correspondence inbound vs silence-ping reasons, and true multi-channel detection
+    import ingestor
+    import work_store
+
+    now = 1_762_700_000.0
+    store = work_store.WorkStore(self.db_path)
+
+    # Seed a legacy bogus buganizer:<gh_id> row to verify sync/purge migration cleans it up
+    store.upsert_artifact(
+        "buganizer:196106",
+        kind="buganizer",
+        title="b/196106: Legacy mis-keyed GitHub issue",
+        url="https://github.com/flutter/flutter/issues/196106",
+        state={"assignee": "Rusino", "status": "OPEN"},
+        now=now - 500,
+    )
+    # Seed a legacy non-flutter GitHub row whose url fell back to chromium and has an obligation
+    store.upsert_artifact(
+        "buganizer:43",
+        kind="buganizer",
+        title="b/43: Legacy non-flutter GitHub issue",
+        url="https://issues.chromium.org/issues/43",
+        state={
+            "bug_key": "gh_issue:Rusino/paragraph#43",
+            "source": "github",
+            "title": "Paragraph wrap bug",
+            "assignee": "Rusino",
+            "status": "CLOSED",
+        },
+        now=now - 500,
+    )
+    store.upsert_artifact(
+        "github_issue:Rusino/paragraph:43",
+        kind="github_issue",
+        title="Rusino/paragraph#43",
+        url="",
+        state={},
+        now=now - 600,
+    )
+    w_legacy_mig = store.create_work("Legacy GH issue obligation migration", now=now - 500)
+    store.link_artifact(w_legacy_mig, "buganizer:43", role="primary", source="manual", now=now)
+    mig_ob_id = store.add_obligation(
+        w_legacy_mig,
+        "Close once paragraph#43 closes",
+        trigger_expr="bug_closed(buganizer:43)",
+        target_artifact_key="buganizer:43",
+        now=now - 450,
+    )
+
+    self.assertEqual(
+        work_store.canonicalize_artifact_key("gh_issue", "Rusino/paragraph#42"),
+        "github_issue:Rusino/paragraph:42",
+    )
+    self.assertEqual(
+        work_store.canonicalize_artifact_key("buganizer", "b/384910293"),
+        "buganizer:384910293",
+    )
+    self.assertEqual(
+        work_store.canonicalize_watcher_bug("b/384910293", {"title": "T"})[0],
+        "buganizer:384910293",
+    )
+    self.assertEqual(
+        work_store._default_artifact_url("github_issue:Rusino/paragraph:42"),
+        "https://github.com/Rusino/paragraph/issues/42",
+    )
+
+    cl_state = {
+        "bugs": {
+            "gh_issue:flutter/flutter#196106": {
+                "bug_key": "gh_issue:flutter/flutter#196106",
+                "source": "github",
+                "tracker_flavor": "github",
+                "id": "196106",
+                "url": "https://github.com/flutter/flutter/issues/196106",
+                "title": "Arabic ligature cut across spans",
+                "status": "OPEN",
+                "assignee": "mdebbar, Rusino",
+                "is_stale_backlog": False,
+                "modified_ts": now - 120,
+            },
+            "gh_issue:flutter/flutter#193731": {
+                "bug_key": "gh_issue:flutter/flutter#193731",
+                "source": "github",
+                "id": "193731",
+                "url": "https://github.com/flutter/flutter/issues/193731",
+                "title": "WebParagraph line metrics diverge",
+                "status": "OPEN",
+                "assignee": "Rusino",
+                "lane": "assigned",
+                "is_stale_backlog": False,
+                "modified_ts": now - 200,
+            },
+            "gh_issue:Rusino/paragraph#42": {
+                "bug_key": "gh_issue:Rusino/paragraph#42",
+                "source": "github",
+                "id": "42",
+                "url": "https://github.com/Rusino/paragraph/issues/42",
+                "title": "TS paragraph line height",
+                "status": "OPEN",
+                "assignee": "Rusino",
+                "lane": "has_cl",
+                "is_stale_backlog": False,
+                "modified_ts": now - 150,
+            },
+            "buganizer:580955594": {
+                "bug_key": "buganizer:580955594",
+                "source": "buganizer",
+                "id": "580955594",
+                "title": "Crash in SkScalerContextProxy",
+                "status": "ASSIGNED",
+                "assignee": "jlavrova@google.com",
+                "lane": "you",
+                "needs_you": True,
+                "why_needs_you": "Blunderbuss SLO ping",
+                "is_stale_backlog": False,
+                "modified_ts": now - 60,
+            },
+            "buganizer:40000001": {
+                "bug_key": "buganizer:40000001",
+                "source": "buganizer",
+                "id": "40000001",
+                "title": "Ancient stale backlog ticket",
+                "status": "ASSIGNED",
+                "assignee": "jlavrova@google.com",
+                "lane": "assigned",
+                "is_stale_backlog": True,
+                "modified_ts": now - 86400 * 400,
+            },
+            "buganizer:520529526": {
+                "bug_key": "buganizer:520529526",
+                "source": "buganizer",
+                "id": "520529526",
+                "title": "Shared SkSpan static extent bug",
+                "status": "ASSIGNED",
+                "assignee": "fmalita@google.com",
+                "lane": "you",
+                "needs_you": True,
+                "why_needs_you": "Your fix CL merged on shared bug — add Collaborator?",
+                "is_stale_backlog": False,
+                "modified_ts": now - 90,
+            },
+        },
+        "items": {
+            "github:195999": {
+                "kind": "github_pr",
+                "target_id": "flutter/flutter:195999",
+                "subject": "Fix Arabic ligature shaping",
+                "url": "https://github.com/flutter/flutter/pull/195999",
+                "status": "OPEN",
+                "role": "author",
+                "is_self": True,
+                "linked_bugs": [
+                    {
+                        "bug_key": "flutter#196106",
+                        "title": "Arabic ligature cut across spans",
+                        "status": "OPEN",
+                    }
+                ],
+                "entity_state": {"lane": "waiting", "status": "waiting"},
+                "updated_ts": now - 100,
+            },
+            "gerrit:1420111": {
+                "kind": "gerrit",
+                "host": "skia",
+                "target_id": "1420111",
+                "patchset": 2,
+                "subject": "[SkoreText] Fix TS paragraph line height",
+                "status": "NEW",
+                "role": "author",
+                "is_self": True,
+                "linked_bugs": [
+                    {
+                        "bug_key": "Rusino/paragraph#42",
+                        "title": "TS paragraph line height",
+                        "status": "OPEN",
+                    }
+                ],
+                "entity_state": {"lane": "waiting", "status": "waiting"},
+                "updated_ts": now - 95,
+            },
+            "gerrit:7686597": {
+                "kind": "gerrit",
+                "host": "chromium",
+                "target_id": "7686597",
+                "patchset": 4,
+                "subject": "skia: add opt-in Linux text correction",
+                "status": "NEW",
+                "role": "reviewer (ext)",
+                "merge_conflict": False,
+                "attention_reason": "WAITING_ON_CQ_DRY_RUN",
+                "entity_state": {
+                    "lane": "waiting",
+                    "status": "waiting",
+                    "reason": "Waiting on CQ dry run",
+                    "is_reviewer_change": True,
+                    "can_finalize_clean_review": True,
+                    "is_armed_finalize": False,
+                },
+                "updated_ts": now - 80,
+            },
+            "gerrit:7686999": {
+                "kind": "gerrit",
+                "host": "chromium",
+                "target_id": "7686999",
+                "patchset": 1,
+                "subject": "[Companion WIP] Probe for crrev/c/7686597",
+                "status": "NEW",
+                "is_companion": True,
+                "companion_to": "gerrit:chromium:7686597",
+                "updated_ts": now - 75,
+            },
+            "gerrit:1409697": {
+                "kind": "gerrit",
+                "host": "skia",
+                "target_id": "1409697",
+                "patchset": 6,
+                "subject": "Conflicted external clean review",
+                "status": "NEW",
+                "role": "reviewer (ext)",
+                "merge_conflict": True,
+                "entity_state": {
+                    "lane": "waiting",
+                    "status": "waiting",
+                    "is_reviewer_change": True,
+                    "can_finalize_clean_review": True,
+                    "is_armed_finalize": False,
+                    "spine_short_state": {"short": "Conflict"},
+                },
+                "updated_ts": now - 70,
+            },
+            "gerrit:1409888": {
+                "kind": "gerrit",
+                "host": "skia",
+                "target_id": "1409888",
+                "patchset": 1,
+                "subject": "Watched foreign CL on CC",
+                "status": "NEW",
+                "role": "cc",
+                "is_self": False,
+                "is_watching": True,
+                "entity_state": {
+                    "lane": "waiting",
+                    "status": "watching",
+                    "is_reviewer_change": False,
+                },
+                "updated_ts": now - 65,
+            },
+        },
+    }
+
+    ingestor.ingest_cl_watcher_state(store, cl_state, now=now)
+    store.purge_config_artifacts_and_works(now=now)
+    store.evaluate_all_obligations(now=now)
+
+    self.assertIsNone(store.get_artifact("buganizer:196106"))
+    gh_art = store.get_artifact("github_issue:flutter/flutter:196106")
+    self.assertIsNotNone(gh_art)
+    assert gh_art is not None
+    self.assertIn("Rusino", str((gh_art.get("state") or {}).get("assignee") or ""))
+
+    self.assertIsNone(store.get_artifact("buganizer:43"))
+    gh43 = store.get_artifact("github_issue:Rusino/paragraph:43")
+    self.assertIsNotNone(gh43)
+    assert gh43 is not None
+    self.assertEqual(gh43["url"], "https://github.com/Rusino/paragraph/issues/43")
+    self.assertEqual(gh43["title"], "Rusino/paragraph#43: Paragraph wrap bug")
+
+    # Standalone inbound email vs 7d silence-ping email should both stay Single item (not multi)
+    w_inbound = store.create_work("Inbound email ask", now=now - 300)
+    store.upsert_artifact(
+        "gmail_thread:th_in",
+        kind="gmail_thread",
+        title="Font fallback question",
+        state={
+            "is_active_correspondence": True,
+            "last_from_me": False,
+            "unanswered_human": True,
+            "last_message_ts": now - 300,
+        },
+        now=now,
+    )
+    store.link_artifact(w_inbound, "gmail_thread:th_in", role="primary", source="manual", now=now)
+    store.reconcile_correspondence_obligations(w_inbound, now=now)
+
+    # Outbound MCP comment reply >7d ago with stale last_from_me=False must wake as silence_ping
+    w_silence = store.create_work("Outbound unanswered ping", now=now - 10 * 86400)
+    store.upsert_artifact(
+        "gmail_thread:th_sil",
+        kind="gmail_thread",
+        title="Roll blocker follow-up",
+        state={
+            "is_active_correspondence": True,
+            "last_from_me": False,
+            "unanswered_human": False,
+            "last_message_ts": now - 9 * 86400,
+            "mcp_reply_ts": now - 8 * 86400,
+        },
+        now=now,
+    )
+    store.link_artifact(w_silence, "gmail_thread:th_sil", role="primary", source="manual", now=now)
+    store.reconcile_correspondence_obligations(w_silence, now=now)
+
+    # Parked auto-gated reply draft on a conflicted own CL must not leak replies into needs_you_types
+    w_parked_conflict = store.create_work("Conflicted own CL with parked reply", now=now - 500)
+    store.upsert_artifact(
+        "gerrit:skia:1418001",
+        kind="gerrit",
+        title="1418001: Fix glyph bounds",
+        state={
+            "status": "NEW",
+            "is_self": True,
+            "role": "author",
+            "merge_conflict": True,
+            "updated_ts": now - 50,
+        },
+        now=now,
+    )
+    store.upsert_artifact(
+        "gmail_thread:th_parked",
+        kind="gmail_thread",
+        title="Reporter ping",
+        state={
+            "is_active_correspondence": True,
+            "last_from_me": False,
+            "unanswered_human": True,
+            "last_message_ts": now - 400,
+        },
+        now=now,
+    )
+    store.link_artifact(
+        w_parked_conflict, "gerrit:skia:1418001", role="primary", source="manual", now=now
+    )
+    store.link_artifact(
+        w_parked_conflict, "gmail_thread:th_parked", role="channel", source="manual", now=now
+    )
+    store.save_reply_draft(
+        w_parked_conflict,
+        "Will reply once Gerrit 1418001 merges",
+        fmt="text",
+        thread_key="gmail_thread:th_parked",
+        auto_gate=True,
+        now=now - 100,
+    )
+
+    # Abandoned CL with stale cached entity_state must transition cleanly to done, not needs-you
+    w_abandoned_cl = store.create_work("Abandoned CL with stale est", now=now - 400)
+    store.upsert_artifact(
+        "gerrit:skia:1399999",
+        kind="gerrit",
+        title="1399999: Old experiment",
+        state={
+            "status": "ABANDONED",
+            "is_self": True,
+            "role": "author",
+            "merge_conflict": True,
+            "entity_state": {"lane": "you", "action_required": True},
+        },
+        now=now,
+    )
+    store.link_artifact(
+        w_abandoned_cl, "gerrit:skia:1399999", role="primary", source="manual", now=now
+    )
+
+    # Companion alert on an unhydrated stub parent must populate both work_types and needs_you_types
+    w_comp_stub = store.create_work("Companion alert on stub parent", now=now - 350)
+    store.upsert_artifact("gerrit:skia:888", kind="gerrit", title="888", state={}, now=now)
+    store.upsert_artifact(
+        "gerrit:skia:889",
+        kind="gerrit",
+        title="889: [Companion WIP] Probe for 888",
+        state={
+            "status": "NEW",
+            "is_companion": True,
+            "companion_to": "gerrit:skia:888",
+            "open_external_threads": 1,
+        },
+        now=now,
+    )
+    store.link_artifact(w_comp_stub, "gerrit:skia:888", role="primary", source="manual", now=now)
+    store.link_artifact(w_comp_stub, "gerrit:skia:889", role="primary", source="manual", now=now)
+
+    # Shared foreign bug linked to a Work should surface why_needs_you but NOT count as my-bugs
+    w_foreign_bug = store.create_work("Shared bug follow-up", now=now - 200)
+    store.link_artifact(
+        w_foreign_bug, "buganizer:520529526", role="primary", source="manual", now=now
+    )
+
+    proj = store.build_dashboard_projection(cl_watcher_state=cl_state, now=now)
+    by_id = {c["work_id"]: c for c in proj["works"]}
+
+    mig_obs = [o for o in by_id[w_legacy_mig]["obligations"] if o["obligation_id"] == mig_ob_id]
+    self.assertEqual(len(mig_obs), 1)
+    self.assertEqual(mig_obs[0]["trigger_expr"], "bug_closed(github_issue:Rusino/paragraph:43)")
+    self.assertEqual(mig_obs[0]["status"], "ready")
+
+    # Bound GitHub issue #196106 stays on its PR Work (not duplicated as virt-github_issue)
+    self.assertNotIn("virt-github_issue:flutter/flutter:196106", by_id)
+    pr_cards = [
+        c for c in proj["works"]
+        if any(a["artifact_key"] == "github_pr:flutter/flutter:195999" for a in c["artifacts"])
+    ]
+    self.assertEqual(len(pr_cards), 1)
+    self.assertIn("my-bugs", pr_cards[0]["work_types"])
+    self.assertIn("my-cls", pr_cards[0]["work_types"])
+    self.assertTrue(pr_cards[0]["is_multi_channel"])
+
+    # Unbound [SkoreText] hub CL retains its linked assigned bug in My Bugs without duplicating
+    self.assertNotIn("virt-github_issue:Rusino/paragraph:42", by_id)
+    hub_virt = by_id["virt-gerrit:skia:1420111"]
+    self.assertIn("my-bugs", hub_virt["work_types"])
+    self.assertIn("my-cls", hub_virt["work_types"])
+
+    # Fresh unbound bugs (#193731 waiting, b/580955594 needs-you) project; stale backlog is skipped
+    self.assertIn("virt-github_issue:flutter/flutter:193731", by_id)
+    self.assertEqual(by_id["virt-github_issue:flutter/flutter:193731"]["lane"], "waiting")
+    self.assertIn("my-bugs", by_id["virt-github_issue:flutter/flutter:193731"]["work_types"])
+    self.assertIn("virt-buganizer:580955594", by_id)
+    self.assertEqual(by_id["virt-buganizer:580955594"]["lane"], "needs-you")
+    self.assertIn("Blunderbuss SLO ping", " ".join(by_id["virt-buganizer:580955594"]["reasons"]))
+    self.assertNotIn("virt-buganizer:40000001", by_id)
+
+    # Foreign bug card shows why_needs_you but never matches my-bugs
+    fb_card = by_id[w_foreign_bug]
+    self.assertEqual(fb_card["lane"], "needs-you")
+    self.assertIn("add Collaborator", " ".join(fb_card["reasons"]))
+    self.assertNotIn("my-bugs", fb_card["work_types"])
+
+    # Clean non-conflicted review promotes to needs-you + reviews even with attention_reason set
+    rev_card = by_id["virt-gerrit:chromium:7686597"]
+    self.assertEqual(rev_card["lane"], "needs-you")
+    self.assertIn("Ready to CR+1", " ".join(rev_card["reasons"]))
+    self.assertIn("reviews", rev_card["needs_you_types"])
+    self.assertFalse(rev_card["is_multi_channel"])
+
+    # Watched/CC foreign CL must not pollute Reviews; abandoned CL must be done
+    self.assertNotIn("reviews", by_id["virt-gerrit:skia:1409888"]["work_types"])
+    self.assertEqual(by_id[w_abandoned_cl]["lane"], "done")
+
+    # Parked draft on conflicted own CL keeps replies in work_types but out of needs_you_types
+    pk_card = by_id[w_parked_conflict]
+    self.assertEqual(pk_card["lane"], "needs-you")
+    self.assertIn("replies", pk_card["work_types"])
+    self.assertIn("my-cls", pk_card["needs_you_types"])
+    self.assertNotIn("replies", pk_card["needs_you_types"])
+
+    # Companion alert on stub parent maintains needs_you_types <= work_types
+    cs_card = by_id[w_comp_stub]
+    self.assertEqual(cs_card["lane"], "needs-you")
+    self.assertIn("reviews", cs_card["needs_you_types"])
+    self.assertIn("reviews", cs_card["work_types"])
+
+    # Merge-conflicted external review stays in waiting rather than demanding CQ Dry Run
+    conf_rev = by_id["virt-gerrit:skia:1409697"]
+    self.assertEqual(conf_rev["lane"], "waiting")
+    self.assertIn("reviews", conf_rev["work_types"])
+
+    # Standalone correspondence Works are Single item and distinguish inbound vs 7d silence ping
+    in_card = by_id[w_inbound]
+    sil_card = by_id[w_silence]
+    self.assertFalse(in_card["is_multi_channel"])
+    self.assertFalse(sil_card["is_multi_channel"])
+    self.assertIn("replies", in_card["needs_you_types"])
+    self.assertIn("replies", sil_card["needs_you_types"])
+    self.assertTrue(any("Reply needed" in r for r in in_card["reasons"]))
+    self.assertTrue(any("silence ping" in r for r in sil_card["reasons"]))
+    self.assertEqual(in_card["obligations"][0]["correspondence_mode"], "inbound_reply")
+    self.assertEqual(sil_card["obligations"][0]["correspondence_mode"], "silence_ping")
+
+  def test_r15_two_dimensional_lane_type_filter_chips_and_live_counts(self) -> None:
+    # Verify 2D (Lane x Type) filter chips replace Multi-channel/Obligations and keep live (N)
+    # counts strictly equal to the number of rendered cards across every combination and search
+    import html as html_lib
+    import json
+    import re
+    import workbench_server
+
+    ui_proj = {
+        "synced_et": "Nov 09 16:00 ET",
+        "counts": {"needs_you": 3, "waiting": 2, "done": 1, "obligations_open": 2, "unanswered": 0},
+        "metrics": {"link_precision": 1.0},
+        "unanswered_tray": [],
+        "works": [
+            {
+                "work_id": "w_mixed_reply",
+                "title": "Email needing reply on LGTMd review",
+                "lane": "needs-you",
+                "work_types": ["replies", "reviews"],
+                "needs_you_types": ["replies"],
+                "is_multi_channel": True,
+                "activity_at": 5000,
+                "origin_at": 4000,
+                "obligations": [{
+                    "obligation_id": "ob_in_1",
+                    "kind": "correspondence",
+                    "status": "ready",
+                    "correspondence_mode": "inbound_reply",
+                    "description": "Reply to Thread alpha",
+                    "trigger_expr": "correspondence_turn(gmail_thread:t1, 7)",
+                }],
+                "artifacts": [],
+                "checklist": [],
+                "reasons": ["📨 Reply needed: Thread alpha"],
+            },
+            {
+                "work_id": "w_hot_review",
+                "title": "External SkParagraph CL needing review",
+                "lane": "needs-you",
+                "work_types": ["reviews", "my-bugs"],
+                "needs_you_types": ["reviews", "my-bugs"],
+                "is_multi_channel": True,
+                "activity_at": 4800,
+                "origin_at": 3800,
+                "obligations": [{
+                    "obligation_id": "ob_sil_1",
+                    "kind": "correspondence",
+                    "status": "ready",
+                    "correspondence_mode": "silence_ping",
+                    "description": "Follow up on ping",
+                    "trigger_expr": "correspondence_turn(gmail_thread:t2, 7)",
+                }],
+                "artifacts": [],
+                "checklist": [],
+                "reasons": ["🟢 Ready to CR+1: crrev/c/7686597 PS4"],
+            },
+            {
+                "work_id": "w_hot_own_cl",
+                "title": "Own CL with merge conflict alpha",
+                "lane": "needs-you",
+                "work_types": ["my-cls"],
+                "needs_you_types": ["my-cls"],
+                "is_multi_channel": False,
+                "activity_at": 4600,
+                "origin_at": 3600,
+                "obligations": [],
+                "artifacts": [],
+                "checklist": [],
+                "reasons": ["⚠️ Merge conflict: Gerrit 1418836"],
+            },
+            {
+                "work_id": "w_wait_bug",
+                "title": "Fresh assigned bug waiting for CL alpha",
+                "lane": "waiting",
+                "work_types": ["my-bugs"],
+                "needs_you_types": [],
+                "is_multi_channel": False,
+                "activity_at": 4400,
+                "origin_at": 3400,
+                "obligations": [],
+                "artifacts": [],
+                "checklist": [],
+                "reasons": ["Assigned bug (no CL yet)"],
+            },
+            {
+                "work_id": "w_wait_rev",
+                "title": "External PR waiting on author",
+                "lane": "waiting",
+                "work_types": ["reviews"],
+                "needs_you_types": [],
+                "is_multi_channel": False,
+                "activity_at": 4200,
+                "origin_at": 3200,
+                "obligations": [],
+                "artifacts": [],
+                "checklist": [],
+                "reasons": ["WAITING_ON_AUTHOR"],
+            },
+            {
+                "work_id": "w_done_bug",
+                "title": "Completed bug fix alpha",
+                "lane": "done",
+                "work_types": ["my-bugs", "my-cls"],
+                "needs_you_types": [],
+                "is_multi_channel": True,
+                "activity_at": 3000,
+                "origin_at": 2000,
+                "obligations": [],
+                "artifacts": [],
+                "checklist": [],
+                "reasons": ["All CLs merged and obligations satisfied"],
+            },
+        ],
+    }
+
+    html_out = workbench_server.render_workbench_html(ui_proj, ui_version=3)
+    self.assertNotIn('data-filter="multi"', html_out)
+    self.assertNotIn('data-filter="obligations"', html_out)
+
+    # Parse actual SSR <button class="wb-chip"> elements and verify initial server counts
+    parsed_lane_chips: list[dict[str, str]] = []
+    parsed_type_chips: list[dict[str, str]] = []
+    for btn_m in re.finditer(r'<button class="wb-chip"([^>]*)>', html_out):
+      attr_map = {
+          k: html_lib.unescape(v)
+          for k, v in re.findall(r'([a-zA-Z0-9_-]+)="([^"]*)"', btn_m.group(1))
+      }
+      if "data-filter" in attr_map:
+        parsed_lane_chips.append(attr_map)
+      elif "data-type" in attr_map:
+        parsed_type_chips.append(attr_map)
+    self.assertEqual(
+        {c["data-filter"]: int(c["data-count"]) for c in parsed_lane_chips},
+        {"all": 5, "needs-you": 3, "waiting": 2, "done": 1},
+    )
+    self.assertEqual(
+        {c["data-type"]: int(c["data-count"]) for c in parsed_type_chips},
+        {"all": 5, "replies": 1, "reviews": 3, "my-bugs": 2, "my-cls": 1},
+    )
+    lane_specs_json = json.dumps(parsed_lane_chips)
+    type_specs_json = json.dumps(parsed_type_chips)
+
+    match = re.search(r"<script>\n(.*?)\n</script>", html_out, re.DOTALL)
+    self.assertIsNotNone(match)
+    assert match is not None
+    script_js = match.group(1)
+
+    node_2d_test = """
+const assert = require('assert');
+function makeEl(id, extra = {}) {
+  const attrs = Object.assign({}, extra.attrs || {});
+  const listeners = {};
+  return Object.assign({
+    id,
+    value: extra.value || '',
+    textContent: extra.textContent || '',
+    innerHTML: extra.innerHTML || '',
+    disabled: false,
+    getAttribute(k) { return Object.prototype.hasOwnProperty.call(attrs, k) ? attrs[k] : null; },
+    setAttribute(k, v) { attrs[k] = String(v); },
+    hasAttribute(k) { return Object.prototype.hasOwnProperty.call(attrs, k); },
+    addEventListener(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); },
+    dispatch(ev, evtObj) { for (const fn of (listeners[ev] || [])) fn(evtObj || {}); },
+  }, extra.props || {});
+}
+const els = {
+  'wb-synced': makeEl('wb-synced'),
+  'kpi-needs': makeEl('kpi-needs'),
+  'kpi-wait': makeEl('kpi-wait'),
+  'kpi-obs': makeEl('kpi-obs'),
+  'kpi-tray': makeEl('kpi-tray'),
+  'kpi-prec': makeEl('kpi-prec'),
+  'wb-tray-container': makeEl('wb-tray-container'),
+  'wb-cards-container': makeEl('wb-cards-container'),
+  'wb-new-btn': makeEl('wb-new-btn'),
+  'wb-cancel-new': makeEl('wb-cancel-new'),
+  'wb-new-form': makeEl('wb-new-form', { props: { reset() {} } }),
+  'wb-sync-btn': makeEl('wb-sync-btn'),
+  'wb-toggle-collapse': makeEl('wb-toggle-collapse', { attrs: { 'data-action': 'collapse' } }),
+  'wb-search': makeEl('wb-search'),
+  'wb-sort-mode': makeEl('wb-sort-mode', { value: 'triage' }),
+  'wb-sort-dir': makeEl('wb-sort-dir', { attrs: { 'data-dir': 'desc' }, textContent: '↓ New' }),
+};
+const laneChips = """ + lane_specs_json + """.map((attrs) =>
+  makeEl('lane-' + attrs['data-filter'], { attrs })
+);
+const typeChips = """ + type_specs_json + """.map((attrs) =>
+  makeEl('type-' + attrs['data-type'], { attrs })
+);
+const allChips = laneChips.concat(typeChips);
+global.localStorage = { getItem: () => null, setItem: () => {} };
+global.window = { addEventListener: () => {}, getSelection: () => '', prompt: () => '' };
+global.setInterval = () => 0;
+global.fetch = async () => ({ ok: false });
+global.document = {
+  getElementById: (id) => els[id] || makeEl(id),
+  querySelectorAll: (sel) => (sel === '.wb-chip' ? allChips : []),
+  createElement: () => {
+    let txt = '';
+    return {
+      set textContent(v) { txt = String(v || ''); },
+      get innerHTML() {
+        return txt.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      },
+    };
+  },
+  body: { addEventListener: () => {} },
+};
+
+""" + script_js + """
+
+function visibleIds() {
+  const re = /data-work-id="([^"]+)"/g;
+  const out = [];
+  let m;
+  while ((m = re.exec(els['wb-cards-container'].innerHTML)) !== null) out.push(m[1]);
+  return out;
+}
+
+// Check correspondence obligation badges under Needs You and Done badge under Done
+laneChips[1].dispatch('click');
+typeChips[0].dispatch('click');
+assert(els['wb-cards-container'].innerHTML.includes('📨 NEEDS REPLY'));
+assert(els['wb-cards-container'].innerHTML.includes('⏰ 7d SILENCE PING'));
+
+laneChips[3].dispatch('click');
+assert(els['wb-cards-container'].innerHTML.includes('✅ Done'));
+assert(!els['wb-cards-container'].innerHTML.includes('⏳ Waiting'));
+
+// Check key semantic slices: Needs You + Reviews excludes w_mixed_reply (email-only urgency)
+laneChips[1].dispatch('click');
+typeChips[2].dispatch('click');
+assert.deepStrictEqual(visibleIds(), ['w_hot_review']);
+
+// Switching to All + Reviews includes all 3 active review cards
+laneChips[0].dispatch('click');
+assert.deepStrictEqual(visibleIds(), ['w_mixed_reply', 'w_hot_review', 'w_wait_rev']);
+
+// Exhaustively verify every (query, laneChip, typeChip) pair matches its displayed data-count
+for (const q of ['', 'alpha']) {
+  els['wb-search'].value = q;
+  els['wb-search'].dispatch('input', { target: els['wb-search'] });
+  for (const lc of laneChips) {
+    lc.dispatch('click');
+    for (const tc of typeChips) {
+      const advertisedTypeCnt = Number(tc.getAttribute('data-count'));
+      tc.dispatch('click');
+      const lVal = lc.getAttribute('data-filter');
+      const tVal = tc.getAttribute('data-type');
+      assert.strictEqual(
+        visibleIds().length,
+        advertisedTypeCnt,
+        `Type count mismatch for q=${q} lane=${lVal} type=${tVal}`
+      );
+      assert(tc.innerHTML.includes(`(${advertisedTypeCnt})`));
+    }
+  }
+  for (const tc of typeChips) {
+    tc.dispatch('click');
+    for (const lc of laneChips) {
+      const advertisedLaneCnt = Number(lc.getAttribute('data-count'));
+      lc.dispatch('click');
+      const tVal = tc.getAttribute('data-type');
+      const lVal = lc.getAttribute('data-filter');
+      assert.strictEqual(
+        visibleIds().length,
+        advertisedLaneCnt,
+        `Lane count mismatch for q=${q} type=${tVal} lane=${lVal}`
+      );
+      assert(lc.innerHTML.includes(`(${advertisedLaneCnt})`));
+    }
+  }
+}
+"""
+    res = subprocess.run(
+        ["node", "-e", node_2d_test], capture_output=True, text=True, check=False
+    )
+    self.assertEqual(
+        res.returncode,
+        0,
+        f"Node 2D filter check failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+    )
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -810,8 +810,8 @@ def is_placeholder_title(title: str, artifact_key: str = "") -> bool:
     return True
   # Treat bare tracker IDs and unlabelled companion tags as placeholders so real subjects win
   if re.match(
-      r"^(?:flutter#\d+|(?:b|crbug)/\d+|pr\s*#?\d+|gerrit\s+\d+"
-      r"|crrev(?:\.com)?/c/\d+|cl/\d+)$",
+      r"^(?:(?:flutter|[a-z0-9_.-]+/[a-z0-9_.-]+)#\d+|(?:b|crbug)/\d+|pr\s*#?\d+"
+      r"|gerrit\s+\d+|crrev(?:\.com)?/c/\d+|cl/\d+)$",
       tl,
   ):
     return True
@@ -1040,18 +1040,25 @@ def canonicalize_artifact_key(
       repo = "chromium" if "chrom" in host.lower() else "skia"
       return f"gerrit:{repo}:{rest}"
     if prefix in ("github", "github_pr", "pr"):
+      if "#" in rest:
+        lhs, num = rest.split("#", 1)
+        repo_slug = lhs.strip() if "/" in lhs else "flutter/flutter"
+        return f"github_pr:{repo_slug}:{num.strip()}"
       if ":" in rest:
         return f"github_pr:{rest}"
       return f"github_pr:flutter/flutter:{rest.lstrip('#')}"
     if prefix in ("github_issue", "flutter_issue", "flutter", "gh_issue"):
       if "#" in rest:
-        num = rest.split("#")[-1].strip()
-        return f"github_issue:flutter/flutter:{num}"
+        # Preserve explicit owner/repo slugs on gh_issue:<owner>/<repo>#<N> keys
+        lhs, num = rest.split("#", 1)
+        repo_slug = lhs.strip() if "/" in lhs else "flutter/flutter"
+        return f"github_issue:{repo_slug}:{num.strip()}"
       if ":" in rest:
         return f"github_issue:{rest}"
       return f"github_issue:flutter/flutter:{rest.lstrip('#')}"
     if prefix in ("buganizer", "b", "crbug"):
-      return f"buganizer:{rest}"
+      clean_bid = re.sub(r"^(?:b|crbug)/", "", rest, flags=re.IGNORECASE).strip()
+      return f"buganizer:{clean_bid}"
     if prefix in (
         "piper",
         "gmail_thread",
@@ -1072,15 +1079,25 @@ def canonicalize_artifact_key(
   if k in ("gerrit:chromium", "chromium_cl", "crrev"):
     return f"gerrit:chromium:{tid}"
   if k in ("github", "github_pr", "pr"):
+    if "#" in tid:
+      lhs, num = tid.split("#", 1)
+      repo_slug = lhs.strip() if "/" in lhs else "flutter/flutter"
+      return f"github_pr:{repo_slug}:{num.strip()}"
     if ":" in tid:
       return f"github_pr:{tid}"
     return f"github_pr:flutter/flutter:{tid.lstrip('#')}"
-  if k in ("github_issue", "flutter_issue", "flutter"):
+  if k in ("github_issue", "flutter_issue", "flutter", "gh_issue"):
+    if "#" in tid:
+      # Mirror 1-arg owner/repo#N parsing so 2-arg callers never emit un-canonicalized slugs
+      lhs, num = tid.split("#", 1)
+      repo_slug = lhs.strip() if "/" in lhs else "flutter/flutter"
+      return f"github_issue:{repo_slug}:{num.strip()}"
     if ":" in tid:
       return f"github_issue:{tid}"
     return f"github_issue:flutter/flutter:{tid.lstrip('#')}"
   if k in ("buganizer", "b", "crbug"):
-    return f"buganizer:{tid}"
+    clean_tid = re.sub(r"^(?:b|crbug)/", "", tid, flags=re.IGNORECASE).strip()
+    return f"buganizer:{clean_tid}"
   if k in (
       "piper",
       "gmail_thread",
@@ -1237,22 +1254,13 @@ def extract_cl_bug_keys(state: Mapping[str, Any] | None) -> list[str]:
   for k in st.get("linked_bug_keys") or []:
     if k:
       seen[canonicalize_artifact_key(str(k))] = None
-  # Parse structured linked_bugs entries from cl_watcher_state.json
+  # Parse structured linked_bugs entries via canonicalize_watcher_bug so repo slugs stay intact
   for lb in st.get("linked_bugs") or []:
     if not isinstance(lb, Mapping):
       continue
-    raw_bk = str(lb.get("bug_key") or lb.get("short_id") or "").strip()
-    if not raw_bk:
-      continue
-    if "#" in raw_bk:
-      num = raw_bk.split("#")[-1].strip()
-      if num.isdigit():
-        seen[canonicalize_artifact_key("flutter_issue", num)] = None
-    elif ":" in raw_bk or "/" in raw_bk:
-      num = re.split(r"[:/]", raw_bk)[-1].strip()
-      if num.isdigit():
-        kind = "flutter_issue" if len(num) <= 6 else "buganizer"
-        seen[canonicalize_artifact_key(kind, num)] = None
+    b_ck, _, _, _ = canonicalize_watcher_bug("", lb)
+    if b_ck:
+      seen[b_ck] = None
   # Parse legacy bug_ids list when present
   for bid in st.get("bug_ids") or []:
     b_str = str(bid).strip()
@@ -1295,10 +1303,93 @@ def format_short_bug_id(artifact_key: str) -> str:
   parts = str(artifact_key or "").split(":")
   tid = parts[-1] if parts else str(artifact_key or "")
   if str(artifact_key or "").startswith("github_issue:"):
+    # Keep non-flutter/flutter GitHub repos unambiguous in short labels
+    if len(parts) >= 3 and parts[1] != "flutter/flutter":
+      return f"{parts[1]}#{tid}"
     return f"flutter#{tid}"
   if str(artifact_key or "").startswith("buganizer:"):
     return f"b/{tid}"
   return tid
+
+
+_RE_GH_ISSUE_URL = re.compile(
+    r"github\.com/([^/]+/[^/]+)/issues/(\d+)", re.IGNORECASE
+)
+_MY_BUG_ASSIGNEES = frozenset({"jlavrova", "rusino"})
+
+
+def canonicalize_watcher_bug(
+    raw_key: str, bval: Mapping[str, Any]
+) -> tuple[str, str, str, str]:
+  """Resolves a cl_watcher_state bug entry into (canonical_key, kind, title, url)."""
+  rk = str(bval.get("bug_key") or bval.get("short_id") or raw_key or "").strip()
+  url = str(bval.get("url") or "").strip()
+  src = str(bval.get("source") or bval.get("tracker_flavor") or "").strip().lower()
+  desc = str(bval.get("title") or bval.get("summary") or "").strip()
+
+  # Detect GitHub issues via #, key prefix, source metadata, github URL, or <=6-digit bare IDs
+  m_gh_url = _RE_GH_ISSUE_URL.search(url)
+  rk_low = rk.lower()
+  is_bug_url = "issues.chromium.org" in url.lower() or "b.corp.google.com" in url.lower()
+  is_gh = (
+      "#" in rk
+      or rk_low.startswith(("gh_issue:", "github_issue:", "flutter_issue:"))
+      or src == "github"
+      or m_gh_url is not None
+      or (
+          not rk_low.startswith(("buganizer:", "b/", "crbug"))
+          and not is_bug_url
+          and rk.isdigit()
+          and len(rk) <= 6
+      )
+  )
+  if is_gh:
+    # Prefer canonical URL slug when available before falling back to key # syntax
+    if m_gh_url is not None:
+      repo_slug, num = m_gh_url.group(1), m_gh_url.group(2)
+    elif "#" in rk:
+      rest = rk.split(":", 1)[1] if rk_low.startswith(("gh_issue:", "github_issue:")) else rk
+      lhs, rhs = rest.split("#", 1)
+      repo_slug = lhs.strip() if "/" in lhs else "flutter/flutter"
+      num = rhs.strip()
+    elif rk_low.startswith("github_issue:") and rk.count(":") >= 2:
+      _, repo_slug, num = rk.split(":", 2)
+      repo_slug, num = repo_slug.strip(), num.strip()
+    else:
+      repo_slug = "flutter/flutter"
+      num = str(bval.get("bug_id") or bval.get("id") or rk.split(":")[-1]).strip().lstrip("#")
+    if not num.isdigit():
+      return "", "", "", ""
+    ckey = f"github_issue:{repo_slug}:{num}"
+    short_lbl = format_short_bug_id(ckey)
+    title = f"{short_lbl}: {desc}" if desc else short_lbl
+    gh_url = url if m_gh_url is not None else f"https://github.com/{repo_slug}/issues/{num}"
+    return ckey, "github_issue", title, gh_url
+
+  # Split on both ':' and '/' so 'b/384910293' and 'crbug.com/384910293' yield bare numeric IDs
+  raw_bid = str(bval.get("bug_id") or bval.get("id") or rk).strip()
+  bid = re.split(r"[:/]", raw_bid)[-1].strip()
+  if not bid.isdigit():
+    return "", "", "", ""
+  ckey = canonicalize_artifact_key("buganizer", bid)
+  title = f"b/{bid}: {desc}" if desc else f"b/{bid}"
+  return ckey, "buganizer", title, url or f"https://issues.chromium.org/issues/{bid}"
+
+
+def is_bug_assigned_to_me(state: Mapping[str, Any] | None) -> bool:
+  """Returns True when a Buganizer or GitHub issue is assigned to jlavrova or Rusino."""
+  if not isinstance(state, Mapping):
+    return False
+  est = state.get("entity_state") if isinstance(state.get("entity_state"), Mapping) else {}
+  raw = str(state.get("assignee") or est.get("assignee") or "").strip().lower()
+  if not raw:
+    return False
+  # Handle multi-assignee GitHub strings (e.g. 'mdebbar, Rusino') and Google email suffixes
+  for tok in re.split(r"[,;\s<>]+", raw):
+    clean = tok.strip()
+    if clean in _MY_BUG_ASSIGNEES or clean.startswith("jlavrova@"):
+      return True
+  return False
 
 
 def _default_artifact_url(artifact_key: str) -> str:
@@ -1310,9 +1401,13 @@ def _default_artifact_url(artifact_key: str) -> str:
   if akey.startswith("gerrit:"):
     return f"https://skia-review.googlesource.com/c/skia/+/{num}"
   if akey.startswith("github_pr:"):
-    return f"https://github.com/flutter/flutter/pull/{num}"
+    parts = akey.split(":")
+    repo_slug = parts[1] if len(parts) >= 3 and "/" in parts[1] else "flutter/flutter"
+    return f"https://github.com/{repo_slug}/pull/{num}"
   if akey.startswith("github_issue:"):
-    return f"https://github.com/flutter/flutter/issues/{num}"
+    parts = akey.split(":")
+    repo_slug = parts[1] if len(parts) >= 3 and "/" in parts[1] else "flutter/flutter"
+    return f"https://github.com/{repo_slug}/issues/{num}"
   if akey.startswith("piper:"):
     return f"http://cl/{num}"
   if akey.startswith("buganizer:"):
@@ -1410,9 +1505,49 @@ def _evaluate_companion_alerts(
 def _evaluate_cl_needs_you(akey: str, st: Mapping[str, Any]) -> str:
   """Returns the Needs You reason for a non-companion CL/PR/bug, or '' when waiting/done."""
   est = st.get("entity_state") if isinstance(st.get("entity_state"), Mapping) else {}
+  if akey.startswith(("buganizer:", "github_issue:")):
+    # Closed tracker issues never keep a Work in Needs You even if stale attention flags remain
+    if str(st.get("status") or "").strip().upper() in CLOSED_BUG_STATUSES:
+      return ""
+    bug_needs_you = (
+        bool(st.get("needs_you"))
+        or st.get("lane") == "you"
+        or bool(est.get("needs_you"))
+        or est.get("lane") == "you"
+        or bool(est.get("action_required"))
+        or est.get("category") == "needs_me"
+    )
+    if not bug_needs_you:
+      return ""
+    why_bug = str(
+        st.get("why_needs_you") or est.get("reason") or st.get("attention_reason") or ""
+    ).strip()
+    return why_bug or f"Needs action: {format_short_bug_id(akey)}"
+
+  # Suppress stale cached flags once a CL/PR is closed, abandoned, or merged without post-submit
+  status_u = str(st.get("status") or "NEW").strip().upper()
+  if status_u in ("ABANDONED", "CLOSED"):
+    return ""
+  is_open_cl = status_u in ("NEW", "OPEN")
+  if status_u in ("MERGED", "SUBMITTED") and not (
+      bool(est.get("is_post_submit_alert"))
+      or bool(est.get("action_required"))
+      or est.get("lane") == "you"
+  ):
+    return ""
+
   is_wip = bool(st.get("is_wip") or st.get("is_draft") or st.get("wip_label"))
   is_own = _is_own_cl(st, est)
-  own_conflict = is_own and not is_wip and bool(st.get("merge_conflict"))
+  own_conflict = is_open_cl and is_own and not is_wip and bool(st.get("merge_conflict"))
+  # Promote clean non-conflicted external reviews awaiting CQ Dry Run -> auto CR+1 finalization
+  clean_review_ready = (
+      is_open_cl
+      and not is_own
+      and not is_wip
+      and not bool(st.get("merge_conflict"))
+      and bool(est.get("can_finalize_clean_review"))
+      and not bool(est.get("is_armed_finalize"))
+  )
   # Ignore synthetic conflict status on foreign PRs while honoring real review/alert lanes
   est_lane_you = est.get("lane") == "you" and (is_own or est.get("status") != "conflict")
   needs_you = (
@@ -1421,12 +1556,16 @@ def _evaluate_cl_needs_you(akey: str, st: Mapping[str, Any]) -> str:
       or est_lane_you
       or bool(est.get("is_post_submit_alert"))
       or own_conflict
+      or clean_review_ready
   )
   if not needs_you:
     return ""
   short_cl = format_short_cl_id(akey, st)
-  if own_conflict or (is_own and est.get("status") == "conflict"):
+  if own_conflict or (is_open_cl and is_own and est.get("status") == "conflict"):
     return f"⚠️ Merge conflict: {short_cl}"
+  # Prioritize clean-review promotion before passive waiting reasons stored in attention_reason
+  if clean_review_ready:
+    return f"🟢 Ready to CR+1: {short_cl}"
   # Read both explicit entity_state.reason and cl_watcher's item-level attention_reason
   explicit_reason = str(est.get("reason") or st.get("attention_reason") or "").strip()
   if explicit_reason and (is_own or "conflict" not in explicit_reason.lower()):
@@ -1438,6 +1577,327 @@ def _evaluate_cl_needs_you(akey: str, st: Mapping[str, Any]) -> str:
   if not is_own and (bool(est.get("is_reviewer_change")) or st.get("role") == "reviewer"):
     return f"Needs review: {short_cl}"
   return f"Needs action: {short_cl}"
+
+
+def _is_correspondence_silence_ping(state: Mapping[str, Any] | None) -> bool:
+  """Returns True when a correspondence obligation woke up from outbound 5-7d silence."""
+  st = state or {}
+  from_me = (
+      bool(st.get("last_from_me"))
+      if "last_from_me" in st
+      else (not bool(st.get("promoted_inbound")))
+  )
+  if from_me:
+    return True
+  last_ts = float(st.get("last_message_ts") or st.get("origin_ts") or 0.0)
+  # Mirror _eval_single_predicate so manual wait, MCP comment replies, and acks match 7d pings
+  override_ts = max(
+      float(st.get("manual_wait_ts") or 0.0),
+      float(st.get("mcp_reply_ts") or 0.0),
+      float(st.get("ack_message_ts") or 0.0),
+  )
+  return override_ts > 0.0 and override_ts >= last_ts
+
+
+def _is_reviewer_cl_state(st: Mapping[str, Any], est: Mapping[str, Any]) -> bool:
+  """Returns True when Julia is an active reviewer (not CC, watcher, or removed) on a CL/PR."""
+  if bool(st.get("is_self")) or bool(st.get("is_mine")):
+    return False
+  if bool(st.get("reviewer_removed")) or bool(st.get("is_watching")):
+    return False
+  role_l = str(st.get("role") or "").strip().lower()
+  if role_l:
+    if role_l in ("author", "owner", "cc", "watcher", "watching"):
+      return False
+    if role_l.startswith("reviewer"):
+      return True
+  if "is_reviewer_change" in est:
+    return bool(est.get("is_reviewer_change"))
+  if bool(st.get("is_external")):
+    return True
+  return st.get("is_self") is False or st.get("is_mine") is False
+
+
+def _is_own_cl_state(st: Mapping[str, Any], est: Mapping[str, Any]) -> bool:
+  """Returns True when a CL/PR belongs to Julia and is not an unhydrated empty stub."""
+  if not st and not est:
+    return False
+  role_l = str(st.get("role") or "").strip().lower()
+  if bool(st.get("is_self")) or bool(st.get("is_mine")) or role_l == "author":
+    return True
+  # Require tracker metadata so empty chat-mention stubs do not masquerade as own CLs
+  has_tracker_meta = any(
+      k in st for k in ("owner", "author", "status", "entity_state", "subject")
+  )
+  return has_tracker_meta and _is_own_cl(st, est)
+
+
+def _compute_is_multi_channel(w_arts: Iterable[Mapping[str, Any]]) -> bool:
+  """Returns True when a card spans >=2 distinct non-context, non-companion channels/entities."""
+  units: set[str] = set()
+  linked_gdoc_ids: set[str] = set()
+  for art in w_arts:
+    if str(art.get("role") or "") == "context_only":
+      continue
+    akey = str(art.get("artifact_key") or "")
+    if akey.startswith("gdoc:") and ":" in akey:
+      linked_gdoc_ids.add(akey.split(":", 1)[1])
+    elif akey.startswith("gdoc_thread:") and akey.count(":") >= 2:
+      linked_gdoc_ids.add(akey.split(":", 2)[1])
+
+  for art in w_arts:
+    if str(art.get("role") or "") == "context_only":
+      continue
+    akey = str(art.get("artifact_key") or "")
+    kind = str(art.get("kind") or artifact_kind_from_key(akey))
+    st = art.get("state") if isinstance(art.get("state"), Mapping) else {}
+    # Companion WIP probes belong to their parent review/CL and do not add a channel
+    if kind in ("gerrit", "github_pr", "piper") and is_companion_artifact(
+        akey, st, str(art.get("title") or ""), str(art.get("link_reason") or "")
+    ):
+      continue
+    if kind == "chat_chain":
+      units.add("channel:chat")
+    elif kind == "gmail_draft":
+      if str(st.get("status") or "DRAFT").upper() != "DRAFT":
+        continue
+      tid = str(st.get("thread_id") or "").strip()
+      units.add(f"mail:{tid}" if tid else f"draft:{akey}")
+    elif kind == "gmail_thread":
+      # Collapse GDoc comment/share notification emails into the same channel as their doc
+      gd_id = str(st.get("gdoc_id") or "").strip()
+      if gd_id and gd_id in linked_gdoc_ids and bool(
+          st.get("is_gdoc_comment") or st.get("is_drive_share")
+      ):
+        units.add(f"gdoc:{gd_id}")
+      else:
+        tid = akey.split(":", 1)[1] if ":" in akey else akey
+        units.add(f"mail:{tid}")
+    elif kind == "gdoc_thread" and akey.count(":") >= 2:
+      units.add(f"gdoc:{akey.split(':', 2)[1]}")
+    elif kind == "gdoc":
+      doc_id = akey.split(":", 1)[1] if ":" in akey else akey
+      units.add(f"gdoc:{doc_id}")
+    elif kind == "roadmap_item":
+      continue
+    elif akey:
+      units.add(akey)
+  return len(units) >= 2
+
+
+def _collect_suppressed_threads(
+    w_arts: list[dict[str, Any]], w_obs: list[dict[str, Any]]
+) -> set[str]:
+  """Returns correspondence artifact_keys covered by parked drafts or superseded by GDoc rows."""
+  suppressed: set[str] = set()
+  art_state_by_key: dict[str, Mapping[str, Any]] = {}
+  gmail_channels: list[str] = []
+  linked_non_ctx_keys: set[str] = set()
+  linked_gdoc_thread_docs: set[str] = set()
+  for art in w_arts:
+    if str(art.get("role") or "") == "context_only":
+      continue
+    ak = str(art.get("artifact_key") or "")
+    linked_non_ctx_keys.add(ak)
+    if ak.startswith("gdoc_thread:") and ak.count(":") >= 2:
+      linked_gdoc_thread_docs.add(ak.split(":", 2)[1])
+    art_state_by_key[ak] = art.get("state") if isinstance(art.get("state"), Mapping) else {}
+    if ak.startswith("gmail_thread:"):
+      gmail_channels.append(ak)
+
+  # Suppress inbound thread alerts already covered by an open auto-gated reply/Gmail draft
+  for ob in w_obs:
+    if str(ob.get("status") or "") != "open":
+      continue
+    t_key = str(ob.get("target_artifact_key") or "")
+    try:
+      ob_meta = json.loads(str(ob.get("meta_json") or "{}"))
+    except Exception:
+      ob_meta = {}
+    is_wb_ob = bool(
+        ob.get("wb_reply_draft")
+        or ob_meta.get("wb_reply_draft")
+        or str(ob.get("obligation_id") or "").startswith("ob-wbdraft-")
+    )
+    if is_wb_ob:
+      d_upd_ts = float(ob_meta.get("draft_updated_ts") or ob.get("created_at") or 0.0)
+      if t_key.startswith("gmail_thread:") and _is_thread_covered_by_draft_ts(
+          art_state_by_key.get(t_key), d_upd_ts
+      ):
+        suppressed.add(t_key)
+    if t_key.startswith("gmail_draft:"):
+      d_st = art_state_by_key.get(t_key) or {}
+      d_upd_ts = float(d_st.get("draft_updated_ts") or ob.get("created_at") or 0.0)
+      d_tid = str(d_st.get("thread_id") or "").strip()
+      cand_t = (
+          f"gmail_thread:{d_tid}"
+          if d_tid
+          else (gmail_channels[0] if len(gmail_channels) == 1 else "")
+      )
+      if cand_t and _is_thread_covered_by_draft_ts(art_state_by_key.get(cand_t), d_upd_ts):
+        suppressed.add(cand_t)
+
+  # Suppress raw GDoc/Drive notification transport threads superseded by a linked GDoc entity
+  for ak in gmail_channels:
+    st = art_state_by_key.get(ak) or {}
+    gt_ref = str(st.get("gdoc_thread_key") or "")
+    sd_ref = str(st.get("shared_doc_key") or "")
+    gd_id = str(st.get("gdoc_id") or "")
+    if (
+        (gt_ref and gt_ref in linked_non_ctx_keys)
+        or (sd_ref and sd_ref in linked_non_ctx_keys)
+        or (
+            bool(st.get("is_gdoc_comment") or st.get("is_drive_share"))
+            and bool(gd_id)
+            and (f"gdoc:{gd_id}" in linked_non_ctx_keys or gd_id in linked_gdoc_thread_docs)
+        )
+    ):
+      suppressed.add(ak)
+  return suppressed
+
+
+def _classify_card_types(
+    lane: str,
+    w_arts: list[dict[str, Any]],
+    w_obs: list[dict[str, Any]],
+    reply_draft: Mapping[str, Any] | None,
+) -> tuple[list[str], list[str]]:
+  """Computes (work_types, needs_you_types) over ('replies', 'reviews', 'my-bugs', 'my-cls')."""
+  work_types: set[str] = set()
+  needs_types: set[str] = set()
+  is_done = lane == "done"
+  is_needs = lane == "needs-you"
+
+  has_open_wb_ob = False
+  has_ready_wb_ob = False
+  gated_draft_keys: set[str] = set()
+  suppressed_threads = _collect_suppressed_threads(w_arts, w_obs)
+  non_comp_cls: dict[str, dict[str, Any]] = {}
+
+  # Classify correspondence obligations and identify parked auto-gated Gmail drafts
+  for ob in w_obs:
+    ob_st = str(ob.get("status") or "")
+    ob_kind = str(ob.get("kind") or "")
+    t_key = str(ob.get("target_artifact_key") or "")
+    is_wb_ob = bool(
+        ob.get("wb_reply_draft")
+        or str(ob.get("obligation_id") or "").startswith("ob-wbdraft-")
+    )
+    is_corr_ob = (
+        ob_kind in ("correspondence", "reply")
+        or is_wb_ob
+        or t_key.startswith(("gmail_", "gchat_", "gdoc"))
+    )
+    if is_corr_ob and (is_done or ob_st != "done"):
+      work_types.add("replies")
+    if ob_st == "open":
+      if is_wb_ob:
+        has_open_wb_ob = True
+      if t_key.startswith("gmail_draft:"):
+        gated_draft_keys.add(t_key)
+    elif ob_st == "ready":
+      if is_wb_ob:
+        has_ready_wb_ob = True
+      if is_needs and is_corr_ob:
+        needs_types.add("replies")
+    if is_needs and bool(ob.get("stalled_alert")) and is_corr_ob:
+      needs_types.add("replies")
+
+  # Live inline reply drafts stay in Replies, while parked auto-gated ones stay non-urgent
+  if reply_draft is not None:
+    work_types.add("replies")
+    mat_dk = str(reply_draft.get("materialized_draft_key") or "")
+    if mat_dk and (has_open_wb_ob or has_ready_wb_ob):
+      gated_draft_keys.add(mat_dk)
+    if is_needs and not has_open_wb_ob and not has_ready_wb_ob:
+      needs_types.add("replies")
+
+  # Index primary non-companion CLs first so companion alerts can resolve their parent role
+  for art in w_arts:
+    if str(art.get("role") or "") == "context_only":
+      continue
+    akey = str(art.get("artifact_key") or "")
+    kind = str(art.get("kind") or "")
+    st = art.get("state") if isinstance(art.get("state"), Mapping) else {}
+    if kind in ("gerrit", "github_pr", "piper") and not is_companion_artifact(
+        akey, st, str(art.get("title") or ""), str(art.get("link_reason") or "")
+    ):
+      non_comp_cls[akey] = art
+
+  for art in w_arts:
+    if str(art.get("role") or "") == "context_only":
+      continue
+    akey = str(art.get("artifact_key") or "")
+    kind = str(art.get("kind") or "")
+    st = art.get("state") if isinstance(art.get("state"), Mapping) else {}
+    est = st.get("entity_state") if isinstance(st.get("entity_state"), Mapping) else {}
+
+    if kind == "gmail_draft":
+      is_live_draft = str(st.get("status") or "DRAFT").upper() == "DRAFT"
+      if is_done or is_live_draft:
+        work_types.add("replies")
+      if is_needs and is_live_draft and akey not in gated_draft_keys:
+        needs_types.add("replies")
+    elif is_active_correspondence_artifact(kind, st):
+      work_types.add("replies")
+      if is_needs and bool(st.get("unanswered_human")) and akey not in suppressed_threads:
+        needs_types.add("replies")
+    elif kind in ("buganizer", "github_issue"):
+      st_upper = str(st.get("status") or "NEW").strip().upper()
+      # Only issues assigned to jlavrova / Rusino belong in My Bugs
+      if is_bug_assigned_to_me(st) and (is_done or st_upper not in CLOSED_BUG_STATUSES):
+        work_types.add("my-bugs")
+        if is_needs:
+          needs_types.add("my-bugs")
+    elif kind in ("gerrit", "github_pr", "piper"):
+      if is_companion_artifact(
+          akey, st, str(art.get("title") or ""), str(art.get("link_reason") or "")
+      ):
+        # Attribute companion probes and any active alerts to their parent CL's work_types
+        p_key = canonicalize_companion_parent(akey, st, str(art.get("title") or ""))
+        p_art = non_comp_cls.get(p_key) if p_key else None
+        if p_art is None and not p_key and len(non_comp_cls) == 1:
+          p_key, p_art = next(iter(non_comp_cls.items()))
+        p_st = (
+            p_art.get("state")
+            if (p_art is not None and isinstance(p_art.get("state"), Mapping))
+            else None
+        )
+        p_est = (
+            p_st.get("entity_state")
+            if (isinstance(p_st, Mapping) and isinstance(p_st.get("entity_state"), Mapping))
+            else {}
+        )
+        comp_type = (
+            "my-cls"
+            if (isinstance(p_st, Mapping) and _is_own_cl_state(p_st, p_est))
+            else "reviews"
+        )
+        work_types.add(comp_type)
+        if is_needs:
+          o_r, c_r = _evaluate_companion_alerts(akey, st, p_key, p_st)
+          if o_r or c_r:
+            needs_types.add(comp_type)
+        continue
+
+      cl_hot = is_needs and str(st.get("status") or "NEW").upper() not in (
+          "ABANDONED",
+          "CLOSED",
+      ) and bool(_evaluate_cl_needs_you(akey, st))
+      if _is_reviewer_cl_state(st, est):
+        work_types.add("reviews")
+        if cl_hot:
+          needs_types.add("reviews")
+      elif _is_own_cl_state(st, est):
+        work_types.add("my-cls")
+        if cl_hot:
+          needs_types.add("my-cls")
+
+  ordered = ("replies", "reviews", "my-bugs", "my-cls")
+  return (
+      [t for t in ordered if t in work_types],
+      [t for t in ordered if t in needs_types],
+  )
 
 
 def compute_artifact_provenance(
@@ -1915,19 +2375,7 @@ def build_work_checklist(
       continue
     for lb in st.get("linked_bugs") or []:
       if isinstance(lb, Mapping):
-        raw_bk = str(lb.get("bug_key") or lb.get("short_id") or "")
-        if "#" in raw_bk:
-          num = raw_bk.split("#")[-1].strip()
-          b_k = canonicalize_artifact_key("flutter_issue", num) if num.isdigit() else ""
-        else:
-          num = re.split(r"[:/]", raw_bk)[-1].strip()
-          b_k = (
-              canonicalize_artifact_key(
-                  "flutter_issue" if len(num) <= 6 else "buganizer", num
-              )
-              if num.isdigit()
-              else ""
-          )
+        b_k, _, _, _ = canonicalize_watcher_bug("", lb)
         if b_k:
           if lb.get("title") and not bug_titles_from_cls.get(b_k):
             bug_titles_from_cls[b_k] = str(lb["title"]).strip()
@@ -1971,14 +2419,7 @@ def build_work_checklist(
       if raw_b_title.lower().startswith(pref.lower()):
         raw_b_title = raw_b_title[len(pref) :].lstrip(" :—–-").strip()
         break
-    b_url = str(b_row.get("url") or "")
-    if not b_url:
-      tid = bk.split(":")[-1]
-      b_url = (
-          f"https://github.com/flutter/flutter/issues/{tid}"
-          if bk.startswith("github_issue:")
-          else f"https://issues.chromium.org/issues/{tid}"
-      )
+    b_url = str(b_row.get("url") or "") or _default_artifact_url(bk)
     b_status = str(b_st.get("status") or bug_status_from_cls.get(bk) or "").upper()
 
     cl_items: list[dict[str, Any]] = []
@@ -4569,12 +5010,11 @@ class WorkStore:
 
     reasons: list[str] = []
     gated_draft_keys: set[str] = set()
-    covered_thread_keys: set[str] = set()
+    suppressed_threads = _collect_suppressed_threads(artifacts, obligations)
     has_open_wb_draft_ob = False
     has_ready_wb_draft_ob = False
     ready_target_keys: set[str] = set()
     art_state_by_key: dict[str, Mapping[str, Any]] = {}
-    gmail_channels: list[str] = []
     for art in artifacts:
       if art.get("role") == "context_only":
         continue
@@ -4582,8 +5022,6 @@ class WorkStore:
       art_state_by_key[ak] = (
           art.get("state") if isinstance(art.get("state"), Mapping) else {}
       )
-      if ak.startswith("gmail_thread:"):
-        gmail_channels.append(ak)
 
     for ob in obligations:
       t_key = str(ob.get("target_artifact_key") or "")
@@ -4599,31 +5037,21 @@ class WorkStore:
       if ob.get("status") == "open":
         if is_wb_ob:
           has_open_wb_draft_ob = True
-          d_upd_ts = float(ob_meta.get("draft_updated_ts") or ob.get("created_at") or 0.0)
-          if t_key.startswith("gmail_thread:") and _is_thread_covered_by_draft_ts(
-              art_state_by_key.get(t_key), d_upd_ts
-          ):
-            covered_thread_keys.add(t_key)
         if t_key.startswith("gmail_draft:"):
           gated_draft_keys.add(t_key)
-          d_st = art_state_by_key.get(t_key) or {}
-          d_upd_ts = float(d_st.get("draft_updated_ts") or ob.get("created_at") or 0.0)
-          d_tid = str(d_st.get("thread_id") or "").strip()
-          cand_t = (
-              f"gmail_thread:{d_tid}"
-              if d_tid
-              else (gmail_channels[0] if len(gmail_channels) == 1 else "")
-          )
-          if cand_t and _is_thread_covered_by_draft_ts(
-              art_state_by_key.get(cand_t), d_upd_ts
-          ):
-            covered_thread_keys.add(cand_t)
       if ob.get("status") == "ready":
         if is_wb_ob:
           has_ready_wb_draft_ob = True
         if t_key:
           ready_target_keys.add(t_key)
-        reasons.append(f"🔔 Ready: {ob.get('description')}")
+        # Separate outbound 5-7d silence reminders from genuine inbound messages needing a reply
+        if ob.get("kind") == "correspondence":
+          if _is_correspondence_silence_ping(art_state_by_key.get(t_key)):
+            reasons.append(f"⏰ 7d silence ping: {ob.get('description')}")
+          else:
+            reasons.append(f"📨 Reply needed: {ob.get('description')}")
+        else:
+          reasons.append(f"🔔 Ready: {ob.get('description')}")
       elif ob.get("stalled_alert"):
         reasons.append(f"⚠️ Stalled >7d: {ob.get('description')}")
 
@@ -4632,17 +5060,12 @@ class WorkStore:
     if mat_dk and (has_open_wb_draft_ob or has_ready_wb_draft_ob):
       gated_draft_keys.add(mat_dk)
 
-    # Index non-companion primary CLs/PRs and linked GDoc keys for transport-thread dedup
+    # Index non-companion primary CLs/PRs so companion alerts resolve their parent state
     parent_cls_by_key: dict[str, dict[str, Any]] = {}
-    linked_non_ctx_keys: set[str] = set()
-    linked_gdoc_thread_docs: set[str] = set()
     for art in artifacts:
       if art.get("role") == "context_only":
         continue
       akey = str(art.get("artifact_key") or "")
-      linked_non_ctx_keys.add(akey)
-      if akey.startswith("gdoc_thread:") and akey.count(":") >= 2:
-        linked_gdoc_thread_docs.add(akey.split(":", 2)[1])
       kind = str(art.get("kind") or "")
       st = art.get("state") if isinstance(art.get("state"), Mapping) else {}
       if kind in ("gerrit", "github_pr", "piper") and not is_companion_artifact(
@@ -4664,26 +5087,8 @@ class WorkStore:
           kind in ("gmail_thread", "gchat_thread", "gdoc_thread")
           and bool(st.get("unanswered_human"))
           and akey not in ready_target_keys
-          and akey not in covered_thread_keys
+          and akey not in suppressed_threads
       ):
-        # Skip raw notification transport threads superseded by a linked #disco or gdoc artifact
-        if kind == "gmail_thread":
-          gt_ref = str(st.get("gdoc_thread_key") or "")
-          sd_ref = str(st.get("shared_doc_key") or "")
-          gd_id = str(st.get("gdoc_id") or "")
-          if (
-              (gt_ref and gt_ref in linked_non_ctx_keys)
-              or (sd_ref and sd_ref in linked_non_ctx_keys)
-              or (
-                  bool(st.get("is_gdoc_comment") or st.get("is_drive_share"))
-                  and bool(gd_id)
-                  and (
-                      f"gdoc:{gd_id}" in linked_non_ctx_keys
-                      or gd_id in linked_gdoc_thread_docs
-                  )
-              )
-          ):
-            continue
         reasons.append(f"📨 Unanswered message: {art.get('title')}")
       elif kind == "chat_chain" and str(st.get("bucket") or "") == "needs-me":
         reasons.append(f"🤖 Chat waiting on you: {art.get('title')}")
@@ -4808,6 +5213,122 @@ class WorkStore:
             "AND (link_reason IS NULL OR link_reason = '' OR link_reason = 'chat_mention')",
             (akey,),
         )
+
+      # Migrate legacy buganizer:<id> rows that actually hold GitHub issues before deduping
+      for akey, ar in list(art_rows.items()):
+        if not akey.startswith("buganizer:"):
+          continue
+        st = _parse_art_state(ar)
+        st_url = str(st.get("url") or "").strip()
+        ar_url = str(ar.get("url") or "").strip()
+        # Ignore generic chromium/buganizer fallback URLs when state holds GitHub metadata
+        cand_url = (
+            st_url
+            if (
+                _RE_GH_ISSUE_URL.search(st_url)
+                or not ar_url
+                or "issues.chromium.org" in ar_url.lower()
+                or "b.corp.google.com" in ar_url.lower()
+            )
+            else ar_url
+        )
+        src = str(st.get("source") or st.get("tracker_flavor") or "").strip().lower()
+        raw_bk = str(st.get("bug_key") or "").strip()
+        is_legacy_gh = (
+            src == "github"
+            or raw_bk.lower().startswith(("gh_issue:", "github_issue:", "flutter_issue:"))
+            or "#" in raw_bk
+            or _RE_GH_ISSUE_URL.search(cand_url) is not None
+        )
+        if not is_legacy_gh:
+          continue
+        eff_gh_url = cand_url if _RE_GH_ISSUE_URL.search(cand_url) else ""
+        b_desc = str(st.get("bug_title") or st.get("title") or st.get("summary") or "").strip()
+        if b_desc and not st.get("bug_title"):
+          st["bug_title"] = b_desc
+        gh_ckey, gh_kind, gh_title, gh_url = canonicalize_watcher_bug(
+            akey, {**st, "url": eff_gh_url}
+        )
+        if not gh_ckey or gh_ckey == akey:
+          continue
+        # Insert canonical github_issue row or merge state/title/url without losing newer data
+        gh_existing = art_rows.get(gh_ckey)
+        if gh_existing is None:
+          conn.execute(
+              "INSERT INTO artifacts (artifact_key, kind, title, url, state_json, updated_at) "
+              "VALUES (?, ?, ?, ?, ?, ?)",
+              (gh_ckey, gh_kind, gh_title, gh_url, json.dumps(st), cur_now),
+          )
+          art_rows[gh_ckey] = {
+              "artifact_key": gh_ckey,
+              "kind": gh_kind,
+              "title": gh_title,
+              "url": gh_url,
+              "state_json": json.dumps(st),
+          }
+        else:
+          gh_st = _parse_art_state(gh_existing)
+          merged_gh = {**st, **gh_st}
+          old_title = str(gh_existing.get("title") or "")
+          new_title = (
+              gh_title
+              if (gh_title and is_placeholder_title(old_title, gh_ckey))
+              else old_title
+          )
+          old_url = str(gh_existing.get("url") or "").strip()
+          new_url = (
+              gh_url
+              if (gh_url and (not old_url or _RE_GH_ISSUE_URL.search(old_url) is None))
+              else old_url
+          )
+          if merged_gh != gh_st or new_title != old_title or new_url != old_url:
+            s_json = json.dumps(merged_gh)
+            conn.execute(
+                "UPDATE artifacts SET title = ?, url = ?, state_json = ?, updated_at = ? "
+                "WHERE artifact_key = ?",
+                (new_title, new_url, s_json, cur_now, gh_ckey),
+            )
+            gh_existing["title"] = new_title
+            gh_existing["url"] = new_url
+            gh_existing["state_json"] = s_json
+        # Re-point links, obligations (including trigger_expr), and tombstones before deletion
+        conn.execute(
+            "INSERT OR IGNORE INTO work_links "
+            "(work_id, artifact_key, role, source, confidence, created_at, "
+            "link_reason, link_detail) "
+            "SELECT work_id, ?, role, source, confidence, created_at, link_reason, link_detail "
+            "FROM work_links WHERE artifact_key = ?",
+            (gh_ckey, akey),
+        )
+        conn.execute("DELETE FROM work_links WHERE artifact_key = ?", (akey,))
+        conn.execute(
+            "UPDATE obligations SET target_artifact_key = ? WHERE target_artifact_key = ?",
+            (gh_ckey, akey),
+        )
+        for ob_r in conn.execute(
+            "SELECT obligation_id, trigger_expr FROM obligations WHERE instr(trigger_expr, ?) > 0",
+            (akey,),
+        ).fetchall():
+          old_expr = str(ob_r["trigger_expr"] or "")
+          new_expr = re.sub(
+              rf"(?<![A-Za-z0-9_:/.-]){re.escape(akey)}(?![A-Za-z0-9_:/.-])",
+              gh_ckey,
+              old_expr,
+          )
+          if new_expr != old_expr:
+            conn.execute(
+                "UPDATE obligations SET trigger_expr = ? WHERE obligation_id = ?",
+                (new_expr, str(ob_r["obligation_id"])),
+            )
+        conn.execute(
+            "INSERT OR IGNORE INTO negative_links (work_id, artifact_key, created_at) "
+            "SELECT work_id, ?, created_at FROM negative_links WHERE artifact_key = ?",
+            (gh_ckey, akey),
+        )
+        conn.execute("DELETE FROM negative_links WHERE artifact_key = ?", (akey,))
+        conn.execute("DELETE FROM candidate_buffer WHERE artifact_key = ?", (akey,))
+        conn.execute("DELETE FROM artifacts WHERE artifact_key = ?", (akey,))
+        art_rows.pop(akey, None)
 
       # Deduplicate GitHub's shared PR/Issue counter when HTML hovercards minted placeholders
       gh_pr_nums = {
@@ -5334,6 +5855,40 @@ class WorkStore:
           ).fetchall()
       ]
 
+    # Overlay live cl_watcher_state bug metadata in-memory so assignee/status stay fresh
+    cl_bugs_raw = (cl_watcher_state or {}).get("bugs") or {}
+    live_bugs_by_ckey: dict[str, tuple[str, str, str, dict[str, Any]]] = {}
+    if isinstance(cl_bugs_raw, Mapping):
+      for raw_bk, bval in cl_bugs_raw.items():
+        if not isinstance(bval, Mapping):
+          continue
+        b_ck, b_kind, b_title, b_url = canonicalize_watcher_bug(str(raw_bk), bval)
+        if not b_ck:
+          continue
+        b_st = dict(bval)
+        b_desc = str(bval.get("title") or bval.get("summary") or "").strip()
+        if b_desc and not b_st.get("bug_title"):
+          b_st["bug_title"] = b_desc
+        live_bugs_by_ckey[b_ck] = (b_kind, b_title, b_url, b_st)
+        # Merge live tracker fields over cached SQLite state and upgrade placeholder titles
+        existing_ar = art_rows.get(b_ck)
+        if existing_ar is not None:
+          prev_raw = existing_ar.get("state")
+          prev_st = prev_raw if isinstance(prev_raw, Mapping) else {}
+          existing_ar["state"] = {**prev_st, **b_st}
+          if b_title and is_placeholder_title(str(existing_ar.get("title") or ""), b_ck):
+            existing_ar["title"] = b_title
+          if b_url and not existing_ar.get("url"):
+            existing_ar["url"] = b_url
+        else:
+          art_rows[b_ck] = {
+              "artifact_key": b_ck,
+              "kind": b_kind,
+              "title": b_title,
+              "url": b_url,
+              "state": b_st,
+          }
+
     active_work_ids = {str(w["work_id"]) for w in work_rows}
     links_by_work: dict[str, list[dict[str, Any]]] = {}
     # Passing context_only mentions never suppress standalone virtual cards in cl_watcher_state
@@ -5469,9 +6024,15 @@ class WorkStore:
         t_ob_key = str(ob.get("target_artifact_key") or "").strip()
         if t_ob_key and t_ob_key in art_rows:
           t_ar = art_rows[t_ob_key]
+          t_st = t_ar.get("state") if isinstance(t_ar.get("state"), Mapping) else None
+          # Expose inbound_reply vs silence_ping to the UI obligation badge renderer
+          if ob.get("kind") == "correspondence" and ob.get("status") == "ready":
+            ob["correspondence_mode"] = (
+                "silence_ping" if _is_correspondence_silence_ping(t_st) else "inbound_reply"
+            )
           p_txt, ev_k = detect_borderline_correspondence_closure(
               str(t_ar.get("kind") or artifact_kind_from_key(t_ob_key)),
-              t_ar.get("state") if isinstance(t_ar.get("state"), Mapping) else None,
+              t_st,
           )
           if p_txt and ev_k:
             ob["ambiguity_prompt"] = p_txt
@@ -5504,6 +6065,9 @@ class WorkStore:
           for o in w_obs
           if o.get("status") != "done"
       )
+      work_types, needs_you_types = _classify_card_types(
+          lane, w_arts, w_obs, card_reply_draft
+      )
       act_et = format_et_timestamp(activity_ts, now=cur_now)
       cards.append({
           "work_id": wid,
@@ -5522,7 +6086,9 @@ class WorkStore:
           "origin_et": format_et_timestamp(origin_ts_val, now=cur_now),
           "has_urgent_obligation": has_urgent_ob,
           "is_virtual": False,
-          "is_multi_channel": len(kinds_seen) >= 2 or len(w_arts) >= 2 or len(w_obs) >= 1,
+          "is_multi_channel": _compute_is_multi_channel(w_arts),
+          "work_types": work_types,
+          "needs_you_types": needs_you_types,
           "reply_draft": card_reply_draft,
           "checklist": checklist,
           "artifacts": w_arts,
@@ -5626,6 +6192,28 @@ class WorkStore:
           cl_v_reason = _evaluate_cl_needs_you(c_key, item)
           if cl_v_reason:
             v_reasons.append(cl_v_reason)
+        # Attach linked bug pills so unbound/hub virtual CLs retain assigned bugs in My Bugs
+        linked_b_pills: list[dict[str, Any]] = []
+        for bk_linked in extract_cl_bug_keys(item):
+          bound_artifact_keys.add(bk_linked)
+          b_ar = art_rows.get(bk_linked)
+          if not b_ar:
+            continue
+          b_ar_st = b_ar.get("state") if isinstance(b_ar.get("state"), Mapping) else {}
+          b_ar_kind = str(b_ar.get("kind") or artifact_kind_from_key(bk_linked))
+          b_hot_r = _evaluate_cl_needs_you(bk_linked, b_ar_st)
+          if b_hot_r:
+            v_reasons.append(b_hot_r)
+          linked_b_pills.append({
+              "artifact_key": bk_linked,
+              "kind": b_ar_kind,
+              "icon": PILL_ICONS.get(b_ar_kind, "🐞"),
+              "title": clean_work_title(str(b_ar.get("title") or bk_linked)) or bk_linked,
+              "url": str(b_ar.get("url") or "") or _default_artifact_url(bk_linked),
+              "role": "primary",
+              "source": "virtual",
+              "state": dict(b_ar_st),
+          })
         lane = "needs-you" if v_reasons else "waiting"
         if not v_reasons:
           fallback_r = str(
@@ -5637,7 +6225,7 @@ class WorkStore:
         raw_v_proj = str(item.get("project") or "")
         v_proj = "" if is_config_project(raw_v_proj) else raw_v_proj
         v_title = str(item.get("subject") or item.get("title") or format_short_cl_id(c_key, item))
-        # Build virtual parent + companion pills first so virtual cards share exact timestamp rules
+        # Build virtual parent, linked bug, and companion pills so timestamps & types stay aligned
         v_arts = [
             {
                 "artifact_key": c_key,
@@ -5649,10 +6237,12 @@ class WorkStore:
                 "source": "virtual",
                 "state": dict(item),
             },
+            *linked_b_pills,
             *comp_pills,
         ]
         v_act_ts, v_orig_ts = compute_card_timestamps(None, v_arts, [], None)
         v_act_et = format_et_timestamp(v_act_ts, now=cur_now)
+        v_work_types, v_needs_types = _classify_card_types(lane, v_arts, [], None)
         cards.append({
             "work_id": f"virt-{c_key}",
             "title": v_title,
@@ -5669,10 +6259,73 @@ class WorkStore:
             "origin_et": format_et_timestamp(v_orig_ts, now=cur_now),
             "has_urgent_obligation": False,
             "is_virtual": True,
-            "is_multi_channel": bool(comp_pills),
+            "is_multi_channel": _compute_is_multi_channel(v_arts),
+            "work_types": v_work_types,
+            "needs_you_types": v_needs_types,
             "artifacts": v_arts,
             "obligations": [],
         })
+
+    # Project fresh unbound open bugs assigned to jlavrova / Rusino (excluding stale backlog)
+    for b_ckey, (b_kind, _, b_url, b_st) in live_bugs_by_ckey.items():
+      if b_ckey in bound_artifact_keys:
+        continue
+      if not is_bug_assigned_to_me(b_st):
+        continue
+      b_status = str(b_st.get("status") or "NEW").strip().upper()
+      if b_status in CLOSED_BUG_STATUSES:
+        continue
+      b_est = b_st.get("entity_state") if isinstance(b_st.get("entity_state"), Mapping) else {}
+      # Omit stale backlog tickets so My Bugs shows only active Works and fresh assigned bugs
+      if bool(b_st.get("is_stale_backlog") or b_est.get("is_stale_backlog")):
+        continue
+      b_desc = str(b_st.get("title") or b_st.get("summary") or "").strip()
+      short_b = format_short_bug_id(b_ckey)
+      bug_hot_reason = _evaluate_cl_needs_you(b_ckey, b_st)
+      b_lane = "needs-you" if bug_hot_reason else "waiting"
+      if bug_hot_reason:
+        b_reasons = [bug_hot_reason]
+      else:
+        has_prior_cl = b_st.get("lane") == "has_cl" or b_est.get("lane") == "has_cl"
+        b_reasons = [
+            "Assigned bug (prior CLs on bug)" if has_prior_cl else "Assigned bug (no CL yet)"
+        ]
+      b_arts = [{
+          "artifact_key": b_ckey,
+          "kind": b_kind,
+          "icon": PILL_ICONS.get(b_kind, "🐞"),
+          "title": f"{short_b} · {b_desc}".strip(" ·"),
+          "url": b_url,
+          "role": "primary",
+          "source": "virtual",
+          "why_badge": "назначен на тебя",
+          "why_tooltip": "Открытый баг из трекера, назначенный на тебя",
+          "state": dict(b_st),
+      }]
+      b_act_ts, b_orig_ts = compute_card_timestamps(None, b_arts, [], None)
+      b_act_et = format_et_timestamp(b_act_ts, now=cur_now)
+      cards.append({
+          "work_id": f"virt-{b_ckey}",
+          "title": b_desc or short_b,
+          "status": "active",
+          "lane": b_lane,
+          "reasons": b_reasons,
+          "project_id": "",
+          "roadmap_item_key": "",
+          "updated_at": b_act_ts,
+          "updated_et": b_act_et,
+          "activity_at": b_act_ts,
+          "activity_et": b_act_et,
+          "origin_at": b_orig_ts,
+          "origin_et": format_et_timestamp(b_orig_ts, now=cur_now),
+          "has_urgent_obligation": False,
+          "is_virtual": True,
+          "is_multi_channel": False,
+          "work_types": ["my-bugs"],
+          "needs_you_types": ["my-bugs"] if b_lane == "needs-you" else [],
+          "artifacts": b_arts,
+          "obligations": [],
+      })
 
     # Rank by lane and urgent obligations first, pushing missing/zero timestamps after dated cards
     lane_rank = {"needs-you": 0, "waiting": 1, "blocked": 2, "done": 3}
@@ -5706,11 +6359,24 @@ class WorkStore:
       if done_ts is not None and float(t.get("last_message_ts") or 0.0) <= done_ts:
         continue
       tray.append(t)
+    active_cards = [c for c in cards if c["lane"] != "done"]
+    needs_cards = [c for c in cards if c["lane"] == "needs-you"]
     counts = {
-        "needs_you": sum(1 for c in cards if c["lane"] == "needs-you"),
+        "all_active": len(active_cards),
+        "needs_you": len(needs_cards),
         "waiting": sum(1 for c in cards if c["lane"] == "waiting"),
         "done": sum(1 for c in cards if c["lane"] == "done"),
-        "multi_channel": sum(1 for c in cards if c.get("is_multi_channel")),
+        "multi_channel": sum(1 for c in active_cards if c.get("is_multi_channel")),
+        "replies": sum(1 for c in active_cards if "replies" in (c.get("work_types") or ())),
+        "reviews": sum(1 for c in active_cards if "reviews" in (c.get("work_types") or ())),
+        "my_bugs": sum(1 for c in active_cards if "my-bugs" in (c.get("work_types") or ())),
+        "my_cls": sum(1 for c in active_cards if "my-cls" in (c.get("work_types") or ())),
+        "needs_reply": sum(
+            1 for c in needs_cards if "replies" in (c.get("needs_you_types") or ())
+        ),
+        "needs_review": sum(
+            1 for c in needs_cards if "reviews" in (c.get("needs_you_types") or ())
+        ),
         "obligations_open": sum(
             1
             for c in cards

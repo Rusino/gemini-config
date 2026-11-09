@@ -356,6 +356,20 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     )
   ssr_body = "\n".join(cards_ssr)
   precision_pct = int(round(float(metrics.get("link_precision", 1.0)) * 100))
+  # Compute initial SSR chip counts directly from works for activeFilter='all', type='all'
+  active_works_ssr = [w for w in works if w.get("lane") != "done"]
+  ssr_all_cnt = len(active_works_ssr)
+  ssr_needs_cnt = sum(1 for w in works if w.get("lane") == "needs-you")
+  ssr_wait_cnt = sum(1 for w in works if w.get("lane") == "waiting")
+  ssr_done_cnt = sum(1 for w in works if w.get("lane") == "done")
+  ssr_types = {
+      t: sum(1 for w in active_works_ssr if t in (w.get("work_types") or ()))
+      for t in ("replies", "reviews", "my-bugs", "my-cls")
+  }
+  ssr_replies_cnt = ssr_types["replies"]
+  ssr_reviews_cnt = ssr_types["reviews"]
+  ssr_bugs_cnt = ssr_types["my-bugs"]
+  ssr_cls_cnt = ssr_types["my-cls"]
 
   return f"""<!DOCTYPE html>
 <html lang="en">
@@ -467,12 +481,21 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     overflow: hidden;
     text-overflow: ellipsis;
   }}
-  .wb-filters {{
+  .wb-filters, .wb-type-filters {{
     display: flex;
     align-items: center;
     gap: 5px;
     margin-top: 8px;
     flex-wrap: wrap;
+  }}
+  .wb-type-filters {{
+    margin-top: 5px;
+  }}
+  .wb-filter-lbl {{
+    color: var(--muted);
+    font-size: 10.5px;
+    font-weight: 600;
+    margin-right: 2px;
   }}
   .wb-chip {{
     cursor: pointer;
@@ -482,6 +505,11 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     border-radius: 999px;
     padding: 2px 9px;
     font-size: 11px;
+  }}
+  .wb-chip-cnt {{
+    opacity: 0.78;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
   }}
   .wb-chip[data-active="true"] {{
     background: rgba(0, 113, 227, 0.10);
@@ -1146,12 +1174,18 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       </div>
     </div>
     <div class="wb-filters">
-      <button class="wb-chip" data-filter="all" data-active="true" type="button">All</button>
-      <button class="wb-chip" data-filter="needs-you" type="button">🚨 Needs You</button>
-      <button class="wb-chip" data-filter="waiting" type="button">⏳ Waiting</button>
-      <button class="wb-chip" data-filter="multi" type="button">🔗 Multi-channel</button>
-      <button class="wb-chip" data-filter="obligations" type="button">🔔 Obligations</button>
-      <button class="wb-chip" data-filter="done" type="button">✅ Done</button>
+      <button class="wb-chip" data-filter="all" data-base-label="All"
+              data-count="{ssr_all_cnt}" data-active="true" type="button">
+        All <span class="wb-chip-cnt">({ssr_all_cnt})</span></button>
+      <button class="wb-chip" data-filter="needs-you" data-base-label="🚨 Needs You"
+              data-count="{ssr_needs_cnt}" type="button">
+        🚨 Needs You <span class="wb-chip-cnt">({ssr_needs_cnt})</span></button>
+      <button class="wb-chip" data-filter="waiting" data-base-label="⏳ Waiting"
+              data-count="{ssr_wait_cnt}" type="button">
+        ⏳ Waiting <span class="wb-chip-cnt">({ssr_wait_cnt})</span></button>
+      <button class="wb-chip" data-filter="done" data-base-label="✅ Done"
+              data-count="{ssr_done_cnt}" type="button">
+        ✅ Done <span class="wb-chip-cnt">({ssr_done_cnt})</span></button>
       <div class="wb-filter-tools">
         <select class="wb-sort-select" id="wb-sort-mode" aria-label="Sort cards">
           <option value="triage">⚡ Triage</option>
@@ -1166,6 +1200,24 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
         <input class="wb-search" id="wb-search" type="search"
                placeholder="Filter works, CLs, bugs...">
       </div>
+    </div>
+    <div class="wb-type-filters">
+      <span class="wb-filter-lbl">Focus:</span>
+      <button class="wb-chip" data-type="all" data-base-label="All types"
+              data-count="{ssr_all_cnt}" data-active="true" type="button">
+        All types <span class="wb-chip-cnt">({ssr_all_cnt})</span></button>
+      <button class="wb-chip" data-type="replies" data-base-label="📨 Replies"
+              data-count="{ssr_replies_cnt}" type="button">
+        📨 Replies <span class="wb-chip-cnt">({ssr_replies_cnt})</span></button>
+      <button class="wb-chip" data-type="reviews" data-base-label="👀 Reviews"
+              data-count="{ssr_reviews_cnt}" type="button">
+        👀 Reviews <span class="wb-chip-cnt">({ssr_reviews_cnt})</span></button>
+      <button class="wb-chip" data-type="my-bugs" data-base-label="🐛 My Bugs"
+              data-count="{ssr_bugs_cnt}" type="button">
+        🐛 My Bugs <span class="wb-chip-cnt">({ssr_bugs_cnt})</span></button>
+      <button class="wb-chip" data-type="my-cls" data-base-label="🔧 My CLs"
+              data-count="{ssr_cls_cnt}" type="button">
+        🔧 My CLs <span class="wb-chip-cnt">({ssr_cls_cnt})</span></button>
     </div>
   </header>
 
@@ -1195,6 +1247,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   const SORT_STORAGE_KEY = 'wb_sort_v1';
   let state = {initial_json};
   let activeFilter = 'all';
+  let activeTypeFilter = 'all';
   let searchQuery = '';
   let sortMode = 'triage';
   let sortDir = 'desc';
@@ -1456,28 +1509,71 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     }});
   }}
 
-  // Return the visible cards matching the active filter chip, search input, and sort mode
+  // Partition works into active lanes ('all', 'needs-you', 'waiting') vs 'done'
+  function matchesLane(w, laneFilter) {{
+    const lane = (w && w.lane) || '';
+    if (laneFilter === 'done') return lane === 'done';
+    // Hide completed works outside the Done tab so active lanes stay focused
+    if (lane === 'done') return false;
+    if (laneFilter === 'needs-you') return lane === 'needs-you';
+    if (laneFilter === 'waiting') return lane === 'waiting';
+    return true;
+  }}
+
+  // Scope Needs You slices to urgent artifact types while All/Waiting/Done slice by membership
+  function matchesTypeForLane(w, laneFilter, typeFilter) {{
+    if (!typeFilter || typeFilter === 'all') return true;
+    const workTypes = Array.isArray(w && w.work_types) ? w.work_types : [];
+    if (laneFilter === 'needs-you' && typeFilter !== 'my-bugs') {{
+      const needsTypes = Array.isArray(w && w.needs_you_types) ? w.needs_you_types : workTypes;
+      return needsTypes.includes(typeFilter);
+    }}
+    return workTypes.includes(typeFilter);
+  }}
+
+  // Evaluate whether card w belongs to a (laneFilter, typeFilter, query) slice
+  function cardMatchesSlice(w, laneFilter, typeFilter, q) {{
+    if (!matchesLane(w, laneFilter)) return false;
+    if (!matchesTypeForLane(w, laneFilter, typeFilter)) return false;
+    if (q && !JSON.stringify(w).toLowerCase().includes(q)) return false;
+    return true;
+  }}
+
+  // Refresh active states and live (N) badges across both Lane and Type filter chip rows
+  function updateFilterChipsUI() {{
+    const allWorks = (state && state.works) || [];
+    const q = searchQuery ? searchQuery.trim().toLowerCase() : '';
+    for (const chip of document.querySelectorAll('.wb-chip')) {{
+      const laneAttr = chip.getAttribute('data-filter');
+      const typeAttr = chip.getAttribute('data-type');
+      let cnt = 0;
+      if (typeAttr !== null) {{
+        chip.setAttribute('data-active', typeAttr === activeTypeFilter ? 'true' : 'false');
+        for (const w of allWorks) {{
+          if (cardMatchesSlice(w, activeFilter, typeAttr, q)) cnt += 1;
+        }}
+      }} else if (laneAttr !== null) {{
+        chip.setAttribute('data-active', laneAttr === activeFilter ? 'true' : 'false');
+        for (const w of allWorks) {{
+          if (cardMatchesSlice(w, laneAttr, activeTypeFilter, q)) cnt += 1;
+        }}
+      }} else {{
+        continue;
+      }}
+      chip.setAttribute('data-count', String(cnt));
+      const baseLbl = chip.getAttribute('data-base-label');
+      if (baseLbl) {{
+        chip.innerHTML = `${{esc(baseLbl)}} <span class="wb-chip-cnt">(${{cnt}})</span>`;
+      }}
+    }}
+  }}
+
+  // Return the visible cards matching the active Lane chip, Type chip, search input, and sort mode
   function getVisibleWorks() {{
     const q = searchQuery ? searchQuery.trim().toLowerCase() : '';
-    const filtered = ((state && state.works) || []).filter((w) => {{
-      if (activeFilter === 'needs-you' && w.lane !== 'needs-you') return false;
-      if (activeFilter === 'waiting' && w.lane !== 'waiting') return false;
-      if (activeFilter === 'multi' && !w.is_multi_channel) return false;
-      if (
-        activeFilter === 'obligations' &&
-        !(w.obligations && w.obligations.some((o) => o.status !== 'done'))
-      ) {{
-        return false;
-      }}
-      // Hide completed works outside the Done tab so active lanes stay focused
-      if (activeFilter === 'done' && w.lane !== 'done') return false;
-      if (activeFilter !== 'done' && w.lane === 'done') return false;
-      if (q) {{
-        const hay = JSON.stringify(w).toLowerCase();
-        if (!hay.includes(q)) return false;
-      }}
-      return true;
-    }});
+    const filtered = ((state && state.works) || []).filter(
+      (w) => cardMatchesSlice(w, activeFilter, activeTypeFilter, q)
+    );
     return sortWorks(filtered);
   }}
 
@@ -1631,6 +1727,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     }}
 
     updateSortControlsUI();
+    updateFilterChipsUI();
     const works = getVisibleWorks();
     updateCollapseToggleUI(works);
 
@@ -1668,7 +1765,10 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       const artCount = (w.artifacts || []).length;
       const laneBadge = w.lane === 'needs-you'
         ? '<span class="wb-badge wb-badge-needs">🚨 Needs You</span>'
-        : '<span class="wb-badge wb-badge-wait">⏳ Waiting</span>';
+        // Render explicit Done badge so completed cards never fall back to a Waiting tag
+        : (w.lane === 'done'
+            ? '<span class="wb-badge" style="color:var(--ready)">✅ Done</span>'
+            : '<span class="wb-badge wb-badge-wait">⏳ Waiting</span>');
       const multiBadge = w.is_multi_channel
         ? '<span class="wb-badge wb-badge-multi">Multi-channel</span>'
         : '<span class="wb-badge" style="color:var(--muted)">Single item</span>';
@@ -1705,8 +1805,15 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
           : (isDraftOb
               ? '<span style="color:var(--accent);font-weight:600">⏳ Parked draft</span>'
               : '<span style="color:var(--accent);font-weight:600">⏳ Waiting</span>');
+        // Distinguish inbound reply urgency from 7d outbound silence pings on ready obligations
+        let readyTag = '<strong style="color:var(--ready)">🔔 READY</strong>';
+        if (o.correspondence_mode === 'silence_ping') {{
+          readyTag = '<strong style="color:var(--warn)">⏰ 7d SILENCE PING</strong>';
+        }} else if (o.correspondence_mode === 'inbound_reply') {{
+          readyTag = '<strong style="color:var(--urgent)">📨 NEEDS REPLY</strong>';
+        }}
         const statusTag = o.status === 'ready'
-          ? '<strong style="color:var(--ready)">🔔 READY</strong>'
+          ? readyTag
           : (o.stalled_alert
               ? '<strong style="color:var(--urgent)">⏰ STALLED &gt;7d</strong>'
               : waitTag);
@@ -2028,11 +2135,16 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     void postJson('/api/sync', {{}});
   }});
 
+  // Update orthogonal Lane and Type filter axes independently on chip clicks
   for (const chip of document.querySelectorAll('.wb-chip')) {{
     chip.addEventListener('click', () => {{
-      for (const c of document.querySelectorAll('.wb-chip')) c.setAttribute('data-active', 'false');
-      chip.setAttribute('data-active', 'true');
-      activeFilter = chip.getAttribute('data-filter') || 'all';
+      const typeAttr = chip.getAttribute('data-type');
+      const laneAttr = chip.getAttribute('data-filter');
+      if (typeAttr !== null) {{
+        activeTypeFilter = typeAttr || 'all';
+      }} else if (laneAttr !== null) {{
+        activeFilter = laneAttr || 'all';
+      }}
       render();
     }});
   }}

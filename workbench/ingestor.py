@@ -1236,23 +1236,29 @@ def ingest_cl_watcher_state(
   if not isinstance(items, Mapping):
     return
 
-  # Upsert all known bugs first so CL->bug links have titles and statuses
+  # Upsert all known bugs first with proper GitHub vs Buganizer canonicalization
+  synced_bug_keys: set[str] = set()
   if isinstance(bugs, Mapping):
     for bkey, bval in bugs.items():
       if not isinstance(bval, Mapping):
         continue
-      bid = str(bval.get("bug_id") or bval.get("id") or bkey).split(":")[-1]
-      if not bid:
+      ckey, bkind, btitle, burl = work_store.canonicalize_watcher_bug(str(bkey), bval)
+      if not ckey:
         continue
-      ckey = work_store.canonicalize_artifact_key("buganizer", bid)
+      bstate = dict(bval)
+      bdesc = str(bval.get("title") or bval.get("summary") or "").strip()
+      # Seed bug_title so GitHub PR/Issue collision dedup preserves real issue rows
+      if bdesc and not bstate.get("bug_title"):
+        bstate["bug_title"] = bdesc
       store.upsert_artifact(
           ckey,
-          kind="buganizer",
-          title=f"b/{bid}: {bval.get('title') or bval.get('summary') or ''}".strip(": "),
-          url=str(bval.get("url") or f"https://issues.chromium.org/issues/{bid}"),
-          state=dict(bval),
+          kind=bkind,
+          title=btitle,
+          url=burl,
+          state=bstate,
           now=cur_now,
       )
+      synced_bug_keys.add(ckey)
 
   # Defer companion attachment until all parent CL/PR Works in this batch are created or matched
   deferred_companions: list[tuple[str, str]] = []
@@ -1276,23 +1282,13 @@ def ingest_cl_watcher_state(
     for lb in item.get("linked_bugs") or []:
       if not isinstance(lb, Mapping):
         continue
-      raw_bk = str(lb.get("bug_key") or lb.get("short_id") or "").strip()
-      if not raw_bk:
+      b_ck, _, _, lb_url = work_store.canonicalize_watcher_bug("", lb)
+      if not b_ck:
         continue
-      if "#" in raw_bk:
-        num = raw_bk.split("#")[-1].strip()
-      else:
-        num = re.split(r"[:/]", raw_bk)[-1].strip()
-      if not num.isdigit():
-        continue
-      b_ck = work_store.canonicalize_artifact_key(
-          "flutter_issue" if ("#" in raw_bk or len(num) <= 6) else "buganizer",
-          num,
-      )
       lb_meta[b_ck] = {
           "title": str(lb.get("title") or "").strip(),
           "status": str(lb.get("status") or "").strip(),
-          "url": str(lb.get("url") or "").strip(),
+          "url": str(lb.get("url") or lb_url or "").strip(),
       }
 
     for b_ckey in linked_bug_keys:
@@ -1300,16 +1296,12 @@ def ingest_cl_watcher_state(
       short_b = work_store.format_short_bug_id(b_ckey)
       b_desc = meta.get("title") or ""
       b_title = f"{short_b}: {b_desc}" if b_desc else short_b
-      b_num = b_ckey.split(":")[-1]
-      b_url = meta.get("url") or (
-          f"https://github.com/flutter/flutter/issues/{b_num}"
-          if b_ckey.startswith("github_issue:")
-          else f"https://issues.chromium.org/issues/{b_num}"
-      )
+      b_url = meta.get("url") or work_store._default_artifact_url(b_ckey)
       b_state: dict[str, Any] = {"short_id": short_b}
       if b_desc:
         b_state["bug_title"] = b_desc
-      if meta.get("status"):
+      # Keep live tracker status from cl_state['bugs'] authoritative over stale CL-linked snapshots
+      if meta.get("status") and b_ckey not in synced_bug_keys:
         b_state["status"] = meta["status"]
       store.upsert_artifact(
           b_ckey,
