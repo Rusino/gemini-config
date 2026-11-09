@@ -222,7 +222,8 @@ GITHUB_TRUNK_REFS = frozenset({"main", "master"})
 ISSUES_CLI_BIN = "/google/bin/releases/issues-cli/issues"
 REMOTE_MCP_BIN = "/google/bin/releases/gemini-cli/tools/remote_mcp"
 BUGANIZER_MCP_SERVER = "blade:devtools.buganizer.mcpservice-prod"
-BUG_SYNC_TTL_SEC = 300.0
+# Match the 120s daemon poll interval so newly assigned bugs do not wait across multiple cycles
+BUG_SYNC_TTL_SEC = 120.0
 BUG_STALE_BACKLOG_DAYS = 60
 BUG_RECENT_CLOSED_DAYS = 14
 # Public Chromium and Skia Buganizer component roots used to pick crbug/ over b/
@@ -7042,8 +7043,22 @@ def _start_chat_for_bug(
 
   bug_chats = discover_bug_chats(include_archived=True)
   cand = bug_chats.get(bug_key)
+  cached_cid = str(bug.get("conversation_id") or "").strip()
+  woken_ts = float(bug.get("chat_woken_ts") or 0.0)
+  st = str(bug.get("status") or "").upper()
+  # Preserve historical chats on closed bugs alongside meta projects and grace-window spawns
+  keep_unindexed_cid = bool(
+      cached_cid
+      and (
+          st not in ("NEW", "ASSIGNED", "ACCEPTED", "OPEN")
+          or str(bug.get("project_name") or "") in META_PROJECT_NAMES
+          or (woken_ts > 0.0 and (time.time() - woken_ts) < CHAT_WAKE_GRACE_SEC)
+      )
+  )
+  # Ignore stale conversation_ids whose titles were renamed away from this bug
   active_cid = str(
-      (cand or {}).get("conversation_id") or bug.get("conversation_id") or ""
+      (cand or {}).get("conversation_id")
+      or (cached_cid if keep_unindexed_cid else "")
   ).strip()
   if not active_cid:
     # Reuse a linked 1:1 self-authored CL chat, ignoring multi-bug umbrella CLs
@@ -8651,6 +8666,9 @@ def _unwrap_mcp_or_json_text(raw_text: str) -> str:
     return data["result"]
   res_obj = data.get("result")
   if isinstance(res_obj, dict):
+    # Keep tool-level isError envelopes intact so _is_mcp_error_output detects RPC failures
+    if res_obj.get("isError"):
+      return raw_text or ""
     content = res_obj.get("content")
     if isinstance(content, list) and content and isinstance(content[0], dict):
       if isinstance(content[0].get("text"), str):
@@ -8954,8 +8972,38 @@ def parse_buganizer_blocks(output_text: str) -> list[dict[str, Any]]:
   return results
 
 
-# Bump whenever parse_rendered_issue_comments changes so cached bugs re-render once
-COMMENTS_PARSER_VERSION = 2
+# Bump whenever parse_rendered_issue_comments changes or failed MCP renders poisoned v2 stamps
+COMMENTS_PARSER_VERSION = 3
+
+
+def _is_mcp_error_output(raw_text: str) -> bool:
+  """Returns True when `raw_text` is a JSON-RPC error or MCP `isError: true` response."""
+  trimmed = (raw_text or "").strip()
+  if not trimmed.startswith("{"):
+    return False
+  try:
+    data = json.loads(trimmed)
+  except ValueError:
+    return False
+  if not isinstance(data, dict):
+    return False
+  # JSON-RPC transport errors omit result while tool-level MCP failures set result.isError
+  if data.get("error") is not None and data.get("result") is None:
+    return True
+  res_obj = data.get("result")
+  return isinstance(res_obj, dict) and bool(res_obj.get("isError"))
+
+
+def _is_valid_rendered_issue_output(raw_text: str, expected_issue_id: str = "") -> bool:
+  """Returns True only when `raw_text` unwrapped cleanly into the expected `Issue ID:` body."""
+  if not (raw_text or "").strip() or _is_mcp_error_output(raw_text):
+    return False
+  text = _unwrap_mcp_or_json_text(raw_text)
+  # Require the rendered Issue ID header so partial responses never stamp checked_mod
+  m_id = re.search(r"(?m)^Issue ID:\s*(\d+)\b", text)
+  if not m_id:
+    return False
+  return not expected_issue_id or m_id.group(1) == str(expected_issue_id)
 
 # Terminates each comment body only at the next top-level Comment #N header or EOF
 # because render_issue_with_external uses blank lines between comments and --- inside bodies
@@ -9069,8 +9117,11 @@ def merge_bug_record_with_prev(
         "comment_cl_urls",
         "comments_checked_major_mod",
     }
+    # Preserve self-assignment watermarks across polls so existing backlog stays seeded
     for carry_key in (
         "acked_ts",
+        "seen_self_assigned",
+        "assigned_to_self_ts",
         "duplicate_of",
         "parent_issue_id",
         "custom_fields",
@@ -9109,6 +9160,43 @@ def merge_bug_record_with_prev(
     else:
       merged["title"] = f"Bug {merged.get('id') or merged.get('bug_key')}"
   return merged
+
+
+def _update_bug_self_assignment_state(
+    bug: dict[str, Any],
+    prev: dict[str, Any] | None,
+    *,
+    has_prev_source_snapshot: bool,
+    now_ts: float,
+) -> None:
+  """Tracks transitions into self-assignment without triggering stampedes on seeded backlog."""
+  if not _is_self_bug_assignee(str(bug.get("assignee") or "")):
+    bug["seen_self_assigned"] = False
+    bug["assigned_to_self_ts"] = 0.0
+    return
+  prev_dict = prev if isinstance(prev, dict) else {}
+  prev_was_self = bool(prev_dict) and (
+      _is_self_bug_assignee(str(prev_dict.get("assignee") or ""))
+      or bool(prev_dict.get("seen_self_assigned"))
+  )
+  bug["seen_self_assigned"] = True
+  if prev_was_self:
+    bug["assigned_to_self_ts"] = float(prev_dict.get("assigned_to_self_ts") or 0.0)
+    return
+  st = str(bug.get("status") or "").upper()
+  if st not in ("NEW", "ASSIGNED", "ACCEPTED", "OPEN"):
+    bug["assigned_to_self_ts"] = 0.0
+    return
+  # Seed initial cold-boot backlog quietly; stamp timestamp only after backlog is seeded
+  if not prev_dict and not has_prev_source_snapshot:
+    bug["assigned_to_self_ts"] = 0.0
+    return
+  bug["assigned_to_self_ts"] = (
+      float(bug.get("modified_ts") or 0.0)
+      or _parse_ts(bug.get("modified_time"))
+      or _parse_ts(bug.get("created_time"))
+      or now_ts
+  )
 
 
 def _extract_topic_from_bug_chat_title(chat_title: str) -> str:
@@ -9979,6 +10067,37 @@ def link_bugs_and_cls(
     )
     for bkey in refs:
       _add_edge(bkey, ikey)
+
+  # Evict orphaned bug conversation_ids when a chat was renamed away from the bug ID
+  if bug_chats is not None:
+    now_link_ts = time.time()
+    for bkey, bug in bugs_by_key.items():
+      if not isinstance(bug, dict) or bkey in bug_chats:
+        continue
+      bcid = str(bug.get("conversation_id") or "").strip()
+      if not bcid:
+        continue
+      st = str(bug.get("status") or "").upper()
+      if st not in ("NEW", "ASSIGNED", "ACCEPTED", "OPEN"):
+        continue
+      if str(bug.get("project_name") or "") in META_PROJECT_NAMES:
+        continue
+      woken_ts = float(bug.get("chat_woken_ts") or 0.0)
+      if woken_ts > 0.0 and (now_link_ts - woken_ts) < CHAT_WAKE_GRACE_SEC:
+        continue
+      shared_with_self_cl = any(
+          rec.get("is_self")
+          and not rec.get("chat_archived")
+          and str(rec.get("conversation_id") or "").strip() == bcid
+          and len(cl_to_bugs.get(ik, [])) <= 1
+          for ik in bug_to_cls.get(bkey, [])
+          for _, rec in cl_entries_by_ikey.get(ik, [])
+      )
+      if not shared_with_self_cl:
+        bug["conversation_id"] = ""
+        bug["chat_title"] = ""
+        bug["chat_archived"] = False
+        bug["chat_busy"] = False
 
   # Pass 1: Propagate an active bug chat onto unchatted 1:1 self-authored fix CLs
   for bkey, cl_ikeys in bug_to_cls.items():
@@ -11353,7 +11472,12 @@ def confirm_security_merge_group(
     for r, out_txt in zip(to_comment, mcp_outs):
       bid = str(r["id"])
       clean_out = (out_txt or "").strip()
-      if clean_out and not clean_out.lower().startswith(("error", "failed")):
+      # Reject JSON-RPC/MCP error envelopes alongside plaintext error prefixes
+      if (
+          clean_out
+          and not _is_mcp_error_output(clean_out)
+          and not clean_out.lower().startswith(("error", "failed"))
+      ):
         r["already_commented"] = True
         comment_ok_ids.add(bid)
         commented_ids.append(bid)
@@ -11663,14 +11787,35 @@ def classify_bug_status(
   pri = str(bug.get("priority") or "P2").upper()
   itype = str(bug.get("issue_type") or "BUG").upper()
   created_ts = _parse_ts(bug.get("created_time"))
+  mod_ts = float(bug.get("modified_ts") or _parse_ts(bug.get("modified_time")) or 0.0)
+  raw_assignee = str(bug.get("assignee") or "").strip()
+  has_foreign_assignee = bool(raw_assignee) and not is_self_assigned
   recent_created = created_ts > 0 and (cur_now - created_ts) <= 7 * 86400
-  # Only the assignee owns CL creation and issue closure when linked CLs merge
+  # Prefer Major Modified Time so routine bot hotlist/SLO touches do not wake old backlog bugs
+  vuln_mod_ts = _parse_ts(bug.get("major_modified_time")) or mod_ts
+  recent_vuln_mod = (
+      itype == "VULNERABILITY"
+      and vuln_mod_ts > 0
+      and (cur_now - vuln_mod_ts) <= 7 * 86400
+  )
+  # Only the assignee owns CL creation and issue closure; skip non-bug PROJECT trackers
   unacked_urgent = (
       not is_non_owner
+      and not has_foreign_assignee
+      and itype != "PROJECT"
       and (not has_cl or only_wip_cls)
       and effective_ack_ts <= 0.0
       and (pri in ("P0", "P1") or itype == "VULNERABILITY")
-      and (status == "NEW" or recent_created)
+      and (status == "NEW" or recent_created or recent_vuln_mod)
+  )
+  # Any newly self-assigned issue enters Needs You even when routed without a comment
+  assign_ts = float(bug.get("assigned_to_self_ts") or 0.0)
+  unacked_assigned = (
+      is_self_assigned
+      and not is_non_owner
+      and itype != "PROJECT"
+      and (not has_cl or only_wip_cls)
+      and assign_ts > comment_ack_ts
   )
   all_merged_unacked = (
       not is_non_owner
@@ -11741,6 +11886,21 @@ def classify_bug_status(
           if itype == "VULNERABILITY"
           else f"New {pri} issue without a CL yet"
       )
+  # Surface newly routed P2-P4 assignments alongside urgent/security issues
+  elif unacked_assigned:
+    bug["needs_you"] = True
+    if only_wip_cls:
+      bug["why_needs_you"] = (
+          f"Newly assigned {pri} vulnerability — WIP CL ready for review"
+          if itype == "VULNERABILITY"
+          else f"Newly assigned {pri} issue — WIP CL ready for review"
+      )
+    else:
+      bug["why_needs_you"] = (
+          f"Newly assigned {pri} vulnerability needs triage"
+          if itype == "VULNERABILITY"
+          else f"Newly assigned {pri} issue needs triage"
+      )
 
   if bug["needs_you"]:
     bug["lane"] = "you"
@@ -11770,8 +11930,12 @@ def should_autostart_bug_triage(bug: dict[str, Any]) -> bool:
   """Returns True when an unchatted Needs You bug should auto-launch a bug-triage chat."""
   if not isinstance(bug, dict):
     return False
-  # Release merge requests follow the 6-gate confirm/reassign flow rather than bug-triage
-  if is_merge_request_bug(bug) or bool(bug.get("is_security_merge_request")):
+  # Release merge requests and program PROJECT trackers do not use code bug-triage
+  if (
+      is_merge_request_bug(bug)
+      or bool(bug.get("is_security_merge_request"))
+      or str(bug.get("issue_type") or "").upper() == "PROJECT"
+  ):
     return False
   # Unassigned @Rusino GitHub mentions surface passively without spawning LLM chats
   if bool(bug.get("is_mentioned")):
@@ -12088,7 +12252,8 @@ def build_buganizer_bulk_query_url(issue_ids: list[str]) -> str:
 def _mcp_mutation_succeeded(output_text: str) -> bool:
   """Returns True when a Buganizer MCP mutation response carries no RPC failure code."""
   txt = (output_text or "").strip()
-  if not txt:
+  # Reject JSON-RPC or tool-level isError envelopes before scanning status codes
+  if not txt or _is_mcp_error_output(txt):
     return False
   up = txt.upper()
   return not any(
@@ -12306,7 +12471,7 @@ def sync_bugs_into_state(
     proj_names: dict[str, str] | None = None,
     skia_dir: str = DEFAULT_SKIA_DIR,
 ) -> None:
-  """Polls Buganizer/crbug and GitHub issues with a 5-min TTL and links them to CLs."""
+  """Polls Buganizer/crbug and GitHub issues with a 2-min TTL and links them to CLs."""
   pnames = proj_names if proj_names is not None else load_project_names()
   prev_bugs: dict[str, Any] = state.get("bugs") or {}
   bug_acks: dict[str, Any] = state.setdefault("bug_acks", {})
@@ -12407,12 +12572,40 @@ def sync_bugs_into_state(
       ("get_bugs_with_external", {"query": open_q, "maxResults": 200, "verbose": True}),
       ("get_bugs_with_external", {"query": closed_q, "maxResults": 50, "verbose": True}),
   ]
-  mcp_outputs = call_buganizer_mcp_batch(mcp_calls)
-  fetched_bz = parse_buganizer_blocks(mcp_outputs[0]) + parse_buganizer_blocks(
-      mcp_outputs[1]
+  # Persist per-tracker backlog seed flags so 0-bug GitHub states and cold outages stay exact
+  seeded_flags = state.setdefault("bug_backlog_seeded", {})
+  if not isinstance(seeded_flags, dict):
+    seeded_flags = {}
+    state["bug_backlog_seeded"] = seeded_flags
+  has_prev_bz = bool(seeded_flags.get("buganizer")) or any(
+      isinstance(v, dict)
+      and v.get("source") == "buganizer"
+      and (
+          _is_self_bug_assignee(str(v.get("assignee") or ""))
+          or bool(v.get("seen_self_assigned"))
+      )
+      for v in prev_bugs.values()
   )
-  if not fetched_bz:
+  has_prev_gh = bool(seeded_flags.get("github")) or any(
+      isinstance(v, dict)
+      and v.get("source") == "github"
+      and (
+          _is_self_bug_assignee(str(v.get("assignee") or ""))
+          or bool(v.get("seen_self_assigned"))
+      )
+      for v in prev_bugs.values()
+  )
+  mcp_outputs = call_buganizer_mcp_batch(mcp_calls)
+  bz_open_raw = mcp_outputs[0] if mcp_outputs else ""
+  bz_closed_raw = mcp_outputs[1] if len(mcp_outputs) > 1 else ""
+  fetched_bz = parse_buganizer_blocks(bz_open_raw) + parse_buganizer_blocks(
+      bz_closed_raw
+  )
+  # Fall back to issues-cli and retain cached Buganizer bugs only when primary open_q failed
+  bz_failed = not bz_open_raw.strip() or _is_mcp_error_output(bz_open_raw)
+  if not fetched_bz and bz_failed:
     fetched_bz = fetch_buganizer_fallback(open_q, limit=150)
+  bz_outage = bz_failed and not fetched_bz
 
   primary_self_bkeys = {str(b.get("bug_key") or "") for b in fetched_bz}
   seen_bz_ids = {str(b.get("id") or "") for b in fetched_bz}
@@ -12429,9 +12622,13 @@ def sync_bugs_into_state(
       for b in (*fetched_bz, *(v for v in prev_bugs.values() if isinstance(v, dict)))
       if isinstance(b, dict) and str(b.get("parent_issue_id") or "").strip().isdigit()
   }
-  missing_bz_ids = sorted(
-      (ref_buganizer_ids | prev_open_ids | parent_bz_ids) - seen_bz_ids
+  # During a primary open_q outage, still resolve CL-referenced IDs while keeping prev_bugs cached
+  reconcile_ids = (
+      (ref_buganizer_ids | parent_bz_ids)
+      if bz_outage
+      else (ref_buganizer_ids | prev_open_ids | parent_bz_ids)
   )
+  missing_bz_ids = sorted(reconcile_ids - seen_bz_ids)
   if missing_bz_ids:
     id_q = " OR ".join(f"id:{bid}" for bid in missing_bz_ids[:40])
     extra_out = call_buganizer_mcp_batch(
@@ -12440,12 +12637,18 @@ def sync_bugs_into_state(
     fetched_bz.extend(parse_buganizer_blocks(extra_out[0]))
 
   all_bugs: dict[str, dict[str, Any]] = {}
-  render_cands: list[tuple[tuple[int, int, float], str]] = []
+  render_cands: list[tuple[tuple[int, int, int, float], str]] = []
   recent_cutoff_ts = now_ts - 30 * 86400
   for raw_b in fetched_bz:
     bkey = raw_b["bug_key"]
     prev_entry = prev_bugs.get(bkey) if isinstance(prev_bugs.get(bkey), dict) else {}
     merged_b = merge_bug_record_with_prev(raw_b, prev_entry)
+    _update_bug_self_assignment_state(
+        merged_b,
+        prev_entry,
+        has_prev_source_snapshot=has_prev_bz,
+        now_ts=now_ts,
+    )
     # Recompute collaborator role from live query membership so removed/reassigned bugs drop out
     merged_b["is_collaborator"] = bool(
         bkey in primary_self_bkeys
@@ -12475,15 +12678,17 @@ def sync_bugs_into_state(
         and mod_stamp
         and mod_stamp != str(merged_b.get("comments_checked_major_mod") or "")
     ):
-      # Prioritize currently Needs Me and chatted bugs ahead of passive 30-day activity
+      # Prioritize vulnerabilities, Needs Me, and chatted bugs ahead of passive 30-day activity
       prio_key = (
+          1 if str(merged_b.get("issue_type") or "").upper() == "VULNERABILITY" else 0,
           1 if prev_entry.get("needs_you") else 0,
           1 if bkey in merged_chats else 0,
           float(merged_b.get("modified_ts") or 0.0),
       )
       render_cands.append((prio_key, merged_b["id"]))
 
-  to_render_ids = [bid for _, bid in sorted(render_cands, reverse=True)[:12]]
+  # Cap per-sync render batch at 8 issues so remote_mcp finishes well inside its 25s budget
+  to_render_ids = [bid for _, bid in sorted(render_cands, reverse=True)[:8]]
   if to_render_ids:
     render_calls = [
         ("render_issue_with_external", {"issueId": bid}) for bid in to_render_ids
@@ -12491,10 +12696,28 @@ def sync_bugs_into_state(
     rendered_outs = call_buganizer_mcp_batch(render_calls)
     for bid, r_out in zip(to_render_ids, rendered_outs):
       b_obj = all_bugs.get(f"buganizer:{bid}")
-      if isinstance(b_obj, dict) and r_out:
+      # Never overwrite cached comment fields or stamp checked_mod when remote_mcp errored
+      if isinstance(b_obj, dict) and _is_valid_rendered_issue_output(r_out, bid):
         cinfo = parse_rendered_issue_comments(r_out)
         b_obj.update(cinfo)
         b_obj["comments_checked_major_mod"] = _bug_comments_mod_stamp(b_obj)
+
+  # Retain cached Buganizer bugs when both remote_mcp and issues-cli fail transiently
+  if bz_outage:
+    for bkey, prev_b in prev_bugs.items():
+      if (
+          isinstance(prev_b, dict)
+          and prev_b.get("source") == "buganizer"
+          and bkey not in all_bugs
+      ):
+        all_bugs[bkey] = dict(prev_b)
+        if prev_b.get("is_collaborator") or _is_self_bug_assignee(
+            str(prev_b.get("assignee") or "")
+        ):
+          primary_self_bkeys.add(bkey)
+  # Mark Buganizer backlog seeded once primary open_q succeeds (or migrated from state)
+  if has_prev_bz or not bz_outage:
+    seeded_flags["buganizer"] = True
 
   gh_errors: list[str] = []
   fetched_gh = fetch_github_bugs(
@@ -12505,6 +12728,12 @@ def sync_bugs_into_state(
     if gh_b.get("from_self_query"):
       primary_self_bkeys.add(bkey)
     merged_gh = merge_bug_record_with_prev(gh_b, prev_bugs.get(bkey))
+    _update_bug_self_assignment_state(
+        merged_gh,
+        prev_bugs.get(bkey) if isinstance(prev_bugs.get(bkey), dict) else None,
+        has_prev_source_snapshot=has_prev_gh,
+        now_ts=now_ts,
+    )
     merged_gh["is_collaborator"] = False
     merged_gh["is_mentioned"] = bool(gh_b.get("is_mentioned"))
     all_bugs[bkey] = merged_gh
@@ -12521,6 +12750,9 @@ def sync_bugs_into_state(
             str(prev_b.get("assignee") or "")
         ):
           primary_self_bkeys.add(bkey)
+  # Mark GitHub backlog seeded once gh issue queries finish without error
+  if has_prev_gh or not gh_errors:
+    seeded_flags["github"] = True
   state["bug_sync_errors"] = gh_errors
 
   # Restore persistent acked_ts watermarks so pruned @mentions do not resurrect on 5-min syncs
@@ -12602,8 +12834,16 @@ def sync_bugs_into_state(
         _parse_ts(bug.get("last_self_comment_at")),
         float(bug.get("acked_ts") or 0.0),
     )
+    # Suppress comment wakeups when COMMENTS_PARSER_VERSION re-renders an unchanged bug
+    prev_checked = str(prev_b.get("comments_checked_major_mod") or "")
+    is_parser_reheal = (
+        bool(prev_checked)
+        and not prev_checked.startswith(f"v{COMMENTS_PARSER_VERSION}:")
+        and bug.get("modified_time") == prev_b.get("modified_time")
+    )
     if (
         wake_chats
+        and not is_parser_reheal
         and bug.get("conversation_id")
         and not bug.get("chat_archived")
         and bug.get("needs_you")
@@ -12638,7 +12878,7 @@ def sync_bugs_into_state(
       )
       del events[50:]
 
-  # Launch highest-priority unchatted Needs You bugs first (P0 -> P4, newest activity first)
+  # Launch security vulnerabilities first, then P0 -> P4, newest activity first
   pri_ranks = {"P0": 0, "P1": 1, "P2": 2, "P3": 3, "P4": 4}
   autostart_cands = [
       (bkey, bug)
@@ -12647,13 +12887,20 @@ def sync_bugs_into_state(
   ]
   autostart_cands.sort(
       key=lambda kv: (
+          0 if str(kv[1].get("issue_type") or "").upper() == "VULNERABILITY" else 1,
           pri_ranks.get(str(kv[1].get("priority") or "P2").upper(), 2),
           -float(kv[1].get("modified_ts") or _parse_ts(kv[1].get("modified_time")) or 0.0),
           kv[0],
       )
   )
   for bkey, bug in autostart_cands:
-    stamp = bug.get("last_human_comment_at") or bug.get("created_time") or "init"
+    # Key assignment autostart claims on assigned_to_self_ts so reassignments get a fresh claim
+    assign_ts = float(bug.get("assigned_to_self_ts") or 0.0)
+    human_at = str(bug.get("last_human_comment_at") or "")
+    if assign_ts > _parse_ts(human_at):
+      stamp = f"assign:{int(assign_ts)}"
+    else:
+      stamp = human_at or str(bug.get("created_time") or "init")
     claim_key = f"bug:{bkey}:{stamp}"
     # Defer background bug chat launches while the target project's senior quota is <5%
     if _check_profile_quota_hold(_resolve_record_profile(bug))[0]:
@@ -19886,8 +20133,9 @@ function render() {
       ? renderSecondarySectionsHtml('bugs', bugSections)
       : (shownBugs.length ? '' : '<p class="empty-note">No tracked bugs in this project.</p>'));
     const projCount = bugProjects.length;
+    // Match BUG_SYNC_TTL_SEC (120s) in the Bugs tab status footer
     document.getElementById('footer').textContent =
-      `${allBugs.length} tracked bugs across ${projCount} projects · refreshes every 5 min`;
+      `${allBugs.length} tracked bugs across ${projCount} projects · refreshes every 2 min`;
     applyRenderScrollPosition(savedScrollY);
     // Bugs view returns early before CL lanes, so emit rendered heartbeat here as well
     notifyParentRendered(data);

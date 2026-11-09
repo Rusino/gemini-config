@@ -1134,6 +1134,8 @@ def compute_bug_entity_state(bug: Mapping[str, Any]) -> dict[str, Any]:
   lane = str(bug.get("lane") or "assigned")
   needs_you = bool(bug.get("needs_you")) or lane == "you"
   chat_busy = bool(bug.get("chat_busy"))
+  # Expose why_needs_you on entity_state so Workbench cards surface concrete bug triage reasons
+  reason = str(bug.get("why_needs_you") or "").strip() if needs_you else ""
   actions: list[str] = []
   # Include both pending security merge requests and approved merge-request bugs needing cherry-pick
   if (bug.get("is_security_merge_request") or bug.get("is_merge_request_bug")) and lane == "you":
@@ -1149,6 +1151,7 @@ def compute_bug_entity_state(bug: Mapping[str, Any]) -> dict[str, Any]:
   return {
       "lane": lane,
       "needs_you": needs_you,
+      "reason": reason,
       "actionable_now": needs_you and not chat_busy,
       "is_overdue": bool(bug.get("is_overdue")),
       "is_stale_backlog": bool(bug.get("is_stale_backlog")),
