@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -13,6 +14,7 @@ WORKBENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 if WORKBENCH_DIR not in sys.path:
   sys.path.insert(0, WORKBENCH_DIR)
 
+import ingestor  # pylint: disable=g-import-not-at-top
 import work_store  # pylint: disable=g-import-not-at-top
 
 ROADMAP_SCRIPT = os.path.expanduser("~/.gemini/config/hooks/roadmap.py")
@@ -37,6 +39,7 @@ def _roadmap_writeback(proj_id: str, item_id: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+  """Parses Workbench CLI subcommands, mutates or queries WorkStore, and returns an exit code."""
   parser = argparse.ArgumentParser(description="Workbench CLI")
   parser.add_argument("--db", default="", help="Override SQLite DB path")
   sub = parser.add_subparsers(dest="cmd", required=True)
@@ -101,6 +104,36 @@ def main(argv: list[str] | None = None) -> int:
   p_ambig.add_argument("obligation_id")
   p_ambig.add_argument("decision", choices=["keep", "close"])
   p_ambig.add_argument("--event-key", default="")
+
+  p_dset = sub.add_parser("draft-set", help="Save or update a live reply draft on a Work")
+  p_dset.add_argument("work_id")
+  body_grp = p_dset.add_mutually_exclusive_group()
+  body_grp.add_argument("--body", default="")
+  body_grp.add_argument("--body-file", default="")
+  fmt_grp = p_dset.add_mutually_exclusive_group()
+  fmt_grp.add_argument("--html", action="store_true")
+  fmt_grp.add_argument("--text", action="store_true")
+  p_dset.add_argument("--thread", default="")
+  p_dset.add_argument("--to", default="")
+  p_dset.add_argument("--cc", default="")
+  p_dset.add_argument("--subject", default="")
+  p_dset.add_argument("--when", default="")
+  ag_grp = p_dset.add_mutually_exclusive_group()
+  ag_grp.add_argument("--auto-gate", dest="auto_gate", action="store_true")
+  ag_grp.add_argument("--no-auto-gate", dest="auto_gate", action="store_false")
+  p_dset.set_defaults(auto_gate=None)
+
+  p_dshow = sub.add_parser("draft-show", help="Show the active live reply draft on a Work")
+  p_dshow.add_argument("work_id")
+  p_dshow.add_argument("--json", action="store_true")
+
+  p_dclear = sub.add_parser("draft-clear", help="Clear the live reply draft on a Work")
+  p_dclear.add_argument("work_id")
+
+  p_dmat = sub.add_parser("draft-materialize", help="Create a Gmail draft from Work's reply draft")
+  p_dmat.add_argument("work_id")
+  p_dmat.add_argument("--force-new", action="store_true")
+  p_dmat.add_argument("--json", action="store_true")
 
   args = parser.parse_args(argv)
   store = work_store.WorkStore(args.db or None)
@@ -224,6 +257,67 @@ def main(argv: list[str] | None = None) -> int:
         decision=args.decision,
         event_key=args.event_key,
     )
+    return 0
+
+  # Persist evolving reply notes inside Workbench without mutating Gmail on intermediate steps
+  if args.cmd == "draft-set":
+    body_str = args.body
+    if args.body_file:
+      with open(args.body_file, "r", encoding="utf-8") as f:
+        body_str = f.read()
+    if args.html:
+      fmt_val = "html"
+    elif args.text:
+      fmt_val = "text"
+    else:
+      has_html_tag = bool(
+          re.search(
+              r"</?(?:p|div|ul|ol|li|br|pre|a|b|strong|i|em|code|blockquote|h[1-6])\b",
+              body_str,
+              re.IGNORECASE,
+          )
+      )
+      fmt_val = "html" if has_html_tag else "text"
+    # Extract referenced CLs/bugs for checklist coverage without promoting them to primary links
+    m_keys = ingestor.extract_draft_mentioned_keys(args.subject, body_str)
+    saved = store.save_reply_draft(
+        args.work_id,
+        body_str,
+        fmt=fmt_val,
+        thread_key=args.thread,
+        to=args.to,
+        cc=args.cc,
+        subject=args.subject,
+        trigger_expr=args.when,
+        auto_gate=args.auto_gate,
+        mentioned_keys=m_keys,
+    )
+    print(json.dumps(saved, ensure_ascii=False))
+    return 0
+
+  if args.cmd == "draft-show":
+    rd = store.get_reply_draft(args.work_id)
+    if rd is None:
+      print("{}" if args.json else "No active reply draft")
+      return 0
+    if args.json:
+      print(json.dumps(rd, indent=2, ensure_ascii=False))
+    else:
+      print(rd.get("body") or "")
+    return 0
+
+  if args.cmd == "draft-clear":
+    store.clear_reply_draft(args.work_id)
+    return 0
+
+  if args.cmd == "draft-materialize":
+    res = ingestor.materialize_reply_draft(
+        store, args.work_id, force_new=bool(args.force_new)
+    )
+    if args.json:
+      print(json.dumps(res, indent=2, ensure_ascii=False))
+    else:
+      print(f"{res['draft_key']}  {res['url']}")
     return 0
 
   return 0

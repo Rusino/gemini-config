@@ -8,6 +8,7 @@ import html as html_lib
 import http.server
 import json
 import os
+import re
 import socketserver
 import subprocess
 import sys
@@ -88,6 +89,82 @@ def export_workbench_info(
 
 def _esc(val: Any) -> str:
   return html_lib.escape(str(val or ""), quote=True)
+
+
+_RE_ANCHOR_TAG = re.compile(
+    r'<a\s+[^>]*href=["\'](https?://[^"\'<>]+)["\'][^>]*>(.*?)</a>',
+    re.IGNORECASE | re.DOTALL,
+)
+_RE_HTML_DRAFT_TAG = re.compile(
+    r"</?(?:p|div|ul|ol|li|br|pre|a|b|strong|i|em|code|blockquote|h[1-6])\b",
+    re.IGNORECASE,
+)
+_RE_SCRIPT_STYLE_BLOCK = re.compile(
+    r"<(?:script|style)\b[^>]*>[\s\S]*?</(?:script|style)>",
+    re.IGNORECASE,
+)
+_RE_PLAIN_URL = re.compile(r"https?://[^\s<>\"']+")
+_RE_BLOCK_BREAK = re.compile(r"</?(?:p|div|li|ul|ol|br|pre|h[1-6])\b[^>]*>", re.IGNORECASE)
+_RE_ANY_TAG = re.compile(r"<[^>]+>")
+
+
+def _detect_draft_format(text: str) -> str:
+  """Classifies draft content as html only when real HTML markup tags are present."""
+  return "html" if _RE_HTML_DRAFT_TAG.search(str(text or "")) else "text"
+
+
+def _linkify_escaped_plain_text(raw: str) -> str:
+  """Escapes plain-text draft content preserving angle-bracket types while linkifying URLs."""
+  parts: list[str] = []
+  last_end = 0
+  for m in _RE_PLAIN_URL.finditer(raw):
+    parts.append(_esc(raw[last_end : m.start()]))
+    url, suffix = ingestor._split_url_trailing_punct(m.group(0))
+    if url:
+      esc_u = _esc(url)
+      parts.append(f'<a href="{esc_u}" target="_blank" rel="noopener">{esc_u}</a>')
+    parts.append(_esc(suffix))
+    last_end = m.end()
+  parts.append(_esc(raw[last_end:]))
+  return re.sub(r"\n{2,}", "\n", "".join(parts)).strip().replace("\n", "<br>")
+
+
+def _render_safe_draft_preview(rd: dict[str, Any] | None) -> str:
+  """Renders an XSS-safe HTML preview of a reply draft preserving only https?:// anchors."""
+  if not rd or not str(rd.get("body") or "").strip():
+    return ""
+  raw = str(rd.get("body") or "").strip()
+  fmt_mode = (
+      "html"
+      if (str(rd.get("format") or "").lower() == "html" or _detect_draft_format(raw) == "html")
+      else "text"
+  )
+  if fmt_mode == "text":
+    return _linkify_escaped_plain_text(raw)
+
+  anchors: list[str] = []
+
+  def _stash_anchor(m: re.Match[str]) -> str:
+    """Replaces an https?:// anchor with a token while unescaping and re-escaping once."""
+    href_clean = html_lib.unescape(m.group(1).strip())
+    if not re.match(r"^https?://", href_clean, re.IGNORECASE):
+      return m.group(2)
+    lbl_clean = html_lib.unescape(_RE_ANY_TAG.sub("", m.group(2)).strip()) or href_clean
+    idx = len(anchors)
+    anchors.append(
+        f'<a href="{_esc(href_clean)}" target="_blank" rel="noopener">{_esc(lbl_clean)}</a>'
+    )
+    return f"@@WB_LINK_{idx}@@"
+
+  no_script = _RE_SCRIPT_STYLE_BLOCK.sub("", raw)
+  stashed = _RE_ANCHOR_TAG.sub(_stash_anchor, no_script)
+  lined = _RE_BLOCK_BREAK.sub("\n", stashed)
+  stripped = _RE_ANY_TAG.sub("", lined)
+  escaped = _esc(html_lib.unescape(stripped))
+  collapsed = re.sub(r"\n{2,}", "\n", escaped).strip().replace("\n", "<br>")
+  for idx, safe_a in enumerate(anchors):
+    collapsed = collapsed.replace(f"@@WB_LINK_{idx}@@", safe_a)
+  return collapsed
 
 
 def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
@@ -257,13 +334,24 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
         if mention_arts_ssr
         else ""
     )
+    rd_obj = w.get("reply_draft")
+    rd_ssr = ""
+    if isinstance(rd_obj, dict) and str(rd_obj.get("body") or "").strip():
+      rd_prev = _render_safe_draft_preview(rd_obj)
+      rd_upd = _esc(rd_obj.get("updated_et") or "")
+      rd_ssr = (
+          f'<div class="wb-reply-draft">'
+          f'<div class="wb-reply-draft-hdr">'
+          f"<span>📝 Live reply draft · {rd_upd}</span></div>"
+          f'<div class="wb-reply-draft-body">{rd_prev}</div></div>'
+      )
     cards_ssr.append(
         f'<article class="wb-card" data-work-id="{wid}" data-lane="{lane}">'
         f'<div class="wb-card-hdr"><div class="wb-hdr-stack">'
         f'<strong class="wb-card-title">{title}</strong>'
         f'<div class="wb-meta-row"><span class="wb-lane-tag">{lane}</span></div>'
         f"{origin_ssr}</div></div>"
-        f'<div class="wb-card-body">{corr_html}{obs_html}{chk_html}'
+        f'<div class="wb-card-body">{corr_html}{obs_html}{rd_ssr}{chk_html}'
         f"<div class='wb-pills'>{pills_html}</div>{mentions_ssr}</div></article>"
     )
   ssr_body = "\n".join(cards_ssr)
@@ -953,6 +1041,50 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     border-color: rgba(21, 128, 61, 0.3);
     color: var(--ready);
   }}
+  .wb-reply-draft {{
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 7px 9px;
+    border-radius: 7px;
+    background: #f0f9ff;
+    border: 1px solid rgba(0, 113, 227, 0.24);
+    font-size: 11.5px;
+  }}
+  .wb-reply-draft-hdr {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    flex-wrap: wrap;
+    font-size: 11px;
+    font-weight: 600;
+    color: #0369a1;
+  }}
+  .wb-reply-draft-body {{
+    color: var(--text);
+    line-height: 1.45;
+    word-break: break-word;
+  }}
+  .wb-reply-draft-body a {{
+    color: var(--accent);
+    text-decoration: none;
+  }}
+  .wb-reply-draft-body a:hover {{
+    text-decoration: underline;
+  }}
+  .wb-reply-textarea {{
+    width: 100%;
+    min-height: 84px;
+    resize: vertical;
+    font-family: inherit;
+    font-size: 11.5px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: #ffffff;
+    color: var(--text);
+  }}
 </style>
 </head>
 <body>
@@ -1033,6 +1165,86 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   let collapsedOverrides = {{}};
   // Keep search-time toggles in memory so clearing search restores saved card states
   let searchCollapsedOverrides = {{}};
+  // Track open inline reply-draft editors per card across periodic projection refreshes
+  let openDraftEditors = {{}};
+
+  function unescapeHtml(s) {{
+    const ta = document.createElement('textarea');
+    ta.innerHTML = String(s || '');
+    return ta.value;
+  }}
+
+  function detectDraftFormat(s) {{
+    return /<\\/?(?:p|div|ul|ol|li|br|pre|a|b|strong|i|em|code|blockquote|h[1-6])\\b/i.test(
+      String(s || '')
+    ) ? 'html' : 'text';
+  }}
+
+  function linkifyPlainDraft(raw) {{
+    const urlRe = /https?:\\/\\/[^\\s<>"']+/g;
+    let out = '';
+    let last = 0;
+    let m;
+    while ((m = urlRe.exec(raw)) !== null) {{
+      out += esc(raw.slice(last, m.index));
+      let u = m[0];
+      let suffix = '';
+      while (u.length > 0) {{
+        const ch = u[u.length - 1];
+        const openP = (u.match(/\\(/g) || []).length;
+        const closeP = (u.match(/\\)/g) || []).length;
+        if ('.,;:!?]'.includes(ch) || (ch === ')' && closeP > openP)) {{
+          suffix = ch + suffix;
+          u = u.slice(0, -1);
+        }} else {{
+          break;
+        }}
+      }}
+      if (u) {{
+        const eu = esc(u);
+        out += `<a href="${{eu}}" target="_blank" rel="noopener">${{eu}}</a>`;
+      }}
+      out += esc(suffix);
+      last = m.index + m[0].length;
+    }}
+    out += esc(raw.slice(last));
+    return out.replace(/\\n{{2,}}/g, '\\n').trim().replace(/\\n/g, '<br>');
+  }}
+
+  // Strip arbitrary HTML tags from draft previews while keeping safe https?:// links clickable
+  function renderDraftPreview(rd) {{
+    if (!rd || !rd.body) return '';
+    const raw = String(rd.body).trim();
+    if (!raw) return '';
+    const fmt = (String(rd.format || '').toLowerCase() === 'html'
+      || detectDraftFormat(raw) === 'html') ? 'html' : 'text';
+    if (fmt === 'text') return linkifyPlainDraft(raw);
+    const anchors = [];
+    const noScript = raw.replace(/<(?:script|style)\\b[^>]*>[\\s\\S]*?<\\/(?:script|style)>/gi, '');
+    const stashed = noScript.replace(
+      /<a\\s+[^>]*href=["'](https?:\\/\\/[^"'<>]+)["'][^>]*>([\\s\\S]*?)<\\/a>/gi,
+      (_, href, inner) => {{
+        const cleanHref = unescapeHtml(String(href || '').trim());
+        if (!/^https?:\\/\\//i.test(cleanHref)) return inner || '';
+        const strippedInner = String(inner || '').replace(/<[^>]+>/g, '').trim();
+        const cleanLbl = unescapeHtml(strippedInner) || cleanHref;
+        const idx = anchors.length;
+        anchors.push(
+          `<a href="${{esc(cleanHref)}}" target="_blank" rel="noopener">${{esc(cleanLbl)}}</a>`
+        );
+        return `@@WB_LINK_${{idx}}@@`;
+      }}
+    );
+    const stripped = stashed
+      .replace(/<\\/?(?:p|div|li|ul|ol|br|pre|h[1-6])\\b[^>]*>/gi, '\\n')
+      .replace(/<[^>]+>/g, '');
+    let out = esc(unescapeHtml(stripped))
+      .replace(/\\n{{2,}}/g, '\\n').trim().replace(/\\n/g, '<br>');
+    anchors.forEach((safeA, idx) => {{
+      out = out.split(`@@WB_LINK_${{idx}}@@`).join(safeA);
+    }});
+    return out;
+  }}
   try {{
     const raw = localStorage.getItem(COLLAPSE_STORAGE_KEY);
     if (raw) {{
@@ -1180,14 +1392,27 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   }}
 
   async function postJson(url, body) {{
-    const resp = await fetch(url, {{
-      method: 'POST',
-      headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify(body || {{}}),
-    }});
-    if (resp.ok) {{
+    try {{
+      const resp = await fetch(url, {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify(body || {{}}),
+      }});
+      if (!resp.ok) {{
+        let errMsg = `Request failed (HTTP ${{resp.status}})`;
+        try {{
+          const errData = await resp.json();
+          if (errData && errData.error) errMsg = String(errData.error);
+        }} catch (_) {{}}
+        window.alert(errMsg);
+        return false;
+      }}
       state = await resp.json();
       render();
+      return true;
+    }} catch (err) {{
+      window.alert(`Network error: ${{err && err.message ? err.message : err}}`);
+      return false;
     }}
   }}
 
@@ -1258,6 +1483,27 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     updateCollapseToggleUI(works);
 
     const container = document.getElementById('wb-cards-container');
+    // Snapshot live textarea edits and selection so background syncs never wipe unsaved typing
+    let focusedDraftWid = null;
+    let focusedSelStart = null;
+    let focusedSelEnd = null;
+    for (const taEl of document.querySelectorAll('.wb-reply-textarea')) {{
+      const taId = String(taEl.id || '');
+      if (!taId.startsWith('wb-draft-ta-')) continue;
+      const wid = taId.slice('wb-draft-ta-'.length);
+      if (!openDraftEditors[wid]) continue;
+      const agEl = document.getElementById(`wb-draft-ag-${{wid}}`);
+      openDraftEditors[wid] = {{
+        body: taEl.value,
+        autoGate: agEl ? Boolean(agEl.checked) : true,
+        initialized: true,
+      }};
+      if (document.activeElement === taEl) {{
+        focusedDraftWid = wid;
+        focusedSelStart = taEl.selectionStart;
+        focusedSelEnd = taEl.selectionEnd;
+      }}
+    }}
     if (works.length === 0) {{
       container.innerHTML = '<div style="color:var(--muted);padding:16px 4px">No works match the current filter.</div>';
       return;
@@ -1302,9 +1548,11 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
 
       const obsItemsHtml = openObs.map((o) => {{
         const isDraftOb = String(o.target_artifact_key || '').startsWith('gmail_draft:');
-        const waitTag = isDraftOb
-          ? '<span style="color:var(--accent);font-weight:600">⏳ Parked draft</span>'
-          : '<span style="color:var(--accent);font-weight:600">⏳ Waiting</span>';
+        const waitTag = o.wb_reply_draft
+          ? '<span style="color:var(--accent);font-weight:600">⏳ Parked reply note</span>'
+          : (isDraftOb
+              ? '<span style="color:var(--accent);font-weight:600">⏳ Parked draft</span>'
+              : '<span style="color:var(--accent);font-weight:600">⏳ Waiting</span>');
         const statusTag = o.status === 'ready'
           ? '<strong style="color:var(--ready)">🔔 READY</strong>'
           : (o.stalled_alert
@@ -1469,8 +1717,80 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
            </details>`
         : '';
 
+      // Render inline reply-draft editor or preview; warn when edits postdate materialization
+      const rd = w.reply_draft || null;
+      const isEditingDraft = Boolean(!w.is_virtual && openDraftEditors[w.work_id]);
+      let replyDraftHtml = '';
+      if (isEditingDraft) {{
+        const edState = openDraftEditors[w.work_id];
+        const hasSnap = edState && typeof edState === 'object' && edState.initialized;
+        const initBody = hasSnap ? String(edState.body ?? '') : (rd ? String(rd.body || '') : '');
+        const initAg = hasSnap ? Boolean(edState.autoGate) : (rd ? Boolean(rd.auto_gate) : true);
+        const lblStyle = 'font-size:11px;color:var(--muted);display:inline-flex;'
+          + 'align-items:center;gap:4px';
+        replyDraftHtml = `
+          <div class="wb-reply-draft">
+            <div class="wb-reply-draft-hdr"><span>📝 Edit live reply draft</span></div>
+            <textarea class="wb-reply-textarea" id="wb-draft-ta-${{esc(w.work_id)}}"
+                      placeholder="HTML or plain-text reply note...">${{esc(initBody)}}</textarea>
+            <div class="wb-actions" style="justify-content:space-between;flex-wrap:wrap">
+              <label style="${{lblStyle}}">
+                <input type="checkbox" id="wb-draft-ag-${{esc(w.work_id)}}"
+                       ${{initAg ? 'checked' : ''}}>
+                Auto-gate on primary CLs/bugs
+              </label>
+              <div class="wb-ob-btns">
+                <button class="wb-btn" data-cancel-draft="${{esc(w.work_id)}}"
+                        type="button">Cancel</button>
+                <button class="wb-btn wb-btn-primary" data-save-draft="${{esc(w.work_id)}}"
+                        type="button">💾 Save</button>
+              </div>
+            </div>
+          </div>
+        `;
+      }} else if (rd && rd.body) {{
+        const rawMatUrl = String(rd.materialized_url || '');
+        const safeMatUrl = /^https?:\\/\\//i.test(rawMatUrl) ? esc(rawMatUrl) : '';
+        let matBtns = '';
+        if (safeMatUrl && !rd.needs_rematerialize) {{
+          matBtns = `<a class="wb-btn wb-btn-primary" href="${{safeMatUrl}}"`
+            + ` target="_blank" rel="noopener"`
+            + ` style="text-decoration:none">✉️ Open Gmail draft ↗</a>`;
+        }} else if (safeMatUrl && rd.needs_rematerialize) {{
+          matBtns = `
+            <button class="wb-btn wb-btn-primary" data-mat-draft="${{esc(w.work_id)}}"
+                    data-force-new="true" type="button">🔄 Create fresh Gmail draft</button>
+            <a class="wb-btn" href="${{safeMatUrl}}" target="_blank" rel="noopener"
+               style="text-decoration:none">Old tab ↗</a>
+          `;
+        }} else {{
+          matBtns = `<button class="wb-btn wb-btn-primary" data-mat-draft="${{esc(w.work_id)}}"`
+            + ` type="button">📤 Create Gmail draft</button>`;
+        }}
+        replyDraftHtml = `
+          <div class="wb-reply-draft">
+            <div class="wb-reply-draft-hdr">
+              <span>📝 Live reply draft · ${{esc(rd.updated_et || '')}}</span>
+              <div class="wb-ob-btns">
+                ${{matBtns}}
+                <button class="wb-btn" data-edit-draft="${{esc(w.work_id)}}"
+                        type="button">✏️ Edit</button>
+                <button class="wb-btn" data-clear-draft="${{esc(w.work_id)}}"
+                        type="button">🗑 Clear</button>
+              </div>
+            </div>
+            <div class="wb-reply-draft-body">${{renderDraftPreview(rd)}}</div>
+          </div>
+        `;
+      }}
+
+      const addDraftBtn = (!w.is_virtual && !rd && !isEditingDraft)
+        ? `<button class="wb-btn" data-edit-draft="${{esc(w.work_id)}}"`
+          + ` type="button">+ Reply draft</button>`
+        : '';
       const cardActions = !w.is_virtual
         ? `<div class="wb-actions">
+             ${{addDraftBtn}}
              <button class="wb-btn" data-add-ob="${{esc(w.work_id)}}" type="button">+ Obligation</button>
              <button class="wb-btn" data-add-link="${{esc(w.work_id)}}" type="button">+ Link</button>
              <button class="wb-btn" data-work-done="${{esc(w.work_id)}}" type="button">✓ Done</button>
@@ -1500,6 +1820,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
             ${{reasonsHtml ? `<div class="wb-reasons">${{reasonsHtml}}</div>` : ''}}
             ${{corrHtml}}
             ${{obsHtml}}
+            ${{replyDraftHtml}}
             ${{checklistHtml}}
             ${{pillsHtml ? `<div class="wb-pills">${{pillsHtml}}</div>` : ''}}
             ${{mentionsHtml}}
@@ -1508,6 +1829,15 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
         </article>
       `;
     }}).join('');
+    if (focusedDraftWid && openDraftEditors[focusedDraftWid]) {{
+      const nextTa = document.getElementById(`wb-draft-ta-${{focusedDraftWid}}`);
+      if (nextTa) {{
+        nextTa.focus();
+        if (typeof focusedSelStart === 'number' && typeof focusedSelEnd === 'number') {{
+          nextTa.setSelectionRange(focusedSelStart, focusedSelEnd);
+        }}
+      }}
+    }}
   }}
 
   document.getElementById('wb-new-btn').addEventListener('click', () => {{
@@ -1558,8 +1888,9 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     render();
   }});
 
-  document.body.addEventListener('click', (e) => {{
-    const target = e.target.closest('button, a, input');
+  document.body.addEventListener('click', async (e) => {{
+    // Exclude textarea and label clicks so editing a live reply draft never collapses its card
+    const target = e.target.closest('button, a, input, textarea, label');
     if (!target) {{
       const sel = window.getSelection ? String(window.getSelection()) : '';
       // Skip collapse when selecting header text unless Alt-click explicitly requests bulk toggle
@@ -1657,6 +1988,63 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       if (!desc) return;
       const trig = window.prompt('Trigger (e.g. rolled_into(Flutter, gerrit:skia:1414545) or always):', 'always') || 'always';
       void postJson('/api/obligation/add', {{ work_id: wid, description: desc, trigger_expr: trig }});
+      return;
+    }}
+    if (target.hasAttribute('data-edit-draft')) {{
+      const wid = target.getAttribute('data-edit-draft');
+      if (wid) {{
+        const wObj = ((state && state.works) || []).find((x) => String(x.work_id) === wid);
+        const rd = (wObj && wObj.reply_draft) || null;
+        openDraftEditors[wid] = {{
+          body: rd ? String(rd.body || '') : '',
+          autoGate: rd ? Boolean(rd.auto_gate) : true,
+          initialized: true,
+        }};
+        render();
+      }}
+      return;
+    }}
+    if (target.hasAttribute('data-cancel-draft')) {{
+      const wid = target.getAttribute('data-cancel-draft');
+      if (wid) {{
+        delete openDraftEditors[wid];
+        render();
+      }}
+      return;
+    }}
+    if (target.hasAttribute('data-save-draft')) {{
+      const wid = target.getAttribute('data-save-draft');
+      const ta = document.getElementById(`wb-draft-ta-${{wid}}`);
+      const ag = document.getElementById(`wb-draft-ag-${{wid}}`);
+      const bodyVal = ta ? ta.value.trim() : '';
+      if (!wid || !bodyVal) return;
+      const fmtVal = detectDraftFormat(bodyVal);
+      const ok = await postJson('/api/work/draft/save', {{
+        work_id: wid,
+        body: bodyVal,
+        format: fmtVal,
+        auto_gate: ag ? Boolean(ag.checked) : true,
+      }});
+      if (ok) {{
+        delete openDraftEditors[wid];
+        render();
+      }}
+      return;
+    }}
+    if (target.hasAttribute('data-clear-draft')) {{
+      const wid = target.getAttribute('data-clear-draft');
+      if (!wid) return;
+      delete openDraftEditors[wid];
+      void postJson('/api/work/draft/clear', {{ work_id: wid }});
+      return;
+    }}
+    if (target.hasAttribute('data-mat-draft')) {{
+      const wid = target.getAttribute('data-mat-draft');
+      if (!wid) return;
+      void postJson('/api/work/draft/materialize', {{
+        work_id: wid,
+        force_new: target.getAttribute('data-force-new') === 'true',
+      }});
       return;
     }}
     if (target.hasAttribute('data-add-link')) {{
@@ -1758,6 +2146,7 @@ def create_server(
       self._send_json({"error": "Not found"}, status=404)
 
     def do_POST(self) -> None:
+      """Handles JSON mutation endpoints for Works, Obligations, Links, Sync, and Reply Drafts."""
       parsed = urllib.parse.urlparse(self.path)
       length = int(self.headers.get("Content-Length") or 0)
       raw_body = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
@@ -1835,6 +2224,63 @@ def create_server(
         if wid:
           active_store.complete_work(wid, roadmap_cb=workctl._roadmap_writeback)
         self._send_json(current_projection())
+        return
+
+      if parsed.path == "/api/work/draft/save":
+        wid = str(body.get("work_id") or "").strip()
+        draft_body = str(body.get("body") or "").strip()
+        if not wid or not draft_body:
+          self._send_json({"error": "work_id and non-empty body are required"}, status=400)
+          return
+        raw_fmt = str(body.get("format") or "").strip().lower()
+        fmt_val = raw_fmt if raw_fmt in ("html", "text") else _detect_draft_format(draft_body)
+        subj_val = str(body.get("subject") or "")
+        m_keys = ingestor.extract_draft_mentioned_keys(subj_val, draft_body)
+        ag_val = bool(body["auto_gate"]) if "auto_gate" in body else None
+        try:
+          active_store.save_reply_draft(
+              wid,
+              draft_body,
+              fmt=fmt_val,
+              thread_key=str(body.get("thread_key") or ""),
+              to=str(body.get("to") or ""),
+              cc=str(body.get("cc") or ""),
+              subject=subj_val,
+              trigger_expr=str(body.get("trigger_expr") or ""),
+              auto_gate=ag_val,
+              mentioned_keys=m_keys,
+          )
+        except ValueError as exc:
+          self._send_json({"error": str(exc)}, status=400)
+          return
+        self._send_json(current_projection())
+        return
+
+      if parsed.path == "/api/work/draft/clear":
+        wid = str(body.get("work_id") or "").strip()
+        if wid:
+          active_store.clear_reply_draft(wid)
+        self._send_json(current_projection())
+        return
+
+      if parsed.path == "/api/work/draft/materialize":
+        wid = str(body.get("work_id") or "").strip()
+        if not wid:
+          self._send_json({"error": "work_id is required"}, status=400)
+          return
+        try:
+          mat = ingestor.materialize_reply_draft(
+              active_store, wid, force_new=bool(body.get("force_new"))
+          )
+        except ValueError as exc:
+          self._send_json({"error": str(exc)}, status=400)
+          return
+        except RuntimeError as exc:
+          self._send_json({"error": str(exc)}, status=502)
+          return
+        proj = current_projection()
+        proj["materialized"] = mat
+        self._send_json(proj)
         return
 
       if parsed.path == "/api/obligation/add":

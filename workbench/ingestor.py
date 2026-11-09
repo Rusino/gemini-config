@@ -6,14 +6,16 @@ from __future__ import annotations
 import base64
 from collections.abc import Mapping
 from datetime import datetime
-from email.utils import getaddresses
+from email.utils import formataddr, getaddresses
 import fcntl
 import glob
+import hashlib
 import html as html_lib
 import json
 import os
 import re
 import subprocess
+import tempfile
 import time
 from typing import Any
 import urllib.parse
@@ -295,6 +297,27 @@ def extract_artifacts_from_text(text: str) -> list[tuple[str, str, str]]:
     )
 
   return [item for _, item in sorted(found.values(), key=lambda x: x[0])]
+
+
+def extract_draft_mentioned_keys(subject: str, body: str) -> list[str]:
+  """Extracts canonical CL/PR/bug/doc artifact keys referenced in a reply draft."""
+  combined = f"{subject}\n{body}"
+  allowed = ("gerrit", "github_pr", "piper", "buganizer", "github_issue", "gdoc")
+  raw_keys = [
+      akey for akey, akind, _ in extract_artifacts_from_text(combined) if akind in allowed
+  ] + work_store._extract_draft_mentioned_keys(combined)
+  # Suppress duplicate flutter issue keys when the same number matched as a GitHub PR
+  pr_nums = {k.split(":")[-1] for k in raw_keys if k.startswith("github_pr:flutter/flutter:")}
+  ordered: list[str] = []
+  seen: set[str] = set()
+  for key in raw_keys:
+    if key.startswith("github_issue:flutter/flutter:") and key.split(":")[-1] in pr_nums:
+      continue
+    ck = work_store.canonicalize_artifact_key(key)
+    if ck not in seen:
+      seen.add(ck)
+      ordered.append(ck)
+  return ordered
 
 
 # Capture optional PR/pull prefix so PR bullets are never misread as GitHub issue bug_titles
@@ -1842,10 +1865,22 @@ def _fetch_gmail_thread_provenance(
     return dict(cached) if isinstance(cached, Mapping) else {"thread_id": tid}
 
 
+def _thread_covered_by_draft(
+    tid: str, last_msg_ts: float, draft_ts_by_thread: Mapping[str, float]
+) -> bool:
+  """Returns True when an active draft on tid was edited at or after last_msg_ts."""
+  if not tid:
+    return False
+  d_ts = float(draft_ts_by_thread.get(tid) or 0.0)
+  if d_ts <= 0.0:
+    return False
+  return last_msg_ts <= 0.0 or last_msg_ts <= d_ts
+
+
 def _ingest_gdoc_gmail_thread(
     store: work_store.WorkStore,
     t_prov: Mapping[str, Any],
-    draft_thread_ids: set[str],
+    draft_ts_by_thread: Mapping[str, float],
     dismissed_keys: set[str],
     completed_thread_ts: Mapping[str, float],
     cur_now: float,
@@ -1950,7 +1985,8 @@ def _ingest_gdoc_gmail_thread(
         "counterparty": cp,
         "is_active_correspondence": True,
         "unanswered_human": (
-            not bool(t_prov.get("last_from_me")) and tid not in draft_thread_ids
+            not bool(t_prov.get("last_from_me"))
+            and not _thread_covered_by_draft(tid, last_msg_ts, draft_ts_by_thread)
         ),
     }
     # External resolves trigger a 1-click confirmation bar instead of silently closing the card
@@ -2055,6 +2091,268 @@ def _work_has_open_cl(store: work_store.WorkStore, work_id: str) -> bool:
   return False
 
 
+def _gmail_draft_still_exists(did: str) -> bool:
+  """Checks whether a draft ID outside the --max 100 list window still exists in Gmail."""
+  try:
+    res = subprocess.run(
+        [GMAIL_BIN, "readonly", "get-draft", did, "--json"],
+        capture_output=True,
+        text=True,
+        timeout=6,
+        check=False,
+    )
+    return res.returncode == 0 and bool(res.stdout.strip())
+  except Exception:
+    # Fail closed on transient CLI errors so drafts above 100 are never falsely marked SENT
+    return True
+
+
+def _ingest_single_gmail_draft(
+    store: work_store.WorkStore,
+    d_stub: Mapping[str, Any],
+    did: str,
+    thread_cache: dict[str, Any],
+    draft_ts_by_thread: dict[str, float],
+    cur_now: float,
+) -> None:
+  """Fetches one active Gmail draft, upserts draft/thread state, and syncs non-WB obligations."""
+  d_res = subprocess.run(
+      [GMAIL_BIN, "readonly", "get-draft", did, "--json"],
+      capture_output=True,
+      text=True,
+      timeout=6,
+      check=False,
+  )
+  if d_res.returncode != 0 or not d_res.stdout.strip():
+    return
+  d_full = json.loads(d_res.stdout)
+  msg = d_full.get("message") if isinstance(d_full, Mapping) else {}
+  payload = (msg or {}).get("payload") if isinstance(msg, Mapping) else {}
+  hdr_map = _extract_msg_headers(msg if isinstance(msg, Mapping) else {})
+  thread_id = str(
+      (msg or {}).get("threadId")
+      or (
+          (d_stub.get("message") or {}).get("threadId")
+          if isinstance(d_stub.get("message"), Mapping)
+          else ""
+      )
+      or d_stub.get("threadId")
+      or ""
+  ).strip()
+  subj = str(
+      hdr_map.get("subject")
+      or d_full.get("subject")
+      or (msg or {}).get("subject")
+      or f"Draft {did[:8]}"
+  )
+  to_hdr = str(hdr_map.get("to") or d_full.get("to") or (msg or {}).get("to") or "")
+  unquoted_body = _decode_gmail_payload_text(payload, strip_quotes=True)
+  d_key = f"gmail_draft:{did}"
+  prev_art = store.get_artifact(d_key) or {}
+  prev_st = prev_art.get("state") if isinstance(prev_art.get("state"), Mapping) else {}
+  from_wb = bool(prev_st.get("from_workbench_draft"))
+  body_sig = hashlib.sha1(f"{subj}\n{to_hdr}\n{unquoted_body}".encode("utf-8")).hexdigest()[:16]
+
+  # Pin draft_updated_ts to Gmail internalDate or content hash so 90s syncs never mask new replies
+  raw_idate = (msg or {}).get("internalDate") if isinstance(msg, Mapping) else None
+  if raw_idate:
+    draft_msg_ts = float(int(raw_idate)) / 1000.0
+  elif prev_st.get("draft_updated_ts") and (
+      prev_st.get("body_sig") == body_sig or (not prev_st.get("body_sig") and from_wb)
+  ):
+    draft_msg_ts = float(prev_st["draft_updated_ts"])
+  else:
+    draft_msg_ts = cur_now
+
+  if thread_id:
+    draft_ts_by_thread[thread_id] = max(draft_ts_by_thread.get(thread_id, 0.0), draft_msg_ts)
+
+  extracted = extract_artifacts_from_text(f"{subj}\n{unquoted_body}")
+  inline_bug_titles = extract_bug_titles_from_html_or_text(unquoted_body)
+  to_name = _clean_display_name(to_hdr) if to_hdr else ""
+  primaries = [
+      (akey, akind, aurl)
+      for akey, akind, aurl in extracted
+      if akind in ("gerrit", "github_pr", "piper", "buganizer", "github_issue", "gdoc")
+  ]
+  mentioned_keys = [akey for akey, _, _ in primaries]
+  draft_bug_keys = [
+      akey for akey, akind, _ in primaries if akind in ("buganizer", "github_issue")
+  ]
+  store.upsert_artifact(
+      d_key,
+      kind="gmail_draft",
+      title=f"Draft: {subj}" + (f" ({to_name})" if to_name else ""),
+      url=f"https://mail.google.com/mail/u/0/#drafts/{did}",
+      state={
+          "status": "DRAFT",
+          "thread_id": thread_id,
+          "to": to_hdr,
+          "mentioned_keys": mentioned_keys,
+          "draft_bug_keys": draft_bug_keys,
+          "draft_updated_ts": draft_msg_ts,
+          "body_sig": body_sig,
+          "from_workbench_draft": from_wb,
+      },
+      now=cur_now,
+  )
+  if not primaries and not from_wb:
+    return
+  wid = store.find_work_by_artifact(d_key, roles=("primary", "channel"))
+  if not wid and thread_id:
+    wid = store.find_work_by_artifact(f"gmail_thread:{thread_id}", roles=("primary", "channel"))
+  if not wid and not from_wb:
+    for akey, _, _ in primaries:
+      wid = store.find_work_by_artifact(akey, roles=("primary",))
+      if wid:
+        break
+  if not wid:
+    if from_wb:
+      return
+    wid = store.create_work(subj, now=cur_now)
+  store.link_artifact(wid, d_key, role="channel", source="auto", now=cur_now)
+  if thread_id:
+    t_key = f"gmail_thread:{thread_id}"
+    t_prov = _fetch_gmail_thread_provenance(thread_id, thread_cache, cur_now)
+    last_ts = float(t_prov.get("last_message_ts") or 0.0)
+    t_prov["unanswered_human"] = bool(
+        not t_prov.get("last_from_me", True)
+        and not t_prov.get("is_automated")
+        and not _thread_covered_by_draft(thread_id, last_ts, draft_ts_by_thread)
+    )
+    if not t_prov.get("counterparty") and to_name:
+      t_prov["counterparty"] = to_name
+    if not t_prov.get("root_subject"):
+      t_prov["root_subject"] = re.sub(
+          r"^(?:re|fwd|fw)\s*:\s*", "", subj, flags=re.IGNORECASE
+      ).strip()
+    t_title = str(t_prov.get("root_subject") or subj)
+    cp = str(t_prov.get("counterparty") or "")
+    if cp and cp.lower() not in t_title.lower():
+      t_title = f"{t_title} ({cp})"
+    store.upsert_artifact(
+        t_key,
+        kind="gmail_thread",
+        title=t_title,
+        url=f"https://mail.google.com/mail/u/0/#all/{thread_id}",
+        state=t_prov,
+        now=cur_now,
+    )
+    store.link_artifact(wid, t_key, role="channel", source="auto", now=cur_now)
+
+  # Materialized Workbench reply drafts keep their own ob-wbdraft gate and never promote body refs
+  if from_wb:
+    return
+
+  for akey, akind, aurl in primaries:
+    b_desc = inline_bug_titles.get(akey, "")
+    if b_desc:
+      short_b = work_store.format_short_bug_id(akey)
+      art_title = f"{short_b}: {b_desc}"
+      art_state: dict[str, Any] | None = {"short_id": short_b, "bug_title": b_desc}
+    else:
+      art_title = ""
+      art_state = None
+    store.upsert_artifact(
+        akey, kind=akind, title=art_title, url=aurl, state=art_state, now=cur_now
+    )
+    store.link_artifact(
+        wid, akey, role="primary", source="auto", link_reason="gmail_draft_ref", now=cur_now
+    )
+
+  store.reconcile_work_bug_cls(wid, now=cur_now)
+
+  if "flutter" in subj.lower() or draft_bug_keys:
+    w_roles = store.get_work_artifact_roles(wid)
+
+    # Companion probes are abandoned/closed rather than merged, so never gate draft sending
+    def _is_comp_cl(k: str) -> bool:
+      """Returns True when artifact key k represents a review-companion probe CL or PR."""
+      ar = store.get_artifact(k) or {}
+      st = ar.get("state") if isinstance(ar.get("state"), Mapping) else {}
+      return work_store.is_companion_artifact(k, st, str(ar.get("title") or ""))
+
+    primary_gerrit = sorted(
+        k
+        for k, r in w_roles.items()
+        if r == "primary" and k.startswith("gerrit:") and not _is_comp_cl(k)
+    )
+    primary_prs = sorted(
+        k
+        for k, r in w_roles.items()
+        if r == "primary" and k.startswith("github_pr:") and not _is_comp_cl(k)
+    )
+    preds: list[str] = []
+    for gk in primary_gerrit:
+      preds.append(f"cl_merged({gk}) AND rolled_into(Flutter, {gk})")
+    for pk in primary_prs:
+      preds.append(f"cl_merged({pk})")
+    if not preds and draft_bug_keys:
+      for bk in draft_bug_keys:
+        preds.append(f"bug_closed({bk})")
+    if preds:
+      if len(draft_bug_keys) >= 2:
+        ob_desc = (
+            f"Send draft reply in '{subj}' once all {len(draft_bug_keys)} "
+            f"bugs land & roll into Flutter"
+        )
+      elif len(primary_gerrit) == 1 and not primary_prs:
+        cl_num = primary_gerrit[0].split(":")[-1]
+        ob_desc = f"Send draft reply in '{subj}' once Gerrit {cl_num} rolls into Flutter"
+      else:
+        ob_desc = f"Send draft reply in '{subj}' once all linked CLs roll into Flutter"
+      store.replace_draft_obligation(
+          wid,
+          draft_key=d_key,
+          description=ob_desc,
+          trigger_expr=" AND ".join(preds),
+          done_matcher=f"reply_sent({d_key})",
+          now=cur_now,
+      )
+
+
+def _reconcile_disappeared_gmail_draft(
+    store: work_store.WorkStore,
+    gone_did: str,
+    draft_list_full: bool,
+    thread_cache: dict[str, Any],
+    draft_ts_by_thread: dict[str, float],
+    active_draft_ids: set[str],
+    cur_now: float,
+) -> None:
+  """Classifies a draft absent from the list query as >100-surviving, DISCARDED, or SENT."""
+  d_key = f"gmail_draft:{gone_did}"
+  d_st = ((store.get_artifact(d_key) or {}).get("state")) or {}
+  # Drafts pushed past --max 100 stay active and continue covering their reply thread
+  if draft_list_full and _gmail_draft_still_exists(gone_did):
+    active_draft_ids.add(gone_did)
+    s_tid = str(d_st.get("thread_id") or "").strip()
+    s_ts = float(d_st.get("draft_updated_ts") or 0.0)
+    if s_tid and s_ts > 0.0:
+      draft_ts_by_thread[s_tid] = max(draft_ts_by_thread.get(s_tid, 0.0), s_ts)
+    return
+
+  # Verify real outbound mail on the thread so discarded Compose tabs never wipe live drafts
+  if d_st.get("from_workbench_draft"):
+    d_tid = str(d_st.get("thread_id") or "").strip()
+    was_sent = False
+    # Standalone compose drafts lack a prior threadId so keep Workbench text unless manually cleared
+    if d_tid:
+      t_prov = _fetch_gmail_thread_provenance(d_tid, {}, cur_now)
+      thread_cache[d_tid] = t_prov
+      store.upsert_artifact(f"gmail_thread:{d_tid}", kind="gmail_thread", state=t_prov, now=cur_now)
+      draft_ts = float(d_st.get("draft_updated_ts") or 0.0)
+      last_ts = float(t_prov.get("last_message_ts") or 0.0)
+      was_sent = bool(t_prov.get("last_from_me")) or (
+          bool(t_prov.get("sent_by_me")) and last_ts >= draft_ts - 60.0
+      )
+    if not was_sent:
+      store.mark_materialized_draft_discarded(d_key, now=cur_now)
+      return
+
+  store.upsert_artifact(d_key, kind="gmail_draft", state={"status": "SENT"}, now=cur_now)
+
+
 def ingest_gmail_drafts_and_threads(
     store: work_store.WorkStore,
     watcher_state: dict[str, Any],
@@ -2070,212 +2368,83 @@ def ingest_gmail_drafts_and_threads(
   dismissed_keys = store.list_dismissed_tray_keys()
   completed_thread_ts = store.list_completed_thread_timestamps()
 
-  # 1. Inspect current drafts via gmail readonly drafts --json
+  # Union DB open drafts so drafts materialized and sent between syncs still reconcile
+  store_open_dids, tracked_open_dids = store.list_open_gmail_draft_ids()
+  prev_drafts = set(watcher_state.get("active_draft_ids") or []) | store_open_dids
   active_draft_ids: set[str] = set()
-  draft_thread_ids: set[str] = set()
+  draft_ts_by_thread: dict[str, float] = {}
+  draft_list: list[Any] = []
+  drafts_list_ok = False
   try:
     res = subprocess.run(
-        [GMAIL_BIN, "readonly", "drafts", "--json"],
+        [GMAIL_BIN, "readonly", "drafts", "--max", "100", "--json"],
         capture_output=True,
         text=True,
         timeout=8,
         check=False,
     )
     if res.returncode == 0 and res.stdout.strip():
-      draft_list = json.loads(res.stdout)
-      if isinstance(draft_list, dict):
-        draft_list = draft_list.get("drafts") or []
-      if isinstance(draft_list, list):
-        for d_stub in draft_list[:10]:
-          did = str((d_stub or {}).get("id") or "").strip()
-          if not did:
-            continue
-          active_draft_ids.add(did)
-          d_res = subprocess.run(
-              [GMAIL_BIN, "readonly", "get-draft", did, "--json"],
-              capture_output=True,
-              text=True,
-              timeout=6,
-              check=False,
-          )
-          if d_res.returncode != 0 or not d_res.stdout.strip():
-            continue
-          d_full = json.loads(d_res.stdout)
-          msg = d_full.get("message") if isinstance(d_full, Mapping) else {}
-          payload = (msg or {}).get("payload") if isinstance(msg, Mapping) else {}
-          hdr_map = _extract_msg_headers(msg if isinstance(msg, Mapping) else {})
-          thread_id = str(
-              (msg or {}).get("threadId")
-              or (
-                  (d_stub.get("message") or {}).get("threadId")
-                  if isinstance(d_stub.get("message"), Mapping)
-                  else ""
-              )
-              or d_stub.get("threadId")
-              or ""
-          ).strip()
-          if thread_id:
-            draft_thread_ids.add(thread_id)
-          subj = str(
-              hdr_map.get("subject")
-              or d_full.get("subject")
-              or (msg or {}).get("subject")
-              or f"Draft {did[:8]}"
-          )
-          to_hdr = str(hdr_map.get("to") or d_full.get("to") or (msg or {}).get("to") or "")
-          unquoted_body = _decode_gmail_payload_text(payload, strip_quotes=True)
-          extracted = extract_artifacts_from_text(f"{subj}\n{unquoted_body}")
-          inline_bug_titles = extract_bug_titles_from_html_or_text(unquoted_body)
-          d_key = f"gmail_draft:{did}"
-          to_name = _clean_display_name(to_hdr) if to_hdr else ""
-          primaries = [
-              (akey, akind, aurl)
-              for akey, akind, aurl in extracted
-              if akind in ("gerrit", "github_pr", "piper", "buganizer", "github_issue", "gdoc")
-          ]
-          mentioned_keys = [akey for akey, _, _ in primaries]
-          draft_bug_keys = [
-              akey
-              for akey, akind, _ in primaries
-              if akind in ("buganizer", "github_issue")
-          ]
-          store.upsert_artifact(
-              d_key,
-              kind="gmail_draft",
-              title=f"Draft: {subj}" + (f" ({to_name})" if to_name else ""),
-              url=f"https://mail.google.com/mail/u/0/#drafts/{did}",
-              state={
-                  "status": "DRAFT",
-                  "thread_id": thread_id,
-                  "to": to_hdr,
-                  "mentioned_keys": mentioned_keys,
-                  "draft_bug_keys": draft_bug_keys,
-              },
-              now=cur_now,
-          )
-          if not primaries:
-            continue
-          wid = store.find_work_by_artifact(d_key, roles=("primary", "channel"))
-          if not wid and thread_id:
-            wid = store.find_work_by_artifact(
-                f"gmail_thread:{thread_id}", roles=("primary", "channel")
-            )
-          if not wid:
-            for akey, _, _ in primaries:
-              wid = store.find_work_by_artifact(akey, roles=("primary",))
-              if wid:
-                break
-          if not wid:
-            wid = store.create_work(subj, now=cur_now)
-          store.link_artifact(wid, d_key, role="channel", source="auto", now=cur_now)
-          if thread_id:
-            t_key = f"gmail_thread:{thread_id}"
-            t_prov = _fetch_gmail_thread_provenance(thread_id, thread_cache, cur_now)
-            t_prov["unanswered_human"] = False
-            if not t_prov.get("counterparty") and to_name:
-              t_prov["counterparty"] = to_name
-            if not t_prov.get("root_subject"):
-              t_prov["root_subject"] = re.sub(
-                  r"^(?:re|fwd|fw)\s*:\s*", "", subj, flags=re.IGNORECASE
-              ).strip()
-            t_title = str(t_prov.get("root_subject") or subj)
-            cp = str(t_prov.get("counterparty") or "")
-            if cp and cp.lower() not in t_title.lower():
-              t_title = f"{t_title} ({cp})"
-            store.upsert_artifact(
-                t_key,
-                kind="gmail_thread",
-                title=t_title,
-                url=f"https://mail.google.com/mail/u/0/#all/{thread_id}",
-                state=t_prov,
-                now=cur_now,
-            )
-            store.link_artifact(wid, t_key, role="channel", source="auto", now=cur_now)
-          for akey, akind, aurl in primaries:
-            b_desc = inline_bug_titles.get(akey, "")
-            if b_desc:
-              short_b = work_store.format_short_bug_id(akey)
-              art_title = f"{short_b}: {b_desc}"
-              art_state: dict[str, Any] | None = {"short_id": short_b, "bug_title": b_desc}
-            else:
-              art_title = ""
-              art_state = None
-            store.upsert_artifact(
-                akey,
-                kind=akind,
-                title=art_title,
-                url=aurl,
-                state=art_state,
-                now=cur_now,
-            )
-            store.link_artifact(
-                wid,
-                akey,
-                role="primary",
-                source="auto",
-                link_reason="gmail_draft_ref",
-                now=cur_now,
-            )
-
-          # Attach any CLs/PRs in the artifact store that fix the draft's primary bugs
-          store.reconcile_work_bug_cls(wid, now=cur_now)
-
-          # Build a single consolidated obligation for the draft across non-companion CLs/bugs
-          if "flutter" in subj.lower() or draft_bug_keys:
-            w_roles = store.get_work_artifact_roles(wid)
-
-            # Companion probes are abandoned/closed rather than merged, so never gate draft sending
-            def _is_comp_cl(k: str) -> bool:
-              ar = store.get_artifact(k) or {}
-              st = ar.get("state") if isinstance(ar.get("state"), Mapping) else {}
-              return work_store.is_companion_artifact(k, st, str(ar.get("title") or ""))
-
-            primary_gerrit = sorted(
-                k
-                for k, r in w_roles.items()
-                if r == "primary" and k.startswith("gerrit:") and not _is_comp_cl(k)
-            )
-            primary_prs = sorted(
-                k
-                for k, r in w_roles.items()
-                if r == "primary" and k.startswith("github_pr:") and not _is_comp_cl(k)
-            )
-            preds: list[str] = []
-            for gk in primary_gerrit:
-              preds.append(f"cl_merged({gk}) AND rolled_into(Flutter, {gk})")
-            for pk in primary_prs:
-              preds.append(f"cl_merged({pk})")
-            if not preds and draft_bug_keys:
-              for bk in draft_bug_keys:
-                preds.append(f"bug_closed({bk})")
-            if preds:
-              if len(draft_bug_keys) >= 2:
-                ob_desc = (
-                    f"Send draft reply in '{subj}' once all {len(draft_bug_keys)} "
-                    f"bugs land & roll into Flutter"
-                )
-              elif len(primary_gerrit) == 1 and not primary_prs:
-                cl_num = primary_gerrit[0].split(":")[-1]
-                ob_desc = f"Send draft reply in '{subj}' once Gerrit {cl_num} rolls into Flutter"
-              else:
-                ob_desc = f"Send draft reply in '{subj}' once all linked CLs roll into Flutter"
-              store.replace_draft_obligation(
-                  wid,
-                  draft_key=d_key,
-                  description=ob_desc,
-                  trigger_expr=" AND ".join(preds),
-                  done_matcher=f"reply_sent({d_key})",
-                  now=cur_now,
-              )
+      raw_drafts = json.loads(res.stdout)
+      if raw_drafts is None:
+        draft_list = []
+        drafts_list_ok = True
+      elif isinstance(raw_drafts, list):
+        draft_list = raw_drafts
+        drafts_list_ok = True
+      elif isinstance(raw_drafts, Mapping) and "error" not in raw_drafts:
+        cand_list = raw_drafts.get("drafts")
+        if cand_list is None or isinstance(cand_list, list):
+          draft_list = cand_list if isinstance(cand_list, list) else []
+          drafts_list_ok = True
   except Exception:
-    pass
+    drafts_list_ok = False
 
-  # Reconcile previously tracked drafts that disappeared -> mark SENT even when 0 remain
-  prev_drafts = set(watcher_state.get("active_draft_ids") or [])
-  for gone_did in prev_drafts - active_draft_ids:
-    d_key = f"gmail_draft:{gone_did}"
-    store.upsert_artifact(d_key, kind="gmail_draft", state={"status": "SENT"}, now=cur_now)
-  watcher_state["active_draft_ids"] = sorted(active_draft_ids)
+  # Collect all active draft IDs up front so per-draft errors or >10 drafts never trigger false SENT
+  valid_stubs: list[tuple[int, Mapping[str, Any], str]] = []
+  for idx, d_stub in enumerate(draft_list):
+    if not isinstance(d_stub, Mapping):
+      continue
+    did = str(d_stub.get("id") or "").strip()
+    if not did:
+      continue
+    active_draft_ids.add(did)
+    stub_tid = str(
+        (d_stub.get("message") or {}).get("threadId")
+        if isinstance(d_stub.get("message"), Mapping)
+        else (d_stub.get("threadId") or "")
+    ).strip()
+    if stub_tid:
+      stored_st = ((store.get_artifact(f"gmail_draft:{did}") or {}).get("state")) or {}
+      stored_ts = float(stored_st.get("draft_updated_ts") or 0.0)
+      if stored_ts > 0.0:
+        draft_ts_by_thread[stub_tid] = max(draft_ts_by_thread.get(stub_tid, 0.0), stored_ts)
+    valid_stubs.append((idx, d_stub, did))
+
+  # Cap get-draft calls at 25 for unlinked scratch drafts while refreshing all Work-tracked drafts
+  for idx, d_stub, did in valid_stubs:
+    if idx >= 25 and did not in tracked_open_dids:
+      continue
+    try:
+      _ingest_single_gmail_draft(
+          store, d_stub, did, thread_cache, draft_ts_by_thread, cur_now
+      )
+    except Exception:
+      continue
+
+  # Reconcile disappeared drafts only when the drafts list query succeeded cleanly
+  if drafts_list_ok:
+    draft_list_full = len(draft_list) >= 100
+    for gone_did in prev_drafts - active_draft_ids:
+      _reconcile_disappeared_gmail_draft(
+          store,
+          gone_did,
+          draft_list_full,
+          thread_cache,
+          draft_ts_by_thread,
+          active_draft_ids,
+          cur_now,
+      )
+    watcher_state["active_draft_ids"] = sorted(active_draft_ids)
 
   # Run targeted Gmail search passes and link via hybrid correspondence & GDoc rules
   search_passes = (
@@ -2347,7 +2516,7 @@ def ingest_gmail_drafts_and_threads(
           _ingest_gdoc_gmail_thread(
               store,
               t_prov,
-              draft_thread_ids,
+              draft_ts_by_thread,
               dismissed_keys,
               completed_thread_ts,
               cur_now,
@@ -2469,7 +2638,9 @@ def ingest_gmail_drafts_and_threads(
         t_prov["unanswered_human"] = bool(
             not t_prov.get("last_from_me", True)
             and not t_prov.get("is_automated")
-            and tid not in draft_thread_ids
+            and not _thread_covered_by_draft(
+                tid, float(t_prov.get("last_message_ts") or 0.0), draft_ts_by_thread
+            )
             and is_recent_reply
             and (
                 t_prov.get("sent_by_me")
@@ -2561,16 +2732,20 @@ def ingest_gmail_drafts_and_threads(
             store.upsert_artifact(
                 t_key, kind="gmail_thread", title=t_title, url=t_url, state=t_prov, now=cur_now
             )
-            unanswered.append({
-                "artifact_key": t_key,
-                "thread_id": tid,
-                "sender": cp,
-                "subject": root_subj,
-                "snippet": str(t_prov.get("last_snippet") or m.get("snippet") or "")[:140],
-                "url": t_url,
-                "last_message_ts": float(t_prov.get("last_message_ts") or 0.0),
-                "bound_work_id": "",
-            })
+            # Suppress tray alerts when an active draft (including >100 survivors) covers tid
+            if not _thread_covered_by_draft(
+                tid, float(t_prov.get("last_message_ts") or 0.0), draft_ts_by_thread
+            ):
+              unanswered.append({
+                  "artifact_key": t_key,
+                  "thread_id": tid,
+                  "sender": cp,
+                  "subject": root_subj,
+                  "snippet": str(t_prov.get("last_snippet") or m.get("snippet") or "")[:140],
+                  "url": t_url,
+                  "last_message_ts": float(t_prov.get("last_message_ts") or 0.0),
+                  "bound_work_id": "",
+              })
           continue
 
         # Case 2: Automated single-CL reviewlog mail -> attach as channel without promoting
@@ -2858,3 +3033,257 @@ def run_sync_cycle(
       unanswered_threads=unanswered,
       now=cur_now,
   )
+
+
+_RE_GOOGLE_URL_REDIRECT = re.compile(r"https?://(?:www\.)?google\.com/url\b", re.IGNORECASE)
+_RE_BARE_HTTP_URL = re.compile(r"https?://[^\s<>\"']+")
+
+
+def _split_url_trailing_punct(raw_url: str) -> tuple[str, str]:
+  """Splits trailing sentence punctuation and unbalanced closing parens from a bare URL."""
+  url = raw_url
+  suffix_chars: list[str] = []
+  while url:
+    ch = url[-1]
+    if ch in ".,;:!?]" or (ch == ")" and url.count(")") > url.count("(")):
+      suffix_chars.append(ch)
+      url = url[:-1]
+    else:
+      break
+  return url, "".join(reversed(suffix_chars))
+
+
+def _linkify_plain_paragraph(para: str) -> str:
+  """Escapes plain-text paragraph text once while wrapping bare https?:// URLs in <a href>."""
+  parts: list[str] = []
+  last_end = 0
+  for m in _RE_BARE_HTTP_URL.finditer(para):
+    parts.append(html_lib.escape(para[last_end : m.start()], quote=True))
+    clean_url, suffix = _split_url_trailing_punct(m.group(0))
+    if clean_url:
+      esc_url = html_lib.escape(clean_url, quote=True)
+      parts.append(f'<a href="{esc_url}">{esc_url}</a>')
+    parts.append(html_lib.escape(suffix, quote=True))
+    last_end = m.end()
+  parts.append(html_lib.escape(para[last_end:], quote=True))
+  return "".join(parts).replace("\n", "<br>")
+
+
+def _render_plain_text_draft_html(raw_text: str) -> str:
+  """Converts a plain-text reply draft into clean HTML with explicit <a href> and <pre> blocks."""
+  blocks = re.split(r"(```[\s\S]*?```)", str(raw_text or "").strip())
+  html_parts: list[str] = []
+  for chunk in blocks:
+    if not chunk:
+      continue
+    # Render fenced code as standalone <pre> blocks instead of inline <code> inside list items
+    if chunk.startswith("```") and chunk.endswith("```"):
+      inner = re.sub(r"^```[^\n]*\n?", "", chunk[:-3]).rstrip("\n")
+      html_parts.append(f"<pre>{html_lib.escape(inner)}</pre>")
+      continue
+    for para in re.split(r"\n{2,}", chunk.strip()):
+      if not para.strip():
+        continue
+      html_parts.append(f"<p>{_linkify_plain_paragraph(para.strip())}</p>")
+  return "\n".join(html_parts) if html_parts else f"<p>{html_lib.escape(raw_text)}</p>"
+
+
+def _filter_reply_recipients(
+    header_values: list[str],
+    *,
+    exclude_addrs: set[str] | None = None,
+    always_strip_me: bool = False,
+) -> tuple[str, set[str]]:
+  """Deduplicates RFC 2822 recipient headers and strips self when other recipients exist."""
+  parsed = [
+      (name.strip(), addr.strip())
+      for name, addr in getaddresses(header_values)
+      if addr.strip()
+  ]
+  excluded = {a.lower() for a in (exclude_addrs or set())}
+  non_me = [
+      (n, a)
+      for n, a in parsed
+      if a.lower() not in excluded and not _is_me_sender(f"{n} <{a}>")
+  ]
+  # Keep self in To only on self-addressed threads so reply To headers never become empty
+  candidates = non_me if (always_strip_me or non_me) else [
+      (n, a) for n, a in parsed if a.lower() not in excluded
+  ]
+  formatted: list[str] = []
+  seen: set[str] = set()
+  for name, addr in candidates:
+    low = addr.lower()
+    if low in seen:
+      continue
+    seen.add(low)
+    formatted.append(formataddr((name, addr)) if name else addr)
+  return ", ".join(formatted), seen
+
+
+def _verify_stored_gmail_draft_clean(gmail_bin: str, did: str) -> None:
+  """Verifies via get-draft that the stored Gmail draft exists and has zero google.com/url links."""
+  ver = subprocess.run(
+      [gmail_bin, "readonly", "get-draft", did, "--json"],
+      capture_output=True,
+      text=True,
+      timeout=10,
+      check=False,
+  )
+  if ver.returncode != 0 or not ver.stdout.strip():
+    raise RuntimeError(f"Failed to verify created Gmail draft {did}: {ver.stderr.strip()}")
+  d_json = json.loads(ver.stdout)
+  msg = d_json.get("message") if isinstance(d_json, Mapping) else {}
+  payload = (msg or {}).get("payload") if isinstance(msg, Mapping) else {}
+  stored_unquoted = _decode_gmail_payload_text(payload, strip_quotes=True)
+  if _RE_GOOGLE_URL_REDIRECT.search(stored_unquoted):
+    raise ValueError(f"Created Gmail draft {did} contains forbidden google.com/url redirect")
+
+
+def materialize_reply_draft(
+    store: work_store.WorkStore,
+    work_id: str,
+    *,
+    force_new: bool = False,
+    gmail_bin: str = GMAIL_BIN,
+    now: float | None = None,
+) -> dict[str, Any]:
+  """Materializes a Work's live reply_draft into Gmail once via gmail mutate create-draft."""
+  cur_now = time.time() if now is None else now
+  rd = store.get_reply_draft(work_id)
+  if not rd or not str(rd.get("body") or "").strip():
+    raise ValueError(f"Work {work_id} has no active reply draft to materialize")
+  raw_body = str(rd["body"]).strip()
+  if _RE_GOOGLE_URL_REDIRECT.search(raw_body):
+    raise ValueError("Reply draft body contains forbidden google.com/url redirect link")
+
+  # Reuse an already-materialized Gmail draft when the Workbench text has not changed since
+  mat_key = str(rd.get("materialized_draft_key") or "").strip()
+  mat_at = float(rd.get("materialized_at") or 0.0)
+  upd_at = float(rd.get("updated_at") or 0.0)
+  if (
+      not force_new
+      and mat_key.startswith("gmail_draft:")
+      and mat_at > 0.0
+      and mat_at + 1e-6 >= upd_at
+  ):
+    prev_did = mat_key.split(":", 1)[1]
+    chk = subprocess.run(
+        [gmail_bin, "readonly", "get-draft", prev_did, "--json"],
+        capture_output=True,
+        text=True,
+        timeout=8,
+        check=False,
+    )
+    if chk.returncode == 0 and chk.stdout.strip():
+      return {
+          "draft_id": prev_did,
+          "draft_key": mat_key,
+          "url": f"https://mail.google.com/mail/u/0/#drafts/{prev_did}",
+          "reused": True,
+      }
+
+  fmt = str(rd.get("format") or "html").strip().lower()
+  html_body = _render_plain_text_draft_html(raw_body) if fmt == "text" else raw_body
+
+  t_key = str(rd.get("thread_key") or "").strip()
+  tid = t_key.split(":", 1)[1] if t_key.startswith("gmail_thread:") else ""
+  latest_msg_id = ""
+  clean_to = str(rd.get("to") or "").strip()
+  clean_cc = str(rd.get("cc") or "").strip()
+  subj = str(rd.get("subject") or "").strip()
+
+  if tid:
+    t_res = subprocess.run(
+        [gmail_bin, "readonly", "get-thread", tid, "--json"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if t_res.returncode == 0 and t_res.stdout.strip():
+      t_data = json.loads(t_res.stdout)
+      msgs = (
+          t_data.get("messages")
+          if isinstance(t_data, Mapping)
+          else (t_data if isinstance(t_data, list) else [])
+      ) or []
+      if msgs and isinstance(msgs[-1], Mapping):
+        last_msg = msgs[-1]
+        latest_msg_id = str(last_msg.get("id") or "").strip()
+        hm = _extract_msg_headers(last_msg)
+        if not subj:
+          subj = str(hm.get("subject") or "").strip()
+        # Explicitly pass both To and Cc because gmail CLI skips auto-Cc when --to strips self
+        to_seen: set[str] = set()
+        if not clean_to:
+          reply_src = hm.get("reply-to") or hm.get("from") or ""
+          clean_to, to_seen = _filter_reply_recipients([reply_src, hm.get("to") or ""])
+        else:
+          _, to_seen = _filter_reply_recipients([clean_to])
+        if not clean_cc and hm.get("cc"):
+          clean_cc, _ = _filter_reply_recipients(
+              [hm.get("cc") or ""], exclude_addrs=to_seen, always_strip_me=True
+          )
+
+  with tempfile.NamedTemporaryFile(
+      mode="w", encoding="utf-8", suffix=".html", delete=False
+  ) as tmp_f:
+    tmp_f.write(html_body)
+    tmp_path = tmp_f.name
+
+  try:
+    cmd = [gmail_bin, "mutate", "create-draft"]
+    if latest_msg_id:
+      cmd.extend(["--message", latest_msg_id, "--all", "--include-history"])
+      if clean_to:
+        cmd.extend(["--to", clean_to])
+      if clean_cc:
+        cmd.extend(["--cc", clean_cc])
+      if rd.get("subject"):
+        cmd.extend(["--subject", str(rd["subject"])])
+    elif tid:
+      if not clean_to:
+        raise ValueError(f"Cannot materialize draft on thread {tid}: missing To recipient")
+      cmd.extend(["--thread", tid, "--to", clean_to, "--subject", subj or "Re: Follow-up"])
+      if clean_cc:
+        cmd.extend(["--cc", clean_cc])
+    else:
+      if not clean_to or not subj:
+        raise ValueError("Standalone Gmail draft requires both To and Subject")
+      cmd.extend(["--to", clean_to, "--subject", subj])
+      if clean_cc:
+        cmd.extend(["--cc", clean_cc])
+    cmd.extend(["--html", "--body-file", tmp_path])
+
+    c_res = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False)
+    if c_res.returncode != 0:
+      err_detail = c_res.stderr.strip() or c_res.stdout.strip()
+      raise RuntimeError(f"gmail create-draft failed: {err_detail}")
+    m_id = re.search(r"ID=([^\s]+)", c_res.stdout or "")
+    new_did = m_id.group(1).strip() if m_id else ""
+    if not new_did and (c_res.stdout or "").strip().startswith("{"):
+      new_did = str((json.loads(c_res.stdout) or {}).get("id") or "").strip()
+    if not new_did:
+      raise RuntimeError(f"Could not parse draft ID from gmail output: {c_res.stdout!r}")
+  finally:
+    try:
+      os.unlink(tmp_path)
+    except OSError:
+      pass
+
+  _verify_stored_gmail_draft_clean(gmail_bin, new_did)
+  d_key = store.record_materialized_reply_draft(
+      work_id,
+      new_did,
+      thread_id=tid,
+      subject=subj,
+      to_hdr=clean_to,
+      now=cur_now,
+  )
+  return {
+      "draft_id": new_did,
+      "draft_key": d_key,
+      "url": f"https://mail.google.com/mail/u/0/#drafts/{new_did}",
+      "reused": False,
+  }

@@ -4100,6 +4100,1097 @@ assert.strictEqual(cards.w_wait2.collapsed, true);
         [o for o in ord_reopen["obligations"] if o["status"] != "done"][0]["status"], "ready"
     )
 
+  def test_r13_gmail_drafts_above_ten_and_cli_failure_never_false_sent(self) -> None:
+    """Verifies >10 active Gmail drafts and failed CLI runs never falsely mark drafts SENT."""
+    import base64
+    from unittest import mock
+    import ingestor
+    import work_store
+
+    now = 1762600000.0
+    store = work_store.WorkStore(self.db_path)
+    store.upsert_artifact(
+        "gerrit:skia:1414016",
+        kind="gerrit",
+        title="1414016: Fix getRectsForRange empty lines",
+        url="https://skia-review.googlesource.com/c/skia/+/1414016",
+        state={"status": "MERGED", "rolls": {"Flutter": {"rolled": False}}},
+        now=now,
+    )
+    b64_12 = base64.urlsafe_b64encode(
+        b'<p>Hi Renzo, fixed in <a href="https://skia-review.googlesource.com/c/skia/+/1414016">'
+        b"CL 1414016</a></p>"
+    ).decode("ascii")
+    b64_noise = base64.urlsafe_b64encode(b"<p>Scratch note</p>").decode("ascii")
+
+    mode = {"cli_fail": False, "drop_12": False}
+    seen_drafts_cmds: list[list[str]] = []
+
+    def fake_gmail(
+        cmd: list[str], *args: object, **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+      del args, kwargs
+      res = subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+      if "drafts" in cmd:
+        seen_drafts_cmds.append(list(cmd))
+        if mode["cli_fail"]:
+          res.returncode = 1
+          res.stderr = "transient LOAS timeout"
+          return res
+        ids = [f"r_d_{i:02d}" for i in range(1, 13)]
+        if mode["drop_12"]:
+          ids = [x for x in ids if x != "r_d_12"]
+        res.stdout = json.dumps([
+            {"id": did, "threadId": "1a19elevendraft" if did == "r_d_12" else f"t_{did}"}
+            for did in ids
+        ])
+      elif "get-draft" in cmd:
+        did = cmd[cmd.index("get-draft") + 1]
+        is_target = did == "r_d_12"
+        res.stdout = json.dumps({
+            "id": did,
+            "message": {
+                "id": f"m_{did}",
+                "threadId": "1a19elevendraft" if is_target else f"t_{did}",
+                "internalDate": str(int((now - 120) * 1000)),
+                "payload": {
+                    "headers": [
+                        {
+                            "name": "Subject",
+                            "value": "Re: Fixed bugs in Flutter" if is_target else f"Note {did}",
+                        },
+                        {"name": "To", "value": "Renzo Olivares <roliv@google.com>"},
+                    ],
+                    "body": {"data": b64_12 if is_target else b64_noise},
+                },
+            },
+        })
+      elif "get-thread" in cmd:
+        res.stdout = json.dumps({
+            "messages": [{
+                "id": "m_orig_12",
+                "internalDate": str(int((now - 600) * 1000)),
+                "labelIds": ["INBOX", "CATEGORY_PERSONAL"],
+                "snippet": "Any update on Flutter bugs?",
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "Fixed bugs in Flutter"},
+                        {"name": "From", "value": "Renzo Olivares <roliv@google.com>"},
+                        {"name": "To", "value": "Julia Lavrova <jlavrova@google.com>"},
+                    ]
+                },
+            }]
+        })
+      elif "search" in cmd:
+        res.stdout = json.dumps({"messages": []})
+      return res
+
+    ws: dict[str, object] = {}
+    with mock.patch("os.path.isfile", return_value=True), mock.patch(
+        "subprocess.run", side_effect=fake_gmail
+    ):
+      ingestor.ingest_gmail_drafts_and_threads(store, ws, now=now)
+      # Second sync with all 12 drafts still active must keep the 12th draft in DRAFT status
+      ingestor.ingest_gmail_drafts_and_threads(store, ws, now=now + 90)
+
+    self.assertGreaterEqual(len(seen_drafts_cmds), 2)
+    self.assertIn("--max", seen_drafts_cmds[0])
+    d12 = store.get_artifact("gmail_draft:r_d_12") or {}
+    self.assertEqual((d12.get("state") or {}).get("status"), "DRAFT")
+    active_ids = ws.get("active_draft_ids")
+    self.assertIsInstance(active_ids, list)
+    assert isinstance(active_ids, list)
+    self.assertEqual(len(active_ids), 12)
+
+    # Transient CLI failure when listing drafts must never mark previously tracked drafts SENT
+    mode["cli_fail"] = True
+    with mock.patch("os.path.isfile", return_value=True), mock.patch(
+        "subprocess.run", side_effect=fake_gmail
+    ):
+      ingestor.ingest_gmail_drafts_and_threads(store, ws, now=now + 180)
+    self.assertEqual(
+        ((store.get_artifact("gmail_draft:r_d_12") or {}).get("state") or {}).get("status"),
+        "DRAFT",
+    )
+
+    # Clean list response omitting r_d_12 marks it SENT
+    mode["cli_fail"] = False
+    mode["drop_12"] = True
+    with mock.patch("os.path.isfile", return_value=True), mock.patch(
+        "subprocess.run", side_effect=fake_gmail
+    ):
+      ingestor.ingest_gmail_drafts_and_threads(store, ws, now=now + 270)
+    self.assertEqual(
+        ((store.get_artifact("gmail_draft:r_d_12") or {}).get("state") or {}).get("status"),
+        "SENT",
+    )
+
+  def test_r13_parked_draft_wakes_card_on_newer_counterparty_reply(self) -> None:
+    """Verifies parked Gmail and Workbench drafts wake into Needs You when a newer reply arrives."""
+    import base64
+    from unittest import mock
+    import ingestor
+    import work_store
+
+    now = 1762610000.0
+    store = work_store.WorkStore(self.db_path)
+    store.upsert_artifact(
+        "gerrit:skia:1421111",
+        kind="gerrit",
+        title="1421111: Fix cluster advance",
+        url="https://skia-review.googlesource.com/c/skia/+/1421111",
+        state={
+            "status": "NEW",
+            "is_mine": True,
+            "assigned_reviewers_count": 1,
+            "entity_state": {"lane": "waiting", "status": "waiting"},
+        },
+        now=now - 500,
+    )
+    b64_draft = base64.urlsafe_b64encode(
+        b'<p>Uploaded <a href="https://skia-review.googlesource.com/c/skia/+/1421111">'
+        b"CL 1421111</a></p>"
+    ).decode("ascii")
+    b64_msg1 = base64.urlsafe_b64encode(b"Could you check cluster advance?").decode("ascii")
+    b64_msg2 = base64.urlsafe_b64encode(b"Wait, it also crashes on RTL!").decode("ascii")
+    thread_stage = {"new_reply": False}
+
+    def fake_gmail(
+        cmd: list[str], *args: object, **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+      del args, kwargs
+      res = subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+      if "drafts" in cmd:
+        res.stdout = json.dumps([{"id": "r_park_1", "threadId": "1a19parkwake1"}])
+      elif "get-draft" in cmd:
+        res.stdout = json.dumps({
+            "id": "r_park_1",
+            "message": {
+                "id": "m_draft_park_1",
+                "threadId": "1a19parkwake1",
+                "internalDate": str(int((now - 300) * 1000)),
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "Re: Fixed bugs in Flutter"},
+                        {"name": "To", "value": "Renzo Olivares <roliv@google.com>"},
+                    ],
+                    "body": {"data": b64_draft},
+                },
+            },
+        })
+      elif "get-thread" in cmd:
+        msgs = [
+            {
+                "id": "m_pw_0",
+                "internalDate": str(int((now - 900) * 1000)),
+                "labelIds": ["SENT"],
+                "snippet": "Looking into it",
+                "payload": {
+                    "mimeType": "text/plain",
+                    "headers": [
+                        {"name": "Subject", "value": "Fixed bugs in Flutter"},
+                        {"name": "From", "value": "Julia Lavrova <jlavrova@google.com>"},
+                        {"name": "To", "value": "Renzo Olivares <roliv@google.com>"},
+                    ],
+                    "body": {"data": b64_msg1},
+                },
+            },
+            {
+                "id": "m_pw_1",
+                "internalDate": str(int((now - 600) * 1000)),
+                "labelIds": ["INBOX", "CATEGORY_PERSONAL"],
+                "snippet": "Could you check cluster advance?",
+                "payload": {
+                    "mimeType": "text/plain",
+                    "headers": [
+                        {"name": "Subject", "value": "Re: Fixed bugs in Flutter"},
+                        {"name": "From", "value": "Renzo Olivares <roliv@google.com>"},
+                        {"name": "To", "value": "Julia Lavrova <jlavrova@google.com>"},
+                    ],
+                    "body": {"data": b64_msg1},
+                },
+            },
+        ]
+        if thread_stage["new_reply"]:
+          msgs.append({
+              "id": "m_pw_2",
+              "internalDate": str(int((now + 150) * 1000)),
+              "labelIds": ["INBOX", "CATEGORY_PERSONAL"],
+              "snippet": "Wait, it also crashes on RTL!",
+              "payload": {
+                  "mimeType": "text/plain",
+                  "headers": [
+                      {"name": "Subject", "value": "Re: Fixed bugs in Flutter"},
+                      {"name": "From", "value": "Renzo Olivares <roliv@google.com>"},
+                      {"name": "To", "value": "Julia Lavrova <jlavrova@google.com>"},
+                  ],
+                  "body": {"data": b64_msg2},
+              },
+          })
+        res.stdout = json.dumps({"messages": msgs})
+      elif "search" in cmd:
+        q_idx = cmd.index("search") + 1
+        q_str = cmd[q_idx] if q_idx < len(cmd) else ""
+        if "in:inbox" in q_str or "from:me" in q_str:
+          res.stdout = json.dumps({"messages": [{"id": "m_pw_1", "threadId": "1a19parkwake1"}]})
+        else:
+          res.stdout = json.dumps({"messages": []})
+      return res
+
+    ws: dict[str, object] = {}
+    with mock.patch("os.path.isfile", return_value=True), mock.patch(
+        "subprocess.run", side_effect=fake_gmail
+    ):
+      ingestor.ingest_gmail_drafts_and_threads(store, ws, now=now)
+      # Re-sync 90s later without draft edits must not advance draft_updated_ts
+      ws["gmail_threads"] = {}
+      ingestor.ingest_gmail_drafts_and_threads(store, ws, now=now + 90)
+
+    proj_wait = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now + 90)
+    cards_wait = [w for w in proj_wait["works"] if "Fixed bugs in Flutter" in w["title"]]
+    self.assertEqual(len(cards_wait), 1)
+    self.assertEqual(cards_wait[0]["lane"], "waiting")
+
+    # Counterparty replies at now+150 (newer than draft at now-300): card MUST wake into needs-you
+    thread_stage["new_reply"] = True
+    ws["gmail_threads"] = {}
+    with mock.patch("os.path.isfile", return_value=True), mock.patch(
+        "subprocess.run", side_effect=fake_gmail
+    ):
+      ingestor.ingest_gmail_drafts_and_threads(store, ws, now=now + 200)
+
+    proj_wake = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now + 200)
+    cards_wake = [w for w in proj_wake["works"] if w["work_id"] == cards_wait[0]["work_id"]]
+    self.assertEqual(len(cards_wake), 1)
+    self.assertEqual(cards_wake[0]["lane"], "needs-you")
+
+    # Part B: Parked Workbench reply_draft also wakes on newer counterparty reply, then re-parks
+    w_wb = store.create_work("Skia shaping question", project_id="skia", now=now)
+    store.upsert_artifact(
+        "gerrit:skia:1422222",
+        kind="gerrit",
+        title="1422222: Fix shaping cluster range",
+        state={
+            "status": "NEW",
+            "is_mine": True,
+            "assigned_reviewers_count": 1,
+            "entity_state": {"lane": "waiting", "status": "waiting"},
+        },
+        now=now,
+    )
+    store.upsert_artifact(
+        "gmail_thread:1a19parkwake2",
+        kind="gmail_thread",
+        title="Shaping cluster range (Florin)",
+        state={
+            "thread_id": "1a19parkwake2",
+            "root_subject": "Shaping cluster range",
+            "counterparty": "Florin Malita",
+            "sent_by_me": True,
+            "last_from_me": False,
+            "last_message_ts": now - 400,
+            "unanswered_human": True,
+            "is_active_correspondence": True,
+        },
+        now=now,
+    )
+    store.link_artifact(w_wb, "gerrit:skia:1422222", role="primary", now=now)
+    store.link_artifact(w_wb, "gmail_thread:1a19parkwake2", role="channel", now=now)
+    store.save_reply_draft(
+        w_wb,
+        "<p>Hi Florin, uploaded CL 1422222 for review.</p>",
+        auto_gate=True,
+        now=now - 100,
+    )
+    proj_wb_wait = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now)
+    wb_card = [w for w in proj_wb_wait["works"] if w["work_id"] == w_wb][0]
+    self.assertEqual(wb_card["lane"], "waiting")
+
+    store.upsert_artifact(
+        "gmail_thread:1a19parkwake2",
+        kind="gmail_thread",
+        state={
+            "last_from_me": False,
+            "last_message_ts": now + 120,
+            "unanswered_human": True,
+        },
+        now=now + 120,
+    )
+    store.reconcile_correspondence_obligations(w_wb, now=now + 120)
+    proj_wb_wake = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now + 120)
+    wb_wake = [w for w in proj_wb_wake["works"] if w["work_id"] == w_wb][0]
+    self.assertEqual(wb_wake["lane"], "needs-you")
+
+    store.save_reply_draft(
+        w_wb,
+        "<p>Hi Florin, updated CL 1422222 and addressed your follow-up.</p>",
+        auto_gate=True,
+        now=now + 220,
+    )
+    proj_wb_repark = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now + 220)
+    wb_repark = [w for w in proj_wb_repark["works"] if w["work_id"] == w_wb][0]
+    self.assertEqual(wb_repark["lane"], "waiting")
+
+  def test_r13_workbench_live_reply_draft_cli_http_and_materialize(self) -> None:
+    """Verifies Workbench live reply drafts across auto-gating, checklist, CLI, HTTP, and Gmail."""
+    import base64
+    from unittest import mock
+    import ingestor
+    import work_store
+    import workbench_server
+
+    now = 1762620000.0
+    store = work_store.WorkStore(self.db_path)
+    wid = store.create_work("Fixed bugs in Flutter", project_id="flutter", now=now)
+    t_key = "gmail_thread:1a19livedraft001"
+    store.upsert_artifact(
+        t_key,
+        kind="gmail_thread",
+        title="Fixed bugs in Flutter (Renzo Olivares)",
+        url="https://mail.google.com/mail/u/0/#all/1a19livedraft001",
+        state={
+            "thread_id": "1a19livedraft001",
+            "root_subject": "Fixed bugs in Flutter",
+            "counterparty": "Renzo Olivares",
+            "sent_by_me": True,
+            "last_from_me": False,
+            "last_message_ts": now - 300,
+            "unanswered_human": True,
+            "is_active_correspondence": True,
+        },
+        now=now,
+    )
+    store.upsert_artifact(
+        "github_issue:flutter/flutter:160251",
+        kind="github_issue",
+        title="flutter#160251: Zero-width cluster letterSpacing",
+        state={"status": "OPEN", "bug_title": "Zero-width cluster letterSpacing"},
+        now=now,
+    )
+    store.upsert_artifact(
+        "github_issue:flutter/flutter:155062",
+        kind="github_issue",
+        title="flutter#155062: getPositionForOffset justification",
+        state={"status": "OPEN", "bug_title": "getPositionForOffset justification"},
+        now=now,
+    )
+    store.link_artifact(wid, t_key, role="primary", source="auto", now=now)
+    store.link_artifact(wid, "github_issue:flutter/flutter:160251", role="primary", now=now)
+    store.link_artifact(wid, "github_issue:flutter/flutter:155062", role="primary", now=now)
+
+    # Save milestone #1 via workctl CLI; comparison CL 1399999 in body must NOT become primary
+    workctl_py = os.path.join(WORKBENCH_DIR, "workctl.py")
+    body1_path = os.path.join(self.tmp_dir.name, "draft_m1.html")
+    with open(body1_path, "w", encoding="utf-8") as f:
+      f.write(
+          '<p>Hi Renzo,</p><ul>'
+          '<li><a href="https://github.com/flutter/flutter/issues/160251">#160251</a> '
+          '(compared with <a href="https://skia-review.googlesource.com/c/skia/+/1399999">'
+          "CL 1399999</a>)</li>"
+          '<li><a href="https://github.com/flutter/flutter/issues/155062">#155062</a></li>'
+          "</ul>"
+      )
+    subprocess.run(
+        [
+            sys.executable,
+            workctl_py,
+            "--db",
+            self.db_path,
+            "draft-set",
+            wid,
+            "--html",
+            "--body-file",
+            body1_path,
+            "--auto-gate",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    self.assertNotIn("gerrit:skia:1399999", store.get_work_artifact_roles(wid))
+
+    # Link Gerrit + PR + Piper primary changes; auto_gate refreshes and checklist flags outdated
+    store.upsert_artifact(
+        "gerrit:skia:1404137",
+        kind="gerrit",
+        title="1404137: Do not letter-space ignorable clusters",
+        url="https://skia-review.googlesource.com/c/skia/+/1404137",
+        state={
+            "status": "NEW",
+            "is_mine": True,
+            "assigned_reviewers_count": 1,
+            "entity_state": {"lane": "waiting", "status": "waiting"},
+            "linked_bugs": [{"bug_key": "gh_issue:flutter/flutter#160251"}],
+        },
+        now=now + 20,
+    )
+    store.upsert_artifact(
+        "github_pr:flutter/flutter:196137",
+        kind="github_pr",
+        title="PR #196137: Fix justification hit-test",
+        url="https://github.com/flutter/flutter/pull/196137",
+        state={
+            "status": "OPEN",
+            "is_mine": True,
+            "assigned_reviewers_count": 1,
+            "entity_state": {"lane": "waiting", "status": "waiting"},
+            "commit_message": "Fixes https://github.com/flutter/flutter/issues/155062",
+        },
+        now=now + 20,
+    )
+    piper_ref = "cl" + "/1008075988"
+    store.upsert_artifact(
+        "piper:1008075988",
+        kind="piper",
+        title=f"{piper_ref}: Sync google3 golden",
+        url=f"http://{piper_ref}",
+        state={
+            "status": "NEW",
+            "is_mine": True,
+            "assigned_reviewers_count": 1,
+            "entity_state": {"lane": "waiting", "status": "waiting"},
+        },
+        now=now + 20,
+    )
+    store.link_artifact(wid, "gerrit:skia:1404137", role="primary", now=now + 20)
+    store.link_artifact(wid, "github_pr:flutter/flutter:196137", role="primary", now=now + 20)
+    store.link_artifact(wid, "piper:1008075988", role="primary", now=now + 20)
+    store.reconcile_correspondence_obligations(wid, now=now + 25)
+
+    proj_mid = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now + 25)
+    card_mid = [w for w in proj_mid["works"] if w["work_id"] == wid][0]
+    self.assertEqual(card_mid["lane"], "waiting")
+    chk_mid = card_mid.get("checklist") or []
+    self.assertEqual(len(chk_mid), 2)
+    self.assertTrue(all(item["draft_outdated"] for item in chk_mid))
+
+    # Update draft mentioning both fixes and merge into a target Work; draft + obligation survive
+    clean_html = (
+        '<p>Hi Renzo,</p><ul>'
+        '<li><a href="https://github.com/flutter/flutter/issues/160251">#160251</a>: '
+        '<a href="https://skia-review.googlesource.com/c/skia/+/1404137">Skia CL 1404137</a> '
+        f'and <a href="http://{piper_ref}">{piper_ref}</a></li>'
+        '<li><a href="https://github.com/flutter/flutter/issues/155062">#155062</a>: '
+        '<a href="https://github.com/flutter/flutter/pull/196137">PR #196137</a></li>'
+        "</ul>"
+    )
+    store.save_reply_draft(wid, clean_html, fmt="html", auto_gate=True, now=now + 40)
+    wid_merged = store.create_work("Merged Flutter bugs card", project_id="flutter", now=now + 45)
+    store.merge_works(wid_merged, wid, now=now + 50)
+    store.reconcile_correspondence_obligations(wid_merged, now=now + 50)
+    merged_rd = store.get_reply_draft(wid_merged)
+    self.assertIsNotNone(merged_rd)
+    assert merged_rd is not None
+    self.assertIn("1404137", merged_rd["body"])
+
+    proj_clean = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now + 55)
+    card_clean = [w for w in proj_clean["works"] if w["work_id"] == wid_merged][0]
+    chk_clean = card_clean.get("checklist") or []
+    self.assertEqual(len(chk_clean), 2)
+    self.assertFalse(any(item["draft_outdated"] for item in chk_clean))
+
+    # Land all 3 changes (including Piper SUBMITTED) -> wb_reply_draft obligation becomes ready
+    store.upsert_artifact(
+        "gerrit:skia:1404137",
+        state={"status": "MERGED", "rolls": {"Flutter": {"rolled": True}}},
+        now=now + 100,
+    )
+    store.upsert_artifact(
+        "github_pr:flutter/flutter:196137", state={"status": "MERGED"}, now=now + 100
+    )
+    store.upsert_artifact("piper:1008075988", state={"status": "SUBMITTED"}, now=now + 100)
+    proj_ready = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now + 105)
+    card_ready = [w for w in proj_ready["works"] if w["work_id"] == wid_merged][0]
+    self.assertEqual(card_ready["lane"], "needs-you")
+
+    # Redirect URLs in draft body must fail fast before calling Gmail CLI
+    store.save_reply_draft(
+        wid_merged,
+        '<p>Bad <a href="https://www.google.com/url?q=https://example.com">link</a></p>',
+        fmt="html",
+        auto_gate=True,
+        now=now + 110,
+    )
+    with self.assertRaises(ValueError):
+      ingestor.materialize_reply_draft(store, wid_merged, now=now + 111)
+    store.save_reply_draft(wid_merged, clean_html, fmt="html", auto_gate=True, now=now + 112)
+
+    # Start HTTP server and verify /api/work/draft/{materialize,save,clear} + SSR/JS rendering
+    create_calls: list[list[str]] = []
+    b64_stored = base64.urlsafe_b64encode(clean_html.encode("utf-8")).decode("ascii")
+
+    def fake_mat_gmail(
+        cmd: list[str], *args: object, **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+      del args, kwargs
+      res = subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+      if "get-thread" in cmd:
+        res.stdout = json.dumps({
+            "messages": [{
+                "id": "msg_latest_77",
+                "threadId": "1a19livedraft001",
+                "internalDate": str(int((now - 300) * 1000)),
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "Fixed bugs in Flutter"},
+                        {"name": "From", "value": "Renzo Olivares <roliv@google.com>"},
+                        {
+                            "name": "To",
+                            "value": (
+                                "Julia Lavrova <jlavrova@google.com>, "
+                                "Extra Peer <peer@google.com>"
+                            ),
+                        },
+                        {
+                            "name": "Cc",
+                            "value": (
+                                "Flora <flora@google.com>, "
+                                "Julia Lavrova <jlavrova@google.com>"
+                            ),
+                        },
+                    ]
+                },
+            }]
+        })
+      elif "create-draft" in cmd:
+        create_calls.append(list(cmd))
+        res.stdout = "Draft created: ID=r_mat_9001\n"
+      elif "get-draft" in cmd:
+        res.stdout = json.dumps({
+            "id": "r_mat_9001",
+            "message": {
+                "id": "m_mat_9001",
+                "threadId": "1a19livedraft001",
+                "payload": {"mimeType": "text/html", "body": {"data": b64_stored}},
+            },
+        })
+      return res
+
+    srv = workbench_server.create_server(
+        host="127.0.0.1",
+        port=0,
+        store=store,
+        cl_state_path=self.cl_state_path,
+        watcher_state_path=self.state_path,
+        info_path=self.info_path,
+    )
+    port = srv.server_address[1]
+    t_srv = threading.Thread(target=srv.serve_forever, daemon=True)
+    t_srv.start()
+    try:
+      def _post(path: str, payload: dict[str, object]) -> dict[str, object]:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+          return json.loads(resp.read().decode("utf-8"))
+
+      with mock.patch("subprocess.run", side_effect=fake_mat_gmail):
+        mat1 = _post("/api/work/draft/materialize", {"work_id": wid_merged})
+        mat2 = _post("/api/work/draft/materialize", {"work_id": wid_merged})
+
+      self.assertEqual(len(create_calls), 1)
+      ccmd = create_calls[0]
+      self.assertIn("--include-history", ccmd)
+      self.assertIn("--html", ccmd)
+      to_val = ccmd[ccmd.index("--to") + 1]
+      cc_val = ccmd[ccmd.index("--cc") + 1]
+      self.assertIn("roliv@google.com", to_val)
+      self.assertIn("peer@google.com", to_val)
+      self.assertNotIn("jlavrova@google.com", to_val)
+      self.assertIn("flora@google.com", cc_val)
+      self.assertNotIn("jlavrova@google.com", cc_val)
+      self.assertEqual((mat1.get("materialized") or {}).get("draft_id"), "r_mat_9001")
+      self.assertTrue(bool((mat2.get("materialized") or {}).get("reused")))
+
+      with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as resp:
+        html_page = resp.read().decode("utf-8")
+      self.assertIn("wb-reply-draft", html_page)
+
+      # Editing after materialization marks needs_rematerialize without mutating Gmail in place
+      after_edit = _post(
+          "/api/work/draft/save",
+          {
+              "work_id": wid_merged,
+              "body": clean_html + "<p>P.S. Rolled today!</p>",
+              "format": "html",
+              "auto_gate": True,
+          },
+      )
+      ed_card = [w for w in after_edit["works"] if w["work_id"] == wid_merged][0]
+      self.assertTrue(bool((ed_card.get("reply_draft") or {}).get("needs_rematerialize")))
+
+      # Simulate sending r_mat_9001 in Gmail -> clears reply_draft and hands off to 7d Waiting
+      store.upsert_artifact("gmail_draft:r_mat_9001", state={"status": "SENT"}, now=now + 300)
+      store.upsert_artifact(
+          t_key,
+          state={"sent_by_me": True, "last_from_me": True, "last_message_ts": now + 300},
+          now=now + 300,
+      )
+      store.reconcile_correspondence_obligations(wid_merged, now=now + 300)
+      proj_sent = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now + 301)
+      sent_card = [w for w in proj_sent["works"] if w["work_id"] == wid_merged][0]
+      self.assertIsNone(sent_card.get("reply_draft"))
+      self.assertEqual(sent_card["lane"], "waiting")
+
+      # Verify /api/work/draft/clear on a new draft
+      _post(
+          "/api/work/draft/save",
+          {"work_id": wid_merged, "body": "Quick follow-up", "format": "text"},
+      )
+      cleared = _post("/api/work/draft/clear", {"work_id": wid_merged})
+      clr_card = [w for w in cleared["works"] if w["work_id"] == wid_merged][0]
+      self.assertIsNone(clr_card.get("reply_draft"))
+    finally:
+      srv.shutdown()
+      srv.server_close()
+
+  def test_r13_phase3_skeptic_confirmed_contracts(self) -> None:
+    """Verifies Skeptic-confirmed R13 contracts across fast-send, discard, unlink/split, and UI."""
+    import base64
+    from unittest import mock
+    import ingestor
+    import work_store
+    import workbench_server
+    import workctl
+
+    now = 1762630000.0
+    store = work_store.WorkStore(self.db_path)
+
+    # 1. Unified draft mention extraction: filters DUMMY_IDS & PR hovercards, keeps prose Skia CL
+    hq_draft_body = (
+        "Hi Renzo,\n\nSee Skia CL 1404137, CL 123456, b/123456789, "
+        '<a data-hydro-click=\'{"url":"https://github.com/flutter/flutter/issues/197778"}\' '
+        'href="https://github.com/flutter/flutter/pull/197778">PR #197778</a>, and '
+        "https://docs.google.com/document/d/1AbCdEfGhIjKlMnOpQrStUvWxYz123456/edit"
+    )
+    m_keys = ingestor.extract_draft_mentioned_keys("Re: Skia CL 1404138", hq_draft_body)
+    self.assertIn("gerrit:skia:1404138", m_keys)
+    self.assertIn("gerrit:skia:1404137", m_keys)
+    self.assertIn("github_pr:flutter/flutter:197778", m_keys)
+    self.assertIn("gdoc:1AbCdEfGhIjKlMnOpQrStUvWxYz123456", m_keys)
+    self.assertNotIn("gerrit:skia:123456", m_keys)
+    self.assertNotIn("buganizer:123456789", m_keys)
+    self.assertNotIn("github_issue:flutter/flutter:197778", m_keys)
+
+    # 2. Fast-send (<90s) vs discarded Gmail draft + empty-mailbox JSON + superseded force-new tab
+    w_fast = store.create_work("Fast-sent materialized draft", now=now)
+    store.upsert_artifact(
+        "gmail_thread:1a19fast1",
+        kind="gmail_thread",
+        title="Fast send thread (Renzo)",
+        state={
+            "thread_id": "1a19fast1",
+            "root_subject": "Fast send thread",
+            "counterparty": "Renzo Olivares",
+            "sent_by_me": True,
+            "last_from_me": False,
+            "last_message_ts": now - 200,
+            "unanswered_human": True,
+            "is_active_correspondence": True,
+        },
+        now=now,
+    )
+    store.link_artifact(w_fast, "gmail_thread:1a19fast1", role="primary", now=now)
+    rd_default = store.save_reply_draft(
+        w_fast, "<p>Done in Skia CL 1404137</p>", subject="Re: Skia CL 1404138", now=now
+    )
+    self.assertTrue(rd_default["auto_gate"])
+    self.assertIn("gerrit:skia:1404138", rd_default["mentioned_keys"])
+    store.record_materialized_reply_draft(
+        w_fast, "r_fast_old", thread_id="1a19fast1", now=now + 1
+    )
+    store.record_materialized_reply_draft(
+        w_fast, "r_fast_new", thread_id="1a19fast1", now=now + 2
+    )
+    self.assertEqual(
+        ((store.get_artifact("gmail_draft:r_fast_old") or {}).get("state") or {}).get("status"),
+        "DISCARDED",
+    )
+
+    w_disc = store.create_work("Discarded materialized draft", now=now)
+    store.upsert_artifact(
+        "gmail_thread:1a19disc1",
+        kind="gmail_thread",
+        title="Discard thread (Florin)",
+        state={
+            "thread_id": "1a19disc1",
+            "root_subject": "Discard thread",
+            "counterparty": "Florin Malita",
+            "sent_by_me": True,
+            "last_from_me": False,
+            "last_message_ts": now - 200,
+            "unanswered_human": True,
+            "is_active_correspondence": True,
+        },
+        now=now,
+    )
+    store.link_artifact(w_disc, "gmail_thread:1a19disc1", role="primary", now=now)
+    store.save_reply_draft(w_disc, "<p>Draft to discard</p>", now=now)
+    store.record_materialized_reply_draft(
+        w_disc, "r_disc_only", thread_id="1a19disc1", now=now + 3
+    )
+
+    b64_sent = base64.urlsafe_b64encode(b"Done in Skia CL 1404137").decode("ascii")
+    b64_in = base64.urlsafe_b64encode(b"Any update?").decode("ascii")
+    empty_mode = {"shape": "empty_obj"}
+
+    def fake_fast_or_discard(
+        cmd: list[str], *args: object, **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+      del args, kwargs
+      res = subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+      if "drafts" in cmd and "get-draft" not in cmd:
+        if empty_mode["shape"] == "empty_obj":
+          res.stdout = json.dumps({"resultSizeEstimate": 0})
+        else:
+          res.stdout = json.dumps({"drafts": None, "resultSizeEstimate": 0})
+      elif "get-thread" in cmd:
+        tid = cmd[cmd.index("get-thread") + 1]
+        if tid == "1a19fast1":
+          res.stdout = json.dumps({
+              "messages": [{
+                  "id": "m_fast_sent",
+                  "internalDate": str(int((now + 10) * 1000)),
+                  "labelIds": ["SENT"],
+                  "payload": {
+                      "mimeType": "text/plain",
+                      "headers": [
+                          {"name": "Subject", "value": "Re: Fast send thread"},
+                          {"name": "From", "value": "Julia Lavrova <jlavrova@google.com>"},
+                          {"name": "To", "value": "Renzo Olivares <roliv@google.com>"},
+                      ],
+                      "body": {"data": b64_sent},
+                  },
+              }]
+          })
+        else:
+          res.stdout = json.dumps({
+              "messages": [{
+                  "id": "m_disc_in",
+                  "internalDate": str(int((now - 200) * 1000)),
+                  "labelIds": ["INBOX", "CATEGORY_PERSONAL"],
+                  "payload": {
+                      "mimeType": "text/plain",
+                      "headers": [
+                          {"name": "Subject", "value": "Discard thread"},
+                          {"name": "From", "value": "Florin Malita <fmalita@google.com>"},
+                          {"name": "To", "value": "Julia Lavrova <jlavrova@google.com>"},
+                      ],
+                      "body": {"data": b64_in},
+                  },
+              }]
+          })
+      elif "search" in cmd:
+        res.stdout = json.dumps({"messages": []})
+      return res
+
+    ws_empty: dict[str, object] = {}
+    with mock.patch("os.path.isfile", return_value=True), mock.patch(
+        "subprocess.run", side_effect=fake_fast_or_discard
+    ):
+      ingestor.ingest_gmail_drafts_and_threads(store, ws_empty, now=now + 20)
+      empty_mode["shape"] = "null_drafts"
+      ingestor.ingest_gmail_drafts_and_threads(store, ws_empty, now=now + 30)
+
+    self.assertEqual(
+        ((store.get_artifact("gmail_draft:r_fast_new") or {}).get("state") or {}).get("status"),
+        "SENT",
+    )
+    self.assertIsNone(store.get_reply_draft(w_fast))
+    self.assertEqual(
+        ((store.get_artifact("gmail_draft:r_disc_only") or {}).get("state") or {}).get("status"),
+        "DISCARDED",
+    )
+    surviving_rd = store.get_reply_draft(w_disc)
+    self.assertIsNotNone(surviving_rd)
+    assert surviving_rd is not None
+    self.assertEqual(surviving_rd.get("materialized_draft_key"), "")
+
+    # 3. mark_obligation_done on ob-wbdraft-* clears reply_draft without zombie resurrection
+    wb_disc_oid = work_store._wb_draft_obligation_id(w_disc)
+    store.record_materialized_reply_draft(
+        w_disc, "r_disc_done", thread_id="1a19disc1", now=now + 35
+    )
+    store.mark_obligation_done(wb_disc_oid, now=now + 40)
+    self.assertIsNone(store.get_reply_draft(w_disc))
+    store.reconcile_correspondence_obligations(w_disc, now=now + 41)
+    proj_done_ob = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now + 41)
+    disc_card = [w for w in proj_done_ob["works"] if w["work_id"] == w_disc][0]
+    self.assertFalse(any("Unsent" in r for r in disc_card["reasons"]))
+
+    # 4. Unlinking sole primary CL retires auto_gate; unlinking thread clears thread_key; split_work
+    w_unlk = store.create_work("Unlink & split draft contracts", now=now + 50)
+    store.upsert_artifact(
+        "gerrit:skia:1430001",
+        kind="gerrit",
+        title="1430001: Pending CL",
+        state={
+            "status": "NEW",
+            "is_mine": True,
+            "assigned_reviewers_count": 1,
+            "entity_state": {"lane": "waiting", "status": "waiting"},
+        },
+        now=now + 50,
+    )
+    store.upsert_artifact(
+        "gmail_thread:1a19unlk1",
+        kind="gmail_thread",
+        title="Unlink thread (Peer)",
+        state={
+            "thread_id": "1a19unlk1",
+            "sent_by_me": True,
+            "last_from_me": True,
+            "last_message_ts": now + 45,
+            "is_active_correspondence": True,
+        },
+        now=now + 50,
+    )
+    store.link_artifact(w_unlk, "gerrit:skia:1430001", role="primary", now=now + 50)
+    store.link_artifact(w_unlk, "gmail_thread:1a19unlk1", role="channel", now=now + 50)
+    store.save_reply_draft(w_unlk, "<p>Will reply after CL lands</p>", now=now + 51)
+    new_split_wid = store.split_work(
+        w_unlk, "gmail_thread:1a19unlk1", "Split thread card", now=now + 52
+    )
+    self.assertEqual((store.get_reply_draft(w_unlk) or {}).get("thread_key"), "")
+    split_obs = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now + 53)
+    new_split_card = [w for w in split_obs["works"] if w["work_id"] == new_split_wid][0]
+    self.assertFalse(
+        any(
+            str(o["obligation_id"]).startswith("ob-wbdraft-")
+            for o in new_split_card["obligations"]
+        )
+    )
+    store.unlink_artifact(w_unlk, "gerrit:skia:1430001", now=now + 55)
+    proj_unlk = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now + 56)
+    unlk_card = [w for w in proj_unlk["works"] if w["work_id"] == w_unlk][0]
+    self.assertEqual(unlk_card["lane"], "needs-you")
+    self.assertTrue(any("Unsent reply draft" in r for r in unlk_card["reasons"]))
+
+    # 5. Config-titled Work with active reply_draft survives purge; standalone To+Subject skips bot
+    # gmail_thread and never silences unrelated gdoc_thread
+    w_cfg = store.create_work("Workbench roadmap notes", project_id="config", now=now + 60)
+    store.upsert_artifact(
+        "gmail_thread:1a19botgerrit",
+        kind="gmail_thread",
+        title="Change 1430002 merged (gerrit)",
+        state={"thread_id": "1a19botgerrit", "is_automated": True, "last_from_me": False},
+        now=now + 60,
+    )
+    store.upsert_artifact(
+        "gdoc_thread:doc777:disc1",
+        kind="gdoc_thread",
+        title="Design doc comment (Alice)",
+        state={
+            "doc_title": "Design doc",
+            "counterparty": "Alice",
+            "last_from_me": False,
+            "last_message_ts": now + 58,
+            "unanswered_human": True,
+            "is_active_correspondence": True,
+        },
+        now=now + 60,
+    )
+    store.upsert_artifact(
+        "gerrit:skia:1430002",
+        kind="gerrit",
+        title="1430002: Active CL",
+        state={
+            "status": "NEW",
+            "is_mine": True,
+            "assigned_reviewers_count": 1,
+            "entity_state": {"lane": "waiting", "status": "waiting"},
+        },
+        now=now + 60,
+    )
+    store.link_artifact(w_cfg, "gerrit:skia:1430002", role="primary", now=now + 60)
+    store.link_artifact(w_cfg, "gmail_thread:1a19botgerrit", role="channel", now=now + 60)
+    store.link_artifact(w_cfg, "gdoc_thread:doc777:disc1", role="channel", now=now + 60)
+    rd_standalone = store.save_reply_draft(
+        w_cfg,
+        "<p>Standalone email</p>",
+        to="bob@google.com",
+        subject="New standalone topic",
+        now=now + 61,
+    )
+    self.assertEqual(rd_standalone["thread_key"], "")
+    proj_gdoc_live = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now + 62)
+    cfg_card = [w for w in proj_gdoc_live["works"] if w["work_id"] == w_cfg][0]
+    self.assertEqual(cfg_card["lane"], "needs-you")
+
+    w_cfg_only = store.create_work("Config-titled card with draft", project_id="config", now=now)
+    store.save_reply_draft(
+        w_cfg_only, "Standalone note", fmt="text", to="bob@google.com", subject="Hi", now=now + 63
+    )
+    store.purge_config_artifacts_and_works(now=now + 64)
+    self.assertIsNotNone(store.get_reply_draft(w_cfg_only))
+
+    # 6. >=25 unlinked scratch drafts skip get-draft on Sync 2+, and >100 surviving draft covers tid
+    get_draft_calls: list[str] = []
+    store.upsert_artifact(
+        "gmail_draft:r_101_surv",
+        kind="gmail_draft",
+        state={
+            "status": "DRAFT",
+            "thread_id": "1a19over100",
+            "draft_updated_ts": now + 70,
+            "from_workbench_draft": True,
+        },
+        now=now + 70,
+    )
+    store.link_artifact(w_cfg, "gmail_draft:r_101_surv", role="channel", now=now + 70)
+
+    def fake_100_drafts(
+        cmd: list[str], *args: object, **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+      del args, kwargs
+      res = subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+      if "drafts" in cmd and "get-draft" not in cmd:
+        res.stdout = json.dumps([
+            {"id": f"r_scratch_{i:03d}", "threadId": f"t_scr_{i:03d}"} for i in range(100)
+        ])
+      elif "get-draft" in cmd:
+        did = cmd[cmd.index("get-draft") + 1]
+        get_draft_calls.append(did)
+        res.stdout = json.dumps({
+            "id": did,
+            "message": {
+                "id": f"m_{did}",
+                "threadId": "1a19over100" if did == "r_101_surv" else f"t_{did}",
+                "internalDate": str(int((now + 70) * 1000)),
+                "payload": {"headers": [], "body": {"data": ""}},
+            },
+        })
+      elif "search" in cmd:
+        q_str = cmd[cmd.index("search") + 1]
+        if "in:inbox" in q_str:
+          res.stdout = json.dumps([{"id": "m_ov100", "threadId": "1a19over100"}])
+        else:
+          res.stdout = json.dumps([])
+      elif "get-thread" in cmd:
+        res.stdout = json.dumps({
+            "messages": [{
+                "id": "m_ov100",
+                "internalDate": str(int((now + 50) * 1000)),
+                "labelIds": ["INBOX", "CATEGORY_PERSONAL"],
+                "payload": {
+                    "mimeType": "text/plain",
+                    "headers": [
+                        {"name": "Subject", "value": "Over 100 draft coverage"},
+                        {"name": "From", "value": "Peer <peer@google.com>"},
+                        {"name": "To", "value": "Julia Lavrova <jlavrova@google.com>"},
+                    ],
+                    "body": {"data": b64_in},
+                },
+            }]
+        })
+      return res
+
+    ws_100: dict[str, object] = {
+        "active_draft_ids": [f"r_scratch_{i:03d}" for i in range(100)] + ["r_101_surv"]
+    }
+    with mock.patch("os.path.isfile", return_value=True), mock.patch(
+        "subprocess.run", side_effect=fake_100_drafts
+    ):
+      tray_100 = ingestor.ingest_gmail_drafts_and_threads(store, ws_100, now=now + 80)
+    self.assertFalse(any(d == "r_scratch_030" for d in get_draft_calls))
+    self.assertEqual([t["thread_id"] for t in tray_100], [])
+
+    # 7. Plain-text URL escaping/punctuation + effective_upd idempotency after mat_at
+    rendered_pt = ingestor._render_plain_text_draft_html(
+        "See https://example.com/a?x=1&y=2, and "
+        "(https://skia-review.googlesource.com/c/skia/+/1414016)."
+    )
+    self.assertIn(
+        '<a href="https://example.com/a?x=1&amp;y=2">https://example.com/a?x=1&amp;y=2</a>,',
+        rendered_pt,
+    )
+    self.assertNotIn("&amp;amp;", rendered_pt)
+    self.assertIn(
+        '(<a href="https://skia-review.googlesource.com/c/skia/+/1414016">'
+        "https://skia-review.googlesource.com/c/skia/+/1414016</a>).",
+        rendered_pt,
+    )
+    w_idemp = store.create_work("Idempotent save", now=now + 90)
+    store.save_reply_draft(
+        w_idemp, "Same body", fmt="text", to="a@google.com", subject="Subj", now=now + 90
+    )
+    store.record_materialized_reply_draft(w_idemp, "r_idemp_1", subject="Subj", now=now + 100)
+    rd_same = store.save_reply_draft(
+        w_idemp, "Same body", fmt="text", to="a@google.com", subject="Subj", now=now + 150
+    )
+    self.assertLessEqual(rd_same["updated_at"], 100.0 + now)
+    # Metadata changes after materialization must advance updated_at
+    rd_diff_to = store.save_reply_draft(
+        w_idemp, "Same body", fmt="text", to="c@google.com", subject="Subj", now=now + 110
+    )
+    self.assertEqual(rd_diff_to["updated_at"], now + 110)
+
+    # 8. Format detector, XSS/entity/C++ template preview parity, JS editor state, and workctl CLI
+    self.assertEqual(
+        workbench_server._detect_draft_format(
+            'Hi Renzo,\n\nSee <a href="https://example.com">CL</a>'
+        ),
+        "html",
+    )
+    self.assertEqual(
+        workbench_server._detect_draft_format("Fixed SkSpan<const Run> bounds"),
+        "text",
+    )
+    prev_text = workbench_server._render_safe_draft_preview({
+        "body": "Fixed SkSpan<const Run> in https://skia-review.googlesource.com/c/skia/+/1414016.",
+        "format": "text",
+    })
+    self.assertIn("&lt;const Run&gt;", prev_text)
+    self.assertIn('href="https://skia-review.googlesource.com/c/skia/+/1414016"', prev_text)
+    prev_html = workbench_server._render_safe_draft_preview({
+        "body": (
+            '<p>R&amp;D <a href="https://example.com?a=1&amp;b=2">A &amp; B</a>'
+            '<script>alert(1)</script><a href="javascript:alert(1)">bad</a></p>'
+        ),
+        "format": "html",
+    })
+    self.assertNotIn("<script>", prev_html)
+    self.assertNotIn("javascript:", prev_html)
+    self.assertNotIn("&amp;amp;", prev_html)
+    self.assertIn("R&amp;D", prev_html)
+    self.assertIn('href="https://example.com?a=1&amp;b=2"', prev_html)
+    self.assertIn(">A &amp; B</a>", prev_html)
+
+    full_ssr = workbench_server.render_workbench_html(
+        store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now + 160), 1
+    )
+    self.assertIn("setSelectionRange", full_ssr)
+    self.assertIn("const ok = await postJson", full_ssr)
+
+    # workctl mutually_exclusive_group + draft-show --json + draft-clear
+    with self.assertRaises(SystemExit):
+      workctl.main(["--db", self.db_path, "draft-set", w_idemp, "--body", "x", "--html", "--text"])
+    with self.assertRaises(SystemExit):
+      workctl.main([
+          "--db",
+          self.db_path,
+          "draft-set",
+          w_idemp,
+          "--body",
+          "x",
+          "--auto-gate",
+          "--no-auto-gate",
+      ])
+    self.assertEqual(workctl.main(["--db", self.db_path, "draft-show", w_idemp, "--json"]), 0)
+    with mock.patch(
+        "ingestor.materialize_reply_draft",
+        return_value={"draft_id": "r_cli", "draft_key": "gmail_draft:r_cli", "url": "https://x"},
+    ):
+      self.assertEqual(
+          workctl.main(["--db", self.db_path, "draft-materialize", w_idemp, "--json"]), 0
+      )
+    self.assertEqual(workctl.main(["--db", self.db_path, "draft-clear", w_idemp]), 0)
+    self.assertIsNone(store.get_reply_draft(w_idemp))
+
 
 if __name__ == "__main__":
   unittest.main()

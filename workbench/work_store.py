@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 import contextlib
 from datetime import datetime
 import glob
@@ -1390,14 +1390,257 @@ def compute_artifact_provenance(
   return reason or "связано", detail or "Связанный артефакт задачи"
 
 
+_DUMMY_DRAFT_IDS = frozenset({
+    "12345",
+    "123456",
+    "1234567",
+    "12345678",
+    "123456789",
+})
+_RE_DRAFT_GH_HOVERCARD_ATTR = re.compile(
+    r'data-(?:url|hydro-click)=(["\'])(?:(?!\1).)*?'
+    r"github\.com/flutter/flutter/issues/\d+(?:(?!\1).)*?\1",
+    re.IGNORECASE,
+)
+_RE_DRAFT_MENTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            r"(?:skia-review\.googlesource\.com/c/skia/\+/"
+            r"|\b(?:Skia\s+)?CL\s+|\bGerrit\s+)(\d{6,8})\b",
+            re.IGNORECASE,
+        ),
+        "gerrit:skia:",
+    ),
+    (
+        re.compile(
+            r"(?:chromium-review\.googlesource\.com/c/chromium/src/\+/"
+            r"|\bcrrev(?:\.com)?/c/)(\d{6,8})\b",
+            re.IGNORECASE,
+        ),
+        "gerrit:chromium:",
+    ),
+    (
+        re.compile(
+            r"(?:github\.com/flutter/flutter/pull/|\bPR\s+#)(\d{4,7})\b",
+            re.IGNORECASE,
+        ),
+        "github_pr:flutter/flutter:",
+    ),
+    (
+        re.compile(
+            r"(?:github\.com/flutter/flutter/issues/|\bflutter#)(\d{4,7})\b",
+            re.IGNORECASE,
+        ),
+        "github_issue:flutter/flutter:",
+    ),
+    (
+        re.compile(r"(?:http://cl/|\bcl/|\bCL\s+)(\d{9,10})\b", re.IGNORECASE),
+        "piper:",
+    ),
+    (
+        re.compile(
+            r"(?:(?:b\.corp\.google\.com|issues\.chromium\.org)/issues/"
+            r"|\b(?:b|crbug(?:\.com)?)/)(\d{7,10})\b",
+            re.IGNORECASE,
+        ),
+        "buganizer:",
+    ),
+    (
+        re.compile(r"docs\.google\.com/document/d/([A-Za-z0-9_\-]{20,64})", re.IGNORECASE),
+        "gdoc:",
+    ),
+)
+
+
+def _wb_draft_obligation_id(work_id: str) -> str:
+  """Returns the deterministic obligation ID for a Work's live Workbench reply draft."""
+  digest = hashlib.sha1(f"wbdraft:{work_id}".encode("utf-8")).hexdigest()[:10]
+  return f"ob-wbdraft-{digest}"
+
+
+def _is_thread_covered_by_draft_ts(
+    thread_state: Mapping[str, Any] | None, draft_updated_ts: float
+) -> bool:
+  """Returns True when no unacknowledged counterparty message is newer than the draft."""
+  st = thread_state or {}
+  if bool(st.get("last_from_me")):
+    return True
+  last_ts = float(st.get("last_message_ts") or 0.0)
+  if last_ts <= 0.0:
+    return draft_updated_ts > 0.0
+  covered_floor = max(
+      draft_updated_ts,
+      float(st.get("ack_message_ts") or 0.0),
+      float(st.get("manual_wait_ts") or 0.0),
+      float(st.get("mcp_reply_ts") or 0.0),
+      float(st.get("resolved_at") or 0.0),
+  )
+  return covered_floor >= last_ts
+
+
+def _active_reply_draft_from_meta(raw_meta_json: Any) -> dict[str, Any] | None:
+  """Extracts an active unsent reply_draft dict from a Work's meta_json payload."""
+  if isinstance(raw_meta_json, Mapping):
+    meta = dict(raw_meta_json)
+  else:
+    try:
+      meta = json.loads(str(raw_meta_json or "{}"))
+    except Exception:
+      meta = {}
+  rd = meta.get("reply_draft")
+  if not isinstance(rd, Mapping):
+    return None
+  if float(rd.get("sent_at") or 0.0) > 0.0:
+    return None
+  if not str(rd.get("body") or "").strip():
+    return None
+  return dict(rd)
+
+
+def _extract_draft_mentioned_keys(text: str) -> list[str]:
+  """Extracts canonical CL/PR/bug/doc artifact keys referenced in a reply draft."""
+  raw = str(text or "")
+  if not raw:
+    return []
+  # Mask GitHub PR hovercard /issues/<N> attributes so PR links never emit phantom issues
+  masked_issue_text = _RE_DRAFT_GH_HOVERCARD_ATTR.sub(
+      lambda m: " " * len(m.group(0)), raw
+  )
+  hits: list[tuple[int, str]] = []
+  pr_nums: set[str] = set()
+  for rx, prefix in _RE_DRAFT_MENTION_PATTERNS:
+    scan_target = masked_issue_text if prefix == "github_issue:flutter/flutter:" else raw
+    for m in rx.finditer(scan_target):
+      num = m.group(1)
+      if prefix != "gdoc:" and num in _DUMMY_DRAFT_IDS:
+        continue
+      if prefix == "github_pr:flutter/flutter:":
+        pr_nums.add(num)
+      hits.append((m.start(), f"{prefix}{num}"))
+  hits.sort(key=lambda x: x[0])
+  ordered: list[str] = []
+  seen: set[str] = set()
+  for _, key in hits:
+    if key.startswith("github_issue:flutter/flutter:") and key.split(":")[-1] in pr_nums:
+      continue
+    ck = canonicalize_artifact_key(key)
+    if ck not in seen:
+      seen.add(ck)
+      ordered.append(ck)
+  return ordered
+
+
+def _merge_reply_draft_meta(
+    target_meta_raw: Any, source_meta_raw: Any
+) -> dict[str, Any] | None:
+  """Copies an active newer reply_draft from source_meta into target_meta; returns updated dict."""
+  try:
+    t_meta = (
+        dict(target_meta_raw)
+        if isinstance(target_meta_raw, Mapping)
+        else json.loads(str(target_meta_raw or "{}"))
+    )
+  except Exception:
+    t_meta = {}
+  src_rd = _active_reply_draft_from_meta(source_meta_raw)
+  if src_rd is None:
+    return None
+  tgt_rd = _active_reply_draft_from_meta(t_meta)
+  if tgt_rd is not None and float(tgt_rd.get("updated_at") or 0.0) >= float(
+      src_rd.get("updated_at") or 0.0
+  ):
+    return None
+  t_meta["reply_draft"] = src_rd
+  return t_meta
+
+
+def _build_auto_gate_spec(
+    work_title: str,
+    w_roles: Mapping[str, str],
+    art_rows: Mapping[str, Mapping[str, Any]],
+    reply_draft: Mapping[str, Any],
+) -> tuple[str, str]:
+  """Builds (trigger_expr, description) across non-companion primary CLs/bugs for auto_gate."""
+  mentioned = [canonicalize_artifact_key(str(k)) for k in (reply_draft.get("mentioned_keys") or [])]
+  subj_lbl = str(reply_draft.get("subject") or "").strip()
+  if not subj_lbl:
+    t_key = str(reply_draft.get("thread_key") or "")
+    t_row = art_rows.get(t_key) or {}
+    t_st = t_row.get("state") if isinstance(t_row.get("state"), Mapping) else {}
+    subj_lbl = str(t_st.get("root_subject") or t_row.get("title") or work_title).strip()
+
+  is_flutter = "flutter" in work_title.lower() or "flutter" in subj_lbl.lower()
+  if not is_flutter:
+    for ak, role in w_roles.items():
+      if role == "context_only":
+        continue
+      if ak.startswith(("github_issue:flutter/flutter:", "github_pr:flutter/flutter:")):
+        is_flutter = True
+        break
+      ar = art_rows.get(ak) or {}
+      if ak.startswith("gmail_thread:") and "flutter" in str(ar.get("title") or "").lower():
+        is_flutter = True
+        break
+  if not is_flutter and any(k.startswith("github_issue:flutter/flutter:") for k in mentioned):
+    is_flutter = True
+
+  # Exclude review scratchpad companion CLs so abandoned probes never block draft readiness
+  primary_cls: list[str] = []
+  primary_bugs: list[str] = []
+  for ak in sorted(w_roles.keys()):
+    if w_roles[ak] != "primary":
+      continue
+    if ak.startswith(("gerrit:", "github_pr:", "piper:")):
+      ar = art_rows.get(ak) or {}
+      st = ar.get("state") if isinstance(ar.get("state"), Mapping) else {}
+      if not is_companion_artifact(ak, st, str(ar.get("title") or "")):
+        primary_cls.append(ak)
+    elif ak.startswith(("buganizer:", "github_issue:")):
+      primary_bugs.append(ak)
+
+  preds: list[str] = []
+  for ck in primary_cls:
+    if ck.startswith("gerrit:skia:") and is_flutter:
+      preds.append(f"cl_merged({ck}) AND rolled_into(Flutter, {ck})")
+    else:
+      preds.append(f"cl_merged({ck})")
+  if not preds:
+    for bk in primary_bugs:
+      preds.append(f"bug_closed({bk})")
+  if not preds:
+    return "", ""
+
+  short_subj = subj_lbl or work_title or "thread"
+  if primary_cls:
+    suffix = "land & roll into Flutter" if is_flutter else "merge"
+    desc = f"Materialize & send reply in '{short_subj}' once linked CLs {suffix}"
+  else:
+    desc = f"Materialize & send reply in '{short_subj}' once linked bugs close"
+  return " AND ".join(preds), desc
+
+
 def build_work_checklist(
     w_arts: list[dict[str, Any]],
     art_rows: Mapping[str, dict[str, Any]],
+    reply_draft: Mapping[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
   """Builds the per-bug CL/PR pipeline checklist and obligation progress summary."""
   draft_mentioned_keys: set[str] = set()
   ordered_bug_keys: list[str] = []
   has_draft = False
+  has_wb_reply_draft = False
+
+  if reply_draft and str(reply_draft.get("body") or "").strip():
+    has_draft = True
+    has_wb_reply_draft = True
+    wb_mks = reply_draft.get("mentioned_keys") or _extract_draft_mentioned_keys(
+        f"{reply_draft.get('subject') or ''}\n{reply_draft.get('body') or ''}"
+    )
+    for mk in wb_mks:
+      ck = canonicalize_artifact_key(str(mk))
+      draft_mentioned_keys.add(ck)
+      if ck.startswith(("github_issue:", "buganizer:")) and ck not in ordered_bug_keys:
+        ordered_bug_keys.append(ck)
 
   # Preserve the exact bug order from the active Gmail draft when one is attached
   for a in w_arts:
@@ -1550,9 +1793,11 @@ def build_work_checklist(
       rolled_fl = (
           (bool(fl_roll) if isinstance(fl_roll, bool) else bool((fl_roll or {}).get("rolled")))
           if ckey.startswith("gerrit:")
-          else (c_status == "MERGED")
+          else (c_status in ("MERGED", "SUBMITTED"))
       )
-      in_draft = (not draft_mentioned_keys) or (ckey in draft_mentioned_keys)
+      in_draft = (not draft_mentioned_keys and not has_wb_reply_draft) or (
+          ckey in draft_mentioned_keys
+      )
       upd = str(st.get("status_changed_et") or st.get("last_msg_et") or "")
       age = str(st.get("status_changed_age") or st.get("last_msg_age") or "")
       upd_label = f"{upd} ({age})" if (upd and age and age not in upd) else upd
@@ -1577,7 +1822,7 @@ def build_work_checklist(
 
     draft_outdated = bool(
         has_draft
-        and draft_mentioned_keys
+        and (draft_mentioned_keys or has_wb_reply_draft)
         and cl_items
         and any(not c["in_draft"] for c in cl_items)
     )
@@ -1660,6 +1905,7 @@ def _eval_single_predicate(
     work_row: Mapping[str, Any],
     now: float,
 ) -> str:
+  """Evaluates one obligation predicate into 3-valued logic ('true'|'false'|'unknown')."""
   expr = pred.strip()
   if not expr or expr.lower() == "always":
     return "true"
@@ -1673,7 +1919,8 @@ def _eval_single_predicate(
     status = str((art.get("state") or {}).get("status") or "").upper()
     if not status:
       return "unknown"
-    return "true" if status == "MERGED" else "false"
+    # Piper CLs report SUBMITTED once landed while Gerrit and GitHub PRs report MERGED
+    return "true" if status in ("MERGED", "SUBMITTED") else "false"
 
   m_roll = re.match(
       r"^rolled_into\(\s*([A-Za-z0-9_]+)\s*,\s*([^)]+?)\s*\)$",
@@ -1811,26 +2058,34 @@ def _is_done_matched(
     st = art.get("state") or {}
     return bool(st.get("resolved")) and bool(st.get("resolved_by_me"))
 
-  m_reply = re.match(r"^reply_sent\(\s*([^)]+?)\s*\)$", matcher, re.IGNORECASE)
+  m_reply = re.match(
+      r"^(?:reply_sent|draft_sent)\(\s*([^)]+?)\s*\)$", matcher, re.IGNORECASE
+  )
   check_key = canonicalize_artifact_key(m_reply.group(1)) if m_reply else target_key
   if not check_key:
     return False
   art = artifacts_by_key.get(check_key)
-  if not art:
-    return False
-  st = art.get("state") or {}
-  kind = str(art.get("kind") or "")
-  if kind == "gmail_draft" and str(st.get("status") or "").upper() == "SENT":
-    return True
-  # Require the obligation trigger to have fired before counting a reply as satisfying the promise
-  if trigger_eval != "true":
-    return False
-  if kind in ("gmail_thread", "gchat_thread", "gdoc_thread"):
-    last_from_me = bool(st.get("last_from_me"))
-    last_ts = float(st.get("last_message_ts") or 0.0)
-    floor_ts = max(created_at, ready_at)
-    if last_from_me and last_ts > floor_ts:
+  if art:
+    st = art.get("state") or {}
+    kind = str(art.get("kind") or "")
+    if kind == "gmail_draft" and str(st.get("status") or "").upper() == "SENT":
       return True
+    # Require the obligation trigger to have fired before counting a reply as satisfying the promise
+    if trigger_eval == "true" and kind in ("gmail_thread", "gchat_thread", "gdoc_thread"):
+      last_from_me = bool(st.get("last_from_me"))
+      last_ts = float(st.get("last_message_ts") or 0.0)
+      if last_from_me and last_ts > max(created_at, ready_at):
+        return True
+  # Also allow direct post-ready thread replies when done_matcher targeted a materialized draft
+  canon_target = canonicalize_artifact_key(target_key) if target_key else ""
+  if trigger_eval == "true" and canon_target and canon_target != check_key:
+    t_art = artifacts_by_key.get(canon_target)
+    if t_art and str(t_art.get("kind") or "") in ("gmail_thread", "gchat_thread", "gdoc_thread"):
+      t_st = t_art.get("state") or {}
+      if bool(t_st.get("last_from_me")) and float(t_st.get("last_message_ts") or 0.0) > max(
+          created_at, ready_at
+      ):
+        return True
   return False
 
 
@@ -1972,11 +2227,25 @@ class WorkStore:
       meta: Mapping[str, Any] | None = None,
       now: float | None = None,
   ) -> str:
+    """Creates or updates an active Work while preserving existing created_at and meta_json keys."""
     cur_now = time.time() if now is None else now
     if not work_id:
       digest = hashlib.sha1(f"{title}:{project_id}:{cur_now}".encode("utf-8")).hexdigest()[:10]
       work_id = f"work-{digest}"
     with self._lock, self._connect() as conn:
+      # Preserve existing created_at and reply_draft when re-minting a deterministic work_id
+      existing_w = conn.execute(
+          "SELECT created_at, meta_json FROM works WHERE work_id = ?", (work_id,)
+      ).fetchone()
+      created_ts = float(existing_w["created_at"]) if existing_w else cur_now
+      merged_meta: dict[str, Any] = {}
+      if existing_w and existing_w["meta_json"]:
+        try:
+          merged_meta = json.loads(existing_w["meta_json"])
+        except Exception:
+          merged_meta = {}
+      if meta:
+        merged_meta.update(dict(meta))
       conn.execute(
           "INSERT OR REPLACE INTO works "
           "(work_id, title, status, project_id, roadmap_item_key, "
@@ -1987,9 +2256,9 @@ class WorkStore:
               title.strip(),
               project_id.strip(),
               roadmap_item_key.strip(),
+              created_ts,
               cur_now,
-              cur_now,
-              json.dumps(dict(meta or {})),
+              json.dumps(merged_meta),
           ),
       )
       self._log_event(
@@ -2161,6 +2430,7 @@ class WorkStore:
       state: Mapping[str, Any] | None = None,
       now: float | None = None,
   ) -> str:
+    """Upserts an artifact row, merging state_json monotonically and returning its canonical key."""
     cur_now = time.time() if now is None else now
     akey = canonicalize_artifact_key(artifact_key)
     akind = kind or artifact_kind_from_key(akey)
@@ -2202,11 +2472,21 @@ class WorkStore:
         )
         if ack_floor > 0 and cur_msg_ts <= ack_floor:
           merged_state["unanswered_human"] = False
+        # Outbound replies satisfy inbound unanswered_human even on partial state updates
+        if bool(merged_state.get("last_from_me")):
+          merged_state["unanswered_human"] = False
         # Clear sticky MCP resolve flags when a newer comment reopens the #disco thread
         if resolved_ts > 0 and "resolved" not in state and cur_msg_ts > resolved_ts:
           merged_state["resolved"] = False
           merged_state["resolved_by_me"] = False
           merged_state["resolved_externally"] = False
+      # Pin initial timestamp on Gmail drafts so 90s re-syncs never advance draft_updated_ts
+      if (
+          akind == "gmail_draft"
+          and str(merged_state.get("status") or "DRAFT").upper() == "DRAFT"
+          and not merged_state.get("draft_updated_ts")
+      ):
+        merged_state["draft_updated_ts"] = cur_now
       # Never overwrite a descriptive stored title with a raw artifact_key placeholder
       existing_title = str(existing["title"] or "") if existing else ""
       if (
@@ -2393,11 +2673,36 @@ class WorkStore:
   def unlink_artifact(
       self, work_id: str, artifact_key: str, now: float | None = None
   ) -> None:
+    """Detaches artifact_key from work_id, records a tombstone, and refreshes obligations."""
     cur_now = time.time() if now is None else now
     akey = canonicalize_artifact_key(artifact_key)
     with self._lock, self._connect() as conn:
       conn.execute(
           "DELETE FROM work_links WHERE work_id = ? AND artifact_key = ?",
+          (work_id, akey),
+      )
+      # Clear stale reply_draft thread bindings when detaching the bound email thread
+      w_row = conn.execute(
+          "SELECT meta_json FROM works WHERE work_id = ?", (work_id,)
+      ).fetchone()
+      if w_row:
+        try:
+          w_meta = json.loads(w_row["meta_json"] or "{}")
+        except Exception:
+          w_meta = {}
+        rd = w_meta.get("reply_draft")
+        if isinstance(rd, Mapping) and str(rd.get("thread_key") or "").strip() == akey:
+          rd_copy = dict(rd)
+          rd_copy["thread_key"] = ""
+          w_meta["reply_draft"] = rd_copy
+          conn.execute(
+              "UPDATE works SET meta_json = ?, updated_at = ? WHERE work_id = ?",
+              (json.dumps(w_meta), cur_now, work_id),
+          )
+      conn.execute(
+          "UPDATE obligations SET target_artifact_key = '' "
+          "WHERE work_id = ? AND target_artifact_key = ? "
+          "AND obligation_id LIKE 'ob-wbdraft-%'",
           (work_id, akey),
       )
       # Close correspondence umbrellas when their underlying channel is detached from the Work
@@ -2419,6 +2724,8 @@ class WorkStore:
           artifact_key=akey,
           now=cur_now,
       )
+    self.reconcile_correspondence_obligations(work_id, now=cur_now)
+    self.evaluate_all_obligations(now=cur_now)
 
   def get_work_artifact_keys(self, work_id: str) -> list[str]:
     with self._lock, self._connect() as conn:
@@ -2553,6 +2860,472 @@ class WorkStore:
     self.evaluate_all_obligations(now=cur_now)
     return ob_id
 
+  def save_reply_draft(
+      self,
+      work_id: str,
+      body: str,
+      *,
+      fmt: str = "html",
+      thread_key: str = "",
+      to: str = "",
+      cc: str = "",
+      subject: str = "",
+      trigger_expr: str = "",
+      auto_gate: bool | None = None,
+      mentioned_keys: Iterable[str] | None = None,
+      now: float | None = None,
+  ) -> dict[str, Any]:
+    """Saves or updates a Work's live reply draft in works.meta_json without touching Gmail."""
+    cur_now = time.time() if now is None else now
+    clean_body = str(body or "").strip()
+    if not clean_body:
+      raise ValueError("Reply draft body cannot be empty")
+    norm_fmt = "text" if str(fmt or "").strip().lower() == "text" else "html"
+
+    with self._lock, self._connect() as conn:
+      w_row = conn.execute(
+          "SELECT title, meta_json FROM works WHERE work_id = ?", (work_id,)
+      ).fetchone()
+      if not w_row:
+        raise ValueError(f"Unknown work_id: {work_id}")
+      work_title = str(w_row["title"] or "")
+      try:
+        w_meta = json.loads(w_row["meta_json"] or "{}")
+      except Exception:
+        w_meta = {}
+      prev_rd = w_meta.get("reply_draft") if isinstance(w_meta.get("reply_draft"), Mapping) else {}
+      if float(prev_rd.get("sent_at") or 0.0) > 0.0:
+        prev_rd = {}
+
+      wl_rows = conn.execute(
+          "SELECT artifact_key, role FROM work_links WHERE work_id = ? ORDER BY created_at ASC",
+          (work_id,),
+      ).fetchall()
+      w_roles = {str(r["artifact_key"]): str(r["role"]) for r in wl_rows}
+      art_rows: dict[str, dict[str, Any]] = {}
+      for r in conn.execute("SELECT * FROM artifacts").fetchall():
+        ad = dict(r)
+        try:
+          ad["state"] = json.loads(ad.get("state_json") or "{}")
+        except Exception:
+          ad["state"] = {}
+        art_rows[str(ad["artifact_key"])] = ad
+
+      eff_to = str(to.strip() or prev_rd.get("to") or "")
+      eff_cc = str(cc.strip() or prev_rd.get("cc") or "")
+      eff_subj = str(subject.strip() or prev_rd.get("subject") or "")
+      resolved_thread = canonicalize_artifact_key(thread_key) if thread_key.strip() else ""
+      if not resolved_thread:
+        prev_tkey = str(prev_rd.get("thread_key") or "").strip()
+        if prev_tkey in w_roles:
+          resolved_thread = prev_tkey
+      is_standalone_compose = bool(
+          to.strip() and subject.strip() and not thread_key.strip() and not resolved_thread
+      )
+      if not resolved_thread and not is_standalone_compose:
+        # Prefer primary human correspondence over channel; skip automated bot notification threads
+        for pref_role in ("primary", "channel"):
+          for ak, r_val in w_roles.items():
+            if r_val != pref_role or not ak.startswith("gmail_thread:"):
+              continue
+            ak_st = (art_rows.get(ak) or {}).get("state")
+            if is_active_correspondence_artifact(
+                "gmail_thread", ak_st if isinstance(ak_st, Mapping) else {}
+            ):
+              resolved_thread = ak
+              break
+          if resolved_thread:
+            break
+
+      extracted_keys = (
+          [canonicalize_artifact_key(str(k)) for k in mentioned_keys]
+          if mentioned_keys is not None
+          else _extract_draft_mentioned_keys(f"{eff_subj}\n{clean_body}")
+      )
+      use_auto_gate = (
+          bool(prev_rd.get("auto_gate", True)) if auto_gate is None else bool(auto_gate)
+      )
+      mat_key = str(prev_rd.get("materialized_draft_key") or "")
+      mat_at = float(prev_rd.get("materialized_at") or 0.0)
+      # Preserve updated_at across no-op saves so materialized drafts are not flagged outdated
+      same_body = str(prev_rd.get("body") or "").strip() == clean_body
+      unchanged_content = (
+          bool(prev_rd)
+          and same_body
+          and prev_rd.get("format") == norm_fmt
+          and prev_rd.get("to", "") == eff_to
+          and prev_rd.get("cc", "") == eff_cc
+          and prev_rd.get("subject", "") == eff_subj
+          and prev_rd.get("thread_key", "") == resolved_thread
+      )
+      effective_upd = (
+          float(prev_rd.get("updated_at") or cur_now) if unchanged_content else cur_now
+      )
+
+      rd_payload: dict[str, Any] = {
+          "body": clean_body,
+          "format": norm_fmt,
+          "thread_key": resolved_thread,
+          "to": eff_to,
+          "cc": eff_cc,
+          "subject": eff_subj,
+          "mentioned_keys": extracted_keys,
+          "auto_gate": use_auto_gate,
+          "updated_at": effective_upd,
+          "materialized_draft_key": mat_key,
+          "materialized_at": mat_at,
+          "sent_at": 0.0,
+      }
+      w_meta["reply_draft"] = rd_payload
+      conn.execute(
+          "UPDATE works SET meta_json = ?, updated_at = ? WHERE work_id = ?",
+          (json.dumps(w_meta), cur_now, work_id),
+      )
+
+      explicit_trig = str(trigger_expr or "").strip()
+      auto_trig, auto_desc = (
+          _build_auto_gate_spec(work_title, w_roles, art_rows, rd_payload)
+          if (use_auto_gate and not explicit_trig)
+          else ("", "")
+      )
+      final_trig = explicit_trig or auto_trig
+      ob_id = _wb_draft_obligation_id(work_id)
+      existing_ob = conn.execute(
+          "SELECT status, meta_json FROM obligations WHERE obligation_id = ?", (ob_id,)
+      ).fetchone()
+
+      if final_trig:
+        t_art = art_rows.get(resolved_thread) or {}
+        t_st = t_art.get("state") if isinstance(t_art.get("state"), Mapping) else {}
+        subj_label = (
+            rd_payload["subject"]
+            or str(t_st.get("root_subject") or t_art.get("title") or work_title).strip()
+            or work_id
+        )
+        final_desc = auto_desc or f"Materialize & send reply in '{subj_label}'"
+        done_ref = mat_key or resolved_thread
+        final_done = f"reply_sent({done_ref})" if done_ref else ""
+        ob_meta: dict[str, Any] = {}
+        if existing_ob and existing_ob["meta_json"]:
+          try:
+            ob_meta = json.loads(existing_ob["meta_json"])
+          except Exception:
+            ob_meta = {}
+        ob_meta["wb_reply_draft"] = True
+        ob_meta["auto_gate"] = use_auto_gate and not explicit_trig
+        ob_meta["draft_updated_ts"] = cur_now
+        if existing_ob:
+          next_st = "open" if str(existing_ob["status"]) == "done" else str(existing_ob["status"])
+          conn.execute(
+              "UPDATE obligations SET target_artifact_key = ?, description = ?, "
+              "trigger_expr = ?, done_matcher = ?, status = ?, satisfied_at = 0, meta_json = ? "
+              "WHERE obligation_id = ?",
+              (
+                  resolved_thread,
+                  final_desc,
+                  final_trig,
+                  final_done,
+                  next_st,
+                  json.dumps(ob_meta),
+                  ob_id,
+              ),
+          )
+        else:
+          conn.execute(
+              "INSERT INTO obligations "
+              "(obligation_id, work_id, target_artifact_key, kind, description, "
+              "trigger_expr, done_matcher, status, last_eval, created_at, satisfied_at, meta_json) "
+              "VALUES (?, ?, ?, 'reply', ?, ?, ?, 'open', 'unknown', ?, 0, ?)",
+              (
+                  ob_id,
+                  work_id,
+                  resolved_thread,
+                  final_desc,
+                  final_trig,
+                  final_done,
+                  cur_now,
+                  json.dumps(ob_meta),
+              ),
+          )
+      elif existing_ob:
+        try:
+          ob_meta = json.loads(existing_ob["meta_json"] or "{}")
+        except Exception:
+          ob_meta = {}
+        # Retire stale parked obligations when auto_gate is disabled or has zero primary targets
+        if (not use_auto_gate) or bool(ob_meta.get("auto_gate", True)):
+          conn.execute(
+              "UPDATE obligations SET status = 'done', satisfied_at = ? WHERE obligation_id = ?",
+              (cur_now, ob_id),
+          )
+        else:
+          ob_meta["draft_updated_ts"] = cur_now
+          conn.execute(
+              "UPDATE obligations SET meta_json = ? WHERE obligation_id = ?",
+              (json.dumps(ob_meta), ob_id),
+          )
+
+      self._log_event(
+          conn,
+          "reply_draft_saved",
+          work_id=work_id,
+          artifact_key=resolved_thread,
+          payload={"format": norm_fmt, "auto_gate": use_auto_gate},
+          now=cur_now,
+      )
+
+    self.reconcile_correspondence_obligations(work_id, now=cur_now)
+    self.evaluate_all_obligations(now=cur_now)
+    return dict(rd_payload)
+
+  def get_reply_draft(self, work_id: str) -> dict[str, Any] | None:
+    """Returns the active unsent reply_draft dict for work_id, or None when absent/sent."""
+    with self._lock, self._connect() as conn:
+      row = conn.execute(
+          "SELECT meta_json FROM works WHERE work_id = ?", (work_id,)
+      ).fetchone()
+      if not row:
+        return None
+      return _active_reply_draft_from_meta(row["meta_json"])
+
+  def clear_reply_draft(self, work_id: str, now: float | None = None) -> None:
+    """Clears the live reply draft on work_id and restores normal correspondence tracking."""
+    cur_now = time.time() if now is None else now
+    ob_id = _wb_draft_obligation_id(work_id)
+    with self._lock, self._connect() as conn:
+      row = conn.execute(
+          "SELECT meta_json FROM works WHERE work_id = ?", (work_id,)
+      ).fetchone()
+      if row:
+        try:
+          w_meta = json.loads(row["meta_json"] or "{}")
+        except Exception:
+          w_meta = {}
+        w_meta.pop("reply_draft", None)
+        conn.execute(
+            "UPDATE works SET meta_json = ?, updated_at = ? WHERE work_id = ?",
+            (json.dumps(w_meta), cur_now, work_id),
+        )
+      conn.execute(
+          "UPDATE obligations SET status = 'done', satisfied_at = ? "
+          "WHERE work_id = ? AND (obligation_id = ? OR obligation_id LIKE 'ob-wbdraft-%') "
+          "AND status IN ('open', 'ready')",
+          (cur_now, work_id, ob_id),
+      )
+      self._log_event(conn, "reply_draft_cleared", work_id=work_id, now=cur_now)
+    self.reconcile_correspondence_obligations(work_id, now=cur_now)
+
+  def list_open_gmail_draft_ids(self) -> tuple[set[str], set[str]]:
+    """Returns (all_open_draft_ids, tracked_open_draft_ids) for active gmail_draft rows."""
+    all_open: set[str] = set()
+    tracked_open: set[str] = set()
+    with self._lock, self._connect() as conn:
+      linked_keys = {
+          str(r["artifact_key"])
+          for r in conn.execute(
+              "SELECT DISTINCT artifact_key FROM work_links "
+              "WHERE artifact_key LIKE 'gmail_draft:%'"
+          ).fetchall()
+      }
+      rows = conn.execute(
+          "SELECT artifact_key, state_json FROM artifacts WHERE kind = 'gmail_draft'"
+      ).fetchall()
+      for r in rows:
+        akey = str(r["artifact_key"] or "")
+        if not akey.startswith("gmail_draft:"):
+          continue
+        did = akey.split(":", 1)[1].strip()
+        if not did:
+          continue
+        try:
+          st = json.loads(r["state_json"] or "{}")
+        except Exception:
+          st = {}
+        if str(st.get("status") or "DRAFT").upper() != "DRAFT":
+          continue
+        all_open.add(did)
+        if akey in linked_keys or st.get("from_workbench_draft") or st.get("mentioned_keys"):
+          tracked_open.add(did)
+    return all_open, tracked_open
+
+  def mark_materialized_draft_discarded(
+      self, draft_key: str, now: float | None = None
+  ) -> None:
+    """Marks a discarded Gmail draft DISCARDED and detaches it from any live reply_draft."""
+    cur_now = time.time() if now is None else now
+    d_key = canonicalize_artifact_key(draft_key)
+    touched_wids: list[str] = []
+    with self._lock, self._connect() as conn:
+      ar = conn.execute(
+          "SELECT state_json FROM artifacts WHERE artifact_key = ?", (d_key,)
+      ).fetchone()
+      st: dict[str, Any] = {}
+      if ar:
+        try:
+          st = json.loads(ar["state_json"] or "{}")
+        except Exception:
+          st = {}
+      st["status"] = "DISCARDED"
+      conn.execute(
+          "UPDATE artifacts SET state_json = ?, updated_at = ? WHERE artifact_key = ?",
+          (json.dumps(st), cur_now, d_key),
+      )
+      for w_row in conn.execute("SELECT work_id, meta_json FROM works").fetchall():
+        wid = str(w_row["work_id"])
+        try:
+          w_meta = json.loads(w_row["meta_json"] or "{}")
+        except Exception:
+          w_meta = {}
+        rd = w_meta.get("reply_draft")
+        if not isinstance(rd, Mapping) or rd.get("materialized_draft_key") != d_key:
+          continue
+        rd_copy = dict(rd)
+        rd_copy["materialized_draft_key"] = ""
+        rd_copy["materialized_at"] = 0.0
+        w_meta["reply_draft"] = rd_copy
+        conn.execute(
+            "UPDATE works SET meta_json = ?, updated_at = ? WHERE work_id = ?",
+            (json.dumps(w_meta), cur_now, wid),
+        )
+        t_ref = str(rd_copy.get("thread_key") or "").strip()
+        done_m = f"reply_sent({t_ref})" if t_ref else ""
+        conn.execute(
+            "UPDATE obligations SET done_matcher = ? "
+            "WHERE obligation_id = ? AND status IN ('open', 'ready')",
+            (done_m, _wb_draft_obligation_id(wid)),
+        )
+        touched_wids.append(wid)
+    for wid in touched_wids:
+      self.reconcile_correspondence_obligations(wid, now=cur_now)
+    self.evaluate_all_obligations(now=cur_now)
+
+  def record_materialized_reply_draft(
+      self,
+      work_id: str,
+      draft_id: str,
+      *,
+      thread_id: str = "",
+      subject: str = "",
+      to_hdr: str = "",
+      mentioned_keys: Iterable[str] | None = None,
+      now: float | None = None,
+  ) -> str:
+    """Links a newly created Gmail draft back onto work_id's reply_draft and obligation."""
+    cur_now = time.time() if now is None else now
+    did = str(draft_id or "").strip()
+    if did.startswith("gmail_draft:"):
+      did = did.split(":", 1)[1]
+    d_key = f"gmail_draft:{did}"
+    rd = self.get_reply_draft(work_id) or {}
+    prev_mat_key = str(rd.get("materialized_draft_key") or "").strip()
+    if prev_mat_key.startswith("gmail_draft:") and prev_mat_key != d_key:
+      # Mark superseded force-new Gmail draft DISCARDED so closing the old tab never triggers SENT
+      self.upsert_artifact(
+          prev_mat_key,
+          kind="gmail_draft",
+          state={"status": "DISCARDED", "superseded_by": d_key},
+          now=cur_now,
+      )
+    mks = (
+        [canonicalize_artifact_key(str(k)) for k in mentioned_keys]
+        if mentioned_keys is not None
+        else list(rd.get("mentioned_keys") or [])
+    )
+    bug_keys = [k for k in mks if k.startswith(("buganizer:", "github_issue:"))]
+    eff_tid = str(thread_id or "").strip()
+    if not eff_tid and str(rd.get("thread_key") or "").startswith("gmail_thread:"):
+      eff_tid = str(rd["thread_key"]).split(":", 1)[1]
+    eff_subj = str(subject or rd.get("subject") or f"Draft {did[:8]}").strip()
+    self.upsert_artifact(
+        d_key,
+        kind="gmail_draft",
+        title=f"Draft: {eff_subj}",
+        url=f"https://mail.google.com/mail/u/0/#drafts/{did}",
+        state={
+            "status": "DRAFT",
+            "thread_id": eff_tid,
+            "to": str(to_hdr or rd.get("to") or ""),
+            "mentioned_keys": mks,
+            "draft_bug_keys": bug_keys,
+            "draft_updated_ts": cur_now,
+            "from_workbench_draft": True,
+        },
+        now=cur_now,
+    )
+    self.link_artifact(
+        work_id, d_key, role="channel", source="manual", link_reason="wb_reply_draft", now=cur_now
+    )
+    ob_id = _wb_draft_obligation_id(work_id)
+    t_key = f"gmail_thread:{eff_tid}" if eff_tid else str(rd.get("thread_key") or d_key)
+    with self._lock, self._connect() as conn:
+      w_row = conn.execute(
+          "SELECT title, meta_json FROM works WHERE work_id = ?", (work_id,)
+      ).fetchone()
+      work_title = str(w_row["title"] or "") if w_row else work_id
+      try:
+        w_meta = json.loads((w_row["meta_json"] if w_row else "") or "{}")
+      except Exception:
+        w_meta = {}
+      cur_rd = dict(w_meta.get("reply_draft") or {})
+      cur_rd["materialized_draft_key"] = d_key
+      cur_rd["materialized_at"] = cur_now
+      if eff_tid and not cur_rd.get("thread_key"):
+        cur_rd["thread_key"] = f"gmail_thread:{eff_tid}"
+      w_meta["reply_draft"] = cur_rd
+      conn.execute(
+          "UPDATE works SET meta_json = ?, updated_at = ? WHERE work_id = ?",
+          (json.dumps(w_meta), cur_now, work_id),
+      )
+      ex_ob = conn.execute(
+          "SELECT status, meta_json FROM obligations WHERE obligation_id = ?", (ob_id,)
+      ).fetchone()
+      if ex_ob and str(ex_ob["status"]) in ("open", "ready"):
+        try:
+          ob_meta = json.loads(ex_ob["meta_json"] or "{}")
+        except Exception:
+          ob_meta = {}
+        ob_meta["wb_reply_draft"] = True
+        ob_meta["draft_updated_ts"] = max(
+            float(ob_meta.get("draft_updated_ts") or 0.0), cur_now
+        )
+        conn.execute(
+            "UPDATE obligations SET done_matcher = ?, meta_json = ? WHERE obligation_id = ?",
+            (f"reply_sent({d_key})", json.dumps(ob_meta), ob_id),
+        )
+      else:
+        ob_meta = {
+            "wb_reply_draft": True,
+            "auto_gate": False,
+            "draft_updated_ts": cur_now,
+            "ready_at": cur_now,
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO obligations "
+            "(obligation_id, work_id, target_artifact_key, kind, description, "
+            "trigger_expr, done_matcher, status, last_eval, created_at, satisfied_at, meta_json) "
+            "VALUES (?, ?, ?, 'reply', ?, 'always', ?, 'ready', 'true', ?, 0, ?)",
+            (
+                ob_id,
+                work_id,
+                t_key,
+                f"Send Gmail draft in '{eff_subj or work_title}'",
+                f"reply_sent({d_key})",
+                cur_now,
+                json.dumps(ob_meta),
+            ),
+        )
+      self._log_event(
+          conn,
+          "reply_draft_materialized",
+          work_id=work_id,
+          artifact_key=d_key,
+          payload={"thread_id": eff_tid},
+          now=cur_now,
+      )
+    self.reconcile_correspondence_obligations(work_id, now=cur_now)
+    self.evaluate_all_obligations(now=cur_now)
+    return d_key
+
   def reconcile_work_bug_cls(
       self, work_id: str, now: float | None = None
   ) -> list[str]:
@@ -2676,6 +3449,42 @@ class WorkStore:
             "WHERE obligation_id = ?",
             (ack_ts, json.dumps(ob_meta), obligation_id),
         )
+        # Clear the Work's active reply_draft when the user manually checks off ob-wbdraft-*
+        if obligation_id.startswith("ob-wbdraft-") or bool(ob_meta.get("wb_reply_draft")):
+          wid_s = str(row["work_id"] or "")
+          w_r = conn.execute(
+              "SELECT meta_json FROM works WHERE work_id = ?", (wid_s,)
+          ).fetchone()
+          if w_r:
+            try:
+              wm = json.loads(w_r["meta_json"] or "{}")
+            except Exception:
+              wm = {}
+            if isinstance(wm.get("reply_draft"), Mapping):
+              rd_done = dict(wm["reply_draft"])
+              rd_done["sent_at"] = cur_now
+              mat_k = str(rd_done.get("materialized_draft_key") or "").strip()
+              wm["reply_draft"] = rd_done
+              conn.execute(
+                  "UPDATE works SET meta_json = ?, updated_at = ? WHERE work_id = ?",
+                  (json.dumps(wm), cur_now, wid_s),
+              )
+              if mat_k.startswith("gmail_draft:"):
+                m_ar = conn.execute(
+                    "SELECT state_json FROM artifacts WHERE artifact_key = ?", (mat_k,)
+                ).fetchone()
+                if m_ar:
+                  try:
+                    m_st = json.loads(m_ar["state_json"] or "{}")
+                  except Exception:
+                    m_st = {}
+                  if str(m_st.get("status") or "DRAFT").upper() == "DRAFT":
+                    m_st["status"] = "DISCARDED"
+                    conn.execute(
+                        "UPDATE artifacts SET state_json = ?, updated_at = ? "
+                        "WHERE artifact_key = ?",
+                        (json.dumps(m_st), cur_now, mat_k),
+                    )
         self._log_event(
             conn,
             "obligation_done",
@@ -2887,6 +3696,143 @@ class WorkStore:
             continue
           existing_corr_by_target[t_ak] = o
 
+        # Canonicalize migrated ob-wbdraft IDs after merge_works and sync auto_gate triggers
+        canon_wb_oid = _wb_draft_obligation_id(wid)
+        for o in list(ob_rows):
+          cur_oid = str(o.get("obligation_id") or "")
+          if not cur_oid.startswith("ob-wbdraft-") or cur_oid == canon_wb_oid:
+            continue
+          if any(str(x.get("obligation_id") or "") == canon_wb_oid for x in ob_rows):
+            conn.execute("DELETE FROM obligations WHERE obligation_id = ?", (cur_oid,))
+            ob_rows.remove(o)
+          else:
+            conn.execute(
+                "UPDATE obligations SET obligation_id = ? WHERE obligation_id = ?",
+                (canon_wb_oid, cur_oid),
+            )
+            o["obligation_id"] = canon_wb_oid
+
+        # Refresh auto-gated reply-draft triggers whenever primary CLs or bugs change on the Work
+        active_rd = _active_reply_draft_from_meta(wr["meta_json"])
+        if active_rd is not None and bool(active_rd.get("auto_gate")):
+          w_roles_map = {str(r["artifact_key"]): str(r["role"]) for r in wl_rows}
+          auto_trig, auto_desc = _build_auto_gate_spec(
+              str(wr["title"] or ""), w_roles_map, art_rows, active_rd
+          )
+          existing_wb = next(
+              (x for x in ob_rows if str(x.get("obligation_id") or "") == canon_wb_oid),
+              None,
+          )
+          if auto_trig:
+            rd_tkey = str(active_rd.get("thread_key") or "").strip()
+            if rd_tkey and rd_tkey not in linked_set:
+              rd_tkey = ""
+            is_standalone_rd = bool(
+                str(active_rd.get("to") or "").strip()
+                and str(active_rd.get("subject") or "").strip()
+                and not rd_tkey
+            )
+            if not rd_tkey and not is_standalone_rd:
+              for gk in gmail_channels:
+                gk_st = (art_rows.get(gk) or {}).get("state")
+                if is_active_correspondence_artifact(
+                    "gmail_thread", gk_st if isinstance(gk_st, Mapping) else {}
+                ):
+                  rd_tkey = gk
+                  break
+            mat_key = str(active_rd.get("materialized_draft_key") or "").strip()
+            done_ref = mat_key or rd_tkey
+            done_m = f"reply_sent({done_ref})" if done_ref else ""
+            if existing_wb is not None:
+              try:
+                wb_meta = json.loads(existing_wb.get("meta_json") or "{}")
+              except Exception:
+                wb_meta = {}
+              if wb_meta.get("auto_gate", True):
+                wb_meta["wb_reply_draft"] = True
+                wb_meta["auto_gate"] = True
+                wb_meta["draft_updated_ts"] = float(
+                    active_rd.get("updated_at") or wb_meta.get("draft_updated_ts") or cur_now
+                )
+                next_st = (
+                    "open"
+                    if str(existing_wb.get("status") or "") == "done"
+                    else str(existing_wb.get("status") or "open")
+                )
+                conn.execute(
+                    "UPDATE obligations SET target_artifact_key = ?, description = ?, "
+                    "trigger_expr = ?, done_matcher = ?, status = ?, meta_json = ? "
+                    "WHERE obligation_id = ?",
+                    (
+                        rd_tkey,
+                        auto_desc,
+                        auto_trig,
+                        done_m,
+                        next_st,
+                        json.dumps(wb_meta),
+                        canon_wb_oid,
+                    ),
+                )
+                existing_wb["target_artifact_key"] = rd_tkey
+                existing_wb["description"] = auto_desc
+                existing_wb["trigger_expr"] = auto_trig
+                existing_wb["done_matcher"] = done_m
+                existing_wb["status"] = next_st
+                existing_wb["meta_json"] = json.dumps(wb_meta)
+            else:
+              wb_meta = {
+                  "wb_reply_draft": True,
+                  "auto_gate": True,
+                  "draft_updated_ts": float(active_rd.get("updated_at") or cur_now),
+              }
+              conn.execute(
+                  "INSERT INTO obligations "
+                  "(obligation_id, work_id, target_artifact_key, kind, description, "
+                  "trigger_expr, done_matcher, status, last_eval, created_at, "
+                  "satisfied_at, meta_json) "
+                  "VALUES (?, ?, ?, 'reply', ?, ?, ?, 'open', 'unknown', ?, 0, ?)",
+                  (
+                      canon_wb_oid,
+                      wid,
+                      rd_tkey,
+                      auto_desc,
+                      auto_trig,
+                      done_m,
+                      cur_now,
+                      json.dumps(wb_meta),
+                  ),
+              )
+              ob_rows.append({
+                  "obligation_id": canon_wb_oid,
+                  "work_id": wid,
+                  "target_artifact_key": rd_tkey,
+                  "kind": "reply",
+                  "description": auto_desc,
+                  "trigger_expr": auto_trig,
+                  "done_matcher": done_m,
+                  "status": "open",
+                  "last_eval": "unknown",
+                  "created_at": cur_now,
+                  "satisfied_at": 0,
+                  "meta_json": json.dumps(wb_meta),
+              })
+          elif existing_wb is not None and str(existing_wb.get("status") or "") in (
+              "open",
+              "ready",
+          ):
+            try:
+              wb_meta = json.loads(existing_wb.get("meta_json") or "{}")
+            except Exception:
+              wb_meta = {}
+            # Retire stale auto_gate obligations when the last primary CL/bug is unlinked
+            if wb_meta.get("auto_gate", True):
+              conn.execute(
+                  "UPDATE obligations SET status = 'done', satisfied_at = ? "
+                  "WHERE obligation_id = ?",
+                  (cur_now, canon_wb_oid),
+              )
+              existing_wb["status"] = "done"
+
         # Collect per-channel specific obligations so CL/bug obligations leave other channels live
         superseded_targets: set[str] = set()
         has_untargeted_reply = False
@@ -2895,19 +3841,53 @@ class WorkStore:
             continue
           if str(o.get("status") or "") not in ("open", "ready"):
             continue
+          try:
+            o_meta = json.loads(o.get("meta_json") or "{}")
+          except Exception:
+            o_meta = {}
+          is_wb_draft_ob = bool(o_meta.get("wb_reply_draft")) or str(
+              o.get("obligation_id") or ""
+          ).startswith("ob-wbdraft-")
           o_tkey = str(o.get("target_artifact_key") or "").strip()
           if not o_tkey:
-            if str(o.get("kind") or "") == "reply":
+            # Standalone untargeted reply_draft notes must never silence unrelated gdoc/chat items
+            if str(o.get("kind") or "") == "reply" and not is_wb_draft_ob:
               has_untargeted_reply = True
             continue
-          superseded_targets.add(o_tkey)
           if o_tkey.startswith("gmail_draft:"):
-            d_st = (art_rows.get(o_tkey) or {}).get("state") or {}
+            superseded_targets.add(o_tkey)
+            d_row = art_rows.get(o_tkey) or {}
+            d_st = d_row.get("state") or {}
+            d_upd_ts = float(
+                d_st.get("draft_updated_ts")
+                or d_row.get("updated_at")
+                or o.get("created_at")
+                or 0.0
+            )
             d_tid = str(d_st.get("thread_id") or "").strip()
-            if d_tid:
-              superseded_targets.add(f"gmail_thread:{d_tid}")
-            elif len(gmail_channels) == 1:
-              superseded_targets.add(gmail_channels[0])
+            cand_tkey = (
+                f"gmail_thread:{d_tid}"
+                if d_tid
+                else (gmail_channels[0] if len(gmail_channels) == 1 else "")
+            )
+            if cand_tkey and _is_thread_covered_by_draft_ts(
+                (art_rows.get(cand_tkey) or {}).get("state"), d_upd_ts
+            ):
+              superseded_targets.add(cand_tkey)
+          elif is_wb_draft_ob:
+            # Parked Workbench reply drafts stop superseding once a newer counterparty reply lands
+            d_upd_ts = float(
+                o_meta.get("draft_updated_ts")
+                or (active_rd or {}).get("updated_at")
+                or o.get("created_at")
+                or 0.0
+            )
+            if _is_thread_covered_by_draft_ts(
+                (art_rows.get(o_tkey) or {}).get("state"), d_upd_ts
+            ):
+              superseded_targets.add(o_tkey)
+          else:
+            superseded_targets.add(o_tkey)
 
         for akey in linked_keys:
           ar = art_rows.get(akey)
@@ -3054,6 +4034,7 @@ class WorkStore:
       return d
 
   def evaluate_all_obligations(self, now: float | None = None) -> None:
+    """Re-evaluates open/ready obligations and marks satisfied obligations and reply_drafts done."""
     cur_now = time.time() if now is None else now
     with self._lock, self._connect() as conn:
       art_rows = conn.execute("SELECT * FROM artifacts").fetchall()
@@ -3104,6 +4085,21 @@ class WorkStore:
               "WHERE obligation_id = ?",
               (cur_now, json.dumps(ob_meta), ob_id),
           )
+          # Mark the Workbench reply_draft sent once its obligation completes so the banner clears
+          if ob_id.startswith("ob-wbdraft-") or bool(ob_meta.get("wb_reply_draft")):
+            try:
+              wm = json.loads(w_row.get("meta_json") or "{}")
+            except Exception:
+              wm = {}
+            if isinstance(wm.get("reply_draft"), Mapping):
+              rd_done = dict(wm["reply_draft"])
+              rd_done["sent_at"] = cur_now
+              wm["reply_draft"] = rd_done
+              conn.execute(
+                  "UPDATE works SET meta_json = ? WHERE work_id = ?",
+                  (json.dumps(wm), str(ob["work_id"])),
+              )
+              w_row["meta_json"] = json.dumps(wm)
           self._log_event(
               conn,
               "obligation_done",
@@ -3137,6 +4133,7 @@ class WorkStore:
       source: str = "manual",
       now: float | None = None,
   ) -> None:
+    """Merges source_work_id links, obligations, and newer reply_draft into target_work_id."""
     if target_work_id == source_work_id:
       return
     cur_now = time.time() if now is None else now
@@ -3159,14 +4156,30 @@ class WorkStore:
           "DELETE FROM work_links WHERE work_id = ?",
           (source_work_id,),
       )
+      t_meta_row = conn.execute(
+          "SELECT meta_json FROM works WHERE work_id = ?", (target_work_id,)
+      ).fetchone()
+      s_meta_row = conn.execute(
+          "SELECT meta_json FROM works WHERE work_id = ?", (source_work_id,)
+      ).fetchone()
+      merged_meta = _merge_reply_draft_meta(
+          t_meta_row["meta_json"] if t_meta_row else "{}",
+          s_meta_row["meta_json"] if s_meta_row else "{}",
+      )
       conn.execute(
           "UPDATE works SET status = 'archived', updated_at = ? WHERE work_id = ?",
           (cur_now, source_work_id),
       )
-      conn.execute(
-          "UPDATE works SET updated_at = ? WHERE work_id = ?",
-          (cur_now, target_work_id),
-      )
+      if merged_meta is not None:
+        conn.execute(
+            "UPDATE works SET meta_json = ?, updated_at = ? WHERE work_id = ?",
+            (json.dumps(merged_meta), cur_now, target_work_id),
+        )
+      else:
+        conn.execute(
+            "UPDATE works SET updated_at = ? WHERE work_id = ?",
+            (cur_now, target_work_id),
+        )
       self._log_event(
           conn,
           "work_merged",
@@ -3182,15 +4195,18 @@ class WorkStore:
       new_title: str,
       now: float | None = None,
   ) -> str:
+    """Splits artifact_key out of source_work_id into a new Work while keeping card drafts."""
     cur_now = time.time() if now is None else now
     akey = canonicalize_artifact_key(artifact_key)
     self.unlink_artifact(source_work_id, akey, now=cur_now)
     new_wid = self.create_work(new_title, now=cur_now)
     self.link_artifact(new_wid, akey, role="primary", source="manual", now=cur_now)
     with self._lock, self._connect() as conn:
+      # Keep ob-wbdraft-* paired with source_work_id's reply_draft metadata
       conn.execute(
           "UPDATE obligations SET work_id = ? "
-          "WHERE work_id = ? AND target_artifact_key = ?",
+          "WHERE work_id = ? AND target_artifact_key = ? "
+          "AND obligation_id NOT LIKE 'ob-wbdraft-%'",
           (new_wid, source_work_id, akey),
       )
       self._log_event(
@@ -3201,6 +4217,8 @@ class WorkStore:
           payload={"from_work_id": source_work_id},
           now=cur_now,
       )
+    self.reconcile_correspondence_obligations(source_work_id, now=cur_now)
+    self.reconcile_correspondence_obligations(new_wid, now=cur_now)
     return new_wid
 
   def complete_work(
@@ -3289,17 +4307,68 @@ class WorkStore:
 
     reasons: list[str] = []
     gated_draft_keys: set[str] = set()
+    covered_thread_keys: set[str] = set()
+    has_open_wb_draft_ob = False
+    has_ready_wb_draft_ob = False
     ready_target_keys: set[str] = set()
+    art_state_by_key: dict[str, Mapping[str, Any]] = {}
+    gmail_channels: list[str] = []
+    for art in artifacts:
+      if art.get("role") == "context_only":
+        continue
+      ak = str(art.get("artifact_key") or "")
+      art_state_by_key[ak] = (
+          art.get("state") if isinstance(art.get("state"), Mapping) else {}
+      )
+      if ak.startswith("gmail_thread:"):
+        gmail_channels.append(ak)
+
     for ob in obligations:
       t_key = str(ob.get("target_artifact_key") or "")
-      if ob.get("status") == "open" and t_key.startswith("gmail_draft:"):
-        gated_draft_keys.add(t_key)
+      try:
+        ob_meta = json.loads(ob.get("meta_json") or "{}")
+      except Exception:
+        ob_meta = {}
+      is_wb_ob = bool(
+          ob.get("wb_reply_draft")
+          or ob_meta.get("wb_reply_draft")
+          or str(ob.get("obligation_id") or "").startswith("ob-wbdraft-")
+      )
+      if ob.get("status") == "open":
+        if is_wb_ob:
+          has_open_wb_draft_ob = True
+          d_upd_ts = float(ob_meta.get("draft_updated_ts") or ob.get("created_at") or 0.0)
+          if t_key.startswith("gmail_thread:") and _is_thread_covered_by_draft_ts(
+              art_state_by_key.get(t_key), d_upd_ts
+          ):
+            covered_thread_keys.add(t_key)
+        if t_key.startswith("gmail_draft:"):
+          gated_draft_keys.add(t_key)
+          d_st = art_state_by_key.get(t_key) or {}
+          d_upd_ts = float(d_st.get("draft_updated_ts") or ob.get("created_at") or 0.0)
+          d_tid = str(d_st.get("thread_id") or "").strip()
+          cand_t = (
+              f"gmail_thread:{d_tid}"
+              if d_tid
+              else (gmail_channels[0] if len(gmail_channels) == 1 else "")
+          )
+          if cand_t and _is_thread_covered_by_draft_ts(
+              art_state_by_key.get(cand_t), d_upd_ts
+          ):
+            covered_thread_keys.add(cand_t)
       if ob.get("status") == "ready":
+        if is_wb_ob:
+          has_ready_wb_draft_ob = True
         if t_key:
           ready_target_keys.add(t_key)
         reasons.append(f"🔔 Ready: {ob.get('description')}")
       elif ob.get("stalled_alert"):
         reasons.append(f"⚠️ Stalled >7d: {ob.get('description')}")
+
+    active_rd = _active_reply_draft_from_meta(work_row.get("meta_json"))
+    mat_dk = str((active_rd or {}).get("materialized_draft_key") or "")
+    if mat_dk and (has_open_wb_draft_ob or has_ready_wb_draft_ob):
+      gated_draft_keys.add(mat_dk)
 
     # Index non-companion primary CLs/PRs and linked GDoc keys for transport-thread dedup
     parent_cls_by_key: dict[str, dict[str, Any]] = {}
@@ -3333,6 +4402,7 @@ class WorkStore:
           kind in ("gmail_thread", "gchat_thread", "gdoc_thread")
           and bool(st.get("unanswered_human"))
           and akey not in ready_target_keys
+          and akey not in covered_thread_keys
       ):
         # Skip raw notification transport threads superseded by a linked #disco or gdoc artifact
         if kind == "gmail_thread":
@@ -3375,6 +4445,10 @@ class WorkStore:
         cl_reason = _evaluate_cl_needs_you(akey, st)
         if cl_reason:
           reasons.append(cl_reason)
+
+    if active_rd is not None and not has_open_wb_draft_ob and not has_ready_wb_draft_ob:
+      if not any(r.startswith("📝 Unsent") for r in reasons):
+        reasons.append("📝 Unsent reply draft")
 
     if reasons:
       return "needs-you", reasons
@@ -3697,6 +4771,17 @@ class WorkStore:
               "UPDATE obligations SET work_id = ? WHERE work_id = ?",
               (merge_owner_wid, wid),
           )
+          ow_row = conn.execute(
+              "SELECT meta_json FROM works WHERE work_id = ?", (merge_owner_wid,)
+          ).fetchone()
+          m_meta = _merge_reply_draft_meta(
+              ow_row["meta_json"] if ow_row else "{}", w.get("meta_json") or "{}"
+          )
+          if m_meta is not None:
+            conn.execute(
+                "UPDATE works SET meta_json = ?, updated_at = ? WHERE work_id = ?",
+                (json.dumps(m_meta), cur_now, merge_owner_wid),
+            )
           conn.execute("DELETE FROM work_links WHERE work_id = ?", (wid,))
           conn.execute(
               "UPDATE works SET status = 'archived', updated_at = ? WHERE work_id = ?",
@@ -3760,8 +4845,11 @@ class WorkStore:
           w_meta = json.loads(w.get("meta_json") or "{}")
         except Exception:
           w_meta = {}
-        is_manual_work = bool(w_meta.get("title_manual")) or any(
-            str(l.get("source") or "") == "manual" for l in w_links
+        has_active_rd = _active_reply_draft_from_meta(w_meta) is not None
+        is_manual_work = (
+            bool(w_meta.get("title_manual"))
+            or has_active_rd
+            or any(str(l.get("source") or "") == "manual" for l in w_links)
         )
         non_ctx_keys = [str(l["artifact_key"]) for l in primaries + channels]
         gmail_keys = [k for k in non_ctx_keys if k.startswith("gmail_thread:")]
@@ -3805,7 +4893,7 @@ class WorkStore:
               continue
             ineligible_standalone_email = False
             break
-        if (
+        if not has_active_rd and (
             (not primaries and not (is_manual_work and channels))
             or ((cfg_proj or cfg_title) and not channels)
             or ineligible_standalone_email
@@ -4098,9 +5186,20 @@ class WorkStore:
       if not w_arts and (is_config_project(raw_proj) or is_config_text(raw_w_title)):
         continue
       effective_proj = "" if is_config_project(raw_proj) else raw_proj
+      active_rd = _active_reply_draft_from_meta(w.get("meta_json"))
       w_obs = obs_by_work.get(wid, [])
-      checklist, prog_summary = build_work_checklist(w_arts, art_rows)
+      checklist, prog_summary = build_work_checklist(
+          w_arts, art_rows, reply_draft=active_rd
+      )
       for ob in w_obs:
+        try:
+          ob_m = json.loads(ob.get("meta_json") or "{}")
+        except Exception:
+          ob_m = {}
+        ob["wb_reply_draft"] = bool(
+            ob_m.get("wb_reply_draft")
+            or str(ob.get("obligation_id") or "").startswith("ob-wbdraft-")
+        )
         if ob.get("status") == "done":
           continue
         if prog_summary:
@@ -4120,6 +5219,22 @@ class WorkStore:
       if resolved_title and resolved_title != str(w["title"]):
         title_updates.append((resolved_title, wid))
       lane, reasons = self.compute_work_lane(w, w_arts, w_obs)
+      card_reply_draft: dict[str, Any] | None = None
+      if active_rd is not None:
+        rd_upd = float(active_rd.get("updated_at") or cur_now)
+        mat_key = str(active_rd.get("materialized_draft_key") or "")
+        mat_ts = float(active_rd.get("materialized_at") or 0.0)
+        mat_did = mat_key.split(":", 1)[1] if mat_key.startswith("gmail_draft:") else ""
+        mat_st = ((art_rows.get(mat_key) or {}).get("state") or {}) if mat_key else {}
+        mat_active = bool(mat_did) and str(mat_st.get("status") or "DRAFT").upper() == "DRAFT"
+        card_reply_draft = {
+            **active_rd,
+            "updated_et": format_et_timestamp(rd_upd),
+            "materialized_url": (
+                f"https://mail.google.com/mail/u/0/#drafts/{mat_did}" if mat_active else ""
+            ),
+            "needs_rematerialize": bool(mat_active and mat_ts > 0.0 and rd_upd > mat_ts + 1e-6),
+        }
       cards.append({
           "work_id": wid,
           "title": resolved_title or str(w["title"]),
@@ -4133,6 +5248,7 @@ class WorkStore:
           "updated_et": format_et_timestamp(float(w.get("updated_at") or cur_now)),
           "is_virtual": False,
           "is_multi_channel": len(kinds_seen) >= 2 or len(w_arts) >= 2 or len(w_obs) >= 1,
+          "reply_draft": card_reply_draft,
           "checklist": checklist,
           "artifacts": w_arts,
           "obligations": w_obs,

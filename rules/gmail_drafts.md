@@ -30,3 +30,8 @@ Why: the `google_gmail` MCP rewrites URLs into expiring redirects (see `INCIDENT
 - **Verify after creating**: Run `readonly get-draft <DRAFT_ID> --json` (never pipe `gmail` CLI
   output to `grep`, `egrep`, or `awk`) and decode the stored HTML body to confirm zero
   `google.com/url` redirects and intact `<a href>` / `<pre>` tags before notifying the user
+- **Multi-step Workbench cards**: Keep evolving reply notes inside Workbench via
+  `workctl.py draft-set <WORK_ID> --html --body-file <path>` (`--auto-gate` is enabled by default;
+  `~/.gemini/config/workbench/workctl.py`) at meaningful milestones (CL uploaded/merged, answered
+  question) rather than mutating Gmail on every step, and run
+  `workctl.py draft-materialize <WORK_ID>` once ready to send
