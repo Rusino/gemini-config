@@ -97,3 +97,88 @@ from the Skia revision pinned in Flutter `DEPS` may not build), 4 submodule rest
 Runtime: two incremental `ninja` builds (a few minutes after a header change in `include/core/`)
 plus about 5–8 minutes for 20 rounds with the default filter. Put the `report.md` table rows
 into the CL `Tested:` block. Tests: `python3 -m unittest test_skia_patch_ab` in `scripts/`.
+
+## Cloudtop Build + Remote Measure Workflow
+
+For bisects and long A/B chains: build on the Cloudtop (many cores), measure on a dedicated
+workstation (quiet, `performance` governor, one isolated core). Scripts in `scripts/`:
+
+| Script | Runs on | Does |
+|---|---|---|
+| `remote_build_push.sh` | Cloudtop | builds one point (Skia sha + LTO mode), stages and pushes it |
+| `perf_remote.py` | Cloudtop | `check`, `has`, `push`, `enqueue`, `status`, `fetch` over ssh |
+| `make_plan.py` | Cloudtop | writes an interleaved-rounds plan for a chain of points |
+| `remote_runner.sh` | workstation | resumable queue: runs plan lines, writes `raw/<out>.json` |
+| `eval_rounds.py` | Cloudtop | per-step median ratio, bootstrap 95% CI, per-round agreement |
+
+Settings come from flags or env; nothing personal is hardcoded in the scripts:
+
+```bash
+export PERF_HOST=jlavrova.rdu.corp.google.com   # measuring workstation
+export PERF_REMOTE_DIR=perf_weekly              # remote root, relative to remote $HOME
+export PERF_CM=${PERF_CM:-/tmp/${USER}_perf_cm}  # ControlPath, the scripts' default
+S=~/.gemini/config/skills/flutter-engine-perf-compare/scripts
+CO=~/.gemini/jetski/scratch/perf_step0/sweep2   # Flutter monorepo checkout used for builds
+```
+
+**One ControlMaster, opened by the user.** Every ssh/rsync uses `-o BatchMode=yes -o
+ControlMaster=no -o ControlPath=$PERF_CM`, because each new ssh costs her a security-key touch.
+When the master is dead, every script exits 3 and prints the command; ask her to run it once:
+
+```bash
+ssh -fNM -o ControlPersist=10h -o ControlPath=$PERF_CM $PERF_HOST
+python3 $S/perf_remote.py check
+```
+
+Never open another ssh as a workaround. The remote root needs `txt_fonts/` (created from the
+first pushed point's fonts) and `ext_fonts/` (fonts for `txt_ext_benchmarks --font-dir`).
+
+**Build and push a point** (one per call; staged name `<sha10>_<mode>`, shared by every agent):
+
+```bash
+bash $S/remote_build_push.sh --checkout $CO --sha <40-hex skia sha> --mode nolto \
+  [--flutter-sha <sha>] [--ext-src <skparagraph_ext_benchmarks.cc>] [--skia-mirror <skia repo>]
+```
+
+- It checks the master first and exits 0 at once if the remote `bin/<point>/.complete` exists,
+  so check `python3 $S/perf_remote.py has <point>` and reuse other agents' points instead of
+  building again. A local `perf_stage/<point>` with the same sha is pushed without a rebuild.
+- `--mode`: `nolto` (gn `--no-lto`), `lto` (Full LTO, what Flutter ships on Linux) or `thinlto`
+  (gn LTO with `-flto` patched to `-flto=thin` in `build/config/compiler/BUILD.gn` for the
+  build only). Out dir `out/perf_<mode>`. One build at a time per checkout (flock); patched
+  files and the Skia checkout are restored on exit, and it refuses to start over local edits.
+- The push uploads into `bin/<point>.tmp`, checks `SHA256SUMS`, links the fixture path baked
+  into the binary to `txt_fonts`, renames the dir to `bin/<point>` and touches `.complete` last.
+  The runner never starts a point without `.complete`: never push by hand with plain `rsync`
+  (a manual push without `.complete` once blocked the queue for 3 hours); rerun the push.
+
+**Plan, enqueue, collect:**
+
+```bash
+python3 $S/make_plan.py --prefix bis1 --rounds 3 --reps 10 --out /tmp/bis1.txt \
+  [--anchor <point> --anchor-every 4] <point A> <point B> <point C>
+python3 $S/perf_remote.py enqueue /tmp/bis1.txt
+python3 $S/perf_remote.py status
+python3 $S/perf_remote.py fetch <local raw dir>
+python3 $S/eval_rounds.py --raw <local raw dir> --prefix bis1 --rounds 3 <A> <B> <C>
+```
+
+- Odd rounds run the points in order, even rounds reversed, with a `BARRIER` after each round.
+  A point that is not pushed yet is passed over until the next `BARRIER` (`STRICT=1` on the
+  runner keeps strict order). Points listed in the remote `skip_points` file are ignored.
+- `enqueue` uploads `remote_runner.sh` and the plan, appends it to `lanes.txt` (earlier lanes
+  have priority, and the runner rereads the file every pass) and starts the runner detached on
+  the remote side unless it already runs. Runner env: `CPU` (default 11), `SIB` (SMT sibling,
+  default 23), `LOAD_MAX`, `BUSY_MAX`, `WARMUP`. Its log is `logs/runner.log` on the remote.
+  An older ad-hoc `rdu_runner.sh` still running there uses the same default core: stop it (or
+  set another `CPU`) first, since the single-runner lock covers only `remote_runner.sh`.
+- `eval_rounds.py` marks a step `CONFIRMED` only when all rounds exist, every round agrees on
+  the sign, `|ratio - 1| > --threshold` (default 0.02) and the CI excludes 1.
+
+**Launching from the agent.** A build takes minutes to tens of minutes: start
+`remote_build_push.sh` with `run_command` `WaitMsBeforeAsync=500` and
+`NotificationTimeoutSeconds` (e.g. 3600), never with `nohup` or `&` inside a synchronous call
+(a hook blocks it). Only the remote runner detaches,
+on the remote side, inside `perf_remote.py enqueue`. Do not poll; wait for the notification.
+
+Tests: `python3 -m unittest test_flutter_engine_perf_runner` in `~/.gemini/config/tests`.
