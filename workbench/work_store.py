@@ -686,10 +686,72 @@ _RE_OPEN_ACTION_CUES = re.compile(
 )
 
 
-# Exclude passive reference GDocs and bot notifications from active correspondence ownership
+_RE_GH_NOTIF_TARGET = re.compile(
+    r"\[([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\][^\n]*\((Issue|PR)\s+#(\d+)\)",
+    re.IGNORECASE,
+)
+
+
+def extract_github_notif_target(subject: str) -> str:
+  """Extracts canonical github_issue or github_pr key from a GitHub notification subject."""
+  m = _RE_GH_NOTIF_TARGET.search(str(subject or ""))
+  if not m:
+    return ""
+  repo = m.group(1)
+  kind = "github_pr" if m.group(2).lower() == "pr" else "github_issue"
+  num = m.group(3)
+  return f"{kind}:{repo}:{num}"
+
+
+def _get_github_target_state(
+    st: Mapping[str, Any],
+    artifacts_by_key: Mapping[str, Mapping[str, Any]] | None,
+) -> Mapping[str, Any]:
+  """Looks up the linked GitHub Issue/PR state dict for a GitHub notification thread."""
+  if not artifacts_by_key:
+    return {}
+  target_key = str(st.get("gh_target_key") or "") or extract_github_notif_target(
+      str(st.get("root_subject") or "")
+  )
+  if not target_key:
+    return {}
+  t_entry = artifacts_by_key.get(target_key)
+  if not isinstance(t_entry, Mapping):
+    return {}
+  raw_st = t_entry.get("state") if "state" in t_entry else t_entry
+  return raw_st if isinstance(raw_st, Mapping) else {}
+
+
+def _resolve_github_thread_turns(
+    st: Mapping[str, Any] | None,
+    target_st: Mapping[str, Any] | None = None,
+) -> tuple[float, float]:
+  """Returns (eff_ext_ts, gh_self_ts) reconciling Gmail and GitHub comment turns."""
+  s = st or {}
+  ts = target_st or {}
+  last_msg_ts = float(s.get("last_message_ts") or 0.0)
+  gh_human_ts = max(
+      float(s.get("gh_human_reply_ts") or 0.0),
+      float(ts.get("last_human_comment_at") or 0.0),
+  )
+  gmail_ext_ts = 0.0 if bool(s.get("last_from_me")) else last_msg_ts
+  # Allow 30s Gmail delivery lag only relative to the latest known GitHub human comment
+  if gh_human_ts > 0 and last_msg_ts <= gh_human_ts + 30.0:
+    ext_ts = gh_human_ts
+  else:
+    ext_ts = max(gh_human_ts, gmail_ext_ts)
+  self_ts = max(
+      float(s.get("gh_self_reply_ts") or 0.0),
+      float(ts.get("last_self_comment_at") or 0.0),
+  )
+  return ext_ts, self_ts
+
+
+# Exclude passive reference GDocs, trashed unjoined GitHub notifications, and bot emails
 def is_active_correspondence_artifact(
     kind: str, state: Mapping[str, Any] | None = None
 ) -> bool:
+  """Returns True when an artifact owns active correspondence obligations."""
   st = state or {}
   if kind == "gchat_thread":
     return True
@@ -698,11 +760,51 @@ def is_active_correspondence_artifact(
   if kind == "gdoc":
     return bool(st.get("is_active_correspondence"))
   if kind == "gmail_thread":
-    if st.get("is_github_issue_thread") or st.get("is_gdoc_comment"):
+    if st.get("is_github_issue_thread") or st.get("is_github_pr_thread"):
+      # Trashed notifications the user never joined stop owning correspondence obligations
+      return not (bool(st.get("in_trash_or_spam")) and not bool(st.get("sent_by_me")))
+    if st.get("is_gdoc_comment"):
       return True
     if st.get("is_drive_share"):
       return bool(st.get("started_by_me") or st.get("is_active_correspondence"))
     return not bool(st.get("is_automated"))
+  return False
+
+
+def is_github_thread_resolved(
+    state: Mapping[str, Any] | None,
+    artifacts_by_key: Mapping[str, Mapping[str, Any]] | None = None,
+) -> bool:
+  """Returns True when a GitHub notification thread is trashed, locked, or cleanly closed."""
+  st = state or {}
+  if not (st.get("is_github_issue_thread") or st.get("is_github_pr_thread")):
+    return False
+  if bool(st.get("in_trash_or_spam")) and not bool(st.get("sent_by_me")):
+    return True
+  target_st = _get_github_target_state(st, artifacts_by_key)
+  synced_at = float(target_st.get("synced_at") or 0.0)
+  if bool(target_st.get("locked")) or (synced_at <= 0 and bool(st.get("gh_locked"))):
+    return True
+  t_status = str(target_st.get("status") or "").strip().upper()
+  last_msg_ts = float(st.get("last_message_ts") or 0.0)
+  ext_ts, gh_self_ts = _resolve_github_thread_turns(st, target_st)
+  self_ts = max(
+      gh_self_ts,
+      last_msg_ts if bool(st.get("last_from_me")) else 0.0,
+  )
+  if t_status in ("CLOSED", "MERGED"):
+    terminal_at = max(
+        float(target_st.get("closed_at") or 0.0),
+        float(target_st.get("merged_at") or 0.0),
+    )
+    if terminal_at > 0:
+      return True if ext_ts <= terminal_at else self_ts >= ext_ts
+    if ext_ts <= 0:
+      return True
+    return self_ts >= ext_ts
+  if not t_status and synced_at <= 0 and bool(st.get("gh_thread_closed")):
+    gh_closed_ts = float(st.get("gh_closed_ts") or 0.0)
+    return gh_closed_ts <= 0 or ext_ts <= gh_closed_ts
   return False
 
 
@@ -856,13 +958,16 @@ def resolve_work_origin_and_title(
       if not is_comp:
         other_arts.append((ots, a))
 
-  # Prefer primary non-issue email threads first, then earlier timestamps
+  # Prefer primary non-GH-notification email threads first, then earlier timestamps
   correspondence_arts.sort(
       key=lambda x: (
           0
           if (
               x[1].get("role") == "primary"
-              and not (x[1].get("state") or {}).get("is_github_issue_thread")
+              and not (
+                  (x[1].get("state") or {}).get("is_github_issue_thread")
+                  or (x[1].get("state") or {}).get("is_github_pr_thread")
+              )
           )
           else (1 if x[1].get("role") == "primary" else 2),
           x[0] if x[0] > 0 else float("inf"),
@@ -1579,9 +1684,29 @@ def _evaluate_cl_needs_you(akey: str, st: Mapping[str, Any]) -> str:
   return f"Needs action: {short_cl}"
 
 
-def _is_correspondence_silence_ping(state: Mapping[str, Any] | None) -> bool:
+def _is_correspondence_silence_ping(
+    state: Mapping[str, Any] | None,
+    artifacts_by_key: Mapping[str, Mapping[str, Any]] | None = None,
+) -> bool:
   """Returns True when a correspondence obligation woke up from outbound 5-7d silence."""
   st = state or {}
+  target_st = _get_github_target_state(st, artifacts_by_key)
+  eff_ext_ts, gh_self_ts = _resolve_github_thread_turns(st, target_st)
+  last_ts = float(st.get("last_message_ts") or st.get("origin_ts") or 0.0)
+  # Mirror _eval_single_predicate so manual wait, MCP/GitHub replies, and acks match 7d pings
+  override_ts = max(
+      float(st.get("manual_wait_ts") or 0.0),
+      float(st.get("mcp_reply_ts") or 0.0),
+      float(st.get("ack_message_ts") or 0.0),
+      gh_self_ts,
+  )
+  gh_human_ts = max(
+      float(st.get("gh_human_reply_ts") or 0.0),
+      float(target_st.get("last_human_comment_at") or 0.0),
+  )
+  # Newer GitHub human comment before Gmail delivery must read as Reply needed, not silence ping
+  if gh_human_ts > max(last_ts, override_ts):
+    return False
   from_me = (
       bool(st.get("last_from_me"))
       if "last_from_me" in st
@@ -1589,14 +1714,8 @@ def _is_correspondence_silence_ping(state: Mapping[str, Any] | None) -> bool:
   )
   if from_me:
     return True
-  last_ts = float(st.get("last_message_ts") or st.get("origin_ts") or 0.0)
-  # Mirror _eval_single_predicate so manual wait, MCP comment replies, and acks match 7d pings
-  override_ts = max(
-      float(st.get("manual_wait_ts") or 0.0),
-      float(st.get("mcp_reply_ts") or 0.0),
-      float(st.get("ack_message_ts") or 0.0),
-  )
-  return override_ts > 0.0 and override_ts >= last_ts
+  compare_ts = eff_ext_ts if eff_ext_ts > 0 else float(st.get("origin_ts") or 0.0)
+  return override_ts > 0.0 and override_ts >= compare_ts
 
 
 def _is_reviewer_cl_state(st: Mapping[str, Any], est: Mapping[str, Any]) -> bool:
@@ -1691,13 +1810,16 @@ def _collect_suppressed_threads(
   """Returns correspondence artifact_keys covered by parked drafts or superseded by GDoc rows."""
   suppressed: set[str] = set()
   art_state_by_key: dict[str, Mapping[str, Any]] = {}
+  all_art_by_key: dict[str, Mapping[str, Any]] = {}
   gmail_channels: list[str] = []
   linked_non_ctx_keys: set[str] = set()
   linked_gdoc_thread_docs: set[str] = set()
   for art in w_arts:
+    ak = str(art.get("artifact_key") or "")
+    if ak:
+      all_art_by_key[ak] = art
     if str(art.get("role") or "") == "context_only":
       continue
-    ak = str(art.get("artifact_key") or "")
     linked_non_ctx_keys.add(ak)
     if ak.startswith("gdoc_thread:") and ak.count(":") >= 2:
       linked_gdoc_thread_docs.add(ak.split(":", 2)[1])
@@ -1722,7 +1844,7 @@ def _collect_suppressed_threads(
     if is_wb_ob:
       d_upd_ts = float(ob_meta.get("draft_updated_ts") or ob.get("created_at") or 0.0)
       if t_key.startswith("gmail_thread:") and _is_thread_covered_by_draft_ts(
-          art_state_by_key.get(t_key), d_upd_ts
+          art_state_by_key.get(t_key), d_upd_ts, all_art_by_key
       ):
         suppressed.add(t_key)
     if t_key.startswith("gmail_draft:"):
@@ -1734,7 +1856,9 @@ def _collect_suppressed_threads(
           if d_tid
           else (gmail_channels[0] if len(gmail_channels) == 1 else "")
       )
-      if cand_t and _is_thread_covered_by_draft_ts(art_state_by_key.get(cand_t), d_upd_ts):
+      if cand_t and _is_thread_covered_by_draft_ts(
+          art_state_by_key.get(cand_t), d_upd_ts, all_art_by_key
+      ):
         suppressed.add(cand_t)
 
   # Suppress raw GDoc/Drive notification transport threads superseded by a linked GDoc entity
@@ -1772,6 +1896,7 @@ def _classify_card_types(
   has_ready_wb_ob = False
   gated_draft_keys: set[str] = set()
   suppressed_threads = _collect_suppressed_threads(w_arts, w_obs)
+  art_state_map = {str(a.get("artifact_key") or ""): a for a in w_arts}
   non_comp_cls: dict[str, dict[str, Any]] = {}
 
   # Classify correspondence obligations and identify parked auto-gated Gmail drafts
@@ -1839,8 +1964,15 @@ def _classify_card_types(
       if is_needs and is_live_draft and akey not in gated_draft_keys:
         needs_types.add("replies")
     elif is_active_correspondence_artifact(kind, st):
-      work_types.add("replies")
-      if is_needs and bool(st.get("unanswered_human")) and akey not in suppressed_threads:
+      gh_resolved = is_github_thread_resolved(st, art_state_map)
+      if is_done or not gh_resolved:
+        work_types.add("replies")
+      if (
+          is_needs
+          and not gh_resolved
+          and bool(st.get("unanswered_human"))
+          and akey not in suppressed_threads
+      ):
         needs_types.add("replies")
     elif kind in ("buganizer", "github_issue"):
       st_upper = str(st.get("status") or "NEW").strip().upper()
@@ -2019,6 +2151,8 @@ def compute_artifact_provenance(
     return "черновик ответа", detail or "Черновик письма в Gmail со ссылками на артефакты задачи"
 
   if kind == "gmail_thread":
+    if st.get("is_github_pr_thread") or reason == "github_pr_thread":
+      return "дискуссия в PR", detail or "Обсуждение в комментариях GitHub PR"
     if st.get("is_github_issue_thread") or reason == "github_issue_thread":
       return "дискуссия в issue", detail or "Живое обсуждение в комментариях GitHub Issue"
     if role == "primary" or reason == "gmail_root":
@@ -2121,14 +2255,23 @@ def _wb_draft_obligation_id(work_id: str) -> str:
 
 
 def _is_thread_covered_by_draft_ts(
-    thread_state: Mapping[str, Any] | None, draft_updated_ts: float
+    thread_state: Mapping[str, Any] | None,
+    draft_updated_ts: float,
+    artifacts_by_key: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> bool:
   """Returns True when no unacknowledged counterparty message is newer than the draft."""
   st = thread_state or {}
-  if bool(st.get("last_from_me")):
+  target_st = _get_github_target_state(st, artifacts_by_key)
+  eff_ext_ts, gh_self_ts = _resolve_github_thread_turns(st, target_st)
+  gh_human_ts = max(
+      float(st.get("gh_human_reply_ts") or 0.0),
+      float(target_st.get("last_human_comment_at") or 0.0),
+  )
+  last_msg_ts = float(st.get("last_message_ts") or 0.0)
+  if bool(st.get("last_from_me")) and gh_human_ts <= max(last_msg_ts, gh_self_ts):
     return True
-  last_ts = float(st.get("last_message_ts") or 0.0)
-  if last_ts <= 0.0:
+  latest_ext_ts = max(eff_ext_ts, gh_human_ts)
+  if latest_ext_ts <= 0.0:
     return draft_updated_ts > 0.0
   covered_floor = max(
       draft_updated_ts,
@@ -2136,8 +2279,9 @@ def _is_thread_covered_by_draft_ts(
       float(st.get("manual_wait_ts") or 0.0),
       float(st.get("mcp_reply_ts") or 0.0),
       float(st.get("resolved_at") or 0.0),
+      gh_self_ts,
   )
-  return covered_floor >= last_ts
+  return covered_floor >= latest_ext_ts
 
 
 def _active_reply_draft_from_meta(raw_meta_json: Any) -> dict[str, Any] | None:
@@ -2632,22 +2776,38 @@ def _eval_single_predicate(
     st = art.get("state") or {}
     if bool(st.get("resolved")) and bool(st.get("resolved_by_me")):
       return "false"
+    if is_github_thread_resolved(st, artifacts_by_key):
+      return "false"
     last_ts = float(st.get("last_message_ts") or st.get("origin_ts") or 0.0)
+    gh_target_st = _get_github_target_state(st, artifacts_by_key)
+    eff_ext_ts, gh_self_ts = _resolve_github_thread_turns(st, gh_target_st)
     override_ts = max(
         float(st.get("manual_wait_ts") or 0.0),
         float(st.get("mcp_reply_ts") or 0.0),
         float(st.get("ack_message_ts") or 0.0),
+        gh_self_ts,
+    )
+    gh_human_ts = max(
+        float(st.get("gh_human_reply_ts") or 0.0),
+        float(gh_target_st.get("last_human_comment_at") or 0.0),
     )
     if "last_from_me" in st:
       from_me = bool(st.get("last_from_me"))
     else:
       from_me = not bool(st.get("promoted_inbound"))
-    # Verbal wait or MCP comment reply newer than the latest Gmail pull flips turn to external wait
-    if not from_me and override_ts > 0 and override_ts >= last_ts:
+    # Verbal wait or MCP/GitHub reply newer than inbound turns flips obligation to waiting
+    if not from_me and override_ts > 0 and override_ts >= eff_ext_ts:
       from_me = True
+    # Newer external GitHub comment after last Gmail pull and self reply re-triggers reply
+    if gh_human_ts > max(last_ts, override_ts):
+      from_me = False
     if not from_me:
       return "true"
-    anchor_ts = max(last_ts, override_ts)
+    anchor_ts = max(
+        eff_ext_ts,
+        last_ts if bool(st.get("last_from_me")) else 0.0,
+        override_ts,
+    )
     if anchor_ts <= 0:
       anchor_ts = float(work_row.get("created_at") or 0.0)
     if anchor_ts <= 0:
@@ -2691,7 +2851,7 @@ def _is_done_matched(
   matcher = str(obligation.get("done_matcher") or "").strip()
   ob_kind = str(obligation.get("kind") or "reply").strip()
 
-  # End-to-end correspondence umbrellas never auto-close on interim replies, only explicit resolve
+  # End-to-end correspondence umbrellas close on explicit resolve or resolved GitHub thread
   if ob_kind == "correspondence":
     if not target_key:
       return False
@@ -2699,7 +2859,10 @@ def _is_done_matched(
     if not art:
       return False
     st = art.get("state") or {}
-    return bool(st.get("resolved")) and bool(st.get("resolved_by_me"))
+    return (
+        (bool(st.get("resolved")) and bool(st.get("resolved_by_me")))
+        or is_github_thread_resolved(st, artifacts_by_key)
+    )
 
   m_reply = re.match(
       r"^(?:reply_sent|draft_sent)\(\s*([^)]+?)\s*\)$", matcher, re.IGNORECASE
@@ -3113,30 +3276,69 @@ class WorkStore:
         prev_ots = float(merged_state.get("origin_ts") or 0.0)
         new_ots = float(state.get("origin_ts") or 0.0)
         prev_last_ts = float(merged_state.get("last_message_ts") or 0.0)
+        prev_gh_self_ts = float(merged_state.get("gh_self_reply_ts") or 0.0)
+        prev_gh_human_ts = float(merged_state.get("gh_human_reply_ts") or 0.0)
         merged_state.update(dict(state))
+        new_gh_self_ts = float(merged_state.get("gh_self_reply_ts") or 0.0)
+        if prev_gh_self_ts > 0 and new_gh_self_ts > 0:
+          merged_state["gh_self_reply_ts"] = max(prev_gh_self_ts, new_gh_self_ts)
+        elif prev_gh_self_ts > 0:
+          merged_state["gh_self_reply_ts"] = prev_gh_self_ts
+        new_gh_human_ts = float(merged_state.get("gh_human_reply_ts") or 0.0)
+        if prev_gh_human_ts > 0 and new_gh_human_ts > 0:
+          merged_state["gh_human_reply_ts"] = max(prev_gh_human_ts, new_gh_human_ts)
+        elif prev_gh_human_ts > 0:
+          merged_state["gh_human_reply_ts"] = prev_gh_human_ts
         if prev_ots > 0 and new_ots > 0:
           merged_state["origin_ts"] = min(prev_ots, new_ots)
         elif prev_ots > 0:
           merged_state["origin_ts"] = prev_ots
-        # Keep monotonic message timestamps and user/MCP acknowledgement overrides across syncs
+        # Keep monotonic message timestamps and user/MCP/GitHub reply overrides across syncs
         mcp_ts = float(merged_state.get("mcp_reply_ts") or 0.0)
         resolved_ts = float(merged_state.get("resolved_at") or 0.0)
+        gh_self_ts = float(merged_state.get("gh_self_reply_ts") or 0.0)
+        gh_human_ts = float(merged_state.get("gh_human_reply_ts") or 0.0)
         cur_msg_ts = float(merged_state.get("last_message_ts") or 0.0)
-        if prev_last_ts > cur_msg_ts and max(mcp_ts, resolved_ts) >= prev_last_ts:
+        if prev_last_ts > cur_msg_ts and max(mcp_ts, resolved_ts, gh_self_ts) >= prev_last_ts:
           merged_state["last_message_ts"] = prev_last_ts
           cur_msg_ts = prev_last_ts
-        if mcp_ts > 0 and cur_msg_ts <= mcp_ts:
+        # Account for 30s Gmail delivery lag relative to gh_human_ts before forcing outbound state
+        if gh_human_ts > 0 and cur_msg_ts <= gh_human_ts + 30.0:
+          eff_ext_ts = gh_human_ts
+        else:
+          eff_ext_ts = max(cur_msg_ts, gh_human_ts)
+        eff_self_ts = max(mcp_ts, gh_self_ts)
+        if gh_human_ts > max(eff_self_ts, cur_msg_ts) and not bool(
+            merged_state.get("gh_thread_closed") or merged_state.get("gh_locked")
+        ):
+          merged_state["last_from_me"] = False
+          trashed_unjoined = bool(merged_state.get("in_trash_or_spam")) and not bool(
+              merged_state.get("sent_by_me")
+          )
+          if (
+              "gh_human_reply_ts" not in state
+              and not trashed_unjoined
+              and (cur_now - gh_human_ts) <= 14 * 86400
+          ):
+            merged_state["unanswered_human"] = True
+        elif eff_self_ts > 0 and eff_ext_ts <= eff_self_ts:
           merged_state["last_from_me"] = True
         ack_floor = max(
             float(merged_state.get("ack_message_ts") or 0.0),
             float(merged_state.get("manual_wait_ts") or 0.0),
             mcp_ts,
             resolved_ts,
+            gh_self_ts,
         )
-        if ack_floor > 0 and cur_msg_ts <= ack_floor:
+        if ack_floor > 0 and eff_ext_ts <= ack_floor:
           merged_state["unanswered_human"] = False
         # Outbound replies satisfy inbound unanswered_human even on partial state updates
         if bool(merged_state.get("last_from_me")):
+          merged_state["unanswered_human"] = False
+        # Trashed unjoined threads never remain flagged as unanswered inbound human mail
+        if bool(merged_state.get("in_trash_or_spam")) and not bool(
+            merged_state.get("sent_by_me")
+        ):
           merged_state["unanswered_human"] = False
         # Clear sticky MCP resolve flags when a newer comment reopens the #disco thread
         if resolved_ts > 0 and "resolved" not in state and cur_msg_ts > resolved_ts:
@@ -4574,7 +4776,7 @@ class WorkStore:
                 else (gmail_channels[0] if len(gmail_channels) == 1 else "")
             )
             if cand_tkey and _is_thread_covered_by_draft_ts(
-                (art_rows.get(cand_tkey) or {}).get("state"), d_upd_ts
+                (art_rows.get(cand_tkey) or {}).get("state"), d_upd_ts, art_rows
             ):
               superseded_targets.add(cand_tkey)
           elif is_wb_draft_ob:
@@ -4586,7 +4788,7 @@ class WorkStore:
                 or 0.0
             )
             if _is_thread_covered_by_draft_ts(
-                (art_rows.get(o_tkey) or {}).get("state"), d_upd_ts
+                (art_rows.get(o_tkey) or {}).get("state"), d_upd_ts, art_rows
             ):
               superseded_targets.add(o_tkey)
           else:
@@ -4601,6 +4803,16 @@ class WorkStore:
           if is_config_artifact(akey, title=str(ar.get("title") or ""), state=st):
             continue
           if not is_active_correspondence_artifact(akind, st):
+            prev_inactive = existing_corr_by_target.get(akey)
+            if prev_inactive is not None and str(prev_inactive.get("status") or "") in (
+                "open",
+                "ready",
+            ):
+              conn.execute(
+                  "UPDATE obligations SET status = 'done', satisfied_at = ? "
+                  "WHERE obligation_id = ?",
+                  (cur_now, prev_inactive["obligation_id"]),
+              )
             continue
 
           # Concrete #disco threads supersede doc-level umbrellas and notification transport threads
@@ -4664,9 +4876,17 @@ class WorkStore:
           trig = f"correspondence_turn({akey}, {STALLED_OBLIGATION_DAYS})"
 
           prev_ob = existing_corr_by_target.get(akey)
-          last_ts = float(st.get("last_message_ts") or 0.0)
           from_me = bool(st.get("last_from_me"))
-          is_self_resolved = bool(st.get("resolved")) and bool(st.get("resolved_by_me"))
+          gh_target_st = _get_github_target_state(st, art_rows)
+          eff_ext_ts, gh_self_ts = _resolve_github_thread_turns(st, gh_target_st)
+          gh_human_ts = max(
+              float(st.get("gh_human_reply_ts") or 0.0),
+              float(gh_target_st.get("last_human_comment_at") or 0.0),
+          )
+          is_self_resolved = (
+              (bool(st.get("resolved")) and bool(st.get("resolved_by_me")))
+              or is_github_thread_resolved(st, art_rows)
+          )
           # Reopen when a specific draft/reply finished or a newer counterparty message arrived
           if prev_ob is not None:
             if str(prev_ob.get("status") or "") == "done":
@@ -4680,7 +4900,11 @@ class WorkStore:
                   float(st.get("ack_message_ts") or 0.0),
                   float(st.get("resolved_at") or 0.0),
               )
-              should_reopen = was_superseded or (not from_me and last_ts > done_floor)
+              should_reopen = (
+                  was_superseded
+                  or (not from_me and eff_ext_ts > done_floor)
+                  or (gh_human_ts > max(done_floor, gh_self_ts))
+              )
               if should_reopen and not is_self_resolved:
                 conn.execute(
                     "UPDATE obligations SET status = 'open', last_eval = 'unknown', "
@@ -4688,6 +4912,12 @@ class WorkStore:
                     "WHERE obligation_id = ?",
                     (desc, trig, json.dumps(prev_meta), ob_id),
                 )
+            elif is_self_resolved:
+              conn.execute(
+                  "UPDATE obligations SET status = 'done', satisfied_at = ? "
+                  "WHERE obligation_id = ?",
+                  (cur_now, ob_id),
+              )
             else:
               conn.execute(
                   "UPDATE obligations SET description = ?, trigger_expr = ? "
@@ -5015,10 +5245,12 @@ class WorkStore:
     has_ready_wb_draft_ob = False
     ready_target_keys: set[str] = set()
     art_state_by_key: dict[str, Mapping[str, Any]] = {}
+    all_art_by_key: dict[str, Mapping[str, Any]] = {}
     for art in artifacts:
+      ak = str(art.get("artifact_key") or "")
+      all_art_by_key[ak] = art
       if art.get("role") == "context_only":
         continue
-      ak = str(art.get("artifact_key") or "")
       art_state_by_key[ak] = (
           art.get("state") if isinstance(art.get("state"), Mapping) else {}
       )
@@ -5046,7 +5278,10 @@ class WorkStore:
           ready_target_keys.add(t_key)
         # Separate outbound 5-7d silence reminders from genuine inbound messages needing a reply
         if ob.get("kind") == "correspondence":
-          if _is_correspondence_silence_ping(art_state_by_key.get(t_key)):
+          st_t = art_state_by_key.get(t_key)
+          if is_github_thread_resolved(st_t, all_art_by_key):
+            continue
+          if _is_correspondence_silence_ping(st_t, all_art_by_key):
             reasons.append(f"⏰ 7d silence ping: {ob.get('description')}")
           else:
             reasons.append(f"📨 Reply needed: {ob.get('description')}")
@@ -5089,7 +5324,13 @@ class WorkStore:
           and akey not in ready_target_keys
           and akey not in suppressed_threads
       ):
-        reasons.append(f"📨 Unanswered message: {art.get('title')}")
+        if not (bool(st.get("in_trash_or_spam")) and not bool(st.get("sent_by_me"))) and not (
+            is_github_thread_resolved(st, all_art_by_key)
+        ):
+          t_st = _get_github_target_state(st, all_art_by_key)
+          ext_ts, gh_self_ts = _resolve_github_thread_turns(st, t_st)
+          if not (gh_self_ts > 0 and gh_self_ts >= ext_ts):
+            reasons.append(f"📨 Unanswered message: {art.get('title')}")
       elif kind == "chat_chain" and str(st.get("bucket") or "") == "needs-me":
         reasons.append(f"🤖 Chat waiting on you: {art.get('title')}")
       elif kind in ("gerrit", "github_pr", "piper") and is_companion_artifact(
@@ -5154,9 +5395,57 @@ class WorkStore:
             else "All CLs closed and obligations satisfied"
         )
         return "done", [done_msg]
-      # Complete pure-correspondence cards once all tracked obligations are satisfied
-      if not non_comp_cls and obligations:
-        return "done", ["All obligations satisfied"]
+      # Complete CL-less cards once tracked obligations finish or closed issues/GH threads resolve
+      has_non_ctx_chat = any(
+          a.get("role") != "context_only" and a.get("kind") == "chat_chain"
+          for a in artifacts
+      )
+      has_closed_bug_or_resolved_gh = any(
+          a.get("role") != "context_only"
+          and (
+              (
+                  a.get("kind") in ("buganizer", "github_issue")
+                  and str((a.get("state") or {}).get("status") or "").upper()
+                  in CLOSED_BUG_STATUSES
+              )
+              or (
+                  a.get("kind") == "gmail_thread"
+                  and is_github_thread_resolved(
+                      a.get("state") if isinstance(a.get("state"), Mapping) else {},
+                      all_art_by_key,
+                  )
+              )
+          )
+          for a in artifacts
+      )
+      has_unresolved_corr = any(
+          a.get("role") != "context_only"
+          and is_active_correspondence_artifact(
+              str(a.get("kind") or ""),
+              a.get("state") if isinstance(a.get("state"), Mapping) else {},
+          )
+          and not (
+              is_github_thread_resolved(
+                  a.get("state") if isinstance(a.get("state"), Mapping) else {},
+                  all_art_by_key,
+              )
+              or (
+                  bool((a.get("state") or {}).get("resolved"))
+                  and bool((a.get("state") or {}).get("resolved_by_me"))
+              )
+          )
+          for a in artifacts
+      )
+      if not non_comp_cls and (
+          obligations
+          or (has_closed_bug_or_resolved_gh and not has_non_ctx_chat and not has_unresolved_corr)
+      ):
+        done_msg = (
+            "All obligations satisfied"
+            if obligations
+            else "All linked issues closed and obligations satisfied"
+        )
+        return "done", [done_msg]
 
     wait_reasons: list[str] = []
     for ob in open_obs:
@@ -5655,6 +5944,7 @@ class WorkStore:
             if (
                 st_g.get("sent_by_me")
                 or st_g.get("is_github_issue_thread")
+                or st_g.get("is_github_pr_thread")
                 or st_g.get("is_gdoc_comment")
                 or st_g.get("is_active_correspondence")
             ):
@@ -5809,11 +6099,97 @@ class WorkStore:
           )
           works_repaired += 1
 
+      works_repaired += self._demote_collateral_gh_issue_links(conn, art_rows, cur_now)
+
     return {
         "links_removed": links_removed,
         "works_archived": works_archived,
         "works_repaired": works_repaired,
     }
+
+  def _demote_collateral_gh_issue_links(
+      self,
+      conn: sqlite3.Connection,
+      art_rows: Mapping[str, Mapping[str, Any]],
+      cur_now: float,
+  ) -> int:
+    """Demotes collateral body-cited github_issue links on GitHub issue notification Works."""
+    repaired = 0
+    work_ids = [
+        str(r["work_id"])
+        for r in conn.execute("SELECT work_id FROM works WHERE status != 'archived'").fetchall()
+    ]
+    for wid in work_ids:
+      wl_rows = [
+          dict(r)
+          for r in conn.execute(
+              "SELECT * FROM work_links WHERE work_id = ?", (wid,)
+          ).fetchall()
+      ]
+      gh_issue_targets: set[str] = set()
+      issue_thread_subjects: list[str] = []
+      has_non_issue_mail_or_draft = False
+      cl_bug_keys: set[str] = set()
+      for wl in wl_rows:
+        akey = str(wl["artifact_key"])
+        role = str(wl.get("role") or "")
+        ar = art_rows.get(akey) or {}
+        try:
+          st = json.loads(str(ar.get("state_json") or "{}"))
+        except Exception:
+          st = {}
+        if not isinstance(st, Mapping):
+          st = {}
+        if akey.startswith("gmail_thread:") and role in ("primary", "channel"):
+          gh_t = str(st.get("gh_target_key") or "") or extract_github_notif_target(
+              str(st.get("root_subject") or ar.get("title") or "")
+          )
+          if gh_t.startswith("github_issue:") or bool(st.get("is_github_issue_thread")):
+            if gh_t.startswith("github_issue:"):
+              gh_issue_targets.add(gh_t)
+            subj = str(st.get("root_subject") or "").strip().lower()
+            if subj:
+              issue_thread_subjects.append(subj)
+          else:
+            has_non_issue_mail_or_draft = True
+        elif akey.startswith("gmail_draft:") and role in ("primary", "channel"):
+          has_non_issue_mail_or_draft = True
+        elif artifact_kind_from_key(akey) in ("gerrit", "github_pr", "piper"):
+          cl_bug_keys.update(extract_cl_bug_keys(st))
+
+      if not gh_issue_targets:
+        continue
+      for wl in wl_rows:
+        akey = str(wl["artifact_key"])
+        if not akey.startswith("github_issue:"):
+          continue
+        if (
+            str(wl.get("role") or "") != "primary"
+            or str(wl.get("source") or "") == "manual"
+            or str(wl.get("link_reason") or "") != "gmail_thread_ref"
+        ):
+          continue
+        if akey in gh_issue_targets or akey in cl_bug_keys:
+          continue
+        detail_low = str(wl.get("link_detail") or "").lower()
+        from_issue_thread = any(
+            s[:45] in detail_low for s in issue_thread_subjects if s
+        )
+        if not has_non_issue_mail_or_draft or from_issue_thread:
+          conn.execute(
+              "UPDATE work_links SET role = 'context_only' "
+              "WHERE work_id = ? AND artifact_key = ?",
+              (wid, akey),
+          )
+          repaired += 1
+    if repaired:
+      self._log_event(
+          conn,
+          "collateral_gh_issue_demoted",
+          payload={"count": repaired},
+          now=cur_now,
+      )
+    return repaired
 
   def build_dashboard_projection(
       self,
@@ -6028,7 +6404,9 @@ class WorkStore:
           # Expose inbound_reply vs silence_ping to the UI obligation badge renderer
           if ob.get("kind") == "correspondence" and ob.get("status") == "ready":
             ob["correspondence_mode"] = (
-                "silence_ping" if _is_correspondence_silence_ping(t_st) else "inbound_reply"
+                "silence_ping"
+                if _is_correspondence_silence_ping(t_st, art_rows)
+                else "inbound_reply"
             )
           p_txt, ev_k = detect_borderline_correspondence_closure(
               str(t_ar.get("kind") or artifact_kind_from_key(t_ob_key)),

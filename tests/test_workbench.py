@@ -6449,6 +6449,1015 @@ for (const q of ['', 'alpha']) {
         f"Node 2D filter check failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
     )
 
+  def test_github_issue_and_pr_correspondence_sync_and_trash(self) -> None:
+    # Verify GitHub GraphQL correspondence reconciliation, trash gating, and body-bug demotion
+    import base64
+    from datetime import datetime, timezone
+    from unittest import mock
+    import ingestor
+    import work_store
+
+    now = 1794256720.0
+    iso_old_ext = datetime.fromtimestamp(now - 7200, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    iso_self = datetime.fromtimestamp(now - 3600, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    iso_closed = datetime.fromtimestamp(now - 3600, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    iso_post_close = datetime.fromtimestamp(now - 600, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+    # Mid-sentence citations must not pollute bug_title while structured list items still parse
+    prose_body = (
+        "Thank you for filing. Another report is #109825: the attached text mixes CJK and "
+        "Arabic with combining marks and looks similar to the old crash."
+    )
+    self.assertEqual(ingestor.extract_bug_titles_from_html_or_text(prose_body), {})
+    bullet_html = (
+        "<ul><li>flutter#109825 — Crash on CJK and Arabic with combining marks</li></ul>"
+    )
+    self.assertEqual(
+        ingestor.extract_bug_titles_from_html_or_text(bullet_html),
+        {"github_issue:flutter/flutter:109825": "Crash on CJK and Arabic with combining marks"},
+    )
+    self.assertEqual(
+        work_store.extract_github_notif_target(
+            "[flutter/flutter] [windows] Crash in skia::textlayout::TextLine::buildTextBlob  "
+            "(Issue #116575)"
+        ),
+        "github_issue:flutter/flutter:116575",
+    )
+    self.assertEqual(
+        work_store.extract_github_notif_target(
+            "Re: [flutter/flutter] [web_paragraph] Render soft hyphens (PR #195366)"
+        ),
+        "github_pr:flutter/flutter:195366",
+    )
+
+    def _b64(text: str) -> str:
+      return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii").rstrip("=")
+
+    store = work_store.WorkStore(self.db_path)
+
+    # Verify _fetch_gmail_thread_provenance detects bot auto-lock and preserves human turn
+    lock_thread_payload = {
+        "messages": [
+            {
+                "id": "m_db_1",
+                "internalDate": str(int((now - 7200) * 1000)),
+                "labelIds": ["IMPORTANT", "CATEGORY_UPDATES"],
+                "snippet": "Same crash #109825: the attached text...",
+                "payload": {
+                    "mimeType": "text/plain",
+                    "headers": [
+                        {
+                            "name": "Subject",
+                            "value": (
+                                "[flutter/flutter] [windows] Crash in "
+                                "skia::textlayout::TextLine::buildTextBlob  (Issue #116575)"
+                            ),
+                        },
+                        {"name": "From", "value": "David Bebawy <notifications@github.com>"},
+                        {"name": "To", "value": "flutter/flutter <flutter@noreply.github.com>"},
+                    ],
+                    "body": {"data": _b64(prose_body)},
+                },
+            },
+            {
+                "id": "m_bot_lock",
+                "internalDate": str(int((now - 600) * 1000)),
+                "labelIds": ["IMPORTANT", "CATEGORY_PERSONAL"],
+                "snippet": "This thread has been automatically locked",
+                "payload": {
+                    "mimeType": "text/plain",
+                    "headers": [
+                        {
+                            "name": "Subject",
+                            "value": (
+                                "Re: [flutter/flutter] [windows] Crash in "
+                                "skia::textlayout::TextLine::buildTextBlob  (Issue #116575)"
+                            ),
+                        },
+                        {
+                            "name": "From",
+                            "value": "github-actions[bot] <notifications@github.com>",
+                        },
+                        {"name": "To", "value": "flutter/flutter <flutter@noreply.github.com>"},
+                    ],
+                    "body": {
+                        "data": _b64(
+                            "This thread has been automatically locked since there has not been "
+                            "any recent activity after it was closed. Please open a new issue."
+                        )
+                    },
+                },
+            },
+        ]
+    }
+    with mock.patch("subprocess.run") as mock_run:
+      mock_run.return_value = subprocess.CompletedProcess(
+          ["gmail"], 0, stdout=json.dumps(lock_thread_payload), stderr=""
+      )
+      prov_116575 = ingestor._fetch_gmail_thread_provenance("th_lock_116575", {}, now)
+    self.assertEqual(prov_116575.get("schema_ver"), 6)
+    self.assertEqual(
+        prov_116575.get("gh_target_key"), "github_issue:flutter/flutter:116575"
+    )
+    self.assertTrue(bool(prov_116575.get("gh_locked")))
+    self.assertTrue(bool(prov_116575.get("gh_thread_closed")))
+    self.assertFalse(bool(prov_116575.get("last_from_me")))
+
+    # Case 1: Closed/locked #116575 + collateral body #109825 -> done and #109825 context_only
+    w_116575 = store.create_work("Issue #116575", now=now - 10000)
+    store.upsert_artifact(
+        "gerrit:skia:572293",
+        kind="gerrit",
+        title="572293: Fix CJK/Arabic buildTextBlob crash",
+        state={"status": "MERGED"},
+        now=now - 10000,
+    )
+    store.upsert_artifact(
+        "github_issue:flutter/flutter:116575",
+        kind="github_issue",
+        title="flutter#116575: [windows] Crash in skia::textlayout::TextLine::buildTextBlob",
+        state={},
+        now=now - 10000,
+    )
+    store.upsert_artifact(
+        "github_issue:flutter/flutter:109825",
+        kind="github_issue",
+        title="flutter#109825: the attached text mixes CJK and Arabic",
+        state={"status": "OPEN", "bug_title": "the attached text mixes CJK and Arabic"},
+        now=now - 10000,
+    )
+    store.upsert_artifact(
+        "gmail_thread:th_116575",
+        kind="gmail_thread",
+        title=(
+            "[flutter/flutter] [windows] Crash in skia::textlayout::TextLine::buildTextBlob "
+            "(Issue #116575) (David Bebawy)"
+        ),
+        state={
+            "thread_id": "th_116575",
+            "root_subject": (
+                "[flutter/flutter] [windows] Crash in "
+                "skia::textlayout::TextLine::buildTextBlob  (Issue #116575)"
+            ),
+            "counterparty": "David Bebawy",
+            "is_github_issue_thread": True,
+            "last_from_me": False,
+            "last_message_ts": now - 7200,
+            "unanswered_human": True,
+            "in_trash_or_spam": False,
+        },
+        now=now - 7200,
+    )
+    store.link_artifact(w_116575, "gerrit:skia:572293", role="primary", source="auto", now=now)
+    store.link_artifact(
+        w_116575,
+        "github_issue:flutter/flutter:116575",
+        role="primary",
+        source="auto",
+        link_reason="gmail_thread_ref",
+        link_detail="Из переписки '[flutter/flutter] [windows] Crash in skia::textlay'",
+        now=now,
+    )
+    store.link_artifact(
+        w_116575,
+        "github_issue:flutter/flutter:109825",
+        role="primary",
+        source="auto",
+        link_reason="gmail_thread_ref",
+        link_detail="Из переписки '[flutter/flutter] [windows] Crash in skia::textlay'",
+        now=now,
+    )
+    store.link_artifact(
+        w_116575,
+        "gmail_thread:th_116575",
+        role="primary",
+        source="auto",
+        link_reason="github_issue_thread",
+        now=now,
+    )
+
+    # Case 2: Open #185368 where Rusino replied on GitHub after flar -> Waiting
+    w_multi = store.create_work("txt_benchmarks", now=now - 10000)
+    store.upsert_artifact(
+        "github_issue:flutter/flutter:185368",
+        kind="github_issue",
+        title="flutter#185368: Engine benchmarks are no longer running after monorepo",
+        state={"status": "OPEN"},
+        now=now - 10000,
+    )
+    store.upsert_artifact(
+        "gmail_thread:th_185368",
+        kind="gmail_thread",
+        title=(
+            "[flutter/flutter] Engine benchmarks are no longer running after monorepo "
+            "(Issue #185368)"
+        ),
+        state={
+            "thread_id": "th_185368",
+            "root_subject": (
+                "[flutter/flutter] Engine benchmarks are no longer running after monorepo "
+                "(Issue #185368)"
+            ),
+            "counterparty": "flar",
+            "is_github_issue_thread": True,
+            "last_from_me": False,
+            "last_message_ts": now - 7200,
+            "unanswered_human": True,
+            "in_trash_or_spam": False,
+        },
+        now=now - 7200,
+    )
+    store.link_artifact(
+        w_multi, "github_issue:flutter/flutter:185368", role="primary", source="auto", now=now
+    )
+    store.link_artifact(w_multi, "gmail_thread:th_185368", role="channel", source="auto", now=now)
+
+    # Case 3: Unlocked CLOSED #199001 with post-close external comment after Rusino -> Needs You
+    w_reopened = store.create_work("Post-close comment issue #199001", now=now - 10000)
+    store.upsert_artifact(
+        "github_issue:flutter/flutter:199001",
+        kind="github_issue",
+        title="flutter#199001: Post-close reply check",
+        state={},
+        now=now - 10000,
+    )
+    store.upsert_artifact(
+        "gmail_thread:th_199001",
+        kind="gmail_thread",
+        title="[flutter/flutter] Post-close reply check (Issue #199001) (Alice)",
+        state={
+            "thread_id": "th_199001",
+            "root_subject": "[flutter/flutter] Post-close reply check (Issue #199001)",
+            "counterparty": "Alice",
+            "is_github_issue_thread": True,
+            "last_from_me": False,
+            "last_message_ts": now - 600,
+            "unanswered_human": True,
+            "in_trash_or_spam": False,
+        },
+        now=now - 600,
+    )
+    store.link_artifact(
+        w_reopened, "github_issue:flutter/flutter:199001", role="primary", source="auto", now=now
+    )
+    store.link_artifact(
+        w_reopened, "gmail_thread:th_199001", role="primary", source="auto", now=now
+    )
+
+    # Case 4: PR thread reviews (skipping PENDING) + 30s delivery lag -> Waiting
+    iso_pr_ext = datetime.fromtimestamp(now - 3610, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    w_pr = store.create_work("PR #195366 soft hyphens", now=now - 10000)
+    store.upsert_artifact(
+        "github_pr:flutter/flutter:195366",
+        kind="github_pr",
+        title="195366: [web_paragraph] Render soft hyphens",
+        state={"status": "OPEN", "is_mine": False, "role": "reviewer"},
+        now=now - 10000,
+    )
+    store.upsert_artifact(
+        "gmail_thread:th_pr_195366",
+        kind="gmail_thread",
+        title="[flutter/flutter] [web_paragraph] Render soft hyphens (PR #195366)",
+        state={
+            "thread_id": "th_pr_195366",
+            "root_subject": "[flutter/flutter] [web_paragraph] Render soft hyphens (PR #195366)",
+            "gh_target_key": "github_pr:flutter/flutter:195366",
+            "counterparty": "contributor1",
+            "is_github_pr_thread": True,
+            "last_from_me": False,
+            "last_message_ts": now - 3590,
+            "unanswered_human": True,
+            "in_trash_or_spam": False,
+        },
+        now=now - 3590,
+    )
+    store.link_artifact(w_pr, "github_pr:flutter/flutter:195366", role="primary", now=now)
+    store.link_artifact(w_pr, "gmail_thread:th_pr_195366", role="channel", now=now)
+
+    store.reconcile_correspondence_obligations(now=now)
+    graphql_resp = {
+        "data": {
+            "repository": {
+                "n0": {
+                    "__typename": "Issue",
+                    "number": 116575,
+                    "title": "[windows] Crash in skia::textlayout::TextLine::buildTextBlob",
+                    "state": "CLOSED",
+                    "locked": True,
+                    "closedAt": iso_closed,
+                    "updatedAt": iso_closed,
+                    "url": "https://github.com/flutter/flutter/issues/116575",
+                    "comments": {
+                        "nodes": [
+                            {
+                                "createdAt": iso_old_ext,
+                                "viewerDidAuthor": False,
+                                "author": {"login": "DavidBebawy"},
+                            },
+                            {
+                                "createdAt": iso_self,
+                                "viewerDidAuthor": True,
+                                "author": {"login": "Rusino"},
+                            },
+                        ]
+                    },
+                },
+                "n1": {
+                    "__typename": "Issue",
+                    "number": 109825,
+                    "title": "Real upstream title for 109825",
+                    "state": "OPEN",
+                    "locked": False,
+                    "closedAt": None,
+                    "updatedAt": iso_old_ext,
+                    "url": "https://github.com/flutter/flutter/issues/109825",
+                    "comments": {"nodes": []},
+                },
+                "n2": {
+                    "__typename": "Issue",
+                    "number": 185368,
+                    "title": "Engine benchmarks are no longer running after monorepo",
+                    "state": "OPEN",
+                    "locked": False,
+                    "closedAt": None,
+                    "updatedAt": iso_self,
+                    "url": "https://github.com/flutter/flutter/issues/185368",
+                    "comments": {
+                        "nodes": [
+                            {
+                                "createdAt": iso_old_ext,
+                                "viewerDidAuthor": False,
+                                "author": {"login": "flar"},
+                            },
+                            {
+                                "createdAt": iso_self,
+                                "viewerDidAuthor": True,
+                                "author": {"login": "Rusino"},
+                            },
+                        ]
+                    },
+                },
+                "n3": {
+                    "__typename": "Issue",
+                    "number": 199001,
+                    "title": "Post-close reply check",
+                    "state": "CLOSED",
+                    "locked": False,
+                    "closedAt": iso_closed,
+                    "updatedAt": iso_post_close,
+                    "url": "https://github.com/flutter/flutter/issues/199001",
+                    "comments": {
+                        "nodes": [
+                            {
+                                "createdAt": iso_self,
+                                "viewerDidAuthor": True,
+                                "author": {"login": "Rusino"},
+                            },
+                            {
+                                "createdAt": iso_post_close,
+                                "viewerDidAuthor": False,
+                                "author": {"login": "alice"},
+                            },
+                        ]
+                    },
+                },
+                "n4": {
+                    "__typename": "PullRequest",
+                    "number": 195366,
+                    "title": "[web_paragraph] Render soft hyphens",
+                    "state": "OPEN",
+                    "locked": False,
+                    "closedAt": None,
+                    "mergedAt": None,
+                    "updatedAt": iso_self,
+                    "url": "https://github.com/flutter/flutter/pull/195366",
+                    "comments": {
+                        "nodes": [
+                            {
+                                "createdAt": iso_pr_ext,
+                                "viewerDidAuthor": False,
+                                "author": {"login": "contributor1"},
+                            }
+                        ]
+                    },
+                    "reviews": {
+                        "nodes": [
+                            {
+                                "state": "APPROVED",
+                                "submittedAt": iso_self,
+                                "viewerDidAuthor": True,
+                                "author": {"login": "Rusino"},
+                            },
+                            {
+                                "state": "PENDING",
+                                "submittedAt": None,
+                                "viewerDidAuthor": False,
+                                "author": {"login": "contributor1"},
+                            },
+                        ]
+                    },
+                },
+            }
+        }
+    }
+    w_state: dict[str, object] = {}
+    with mock.patch("subprocess.run") as mock_run:
+      mock_run.return_value = subprocess.CompletedProcess(
+          ["gh"], 0, stdout=json.dumps(graphql_resp), stderr=""
+      )
+      ingestor.sync_github_artifacts(store, w_state, now=now, force=True)
+
+    store.purge_config_artifacts_and_works(now=now)
+    store.reconcile_correspondence_obligations(now=now)
+    proj = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now)
+    cards = {c["work_id"]: c for c in proj["works"]}
+
+    self.assertEqual(
+        (store.get_artifact("github_issue:flutter/flutter:116575") or {}).get("state", {}).get(
+            "status"
+        ),
+        "CLOSED",
+    )
+    self.assertEqual(
+        (store.get_artifact("github_issue:flutter/flutter:109825") or {}).get("title"),
+        "flutter#109825: Real upstream title for 109825",
+    )
+    self.assertEqual(
+        store.get_work_artifact_roles(w_116575).get("github_issue:flutter/flutter:109825"),
+        "context_only",
+    )
+    self.assertEqual(cards[w_116575]["lane"], "done")
+    self.assertTrue(
+        all(o["status"] == "done" for o in cards[w_116575]["obligations"])
+    )
+
+    self.assertEqual(cards[w_multi]["lane"], "waiting")
+    self.assertEqual(
+        [o["status"] for o in cards[w_multi]["obligations"]], ["open"]
+    )
+    self.assertFalse(
+        bool((store.get_artifact("gmail_thread:th_185368") or {}).get("state", {}).get(
+            "unanswered_human"
+        ))
+    )
+
+    self.assertEqual(cards[w_reopened]["lane"], "needs-you")
+    self.assertEqual(
+        [o["status"] for o in cards[w_reopened]["obligations"]], ["ready"]
+    )
+    self.assertEqual(cards[w_pr]["lane"], "waiting")
+    self.assertFalse(
+        bool((store.get_artifact("gmail_thread:th_pr_195366") or {}).get("state", {}).get(
+            "unanswered_human"
+        ))
+    )
+
+    # Case 5: Trashed GitHub thread never mints a Work and refreshes tracked threads to done
+    w_trashed = store.create_work("Trashed GH thread", now=now - 5000)
+    store.upsert_artifact(
+        "gmail_thread:th_trash_existing",
+        kind="gmail_thread",
+        title="[flutter/flutter] Old issue (Issue #177777) (Bob)",
+        state={
+            "thread_id": "th_trash_existing",
+            "root_subject": "[flutter/flutter] Old issue (Issue #177777)",
+            "counterparty": "Bob",
+            "is_github_issue_thread": True,
+            "last_from_me": False,
+            "last_message_ts": now - 500,
+            "unanswered_human": True,
+            "in_trash_or_spam": False,
+        },
+        now=now - 500,
+    )
+    store.link_artifact(w_trashed, "gmail_thread:th_trash_existing", role="primary", now=now - 500)
+    store.reconcile_correspondence_obligations(w_trashed, now=now - 400)
+
+    trashed_existing_payload = {
+        "messages": [{
+            "id": "m_trash_existing",
+            "internalDate": str(int((now - 500) * 1000)),
+            "labelIds": ["TRASH", "CATEGORY_UPDATES"],
+            "snippet": "Hello",
+            "payload": {
+                "mimeType": "text/plain",
+                "headers": [
+                    {"name": "Subject", "value": "[flutter/flutter] Old issue (Issue #177777)"},
+                    {"name": "From", "value": "Bob <notifications@github.com>"},
+                    {"name": "To", "value": "flutter/flutter <flutter@noreply.github.com>"},
+                ],
+                "body": {"data": _b64("Can you check flutter#177777?")},
+            },
+        }]
+    }
+    trashed_gh_payload = {
+        "messages": [{
+            "id": "m_trash_new",
+            "internalDate": str(int((now - 100) * 1000)),
+            "labelIds": ["TRASH", "CATEGORY_UPDATES"],
+            "snippet": "Hello",
+            "payload": {
+                "mimeType": "text/plain",
+                "headers": [
+                    {"name": "Subject", "value": "[flutter/flutter] Trashed new (Issue #188888)"},
+                    {"name": "From", "value": "Someone <notifications@github.com>"},
+                    {"name": "To", "value": "flutter/flutter <flutter@noreply.github.com>"},
+                ],
+                "body": {"data": _b64("Can you check flutter#188888?")},
+            },
+        }]
+    }
+
+    def _fake_gmail_trash(cmd: list[str], **_kw: object) -> subprocess.CompletedProcess[str]:
+      if "drafts" in cmd:
+        return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+      if "search" in cmd:
+        q = cmd[cmd.index("search") + 1]
+        if "notifications@github.com" in q:
+          return subprocess.CompletedProcess(
+              cmd, 0, stdout=json.dumps([{"threadId": "th_trash_new"}]), stderr=""
+          )
+        return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+      if "get-thread" in cmd and "th_trash_new" in cmd:
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps(trashed_gh_payload), stderr=""
+        )
+      if "get-thread" in cmd and "th_trash_existing" in cmd:
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps(trashed_existing_payload), stderr=""
+        )
+      return subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr="")
+
+    works_before = len(store.list_works())
+    with (
+        mock.patch.object(ingestor.os.path, "isfile", return_value=True),
+        mock.patch("subprocess.run", side_effect=_fake_gmail_trash),
+    ):
+      tray_after = ingestor.ingest_gmail_drafts_and_threads(store, {}, now=now)
+    trashed_card = [
+        c
+        for c in store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now)["works"]
+        if c["work_id"] == w_trashed
+    ][0]
+    self.assertTrue(all(o["status"] == "done" for o in trashed_card["obligations"]))
+    self.assertEqual(len(store.list_works()), works_before)
+    self.assertEqual(tray_after, [])
+    self.assertIsNone(store.get_artifact("github_issue:flutter/flutter:188888"))
+
+  def test_github_sync_edge_contracts_b1_to_b6(self) -> None:
+    # Verify B1-B6 GitHub sync invariants: turn preservation, PR provenance, push lag,
+    # cross-issue close filter, CL-less closed issue completion, and generic owner/repo parsing
+    import base64
+    from datetime import datetime, timezone
+    from unittest import mock
+    import ingestor
+    import work_store
+
+    now = 1794300000.0
+    iso_self = datetime.fromtimestamp(now - 3600, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    iso_human = datetime.fromtimestamp(now - 600, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _b64(text: str) -> str:
+      return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii").rstrip("=")
+
+    store = work_store.WorkStore(self.db_path)
+
+    # B1: Post-self-reply GitHub human comment before Gmail delivery keeps last_from_me=False,
+    # wakes parked auto-gated reply drafts, and classifies as Reply needed (never 7d silence ping)
+    with self.subTest("B1"):
+      w_b1 = store.create_work("B1 post-reply GitHub comment", now=now - 10000)
+      store.upsert_artifact(
+          "github_issue:flutter/flutter:198001",
+          kind="github_issue",
+          title="flutter#198001: B1 issue",
+          state={"status": "OPEN"},
+          now=now - 10000,
+      )
+      store.upsert_artifact(
+          "gerrit:skia:1498001",
+          kind="gerrit",
+          title="1498001: Fix B1",
+          state={"status": "NEW", "is_mine": True, "entity_state": {"lane": "waiting"}},
+          now=now - 10000,
+      )
+      store.upsert_artifact(
+          "gmail_thread:th_b1",
+          kind="gmail_thread",
+          title="[flutter/flutter] B1 issue (Issue #198001) (Alice)",
+          state={
+              "thread_id": "th_b1",
+              "root_subject": "[flutter/flutter] B1 issue (Issue #198001)",
+              "gh_target_key": "github_issue:flutter/flutter:198001",
+              "counterparty": "Alice",
+              "is_github_issue_thread": True,
+              "sent_by_me": True,
+              "last_from_me": True,
+              "last_message_ts": now - 7200,
+              "gh_self_reply_ts": now - 3600,
+              "unanswered_human": False,
+          },
+          now=now - 3600,
+      )
+      store.link_artifact(w_b1, "github_issue:flutter/flutter:198001", role="primary", now=now)
+      store.link_artifact(w_b1, "gerrit:skia:1498001", role="primary", now=now)
+      store.link_artifact(w_b1, "gmail_thread:th_b1", role="channel", now=now)
+      store.save_reply_draft(
+          w_b1,
+          "Merged CL 1498001 and fixed flutter#198001.",
+          thread_key="gmail_thread:th_b1",
+          auto_gate=True,
+          now=now - 4000,
+      )
+
+      b1_gql = {
+          "data": {
+              "repository": {
+                  "n0": {
+                      "__typename": "Issue",
+                      "number": 198001,
+                      "title": "B1 issue",
+                      "state": "OPEN",
+                      "locked": False,
+                      "closedAt": None,
+                      "updatedAt": iso_human,
+                      "url": "https://github.com/flutter/flutter/issues/198001",
+                      "comments": {
+                          "nodes": [
+                              {
+                                  "createdAt": iso_self,
+                                  "viewerDidAuthor": True,
+                                  "author": {"login": "Rusino"},
+                              },
+                              {
+                                  "createdAt": iso_human,
+                                  "viewerDidAuthor": False,
+                                  "author": {"login": "alice"},
+                              },
+                          ]
+                      },
+                  }
+              }
+          }
+      }
+      with mock.patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["gh"], 0, stdout=json.dumps(b1_gql), stderr=""
+        )
+        ingestor.sync_github_artifacts(store, {}, now=now, force=True)
+
+      # Stale Gmail re-sync before email delivery must not wipe newer gh_human_reply_ts
+      store.upsert_artifact(
+          "gmail_thread:th_b1",
+          kind="gmail_thread",
+          state={
+              "last_from_me": True,
+              "last_message_ts": now - 7200,
+              "unanswered_human": False,
+          },
+          now=now,
+      )
+      store.reconcile_correspondence_obligations(w_b1, now=now)
+      b1_th_st = (store.get_artifact("gmail_thread:th_b1") or {}).get("state") or {}
+      self.assertFalse(bool(b1_th_st.get("last_from_me")))
+      self.assertTrue(bool(b1_th_st.get("unanswered_human")))
+      self.assertEqual(float(b1_th_st.get("gh_human_reply_ts") or 0.0), now - 600)
+      b1_issue_art = store.get_artifact("github_issue:flutter/flutter:198001") or {}
+      self.assertFalse(
+          work_store._is_correspondence_silence_ping(
+              b1_th_st, {"github_issue:flutter/flutter:198001": b1_issue_art}
+          )
+      )
+      b1_proj = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now)
+      b1_card = [c for c in b1_proj["works"] if c["work_id"] == w_b1][0]
+      self.assertEqual(b1_card["lane"], "needs-you")
+      self.assertTrue(
+          any("Reply needed" in r or "Unanswered" in r for r in b1_card["reasons"])
+      )
+      self.assertFalse(any("7d silence ping" in r for r in b1_card["reasons"]))
+
+    # B2: PR threads stay protected in purge, lose origin tiebreak to real mail, and label right
+    with self.subTest("B2"):
+      w_b2_solo = store.create_work("Solo PR notif", now=now - 5000)
+      store.upsert_artifact(
+          "gmail_thread:th_b2_solo",
+          kind="gmail_thread",
+          title="[flutter/flutter] Solo PR (PR #198002) (Bob)",
+          state={
+              "thread_id": "th_b2_solo",
+              "root_subject": "[flutter/flutter] Solo PR (PR #198002)",
+              "is_github_pr_thread": True,
+              "sent_by_me": False,
+              "schema_ver": 6,
+              "in_inbox": False,
+              "has_personal_category": False,
+              "me_addressed": False,
+              "recipient_count": 0,
+          },
+          now=now - 5000,
+      )
+      store.link_artifact(
+          w_b2_solo,
+          "gmail_thread:th_b2_solo",
+          role="primary",
+          link_reason="github_pr_thread",
+          now=now - 5000,
+      )
+      w_b2 = store.create_work("Combined human + PR notif", now=now - 5000)
+      store.upsert_artifact(
+          "gmail_thread:th_b2_pr",
+          kind="gmail_thread",
+          title="[flutter/flutter] PR thread (PR #198012) (Bob)",
+          state={
+              "thread_id": "th_b2_pr",
+              "root_subject": "[flutter/flutter] PR thread (PR #198012)",
+              "origin_ts": now - 4000,
+              "is_github_pr_thread": True,
+              "sent_by_me": False,
+              "schema_ver": 6,
+          },
+          now=now - 4000,
+      )
+      store.upsert_artifact(
+          "gmail_thread:th_b2_human",
+          kind="gmail_thread",
+          title="Real design review email (Bob)",
+          state={
+              "thread_id": "th_b2_human",
+              "root_subject": "Real design review email",
+              "origin_ts": now - 1000,
+              "is_active_correspondence": True,
+              "sent_by_me": True,
+              "schema_ver": 6,
+          },
+          now=now - 1000,
+      )
+      store.link_artifact(
+          w_b2,
+          "gmail_thread:th_b2_pr",
+          role="primary",
+          link_reason="github_pr_thread",
+          now=now - 4000,
+      )
+      store.link_artifact(
+          w_b2,
+          "gmail_thread:th_b2_human",
+          role="primary",
+          link_reason="gmail_root",
+          now=now - 1000,
+      )
+      store.purge_config_artifacts_and_works(now=now)
+      b2_proj = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now)
+      b2_active_wids = {c["work_id"] for c in b2_proj["works"]}
+      self.assertIn(w_b2_solo, b2_active_wids)
+      b2_card = [c for c in b2_proj["works"] if c["work_id"] == w_b2][0]
+      _, origin_info = work_store.resolve_work_origin_and_title(
+          {"work_id": w_b2, "title": b2_card["title"], "meta_json": "{}"},
+          b2_card["artifacts"],
+      )
+      self.assertEqual(origin_info.get("artifact_key"), "gmail_thread:th_b2_human")
+      pr_badge, _ = work_store.compute_artifact_provenance(
+          {
+              "artifact_key": "gmail_thread:th_b2_pr",
+              "kind": "gmail_thread",
+              "role": "primary",
+              "link_reason": "github_pr_thread",
+              "state": {"is_github_pr_thread": True},
+          },
+          [],
+      )
+      self.assertEqual(pr_badge, "дискуссия в PR")
+
+    # B3: Post-review PR push newer than last_self_comment_at wakes card even after synced_at,
+    # while 30s delivery lag relative to gh_human_ts stays covered
+    with self.subTest("B3"):
+      w_b3 = store.create_work("B3 PR push after review", now=now - 10000)
+      store.upsert_artifact(
+          "github_pr:flutter/flutter:198003",
+          kind="github_pr",
+          title="198003: B3 PR",
+          state={
+              "status": "OPEN",
+              "is_mine": False,
+              "role": "reviewer",
+              "last_self_comment_at": now - 3600,
+              "last_human_comment_at": 0.0,
+              "synced_at": now - 20,
+          },
+          now=now - 20,
+      )
+      store.upsert_artifact(
+          "gmail_thread:th_b3",
+          kind="gmail_thread",
+          title="[flutter/flutter] B3 PR (PR #198003) (Author)",
+          state={
+              "thread_id": "th_b3",
+              "root_subject": "[flutter/flutter] B3 PR (PR #198003)",
+              "gh_target_key": "github_pr:flutter/flutter:198003",
+              "counterparty": "Author",
+              "is_github_pr_thread": True,
+              "last_from_me": False,
+              "last_message_ts": now - 100,
+              "gh_self_reply_ts": now - 3600,
+              "unanswered_human": True,
+          },
+          now=now - 100,
+      )
+      store.link_artifact(w_b3, "github_pr:flutter/flutter:198003", role="primary", now=now)
+      store.link_artifact(w_b3, "gmail_thread:th_b3", role="channel", now=now)
+      store.reconcile_correspondence_obligations(w_b3, now=now)
+      b3_proj = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now)
+      b3_card = [c for c in b3_proj["works"] if c["work_id"] == w_b3][0]
+      self.assertEqual(b3_card["lane"], "needs-you")
+
+      # Verify 30s delivery lag relative to gh_human_ts still stays Waiting
+      w_b3_lag = store.create_work("B3 delivery lag stays waiting", now=now - 10000)
+      store.upsert_artifact(
+          "github_pr:flutter/flutter:198004",
+          kind="github_pr",
+          title="198004: B3 lag PR",
+          state={
+              "status": "OPEN",
+              "is_mine": False,
+              "role": "reviewer",
+              "last_human_comment_at": now - 3610,
+              "last_self_comment_at": now - 3600,
+              "synced_at": now - 10,
+          },
+          now=now - 10,
+      )
+      store.upsert_artifact(
+          "gmail_thread:th_b3_lag",
+          kind="gmail_thread",
+          title="[flutter/flutter] B3 lag PR (PR #198004) (Author)",
+          state={
+              "thread_id": "th_b3_lag",
+              "root_subject": "[flutter/flutter] B3 lag PR (PR #198004)",
+              "gh_target_key": "github_pr:flutter/flutter:198004",
+              "counterparty": "Author",
+              "is_github_pr_thread": True,
+              "last_from_me": False,
+              "last_message_ts": now - 3590,
+              "gh_self_reply_ts": now - 3600,
+              "unanswered_human": False,
+          },
+          now=now - 3590,
+      )
+      store.link_artifact(w_b3_lag, "github_pr:flutter/flutter:198004", role="primary", now=now)
+      store.link_artifact(w_b3_lag, "gmail_thread:th_b3_lag", role="channel", now=now)
+      store.reconcile_correspondence_obligations(w_b3_lag, now=now)
+      b3_lag_proj = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now)
+      b3_lag_card = [c for c in b3_lag_proj["works"] if c["work_id"] == w_b3_lag][0]
+      self.assertEqual(b3_lag_card["lane"], "waiting")
+
+    # B4: Collateral close/merge of another issue number in body must not close target issue
+    with self.subTest("B4"):
+      b4_body = "We closed #109825 as not planned yesterday.\nStill open here."
+      b4_payload = {
+          "messages": [{
+              "id": "m_b4_1",
+              "internalDate": str(int((now - 500) * 1000)),
+              "labelIds": ["INBOX", "CATEGORY_UPDATES"],
+              "snippet": "We closed #109825 as not planned yesterday",
+              "payload": {
+                  "mimeType": "text/plain",
+                  "headers": [
+                      {
+                          "name": "Subject",
+                          "value": "[flutter/flutter] Open target (Issue #116576)",
+                      },
+                      {"name": "From", "value": "Alice <notifications@github.com>"},
+                      {"name": "To", "value": "flutter/flutter <flutter@noreply.github.com>"},
+                  ],
+                  "body": {"data": _b64(b4_body)},
+              },
+          }]
+      }
+      with mock.patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["gmail"], 0, stdout=json.dumps(b4_payload), stderr=""
+        )
+        prov_b4 = ingestor._fetch_gmail_thread_provenance("th_b4_open", {}, now)
+      self.assertFalse(bool(prov_b4.get("gh_thread_closed")))
+
+    # B5: CL-less Work with already-closed/locked GitHub issue (0 obligations) completes to done
+    with self.subTest("B5"):
+      w_b5 = store.create_work("CL-less closed GH issue #116577", now=now - 10000)
+      store.upsert_artifact(
+          "github_issue:flutter/flutter:116577",
+          kind="github_issue",
+          title="flutter#116577: Closed issue with no CL",
+          state={"status": "CLOSED", "locked": True, "closed_at": now - 3600, "synced_at": now},
+          now=now,
+      )
+      store.upsert_artifact(
+          "gmail_thread:th_b5",
+          kind="gmail_thread",
+          title="[flutter/flutter] Closed issue (Issue #116577) (Bob)",
+          state={
+              "thread_id": "th_b5",
+              "root_subject": "[flutter/flutter] Closed issue (Issue #116577)",
+              "gh_target_key": "github_issue:flutter/flutter:116577",
+              "is_github_issue_thread": True,
+              "gh_locked": True,
+              "gh_thread_closed": True,
+              "last_from_me": False,
+              "unanswered_human": False,
+          },
+          now=now,
+      )
+      store.link_artifact(w_b5, "github_issue:flutter/flutter:116577", role="primary", now=now)
+      store.link_artifact(w_b5, "gmail_thread:th_b5", role="primary", now=now)
+      store.reconcile_correspondence_obligations(w_b5, now=now)
+      b5_proj = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now)
+      b5_card = [c for c in b5_proj["works"] if c["work_id"] == w_b5][0]
+      self.assertEqual(b5_card["obligations"], [])
+      self.assertEqual(b5_card["lane"], "done")
+
+      # Pure chat_chain Works without CLs or closed bugs stay waiting
+      w_b5_chat = store.create_work("Pure chat stays waiting", now=now - 10000)
+      store.upsert_artifact(
+          "chat_chain:pure_b5",
+          kind="chat_chain",
+          title="Debugging chat",
+          state={"bucket": "waiting"},
+          now=now,
+      )
+      store.link_artifact(w_b5_chat, "chat_chain:pure_b5", role="primary", now=now)
+      b5_chat_proj = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now)
+      b5_chat_card = [c for c in b5_chat_proj["works"] if c["work_id"] == w_b5_chat][0]
+      self.assertEqual(b5_chat_card["lane"], "waiting")
+
+    # B6: Generic <owner>/<repo> and <4-digit GH notifications never map to flutter/flutter
+    with self.subTest("B6"):
+      self.assertEqual(
+          ingestor.extract_artifacts_from_text("[Rusino/paragraph] Fix wrap (PR #42)"),
+          [(
+              "github_pr:Rusino/paragraph:42",
+              "github_pr",
+              "https://github.com/Rusino/paragraph/pull/42",
+          )],
+      )
+      self.assertEqual(
+          ingestor.extract_artifacts_from_text("[Rusino/paragraph] Fix wrap (PR #1234)"),
+          [(
+              "github_pr:Rusino/paragraph:1234",
+              "github_pr",
+              "https://github.com/Rusino/paragraph/pull/1234",
+          )],
+      )
+      self.assertEqual(
+          ingestor.extract_artifacts_from_text("Re: PR #197779"),
+          [(
+              "github_pr:flutter/flutter:197779",
+              "github_pr",
+              "https://github.com/flutter/flutter/pull/197779",
+          )],
+      )
+      b6_body = "Updated line wrapping in https://github.com/Rusino/paragraph/pull/42"
+      b6_payload = {
+          "messages": [{
+              "id": "m_b6_1",
+              "internalDate": str(int((now - 120) * 1000)),
+              "labelIds": ["INBOX", "CATEGORY_UPDATES"],
+              "snippet": "Please check PR #42",
+              "payload": {
+                  "mimeType": "text/plain",
+                  "headers": [
+                      {"name": "Subject", "value": "[Rusino/paragraph] Fix wrap (PR #42)"},
+                      {"name": "From", "value": "Someone <notifications@github.com>"},
+                      {"name": "To", "value": "Rusino/paragraph <paragraph@noreply.github.com>"},
+                  ],
+                  "body": {"data": _b64(b6_body)},
+              },
+          }]
+      }
+
+      def _fake_gmail_b6(cmd: list[str], **_kw: object) -> subprocess.CompletedProcess[str]:
+        if "drafts" in cmd:
+          return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+        if "search" in cmd:
+          q = cmd[cmd.index("search") + 1]
+          if "notifications@github.com" in q:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=json.dumps([{"threadId": "th_b6_para"}]), stderr=""
+            )
+          return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+        if "get-thread" in cmd and "th_b6_para" in cmd:
+          return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(b6_payload), stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr="")
+
+      with (
+          mock.patch.object(ingestor.os.path, "isfile", return_value=True),
+          mock.patch("subprocess.run", side_effect=_fake_gmail_b6),
+      ):
+        ingestor.ingest_gmail_drafts_and_threads(store, {}, now=now)
+      b6_wid = store.find_work_by_artifact("github_pr:Rusino/paragraph:42", roles=("primary",))
+      self.assertTrue(bool(b6_wid))
+      self.assertIsNone(store.get_artifact("github_pr:flutter/flutter:42"))
+
+
 
 if __name__ == "__main__":
   unittest.main()

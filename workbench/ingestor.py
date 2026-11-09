@@ -188,9 +188,23 @@ def _parse_mcp_call_args(args: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
 # GitHub PR notification emails embed /issues/<N> inside pull_request hovercard attributes
 _RE_GH_HOVERCARD_DATA_ATTR = re.compile(
     r'data-(?:url|hydro-click)=(["\'])(?:(?!\1).)*?'
-    r"github\.com/flutter/flutter/issues/\d+(?:(?!\1).)*?\1",
+    r"github\.com/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+/issues/\d+(?:(?!\1).)*?\1",
     re.IGNORECASE,
 )
+_RE_GH_REPO_URL = re.compile(
+    r"github\.com/([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)/(pull|issues)/(\d+)\b",
+    re.IGNORECASE,
+)
+_RE_GH_REPO_NOTIF = re.compile(
+    r"\[([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\][^\n]*?(\((PR|Issue)\s+#(\d+)\))",
+    re.IGNORECASE,
+)
+
+
+def _mask_span(chars: list[str], start: int, end: int) -> None:
+  """Replaces [start:end] in a mutable character buffer with spaces preserving offsets."""
+  for idx in range(start, end):
+    chars[idx] = " "
 
 
 def extract_artifacts_from_text(text: str) -> list[tuple[str, str, str]]:
@@ -203,6 +217,21 @@ def extract_artifacts_from_text(text: str) -> list[tuple[str, str, str]]:
   issue_scan_text = _RE_GH_HOVERCARD_DATA_ATTR.sub(
       lambda m: " " * len(m.group(0)), text
   )
+
+  # Mask repo-scoped GitHub URLs and [owner/repo] (PR/Issue #N) tails before flutter defaults run
+  bare_chars = list(text)
+  bare_issue_chars = list(issue_scan_text)
+  repo_url_matches = list(_RE_GH_REPO_URL.finditer(text))
+  repo_issue_url_matches = list(_RE_GH_REPO_URL.finditer(issue_scan_text))
+  repo_notif_matches = list(_RE_GH_REPO_NOTIF.finditer(text))
+  for m in repo_url_matches:
+    _mask_span(bare_chars, m.start(), m.end())
+    _mask_span(bare_issue_chars, m.start(), m.end())
+  for m in repo_notif_matches:
+    _mask_span(bare_chars, m.start(2), m.end(2))
+    _mask_span(bare_issue_chars, m.start(2), m.end(2))
+  bare_text = "".join(bare_chars)
+  bare_issue_text = "".join(bare_issue_chars)
 
   def _add(pos: int, key: str, kind: str, url: str) -> None:
     if key not in found or pos < found[key][0]:
@@ -228,7 +257,27 @@ def extract_artifacts_from_text(text: str) -> list[tuple[str, str, str]]:
           f"https://chromium-review.googlesource.com/c/chromium/src/+/{num}",
       )
 
-  for m in RE_GITHUB_PR.finditer(text):
+  for m in repo_url_matches:
+    repo_slug, ref_kind, num = m.group(1), m.group(2).lower(), m.group(3)
+    if ref_kind == "pull" and num not in DUMMY_IDS:
+      _add(
+          m.start(),
+          f"github_pr:{repo_slug}:{num}",
+          "github_pr",
+          f"https://github.com/{repo_slug}/pull/{num}",
+      )
+
+  for m in repo_notif_matches:
+    repo_slug, ref_kind, num = m.group(1), m.group(3).lower(), m.group(4)
+    if ref_kind == "pr" and num not in DUMMY_IDS:
+      _add(
+          m.start(),
+          f"github_pr:{repo_slug}:{num}",
+          "github_pr",
+          f"https://github.com/{repo_slug}/pull/{num}",
+      )
+
+  for m in RE_GITHUB_PR.finditer(bare_text):
     num = m.group(1)
     if num not in DUMMY_IDS:
       _add(
@@ -238,8 +287,36 @@ def extract_artifacts_from_text(text: str) -> list[tuple[str, str, str]]:
           f"https://github.com/flutter/flutter/pull/{num}",
       )
 
-  # GitHub PRs and issues share one counter per repo; suppress PR numbers in (flutter/flutter#N)
-  for m in RE_FLUTTER_ISSUE.finditer(issue_scan_text):
+  # GitHub PRs and issues share one counter per repo; suppress PR numbers in (owner/repo#N)
+  for m in repo_issue_url_matches:
+    repo_slug, ref_kind, num = m.group(1), m.group(2).lower(), m.group(3)
+    if (
+        ref_kind == "issues"
+        and num not in DUMMY_IDS
+        and f"github_pr:{repo_slug}:{num}" not in found
+    ):
+      _add(
+          m.start(),
+          f"github_issue:{repo_slug}:{num}",
+          "github_issue",
+          f"https://github.com/{repo_slug}/issues/{num}",
+      )
+
+  for m in repo_notif_matches:
+    repo_slug, ref_kind, num = m.group(1), m.group(3).lower(), m.group(4)
+    if (
+        ref_kind == "issue"
+        and num not in DUMMY_IDS
+        and f"github_pr:{repo_slug}:{num}" not in found
+    ):
+      _add(
+          m.start(),
+          f"github_issue:{repo_slug}:{num}",
+          "github_issue",
+          f"https://github.com/{repo_slug}/issues/{num}",
+      )
+
+  for m in RE_FLUTTER_ISSUE.finditer(bare_issue_text):
     num = m.group(1)
     if num not in DUMMY_IDS and f"github_pr:flutter/flutter:{num}" not in found:
       _add(
@@ -320,8 +397,9 @@ def extract_draft_mentioned_keys(subject: str, body: str) -> list[str]:
   return ordered
 
 
-# Capture optional PR/pull prefix so PR bullets are never misread as GitHub issue bug_titles
+# Anchor inline bug titles at bullet/line start so prose citations never stamp bug_titles
 _RE_INLINE_FLUTTER_TITLE = re.compile(
+    r"^(?:[-*•▪▫◦]|\d+[.)]|\[[ xX]\])?\s*"
     r"(?P<pr_prefix>\bPR\s*|\bpull/)?(?:#|flutter#)(\d{4,7})\b\s*[—–\-:]\s*([^\n(]+)",
     re.IGNORECASE,
 )
@@ -330,6 +408,7 @@ _RE_GH_NOTIF_ISSUE_TITLE = re.compile(
     re.IGNORECASE,
 )
 _RE_INLINE_BUGANIZER_TITLE = re.compile(
+    r"^(?:[-*•▪▫◦]|\d+[.)]|\[[ xX]\])?\s*"
     r"\b(?:b|crbug)/(\d{7,10})\b\s*[—–\-:]\s*([^\n(]+)",
     re.IGNORECASE,
 )
@@ -353,17 +432,17 @@ def extract_bug_titles_from_html_or_text(raw: str) -> dict[str, str]:
       if num not in DUMMY_IDS and len(desc) >= 6:
         ck = work_store.canonicalize_artifact_key("flutter_issue", num)
         titles[ck] = desc
-    for m in _RE_INLINE_FLUTTER_TITLE.finditer(clean_line):
-      if m.group("pr_prefix"):
-        continue
+    m = _RE_INLINE_FLUTTER_TITLE.match(clean_line)
+    if m and not m.group("pr_prefix"):
       num = m.group(2)
       desc = m.group(3).strip(" —–-:;,.()")
       if num not in DUMMY_IDS and len(desc) >= 6:
         ck = work_store.canonicalize_artifact_key("flutter_issue", num)
         titles[ck] = desc
-    for m in _RE_INLINE_BUGANIZER_TITLE.finditer(clean_line):
-      num = m.group(1)
-      desc = m.group(2).strip(" —–-:;,.()")
+    m_b = _RE_INLINE_BUGANIZER_TITLE.match(clean_line)
+    if m_b:
+      num = m_b.group(1)
+      desc = m_b.group(2).strip(" —–-:;,.()")
       if num not in DUMMY_IDS and len(desc) >= 6:
         ck = work_store.canonicalize_artifact_key("buganizer", num)
         titles[ck] = desc
@@ -1590,6 +1669,88 @@ def _is_eligible_inbound_human_thread(prov: Mapping[str, Any]) -> bool:
   return 1 <= rec_cnt <= MAX_HUMAN_GROUP_RECIPIENTS
 
 
+_GH_BOT_LOGINS = frozenset({
+    "github-actions",
+    "flutter-dashboard",
+    "gemini-code-assist",
+    "dependabot",
+    "fluttergithubbot",
+    "skia-autoroll",
+    "engine-flutter-autoroll",
+    "skia-flutter-autoroll",
+    "cocoon",
+    "codecov",
+    "cla-bot",
+    "googlebot",
+})
+
+_RE_GH_LOCK_MSG = re.compile(
+    r"(?:thread\s+has\s+been\s+(?:automatically\s+)?locked"
+    r"|conversation\s+has\s+been\s+locked"
+    r"|\blocked\s+(?:as\s+\w+\s+)?and\s+limited\s+conversation\b)",
+    re.IGNORECASE,
+)
+_RE_GH_CLOSED_LINE = re.compile(
+    r"(?:(?:^|\n)\s*(?:closed|merged)\s+#(\d+)\b"
+    r"|\b(?:closed|merged)\s+#(\d+)\s+(?:as\s+(?:completed|not\s+planned|duplicate)|via\s+|into\s+))",
+    re.IGNORECASE,
+)
+_RE_GH_REOPENED_LINE = re.compile(
+    r"(?:^|\n)\s*reopened\s+#(\d+)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_github_bot_login(login: str) -> bool:
+  """Returns True when a GitHub login or notification sender belongs to automation."""
+  low = str(login or "").strip().lower()
+  if not low:
+    return False
+  return (
+      low in _GH_BOT_LOGINS
+      or low.endswith(("[bot]", "-bot", "_bot"))
+      or "autoroll" in low
+  )
+
+
+def _is_self_github_actor(node: Mapping[str, Any]) -> bool:
+  """Returns True when a GraphQL comment or review node was authored by Julia (Rusino)."""
+  if bool(node.get("viewerDidAuthor")):
+    return True
+  author = node.get("author")
+  login = str(author.get("login") or "") if isinstance(author, Mapping) else ""
+  return login.strip().lower() == "rusino"
+
+
+def _update_gh_notif_closure_state(
+    body_txt: str,
+    snip: str,
+    mts: float,
+    gh_closure: dict[str, Any],
+    target_num: str = "",
+) -> None:
+  """Updates lock/close/reopen state from one decoded GitHub notification message."""
+  text = f"{body_txt}\n{snip}"
+  if _RE_GH_LOCK_MSG.search(text):
+    gh_closure["locked"] = True
+    gh_closure["closed"] = True
+    if mts > float(gh_closure.get("closed_ts") or 0.0):
+      gh_closure["closed_ts"] = mts
+  for m in _RE_GH_CLOSED_LINE.finditer(text):
+    num = m.group(1) or m.group(2)
+    if target_num and num != target_num:
+      continue
+    gh_closure["closed"] = True
+    if mts > float(gh_closure.get("closed_ts") or 0.0):
+      gh_closure["closed_ts"] = mts
+  for m in _RE_GH_REOPENED_LINE.finditer(text):
+    if target_num and m.group(1) != target_num:
+      continue
+    if mts >= float(gh_closure.get("closed_ts") or 0.0):
+      gh_closure["closed"] = False
+      gh_closure["closed_ts"] = 0.0
+
+
 def _fetch_gmail_thread_provenance(
     thread_id: str,
     thread_cache: dict[str, Any],
@@ -1602,7 +1763,7 @@ def _fetch_gmail_thread_provenance(
   cached = thread_cache.get(tid)
   if (
       isinstance(cached, Mapping)
-      and int(cached.get("schema_ver") or 0) == 5
+      and int(cached.get("schema_ver") or 0) == 6
       and (now - float(cached.get("fetched_at") or 0.0) < 600)
   ):
     return dict(cached)
@@ -1636,9 +1797,14 @@ def _fetch_gmail_thread_provenance(
     to0 = h0.get("to") or ""
     started_by_me = _is_me_sender(from0)
     origin_from = _clean_display_name(from0)
-    is_gh_issue = "notifications@github.com" in from0.lower() and bool(
-        re.search(r"\(Issue\s+#\d+\)", raw_subj, flags=re.IGNORECASE)
+    gh_target_key = (
+        work_store.extract_github_notif_target(root_subj)
+        if "notifications@github.com" in from0.lower()
+        else ""
     )
+    is_gh_issue = gh_target_key.startswith("github_issue:")
+    is_gh_pr = gh_target_key.startswith("github_pr:")
+    is_gh_notif = is_gh_issue or is_gh_pr
     is_gdoc_comment = "comments-noreply@docs.google.com" in from0.lower()
     is_drive_share = bool(
         "drive-shares-dm-noreply@google.com" in from0.lower()
@@ -1676,6 +1842,8 @@ def _fetch_gmail_thread_provenance(
     seen_non_personal_cat = False
     is_bulk_or_list = False
     inbound_hdrs: list[dict[str, str]] = []
+    gh_closure: dict[str, Any] = {"locked": False, "closed": False, "closed_ts": 0.0}
+    gh_target_num = gh_target_key.rsplit(":", 1)[-1] if gh_target_key else ""
     for m in msgs:
       if not isinstance(m, Mapping):
         continue
@@ -1703,14 +1871,20 @@ def _fetch_gmail_thread_provenance(
       if "drive-shares-dm-noreply@google.com" in f_hdr.lower():
         is_drive_share = True
       mts = float(int(m.get("internalDate") or 0)) / 1000.0 if m.get("internalDate") else 0.0
+      if is_gh_notif:
+        _update_gh_notif_closure_state(
+            body_txt, snip, mts, gh_closure, target_num=gh_target_num
+        )
       is_me = _is_me_sender(f_hdr)
       cand_sender = _clean_display_name(f_hdr)
       is_gdoc_human_proxy = (
           ("comments-noreply@docs.google.com" in f_hdr.lower())
           or ("drive-shares-dm-noreply@google.com" in f_hdr.lower())
       ) and bool(cand_sender) and cand_sender.lower() not in ("google docs", "google drive")
+      is_gh_bot = is_gh_notif and _is_github_bot_login(cand_sender)
       is_bot = (
           "[bot]" in cand_sender.lower()
+          or is_gh_bot
           or (not is_gdoc_human_proxy and bool(_RE_AUTOMATED_SENDER_ADDR.search(f_hdr)))
       )
       if is_me:
@@ -1724,7 +1898,7 @@ def _fetch_gmail_thread_provenance(
         if _NON_PERSONAL_CATEGORIES & m_labels:
           seen_non_personal_cat = True
         # GitHub @mention notifications intentionally carry List-Id/Precedence: list headers
-        if not is_gh_issue and not is_gdoc_comment:
+        if not is_gh_notif and not is_gdoc_comment:
           prec = str(hm.get("precedence") or "").strip().lower()
           auto_sub = str(hm.get("auto-submitted") or "").strip().lower()
           if (
@@ -1737,7 +1911,7 @@ def _fetch_gmail_thread_provenance(
               or auto_sub not in ("", "no")
           ):
             is_bulk_or_list = True
-      if mts >= last_message_ts and not (is_gh_issue and "[bot]" in cand_sender.lower()):
+      if mts >= last_message_ts and not is_gh_bot:
         last_message_ts = mts
         last_from_me = is_me
         last_labels = m_labels
@@ -1748,7 +1922,7 @@ def _fetch_gmail_thread_provenance(
         non_bot_human_count += 1
       if not is_me and f_hdr and not is_bot:
         if cand_sender:
-          if not counterparty or is_gh_issue or is_gdoc_comment:
+          if not counterparty or is_gh_notif or is_gdoc_comment:
             counterparty = cand_sender
         if mts > counterparty_reply_ts:
           counterparty_reply_ts = mts
@@ -1815,7 +1989,7 @@ def _fetch_gmail_thread_provenance(
           gdoc_resolved_by_me = bool(last_from_me)
 
     prov = {
-        "schema_ver": 5,
+        "schema_ver": 6,
         "thread_id": tid,
         "origin_ts": origin_ts,
         "root_subject": root_subj,
@@ -1831,7 +2005,12 @@ def _fetch_gmail_thread_provenance(
         "counterparty_reply_ts": counterparty_reply_ts,
         "message_count": len(msgs),
         "non_bot_human_count": non_bot_human_count,
+        "gh_target_key": gh_target_key,
         "is_github_issue_thread": is_gh_issue,
+        "is_github_pr_thread": is_gh_pr,
+        "gh_locked": bool(gh_closure["locked"]),
+        "gh_thread_closed": bool(gh_closure["closed"]),
+        "gh_closed_ts": float(gh_closure["closed_ts"]),
         "is_gdoc_comment": is_gdoc_comment,
         "is_automated": is_automated,
         "is_drive_share": is_drive_share,
@@ -2520,8 +2699,11 @@ def ingest_gmail_drafts_and_threads(
           continue
         if any(tok in cp.lower() for tok in ("unsubscribe", "noreply", "organizers")):
           continue
+        is_gh_notif = bool(
+            t_prov.get("is_github_issue_thread") or t_prov.get("is_github_pr_thread")
+        )
         if pass_kind == "gh_issue":
-          if not t_prov.get("is_github_issue_thread"):
+          if not is_gh_notif:
             continue
           if int(t_prov.get("non_bot_human_count") or 0) < 1:
             continue
@@ -2535,14 +2717,34 @@ def ingest_gmail_drafts_and_threads(
         t_key = f"gmail_thread:{tid}"
         t_url = f"https://mail.google.com/mail/u/0/#all/{tid}"
         t_title = f"{root_subj} ({cp})" if cp.lower() not in root_subj.lower() else root_subj
+        # Skip trashed unjoined mail before artifact extraction so it never mints Works
+        if t_prov.get("in_trash_or_spam") and not t_prov.get("sent_by_me"):
+          if store.get_artifact(t_key) is not None:
+            t_prov["unanswered_human"] = False
+            store.upsert_artifact(
+                t_key, kind="gmail_thread", title=t_title, url=t_url, state=t_prov, now=cur_now
+            )
+          continue
         full_text = str(t_prov.get("thread_text") or root_subj)
         t_arts = extract_artifacts_from_text(full_text)
         inline_bug_titles = extract_bug_titles_from_html_or_text(full_text)
+        gh_target_key = str(
+            t_prov.get("gh_target_key") or work_store.extract_github_notif_target(root_subj)
+        )
         raw_primaries = [
             (akey, akind, aurl)
             for akey, akind, aurl in t_arts
             if akind in ("gerrit", "github_pr", "piper", "buganizer", "github_issue", "gdoc")
         ]
+        if (
+            is_gh_notif
+            and gh_target_key.startswith(("github_issue:", "github_pr:"))
+            and gh_target_key not in {k for k, _, _ in raw_primaries}
+        ):
+          gh_kind = "github_pr" if gh_target_key.startswith("github_pr:") else "github_issue"
+          raw_primaries.insert(
+              0, (gh_target_key, gh_kind, work_store._default_artifact_url(gh_target_key))
+          )
         tech_primaries = [x for x in raw_primaries if x[1] != "gdoc"]
         is_drive_share = bool(
             t_prov.get("is_drive_share")
@@ -2558,19 +2760,30 @@ def ingest_gmail_drafts_and_threads(
             )
           continue
 
-        # Separate passing CL citations in the email body from focused primary targets
+        # Separate passing CL citations and collateral issue-thread bug citations from root targets
         subj_cl_keys = {
             k
             for k, kind, _ in extract_artifacts_from_text(root_subj)
             if kind in ("gerrit", "github_pr", "piper")
         }
+        if is_gh_notif and gh_target_key.startswith("github_pr:"):
+          subj_cl_keys.add(gh_target_key)
         email_bug_keys = {
             k for k, kind, _ in raw_primaries if kind in ("buganizer", "github_issue")
         }
         cp_tokens = {tok for tok in re.split(r"\W+", cp.strip().lower()) if len(tok) >= 3}
         t_primaries: list[tuple[str, str, str]] = []
         context_cl_refs: list[tuple[str, str, str]] = []
+        context_bug_refs: list[tuple[str, str, str]] = []
         for akey, akind, aurl in raw_primaries:
+          if (
+              t_prov.get("is_github_issue_thread")
+              and gh_target_key.startswith("github_issue:")
+              and akind in ("buganizer", "github_issue")
+              and akey != gh_target_key
+          ):
+            context_bug_refs.append((akey, akind, aurl))
+            continue
           if akind in ("gerrit", "github_pr", "piper") and akey not in subj_cl_keys:
             w_owner = store.find_work_by_artifact(akey, roles=("primary",))
             w_roles = store.get_work_artifact_roles(w_owner) if w_owner else {}
@@ -2585,7 +2798,10 @@ def ingest_gmail_drafts_and_threads(
             for k_r, r_val in w_roles.items():
               if k_r.startswith("gmail_thread:") and k_r != t_key and r_val == "primary":
                 other_st = (store.get_artifact(k_r) or {}).get("state") or {}
-                if not other_st.get("is_github_issue_thread"):
+                if not (
+                    other_st.get("is_github_issue_thread")
+                    or other_st.get("is_github_pr_thread")
+                ):
                   other_cp = str(other_st.get("counterparty") or "").strip().lower()
                   other_toks = {tok for tok in re.split(r"\W+", other_cp) if len(tok) >= 3}
                   if other_toks and cp_tokens and not (other_toks & cp_tokens):
@@ -2627,16 +2843,19 @@ def ingest_gmail_drafts_and_threads(
             matched_wids.append(w_match)
 
         is_recent_reply = (cur_now - float(t_prov.get("last_message_ts") or 0.0)) <= 14 * 86400
+        existing_t_st = ((store.get_artifact(t_key) or {}).get("state")) or {}
+        gh_resolved = _is_gh_notif_resolved(store, t_prov, existing_t_st)
         t_prov["unanswered_human"] = bool(
             not t_prov.get("last_from_me", True)
             and not t_prov.get("is_automated")
+            and not gh_resolved
             and not _thread_covered_by_draft(
                 tid, float(t_prov.get("last_message_ts") or 0.0), draft_ts_by_thread
             )
             and is_recent_reply
             and (
                 t_prov.get("sent_by_me")
-                or t_prov.get("is_github_issue_thread")
+                or is_gh_notif
                 or bool(existing_tid_wid)
             )
         )
@@ -2655,7 +2874,7 @@ def ingest_gmail_drafts_and_threads(
                 t_key, kind="gmail_thread", title=t_title, url=t_url, state=t_prov, now=cur_now
             )
           continue
-        if not t_prov.get("sent_by_me") and not t_prov.get("is_github_issue_thread"):
+        if not t_prov.get("sent_by_me") and not is_gh_notif:
           ineligible_inbound = (
               (t_prov.get("is_automated") and (not matched_wids or t_prov.get("is_bulk_or_list")))
               or (
@@ -2692,7 +2911,7 @@ def ingest_gmail_drafts_and_threads(
             and not t_prov.get("sent_by_me")
             and not existing_tid_wid
             and not matched_wids
-            and not t_prov.get("is_github_issue_thread")
+            and not is_gh_notif
         ):
           if existing_tid_wid or t_prov.get("sent_by_me"):
             target_wid = existing_tid_wid or store.create_work(root_subj, now=cur_now)
@@ -2824,19 +3043,16 @@ def ingest_gmail_drafts_and_threads(
             and k != t_key
             and r == "primary"
             and not bool(
-                ((store.get_artifact(k) or {}).get("state") or {}).get(
-                    "is_github_issue_thread"
-                )
+                ((store.get_artifact(k) or {}).get("state") or {}).get("is_github_issue_thread")
+                or ((store.get_artifact(k) or {}).get("state") or {}).get("is_github_pr_thread")
             )
             for k, r in w_roles_now.items()
         )
-        t_role = (
-            "channel"
-            if (t_prov.get("is_github_issue_thread") and has_non_issue_email_root)
-            else "primary"
-        )
+        t_role = "channel" if (is_gh_notif and has_non_issue_email_root) else "primary"
         t_reason = (
-            "github_issue_thread" if t_prov.get("is_github_issue_thread") else "gmail_root"
+            "github_pr_thread"
+            if t_prov.get("is_github_pr_thread")
+            else ("github_issue_thread" if t_prov.get("is_github_issue_thread") else "gmail_root")
         )
         store.link_artifact(
             target_wid,
@@ -2913,12 +3129,395 @@ def ingest_gmail_drafts_and_threads(
               link_detail=f"Упомянут в письме '{root_subj[:50]}'",
               now=cur_now,
           )
+        for b_akey, b_akind, b_aurl in context_bug_refs:
+          if w_roles_now.get(b_akey) == "primary":
+            continue
+          b_desc = inline_bug_titles.get(b_akey, "")
+          if b_desc:
+            short_b = work_store.format_short_bug_id(b_akey)
+            b_title = f"{short_b}: {b_desc}"
+            b_state: dict[str, Any] | None = {"short_id": short_b, "bug_title": b_desc}
+          else:
+            b_title = ""
+            b_state = None
+          store.upsert_artifact(
+              b_akey, kind=b_akind, title=b_title, url=b_aurl, state=b_state, now=cur_now
+          )
+          store.link_artifact(
+              target_wid,
+              b_akey,
+              role="context_only",
+              source="auto",
+              link_reason="gmail_thread_ref",
+              link_detail=f"Упомянут в письме '{root_subj[:50]}'",
+              now=cur_now,
+          )
         store.reconcile_work_bug_cls(target_wid, now=cur_now)
     except Exception:
       pass
 
+  _refresh_tracked_gmail_threads(store, thread_cache, draft_ts_by_thread, seen_tids, cur_now)
   store.reconcile_correspondence_obligations(now=cur_now)
   return unanswered
+
+
+def _is_gh_notif_resolved(
+    store: work_store.WorkStore,
+    t_prov: Mapping[str, Any],
+    existing_t_st: Mapping[str, Any],
+) -> bool:
+  """Returns True when a GitHub notification thread is resolved against stored target state."""
+  if not (t_prov.get("is_github_issue_thread") or t_prov.get("is_github_pr_thread")):
+    return False
+  gh_target_key = str(
+      t_prov.get("gh_target_key")
+      or existing_t_st.get("gh_target_key")
+      or work_store.extract_github_notif_target(
+          str(t_prov.get("root_subject") or existing_t_st.get("root_subject") or "")
+      )
+  )
+  gh_target_st = (
+      ((store.get_artifact(gh_target_key) or {}).get("state") or {}) if gh_target_key else {}
+  )
+  gh_arts_map = (
+      {gh_target_key: {"state": gh_target_st}}
+      if gh_target_key and isinstance(gh_target_st, Mapping)
+      else None
+  )
+  return work_store.is_github_thread_resolved({**existing_t_st, **t_prov}, gh_arts_map)
+
+
+def _refresh_tracked_gmail_threads(
+    store: work_store.WorkStore,
+    thread_cache: dict[str, Any],
+    draft_ts_by_thread: Mapping[str, float],
+    seen_tids: set[str],
+    cur_now: float,
+    limit: int = 25,
+) -> None:
+  """Refreshes active tracked Gmail threads missed by 21d search passes (e.g. trashed/locked)."""
+  candidates: list[tuple[int, str]] = []
+  queued: set[str] = set()
+  for w in store.list_works(include_archived=False):
+    if str(w.get("status") or "") == "done":
+      continue
+    w_roles = store.get_work_artifact_roles(str(w["work_id"]))
+    for akey, role in w_roles.items():
+      if not akey.startswith("gmail_thread:") or role not in ("primary", "channel"):
+        continue
+      tid = akey.split(":", 1)[1].strip()
+      if not tid or tid in seen_tids or tid in queued:
+        continue
+      queued.add(tid)
+      prev_st = ((store.get_artifact(akey) or {}).get("state")) or {}
+      # Refresh stale schema or unanswered threads first so active cards never starve
+      pri = 0 if (int(prev_st.get("schema_ver") or 0) < 6 or prev_st.get("unanswered_human")) else 1
+      candidates.append((pri, tid))
+
+  candidates.sort(key=lambda item: item[0])
+  for _, tid in candidates[:limit]:
+    seen_tids.add(tid)
+    t_prov = _fetch_gmail_thread_provenance(tid, thread_cache, cur_now)
+    if not t_prov.get("schema_ver"):
+      continue
+    t_key = f"gmail_thread:{tid}"
+    prev_art = store.get_artifact(t_key) or {}
+    prev_st = prev_art.get("state") if isinstance(prev_art.get("state"), Mapping) else {}
+    prev_msg_ts = float(prev_st.get("last_message_ts") or 0.0)
+    new_msg_ts = float(t_prov.get("last_message_ts") or 0.0)
+    gh_resolved = _is_gh_notif_resolved(store, t_prov, prev_st)
+    trashed_unjoined = bool(t_prov.get("in_trash_or_spam")) and not bool(t_prov.get("sent_by_me"))
+    if (
+        t_prov.get("last_from_me", True)
+        or t_prov.get("is_automated")
+        or trashed_unjoined
+        or gh_resolved
+        or _thread_covered_by_draft(tid, new_msg_ts, draft_ts_by_thread)
+    ):
+      t_prov["unanswered_human"] = False
+    elif new_msg_ts > prev_msg_ts and (cur_now - new_msg_ts) <= 14 * 86400:
+      t_prov["unanswered_human"] = True
+    else:
+      t_prov["unanswered_human"] = bool(prev_st.get("unanswered_human"))
+
+    cp = str(t_prov.get("counterparty") or "").strip()
+    root_subj = str(t_prov.get("root_subject") or "").strip()
+    t_title = (
+        f"{root_subj} ({cp})"
+        if (root_subj and cp and cp.lower() not in root_subj.lower())
+        else root_subj
+    )
+    store.upsert_artifact(
+        t_key,
+        kind="gmail_thread",
+        title=t_title,
+        url=f"https://mail.google.com/mail/u/0/#all/{tid}",
+        state=t_prov,
+        now=cur_now,
+    )
+
+
+def _collect_github_sync_targets(
+    store: work_store.WorkStore,
+) -> tuple[list[tuple[str, str, str, int]], dict[str, set[str]]]:
+  """Collects active GitHub Issue/PR targets (primary/channel before context_only) and threads."""
+  primary_targets: list[tuple[str, str, str, int]] = []
+  context_targets: list[tuple[str, str, str, int]] = []
+  seen_targets: set[str] = set()
+  target_to_gmail_keys: dict[str, set[str]] = {}
+
+  def _parse_gh_key(akey: str) -> tuple[str, str, int] | None:
+    parts = akey.split(":")
+    if len(parts) != 3 or "/" not in parts[1] or not parts[2].isdigit():
+      return None
+    owner, repo = parts[1].split("/", 1)
+    if not re.match(r"^[A-Za-z0-9_.\-]+$", owner) or not re.match(r"^[A-Za-z0-9_.\-]+$", repo):
+      return None
+    return owner, repo, int(parts[2])
+
+  for w in store.list_works(include_archived=False):
+    if str(w.get("status") or "") == "done":
+      continue
+    w_roles = store.get_work_artifact_roles(str(w["work_id"]))
+    for akey, role in w_roles.items():
+      if akey.startswith("gmail_thread:") and role in ("primary", "channel"):
+        art = store.get_artifact(akey) or {}
+        st = art.get("state") if isinstance(art.get("state"), Mapping) else {}
+        t_key = str(st.get("gh_target_key") or "") or work_store.extract_github_notif_target(
+            str(st.get("root_subject") or art.get("title") or "")
+        )
+        if t_key.startswith(("github_issue:", "github_pr:")):
+          target_to_gmail_keys.setdefault(t_key, set()).add(akey)
+          if t_key not in seen_targets:
+            parsed = _parse_gh_key(t_key)
+            if parsed:
+              seen_targets.add(t_key)
+              primary_targets.append((t_key, parsed[0], parsed[1], parsed[2]))
+      elif akey.startswith(("github_issue:", "github_pr:")) and akey not in seen_targets:
+        parsed = _parse_gh_key(akey)
+        if parsed:
+          seen_targets.add(akey)
+          entry = (akey, parsed[0], parsed[1], parsed[2])
+          if role in ("primary", "channel"):
+            primary_targets.append(entry)
+          else:
+            context_targets.append(entry)
+
+  return primary_targets + context_targets, target_to_gmail_keys
+
+
+def _build_github_graphql_query(owner: str, repo: str, chunk: list[tuple[str, int]]) -> str:
+  """Builds a batched GraphQL issueOrPullRequest query for one repository chunk."""
+  fields: list[str] = []
+  for idx, (_, num) in enumerate(chunk):
+    fields.append(
+        f"n{idx}: issueOrPullRequest(number: {num}) {{\n"
+        "      __typename\n"
+        "      ... on Issue {\n"
+        "        number title state locked closedAt updatedAt url\n"
+        "        comments(last: 20) { nodes { createdAt viewerDidAuthor author { login } } }\n"
+        "      }\n"
+        "      ... on PullRequest {\n"
+        "        number title state locked closedAt mergedAt updatedAt url\n"
+        "        comments(last: 20) { nodes { createdAt viewerDidAuthor author { login } } }\n"
+        "        reviews(last: 20) {\n"
+        "          nodes { state submittedAt viewerDidAuthor author { login } }\n"
+        "        }\n"
+        "      }\n"
+        "    }"
+    )
+  body = "\n    ".join(fields)
+  return f'query {{ repository(owner: "{owner}", name: "{repo}") {{\n    {body}\n  }} }}'
+
+
+def _extract_github_comment_timestamps(node: Mapping[str, Any]) -> tuple[float, float]:
+  """Returns (last_self_comment_at, last_human_comment_at) across Issue/PR comments & reviews."""
+  last_self_ts = 0.0
+  last_human_ts = 0.0
+  comments = ((node.get("comments") or {}).get("nodes") or []) if isinstance(
+      node.get("comments"), Mapping
+  ) else []
+  for item in comments:
+    if not isinstance(item, Mapping):
+      continue
+    ts = _parse_iso_ts(str(item.get("createdAt") or ""))
+    if ts <= 0:
+      continue
+    if _is_self_github_actor(item):
+      last_self_ts = max(last_self_ts, ts)
+    else:
+      author = item.get("author")
+      login = str(author.get("login") or "") if isinstance(author, Mapping) else ""
+      if not _is_github_bot_login(login):
+        last_human_ts = max(last_human_ts, ts)
+
+  reviews = ((node.get("reviews") or {}).get("nodes") or []) if isinstance(
+      node.get("reviews"), Mapping
+  ) else []
+  for rev in reviews:
+    if not isinstance(rev, Mapping):
+      continue
+    if str(rev.get("state") or "").strip().upper() == "PENDING":
+      continue
+    sub_at = str(rev.get("submittedAt") or "").strip()
+    if not sub_at:
+      continue
+    ts = _parse_iso_ts(sub_at)
+    if ts <= 0:
+      continue
+    if _is_self_github_actor(rev):
+      last_self_ts = max(last_self_ts, ts)
+    else:
+      author = rev.get("author")
+      login = str(author.get("login") or "") if isinstance(author, Mapping) else ""
+      if not _is_github_bot_login(login):
+        last_human_ts = max(last_human_ts, ts)
+  return last_self_ts, last_human_ts
+
+
+def _apply_github_node_to_store(
+    store: work_store.WorkStore,
+    akey: str,
+    node: Mapping[str, Any],
+    linked_gmail_keys: set[str],
+    cur_now: float,
+) -> None:
+  """Updates one GitHub Issue/PR artifact and its linked Gmail thread correspondence state."""
+  gh_title = str(node.get("title") or "").strip()
+  gh_status = str(node.get("state") or "").strip().upper()
+  gh_locked = bool(node.get("locked"))
+  closed_at = _parse_iso_ts(str(node.get("closedAt") or ""))
+  merged_at = _parse_iso_ts(str(node.get("mergedAt") or ""))
+  updated_at = _parse_iso_ts(str(node.get("updatedAt") or ""))
+  gh_url = str(node.get("url") or "").strip()
+  last_self_ts, last_human_ts = _extract_github_comment_timestamps(node)
+
+  art_state: dict[str, Any] = {
+      "status": gh_status,
+      "locked": gh_locked,
+      "closed_at": closed_at,
+      "merged_at": merged_at,
+      "updated_at": updated_at,
+      "last_self_comment_at": last_self_ts,
+      "last_human_comment_at": last_human_ts,
+      "synced_at": cur_now,
+  }
+  if akey.startswith("github_issue:"):
+    short_b = work_store.format_short_bug_id(akey)
+    art_title = f"{short_b}: {gh_title}" if gh_title else ""
+    if gh_title:
+      art_state["short_id"] = short_b
+      art_state["bug_title"] = gh_title
+    akind = "github_issue"
+  else:
+    num_str = akey.split(":")[-1]
+    art_title = f"{num_str}: {gh_title}" if gh_title else ""
+    akind = "github_pr"
+
+  store.upsert_artifact(akey, kind=akind, title=art_title, url=gh_url, state=art_state, now=cur_now)
+
+  for t_key in linked_gmail_keys:
+    t_art = store.get_artifact(t_key)
+    if not t_art:
+      continue
+    t_st = t_art.get("state") if isinstance(t_art.get("state"), Mapping) else {}
+    t_patch: dict[str, Any] = {
+        "gh_target_key": akey,
+        "gh_locked": gh_locked,
+        "gh_thread_closed": gh_status in ("CLOSED", "MERGED"),
+        "gh_closed_ts": max(closed_at, merged_at),
+    }
+    if last_self_ts > 0:
+      t_patch["gh_self_reply_ts"] = last_self_ts
+    if last_human_ts > 0:
+      t_patch["gh_human_reply_ts"] = last_human_ts
+
+    last_msg_ts = float(t_st.get("last_message_ts") or 0.0)
+    merged_t_st = {**t_st, **t_patch}
+    resolved = work_store.is_github_thread_resolved(merged_t_st, {akey: {"state": art_state}})
+    eff_self_ts = max(float(t_st.get("gh_self_reply_ts") or 0.0), last_self_ts)
+    if resolved:
+      t_patch["unanswered_human"] = False
+    elif eff_self_ts > 0 and eff_self_ts >= last_human_ts and (
+        eff_self_ts >= last_msg_ts or last_msg_ts <= last_human_ts + 30.0
+    ):
+      # Account for 30s Gmail delivery lag so pre-sync notification emails do not mask GH replies
+      t_patch["last_from_me"] = True
+      t_patch["unanswered_human"] = False
+    elif last_human_ts > max(last_msg_ts, eff_self_ts) or (
+        last_human_ts > eff_self_ts
+        and not bool(t_st.get("last_from_me"))
+        and last_msg_ts <= last_human_ts + 30.0
+    ):
+      trashed_unjoined = bool(t_st.get("in_trash_or_spam")) and not bool(t_st.get("sent_by_me"))
+      t_patch["last_from_me"] = False
+      t_patch["unanswered_human"] = not trashed_unjoined and (cur_now - last_human_ts) <= 14 * 86400
+
+    store.upsert_artifact(t_key, kind="gmail_thread", state=t_patch, now=cur_now)
+
+
+def sync_github_artifacts(
+    store: work_store.WorkStore,
+    watcher_state: dict[str, Any],
+    now: float | None = None,
+    force: bool = False,
+) -> int:
+  """Batches gh api graphql queries for non-done Works' GitHub Issues/PRs (300s throttle)."""
+  cur_now = time.time() if now is None else now
+  if not force and (cur_now - float(watcher_state.get("last_github_sync") or 0.0) < 300):
+    return 0
+  watcher_state["last_github_sync"] = cur_now
+
+  targets, target_to_gmail_keys = _collect_github_sync_targets(store)
+  if not targets:
+    return 0
+
+  by_repo: dict[tuple[str, str], list[tuple[str, int]]] = {}
+  for akey, owner, repo, num in targets:
+    by_repo.setdefault((owner, repo), []).append((akey, num))
+
+  updated = 0
+  for (owner, repo), repo_items in by_repo.items():
+    for start in range(0, len(repo_items), 30):
+      chunk = repo_items[start : start + 30]
+      query = _build_github_graphql_query(owner, repo, chunk)
+      try:
+        res = subprocess.run(
+            ["gh", "api", "graphql", "-f", f"query={query}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+      except (subprocess.SubprocessError, OSError):
+        continue
+      if not (res.stdout or "").strip():
+        continue
+      try:
+        payload = json.loads(res.stdout)
+      except json.JSONDecodeError:
+        continue
+      repo_data = (
+          ((payload.get("data") or {}).get("repository") or {})
+          if isinstance(payload, Mapping)
+          else {}
+      )
+      if not isinstance(repo_data, Mapping) or not repo_data:
+        continue
+      by_number = {
+          int(v["number"]): v
+          for v in repo_data.values()
+          if isinstance(v, Mapping) and v.get("number") is not None
+      }
+      for idx, (akey, num) in enumerate(chunk):
+        node = by_number.get(num) or repo_data.get(f"n{idx}")
+        if not isinstance(node, Mapping):
+          continue
+        _apply_github_node_to_store(
+            store, akey, node, target_to_gmail_keys.get(akey, set()), cur_now
+        )
+        updated += 1
+  return updated
 
 
 def run_sync_cycle(
@@ -3007,6 +3606,9 @@ def run_sync_cycle(
     w_state["unanswered_tray"] = unanswered
     w_state["unanswered_tray_schema"] = 5
     w_state["last_gmail_sync"] = cur_now
+
+  if include_gmail:
+    sync_github_artifacts(store, w_state, now=cur_now)
 
   store.purge_config_artifacts_and_works(now=cur_now)
   store.reconcile_correspondence_obligations(now=cur_now)
