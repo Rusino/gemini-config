@@ -26,13 +26,19 @@ description: "When editing source code or tests, writing code comments, commit m
 - Keep each function and loop body at one level of abstraction: extract a self-contained domain
   step with its own local state (e.g. building a font cascade, feature list, or variation map) into
   a helper that returns a value; never slice an algorithm arbitrarily or add trivial wrappers
+- Prefer early `return` or `continue` for preconditions, degenerate cases, and short fast paths
+  when nothing follows the `if`/`else`, keeping the main body unindented; keep `if`/`else` for
+  short symmetric peer branches (e.g. LTR vs RTL) or when shared work runs after both branches
 - Platform or backend code is picked by the build, as in `skunicode` and `skshaper`: its own
   source list in gni/Bazel, `sources +=` under the gn flag. Never wrap a whole `.h`/`.cpp` in
   `#if`; `#if` stays only at call sites in shared code that choose a backend
 - Callbacks are a plain function parameter (`std::function` or a function pointer) by default.
   A template parameter needs a why-comment with a measured cost or a precedent
   (`SkUnicode::forEachCodepoint`); same for any other non-obvious language construct
-- `SkASSERT` invariants at boundaries; no defensive `if (!ptr) return;` along internal call chains
+- Assert invariants at boundaries (`SkASSERT` in Skia, `CHECK`/`DCHECK` in Chromium, `assert` in
+  Dart/TS), with a why-comment when the guarantee is non-obvious; no defensive `if (!ptr) return;`
+  along internal call chains or branches for container/field states that no constructor or builder
+  produces (check the producer and sibling path first)
 - Root-cause fixes only: no special-case branch for the failing input; keep layout, hit-testing,
   caret, selection and rendering consistent
 - Tests: no narrative comment before every assert; test domain edges, not C++ mechanics
