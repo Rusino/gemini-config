@@ -7457,6 +7457,169 @@ for (const q of ['', 'alpha']) {
       self.assertTrue(bool(b6_wid))
       self.assertIsNone(store.get_artifact("github_pr:flutter/flutter:42"))
 
+  def test_github_iso_timestamp_parsing_across_correspondence_and_drafts(self) -> None:
+    # Verify ISO-8601 strings from cl_watcher on GitHub artifacts never crash or skew turn order
+    from datetime import datetime, timezone
+    import work_store
+
+    now = 1794300000.0
+
+    def _iso(ts: float) -> str:
+      return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    ts_old = now - 7200
+    ts_self = now - 3600
+    ts_closed = now - 1800
+    ts_new_human = now - 600
+
+    store = work_store.WorkStore(self.db_path)
+
+    # Closed issue with ISO timestamps (cl_watcher format) must resolve to done without ValueError
+    w_closed = store.create_work("ISO closed issue #198501", now=now - 10000)
+    store.upsert_artifact(
+        "github_issue:flutter/flutter:198501",
+        kind="github_issue",
+        title="flutter#198501: ISO closed issue",
+        state={
+            "status": "CLOSED",
+            "locked": False,
+            "closed_at": _iso(ts_closed),
+            "last_human_comment_at": _iso(ts_old),
+            "last_self_comment_at": _iso(ts_self),
+            "synced_at": _iso(ts_closed + 60),
+        },
+        now=now,
+    )
+    store.upsert_artifact(
+        "gmail_thread:th_iso_closed",
+        kind="gmail_thread",
+        title="[flutter/flutter] ISO closed (Issue #198501) (Alice)",
+        state={
+            "thread_id": "th_iso_closed",
+            "root_subject": "[flutter/flutter] ISO closed (Issue #198501)",
+            "gh_target_key": "github_issue:flutter/flutter:198501",
+            "counterparty": "Alice",
+            "is_github_issue_thread": True,
+            "last_from_me": False,
+            "last_message_ts": ts_old,
+            "unanswered_human": True,
+        },
+        now=now,
+    )
+    store.link_artifact(w_closed, "github_issue:flutter/flutter:198501", role="primary", now=now)
+    store.link_artifact(w_closed, "gmail_thread:th_iso_closed", role="channel", now=now)
+    store.reconcile_correspondence_obligations(w_closed, now=now)
+    # Also verify live cl_watcher_state['bugs'] ISO overlay during projection never crashes
+    proj_closed = store.build_dashboard_projection(
+        cl_watcher_state={
+            "items": {},
+            "bugs": {
+                "gh_issue:flutter/flutter#198501": {
+                    "bug_key": "gh_issue:flutter/flutter#198501",
+                    "source": "github",
+                    "id": "198501",
+                    "tracker_flavor": "github",
+                    "status": "CLOSED",
+                    "last_human_comment_at": _iso(ts_old),
+                    "last_self_comment_at": _iso(ts_self),
+                }
+            },
+        },
+        now=now,
+    )
+    card_closed = [c for c in proj_closed["works"] if c["work_id"] == w_closed][0]
+    self.assertEqual(card_closed["lane"], "done")
+
+    # Open issue with newer ISO human comment must wake done obligation, void stale draft & ping
+    w_open = store.create_work("ISO open issue #198502", now=now - 10000)
+    store.upsert_artifact(
+        "github_issue:flutter/flutter:198502",
+        kind="github_issue",
+        title="flutter#198502: ISO open issue",
+        state={
+            "status": "OPEN",
+            "last_human_comment_at": _iso(ts_old),
+            "last_self_comment_at": _iso(ts_self),
+        },
+        now=now,
+    )
+    store.upsert_artifact(
+        "gmail_thread:th_iso_open",
+        kind="gmail_thread",
+        title="[flutter/flutter] ISO open (Issue #198502) (Bob)",
+        state={
+            "thread_id": "th_iso_open",
+            "root_subject": "[flutter/flutter] ISO open (Issue #198502)",
+            "gh_target_key": "github_issue:flutter/flutter:198502",
+            "counterparty": "Bob",
+            "is_github_issue_thread": True,
+            "last_from_me": True,
+            "last_message_ts": ts_self,
+            "unanswered_human": False,
+        },
+        now=now,
+    )
+    store.link_artifact(w_open, "github_issue:flutter/flutter:198502", role="primary", now=now)
+    store.link_artifact(w_open, "gmail_thread:th_iso_open", role="channel", now=now)
+    store.reconcile_correspondence_obligations(w_open, now=now - 1000)
+    with store._connect() as conn:
+      conn.execute(
+          "UPDATE obligations SET status = 'done', satisfied_at = ? WHERE work_id = ?",
+          (ts_self, w_open),
+      )
+
+    # New ISO human comment arrives after satisfied_at and after draft_updated_ts
+    store.upsert_artifact(
+        "github_issue:flutter/flutter:198502",
+        kind="github_issue",
+        state={"last_human_comment_at": _iso(ts_new_human)},
+        now=now,
+    )
+    th_open_art = store.get_artifact("gmail_thread:th_iso_open") or {}
+    th_open_st = json.loads(th_open_art["state_json"])
+    arts_open = {
+        "github_issue:flutter/flutter:198502": {
+            "state": {"status": "OPEN", "last_human_comment_at": _iso(ts_new_human)}
+        }
+    }
+    self.assertFalse(work_store._is_correspondence_silence_ping(th_open_st, arts_open))
+    self.assertFalse(work_store._is_thread_covered_by_draft_ts(th_open_st, ts_self, arts_open))
+
+    store.reconcile_correspondence_obligations(w_open, now=now)
+    proj_open = store.build_dashboard_projection(cl_watcher_state={"items": {}}, now=now)
+    card_open = [c for c in proj_open["works"] if c["work_id"] == w_open][0]
+    self.assertEqual(card_open["lane"], "needs-you")
+    self.assertTrue(any("Reply needed" in r for r in card_open["reasons"]))
+
+    # Merged PR with ISO merged_at respects pre-merge vs post-merge ISO human comment timestamps
+    pr_pre_arts = {
+        "github_pr:flutter/flutter:198503": {
+            "state": {
+                "status": "MERGED",
+                "merged_at": _iso(ts_closed),
+                "last_human_comment_at": _iso(ts_old),
+                "last_self_comment_at": _iso(ts_self),
+            }
+        }
+    }
+    pr_post_arts = {
+        "github_pr:flutter/flutter:198503": {
+            "state": {
+                "status": "MERGED",
+                "merged_at": _iso(ts_closed),
+                "last_human_comment_at": _iso(ts_new_human),
+                "last_self_comment_at": _iso(ts_self),
+            }
+        }
+    }
+    pr_th_st = {
+        "is_github_pr_thread": True,
+        "gh_target_key": "github_pr:flutter/flutter:198503",
+        "last_message_ts": ts_old,
+        "last_from_me": False,
+    }
+    self.assertTrue(work_store.is_github_thread_resolved(pr_th_st, pr_pre_arts))
+    self.assertFalse(work_store.is_github_thread_resolved(pr_th_st, pr_post_arts))
 
 
 if __name__ == "__main__":

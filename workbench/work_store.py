@@ -729,10 +729,11 @@ def _resolve_github_thread_turns(
   """Returns (eff_ext_ts, gh_self_ts) reconciling Gmail and GitHub comment turns."""
   s = st or {}
   ts = target_st or {}
-  last_msg_ts = float(s.get("last_message_ts") or 0.0)
+  # cl_watcher writes ISO-8601 strings on GitHub bugs, so normalize every turn field
+  last_msg_ts = _parse_domain_ts(s.get("last_message_ts"))
   gh_human_ts = max(
-      float(s.get("gh_human_reply_ts") or 0.0),
-      float(ts.get("last_human_comment_at") or 0.0),
+      _parse_domain_ts(s.get("gh_human_reply_ts")),
+      _parse_domain_ts(ts.get("last_human_comment_at")),
   )
   gmail_ext_ts = 0.0 if bool(s.get("last_from_me")) else last_msg_ts
   # Allow 30s Gmail delivery lag only relative to the latest known GitHub human comment
@@ -741,8 +742,8 @@ def _resolve_github_thread_turns(
   else:
     ext_ts = max(gh_human_ts, gmail_ext_ts)
   self_ts = max(
-      float(s.get("gh_self_reply_ts") or 0.0),
-      float(ts.get("last_self_comment_at") or 0.0),
+      _parse_domain_ts(s.get("gh_self_reply_ts")),
+      _parse_domain_ts(ts.get("last_self_comment_at")),
   )
   return ext_ts, self_ts
 
@@ -782,11 +783,11 @@ def is_github_thread_resolved(
   if bool(st.get("in_trash_or_spam")) and not bool(st.get("sent_by_me")):
     return True
   target_st = _get_github_target_state(st, artifacts_by_key)
-  synced_at = float(target_st.get("synced_at") or 0.0)
+  synced_at = _parse_domain_ts(target_st.get("synced_at"))
   if bool(target_st.get("locked")) or (synced_at <= 0 and bool(st.get("gh_locked"))):
     return True
   t_status = str(target_st.get("status") or "").strip().upper()
-  last_msg_ts = float(st.get("last_message_ts") or 0.0)
+  last_msg_ts = _parse_domain_ts(st.get("last_message_ts"))
   ext_ts, gh_self_ts = _resolve_github_thread_turns(st, target_st)
   self_ts = max(
       gh_self_ts,
@@ -794,8 +795,8 @@ def is_github_thread_resolved(
   )
   if t_status in ("CLOSED", "MERGED"):
     terminal_at = max(
-        float(target_st.get("closed_at") or 0.0),
-        float(target_st.get("merged_at") or 0.0),
+        _parse_domain_ts(target_st.get("closed_at")),
+        _parse_domain_ts(target_st.get("merged_at")),
     )
     if terminal_at > 0:
       return True if ext_ts <= terminal_at else self_ts >= ext_ts
@@ -803,7 +804,7 @@ def is_github_thread_resolved(
       return True
     return self_ts >= ext_ts
   if not t_status and synced_at <= 0 and bool(st.get("gh_thread_closed")):
-    gh_closed_ts = float(st.get("gh_closed_ts") or 0.0)
+    gh_closed_ts = _parse_domain_ts(st.get("gh_closed_ts"))
     return gh_closed_ts <= 0 or ext_ts <= gh_closed_ts
   return False
 
@@ -1692,17 +1693,17 @@ def _is_correspondence_silence_ping(
   st = state or {}
   target_st = _get_github_target_state(st, artifacts_by_key)
   eff_ext_ts, gh_self_ts = _resolve_github_thread_turns(st, target_st)
-  last_ts = float(st.get("last_message_ts") or st.get("origin_ts") or 0.0)
+  last_ts = _parse_domain_ts(st.get("last_message_ts")) or _parse_domain_ts(st.get("origin_ts"))
   # Mirror _eval_single_predicate so manual wait, MCP/GitHub replies, and acks match 7d pings
   override_ts = max(
-      float(st.get("manual_wait_ts") or 0.0),
-      float(st.get("mcp_reply_ts") or 0.0),
-      float(st.get("ack_message_ts") or 0.0),
+      _parse_domain_ts(st.get("manual_wait_ts")),
+      _parse_domain_ts(st.get("mcp_reply_ts")),
+      _parse_domain_ts(st.get("ack_message_ts")),
       gh_self_ts,
   )
   gh_human_ts = max(
-      float(st.get("gh_human_reply_ts") or 0.0),
-      float(target_st.get("last_human_comment_at") or 0.0),
+      _parse_domain_ts(st.get("gh_human_reply_ts")),
+      _parse_domain_ts(target_st.get("last_human_comment_at")),
   )
   # Newer GitHub human comment before Gmail delivery must read as Reply needed, not silence ping
   if gh_human_ts > max(last_ts, override_ts):
@@ -1714,7 +1715,7 @@ def _is_correspondence_silence_ping(
   )
   if from_me:
     return True
-  compare_ts = eff_ext_ts if eff_ext_ts > 0 else float(st.get("origin_ts") or 0.0)
+  compare_ts = eff_ext_ts if eff_ext_ts > 0 else _parse_domain_ts(st.get("origin_ts"))
   return override_ts > 0.0 and override_ts >= compare_ts
 
 
@@ -2264,10 +2265,10 @@ def _is_thread_covered_by_draft_ts(
   target_st = _get_github_target_state(st, artifacts_by_key)
   eff_ext_ts, gh_self_ts = _resolve_github_thread_turns(st, target_st)
   gh_human_ts = max(
-      float(st.get("gh_human_reply_ts") or 0.0),
-      float(target_st.get("last_human_comment_at") or 0.0),
+      _parse_domain_ts(st.get("gh_human_reply_ts")),
+      _parse_domain_ts(target_st.get("last_human_comment_at")),
   )
-  last_msg_ts = float(st.get("last_message_ts") or 0.0)
+  last_msg_ts = _parse_domain_ts(st.get("last_message_ts"))
   if bool(st.get("last_from_me")) and gh_human_ts <= max(last_msg_ts, gh_self_ts):
     return True
   latest_ext_ts = max(eff_ext_ts, gh_human_ts)
@@ -2275,10 +2276,10 @@ def _is_thread_covered_by_draft_ts(
     return draft_updated_ts > 0.0
   covered_floor = max(
       draft_updated_ts,
-      float(st.get("ack_message_ts") or 0.0),
-      float(st.get("manual_wait_ts") or 0.0),
-      float(st.get("mcp_reply_ts") or 0.0),
-      float(st.get("resolved_at") or 0.0),
+      _parse_domain_ts(st.get("ack_message_ts")),
+      _parse_domain_ts(st.get("manual_wait_ts")),
+      _parse_domain_ts(st.get("mcp_reply_ts")),
+      _parse_domain_ts(st.get("resolved_at")),
       gh_self_ts,
   )
   return covered_floor >= latest_ext_ts
@@ -2778,18 +2779,18 @@ def _eval_single_predicate(
       return "false"
     if is_github_thread_resolved(st, artifacts_by_key):
       return "false"
-    last_ts = float(st.get("last_message_ts") or st.get("origin_ts") or 0.0)
+    last_ts = _parse_domain_ts(st.get("last_message_ts")) or _parse_domain_ts(st.get("origin_ts"))
     gh_target_st = _get_github_target_state(st, artifacts_by_key)
     eff_ext_ts, gh_self_ts = _resolve_github_thread_turns(st, gh_target_st)
     override_ts = max(
-        float(st.get("manual_wait_ts") or 0.0),
-        float(st.get("mcp_reply_ts") or 0.0),
-        float(st.get("ack_message_ts") or 0.0),
+        _parse_domain_ts(st.get("manual_wait_ts")),
+        _parse_domain_ts(st.get("mcp_reply_ts")),
+        _parse_domain_ts(st.get("ack_message_ts")),
         gh_self_ts,
     )
     gh_human_ts = max(
-        float(st.get("gh_human_reply_ts") or 0.0),
-        float(gh_target_st.get("last_human_comment_at") or 0.0),
+        _parse_domain_ts(st.get("gh_human_reply_ts")),
+        _parse_domain_ts(gh_target_st.get("last_human_comment_at")),
     )
     if "last_from_me" in st:
       from_me = bool(st.get("last_from_me"))
@@ -4880,8 +4881,8 @@ class WorkStore:
           gh_target_st = _get_github_target_state(st, art_rows)
           eff_ext_ts, gh_self_ts = _resolve_github_thread_turns(st, gh_target_st)
           gh_human_ts = max(
-              float(st.get("gh_human_reply_ts") or 0.0),
-              float(gh_target_st.get("last_human_comment_at") or 0.0),
+              _parse_domain_ts(st.get("gh_human_reply_ts")),
+              _parse_domain_ts(gh_target_st.get("last_human_comment_at")),
           )
           is_self_resolved = (
               (bool(st.get("resolved")) and bool(st.get("resolved_by_me")))
@@ -4896,9 +4897,9 @@ class WorkStore:
                 prev_meta = {}
               was_superseded = bool(prev_meta.pop("superseded_by_specific", False))
               done_floor = max(
-                  float(prev_ob.get("satisfied_at") or 0.0),
-                  float(st.get("ack_message_ts") or 0.0),
-                  float(st.get("resolved_at") or 0.0),
+                  _parse_domain_ts(prev_ob.get("satisfied_at")),
+                  _parse_domain_ts(st.get("ack_message_ts")),
+                  _parse_domain_ts(st.get("resolved_at")),
               )
               should_reopen = (
                   was_superseded
