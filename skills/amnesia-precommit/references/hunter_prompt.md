@@ -31,7 +31,8 @@ Instructions:
 2. Evaluate the diff across six strict axes:
    - **Scope & Goal-Drift Check (Drive-By Pruning + Constraint Audit)**: Identify any hunk, file, formatting change, or refactor that is not strictly required to achieve the Intended Task Goal, and verify that no explicit user requirement or constraint from `Original User Constraints` was silently dropped or violated across `/compact` or `handoff`.
    - **Size (Diff Golfing — `BLOCKING_SCOPE` vs `OPTIONAL_GOLFING`)**: Identify unrelated drive-by
-     hunks, dead/speculative helpers (YAGNI), unreachable defensive/fallback branches
+     hunks, dead/speculative helpers with zero callers (YAGNI; a cohesive phase helper called once
+     from a long function or loop is valid), unreachable defensive/fallback branches
      (`if (x.empty())`, `if (!x)`, `else`) for container or field states that no constructor,
      builder, or caller can produce (`BLOCKING_SCOPE`, replace with an invariant assertion and a
      why-comment when the producer guarantee is non-obvious), or leftover debug code
@@ -40,7 +41,12 @@ Instructions:
      `if`/`else` blocks where a short branch exits (`return`/`continue`) and a long main body stays
      indented inside `else` with nothing following (`BLOCKING_SCOPE` in new functions,
      `OPTIONAL_GOLFING` otherwise; keep `if`/`else` for short symmetric peer branches or shared
-     post-branch work).
+     post-branch work), as well as monolithic functions (`> ~80` lines), loop bodies (`> ~45`
+     lines), or named multi-line local closures (e.g. C++ `[&]` lambdas) that mix multiple domain
+     phases or hide loop-carried state in outer locals instead of narrow-signature helpers and a
+     small state struct (`BLOCKING_SCOPE` in new functions, new loops, or newly added closures,
+     `OPTIONAL_GOLFING` in existing functions; do not split a uniform `switch`/dispatch table or
+     demand tiny pass-through wrappers).
    - **Dropped Guards & Historical Regressions (`-` Lines)**: For every deleted or simplified condition, branch, early return, or fallback (`-` lines in `git diff`, or any reduction you propose under Diff Golfing), run `git log -S "<symbol_or_expr>" -p -n 3` or `git log -L <start>,<end>:<file>` to verify the removed guard was not previously introduced to fix a specific bug or edge case.
    - **Pattern Completeness ("What is Missing from the Diff?")**: Inspect full modified files and run `git grep` or `code_search` on modified functions, structs, enums, and flags to check all callers, paired backends, and symmetrical code paths (e.g., `SkParagraph` vs. `WebParagraph`, ICU vs. Apple/Client `SkUnicode`, `layout` vs. `paint` / `getRectsForRange`, serialization read vs. write, header declarations vs. all implementations). Always run an unanchored substring/basename search (`git grep -i`) before claiming a sibling symbol or caller is missing (`False` vs. `Near miss`). Flag any sibling site that was forgotten.
    - **Correctness & KEEPER Invariants**: Check against C++ Systems Invariants (`cpp_systems_invariants.md`), Text Domain Invariants (`text_domain_invariants.md`), and Code Style (`code_style.md`) — specifically zero-allocation hot paths, loop guards, fail-fast assertions (`SkASSERT` in Skia, `CHECK`/`DCHECK` in Chromium, `assert` in Dart/TS) over defensive `if (!ptr) return;` or unreachable container/field branches, and cross-layer consistency. When touching text-layout line, run, or cluster geometry (`modules/skparagraph/`, `modules/skshaper/`, or `lib/web_ui/`), verify both `LTR` and paragraph-level `RTL` (`TextDirection::kRtl` / `TextDirection.rtl`), verify visual order (`fRunsInVisualOrder`) vs. logical cluster order (`fClusterRange`) at line edges, and exercise non-cursive RTL scripts (e.g., Hebrew `\u05D0..\u05EA`) rather than relying solely on cursive scripts like Arabic where `Run::isCursiveScript()` disables `letterSpacing` and masks visual-edge bugs. Never offer `"or document as a known limitation"` on any Section 2 `BLOCKING` defect (`B*`). For Skia C++ / text / font diffs, also apply `veteran-review` lens mode (`~/.gemini/config/skills/veteran-review/SKILL.md`, Steps 1–3: precedent search + Layer 1/2 invariants) and report its candidates under Section 2.

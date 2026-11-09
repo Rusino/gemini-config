@@ -23,9 +23,12 @@ description: "When editing source code or tests, writing code comments, commit m
 ## Code
 - Strict YAGNI: no helpers, overloads, iterators or wrappers without a caller in this change.
   Private state is a plain struct with `fMember` fields
-- Keep each function and loop body at one level of abstraction: extract a self-contained domain
-  step with its own local state (e.g. building a font cascade, feature list, or variation map) into
-  a helper that returns a value; never slice an algorithm arbitrarily or add trivial wrappers
+- Keep each function and loop body readable on one screen at one level of abstraction: extract
+  a cohesive domain phase (e.g. building a font cascade, resolving a run's font, computing
+  advances, or populating an output run) into a file-local function or private method with a
+  narrow signature (one caller in a long function or loop satisfies Strict YAGNI), and group
+  loop-carried state into a small struct instead of named multi-line closures (e.g. C++ `[&]`
+  lambdas); never slice an algorithm into tiny pass-through wrappers with long parameter lists
 - Prefer early `return` or `continue` for preconditions, degenerate cases, and short fast paths
   when nothing follows the `if`/`else`, keeping the main body unindented; keep `if`/`else` for
   short symmetric peer branches (e.g. LTR vs RTL) or when shared work runs after both branches
