@@ -1793,9 +1793,19 @@ def render_redline_html(
     --surface-bg: #f6f8fa;
     --border-col: #d1d9e0;
   }}
+  /* Host dark-mode srcdoc iframes inject dark surfaces and clip height unless overridden */
+  html {{
+    color-scheme: light;
+    background: #ffffff !important;
+    overflow-y: auto !important;
+    height: auto !important;
+  }}
   body {{
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    color: var(--text-fg);
+    background: #ffffff !important;
+    color: var(--text-fg) !important;
+    overflow: visible !important;
+    height: auto !important;
     max-width: 920px;
     margin: 1.5rem auto 3rem;
     padding: 0 1.25rem;
@@ -2021,6 +2031,12 @@ def render_redline_html(
   body[data-mode="sbs"] {{ max-width: 1380px; }}
   body[data-mode="sbs"] #redline-flow {{ display: none; }}
   body[data-mode="sbs"] #redline-sbs {{ display: block; }}
+  /* Narrow side-pane iframes crush 2 columns unless the user explicitly clicked sbs */
+  @media (max-width: 860px) {{
+    body[data-mode="sbs"]:not([data-user-mode="1"]) {{ max-width: 920px; }}
+    body[data-mode="sbs"]:not([data-user-mode="1"]) #redline-flow {{ display: block; }}
+    body[data-mode="sbs"]:not([data-user-mode="1"]) #redline-sbs {{ display: none; }}
+  }}
   .sbs-header {{
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -2118,9 +2134,18 @@ def render_redline_html(
 </main>
 <script>
 function setMode(mode, btn) {{
+  document.body.setAttribute('data-user-mode', '1');
   document.body.setAttribute('data-mode', mode);
   for (const el of document.querySelectorAll('.mode-btn')) {{
     el.classList.toggle('active', el === btn);
+  }}
+}}
+if (document.body.getAttribute('data-mode') === 'sbs' && window.innerWidth <= 860) {{
+  document.body.setAttribute('data-mode', 'redline');
+  const btns = document.querySelectorAll('.mode-btn');
+  if (btns.length >= 2) {{
+    btns[0].classList.add('active');
+    btns[1].classList.remove('active');
   }}
 }}
 </script>

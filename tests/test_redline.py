@@ -309,6 +309,25 @@ class RedlineTest(unittest.TestCase):
     self.assertIn('<span class="rewrite-tag">Стало</span>', page)
     self.assertIn('<body data-mode="sbs">', page)
 
+  # Host dark-mode srcdoc iframes inherit dark surfaces and narrow widths unless
+  # the document pins a light canvas and falls back from 2-column mode <= 860px
+  def test_host_iframe_light_canvas_and_narrow_viewport_fallback(self):
+    old = (
+        "Старая архитектура использовала синхронный вызов парсера таблиц шрифтов "
+        "при каждом создании процесса приложения на старте системы.\n"
+    )
+    new = (
+        "В новой схеме потоки рендеринга запрашивают дескрипторы шрифтов лениво "
+        "через системный кэш без блокировки главного цикла.\n"
+    )
+    page, _ = redline.render_redline_html(old, new)
+    self.assertIn("color-scheme: light;", page)
+    self.assertIn("background: #ffffff !important;", page)
+    self.assertIn("overflow-y: auto !important;", page)
+    self.assertIn('@media (max-width: 860px)', page)
+    self.assertIn("window.innerWidth <= 860", page)
+    self.assertIn("setAttribute('data-user-mode', '1')", page)
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -133,6 +133,12 @@ broken tags, raw Markdown artifacts, or console errors:
    - Headings, bullet and numbered lists, alerts, and inline `<code>` blocks are rendered as HTML
      (not raw `##`, `**`, or backticks).
    - Green `<ins>` and red strikethrough `<del>` spans are legible and properly coalesced.
-4. **Deliver**: Link the `.html` file in chat
-   (`[draft_diff.html](file://<artifact_dir>/draft_diff.html)`) and briefly state which base
-   version was used and the word-count delta.
+4. **Register as HTML artifact & deliver**:
+   - Because `redline.py` writes via `run_command` without Jetski artifact metadata, clicking a raw
+     `file://` link opens HTML source text instead of the rendered preview unless registered. Call
+     `edit_file` on `<artifact_dir>/draft_diff.html` (`Target="<!doctype html>"`,
+     `Replacement="<!doctype html>"`) with `ArtifactMetadata={"UserFacing": true,
+     "RequestFeedback": false, "Summary": "..."}` so Jetski renders the HTML artifact in its side
+     pane (and optionally embed `<agent-embed src="file://<artifact_dir>/draft_diff.html"></agent-embed>`).
+   - Link `[draft_diff.html](file://<artifact_dir>/draft_diff.html)` in chat and briefly state which
+     base version was used and the word-count delta.
