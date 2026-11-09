@@ -494,6 +494,30 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     display: inline-flex;
     align-items: center;
     gap: 5px;
+    flex-wrap: wrap;
+  }}
+  .wb-sort-select {{
+    height: 24px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 0 6px;
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+  }}
+  .wb-sort-select:hover {{
+    border-color: rgba(0, 113, 227, 0.45);
+  }}
+  .wb-sort-dir {{
+    height: 24px;
+    padding: 0 7px;
+    font-size: 11px;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    white-space: nowrap;
   }}
   .wb-btn-icon {{
     width: 26px;
@@ -1124,10 +1148,18 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     <div class="wb-filters">
       <button class="wb-chip" data-filter="all" data-active="true" type="button">All</button>
       <button class="wb-chip" data-filter="needs-you" type="button">🚨 Needs You</button>
+      <button class="wb-chip" data-filter="waiting" type="button">⏳ Waiting</button>
       <button class="wb-chip" data-filter="multi" type="button">🔗 Multi-channel</button>
       <button class="wb-chip" data-filter="obligations" type="button">🔔 Obligations</button>
       <button class="wb-chip" data-filter="done" type="button">✅ Done</button>
       <div class="wb-filter-tools">
+        <select class="wb-sort-select" id="wb-sort-mode" aria-label="Sort cards">
+          <option value="triage">⚡ Triage</option>
+          <option value="activity">🕒 Activity</option>
+          <option value="age">⏳ Age</option>
+        </select>
+        <button class="wb-btn wb-sort-dir" id="wb-sort-dir" type="button" data-dir="desc"
+                title="Triage: Needs You &amp; urgent first, newest activity">↓ New</button>
         <button class="wb-btn wb-btn-icon" id="wb-toggle-collapse" type="button"
                 data-action="collapse" aria-label="⇈ Collapse visible cards"
                 title="⇈ Collapse visible cards">⇈</button>
@@ -1159,9 +1191,13 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   const UI_VERSION = {int(ui_version)};
   // Bump storage key to v2 so legacy v1 global bulk flags cannot overwrite lane defaults
   const COLLAPSE_STORAGE_KEY = 'wb_collapsed_v2';
+  // Persist sort mode and direction separately from per-card collapse overrides
+  const SORT_STORAGE_KEY = 'wb_sort_v1';
   let state = {initial_json};
   let activeFilter = 'all';
   let searchQuery = '';
+  let sortMode = 'triage';
+  let sortDir = 'desc';
   let collapsedOverrides = {{}};
   // Keep search-time toggles in memory so clearing search restores saved card states
   let searchCollapsedOverrides = {{}};
@@ -1255,6 +1291,57 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     }}
   }} catch {{}}
 
+  // Restore user sort preferences across reloads while rejecting unknown enum values
+  try {{
+    const rawSort = localStorage.getItem(SORT_STORAGE_KEY);
+    if (rawSort) {{
+      const parsedSort = JSON.parse(rawSort);
+      if (parsedSort && typeof parsedSort === 'object') {{
+        if (['triage', 'activity', 'age'].includes(parsedSort.mode)) {{
+          sortMode = parsedSort.mode;
+        }}
+        if (['desc', 'asc'].includes(parsedSort.dir)) {{
+          sortDir = parsedSort.dir;
+        }}
+      }}
+    }}
+  }} catch {{}}
+
+  // Persist active sort mode and direction to localStorage without failing in private contexts
+  function saveSortPrefs() {{
+    try {{
+      localStorage.setItem(
+        SORT_STORAGE_KEY,
+        JSON.stringify({{ mode: sortMode, dir: sortDir }})
+      );
+    }} catch {{}}
+  }}
+
+  // Sync the sort select, direction pill label, and tooltip with current sort state
+  function updateSortControlsUI() {{
+    const modeEl = document.getElementById('wb-sort-mode');
+    if (modeEl && modeEl.value !== sortMode) modeEl.value = sortMode;
+    const dirEl = document.getElementById('wb-sort-dir');
+    if (!dirEl) return;
+    dirEl.setAttribute('data-dir', sortDir);
+    const lbl = sortDir === 'desc' ? '↓ New' : '↑ Old';
+    if (dirEl.textContent !== lbl) dirEl.textContent = lbl;
+    let tip = 'Triage: Needs You & urgent first, newest activity';
+    if (sortMode === 'triage' && sortDir === 'asc') {{
+      tip = 'Triage: Needs You & urgent first, oldest activity';
+    }} else if (sortMode === 'activity') {{
+      tip = sortDir === 'desc'
+        ? 'Activity: most recent activity first'
+        : 'Activity: quietest / oldest activity first';
+    }} else if (sortMode === 'age') {{
+      tip = sortDir === 'asc'
+        ? 'Age: longest-open first (oldest origin)'
+        : 'Age: recently opened first (newest origin)';
+    }}
+    dirEl.setAttribute('title', tip);
+    dirEl.setAttribute('aria-label', tip);
+  }}
+
   function saveCollapsePrefs() {{
     try {{
       localStorage.setItem(
@@ -1307,11 +1394,74 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     }}
   }}
 
-  // Return the visible cards matching the active filter chip and search input
+  // Prefer precomputed backend urgency flag, falling back to live obligation status inspection
+  function hasUrgentOb(w) {{
+    if (w && typeof w.has_urgent_obligation === 'boolean') {{
+      return w.has_urgent_obligation;
+    }}
+    return Boolean(
+      w && Array.isArray(w.obligations) && w.obligations.some(
+        (o) => o && o.status !== 'done' && (o.status === 'ready' || o.stalled_alert)
+      )
+    );
+  }}
+
+  // Read positive domain activity seconds, returning 0 for missing or non-finite values
+  function getActivityTs(w) {{
+    const v = Number((w && (w.activity_at ?? w.updated_at)) || 0);
+    return Number.isFinite(v) && v > 0 ? v : 0;
+  }}
+
+  // Read positive work origin seconds, returning 0 for missing or non-finite values
+  function getOriginTs(w) {{
+    const v = Number((w && (w.origin_at ?? w.created_at)) || 0);
+    return Number.isFinite(v) && v > 0 ? v : 0;
+  }}
+
+  // Keep missing or zero timestamps at the bottom regardless of sort direction
+  function cmpTimestamps(ta, tb, dir) {{
+    if (ta <= 0 && tb <= 0) return 0;
+    if (ta <= 0) return 1;
+    if (tb <= 0) return -1;
+    if (ta === tb) return 0;
+    return dir === 'asc' ? (ta - tb) : (tb - ta);
+  }}
+
+  // Order a shallow copy of cards by Triage priority, pure Activity recency, or origin Age
+  function sortWorks(items) {{
+    const laneRank = {{ 'needs-you': 0, waiting: 1, blocked: 2, done: 3 }};
+    return items.slice().sort((a, b) => {{
+      if (sortMode === 'triage') {{
+        const la = laneRank[a && a.lane] ?? 9;
+        const lb = laneRank[b && b.lane] ?? 9;
+        if (la !== lb) return la - lb;
+        const ua = hasUrgentOb(a) ? 0 : 1;
+        const ub = hasUrgentOb(b) ? 0 : 1;
+        if (ua !== ub) return ua - ub;
+        const tc = cmpTimestamps(getActivityTs(a), getActivityTs(b), sortDir);
+        if (tc !== 0) return tc;
+      }} else if (sortMode === 'activity') {{
+        const tc = cmpTimestamps(getActivityTs(a), getActivityTs(b), sortDir);
+        if (tc !== 0) return tc;
+      }} else if (sortMode === 'age') {{
+        // Break equal creation ages by most/least recent activity in the same direction
+        const oc = cmpTimestamps(getOriginTs(a), getOriginTs(b), sortDir);
+        if (oc !== 0) return oc;
+        const ac = cmpTimestamps(getActivityTs(a), getActivityTs(b), sortDir);
+        if (ac !== 0) return ac;
+      }}
+      const wa = String((a && a.work_id) || '');
+      const wb = String((b && b.work_id) || '');
+      return wa < wb ? -1 : (wa > wb ? 1 : 0);
+    }});
+  }}
+
+  // Return the visible cards matching the active filter chip, search input, and sort mode
   function getVisibleWorks() {{
     const q = searchQuery ? searchQuery.trim().toLowerCase() : '';
-    return ((state && state.works) || []).filter((w) => {{
+    const filtered = ((state && state.works) || []).filter((w) => {{
       if (activeFilter === 'needs-you' && w.lane !== 'needs-you') return false;
+      if (activeFilter === 'waiting' && w.lane !== 'waiting') return false;
       if (activeFilter === 'multi' && !w.is_multi_channel) return false;
       if (
         activeFilter === 'obligations' &&
@@ -1328,6 +1478,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       }}
       return true;
     }});
+    return sortWorks(filtered);
   }}
 
   function updateCollapseToggleUI(works) {{
@@ -1479,6 +1630,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       `;
     }}
 
+    updateSortControlsUI();
     const works = getVisibleWorks();
     updateCollapseToggleUI(works);
 
@@ -1797,6 +1949,19 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
            </div>`
         : '';
 
+      // Surface creation date directly in Age mode, and expose it as a hover tooltip otherwise
+      const actEt = String(w.activity_et || w.updated_et || '');
+      const origEt = String(w.origin_et || '');
+      let timeMetaHtml = `<span>${{esc(actEt)}}</span>`;
+      if (sortMode === 'age' && origEt) {{
+        const ageTxt = (actEt && actEt !== origEt)
+          ? `Opened ${{esc(origEt)}} · Active ${{esc(actEt)}}`
+          : `Opened ${{esc(origEt)}}`;
+        timeMetaHtml = `<span>${{ageTxt}}</span>`;
+      }} else if (origEt && origEt !== actEt) {{
+        timeMetaHtml = `<span title="Opened ${{esc(origEt)}}">${{esc(actEt)}}</span>`;
+      }}
+
       return `
         <article class="wb-card" data-work-id="${{esc(w.work_id)}}" data-lane="${{esc(w.lane)}}" data-collapsed="${{collapsed}}">
           <div class="wb-card-hdr" data-toggle-card="${{esc(w.work_id)}}">
@@ -1810,7 +1975,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
                   ${{laneBadge}} ${{multiBadge}} ${{countsBadge}}
                   ${{projLabel}}
                   ${{w.roadmap_item_key ? `<span>🗺 ${{esc(w.roadmap_item_key)}}</span>` : ''}}
-                  <span>${{esc(w.updated_et)}}</span>
+                  ${{timeMetaHtml}}
                 </div>
                 ${{originRowHtml}}
               </div>
@@ -1872,6 +2037,29 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     }});
   }}
 
+  // Smart-default sort direction on mode switch: Age surfaces longest-open first (asc)
+  const sortModeEl = document.getElementById('wb-sort-mode');
+  if (sortModeEl) {{
+    sortModeEl.addEventListener('change', (e) => {{
+      const nextMode = String((e && e.target && e.target.value) || sortModeEl.value || 'triage');
+      // Ignore unknown DOM option values so tampered state cannot corrupt sort comparators
+      if (['triage', 'activity', 'age'].includes(nextMode)) {{
+        sortMode = nextMode;
+        sortDir = nextMode === 'age' ? 'asc' : 'desc';
+        saveSortPrefs();
+        render();
+      }}
+    }});
+  }}
+  const sortDirEl = document.getElementById('wb-sort-dir');
+  if (sortDirEl) {{
+    sortDirEl.addEventListener('click', () => {{
+      sortDir = sortDir === 'desc' ? 'asc' : 'desc';
+      saveSortPrefs();
+      render();
+    }});
+  }}
+
   // Scope toolbar toggle to currently visible cards without touching hidden tabs
   document.getElementById('wb-toggle-collapse').addEventListener('click', () => {{
     const works = getVisibleWorks();
@@ -1889,8 +2077,8 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   }});
 
   document.body.addEventListener('click', async (e) => {{
-    // Exclude textarea and label clicks so editing a live reply draft never collapses its card
-    const target = e.target.closest('button, a, input, textarea, label');
+    // Exclude form/select/textarea clicks so editing controls never collapses a card
+    const target = e.target.closest('button, a, input, select, textarea, label');
     if (!target) {{
       const sel = window.getSelection ? String(window.getSelection()) : '';
       // Skip collapse when selecting header text unless Alt-click explicitly requests bulk toggle

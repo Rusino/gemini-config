@@ -20,8 +20,10 @@ import os
 import re
 import shlex
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 
 from pre_tool_guard import (
     EDIT_TOOLS,
@@ -450,20 +452,180 @@ def is_roadmap_set_done_command(cmd: str) -> bool:
   return False
 
 
-def discover_skills() -> dict:
-  """Maps skill directory names to their SKILL.md paths.
+PLUGIN_SKILL_CACHE_FILE = os.path.expanduser(
+    "~/.cache/jetski/stop_guard_plugin_skills.json"
+)
+_MEM_PLUGIN_SKILL_CACHE: dict[str, list[str]] | None = None
 
-  Only hyphenated or underscored names qualify, so plain words in a request
-  (e.g. "browser") never count as naming a skill.
-  """
+
+def _is_external_symlink(
+    entry: os.DirEntry, base_dir: str, local_prefixes: tuple[str, ...]
+) -> str:
+  """Returns raw readlink target when entry points outside local_prefixes and base_dir."""
+  if not entry.is_symlink():
+    return ""
+  try:
+    raw_target = os.readlink(entry.path)
+  except OSError:
+    return ""
+  resolved = os.path.abspath(
+      os.path.join(os.path.dirname(entry.path), raw_target)
+  )
+  base_prefixes = (
+      os.path.abspath(base_dir).rstrip(os.sep) + os.sep,
+      os.path.realpath(base_dir).rstrip(os.sep) + os.sep,
+  )
+  if any(resolved.startswith(p) for p in base_prefixes + local_prefixes):
+    return ""
+  return raw_target
+
+
+def _scan_skill_dir(
+    skills_dir: str,
+    local_prefixes: tuple[str, ...],
+    skills: dict[str, str],
+) -> bool:
+  """Populates skills from skills_dir and returns True when scanned without transient I/O errors."""
+  try:
+    entries = list(os.scandir(skills_dir))
+  except FileNotFoundError:
+    # Missing skills/ is authoritative only when the parent plugin directory itself is reachable
+    try:
+      return stat.S_ISDIR(os.stat(os.path.dirname(skills_dir)).st_mode)
+    except OSError:
+      return False
+  except NotADirectoryError:
+    return True
+  except OSError:
+    return False
+  clean = True
+  for entry in entries:
+    name = entry.name
+    if ("-" not in name and "_" not in name) or name.startswith("."):
+      continue
+    skill_md = os.path.join(entry.path, "SKILL.md")
+    # External skill symlinks sit on network FUSE mounts whose stats stall on upstream churn
+    if _is_external_symlink(entry, skills_dir, local_prefixes):
+      skills[name] = skill_md
+      continue
+    try:
+      if stat.S_ISREG(os.stat(skill_md).st_mode):
+        skills[name] = skill_md
+    except (FileNotFoundError, NotADirectoryError):
+      continue
+    except OSError:
+      clean = False
+  return clean
+
+
+def _cached_external_plugin_skills(
+    plugin_path: str, raw_target: str, local_prefixes: tuple[str, ...]
+) -> list[str]:
+  """Returns cached skill directory names for an external plugin symlink."""
+  global _MEM_PLUGIN_SKILL_CACHE
+  # Key indefinitely by (plugin_path, raw_target) so head churn never triggers periodic FUSE stats
+  if _MEM_PLUGIN_SKILL_CACHE is None:
+    loaded: dict[str, list[str]] = {}
+    try:
+      with open(PLUGIN_SKILL_CACHE_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+      if isinstance(data, dict):
+        loaded = {
+            str(k): [str(x) for x in v]
+            for k, v in data.items()
+            if isinstance(v, list)
+        }
+    except Exception:
+      loaded = {}
+    _MEM_PLUGIN_SKILL_CACHE = loaded
+
+  cache_key = f"{plugin_path}->{raw_target}"
+  if cache_key in _MEM_PLUGIN_SKILL_CACHE:
+    return _MEM_PLUGIN_SKILL_CACHE[cache_key]
+
+  found: dict[str, str] = {}
+  clean = _scan_skill_dir(
+      os.path.join(plugin_path, "skills"), local_prefixes, found
+  )
+  names = sorted(found)
+  # Skip caching on transient FUSE or LOAS errors so empty [] never poisons future hook runs
+  if not clean:
+    return names
+  _MEM_PLUGIN_SKILL_CACHE[cache_key] = names
+  # Atomic replace prevents partial JSON reads when parallel test workers warm the cache
+  try:
+    os.makedirs(os.path.dirname(PLUGIN_SKILL_CACHE_FILE), exist_ok=True)
+    tmp_path = f"{PLUGIN_SKILL_CACHE_FILE}.{os.getpid()}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+      json.dump(_MEM_PLUGIN_SKILL_CACHE, f, indent=2, sort_keys=True)
+    os.replace(tmp_path, PLUGIN_SKILL_CACHE_FILE)
+  except OSError:
+    pass
+  return names
+
+
+def discover_skills() -> dict:
+  """Maps hyphenated or underscored skill directory names to their SKILL.md paths."""
   import glob
 
-  skills = {}
+  skills: dict[str, str] = {}
+  suffix = os.path.join("*", "SKILL.md")
+  plugin_mid = os.path.join("*", "skills")
+  home_dir = os.path.expanduser("~")
+  tmp_dir = tempfile.gettempdir()
+  # Include realpath for symlinked home/temp dirs while excluding '/' so root HOME stays external
+  local_prefixes = tuple(
+      dict.fromkeys(
+          prefix
+          for p in (
+              home_dir,
+              os.path.realpath(home_dir),
+              tmp_dir,
+              os.path.realpath(tmp_dir),
+          )
+          if (prefix := os.path.abspath(p).rstrip(os.sep) + os.sep) != os.sep
+      )
+  )
   for pattern in SKILL_GLOBS:
-    for path in glob.glob(os.path.expanduser(pattern)):
-      name = os.path.basename(os.path.dirname(path))
-      if "-" in name or "_" in name:
-        skills[name] = path
+    expanded = os.path.expanduser(pattern)
+    if not expanded.endswith(suffix):
+      for path in glob.glob(expanded):
+        name = os.path.basename(os.path.dirname(path))
+        if "-" in name or "_" in name:
+          skills[name] = path
+      continue
+    parent_glob = expanded[: -len(suffix)].rstrip(os.sep)
+    # Inspect plugin entries via scandir before globbing */skills to avoid FUSE plugin stats
+    if parent_glob.endswith(os.sep + plugin_mid):
+      plugins_root = parent_glob[: -(len(plugin_mid) + 1)].rstrip(os.sep)
+      if not glob.has_magic(plugins_root):
+        try:
+          plugin_entries = list(os.scandir(plugins_root))
+        except OSError:
+          continue
+        for p_entry in plugin_entries:
+          if p_entry.name.startswith("."):
+            continue
+          ext_target = _is_external_symlink(p_entry, plugins_root, local_prefixes)
+          if ext_target:
+            for s_name in _cached_external_plugin_skills(
+                p_entry.path, ext_target, local_prefixes
+            ):
+              skills[s_name] = os.path.join(
+                  p_entry.path, "skills", s_name, "SKILL.md"
+              )
+            continue
+          _scan_skill_dir(
+              os.path.join(p_entry.path, "skills"), local_prefixes, skills
+          )
+        continue
+    skill_dirs = (
+        [parent_glob]
+        if not glob.has_magic(parent_glob)
+        else glob.glob(parent_glob)
+    )
+    for skills_dir in skill_dirs:
+      _scan_skill_dir(skills_dir, local_prefixes, skills)
   return skills
 
 
@@ -778,12 +940,14 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
             if not rep_scripts or s in rep_scripts or s in content:
               corpus_passed[s] = True
 
-  for name in sorted(discover_skills()):
-    if not re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", request_text):
-      continue
-    suffix = f"{name}/SKILL.md"
-    if not any(suffix in blob for blob in read_blobs):
-      result["unread_skills"].append(name)
+  # Every discover_skills key contains '-' or '_', so skip scanning when neither appears in request
+  if "-" in request_text or "_" in request_text:
+    for name in sorted(discover_skills()):
+      if not re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", request_text):
+        continue
+      suffix = f"{name}/SKILL.md"
+      if not any(suffix in blob for blob in read_blobs):
+        result["unread_skills"].append(name)
 
   # Retain artifact bodies so inline and artifact review checks can inspect both
   artifact_texts = []

@@ -2285,6 +2285,189 @@ class TestStopGuard(unittest.TestCase):
         "",
     )
 
+  # Verify discover_skills resolves external skill and plugin symlinks without statting FUSE mounts,
+  # avoids poisoning the plugin disk cache on transient mount/LOAS errors, and handles symlinked or
+  # root HOME prefixes while rejecting broken local symlinks and plain single-word directories
+  def test_discover_skills_avoids_dereferencing_srcfs_symlinks(self):
+    with tempfile.TemporaryDirectory() as root_dir:
+      sys_tmp = os.path.join(root_dir, "sys_tmp")
+      real_home = os.path.join(root_dir, "real_home")
+      link_home = os.path.join(root_dir, "link_home")
+      remote_mount = os.path.join(root_dir, "remote_mount")
+      os.makedirs(sys_tmp, exist_ok=True)
+      os.makedirs(real_home, exist_ok=True)
+      os.symlink(real_home, link_home)
+
+      skills_dir = os.path.join(link_home, "skills")
+      local_ok = os.path.join(skills_dir, "review-triage")
+      os.makedirs(local_ok, exist_ok=True)
+      with open(os.path.join(local_ok, "SKILL.md"), "w", encoding="utf-8") as f:
+        f.write("# Review Triage\n")
+      os.makedirs(os.path.join(skills_dir, "empty-dir"), exist_ok=True)
+      plain_dir = os.path.join(skills_dir, "browser")
+      os.makedirs(plain_dir, exist_ok=True)
+      with open(os.path.join(plain_dir, "SKILL.md"), "w", encoding="utf-8") as f:
+        f.write("# Browser\n")
+      os.symlink(
+          os.path.join(sys_tmp, "missing_local"),
+          os.path.join(skills_dir, "broken-local"),
+      )
+      os.symlink(
+          os.path.join(real_home, "missing_in_real_home"),
+          os.path.join(skills_dir, "broken-home"),
+      )
+      os.symlink(
+          os.path.join(real_home, "skills", "missing_in_real_skills"),
+          os.path.join(skills_dir, "broken-real-skill"),
+      )
+      remote_skill_target = "/opt/remote_mounts/skills/visual_html_reporting"
+      fuse_link = os.path.join(skills_dir, "visual-html-reporting")
+      os.symlink(remote_skill_target, fuse_link)
+
+      plugins_dir = os.path.join(link_home, "plugins")
+      local_plug_skill = os.path.join(
+          plugins_dir, "local-plugin", "skills", "browser_operations"
+      )
+      os.makedirs(local_plug_skill, exist_ok=True)
+      with open(
+          os.path.join(local_plug_skill, "SKILL.md"), "w", encoding="utf-8"
+      ) as f:
+        f.write("# Browser Operations\n")
+      remote_plugin_dir = os.path.join(remote_mount, "plugins", "cloudtop_use")
+      remote_plugin_skill = os.path.join(
+          remote_plugin_dir, "skills", "cloudtop-use"
+      )
+      os.makedirs(remote_plugin_skill, exist_ok=True)
+      with open(
+          os.path.join(remote_plugin_skill, "SKILL.md"), "w", encoding="utf-8"
+      ) as f:
+        f.write("# Cloudtop Use\n")
+      plugin_link = os.path.join(plugins_dir, "cloudtop-use")
+      os.symlink(remote_plugin_dir, plugin_link)
+      empty_remote_plugin = os.path.join(remote_mount, "plugins", "chat_plugin")
+      os.makedirs(empty_remote_plugin, exist_ok=True)
+      os.symlink(empty_remote_plugin, os.path.join(plugins_dir, "google_chat"))
+
+      cache_file = os.path.join(sys_tmp, "plugin_skills_cache.json")
+      globs = (
+          os.path.join(skills_dir, "*", "SKILL.md"),
+          os.path.join(plugins_dir, "*", "skills", "*", "SKILL.md"),
+      )
+      orig_stat = os.stat
+      orig_lstat = os.lstat
+      orig_scandir = os.scandir
+
+      def transient_error_scandir(path):
+        p_str = str(os.fspath(path))
+        if (
+            "cloudtop-use" in p_str
+            or "google_chat" in p_str
+            or p_str.startswith(remote_mount)
+        ):
+          raise PermissionError("LOAS expired")
+        return orig_scandir(path)
+
+      # Transient FUSE/LOAS errors on cold scan must not persist empty [] entries to disk
+      with (
+          patch.object(stop_guard, "SKILL_GLOBS", globs),
+          patch.object(stop_guard, "PLUGIN_SKILL_CACHE_FILE", cache_file),
+          patch.object(stop_guard, "_MEM_PLUGIN_SKILL_CACHE", None),
+          patch("tempfile.gettempdir", return_value=sys_tmp),
+          patch(
+              "os.path.expanduser",
+              side_effect=lambda p: link_home if p == "~" else p,
+          ),
+          patch("os.scandir", side_effect=transient_error_scandir),
+      ):
+        degraded = stop_guard.discover_skills()
+      self.assertNotIn("cloudtop-use", degraded)
+      self.assertNotIn("broken-home", degraded)
+      self.assertFalse(os.path.exists(cache_file))
+
+      # Once FUSE recovers, cold scan populates the disk cache (including [] for skill-less plugins)
+      expected_skills = {
+          "review-triage": os.path.join(local_ok, "SKILL.md"),
+          "browser_operations": os.path.join(local_plug_skill, "SKILL.md"),
+          "visual-html-reporting": os.path.join(fuse_link, "SKILL.md"),
+          "cloudtop-use": os.path.join(
+              plugin_link, "skills", "cloudtop-use", "SKILL.md"
+          ),
+      }
+      with (
+          patch.object(stop_guard, "SKILL_GLOBS", globs),
+          patch.object(stop_guard, "PLUGIN_SKILL_CACHE_FILE", cache_file),
+          patch.object(stop_guard, "_MEM_PLUGIN_SKILL_CACHE", None),
+          patch("tempfile.gettempdir", return_value=sys_tmp),
+          patch(
+              "os.path.expanduser",
+              side_effect=lambda p: link_home if p == "~" else p,
+          ),
+      ):
+        warmed = stop_guard.discover_skills()
+      self.assertEqual(warmed, expected_skills)
+      self.assertTrue(os.path.isfile(cache_file))
+      os.unlink(os.path.join(skills_dir, "broken-home"))
+
+      def guarded_stat(path, *args, **kwargs):
+        p_str = str(os.fspath(path))
+        follow = kwargs.get("follow_symlinks", True)
+        if follow and (
+            "visual-html-reporting" in p_str
+            or "cloudtop-use" in p_str
+            or "google_chat" in p_str
+            or p_str.startswith("/opt/remote_mounts/")
+            or p_str.startswith(remote_mount)
+        ):
+          raise AssertionError(f"Dereferenced external symlink via stat: {p_str}")
+        if not follow and (
+            p_str.endswith("visual-html-reporting/SKILL.md")
+            or p_str.endswith("cloudtop-use/skills")
+            or p_str.startswith("/opt/remote_mounts/")
+            or p_str.startswith(remote_mount)
+        ):
+          raise AssertionError(f"Probed inside external symlink via lstat: {p_str}")
+        return orig_stat(path, *args, **kwargs)
+
+      def guarded_lstat(path, *args, **kwargs):
+        p_str = str(os.fspath(path))
+        if (
+            p_str.endswith("visual-html-reporting/SKILL.md")
+            or p_str.endswith("cloudtop-use/skills")
+            or p_str.startswith("/opt/remote_mounts/")
+            or p_str.startswith(remote_mount)
+        ):
+          raise AssertionError(f"Probed inside external symlink via lstat: {p_str}")
+        return orig_lstat(path, *args, **kwargs)
+
+      def guarded_scandir(path):
+        p_str = str(os.fspath(path))
+        if (
+            "cloudtop-use" in p_str
+            or "google_chat" in p_str
+            or p_str.startswith("/opt/remote_mounts/")
+            or p_str.startswith(remote_mount)
+        ):
+          raise AssertionError(f"Scanned inside external plugin symlink: {p_str}")
+        return orig_scandir(path)
+
+      # Even with HOME="/" and reset memory cache, persisted disk cache avoids all remote stats
+      with (
+          patch.object(stop_guard, "SKILL_GLOBS", globs),
+          patch.object(stop_guard, "PLUGIN_SKILL_CACHE_FILE", cache_file),
+          patch.object(stop_guard, "_MEM_PLUGIN_SKILL_CACHE", None),
+          patch("tempfile.gettempdir", return_value=sys_tmp),
+          patch(
+              "os.path.expanduser",
+              side_effect=lambda p: "/" if p == "~" else p,
+          ),
+          patch("os.stat", side_effect=guarded_stat),
+          patch("os.lstat", side_effect=guarded_lstat),
+          patch("os.scandir", side_effect=guarded_scandir),
+      ):
+        found = stop_guard.discover_skills()
+
+      self.assertEqual(found, expected_skills)
+
 
 if __name__ == "__main__":
   unittest.main()

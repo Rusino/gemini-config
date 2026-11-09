@@ -5,10 +5,11 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Mapping
 import contextlib
-from datetime import datetime
+from datetime import datetime, timezone
 import glob
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -423,12 +424,15 @@ PILL_ICONS: dict[str, str] = {
 }
 
 
-def format_et_timestamp(ts: float) -> str:
-  if not ts or ts <= 0:
+def format_et_timestamp(ts: float, now: float | None = None) -> str:
+  """Formats a positive epoch timestamp in New York time with a relative age suffix."""
+  if not ts or not math.isfinite(ts) or ts <= 0:
     return ""
+  # Anchor both ET date rollover and relative age to one clock snapshot for deterministic tests
+  cur_now = time.time() if now is None else now
   dt = datetime.fromtimestamp(ts, tz=ET_ZONE)
-  now_dt = datetime.now(tz=ET_ZONE)
-  delta_s = max(0, int(time.time() - ts))
+  now_dt = datetime.fromtimestamp(cur_now, tz=ET_ZONE)
+  delta_s = max(0, int(cur_now - ts))
   if delta_s < 60:
     rel = "just now"
   elif delta_s < 3600:
@@ -442,8 +446,206 @@ def format_et_timestamp(ts: float) -> str:
   return f"{dt.strftime('%b %-d at %H:%M')} ET ({rel})"
 
 
+_RE_SUBSECOND_OVERFLOW = re.compile(r"(\.\d{6})\d+")
+
+
+def _parse_domain_ts(val: Any) -> float:
+  """Parses numeric epoch seconds, ISO-8601/Gerrit UTC, or Piper ET dates into positive seconds."""
+  # Reject booleans (int subclass in Python), non-finite floats, and Go zero-time sentinels
+  if val is None or isinstance(val, bool):
+    return 0.0
+  if isinstance(val, (int, float)):
+    ts_f = float(val)
+    return ts_f if math.isfinite(ts_f) and ts_f > 0.0 else 0.0
+  s = str(val).strip()
+  if not s or s.startswith("0001-"):
+    return 0.0
+  try:
+    ts_num = float(s)
+    return ts_num if math.isfinite(ts_num) and ts_num > 0.0 else 0.0
+  except ValueError:
+    pass
+  # Clamp 9-digit nanosecond Gerrit/SQLite timestamps so Python <3.11 parses them identically
+  iso_s = _RE_SUBSECOND_OVERFLOW.sub(r"\1", s)
+  if iso_s.endswith(("Z", "z")):
+    iso_s = iso_s[:-1] + "+00:00"
+  try:
+    dt = datetime.fromisoformat(iso_s)
+    # Naive Gerrit timestamps ("YYYY-MM-DD HH:MM:SS.fffffffff") are UTC regardless of host TZ
+    if dt.tzinfo is None:
+      dt = dt.replace(tzinfo=timezone.utc)
+    ts_iso = dt.timestamp()
+    return ts_iso if ts_iso > 0.0 else 0.0
+  except ValueError:
+    pass
+  # Piper g4 describe emits America/New_York wall-clock slash timestamps without a TZ suffix
+  try:
+    ts_piper = datetime.strptime(s, "%Y/%m/%d %H:%M:%S").replace(tzinfo=ET_ZONE).timestamp()
+    return ts_piper if ts_piper > 0.0 else 0.0
+  except ValueError:
+    return 0.0
+
+
+def _first_positive_ts(state: Mapping[str, Any], keys: tuple[str, ...]) -> float:
+  """Returns the first positive timestamp found under keys in state, or 0.0."""
+  for k in keys:
+    ts = _parse_domain_ts(state.get(k))
+    if ts > 0.0:
+      return ts
+  return 0.0
+
+
+def _max_positive_ts(state: Mapping[str, Any], keys: tuple[str, ...]) -> float:
+  """Returns the maximum positive timestamp across keys in state, or 0.0."""
+  best = 0.0
+  for k in keys:
+    ts = _parse_domain_ts(state.get(k))
+    if ts > best:
+      best = ts
+  return best
+
+
+def _extract_artifact_timestamps(art: Mapping[str, Any]) -> tuple[float, float, int]:
+  """Extracts (activity_ts, origin_ts, origin_tier) for one non-context domain artifact."""
+  akey = str(art.get("artifact_key") or "")
+  kind = str(art.get("kind") or artifact_kind_from_key(akey))
+  st = art.get("state") if isinstance(art.get("state"), Mapping) else {}
+  title = str(art.get("title") or "")
+  link_reason = str(art.get("link_reason") or "")
+
+  # Keep origin_ts strictly on creation keys so fresh replies/audits never reset work age
+  if kind in ("gmail_thread", "gchat_thread", "gdoc_thread") or (
+      kind == "gdoc" and is_active_correspondence_artifact("gdoc", st)
+  ):
+    act_ts = _max_positive_ts(
+        st,
+        (
+            "last_message_ts", "counterparty_reply_ts", "mcp_reply_ts",
+            "manual_wait_ts", "resolved_at", "created_ts", "origin_ts",
+        ),
+    )
+    orig_ts = _first_positive_ts(st, ("origin_ts", "created_ts"))
+    return act_ts, orig_ts, (1 if orig_ts > 0.0 else 0)
+
+  # Sent or vanished Gmail drafts hold stale timestamps owned by the thread, not a live draft
+  if kind == "gmail_draft":
+    if str(st.get("status") or "DRAFT").upper() != "DRAFT":
+      return 0.0, 0.0, 0
+    act_ts = _max_positive_ts(st, ("draft_updated_ts", "created_ts", "origin_ts"))
+    orig_ts = _first_positive_ts(st, ("origin_ts", "created_ts"))
+    return act_ts, orig_ts, (1 if orig_ts > 0.0 else 0)
+
+  if kind in ("gerrit", "github_pr", "github", "piper"):
+    # Exclude local audited_msg_date unless no tracker timestamp exists (e.g. virtual Piper CL)
+    act_ts = _max_positive_ts(
+        st,
+        (
+            "activity_ts", "updated_ts", "submitted_ts", "last_msg_date",
+            "status_changed_raw", "created_ts", "created", "origin_ts",
+        ),
+    )
+    if act_ts <= 0.0:
+      act_ts = _max_positive_ts(st, ("audited_msg_date", "chat_last_modified"))
+    orig_ts = _first_positive_ts(st, ("created_ts", "created", "origin_ts"))
+    if orig_ts <= 0.0:
+      return act_ts, 0.0, 0
+    # Companion WIP CLs are review/test scaffolding and must not override the parent CL's age
+    tier = 2 if is_companion_artifact(akey, st, title, link_reason) else 1
+    return act_ts, orig_ts, tier
+
+  if kind in ("buganizer", "github_issue"):
+    act_ts = _max_positive_ts(
+        st,
+        (
+            "modified_ts", "last_human_comment_at", "last_self_comment_at",
+            "major_modified_time", "modified_time", "resolved_time",
+            "created_time", "origin_ts",
+        ),
+    )
+    # Keep multi-year upstream issue dates in Tier 3 so bound works keep their own start age
+    orig_ts = _first_positive_ts(st, ("origin_ts", "created_time"))
+    return act_ts, orig_ts, (3 if orig_ts > 0.0 else 0)
+
+  if kind == "chat_chain":
+    act_ts = _max_positive_ts(
+        st, ("last_activity_ts", "updated_ts", "last_modified_time", "created_ts", "origin_ts")
+    )
+    orig_ts = _first_positive_ts(st, ("origin_ts", "created_ts"))
+    return act_ts, orig_ts, (1 if orig_ts > 0.0 else 0)
+
+  return 0.0, 0.0, 0
+
+
+def compute_card_timestamps(
+    work_row: Mapping[str, Any] | None,
+    w_arts: Iterable[Mapping[str, Any]],
+    w_obs: Iterable[Mapping[str, Any]],
+    reply_draft: Mapping[str, Any] | None,
+) -> tuple[float, float]:
+  """Computes (activity_at, origin_at) from non-context artifacts, drafts, and obligations."""
+  act_candidates: list[float] = []
+  tier1_origins: list[float] = []
+  own_origins: list[float] = []
+  issue_origins: list[float] = []
+
+  for art in w_arts:
+    # Context-only chat mentions must never skew either recent activity or work age
+    if str(art.get("role") or "") == "context_only":
+      continue
+    act_ts, orig_ts, orig_tier = _extract_artifact_timestamps(art)
+    if act_ts > 0.0:
+      act_candidates.append(act_ts)
+    if orig_tier == 1:
+      tier1_origins.append(orig_ts)
+    elif orig_tier == 2:
+      own_origins.append(orig_ts)
+    elif orig_tier == 3:
+      issue_origins.append(orig_ts)
+
+  # Saving or materializing an inline reply draft counts as fresh work activity
+  if isinstance(reply_draft, Mapping):
+    rd_ts = _max_positive_ts(reply_draft, ("updated_at", "materialized_at"))
+    if rd_ts > 0.0:
+      act_candidates.append(rd_ts)
+
+  # Fired obligations surface fresh triage activity; obligation and work creation bound own age
+  for ob in w_obs:
+    if str(ob.get("status") or "") == "done":
+      continue
+    if str(ob.get("status") or "") == "ready":
+      sat_ts = _parse_domain_ts(ob.get("satisfied_at"))
+      if sat_ts > 0.0:
+        act_candidates.append(sat_ts)
+    ob_orig = _parse_domain_ts(ob.get("created_at"))
+    if ob_orig > 0.0:
+      own_origins.append(ob_orig)
+
+  work_created = _parse_domain_ts((work_row or {}).get("created_at"))
+  if work_created > 0.0:
+    own_origins.append(work_created)
+
+  # Return 0.0 when no domain or stored clock exists so unknown-timestamp cards always sort last
+  activity_at = max(act_candidates, default=0.0)
+  if activity_at <= 0.0 and work_row is not None:
+    activity_at = _parse_domain_ts(work_row.get("updated_at")) or work_created
+
+  if tier1_origins:
+    origin_at = min(tier1_origins)
+  elif own_origins:
+    origin_at = min(own_origins)
+  elif issue_origins:
+    origin_at = min(issue_origins)
+  else:
+    origin_at = activity_at
+
+  # Guard against clock skew between local SQLite creation and earlier external timestamps
+  if activity_at > 0.0 and origin_at > activity_at:
+    origin_at = activity_at
+  return activity_at, origin_at
+
+
 def format_short_et_date(ts: float) -> str:
-  if not ts or ts <= 0:
+  if not ts or not math.isfinite(ts) or ts <= 0:
     return ""
   dt = datetime.fromtimestamp(ts, tz=ET_ZONE)
   return dt.strftime("%b %-d")
@@ -2227,46 +2429,66 @@ class WorkStore:
       meta: Mapping[str, Any] | None = None,
       now: float | None = None,
   ) -> str:
-    """Creates or updates an active Work while preserving existing created_at and meta_json keys."""
+    """Creates or updates a Work in place while preserving status, snooze_until, and created_at."""
     cur_now = time.time() if now is None else now
     if not work_id:
       digest = hashlib.sha1(f"{title}:{project_id}:{cur_now}".encode("utf-8")).hexdigest()[:10]
       work_id = f"work-{digest}"
+    clean_title = title.strip()
+    clean_proj = project_id.strip()
+    clean_roadmap = roadmap_item_key.strip()
     with self._lock, self._connect() as conn:
-      # Preserve existing created_at and reply_draft when re-minting a deterministic work_id
       existing_w = conn.execute(
-          "SELECT created_at, meta_json FROM works WHERE work_id = ?", (work_id,)
+          "SELECT title, status, project_id, roadmap_item_key, created_at, meta_json "
+          "FROM works WHERE work_id = ?",
+          (work_id,),
       ).fetchone()
-      created_ts = float(existing_w["created_at"]) if existing_w else cur_now
-      merged_meta: dict[str, Any] = {}
-      if existing_w and existing_w["meta_json"]:
+      if existing_w is None:
+        conn.execute(
+            "INSERT INTO works "
+            "(work_id, title, status, project_id, roadmap_item_key, "
+            "created_at, updated_at, meta_json) "
+            "VALUES (?, ?, 'active', ?, ?, ?, ?, ?)",
+            (
+                work_id,
+                clean_title,
+                clean_proj,
+                clean_roadmap,
+                cur_now,
+                cur_now,
+                json.dumps(dict(meta) if meta else {}),
+            ),
+        )
+        self._log_event(
+            conn,
+            "work_minted",
+            work_id=work_id,
+            payload={"title": title, "project_id": project_id},
+            now=cur_now,
+        )
+        return work_id
+
+      prev_meta: dict[str, Any] = {}
+      if existing_w["meta_json"]:
         try:
-          merged_meta = json.loads(existing_w["meta_json"])
+          prev_meta = json.loads(existing_w["meta_json"])
         except Exception:
-          merged_meta = {}
+          prev_meta = {}
+      merged_meta = dict(prev_meta)
       if meta:
         merged_meta.update(dict(meta))
+      # Skip no-op sync passes; UPDATE in place so status, snooze_until, and work_minted stay intact
+      if (
+          str(existing_w["title"] or "") == clean_title
+          and str(existing_w["project_id"] or "") == clean_proj
+          and str(existing_w["roadmap_item_key"] or "") == clean_roadmap
+          and merged_meta == prev_meta
+      ):
+        return work_id
       conn.execute(
-          "INSERT OR REPLACE INTO works "
-          "(work_id, title, status, project_id, roadmap_item_key, "
-          "created_at, updated_at, meta_json) "
-          "VALUES (?, ?, 'active', ?, ?, ?, ?, ?)",
-          (
-              work_id,
-              title.strip(),
-              project_id.strip(),
-              roadmap_item_key.strip(),
-              created_ts,
-              cur_now,
-              json.dumps(merged_meta),
-          ),
-      )
-      self._log_event(
-          conn,
-          "work_minted",
-          work_id=work_id,
-          payload={"title": title, "project_id": project_id},
-          now=cur_now,
+          "UPDATE works SET title = ?, project_id = ?, roadmap_item_key = ?, "
+          "updated_at = ?, meta_json = ? WHERE work_id = ?",
+          (clean_title, clean_proj, clean_roadmap, cur_now, json.dumps(merged_meta), work_id),
       )
     return work_id
 
@@ -2609,16 +2831,25 @@ class WorkStore:
         return None
 
       existing_link = conn.execute(
-          "SELECT role, link_reason, link_detail, created_at "
+          "SELECT role, source, confidence, link_reason, link_detail, created_at "
           "FROM work_links WHERE work_id = ? AND artifact_key = ?",
           (work_id, akey),
       ).fetchone()
+      prev_role = str(existing_link["role"] or "") if existing_link else ""
+      prev_source = str(existing_link["source"] or "") if existing_link else ""
+      prev_conf = float(existing_link["confidence"] or 0.0) if existing_link else 0.0
       prev_reason = str(existing_link["link_reason"] or "") if existing_link else ""
       prev_detail = str(existing_link["link_detail"] or "") if existing_link else ""
       created_ts = float(existing_link["created_at"]) if existing_link else cur_now
 
-      final_reason = link_reason.strip() or prev_reason or ("manual" if source == "manual" else "")
-      final_detail = link_detail.strip() or prev_detail
+      # Never let background auto sync passes downgrade or overwrite a manually pinned link
+      if existing_link is not None and prev_source == "manual" and source != "manual":
+        return prev_role or role
+
+      req_reason = link_reason.strip()
+      req_detail = link_detail.strip()
+      final_reason = req_reason or prev_reason or ("manual" if source == "manual" else "")
+      final_detail = req_detail or prev_detail
 
       effective_role = role
       if (
@@ -2630,12 +2861,35 @@ class WorkStore:
       # Never promote a mid-chat mention to primary without an explicit structural link_reason
       if (
           existing_link
-          and str(existing_link["role"]) == "context_only"
+          and prev_role == "context_only"
           and prev_reason == "chat_mention"
           and source != "manual"
-          and link_reason.strip() in ("", "chat_mention")
+          and req_reason in ("", "chat_mention")
       ):
         effective_role = "context_only"
+
+      # Keep established auto link_reason/detail across competing sync passes unless companion_wip
+      if (
+          existing_link is not None
+          and prev_role == effective_role
+          and source != "manual"
+          and prev_reason
+          and req_reason != "companion_wip"
+      ):
+        final_reason = prev_reason
+        final_detail = prev_detail
+      final_conf = max(prev_conf, confidence) if existing_link is not None else confidence
+
+      # Skip redundant SQLite writes on unchanged links so periodic syncs do not clobber updated_at
+      if (
+          existing_link is not None
+          and prev_role == effective_role
+          and prev_source == source
+          and prev_conf == final_conf
+          and prev_reason == final_reason
+          and prev_detail == final_detail
+      ):
+        return effective_role
 
       conn.execute(
           "INSERT OR REPLACE INTO work_links "
@@ -2646,7 +2900,7 @@ class WorkStore:
               akey,
               effective_role,
               source,
-              confidence,
+              final_conf,
               created_ts,
               final_reason,
               final_detail,
@@ -3343,6 +3597,8 @@ class WorkStore:
 
     bug_keys: set[str] = set()
     linked_cls: set[str] = set()
+    # Skip re-linking CLs already attached as primary while keeping linked_cls for stack children
+    primary_cls: set[str] = set()
     for r in wl_rows:
       akey = str(r["artifact_key"])
       role = str(r["role"])
@@ -3350,6 +3606,8 @@ class WorkStore:
         bug_keys.add(akey)
       elif akey.startswith(("gerrit:", "github_pr:", "piper:")):
         linked_cls.add(akey)
+        if role == "primary":
+          primary_cls.add(akey)
       elif akey.startswith("gmail_draft:"):
         ar = art_rows.get(akey) or {}
         try:
@@ -3378,35 +3636,39 @@ class WorkStore:
           c_bugs = set(extract_cl_bug_keys(st))
           matched_bugs = sorted(c_bugs & bug_keys)
           if matched_bugs:
-            b_short = ", ".join(format_short_bug_id(b) for b in matched_bugs[:2])
-            self.link_artifact(
-                work_id,
-                akey,
-                role="primary",
-                source="auto",
-                link_reason="bug_trailer",
-                link_detail=f"В описании СЛ указан баг {b_short}",
-                now=cur_now,
-            )
             linked_cls.add(akey)
-            newly_linked.append(akey)
-        else:
-          p_raw = str(st.get("stack_parent_ikey") or "").strip()
-          if p_raw:
-            p_ckey = canonicalize_artifact_key(p_raw)
-            if p_ckey in linked_cls:
-              p_num = p_ckey.split(":")[-1]
+            if akey not in primary_cls:
+              b_short = ", ".join(format_short_bug_id(b) for b in matched_bugs[:2])
               self.link_artifact(
                   work_id,
                   akey,
                   role="primary",
                   source="auto",
-                  link_reason="stack_child",
-                  link_detail=f"Дочерний СЛ в стеке Gerrit поверх {p_num}",
+                  link_reason="bug_trailer",
+                  link_detail=f"В описании СЛ указан баг {b_short}",
                   now=cur_now,
               )
-              linked_cls.add(akey)
+              primary_cls.add(akey)
               newly_linked.append(akey)
+        else:
+          p_raw = str(st.get("stack_parent_ikey") or "").strip()
+          if p_raw:
+            p_ckey = canonicalize_artifact_key(p_raw)
+            if p_ckey in linked_cls:
+              linked_cls.add(akey)
+              if akey not in primary_cls:
+                p_num = p_ckey.split(":")[-1]
+                self.link_artifact(
+                    work_id,
+                    akey,
+                    role="primary",
+                    source="auto",
+                    link_reason="stack_child",
+                    link_detail=f"Дочерний СЛ в стеке Gerrit поверх {p_num}",
+                    now=cur_now,
+                )
+                primary_cls.add(akey)
+                newly_linked.append(akey)
     return newly_linked
 
   def mark_obligation_done(
@@ -5229,12 +5491,20 @@ class WorkStore:
         mat_active = bool(mat_did) and str(mat_st.get("status") or "DRAFT").upper() == "DRAFT"
         card_reply_draft = {
             **active_rd,
-            "updated_et": format_et_timestamp(rd_upd),
+            "updated_et": format_et_timestamp(rd_upd, now=cur_now),
             "materialized_url": (
                 f"https://mail.google.com/mail/u/0/#drafts/{mat_did}" if mat_active else ""
             ),
             "needs_rematerialize": bool(mat_active and mat_ts > 0.0 and rd_upd > mat_ts + 1e-6),
         }
+      # Expose real domain activity on updated_at too so legacy CLI/API callers see true recency
+      activity_ts, origin_ts_val = compute_card_timestamps(w, w_arts, w_obs, card_reply_draft)
+      has_urgent_ob = any(
+          o.get("status") == "ready" or bool(o.get("stalled_alert"))
+          for o in w_obs
+          if o.get("status") != "done"
+      )
+      act_et = format_et_timestamp(activity_ts, now=cur_now)
       cards.append({
           "work_id": wid,
           "title": resolved_title or str(w["title"]),
@@ -5244,8 +5514,13 @@ class WorkStore:
           "reasons": reasons,
           "project_id": effective_proj,
           "roadmap_item_key": str(w.get("roadmap_item_key") or ""),
-          "updated_at": float(w.get("updated_at") or cur_now),
-          "updated_et": format_et_timestamp(float(w.get("updated_at") or cur_now)),
+          "updated_at": activity_ts,
+          "updated_et": act_et,
+          "activity_at": activity_ts,
+          "activity_et": act_et,
+          "origin_at": origin_ts_val,
+          "origin_et": format_et_timestamp(origin_ts_val, now=cur_now),
+          "has_urgent_obligation": has_urgent_ob,
           "is_virtual": False,
           "is_multi_channel": len(kinds_seen) >= 2 or len(w_arts) >= 2 or len(w_obs) >= 1,
           "reply_draft": card_reply_draft,
@@ -5358,11 +5633,26 @@ class WorkStore:
           )
           if fallback_r:
             v_reasons.append(fallback_r)
-        updated_ts = float(item.get("updated_ts") or cur_now)
         # Strip config project stamps from virtual cards when discussed in a config conversation
         raw_v_proj = str(item.get("project") or "")
         v_proj = "" if is_config_project(raw_v_proj) else raw_v_proj
         v_title = str(item.get("subject") or item.get("title") or format_short_cl_id(c_key, item))
+        # Build virtual parent + companion pills first so virtual cards share exact timestamp rules
+        v_arts = [
+            {
+                "artifact_key": c_key,
+                "kind": artifact_kind_from_key(c_key),
+                "icon": PILL_ICONS.get(artifact_kind_from_key(c_key), "🔧"),
+                "title": f"{c_key.split(':')[-1]} · {item.get('subject') or ''}".strip(" ·"),
+                "url": str(item.get("url") or ""),
+                "role": "primary",
+                "source": "virtual",
+                "state": dict(item),
+            },
+            *comp_pills,
+        ]
+        v_act_ts, v_orig_ts = compute_card_timestamps(None, v_arts, [], None)
+        v_act_et = format_et_timestamp(v_act_ts, now=cur_now)
         cards.append({
             "work_id": f"virt-{c_key}",
             "title": v_title,
@@ -5371,32 +5661,28 @@ class WorkStore:
             "reasons": v_reasons,
             "project_id": v_proj,
             "roadmap_item_key": "",
-            "updated_at": updated_ts,
-            "updated_et": format_et_timestamp(updated_ts),
+            "updated_at": v_act_ts,
+            "updated_et": v_act_et,
+            "activity_at": v_act_ts,
+            "activity_et": v_act_et,
+            "origin_at": v_orig_ts,
+            "origin_et": format_et_timestamp(v_orig_ts, now=cur_now),
+            "has_urgent_obligation": False,
             "is_virtual": True,
             "is_multi_channel": bool(comp_pills),
-            "artifacts": [
-                {
-                    "artifact_key": c_key,
-                    "kind": artifact_kind_from_key(c_key),
-                    "icon": PILL_ICONS.get(artifact_kind_from_key(c_key), "🔧"),
-                    "title": f"{c_key.split(':')[-1]} · {item.get('subject') or ''}".strip(" ·"),
-                    "url": str(item.get("url") or ""),
-                    "role": "primary",
-                    "source": "virtual",
-                    "state": dict(item),
-                },
-                *comp_pills,
-            ],
+            "artifacts": v_arts,
             "obligations": [],
         })
 
+    # Rank by lane and urgent obligations first, pushing missing/zero timestamps after dated cards
     lane_rank = {"needs-you": 0, "waiting": 1, "blocked": 2, "done": 3}
     cards.sort(
         key=lambda c: (
             lane_rank.get(c["lane"], 9),
-            0 if not c["is_virtual"] else 1,
-            -float(c.get("updated_at") or 0.0),
+            0 if c.get("has_urgent_obligation") else 1,
+            1 if float(c.get("activity_at") or c.get("updated_at") or 0.0) <= 0.0 else 0,
+            -float(c.get("activity_at") or c.get("updated_at") or 0.0),
+            str(c.get("work_id") or ""),
         )
     )
     # Exclude dismissed threads, active linked threads, and completed threads without newer replies
@@ -5439,5 +5725,5 @@ class WorkStore:
         "candidates": self.list_candidates(now=cur_now)[:25],
         "metrics": self.compute_metrics(days=14, now=cur_now),
         "counts": counts,
-        "synced_et": format_et_timestamp(cur_now),
+        "synced_et": format_et_timestamp(cur_now, now=cur_now),
     }

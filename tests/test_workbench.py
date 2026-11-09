@@ -5191,6 +5191,511 @@ assert.strictEqual(cards.w_wait2.collapsed, true);
     self.assertEqual(workctl.main(["--db", self.db_path, "draft-clear", w_idemp]), 0)
     self.assertIsNone(store.get_reply_draft(w_idemp))
 
+  # Verify domain activity/origin timestamps survive sync passes, lift virtual CLs on equal footing,
+  # and drive Waiting chip filtering plus Triage/Activity/Age bidirectional sorting in the UI
+  def test_r14_domain_timestamps_sync_idempotency_and_sorting_ui(self) -> None:
+    import re
+    import workbench_server
+    import work_store
+
+    # 2026-11-09 16:00:00 UTC
+    now = 1794240000.0
+    store = work_store.WorkStore(self.db_path)
+
+    wid_idem = store.create_work(
+        "SkParagraph strut cache", project_id="skia", work_id="work-idem", now=now - 3600
+    )
+    store.upsert_artifact(
+        "gerrit:skia:1414001",
+        kind="gerrit",
+        title="1414001: strut cache",
+        state={"created_ts": now - 86400, "activity_ts": now - 3600},
+        now=now - 3600,
+    )
+    store.link_artifact(
+        wid_idem, "gerrit:skia:1414001", role="primary", link_reason="chat_topic", now=now - 3600
+    )
+    with store._connect() as conn:
+      upd_before = float(
+          conn.execute(
+              "SELECT updated_at FROM works WHERE work_id = ?", (wid_idem,)
+          ).fetchone()["updated_at"]
+      )
+      ev_before = int(
+          conn.execute(
+              "SELECT COUNT(*) AS c FROM events WHERE work_id = ?", (wid_idem,)
+          ).fetchone()["c"]
+      )
+
+    store.create_work(
+        "SkParagraph strut cache", project_id="skia", work_id="work-idem", now=now
+    )
+    store.link_artifact(
+        wid_idem, "gerrit:skia:1414001", role="primary", link_reason="chat_topic", now=now
+    )
+    with store._connect() as conn:
+      upd_after = float(
+          conn.execute(
+              "SELECT updated_at FROM works WHERE work_id = ?", (wid_idem,)
+          ).fetchone()["updated_at"]
+      )
+      ev_after = int(
+          conn.execute(
+              "SELECT COUNT(*) AS c FROM events WHERE work_id = ?", (wid_idem,)
+          ).fetchone()["c"]
+      )
+    self.assertEqual(upd_after, upd_before)
+    self.assertEqual(ev_after, ev_before)
+
+    # C4: Piper local ET slash timestamps and non-finite float guards
+    self.assertEqual(work_store._parse_domain_ts("2026/11/09 11:00:00"), now)
+    self.assertEqual(work_store._parse_domain_ts(float("inf")), 0.0)
+    self.assertEqual(work_store._parse_domain_ts("inf"), 0.0)
+    self.assertEqual(work_store._parse_domain_ts(float("nan")), 0.0)
+    self.assertEqual(work_store.format_et_timestamp(float("inf"), now=now), "")
+
+    # C5: create_work on existing work_id preserves snooze_until, done status, and work_minted count
+    wid_lifecycle = store.create_work("Lifecycle work", work_id="work-lifecycle", now=now - 7200)
+    with store._connect() as conn:
+      conn.execute(
+          "UPDATE works SET snooze_until = ? WHERE work_id = ?",
+          (now + 3600, wid_lifecycle),
+      )
+    store.create_work("Lifecycle work v2", work_id="work-lifecycle", meta={"k": 1}, now=now - 3600)
+    store.complete_work(wid_lifecycle, now=now - 1800)
+    store.create_work("Lifecycle work v2", work_id="work-lifecycle", meta={"k": 1}, now=now)
+    with store._connect() as conn:
+      lc_row = conn.execute(
+          "SELECT status, snooze_until FROM works WHERE work_id = ?", (wid_lifecycle,)
+      ).fetchone()
+      minted_cnt = int(
+          conn.execute(
+              "SELECT COUNT(*) AS c FROM events WHERE work_id = ? AND event_type = 'work_minted'",
+              (wid_lifecycle,),
+          ).fetchone()["c"]
+      )
+    self.assertEqual(lc_row["status"], "done")
+    self.assertEqual(float(lc_row["snooze_until"]), now + 3600)
+    self.assertEqual(minted_cnt, 1)
+
+    # C3: manual links survive auto syncs and competing auto reasons do not ping-pong updated_at
+    wid_manual = store.create_work("Manual bug + CL", work_id="work-manual", now=now - 5000)
+    store.upsert_artifact(
+        "buganizer:580955594",
+        kind="buganizer",
+        state={"status": "ASSIGNED", "origin_ts": now - 90000, "modified_ts": now - 5000},
+        now=now - 5000,
+    )
+    store.upsert_artifact(
+        "gerrit:skia:1414002",
+        kind="gerrit",
+        state={
+            "status": "NEW",
+            "linked_bug_keys": ["buganizer:580955594"],
+            "created_ts": now - 4000,
+            "activity_ts": now - 4000,
+        },
+        now=now - 5000,
+    )
+    store.link_artifact(
+        wid_manual, "buganizer:580955594", role="primary", source="manual", now=now - 5000
+    )
+    store.link_artifact(
+        wid_manual,
+        "gerrit:skia:1414002",
+        role="primary",
+        source="manual",
+        link_reason="manual",
+        link_detail="Pinned manually",
+        now=now - 5000,
+    )
+    store.reconcile_work_bug_cls(wid_manual, now=now - 1000)
+    store.link_artifact(
+        wid_manual,
+        "gerrit:skia:1414002",
+        role="primary",
+        source="auto",
+        link_reason="bug_trailer",
+        link_detail="В описании СЛ 1414002 указан баг b/580955594",
+        now=now - 500,
+    )
+    with store._connect() as conn:
+      man_link = conn.execute(
+          "SELECT source, link_reason FROM work_links WHERE work_id = ? AND artifact_key = ?",
+          (wid_manual, "gerrit:skia:1414002"),
+      ).fetchone()
+      man_upd = float(
+          conn.execute(
+              "SELECT updated_at FROM works WHERE work_id = ?", (wid_manual,)
+          ).fetchone()["updated_at"]
+      )
+    self.assertEqual(man_link["source"], "manual")
+    self.assertEqual(man_upd, now - 5000)
+
+    store.link_artifact(
+        wid_idem,
+        "gerrit:skia:1414001",
+        role="primary",
+        source="auto",
+        link_reason="bug_trailer",
+        link_detail="В описании СЛ 1414001 указан баг b/1",
+        now=now,
+    )
+    with store._connect() as conn:
+      upd_competing = float(
+          conn.execute(
+              "SELECT updated_at FROM works WHERE work_id = ?", (wid_idem,)
+          ).fetchone()["updated_at"]
+      )
+    self.assertEqual(upd_competing, upd_before)
+
+    # C2: materializing a draft or auditing a stub CL today must not reset a 10d Work's origin_at
+    wid_stalled = store.create_work(
+        "Stalled upstream issue follow-up", work_id="work-stalled", now=now - 10 * 86400
+    )
+    store.upsert_artifact(
+        "piper:1008075988",
+        kind="piper",
+        title="1008075988: Piper audit stub",
+        state={"status": "PENDING", "audited_msg_date": "2026-11-09T15:59:00Z"},
+        now=now,
+    )
+    store.link_artifact(wid_stalled, "piper:1008075988", role="primary", now=now - 10 * 86400)
+    store.save_reply_draft(
+        wid_stalled,
+        "Checking in",
+        to="roliv@google.com",
+        subject="Status update",
+        now=now,
+    )
+    store.record_materialized_reply_draft(wid_stalled, "r_mat_age", now=now)
+
+    wid_reb = store.create_work("Rebased feature work", work_id="work-rebased", now=now)
+    store.upsert_artifact(
+        "github_issue:flutter/flutter:50168",
+        kind="github_issue",
+        title="flutter#50168 Old 2020 bug",
+        state={"status": "OPEN", "origin_ts": 1580000000.0, "created_time": "2020-01-26T00:00:00Z"},
+        now=now,
+    )
+    store.upsert_artifact(
+        "gerrit:skia:1414100",
+        kind="gerrit",
+        title="1414100: Main fix",
+        state={
+            "status": "NEW",
+            "is_self": True,
+            "role": "author",
+            "merge_conflict": True,
+            "created_ts": now - 3 * 86400,
+            "activity_ts": now - 6 * 3600,
+            "audited_msg_date": "2026-11-09T15:59:00Z",
+        },
+        now=now,
+    )
+    store.upsert_artifact(
+        "gerrit:skia:1414101",
+        kind="gerrit",
+        title="1414101: [WIP] Companion tests for 1414100",
+        state={
+            "status": "NEW",
+            "is_self": True,
+            "is_wip": True,
+            "is_companion": True,
+            "companion_to": "gerrit:skia:1414100",
+            "created_ts": now - 5 * 3600,
+            "activity_ts": now - 5 * 3600,
+        },
+        now=now,
+    )
+    store.upsert_artifact(
+        "gerrit:skia:1414999",
+        kind="gerrit",
+        title="1414999: Passing mention",
+        state={"status": "NEW", "created_ts": now - 60, "activity_ts": now - 60},
+        now=now,
+    )
+    store.link_artifact(wid_reb, "github_issue:flutter/flutter:50168", role="primary", now=now)
+    store.link_artifact(wid_reb, "gerrit:skia:1414100", role="primary", now=now)
+    store.link_artifact(
+        wid_reb, "gerrit:skia:1414101", role="primary", link_reason="companion_wip", now=now
+    )
+    store.link_artifact(
+        wid_reb, "gerrit:skia:1414999", role="context_only", link_reason="chat_mention", now=now
+    )
+
+    wid_urgent = store.create_work("Ready obligation work", work_id="work-urgent", now=now)
+    store.upsert_artifact(
+        "gmail_thread:th_urgent",
+        kind="gmail_thread",
+        title="Question from Renzo",
+        state={
+            "origin_ts": now - 5 * 86400,
+            "last_message_ts": now - 12 * 3600,
+            "is_automated": False,
+        },
+        now=now,
+    )
+    store.link_artifact(wid_urgent, "gmail_thread:th_urgent", role="channel", now=now)
+    store.add_obligation(
+        wid_urgent,
+        description="Reply to Renzo",
+        trigger_expr="always",
+        target_artifact_key="gmail_thread:th_urgent",
+        now=now - 12 * 3600,
+    )
+
+    cl_state = {
+        "items": {
+            "gerrit:1414555": {
+                "kind": "gerrit",
+                "target_id": "1414555",
+                "host": "skia-review.googlesource.com",
+                "status": "NEW",
+                "is_self": False,
+                "role": "reviewer",
+                "in_my_attention": True,
+                "subject": "Fresh incoming review CL",
+                "created": "2026-11-08 16:00:00.000000000",
+                "last_msg_date": "2026-11-09 15:55:00.000000000",
+                "updated_at": "10:55:00 ET",
+                "entity_state": {"lane": "you", "action_required": True, "reason": "Review needed"},
+            },
+            "gerrit:1420999": {
+                "kind": "gerrit",
+                "target_id": "1420999",
+                "host": "skia-review.googlesource.com",
+                "status": "NEW",
+                "is_self": False,
+                "role": "reviewer",
+                "in_my_attention": True,
+                "subject": "Dateless virtual CL",
+                "entity_state": {"lane": "you", "action_required": True, "reason": "Review needed"},
+            },
+        }
+    }
+    proj = store.build_dashboard_projection(cl_watcher_state=cl_state, now=now)
+    by_id = {w["work_id"]: w for w in proj["works"]}
+
+    stalled_card = by_id["work-stalled"]
+    self.assertEqual(stalled_card["origin_at"], now - 10 * 86400)
+    self.assertEqual(stalled_card["activity_at"], now)
+
+    reb_card = by_id["work-rebased"]
+    self.assertEqual(reb_card["origin_at"], now - 3 * 86400)
+    self.assertEqual(reb_card["activity_at"], now - 5 * 3600)
+
+    virt_card = by_id["virt-gerrit:skia:1414555"]
+    self.assertEqual(virt_card["activity_at"], now - 300)
+    self.assertEqual(virt_card["origin_at"], now - 86400)
+
+    dateless_card = by_id["virt-gerrit:skia:1420999"]
+    self.assertEqual(dateless_card["activity_at"], 0.0)
+    self.assertEqual(dateless_card["origin_at"], 0.0)
+    self.assertEqual(dateless_card["activity_et"], "")
+    self.assertEqual(dateless_card["origin_et"], "")
+
+    needs_ids = [w["work_id"] for w in proj["works"] if w["lane"] == "needs-you"]
+    self.assertEqual(
+        needs_ids,
+        [
+            "work-urgent",
+            "virt-gerrit:skia:1414555",
+            "work-rebased",
+            "virt-gerrit:skia:1420999",
+        ],
+    )
+
+    ui_proj = {
+        "synced_et": "11:00 ET (just now)",
+        "counts": {"needs_you": 2, "waiting": 2, "obligations_open": 1, "unanswered": 0},
+        "metrics": {"link_precision": 1.0},
+        "unanswered_tray": [],
+        "works": [
+            {
+                "work_id": "w_urgent",
+                "title": "Urgent Ready Work",
+                "lane": "needs-you",
+                "has_urgent_obligation": True,
+                "activity_at": 1000,
+                "activity_et": "Nov 5 at 10:00 ET (4d ago)",
+                "origin_at": 500,
+                "origin_et": "Nov 1 at 09:00 ET (8d ago)",
+                "updated_at": 1000,
+                "updated_et": "Nov 5 at 10:00 ET (4d ago)",
+                "is_multi_channel": True,
+                "obligations": [
+                    {"status": "ready", "description": "Reply", "trigger_expr": "always"}
+                ],
+                "artifacts": [],
+                "checklist": [],
+                "reasons": ["Ready"],
+            },
+            {
+                "work_id": "w_fresh_wait",
+                "title": "Fresh Waiting CL",
+                "lane": "waiting",
+                "has_urgent_obligation": False,
+                "activity_at": 5000,
+                "activity_et": "10:58 ET (2m ago)",
+                "origin_at": 4900,
+                "origin_et": "10:55 ET (5m ago)",
+                "updated_at": 5000,
+                "updated_et": "10:58 ET (2m ago)",
+                "is_multi_channel": False,
+                "obligations": [],
+                "artifacts": [],
+                "checklist": [],
+                "reasons": ["Waiting on reviewer"],
+            },
+            {
+                "work_id": "w_old_needs",
+                "title": "Long Open Rebased Work",
+                "lane": "needs-you",
+                "has_urgent_obligation": False,
+                "activity_at": 4000,
+                "activity_et": "10:30 ET (30m ago)",
+                "origin_at": 100,
+                "origin_et": "Oct 20 at 12:00 ET (20d ago)",
+                "updated_at": 4000,
+                "updated_et": "10:30 ET (30m ago)",
+                "is_multi_channel": False,
+                "obligations": [],
+                "artifacts": [],
+                "checklist": [],
+                "reasons": ["Merge conflict"],
+            },
+            {
+                "work_id": "w_zero_ts",
+                "title": "Unknown Timestamp Waiting",
+                "lane": "waiting",
+                "has_urgent_obligation": False,
+                "activity_at": 0,
+                "activity_et": "",
+                "origin_at": 0,
+                "origin_et": "",
+                "updated_at": 0,
+                "updated_et": "",
+                "is_multi_channel": False,
+                "obligations": [],
+                "artifacts": [],
+                "checklist": [],
+                "reasons": [],
+            },
+        ],
+    }
+    html_out = workbench_server.render_workbench_html(ui_proj, ui_version=2)
+    self.assertIn('data-filter="waiting"', html_out)
+    self.assertIn('id="wb-sort-mode"', html_out)
+    self.assertIn('id="wb-sort-dir"', html_out)
+    match = re.search(r"<script>\n(.*?)\n</script>", html_out, re.DOTALL)
+    self.assertIsNotNone(match)
+    script_js = match.group(1)
+
+    node_sort_test = """
+const assert = require('assert');
+const storage = new Map();
+function makeEl(id, extra = {}) {
+  const attrs = Object.assign({}, extra.attrs || {});
+  const listeners = {};
+  return Object.assign({
+    id,
+    value: extra.value || '',
+    textContent: extra.textContent || '',
+    innerHTML: '',
+    disabled: false,
+    getAttribute(k) { return Object.prototype.hasOwnProperty.call(attrs, k) ? attrs[k] : null; },
+    setAttribute(k, v) { attrs[k] = String(v); },
+    addEventListener(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); },
+    dispatch(ev, evtObj) { for (const fn of (listeners[ev] || [])) fn(evtObj || {}); },
+  }, extra.props || {});
+}
+const els = {
+  'wb-synced': makeEl('wb-synced'),
+  'kpi-needs': makeEl('kpi-needs'),
+  'kpi-wait': makeEl('kpi-wait'),
+  'kpi-obs': makeEl('kpi-obs'),
+  'kpi-tray': makeEl('kpi-tray'),
+  'kpi-prec': makeEl('kpi-prec'),
+  'wb-tray-container': makeEl('wb-tray-container'),
+  'wb-cards-container': makeEl('wb-cards-container'),
+  'wb-new-btn': makeEl('wb-new-btn'),
+  'wb-cancel-new': makeEl('wb-cancel-new'),
+  'wb-new-form': makeEl('wb-new-form', { props: { reset() {} } }),
+  'wb-sync-btn': makeEl('wb-sync-btn'),
+  'wb-toggle-collapse': makeEl('wb-toggle-collapse', { attrs: { 'data-action': 'collapse' } }),
+  'wb-search': makeEl('wb-search'),
+  'wb-sort-mode': makeEl('wb-sort-mode', { value: 'triage' }),
+  'wb-sort-dir': makeEl('wb-sort-dir', { attrs: { 'data-dir': 'desc' }, textContent: '↓ New' }),
+};
+const chips = ['all', 'needs-you', 'waiting', 'multi', 'obligations', 'done'].map((f, idx) =>
+  makeEl('chip-' + f, { attrs: { 'data-filter': f, 'data-active': idx === 0 ? 'true' : 'false' } })
+);
+global.localStorage = {
+  getItem: (k) => (storage.has(k) ? storage.get(k) : null),
+  setItem: (k, v) => { storage.set(k, String(v)); },
+};
+global.window = { addEventListener: () => {}, getSelection: () => '', prompt: () => '' };
+global.setInterval = () => 0;
+global.fetch = async () => ({ ok: false });
+global.document = {
+  getElementById: (id) => els[id] || makeEl(id),
+  querySelectorAll: (sel) => (sel === '.wb-chip' ? chips : []),
+  createElement: () => {
+    let txt = '';
+    return {
+      set textContent(v) { txt = String(v || ''); },
+      get innerHTML() {
+        return txt.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      },
+    };
+  },
+  body: { addEventListener: () => {} },
+};
+
+""" + script_js + """
+
+function visibleIds() {
+  const re = /data-work-id="([^"]+)"/g;
+  const out = [];
+  let m;
+  while ((m = re.exec(els['wb-cards-container'].innerHTML)) !== null) out.push(m[1]);
+  return out;
+}
+
+assert.deepStrictEqual(visibleIds(), ['w_urgent', 'w_old_needs', 'w_fresh_wait', 'w_zero_ts']);
+
+chips[2].dispatch('click');
+assert.deepStrictEqual(visibleIds(), ['w_fresh_wait', 'w_zero_ts']);
+
+chips[0].dispatch('click');
+els['wb-sort-mode'].value = 'activity';
+els['wb-sort-mode'].dispatch('change', { target: els['wb-sort-mode'] });
+assert.strictEqual(els['wb-sort-dir'].getAttribute('data-dir'), 'desc');
+assert.strictEqual(els['wb-sort-dir'].textContent, '↓ New');
+assert.deepStrictEqual(visibleIds(), ['w_fresh_wait', 'w_old_needs', 'w_urgent', 'w_zero_ts']);
+
+els['wb-sort-dir'].dispatch('click');
+assert.strictEqual(els['wb-sort-dir'].getAttribute('data-dir'), 'asc');
+assert.strictEqual(els['wb-sort-dir'].textContent, '↑ Old');
+assert.deepStrictEqual(visibleIds(), ['w_urgent', 'w_old_needs', 'w_fresh_wait', 'w_zero_ts']);
+
+els['wb-sort-mode'].value = 'age';
+els['wb-sort-mode'].dispatch('change', { target: els['wb-sort-mode'] });
+assert.strictEqual(els['wb-sort-dir'].getAttribute('data-dir'), 'asc');
+assert.deepStrictEqual(visibleIds(), ['w_old_needs', 'w_urgent', 'w_fresh_wait', 'w_zero_ts']);
+assert(els['wb-cards-container'].innerHTML.includes('Opened Oct 20 at 12:00 ET'));
+assert.deepStrictEqual(JSON.parse(storage.get('wb_sort_v1')), { mode: 'age', dir: 'asc' });
+"""
+    res = subprocess.run(
+        ["node", "-e", node_sort_test], capture_output=True, text=True, check=False
+    )
+    self.assertEqual(
+        res.returncode,
+        0,
+        f"Node sort check failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+    )
+
 
 if __name__ == "__main__":
   unittest.main()

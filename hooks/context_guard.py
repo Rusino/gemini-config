@@ -655,6 +655,26 @@ def get_active_chats_by_project(
   return result
 
 
+# Canonical project ID for My Work (Workbench :8090), which has no gitFolder resource in its JSON
+MY_WORK_PROJECT_ID = "61f270de-563d-45a4-b9eb-1c0bccf80cc9"
+
+
+def _is_my_work_project(pid: str, name: str) -> bool:
+  """Returns True when pid or display name identifies the My Work (Workbench) project."""
+  if pid == MY_WORK_PROJECT_ID:
+    return True
+  # Strip live activity badges ("My Work · ⟳ 1") when matching by display name
+  base = re.sub(r"\s*·.*$", "", str(name or "")).strip().lower()
+  return base == "my work"
+
+
+def _format_radar_project_label(pid: str, name: str) -> str:
+  """Formats a project label for SCOPE GUARD, annotating My Work with its Workbench path/port."""
+  if _is_my_work_project(pid, name):
+    return f"`{name}` (Workbench: `~/.gemini/config/workbench/` — :8090)"
+  return f"`{name}`"
+
+
 def collect_project_directory(
     hint_path: str = "",
     include_active_chats: bool = False,
@@ -665,6 +685,7 @@ def collect_project_directory(
 
   pdir = projects_root()
   r_root = roadmap.roadmaps_root()
+  config_root = os.path.abspath(os.path.expanduser("~/.gemini/config")).rstrip("/")
   active_by_proj = (
       get_active_chats_by_project(hint_path, exclude_conv_id=exclude_conv_id)
       if include_active_chats
@@ -685,6 +706,9 @@ def collect_project_directory(
         continue
       name = str(pdata.get("name") or pid).strip()
       roots: set[str] = set()
+      # Bind My Work to ~/.gemini/config (non-exclusive via config_root filter below)
+      if _is_my_work_project(pid, name):
+        roots.add(config_root)
       resources = pdata.get("projectResources", {}).get("resources", [])
       for r in resources:
         for uri in (
@@ -743,8 +767,7 @@ def collect_project_directory(
           "active_chat": active_by_proj.get(pid),
       }
 
-  # ~/.gemini/config is shared across Improving Experience, Flight Deck, and other projects
-  config_root = os.path.abspath(os.path.expanduser("~/.gemini/config")).rstrip("/")
+  # ~/.gemini/config is shared across My Work, Improving Experience, Flight Deck, and others
   exclusive_roots = {
       rt: owners[0]
       for rt, owners in root_owners.items()
@@ -1092,6 +1115,7 @@ def build_scope_radar_notice(
     cur_pid = infer_project_id_from_workspaces(workspace_paths)
   cur_proj = projects.get(cur_pid) if cur_pid else None
   cur_proj_name = cur_proj["name"] if cur_proj else (cur_pid or "outside-of-project")
+  cur_proj_label = _format_radar_project_label(cur_pid, cur_proj_name)
   cur_roots = (
       ", ".join(f"`{r}`" for r in cur_proj["roots"])
       if cur_proj and cur_proj["roots"]
@@ -1126,7 +1150,7 @@ def build_scope_radar_notice(
       ac = pinfo.get("active_chat")
       if not roots_str and not ac:
         continue
-      parts = [f"- `{pinfo['name']}`"]
+      parts = [f"- {_format_radar_project_label(pid, pinfo['name'])}"]
       if roots_str:
         parts.append(f"workspace {roots_str}")
       if ac:
@@ -1139,7 +1163,7 @@ def build_scope_radar_notice(
 
   blocks = [
       "[SCOPE GUARD: WRONG-CHAT / WRONG-PROJECT RADAR]",
-      f"Current chat: `{cur_title or conv_id}` | Project: `{cur_proj_name}` | "
+      f"Current chat: `{cur_title or conv_id}` | Project: {cur_proj_label} | "
       f"Workspace(s): {cur_roots}",
   ]
   # Same-project sibling chats only coordinate shared resources and never redirect the user

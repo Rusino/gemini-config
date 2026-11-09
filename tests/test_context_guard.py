@@ -1120,6 +1120,69 @@ class TestContextGuard(unittest.TestCase):
     self.assertIsInstance(json.loads(proc_bad.stdout), dict)
     self.assertEqual(self.last_log()["max"], 256000)
 
+  # Verify My Work binds ~/.gemini/config non-exclusively and labels Workbench in SCOPE GUARD
+  # so Workbench chats never redirect to Flight Deck while sibling config projects stay unblocked
+  def test_my_work_project_binds_config_non_exclusively_and_annotates_workbench(self):
+    pdir = os.path.join(self.tmp.name, "projects")
+    os.makedirs(pdir, exist_ok=True)
+    my_work_id = "61f270de-563d-45a4-b9eb-1c0bccf80cc9"
+    fd_id = "5a2a0f80-96c2-4334-a58d-7631310d4f72"
+    with open(os.path.join(pdir, f"{my_work_id}.json"), "w", encoding="utf-8") as f:
+      json.dump({"id": my_work_id, "name": "My Work · ⟳ 1", "projectResources": {}}, f)
+    with open(os.path.join(pdir, f"{fd_id}.json"), "w", encoding="utf-8") as f:
+      json.dump({"id": fd_id, "name": "Flight Deck", "projectResources": {}}, f)
+
+    cfg_root = os.path.abspath(os.path.expanduser("~/.gemini/config")).rstrip("/")
+    directory = context_guard.collect_project_directory(self.transcript)
+    self.assertIn(cfg_root, directory["projects"][my_work_id]["roots"])
+    self.assertNotIn(cfg_root, directory["exclusive_roots"])
+
+    with (
+        patch.object(
+            context_guard,
+            "get_conversation_db_info",
+            return_value=("[10:46] ⦿ Workbench card sorting", my_work_id),
+        ),
+        patch.object(
+            context_guard,
+            "get_active_chats_by_project",
+            return_value={
+                my_work_id: ("94571525", "[10:46] ⦿ Workbench card sorting"),
+                fd_id: ("fd001122", "[09:15] ⦿ Flight Deck roll status"),
+            },
+        ),
+        patch.object(context_guard, "summary_db_paths", return_value=[]),
+    ):
+      radar_my_work = context_guard.build_scope_radar_notice(
+          "c1", self.transcript, [], "Неплохо было бы уметь сортировать карточки по времени"
+      )
+      expected_annot = "(Workbench: `~/.gemini/config/workbench/` — :8090)"
+      self.assertIn(cfg_root, radar_my_work)
+      self.assertNotIn("Workspace(s): none", radar_my_work)
+      self.assertIn(expected_annot, radar_my_work)
+
+    with (
+        patch.object(
+            context_guard,
+            "get_conversation_db_info",
+            return_value=("[09:15] ⦿ Flight Deck roll status", fd_id),
+        ),
+        patch.object(
+            context_guard,
+            "get_active_chats_by_project",
+            return_value={
+                my_work_id: ("94571525", "[10:46] ⦿ Workbench card sorting"),
+                fd_id: ("fd001122", "[09:15] ⦿ Flight Deck roll status"),
+            },
+        ),
+        patch.object(context_guard, "summary_db_paths", return_value=[]),
+    ):
+      radar_fd = context_guard.build_scope_radar_notice(
+          "c2", self.transcript, [], "Посмотри карточки в Workbench"
+      )
+      self.assertIn("My Work", radar_fd)
+      self.assertIn(expected_annot, radar_fd)
+
 
 if __name__ == "__main__":
   unittest.main()
