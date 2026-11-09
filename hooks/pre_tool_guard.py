@@ -2660,7 +2660,49 @@ def run_command_wait_denial(tool_args: dict) -> str:
           "you without manual polling (pass `IsDaemon=true` only for indefinite servers, "
           "or `WaitMsBeforeAsync=10000` for synchronous commands)."
       )
+    return ""
+  if not is_daemon:
+    return _detached_job_denial(str(tool_args.get("CommandLine") or ""))
   return ""
+
+
+_HEREDOC_BODY_RE = re.compile(
+    r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n[ \t]*\2[ \t]*(?=\n|$)", re.DOTALL
+)
+_QUOTED_RE = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"")
+# Only in command position (line start, after an operator or an opening quote), so prose such
+# as a commit message that mentions nohup does not trigger it
+_DETACH_CMD_RE = re.compile(
+    r"(?:^|[;&|(\n'\"])[ \t]*(?:sudo[ \t]+)?(nohup|setsid|disown)(?![\w-])", re.MULTILINE
+)
+# A lone `&` is the background operator; `&&`, `|&`, `2>&1`, `&>` and `<&` are not
+_BG_AMP_RE = re.compile(r"(?<![&|><])&(?![&>])")
+_WAIT_RE = re.compile(r"(?<![\w-])wait(?![\w-])")
+
+
+def _detached_job_denial(cmd: str) -> str:
+  """Blocks a synchronous run_command that starts a job meant to outlive the call.
+
+  `nohup`, `setsid` and `disown` (even inside an ssh quote) always detach; a lone `&` outside
+  heredoc bodies and quotes detaches unless the command joins its jobs with `wait`. Such jobs
+  finish with no task notification, so the agent ends up polling them by hand. Returns the
+  denial text or ''.
+  """
+  if not cmd:
+    return ""
+  no_heredoc = _HEREDOC_BODY_RE.sub("\n", cmd)
+  match = _DETACH_CMD_RE.search(no_heredoc)
+  bare = _QUOTED_RE.sub("''", no_heredoc)
+  if not match and not (_BG_AMP_RE.search(bare) and not _WAIT_RE.search(bare)):
+    return ""
+  what = f"`{match.group(1)}`" if match else "a trailing `&` background job"
+  return (
+      f"[DETACHED-JOB GUARD] This synchronous `run_command` (`WaitMsBeforeAsync>=10000`) "
+      f"starts {what} that outlives the call, so no task notification ever arrives and the "
+      "job has to be polled by hand. Run the long job itself in the foreground with "
+      "`WaitMsBeforeAsync=500` + `NotificationTimeoutSeconds` (or `IsDaemon=true` for a "
+      "server), or join parallel `&` jobs with `wait`."
+  )
 
 
 def _polling_call_label(

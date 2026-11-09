@@ -81,6 +81,46 @@ class TestR133TelemetryGuards(unittest.TestCase):
       })
       self.assertEqual(res_ok.get("decision"), "allow", f"Unexpected deny: {res_ok}")
 
+  # Detached jobs inside a synchronous run_command outlive the call with no wakeup; redirections,
+  # `&&`, quoted or heredoc `&`, and `&` jobs joined by `wait` stay synchronous and must pass
+  def test_sync_run_command_blocks_detached_jobs(self) -> None:
+    def decide(cmd: str, **extra) -> dict:
+      args = {"CommandLine": cmd, "WaitMsBeforeAsync": 10000, **extra}
+      return self._run_pre_tool({
+          "conversationId": "c-detach",
+          "toolCall": {"name": "run_command", "args": args},
+      })
+
+    for bad in (
+        "nohup ./run_queue.sh > q.log 2>&1 &",
+        "ssh host 'cd x && nohup ./r.sh >/dev/null 2>&1 &'",
+        "./runner.sh & disown",
+        "setsid ./runner.sh >/dev/null 2>&1 < /dev/null",
+        "./build.sh > b.log 2>&1 &\necho started",
+        "sleep 100 & echo $!",
+    ):
+      res = decide(bad)
+      self.assertEqual(res.get("decision"), "deny", f"Expected deny for {bad!r}")
+      self.assertIn("[DETACHED-JOB GUARD]", res.get("reason", ""))
+
+    for good in (
+        "make && make test 2>&1 | tail -5",
+        "cmd >/dev/null 2>&1; echo $?",
+        "curl -s 'https://x.test/?a=1&b=2'",
+        'echo "a & b"',
+        "python3 - <<'EOF'\nx = 1 & 3\nEOF",
+        "a.sh & b.sh & wait",
+        "cmd |& tee log",
+        "echo nohup-free &>/dev/null",
+        "git commit -m 'deny nohup, setsid or a lone & job'",
+    ):
+      res = decide(good)
+      self.assertEqual(res.get("decision"), "allow", f"Unexpected deny for {good!r}: {res}")
+
+    # The 500 ms + notification path is the sanctioned way to start long jobs
+    res_bg = decide("nohup ./run_queue.sh &", WaitMsBeforeAsync=500, NotificationTimeoutSeconds=600)
+    self.assertEqual(res_bg.get("decision"), "allow")
+
   # Verifies at most 1 status/polling check is allowed per window until a reactive wakeup arrives
   def test_manual_polling_loop_guard_across_manage_task_subagents_and_schedule(self) -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:

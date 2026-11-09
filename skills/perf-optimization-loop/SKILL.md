@@ -128,3 +128,18 @@ positive tag `REMOVES_WORK`. Then review by hand:
 To compare e.g. a week-old revision with HEAD, collect samples for both revisions with the
 same harness, then run `bench_compare.py` and, optionally, `opt_branch_audit.py <old> <new>`
 for a per-commit view of the range.
+
+## Bisects and Screening Across Many Commits (LTO policy)
+
+Build on the Cloudtop and measure on the dedicated workstation with the "Cloudtop Build +
+Remote Measure Workflow" of
+[`flutter-engine-perf-compare`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/flutter-engine-perf-compare/SKILL.md)
+(`remote_build_push.sh`, `make_plan.py`, `perf_remote.py enqueue`, `eval_rounds.py`).
+
+- Screen and bisect with `--mode nolto` (or `thinlto`) builds first: relinking
+  `txt_benchmarks` took 3.8 s (no LTO) and 5.2 s (ThinLTO) against 63 s (Full LTO) on the
+  Cloudtop, and they show code costs that Full LTO inlining can hide.
+- Confirm the final culprit in both `nolto` and `lto` (Full LTO, the mode Flutter ships):
+  the sign of a step can flip between modes, so a no-LTO result alone is not a verdict.
+- Staged points are named `<sha10>_<mode>` and shared by all agents and subagents: run
+  `perf_remote.py has <point>` before building, and reuse a point that has `.complete`.
