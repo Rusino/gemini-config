@@ -405,3 +405,40 @@
   - Плагин `trooper` поставляется с предкомпилированным Linux-бинарником и падает на Darwin.
 - **Вердикт полезности**: `⚪ Не нужно (YAGNI) / справочно`.
   - Наша основная среда разработки — полноценный Linux Cloudtop, где все MCP-серверы и плагины запускаются нативно без удаленных SSH-туннелей и несовместимости бинарников.
+
+
+---
+
+## 2026-11-09
+
+### Sad RU Googlers (HISTORY OFF) (`spaces/AAAAn_HZbYs`)
+
+#### 1. Официальный курс EngEdu по AI-грамотности «Judgement is the job» (go/judgementisthejob)
+- **Авторы**: Maria Shulgina (`mshulgina@google.com`, 13:45 ET / 18:45 UTC, тред `spaces/AAAAn_HZbYs/threads/Yis4w4e4VTs`), Kirill Cherkashin (`kirjs@google.com`, 16:58 ET / 21:58 UTC), Slava Guzanov (`vguzanov@google.com`).
+- **Ссылки и ресурсы**: Документация и курс [go/judgementisthejob](http://go/judgementisthejob), [`/google/src/files/head/depot/company/engedu/ai/ai_fluency/judgement/index.md`](file:///google/src/files/head/depot/company/engedu/ai/ai_fluency/judgement/index.md), обучающий тьютор-скилл [`/google/src/files/head/depot/google3/engedu/_agents/skills/twai_learning_tutor/SKILL.md`](file:///google/src/files/head/depot/google3/engedu/_agents/skills/twai_learning_tutor/SKILL.md), материалы Dave Rensin [go/design-is-the-new-code](http://go/design-is-the-new-code).
+- **Суть находок и концепций**:
+  1. *Elephant-Goldfish Model (EGM)*: разделение контекста на долгоживущий каркас с инвариантами и журналом решений (*The Elephant*) и изолированные сессии с чистым контекстом (*The Goldfish*) для устранения эффекта подтверждения (confirmation bias) и независимой верификации.
+  2. *Четыре признака AI-слопа (Four Marks of AI Slop)*: раздутый объем (8 страниц вместо 2 страниц сути), корпоративный жаргон и псевдоакадемические штампы, декоративные эмодзи и кричащие заголовки, внутренние логические противоречия между разделами.
+  3. *3-ступенчатый диагностический тест на слоп (3-Step Diagnostic Test)*: (1) пересказ сути простым английским без компрессии; (2) вскрытие «воды» и повторов; (3) поиск внутренних логических противоречий со ссылками на разделы.
+  4. *Anti-Sycophancy & Direct Steering*: активное подавление поддакивания и склонности авторегрессионных LLM соглашаться с пользователем через прямое директивное управление.
+  5. *Интерактивный AI-тьютор*: скилл `twai_learning_tutor` в Gemini и Jetski Hub для интерактивного прохождения программы.
+- **Вердикт полезности**: `🟡 Уже внедрено у нас (базовые инварианты)` + `⚪ Не нужно (YAGNI) (скилл тьютора)`.
+- **Где это реализовано у нас**:
+  1. Модель *Goldfish* (чистый контекст) у нас уже фундаментально работает в `skills/amnesia-doc-check/SKILL.md` (Stage A Hunter + Stage B Skeptic) и `skills/amnesia-precommit/SKILL.md` через изолированных субагентов `keeper_skeptic`, которым передается только сырой текст без истории обсуждения.
+  2. Защита от *AI Slop* и поиск внутренних противоречий заложены в инвариант №3 `amnesia-doc-check` (*Internal Self-Consistency First*) и правила `rules/code_style.md` (запрет списков причастий, запрет корпоративного булшита вроде `utilize`, `facilitate`, `comprehensive`).
+  3. *Anti-Sycophancy* жестко закреплен в `rules/communication_style.md` (раздел *Pushback*: никакой лести, фальсификация гипотез пользователя, запрет капитуляции без кода/тестов).
+  4. Обучающий скилл `twai_learning_tutor` предназначен для людей-студентов EngEdu; боевому автономному агенту разработки он не нужен.
+
+---
+
+### Chrome AI Discuss (`spaces/AAQA45T8nC8`)
+
+#### 1. Галлюцинации и порча имён MCP-инструментов в Jetski Hub и версионирование `~/.gemini/config` в git
+- **Авторы**: Greg Thompson (`grt@google.com`, 02:32–04:31 ET / 07:32–09:31 UTC, треды `spaces/AAQA45T8nC8/threads/RD0puncNd_I`, `spaces/AAQA45T8nC8/threads/pAWxxkqNgTM`, `spaces/AAQA45T8nC8/threads/gnZrEyHtBSU`), Ming-Ying Chung (`mych@google.com`, 03:08 ET / 08:08 UTC).
+- **Суть проблемы и обсуждения**:
+  - Greg Thompson столкнулся с деградацией вызовов MCP-серверов в Jetski Hub после выходных: модель «забыла» выданные разрешения, запрашивает доступ к вымышленным или искаженным именам инструментов (например, `pndMcp/ank_not_used_wait_wrong_tool_name`) и приклеивает случайный мусор к концу легитимных команд.
+  - Ming-Ying Chung порекомендовал версионировать `~/.gemini/config` в локальном git-репозитории и настроить правила для агента по автоматическому контролю целостности конфигурации.
+- **Вердикт полезности**: `🟡 Уже внедрено у нас`.
+- **Где это реализовано у нас**:
+  1. Каталог `~/.gemini/config` у нас с самого начала является полноценным локальным git-репозиторием с хуками жизненного цикла (`chat_lifecycle.py`), пре-тул гардами (`pre_tool_guard.py`), проверкой целостности и автоматическим коммитом через `auto_ship.py`.
+  2. Для защиты от галлюцинаций MCP-инструментов у нас в `rules/subagent_exploration.md` зафиксированы канонические имена MCP-серверов (`google_chat_google_chat`, `google_docs_google_docs`, `google_drive_google_drive`), а схема каждого инструмента считывается из `~/.gemini/jetski/mcp/<server>/<tool>.json` перед вызовом.
