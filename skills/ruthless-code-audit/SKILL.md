@@ -61,17 +61,21 @@ python3 ~/.gemini/config/skills/ruthless-code-audit/scripts/ruthless_audit.py \
 Do not stop at the script output. Inspect the flagged hotspots and read the core domain files to evaluate architecture, correctness, and code taste.
 
 ### Orchestration in Jetski / Antigravity
-- **Persistent Finding Ledger (`finding_ledger.py`)**: Stage 1 (`ruthless_audit.py`) automatically queries `~/.gemini/config/scripts/finding_ledger.py` and outputs any prior refuted findings for the target repo/diff/files. Always include those entries in the prompt of every Stage 2 Hunter subagent so they do not waste tokens re-raising already-refuted issues.
+- **Stage 0 Parallel Diff Context Bundle (`stage_diff_context.py`)**: When auditing a diff, branch, CL, or PR, run `python3 ~/.gemini/config/scripts/stage_diff_context.py --repo <repo_root> --diff <ref> --out-dir <appDataDir>/brain/<conversation-id>/scratch/stage0` (or `--target <CL_or_PR>`) before spawning Stage 2 shards so every shard reads `<stage0_dir>/context.md`, `<stage0_dir>/diff.patch`, `<stage0_dir>/files_bundle.md`, and assigned `<stage0_dir>/files/*.txt` in a single parallel Turn 1 `read_file` batch instead of re-running `git diff` or `finding_ledger.py`. For `<= 3`-turn external caller/header lookups, delegate to `scout` (`Model="flash"`).
+- **Persistent Finding Ledger (`finding_ledger.py`)**: Stage 1 (`ruthless_audit.py`) and Stage 0 (`stage_diff_context.py`) automatically query `~/.gemini/config/scripts/finding_ledger.py` and output any prior refuted findings for the target repo/diff/files. Always include those entries in the prompt of every Stage 2 Hunter subagent so they do not waste tokens re-raising already-refuted issues.
 - **For diffs `> 5` files, cross-layer changes, or large repositories (`> 3,000` lines)**: shard
   Stage 2 into parallel read-only Hunter subagents (`invoke_subagent` with `TypeName="self"` or
   `TypeName="keeper_inquisitor"`), assigning each shard `<= 5` files or a focused rule lens (e.g.,
   Shard 1: *Scope, Duplication & Dropped Guards (`git log -S`)*; Shard 2: *Callers, Concurrency &
   Domain Invariants*; Shard 3: *Tests & Mutation Harness*) and feeding all candidate findings into
   **one** batched Stage 2.5 `keeper_skeptic`.
-- **Mandatory Checked-Site Enumeration Before `None`**: Every Stage 2 Hunter shard must list 3–5
-  concrete sites, callers, or guards it inspected (`Checked Sites: <file:line> (<caller/guard/
-  invariant verified>) — OK`) before reporting `None` for any audit category, preventing
-  superficial skimming of large files.
+- **Mandatory Checked-Site Enumeration & `COMPACTION: YES/NO` Footer**: Every Stage 2 Hunter shard
+  must list 3–5 concrete sites, callers, or guards it inspected (`Checked Sites: <file:line>
+  (<caller/guard/invariant verified>) — OK`) before reporting `None` for any audit category, and
+  must end its report with a standalone final line `COMPACTION: YES` or `COMPACTION: NO`
+  (indicating whether `<CONTEXT_SUMMARY>` appeared in its context). If **any** Stage 2 shard or
+  Stage 2.5 `keeper_skeptic` batch reports `COMPACTION: YES`, discard that compacted report,
+  re-shard its scope into smaller slices (`<= 2–3` files or `<= 5` candidates), and re-run.
 - **Separate `BLOCKING` Defects from `OPTIONAL_GOLFING` (`nit:`)**: Tag every candidate as either
   `BLOCKING` (`HIGH`/`CRITICAL` bugs, broken invariants, or dead/duplicate code in Matrix 2.1
   `DELETE`) or `OPTIONAL_GOLFING` (`nit:` stylistic micro-compaction). `OPTIONAL_GOLFING` items
@@ -110,7 +114,7 @@ invoke_subagent(
     Workspace="inherit",
     Prompt="""
 You are the Verification Skeptic (`keeper_skeptic`) auditing candidate findings in `<repo_root>`.
-Refute each candidate below using real code, callers (`git grep`, `grep -rn`, `code_search`), templates, build files, comments, and unit tests per your Three Iron Verification Principles.
+Refute each candidate below using real code, callers (`git grep`, `grep -rn`, `code_search`), templates, build files, comments, and unit tests per your Three Iron Verification Principles. End your report with `COMPACTION: YES` or `COMPACTION: NO` depending on whether `<CONTEXT_SUMMARY>` appeared in your context.
 
 Candidates Under Test (Batch V001):
 <paste all candidate HIGH/CRITICAL bugs (B1, B2...) and all candidate DELETE / non-trivial SIMPLIFY items (D1, D2...)>

@@ -6,10 +6,10 @@ description: "Context hygiene: when to delegate to subagents, which model, and g
 # Context Hygiene and Delegation
 
 - Size the task: under 3 tool calls → do it yourself; 3–15 calls (exploring a subsystem, call
-  graph over more than 3–4 files, clean-context audit) → one subagent; over 15 calls or many
-  items → `run_workflow` or several subagents
-- Models: `Model="flash"` for mechanical lookups, test/build runners, log triage and routine
-  `keeper_skeptic` batches; `Model="inherit"` for semantic research, root-cause work and
+  graph over more than 3–4 files, clean-context audit) → one subagent (`scout` for `<= 3`-turn
+  `file:line` lookups); over 15 calls or many items → `run_workflow` or several subagents
+- Models: `Model="flash"` for mechanical lookups (`scout`), test/build runners, log triage and
+  routine `keeper_skeptic` batches; `Model="inherit"` for semantic research, root-cause work and
   `keeper_inquisitor`. Never `Model="pro"` (hook-enforced)
 - Give a subagent at most 150 KB or 10 files per turn; never dump whole `references/`, `g3doc/`
   or module trees into one subagent

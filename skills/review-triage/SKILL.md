@@ -117,9 +117,16 @@ Triage output alone is never the final word. Every `🔴 SURGICAL AUDIT / CORE D
      threads where the CL owner replied last) and report an explicit verdict (`valid`,
      `already addressed in PS<n>` with `file:line`, or `question for the user`).
    - **Commit message grounding**: Read the full commit message before drafting comments; never ask the author to document something already explained in the commit message.
-1. Fetch the current patchset into a separate worktree per [`companion-cl-review` Phase 1](file:///usr/local/google/home/jlavrova/.gemini/config/skills/companion-cl-review/SKILL.md). To inspect baseline versions of modified files without switching branches, use `git cat-file -p <base_sha>:<path>`.
-2. Run Stage 1 (`ruthless_audit.py ... --diff <parent>`) and Stage 2 (semantic review of the pinpointed hunks against the full file, passing prior refuted findings from `finding_ledger.py`). For Skia C++ / text / font diffs, include `veteran-review` **lens mode** (`~/.gemini/config/skills/veteran-review/SKILL.md`, Steps 1–3) in the same Stage 2.5 packet.
-3. **Run Stage 2.5 (`keeper_skeptic` Batched Refutation Pass)**:
+1. **Stage 0 Parallel Context Bundle & Worktree Checkout**: Fetch the current patchset into a separate worktree per [`companion-cl-review` Phase 1](../companion-cl-review/SKILL.md) (to inspect baseline versions of modified files without switching branches, use `git cat-file -p <base_sha>:<path>`), and pre-stage the CL/PR commit message, open threads, `finding_ledger.py` refutations, `<stage0_dir>/diff.patch`, and 1-indexed `Side B` post-patch files + companion `.h` headers in one command:
+   ```bash
+   python3 ~/.gemini/config/scripts/stage_diff_context.py \
+     --target <CL_or_PR> --repo <worktree_or_repo> \
+     --out-dir <appDataDir>/brain/<conversation-id>/scratch/stage0
+   ```
+   Instruct every Stage 2 auditor shard to read `<scratch>/stage0/{context.md,diff.patch,files_bundle.md}` (and any scoped `files/*.txt`) in **one parallel `read_file` batch on Turn 1** instead of re-fetching Gerrit/PR metadata, and use `scout` (`Model="flash"`) for `<= 3`-turn untouched external caller lookups.
+2. Run Stage 1 (`ruthless_audit.py ... --diff <parent>`) and Stage 2 (semantic review of the pinpointed hunks against the full file using `recommended_topology` / `recommended_shards` from `stage_diff_context.py`, passing prior refuted findings from `finding_ledger.py`). For Skia C++ / text / font diffs, include `veteran-review` **lens mode** (`~/.gemini/config/skills/veteran-review/SKILL.md`, Steps 1–3) in the same Stage 2.5 packet.
+3. **Run Stage 2.5 (`keeper_skeptic` Batched Refutation Pass) & Compaction Audit (`COMPACTION: YES/NO`)**:
+   - Require every Stage 2 auditor shard and Stage 2.5 `keeper_skeptic` report to end with `COMPACTION: YES` or `COMPACTION: NO` (whether `<CONTEXT_SUMMARY>` appeared in the subagent's context). If **any** slice reports `COMPACTION: YES`, discard that slice, re-shard its files (`<= 2–3` files per shard) or candidate batch (`<= 5` candidates), and re-run before presenting drafts.
    - Whenever Stage 2 raises any `HIGH` / `CRITICAL` candidate defect or architectural pushback, spawn **one batched `keeper_skeptic` subagent** following [`plugins/keeper/agents/keeper_skeptic.md`](file:///usr/local/google/home/jlavrova/.gemini/config/plugins/keeper/agents/keeper_skeptic.md) (`XFAMILY_REFUTE` routing, Quota Fallback Ladder, and `finding_ledger.py add`).
    - **`REFUTED`**: Drop **completely** (never rephrase as a "polite question" or doc nit) and persist via `finding_ledger.py add`. If all candidates are `REFUTED`, the draft is a clean `LGTM`.
    - **`CONFIRMED`**: Proceed to **Default Companion WIP CL Execution (`companion-cl-review`)** below.

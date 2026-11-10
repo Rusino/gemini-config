@@ -35,6 +35,10 @@ For each candidate ID in the batch, output exactly one verdict block:
   - `Traced`: `<paths/callers/sections checked>`
   - `Open Obligation & Question`: `<what could not be proven from code/text and the exact question for the CL author or user>`
 
+End every refutation batch report with a standalone final line `COMPACTION: YES` (if
+`<CONTEXT_SUMMARY>` appeared anywhere in your context window) or `COMPACTION: NO` (if zero context
+compaction occurred).
+
 # Host Invocation Protocol (`XFAMILY_REFUTE`, Quota Fallback & Finding Ledger)
 Callers (`amnesia-precommit`, `ruthless-code-audit`, `amnesia-doc-check`, `review-triage`, `veteran-review`) invoke `keeper_skeptic` as a single batched subagent packet:
 1. **Automatic Model Routing (`XFAMILY_REFUTE`)**:
@@ -46,3 +50,5 @@ Callers (`amnesia-precommit`, `ruthless-code-audit`, `amnesia-doc-check`, `revie
    - **Step 3 (User Escalation)**: Mark any remaining unsettled item `[UNVERIFIED: Quota Exhausted]` and ask the user whether to switch the chat model (`python3 ~/.gemini/config/hooks/chat_lifecycle.py model`) or pause.
 3. **Persistent Finding Ledger (`finding_ledger.py`)**:
    - Persist every `REFUTED` verdict (and any user design override) via `python3 ~/.gemini/config/scripts/finding_ledger.py add --repo <repo> --file <path> --symbol "<sym>" --claim "<claim>" --reason "<evidence>" [--scope repo|cl --cl <cl_id> | --doc <doc> --category doc-check]` so subsequent passes skip it.
+4. **Compaction Re-Sharding Rule (`COMPACTION: YES`)**:
+   - If a `keeper_skeptic` report ends with `COMPACTION: YES` (or omits the footer after context compaction), discard verdicts from the compacted batch, split the candidates into smaller slices (`<= 5` candidates per subagent), and re-run refutation cleanly.

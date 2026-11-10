@@ -2591,6 +2591,8 @@ _FLASH_ONLY_SUBAGENT_TYPES = frozenset({
     "research-google",
     "jetski-guide",
     "keeper_skeptic",
+    # 3-turn file:line lookup agent must stay on Flash instead of inheriting Opus
+    "scout",
 })
 _POLLING_PROMPT_RE = re.compile(
     r"\b(?:poll\w*|check\w*|status|progress|wait\w*|complet\w*|finish\w*"
@@ -3011,13 +3013,15 @@ def exploration_circuit_breaker_denial(
       read_calls >= MAX_TURN_SOURCE_READ_CALLS
       and len(distinct_files) >= MAX_TURN_SOURCE_READ_FILES
   ):
+    # Point main-chat read sprees to ultra-lean 3-turn scout before heavier subagents
     return (
         f"[EXPLORATION CIRCUIT BREAKER] You have already made {read_calls} file-read "
         f"calls across {len(distinct_files)} source files in this turn without delegating "
         "to a subagent or editing code. Reading dozens of file chunks in the main chat "
         "bloats the context window and causes generation collapse. Either answer the "
         "user now with the facts already gathered, or delegate any further multi-file "
-        "exploration to `invoke_subagent` (`TypeName=\"research\"` or `\"self\"`)."
+        'exploration to `invoke_subagent` (`TypeName="scout"`, `"research-google"`, '
+        'or `"self"`).'
     )
   return ""
 

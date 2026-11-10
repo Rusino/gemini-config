@@ -361,7 +361,7 @@ class TestR133TelemetryGuards(unittest.TestCase):
 
   # Verifies mechanical/lookup/skeptic subagents require explicit Model='flash'
   def test_subagent_model_inheritance_hygiene(self) -> None:
-    for sub_type in ("research-google", "jetski-guide", "keeper_skeptic"):
+    for sub_type in ("research-google", "jetski-guide", "keeper_skeptic", "scout"):
       for bad_args in (
           {"TypeName": sub_type, "Role": "Codebase Researcher", "Prompt": "Find X"},
           {

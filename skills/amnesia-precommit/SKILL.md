@@ -42,17 +42,25 @@ Execute a strict pre-commit audit and diff minimization workflow before uploadin
    - Strip leftover debug prints, anonymous `TODO`s without `KEEPER-DEBT`, and uncalled helpers.
    - Format modified lines only: `git clang-format` (or `dart format` for Dart files).
 
+4. **Stage 0 Parallel Context Bundle**: After mechanical fixes settle, pre-stage the commit message, `finding_ledger.py` refutations, optional `transcript.jsonl` user constraints, unified `diff.patch`, and 1-indexed post-patch `Side B` files + companion `.h` headers in one pass so Stage A Hunter shards read them in a single parallel Turn 1 `read_file` batch:
+   ```bash
+   python3 ~/.gemini/config/scripts/stage_diff_context.py \
+     --repo . --diff HEAD \
+     --transcript <appDataDir>/brain/<conversation-id>/.system_generated/logs/transcript.jsonl \
+     --out-dir <appDataDir>/brain/<conversation-id>/scratch/stage0
+   ```
+
 ---
 
 ### Phase 2: The Amnesiac Shrinker & Inquisitor (Stage A Hunter Subagent(s))
 
-Read [`references/hunter_prompt.md`](references/hunter_prompt.md) and spawn the Stage A `keeper_inquisitor` Hunter subagent(s) (`1` subagent for `<= 5` files in a single layer; `2–3` parallel shards for `> 5` files or cross-layer diffs, split `<= 5` files per shard or *Shard 1: Scope, Diff Golfing & Dropped Guards (`git log -S`)* vs *Shard 2: Pattern Completeness, Callers & Domain Invariants*) with the exact prompt, 6 evaluation axes (including `veteran-review` lens mode for Skia C++/text/font diffs and the WebParagraph M1–M9 gate for `lib/web_ui/`), strict `S*` / `B*` / Grill output sections, and mandatory `Checked Sites` enumeration before `None`.
+Read [`references/hunter_prompt.md`](references/hunter_prompt.md) and spawn the Stage A `keeper_inquisitor` Hunter subagent(s) (`1` subagent for `<= 5` files in a single layer; `2–3` parallel shards for `> 5` files or cross-layer diffs per `recommended_topology` / `recommended_shards` from `stage_diff_context.py`, split `<= 5` files per shard or *Shard 1: Scope, Diff Golfing & Dropped Guards (`git log -S`)* vs *Shard 2: Pattern Completeness, Callers & Domain Invariants*) with the exact prompt, 6 evaluation axes (including `veteran-review` lens mode for Skia C++/text/font diffs and the WebParagraph M1–M9 gate for `lib/web_ui/`), strict `S*` / `B*` / Grill output sections, mandatory `Checked Sites` enumeration before `None`, and mandatory `COMPACTION: YES` / `COMPACTION: NO` final footer. Use `scout` (`Model="flash"`) for `<= 3`-turn external `file:line` caller lookups. If **any** Stage A shard reports `COMPACTION: YES` (meaning `<CONTEXT_SUMMARY>` appeared in its context), discard that shard's output, re-shard its assigned files into smaller slices (`<= 2–3` files per shard), and re-run before Phase 2.5.
 
 ---
 
 ### Phase 2.5: The Skeptic Refutation Pass (`keeper_skeptic`, `Hunt then Refute` + `XFAMILY_REFUTE`)
 
-Whenever Phase 2 (across all Hunter shards) produces any candidate defects in **Section 2 (`B1, B2...`)** OR any `BLOCKING_SCOPE` / non-trivial code removal in **Section 1 (`S1, S2...`)** (skip if Phase 2 returned `None` or only `OPTIONAL_GOLFING` `nit:` / trivial comment cleanup), spawn **one batched `keeper_skeptic` subagent** using the Phase 2.5 prompt in [`references/hunter_prompt.md`](references/hunter_prompt.md) and following the `XFAMILY_REFUTE` routing (`Model="flash"` default, `Model="inherit"` for concurrency/BiDi/metrics/dropped guards/cross-backend), Quota Exhaustion Fallback Ladder (`inherit` → `flash` → Phase 3 Trapsmith TDD → user escalation), and Three Iron Verification Principles in `plugins/keeper/agents/keeper_skeptic.md`.
+Whenever Phase 2 (across all Hunter shards) produces any candidate defects in **Section 2 (`B1, B2...`)** OR any `BLOCKING_SCOPE` / non-trivial code removal in **Section 1 (`S1, S2...`)** (skip if Phase 2 returned `None` or only `OPTIONAL_GOLFING` `nit:` / trivial comment cleanup), spawn **one batched `keeper_skeptic` subagent** using the Phase 2.5 prompt in [`references/hunter_prompt.md`](references/hunter_prompt.md) and following the `XFAMILY_REFUTE` routing (`Model="flash"` default, `Model="inherit"` for concurrency/BiDi/metrics/dropped guards/cross-backend), Quota Exhaustion Fallback Ladder (`inherit` → `flash` → Phase 3 Trapsmith TDD → user escalation), Three Iron Verification Principles, and mandatory `COMPACTION: YES` / `COMPACTION: NO` footer in `plugins/keeper/agents/keeper_skeptic.md` (re-sharding into `<= 5`-candidate batches if `COMPACTION: YES` is reported).
 
 ---
 
