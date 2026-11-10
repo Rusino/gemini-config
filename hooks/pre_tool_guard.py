@@ -1805,6 +1805,8 @@ SKORETEXT_SCOPE_PREFIXES = (
     "modules/skunicode/",
     "modules/skshaper/",
     "experimental/skoretext/",
+    # [1/6] registers the CoreText source lists in the Bazel -> GN exporter (user OK Nov 10 2026)
+    "bazel/exporter_tool/main.go",
 )
 UPSTREAM_REVERT_WINDOW = 100
 # Revert/reland commits undo upstream on purpose; project prefixes like `[SkoreText] ` may
