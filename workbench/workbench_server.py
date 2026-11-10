@@ -167,6 +167,649 @@ def _render_safe_draft_preview(rd: dict[str, Any] | None) -> str:
   return collapsed
 
 
+_RE_STAGE_EMOJI = re.compile(r"^(?:[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200D]+\s*)+")
+_RE_CL_DIGITS = re.compile(r"\b(\d{5,10})\b")
+_RE_CL_TITLE_PREFIX = re.compile(
+    r"^(?:(?:gerrit:[^:\s]+:\d+|github_pr:[^:\s]+:\d+|piper:\d+)"
+    r"|(?:Gerrit|Skia)\s+\d+(?:\s+PS\d+)?"
+    r"|PR\s*#\d+(?:\s+PS\d+)?"
+    r"|\d{5,10})(?:\s*[:·-]\s*|\s*$)",
+    re.IGNORECASE,
+)
+_RE_CM_GH_ISSUE = re.compile(r"github\.com/([^/\s#]+/[^/\s#]+)/issues/(\d+)\b", re.IGNORECASE)
+_RE_CM_CRBUG = re.compile(
+    r"(?:crbug\.com/|issues\.chromium\.org/issues/)(\d+)\b",
+    re.IGNORECASE,
+)
+
+
+def _clean_stage_text(raw: Any) -> str:
+  """Strips leading Unicode emoji/pictographs per ' · ' segment while keeping words."""
+  txt = str(raw or "").strip()
+  parts = [_RE_STAGE_EMOJI.sub("", seg).strip() or seg.strip() for seg in txt.split(" · ")]
+  cleaned = " · ".join(p for p in parts if p)
+  return cleaned or txt
+
+
+def _clean_cl_subject(raw_title: str, ast: dict[str, Any], short_lbl: str) -> str:
+  """Strips redundant Gerrit/PR/key prefixes from a CL title, falling back to state.subject."""
+  raw = str(raw_title or "").strip()
+  cleaned = _RE_CL_TITLE_PREFIX.sub("", raw).strip()
+  if not cleaned or cleaned.lower() == short_lbl.lower():
+    return str(ast.get("subject") or "").strip()
+  return cleaned
+
+
+def _split_card_headline(w: dict[str, Any]) -> tuple[str, str]:
+  """Extracts headline and verified artifact counterparty without inventing one from ' — '."""
+  raw_title = str(w.get("title") or "").strip()
+  origin_key = str((w.get("origin") or {}).get("artifact_key") or "")
+  ranked: list[tuple[tuple[int, int, int], str]] = []
+  for a in w.get("artifacts") or []:
+    if not isinstance(a, dict) or a.get("role") == "context_only":
+      continue
+    cp = str((a.get("state") or {}).get("counterparty") or "").strip()
+    if not cp:
+      continue
+    akey = str(a.get("artifact_key") or "")
+    akind = str(a.get("kind") or "")
+    prio = (
+        0 if (origin_key and akey == origin_key) else 1,
+        1 if akind in ("github_pr", "github_issue") else 0,
+        0 if a.get("role") == "primary" else 1,
+    )
+    ranked.append((prio, cp))
+  ranked.sort(key=lambda item: item[0])
+  candidates: list[str] = []
+  seen_lower: set[str] = set()
+  for _, cp in ranked:
+    low = cp.lower()
+    if low not in seen_lower:
+      seen_lower.add(low)
+      candidates.append(cp)
+  if not candidates:
+    return raw_title, ""
+  best_cp = candidates[0]
+  if " — " in raw_title:
+    head, tail = raw_title.rsplit(" — ", 1)
+    if head.strip() and tail.strip():
+      tail_low = tail.strip().lower()
+      for cand in candidates:
+        if cand.lower() == tail_low:
+          return head.strip(), cand
+  return raw_title, best_cp
+
+
+def _short_issue_id(art: dict[str, Any]) -> str:
+  """Formats canonical issue keys into flutter#<N>, <owner>/<repo>#<N>, b/<N>, or crbug/<N>."""
+  akey = str(art.get("artifact_key") or "")
+  if akey.startswith(("github_issue:", "buganizer:")):
+    return work_store.format_short_bug_id(akey)
+  parts = akey.split(":")
+  if akey.startswith("crbug:") and len(parts) >= 2:
+    return f"crbug/{parts[-1]}"
+  title = str(art.get("title") or "")
+  return title.split(":", 1)[0].strip() or akey
+
+
+def _short_cl_label(akey: str, fallback_label: str) -> tuple[str, str]:
+  """Returns (compact_cl_label, patchset_tag) for folded and expanded peer spines."""
+  ps_match = re.search(r"\b(PS\d+)\b", fallback_label)
+  ps_tag = ps_match.group(1) if ps_match else ""
+  parts = akey.split(":")
+  if akey.startswith("gerrit:") and len(parts) >= 3:
+    proj = parts[1]
+    prefix = "Skia" if proj == "skia" else proj.capitalize()
+    return f"{prefix} {parts[2]}", ps_tag
+  if akey.startswith("github_pr:") and len(parts) >= 3:
+    return f"PR #{parts[2]}", ps_tag
+  if akey.startswith("piper:") and len(parts) >= 2:
+    p_lbl = "cl" + "/" + parts[1]
+    return p_lbl, ps_tag
+  clean_lbl = re.sub(r"\s+PS\d+\b", "", fallback_label).strip()
+  return (clean_lbl or akey), ps_tag
+
+
+def _cl_id_tokens(akey: str) -> set[str]:
+  """Extracts numeric change IDs from an artifact key for bug/companion cross-matching."""
+  return set(_RE_CL_DIGITS.findall(akey))
+
+
+def _extract_ssr_cl_bug_keys(ast: dict[str, Any]) -> set[str]:
+  """Collects canonical bug keys linked to a CL state including non-Flutter GH and crbug URLs."""
+  keys = set(work_store.extract_cl_bug_keys(ast))
+  cm = str(ast.get("commit_message") or "")
+  for m in _RE_CM_GH_ISSUE.finditer(cm):
+    keys.add(f"github_issue:{m.group(1)}:{m.group(2)}")
+  for m in _RE_CM_CRBUG.finditer(cm):
+    keys.add(f"crbug:{m.group(1)}")
+  return keys
+
+
+def _build_ssr_checklist_peers(
+    checklist: list[dict[str, Any]],
+    art_by_key: dict[str, dict[str, Any]],
+    covered: set[str],
+) -> list[dict[str, Any]]:
+  """Converts checklist entries into baseline peer rows and records covered artifact keys."""
+  peers: list[dict[str, Any]] = []
+  for idx, item in enumerate(checklist):
+    bkey = str(item.get("bug_key") or "")
+    if bkey:
+      covered.add(bkey)
+    cls_out: list[dict[str, Any]] = []
+    cl_tokens: set[str] = set()
+    for c in item.get("cls") or []:
+      ckey = str(c.get("artifact_key") or "")
+      if ckey:
+        covered.add(ckey)
+        cl_tokens |= _cl_id_tokens(ckey)
+      art = art_by_key.get(ckey) or {}
+      ast = art.get("state") or {}
+      short_lbl, ps_tag = _short_cl_label(ckey, str(c.get("label") or ckey))
+      if not ps_tag and ast.get("patchset"):
+        ps_tag = f"PS{ast['patchset']}"
+      why_b = str(art.get("why_badge") or "")
+      short_bug = str(item.get("short_id") or "")
+      # Omit redundant fix badge when the CL already sits inside that exact bug peer
+      if short_bug and why_b == f"фикс {short_bug}":
+        why_b = ""
+      cls_out.append({
+          "artifact_key": ckey,
+          "short_label": short_lbl,
+          "ps_tag": ps_tag,
+          "url": str(c.get("url") or art.get("url") or "#"),
+          "subject": _clean_cl_subject(str(c.get("subject") or ""), ast, short_lbl),
+          "status": str(c.get("status") or ast.get("status") or ""),
+          "merge_conflict": bool(c.get("merge_conflict")),
+          "is_wip": bool(c.get("is_wip") or ast.get("is_draft")),
+          "why_badge": why_b,
+      })
+    peers.append({
+        "peer_key": bkey or f"chk:{idx}",
+        "bug_key": bkey,
+        "short_id": str(item.get("short_id") or bkey),
+        "title": str(item.get("title") or ""),
+        "url": str(item.get("url") or "#"),
+        "bug_status": str(item.get("bug_status") or "OPEN"),
+        "stage": str(item.get("stage") or ""),
+        "stage_tone": str(item.get("stage_tone") or "muted"),
+        "stage_label": _clean_stage_text(item.get("stage_label") or item.get("stage") or ""),
+        "draft_outdated": bool(item.get("draft_outdated")),
+        "extra_issues": [],
+        "cls": cls_out,
+        "cl_tokens": cl_tokens,
+        "from_checklist": True,
+    })
+  return peers
+
+
+def _attach_or_promote_ssr_bugs(
+    arts: list[dict[str, Any]],
+    art_by_key: dict[str, dict[str, Any]],
+    peers: list[dict[str, Any]],
+    covered: set[str],
+    promote_roles: set[str],
+) -> None:
+  """Attaches companion bugs sharing a CL onto existing peers or promotes allowed bug roles."""
+  bug_kinds = {"github_issue", "buganizer", "crbug"}
+  for a in arts:
+    akey = str(a.get("artifact_key") or "")
+    role = str(a.get("role") or "")
+    if not akey or akey in covered or role == "context_only":
+      continue
+    if str(a.get("kind") or "") not in bug_kinds:
+      continue
+    ast = a.get("state") or {}
+    ref_tokens = set(_RE_CL_DIGITS.findall(str(a.get("why_badge") or "")))
+    for lc in ast.get("linked_cls") or []:
+      if isinstance(lc, dict):
+        ref_tokens |= set(_RE_CL_DIGITS.findall(
+            f"{lc.get('target_id', '')} {lc.get('item_key', '')}"
+        ))
+    matched_peer = None
+    for p in peers:
+      if ref_tokens & p["cl_tokens"]:
+        matched_peer = p
+        break
+      for c in p["cls"]:
+        cl_art = art_by_key.get(c["artifact_key"]) or {}
+        if akey in _extract_ssr_cl_bug_keys(cl_art.get("state") or {}):
+          matched_peer = p
+          break
+      if matched_peer is not None:
+        break
+    if matched_peer is not None:
+      matched_peer["extra_issues"].append({
+          "artifact_key": akey,
+          "short_id": _short_issue_id(a),
+          "url": str(a.get("url") or "#"),
+          "title": str(a.get("title") or ""),
+      })
+      covered.add(akey)
+    elif role in promote_roles:
+      sid = _short_issue_id(a)
+      raw_t = str(a.get("title") or "")
+      clean_t = raw_t.split(":", 1)[1].strip() if ":" in raw_t else raw_t
+      st_lbl = _clean_stage_text(ast.get("status") or "Open")
+      peers.append({
+          "peer_key": akey,
+          "bug_key": akey,
+          "short_id": sid,
+          "title": clean_t,
+          "url": str(a.get("url") or "#"),
+          "bug_status": str(ast.get("status") or "OPEN"),
+          "stage": "open",
+          "stage_tone": "muted",
+          "stage_label": st_lbl,
+          "draft_outdated": False,
+          "extra_issues": [],
+          "cls": [],
+          "cl_tokens": set(),
+          "from_checklist": False,
+      })
+      covered.add(akey)
+
+
+def _refresh_ssr_non_checklist_stages(peers: list[dict[str, Any]]) -> None:
+  """Updates stage badges on promoted non-checklist bug peers once uncovered CLs attach."""
+  for p in peers:
+    if p.get("from_checklist") or not p.get("bug_key") or not p["cls"]:
+      continue
+    if any(c["merge_conflict"] for c in p["cls"]):
+      p["stage"], p["stage_tone"], p["stage_label"] = "wip", "urgent", "Merge conflict"
+    elif any(c["is_wip"] for c in p["cls"]):
+      p["stage"], p["stage_tone"], p["stage_label"] = "wip", "warn", "WIP"
+    elif all(c["status"] in ("MERGED", "SUBMITTED") for c in p["cls"]):
+      p["stage"], p["stage_tone"], p["stage_label"] = "merged", "ok", "Merged"
+    else:
+      p["stage"], p["stage_tone"], p["stage_label"] = "review", "wait", "In review"
+
+
+def _attach_ssr_uncovered_cls(
+    arts: list[dict[str, Any]],
+    peers: list[dict[str, Any]],
+    covered: set[str],
+) -> None:
+  """Attaches uncovered primary/channel CL, PR, and Piper artifacts so zero CLs orphan as pills."""
+  cl_kinds = {"gerrit", "github_pr", "piper"}
+  ordered_cls = sorted(
+      (
+          a
+          for a in arts
+          if a.get("role") != "context_only"
+          and str(a.get("kind") or "") in cl_kinds
+          and str(a.get("artifact_key") or "") not in covered
+      ),
+      key=lambda x: 0 if x.get("role") == "primary" else 1,
+  )
+  for a in ordered_cls:
+    akey = str(a.get("artifact_key") or "")
+    if not akey or akey in covered:
+      continue
+    ast = a.get("state") or {}
+    short_lbl, ps_tag = _short_cl_label(akey, str(a.get("title") or akey))
+    if not ps_tag and ast.get("patchset"):
+      ps_tag = f"PS{ast['patchset']}"
+    subj = _clean_cl_subject(str(a.get("title") or ""), ast, short_lbl)
+    why_b = str(a.get("why_badge") or "")
+    is_wip = bool(ast.get("is_wip") or ast.get("is_draft"))
+    st_str = str(ast.get("status") or "OPEN")
+    cl_entry = {
+        "artifact_key": akey,
+        "short_label": short_lbl,
+        "ps_tag": ps_tag,
+        "url": str(a.get("url") or "#"),
+        "subject": subj,
+        "status": st_str,
+        "merge_conflict": bool(ast.get("merge_conflict")),
+        "is_wip": is_wip,
+        "why_badge": why_b,
+    }
+    lbugs = _extract_ssr_cl_bug_keys(ast)
+    why_tokens = set(_RE_CL_DIGITS.findall(why_b))
+    target_peer = None
+    for p in peers:
+      if p["bug_key"] and p["bug_key"] in lbugs:
+        target_peer = p
+        break
+      if p["short_id"] and p["short_id"] in why_b:
+        target_peer = p
+        break
+      if why_tokens & p["cl_tokens"]:
+        target_peer = p
+        break
+    # Single-open-bug cards co-locate an uncovered primary CL (e.g. Piper flag) onto that bug
+    if target_peer is None and a.get("role") == "primary":
+      open_bug_peers = [
+          p for p in peers if p["bug_key"] and p["bug_status"].upper() != "CLOSED"
+      ]
+      if len(open_bug_peers) == 1:
+        target_peer = open_bug_peers[0]
+    if target_peer is not None:
+      target_peer["cls"].append(cl_entry)
+      target_peer["cl_tokens"] |= _cl_id_tokens(akey)
+    else:
+      is_done_st = st_str in ("MERGED", "SUBMITTED")
+      if ast.get("merge_conflict"):
+        s_tone, s_lbl = "urgent", "Merge conflict"
+      elif is_done_st:
+        s_tone, s_lbl = "ok", "Merged"
+      elif is_wip:
+        s_tone, s_lbl = "warn", ("Draft" if ast.get("is_draft") else "WIP")
+      else:
+        s_tone, s_lbl = "wait", "In review"
+      peers.append({
+          "peer_key": akey,
+          "bug_key": "",
+          "short_id": short_lbl,
+          "title": subj,
+          "url": str(a.get("url") or "#"),
+          "bug_status": "OPEN",
+          "stage": st_str.lower(),
+          "stage_tone": s_tone,
+          "stage_label": s_lbl,
+          "draft_outdated": False,
+          "extra_issues": [],
+          "cls": [cl_entry],
+          "cl_tokens": _cl_id_tokens(akey),
+          "from_checklist": False,
+      })
+    covered.add(akey)
+
+
+def _build_ssr_peers(w: dict[str, Any]) -> tuple[list[dict[str, Any]], set[str]]:
+  """Runs 4-phase peer assembly across checklist rows, primary bugs, CLs, and companion bugs."""
+  arts = w.get("artifacts") or []
+  art_by_key = {str(a.get("artifact_key") or ""): a for a in arts if a.get("artifact_key")}
+  covered: set[str] = set()
+  peers = _build_ssr_checklist_peers(w.get("checklist") or [], art_by_key, covered)
+  _attach_or_promote_ssr_bugs(arts, art_by_key, peers, covered, {"primary"})
+  _attach_ssr_uncovered_cls(arts, peers, covered)
+  _refresh_ssr_non_checklist_stages(peers)
+  _attach_or_promote_ssr_bugs(arts, art_by_key, peers, covered, {"primary", "channel"})
+  return peers, covered
+
+
+def _is_ssr_corr_art(a_item: dict[str, Any]) -> bool:
+  """Returns True when an artifact is a correspondence item (including Gmail drafts)."""
+  ak = str(a_item.get("kind") or "")
+  ast = a_item.get("state") or {}
+  if ak in ("gmail_thread", "gmail_draft", "gchat_thread", "gdoc_thread"):
+    return True
+  return ak == "gdoc" and bool(ast.get("is_active_correspondence"))
+
+
+def _is_ssr_discarded_draft(a_item: dict[str, Any]) -> bool:
+  """Returns True when a Gmail draft artifact has DISCARDED status."""
+  if str(a_item.get("kind") or "") != "gmail_draft":
+    return False
+  return str((a_item.get("state") or {}).get("status") or "DRAFT").upper() == "DISCARDED"
+
+
+def _render_ssr_peer_row(wid: str, peer: dict[str, Any]) -> str:
+  """Renders one deliverable peer row and its CL spine for initial SSR markup."""
+  cl_chips: list[str] = []
+  folded_cls: list[str] = []
+  is_standalone_single = (not peer["bug_key"]) and len(peer["cls"]) == 1
+  for c in peer["cls"]:
+    if not (not peer["bug_key"] and c["artifact_key"] == peer["peer_key"]):
+      conf_cls = " is-conflict" if c["merge_conflict"] else ""
+      folded_cls.append(
+          f'<a class="re-folded-cl{conf_cls}" href="{_esc(c["url"])}" '
+          f'target="_blank" rel="noopener">{_esc(c["short_label"])}</a>'
+      )
+    ps_ssr = f' <span class="re-ps">{_esc(c["ps_tag"])}</span>' if c["ps_tag"] else ""
+    show_subj = (
+        bool(c["subject"])
+        and c["subject"] != c["short_label"]
+        and not (is_standalone_single and c["subject"] == peer["title"])
+    )
+    subj_ssr = f' <span class="wb-cl-subj">{_esc(c["subject"])}</span>' if show_subj else ""
+    why_ssr = (
+        f' <span class="wb-why">· {_esc(c["why_badge"])}</span>'
+        if c["why_badge"]
+        else ""
+    )
+    cl_chips.append(
+        f'<div class="wb-cl-chip re-cl-row">'
+        f'<a class="re-cl-link" href="{_esc(c["url"])}" '
+        f'target="_blank" rel="noopener">{_esc(c["short_label"])}</a>'
+        f"{ps_ssr}{subj_ssr}{why_ssr}</div>"
+    )
+  extra_ssr = "".join(
+      f'<a class="re-extra-bug" href="{_esc(ex["url"])}" '
+      f'target="_blank" rel="noopener">+{_esc(ex["short_id"])}</a>'
+      for ex in peer["extra_issues"]
+  )
+  empty_spine_ssr = (
+      '<div class="wb-chk-cls re-spine">'
+      '<div class="re-empty-spine">No linked CLs yet</div></div>'
+  )
+  cls_ssr = (
+      f'<div class="wb-chk-cls re-spine">{"".join(cl_chips)}</div>'
+      if cl_chips
+      else empty_spine_ssr
+  )
+  outdated_ssr = (
+      '<span class="wb-draft-warn">Not in draft</span>'
+      if peer["draft_outdated"]
+      else ""
+  )
+  return (
+      f'<div class="wb-chk-row re-peer" data-stage="{_esc(peer["stage"])}" '
+      f'data-peer-key="{_esc(peer["peer_key"])}" data-peer-open="true">'
+      f'<div class="re-peer-hdr" data-peer-hdr="{_esc(peer["peer_key"])}" '
+      f'data-peer-work="{wid}">'
+      f'<div class="re-peer-lead">'
+      f'<a class="wb-bug-id re-peer-id" href="{_esc(peer["url"])}" '
+      f'target="_blank" rel="noopener">{_esc(peer["short_id"])}</a>'
+      f"{extra_ssr}"
+      f'<span class="wb-bug-title re-peer-title">{_esc(peer["title"])}</span></div>'
+      f'<div class="re-peer-folded-cls">{"".join(folded_cls)}</div>'
+      f'<div class="re-peer-badges">'
+      f'<span class="wb-stage-badge re-stage" '
+      f'data-tone="{_esc(peer["stage_tone"])}">'
+      f'{_esc(peer["stage_label"])}</span>{outdated_ssr}</div></div>'
+      f"{cls_ssr}</div>"
+  )
+
+
+def _render_ssr_card(w: dict[str, Any]) -> str:
+  """Renders one editorial Work card into initial SSR HTML matching client band structure."""
+  wid = _esc(w.get("work_id"))
+  full_title = _esc(w.get("title"))
+  clean_head, counterparty = _split_card_headline(w)
+  head_esc = _esc(clean_head)
+  cp_ssr = (
+      f'<span class="re-counterparty">{_esc(counterparty)}</span>'
+      if counterparty
+      else ""
+  )
+  raw_lane = str(w.get("lane") or "")
+  lane = _esc(raw_lane)
+  collapsed_attr = "false" if raw_lane == "needs-you" else "true"
+  origin = w.get("origin") or {}
+  origin_ssr = (
+      f'<div class="wb-origin-row"><span class="wb-origin" '
+      f'title="{_esc(origin.get("label"))}">'
+      f'{_esc(origin.get("label"))}</span></div>'
+      if origin.get("label")
+      else ""
+  )
+  reasons_ssr = " · ".join(
+      _esc(_clean_stage_text(r)) for r in (w.get("reasons") or []) if str(r or "").strip()
+  )
+  decision_ssr = (
+      f'<div class="re-decision"><div class="re-decision-txt">{reasons_ssr}</div></div>'
+      if reasons_ssr
+      else ""
+  )
+  obs_parts: list[str] = []
+  for ob in w.get("obligations") or []:
+    if ob.get("status") == "done":
+      continue
+    ob_id_esc = _esc(ob.get("obligation_id"))
+    prog = _esc(ob.get("progress_summary") or "")
+    prog_html = f'<div class="wb-ob-prog">{prog}</div>' if prog else ""
+    ambig_p = _esc(ob.get("ambiguity_prompt") or "")
+    ambig_ev = _esc(ob.get("ambiguity_event_key") or "")
+    ambig_ssr = (
+        f'<div class="wb-ob-ambig"><span>{ambig_p}</span>'
+        f'<div class="wb-ob-btns">'
+        f'<button class="wb-btn" data-ob-keep="{ob_id_esc}" '
+        f'data-ob-event="{ambig_ev}" type="button">Оставить обязательство</button>'
+        f'<button class="wb-btn" data-ob-close-topic="{ob_id_esc}" '
+        f'data-ob-event="{ambig_ev}" type="button">Тема закрыта ✓</button>'
+        f"</div></div>"
+        if ambig_p
+        else ""
+    )
+    wait_btn_ssr = (
+        f'<button class="wb-btn" data-ob-wait="{ob_id_esc}" type="button">'
+        f"Ответила → жду</button>"
+        if ob.get("kind") == "correspondence" and ob.get("status") == "ready"
+        else ""
+    )
+    obs_parts.append(
+        f'<div class="wb-ob re-loop-row" data-status="{_esc(ob.get("status"))}">'
+        f'<div class="wb-ob-main"><span>{_esc(ob.get("description"))}</span>'
+        f"{prog_html}{ambig_ssr}</div>"
+        f'<div class="wb-ob-btns">{wait_btn_ssr}'
+        f'<button class="wb-btn" data-ob-done="{ob_id_esc}" type="button">✓</button>'
+        f"</div></div>"
+    )
+  obs_html = f'<div class="wb-obs">{"".join(obs_parts)}</div>' if obs_parts else ""
+  peers_ssr, chk_covered = _build_ssr_peers(w)
+  chk_rows_ssr = [_render_ssr_peer_row(wid, peer) for peer in peers_ssr]
+  deliv_band_ssr = (
+      f'<div class="re-band"><div class="wb-checklist re-peer-list">'
+      f'{"".join(chk_rows_ssr)}</div></div>'
+      if chk_rows_ssr
+      else ""
+  )
+  arts = w.get("artifacts") or []
+  corr_arts_ssr = [
+      a
+      for a in arts
+      if a.get("role") != "context_only"
+      and _is_ssr_corr_art(a)
+      and not _is_ssr_discarded_draft(a)
+  ]
+  chat_arts_ssr = [
+      a
+      for a in arts
+      if a.get("role") != "context_only"
+      and str(a.get("artifact_key") or "") not in chk_covered
+      and str(a.get("kind") or "") == "chat_chain"
+  ]
+  main_arts_ssr = [
+      a
+      for a in arts
+      if a.get("role") != "context_only"
+      and str(a.get("artifact_key") or "") not in chk_covered
+      and not _is_ssr_corr_art(a)
+      and str(a.get("kind") or "") != "chat_chain"
+  ]
+  mention_arts_ssr = [
+      a
+      for a in arts
+      if a.get("role") == "context_only"
+      and str(a.get("artifact_key") or "") not in chk_covered
+  ]
+  corr_pills_ssr = "".join(
+      f'<div class="wb-pill re-corr-item" data-kind="{_esc(a.get("kind"))}" '
+      f'data-role="{_esc(a.get("role"))}" title="{_esc(a.get("why_tooltip") or "")}">'
+      f'{_esc(a.get("title"))}'
+      + (
+          f' <span class="wb-why">· {_esc(a.get("why_badge"))}</span>'
+          if a.get("why_badge")
+          else ""
+      )
+      + "</div>"
+      for a in corr_arts_ssr
+  )
+  corr_html = f'<div class="wb-correspondence">{corr_pills_ssr}</div>' if corr_arts_ssr else ""
+  rd_obj = w.get("reply_draft")
+  rd_ssr = ""
+  if isinstance(rd_obj, dict) and str(rd_obj.get("body") or "").strip():
+    rd_prev = _render_safe_draft_preview(rd_obj)
+    rd_upd = _esc(rd_obj.get("updated_et") or "")
+    rd_ssr = (
+        f'<div class="wb-reply-draft">'
+        f'<div class="wb-reply-draft-hdr">'
+        f"<span>Live reply draft · {rd_upd}</span></div>"
+        f'<div class="wb-reply-draft-body">{rd_prev}</div></div>'
+    )
+  loop_band_ssr = (
+      f'<div class="re-band">{obs_html}{corr_html}{rd_ssr}</div>'
+      if (obs_html or corr_html or rd_ssr)
+      else ""
+  )
+  chats_ssr = (
+      '<div class="re-chats-row">'
+      + "".join(
+          f'<span class="re-chat-chip">{_esc(a.get("title"))}</span>'
+          for a in chat_arts_ssr[:4]
+      )
+      + "</div>"
+      if chat_arts_ssr
+      else ""
+  )
+  pills_html = "".join(
+      f'<div class="wb-pill" data-kind="{_esc(a.get("kind"))}" '
+      f'data-role="{_esc(a.get("role"))}" title="{_esc(a.get("why_tooltip") or "")}">'
+      f'{_esc(a.get("title"))}'
+      + (
+          f' <span class="wb-why">· {_esc(a.get("why_badge"))}</span>'
+          if a.get("why_badge")
+          else ""
+      )
+      + "</div>"
+      for a in main_arts_ssr
+  )
+  pills_wrap_ssr = f'<div class="wb-pills">{pills_html}</div>' if pills_html else ""
+  mentions_inner_ssr = "".join(
+      f'<div class="wb-pill" data-kind="{_esc(a.get("kind"))}" data-role="context_only" '
+      f'title="{_esc(a.get("why_tooltip") or "")}">'
+      f'{_esc(a.get("title"))}'
+      + (
+          f' <span class="wb-why">· {_esc(a.get("why_badge"))}</span>'
+          if a.get("why_badge")
+          else ""
+      )
+      + "</div>"
+      for a in mention_arts_ssr
+  )
+  mentions_cnt = len(mention_arts_ssr)
+  mentions_lbl = f"{mentions_cnt} chat mention" + ("" if mentions_cnt == 1 else "s")
+  util_wrap_ssr = (
+      f'<div class="re-utility-row"><details class="wb-mentions re-mentions">'
+      f'<summary title="📎 Упомянуто в чате ({mentions_cnt})">'
+      f"{mentions_lbl}</summary>"
+      f'<div class="wb-mentions-list">{mentions_inner_ssr}</div></details></div>'
+      if mention_arts_ssr
+      else ""
+  )
+  footer_ssr = (
+      f'<div class="re-footer">{chats_ssr}{pills_wrap_ssr}{util_wrap_ssr}</div>'
+      if (chats_ssr or pills_wrap_ssr or util_wrap_ssr)
+      else ""
+  )
+  return (
+      f'<article class="wb-card" data-work-id="{wid}" data-lane="{lane}" '
+      f'data-collapsed="{collapsed_attr}">'
+      f'<div class="wb-card-hdr" data-toggle-card="{wid}"><div class="wb-hdr-stack">'
+      f'<div class="re-eyebrow"><span class="re-status-pill">{lane}</span>'
+      f"{cp_ssr}{origin_ssr}</div>"
+      f'<div class="re-headline-row">'
+      f'<strong class="wb-card-title re-headline" title="{full_title}">{head_esc}</strong>'
+      f"</div></div></div>"
+      f'<div class="wb-card-body">{decision_ssr}{loop_band_ssr}{deliv_band_ssr}'
+      f"{footer_ssr}</div></article>"
+  )
+
+
 def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   """Renders the standalone/embedded Workbench HTML dashboard."""
   counts = projection.get("counts") or {}
@@ -175,186 +818,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   tray = projection.get("unanswered_tray") or []
   synced_et = _esc(projection.get("synced_et") or "")
   initial_json = json.dumps(projection, ensure_ascii=False).replace("</", "<\\/")
-
-  def _is_ssr_corr(a_item: dict[str, Any]) -> bool:
-    ak = str(a_item.get("kind") or "")
-    ast = a_item.get("state") or {}
-    if ak in ("gmail_thread", "gmail_draft", "gchat_thread", "gdoc_thread"):
-      return True
-    return ak == "gdoc" and bool(ast.get("is_active_correspondence"))
-
-  cards_ssr: list[str] = []
-  for w in works[:40]:
-    wid = _esc(w.get("work_id"))
-    title = _esc(w.get("title"))
-    lane = _esc(w.get("lane"))
-    origin = w.get("origin") or {}
-    origin_ssr = (
-        f'<div class="wb-origin-row"><span class="wb-origin">'
-        f'{_esc(origin.get("label"))}</span></div>'
-        if origin.get("label")
-        else ""
-    )
-    obs_parts: list[str] = []
-    for ob in w.get("obligations") or []:
-      if ob.get("status") == "done":
-        continue
-      ob_id_esc = _esc(ob.get("obligation_id"))
-      prog = _esc(ob.get("progress_summary") or "")
-      prog_html = f'<div class="wb-ob-prog">{prog}</div>' if prog else ""
-      ambig_p = _esc(ob.get("ambiguity_prompt") or "")
-      ambig_ev = _esc(ob.get("ambiguity_event_key") or "")
-      ambig_ssr = (
-          f'<div class="wb-ob-ambig"><span>⚖️ {ambig_p}</span>'
-          f'<div class="wb-ob-btns">'
-          f'<button class="wb-btn" data-ob-keep="{ob_id_esc}" '
-          f'data-ob-event="{ambig_ev}" type="button">Оставить обязательство</button>'
-          f'<button class="wb-btn" data-ob-close-topic="{ob_id_esc}" '
-          f'data-ob-event="{ambig_ev}" type="button">Тема закрыта ✓</button>'
-          f"</div></div>"
-          if ambig_p
-          else ""
-      )
-      wait_btn_ssr = (
-          f'<button class="wb-btn" data-ob-wait="{ob_id_esc}" type="button">'
-          f"Ответила → жду</button>"
-          if ob.get("kind") == "correspondence" and ob.get("status") == "ready"
-          else ""
-      )
-      obs_parts.append(
-          f'<div class="wb-ob" data-status="{_esc(ob.get("status"))}">'
-          f'<div class="wb-ob-main"><span>🔔 {_esc(ob.get("description"))}</span>'
-          f"{prog_html}{ambig_ssr}</div>"
-          f'<div class="wb-ob-btns">{wait_btn_ssr}'
-          f'<button class="wb-btn" data-ob-done="{ob_id_esc}" type="button">✓</button>'
-          f"</div></div>"
-      )
-    obs_html = "".join(obs_parts)
-    chk_items = w.get("checklist") or []
-    chk_covered: set[str] = set()
-    chk_rows_ssr: list[str] = []
-    for item in chk_items:
-      chk_covered.add(str(item.get("bug_key") or ""))
-      cl_chips: list[str] = []
-      for c in item.get("cls") or []:
-        chk_covered.add(str(c.get("artifact_key") or ""))
-        cl_chips.append(
-            f'<div class="wb-cl-chip">'
-            f'<a href="{_esc(c.get("url") or "#")}" '
-            f'target="_blank" rel="noopener">{_esc(c.get("label"))}</a></div>'
-        )
-      cls_ssr = (
-          f'<div class="wb-chk-cls">{"".join(cl_chips)}</div>' if cl_chips else ""
-      )
-      outdated_ssr = (
-          '<span class="wb-draft-warn">📝 Not in draft yet</span>'
-          if item.get("draft_outdated")
-          else ""
-      )
-      chk_rows_ssr.append(
-          f'<div class="wb-chk-row" data-stage="{_esc(item.get("stage"))}">'
-          f'<div class="wb-chk-bug">'
-          f'<a class="wb-bug-id" href="{_esc(item.get("url") or "#")}" '
-          f'target="_blank" rel="noopener">🐛 {_esc(item.get("short_id"))}</a>'
-          f'<span class="wb-bug-title">{_esc(item.get("title"))}</span></div>'
-          f'<div class="wb-chk-status">'
-          f'<span class="wb-stage-badge" '
-          f'data-tone="{_esc(item.get("stage_tone"))}">'
-          f'{_esc(item.get("stage_label"))}</span>{outdated_ssr}</div>'
-          f"{cls_ssr}</div>"
-      )
-    chk_html = (
-        f'<div class="wb-checklist">{"".join(chk_rows_ssr)}</div>'
-        if chk_rows_ssr
-        else ""
-    )
-    corr_arts_ssr = [
-        a
-        for a in (w.get("artifacts") or [])
-        if a.get("role") != "context_only" and _is_ssr_corr(a)
-    ]
-    main_arts_ssr = [
-        a
-        for a in (w.get("artifacts") or [])
-        if a.get("role") != "context_only"
-        and str(a.get("artifact_key") or "") not in chk_covered
-        and not _is_ssr_corr(a)
-    ]
-    mention_arts_ssr = [
-        a
-        for a in (w.get("artifacts") or [])
-        if a.get("role") == "context_only"
-        and str(a.get("artifact_key") or "") not in chk_covered
-    ]
-    corr_pills_ssr = "".join(
-        f'<div class="wb-pill" data-kind="{_esc(a.get("kind"))}" '
-        f'title="{_esc(a.get("why_tooltip") or "")}">'
-        f'{_esc(a.get("icon"))} {_esc(a.get("title"))}'
-        + (
-            f' <span class="wb-why">· {_esc(a.get("why_badge"))}</span>'
-            if a.get("why_badge")
-            else ""
-        )
-        + "</div>"
-        for a in corr_arts_ssr
-    )
-    corr_html = (
-        f'<div class="wb-correspondence">{corr_pills_ssr}</div>'
-        if corr_arts_ssr
-        else ""
-    )
-    pills_html = "".join(
-        f'<div class="wb-pill" data-kind="{_esc(a.get("kind"))}" '
-        f'title="{_esc(a.get("why_tooltip") or "")}">'
-        f'{_esc(a.get("icon"))} {_esc(a.get("title"))}'
-        + (
-            f' <span class="wb-why">· {_esc(a.get("why_badge"))}</span>'
-            if a.get("why_badge")
-            else ""
-        )
-        + "</div>"
-        for a in main_arts_ssr
-    )
-    mentions_inner_ssr = "".join(
-        f'<div class="wb-pill" data-kind="{_esc(a.get("kind"))}" data-role="context_only" '
-        f'title="{_esc(a.get("why_tooltip") or "")}">'
-        f'{_esc(a.get("icon"))} {_esc(a.get("title"))}'
-        + (
-            f' <span class="wb-why">· {_esc(a.get("why_badge"))}</span>'
-            if a.get("why_badge")
-            else ""
-        )
-        + "</div>"
-        for a in mention_arts_ssr
-    )
-    mentions_ssr = (
-        f'<details class="wb-mentions">'
-        f"<summary>📎 Упомянуто в чате ({len(mention_arts_ssr)})</summary>"
-        f'<div class="wb-mentions-list">{mentions_inner_ssr}</div></details>'
-        if mention_arts_ssr
-        else ""
-    )
-    rd_obj = w.get("reply_draft")
-    rd_ssr = ""
-    if isinstance(rd_obj, dict) and str(rd_obj.get("body") or "").strip():
-      rd_prev = _render_safe_draft_preview(rd_obj)
-      rd_upd = _esc(rd_obj.get("updated_et") or "")
-      rd_ssr = (
-          f'<div class="wb-reply-draft">'
-          f'<div class="wb-reply-draft-hdr">'
-          f"<span>📝 Live reply draft · {rd_upd}</span></div>"
-          f'<div class="wb-reply-draft-body">{rd_prev}</div></div>'
-      )
-    cards_ssr.append(
-        f'<article class="wb-card" data-work-id="{wid}" data-lane="{lane}">'
-        f'<div class="wb-card-hdr"><div class="wb-hdr-stack">'
-        f'<strong class="wb-card-title">{title}</strong>'
-        f'<div class="wb-meta-row"><span class="wb-lane-tag">{lane}</span></div>'
-        f"{origin_ssr}</div></div>"
-        f'<div class="wb-card-body">{corr_html}{obs_html}{rd_ssr}{chk_html}'
-        f"<div class='wb-pills'>{pills_html}</div>{mentions_ssr}</div></article>"
-    )
-  ssr_body = "\n".join(cards_ssr)
+  ssr_body = "\n".join(_render_ssr_card(w) for w in works[:40])
   precision_pct = int(round(float(metrics.get("link_precision", 1.0)) * 100))
   # Compute initial SSR chip counts directly from works for activeFilter='all', type='all'
   active_works_ssr = [w for w in works if w.get("lane") != "done"]
@@ -657,164 +1121,300 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   #wb-cards-container {{
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 10px;
   }}
   .wb-card {{
     background: var(--surface);
     border: 1px solid var(--border);
-    box-shadow: var(--shadow);
-    border-radius: 10px;
-    padding: 9px 10px;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03), 0 4px 16px rgba(0, 0, 0, 0.035);
+    border-radius: 12px;
+    overflow: hidden;
     display: flex;
     flex-direction: column;
-    gap: 6px;
-    transition: border-color 0.12s ease, background 0.12s ease;
+    transition: border-color 0.14s ease, box-shadow 0.14s ease;
   }}
-  .wb-card[data-collapsed="true"] {{
-    padding: 7px 10px;
-    gap: 0;
-  }}
-  .wb-card[data-collapsed="true"]:hover {{
-    background: var(--surface-hover);
+  .wb-card:hover {{
+    border-color: rgba(0, 0, 0, 0.14);
   }}
   .wb-card[data-lane="needs-you"] {{
     border-left: 3px solid var(--urgent);
-    background: linear-gradient(90deg, #fff2f1 0%, #ffffff 32px);
   }}
   .wb-card[data-lane="waiting"] {{
     border-left: 3px solid var(--accent);
   }}
+  .wb-card[data-lane="on-desk"] {{
+    border-left: 3px solid var(--warn);
+  }}
   .wb-card[data-lane="done"] {{
-    opacity: 0.68;
+    opacity: 0.72;
   }}
   .wb-card-hdr {{
     display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 8px;
-    cursor: pointer;
-  }}
-  .wb-card-hdr-main {{
-    display: flex;
-    align-items: flex-start;
-    gap: 6px;
-    min-width: 0;
-    flex: 1;
-  }}
-  .wb-chevron {{
-    color: var(--muted);
-    font-size: 12px;
-    line-height: 1.45;
-    width: 12px;
-    flex-shrink: 0;
-    user-select: none;
-  }}
-  .wb-card-hdr:hover .wb-chevron {{
-    color: var(--accent);
-  }}
-  .wb-card-body {{
-    display: flex;
     flex-direction: column;
-    gap: 6px;
-    padding-left: 18px;
+    gap: 5px;
+    padding: 11px 14px 10px;
+    cursor: pointer;
+    background: var(--surface);
+    transition: background 0.12s ease;
   }}
-  .wb-card[data-collapsed="true"] .wb-card-body {{
-    display: none;
+  .wb-card[data-collapsed="true"] .wb-card-hdr {{
+    padding: 9px 14px;
+  }}
+  .wb-card-hdr:hover {{
+    background: #fafafa;
   }}
   .wb-hdr-stack {{
     display: flex;
     flex-direction: column;
-    align-items: flex-start;
     gap: 4px;
     min-width: 0;
-    flex: 1;
+    width: 100%;
   }}
-  .wb-card-title {{
-    font-weight: 600;
-    font-size: 13px;
-    color: var(--text);
-    word-break: break-word;
-  }}
-  .wb-meta-row {{
+  .re-eyebrow {{
     display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+    min-width: 0;
+    font-size: 11px;
+    color: var(--muted);
+  }}
+  .re-eyebrow-left, .re-eyebrow-right {{
+    display: inline-flex;
     align-items: center;
     gap: 6px;
     flex-wrap: wrap;
-    font-size: 11px;
-    color: var(--muted);
+    min-width: 0;
   }}
-  .wb-origin-row {{
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    max-width: 100%;
+  .re-eyebrow-right {{
+    margin-left: auto;
+    flex-shrink: 0;
   }}
-  .wb-origin {{
+  .re-status-pill {{
     display: inline-flex;
     align-items: center;
-    gap: 4px;
-    padding: 2px 6px;
-    border-radius: 4px;
-    font-size: 10.5px;
-    font-weight: 500;
-    background: #f5f5f7;
-    border: 1px solid var(--border);
-    color: #3a3a3c;
-    text-decoration: none;
-    max-width: 100%;
-    word-break: break-word;
-  }}
-  .wb-reasons {{
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 2px;
-    font-size: 11px;
-    color: var(--muted);
-  }}
-  .wb-obs {{
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }}
-  a.wb-origin:hover {{
-    border-color: rgba(0, 113, 227, 0.45);
-    color: var(--accent);
-    background: #eff6ff;
-  }}
-  .wb-badge {{
-    display: inline-flex;
-    align-items: center;
-    padding: 1px 6px;
-    border-radius: 4px;
+    gap: 5px;
+    padding: 1.5px 7px;
+    border-radius: 999px;
     font-size: 10.5px;
     font-weight: 600;
-  }}
-  .wb-badge-needs {{
-    background: #fff2f1;
-    color: var(--urgent);
-    border: 1px solid rgba(255, 59, 48, 0.22);
-  }}
-  .wb-badge-wait {{
+    letter-spacing: -0.01em;
     background: #eff6ff;
     color: var(--accent);
     border: 1px solid rgba(0, 113, 227, 0.2);
   }}
-  .wb-badge-multi {{
+  .re-status-pill[data-tone="urgent"] {{
+    background: #fff2f1;
+    color: var(--urgent);
+    border-color: rgba(255, 59, 48, 0.24);
+  }}
+  .re-status-pill[data-tone="warn"] {{
+    background: #fffbeb;
+    color: var(--warn);
+    border-color: rgba(180, 83, 9, 0.25);
+  }}
+  .re-status-pill[data-tone="ready"] {{
     background: #f0fdf4;
     color: var(--ready);
-    border: 1px solid rgba(21, 128, 61, 0.2);
+    border-color: rgba(21, 128, 61, 0.24);
+  }}
+  .re-dot {{
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    flex-shrink: 0;
+  }}
+  .re-counterparty {{
+    font-weight: 600;
+    color: #3a3a3c;
+    font-size: 11px;
+  }}
+  .wb-origin-row {{
+    display: inline-flex;
+    align-items: center;
+    min-width: 0;
+    max-width: 100%;
+  }}
+  .wb-origin {{
+    display: inline-block;
+    vertical-align: middle;
+    padding: 1px 6px;
+    border-radius: 5px;
+    font-size: 10.5px;
+    font-weight: 500;
+    background: #f5f5f7;
+    border: 1px solid rgba(0, 0, 0, 0.06);
+    color: #515154;
+    text-decoration: none;
+    max-width: 280px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }}
+  a.wb-origin:hover {{
+    border-color: rgba(0, 113, 227, 0.4);
+    color: var(--accent);
+    background: #eff6ff;
+  }}
+  .re-chevron {{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    color: var(--muted);
+    transition: transform 0.14s ease, color 0.12s ease;
+  }}
+  .wb-card[data-collapsed="false"] .re-chevron {{
+    transform: rotate(90deg);
+  }}
+  .wb-card-hdr:hover .re-chevron {{
+    color: var(--accent);
+  }}
+  .re-headline-row {{
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    min-width: 0;
+  }}
+  .wb-card-title {{
+    font-weight: 650;
+    font-size: 13.5px;
+    line-height: 1.32;
+    letter-spacing: -0.012em;
+    color: var(--text);
+    word-break: break-word;
+    min-width: 0;
+    flex: 1;
+  }}
+  .re-headline-sub {{
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--muted);
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
+  }}
+  .re-collapsed-summary {{
+    display: none;
+    font-size: 11px;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }}
+  .wb-card[data-collapsed="true"] .re-collapsed-summary {{
+    display: block;
+  }}
+  .wb-card-body {{
+    display: flex;
+    flex-direction: column;
+    border-top: 1px solid var(--border);
+  }}
+  .wb-card[data-collapsed="true"] .wb-card-body {{
+    display: none;
+  }}
+  .re-decision {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 7px 14px;
+    background: #fffbeb;
+    border-bottom: 1px solid rgba(180, 83, 9, 0.14);
+    color: #92400e;
+    font-size: 11.5px;
+  }}
+  .wb-card[data-lane="needs-you"] .re-decision {{
+    background: #fff5f5;
+    border-bottom-color: rgba(255, 59, 48, 0.14);
+    color: #991b1b;
+  }}
+  .re-decision-txt {{
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    flex: 1;
+    font-weight: 500;
+  }}
+  .re-band {{
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    padding: 9px 14px;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+  }}
+  .re-band:last-child {{
+    border-bottom: none;
+  }}
+  .re-band-hdr {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+  }}
+  .re-band-lbl {{
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+  }}
+  .re-fold-bar {{
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    background: #f2f2f7;
+    padding: 2px;
+    border-radius: 6px;
+  }}
+  .re-fold-btn {{
+    cursor: pointer;
+    border: none;
+    background: transparent;
+    color: var(--muted);
+    font-size: 10.5px;
+    font-weight: 500;
+    padding: 1.5px 7px;
+    border-radius: 4px;
+  }}
+  .re-fold-btn:hover {{
+    color: var(--text);
+  }}
+  .re-fold-btn[data-active="true"] {{
+    background: var(--surface);
+    color: var(--text);
+    font-weight: 600;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+  }}
+  .wb-obs {{
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
   }}
   .wb-ob {{
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
     gap: 8px;
-    padding: 6px 8px;
-    border-radius: 6px;
+    padding: 6px 9px;
+    border-radius: 8px;
     background: #f8fafc;
-    border: 1px solid var(--border);
+    border: 1px solid rgba(0, 0, 0, 0.06);
     font-size: 11.5px;
+  }}
+  .wb-ob[data-status="ready"] {{
+    background: #f0fdf4;
+    border-color: rgba(21, 128, 61, 0.28);
+  }}
+  .wb-ob[data-stalled="true"] {{
+    background: #fff2f1;
+    border-color: rgba(255, 59, 48, 0.28);
   }}
   .wb-ob-main {{
     display: flex;
@@ -824,22 +1424,15 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     min-width: 0;
     flex: 1;
   }}
-  .wb-ob[data-status="ready"] {{
-    background: #f0fdf4;
-    border-color: rgba(21, 128, 61, 0.35);
-  }}
-  .wb-ob[data-stalled="true"] {{
-    background: #fff2f1;
-    border-color: rgba(255, 59, 48, 0.35);
-  }}
   .wb-ob-prog {{
     font-size: 10.5px;
     font-weight: 600;
     color: var(--accent);
     background: #eff6ff;
-    border: 1px solid rgba(0, 113, 227, 0.22);
+    border: 1px solid rgba(0, 113, 227, 0.18);
     padding: 1px 7px;
     border-radius: 999px;
+    font-variant-numeric: tabular-nums;
   }}
   .wb-ob-btns {{
     display: inline-flex;
@@ -856,108 +1449,219 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     flex-wrap: wrap;
     width: 100%;
     margin-top: 2px;
-    padding: 4px 7px;
-    border-radius: 5px;
+    padding: 4px 8px;
+    border-radius: 6px;
     background: #fffbeb;
-    border: 1px solid rgba(180, 83, 9, 0.28);
+    border: 1px solid rgba(180, 83, 9, 0.24);
     color: var(--warn);
     font-size: 11px;
   }}
   .wb-correspondence {{
     display: flex;
     flex-direction: column;
-    align-items: flex-start;
-    gap: 4px;
-    padding: 6px 8px;
-    border-radius: 7px;
+    gap: 3px;
+  }}
+  .re-corr-row {{
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 7px;
+    border-radius: 6px;
     background: #f8fafc;
-    border: 1px solid rgba(0, 113, 227, 0.18);
+    border: 1px solid rgba(0, 0, 0, 0.05);
+    font-size: 11.5px;
+    min-width: 0;
+  }}
+  .re-corr-row:hover {{
+    border-color: rgba(0, 113, 227, 0.3);
+    background: #f2f7ff;
+  }}
+  .re-corr-link {{
+    color: var(--text);
+    text-decoration: none;
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    flex: 1;
+  }}
+  .re-corr-link:hover {{
+    color: var(--accent);
+  }}
+  .re-msg-cnt {{
+    font-size: 10.5px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
   }}
   .wb-checklist {{
     display: flex;
     flex-direction: column;
     border: 1px solid var(--border);
-    border-radius: 8px;
-    background: #fcfcfd;
+    border-radius: 9px;
+    background: var(--surface);
     overflow: hidden;
   }}
-  .wb-chk-row {{
+  .wb-chk-row.re-peer {{
     display: flex;
     flex-direction: column;
-    align-items: flex-start;
-    gap: 4px;
-    padding: 7px 9px;
-    border-top: 1px solid var(--border);
+    border-top: 1px solid rgba(0, 0, 0, 0.06);
+    background: var(--surface);
   }}
-  .wb-chk-row:first-child {{
+  .wb-chk-row.re-peer:first-child {{
     border-top: none;
   }}
-  .wb-chk-bug {{
+  .re-peer-hdr {{
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 7px;
+    min-height: 34px;
+    padding: 6px 10px;
+    cursor: pointer;
+    min-width: 0;
+    transition: background 0.1s ease;
+  }}
+  .re-peer-hdr:hover {{
+    background: #f9f9fb;
+  }}
+  .re-peer-caret {{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 13px;
+    height: 13px;
+    color: var(--muted);
+    flex-shrink: 0;
+    transition: transform 0.12s ease;
+  }}
+  .re-peer[data-peer-open="true"] .re-peer-caret {{
+    transform: rotate(90deg);
+  }}
+  .re-peer-lead {{
     display: flex;
     align-items: baseline;
     gap: 6px;
-    max-width: 100%;
-  }}
-  .wb-chk-status {{
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 3px;
-    padding-left: 18px;
+    flex: 1 1 160px;
+    min-width: 140px;
+    overflow: hidden;
   }}
   .wb-bug-id {{
-    font-weight: 600;
+    font-weight: 650;
     font-size: 11.5px;
     color: var(--accent);
     text-decoration: none;
     white-space: nowrap;
+    flex-shrink: 0;
   }}
   .wb-bug-id:hover {{
     text-decoration: underline;
   }}
+  .re-extra-wrap {{
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    flex-shrink: 0;
+  }}
+  .re-extra-bug {{
+    font-size: 10.5px;
+    font-weight: 600;
+    color: #0369a1;
+    background: #e0f2fe;
+    padding: 0 5px;
+    border-radius: 4px;
+    text-decoration: none;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }}
+  .re-extra-bug:hover {{
+    text-decoration: underline;
+  }}
   .wb-bug-title {{
     font-size: 11.5px;
-    color: var(--text);
-    word-break: break-word;
+    color: #3a3a3c;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
   }}
-  .wb-stage-badge {{
+  .re-peer[data-peer-open="true"] .wb-bug-title {{
+    white-space: normal;
+  }}
+  .re-peer-folded-cls {{
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+    flex-shrink: 1;
+    min-width: 0;
+  }}
+  .re-peer[data-peer-open="true"] .re-peer-folded-cls {{
+    display: none;
+  }}
+  .re-folded-cl {{
     display: inline-flex;
     align-items: center;
     padding: 1px 6px;
     border-radius: 4px;
     font-size: 10.5px;
     font-weight: 600;
+    background: #f2f4f7;
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    color: var(--accent);
+    text-decoration: none;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }}
+  .re-folded-cl:hover {{
+    border-color: rgba(0, 113, 227, 0.45);
+    background: #eff6ff;
+  }}
+  .re-folded-cl.is-conflict {{
+    background: #fff2f1;
+    border-color: rgba(255, 59, 48, 0.35);
+    color: var(--urgent);
+  }}
+  .re-peer-badges {{
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    flex-shrink: 0;
+    margin-left: auto;
+  }}
+  .wb-stage-badge {{
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 6px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 600;
     white-space: nowrap;
   }}
   .wb-stage-badge[data-tone="ready"] {{
     background: #dcfce7;
     color: var(--ready);
-    border: 1px solid rgba(21, 128, 61, 0.25);
   }}
   .wb-stage-badge[data-tone="ok"] {{
     background: #e0f2fe;
     color: #0369a1;
-    border: 1px solid rgba(3, 105, 161, 0.25);
   }}
   .wb-stage-badge[data-tone="wait"] {{
     background: #eff6ff;
     color: var(--accent);
-    border: 1px solid rgba(0, 113, 227, 0.22);
   }}
   .wb-stage-badge[data-tone="warn"] {{
     background: #fffbeb;
     color: var(--warn);
-    border: 1px solid rgba(180, 83, 9, 0.25);
   }}
   .wb-stage-badge[data-tone="urgent"] {{
     background: #fff2f1;
     color: var(--urgent);
-    border: 1px solid rgba(255, 59, 48, 0.25);
   }}
   .wb-stage-badge[data-tone="muted"] {{
-    background: #f5f5f7;
+    background: #f2f2f7;
     color: var(--muted);
-    border: 1px solid var(--border);
   }}
   .wb-draft-warn {{
     display: inline-flex;
@@ -968,44 +1672,118 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     font-weight: 600;
     background: #fffbeb;
     color: var(--warn);
-    border: 1px dashed rgba(180, 83, 9, 0.45);
+    border: 1px dashed rgba(180, 83, 9, 0.4);
     white-space: nowrap;
   }}
   .wb-chk-cls {{
     display: flex;
     flex-direction: column;
-    align-items: flex-start;
     gap: 4px;
-    padding-left: 18px;
+    padding: 2px 10px 8px 29px;
+    background: #fbfbfd;
+    border-top: 1px solid rgba(0, 0, 0, 0.04);
     width: 100%;
   }}
+  .re-peer[data-peer-open="false"] .wb-chk-cls {{
+    display: none;
+  }}
   .wb-cl-chip {{
-    display: inline-flex;
+    display: flex;
     align-items: center;
     flex-wrap: wrap;
-    gap: 5px;
-    padding: 2px 7px;
-    border-radius: 5px;
-    background: #ffffff;
-    border: 1px solid var(--border);
+    gap: 6px;
+    padding: 3px 6px;
+    border-radius: 6px;
+    background: var(--surface);
+    border: 1px solid rgba(0, 0, 0, 0.06);
     color: var(--text);
-    text-decoration: none;
     font-size: 11px;
-    max-width: 100%;
+    width: 100%;
   }}
-  .wb-cl-chip:hover {{
-    border-color: rgba(0, 113, 227, 0.45);
-    background: #eff6ff;
+  .re-cl-link {{
+    color: var(--accent);
+    text-decoration: none;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }}
+  .re-cl-link:hover {{
+    text-decoration: underline;
+  }}
+  .re-ps {{
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--muted);
+    background: #f2f2f7;
+    padding: 0 4px;
+    border-radius: 3px;
   }}
   .wb-cl-subj {{
-    color: #4b5563;
+    color: #48484a;
     font-size: 11px;
+    flex: 1 1 160px;
+    min-width: 120px;
   }}
   .wb-cl-tag {{
     font-size: 9.5px;
-    padding: 0 4px;
-    border-radius: 3px;
+    padding: 0.5px 5px;
+    border-radius: 4px;
     font-weight: 600;
+    white-space: nowrap;
+  }}
+  .re-empty-spine {{
+    font-size: 10.5px;
+    color: var(--muted);
+    padding: 2px 0;
+  }}
+  .re-footer {{
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 14px 9px;
+    background: #fafafa;
+  }}
+  .re-chats-row {{
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 5px;
+  }}
+  .re-chat-chip {{
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 7px;
+    border-radius: 6px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    font-size: 10.5px;
+    color: #3a3a3c;
+    max-width: 100%;
+  }}
+  .re-chat-main {{
+    color: inherit;
+    text-decoration: none;
+    font-weight: 500;
+    max-width: 260px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }}
+  .re-chat-main:hover {{
+    color: var(--accent);
+  }}
+  .re-chat-piece {{
+    color: var(--accent);
+    text-decoration: none;
+    font-weight: 600;
+    padding: 0 3px;
+    border-radius: 3px;
+    background: #eff6ff;
+    font-variant-numeric: tabular-nums;
+  }}
+  .re-chat-piece:hover {{
+    background: #dbeafe;
   }}
   .wb-pills {{
     display: flex;
@@ -1017,22 +1795,18 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     display: inline-flex;
     align-items: center;
     flex-wrap: wrap;
-    gap: 4px;
+    gap: 5px;
     padding: 3px 8px;
-    border-radius: 5px;
-    background: #f8fafc;
+    border-radius: 6px;
+    background: var(--surface);
     border: 1px solid var(--border);
     color: var(--text);
     text-decoration: none;
     font-size: 11px;
     max-width: 100%;
   }}
-  .wb-pill:hover {{
-    border-color: rgba(0, 113, 227, 0.45);
-    background: #eff6ff;
-  }}
   .wb-pill[data-role="context_only"] {{
-    opacity: 0.78;
+    opacity: 0.84;
     border-style: dashed;
   }}
   .wb-why {{
@@ -1040,8 +1814,14 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     font-size: 10px;
     font-weight: 500;
   }}
+  .re-utility-row {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+  }}
   .wb-mentions {{
-    margin-top: 2px;
     font-size: 11px;
     color: var(--muted);
   }}
@@ -1049,6 +1829,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     cursor: pointer;
     user-select: none;
     font-size: 10.5px;
+    font-weight: 500;
     color: var(--muted);
     padding: 2px 0;
   }}
@@ -1060,29 +1841,42 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     flex-direction: column;
     align-items: flex-start;
     gap: 4px;
-    margin-top: 4px;
-    padding-left: 8px;
+    margin-top: 5px;
+    padding-left: 6px;
   }}
-  .wb-cut {{
+  .re-unlink, .wb-cut {{
     cursor: pointer;
     border: none;
     background: transparent;
     color: var(--muted);
-    font-size: 10px;
-    padding: 0 2px;
-    margin-left: 2px;
+    font-size: 11px;
+    line-height: 1;
+    padding: 1px 3px;
+    border-radius: 3px;
+    opacity: 0.42;
+    transition: opacity 0.1s ease, color 0.1s ease;
   }}
-  .wb-cut:hover {{
+  .re-peer-hdr:hover .re-unlink,
+  .re-extra-wrap:hover .re-unlink,
+  .wb-cl-chip:hover .re-unlink,
+  .re-corr-row:hover .re-unlink,
+  .re-chat-chip:hover .re-unlink,
+  .wb-pill:hover .re-unlink {{
+    opacity: 0.9;
+  }}
+  .re-unlink:hover, .wb-cut:hover {{
+    opacity: 1;
     color: var(--urgent);
+    background: rgba(255, 59, 48, 0.08);
   }}
   .wb-rolls {{
     display: inline-flex;
     gap: 2px;
-    margin-left: 3px;
   }}
   .wb-roll-dot {{
     font-size: 9.5px;
-    padding: 0 3px;
+    font-weight: 600;
+    padding: 0 4px;
     border-radius: 3px;
     background: #f1f5f9;
     border: 1px solid #e2e8f0;
@@ -1090,17 +1884,17 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   }}
   .wb-roll-dot[data-rolled="true"] {{
     background: #dcfce7;
-    border-color: rgba(21, 128, 61, 0.3);
+    border-color: rgba(21, 128, 61, 0.28);
     color: var(--ready);
   }}
   .wb-reply-draft {{
     display: flex;
     flex-direction: column;
     gap: 6px;
-    padding: 7px 9px;
-    border-radius: 7px;
-    background: #f0f9ff;
-    border: 1px solid rgba(0, 113, 227, 0.24);
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: #f5f9ff;
+    border: 1px solid rgba(0, 113, 227, 0.2);
     font-size: 11.5px;
   }}
   .wb-reply-draft-hdr {{
@@ -1124,6 +1918,19 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   }}
   .wb-reply-draft-body a:hover {{
     text-decoration: underline;
+  }}
+  .re-sync-strip {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 4px 8px;
+    border-radius: 6px;
+    background: #fffbeb;
+    border: 1px dashed rgba(180, 83, 9, 0.35);
+    color: #92400e;
+    font-size: 10.5px;
   }}
   .wb-reply-textarea {{
     width: 100%;
@@ -1245,6 +2052,8 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   const COLLAPSE_STORAGE_KEY = 'wb_collapsed_v2';
   // Persist sort mode and direction separately from per-card collapse overrides
   const SORT_STORAGE_KEY = 'wb_sort_v1';
+  // Persist deliverable peer fold modes and per-peer overrides across 30s state refreshes
+  const PEER_FOLD_STORAGE_KEY = 'wb_peer_fold_v1';
   let state = {initial_json};
   let activeFilter = 'all';
   let activeTypeFilter = 'all';
@@ -1252,6 +2061,8 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   let sortMode = 'triage';
   let sortDir = 'desc';
   let collapsedOverrides = {{}};
+  let peerFoldModes = {{}};
+  let peerOpenOverrides = {{}};
   // Keep search-time toggles in memory so clearing search restores saved card states
   let searchCollapsedOverrides = {{}};
   // Track open inline reply-draft editors per card across periodic projection refreshes
@@ -1663,6 +2474,609 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     }}
   }}
 
+  const SVG_CHEVRON = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" '
+    + 'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+    + '<path d="M6 4l4 4-4 4"/></svg>';
+  const SVG_CHEVRON_SM = '<svg width="10" height="10" viewBox="0 0 16 16" fill="none" '
+    + 'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+    + '<path d="M6 4l4 4-4 4"/></svg>';
+
+  try {{
+    const rawFold = localStorage.getItem(PEER_FOLD_STORAGE_KEY);
+    if (rawFold) {{
+      const parsedFold = JSON.parse(rawFold);
+      if (parsedFold && typeof parsedFold === 'object') {{
+        peerFoldModes = parsedFold.modes || {{}};
+        peerOpenOverrides = parsedFold.overrides || {{}};
+      }}
+    }}
+  }} catch {{}}
+
+  // Persist per-card fold mode and per-peer overrides in localStorage
+  function savePeerFoldPrefs() {{
+    try {{
+      localStorage.setItem(
+        PEER_FOLD_STORAGE_KEY,
+        JSON.stringify({{ modes: peerFoldModes, overrides: peerOpenOverrides }})
+      );
+    }} catch {{}}
+  }}
+
+  const RE_EMOJI_PREFIX =
+    /^(?:[\\p{{Extended_Pictographic}}\\u2600-\\u27BF\\uFE0F\\u200D]+\\s*)+/u;
+  const RE_ORIGIN_PREFIX =
+    /^(?:[\\p{{Extended_Pictographic}}\\u2600-\\u27BF\\uFE0F\\u200D]+\\s*)*Origin:\\s*/iu;
+  const RE_CL_TITLE_PREFIX = new RegExp(
+    `^(?:${{[
+      /(?:gerrit:[^:\\s]+:\\d+|github_pr:[^:\\s]+:\\d+|piper:\\d+)/.source,
+      /(?:Gerrit|Skia)\\s+\\d+(?:\\s+PS\\d+)?/.source,
+      /PR\\s*#\\d+(?:\\s+PS\\d+)?/.source,
+      /\\d{{5,10}}/.source,
+    ].join('|')}})${{/(?:\\s*[:·-]\\s*|\\s*$)/.source}}`,
+    'i'
+  );
+
+  // Strip leading Unicode emoji/pictographs per ' · ' segment while preserving words and quotes
+  function cleanEmojiPrefix(s) {{
+    const raw = String(s || '').trim();
+    const cleaned = raw
+      .split(' · ')
+      .map((seg) => seg.trim().replace(RE_EMOJI_PREFIX, '').trim() || seg.trim())
+      .filter(Boolean)
+      .join(' · ');
+    return cleaned || raw;
+  }}
+
+  // Strip redundant Gerrit/PR/key prefixes from a CL title, falling back to state.subject
+  function cleanClSubject(rawTitle, ast, shortLabel) {{
+    const raw = String(rawTitle || '').trim();
+    const cleaned = raw.replace(RE_CL_TITLE_PREFIX, '').trim();
+    if (!cleaned || cleaned.toLowerCase() === String(shortLabel || '').toLowerCase()) {{
+      return String((ast && ast.subject) || '').trim();
+    }}
+    return cleaned;
+  }}
+
+  // Split 'Title — Counterparty' only when a verified artifact counterparty exists on the card
+  function splitCardHeadline(w) {{
+    const rawTitle = String((w && w.title) || '').trim();
+    const originKey = String((w && w.origin && w.origin.artifact_key) || '');
+    const ranked = [];
+    for (const a of ((w && w.artifacts) || [])) {{
+      if (!a || a.role === 'context_only') continue;
+      const cp = String((a.state && a.state.counterparty) || '').trim();
+      if (!cp) continue;
+      const akey = String(a.artifact_key || '');
+      const akind = String(a.kind || '');
+      const p0 = (originKey && akey === originKey) ? 0 : 1;
+      const p1 = (akind === 'github_pr' || akind === 'github_issue') ? 1 : 0;
+      const p2 = a.role === 'primary' ? 0 : 1;
+      ranked.push({{ score: p0 * 100 + p1 * 10 + p2, cp }});
+    }}
+    ranked.sort((x, y) => x.score - y.score);
+    const candidates = [];
+    const seen = new Set();
+    for (const item of ranked) {{
+      const low = item.cp.toLowerCase();
+      if (!seen.has(low)) {{
+        seen.add(low);
+        candidates.push(item.cp);
+      }}
+    }}
+    if (!candidates.length) return {{ headline: rawTitle, counterparty: '' }};
+    const bestCp = candidates[0];
+    const sepIdx = rawTitle.lastIndexOf(' — ');
+    if (sepIdx > 0) {{
+      const head = rawTitle.slice(0, sepIdx).trim();
+      const tail = rawTitle.slice(sepIdx + 3).trim();
+      if (head && tail) {{
+        const matched = candidates.find((c) => c.toLowerCase() === tail.toLowerCase());
+        if (matched) return {{ headline: head, counterparty: matched }};
+      }}
+    }}
+    return {{ headline: rawTitle, counterparty: bestCp }};
+  }}
+
+  // Condense verbose origin badge text into 'Origin · <meta>' while keeping full tooltip
+  function compactOriginLabel(o) {{
+    const raw = String((o && o.label) || '').trim();
+    if (!raw) return '';
+    const parenIdx = raw.lastIndexOf('(');
+    if (parenIdx > 0 && raw.endsWith(')')) {{
+      return 'Origin · ' + raw.slice(parenIdx + 1, -1);
+    }}
+    return 'Origin · ' + cleanEmojiPrefix(raw.replace(RE_ORIGIN_PREFIX, ''));
+  }}
+
+  // Format canonical issue keys into flutter#<N>, <owner>/<repo>#<N>, b/<N>, or crbug/<N>
+  function shortIssueId(art) {{
+    const akey = String((art && art.artifact_key) || '');
+    const parts = akey.split(':');
+    const tid = parts[parts.length - 1] || akey;
+    if (akey.startsWith('github_issue:') && parts.length >= 3) {{
+      return parts[1] !== 'flutter/flutter' ? `${{parts[1]}}#${{tid}}` : `flutter#${{tid}}`;
+    }}
+    if (akey.startsWith('buganizer:') && parts.length >= 2) {{
+      const bPfx = 'b' + '/';
+      return bPfx + tid;
+    }}
+    if (akey.startsWith('crbug:') && parts.length >= 2) {{
+      const crPfx = 'crbug' + '/';
+      return crPfx + tid;
+    }}
+    const t = String((art && art.title) || '');
+    const idx = t.indexOf(':');
+    return (idx > 0 ? t.slice(0, idx).trim() : t.trim()) || akey;
+  }}
+
+  // Split CL artifact key and label into compact link text and optional patchset tag
+  function shortClParts(akey, fallbackLabel) {{
+    const lbl = String(fallbackLabel || '');
+    const psMatch = lbl.match(/\\b(PS\\d+)\\b/);
+    const psTag = psMatch ? psMatch[1] : '';
+    const parts = String(akey || '').split(':');
+    if (akey.startsWith('gerrit:') && parts.length >= 3) {{
+      const proj = parts[1] === 'skia'
+        ? 'Skia'
+        : (parts[1].charAt(0).toUpperCase() + parts[1].slice(1));
+      return {{ shortLabel: `${{proj}} ${{parts[2]}}`, psTag }};
+    }}
+    if (akey.startsWith('github_pr:') && parts.length >= 3) {{
+      return {{ shortLabel: `PR #${{parts[2]}}`, psTag }};
+    }}
+    if (akey.startsWith('piper:') && parts.length >= 2) {{
+      const pfx = 'cl' + '/';
+      return {{ shortLabel: pfx + parts[1], psTag }};
+    }}
+    const clean = lbl.replace(/\\s+PS\\d+\\b/, '').trim();
+    return {{ shortLabel: clean || akey, psTag }};
+  }}
+
+  // Extract 5-to-10-digit CL/PR/Piper numeric tokens for cross-linking bugs and CLs
+  function extractClDigits(text) {{
+    return String(text || '').match(/\\b\\d{{5,10}}\\b/g) || [];
+  }}
+
+  // Normalize bug tokens from linked_bug_keys, linked_bugs, bug_ids, and commit_message
+  function normalizeBugKeyJs(rawKey) {{
+    const s = String(rawKey || '').trim();
+    if (!s) return '';
+    if (s.startsWith('github_issue:') || s.startsWith('buganizer:') || s.startsWith('crbug:')) {{
+      return s;
+    }}
+    const flMatch = s.match(/^flutter#(\\d+)$/i);
+    if (flMatch) return `github_issue:flutter/flutter:${{flMatch[1]}}`;
+    const ghMatch = s.match(/^([A-Za-z0-9_.-]+\\/[A-Za-z0-9_.-]+)#(\\d+)$/);
+    if (ghMatch) return `github_issue:${{ghMatch[1]}}:${{ghMatch[2]}}`;
+    const bPfx = 'b' + '/';
+    if (s.startsWith(bPfx) && /^\\d+$/.test(s.slice(2))) return `buganizer:${{s.slice(2)}}`;
+    const crPfx = 'crbug' + '/';
+    if (s.startsWith(crPfx) && /^\\d+$/.test(s.slice(6))) return `crbug:${{s.slice(6)}}`;
+    return s;
+  }}
+
+  // Extract canonical bug keys referenced by a CL state across metadata fields and commit message
+  function extractClBugKeysJs(ast) {{
+    const st = ast || {{}};
+    const out = new Set();
+    for (const k of (st.linked_bug_keys || [])) {{
+      const nk = normalizeBugKeyJs(k);
+      if (nk) out.add(nk);
+    }}
+    for (const lb of (st.linked_bugs || [])) {{
+      if (!lb || typeof lb !== 'object') continue;
+      if (lb.item_key) out.add(normalizeBugKeyJs(lb.item_key));
+      const num = String(lb.number || lb.id || lb.target_id || '').trim();
+      const repo = String(lb.repo || 'flutter/flutter').trim();
+      if (/^\\d+$/.test(num)) {{
+        if (String(lb.kind || '').includes('buganizer')) out.add(`buganizer:${{num}}`);
+        else if (String(lb.kind || '').includes('crbug')) out.add(`crbug:${{num}}`);
+        else out.add(`github_issue:${{repo}}:${{num}}`);
+      }}
+    }}
+    for (const bid of (st.bug_ids || [])) {{
+      const bs = String(bid || '').trim();
+      if (/^\\d+$/.test(bs)) {{
+        out.add(bs.length <= 6 ? `github_issue:flutter/flutter:${{bs}}` : `buganizer:${{bs}}`);
+      }}
+    }}
+    const cm = String(st.commit_message || '');
+    if (cm) {{
+      const ghIssueRe = /github\\.com\\/([^/\\s#]+\\/[^/\\s#]+)\\/issues\\/(\\d+)\\b/gi;
+      for (const m of cm.matchAll(ghIssueRe)) {{
+        out.add(`github_issue:${{m[1]}}:${{m[2]}}`);
+      }}
+      for (const m of cm.matchAll(/(?:flutter#|(?<![A-Za-z0-9_/])#)(\\d{{4,6}})\\b/gi)) {{
+        out.add(`github_issue:flutter/flutter:${{m[1]}}`);
+      }}
+      const bugUrlRe =
+        /(?:(?<![A-Za-z0-9_./-])b\\/|issuetracker\\.google\\.com\\/issues\\/)(\\d{{6,}})\\b/gi;
+      for (const m of cm.matchAll(bugUrlRe)) out.add(`buganizer:${{m[1]}}`);
+      const crbugRe = /(?:crbug\\.com\\/|issues\\.chromium\\.org\\/issues\\/)(\\d+)\\b/gi;
+      for (const m of cm.matchAll(crbugRe)) {{
+        out.add(`crbug:${{m[1]}}`);
+      }}
+    }}
+    return out;
+  }}
+
+  // Read normalized uppercase Gmail draft status, defaulting to DRAFT when unspecified
+  function gmailDraftStatus(a) {{
+    return String((a && a.state && a.state.status) || 'DRAFT').toUpperCase();
+  }}
+
+  // Return true when the card has a live inline reply draft or an active DRAFT Gmail draft
+  function hasParkedDraft(w) {{
+    if (w && w.reply_draft && String(w.reply_draft.body || '').trim()) return true;
+    return Boolean(
+      w && Array.isArray(w.artifacts) && w.artifacts.some(
+        (a) => a && a.role !== 'context_only'
+          && a.kind === 'gmail_draft' && gmailDraftStatus(a) === 'DRAFT'
+      )
+    );
+  }}
+
+  // Collect canonical keys and numeric CL IDs mentioned in active reply drafts on card w
+  function collectDraftMentionedTokens(w) {{
+    const keys = new Set();
+    const digits = new Set();
+    const addText = (txt) => {{
+      for (const d of extractClDigits(txt)) digits.add(d);
+    }};
+    const rd = w && w.reply_draft;
+    if (rd) {{
+      for (const k of (rd.mentioned_keys || [])) {{
+        keys.add(String(k));
+        addText(k);
+      }}
+      addText(rd.subject || '');
+      addText(rd.body || '');
+    }}
+    for (const a of ((w && w.artifacts) || [])) {{
+      if (!a || a.role === 'context_only' || a.kind !== 'gmail_draft') continue;
+      if (gmailDraftStatus(a) !== 'DRAFT') continue;
+      const ast = a.state || {{}};
+      for (const k of (ast.mentioned_keys || [])) {{
+        keys.add(String(k));
+        addText(k);
+      }}
+      addText(ast.body || ast.snippet || a.title || '');
+    }}
+    return {{ keys, digits }};
+  }}
+
+  // Convert checklist items into baseline peer entries and record covered artifact keys
+  function buildChecklistPeers(chkList, artByKey, covered) {{
+    const peers = [];
+    chkList.forEach((item, idx) => {{
+      const bkey = String(item.bug_key || '');
+      if (bkey) covered.add(bkey);
+      const clTokens = new Set();
+      const cls = (item.cls || []).map((c) => {{
+        const ckey = String(c.artifact_key || '');
+        if (ckey) {{
+          covered.add(ckey);
+          for (const d of extractClDigits(ckey)) clTokens.add(d);
+        }}
+        const art = artByKey.get(ckey) || {{}};
+        const ast = art.state || {{}};
+        const {{ shortLabel, psTag }} = shortClParts(ckey, c.label || ckey);
+        const finalPs = psTag || (ast.patchset ? `PS${{ast.patchset}}` : '');
+        let whyBadge = String(art.why_badge || '');
+        if (item.short_id && whyBadge === `фикс ${{item.short_id}}`) whyBadge = '';
+        const mergedRolls = (c.rolls && Object.keys(c.rolls).length)
+          ? c.rolls
+          : ((ast.post_submit && ast.post_submit.rolls) || ast.rolls || {{}});
+        return {{
+          artifact_key: ckey,
+          shortLabel,
+          psTag: finalPs,
+          url: c.url || art.url || '#',
+          subject: cleanClSubject(c.subject || '', ast, shortLabel),
+          status: String(c.status || ast.status || ''),
+          is_wip: Boolean(c.is_wip || ast.is_draft),
+          wip_label: String(c.wip_label || (ast.is_draft ? 'Draft' : '')),
+          merge_conflict: Boolean(c.merge_conflict),
+          assigned_reviewers_count: c.assigned_reviewers_count ?? 1,
+          in_draft: c.in_draft !== false,
+          is_stacked: Boolean(c.is_stacked),
+          updated_et: String(c.updated_et || ''),
+          rolls: mergedRolls,
+          why_badge: whyBadge,
+        }};
+      }});
+      peers.push({{
+        peerKey: bkey || `chk:${{idx}}`,
+        bugKey: bkey,
+        shortId: String(item.short_id || bkey),
+        title: String(item.title || ''),
+        url: String(item.url || '#'),
+        bugStatus: String(item.bug_status || 'OPEN'),
+        stage: String(item.stage || ''),
+        stageTone: String(item.stage_tone || 'muted'),
+        stageLabel: cleanEmojiPrefix(item.stage_label || item.stage || ''),
+        draftOutdated: Boolean(item.draft_outdated),
+        extraIssues: [],
+        cls,
+        clTokens,
+        fromChecklist: true,
+      }});
+    }});
+    return peers;
+  }}
+
+  // Attach companion bugs sharing a CL onto existing peers or promote allowed bug roles
+  function attachOrPromoteBugs(arts, artByKey, peers, covered, promoteRoles) {{
+    const bugKinds = ['github_issue', 'buganizer', 'crbug'];
+    for (const a of arts) {{
+      if (!a || a.role === 'context_only') continue;
+      const akey = String(a.artifact_key || '');
+      if (!akey || covered.has(akey) || !bugKinds.includes(a.kind)) continue;
+      const ast = a.state || {{}};
+      const refTokens = new Set(extractClDigits(a.why_badge || ''));
+      for (const lc of (ast.linked_cls || [])) {{
+        if (!lc) continue;
+        for (const d of extractClDigits(`${{lc.target_id || ''}} ${{lc.item_key || ''}}`)) {{
+          refTokens.add(d);
+        }}
+      }}
+      let matchedPeer = null;
+      for (const p of peers) {{
+        for (const tok of refTokens) {{
+          if (p.clTokens.has(tok)) {{
+            matchedPeer = p;
+            break;
+          }}
+        }}
+        if (matchedPeer) break;
+        for (const c of p.cls) {{
+          const clArt = artByKey.get(c.artifact_key);
+          const lbugs = extractClBugKeysJs(clArt && clArt.state);
+          if (lbugs.has(akey)) {{
+            matchedPeer = p;
+            break;
+          }}
+        }}
+        if (matchedPeer) break;
+      }}
+      if (matchedPeer) {{
+        matchedPeer.extraIssues.push({{
+          artifact_key: akey,
+          shortId: shortIssueId(a),
+          url: String(a.url || '#'),
+          title: String(a.title || ''),
+        }});
+        covered.add(akey);
+      }} else if (promoteRoles.includes(a.role)) {{
+        const sid = shortIssueId(a);
+        const rawT = String(a.title || '');
+        const colonIdx = rawT.indexOf(':');
+        const cleanT = colonIdx > 0 ? rawT.slice(colonIdx + 1).trim() : rawT;
+        const stStr = String(ast.status || 'Open');
+        peers.push({{
+          peerKey: akey,
+          bugKey: akey,
+          shortId: sid,
+          title: cleanT,
+          url: String(a.url || '#'),
+          bugStatus: stStr,
+          stage: 'open',
+          stageTone: 'muted',
+          stageLabel: cleanEmojiPrefix(stStr),
+          draftOutdated: false,
+          extraIssues: [],
+          cls: [],
+          clTokens: new Set(),
+          fromChecklist: false,
+        }});
+        covered.add(akey);
+      }}
+    }}
+  }}
+
+  // Recompute stage badges on promoted non-checklist bug peers once uncovered CLs attach
+  function refreshNonChecklistPeerStages(peers) {{
+    for (const p of peers) {{
+      if (p.fromChecklist || !p.bugKey || !p.cls.length) continue;
+      if (p.cls.some((c) => c.merge_conflict)) {{
+        p.stage = 'wip';
+        p.stageTone = 'urgent';
+        p.stageLabel = 'Merge conflict';
+      }} else if (p.cls.some((c) => c.is_wip)) {{
+        p.stage = 'wip';
+        p.stageTone = 'warn';
+        p.stageLabel = 'WIP';
+      }} else if (p.cls.every((c) => c.status === 'MERGED' || c.status === 'SUBMITTED')) {{
+        p.stage = 'merged';
+        p.stageTone = 'ok';
+        p.stageLabel = 'Merged';
+      }} else {{
+        p.stage = 'review';
+        p.stageTone = 'wait';
+        p.stageLabel = 'In review';
+      }}
+    }}
+  }}
+
+  // Attach uncovered primary/channel CL, PR, and Piper artifacts onto peers or promote them
+  function attachUncoveredCls(w, arts, peers, covered, hasDraft, draftTokens) {{
+    const clKinds = ['gerrit', 'github_pr', 'piper'];
+    const uncoveredCls = arts
+      .filter((a) => a && a.role !== 'context_only'
+        && clKinds.includes(a.kind) && !covered.has(String(a.artifact_key || '')))
+      .sort((a, b) => (a.role === 'primary' ? 0 : 1) - (b.role === 'primary' ? 0 : 1));
+
+    for (const a of uncoveredCls) {{
+      const akey = String(a.artifact_key || '');
+      if (!akey || covered.has(akey)) continue;
+      const ast = a.state || {{}};
+      const {{ shortLabel, psTag }} = shortClParts(akey, a.title || akey);
+      const finalPs = psTag || (ast.patchset ? `PS${{ast.patchset}}` : '');
+      const subj = cleanClSubject(a.title || '', ast, shortLabel);
+      const whyBadge = String(a.why_badge || '');
+      const mergedRolls = (ast.post_submit && ast.post_submit.rolls) || ast.rolls || {{}};
+      const isWip = Boolean(ast.is_wip || ast.is_draft);
+      const wipLbl = String(
+        ast.wip_label || (ast.is_draft ? 'Draft' : (ast.is_wip ? 'WIP' : ''))
+      );
+      const keyDigits = extractClDigits(akey);
+      const inDraft = !hasDraft
+        || draftTokens.keys.has(akey)
+        || keyDigits.some((d) => draftTokens.digits.has(d));
+      const clEntry = {{
+        artifact_key: akey,
+        shortLabel,
+        psTag: finalPs,
+        url: String(a.url || '#'),
+        subject: subj,
+        status: String(ast.status || ''),
+        is_wip: isWip,
+        wip_label: wipLbl,
+        merge_conflict: Boolean(ast.merge_conflict),
+        assigned_reviewers_count: ast.assigned_reviewers_count ?? 1,
+        in_draft: inDraft,
+        is_stacked: Boolean(ast.is_stacked),
+        updated_et: String(ast.updated_et || ast.status_changed_et || ast.last_msg_et || ''),
+        rolls: mergedRolls,
+        why_badge: whyBadge,
+      }};
+      const lbugs = extractClBugKeysJs(ast);
+      const whyTokens = extractClDigits(whyBadge);
+      let targetPeer = null;
+      for (const p of peers) {{
+        if (p.bugKey && lbugs.has(p.bugKey)) {{
+          targetPeer = p;
+          break;
+        }}
+        if (p.shortId && whyBadge.includes(p.shortId)) {{
+          targetPeer = p;
+          break;
+        }}
+        if (whyTokens.some((tok) => p.clTokens.has(tok))) {{
+          targetPeer = p;
+          break;
+        }}
+      }}
+      if (!targetPeer && a.role === 'primary') {{
+        const openBugPeers = peers.filter(
+          (p) => p.bugKey && p.bugStatus.toUpperCase() !== 'CLOSED'
+        );
+        if (openBugPeers.length === 1) targetPeer = openBugPeers[0];
+      }}
+      if (targetPeer) {{
+        targetPeer.cls.push(clEntry);
+        for (const d of keyDigits) targetPeer.clTokens.add(d);
+      }} else {{
+        const stStr = String(ast.status || 'OPEN');
+        const isDoneSt = stStr === 'MERGED' || stStr === 'SUBMITTED';
+        let sTone = 'wait';
+        let sLbl = 'In review';
+        if (ast.merge_conflict) {{
+          sTone = 'urgent';
+          sLbl = 'Merge conflict';
+        }} else if (isDoneSt) {{
+          sTone = 'ok';
+          sLbl = 'Merged';
+        }} else if (isWip) {{
+          sTone = 'warn';
+          sLbl = wipLbl || 'WIP';
+        }}
+        peers.push({{
+          peerKey: akey,
+          bugKey: '',
+          shortId: shortLabel,
+          title: subj,
+          url: String(a.url || '#'),
+          bugStatus: 'OPEN',
+          stage: stStr.toLowerCase(),
+          stageTone: sTone,
+          stageLabel: sLbl,
+          draftOutdated: false,
+          extraIssues: [],
+          cls: [clEntry],
+          clTokens: new Set(keyDigits),
+          fromChecklist: false,
+        }});
+      }}
+      covered.add(akey);
+    }}
+  }}
+
+  // Run 4-phase peer assembly across checklist rows, primary bugs, CLs, and companion bugs
+  function buildDeliverablePeers(w, hasDraft) {{
+    const arts = (w && w.artifacts) || [];
+    const artByKey = new Map();
+    for (const a of arts) {{
+      if (a && a.artifact_key) artByKey.set(String(a.artifact_key), a);
+    }}
+    const activeDraft = typeof hasDraft === 'boolean' ? hasDraft : hasParkedDraft(w);
+    const draftTokens = activeDraft
+      ? collectDraftMentionedTokens(w)
+      : {{ keys: new Set(), digits: new Set() }};
+    const covered = new Set();
+    const peers = buildChecklistPeers((w && w.checklist) || [], artByKey, covered);
+    attachOrPromoteBugs(arts, artByKey, peers, covered, ['primary']);
+    attachUncoveredCls(w, arts, peers, covered, activeDraft, draftTokens);
+    refreshNonChecklistPeerStages(peers);
+    attachOrPromoteBugs(arts, artByKey, peers, covered, ['primary', 'channel']);
+    return {{ peers, covered, artByKey }};
+  }}
+
+  // Return true when any CL in the peer needs action (conflict, WIP, 0 reviewers, draft lag)
+  function peerNeedsAttention(w, peer, hasDraft) {{
+    if (peer.draftOutdated) return true;
+    for (const c of peer.cls) {{
+      if (c.merge_conflict || c.is_wip) return true;
+      if (c.status === 'NEW' && Number(c.assigned_reviewers_count ?? 1) === 0) return true;
+      if (hasDraft && c.in_draft === false) return true;
+    }}
+    return false;
+  }}
+
+  // Compute baseline open state for a peer under Smart, All, or None mode without overrides
+  function defaultPeerOpen(w, peer, hasDraft) {{
+    const wid = String((w && w.work_id) || '');
+    const mode = peerFoldModes[wid] || 'smart';
+    if (mode === 'folded') return false;
+    if (mode === 'expanded') return true;
+    if (peer.bugStatus.toUpperCase() === 'CLOSED' && peer.cls.length === 0) return false;
+    if (peerNeedsAttention(w, peer, hasDraft)) return true;
+    if ((w && w.lane) === 'needs-you' && peer.cls.length > 0) return true;
+    return false;
+  }}
+
+  // Compute expanded/folded state of a peer row honoring manual per-peer overrides
+  function isPeerOpen(w, peer, hasDraft) {{
+    const wid = String((w && w.work_id) || '');
+    const ovKey = `${{wid}}::${{peer.peerKey}}`;
+    if (Object.prototype.hasOwnProperty.call(peerOpenOverrides, ovKey)) {{
+      return Boolean(peerOpenOverrides[ovKey]);
+    }}
+    return defaultPeerOpen(w, peer, hasDraft);
+  }}
+
+  // Group multi-piece handoff chains sharing a real title while keeping raw Chat <hex> distinct
+  function groupChatChains(chatArts) {{
+    const seenCids = new Set();
+    const groups = new Map();
+    for (const a of chatArts) {{
+      const cid = String((a.state && a.state.cascade_id) || a.artifact_key.split(':').pop());
+      if (!cid || seenCids.has(cid)) continue;
+      seenCids.add(cid);
+      const rawTitle = String(a.title || '').trim();
+      const isRaw = /^Chat\\s+[0-9a-f]{{6,}}$/i.test(rawTitle);
+      const gKey = isRaw ? `raw:${{a.artifact_key}}` : `title:${{rawTitle.toLowerCase()}}`;
+      if (!groups.has(gKey)) {{
+        groups.set(gKey, {{
+          label: rawTitle || cid.slice(0, 8),
+          items: [],
+        }});
+      }}
+      groups.get(gKey).items.push({{ cid, artifact_key: a.artifact_key, title: rawTitle }});
+    }}
+    return Array.from(groups.values());
+  }}
+
   function renderRollDots(art) {{
     const st = (art && art.state) || {{}};
     const rolls = st.rolls;
@@ -1677,17 +3091,604 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     for (const [k, short] of map) {{
       if (k in rolls) {{
         const r = rolls[k];
-        const rolled = typeof r === 'boolean' ? r : Boolean(r && r.rolled);
-        items.push(`<span class="wb-roll-dot" data-rolled="${{rolled}}" title="${{k}}: ${{rolled ? 'rolled' : 'pending'}}">${{short}}</span>`);
+        const rolled = typeof r === 'boolean'
+          ? r
+          : Boolean(r && (r.rolled || r.state === '✓'));
+        items.push(
+          `<span class="wb-roll-dot" data-rolled="${{rolled}}" `
+          + `title="${{k}}: ${{rolled ? 'rolled' : 'pending'}}">${{short}}</span>`
+        );
       }}
     }}
     return items.length ? `<span class="wb-rolls">${{items.join('')}}</span>` : '';
   }}
 
+  // Return true when an artifact is a correspondence thread, doc, or Gmail draft
+  function isCorrArt(a) {{
+    if (!a) return false;
+    if (['gmail_thread', 'gmail_draft', 'gchat_thread', 'gdoc_thread'].includes(a.kind)) {{
+      return true;
+    }}
+    return a.kind === 'gdoc' && Boolean(a.state && a.state.is_active_correspondence);
+  }}
+
+  // Render the editorial eyebrow, deduplicated headline, and collapsed summary for card w
+  function renderCardHeader(w, peers, totalPeerCls, attentionPeers, hasDraft, openObs) {{
+    let statusPillHtml = '';
+    if (w.lane === 'needs-you') {{
+      statusPillHtml = (
+        '<span class="re-status-pill" data-tone="urgent">'
+        + '<span class="re-dot"></span>Needs You</span>'
+      );
+    }} else if (w.lane === 'done') {{
+      statusPillHtml = '<span class="re-status-pill" data-tone="ready">✅ Done</span>';
+    }} else if (w.lane === 'on-desk') {{
+      statusPillHtml = (
+        '<span class="re-status-pill" data-tone="warn">'
+        + '<span class="re-dot"></span>On Desk</span>'
+      );
+    }} else if (attentionPeers > 0 && peers.length > 0) {{
+      const parkedSfx = hasDraft ? ' · Parked' : '';
+      statusPillHtml = (
+        `<span class="re-status-pill" data-tone="warn">`
+        + `<span class="re-dot"></span>Action ${{attentionPeers}}/${{peers.length}}`
+        + `${{parkedSfx}}</span>`
+      );
+    }} else {{
+      statusPillHtml = (
+        '<span class="re-status-pill" data-tone="wait">'
+        + '<span class="re-dot"></span>Waiting</span>'
+      );
+    }}
+
+    const {{ headline, counterparty }} = splitCardHeadline(w);
+    const cpHtml = counterparty
+      ? `<span class="re-counterparty">${{esc(counterparty)}}</span>`
+      : '';
+
+    let originRowHtml = '';
+    if (w.origin && w.origin.label) {{
+      const o = w.origin;
+      const shortOrig = compactOriginLabel(o);
+      const fullOrig = esc(o.label);
+      let inner = '';
+      if (o.kind === 'chat_chain') {{
+        const ocid = String(o.artifact_key || '').split(':').pop();
+        inner = `<a class="wb-origin" href="#" data-open-chat="${{esc(ocid)}}" `
+          + `title="${{fullOrig}}">${{esc(shortOrig)}}</a>`;
+      }} else if (o.url) {{
+        inner = `<a class="wb-origin" href="${{esc(o.url)}}" target="_blank" rel="noopener" `
+          + `title="${{fullOrig}}">${{esc(shortOrig)}}</a>`;
+      }} else {{
+        inner = `<span class="wb-origin" title="${{fullOrig}}">${{esc(shortOrig)}}</span>`;
+      }}
+      originRowHtml = `<div class="wb-origin-row">${{inner}}</div>`;
+    }}
+
+    const projLabel = (w.project_id && !/^[0-9a-f]{{8}}-[0-9a-f]{{4}}-/i.test(w.project_id))
+      ? `<span>${{esc(w.project_id)}}</span>`
+      : '';
+    const roadmapTag = w.roadmap_item_key ? `<span>${{esc(w.roadmap_item_key)}}</span>` : '';
+
+    // Surface creation date directly in Age mode, and expose it as a hover tooltip otherwise
+    const actEt = String(w.activity_et || w.updated_et || '');
+    const origEt = String(w.origin_et || '');
+    let timeMetaHtml = `<span>${{esc(actEt)}}</span>`;
+    if (sortMode === 'age' && origEt) {{
+      const ageTxt = (actEt && actEt !== origEt)
+        ? `Opened ${{esc(origEt)}} · Active ${{esc(actEt)}}`
+        : `Opened ${{esc(origEt)}}`;
+      timeMetaHtml = `<span>${{ageTxt}}</span>`;
+    }} else if (origEt && origEt !== actEt) {{
+      timeMetaHtml = `<span title="Opened ${{esc(origEt)}}">${{esc(actEt)}}</span>`;
+    }}
+
+    const headlineSubHtml = peers.length > 0
+      ? `<span class="re-headline-sub">${{peers.length}} deliverable`
+        + `${{peers.length === 1 ? '' : 's'}}`
+        + `${{totalPeerCls ? ` · ${{totalPeerCls}} CL${{totalPeerCls === 1 ? '' : 's'}}` : ''}}`
+        + `</span>`
+      : '';
+
+    const firstReason = (w.reasons && w.reasons.length) ? cleanEmojiPrefix(w.reasons[0]) : '';
+    const firstProg = (openObs.length && openObs[0].progress_summary)
+      ? String(openObs[0].progress_summary)
+      : '';
+    const collapsedSummaryTxt = [firstReason, firstProg].filter(Boolean).join(' · ');
+    const collapsedSummaryHtml = collapsedSummaryTxt
+      ? `<div class="re-collapsed-summary">${{esc(collapsedSummaryTxt)}}</div>`
+      : '';
+
+    return `
+      <div class="wb-card-hdr" data-toggle-card="${{esc(w.work_id)}}">
+        <div class="wb-hdr-stack">
+          <div class="re-eyebrow">
+            <div class="re-eyebrow-left">
+              ${{statusPillHtml}}
+              ${{cpHtml}}
+              ${{originRowHtml}}
+              ${{projLabel}}
+              ${{roadmapTag}}
+            </div>
+            <div class="re-eyebrow-right">
+              ${{timeMetaHtml}}
+              <span class="re-chevron" aria-hidden="true"
+                    title="Click to toggle · Alt-click to toggle all visible cards"
+                    >${{SVG_CHEVRON}}</span>
+            </div>
+          </div>
+          <div class="re-headline-row">
+            <div class="wb-card-title re-headline"
+                 title="${{esc(w.title)}}">${{esc(headline)}}</div>
+            ${{headlineSubHtml}}
+          </div>
+          ${{collapsedSummaryHtml}}
+        </div>
+      </div>
+    `;
+  }}
+
+  // Render one open correspondence/action obligation row with ambiguity and wait controls
+  function renderObligationRow(o) {{
+    const isDraftOb = String(o.target_artifact_key || '').startsWith('gmail_draft:');
+    const waitTag = o.wb_reply_draft
+      ? '<span style="color:var(--accent);font-weight:600">Parked reply note</span>'
+      : (isDraftOb
+          ? '<span style="color:var(--accent);font-weight:600">Parked draft</span>'
+          : '<span style="color:var(--accent);font-weight:600">Waiting</span>');
+    let readyTag = '<strong style="color:var(--ready)">READY</strong>';
+    if (o.correspondence_mode === 'silence_ping') {{
+      readyTag = '<strong style="color:var(--warn)">⏰ 7d SILENCE PING</strong>';
+    }} else if (o.correspondence_mode === 'inbound_reply') {{
+      readyTag = '<strong style="color:var(--urgent)">📨 NEEDS REPLY</strong>';
+    }}
+    const statusTag = o.status === 'ready'
+      ? readyTag
+      : (o.stalled_alert
+          ? '<strong style="color:var(--urgent)">STALLED &gt;7d</strong>'
+          : waitTag);
+    const progHtml = o.progress_summary
+      ? `<div class="wb-ob-prog">${{esc(o.progress_summary)}}</div>`
+      : '';
+    const ambigHtml = o.ambiguity_prompt
+      ? `<div class="wb-ob-ambig">
+           <span>${{esc(o.ambiguity_prompt)}}</span>
+           <div class="wb-ob-btns">
+             <button class="wb-btn" data-ob-keep="${{esc(o.obligation_id)}}"
+                     data-ob-event="${{esc(o.ambiguity_event_key || '')}}"
+                     type="button">Оставить обязательство</button>
+             <button class="wb-btn" data-ob-close-topic="${{esc(o.obligation_id)}}"
+                     data-ob-event="${{esc(o.ambiguity_event_key || '')}}"
+                     type="button">Тема закрыта ✓</button>
+           </div>
+         </div>`
+      : '';
+    const waitBtnHtml = (o.kind === 'correspondence' && o.status === 'ready')
+      ? `<button class="wb-btn" data-ob-wait="${{esc(o.obligation_id)}}"
+                 title="Ответила устно / в другом канале — перевести в ожидание (7д)"
+                 type="button">Ответила → жду</button>`
+      : '';
+    return `
+      <div class="wb-ob re-loop-row" data-status="${{esc(o.status)}}"
+           data-stalled="${{Boolean(o.stalled_alert)}}"
+           title="Trigger: ${{esc(o.trigger_expr)}}">
+        <div class="wb-ob-main">
+          <div>${{statusTag}} · ${{esc(o.description)}}</div>
+          ${{progHtml}}
+          ${{ambigHtml}}
+        </div>
+        <div class="wb-ob-btns">
+          ${{waitBtnHtml}}
+          <button class="wb-btn" data-ob-done="${{esc(o.obligation_id)}}"
+                  type="button">✓</button>
+        </div>
+      </div>
+    `;
+  }}
+
+  // Render inline reply-draft editor or preview with Gmail materialization and sync strip
+  function renderReplyDraftBox(w, syncStripHtml) {{
+    const rd = w.reply_draft || null;
+    const isEditingDraft = Boolean(!w.is_virtual && openDraftEditors[w.work_id]);
+    if (isEditingDraft) {{
+      const edState = openDraftEditors[w.work_id];
+      const hasSnap = edState && typeof edState === 'object' && edState.initialized;
+      const initBody = hasSnap ? String(edState.body ?? '') : (rd ? String(rd.body || '') : '');
+      const initAg = hasSnap ? Boolean(edState.autoGate) : (rd ? Boolean(rd.auto_gate) : true);
+      const lblStyle = 'font-size:11px;color:var(--muted);display:inline-flex;'
+        + 'align-items:center;gap:4px';
+      return `
+        <div class="wb-reply-draft">
+          <div class="wb-reply-draft-hdr"><span>Edit live reply draft</span></div>
+          <textarea class="wb-reply-textarea" id="wb-draft-ta-${{esc(w.work_id)}}"
+                    placeholder="HTML or plain-text reply note...">${{esc(initBody)}}</textarea>
+          ${{syncStripHtml}}
+          <div class="wb-actions" style="justify-content:space-between;flex-wrap:wrap">
+            <label style="${{lblStyle}}">
+              <input type="checkbox" id="wb-draft-ag-${{esc(w.work_id)}}"
+                     ${{initAg ? 'checked' : ''}}>
+              Auto-gate on primary CLs/bugs
+            </label>
+            <div class="wb-ob-btns">
+              <button class="wb-btn" data-cancel-draft="${{esc(w.work_id)}}"
+                      type="button">Cancel</button>
+              <button class="wb-btn wb-btn-primary" data-save-draft="${{esc(w.work_id)}}"
+                      type="button">Save</button>
+            </div>
+          </div>
+        </div>
+      `;
+    }}
+    if (!rd || !rd.body) return '';
+    const rawMatUrl = String(rd.materialized_url || '');
+    const safeMatUrl = /^https?:\\/\\//i.test(rawMatUrl) ? esc(rawMatUrl) : '';
+    let matBtns = '';
+    if (safeMatUrl && !rd.needs_rematerialize) {{
+      matBtns = `<a class="wb-btn wb-btn-primary" href="${{safeMatUrl}}"`
+        + ` target="_blank" rel="noopener"`
+        + ` style="text-decoration:none">Open Gmail draft ↗</a>`;
+    }} else if (safeMatUrl && rd.needs_rematerialize) {{
+      matBtns = `
+        <button class="wb-btn wb-btn-primary" data-mat-draft="${{esc(w.work_id)}}"
+                data-force-new="true" type="button">Sync Gmail draft</button>
+        <a class="wb-btn" href="${{safeMatUrl}}" target="_blank" rel="noopener"
+           style="text-decoration:none">Old tab ↗</a>
+      `;
+    }} else {{
+      matBtns = `<button class="wb-btn wb-btn-primary" data-mat-draft="${{esc(w.work_id)}}"`
+        + ` type="button">Create Gmail draft</button>`;
+    }}
+    return `
+      <div class="wb-reply-draft">
+        <div class="wb-reply-draft-hdr">
+          <span>Live reply draft · ${{esc(rd.updated_et || '')}}</span>
+          <div class="wb-ob-btns">
+            ${{matBtns}}
+            <button class="wb-btn" data-edit-draft="${{esc(w.work_id)}}"
+                    type="button">Edit</button>
+            <button class="wb-btn" data-clear-draft="${{esc(w.work_id)}}"
+                    type="button">Clear</button>
+          </div>
+        </div>
+        <div class="wb-reply-draft-body">${{renderDraftPreview(rd)}}</div>
+        ${{syncStripHtml}}
+      </div>
+    `;
+  }}
+
+  // Render Band 1 combining obligations, correspondence threads/drafts, and inline draft composer
+  function renderLoopBand(w, openObs, peers, hasDraft) {{
+    const obsItemsHtml = openObs.map(renderObligationRow).join('');
+    const obsHtml = obsItemsHtml ? `<div class="wb-obs">${{obsItemsHtml}}</div>` : '';
+    const corrPills = (w.artifacts || []).filter(
+      (a) => a.role !== 'context_only' && isCorrArt(a)
+        && !(a.kind === 'gmail_draft' && gmailDraftStatus(a) === 'DISCARDED')
+    );
+    const corrRowsHtml = corrPills.map((a) => {{
+      const cutBtn = !w.is_virtual
+        ? `<button class="re-unlink wb-cut" title="Detach from Work" `
+          + `data-unlink-work="${{esc(w.work_id)}}" `
+          + `data-unlink-key="${{esc(a.artifact_key)}}" type="button">×</button>`
+        : '';
+      const msgCnt = a.state && a.state.message_count
+        ? `<span class="re-msg-cnt">(${{esc(a.state.message_count)}}) ↗</span>`
+        : '';
+      const sentTag = (a.kind === 'gmail_draft' && gmailDraftStatus(a) === 'SENT')
+        ? '<span style="color:var(--ready);font-size:10px;font-weight:600">[SENT]</span>'
+        : '';
+      const whySpan = a.why_badge ? `<span class="wb-why">· ${{esc(a.why_badge)}}</span>` : '';
+      return `
+        <div class="re-corr-row" data-kind="${{esc(a.kind)}}" data-role="${{esc(a.role)}}">
+          <a class="re-corr-link" href="${{esc(a.url || '#')}}"
+             target="_blank" rel="noopener">${{esc(a.title)}}</a>
+          ${{sentTag}}
+          ${{whySpan}}
+          ${{msgCnt}}
+          ${{cutBtn}}
+        </div>
+      `;
+    }}).join('');
+    const corrHtml = corrRowsHtml ? `<div class="wb-correspondence">${{corrRowsHtml}}</div>` : '';
+
+    const missingDraftCls = [];
+    if (hasDraft) {{
+      for (const p of peers) {{
+        for (const c of p.cls) {{
+          if (c.in_draft === false) missingDraftCls.push(c.shortLabel);
+        }}
+      }}
+    }}
+    const syncStripHtml = missingDraftCls.length
+      ? `<div class="re-sync-strip"><span>Not in draft yet: `
+        + `<strong>${{esc(missingDraftCls.join(', '))}}</strong></span></div>`
+      : '';
+    const replyDraftHtml = renderReplyDraftBox(w, syncStripHtml);
+    if (!obsHtml && !corrHtml && !replyDraftHtml) return '';
+    return `<div class="re-band">${{obsHtml}}${{corrHtml}}${{replyDraftHtml}}</div>`;
+  }}
+
+  // Render one CL/PR row inside an expanded peer spine without duplicating standalone titles
+  function renderPeerSpineClRow(w, peer, c, hasDraft) {{
+    const psBadge = c.psTag ? `<span class="re-ps">${{esc(c.psTag)}}</span>` : '';
+    const wipBadge = c.is_wip
+      ? `<span class="wb-cl-tag" style="background:#fffbeb;color:var(--warn)">`
+        + `${{esc(c.wip_label || 'WIP')}}</span>`
+      : '';
+    const noRevBadge = (
+      !c.is_wip && c.status === 'NEW' && Number(c.assigned_reviewers_count ?? 1) === 0
+    )
+      ? '<span class="wb-cl-tag" style="background:#fffbeb;color:var(--warn)">no reviewers</span>'
+      : '';
+    const stackBadge = c.is_stacked
+      ? '<span class="wb-cl-tag" style="background:#f1f5f9;color:var(--muted)">stacked</span>'
+      : '';
+    const confBadge = c.merge_conflict
+      ? '<span class="wb-cl-tag" style="background:#fff2f1;color:var(--urgent)">conflict</span>'
+      : '';
+    const draftMissBadge = (hasDraft && c.in_draft === false)
+      ? '<span class="wb-cl-tag" style="background:#fffbeb;color:var(--warn)">not in draft</span>'
+      : '';
+    const isStandaloneDup = (
+      peer.bugKey === '' && peer.cls.length === 1 && c.subject === peer.title
+    );
+    const subjSpan = (c.subject && c.subject !== c.shortLabel && !isStandaloneDup)
+      ? `<span class="wb-cl-subj">${{esc(c.subject)}}</span>`
+      : '';
+    const whySpan = c.why_badge ? `<span class="wb-why">· ${{esc(c.why_badge)}}</span>` : '';
+    const updSpan = c.updated_et
+      ? `<span style="color:var(--muted);font-size:10px">${{esc(c.updated_et)}}</span>`
+      : '';
+    const clCutBtn = !w.is_virtual
+      ? `<button class="re-unlink wb-cut" title="Detach CL from Work" `
+        + `data-unlink-work="${{esc(w.work_id)}}" `
+        + `data-unlink-key="${{esc(c.artifact_key)}}" type="button">×</button>`
+      : '';
+    return `
+      <div class="wb-cl-chip re-cl-row">
+        <a class="re-cl-link" href="${{esc(c.url || '#')}}"
+           target="_blank" rel="noopener">${{esc(c.shortLabel)}}</a>
+        ${{psBadge}}
+        ${{subjSpan}}
+        ${{confBadge}}${{wipBadge}}${{noRevBadge}}${{draftMissBadge}}${{stackBadge}}
+        ${{renderRollDots({{ state: {{ rolls: c.rolls }} }})}}
+        ${{whySpan}}
+        ${{updSpan}}
+        ${{clCutBtn}}
+      </div>
+    `;
+  }}
+
+  // Render Band 2 containing Smart/All/None fold controls and co-equal deliverable peers
+  function renderDeliverablesBand(w, peers, artByKey, hasDraft) {{
+    if (!peers.length) return '';
+    const curFoldMode = peerFoldModes[w.work_id] || 'smart';
+    const foldBarHtml = peers.length > 1
+      ? `<div class="re-fold-bar" role="group" aria-label="Peer fold mode">
+           <button class="re-fold-btn" type="button"
+                   data-fold-mode="smart" data-fold-work="${{esc(w.work_id)}}"
+                   data-active="${{curFoldMode === 'smart'}}">Smart</button>
+           <button class="re-fold-btn" type="button"
+                   data-fold-mode="folded" data-fold-work="${{esc(w.work_id)}}"
+                   data-active="${{curFoldMode === 'folded'}}">All</button>
+           <button class="re-fold-btn" type="button"
+                   data-fold-mode="expanded" data-fold-work="${{esc(w.work_id)}}"
+                   data-active="${{curFoldMode === 'expanded'}}">None</button>
+         </div>`
+      : '';
+    const peerRowsHtml = peers.map((peer) => {{
+      const peerOpen = isPeerOpen(w, peer, hasDraft);
+      const extraHtml = peer.extraIssues.map((ex) => {{
+        const exCut = (!w.is_virtual && artByKey.has(ex.artifact_key))
+          ? `<button class="re-unlink wb-cut" title="Detach companion bug" `
+            + `data-unlink-work="${{esc(w.work_id)}}" `
+            + `data-unlink-key="${{esc(ex.artifact_key)}}" type="button">×</button>`
+          : '';
+        return `<span class="re-extra-wrap"><a class="re-extra-bug" href="${{esc(ex.url)}}" `
+          + `target="_blank" rel="noopener" title="${{esc(ex.title)}}">+${{esc(ex.shortId)}}</a>`
+          + `${{exCut}}</span>`;
+      }}).join('');
+      const foldedClsHtml = peer.cls
+        .filter((c) => !(peer.bugKey === '' && c.artifact_key === peer.peerKey))
+        .map((c) => {{
+          const confCls = c.merge_conflict ? ' is-conflict' : '';
+          return `<a class="re-folded-cl${{confCls}}" href="${{esc(c.url || '#')}}" `
+            + `target="_blank" rel="noopener">${{esc(c.shortLabel)}}</a>`;
+        }}).join('');
+      const peerUnlinkKey = peer.bugKey || (peer.cls[0] && peer.cls[0].artifact_key) || '';
+      const peerCutBtn = (!w.is_virtual && peerUnlinkKey && artByKey.has(peerUnlinkKey))
+        ? `<button class="re-unlink wb-cut" title="Detach from Work" `
+          + `data-unlink-work="${{esc(w.work_id)}}" `
+          + `data-unlink-key="${{esc(peerUnlinkKey)}}" type="button">×</button>`
+        : '';
+      const spineClsHtml = peer.cls.length
+        ? peer.cls.map((c) => renderPeerSpineClRow(w, peer, c, hasDraft)).join('')
+        : '<div class="re-empty-spine">No linked CLs yet</div>';
+      const outdatedTag = peer.draftOutdated
+        ? '<span class="wb-draft-warn">Not in draft</span>'
+        : '';
+      return `
+        <div class="wb-chk-row re-peer" data-stage="${{esc(peer.stage)}}"
+             data-peer-key="${{esc(peer.peerKey)}}" data-peer-open="${{peerOpen}}">
+          <div class="re-peer-hdr" data-peer-hdr="${{esc(peer.peerKey)}}"
+               data-peer-work="${{esc(w.work_id)}}">
+            <span class="re-peer-caret" aria-hidden="true">${{SVG_CHEVRON_SM}}</span>
+            <div class="re-peer-lead">
+              <a class="wb-bug-id re-peer-id" href="${{esc(peer.url || '#')}}"
+                 target="_blank" rel="noopener">${{esc(peer.shortId)}}</a>
+              ${{extraHtml}}
+              <span class="wb-bug-title re-peer-title"
+                    title="${{esc(peer.title)}}">${{esc(peer.title)}}</span>
+            </div>
+            <div class="re-peer-folded-cls">${{foldedClsHtml}}</div>
+            <div class="re-peer-badges">
+              <span class="wb-stage-badge re-stage"
+                    data-tone="${{esc(peer.stageTone)}}">${{esc(peer.stageLabel)}}</span>
+              ${{outdatedTag}}
+              ${{peerCutBtn}}
+            </div>
+          </div>
+          <div class="wb-chk-cls re-spine">${{spineClsHtml}}</div>
+        </div>
+      `;
+    }}).join('');
+    return `
+      <div class="re-band">
+        <div class="re-band-hdr">
+          <span class="re-band-lbl">Deliverables (${{peers.length}})</span>
+          ${{foldBarHtml}}
+        </div>
+        <div class="wb-checklist re-peer-list">${{peerRowsHtml}}</div>
+      </div>
+    `;
+  }}
+
+  // Render a secondary or chat-mention artifact pill with optional unlink button
+  function renderPillItem(w, a) {{
+    const cutBtn = !w.is_virtual
+      ? `<button class="re-unlink wb-cut" title="Detach from Work" `
+        + `data-unlink-work="${{esc(w.work_id)}}" `
+        + `data-unlink-key="${{esc(a.artifact_key)}}" type="button">×</button>`
+      : '';
+    const isChat = a.kind === 'chat_chain';
+    const chatCid = (a.state && a.state.cascade_id) || a.artifact_key.split(':').pop();
+    const linkAttrs = isChat
+      ? `href="#" data-open-chat="${{esc(chatCid)}}"`
+      : `href="${{esc(a.url || '#')}}" target="_blank" rel="noopener"`;
+    const stBadge = (a.state && a.state.status)
+      ? `<span style="color:var(--muted);font-size:10px">[${{esc(a.state.status)}}]</span>`
+      : '';
+    const whySpan = a.why_badge ? `<span class="wb-why">· ${{esc(a.why_badge)}}</span>` : '';
+    const tipAttr = a.why_tooltip ? `title="${{esc(a.why_tooltip)}}"` : '';
+    return `
+      <div class="wb-pill" data-kind="${{esc(a.kind)}}"
+           data-role="${{esc(a.role)}}" ${{tipAttr}}>
+        <a ${{linkAttrs}} style="color:inherit;text-decoration:none">${{esc(a.title)}}</a>
+        ${{whySpan}}
+        ${{stBadge}}
+        ${{renderRollDots(a)}}
+        ${{cutBtn}}
+      </div>
+    `;
+  }}
+
+  // Render the card footer with grouped chat chips, remaining pills, mentions, and actions
+  function renderCardFooter(w, chkCovered) {{
+    const chatArts = (w.artifacts || []).filter(
+      (a) => a && a.role !== 'context_only' && !chkCovered.has(a.artifact_key)
+        && a.kind === 'chat_chain'
+    );
+    const chatGroups = groupChatChains(chatArts);
+    const chatsHtml = chatGroups.length
+      ? `<div class="re-chats-row">${{chatGroups.map((g) => {{
+          const first = g.items[0];
+          const allKeys = g.items.map((it) => it.artifact_key).join(',');
+          const piecesHtml = g.items.length > 1
+            ? g.items.map(
+                (it, i) => `<a class="re-chat-piece" href="#" `
+                  + `data-open-chat="${{esc(it.cid)}}">#${{i + 1}}</a>`
+              ).join('')
+            : '';
+          const mainLink = g.items.length > 1
+            ? `<span class="re-chat-main" title="${{esc(g.label)}}">${{esc(g.label)}}</span>`
+            : `<a class="re-chat-main" href="#" data-open-chat="${{esc(first.cid)}}" `
+              + `title="${{esc(g.label)}}">${{esc(g.label)}}</a>`;
+          const cutChatBtn = !w.is_virtual
+            ? `<button class="re-unlink wb-cut" title="Detach chat" `
+              + `data-unlink-work="${{esc(w.work_id)}}" `
+              + `data-unlink-key="${{esc(allKeys)}}" type="button">×</button>`
+            : '';
+          return `<span class="re-chat-chip">${{mainLink}}${{piecesHtml}}${{cutChatBtn}}</span>`;
+        }}).join('')}}</div>`
+      : '';
+
+    const otherPills = (w.artifacts || []).filter(
+      (a) => a && a.role !== 'context_only' && !chkCovered.has(a.artifact_key)
+        && !isCorrArt(a) && a.kind !== 'chat_chain'
+    );
+    const mentionPills = (w.artifacts || []).filter(
+      (a) => a && a.role === 'context_only' && !chkCovered.has(a.artifact_key)
+    );
+    const pillsHtml = otherPills.map((a) => renderPillItem(w, a)).join('');
+    const mCnt = mentionPills.length;
+    const mLbl = `${{mCnt}} chat mention${{mCnt === 1 ? '' : 's'}}`;
+    const mentionItemsHtml = mentionPills.map((a) => renderPillItem(w, a)).join('');
+    const mentionsHtml = mCnt
+      ? `<details class="wb-mentions re-mentions">
+           <summary title="📎 Упомянуто в чате (${{mCnt}})">${{mLbl}}</summary>
+           <div class="wb-mentions-list">${{mentionItemsHtml}}</div>
+         </details>`
+      : '<span></span>';
+
+    const rd = w.reply_draft || null;
+    const isEditingDraft = Boolean(!w.is_virtual && openDraftEditors[w.work_id]);
+    const addDraftBtn = (!w.is_virtual && !rd && !isEditingDraft)
+      ? `<button class="wb-btn" data-edit-draft="${{esc(w.work_id)}}"`
+        + ` type="button">+ Reply draft</button>`
+      : '';
+    const cardActions = !w.is_virtual
+      ? `<div class="wb-actions">
+           ${{addDraftBtn}}
+           <button class="wb-btn" data-add-ob="${{esc(w.work_id)}}"
+                   type="button">+ Obligation</button>
+           <button class="wb-btn" data-add-link="${{esc(w.work_id)}}"
+                   type="button">+ Link</button>
+           <button class="wb-btn" data-work-done="${{esc(w.work_id)}}"
+                   type="button">✓ Done</button>
+         </div>`
+      : '';
+
+    return `
+      <div class="re-footer">
+        ${{chatsHtml}}
+        ${{pillsHtml ? `<div class="wb-pills">${{pillsHtml}}</div>` : ''}}
+        <div class="re-utility-row">
+          ${{mentionsHtml}}
+          ${{cardActions}}
+        </div>
+      </div>
+    `;
+  }}
+
+  // Render a single editorial Work card across header, decision strip, loop, peers, and footer
+  function renderWorkCard(w) {{
+    const collapsed = isCardCollapsed(w);
+    const openObs = (w.obligations || []).filter((o) => o.status !== 'done');
+    const hasDraft = hasParkedDraft(w);
+    const {{ peers, covered: chkCovered, artByKey }} = buildDeliverablePeers(w, hasDraft);
+    const totalPeerCls = peers.reduce((acc, p) => acc + p.cls.length, 0);
+    const attentionPeers = peers.filter((p) => peerNeedsAttention(w, p, hasDraft)).length;
+    const headerHtml = renderCardHeader(
+      w, peers, totalPeerCls, attentionPeers, hasDraft, openObs
+    );
+    const reasonsList = (w.reasons || []).map((r) => esc(cleanEmojiPrefix(r))).join(' · ');
+    const decisionHtml = reasonsList
+      ? `<div class="re-decision"><div class="re-decision-txt">${{reasonsList}}</div></div>`
+      : '';
+    const loopBandHtml = renderLoopBand(w, openObs, peers, hasDraft);
+    const deliverablesBandHtml = renderDeliverablesBand(w, peers, artByKey, hasDraft);
+    const footerHtml = renderCardFooter(w, chkCovered);
+    const cardAttrs = `data-work-id="${{esc(w.work_id)}}"`
+      + ` data-lane="${{esc(w.lane)}}" data-collapsed="${{collapsed}}"`;
+    return `
+      <article class="wb-card" ${{cardAttrs}}>
+        ${{headerHtml}}
+        <div class="wb-card-body">
+          ${{decisionHtml}}
+          ${{loopBandHtml}}
+          ${{deliverablesBandHtml}}
+          ${{footerHtml}}
+        </div>
+      </article>
+    `;
+  }}
+
+  // Refresh KPIs, unanswered tray, filter chips, and card list while preserving live draft typing
   function render() {{
     const counts = (state && state.counts) || {{}};
     const metrics = (state && state.metrics) || {{}};
-    document.getElementById('wb-synced').textContent = 'Synced ' + ((state && state.synced_et) || '');
+    document.getElementById('wb-synced').textContent = (
+      'Synced ' + ((state && state.synced_et) || '')
+    );
     document.getElementById('kpi-needs').textContent = String(counts.needs_you || 0);
     document.getElementById('kpi-wait').textContent = String(counts.waiting || 0);
     document.getElementById('kpi-obs').textContent = String(counts.obligations_open || 0);
@@ -1720,7 +3721,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       }}).join('');
       trayEl.innerHTML = `
         <div class="wb-tray">
-          <div class="wb-tray-hdr"><span>📨 Unanswered Human Threads (${{tray.length}})</span></div>
+          <div class="wb-tray-hdr"><span>Unanswered Human Threads (${{tray.length}})</span></div>
           ${{rows}}
         </div>
       `;
@@ -1754,353 +3755,14 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       }}
     }}
     if (works.length === 0) {{
-      container.innerHTML = '<div style="color:var(--muted);padding:16px 4px">No works match the current filter.</div>';
+      container.innerHTML = (
+        '<div style="color:var(--muted);padding:16px 4px">'
+        + 'No works match the current filter.</div>'
+      );
       return;
     }}
 
-    container.innerHTML = works.map((w) => {{
-      const collapsed = isCardCollapsed(w);
-      const chevron = collapsed ? '▸' : '▾';
-      const openObs = (w.obligations || []).filter((o) => o.status !== 'done');
-      const artCount = (w.artifacts || []).length;
-      const laneBadge = w.lane === 'needs-you'
-        ? '<span class="wb-badge wb-badge-needs">🚨 Needs You</span>'
-        // Render explicit Done badge so completed cards never fall back to a Waiting tag
-        : (w.lane === 'done'
-            ? '<span class="wb-badge" style="color:var(--ready)">✅ Done</span>'
-            : '<span class="wb-badge wb-badge-wait">⏳ Waiting</span>');
-      const multiBadge = w.is_multi_channel
-        ? '<span class="wb-badge wb-badge-multi">Multi-channel</span>'
-        : '<span class="wb-badge" style="color:var(--muted)">Single item</span>';
-      const countsBadge = `
-        ${{openObs.length ? `<span class="wb-badge" style="color:var(--warn)">🔔 ${{openObs.length}}</span>` : ''}}
-        <span class="wb-badge" style="color:var(--muted)">📎 ${{artCount}}</span>
-      `;
-      // Render clickable root-cause provenance badge on its own vertical row in the header
-      let originRowHtml = '';
-      if (w.origin && w.origin.label) {{
-        const o = w.origin;
-        let inner = '';
-        if (o.kind === 'chat_chain') {{
-          const ocid = String(o.artifact_key || '').split(':').pop();
-          inner = `<a class="wb-origin" href="#" data-open-chat="${{esc(ocid)}}">${{esc(o.label)}}</a>`;
-        }} else if (o.url) {{
-          inner = `<a class="wb-origin" href="${{esc(o.url)}}" target="_blank" rel="noopener">${{esc(o.label)}}</a>`;
-        }} else {{
-          inner = `<span class="wb-origin">${{esc(o.label)}}</span>`;
-        }}
-        originRowHtml = `<div class="wb-origin-row">${{inner}}</div>`;
-      }}
-      const projLabel = (w.project_id && !/^[0-9a-f]{{8}}-[0-9a-f]{{4}}-/i.test(w.project_id))
-        ? `<span>📁 ${{esc(w.project_id)}}</span>`
-        : '';
-      const reasonsHtml = (w.reasons || [])
-        .map((r) => `<div class="wb-reason-row">${{esc(r)}}</div>`)
-        .join('');
-
-      const obsItemsHtml = openObs.map((o) => {{
-        const isDraftOb = String(o.target_artifact_key || '').startsWith('gmail_draft:');
-        const waitTag = o.wb_reply_draft
-          ? '<span style="color:var(--accent);font-weight:600">⏳ Parked reply note</span>'
-          : (isDraftOb
-              ? '<span style="color:var(--accent);font-weight:600">⏳ Parked draft</span>'
-              : '<span style="color:var(--accent);font-weight:600">⏳ Waiting</span>');
-        // Distinguish inbound reply urgency from 7d outbound silence pings on ready obligations
-        let readyTag = '<strong style="color:var(--ready)">🔔 READY</strong>';
-        if (o.correspondence_mode === 'silence_ping') {{
-          readyTag = '<strong style="color:var(--warn)">⏰ 7d SILENCE PING</strong>';
-        }} else if (o.correspondence_mode === 'inbound_reply') {{
-          readyTag = '<strong style="color:var(--urgent)">📨 NEEDS REPLY</strong>';
-        }}
-        const statusTag = o.status === 'ready'
-          ? readyTag
-          : (o.stalled_alert
-              ? '<strong style="color:var(--urgent)">⏰ STALLED &gt;7d</strong>'
-              : waitTag);
-        const progHtml = o.progress_summary
-          ? `<div class="wb-ob-prog">${{esc(o.progress_summary)}}</div>`
-          : '';
-        const ambigHtml = o.ambiguity_prompt
-          ? `<div class="wb-ob-ambig">
-               <span>⚖️ ${{esc(o.ambiguity_prompt)}}</span>
-               <div class="wb-ob-btns">
-                 <button class="wb-btn" data-ob-keep="${{esc(o.obligation_id)}}"
-                         data-ob-event="${{esc(o.ambiguity_event_key || '')}}"
-                         type="button">Оставить обязательство</button>
-                 <button class="wb-btn" data-ob-close-topic="${{esc(o.obligation_id)}}"
-                         data-ob-event="${{esc(o.ambiguity_event_key || '')}}"
-                         type="button">Тема закрыта ✓</button>
-               </div>
-             </div>`
-          : '';
-        const waitBtnHtml = (o.kind === 'correspondence' && o.status === 'ready')
-          ? `<button class="wb-btn" data-ob-wait="${{esc(o.obligation_id)}}"
-                     title="Ответила устно / в другом канале — перевести в ожидание (7д)"
-                     type="button">Ответила → жду</button>`
-          : '';
-        return `
-          <div class="wb-ob" data-status="${{esc(o.status)}}"
-               data-stalled="${{Boolean(o.stalled_alert)}}"
-               title="Trigger: ${{esc(o.trigger_expr)}}">
-            <div class="wb-ob-main">
-              <div>${{statusTag}} · ${{esc(o.description)}}</div>
-              ${{progHtml}}
-              ${{ambigHtml}}
-            </div>
-            <div class="wb-ob-btns">
-              ${{waitBtnHtml}}
-              <button class="wb-btn" data-ob-done="${{esc(o.obligation_id)}}"
-                      type="button">✓</button>
-            </div>
-          </div>
-        `;
-      }}).join('');
-      const obsHtml = obsItemsHtml ? `<div class="wb-obs">${{obsItemsHtml}}</div>` : '';
-
-      const chkItems = w.checklist || [];
-      const chkCovered = new Set();
-      const chkRowsHtml = chkItems.map((item) => {{
-        if (item.bug_key) chkCovered.add(item.bug_key);
-        const clChips = (item.cls || []).map((c) => {{
-          if (c.artifact_key) chkCovered.add(c.artifact_key);
-          const wipBadge = c.is_wip
-            ? `<span class="wb-cl-tag" style="background:#fffbeb;color:var(--warn)">${{esc(c.wip_label || 'WIP')}}</span>`
-            : '';
-          const stackBadge = c.is_stacked
-            ? '<span class="wb-cl-tag" style="background:#f1f5f9;color:var(--muted)">stacked</span>'
-            : '';
-          const confBadge = c.merge_conflict
-            ? '<span class="wb-cl-tag" style="background:#fff2f1;color:var(--urgent)">⚠️ conflict</span>'
-            : '';
-          const rawSubj = String(c.subject || '').replace(/^\\d+:\\s*/, '').trim();
-          const subjSpan = (rawSubj && rawSubj !== c.artifact_key && rawSubj !== c.label)
-            ? `<span class="wb-cl-subj">— ${{esc(rawSubj)}}</span>`
-            : '';
-          const updSpan = c.updated_et
-            ? `<span style="color:var(--muted);font-size:10px">${{esc(c.updated_et)}}</span>`
-            : '';
-          const cutBtn = !w.is_virtual
-            ? `<button class="wb-cut" title="Detach from Work" data-unlink-work="${{esc(w.work_id)}}" data-unlink-key="${{esc(c.artifact_key)}}" type="button">✂</button>`
-            : '';
-          return `
-            <div class="wb-cl-chip">
-              <a href="${{esc(c.url || '#')}}" target="_blank" rel="noopener"
-                 style="color:var(--accent);text-decoration:none;font-weight:600">${{esc(c.label)}}</a>
-              ${{subjSpan}}
-              ${{wipBadge}}${{stackBadge}}${{confBadge}}
-              ${{renderRollDots({{ state: {{ rolls: c.rolls }} }})}}
-              ${{updSpan}}${{cutBtn}}
-            </div>
-          `;
-        }}).join('');
-        const clsBlock = clChips ? `<div class="wb-chk-cls">${{clChips}}</div>` : '';
-        const outdatedTag = item.draft_outdated
-          ? '<span class="wb-draft-warn">📝 Not in draft yet</span>'
-          : '';
-        return `
-          <div class="wb-chk-row" data-stage="${{esc(item.stage)}}">
-            <div class="wb-chk-bug">
-              <a class="wb-bug-id" href="${{esc(item.url || '#')}}"
-                 target="_blank" rel="noopener">🐛 ${{esc(item.short_id)}}</a>
-              <span class="wb-bug-title">${{esc(item.title)}}</span>
-            </div>
-            <div class="wb-chk-status">
-              <span class="wb-stage-badge"
-                    data-tone="${{esc(item.stage_tone)}}">${{esc(item.stage_label)}}</span>
-              ${{outdatedTag}}
-            </div>
-            ${{clsBlock}}
-          </div>
-        `;
-      }}).join('');
-      const checklistHtml = chkRowsHtml ? `<div class="wb-checklist">${{chkRowsHtml}}</div>` : '';
-
-      const isCorrArt = (a) => {{
-        if (!a) return false;
-        if (['gmail_thread', 'gmail_draft', 'gchat_thread', 'gdoc_thread'].includes(a.kind)) {{
-          return true;
-        }}
-        return a.kind === 'gdoc' && Boolean(a.state && a.state.is_active_correspondence);
-      }};
-      const corrPills = (w.artifacts || []).filter((a) => {{
-        if (a.role === 'context_only') return false;
-        return isCorrArt(a);
-      }});
-      let chatPillCount = 0;
-      const visiblePills = (w.artifacts || []).filter((a) => {{
-        if (a.role === 'context_only') return false;
-        if (chkCovered.has(a.artifact_key)) return false;
-        if (isCorrArt(a)) return false;
-        if (a.kind === 'chat_chain') {{
-          const isRawChat = /^Chat\\s+[0-9a-f]{{6,}}$/i.test(String(a.title || ''));
-          if (isRawChat && chatPillCount >= 1) return false;
-          chatPillCount += 1;
-        }}
-        return true;
-      }});
-      const mentionPills = (w.artifacts || []).filter((a) => {{
-        if (a.role !== 'context_only') return false;
-        if (chkCovered.has(a.artifact_key)) return false;
-        return true;
-      }});
-      const renderPillItem = (a) => {{
-        const cutBtn = !w.is_virtual
-          ? `<button class="wb-cut" title="Detach from Work (prevent auto-relink)" data-unlink-work="${{esc(w.work_id)}}" data-unlink-key="${{esc(a.artifact_key)}}" type="button">✂</button>`
-          : '';
-        const isChat = a.kind === 'chat_chain';
-        const chatCid = (a.state && a.state.cascade_id) || a.artifact_key.split(':').pop();
-        const linkAttrs = isChat
-          ? `href="#" data-open-chat="${{esc(chatCid)}}"`
-          : `href="${{esc(a.url || '#')}}" target="_blank" rel="noopener"`;
-        const stBadge = (a.state && a.state.status) ? `<span style="color:var(--muted);font-size:10px">[${{esc(a.state.status)}}]</span>` : '';
-        const whySpan = a.why_badge ? `<span class="wb-why">· ${{esc(a.why_badge)}}</span>` : '';
-        const tipAttr = a.why_tooltip ? `title="${{esc(a.why_tooltip)}}"` : '';
-        return `
-          <div class="wb-pill" data-kind="${{esc(a.kind)}}" data-role="${{esc(a.role)}}" ${{tipAttr}}>
-            <a ${{linkAttrs}} style="color:inherit;text-decoration:none">${{esc(a.icon)}} ${{esc(a.title)}}</a>
-            ${{whySpan}}
-            ${{stBadge}}
-            ${{renderRollDots(a)}}
-            ${{cutBtn}}
-          </div>
-        `;
-      }};
-      const corrHtml = corrPills.length
-        ? `<div class="wb-correspondence">${{corrPills.map(renderPillItem).join('')}}</div>`
-        : '';
-      const pillsHtml = visiblePills.map(renderPillItem).join('');
-      const mentionsHtml = mentionPills.length
-        ? `<details class="wb-mentions">
-             <summary>📎 Упомянуто в чате (${{mentionPills.length}})</summary>
-             <div class="wb-mentions-list">${{mentionPills.map(renderPillItem).join('')}}</div>
-           </details>`
-        : '';
-
-      // Render inline reply-draft editor or preview; warn when edits postdate materialization
-      const rd = w.reply_draft || null;
-      const isEditingDraft = Boolean(!w.is_virtual && openDraftEditors[w.work_id]);
-      let replyDraftHtml = '';
-      if (isEditingDraft) {{
-        const edState = openDraftEditors[w.work_id];
-        const hasSnap = edState && typeof edState === 'object' && edState.initialized;
-        const initBody = hasSnap ? String(edState.body ?? '') : (rd ? String(rd.body || '') : '');
-        const initAg = hasSnap ? Boolean(edState.autoGate) : (rd ? Boolean(rd.auto_gate) : true);
-        const lblStyle = 'font-size:11px;color:var(--muted);display:inline-flex;'
-          + 'align-items:center;gap:4px';
-        replyDraftHtml = `
-          <div class="wb-reply-draft">
-            <div class="wb-reply-draft-hdr"><span>📝 Edit live reply draft</span></div>
-            <textarea class="wb-reply-textarea" id="wb-draft-ta-${{esc(w.work_id)}}"
-                      placeholder="HTML or plain-text reply note...">${{esc(initBody)}}</textarea>
-            <div class="wb-actions" style="justify-content:space-between;flex-wrap:wrap">
-              <label style="${{lblStyle}}">
-                <input type="checkbox" id="wb-draft-ag-${{esc(w.work_id)}}"
-                       ${{initAg ? 'checked' : ''}}>
-                Auto-gate on primary CLs/bugs
-              </label>
-              <div class="wb-ob-btns">
-                <button class="wb-btn" data-cancel-draft="${{esc(w.work_id)}}"
-                        type="button">Cancel</button>
-                <button class="wb-btn wb-btn-primary" data-save-draft="${{esc(w.work_id)}}"
-                        type="button">💾 Save</button>
-              </div>
-            </div>
-          </div>
-        `;
-      }} else if (rd && rd.body) {{
-        const rawMatUrl = String(rd.materialized_url || '');
-        const safeMatUrl = /^https?:\\/\\//i.test(rawMatUrl) ? esc(rawMatUrl) : '';
-        let matBtns = '';
-        if (safeMatUrl && !rd.needs_rematerialize) {{
-          matBtns = `<a class="wb-btn wb-btn-primary" href="${{safeMatUrl}}"`
-            + ` target="_blank" rel="noopener"`
-            + ` style="text-decoration:none">✉️ Open Gmail draft ↗</a>`;
-        }} else if (safeMatUrl && rd.needs_rematerialize) {{
-          matBtns = `
-            <button class="wb-btn wb-btn-primary" data-mat-draft="${{esc(w.work_id)}}"
-                    data-force-new="true" type="button">🔄 Create fresh Gmail draft</button>
-            <a class="wb-btn" href="${{safeMatUrl}}" target="_blank" rel="noopener"
-               style="text-decoration:none">Old tab ↗</a>
-          `;
-        }} else {{
-          matBtns = `<button class="wb-btn wb-btn-primary" data-mat-draft="${{esc(w.work_id)}}"`
-            + ` type="button">📤 Create Gmail draft</button>`;
-        }}
-        replyDraftHtml = `
-          <div class="wb-reply-draft">
-            <div class="wb-reply-draft-hdr">
-              <span>📝 Live reply draft · ${{esc(rd.updated_et || '')}}</span>
-              <div class="wb-ob-btns">
-                ${{matBtns}}
-                <button class="wb-btn" data-edit-draft="${{esc(w.work_id)}}"
-                        type="button">✏️ Edit</button>
-                <button class="wb-btn" data-clear-draft="${{esc(w.work_id)}}"
-                        type="button">🗑 Clear</button>
-              </div>
-            </div>
-            <div class="wb-reply-draft-body">${{renderDraftPreview(rd)}}</div>
-          </div>
-        `;
-      }}
-
-      const addDraftBtn = (!w.is_virtual && !rd && !isEditingDraft)
-        ? `<button class="wb-btn" data-edit-draft="${{esc(w.work_id)}}"`
-          + ` type="button">+ Reply draft</button>`
-        : '';
-      const cardActions = !w.is_virtual
-        ? `<div class="wb-actions">
-             ${{addDraftBtn}}
-             <button class="wb-btn" data-add-ob="${{esc(w.work_id)}}" type="button">+ Obligation</button>
-             <button class="wb-btn" data-add-link="${{esc(w.work_id)}}" type="button">+ Link</button>
-             <button class="wb-btn" data-work-done="${{esc(w.work_id)}}" type="button">✓ Done</button>
-           </div>`
-        : '';
-
-      // Surface creation date directly in Age mode, and expose it as a hover tooltip otherwise
-      const actEt = String(w.activity_et || w.updated_et || '');
-      const origEt = String(w.origin_et || '');
-      let timeMetaHtml = `<span>${{esc(actEt)}}</span>`;
-      if (sortMode === 'age' && origEt) {{
-        const ageTxt = (actEt && actEt !== origEt)
-          ? `Opened ${{esc(origEt)}} · Active ${{esc(actEt)}}`
-          : `Opened ${{esc(origEt)}}`;
-        timeMetaHtml = `<span>${{ageTxt}}</span>`;
-      }} else if (origEt && origEt !== actEt) {{
-        timeMetaHtml = `<span title="Opened ${{esc(origEt)}}">${{esc(actEt)}}</span>`;
-      }}
-
-      return `
-        <article class="wb-card" data-work-id="${{esc(w.work_id)}}" data-lane="${{esc(w.lane)}}" data-collapsed="${{collapsed}}">
-          <div class="wb-card-hdr" data-toggle-card="${{esc(w.work_id)}}">
-            <div class="wb-card-hdr-main">
-              <span class="wb-chevron" aria-hidden="true"
-                    title="Click to toggle · Alt-click to toggle all visible cards"
-                    >${{chevron}}</span>
-              <div class="wb-hdr-stack">
-                <div class="wb-card-title">${{esc(w.title)}}</div>
-                <div class="wb-meta-row">
-                  ${{laneBadge}} ${{multiBadge}} ${{countsBadge}}
-                  ${{projLabel}}
-                  ${{w.roadmap_item_key ? `<span>🗺 ${{esc(w.roadmap_item_key)}}</span>` : ''}}
-                  ${{timeMetaHtml}}
-                </div>
-                ${{originRowHtml}}
-              </div>
-            </div>
-          </div>
-          <div class="wb-card-body">
-            ${{reasonsHtml ? `<div class="wb-reasons">${{reasonsHtml}}</div>` : ''}}
-            ${{corrHtml}}
-            ${{obsHtml}}
-            ${{replyDraftHtml}}
-            ${{checklistHtml}}
-            ${{pillsHtml ? `<div class="wb-pills">${{pillsHtml}}</div>` : ''}}
-            ${{mentionsHtml}}
-            ${{cardActions}}
-          </div>
-        </article>
-      `;
-    }}).join('');
+    container.innerHTML = works.map(renderWorkCard).join('');
     if (focusedDraftWid && openDraftEditors[focusedDraftWid]) {{
       const nextTa = document.getElementById(`wb-draft-ta-${{focusedDraftWid}}`);
       if (nextTa) {{
@@ -2188,13 +3850,46 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     render();
   }});
 
+  // Toggle one peer row open/closed, deleting redundant overrides when back at mode default
+  function togglePeerHeader(peerHdr) {{
+    const pkey = peerHdr.getAttribute('data-peer-hdr');
+    const wid = peerHdr.getAttribute('data-peer-work');
+    if (!wid || !pkey) return;
+    const ovKey = `${{wid}}::${{pkey}}`;
+    const wObj = ((state && state.works) || []).find((x) => String(x.work_id) === wid);
+    if (wObj) {{
+      const hasDraft = hasParkedDraft(wObj);
+      const {{ peers }} = buildDeliverablePeers(wObj, hasDraft);
+      const pObj = peers.find((p) => p.peerKey === pkey);
+      if (pObj) {{
+        const nextOpen = !isPeerOpen(wObj, pObj, hasDraft);
+        if (nextOpen === defaultPeerOpen(wObj, pObj, hasDraft)) {{
+          delete peerOpenOverrides[ovKey];
+        }} else {{
+          peerOpenOverrides[ovKey] = nextOpen;
+        }}
+        savePeerFoldPrefs();
+        render();
+        return;
+      }}
+    }}
+    peerOpenOverrides[ovKey] = false;
+    savePeerFoldPrefs();
+    render();
+  }}
+
   document.body.addEventListener('click', async (e) => {{
-    // Exclude form/select/textarea clicks so editing controls never collapses a card
-    const target = e.target.closest('button, a, input, select, textarea, label');
+    // Exclude interactive controls so inner link or button clicks never toggle peer or card
+    const target = e.target.closest('button, a, input, select, textarea, label, summary');
     if (!target) {{
       const sel = window.getSelection ? String(window.getSelection()) : '';
-      // Skip collapse when selecting header text unless Alt-click explicitly requests bulk toggle
+      // Skip collapse or peer toggle when selecting text unless Alt-click requests bulk toggle
       if (!e.altKey && sel) return;
+      const peerHdr = e.target.closest('[data-peer-hdr]');
+      if (peerHdr) {{
+        togglePeerHeader(peerHdr);
+        return;
+      }}
       const hdr = e.target.closest('[data-toggle-card]');
       if (hdr) {{
         const wid = hdr.getAttribute('data-toggle-card');
@@ -2218,6 +3913,19 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       }}
       return;
     }}
+    if (target.hasAttribute('data-fold-mode')) {{
+      const mode = target.getAttribute('data-fold-mode');
+      const wid = target.getAttribute('data-fold-work');
+      if (wid && ['smart', 'folded', 'expanded'].includes(mode)) {{
+        peerFoldModes[wid] = mode;
+        for (const k of Object.keys(peerOpenOverrides)) {{
+          if (k.startsWith(`${{wid}}::`)) delete peerOpenOverrides[k];
+        }}
+        savePeerFoldPrefs();
+        render();
+      }}
+      return;
+    }}
     if (target.hasAttribute('data-open-chat')) {{
       e.preventDefault();
       const cid = target.getAttribute('data-open-chat');
@@ -2227,10 +3935,14 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       return;
     }}
     if (target.hasAttribute('data-unlink-work')) {{
-      void postJson('/api/work/unlink', {{
-        work_id: target.getAttribute('data-unlink-work'),
-        artifact_key: target.getAttribute('data-unlink-key'),
-      }});
+      const wid = target.getAttribute('data-unlink-work');
+      const rawKeys = String(target.getAttribute('data-unlink-key') || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      for (const akey of rawKeys) {{
+        await postJson('/api/work/unlink', {{ work_id: wid, artifact_key: akey }});
+      }}
       return;
     }}
     if (target.hasAttribute('data-ob-done')) {{
