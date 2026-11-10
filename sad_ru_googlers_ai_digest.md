@@ -442,3 +442,99 @@
 - **Где это реализовано у нас**:
   1. Каталог `~/.gemini/config` у нас с самого начала является полноценным локальным git-репозиторием с хуками жизненного цикла (`chat_lifecycle.py`), пре-тул гардами (`pre_tool_guard.py`), проверкой целостности и автоматическим коммитом через `auto_ship.py`.
   2. Для защиты от галлюцинаций MCP-инструментов у нас в `rules/subagent_exploration.md` зафиксированы канонические имена MCP-серверов (`google_chat_google_chat`, `google_docs_google_docs`, `google_drive_google_drive`), а схема каждого инструмента считывается из `~/.gemini/jetski/mcp/<server>/<tool>.json` перед вызовом.
+
+---
+
+## 2026-11-10
+
+### Sad RU Googlers (HISTORY OFF) (`spaces/AAAAn_HZbYs`)
+
+#### 1. Падение `Fable 5.2` в `swarm` с ошибкой `Invalid signature in thinking block` и баланс моделей (`Opus 5.5` vs `Fable 5.1/5.2`)
+- **Авторы**: Vanya Davidenko (`vdvd@google.com`, 15:51 и 16:14 ET / 20:51 и 21:14 UTC, тред `spaces/AAAAn_HZbYs/threads/4hNVHqtVfFY`), Leonid Lyakhovitskiy (`leonil@google.com`, 15:55 ET), Sergey Zaika (`szaika@google.com`, 15:57–16:14 ET), Dmitry Labutin (`labutin@google.com`, 16:01 ET), Aleksandr Chuklin (`chuklin@google.com`, 16:30 ET).
+- **Суть проблемы и обсуждения**:
+  - При запуске `Fable 5.2` вместе с инструментом `swarm` на длинной аналитической задаче сессия проработала около часа, израсходовала ~70% квоты и оборвалась с жесткой ошибкой API: `INVALID_ARGUMENT (code 400): invalid_request_error: messages.1.content.0: Invalid signature in thinking block. The block is bound to a different conversation. Remove the block, or set thinking.block_binding.prefix_mismatch_behavior to "drop_block" ... The system prompt and the tools list both differ from when this block was created` (требует заголовка `anthropic-beta: thinking-binding-controls-2026-08-01`).
+  - Leonid Lyakhovitskiy подтвердил воспроизведение и откат на `5.1`, а Aleksandr Chuklin отметил массовый характер проблемы.
+  - По соотношению полезности и расхода квоты Sergey Zaika выделил `Opus 5.5 high` как наиболее сбалансированную рабочую модель.
+- **Вердикт полезности**: `🟢 Кандидат на внедрение`.
+- **Предложение по интеграции**:
+  - Учесть ограничение криптографической привязки `thinking`-блока к паре `(system prompt, tools list)` в открытом эпике мультимодельных дебатов `R94` (`Epic: Multi-Model Code Debate & XFAMILY Verification`) и в [`SKILL.md`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/debate/SKILL.md): при оркестрации `swarm` никогда не вызывать `fork:"<member>"` в воркеры на `Fable 5.2` / Claude с extended thinking, если у воркера отличается системный промпт или набор инструментов (запускать чистых воркеров с передачей контекста через доску сообщений), и до исправления `thinking-binding-controls` на бэкенде предпочитать `opus-5.5-high` вместо `Fable 5.2` в длинных `swarm`-сессиях.
+
+#### 2. Выкатка `Hydrogen` (семейство Flash) и `Fable 5.2`, связка `Carbon` + `Opus` в `swarm` и внешняя детерминированная оркестрация
+- **Авторы**: Vanya Davidenko (`vdvd@google.com`, 21:45 ET 9 нояб. / 02:45 UTC 10 нояб.), Dennis Kormalev (`denk@google.com`, 23:01–02:25 ET), Slava Guzanov (`vguzanov@google.com`, 02:13–06:28 ET), Alexander Lyashuk (`crem@google.com`, 04:04 ET), Aleksandr Chuklin (`chuklin@google.com`, 06:20–09:29 ET), Anna Nachesa (`ashalynd@google.com`), Dmitry Labutin (`labutin@google.com`), Ilia Novozhilov (`novozhilov@google.com`), Roman Pavlov (`romanpavlov@google.com`), треды `spaces/AAAAn_HZbYs/threads/VGTrK-Mbqyc` и `spaces/AAAAn_HZbYs/threads/ZtC-ug0Repg`.
+- **Ссылки и ресурсы**: Паттерны мультиагентной оркестрации [Restate Multi-Agent Patterns](https://docs.restate.dev/ai/patterns/multi-agent).
+- **Суть обсуждения**:
+  - В Jetski появились `Hydrogen` (модель семейства Flash / будущий Gemini 4 Flash, расходует Flash-квоту) и `Fable 5.2`.
+  - Dennis Kormalev и Slava Guzanov отметили, что `Carbon` заметно превосходит `Argon` в сложном reasoning, но работает медленно: оптимальный паттерн — запускать связку `Carbon` + `Opus` в роли редтима, верификатора или синтезатора поверх пула быстрых воркеров на `Pro-Next`.
+  - Slava Guzanov подчеркнул отказ от «когнитивной хореографии» (когда модели сами договариваются о маршрутизации) в пользу внешнего детерминированного оркестратора (Temporal / Restate) для структурных пайплайнов.
+- **Вердикт полезности**: `🟡 Уже внедрено у нас`.
+- **Где это реализовано у нас**:
+  - Детерминированная оркестрация пайплайнов вынесена в Python-скрипты и хуки (`pre_tool_guard.py`, `stop_guard.py`, `scripts/stage_diff_context.py`), а независимая верификация и редтиминг выполняются через чистоконтекстного скептика `keeper_skeptic` и [`debate`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/debate/SKILL.md).
+
+#### 3. Структура 20-часовой квоты на 3P-модели (Claude) в Jetski и `go/agy-for-googlers`
+- **Авторы**: Dmitry Labutin (`labutin@google.com`, 11:39 ET / 16:39 UTC, тред `spaces/AAAAn_HZbYs/threads/BrzAxQV30QE`), Anton Tsitsulin (`tsitsulin@google.com`, 11:42–11:54 ET), Vladimir Em (`vladimirem@google.com`), Vanya Davidenko (`vdvd@google.com`), Andrei Shikov (`ashikov@google.com`), Vitaly Lysenkov (`vlysenkov@google.com`, 12:26 ET).
+- **Ссылки и ресурсы**: Программа [go/agy-for-googlers](http://goto.google.com/agy-for-googlers).
+- **Суть обсуждения**:
+  - Корпоративная 20-часовая квота на сторонние модели (Claude) эквивалентна ~$200/день в API-ценах (едина для всех инженеров вне GDM Safety и отдельных команд разработки чипов) и при активной работе сгорает за 2–3 часа.
+  - Программа [go/agy-for-googlers](http://goto.google.com/agy-for-googlers) увеличила лимиты только для моделей Google, оставив квоту на Claude в личном Antigravity минимальной.
+- **Вердикт полезности**: `🟡 Уже внедрено у нас`.
+- **Где это реализовано у нас**:
+  - В [`subagent_exploration.md`](file:///usr/local/google/home/jlavrova/.gemini/config/rules/subagent_exploration.md) механические `file:line` выгрузки (`scout`), запуск тестов и рутинная валидация уведены на `Model="flash"` с жестким потолком `<= 150 KB` / `<= 10` файлов на ход, что бережет квоту старшей модели.
+
+#### 4. Подключение локального Jetski к Gmail и Google Drive через LOAS CLI на Cloudtop
+- **Авторы**: Slava Guzanov (`vguzanov@google.com`, 03:21 и 04:56 ET / 08:21 и 09:56 UTC, тред `spaces/AAAAn_HZbYs/threads/xkZXqazu3WM`), Timur Nikolaenko (`timurn@google.com`, 04:10 ET), Alexander Akbashev (`aal@google.com`, 09:06 ET).
+- **Суть решения**:
+  - Прямой плагин Gmail от Gemini Enterprise отклоняется локальным Jetski как `Restricted client`; рабочая схема для локальной машины — проброс из локального MCP по SSH на Cloudtop к официальным LOAS CLI (либо штатный скилл `gmail` / плагин Gmail для Jetski).
+- **Вердикт полезности**: `🟡 Уже внедрено у нас`.
+- **Где это реализовано у нас**:
+  - Мы работаем на Cloudtop через официальный Go CLI [`SKILL.md`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/gmail/SKILL.md) и MCP-сервер `google_drive_google_drive`.
+
+---
+
+### Chrome AI Discuss (`spaces/AAQA45T8nC8`)
+
+#### 1. Сайдбар Jetski в Gerrit ([b/576815480](https://b.corp.google.com/issues/576815480)), `skydeck_triggers` и цифровой двойник ревьюера `msw-digital-twin`
+- **Авторы**: Matt Mueller (`mattm@google.com`, 14:41 ET / 19:41 UTC, тред `spaces/AAQA45T8nC8/threads/kEX2ZUxcdMk`), Alex Mineer (`amineer@google.com`, 17:33–17:34 ET), Mike Wasserman (`msw@google.com`, 17:43 ET), Sarah Silva (`sarahsilva@google.com`, 17:45–17:50 ET).
+- **Ссылки и пути в репозитории**: Баг [b/576815480](https://b.corp.google.com/issues/576815480), документация [go/gob/users/ai-features](http://goto.google.com/gob/users/ai-features) и [go/gerrit-comments2code](http://goto.google.com/gerrit-comments2code), конфиг серверных очередей [`/google/src/files/head/depot/google3/devtools/ai/services/triggers/manifest/config/skydeck_triggers/pnd_hosts.pi`](file:///google/src/files/head/depot/google3/devtools/ai/services/triggers/manifest/config/skydeck_triggers/pnd_hosts.pi), плагин Mike Wasserman [`/google/src/files/head/depot/configs/users/msw/_agents/plugins/msw-digital-twin/README.md`](file:///google/src/files/head/depot/configs/users/msw/_agents/plugins/msw-digital-twin/README.md).
+- **Суть находок**:
+  - Новая боковая панель Jetski в Gerrit выполняет встроенный дефолтный промпт верхнеуровневого ревью при отправке пустого ввода и поддерживает кастомные скиллы для диалога, тогда как для публичных AI-комментариев в Gerrit рекомендуется кнопка «Add AI Reviewer» (`skydeck_triggers` с групповыми агентами `groupagent-*-review`).
+  - Mike Wasserman выложил плагин `msw-digital-twin`, дистиллированный из 15 лет его ревью и CL в Chromium (3 596 ревью, 1 665 CL, архив отчетов в [cl/1003507007](http://cl/1003507007)), где выделяются три сильные инженерные практики:
+    1. **Cover-to-Vote Coupling**: строгий запрет подстроки `lgtm` в тексте cover-сообщения при удержании `CR+1` (чтобы ревьюер или автор не приняли вежливую формулировку за аппрув).
+    2. **Silent-in-Review vs. Strict-in-Authoring**: жесткое соблюдение собственных стандартов оформления коммит-сообщений (`Test:`, отказ от `OMIT_IF_EMPTY`) при полном молчании о них в чужих CL, если нет содержательных дефектов.
+    3. **Pre-AI Voice Cutoff & Held-Out 7-gram Backtest**: срез обучающего корпуса строго до апреля 2026 года (с фильтрацией агентских маркеров `TAG=agy`) и отложенная выборка из 60 CL с проверкой нулевого дословного 7-граммного пересечения ([`/google/src/files/head/depot/configs/users/msw/_agents/plugins/msw-digital-twin/training/backtest/heldout_overlap.py`](file:///google/src/files/head/depot/configs/users/msw/_agents/plugins/msw-digital-twin/training/backtest/heldout_overlap.py)).
+- **Вердикт полезности**: `🟢 Кандидат на внедрение` (правила `Cover-to-Vote Coupling` и `Silent-in-Review vs. Strict-in-Authoring` для наших скиллов ревью) + `⚪ Не нужно (YAGNI)` (веб-сайдбар Gerrit и `skydeck_triggers`).
+- **Предложение по интеграции**:
+  - Добавить в открытый эпик ревью-триажа `R38` (`Epic: Review-Triage & Gerrit Best Practices`, файлы [`SKILL.md`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/review-triage/SKILL.md) и [`gerrit_draft.py`](file:///usr/local/google/home/jlavrova/.gemini/config/scripts/gerrit_draft.py)) проверку **Cover-to-Vote Coupling** (блокировать подстроку `lgtm` в верхнеуровневых черновиках обложки ревью, когда триаж классифицирует CL как `🟠 PUSHBACK` или находит блокирующие дефекты в `🔴 SURGICAL AUDIT`) и правило **Silent-in-Review vs. Strict-in-Authoring** (не делать замечаний внешним авторам по формату блока `Tested:` или локальным конвенциям наших собственных коммитов). Методику held-out 7-gram валидации и `Pre-AI Cutoff` сохранить как референс для замороженной задачи `R33` ([`SKILL.md`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/veteran-review/SKILL.md)).
+
+#### 2. Блокировка RPC `CreateProject` для агентских токенов в Jetski и скилл `fork-to-workspace`
+- **Авторы**: Russ Hamilton (`behamilton@google.com`, 15:11 и 17:40 ET / 20:11 и 22:40 UTC, тред `spaces/AAQA45T8nC8/threads/uIjVbJVr_P8`), Nasko Oskov (`nasko@google.com`, 17:38 ET).
+- **Путь в репозитории**: [`/google/src/files/head/depot/configs/users/behamilton/_agents/skills/fork-to-workspace/SKILL.md`](file:///google/src/files/head/depot/configs/users/behamilton/_agents/skills/fork-to-workspace/SKILL.md) и [`/google/src/files/head/depot/configs/users/behamilton/_agents/skills/fork-to-workspace/scripts/fork_to_workspace.py`](file:///google/src/files/head/depot/configs/users/behamilton/_agents/skills/fork-to-workspace/scripts/fork_to_workspace.py) (строка 1632).
+- **Суть проблемы**:
+  - В Jetski ужесточили права управления агентами изнутри агентских сессий: вызов `LanguageServerService/CreateProject` через агентский токен (`jetski fetch-token`) теперь заблокирован, что сломало автоматическое создание новых воркспейс-проектов в скилле `fork-to-workspace` при веерной нарезке дизайн-доков на независимые CL.
+- **Вердикт полезности**: `🟡 Уже внедрено у нас` (наши скрипты безопасны).
+- **Где это реализовано у нас**:
+  - Проверка [`chat_lifecycle.py`](file:///usr/local/google/home/jlavrova/.gemini/config/hooks/chat_lifecycle.py) и [`move_chats_to_project.py`](file:///usr/local/google/home/jlavrova/.gemini/config/scripts/move_chats_to_project.py) подтвердила, что они не вызывают `CreateProject`: привязка идет только к существующим проектам через `StartCascade` (`projectEnvConfig.projectId`) и `JetboxWriteSummary`. При будущей реализации замороженной задачи `R32` (`--fork` в `move_chats_to_project.py`) следует также опираться только на существующие `projectId`.
+
+#### 3. Самовольный ребейз всего стека веток в `jetski-cli` из-за памяти агента и read-only защита `.git` в `bwrap`
+- **Авторы**: Adam Rice (`ricea@google.com`, 22:32 ET 9 нояб. / 03:32 UTC 10 нояб., тред `spaces/AAQA45T8nC8/threads/hUXZKoMjz6k`), Tim Dresser (`tdresser@google.com`, 10:28 ET / 15:28 UTC); смежные правила в [`AGENTS.md`](file:///google/src/files/head/depot/configs/users/behamilton/_agents/AGENTS.md) Russ Hamilton (строки 96–117).
+- **Суть проблемы и решения**:
+  - При вызове `jetski-cli` из внешнего скрипта исключительно для разрешения merge-конфликта на одной ветке агент достает из долговременной памяти имена остальных веток стека и самовольно ребейзит весь стек дальше.
+  - Tim Dresser решает это монтированием метаданных VCS (`.git`) в режим `read-only` внутри песочницы `bwrap`; аналогично в обновленном `AGENTS.md` у Russ Hamilton метаданные ворктри `.git/worktrees/` закрыты от записи из песочницы, а удаление `.git/index.lock` через `rm` запрещено.
+- **Вердикт полезности**: `🟢 Кандидат на внедрение`.
+- **Предложение по интеграции**:
+  - Дополнить открытую задачу `R128` (`Add sandboxed scratch-Python runner scripts/bwrap_python3.py`): поверх `rw`-монтирования не-CitC воркспейса по умолчанию накладывать `--ro-bind` на `<workspace>/.git` (и целевой `gitdir` связанного ворктри `.git/worktrees/<name>`), чтобы ни один вспомогательный Python-скрипт не мог переключать ветки, двигать рефы, трогать чужие ветки стека или удалять `index.lock`.
+
+#### 4. `Carbon Low` против веера `Flash 3.8` на задачах код-ревью
+- **Авторы**: Peter Wen (`wnwen@google.com`, 07:55–08:05 ET / 12:55–13:05 UTC, тред `spaces/AAQA45T8nC8/threads/T4DHfEaPFbc`), Marcin Mordecki (`mordeckimarcin@google.com`, 08:02–08:05 ET).
+- **Суть наблюдений**:
+  - Запуск роя `Flash 3.8` для первичного поиска багов с последующей фильтрацией на `Pro`-модели дает плохой баланс сигнал/шум: `Flash` генерирует в среднем 3–4 «серьезных» находки, большинство из которых оказываются ложноположительными и сжигают токены старшей модели на опровержение. `Carbon Low`, напротив, сохраняет высокую точность (precision) и снижает лишь полноту (0–1 дефект против 1–2 на `Carbon Medium`).
+- **Вердикт полезности**: `🟡 Уже внедрено у нас`.
+- **Где это реализовано у нас**:
+  - В [`subagent_exploration.md`](file:///usr/local/google/home/jlavrova/.gemini/config/rules/subagent_exploration.md) семантический поиск дефектов и `keeper_inquisitor` закреплены строго за `Model="inherit"`, а `Model="flash"` используется только для механических `scout`-выгрузок и прогона тестов.
+
+#### 5. Потеря границы `</thought>` и паника модели в видимом ответе ([b/497841247](https://b.corp.google.com/issues/497841247))
+- **Авторы**: Rick Byers (`rbyers@google.com`, 11:05 ET / 16:05 UTC, тред `spaces/AAQA45T8nC8/threads/6VQTvU8bQ9w`), Jason Robbins (`jrobbins@google.com`, 12:44 ET), Mike Wasserman (`msw@google.com`, 12:50 ET), Liza Burakova (`yelizaveta@google.com`, 16:11 ET).
+- **Ссылки на баги**: [b/497841247](https://b.corp.google.com/issues/497841247).
+- **Суть курьеза**:
+  - Модель преждевременно закрыла блок `</thought>` и продолжила внутреннюю самокоррекцию уже в видимом потоке токенов, впав в рекурсивную панику (*«Wait — AM I in `<thought>` or outside `<thought>`?! ... STOP IMMEDIATELY!»*).
+- **Вердикт полезности**: `⚪ Не нужно (YAGNI) / платформенный баг стриминга` (перекликается с утечкой мыслей в Argon от 2026-11-04).
+
