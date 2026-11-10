@@ -3234,10 +3234,17 @@ class WorkStore:
     )
     os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
     self._lock = threading.RLock()
+    self._write_seq = 0
     self._init_schema()
+
+  @property
+  def write_seq(self) -> int:
+    """Returns the monotonic in-process SQLite row-mutation counter for cache invalidation."""
+    return self._write_seq
 
   @contextlib.contextmanager
   def _connect(self) -> Iterator[sqlite3.Connection]:
+    """Opens a WAL SQLite connection and bumps write_seq whenever DML modifies rows."""
     conn = sqlite3.connect(self.db_path, timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA synchronous=NORMAL")
@@ -3245,6 +3252,9 @@ class WorkStore:
     try:
       with conn:
         yield conn
+      # Advance in-process cache version only when INSERT/UPDATE/DELETE touched rows
+      if conn.total_changes > 0:
+        self._write_seq += 1
     finally:
       conn.close()
 

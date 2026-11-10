@@ -53,8 +53,8 @@
   const FLIGHT_DECK_MIN_WIDTH_PX = 320;
   const FLIGHT_DECK_MAX_WIDTH_PX = 900;
   const FLIGHT_DECK_INFO_TTL_MS = 10000;
-  // Bounds unrendered loads, ping acks, open-drawer silence, and reload bursts
-  const FLIGHT_DECK_LOAD_TIMEOUT_MS = 12000;
+  // Bounds unrendered loads (25s for cold UberProxy/sync startups), ping acks, and reload bursts
+  const FLIGHT_DECK_LOAD_TIMEOUT_MS = 25000;
   const FLIGHT_DECK_PING_ACK_TIMEOUT_MS = 8000;
   const FLIGHT_DECK_OPEN_IDLE_PING_MS = 150000;
   const FLIGHT_DECK_RELOAD_COOLDOWN_MS = 15000;
@@ -967,16 +967,32 @@
     return m ? Number(m[1]) || 0 : 0;
   }
 
-  // Normalizes pen_url to preserve the last known valid non-loopback UberProxy endpoint
-  function normalizeFlightDeckPenUrl(rawPenUrl) {
+  // Infers whether an info payload or drawer mode targets Workbench (:8090) vs Flight Deck (:8089)
+  function isWorkbenchTarget(info, mode = activeDrawerMode) {
+    if (Number(info?.port) === 8090) return true;
+    if (Number(info?.port) === 8089) return false;
+    const loc = typeof info?.local_url === 'string' ? info.local_url : '';
+    if (/:8090(?:[/?#]|$)/.test(loc)) return true;
+    if (/:8089(?:[/?#]|$)/.test(loc)) return false;
+    return mode === 'workbench';
+  }
+
+  // Normalizes pen_url per target port so Workbench (8090) never clobbers Flight Deck (8089)
+  function normalizeFlightDeckPenUrl(rawPenUrl, isWb = false) {
     const raw = typeof rawPenUrl === 'string' ? rawPenUrl.trim() : '';
     if (raw && !isLoopbackFlightDeckUrl(raw)) {
-      lastValidFlightDeckPenBase = raw.replace(/[?#].*$/, '');
+      const cleanBase = raw.replace(/[?#].*$/, '');
+      if (isWb) {
+        lastValidWorkbenchPenBase = cleanBase;
+      } else {
+        lastValidFlightDeckPenBase = cleanBase;
+      }
       return raw;
     }
     const vMatch = raw ? /[?&]v=\d+/.exec(raw) : null;
     const vSuffix = vMatch ? `?${vMatch[0].slice(1)}` : '';
-    return `${lastValidFlightDeckPenBase}${vSuffix}`;
+    const fallbackBase = isWb ? lastValidWorkbenchPenBase : lastValidFlightDeckPenBase;
+    return `${fallbackBase}${vSuffix}`;
   }
 
   // Fetches jetski-flight-deck.json or jetski-workbench.json for the active drawer mode
@@ -1013,19 +1029,13 @@
       if (resp && resp.ok) {
         const data = await resp.json();
         if (data && typeof data === 'object') {
+          // Keep each port's last valid UberProxy origin isolated when pen_url is loopback/empty
+          data.pen_url = normalizeFlightDeckPenUrl(data.pen_url, isWb);
           if (isWb) {
-            const rawPen = typeof data.pen_url === 'string' ? data.pen_url.trim() : '';
-            if (rawPen && !isLoopbackFlightDeckUrl(rawPen)) {
-              lastValidWorkbenchPenBase = rawPen.replace(/[?#].*$/, '');
-            } else {
-              data.pen_url = lastValidWorkbenchPenBase;
-            }
             workbenchInfoCache = data;
             workbenchInfoFetchedAt = now;
             return workbenchInfoCache;
           }
-          // Keep the last valid UberProxy origin if pen_url is empty or loopback
-          data.pen_url = normalizeFlightDeckPenUrl(data.pen_url);
           flightDeckInfoCache = data;
           flightDeckInfoFetchedAt = now;
           return flightDeckInfoCache;
@@ -1057,19 +1067,21 @@
     return flightDeckInfoCache;
   }
 
-  // Chooses localhost vs PEN proxy based on the Jetski Web host and appends embed param
-  function resolveFlightDeckUrl(info, embedded = true) {
+  // Chooses localhost vs PEN proxy for Flight Deck (8089) or Workbench (8090) and appends embed
+  function resolveFlightDeckUrl(info, embedded = true, mode = activeDrawerMode) {
+    const isWb = isWorkbenchTarget(info, mode);
+    const defaultLocal = isWb ? 'http://localhost:8090' : 'http://localhost:8089';
     const host = typeof window !== 'undefined' ? window.location?.hostname || '' : '';
     // Treat loopback as local only in native browser, never inside Mac CDP-injected wrapper
     const isMacWrapper = typeof window !== 'undefined' && Boolean(
       window.__jetskiClosedChatsFilterMacVer || window.__jetskiClosedChatsFilterLoadingVer
     );
     const isLocal = !isMacWrapper && (host === 'localhost' || host === '127.0.0.1');
-    // Normalize caller-supplied pen_url so remote and Mac windows never downgrade to localhost
-    const normalizedPen = normalizeFlightDeckPenUrl(info?.pen_url);
-    let base = isLocal
-      ? (info?.local_url || 'http://localhost:8089')
-      : (normalizedPen || info?.local_url || 'http://localhost:8089');
+    // Normalize caller-supplied pen_url per mode so remote/Mac windows keep isolated PEN bases
+    const normalizedPen = normalizeFlightDeckPenUrl(info?.pen_url, isWb);
+    const base = isLocal
+      ? (info?.local_url || defaultLocal)
+      : (normalizedPen || info?.local_url || defaultLocal);
     if (!embedded) return base;
     const sep = base.includes('?') ? '&' : '?';
     return `${base}${sep}embed=1`;
@@ -10887,6 +10899,8 @@
         now - lastFlightDeckRenderedAt >= FLIGHT_DECK_OPEN_IDLE_PING_MS
       ) {
         flightDeckInfoFetchedAt = 0;
+        // Force a fresh jetski-workbench.json lookup on open-idle ping recovery
+        workbenchInfoFetchedAt = 0;
         pingFlightDeckIframe(iframe, now);
       }
       void syncFlightDeckIframeUrl(drawerEl, false);
@@ -10896,21 +10910,35 @@
     }
   }
 
-  // Fetches current Flight Deck host URL and updates or recovers embedded iframe src
+  // Fetches current Flight Deck or Workbench URL for the active mode and syncs iframe src
   function syncFlightDeckIframeUrl(drawerEl, forceReload = false) {
     if (!drawerEl) return;
     const iframe = drawerEl.querySelector(`.${FLIGHT_DECK_IFRAME_CLASS}`);
-    return fetchFlightDeckInfo().then((info) => {
-      if (!iframe || !flightDeckOpen) return;
+    const reqMode = activeDrawerMode;
+    return fetchFlightDeckInfo(reqMode).then((info) => {
+      // Ignore stale responses if the drawer closed or switched mode while fetch was in flight
+      if (!iframe || !flightDeckOpen || activeDrawerMode !== reqMode) return;
       const now = Date.now();
-      const embedUrl = resolveFlightDeckUrl(info, true);
+      const embedUrl = resolveFlightDeckUrl(info, true, reqMode);
       const curBaseSrc = iframe.getAttribute('data-base-src') || '';
       const prevClean = stripFlightDeckVersionParam(curBaseSrc);
       const nextClean = stripFlightDeckVersionParam(embedUrl);
       const originChanged = !curBaseSrc || prevClean !== nextClean;
+      if (originChanged) {
+        lastFlightDeckRenderedVer = 0;
+        lastFlightDeckRenderedAt = 0;
+        flightDeckReloadedTargetVer = 0;
+      }
       const infoVer = extractFlightDeckUiVersion(info, embedUrl);
       const curVer = extractFlightDeckUiVersion(null, curBaseSrc);
+      // Upgrade fallback unversioned src once daemon info exports a concrete ?v= version
+      const upgradedFromFallback =
+        curVer === 0 && infoVer > 0 && lastFlightDeckRenderedAt === 0;
+      const needsCleanNav = originChanged || upgradedFromFallback;
       const baselineVer = lastFlightDeckRenderedVer || curVer;
+      const coldLoadInFlight =
+        flightDeckLoadStartedAt > 0 &&
+        lastFlightDeckRenderedAt < flightDeckLoadStartedAt;
       // Suppress repeat reloads when target infoVer already loaded and rendered a lower live ver
       const alreadyReloadedForInfoVer =
         infoVer > 0 &&
@@ -10919,11 +10947,12 @@
         lastFlightDeckRenderedAt >= flightDeckLoadStartedAt;
 
       let autoForceReload = false;
-      if (!forceReload && !originChanged) {
+      if (!forceReload && !needsCleanNav) {
         if (
           infoVer > 0 &&
           baselineVer > 0 &&
           infoVer !== baselineVer &&
+          !coldLoadInFlight &&
           !alreadyReloadedForInfoVer
         ) {
           if (flightDeckPendingVer !== infoVer) {
@@ -10950,8 +10979,7 @@
         ) {
           autoForceReload = true;
         } else if (
-          flightDeckLoadStartedAt > 0 &&
-          lastFlightDeckRenderedAt < flightDeckLoadStartedAt &&
+          coldLoadInFlight &&
           now - flightDeckLoadStartedAt >= FLIGHT_DECK_LOAD_TIMEOUT_MS
         ) {
           autoForceReload = true;
@@ -10967,7 +10995,7 @@
       }
 
       // Append cache-busting timestamp only on forced reloads so initial origin loads stay clean
-      if (forceReload || originChanged || autoForceReload) {
+      if (forceReload || needsCleanNav || autoForceReload) {
         const bustCache = Boolean(forceReload || autoForceReload);
         iframe.setAttribute('data-base-src', embedUrl);
         const sep = embedUrl.includes('?') ? '&' : '?';
@@ -10994,6 +11022,12 @@
     activeDrawerMode = normalized;
     safeSetStorage(STORAGE_DRAWER_MODE_KEY, activeDrawerMode);
     if (modeChanged) {
+      // Clear previous port's cached info and rendered state so cold loads never inherit them
+      flightDeckInfoFetchedAt = 0;
+      workbenchInfoFetchedAt = 0;
+      lastFlightDeckRenderedVer = 0;
+      lastFlightDeckRenderedAt = 0;
+      flightDeckReloadedTargetVer = 0;
       flightDeckPendingVer = 0;
       flightDeckPendingVerSince = 0;
       flightDeckPingSentAt = 0;
@@ -11019,9 +11053,10 @@
       workbenchInfoFetchedAt = 0;
       const drawerEl = document.getElementById(FLIGHT_DECK_DRAWER_ID);
       const iframe = drawerEl?.querySelector(`.${FLIGHT_DECK_IFRAME_CLASS}`);
-      const hasPriorSrc = Boolean(
-        iframe?.getAttribute('data-base-src') || iframe?.getAttribute('src')
-      );
+      const priorSrc = iframe?.getAttribute('data-base-src') || iframe?.getAttribute('src') || '';
+      const hasPriorSrc =
+        Boolean(priorSrc) &&
+        isWorkbenchTarget({ local_url: priorSrc }, '') === (activeDrawerMode === 'workbench');
       const currentSrcRendered =
         hasPriorSrc &&
         flightDeckLoadStartedAt > 0 &&

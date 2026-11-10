@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterator, Mapping
+import contextlib
 import html as html_lib
 import http.server
 import json
@@ -177,6 +179,14 @@ _RE_CL_TITLE_PREFIX = re.compile(
     re.IGNORECASE,
 )
 _RE_CM_GH_ISSUE = re.compile(r"github\.com/([^/\s#]+/[^/\s#]+)/issues/(\d+)\b", re.IGNORECASE)
+_RE_CM_SHORT_FLUTTER = re.compile(
+    r"(?:flutter#|(?<![A-Za-z0-9_/])#)(\d{4,6})\b",
+    re.IGNORECASE,
+)
+_RE_CM_BUGANIZER = re.compile(
+    r"(?:(?<![A-Za-z0-9_./-])b/|issuetracker\.google\.com/issues/)(\d{6,})\b",
+    re.IGNORECASE,
+)
 _RE_CM_CRBUG = re.compile(
     r"(?:crbug\.com/|issues\.chromium\.org/issues/)(\d+)\b",
     re.IGNORECASE,
@@ -275,15 +285,278 @@ def _cl_id_tokens(akey: str) -> set[str]:
   return set(_RE_CL_DIGITS.findall(akey))
 
 
-def _extract_ssr_cl_bug_keys(ast: dict[str, Any]) -> set[str]:
-  """Collects canonical bug keys linked to a CL state including non-Flutter GH and crbug URLs."""
-  keys = set(work_store.extract_cl_bug_keys(ast))
+def _extract_ssr_cl_bug_keys(ast: Mapping[str, Any]) -> set[str]:
+  """Collects canonical and crbug keys linked to a CL across metadata and commit text."""
+  keys = set(work_store.extract_cl_bug_keys(dict(ast)))
+  # Preserve explicit crbug:<N> / crbug/<N> keys across slim_ui_projection -> SSR passes
+  for k in ast.get("linked_bug_keys") or ():
+    ks = str(k or "").strip()
+    if ks.startswith("crbug:"):
+      keys.add(ks)
+    elif ks.lower().startswith("crbug/") and ks[6:].isdigit():
+      keys.add(f"crbug:{ks[6:]}")
+  for lb in ast.get("linked_bugs") or ():
+    if not isinstance(lb, Mapping):
+      continue
+    ik = str(lb.get("item_key") or "").strip()
+    if ik.startswith("crbug:"):
+      keys.add(ik)
+    elif ik.lower().startswith("crbug/") and ik[6:].isdigit():
+      keys.add(f"crbug:{ik[6:]}")
+    num = str(lb.get("number") or lb.get("id") or lb.get("target_id") or "").strip()
+    if num.isdigit() and "crbug" in str(lb.get("kind") or "").lower():
+      keys.add(f"crbug:{num}")
   cm = str(ast.get("commit_message") or "")
   for m in _RE_CM_GH_ISSUE.finditer(cm):
     keys.add(f"github_issue:{m.group(1)}:{m.group(2)}")
+  for m in _RE_CM_SHORT_FLUTTER.finditer(cm):
+    keys.add(f"github_issue:flutter/flutter:{m.group(1)}")
+  for m in _RE_CM_BUGANIZER.finditer(cm):
+    keys.add(f"buganizer:{m.group(1)}")
   for m in _RE_CM_CRBUG.finditer(cm):
     keys.add(f"crbug:{m.group(1)}")
   return keys
+
+
+_SLIM_STR_STATE_KEYS = (
+    "status",
+    "subject",
+    "wip_label",
+    "updated_et",
+    "status_changed_et",
+    "last_msg_et",
+    "counterparty",
+    "cascade_id",
+)
+_SLIM_BOOL_STATE_KEYS = (
+    "is_wip",
+    "is_draft",
+    "in_development",
+    "merge_conflict",
+    "is_stacked",
+    "is_active_correspondence",
+    "is_self",
+    "is_mine",
+)
+_SLIM_OBLIGATION_KEYS = (
+    "obligation_id",
+    "work_id",
+    "target_artifact_key",
+    "kind",
+    "description",
+    "trigger_expr",
+    "status",
+    "stalled_alert",
+    "wb_reply_draft",
+    "progress_summary",
+    "correspondence_mode",
+    "ambiguity_prompt",
+    "ambiguity_event_key",
+)
+
+
+def _slim_rolls(raw_rolls: Any) -> dict[str, bool]:
+  """Compresses verbose per-target autoroll dicts into compact boolean roll indicators."""
+  if not isinstance(raw_rolls, Mapping):
+    return {}
+  out: dict[str, bool] = {}
+  # Normalize heterogeneous cl_watcher dicts, '✓' status markers, and booleans into True/False
+  for k, r in raw_rolls.items():
+    if isinstance(r, bool):
+      out[str(k)] = r
+    elif isinstance(r, Mapping):
+      out[str(k)] = bool(r.get("rolled") or r.get("state") == "✓")
+    elif isinstance(r, str):
+      out[str(k)] = r.strip() == "✓"
+    else:
+      out[str(k)] = bool(r)
+  return out
+
+
+def _slim_artifact(art: Mapping[str, Any]) -> dict[str, Any]:
+  """Projects one artifact to UI-visible fields while preserving bug and draft cross-links."""
+  out: dict[str, Any] = {
+      "artifact_key": str(art.get("artifact_key") or ""),
+      "kind": str(art.get("kind") or ""),
+      "title": str(art.get("title") or ""),
+      "url": str(art.get("url") or ""),
+      "role": str(art.get("role") or ""),
+  }
+  for opt_k in ("icon", "source", "link_reason", "why_badge", "why_tooltip"):
+    val = art.get(opt_k)
+    if val:
+      out[opt_k] = val
+
+  ast = art.get("state")
+  if not isinstance(ast, Mapping):
+    out["state"] = {}
+    return out
+
+  slim_st: dict[str, Any] = {}
+  for sk in _SLIM_STR_STATE_KEYS:
+    sval = str(ast.get(sk) or "").strip()
+    if sval:
+      slim_st[sk] = sval
+  for bk in _SLIM_BOOL_STATE_KEYS:
+    if ast.get(bk):
+      slim_st[bk] = True
+  for nk in ("patchset", "message_count"):
+    if ast.get(nk):
+      slim_st[nk] = ast[nk]
+  # Preserve explicit 0-reviewer counts so On Desk pre-review badges survive payload slimming
+  if "assigned_reviewers_count" in ast and ast["assigned_reviewers_count"] is not None:
+    slim_st["assigned_reviewers_count"] = int(ast["assigned_reviewers_count"] or 0)
+
+  # Fold commit_message / bug_ids / linked_bugs into canonical linked_bug_keys before stripping text
+  if out["kind"] in ("gerrit", "github_pr", "piper") or any(
+      ast.get(k) for k in ("linked_bug_keys", "linked_bugs", "bug_ids", "commit_message")
+  ):
+    bkeys = sorted(_extract_ssr_cl_bug_keys(ast))
+    if bkeys:
+      slim_st["linked_bug_keys"] = bkeys
+
+  # Retain only cross-link identifiers on issue linked_cls without multi-KB watcher payloads
+  raw_lcls = ast.get("linked_cls")
+  if isinstance(raw_lcls, list) and raw_lcls:
+    slim_lcls = [
+        {"target_id": str(lc.get("target_id") or ""), "item_key": str(lc.get("item_key") or "")}
+        for lc in raw_lcls
+        if isinstance(lc, Mapping) and (lc.get("target_id") or lc.get("item_key"))
+    ]
+    if slim_lcls:
+      slim_st["linked_cls"] = slim_lcls
+
+  # Collapse post_submit autoroll dictionaries into boolean dots before dropping raw build logs
+  ps_obj = ast.get("post_submit")
+  rolls_src = ps_obj.get("rolls") if isinstance(ps_obj, Mapping) else None
+  slim_r = _slim_rolls(rolls_src or ast.get("rolls"))
+  if slim_r:
+    slim_st["rolls"] = slim_r
+
+  # Keep only status/lane from entity_state so On Desk dev badges work without comment arrays
+  est = ast.get("entity_state")
+  if isinstance(est, Mapping):
+    slim_est = {k: est[k] for k in ("status", "lane") if est.get(k)}
+    if slim_est:
+      slim_st["entity_state"] = slim_est
+
+  # Extract mentioned CL keys/digits from Gmail draft body/snippet before dropping raw draft text
+  if out["kind"] == "gmail_draft":
+    draft_txt = f"{ast.get('body') or ''}\n{ast.get('snippet') or ''}"
+    raw_tokens = (
+        *(str(x).strip() for x in (ast.get("mentioned_keys") or ())),
+        *ingestor.extract_draft_mentioned_keys(out["title"], draft_txt),
+        *_RE_CL_DIGITS.findall(draft_txt),
+    )
+    merged_m = list(dict.fromkeys(tok for tok in raw_tokens if tok))
+    if merged_m:
+      slim_st["mentioned_keys"] = merged_m
+
+  out["state"] = slim_st
+  return out
+
+
+def _build_card_search_text(card: Mapping[str, Any]) -> str:
+  """Builds a deduplicated lowercase search index across card metadata, obligations, and peers."""
+  parts: list[str] = []
+  seen: set[str] = set()
+
+  def _add(val: Any) -> None:
+    """Appends unique lowercase text fragments so repeated artifact titles do not bloat JSON."""
+    s = str(val or "").strip().lower()
+    if s and s not in seen:
+      seen.add(s)
+      parts.append(s)
+
+  # Index top-level card identity, triage reasons, origin, and inline reply draft fields
+  for k in ("work_id", "title", "lane", "project_id", "roadmap_item_key"):
+    _add(card.get(k))
+  for r in card.get("reasons") or ():
+    _add(r)
+  orig = card.get("origin")
+  if isinstance(orig, Mapping):
+    _add(orig.get("label"))
+    _add(orig.get("artifact_key"))
+    _add(orig.get("url"))
+  rd = card.get("reply_draft")
+  if isinstance(rd, Mapping):
+    _add(rd.get("subject"))
+    _add(rd.get("body"))
+    _add(rd.get("to"))
+  # Index open/waiting obligation summaries, ambiguity prompts, and checklist deliverable rows
+  for ob in card.get("obligations") or ():
+    for ok in (
+        "description",
+        "progress_summary",
+        "target_artifact_key",
+        "trigger_expr",
+        "ambiguity_prompt",
+    ):
+      _add(ob.get(ok))
+  for chk in card.get("checklist") or ():
+    for ck in ("bug_key", "short_id", "title", "stage_label", "url"):
+      _add(chk.get(ck))
+    for c in chk.get("cls") or ():
+      for clk in ("artifact_key", "label", "subject", "url"):
+        _add(c.get(clk))
+      c_key = str(c.get("artifact_key") or "")
+      if c_key:
+        _add(_short_cl_label(c_key, str(c.get("label") or ""))[0])
+  # Index artifact keys, URLs, tooltips, chat IDs, short CL labels, and short bug aliases
+  for a in card.get("artifacts") or ():
+    akey = str(a.get("artifact_key") or "")
+    akind = str(a.get("kind") or "")
+    for ak in ("artifact_key", "kind", "title", "url", "why_badge", "why_tooltip"):
+      _add(a.get(ak))
+    if akind in ("github_issue", "buganizer", "crbug"):
+      _add(_short_issue_id(dict(a)))
+      if akind == "crbug" and ":" in akey:
+        _add(f"crbug/{akey.split(':')[-1]}")
+    elif akind in ("gerrit", "github_pr", "piper") and akey:
+      _add(_short_cl_label(akey, str(a.get("title") or ""))[0])
+    ast = a.get("state")
+    if isinstance(ast, Mapping):
+      for sk in ("subject", "counterparty", "wip_label", "status", "cascade_id"):
+        _add(ast.get(sk))
+      for bk in ast.get("linked_bug_keys") or ():
+        _add(bk)
+        _add(_short_issue_id({"artifact_key": bk}))
+  return " ".join(parts)
+
+
+def slim_ui_projection(projection: Mapping[str, Any]) -> dict[str, Any]:
+  """Strips multi-megabyte raw thread/CL blobs from a projection and attaches card search_text."""
+  slim_works: list[dict[str, Any]] = []
+  for w in projection.get("works") or ():
+    cw = dict(w)
+    cw["artifacts"] = [_slim_artifact(a) for a in (w.get("artifacts") or ())]
+    cw["obligations"] = [
+        {k: ob[k] for k in _SLIM_OBLIGATION_KEYS if k in ob}
+        for ob in (w.get("obligations") or ())
+    ]
+    # Compress nested checklist CL roll dictionaries into compact booleans
+    if isinstance(w.get("checklist"), list):
+      slim_chk: list[dict[str, Any]] = []
+      for item in w["checklist"]:
+        ci = dict(item)
+        if isinstance(item.get("cls"), list):
+          slim_cls: list[dict[str, Any]] = []
+          for c in item["cls"]:
+            cc = dict(c)
+            if "rolls" in cc:
+              cc["rolls"] = _slim_rolls(cc["rolls"])
+            slim_cls.append(cc)
+          ci["cls"] = slim_cls
+        slim_chk.append(ci)
+      cw["checklist"] = slim_chk
+    cw["search_text"] = _build_card_search_text(cw)
+    slim_works.append(cw)
+
+  # Preserve unanswered_tray (including thread_id) intact while dropping unused candidates list
+  out = dict(projection)
+  out["works"] = slim_works
+  out.pop("candidates", None)
+  return out
 
 
 def _build_ssr_checklist_peers(
@@ -863,14 +1136,17 @@ def _render_ssr_card(w: dict[str, Any]) -> str:
   )
 
 
-def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
-  """Renders the standalone/embedded Workbench HTML dashboard."""
-  counts = projection.get("counts") or {}
-  metrics = projection.get("metrics") or {}
-  works = projection.get("works") or []
-  tray = projection.get("unanswered_tray") or []
-  synced_et = _esc(projection.get("synced_et") or "")
-  initial_json = json.dumps(projection, ensure_ascii=False).replace("</", "<\\/")
+def render_workbench_html(
+    projection: Mapping[str, Any], ui_version: int, *, _already_slim: bool = False
+) -> str:
+  """Renders the standalone/embedded Workbench HTML dashboard from a slimmed UI projection."""
+  slim_proj = projection if _already_slim else slim_ui_projection(projection)
+  counts = slim_proj.get("counts") or {}
+  metrics = slim_proj.get("metrics") or {}
+  works = slim_proj.get("works") or []
+  tray = slim_proj.get("unanswered_tray") or []
+  synced_et = _esc(slim_proj.get("synced_et") or "")
+  initial_json = json.dumps(slim_proj, ensure_ascii=False).replace("</", "<\\/")
   ssr_body = "\n".join(_render_ssr_card(w) for w in works[:40])
   precision_pct = int(round(float(metrics.get("link_precision", 1.0)) * 100))
   # Compute initial SSR chip counts directly from works for activeFilter='all', type='all'
@@ -2415,7 +2691,13 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   function cardMatchesSlice(w, laneFilter, typeFilter, q) {{
     if (!matchesLane(w, laneFilter)) return false;
     if (!matchesTypeForLane(w, laneFilter, typeFilter)) return false;
-    if (q && !JSON.stringify(w).toLowerCase().includes(q)) return false;
+    // Match against precomputed search_text to avoid O(cards * chips) JSON.stringify passes
+    if (q) {{
+      const hay = (w && typeof w.search_text === 'string')
+        ? w.search_text
+        : JSON.stringify(w).toLowerCase();
+      if (!hay.includes(q)) return false;
+    }}
     return true;
   }}
 
@@ -2440,10 +2722,18 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       }} else {{
         continue;
       }}
-      chip.setAttribute('data-count', String(cnt));
+      // Skip redundant DOM attribute and innerHTML writes when chip counts are unchanged
+      const prevCnt = chip.getAttribute('data-count');
+      const nextCnt = String(cnt);
+      if (prevCnt !== nextCnt) {{
+        chip.setAttribute('data-count', nextCnt);
+      }}
       const baseLbl = chip.getAttribute('data-base-label');
       if (baseLbl) {{
-        chip.innerHTML = `${{esc(baseLbl)}} <span class="wb-chip-cnt">(${{cnt}})</span>`;
+        const nextHtml = `${{esc(baseLbl)}} <span class="wb-chip-cnt">(${{cnt}})</span>`;
+        if (chip.innerHTML !== nextHtml) {{
+          chip.innerHTML = nextHtml;
+        }}
       }}
     }}
   }}
@@ -2511,6 +2801,19 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       notifyParentRendered();
     }}
   }});
+  // Bind SSR filter chips upfront so clicks respond before full card-body setup finishes
+  for (const chip of document.querySelectorAll('.wb-chip')) {{
+    chip.addEventListener('click', () => {{
+      const typeAttr = chip.getAttribute('data-type');
+      const laneAttr = chip.getAttribute('data-filter');
+      if (typeAttr !== null) {{
+        activeTypeFilter = typeAttr || 'all';
+      }} else if (laneAttr !== null) {{
+        activeFilter = laneAttr || 'all';
+      }}
+      render();
+    }});
+  }}
 
   function esc(s) {{
     const d = document.createElement('div');
@@ -2536,6 +2839,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       }}
       state = await resp.json();
       render();
+      lastRenderedSig = projectionRenderSignature(state);
       return true;
     }} catch (err) {{
       window.alert(`Network error: ${{err && err.message ? err.message : err}}`);
@@ -3914,20 +4218,6 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     void postJson('/api/sync', {{}});
   }});
 
-  // Update orthogonal Lane and Type filter axes independently on chip clicks
-  for (const chip of document.querySelectorAll('.wb-chip')) {{
-    chip.addEventListener('click', () => {{
-      const typeAttr = chip.getAttribute('data-type');
-      const laneAttr = chip.getAttribute('data-filter');
-      if (typeAttr !== null) {{
-        activeTypeFilter = typeAttr || 'all';
-      }} else if (laneAttr !== null) {{
-        activeFilter = laneAttr || 'all';
-      }}
-      render();
-    }});
-  }}
-
   // Smart-default sort direction on mode switch: Age surfaces longest-open first (asc)
   const sortModeEl = document.getElementById('wb-sort-mode');
   if (sortModeEl) {{
@@ -4184,27 +4474,108 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     }}
   }});
 
-  render();
-  notifyParentRendered();
-  setInterval(async () => {{
-    try {{
-      const r = await fetch('/api/state');
-      if (r.ok) {{
-        state = await r.json();
-        render();
-        notifyParentRendered();
+  const RE_REL_ET_SUFFIX = /\\s*\\((?:just now|(?:\\d+[mhd]\\s+)+ago)\\)$/i;
+
+  // Strip volatile sync clock and relative "(Xm ago)" suffixes to detect real card deltas
+  function projectionRenderSignature(st) {{
+    if (!st || typeof st !== 'object') return '';
+    const payload = {{
+      counts: st.counts || {{}},
+      metrics: st.metrics || {{}},
+      unanswered_tray: st.unanswered_tray || [],
+      works: st.works || [],
+    }};
+    // Drop derived search_text and minute-ticking relative ET suffixes from render comparison
+    return JSON.stringify(payload, (k, v) => {{
+      if (k === 'synced_et' || k === 'search_text') return undefined;
+      if (typeof v === 'string' && k.endsWith('_et')) {{
+        return v.replace(RE_REL_ET_SUFFIX, '');
       }}
-    }} catch {{}}
-  }}, 30000);
+      return v;
+    }});
+  }}
+
+  render();
+  let lastRenderedSig = projectionRenderSignature(state);
+  let pollInFlight = false;
+  notifyParentRendered();
+
+  // Poll /api/state every 60s with timeout and skip innerHTML rebuilds when data is unchanged
+  async function pollState() {{
+    // Serialize background polls so slow network responses never overlap
+    if (pollInFlight) return;
+    pollInFlight = true;
+    const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), 15000) : 0;
+    if (timer && typeof timer.unref === 'function') timer.unref();
+    try {{
+      const reqOpts = ctrl
+        ? {{ cache: 'no-store', signal: ctrl.signal }}
+        : {{ cache: 'no-store' }};
+      const r = await fetch('/api/state', reqOpts);
+      if (!r || !r.ok) return;
+      const nextState = await r.json();
+      const nextVer = Number((nextState && nextState.ui_version) || 0);
+      // Reload full HTML on daemon code updates only when no inline draft editor holds unsaved text
+      if (
+        UI_VERSION > 0
+        && nextVer > 0
+        && nextVer !== UI_VERSION
+        && Object.keys(openDraftEditors).length === 0
+        && window.location
+        && typeof window.location.reload === 'function'
+      ) {{
+        window.location.reload();
+        return;
+      }}
+      const nextSig = projectionRenderSignature(nextState);
+      state = nextState;
+      // Fast-path no-op syncs: update timestamp and parent watchdog heartbeat without DOM rebuilds
+      if (lastRenderedSig && nextSig === lastRenderedSig) {{
+        const syncedEl = document.getElementById('wb-synced');
+        if (syncedEl) {{
+          syncedEl.textContent = 'Synced ' + ((state && state.synced_et) || '');
+        }}
+        notifyParentRendered();
+        return;
+      }}
+      // Preserve vertical scroll offset across real card list updates
+      const prevScrollY = typeof window.scrollY === 'number' ? window.scrollY : 0;
+      render();
+      lastRenderedSig = nextSig;
+      if (typeof window.scrollTo === 'function') {{
+        window.scrollTo(0, prevScrollY);
+      }}
+      notifyParentRendered();
+    }} catch {{}} finally {{
+      if (timer) clearTimeout(timer);
+      pollInFlight = false;
+    }}
+  }}
+
+  const pollTimer = setInterval(pollState, 60000);
+  if (pollTimer && typeof pollTimer.unref === 'function') pollTimer.unref();
 }})();
 </script>
 </body>
 </html>"""
 
 
+def _file_stat_sig(path: str) -> tuple[int, int]:
+  """Returns (mtime_ns, size) for path, or (0, 0) when missing."""
+  try:
+    st = os.stat(path)
+    return (st.st_mtime_ns, st.st_size)
+  except OSError:
+    return (0, 0)
+
+
 class WorkbenchHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
   allow_reuse_address = True
   daemon_threads = True
+  refresh_snapshot: Any = None
+  bg_sync_guard: Any = None
+  get_cached_projection: Any = None
 
 
 def create_server(
@@ -4215,24 +4586,115 @@ def create_server(
     watcher_state_path: str = ingestor.DEFAULT_WATCHER_STATE,
     info_path: str = DEFAULT_INFO_FILE,
 ) -> WorkbenchHTTPServer:
-  """Creates a configured WorkbenchHTTPServer instance."""
+  """Creates a configured WorkbenchHTTPServer with non-blocking snapshot caching."""
   active_store = store or work_store.WorkStore()
+  cache_lock = threading.Lock()
+  gen_seq = 0
+  bg_sync_depth = 0
+  snapshot_cache: dict[str, Any] = {
+      "gen": 0,
+      "sig": None,
+      "proj": None,
+      "json_bytes": b"",
+      "html_bytes": b"",
+  }
+
+  @contextlib.contextmanager
+  def bg_sync_guard() -> Iterator[None]:
+    """Marks a multi-step sync cycle active so HTTP GETs serve warm cache over torn DB states."""
+    nonlocal bg_sync_depth
+    with cache_lock:
+      bg_sync_depth += 1
+    try:
+      yield
+    finally:
+      with cache_lock:
+        bg_sync_depth = max(0, bg_sync_depth - 1)
+
+  def source_signature() -> tuple[Any, ...]:
+    """Computes a lock-free version tuple across in-process SQLite writes and state files."""
+    return (
+        active_store.write_seq,
+        _file_stat_sig(active_store.db_path),
+        _file_stat_sig(f"{active_store.db_path}-wal"),
+        _file_stat_sig(cl_state_path),
+        _file_stat_sig(watcher_state_path),
+    )
+
+  def refresh_snapshot(
+      nonblocking: bool = False, fallback: dict[str, Any] | None = None
+  ) -> dict[str, Any]:
+    """Builds a slimmed UI projection under store._lock and encodes bytes outside the lock."""
+    nonlocal gen_seq
+    if nonblocking:
+      if not active_store._lock.acquire(blocking=False):
+        return fallback if fallback is not None else {}
+    else:
+      active_store._lock.acquire()
+    try:
+      cl_state = ingestor.load_cl_watcher_snapshot(cl_state_path)
+      w_state: dict[str, Any] = {}
+      # Fall back to an empty unanswered tray if watcher_state.json is mid-rotation or unreadable
+      if os.path.isfile(watcher_state_path):
+        try:
+          with open(watcher_state_path, "r", encoding="utf-8") as f:
+            w_state = json.load(f)
+        except Exception:
+          w_state = {}
+      raw_proj = active_store.build_dashboard_projection(
+          cl_watcher_state=cl_state,
+          unanswered_threads=w_state.get("unanswered_tray") or [],
+      )
+      slim_proj = slim_ui_projection(raw_proj)
+      slim_proj["ui_version"] = _INITIAL_MTIME
+      sig_after = source_signature()
+      gen_seq += 1
+      snap_gen = gen_seq
+    finally:
+      active_store._lock.release()
+    # Encode UTF-8 JSON and SSR HTML outside active_store._lock so SQLite writers never wait on it
+    json_bytes = json.dumps(slim_proj, ensure_ascii=False).encode("utf-8")
+    html_bytes = render_workbench_html(
+        slim_proj, _INITIAL_MTIME, _already_slim=True
+    ).encode("utf-8")
+    snap = {
+        "gen": snap_gen,
+        "sig": sig_after,
+        "proj": slim_proj,
+        "json_bytes": json_bytes,
+        "html_bytes": html_bytes,
+    }
+    with cache_lock:
+      # Never let an older slow HTML encode overwrite a newer POST or sync snapshot generation
+      if snap_gen >= int(snapshot_cache["gen"] or 0):
+        snapshot_cache.update(snap)
+        return snap
+      return dict(snapshot_cache)
+
+  def get_http_snapshot() -> dict[str, Any]:
+    """Returns a fresh snapshot when uncontended, or the warm cached snapshot during syncs."""
+    cur_sig = source_signature()
+    with cache_lock:
+      if snapshot_cache["proj"] is not None and snapshot_cache["sig"] == cur_sig:
+        return dict(snapshot_cache)
+      has_warm = snapshot_cache["proj"] is not None
+      in_bg_sync = bg_sync_depth > 0
+      warm_copy = dict(snapshot_cache)
+    # Serve warm cache while multi-step sync runs or store._lock is contended
+    if has_warm and in_bg_sync:
+      return warm_copy
+    if has_warm:
+      return refresh_snapshot(nonblocking=True, fallback=warm_copy)
+    return refresh_snapshot()
 
   def current_projection() -> dict[str, Any]:
-    cl_state = ingestor.load_cl_watcher_snapshot(cl_state_path)
-    w_state: dict[str, Any] = {}
-    if os.path.isfile(watcher_state_path):
-      try:
-        with open(watcher_state_path, "r", encoding="utf-8") as f:
-          w_state = json.load(f)
-      except Exception:
-        w_state = {}
-    proj = active_store.build_dashboard_projection(
-        cl_watcher_state=cl_state,
-        unanswered_threads=w_state.get("unanswered_tray") or [],
-    )
-    proj["ui_version"] = _INITIAL_MTIME
-    return proj
+    """Refreshes the cached slim projection synchronously after POST mutations."""
+    return refresh_snapshot()["proj"]
+
+  def get_cached_projection() -> dict[str, Any]:
+    """Returns a shallow copy of the currently cached slim projection dictionary."""
+    with cache_lock:
+      return dict(snapshot_cache["proj"] or {})
 
   class Handler(http.server.BaseHTTPRequestHandler):
 
@@ -4240,37 +4702,39 @@ def create_server(
       del fmt, args
       return
 
-    def _send_json(self, data: Any, status: int = 200) -> None:
-      raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
-      self.send_response(status)
-      self.send_header("Content-Type", "application/json; charset=utf-8")
-      self.send_header("Cache-Control", "no-store")
-      self.send_header("Access-Control-Allow-Origin", "*")
-      self.send_header("Content-Length", str(len(raw)))
-      self.end_headers()
-      self.wfile.write(raw)
+    def _send_bytes(self, raw: bytes, content_type: str, status: int = 200) -> None:
+      """Writes pre-encoded response bytes while ignoring mid-flight client disconnects."""
+      try:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        if content_type.startswith("application/json"):
+          self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+      except (BrokenPipeError, ConnectionResetError):
+        return
 
-    def _send_html(self, html_str: str, status: int = 200) -> None:
-      raw = html_str.encode("utf-8")
-      self.send_response(status)
-      self.send_header("Content-Type", "text/html; charset=utf-8")
-      self.send_header("Cache-Control", "no-store")
-      self.send_header("Content-Length", str(len(raw)))
-      self.end_headers()
-      self.wfile.write(raw)
+    def _send_json(self, data: Any, status: int = 200) -> None:
+      """Serializes data as UTF-8 JSON and writes it to the HTTP client."""
+      raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+      self._send_bytes(raw, "application/json; charset=utf-8", status=status)
 
     def do_GET(self) -> None:
+      """Serves cached or refreshed /api/state JSON and / HTML without blocking on sync locks."""
       parsed = urllib.parse.urlparse(self.path)
       if parsed.path == "/api/state":
-        self._send_json(current_projection())
+        snap = get_http_snapshot()
+        self._send_bytes(snap["json_bytes"], "application/json; charset=utf-8")
         return
       if parsed.path == "/favicon.ico":
         self.send_response(204)
         self.end_headers()
         return
       if parsed.path in ("/", "/index.html"):
-        proj = current_projection()
-        self._send_html(render_workbench_html(proj, _INITIAL_MTIME))
+        snap = get_http_snapshot()
+        self._send_bytes(snap["html_bytes"], "text/html; charset=utf-8")
         return
       self._send_json({"error": "Not found"}, status=404)
 
@@ -4407,7 +4871,8 @@ def create_server(
         except RuntimeError as exc:
           self._send_json({"error": str(exc)}, status=502)
           return
-        proj = current_projection()
+        # Copy cached projection dict before attaching one-shot materialization metadata
+        proj = dict(current_projection())
         proj["materialized"] = mat
         self._send_json(proj)
         return
@@ -4462,24 +4927,29 @@ def create_server(
         return
 
       if parsed.path == "/api/sync":
-        ingestor.run_sync_cycle(
-            active_store,
-            cl_state_path=cl_state_path,
-            watcher_state_path=watcher_state_path,
-            include_gmail=True,
-        )
+        with bg_sync_guard():
+          ingestor.run_sync_cycle(
+              active_store,
+              cl_state_path=cl_state_path,
+              watcher_state_path=watcher_state_path,
+              include_gmail=True,
+          )
         self._send_json(current_projection())
         return
 
       self._send_json({"error": "Unknown endpoint"}, status=404)
 
   srv = WorkbenchHTTPServer((host, port), Handler)
+  srv.refresh_snapshot = refresh_snapshot
+  srv.bg_sync_guard = bg_sync_guard
+  srv.get_cached_projection = get_cached_projection
   actual_port = srv.server_address[1]
   export_workbench_info(actual_port, info_path=info_path)
   return srv
 
 
 def main(argv: list[str] | None = None) -> int:
+  """Runs the Workbench HTTP server and periodic background sync loop."""
   parser = argparse.ArgumentParser(description="Workbench HTTP server & passive sync daemon")
   parser.add_argument("--host", default="0.0.0.0")
   parser.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -4494,20 +4964,22 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
   srv = create_server(host=args.host, port=args.port, store=store)
+  # Warm initial snapshot from SQLite before bg_loop runs the first external sync cycle
+  srv.refresh_snapshot()
   stop_event = threading.Event()
 
   def bg_loop() -> None:
-    try:
-      ingestor.run_sync_cycle(store)
-      export_workbench_info(args.port)
-    except Exception:
-      pass
-    while not stop_event.wait(max(10, args.interval)):
+    """Executes periodic ingestor sync cycles and swaps the pre-encoded UI snapshot."""
+    while True:
       try:
-        ingestor.run_sync_cycle(store)
+        with srv.bg_sync_guard():
+          ingestor.run_sync_cycle(store)
+        srv.refresh_snapshot()
         export_workbench_info(args.port)
       except Exception:
         pass
+      if stop_event.wait(max(10, args.interval)):
+        break
 
   t = threading.Thread(target=bg_loop, daemon=True)
   t.start()
