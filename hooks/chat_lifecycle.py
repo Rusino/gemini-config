@@ -3371,12 +3371,59 @@ def create_handoff(
 ROADMAP_ITEM_ID_RE = re.compile(r"^R[1-9]\d*(?:\.[1-9]\d*)*$", re.IGNORECASE)
 
 
+def _chain_open_own_gerrit_cls(
+    project_id: str,
+    chain: list[str],
+    doc: dict | None = None,
+    extra_texts: list[str] | None = None,
+    projects_dir: str = "",
+    other_chain_owners: set[str] | None = None,
+) -> list[dict]:
+  """Returns open NEW self-owned non-companion Gerrit CLs tied to chain in project_id."""
+  if not project_id or project_id == "outside-of-project" or not chain:
+    return []
+  import roadmap
+
+  if roadmap.is_meta_project(project_id, projects_dir=projects_dir):
+    return []
+  if doc is None:
+    try:
+      doc = roadmap.load(project_id)
+    except Exception:
+      doc = None
+  chain_set = {c for c in chain if c}
+  texts: list[str] = [t for t in (extra_texts or ()) if t]
+  if isinstance(doc, dict):
+    for it in doc.get("items", []):
+      owner_cid = (it.get("owner") or "").strip()
+      link_cid = (it.get("link") or "").strip()
+      updated_cid = (it.get("updated_by") or "").strip()
+      # Prefer explicit owner/link over updated_by so orchestrators do not inherit worker items
+      assigned_cids = {c for c in (owner_cid, link_cid) if c}
+      matches_chain = (
+          bool(assigned_cids & chain_set)
+          if assigned_cids
+          else (updated_cid in chain_set)
+      )
+      if matches_chain:
+        txt = (it.get("text") or "").strip()
+        if txt:
+          texts.append(txt)
+  return roadmap.resolve_open_own_gerrit_cls(
+      texts,
+      chain_cids=chain_set,
+      include_watcher_chain=True,
+      other_chain_owners=other_chain_owners,
+  )
+
+
 # Finalizes open sibling chats in project_id that completed roadmap items and own no open items
 def sweep_completed_project_chats(
     project_id: str,
     exclude_cids: set[str] | None = None,
     finalized_cids: set[str] | None = None,
 ) -> list[list[str]]:
+  """Archives open sibling chains in project_id that own no open roadmap items or NEW own CLs."""
   if not project_id or project_id == "outside-of-project":
     return []
   try:
@@ -3430,6 +3477,13 @@ def sweep_completed_project_chats(
     leaf_title = get_conversation_title(leaf_id)
     if not leaf_title or is_archived(leaf_id) or is_waiting_title(leaf_title):
       continue
+    piece_titles = [
+        leaf_title if c == leaf_id else get_conversation_title(c) for c in chain
+    ]
+    if _chain_open_own_gerrit_cls(
+        project_id, chain, doc=doc, extra_texts=piece_titles
+    ):
+      continue
     # A finalized chat drops out of sight, so live work must not report into it; with live
     # state unknown nothing is finalized
     if not live_fetched:
@@ -3469,6 +3523,7 @@ def create_next_task(
     force: bool = False,
     ignore_live: bool = False,
 ) -> dict:
+  """Archives current_conv_id's chain and starts a fresh root chat for the next roadmap item."""
   if not current_conv_id:
     raise ValueError("current_conv_id must not be empty")
 
@@ -3493,21 +3548,62 @@ def create_next_task(
 
   doc = roadmap.load(project_id)
   norm_id = item_id.strip().upper() if item_id else ""
+  caller_chain = discover_conversation_chain(current_conv_id) or [current_conv_id]
+  caller_chain_set = set(caller_chain)
 
-  # Refuse to abandon an in-flight doing item owned by current_conv_id without closing it first
+  # Refuse to abandon an in-flight doing item owned or linked on any piece of caller_chain
   owned_doing = [
       it["id"]
       for it in doc.get("items", [])
       if it.get("status") == "doing"
-      and it.get("owner") == current_conv_id
+      and (
+          (it.get("owner") or "").strip() in caller_chain_set
+          or (it.get("link") or "").strip() in caller_chain_set
+      )
       and it.get("id") != norm_id
   ]
   if owned_doing and not force:
     raise RuntimeError(
-        f"conversation {current_conv_id[:8]} still owns 'doing' item(s)"
+        f"conversation {current_conv_id[:8]} chain still owns 'doing' item(s)"
         f" {', '.join(owned_doing)}: mark them done/todo via `roadmap.py set`"
         " before starting the next task"
     )
+
+  # Refuse to strand an open todo item explicitly linked to caller_chain
+  linked_todo = [
+      it["id"]
+      for it in doc.get("items", [])
+      if it.get("status") == "todo"
+      and (
+          (it.get("owner") or "").strip() in caller_chain_set
+          or (it.get("link") or "").strip() in caller_chain_set
+      )
+      and it.get("id") != norm_id
+  ]
+  if linked_todo and not force:
+    raise RuntimeError(
+        f"conversation {current_conv_id[:8]} chain still links open 'todo'"
+        f" item(s) {', '.join(linked_todo)}: close or re-link them before"
+        " starting the next task"
+    )
+
+  if not force:
+    piece_titles = [get_conversation_title(c) for c in caller_chain]
+    open_cls = _chain_open_own_gerrit_cls(
+        project_id,
+        caller_chain,
+        doc=doc,
+        extra_texts=piece_titles,
+    )
+    if open_cls:
+      cl_desc = ", ".join(f"Gerrit {c['cl_id']}" for c in open_cls)
+      raise RuntimeError(
+          f"conversation {current_conv_id[:8]} chain still has open NEW"
+          f" self-owned CL(s) ({cl_desc}); next-task archives the caller chain,"
+          " so launch a separate chat via `python3"
+          ' ~/.gemini/config/hooks/chat_lifecycle.py start --title "<Topic>"'
+          ' "<prompt>"` instead (or pass --force)'
+      )
 
   # Auto-select the first top-level todo item (or any todo item) when item_id is omitted
   if not norm_id:
@@ -3529,7 +3625,7 @@ def create_next_task(
   if st in ("done", "dropped"):
     raise RuntimeError(f"roadmap item {norm_id} is already {st}")
   owner = target_item.get("owner") or ""
-  if st == "doing" and owner and owner != current_conv_id and not force:
+  if st == "doing" and owner and owner not in caller_chain_set and not force:
     raise RuntimeError(
         f"roadmap item {norm_id} is already 'doing' in conversation {owner[:8]}"
     )
@@ -3923,10 +4019,56 @@ def archive_project_conversations(
   active_chats.sort(key=lambda x: x[0])
   if keep > 0:
     to_keep = [cid for _, cid in active_chats[-keep:]]
-    to_archive = [cid for _, cid in active_chats[:-keep]]
+    raw_to_archive = [cid for _, cid in active_chats[:-keep]]
   else:
     to_keep = []
-    to_archive = [cid for _, cid in active_chats]
+    raw_to_archive = [cid for _, cid in active_chats]
+
+  doc: dict | None = None
+  open_item_cids: set[str] = set()
+  if target_project_id and target_project_id != "outside-of-project":
+    try:
+      import roadmap
+
+      doc = roadmap.load(target_project_id)
+      for it in doc.get("items", []):
+        if it.get("status") in ("doing", "todo"):
+          for field in ("owner", "link"):
+            val = (it.get(field) or "").strip()
+            if val:
+              open_item_cids.add(val)
+    except Exception:
+      doc = None
+
+  def _SummaryTitle(conv_id: str) -> str:
+    rec = summaries.get(conv_id) if isinstance(summaries.get(conv_id), dict) else {}
+    ann = (rec.get("annotations") or {}) if isinstance(rec, dict) else {}
+    return str(ann.get("title") or get_conversation_title(conv_id) or "").strip()
+
+  # Never retention-archive chats with waiting markers, live tasks, open items, or NEW own CLs
+  to_archive: list[str] = []
+  for cid in raw_to_archive:
+    chain = discover_conversation_chain(cid) or [cid]
+    s_title = _SummaryTitle(cid)
+    if (
+        is_waiting_title(s_title)
+        or any(c in open_item_cids for c in chain)
+        or list_live_dependents(chain, summaries, include_running=True)
+    ):
+      to_keep.append(cid)
+      continue
+    piece_titles = [t for t in (_SummaryTitle(c) for c in chain) if t]
+    # Keep chains that still own open Gerrit CLs so retention never hides active reviews
+    if _chain_open_own_gerrit_cls(
+        target_project_id,
+        chain,
+        doc=doc,
+        extra_texts=piece_titles,
+        projects_dir=projects_dir,
+    ):
+      to_keep.append(cid)
+      continue
+    to_archive.append(cid)
 
   if not to_archive:
     return {
@@ -4113,8 +4255,10 @@ def audit_conversations(
 
   raw_parent, _, created_at_of = _scan_transcript_graph()
 
-  # Determine visible top-level conversations
+  # Determine visible top-level conversations and track non-top-level / archived sets
   visible_ids: set[str] = set()
+  archived_ids: set[str] = set(archived_on_disk)
+  excluded_non_top_ids: set[str] = set()
   ls_titles: dict[str, str] = {}
   ls_projects: dict[str, str] = {}
   if ls_online and ls_summaries is not None:
@@ -4122,31 +4266,44 @@ def audit_conversations(
       if not isinstance(s, dict):
         continue
       ann = s.get("annotations") or {}
-      if ann.get("archived") or cid in archived_on_disk:
-        continue
       meta = s.get("trajectoryMetadata") or {}
       if meta.get("parentConversationId") or meta.get("isBattleModeFork"):
+        excluded_non_top_ids.add(cid)
         continue
       ls_t = str(ann.get("title") or s.get("summary") or "").strip()
       pid = str(meta.get("projectId") or "").strip()
+      cat = str(meta.get("createdAt") or "").strip()
       source_meta = meta.get("sourceMetadata") or {}
-      if (
+      is_hidden_tool = bool(
           source_meta.get("tool")
           or source_meta.get("hideFromConversationList")
           or source_meta.get("hide_from_conversation_list")
-      ):
+      )
+      if ann.get("archived") or cid in archived_on_disk:
+        if is_hidden_tool:
+          excluded_non_top_ids.add(cid)
+        else:
+          archived_ids.add(cid)
+          if ls_t:
+            ls_titles[cid] = ls_t
+          if pid:
+            ls_projects[cid] = pid
+          if cat:
+            created_at_of[cid] = cat
+        continue
+      if is_hidden_tool:
         eff_title = pbtxt_titles.get(cid) or db_titles.get(cid) or ls_t
         eff_pid = pid or db_projects.get(cid) or ""
         if (
             parse_title_marker(eff_title) not in LEGACY_CLOSED_MARKERS
             and eff_pid not in archived_project_ids
         ):
+          excluded_non_top_ids.add(cid)
           continue
       visible_ids.add(cid)
       ls_titles[cid] = ls_t
       if pid:
         ls_projects[cid] = pid
-      cat = str(meta.get("createdAt") or "").strip()
       if cat:
         created_at_of[cid] = cat
   else:
@@ -4292,6 +4449,110 @@ def audit_conversations(
             "fixed": is_fixed,
         })
 
+  # Report archived chains and forked branches that still own open roadmap items or NEW own CLs
+  all_known_ids = (
+      (
+          set(visible_ids)
+          | set(pbtxt_titles.keys())
+          | set(db_titles.keys())
+          | set(ls_titles.keys())
+          | set(archived_ids)
+      )
+      - excluded_non_top_ids
+  )
+  all_parent, all_children = link_visible_chains(all_known_ids, raw_parent)
+  # Exclude ancestors shared with any visible open branch so open forks are not misreported
+  visible_branch_ids: set[str] = set()
+  for vcid in visible_ids:
+    cur_v: str | None = vcid
+    seen_v: set[str] = set()
+    while cur_v and cur_v not in seen_v:
+      seen_v.add(cur_v)
+      visible_branch_ids.add(cur_v)
+      cur_v = all_parent.get(cur_v)
+
+  archived_leaves = sorted(
+      (
+          c
+          for c in all_known_ids
+          if not all_children.get(c)
+          and c not in visible_ids
+          and c in archived_ids
+      ),
+      key=lambda c: (created_at_of.get(c, ""), c),
+      reverse=True,
+  )
+  claimed_archived_nodes: set[str] = set(visible_branch_ids)
+  roadmaps_cache: dict[str, dict | None] = {}
+  import roadmap
+
+  for leaf_id in archived_leaves:
+    rev_path: list[str] = []
+    cur_p: str | None = leaf_id
+    seen_p: set[str] = set()
+    while cur_p and cur_p not in seen_p:
+      seen_p.add(cur_p)
+      rev_path.append(cur_p)
+      cur_p = all_parent.get(cur_p)
+    full_path = list(reversed(rev_path))
+    branch = [c for c in full_path if c not in claimed_archived_nodes]
+    claimed_archived_nodes.update(branch)
+    if not branch:
+      continue
+    chain_pids = [
+        _ProjectOf(c)
+        for c in reversed(full_path)
+        if _ProjectOf(c) != "outside-of-project"
+    ]
+    pid = chain_pids[0] if chain_pids else "outside-of-project"
+    # Skip chains in archived projects or outside the requested project filter
+    if pid in archived_project_ids:
+      continue
+    if target_project_id and not any(
+        _ProjectOf(c) == target_project_id for c in full_path
+    ):
+      continue
+    if pid not in roadmaps_cache:
+      if pid == "outside-of-project":
+        roadmaps_cache[pid] = None
+      else:
+        try:
+          roadmaps_cache[pid] = roadmap.load(pid)
+        except Exception:
+          roadmaps_cache[pid] = None
+    rdoc = roadmaps_cache[pid]
+    branch_set = set(branch)
+    live_work: list[str] = []
+    if isinstance(rdoc, dict):
+      for it in rdoc.get("items", []):
+        if it.get("status") in ("doing", "todo") and (
+            (it.get("owner") or "").strip() in branch_set
+            or (it.get("link") or "").strip() in branch_set
+        ):
+          live_work.append(f"roadmap {it['id']} ({it['status']})")
+    open_cls = _chain_open_own_gerrit_cls(
+        pid,
+        branch,
+        doc=rdoc,
+        extra_texts=[_BestTitle(c) for c in branch],
+        projects_dir=projects_dir,
+        other_chain_owners=all_known_ids - branch_set,
+    )
+    for cl_info in open_cls:
+      live_work.append(f"Gerrit {cl_info['cl_id']} (NEW)")
+    # Never auto-unarchive on --fix; surface leaf_id so reopening stays an explicit user choice
+    if live_work:
+      leaf_pid = _ProjectOf(leaf_id)
+      discrepancies.append({
+          "conversation_id": leaf_id,
+          "project_id": pid if leaf_pid == "outside-of-project" else leaf_pid,
+          "chain_position": f"{len(full_path)}/{len(full_path)}",
+          "issues": ["archived_with_live_work"],
+          "live_work": live_work,
+          "title": _BestTitle(leaf_id),
+          "fixed": False,
+      })
+
   export_chain_index()
   return {
       "ls_online": ls_online,
@@ -4363,7 +4624,10 @@ Commands:
                                       for storage desync (LS RPC vs .pbtxt vs SQLite)
                                       and broken/double markers; visible handed-off
                                       pieces and old «…»-closed chats are reported as
-                                      should_be_archived. --fix retitles / archives.
+                                      should_be_archived, while archived chains with
+                                      open roadmap items or NEW own Gerrit CLs are
+                                      reported as archived_with_live_work (never
+                                      auto-unarchived). --fix retitles / archives.
   archive [<id...>] [--chain]         Archive the specified conversation(s) (or their
           [--project <p>] [--keep <N>] entire handoff chain with --chain) via LS RPC
                                       and annotations/<id>.pbtxt. With --project,

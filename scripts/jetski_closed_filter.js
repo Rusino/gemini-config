@@ -104,6 +104,7 @@
 
   const BUCKET_ORDER = ['needs-me', 'working', 'waiting'];
   const SEARCH_BTN_CLASS = 'jetski-chat-search-btn';
+  const SIDEBAR_SEARCH_BTN_CLASS = 'jetski-sidebar-search-btn';
   const LOCATE_BTN_CLASS = 'jetski-chat-locate-btn';
   const LOCATED_ROW_ATTR = 'data-jetski-located-row';
   const SEARCH_PANEL_ID = 'jetski-chat-search-panel';
@@ -7105,7 +7106,8 @@
         display: block;
         background: #d97706;
       }
-      /* Flight Deck and Workbench side panel toggle buttons */
+      /* Sidebar search fallback, Flight Deck, and Workbench side panel toggle buttons */
+      .${SIDEBAR_SEARCH_BTN_CLASS},
       .${FLIGHT_DECK_TOGGLE_BTN_CLASS},
       .${WORKBENCH_TOGGLE_BTN_CLASS} {
         position: relative;
@@ -7126,6 +7128,7 @@
         flex-shrink: 0;
         transition: background-color 100ms ease, color 100ms ease;
       }
+      .${SIDEBAR_SEARCH_BTN_CLASS}:hover,
       .${FLIGHT_DECK_TOGGLE_BTN_CLASS}:hover,
       .${WORKBENCH_TOGGLE_BTN_CLASS}:hover {
         background: var(--sidebar-secondary, rgba(128, 134, 139, 0.16));
@@ -8626,15 +8629,104 @@
     }
   }
 
+  let openSearchSeq = 0;
+  // Cancels any in-flight openSearchPanel call and removes mounted search panels
   function closeSearchPanel() {
-    document.getElementById(SEARCH_PANEL_ID)?.remove();
+    ++openSearchSeq;
+    for (const el of document.querySelectorAll(`#${SEARCH_PANEL_ID}`)) {
+      el.remove();
+    }
   }
 
   let searchSeq = 0;
-  // Searches every piece of the chain; steps are fetched once per opened panel
+  // Queries Language Server SearchConversations and renders global hit cards (null when stale)
+  async function fetchGlobalSearchHtml(needle, isStale) {
+    const url = resolveApiUrl(
+      '/exa.language_server_pb.LanguageServerService/SearchConversations'
+    );
+    const resp = await window.fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-codeium-csrf-token': getCsrfToken(),
+      },
+      body: JSON.stringify({ query: needle }),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status} ${await resp.text()}`);
+    const data = await resp.json();
+    if (isStale()) return null;
+    const rawResults = Array.isArray(data?.results) ? data.results : [];
+    if (rawResults.length === 0) return '';
+
+    // Resolve chain position and archive state per hit so results show piece index and badge
+    const items = [];
+    for (const r of rawResults) {
+      const cid = r.cascadeId || '';
+      if (!cid) continue;
+      let chain = [cid];
+      try {
+        chain = await chainOf(cid);
+      } catch {
+        chain = [cid];
+      }
+      if (isStale()) return null;
+      const pieceIdx = chain.indexOf(cid);
+      const piece = pieceIdx >= 0 ? pieceIdx + 1 : 1;
+      const isArchived = Boolean(r.archived || isArchivedCascadeId(cid));
+      const title = r.title || cid;
+      const snippet = r.snippet || '';
+      items.push({
+        cid,
+        piece,
+        chainLength: chain.length,
+        isArchived,
+        title,
+        snippet,
+        matchedStepIndex: r.matchedStepIndex ?? -1,
+      });
+    }
+
+    return items
+      .map((it) => {
+        const metaParts = [];
+        if (it.chainLength > 1) {
+          metaParts.push(`piece ${it.piece}/${it.chainLength}`);
+        }
+        if (it.isArchived) {
+          metaParts.push('🗄 archived');
+        }
+        if (it.matchedStepIndex >= 0) {
+          metaParts.push(`step ${it.matchedStepIndex}`);
+        }
+        const metaStr = metaParts.length > 0 ? ` · ${metaParts.join(' · ')}` : '';
+        const titleHtml = escapeHtml(it.title);
+        let snippetHtml = escapeHtml(it.snippet);
+        const lowerSnip = it.snippet.toLowerCase();
+        const lowerNeedle = needle.toLowerCase();
+        const at = lowerSnip.indexOf(lowerNeedle);
+        if (at >= 0) {
+          snippetHtml =
+            escapeHtml(it.snippet.slice(0, at)) +
+            '<mark>' +
+            escapeHtml(it.snippet.slice(at, at + needle.length)) +
+            '</mark>' +
+            escapeHtml(it.snippet.slice(at + needle.length));
+        }
+        return (
+          `<div class="jcs-hit" data-cascade-id="${escapeHtml(it.cid)}">` +
+          `<div class="jcs-meta">${titleHtml}${metaStr}</div>` +
+          `<div>${snippetHtml}</div>` +
+          `</div>`
+        );
+      })
+      .join('');
+  }
+
+  // Searches every piece of the chain; falls back to global archived search when chain has 0 hits
   async function runChatSearch(query, resultsEl, chain, stepCache) {
     const seq = ++searchSeq;
-    const needle = query.trim().toLowerCase();
+    const rawNeedle = query.trim();
+    const needle = rawNeedle.toLowerCase();
     if (!needle) {
       resultsEl.innerHTML = '';
       return;
@@ -8671,6 +8763,20 @@
     // A slower earlier search must not overwrite results of a newer query
     if (seq !== searchSeq) return;
     if (groups.length === 0) {
+      try {
+        const globalHtml = await fetchGlobalSearchHtml(rawNeedle, () => seq !== searchSeq);
+        if (seq !== searchSeq) return;
+        if (globalHtml) {
+          resultsEl.innerHTML =
+            '<div class="jcs-meta">' +
+            'No matches in this chat chain - showing matches across all chats (incl. archived):' +
+            '</div>' +
+            globalHtml;
+          return;
+        }
+      } catch {
+        if (seq !== searchSeq) return;
+      }
       resultsEl.innerHTML = '<div class="jcs-meta">No matches</div>';
       return;
     }
@@ -8697,102 +8803,22 @@
       resultsEl.innerHTML = '';
       return;
     }
-    let data;
     try {
-      const url = resolveApiUrl(
-        '/exa.language_server_pb.LanguageServerService/SearchConversations'
-      );
-      const resp = await window.fetch(url, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-codeium-csrf-token': getCsrfToken(),
-          },
-          body: JSON.stringify({ query: needle }),
-        }
-      );
-      if (!resp.ok) throw new Error(`HTTP ${resp.status} ${await resp.text()}`);
-      data = await resp.json();
+      const globalHtml = await fetchGlobalSearchHtml(needle, () => seq !== searchSeq);
+      if (seq !== searchSeq || globalHtml === null) return;
+      resultsEl.innerHTML = globalHtml || '<div class="jcs-meta">No matches</div>';
     } catch (err) {
       if (seq === searchSeq) {
         resultsEl.innerHTML = `<div class="jcs-meta">Search failed: ${escapeHtml(err)}</div>`;
       }
-      return;
     }
-    if (seq !== searchSeq) return;
-    const rawResults = Array.isArray(data?.results) ? data.results : [];
-    if (rawResults.length === 0) {
-      resultsEl.innerHTML = '<div class="jcs-meta">No matches</div>';
-      return;
-    }
-
-    const items = [];
-    for (const r of rawResults) {
-      const cid = r.cascadeId || '';
-      if (!cid) continue;
-      let chain = [cid];
-      try {
-        chain = await chainOf(cid);
-      } catch {
-        chain = [cid];
-      }
-      if (seq !== searchSeq) return;
-      const pieceIdx = chain.indexOf(cid);
-      const piece = pieceIdx >= 0 ? pieceIdx + 1 : 1;
-      const isArchived = Boolean(r.archived || isArchivedCascadeId(cid));
-      const title = r.title || cid;
-      const snippet = r.snippet || '';
-      items.push({
-        cid,
-        piece,
-        chainLength: chain.length,
-        isArchived,
-        title,
-        snippet,
-        matchedStepIndex: r.matchedStepIndex ?? -1,
-      });
-    }
-
-    resultsEl.innerHTML = items
-      .map((it) => {
-        const metaParts = [];
-        if (it.chainLength > 1) {
-          metaParts.push(`piece ${it.piece}/${it.chainLength}`);
-        }
-        if (it.isArchived) {
-          metaParts.push('🗄 archived');
-        }
-        if (it.matchedStepIndex >= 0) {
-          metaParts.push(`step ${it.matchedStepIndex}`);
-        }
-        const metaStr = metaParts.length > 0 ? ` · ${metaParts.join(' · ')}` : '';
-        const titleHtml = escapeHtml(it.title);
-        let snippetHtml = escapeHtml(it.snippet);
-        const lowerSnip = it.snippet.toLowerCase();
-        const lowerNeedle = needle.toLowerCase();
-        const at = lowerSnip.indexOf(lowerNeedle);
-        if (at >= 0) {
-          snippetHtml =
-            escapeHtml(it.snippet.slice(0, at)) +
-            '<mark>' +
-            escapeHtml(it.snippet.slice(at, at + needle.length)) +
-            '</mark>' +
-            escapeHtml(it.snippet.slice(at + needle.length));
-        }
-        return (
-          `<div class="jcs-hit" data-cascade-id="${escapeHtml(it.cid)}">` +
-          `<div class="jcs-meta">${titleHtml}${metaStr}</div>` +
-          `<div>${snippetHtml}</div>` +
-          `</div>`
-        );
-      })
-      .join('');
   }
 
   // Search window over all chats or one chat's chain; supports global search mode
   // that finds archived chats and chain pieces across the entire workspace
   async function openSearchPanel(cascadeId, options) {
     closeSearchPanel();
+    const seq = ++openSearchSeq;
     let currentMode = options?.mode || (cascadeId ? 'chain' : 'global');
     let chain = [];
     if (cascadeId) {
@@ -8801,6 +8827,7 @@
       } catch {
         chain = [cascadeId];
       }
+      if (seq !== openSearchSeq || disposed) return;
     }
     const stepCache = new Map();
     const panel = document.createElement('div');
@@ -8862,14 +8889,17 @@
       }
     };
 
-    globalBtn.addEventListener('click', () => {
+    const activateGlobalMode = () => {
       if (currentMode !== 'global') {
         currentMode = 'global';
         updateModeUI();
         executeSearch();
-        input.focus();
       }
-    });
+      input.focus();
+    };
+    panel.__switchToGlobal = activateGlobalMode;
+
+    globalBtn.addEventListener('click', activateGlobalMode);
     if (chainBtn) {
       chainBtn.addEventListener('click', () => {
         if (currentMode !== 'chain') {
@@ -10614,6 +10644,45 @@
       sidebarEl.querySelector('div:first-child');
     if (!mountParent) return;
 
+    // Mount fallback archive-aware search trigger when native sidebar-search-button is absent,
+    // sweeping document-wide so re-parented header wrappers never leave an orphaned button
+    let fallbackSearchBtn = null;
+    const allFallbacks = document.querySelectorAll(`.${SIDEBAR_SEARCH_BTN_CLASS}`);
+    if (searchBtn) {
+      for (const el of allFallbacks) {
+        el.remove();
+      }
+    } else {
+      for (const el of allFallbacks) {
+        if (!fallbackSearchBtn && el.parentElement === mountParent) {
+          fallbackSearchBtn = el;
+        } else {
+          el.remove();
+        }
+      }
+      if (!fallbackSearchBtn) {
+        fallbackSearchBtn = document.createElement('button');
+        fallbackSearchBtn.type = 'button';
+        fallbackSearchBtn.className = SIDEBAR_SEARCH_BTN_CLASS;
+        fallbackSearchBtn.setAttribute('data-testid', 'jetski-sidebar-search-btn');
+        fallbackSearchBtn.setAttribute('aria-label', 'Search all chats (including archived)');
+        fallbackSearchBtn.setAttribute('title', 'Search all chats (including archived)');
+        fallbackSearchBtn.textContent = '🔍';
+        bindHoverBubble(
+          fallbackSearchBtn,
+          () => fallbackSearchBtn.getAttribute('aria-label') || 'Search all chats'
+        );
+        bindActionBtnHandlers(fallbackSearchBtn, () => {
+          toggleOrOpenGlobalSearch();
+        });
+        if (mountParent.children && mountParent.children.length > 0) {
+          mountParent.insertBefore(fallbackSearchBtn, mountParent.children[0]);
+        } else {
+          mountParent.appendChild(fallbackSearchBtn);
+        }
+      }
+    }
+
     let toggleBtn = mountParent.querySelector(`.${TOP_NAV_TOGGLE_BTN_CLASS}`);
     if (!toggleBtn) {
       toggleBtn = document.createElement('button');
@@ -10641,8 +10710,11 @@
         }
       });
 
-      if (searchBtn && searchBtn.parentElement === mountParent) {
-        mountParent.insertBefore(toggleBtn, searchBtn.nextSibling);
+      const anchorSearchBtn =
+        (searchBtn && searchBtn.parentElement === mountParent ? searchBtn : null) ||
+        fallbackSearchBtn;
+      if (anchorSearchBtn && anchorSearchBtn.parentElement === mountParent) {
+        mountParent.insertBefore(toggleBtn, anchorSearchBtn.nextSibling);
       } else {
         mountParent.appendChild(toggleBtn);
       }
@@ -11369,6 +11441,34 @@
     }
   }
 
+  // Opens archive-aware global search anchored to the focused conversation pane when present
+  function openGlobalSearchFromActiveContext() {
+    const store = findReduxStore();
+    const activeCid =
+      store?.getState()?.conversation?.cascadeId ||
+      store?.getState()?.multiConvoLayout?.focusedPaneId ||
+      '';
+    void openSearchPanel(activeCid, { mode: 'global' });
+  }
+
+  // Toggles global search closed when active, switches chain search to global in-place, or opens
+  function toggleOrOpenGlobalSearch() {
+    const existingPanel = document.getElementById(SEARCH_PANEL_ID);
+    if (existingPanel) {
+      const globalBtn = existingPanel.querySelector('[data-mode="global"]');
+      if (globalBtn?.getAttribute('data-active') === 'true') {
+        closeSearchPanel();
+        return;
+      }
+      if (typeof existingPanel.__switchToGlobal === 'function') {
+        existingPanel.__switchToGlobal();
+        return;
+      }
+    }
+    openGlobalSearchFromActiveContext();
+  }
+
+  let lastSidebarSearchPointerTs = 0;
   // Intercepts built-in sidebar search button to open our archive-aware global search panel
   function handleSidebarSearchIntercept(event) {
     const target = event?.target;
@@ -11381,13 +11481,32 @@
     if (typeof event.stopImmediatePropagation === 'function') {
       event.stopImmediatePropagation();
     }
-    // Target the active chat pane if open, otherwise open standalone global search
-    const store = findReduxStore();
-    const activeCid =
-      store?.getState()?.conversation?.cascadeId ||
-      store?.getState()?.multiConvoLayout?.focusedPaneId ||
-      '';
-    void openSearchPanel(activeCid, { mode: 'global' });
+    // Suppress follow-up click within 300ms of pointerdown so one press mounts one panel
+    if (event.type === 'pointerdown') {
+      lastSidebarSearchPointerTs = Date.now();
+    } else if (event.type === 'click' && Date.now() - lastSidebarSearchPointerTs < 300) {
+      return;
+    }
+    openGlobalSearchFromActiveContext();
+  }
+
+  // Intercepts Cmd/Ctrl+K in capture phase so keyboard search covers archived chats too
+  function handleGlobalSearchKeydown(event) {
+    if (!event) return;
+    const rawKey = typeof event.key === 'string' ? event.key : '';
+    const key = rawKey.toLowerCase();
+    const isKeyK =
+      key === 'k' || (event.code === 'KeyK' && rawKey.length > 0 && !/^[a-z0-9]$/i.test(rawKey));
+    if (!isKeyK || !(event.metaKey || event.ctrlKey) || event.shiftKey || event.altKey) {
+      return;
+    }
+    if (typeof event.preventDefault === 'function') event.preventDefault();
+    if (typeof event.stopPropagation === 'function') event.stopPropagation();
+    if (typeof event.stopImmediatePropagation === 'function') {
+      event.stopImmediatePropagation();
+    }
+    if (event.repeat) return;
+    toggleOrOpenGlobalSearch();
   }
 
   function bindInputBoxSeenListeners() {
@@ -11398,6 +11517,7 @@
       document.addEventListener('keydown', handleInputBoxSeen, true);
       document.addEventListener('pointerdown', handleSidebarSearchIntercept, true);
       document.addEventListener('click', handleSidebarSearchIntercept, true);
+      document.addEventListener('keydown', handleGlobalSearchKeydown, true);
       document.addEventListener('pointerdown', handleTopNavOutsideClick, true);
       document.addEventListener('click', handleTopNavOutsideClick, true);
       document.addEventListener('keydown', handleTopNavKeydown, true);
@@ -11412,6 +11532,7 @@
       document.removeEventListener('keydown', handleInputBoxSeen, true);
       document.removeEventListener('pointerdown', handleSidebarSearchIntercept, true);
       document.removeEventListener('click', handleSidebarSearchIntercept, true);
+      document.removeEventListener('keydown', handleGlobalSearchKeydown, true);
       document.removeEventListener('pointerdown', handleTopNavOutsideClick, true);
       document.removeEventListener('click', handleTopNavOutsideClick, true);
       document.removeEventListener('keydown', handleTopNavKeydown, true);
@@ -14720,6 +14841,7 @@
         target.className === TITLEBAR_REMINDER_BTN_CLASS ||
         target.className === INBOX_REMINDER_BTN_CLASS ||
         target.className === ROW_REMINDER_BTN_CLASS ||
+        target.className === SIDEBAR_SEARCH_BTN_CLASS ||
         target.className === FLIGHT_DECK_TOGGLE_BTN_CLASS ||
         target.className === FLIGHT_DECK_DRAWER_CLASS ||
         target.className === FLIGHT_DECK_RESIZE_HANDLE_CLASS ||
@@ -14762,6 +14884,7 @@
             target.closest(`#${STAR_TOOLTIP_ID}`) ||
             target.closest(`.${BAR_CLASS}`) ||
             target.closest(`#${FLIGHT_DECK_DRAWER_ID}`) ||
+            target.closest(`.${SIDEBAR_SEARCH_BTN_CLASS}`) ||
             target.closest(`.${FLIGHT_DECK_TOGGLE_BTN_CLASS}`) ||
             // Skip subtree mutations inside the Needs-Reaction inbox widget
             target.closest(`.${INBOX_CLASS}`) ||
@@ -14922,6 +15045,7 @@
       `#${AUTOPILOT_TOAST_ID}`,
       `.${TOP_NAV_TOGGLE_BTN_CLASS}`,
       `.${TOP_NAV_SETTINGS_BTN_CLASS}`,
+      `.${SIDEBAR_SEARCH_BTN_CLASS}`,
       `.${FLIGHT_DECK_TOGGLE_BTN_CLASS}`,
       `.${WORKBENCH_TOGGLE_BTN_CLASS}`,
       `.${TITLEBAR_REMINDER_BTN_CLASS}`,

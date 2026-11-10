@@ -752,6 +752,193 @@ class TestRoadmap(unittest.TestCase):
         os.path.isfile(os.path.join(target_dir2, "proj-mig2", "state", "c2.md"))
     )
 
+  # Verifies Gerrit citation extraction and NEW self-owned CL guards on set done and --force
+  def test_r85_set_done_blocks_open_own_gerrit_cl_unless_forced(self):
+    import stop_guard
+
+    proj_dir = os.path.join(self.tmp.name, "projects")
+    os.makedirs(proj_dir, exist_ok=True)
+    for pid, name in (("p-skp", "SkParagraph"), ("p-meta", "Breaking Chats")):
+      with open(os.path.join(proj_dir, f"{pid}.json"), "w", encoding="utf-8") as f:
+        json.dump({"id": pid, "name": name}, f)
+
+    watcher_path = os.path.join(self.tmp.name, "cl_watcher_state.json")
+    watcher_state = {
+        "items": {
+            "gerrit:1422496@c-skp": {
+                "kind": "gerrit",
+                "item_key": "gerrit:1422496",
+                "host": "skia-review.googlesource.com",
+                "status": "NEW",
+                "owner_email": "jlavrova@google.com",
+                "is_wip": False,
+                "conversation_id": "c-skp",
+                "subject": "[skparagraph] Cache Cluster::isSoftBreak",
+            },
+            "gerrit:1418478@c-wip": {
+                "kind": "gerrit",
+                "item_key": "gerrit:1418478",
+                "host": "skia-review.googlesource.com",
+                "status": "NEW",
+                "owner_email": "jlavrova@google.com",
+                "is_wip": True,
+                "conversation_id": "c-wip",
+                "subject": "[skparagraph] Keep signed span advance",
+            },
+            "gerrit:1418836@c-ext": {
+                "kind": "gerrit",
+                "item_key": "gerrit:1418836",
+                "host": "skia-review.googlesource.com",
+                "status": "NEW",
+                "owner_email": "I@YeungKC.com",
+                "is_wip": False,
+                "conversation_id": "c-ext",
+                "subject": "[skparagraph] Do not decode text",
+            },
+            "gerrit:1421862@unchatted": {
+                "kind": "gerrit",
+                "item_key": "gerrit:1421862",
+                "host": "skia-review.googlesource.com",
+                "status": "NEW",
+                "owner_email": "jlavrova@google.com",
+                "is_wip": False,
+                "is_companion": True,
+                "companion_to": "gerrit:1418836",
+                "conversation_id": "",
+                "subject": "[skparagraph] Companion soft hyphen",
+            },
+        }
+    }
+    with open(watcher_path, "w", encoding="utf-8") as f:
+      json.dump(watcher_state, f)
+
+    cands = roadmap.extract_own_cl_candidates(
+        "Fix regressions: Gerrit stack 1422496 PS3 -> 1422516 PS3; "
+        "kept out of CL 1406297; Piper cl"
+        "/1008075988 ignored"
+    )
+    self.assertEqual([c[0] for c in cands], ["1422496", "1422516"])
+
+    # Excluded Markdown links, backticks, excluded stacks, and mixed-host stacks stay accurate
+    edge_cands = roadmap.extract_own_cl_candidates(
+        "Backport after [Chromium CL 8663938]"
+        "(https://chromium-review.googlesource.com/c/chromium/src/+/8663938): "
+        "Skia CL 1422496 PS1 -> 1422516 PS1; "
+        "kept out of Gerrit stack 1406297 -> 1406298; "
+        "blocked on `Gerrit 1406299`"
+    )
+    self.assertEqual(
+        edge_cands,
+        [
+            ("1422496", "skia-review.googlesource.com"),
+            ("1422516", "skia-review.googlesource.com"),
+        ],
+    )
+    self.assertTrue(roadmap.is_meta_project("skia-g3-roll-check", projects_dir=proj_dir))
+
+    env_patch = {
+        "JETSKI_CL_WATCHER_STATE_FILE": watcher_path,
+        "ANTIGRAVITY_PROJECTS_DIR": proj_dir,
+    }
+    with unittest.mock.patch.dict(os.environ, env_patch):
+      roadmap.clear_gerrit_probe_cache()
+      roadmap.add_item(
+          "p-skp",
+          "c-skp",
+          "Fix ellipsis: Gerrit stack 1422496 PS3 -> 1422516 PS3",
+      )
+      roadmap.set_status("p-skp", "c-skp", "R1", "doing")
+      with self.assertRaises(roadmap.RoadmapError) as ctx:
+        roadmap.set_status("p-skp", "c-skp", "R1", "done")
+      self.assertIn("1422496", str(ctx.exception))
+      self.assertIn("--force", str(ctx.exception))
+
+      # CLI --force overrides the NEW own-CL block and stop_guard recognizes --force
+      self.assertTrue(
+          stop_guard.is_roadmap_set_done_command(
+              "python3 ~/.gemini/config/hooks/roadmap.py set c-skp R1 done --force"
+          )
+      )
+      self.assertTrue(
+          stop_guard.is_roadmap_set_done_command(
+              "python3 ~/.gemini/config/hooks/roadmap.py set --force c-skp R1 done"
+          )
+      )
+      with unittest.mock.patch.object(roadmap, "require_project_id", return_value="p-skp"):
+        rc = roadmap._cli(["set", "c-skp", "R1", "done", "--force"])
+      self.assertEqual(rc, 0)
+      self.assertEqual(roadmap.load("p-skp")["items"][0]["status"], "done")
+
+      # Uncited own WIP CL owned by c-wip in cl_watcher_state.json also blocks last doing item
+      roadmap.add_item("p-skp", "c-wip", "Arabic span ligature fix")
+      roadmap.set_status("p-skp", "c-wip", "R2", "doing")
+      with self.assertRaises(roadmap.RoadmapError) as ctx2:
+        roadmap.set_status("p-skp", "c-wip", "R2", "done")
+      self.assertIn("1418478", str(ctx2.exception))
+
+      # External author CLs and companion CLs do not block marking done
+      roadmap.add_item(
+          "p-skp",
+          "c-ext",
+          "Triage Gerrit 1418836 with companion Gerrit 1421862",
+      )
+      roadmap.set_status("p-skp", "c-ext", "R3", "doing")
+      roadmap.set_status("p-skp", "c-ext", "R3", "done")
+      self.assertEqual(roadmap.load("p-skp")["items"][2]["status"], "done")
+
+      # Meta projects citing incident CLs are exempt from own-CL blocking
+      roadmap.add_item("p-meta", "c-meta", "Investigate Gerrit 1422496 search gap")
+      roadmap.set_status("p-meta", "c-meta", "R1", "doing")
+      roadmap.set_status("p-meta", "c-meta", "R1", "done")
+      self.assertEqual(roadmap.load("p-meta")["items"][0]["status"], "done")
+
+      # Cited CL recorded on another piece of a handoff chain still blocks set done,
+      # and uncited watcher CL on an earlier piece blocks closing the leaf's last doing item
+      import chat_lifecycle
+
+      with unittest.mock.patch.object(
+          chat_lifecycle,
+          "discover_conversation_chain",
+          side_effect=lambda cid, include_descendants=True: (
+              ["c-skp", "c-skp-leaf"]
+              if cid in ("c-skp", "c-skp-leaf")
+              else (["c-wip", "c-wip-leaf"] if cid in ("c-wip", "c-wip-leaf") else [cid])
+          ),
+      ):
+        roadmap.add_item("p-skp", "c-skp-leaf", "Follow-up on Gerrit 1422496")
+        roadmap.set_status("p-skp", "c-skp-leaf", "R4", "doing")
+        with self.assertRaises(roadmap.RoadmapError) as ctx_chain_cited:
+          roadmap.set_status("p-skp", "c-skp-leaf", "R4", "done")
+        self.assertIn("1422496", str(ctx_chain_cited.exception))
+        roadmap.set_status("p-skp", "c-skp-leaf", "R4", "done", force=True)
+
+        roadmap.set_status("p-skp", "c-wip", "R2", "done", force=True)
+        roadmap.add_item("p-skp", "c-wip-leaf", "Finish Arabic span ligature")
+        roadmap.set_status("p-skp", "c-wip-leaf", "R5", "doing")
+        with self.assertRaises(roadmap.RoadmapError) as ctx_chain_uncited:
+          roadmap.set_status("p-skp", "c-wip-leaf", "R5", "done")
+        self.assertIn("1418478", str(ctx_chain_uncited.exception))
+
+      # Unauthenticated HTTP 404 on private/ACL CL falls back to watcher NEW state
+      roadmap.clear_gerrit_probe_cache()
+      http_404 = roadmap.urllib.error.HTTPError(
+          "https://skia-review.googlesource.com/changes/1422496",
+          404,
+          "Not Found",
+          {},
+          None,
+      )
+      with (
+          unittest.mock.patch.dict(sys.modules, {"unittest": None}),
+          unittest.mock.patch.object(roadmap.urllib.request, "urlopen", side_effect=http_404),
+      ):
+        del sys.modules["unittest"]
+        try:
+          priv_open = roadmap.resolve_open_own_gerrit_cls(["Gerrit 1422496"])
+        finally:
+          sys.modules["unittest"] = unittest
+      self.assertEqual([c["cl_id"] for c in priv_open], ["1422496"])
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -1517,6 +1517,111 @@ const liveBucketBtn = (k) =>
   searchPanel.remove();
   sidebarSearchBtn.remove();
 
+  // R85: Cmd/Ctrl+K intercepts in capture phase, and chain zero-hit search falls back to global
+  let cmdKPrevented = false;
+  let cmdKStopped = false;
+  document.dispatchEvent({
+    type: 'keydown',
+    target: bodyEl,
+    key: 'k',
+    metaKey: true,
+    ctrlKey: false,
+    shiftKey: false,
+    altKey: false,
+    preventDefault() { cmdKPrevented = true; },
+    stopPropagation() { cmdKStopped = true; },
+    stopImmediatePropagation() { cmdKStopped = true; },
+  });
+  await new Promise((r) => setTimeout(r, 10));
+  const r85Panel = document.getElementById('jetski-chat-search-panel');
+  assert(r85Panel, 'Cmd+K must open global search panel');
+  assert.strictEqual(
+    r85Panel.querySelector('[data-mode="global"]').getAttribute('data-active'),
+    'true'
+  );
+  assert.strictEqual(cmdKPrevented, true, 'Cmd+K must call preventDefault');
+  assert.strictEqual(cmdKStopped, true, 'Cmd+K must stop propagation');
+
+  // Key repeat on Cmd+K must not strobe/close the open global search panel
+  document.dispatchEvent({
+    type: 'keydown',
+    target: bodyEl,
+    key: 'k',
+    code: 'KeyK',
+    repeat: true,
+    metaKey: true,
+    ctrlKey: false,
+    shiftKey: false,
+    altKey: false,
+    preventDefault() {},
+    stopPropagation() {},
+    stopImmediatePropagation() {},
+  });
+  assert(
+    document.getElementById('jetski-chat-search-panel'),
+    'Repeated Cmd+K keydown must not close the open global search panel'
+  );
+  window.__jetskiChatSearch.closeSearchPanel();
+
+  // Cmd+K while chain search is open switches to global mode in-place preserving typed input
+  await window.__jetskiChatSearch.openSearchPanel('solo-active', { mode: 'chain' });
+  const chainModePanel = document.getElementById('jetski-chat-search-panel');
+  const chainInput = chainModePanel.children.find((c) => c.tagName === 'INPUT');
+  assert(chainInput, 'Search panel must carry a search input');
+  chainInput.value = '1410476';
+  document.dispatchEvent({
+    type: 'keydown',
+    target: chainInput,
+    key: '\u043b',
+    code: 'KeyK',
+    metaKey: true,
+    ctrlKey: false,
+    shiftKey: false,
+    altKey: false,
+    preventDefault() {},
+    stopPropagation() {},
+    stopImmediatePropagation() {},
+  });
+  await new Promise((r) => setTimeout(r, 10));
+  const switchedPanel = document.getElementById('jetski-chat-search-panel');
+  assert.strictEqual(switchedPanel, chainModePanel, 'Cmd+K must switch mode in-place');
+  assert.strictEqual(
+    switchedPanel.querySelector('[data-mode="global"]').getAttribute('data-active'),
+    'true'
+  );
+  assert.strictEqual(
+    switchedPanel.children.find((c) => c.tagName === 'INPUT').value,
+    '1410476',
+    'Cmd+K mode switch must preserve typed query'
+  );
+  window.__jetskiChatSearch.closeSearchPanel();
+
+  // Concurrent openSearchPanel calls across async chainOf mount at most one panel
+  const pOpen1 = window.__jetskiChatSearch.openSearchPanel('open-step', { mode: 'global' });
+  const pOpen2 = window.__jetskiChatSearch.openSearchPanel('open-step', { mode: 'global' });
+  await Promise.all([pOpen1, pOpen2]);
+  assert.strictEqual(
+    document.querySelectorAll('#jetski-chat-search-panel').length,
+    1,
+    'Concurrent openSearchPanel calls must mount only one panel'
+  );
+  window.__jetskiChatSearch.closeSearchPanel();
+  assert.strictEqual(document.querySelectorAll('#jetski-chat-search-panel').length, 0);
+
+  // Chain search with 0 hits in solo-active automatically falls back to global archived matches
+  const fallbackChainResults = new FakeElement('div');
+  await window.__jetskiChatSearch.runChatSearch(
+    '1410476',
+    fallbackChainResults,
+    ['solo-active'],
+    new Map()
+  );
+  assert(
+    fallbackChainResults.innerHTML.includes('open-step') &&
+      fallbackChainResults.innerHTML.includes('🗄 archived'),
+    'Zero-hit chain search must surface archived global matches'
+  );
+
   // 1. Verify chain navigator stars on 'open-step' (middle piece: 2 before, 1 after)
   const starsBefore = convoNavEl.querySelector('[data-testid="jetski-chain-stars-before"]');
   assert(starsBefore, 'Stars before group must be mounted in convo navigator');
@@ -8047,6 +8152,31 @@ eval(code);
   assert(toggleBtn, 'Toggle button must be mounted inside sidebar header row');
   assert.strictEqual(toggleBtn.getAttribute('data-testid'), 'jetski-top-nav-toggle-btn');
   assert.strictEqual(toggleBtn.getAttribute('data-expanded'), 'false');
+
+  // R85: Removing native sidebar-search-button mounts fallback jetski-sidebar-search-btn,
+  // and restoring native sidebar-search-button removes the fallback automatically
+  assert.strictEqual(
+    headerRow.querySelector('[data-testid="jetski-sidebar-search-btn"]'),
+    null,
+    'Fallback search button must stay unmounted while native sidebar-search-button is present'
+  );
+  searchBtn.remove();
+  window.__jetskiTopNav.ensureTopNavToggle();
+  const fallbackSearchBtn = headerRow.querySelector('[data-testid="jetski-sidebar-search-btn"]');
+  assert(fallbackSearchBtn, 'Fallback sidebar search button must mount when native btn is absent');
+  assert.strictEqual(headerRow.children[0], fallbackSearchBtn);
+  const nestedHeaderActions = new FakeElement('div');
+  headerRow.insertBefore(nestedHeaderActions, headerRow.children[0]);
+  nestedHeaderActions.appendChild(searchBtn);
+  window.__jetskiTopNav.ensureTopNavToggle();
+  assert.strictEqual(
+    document.querySelectorAll('[data-testid="jetski-sidebar-search-btn"]').length,
+    0,
+    'Fallback search button must be removed even when native sidebar-search-button mounts nested'
+  );
+  headerRow.insertBefore(searchBtn, headerRow.children[0]);
+  nestedHeaderActions.remove();
+  window.__jetskiTopNav.ensureTopNavToggle();
   assert.strictEqual(
     toggleBtn.getAttribute('aria-label'),
     'Top navigation (Automations, Customizations, Extensions, Settings)'

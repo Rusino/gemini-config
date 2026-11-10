@@ -55,8 +55,8 @@ Use only these commands (`python3 ~/.gemini/config/hooks/chat_lifecycle.py ...`)
 | `set-title <id> "<Topic>"` | User asks to name/rename the chat, or on the first turn of a root chat to refine an auto-detected ID or replace a generic title (never on continuations or later turns unless asked). Pass bare English `<Topic>`. |
 | `auto-title <id> "<prompt>"` | Detect PR/CL/bug/commit in prompt and set provisional entity ID if untitled (invoked automatically by `context_guard.py`; leaves chat requiring English refinement via `set-title`). |
 | `handoff <id> [summary_file] [--notes "..."] [--next "..."] [--force]` | Context guard alert, or user asks to continue in a new chat. Preserves `<id>`'s existing topic verbatim across the continuation chain. Writes/updates summary, launches visible continuation in the same project on `<id>`'s last model, verifies `sourceMetadata: null`, archives `<id>`. Refuses while `<id>` has running subagents or background tasks (timers included), since their reports would land in a hidden chat: wait for them or kill them; `--ignore-live` only after recording them in the state file. `--model <id\|name>` only on explicit user request; `--force` only when user explicitly asked for a second continuation. |
-| `next-task [<id>] [<R_ID>] [--topic "<Topic>"] [--notes "..."] [--next "..."] [--force]` | **Only** when the user explicitly asks to start the next roadmap item `<R_ID>` in a fresh chat: archives `<id>`'s chain and all completed sibling chats in the project (releasing worktree leases), launches an independent root chat (`⦿`) in the same project, claims `<R_ID>` as `doing`, links `<R_ID> → <new_id>`, and seeds `state/<new_id>.md`. Never propose or ask about `next-task` automatically after finishing a task. |
-| `start [--project <p>] [--title <Topic>] [--model <m>] "<prompt>"` | Starts an independent root chat atomically pinned to the project via before_send hook. |
+| `next-task [<id>] [<R_ID>] [--topic "<Topic>"] [--notes "..."] [--next "..."] [--model <m>] [--force] [--ignore-live]` | **Only** when the user explicitly asks to start the next roadmap item `<R_ID>` after the current chain's work and CLs are closed: archives `<id>`'s chain and completed sibling chats in the project (releasing worktree leases), launches an independent root chat (`⦿`) in the same project, claims `<R_ID>` as `doing`, links `<R_ID> → <new_id>`, and seeds `state/<new_id>.md`. Refuses while `<id>`'s chain owns/links open `doing` or `todo` items other than `<R_ID>` or, in product projects, has self-owned non-companion Gerrit CLs in status `NEW` (unless `--force`). Never use `next-task` when the user asks to work *"в отдельном чате"* / in a separate chat (use `start` instead), and never propose `next-task` automatically after finishing a task. |
+| `start [--project <p>] [--title <Topic>] [--model <m>] "<prompt>"` | Starts an independent root chat (`⦿`) atomically pinned to the project via `StartCascade` `projectEnvConfig` (`_record_pending_move`) without archiving the caller chain; use `start` whenever the user asks to handle work *"в отдельном чате"* / in a separate chat while keeping the current chat open. |
 | `summary-path <id>` | Returns the canonical summary path before writing with `write_file`. |
 | `finalize <id>` | **Only** when the user explicitly says *"финал"* (or unambiguous equivalent): archives the chain; also archives completed sibling chats in the same project that own no open roadmap items. |
 | `reopen <leaf_id>` | **Only** after explicit user confirmation via `ask_question`: unarchives `<leaf_id>` (the chain's latest leaf from `status <id>`, never an earlier handed-off piece) as an open `⦿` chat so follow-up work can be sent there via `env -u ANTIGRAVITY_SOURCE_METADATA agentapi send-message <leaf_id> "..."`. |
@@ -64,7 +64,7 @@ Use only these commands (`python3 ~/.gemini/config/hooks/chat_lifecycle.py ...`)
 | `status [id]` | Inspect chain structure and summary paths. |
 | `model [id] [--trailer]` | Inspect chat model or print `Assisted-by: ...` git trailer (`--trailer`). |
 | `project-model [<p>] [<m>]` | View or set project preferred model in `~/.gemini/config/projects_models.json`. |
-| `audit [--fix] [--project <id\|name>]` | Scan/repair title desync and broken markers; visible handed-off pieces and old `«…»`-closed chats are reported as `should_be_archived` (`--fix` archives them unless live work runs in them). |
+| `audit [--fix] [--project <id\|name>]` | Scan/repair title desync and broken markers; visible handed-off pieces and old `«…»`-closed chats are reported as `should_be_archived` (`--fix` archives them unless live work runs in them), and archived chains that still own open `doing`/`todo` roadmap items or `NEW` self-owned Gerrit CLs are reported as `archived_with_live_work` (never auto-unarchived on `--fix`). |
 | `archive [<id...>] [--chain] [--project <p>] [--keep <N>]` | Archive chats/chains via LS RPC and `.pbtxt`, or prune project `<p>` keeping `<N>` newest. |
 | `auto-archive [--hook]` | Prune older chats across projects with retention policies. |
 
@@ -81,8 +81,14 @@ To move chats/chains between projects, run `python3
   - **Backlog requests ("в бэклог: X")**: run `roadmap.py add <id> "X"`, confirm on one line (or
     bulleted list separated by blank lines for multiple items), then continue current work.
   - **Finishing a task (no automatic `next-task` proposals)**:
+    - In product projects, keep a roadmap item as `doing` while its self-owned non-companion Gerrit
+      CLs remain in status `NEW` (`roadmap.py set <id> <R_prev> done` refuses while such CLs are
+      `NEW` unless `--force` is passed intentionally; meta/personal projects are exempt): report the
+      uploaded `[<Repo> CL <N> PS<M>](<gerrit url>)` link and stop while keeping `<R_prev>` in
+      `doing` until the CL merges or is abandoned.
     - Once the current roadmap item is completed and marked `done` (`roadmap.py set <id> <R_prev>
-      done`), obey the `[VCS BATON: ...]` line printed by `roadmap.py` and **never** ask the user
+      done`, after its product CLs merge or immediately in personal/meta repos), obey the
+      `[VCS BATON: ...]` line printed by `roadmap.py` and **never** ask the user
       which roadmap item to take next (`"Какую задачу из роадмапа берём в работу следующей?"`) or
       propose `next-task` unless the user explicitly asks what is next in the roadmap:
       - **`[VCS BATON: PENDING ...]`**:

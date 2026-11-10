@@ -451,7 +451,8 @@ def is_roadmap_set_done_command(cmd: str) -> bool:
       tokens = seg.split()
     for i, tok in enumerate(tokens):
       if _clean_cmd_token(tok) == "roadmap.py":
-        rest = tokens[i + 1 :]
+        # Strip --force so set ... done detection matches forced completions too
+        rest = [t for t in tokens[i + 1 :] if t != "--force"]
         if len(rest) >= 4 and rest[0] == "set" and rest[3] == "done":
           return True
         if len(rest) == 3 and rest[0] == "set" and rest[2] == "done":

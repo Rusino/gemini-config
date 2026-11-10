@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import glob
 import json
 import os
 import re
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 
 ROADMAPS_DIR_ENV = "JETSKI_ROADMAPS_DIR"
@@ -30,6 +33,30 @@ ROADMAP_INDEX_FILE_NAME = "jetski-roadmaps.json"
 # Out-of-band dossier index aggregating roadmap, state, CL/PR links, and AI summaries
 DOSSIER_INDEX_FILE_NAME = "jetski-dossiers.json"
 CL_WATCHER_STATE_PATH = os.path.expanduser("~/.gemini/config/logs/cl_watcher_state.json")
+CL_WATCHER_STATE_ENV = "JETSKI_CL_WATCHER_STATE_FILE"
+DEFAULT_PROJECTS_DIR = "~/.gemini/config/projects"
+SELF_GERRIT_EMAILS = frozenset({
+    "jlavrova@google.com",
+    "jlavrova@chromium.org",
+    "jlavrova@skia.org",
+})
+META_PROJECT_NAMES = frozenset({
+    "flight deck",
+    "improving experience",
+    "reviews of e-mails, meetings and such",
+    "sad-ru-googlers-ai-digest",
+    "personal",
+    "code review organizer",
+    "breaking chats",
+    "my work",
+    "unassigned",
+    "outside-of-project",
+    "skia gardener",
+    "skia-g3-roll-check",
+    "partnership with ai",
+    "ui experiments",
+    "stitch-design/stitch",
+})
 APP_DATA_DIR_CANDIDATES = ("~/.gemini/jetski", "~/.gemini/antigravity")
 OUTSIDE_PROJECT = "outside-of-project"
 SCHEMA_VERSION = 1
@@ -54,7 +81,7 @@ roadmap.py — per-project Epic Roadmap (shared by all chats of the project).
 
 Usage:
   roadmap.py add <conv_id> "<text>" [--parent ID]   Add an item (prints its new ID)
-  roadmap.py set <conv_id> <ID> todo|doing|done|dropped
+  roadmap.py set <conv_id> <ID> todo|doing|done|dropped [--force]
                                                   Change status; `doing` claims it
   roadmap.py link <conv_id> <ID> <chat_id>        Item is handled in its own chat
   roadmap.py edit <conv_id> <ID> "<new text>"     Reword an item (ID/status/link kept)
@@ -391,10 +418,366 @@ def _evaluate_baton(doc: dict, conv_id: str, status: str) -> str:
   )
 
 
+_PROJECT_BADGE_RE = re.compile(
+    r"(?:\s*·\s*(?:[⟳⚠●]\s*\d+)(?:\s+(?:[⟳⚠●]\s*\d+))*)+$"
+)
+_EXCLUDED_CL_PREFIX_RE = re.compile(
+    r"(?:kept\s+out\s+of|split\s+(?:out\s+)?from|out\s+of\s+scope\s+for"
+    r"|covered\s+by|superseded\s+by|reland\s+of|after|blocked\s+on"
+    r"|waiting\s+on|companion(?:\s+(?:to|for))?|review\s+of)"
+    r"\s+(?:\[[^\]\n]*\]\s*\(\s*)?[`'\"(\[]*$",
+    re.IGNORECASE,
+)
+_GERRIT_URL_RE = re.compile(
+    r"https?://([a-z0-9-]+-review\.googlesource\.com)"
+    r"/(?:c/(?:[^/\s]+/\+/)?|#/c/)?(?<!\d)(\d{5,8})(?![0-9A-Za-z_])",
+    re.IGNORECASE,
+)
+_CRREV_CL_RE = re.compile(
+    r"\bcrrev(?:\.com)?/c/(?<!\d)(\d{5,8})(?![0-9A-Za-z_])", re.IGNORECASE
+)
+_SKREV_CL_RE = re.compile(
+    r"\bskrev(?:\.com)?/(?<!\d)(\d{5,8})(?![0-9A-Za-z_])", re.IGNORECASE
+)
+_NAMED_CL_RE = re.compile(
+    r"\b(Skia\s+CL\s+|Chromium\s+CL\s+|Gerrit(?:\s+(?:stack|CL|change))?\s+|cl/|CL\s+)"
+    r"#?(?<!\d)(\d{5,8})(?![0-9A-Za-z_])",
+    re.IGNORECASE,
+)
+_STACK_STEP_RE = re.compile(
+    r"(?:/\d+)?[`'\")\]]*(?:\s+PS\d+|\s*\(PS\d+\))?\s*(?:->|→)\s*"
+    r"(Gerrit(?:\s+(?:CL|change))?\s+|Skia\s+CL\s+|Chromium\s+CL\s+|CL\s+)?"
+    r"#?(?<!\d)(\d{5,8})(?![0-9A-Za-z_])",
+    re.IGNORECASE,
+)
+_COMPANION_SUBJECT_RE = re.compile(
+    r"(?:^\[DO NOT SUBMIT\]|\bcompanion\b)", re.IGNORECASE
+)
+_ITEM_KEY_GERRIT_RE = re.compile(r"^gerrit:(\d{5,8})(?:@|$)")
+
+_GERRIT_PROBE_CACHE: dict[tuple[str, str], dict | None] = {}
+_GERRIT_UNREACHABLE_HOSTS: set[str] = set()
+_WATCHER_GERRIT_CACHE: tuple[str, int, dict[str, list[dict]]] | None = None
+
+
+def clear_gerrit_probe_cache() -> None:
+  """Clears in-memory Gerrit probe and watcher caches so callers re-read fresh state."""
+  global _WATCHER_GERRIT_CACHE
+  _GERRIT_PROBE_CACHE.clear()
+  _GERRIT_UNREACHABLE_HOSTS.clear()
+  _WATCHER_GERRIT_CACHE = None
+
+
+def _strip_project_badge(name: str) -> str:
+  """Strips trailing live activity counters (' · ⟳ 1') from a project display name."""
+  if not name:
+    return ""
+  return _PROJECT_BADGE_RE.sub("", name).strip()
+
+
+def is_meta_project(project_id: str, projects_dir: str = "") -> bool:
+  """Returns True when project_id is outside-of-project or a meta/personal/tooling project."""
+  clean_pid = _strip_project_badge((project_id or "").strip())
+  if not clean_pid or clean_pid.lower() in META_PROJECT_NAMES:
+    return True
+  pdir = projects_dir or os.path.expanduser(
+      os.environ.get("ANTIGRAVITY_PROJECTS_DIR", DEFAULT_PROJECTS_DIR)
+  )
+  if not os.path.isdir(pdir):
+    return False
+  direct = os.path.join(pdir, f"{clean_pid}.json")
+  candidates = [direct] if os.path.isfile(direct) else sorted(
+      glob.glob(os.path.join(pdir, "*.json"))
+  )
+  for pfile in candidates:
+    try:
+      with open(pfile, "r", encoding="utf-8") as f:
+        pdata = json.load(f)
+      if not isinstance(pdata, dict):
+        continue
+      fid = str(pdata.get("id") or os.path.basename(pfile)[:-5]).strip()
+      if fid == clean_pid:
+        pname = _strip_project_badge(str(pdata.get("name") or "")).lower()
+        return pname in META_PROJECT_NAMES
+    except (OSError, ValueError):
+      continue
+  return False
+
+
+def extract_own_cl_candidates(text: str) -> list[tuple[str, str]]:
+  """Extracts ordered unique (cl_id, host_hint) 5-8 digit Gerrit CLs from text.
+
+  Ignores 9-10 digit Piper CLs and mentions preceded by exclusion/dependency phrases
+  such as 'kept out of', 'companion to', or 'blocked on'.
+  """
+  if not text:
+    return []
+  raw_hits: list[tuple[int, int, str, str]] = []
+  for m in _GERRIT_URL_RE.finditer(text):
+    if not _EXCLUDED_CL_PREFIX_RE.search(text[: m.start()]):
+      raw_hits.append((m.start(), m.end(), m.group(2), m.group(1).lower()))
+  for m in _CRREV_CL_RE.finditer(text):
+    if not _EXCLUDED_CL_PREFIX_RE.search(text[: m.start()]):
+      raw_hits.append(
+          (m.start(), m.end(), m.group(1), "chromium-review.googlesource.com")
+      )
+  for m in _SKREV_CL_RE.finditer(text):
+    if not _EXCLUDED_CL_PREFIX_RE.search(text[: m.start()]):
+      raw_hits.append(
+          (m.start(), m.end(), m.group(1), "skia-review.googlesource.com")
+      )
+  for m in _NAMED_CL_RE.finditer(text):
+    if _EXCLUDED_CL_PREFIX_RE.search(text[: m.start()]):
+      continue
+    prefix = m.group(1).lower()
+    host = ""
+    if prefix.startswith("skia"):
+      host = "skia-review.googlesource.com"
+    elif prefix.startswith("chromium"):
+      host = "chromium-review.googlesource.com"
+    raw_hits.append((m.start(), m.end(), m.group(2), host))
+
+  if raw_hits:
+    raw_hits.sort(key=lambda x: x[0])
+    # Chain stack arrows only immediately after each non-excluded predecessor so excluded
+    # stacks stay ignored and mixed-host texts inherit the immediate predecessor's host
+    stack_hits: list[tuple[int, int, str, str]] = []
+    for _, hit_end, _, hit_host in raw_hits:
+      pos = hit_end
+      cur_host = hit_host
+      while pos < len(text):
+        step = _STACK_STEP_RE.match(text, pos)
+        if not step or step.end() <= pos:
+          break
+        step_prefix = (step.group(1) or "").lower()
+        if step_prefix.startswith("skia"):
+          cur_host = "skia-review.googlesource.com"
+        elif step_prefix.startswith("chromium"):
+          cur_host = "chromium-review.googlesource.com"
+        stack_hits.append((step.start(), step.end(), step.group(2), cur_host))
+        pos = step.end()
+    raw_hits.extend(stack_hits)
+    raw_hits.sort(key=lambda x: x[0])
+
+  ordered: dict[str, str] = {}
+  for _, _, cl_id, host in raw_hits:
+    if cl_id not in ordered or (not ordered[cl_id] and host):
+      ordered[cl_id] = host
+  return list(ordered.items())
+
+
+def _is_companion_record(rec: dict) -> bool:
+  """Returns True when a cl_watcher record represents a review companion CL."""
+  if rec.get("is_companion") or str(rec.get("companion_to") or "").strip():
+    return True
+  ent = rec.get("entity_state")
+  if isinstance(ent, dict) and ent.get("is_companion"):
+    return True
+  subj = str(rec.get("subject") or "").strip()
+  return bool(_COMPANION_SUBJECT_RE.search(subj))
+
+
+def _load_watcher_gerrit_records() -> dict[str, list[dict]]:
+  """Loads Gerrit records keyed by numeric CL ID from cl_watcher_state.json with mtime caching."""
+  global _WATCHER_GERRIT_CACHE
+  wpath = os.path.expanduser(
+      os.environ.get(CL_WATCHER_STATE_ENV) or CL_WATCHER_STATE_PATH
+  )
+  if not wpath or not os.path.isfile(wpath):
+    return {}
+  try:
+    mtime_ns = os.stat(wpath).st_mtime_ns
+  except OSError:
+    return {}
+  if (
+      _WATCHER_GERRIT_CACHE is not None
+      and _WATCHER_GERRIT_CACHE[0] == wpath
+      and _WATCHER_GERRIT_CACHE[1] == mtime_ns
+  ):
+    return _WATCHER_GERRIT_CACHE[2]
+  by_cl: dict[str, list[dict]] = {}
+  try:
+    with open(wpath, "r", encoding="utf-8") as f:
+      data = json.load(f)
+    raw_items = (data.get("items") if isinstance(data, dict) else None) or {}
+    for outer_key, rec in raw_items.items():
+      if not isinstance(rec, dict):
+        continue
+      kind = str(rec.get("kind") or "").strip().lower()
+      if kind and kind != "gerrit":
+        continue
+      m = _ITEM_KEY_GERRIT_RE.match(str(rec.get("item_key") or "").strip())
+      if not m:
+        m = _ITEM_KEY_GERRIT_RE.match(str(outer_key or "").strip())
+      raw_cid = str(rec.get("cl_id") or "").strip()
+      cl_id = m.group(1) if m else (raw_cid if re.match(r"^\d{5,8}$", raw_cid) else "")
+      if cl_id:
+        by_cl.setdefault(cl_id, []).append(rec)
+  except (OSError, ValueError):
+    return {}
+  _WATCHER_GERRIT_CACHE = (wpath, mtime_ns, by_cl)
+  return by_cl
+
+
+def _fetch_gerrit_change_json(host: str, cl_id: str) -> dict | None:
+  """Queries Gerrit REST API for change metadata, returning None offline or under unittest."""
+  if "unittest" in sys.modules or host in _GERRIT_UNREACHABLE_HOSTS:
+    return None
+  url = f"https://{host}/changes/{cl_id}?o=DETAILED_ACCOUNTS"
+  req = urllib.request.Request(url, headers={"Accept": "application/json"})
+  try:
+    with urllib.request.urlopen(req, timeout=2.5) as resp:
+      raw = resp.read().decode("utf-8", errors="replace")
+  except urllib.error.HTTPError:
+    # Anonymous Gerrit REST returns 404 on private/ACL CLs, so fall back to watcher state
+    return None
+  except (urllib.error.URLError, TimeoutError, OSError):
+    _GERRIT_UNREACHABLE_HOSTS.add(host)
+    return None
+  if raw.startswith(")]}'"):
+    raw = raw.split("\n", 1)[1] if "\n" in raw else ""
+  try:
+    parsed = json.loads(raw)
+    return parsed if isinstance(parsed, dict) else None
+  except ValueError:
+    return None
+
+
+def _probe_live_gerrit_cl(cl_id: str, host_hint: str = "") -> dict | None:
+  """Resolves live status and owner for cl_id on Gerrit with per-process caching."""
+  host = host_hint or (
+      "skia-review.googlesource.com"
+      if int(cl_id) < 4_000_000
+      else "chromium-review.googlesource.com"
+  )
+  cache_key = (cl_id, host)
+  if cache_key in _GERRIT_PROBE_CACHE:
+    return _GERRIT_PROBE_CACHE[cache_key]
+  data = _fetch_gerrit_change_json(host, cl_id)
+  if data is None:
+    _GERRIT_PROBE_CACHE[cache_key] = None
+    return None
+  owner = data.get("owner") if isinstance(data.get("owner"), dict) else {}
+  res = {
+      "cl_id": cl_id,
+      "host": host,
+      "status": str(data.get("status") or "").strip().upper(),
+      "owner_email": str(owner.get("email") or "").strip(),
+      "subject": str(data.get("subject") or "").strip(),
+      "is_wip": bool(data.get("work_in_progress", False)),
+      "url": f"https://{host}/c/{cl_id}",
+  }
+  _GERRIT_PROBE_CACHE[cache_key] = res
+  return res
+
+
+def resolve_open_own_gerrit_cls(
+    texts: list[str] | tuple[str, ...],
+    chain_cids: set[str] | list[str] | None = None,
+    include_watcher_chain: bool = False,
+    other_chain_owners: set[str] | None = None,
+) -> list[dict]:
+  """Returns open NEW self-owned non-companion Gerrit CL descriptors for texts and chain_cids."""
+  if "unittest" in sys.modules and CL_WATCHER_STATE_ENV not in os.environ:
+    return []
+  candidates: dict[str, str] = {}
+  for txt in texts or ():
+    for cl_id, host in extract_own_cl_candidates(txt or ""):
+      if cl_id not in candidates or (not candidates[cl_id] and host):
+        candidates[cl_id] = host
+
+  records_by_cl = _load_watcher_gerrit_records()
+  chain_set = {c for c in (chain_cids or ()) if c}
+  if include_watcher_chain and chain_set:
+    for cl_id, recs in records_by_cl.items():
+      if any(str(r.get("conversation_id") or "").strip() in chain_set for r in recs):
+        rec_host = next(
+            (str(r.get("host") or "").strip() for r in recs if r.get("host")), ""
+        )
+        if cl_id not in candidates or (not candidates[cl_id] and rec_host):
+          candidates[cl_id] = rec_host
+
+  open_own: list[dict] = []
+  for cl_id, host_hint in candidates.items():
+    recs = records_by_cl.get(cl_id) or []
+    if any(_is_companion_record(r) for r in recs):
+      continue
+    if chain_set and recs:
+      known_cids = [
+          str(r.get("conversation_id") or "").strip()
+          for r in recs
+          if str(r.get("conversation_id") or "").strip() not in ("", "unchatted")
+      ]
+      # Skip CLs explicitly owned by another known conversation chain
+      if known_cids and not any(rc in chain_set for rc in known_cids):
+        if other_chain_owners is None or any(
+            rc in other_chain_owners for rc in known_cids
+        ):
+          continue
+    if recs:
+      statuses = {
+          str(r.get("status") or "").strip().upper()
+          for r in recs
+          if r.get("status")
+      }
+      if statuses and "NEW" not in statuses:
+        continue
+      owners = {
+          str(r.get("owner_email") or "").strip().lower()
+          for r in recs
+          if r.get("owner_email")
+      }
+      if owners and not (owners & SELF_GERRIT_EMAILS):
+        continue
+      if not host_hint:
+        host_hint = next(
+            (str(r.get("host") or "").strip() for r in recs if r.get("host")), ""
+        )
+
+    # Prefer live Gerrit status when reachable so merged CLs unblock before watcher polls
+    live = _probe_live_gerrit_cl(cl_id, host_hint)
+    if live is not None:
+      if live.get("status") != "NEW":
+        continue
+      if str(live.get("owner_email") or "").strip().lower() not in SELF_GERRIT_EMAILS:
+        continue
+      if _COMPANION_SUBJECT_RE.search(str(live.get("subject") or "")):
+        continue
+      open_own.append(live)
+      continue
+
+    matched_rec = next(
+        (
+            r
+            for r in recs
+            if str(r.get("status") or "").strip().upper() == "NEW"
+            and str(r.get("owner_email") or "").strip().lower() in SELF_GERRIT_EMAILS
+        ),
+        None,
+    )
+    if matched_rec is not None:
+      r_host = str(matched_rec.get("host") or host_hint or "skia-review.googlesource.com")
+      open_own.append({
+          "cl_id": cl_id,
+          "host": r_host,
+          "status": "NEW",
+          "owner_email": str(matched_rec.get("owner_email") or ""),
+          "subject": str(matched_rec.get("subject") or ""),
+          "is_wip": bool(matched_rec.get("is_wip", False)),
+          "url": str(matched_rec.get("url") or f"https://{r_host}/c/{cl_id}"),
+      })
+  return open_own
+
+
 # Updates item status and returns (message, ownership warning, baton notice)
 def set_status_with_baton(
-    project_id: str, conv_id: str, item_id: str, status: str
+    project_id: str,
+    conv_id: str,
+    item_id: str,
+    status: str,
+    force: bool = False,
 ) -> tuple[str, str, str]:
+  """Updates item_id to status, blocking premature done while self-owned Gerrit CLs remain NEW."""
   if status not in STATUSES:
     raise RoadmapError(f"bad status '{status}' (expected {'|'.join(STATUSES)})")
   warning: list[str] = []
@@ -402,6 +785,53 @@ def set_status_with_baton(
 
   def apply(doc: dict):
     it = _find(doc, item_id)
+    # Keep product roadmap items open while their self-owned Gerrit CLs remain unmerged
+    if status == "done" and not force and not is_meta_project(project_id):
+      open_cls = resolve_open_own_gerrit_cls(
+          [it.get("text") or ""],
+          chain_cids=None,
+          include_watcher_chain=False,
+      )
+      # Fall back to watcher CLs owned by conv_id's chain when closing its last doing item
+      if not open_cls and conv_id:
+        caller_chain = {conv_id}
+        link_cid = (it.get("link") or "").strip()
+        if link_cid:
+          caller_chain.add(link_cid)
+        try:
+          import chat_lifecycle
+
+          for seed_cid in list(caller_chain):
+            caller_chain.update(
+                chat_lifecycle.discover_conversation_chain(seed_cid) or ()
+            )
+        except Exception:
+          pass
+        other_doing = [
+            other
+            for other in doc.get("items", [])
+            if other["id"] != item_id
+            and other.get("status") == "doing"
+            and (
+                (other.get("owner") or "").strip() in caller_chain
+                or (other.get("link") or "").strip() in caller_chain
+            )
+        ]
+        if not other_doing:
+          open_cls = resolve_open_own_gerrit_cls(
+              [],
+              chain_cids=caller_chain,
+              include_watcher_chain=True,
+          )
+      if open_cls:
+        cl_desc = ", ".join(
+            f"Gerrit {c['cl_id']} ({c['url']})" for c in open_cls
+        )
+        raise RoadmapError(
+            f"cannot mark {item_id} done while self-owned Gerrit CL(s) remain"
+            f" NEW ({cl_desc}); keep {item_id} as 'doing' until merged/abandoned,"
+            " or pass --force if intentional"
+        )
     prev_owner = it.get("owner") or ""
     if (
         status == "doing"
@@ -427,8 +857,17 @@ def set_status_with_baton(
 
 
 # Preserves the 2-tuple (message, warning) contract for callers that do not print baton hints
-def set_status(project_id: str, conv_id: str, item_id: str, status: str) -> tuple[str, str]:
-  msg, warn, _ = set_status_with_baton(project_id, conv_id, item_id, status)
+def set_status(
+    project_id: str,
+    conv_id: str,
+    item_id: str,
+    status: str,
+    force: bool = False,
+) -> tuple[str, str]:
+  """Updates item_id to status and returns (message, ownership_warning)."""
+  msg, warn, _ = set_status_with_baton(
+      project_id, conv_id, item_id, status, force=force
+  )
   return msg, warn
 
 
@@ -1793,15 +2232,23 @@ def _cli(argv: list[str]) -> int:
   if cmd == "add" and len(args) in (2, 4) and (len(args) == 2 or args[2] == "--parent"):
     pid = require_project_id(args[0])
     print(add_item(pid, args[0], args[1], args[3] if len(args) == 4 else ""))
-  elif cmd == "set" and len(args) == 3:
-    pid = require_project_id(args[0])
+  elif cmd == "set":
+    force = "--force" in args
+    pos_args = [a for a in args if a != "--force"]
+    if len(pos_args) != 3 or any(a.startswith("-") for a in pos_args):
+      print(f"roadmap.py: bad arguments for '{cmd}'\n", file=sys.stderr)
+      print(USAGE, file=sys.stderr, end="")
+      return 2
+    pid = require_project_id(pos_args[0])
     # Emit baton notice on stdout so CLI callers know whether to propose next-task
-    msg, warning, baton_notice = set_status_with_baton(pid, args[0], args[1], args[2])
+    msg, warning, baton_notice = set_status_with_baton(
+        pid, pos_args[0], pos_args[1], pos_args[2], force=force
+    )
     if warning:
       print(warning, file=sys.stderr)
     print(msg)
-    if args[2] == "done":
-      vcs_notice = evaluate_vcs_baton(args[0], pid)
+    if pos_args[2] == "done":
+      vcs_notice = evaluate_vcs_baton(pos_args[0], pid)
       if vcs_notice:
         print(vcs_notice)
     if baton_notice:

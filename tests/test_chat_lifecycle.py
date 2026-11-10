@@ -2774,6 +2774,284 @@ class TestChatLifecycle(unittest.TestCase):
         self.assertEqual(len(woken_calls), 2)
         self.assertEqual(quota_hold.load_hold_queue(qpath), {})
 
+  # Verifies R85 archive guards across next-task, sweep, project retention, and archived audit
+  def test_r85_live_work_and_open_gerrit_cl_archive_guards(self):
+    import roadmap
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      proj_dir = os.path.join(tmp_dir, "projects")
+      os.makedirs(proj_dir, exist_ok=True)
+      with open(os.path.join(proj_dir, "proj-skp.json"), "w", encoding="utf-8") as f:
+        json.dump({"id": "proj-skp", "name": "SkParagraph"}, f)
+
+      watcher_path = os.path.join(tmp_dir, "cl_watcher_state.json")
+      with open(watcher_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "items": {
+                    "gerrit:1422496@c-leaf": {
+                        "kind": "gerrit",
+                        "item_key": "gerrit:1422496",
+                        "host": "skia-review.googlesource.com",
+                        "status": "NEW",
+                        "owner_email": "jlavrova@google.com",
+                        "is_wip": False,
+                        "conversation_id": "c-leaf",
+                        "subject": "[skparagraph] Cache Cluster::isSoftBreak",
+                    },
+                    "gerrit:1418478@sib-wip": {
+                        "kind": "gerrit",
+                        "item_key": "gerrit:1418478",
+                        "host": "skia-review.googlesource.com",
+                        "status": "NEW",
+                        "owner_email": "jlavrova@google.com",
+                        "is_wip": True,
+                        "conversation_id": "sib-wip",
+                        "subject": "[skparagraph] Arabic span advance",
+                    },
+                    "gerrit:1418836@sib-ext": {
+                        "kind": "gerrit",
+                        "item_key": "gerrit:1418836",
+                        "host": "skia-review.googlesource.com",
+                        "status": "NEW",
+                        "owner_email": "I@YeungKC.com",
+                        "is_wip": False,
+                        "conversation_id": "sib-ext",
+                        "subject": "[skparagraph] External CL",
+                    },
+                }
+            },
+            f,
+        )
+
+      self.write_chain(
+          tmp_dir,
+          [
+              ("c-root", None),
+              ("c-leaf", "c-root"),
+              ("sib-wip", None),
+              ("sib-ext", None),
+              ("arch-live", None),
+              ("fork-root", None),
+              ("fork-open", "fork-root"),
+              ("fork-arch", "fork-root"),
+              ("c-orch", None),
+          ],
+      )
+      self.write_titles(
+          tmp_dir,
+          {
+              "c-root": "[09:00] ⦿ R1 Ellipsis perf",
+              "c-leaf": "[09:30] ⦿ R1 Ellipsis perf",
+              "sib-wip": "[10:00] ⦿ Gerrit 1418478 Arabic span",
+              "sib-ext": "[10:15] ⦿ Gerrit 1418836 review",
+              "arch-live": "[08:00] ⦿ R5 Archived prematurely",
+              "fork-root": "[07:00] ⦿ Fork root",
+              "fork-open": "[07:30] ⦿ Fork open branch",
+              "fork-arch": "[07:45] ⦿ Fork archived branch",
+              "c-orch": "[11:00] ⦿ Orchestrator chat",
+              "sub-agent-1": "[11:05] ⦿ Subagent worker",
+              "hidden-tool-1": "[11:10] ⦿ Hidden tool helper",
+          },
+          project="proj-skp",
+      )
+
+      env_patch = {
+          "JETSKI_CL_WATCHER_STATE_FILE": watcher_path,
+          "ANTIGRAVITY_PROJECTS_DIR": proj_dir,
+      }
+      start = unittest.mock.MagicMock(
+          side_effect=lambda enum, title, prompt, pid, before_send=None: (
+              before_send("c-next") if before_send else None,
+              "c-next",
+          )[1]
+      )
+      p = self.handoff_patches(tmp_dir, start)
+      with (
+          unittest.mock.patch.dict(os.environ, env_patch),
+          p[0],
+          p[1],
+          p[2],
+          p[3],
+          p[4],
+          p[5],
+      ):
+        roadmap.clear_gerrit_probe_cache()
+        roadmap.add_item("proj-skp", "c-root", "Ellipsis perf Gerrit 1422496")
+        roadmap.set_status("proj-skp", "c-root", "R1", "doing")
+        roadmap.add_item("proj-skp", "sib-wip", "Arabic span fix")
+        roadmap.set_status("proj-skp", "sib-wip", "R2", "doing")
+        roadmap.set_status("proj-skp", "sib-wip", "R2", "done", force=True)
+        roadmap.add_item("proj-skp", "sib-ext", "External review Gerrit 1418836")
+        roadmap.set_status("proj-skp", "sib-ext", "R3", "doing")
+        roadmap.set_status("proj-skp", "sib-ext", "R3", "done")
+        roadmap.add_item("proj-skp", "c-leaf", "Next ellipsis task")
+        roadmap.add_item("proj-skp", "arch-live", "Still doing task")
+        roadmap.set_status("proj-skp", "arch-live", "R5", "doing")
+
+        # Earlier piece c-root owning doing R1 blocks next-task from c-leaf
+        with self.assertRaisesRegex(RuntimeError, "still owns 'doing' item.*R1"):
+          chat_lifecycle.create_next_task(current_conv_id="c-leaf", item_id="R4")
+
+        # Even after R1 is force-marked done, an open linked todo spin-off blocks next-task
+        roadmap.set_status("proj-skp", "c-root", "R1", "done", force=True)
+        roadmap.add_item("proj-skp", "c-orch", "Linked spin-off task")
+        roadmap.link_item("proj-skp", "c-orch", "R6", "c-root")
+        with self.assertRaisesRegex(RuntimeError, "todo.*R6"):
+          chat_lifecycle.create_next_task(current_conv_id="c-leaf", item_id="R4")
+        roadmap.set_status("proj-skp", "c-root", "R6", "dropped")
+
+        # NEW own Gerrit 1422496 also blocks next-task and points to chat_lifecycle.py start
+        with self.assertRaisesRegex(RuntimeError, "1422496.*chat_lifecycle\\.py start"):
+          chat_lifecycle.create_next_task(current_conv_id="c-leaf", item_id="R4")
+
+        # Delegated worker item updated_by c-orch does not attribute worker CL to c-orch
+        roadmap.add_item("proj-skp", "c-orch", "Delegated Gerrit 1418478")
+        roadmap.link_item("proj-skp", "c-orch", "R7", "sib-wip")
+        self.assertEqual(
+            chat_lifecycle._chain_open_own_gerrit_cls(
+                "proj-skp", ["c-orch"], projects_dir=proj_dir
+            ),
+            [],
+        )
+
+        # sweep_completed_project_chats archives sib-ext (external CL) while keeping sib-wip
+        chat_lifecycle.archive_conversations(["c-root", "fork-root", "fork-arch"], archived=True)
+        roadmap.add_item("proj-skp", "fork-arch", "Abandoned fork branch item")
+        roadmap.set_status("proj-skp", "fork-arch", "R8", "doing")
+        roadmap.add_item("proj-skp", "sub-agent-1", "Subagent scratch item")
+        roadmap.set_status("proj-skp", "sub-agent-1", "R9", "doing")
+        roadmap.add_item("proj-skp", "hidden-tool-1", "Hidden tool scratch item")
+        roadmap.set_status("proj-skp", "hidden-tool-1", "R10", "doing")
+
+        swept = chat_lifecycle.sweep_completed_project_chats(
+            "proj-skp", exclude_cids={"c-leaf", "fork-open", "c-orch"}
+        )
+        self.assertEqual(swept, [["sib-ext"]])
+        self.assertFalse(chat_lifecycle.is_archived("sib-wip"))
+        self.assertTrue(chat_lifecycle.is_archived("sib-ext"))
+
+        # archive_project_conversations protects chats with open items or NEW own CLs
+        ls_fake = {
+            "c-leaf": {
+                "annotations": {"title": "[09:30] ⦿ R1 Ellipsis perf", "archived": False},
+                "trajectoryMetadata": {
+                    "projectId": "proj-skp",
+                    "createdAt": "2026-11-10T09:30:00Z",
+                },
+            },
+            "sib-wip": {
+                "annotations": {
+                    "title": "[10:00] ⦿ Gerrit 1418478 Arabic span",
+                    "archived": False,
+                },
+                "trajectoryMetadata": {
+                    "projectId": "proj-skp",
+                    "createdAt": "2026-11-10T10:00:00Z",
+                },
+            },
+        }
+        with unittest.mock.patch.object(
+            chat_lifecycle, "_fetch_ls_summaries_for_audit", return_value=ls_fake
+        ):
+          ret_res = chat_lifecycle.archive_project_conversations(
+              "proj-skp", keep=0, projects_dir=proj_dir
+          )
+        self.assertEqual(ret_res["archived_ids"], [])
+        self.assertFalse(chat_lifecycle.is_archived("c-leaf"))
+        self.assertFalse(chat_lifecycle.is_archived("sib-wip"))
+
+        # audit_conversations reports archived chains and archived fork branches with live work
+        # while ignoring active subagents and non-archived hidden tool trajectories
+        chat_lifecycle.archive_conversations(["arch-live", "sib-wip"], archived=True)
+        ls_audit = {
+            "c-leaf": ls_fake["c-leaf"],
+            "fork-open": {
+                "annotations": {"title": "[07:30] ⦿ Fork open branch", "archived": False},
+                "trajectoryMetadata": {
+                    "projectId": "proj-skp",
+                    "createdAt": "2026-11-10T07:30:00Z",
+                },
+            },
+            "fork-root": {
+                "annotations": {"title": "[07:00] ⦿ Fork root", "archived": True},
+                "trajectoryMetadata": {
+                    "projectId": "proj-skp",
+                    "createdAt": "2026-11-10T07:00:00Z",
+                },
+            },
+            "fork-arch": {
+                "annotations": {"title": "[07:45] ⦿ Fork archived branch", "archived": True},
+                "trajectoryMetadata": {
+                    "projectId": "proj-skp",
+                    "createdAt": "2026-11-10T07:45:00Z",
+                },
+            },
+            "sub-agent-1": {
+                "annotations": {"title": "[11:05] ⦿ Subagent worker", "archived": False},
+                "trajectoryMetadata": {
+                    "projectId": "proj-skp",
+                    "parentConversationId": "c-leaf",
+                    "createdAt": "2026-11-10T11:05:00Z",
+                },
+            },
+            "hidden-tool-1": {
+                "annotations": {"title": "[11:10] ⦿ Hidden tool helper", "archived": False},
+                "trajectoryMetadata": {
+                    "projectId": "proj-skp",
+                    "sourceMetadata": {"tool": True},
+                    "createdAt": "2026-11-10T11:10:00Z",
+                },
+            },
+            "arch-live": {
+                "annotations": {
+                    "title": "[08:00] ⦿ R5 Archived prematurely",
+                    "archived": True,
+                },
+                "trajectoryMetadata": {
+                    "projectId": "proj-skp",
+                    "createdAt": "2026-11-10T08:00:00Z",
+                },
+            },
+            "sib-wip": {
+                "annotations": {
+                    "title": "[10:00] ⦿ Gerrit 1418478 Arabic span",
+                    "archived": True,
+                },
+                "trajectoryMetadata": {
+                    "projectId": "proj-skp",
+                    "createdAt": "2026-11-10T10:00:00Z",
+                },
+            },
+            "sib-ext": {
+                "annotations": {
+                    "title": "[10:15] ⦿ Gerrit 1418836 review",
+                    "archived": True,
+                },
+                "trajectoryMetadata": {
+                    "projectId": "proj-skp",
+                    "createdAt": "2026-11-10T10:15:00Z",
+                },
+            },
+        }
+        with unittest.mock.patch.object(
+            chat_lifecycle, "_fetch_ls_summaries_for_audit", return_value=ls_audit
+        ):
+          report = chat_lifecycle.audit_conversations(
+              fix=True, project_filter="proj-skp", projects_dir=proj_dir
+          )
+        flagged = {
+            d["conversation_id"]: d
+            for d in report["discrepancies"]
+            if "archived_with_live_work" in d["issues"]
+        }
+        self.assertEqual(set(flagged.keys()), {"arch-live", "sib-wip", "fork-arch"})
+        self.assertFalse(flagged["arch-live"]["fixed"])
+        self.assertFalse(flagged["sib-wip"]["fixed"])
+        self.assertFalse(flagged["fork-arch"]["fixed"])
+        self.assertTrue(chat_lifecycle.is_archived("arch-live"))
+        self.assertTrue(chat_lifecycle.is_archived("sib-wip"))
+
 
 if __name__ == "__main__":
   unittest.main()
