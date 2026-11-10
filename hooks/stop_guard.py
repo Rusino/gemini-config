@@ -465,6 +465,33 @@ PLUGIN_SKILL_CACHE_FILE = os.path.expanduser(
 _MEM_PLUGIN_SKILL_CACHE: dict[str, list[str]] | None = None
 
 
+def _root_symlink_aliases(prefixes: tuple[str, ...]) -> tuple[str, ...]:
+  """Returns prefixes rewritten through top-level symlinks of '/' (macOS /var -> /private/var).
+
+  A link target written as /var/... must match a realpath prefix under /private/var. Only
+  readlink runs on the entries of '/', so no target (possibly a FUSE mount) is followed
+  """
+  try:
+    entries = list(os.scandir(os.sep))
+  except OSError:
+    return ()
+  aliases: list[str] = []
+  for entry in entries:
+    if not entry.is_symlink():
+      continue
+    try:
+      target = os.path.normpath(os.path.join(os.sep, os.readlink(entry.path)))
+    except OSError:
+      continue
+    target_prefix = target.rstrip(os.sep) + os.sep
+    for prefix in prefixes:
+      if prefix.startswith(target_prefix):
+        alias = entry.path.rstrip(os.sep) + os.sep + prefix[len(target_prefix):]
+        if alias not in prefixes and alias not in aliases:
+          aliases.append(alias)
+  return tuple(aliases)
+
+
 def _is_external_symlink(
     entry: os.DirEntry, base_dir: str, local_prefixes: tuple[str, ...]
 ) -> str:
@@ -482,6 +509,8 @@ def _is_external_symlink(
       os.path.abspath(base_dir).rstrip(os.sep) + os.sep,
       os.path.realpath(base_dir).rstrip(os.sep) + os.sep,
   )
+  # A symlinked base_dir resolves to /private/var on macOS; targets may keep the /var spelling
+  base_prefixes += _root_symlink_aliases(base_prefixes)
   if any(resolved.startswith(p) for p in base_prefixes + local_prefixes):
     return ""
   return raw_target
@@ -593,6 +622,8 @@ def discover_skills() -> dict:
           if (prefix := os.path.abspath(p).rstrip(os.sep) + os.sep) != os.sep
       )
   )
+  # realpath gives /private/var on macOS while link targets keep the /var spelling
+  local_prefixes += _root_symlink_aliases(local_prefixes)
   for pattern in SKILL_GLOBS:
     expanded = os.path.expanduser(pattern)
     if not expanded.endswith(suffix):

@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -213,6 +214,10 @@ echo '{"benchmarks": []}' > "$out"
 """
 
 
+# remote_runner.sh runs only on the Linux measuring workstation (/proc/loadavg, /proc/stat,
+# taskset); macOS has none of them, nor GNU timeout
+@unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("taskset")
+                     and shutil.which("timeout"), "remote_runner.sh needs Linux, taskset, timeout")
 class RemoteRunnerTest(unittest.TestCase):
   """Runs remote_runner.sh locally against fake binaries in a temp root."""
 
