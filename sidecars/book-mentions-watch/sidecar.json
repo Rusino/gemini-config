@@ -13,13 +13,14 @@
   ],
   "restart_policy": "always",
   "display_name": "Book Mentions Watch (Daily 9:00 AM ET)",
-  "description": "Every day at 9:00 AM America/New_York, checks Google Alerts mail (and on the 1st runs the full citation sweep) for new verified mentions of Misha's book Start Doing Graph Theory, appends them to book_mentions_sweep.md, and creates an unsent Gmail reply draft to Misha when something new is found.",
+  "description": "Every day at 9:00 AM America/New_York, checks Google Alerts mail, Bluesky, Hacker News comments, Hypothes.is and Stack Exchange (and on the 1st runs the full citation sweep) for new verified mentions of Misha's book Start Doing Graph Theory, appends them to book_mentions_sweep.md, and creates an unsent Gmail reply draft to Misha when something new is found.",
   "agent_permissions": {
     "workspace_uris": [
       "file:///usr/local/google/home/jlavrova/.gemini/config/sidecars/book-mentions-watch"
     ],
     "access_grants": [
       "command(python3 /usr/local/google/home/jlavrova/.gemini/config/sidecars/book-mentions-watch/check_alerts.py)",
+      "command(python3 /usr/local/google/home/jlavrova/.gemini/config/sidecars/book-mentions-watch/check_social.py)",
       "command(/google/bin/releases/gemini-agents-gmail/gmail readonly)",
       "command(/google/bin/releases/gemini-agents-gmail/gmail mutate create-draft)",
       "command(python3 /usr/local/google/home/jlavrova/.gemini/jetski/brain/352bea2a-50e0-4b10-8eb2-516e7892559e/scratch/citation_sweep.py)",
