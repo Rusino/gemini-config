@@ -116,6 +116,8 @@ class PerfRemoteTest(unittest.TestCase):
 
   # Enqueue starts the background runner when .runner.lock is free instead of matching its own
   # shell command line, and reports RUNNING without spawning a duplicate when locked
+  # The remote scripts lock with util-linux flock, which macOS does not ship
+  @unittest.skipUnless(shutil.which("flock"), "needs util-linux flock (Linux workstation)")
   def test_enqueue_remote_script_runs(self):
     with tempfile.TemporaryDirectory() as root:
       r = pathlib.Path(root)
@@ -283,6 +285,8 @@ class ShellSyntaxTest(unittest.TestCase):
 
   # Upstream Skia switched utils to skia_source_set, so remote_build_push.sh must inspect
   # Flutter's flutter/skia/modules/skparagraph/BUILD.gn when wiring txt_ext_benchmarks
+  # The remote scripts lock with util-linux flock, which macOS does not ship
+  @unittest.skipUnless(shutil.which("flock"), "needs util-linux flock (Linux workstation)")
   def test_ext_target_links_flutter_skia_utils(self):
     git_env = {
         **os.environ,

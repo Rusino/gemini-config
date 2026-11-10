@@ -237,7 +237,18 @@ def main() -> int:
         action="store_true",
         help="Skip ref if attestation and summary JSON already exist in output dir",
     )
-    args = ap.parse_args()
+    # Forwarding arbitrary flags with dashes to --extra-dm-flags before positional targets
+    # would trip argparse unless delimited by '--' and extracted before top-level parsing
+    raw_argv = sys.argv[1:]
+    extra_flags: List[str] = []
+    if "--extra-dm-flags" in raw_argv:
+        idx = raw_argv.index("--extra-dm-flags")
+        if "--" in raw_argv[idx:]:
+            end_idx = idx + raw_argv[idx:].index("--")
+            extra_flags = raw_argv[idx + 1:end_idx]
+            raw_argv = raw_argv[:idx] + raw_argv[end_idx + 1:]
+
+    args = ap.parse_args(raw_argv)
 
     repo = pathlib.Path(args.repo).resolve()
     out_dir = pathlib.Path(args.out).resolve()
@@ -340,7 +351,9 @@ def main() -> int:
                 attestation["binary_mtime"] = None
 
             # 4. Construct test command line
-            test_cmd = [str(dm_bin), "--src", args.src, "--match", args.match]
+            test_cmd = [str(dm_bin), "--src", args.src]
+            if not any(f in ("--match", "-m") for f in extra_flags):
+                test_cmd.extend(["--match", args.match])
             if args.config:
                 test_cmd.extend(["--config", args.config])
             if args.nogpu:
@@ -348,6 +361,7 @@ def main() -> int:
             if args.ci_fonts:
                 test_cmd.extend(["--nativeFonts", "--paragraph_fonts", "extra_fonts",
                                  "--norun_paragraph_tests_needing_system_fonts"])
+            test_cmd.extend(extra_flags)
             test_cmd.extend(args.extra_dm_flags)
             attestation["test_cmd"] = test_cmd
 
