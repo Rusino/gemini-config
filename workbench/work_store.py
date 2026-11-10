@@ -1634,7 +1634,50 @@ def _sanitize_gerrit_account_placeholders(
   return re.sub(r"<GERRIT_ACCOUNT_(\d+)>", r"account #\1", text)
 
 
-def _evaluate_cl_needs_you(akey: str, st: Mapping[str, Any]) -> str:
+def _is_dns_probe_subject(subject_or_title: str) -> bool:
+  """Returns True when a CL/PR subject or title marks a DO NOT SUBMIT or Control: probe."""
+  subj_u = subject_or_title.strip().upper()
+  if not subj_u:
+    return False
+  if "DO NOT SUBMIT" in subj_u:
+    return True
+  # Strip optional Gerrit numeric prefix ("1419002: ") and bracket tags ("[SkoreText] ")
+  tail = re.sub(r"^(?:\d+\s*:\s*)?(?:\[[^\]]*\]\s*)*", "", subj_u)
+  return tail.startswith("CONTROL:")
+
+
+def _is_pre_review_own_cl(
+    st: Mapping[str, Any], est: Mapping[str, Any], fallback_title: str = ""
+) -> tuple[bool, bool, bool]:
+  """Returns (is_wip_or_draft, is_no_reviewers, is_dns) for pre-review On Desk checks."""
+  is_wip_or_draft = bool(
+      st.get("is_wip")
+      or st.get("is_draft")
+      or st.get("wip_label")
+      or est.get("status") == "draft"
+  )
+  # Require explicit in-development or 0-reviewer metadata so minimal test stubs stay waiting
+  has_explicit_zero_rev = (
+      "assigned_reviewers_count" in st
+      and int(st.get("assigned_reviewers_count") or 0) == 0
+      and str(st.get("reviewer_status") or "").strip().lower().startswith("no reviewer")
+  )
+  # Honor lane=="desk" only on status-less stubs so status=="waiting" conflicts stay Needs You
+  is_no_reviewers = bool(
+      st.get("in_development")
+      or est.get("status") == "dev"
+      or has_explicit_zero_rev
+      or (not is_wip_or_draft and not est.get("status") and est.get("lane") == "desk")
+  )
+  is_dns = _is_dns_probe_subject(
+      str(st.get("subject") or fallback_title or st.get("title") or "")
+  )
+  return is_wip_or_draft, is_no_reviewers, is_dns
+
+
+def _evaluate_cl_needs_you(
+    akey: str, st: Mapping[str, Any], fallback_title: str = ""
+) -> str:
   """Returns the Needs You reason for a non-companion CL/PR/bug, or '' when waiting/done."""
   est = st.get("entity_state") if isinstance(st.get("entity_state"), Mapping) else {}
   if akey.startswith(("buganizer:", "github_issue:")):
@@ -1670,9 +1713,11 @@ def _evaluate_cl_needs_you(akey: str, st: Mapping[str, Any]) -> str:
     if not (bool(est.get("is_post_submit_alert")) or bool(est.get("action_required"))):
       return ""
 
-  is_wip = bool(st.get("is_wip") or st.get("is_draft") or st.get("wip_label"))
+  is_wip, is_no_rev, is_dns = _is_pre_review_own_cl(st, est, fallback_title)
+  is_pre_review = is_wip or is_no_rev or is_dns
   is_own = _is_own_cl(st, est)
-  own_conflict = is_open_cl and is_own and not is_wip and bool(st.get("merge_conflict"))
+  # Pre-review drafts, 0-reviewer CLs, and probes stay On Desk on merge conflict (entity_state.py)
+  own_conflict = is_open_cl and is_own and not is_pre_review and bool(st.get("merge_conflict"))
   # Promote clean non-conflicted external reviews awaiting CQ Dry Run -> auto CR+1 finalization
   clean_review_ready = (
       is_open_cl
@@ -1734,6 +1779,57 @@ def _evaluate_cl_needs_you(akey: str, st: Mapping[str, Any]) -> str:
   if not is_own and (bool(est.get("is_reviewer_change")) or st.get("role") == "reviewer"):
     return f"Needs review: {short_cl}"
   return f"Needs action: {short_cl}"
+
+
+def _evaluate_cl_on_desk(
+    akey: str, st: Mapping[str, Any], fallback_title: str = ""
+) -> tuple[int, str] | None:
+  """Returns (desk_tier, reason) for a prepared self CL/PR not yet in review, or None."""
+  if akey.startswith(("buganizer:", "github_issue:")):
+    return None
+  status_u = str(st.get("status") or "NEW").strip().upper()
+  if status_u not in ("NEW", "OPEN"):
+    return None
+  est = st.get("entity_state") if isinstance(st.get("entity_state"), Mapping) else {}
+  if not _is_own_cl_state(st, est):
+    return None
+  # Urgent Needs You signals (comments, broken builds, Ready-to-Submit, active review conflicts) win
+  if _evaluate_cl_needs_you(akey, st, fallback_title):
+    return None
+  is_wip_or_draft, is_no_reviewers, is_dns = _is_pre_review_own_cl(st, est, fallback_title)
+  if not is_wip_or_draft and not is_no_reviewers and not is_dns:
+    return None
+  conflict_suffix = " · ⚠️ Merge conflict" if bool(st.get("merge_conflict")) else ""
+  short_cl = format_short_cl_id(akey, st)
+  # Rank ready-to-send no-reviewer CLs (0) ahead of WIP drafts (1) and DO NOT SUBMIT probes (2)
+  if is_dns:
+    return 2, f"DO NOT SUBMIT probe: {short_cl}{conflict_suffix}"
+  if is_no_reviewers and not is_wip_or_draft:
+    return 0, f"No reviewers assigned: {short_cl}{conflict_suffix}"
+  return 1, f"WIP / Draft: {short_cl}{conflict_suffix}"
+
+
+def _collect_desk_hits(artifacts: Iterable[Mapping[str, Any]]) -> list[tuple[int, str]]:
+  """Collects and tier-orders On Desk (tier, reason) hits across non-context non-companion CLs."""
+  indexed: list[tuple[int, int, str]] = []
+  for idx, art in enumerate(artifacts):
+    # Ignore passing chat mentions and subordinate companion probes when computing card lane
+    if art.get("role") == "context_only":
+      continue
+    akey = str(art.get("artifact_key") or "")
+    kind = str(art.get("kind") or artifact_kind_from_key(akey))
+    st = art.get("state") if isinstance(art.get("state"), Mapping) else {}
+    art_title = str(art.get("title") or "")
+    if kind not in ("gerrit", "github_pr", "piper") or is_companion_artifact(
+        akey, st, art_title, str(art.get("link_reason") or "")
+    ):
+      continue
+    hit = _evaluate_cl_on_desk(akey, st, art_title)
+    if hit is not None:
+      indexed.append((hit[0], idx, hit[1]))
+  # Preserve input artifact order as tie-breaker within the same On Desk sub-tier
+  indexed.sort(key=lambda item: (item[0], item[1]))
+  return [(tier, reason) for tier, _, reason in indexed]
 
 
 def _is_correspondence_silence_ping(
@@ -2604,6 +2700,7 @@ def build_work_checklist(
   n_rolled = 0
   n_merged = 0
   n_review = 0
+  n_on_desk = 0
   n_wip = 0
   n_conflict = 0
   n_outdated = 0
@@ -2629,12 +2726,20 @@ def build_work_checklist(
     cl_items: list[dict[str, Any]] = []
     for ckey, c_art, is_stacked in cls_by_bug.get(bk, []):
       st = c_art.get("state") or {}
+      c_title = str(c_art.get("title") or "")
       c_status = str(st.get("status") or "NEW").upper()
       is_wip = bool(st.get("is_wip") or st.get("is_draft") or st.get("wip_label"))
       default_wip = "Draft" if st.get("is_draft") else "WIP"
       wip_lbl = str(st.get("wip_label") or default_wip) if is_wip else ""
       est = st.get("entity_state") or {}
       conflict = bool(st.get("merge_conflict") or est.get("status") == "conflict")
+      desk_hit = _evaluate_cl_on_desk(ckey, st, c_title)
+      desk_tier = desk_hit[0] if desk_hit is not None else None
+      rev_cnt = (
+          int(st.get("assigned_reviewers_count") or 0)
+          if "assigned_reviewers_count" in st
+          else (0 if desk_tier is not None else 1)
+      )
       rolls = st.get("rolls") if isinstance(st.get("rolls"), Mapping) else {}
       fl_roll = rolls.get("Flutter") if isinstance(rolls, Mapping) else None
       rolled_fl = (
@@ -2652,14 +2757,15 @@ def build_work_checklist(
           "artifact_key": ckey,
           "label": format_short_cl_id(ckey, st),
           "url": str(c_art.get("url") or st.get("url") or ""),
-          "subject": str(st.get("subject") or c_art.get("title") or ckey),
+          "subject": str(st.get("subject") or c_title or ckey),
           "status": c_status,
           "is_wip": is_wip,
           "wip_label": wip_lbl,
+          "on_desk_tier": desk_tier,
           "merge_conflict": conflict,
           "cr_summary": str(st.get("cr_summary") or ""),
           "reviewer_status": str(st.get("reviewer_status") or ""),
-          "assigned_reviewers_count": int(st.get("assigned_reviewers_count") or 0),
+          "assigned_reviewers_count": rev_cnt,
           "rolled_flutter": rolled_fl,
           "in_draft": in_draft,
           "is_stacked": is_stacked,
@@ -2692,6 +2798,7 @@ def build_work_checklist(
       n_merged += 1
     else:
       has_wip = any(c["is_wip"] for c in cl_items)
+      has_on_desk = any(c["on_desk_tier"] is not None for c in cl_items)
       has_conflict = any(c["merge_conflict"] for c in cl_items)
       if has_conflict:
         n_conflict += 1
@@ -2705,6 +2812,16 @@ def build_work_checklist(
           parts_s.append("No reviewers")
         stage_label = " · ".join(parts_s)
         n_wip += 1
+      elif has_on_desk:
+        stage = "on_desk"
+        stage_tone = "urgent" if has_conflict else "warn"
+        lead_s = (
+            "🧪 DO NOT SUBMIT"
+            if any(c["on_desk_tier"] == 2 for c in cl_items)
+            else "📝 No reviewers"
+        )
+        stage_label = f"{lead_s} · ⚠️ Conflict" if has_conflict else lead_s
+        n_on_desk += 1
       elif has_conflict:
         stage = "conflict"
         stage_tone = "urgent"
@@ -2737,6 +2854,8 @@ def build_work_checklist(
     prog_parts.append(f"{n_merged} merged")
   if n_review:
     prog_parts.append(f"{n_review} in review")
+  if n_on_desk:
+    prog_parts.append(f"{n_on_desk} on desk")
   if n_wip:
     prog_parts.append(f"{n_wip} WIP")
   if n_conflict:
@@ -5578,12 +5697,22 @@ class WorkStore:
       artifacts: list[dict[str, Any]],
       obligations: list[dict[str, Any]],
   ) -> tuple[str, list[str]]:
-    """Computes unified Work lane ('needs-you'|'waiting'|'blocked'|'done') and reasons."""
+    """Computes Work lane ('needs-you'|'on-desk'|'waiting'|'blocked'|'done') and reasons."""
+    lane, reasons, _ = self._compute_work_lane_and_tier(work_row, artifacts, obligations)
+    return lane, reasons
+
+  def _compute_work_lane_and_tier(
+      self,
+      work_row: Mapping[str, Any],
+      artifacts: list[dict[str, Any]],
+      obligations: list[dict[str, Any]],
+  ) -> tuple[str, list[str], int]:
+    """Computes Work lane, reasons, and highest-priority On Desk sub-tier in a single pass."""
     status = str(work_row.get("status") or "active")
     if status == "done":
-      return "done", ["Completed"]
+      return "done", ["Completed"], 0
     if status == "blocked":
-      return "blocked", ["Blocked"]
+      return "blocked", ["Blocked"], 0
 
     reasons: list[str] = []
     gated_draft_keys: set[str] = set()
@@ -5697,7 +5826,7 @@ class WorkStore:
         reasons.extend(orphan_r)
         reasons.extend(comment_r)
       elif kind in ("gerrit", "github_pr", "piper", "buganizer", "github_issue"):
-        cl_reason = _evaluate_cl_needs_you(akey, st)
+        cl_reason = _evaluate_cl_needs_you(akey, st, str(art.get("title") or ""))
         if cl_reason:
           reasons.append(cl_reason)
 
@@ -5706,7 +5835,7 @@ class WorkStore:
         reasons.append("📝 Unsent reply draft")
 
     if reasons:
-      return "needs-you", reasons
+      return "needs-you", reasons, 0
 
     open_obs = [ob for ob in obligations if ob.get("status") in ("open", "ready")]
     # Exclude companion probes from active_cls so open companions do not block terminal parents
@@ -5741,7 +5870,7 @@ class WorkStore:
             if all_merged
             else "All CLs closed and obligations satisfied"
         )
-        return "done", [done_msg]
+        return "done", [done_msg], 0
       # Complete CL-less cards once tracked obligations finish or closed issues/GH threads resolve
       has_non_ctx_chat = any(
           a.get("role") != "context_only" and a.get("kind") == "chat_chain"
@@ -5792,7 +5921,13 @@ class WorkStore:
             if obligations
             else "All linked issues closed and obligations satisfied"
         )
-        return "done", [done_msg]
+        return "done", [done_msg], 0
+
+    # Route prepared self CLs without open obligations to On Desk instead of passive Waiting
+    if not open_obs:
+      desk_hits = _collect_desk_hits(active_cls)
+      if desk_hits:
+        return "on-desk", [r for _, r in desk_hits], desk_hits[0][0]
 
     wait_reasons: list[str] = []
     for ob in open_obs:
@@ -5801,7 +5936,7 @@ class WorkStore:
       wait_reasons.append(f"⏳ Parked: {ob.get('description')}{prog_suffix}")
     if not wait_reasons:
       wait_reasons.append("In progress / waiting on external actors")
-    return "waiting", wait_reasons
+    return "waiting", wait_reasons, 0
 
   def purge_config_artifacts_and_works(
       self, now: float | None = None
@@ -6984,7 +7119,7 @@ class WorkStore:
       resolved_title, origin_info = resolve_work_origin_and_title(w, w_arts)
       if resolved_title and resolved_title != str(w["title"]):
         title_updates.append((resolved_title, wid))
-      lane, reasons = self.compute_work_lane(w, w_arts, w_obs)
+      lane, reasons, w_desk_tier = self._compute_work_lane_and_tier(w, w_arts, w_obs)
       card_reply_draft: dict[str, Any] | None = None
       if active_rd is not None:
         rd_upd = float(active_rd.get("updated_at") or cur_now)
@@ -7018,6 +7153,7 @@ class WorkStore:
           "origin": origin_info,
           "status": str(w["status"]),
           "lane": lane,
+          "desk_tier": w_desk_tier,
           "reasons": reasons,
           "project_id": effective_proj,
           "roadmap_item_key": str(w.get("roadmap_item_key") or ""),
@@ -7157,8 +7293,16 @@ class WorkStore:
               "source": "virtual",
               "state": dict(b_ar_st),
           })
-        lane = "needs-you" if v_reasons else "waiting"
-        if not v_reasons:
+        # Route prepared standalone self CLs to On Desk before passive Waiting
+        v_desk_tier = 0
+        if v_reasons:
+          lane = "needs-you"
+        elif (desk_hit := _evaluate_cl_on_desk(c_key, item)) is not None:
+          lane = "on-desk"
+          v_desk_tier, desk_reason = desk_hit
+          v_reasons.append(desk_reason)
+        else:
+          lane = "waiting"
           fallback_r = _sanitize_gerrit_account_placeholders(
               str(est.get("reason") or item.get("attention_reason") or status),
               item,
@@ -7192,6 +7336,7 @@ class WorkStore:
             "title": v_title,
             "status": "active",
             "lane": lane,
+            "desk_tier": v_desk_tier,
             "reasons": v_reasons,
             "project_id": v_proj,
             "roadmap_item_key": "",
@@ -7271,12 +7416,13 @@ class WorkStore:
           "obligations": [],
       })
 
-    # Rank by lane and urgent obligations first, pushing missing/zero timestamps after dated cards
-    lane_rank = {"needs-you": 0, "waiting": 1, "blocked": 2, "done": 3}
+    # Rank by lane, urgency, and On Desk sub-tier first, pushing zero timestamps after dated cards
+    lane_rank = {"needs-you": 0, "on-desk": 1, "waiting": 2, "blocked": 3, "done": 4}
     cards.sort(
         key=lambda c: (
             lane_rank.get(c["lane"], 9),
             0 if c.get("has_urgent_obligation") else 1,
+            int(c.get("desk_tier", 1)) if c["lane"] == "on-desk" else 0,
             1 if float(c.get("activity_at") or c.get("updated_at") or 0.0) <= 0.0 else 0,
             -float(c.get("activity_at") or c.get("updated_at") or 0.0),
             str(c.get("work_id") or ""),
@@ -7308,6 +7454,7 @@ class WorkStore:
     counts = {
         "all_active": len(active_cards),
         "needs_you": len(needs_cards),
+        "on_desk": sum(1 for c in cards if c["lane"] == "on-desk"),
         "waiting": sum(1 for c in cards if c["lane"] == "waiting"),
         "done": sum(1 for c in cards if c["lane"] == "done"),
         "multi_channel": sum(1 for c in active_cards if c.get("is_multi_channel")),

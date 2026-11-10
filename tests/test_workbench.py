@@ -6300,7 +6300,7 @@ assert.deepStrictEqual(JSON.parse(storage.get('wb_sort_v1')), { mode: 'age', dir
         parsed_type_chips.append(attr_map)
     self.assertEqual(
         {c["data-filter"]: int(c["data-count"]) for c in parsed_lane_chips},
-        {"all": 5, "needs-you": 3, "waiting": 2, "done": 1},
+        {"all": 5, "needs-you": 3, "on-desk": 0, "waiting": 2, "done": 1},
     )
     self.assertEqual(
         {c["data-type"]: int(c["data-count"]) for c in parsed_type_chips},
@@ -6392,7 +6392,7 @@ typeChips[0].dispatch('click');
 assert(els['wb-cards-container'].innerHTML.includes('📨 NEEDS REPLY'));
 assert(els['wb-cards-container'].innerHTML.includes('⏰ 7d SILENCE PING'));
 
-laneChips[3].dispatch('click');
+laneChips.find((c) => c.getAttribute('data-filter') === 'done').dispatch('click');
 assert(els['wb-cards-container'].innerHTML.includes('✅ Done'));
 assert(!els['wb-cards-container'].innerHTML.includes('⏳ Waiting'));
 

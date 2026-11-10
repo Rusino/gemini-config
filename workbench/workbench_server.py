@@ -411,6 +411,34 @@ def _attach_or_promote_ssr_bugs(
       covered.add(akey)
 
 
+def _ssr_cl_desk_kind(ast: dict[str, Any], title: str) -> str:
+  """Classifies an open CL/PR state into 'dns', 'wip', 'norev', or '' for SSR peer badges."""
+  if str(ast.get("status") or "OPEN").strip().upper() not in ("NEW", "OPEN"):
+    return ""
+  raw_u = str(ast.get("subject") or title or "").strip().upper()
+  if "DO NOT SUBMIT" in raw_u or re.sub(
+      r"^(?:\d+\s*:\s*)?(?:\[[^\]]*\]\s*)*", "", raw_u
+  ).startswith("CONTROL:"):
+    return "dns"
+  est = ast.get("entity_state") if isinstance(ast.get("entity_state"), dict) else {}
+  if bool(
+      ast.get("is_wip")
+      or ast.get("is_draft")
+      or ast.get("wip_label")
+      or est.get("status") == "draft"
+  ):
+    return "wip"
+  # Honor lane=="desk" only on status-less stubs so explicit waiting/conflict states hold
+  if bool(
+      ast.get("in_development")
+      or est.get("status") == "dev"
+      or (not est.get("status") and est.get("lane") == "desk")
+      or ("assigned_reviewers_count" in ast and int(ast.get("assigned_reviewers_count") or 0) == 0)
+  ):
+    return "norev"
+  return ""
+
+
 def _refresh_ssr_non_checklist_stages(peers: list[dict[str, Any]]) -> None:
   """Updates stage badges on promoted non-checklist bug peers once uncovered CLs attach."""
   for p in peers:
@@ -418,10 +446,14 @@ def _refresh_ssr_non_checklist_stages(peers: list[dict[str, Any]]) -> None:
       continue
     if any(c["merge_conflict"] for c in p["cls"]):
       p["stage"], p["stage_tone"], p["stage_label"] = "wip", "urgent", "Merge conflict"
-    elif any(c["is_wip"] for c in p["cls"]):
-      p["stage"], p["stage_tone"], p["stage_label"] = "wip", "warn", "WIP"
     elif all(c["status"] in ("MERGED", "SUBMITTED") for c in p["cls"]):
       p["stage"], p["stage_tone"], p["stage_label"] = "merged", "ok", "Merged"
+    elif any(c["is_wip"] or c.get("desk_kind") == "wip" for c in p["cls"]):
+      p["stage"], p["stage_tone"], p["stage_label"] = "wip", "warn", "WIP"
+    elif any(c.get("desk_kind") == "dns" for c in p["cls"]):
+      p["stage"], p["stage_tone"], p["stage_label"] = "on_desk", "warn", "DO NOT SUBMIT"
+    elif any(c.get("desk_kind") == "norev" for c in p["cls"]):
+      p["stage"], p["stage_tone"], p["stage_label"] = "on_desk", "warn", "No reviewers"
     else:
       p["stage"], p["stage_tone"], p["stage_label"] = "review", "wait", "In review"
 
@@ -448,12 +480,14 @@ def _attach_ssr_uncovered_cls(
     if not akey or akey in covered:
       continue
     ast = a.get("state") or {}
-    short_lbl, ps_tag = _short_cl_label(akey, str(a.get("title") or akey))
+    raw_title = str(a.get("title") or "")
+    short_lbl, ps_tag = _short_cl_label(akey, raw_title or akey)
     if not ps_tag and ast.get("patchset"):
       ps_tag = f"PS{ast['patchset']}"
-    subj = _clean_cl_subject(str(a.get("title") or ""), ast, short_lbl)
+    subj = _clean_cl_subject(raw_title, ast, short_lbl)
     why_b = str(a.get("why_badge") or "")
-    is_wip = bool(ast.get("is_wip") or ast.get("is_draft"))
+    desk_kind = _ssr_cl_desk_kind(ast, raw_title)
+    is_wip = bool(ast.get("is_wip") or ast.get("is_draft") or desk_kind == "wip")
     st_str = str(ast.get("status") or "OPEN")
     cl_entry = {
         "artifact_key": akey,
@@ -464,6 +498,7 @@ def _attach_ssr_uncovered_cls(
         "status": st_str,
         "merge_conflict": bool(ast.get("merge_conflict")),
         "is_wip": is_wip,
+        "desk_kind": desk_kind,
         "why_badge": why_b,
     }
     lbugs = _extract_ssr_cl_bug_keys(ast)
@@ -495,8 +530,12 @@ def _attach_ssr_uncovered_cls(
         s_tone, s_lbl = "urgent", "Merge conflict"
       elif is_done_st:
         s_tone, s_lbl = "ok", "Merged"
+      elif desk_kind == "dns":
+        s_tone, s_lbl = "warn", "DO NOT SUBMIT"
       elif is_wip:
-        s_tone, s_lbl = "warn", ("Draft" if ast.get("is_draft") else "WIP")
+        s_tone, s_lbl = "warn", str(ast.get("wip_label") or ("Draft" if ast.get("is_draft") else "WIP"))
+      elif desk_kind == "norev":
+        s_tone, s_lbl = "warn", "No reviewers"
       else:
         s_tone, s_lbl = "wait", "In review"
       peers.append({
@@ -796,11 +835,25 @@ def _render_ssr_card(w: dict[str, Any]) -> str:
       if (chats_ssr or pills_wrap_ssr or util_wrap_ssr)
       else ""
   )
+  # Mirror renderCardHeader status pill tones so initial SSR paint has zero hydration flash
+  if raw_lane == "done":
+    status_pill_ssr = '<span class="re-status-pill" data-tone="ready">✅ Done</span>'
+  else:
+    pill_tone, pill_lbl = {
+        "needs-you": ("urgent", "Needs You"),
+        "on-desk": ("warn", "On Desk"),
+        "waiting": ("wait", "Waiting"),
+        "": ("wait", "Waiting"),
+    }.get(raw_lane, ("wait", lane))
+    status_pill_ssr = (
+        f'<span class="re-status-pill" data-tone="{pill_tone}">'
+        f'<span class="re-dot"></span>{pill_lbl}</span>'
+    )
   return (
       f'<article class="wb-card" data-work-id="{wid}" data-lane="{lane}" '
       f'data-collapsed="{collapsed_attr}">'
       f'<div class="wb-card-hdr" data-toggle-card="{wid}"><div class="wb-hdr-stack">'
-      f'<div class="re-eyebrow"><span class="re-status-pill">{lane}</span>'
+      f'<div class="re-eyebrow">{status_pill_ssr}'
       f"{cp_ssr}{origin_ssr}</div>"
       f'<div class="re-headline-row">'
       f'<strong class="wb-card-title re-headline" title="{full_title}">{head_esc}</strong>'
@@ -824,6 +877,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
   active_works_ssr = [w for w in works if w.get("lane") != "done"]
   ssr_all_cnt = len(active_works_ssr)
   ssr_needs_cnt = sum(1 for w in works if w.get("lane") == "needs-you")
+  ssr_desk_cnt = sum(1 for w in works if w.get("lane") == "on-desk")
   ssr_wait_cnt = sum(1 for w in works if w.get("lane") == "waiting")
   ssr_done_cnt = sum(1 for w in works if w.get("lane") == "done")
   ssr_types = {
@@ -1031,14 +1085,19 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     cursor: default;
     pointer-events: none;
   }}
+  /* Right-align search in Focus bar and allow shrinking to 110px before flex-wrap breaks */
   .wb-search {{
+    margin-left: auto;
     background: var(--surface);
     border: 1px solid var(--border);
     color: var(--text);
     border-radius: 6px;
-    padding: 3px 8px;
+    height: 24px;
+    padding: 2px 8px;
     font-size: 11.5px;
-    width: 150px;
+    flex: 1 1 110px;
+    min-width: 110px;
+    max-width: 165px;
   }}
   .wb-main {{
     padding: 10px 12px 28px;
@@ -1987,6 +2046,9 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       <button class="wb-chip" data-filter="needs-you" data-base-label="🚨 Needs You"
               data-count="{ssr_needs_cnt}" type="button">
         🚨 Needs You <span class="wb-chip-cnt">({ssr_needs_cnt})</span></button>
+      <button class="wb-chip" data-filter="on-desk" data-base-label="📝 On Desk"
+              data-count="{ssr_desk_cnt}" type="button">
+        📝 On Desk <span class="wb-chip-cnt">({ssr_desk_cnt})</span></button>
       <button class="wb-chip" data-filter="waiting" data-base-label="⏳ Waiting"
               data-count="{ssr_wait_cnt}" type="button">
         ⏳ Waiting <span class="wb-chip-cnt">({ssr_wait_cnt})</span></button>
@@ -2004,8 +2066,6 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
         <button class="wb-btn wb-btn-icon" id="wb-toggle-collapse" type="button"
                 data-action="collapse" aria-label="⇈ Collapse visible cards"
                 title="⇈ Collapse visible cards">⇈</button>
-        <input class="wb-search" id="wb-search" type="search"
-               placeholder="Filter works, CLs, bugs...">
       </div>
     </div>
     <div class="wb-type-filters">
@@ -2025,6 +2085,8 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       <button class="wb-chip" data-type="my-cls" data-base-label="🔧 My CLs"
               data-count="{ssr_cls_cnt}" type="button">
         🔧 My CLs <span class="wb-chip-cnt">({ssr_cls_cnt})</span></button>
+      <input class="wb-search" id="wb-search" type="search"
+             placeholder="Filter works, CLs, bugs...">
     </div>
   </header>
 
@@ -2293,7 +2355,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
 
   // Order a shallow copy of cards by Triage priority, pure Activity recency, or origin Age
   function sortWorks(items) {{
-    const laneRank = {{ 'needs-you': 0, waiting: 1, blocked: 2, done: 3 }};
+    const laneRank = {{ 'needs-you': 0, 'on-desk': 1, waiting: 2, blocked: 3, done: 4 }};
     return items.slice().sort((a, b) => {{
       if (sortMode === 'triage') {{
         const la = laneRank[a && a.lane] ?? 9;
@@ -2302,6 +2364,12 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
         const ua = hasUrgentOb(a) ? 0 : 1;
         const ub = hasUrgentOb(b) ? 0 : 1;
         if (ua !== ub) return ua - ub;
+        // Sub-rank On Desk cards by tier (0=no-reviewer, 1=WIP, 2=DO NOT SUBMIT probe)
+        if (a && a.lane === 'on-desk') {{
+          const da = Number(a.desk_tier ?? 1);
+          const db = Number(b.desk_tier ?? 1);
+          if (da !== db) return da - db;
+        }}
         const tc = cmpTimestamps(getActivityTs(a), getActivityTs(b), sortDir);
         if (tc !== 0) return tc;
       }} else if (sortMode === 'activity') {{
@@ -2320,13 +2388,14 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     }});
   }}
 
-  // Partition works into active lanes ('all', 'needs-you', 'waiting') vs 'done'
+  // Partition works into active lanes ('all', 'needs-you', 'on-desk', 'waiting') vs 'done'
   function matchesLane(w, laneFilter) {{
     const lane = (w && w.lane) || '';
     if (laneFilter === 'done') return lane === 'done';
     // Hide completed works outside the Done tab so active lanes stay focused
     if (lane === 'done') return false;
     if (laneFilter === 'needs-you') return lane === 'needs-you';
+    if (laneFilter === 'on-desk') return lane === 'on-desk';
     if (laneFilter === 'waiting') return lane === 'waiting';
     return true;
   }}
@@ -2874,6 +2943,36 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     }}
   }}
 
+  // Return true when a Gerrit CL or GitHub PR status is still open
+  function isOpenClStatus(st) {{
+    const u = String(st || '').trim().toUpperCase();
+    return u === 'NEW' || u === 'OPEN';
+  }}
+
+  // Classify an open CL/PR state into 'dns', 'wip', 'norev', or '' matching SSR peer badges
+  function clDeskKind(ast, title) {{
+    const stObj = ast || {{}};
+    if (!isOpenClStatus(stObj.status || 'OPEN')) return '';
+    const raw = String(stObj.subject || title || '').trim();
+    const tail = raw.replace(/^(?:\\d+\\s*:\\s*)?(?:\\[[^\\]]*\\]\\s*)*/, '');
+    if (/DO NOT SUBMIT/i.test(raw) || /^CONTROL:/i.test(tail)) return 'dns';
+    const est = (stObj.entity_state && typeof stObj.entity_state === 'object')
+      ? stObj.entity_state
+      : {{}};
+    if (stObj.is_wip || stObj.is_draft || stObj.wip_label || est.status === 'draft') return 'wip';
+    const explicitZero = (
+      stObj.assigned_reviewers_count !== undefined
+      && stObj.assigned_reviewers_count !== null
+      && Number(stObj.assigned_reviewers_count) === 0
+    );
+    // Honor lane==='desk' only on status-less stubs so explicit waiting/conflict states hold
+    const deskStub = !est.status && est.lane === 'desk';
+    if (stObj.in_development || est.status === 'dev' || deskStub || explicitZero) {{
+      return 'norev';
+    }}
+    return '';
+  }}
+
   // Recompute stage badges on promoted non-checklist bug peers once uncovered CLs attach
   function refreshNonChecklistPeerStages(peers) {{
     for (const p of peers) {{
@@ -2882,14 +2981,22 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
         p.stage = 'wip';
         p.stageTone = 'urgent';
         p.stageLabel = 'Merge conflict';
-      }} else if (p.cls.some((c) => c.is_wip)) {{
-        p.stage = 'wip';
-        p.stageTone = 'warn';
-        p.stageLabel = 'WIP';
       }} else if (p.cls.every((c) => c.status === 'MERGED' || c.status === 'SUBMITTED')) {{
         p.stage = 'merged';
         p.stageTone = 'ok';
         p.stageLabel = 'Merged';
+      }} else if (p.cls.some((c) => c.is_wip || c.desk_kind === 'wip')) {{
+        p.stage = 'wip';
+        p.stageTone = 'warn';
+        p.stageLabel = 'WIP';
+      }} else if (p.cls.some((c) => c.desk_kind === 'dns')) {{
+        p.stage = 'on_desk';
+        p.stageTone = 'warn';
+        p.stageLabel = 'DO NOT SUBMIT';
+      }} else if (p.cls.some((c) => c.desk_kind === 'norev')) {{
+        p.stage = 'on_desk';
+        p.stageTone = 'warn';
+        p.stageLabel = 'No reviewers';
       }} else {{
         p.stage = 'review';
         p.stageTone = 'wait';
@@ -2910,30 +3017,34 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
       const akey = String(a.artifact_key || '');
       if (!akey || covered.has(akey)) continue;
       const ast = a.state || {{}};
-      const {{ shortLabel, psTag }} = shortClParts(akey, a.title || akey);
+      const rawTitle = String(a.title || '');
+      const {{ shortLabel, psTag }} = shortClParts(akey, rawTitle || akey);
       const finalPs = psTag || (ast.patchset ? `PS${{ast.patchset}}` : '');
-      const subj = cleanClSubject(a.title || '', ast, shortLabel);
+      const subj = cleanClSubject(rawTitle, ast, shortLabel);
       const whyBadge = String(a.why_badge || '');
       const mergedRolls = (ast.post_submit && ast.post_submit.rolls) || ast.rolls || {{}};
-      const isWip = Boolean(ast.is_wip || ast.is_draft);
+      const deskKind = clDeskKind(ast, rawTitle);
+      const isWip = Boolean(ast.is_wip || ast.is_draft || deskKind === 'wip');
       const wipLbl = String(
-        ast.wip_label || (ast.is_draft ? 'Draft' : (ast.is_wip ? 'WIP' : ''))
+        ast.wip_label || (ast.is_draft ? 'Draft' : (isWip ? 'WIP' : ''))
       );
       const keyDigits = extractClDigits(akey);
       const inDraft = !hasDraft
         || draftTokens.keys.has(akey)
         || keyDigits.some((d) => draftTokens.digits.has(d));
+      const stStr = String(ast.status || 'OPEN');
       const clEntry = {{
         artifact_key: akey,
         shortLabel,
         psTag: finalPs,
         url: String(a.url || '#'),
         subject: subj,
-        status: String(ast.status || ''),
+        status: stStr,
         is_wip: isWip,
         wip_label: wipLbl,
+        desk_kind: deskKind,
         merge_conflict: Boolean(ast.merge_conflict),
-        assigned_reviewers_count: ast.assigned_reviewers_count ?? 1,
+        assigned_reviewers_count: ast.assigned_reviewers_count ?? (deskKind === 'norev' ? 0 : 1),
         in_draft: inDraft,
         is_stacked: Boolean(ast.is_stacked),
         updated_et: String(ast.updated_et || ast.status_changed_et || ast.last_msg_et || ''),
@@ -2967,7 +3078,6 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
         targetPeer.cls.push(clEntry);
         for (const d of keyDigits) targetPeer.clTokens.add(d);
       }} else {{
-        const stStr = String(ast.status || 'OPEN');
         const isDoneSt = stStr === 'MERGED' || stStr === 'SUBMITTED';
         let sTone = 'wait';
         let sLbl = 'In review';
@@ -2977,9 +3087,15 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
         }} else if (isDoneSt) {{
           sTone = 'ok';
           sLbl = 'Merged';
+        }} else if (deskKind === 'dns') {{
+          sTone = 'warn';
+          sLbl = 'DO NOT SUBMIT';
         }} else if (isWip) {{
           sTone = 'warn';
           sLbl = wipLbl || 'WIP';
+        }} else if (deskKind === 'norev') {{
+          sTone = 'warn';
+          sLbl = 'No reviewers';
         }}
         peers.push({{
           peerKey: akey,
@@ -3022,12 +3138,12 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     return {{ peers, covered, artByKey }};
   }}
 
-  // Return true when any CL in the peer needs action (conflict, WIP, 0 reviewers, draft lag)
+  // Return true when any CL in the peer needs action (conflict, On Desk/WIP, 0 reviewers, draft lag)
   function peerNeedsAttention(w, peer, hasDraft) {{
     if (peer.draftOutdated) return true;
     for (const c of peer.cls) {{
-      if (c.merge_conflict || c.is_wip) return true;
-      if (c.status === 'NEW' && Number(c.assigned_reviewers_count ?? 1) === 0) return true;
+      if (c.merge_conflict || c.is_wip || c.desk_kind) return true;
+      if (isOpenClStatus(c.status) && Number(c.assigned_reviewers_count ?? 1) === 0) return true;
       if (hasDraft && c.in_draft === false) return true;
     }}
     return false;
@@ -3041,7 +3157,8 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
     if (mode === 'expanded') return true;
     if (peer.bugStatus.toUpperCase() === 'CLOSED' && peer.cls.length === 0) return false;
     if (peerNeedsAttention(w, peer, hasDraft)) return true;
-    if ((w && w.lane) === 'needs-you' && peer.cls.length > 0) return true;
+    const lane = (w && w.lane) || '';
+    if ((lane === 'needs-you' || lane === 'on-desk') && peer.cls.length > 0) return true;
     return false;
   }}
 
@@ -3415,7 +3532,7 @@ def render_workbench_html(projection: dict[str, Any], ui_version: int) -> str:
         + `${{esc(c.wip_label || 'WIP')}}</span>`
       : '';
     const noRevBadge = (
-      !c.is_wip && c.status === 'NEW' && Number(c.assigned_reviewers_count ?? 1) === 0
+      !c.is_wip && isOpenClStatus(c.status) && Number(c.assigned_reviewers_count ?? 1) === 0
     )
       ? '<span class="wb-cl-tag" style="background:#fffbeb;color:var(--warn)">no reviewers</span>'
       : '';
