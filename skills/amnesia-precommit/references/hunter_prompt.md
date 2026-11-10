@@ -49,7 +49,32 @@ Instructions:
      phases or hide loop-carried state in outer locals instead of narrow-signature helpers and a
      small state struct (`BLOCKING_SCOPE` in new functions, new loops, or newly added closures,
      `OPTIONAL_GOLFING` in existing functions; do not split a uniform `switch`/dispatch table or
-     demand tiny pass-through wrappers).
+     demand tiny pass-through wrappers). Also run four mandatory code-simplification checks:
+     1. **Zero-Base Necessity & Deletion Dominance**: For every new class, struct, field, cache,
+        helper, overload, or branch, run a counterfactual deletion check—name the concrete target
+        contract that breaks if the entity is deleted completely in favor of existing primitives
+        (`BLOCKING_SCOPE` if none). **Deletion Dominance**: whenever a file, class, helper, member,
+        or branch is proposed for deletion (`BLOCKING_SCOPE`), never emit separate findings
+        polishing its internals (`#include` or `import` hygiene, naming, comments, or micro-style
+        inside the deleted span)—collapse all sub-findings into that single deletion item.
+     2. **Structural Diff of Feature/Backend Branches & Consecutive Loops**: When an `if` branch
+        (feature, backend, or direction) and its adjacent `else` or post-`return` fallthrough
+        duplicate `> 10` structurally parallel lines or repeat the same loop traversal with an
+        early `return`, sink the leaf difference into one shared loop or narrow helper instead of
+        duplicating the loop (`BLOCKING_SCOPE` in new code, `OPTIONAL_GOLFING` in existing code).
+        Fuse consecutive passes over the same collection (e.g., `runs`, `clusters`, `lines`) when
+        phase invariants permit a single pass and single-screen readability holds.
+     3. **No Round-Trip Property Plumbing & Above/Below Early-Exit Audit**: Flag copying or
+        plumbing a property into an intermediate carrier struct when the consumer already holds
+        direct access to the owning object (e.g., `Paragraph`, `Style`, `Run`). Whenever adding or
+        moving an early `return` or `continue`, audit the lines **above** it (sink computations or
+        allocations now wasted on the early-exit path — `BLOCKING_SCOPE`) and **below** it (strip
+        tautological negated re-checks of the same condition and dead branches — `BLOCKING_SCOPE`;
+        report stale invariants or bypassed cleanup under Section 2 `B*`).
+     4. **Prototype-Scar Elimination Across All Languages (`C++`, `Dart`, `TypeScript`, `Python` —
+        generalizes `M7`)**: Purge orphaned `#include` or `import` lines in code and tests,
+        leftover constants, flags, or debug helpers from abandoned hypotheses, and early-iteration
+        symptom workarounds made redundant by the root-cause fix (`BLOCKING_SCOPE`).
    - **Dropped Guards & Historical Regressions (`-` Lines)**: For every deleted or simplified condition, branch, early return, or fallback (`-` lines in `git diff`, or any reduction you propose under Diff Golfing), run `git log -S "<symbol_or_expr>" -p -n 3` or `git log -L <start>,<end>:<file>` to verify the removed guard was not previously introduced to fix a specific bug or edge case.
    - **Pattern Completeness ("What is Missing from the Diff?")**: Inspect full modified files and run `git grep` or `code_search` on modified functions, structs, enums, and flags to check all callers, paired backends, and symmetrical code paths (e.g., `SkParagraph` vs. `WebParagraph`, ICU vs. Apple/Client `SkUnicode`, `layout` vs. `paint` / `getRectsForRange`, serialization read vs. write, header declarations vs. all implementations). Always run an unanchored substring/basename search (`git grep -i`) before claiming a sibling symbol or caller is missing (`False` vs. `Near miss`). Flag any sibling site that was forgotten.
    - **Correctness & KEEPER Invariants**: Check against C++ Systems Invariants (`cpp_systems_invariants.md`), Text Domain Invariants (`text_domain_invariants.md`), and Code Style (`code_style.md`) — specifically zero-allocation hot paths, loop guards, fail-fast assertions (`SkASSERT` in Skia, `CHECK`/`DCHECK` in Chromium, `assert` in Dart/TS) over defensive `if (!ptr) return;` or unreachable container/field branches, and cross-layer consistency. When touching text-layout line, run, or cluster geometry (`modules/skparagraph/`, `modules/skshaper/`, or `lib/web_ui/`), verify both `LTR` and paragraph-level `RTL` (`TextDirection::kRtl` / `TextDirection.rtl`), verify visual order (`fRunsInVisualOrder`) vs. logical cluster order (`fClusterRange`) at line edges, and exercise non-cursive RTL scripts (e.g., Hebrew `\u05D0..\u05EA`) rather than relying solely on cursive scripts like Arabic where `Run::isCursiveScript()` disables `letterSpacing` and masks visual-edge bugs. Never offer `"or document as a known limitation"` on any Section 2 `BLOCKING` defect (`B*`). For Skia C++ / text / font diffs, also apply `veteran-review` lens mode (`~/.gemini/config/skills/veteran-review/SKILL.md`, Steps 1–3: precedent search + Layer 1/2 invariants) and report its candidates under Section 2.
@@ -101,6 +126,9 @@ Output Format (Strict):
 For each reduction (`S1`, `S2`...), tag it as `BLOCKING_SCOPE` (unrelated drive-by, dead helper, or
 leftover debug code) or `OPTIONAL_GOLFING` (`nit:` stylistic line compression), and provide
 `File:Lines`, why it is unnecessary/verbose, and the exact replacement or `git checkout` action.
+Enforce **Deletion Dominance**: collapse all internal style, `#include` or `import`, naming, or
+comment polish notes inside a deleted span into its single `BLOCKING_SCOPE` deletion item (report
+genuine behavioral bugs separately in Section 2 in case `keeper_skeptic` refutes the deletion).
 
 ### 2. Behavioral, Dropped-Guard & Pattern-Completeness Defects (B1, B2... — BLOCKING)
 For each suspected bug:

@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Deterministic multi-pass code horror, duplication, dead-code, and invariant auditor."""
 
+# Enable PEP 604 union type annotations on macOS Xcode Python 3.9
+from __future__ import annotations
+
 import argparse
+import ast
 from collections import defaultdict
 import hashlib
 import json
@@ -354,15 +358,40 @@ def detect_exact_file_duplicates(file_records):
   return duplicates
 
 
+_PY_TOKEN_OR_COMMENT_RE = re.compile(
+    r'(?m)"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\''
+    r'|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|(#.*$)'
+)
+_SCRIPT_TOKEN_OR_COMMENT_RE = re.compile(
+    r'(?m)"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|`(?:\\.|[^`\\])*`'
+    r"|(/\*[\s\S]*?\*/)|(//.*$)"
+)
+_CFAM_TOKEN_OR_COMMENT_RE = re.compile(
+    r'(?m)"(?:\\.|[^"\\\n])*"|(?<![0-9A-Za-z_])\'(?:\\.|[^\'\\\n]){1,4}\''
+    r"|(/\*[\s\S]*?\*/)|(//.*$)"
+)
+
+
 def _strip_comments_for_ext(content: str, ext: str, keep_newlines: bool = False) -> str:
-  """Strip comments using syntax appropriate for the file extension."""
+  """Strip comments outside string literals while optionally preserving line numbers; pure."""
   if ext == ".py":
-    return re.sub(r"(?m)#.*$", "", content)
-  if keep_newlines:
-    content = BLOCK_COMMENT_RE.sub(lambda m: "\n" * m.group(0).count("\n"), content)
-  else:
-    content = BLOCK_COMMENT_RE.sub("", content)
-  return LINE_COMMENT_RE.sub("", content)
+    # Preserve `#` inside string literals while stripping end-of-line comments per line
+    return _PY_TOKEN_OR_COMMENT_RE.sub(lambda m: "" if m.group(1) else m.group(0), content)
+
+  def _repl_c_style(m: re.Match[str]) -> str:
+    if m.group(1):
+      return "\n" * m.group(1).count("\n") if keep_newlines else ""
+    if m.group(2):
+      return ""
+    return m.group(0)
+
+  # Keep `//` and `/*` inside URL strings/templates intact without breaking C++ digit separators
+  pat = (
+      _SCRIPT_TOKEN_OR_COMMENT_RE
+      if ext in (".ts", ".tsx", ".js", ".mjs", ".cjs", ".jsx", ".dart")
+      else _CFAM_TOKEN_OR_COMMENT_RE
+  )
+  return pat.sub(_repl_c_style, content)
 
 
 def run_builtin_block_clone_detector(file_records, min_lines=10, min_tokens=50):
@@ -633,6 +662,469 @@ def analyze_functions_and_dead_code(file_records, max_func_lines=120, max_file_l
   }
 
 
+_JS_IDENT_RE = re.compile(r"(?<![A-Za-z0-9_$])([A-Za-z_$][A-Za-z0-9_$]*)(?![A-Za-z0-9_$])")
+
+
+def _collect_top_if_imports(if_node: ast.If, out: list[ast.Import | ast.ImportFrom]) -> None:
+  """Collect Import/ImportFrom nodes across both `body` and `orelse` of top-level `if` guards."""
+  for branch in (if_node.body, if_node.orelse):
+    for sub in branch:
+      if isinstance(sub, (ast.Import, ast.ImportFrom)):
+        out.append(sub)
+      elif isinstance(sub, ast.If):
+        _collect_top_if_imports(sub, out)
+
+
+def _scan_unused_py_imports(
+    rel_path: str, content: str, lines: list[str], cleaned_py: list[str]
+) -> list[tuple[str, str]]:
+  """Return (loc, snippet) pairs for unused top-level Python imports; pure, no side effects."""
+  # Package __init__.py modules re-export symbols for callers without local references
+  if pathlib.Path(rel_path).name == "__init__.py":
+    return []
+  try:
+    tree = ast.parse(content)
+  except SyntaxError:
+    return []
+
+  # Restrict to module-level imports (including `if/elif/else` version or TYPE_CHECKING guards)
+  # so import-smoke statements inside test methods and try/except ImportError probes stay valid
+  nodes: list[ast.Import | ast.ImportFrom] = []
+  for stmt in tree.body:
+    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+      nodes.append(stmt)
+    elif isinstance(stmt, ast.If):
+      _collect_top_if_imports(stmt, nodes)
+
+  import_lines: set[int] = set()
+  for node in nodes:
+    end_ln = getattr(node, "end_lineno", None) or node.lineno
+    import_lines.update(range(node.lineno, end_ln + 1))
+
+  used_idents: set[str] = set()
+  for ln_no, cl in enumerate(cleaned_py, start=1):
+    if ln_no not in import_lines:
+      used_idents.update(IDENT_RE.findall(cl))
+
+  ignore_re = re.compile(r"#.*\b(?:noqa|pylint:|pytype:|type:\s*ignore|side-effect|keep)\b", re.I)
+  out: list[tuple[str, str]] = []
+  for node in nodes:
+    # Compiler directives in __future__ alter parser behavior rather than binding runtime symbols
+    if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+      continue
+    end_ln = getattr(node, "end_lineno", None) or node.lineno
+    raw_span = "\n".join(lines[node.lineno - 1 : end_ln])
+    # Honor explicit suppression comments on side-effect imports that register hooks
+    if ignore_re.search(raw_span):
+      continue
+    for alias in node.names:
+      if alias.name == "*":
+        continue
+      bound = alias.asname or alias.name.split(".")[0]
+      if bound not in used_idents:
+        out.append((f"{rel_path}:L{node.lineno}", f"unused import `{bound}`"))
+  return out
+
+
+def _parse_ts_import_bindings(clause: str, is_jsx: bool) -> list[str]:
+  """Extract local bound identifiers from a TS/JS import clause; pure, no side effects."""
+  clause = re.sub(r"^type\s+", "", clause.strip())
+  bindings: list[str] = []
+  # Namespace imports (`* as ns`) bind one local module object
+  ns_m = re.search(r"\*\s+as\s+([A-Za-z_$][\w$]*)", clause)
+  if ns_m:
+    bindings.append(ns_m.group(1))
+  # Named specifiers (`{ a, b as c, type T }`) bind the alias target when `as` is present
+  brace_m = re.search(r"\{([^}]*)\}", clause)
+  if brace_m:
+    for part in brace_m.group(1).split(","):
+      tok = re.sub(r"^type\s+", "", part.strip())
+      if not tok:
+        continue
+      as_m = re.search(r"\bas\s+([A-Za-z_$][\w$]*)$", tok)
+      cand = as_m.group(1) if as_m else tok
+      if re.match(r"^[A-Za-z_$][\w$]*$", cand):
+        bindings.append(cand)
+  # Classic JSX transforms lower `<Tag />` to `React.createElement` without a source token
+  rem = re.sub(r"\{[^}]*\}|\*\s+as\s+[A-Za-z_$][\w$]*", "", clause).strip(" ,")
+  if re.match(r"^[A-Za-z_$][\w$]*$", rem) and not (is_jsx and rem == "React"):
+    bindings.append(rem)
+  return bindings
+
+
+def _scan_unused_ts_or_dart_imports(
+    rel_path: str, ext: str, content: str, lines: list[str], cleaned: list[str]
+) -> list[tuple[str, str]]:
+  """Return (loc, snippet) pairs for unused explicit TS/JS or Dart imports; pure."""
+  fname = pathlib.Path(rel_path).name
+  is_ts = ext in (".ts", ".tsx", ".js", ".mjs", ".cjs", ".jsx")
+  # Skip TS barrel entrypoints and ambient `.d.ts` files that import symbols for re-export
+  if is_ts and (fname.startswith("index.") or rel_path.endswith(".d.ts")):
+    return []
+  if ext == ".dart":
+    # Skip Dart libraries with `part '...'` (whose parts share library imports) and pure barrels
+    if re.search(r"""(?m)^\s*part\s+['"]""", content):
+      return []
+    if "export '" in content or 'export "' in content:
+      if not re.search(r"\b(?:class|enum|mixin|extension|void\s+main)\b", content):
+        return []
+
+  spans: list[tuple[int, int, list[str]]] = []
+  idx, total = 0, len(cleaned)
+  next_stmt_re = re.compile(
+      r"^\s*(?:import|export|const|let|var|function|class|interface|enum)\b"
+  )
+  while idx < total:
+    line = cleaned[idx]
+    # Match static ES imports; short-circuit semicolon-less bare `import './x.css'` first
+    if is_ts and re.match(r"^\s*import\b(?!\s*\()", line):
+      if re.match(r"""^\s*import\s+['"][^'"]+['"]\s*;?\s*$""", line):
+        idx += 1
+        continue
+      end = idx
+      while end + 1 < total and end - idx < 80 and ";" not in cleaned[end]:
+        if re.search(r"""\bfrom\s+['"][^'"]+['"]""", cleaned[end]):
+          break
+        if next_stmt_re.match(cleaned[end + 1]):
+          break
+        end += 1
+      raw_span = "\n".join(lines[idx : end + 1])
+      stmt = " ".join(cleaned[idx : end + 1])
+      m_from = re.match(r"""^\s*import\s+(.+?)\s+from\s+['"][^'"]+['"]""", stmt)
+      if m_from and not re.search(r"eslint-disable|@ts-", raw_span):
+        bnds = _parse_ts_import_bindings(m_from.group(1), ext in (".tsx", ".jsx"))
+        spans.append((idx + 1, end + 1, bnds))
+      idx = end + 1
+      continue
+    # Unqualified Dart imports bring an implicit library scope in; check explicit `as` and `show`
+    if ext == ".dart" and re.match(r"""^\s*import\s+['"]""", line):
+      end = idx
+      while end + 1 < total and end - idx < 80 and ";" not in cleaned[end]:
+        end += 1
+      raw_span = "\n".join(lines[idx : end + 1])
+      stmt = " ".join(cleaned[idx : end + 1])
+      if "ignore:" not in raw_span:
+        bnds = []
+        as_m = re.search(r"\bas\s+([A-Za-z_]\w*)\b", stmt)
+        if as_m:
+          bnds.append(as_m.group(1))
+        show_m = re.search(r"\bshow\s+([^;]+)", stmt)
+        if show_m:
+          shown = re.split(r"\bhide\b", show_m.group(1))[0]
+          bnds.extend(
+              t.strip() for t in shown.split(",") if re.match(r"^[A-Za-z_]\w*$", t.strip())
+          )
+        if bnds:
+          spans.append((idx + 1, end + 1, bnds))
+      idx = end + 1
+      continue
+    idx += 1
+
+  if not spans:
+    return []
+  import_lines = {ln for s, e, _ in spans for ln in range(s, e + 1)}
+  tok_re = _JS_IDENT_RE if is_ts else IDENT_RE
+  used_idents: set[str] = set()
+  for ln_no, cl in enumerate(cleaned, start=1):
+    if ln_no not in import_lines:
+      used_idents.update(tok_re.findall(cl))
+  return [
+      (f"{rel_path}:L{s}", f"unused import `{b}`")
+      for s, _, bnds in spans
+      for b in bnds
+      if b not in used_idents
+  ]
+
+
+def _extract_loop_header(line: str, ext: str) -> tuple[str, str] | None:
+  """Extract (loop_var, collection_key) from a `for` header line, or None; pure."""
+  if ext == ".py":
+    m = re.match(r"^\s*for\s+([A-Za-z_]\w*)\s+in\s+([A-Za-z_][\w.]*)\s*:\s*$", line)
+    return (m.group(1), m.group(2)) if m else None
+  # Match Dart/TS `in`/`of`, C++ range-for `:`, and canonical 0-based index loops
+  for pat in (
+      (
+          r"^\s*for\s*\(\s*(?:final|var|const|let|[A-Za-z_][\w<>?]*)\s+"
+          r"([A-Za-z_]\w*)\s+(?:in|of)\s+([A-Za-z_][\w.\->]*)\s*\)\s*\{\s*$"
+      ),
+      r"^\s*for\s*\([^:;]*?\b([A-Za-z_]\w*)\s*:\s*([A-Za-z_][\w.\->]*)\s*\)\s*\{\s*$",
+      (
+          r"^\s*for\s*\([^;]*?\b([A-Za-z_]\w*)\s*=\s*0\s*;\s*\1\s*<\s*"
+          r"([A-Za-z_][\w.\->]*?)(?:\.(?:size|count|length)\(\)|\.length)?\s*;"
+          r"\s*(?:\+\+\1|\1\+\+)\s*\)\s*\{\s*$"
+      ),
+  ):
+    m = re.match(pat, line)
+    if m:
+      return (m.group(1), m.group(2))
+  return None
+
+
+def _find_loop_end(cleaned_lines: list[str], start: int, ext: str) -> int | None:
+  """Return 0-based inclusive end line of loop at `start` (bounded <= 60 lines), or None."""
+  total = len(cleaned_lines)
+  # Cap loop window at 60 lines so multi-screen outer passes are left to semantic review
+  if ext == ".py":
+    base_ind = len(cleaned_lines[start]) - len(cleaned_lines[start].lstrip())
+    end = start
+    for k in range(start + 1, min(total, start + 61)):
+      if cleaned_lines[k].strip():
+        if len(cleaned_lines[k]) - len(cleaned_lines[k].lstrip()) <= base_ind:
+          return end if end > start else None
+        end = k
+    return end if end > start and total - start <= 61 else None
+  depth = cleaned_lines[start].count("{") - cleaned_lines[start].count("}")
+  for k in range(start + 1, min(total, start + 61)):
+    s = STRING_LITERAL_RE.sub("", cleaned_lines[k])
+    depth += s.count("{") - s.count("}")
+    if depth == 0:
+      return k
+  return None
+
+
+_COLL_MUTATOR_RE = re.compile(
+    r"\.\s*(?:push_back|emplace_back|pop_back|insert|erase|clear|resize|sort|reverse|"
+    r"add|remove|removeAt|append|pop|update|extend|set|delete|setdefault)\s*\("
+)
+_EARLY_CTRL_RE = re.compile(r"\b(?:return|break|goto|throw|raise)\b")
+_LHS_WRITE_RE = re.compile(
+    r"\b([A-Za-z_]\w*)\s*(?:\[[^\]\n]+\]\s*)?(?:=(?!=)|[+\-*/|&]=|\+\+|--)"
+    r"|(?:\+\+|--|&)\s*\b([A-Za-z_]\w*)\b"
+)
+
+
+def _scan_consecutive_loops(
+    rel_path: str, ext: str, cleaned_lines: list[str]
+) -> list[tuple[str, str]]:
+  """Return (loc, snippet) pairs for fuseable back-to-back loops over one collection; pure."""
+  out: list[tuple[str, str]] = []
+  total = len(cleaned_lines)
+  for idx in range(total):
+    hdr1 = _extract_loop_header(cleaned_lines[idx], ext)
+    if not hdr1:
+      continue
+    end1 = _find_loop_end(cleaned_lines, idx, ext)
+    if end1 is None:
+      continue
+    nxt = end1 + 1
+    while nxt < total and not cleaned_lines[nxt].strip():
+      nxt += 1
+    if nxt >= total:
+      continue
+    ind1 = len(cleaned_lines[idx]) - len(cleaned_lines[idx].lstrip())
+    ind2 = len(cleaned_lines[nxt]) - len(cleaned_lines[nxt].lstrip())
+    hdr2 = _extract_loop_header(cleaned_lines[nxt], ext)
+    # Require identical block indentation and identical collection expression
+    if not hdr2 or ind1 != ind2 or hdr1[1] != hdr2[1]:
+      continue
+    end2 = _find_loop_end(cleaned_lines, nxt, ext)
+    if end2 is None:
+      continue
+    body1 = "\n".join(cleaned_lines[idx + 1 : end1 + (1 if ext == ".py" else 0)])
+    body2 = "\n".join(cleaned_lines[nxt + 1 : end2 + (1 if ext == ".py" else 0)])
+    # Skip when Pass 1 exits early or mutates container cardinality/order before Pass 2
+    if _EARLY_CTRL_RE.search(body1) or _COLL_MUTATOR_RE.search(body1):
+      continue
+    coll_root = re.split(r"[.\->]", hdr1[1])[0]
+    skip_syms = {hdr1[0], coll_root, "self", "this"} | KEYWORDS
+    written = {
+        (m.group(1) or m.group(2))
+        for m in _LHS_WRITE_RE.finditer(body1)
+        if (m.group(1) or m.group(2)) not in skip_syms
+    }
+    # Preserve two-phase reduction/histogram passes where Pass 1 writes state read by Pass 2
+    if written & set(IDENT_RE.findall(body2)):
+      continue
+    out.append((
+        f"{rel_path}:L{nxt + 1}",
+        f"consecutive loop over `{hdr1[1]}` (prev at L{idx + 1})",
+    ))
+  return out
+
+
+def _canonicalize_guard_cond(cond: str) -> tuple[str, bool] | None:
+  """Map simple null/bool/empty guard `cond` to (ident, truthy_polarity), or None; pure."""
+  c = cond.strip()
+  while c.startswith("(") and c.endswith(")") and "(" not in c[1:-1]:
+    c = c[1:-1].strip()
+  # Normalize negated null/empty checks vs truthy checks onto `(ident, truthy_polarity)`
+  false_pats = (
+      r"^!\s*([A-Za-z_]\w*)$",
+      r"^not\s+([A-Za-z_]\w*)$",
+      r"^([A-Za-z_]\w*)\s*==\s*(?:nullptr|null|NULL|None)$",
+      r"^(?:nullptr|null|NULL|None)\s*==\s*([A-Za-z_]\w*)$",
+      r"^([A-Za-z_]\w*)\s+is\s+None$",
+      r"^([A-Za-z_]\w*)\.(?:empty\(\)|isEmpty)$",
+      r"^len\(\s*([A-Za-z_]\w*)\s*\)\s*==\s*0$",
+  )
+  true_pats = (
+      r"^([A-Za-z_]\w*)$",
+      r"^([A-Za-z_]\w*)\s*!=\s*(?:nullptr|null|NULL|None)$",
+      r"^(?:nullptr|null|NULL|None)\s*!=\s*([A-Za-z_]\w*)$",
+      r"^([A-Za-z_]\w*)\s+is\s+not\s+None$",
+      r"^!\s*([A-Za-z_]\w*)\.empty\(\)$",
+      r"^([A-Za-z_]\w*)\.isNotEmpty$",
+      r"^len\(\s*([A-Za-z_]\w*)\s*\)\s*(?:>\s*0|!=\s*0)$",
+  )
+  for pat in false_pats:
+    m = re.match(pat, c)
+    if m and m.group(1) not in KEYWORDS:
+      return (m.group(1), False)
+  for pat in true_pats:
+    m = re.match(pat, c)
+    if m and m.group(1) not in KEYWORDS:
+      return (m.group(1), True)
+  return None
+
+
+def _match_early_exit_guard(
+    cleaned_lines: list[str], idx: int, ext: str
+) -> tuple[str, bool, int, int] | None:
+  """Match unconditional `if (cond) return/continue` at `idx`; return (ident, pol, end_idx, ind)."""
+  line = cleaned_lines[idx]
+  ind = len(line) - len(line.lstrip())
+  total = len(cleaned_lines)
+  if ext == ".py":
+    m1 = re.match(r"^\s*if\s+([^:]+):\s*(?:return(?:\s+.*)?|continue)\s*$", line)
+    if m1:
+      end_i = idx
+      cond_raw = m1.group(1)
+    else:
+      m2 = re.match(r"^\s*if\s+([^:]+):\s*$", line)
+      if not m2 or idx + 1 >= total:
+        return None
+      nxt = idx + 1
+      while nxt < total and not cleaned_lines[nxt].strip():
+        nxt += 1
+      if nxt >= total:
+        return None
+      body_ln = cleaned_lines[nxt]
+      if len(body_ln) - len(body_ln.lstrip()) <= ind:
+        return None
+      if not re.match(r"^\s*(?:return(?:\s+.*)?|continue)\s*$", body_ln):
+        return None
+      end_i = nxt
+      cond_raw = m2.group(1)
+    # Exclude `if/elif/else` chains where later siblings do not execute on fallthrough
+    after = end_i + 1
+    while after < total and not cleaned_lines[after].strip():
+      after += 1
+    if after < total and re.match(r"^\s*(?:else\s*:|elif\b)", cleaned_lines[after]):
+      if len(cleaned_lines[after]) - len(cleaned_lines[after].lstrip()) == ind:
+        return None
+    can = _canonicalize_guard_cond(cond_raw)
+    return (can[0], can[1], end_i, ind) if can else None
+
+  # Exclude guards nested directly inside an unbraced outer `if (...)` / `else` / `for (...)`
+  prev = idx - 1
+  while prev >= 0 and not cleaned_lines[prev].strip():
+    prev -= 1
+  if prev >= 0:
+    p_str = cleaned_lines[prev].rstrip()
+    if re.match(r"^\s*(?:if|for|while)\s*\(.*\)\s*$|^\s*else\s*$", p_str):
+      return None
+
+  # Match single-line `if (cond) return;` and 3-line braced `if (cond) { return; }`
+  m1 = re.match(
+      r"^\s*if\s*\(([^()]+(?:\(\))?[^()]*)\)\s*"
+      r"(?:\{\s*(?:return(?:\s+[^;{}]*)?|continue)\s*;\s*\}"
+      r"|(?:return(?:\s+[^;{}]*)?|continue)\s*;)\s*$",
+      line,
+  )
+  if m1:
+    after = idx + 1
+    while after < total and not cleaned_lines[after].strip():
+      after += 1
+    if after < total and re.match(r"^\s*else\b", cleaned_lines[after]):
+      return None
+    can = _canonicalize_guard_cond(m1.group(1))
+    return (can[0], can[1], idx, ind) if can else None
+  m2 = re.match(r"^\s*if\s*\(([^()]+(?:\(\))?[^()]*)\)\s*\{\s*$", line)
+  if not m2 or idx + 2 >= total:
+    return None
+  if not re.match(r"^\s*(?:return(?:\s+[^;{}]*)?|continue)\s*;\s*$", cleaned_lines[idx + 1]):
+    return None
+  if not re.match(r"^\s*\}\s*$", cleaned_lines[idx + 2]):
+    return None
+  after = idx + 3
+  while after < total and not cleaned_lines[after].strip():
+    after += 1
+  if after < total and re.match(r"^\s*else\b", cleaned_lines[after]):
+    return None
+  can = _canonicalize_guard_cond(m2.group(1))
+  return (can[0], can[1], idx + 2, ind) if can else None
+
+
+def _scan_post_early_exit_guards(
+    rel_path: str, ext: str, cleaned_lines: list[str]
+) -> list[tuple[str, str]]:
+  """Return (loc, snippet) pairs for tautological/dead checks right below early exit; pure."""
+  out: list[tuple[str, str]] = []
+  total = len(cleaned_lines)
+  for idx in range(total):
+    guard = _match_early_exit_guard(cleaned_lines, idx, ext)
+    if not guard:
+      continue
+    ident, exit_pol, end_idx, ind = guard
+    # Member fields (`fFoo`, `_foo`, `m_foo`) can be mutated indirectly by helper calls
+    is_member = bool(re.match(r"^(?:f[A-Z]|_[a-z]|m_)\w*$", ident))
+    esc = re.escape(ident)
+    mut_re = re.compile(
+        rf"\b{esc}\s*(?:\[[^\]\n]*\]\s*)?(?:=(?!=)|[+\-*/|&]=|\+\+|--|\.\w+\()"
+        rf"|(?:\+\+|--|&)\s*\b{esc}\b"
+        rf"|\bdel\s+[^\n;]*\b{esc}\b"
+        rf"|\b(?!if\b|elif\b|while\b|switch\b|return\b|len\b|sizeof\b)\w+\s*\([^;\n]*\b{esc}\b"
+    )
+    depth = 0
+    for j in range(end_idx + 1, min(total, end_idx + 13)):
+      ln = cleaned_lines[j]
+      if not ln.strip():
+        continue
+      cur_ind = len(ln) - len(ln.lstrip())
+      if ext == ".py":
+        if cur_ind < ind:
+          break
+        if cur_ind > ind:
+          continue
+        m_if = re.match(r"^\s*if\s+([^:]+):", ln)
+      else:
+        s_ln = STRING_LITERAL_RE.sub("", ln)
+        # Stop at preprocessor conditionals (`#if/#else/#endif`), block ends, or switch/goto labels
+        if re.match(r"^\s*#\s*(?:if|ifdef|ifndef|elif|else|endif)\b", s_ln):
+          break
+        is_block_end = s_ln.lstrip().startswith("}") or re.match(
+            r"^\s*(?:case\b|default\s*:|[A-Za-z_]\w*\s*:(?!:))", s_ln
+        )
+        if depth == 0 and (is_block_end or cur_ind < ind):
+          break
+        if depth == 0:
+          m_if = re.match(r"^\s*if\s*\(([^()]+(?:\(\))?[^()]*)\)", s_ln)
+        else:
+          m_if = None
+        depth += s_ln.count("{") - s_ln.count("}")
+        if depth < 0:
+          break
+        if m_if is None and depth > 0:
+          if mut_re.search(s_ln) or (is_member and re.search(r"\b\w+\s*\(", s_ln)):
+            break
+          continue
+
+      # Matching polarity after exit is unreachable dead code; opposite polarity is tautological
+      if m_if:
+        can2 = _canonicalize_guard_cond(m_if.group(1))
+        if can2 and can2[0] == ident:
+          kind = "dead branch" if can2[1] == exit_pol else "tautological guard"
+          out.append((
+              f"{rel_path}:L{j + 1}",
+              f"{kind} on `{ident}` after early exit at L{idx + 1}",
+          ))
+          break
+      # Stop once the guarded symbol may be reassigned, passed to a call, or mutated in place
+      if mut_re.search(ln) or (is_member and re.search(r"\b\w+\s*\(", ln)):
+        break
+  return out
+
+
 def scan_horrors_and_invariants(file_records, allow_cyrillic=False):
   """Scan files for KEEPER invariant breaches, anti-slop horrors, and test smells."""
   horrors = defaultdict(list)
@@ -732,6 +1224,28 @@ def scan_horrors_and_invariants(file_records, allow_cyrillic=False):
           horrors["test_font_metric_pins"].append(
               (f"{rel_path}:L{ln}", " ".join(pm.group(0).split())[:100])
           )
+
+    # Cross-language simplification & prototype-scar checks (R138)
+    if ext in (
+        ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hxx", ".m", ".mm",
+        ".dart", ".ts", ".tsx", ".js", ".mjs", ".cjs", ".jsx", ".py",
+    ):
+      cleaned_for_cf = _strip_comments_for_ext(content, ext, keep_newlines=True).splitlines()
+      if ext == ".py":
+        horrors["unused_imports"].extend(
+            _scan_unused_py_imports(rel_path, content, lines, cleaned_for_cf)
+        )
+      elif ext in (".ts", ".tsx", ".js", ".mjs", ".cjs", ".jsx", ".dart"):
+        horrors["unused_imports"].extend(
+            _scan_unused_ts_or_dart_imports(rel_path, ext, content, lines, cleaned_for_cf)
+        )
+      if not test_flag:
+        horrors["consecutive_collection_loops"].extend(
+            _scan_consecutive_loops(rel_path, ext, cleaned_for_cf)
+        )
+      horrors["post_early_exit_tautologies"].extend(
+          _scan_post_early_exit_guards(rel_path, ext, cleaned_for_cf)
+      )
 
   duplicated_endpoints = [
       {"endpoint": ep, "files": sorted(flist)}
@@ -857,6 +1371,10 @@ def format_markdown_report(report):
       ("dart_test_non_ci_fonts", "Non-CI Desktop Font Family in Dart Tests (Rule M4)"),
       ("dart_zero_color_checks", "Incomplete Transparent Color Check `Color(0x00000000)` (Rule M6)"),
       ("dart_un_treeshaken_debug", "Un-Tree-Shaken `WebParagraphDebug` Call or Non-`const` Flag (Rule M6)"),
+      # Surface R138 cross-language prototype-scar and control-flow simplification categories
+      ("unused_imports", "Orphaned / Unused Explicit Imports (Prototype-Scar Elimination)"),
+      ("consecutive_collection_loops", "Fuseable Consecutive Same-Collection Loops"),
+      ("post_early_exit_tautologies", "Tautological or Dead Re-Checks Below Early Return/Continue"),
   ]
   for key, title in labels:
     items = horrors.get(key, [])

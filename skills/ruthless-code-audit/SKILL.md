@@ -52,7 +52,8 @@ python3 ~/.gemini/config/skills/ruthless-code-audit/scripts/ruthless_audit.py \
    - Anonymous `TODO`/`FIXME`/`HACK` without `KEEPER-DEBT` or bug IDs.
    - Hardcoded home paths (`/usr/local/google/home/`, `/Users/`), debug print leftovers, unexpected Cyrillic `[А-Яа-яЁё]`.
    - Test horrors: sleep-based synchronization (`time.Sleep`, `Future.delayed`, `sleep_for`), magic score/probability/sizeof pinning (`Probability != 89`, `sizeof(...) == 544`), and narrative headers above assertions.
-   - Mechanical comment violations and uncommented diff hunks via [`audit_comments.py`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/code-comments/scripts/audit_comments.py).
+   - Cross-language prototype scars & control-flow redundancy: orphaned explicit `import`s (`Python`, `TypeScript`/JS, `Dart` `as`/`show` in code and tests), fuseable back-to-back loops over the same collection with zero cross-pass scalar dependency, and tautological or dead re-checks of the same condition right below an early `return` or `continue`.
+   - Mechanical comment violations and uncommented diff hunks via [`audit_comments.py`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/code-comments/scripts/audit_comments.py); when auditing Skia C++ text modules, also run standalone [`resource_lints.py`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/ruthless-code-audit/scripts/resource_lints.py) for C++ lifetime, bounded-cache, `SkUTF` owner, and same-range loop checks.
 
 ---
 
@@ -76,10 +77,14 @@ Do not stop at the script output. Inspect the flagged hotspots and read the core
   (indicating whether `<CONTEXT_SUMMARY>` appeared in its context). If **any** Stage 2 shard or
   Stage 2.5 `keeper_skeptic` batch reports `COMPACTION: YES`, discard that compacted report,
   re-shard its scope into smaller slices (`<= 2–3` files or `<= 5` candidates), and re-run.
-- **Separate `BLOCKING` Defects from `OPTIONAL_GOLFING` (`nit:`)**: Tag every candidate as either
-  `BLOCKING` (`HIGH`/`CRITICAL` bugs, broken invariants, or dead/duplicate code in Matrix 2.1
-  `DELETE`) or `OPTIONAL_GOLFING` (`nit:` stylistic micro-compaction). `OPTIONAL_GOLFING` items
-  never block a commit/upload or inflate `HIGH`/`CRITICAL` defect counts.
+- **Separate `BLOCKING` Defects from `OPTIONAL_GOLFING` (`nit:`) & Enforce Deletion Dominance**:
+  Tag every candidate as either `BLOCKING` (`HIGH`/`CRITICAL` bugs, broken invariants, or
+  dead/duplicate code in Matrix 2.1 `DELETE`) or `OPTIONAL_GOLFING` (`nit:` stylistic
+  micro-compaction). `OPTIONAL_GOLFING` items never block a commit/upload or inflate
+  `HIGH`/`CRITICAL` defect counts. **Deletion Dominance**: whenever a file, class, helper, field,
+  branch, or feature is slated for `DELETE` (`BLOCKING_SCOPE` / Matrix 2.1), fold and suppress all
+  internal polish findings (`#include` or `import` hygiene, naming, comments, micro-style, or local
+  nits inside the deleted span) into that single `DELETE` item.
 - **Veteran lens (Skia C++ / text / font code)**: run `veteran-review` in lens mode (`~/.gemini/config/skills/veteran-review/SKILL.md`, Steps 1–3) and feed its candidates into the Stage 2.5 packet instead of running its own skeptic pass.
 - **Built-in Google3 reference skills** (when `/google/src/files/head/...` is mounted):
   - Consult [`copy-paste-detection`](file:///google/src/files/head/depot/google3/learning/gemini/agents/skills/copy_paste_detection/SKILL.md) for DRY vs. DAMP judgment and `--query-snippet` bug propagation.
@@ -94,10 +99,14 @@ Do not stop at the script output. Inspect the flagged hotspots and read the core
    - **Ousterhout's Deep Modules**: Flag shallow pass-through wrappers, speculative interfaces with a single implementation, and uncalled getters/setters.
    - **Linus's Principle**: Identify `if/else` special-case proliferation or symptomatic test-fitting branches that disappear when the underlying data representation is fixed.
    - **Replace Before Extract**: Before proposing a new helper for duplicated code, check whether a standard library function or an existing project helper already solves it, or whether the repetition is intentional DAMP (e.g., table-driven test inputs).
+   - **Zero-Base Necessity + Deletion Dominance**: Run a counterfactual deletion check on every class, struct, field, cache, helper, overload, or branch—name what concrete part of the target contract breaks if deleted completely in favor of existing primitives, and route unnecessary entities to `DELETE` while suppressing internal polish notes inside them.
+   - **Structural Diff of Feature/Backend Branches & Consecutive Loops**: When an `if` branch (feature, backend, or direction) and its adjacent `else` or post-`return` fallthrough duplicate `> 10` structurally parallel lines or repeat the same loop traversal with an early `return`, sink the leaf difference into one shared loop or narrow helper; fuse consecutive passes over the same collection (`runs`, `clusters`, `lines`) when phase invariants permit and single-screen readability holds.
+   - **No Round-Trip Property Plumbing**: Reject copying or plumbing a property into an intermediate carrier struct when the consumer already holds direct access to the owning object (e.g., `Paragraph`, `Style`, `Run`).
+   - **Prototype-Scar Elimination Across All Languages (`C++`, `Dart`, `TypeScript`, `Python` — generalizes `M7`)**: Purge orphaned `#include` or `import` lines in code and tests, leftover constants, flags, or debug helpers from abandoned hypotheses, and early-iteration symptom workarounds made redundant by a root-cause fix.
 3. **Production Bug Hunting**:
    - **Concurrency & Data Races**: Slice/map/pointer mutations under `RLock` or after releasing a lock while JSON serialization or background goroutines/threads run.
    - **Cache Poisoning & Memory Leaks**: Caching empty/error results when an RPC/subprocess times out; unbounded global caches (`diffCache`, font registries) holding megabytes of dead blobs forever.
-   - **Control-Flow Shadowing**: Missing early `return`/`continue` that causes a specific triage branch to fall through and get overwritten by generic scoring at the bottom of a monolithic function; parameters that are always `false` in production because an upstream filter already excluded those items.
+   - **Control-Flow Shadowing & Above/Below Early-Return Audit**: Missing early `return`/`continue` that causes a specific triage branch to fall through and get overwritten by generic scoring at the bottom of a monolithic function; parameters that are always `false` in production because an upstream filter already excluded those items. Whenever an early `return` or `continue` is added or moved, audit lines **above** it (computations or allocations now wasted on the early-exit path that belong below the guard) and lines **below** it (tautological negated re-checks of the same condition, dead branches, stale invariants, or bypassed cleanup).
    - **Naive Substring / Regex Traps**: Short tags like `"gl"` matching `"glyph"`/`"google"`, or `"gn"` matching `"align"`/`"diagnostic"`.
 
 ---

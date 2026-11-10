@@ -309,6 +309,249 @@ class TestRuthlessCodeAudit(unittest.TestCase):
     self.assertEqual(payload["summary"]["total_files"], 1)
     self.assertEqual(payload["summary"]["clone_backend"], "builtin-winnowing")
 
+  # Verifies cross-language unused explicit import detection (Python, TS/JS, Dart) and safe skips
+  def test_cross_language_unused_imports_detection(self):
+    py_file = "\n".join([
+        "from __future__ import annotations",
+        "import os",
+        "import sys  # keep: side-effect",
+        "from typing import TYPE_CHECKING, Optional",
+        "if TYPE_CHECKING:",
+        "  from pkg.models import UsedModel, UnusedModel",
+        "",
+        "def run(val: UsedModel) -> int:",
+        "  try:",
+        "    import optional_dep",
+        "  except ImportError:",
+        "    pass",
+        "  return 1",
+    ])
+    compat_py = "\n".join([
+        "import sys",
+        "if sys.version_info >= (3, 11):",
+        "  import tomllib",
+        "else:",
+        "  import tomli as tomllib",
+        "PLATFORM = sys.platform",
+    ])
+    ts_file = "\n".join([
+        "import React from 'react';",
+        (
+            "import DefaultUnused, { usedFn, unusedFn as aliasUnused,"
+            " type UsedT, type UnusedT } from './m';"
+        ),
+        "import * as usedNs from './ns';",
+        "import * as unusedNs from './dead_ns';",
+        "import { $, user$ } from './signals';",
+        "import './side_effect_only.css';",
+        "export function Widget(x: UsedT): number {",
+        "  const endpoint = 'https://example.com/' + usedFn(usedNs.val, x) + $(user$.val);",
+        "  return endpoint.length;",
+        "}",
+    ])
+    ts_semiless = "\n".join([
+        "import { helper } from './helper'",
+        "import './styles.css'",
+        "import DeadDefault from './dead'",
+        "export function run(): number {",
+        "  return helper()",
+        "}",
+        "export { PublicType } from './types'",
+    ])
+    dart_file = "\n".join([
+        "import 'dart:math' as math;",
+        "import 'dart:developer' as unusedDev;",
+        "import 'package:ui/ui.dart'",
+        "    show",
+        "        Offset,",
+        "        RRect,",
+        "        RSTransform,",
+        "        Radius,",
+        "        Rect,",
+        "        Shader,",
+        "        Shadow,",
+        "        Size,",
+        "        Tangent,",
+        "        UnusedTen;",
+        "class Box {",
+        "  Object all(RRect a, RSTransform b, Radius c, Rect d, Shader e, Shadow f, Tangent g) =>",
+        "      Offset(math.max(0.0, 1.0), 0.0);",
+        "}",
+    ])
+    dart_barrel = "export 'src/a.dart';\nimport 'dart:ui' as ui;\n"
+    dart_part_owner = "library owner;\nimport 'dart:math' as math;\npart 'owner_part.dart';\nclass Owner {}\n"
+
+    self._write("pkg/__init__.py", "from .sub import ReExported\n")
+    self._write("app.py", py_file)
+    self._write("compat.py", compat_py)
+    self._write("ui/widget.tsx", ts_file)
+    self._write("ui/semiless.ts", ts_semiless)
+    self._write("lib/box.dart", dart_file)
+    self._write("lib/barrel.dart", dart_barrel)
+    self._write("lib/owner.dart", dart_part_owner)
+
+    raw_files = ruthless_audit.collect_files([self.root], self.root)
+    records = [
+        (p, rel, p.read_text(encoding="utf-8"), p.read_text(encoding="utf-8").splitlines())
+        for p, rel in raw_files
+    ]
+    horrors = ruthless_audit.scan_horrors_and_invariants(records, allow_cyrillic=False)
+    unused = {f"{loc}:{msg}" for loc, msg in horrors["unused_imports"]}
+
+    self.assertIn("app.py:L2:unused import `os`", unused)
+    self.assertIn("app.py:L4:unused import `Optional`", unused)
+    self.assertIn("app.py:L6:unused import `UnusedModel`", unused)
+    self.assertNotIn("app.py:L3:unused import `sys`", unused)
+    self.assertNotIn("app.py:L4:unused import `TYPE_CHECKING`", unused)
+    self.assertNotIn("app.py:L6:unused import `UsedModel`", unused)
+    self.assertIn("compat.py:L3:unused import `tomllib`", unused)
+    self.assertIn("compat.py:L5:unused import `tomllib`", unused)
+
+    self.assertIn("ui/widget.tsx:L2:unused import `DefaultUnused`", unused)
+    self.assertIn("ui/widget.tsx:L2:unused import `aliasUnused`", unused)
+    self.assertIn("ui/widget.tsx:L2:unused import `UnusedT`", unused)
+    self.assertIn("ui/widget.tsx:L4:unused import `unusedNs`", unused)
+    for used_sym in ("`React`", "`usedFn`", "`UsedT`", "`usedNs`", "`$`", "`user$`"):
+      self.assertFalse(any(used_sym in item for item in unused), used_sym)
+    self.assertIn("ui/semiless.ts:L3:unused import `DeadDefault`", unused)
+    self.assertNotIn("ui/semiless.ts:L1:unused import `helper`", unused)
+
+    self.assertIn("lib/box.dart:L2:unused import `unusedDev`", unused)
+    self.assertIn("lib/box.dart:L3:unused import `Size`", unused)
+    self.assertIn("lib/box.dart:L3:unused import `UnusedTen`", unused)
+    self.assertFalse(any("barrel.dart" in item for item in unused))
+    self.assertFalse(any("owner.dart" in item for item in unused))
+    self.assertFalse(any("__init__.py" in item for item in unused))
+
+  # Verifies fuseable consecutive loops vs phase-dependent reduction/early-return loops
+  def test_consecutive_loops_and_post_early_exit_tautologies(self):
+    cpp_code = "\n".join([
+        "void processRuns( Paragraph* para, Node* ptr ) {",
+        "  if (!ptr) {",
+        "    return;",
+        "  }",
+        "  int x = 1;",
+        "  if (ptr != nullptr) {",
+        "    ptr->touch(x);",
+        "  }",
+        "  for (auto& run : fRuns) {",
+        "    run.resetOffsets();",
+        "  }",
+        "  // Comment between two fuseable passes",
+        "  for (auto& run : fRuns) {",
+        "    run.computeMetrics();",
+        "  }",
+        "  float maxAscent = 0.0f;",
+        "  for (const auto& run : fBaselineRuns) {",
+        "    maxAscent = minVal(maxAscent, run.ascent());",
+        "  }",
+        "  for (auto& run : fBaselineRuns) {",
+        "    run.setBaseline(maxAscent);",
+        "  }",
+        "  for (auto& run : fScaledRuns) {",
+        "    this->fTotal += run.width();",
+        "  }",
+        "  for (auto& run : fScaledRuns) {",
+        "    run.scale(this->fTotal);",
+        "  }",
+        "  if (fItems.empty()) {",
+        "    return;",
+        "  }",
+        "  pruneInPlace(fItems);",
+        "  if (fItems.empty()) {",
+        "    return;",
+        "  }",
+        "#if defined(SK_DEBUG)",
+        "  if (!para) {",
+        "    return;",
+        "  }",
+        "#endif",
+        "  if (!para) {",
+        "    recover();",
+        "  }",
+        "  if (strict)",
+        "    if (!optPtr) return;",
+        "  if (!optPtr) {",
+        "    fallback();",
+        "  }",
+        "}",
+    ])
+    py_code = "\n".join([
+        "def handle(items, rows, mut_list):",
+        "  if not items:",
+        "    return 0",
+        "  total = 0",
+        "  if items:",
+        "    total += 1",
+        "  for row in items:",
+        "    row.prepare()",
+        "  for row in items:",
+        "    row.commit()",
+        "  counts = {}",
+        "  for r in rows:",
+        "    counts[r.key] = counts.get(r.key, 0) + 1",
+        "  for r in rows:",
+        "    r.is_dup = counts[r.key] > 1",
+        "  if not mut_list:",
+        "    return 0",
+        "  del mut_list[:1]",
+        "  if not mut_list:",
+        "    return 0",
+        "  return total",
+    ])
+    cjs_code = "function f(x) {\n  if (!x) return 0;\n  if (x) { return 1; }\n  return 2;\n}\n"
+    self._write("src/runs.cpp", cpp_code)
+    self._write("src/handler.py", py_code)
+    self._write("src/mod.cjs", cjs_code)
+
+    raw_files = ruthless_audit.collect_files([self.root], self.root)
+    records = [
+        (p, rel, p.read_text(encoding="utf-8"), p.read_text(encoding="utf-8").splitlines())
+        for p, rel in raw_files
+    ]
+    horrors = ruthless_audit.scan_horrors_and_invariants(records, allow_cyrillic=False)
+
+    loop_locs = [loc for loc, _ in horrors["consecutive_collection_loops"]]
+    self.assertEqual(loop_locs, ["src/handler.py:L9", "src/runs.cpp:L13"])
+
+    taut_items = {f"{loc}:{msg}" for loc, msg in horrors["post_early_exit_tautologies"]}
+    self.assertEqual(
+        taut_items,
+        {
+            "src/runs.cpp:L6:tautological guard on `ptr` after early exit at L2",
+            "src/handler.py:L5:tautological guard on `items` after early exit at L2",
+            "src/mod.cjs:L3:tautological guard on `x` after early exit at L2",
+        },
+    )
+
+  # Verifies R138 4 simplification checks and Zero-Content-Loss anchors across skill docs
+  def test_r138_simplification_checks_documented_without_content_loss(self):
+    cfg_root = pathlib.Path(__file__).resolve().parents[1]
+    hunter_md = (
+        cfg_root / "skills" / "amnesia-precommit" / "references" / "hunter_prompt.md"
+    ).read_text(encoding="utf-8")
+    precommit_md = (
+        cfg_root / "skills" / "amnesia-precommit" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    ruthless_md = (
+        cfg_root / "skills" / "ruthless-code-audit" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+
+    for doc_name, txt in (("hunter_prompt.md", hunter_md), ("ruthless/SKILL.md", ruthless_md)):
+      self.assertIn("Zero-Base Necessity", txt, doc_name)
+      self.assertIn("Deletion Dominance", txt, doc_name)
+      self.assertIn("Structural Diff", txt, doc_name)
+      self.assertIn("No Round-Trip Property Plumbing", txt, doc_name)
+      self.assertIn("Prototype-Scar Elimination", txt, doc_name)
+      self.assertIn("COMPACTION: YES", txt, doc_name)
+      self.assertIn("COMPACTION: NO", txt, doc_name)
+
+    self.assertIn("Deletion Dominance", precommit_md)
+    self.assertIn("stage_diff_context.py", precommit_md)
+    self.assertIn("stage_diff_context.py", ruthless_md)
+    for m_rule in ("M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9"):
+      self.assertIn(m_rule, hunter_md)
+
 
 if __name__ == "__main__":
   unittest.main()
