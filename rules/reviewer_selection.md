@@ -1,6 +1,6 @@
 ---
-trigger: always_on
-description: "Verify a reviewer, owner or assignee is still active before proposing them."
+trigger: model_decision
+description: "When selecting, suggesting, or assigning any @google.com LDAP or person as a CL/PR reviewer, bug owner, assignee, or CC."
 ---
 
 # Reviewer Selection

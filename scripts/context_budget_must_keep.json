@@ -112,7 +112,8 @@
  },
  {
   "name": "active reviewer check",
-  "regex": "id -u"
+  "regex": "id -u",
+  "scope": "any"
  },
  {
   "name": "untrusted bug text",
