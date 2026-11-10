@@ -162,9 +162,14 @@ For surviving Skia CLs in `🔴 SURGICAL AUDIT` or `🟠 PUSHBACK`, run
   Buildbucket). Only after it prints `TRIGGER: VERIFIED`, launch
   `python3 ~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py watch --cl <N> --save-draft`
   in the background (`WaitMsBeforeAsync=500`, `NotificationTimeoutSeconds=5400`).
-  - **On Red Canary (`UNRELATED_HEAD_BREAKAGE`)**: `watch --save-draft` automatically saves a
-    sanitized Gerrit `/PATCHSET_LEVEL` draft (only when Canary is red; never when green) and wakes
-    the chat.
+  - **On Red Canary (`Canary-G3`, `Canary-Chromium`, `Canary-Android`)**: `watch --save-draft`
+    and `triage --save-draft` verify on the downstream roll CL that our part actually passed before
+    marking `UNRELATED_HEAD_BREAKAGE` and saving a sanitized English `/PATCHSET_LEVEL` draft on the
+    CL's current patchset (never when green; re-run `triage --cl <N> --save-draft` if a later
+    `NO_CODE_CHANGE` patchset is uploaded). If automated triage returns `CANNOT_TRIAGE` or
+    `CL_SUSPECTED_REGRESSION` and manual stack-trace/roll inspection proves our part passed, save
+    the sanitized `/PATCHSET_LEVEL` draft via `python3 ~/.gemini/config/scripts/gerrit_draft.py
+    save --cl <N> --resolved --message "..."`.
   - **On Red ASAN**: Never touch external/others' CLs directly. Create or update the `%wip`
     companion CL per `companion-cl-review` (`PS1` = reproducer test, `PS2` = fix), update the
     parent CL's `/PATCHSET_LEVEL` draft (`unresolved: true`) with the ASAN trace and companion link,

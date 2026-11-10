@@ -140,6 +140,7 @@ When Outcome 1 or 2 applies:
      Assisted-by: <Model Name>"
      git push origin HEAD:refs/for/main%wip
      ```
+   - **Red Skia Canaries on Prepared / WIP CLs**: Whenever any Skia canary (`Canary-G3`, `Canary-Chromium`, `Canary-Android`) runs on the Skia CL and fails on unrelated or infrastructure targets **after** proving on the downstream roll CL that our part passed, save a sanitized English `/PATCHSET_LEVEL` Gerrit draft on the Skia CL's final current patchset via `python3 ~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py triage --cl <CL> --save-draft` (or `python3 ~/.gemini/config/scripts/gerrit_draft.py save --cl <CL> --resolved --message "..."` for manual roll/stack proof), re-saving after any `NO_CODE_CHANGE` `Tested:` upload so the explanation lives on the Gerrit CL itself and not only in the issue tracker reply.
 
 ---
 

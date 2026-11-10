@@ -32,7 +32,13 @@ A structured specification:
   then `luci-auth context -- git cl upload -f --commit-description=+`; a message-only patchset is
   `NO_CODE_CHANGE` and keeps tryjob results). `canary_advisor.py triage` prints
   `TESTED BLOCK: STALE` until every green trybot is listed and must print `TESTED BLOCK: OK`
-  before the final summary. The final chat summary carries the same per-suite environment
+  before the final summary. When any Skia canary (`Canary-G3`, `Canary-Chromium`, `Canary-Android`)
+  failed on unrelated/infra targets after our part was proven green, re-run
+  `canary_advisor.py triage --cl <CL> --save-draft` (or
+  `python3 ~/.gemini/config/scripts/gerrit_draft.py save --cl <CL> --resolved --message "..."` for
+  manual proof) **after** the `--commit-description=+` upload so `triage` also prints
+  `CANARY DRAFT: OK` on the latest patchset. The final chat summary carries the same per-suite
+  environment
 
 ## `WebParagraph` / `flutter/flutter` PRs: `Reviewer & AI Audit Context`
 Include a compact 4-bullet **`Reviewer & AI Audit Context`** block in the PR description:

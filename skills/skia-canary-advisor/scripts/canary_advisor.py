@@ -26,6 +26,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 GERRIT = "https://skia-review.googlesource.com"
@@ -755,6 +756,10 @@ def advise(args):
             else:
                 print(f"\nCanary Command (run only after user approval):")
                 print(f"  {cmd}")
+            if meta["cl"]:
+                script_path = os.path.abspath(__file__)
+                print("  # Watch running canaries and save drafts if unrelated targets fail:")
+                print(f"  python3 {script_path} watch --cl {meta['cl']} --save-draft")
     
     for name, cmd in local_actions:
         print(f"\nAGENT ACTION (LOCAL gate {name}: run in background now; no LGTM, CLEAN verdict, "
@@ -852,6 +857,43 @@ def bb_cl_builds(cl, ps):
         except json.JSONDecodeError:
             continue
     return builds
+
+
+def same_tree_builds(cl, meta, ps):
+    """Collect newest Buildbucket builds per builder across all same-tree patchsets code_ps..ps.
+
+    Canaries are often triggered on an intermediate NO_CODE_CHANGE patchset (e.g. PS3) before
+    a final Tested: description update (PS4); scanning the full range keeps every tryjob and
+    tags each build with `_patchset` so Swarming tasks are looked up on the patchset that ran it.
+    """
+    ps = int(ps)
+    code_ps = int(code_patchset(meta, ps))
+    merged = {}
+    source_ps = set()
+    for cand_ps in range(code_ps, ps + 1):
+        ps_builds = bb_cl_builds(cl, cand_ps)
+        if ps_builds:
+            source_ps.add(cand_ps)
+        for builder, b in ps_builds.items():
+            annotated = {**b, "_patchset": cand_ps}
+            cur = merged.get(builder)
+            if not cur or (
+                annotated.get("createTime", ""),
+                cand_ps,
+            ) >= (
+                cur.get("createTime", ""),
+                cur.get("_patchset", cand_ps),
+            ):
+                merged[builder] = annotated
+    return merged, code_ps, sorted(source_ps)
+
+
+def _tasks_for_ps(cl, ps, cache):
+    """Return Swarming tasks for (cl, ps), memoizing per patchset inside cache."""
+    ps = int(ps)
+    if ps not in cache:
+        cache[ps] = swarming_tasks_for_cl(cl, ps)
+    return cache[ps]
 
 
 def swarming_tasks_for_cl(cl, ps, name=None):
@@ -981,26 +1023,52 @@ def fetch_logdog_step(task_id, run_id, step):
     return ""
 
 
+def _google3_skia_target_label(g3_skia_root, rel_path):
+    """Map a Skia repo-relative path to its nearest enclosing Blaze label in google3 HEAD."""
+    pkg_dir = os.path.dirname(rel_path)
+    while pkg_dir and not os.path.isfile(os.path.join(g3_skia_root, pkg_dir, "BUILD")):
+        pkg_dir = os.path.dirname(pkg_dir)
+    if not pkg_dir and not os.path.isfile(os.path.join(g3_skia_root, "BUILD")):
+        return None
+    pkg_prefix = f"//third_party/skia/HEAD/{pkg_dir}" if pkg_dir else "//third_party/skia/HEAD"
+    full = os.path.join(g3_skia_root, rel_path)
+    # New files added by the CL or BUILD/BUILD.bazel edits map to all rules in their package
+    if not os.path.exists(full) or os.path.basename(rel_path) in ("BUILD", "BUILD.bazel"):
+        return f"{pkg_prefix}:all"
+    target_rel = os.path.relpath(rel_path, pkg_dir) if pkg_dir else rel_path
+    return f"{pkg_prefix}:{target_rel}"
+
+
+G3_IGNORED_FILE_RE = re.compile(r"(^|/)BUILD\.gn$|\.gni$")
+
+
 def check_google3_somepath(target, touched_files):
-    if not os.path.isdir(GOOGLE3_DIR):
+    """Query Blaze `somepath` from `target` to `touched_files`; return (has_path_or_none, lines)."""
+    g3_skia_root = os.path.join(GOOGLE3_DIR, "third_party/skia/HEAD")
+    if not touched_files or not os.path.isdir(g3_skia_root):
+        return None, []
+    # Skip Skia unit tests/docs and GN-only files absent from google3 Blaze packages (CL 1421816)
+    g3_files = [
+        f for f in touched_files
+        if not NO_EFFECT.search(f) and not G3_IGNORED_FILE_RE.search(f)
+    ]
+    if not g3_files:
         return False, []
     labels = []
-    for f in touched_files:
-        full = os.path.join(GOOGLE3_DIR, "third_party/skia/HEAD", f)
-        if not os.path.exists(full):
-            continue
-        d = os.path.dirname(f)
-        b = os.path.basename(f)
-        label = f"//third_party/skia/HEAD/{d}:{b}" if d else f"//third_party/skia/HEAD:{b}"
-        labels.append(label)
-    if not labels:
-        return False, []
+    for f in g3_files:
+        lbl = _google3_skia_target_label(g3_skia_root, f)
+        if not lbl:
+            return None, []
+        if lbl not in labels:
+            labels.append(lbl)
     set_expr = " ".join(labels)
     query = f"somepath({target}, set({set_expr}))"
-    cmd = ["blaze", "query", query]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60, cwd=GOOGLE3_DIR)
+    proc = subprocess.run(
+        ["blaze", "query", query], capture_output=True, text=True, timeout=60, cwd=GOOGLE3_DIR
+    )
+    # Return None on Blaze errors so callers fail closed instead of mistaking errors for empty paths
     if proc.returncode != 0:
-        return False, []
+        return None, []
     lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
     return bool(lines), lines
 
@@ -1173,7 +1241,62 @@ def triage_asan_failure(cl, ps, builder, bb_build, sw_tasks, touched_files):
     }
 
 
+# Internal corporate URLs, shortlinks, hostnames, and target paths forbidden on public Gerrit
+PUBLIC_DRAFT_LEAK_RE = re.compile(
+    r"(/google/" r"src/|/google_" r"src/|/usr/local/" r"google/home/|//depot/" r"google3\b"
+    r"|\b(?:[a-zA-Z0-9-]+\.)*corp\.(?:google\.com|goog)\b"
+    r"|\bgoogleplex\b|\bgoto\.google\.com\b"
+    r"|(?<![a-zA-Z0-9_./-])(?:https?://)?(?:cl|cr|ag)/\d+\b"
+    r"|(?<![a-zA-Z0-9_./-])(?:https?://)?b/\d{5,}\b"
+    r"|(?<![a-zA-Z0-9_./-])(?:https?://)?go/[a-z0-9][a-z0-9_-]{2,}\b"
+    r"|\bI\d{15,}\b|(?:^|\s)//[a-zA-Z0-9_.-]+/)"
+)
+
+SKIA_SYMBOL_RE = re.compile(
+    r"\b(?:Sk[A-Z][A-Za-z0-9_]*|Gr[A-Z][A-Za-z0-9_]*|skgpu::|skia::|android::uirenderer::)\b"
+)
+CHROMIUM_ROLL_URL_RE = re.compile(
+    r"https://chromium-review\.googlesource\.com/c/(?:chromium/src/\+/)?(\d+)"
+)
+ANDROID_ROLL_URL_RE = re.compile(
+    r"https://googleplex-android-review\.googlesource\.com/c/"
+    r"(?:platform/external/skia/\+/)?(\d+)"
+)
+TREEHUGGER_SUMMARY_RE = re.compile(
+    r"^## Presubmit (?:finished|running):\s*([^\n]+)", re.MULTILINE
+)
+TREEHUGGER_PASSED_COUNT_RE = re.compile(r"(\d+)\s+passed")
+TREEHUGGER_TEST_FAIL_RE = re.compile(
+    r"FAIL:\s*Tests failed for \[([^\]]+)\]"
+    r"\(https://android-build\.googleplex\.com/builds/tests/view\?invocationId=(I\d+)\)"
+    r"(?:\s+on\s+([^\s.\n]+))?(?:\.\s*Caused by\s+([A-Z0-9_]+))?"
+)
+TREEHUGGER_BUILD_FAIL_RE = re.compile(
+    r"FAIL:\s*Failed to build \[([^\]]+)\]"
+    r"\(https://android-build\.googleplex\.com/builds/(?:pending|submitted)/"
+    r"([A-Za-z0-9_]+)/([^/]+)/latest/view/logs%2Fbuild_error\.log\)"
+)
+ANDROID_COMPILER_ERROR_RE = re.compile(
+    r"^(?:external/[^\s:]+|[A-Za-z0-9_./-]+\.(?:h|hpp|cpp|cc|c|rs)):\d+(?::\d+)?:\s*"
+    r"(?:fatal )?error:\s*([^\n]+)",
+    re.MULTILINE,
+)
+ANDROID_MISSING_SYMBOL_RE = re.compile(
+    r'CANNOT LINK EXECUTABLE[^\n]*?:\s*cannot locate symbol "([^"]+)"'
+)
+ANDROID_MANGLED_SKIA_RE = re.compile(
+    r"Sk[A-Z]|Gr[A-Z]|\d+(?:skgpu|skia|skparagraph|skottie|skshaper|skunicode|skcms|uirenderer)"
+)
+
+
+def find_public_draft_leak(text):
+    """Return the first corporate/internal substring in `text`, or empty string when clean."""
+    m = PUBLIC_DRAFT_LEAK_RE.search(text or "")
+    return m.group(0).strip() if m else ""
+
+
 def triage_canary_g3_failure(cl, ps, bb_build, sw_tasks, touched_files):
+    """Triage a red Canary-G3 build via skia_gardener and blaze somepath; return verdict dict."""
     # Check Buildbucket summary_markdown first so merge conflicts never fall back to old tasks
     nm = _not_mergeable_verdict(bb_build)
     if nm:
@@ -1241,20 +1364,53 @@ def triage_canary_g3_failure(cl, ps, bb_build, sw_tasks, touched_files):
             "summary": "Failed to parse skia_gardener JSON output",
         }
 
-    gardener_verdict = triage_data.get("verdict", "")
-    runs = triage_data.get("runs", [])
-    targets = triage_data.get("targets", [])
+    # skia_gardener -json emits Go field names (Verdict/Runs/Targets); lowercase reads
+    # silently saw no runs and reported every G3 failure as a CL regression
+    gardener_verdict = triage_data.get("Verdict", triage_data.get("verdict", ""))
+    runs = triage_data.get("Runs", triage_data.get("runs", [])) or []
+    targets = triage_data.get("Targets", triage_data.get("targets", [])) or []
 
-    skia_tests_ran = any(
-        r.get("check") == "CheckTestsSkia" and
-        r.get("status") not in ("BROKEN", "PENDING", "RUNNING") and not r.get("setup_error")
-        for r in runs
+    live_runs = [r for r in runs if not r.get("superseded")]
+
+    def _check_passed(check_id):
+        matched = [r for r in live_runs if r.get("check") == check_id]
+        return bool(matched) and all(
+            r.get("status") in ("PASSED", "OK", "SUCCESS")
+            and int(r.get("failed") or 0) == 0
+            and not r.get("setup_error")
+            for r in matched
+        )
+
+    def _check_settled(check_id):
+        matched = [r for r in live_runs if r.get("check") == check_id]
+        return bool(matched) and all(
+            not r.get("setup_error")
+            and (
+                (r.get("status") in ("PASSED", "OK", "SUCCESS") and int(r.get("failed") or 0) == 0)
+                or (r.get("status") in ("FAILED", "WARNING") and int(r.get("failed") or 0) > 0)
+            )
+            for r in matched
+        )
+
+    skia_tests_passed = _check_passed("CheckTestsSkia")
+    all_skia_tap_passed = (
+        skia_tests_passed
+        and _check_passed("CheckSkiaDependents")
+        and _check_passed("CheckTestsSkiaDependents")
+    )
+    all_skia_tap_settled = (
+        skia_tests_passed
+        and _check_settled("CheckSkiaDependents")
+        and _check_settled("CheckTestsSkiaDependents")
+    )
+    any_broken_setup = any(
+        r.get("status") == "BROKEN" or bool(r.get("setup_error")) for r in live_runs
     )
 
-    if gardener_verdict in ("PRESUBMIT_CONFIG_BROKEN", "INFRA_ONLY") and not skia_tests_ran:
+    if gardener_verdict in ("PRESUBMIT_CONFIG_BROKEN", "INFRA_ONLY") and not skia_tests_passed:
         return {
             "verdict": "INFRA_DID_NOT_RUN", "g3_cl": g3_cl, "our_part_passed": False,
-            "summary": "google3 presubmit broken or infra failure before Skia tests ran",
+            "summary": "google3 presubmit broken or infra failure before Skia tests passed",
         }
 
     target_details = []
@@ -1264,16 +1420,22 @@ def triage_canary_g3_failure(cl, ps, bb_build, sw_tasks, touched_files):
             continue
         tgt_name = t.get("target", "")
         kind = t.get("kind", "")
-        if kind == "BROKEN_AT_HEAD":
+        if kind in ("BROKEN_AT_HEAD", "INFRA", "LIKELY_FLAKY"):
             target_details.append({
-                "target": tgt_name, "unrelated": True, "reason": "BROKEN_AT_HEAD",
+                "target": tgt_name, "unrelated": True, "reason": kind,
             })
             continue
         has_path, path_lines = check_google3_somepath(tgt_name, touched_files)
-        if not has_path:
+        if has_path is False:
             target_details.append({
                 "target": tgt_name, "unrelated": True,
                 "reason": "somepath empty (no dependency on touched Skia files)",
+            })
+        elif has_path is None:
+            all_unrelated = False
+            target_details.append({
+                "target": tgt_name, "unrelated": False,
+                "reason": "somepath query inconclusive (cannot prove target unrelated at HEAD)",
             })
         else:
             all_unrelated = False
@@ -1283,55 +1445,706 @@ def triage_canary_g3_failure(cl, ps, bb_build, sw_tasks, touched_files):
                 "somepath": path_lines[:5],
             })
 
-    our_part_passed = skia_tests_ran and (all_unrelated or not target_details)
+    # Included non-TAP presubmits (e.g. YouTube iOS buildtest) stay RUNNING after TAP exits;
+    # require all three Skia TAP checks to settle with unrelated failures, or all three to pass
+    our_part_passed = not any_broken_setup and (
+        (all_skia_tap_settled and bool(target_details) and all_unrelated)
+        or (all_skia_tap_passed and not target_details)
+    )
     verdict = "UNRELATED_HEAD_BREAKAGE" if our_part_passed else "CL_SUSPECTED_REGRESSION"
 
     sanitized_draft = ""
     if our_part_passed:
-        sanitized_draft = (
-            "Canary-G3 failed on unrelated google3 targets that are already broken at HEAD "
-            "or do not depend on the files modified in this CL. All Skia tests "
-            "(CheckTestsSkia) and dependent targets exercising the touched code passed."
-        )
+        if not target_details:
+            sanitized_draft = (
+                "Canary-G3 hit a wrapper timeout/infrastructure error after all Skia unit tests "
+                "(CheckTestsSkia) and dependent targets passed with 0 failures."
+            )
+        else:
+            sanitized_draft = (
+                "Canary-G3 failed only on unrelated downstream targets (already broken at HEAD, "
+                "infrastructure errors, or targets with no build dependency on the files modified "
+                "in this CL); CheckTestsSkia and all dependent targets exercising the touched "
+                "code passed."
+            )
 
     return {
         "verdict": verdict, "g3_cl": g3_cl, "our_part_passed": our_part_passed,
-        "skia_tests_ran": skia_tests_ran, "gardener_verdict": gardener_verdict,
+        "skia_tests_ran": skia_tests_passed, "gardener_verdict": gardener_verdict,
         "targets": target_details, "sanitized_draft": sanitized_draft,
     }
 
 
-def triage_other_canary_failure(cl, ps, builder, bb_build, sw_tasks, touched_files):
-    # Avoid classifying a pre-task merge conflict or startup error as UNRELATED_HEAD_BREAKAGE
+def _prpc_json_post(url, payload, timeout=15):
+    """POST JSON to a public LUCI pRPC endpoint and strip the optional XSSI prefix."""
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "User-Agent": "canary-advisor",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read(1024 * 1024).decode("utf-8", "replace").strip()
+    if raw.startswith(")]}'"):
+        raw = raw[4:].lstrip()
+    return json.loads(raw) if raw else {}
+
+
+def _is_bot_update_patch_failure(summary):
+    """Return True when a Chromium trybot failed applying DEPS in bot_update due to GoB lag."""
+    low = (summary or "").lower()
+    return (
+        "patch failure" in low
+        or "patch_failure" in low
+        or "patch error log attached to bot_update" in low
+    )
+
+
+def _extract_chromium_summary_failed_tests(summary):
+    """Extract markdown bullet items of failing tests from Buildbucket summaryMarkdown."""
+    tests = []
+    for line in (summary or "").splitlines():
+        s = line.strip()
+        if s.startswith(("- ", "* ")):
+            item = s[2:].strip()
+            if item and not item.startswith(("...", "http")) and item not in tests:
+                tests.append(item)
+    return tests
+
+
+def _extract_chromium_non_skia_compile_sig(summary, stems):
+    """Return a non-empty target signature only when a Chromium compile failure excludes Skia."""
+    low = (summary or "").lower()
+    if "step _compile" not in low:
+        return ""
+    if "skia" in low or SKIA_SYMBOL_RE.search(summary or ""):
+        return ""
+    if any(st and st.lower() in low for st in stems):
+        return ""
+    in_fence = False
+    code_lines = []
+    for raw in (summary or "").splitlines():
+        s = raw.strip()
+        if s.startswith("```"):
+            if in_fence:
+                break
+            in_fence = True
+            continue
+        if in_fence and s and not s.startswith("#####"):
+            code_lines.append(s)
+    return code_lines[0] if code_lines else ""
+
+
+def _chromium_tests_fail_on_sibling_cl(cr_cl, builder_name, failed_build_id, failed_tests):
+    """Check whether `failed_tests` also failed recently on another non-autoroll Chromium CL."""
+    if not failed_tests or not builder_name:
+        return 0
+    short_builder = builder_name.removeprefix("chromium/try/")
+    payload = {
+        "predicate": {
+            "builder": {"project": "chromium", "bucket": "try", "builder": short_builder},
+            "status": "FAILURE",
+        },
+        "pageSize": 20,
+        "mask": {"fields": "id,status,summaryMarkdown,input.gerritChanges,tags"},
+    }
+    try:
+        resp = _prpc_json_post(
+            "https://cr-buildbucket.appspot.com/prpc/buildbucket.v2.Builds/SearchBuilds", payload
+        )
+    except (urllib.error.URLError, OSError, ValueError):
+        return 0
+    for sb in resp.get("builds") or []:
+        if sb.get("status") != "FAILURE" or not sb.get("id") or sb.get("id") == failed_build_id:
+            continue
+        changes = (sb.get("input") or {}).get("gerritChanges") or []
+        if not changes:
+            continue
+        try:
+            sib_cl = int(str(changes[0].get("change", "0")).strip('"'))
+        except ValueError:
+            continue
+        if sib_cl <= 0 or sib_cl == int(cr_cl):
+            continue
+        if any(
+            t.get("key") == "cq_cl_owner" and "autoroll" in (t.get("value") or "").lower()
+            for t in (sb.get("tags") or [])
+        ):
+            continue
+        sib_tests = set(_extract_chromium_summary_failed_tests(_build_summary_markdown(sb)))
+        if sib_tests and all(ft in sib_tests for ft in failed_tests):
+            return sib_cl
+    return 0
+
+
+def _classify_chromium_failed_build(cr_cl, b_name, fb, has_independent_infra_peer, stems):
+    """Classify one un-cleared Chromium roll build as (is_unrelated, reason_str)."""
+    b_id = fb.get("id", "")
+    status = fb.get("status", "")
+    if status in ("SCHEDULED", "STARTED", "CANCELED"):
+        return False, f"{b_name} {status} before completing"
+    summary = _build_summary_markdown(fb)
+    if _is_bot_update_patch_failure(summary):
+        return True, f"{b_name} hit bot_update patch failure"
+    # Only clear an early-aborted shard when an independent peer hit bot_update/INFRA_FAILURE
+    if (
+        status == "FAILURE"
+        and has_independent_infra_peer
+        and "did a shard fail early?" in summary.lower()
+        and "skia" not in summary.lower()
+        and not SKIA_SYMBOL_RE.search(summary)
+        and not _extract_chromium_summary_failed_tests(summary)
+    ):
+        return True, f"{b_name} aborted early after sibling infra failure"
+
+    detail = {}
+    if b_id:
+        try:
+            detail = _prpc_json_post(
+                "https://cr-buildbucket.appspot.com/prpc/buildbucket.v2.Builds/GetBuild",
+                {"id": b_id, "mask": {"fields": "status,summaryMarkdown,steps"}},
+            )
+        except (urllib.error.URLError, OSError, ValueError):
+            detail = {}
+
+    detail_sum = _build_summary_markdown(detail) or summary
+    steps = detail.get("steps") or []
+    failed_steps = [
+        st.get("name", "")
+        for st in steps
+        if st.get("status") in ("FAILURE", "INFRA_FAILURE")
+        and "|" not in st.get("name", "")
+        and st.get("name") not in ("lookup_builder_gn_args", "TRYJOB FAILURE")
+    ]
+    compile_failed = any(
+        st.get("name", "").lower().startswith("compile")
+        and st.get("status") in ("FAILURE", "INFRA_FAILURE")
+        for st in steps
+    ) or "step _compile" in detail_sum.lower()
+
+    if "bot_update" in failed_steps or _is_bot_update_patch_failure(detail_sum):
+        return True, f"{b_name} hit bot_update patch failure"
+    if status == "INFRA_FAILURE" and not compile_failed:
+        return True, f"{b_name} hit Buildbucket INFRA_FAILURE"
+    if compile_failed:
+        # Consumer compile errors in cc/blink omit "skia" in truncated summaries; require trunk
+        # compile (without patch) to have failed as well before clearing a compile step
+        wo_patch_failed = any(
+            st.get("name", "").lower().startswith("compile")
+            and "without patch" in st.get("name", "").lower()
+            and st.get("status") in ("FAILURE", "INFRA_FAILURE")
+            for st in steps
+        )
+        non_skia_sig = _extract_chromium_non_skia_compile_sig(detail_sum, stems)
+        if wo_patch_failed and non_skia_sig:
+            return True, f"{b_name} failed compiling unrelated target broken without patch"
+        return False, f"{b_name} failed in compile"
+
+    combined_low = (detail_sum + "\n" + "\n".join(failed_steps)).lower()
+    touches_stems = any(st and st.lower() in combined_low for st in stems)
+    # Browser/WebSocket disconnects can stem from GPU/renderer crashes; only pure ADB transport
+    # disconnects without crash/Skia tokens clear without cross-CL reproduction
+    adb_disconnect = ("deviceunreachableerror", "adbshellcommandfailederror")
+    crash_tokens = ("skia", "crash", "minidump", "sigsegv", "sigabrt", "gpuprocess", "renderer")
+    if (
+        any(k in combined_low for k in adb_disconnect)
+        and not touches_stems
+        and not any(tok in combined_low for tok in crash_tokens)
+        and not SKIA_SYMBOL_RE.search(detail_sum)
+    ):
+        return True, f"{b_name} hit an ADB device disconnect"
+
+    failed_tests = _extract_chromium_summary_failed_tests(detail_sum)
+    if failed_tests and not touches_stems:
+        sib_cl = _chromium_tests_fail_on_sibling_cl(cr_cl, b_name, b_id, failed_tests)
+        if sib_cl:
+            return (
+                True,
+                f"{b_name} failed on pre-existing Chromium flake "
+                f"(also failing on https://crrev.com/c/{sib_cl})",
+            )
+
+    step_desc = ", ".join(failed_steps[:2]) or "test failure"
+    return False, f"{b_name} failed ({step_desc})"
+
+
+def _fetch_chromium_roll_builds(cr_cl):
+    """Fetch Buildbucket tryjobs on the newest populated patchset of Chromium roll `cr_cl`."""
+    # Check newest patchsets first so PS3 retries are never shadowed by earlier PS2 builds
+    for cand_ps in (3, 2, 1):
+        try:
+            resp = _prpc_json_post(
+                "https://cr-buildbucket.appspot.com/prpc/buildbucket.v2.Builds/SearchBuilds",
+                {
+                    "predicate": {
+                        "gerritChanges": [{
+                            "host": "chromium-review.googlesource.com",
+                            "project": "chromium/src",
+                            "change": cr_cl,
+                            "patchset": cand_ps,
+                        }]
+                    },
+                    "pageSize": 200,
+                    "mask": {"fields": "id,status,summaryMarkdown,builder,createTime"},
+                },
+            )
+        except (urllib.error.URLError, OSError, ValueError):
+            continue
+        if resp.get("builds"):
+            return resp["builds"], cand_ps
+    return [], 2
+
+
+def _partition_chromium_roll_builds(roll_builds):
+    """Split Chromium roll builds into (passed_compile_builders, unpassed_latest_by_builder)."""
+    passed_all = {
+        (b.get("builder") or {}).get("builder")
+        for b in roll_builds
+        if b.get("status") == "SUCCESS" and (b.get("builder") or {}).get("builder")
+    }
+    # Exclude non-compiling presubmit/analysis bots so C++ compilation is proven before passing
+    passed_compile = {
+        name for name in passed_all
+        if "presubmit" not in name.lower() and "tricium" not in name.lower()
+    }
+    unpassed = {}
+    for b in roll_builds:
+        b_name = (b.get("builder") or {}).get("builder") or ""
+        if not b_name or b_name in passed_all:
+            continue
+        if b.get("status") != "SUCCESS":
+            cur = unpassed.get(b_name)
+            if not cur or b.get("createTime", "") >= cur.get("createTime", ""):
+                unpassed[b_name] = b
+    return passed_compile, unpassed
+
+
+def triage_canary_chromium_failure(cl, ps, bb_build, sw_tasks, touched_files):
+    """Verify a red Canary-Chromium build by inspecting CQ trybots on its Chromium roll CL."""
+    nm = _not_mergeable_verdict(bb_build)
+    if nm:
+        return {**nm, "builder": "Canary-Chromium"}
+    summary_md = _build_summary_markdown(bb_build)
+    task = _find_builder_task(cl, ps, "Canary-Chromium", bb_build, sw_tasks)
+    if not task:
+        return {
+            "verdict": "INFRA_NO_TASK", "builder": "Canary-Chromium", "our_part_passed": False,
+            "summary": summary_md or "Canary-Chromium Swarming task not found",
+        }
+    stdout = swarming_task_stdout(task.get("taskId"))
+    m_cr = CHROMIUM_ROLL_URL_RE.search(stdout)
+    if not m_cr:
+        if "merge conflict" in stdout.lower() or "failed to cherry-pick" in stdout.lower():
+            return {
+                "verdict": "MERGE_CONFLICT_WITH_CHROMIUM_SKIA",
+                "builder": "Canary-Chromium",
+                "our_part_passed": False,
+                "summary": "The CL does not apply cleanly to Chromium's pinned Skia revision",
+            }
+        return {
+            "verdict": "INFRA_NO_ROLL_CL", "builder": "Canary-Chromium", "our_part_passed": False,
+            "summary": "Canary-Chromium did not produce a Chromium roll CL",
+        }
+
+    cr_cl = int(m_cr.group(1))
+    roll_builds, roll_ps = _fetch_chromium_roll_builds(cr_cl)
+    if not roll_builds:
+        return {
+            "verdict": "CANNOT_TRIAGE", "builder": "Canary-Chromium", "cr_cl": cr_cl,
+            "our_part_passed": False,
+            "summary": f"No Chromium trybot builds found on https://crrev.com/c/{cr_cl}",
+        }
+
+    passed_compile, unpassed = _partition_chromium_roll_builds(roll_builds)
+    if not passed_compile:
+        return {
+            "verdict": "CL_SUSPECTED_REGRESSION", "builder": "Canary-Chromium",
+            "cr_cl": cr_cl, "roll_ps": roll_ps, "our_part_passed": False,
+            "summary": f"0 compiling Chromium CQ trybots passed on https://crrev.com/c/{cr_cl}/{roll_ps}",
+        }
+    if not unpassed:
+        draft = (
+            f"Canary-Chromium exited before CQ completion on roll "
+            f"https://crrev.com/c/{cr_cl}/{roll_ps}, where all {len(passed_compile)} "
+            f"compiling Chromium CQ trybots passed."
+        )
+        return {
+            "verdict": "UNRELATED_HEAD_BREAKAGE", "builder": "Canary-Chromium",
+            "cr_cl": cr_cl, "roll_ps": roll_ps, "passed_count": len(passed_compile),
+            "our_part_passed": True, "sanitized_draft": draft,
+        }
+
+    stems = [os.path.splitext(os.path.basename(f))[0] for f in touched_files]
+    unrelated_reasons, suspect_reasons = [], []
+    for b_name in sorted(unpassed):
+        has_infra_peer = any(
+            other != b_name and (
+                peer.get("status") == "INFRA_FAILURE"
+                or _is_bot_update_patch_failure(_build_summary_markdown(peer))
+            )
+            for other, peer in unpassed.items()
+        )
+        ok, why = _classify_chromium_failed_build(
+            cr_cl, b_name, unpassed[b_name], has_infra_peer, stems
+        )
+        (unrelated_reasons if ok else suspect_reasons).append(why)
+
+    our_part_passed = not suspect_reasons
+    verdict = "UNRELATED_HEAD_BREAKAGE" if our_part_passed else "CL_SUSPECTED_REGRESSION"
+    sanitized_draft = (
+        f"Canary-Chromium roll (https://crrev.com/c/{cr_cl}/{roll_ps}) passed on "
+        f"{len(passed_compile)} Chromium CQ trybots; remaining failure(s) were unrelated "
+        f"to this CL ({'; '.join(unrelated_reasons)})."
+        if our_part_passed else ""
+    )
+    return {
+        "verdict": verdict, "builder": "Canary-Chromium", "cr_cl": cr_cl, "roll_ps": roll_ps,
+        "passed_count": len(passed_compile), "our_part_passed": our_part_passed,
+        "summary": "; ".join(suspect_reasons or unrelated_reasons),
+        "sanitized_draft": sanitized_draft,
+    }
+
+
+def _sso_fetch_json(url, timeout=20):
+    """Fetch an internal Gerrit JSON payload via sso_client, returning None when unavailable."""
+    sso = shutil.which("sso_client")
+    if not sso:
+        return None
+    try:
+        proc = subprocess.run(
+            [sso, "--location", f"--url={url}"],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    raw = proc.stdout.strip()
+    if raw.startswith(")]}'"):
+        raw = raw[4:].lstrip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def _android_build_api_get(path_and_query, timeout=15):
+    """Read an AnTS / Android Build v3 path using a luci-auth androidbuild.internal token."""
+    scope = "https://www.googleapis.com/auth/androidbuild.internal"
+    try:
+        tok_proc = subprocess.run(
+            [LUCI_AUTH, "token", "-scopes", scope],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return ""
+    tok = (tok_proc.stdout or "").strip()
+    if tok_proc.returncode != 0 or not tok:
+        return ""
+    url = "https://androidbuildinternal.googleapis.com/" + path_and_query.lstrip("/")
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "canary-advisor", "Authorization": f"Bearer {tok}"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read(512 * 1024).decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError):
+        return ""
+
+
+def _is_skia_related_android_text(text, stems=()):
+    """Return True if an Android log or test record mentions Skia, HWUI, Minikin, or stems."""
+    low = (text or "").lower()
+    keywords = (
+        "external/skia", "libskia", "libhwui", "hwui", "renderengine", "skparagraph",
+        "skottie", "skshaper", "skunicode", "skcms", "ctsuirendering", "ctsgraphics",
+        "ctstext", "minikin", "typeface", "staticlayout", "pdfium", "surfaceflinger", "skia",
+    )
+    if any(kw in low for kw in keywords):
+        return True
+    if any(st and st.lower() in low for st in stems):
+        return True
+    return bool(SKIA_SYMBOL_RE.search(text or ""))
+
+
+def _is_skia_related_android_test_failure(tr, stems=()):
+    """Evaluate one AnTS testResult record for Skia/HWUI involvement (handling linker errors)."""
+    ident = tr.get("testIdentifier") or {}
+    dbg = tr.get("debugInfo") or {}
+    err_msg = dbg.get("errorMessage") or ""
+    m_sym = ANDROID_MISSING_SYMBOL_RE.search(err_msg)
+    if m_sym:
+        sym = m_sym.group(1)
+        return (
+            _is_skia_related_android_text(sym, stems)
+            or bool(ANDROID_MANGLED_SKIA_RE.search(sym))
+        )
+    combined = "\n".join([
+        ident.get("module") or "",
+        ident.get("testClass") or "",
+        ident.get("method") or "",
+        err_msg,
+        dbg.get("trace") or "",
+    ])
+    return _is_skia_related_android_text(combined, stems)
+
+
+def _parse_treehugger_verdict(messages):
+    """Extract the newest latest-revision TreeHugger verdict from Gerrit `messages`."""
+    rev_nums = [int(m.get("_revision_number") or 0) for m in messages if m.get("_revision_number")]
+    latest_rev = max(rev_nums) if rev_nums else 0
+    passed_count = ""
+    test_fails, build_fails = [], []
+    retry_passed = False
+    has_unparsed_fail = False
+
+    for msg in reversed(messages):
+        msg_rev = int(msg.get("_revision_number") or 0)
+        if latest_rev and msg_rev and msg_rev != latest_rev:
+            continue
+        tag = msg.get("tag") or ""
+        body = msg.get("message") or ""
+        if "TreeHugger" not in tag and "FAIL:" not in body and "Presubmit-Verified" not in body:
+            continue
+        m_sum = TREEHUGGER_SUMMARY_RE.search(body)
+        if m_sum and not passed_count:
+            m_cnt = TREEHUGGER_PASSED_COUNT_RE.search(m_sum.group(1))
+            if m_cnt:
+                passed_count = m_cnt.group(1)
+        no_vote_removal = "Removed Presubmit-Verified" not in body
+        is_explicit_fail = (
+            "Verify-Fail" in tag
+            or "TreeHugger:Verify-Fail" in body
+            or (no_vote_removal and ("Presubmit-Verified-1" in body or "Presubmit-Verified-2" in body))
+            or bool(re.search(r"^## Presubmit finished:[^\n]*\bfailed\b", body, re.I | re.M))
+            or bool(re.search(r"^FAIL:", body, re.MULTILINE))
+        )
+        is_pass = not is_explicit_fail and (
+            "Verify-Pass" in tag
+            or "TreeHugger:Verify-Pass" in body
+            or (no_vote_removal and ("Presubmit-Verified+1" in body or "Presubmit-Verified+2" in body))
+            or ("TreeHugger" in tag and "Presubmit finished" in body and "failed" not in body.lower())
+        )
+        if is_pass:
+            retry_passed = True
+            break
+        if is_explicit_fail:
+            for suite, inv_id, dev, caused_by in TREEHUGGER_TEST_FAIL_RE.findall(body):
+                test_fails.append((suite.strip(), inv_id.strip(), dev.strip(), caused_by.strip()))
+            for label, build_id, target in TREEHUGGER_BUILD_FAIL_RE.findall(body):
+                build_fails.append((label.strip(), build_id.strip(), target.strip()))
+            total_fail_lines = len(re.findall(r"^FAIL:", body, re.MULTILINE))
+            has_unparsed_fail = (
+                len(test_fails) + len(build_fails) < total_fail_lines
+                or (not test_fails and not build_fails)
+            )
+            # Never walk backward past a newer Verify-Fail into an older Verify-Pass
+            break
+    return retry_passed, passed_count, build_fails, test_fails, has_unparsed_fail
+
+
+def _fetch_android_build_error_log(build_id, target):
+    """Fetch `build_error.log` text via `/url` redirect or JSON `signedUrl` payload."""
+    enc_bid = urllib.parse.quote(build_id, safe="")
+    enc_tgt = urllib.parse.quote(target, safe="")
+    raw = _android_build_api_get(
+        f"/android/internal/build/v3/builds/{enc_bid}/{enc_tgt}/"
+        "attempts/latest/artifacts/logs%2Fbuild_error.log/url"
+    )
+    if raw.lstrip().startswith("{"):
+        try:
+            signed_url = (json.loads(raw) or {}).get("signedUrl") or ""
+        except json.JSONDecodeError:
+            signed_url = ""
+        if signed_url.startswith("https://"):
+            req = urllib.request.Request(signed_url, headers={"User-Agent": "canary-advisor"})
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    return resp.read(512 * 1024).decode("utf-8", "replace")
+            except (urllib.error.URLError, OSError):
+                return ""
+    return raw
+
+
+def _android_build_fails_unrelated(ag_cl, build_fails, stems):
+    """Verify every Android build failure in `build_fails` is outside Skia/HWUI/consumers."""
+    for label, build_id, target in build_fails:
+        log_str = _fetch_android_build_error_log(build_id, target)
+        if (
+            not log_str
+            or not ANDROID_COMPILER_ERROR_RE.search(log_str)
+            or _is_skia_related_android_text(log_str, stems)
+        ):
+            return {
+                "verdict": "CL_SUSPECTED_REGRESSION", "builder": "Canary-Android",
+                "ag_cl": ag_cl, "our_part_passed": False,
+                "summary": f"Android build failure on {label} (ag/{ag_cl})",
+            }
+    return {
+        "verdict": "UNRELATED_HEAD_BREAKAGE", "builder": "Canary-Android", "ag_cl": ag_cl,
+        "our_part_passed": True,
+        "summary": f"Unrelated non-Skia Android build failure on ag/{ag_cl}",
+        "sanitized_draft": (
+            "Canary-Android failed to build an unrelated non-Skia platform target; "
+            "external/skia compiled with 0 Skia errors."
+        ),
+    }
+
+
+def _fetch_ants_failed_tests(inv_id, max_pages=5):
+    """Fetch paginated AnTS failed/error test results; return (complete_ok, results)."""
+    results = []
+    page_token = ""
+    enc_inv = urllib.parse.quote(inv_id, safe="")
+    for _ in range(max_pages):
+        tok_arg = f"&pageToken={urllib.parse.quote(page_token, safe='')}" if page_token else ""
+        raw = _android_build_api_get(
+            f"/android/internal/build/v3/tests?invocationId={enc_inv}"
+            f"&testStatuses=testError&testStatuses=fail&maxResults=50{tok_arg}"
+        )
+        try:
+            payload = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            return False, []
+        results.extend(payload.get("testResults") or [])
+        page_token = (payload.get("nextPageToken") or "").strip()
+        if not page_token:
+            return bool(results), results
+    # Fail closed if AnTS still has uninspected pages past max_pages
+    return False, []
+
+
+def _android_test_fails_unrelated(ag_cl, test_fails, stems, passed_count, count_note):
+    """Verify every TreeHugger test failure is pure infra or has 0 Skia/HWUI/consumer frames."""
+    internal_notes = []
+    saw_ants_verified = False
+    for suite, inv_id, _dev, caused_by in test_fails:
+        if "INFRA_ERROR" in caused_by:
+            internal_notes.append(f"{suite} ({caused_by})")
+            continue
+        ok, test_results = _fetch_ants_failed_tests(inv_id)
+        if not ok or any(_is_skia_related_android_test_failure(tr, stems) for tr in test_results):
+            return {
+                "verdict": "CL_SUSPECTED_REGRESSION", "builder": "Canary-Android", "ag_cl": ag_cl,
+                "our_part_passed": False,
+                "summary": f"Android test failure in {suite} ({inv_id}) on ag/{ag_cl}",
+            }
+        saw_ants_verified = True
+        internal_notes.append(f"{suite} (0 Skia/HWUI frames)")
+    if not saw_ants_verified and int(passed_count or 0) <= 0:
+        return {
+            "verdict": "CL_SUSPECTED_REGRESSION", "builder": "Canary-Android", "ag_cl": ag_cl,
+            "our_part_passed": False,
+            "summary": f"0 passing Android presubmit targets recorded on ag/{ag_cl}",
+        }
+    return {
+        "verdict": "UNRELATED_HEAD_BREAKAGE", "builder": "Canary-Android", "ag_cl": ag_cl,
+        "our_part_passed": True,
+        "summary": f"Unrelated Android failure(s) on ag/{ag_cl}: {', '.join(internal_notes)}",
+        "sanitized_draft": (
+            f"Canary-Android built Skia cleanly ({count_note}) and failed only in unrelated "
+            f"non-Skia platform tests/infrastructure with 0 Skia or HWUI failures."
+        ),
+    }
+
+
+def triage_canary_android_failure(cl, ps, bb_build, sw_tasks, touched_files):
+    """Verify a red Canary-Android build via internal TreeHugger messages and AnTS results."""
+    nm = _not_mergeable_verdict(bb_build)
+    if nm:
+        return {**nm, "builder": "Canary-Android"}
+    summary_md = _build_summary_markdown(bb_build)
+    task = _find_builder_task(cl, ps, "Canary-Android", bb_build, sw_tasks)
+    if not task:
+        return {
+            "verdict": "INFRA_NO_TASK", "builder": "Canary-Android", "our_part_passed": False,
+            "summary": summary_md or "Canary-Android Swarming task not found",
+        }
+    stdout = swarming_task_stdout(task.get("taskId"))
+    m_ag = ANDROID_ROLL_URL_RE.search(stdout)
+    if not m_ag:
+        if "merge conflict" in stdout.lower() or "failed to cherry-pick" in stdout.lower():
+            return {
+                "verdict": "MERGE_CONFLICT_WITH_ANDROID_SKIA",
+                "builder": "Canary-Android",
+                "our_part_passed": False,
+                "summary": "The CL does not apply cleanly to Android external/skia",
+            }
+        return {
+            "verdict": "INFRA_NO_ROLL_CL", "builder": "Canary-Android", "our_part_passed": False,
+            "summary": "Canary-Android did not produce an Android roll CL",
+        }
+
+    ag_cl = int(m_ag.group(1))
+    change = _sso_fetch_json(
+        f"https://googleplex-android-review.git.corp.google.com/changes/{ag_cl}"
+        "?o=MESSAGES&o=LABELS"
+    )
+    if not isinstance(change, dict):
+        return {
+            "verdict": "CANNOT_TRIAGE", "builder": "Canary-Android", "ag_cl": ag_cl,
+            "our_part_passed": False,
+            "summary": f"Could not fetch Android roll CL ag/{ag_cl} via sso_client",
+        }
+
+    stems = [os.path.splitext(os.path.basename(f))[0] for f in touched_files]
+    retry_passed, passed_count, build_fails, test_fails, unparsed = _parse_treehugger_verdict(
+        change.get("messages") or []
+    )
+    count_note = (
+        f"{passed_count} targets passed, 0 build failures" if passed_count else "0 build failures"
+    )
+    if retry_passed:
+        return {
+            "verdict": "UNRELATED_HEAD_BREAKAGE", "builder": "Canary-Android", "ag_cl": ag_cl,
+            "our_part_passed": True, "summary": f"TreeHugger Verify-Pass on retry ({count_note})",
+            "sanitized_draft": (
+                f"Canary-Android exited on an initial presubmit flake/infrastructure error, and "
+                f"Android presubmit passed on automatic retry ({count_note})."
+            ),
+        }
+    if unparsed:
+        return {
+            "verdict": "CL_SUSPECTED_REGRESSION", "builder": "Canary-Android", "ag_cl": ag_cl,
+            "our_part_passed": False,
+            "summary": f"Unparsed TreeHugger presubmit failure on ag/{ag_cl}",
+        }
+    if not build_fails and not test_fails:
+        return {
+            "verdict": "CANNOT_TRIAGE", "builder": "Canary-Android", "ag_cl": ag_cl,
+            "our_part_passed": False,
+            "summary": f"No finalized TreeHugger verdict found on ag/{ag_cl}",
+        }
+    if build_fails:
+        return _android_build_fails_unrelated(ag_cl, build_fails, stems)
+    return _android_test_fails_unrelated(ag_cl, test_fails, stems, passed_count, count_note)
+
+
+def triage_other_canary_failure(cl, ps, builder, bb_build, sw_tasks, _touched_files):
+    """Fail-closed fallback for unknown canary builders whose roll target has no verifier."""
     nm = _not_mergeable_verdict(bb_build)
     if nm:
         return {**nm, "builder": builder}
     task = _find_builder_task(cl, ps, builder, bb_build, sw_tasks)
     summary_md = _build_summary_markdown(bb_build)
-    if not task and summary_md:
+    if not task:
         return {
             "verdict": "INFRA_NO_TASK", "builder": builder, "our_part_passed": False,
-            "summary": summary_md,
+            "summary": summary_md or f"{builder} Swarming task not found",
         }
-    tid = task.get("taskId") if task else ""
-    stdout = swarming_task_stdout(tid) if tid else ""
-    stems = [os.path.splitext(os.path.basename(f))[0] for f in touched_files]
-    mentions_cl = any(st in stdout for st in stems) if stems else False
-
-    if not mentions_cl:
-        return {
-            "verdict": "UNRELATED_HEAD_BREAKAGE", "builder": builder,
-            "our_part_passed": True,
-            "summary": f"{builder} failed without mentioning modified Skia files",
-            "sanitized_draft": (
-                f"{builder} failed on unrelated upstream targets outside the files "
-                "modified in this CL."
-            ),
-        }
+    # Never mark a canary UNRELATED_HEAD_BREAKAGE from Swarming stdout alone: canary.go only
+    # prints the roll URL and panic line, never downstream compiler/test diagnostics
     return {
-        "verdict": "CL_SUSPECTED_REGRESSION", "builder": builder,
-        "our_part_passed": False,
-        "summary": f"{builder} failure intersects modified Skia files or symbols",
+        "verdict": "CANNOT_TRIAGE", "builder": builder, "our_part_passed": False,
+        "summary": (
+            f"{builder} failed (task {task.get('taskId')}); inspect the downstream roll CL "
+            "before saving a Gerrit draft"
+        ),
     }
 
 
@@ -1350,7 +2163,44 @@ def dm_failure_lines(stdout, limit=20):
     return []
 
 
+def _merge_patchset_draft_notes(old_msg, note_text):
+    """Merge per-canary paragraphs into `old_msg`, replacing stale notes for the same canary."""
+    paras = [p.strip() for p in (old_msg or "").split("\n\n") if p.strip()]
+    for note in [n.strip() for n in (note_text or "").split("\n\n") if n.strip()]:
+        if note in paras:
+            continue
+        m_prefix = re.match(r"^(Canary-[A-Za-z0-9_-]+)\b", note)
+        replaced = False
+        if m_prefix:
+            prefix_re = re.compile(rf"^{re.escape(m_prefix.group(1))}\b")
+            for idx, existing in enumerate(paras):
+                if prefix_re.match(existing):
+                    paras[idx] = note
+                    replaced = True
+                    break
+        if not replaced:
+            paras.append(note)
+    return "\n\n".join(paras)
+
+
+def _is_top_level_ps_draft(item):
+    """Return True if a Gerrit draft item is a standalone /PATCHSET_LEVEL comment (not a reply)."""
+    return (
+        not item.get("in_reply_to")
+        and not item.get("line")
+        and (item.get("side") or "REVISION") == "REVISION"
+    )
+
+
 def save_gerrit_patchset_draft(cl, ps, note_text, unresolved=False):
+    """Save or update an unpublished /PATCHSET_LEVEL draft on Gerrit after public leak checks."""
+    leak = find_public_draft_leak(note_text)
+    if leak:
+        print(
+            f"ERROR: refusing to save Gerrit draft on CL {cl} PS {ps}: "
+            f"internal leak detected ({leak!r})"
+        )
+        return False
     json_headers = {"Content-Type": "application/json; charset=UTF-8"}
     drafts_url = f"{GERRIT}/a/changes/{cl}/revisions/{ps}/drafts"
     resp_pair, err = _gerrit_authed_urlopen(drafts_url, headers=json_headers, timeout=15)
@@ -1364,16 +2214,16 @@ def save_gerrit_patchset_draft(cl, ps, note_text, unresolved=False):
         print(f"WARNING: failed to parse Gerrit drafts on CL {cl} PS {ps}: {e}")
         return False
 
-    existing_ps_draft = None
-    for item in drafts_data.get("/PATCHSET_LEVEL", []):
-        existing_ps_draft = item
-        break
+    existing_ps_draft = next(
+        (item for item in (drafts_data.get("/PATCHSET_LEVEL") or []) if _is_top_level_ps_draft(item)),
+        None,
+    )
 
     if existing_ps_draft:
         old_msg = existing_ps_draft.get("message", "")
-        if note_text in old_msg:
+        new_msg = _merge_patchset_draft_notes(old_msg, note_text)
+        if new_msg == old_msg.strip():
             return True
-        new_msg = f"{old_msg}\n\n{note_text}".strip()
         target_url = f"{drafts_url}/{existing_ps_draft['id']}"
         payload = json.dumps({
             "path": "/PATCHSET_LEVEL",
@@ -1397,36 +2247,69 @@ def save_gerrit_patchset_draft(cl, ps, note_text, unresolved=False):
     return put_pair[0] in (200, 201)
 
 
+def has_gerrit_canary_drafts(cl, ps, canary_names):
+    """Return True if CL `cl` PS `ps` already has a /PATCHSET_LEVEL draft naming every canary."""
+    if not canary_names:
+        return True
+    drafts_url = f"{GERRIT}/a/changes/{cl}/revisions/{ps}/drafts"
+    resp_pair, _err = _gerrit_authed_urlopen(
+        drafts_url, headers={"Content-Type": "application/json; charset=UTF-8"}, timeout=15
+    )
+    if resp_pair is None:
+        return False
+    try:
+        raw = resp_pair[1].decode("utf-8", "replace")
+        drafts_data = json.loads(raw[4:] if raw.startswith(")]}'") else raw)
+    except json.JSONDecodeError:
+        return False
+    combined = "\n".join(
+        (item.get("message") or "")
+        for item in (drafts_data.get("/PATCHSET_LEVEL") or [])
+        if _is_top_level_ps_draft(item)
+    )
+    return all(cb in combined for cb in canary_names)
+
+
 def cmd_triage(args):
+    """Triage ASAN, Canary, and platform trybots across same-tree patchsets and save drafts."""
     meta = load_cl(args.cl, ps=args.ps)
     cl = meta["cl"]
-    ps = meta["patchset"]
+    ps = int(meta["patchset"])
+    cur_ps = int(meta.get("current_patchset") or ps)
     files = parse_diff(meta["diff"])
     touched_files = list(files.keys())
 
-    builds = bb_cl_builds(cl, ps)
-    build_ps = ps
-    if not builds and code_patchset(meta, ps) != ps:
-        build_ps = code_patchset(meta, ps)
-        builds = bb_cl_builds(cl, build_ps)
-    sw_tasks = swarming_tasks_for_cl(cl, build_ps)
+    code_ps = int(code_patchset(meta, ps))
+    # Standalone /PATCHSET_LEVEL drafts belong on current_patchset when only commit messages
+    # changed after `ps`, and same_tree_builds scans through `draft_ps` to keep newer retries
+    draft_ps = cur_ps if cur_ps > ps and int(code_patchset(meta, cur_ps)) == code_ps else ps
+    builds, code_ps, source_ps = same_tree_builds(cl, meta, draft_ps)
+    sw_cache = {}
 
-    results = {"cl": cl, "patchset": ps, "builds": {}, "drafts_saved": []}
+    results = {
+        "cl": cl, "patchset": ps, "draft_patchset": draft_ps, "builds": {}, "drafts_saved": [],
+    }
     drafts_to_save = []
+    red_unrelated_canaries = []
+    manual_proof_canaries = []
 
     print(f"# Tryjob Triage: CL {cl} PS {ps} ({meta['subject']})\n")
-    if build_ps != ps:
+    other_ps = [p for p in source_ps if p != ps]
+    if code_ps != ps and other_ps:
+        ps_list = ", ".join(f"PS {p}" for p in source_ps)
         print(f"Note: PS {ps} changes only the commit message (NO_CODE_CHANGE); "
-              f"using tryjobs from PS {build_ps}\n")
+              f"using same-tree tryjobs from {ps_list}\n")
 
     asan_builder = next((b for b in builds if "ASAN" in b), None)
     if asan_builder:
         b_info = builds[asan_builder]
+        b_ps = int(b_info.get("_patchset") or ps)
         status = b_info.get("status", "UNKNOWN")
         print(f"## ASAN: {asan_builder} [{status}]")
         if status in ("FAILURE", "INFRA_FAILURE"):
+            sw_tasks = _tasks_for_ps(cl, b_ps, sw_cache)
             triage_res = triage_asan_failure(
-                cl, build_ps, asan_builder, b_info, sw_tasks, touched_files)
+                cl, b_ps, asan_builder, b_info, sw_tasks, touched_files)
             results["builds"][asan_builder] = triage_res
             print(f"- Verdict: {triage_res['verdict']}")
             print(f"- Summary: {triage_res['summary']}")
@@ -1450,18 +2333,25 @@ def cmd_triage(args):
     if canary_builders:
         for cb in canary_builders:
             b_info = builds[cb]
+            b_ps = int(b_info.get("_patchset") or ps)
             status = b_info.get("status", "UNKNOWN")
             print(f"\n## Canary: {cb} [{status}]")
             if status in ("FAILURE", "INFRA_FAILURE"):
+                sw_tasks = _tasks_for_ps(cl, b_ps, sw_cache)
                 if cb == "Canary-G3":
                     triage_res = triage_canary_g3_failure(
-                        cl, build_ps, b_info, sw_tasks, touched_files)
+                        cl, b_ps, b_info, sw_tasks, touched_files)
+                elif cb == "Canary-Chromium":
+                    triage_res = triage_canary_chromium_failure(
+                        cl, b_ps, b_info, sw_tasks, touched_files)
+                elif cb == "Canary-Android":
+                    triage_res = triage_canary_android_failure(
+                        cl, b_ps, b_info, sw_tasks, touched_files)
                 else:
                     triage_res = triage_other_canary_failure(
-                        cl, build_ps, cb, b_info, sw_tasks, touched_files)
+                        cl, b_ps, cb, b_info, sw_tasks, touched_files)
                 results["builds"][cb] = triage_res
                 print(f"- Verdict: {triage_res['verdict']}")
-                # Surface summary on pre-roll verdicts (NOT_MERGEABLE, MISSING_APPROVAL, INFRA_*)
                 if triage_res.get("summary") and not triage_res.get("sanitized_draft"):
                     print(f"- Summary: {triage_res['summary']}")
                 if cb == "Canary-G3" and triage_res.get("g3_cl"):
@@ -1471,10 +2361,20 @@ def cmd_triage(args):
                         print("- Failing Targets:")
                         for tgt in triage_res["targets"]:
                             print(f"  * {tgt['target']}: {tgt['reason']}")
+                elif cb == "Canary-Chromium" and triage_res.get("cr_cl"):
+                    roll_ps = triage_res.get("roll_ps") or 1
+                    print(f"- Roll CL: https://crrev.com/c/{triage_res['cr_cl']}/{roll_ps}")
+                elif cb == "Canary-Android" and triage_res.get("ag_cl"):
+                    print(f"- Roll CL: http://ag/{triage_res['ag_cl']}")
+                    if triage_res.get("summary") and triage_res.get("sanitized_draft"):
+                        print(f"- Internal Triage: {triage_res['summary']}")
                 if triage_res.get("sanitized_draft"):
                     print(f"- Sanitized Draft Message: \"{triage_res['sanitized_draft']}\"")
                     if triage_res.get("verdict") == "UNRELATED_HEAD_BREAKAGE":
                         drafts_to_save.append(triage_res["sanitized_draft"])
+                        red_unrelated_canaries.append(cb)
+                elif triage_res.get("verdict") not in ("NOT_MERGEABLE", "MISSING_APPROVAL"):
+                    manual_proof_canaries.append(cb)
             else:
                 results["builds"][cb] = {"verdict": status}
                 print(f"- Verdict: {status}")
@@ -1487,6 +2387,7 @@ def cmd_triage(args):
     other_builders = [b for b in builds if "ASAN" not in b and not b.startswith("Canary-")]
     for ob in other_builders:
         b_info = builds[ob]
+        b_ps = int(b_info.get("_patchset") or ps)
         status = b_info.get("status", "UNKNOWN")
         print(f"\n## Trybot: {ob} [{status}]")
         # Android NativeFonts bots omit --paragraph_fonts extra_fonts (dm_flags.go:1813), so
@@ -1514,7 +2415,8 @@ def cmd_triage(args):
         triage_res = _not_mergeable_verdict(b_info) or {}
         failures = []
         if not triage_res:
-            task = _find_builder_task(cl, build_ps, ob, b_info, sw_tasks)
+            sw_tasks = _tasks_for_ps(cl, b_ps, sw_cache)
+            task = _find_builder_task(cl, b_ps, ob, b_info, sw_tasks)
             tid = task.get("taskId", "") if task else ""
             rid = swarming_task_result(tid).get("runId", "") if tid else ""
             for step in ("dm", "symbolized_dm", "test_skia"):
@@ -1543,6 +2445,16 @@ def cmd_triage(args):
             print("\n".join(failures))
             print("```")
 
+    draft_saved_ok = False
+    if args.save_draft and drafts_to_save:
+        combined_draft = "\n\n".join(drafts_to_save)
+        draft_saved_ok = save_gerrit_patchset_draft(cl, draft_ps, combined_draft, unresolved=False)
+        if draft_saved_ok:
+            print(f"\n[GERRIT DRAFT SAVED] Saved sanitized draft to CL {cl} PS {draft_ps}")
+            results["drafts_saved"].append(combined_draft)
+        else:
+            print(f"\n[GERRIT DRAFT FAILED] Could not save draft to CL {cl} PS {draft_ps}")
+
     # Canary triage checks unrelated breakage against the roll; trybot triage cannot, so stays red
     if not results["builds"]:
         print("\nTRYJOBS: NOT GREEN (no tryjobs found)")
@@ -1552,25 +2464,41 @@ def cmd_triage(args):
                and not (b.startswith("Canary-") and r.get("verdict") == "UNRELATED_HEAD_BREAKAGE")]
         print("\nTRYJOBS: " + (f"NOT GREEN ({', '.join(sorted(red))})" if red else "ALL GREEN"))
         green = [b for b, r in results["builds"].items() if r.get("verdict") == "SUCCESS"]
-        if not red and meta.get("status", "NEW") == "NEW":
-            gaps = tested_block_gaps(cl, ps, green)
+        is_open = meta.get("status", "NEW") == "NEW"
+        if not red and is_open:
+            gaps = tested_block_gaps(cl, draft_ps, green)
             print("TESTED BLOCK: " + (f"STALE (missing: {', '.join(gaps)})" if gaps else "OK"))
             if gaps:
+                re_save_hint = (
+                    f", and then re-run `python3 {os.path.abspath(__file__)} triage --cl {cl} "
+                    "--save-draft` so the red-canary /PATCHSET_LEVEL draft lands on the new PS"
+                    if red_unrelated_canaries
+                    else ""
+                )
                 print("AGENT ACTION (update the CL description before the final summary): add "
                       "the trybots and the latest local runs (suites, test counts, OS/arch, "
                       "build type, compiler, font/Unicode backend) plus Not tested: to the "
                       "Tested: block, then `git commit --amend` and `luci-auth context -- git cl "
                       "upload -f --commit-description=+` (a NO_CODE_CHANGE patchset keeps these "
-                      "tryjob results)")
-
-    if args.save_draft and drafts_to_save:
-        combined_draft = "\n\n".join(drafts_to_save)
-        ok = save_gerrit_patchset_draft(cl, ps, combined_draft, unresolved=False)
-        if ok:
-            print(f"\n[GERRIT DRAFT SAVED] Saved sanitized draft to CL {cl} PS {ps}")
-            results["drafts_saved"].append(combined_draft)
-        else:
-            print(f"\n[GERRIT DRAFT FAILED] Could not save draft to CL {cl} PS {ps}")
+                      f"tryjob results){re_save_hint}")
+        if is_open and red_unrelated_canaries:
+            has_draft = draft_saved_ok or has_gerrit_canary_drafts(
+                cl, draft_ps, red_unrelated_canaries
+            )
+            if has_draft:
+                print(f"CANARY DRAFT: OK (present on PS {draft_ps})")
+            else:
+                missing_str = ", ".join(red_unrelated_canaries)
+                print(f"CANARY DRAFT: MISSING on PS {draft_ps} ({missing_str})")
+                print(f"AGENT ACTION (save sanitized red-canary draft on current PS {draft_ps}): "
+                      f"python3 {os.path.abspath(__file__)} triage --cl {cl} --save-draft")
+        if is_open and manual_proof_canaries:
+            listed = ", ".join(manual_proof_canaries)
+            print(f"AGENT NOTE ({listed}): if manual stack-trace / roll-CL triage proves our part "
+                  f"passed and the failure is unrelated to this CL, you MUST save a sanitized "
+                  f"English /PATCHSET_LEVEL Gerrit draft on the final current patchset via "
+                  f"`python3 ~/.gemini/config/scripts/gerrit_draft.py save --cl {cl} --resolved "
+                  f"...` explaining what passed for our part and why the canary failed.")
 
     if args.json:
         print(f"\n```json\n{json.dumps(results, indent=2)}\n```")
@@ -1633,19 +2561,18 @@ def cmd_try(args):
 
 
 def cmd_watch(args):
+    """Poll Buildbucket and Gerrit across same-tree patchsets until tryjobs finish, then triage."""
     cl = args.cl
-    meta = load_cl(cl, ps=args.ps)
-    ps = meta["patchset"]
+    init_meta = load_cl(cl, ps=args.ps)
+    ps = init_meta["patchset"]
     poll_sec = args.poll_sec
     timeout_sec = args.timeout_min * 60
     start_time = time.time()
 
     print(f"# Watching Tryjobs on CL {cl} PS {ps} (poll={poll_sec}s, timeout={args.timeout_min}m)")
 
-    files = parse_diff(meta["diff"])
+    files = parse_diff(init_meta["diff"])
     asan_retried = False
-    # Description-only patchsets get no new tryjobs, so watch the last patchset with code
-    code_ps = code_patchset(meta, ps)
 
     while True:
         elapsed = time.time() - start_time
@@ -1666,28 +2593,37 @@ def cmd_watch(args):
         if cl_status in ("MERGED", "ABANDONED"):
             print(f"\nWAKEUP_REASON: CL_{cl_status}")
             return 0
+        poll_meta = meta if meta.get("kinds") else init_meta
         latest_ps = max(int(meta.get("patchset") or 0), int(meta.get("current_patchset") or 0))
         if latest_ps > ps:
-            print(f"\nWAKEUP_REASON: SUPERSEDED (PS {ps} replaced by PS {latest_ps})")
-            return 0
+            # Keep watching across NO_CODE_CHANGE description updates when --ps was not pinned
+            if (
+                not args.ps
+                and poll_meta.get("kinds")
+                and int(code_patchset(poll_meta, latest_ps)) == int(code_patchset(poll_meta, ps))
+            ):
+                print(f"Note: PS {latest_ps} is NO_CODE_CHANGE; advancing watch PS {ps} -> {latest_ps}")
+                ps = latest_ps
+                init_meta = {**init_meta, "kinds": poll_meta["kinds"], "current_patchset": ps}
+            else:
+                print(f"\nWAKEUP_REASON: SUPERSEDED (PS {ps} replaced by PS {latest_ps})")
+                return 0
 
         # Retry on the next tick if Buildbucket, Swarming, or Gerrit RPCs fail transiently
         try:
-            build_ps = ps
-            builds = bb_cl_builds(cl, ps)
-            if not builds and code_ps != ps:
-                build_ps = code_ps
-                builds = bb_cl_builds(cl, build_ps)
-            sw_tasks = swarming_tasks_for_cl(cl, build_ps)
+            builds, _code_ps, _source_ps = same_tree_builds(cl, poll_meta, ps)
+            sw_cache = {}
 
             asan_builder = next((b for b in builds if "ASAN" in b), None)
             if asan_builder:
                 b_info = builds[asan_builder]
+                b_ps = int(b_info.get("_patchset") or ps)
                 status = b_info.get("status")
                 if status in ("FAILURE", "INFRA_FAILURE"):
                     touched = list(files.keys())
+                    sw_tasks = _tasks_for_ps(cl, b_ps, sw_cache)
                     triage_res = triage_asan_failure(
-                        cl, build_ps, asan_builder, b_info, sw_tasks, touched
+                        cl, b_ps, asan_builder, b_info, sw_tasks, touched
                     )
                     if triage_res["verdict"] == "INFRA_MISHAP" and not asan_retried:
                         print(f"ASAN infra mishap on {asan_builder}; retrying once")

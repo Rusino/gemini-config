@@ -68,26 +68,40 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
      as a background command (`WaitMsBeforeAsync=500`, `NotificationTimeoutSeconds=5400`). The
      watcher exits with `WAKEUP_REASON: NO_TRYJOBS` when the patchset still has no build after
      `--no-builds-min` (10) minutes; treat that as a failed trigger, not as a slow bot.
-   - **On Red Canary (`UNRELATED_HEAD_BREAKAGE`)**: `watch --save-draft` automatically verifies
-     `CheckTestsSkia` + `blaze query somepath` for all failing targets and saves a strictly
-     sanitized English `/PATCHSET_LEVEL` draft on Gerrit (never leaking internal `google3` target
-     paths or `cl/N` numbers to public Gerrit). When woken up, the agent shows the internal triage
-     table in chat and confirms the draft is saved. (No Gerrit draft is created when Canary is
-     green).
-   - **Approval gate (`TRYJOBS:` line)**: `triage` (and `watch` on wakeup) ends with
-     `TRYJOBS: ALL GREEN` or `TRYJOBS: NOT GREEN (<builders>)`, covering ASAN, canaries, and
-     other trybots such as Mac `NativeFonts_Fontations` (with the dm `Failures:` block). Never
-     give LGTM / `CR+1` / a CLEAN verdict before `ALL GREEN`; if the watcher was killed, run
-     `triage` by hand. `stop_guard.py` (`[TRYJOB GATE GUARD]`) enforces this.
-   - **Description gate (`TESTED BLOCK:` line)**: on `ALL GREEN` for an open CL, `triage` checks
-     the current patchset's commit message and prints `TESTED BLOCK: OK` or
-     `TESTED BLOCK: STALE (missing: ...)`. On `STALE`, update the `Tested:` block from the
-     latest local runs and trybots (`skills/amnesia-precommit/references/commit_message.md`)
-     and re-upload with `--commit-description=+` before the final summary. A description-only patchset
-     (`NO_CODE_CHANGE`) gets no new tryjobs; `triage` and `watch` read the tryjobs of the last
-     patchset with code, so do not re-trigger ASAN for it.
-   - **On Red Canary (`CL_SUSPECTED_REGRESSION`)**: Report the failing target, `somepath` chain,
-     and stack trace to the user and proceed to fix.
+   - **On Red Canary (`UNRELATED_HEAD_BREAKAGE` across All Canaries)**: `watch --save-draft` and
+     `triage --save-draft` verify the downstream roll CL for **all** Skia canaries (`Canary-G3`
+     via `skia_gardener` `CheckTestsSkia` + `blaze query somepath`, `Canary-Chromium` via
+     Buildbucket CQ trybots on `https://crrev.com/c/<roll_cl>/<ps>`, and `Canary-Android` via
+     TreeHugger messages + AnTS build/test logs) before returning `UNRELATED_HEAD_BREAKAGE`, and
+     save a strictly sanitized English `/PATCHSET_LEVEL` draft on the CL's **current** patchset
+     (enforcing `PUBLIC_DRAFT_LEAK_RE` so zero `cl/`, `ag/`, `cr/`, `b/`, `go/`, `googleplex`,
+     `//...` paths, or AnTS `I<15+>` IDs reach public Gerrit). When woken up, show the internal
+     triage summary in chat and confirm the draft is saved. (No Gerrit draft is created when a
+     canary is green.)
+   - **Approval gate (`TRYJOBS:` line)**: `triage` (and `watch` on wakeup) aggregates tryjobs
+     across all same-tree patchsets (`code_patchset..ps`) and ends with `TRYJOBS: ALL GREEN` or
+     `TRYJOBS: NOT GREEN (<builders>)`, covering ASAN, canaries, and other trybots such as Mac
+     `NativeFonts_Fontations` (with the dm `Failures:` block). Never give LGTM / `CR+1` / a CLEAN
+     verdict before `ALL GREEN`; if the watcher was killed, run `triage` by hand. `stop_guard.py`
+     (`[TRYJOB GATE GUARD]`) enforces this.
+   - **Description & Red-Canary Draft gates (`TESTED BLOCK:` and `CANARY DRAFT:` lines)**: on
+     `ALL GREEN` for an open CL, `triage` checks the current patchset's commit message and prints
+     `TESTED BLOCK: OK` or `TESTED BLOCK: STALE (missing: ...)`, plus `CANARY DRAFT: OK` or
+     `CANARY DRAFT: MISSING on PS <draft_ps>` whenever any canary failed on unrelated/infra
+     targets. On `STALE`, update the `Tested:` block from the latest local runs and trybots
+     (`skills/amnesia-precommit/references/commit_message.md`) and re-upload with
+     `--commit-description=+` before the final summary; if any canary was red (`UNRELATED_HEAD_BREAKAGE`),
+     re-run `python3 ~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py triage --cl <CL> --save-draft`
+     right after the `NO_CODE_CHANGE` upload so the `/PATCHSET_LEVEL` draft lands on the new
+     latest patchset instead of staying stale on an older patchset. Do not re-trigger ASAN or
+     canaries for a `NO_CODE_CHANGE` patchset.
+   - **On Red Canary (`CL_SUSPECTED_REGRESSION` or `CANNOT_TRIAGE`)**: Inspect the failing target,
+     dependency chain, or roll logs before blaming the CL. If the failure is caused by the CL,
+     report the target and stack trace to the user and proceed to fix. If manual stack-trace or
+     roll-CL inspection proves our part passed and the failure is unrelated, you MUST save a
+     sanitized English `/PATCHSET_LEVEL` Gerrit draft on the final current patchset via
+     `python3 ~/.gemini/config/scripts/gerrit_draft.py save --cl <CL> --resolved --message "..."`
+     stating specifically what passed for our part and why the canary failed.
    - **On Red Canary / ASAN (`NOT_MERGEABLE`)**: Build failed at Task Scheduler startup because the
      CL has merge conflicts against `main`; ask the author to rebase (do not re-trigger on the
      conflicting patchset).
@@ -100,18 +114,21 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
      - **Own CLs (`amnesia-precommit` / Self-Review)**: Reproduce and fix in an isolated worktree,
        verify with a local ASAN build, upload the fix (or ask first if reviewers have already
        voted `CR+1`), re-trigger ASAN + `watch`, and report to the user.
-6. A red canary is not automatically the CL's fault. Follow the **Canary-G3 Runtime & Triage
-   Procedure** below before blaming the CL.
+6. A red canary is not automatically the CL's fault, nor is it automatically unrelated. Follow the
+   **Canary Triage Procedures (`Canary-G3`, `Canary-Chromium`, `Canary-Android`)** below to prove
+   our part passed before saving any Gerrit draft.
 
-## Canary-G3 Runtime & Triage Procedure
+## Canary Triage Procedures (`Canary-G3`, `Canary-Chromium`, `Canary-Android`)
 
-- **Runtime**: `Canary-G3` can run for ~55 minutes. Do not assume timeout after 8–10 minutes.
+### `Canary-G3`
+- **Runtime**: `Canary-G3` can run for ~55 minutes (or hit a 3h Swarming wrapper timeout after checks finish). Do not assume timeout after 8–10 minutes.
 - **Triage on Red Canary**:
-  1. Extract the canary roll CL number from the swarming task stdout (`Canary roll [ http://cl/N ]`) or the Swarming UI task step.
+  1. Extract the canary roll CL number from the Swarming task stdout (`Canary roll [ http://cl/N ]`) or the Swarming UI task step.
   2. Run the automated google3 triage command:
      ```bash
      cd ~/.gemini/jetski/scratch/skia_gardener && go run . -triage-google3 -cl <g3 canary CL>
      ```
+     Confirm `CheckTestsSkia` actually `PASSED` (`failed == 0`, no `setup_error`).
   3. Perform 3-step per-target verification for every failing target:
      - **(a) Transitive Dependency Path Check**: Never conclude a target does not use Skia/SkParagraph based on local directory searches (dependencies are often transitive, e.g. `map3d -> impress canvas -> skparagraph`). From `/google/src/head/depot/google3`, query the exact dependency path:
        ```bash
@@ -125,6 +142,16 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
        ```bash
        autorepair readonly investigate --sponge_id=<id> --test_target=<target>
        ```
+
+### `Canary-Chromium`
+- `canary_advisor.py triage` extracts `https://chromium-review.googlesource.com/c/.../<roll_cl>` from Swarming stdout and queries Buildbucket `SearchBuilds` + `GetBuild` on `chromium/src` across roll patchsets `(3, 2, 1)` newest-first:
+  - Requires `> 0` green compiling Chromium CQ trybots (`passed_compile`, excluding `presubmit`/`tricium`), fails closed on `SCHEDULED`/`STARTED`/`CANCELED` builders, clears bots that passed on retry, and classifies remaining failures (`bot_update` GoB lag patch failure, early shard abort paired with an independent infra peer, Buildbucket `INFRA_FAILURE`, non-Skia compile error where `compile (without patch)` also failed, pure ADB device disconnect without crash/Skia tokens, or pre-existing Chromium test flake reproduced on sibling non-autoroll CLs).
+  - Any Skia/caller compile error where trunk compiled cleanly or unproven test failure fails closed (`CL_SUSPECTED_REGRESSION`). Public Gerrit drafts cite `https://crrev.com/c/<roll_cl>/<ps>` (never `cr/<N>`).
+
+### `Canary-Android`
+- `canary_advisor.py triage` extracts the `googleplex-android-review` roll CL from Swarming stdout, fetches `?o=MESSAGES&o=LABELS` via `sso_client`, and inspects paginated AnTS build/test logs via `androidbuildinternal.googleapis.com` (`luci-auth token -scopes https://www.googleapis.com/auth/androidbuild.internal`):
+  - Evaluates the newest latest-revision TreeHugger message (failing closed on unparsed `FAIL:` lines) and marks `UNRELATED_HEAD_BREAKAGE` only when TreeHugger passed on automatic retry (`Verify-Pass` / `Presubmit-Verified+1`), when `build_error.log` fails strictly outside Skia/HWUI/consumers, or when failing test runs are TradeFed `*INFRA_ERROR` / AnTS failures with `0` Skia, HWUI, RenderEngine, Minikin, CtsText, PDFium, SurfaceFlinger, or touched-stem frames.
+  - Public Gerrit drafts must never contain `ag/<N>`, `googleplex`, `*.corp.google.com` / `*.corp.goog`, internal device/lunch target names, or AnTS `I<15+>` invocation IDs.
 
 ## ASAN Sanitizer & Font-Backend Trybot Selection
 

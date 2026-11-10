@@ -1035,6 +1035,834 @@ class TestCanaryAdvisor(unittest.TestCase):
       ):
         self.assertEqual(canary_advisor.tested_block_gaps(1, 1, [asan]), want)
 
+  # Checks R135 Canary-G3 triage on PascalCase skia_gardener output with settled Skia TAP checks
+  # and fail-closed rejection when a TAP check fails without diagnosed targets
+  def test_triage_canary_g3_verifies_pascal_case_runs_and_settled_tap_checks(self):
+    sw_tasks = [{"name": "Canary-G3", "taskId": "task_g3_1421656"}]
+    stdout = "Canary roll [ http://cl/1017394648 ] failed\n"
+    gardener_ok = {
+        "Verdict": "DEPENDENT_HEAD_UNKNOWN",
+        "Runs": [
+            {"id": "r1", "check": "CheckTestsSkia", "status": "PASSED", "failed": 0},
+            {"id": "r2", "check": "CheckSkiaDependents", "status": "PASSED", "failed": 0},
+            {"id": "r3", "check": "CheckTestsSkiaDependents", "status": "FAILED", "failed": 2},
+            {"id": "", "check": "Presubmit", "status": "RUNNING", "failed": 0},
+        ],
+        "Targets": [
+            {"target": "//cloud/ml/translate:handler_test", "kind": "INFRA",
+             "failed_in_latest": True},
+            {"target": "//video/youtube/scotty:handler_test", "kind": "UNKNOWN",
+             "failed_in_latest": True},
+        ],
+    }
+    ok_proc = type("P", (), {"returncode": 0, "stdout": json.dumps(gardener_ok), "stderr": ""})()
+    with patch("os.path.isdir", return_value=True), patch.object(
+        canary_advisor, "swarming_task_stdout", return_value=stdout
+    ), patch.object(
+        canary_advisor.subprocess, "run", return_value=ok_proc
+    ), patch.object(
+        canary_advisor, "check_google3_somepath", return_value=(False, [])
+    ):
+      res = canary_advisor.triage_canary_g3_failure(
+          1421656, 3, {"status": "INFRA_FAILURE"}, sw_tasks, ["src/core/SkScalerContext.cpp"]
+      )
+    self.assertEqual(res["verdict"], "UNRELATED_HEAD_BREAKAGE")
+    self.assertTrue(res["our_part_passed"])
+    self.assertEqual(canary_advisor.find_public_draft_leak(res["sanitized_draft"]), "")
+    self.assertIn("CheckTestsSkia", res["sanitized_draft"])
+
+    # Undiagnosed FAILED CheckSkiaDependents (failed == 0, empty Targets) must fail closed
+    gardener_undiagnosed = {
+        "Verdict": "UNKNOWN",
+        "Runs": [
+            {"id": "r1", "check": "CheckTestsSkia", "status": "PASSED", "failed": 0},
+            {"id": "r2", "check": "CheckSkiaDependents", "status": "FAILED", "failed": 0},
+            {"id": "r3", "check": "CheckTestsSkiaDependents", "status": "PASSED", "failed": 0},
+        ],
+        "Targets": [],
+    }
+    bad_proc = type(
+        "P", (), {"returncode": 0, "stdout": json.dumps(gardener_undiagnosed), "stderr": ""}
+    )()
+    with patch("os.path.isdir", return_value=True), patch.object(
+        canary_advisor, "swarming_task_stdout", return_value=stdout
+    ), patch.object(canary_advisor.subprocess, "run", return_value=bad_proc):
+      bad_res = canary_advisor.triage_canary_g3_failure(
+          1421656, 3, {"status": "FAILURE"}, sw_tasks, ["src/core/SkScalerContext.cpp"]
+      )
+    self.assertEqual(bad_res["verdict"], "CL_SUSPECTED_REGRESSION")
+    self.assertFalse(bad_res["our_part_passed"])
+    self.assertEqual(bad_res["sanitized_draft"], "")
+
+  # Checks R135 Canary-Chromium roll verification: bot_update GoB lag after green CQ bots clears,
+  # whereas a Skia compile error or unproven test failure stays CL_SUSPECTED_REGRESSION
+  def test_triage_canary_chromium_proves_cq_roll_passed_and_fails_closed_on_skia_regression(self):
+    sw_tasks = [{"name": "Canary-Chromium", "taskId": "task_cr_1"}]
+    stdout = "Created roll https://chromium-review.googlesource.com/c/chromium/src/+/8774115\n"
+    search_ok = {
+        "builds": [
+            {"id": "101", "status": "SUCCESS", "builder": {"builder": "linux-rel"}},
+            {"id": "102", "status": "SUCCESS", "builder": {"builder": "mac-rel"}},
+            {
+                "id": "103",
+                "status": "INFRA_FAILURE",
+                "builder": {"builder": "ios-simulator"},
+                "summaryMarkdown": "patch error log attached to bot_update",
+            },
+        ]
+    }
+    with patch.object(canary_advisor, "swarming_task_stdout", return_value=stdout), patch.object(
+        canary_advisor, "_prpc_json_post", side_effect=[{"builds": []}, search_ok]
+    ):
+      res = canary_advisor.triage_canary_chromium_failure(
+          1421656, 3, {"status": "FAILURE"}, sw_tasks, ["src/core/SkScalerContext.cpp"]
+      )
+    self.assertEqual(res["verdict"], "UNRELATED_HEAD_BREAKAGE")
+    self.assertTrue(res["our_part_passed"])
+    self.assertIn("https://crrev.com/c/8774115/2", res["sanitized_draft"])
+    self.assertIn("passed on 2 Chromium CQ trybots", res["sanitized_draft"])
+    self.assertEqual(canary_advisor.find_public_draft_leak(res["sanitized_draft"]), "")
+
+    # Skia compile failure on a Chromium roll trybot must fail closed as CL_SUSPECTED_REGRESSION
+    search_skia_err = {
+        "builds": [
+            {"id": "201", "status": "SUCCESS", "builder": {"builder": "ios-simulator"}},
+            {
+                "id": "202",
+                "status": "FAILURE",
+                "builder": {"builder": "linux-rel"},
+                "summaryMarkdown": "step _compile failed:\n```\n../../third_party/skia/src/core/"
+                "SkScalerContext.cpp:99: error: undeclared identifier\n```",
+            },
+        ]
+    }
+    detail_skia_err = {
+        "status": "FAILURE",
+        "summaryMarkdown": search_skia_err["builds"][1]["summaryMarkdown"],
+        "steps": [{"name": "compile (with patch)", "status": "FAILURE"}],
+    }
+    with patch.object(canary_advisor, "swarming_task_stdout", return_value=stdout), patch.object(
+        canary_advisor, "_prpc_json_post", side_effect=[search_skia_err, detail_skia_err]
+    ):
+      bad = canary_advisor.triage_canary_chromium_failure(
+          1421656, 3, {"status": "FAILURE"}, sw_tasks, ["src/core/SkScalerContext.cpp"]
+      )
+    self.assertEqual(bad["verdict"], "CL_SUSPECTED_REGRESSION")
+    self.assertFalse(bad["our_part_passed"])
+    self.assertEqual(bad["sanitized_draft"], "")
+
+  # Checks R135 Canary-Android verification across TreeHugger retry, non-Skia AnTS failures, and
+  # HWUI/Skia stack failures while ensuring zero internal identifiers leak into drafts
+  def test_triage_canary_android_proves_treehugger_or_ants_and_strips_internal_leaks(self):
+    sw_tasks = [{"name": "Canary-Android", "taskId": "task_ag_1"}]
+    stdout = (
+        "Roll https://googleplex-android-review.googlesource.com/c/"
+        "platform/external/skia/+/43653565 failed\n"
+    )
+    retry_change = {
+        "messages": [
+            {
+                "tag": "autogenerated:TreeHugger:Verify-Fail",
+                "message": (
+                    "## Presubmit finished: 119 passed, 1 failed\n"
+                    "FAIL: Tests failed for [pts-bot](https://android-build.googleplex.com/"
+                    "builds/tests/view?invocationId=I8570000105396069325) on menari_lte. "
+                    "Caused by UNKNOWN_INFRA_ERROR"
+                ),
+            },
+            {
+                "tag": "autogenerated:TreeHugger:Verify-Pass",
+                "message": "Patch Set 1: Presubmit-Verified+1\n\n## Presubmit finished: 121 passed",
+            },
+        ]
+    }
+    with patch.object(canary_advisor, "swarming_task_stdout", return_value=stdout), patch.object(
+        canary_advisor, "_sso_fetch_json", return_value=retry_change
+    ):
+      res_retry = canary_advisor.triage_canary_android_failure(
+          1421816, 4, {"status": "FAILURE"}, sw_tasks, ["src/ports/SkFontHost_FreeType.cpp"]
+      )
+    self.assertEqual(res_retry["verdict"], "UNRELATED_HEAD_BREAKAGE")
+    self.assertTrue(res_retry["our_part_passed"])
+    self.assertIn("121 targets passed, 0 build failures", res_retry["sanitized_draft"])
+    self.assertEqual(canary_advisor.find_public_draft_leak(res_retry["sanitized_draft"]), "")
+    self.assertNotIn("menari_lte", res_retry["sanitized_draft"])
+    self.assertNotIn("43653565", res_retry["sanitized_draft"])
+
+    # Non-Skia AnTS failure passes, whereas HWUI/Skia frame fails closed as CL_SUSPECTED_REGRESSION
+    fail_change = {"messages": [retry_change["messages"][0].copy()]}
+    fail_change["messages"][0]["message"] = (
+        "## Presubmit finished: 120 passed, 1 failed\n"
+        "FAIL: Tests failed for [CtsNetTestCases](https://android-build.googleplex.com/"
+        "builds/tests/view?invocationId=I8570000105396069999) on pixel_fold"
+    )
+    non_skia_ants = json.dumps({
+        "testResults": [{
+            "testIdentifier": {"module": "CtsNetTestCases", "testClass": " ConnectivityTest"},
+            "debugInfo": {"errorMessage": "SocketTimeoutException", "trace": "android.net.Foo"},
+        }]
+    })
+    hwui_ants = json.dumps({
+        "testResults": [{
+            "testIdentifier": {"module": "CtsUiRenderingTestCases", "testClass": "CanvasTest"},
+            "debugInfo": {"errorMessage": "crash", "trace": "android::uirenderer::SkiaPipeline"},
+        }]
+    })
+    with patch.object(canary_advisor, "swarming_task_stdout", return_value=stdout), patch.object(
+        canary_advisor, "_sso_fetch_json", return_value=fail_change
+    ), patch.object(canary_advisor, "_android_build_api_get", return_value=non_skia_ants):
+      res_ants_ok = canary_advisor.triage_canary_android_failure(
+          1421816, 4, {"status": "FAILURE"}, sw_tasks, ["src/ports/SkFontHost_FreeType.cpp"]
+      )
+    self.assertEqual(res_ants_ok["verdict"], "UNRELATED_HEAD_BREAKAGE")
+    self.assertEqual(canary_advisor.find_public_draft_leak(res_ants_ok["sanitized_draft"]), "")
+
+    with patch.object(canary_advisor, "swarming_task_stdout", return_value=stdout), patch.object(
+        canary_advisor, "_sso_fetch_json", return_value=fail_change
+    ), patch.object(canary_advisor, "_android_build_api_get", return_value=hwui_ants):
+      res_hwui = canary_advisor.triage_canary_android_failure(
+          1421816, 4, {"status": "FAILURE"}, sw_tasks, ["src/ports/SkFontHost_FreeType.cpp"]
+      )
+    self.assertEqual(res_hwui["verdict"], "CL_SUSPECTED_REGRESSION")
+    self.assertFalse(res_hwui["our_part_passed"])
+
+  # Checks R135 public Gerrit leak blocker and in-place per-canary draft paragraph replacement
+  def test_save_gerrit_patchset_draft_blocks_corporate_leaks_and_replaces_same_canary_note(self):
+    leaking_inputs = [
+        "Canary-G3 failed on http://cl/1017355544.",
+        "Canary-Android failed on ag/43653565.",
+        "Canary-Chromium failed on " + "cr" + "/8774115.",
+        "Tracked in b/493545344.",
+        "See go/skia-g3-policy for details.",
+        "Host https://android-build.googleplex.com/builds failed.",
+        "Target //video/youtube/scotty:handler_test failed.",
+        "Invocation I8570000105396069325 timed out.",
+    ]
+    with patch.object(canary_advisor, "_gerrit_authed_urlopen") as mock_http:
+      for bad_text in leaking_inputs:
+        with self.subTest(bad_text=bad_text), patch("sys.stdout", io.StringIO()):
+          self.assertFalse(canary_advisor.save_gerrit_patchset_draft(1421656, 4, bad_text))
+      mock_http.assert_not_called()
+
+    merged = canary_advisor._merge_patchset_draft_notes(
+        "Reviewer note.\n\nCanary-Chromium roll (https://crrev.com/c/1/1) failed.",
+        "Canary-Chromium roll (https://crrev.com/c/1/2) passed on 48 CQ trybots.\n\n"
+        "Canary-G3 failed only on unrelated downstream targets.",
+    )
+    self.assertEqual(
+        merged,
+        "Reviewer note.\n\n"
+        "Canary-Chromium roll (https://crrev.com/c/1/2) passed on 48 CQ trybots.\n\n"
+        "Canary-G3 failed only on unrelated downstream targets.",
+    )
+
+  # Checks R135 NO_CODE_CHANGE multi-patchset aggregation (PS2+PS3 -> PS4) and saving the red-canary
+  # /PATCHSET_LEVEL draft onto current_patchset (PS4) so it never lands stale on PS3
+  def test_cmd_triage_aggregates_no_code_change_patchsets_and_saves_draft_on_current_ps(self):
+    asan = "Test-Ubuntu24.04-Clang-GCE-CPU-AVX2-x86_64-Debug-All-ASAN"
+    meta_ps3 = {
+        "cl": 1421656,
+        "patchset": 3,
+        "current_patchset": 4,
+        "status": "NEW",
+        "subject": "[SkScalerContext] Harden mask-filtered getImage",
+        "owner": "jlavrova@google.com",
+        "diff": "diff --git a/src/core/SkScalerContext.cpp b/src/core/SkScalerContext.cpp\n+// x\n",
+        "googler_cr_plus_one": True,
+        "kinds": {1: "REWORK", 2: "REWORK", 3: "NO_CODE_CHANGE", 4: "NO_CODE_CHANGE"},
+    }
+    ps_builds = {
+        2: {asan: {"id": "802", "status": "SUCCESS", "createTime": "2026-11-09T20:00:00Z"}},
+        3: {"Canary-Chromium": {"id": "803", "status": "FAILURE",
+                                "createTime": "2026-11-09T21:00:00Z"}},
+        4: {},
+    }
+    cr_verdict = {
+        "verdict": "UNRELATED_HEAD_BREAKAGE",
+        "builder": "Canary-Chromium",
+        "cr_cl": 8774115,
+        "roll_ps": 2,
+        "our_part_passed": True,
+        "sanitized_draft": (
+            "Canary-Chromium roll (https://crrev.com/c/8774115/2) passed on 48 Chromium CQ trybots."
+        ),
+    }
+
+    # Without --save-draft and no existing draft on PS 4 -> CANARY DRAFT: MISSING on PS 4
+    buf_missing = io.StringIO()
+    args_no_save = type(
+        "Args", (), {"cl": "1421656", "ps": "4", "save_draft": False, "json": False}
+    )()
+    with patch.object(
+        canary_advisor, "load_cl", return_value={**meta_ps3, "patchset": 4}
+    ), patch.object(
+        canary_advisor, "bb_cl_builds", side_effect=lambda _cl, p: ps_builds[int(p)]
+    ), patch.object(
+        canary_advisor, "swarming_tasks_for_cl", return_value=[]
+    ), patch.object(
+        canary_advisor, "triage_canary_chromium_failure", return_value=cr_verdict
+    ), patch.object(
+        canary_advisor, "tested_block_gaps", return_value=[]
+    ), patch.object(
+        canary_advisor, "has_gerrit_canary_drafts", return_value=False
+    ), patch("sys.stdout", buf_missing):
+      canary_advisor.cmd_triage(args_no_save)
+    out_missing = buf_missing.getvalue()
+    self.assertIn("TRYJOBS: ALL GREEN", out_missing)
+    self.assertIn("CANARY DRAFT: MISSING on PS 4 (Canary-Chromium)", out_missing)
+
+    # With --save-draft while inspecting PS 3 -> still saves onto current_patchset PS 4!
+    saved_calls = []
+    buf_save = io.StringIO()
+    args_save = type("Args", (), {"cl": "1421656", "ps": "3", "save_draft": True, "json": False})()
+    with patch.object(canary_advisor, "load_cl", return_value=meta_ps3), patch.object(
+        canary_advisor, "bb_cl_builds", side_effect=lambda _cl, p: ps_builds[int(p)]
+    ), patch.object(
+        canary_advisor, "swarming_tasks_for_cl", return_value=[]
+    ), patch.object(
+        canary_advisor, "triage_canary_chromium_failure", return_value=cr_verdict
+    ), patch.object(
+        canary_advisor, "tested_block_gaps", return_value=[]
+    ), patch.object(
+        canary_advisor,
+        "save_gerrit_patchset_draft",
+        side_effect=lambda cl, ps, msg, unresolved=False: saved_calls.append((cl, ps, msg)) or True,
+    ), patch("sys.stdout", buf_save):
+      res_save = canary_advisor.cmd_triage(args_save)
+    out_save = buf_save.getvalue()
+    self.assertEqual(res_save["draft_patchset"], 4)
+    self.assertEqual(len(saved_calls), 1)
+    self.assertEqual(saved_calls[0][1], 4)
+    self.assertIn("CANARY DRAFT: OK (present on PS 4)", out_save)
+    self.assertIn("TESTED BLOCK: OK", out_save)
+
+  # Checks R135 cmd_watch across NO_CODE_CHANGE patchsets: watching PS4 waits for a canary running
+  # on PS3 instead of exiting early after seeing only PS2 ASAN
+  def test_cmd_watch_polls_across_same_tree_no_code_change_patchsets(self):
+    asan = "Test-Ubuntu24.04-Clang-GCE-CPU-AVX2-x86_64-Debug-All-ASAN"
+    meta = {
+        "cl": 1421656,
+        "patchset": 4,
+        "current_patchset": 4,
+        "status": "NEW",
+        "subject": "Test",
+        "owner": "jlavrova@google.com",
+        "diff": "diff --git a/src/core/SkScalerContext.cpp b/src/core/SkScalerContext.cpp\n+// x\n",
+        "googler_cr_plus_one": True,
+        "kinds": {1: "REWORK", 2: "REWORK", 3: "NO_CODE_CHANGE", 4: "NO_CODE_CHANGE"},
+    }
+    tick = {"n": 0}
+
+    def fake_bb(_cl, ps):
+      ps = int(ps)
+      if ps == 2:
+        return {asan: {"id": "1", "status": "SUCCESS", "createTime": "2026-11-09T20:00:00Z"}}
+      if ps == 3:
+        st = "STARTED" if tick["n"] == 0 else "FAILURE"
+        tick["n"] += 1
+        return {"Canary-Chromium": {"id": "2", "status": st, "createTime": "2026-11-09T21:00:00Z"}}
+      return {}
+
+    args = type(
+        "Args",
+        (),
+        {
+            "cl": "1421656",
+            "ps": "4",
+            "poll_sec": 1,
+            "timeout_min": 5,
+            "no_builds_min": 10,
+            "save_draft": True,
+            "json": False,
+        },
+    )()
+    buf = io.StringIO()
+    with patch.object(canary_advisor, "load_cl", return_value=meta), patch.object(
+        canary_advisor, "bb_cl_builds", side_effect=fake_bb
+    ), patch.object(canary_advisor, "cmd_triage", return_value={}) as mock_triage, patch.object(
+        canary_advisor.time, "sleep"
+    ) as mock_sleep, patch("sys.stdout", buf):
+      rc = canary_advisor.cmd_watch(args)
+    self.assertEqual(rc, 0)
+    self.assertEqual(mock_sleep.call_count, 1)
+    mock_triage.assert_called_once()
+    self.assertIn("ALL_TRYJOBS_COMPLETE", buf.getvalue())
+
+  # Checks R135 B1/B2 fail-closed Chromium roll gates: PS3-first lookup, presubmit-only/CANCELED/
+  # STARTED rejection, caller compile without-patch check, browser crash, and mutual shard aborts
+  def test_triage_canary_chromium_fails_closed_on_presubmit_only_unpassed_and_caller_compile(self):
+    sw_tasks = [{"name": "Canary-Chromium", "taskId": "task_cr_b1"}]
+    stdout = "Created roll https://chromium-review.googlesource.com/c/chromium/src/+/8774115\n"
+
+    # PS3 must be queried before PS2, and presubmit-only + CANCELED C++ bot must fail closed
+    seen_ps = []
+
+    def fake_ps_order(_url, payload, timeout=15):
+      ps = payload["predicate"]["gerritChanges"][0]["patchset"]
+      seen_ps.append(ps)
+      if ps == 3:
+        return {
+            "builds": [
+                {"id": "1", "status": "SUCCESS", "builder": {"builder": "chromium_presubmit"}},
+                {"id": "2", "status": "CANCELED", "builder": {"builder": "linux-rel"}},
+            ]
+        }
+      return {"builds": [{"id": "3", "status": "SUCCESS", "builder": {"builder": "linux-rel"}}]}
+
+    with patch.object(canary_advisor, "swarming_task_stdout", return_value=stdout), patch.object(
+        canary_advisor, "_prpc_json_post", side_effect=fake_ps_order
+    ):
+      res_presub = canary_advisor.triage_canary_chromium_failure(
+          1421656, 3, {"status": "FAILURE"}, sw_tasks, ["src/core/SkScalerContext.cpp"]
+      )
+    self.assertEqual(seen_ps[0], 3)
+    self.assertEqual(res_presub["verdict"], "CL_SUSPECTED_REGRESSION")
+    self.assertFalse(res_presub["our_part_passed"])
+
+    # STARTED trybot alongside green linux-rel must fail closed
+    search_started = {
+        "builds": [
+            {"id": "10", "status": "SUCCESS", "builder": {"builder": "linux-rel"}},
+            {"id": "11", "status": "STARTED", "builder": {"builder": "win-rel"}},
+        ]
+    }
+    with patch.object(canary_advisor, "swarming_task_stdout", return_value=stdout), patch.object(
+        canary_advisor, "_prpc_json_post", return_value=search_started
+    ):
+      res_started = canary_advisor.triage_canary_chromium_failure(
+          1421656, 3, {"status": "FAILURE"}, sw_tasks, ["src/core/SkScalerContext.cpp"]
+      )
+    self.assertFalse(res_started["our_part_passed"])
+
+    # Caller compile error in cc/paint without "skia" in snippet fails closed when compile
+    # (without patch) passed, and clears only when compile (without patch) also failed
+    cc_sum = "step _compile failed:\n```\n../../cc/paint/paint_op_buffer.cc:44: error: no match\n```"
+    search_cc = {
+        "builds": [
+            {"id": "20", "status": "SUCCESS", "builder": {"builder": "mac-rel"}},
+            {"id": "21", "status": "FAILURE", "builder": {"builder": "linux-rel"},
+             "summaryMarkdown": cc_sum},
+        ]
+    }
+    detail_wo_ok = {
+        "status": "FAILURE",
+        "summaryMarkdown": cc_sum,
+        "steps": [
+            {"name": "compile (with patch)", "status": "FAILURE"},
+            {"name": "compile (without patch)", "status": "SUCCESS"},
+        ],
+    }
+    detail_wo_fail = {
+        "status": "FAILURE",
+        "summaryMarkdown": cc_sum,
+        "steps": [
+            {"name": "compile (with patch)", "status": "FAILURE"},
+            {"name": "compile (without patch)", "status": "FAILURE"},
+        ],
+    }
+    with patch.object(canary_advisor, "swarming_task_stdout", return_value=stdout), patch.object(
+        canary_advisor, "_prpc_json_post", side_effect=[search_cc, detail_wo_ok]
+    ):
+      self.assertFalse(
+          canary_advisor.triage_canary_chromium_failure(
+              1421656, 3, {"status": "FAILURE"}, sw_tasks, ["src/core/SkScalerContext.cpp"]
+          )["our_part_passed"]
+      )
+    with patch.object(canary_advisor, "swarming_task_stdout", return_value=stdout), patch.object(
+        canary_advisor, "_prpc_json_post", side_effect=[search_cc, detail_wo_fail]
+    ):
+      self.assertTrue(
+          canary_advisor.triage_canary_chromium_failure(
+              1421656, 3, {"status": "FAILURE"}, sw_tasks, ["src/core/SkScalerContext.cpp"]
+          )["our_part_passed"]
+      )
+
+    # BrowserConnectionGoneException and two mutual early-shard crashes must both fail closed
+    search_browser_crash = {
+        "builds": [
+            {"id": "30", "status": "SUCCESS", "builder": {"builder": "mac-rel"}},
+            {"id": "31", "status": "FAILURE", "builder": {"builder": "linux-rel"},
+             "summaryMarkdown": "BrowserConnectionGoneException during telemetry_gpu_integration"},
+        ]
+    }
+    detail_browser = {
+        "status": "FAILURE",
+        "summaryMarkdown": "BrowserConnectionGoneException during telemetry_gpu_integration",
+        "steps": [{"name": "pixel_skia_gold_validating_test", "status": "FAILURE"}],
+    }
+    with patch.object(canary_advisor, "swarming_task_stdout", return_value=stdout), patch.object(
+        canary_advisor, "_prpc_json_post", side_effect=[search_browser_crash, detail_browser]
+    ):
+      self.assertFalse(
+          canary_advisor.triage_canary_chromium_failure(
+              1421656, 3, {"status": "FAILURE"}, sw_tasks, ["src/core/SkScalerContext.cpp"]
+          )["our_part_passed"]
+      )
+
+    search_mutual_abort = {
+        "builds": [
+            {"id": "40", "status": "SUCCESS", "builder": {"builder": "win-rel"}},
+            {"id": "41", "status": "FAILURE", "builder": {"builder": "linux-rel"},
+             "summaryMarkdown": "Suite failed: did a shard fail early?"},
+            {"id": "42", "status": "FAILURE", "builder": {"builder": "mac-rel"},
+             "summaryMarkdown": "Suite failed: did a shard fail early?"},
+        ]
+    }
+    with patch.object(canary_advisor, "swarming_task_stdout", return_value=stdout), patch.object(
+        canary_advisor, "_prpc_json_post", return_value=search_mutual_abort
+    ):
+      self.assertFalse(
+          canary_advisor.triage_canary_chromium_failure(
+              1421656, 3, {"status": "FAILURE"}, sw_tasks, ["src/core/SkScalerContext.cpp"]
+          )["our_part_passed"]
+      )
+
+  # Checks R135 B3 Android gates: newest revision verdict precedence, unparsed FAIL lines,
+  # Minikin/CtsText/PDFium consumer detection, AnTS pagination, and signedUrl build_error.log
+  def test_triage_canary_android_fails_closed_on_latest_verdict_unparsed_fail_and_consumers(self):
+    sw_tasks = [{"name": "Canary-Android", "taskId": "task_ag_b3"}]
+    stdout = (
+        "Roll https://googleplex-android-review.googlesource.com/c/"
+        "platform/external/skia/+/43653565 failed\n"
+    )
+
+    # Latest message is Verify-Fail with unparsed Soong error + Removed Presubmit-Verified+1 after
+    # an older Verify-Pass: must NOT walk backward into the older Verify-Pass
+    soong_fail_change = {
+        "messages": [
+            {
+                "_revision_number": 1,
+                "tag": "autogenerated:TreeHugger:Verify-Pass",
+                "message": "Patch Set 1: Presubmit-Verified+1\n\n## Presubmit finished: 100 passed",
+            },
+            {
+                "_revision_number": 2,
+                "tag": "autogenerated:TreeHugger:Verify-Fail",
+                "message": (
+                    "Patch Set 2: Presubmit-Verified-1 (Removed Presubmit-Verified+1)\n\n"
+                    "## Presubmit finished: 0 passed, 1 failed\n"
+                    "FAIL: Soong blueprint hook failed in external/skia/Android.bp"
+                ),
+            },
+        ]
+    }
+    with patch.object(canary_advisor, "swarming_task_stdout", return_value=stdout), patch.object(
+        canary_advisor, "_sso_fetch_json", return_value=soong_fail_change
+    ):
+      self.assertFalse(
+          canary_advisor.triage_canary_android_failure(
+              1421816, 4, {"status": "FAILURE"}, sw_tasks, ["src/ports/SkFontMgr_android.cpp"]
+          )["our_part_passed"]
+      )
+
+    # Unparsed FAIL alongside INFRA_ERROR test failure must also fail closed
+    mixed_unparsed = {
+        "messages": [{
+            "_revision_number": 2,
+            "tag": "autogenerated:TreeHugger:Verify-Fail",
+            "message": (
+                "## Presubmit finished: 118 passed, 2 failed\n"
+                "FAIL: Tests failed for [pts-bot](https://android-build.googleplex.com/"
+                "builds/tests/view?invocationId=I8570000105396069325) on dev. "
+                "Caused by UNKNOWN_INFRA_ERROR\n"
+                "FAIL: Hook check_api_lint failed"
+            ),
+        }]
+    }
+    with patch.object(canary_advisor, "swarming_task_stdout", return_value=stdout), patch.object(
+        canary_advisor, "_sso_fetch_json", return_value=mixed_unparsed
+    ):
+      self.assertFalse(
+          canary_advisor.triage_canary_android_failure(
+              1421816, 4, {"status": "FAILURE"}, sw_tasks, ["src/ports/SkFontMgr_android.cpp"]
+          )["our_part_passed"]
+      )
+
+    # Minikin / CtsText failure on page 2 of AnTS pagination must be caught and fail closed
+    ants_change = {
+        "messages": [{
+            "_revision_number": 1,
+            "tag": "autogenerated:TreeHugger:Verify-Fail",
+            "message": (
+                "## Presubmit finished: 110 passed, 1 failed\n"
+                "FAIL: Tests failed for [CtsTestSuite](https://android-build.googleplex.com/"
+                "builds/tests/view?invocationId=I8570000105396069777) on pixel"
+            ),
+        }]
+    }
+    page1 = json.dumps({
+        "testResults": [{
+            "testIdentifier": {"module": "CtsNetTestCases", "testClass": "NetTest"},
+            "debugInfo": {"errorMessage": "timeout", "trace": "android.net.Socket"},
+        }],
+        "nextPageToken": "tok_p2",
+    })
+    page2_minikin = json.dumps({
+        "testResults": [{
+            "testIdentifier": {"module": "CtsTextTestCases", "testClass": "StaticLayoutTest"},
+            "debugInfo": {"errorMessage": "mismatch", "trace": "minikin::Layout::doLayout"},
+        }],
+    })
+    with patch.object(canary_advisor, "swarming_task_stdout", return_value=stdout), patch.object(
+        canary_advisor, "_sso_fetch_json", return_value=ants_change
+    ), patch.object(canary_advisor, "_android_build_api_get", side_effect=[page1, page2_minikin]):
+      self.assertFalse(
+          canary_advisor.triage_canary_android_failure(
+              1421816, 4, {"status": "FAILURE"}, sw_tasks, ["src/ports/SkFontMgr_android.cpp"]
+          )["our_part_passed"]
+      )
+
+    # Build failure returning {"signedUrl": ...} downloads the signed log and classifies cleanly
+    build_change = {
+        "messages": [{
+            "_revision_number": 1,
+            "tag": "autogenerated:TreeHugger:Verify-Fail",
+            "message": (
+                "## Presubmit finished: 90 passed, 1 failed\n"
+                "FAIL: Failed to build [cf_x86_64](https://android-build.googleplex.com/builds/"
+                "submitted/P12345/cf_x86_64-userdebug/latest/view/logs%2Fbuild_error.log)"
+            ),
+        }]
+    }
+
+    class _SignedResp:
+      def __enter__(self):
+        return self
+
+      def __exit__(self, *args):
+        return False
+
+      def read(self, _n=-1):
+        return b"frameworks/base/WindowManager.cpp:12:3: error: undeclared identifier 'wm'\n"
+
+    with patch.object(canary_advisor, "swarming_task_stdout", return_value=stdout), patch.object(
+        canary_advisor, "_sso_fetch_json", return_value=build_change
+    ), patch.object(
+        canary_advisor,
+        "_android_build_api_get",
+        return_value=json.dumps({"signedUrl": "https://storage.googleapis.com/ants/err.log"}),
+    ), patch.object(canary_advisor.urllib.request, "urlopen", return_value=_SignedResp()):
+      res_signed = canary_advisor.triage_canary_android_failure(
+          1421816, 4, {"status": "FAILURE"}, sw_tasks, ["src/ports/SkFontMgr_android.cpp"]
+      )
+    self.assertTrue(res_signed["our_part_passed"])
+    self.assertEqual(res_signed["verdict"], "UNRELATED_HEAD_BREAKAGE")
+
+  # Checks R135 B4 Canary-G3 fail-closed somepath when Blaze or GOOGLE3_DIR is unavailable, GN/test
+  # filtering on mixed diffs (CL 1421816), and requiring every CheckTestsSkia run to pass
+  def test_triage_canary_g3_fails_closed_when_somepath_inconclusive_or_duplicate_run_failed(self):
+    with patch("os.path.isdir", return_value=False):
+      status, lines = canary_advisor.check_google3_somepath(
+          "//video/youtube:test", ["src/core/SkScalerContext.cpp"]
+      )
+    self.assertIsNone(status)
+    self.assertEqual(lines, [])
+
+    # GN-only and tests/ files must not pollute Blaze target labels (CL 1421816)
+    seen_queries = []
+
+    def fake_blaze(cmd, **kwargs):
+      seen_queries.append(cmd[2])
+      return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    with patch("os.path.isdir", return_value=True), patch(
+        "os.path.isfile",
+        side_effect=lambda p: p.endswith("src/ports/BUILD") or p.endswith("HEAD/BUILD"),
+    ), patch("os.path.exists", return_value=True), patch.object(
+        canary_advisor.subprocess, "run", side_effect=fake_blaze
+    ):
+      st_gn, _ = canary_advisor.check_google3_somepath(
+          "//video/youtube:test",
+          [
+              "BUILD.gn",
+              "src/ports/SkFontHost_FreeType_common.cpp",
+              "tests/FontHost_FreeTypeTest.cpp",
+          ],
+      )
+    self.assertIs(st_gn, False)
+    want_q = (
+        "somepath(//video/youtube:test, "
+        "set(//third_party/skia/HEAD/src/ports:SkFontHost_FreeType_common.cpp))"
+    )
+    self.assertEqual(seen_queries, [want_q])
+
+    sw_tasks = [{"name": "Canary-G3", "taskId": "task_g3_b4"}]
+    stdout = "Canary roll [ http://cl/1017394648 ] failed\n"
+    gardener_unknown_tgt = {
+        "Verdict": "DEPENDENT_HEAD_UNKNOWN",
+        "Runs": [
+            {"id": "r1", "check": "CheckTestsSkia", "status": "PASSED", "failed": 0},
+            {"id": "r2", "check": "CheckSkiaDependents", "status": "PASSED", "failed": 0},
+            {"id": "r3", "check": "CheckTestsSkiaDependents", "status": "FAILED", "failed": 1},
+        ],
+        "Targets": [
+            {"target": "//video/youtube:handler_test", "kind": "UNKNOWN", "failed_in_latest": True}
+        ],
+    }
+    proc_ok = type(
+        "P", (), {"returncode": 0, "stdout": json.dumps(gardener_unknown_tgt), "stderr": ""}
+    )()
+    with patch("os.path.isdir", return_value=True), patch.object(
+        canary_advisor, "swarming_task_stdout", return_value=stdout
+    ), patch.object(
+        canary_advisor.subprocess, "run", return_value=proc_ok
+    ), patch.object(canary_advisor, "check_google3_somepath", return_value=(None, [])):
+      res_inconc = canary_advisor.triage_canary_g3_failure(
+          1421656, 3, {"status": "FAILURE"}, sw_tasks, ["src/core/SkScalerContext.cpp"]
+      )
+    self.assertEqual(res_inconc["verdict"], "CL_SUSPECTED_REGRESSION")
+    self.assertFalse(res_inconc["our_part_passed"])
+
+    # Split CheckTestsSkia runs (one PASSED, one FAILED, neither superseded) must fail closed
+    gardener_split = {
+        "Verdict": "UNKNOWN",
+        "Runs": [
+            {"id": "r1", "check": "CheckTestsSkia", "status": "PASSED", "failed": 0},
+            {"id": "r2", "check": "CheckTestsSkia", "status": "FAILED", "failed": 1},
+            {"id": "r3", "check": "CheckSkiaDependents", "status": "PASSED", "failed": 0},
+            {"id": "r4", "check": "CheckTestsSkiaDependents", "status": "PASSED", "failed": 0},
+        ],
+        "Targets": [],
+    }
+    proc_split = type(
+        "P", (), {"returncode": 0, "stdout": json.dumps(gardener_split), "stderr": ""}
+    )()
+    with patch("os.path.isdir", return_value=True), patch.object(
+        canary_advisor, "swarming_task_stdout", return_value=stdout
+    ), patch.object(canary_advisor.subprocess, "run", return_value=proc_split):
+      res_split = canary_advisor.triage_canary_g3_failure(
+          1421656, 3, {"status": "FAILURE"}, sw_tasks, ["src/core/SkScalerContext.cpp"]
+      )
+    self.assertFalse(res_split["our_part_passed"])
+
+  # Checks R135 B5: thread-reply drafts (in_reply_to) are never overwritten or counted as top-level
+  # canary drafts, and all *.corp.google.com / *.corp.goog domains are blocked by leak check
+  def test_patchset_draft_ignores_thread_replies_and_blocks_all_corp_domains(self):
+    for corp_leak in (
+        "Bug https://b.corp.google.com/issues/580852205 reproduced.",
+        "Mirror https://skia-review.git.corp.google.com/c/skia/+/1421656 failed.",
+        "Dashboard https://autoroll-internal.corp.goog/r/skia failed.",
+    ):
+      self.assertNotEqual(canary_advisor.find_public_draft_leak(corp_leak), "", msg=corp_leak)
+
+    reply_only_drafts = json.dumps({
+        "/PATCHSET_LEVEL": [{
+            "id": "reply_draft_99",
+            "in_reply_to": "reviewer_comment_1",
+            "message": "Done — Canary-Chromium was unrelated.",
+            "unresolved": False,
+        }]
+    }).encode("utf-8")
+    calls = []
+
+    def fake_authed(url, data=None, method=None, headers=None, timeout=20):
+      calls.append((method or ("POST" if data else "GET"), url, data))
+      if method == "PUT":
+        return (201, b")]}'\n{\"id\":\"new_top_draft\"}"), None
+      return (200, b")]}'\n" + reply_only_drafts), None
+
+    with patch.object(canary_advisor, "_gerrit_authed_urlopen", side_effect=fake_authed):
+      self.assertFalse(canary_advisor.has_gerrit_canary_drafts(1421656, 4, ["Canary-Chromium"]))
+      ok = canary_advisor.save_gerrit_patchset_draft(
+          1421656, 4, "Canary-Chromium roll (https://crrev.com/c/8774115/2) passed on 49 trybots."
+      )
+    self.assertTrue(ok)
+    put_calls = [c for c in calls if c[0] == "PUT"]
+    self.assertEqual(len(put_calls), 1)
+    # Must create a fresh top-level draft at .../drafts, NOT overwrite .../drafts/reply_draft_99
+    self.assertTrue(put_calls[0][1].endswith("/revisions/4/drafts"), msg=put_calls[0][1])
+
+  # Checks R135 B6 & Grill 1: cmd_watch advances across NO_CODE_CHANGE patchsets without SUPERSEDED,
+  # cmd_triage --ps 3 includes PS4 builds on the same tree, and advise prints watch --save-draft
+  def test_cmd_watch_and_triage_follow_no_code_change_patchsets_and_advise_prints_watch(self):
+    meta_ps3 = {
+        "cl": 1421656,
+        "patchset": 3,
+        "current_patchset": 3,
+        "status": "NEW",
+        "subject": "Test",
+        "owner": "jlavrova@google.com",
+        "diff": "diff --git a/src/core/SkScalerContext.cpp b/src/core/SkScalerContext.cpp\n+// x\n",
+        "googler_cr_plus_one": True,
+        "kinds": {1: "REWORK", 2: "REWORK", 3: "NO_CODE_CHANGE"},
+    }
+    meta_ps4 = {
+        **meta_ps3,
+        "patchset": 4,
+        "current_patchset": 4,
+        "kinds": {1: "REWORK", 2: "REWORK", 3: "NO_CODE_CHANGE", 4: "NO_CODE_CHANGE"},
+    }
+    watch_args = type(
+        "Args",
+        (),
+        {
+            "cl": "1421656",
+            "ps": None,
+            "poll_sec": 1,
+            "timeout_min": 5,
+            "no_builds_min": 10,
+            "save_draft": True,
+            "json": False,
+        },
+    )()
+    buf_watch = io.StringIO()
+    with patch.object(canary_advisor, "load_cl", side_effect=[meta_ps3, meta_ps4]), patch.object(
+        canary_advisor,
+        "bb_cl_builds",
+        side_effect=lambda _cl, p: (
+            {"Canary-Chromium": {"id": "9", "status": "SUCCESS"}} if int(p) == 3 else {}
+        ),
+    ), patch.object(canary_advisor, "cmd_triage", return_value={}) as mock_triage, patch(
+        "sys.stdout", buf_watch
+    ):
+      rc = canary_advisor.cmd_watch(watch_args)
+    self.assertEqual(rc, 0)
+    self.assertNotIn("SUPERSEDED", buf_watch.getvalue())
+    self.assertIn("ALL_TRYJOBS_COMPLETE", buf_watch.getvalue())
+    mock_triage.assert_called_once()
+
+    # cmd_triage --ps 3 when current_patchset is PS 4 (NO_CODE_CHANGE) must scan PS 4 builds too
+    triage_args = type("Args", (), {"cl": "1421656", "ps": "3", "save_draft": False, "json": False})()
+    with patch.object(
+        canary_advisor, "load_cl", return_value={**meta_ps4, "patchset": 3}
+    ), patch.object(
+        canary_advisor,
+        "bb_cl_builds",
+        side_effect=lambda _cl, p: (
+            {"Canary-G3": {"id": "77", "status": "SUCCESS", "createTime": "2026-11-09T22:00:00Z"}}
+            if int(p) == 4
+            else {}
+        ),
+    ), patch.object(canary_advisor, "tested_block_gaps", return_value=[]), patch(
+        "sys.stdout", io.StringIO()
+    ):
+      res_triage = canary_advisor.cmd_triage(triage_args)
+    self.assertIn("Canary-G3", res_triage["builds"])
+
+    # advise on own CL prints watch --cl <CL> --save-draft under Canary Command
+    adv_args = type(
+        "Args",
+        (),
+        {
+            "cl": "1421656",
+            "repo": None,
+            "base": "origin/main",
+            "max_symbols": 6,
+            "no_search": True,
+            "no_health": True,
+            "no_log": True,
+            "strong_only": False,
+        },
+    )()
+    buf_adv = io.StringIO()
+    with patch.object(
+        canary_advisor, "load_cl", return_value={**meta_ps3, "owner": canary_advisor.ME}
+    ), patch("sys.stdout", buf_adv):
+      canary_advisor.advise(adv_args)
+    adv_out = buf_adv.getvalue()
+    canary_section = adv_out.split("Canary Command (run only after user approval):")[-1]
+    self.assertIn("watch --cl 1421656 --save-draft", canary_section)
+
 
 if __name__ == "__main__":
   unittest.main()

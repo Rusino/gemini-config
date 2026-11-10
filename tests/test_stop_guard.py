@@ -958,6 +958,50 @@ class TestStopGuard(unittest.TestCase):
       with tempfile.TemporaryDirectory() as tmp_green:
         self.assertEqual(self.run_discipline_stop(tmp_green, green_steps), {})
 
+      # Approving when TRYJOBS: ALL GREEN still has CANARY DRAFT: MISSING is blocked until saved
+      missing_draft_steps = premature_steps[:-1] + [
+          {
+              "step_index": 6,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": (
+                  "Command exited with code 0.\n\n"
+                  "TRYJOBS: ALL GREEN\n"
+                  "CANARY DRAFT: MISSING on PS 4 (Canary-Chromium)\n"
+              ),
+          },
+          {
+              "step_index": 7,
+              "type": "PLANNER_RESPONSE",
+              "content": "### Execution Ledger\n- Triage: done\n\n**Case 1: Ideal CL**",
+          },
+      ]
+      with tempfile.TemporaryDirectory() as tmp_missing_draft:
+        res_missing_draft = self.run_discipline_stop(tmp_missing_draft, missing_draft_steps)
+      self.assertEqual(res_missing_draft.get("decision"), "continue")
+      self.assertIn("[TRYJOB GATE GUARD]", res_missing_draft.get("reason", ""))
+      self.assertIn("--save-draft", res_missing_draft.get("reason", ""))
+
+      ok_draft_steps = premature_steps[:-1] + [
+          {
+              "step_index": 6,
+              "type": "GENERIC",
+              "status": "DONE",
+              "content": (
+                  "Command exited with code 0.\n\n"
+                  "TRYJOBS: ALL GREEN\n"
+                  "CANARY DRAFT: OK (present on PS 4)\n"
+              ),
+          },
+          {
+              "step_index": 7,
+              "type": "PLANNER_RESPONSE",
+              "content": "### Execution Ledger\n- Triage: done\n\n**Case 1: Ideal CL**",
+          },
+      ]
+      with tempfile.TemporaryDirectory() as tmp_ok_draft:
+        self.assertEqual(self.run_discipline_stop(tmp_ok_draft, ok_draft_steps), {})
+
       # Red font trybot blocks approval until fixed or marked UNVERIFIED ON TRYBOTS
       red_steps = premature_steps[:-1] + [
           {

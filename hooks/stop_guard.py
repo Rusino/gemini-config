@@ -356,6 +356,7 @@ USER_G3_OPTOUT_RE = re.compile(
 )
 # Tryjob verdicts from `canary_advisor.py triage/watch` and `git cl try-results`
 TRYJOBS_VERDICT_RE = re.compile(r"^TRYJOBS: (ALL GREEN|NOT GREEN[^\n]*)", re.MULTILINE)
+CANARY_DRAFT_STATUS_RE = re.compile(r"^CANARY DRAFT: (OK|MISSING)\b", re.MULTILINE)
 TRY_RESULTS_TOTAL_RE = re.compile(r"^Total: (\d+) tryjobs?", re.MULTILINE)
 TRY_RESULTS_NOT_GREEN_RE = re.compile(
     r"^(?:Failures|Infra Failures|Started|Scheduled|Canceled):\s*$", re.MULTILINE
@@ -367,7 +368,13 @@ UNVERIFIED_TRYBOTS_RE = re.compile(r"\bUNVERIFIED[_\s]+ON[_\s]+TRYBOTS\b", re.IG
 def _tryjob_report_green(text: str):
   verdicts = TRYJOBS_VERDICT_RE.findall(text)
   if verdicts:
-    return verdicts[-1] == "ALL GREEN"
+    if verdicts[-1] != "ALL GREEN":
+      return False
+    # Red canaries cleared as unrelated still require a saved sanitized /PATCHSET_LEVEL draft
+    draft_statuses = CANARY_DRAFT_STATUS_RE.findall(text)
+    if draft_statuses and draft_statuses[-1] == "MISSING":
+      return False
+    return True
   totals = TRY_RESULTS_TOTAL_RE.findall(text)
   if totals:
     if int(totals[-1]) == 0:
@@ -1067,8 +1074,8 @@ def analyze_review_discipline(transcript_path: str, artifact_dir: str) -> dict:
         f"[TRYJOB GATE GUARD] The tryjobs triggered from `canary_advisor.py` are {state}, but "
         "your response recommends approval (`Case 1-3` / `LGTM` / `Code-Review+1`). Run "
         "`python3 ~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py triage "
-        "--cl <N> --ps <PS>` and approve only after it prints `TRYJOBS: ALL GREEN` (or mark the "
-        "review `UNVERIFIED ON TRYBOTS`)"
+        "--cl <N> --ps <PS> --save-draft` and approve only after it prints `TRYJOBS: ALL GREEN` "
+        "without `CANARY DRAFT: MISSING` (or mark the review `UNVERIFIED ON TRYBOTS`)"
     )
   if not user_opted_out_try:
     missing_try_bots = required_agent_bots - triggered_try_bots
