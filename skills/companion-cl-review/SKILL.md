@@ -77,6 +77,7 @@ Never upload a companion WIP CL blindly. After auditing the patchset and testing
    - If no defects exist and no new tests are needed → **Case 1** or **Case 2** (skip Phases 3–4 and proceed directly to Phase 5 to draft the prose review and save the Gerrit draft).
    - If the new tests **pass** on the author's unmodified code → **Case 3**.
    - If the new tests **fail** (`Gate A` confirmed), record the exact failing test names and assertion count (`N failing assertions across K tests`), then decide between **Case 4** (reproducer tests only) and **Case 5** (tests in `PS1` + fix in `PS2`).
+   - For **Case 5**, pin the confirmed failing `Gate A` test file(s) before starting Phase 4 (`Gate B`): `python3 ~/.gemini/config/hooks/gate_a_lock.py lock <path/to/test_file>`.
 
 ---
 
@@ -113,6 +114,7 @@ When **Case 5** applies:
    - Ensure all code comments follow project conventions (concise English rationale explaining *why*, 1–4 lines, no trailing periods in C++, `<= 100` columns).
 2. **Verify all tests pass (including `flutter-test-paragraph-engine` and `google3-test-paragraph` for `SkParagraph` / `SkUnicode` changes)**:
    - Recompile and run both the new contract tests from `PS1` and the full module test suite to prove zero regressions.
+   - Verify `Gate A` test integrity and release the hash lock after `Gate B` passes: `python3 ~/.gemini/config/hooks/gate_a_lock.py verify && python3 ~/.gemini/config/hooks/gate_a_lock.py clear` (use `unlock --reason "..."` only if adding a new test case or fixing a `Gate A` typo).
    - Whenever the CL modifies executable code in `modules/skparagraph/{src,include}/`, `modules/skunicode/{src,include}/`, or `modules/skshaper/{src,include}/`, you **must** also run `flutter-test-paragraph-engine` (`~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py`) against the `PS2` tree before uploading `PS2` (and on Linux Cloudtop for `modules/skparagraph/` or `modules/skunicode/`, run `google3-test-paragraph` fast tier across 1,139 targets including `skia_build_test`). Never upload a `PS2` fix verified only with native Skia `dm`.
 3. **Mandatory clean-context audit of our own fix (non-skippable)**:
    - `PS2` is code we ask someone else to adopt, so it gets the full `amnesia-precommit` pipeline (or the environment's equivalent): comment and code audits on `HEAD`, the clean-context Hunter (`keeper_inquisitor`), and the batched Skeptic (`keeper_skeptic`, `pro` for line-breaking, BiDi, or index math) on every candidate defect.

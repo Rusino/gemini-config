@@ -5760,6 +5760,31 @@ def main() -> None:
             )
             return
 
+  # Enforce Gate A SHA-256 contract test locks across parent, subagents, and handoffs
+  # before READ-BEFORE-EDIT or shell execution so Gate B fixes never weaken Gate A tests
+  if tool_name in EDIT_TOOLS or tool_name == "run_command":
+    _hooks_dir = os.path.dirname(os.path.abspath(__file__))
+    if _hooks_dir not in sys.path:
+      sys.path.insert(0, _hooks_dir)
+    from gate_a_lock import denial_for_tool_call
+
+    gate_a_denial = denial_for_tool_call(
+        tool_name,
+        tool_args,
+        conv_id,
+        parent_conv_id=parent_conv_id,
+        transcript_path=transcript_path,
+        artifact_dir=artifact_dir,
+        workspace_paths=workspace_paths,
+    )
+    if gate_a_denial:
+      print(
+          json.dumps(
+              {"decision": "deny", "reason": gate_a_denial}, ensure_ascii=False
+          )
+      )
+      return
+
   # 2. Guards for source file edits (apply to both main agent and subagents)
   if tool_name in EDIT_TOOLS:
     target_file = get_tool_target_file(tool_args)

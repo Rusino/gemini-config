@@ -111,9 +111,11 @@ When Outcome 1 or 2 applies:
      Assisted-by: <Model Name>"
      git push origin HEAD:refs/for/main%wip
      ```
+   - Pin the confirmed failing `Gate A` test file(s) before starting `Gate B` so production fixes cannot weaken assertions: `python3 ~/.gemini/config/hooks/gate_a_lock.py lock <test_files>`.
 3. **Implement Root-Cause Fix & Verify (`PS2`, Outcome 1 Only)**:
    - Implement minimal root-cause invariant fix.
    - Verify native unit tests pass.
+   - Verify the `Gate A` hash lock remained untouched and release it once `Gate B` passes: `python3 ~/.gemini/config/hooks/gate_a_lock.py verify && python3 ~/.gemini/config/hooks/gate_a_lock.py clear` (use `unlock --reason "..."` only if adding a new test case or fixing a `Gate A` typo).
    - For `modules/skparagraph/`, `modules/skunicode/`, `modules/skshaper/`: run `flutter-test-paragraph-engine` and `google3-test-paragraph`. For `modules/skparagraph/` and `modules/skunicode/` also run the Flutter web CanvasKit suite `felt test --suite chrome-dart2js-canvaskit-canvaskit` with CanvasKit rebuilt from the patched Skia (incident: Gerrit 1418376, reverted in Gerrit 1420816). For `lib/web_ui/lib/`: run `webparagraph-corpus`.
    - Run `amnesia-precommit` checks (`audit_comments.py`, `ruthless_audit.py`).
    - Amend commit and push `PS2` with an explicit pre-fix test failure statement and a complete, human-readable `Tested:` matrix listing every verification gate actually executed (native unit tests with test count, Flutter targeted and full framework corpora, Google3 transitive corpus test count **without** internal `//...` target paths or `cl/` numbers, ASAN trybot, and any platform or physical device trybots on Mac, Windows, or Android). If slow gates (such as the Google3 corpus or a physical device trybot) complete after the initial `%wip` `PS2` upload, update the CL commit message so `Tested:` reflects the full verification record:
