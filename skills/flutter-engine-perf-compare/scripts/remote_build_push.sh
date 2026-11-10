@@ -107,7 +107,9 @@ else
     cp "$EXT_SRC" "$EXT_DST"
     TARGETS+=("$TXT:txt_ext_benchmarks")
     utils=""
-    grep -q 'skia_component("utils")' "$SK/modules/skparagraph/BUILD.gn" && \
+    # The label below lives in Flutter's flutter/skia BUILD.gn; Skia's own BUILD.gn turned
+    # utils into a skia_source_set, so checking it drops TestFontCollection from the link
+    grep -q 'skia_component("utils")' flutter/skia/modules/skparagraph/BUILD.gn && \
       utils='      "//flutter/skia/modules/skparagraph:utils",'
     {
       echo ''

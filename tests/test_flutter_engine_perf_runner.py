@@ -9,6 +9,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -112,18 +113,35 @@ class PerfRemoteTest(unittest.TestCase):
     self.assertIn(".complete", calls[1])
     self.assertIn("touch bin/pt/.complete", calls[2][-1])
 
-  # Enqueue adds only new lanes (also to a legacy one-line lanes.txt) and starts the runner
+  # Enqueue starts the background runner when .runner.lock is free instead of matching its own
+  # shell command line, and reports RUNNING without spawning a duplicate when locked
   def test_enqueue_remote_script_runs(self):
     with tempfile.TemporaryDirectory() as root:
       r = pathlib.Path(root)
       (r / "lanes.txt").write_text("plans/a.txt plans/b.txt\n")
-      (r / "remote_runner.sh").write_text("#!/bin/sh\necho ran > started\n")
+      (r / "remote_runner.sh").write_text("#!/bin/sh\necho ran >> started\n")
       (r / "remote_runner.sh").chmod(0o755)
       out = subprocess.run(
           ["bash", "-c", perf_remote.enqueue_remote_script(root, ["b.txt", "c.txt"])],
           capture_output=True, text=True, check=True).stdout
       self.assertEqual((r / "lanes.txt").read_text(), "plans/a.txt plans/b.txt\nplans/c.txt\n")
-      self.assertIn(out.strip(), ("STARTED", "RUNNING"))
+      self.assertEqual(out.strip(), "STARTED")
+      deadline = time.monotonic() + 2.0
+      while not (r / "started").is_file() and time.monotonic() < deadline:
+        time.sleep(0.02)
+      self.assertEqual((r / "started").read_text(), "ran\n")
+
+      holder = subprocess.Popen(["flock", str(r / ".runner.lock"), "sleep", "5"])
+      try:
+        time.sleep(0.05)
+        locked_out = subprocess.run(
+            ["bash", "-c", perf_remote.enqueue_remote_script(root, ["d.txt"])],
+            capture_output=True, text=True, check=True).stdout
+        self.assertEqual(locked_out.strip(), "RUNNING")
+        self.assertEqual((r / "started").read_text(), "ran\n")
+      finally:
+        holder.terminate()
+        holder.wait(timeout=2)
 
   # Runs the real publish script locally: a good stage becomes bin/<point> with .complete
   # and linked fonts, a checksum mismatch publishes nothing
@@ -256,6 +274,75 @@ class ShellSyntaxTest(unittest.TestCase):
       r = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True, check=False)
       self.assertEqual(r.returncode, 0, f"{name}: {r.stderr}")
       self.assertTrue(os.access(path, os.X_OK), f"{name} is not executable")
+
+
+  # Upstream Skia switched utils to skia_source_set, so remote_build_push.sh must inspect
+  # Flutter's flutter/skia/modules/skparagraph/BUILD.gn when wiring txt_ext_benchmarks
+  def test_ext_target_links_flutter_skia_utils(self):
+    git_env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@e",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@e",
+    }
+    with tempfile.TemporaryDirectory() as d:
+      co = pathlib.Path(d) / "flutter"
+      eng = co / "engine/src"
+      sk = eng / "flutter/third_party/skia"
+      for rel, body in (
+          ("flutter/txt/benchmarks/.keep", ""),
+          ("flutter/txt/BUILD.gn", "# base\n"),
+          ("flutter/txt/src/skia/paragraph_builder_skia.cc", "// base\n"),
+          ("build/config/compiler/BUILD.gn", "# cfg\n"),
+          ("flutter/skia/modules/skparagraph/BUILD.gn", 'skia_component("utils") {}\n'),
+          ("out/perf_nolto/build.ninja", "# pregenerated\n"),
+          ("out/perf_nolto/args.gn", "enable_lto = false\n"),
+      ):
+        p = eng / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body)
+      clang = eng / "flutter/buildtools/linux-x64/clang/bin/clang++"
+      clang.parent.mkdir(parents=True, exist_ok=True)
+      clang.write_text("#!/bin/sh\necho fake-clang\n")
+      clang.chmod(0o755)
+      subprocess.run(["git", "init", "-q", str(co)], env=git_env, check=True)
+      subprocess.run(["git", "-C", str(co), "add", "."], env=git_env, check=True)
+      subprocess.run(["git", "-C", str(co), "commit", "-qm", "init"], env=git_env, check=True)
+
+      for rel, body in (
+          ("modules/skparagraph/include/ParagraphStyle.h",
+           "setRenderSoftHyphens setSoftHyphenString\n"),
+          ("modules/skparagraph/BUILD.gn", 'skia_source_set("utils") {}\n'),
+      ):
+        p = sk / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body)
+      subprocess.run(["git", "init", "-q", str(sk)], env=git_env, check=True)
+      subprocess.run(["git", "-C", str(sk), "add", "."], env=git_env, check=True)
+      subprocess.run(["git", "-C", str(sk), "commit", "-qm", "sk"], env=git_env, check=True)
+      sha = subprocess.run(
+          ["git", "-C", str(sk), "rev-parse", "HEAD"],
+          capture_output=True, text=True, check=True).stdout.strip()
+
+      ext_cc = pathlib.Path(d) / "ext.cc"
+      ext_cc.write_text("int main() { return 0; }\n")
+      ninja = pathlib.Path(d) / "fake_ninja.sh"
+      captured = pathlib.Path(d) / "captured_txt_build.gn"
+      ninja.write_text(
+          f"#!/bin/sh\ncp flutter/txt/BUILD.gn {captured}\n"
+          "touch out/perf_nolto/txt_benchmarks out/perf_nolto/txt_ext_benchmarks "
+          "out/perf_nolto/icudtl.dat\n"
+      )
+      ninja.chmod(0o755)
+      res = subprocess.run(
+          ["bash", str(SKILL_DIR / "remote_build_push.sh"), "--checkout", str(co),
+           "--sha", sha, "--mode", "nolto", "--ext-src", str(ext_cc), "--no-push"],
+          env={**os.environ, "NINJA": str(ninja)},
+          capture_output=True, text=True, check=False)
+      self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+      self.assertIn('"//flutter/skia/modules/skparagraph:utils"', captured.read_text())
+      self.assertEqual((eng / "flutter/txt/BUILD.gn").read_text(), "# base\n")
 
 
 if __name__ == "__main__":

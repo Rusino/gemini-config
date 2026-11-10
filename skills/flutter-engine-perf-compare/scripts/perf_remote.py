@@ -108,9 +108,11 @@ def enqueue_remote_script(remote_dir: str, plan_names: list[str]) -> str:
   adds = "; ".join(
       f"tr -s ' ' '\\n' < lanes.txt | grep -qxF {shlex.quote('plans/' + n)} || "
       f"echo {shlex.quote('plans/' + n)} >> lanes.txt" for n in plan_names)
+  # Probe the runner's own .runner.lock: pgrep -f would match this very shell, whose
+  # command line contains the runner's name in the start branch, and never start it
   return (
       f"set -e; cd {r}; mkdir -p logs raw bin plans; touch lanes.txt; {adds}; "
-      "if pgrep -f '[r]emote_runner.sh' >/dev/null; then echo RUNNING; else "
+      "if ! flock -n .runner.lock true; then echo RUNNING; else "
       "(setsid nohup ./remote_runner.sh >> logs/runner.out 2>&1 < /dev/null &); "
       "echo STARTED; fi"
   )
