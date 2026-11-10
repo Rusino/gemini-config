@@ -1609,6 +1609,31 @@ def _evaluate_companion_alerts(
   return orphan_reasons, comment_reasons
 
 
+def _sanitize_gerrit_account_placeholders(
+    text: str, state: Mapping[str, Any] | None = None
+) -> str:
+  """Strips leaked <GERRIT_ACCOUNT_N> tokens from cached attention reasons."""
+  if "<GERRIT_ACCOUNT_" not in text:
+    return text
+  st = state or {}
+  actor = str(st.get("last_msg_author_name") or st.get("last_msg_author") or "").strip()
+  actor_low = actor.lower()
+  is_self_or_bot = actor_low in (
+      "",
+      "jlavrova",
+      "julia lavrova",
+      "jlavrova@google.com",
+      "you",
+  ) or any(
+      tok in actor_low
+      for tok in ("bot", "skcq", "luci", "roller", "autoroll", "gerrit", "tree hugger")
+  )
+  # Substitute last_msg_author into "replied on" only when it names an external human reviewer
+  if "replied on" in text.lower() and not is_self_or_bot:
+    return re.sub(r"<GERRIT_ACCOUNT_\d+>", actor, text)
+  return re.sub(r"<GERRIT_ACCOUNT_(\d+)>", r"account #\1", text)
+
+
 def _evaluate_cl_needs_you(akey: str, st: Mapping[str, Any]) -> str:
   """Returns the Needs You reason for a non-companion CL/PR/bug, or '' when waiting/done."""
   est = st.get("entity_state") if isinstance(st.get("entity_state"), Mapping) else {}
@@ -1626,9 +1651,10 @@ def _evaluate_cl_needs_you(akey: str, st: Mapping[str, Any]) -> str:
     )
     if not bug_needs_you:
       return ""
-    why_bug = str(
+    raw_bug_reason = str(
         st.get("why_needs_you") or est.get("reason") or st.get("attention_reason") or ""
     ).strip()
+    why_bug = _sanitize_gerrit_account_placeholders(raw_bug_reason, st)
     return why_bug or f"Needs action: {format_short_bug_id(akey)}"
 
   # Suppress stale cached flags once a CL/PR is closed, abandoned, or merged without post-submit
@@ -1636,12 +1662,13 @@ def _evaluate_cl_needs_you(akey: str, st: Mapping[str, Any]) -> str:
   if status_u in ("ABANDONED", "CLOSED"):
     return ""
   is_open_cl = status_u in ("NEW", "OPEN")
-  if status_u in ("MERGED", "SUBMITTED") and not (
-      bool(est.get("is_post_submit_alert"))
-      or bool(est.get("action_required"))
-      or est.get("lane") == "you"
-  ):
-    return ""
+  if status_u in ("MERGED", "SUBMITTED"):
+    # Discard pre-merge entity_state cached while the CL was still NEW/OPEN
+    sig_status = str(est.get("input_sig") or "").split("|", 1)[0].strip().upper()
+    if sig_status not in ("", "MERGED", "SUBMITTED"):
+      est = {}
+    if not (bool(est.get("is_post_submit_alert")) or bool(est.get("action_required"))):
+      return ""
 
   is_wip = bool(st.get("is_wip") or st.get("is_draft") or st.get("wip_label"))
   is_own = _is_own_cl(st, est)
@@ -1655,6 +1682,22 @@ def _evaluate_cl_needs_you(akey: str, st: Mapping[str, Any]) -> str:
       and bool(est.get("can_finalize_clean_review"))
       and not bool(est.get("is_armed_finalize"))
   )
+  ready_self_submit = (
+      is_open_cl
+      and is_own
+      and not is_wip
+      and not own_conflict
+      and not bool(st.get("cq_failed"))
+      and int(st.get("open_external_threads") or 0) == 0
+      and (
+          bool(est.get("needs_self_submit"))
+          or (
+              est.get("lane") == "you"
+              and str((est.get("spine_short_state") or {}).get("short") or "")
+              == "Ready to submit"
+          )
+      )
+  )
   # Ignore synthetic conflict status on foreign PRs while honoring real review/alert lanes
   est_lane_you = est.get("lane") == "you" and (is_own or est.get("status") != "conflict")
   needs_you = (
@@ -1664,6 +1707,7 @@ def _evaluate_cl_needs_you(akey: str, st: Mapping[str, Any]) -> str:
       or bool(est.get("is_post_submit_alert"))
       or own_conflict
       or clean_review_ready
+      or ready_self_submit
   )
   if not needs_you:
     return ""
@@ -1673,8 +1717,14 @@ def _evaluate_cl_needs_you(akey: str, st: Mapping[str, Any]) -> str:
   # Prioritize clean-review promotion before passive waiting reasons stored in attention_reason
   if clean_review_ready:
     return f"🟢 Ready to CR+1: {short_cl}"
+  # Surface approved green self CLs awaiting manual CQ+2 before passive attention_reason text
+  if ready_self_submit:
+    return f"🚀 Ready to submit: {short_cl}"
   # Read both explicit entity_state.reason and cl_watcher's item-level attention_reason
-  explicit_reason = str(est.get("reason") or st.get("attention_reason") or "").strip()
+  explicit_reason = _sanitize_gerrit_account_placeholders(
+      str(est.get("reason") or st.get("attention_reason") or "").strip(),
+      st,
+  )
   if explicit_reason and (is_own or "conflict" not in explicit_reason.lower()):
     return explicit_reason
   # Suppress spine_short_state 'Conflict' leaked by entity_state.py on foreign PRs
@@ -2204,7 +2254,9 @@ _RE_DRAFT_MENTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(
             r"(?:skia-review\.googlesource\.com/c/skia/\+/"
-            r"|\b(?:Skia\s+)?CL\s+|\bGerrit\s+)(\d{6,8})\b",
+            r"|\bSkia\s+(?:Gerrit\s+)?CL\s+#?"
+            r"|(?<!Chromium )(?<!Chromium Gerrit )\bCL\s+#?"
+            r"|\bGerrit\s+)(\d{6,8})\b",
             re.IGNORECASE,
         ),
         "gerrit:skia:",
@@ -2212,6 +2264,7 @@ _RE_DRAFT_MENTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(
             r"(?:chromium-review\.googlesource\.com/c/chromium/src/\+/"
+            r"|\bChromium\s+(?:Gerrit\s+)?CL\s+#?"
             r"|\bcrrev(?:\.com)?/c/)(\d{6,8})\b",
             re.IGNORECASE,
         ),
@@ -2316,6 +2369,7 @@ def _extract_draft_mentioned_keys(text: str) -> list[str]:
   )
   hits: list[tuple[int, str]] = []
   pr_nums: set[str] = set()
+  cr_nums: set[str] = set()
   for rx, prefix in _RE_DRAFT_MENTION_PATTERNS:
     scan_target = masked_issue_text if prefix == "github_issue:flutter/flutter:" else raw
     for m in rx.finditer(scan_target):
@@ -2324,12 +2378,16 @@ def _extract_draft_mentioned_keys(text: str) -> list[str]:
         continue
       if prefix == "github_pr:flutter/flutter:":
         pr_nums.add(num)
+      elif prefix == "gerrit:chromium:":
+        cr_nums.add(num)
       hits.append((m.start(), f"{prefix}{num}"))
   hits.sort(key=lambda x: x[0])
   ordered: list[str] = []
   seen: set[str] = set()
   for _, key in hits:
     if key.startswith("github_issue:flutter/flutter:") and key.split(":")[-1] in pr_nums:
+      continue
+    if key.startswith("gerrit:skia:") and key.split(":")[-1] in cr_nums:
       continue
     ck = canonicalize_artifact_key(key)
     if ck not in seen:
@@ -3661,6 +3719,15 @@ class WorkStore:
           and req_reason in ("", "chat_mention")
       ):
         effective_role = "context_only"
+      # Never let collateral mentions downgrade an established primary or channel link
+      if (
+          existing_link is not None
+          and prev_role in ("primary", "channel")
+          and effective_role == "context_only"
+          and source != "manual"
+          and not is_hub_artifact(akey, art_state)
+      ):
+        return prev_role
 
       # Keep established auto link_reason/detail across competing sync passes unless companion_wip
       if (
@@ -6379,6 +6446,200 @@ class WorkStore:
           )
           works_repaired += 1
 
+        # Split flutter#184815 / 1418376 / 1420816 / 1422517 / PR #196148 out of Jorge 1415856 card
+        if (
+            "gerrit:skia:1415856" in l_map
+            and l_map["gerrit:skia:1415856"].get("role") == "primary"
+            and any(
+                k in l_map and l_map[k].get("role") == "primary"
+                for k in (
+                    "github_issue:flutter/flutter:184815",
+                    "gerrit:skia:1418376",
+                    "gerrit:skia:1422517",
+                    "gerrit:skia:1420816",
+                    "github_pr:flutter/flutter:196148",
+                )
+            )
+        ):
+          split_184815 = "work-184815-r18"
+          conn.execute(
+              "INSERT INTO works "
+              "(work_id, title, status, project_id, roadmap_item_key, "
+              "created_at, updated_at, meta_json) "
+              "VALUES (?, ?, 'active', '', '', ?, ?, '{}') "
+              "ON CONFLICT(work_id) DO UPDATE SET updated_at = excluded.updated_at",
+              (
+                  split_184815,
+                  '1422517: Reland "[skparagraph] Cap letter spacing line shift" (flutter#184815)',
+                  cur_now,
+                  cur_now,
+              ),
+          )
+          had_1418376 = "gerrit:skia:1418376" in l_map
+          move_184815 = [
+              (
+                  "github_issue:flutter/flutter:184815",
+                  "primary",
+                  "bug_trailer",
+                  "Целевой баг из описания СЛ 1418376 / 1422517 / PR #196148",
+              ),
+              (
+                  "gerrit:skia:1418376",
+                  "primary",
+                  "bug_trailer",
+                  "В описании СЛ 1418376 указан баг flutter#184815",
+              ),
+              (
+                  "gerrit:skia:1420816",
+                  "primary",
+                  "bug_trailer",
+                  "В описании СЛ 1420816 указан баг flutter#184815",
+              ),
+              (
+                  "gerrit:skia:1422517",
+                  "primary",
+                  "bug_trailer",
+                  "В описании СЛ 1422517 указан баг flutter#184815",
+              ),
+              (
+                  "github_pr:flutter/flutter:196148",
+                  "primary",
+                  "bug_trailer",
+                  "В описании PR #196148 указан баг flutter#184815",
+              ),
+              (
+                  "gmail_thread:1a1b3655788740e1",
+                  "channel",
+                  "github_pr_thread",
+                  "Переписка с Mouad Debbar по PR #196148 (flutter#184815)",
+              ),
+              (
+                  "chat_chain:3d1e2bf2-0ae9-4459-a595-9a291b48e719",
+                  "channel",
+                  "chat_topic",
+                  "Чат по багу flutter#184815 и СЛ 1418376",
+              ),
+              (
+                  "chat_chain:78507fdf-d92f-4b37-9daa-7f6078a1ead4",
+                  "channel",
+                  "cl_watcher_chat",
+                  "Рабочий чат по СЛ 1418376 (flutter#184815)",
+              ),
+              (
+                  "chat_chain:c781389f-a5ff-41f5-9409-c4b1ff166df5",
+                  "channel",
+                  "cl_watcher_chat",
+                  "Рабочий чат по СЛ 1418376 (flutter#184815)",
+              ),
+              (
+                  "chat_chain:6a54b868-142b-4f46-9df0-3bd46520e2a2",
+                  "channel",
+                  "cl_watcher_chat",
+                  "Рабочий чат по СЛ 1420816 (flutter#184815)",
+              ),
+              (
+                  "chat_chain:14d9bdbd-06b6-4e94-bd63-31cb55d095f7",
+                  "channel",
+                  "cl_watcher_chat",
+                  "Рабочий чат по PR #196148 (flutter#184815)",
+              ),
+              (
+                  "chat_chain:03a25520-2dbf-451a-a221-63858b90e067",
+                  "channel",
+                  "cl_watcher_chat",
+                  "Рабочий чат по PR #196148 (flutter#184815)",
+              ),
+          ]
+          # Move flutter#184815 primary deliverables and dedicated correspondence/chats off Jorge
+          moved_keys: set[str] = set()
+          chat_prefixes_184815: set[str] = {
+              "3d1e2bf2",
+              "78507fdf",
+              "c781389f",
+              "6a54b868",
+              "14d9bdbd",
+              "03a25520",
+          }
+          # Sweep dynamically attached flutter#184815 / 1422517 chats off Jorge's card as well
+          for ak, row_d in l_map.items():
+            if not ak.startswith("chat_chain:"):
+              continue
+            det_s = str(row_d.get("link_detail") or "")
+            title_s = str((art_rows.get(ak) or {}).get("title") or "")
+            comb = f"{det_s} {title_s}"
+            if "1415856" not in comb and any(
+                tok in comb for tok in ("184815", "1418376", "1420816", "1422517", "196148")
+            ):
+              move_184815.append((
+                  ak,
+                  str(row_d.get("role") or "channel"),
+                  str(row_d.get("link_reason") or "cl_watcher_chat"),
+                  det_s or "Рабочий чат (flutter#184815)",
+              ))
+              cid_pref = ak.split(":", 1)[1][:8]
+              if cid_pref:
+                chat_prefixes_184815.add(cid_pref)
+          # Rebind each flutter#184815 deliverable and chat link onto work-184815-r18
+          for ak, r_role, r_reason, r_detail in move_184815:
+            if ak in l_map and ak not in moved_keys:
+              conn.execute(
+                  "DELETE FROM work_links WHERE work_id = ? AND artifact_key = ?",
+                  (wid, ak),
+              )
+              conn.execute(
+                  "INSERT OR REPLACE INTO work_links "
+                  "(work_id, artifact_key, role, source, confidence, "
+                  "created_at, link_reason, link_detail) "
+                  "VALUES (?, ?, ?, 'auto', 1.0, ?, ?, ?)",
+                  (split_184815, ak, r_role, cur_now, r_reason, r_detail),
+              )
+              moved_keys.add(ak)
+          # Carry collateral chat_mention references from the moved flutter#184815 chats with them
+          for ak, row_d in l_map.items():
+            if ak in moved_keys or row_d.get("role") != "context_only":
+              continue
+            det = str(row_d.get("link_detail") or "")
+            if row_d.get("link_reason") == "chat_mention" and any(
+                p in det for p in chat_prefixes_184815
+            ):
+              conn.execute(
+                  "DELETE FROM work_links WHERE work_id = ? AND artifact_key = ?",
+                  (wid, ak),
+              )
+              conn.execute(
+                  "INSERT OR REPLACE INTO work_links "
+                  "(work_id, artifact_key, role, source, confidence, "
+                  "created_at, link_reason, link_detail) "
+                  "VALUES (?, ?, 'context_only', 'auto', 1.0, ?, 'chat_mention', ?)",
+                  (split_184815, ak, cur_now, det),
+              )
+          # Retain 1418376 as context_only on Jorge's card since Julia cited it in that thread
+          if had_1418376:
+            conn.execute(
+                "INSERT OR REPLACE INTO work_links "
+                "(work_id, artifact_key, role, source, confidence, "
+                "created_at, link_reason, link_detail) "
+                "VALUES (?, 'gerrit:skia:1418376', 'context_only', 'auto', 1.0, "
+                "?, 'gmail_thread_ref', ?)",
+                (
+                    wid,
+                    cur_now,
+                    "Упомянут в письме 'Please revert Skia CL 1415856 (breaks ASAN/UBSan b'",
+                ),
+            )
+          # Rebind Mouad's PR #196148 correspondence obligation to the dedicated flutter#184815 Work
+          conn.execute(
+              "UPDATE obligations SET work_id = ? "
+              "WHERE work_id = ? AND target_artifact_key = 'gmail_thread:1a1b3655788740e1'",
+              (split_184815, wid),
+          )
+          conn.execute(
+              "INSERT INTO events (ts, event_type, work_id, artifact_key, payload_json) "
+              "VALUES (?, 'work_split', ?, '', ?)",
+              (cur_now, split_184815, json.dumps({"from_work_id": wid})),
+          )
+          works_repaired += 1
+
       works_repaired += self._demote_collateral_gh_issue_links(conn, art_rows, cur_now)
 
     return {
@@ -6544,6 +6805,30 @@ class WorkStore:
               "url": b_url,
               "state": b_st,
           }
+
+    # Overlay live cl_watcher_state CL/PR items onto bound SQLite rows so lane/merge transitions
+    # render without waiting for the 45s background ingestor sync
+    cl_items_raw = (cl_watcher_state or {}).get("items") or {}
+    if isinstance(cl_items_raw, Mapping):
+      for raw_ik, cval in cl_items_raw.items():
+        if not isinstance(cval, Mapping):
+          continue
+        c_kind = str(cval.get("kind") or "gerrit")
+        c_tid = str(cval.get("target_id") or raw_ik)
+        c_host = str(cval.get("host") or "")
+        c_ck = canonicalize_artifact_key(c_kind, c_tid, host=c_host)
+        existing_cl = art_rows.get(c_ck)
+        if existing_cl is not None:
+          # Preserve DB metadata while overlaying fresh cl_watcher status and entity_state
+          prev_raw = existing_cl.get("state")
+          prev_st = prev_raw if isinstance(prev_raw, Mapping) else {}
+          existing_cl["state"] = {**prev_st, **dict(cval)}
+          c_subj = str(cval.get("subject") or cval.get("title") or "").strip()
+          if c_subj and is_placeholder_title(str(existing_cl.get("title") or ""), c_ck):
+            existing_cl["title"] = f"{c_tid}: {c_subj}"
+          c_url = str(cval.get("url") or "").strip()
+          if c_url and not existing_cl.get("url"):
+            existing_cl["url"] = c_url
 
     active_work_ids = {str(w["work_id"]) for w in work_rows}
     links_by_work: dict[str, list[dict[str, Any]]] = {}
@@ -6874,8 +7159,9 @@ class WorkStore:
           })
         lane = "needs-you" if v_reasons else "waiting"
         if not v_reasons:
-          fallback_r = str(
-              est.get("reason") or item.get("attention_reason") or status
+          fallback_r = _sanitize_gerrit_account_placeholders(
+              str(est.get("reason") or item.get("attention_reason") or status),
+              item,
           )
           if fallback_r:
             v_reasons.append(fallback_r)

@@ -344,6 +344,36 @@ class EntityStateTest(unittest.TestCase):
                     "corpus_status": "not_required",
                 },
             },
+            "gerrit:1422517": {
+                "item_key": "gerrit:1422517",
+                "kind": "gerrit",
+                "target_id": "1422517",
+                "status": "NEW",
+                "patchset": 2,
+                "is_self": True,
+                "is_wip": False,
+                "phase": "WAITING_ON_OTHERS",
+                "in_my_attention": False,
+                "approved_count": 1,
+                "missing_approvals": 0,
+                "cq_status": "✓ Checks green",
+            },
+            "gerrit:1422518": {
+                "item_key": "gerrit:1422518",
+                "kind": "gerrit",
+                "target_id": "1422518",
+                "status": "NEW",
+                "patchset": 1,
+                "is_self": True,
+                "is_wip": False,
+                "phase": "WAITING_ON_OTHERS",
+                "in_my_attention": False,
+                "approved_count": 1,
+                "missing_approvals": 0,
+                "cq_status": "✓ Checks green",
+                "stack_parent_ikey": "gerrit:2001",
+                "stack_ancestors": ["gerrit:2001"],
+            },
         },
         "bugs": {},
     }
@@ -376,6 +406,7 @@ function collect(data) {{
       isAlert: isAlert(it),
       isPostSubmitAlert: isPostSubmitAlert(it),
       needsSponsorAction: needsSponsorAction(it),
+      needsSelfSubmit: needsSelfSubmit(it),
       isReviewerChange: isReviewerChange(it),
       canRebase: canRebase(it),
       canFinalizeCleanReview: canFinalizeCleanReview(it),
@@ -448,6 +479,274 @@ console.log(JSON.stringify({{
     self.assertTrue(payload["compParity"])
     self.assertFalse(payload["freshAfterConvMutation"])
     self.assertFalse(payload["sponsorWithUnapprovedAncInCachedData"])
+
+  # Verify approved green self CLs route to Needs You while unapproved zero-missing, CQ+2, WIP, or
+  # upstream-blocked CLs stay out, and <GERRIT_ACCOUNT_N> placeholders resolve to human names
+  def test_r18_needs_self_submit_and_gerrit_account_placeholder_cleanup(self) -> None:
+    now_ts = 1_794_331_000.0
+    ready_cl = {
+        "item_key": "gerrit:1422517",
+        "kind": "gerrit",
+        "target_id": "1422517",
+        "status": "NEW",
+        "phase": "WAITING_ON_OTHERS",
+        "is_self": True,
+        "is_wip": False,
+        "is_draft": False,
+        "in_development": False,
+        "in_my_attention": False,
+        "approved_count": 1,
+        "missing_approvals": 0,
+        "cq_status": "✓ Checks green",
+    }
+    self.assertTrue(es.needs_self_submit(ready_cl))
+    self.assertEqual(es.status_of(ready_cl, now_ts=now_ts), "attention")
+    self.assertEqual(es.lane_of(ready_cl, now_ts=now_ts), "you")
+    self.assertEqual(
+        es.spine_step_short_state(ready_cl, now_ts=now_ts),
+        {"short": "Ready to submit", "icon": "🚀", "tone": "spine-you"},
+    )
+    self.assertTrue(es.compute_item_entity_state(ready_cl, now_ts=now_ts)["needs_self_submit"])
+
+    for bad_override in [
+        {"approved_count": 0, "missing_approvals": 0},
+        {"approved_count": 1, "missing_approvals": 1},
+        {"cq_status": "CQ+2 (Submitting)"},
+        {"cq_status": "CQ+1 · 2 checks running"},
+        {"cq_status": "🔄 1 running"},
+        {"cq_status": "🏷️ autosubmit"},
+        {"cq_status": "🔴 Failed"},
+        {"cq_status": "🌲 Tree closed"},
+        {"phase": "SUBMITTING"},
+        {"phase": "ALERT_CQ_FAILED"},
+        {"is_wip": True},
+        {"is_draft": True},
+        {"in_development": True},
+        {"is_companion": True},
+        {"merge_conflict": True},
+        {"cq_sync_rebase_needed": True},
+        {"cq_failed": True},
+        {"tree_red": True},
+    ]:
+      cand = {**ready_cl, **bad_override}
+      self.assertFalse(es.needs_self_submit(cand), f"Expected False for {bad_override}")
+
+    stacked_child = {
+        **ready_cl,
+        "item_key": "gerrit:1422518",
+        "stack_parent_ikey": "gerrit:1422510",
+        "stack_ancestors": ["gerrit:1422510"],
+    }
+    unapproved_anc = {
+        "gerrit:1422510": {
+            "item_key": "gerrit:1422510",
+            "status": "NEW",
+            "approved_count": 0,
+            "missing_approvals": 0,
+        }
+    }
+    self.assertFalse(es.needs_self_submit(stacked_child, by_ikey=unapproved_anc))
+    merged_anc = {
+        "gerrit:1422510": {
+            "item_key": "gerrit:1422510",
+            "status": "MERGED",
+            "approved_count": 0,
+            "missing_approvals": 1,
+        }
+    }
+    self.assertTrue(es.needs_self_submit(stacked_child, by_ikey=merged_anc))
+
+    att_entry = {
+        "reason": "Added by <GERRIT_ACCOUNT_5283275> using the hovercard menu",
+        "reason_account": {
+            "_account_id": 5283275,
+            "name": "Miyoung Shin",
+            "email": "myid.shin@igalia.com",
+        },
+    }
+    self.assertEqual(
+        w._resolve_gerrit_account_placeholders(att_entry["reason"], entry=att_entry),
+        "Added by Miyoung Shin using the hovercard menu",
+    )
+    self.assertEqual(
+        w._resolve_gerrit_account_placeholders("Ping <GERRIT_ACCOUNT_9999999>"),
+        "Ping account #9999999",
+    )
+
+    # Gerrit CR-1 veto, unsatisfied Code-Owners, and GitHub CHANGES_REQUESTED block submit
+    veto_payload = {
+        "status": "NEW",
+        "subject": "[skparagraph] Cap letter spacing",
+        "owner": {"email": "jlavrova@google.com", "name": "Julia Lavrova"},
+        "current_revision": "sha333",
+        "revisions": {"sha333": {"_number": 1}},
+        "reviewers": {
+            "REVIEWER": [
+                {"email": "fmalita@google.com"},
+                {"email": "bungeman@google.com"},
+            ]
+        },
+        "labels": {
+            "Code-Review": {
+                "all": [
+                    {"email": "fmalita@google.com", "value": 1},
+                    {"email": "bungeman@google.com", "value": -1},
+                ]
+            }
+        },
+        "submit_requirements": [{"name": "Code-Review", "status": "UNSATISFIED"}],
+        "messages": [],
+    }
+    owners_payload = {
+        **veto_payload,
+        "labels": {
+            "Code-Review": {"all": [{"email": "fmalita@google.com", "value": 1}]}
+        },
+        "submit_requirements": [{"name": "Code-Owners", "status": "UNSATISFIED"}],
+    }
+    autosubmit_gerrit_payload = {
+        **veto_payload,
+        "labels": {
+            "Code-Review": {"all": [{"email": "fmalita@google.com", "value": 1}]},
+            "Auto-Submit": {"all": [{"email": "jlavrova@google.com", "value": 1}]},
+        },
+        "submit_requirements": [{"name": "Code-Review", "status": "SATISFIED"}],
+    }
+    from unittest import mock
+
+    def _json_resp(obj: dict) -> mock.MagicMock:
+      resp = mock.MagicMock()
+      resp.read.return_value = (")]}'\n" + json.dumps(obj)).encode("utf-8")
+      resp.__enter__.return_value = resp
+      return resp
+
+    for bad_gerrit_payload in (veto_payload, owners_payload, autosubmit_gerrit_payload):
+      with (
+          mock.patch.object(
+              w.urllib.request, "urlopen", return_value=_json_resp(bad_gerrit_payload)
+          ),
+          mock.patch.object(w, "gerrit_mergeable", return_value=True),
+      ):
+        g_rec = w.fetch_gerrit_cl_status("1422599", [], [], skia_dir="/nonexistent")
+      self.assertFalse(es.needs_self_submit(g_rec), f"Expected False for {g_rec}")
+
+    gh_changes_req_payload = {
+        "number": 196199,
+        "title": "[web] Test PR",
+        "state": "OPEN",
+        "isDraft": False,
+        "headRefName": "fix-branch",
+        "headRefOid": "abcdef123456",
+        "reviewDecision": "CHANGES_REQUESTED",
+        "author": {"login": "jlavrova"},
+        "latestReviews": [
+            {"author": {"login": "mdebbar"}, "state": "APPROVED", "authorAssociation": "MEMBER"},
+            {
+                "author": {"login": "yjbanov"},
+                "state": "CHANGES_REQUESTED",
+                "authorAssociation": "MEMBER",
+            },
+        ],
+        "reviews": [],
+        "reviewRequests": [],
+        "comments": [],
+        "commits": [],
+        "labels": [],
+        "statusCheckRollup": [{"name": "Linux", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+    }
+    gh_autosubmit_payload = {
+        **gh_changes_req_payload,
+        "reviewDecision": "APPROVED",
+        "latestReviews": [
+            {"author": {"login": "mdebbar"}, "state": "APPROVED", "authorAssociation": "MEMBER"}
+        ],
+        "labels": [{"name": "autosubmit"}],
+    }
+    for bad_gh_payload in (gh_changes_req_payload, gh_autosubmit_payload):
+      with mock.patch.object(
+          w.subprocess, "check_output", return_value=json.dumps(bad_gh_payload)
+      ):
+        gh_rec = w.fetch_github_pr_status("196199")
+      self.assertFalse(es.needs_self_submit(gh_rec), f"Expected False for {gh_rec}")
+
+    # Ancestor open_external_threads / tree_red, bug link stack_idx, and JS composite keys
+    anc_threads = {
+        "gerrit:1422510": {
+            "item_key": "gerrit:1422510",
+            "status": "NEW",
+            "approved_count": 1,
+            "missing_approvals": 0,
+            "open_external_threads": 2,
+        }
+    }
+    self.assertFalse(es.needs_self_submit(stacked_child, by_ikey=anc_threads))
+    bugs_map = {
+        "b:500000001": {
+            "bug_key": "b:500000001",
+            "status": "ASSIGNED",
+            "gerrit_cl_ids": ["1422518"],
+        }
+    }
+    items_composite = {
+        "gerrit:1422510@unchatted": {
+            "item_key": "gerrit:1422510",
+            "kind": "gerrit",
+            "target_id": "1422510",
+            "status": "NEW",
+            "approved_count": 0,
+            "missing_approvals": 1,
+        },
+        "gerrit:1422518@unchatted": {
+            **stacked_child,
+            "commit_message": "Bug: b/500000001",
+        },
+    }
+    w.link_bugs_and_cls(bugs_map, items_composite)
+    subtasks = bugs_map["b:500000001"].get("linked_cls") or []
+    self.assertEqual(len(subtasks), 1)
+    self.assertFalse(subtasks[0]["in_needs_you"])
+
+    # JS composite ancestor lookup blocks child submit while focusCard keeps reviewer reply snippet
+    js_src = _extract_dashboard_script()
+    node_probe = f"""
+{js_src}
+cachedData = {{
+  items: {{
+    "gerrit:1422510@unchatted": {{
+      item_key: "gerrit:1422510", kind: "gerrit", target_id: "1422510",
+      status: "NEW", is_cherry_pick: true, cherry_pick_of: "gerrit:1400000",
+      approved_count: 0, missing_approvals: 1
+    }},
+    "gerrit:1400000@unchatted": {{
+      item_key: "gerrit:1400000", kind: "gerrit", target_id: "1400000", status: "MERGED"
+    }},
+    "gerrit:1422518@unchatted": {{
+      item_key: "gerrit:1422518", kind: "gerrit", target_id: "1422518",
+      status: "NEW", is_self: true, approved_count: 1, missing_approvals: 0,
+      cq_status: "✓ Dry Run Passed", stack_ancestors: ["gerrit:1422510"]
+    }}
+  }}
+}};
+buildStackContext(visibleItemsFromData(cachedData));
+const childBlocked = needsSelfSubmit(cachedData.items["gerrit:1422518@unchatted"]);
+const cardHtml = focusCard({{
+  item_key: "gerrit:1422517", kind: "gerrit", target_id: "1422517",
+  project_name: "Skia", subject: "Cap letter spacing", url: "https://example.com/1422517",
+  status: "NEW", patchset: 2, is_self: true, phase: "NEEDS_YOUR_ACTION",
+  in_my_attention: true, approved_count: 1, missing_approvals: 0, open_external_threads: 0,
+  cq_status: "Idle", last_msg_author: "fmalita@google.com",
+  last_msg_snippet: "LGTM modulo comment wording", status_changed_et: "12:00"
+}}, cachedData);
+console.log(JSON.stringify({{childBlocked, cardHtml}}));
+"""
+    probe_out = json.loads(
+        subprocess.check_output(["node", "-"], input=node_probe, text=True, timeout=10)
+    )
+    self.assertFalse(probe_out["childBlocked"])
+    self.assertIn("Ready to submit", probe_out["cardHtml"])
+    self.assertIn("LGTM modulo comment wording", probe_out["cardHtml"])
+    self.assertNotIn("checks green", probe_out["cardHtml"])
+
 
 
 if __name__ == "__main__":

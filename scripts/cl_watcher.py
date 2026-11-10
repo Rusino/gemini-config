@@ -4544,6 +4544,56 @@ def check_skia_cq_sync_infra_failure(cl_id: str, ps_num: int) -> bool:
   return fetch_skia_cq_failure_details(cl_id, ps_num)[0]
 
 
+def _resolve_gerrit_account_placeholders(
+    text: str,
+    entry: dict[str, Any] | None = None,
+    change_detail: dict[str, Any] | None = None,
+) -> str:
+  """Replaces <GERRIT_ACCOUNT_N> placeholders in Gerrit reason text with human names."""
+  if "<GERRIT_ACCOUNT_" not in text:
+    return text
+  acc_map: dict[str, str] = {}
+
+  def _record(acc: Any) -> None:
+    if not isinstance(acc, dict) or acc.get("_account_id") is None:
+      return
+    aid = str(acc["_account_id"])
+    lbl = str(acc.get("name") or acc.get("email") or "").strip()
+    if lbl and aid not in acc_map:
+      acc_map[aid] = lbl
+
+  if isinstance(entry, dict):
+    _record(entry.get("reason_account"))
+    _record(entry.get("account"))
+  # Walk reviewers, attention_set, and messages to map numeric Gerrit _account_id to human names
+  if isinstance(change_detail, dict):
+    _record(change_detail.get("owner"))
+    revs = change_detail.get("reviewers")
+    if isinstance(revs, dict):
+      for grp in revs.values():
+        if isinstance(grp, list):
+          for acc in grp:
+            _record(acc)
+    att = change_detail.get("attention_set")
+    if isinstance(att, dict):
+      for av in att.values():
+        if isinstance(av, dict):
+          _record(av.get("reason_account"))
+          _record(av.get("account"))
+    msgs = change_detail.get("messages")
+    if isinstance(msgs, list):
+      for msg in msgs:
+        if isinstance(msg, dict):
+          _record(msg.get("author"))
+          for acc in msg.get("accounts_in_message") or []:
+            _record(acc)
+  return re.sub(
+      r"<GERRIT_ACCOUNT_(\d+)>",
+      lambda m: acc_map.get(m.group(1), f"account #{m.group(1)}"),
+      text,
+  )
+
+
 def fetch_gerrit_cl_status(
     cl_id: str,
     rollers: dict[str, Any],
@@ -4640,8 +4690,11 @@ def fetch_gerrit_cl_status(
           str((v.get("account") or {}).get("email") or "")
           for v in (d.get("attention_set") or {}).values()
       ]
+      # Resolve raw <GERRIT_ACCOUNT_N> tokens before caching self attention reasons
       self_att_reasons = [
-          str(v.get("reason") or "")
+          _resolve_gerrit_account_placeholders(
+              str(v.get("reason") or ""), entry=v, change_detail=d
+          )
           for v in (d.get("attention_set") or {}).values()
           if isinstance(v, dict)
           and str((v.get("account") or {}).get("email") or "") in SELF_EMAILS
@@ -4703,9 +4756,16 @@ def fetch_gerrit_cl_status(
           for a in ((labels.get("Commit-Queue") or {}).get("all") or [])
           if a.get("value")
       ]
+      # Track Gerrit Auto-Submit votes so Auto-Submit CLs do not prompt manual CQ+2
+      autosubmit_votes = [
+          (str(a.get("email") or ""), int(a.get("value") or 0))
+          for a in ((labels.get("Auto-Submit") or {}).get("all") or [])
+          if a.get("value")
+      ]
       max_cr = max([v for _, v in cr_votes], default=0)
       min_cr = min([v for _, v in cr_votes], default=0)
       max_cq = max([v for _, v in cq_votes], default=0)
+      max_autosubmit = max([v for _, v in autosubmit_votes], default=0)
       self_cr_vote = max((v for e, v in cr_votes if e in SELF_EMAILS), default=0)
 
       self_review_state, self_review_ps, self_comment_count = (
@@ -4792,19 +4852,16 @@ def fetch_gerrit_cl_status(
           else 0
       )
       submit_reqs = d.get("submit_requirements") or []
-      unsatisfied_review_reqs = [
-          str(sr.get("name") or "")
+      any_unsatisfied_sr = any(
+          isinstance(sr, dict) and str(sr.get("status") or "") == "UNSATISFIED"
           for sr in submit_reqs
-          if isinstance(sr, dict)
-          and str(sr.get("status") or "") == "UNSATISFIED"
-          and str(sr.get("name") or "")
-          in ("Code-Review", "Review-Enforcement", "Owners-Override")
-      ]
+      )
+      # Block Ready-to-submit on CR-1 vetoes, unsatisfied Code-Owners, or submittable=False
       missing_approvals = (
           max(
               0,
               required_approvals - approved_count,
-              1 if (unsatisfied_review_reqs and min_cr >= 0) else 0,
+              1 if (any_unsatisfied_sr or min_cr < 0 or d.get("submittable") is False) else 0,
           )
           if status == "NEW"
           else 0
@@ -5012,6 +5069,13 @@ def fetch_gerrit_cl_status(
           cq_status = "✓ Dry Run Passed"
           cq_msg_date = str(m.get("date") or "")
           break
+      # Mark Auto-Submit CLs in cq_status so needs_self_submit leaves them in Waiting
+      if max_autosubmit > 0 and max_cq == 0 and not cq_failed:
+        cq_status = (
+            "🏷️ Auto-Submit (Dry Run Passed)"
+            if cq_status == "✓ Dry Run Passed"
+            else "🏷️ Auto-Submit"
+        )
       if cq_failed and host == GERRIT_SKIA_HOST and status == "NEW":
         cq_sync_rebase_needed, failed_check_details, cq_advice = (
             fetch_skia_cq_failure_details(cl_id, ps_num, files)
@@ -5942,7 +6006,11 @@ def fetch_github_pr_status(
     elif pending_checks:
       cq_status = f"🔄 {len(pending_checks)} running"
     else:
-      cq_status = "✓ Checks green"
+      # Distinguish GitHub auto-merge PRs from idle green PRs needing manual merge
+      has_autosubmit = bool(d.get("autoMergeRequest")) or any(
+          lbl.lower() in ("autosubmit", "auto-submit") for lbl in label_names
+      )
+      cq_status = "🏷️ autosubmit" if has_autosubmit else "✓ Checks green"
 
     reviews = d.get("reviews") or []
     # flutter/flutter requires 2 approvals on external PRs; reviewDecision reflects branch rules
@@ -6017,6 +6085,9 @@ def fetch_github_pr_status(
     )
     if state != "OPEN":
       missing_approvals = 0
+    # Force missing_approvals >= 1 whenever any reviewer requests changes
+    elif changes_requested_by or review_decision == "CHANGES_REQUESTED":
+      missing_approvals = max(1, required_approvals - approved_count)
     elif review_decision == "APPROVED" and required_approvals == 1:
       missing_approvals = 0
     elif review_decision == "REVIEW_REQUIRED":
@@ -10166,6 +10237,7 @@ def link_bugs_and_cls(
         bug["project_name"] = str(chosen.get("project_name") or "")
 
   # Populate bidirectional display lists on bugs and CL items
+  stack_idx = {ik: pairs[0][1] for ik, pairs in cl_entries_by_ikey.items() if pairs}
   for bkey, bug in bugs_by_key.items():
     if not isinstance(bug, dict):
       continue
@@ -10198,9 +10270,12 @@ def link_bugs_and_cls(
             "is_wip": bool(rec.get("is_wip") or rec.get("is_draft")),
             "shared_1_to_1": len(cl_to_bugs.get(ik, [])) <= 1,
             "in_needs_you": bool(
-                rec.get("in_my_attention") 
+                rec.get("in_my_attention")
                 or (rec.get("merge_conflict") and rec.get("is_self"))
                 or bool(rec.get("sponsor_action"))
+                or entity_state.needs_self_submit(
+                    rec, by_ikey=stack_idx, raw_items=items_by_key
+                )
             ),
             "state_summary": _summarize_cl_for_bug_subtask(rec),
             # Fall back to parsed creation timestamp when created_ts is not precomputed on rec
@@ -12082,6 +12157,7 @@ def attach_merge_children_to_cls_and_bugs(
     merge_groups.setdefault(gk, []).append(bug)
 
   covered_cp_ikeys: set[str] = set()
+  stack_idx = {ik: recs[0] for ik, recs in by_ikey.items() if recs}
   for gk, group_bugs in merge_groups.items():
     parent_id = "" if gk.startswith("solo:") else gk
     parent_bug = (bugs or {}).get(f"buganizer:{parent_id}") if parent_id else None
@@ -12146,6 +12222,7 @@ def attach_merge_children_to_cls_and_bugs(
             cp_rec.get("in_my_attention")
             or (cp_rec.get("merge_conflict") and cp_rec.get("is_self"))
             or str(cp_rec.get("phase") or "").startswith("ALERT_")
+            or entity_state.needs_self_submit(cp_rec, by_ikey=stack_idx, raw_items=items)
         )
       elif cp_ikey:
         covered_cp_ikeys.add(cp_ikey)
@@ -12212,6 +12289,7 @@ def attach_merge_children_to_cls_and_bugs(
         sample.get("in_my_attention")
         or (sample.get("merge_conflict") and sample.get("is_self"))
         or str(sample.get("phase") or "").startswith("ALERT_")
+        or entity_state.needs_self_submit(sample, by_ikey=stack_idx, raw_items=items)
     )
     entry = {
         "milestone": ms_val,
@@ -15886,8 +15964,21 @@ function itemCoreSig(it) {
     psPending, s(it.sponsor_action), b(it.self_approved), s(it.self_review_state),
     n(it.self_cr_vote), b(it.chat_busy), b(it.conversation_id), s(it.stack_root_ikey),
     n(it.patchset), n(it.reviewed_ps), n(it.review_target_ps), s(it.head_sha),
-    s(it.revision), s(it.kind), s(it.item_key), compsSig, mcNeeds, trSig, armedSig,
+    s(it.revision), s(it.kind), s(it.item_key), s(it.review_decision), s(it.cr_summary),
+    compsSig, mcNeeds, trSig, armedSig,
   ].join('|');
+}
+
+// Resolves an ancestor item_key across cachedStackByIkey and composite "<ikey>@<cid>" entries
+function lookupAncItem(ancKey, rawItems) {
+  const direct = cachedStackByIkey.get(ancKey) || (rawItems && rawItems[ancKey]);
+  if (direct) return direct;
+  // Unchatted CLs are stored under "<ikey>@unchatted" keys in rawItems
+  if (!rawItems || typeof rawItems !== 'object') return null;
+  for (const v of Object.values(rawItems)) {
+    if (v && typeof v === 'object' && itemKeyOf(v) === ancKey) return v;
+  }
+  return null;
 }
 
 // Verifies whether backend-computed entity_state matches the item and its stack ancestors
@@ -15901,7 +15992,7 @@ function hasFreshEntityState(it, data) {
   if (!ancs.length) return es.input_sig === base;
   const rawItems = (data && data.items) || (cachedData && cachedData.items) || {};
   const parts = ancs.map(k => {
-    const anc = cachedStackByIkey.get(k) || rawItems[k] || null;
+    const anc = lookupAncItem(k, rawItems);
     return `${k}=${anc ? itemCoreSig(anc) : ''}`;
   });
   return es.input_sig === `${base}||${parts.join('~')}`;
@@ -16321,6 +16412,7 @@ function spineStepShortState(m) {
     }
     return {short: 'Ready CQ+2', icon: '🚀', tone: 'spine-you'};
   }
+  if (needsSelfSubmit(m)) return {short: 'Ready to submit', icon: '🚀', tone: 'spine-you'};
   if (m.self_approved || m.self_review_state === 'approved') {
     return {short: 'CR+1', icon: '✓', tone: 'spine-ok'};
   }
@@ -16413,7 +16505,8 @@ function renderFocusSection(youItems, shownItems, data) {
       m => needsSponsorAction(m) && m.sponsor_action === 'assign_second_reviewer'
     );
     const readyCq = youMembers.filter(
-      m => needsSponsorAction(m) && String(m.sponsor_action || '').startsWith('submit_cq')
+      m => needsSelfSubmit(m) ||
+        (needsSponsorAction(m) && String(m.sponsor_action || '').startsWith('submit_cq'))
     );
     const otherYou = youMembers.length - need2nd.length - readyCq.length;
     const approved = members.filter(
@@ -16895,7 +16988,7 @@ function needsSponsorAction(it) {
     // Fall back to cachedData.items when cachedStackByIkey has not been built yet
     const rawItems = (cachedData && cachedData.items) || {};
     for (const ancKey of ancs) {
-      const anc = cachedStackByIkey.get(ancKey) || rawItems[ancKey] || null;
+      const anc = lookupAncItem(ancKey, rawItems);
       if (!anc) continue;
       const st = String(anc.status || '').toUpperCase();
       if (st === 'MERGED' || st === 'ABANDONED' || st === 'CLOSED') continue;
@@ -16903,6 +16996,55 @@ function needsSponsorAction(it) {
           anc.cq_failed || anc.is_wip) {
         return false;
       }
+    }
+  }
+  return true;
+}
+
+// Self-authored open CLs with all approvals and green idle checks need manual CQ+2
+function needsSelfSubmit(it) {
+  // Reuse backend needs_self_submit predicate when item and ancestor states are fresh
+  if (hasFreshEntityState(it)) return Boolean(it.entity_state.needs_self_submit);
+  // Pre-review drafts, WIPs, companions, and failing/conflicted CLs never prompt manual CQ+2
+  if (!it || !it.is_self || isCompanion(it)) return false;
+  if (it.status !== 'NEW' && it.status !== 'OPEN') return false;
+  if (it.phase === 'SUBMITTING' || it.phase === 'ALERT_CQ_FAILED') return false;
+  if (it.is_wip || it.is_draft || it.in_development) return false;
+  if (it.cq_failed || it.merge_conflict || it.cq_sync_rebase_needed || it.tree_red ||
+      Number(it.open_external_threads || 0) > 0) {
+    return false;
+  }
+  // Reject unapproved, partially approved, or vetoed CLs
+  const crSum = String(it.cr_summary || '');
+  if (Number(it.approved_count || 0) <= 0 || Number(it.missing_approvals || 0) > 0 ||
+      String(it.review_decision || '').toUpperCase() === 'CHANGES_REQUESTED' ||
+      String(it.reviewer_status || '') === 'Changes requested' ||
+      crSum.startsWith('-') || crSum.startsWith('✗')) {
+    return false;
+  }
+  // Active CQ runs, Auto-Submit, and tree/tryjob failures belong to landing or alert lanes
+  const cq = String(it.cq_status || '');
+  const cqLow = cq.toLowerCase();
+  if (cq.startsWith('CQ+') || cq.startsWith('🔴') || cq.startsWith('🌲') ||
+      cq.startsWith('🏷️') || cqLow.includes('running') || cqLow.includes('autosubmit') ||
+      cqLow.includes('submitting')) {
+    return false;
+  }
+  // Hold manual CQ+2 when an unmerged stack ancestor still lacks approvals or has blockers
+  const rawAncs = Array.isArray(it.stack_ancestors) && it.stack_ancestors.length
+    ? it.stack_ancestors.filter(Boolean).map(String)
+    : (it.stack_parent_ikey ? [String(it.stack_parent_ikey)] : []);
+  const rawItems = (cachedData && cachedData.items) || {};
+  for (const ancKey of rawAncs) {
+    const anc = lookupAncItem(ancKey, rawItems);
+    if (!anc) continue;
+    const st = String(anc.status || '').toUpperCase();
+    if (st === 'MERGED' || st === 'ABANDONED' || st === 'CLOSED') continue;
+    if (Number(anc.approved_count || 0) <= 0 || Number(anc.missing_approvals || 0) > 0 ||
+        anc.merge_conflict || anc.cq_sync_rebase_needed || anc.cq_failed || anc.tree_red ||
+        Number(anc.open_external_threads || 0) > 0 ||
+        anc.is_wip || anc.is_draft || anc.in_development) {
+      return false;
     }
   }
   return true;
@@ -16926,6 +17068,8 @@ function statusOf(it) {
   }
   // Sponsored external CLs stay out of Gerrit attention_set yet still need Googler action
   if (needsSponsorAction(it)) return 'attention';
+  // Approved green self CLs drop out of Gerrit attention_set once checks finish yet need CQ+2
+  if (needsSelfSubmit(it)) return 'attention';
   // Open orphan companions wait on the parent author unless marked ready to abandon
   if (isCompanion(it)) {
     return it.ready_to_abandon ? 'attention' : 'waiting';
@@ -19033,6 +19177,17 @@ function focusCard(it, data) {
     } else {
       actions = link(it.url, `Open ${kindWord}`, 'btn primary') + chatBtn;
     }
+  } else if (needsSelfSubmit(it)) {
+    // Surface manual submit callout while preserving unread reviewer note snippets on PS
+    const cqRaw = String(it.cq_status || '').trim();
+    const readyDetail = (!cqRaw || cqRaw === 'Idle')
+      ? 'All approvals met · ready for CQ+2'
+      : 'All approvals met and checks green';
+    const tail = (needsMyReply(it) && !hasFreshReviewWithoutNewerReply(it))
+      ? formatMsgWhy(it)
+      : formatStatusTime(it);
+    why = [`<b>🚀 Ready to submit</b>: ${readyDetail}`, tail].filter(Boolean).join(' · ');
+    actions = link(it.url, `Open ${kindWord}`, 'btn primary') + chatBtn;
   } else {
     // Omit the trigger message when a current-PS review summary is already shown below
     if (hasFreshReviewWithoutNewerReply(it)) {

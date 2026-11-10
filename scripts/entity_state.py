@@ -519,6 +519,81 @@ def needs_sponsor_action(
   return True
 
 
+def needs_self_submit(
+    item: Mapping[str, Any] | None,
+    by_ikey: Mapping[str, dict[str, Any]] | None = None,
+    raw_items: Mapping[str, dict[str, Any]] | None = None,
+) -> bool:
+  """Self-authored open CLs with all approvals and green idle checks need manual CQ+2."""
+  if not isinstance(item, Mapping) or not item.get("is_self") or is_companion(item):
+    return False
+  if item.get("status") not in ("NEW", "OPEN") or item.get("phase") in (
+      "SUBMITTING",
+      "ALERT_CQ_FAILED",
+  ):
+    return False
+  if item.get("is_wip") or item.get("is_draft") or item.get("in_development"):
+    return False
+  if (
+      item.get("cq_failed")
+      or item.get("merge_conflict")
+      or item.get("cq_sync_rebase_needed")
+      or item.get("tree_red")
+      or _to_int(item.get("open_external_threads") or 0) > 0
+  ):
+    return False
+  # Reject unapproved, partially approved, or vetoed CLs even when missing_approvals is 0
+  if (
+      _to_int(item.get("approved_count") or 0) <= 0
+      or _to_int(item.get("missing_approvals") or 0) > 0
+      or str(item.get("review_decision") or "").upper() == "CHANGES_REQUESTED"
+      or str(item.get("reviewer_status") or "") == "Changes requested"
+      or str(item.get("cr_summary") or "").startswith(("-", "✗"))
+  ):
+    return False
+  # Active CQ runs, Auto-Submit, and tree/tryjob failures belong to landing or alert lanes
+  cq = str(item.get("cq_status") or "")
+  cq_low = cq.lower()
+  if (
+      cq.startswith(("CQ+", "🔴", "🌲", "🏷️"))
+      or "running" in cq_low
+      or "autosubmit" in cq_low
+      or "submitting" in cq_low
+  ):
+    return False
+  # Hold manual CQ+2 when an unmerged stack ancestor still lacks approvals or has blockers
+  raw_ancs = item.get("stack_ancestors")
+  if isinstance(raw_ancs, list) and raw_ancs:
+    ancs = [str(a) for a in raw_ancs if a]
+  elif item.get("stack_parent_ikey"):
+    ancs = [str(item["stack_parent_ikey"])]
+  else:
+    ancs = []
+  for anc_key in ancs:
+    anc = (by_ikey.get(anc_key) if by_ikey else None) or (
+        raw_items.get(anc_key) if raw_items else None
+    )
+    if not isinstance(anc, Mapping):
+      continue
+    st = str(anc.get("status") or "").upper()
+    if st in ("MERGED", "ABANDONED", "CLOSED"):
+      continue
+    if (
+        _to_int(anc.get("approved_count") or 0) <= 0
+        or _to_int(anc.get("missing_approvals") or 0) > 0
+        or anc.get("merge_conflict")
+        or anc.get("cq_sync_rebase_needed")
+        or anc.get("cq_failed")
+        or anc.get("tree_red")
+        or _to_int(anc.get("open_external_threads") or 0) > 0
+        or anc.get("is_wip")
+        or anc.get("is_draft")
+        or anc.get("in_development")
+    ):
+      return False
+  return True
+
+
 def status_of(
     item: Mapping[str, Any] | None,
     by_ikey: Mapping[str, dict[str, Any]] | None = None,
@@ -544,6 +619,9 @@ def status_of(
   ):
     return "attention"
   if needs_sponsor_action(item, by_ikey=by_ikey, raw_items=raw_items):
+    return "attention"
+  # Approved green self CLs drop out of Gerrit attention_set once checks finish yet need CQ+2
+  if needs_self_submit(item, by_ikey=by_ikey, raw_items=raw_items):
     return "attention"
   if is_companion(item):
     return "attention" if item.get("ready_to_abandon") else "waiting"
@@ -765,6 +843,9 @@ def spine_step_short_state(
     if act == "submit_cq_conflict":
       return {"short": "CR+1 · rebase", "icon": "⚠️", "tone": "spine-warn"}
     return {"short": "Ready CQ+2", "icon": "🚀", "tone": "spine-you"}
+  # Surface Ready to submit badge on approved green self CLs awaiting manual CQ+2
+  if needs_self_submit(item, by_ikey=by_ikey, raw_items=raw_items):
+    return {"short": "Ready to submit", "icon": "🚀", "tone": "spine-you"}
   if item.get("self_approved") or item.get("self_review_state") == "approved":
     return {"short": "CR+1", "icon": "✓", "tone": "spine-ok"}
   if is_armed_finalize(item):
@@ -1055,6 +1136,9 @@ def _item_core_sig(item: Mapping[str, Any] | None, now_ts: float | None = None) 
       s(item.get("revision")),
       s(item.get("kind")),
       s(item.get("item_key")),
+      # Include review_decision and cr_summary so veto flips invalidate cached entity_state
+      s(item.get("review_decision")),
+      s(item.get("cr_summary")),
       comps_sig,
       mc_needs,
       tr_sig,
@@ -1107,6 +1191,7 @@ def compute_item_entity_state(
       "is_alert": is_alert(item),
       "is_post_submit_alert": is_post_submit_alert(item),
       "needs_sponsor_action": needs_sponsor_action(item, by_ikey=by_ikey, raw_items=raw_items),
+      "needs_self_submit": needs_self_submit(item, by_ikey=by_ikey, raw_items=raw_items),
       "is_reviewer_change": is_reviewer_change(item),
       "can_rebase": can_rebase(item),
       "can_finalize_clean_review": can_finalize_clean_review(item),

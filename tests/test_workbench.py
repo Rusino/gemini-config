@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -7957,6 +7958,482 @@ for (const q of ['', 'alpha']) {
         now=now + 31,
     )
     self.assertNotIn(w_dup_bug, {w["work_id"] for w in store.list_works()})
+
+  # Verify approved self CLs surface Ready to submit in Needs You, chat_mention never downgrades
+  # primary links, subject-scoped emails demote unrelated body CLs, and flutter#184815 splits out
+  def test_r18_ready_to_submit_lane_chat_mention_guard_and_subject_email_isolation(self) -> None:
+    scripts_dir = os.path.expanduser("~/.gemini/config/scripts")
+    if scripts_dir not in sys.path:
+      sys.path.insert(0, scripts_dir)
+    from unittest import mock
+    import entity_state as es
+    import ingestor
+    import work_store
+
+    now = 1_794_331_000.0
+    store = work_store.WorkStore(self.db_path)
+
+    ready_item = {
+        "item_key": "gerrit:1422517",
+        "kind": "gerrit",
+        "target_id": "1422517",
+        "project_name": "Skia",
+        "status": "NEW",
+        "patchset": 2,
+        "is_self": True,
+        "is_wip": False,
+        "phase": "WAITING_ON_OTHERS",
+        "in_my_attention": False,
+        "approved_count": 1,
+        "missing_approvals": 0,
+        "cq_status": "✓ Checks green",
+        "open_external_threads": 0,
+        "subject": 'Reland "[skparagraph] Cap letter spacing line shift"',
+        "url": "https://skia-review.googlesource.com/c/skia/+/1422517",
+    }
+    ready_item["entity_state"] = es.compute_item_entity_state(ready_item, now_ts=now)
+
+    reply_item = {
+        "item_key": "gerrit:1409637",
+        "kind": "gerrit",
+        "target_id": "1409637",
+        "project_name": "Skia",
+        "status": "NEW",
+        "patchset": 4,
+        "is_self": True,
+        "is_wip": False,
+        "phase": "NEEDS_YOUR_ACTION",
+        "in_my_attention": True,
+        "approved_count": 1,
+        "missing_approvals": 0,
+        "cq_status": "✓ Checks green",
+        "open_external_threads": 1,
+        "attention_reason": "Added by <GERRIT_ACCOUNT_5283275> using the hovercard menu",
+        "last_msg_author_name": "Miyoung Shin",
+        "subject": "Handle bidi runs",
+        "url": "https://skia-review.googlesource.com/c/skia/+/1409637",
+    }
+    reply_item["entity_state"] = es.compute_item_entity_state(reply_item, now_ts=now)
+
+    proj_cl = store.build_dashboard_projection(
+        cl_watcher_state={
+            "items": {
+                "gerrit:1422517": ready_item,
+                "gerrit:1409637": reply_item,
+            }
+        },
+        now=now,
+    )
+    by_virt_id = {w["work_id"]: w for w in proj_cl["works"]}
+    card_1422517 = by_virt_id["virt-gerrit:skia:1422517"]
+    self.assertEqual(card_1422517["lane"], "needs-you")
+    self.assertIn("🚀 Ready to submit: Gerrit 1422517 PS2", card_1422517["reasons"])
+
+    card_1409637 = by_virt_id["virt-gerrit:skia:1409637"]
+    self.assertEqual(card_1409637["lane"], "needs-you")
+    for r_txt in card_1409637["reasons"]:
+      self.assertNotIn("<GERRIT_ACCOUNT_", r_txt)
+      self.assertNotIn("Ready to submit", r_txt)
+
+    # chat_mention must never downgrade an existing primary link to context_only
+    w_guard = store.create_work("1418376: Cap letter spacing", now=now)
+    store.upsert_artifact(
+        "gerrit:skia:1418376",
+        kind="gerrit",
+        title="1418376: [skparagraph] Cap letter spacing line shift",
+        state={
+            "status": "MERGED",
+            "is_mine": True,
+            "commit_message": "Bug: https://github.com/flutter/flutter/issues/184815",
+        },
+        now=now,
+    )
+    store.link_artifact(
+        w_guard,
+        "gerrit:skia:1418376",
+        role="primary",
+        source="auto",
+        link_reason="bug_trailer",
+        now=now,
+    )
+    role_after_mention = store.link_artifact(
+        w_guard,
+        "gerrit:skia:1418376",
+        role="context_only",
+        source="auto",
+        link_reason="chat_mention",
+        now=now + 10,
+    )
+    self.assertEqual(role_after_mention, "primary")
+    self.assertEqual(store.get_work_artifact_roles(w_guard)["gerrit:skia:1418376"], "primary")
+
+    # Subject-scoped revert email ("Please revert Skia CL 1415856") must not hijack unrelated
+    # self-authored body CL 1418376 even before 1418376 has a Work owner
+    store2_path = self.db_path + ".subj_iso"
+    store2 = work_store.WorkStore(store2_path)
+    store2.upsert_artifact(
+        "gerrit:skia:1415856",
+        kind="gerrit",
+        title="1415856: Swizzler SIMD tweak",
+        state={"status": "MERGED", "is_mine": True, "commit_message": "Bug: b/400000111"},
+        now=now,
+    )
+    store2.upsert_artifact(
+        "gerrit:skia:1418376",
+        kind="gerrit",
+        title="1418376: [skparagraph] Cap letter spacing line shift",
+        state={
+            "status": "MERGED",
+            "is_mine": True,
+            "commit_message": "Bug: https://github.com/flutter/flutter/issues/184815",
+        },
+        now=now,
+    )
+
+    def _b64(s: str) -> str:
+      return base64.urlsafe_b64encode(s.encode("utf-8")).decode("ascii")
+
+    def fake_jorge_gmail(cmd, *args, **kwargs):
+      del args, kwargs
+      res = subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+      if "drafts" in cmd:
+        res.stdout = json.dumps({"drafts": []})
+      elif "search" in cmd:
+        q = " ".join(cmd)
+        if "from:me" in q:
+          res.stdout = json.dumps({"messages": [{"id": "mj1", "threadId": "1a1ae0e07e44a362"}]})
+        else:
+          res.stdout = json.dumps({"messages": []})
+      elif "get-thread" in cmd:
+        res.stdout = json.dumps({
+            "messages": [
+                {
+                    "internalDate": str(int((now - 3600) * 1000)),
+                    "snippet": "Please revert Skia CL 1415856",
+                    "payload": {
+                        "mimeType": "text/plain",
+                        "headers": [
+                            {
+                                "name": "Subject",
+                                "value": "Please revert Skia CL 1415856 (breaks ASAN/UBSan bots)",
+                            },
+                            {"name": "From", "value": "Jorge Betancourt <jmbetancourt@google.com>"},
+                            {"name": "To", "value": "Julia Lavrova <jlavrova@google.com>"},
+                        ],
+                        "body": {
+                            "data": _b64(
+                                "Hi Julia, https://skia-review.googlesource.com/c/skia/+/1415856 "
+                                "broke ASAN."
+                            )
+                        },
+                    },
+                },
+                {
+                    "internalDate": str(int((now - 1800) * 1000)),
+                    "snippet": "Sorry, I was focused on 1418376",
+                    "payload": {
+                        "mimeType": "text/plain",
+                        "headers": [
+                            {
+                                "name": "Subject",
+                                "value": (
+                                    "Re: Please revert Skia CL 1415856 (breaks ASAN/UBSan bots)"
+                                ),
+                            },
+                            {"name": "From", "value": "Julia Lavrova <jlavrova@google.com>"},
+                            {"name": "To", "value": "Jorge Betancourt <jmbetancourt@google.com>"},
+                        ],
+                        "body": {
+                            "data": _b64(
+                                "Sorry, I was landing "
+                                "https://skia-review.googlesource.com/c/skia/+/1418376 first."
+                            )
+                        },
+                    },
+                },
+            ]
+        })
+      return res
+
+    with (
+        mock.patch("os.path.isfile", return_value=True),
+        mock.patch("subprocess.run", side_effect=fake_jorge_gmail),
+    ):
+      ingestor.ingest_gmail_drafts_and_threads(store2, {}, now=now)
+
+    jorge_wid = store2.find_work_by_artifact("gmail_thread:1a1ae0e07e44a362", roles=("primary",))
+    self.assertIsNotNone(jorge_wid)
+    jorge_roles = store2.get_work_artifact_roles(jorge_wid or "")
+    self.assertEqual(jorge_roles.get("gerrit:skia:1415856"), "primary")
+    self.assertEqual(jorge_roles.get("gerrit:skia:1418376"), "context_only")
+
+    # Polluted Jorge card splits flutter#184815 artifacts + Mouad PR thread into work-184815-r18
+    store3 = work_store.WorkStore(self.db_path + ".split_184815")
+    w_polluted = store3.create_work(
+        "Please revert Skia CL 1415856 (breaks ASAN/UBSan bots on main) — Jorge Betancourt",
+        work_id="work-189f43b331",
+        now=now,
+    )
+    for ak, kind, title in [
+        ("gmail_thread:1a1ae0e07e44a362", "gmail_thread", "Please revert Skia CL 1415856"),
+        ("gmail_thread:1a1b3655788740e1", "gmail_thread", "[flutter/flutter] PR #196148"),
+        ("gerrit:skia:1415856", "gerrit", "1415856: Swizzler"),
+        ("gerrit:skia:1418376", "gerrit", "1418376: [skparagraph] Cap letter spacing line shift"),
+        ("gerrit:skia:1420816", "gerrit", "1420816: Revert Cap letter spacing"),
+        ("gerrit:skia:1422517", "gerrit", '1422517: Reland "[skparagraph] Cap letter spacing"'),
+        ("github_issue:flutter/flutter:184815", "github_issue", "flutter#184815: letterSpacing"),
+        ("github_pr:flutter/flutter:196148", "github_pr", "PR #196148: Accept capped line shift"),
+        ("chat_chain:78507fdf-d92f-4b37-9daa-7f6078a1ead4", "chat_chain", "Chat 1418376"),
+        ("github_pr:flutter/flutter:196295", "github_pr", "PR #196295"),
+    ]:
+      store3.upsert_artifact(ak, kind=kind, title=title, now=now)
+    store3.link_artifact(
+        w_polluted, "gmail_thread:1a1ae0e07e44a362", role="primary", link_reason="gmail_root"
+    )
+    store3.link_artifact(
+        w_polluted, "gerrit:skia:1415856", role="primary", link_reason="gmail_thread_ref"
+    )
+    store3.link_artifact(
+        w_polluted, "gerrit:skia:1418376", role="primary", link_reason="gmail_thread_ref"
+    )
+    store3.link_artifact(
+        w_polluted, "gerrit:skia:1420816", role="primary", link_reason="bug_trailer"
+    )
+    store3.link_artifact(
+        w_polluted, "gerrit:skia:1422517", role="primary", link_reason="bug_trailer"
+    )
+    store3.link_artifact(
+        w_polluted, "github_issue:flutter/flutter:184815", role="primary", link_reason="bug_trailer"
+    )
+    store3.link_artifact(
+        w_polluted, "github_pr:flutter/flutter:196148", role="primary", link_reason="bug_trailer"
+    )
+    store3.link_artifact(
+        w_polluted,
+        "gmail_thread:1a1b3655788740e1",
+        role="channel",
+        link_reason="github_pr_thread",
+    )
+    store3.link_artifact(
+        w_polluted,
+        "chat_chain:78507fdf-d92f-4b37-9daa-7f6078a1ead4",
+        role="channel",
+        link_reason="cl_watcher_chat",
+    )
+    store3.link_artifact(
+        w_polluted,
+        "github_pr:flutter/flutter:196295",
+        role="context_only",
+        link_reason="chat_mention",
+        link_detail="Попутно упомянут в чате 3d1e2bf2 (шаг 391)",
+    )
+    ob_id = store3.add_obligation(
+        w_polluted,
+        "Close loop PR #196148",
+        trigger_expr="correspondence_turn(gmail_thread:1a1b3655788740e1, 7)",
+        target_artifact_key="gmail_thread:1a1b3655788740e1",
+        now=now,
+    )
+
+    store3.purge_config_artifacts_and_works(now=now + 60)
+
+    roles_jorge = store3.get_work_artifact_roles("work-189f43b331")
+    roles_184815 = store3.get_work_artifact_roles("work-184815-r18")
+    self.assertEqual(roles_jorge.get("gerrit:skia:1415856"), "primary")
+    self.assertEqual(roles_jorge.get("gerrit:skia:1418376"), "context_only")
+    self.assertNotIn("gerrit:skia:1422517", roles_jorge)
+    self.assertNotIn("github_issue:flutter/flutter:184815", roles_jorge)
+    self.assertNotIn("gmail_thread:1a1b3655788740e1", roles_jorge)
+    self.assertNotIn("github_pr:flutter/flutter:196295", roles_jorge)
+
+    self.assertEqual(roles_184815.get("github_issue:flutter/flutter:184815"), "primary")
+    self.assertEqual(roles_184815.get("gerrit:skia:1418376"), "primary")
+    self.assertEqual(roles_184815.get("gerrit:skia:1420816"), "primary")
+    self.assertEqual(roles_184815.get("gerrit:skia:1422517"), "primary")
+    self.assertEqual(roles_184815.get("github_pr:flutter/flutter:196148"), "primary")
+    self.assertEqual(roles_184815.get("gmail_thread:1a1b3655788740e1"), "channel")
+    self.assertEqual(
+        roles_184815.get("chat_chain:78507fdf-d92f-4b37-9daa-7f6078a1ead4"), "channel"
+    )
+    self.assertEqual(roles_184815.get("github_pr:flutter/flutter:196295"), "context_only")
+    ob_moved = store3.get_obligation(ob_id, now=now + 60)
+    self.assertIsNotNone(ob_moved)
+    self.assertEqual((ob_moved or {}).get("work_id"), "work-184815-r18")
+
+    # Stale pre-merge entity_state on MERGED PR must not leak Ready to submit, while partial
+    # entity_state={"needs_self_submit": True} on an OPEN self CL surfaces Ready to submit
+    self.assertEqual(
+        work_store._evaluate_cl_needs_you(
+            "github_pr:flutter/flutter:196148",
+            {
+                "status": "MERGED",
+                "is_mine": True,
+                "entity_state": {
+                    "input_sig": "OPEN|WAITING_ON_OTHERS|0",
+                    "lane": "you",
+                    "action_required": True,
+                    "needs_self_submit": True,
+                    "spine_short_state": {"short": "Ready to submit"},
+                },
+            },
+        ),
+        "",
+    )
+    self.assertEqual(
+        work_store._evaluate_cl_needs_you(
+            "gerrit:skia:1422517",
+            {
+                "status": "NEW",
+                "is_mine": True,
+                "patchset": 2,
+                "entity_state": {"needs_self_submit": True},
+            },
+        ),
+        "🚀 Ready to submit: Gerrit 1422517 PS2",
+    )
+
+    # Auto context_only with matching gmail_thread_ref or empty prev_reason never downgrades
+    w_same_reason = store.create_work("1419757: Revert Swizzler", now=now)
+    store.upsert_artifact("gerrit:skia:1419757", kind="gerrit", title="1419757", now=now)
+    store.link_artifact(
+        w_same_reason,
+        "gerrit:skia:1419757",
+        role="primary",
+        source="auto",
+        link_reason="gmail_thread_ref",
+        now=now,
+    )
+    self.assertEqual(
+        store.link_artifact(
+            w_same_reason,
+            "gerrit:skia:1419757",
+            role="context_only",
+            source="auto",
+            link_reason="gmail_thread_ref",
+            now=now + 5,
+        ),
+        "primary",
+    )
+
+    # "Chromium CL 8663938" extracts gerrit:chromium:8663938 without phantom gerrit:skia
+    draft_keys = work_store._extract_draft_mentioned_keys("Please land Chromium CL 8663938 first")
+    self.assertIn("gerrit:chromium:8663938", draft_keys)
+    self.assertNotIn("gerrit:skia:8663938", draft_keys)
+
+    # Bot last_msg_author_name must not impersonate human <GERRIT_ACCOUNT_N> reviewer
+    sanitized_bot = work_store._sanitize_gerrit_account_placeholders(
+        "<GERRIT_ACCOUNT_5283275> replied on the change",
+        {"last_msg_author_name": "Skia Commit-Bot"},
+    )
+    self.assertEqual(sanitized_bot, "account #5283275 replied on the change")
+
+    # Unhydrated stub body CL is still demoted on subject-scoped email, whereas stacked
+    # parent CL referenced by subject child's stack_parent_ikey stays primary even with w_owner
+    store4 = work_store.WorkStore(self.db_path + ".stub_and_stack")
+    w_parent = store4.create_work("1422510: Base CL", now=now)
+    store4.upsert_artifact(
+        "gerrit:skia:1422510",
+        kind="gerrit",
+        title="1422510: Base CL",
+        state={"status": "NEW", "is_mine": True},
+        now=now,
+    )
+    store4.link_artifact(w_parent, "gerrit:skia:1422510", role="primary", now=now)
+    store4.upsert_artifact(
+        "gerrit:skia:1422518",
+        kind="gerrit",
+        title="1422518: Child CL",
+        state={
+            "status": "NEW",
+            "is_mine": True,
+            "stack_parent_ikey": "gerrit:1422510",
+            "stack_ancestors": ["gerrit:1422510"],
+        },
+        now=now,
+    )
+    store4.upsert_artifact("gerrit:skia:1499999", kind="gerrit", title="1499999", state={}, now=now)
+
+    def fake_stack_gmail(cmd, *args, **kwargs):
+      del args, kwargs
+      res = subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+      if "drafts" in cmd:
+        res.stdout = json.dumps({"drafts": []})
+      elif "search" in cmd:
+        msgs = [{"id": "ms1", "threadId": "th_stack"}] if "from:me" in " ".join(cmd) else []
+        res.stdout = json.dumps({"messages": msgs})
+      elif "get-thread" in cmd:
+        res.stdout = json.dumps({
+            "messages": [{
+                "internalDate": str(int((now - 600) * 1000)),
+                "snippet": "Child CL 1422518",
+                "payload": {
+                    "mimeType": "text/plain",
+                    "headers": [
+                        {"name": "Subject", "value": "Question on Skia CL 1422518"},
+                        {"name": "From", "value": "Florin Malita <fmalita@google.com>"},
+                        {"name": "To", "value": "Julia Lavrova <jlavrova@google.com>"},
+                    ],
+                    "body": {
+                        "data": _b64(
+                            "Depends on https://skia-review.googlesource.com/c/skia/+/1422510 ; "
+                            "unrelated https://skia-review.googlesource.com/c/skia/+/1499999 ."
+                        )
+                    },
+                },
+            }]
+        })
+      return res
+
+    with (
+        mock.patch("os.path.isfile", return_value=True),
+        mock.patch("subprocess.run", side_effect=fake_stack_gmail),
+    ):
+      ingestor.ingest_gmail_drafts_and_threads(store4, {}, now=now)
+    th_wid = store4.find_work_by_artifact("gmail_thread:th_stack", roles=("primary", "channel"))
+    self.assertEqual(th_wid, w_parent)
+    th_roles = store4.get_work_artifact_roles(w_parent)
+    self.assertEqual(th_roles.get("gerrit:skia:1422510"), "primary")
+    self.assertEqual(th_roles.get("gerrit:skia:1422518"), "primary")
+    self.assertEqual(th_roles.get("gerrit:skia:1499999"), "context_only")
+
+    # Split preserves existing snooze_until on work-184815-r18 and moves 1422517 chat
+    with store3._connect() as conn:
+      conn.execute(
+          "UPDATE works SET snooze_until = ? WHERE work_id = ?",
+          (now + 3600, "work-184815-r18"),
+      )
+    store3.upsert_artifact(
+        "chat_chain:99991848-1111-2222-3333-444455556666",
+        kind="chat_chain",
+        title="Gerrit 1422517 reland",
+        now=now + 70,
+    )
+    store3.link_artifact(
+        "work-189f43b331",
+        "gerrit:skia:1418376",
+        role="primary",
+        source="manual",
+        now=now + 70,
+    )
+    store3.link_artifact(
+        "work-189f43b331",
+        "chat_chain:99991848-1111-2222-3333-444455556666",
+        role="channel",
+        link_reason="cl_watcher_chat",
+        link_detail="Рабочий чат по СЛ 1422517",
+        now=now + 70,
+    )
+    store3.purge_config_artifacts_and_works(now=now + 80)
+    w_split_after = {w["work_id"]: w for w in store3.list_works()}.get("work-184815-r18") or {}
+    self.assertEqual(float(w_split_after.get("snooze_until") or 0.0), now + 3600)
+    self.assertEqual(
+        store3.get_work_artifact_roles("work-184815-r18").get(
+            "chat_chain:99991848-1111-2222-3333-444455556666"
+        ),
+        "channel",
+    )
+
+
 
 
 if __name__ == "__main__":

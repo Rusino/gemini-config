@@ -56,12 +56,15 @@ _RE_CALENDAR_SUBJECT = re.compile(
 )
 _RE_MEETING_NOTES_SUBJECT = re.compile(r"^Notes:\s*[“\"']", re.IGNORECASE)
 
+# Match Gerrit URLs plus human "Skia CL <N>" / "Chromium CL <N>" subject prefixes
 RE_SKIA_GERRIT = re.compile(
-    r"(?:skia-review\.googlesource\.com/c/skia/\+/|\bGerrit\s+|\b--change[=\s]+)(\d{6,8})\b",
+    r"(?:skia-review\.googlesource\.com/c/skia/\+/|\bGerrit\s+"
+    r"|\bSkia\s+(?:Gerrit\s+)?CL\s+#?|\b--change[=\s]+)(\d{6,8})\b",
     re.IGNORECASE,
 )
 RE_CHROMIUM_GERRIT = re.compile(
-    r"(?:chromium-review\.googlesource\.com/c/chromium/src/\+/|\bcrrev(?:\.com)?/c/)(\d{6,8})\b",
+    r"(?:chromium-review\.googlesource\.com/c/chromium/src/\+/|\bcrrev(?:\.com)?/c/"
+    r"|\bChromium\s+(?:Gerrit\s+)?CL\s+#?)(\d{6,8})\b",
     re.IGNORECASE,
 )
 RE_GITHUB_PR = re.compile(
@@ -2771,6 +2774,47 @@ def ingest_gmail_drafts_and_threads(
         email_bug_keys = {
             k for k, kind, _ in raw_primaries if kind in ("buganizer", "github_issue")
         }
+        # Collect bug and CL links from subject-named CLs so true stack/bug siblings stay primary
+        def _collect_cl_related_keys(st: Mapping[str, Any]) -> set[str]:
+          rel: set[str] = set()
+          # Normalize bare numeric cherry-pick change IDs alongside canonical item_keys
+          for fld in (
+              "stack_parent_ikey",
+              "stack_root_ikey",
+              "cherry_pick_of",
+              "cherry_pick_of_change",
+          ):
+            val = st.get(fld)
+            if val:
+              raw_v = str(val).strip()
+              if fld == "cherry_pick_of_change" and raw_v.isdigit():
+                rel.add(work_store.canonicalize_artifact_key(f"gerrit:{raw_v}"))
+              else:
+                rel.add(work_store.canonicalize_artifact_key(raw_v))
+          # Include stack ancestor/member lists and CLs referenced in commit trailers
+          for lfld in ("stack_ancestors", "stack_ikeys", "fixes", "fixes_cls", "fixed_by_cls"):
+            for elem in st.get(lfld) or []:
+              if elem:
+                rel.add(work_store.canonicalize_artifact_key(str(elem)))
+          for k_ref, kind_ref, _ in extract_artifacts_from_text(
+              f"{st.get('subject') or ''}\n{st.get('commit_message') or ''}"
+          ):
+            if kind_ref in ("gerrit", "github_pr", "piper"):
+              rel.add(k_ref)
+          return rel
+
+        subj_cl_bugs: set[str] = set()
+        subj_cl_rel_refs: set[str] = set()
+        for sk in subj_cl_keys:
+          s_st = (store.get_artifact(sk) or {}).get("state") or {}
+          subj_cl_bugs.update(work_store.extract_cl_bug_keys(s_st))
+          subj_cl_rel_refs.update(_collect_cl_related_keys(s_st))
+          s_owner = store.find_work_by_artifact(sk, roles=("primary",))
+          if s_owner:
+            for k_b, r_b in store.get_work_artifact_roles(s_owner).items():
+              if r_b == "primary" and k_b.startswith(("buganizer:", "github_issue:")):
+                subj_cl_bugs.add(k_b)
+        existing_tid_wid = store.find_work_by_artifact(t_key, roles=("primary", "channel"))
         cp_tokens = {tok for tok in re.split(r"\W+", cp.strip().lower()) if len(tok) >= 3}
         t_primaries: list[tuple[str, str, str]] = []
         context_cl_refs: list[tuple[str, str, str]] = []
@@ -2792,6 +2836,15 @@ def ingest_gmail_drafts_and_threads(
                 for k, r in w_roles.items()
                 if r == "primary" and (k.startswith("buganizer:") or k.startswith("github_issue:"))
             }
+            # Treat body CLs sharing a bug or stack link with subject CLs as thread peers
+            art_st = (store.get_artifact(akey) or {}).get("state") or {}
+            cl_bugs = set(work_store.extract_cl_bug_keys(art_st)) | w_bugs
+            cl_rel_cls = _collect_cl_related_keys(art_st) if art_st else set()
+            is_related_to_subj_cl = bool(
+                akey in subj_cl_rel_refs
+                or (cl_bugs & (email_bug_keys | subj_cl_bugs))
+                or (cl_rel_cls & subj_cl_keys)
+            )
             # Body CL belonging to another work when the email subject already names a different CL,
             # or when that work already has a primary email thread with a different counterparty
             w_has_other_cp_email = False
@@ -2809,7 +2862,7 @@ def ingest_gmail_drafts_and_threads(
                     break
             if (
                 w_owner
-                and not (w_bugs & email_bug_keys)
+                and not is_related_to_subj_cl
                 and (
                     (subj_cl_keys and not (set(w_roles.keys()) & subj_cl_keys))
                     or w_has_other_cp_email
@@ -2817,8 +2870,15 @@ def ingest_gmail_drafts_and_threads(
             ):
               context_cl_refs.append((akey, akind, aurl))
               continue
+            # Demote body CLs on subject-scoped threads lacking a shared bug or stack link
+            if (
+                subj_cl_keys
+                and not is_related_to_subj_cl
+                and (not w_owner or w_owner != existing_tid_wid)
+            ):
+              context_cl_refs.append((akey, akind, aurl))
+              continue
             # Foreign CL in body whose author differs from counterparty and shares no bugs
-            art_st = (store.get_artifact(akey) or {}).get("state") or {}
             if art_st.get("is_mine") is False and akind in ("gerrit", "github_pr"):
               cl_author = str(art_st.get("author") or "").strip().lower()
               author_tokens = {tok for tok in re.split(r"\W+", cl_author) if len(tok) >= 3}
@@ -2834,7 +2894,6 @@ def ingest_gmail_drafts_and_threads(
           t_primaries.append((akey, akind, aurl))
 
         matched_wids: list[str] = []
-        existing_tid_wid = store.find_work_by_artifact(t_key, roles=("primary", "channel"))
         if existing_tid_wid:
           matched_wids.append(existing_tid_wid)
         for akey, _, _ in t_primaries:
@@ -3402,6 +3461,9 @@ def _apply_github_node_to_store(
       "last_human_comment_at": last_human_ts,
       "synced_at": cur_now,
   }
+  # Clear cached open entity_state once GitHub GraphQL reports the PR or issue closed/merged
+  if gh_status in ("MERGED", "CLOSED"):
+    art_state["entity_state"] = {}
   if akey.startswith("github_issue:"):
     short_b = work_store.format_short_bug_id(akey)
     art_title = f"{short_b}: {gh_title}" if gh_title else ""
