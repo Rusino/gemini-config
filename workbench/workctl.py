@@ -135,6 +135,12 @@ def main(argv: list[str] | None = None) -> int:
   p_dmat.add_argument("--force-new", action="store_true")
   p_dmat.add_argument("--json", action="store_true")
 
+  p_schat = sub.add_parser("start-chat", help="Start or reuse a Jetski chat for a Work card")
+  p_schat.add_argument("work_id")
+  p_schat.add_argument("--force-new", action="store_true")
+  p_schat.add_argument("--cl-state", default=ingestor.DEFAULT_CL_WATCHER_STATE)
+  p_schat.add_argument("--json", action="store_true")
+
   args = parser.parse_args(argv)
   store = work_store.WorkStore(args.db or None)
 
@@ -318,6 +324,19 @@ def main(argv: list[str] | None = None) -> int:
       print(json.dumps(res, indent=2, ensure_ascii=False))
     else:
       print(f"{res['draft_key']}  {res['url']}")
+    return 0
+
+  if args.cmd == "start-chat":
+    res = ingestor.start_chat_for_work(
+        store,
+        args.work_id,
+        cl_state_path=args.cl_state,
+        force_new=bool(args.force_new),
+    )
+    if args.json:
+      print(json.dumps(res, indent=2, ensure_ascii=False))
+    else:
+      print(f"{res['conversation_id']}  {res['chat_url']}")
     return 0
 
   return 0

@@ -12,15 +12,26 @@ import glob
 import hashlib
 import html as html_lib
 import json
+import math
 import os
 import re
+import socket
 import subprocess
+import sys
 import tempfile
 import time
 from typing import Any
 import urllib.parse
 
-import work_store
+# Expose hooks/chat_lifecycle.py so Workbench launches visible chats with exact model/title pinning
+HOOKS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks"
+)
+if HOOKS_DIR not in sys.path:
+  sys.path.insert(0, HOOKS_DIR)
+
+import chat_lifecycle as cl  # pylint: disable=g-import-not-at-top
+import work_store  # pylint: disable=g-import-not-at-top
 
 DEFAULT_CL_WATCHER_STATE = os.path.expanduser(
     "~/.gemini/config/logs/cl_watcher_state.json"
@@ -32,9 +43,26 @@ DEFAULT_BRAIN_DIR = os.path.expanduser("~/.gemini/jetski/brain")
 DEFAULT_DOSSIERS_FILE = os.path.expanduser(
     "~/.gemini/jetski/brain/jetski-dossiers.json"
 )
+DEFAULT_PROJECTS_DIR = os.path.expanduser("~/.gemini/config/projects")
+OPEN_CHAT_REQ_FILE = os.path.expanduser(
+    "~/.gemini/jetski/brain/jetski-open-chat.json"
+)
+ANNOTATIONS_DIR = os.path.expanduser("~/.gemini/jetski/annotations")
 GMAIL_BIN = "/google/bin/releases/gemini-agents-gmail/gmail"
+MAX_OPEN_CHAT_TIMEOUT_SEC = 5.0
+_RE_SAFE_CONV_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{3,127}$")
 # Cap small-group human threads above typical colleague CC lists while cutting 39-person blasts
 MAX_HUMAN_GROUP_RECIPIENTS = 8
+
+
+def jetski_box_url() -> str:
+  """Returns the Jetski Web base URL derived from this Cloudtop short hostname."""
+  return f"https://jetski.corp.google.com/box/{socket.gethostname().split('.')[0]}"
+
+
+def is_valid_conversation_id(conv_id: str) -> bool:
+  """Returns True when conv_id is a path-safe UUID or conversation slug."""
+  return bool(_RE_SAFE_CONV_ID.match(str(conv_id or "").strip()))
 
 _NON_PERSONAL_CATEGORIES = frozenset({
     "CATEGORY_PROMOTIONS",
@@ -793,6 +821,55 @@ def _apply_transcript_gdoc_comment_ops(
   return touched_wids
 
 
+def _upsert_and_link_chat_chain(
+    store: work_store.WorkStore,
+    work_id: str,
+    conv_id: str,
+    detected_root: str,
+    chat_title: str,
+    first_user_prompt: str,
+    chain_origin_ts: float,
+    cur_now: float,
+    *,
+    source: str = "auto",
+    link_reason: str = "chat_topic",
+    link_detail: str = "",
+) -> str | None:
+  """Upserts a chat_chain artifact in store and links it as a channel on work_id."""
+  chain_key = f"chat_chain:{detected_root}"
+  existing_chain = store.get_artifact(chain_key) or {}
+  prev_chain_title = work_store.clean_work_title(str(existing_chain.get("title") or ""))
+  # Discard generic ID or baton placeholders so real user prompts can upgrade the chip label
+  if prev_chain_title.startswith("Chat ") or prev_chain_title.startswith("Continuing unfinished"):
+    prev_chain_title = ""
+  resolved_chain_title = (
+      chat_title
+      or prev_chain_title
+      or first_user_prompt[:60]
+      or f"Chat {detected_root[:8]}"
+  )
+  chain_state: dict[str, Any] = {"cascade_id": conv_id, "root_cid": detected_root}
+  if chain_origin_ts > 0:
+    chain_state["origin_ts"] = chain_origin_ts
+  store.upsert_artifact(
+      chain_key,
+      kind="chat_chain",
+      title=resolved_chain_title,
+      url=f"/c/{conv_id}",
+      state=chain_state,
+      now=cur_now,
+  )
+  return store.link_artifact(
+      work_id,
+      chain_key,
+      role="channel",
+      source=source,
+      link_reason=link_reason,
+      link_detail=link_detail or f"Рабочий чат {detected_root[:8]} по этой задаче",
+      now=cur_now,
+  )
+
+
 def ingest_transcript_file(
     store: work_store.WorkStore,
     conv_id: str,
@@ -1004,6 +1081,11 @@ def ingest_transcript_file(
           now=cur_now,
       )
 
+  # Check stored artifact metadata so companion and hub docs/CLs never anchor card ownership
+  def _is_stored_hub(akey: str) -> bool:
+    st_meta = (store.get_artifact(akey) or {}).get("state")
+    return work_store.is_hub_artifact(akey, st_meta if isinstance(st_meta, Mapping) else None)
+
   if not has_write:
     # Read-only session: never mint a Work card; store artifacts in 7-day candidate buffer
     for akey, akind, aurl in extracted.values():
@@ -1020,6 +1102,40 @@ def ingest_transcript_file(
           chat_chain_id=detected_root,
           now=cur_now,
       )
+    # Attach read-only discussion chats only when every anchored doc/CL resolves to one Work
+    ro_wid = store.find_work_by_artifact(chain_key)
+    if not ro_wid:
+      anchored_gdocs = [
+          akey for akey, akind, _ in extracted.values() if akind == "gdoc" and akey in anchor_keys
+      ]
+      anchored_code = [
+          akey
+          for akey, akind, _ in extracted.values()
+          if akind in CODE_PRIMARY_KINDS and akey in anchor_keys
+      ]
+      if anchored_gdocs and all(not _is_stored_hub(k) for k in anchored_gdocs):
+        doc_wids = [
+            store.find_all_works_by_artifact(k, roles=("primary", "channel"))
+            for k in anchored_gdocs
+        ]
+        if all(len(ws) == 1 and ws[0] == doc_wids[0][0] for ws in doc_wids):
+          cand_wid = doc_wids[0][0]
+          if all(
+              store.find_all_works_by_artifact(ck, roles=("primary", "channel")) == [cand_wid]
+              for ck in anchored_code
+          ):
+            ro_wid = cand_wid
+    if ro_wid:
+      _upsert_and_link_chat_chain(
+          store,
+          ro_wid,
+          conv_id,
+          detected_root,
+          chat_title,
+          first_user_prompt,
+          chain_origin_ts,
+          cur_now,
+      )
     return True
 
   # Write session: bound -> attach-first -> mint
@@ -1028,16 +1144,6 @@ def ingest_transcript_file(
       for akey, akind, aurl in extracted.values()
       if akind in ("gerrit", "github_pr", "piper", "buganizer", "github_issue", "gdoc")
   ]
-  # Check stored artifact metadata so companion and hub CLs are excluded from primary anchors
-  def _is_stored_hub(akey: str) -> bool:
-    row = store.get_artifact(akey) or {}
-    raw_st = row.get("state_json")
-    try:
-      st = json.loads(raw_st) if isinstance(raw_st, str) and raw_st else {}
-    except Exception:
-      st = {}
-    return work_store.is_hub_artifact(akey, st)
-
   non_hub_primaries = [
       (akey, akind, aurl)
       for akey, akind, aurl in all_primaries
@@ -1118,35 +1224,15 @@ def ingest_transcript_file(
     )
     work_id = store.create_work(default_title, project_id=project_id, now=cur_now)
 
-  existing_chain = store.get_artifact(chain_key) or {}
-  prev_chain_title = work_store.clean_work_title(str(existing_chain.get("title") or ""))
-  if prev_chain_title.startswith("Chat ") or prev_chain_title.startswith("Continuing unfinished"):
-    prev_chain_title = ""
-  resolved_chain_title = (
-      chat_title
-      or prev_chain_title
-      or first_user_prompt[:60]
-      or f"Chat {detected_root[:8]}"
-  )
-  chain_state: dict[str, Any] = {"cascade_id": conv_id, "root_cid": detected_root}
-  if chain_origin_ts > 0:
-    chain_state["origin_ts"] = chain_origin_ts
-  store.upsert_artifact(
-      chain_key,
-      kind="chat_chain",
-      title=resolved_chain_title,
-      url=f"/c/{conv_id}",
-      state=chain_state,
-      now=cur_now,
-  )
-  linked_ch = store.link_artifact(
+  linked_ch = _upsert_and_link_chat_chain(
+      store,
       work_id,
-      chain_key,
-      role="channel",
-      source="auto",
-      link_reason="chat_topic",
-      link_detail=f"Рабочий чат {detected_root[:8]} по этой задаче",
-      now=cur_now,
+      conv_id,
+      detected_root,
+      chat_title,
+      first_user_prompt,
+      chain_origin_ts,
+      cur_now,
   )
   if linked_ch is None:
     return False
@@ -3942,4 +4028,575 @@ def materialize_reply_draft(
       "draft_key": d_key,
       "url": f"https://mail.google.com/mail/u/0/#drafts/{new_did}",
       "reused": False,
+  }
+
+
+CORRESPONDENCE_PROJECT_NAME = "Reviews of e-mails, meetings and such"
+CODE_PRIMARY_KINDS = frozenset({
+    "gerrit",
+    "github_pr",
+    "piper",
+    "buganizer",
+    "github_issue",
+})
+# Ordered most-specific first so niche repos/APIs match before broad SkParagraph/Skia fallbacks
+_CODE_PROJECT_RULES: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
+    ("Typescript WebParagraph", (), ("typescript", "ts paragraph", "ts webparagraph")),
+    ("WebParagraph", (), ("webparagraph", "web_paragraph", "web_ui")),
+    ("TextClusters API", (), ("textclusters", "gettextclusters", "text_clusters")),
+    ("Chromium", ("gerrit:chromium:",), ("chromium", "blink")),
+    ("SkGlyphID to 32 bits", (), ("skglyphid", "32-bit glyph")),
+    ("Lazy Android", (), ("lazy android", "ndk font", "fontmgr_android")),
+    (
+        "SkParagraph",
+        ("github_pr:flutter/", "github_issue:flutter/"),
+        ("skparagraph", "skunicode", "skshaper", "textlayout"),
+    ),
+)
+
+
+def _load_active_projects(
+    projects_dir: str | None = None,
+) -> tuple[dict[str, tuple[str, str]], dict[str, str]]:
+  """Reads projects_dir JSON files and returns (by_token, by_name) for active product projects."""
+  target_dir = projects_dir or DEFAULT_PROJECTS_DIR
+  by_token: dict[str, tuple[str, str]] = {}
+  by_name: dict[str, str] = {}
+  for pfile in sorted(glob.glob(os.path.join(target_dir, "*.json"))):
+    try:
+      with open(pfile, "r", encoding="utf-8") as f:
+        pdata = json.load(f)
+    except (OSError, ValueError):
+      continue
+    # Never route newly launched chats into archived projects such as SkoreText
+    if not isinstance(pdata, Mapping) or bool(pdata.get("archived")):
+      continue
+    pid = str(pdata.get("id") or "").strip()
+    raw_name = str(pdata.get("name") or "").strip()
+    clean_name = cl.strip_activity_badge(cl.clean_base_title(raw_name)).strip()
+    if not pid or not clean_name:
+      continue
+    # Exclude meta/config projects (e.g. My Work) so product chats stay visible on Workbench
+    if work_store.is_config_project(pid) or work_store.is_config_project(clean_name):
+      continue
+    pair = (pid, clean_name)
+    by_token[pid.lower()] = pair
+    if len(pid) >= 8:
+      by_token[pid[:8].lower()] = pair
+    by_token[clean_name.lower()] = pair
+    by_name[clean_name] = pid
+  return by_token, by_name
+
+
+def resolve_work_chat_project(
+    card: Mapping[str, Any],
+    *,
+    projects_dir: str | None = None,
+    loaded_projects: tuple[dict[str, tuple[str, str]], dict[str, str]] | None = None,
+) -> tuple[str, str]:
+  """Resolves (project_id, project_name), routing docs to correspondence and CLs to active repos."""
+  by_token, by_name = loaded_projects or _load_active_projects(projects_dir=projects_dir)
+  raw_proj = cl.strip_activity_badge(str(card.get("project_id") or "")).strip().lower()
+  # Honor any explicit non-archived non-config code project already stamped on the card
+  if raw_proj and raw_proj in by_token:
+    cand_pid, cand_name = by_token[raw_proj]
+    if cand_name != CORRESPONDENCE_PROJECT_NAME:
+      return cand_pid, cand_name
+
+  arts = [a for a in (card.get("artifacts") or []) if isinstance(a, Mapping)]
+  code_primaries = [
+      a
+      for a in arts
+      if str(a.get("role") or "primary") == "primary"
+      and str(a.get("kind") or "") in CODE_PRIMARY_KINDS
+  ]
+  if code_primaries:
+    parts = [str(card.get("title") or "")]
+    for a in code_primaries:
+      parts.append(str(a.get("artifact_key") or ""))
+      parts.append(str(a.get("title") or ""))
+      st = a.get("state") if isinstance(a.get("state"), Mapping) else {}
+      parts.append(str(st.get("subject") or ""))
+      parts.append(str(st.get("project") or ""))
+    haystack = " ".join(parts).lower()
+    akeys = [str(a.get("artifact_key") or "") for a in code_primaries]
+    for proj_name, key_prefixes, keywords in _CODE_PROJECT_RULES:
+      has_prefix = bool(key_prefixes) and any(k.startswith(key_prefixes) for k in akeys)
+      if (has_prefix or any(kw in haystack for kw in keywords)) and proj_name in by_name:
+        return by_name[proj_name], proj_name
+    # Default remaining Skia/Buganizer/Piper code cards (including [SkoreText] CLs) to Skia
+    if "Skia" in by_name:
+      return by_name["Skia"], "Skia"
+
+  # Route Google Doc, email, and meeting correspondence cards to the dedicated reviews project
+  if CORRESPONDENCE_PROJECT_NAME in by_name:
+    return by_name[CORRESPONDENCE_PROJECT_NAME], CORRESPONDENCE_PROJECT_NAME
+  for fallback_name, fallback_pid in by_name.items():
+    return fallback_pid, fallback_name
+  return "outside-of-project", ""
+
+
+def open_chat_in_jetski(
+    conv_id: str,
+    *,
+    timeout_sec: float = 1.8,
+    req_file: str | None = None,
+    annotations_dir: str | None = None,
+) -> dict[str, Any]:
+  """Writes jetski-open-chat.json for conv_id and polls for tab ack within bounded timeout."""
+  cid = str(conv_id or "").strip()
+  if not is_valid_conversation_id(cid):
+    return {"ok": False, "error": "Invalid conversation_id"}
+  try:
+    to_val = float(timeout_sec)
+  except (TypeError, ValueError):
+    to_val = 0.0
+  # Clamp non-finite and oversized timeouts so HTTP worker loops provably terminate
+  if not math.isfinite(to_val) or to_val <= 0.0:
+    to_val = 0.0
+  else:
+    to_val = min(to_val, MAX_OPEN_CHAT_TIMEOUT_SEC)
+
+  target_req = req_file or OPEN_CHAT_REQ_FILE
+  target_ann_dir = annotations_dir or ANNOTATIONS_DIR
+  ann_file = os.path.join(target_ann_dir, f"{cid}.pbtxt")
+  before_mtime = 0.0
+  before_txt = ""
+  # Snapshot prior .pbtxt state so Jetski's navigation ack can be detected by mtime or content diff
+  if os.path.isfile(ann_file):
+    try:
+      before_mtime = os.path.getmtime(ann_file)
+      with open(ann_file, "r", encoding="utf-8", errors="ignore") as f:
+        before_txt = f.read()
+    except OSError:
+      pass
+
+  req_ts_ms = int(time.time() * 1000)
+  payload = {
+      "requestId": f"req-{req_ts_ms}-{cid[:8]}",
+      "cascadeId": cid,
+      "requestedAt": req_ts_ms,
+  }
+  reused = False
+  wrote_req = True
+  try:
+    os.makedirs(os.path.dirname(target_req), exist_ok=True)
+    tmp_path = f"{target_req}.tmp.{os.getpid()}"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+      json.dump(payload, f, ensure_ascii=False)
+    os.replace(tmp_path, target_req)
+  except OSError:
+    wrote_req = False
+
+  # Poll briefly for an open Jetski Web tab to consume the IPC file before standalone popup fallback
+  if wrote_req and to_val > 0.0:
+    deadline = time.time() + to_val
+    while time.time() < deadline:
+      time.sleep(0.05)
+      if os.path.isfile(ann_file):
+        try:
+          cur_mtime = os.path.getmtime(ann_file)
+          with open(ann_file, "r", encoding="utf-8", errors="ignore") as f:
+            cur_txt = f.read()
+          if cur_mtime > before_mtime or cur_txt != before_txt:
+            reused = True
+            break
+        except OSError:
+          pass
+  return {
+      "ok": True,
+      "conversation_id": cid,
+      "chat_url": f"{jetski_box_url()}/c/{cid}",
+      "reused_tab": reused,
+  }
+
+
+def _sanitize_non_config_snippet(text: str) -> str:
+  """Replaces _CONFIG_TEXT_PATTERNS matches in text so product chats never trip is_config_text."""
+  out = str(text or "")
+  for rx in work_store._CONFIG_TEXT_PATTERNS:
+    out = rx.sub("[tooling]", out)
+  return out
+
+
+def _short_entity_prefix(artifact_key: str) -> str:
+  """Returns a title-safe short ID prefix for artifact_key without cl/<5-8 digits> collisions."""
+  akey = str(artifact_key or "")
+  if akey.startswith("gerrit:chromium:"):
+    return f"crrev/c/{akey.split(':')[-1]}"
+  if akey.startswith("gerrit:"):
+    return f"Gerrit {akey.split(':')[-1]}"
+  if akey.startswith("github_pr:"):
+    return f"PR #{akey.split(':')[-1]}"
+  if akey.startswith("github_issue:flutter/"):
+    return f"flutter#{akey.split(':')[-1]}"
+  if akey.startswith("github_issue:"):
+    return f"Issue #{akey.split(':')[-1]}"
+  if akey.startswith("buganizer:"):
+    return f"b/{akey.split(':')[-1]}"
+  if akey.startswith("piper:"):
+    return f"CL {akey.split(':')[-1]}"
+  return ""
+
+
+def _truncate_words(text: str, max_len: int = 38) -> str:
+  """Truncates whitespace-normalized text at a word boundary within max_len chars."""
+  collapsed = " ".join(text.split()).strip(" -:/·")
+  if len(collapsed) <= max_len:
+    return collapsed
+  cut = collapsed[:max_len].rsplit(" ", 1)[0].strip(" -:/·")
+  return cut if len(cut) >= 10 else collapsed[:max_len].strip(" -:/·")
+
+
+_RE_BARE_TOPIC_ENTITY = re.compile(
+    r"\b(?:crrev/c/\d+|flutter#\d+|b/\d+|gerrit\s+\d+|pr\s+#?\d+|issue\s+#?\d+|cl\s+\d+)\b",
+    re.IGNORECASE,
+)
+
+
+def _build_work_chat_topic(card: Mapping[str, Any]) -> str:
+  """Derives an English chat topic (<= 38 chars) from card that passes validate_chat_topic."""
+  raw_title = work_store.clean_work_title(str(card.get("title") or ""))
+  # Strip trailing counterparty suffixes when the base document/CL subject already has >= 2 words
+  if " — " in raw_title:
+    head_part = raw_title.split(" — ", 1)[0].strip()
+    if len(head_part.split()) >= 2:
+      raw_title = head_part
+  ascii_title = (
+      raw_title.replace("—", "-")
+      .replace("–", "-")
+      .replace("“", '"')
+      .replace("”", '"')
+      .replace("’", "'")
+  )
+  # Replace bare cl/<5-8 digits> with Gerrit <N> per clickable_links / title rules
+  ascii_title = re.sub(r"\bcl/(\d{5,8})\b", r"Gerrit \1", ascii_title, flags=re.IGNORECASE)
+  ascii_title = ascii_title.encode("ascii", "ignore").decode("ascii")
+  ascii_title = _sanitize_non_config_snippet(ascii_title)
+
+  arts = [a for a in (card.get("artifacts") or []) if isinstance(a, Mapping)]
+  prim_prefix = ""
+  prim_num = ""
+  has_gdoc = False
+  for a in arts:
+    if str(a.get("kind") or "") == "gdoc":
+      has_gdoc = True
+    if not prim_prefix and str(a.get("role") or "primary") == "primary":
+      akey = str(a.get("artifact_key") or "")
+      prim_prefix = _short_entity_prefix(akey)
+      num_m = re.search(r"(\d+)$", akey)
+      prim_num = num_m.group(1) if num_m else ""
+
+  # Require non-ID subject words before accepting raw title so bare flutter#<N> falls back cleanly
+  stripped_ids = _RE_BARE_TOPIC_ENTITY.sub(" ", ascii_title)
+  has_subject_words = bool(re.search(r"[A-Za-z]{2,}", stripped_ids))
+  has_prim_num = bool(prim_num and re.search(rf"\b{re.escape(prim_num)}\b", ascii_title))
+
+  # Prefer entity-prefixed subject, then ASCII title, then deterministic multi-word fallbacks
+  candidates: list[str] = []
+  if prim_prefix and has_subject_words and not has_prim_num:
+    stripped_brackets = re.sub(r"^\[[^\]]+\]\s*", "", ascii_title).strip()
+    candidates.append(_truncate_words(f"{prim_prefix} {stripped_brackets}"))
+  if ascii_title and has_subject_words:
+    candidates.append(_truncate_words(ascii_title))
+  if prim_prefix:
+    candidates.append(_truncate_words(f"{prim_prefix} review follow up"))
+  if has_gdoc:
+    candidates.append("Google Doc sync action items")
+  candidates.append("Card action items follow up")
+
+  for cand in candidates:
+    if not cand or work_store.is_config_text(cand):
+      continue
+    try:
+      return cl.validate_chat_topic(cand)
+    except Exception:
+      continue
+  return "Google Doc sync action items"
+
+
+def _build_work_chat_prompt(card: Mapping[str, Any]) -> str:
+  """Builds a sanitized Russian first-turn prompt grounding the agent on card's docs and threads."""
+  card_title = _sanitize_non_config_snippet(
+      work_store.clean_work_title(str(card.get("title") or "Рабочая карточка"))
+  )
+  arts = [a for a in (card.get("artifacts") or []) if isinstance(a, Mapping)]
+  gdocs = [
+      a for a in arts if str(a.get("kind") or "") == "gdoc" and a.get("role") != "context_only"
+  ]
+  primaries = [
+      a
+      for a in arts
+      if str(a.get("role") or "primary") == "primary" and str(a.get("kind") or "") != "gdoc"
+  ]
+  threads = [
+      a
+      for a in arts
+      if str(a.get("kind") or "") in ("gdoc_thread", "gmail_thread", "gchat_thread")
+      and a.get("role") != "context_only"
+  ]
+  open_obs = [
+      o
+      for o in (card.get("obligations") or [])
+      if isinstance(o, Mapping) and str(o.get("status") or "") != "done"
+  ]
+
+  lines: list[str] = [f'Открой рабочую задачу «{card_title}» и помоги разобрать текущие пункты.']
+  # Instruct Drive MCP reading with includeComments: true whenever the card owns a Google Doc
+  if gdocs:
+    lines.append("")
+    lines.append("Документы карточки:")
+    for gd in gdocs:
+      doc_id = str(gd.get("artifact_key") or "").split(":", 1)[-1]
+      doc_url = str(gd.get("url") or f"https://docs.google.com/document/d/{doc_id}/edit")
+      doc_title = _sanitize_non_config_snippet(str(gd.get("title") or doc_id))
+      lines.append(f"- {doc_title}: {doc_url} (fileId: `{doc_id}`)")
+    lines.append(
+        "Сначала прочитай содержимое документа и все открытые комментарии через "
+        "`google_drive_google_drive` `read_file_content` с `includeComments: true`."
+    )
+  if primaries:
+    lines.append("")
+    lines.append("Основные артефакты:")
+    for pr in primaries:
+      p_title = _sanitize_non_config_snippet(str(pr.get("title") or pr.get("artifact_key") or ""))
+      p_url = str(pr.get("url") or "")
+      lines.append(f"- {p_title}" + (f": {p_url}" if p_url else ""))
+
+  # Include recent correspondence thread URLs and unquoted snippets so context is self-contained
+  if threads:
+    lines.append("")
+    lines.append("Активные треды и комментарии:")
+    for th in threads[:5]:
+      st = th.get("state") if isinstance(th.get("state"), Mapping) else {}
+      cp = _sanitize_non_config_snippet(str(st.get("counterparty") or ""))
+      disco = str(st.get("disco_id") or "")
+      th_url = str(th.get("url") or "")
+      raw_snip = str(st.get("last_unquoted_text") or st.get("last_snippet") or "").strip()
+      clean_snip = _sanitize_non_config_snippet(" ".join(raw_snip.split())[:360])
+      hdr = cp or _sanitize_non_config_snippet(str(th.get("title") or th.get("artifact_key") or ""))
+      meta_bits = [b for b in (disco, th_url) if b]
+      hdr_line = f"- {hdr}" + (f" ({' · '.join(meta_bits)})" if meta_bits else "")
+      lines.append(hdr_line)
+      if clean_snip:
+        lines.append(f"  Цитата: {clean_snip}")
+
+  if open_obs:
+    lines.append("")
+    lines.append("Открытые обязательства:")
+    for ob in open_obs[:5]:
+      desc = _sanitize_non_config_snippet(str(ob.get("description") or ""))
+      if desc:
+        lines.append(f"- {desc}")
+
+  # Enforce read-only safety on turn 1 so comments/docs are never mutated before user confirmation
+  lines.append("")
+  lines.append(
+      "Коротко выпиши по-русски реальные задачи, вопросы и action items на мне (особенно свежие "
+      "комментарии и сегодняшние пункты), ничего не публикуй, не резолвь и не редактируй без "
+      "моего подтверждения, и жди моих указаний."
+  )
+  return "\n".join(lines)
+
+
+def _hydrate_stored_work_card(
+    store: work_store.WorkStore, w_row: Mapping[str, Any]
+) -> dict[str, Any]:
+  """Hydrates artifacts and obligations from SQLite for archived or promoted Work rows."""
+  wid = str(w_row.get("work_id") or "")
+  roles_map = store.get_work_artifact_roles(wid)
+  arts: list[dict[str, Any]] = []
+  for akey, role in roles_map.items():
+    art_row = store.get_artifact(akey)
+    if art_row:
+      arts.append({**art_row, "role": role})
+  with store._lock, store._connect() as conn:
+    ob_rows = conn.execute("SELECT * FROM obligations WHERE work_id = ?", (wid,)).fetchall()
+  obs = [dict(r) for r in ob_rows]
+  return {**dict(w_row), "artifacts": arts, "obligations": obs, "is_virtual": False}
+
+
+def _resolve_card_for_chat(
+    store: work_store.WorkStore,
+    raw_wid: str,
+    cl_state_path: str,
+    cur_now: float,
+) -> dict[str, Any]:
+  """Resolves active, already-promoted virtual, or archived Work cards for chat launching."""
+  proj = store.build_dashboard_projection(
+      cl_watcher_state=load_cl_watcher_snapshot(cl_state_path), now=cur_now
+  )
+  works = proj.get("works") or []
+  card = next((w for w in works if str(w.get("work_id")) == raw_wid), None)
+  if card is not None:
+    return card
+
+  target_wid = raw_wid
+  # Map already-promoted virt-<key> IDs to their persisted Work when projection suppressed virt-
+  if raw_wid.startswith("virt-"):
+    prim_key = work_store.canonicalize_artifact_key(raw_wid[len("virt-") :])
+    promoted = (
+        store.find_work_by_artifact(prim_key, roles=("primary", "channel")) if prim_key else None
+    )
+    if promoted:
+      hit = next((w for w in works if str(w.get("work_id")) == promoted), None)
+      if hit is not None:
+        return hit
+      target_wid = promoted
+
+  if not target_wid.startswith("virt-"):
+    fallback_w = next(
+        (w for w in store.list_works(include_archived=True) if str(w.get("work_id")) == target_wid),
+        None,
+    )
+    if fallback_w is not None:
+      return _hydrate_stored_work_card(store, fallback_w)
+  raise ValueError(f"Unknown work_id: {raw_wid}")
+
+
+def _materialize_virtual_card(
+    store: work_store.WorkStore,
+    card: Mapping[str, Any],
+    project_name: str,
+    cur_now: float,
+) -> dict[str, Any]:
+  """Persists a virtual tracker card into store and returns the hydrated materialized card dict."""
+  arts = [a for a in (card.get("artifacts") or []) if isinstance(a, Mapping)]
+  raw_wid = str(card.get("work_id") or "")
+  prim_key = work_store.canonicalize_artifact_key(
+      raw_wid[len("virt-") :] if raw_wid.startswith("virt-") else ""
+  )
+  # Reuse an existing persisted Work when the primary tracker artifact was already promoted
+  persisted_wid = store.find_work_by_artifact(prim_key, roles=("primary",)) if prim_key else None
+  if not persisted_wid:
+    persisted_wid = store.create_work(
+        str(card.get("title") or prim_key or "Work"),
+        project_id=project_name,
+        now=cur_now,
+    )
+  for a in arts:
+    akey = work_store.canonicalize_artifact_key(str(a.get("artifact_key") or ""))
+    if not akey:
+      continue
+    kind = str(a.get("kind") or work_store.artifact_kind_from_key(akey))
+    role = str(a.get("role") or "primary")
+    st = a.get("state") if isinstance(a.get("state"), Mapping) else {}
+    store.upsert_artifact(
+        akey,
+        kind=kind,
+        title=str(a.get("title") or akey),
+        url=str(a.get("url") or work_store._default_artifact_url(akey)),
+        state=st,
+        now=cur_now,
+    )
+    store.link_artifact(
+        persisted_wid,
+        akey,
+        role=role,
+        source="manual" if role == "primary" else "auto",
+        now=cur_now,
+    )
+  # Reload stored links so any concurrently linked chat_chain is visible to reuse checks
+  stored_row = next(
+      (
+          w
+          for w in store.list_works(include_archived=True)
+          if str(w.get("work_id")) == persisted_wid
+      ),
+      {"work_id": persisted_wid, "title": card.get("title") or "", "project_id": project_name},
+  )
+  return _hydrate_stored_work_card(store, stored_row)
+
+
+def start_chat_for_work(
+    store: work_store.WorkStore,
+    work_id: str,
+    *,
+    cl_state_path: str = DEFAULT_CL_WATCHER_STATE,
+    projects_dir: str | None = None,
+    force_new: bool = False,
+    now: float | None = None,
+) -> dict[str, Any]:
+  """Reuses an active linked chat or spawns and links a visible project-routed chat for work_id."""
+  cur_now = time.time() if now is None else float(now)
+  raw_wid = str(work_id or "").strip()
+  if not raw_wid:
+    raise ValueError("work_id is required")
+
+  card = _resolve_card_for_chat(store, raw_wid, cl_state_path, cur_now)
+  loaded_projects = _load_active_projects(projects_dir=projects_dir)
+  project_id, project_name = resolve_work_chat_project(card, loaded_projects=loaded_projects)
+  # Materialize only when the resolved card itself is still an unpersisted virtual projection
+  if str(card.get("work_id") or "").startswith("virt-") or bool(card.get("is_virtual")):
+    card = _materialize_virtual_card(store, card, project_name, cur_now)
+  resolved_wid = str(card["work_id"])
+
+  # Reuse an existing non-archived channel chat unless the caller explicitly asked for a new thread
+  if not force_new:
+    for art in card.get("artifacts") or []:
+      if not isinstance(art, Mapping):
+        continue
+      if str(art.get("kind") or "") != "chat_chain" or art.get("role") == "context_only":
+        continue
+      st = art.get("state") if isinstance(art.get("state"), Mapping) else {}
+      key_cid = str(art.get("artifact_key") or "").split(":", 1)[-1]
+      cid = str(st.get("cascade_id") or st.get("root_cid") or key_cid).strip()
+      if cid and not cl.is_archived(cid):
+        return {
+            "ok": True,
+            "started": False,
+            "already_existed": True,
+            "work_id": resolved_wid,
+            "conversation_id": cid,
+            "title": str(art.get("title") or card.get("title") or ""),
+            "project_id": project_id,
+            "project_name": project_name,
+            "chat_url": f"{jetski_box_url()}/c/{cid}",
+        }
+
+  topic = _build_work_chat_topic(card)
+  full_title = f"[{cl.get_current_time_str()}] ⦿ {topic}"
+  prompt = _build_work_chat_prompt(card)
+  model_info = cl.resolve_handoff_model("", tier="pro", explicit="", project_id=project_id)
+  new_cid = cl.start_conversation_exact(
+      str(model_info["enum"]), full_title, prompt, project_id
+  )
+  _upsert_and_link_chat_chain(
+      store,
+      resolved_wid,
+      new_cid,
+      new_cid,
+      topic,
+      prompt,
+      cur_now,
+      cur_now,
+      source="manual",
+      link_reason="manual",
+      link_detail="Чат открыт с карточки",
+  )
+
+  # Stamp the resolved non-archived project onto cards with empty/archived/config project_id
+  by_token, _ = loaded_projects
+  cur_proj = cl.strip_activity_badge(str(card.get("project_id") or "")).strip().lower()
+  if project_name and (not cur_proj or cur_proj not in by_token):
+    store.create_work(
+        str(card.get("title") or topic),
+        project_id=project_name,
+        roadmap_item_key=str(card.get("roadmap_item_key") or ""),
+        work_id=resolved_wid,
+        now=cur_now,
+    )
+
+  # Force immediate chat classification refresh so build_dashboard_projection includes new_cid
+  work_store._CHAT_CLASS_CACHE["ts"] = 0.0
+  return {
+      "ok": True,
+      "started": True,
+      "already_existed": False,
+      "work_id": resolved_wid,
+      "conversation_id": new_cid,
+      "title": full_title,
+      "project_id": project_id,
+      "project_name": project_name,
+      "chat_url": f"{jetski_box_url()}/c/{new_cid}",
   }

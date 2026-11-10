@@ -9,6 +9,7 @@ import contextlib
 import html as html_lib
 import http.server
 import json
+import math
 import os
 import re
 import socketserver
@@ -1095,19 +1096,43 @@ def _render_ssr_card(w: dict[str, Any]) -> str:
   )
   mentions_cnt = len(mention_arts_ssr)
   mentions_lbl = f"{mentions_cnt} chat mention" + ("" if mentions_cnt == 1 else "s")
-  util_wrap_ssr = (
-      f'<div class="re-utility-row"><details class="wb-mentions re-mentions">'
+  # Keep an empty flex child when there are zero mentions so card actions stay right-aligned
+  mentions_ssr = (
+      f'<details class="wb-mentions re-mentions">'
       f'<summary title="📎 Упомянуто в чате ({mentions_cnt})">'
       f"{mentions_lbl}</summary>"
-      f'<div class="wb-mentions-list">{mentions_inner_ssr}</div></details></div>'
+      f'<div class="wb-mentions-list">{mentions_inner_ssr}</div></details>'
       if mention_arts_ssr
-      else ""
+      else "<span></span>"
   )
-  footer_ssr = (
-      f'<div class="re-footer">{chats_ssr}{pills_wrap_ssr}{util_wrap_ssr}</div>'
-      if (chats_ssr or pills_wrap_ssr or util_wrap_ssr)
-      else ""
+  # First click reuses any active chat idempotently; cards with a chip request a new chat
+  force_new_ssr = ' data-force-new="true"' if chat_arts_ssr else ""
+  chat_tip_ssr = (
+      "Start an additional chat for this card"
+      if chat_arts_ssr
+      else "Start or open chat for this card"
   )
+  start_chat_btn_ssr = (
+      f'<button class="wb-btn" data-start-chat="{wid}"{force_new_ssr} '
+      f'title="{chat_tip_ssr}" type="button">+ Chat</button>'
+  )
+  # Virtual cards materialize into persisted Works on + Chat before exposing persisted controls
+  persisted_btns_ssr = ""
+  if not bool(w.get("is_virtual")):
+    add_draft_ssr = (
+        f'<button class="wb-btn" data-edit-draft="{wid}" type="button">+ Reply draft</button>'
+        if not rd_ssr
+        else ""
+    )
+    persisted_btns_ssr = (
+        f"{add_draft_ssr}"
+        f'<button class="wb-btn" data-add-ob="{wid}" type="button">+ Obligation</button>'
+        f'<button class="wb-btn" data-add-link="{wid}" type="button">+ Link</button>'
+        f'<button class="wb-btn" data-work-done="{wid}" type="button">✓ Done</button>'
+    )
+  actions_ssr = f'<div class="wb-actions">{start_chat_btn_ssr}{persisted_btns_ssr}</div>'
+  util_wrap_ssr = f'<div class="re-utility-row">{mentions_ssr}{actions_ssr}</div>'
+  footer_ssr = f'<div class="re-footer">{chats_ssr}{pills_wrap_ssr}{util_wrap_ssr}</div>'
   # Mirror renderCardHeader status pill tones so initial SSR paint has zero hydration flash
   if raw_lane == "done":
     status_pill_ssr = '<span class="re-status-pill" data-tone="ready">✅ Done</span>'
@@ -1147,6 +1172,7 @@ def render_workbench_html(
   tray = slim_proj.get("unanswered_tray") or []
   synced_et = _esc(slim_proj.get("synced_et") or "")
   initial_json = json.dumps(slim_proj, ensure_ascii=False).replace("</", "<\\/")
+  jetski_box_json = json.dumps(ingestor.jetski_box_url(), ensure_ascii=False)
   ssr_body = "\n".join(_render_ssr_card(w) for w in works[:40])
   precision_pct = int(round(float(metrics.get("link_precision", 1.0)) * 100))
   # Compute initial SSR chip counts directly from works for activeFilter='all', type='all'
@@ -2386,6 +2412,7 @@ def render_workbench_html(
 <script>
 (() => {{
   const UI_VERSION = {int(ui_version)};
+  const JETSKI_BOX_URL = {jetski_box_json};
   // Bump storage key to v2 so legacy v1 global bulk flags cannot overwrite lane defaults
   const COLLAPSE_STORAGE_KEY = 'wb_collapsed_v2';
   // Persist sort mode and direction separately from per-card collapse overrides
@@ -2821,6 +2848,38 @@ def render_workbench_html(
     return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }}
 
+  // Carry collapse and peer-fold overrides across virt-<key> -> work-<hash> promotion
+  function migrateVirtualCardPrefs(oldWid, newWid) {{
+    if (!oldWid || !newWid || oldWid === newWid) return;
+    let movedCollapse = false;
+    if (Object.prototype.hasOwnProperty.call(collapsedOverrides, oldWid)) {{
+      collapsedOverrides[newWid] = collapsedOverrides[oldWid];
+      delete collapsedOverrides[oldWid];
+      movedCollapse = true;
+    }}
+    if (Object.prototype.hasOwnProperty.call(searchCollapsedOverrides, oldWid)) {{
+      searchCollapsedOverrides[newWid] = searchCollapsedOverrides[oldWid];
+      delete searchCollapsedOverrides[oldWid];
+    }}
+    if (movedCollapse) saveCollapsePrefs();
+
+    let movedFold = false;
+    if (Object.prototype.hasOwnProperty.call(peerFoldModes, oldWid)) {{
+      peerFoldModes[newWid] = peerFoldModes[oldWid];
+      delete peerFoldModes[oldWid];
+      movedFold = true;
+    }}
+    const oldPrefix = `${{oldWid}}::`;
+    for (const k of Object.keys(peerOpenOverrides)) {{
+      if (k.startsWith(oldPrefix)) {{
+        peerOpenOverrides[`${{newWid}}::${{k.slice(oldPrefix.length)}}`] = peerOpenOverrides[k];
+        delete peerOpenOverrides[k];
+        movedFold = true;
+      }}
+    }}
+    if (movedFold) savePeerFoldPrefs();
+  }}
+
   async function postJson(url, body) {{
     try {{
       const resp = await fetch(url, {{
@@ -2838,12 +2897,47 @@ def render_workbench_html(
         return false;
       }}
       state = await resp.json();
+      if (body && body.work_id && state && state.started_chat && state.started_chat.work_id) {{
+        migrateVirtualCardPrefs(String(body.work_id), String(state.started_chat.work_id));
+      }}
       render();
       lastRenderedSig = projectionRenderSignature(state);
       return true;
     }} catch (err) {{
       window.alert(`Network error: ${{err && err.message ? err.message : err}}`);
       return false;
+    }}
+  }}
+
+  // Open a Jetski conversation via iframe postMessage or standalone /api/chat/open + named tab
+  async function openChatInJetski(cid, fallbackUrl) {{
+    if (!cid) return;
+    // Embedded sidecar notifies its parent frame immediately and writes the non-blocking IPC file
+    if (window.parent && window.parent !== window) {{
+      window.parent.postMessage({{ type: 'jetski-flight-deck-open-chat', cascadeId: cid }}, '*');
+      fetch('/api/chat/open', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ conversation_id: cid, timeout_sec: 0.0 }}),
+      }}).catch(() => {{}});
+      return;
+    }}
+    const defaultUrl = fallbackUrl || `${{JETSKI_BOX_URL}}/c/${{encodeURIComponent(cid)}}`;
+    let targetUrl = defaultUrl;
+    try {{
+      const resp = await fetch('/api/chat/open', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ conversation_id: cid }}),
+      }});
+      const data = resp.ok ? await resp.json() : null;
+      if (data && data.reused_tab) return;
+      if (data && data.chat_url) targetUrl = data.chat_url;
+    }} catch (_) {{}}
+    // Fall back to location.assign if browser popup blockers reject async window.open
+    const win = window.open(targetUrl, 'jetski-chat');
+    if (!win && window.location && typeof window.location.assign === 'function') {{
+      window.location.assign(targetUrl);
     }}
   }}
 
@@ -4042,21 +4136,29 @@ def render_workbench_html(
 
     const rd = w.reply_draft || null;
     const isEditingDraft = Boolean(!w.is_virtual && openDraftEditors[w.work_id]);
+    // Cards that already show a chat chip pass data-force-new so + Chat opens an extra thread
+    const forceNewAttr = chatGroups.length > 0 ? ' data-force-new="true"' : '';
+    const chatBtnTip = chatGroups.length > 0
+      ? 'Start an additional chat for this card'
+      : 'Start or open chat for this card';
+    const startChatBtn = (
+      `<button class="wb-btn" data-start-chat="${{esc(w.work_id)}}"`
+      + `${{forceNewAttr}} title="${{chatBtnTip}}" type="button">+ Chat</button>`
+    );
     const addDraftBtn = (!w.is_virtual && !rd && !isEditingDraft)
       ? `<button class="wb-btn" data-edit-draft="${{esc(w.work_id)}}"`
         + ` type="button">+ Reply draft</button>`
       : '';
-    const cardActions = !w.is_virtual
-      ? `<div class="wb-actions">
-           ${{addDraftBtn}}
-           <button class="wb-btn" data-add-ob="${{esc(w.work_id)}}"
-                   type="button">+ Obligation</button>
-           <button class="wb-btn" data-add-link="${{esc(w.work_id)}}"
-                   type="button">+ Link</button>
-           <button class="wb-btn" data-work-done="${{esc(w.work_id)}}"
-                   type="button">✓ Done</button>
-         </div>`
+    const persistedBtns = !w.is_virtual
+      ? `${{addDraftBtn}}
+         <button class="wb-btn" data-add-ob="${{esc(w.work_id)}}"
+                 type="button">+ Obligation</button>
+         <button class="wb-btn" data-add-link="${{esc(w.work_id)}}"
+                 type="button">+ Link</button>
+         <button class="wb-btn" data-work-done="${{esc(w.work_id)}}"
+                 type="button">✓ Done</button>`
       : '';
+    const cardActions = `<div class="wb-actions">${{startChatBtn}}${{persistedBtns}}</div>`;
 
     return `
       <div class="re-footer">
@@ -4336,8 +4438,32 @@ def render_workbench_html(
     if (target.hasAttribute('data-open-chat')) {{
       e.preventDefault();
       const cid = target.getAttribute('data-open-chat');
-      if (window.parent && window.parent !== window) {{
-        window.parent.postMessage({{ type: 'jetski-flight-deck-open-chat', cascadeId: cid }}, '*');
+      if (cid) await openChatInJetski(cid, '');
+      return;
+    }}
+    // Guard against double-click spawning while start_chat_for_work calls StartCascade
+    if (target.hasAttribute('data-start-chat')) {{
+      const wid = target.getAttribute('data-start-chat');
+      if (!wid || target.disabled) return;
+      const forceNew = target.getAttribute('data-force-new') === 'true';
+      const origLabel = target.textContent;
+      target.disabled = true;
+      target.textContent = 'Starting…';
+      try {{
+        const ok = await postJson('/api/work/start_chat', {{
+          work_id: wid,
+          force_new: forceNew,
+        }});
+        if (ok && state && state.started_chat && state.started_chat.conversation_id) {{
+          notifyParentRendered();
+          await openChatInJetski(
+            state.started_chat.conversation_id,
+            state.started_chat.chat_url || ''
+          );
+        }}
+      }} finally {{
+        target.disabled = false;
+        target.textContent = origLabel;
       }}
       return;
     }}
@@ -4736,6 +4862,16 @@ def create_server(
         snap = get_http_snapshot()
         self._send_bytes(snap["html_bytes"], "text/html; charset=utf-8")
         return
+      # Redirect standalone /c/<cid> links (e.g. middle-click) to the Jetski Web box URL
+      if parsed.path.startswith("/c/"):
+        cid = parsed.path[len("/c/") :].strip("/")
+        if not ingestor.is_valid_conversation_id(cid):
+          self._send_json({"error": "Invalid conversation_id"}, status=400)
+          return
+        self.send_response(302)
+        self.send_header("Location", f"{ingestor.jetski_box_url()}/c/{cid}")
+        self.end_headers()
+        return
       self._send_json({"error": "Not found"}, status=404)
 
     def do_POST(self) -> None:
@@ -4924,6 +5060,56 @@ def create_server(
             self._send_json({"error": str(exc)}, status=400)
             return
         self._send_json(current_projection())
+        return
+
+      # Route standalone :8090 chat clicks through IPC poll before opening a browser tab
+      if parsed.path == "/api/chat/open":
+        cid = str(body.get("conversation_id") or "").strip()
+        if not ingestor.is_valid_conversation_id(cid):
+          self._send_json({"error": "Valid conversation_id is required"}, status=400)
+          return
+        raw_to = body.get("timeout_sec")
+        if raw_to is None:
+          timeout_sec = 1.8
+        elif isinstance(raw_to, bool):
+          self._send_json({"error": "Invalid timeout_sec"}, status=400)
+          return
+        else:
+          try:
+            timeout_sec = float(raw_to)
+          except (TypeError, ValueError):
+            self._send_json({"error": "Invalid timeout_sec"}, status=400)
+            return
+          if not math.isfinite(timeout_sec) or timeout_sec < 0.0:
+            self._send_json({"error": "Invalid timeout_sec"}, status=400)
+            return
+          timeout_sec = min(timeout_sec, ingestor.MAX_OPEN_CHAT_TIMEOUT_SEC)
+        self._send_json(ingestor.open_chat_in_jetski(cid, timeout_sec=timeout_sec))
+        return
+
+      # Materialize virtual cards on demand, spawn/reuse chat, and return refreshed projection
+      if parsed.path == "/api/work/start_chat":
+        wid = str(body.get("work_id") or "").strip()
+        if not wid:
+          self._send_json({"error": "work_id is required"}, status=400)
+          return
+        try:
+          started = ingestor.start_chat_for_work(
+              active_store,
+              wid,
+              cl_state_path=cl_state_path,
+              force_new=bool(body.get("force_new")),
+          )
+        except ValueError as exc:
+          self._send_json({"error": str(exc)}, status=400)
+          return
+        except Exception as exc:
+          self._send_json({"error": str(exc)}, status=502)
+          return
+        # Copy cached projection dict before attaching one-shot started_chat metadata
+        proj = dict(current_projection())
+        proj["started_chat"] = started
+        self._send_json(proj)
         return
 
       if parsed.path == "/api/sync":
