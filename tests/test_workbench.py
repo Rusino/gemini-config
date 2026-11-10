@@ -7621,6 +7621,343 @@ for (const q of ['', 'alpha']) {
     self.assertTrue(work_store.is_github_thread_resolved(pr_th_st, pr_pre_arts))
     self.assertFalse(work_store.is_github_thread_resolved(pr_th_st, pr_post_arts))
 
+  def test_absorb_obligation_covered_duplicate_cl_works(self) -> None:
+    """Absorbs orphan auto-created CL Works only when a correspondence Work gates their CLs."""
+    import base64
+    from unittest import mock
+    import ingestor
+    import work_store
+
+    store = work_store.WorkStore(self.db_path)
+    now = 1762900000.0
+
+    # Pre-existing correspondence Work mirrors live DB where Gmail thread arrived before CL links
+    w_renzo = store.create_work("Fixed bugs in Flutter — Renzo Olivares", now=now - 500)
+    store.upsert_artifact(
+        "gmail_thread:1a13c69d14fe1c3d",
+        kind="gmail_thread",
+        title="Fixed bugs in Flutter (Renzo Olivares)",
+        state={
+            "thread_id": "1a13c69d14fe1c3d",
+            "root_subject": "Fixed bugs in Flutter",
+            "counterparty": "Renzo Olivares",
+            "sent_by_me": True,
+            "last_from_me": False,
+            "last_message_ts": now - 400,
+            "is_active_correspondence": True,
+        },
+        now=now - 500,
+    )
+    store.link_artifact(
+        w_renzo, "gmail_thread:1a13c69d14fe1c3d", role="primary", link_reason="gmail_root", now=now
+    )
+
+    # Prerequisite stack parent without its own Bug: trailer (exercises upward stack coverage)
+    w_stack = store.create_work(
+        "[skparagraph] Keep visual cluster advance non-negative", now=now - 150
+    )
+    store.upsert_artifact(
+        "gerrit:skia:1421196",
+        kind="gerrit",
+        title="1421196: [skparagraph] Keep visual cluster advance non-negative",
+        state={"status": "NEW", "is_mine": True},
+        now=now - 150,
+    )
+    store.link_artifact(
+        w_stack, "gerrit:skia:1421196", role="primary", source="auto", now=now - 150
+    )
+
+    cl_state = {
+        "items": {
+            "gerrit:1421196@p1": {
+                "item_key": "gerrit:1421196",
+                "kind": "gerrit",
+                "target_id": "1421196",
+                "host": "skia-review.googlesource.com",
+                "status": "NEW",
+                "patchset": 2,
+                "is_mine": True,
+                "subject": "[skparagraph] Keep visual cluster advance non-negative",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1421196",
+                "commit_message": "Refactor cluster advance helper",
+                "entity_state": {"status": "waiting", "lane": "waiting"},
+            },
+            "gerrit:1404137@c1": {
+                "item_key": "gerrit:1404137",
+                "kind": "gerrit",
+                "target_id": "1404137",
+                "host": "skia-review.googlesource.com",
+                "status": "NEW",
+                "patchset": 11,
+                "is_mine": True,
+                "stack_parent_ikey": "gerrit:1421196",
+                "subject": "[skparagraph] Do not letter-space default-ignorable clusters",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1404137",
+                "commit_message": "Bug: https://github.com/flutter/flutter/issues/160251",
+                "entity_state": {"status": "waiting", "lane": "waiting"},
+            },
+            "gerrit:1414017@c2": {
+                "item_key": "gerrit:1414017",
+                "kind": "gerrit",
+                "target_id": "1414017",
+                "host": "skia-review.googlesource.com",
+                "status": "NEW",
+                "patchset": 1,
+                "is_mine": True,
+                "subject": "[skparagraph] Shift the trailing space of an RTL run when justifying",
+                "url": "https://skia-review.googlesource.com/c/skia/+/1414017",
+                "commit_message": "Bug: https://github.com/flutter/flutter/issues/84030",
+                "entity_state": {"status": "waiting", "lane": "waiting"},
+            },
+        },
+        "bugs": {},
+    }
+    ingestor.ingest_cl_watcher_state(store, cl_state, now=now - 100)
+
+    w_ignorable = store.find_work_by_artifact("gerrit:skia:1404137", roles=("primary",))
+    w_rtl = store.find_work_by_artifact("gerrit:skia:1414017", roles=("primary",))
+    self.assertEqual(w_ignorable, w_stack)
+    self.assertIsNotNone(w_rtl)
+    self.assertNotEqual(w_rtl, w_renzo)
+    assert w_ignorable is not None and w_rtl is not None
+    store.upsert_artifact(
+        "chat_chain:4726af35-fce3-4cea-9fc1-743d0357e8ac",
+        kind="chat_chain",
+        title="Default-ignorable clusters",
+        now=now - 90,
+    )
+    store.link_artifact(
+        w_ignorable,
+        "chat_chain:4726af35-fce3-4cea-9fc1-743d0357e8ac",
+        role="channel",
+        source="auto",
+        link_reason="cl_watcher_chat",
+        now=now - 90,
+    )
+    # Automated reviewlog mail and companion probes on S must not block duplicate absorption
+    store.upsert_artifact(
+        "gmail_thread:th_auto_reviewlog",
+        kind="gmail_thread",
+        title="Change in skia[main]: 1404137",
+        state={"thread_id": "th_auto_reviewlog", "is_automated": True},
+        now=now - 88,
+    )
+    store.link_artifact(
+        w_ignorable,
+        "gmail_thread:th_auto_reviewlog",
+        role="channel",
+        source="auto",
+        link_reason="gmail_thread_ref",
+        now=now - 88,
+    )
+    store.upsert_artifact(
+        "gerrit:skia:1499999",
+        kind="gerrit",
+        title="1499999: [WIP] companion probe",
+        state={"status": "ABANDONED", "is_companion": True, "companion_to": "gerrit:skia:1404137"},
+        now=now - 86,
+    )
+    store.link_artifact(
+        w_ignorable,
+        "gerrit:skia:1499999",
+        role="primary",
+        source="auto",
+        link_reason="companion_wip",
+        now=now - 86,
+    )
+
+    # Manually titled Work sharing a gated CL must stay separate even after draft sync
+    w_manual = store.create_work(
+        "Pinned custom note", meta={"title_manual": True}, now=now - 80
+    )
+    store.link_artifact(w_manual, "gerrit:skia:1404137", role="primary", source="auto", now=now - 80)
+
+    draft_html = (
+        "<p>Hi Renzo,</p><ul>"
+        '<li><a href="https://github.com/flutter/flutter/issues/160251">#160251</a> '
+        '(<a href="https://skia-review.googlesource.com/c/skia/+/1404137">CL 1404137</a>)</li>'
+        '<li><a href="https://github.com/flutter/flutter/issues/84030">#84030</a> '
+        '(<a href="https://skia-review.googlesource.com/c/skia/+/1414017">CL 1414017</a>)</li>'
+        "</ul>"
+    )
+    b64_body = base64.urlsafe_b64encode(draft_html.encode("utf-8")).decode("ascii")
+
+    def fake_gmail(cmd, *args, **kwargs):
+      del args, kwargs
+      res = subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+      if "drafts" in cmd:
+        res.stdout = json.dumps(
+            {"drafts": [{"id": "r_renzo_dup", "threadId": "1a13c69d14fe1c3d"}]}
+        )
+      elif "get-draft" in cmd:
+        res.stdout = json.dumps({
+            "id": "r_renzo_dup",
+            "message": {
+                "threadId": "1a13c69d14fe1c3d",
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "Re: Fixed bugs in Flutter"},
+                        {"name": "To", "value": "Renzo Olivares <roliv@google.com>"},
+                    ],
+                    "body": {"data": b64_body},
+                },
+            },
+        })
+      elif "get-thread" in cmd:
+        res.stdout = json.dumps({
+            "messages": [{
+                "internalDate": str(int((now - 400) * 1000)),
+                "snippet": "Fixed bugs in Flutter",
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "Fixed bugs in Flutter"},
+                        {"name": "From", "value": "Renzo Olivares <roliv@google.com>"},
+                        {"name": "To", "value": "Julia Lavrova <jlavrova@google.com>"},
+                    ]
+                },
+            }]
+        })
+      else:
+        res.stdout = json.dumps({"messages": []})
+      return res
+
+    with mock.patch("os.path.isfile", return_value=True), mock.patch(
+        "subprocess.run", side_effect=fake_gmail
+    ):
+      ingestor.ingest_gmail_drafts_and_threads(store, {}, now=now)
+
+    active_ids = {w["work_id"] for w in store.list_works()}
+    self.assertIn(w_renzo, active_ids)
+    self.assertNotIn(w_ignorable, active_ids)
+    self.assertNotIn(w_rtl, active_ids)
+    self.assertIn(w_manual, active_ids)
+    renzo_roles = store.get_work_artifact_roles(w_renzo)
+    self.assertEqual(renzo_roles.get("gerrit:skia:1421196"), "primary")
+    self.assertEqual(
+        renzo_roles.get("chat_chain:4726af35-fce3-4cea-9fc1-743d0357e8ac"), "channel"
+    )
+
+    # Splitting a CL out of the consolidated card must keep the split card alive across syncs
+    w_split = store.split_work(w_renzo, "gerrit:skia:1414017", "Standalone RTL CL", now=now + 10)
+    store.reconcile_correspondence_obligations(now=now + 15)
+    self.assertIn(w_split, {w["work_id"] for w in store.list_works()})
+
+    # Passive reference GDoc without active correspondence must never absorb standalone CL cards
+    store.upsert_artifact(
+        "gdoc:1PassiveSpecDocId1234567890",
+        kind="gdoc",
+        title="Design Spec",
+        state={"doc_title": "Design Spec"},
+        now=now + 16,
+    )
+    store.upsert_artifact(
+        "gerrit:skia:1430999",
+        kind="gerrit",
+        title="1430999: Spec implementation",
+        state={"status": "NEW", "is_mine": True},
+        now=now + 16,
+    )
+    w_cl_spec = store.create_work("1430999: Spec implementation", now=now + 16)
+    store.link_artifact(
+        w_cl_spec, "gerrit:skia:1430999", role="primary", source="auto", now=now + 16
+    )
+    w_doc_only = store.create_work("Design Spec card", now=now + 16)
+    store.link_artifact(
+        w_doc_only, "gdoc:1PassiveSpecDocId1234567890", role="primary", now=now + 16
+    )
+    store.link_artifact(w_doc_only, "gerrit:skia:1430999", role="primary", now=now + 16)
+    store.add_obligation(
+        w_doc_only,
+        "Verify spec after merge",
+        trigger_expr="cl_merged(gerrit:skia:1430999)",
+        now=now + 17,
+    )
+    self.assertIn(w_cl_spec, {w["work_id"] for w in store.list_works()})
+
+    # Ungated correspondence never merges a CL card until an auto-gated reply draft gates that CL
+    store.upsert_artifact(
+        "gerrit:skia:1431001",
+        kind="gerrit",
+        title="1431001: Ungated until draft",
+        state={"status": "NEW", "is_mine": True},
+        now=now + 20,
+    )
+    w_dup_wb = store.create_work("1431001: Ungated until draft", now=now + 20)
+    store.link_artifact(w_dup_wb, "gerrit:skia:1431001", role="primary", source="auto", now=now + 20)
+    w_corr_wb = store.create_work("Flutter follow-up — Peer", now=now + 20)
+    store.upsert_artifact(
+        "gmail_thread:th_wb_gate",
+        kind="gmail_thread",
+        title="Flutter follow-up (Peer)",
+        state={
+            "thread_id": "th_wb_gate",
+            "root_subject": "Flutter follow-up",
+            "counterparty": "Peer",
+            "sent_by_me": True,
+            "last_from_me": True,
+            "last_message_ts": now + 15,
+            "is_active_correspondence": True,
+        },
+        now=now + 20,
+    )
+    store.link_artifact(w_corr_wb, "gmail_thread:th_wb_gate", role="channel", now=now + 20)
+    store.link_artifact(w_corr_wb, "gerrit:skia:1431001", role="primary", now=now + 20)
+    store.reconcile_correspondence_obligations(now=now + 21)
+    self.assertIn(w_dup_wb, {w["work_id"] for w in store.list_works()})
+
+    store.save_reply_draft(
+        w_corr_wb, "<p>Will update once 1431001 lands</p>", auto_gate=True, now=now + 25
+    )
+    self.assertNotIn(w_dup_wb, {w["work_id"] for w in store.list_works()})
+
+    # Scoped reconciliation on a newly minted duplicate source Work must still absorb it into T
+    w_late_src = store.create_work("1431001: Late transcript card", now=now + 26)
+    store.link_artifact(
+        w_late_src, "gerrit:skia:1431001", role="primary", source="auto", now=now + 26
+    )
+    store.reconcile_correspondence_obligations(w_late_src, now=now + 27)
+    self.assertNotIn(w_late_src, {w["work_id"] for w in store.list_works()})
+
+    # bug_closed(...) obligation on correspondence Work must absorb auto CL Work fixing that bug
+    store.upsert_artifact(
+        "github_issue:flutter/flutter:99901",
+        kind="github_issue",
+        title="flutter#99901: Line break bug",
+        state={"status": "OPEN"},
+        now=now + 30,
+    )
+    store.upsert_artifact(
+        "gerrit:skia:1432002",
+        kind="gerrit",
+        title="1432002: Fix line break bug",
+        state={
+            "status": "NEW",
+            "is_mine": True,
+            "commit_message": "Bug: https://github.com/flutter/flutter/issues/99901",
+        },
+        now=now + 30,
+    )
+    w_bug_corr = store.create_work("Bug 99901 thread — Peer", now=now + 30)
+    store.link_artifact(w_bug_corr, "gmail_thread:th_wb_gate", role="channel", now=now + 30)
+    store.link_artifact(
+        w_bug_corr, "github_issue:flutter/flutter:99901", role="primary", now=now + 30
+    )
+    store.link_artifact(w_bug_corr, "gerrit:skia:1432002", role="primary", now=now + 30)
+    w_dup_bug = store.create_work("1432002: Fix line break bug", now=now + 30)
+    store.link_artifact(
+        w_dup_bug, "gerrit:skia:1432002", role="primary", source="auto", now=now + 30
+    )
+    store.link_artifact(
+        w_dup_bug, "github_issue:flutter/flutter:99901", role="primary", source="auto", now=now + 30
+    )
+    store.add_obligation(
+        w_bug_corr,
+        "Reply once #99901 closes",
+        trigger_expr="bug_closed(github_issue:flutter/flutter:99901)",
+        now=now + 31,
+    )
+    self.assertNotIn(w_dup_bug, {w["work_id"] for w in store.list_works()})
+
 
 if __name__ == "__main__":
   unittest.main()

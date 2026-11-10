@@ -3,8 +3,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 import contextlib
+import dataclasses
 from datetime import datetime, timezone
 import glob
 import hashlib
@@ -2840,6 +2841,155 @@ def evaluate_trigger(
   return "unknown" if has_unknown else "true"
 
 
+@dataclasses.dataclass(frozen=True)
+class _DuplicateMergeSnapshot:
+  """Read-only snapshot of active Works and links for obligation-covered duplicate detection."""
+
+  work_rows: list[dict[str, Any]]
+  links_by_w: dict[str, list[dict[str, Any]]]
+  obs_by_w: dict[str, list[str]]
+  negs_by_w: dict[str, set[str]]
+  split_wids: set[str]
+  art_kinds: dict[str, str]
+  art_states: dict[str, dict[str, Any]]
+  art_titles: dict[str, str]
+
+
+def _is_live_correspondence_or_draft_artifact(
+    akey: str,
+    snap: _DuplicateMergeSnapshot,
+) -> bool:
+  """Returns True when akey is an active correspondence channel or an unsent Gmail draft."""
+  akind = snap.art_kinds.get(akey) or artifact_kind_from_key(akey)
+  st = snap.art_states.get(akey) or {}
+  if akind == "gmail_draft":
+    return str(st.get("status") or "DRAFT").upper() == "DRAFT"
+  return is_active_correspondence_artifact(akind, st)
+
+
+def _extract_obligation_gated_keys(trigger_expr: str) -> set[str]:
+  """Extracts canonicalized artifact keys from cl_merged/rolled_into/bug_closed predicates."""
+  gated: set[str] = set()
+  for part in re.split(r"\bAND\b", str(trigger_expr or ""), flags=re.IGNORECASE):
+    expr = part.strip()
+    if not expr:
+      continue
+    m_single = re.match(r"^(?:cl_merged|bug_closed)\(\s*([^)]+?)\s*\)$", expr, re.IGNORECASE)
+    if m_single:
+      gated.add(canonicalize_artifact_key(m_single.group(1)))
+      continue
+    m_roll = re.match(r"^rolled_into\(\s*[A-Za-z0-9_]+\s*,\s*([^)]+?)\s*\)$", expr, re.IGNORECASE)
+    if m_roll:
+      gated.add(canonicalize_artifact_key(m_roll.group(1)))
+  return gated
+
+
+def _expand_gated_with_bug_cls_and_stack(
+    gated_keys: set[str],
+    primary_keys: set[str],
+    neg_keys: set[str],
+    snap: _DuplicateMergeSnapshot,
+) -> tuple[set[str], set[str]]:
+  """Expands gated keys to bug-fixing primary CLs and non-hub Gerrit stack ancestors."""
+  covered = set(gated_keys)
+  # Expand bug_closed(...) obligations to primary product CLs whose Bug: trailers match
+  for pkey in primary_keys:
+    if not pkey.startswith(("gerrit:", "github_pr:", "piper:")):
+      continue
+    pst = snap.art_states.get(pkey) or {}
+    if is_hub_artifact(pkey, pst) or is_companion_artifact(
+        pkey, pst, snap.art_titles.get(pkey) or ""
+    ):
+      continue
+    if set(extract_cl_bug_keys(pst)) & covered:
+      covered.add(pkey)
+
+  # Include stacked primary child CLs whose parent matched bug_closed(...)
+  for pkey in primary_keys:
+    if pkey.startswith("gerrit:") and pkey not in covered:
+      praw = str((snap.art_states.get(pkey) or {}).get("stack_parent_ikey") or "").strip()
+      if praw and canonicalize_artifact_key(praw) in covered:
+        covered.add(pkey)
+
+  # Walk upward along stack_parent_ikey so prerequisite parent CLs without Bug: trailers merge too
+  stack_ancestors: set[str] = set()
+  queue = [k for k in covered if k.startswith("gerrit:")]
+  visited_parents: set[str] = set()
+  while queue:
+    cur = queue.pop()
+    parent_raw = str((snap.art_states.get(cur) or {}).get("stack_parent_ikey") or "").strip()
+    if not parent_raw:
+      continue
+    parent_key = canonicalize_artifact_key(parent_raw)
+    # Each stored parent_key enters visited_parents at most once, bounding the traversal
+    if parent_key in visited_parents or parent_key in neg_keys:
+      continue
+    visited_parents.add(parent_key)
+    pst = snap.art_states.get(parent_key) or {}
+    if not pst or is_hub_artifact(parent_key, pst) or is_companion_artifact(
+        parent_key, pst, snap.art_titles.get(parent_key) or ""
+    ):
+      continue
+    covered.add(parent_key)
+    stack_ancestors.add(parent_key)
+    queue.append(parent_key)
+  return covered, stack_ancestors
+
+
+def _is_absorbable_duplicate_work(
+    s_row: Mapping[str, Any],
+    t_primaries: set[str],
+    t_allowed_primaries: set[str],
+    t_covered_keys: set[str],
+    t_negatives: set[str],
+    snap: _DuplicateMergeSnapshot,
+) -> bool:
+  """Returns True when auto-created CL Work s_row has no own thread/obligations and T gates it."""
+  sid = str(s_row.get("work_id") or "")
+  if snap.obs_by_w.get(sid) or sid in snap.split_wids:
+    return False
+  if str(s_row.get("roadmap_item_key") or "").strip():
+    return False
+  try:
+    s_meta = json.loads(str(s_row.get("meta_json") or "{}"))
+  except Exception:
+    s_meta = {}
+  if bool(s_meta.get("title_manual")) or _active_reply_draft_from_meta(s_meta) is not None:
+    return False
+  s_links: Sequence[Mapping[str, Any]] = snap.links_by_w.get(sid) or ()
+  if not s_links:
+    return False
+  s_primaries: set[str] = set()
+  s_cls: list[str] = []
+  for link in s_links:
+    ak = str(link.get("artifact_key") or "")
+    role = str(link.get("role") or "")
+    # Respect user link edits, explicit unlink tombstones, and independent correspondence cards
+    if str(link.get("source") or "") == "manual" or ak in t_negatives:
+      return False
+    if role in ("primary", "channel") and _is_live_correspondence_or_draft_artifact(ak, snap):
+      return False
+    if role != "primary":
+      continue
+    if ak.startswith(("gerrit:", "github_pr:", "piper:")):
+      # Companion test probes are ephemeral review artifacts and should not block parent absorption
+      if is_companion_artifact(
+          ak,
+          snap.art_states.get(ak) or {},
+          snap.art_titles.get(ak) or "",
+          str(link.get("link_reason") or ""),
+      ):
+        continue
+      s_cls.append(ak)
+    s_primaries.add(ak)
+  # Require at least one shared primary CL so parent-only Works never merge into child-only threads
+  if not s_cls or not (set(s_cls) & t_primaries):
+    return False
+  if not s_primaries.issubset(t_allowed_primaries):
+    return False
+  return all(ck in t_covered_keys for ck in s_cls)
+
+
 def _is_done_matched(
     obligation: Mapping[str, Any],
     artifacts_by_key: Mapping[str, Mapping[str, Any]],
@@ -4519,7 +4669,10 @@ class WorkStore:
       self.evaluate_all_obligations(now=cur_now)
 
   def reconcile_correspondence_obligations(
-      self, work_id: str | None = None, now: float | None = None
+      self,
+      work_id: str | None = None,
+      now: float | None = None,
+      _allow_absorb: bool = True,
   ) -> None:
     """Ensures active correspondence channels carry end-to-end ownership umbrellas."""
     cur_now = time.time() if now is None else now
@@ -4945,6 +5098,9 @@ class WorkStore:
               now=cur_now,
           )
     self.evaluate_all_obligations(now=cur_now)
+    # Fold in auto-minted CL Works whose primaries are now gated by active obligations
+    if _allow_absorb:
+      self.absorb_obligation_covered_duplicate_works(work_id=work_id, now=cur_now)
 
   def get_obligation(
       self, obligation_id: str, now: float | None = None
@@ -5121,6 +5277,129 @@ class WorkStore:
           payload={"source_work_id": source_work_id},
           now=cur_now,
       )
+
+  def _load_duplicate_merge_snapshot(self) -> _DuplicateMergeSnapshot | None:
+    """Loads active Works, links, open obligations, and tombstones for duplicate merge checks."""
+    with self._lock, self._connect() as conn:
+      work_rows = [
+          dict(r)
+          for r in conn.execute(
+              "SELECT * FROM works WHERE status NOT IN ('done', 'archived') "
+              "ORDER BY updated_at DESC, work_id ASC"
+          ).fetchall()
+      ]
+      if len(work_rows) < 2:
+        return None
+      active_ids = {str(w["work_id"]) for w in work_rows}
+      links_by_w: dict[str, list[dict[str, Any]]] = {wid: [] for wid in active_ids}
+      for lr in conn.execute("SELECT * FROM work_links").fetchall():
+        wid_l = str(lr["work_id"])
+        if wid_l in links_by_w:
+          links_by_w[wid_l].append(dict(lr))
+      obs_by_w: dict[str, list[str]] = {wid: [] for wid in active_ids}
+      for obr in conn.execute(
+          "SELECT work_id, trigger_expr FROM obligations WHERE status IN ('open', 'ready')"
+      ).fetchall():
+        wid_o = str(obr["work_id"])
+        if wid_o in obs_by_w:
+          obs_by_w[wid_o].append(str(obr["trigger_expr"] or ""))
+      negs_by_w: dict[str, set[str]] = {wid: set() for wid in active_ids}
+      for nr in conn.execute("SELECT work_id, artifact_key FROM negative_links").fetchall():
+        wid_n = str(nr["work_id"])
+        if wid_n in negs_by_w:
+          negs_by_w[wid_n].add(str(nr["artifact_key"]))
+      split_wids = {
+          str(sr["work_id"])
+          for sr in conn.execute(
+              "SELECT DISTINCT work_id FROM events WHERE event_type = 'work_split'"
+          ).fetchall()
+      }
+      art_kinds: dict[str, str] = {}
+      art_states: dict[str, dict[str, Any]] = {}
+      art_titles: dict[str, str] = {}
+      for ar in conn.execute(
+          "SELECT artifact_key, kind, title, state_json FROM artifacts"
+      ).fetchall():
+        ak = str(ar["artifact_key"])
+        art_kinds[ak] = str(ar["kind"] or artifact_kind_from_key(ak))
+        art_titles[ak] = str(ar["title"] or "")
+        try:
+          art_states[ak] = json.loads(ar["state_json"] or "{}")
+        except Exception:
+          art_states[ak] = {}
+    return _DuplicateMergeSnapshot(
+        work_rows=work_rows,
+        links_by_w=links_by_w,
+        obs_by_w=obs_by_w,
+        negs_by_w=negs_by_w,
+        split_wids=split_wids,
+        art_kinds=art_kinds,
+        art_states=art_states,
+        art_titles=art_titles,
+    )
+
+  def absorb_obligation_covered_duplicate_works(
+      self,
+      work_id: str | None = None,
+      now: float | None = None,
+  ) -> list[str]:
+    """Merges auto-created orphan CL Works into correspondence Works whose obligations gate them."""
+    cur_now = time.time() if now is None else now
+    snap = self._load_duplicate_merge_snapshot()
+    if snap is None:
+      return []
+    merge_pairs: list[tuple[str, str]] = []
+    absorbed: set[str] = set()
+    for tw in snap.work_rows:
+      tid = str(tw["work_id"])
+      if tid in absorbed or not snap.obs_by_w.get(tid):
+        continue
+      t_links = snap.links_by_w.get(tid) or []
+      has_corr = (
+          _active_reply_draft_from_meta(tw.get("meta_json") or "{}") is not None
+          or any(
+              l["role"] in ("primary", "channel")
+              and _is_live_correspondence_or_draft_artifact(str(l["artifact_key"]), snap)
+              for l in t_links
+          )
+      )
+      if not has_corr:
+        continue
+      t_primaries = {str(l["artifact_key"]) for l in t_links if l["role"] == "primary"}
+      t_gated: set[str] = set()
+      for trig in snap.obs_by_w[tid]:
+        t_gated |= _extract_obligation_gated_keys(trig)
+      t_gated &= t_primaries
+      if not t_gated:
+        continue
+      t_negs = snap.negs_by_w.get(tid) or set()
+      t_covered, stack_ancestors = _expand_gated_with_bug_cls_and_stack(
+          t_gated, t_primaries, t_negs, snap
+      )
+      t_allowed_primaries = t_primaries | stack_ancestors
+      for sw in snap.work_rows:
+        sid = str(sw["work_id"])
+        # Match scoped calls whether work_id updated target tid or candidate duplicate sid
+        if work_id and tid != work_id and sid != work_id:
+          continue
+        if sid == tid or sid in absorbed:
+          continue
+        if _is_absorbable_duplicate_work(
+            sw, t_primaries, t_allowed_primaries, t_covered, t_negs, snap
+        ):
+          merge_pairs.append((tid, sid))
+          absorbed.add(sid)
+
+    # Run writes outside the read snapshot so SQLite WAL never nests write connections
+    affected_tids: list[str] = []
+    for tid, sid in merge_pairs:
+      self.merge_works(tid, sid, source="auto", now=cur_now)
+      if tid not in affected_tids:
+        affected_tids.append(tid)
+    # Refresh target auto_gate triggers and migrated obligation IDs once links transfer
+    for tid in affected_tids:
+      self.reconcile_correspondence_obligations(tid, now=cur_now, _allow_absorb=False)
+    return [sid for _, sid in merge_pairs]
 
   def split_work(
       self,
