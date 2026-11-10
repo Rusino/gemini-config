@@ -2,8 +2,8 @@
 name: review-triage
 description: >-
   Code Review Triage and Action Engine for Gerrit CLs, Git PRs, and Piper diffs (4 triage
-  categories, core 5% hunk isolation, `keeper_skeptic` refutation + finding ledger, and default
-  `companion-cl-review` WIP CL unless opted out with "без компаньона" / "только текстом").
+  categories, split_refactor parity, perf ablation gate, core 5% isolation, keeper_skeptic +
+  finding ledger, default companion-cl-review WIP CL unless "без компаньона" / "только текстом").
   Trigger when asked to "разбери СЛ", "сделай триаж ревью", "оцени СЛ", "посмотри этот ревью",
   "triage this CL/PR", or "что делать с этим ревью".
 ---
@@ -131,6 +131,25 @@ Triage output alone is never the final word. Every `🔴 SURGICAL AUDIT / CORE D
    - **`REFUTED`**: Drop **completely** (never rephrase as a "polite question" or doc nit) and persist via `finding_ledger.py add`. If all candidates are `REFUTED`, the draft is a clean `LGTM`.
    - **`CONFIRMED`**: Proceed to **Default Companion WIP CL Execution (`companion-cl-review`)** below.
    - **`UNPROVEN`**: Convert into a polite, specific **Question for the CL Author** in English.
+
+### Profile B: Pure File/Test Split & Relocation Parity Mode (`split_refactor`)
+
+When `triage_cl.py` sets `review_profile: "split_refactor"` (`### 🧩 Split / Refactor 100% Parity Audit`) on a pure file decomposition, code relocation, or test-suite split without new functional logic (suppressing false missing-test/scope pushbacks and blocking blind `MECHANICAL` auto-approval), do **not** generate false-positive bug or style critiques on unchanged moved legacy code. Instead, audit **100% 3-axis parity** (`git cat-file -p <base_sha>:<path>` vs. patched files) and pass real parity defects through `keeper_skeptic`:
+1. **Exact Test Counter & Omission Parity**: Verify `0` dropped, silently `DISABLED_`/skipped, or platform/context-narrowed tests across `Skia` (`DEF_TEST`, `DEF_GANESH_TEST`, `DEF_GANESH_TEST_FOR_RENDERING_CONTEXTS`, `DEF_GRAPHITE_TEST*`, `UNIX_ONLY_TEST`), `Chromium` / GoogleTest (`TEST`, `TEST_F`, `TEST_P`, `TYPED_TEST`), and `Flutter` (Dart and TS `test(`, `testWidgets(`), plus `0` dropped functions/classes, `#if` / `#ifdef` / `#if defined(...)` / `BUILDFLAG(...)` guards (or newly added `#if 0` blocks), or `KEEPER-DEBT` / task-marker and invariant comments.
+2. **Semantic & Lifetime Equivalence**: Verify token-level equivalence of migrated bodies, assertion fidelity, fixture/member initialization and destruction order, `FRIEND_TEST_ALL_PREFIXES` suite names, and anonymous-namespace scoping.
+3. **Build Graph & Header Symmetry**: Verify every new/moved `.h`/`.cpp`/`.cc`/`.mm` file is symmetrically registered and every deleted/renamed-from path is cleaned out across touched source lists (`gn/*.gni` / `modules/*/*.gni` **and** `BUILD.bazel` / `public.bzl` in `Skia`; `BUILD.gn` in `Chromium` and `Flutter` Engine), with self-contained headers and clean `#include`s.
+
+### Incoming Performance `Ablation Gate` (External / Non-Self Perf CLs)
+
+When `triage_cl.py` emits `### 🧪 Incoming Perf Ablation Gate` (`ablation_gate.is_perf_cl == true` on non-self CLs targeting performance, benchmarks, caches, or fast paths):
+1. **Per-Mechanism Ablation Over Bundling (`baseline`, `A`, `B`, `A+B`)**: If an incoming perf CL mixes `2+` independent mechanisms (e.g., new cache/memoization + loop/algorithm rewrite + side fast-path, container `.reserve()` tuning, or cleanup refactor) without isolated per-mechanism benchmarks, request isolated ablation data (`baseline`, `A`, `B`, `A+B`) or separate CLs—recommending deletion of any sub-mechanism whose standalone win does not justify its state/complexity cost.
+2. **Benchmark ↔ Guard Condition Alignment**: Verify in code that the benchmark stories cited in the commit description actually execute the modified runtime guard conditions (`if (...)`, `#if ...`, feature flags) rather than measuring an unexercised path, alongside the mandatory local `txt_benchmarks A/B` gate in `## Report Contract` when applicable.
+
+### `Deletion Dominance` & `Whole-Function Clean Rewrite` Consolidation (`<= 40` Lines)
+
+During review draft synthesis (after `keeper_skeptic` filtering):
+1. **Deletion Dominance**: When a `CONFIRMED` finding recommends deleting an unnecessary helper, class, member, branch, or file change `X`, suppress/fold all downstream lifetime, `#include`, comment, or style findings inside `X` into that deletion item—never post one comment asking to delete `X` and separate comments fixing nits inside `X`.
+2. **Whole-Function Clean Rewrite (`<= 40` Lines)**: When `2+` `CONFIRMED` findings or simplifications fall inside the same short function or method (`<= 40` lines on the patched side) and that function is **not** slated for complete deletion under `Deletion Dominance`, merge them into **one** review comment containing a single clean whole-function rewrite instead of scattering multiple small threads across the same function.
 
 ---
 
