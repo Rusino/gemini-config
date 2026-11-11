@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Iterator, Mapping
 import contextlib
+import functools
 import html as html_lib
 import http.server
 import json
@@ -1159,6 +1160,18 @@ def _render_ssr_card(w: dict[str, Any]) -> str:
       f'<div class="wb-card-body">{decision_ssr}{loop_band_ssr}{deliv_band_ssr}'
       f"{footer_ssr}</div></article>"
   )
+
+
+@functools.lru_cache(maxsize=1)
+def _compact_workbench_tail(tail: str) -> str:
+  """Strips static JS comments and leading indentation to keep inline <script> compact."""
+  script_part, html_close = tail.split("</script>", 1)
+  lines = [
+      ln.lstrip(" ")
+      for ln in script_part.splitlines()
+      if ln.strip() and not ln.lstrip(" ").startswith("//")
+  ]
+  return "\n".join(lines) + "\n</script>" + html_close
 
 
 def render_workbench_html(
@@ -2453,7 +2466,7 @@ def render_workbench_html(
   const DRAFTS_STORAGE_KEY = 'wb_drafts_v1';
   let draftsOpen = false;
   let state = {initial_json};
-  let activeFilter = 'all';
+""" + _compact_workbench_tail(f"""  let activeFilter = 'all';
   let activeTypeFilter = 'all';
   let searchQuery = '';
   let sortMode = 'triage';
@@ -2465,6 +2478,31 @@ def render_workbench_html(
   let searchCollapsedOverrides = {{}};
   // Track open inline reply-draft editors per card across periodic projection refreshes
   let openDraftEditors = {{}};
+  const openDetailsKeys = new Set();
+  const startingChatButtons = new Set();
+  let domMorphSupported = null;
+  let lastSlotHtml = new WeakMap();
+  let lastNodeHtml = new WeakMap();
+  let lastInputDefault = new WeakMap();
+
+  function resetDomReconcilerCache() {{
+    lastSlotHtml = new WeakMap();
+    lastNodeHtml = new WeakMap();
+    lastInputDefault = new WeakMap();
+  }}
+
+  function setTextIfChanged(el, nextText) {{
+    if (!el) return;
+    const s = String(nextText ?? '');
+    if (el.textContent !== s) el.textContent = s;
+  }}
+
+  function setAttrIfChanged(el, name, val) {{
+    if (!el || typeof el.setAttribute !== 'function') return;
+    const s = String(val ?? '');
+    if (typeof el.getAttribute === 'function' && el.getAttribute(name) === s) return;
+    el.setAttribute(name, s);
+  }}
 
   function unescapeHtml(s) {{
     const ta = document.createElement('textarea');
@@ -2596,9 +2634,9 @@ def render_workbench_html(
     if (modeEl && modeEl.value !== sortMode) modeEl.value = sortMode;
     const dirEl = document.getElementById('wb-sort-dir');
     if (!dirEl) return;
-    dirEl.setAttribute('data-dir', sortDir);
+    setAttrIfChanged(dirEl, 'data-dir', sortDir);
     const lbl = sortDir === 'desc' ? '↓ New' : '↑ Old';
-    if (dirEl.textContent !== lbl) dirEl.textContent = lbl;
+    setTextIfChanged(dirEl, lbl);
     let tip = 'Triage: Needs You & urgent first, newest activity';
     if (sortMode === 'triage' && sortDir === 'asc') {{
       tip = 'Triage: Needs You & urgent first, oldest activity';
@@ -2611,8 +2649,8 @@ def render_workbench_html(
         ? 'Age: longest-open first (oldest origin)'
         : 'Age: recently opened first (newest origin)';
     }}
-    dirEl.setAttribute('title', tip);
-    dirEl.setAttribute('aria-label', tip);
+    setAttrIfChanged(dirEl, 'title', tip);
+    setAttrIfChanged(dirEl, 'aria-label', tip);
   }}
 
   function saveCollapsePrefs() {{
@@ -2781,12 +2819,12 @@ def render_workbench_html(
       const typeAttr = chip.getAttribute('data-type');
       let cnt = 0;
       if (typeAttr !== null) {{
-        chip.setAttribute('data-active', typeAttr === activeTypeFilter ? 'true' : 'false');
+        setAttrIfChanged(chip, 'data-active', typeAttr === activeTypeFilter ? 'true' : 'false');
         for (const w of allWorks) {{
           if (cardMatchesSlice(w, activeFilter, typeAttr, q)) cnt += 1;
         }}
       }} else if (laneAttr !== null) {{
-        chip.setAttribute('data-active', laneAttr === activeFilter ? 'true' : 'false');
+        setAttrIfChanged(chip, 'data-active', laneAttr === activeFilter ? 'true' : 'false');
         for (const w of allWorks) {{
           if (cardMatchesSlice(w, laneAttr, activeTypeFilter, q)) cnt += 1;
         }}
@@ -2794,16 +2832,17 @@ def render_workbench_html(
         continue;
       }}
       // Skip redundant DOM attribute and innerHTML writes when chip counts are unchanged
-      const prevCnt = chip.getAttribute('data-count');
-      const nextCnt = String(cnt);
-      if (prevCnt !== nextCnt) {{
-        chip.setAttribute('data-count', nextCnt);
-      }}
+      setAttrIfChanged(chip, 'data-count', cnt);
       const baseLbl = chip.getAttribute('data-base-label');
       if (baseLbl) {{
-        const nextHtml = `${{esc(baseLbl)}} <span class="wb-chip-cnt">(${{cnt}})</span>`;
-        if (chip.innerHTML !== nextHtml) {{
-          chip.innerHTML = nextHtml;
+        const cntEl = typeof chip.querySelector === 'function'
+          ? chip.querySelector('.wb-chip-cnt')
+          : null;
+        if (cntEl) {{
+          setTextIfChanged(cntEl, `(${{cnt}})`);
+        }} else {{
+          const nextHtml = `${{esc(baseLbl)}} <span class="wb-chip-cnt">(${{cnt}})</span>`;
+          if (chip.innerHTML !== nextHtml) chip.innerHTML = nextHtml;
         }}
       }}
     }}
@@ -2841,13 +2880,14 @@ def render_workbench_html(
         ? `⇈ Collapse visible cards (${{expandedCount}}/${{totalCount}} open)`
         : `⇊ Expand visible cards (${{collapsedCount}} collapsed)`;
     }}
-    btn.disabled = totalCount === 0;
-    btn.setAttribute('data-action', action);
-    btn.setAttribute('data-expanded-count', String(expandedCount));
-    btn.setAttribute('data-collapsed-count', String(collapsedCount));
-    btn.setAttribute('aria-label', label);
-    btn.setAttribute('title', label);
-    if (btn.textContent !== icon) btn.textContent = icon;
+    const nextDisabled = totalCount === 0;
+    if (Boolean(btn.disabled) !== nextDisabled) btn.disabled = nextDisabled;
+    setAttrIfChanged(btn, 'data-action', action);
+    setAttrIfChanged(btn, 'data-expanded-count', expandedCount);
+    setAttrIfChanged(btn, 'data-collapsed-count', collapsedCount);
+    setAttrIfChanged(btn, 'aria-label', label);
+    setAttrIfChanged(btn, 'title', label);
+    setTextIfChanged(btn, icon);
   }}
 
   function notifyParentRendered() {{
@@ -3679,26 +3719,29 @@ def render_workbench_html(
     let statusPillHtml = '';
     if (w.lane === 'needs-you') {{
       statusPillHtml = (
-        '<span class="re-status-pill" data-tone="urgent">'
+        '<span class="re-status-pill" data-unit-key="eyebrow:status" data-tone="urgent">'
         + '<span class="re-dot"></span>Needs You</span>'
       );
     }} else if (w.lane === 'done') {{
-      statusPillHtml = '<span class="re-status-pill" data-tone="ready">✅ Done</span>';
+      statusPillHtml = (
+        '<span class="re-status-pill" data-unit-key="eyebrow:status" data-tone="ready">'
+        + '✅ Done</span>'
+      );
     }} else if (w.lane === 'on-desk') {{
       statusPillHtml = (
-        '<span class="re-status-pill" data-tone="warn">'
+        '<span class="re-status-pill" data-unit-key="eyebrow:status" data-tone="warn">'
         + '<span class="re-dot"></span>On Desk</span>'
       );
     }} else if (attentionPeers > 0 && peers.length > 0) {{
       const parkedSfx = hasDraft ? ' · Parked' : '';
       statusPillHtml = (
-        `<span class="re-status-pill" data-tone="warn">`
+        `<span class="re-status-pill" data-unit-key="eyebrow:status" data-tone="warn">`
         + `<span class="re-dot"></span>Action ${{attentionPeers}}/${{peers.length}}`
         + `${{parkedSfx}}</span>`
       );
     }} else {{
       statusPillHtml = (
-        '<span class="re-status-pill" data-tone="wait">'
+        '<span class="re-status-pill" data-unit-key="eyebrow:status" data-tone="wait">'
         + '<span class="re-dot"></span>Waiting</span>'
       );
     }}
@@ -3724,13 +3767,15 @@ def render_workbench_html(
       }} else {{
         inner = `<span class="wb-origin" title="${{fullOrig}}">${{esc(shortOrig)}}</span>`;
       }}
-      originRowHtml = `<div class="wb-origin-row">${{inner}}</div>`;
+      originRowHtml = `<div class="wb-origin-row" data-unit-key="eyebrow:origin">${{inner}}</div>`;
     }}
 
     const projLabel = (w.project_id && !/^[0-9a-f]{{8}}-[0-9a-f]{{4}}-/i.test(w.project_id))
-      ? `<span>${{esc(w.project_id)}}</span>`
+      ? `<span data-unit-key="eyebrow:proj">${{esc(w.project_id)}}</span>`
       : '';
-    const roadmapTag = w.roadmap_item_key ? `<span>${{esc(w.roadmap_item_key)}}</span>` : '';
+    const roadmapTag = w.roadmap_item_key
+      ? `<span data-unit-key="eyebrow:roadmap">${{esc(w.roadmap_item_key)}}</span>`
+      : '';
 
     // Surface creation date directly in Age mode, and expose it as a hover tooltip otherwise
     const actEt = String(w.activity_et || w.updated_et || '');
@@ -3758,28 +3803,29 @@ def render_workbench_html(
       : '';
     const collapsedSummaryTxt = [firstReason, firstProg].filter(Boolean).join(' · ');
     const collapsedSummaryHtml = collapsedSummaryTxt
-      ? `<div class="re-collapsed-summary">${{esc(collapsedSummaryTxt)}}</div>`
+      ? `<div class="re-collapsed-summary" data-unit-key="hdr:summary">`
+        + `${{esc(collapsedSummaryTxt)}}</div>`
       : '';
 
     return `
-      <div class="wb-card-hdr" data-toggle-card="${{esc(w.work_id)}}">
+      <div class="wb-card-hdr" data-unit-key="card:hdr" data-toggle-card="${{esc(w.work_id)}}">
         <div class="wb-hdr-stack">
-          <div class="re-eyebrow">
-            <div class="re-eyebrow-left">
+          <div class="re-eyebrow" data-unit-key="hdr:eyebrow">
+            <div class="re-eyebrow-left" data-unit-key="eyebrow:left">
               ${{statusPillHtml}}
               ${{cpHtml}}
               ${{originRowHtml}}
               ${{projLabel}}
               ${{roadmapTag}}
             </div>
-            <div class="re-eyebrow-right">
+            <div class="re-eyebrow-right" data-unit-key="eyebrow:right">
               ${{timeMetaHtml}}
               <span class="re-chevron" aria-hidden="true"
                     title="Click to toggle · Alt-click to toggle all visible cards"
                     >${{SVG_CHEVRON}}</span>
             </div>
           </div>
-          <div class="re-headline-row">
+          <div class="re-headline-row" data-unit-key="hdr:headline">
             <div class="wb-card-title re-headline"
                  title="${{esc(w.title)}}">${{esc(headline)}}</div>
             ${{headlineSubHtml}}
@@ -3792,7 +3838,8 @@ def render_workbench_html(
   }}
 
   // Render one open correspondence/action obligation row with ambiguity and wait controls
-  function renderObligationRow(o) {{
+  function renderObligationRow(o, idx) {{
+    const obKey = esc(o.obligation_id || idx);
     const isDraftOb = String(o.target_artifact_key || '').startsWith('gmail_draft:');
     const waitTag = o.wb_reply_draft
       ? '<span style="color:var(--accent);font-weight:600">Parked reply note</span>'
@@ -3832,8 +3879,8 @@ def render_workbench_html(
                  type="button">Ответила → жду</button>`
       : '';
     return `
-      <div class="wb-ob re-loop-row" data-status="${{esc(o.status)}}"
-           data-stalled="${{Boolean(o.stalled_alert)}}"
+      <div class="wb-ob re-loop-row" data-unit-key="ob:${{obKey}}"
+           data-status="${{esc(o.status)}}" data-stalled="${{Boolean(o.stalled_alert)}}"
            title="Trigger: ${{esc(o.trigger_expr)}}">
         <div class="wb-ob-main">
           <div>${{statusTag}} · ${{esc(o.description)}}</div>
@@ -3861,12 +3908,16 @@ def render_workbench_html(
       const lblStyle = 'font-size:11px;color:var(--muted);display:inline-flex;'
         + 'align-items:center;gap:4px';
       return `
-        <div class="wb-reply-draft">
-          <div class="wb-reply-draft-hdr"><span>Edit live reply draft</span></div>
-          <textarea class="wb-reply-textarea" id="wb-draft-ta-${{esc(w.work_id)}}"
+        <div class="wb-reply-draft" data-unit-key="loop:draft-edit">
+          <div class="wb-reply-draft-hdr" data-unit-key="draft:hdr">
+            <span>Edit live reply draft</span>
+          </div>
+          <textarea class="wb-reply-textarea" data-unit-key="draft:ta"
+                    id="wb-draft-ta-${{esc(w.work_id)}}"
                     placeholder="HTML or plain-text reply note...">${{esc(initBody)}}</textarea>
           ${{syncStripHtml}}
-          <div class="wb-actions" style="justify-content:space-between;flex-wrap:wrap">
+          <div class="wb-actions" data-unit-key="draft:actions"
+               style="justify-content:space-between;flex-wrap:wrap">
             <label style="${{lblStyle}}">
               <input type="checkbox" id="wb-draft-ag-${{esc(w.work_id)}}"
                      ${{initAg ? 'checked' : ''}}>
@@ -3902,8 +3953,8 @@ def render_workbench_html(
         + ` type="button">Create Gmail draft</button>`;
     }}
     return `
-      <div class="wb-reply-draft">
-        <div class="wb-reply-draft-hdr">
+      <div class="wb-reply-draft" data-unit-key="loop:draft-preview">
+        <div class="wb-reply-draft-hdr" data-unit-key="draft:hdr">
           <span>Live reply draft · ${{esc(rd.updated_et || '')}}</span>
           <div class="wb-ob-btns">
             ${{matBtns}}
@@ -3913,7 +3964,8 @@ def render_workbench_html(
                     type="button">Clear</button>
           </div>
         </div>
-        <div class="wb-reply-draft-body">${{renderDraftPreview(rd)}}</div>
+        <div class="wb-reply-draft-body"
+             data-unit-key="draft:body">${{renderDraftPreview(rd)}}</div>
         ${{syncStripHtml}}
       </div>
     `;
@@ -3922,12 +3974,14 @@ def render_workbench_html(
   // Render Band 1 combining obligations, correspondence threads/drafts, and inline draft composer
   function renderLoopBand(w, openObs, peers, hasDraft) {{
     const obsItemsHtml = openObs.map(renderObligationRow).join('');
-    const obsHtml = obsItemsHtml ? `<div class="wb-obs">${{obsItemsHtml}}</div>` : '';
+    const obsHtml = obsItemsHtml
+      ? `<div class="wb-obs" data-unit-key="loop:obs">${{obsItemsHtml}}</div>`
+      : '';
     const corrPills = (w.artifacts || []).filter(
       (a) => a.role !== 'context_only' && isCorrArt(a)
         && !(a.kind === 'gmail_draft' && gmailDraftStatus(a) === 'DISCARDED')
     );
-    const corrRowsHtml = corrPills.map((a) => {{
+    const corrRowsHtml = corrPills.map((a, idx) => {{
       const cutBtn = !w.is_virtual
         ? `<button class="re-unlink wb-cut" title="Detach from Work" `
           + `data-unlink-work="${{esc(w.work_id)}}" `
@@ -3940,8 +3994,10 @@ def render_workbench_html(
         ? '<span style="color:var(--ready);font-size:10px;font-weight:600">[SENT]</span>'
         : '';
       const whySpan = a.why_badge ? `<span class="wb-why">· ${{esc(a.why_badge)}}</span>` : '';
+      const corrKey = esc(a.artifact_key || idx);
       return `
-        <div class="re-corr-row" data-kind="${{esc(a.kind)}}" data-role="${{esc(a.role)}}">
+        <div class="re-corr-row" data-unit-key="corr:${{corrKey}}"
+             data-kind="${{esc(a.kind)}}" data-role="${{esc(a.role)}}">
           <a class="re-corr-link" href="${{esc(a.url || '#')}}"
              target="_blank" rel="noopener">${{esc(a.title)}}</a>
           ${{sentTag}}
@@ -3951,7 +4007,9 @@ def render_workbench_html(
         </div>
       `;
     }}).join('');
-    const corrHtml = corrRowsHtml ? `<div class="wb-correspondence">${{corrRowsHtml}}</div>` : '';
+    const corrHtml = corrRowsHtml
+      ? `<div class="wb-correspondence" data-unit-key="loop:corr">${{corrRowsHtml}}</div>`
+      : '';
 
     const missingDraftCls = [];
     if (hasDraft) {{
@@ -3962,12 +4020,15 @@ def render_workbench_html(
       }}
     }}
     const syncStripHtml = missingDraftCls.length
-      ? `<div class="re-sync-strip"><span>Not in draft yet: `
+      ? `<div class="re-sync-strip" data-unit-key="draft:sync"><span>Not in draft yet: `
         + `<strong>${{esc(missingDraftCls.join(', '))}}</strong></span></div>`
       : '';
     const replyDraftHtml = renderReplyDraftBox(w, syncStripHtml);
     if (!obsHtml && !corrHtml && !replyDraftHtml) return '';
-    return `<div class="re-band">${{obsHtml}}${{corrHtml}}${{replyDraftHtml}}</div>`;
+    return (
+      `<div class="re-band" data-unit-key="band:loop">`
+      + `${{obsHtml}}${{corrHtml}}${{replyDraftHtml}}</div>`
+    );
   }}
 
   // Render one CL/PR row inside an expanded peer spine without duplicating standalone titles
@@ -4007,7 +4068,7 @@ def render_workbench_html(
         + `data-unlink-key="${{esc(c.artifact_key)}}" type="button">×</button>`
       : '';
     return `
-      <div class="wb-cl-chip re-cl-row">
+      <div class="wb-cl-chip re-cl-row" data-unit-key="cl:${{esc(c.artifact_key)}}">
         <a class="re-cl-link" href="${{esc(c.url || '#')}}"
            target="_blank" rel="noopener">${{esc(c.shortLabel)}}</a>
         ${{psBadge}}
@@ -4065,12 +4126,13 @@ def render_workbench_html(
         : '';
       const spineClsHtml = peer.cls.length
         ? peer.cls.map((c) => renderPeerSpineClRow(w, peer, c, hasDraft)).join('')
-        : '<div class="re-empty-spine">No linked CLs yet</div>';
+        : '<div class="re-empty-spine" data-unit-key="cl:empty">No linked CLs yet</div>';
       const outdatedTag = peer.draftOutdated
         ? '<span class="wb-draft-warn">Not in draft</span>'
         : '';
       return `
-        <div class="wb-chk-row re-peer" data-stage="${{esc(peer.stage)}}"
+        <div class="wb-chk-row re-peer" data-unit-key="peer:${{esc(peer.peerKey)}}"
+             data-stage="${{esc(peer.stage)}}"
              data-peer-key="${{esc(peer.peerKey)}}" data-peer-open="${{peerOpen}}">
           <div class="re-peer-hdr" data-peer-hdr="${{esc(peer.peerKey)}}"
                data-peer-work="${{esc(w.work_id)}}">
@@ -4095,18 +4157,18 @@ def render_workbench_html(
       `;
     }}).join('');
     return `
-      <div class="re-band">
-        <div class="re-band-hdr">
+      <div class="re-band" data-unit-key="band:deliverables">
+        <div class="re-band-hdr" data-unit-key="deliv:hdr">
           <span class="re-band-lbl">Deliverables (${{peers.length}})</span>
           ${{foldBarHtml}}
         </div>
-        <div class="wb-checklist re-peer-list">${{peerRowsHtml}}</div>
+        <div class="wb-checklist re-peer-list" data-unit-key="deliv:list">${{peerRowsHtml}}</div>
       </div>
     `;
   }}
 
   // Render a secondary or chat-mention artifact pill with optional unlink button
-  function renderPillItem(w, a) {{
+  function renderPillItem(w, a, idx) {{
     const cutBtn = !w.is_virtual
       ? `<button class="re-unlink wb-cut" title="Detach from Work" `
         + `data-unlink-work="${{esc(w.work_id)}}" `
@@ -4122,8 +4184,9 @@ def render_workbench_html(
       : '';
     const whySpan = a.why_badge ? `<span class="wb-why">· ${{esc(a.why_badge)}}</span>` : '';
     const tipAttr = a.why_tooltip ? `title="${{esc(a.why_tooltip)}}"` : '';
+    const pillKey = esc(a.artifact_key || idx);
     return `
-      <div class="wb-pill" data-kind="${{esc(a.kind)}}"
+      <div class="wb-pill" data-unit-key="pill:${{pillKey}}" data-kind="${{esc(a.kind)}}"
            data-role="${{esc(a.role)}}" ${{tipAttr}}>
         <a ${{linkAttrs}} style="color:inherit;text-decoration:none">${{esc(a.title)}}</a>
         ${{whySpan}}
@@ -4142,7 +4205,7 @@ def render_workbench_html(
     );
     const chatGroups = groupChatChains(chatArts);
     const chatsHtml = chatGroups.length
-      ? `<div class="re-chats-row">${{chatGroups.map((g) => {{
+      ? `<div class="re-chats-row" data-unit-key="footer:chats">${{chatGroups.map((g) => {{
           const first = g.items[0];
           const allKeys = g.items.map((it) => it.artifact_key).join(',');
           const piecesHtml = g.items.length > 1
@@ -4160,7 +4223,10 @@ def render_workbench_html(
               + `data-unlink-work="${{esc(w.work_id)}}" `
               + `data-unlink-key="${{esc(allKeys)}}" type="button">×</button>`
             : '';
-          return `<span class="re-chat-chip">${{mainLink}}${{piecesHtml}}${{cutChatBtn}}</span>`;
+          return (
+            `<span class="re-chat-chip" data-unit-key="chat-grp:${{esc(allKeys)}}">`
+            + `${{mainLink}}${{piecesHtml}}${{cutChatBtn}}</span>`
+          );
         }}).join('')}}</div>`
       : '';
 
@@ -4171,16 +4237,20 @@ def render_workbench_html(
     const mentionPills = (w.artifacts || []).filter(
       (a) => a && a.role === 'context_only' && !chkCovered.has(a.artifact_key)
     );
-    const pillsHtml = otherPills.map((a) => renderPillItem(w, a)).join('');
+    const pillsHtml = otherPills.map((a, idx) => renderPillItem(w, a, idx)).join('');
     const mCnt = mentionPills.length;
     const mLbl = `${{mCnt}} chat mention${{mCnt === 1 ? '' : 's'}}`;
-    const mentionItemsHtml = mentionPills.map((a) => renderPillItem(w, a)).join('');
+    const mentionItemsHtml = mentionPills.map((a, idx) => renderPillItem(w, a, idx)).join('');
+    const mentionsKey = `mentions:${{w.work_id}}`;
+    const mentionsOpenAttr = openDetailsKeys.has(mentionsKey) ? ' open' : '';
     const mentionsHtml = mCnt
-      ? `<details class="wb-mentions re-mentions">
-           <summary title="📎 Упомянуто в чате (${{mCnt}})">${{mLbl}}</summary>
-           <div class="wb-mentions-list">${{mentionItemsHtml}}</div>
+      ? `<details class="wb-mentions re-mentions" data-unit-key="util:mentions"`
+        + ` data-details-key="${{esc(mentionsKey)}}"${{mentionsOpenAttr}}>
+           <summary data-unit-key="mentions:sum"`
+        + ` title="📎 Упомянуто в чате (${{mCnt}})">${{mLbl}}</summary>
+           <div class="wb-mentions-list" data-unit-key="mentions:list">${{mentionItemsHtml}}</div>
          </details>`
-      : '<span></span>';
+      : '<span data-unit-key="util:mentions-empty"></span>';
 
     const rd = w.reply_draft || null;
     const isEditingDraft = Boolean(!w.is_virtual && openDraftEditors[w.work_id]);
@@ -4190,35 +4260,41 @@ def render_workbench_html(
       ? 'Start an additional chat for this card'
       : 'Start or open chat for this card';
     const startChatBtn = (
-      `<button class="wb-btn" data-start-chat="${{esc(w.work_id)}}"`
+      `<button class="wb-btn" data-unit-key="act:chat" data-start-chat="${{esc(w.work_id)}}"`
       + `${{forceNewAttr}} title="${{chatBtnTip}}" type="button">+ Chat</button>`
     );
     const addDraftBtn = (!w.is_virtual && !rd && !isEditingDraft)
-      ? `<button class="wb-btn" data-edit-draft="${{esc(w.work_id)}}"`
+      ? `<button class="wb-btn" data-unit-key="act:draft" data-edit-draft="${{esc(w.work_id)}}"`
         + ` type="button">+ Reply draft</button>`
       : '';
     const acceptBtn = w.owner !== 'user'
-      ? `<button class="wb-btn" data-work-accept="${{esc(w.work_id)}}"
+      ? `<button class="wb-btn" data-unit-key="act:accept" data-work-accept="${{esc(w.work_id)}}"
                  title="Сделать своей работой" type="button">Принять</button>`
       : '';
     const persistedBtns = !w.is_virtual
       ? `${{addDraftBtn}}
-         <button class="wb-btn" data-add-ob="${{esc(w.work_id)}}"
+         <button class="wb-btn" data-unit-key="act:ob" data-add-ob="${{esc(w.work_id)}}"
                  type="button">+ Obligation</button>
-         <button class="wb-btn" data-add-link="${{esc(w.work_id)}}"
+         <button class="wb-btn" data-unit-key="act:link" data-add-link="${{esc(w.work_id)}}"
                  type="button">+ Link</button>
          ${{acceptBtn}}
-         <button class="wb-btn" data-work-done="${{esc(w.work_id)}}"
+         <button class="wb-btn" data-unit-key="act:done" data-work-done="${{esc(w.work_id)}}"
                  type="button">✓ Done</button>`
       : '';
-    const cardActions = `<div class="wb-actions">${{startChatBtn}}${{persistedBtns}}</div>`;
+    const cardActions = (
+      `<div class="wb-actions" data-unit-key="util:actions">`
+      + `${{startChatBtn}}${{persistedBtns}}</div>`
+    );
 
+    const pillsBlock = pillsHtml
+      ? `<div class="wb-pills" data-unit-key="footer:pills">${{pillsHtml}}</div>`
+      : '';
     return `
-      <div class="re-footer">
+      <div class="re-footer" data-unit-key="band:footer">
         ${{chatsHtml}}
-        ${{pillsHtml ? `<div class="wb-pills">${{pillsHtml}}</div>` : ''}}
+        ${{pillsBlock}}
         ${{renderSuggestions(w)}}
-        <div class="re-utility-row">
+        <div class="re-utility-row" data-unit-key="footer:util">
           ${{mentionsHtml}}
           ${{cardActions}}
         </div>
@@ -4246,8 +4322,8 @@ def render_workbench_html(
         + `${{acts}}<button class="wb-btn wb-sug-btn" data-hint-dismiss="${{kind}}"`
         + ` data-hint-work="${{wid}}" title="Скрыть" type="button">✕</button></span>`;
     }}).join('');
-    return `<div class="wb-sug-row wb-hint-row"><span class="wb-sug-hdr">Подсказка</span>`
-      + `${{items}}</div>`;
+    return `<div class="wb-sug-row wb-hint-row" data-unit-key="hdr:hints">`
+      + `<span class="wb-sug-hdr">Подсказка</span>${{items}}</div>`;
   }}
 
   // Text mentions held back from her work until she takes (✓) or drops (✕) each one
@@ -4268,8 +4344,8 @@ def render_workbench_html(
     const total = Math.max(Number(w.suggestions_total) || 0, sugs.length);
     const more = total > sugs.length
       ? `<span class="wb-sug-more">+${{total - sugs.length}}</span>` : '';
-    return `<div class="wb-sug-row"><span class="wb-sug-hdr">Предложено (${{total}})</span>`
-      + `${{items}}${{more}}</div>`;
+    return `<div class="wb-sug-row" data-unit-key="footer:sugs">`
+      + `<span class="wb-sug-hdr">Предложено (${{total}})</span>${{items}}${{more}}</div>`;
   }}
 
   // Render a single editorial Work card across header, decision strip, loop, peers, and footer
@@ -4285,7 +4361,8 @@ def render_workbench_html(
     );
     const reasonsList = (w.reasons || []).map((r) => esc(cleanEmojiPrefix(r))).join(' · ');
     const decisionHtml = reasonsList
-      ? `<div class="re-decision"><div class="re-decision-txt">${{reasonsList}}</div></div>`
+      ? `<div class="re-decision" data-unit-key="band:decision">`
+        + `<div class="re-decision-txt">${{reasonsList}}</div></div>`
       : '';
     const loopBandHtml = renderLoopBand(w, openObs, peers, hasDraft);
     const deliverablesBandHtml = renderDeliverablesBand(w, peers, artByKey, hasDraft);
@@ -4295,7 +4372,7 @@ def render_workbench_html(
     return `
       <article class="wb-card" ${{cardAttrs}}>
         ${{headerHtml}}
-        <div class="wb-card-body">
+        <div class="wb-card-body" data-unit-key="card:body">
           ${{decisionHtml}}
           ${{loopBandHtml}}
           ${{deliverablesBandHtml}}
@@ -4314,37 +4391,316 @@ def render_workbench_html(
     const drafts = works.filter(isFoldedDraft);
     if (!drafts.length) return main.map(renderWorkCard).join('');
     const caret = draftsOpen ? '▾' : '▸';
-    return `<div class="wb-group-hdr">Мои работы (${{main.length}})</div>`
+    return `<div class="wb-group-hdr" data-unit-key="wb-sec:main-hdr">`
+      + `Мои работы (${{main.length}})</div>`
       + main.map(renderWorkCard).join('')
-      + `<button class="wb-group-hdr wb-drafts-toggle" data-drafts-toggle type="button"`
+      + `<button class="wb-group-hdr wb-drafts-toggle" data-unit-key="wb-sec:drafts-toggle"`
+      + ` data-drafts-toggle type="button"`
       + ` aria-expanded="${{draftsOpen}}">${{caret}} Черновики (${{drafts.length}})</button>`
-      + `<div class="wb-drafts-body"${{draftsOpen ? '' : ' hidden'}}>`
-      + `${{drafts.map(renderWorkCard).join('')}}</div>`;
+      + `<div class="wb-drafts-body" data-unit-key="wb-sec:drafts-body"`
+      + `${{draftsOpen ? '' : ' hidden'}}>${{drafts.map(renderWorkCard).join('')}}</div>`;
+  }}
+
+  // Snapshot mounted <details data-details-key> open states before DOM reconciliation
+  function syncOpenDetailsFromDom() {{
+    if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') {{
+      return;
+    }}
+    const nodes = document.querySelectorAll('details[data-details-key]');
+    if (!nodes || !nodes.length) return;
+    for (const el of nodes) {{
+      if (!el || typeof el.getAttribute !== 'function') continue;
+      const k = el.getAttribute('data-details-key');
+      if (!k) continue;
+      const isOpen = typeof el.open === 'boolean'
+        ? el.open
+        : (typeof el.hasAttribute === 'function' && el.hasAttribute('open'));
+      if (isOpen) openDetailsKeys.add(k);
+      else openDetailsKeys.delete(k);
+    }}
+  }}
+
+  function unitKeyOfNode(el) {{
+    if (!el || el.nodeType !== 1 || typeof el.getAttribute !== 'function') return '';
+    return el.getAttribute('data-unit-key')
+      || (el.hasAttribute('data-work-id') ? `work:${{el.getAttribute('data-work-id')}}` : '');
+  }}
+
+  function isWhitespaceTextNode(n) {{
+    return Boolean(n && n.nodeType === 3 && !/[^\\s]/.test(n.nodeValue || ''));
+  }}
+
+  function nextNonWhitespaceCursor(node) {{
+    let cur = node;
+    while (isWhitespaceTextNode(cur)) cur = cur.nextSibling;
+    return cur;
+  }}
+
+  function hasNonWhitespaceTextChild(el) {{
+    const nodes = (el && el.childNodes) || [];
+    for (let i = 0; i < nodes.length; i++) {{
+      if (nodes[i].nodeType === 3 && /[^\\s]/.test(nodes[i].nodeValue || '')) return true;
+    }}
+    return false;
+  }}
+
+  // Probe element-tree DOM support once so stub Node test harnesses fall back to innerHTML
+  function canMorphContainer(el) {{
+    if (!el) return false;
+    if (typeof el.insertBefore !== 'function' || typeof el.removeChild !== 'function') {{
+      domMorphSupported = false;
+      return false;
+    }}
+    if (domMorphSupported !== null) return domMorphSupported;
+    if (typeof document === 'undefined' || typeof document.createElement !== 'function') {{
+      domMorphSupported = false;
+      return false;
+    }}
+    try {{
+      const probe = document.createElement('div');
+      probe.innerHTML = '<i data-p="1">x</i>';
+      const ch = probe.firstChild;
+      domMorphSupported = Boolean(
+        ch && ch.nodeType === 1 && typeof ch.getAttribute === 'function'
+        && ch.getAttribute('data-p') === '1'
+      );
+    }} catch {{
+      domMorphSupported = false;
+    }}
+    return domMorphSupported;
+  }}
+
+  // Seed initial server-rendered input defaults and keyed outerHTML on newly mounted subtrees
+  function seedSubtreeDefaults(node) {{
+    if (!node || node.nodeType !== 1) return;
+    const tag = String(node.tagName || '').toUpperCase();
+    if (tag === 'TEXTAREA') {{
+      const defVal = typeof node.value === 'string' ? node.value : String(node.textContent || '');
+      lastInputDefault.set(node, defVal);
+    }} else if (tag === 'INPUT' && node.type !== 'checkbox' && node.type !== 'button') {{
+      lastInputDefault.set(node, String(node.getAttribute('value') || ''));
+    }}
+    const uKey = unitKeyOfNode(node);
+    if (uKey && typeof node.outerHTML === 'string') {{
+      lastNodeHtml.set(node, node.outerHTML);
+    }}
+    const kids = node.children || [];
+    for (let i = 0; i < kids.length; i++) {{
+      seedSubtreeDefaults(kids[i]);
+    }}
+  }}
+
+  // Sync changed attributes while keeping open <details>, checkboxes, and in-flight + Chat intact
+  function morphAttributes(liveEl, targetEl) {{
+    const keepStartFlight = startingChatButtons.has(liveEl);
+    const attrs = liveEl.attributes || [];
+    for (let i = attrs.length - 1; i >= 0; i--) {{
+      const name = attrs[i].name;
+      if (name === 'open' && liveEl.hasAttribute('data-details-key')) continue;
+      if (name === 'disabled' && keepStartFlight) continue;
+      if (!targetEl.hasAttribute(name)) liveEl.removeAttribute(name);
+    }}
+    const nextAttrs = targetEl.attributes || [];
+    for (let i = 0; i < nextAttrs.length; i++) {{
+      const {{ name, value }} = nextAttrs[i];
+      if (name === 'open' && liveEl.hasAttribute('data-details-key')) continue;
+      if (name === 'disabled' && keepStartFlight) continue;
+      if (liveEl.getAttribute(name) !== value) liveEl.setAttribute(name, value);
+    }}
+    if (liveEl.tagName === 'DETAILS' && liveEl.hasAttribute('data-details-key')) {{
+      const wantOpen = openDetailsKeys.has(liveEl.getAttribute('data-details-key'));
+      if (Boolean(liveEl.open) !== wantOpen) liveEl.open = wantOpen;
+    }}
+    if (liveEl.tagName === 'INPUT' && liveEl.type === 'checkbox') {{
+      const wantChecked = targetEl.hasAttribute('checked');
+      if (Boolean(liveEl.checked) !== wantChecked) liveEl.checked = wantChecked;
+    }}
+    if ('disabled' in liveEl && !keepStartFlight) {{
+      const wantDisabled = targetEl.hasAttribute('disabled');
+      if (Boolean(liveEl.disabled) !== wantDisabled) liveEl.disabled = wantDisabled;
+    }}
+  }}
+
+  function canMorphPair(a, b) {{
+    if (!a || !b || a.nodeType !== b.nodeType) return false;
+    if (a.nodeType === 3 || a.nodeType === 8) return true;
+    if (a.nodeType === 1) {{
+      return a.tagName === b.tagName && unitKeyOfNode(a) === unitKeyOfNode(b);
+    }}
+    return false;
+  }}
+
+  // Reconcile keyed card/section lists in place so surviving items shift without teardown
+  function reconcileKeyedChildren(parent, targetParent) {{
+    if (hasNonWhitespaceTextChild(targetParent)) return false;
+    const targetEls = Array.from(targetParent.children || []);
+    if (!targetEls.length) return false;
+    const targetKeys = new Set();
+    for (let i = 0; i < targetEls.length; i++) {{
+      const k = unitKeyOfNode(targetEls[i]);
+      if (!k || targetKeys.has(k)) return false;
+      targetKeys.add(k);
+    }}
+    const liveByKey = new Map();
+    const initialNodes = Array.from(parent.childNodes || []);
+    for (let i = 0; i < initialNodes.length; i++) {{
+      const n = initialNodes[i];
+      if (isWhitespaceTextNode(n)) continue;
+      const k = unitKeyOfNode(n);
+      if (!k || !targetKeys.has(k) || liveByKey.has(k)) {{
+        parent.removeChild(n);
+      }} else {{
+        liveByKey.set(k, n);
+      }}
+    }}
+    // Skip inter-element whitespace text nodes so matching cards never spuriously re-insert
+    let cursor = nextNonWhitespaceCursor(parent.firstChild);
+    for (let i = 0; i < targetEls.length; i++) {{
+      const targetEl = targetEls[i];
+      const k = unitKeyOfNode(targetEl);
+      const live = liveByKey.get(k);
+      if (!live) {{
+        parent.insertBefore(targetEl, cursor);
+        seedSubtreeDefaults(targetEl);
+        continue;
+      }}
+      if (live !== cursor) {{
+        parent.insertBefore(live, cursor);
+      }} else {{
+        cursor = nextNonWhitespaceCursor(cursor ? cursor.nextSibling : null);
+      }}
+      const nextOuter = typeof targetEl.outerHTML === 'string' ? targetEl.outerHTML : '';
+      if (!nextOuter || lastNodeHtml.get(live) !== nextOuter) {{
+        if (morphElement(live, targetEl) && nextOuter) {{
+          lastNodeHtml.set(live, nextOuter);
+        }}
+      }}
+    }}
+    return true;
+  }}
+
+  // Morph mixed inline text and element children with 1-step lookahead for badge insertions
+  function morphChildNodes(liveParent, targetParent) {{
+    const targetNodes = Array.from(targetParent.childNodes || []);
+    let liveCur = liveParent.firstChild;
+    let ti = 0;
+    while (liveCur && ti < targetNodes.length) {{
+      const targetNode = targetNodes[ti];
+      if (canMorphPair(liveCur, targetNode)) {{
+        const nextLive = liveCur.nextSibling;
+        if (liveCur.nodeType === 1) {{
+          morphElement(liveCur, targetNode);
+        }} else if (liveCur.nodeValue !== targetNode.nodeValue) {{
+          liveCur.nodeValue = targetNode.nodeValue;
+        }}
+        liveCur = nextLive;
+        ti += 1;
+        continue;
+      }}
+      if (ti + 1 < targetNodes.length && canMorphPair(liveCur, targetNodes[ti + 1])) {{
+        liveParent.insertBefore(targetNode, liveCur);
+        seedSubtreeDefaults(targetNode);
+        ti += 1;
+        continue;
+      }}
+      if (liveCur.nextSibling && canMorphPair(liveCur.nextSibling, targetNode)) {{
+        const nextLive = liveCur.nextSibling;
+        liveParent.removeChild(liveCur);
+        liveCur = nextLive;
+        continue;
+      }}
+      const nextLive = liveCur.nextSibling;
+      liveParent.replaceChild(targetNode, liveCur);
+      seedSubtreeDefaults(targetNode);
+      liveCur = nextLive;
+      ti += 1;
+    }}
+    while (ti < targetNodes.length) {{
+      const n = targetNodes[ti++];
+      liveParent.appendChild(n);
+      seedSubtreeDefaults(n);
+    }}
+    while (liveCur) {{
+      const nextLive = liveCur.nextSibling;
+      liveParent.removeChild(liveCur);
+      liveCur = nextLive;
+    }}
+    return true;
+  }}
+
+  function morphElement(liveEl, targetEl) {{
+    morphAttributes(liveEl, targetEl);
+    if (startingChatButtons.has(liveEl)) return false;
+    const tag = String(liveEl.tagName || '').toUpperCase();
+    const isTextInput = tag === 'TEXTAREA'
+      || (tag === 'INPUT' && liveEl.type !== 'checkbox' && liveEl.type !== 'button');
+    if (isTextInput) {{
+      // Overwrite live .value only when unfocused and still at the previous server default
+      const nextDef = tag === 'TEXTAREA'
+        ? (typeof targetEl.value === 'string' ? targetEl.value : String(targetEl.textContent || ''))
+        : String(targetEl.getAttribute('value') || '');
+      const prevDef = lastInputDefault.get(liveEl);
+      const active = typeof document !== 'undefined' && document.activeElement === liveEl;
+      if (prevDef !== undefined && nextDef !== prevDef && liveEl.value === prevDef) {{
+        if (active) return false;
+        liveEl.value = nextDef;
+      }}
+      lastInputDefault.set(liveEl, nextDef);
+      return true;
+    }}
+    if (reconcileKeyedChildren(liveEl, targetEl)) return true;
+    return morphChildNodes(liveEl, targetEl);
+  }}
+
+  // Reconcile a Workbench slot container, skipping untouched slots and preserving live subtrees
+  function patchSlotHtml(el, html) {{
+    if (!el) return;
+    const next = String(html ?? '');
+    if (!canMorphContainer(el)) {{
+      if (el.innerHTML !== next) el.innerHTML = next;
+      return;
+    }}
+    if (lastSlotHtml.get(el) === next && (next === '' || el.firstChild)) {{
+      return;
+    }}
+    if (!next.trim()) {{
+      while (el.firstChild) el.removeChild(el.firstChild);
+      lastSlotHtml.set(el, next);
+      return;
+    }}
+    const temp = document.createElement('div');
+    temp.innerHTML = next;
+    let ok = reconcileKeyedChildren(el, temp);
+    if (!ok) ok = morphChildNodes(el, temp);
+    if (ok && startingChatButtons.size === 0) lastSlotHtml.set(el, next);
   }}
 
   // Refresh KPIs, unanswered tray, filter chips, and card list while preserving live draft typing
   function render() {{
+    syncOpenDetailsFromDom();
     const counts = (state && state.counts) || {{}};
     const metrics = (state && state.metrics) || {{}};
-    document.getElementById('wb-synced').textContent = (
+    setTextIfChanged(
+      document.getElementById('wb-synced'),
       'Synced ' + ((state && state.synced_et) || '')
     );
-    document.getElementById('kpi-needs').textContent = String(counts.needs_you || 0);
-    document.getElementById('kpi-wait').textContent = String(counts.waiting || 0);
-    document.getElementById('kpi-obs').textContent = String(counts.obligations_open || 0);
-    document.getElementById('kpi-tray').textContent = String(counts.unanswered || 0);
+    setTextIfChanged(document.getElementById('kpi-needs'), counts.needs_you || 0);
+    setTextIfChanged(document.getElementById('kpi-wait'), counts.waiting || 0);
+    setTextIfChanged(document.getElementById('kpi-obs'), counts.obligations_open || 0);
+    setTextIfChanged(document.getElementById('kpi-tray'), counts.unanswered || 0);
     const prec = Math.round(((metrics.link_precision ?? 1) * 100));
-    document.getElementById('kpi-prec').textContent = `${{prec}}%`;
+    setTextIfChanged(document.getElementById('kpi-prec'), `${{prec}}%`);
 
     const tray = (state && state.unanswered_tray) || [];
     const trayEl = document.getElementById('wb-tray-container');
     if (tray.length === 0) {{
-      trayEl.innerHTML = '';
+      patchSlotHtml(trayEl, '');
     }} else {{
-      const rows = tray.map((t) => {{
+      const rows = tray.map((t, idx) => {{
         const safeUrl = /^https?:\\/\\//i.test(String(t.url || '')) ? esc(t.url) : '#';
+        const rowKey = esc(t.artifact_key || idx);
         return `
-        <div class="wb-tray-row">
+        <div class="wb-tray-row" data-unit-key="tray-row:${{rowKey}}">
           <div style="min-width:0;flex:1">
             <strong>${{esc(t.sender)}}</strong> ·
             <a href="${{safeUrl}}" target="_blank" rel="noopener"
@@ -4359,12 +4715,13 @@ def render_workbench_html(
         </div>
       `;
       }}).join('');
-      trayEl.innerHTML = `
-        <div class="wb-tray">
-          <div class="wb-tray-hdr"><span>Unanswered Human Threads (${{tray.length}})</span></div>
-          ${{rows}}
-        </div>
-      `;
+      patchSlotHtml(
+        trayEl,
+        `<div class="wb-tray" data-unit-key="wb-tray">`
+        + `<div class="wb-tray-hdr" data-unit-key="tray:hdr">`
+        + `<span>Unanswered Human Threads (${{tray.length}})</span></div>`
+        + `${{rows}}</div>`
+      );
     }}
 
     updateSortControlsUI();
@@ -4395,17 +4752,18 @@ def render_workbench_html(
       }}
     }}
     if (works.length === 0) {{
-      container.innerHTML = (
-        '<div style="color:var(--muted);padding:16px 4px">'
+      patchSlotHtml(
+        container,
+        '<div data-unit-key="wb-empty" style="color:var(--muted);padding:16px 4px">'
         + 'No works match the current filter.</div>'
       );
       return;
     }}
 
-    container.innerHTML = renderGroupedCards(works);
+    patchSlotHtml(container, renderGroupedCards(works));
     if (focusedDraftWid && openDraftEditors[focusedDraftWid]) {{
       const nextTa = document.getElementById(`wb-draft-ta-${{focusedDraftWid}}`);
-      if (nextTa) {{
+      if (nextTa && document.activeElement !== nextTa) {{
         nextTa.focus();
         if (typeof focusedSelStart === 'number' && typeof focusedSelEnd === 'number') {{
           nextTa.setSelectionRange(focusedSelStart, focusedSelEnd);
@@ -4564,6 +4922,7 @@ def render_workbench_html(
       if (!wid || target.disabled) return;
       const forceNew = target.getAttribute('data-force-new') === 'true';
       const origLabel = target.textContent;
+      startingChatButtons.add(target);
       target.disabled = true;
       target.textContent = 'Starting…';
       try {{
@@ -4579,8 +4938,10 @@ def render_workbench_html(
           );
         }}
       }} finally {{
+        startingChatButtons.delete(target);
         target.disabled = false;
         target.textContent = origLabel;
+        resetDomReconcilerCache();
       }}
       return;
     }}
@@ -4820,18 +5181,18 @@ def render_workbench_html(
       state = nextState;
       // Fast-path no-op syncs: update timestamp and parent watchdog heartbeat without DOM rebuilds
       if (lastRenderedSig && nextSig === lastRenderedSig) {{
-        const syncedEl = document.getElementById('wb-synced');
-        if (syncedEl) {{
-          syncedEl.textContent = 'Synced ' + ((state && state.synced_et) || '');
-        }}
+        setTextIfChanged(
+          document.getElementById('wb-synced'),
+          'Synced ' + ((state && state.synced_et) || '')
+        );
         notifyParentRendered();
         return;
       }}
-      // Preserve vertical scroll offset across real card list updates
+      // Preserve vertical scroll offset on stub-DOM innerHTML fallbacks; live morphing keeps scroll
       const prevScrollY = typeof window.scrollY === 'number' ? window.scrollY : 0;
       render();
       lastRenderedSig = nextSig;
-      if (typeof window.scrollTo === 'function') {{
+      if (domMorphSupported === false && typeof window.scrollTo === 'function') {{
         window.scrollTo(0, prevScrollY);
       }}
       notifyParentRendered();
@@ -4846,7 +5207,7 @@ def render_workbench_html(
 }})();
 </script>
 </body>
-</html>"""
+</html>""")
 
 
 def _file_stat_sig(path: str) -> tuple[int, int]:
