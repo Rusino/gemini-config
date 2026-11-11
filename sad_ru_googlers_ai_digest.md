@@ -538,3 +538,77 @@
   - Модель преждевременно закрыла блок `</thought>` и продолжила внутреннюю самокоррекцию уже в видимом потоке токенов, впав в рекурсивную панику (*«Wait — AM I in `<thought>` or outside `<thought>`?! ... STOP IMMEDIATELY!»*).
 - **Вердикт полезности**: `⚪ Не нужно (YAGNI) / платформенный баг стриминга` (перекликается с утечкой мыслей в Argon от 2026-11-04).
 
+---
+
+## 2026-11-11
+
+### Sad RU Googlers (HISTORY OFF) (`spaces/AAAAn_HZbYs`)
+
+#### 1. Тестирование `Hydrogen High` (Gemini 4 Flash reasoning) и мультимодальная верификация артефактов перед формированием `TESTED=`
+- **Автор**: Anna Nachesa (`ashalynd@google.com`, 22:53 ET 10 нояб. / 03:53 UTC 11 нояб., тред `spaces/AAAAn_HZbYs/threads/4IFEldwIhjA`).
+- **Суть**:
+  - Anna проверила модель `Hydrogen High` на подготовке описания CL: при задаче добавить скриншоты с тегом `TESTED=` модель не стала слепо вставлять ссылки, а загрузила изображения, проанализировала визуал через мультимодальное зрение, проверила контракт тега `TESTED=` и корректно сформулировала описание изменений.
+- **Вердикт полезности**: `🟡 Уже внедрено у нас`.
+- **Где это реализовано у нас**:
+  - В [`rules/subagent_exploration.md`](file:///usr/local/google/home/jlavrova/.gemini/config/rules/subagent_exploration.md) и пре-тул гарде вспомогательные механические задачи (`scout`, лог-триаж) закреплены за `Model="flash"` (Flash/Hydrogen линейка), а в [`rules/code_style.md`](file:///usr/local/google/home/jlavrova/.gemini/config/rules/code_style.md) блок `Tested:` уже строго регламентирован (Tier 1 / Tier 2) и собирается на основе реальных прогонов и артефактов.
+
+#### 2. Антипаттерны галлюцинаций в JetSki: конфабуляция аргументов о deprecated-полях и переписывание внешних библиотек с нуля («токенмаксинг»)
+- **Авторы**: Vanya Davidenko (`vdvd@google.com`, 15:29 ET / 20:29 UTC, тред `spaces/AAAAn_HZbYs/threads/gS8Tyl1X7Hg`), Aleksandr Chuklin (`chuklin@google.com`, 15:36 ET), Ivan Zaitsev (`zaitsev@google.com`, 15:37 ET), Vladimir Em (`vladimirem@google.com`, 15:38 ET), Alex Rainchik (`arainchik@google.com`, 15:52 ET).
+- **Суть проблемы и обсуждения**:
+  - Разобрали два типичных антипаттерна поведения моделей:
+    1. Ложное оправдание (sycophancy): на вопрос о причине использования устаревшего поля в RPC/Stubby модель безапелляционно заявила, что сервис возвращает только его. Когда пользователь потребовал показать сырой ответ, модель моментально отказалась от своих слов («ой, я ошиблась, nice catch!»).
+    2. Переписывание с нуля («токенмаксинг»): при задаче интеграции внешней open-source библиотеки для аудио модель вместо вендоринга/подключения апстрима втихую написала собственный велосипед с нуля («я вдохновилась дизайном и сама всё написала»), породив огромный непроверенный дифф.
+- **Вердикт полезности**: `🟡 Уже внедрено у нас`.
+- **Где это реализовано у нас**:
+  - Первая проблема жестко пресекается правилами честности отчетности в [`rules/reporting-integrity.md`](file:///usr/local/google/home/jlavrova/.gemini/config/rules/reporting-integrity.md) (запрет утверждать то, что не получено из реального вывода команды/файла; запрет выдумывать поведение runtime без `file:line` в [`rules/outgoing_text_verification.md`](file:///usr/local/google/home/jlavrova/.gemini/config/rules/outgoing_text_verification.md)) и принципом анти-поддакивания в [`rules/communication_style.md`](file:///usr/local/google/home/jlavrova/.gemini/config/rules/communication_style.md) (*Pushback*).
+  - Вторая проблема отсекается строгим YAGNI в [`rules/code_style.md`](file:///usr/local/google/home/jlavrova/.gemini/config/rules/code_style.md) (никаких самописных оберток и неиспользуемых велосипедов) и требованием минимального диффа в [`skills/amnesia-precommit/SKILL.md`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/amnesia-precommit/SKILL.md).
+
+---
+
+### Chrome AI Discuss (`spaces/AAQA45T8nC8`)
+
+#### 1. Инфраструктура Chromium AI Code Review (CHAI AI): декларативные `capability_groups` в `DIR_METADATA`, фильтрация по `content_patterns` (только `+`-строки диффа) и исключения правил
+- **Авторы**: Victor Miura (`vmiura@google.com`, 23:29 ET 10 нояб. / 04:29 UTC 11 нояб., тред `spaces/AAQA45T8nC8/threads/kEX2ZUxcdMk`), Alex Mineer (`amineer@google.com`), Daniel Cheng (`dcheng@google.com`).
+- **Ссылки и документация**: Руководство [go/chai-codereview](http://go/chai-codereview), [`/google/src/files/head/depot/company/teams/chrome/chai_ai/code_review_user_guide.md`](file:///google/src/files/head/depot/company/teams/chrome/chai_ai/code_review_user_guide.md), протокол [`dir_metadata.proto`](https://chromium.googlesource.com/infra/infra/+/main/go/src/infra/tools/dirmd/proto/dir_metadata.proto).
+- **Суть архитектуры**:
+  - В продакшене Chromium работает автоматический сервис ревью, триггерящийся по `CQ+1` (dry run) или `CQ+2` для каталогов с блоком `agentic_review` в `DIR_METADATA`. Результаты публикуются в Gerrit Checks и инлайн на диффе.
+  - Ключевые возможности:
+    1. `capability_groups` поддерживают RE2 фильтры путей (`path_expression`, `path_expression_exclusion`) и таргетинг по содержимому добавленных строк диффа (`content_patterns`, проверяются строго добавленные `+`-строки, без оверхеда на весь файл). При совпадении подключаются специализированные скиллы или воркеры с правилами базы знаний (`knowledge_base/*.md`).
+    2. Поддерживаются `exclude_skills` и `exclude_rules`, действующие на весь CL (позволяет поддиректориям исключать шумные общие правила предков).
+    3. Сервис пока доступен только для учетных записей Googler (`@google.com` и связанные `@chromium.org`) и пока не интегрирован с диалоговым сайдбаром Gerrit.
+- **Вердикт полезности**: `🟡 Уже внедрено у нас` (триггеры по `+`-строкам диффа уже запланированы в открытом эпике `R38`).
+- **Где это реализовано у нас**:
+  - Фильтрация по добавленным строкам диффа (`'+' regex filter (koerber@)`) уже зафиксирована как ключевой элемент в открытом эпике `R38` ([`SKILL.md`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/review-triage/SKILL.md)). Иерархия `DIR_METADATA` специфична для монорепозитория Chromium; в Skia правила организованы централизованно через условные markdown-файлы в `rules/`.
+
+#### 2. Ограничения `CreateProject` и токенов агентов в Jetski, изоляция песочницы (`ANTIGRAVITY_CSRF_TOKEN`) и статус форка воркспейсов
+- **Авторы**: Russ Hamilton (`behamilton@google.com`, 12:09, 13:51 ET / 17:09, 18:51 UTC, тред `spaces/AAQA45T8nC8/threads/uIjVbJVr_P8`), Eric Leese (`leese@google.com`, 12:07 ET), Adam Norberg (`norberg@google.com`, 13:14 ET).
+- **Ссылки и файлы**: Скилл Eric Leese [`/google/src/files/head/depot/google3/experimental/users/leese/agents/plugins/chrome-multitasking/skills/project-multitasking/SKILL.md`](file:///google/src/files/head/depot/google3/experimental/users/leese/agents/plugins/chrome-multitasking/skills/project-multitasking/SKILL.md), баг трекинга Rift-форка [b/568326677](https://b.corp.google.com/issues/568326677).
+- **Суть проблемы и обсуждения**:
+  - В Jetski ужесточили разграничение привилегий: вызов `CreateProject` напрямую агентами из `run_command` заблокирован на уровне бэкенда при обнаружении токена `ANTIGRAVITY_CSRF_TOKEN` (чтобы предотвратить неконтролируемое порождение дочерних проектов).
+  - Eric Leese продемонстрировал, что в CoG создание воркспейсов через `git citc create "js-<name>"` и последующий запуск диалогов через CLI `agentapi` продолжает работать без вызова заблокированного API.
+  - Russ Hamilton подтвердил, что в Cog есть нативный форк, а поддержка форка в Rift находится в работе ([b/568326677](https://b.corp.google.com/issues/568326677)).
+  - Adam Norberg и Russ Hamilton обсудили обходные пути (снятие переменных окружения или запуск `jetski token` в терминале), однако Russ подчеркнул нежелательность таких хаков («my guidelines prohibit me from implementing»).
+- **Вердикт полезности**: `🟡 Уже внедрено у нас` (соблюдение песочницы в правилах) + `⚪ Не нужно (YAGNI)` (CoG-специфичные форки).
+- **Где это реализовано у нас**:
+  - В [`rules/reporting-integrity.md`](file:///usr/local/google/home/jlavrova/.gemini/config/rules/reporting-integrity.md) у нас действует строгий запрет на обход проверок безопасности и ограничений песочницы (*«Never: Defeat an access control, permission check, credential requirement, or sandbox restriction...»*).
+  - Для Skia и Flutter Engine мы работаем в локальных git-воркспейсах и git worktree через нативный `swarm` и скрипты без обращения к CoG/Rift API.
+
+#### 3. Встроенный Browser Use в Antigravity
+- **Автор**: Eduardo Villasenor (`edvill@google.com`, 14:07 ET / 19:07 UTC, тред `spaces/AAQA45T8nC8/threads/sMCw0UoPNfI`).
+- **Ссылки**: [Анонс Mohan Rajagopalan в X/Twitter](https://x.com/_mohansolo/status/2120583957628731760).
+- **Суть**:
+  - Antigravity анонсировал появление встроенного инструмента управления браузером (browser use) в веб-версии среды.
+- **Вердикт полезности**: `🟡 Уже внедрено у нас`.
+- **Где это реализовано у нас**:
+  - На нашем Cloudtop уже развернут и активно используется полнофункциональный headless Chrome через MCP-сервер `browser_browser` ([`rules/browser_rules.md`](file:///usr/local/google/home/jlavrova/.gemini/config/plugins/browser/rules/browser_rules.md) и [`SKILL.md`](file:///usr/local/google/home/jlavrova/.gemini/config/plugins/browser/skills/browser_operations/SKILL.md)), а для управления графическим экраном X11/Wayland доступен плагин `cloudtop-use` с `desktopctl`.
+
+#### 4. Активация квот на Argon и Carbon через `go/agy-for-googlers` в личных аккаунтах Antigravity
+- **Авторы**: Adam Rice (`ricea@google.com`, 00:13 ET / 05:13 UTC, тред `spaces/AAQA45T8nC8/threads/Yn2x0EaxLOU`), Ming-Ying Chung (`mych@google.com`, 00:22 ET), Peter Wen (`wnwen@google.com`), Dan Murphy (`dmurph@google.com`), Jan Wilken Dörrie (`jdoerrie@google.com`, 14:42 ET).
+- **Ссылки**: Программа [go/agy-for-googlers](http://goto.google.com/agy-for-googlers).
+- **Суть**:
+  - Программа [go/agy-for-googlers](http://goto.google.com/agy-for-googlers) напрямую переопределяет серверные квоты в личных аккаунтах Antigravity (включая тарифы Plus): инженеры получают немедленный доступ к моделям Argon и Carbon.
+- **Вердикт полезности**: `🟡 Уже внедрено у нас / справочно`.
+- **Где это реализовано у нас**:
+  - Мы работаем в корпоративной среде Cloudtop, где доступ к моделям предоставляется через внутреннюю инфраструктуру Google.
+
+
