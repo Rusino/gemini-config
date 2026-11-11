@@ -6142,6 +6142,28 @@
       .${TITLEBAR_BTN_CLASS}:hover {
         opacity: 1;
       }
+      /* Compact titlebar Flight Deck and Workbench drawer toggle buttons */
+      .${TITLEBAR_FLIGHT_DECK_TOGGLE_BTN_CLASS},
+      .${TITLEBAR_WORKBENCH_TOGGLE_BTN_CLASS} {
+        background: transparent;
+        border: none;
+        border-radius: 5px;
+        cursor: pointer;
+        padding: 2px 4px;
+        opacity: 0.8;
+        font-size: 14px;
+        line-height: 1;
+      }
+      .${TITLEBAR_FLIGHT_DECK_TOGGLE_BTN_CLASS}:hover,
+      .${TITLEBAR_WORKBENCH_TOGGLE_BTN_CLASS}:hover {
+        opacity: 1;
+        background: var(--sidebar-secondary, rgba(128, 134, 139, 0.16));
+      }
+      .${TITLEBAR_FLIGHT_DECK_TOGGLE_BTN_CLASS}[data-active="true"],
+      .${TITLEBAR_WORKBENCH_TOGGLE_BTN_CLASS}[data-active="true"] {
+        opacity: 1;
+        background: var(--sidebar-secondary, rgba(128, 134, 139, 0.24));
+      }
       /* Compact context volume pill aligned with context_guard 60% / 65% / 80% thresholds */
       .${TITLEBAR_CONTEXT_BADGE_CLASS} {
         display: inline-flex;
@@ -11255,8 +11277,48 @@
     return drawerEl;
   }
 
+  function createDrawerToggleButton(className, testId, icon, mode) {
+    const fallback = mode === 'workbench' ? 'Workbench' : 'Flight Deck';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = className;
+    btn.setAttribute('data-testid', testId);
+    btn.textContent = icon;
+    bindHoverBubble(btn, () => btn.getAttribute('aria-label') || fallback);
+    bindActionBtnHandlers(btn, () => {
+      // Clicking the active mode icon closes the drawer; clicking the sibling switches in place
+      if (flightDeckOpen && activeDrawerMode === mode) {
+        setFlightDeckOpen(false);
+      } else {
+        setDrawerMode(mode, true);
+      }
+      const label = btn.getAttribute('aria-label');
+      if (label) {
+        showActionPillBubble(btn, label);
+      }
+    });
+    return btn;
+  }
+
+  function syncDrawerToggleBtnState(btn, mode) {
+    const active = flightDeckOpen && activeDrawerMode === mode;
+    const name = mode === 'workbench' ? 'Workbench' : 'Flight Deck';
+    const label = active ? `Hide ${name} panel` : `Open ${name} panel`;
+    setAttrIfChanged(btn, 'data-active', active ? 'true' : 'false');
+    // Omit native title so OS tooltips never overlap the custom hover pill bubble
+    setAttrIfChanged(btn, 'aria-label', label);
+  }
+
   // Mounts or updates the Flight Deck (✈️) and Workbench (🛠️) toggle buttons in sidebar top bar
   function ensureFlightDeckToggle() {
+    // Keep mounted chat-titlebar drawer toggles synced even when the left sidebar is collapsed
+    for (const el of document.querySelectorAll(`.${TITLEBAR_FLIGHT_DECK_TOGGLE_BTN_CLASS}`)) {
+      syncDrawerToggleBtnState(el, 'flight-deck');
+    }
+    for (const el of document.querySelectorAll(`.${TITLEBAR_WORKBENCH_TOGGLE_BTN_CLASS}`)) {
+      syncDrawerToggleBtnState(el, 'workbench');
+    }
+
     const sidebarEl = document.querySelector('[aria-label="Sidebar"]');
     const searchBtn =
       document.querySelector('[data-testid="sidebar-search-button"]') ||
@@ -11268,23 +11330,12 @@
 
     let fdBtn = mountParent.querySelector(`.${FLIGHT_DECK_TOGGLE_BTN_CLASS}`);
     if (!fdBtn) {
-      fdBtn = document.createElement('button');
-      fdBtn.type = 'button';
-      fdBtn.className = FLIGHT_DECK_TOGGLE_BTN_CLASS;
-      fdBtn.setAttribute('data-testid', 'jetski-flight-deck-toggle-btn');
-      fdBtn.textContent = '✈️';
-      bindHoverBubble(fdBtn, () => fdBtn.getAttribute('aria-label') || 'Flight Deck');
-      bindActionBtnHandlers(fdBtn, () => {
-        if (flightDeckOpen && activeDrawerMode === 'flight-deck') {
-          setFlightDeckOpen(false);
-        } else {
-          setDrawerMode('flight-deck', true);
-        }
-        const label = fdBtn.getAttribute('aria-label');
-        if (label) {
-          showActionPillBubble(fdBtn, label);
-        }
-      });
+      fdBtn = createDrawerToggleButton(
+        FLIGHT_DECK_TOGGLE_BTN_CLASS,
+        'jetski-flight-deck-toggle-btn',
+        '✈️',
+        'flight-deck'
+      );
 
       const topNavBtn = mountParent.querySelector(`.${TOP_NAV_TOGGLE_BTN_CLASS}`);
       if (topNavBtn && topNavBtn.nextSibling) {
@@ -11298,23 +11349,12 @@
 
     let wbBtn = mountParent.querySelector(`.${WORKBENCH_TOGGLE_BTN_CLASS}`);
     if (!wbBtn) {
-      wbBtn = document.createElement('button');
-      wbBtn.type = 'button';
-      wbBtn.className = WORKBENCH_TOGGLE_BTN_CLASS;
-      wbBtn.setAttribute('data-testid', 'jetski-workbench-toggle-btn');
-      wbBtn.textContent = '🛠️';
-      bindHoverBubble(wbBtn, () => wbBtn.getAttribute('aria-label') || 'Workbench');
-      bindActionBtnHandlers(wbBtn, () => {
-        if (flightDeckOpen && activeDrawerMode === 'workbench') {
-          setFlightDeckOpen(false);
-        } else {
-          setDrawerMode('workbench', true);
-        }
-        const label = wbBtn.getAttribute('aria-label');
-        if (label) {
-          showActionPillBubble(wbBtn, label);
-        }
-      });
+      wbBtn = createDrawerToggleButton(
+        WORKBENCH_TOGGLE_BTN_CLASS,
+        'jetski-workbench-toggle-btn',
+        '🛠️',
+        'workbench'
+      );
 
       if (fdBtn.nextSibling) {
         mountParent.insertBefore(wbBtn, fdBtn.nextSibling);
@@ -11323,17 +11363,8 @@
       }
     }
 
-    const fdActive = flightDeckOpen && activeDrawerMode === 'flight-deck';
-    const wbActive = flightDeckOpen && activeDrawerMode === 'workbench';
-    setAttrIfChanged(fdBtn, 'data-active', fdActive ? 'true' : 'false');
-    const fdLabel = fdActive ? 'Hide Flight Deck panel' : 'Open Flight Deck panel';
-    setAttrIfChanged(fdBtn, 'aria-label', fdLabel);
-    setAttrIfChanged(fdBtn, 'title', fdLabel);
-
-    setAttrIfChanged(wbBtn, 'data-active', wbActive ? 'true' : 'false');
-    const wbLabel = wbActive ? 'Hide Workbench panel' : 'Open Workbench panel';
-    setAttrIfChanged(wbBtn, 'aria-label', wbLabel);
-    setAttrIfChanged(wbBtn, 'title', wbLabel);
+    syncDrawerToggleBtnState(fdBtn, 'flight-deck');
+    syncDrawerToggleBtnState(wbBtn, 'workbench');
   }
 
   // Synchronizes Flight Deck toggle button and embedded drawer panel
@@ -14083,22 +14114,27 @@
       
       let fdBtn = container.querySelector(`.${TITLEBAR_FLIGHT_DECK_TOGGLE_BTN_CLASS}`);
       if (!fdBtn) {
-        fdBtn = document.createElement('button');
-        fdBtn.className = TITLEBAR_FLIGHT_DECK_TOGGLE_BTN_CLASS;
-        fdBtn.type = 'button';
-        fdBtn.setAttribute('data-testid', 'jetski-titlebar-flight-deck-btn');
-        fdBtn.textContent = '✈️';
-        bindHoverBubble(fdBtn, () => flightDeckOpen ? 'Hide Flight Deck panel' : 'Open Flight Deck panel');
-        bindActionBtnHandlers(fdBtn, () => {
-          setFlightDeckOpen(!flightDeckOpen);
-          const label = flightDeckOpen ? 'Hide Flight Deck panel' : 'Open Flight Deck panel';
-          fdBtn.setAttribute('aria-label', label);
-          showActionPillBubble(fdBtn, label);
-        });
+        fdBtn = createDrawerToggleButton(
+          TITLEBAR_FLIGHT_DECK_TOGGLE_BTN_CLASS,
+          'jetski-titlebar-flight-deck-btn',
+          '✈️',
+          'flight-deck'
+        );
         container.insertBefore(fdBtn, moreBtn);
       }
-      setAttrIfChanged(fdBtn, 'aria-label', flightDeckOpen ? 'Hide Flight Deck panel' : 'Open Flight Deck panel');
-      setAttrIfChanged(fdBtn, 'data-active', flightDeckOpen ? 'true' : 'false');
+
+      let wbBtn = container.querySelector(`.${TITLEBAR_WORKBENCH_TOGGLE_BTN_CLASS}`);
+      if (!wbBtn) {
+        wbBtn = createDrawerToggleButton(
+          TITLEBAR_WORKBENCH_TOGGLE_BTN_CLASS,
+          'jetski-titlebar-workbench-btn',
+          '🛠️',
+          'workbench'
+        );
+        container.insertBefore(wbBtn, moreBtn);
+      }
+      syncDrawerToggleBtnState(fdBtn, 'flight-deck');
+      syncDrawerToggleBtnState(wbBtn, 'workbench');
 
       updateTitlebarArchiveButtonUI(btn, cascadeId);
     }
@@ -14959,6 +14995,9 @@
         target.className === ROW_REMINDER_BTN_CLASS ||
         target.className === SIDEBAR_SEARCH_BTN_CLASS ||
         target.className === FLIGHT_DECK_TOGGLE_BTN_CLASS ||
+        target.className === WORKBENCH_TOGGLE_BTN_CLASS ||
+        target.className === TITLEBAR_FLIGHT_DECK_TOGGLE_BTN_CLASS ||
+        target.className === TITLEBAR_WORKBENCH_TOGGLE_BTN_CLASS ||
         target.className === FLIGHT_DECK_DRAWER_CLASS ||
         target.className === FLIGHT_DECK_RESIZE_HANDLE_CLASS ||
         target.className === FLIGHT_DECK_IFRAME_CLASS ||
@@ -15002,6 +15041,9 @@
             target.closest(`#${FLIGHT_DECK_DRAWER_ID}`) ||
             target.closest(`.${SIDEBAR_SEARCH_BTN_CLASS}`) ||
             target.closest(`.${FLIGHT_DECK_TOGGLE_BTN_CLASS}`) ||
+            target.closest(`.${WORKBENCH_TOGGLE_BTN_CLASS}`) ||
+            target.closest(`.${TITLEBAR_FLIGHT_DECK_TOGGLE_BTN_CLASS}`) ||
+            target.closest(`.${TITLEBAR_WORKBENCH_TOGGLE_BTN_CLASS}`) ||
             // Skip subtree mutations inside the Needs-Reaction inbox widget
             target.closest(`.${INBOX_CLASS}`) ||
             target.closest(`.${BUTTON_CLASS}`) ||

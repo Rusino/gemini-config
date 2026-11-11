@@ -153,31 +153,44 @@ class TestJetskiMacInjector(unittest.TestCase):
           ("jetski-chains.json", "parentOf"),
           ("jetski-roadmaps.json", "projects"),
           ("jetski-flight-deck.json", "local_url"),
+          ("jetski-workbench.json", "local_url"),
       ):
         fpath = os.path.join(brain_dir, fname)
         self.assertTrue(os.path.isfile(fpath), f"Expected {fname} to be seeded")
         with open(fpath, "r", encoding="utf-8") as f:
           content = json.load(f)
         self.assertIn(expected_key, content)
-        # Seeded Flight Deck metadata must point pen_url at the HTTPS UberProxy endpoint
-        if fname == "jetski-flight-deck.json":
-          self.assertTrue(
-              str(content.get("pen_url", "")).startswith("https://"),
-              f"Expected HTTPS pen_url, got {content.get('pen_url')!r}",
+        # Seeded Flight Deck and Workbench metadata must point pen_url at HTTPS UberProxy
+        if fname in ("jetski-flight-deck.json", "jetski-workbench.json"):
+          is_wb = fname == "jetski-workbench.json"
+          expected_port = 8090 if is_wb else 8089
+          expected_local = f"http://localhost:{expected_port}"
+          expected_pen = (
+              jmi.DEFAULT_WORKBENCH_PEN_URL
+              if is_wb
+              else jmi.DEFAULT_FLIGHT_DECK_PEN_URL
           )
+          self.assertEqual(content.get("port"), expected_port)
+          self.assertEqual(content.get("local_url"), expected_local)
+          self.assertEqual(content.get("pen_url"), expected_pen)
+          self.assertTrue(str(expected_pen).startswith("https://"))
+          for bad_pen in ("", expected_local):
+            with open(fpath, "w", encoding="utf-8") as f:
+              json.dump({"pen_url": bad_pen, "local_url": expected_local}, f)
+            jmi.sync_mac_artifact_js(src, dst)
+            with open(fpath, "r", encoding="utf-8") as f:
+              repaired = json.load(f)
+            self.assertEqual(repaired.get("pen_url"), expected_pen)
+          custom_pen = f"https://custom-{expected_port}.proxy.googlers.com"
           with open(fpath, "w", encoding="utf-8") as f:
-            f.write('{"pen_url": "", "local_url": "http://localhost:8089"}\n')
-          jmi.sync_mac_artifact_js(src, dst)
-          with open(fpath, "r", encoding="utf-8") as f:
-            repaired = json.load(f)
-          self.assertEqual(repaired.get("pen_url"), jmi.DEFAULT_FLIGHT_DECK_PEN_URL)
-          custom_pen = "https://custom-pen.proxy.googlers.com"
-          with open(fpath, "w", encoding="utf-8") as f:
-            json.dump({"pen_url": custom_pen, "local_url": "http://localhost:8089"}, f)
+            json.dump({"pen_url": custom_pen, "local_url": expected_local}, f)
           jmi.sync_mac_artifact_js(src, dst)
           with open(fpath, "r", encoding="utf-8") as f:
             preserved = json.load(f)
           self.assertEqual(preserved.get("pen_url"), custom_pen)
+      self.assertNotEqual(
+          jmi.DEFAULT_FLIGHT_DECK_PEN_URL, jmi.DEFAULT_WORKBENCH_PEN_URL
+      )
 
   def test_cdp_session_attach_ping_coalescing_and_hot_reload(self):
     recorded = []

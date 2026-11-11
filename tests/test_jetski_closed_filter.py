@@ -1044,11 +1044,13 @@ const liveBucketBtn = (k) =>
   const titlebarSearchElem = titlebarToolbar.querySelector('.jetski-chat-search-btn');
   const titlebarLocateBtn = titlebarToolbar.querySelector('.jetski-chat-locate-btn');
   const titlebarFdBtn = titlebarToolbar.querySelector('.jetski-titlebar-flight-deck-btn');
+  const titlebarWbBtn = titlebarToolbar.querySelector('.jetski-titlebar-workbench-btn');
   const titlebarBtn = titlebarToolbar.querySelector('.jetski-titlebar-archive-btn');
   assert(titlebarContextBadge, 'Titlebar context badge must be injected leftmost');
   assert(titlebarReminderBtn, 'Titlebar Reminder button must be injected after Context badge');
   assert(titlebarLocateBtn, 'Titlebar Locate button must be injected after Search');
-  assert(titlebarFdBtn, 'Titlebar Flight Deck button must be injected after Locate');
+  assert(titlebarFdBtn, 'Titlebar Flight Deck button must be injected after Archive');
+  assert(titlebarWbBtn, 'Titlebar Workbench button must be injected after Flight Deck');
   assert(
     !titlebarToolbar.querySelector('.jetski-titlebar-wait-btn'),
     'Titlebar must not contain Wait button'
@@ -1068,13 +1070,22 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(titlebarLocateBtn.getAttribute('data-cascade-id'), 'open-current');
   assert.strictEqual(titlebarFdBtn.textContent, '✈️');
   assert.strictEqual(titlebarFdBtn.getAttribute('data-testid'), 'jetski-titlebar-flight-deck-btn');
+  assert.strictEqual(titlebarFdBtn.getAttribute('aria-label'), 'Open Flight Deck panel');
+  assert.strictEqual(titlebarFdBtn.getAttribute('title'), null);
+  assert.strictEqual(titlebarFdBtn.getAttribute('data-active'), 'false');
+  assert.strictEqual(titlebarWbBtn.textContent, '🛠️');
+  assert.strictEqual(titlebarWbBtn.getAttribute('data-testid'), 'jetski-titlebar-workbench-btn');
+  assert.strictEqual(titlebarWbBtn.getAttribute('aria-label'), 'Open Workbench panel');
+  assert.strictEqual(titlebarWbBtn.getAttribute('title'), null);
+  assert.strictEqual(titlebarWbBtn.getAttribute('data-active'), 'false');
   assert.strictEqual(titlebarToolbar.children[0], titlebarContextBadge);
   assert.strictEqual(titlebarToolbar.children[1], titlebarReminderBtn);
   assert.strictEqual(titlebarToolbar.children[2], titlebarSearchElem);
   assert.strictEqual(titlebarToolbar.children[3], titlebarLocateBtn);
   assert.strictEqual(titlebarToolbar.children[4], titlebarBtn);
   assert.strictEqual(titlebarToolbar.children[5], titlebarFdBtn);
-  assert.strictEqual(titlebarToolbar.children[6], moreActionsBtn);
+  assert.strictEqual(titlebarToolbar.children[6], titlebarWbBtn);
+  assert.strictEqual(titlebarToolbar.children[7], moreActionsBtn);
   assert.strictEqual(titlebarBtn.textContent, '🗄');
   assert.strictEqual(titlebarBtn.getAttribute('data-testid'), 'jetski-titlebar-archive-btn');
   assert.strictEqual(titlebarBtn.getAttribute('aria-label'), 'Archive chat');
@@ -1096,6 +1107,8 @@ const liveBucketBtn = (k) =>
     { target: titlebarReminderBtn },
     { target: titlebarLocateBtn },
     { target: titlebarBtn },
+    { target: titlebarFdBtn },
+    { target: titlebarWbBtn },
   ]);
   assert.strictEqual(rafCallbacks.length, 0);
 
@@ -2918,6 +2931,8 @@ const liveBucketBtn = (k) =>
   assert.strictEqual(targetSidebarRow.hasAttribute('data-jetski-located-row'), false);
   assert(!titlebarToolbar.querySelector('.jetski-titlebar-context-badge'));
   assert(!titlebarToolbar.querySelector('.jetski-chat-locate-btn'));
+  assert(!titlebarToolbar.querySelector('.jetski-titlebar-flight-deck-btn'));
+  assert(!titlebarToolbar.querySelector('.jetski-titlebar-workbench-btn'));
   // Verify the Needs-Reaction inbox widget is removed from the DOM on cleanup
   assert(!bodyEl.querySelector('.jetski-needs-reaction-inbox'));
 
@@ -8621,6 +8636,17 @@ global.MutationObserver = class {
   disconnect() {}
 };
 
+// Mount a chat titlebar before initial sync so titlebar ✈️ and 🛠️ toggles mount alongside sidebar
+const chatTitlebar = new FakeElement('div');
+const chatMoreBtn = new FakeElement('button');
+chatMoreBtn.setAttribute('data-testid', 'titlebar-more-actions');
+chatMoreBtn.__reactFiber$tb = {
+  memoizedProps: {},
+  return: { memoizedProps: { cascadeId: 'chat-target-42' } },
+};
+chatTitlebar.appendChild(chatMoreBtn);
+bodyEl.appendChild(chatTitlebar);
+
 eval(code);
 
 (async () => {
@@ -9065,11 +9091,60 @@ eval(code);
   await new Promise((r) => setTimeout(r, 20));
   assert.strictEqual(iframe.getAttribute('src'), 'http://localhost:8089?embed=1');
 
+  // Verify chat titlebar ✈️ and 🛠️ buttons switch/toggle drawer mode and stay synced even
+  // when the left sidebar is collapsed/removed from DOM
+  const tbFdBtn = chatTitlebar.querySelector('.jetski-titlebar-flight-deck-btn');
+  const tbWbBtn = chatTitlebar.querySelector('.jetski-titlebar-workbench-btn');
+  assert(tbFdBtn, 'Titlebar ✈️ toggle button must be mounted');
+  assert(tbWbBtn, 'Titlebar 🛠️ toggle button must be mounted');
+  assert.strictEqual(tbFdBtn.getAttribute('data-active'), 'true');
+  assert.strictEqual(tbWbBtn.getAttribute('data-active'), 'false');
+
+  // Clicking 🛠️ in chat titlebar while Flight Deck is open switches drawer to Workbench (:8090)
+  tbWbBtn.dispatchEvent('pointerdown');
+  assert.strictEqual(window.__jetskiFlightDeck.isOpen(), true);
+  assert.strictEqual(window.__jetskiFlightDeck.getMode(), 'workbench');
+  assert.strictEqual(tbWbBtn.getAttribute('data-active'), 'true');
+  assert.strictEqual(tbWbBtn.getAttribute('aria-label'), 'Hide Workbench panel');
+  assert.strictEqual(tbFdBtn.getAttribute('data-active'), 'false');
+  assert.strictEqual(tbFdBtn.getAttribute('aria-label'), 'Open Flight Deck panel');
+  assert.strictEqual(wbToggleBtn.getAttribute('data-active'), 'true');
+  assert.strictEqual(toggleBtn.getAttribute('data-active'), 'false');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.strictEqual(iframe.getAttribute('src'), 'http://localhost:8090?embed=1');
+
+  // Clicking ✈️ in chat titlebar while Workbench is open switches back to Flight Deck (:8089)
+  await new Promise((r) => setTimeout(r, 350));
+  tbFdBtn.dispatchEvent('pointerdown');
+  assert.strictEqual(window.__jetskiFlightDeck.isOpen(), true);
+  assert.strictEqual(window.__jetskiFlightDeck.getMode(), 'flight-deck');
+  assert.strictEqual(tbFdBtn.getAttribute('data-active'), 'true');
+  assert.strictEqual(tbWbBtn.getAttribute('data-active'), 'false');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.strictEqual(iframe.getAttribute('src'), 'http://localhost:8089?embed=1');
+
+  // Collapse/detach sidebar and verify titlebar 🛠️ still opens and closes Workbench cleanly
+  sidebarEl.remove();
+  await new Promise((r) => setTimeout(r, 350));
+  tbWbBtn.dispatchEvent('pointerdown');
+  assert.strictEqual(window.__jetskiFlightDeck.isOpen(), true);
+  assert.strictEqual(window.__jetskiFlightDeck.getMode(), 'workbench');
+  assert.strictEqual(tbWbBtn.getAttribute('data-active'), 'true');
+  assert.strictEqual(tbFdBtn.getAttribute('data-active'), 'false');
+  await new Promise((r) => setTimeout(r, 350));
+  tbWbBtn.dispatchEvent('pointerdown');
+  assert.strictEqual(window.__jetskiFlightDeck.isOpen(), false);
+  assert.strictEqual(tbWbBtn.getAttribute('data-active'), 'false');
+  assert.strictEqual(tbWbBtn.getAttribute('aria-label'), 'Open Workbench panel');
+  bodyEl.appendChild(sidebarEl);
+
   window.__jetskiFlightDeck.setOpen(true);
   window.__jetskiClosedChatsFilterCleanup();
   assert.strictEqual(document.getElementById('jetski-flight-deck-drawer'), null);
   assert.strictEqual(headerRow.querySelector('.jetski-flight-deck-toggle-btn'), null);
   assert.strictEqual(headerRow.querySelector('.jetski-workbench-toggle-btn'), null);
+  assert.strictEqual(chatTitlebar.querySelector('.jetski-titlebar-flight-deck-btn'), null);
+  assert.strictEqual(chatTitlebar.querySelector('.jetski-titlebar-workbench-btn'), null);
   assert.strictEqual(bodyEl.getAttribute('data-jetski-flight-deck-open'), null);
 
   console.log('ALL_FLIGHT_DECK_TESTS_PASSED');

@@ -51,6 +51,9 @@ DISCONNECTED_POLL_SEC = 3.0
 DEFAULT_FLIGHT_DECK_PEN_URL = (
     "https://b2607f8b048001000013f0f0cac12c3b11f99000000000000000001.proxy.googlers.com"
 )
+DEFAULT_WORKBENCH_PEN_URL = (
+    "https://b2607f8b048001000013f0f0cac12c3b11f9a000000000000000001.proxy.googlers.com"
+)
 
 
 class CdpClosedError(OSError):
@@ -124,12 +127,23 @@ def sync_mac_artifact_js(
           },
           indent=2,
       ) + "\n",
+      "jetski-workbench.json": json.dumps(
+          {
+              "pen_url": DEFAULT_WORKBENCH_PEN_URL,
+              "local_url": "http://localhost:8090",
+              "port": 8090,
+          },
+          indent=2,
+      ) + "\n",
   }
   for fname, content in defaults.items():
     fpath = os.path.join(brain_dir, fname)
     needs_seed = not os.path.isfile(fpath)
     # Upgrade legacy Mac seed files that left pen_url empty or pointed at loopback
-    if not needs_seed and fname == "jetski-flight-deck.json":
+    if not needs_seed and fname in (
+        "jetski-flight-deck.json",
+        "jetski-workbench.json",
+    ):
       try:
         with open(fpath, "r", encoding="utf-8") as f:
           cur_fd = json.load(f)
