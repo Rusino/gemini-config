@@ -2492,6 +2492,21 @@ def _extract_draft_mentioned_keys(text: str) -> list[str]:
   return ordered
 
 
+WORK_OWNERS = ("user", "draft")
+
+
+def work_owner(meta: Any) -> str:
+  """Returns "user" only for works she owns; missing, bad, or unknown owner reads as "draft"."""
+  if not isinstance(meta, Mapping):
+    try:
+      meta = json.loads(str(meta or "{}"))
+    except Exception:
+      return "draft"
+  if not isinstance(meta, Mapping):
+    return "draft"
+  return "user" if meta.get("owner") == "user" else "draft"
+
+
 def _merge_reply_draft_meta(
     target_meta_raw: Any, source_meta_raw: Any
 ) -> dict[str, Any] | None:
@@ -3345,6 +3360,14 @@ class WorkStore:
       }
       if "meta_json" not in ob_cols:
         conn.execute("ALTER TABLE obligations ADD COLUMN meta_json TEXT DEFAULT '{}'")
+      # R30: legacy works predate ownership and are auto groups; never touch an explicit owner,
+      # and leave malformed meta_json alone since work_owner already reads it as draft
+      conn.execute(
+          "UPDATE works SET meta_json = json_set("
+          "CASE WHEN json_valid(meta_json) THEN meta_json ELSE '{}' END, '$.owner', 'draft') "
+          "WHERE COALESCE(meta_json, '') = '' "
+          "OR (json_valid(meta_json) AND json_extract(meta_json, '$.owner') IS NULL)"
+      )
 
   def _log_event(
       self,
@@ -3370,8 +3393,14 @@ class WorkStore:
       work_id: str = "",
       meta: Mapping[str, Any] | None = None,
       now: float | None = None,
+      owner: str = "draft",
   ) -> str:
-    """Creates or updates a Work in place while preserving status, snooze_until, and created_at."""
+    """Creates or updates a Work in place while preserving status, snooze_until, and created_at.
+
+    owner="user" marks her own Work; the "draft" default is for auto-linker groups and never
+    downgrades an existing user Work on update.
+    """
+    assert owner in WORK_OWNERS, owner
     cur_now = time.time() if now is None else now
     if not work_id:
       digest = hashlib.sha1(f"{title}:{project_id}:{cur_now}".encode("utf-8")).hexdigest()[:10]
@@ -3398,7 +3427,7 @@ class WorkStore:
                 clean_roadmap,
                 cur_now,
                 cur_now,
-                json.dumps(dict(meta) if meta else {}),
+                json.dumps({**(dict(meta) if meta else {}), "owner": owner}),
             ),
         )
         self._log_event(
@@ -3419,6 +3448,7 @@ class WorkStore:
       merged_meta = dict(prev_meta)
       if meta:
         merged_meta.update(dict(meta))
+      merged_meta["owner"] = "user" if "user" in (owner, work_owner(prev_meta)) else "draft"
       # Skip no-op sync passes; UPDATE in place so status, snooze_until, and work_minted stay intact
       if (
           str(existing_w["title"] or "") == clean_title
@@ -3433,6 +3463,30 @@ class WorkStore:
           (clean_title, clean_proj, clean_roadmap, cur_now, json.dumps(merged_meta), work_id),
       )
     return work_id
+
+  def set_work_owner(self, work_id: str, owner: str, now: float | None = None) -> None:
+    """Sets works.meta_json owner (accept flips draft -> user) and logs work_owner_set.
+
+    Leaves updated_at alone so accepting a card does not reorder recency-sorted lookups.
+    """
+    assert owner in WORK_OWNERS, owner
+    with self._lock, self._connect() as conn:
+      row = conn.execute("SELECT meta_json FROM works WHERE work_id = ?", (work_id,)).fetchone()
+      if row is None:
+        return
+      try:
+        meta = dict(json.loads(row["meta_json"] or "{}"))
+      except Exception:
+        meta = {}
+      if meta.get("owner") == owner:
+        return
+      meta["owner"] = owner
+      conn.execute(
+          "UPDATE works SET meta_json = ? WHERE work_id = ?", (json.dumps(meta), work_id)
+      )
+      self._log_event(
+          conn, "work_owner_set", work_id=work_id, payload={"owner": owner}, now=now
+      )
 
   def find_work_by_artifact(
       self, artifact_key: str, roles: tuple[str, ...] = ("primary", "channel")
@@ -3771,6 +3825,21 @@ class WorkStore:
       ).fetchall()
       return [dict(r) for r in rows]
 
+  def _user_work_holds_primary(
+      self, conn: sqlite3.Connection, work_id: str, akey: str
+  ) -> bool:
+    """True when work_id is a draft and another active owner=user Work has akey as primary."""
+    w_row = conn.execute("SELECT meta_json FROM works WHERE work_id = ?", (work_id,)).fetchone()
+    if w_row is None or work_owner(w_row["meta_json"]) == "user":
+      return False
+    rows = conn.execute(
+        "SELECT w.meta_json FROM work_links wl JOIN works w ON w.work_id = wl.work_id "
+        "WHERE wl.artifact_key = ? AND wl.role = 'primary' AND wl.work_id != ? "
+        "AND w.status NOT IN ('done', 'archived')",
+        (akey, work_id),
+    ).fetchall()
+    return any(work_owner(r["meta_json"]) == "user" for r in rows)
+
   def link_artifact(
       self,
       work_id: str,
@@ -3846,6 +3915,15 @@ class WorkStore:
           and prev_reason == "chat_mention"
           and source != "manual"
           and req_reason in ("", "chat_mention")
+      ):
+        effective_role = "context_only"
+      # R30: the auto-linker never hands a draft group a new primary that one of her own works
+      # already holds as primary; existing primary edges stay put so syncs do not churn
+      if (
+          effective_role == "primary"
+          and source != "manual"
+          and prev_role != "primary"
+          and self._user_work_holds_primary(conn, work_id, akey)
       ):
         effective_role = "context_only"
       # A companion pinned primary via companion_wip is structural; collateral auto mentions
@@ -5471,6 +5549,16 @@ class WorkStore:
           t_meta_row["meta_json"] if t_meta_row else "{}",
           s_meta_row["meta_json"] if s_meta_row else "{}",
       )
+      # R30: folding her Work into a draft (or a draft into hers) yields her Work
+      t_owner = work_owner(t_meta_row["meta_json"] if t_meta_row else "{}")
+      s_owner = work_owner(s_meta_row["meta_json"] if s_meta_row else "{}")
+      if t_meta_row and s_owner == "user" and t_owner != "user":
+        if merged_meta is None:
+          try:
+            merged_meta = dict(json.loads(t_meta_row["meta_json"] or "{}"))
+          except Exception:
+            merged_meta = {}
+        merged_meta["owner"] = "user"
       conn.execute(
           "UPDATE works SET status = 'archived', updated_at = ? WHERE work_id = ?",
           (cur_now, source_work_id),
@@ -5627,7 +5715,13 @@ class WorkStore:
     cur_now = time.time() if now is None else now
     akey = canonicalize_artifact_key(artifact_key)
     self.unlink_artifact(source_work_id, akey, now=cur_now)
-    new_wid = self.create_work(new_title, now=cur_now)
+    with self._lock, self._connect() as conn:
+      src_row = conn.execute(
+          "SELECT meta_json FROM works WHERE work_id = ?", (source_work_id,)
+      ).fetchone()
+    # A split piece of her Work stays hers; a split draft stays a draft
+    src_owner = work_owner(src_row["meta_json"] if src_row else "{}")
+    new_wid = self.create_work(new_title, now=cur_now, owner=src_owner)
     self.link_artifact(new_wid, akey, role="primary", source="manual", now=cur_now)
     with self._lock, self._connect() as conn:
       # Keep ob-wbdraft-* paired with source_work_id's reply_draft metadata
@@ -7182,6 +7276,7 @@ class WorkStore:
           "title": resolved_title or str(w["title"]),
           "origin": origin_info,
           "status": str(w["status"]),
+          "owner": work_owner(w.get("meta_json")),
           "lane": lane,
           "desk_tier": w_desk_tier,
           "reasons": reasons,
@@ -7378,6 +7473,7 @@ class WorkStore:
             "origin_et": format_et_timestamp(v_orig_ts, now=cur_now),
             "has_urgent_obligation": False,
             "is_virtual": True,
+            "owner": "draft",
             "is_multi_channel": _compute_is_multi_channel(v_arts),
             "work_types": v_work_types,
             "needs_you_types": v_needs_types,
@@ -7439,6 +7535,7 @@ class WorkStore:
           "origin_et": format_et_timestamp(b_orig_ts, now=cur_now),
           "has_urgent_obligation": False,
           "is_virtual": True,
+          "owner": "draft",
           "is_multi_channel": False,
           "work_types": ["my-bugs"],
           "needs_you_types": ["my-bugs"] if b_lane == "needs-you" else [],

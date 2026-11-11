@@ -1251,6 +1251,20 @@ def render_workbench_html(
     font-size: 11px;
     font-weight: 400;
   }}
+  .wb-group-hdr {{
+    display: block;
+    margin: 14px 2px 6px;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--muted);
+    font: inherit;
+    font-weight: 600;
+    text-align: left;
+  }}
+  .wb-drafts-toggle {{
+    cursor: pointer;
+  }}
   .wb-actions {{
     display: flex;
     align-items: center;
@@ -2419,6 +2433,9 @@ def render_workbench_html(
   const SORT_STORAGE_KEY = 'wb_sort_v1';
   // Persist deliverable peer fold modes and per-peer overrides across 30s state refreshes
   const PEER_FOLD_STORAGE_KEY = 'wb_peer_fold_v1';
+  // Persist the Черновики fold separately; drafts start collapsed until she opens them
+  const DRAFTS_STORAGE_KEY = 'wb_drafts_v1';
+  let draftsOpen = false;
   let state = {initial_json};
   let activeFilter = 'all';
   let activeTypeFilter = 'all';
@@ -2535,6 +2552,17 @@ def render_workbench_html(
       }}
     }}
   }} catch {{}}
+
+  try {{
+    const rawDrafts = localStorage.getItem(DRAFTS_STORAGE_KEY);
+    if (rawDrafts) draftsOpen = JSON.parse(rawDrafts).open === true;
+  }} catch {{}}
+
+  function saveDraftsPrefs() {{
+    try {{
+      localStorage.setItem(DRAFTS_STORAGE_KEY, JSON.stringify({{ open: draftsOpen }}));
+    }} catch {{}}
+  }}
 
   // Persist active sort mode and direction to localStorage without failing in private contexts
   function saveSortPrefs() {{
@@ -4152,12 +4180,17 @@ def render_workbench_html(
       ? `<button class="wb-btn" data-edit-draft="${{esc(w.work_id)}}"`
         + ` type="button">+ Reply draft</button>`
       : '';
+    const acceptBtn = w.owner !== 'user'
+      ? `<button class="wb-btn" data-work-accept="${{esc(w.work_id)}}"
+                 title="Сделать своей работой" type="button">Принять</button>`
+      : '';
     const persistedBtns = !w.is_virtual
       ? `${{addDraftBtn}}
          <button class="wb-btn" data-add-ob="${{esc(w.work_id)}}"
                  type="button">+ Obligation</button>
          <button class="wb-btn" data-add-link="${{esc(w.work_id)}}"
                  type="button">+ Link</button>
+         ${{acceptBtn}}
          <button class="wb-btn" data-work-done="${{esc(w.work_id)}}"
                  type="button">✓ Done</button>`
       : '';
@@ -4206,6 +4239,23 @@ def render_workbench_html(
         </div>
       </article>
     `;
+  }}
+
+  // Her works and every Needs-You card stay in the main group; quiet auto drafts fold away
+  function renderGroupedCards(works) {{
+    // Activity and Age are flat chronological views; only Triage splits by ownership
+    if (sortMode !== 'triage') return works.map(renderWorkCard).join('');
+    const isFoldedDraft = (w) => w.owner !== 'user' && w.lane !== 'needs-you';
+    const main = works.filter((w) => !isFoldedDraft(w));
+    const drafts = works.filter(isFoldedDraft);
+    if (!drafts.length) return main.map(renderWorkCard).join('');
+    const caret = draftsOpen ? '▾' : '▸';
+    return `<div class="wb-group-hdr">Мои работы (${{main.length}})</div>`
+      + main.map(renderWorkCard).join('')
+      + `<button class="wb-group-hdr wb-drafts-toggle" data-drafts-toggle type="button"`
+      + ` aria-expanded="${{draftsOpen}}">${{caret}} Черновики (${{drafts.length}})</button>`
+      + `<div class="wb-drafts-body"${{draftsOpen ? '' : ' hidden'}}>`
+      + `${{drafts.map(renderWorkCard).join('')}}</div>`;
   }}
 
   // Refresh KPIs, unanswered tray, filter chips, and card list while preserving live draft typing
@@ -4288,7 +4338,7 @@ def render_workbench_html(
       return;
     }}
 
-    container.innerHTML = works.map(renderWorkCard).join('');
+    container.innerHTML = renderGroupedCards(works);
     if (focusedDraftWid && openDraftEditors[focusedDraftWid]) {{
       const nextTa = document.getElementById(`wb-draft-ta-${{focusedDraftWid}}`);
       if (nextTa) {{
@@ -4506,6 +4556,18 @@ def render_workbench_html(
         obligation_id: target.getAttribute('data-ob-close-topic'),
         decision: 'close',
         event_key: target.getAttribute('data-ob-event') || '',
+      }});
+      return;
+    }}
+    if (target.hasAttribute('data-drafts-toggle')) {{
+      draftsOpen = !draftsOpen;
+      saveDraftsPrefs();
+      render();
+      return;
+    }}
+    if (target.hasAttribute('data-work-accept')) {{
+      void postJson('/api/work/accept', {{
+        work_id: target.getAttribute('data-work-accept'),
       }});
       return;
     }}
@@ -4894,6 +4956,7 @@ def create_server(
             project_id=str(body.get("project_id") or ""),
             roadmap_item_key=str(body.get("roadmap_item_key") or ""),
             meta={"title_manual": True},
+            owner="user",
         )
         primaries_in = [str(p) for p in (body.get("primaries") or []) if str(p).strip()]
         channels_in = [str(ch) for ch in (body.get("channels") or []) if str(ch).strip()]
@@ -4955,6 +5018,13 @@ def create_server(
         wid = str(body.get("work_id") or "")
         if wid:
           active_store.complete_work(wid, roadmap_cb=workctl._roadmap_writeback)
+        self._send_json(current_projection())
+        return
+
+      if parsed.path == "/api/work/accept":
+        wid = str(body.get("work_id") or "")
+        if wid:
+          active_store.set_work_owner(wid, "user")
         self._send_json(current_projection())
         return
 

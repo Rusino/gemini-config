@@ -4476,6 +4476,8 @@ def _materialize_virtual_card(
         str(card.get("title") or prim_key or "Work"),
         project_id=project_name,
         now=cur_now,
+        # Materializing runs only from her explicit + Chat click, so the Work is hers
+        owner="user",
     )
   for a in arts:
     akey = work_store.canonicalize_artifact_key(str(a.get("artifact_key") or ""))

@@ -150,6 +150,7 @@ def main(argv: list[str] | None = None) -> int:
         project_id=args.project,
         roadmap_item_key=args.roadmap,
         meta={"title_manual": True},
+        owner="user",
     )
     for pkey in args.primary:
       ck = work_store.canonicalize_artifact_key(pkey)
@@ -177,7 +178,10 @@ def main(argv: list[str] | None = None) -> int:
     ch_key = f"chat_chain:{cid}"
     wid = store.find_work_by_artifact(ch_key)
     if not wid:
-      wid = store.create_work(args.title, project_id=args.project)
+      wid = store.create_work(args.title, project_id=args.project, owner="user")
+    else:
+      # An explicit pin claims an ingestor-made draft as hers
+      store.set_work_owner(wid, "user")
     store.upsert_artifact(ch_key, kind="chat_chain", title=args.title, url=f"/c/{cid}")
     store.link_artifact(wid, ch_key, role="channel", source="manual")
     print(wid)
