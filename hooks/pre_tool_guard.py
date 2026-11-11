@@ -1807,6 +1807,10 @@ SKORETEXT_SCOPE_PREFIXES = (
     "experimental/skoretext/",
     # [1/6] registers the CoreText source lists in the Bazel -> GN exporter (user OK Nov 10 2026)
     "bazel/exporter_tool/main.go",
+    # SkUnicode::getScript / isNonSpacingMark: the skottie SkUnicode wrapper must override the
+    # new virtuals, and the generator emits SkUnicode_hardcoded_tables.h (user OK Nov 11 2026)
+    "modules/skottie/src/text/Unicode.cpp",
+    "tools/unicode/generate_skunicode_tables.py",
 )
 UPSTREAM_REVERT_WINDOW = 100
 # Revert/reland commits undo upstream on purpose; project prefixes like `[SkoreText] ` may
