@@ -176,13 +176,13 @@ def main():
                     help="glob of files where SkUTF decoding is owned by one file "
                          "(default modules/skparagraph/src/CoreText*)")
     ap.add_argument("--utf-owner", action="append",
-                    help="glob of the owner file (default */CoreTextIndexMap.cpp)")
+                    help="glob of the owner file (default */CoreTextIndexMap.*)")
     ap.add_argument("--same-range", type=int, default=3)
     ap.add_argument("--long-func", type=int, default=80)
     ap.add_argument("--format", choices=("text", "json"), default="text")
     args = ap.parse_args()
     args.utf_scope = args.utf_scope or ["modules/skparagraph/src/CoreText*"]
-    args.utf_owner = args.utf_owner or ["*/CoreTextIndexMap.cpp"]
+    args.utf_owner = args.utf_owner or ["*/CoreTextIndexMap.*"]
 
     repo = pathlib.Path(args.repo).resolve()
     report = []

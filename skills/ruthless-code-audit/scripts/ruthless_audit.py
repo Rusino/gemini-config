@@ -1125,12 +1125,342 @@ def _scan_post_early_exit_guards(
   return out
 
 
+_CPP_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]\s*$')
+_CPP_PREPROC_RE = re.compile(r"^\s*#\s*(\w+)(.*)$")
+_CPP_ACCESS_RE = re.compile(r"(?m)^\s*(?:public|private|protected)\s*:")
+_CPP_STR_OR_CHAR_RE = re.compile(
+    r'"(?:\\.|[^"\\\n])*"|(?<![0-9A-Za-z_])\'(?:\\.|[^\'\\\n]){1,4}\''
+)
+_CPP_TYPE_DECL_RE = re.compile(
+    r"\b(?:class|struct)\s+(?:[A-Z_][A-Z0-9_]*\s+)*([A-Za-z_]\w*)"
+    r"\s*(?:final\b)?\s*(?::\s*([^{;]+))?$"
+)
+_CPP_FN_BODY_TAIL_RE = re.compile(
+    r"(?:\)|\}|\]\]|&&?|->\s*[\w:<>~*&\s,]+"
+    r"|\b(?:const|noexcept|volatile|final|[A-Z_][A-Z0-9_]*))\s*$"
+)
+
+
+def _extract_cpp_includes(
+    comment_stripped: str, allow_header_guard: bool
+) -> tuple[set[str], str] | None:
+  """Extract `#include` targets and mask literals; return None on macros or `#if` guards."""
+  includes: set[str] = set()
+  out_lines: list[str] = []
+  saw_pragma = False
+  saw_content = False
+  guard_ident: str | None = None
+  guard_defined = False
+  guard_open = False
+  guard_closed = False
+  for line in comment_stripped.splitlines():
+    inc_m = _CPP_INCLUDE_RE.match(line)
+    if inc_m:
+      if guard_closed or (guard_open and not guard_defined):
+        return None
+      saw_content = True
+      includes.add(inc_m.group(1).strip())
+      out_lines.append("")
+      continue
+    pp_m = _CPP_PREPROC_RE.match(line)
+    if pp_m:
+      kw, rest = pp_m.group(1), pp_m.group(2).strip()
+      if allow_header_guard and kw == "pragma" and rest == "once" and guard_ident is None:
+        saw_pragma = True
+        out_lines.append("")
+        continue
+      # Accept at most one outer `#ifndef X` / `#define X` / `#endif` include guard in `.h`
+      if (
+          allow_header_guard
+          and kw == "ifndef"
+          and not saw_pragma
+          and not saw_content
+          and guard_ident is None
+          and re.match(r"^\w+$", rest)
+      ):
+        guard_ident, guard_open = rest, True
+        out_lines.append("")
+        continue
+      if (
+          allow_header_guard
+          and kw == "define"
+          and guard_open
+          and not guard_defined
+          and rest == guard_ident
+      ):
+        guard_defined = True
+        out_lines.append("")
+        continue
+      if allow_header_guard and kw == "endif" and guard_open and guard_defined:
+        guard_open, guard_closed = False, True
+        out_lines.append("")
+        continue
+      # Conditional compilation (`#if`/`#ifdef`) or macros make `.cpp` non-trivial to inline
+      return None
+    masked = _CPP_STR_OR_CHAR_RE.sub('""', line)
+    if masked.strip():
+      if guard_closed or (guard_open and not guard_defined):
+        return None
+      saw_content = True
+    out_lines.append(masked)
+  return None if guard_open else (includes, "\n".join(out_lines))
+
+
+def _find_matching_brace(text: str, open_idx: int) -> int | None:
+  """Return index of `}` matching `text[open_idx] == '{'`, or None if unbalanced; pure."""
+  depth = 1
+  for j in range(open_idx + 1, len(text)):
+    ch = text[j]
+    if ch == "{":
+      depth += 1
+    elif ch == "}":
+      depth -= 1
+      if depth == 0:
+        return j
+  return None
+
+
+def _split_sig_and_init(raw_head: str) -> tuple[str, str] | None:
+  """Split C++ declaration header before `{` into `(before_params, post_params)`; pure."""
+  first_open = raw_head.find("(")
+  if first_open < 0:
+    return None
+  before = raw_head[:first_open]
+  # Advance past `operator()` empty parens when followed by the call operator's parameter list
+  pos = first_open
+  while pos < len(raw_head) and raw_head[pos] == "(":
+    depth = 0
+    close_idx = -1
+    for j in range(pos, len(raw_head)):
+      if raw_head[j] == "(":
+        depth += 1
+      elif raw_head[j] == ")":
+        depth -= 1
+        if depth == 0:
+          close_idx = j
+          break
+    if close_idx < 0:
+      return None
+    nxt = close_idx + 1
+    while nxt < len(raw_head) and raw_head[nxt].isspace():
+      nxt += 1
+    if re.search(r"\boperator\s*$", before) and pos == first_open and nxt < len(raw_head):
+      if raw_head[nxt] == "(":
+        before = raw_head[:nxt]
+        pos = nxt
+        continue
+    return (before, raw_head[close_idx + 1 :])
+  return None
+
+
+def _count_method_body_lines(init_seg: str, body_seg: str) -> int | None:
+  """Count ctor-init + non-brace statement lines, or return None on function-local `static`."""
+  if re.search(r"\bstatic\b", body_seg):
+    return None
+  colon_m = re.search(r"(?<!:):(?!:)", init_seg)
+  init_lines = (
+      sum(1 for ln in init_seg[colon_m.start() :].splitlines() if ln.strip()) if colon_m else 0
+  )
+  stmt_lines = sum(
+      1 for ln in body_seg.splitlines() if ln.strip() and ln.strip() not in ("{", "}", "};")
+  )
+  return init_lines + stmt_lines
+
+
+def _inspect_private_header(hdr_masked: str) -> set[str] | None:
+  """Return non-virtual class/struct names in `hdr_masked` if inline bodies are <= 10 lines."""
+  if re.search(r"\b(?:virtual|override|template)\b", hdr_masked):
+    return None
+  text = _CPP_ACCESS_RE.sub("", hdr_masked)
+  hdr_classes: set[str] = set()
+  scope_stack: list[str] = []
+  paren_depth, stmt_start, i, n = 0, 0, 0, len(text)
+  while i < n:
+    ch = text[i]
+    if ch == "(":
+      paren_depth += 1
+    elif ch == ")":
+      paren_depth = max(0, paren_depth - 1)
+    elif paren_depth == 0 and ch == ";":
+      stmt_start = i + 1
+    elif paren_depth == 0 and ch == "{":
+      raw_head = text[stmt_start:i]
+      head = " ".join(raw_head.split())
+      if re.match(r"^namespace\s+[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*$", head):
+        scope_stack.append("ns")
+        stmt_start = i + 1
+      elif re.search(r"\benum\b", head) and "(" not in head:
+        scope_stack.append("enum")
+        stmt_start = i + 1
+      elif re.search(r"\b(?:class|struct|union)\b", head) and "(" not in head:
+        m = _CPP_TYPE_DECL_RE.search(head)
+        if not m or "union" in head.split():
+          return None
+        # Reject inherited bases other than SkNoncopyable because base vtables need a key function
+        if m.group(2):
+          bases = [
+              re.sub(r"^\b(?:public|private|protected)\b\s*", "", b.strip())
+              for b in m.group(2).split(",")
+          ]
+          if any(b != "SkNoncopyable" for b in bases):
+            return None
+        hdr_classes.add(m.group(1))
+        scope_stack.append("type")
+        stmt_start = i + 1
+      elif "(" in head and _CPP_FN_BODY_TAIL_RE.search(raw_head):
+        sig_init = _split_sig_and_init(raw_head)
+        end_b = _find_matching_brace(text, i)
+        if not sig_init or end_b is None:
+          return None
+        cnt = _count_method_body_lines(sig_init[1], text[i + 1 : end_b])
+        if cnt is None or cnt > 10:
+          return None
+        i, stmt_start = end_b, end_b + 1
+      else:
+        # Skip value/member brace-initializers (`int fX{0};`, `: fArr{1}`) keeping `stmt_start`
+        end_b = _find_matching_brace(text, i)
+        if end_b is None:
+          return None
+        i = end_b
+    elif paren_depth == 0 and ch == "}":
+      if not scope_stack:
+        return None
+      scope_stack.pop()
+      stmt_start = i + 1
+    i += 1
+  return hdr_classes if (hdr_classes and not scope_stack) else None
+
+
+def _is_stub_cpp_body(cpp_masked: str, hdr_classes: set[str]) -> bool:
+  """Return True when `.cpp` holds only <= 10-line out-of-line methods of `hdr_classes`."""
+  if re.search(r"\b(?:virtual|override|template)\b", cpp_masked):
+    return False
+  scope_stack: list[str] = []
+  paren_depth, stmt_start, i, n = 0, 0, 0, len(cpp_masked)
+  while i < n:
+    ch = cpp_masked[i]
+    if ch == "(":
+      paren_depth += 1
+    elif ch == ")":
+      paren_depth = max(0, paren_depth - 1)
+    elif paren_depth == 0 and ch == ";":
+      stmt = " ".join(cpp_masked[stmt_start:i].split())
+      stmt_start = i + 1
+      if not stmt:
+        i += 1
+        continue
+      # Allow out-of-line `= default`/`= delete` members while rejecting globals/static data
+      m_def = re.search(
+          r"\b([A-Za-z_]\w*)::(?:~\1|[A-Za-z_]\w*|operator\b[^(]*)\s*\([^;]*\)\s*"
+          r"(?:const\s*)?(?:&&?\s*)?(?:noexcept\s*)?=\s*(?:default|delete)$",
+          stmt,
+      )
+      if not m_def or m_def.group(1) not in hdr_classes or re.search(r"\bstatic\b", stmt):
+        return False
+    elif paren_depth == 0 and ch == "{":
+      raw_head = cpp_masked[stmt_start:i]
+      head = " ".join(raw_head.split())
+      if re.match(r"^namespace\s+[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*$", head):
+        scope_stack.append("ns")
+        stmt_start = i + 1
+      elif "(" in head and re.search(r"(?<!:):(?!:)", raw_head) and not _CPP_FN_BODY_TAIL_RE.search(
+          raw_head
+      ):
+        # Skip brace member-initializers inside ctor initializer lists before the body `{`
+        end_b = _find_matching_brace(cpp_masked, i)
+        if end_b is None:
+          return False
+        i = end_b
+      else:
+        if re.search(r"\b(?:static|extern|namespace|class|struct|enum|union)\b", head):
+          return False
+        if not _CPP_FN_BODY_TAIL_RE.search(raw_head):
+          return False
+        sig_init = _split_sig_and_init(raw_head)
+        end_b = _find_matching_brace(cpp_masked, i)
+        if not sig_init or end_b is None:
+          return False
+        # Require `ClassName::Method` before `(` so free helpers taking `ClassName` are excluded
+        cls_m = re.search(
+            r"\b([A-Za-z_]\w*)::(?:~\1|[A-Za-z_]\w*|operator\b.*)$", sig_init[0].strip()
+        )
+        if not cls_m or cls_m.group(1) not in hdr_classes:
+          return False
+        cnt = _count_method_body_lines(sig_init[1], cpp_masked[i + 1 : end_b])
+        if cnt is None or cnt > 10:
+          return False
+        i, stmt_start = end_b, end_b + 1
+    elif paren_depth == 0 and ch == "}":
+      if not scope_stack:
+        return False
+      scope_stack.pop()
+      stmt_start = i + 1
+    i += 1
+  return not scope_stack and not cpp_masked[stmt_start:].strip()
+
+
+def _check_stub_cpp_file(
+    full_path: pathlib.Path, rel_path: str, cpp_content: str
+) -> tuple[str, str] | None:
+  """Flag private `src/*.cpp` files whose `<= 10`-line methods belong in-class in paired `.h`."""
+  norm_rel = rel_path.replace("\\", "/")
+  rel_parts = pathlib.PurePosixPath(norm_rel).parts
+  dir_parts = rel_parts[:-1]
+  if "src" not in dir_parts or "include" in dir_parts or "public" in dir_parts:
+    return None
+  hdr_path = next(
+      (
+          full_path.with_suffix(suf)
+          for suf in (".h", ".hpp")
+          if full_path.with_suffix(suf).is_file()
+      ),
+      None,
+  )
+  if hdr_path is None:
+    return None
+  hdr_rel = str(pathlib.PurePosixPath(norm_rel).with_suffix(hdr_path.suffix))
+  try:
+    hdr_raw = hdr_path.read_text(encoding="utf-8", errors="replace")
+  except OSError:
+    return None
+  cpp_parsed = _extract_cpp_includes(
+      _strip_comments_for_ext(cpp_content, ".cpp", keep_newlines=True), allow_header_guard=False
+  )
+  hdr_parsed = _extract_cpp_includes(
+      _strip_comments_for_ext(hdr_raw, ".h", keep_newlines=True), allow_header_guard=True
+  )
+  if not cpp_parsed or not hdr_parsed:
+    return None
+  cpp_incs, cpp_masked = cpp_parsed
+  hdr_incs, hdr_masked = hdr_parsed
+  is_self = lambda inc: inc in (hdr_rel, hdr_path.name) or hdr_rel.endswith("/" + inc)
+  if not any(is_self(inc) for inc in cpp_incs):
+    return None
+  # Keep `.cpp` files that isolate extra `#include` dependencies behind forward declarations
+  repo_root = full_path.parents[len(rel_parts) - 1]
+  resolve_inc = lambda base_dir, inc: (
+      (repo_root / inc).resolve() if (repo_root / inc).is_file() else (base_dir / inc).resolve()
+  )
+  hdr_resolved = {resolve_inc(hdr_path.parent, h) for h in hdr_incs}
+  for inc in cpp_incs:
+    if not is_self(inc) and inc not in hdr_incs:
+      if resolve_inc(full_path.parent, inc) not in hdr_resolved:
+        return None
+  hdr_classes = _inspect_private_header(hdr_masked)
+  if not hdr_classes or not _is_stub_cpp_body(cpp_masked, hdr_classes):
+    return None
+  return (
+      f"{rel_path}:L1",
+      f"[STUB_CPP] move <= 10-line methods in-class into `{hdr_rel}` and delete stub `.cpp`",
+  )
+
+
 def scan_horrors_and_invariants(file_records, allow_cyrillic=False):
   """Scan files for KEEPER invariant breaches, anti-slop horrors, and test smells."""
   horrors = defaultdict(list)
   endpoints = defaultdict(set)
 
-  for _, rel_path, content, lines in file_records:
+  for full_path, rel_path, content, lines in file_records:
     test_flag = is_test_file(rel_path)
     ext = pathlib.Path(rel_path).suffix.lower()
     in_hot_func = False
@@ -1243,6 +1573,10 @@ def scan_horrors_and_invariants(file_records, allow_cyrillic=False):
         horrors["consecutive_collection_loops"].extend(
             _scan_consecutive_loops(rel_path, ext, cleaned_for_cf)
         )
+        if ext in (".cc", ".cpp", ".cxx"):
+          stub_hit = _check_stub_cpp_file(full_path, rel_path, content)
+          if stub_hit:
+            horrors["stub_cpp_files"].append(stub_hit)
       horrors["post_early_exit_tautologies"].extend(
           _scan_post_early_exit_guards(rel_path, ext, cleaned_for_cf)
       )
@@ -1375,6 +1709,10 @@ def format_markdown_report(report):
       ("unused_imports", "Orphaned / Unused Explicit Imports (Prototype-Scar Elimination)"),
       ("consecutive_collection_loops", "Fuseable Consecutive Same-Collection Loops"),
       ("post_early_exit_tautologies", "Tautological or Dead Re-Checks Below Early Return/Continue"),
+      (
+          "stub_cpp_files",
+          "Private `src/` Stub `.cpp` Files Belonging In-Class in `.h` (`[STUB_CPP]`)",
+      ),
   ]
   for key, title in labels:
     items = horrors.get(key, [])

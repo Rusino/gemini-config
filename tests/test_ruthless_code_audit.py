@@ -552,6 +552,206 @@ class TestRuthlessCodeAudit(unittest.TestCase):
     for m_rule in ("M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9"):
       self.assertIn(m_rule, hunter_md)
 
+  # Verifies [STUB_CPP] flags private src/ stub .cpp files while preserving public ABI,
+  # extra-#include encapsulation, polymorphic/singleton types, and >10-line or helper .cpp files
+  def test_stub_cpp_detection_and_safe_exclusions(self):
+    self._write(
+        "modules/demo/src/IndexMap.h",
+        "\n".join([
+            "#ifndef IndexMap_DEFINED",
+            "#define IndexMap_DEFINED",
+            '#include "include/core/SkTypes.h"',
+            '#include "include/private/SkTo.h"',
+            "namespace demo {",
+            "class IndexMap {",
+            "public:",
+            "  IndexMap();",
+            "  IndexMap& operator=(IndexMap&&) noexcept;",
+            "  static int Next(const char** p, const char* end);",
+            "  void start(size_t n);",
+            "  size_t map(size_t i) const;",
+            "  bool isSupp(uint32_t cp) const;",
+            "private:",
+            "  size_t fLen;",
+            "};",
+            "inline int IndexMap::Next(const char** p, const char* end) {",
+            "  if (*p >= end) {",
+            "    return -1;",
+            "  }",
+            "  return *(*p)++;",
+            "}",
+            "}  // namespace demo",
+            "#endif",
+        ]),
+    )
+    self._write(
+        "modules/demo/src/IndexMap.cpp",
+        "\n".join([
+            '#include "modules/demo/src/IndexMap.h"',
+            '#include "include/private/SkTo.h"',
+            "namespace demo {",
+            "IndexMap::IndexMap() : fLen(0) {}",
+            "IndexMap& IndexMap::operator=(IndexMap&&) noexcept = default;",
+            "void IndexMap::start(size_t n) {",
+            "  // Bounds table capacity",
+            "  fLen = n;",
+            "}",
+            "size_t IndexMap::map(size_t i) const {",
+            "  return i < fLen ? i : fLen;",
+            "}",
+            "bool IndexMap::isSupp(uint32_t cp) const {",
+            "  if (cp >= 0x10'000) { return cp <= 0x10'FFFF; }",
+            "  return false;",
+            "}",
+            "}  // namespace demo",
+        ]),
+    )
+
+    # Negative 1: public include/ header paired with src/.cpp (Frozen ABI)
+    self._write(
+        "modules/demo/include/PublicStyle.h",
+        "namespace demo { class PublicStyle { public: int count() const; }; }\n",
+    )
+    self._write(
+        "modules/demo/src/PublicStyle.cpp",
+        '#include "modules/demo/include/PublicStyle.h"\n'
+        "namespace demo { int PublicStyle::count() const { return 0; } }\n",
+    )
+
+    # Negative 2: .cpp adds an #include not present in .h (dependency encapsulation)
+    self._write(
+        "modules/demo/src/Encapsulated.h",
+        "namespace demo { class Heavy; class Encapsulated { public: void run(Heavy*); }; }\n",
+    )
+    self._write(
+        "modules/demo/src/Encapsulated.cpp",
+        '#include "modules/demo/src/Encapsulated.h"\n'
+        '#include "modules/demo/src/Heavy.h"\n'
+        "namespace demo { void Encapsulated::run(Heavy*) {} }\n",
+    )
+
+    # Negative 3a: virtual/override or base-class polymorphism (-Wweak-vtables)
+    self._write(
+        "modules/demo/src/PainterImpl.h",
+        "namespace demo { class PainterImpl { public: virtual ~PainterImpl(); void draw(); }; }\n",
+    )
+    self._write(
+        "modules/demo/src/PainterImpl.cpp",
+        '#include "modules/demo/src/PainterImpl.h"\n'
+        "namespace demo { PainterImpl::~PainterImpl() = default; void PainterImpl::draw() {} }\n",
+    )
+    self._write(
+        "modules/demo/src/RefCntSub.h",
+        "namespace demo { class RefCntSub : public SkRefCnt { public: RefCntSub(); }; }\n",
+    )
+    self._write(
+        "modules/demo/src/RefCntSub.cpp",
+        '#include "modules/demo/src/RefCntSub.h"\n'
+        "namespace demo { RefCntSub::RefCntSub() {} }\n",
+    )
+
+    # Negative 3b: function-local static singleton or lookup table
+    self._write(
+        "modules/demo/src/Registry.h",
+        "namespace demo { class Registry { public: static Registry& Instance(); }; }\n",
+    )
+    self._write(
+        "modules/demo/src/Registry.cpp",
+        '#include "modules/demo/src/Registry.h"\n'
+        "namespace demo { Registry& Registry::Instance() {\n"
+        "  static Registry kInst;\n"
+        "  return kInst;\n"
+        "} }\n",
+    )
+
+    # Negative 4a: method body > 10 non-comment code lines
+    eleven_stmts = "\n".join(f"  acc += {i};" for i in range(1, 11)) + "\n  return acc;"
+    self._write(
+        "modules/demo/src/LargeMethod.h",
+        "namespace demo { class LargeMethod { public: int compute(int acc) const; }; }\n",
+    )
+    self._write(
+        "modules/demo/src/LargeMethod.cpp",
+        '#include "modules/demo/src/LargeMethod.h"\n'
+        f"namespace demo {{ int LargeMethod::compute(int acc) const {{\n{eleven_stmts}\n}} }}\n",
+    )
+
+    # Negative 4b: file-local anonymous-namespace helper in .cpp
+    self._write(
+        "modules/demo/src/WithHelpers.h",
+        "namespace demo { class WithHelpers { public: int calc(int x) const; }; }\n",
+    )
+    self._write(
+        "modules/demo/src/WithHelpers.cpp",
+        '#include "modules/demo/src/WithHelpers.h"\n'
+        "namespace demo {\n"
+        "namespace { int clampPos(int x) { return x > 0 ? x : 0; } }\n"
+        "int WithHelpers::calc(int x) const { return clampPos(x); }\n"
+        "}\n",
+    )
+
+    # Negative 5: #pragma once header with conditional #ifndef include block
+    self._write(
+        "modules/demo/src/CondInc.h",
+        "#pragma once\n"
+        "#ifndef DEMO_MAC\n"
+        '#include "modules/demo/src/WinDep.h"\n'
+        "#endif\n"
+        "namespace demo { class CondInc { public: void run(); }; }\n",
+    )
+    self._write(
+        "modules/demo/src/CondInc.cpp",
+        '#include "modules/demo/src/CondInc.h"\n'
+        '#include "modules/demo/src/WinDep.h"\n'
+        "namespace demo { void CondInc::run() {} }\n",
+    )
+
+    # Negative 6: ref-qualified / trailing-return-type inline method hiding static or >10 lines
+    self._write(
+        "modules/demo/src/RefQualBig.h",
+        "namespace demo {\n"
+        "class RefQualBig {\n"
+        "public:\n"
+        "  RefQualBig();\n"
+        "  int get() const& { static int s = 0; return ++s; }\n"
+        "  auto pair(int acc) const -> std::pair<int, int> {\n"
+        f"{eleven_stmts}\n"
+        "  }\n"
+        "};\n"
+        "}\n",
+    )
+    self._write(
+        "modules/demo/src/RefQualBig.cpp",
+        '#include "modules/demo/src/RefQualBig.h"\n'
+        "namespace demo { RefQualBig::RefQualBig() {} }\n",
+    )
+
+    raw_files = ruthless_audit.collect_files([self.root], self.root)
+    records = [
+        (p, rel, p.read_text(encoding="utf-8"), p.read_text(encoding="utf-8").splitlines())
+        for p, rel in raw_files
+    ]
+    horrors = ruthless_audit.scan_horrors_and_invariants(records, allow_cyrillic=False)
+    stub_items = horrors["stub_cpp_files"]
+    self.assertEqual([loc for loc, _ in stub_items], ["modules/demo/src/IndexMap.cpp:L1"])
+    self.assertIn("[STUB_CPP]", stub_items[0][1])
+
+    # Header-only CoreTextIndexMap.h must also satisfy sibling resource_lints.py utf-decode-owner
+    self._write(
+        "modules/skparagraph/src/CoreTextIndexMap.h",
+        "namespace skia { class CoreTextIndexMap {\n"
+        "  int next(const char** p, const char* end) { return SkUTF::NextUTF8(p, end); }\n"
+        "}; }\n",
+    )
+    lints_py = SCRIPT_PATH.with_name("resource_lints.py")
+    lint_proc = subprocess.run(
+        [sys.executable, str(lints_py), "--repo", str(self.root), "modules/skparagraph/src"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(lint_proc.returncode, 0, msg=lint_proc.stdout + lint_proc.stderr)
+
 
 if __name__ == "__main__":
   unittest.main()

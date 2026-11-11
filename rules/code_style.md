@@ -24,7 +24,8 @@ description: "When editing source code or tests, writing code comments, commit m
 - Every line <= 100 columns in every language (clang-format covers only C++)
 - Strict YAGNI: no uncalled helpers, overloads, iterators or wrappers. State is a plain struct,
   not a class with accessors: `fMember` when it has methods, plain field names on methodless POD
-  structs
+  structs. Private (src/) non-virtual, non-singleton types whose methods are all <= 10 lines and
+  add no `#include`s keep bodies in-class in `.h` (no stub `.cpp`)
 - One screen per function or loop at one abstraction level: extract cohesive domain phases into
   narrow-signature helpers (one caller in a long loop satisfies YAGNI), and hold loop state in a
   struct instead of multi-line `[&]` lambdas. Pass the owning object or slice directly rather than
