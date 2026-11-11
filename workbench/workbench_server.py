@@ -1265,6 +1265,22 @@ def render_workbench_html(
   .wb-drafts-toggle {{
     cursor: pointer;
   }}
+  .wb-sug-row {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+    align-items: center;
+    margin: 4px 0;
+    font-size: 12px;
+  }}
+  .wb-sug-hdr {{
+    color: var(--muted);
+    font-weight: 600;
+  }}
+  .wb-sug-btn {{
+    padding: 0 5px;
+    margin-left: 2px;
+  }}
   .wb-actions {{
     display: flex;
     align-items: center;
@@ -4200,12 +4216,35 @@ def render_workbench_html(
       <div class="re-footer">
         ${{chatsHtml}}
         ${{pillsHtml ? `<div class="wb-pills">${{pillsHtml}}</div>` : ''}}
+        ${{renderSuggestions(w)}}
         <div class="re-utility-row">
           ${{mentionsHtml}}
           ${{cardActions}}
         </div>
       </div>
     `;
+  }}
+
+  // Text mentions held back from her work until she takes (✓) or drops (✕) each one
+  function renderSuggestions(w) {{
+    const sugs = w.suggestions || [];
+    if (!sugs.length) return '';
+    const wid = esc(w.work_id);
+    const items = sugs.map((s) => {{
+      const key = esc(s.artifact_key);
+      return `<span class="wb-sug-item" title="${{esc(s.link_reason)}}">`
+        + `<a href="${{esc(s.url)}}" target="_blank" rel="noopener">${{esc(s.title)}}</a>`
+        + `<button class="wb-btn wb-sug-btn" data-suggestion-accept="${{key}}"`
+        + ` data-suggestion-work="${{wid}}" title="Добавить" type="button">✓</button>`
+        + `<button class="wb-btn wb-sug-btn" data-suggestion-reject="${{key}}"`
+        + ` data-suggestion-work="${{wid}}" title="Отклонить" type="button">✕</button></span>`;
+    }}).join('');
+    // The payload is capped, so the header shows the full count and how many are hidden
+    const total = Math.max(Number(w.suggestions_total) || 0, sugs.length);
+    const more = total > sugs.length
+      ? `<span class="wb-sug-more">+${{total - sugs.length}}</span>` : '';
+    return `<div class="wb-sug-row"><span class="wb-sug-hdr">Предложено (${{total}})</span>`
+      + `${{items}}${{more}}</div>`;
   }}
 
   // Render a single editorial Work card across header, decision strip, loop, peers, and footer
@@ -4563,6 +4602,17 @@ def render_workbench_html(
       draftsOpen = !draftsOpen;
       saveDraftsPrefs();
       render();
+      return;
+    }}
+    for (const [attr, path] of [
+      ['data-suggestion-accept', '/api/work/suggestion/accept'],
+      ['data-suggestion-reject', '/api/work/suggestion/reject'],
+    ]) {{
+      if (!target.hasAttribute(attr)) continue;
+      void postJson(path, {{
+        work_id: target.getAttribute('data-suggestion-work'),
+        artifact_key: target.getAttribute(attr),
+      }});
       return;
     }}
     if (target.hasAttribute('data-work-accept')) {{
@@ -5018,6 +5068,17 @@ def create_server(
         wid = str(body.get("work_id") or "")
         if wid:
           active_store.complete_work(wid, roadmap_cb=workctl._roadmap_writeback)
+        self._send_json(current_projection())
+        return
+
+      if parsed.path in ("/api/work/suggestion/accept", "/api/work/suggestion/reject"):
+        wid = str(body.get("work_id") or "")
+        akey = str(body.get("artifact_key") or "")
+        if wid and akey:
+          if parsed.path.endswith("/accept"):
+            active_store.accept_link_suggestion(wid, akey)
+          else:
+            active_store.reject_link_suggestion(wid, akey)
         self._send_json(current_projection())
         return
 

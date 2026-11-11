@@ -2494,6 +2494,21 @@ def _extract_draft_mentioned_keys(text: str) -> list[str]:
 
 WORK_OWNERS = ("user", "draft")
 
+# R30: auto reasons where the artifact is the same thing or formally bound to the work
+# (trailer, root thread, watcher item, stack, companion, doc thread, chat target, its chat)
+STRUCTURAL_LINK_REASONS = frozenset({
+    "bug_trailer", "gmail_root", "cl_watcher", "cl_watcher_chat", "companion_wip",
+    "stack_child", "github_issue_thread", "github_pr_thread", "gdoc_comment", "gdoc_share",
+    "chat_topic", "wb_reply_draft", "gmail_reviewlog",
+})
+# Text references found in mail or chat bodies; on her works they wait as suggestions
+MENTION_LINK_REASONS = frozenset({
+    "gmail_thread_ref", "gmail_draft_ref", "chat_mention", "gmail_digest_ref",
+})
+# Accepted mail refs name the work's subject; chat and digest mentions stay background
+_SUGGESTION_PRIMARY_REASONS = frozenset({"gmail_thread_ref", "gmail_draft_ref"})
+SUGGESTIONS_PER_CARD = 10
+
 
 def work_owner(meta: Any) -> str:
   """Returns "user" only for works she owns; missing, bad, or unknown owner reads as "draft"."""
@@ -3148,6 +3163,9 @@ def _is_absorbable_duplicate_work(
     s_meta = {}
   if bool(s_meta.get("title_manual")) or _active_reply_draft_from_meta(s_meta) is not None:
     return False
+  # R30: her Work may survive or be skipped, but auto absorption never folds it away
+  if work_owner(s_meta) == "user":
+    return False
   s_links: Sequence[Mapping[str, Any]] = snap.links_by_w.get(sid) or ()
   if not s_links:
     return False
@@ -3311,6 +3329,15 @@ class WorkStore:
           work_id TEXT NOT NULL,
           artifact_key TEXT NOT NULL,
           created_at REAL NOT NULL,
+          PRIMARY KEY (work_id, artifact_key)
+        );
+        CREATE TABLE IF NOT EXISTS link_suggestions (
+          work_id TEXT NOT NULL,
+          artifact_key TEXT NOT NULL,
+          link_reason TEXT DEFAULT '',
+          link_detail TEXT DEFAULT '',
+          created_at REAL NOT NULL,
+          status TEXT NOT NULL DEFAULT 'open',
           PRIMARY KEY (work_id, artifact_key)
         );
         CREATE TABLE IF NOT EXISTS obligations (
@@ -3826,19 +3853,132 @@ class WorkStore:
       return [dict(r) for r in rows]
 
   def _user_work_holds_primary(
-      self, conn: sqlite3.Connection, work_id: str, akey: str
+      self, conn: sqlite3.Connection, work_id: str, akey: str, exclude: tuple[str, ...] = ()
   ) -> bool:
-    """True when work_id is a draft and another active owner=user Work has akey as primary."""
+    """True when work_id is a draft and another active owner=user Work has akey as primary.
+
+    exclude lists further Works to ignore (merge source/target).
+    """
     w_row = conn.execute("SELECT meta_json FROM works WHERE work_id = ?", (work_id,)).fetchone()
     if w_row is None or work_owner(w_row["meta_json"]) == "user":
       return False
     rows = conn.execute(
-        "SELECT w.meta_json FROM work_links wl JOIN works w ON w.work_id = wl.work_id "
+        "SELECT wl.work_id, w.meta_json FROM work_links wl JOIN works w "
+        "ON w.work_id = wl.work_id "
         "WHERE wl.artifact_key = ? AND wl.role = 'primary' AND wl.work_id != ? "
         "AND w.status NOT IN ('done', 'archived')",
         (akey, work_id),
     ).fetchall()
-    return any(work_owner(r["meta_json"]) == "user" for r in rows)
+    return any(
+        work_owner(r["meta_json"]) == "user" and r["work_id"] not in exclude for r in rows
+    )
+
+  def _suggest_instead_of_link(
+      self,
+      conn: sqlite3.Connection,
+      work_id: str,
+      akey: str,
+      link_reason: str,
+      link_detail: str,
+      now: float,
+  ) -> bool:
+    """Parks a new mention edge on her Work in link_suggestions; True when it was diverted.
+
+    INSERT OR IGNORE keeps re-suggestions silent: no updated_at bump, no event, status kept.
+    """
+    if link_reason not in MENTION_LINK_REASONS:
+      return False
+    w_row = conn.execute("SELECT meta_json FROM works WHERE work_id = ?", (work_id,)).fetchone()
+    if w_row is None or work_owner(w_row["meta_json"]) != "user":
+      return False
+    conn.execute(
+        "INSERT OR IGNORE INTO link_suggestions "
+        "(work_id, artifact_key, link_reason, link_detail, created_at) VALUES (?, ?, ?, ?, ?)",
+        (work_id, akey, link_reason, link_detail, now),
+    )
+    return True
+
+  def _take_open_suggestion(
+      self, work_id: str, akey: str
+  ) -> sqlite3.Row | None:
+    """Returns the open suggestion row, or None when it is gone, decided, or already linked.
+
+    A row whose artifact got an edge another way is closed as 'linked', so a stale ✓ / ✕
+    never rewrites or tombstones that live edge. Callers hold self._lock across the decision.
+    """
+    with self._connect() as conn:
+      row = conn.execute(
+          "SELECT link_reason, link_detail FROM link_suggestions "
+          "WHERE work_id = ? AND artifact_key = ? AND status = 'open'",
+          (work_id, akey),
+      ).fetchone()
+      if row is None:
+        return None
+      if conn.execute(
+          "SELECT 1 FROM work_links WHERE work_id = ? AND artifact_key = ?", (work_id, akey)
+      ).fetchone():
+        conn.execute(
+            "UPDATE link_suggestions SET status = 'linked' WHERE work_id = ? AND artifact_key = ?",
+            (work_id, akey),
+        )
+        return None
+      return row
+
+  def accept_link_suggestion(
+      self, work_id: str, artifact_key: str, now: float | None = None
+  ) -> None:
+    """Links an open suggested artifact as a manual edge and marks the suggestion accepted.
+
+    Mail refs land as primary, chat/digest mentions as context_only; decided, stale, or
+    unknown rows are ignored.
+    """
+    cur_now = time.time() if now is None else now
+    akey = canonicalize_artifact_key(artifact_key)
+    with self._lock:
+      row = self._take_open_suggestion(work_id, akey)
+      if row is None:
+        return
+      reason = str(row["link_reason"] or "")
+      role = "primary" if reason in _SUGGESTION_PRIMARY_REASONS else "context_only"
+      self.link_artifact(
+          work_id,
+          akey,
+          role=role,
+          source="manual",
+          link_reason=reason,
+          link_detail=str(row["link_detail"] or ""),
+          now=cur_now,
+      )
+      with self._connect() as conn:
+        conn.execute(
+            "UPDATE link_suggestions SET status = 'accepted' "
+            "WHERE work_id = ? AND artifact_key = ?",
+            (work_id, akey),
+        )
+
+  def reject_link_suggestion(
+      self, work_id: str, artifact_key: str, now: float | None = None
+  ) -> None:
+    """Tombstones an open suggested artifact on work_id so it is never linked or offered again."""
+    cur_now = time.time() if now is None else now
+    akey = canonicalize_artifact_key(artifact_key)
+    with self._lock:
+      if self._take_open_suggestion(work_id, akey) is None:
+        return
+      with self._connect() as conn:
+        conn.execute(
+            "UPDATE link_suggestions SET status = 'rejected' "
+            "WHERE work_id = ? AND artifact_key = ?",
+            (work_id, akey),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO negative_links (work_id, artifact_key, created_at) "
+            "VALUES (?, ?, ?)",
+            (work_id, akey, cur_now),
+        )
+        self._log_event(
+            conn, "link_suggestion_rejected", work_id=work_id, artifact_key=akey, now=cur_now
+        )
 
   def link_artifact(
       self,
@@ -3891,6 +4031,16 @@ class WorkStore:
       prev_reason = str(existing_link["link_reason"] or "") if existing_link else ""
       prev_detail = str(existing_link["link_detail"] or "") if existing_link else ""
       created_ts = float(existing_link["created_at"]) if existing_link else cur_now
+
+      # R30: a new text mention on her Work waits for her ✓ instead of growing the card
+      if (
+          existing_link is None
+          and source != "manual"
+          and self._suggest_instead_of_link(
+              conn, work_id, akey, link_reason.strip(), link_detail.strip(), cur_now
+          )
+      ):
+        return None
 
       # Never let background auto sync passes downgrade or overwrite a manually pinned link
       if existing_link is not None and prev_source == "manual" and source != "manual":
@@ -5521,6 +5671,12 @@ class WorkStore:
       return
     cur_now = time.time() if now is None else now
     with self._lock, self._connect() as conn:
+      t_keys_before = {
+          str(r["artifact_key"])
+          for r in conn.execute(
+              "SELECT artifact_key FROM work_links WHERE work_id = ?", (target_work_id,)
+          ).fetchall()
+      }
       conn.execute(
           "INSERT OR IGNORE INTO work_links "
           "(work_id, artifact_key, role, source, confidence, created_at, link_reason, link_detail) "
@@ -5531,8 +5687,33 @@ class WorkStore:
           "))",
           (target_work_id, source, cur_now, source_work_id, source, target_work_id),
       )
+      # R30: the bulk copy bypasses link_artifact, so re-apply its guard to copied primaries;
+      # a user source turns the target into her Work below, where the guard does not apply
+      s_owner_row = conn.execute(
+          "SELECT meta_json FROM works WHERE work_id = ?", (source_work_id,)
+      ).fetchone()
+      if work_owner(s_owner_row["meta_json"] if s_owner_row else "{}") != "user":
+        for cr in conn.execute(
+            "SELECT artifact_key FROM work_links WHERE work_id = ? AND role = 'primary'",
+            (target_work_id,),
+        ).fetchall():
+          c_key = str(cr["artifact_key"])
+          if c_key in t_keys_before or not self._user_work_holds_primary(
+              conn, target_work_id, c_key, exclude=(source_work_id,)
+          ):
+            continue
+          conn.execute(
+              "UPDATE work_links SET role = 'context_only' "
+              "WHERE work_id = ? AND artifact_key = ?",
+              (target_work_id, c_key),
+          )
       conn.execute(
           "UPDATE obligations SET work_id = ? WHERE work_id = ?",
+          (target_work_id, source_work_id),
+      )
+      # Open suggestions follow the work; a target row for the same key already decided wins
+      conn.execute(
+          "UPDATE OR IGNORE link_suggestions SET work_id = ? WHERE work_id = ? AND status = 'open'",
           (target_work_id, source_work_id),
       )
       conn.execute(
@@ -6425,6 +6606,9 @@ class WorkStore:
           cand_owner = primary_cl_owner.get(sole_p, "")
           if cand_owner and cand_owner != wid:
             merge_owner_wid = cand_owner
+        # R30: companion repair archives wid without carrying owner, so never fold her Work
+        if work_owner(w.get("meta_json")) == "user":
+          merge_owner_wid = ""
 
         # Transfer links and obligations to the real parent Work while respecting negative_links
         if merge_owner_wid:
@@ -7030,6 +7214,17 @@ class WorkStore:
               "SELECT * FROM obligations ORDER BY created_at ASC"
           ).fetchall()
       ]
+      # Open suggestions only, oldest first; titles/urls come from art_rows below
+      sug_by_w: dict[str, list[tuple[str, str]]] = {}
+      for sr in conn.execute(
+          "SELECT work_id, artifact_key, link_reason FROM link_suggestions s "
+          "WHERE status = 'open' AND NOT EXISTS (SELECT 1 FROM work_links l "
+          "  WHERE l.work_id = s.work_id AND l.artifact_key = s.artifact_key) "
+          "ORDER BY created_at ASC"
+      ).fetchall():
+        sug_by_w.setdefault(str(sr["work_id"]), []).append(
+            (str(sr["artifact_key"]), str(sr["link_reason"] or ""))
+        )
 
     # Overlay live cl_watcher_state bug metadata in-memory so assignee/status stay fresh
     cl_bugs_raw = (cl_watcher_state or {}).get("bugs") or {}
@@ -7271,12 +7466,24 @@ class WorkStore:
           lane, w_arts, w_obs, card_reply_draft
       )
       act_et = format_et_timestamp(activity_ts, now=cur_now)
+      w_owner = work_owner(w.get("meta_json"))
+      card_suggestions: list[dict[str, str]] = []
+      # Small fields only and capped, so /api/state stays slim
+      if w_owner == "user":
+        for s_key, s_reason in (sug_by_w.get(wid) or [])[:SUGGESTIONS_PER_CARD]:
+          s_art = art_rows.get(s_key) or {}
+          card_suggestions.append({
+              "artifact_key": s_key,
+              "title": str(s_art.get("title") or s_key),
+              "url": str(s_art.get("url") or _default_artifact_url(s_key)),
+              "link_reason": s_reason,
+          })
       cards.append({
           "work_id": wid,
           "title": resolved_title or str(w["title"]),
           "origin": origin_info,
           "status": str(w["status"]),
-          "owner": work_owner(w.get("meta_json")),
+          "owner": w_owner,
           "lane": lane,
           "desk_tier": w_desk_tier,
           "reasons": reasons,
@@ -7297,6 +7504,8 @@ class WorkStore:
           "checklist": checklist,
           "artifacts": w_arts,
           "obligations": w_obs,
+          "suggestions": card_suggestions,
+          "suggestions_total": len(sug_by_w.get(wid) or []) if w_owner == "user" else 0,
       })
 
     # Persist upgraded titles back to SQLite so CLI and subsequent reads stay consistent

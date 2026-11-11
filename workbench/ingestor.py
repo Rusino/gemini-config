@@ -3118,7 +3118,8 @@ def ingest_gmail_drafts_and_threads(
                 t_key,
                 role="channel",
                 source="auto",
-                link_reason="gmail_thread_ref",
+                # A bot mail about a CL already in the work is its channel, not a text mention
+                link_reason="gmail_reviewlog",
                 now=cur_now,
             )
           continue
