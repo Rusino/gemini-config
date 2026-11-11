@@ -3784,6 +3784,7 @@ def render_workbench_html(
                  title="${{esc(w.title)}}">${{esc(headline)}}</div>
             ${{headlineSubHtml}}
           </div>
+          ${{renderHints(w)}}
           ${{collapsedSummaryHtml}}
         </div>
       </div>
@@ -4225,6 +4226,30 @@ def render_workbench_html(
     `;
   }}
 
+  // Agent hints (adopt / split / close): she acts with one button or hides the kind with ✕
+  function renderHints(w) {{
+    const hints = w.hints || [];
+    if (!hints.length) return '';
+    const wid = esc(w.work_id);
+    const items = hints.map((h) => {{
+      const kind = esc(h.kind);
+      const clusters = h.clusters || [];
+      const text = clusters.length
+        ? `${{h.label}}: ${{clusters.map((c) => c.label).join(', ')}}` : h.label;
+      const acts = clusters.length
+        ? clusters.map((c) => `<button class="wb-btn wb-sug-btn" data-hint-action="${{kind}}"`
+            + ` data-hint-work="${{wid}}" data-hint-bug="${{esc(c.bug_key)}}" type="button"`
+            + ` title="Вынести в отдельную работу">✂ ${{esc(c.label)}}</button>`).join('')
+        : `<button class="wb-btn wb-sug-btn" data-hint-action="${{kind}}"`
+            + ` data-hint-work="${{wid}}" type="button">Да</button>`;
+      return `<span class="wb-hint-item" title="${{esc(h.detail || '')}}">${{esc(text)}}`
+        + `${{acts}}<button class="wb-btn wb-sug-btn" data-hint-dismiss="${{kind}}"`
+        + ` data-hint-work="${{wid}}" title="Скрыть" type="button">✕</button></span>`;
+    }}).join('');
+    return `<div class="wb-sug-row wb-hint-row"><span class="wb-sug-hdr">Подсказка</span>`
+      + `${{items}}</div>`;
+  }}
+
   // Text mentions held back from her work until she takes (✓) or drops (✕) each one
   function renderSuggestions(w) {{
     const sugs = w.suggestions || [];
@@ -4613,6 +4638,28 @@ def render_workbench_html(
         work_id: target.getAttribute('data-suggestion-work'),
         artifact_key: target.getAttribute(attr),
       }});
+      return;
+    }}
+    if (target.hasAttribute('data-hint-dismiss')) {{
+      void postJson('/api/work/hint/dismiss', {{
+        work_id: target.getAttribute('data-hint-work'),
+        kind: target.getAttribute('data-hint-dismiss'),
+      }});
+      return;
+    }}
+    if (target.hasAttribute('data-hint-action')) {{
+      const wid = target.getAttribute('data-hint-work');
+      const kind = target.getAttribute('data-hint-action');
+      if (kind === 'split') {{
+        void postJson('/api/work/split_cluster', {{
+          work_id: wid,
+          bug_key: target.getAttribute('data-hint-bug'),
+        }});
+      }} else if (kind === 'adopt' || kind === 'close') {{
+        void postJson(kind === 'adopt' ? '/api/work/accept' : '/api/work/done', {{
+          work_id: wid,
+        }});
+      }}
       return;
     }}
     if (target.hasAttribute('data-work-accept')) {{
@@ -5086,6 +5133,21 @@ def create_server(
         wid = str(body.get("work_id") or "")
         if wid:
           active_store.set_work_owner(wid, "user")
+        self._send_json(current_projection())
+        return
+
+      if parsed.path == "/api/work/hint/dismiss":
+        wid = str(body.get("work_id") or "")
+        if wid:
+          active_store.dismiss_work_hint(wid, str(body.get("kind") or ""))
+        self._send_json(current_projection())
+        return
+
+      if parsed.path == "/api/work/split_cluster":
+        wid = str(body.get("work_id") or "")
+        bkey = str(body.get("bug_key") or "")
+        if wid and bkey:
+          active_store.split_work_cluster(wid, bkey)
         self._send_json(current_projection())
         return
 

@@ -2522,6 +2522,158 @@ def work_owner(meta: Any) -> str:
   return "user" if meta.get("owner") == "user" else "draft"
 
 
+HINT_KINDS = ("adopt", "split", "close")
+HINT_WINDOW_S = 7 * 86400
+SPLIT_HINT_MAX_MEMBERS = 15
+_HINT_CL_KINDS = frozenset({"gerrit", "github_pr", "piper"})
+# GitHub reports a closed-unmerged PR as CLOSED, Gerrit as ABANDONED
+_LANDED_CL_STATUSES = frozenset({"MERGED", "ABANDONED", "CLOSED"})
+
+
+def _is_bug_key(akey: str) -> bool:
+  return akey.startswith(("buganizer:", "github_issue:"))
+
+
+def hint_fingerprint(member_keys: Iterable[str]) -> str:
+  """Hashes the sorted non-context member keys; a dismissed hint returns when they change."""
+  joined = "\n".join(sorted(set(member_keys)))
+  return hashlib.sha1(joined.encode("utf-8")).hexdigest()[:16]
+
+
+def bug_clusters(members: Sequence[Mapping[str, Any]]) -> list[tuple[str, list[str]]]:
+  """Groups members by bug: [(bug_key, member keys)] in artifact_key order, bug key first.
+
+  A CL joins the first member bug its Bug: trailer names; correspondence joins the first bug
+  its link_detail names. Members matching no bug stay out of every cluster (the remainder).
+  """
+  # Sorting keeps the hint projection and split_work_cluster on the same assignment
+  ordered = sorted(members, key=lambda a: str(a.get("artifact_key") or ""))
+  clusters: dict[str, list[str]] = {}
+  for a in ordered:
+    akey = str(a.get("artifact_key") or "")
+    if _is_bug_key(akey):
+      clusters[akey] = [akey]
+  for a in ordered:
+    akey = str(a.get("artifact_key") or "")
+    kind = str(a.get("kind") or artifact_kind_from_key(akey))
+    st = a.get("state") if isinstance(a.get("state"), Mapping) else {}
+    if kind in _HINT_CL_KINDS:
+      refs = extract_cl_bug_keys(st)
+    elif is_active_correspondence_artifact(kind, st) and a.get("link_detail"):
+      detail = str(a.get("link_detail"))
+      # Digit boundary: b/12345678 must not match inside b/123456789
+      refs = [
+          bk for bk in clusters
+          if any(
+              re.search(re.escape(s) + r"(?!\d)", detail)
+              for s in (bk, format_short_bug_id(bk))
+          )
+      ]
+    else:
+      continue
+    bk = next((b for b in refs if b in clusters), "")
+    if bk:
+      clusters[bk].append(akey)
+  return list(clusters.items())
+
+
+def _is_adopt_signal(art: Mapping[str, Any], now: float) -> bool:
+  """True for her own CL/PR or correspondence whose last message is hers within the window."""
+  akey = str(art.get("artifact_key") or "")
+  kind = str(art.get("kind") or artifact_kind_from_key(akey))
+  st = art.get("state") if isinstance(art.get("state"), Mapping) else {}
+  if kind in _HINT_CL_KINDS:
+    est = st.get("entity_state") if isinstance(st.get("entity_state"), Mapping) else {}
+    return _is_own_cl_state(st, est)
+  if not is_active_correspondence_artifact(kind, st) or not st.get("last_from_me"):
+    return False
+  return _parse_domain_ts(st.get("last_message_ts")) >= now - HINT_WINDOW_S
+
+
+def _split_hint(members: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+  """Offers bug clusters to split out: 2+ clusters of 2+, or any cluster in an oversized work."""
+  # A cluster that is the whole work has nothing to split away from
+  clusters = [c for c in bug_clusters(members) if len(c[1]) < len(members)]
+  picked = [c for c in clusters if len(c[1]) >= 2]
+  if len(picked) < 2:
+    if len(members) <= SPLIT_HINT_MAX_MEMBERS:
+      return None
+    picked = picked or clusters
+  if not picked:
+    return None
+  labels = [format_short_bug_id(bk) for bk, _ in picked]
+  return {
+      "kind": "split",
+      "label": "Разделить?",
+      "detail": ", ".join(labels),
+      "clusters": [{"bug_key": bk, "label": lb} for (bk, _), lb in zip(picked, labels)],
+  }
+
+
+def _is_finished_work(
+    w_arts: Sequence[Mapping[str, Any]], w_obs: Sequence[Mapping[str, Any]]
+) -> bool:
+  """True when every primary bug is closed, every primary CL/PR landed, and nothing is open."""
+  bugs: list[str] = []
+  cls: list[str] = []
+  for a in w_arts:
+    if a.get("role") != "primary":
+      continue
+    akey = str(a.get("artifact_key") or "")
+    st = a.get("state") if isinstance(a.get("state"), Mapping) else {}
+    status = str(st.get("status") or "").strip().upper()
+    if _is_bug_key(akey):
+      bugs.append(status)
+    elif str(a.get("kind") or "") in _HINT_CL_KINDS:
+      cls.append(status)
+  # Mail-only works have no tracker signal that says the work is over
+  if not bugs and not cls:
+    return False
+  if any(o.get("status") in ("open", "ready") for o in w_obs):
+    return False
+  return all(s in CLOSED_BUG_STATUSES for s in bugs) and all(
+      s in _LANDED_CL_STATUSES for s in cls
+  )
+
+
+def compute_work_hints(
+    w_arts: Sequence[Mapping[str, Any]],
+    w_obs: Sequence[Mapping[str, Any]],
+    owner: str,
+    member_keys: Iterable[str],
+    activity_ts: float,
+    now: float,
+    meta_raw: Any,
+) -> list[dict[str, Any]]:
+  """Returns 0-3 advisory card hints: adopt on drafts, split and close on her works.
+
+  member_keys are the raw non-context link keys, the same set dismiss_work_hint hashes, so a
+  dismissed kind stays hidden until membership changes. Never feeds lane classification.
+  """
+  try:
+    meta = json.loads(meta_raw or "{}") if not isinstance(meta_raw, Mapping) else meta_raw
+  except Exception:
+    meta = {}
+  dismissed = meta.get("hint_dismissed") if isinstance(meta, Mapping) else None
+  dismissed = dismissed if isinstance(dismissed, Mapping) else {}
+  members = [a for a in w_arts if a.get("role") != "context_only"]
+  recent = activity_ts >= now - HINT_WINDOW_S
+  hints: list[dict[str, Any]] = []
+  if owner != "user":
+    if len(members) >= 3 and recent and any(_is_adopt_signal(a, now) for a in members):
+      hints.append({"kind": "adopt", "label": "Сделать своей?", "detail": ""})
+  else:
+    split = _split_hint(members)
+    if split:
+      hints.append(split)
+    if not recent and _is_finished_work(w_arts, w_obs):
+      hints.append({"kind": "close", "label": "Закрыть?", "detail": ""})
+  if not hints or not dismissed:
+    return hints
+  fp = hint_fingerprint(member_keys)
+  return [h for h in hints if dismissed.get(h["kind"]) != fp]
+
+
 def _merge_reply_draft_meta(
     target_meta_raw: Any, source_meta_raw: Any
 ) -> dict[str, Any] | None:
@@ -3515,6 +3667,117 @@ class WorkStore:
           conn, "work_owner_set", work_id=work_id, payload={"owner": owner}, now=now
       )
 
+  def dismiss_work_hint(self, work_id: str, kind: str, now: float | None = None) -> None:
+    """Stores meta hint_dismissed[kind] = fingerprint of the current non-context members.
+
+    Leaves updated_at alone: a dismissed hint is not activity on the work.
+    """
+    if kind not in HINT_KINDS:
+      return
+    with self._lock, self._connect() as conn:
+      row = conn.execute("SELECT meta_json FROM works WHERE work_id = ?", (work_id,)).fetchone()
+      if row is None:
+        return
+      keys = [
+          str(r["artifact_key"])
+          for r in conn.execute(
+              "SELECT artifact_key FROM work_links WHERE work_id = ? AND role != 'context_only'",
+              (work_id,),
+          ).fetchall()
+      ]
+      try:
+        meta = dict(json.loads(row["meta_json"] or "{}"))
+      except Exception:
+        meta = {}
+      prev = meta.get("hint_dismissed")
+      dismissed = dict(prev) if isinstance(prev, Mapping) else {}
+      dismissed[kind] = hint_fingerprint(keys)
+      meta["hint_dismissed"] = dismissed
+      conn.execute(
+          "UPDATE works SET meta_json = ? WHERE work_id = ?", (json.dumps(meta), work_id)
+      )
+      self._log_event(
+          conn, "work_hint_dismissed", work_id=work_id, payload={"kind": kind}, now=now
+      )
+
+  def split_work_cluster(self, work_id: str, bug_key: str, now: float | None = None) -> str:
+    """Moves bug_key's cluster (see bug_clusters) out of her Work work_id into a new user Work.
+
+    Returns the new work_id, or "" when work_id is a draft, bug_key heads no cluster, or the
+    cluster is every member. Links keep role and detail; non-draft obligations move with their
+    status. All moves share one transaction; on failure the new empty Work is deleted.
+    """
+    cur_now = time.time() if now is None else now
+    bk = canonicalize_artifact_key(bug_key)
+    with self._lock, self._connect() as conn:
+      src_row = conn.execute(
+          "SELECT meta_json FROM works WHERE work_id = ?", (work_id,)
+      ).fetchone()
+      rows = conn.execute(
+          "SELECT l.artifact_key, l.role, l.link_detail, a.kind, a.title, a.state_json "
+          "FROM work_links l LEFT JOIN artifacts a ON a.artifact_key = l.artifact_key "
+          "WHERE l.work_id = ? AND l.role != 'context_only'",
+          (work_id,),
+      ).fetchall()
+    if src_row is None or work_owner(src_row["meta_json"]) != "user":
+      return ""
+    members: list[dict[str, Any]] = []
+    for r in rows:
+      try:
+        st = json.loads(r["state_json"] or "{}")
+      except Exception:
+        st = {}
+      members.append({
+          "artifact_key": str(r["artifact_key"]),
+          "kind": str(r["kind"] or ""),
+          "link_detail": str(r["link_detail"] or ""),
+          "title": str(r["title"] or ""),
+          "state": st if isinstance(st, Mapping) else {},
+      })
+    keys = dict(bug_clusters(members)).get(bk)
+    if not keys or len(keys) == len(members):
+      return ""
+    bug = next(m for m in members if m["artifact_key"] == bk)
+    title = clean_work_title(
+        str(bug["state"].get("bug_title") or bug["title"] or "")
+    ) or format_short_bug_id(bk)
+    # create_work commits on its own connection, so it must run before the move transaction
+    new_wid = self.create_work(title, now=cur_now, owner="user")
+    try:
+      with self._lock, self._connect() as conn:
+        for akey in keys:
+          conn.execute(
+              "INSERT OR REPLACE INTO work_links "
+              "(work_id, artifact_key, role, source, confidence, created_at, link_reason, "
+              "link_detail) "
+              "SELECT ?, artifact_key, role, 'manual', confidence, ?, link_reason, link_detail "
+              "FROM work_links WHERE work_id = ? AND artifact_key = ?",
+              (new_wid, cur_now, work_id, akey),
+          )
+          self._detach_link(conn, work_id, akey, cur_now)
+          # ob-wbdraft-* stays paired with work_id's reply_draft metadata
+          conn.execute(
+              "UPDATE obligations SET work_id = ? "
+              "WHERE work_id = ? AND target_artifact_key = ? "
+              "AND obligation_id NOT LIKE 'ob-wbdraft-%'",
+              (new_wid, work_id, akey),
+          )
+        self._log_event(
+            conn,
+            "work_split",
+            work_id=new_wid,
+            artifact_key=bk,
+            payload={"from_work_id": work_id, "artifact_keys": keys},
+            now=cur_now,
+        )
+    except BaseException:
+      with self._lock, self._connect() as conn:
+        conn.execute("DELETE FROM works WHERE work_id = ?", (new_wid,))
+      raise
+    self.reconcile_correspondence_obligations(work_id, now=cur_now)
+    self.reconcile_correspondence_obligations(new_wid, now=cur_now)
+    return new_wid
+
   def find_work_by_artifact(
       self, artifact_key: str, roles: tuple[str, ...] = ("primary", "channel")
   ) -> str | None:
@@ -4168,45 +4431,13 @@ class WorkStore:
     cur_now = time.time() if now is None else now
     akey = canonicalize_artifact_key(artifact_key)
     with self._lock, self._connect() as conn:
-      conn.execute(
-          "DELETE FROM work_links WHERE work_id = ? AND artifact_key = ?",
-          (work_id, akey),
-      )
-      # Clear stale reply_draft thread bindings when detaching the bound email thread
-      w_row = conn.execute(
-          "SELECT meta_json FROM works WHERE work_id = ?", (work_id,)
-      ).fetchone()
-      if w_row:
-        try:
-          w_meta = json.loads(w_row["meta_json"] or "{}")
-        except Exception:
-          w_meta = {}
-        rd = w_meta.get("reply_draft")
-        if isinstance(rd, Mapping) and str(rd.get("thread_key") or "").strip() == akey:
-          rd_copy = dict(rd)
-          rd_copy["thread_key"] = ""
-          w_meta["reply_draft"] = rd_copy
-          conn.execute(
-              "UPDATE works SET meta_json = ?, updated_at = ? WHERE work_id = ?",
-              (json.dumps(w_meta), cur_now, work_id),
-          )
-      conn.execute(
-          "UPDATE obligations SET target_artifact_key = '' "
-          "WHERE work_id = ? AND target_artifact_key = ? "
-          "AND obligation_id LIKE 'ob-wbdraft-%'",
-          (work_id, akey),
-      )
+      self._detach_link(conn, work_id, akey, cur_now)
       # Close correspondence umbrellas when their underlying channel is detached from the Work
       conn.execute(
           "UPDATE obligations SET status = 'done', satisfied_at = ? "
           "WHERE work_id = ? AND target_artifact_key = ? "
           "AND kind = 'correspondence' AND status IN ('open', 'ready')",
           (cur_now, work_id, akey),
-      )
-      conn.execute(
-          "INSERT OR REPLACE INTO negative_links (work_id, artifact_key, created_at) "
-          "VALUES (?, ?, ?)",
-          (work_id, akey, cur_now),
       )
       self._log_event(
           conn,
@@ -4217,6 +4448,44 @@ class WorkStore:
       )
     self.reconcile_correspondence_obligations(work_id, now=cur_now)
     self.evaluate_all_obligations(now=cur_now)
+
+  def _detach_link(
+      self, conn: sqlite3.Connection, work_id: str, akey: str, cur_now: float
+  ) -> None:
+    """Deletes the work_links row, unbinds reply-draft refs to akey, and tombstones it."""
+    conn.execute(
+        "DELETE FROM work_links WHERE work_id = ? AND artifact_key = ?",
+        (work_id, akey),
+    )
+    # Clear stale reply_draft thread bindings when detaching the bound email thread
+    w_row = conn.execute(
+        "SELECT meta_json FROM works WHERE work_id = ?", (work_id,)
+    ).fetchone()
+    if w_row:
+      try:
+        w_meta = json.loads(w_row["meta_json"] or "{}")
+      except Exception:
+        w_meta = {}
+      rd = w_meta.get("reply_draft")
+      if isinstance(rd, Mapping) and str(rd.get("thread_key") or "").strip() == akey:
+        rd_copy = dict(rd)
+        rd_copy["thread_key"] = ""
+        w_meta["reply_draft"] = rd_copy
+        conn.execute(
+            "UPDATE works SET meta_json = ?, updated_at = ? WHERE work_id = ?",
+            (json.dumps(w_meta), cur_now, work_id),
+        )
+    conn.execute(
+        "UPDATE obligations SET target_artifact_key = '' "
+        "WHERE work_id = ? AND target_artifact_key = ? "
+        "AND obligation_id LIKE 'ob-wbdraft-%'",
+        (work_id, akey),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO negative_links (work_id, artifact_key, created_at) "
+        "VALUES (?, ?, ?)",
+        (work_id, akey, cur_now),
+    )
 
   def get_work_artifact_keys(self, work_id: str) -> list[str]:
     with self._lock, self._connect() as conn:
@@ -7478,6 +7747,12 @@ class WorkStore:
               "url": str(s_art.get("url") or _default_artifact_url(s_key)),
               "link_reason": s_reason,
           })
+      member_keys = [
+          str(lk["artifact_key"]) for lk in w_links if str(lk.get("role") or "") != "context_only"
+      ]
+      card_hints = compute_work_hints(
+          w_arts, w_obs, w_owner, member_keys, activity_ts, cur_now, w.get("meta_json")
+      )
       cards.append({
           "work_id": wid,
           "title": resolved_title or str(w["title"]),
@@ -7506,6 +7781,7 @@ class WorkStore:
           "obligations": w_obs,
           "suggestions": card_suggestions,
           "suggestions_total": len(sug_by_w.get(wid) or []) if w_owner == "user" else 0,
+          "hints": card_hints,
       })
 
     # Persist upgraded titles back to SQLite so CLI and subsequent reads stay consistent
