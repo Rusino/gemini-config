@@ -451,6 +451,98 @@ def audit_commit_message(msg_text):
   return issues
 
 
+BUG_TRAILER_RE = re.compile(r"^(Bug|Fixed|BUG)\s*[:=]\s*(.*)$")
+COMMENTLINKS_CACHE_DIR = pathlib.Path("/tmp/audit_comments_commentlinks")
+
+
+def _gerrit_host_and_project(repo_path):
+  """Maps the repo's googlesource origin to its Gerrit review host and project, else None."""
+  res = subprocess.run(
+      ["git", "-C", str(repo_path), "remote", "get-url", "origin"],
+      capture_output=True, text=True, check=False,
+  )
+  m = re.match(r"^(?:https?|sso)://([\w-]+)\.googlesource\.com/(.+?)(?:\.git)?/?$",
+               res.stdout.strip())
+  if res.returncode != 0 or not m:
+    return None
+  host = m.group(1)
+  if not host.endswith("-review"):
+    host += "-review"
+  project = m.group(2)
+  # Authenticated remotes prefix the project with a/, which is not part of its name
+  if project.startswith("a/"):
+    project = project[2:]
+  return f"{host}.googlesource.com", project
+
+
+def _fetch_commentlinks(host, project):
+  """Returns compiled (regex, link) pairs from the Gerrit project config, cached for a day."""
+  import json  # pylint: disable=g-import-not-at-top
+  import time  # pylint: disable=g-import-not-at-top
+  import urllib.parse  # pylint: disable=g-import-not-at-top
+  import urllib.request  # pylint: disable=g-import-not-at-top
+  cache = COMMENTLINKS_CACHE_DIR / f"{host}_{project.replace('/', '_')}.json"
+  if cache.is_file() and time.time() - cache.stat().st_mtime < 86400:
+    raw = cache.read_text(encoding="utf-8")
+  else:
+    url = f"https://{host}/projects/{urllib.parse.quote(project, safe='')}/config"
+    body = urllib.request.urlopen(url, timeout=15).read().decode("utf-8")
+    raw = body[body.find("{"):]
+    COMMENTLINKS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache.write_text(raw, encoding="utf-8")
+  links = json.loads(raw).get("commentlinks") or {}
+  pairs = []
+  for cfg in links.values():
+    try:
+      pairs.append((re.compile(cfg["match"]), cfg.get("link", "")))
+    except (KeyError, re.error):
+      continue
+  return pairs
+
+
+def audit_bug_trailer_links(msg_text, repo_path):
+  """Checks that every ID in Bug:/Fixed: trailers becomes a Gerrit link.
+
+  Gerrit linkifies trailer IDs only through the project's commentlinks, so a token no regex
+  covers (e.g. a second `b/<id>` after a comma in Skia) renders as plain text or a wrong link.
+  Returns (issues, advisories); network or non-Gerrit repos yield one advisory and no issues.
+  """
+  hp = _gerrit_host_and_project(repo_path)
+  if not hp:
+    return [], []
+  try:
+    pairs = _fetch_commentlinks(*hp)
+  except Exception as exc:  # pylint: disable=broad-except
+    return [], [f"Bug: trailer link check skipped ({hp[0]} commentlinks unavailable: {exc})"]
+  issues = []
+  for idx, raw in enumerate(msg_text.splitlines(), start=1):
+    m = BUG_TRAILER_RE.match(raw)
+    if not m:
+      continue
+    covered = []
+    for rx, link in pairs:
+      for hit in rx.finditer(raw):
+        covered.append((hit.start(), hit.end(), hit, link))
+    value_start = m.start(2)
+    for tok in re.finditer(r"[^\s,]+", m.group(2)):
+      text = tok.group(0)
+      if text.lower() == "none" or text.startswith(("http://", "https://")):
+        continue
+      start, end = value_start + tok.start(), value_start + tok.end()
+      # A token counts as linked only if a commentlink match contains its digits
+      digits = re.search(r"\d+", text)
+      d_start = start + digits.start() if digits else start
+      d_end = start + digits.end() if digits else end
+      if not any(s <= d_start and d_end <= e for s, e, _, _ in covered):
+        issues.append((
+            f"L{idx}",
+            f"Bug: trailer token '{text}' is not linkified by {hp[0]} commentlinks; "
+            "use 'chromium:<id>' for issues.chromium.org bugs and a single 'b/<id>' "
+            f"right after 'Bug: ' only for the project's own tracker: '{raw.strip()}'",
+        ))
+  return issues, []
+
+
 def extract_commit_disclaimers(msg_text):
   # Collect multi-line paragraph disclaimers (e.g. 'Not covered: ...') until the next blank/trailer
   disclaimers = []
@@ -705,6 +797,12 @@ def main():
         for span, msg in audit_commit_message(msg_text):
           print(f"[ISSUE] {args.commit_msg}:{span}: {msg}")
           total_issues += 1
+        link_issues, link_notes = audit_bug_trailer_links(msg_text, repo)
+        for span, msg in link_issues:
+          print(f"[ISSUE] {args.commit_msg}:{span}: {msg}")
+          total_issues += 1
+        for note in link_notes:
+          print(f"[ADVISORY] {note}")
         for span, text in extract_commit_disclaimers(msg_text):
           disclaimers.append((args.commit_msg, span, text))
 
@@ -755,6 +853,12 @@ def main():
         for span, msg in audit_commit_message(head_msg):
           print(f"[ISSUE] HEAD commit-msg:{span}: {msg}")
           total_issues += 1
+        link_issues, link_notes = audit_bug_trailer_links(head_msg, repo)
+        for span, msg in link_issues:
+          print(f"[ISSUE] HEAD commit-msg:{span}: {msg}")
+          total_issues += 1
+        for note in link_notes:
+          print(f"[ADVISORY] {note}")
         for span, text in extract_commit_disclaimers(head_msg):
           disclaimers.append(("HEAD commit-msg", span, text))
 
