@@ -16148,6 +16148,14 @@ function itemKeyOf(it) {
   return String(it.item_key || `${it.kind || 'gerrit'}:${it.target_id || ''}`);
 }
 
+// Stable reconciliation key per CL/PR entry, distinguishing multi-chat items via composite_key
+function clUnitKey(it) {
+  if (!it) return 'cl:';
+  if (it.composite_key) return `cl:${it.composite_key}`;
+  const base = itemKeyOf(it);
+  return it.conversation_id ? `cl:${base}@${it.conversation_id}` : `cl:${base}`;
+}
+
 // Resolves the topological root item key for a stacked CL/PR chain
 function resolveStackRootKey(it, byIkey) {
   if (!it) return '';
@@ -16471,7 +16479,8 @@ function stackSpineHtml(members) {
     const tip = `${clLabel(m)}: ${cleanSubject(m.subject)} (${info.short})`;
     return link(m.url, label, `spine-step ${info.tone}`, tip);
   });
-  return `<div class="stack-spine">${steps.join('<span class="spine-arrow">→</span>')}</div>`;
+  return `<div class="stack-spine" data-unit-key="stack-spine">` +
+    `${steps.join('<span class="spine-arrow">→</span>')}</div>`;
 }
 
 // Groups stacked changes in Needs You into a single container with a spine and collapsed siblings
@@ -16543,7 +16552,7 @@ function renderFocusSection(youItems, shownItems, data) {
     }
 
     const headHtml = `
-      <div class="stack-head">
+      <div class="stack-head" data-unit-key="stack-head">
         <div class="stack-head-top">
           <span class="stack-head-title">🔗 Stack (${total} ${kindPlural})</span>
           <span class="stack-head-meta">${project} · by ${author} · ${countsDesc}</span>
@@ -16578,7 +16587,7 @@ function renderFocusSection(youItems, shownItems, data) {
       const stackDetailsKey = `stack:${itemKeyOf(m)}`;
       const stackOpenAttr = openDetailsKeys.has(stackDetailsKey) ? ' open' : '';
       return `
-        <details class="stack-step-collapsed" ` +
+        <details class="stack-step-collapsed" data-unit-key="stack-step:${esc(clUnitKey(m))}" ` +
           `data-details-key="${esc(stackDetailsKey)}"${stackOpenAttr}>
           <summary>
             ${stepBadge}
@@ -16594,7 +16603,7 @@ function renderFocusSection(youItems, shownItems, data) {
     }).join('');
 
     htmlParts.push(`
-      <section class="stack-group">
+      <section class="stack-group" data-unit-key="stack:${esc(rootKey)}">
         ${headHtml}
         ${memberCards}
       </section>`);
@@ -16638,7 +16647,7 @@ function renderLaneItemsHtml(laneItems, data) {
     const kindPlural = (rootItem.kind === 'github' ? 'PR' : 'CL') + (total === 1 ? '' : 's');
 
     const headHtml = `
-      <div class="stack-lane-head">
+      <div class="stack-lane-head" data-unit-key="stack-lane-head">
         <b>🔗 Stack (${membersInLane.length} of ${total} ${kindPlural})</b> · ` +
         `${project} · by ${author}
       </div>
@@ -16646,7 +16655,7 @@ function renderLaneItemsHtml(laneItems, data) {
 
     const rows = membersInLane.map(m => rowHtml(m, data)).join('');
     htmlParts.push(`
-      <div class="stack-lane-group">
+      <div class="stack-lane-group" data-unit-key="stack-lane:${esc(rKey)}">
         ${headHtml}
         ${rows}
       </div>`);
@@ -18843,7 +18852,8 @@ function renderPingsSection(shownItems) {
       const subjLink = link(it.url, esc(cleanSubject(it.subject)), 'ping-subj');
       const whyHtml = `<div class="ping-why">${pingOwnershipAndActionText(p, it)}</div>`;
       return `
-        <div class="ping-row${x.included ? '' : ' excluded'}">
+        <div class="ping-row${x.included ? '' : ' excluded'}" ` +
+          `data-unit-key="ping-row:${esc(x.item_key)}">
           <input type="checkbox" ${x.included ? 'checked' : ''}
             onchange="togglePingItem(${revJson}, ${keyJson}, this.checked)">
           ${stackStepBadgeHtml(it)}${pingReasonBadgeHtml(p, it)}${offAtt}
@@ -18858,7 +18868,7 @@ function renderPingsSection(shownItems) {
     const copyDis = selectedCount === 0 ? ' disabled' : '';
     const btnLabel = `📋 Copy Chat ping (${selectedCount} CL${selectedCount === 1 ? '' : 's'})`;
     return `
-      <div class="ping-card">
+      <div class="ping-card" data-unit-key="ping:${esc(g.reviewer)}">
         <div class="ping-card-top">
           <span class="ping-who">${esc(g.reviewer_name)} (${esc(shortActor(g.reviewer))})</span>
           <span class="ping-counts">${esc(summaryParts.join(' · '))}</span>
@@ -18875,8 +18885,8 @@ function renderPingsSection(shownItems) {
   }).join('');
 
   return `
-    <section class="pings-wrap">
-      <div class="pings-head">
+    <section class="pings-wrap" data-unit-key="pings-wrap">
+      <div class="pings-head" data-unit-key="pings-head">
         <h3>Reviewer Pings</h3>
         <span class="n">${totalCls.size} CL${totalCls.size === 1 ? '' : 's'} · ` +
           `${groups.length} reviewer${groups.length === 1 ? '' : 's'}</span>
@@ -19044,9 +19054,11 @@ function formatMsgWhy(it) {
 }
 
 function focusCard(it, data) {
+  const uKey = esc(clUnitKey(it));
   const chatBtn = chatActionHtml(it, data, false);
   const busyBadge = it.chat_busy
-    ? '<span class="busy-pill"><i class="dot moving"></i>Chat is working</span> · '
+    ? '<span class="busy-pill" data-unit-key="busy-pill">' +
+      '<i class="dot moving"></i>Chat is working</span> · '
     : '';
   const subject = esc(cleanSubject(it.subject));
   const cardTitle = `${badgesHtml(it, {omitFixes: true})}${link(it.url, subject)}`;
@@ -19095,7 +19107,7 @@ function focusCard(it, data) {
       ? `${fixPrimary}<div class="why-context">${landed}${blame}</div>${adviceHtml}`
       : `${landed}${blame}${adviceHtml}`;
     return `
-    <article class="card alert">
+    <article class="card alert" data-unit-key="${uKey}">
       <div><div class="eyebrow">${busyBadge}${eyebrow} · ${esc(it.project_name)} ·
         ${link(it.url, clLabel(it))} · by ${authorHtml}</div>
         <h2>${cardTitle}</h2>
@@ -19211,7 +19223,7 @@ function focusCard(it, data) {
     ? 'You'
     : link(actorUrl(it, it.owner_email || it.owner_name), esc(authorLabel(it)));
   return `
-    <article class="card">
+    <article class="card" data-unit-key="${uKey}">
       <div><div class="eyebrow">${busyBadge}${verdictPill}${esc(it.project_name)} · ` +
         `${link(it.url, clLabel(it))} · PS${esc(it.patchset || 1)} · by ${authorHtml}</div>
         <h2>${cardTitle}</h2>
@@ -19285,7 +19297,7 @@ function rowHtml(it, data) {
     chatActionHtml(it, data, true),
   ].filter(Boolean).join(' · ');
   return `
-    <div class="row">
+    <div class="row" data-unit-key="${esc(clUnitKey(it))}">
       <div><div class="title">${badgesHtml(it)}${link(it.url, esc(cleanSubject(it.subject)))}</div>
         <div class="meta">${meta}</div>
         <!-- Surface fix-for linkage and broken bots on lane rows -->
@@ -19414,11 +19426,14 @@ function processingStripItemHtml(it, data, type) {
   const contentHtml = isBug ? bugFocusCard(it, data) : focusCard(it, data);
   const chatHtml = isBug ? bugChatActionHtml(it, data, true) : chatActionHtml(it, data, true);
   const chatSpan = chatHtml ? `<span class="stack-step-chat" onclick="event.stopPropagation()">· ${chatHtml}</span>` : '';
-  const procId = isBug ? (it.bug_key || it.issue_id || '') : itemKeyOf(it);
+  const procId = isBug
+    ? (it.bug_key || it.id || it.issue_id || '')
+    : (it.composite_key || itemKeyOf(it));
   const procKey = `proc:${procId}`;
+  const procUnitKey = isBug ? `proc:bug:${procId}` : `proc:${clUnitKey(it)}`;
   const procOpen = openDetailsKeys.has(procKey) ? ' open' : '';
   return `
-    <details class="stack-step-collapsed processing-item" ` +
+    <details class="stack-step-collapsed processing-item" data-unit-key="${esc(procUnitKey)}" ` +
       `data-details-key="${esc(procKey)}"${procOpen}>
       <summary>
         <span class="badge stack-step" style="background: var(--bg-hover);">⏳ Processing</span>
@@ -19608,7 +19623,8 @@ function securityMergeCard(grp) {
 
   const badgeBug = {priority: grp.priority || 'P1', severity: grp.severity || ''};
   const titleTxt = `[Merge ${grp.milestones_label || ''}] ${grp.parent_title || ''}`.trim();
-  return `<article class="card alert">` +
+  const mKey = esc('sec-merge:' + (grp.group_key || grp.parent_id || ''));
+  return `<article class="card alert" data-unit-key="${mKey}">` +
     `<div><div class="eyebrow">${esc(grp.project_name || 'Skia')} · ` +
     `Security merge request · Parent ${link(grp.parent_url, esc(parentShort))}` +
     `${reqLinks ? ` · ${reqLinks}` : ''}</div>` +
@@ -19675,7 +19691,8 @@ function groupedMergeFocusCard(siblings, parentId, data) {
     `onclick="ackBugs(${esc(JSON.stringify(bugKeys))}, this)">✓ Ack</button>`;
   const chatTarget = parentBug || first;
   const chatBtn = bugChatActionHtml(chatTarget, data, false);
-  return `<article class="card alert">` +
+  const gKey = esc('merge-group:' + (parentId || first.bug_key || first.id || ''));
+  return `<article class="card alert" data-unit-key="${gKey}">` +
     `<div><div class="eyebrow">Security merge request · ${esc(first.project_name || 'Skia')}` +
     `${parentChip} · ${childLinks}</div>` +
     `<h2>${bugPriorityBadgeHtml(first)}[${esc(msJoined)}] ${link(bulkUrl, esc(baseTitle))}</h2>` +
@@ -19712,7 +19729,9 @@ function groupedMergeLaneRowHtml(siblings, parentId, data) {
   ].filter(Boolean).join(' · ');
   const whenTxt = first.modified_et
     ? `${esc(first.modified_et)}${first.modified_age ? ` (${esc(first.modified_age)})` : ''}` : '';
-  return `<div class="row"><div><div class="title">${bugPriorityBadgeHtml(first)}` +
+  const gRowKey = esc('merge-row:' + (parentId || first.bug_key || first.id || ''));
+  return `<div class="row" data-unit-key="${gRowKey}">` +
+    `<div><div class="title">${bugPriorityBadgeHtml(first)}` +
     `[${esc(msJoined)}] ${link(bulkUrl, esc(baseTitle))}</div>` +
     `<div class="meta">${meta}</div></div>` +
     `<div class="state">${siblings.length} merge requests</div>` +
@@ -19728,7 +19747,8 @@ function bugFocusCard(bug, data) {
   const isAlert = Boolean(bug.is_overdue || bug.issue_type === 'VULNERABILITY' ||
     (bug.priority === 'P0' && !bug.is_collaborator));
   const busyBadge = bug.chat_busy
-    ? '<span class="busy-pill"><i class="dot moving"></i>Chat is working</span> · ' : '';
+    ? '<span class="busy-pill" data-unit-key="busy-pill">' +
+      '<i class="dot moving"></i>Chat is working</span> · ' : '';
   const ownerActor = (bug.assignee && bug.assignee !== 'N/A') ? shortActor(bug.assignee) : '';
   const collabTag = bug.is_collaborator
     ? ` · Collaborator${ownerActor ? ` (owner: ${esc(ownerActor)})` : ''}` : '';
@@ -19753,7 +19773,8 @@ function bugFocusCard(bug, data) {
         `👤 Assign to ${esc(bug.assign_target || 'me')}</button>`)
     : '';
   const openBtnCls = assignBtn ? 'btn secondary' : 'btn primary';
-  return `<article class="card${isAlert ? ' alert' : ''}">` +
+  const bKey = esc('bug:' + (bug.bug_key || bug.id || ''));
+  return `<article class="card${isAlert ? ' alert' : ''}" data-unit-key="${bKey}">` +
     `<div><div class="eyebrow">${busyBadge}${esc(bug.project_name || 'Skia')} · ` +
     `${link(bug.url, esc(bug.short_id || bug.bug_key))}${collabTag}${typeTag}</div>` +
     `<h2>${bugPriorityBadgeHtml(bug)}${link(bug.url, esc(bug.title))}</h2>` +
@@ -19802,13 +19823,16 @@ function bugRowHtml(bug, data) {
   const whenTxt = bug.modified_et
     ? `${esc(bug.modified_et)}${bug.modified_age ? ` (${esc(bug.modified_age)})` : ''}` : '';
   const subtasks = `${bugSubtasksHtml(bug, data)}${mergesBannerHtml(bug)}`;
-  return `<div class="row"><div><div class="title">${bugPriorityBadgeHtml(bug)}` +
+  const bKey = esc('bug:' + (bug.bug_key || bug.id || ''));
+  return `<div class="row" data-unit-key="${bKey}">` +
+    `<div><div class="title">${bugPriorityBadgeHtml(bug)}` +
     `${link(bug.url, esc(bug.title))}</div><div class="meta">${meta}</div>` +
     `${subtasks}</div><div class="state">${stateTxt}</div>` +
     `<div class="when">${whenTxt}</div></div>`;
 }
 
 function toggleSection(secId) {
+  disarmConfirmations();
   const v = selectedView === 'bugs' ? 'bugs' : 'cls';
   selectedSection[v] = selectedSection[v] === secId ? null : secId;
   try {
@@ -19829,8 +19853,8 @@ function laneSectionBodyHtml(title, count, hint, itemsHtml, secId = '') {
     ? `<button type="button" class="link-btn sec-close-btn" ` +
       `onclick="toggleSection(${esc(JSON.stringify(secId))})">Hide ✕</button>`
     : '';
-  return `<div class="lane-head"><h3>${title}</h3><span class="n">${count}</span>` +
-    `${hintHtml}${closeHtml}</div>${itemsHtml}`;
+  return `<div class="lane-head" data-unit-key="lane-head"><h3>${title}</h3>` +
+    `<span class="n">${count}</span>${hintHtml}${closeHtml}</div>${itemsHtml}`;
 }
 
 // Renders a single-select toolbar of non-empty secondary sections with 0 or 1 open panel
@@ -19843,7 +19867,7 @@ function renderSecondarySectionsHtml(view, sections) {
     const closeMark = isOn ? '<span class="sec-close" aria-hidden="true">✕</span>' : '';
     const titleAttr = isOn ? ' title="Click to hide section"' : '';
     return `<button type="button" class="sec-tab${isOn ? ' on' : ''}" ` +
-      `aria-expanded="${isOn ? 'true' : 'false'}"${titleAttr} ` +
+      `data-unit-key="tab:${esc(s.id)}" aria-expanded="${isOn ? 'true' : 'false'}"${titleAttr} ` +
       `onclick="toggleSection(${esc(JSON.stringify(s.id))})">` +
       `${s.title}<span class="n">${s.count}</span>${closeMark}</button>`;
   }).join('');
@@ -19851,28 +19875,32 @@ function renderSecondarySectionsHtml(view, sections) {
     const isOn = openId === s.id;
     const cls = isOn ? 'lane sec-panel open' : 'lane sec-panel';
     const hid = isOn ? '' : ' hidden';
-    return `<section class="${cls}" data-section="${esc(s.id)}"${hid}>${s.bodyHtml}</section>`;
+    return `<section class="${cls}" data-unit-key="sec:${esc(s.id)}" ` +
+      `data-section="${esc(s.id)}"${hid}>${s.bodyHtml}</section>`;
   }).join('');
-  return `<div class="sec-tabs" role="toolbar" aria-label="Secondary sections">${tabs}</div>` +
-    panels;
+  return `<div class="sec-tabs" data-unit-key="sec-tabs" role="toolbar" ` +
+    `aria-label="Secondary sections">${tabs}</div>${panels}`;
 }
 
-function renderProjectChips(items, projects) {
+function renderProjectChips(items, projects, forceMorph = false) {
   const projOf = it => it.project_name || 'Unassigned';
   const chip = (val, lbl, n) => `<button class="proj${selectedProject === val ? ' on' : ''}" ` +
-    `onclick="setProject(${esc(JSON.stringify(val))})">${esc(lbl)}` +
-    `<span class="n">${n}</span></button>`;
-  document.getElementById('projects').innerHTML = chip('ALL', 'All', items.length) +
+    `data-unit-key="proj:${esc(val)}" onclick="setProject(${esc(JSON.stringify(val))})">` +
+    `${esc(lbl)}<span class="n">${n}</span></button>`;
+  const html = chip('ALL', 'All', items.length) +
     projects.map(p => chip(p, p, items.filter(it => projOf(it) === p).length)).join('');
+  patchSlotHtml(document.getElementById('projects'), html, forceMorph);
 }
 
 function renderViewSwitchHtml(clNeedYou, clTotal, bugNeedYou, bugTotal) {
   const badge = (need, tot) => need > 0
     ? `<span class="v-you">● ${need}</span>` : `<span class="v-count">${tot}</span>`;
-  return `<button class="view-tab${selectedView === 'cls' ? ' on' : ''}" role="tab" ` +
-    `onclick="setView('cls')">CLs ${badge(clNeedYou, clTotal)}</button>` +
-    `<button class="view-tab${selectedView === 'bugs' ? ' on' : ''}" role="tab" ` +
-    `onclick="setView('bugs')">Bugs ${badge(bugNeedYou, bugTotal)}</button>`;
+  return `<button class="view-tab${selectedView === 'cls' ? ' on' : ''}" ` +
+    `data-unit-key="view:cls" role="tab" onclick="setView('cls')">` +
+    `CLs ${badge(clNeedYou, clTotal)}</button>` +
+    `<button class="view-tab${selectedView === 'bugs' ? ' on' : ''}" ` +
+    `data-unit-key="view:bugs" role="tab" onclick="setView('bugs')">` +
+    `Bugs ${badge(bugNeedYou, bugTotal)}</button>`;
 }
 
 function syncLocationHash() {
@@ -19889,6 +19917,7 @@ function syncLocationHash() {
 }
 
 function setView(v) {
+  disarmConfirmations();
   selectedView = v === 'bugs' ? 'bugs' : 'cls';
   try {
     if (typeof localStorage !== 'undefined') localStorage.setItem('flight_deck_view', selectedView);
@@ -19929,6 +19958,7 @@ function projectsOf(items) {
 }
 
 function setProject(p) {
+  disarmConfirmations();
   selectedProject = p;
   try {
     if (typeof localStorage !== 'undefined') localStorage.setItem('flight_deck_project', p);
@@ -19994,9 +20024,10 @@ function persistScrollPosition(y) {
   writeClientStorage(SCROLL_Y_STORAGE_KEY, String(cleanY), false);
 }
 
-// Excludes transient _stack links and unused multi-hundred-KB item blobs from JSON snapshots
+// Strips _stack links, updated_at sync stamps (keeping quiet polls zero-DOM no-ops), and blobs
 function stripTransientStatusFields(k, v) {
   return k.startsWith('_stack') ||
+    k === 'updated_at' ||
     k === 'commit_message' ||
     k === 'revision_ps_by_sha' ||
     k === 'gmail'
@@ -20035,11 +20066,12 @@ function reloadDashboardPage() {
   return true;
 }
 
-// Restores either live in-page scrollY or one-shot boot scrollY after innerHTML replacement
+// Restores boot scrollY once when at top, and re-applies savedScrollY on stub innerHTML fallbacks
 function applyRenderScrollPosition(savedScrollY) {
+  const isBootRestore = !(savedScrollY > 0) && pendingBootScrollY > 0;
   const targetY = savedScrollY > 0 ? savedScrollY : pendingBootScrollY;
   pendingBootScrollY = 0;
-  restoreScrollPosition(targetY);
+  if (isBootRestore || domMorphSupported === false) restoreScrollPosition(targetY);
   persistScrollPosition(targetY);
 }
 
@@ -20129,14 +20161,316 @@ function hasActiveConfirmation() {
   return false;
 }
 
-function render() {
+let domMorphSupported = null;
+let lastSlotHtml = new WeakMap();
+let lastNodeHtml = new WeakMap();
+let lastInputDefault = new WeakMap();
+
+function resetDomReconcilerCache() {
+  domMorphSupported = null;
+  lastSlotHtml = new WeakMap();
+  lastNodeHtml = new WeakMap();
+  lastInputDefault = new WeakMap();
+}
+
+function setTextIfChanged(el, nextText) {
+  if (!el) return;
+  const s = String(nextText ?? '');
+  if (el.textContent !== s) el.textContent = s;
+}
+
+function unitKeyOfNode(el) {
+  return (el && el.nodeType === 1 && typeof el.getAttribute === 'function')
+    ? (el.getAttribute('data-unit-key') || '')
+    : '';
+}
+
+function isWhitespaceTextNode(n) {
+  return Boolean(n && n.nodeType === 3 && !/[^\s]/.test(n.nodeValue || ''));
+}
+
+function nextNonWhitespaceCursor(node) {
+  let cur = node;
+  while (isWhitespaceTextNode(cur)) cur = cur.nextSibling;
+  return cur;
+}
+
+function hasNonWhitespaceTextChild(el) {
+  const nodes = (el && el.childNodes) || [];
+  for (let i = 0; i < nodes.length; i++) {
+    if (nodes[i].nodeType === 3 && /[^\s]/.test(nodes[i].nodeValue || '')) return true;
+  }
+  return false;
+}
+
+// Probes real or mini-DOM tree support once so stub Node test harnesses fall back to innerHTML
+function canMorphContainer(el) {
+  if (!el) return false;
+  if (typeof el.insertBefore !== 'function' || typeof el.removeChild !== 'function') {
+    domMorphSupported = false;
+    return false;
+  }
+  if (domMorphSupported !== null) return domMorphSupported;
+  if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
+    domMorphSupported = false;
+    return false;
+  }
+  try {
+    const probe = document.createElement('div');
+    probe.innerHTML = '<i data-p="1">x</i>';
+    const ch = probe.firstChild;
+    domMorphSupported = Boolean(
+      ch && ch.nodeType === 1 && typeof ch.getAttribute === 'function' &&
+      ch.getAttribute('data-p') === '1'
+    );
+  } catch (e) {
+    domMorphSupported = false;
+  }
+  return domMorphSupported;
+}
+
+function isArmedConfirmSubtree(node) {
+  if (!node || node.nodeType !== 1) return false;
+  if (typeof node.getAttribute === 'function' && node.getAttribute('data-confirming') === '1') {
+    return true;
+  }
+  return typeof node.querySelector === 'function' &&
+    Boolean(node.querySelector('[data-confirming="1"]'));
+}
+
+// Records initial server-rendered input defaults and keyed outerHTML on newly mounted subtrees
+function seedSubtreeDefaults(node) {
+  if (!node || node.nodeType !== 1) return;
+  const tag = String(node.tagName || '').toUpperCase();
+  if (tag === 'TEXTAREA') {
+    const defVal = typeof node.value === 'string' ? node.value : String(node.textContent || '');
+    lastInputDefault.set(node, defVal);
+  } else if (tag === 'INPUT' && node.type !== 'checkbox' && node.type !== 'button') {
+    lastInputDefault.set(node, String(node.getAttribute('value') || ''));
+  }
+  const uKey = unitKeyOfNode(node);
+  if (uKey && typeof node.outerHTML === 'string') {
+    lastNodeHtml.set(node, node.outerHTML);
+  }
+  const kids = node.children || [];
+  for (let i = 0; i < kids.length; i++) {
+    seedSubtreeDefaults(kids[i]);
+  }
+}
+
+// Syncs changed attributes without touching unchanged classes so CSS animations keep running
+function morphAttributes(liveEl, targetEl) {
+  // Keep user-toggled <details data-details-key> state governed by openDetailsKeys, not HTML
+  const attrs = liveEl.attributes || [];
+  for (let i = attrs.length - 1; i >= 0; i--) {
+    const name = attrs[i].name;
+    if (name === 'open' && liveEl.hasAttribute('data-details-key')) continue;
+    if (!targetEl.hasAttribute(name)) liveEl.removeAttribute(name);
+  }
+  const nextAttrs = targetEl.attributes || [];
+  for (let i = 0; i < nextAttrs.length; i++) {
+    const {name, value} = nextAttrs[i];
+    if (name === 'open' && liveEl.hasAttribute('data-details-key')) continue;
+    if (liveEl.getAttribute(name) !== value) liveEl.setAttribute(name, value);
+  }
+  if (liveEl.tagName === 'DETAILS' && liveEl.hasAttribute('data-details-key')) {
+    const wantOpen = openDetailsKeys.has(liveEl.getAttribute('data-details-key'));
+    if (Boolean(liveEl.open) !== wantOpen) liveEl.open = wantOpen;
+  }
+  if (liveEl.tagName === 'INPUT' && liveEl.type === 'checkbox') {
+    const wantChecked = targetEl.hasAttribute('checked');
+    if (Boolean(liveEl.checked) !== wantChecked) liveEl.checked = wantChecked;
+  }
+  if ('disabled' in liveEl) {
+    const wantDisabled = targetEl.hasAttribute('disabled');
+    if (Boolean(liveEl.disabled) !== wantDisabled) liveEl.disabled = wantDisabled;
+  }
+}
+
+function canMorphPair(a, b) {
+  if (!a || !b || a.nodeType !== b.nodeType) return false;
+  if (a.nodeType === 3 || a.nodeType === 8) return true;
+  if (a.nodeType === 1) {
+    return a.tagName === b.tagName && unitKeyOfNode(a) === unitKeyOfNode(b);
+  }
+  return false;
+}
+
+// Clears armed 2-click confirmations before explicit view, project, or section navigation
+function disarmConfirmations() {
+  for (const btn of [...confirmingButtons]) {
+    if (!btn) continue;
+    delete btn.dataset.confirming;
+    if (btn.classList) btn.classList.remove('danger');
+    if (btn.dataset && btn.dataset.origLabel) btn.textContent = btn.dataset.origLabel;
+  }
+  confirmingButtons.clear();
+  if (typeof document !== 'undefined' && typeof document.querySelectorAll === 'function') {
+    for (const el of document.querySelectorAll('[data-confirming="1"]')) {
+      if (typeof el.removeAttribute === 'function') el.removeAttribute('data-confirming');
+    }
+  }
+}
+
+// Reconciles keyed card/section lists in place so surviving items shift without teardown
+function reconcileKeyedChildren(parent, targetParent, forceMorph) {
+  if (hasNonWhitespaceTextChild(targetParent)) return false;
+  const targetEls = Array.from(targetParent.children || []);
+  if (!targetEls.length) return false;
+  const targetKeys = new Set();
+  for (let i = 0; i < targetEls.length; i++) {
+    const k = unitKeyOfNode(targetEls[i]);
+    if (!k || targetKeys.has(k)) return false;
+    targetKeys.add(k);
+  }
+  const liveByKey = new Map();
+  const initialNodes = Array.from(parent.childNodes || []);
+  for (let i = 0; i < initialNodes.length; i++) {
+    const n = initialNodes[i];
+    if (isWhitespaceTextNode(n)) continue;
+    const k = unitKeyOfNode(n);
+    if (!k || !targetKeys.has(k) || liveByKey.has(k)) {
+      parent.removeChild(n);
+    } else {
+      liveByKey.set(k, n);
+    }
+  }
+  // Skip inter-element whitespace text nodes so matching cards are not spuriously re-inserted
+  let cursor = nextNonWhitespaceCursor(parent.firstChild);
+  for (let i = 0; i < targetEls.length; i++) {
+    const targetEl = targetEls[i];
+    const k = unitKeyOfNode(targetEl);
+    const live = liveByKey.get(k);
+    if (!live) {
+      parent.insertBefore(targetEl, cursor);
+      seedSubtreeDefaults(targetEl);
+      continue;
+    }
+    if (live !== cursor) {
+      parent.insertBefore(live, cursor);
+    } else {
+      cursor = nextNonWhitespaceCursor(cursor ? cursor.nextSibling : null);
+    }
+    const nextOuter = typeof targetEl.outerHTML === 'string' ? targetEl.outerHTML : '';
+    if (forceMorph || !nextOuter || lastNodeHtml.get(live) !== nextOuter) {
+      if (morphElement(live, targetEl, forceMorph) && nextOuter) {
+        lastNodeHtml.set(live, nextOuter);
+      }
+    }
+  }
+  return true;
+}
+
+// Morphs mixed inline text and element children with 1-step lookahead for badge insertions
+function morphChildNodes(liveParent, targetParent, forceMorph) {
+  const targetNodes = Array.from(targetParent.childNodes || []);
+  let liveCur = liveParent.firstChild;
+  let ti = 0;
+  while (liveCur && ti < targetNodes.length) {
+    const targetNode = targetNodes[ti];
+    if (canMorphPair(liveCur, targetNode)) {
+      const nextLive = liveCur.nextSibling;
+      if (liveCur.nodeType === 1) {
+        morphElement(liveCur, targetNode, forceMorph);
+      } else if (liveCur.nodeValue !== targetNode.nodeValue) {
+        liveCur.nodeValue = targetNode.nodeValue;
+      }
+      liveCur = nextLive;
+      ti += 1;
+      continue;
+    }
+    if (ti + 1 < targetNodes.length && canMorphPair(liveCur, targetNodes[ti + 1])) {
+      liveParent.insertBefore(targetNode, liveCur);
+      seedSubtreeDefaults(targetNode);
+      ti += 1;
+      continue;
+    }
+    if (liveCur.nextSibling && canMorphPair(liveCur.nextSibling, targetNode)) {
+      const nextLive = liveCur.nextSibling;
+      liveParent.removeChild(liveCur);
+      liveCur = nextLive;
+      continue;
+    }
+    const nextLive = liveCur.nextSibling;
+    liveParent.replaceChild(targetNode, liveCur);
+    seedSubtreeDefaults(targetNode);
+    liveCur = nextLive;
+    ti += 1;
+  }
+  while (ti < targetNodes.length) {
+    const n = targetNodes[ti++];
+    liveParent.appendChild(n);
+    seedSubtreeDefaults(n);
+  }
+  while (liveCur) {
+    const nextLive = liveCur.nextSibling;
+    liveParent.removeChild(liveCur);
+    liveCur = nextLive;
+  }
+  return true;
+}
+
+function morphElement(liveEl, targetEl, forceMorph = false) {
+  morphAttributes(liveEl, targetEl);
+  const tag = String(liveEl.tagName || '').toUpperCase();
+  const isTextInput = tag === 'TEXTAREA' ||
+    (tag === 'INPUT' && liveEl.type !== 'checkbox' && liveEl.type !== 'button');
+  if (isTextInput) {
+    // Overwrite live .value only when unfocused and still at the previous server default
+    const nextDef = tag === 'TEXTAREA'
+      ? (typeof targetEl.value === 'string' ? targetEl.value : String(targetEl.textContent || ''))
+      : String(targetEl.getAttribute('value') || '');
+    const prevDef = lastInputDefault.get(liveEl);
+    const active = typeof document !== 'undefined' && document.activeElement === liveEl;
+    if (prevDef !== undefined && nextDef !== prevDef && liveEl.value === prevDef) {
+      if (active) {
+        pendingDeferredRender = true;
+        return false;
+      }
+      liveEl.value = nextDef;
+    }
+    lastInputDefault.set(liveEl, nextDef);
+    return true;
+  }
+  if (reconcileKeyedChildren(liveEl, targetEl, forceMorph)) return true;
+  return morphChildNodes(liveEl, targetEl, forceMorph);
+}
+
+// Reconciles a dashboard slot container, skipping untouched slots and preserving live subtrees
+function patchSlotHtml(el, html, forceMorph = false) {
+  if (!el) return;
+  const next = String(html ?? '');
+  if (!canMorphContainer(el)) {
+    if (forceMorph || el.innerHTML !== next) el.innerHTML = next;
+    return;
+  }
+  if (isArmedConfirmSubtree(el)) {
+    pendingDeferredRender = true;
+    return;
+  }
+  if (!forceMorph && lastSlotHtml.get(el) === next && (next === '' || el.firstChild)) {
+    return;
+  }
+  if (!next.trim()) {
+    while (el.firstChild) el.removeChild(el.firstChild);
+    lastSlotHtml.set(el, next);
+    return;
+  }
+  const temp = document.createElement('div');
+  temp.innerHTML = next;
+  let ok = reconcileKeyedChildren(el, temp, forceMorph);
+  if (!ok) ok = morphChildNodes(el, temp, forceMorph);
+  if (ok && !pendingDeferredRender) lastSlotHtml.set(el, next);
+}
+
+function render(forceMorph = false) {
   const data = cachedData;
   if (!data) return;
   syncOpenDetailsFromDom();
   const savedScrollY = captureScrollPosition();
   lastRenderedDataSig = statusRenderSignature(data);
   pendingDeferredRender = false;
-  confirmingButtons.clear();
+  if (domMorphSupported === false) confirmingButtons.clear();
   let all = visibleItemsFromData(data)
     .sort((a, b) => (b.activity_ts || 0) - (a.activity_ts || 0));
   buildStackContext(all);
@@ -20165,26 +20499,34 @@ function render() {
   const bugNeedCount = groupNeedYouBugUnits(bugYouAll.filter(b => !b.chat_busy)).length;
   const viewSwitchEl = document.getElementById('view-switch');
   if (viewSwitchEl) {
-    viewSwitchEl.innerHTML = renderViewSwitchHtml(
-      clNeedCount, projFilteredCls.length, bugNeedCount, projFilteredBugs.length
+    patchSlotHtml(
+      viewSwitchEl,
+      renderViewSwitchHtml(
+        clNeedCount, projFilteredCls.length, bugNeedCount, projFilteredBugs.length
+      ),
+      forceMorph,
     );
   }
 
   const r = data.rollers_summary || {};
-  document.getElementById('rollers').innerHTML = PRODUCTS.map(p => {
+  const rollersHtml = PRODUCTS.map(p => {
     const x = r[p] || {};
     const tip = `${p}: ${x.badge || ''} · ${x.num_behind ?? '?'} commits behind`;
     return link(x.url, `<i class="dot ${x.num_failed ? 'moving' : 'ok'}"></i>` +
       `<span class="name">${p}</span>`, '', tip);
   }).join('') + (data.gardener_url ? link(data.gardener_url, 'Gardener') : '');
+  patchSlotHtml(document.getElementById('rollers'), rollersHtml, forceMorph);
   // Keep Loading… indicator visible while showing warm-cached DOM before live fetch resolves
-  document.getElementById('synced').textContent = hasLiveStatus
-    ? (data.last_sync || '')
-    : (data.last_sync ? `Loading… · ${data.last_sync}` : 'Loading…');
+  setTextIfChanged(
+    document.getElementById('synced'),
+    hasLiveStatus
+      ? (data.last_sync || '')
+      : (data.last_sync ? `Loading… · ${data.last_sync}` : 'Loading…'),
+  );
 
   // Render the Bugs tab with its own project chips, Needs You focus cards, and lanes
   if (selectedView === 'bugs') {
-    renderProjectChips(allBugs, bugProjects);
+    renderProjectChips(allBugs, bugProjects, forceMorph);
     const shownBugs = allBugs.filter(
       b => selectedProject === 'ALL' || projOf(b) === selectedProject
     );
@@ -20199,17 +20541,27 @@ function render() {
     const busyYouBugs = byBug.you.filter(b => b.chat_busy);
     const needYouUnits = groupNeedYouBugUnits(needYouBugs);
     const needBugs = needYouUnits.length;
-    document.getElementById('headline').innerHTML = headlineHtml(
-      needBugs, selectedProject, busyBugs
+    patchSlotHtml(
+      document.getElementById('headline'),
+      headlineHtml(needBugs, selectedProject, busyBugs),
+      forceMorph,
     );
     // Secondary bug counts now appear on the .sec-tabs pills below #focus
-    document.getElementById('subline').textContent = '';
-    document.getElementById('focus').innerHTML = needYouUnits.map(u =>
-      u.kind === 'merge_group'
-        ? groupedMergeFocusCard(u.bugs, u.parentId, data)
-        : bugFocusCard(u.bug, data)
-    ).join('');
-    document.getElementById('processing').innerHTML = busyYouBugs.map(b => processingStripItemHtml(b, data, 'bug')).join('');
+    setTextIfChanged(document.getElementById('subline'), '');
+    patchSlotHtml(
+      document.getElementById('focus'),
+      needYouUnits.map(u =>
+        u.kind === 'merge_group'
+          ? groupedMergeFocusCard(u.bugs, u.parentId, data)
+          : bugFocusCard(u.bug, data)
+      ).join(''),
+      forceMorph,
+    );
+    patchSlotHtml(
+      document.getElementById('processing'),
+      busyYouBugs.map(b => processingStripItemHtml(b, data, 'bug')).join(''),
+      forceMorph,
+    );
 
     const bugSections = [];
     for (const l of BUG_LANES) {
@@ -20280,24 +20632,30 @@ function render() {
     // Surface upstream bug fetcher errors directly above the Bugs tab lanes
     const bugErrBanner = Array.isArray(data.bug_sync_errors) && data.bug_sync_errors.length
       ? data.bug_sync_errors.filter(Boolean).map(
-          e => '<div class="stack-blocker-banner"><b>⚠️ Bug sync warning:</b> ' +
-            `<span>${esc(e)}</span></div>`
+          (e, idx) => `<div class="stack-blocker-banner" data-unit-key="bug-err:${idx}">` +
+            `<b>⚠️ Bug sync warning:</b> <span>${esc(e)}</span></div>`
         ).join('')
       : '';
-    document.getElementById('lanes').innerHTML = bugErrBanner + (bugSections.length
+    const bugLanesHtml = bugErrBanner + (bugSections.length
       ? renderSecondarySectionsHtml('bugs', bugSections)
-      : (shownBugs.length ? '' : '<p class="empty-note">No tracked bugs in this project.</p>'));
+      : (shownBugs.length
+          ? ''
+          : '<p class="empty-note" data-unit-key="empty-note">' +
+            'No tracked bugs in this project.</p>'));
+    patchSlotHtml(document.getElementById('lanes'), bugLanesHtml, forceMorph);
     const projCount = bugProjects.length;
     // Match BUG_SYNC_TTL_SEC (120s) in the Bugs tab status footer
-    document.getElementById('footer').textContent =
-      `${allBugs.length} tracked bugs across ${projCount} projects · refreshes every 2 min`;
+    setTextIfChanged(
+      document.getElementById('footer'),
+      `${allBugs.length} tracked bugs across ${projCount} projects · refreshes every 2 min`,
+    );
     applyRenderScrollPosition(savedScrollY);
     // Bugs view returns early before CL lanes, so emit rendered heartbeat here as well
     notifyParentRendered(data);
     return;
   }
 
-  renderProjectChips(all, projects);
+  renderProjectChips(all, projects, forceMorph);
 
   const shown = all.filter(it => selectedProject === 'ALL' || projOf(it) === selectedProject);
   const by = {you: [], landing: [], desk: [], waiting: [], watching: [], done: []};
@@ -20323,12 +20681,24 @@ function render() {
   const needYouItems = by.you.filter(it => !it.chat_busy);
   const busyYouItems = by.you.filter(it => it.chat_busy);
   const needYou = needYouItems.length;
-  document.getElementById('headline').innerHTML = headlineHtml(needYou, selectedProject, busyYou);
+  patchSlotHtml(
+    document.getElementById('headline'),
+    headlineHtml(needYou, selectedProject, busyYou),
+    forceMorph,
+  );
   // Secondary lane counts now appear on the .sec-tabs pills below #focus
-  document.getElementById('subline').textContent = '';
+  setTextIfChanged(document.getElementById('subline'), '');
 
-  document.getElementById('focus').innerHTML = renderFocusSection(needYouItems, shown, data);
-  document.getElementById('processing').innerHTML = busyYouItems.map(it => processingStripItemHtml(it, data, 'cl')).join('');
+  patchSlotHtml(
+    document.getElementById('focus'),
+    renderFocusSection(needYouItems, shown, data),
+    forceMorph,
+  );
+  patchSlotHtml(
+    document.getElementById('processing'),
+    busyYouItems.map(it => processingStripItemHtml(it, data, 'cl')).join(''),
+    forceMorph,
+  );
 
   const clSections = [];
   const pingGroups = collectReviewerPingGroups(shown);
@@ -20358,11 +20728,17 @@ function render() {
       ),
     });
   }
-  document.getElementById('lanes').innerHTML = clSections.length
+  const clLanesHtml = clSections.length
     ? renderSecondarySectionsHtml('cls', clSections)
-    : (shown.length ? '' : '<p class="empty-note">No open CL or PR chats in this project.</p>');
-  document.getElementById('footer').textContent =
-    `${all.length} open CL and PR chats across ${projects.length} projects · refreshes every 60 s`;
+    : (shown.length
+        ? ''
+        : '<p class="empty-note" data-unit-key="empty-note">' +
+          'No open CL or PR chats in this project.</p>');
+  patchSlotHtml(document.getElementById('lanes'), clLanesHtml, forceMorph);
+  setTextIfChanged(
+    document.getElementById('footer'),
+    `${all.length} open CL and PR chats across ${projects.length} projects · refreshes every 60 s`,
+  );
   applyRenderScrollPosition(savedScrollY);
   notifyParentRendered(data);
 }
@@ -20414,7 +20790,7 @@ async function fetchState(forceRender = false) {
     // Defer destructive DOM replacement while a 2-click confirmation button is armed
     if (cachedData && hasActiveConfirmation()) {
       cachedData = nextData;
-      if (syncedEl) syncedEl.textContent = (nextData && nextData.last_sync) || '';
+      setTextIfChanged(syncedEl, (nextData && nextData.last_sync) || '');
       if (mustRender || nextSig !== lastRenderedDataSig) pendingDeferredRender = true;
       notifyParentRendered(cachedData);
       return;
@@ -20422,12 +20798,12 @@ async function fetchState(forceRender = false) {
     // Skip redundant DOM rebuilds when status content is identical to the rendered view
     if (!mustRender && cachedData && lastRenderedDataSig && nextSig === lastRenderedDataSig) {
       cachedData = nextData;
-      if (syncedEl) syncedEl.textContent = (nextData && nextData.last_sync) || '';
+      setTextIfChanged(syncedEl, (nextData && nextData.last_sync) || '');
       notifyParentRendered(cachedData);
       return;
     }
     cachedData = nextData;
-    render();
+    render(mustRender);
   } catch (e) {
     document.getElementById('synced').textContent = 'Connection lost, retrying';
     // Retry faster than the 60s poll until the first live /api/status response succeeds
@@ -20875,6 +21251,7 @@ async function triggerRefresh() {
 }
 
 function boot() {
+  resetDomReconcilerCache();
   hasLiveStatus = false;
   cachedUiVersion = null;
   cachedData = null;
