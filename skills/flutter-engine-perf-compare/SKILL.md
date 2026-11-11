@@ -143,9 +143,10 @@ bash $S/remote_build_push.sh --checkout $CO --sha <40-hex skia sha> --mode nolto
 - It checks the master first and exits 0 at once if the remote `bin/<point>/.complete` exists,
   so check `python3 $S/perf_remote.py has <point>` and reuse other agents' points instead of
   building again. A local `perf_stage/<point>` with the same sha is pushed without a rebuild.
-- `--mode`: `nolto` (gn `--no-lto`), `lto` (Full LTO, what Flutter ships on Linux) or `thinlto`
-  (gn LTO with `-flto` patched to `-flto=thin` in `build/config/compiler/BUILD.gn` for the
-  build only). Out dir `out/perf_<mode>`. One build at a time per checkout (flock); patched
+- `--mode`: `nolto` (gn `--no-lto`, macOS/Windows desktop), `lto` (Full LTO, Android/iOS and
+  the `standalone/linux_benchmarks.json` dashboard builder) or `thinlto` (Linux desktop since
+  flutter#196314; gn `--thin-lto` when the checkout has it, else `-flto` patched to
+  `-flto=thin` in `build/config/compiler/BUILD.gn` for the build only). Out dir `out/perf_<mode>`. One build at a time per checkout (flock); patched
   files and the Skia checkout are restored on exit, and it refuses to start over local edits.
 - The push uploads into `bin/<point>.tmp`, checks `SHA256SUMS`, links the fixture path baked
   into the binary to `txt_fonts`, renames the dir to `bin/<point>` and touches `.complete` last.

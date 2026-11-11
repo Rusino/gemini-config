@@ -130,14 +130,19 @@ else
     } >> "$TXT/BUILD.gn"
   fi
 
-  # Flutter's gn has only --lto/--no-lto; ThinLTO is the same -flto switch with =thin
-  if [ "$MODE" = thinlto ]; then
-    sed -i 's/"-flto"/"-flto=thin"/' "$CFG"
-    grep -q '"-flto=thin"' "$CFG" || { log "THINLTO_PATCH_FAIL $CFG"; exit 1; }
-  fi
   OD=out/perf_$MODE
   GNFLAG=""
   [ "$MODE" = nolto ] && GNFLAG=--no-lto
+  # Checkouts after flutter#196314 have gn --thin-lto; older ones only --lto/--no-lto, so
+  # ThinLTO there is the same -flto switch patched to =thin
+  if [ "$MODE" = thinlto ]; then
+    if grep -q -- "'--thin-lto'" flutter/tools/gn; then
+      GNFLAG=--thin-lto
+    else
+      sed -i 's/"-flto"/"-flto=thin"/' "$CFG"
+      grep -q '"-flto=thin"' "$CFG" || { log "THINLTO_PATCH_FAIL $CFG"; exit 1; }
+    fi
+  fi
 
   # Generates OD if needed and builds TARGETS in it; returns ninja's status
   build() {

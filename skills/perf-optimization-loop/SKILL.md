@@ -139,7 +139,8 @@ Remote Measure Workflow" of
 - Screen and bisect with `--mode nolto` (or `thinlto`) builds first: relinking
   `txt_benchmarks` took 3.8 s (no LTO) and 5.2 s (ThinLTO) against 63 s (Full LTO) on the
   Cloudtop, and they show code costs that Full LTO inlining can hide.
-- Confirm the final culprit in both `nolto` and `lto` (Full LTO, the mode Flutter ships):
-  the sign of a step can flip between modes, so a no-LTO result alone is not a verdict.
+- Confirm the final culprit in `nolto`, `thinlto` and `lto`, each matching shipped Flutter:
+  Full LTO on Android/iOS, ThinLTO on Linux desktop (flutter#196314), no LTO on macOS and
+  Windows desktop. The sign of a step can flip between modes, so one mode is not a verdict.
 - Staged points are named `<sha10>_<mode>` and shared by all agents and subagents: run
   `perf_remote.py has <point>` before building, and reuse a point that has `.complete`.
