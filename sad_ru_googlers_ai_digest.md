@@ -455,7 +455,7 @@
   - При запуске `Fable 5.2` вместе с инструментом `swarm` на длинной аналитической задаче сессия проработала около часа, израсходовала ~70% квоты и оборвалась с жесткой ошибкой API: `INVALID_ARGUMENT (code 400): invalid_request_error: messages.1.content.0: Invalid signature in thinking block. The block is bound to a different conversation. Remove the block, or set thinking.block_binding.prefix_mismatch_behavior to "drop_block" ... The system prompt and the tools list both differ from when this block was created` (требует заголовка `anthropic-beta: thinking-binding-controls-2026-08-01`).
   - Leonid Lyakhovitskiy подтвердил воспроизведение и откат на `5.1`, а Aleksandr Chuklin отметил массовый характер проблемы.
   - По соотношению полезности и расхода квоты Sergey Zaika выделил `Opus 5.5 high` как наиболее сбалансированную рабочую модель.
-- **Вердикт полезности**: `🟢 Кандидат на внедрение`.
+- **Вердикт полезности**: `⚪ Отложено при разборе`.
 - **Предложение по интеграции**:
   - Учесть ограничение криптографической привязки `thinking`-блока к паре `(system prompt, tools list)` в открытом эпике мультимодельных дебатов `R94` (`Epic: Multi-Model Code Debate & XFAMILY Verification`) и в [`SKILL.md`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/debate/SKILL.md): при оркестрации `swarm` никогда не вызывать `fork:"<member>"` в воркеры на `Fable 5.2` / Claude с extended thinking, если у воркера отличается системный промпт или набор инструментов (запускать чистых воркеров с передачей контекста через доску сообщений), и до исправления `thinking-binding-controls` на бэкенде предпочитать `opus-5.5-high` вместо `Fable 5.2` в длинных `swarm`-сессиях.
 
@@ -501,7 +501,7 @@
     1. **Cover-to-Vote Coupling**: строгий запрет подстроки `lgtm` в тексте cover-сообщения при удержании `CR+1` (чтобы ревьюер или автор не приняли вежливую формулировку за аппрув).
     2. **Silent-in-Review vs. Strict-in-Authoring**: жесткое соблюдение собственных стандартов оформления коммит-сообщений (`Test:`, отказ от `OMIT_IF_EMPTY`) при полном молчании о них в чужих CL, если нет содержательных дефектов.
     3. **Pre-AI Voice Cutoff & Held-Out 7-gram Backtest**: срез обучающего корпуса строго до апреля 2026 года (с фильтрацией агентских маркеров `TAG=agy`) и отложенная выборка из 60 CL с проверкой нулевого дословного 7-граммного пересечения ([`/google/src/files/head/depot/configs/users/msw/_agents/plugins/msw-digital-twin/training/backtest/heldout_overlap.py`](file:///google/src/files/head/depot/configs/users/msw/_agents/plugins/msw-digital-twin/training/backtest/heldout_overlap.py)).
-- **Вердикт полезности**: `🟢 Кандидат на внедрение` (правила `Cover-to-Vote Coupling` и `Silent-in-Review vs. Strict-in-Authoring` для наших скиллов ревью) + `⚪ Не нужно (YAGNI)` (веб-сайдбар Gerrit и `skydeck_triggers`).
+- **Вердикт полезности**: `⚪ Отложено при разборе` (правила `Cover-to-Vote Coupling` и `Silent-in-Review vs. Strict-in-Authoring` для наших скиллов ревью) + `⚪ Не нужно (YAGNI)` (веб-сайдбар Gerrit и `skydeck_triggers`).
 - **Предложение по интеграции**:
   - Добавить в открытый эпик ревью-триажа `R38` (`Epic: Review-Triage & Gerrit Best Practices`, файлы [`SKILL.md`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/review-triage/SKILL.md) и [`gerrit_draft.py`](file:///usr/local/google/home/jlavrova/.gemini/config/scripts/gerrit_draft.py)) проверку **Cover-to-Vote Coupling** (блокировать подстроку `lgtm` в верхнеуровневых черновиках обложки ревью, когда триаж классифицирует CL как `🟠 PUSHBACK` или находит блокирующие дефекты в `🔴 SURGICAL AUDIT`) и правило **Silent-in-Review vs. Strict-in-Authoring** (не делать замечаний внешним авторам по формату блока `Tested:` или локальным конвенциям наших собственных коммитов). Методику held-out 7-gram валидации и `Pre-AI Cutoff` сохранить как референс для замороженной задачи `R33` ([`SKILL.md`](file:///usr/local/google/home/jlavrova/.gemini/config/skills/veteran-review/SKILL.md)).
 
@@ -519,7 +519,7 @@
 - **Суть проблемы и решения**:
   - При вызове `jetski-cli` из внешнего скрипта исключительно для разрешения merge-конфликта на одной ветке агент достает из долговременной памяти имена остальных веток стека и самовольно ребейзит весь стек дальше.
   - Tim Dresser решает это монтированием метаданных VCS (`.git`) в режим `read-only` внутри песочницы `bwrap`; аналогично в обновленном `AGENTS.md` у Russ Hamilton метаданные ворктри `.git/worktrees/` закрыты от записи из песочницы, а удаление `.git/index.lock` через `rm` запрещено.
-- **Вердикт полезности**: `🟢 Кандидат на внедрение`.
+- **Вердикт полезности**: `🟢 Взято в роадмап: R128.1`.
 - **Предложение по интеграции**:
   - Дополнить открытую задачу `R128` (`Add sandboxed scratch-Python runner scripts/bwrap_python3.py`): поверх `rw`-монтирования не-CitC воркспейса по умолчанию накладывать `--ro-bind` на `<workspace>/.git` (и целевой `gitdir` связанного ворктри `.git/worktrees/<name>`), чтобы ни один вспомогательный Python-скрипт не мог переключать ветки, двигать рефы, трогать чужие ветки стека или удалять `index.lock`.
 
