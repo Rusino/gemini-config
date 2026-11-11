@@ -300,6 +300,159 @@ class DebateCoreTest(unittest.TestCase):
     self.assertIsNotNone(rev_phase.revisions["B"])
     self.assertTrue(dc.all_unchanged(rev_phase, 2))
 
+  # Verifies hidden debate cascades get a valid [HH:MM] lifecycle title so context_guard
+  # never injects [TITLE GUARD] shell instructions into non-interactive arms
+  def test_ls_runner_sets_valid_lifecycle_title_on_hidden_cascade(self) -> None:
+    runner = dlr.LsDebateRunner(
+        question="Q?",
+        arms=[{"id": "gemini-4-carbon-high", "displayName": "Gemini 4 Carbon", "enum": "E1"}],
+        scribe={"id": "s1", "displayName": "S1", "enum": "ES"},
+    )
+    calls: list[tuple[str, dict]] = []
+
+    def fake_rpc(method: str, body: dict) -> dict:
+      calls.append((method, body))
+      if method == "StartCascade":
+        return {"cascadeId": "cid-b"}
+      return {}
+
+    with mock.patch.object(dlr.cl, "ls_rpc", side_effect=fake_rpc):
+      cid = runner._spawn_cascade(
+          "B", {"id": "gemini-4-carbon-high", "enum": "E1"}, {"type": "string"}
+      )
+    self.assertEqual(cid, "cid-b")
+    annot_calls = [b for m, b in calls if m == "UpdateConversationAnnotations"]
+    self.assertEqual(len(annot_calls), 1)
+    title = annot_calls[0]["annotations"]["title"]
+    self.assertTrue(dlr.cl.has_lifecycle_title_prefix(title), msg=title)
+    self.assertTrue(dlr.cl.is_valid_chat_topic(dlr.cl.clean_base_title(title)), msg=title)
+
+  # Verifies send_turn_and_wait fails fast with diagnostics instead of hanging until timeout
+  # when a hidden cascade stops IDLE with an error step and never calls finish
+  def test_ls_runner_fails_fast_when_cascade_goes_idle_with_error(self) -> None:
+    runner = dlr.LsDebateRunner(
+        question="Q?",
+        arms=[{"id": "m1", "displayName": "Gemini 4 Carbon", "enum": "E1"}],
+        scribe={"id": "s1", "displayName": "S1", "enum": "ES"},
+    )
+    runner.cascades["A"] = "cid-a0"
+    spawned = iter(["cid-a1", "cid-a2", "cid-a3"])
+    err_step = {
+        "type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+        "status": "CORTEX_STEP_STATUS_ERROR",
+        "errorMessage": {"message": "HTTP 400 Invalid signature in thinking block"},
+    }
+    seen_initial: set[str] = set()
+    injected_transient = False
+
+    def fake_rpc(method: str, body: dict) -> dict:
+      nonlocal injected_transient
+      if method == "StartCascade":
+        return {"cascadeId": next(spawned)}
+      if method == "GetCascadeTrajectory":
+        if not injected_transient:
+          injected_transient = True
+          raise RuntimeError("LS HTTP 503 transient")
+        return {"status": "CASCADE_RUN_STATUS_IDLE"}
+      if method == "GetCascadeTrajectorySteps":
+        cid = body["cascadeId"]
+        if cid not in seen_initial and cid == "cid-a0":
+          seen_initial.add(cid)
+          return {"steps": []}
+        return {"steps": [err_step]}
+      return {}
+
+    with mock.patch.object(dlr.cl, "ls_rpc", side_effect=fake_rpc), mock.patch.object(
+        dlr.time, "sleep"
+    ):
+      with self.assertRaises(RuntimeError) as ctx:
+        runner.send_turn_and_wait(
+            "A",
+            {"id": "m1", "displayName": "Gemini 4 Carbon", "enum": "E1"},
+            "Prompt",
+            {"type": "string"},
+            timeout_sec=0.3,
+        )
+    self.assertIn("IDLE", str(ctx.exception))
+    self.assertIn("Invalid signature", str(ctx.exception))
+
+  # Verifies Claude/Fable arms spawn a fresh cascade seeded with prior_context on Turn 2+
+  # (including validation repair retries) and forbid intermediate tool calls before finish
+  def test_ls_runner_claude_turn2_uses_fresh_seeded_cascade_and_single_step(self) -> None:
+    claude_arm = {"id": "fable-5.2-high", "displayName": "Claude Fable 5.2", "enum": "EC"}
+    gemini_arm = {"id": "gemini-4-carbon-high", "displayName": "Gemini 4 Carbon", "enum": "EG"}
+    runner = dlr.LsDebateRunner(
+        question="Must preserve zero allocations on hot path?",
+        arms=[claude_arm, gemini_arm],
+        scribe={"id": "s1", "displayName": "S1", "enum": "ES"},
+    )
+    runner.cascades = {"A": "cid-a1", "B": "cid-b1"}
+    runner.turn_counts = {"A": 1, "B": 1}
+    runner.record.base_answers = {
+        "A": "Claude base position on lookup tables.",
+        "B": "Gemini base position on lookup tables.",
+    }
+
+    spawn_seq = iter(["cid-a2", "cid-a3"])
+    deleted_cids: list[str] = []
+    sent_messages: list[tuple[str, str]] = []
+    valid_a_crit = '{"B": {"analysis": "Solid.", "attacks": []}}'
+    valid_b_crit = '{"A": {"analysis": "Clean.", "attacks": []}}'
+    payload_by_cid = {
+        "cid-a2": "broken non-json draft",
+        "cid-a3": valid_a_crit,
+        "cid-b1": valid_b_crit,
+    }
+    polled_pre: set[str] = set()
+
+    def fake_rpc(method: str, body: dict) -> dict:
+      if method == "DeleteCascadeTrajectory":
+        deleted_cids.append(body["cascadeId"])
+        return {}
+      if method == "StartCascade":
+        return {"cascadeId": next(spawn_seq)}
+      if method == "SendUserCascadeMessage":
+        sent_messages.append((body["cascadeId"], body["items"][0]["text"]))
+        return {}
+      if method == "GetCascadeTrajectorySteps":
+        cid = body["cascadeId"]
+        if cid in ("cid-a1", "cid-b1") and cid not in polled_pre:
+          polled_pre.add(cid)
+          return {"steps": []}
+        res_val = payload_by_cid.get(cid, valid_a_crit)
+        return {
+            "steps": [{
+                "status": "CORTEX_STEP_STATUS_DONE",
+                "metadata": {
+                    "toolCall": {
+                        "name": "finish",
+                        "argumentsJson": dlr.json.dumps({"result": res_val}),
+                    }
+                },
+            }]
+        }
+      return {}
+
+    with mock.patch.object(dlr.cl, "ls_rpc", side_effect=fake_rpc), mock.patch.object(
+        dlr.time, "sleep"
+    ):
+      crit_phase, _ = runner._run_critique_phase(1)
+
+    self.assertEqual(deleted_cids, ["cid-a1", "cid-a2"])
+    self.assertNotIn("cid-b1", deleted_cids)
+    msg_by_cid = dict(sent_messages)
+    self.assertIn("cid-a2", msg_by_cid)
+    self.assertIn("Must preserve zero allocations on hot path?", msg_by_cid["cid-a2"])
+    self.assertIn("Claude base position on lookup tables.", msg_by_cid["cid-a2"])
+    self.assertNotIn("You may use read-only inspection tools", msg_by_cid["cid-a2"])
+    self.assertIn("ONLY tool call", msg_by_cid["cid-a2"])
+    self.assertIn("cid-a3", msg_by_cid)
+    self.assertIn("Must preserve zero allocations on hot path?", msg_by_cid["cid-a3"])
+    self.assertIn("Claude base position on lookup tables.", msg_by_cid["cid-a3"])
+    self.assertIn("broken non-json draft", msg_by_cid["cid-a3"])
+    self.assertIn("You may use read-only inspection tools", msg_by_cid["cid-b1"])
+    self.assertEqual(crit_phase.critiques["A"].critiques["B"].analysis, "Solid.")
+
 
 if __name__ == "__main__":
   unittest.main()

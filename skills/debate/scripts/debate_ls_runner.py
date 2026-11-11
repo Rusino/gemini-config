@@ -103,6 +103,60 @@ def wrap_result_schema(schema: dict | None) -> str:
   return json.dumps(wrapper, separators=(",", ":"))
 
 
+DEFAULT_FINISH_SUFFIX = "\n\nWhen done, call the finish tool with your result."
+SINGLE_STEP_SUFFIX = (
+    "\n\nCRITICAL EXECUTION RULE: Do NOT call `read_file`, `run_command`, `grep_search`, "
+    "`find_by_name`, or ANY tool other than `finish`. Evaluate the text directly and call "
+    "the `finish` tool immediately as your VERY FIRST and ONLY tool call."
+)
+
+
+def needs_single_step_cascade(model_info: dict) -> bool:
+  """Returns True for Claude arms where stripped ephemeral steps break multi-step signatures."""
+  return (
+      detect_provider_family(model_info.get("displayName", ""), model_info.get("id", ""))
+      == "claude"
+  )
+
+
+def extract_step_outcome(
+    steps: list[dict],
+    from_step: int,
+    allow_plain_text: bool,
+) -> tuple[str | None, str | None, str | None]:
+  """Extracts (finish_fingerprint, fallback_plain_text, first_error) from steps[from_step:]."""
+  plain_texts: list[str] = []
+  errors: list[str] = []
+  for s in reversed(steps[from_step:]):
+    stype = s.get("type", "")
+    st = s.get("status", "")
+    meta = s.get("metadata") or {}
+    tool_call = meta.get("toolCall") or {}
+    if tool_call.get("name") == "finish" or stype == "CORTEX_STEP_TYPE_FINISH":
+      raw_args = tool_call.get("argumentsJson")
+      if not raw_args and isinstance(s.get("finish"), dict):
+        raw_args = json.dumps(s["finish"])
+      if st == "CORTEX_STEP_STATUS_DONE" and raw_args:
+        return f"{st}:{raw_args}", None, None
+    if stype == "CORTEX_STEP_TYPE_ERROR_MESSAGE" or st == "CORTEX_STEP_STATUS_ERROR":
+      err_payload = s.get("errorMessage") or s.get("error") or meta.get("error") or s
+      errors.append(json.dumps(err_payload)[:600])
+    if (
+        allow_plain_text
+        and stype == "CORTEX_STEP_TYPE_PLANNER_RESPONSE"
+        and st == "CORTEX_STEP_STATUS_DONE"
+    ):
+      pr = s.get("plannerResponse") or {}
+      resp_txt = (pr.get("response") or pr.get("modifiedResponse") or "").strip()
+      if len(resp_txt) >= 400:
+        plain_texts.append(resp_txt)
+  return (
+      None,
+      plain_texts[0] if plain_texts else None,
+      errors[0] if errors else None,
+  )
+
+
 def finish_cascade_config(wrapped_schema: str, model_enum: str, max_forced: int) -> dict:
   """Constructs turn CascadeConfig requiring finish with schema and forced budget."""
   return {
@@ -143,9 +197,9 @@ class LsDebateRunner:
     self.turn_counts: dict[str, int] = {}
 
   def _spawn_cascade(self, target_name: str, model_info: dict, initial_schema: dict | None) -> str:
-    """Spawns a hidden cascade for an arm or scribe with finish tool pre-mounted."""
+    """Spawns a hidden cascade for target_name with finish pre-mounted and a valid title."""
     project_id = os.environ.get("ANTIGRAVITY_PROJECT_ID", "")
-    wrapped = wrap_result_schema(initial_schema) if initial_schema else ""
+    wrapped = wrap_result_schema(initial_schema)
     body: dict = {
         "source": "CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT",
         "trajectoryType": "CORTEX_TRAJECTORY_TYPE_CASCADE",
@@ -174,16 +228,55 @@ class LsDebateRunner:
     if not cid:
       raise RuntimeError(f"StartCascade failed for {target_name}: {resp}")
     self.cascades[target_name] = cid
-    self.turn_counts[target_name] = 0
+    self.turn_counts.setdefault(target_name, 0)
+    # Format a valid [HH:MM] lifecycle topic so context_guard never injects [TITLE GUARD]
+    # shell instructions into non-interactive hidden debate cascades
+    clean_tag = "".join(ch for ch in target_name.lower() if ch.isalnum()) or "arm"
+    title = f"[{cl.get_current_time_str()}] {cl.MARKER_ACTIVE} Cross model debate {clean_tag}"
     cl.ls_rpc(
         "UpdateConversationAnnotations",
         {
             "cascadeIds": [cid],
-            "annotations": {"title": f"Debate {target_name} ({model_info.get('id', '')})"},
+            "annotations": {"title": title},
             "mergeAnnotations": True,
         },
     )
     return cid
+
+  def _replace_with_fresh_cascade(
+      self,
+      target_name: str,
+      model_info: dict,
+      prompt: str,
+      schema: dict | None,
+      repair_context: str = "",
+  ) -> tuple[str, str]:
+    """Deletes target_name's prior hidden cascade and spawns a fresh cascade with prior_context."""
+    old_cid = self.cascades.get(target_name)
+    if old_cid:
+      try:
+        cl.ls_rpc("DeleteCascadeTrajectory", {"cascadeId": old_cid})
+      except Exception:  # lint: allow-broad-except (Language Server RPC errors)
+        pass
+    new_cid = self._spawn_cascade(target_name, model_info, schema)
+    if target_name == "scribe":
+      return new_cid, prompt
+    prior_parts: list[str] = []
+    # Turn 2+ critique, revise, and repair prompts omit <question>; seed it when absent
+    if self.question and not prompt.lstrip().startswith("<question>"):
+      prior_parts.append(f"Debate question:\n{self.question}")
+    prior_ans = dc.get_current_answer(self.record, target_name)
+    if prior_ans:
+      prior_parts.append(
+          f"Your current answer as Participant {target_name} "
+          f"(for reference; follow the phase task below):\n\n{prior_ans}"
+      )
+    if repair_context.strip():
+      prior_parts.append(repair_context.strip())
+    if not prior_parts:
+      return new_cid, prompt
+    seeded = dc.frame("prior_context", "\n\n".join(prior_parts)) + "\n\n" + prompt
+    return new_cid, seeded
 
   def start_cascades(self) -> None:
     """Spawns hidden conversations for all participant arms."""
@@ -196,57 +289,127 @@ class LsDebateRunner:
       model_info: dict,
       prompt: str,
       schema: dict | None,
-      timeout_sec: int = 600,
+      timeout_sec: float = 600,
+      repair_context: str = "",
   ) -> str:
-    """Sends a turn with an enforced finish schema and waits until the agent calls finish."""
-    cid = self.cascades[target_name]
+    """Sends a turn with enforced finish schema and returns the validated result payload."""
     self.turn_counts[target_name] = self.turn_counts.get(target_name, 0) + 1
     turn_num = self.turn_counts[target_name]
+    single_step = needs_single_step_cascade(model_info)
 
-    # Record from_step before sending message so earlier turns never match
-    pre_resp = cl.ls_rpc("GetCascadeTrajectorySteps", {"cascadeId": cid})
-    pre_steps = (pre_resp.get("response") or {}).get("steps") or pre_resp.get("steps") or []
-    from_step = len(pre_steps)
+    # SDK strips hook EPHEMERAL_MESSAGE steps before Turn 2+, shifting Anthropic thinking
+    # block_binding signatures; replace Claude cascades on Turn 2+ with seeded prior_context
+    if single_step and turn_num > 1 and target_name != "scribe":
+      cid, send_prompt = self._replace_with_fresh_cascade(
+          target_name, model_info, prompt, schema, repair_context
+      )
+      from_step = 0
+    else:
+      cid = self.cascades[target_name]
+      pre_resp = cl.ls_rpc("GetCascadeTrajectorySteps", {"cascadeId": cid})
+      pre_steps = (pre_resp.get("response") or {}).get("steps") or pre_resp.get("steps") or []
+      from_step = len(pre_steps)
+      send_prompt = prompt
 
-    wrapped = wrap_result_schema(schema) if schema else ""
-    cfg = finish_cascade_config(wrapped, model_info.get("enum"), 3 * turn_num)
-    req: dict = {
-        "cascadeId": cid,
-        "items": [{"text": prompt + "\n\nWhen done, call the finish tool with your result."}],
-        "blocking": False,
-        "cascadeConfig": cfg,
-    }
+    wrapped = wrap_result_schema(schema)
+    max_forced = 4 if single_step else 3 * turn_num
+    cfg = finish_cascade_config(wrapped, model_info.get("enum"), max_forced)
+    suffix = SINGLE_STEP_SUFFIX if single_step else DEFAULT_FINISH_SUFFIX
+    cl.ls_rpc(
+        "SendUserCascadeMessage",
+        {
+            "cascadeId": cid,
+            "items": [{"text": send_prompt + suffix}],
+            "blocking": False,
+            "cascadeConfig": cfg,
+        },
+    )
+    return self._poll_for_finish(
+        cid=cid,
+        from_step=from_step,
+        target_name=target_name,
+        model_info=model_info,
+        prompt=prompt,
+        schema=schema,
+        cfg=cfg,
+        timeout_sec=timeout_sec,
+        repair_context=repair_context,
+    )
 
-    cl.ls_rpc("SendUserCascadeMessage", req)
-
-    # Poll for completion with two-fingerprint debounce
+  def _poll_for_finish(
+      self,
+      cid: str,
+      from_step: int,
+      target_name: str,
+      model_info: dict,
+      prompt: str,
+      schema: dict | None,
+      cfg: dict,
+      timeout_sec: float,
+      repair_context: str,
+  ) -> str:
+    """Polls trajectory steps until finish completes or fails fast on repeated IDLE errors."""
+    is_string_schema = schema == {"type": "string"}
     start_time = time.time()
     last_fp = ""
+    nudges = 0
+    idle_polls = 0
     while time.time() - start_time < timeout_sec:
       time.sleep(2.5)
+      # Scope broad exception handling strictly to polling RPCs so transient HTTP RuntimeErrors
+      # from cl.ls_rpc retry on the next tick without swallowing retry exhaustion errors below
       try:
+        tr = cl.ls_rpc("GetCascadeTrajectory", {"cascadeId": cid})
+        status = tr.get("status", "")
         r = cl.ls_rpc("GetCascadeTrajectorySteps", {"cascadeId": cid})
         steps = (r.get("response") or {}).get("steps") or r.get("steps") or []
-        done_step = None
-        for s in reversed(steps[from_step:]):
-          tool_call = (s.get("metadata") or {}).get("toolCall") or {}
-          if tool_call.get("name") == "finish":
-            done_step = s
-            break
-        # Wait strictly for the finish tool call enforced by requireFinishTool so
-        # intermediate status messages before tool/subagent steps are never captured
-        if done_step:
-          status = done_step.get("status")
-          raw_args = ((done_step.get("metadata") or {}).get("toolCall") or {}).get("argumentsJson")
-          if status == "CORTEX_STEP_STATUS_DONE" and raw_args:
-            cur_fp = f"{status}:{raw_args}"
-            if cur_fp == last_fp:
-              parsed_args = json.loads(raw_args)
-              res = parsed_args.get("result", parsed_args)
-              return json.dumps(res) if not isinstance(res, str) else res
-            last_fp = cur_fp
+        fp, plain_txt, err_txt = extract_step_outcome(steps, from_step, is_string_schema)
       except Exception:  # lint: allow-broad-except (Language Server RPC errors)
-        pass
+        continue
+
+      # Wait strictly for two matching DONE polls on finish so interim steps never leak
+      if fp:
+        if fp == last_fp:
+          _, raw_args = fp.split(":", 1)
+          parsed_args = json.loads(raw_args)
+          res = parsed_args.get("result", parsed_args)
+          return json.dumps(res) if not isinstance(res, str) else res
+        last_fp = fp
+        continue
+
+      # Require two consecutive IDLE polls so a finish step landing right as status flips
+      # is never misclassified as an aborted turn
+      if status != "CASCADE_RUN_STATUS_IDLE" or len(steps) <= from_step:
+        idle_polls = 0
+        continue
+
+      idle_polls += 1
+      if idle_polls < 2:
+        continue
+      if is_string_schema and plain_txt and nudges >= 1:
+        return plain_txt
+      if nudges >= 2:
+        raise RuntimeError(
+            f"Arm {target_name} ({model_info['id']}) went IDLE without calling finish "
+            f"after {nudges} retries; err={err_txt}"
+        )
+      nudges += 1
+      idle_polls = 0
+      last_fp = ""
+      time.sleep(4.0)
+      cid, seeded = self._replace_with_fresh_cascade(
+          target_name, model_info, prompt, schema, repair_context
+      )
+      from_step = 0
+      cl.ls_rpc(
+          "SendUserCascadeMessage",
+          {
+              "cascadeId": cid,
+              "items": [{"text": seeded + SINGLE_STEP_SUFFIX}],
+              "blocking": False,
+              "cascadeConfig": cfg,
+          },
+      )
 
     raise TimeoutError(f"Turn on {target_name} ({model_info['id']}) timed out after {timeout_sec}s")
 
@@ -282,14 +445,25 @@ class LsDebateRunner:
           if o.name != p.name
       ]
       peers_dict = dict(peers)
-      c_prompt = dc.build_critique_prompt(p.name, r_num, self.rounds, peers)
+      allow_tools = not needs_single_step_cascade(self.arms[idx])
+      c_prompt = dc.build_critique_prompt(
+          p.name, r_num, self.rounds, peers, allow_tools=allow_tools
+      )
       c_schema = dc.critique_schema([other_name for other_name, _ in peers])
       raw_str = self.send_turn_and_wait(p.name, self.arms[idx], c_prompt, c_schema)
       parsed, err = dc.parse_critique(raw_str, r_num, p.name, peers_dict)
       if err:
         print(f"Arm {p.name} critique error: {err}; retrying with repair")
         rep_prompt = dc.build_repair_prompt(r_num, "critique", 1, err)
-        raw_rep = self.send_turn_and_wait(p.name, self.arms[idx], rep_prompt, c_schema)
+        # Seed fresh repair cascades with the phase prompt and failed draft so single-step
+        # models can fix validation errors without losing valid sections
+        rep_ctx = (
+            f"Round {r_num} critique prompt:\n{c_prompt}\n\n"
+            f"Your previous invalid submission:\n{raw_str}"
+        )
+        raw_rep = self.send_turn_and_wait(
+            p.name, self.arms[idx], rep_prompt, c_schema, repair_context=rep_ctx
+        )
         parsed, err2 = dc.parse_critique(raw_rep, r_num, p.name, peers_dict)
         if err2 or parsed is None:
           parsed = dc.CritiqueReport(
@@ -331,7 +505,14 @@ class LsDebateRunner:
       if err:
         print(f"Arm {p.name} revise error: {err}; retrying with repair")
         rep_prompt = dc.build_repair_prompt(r_num, "revise", 1, err)
-        raw_rep = self.send_turn_and_wait(p.name, self.arms[idx], rep_prompt, r_schema)
+        # Include the round prompt and failed draft when repair spawns a fresh cascade
+        rep_ctx = (
+            f"Round {r_num} revise prompt:\n{r_prompt}\n\n"
+            f"Your previous invalid submission:\n{raw_str}"
+        )
+        raw_rep = self.send_turn_and_wait(
+            p.name, self.arms[idx], rep_prompt, r_schema, repair_context=rep_ctx
+        )
         parsed, err2 = dc.parse_revise(raw_rep, attacks_on_p)
         if err2 or parsed is None:
           parsed = dc.ReviseReport(

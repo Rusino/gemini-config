@@ -155,10 +155,19 @@ def build_critique_prompt(
     round_num: int,
     max_rounds: int,
     peers: list[tuple[str, str]],
+    allow_tools: bool = True,
 ) -> str:
-  """Builds the critique prompt forcing load-bearing attacks and allowing silence."""
+  """Builds the critique prompt for self_name over peers, optionally forbidding tool calls."""
   peer_blocks = [frame("peer", text, name=p_name) for p_name, text in peers]
   peers_joined = "\n\n".join(peer_blocks)
+  # Single-step models fail when stripped ephemeral steps shift thinking signatures across tools
+  tool_clause = (
+      "You may use read-only inspection tools to verify a fact if it decides "
+      "the point; do not write or modify files."
+      if allow_tools
+      else "Do not call inspection or shell tools; evaluate the provided question and peer "
+      "answers directly and report only via the finish tool."
+  )
   header = (
       f'<debate round="{round_num}" phase="critique">\n'
       f"You are Participant {self_name} in a structured debate among {len(peers) + 1} "
@@ -172,8 +181,7 @@ def build_critique_prompt(
       f"omissions: the load-bearing claim. At most {MAX_ATTACKS_PER_PEER} attacks per peer, "
       f"strongest first.\n"
       f"- Argue with evidence: name the specific code, specification, measurement, or behavior "
-      f"that contradicts it. You may use read-only inspection tools to verify a fact if it decides "
-      f"the point; do not write or modify files.\n"
+      f"that contradicts it. {tool_clause}\n"
       f"- If you find nothing material to attack in a peer's answer, give it no attacks. "
       f"Silence is a valid verdict; manufactured objections are not.\n\n"
       f"Report by calling the finish tool. The arguments have exactly one entry per peer, keyed by "

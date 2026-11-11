@@ -44,6 +44,29 @@ description: "When editing source code or tests, writing code comments, commit m
   produces (check the producer and sibling path first)
 - Root-cause fixes only: no special-case branch for the failing input; keep layout, hit-testing,
   caret, selection and rendering consistent
+- Lookup tables (`ES.28`, `SL.con.1`): in C++, build fixed lookup tables as `std::array<T, N>`:
+  `constexpr` when compile-time computable, otherwise a function-local `static const`
+  initialized once by a value-returning lambda (`static const auto kTable = [] {
+  std::array<T, N> a{}; ... return a; }();`, using `SkNoDestructor` only when `T` is not
+  trivially destructible) — never C arrays, `const T(*)[N]`, or mutable `static` init flags.
+  Do not mark owning locals `const` when returned or moved, or put top-level `const` on
+  by-value parameter declarations
+- Buffers and slices (`I.13`): across new internal C++ interfaces, pass contiguous buffers
+  and string slices by value as `SkSpan<const T>` (`SkSpan<T>` when mutated) and
+  `std::string_view` instead of `(ptr, count)` pairs, decaying C arrays, or
+  `const std::string&`; keep `(ptr, count)` only at C, CoreFoundation, CoreText, ICU, and
+  HarfBuzz call sites and in existing public or virtual signatures (`Frozen ABI`)
+- Resource handles (`R.1`): bind every owned C, CoreFoundation (`Create`/`Copy`), ICU,
+  FreeType, and HarfBuzz handle to its RAII owner on the line that acquires it (`sk_sp<T>`,
+  `SkUniqueCFRef<CFRef>` or `sk_cfp<CFRef>` for CF pointer typedefs, or
+  `std::unique_ptr<Pointee, SkFunctionObject<DestroyFn>>` where `Pointee` is the underlying
+  struct, not a pointer typedef); never pair manual release or destroy calls across early
+  returns
+- Values and flags (`F.16`, `F.20`, `I.4`, `Enum.3`): pass small trivially-copyable values
+  (`SkSpan`, `std::string_view`, scalars, ranges) by value, and return single values, small
+  structs, or `std::optional<T>` by value from new internal C++ functions; use `T*`
+  out-parameters (never non-const `T&`) only for reused hot-path buffers or existing Skia
+  APIs. Replace adjacent `bool` or raw `int` flags with `enum class` or named structs
 - Tests: no narrative comment before every assert; test domain edges, not C++ mechanics
 - Tests check behavior through the public API (`Paragraph`, `TextLine` visitors); internal state
   (`runs()`, `clusters()`, run counts) only with a why-comment when that structure is the
