@@ -51,6 +51,12 @@ SK_COND_RE = re.compile(r"^\s*#\s*if(?:def)?\b.*\bSK_\w+")
 NON_BACKEND_SK_MACRO_RE = re.compile(r"^SK_(?:DEBUG|RELEASE|SUPPORT_LEGACY_\w+)$")
 TEMPLATE_RE = re.compile(r"^\s*template\s*<(?!\s*>)")
 TEMPLATE_ANY_RE = re.compile(r"^\s*template\s*<")
+CALLABLE_TPARAM_RE = re.compile(
+    r"^(?:typename|class)(?:\s*\.\.\.\s*|\s+)"
+    r"(?:\w*(?:Callback|Visitor|Fn|Func|Function)s?|On[A-Z]\w*)$"
+)
+# A template heading a class/struct/union or alias stores its callable, unlike a function visitor
+TEMPLATE_TYPE_DECL_RE = re.compile(r"^\s*(?:class|struct|union|using)\b")
 DECL_QUALIFIER_RE = re.compile(
     r"^(?:(?:static|virtual|inline|constexpr|explicit|friend|extern|SK_API|\[\[nodiscard\]\])\s+)*"
 )
@@ -75,9 +81,8 @@ WHOLE_FILE_IFDEF_MSG = (
     "skunicode/skshaper), not by a whole-file #if"
 )
 TEMPLATE_NO_WHY_MSG = (
-    "TEMPLATE_NO_WHY: template with no comment above; a template needs a why-comment, and a "
-    "callback template a measured cost or a precedent over a plain function parameter "
-    "(std::function or function pointer; code_style.md)"
+    "TEMPLATE_NO_WHY: template with no comment above; header templates need a contract comment, "
+    "and non-callable templates in .cpp/.cc/.mm need a why-comment (code_style.md)"
 )
 FUNC_NO_CONTRACT_MSG = (
     "FUNC_NO_CONTRACT: new function '{name}' has no contract comment above it (what it does, "
@@ -131,6 +136,33 @@ def _skip_template_header(lines, idx):
   if idx > 0 and TEMPLATE_ANY_RE.match(lines[idx - 1]):
     return idx - 1
   return idx
+
+
+def _is_callable_only_template(line):
+  """Return True when every template parameter on line is a synchronous callable type parameter.
+
+  Accepts Callback/Visitor/Fn/Func/Function and OnXxx names (e.g. OnCodepoint, MapFn) so file-local
+  zero-allocation visitors in .cpp/.cc/.mm do not trigger TEMPLATE_NO_WHY.
+  """
+  start = line.find("<")
+  if start < 0:
+    return False
+  # Split top-level parameters on commas outside nested angle brackets
+  params, cur, depth = [], [], 0
+  for ch in line[start:]:
+    depth += {"<": 1, ">": -1}.get(ch, 0)
+    if depth == 0:
+      break
+    if ch == "," and depth == 1:
+      params.append("".join(cur))
+      cur = []
+    elif depth > 1 or ch != "<":
+      cur.append(ch)
+  else:
+    # Multi-line template heads stay conservative and keep TEMPLATE_NO_WHY
+    return False
+  params.append("".join(cur))
+  return all(CALLABLE_TPARAM_RE.match(p.split("=", 1)[0].strip()) for p in params)
 
 
 def _whole_file_ifdef(lines):
@@ -231,13 +263,20 @@ def audit_cpp_structure(rel_path, lines, added_lines, is_new_file):
     if cond:
       issues.append(("L1", WHOLE_FILE_IFDEF_MSG.format(cond=cond)))
 
+  is_header = rel_path.endswith((".h", ".hpp"))
   for ln in sorted(added_lines):
     idx = ln - 1
     if 0 <= idx < len(lines) and TEMPLATE_RE.match(lines[idx]):
+      # Synchronous visitor/callback templates in implementation files avoid std::function heap
+      # allocation without needing a per-helper why-comment; headers still require contracts
+      next_line = lines[idx + 1] if idx + 1 < len(lines) else ""
+      if (not is_header and _is_callable_only_template(lines[idx])
+          and not TEMPLATE_TYPE_DECL_RE.match(next_line)):
+        continue
       if not _has_comment_above(comment_lines, idx):
         issues.append((f"L{ln}", TEMPLATE_NO_WHY_MSG))
 
-  if not rel_path.endswith((".h", ".hpp")):
+  if not is_header:
     return issues
   # Track brace scopes so statements inside inline bodies never count as declarations
   scope_stack = []
@@ -726,7 +765,10 @@ def main():
         print(f"[ADVISORY {rel_path}:{span}] {msg}")
 
     if uncommented_hunks:
-      print("\n=== Uncommented Diff Hunks (Add a comment if the change is non-trivial, even 1 line) ===")
+      print(
+          "\n=== Uncommented Diff Hunks (advisory: comment non-obvious invariants, call order, "
+          "or API quirks; skip self-explanatory guards, renames, and pure phase extractions) ==="
+      )
       for rel_path, near_line, added_code, deleted_code in uncommented_hunks:
         parts = []
         if deleted_code:

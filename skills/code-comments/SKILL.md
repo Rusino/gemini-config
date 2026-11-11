@@ -15,7 +15,7 @@ Curate code comments so that every remaining or newly added comment earns its pl
 
 ### A. What to ADD (Including 1-Line Non-Trivial Changes)
 
-Even if a change touches **only a single line** (1 line added, modified, or deleted), if it is **non-trivial** (anything beyond a typo, formatting, or obvious dead variable cleanup), **you must add a comment** explaining why:
+Even if a change touches **only a single line** (1 line added, modified, or deleted), add a comment when it encodes a **non-obvious** invariant, call-order constraint, negative invariant, or API quirk. Skip self-explanatory guards, renames, and pure phase extractions (`rules/code_style.md` Comments):
 
 1. **Design Rationale ("Why this way")**
    Explain why a non-obvious algorithm, ordering, or data layout was chosen over the naive alternative.
@@ -78,8 +78,8 @@ python3 ~/.gemini/config/skills/code-comments/scripts/audit_comments.py <file1> 
 
 ### Step 2: Review Every Hunk & Existing Comment
 1. **Every diff hunk (even 1-line additions, modifications, or deletions)**:
-   - Is it trivial (typo, formatting, unused import, obvious rename)? If so, skip.
-   - Is it **non-trivial** (logic tweak, boundary condition `<` vs `<=`, removed call/reset, added guard, changed parameter)? **Add a 1–4 line comment** explaining the rationale or invariant. If the "why" is not clear from context, ask the user.
+   - Is it trivial or self-explanatory (typo, formatting, unused import, obvious rename, self-explanatory guard, pure phase extraction)? If so, skip.
+   - Does it encode a **non-obvious** invariant (logic tweak, boundary condition `<` vs `<=`, removed call/reset, guard for a non-obvious state, changed parameter)? **Add a 1–4 line comment** explaining the rationale or invariant. If the "why" is not clear from context, ask the user.
 2. **Existing comments in scope**:
    - **You remember adding it yourself in this session**: rewrite or delete it directly in the file to match the style contract.
    - **You did NOT add it (or do not remember adding it)**: **DO NOT touch it silently**. List it for the user and ask whether to rewrite/remove it.

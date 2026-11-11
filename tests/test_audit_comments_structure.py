@@ -148,6 +148,49 @@ class AuditCppStructureTest(unittest.TestCase):
     issues = audit_comments.audit_cpp_structure("src/Map.h", lines, added, True)
     self.assertEqual(_ids(issues), [("L3", "TEMPLATE_NO_WHY")])
 
+  # Callable visitor/callback templates in .cpp/.cc/.mm skip TEMPLATE_NO_WHY, while non-callable
+  # type templates in .cpp and all uncommented templates in headers still fire
+  def test_cpp_callable_templates_skip_why_but_type_and_header_templates_fire(self):
+    cpp = (
+        "template <typename Callback>\n"
+        "void forEachItem(Callback&& cb) { cb(1); }\n"
+        "template <class Visitor>\n"
+        "void visitRuns(Visitor&& v) { v(2); }\n"
+        "template <typename MapFn, typename OnCodepoint>\n"
+        "void mapCodepoints(MapFn&& m, OnCodepoint&& onCp) { onCp(m(3)); }\n"
+        "template <typename T>\n"
+        "T identity(T x) { return x; }\n"
+        "template <typename T, typename Callback>\n"
+        "void mixed(T x, Callback&& cb) { cb(x); }\n"
+    )
+    lines, added = _all(cpp)
+    for ext in (".cpp", ".cc", ".mm"):
+      issues = audit_comments.audit_cpp_structure(f"src/Helper{ext}", lines, added, False)
+      self.assertEqual(_ids(issues), [("L7", "TEMPLATE_NO_WHY"), ("L9", "TEMPLATE_NO_WHY")])
+
+    hdr_lines, hdr_added = _all("template <typename Callback>\nvoid forEachItem(Callback&& cb);\n")
+    hdr_issues = audit_comments.audit_cpp_structure("src/Helper.h", hdr_lines, hdr_added, False)
+    self.assertEqual(_ids(hdr_issues), [("L1", "TEMPLATE_NO_WHY"), ("L2", "FUNC_NO_CONTRACT")])
+
+  # clang-formatted variadic callable packs (`typename... Fns`) skip TEMPLATE_NO_WHY, while a class
+  # template holding a callable stores it and still needs a why-comment
+  def test_cpp_variadic_callable_packs_skip_but_class_templates_fire(self):
+    cpp = (
+        "template <class... Visitors>\n"
+        "void visitAll(Visitors&&... vs) {}\n"
+        "template <typename... Fns>\n"
+        "void callAll(Fns&&... fs) {}\n"
+        "template <typename Callback>\n"
+        "class Holder {\n"
+        "  Callback fCb;\n"
+        "};\n"
+        "template <typename OnDone>\n"
+        "struct Task;\n"
+    )
+    lines, added = _all(cpp)
+    issues = audit_comments.audit_cpp_structure("src/V.cpp", lines, added, False)
+    self.assertEqual(_ids(issues), [("L5", "TEMPLATE_NO_WHY"), ("L9", "TEMPLATE_NO_WHY")])
+
   # Test headers that name a contract ID or a bug pass; others get a non-blocking advisory, and
   # tests with no header are left to TEST_NO_HEADER
   def test_contract_or_bug_advisory(self):
@@ -228,6 +271,14 @@ class AuditCommentsCliTest(unittest.TestCase):
     res = self.run_audit("--diff", "HEAD")
     self.assertEqual(res.returncode, 0, res.stdout)
     self.assertIn("[ADVISORY tests/ATest.cpp:L2] TEST_NO_CONTRACT_OR_BUG", res.stdout)
+
+  # Uncommented diff hunks remain non-blocking and explicitly state the advisory skip list
+  def test_uncommented_hunks_banner_marks_section_advisory(self):
+    self.write("src/Clamp.cpp", "int clampPos(int x) {\n  if (x < 0) return 0;\n  return x;\n}\n")
+    res = self.run_audit("--diff", "HEAD")
+    self.assertEqual(res.returncode, 0, res.stdout)
+    self.assertIn("Uncommented Diff Hunks (advisory:", res.stdout)
+    self.assertIn("skip self-explanatory guards, renames, and pure phase extractions", res.stdout)
 
   # --commit reads a past commit without checkout, even after the tree moved on
   def test_commit_mode_reads_blobs_from_revision(self):
