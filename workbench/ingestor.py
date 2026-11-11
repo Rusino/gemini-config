@@ -2498,7 +2498,10 @@ def _ingest_single_gmail_draft(
         state=t_prov,
         now=cur_now,
     )
-    store.link_artifact(wid, t_key, role="channel", source="auto", now=cur_now)
+    # A draft is a reply on the thread, not a reason to demote a gmail_root primary thread;
+    # demoting it made the root pass flip channel <-> primary on every sync
+    if store.get_work_artifact_roles(wid).get(t_key) != "primary":
+      store.link_artifact(wid, t_key, role="channel", source="auto", now=cur_now)
 
   # Materialized Workbench reply drafts keep their own ob-wbdraft gate and never promote body refs
   if from_wb:

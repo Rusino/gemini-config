@@ -3848,6 +3848,18 @@ class WorkStore:
           and req_reason in ("", "chat_mention")
       ):
         effective_role = "context_only"
+      # A companion pinned primary via companion_wip is structural; collateral auto mentions
+      # (gmail_thread_ref etc.) must not demote it, or the companion repair re-promotes it
+      # silently on every sync and the demotion is logged as churn
+      if (
+          existing_link is not None
+          and prev_role == "primary"
+          and prev_reason == "companion_wip"
+          and effective_role == "context_only"
+          and source != "manual"
+          and req_reason != "companion_wip"
+      ):
+        return prev_role
       # Never let collateral mentions downgrade an established primary or channel link
       if (
           existing_link is not None
@@ -3900,16 +3912,23 @@ class WorkStore:
           "UPDATE works SET updated_at = ? WHERE work_id = ?",
           (cur_now, work_id),
       )
+      # link_added counts only new edges; rewrites of an existing edge are link_changed so churn
+      # and precision metrics do not mistake role/reason flips for new links
+      ev_payload: dict[str, Any] = {
+          "role": effective_role,
+          "source": source,
+          "link_reason": final_reason,
+      }
+      if existing_link is not None:
+        ev_payload.update(
+            {"prev_role": prev_role, "prev_source": prev_source, "prev_reason": prev_reason}
+        )
       self._log_event(
           conn,
-          "link_added",
+          "link_added" if existing_link is None else "link_changed",
           work_id=work_id,
           artifact_key=akey,
-          payload={
-              "role": effective_role,
-              "source": source,
-              "link_reason": final_reason,
-          },
+          payload=ev_payload,
           now=cur_now,
       )
       return effective_role
@@ -5691,6 +5710,7 @@ class WorkStore:
           "window_days": days,
           "work_minted": counts.get("work_minted", 0),
           "link_added": added,
+          "link_changed": counts.get("link_changed", 0),
           "link_detached": detached,
           "work_merged": counts.get("work_merged", 0),
           "work_split": counts.get("work_split", 0),
