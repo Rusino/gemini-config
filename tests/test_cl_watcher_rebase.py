@@ -748,6 +748,20 @@ console.log(JSON.stringify({
     self.assertEqual(sent["code"], 200)
     self.assertTrue(sent["payload"]["reused_tab"])
 
+    # Embedded iframe passes timeout_sec=0.0 so HTTP handler returns immediately without 1.8s poll
+    body_nb = json.dumps({"conversation_id": "c-456", "timeout_sec": 0.0}).encode("utf-8")
+    handler.headers = {"Content-Length": str(len(body_nb))}
+    handler.rfile = io.BytesIO(body_nb)
+    sent.clear()
+    with mock.patch.object(
+        w,
+        "open_chat_for_id",
+        return_value={"ok": True, "conversation_id": "c-456", "reused_tab": False},
+    ) as mock_open_nb:
+      handler.do_POST()
+    mock_open_nb.assert_called_once_with("c-456", timeout_sec=0.0)
+    self.assertEqual(sent["code"], 200)
+
     script_body = w.DASHBOARD_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
     harness = script_body.split("\nboot();", 1)[0] + """
 const item = {
@@ -759,8 +773,9 @@ const item = {
   let openedUrl = '';
   let openedTarget = '';
   global.window = {
-    open: (u, t) => { openedUrl = u; openedTarget = t; },
+    open: (u, t) => { openedUrl = u; openedTarget = t; return {}; },
   };
+  global.window.parent = global.window;
   global.setTimeout = (fn) => fn();
   global.fetch = async () => ({
     json: async () => ({ ok: true, reused_tab: true }),
@@ -774,10 +789,33 @@ const item = {
   global.fetch = async () => ({
     json: async () => ({ ok: true, reused_tab: false }),
   });
-  global.window.open = (u, t) => { fallbackOpenedUrl = u; };
+  global.window.open = (u, t) => { fallbackOpenedUrl = u; return {}; };
   const fallbackRes = await openChat('c-789', 'https://jetski.test/c/c-789', {
     preventDefault: () => {},
   });
+
+  // Popup blocker returning null after async await falls back to window.location.assign
+  let assignedUrl = '';
+  global.fetch = async () => ({
+    json: async () => ({
+      ok: true,
+      reused_tab: false,
+      chat_url: 'https://jetski.test/c/c-789-from-api',
+    }),
+  });
+  global.window.open = () => null;
+  global.window.location = { assign: (u) => { assignedUrl = u; } };
+  await openChat('c-789', '', { preventDefault: () => {} });
+
+  // Embedded iframe sends chatUrl in postMessage and passes timeout_sec=0.0 to /api/open_chat
+  const parentMsgs = [];
+  const embFetches = [];
+  global.window.parent = { postMessage: (m) => parentMsgs.push(m) };
+  global.fetch = async (u, opts) => {
+    embFetches.push({ url: u, body: JSON.parse(opts.body) });
+    return { json: async () => ({ ok: true }) };
+  };
+  await openChat('c-789', 'https://jetski.test/c/c-789', { preventDefault: () => {} });
 
   console.log(JSON.stringify({
     actionHtml: chatActionHtml(item, {jetski_box_url: 'https://jetski.test'}, false),
@@ -786,6 +824,9 @@ const item = {
     reusedBtnText: btn.textContent,
     openedUrl,
     fallbackOpenedUrl,
+    assignedUrl,
+    parentMsgs,
+    embFetches,
   }));
 })();
 """
@@ -801,6 +842,11 @@ const item = {
     self.assertFalse(out["reusedRes"])
     self.assertEqual(out["openedUrl"], "")
     self.assertEqual(out["fallbackOpenedUrl"], "https://jetski.test/c/c-789")
+    self.assertEqual(out["assignedUrl"], "https://jetski.test/c/c-789-from-api")
+    self.assertEqual(len(out["parentMsgs"]), 1)
+    self.assertEqual(out["parentMsgs"][0]["cascadeId"], "c-789")
+    self.assertEqual(out["parentMsgs"][0]["chatUrl"], "https://jetski.test/c/c-789")
+    self.assertEqual(out["embFetches"][0]["body"]["timeout_sec"], 0.0)
 
     # Verify 1.8s default timeout on both backend open_chat helpers
     import inspect

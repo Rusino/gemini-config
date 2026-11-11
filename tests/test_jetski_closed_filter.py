@@ -11927,6 +11927,344 @@ async function refreshCatalogInStore() {
     )
     self.assertIn("MORNING_MODEL_RESET_PASSED", res.stdout)
 
+  # Verifies cross-project ?project= sync, convoState split routing, /web/ prefix, Mac remote
+  # Cloudtop fallback, and archived predecessor redirect on Open chat (R92)
+  def test_open_chat_cross_project_convo_state_mac_remote_and_redirects(self) -> None:
+    node_bin = find_node_binary()
+    js_path = os.path.join(SCRIPTS_DIR, "jetski_closed_filter.js")
+    harness = r"""
+const fs = require('fs');
+const assert = require('assert');
+const code = fs.readFileSync(process.argv[1], 'utf8');
+
+class FakeElement {
+  constructor(tag) {
+    this.tagName = tag.toUpperCase();
+    this.children = [];
+    this.parentElement = null;
+    this.style = {};
+    this.attrs = new Map();
+    this.listeners = new Map();
+    this.textContent = '';
+    this.id = '';
+  }
+  get parentNode() { return this.parentElement; }
+  get nextSibling() { return null; }
+  setAttribute(k, v) {
+    this.attrs.set(k, String(v));
+    if (k === 'id') this.id = String(v);
+  }
+  getAttribute(k) { return this.attrs.has(k) ? this.attrs.get(k) : null; }
+  removeAttribute(k) { this.attrs.delete(k); }
+  appendChild(c) {
+    c.parentElement = this;
+    this.children.push(c);
+    return c;
+  }
+  insertBefore(c) { return this.appendChild(c); }
+  remove() {
+    if (!this.parentElement) return;
+    this.parentElement.children = this.parentElement.children.filter((x) => x !== this);
+    this.parentElement = null;
+  }
+  addEventListener(t, fn) {
+    if (!this.listeners.has(t)) this.listeners.set(t, []);
+    this.listeners.get(t).push(fn);
+  }
+  closest() { return null; }
+  querySelector(s) { return this.querySelectorAll(s)[0] || null; }
+  querySelectorAll(s) {
+    const out = [];
+    const visit = (n) => {
+      for (const c of n.children) {
+        if (typeof s === 'string') {
+          if (s.startsWith('#') && c.id === s.slice(1)) out.push(c);
+          else if (
+            s.includes('conversation-list-sidebar') &&
+            c.getAttribute('data-testid') === 'conversation-list-sidebar'
+          ) out.push(c);
+        }
+        visit(c);
+      }
+    };
+    visit(this);
+    return out;
+  }
+}
+
+const docEl = new FakeElement('html');
+const headEl = new FakeElement('head');
+const bodyEl = new FakeElement('body');
+docEl.appendChild(headEl);
+docEl.appendChild(bodyEl);
+
+const storeState = {
+  conversation: {
+    convoState: { type: 'subagent', parentConversationId: 'pane-b', childConversationId: 'sub-1' },
+  },
+  multiConvoLayout: {
+    focusedPaneId: 'p2',
+    rootNode: {
+      type: 'split',
+      id: 's1',
+      children: [
+        { type: 'pane', id: 'p1', cascadeId: 'pane-a' },
+        { type: 'pane', id: 'p2', cascadeId: 'pane-b' },
+      ],
+    },
+  },
+  trajectorySummaries: {
+    summaries: {
+      'chat-skp': {
+        cascadeId: 'chat-skp',
+        annotations: { title: '[13:56] Gerrit 1414546', archived: false },
+        trajectoryMetadata: { projectId: 'proj-skparagraph' },
+      },
+      'chat-standalone': {
+        cascadeId: 'chat-standalone',
+        annotations: { title: 'Standalone chat', archived: false },
+        trajectoryMetadata: { projectId: '' },
+      },
+      'chat-piece-1': {
+        cascadeId: 'chat-piece-1',
+        annotations: { title: '[08:25] Piece 1', archived: true },
+        trajectoryMetadata: { projectId: 'proj-skparagraph' },
+      },
+      'chat-archived-leaf': {
+        cascadeId: 'chat-archived-leaf',
+        annotations: { title: '[07:10] Archived standalone leaf', archived: true },
+        trajectoryMetadata: { projectId: 'proj-skparagraph' },
+      },
+    },
+    externalSummaries: {
+      'chat-ext-piece-0': {
+        cascadeId: 'chat-ext-piece-0',
+        annotations: { title: '[08:00] Piece 0', archived: true },
+        trajectoryMetadata: { projectId: 'proj-skparagraph' },
+      },
+    },
+  },
+  projects: { projects: [{ id: 'proj-skparagraph', archived: false }] },
+};
+
+const dispatched = [];
+const mockStore = {
+  getState: () => storeState,
+  dispatch: (a) => dispatched.push(a),
+  subscribe: () => () => {},
+};
+
+const vlistEl = new FakeElement('div');
+vlistEl.setAttribute('data-testid', 'conversation-list-sidebar');
+vlistEl['__reactFiber$test'] = { memoizedProps: { store: mockStore, items: [] } };
+bodyEl.appendChild(vlistEl);
+
+const fetchCalls = [];
+const openedPopups = [];
+let navigatedUrl = '';
+const storageMap = new Map([['jetski_visible_buckets_v1', JSON.stringify(['working'])]]);
+
+global.requestAnimationFrame = (cb) => cb();
+global.PopStateEvent = class { constructor(t) { this.type = t; } };
+global.window = {
+  __APP_CONFIG__: { csrfToken: 'csrf-r92' },
+  location: { pathname: '/c/pane-a+pane-b', search: '?project=proj-prev', hash: '' },
+  history: {
+    state: { __TSR_index: 1 },
+    pushState: (_st, _t, url) => {
+      navigatedUrl = url;
+      const qIdx = url.indexOf('?');
+      window.location.pathname = qIdx >= 0 ? url.slice(0, qIdx) : url;
+      window.location.search = qIdx >= 0 ? url.slice(qIdx) : '';
+    },
+    replaceState: (_st, _t, url) => { navigatedUrl = url; },
+  },
+  open: (u, target) => { openedPopups.push({ url: u, target }); return {}; },
+  fetch: async (url, opts) => {
+    fetchCalls.push({ url: String(url), body: opts?.body ? JSON.parse(opts.body) : null });
+    if (String(url).includes('jetski-chains.json')) {
+      return {
+        ok: true,
+        json: async () => ({
+          parentOf: { 'chat-skp': 'chat-piece-1', 'chat-piece-1': 'chat-ext-piece-0' },
+          createdAt: {},
+          redirects: {
+            'chat-ext-piece-0': { to: 'chat-piece-1', at: new Date().toISOString() },
+            'chat-piece-1': { to: 'chat-skp', at: new Date().toISOString() },
+          },
+        }),
+      };
+    }
+    return { ok: true, json: async () => ({}) };
+  },
+  localStorage: {
+    getItem: (k) => storageMap.get(k) || null,
+    setItem: (k, v) => storageMap.set(k, String(v)),
+  },
+  dispatchEvent: () => {},
+  addEventListener: () => {},
+  removeEventListener: () => {},
+  setTimeout: (cb) => { Promise.resolve().then(cb); return 1; },
+  clearTimeout: () => {},
+};
+global.setTimeout = window.setTimeout;
+global.clearTimeout = window.clearTimeout;
+global.document = {
+  documentElement: docEl,
+  head: headEl,
+  body: bodyEl,
+  getElementById: (id) => docEl.querySelector(`#${id}`),
+  createElement: (tag) => new FakeElement(tag),
+  querySelector: (sel) => docEl.querySelector(sel),
+  querySelectorAll: (sel) => docEl.querySelectorAll(sel),
+  addEventListener() {},
+  removeEventListener() {},
+  dispatchEvent() {},
+};
+global.MutationObserver = class { observe() {} disconnect() {} };
+
+eval(code);
+
+(async () => {
+  // 0. Cold-cache handleMessage on externalSummaries archived predecessor loads jetski-chains.json
+  // and follows multi-hop redirects to active leaf chat-skp before touching manualVisitedCids
+  window.location.pathname = '/c/pane-a';
+  window.location.search = '?project=proj-prev';
+  window.__jetskiFlightDeck.handleMessage({
+    data: { type: 'jetski-flight-deck-open-chat', cascadeId: 'chat-ext-piece-0' },
+  });
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+  assert.strictEqual(
+    navigatedUrl,
+    '/c/chat-skp?project=proj-skparagraph',
+    `Expected cold-cache externalSummaries predecessor to redirect to chat-skp, got: ${navigatedUrl}`
+  );
+  const ackRpc = fetchCalls.find((c) => c.url.includes('/UpdateConversationAnnotations'));
+  assert(ackRpc, 'Must acknowledge UpdateConversationAnnotations');
+  assert.deepStrictEqual(ackRpc.body.cascadeIds, ['chat-ext-piece-0', 'chat-skp']);
+
+  // 1. Cross-project ?project= updates to targetProjectId and convoState replaces pane-b only
+  window.location.pathname = '/c/pane-a+pane-b';
+  window.location.search = '?project=proj-prev';
+  storeState.multiConvoLayout.rootNode.children[1].cascadeId = 'pane-b';
+  storeState.conversation.convoState = {
+    type: 'subagent',
+    parentConversationId: 'pane-b',
+    childConversationId: 'sub-1',
+  };
+  delete storeState.conversation.cascadeId;
+  window.__jetskiOpenConversation('chat-skp');
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  assert.strictEqual(
+    navigatedUrl,
+    '/c/pane-a+chat-skp?project=proj-skparagraph&focused=chat-skp',
+    `Expected pane-b replaced and ?project= updated, got: ${navigatedUrl}`
+  );
+
+  // 2. Focused _new split pane (empty cascadeId, no ?focused=) replaces p2 instead of pane-a
+  window.location.pathname = '/c/pane-a+_new';
+  window.location.search = '?project=proj-prev';
+  storeState.multiConvoLayout.focusedPaneId = 'p2';
+  storeState.multiConvoLayout.rootNode.children[0].cascadeId = 'pane-a';
+  storeState.multiConvoLayout.rootNode.children[1].cascadeId = '';
+  storeState.conversation = { cascadeId: 'pane-a' };
+  window.__jetskiOpenConversation('chat-skp');
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  assert.strictEqual(
+    navigatedUrl,
+    '/c/pane-a+chat-skp?project=proj-skparagraph&focused=chat-skp',
+    `Expected focused _new pane p2 replaced without clobbering pane-a, got: ${navigatedUrl}`
+  );
+
+  // 3. Proto3 standalone chat (projectId === '') clears stale ?project= param
+  storeState.multiConvoLayout.rootNode.children[1].cascadeId = 'chat-skp';
+  storeState.conversation = { convoState: { type: 'active', cascadeId: 'chat-skp' } };
+  window.__jetskiOpenConversation('chat-standalone');
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  assert.strictEqual(
+    navigatedUrl,
+    '/c/pane-a+chat-standalone?focused=chat-standalone',
+    `Expected ?project= cleared for proto3 standalone chat, got: ${navigatedUrl}`
+  );
+
+  // 4. Non-convo /web/<slot> and /jetski-devs/web/<slot> routes preserve proxy prefixes
+  window.location.pathname = '/jetski-devs/web/slot-alpha/automations';
+  window.location.search = '';
+  window.__jetskiOpenConversation('chat-skp');
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  assert.strictEqual(
+    navigatedUrl,
+    '/jetski-devs/web/slot-alpha/c/chat-skp?section=proj-skparagraph',
+    `Expected /jetski-devs/web/<slot> prefix preserved, got: ${navigatedUrl}`
+  );
+
+  // 5. Opening unredirected archived chat does not unhide filtered-out sidebar buckets
+  storageMap.set('jetski_visible_buckets_v1', JSON.stringify(['working']));
+  window.location.pathname = '/c/pane-a';
+  window.location.search = '';
+  window.__jetskiOpenConversation('chat-archived-leaf');
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  assert.strictEqual(
+    storageMap.get('jetski_visible_buckets_v1'),
+    JSON.stringify(['working']),
+    'Archived chat navigation must not unhide filtered-out sidebar buckets'
+  );
+
+  // 6. Array state.projects.projects with archived: false must not fire spurious /UpdateProject RPC
+  assert(
+    !fetchCalls.some((c) => c.url.includes('/UpdateProject')),
+    'Non-archived project in Array state.projects.projects must not fire /UpdateProject RPC'
+  );
+
+  // 7. Mac wrapper opens remote Cloudtop chatUrl when cascadeId is absent from local summaries
+  window.__jetskiClosedChatsFilterMacVer = 'mac-test';
+  navigatedUrl = '';
+  window.__jetskiFlightDeck.handleMessage({
+    data: {
+      type: 'jetski-flight-deck-open-chat',
+      cascadeId: '68fead9a-remote-cloudtop',
+      chatUrl: 'https://jetski.corp.google.com/box/jlavrova-for-jetski/c/68fead9a-remote-cloudtop',
+    },
+  });
+  assert.strictEqual(navigatedUrl, '', 'Mac wrapper must not navigate local Hub to missing ID');
+  assert.strictEqual(openedPopups.length, 1);
+  assert.strictEqual(
+    openedPopups[0].url,
+    'https://jetski.corp.google.com/box/jlavrova-for-jetski/c/68fead9a-remote-cloudtop'
+  );
+  assert.strictEqual(openedPopups[0].target, 'jetski-chat');
+
+  // Local chat on Mac wrapper still navigates locally via openConversation
+  window.__jetskiFlightDeck.handleMessage({
+    data: { type: 'jetski-flight-deck-open-chat', cascadeId: 'chat-skp' },
+  });
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  assert.strictEqual(openedPopups.length, 1, 'Local Mac chat must not open external popup');
+  assert.strictEqual(navigatedUrl, '/c/chat-skp');
+
+  window.__jetskiClosedChatsFilterCleanup?.();
+  process.stdout.write('R92_OPEN_CHAT_PASSED\n');
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"""
+    env = os.environ.copy()
+    env["ELECTRON_RUN_AS_NODE"] = "1"
+    res = subprocess.run(
+        [node_bin, "-e", harness, js_path],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    self.assertEqual(
+        res.returncode,
+        0,
+        f"R92 open chat harness failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+    )
+    self.assertIn("R92_OPEN_CHAT_PASSED", res.stdout)
+
 
 if __name__ == "__main__":
   unittest.main()

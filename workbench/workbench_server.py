@@ -2912,9 +2912,13 @@ def render_workbench_html(
   // Open a Jetski conversation via iframe postMessage or standalone /api/chat/open + named tab
   async function openChatInJetski(cid, fallbackUrl) {{
     if (!cid) return;
+    const defaultUrl = fallbackUrl || `${{JETSKI_BOX_URL}}/c/${{encodeURIComponent(cid)}}`;
     // Embedded sidecar notifies its parent frame immediately and writes the non-blocking IPC file
     if (window.parent && window.parent !== window) {{
-      window.parent.postMessage({{ type: 'jetski-flight-deck-open-chat', cascadeId: cid }}, '*');
+      window.parent.postMessage(
+        {{ type: 'jetski-flight-deck-open-chat', cascadeId: cid, chatUrl: defaultUrl }},
+        '*'
+      );
       fetch('/api/chat/open', {{
         method: 'POST',
         headers: {{ 'Content-Type': 'application/json' }},
@@ -2922,7 +2926,6 @@ def render_workbench_html(
       }}).catch(() => {{}});
       return;
     }}
-    const defaultUrl = fallbackUrl || `${{JETSKI_BOX_URL}}/c/${{encodeURIComponent(cid)}}`;
     let targetUrl = defaultUrl;
     try {{
       const resp = await fetch('/api/chat/open', {{

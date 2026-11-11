@@ -857,11 +857,11 @@
     return '';
   }
 
-  // Extracts the /box/<host> routing prefix when Jetski Web is accessed through the
-  // corp reverse proxy
+  // Extracts the /box/<host> or /web/<slot> routing prefix when Jetski Web is accessed through
+  // the corp reverse proxy or remote-control slot
   function getBoxRoutePrefix() {
     const path = typeof window !== 'undefined' ? window.location?.pathname || '' : '';
-    const m = /^(\/box\/[^/]+)(?:\/|$)/.exec(path);
+    const m = /^(\/(?:box|(?:jetski-devs\/)?web)\/[^/]+)(?:\/|$)/.exec(path);
     return m ? m[1] : '';
   }
 
@@ -1330,8 +1330,51 @@
     return Boolean(s?.annotations?.archived);
   }
 
+  function isKnownUnarchivedSummary(cascadeId, store) {
+    if (!cascadeId) return false;
+    const ts = (store || findReduxStore())?.getState()?.trajectorySummaries;
+    const s = ts?.summaries?.[cascadeId] || ts?.externalSummaries?.[cascadeId];
+    return Boolean(s && !s.annotations?.archived);
+  }
+
+  function isKnownArchivedSummary(cascadeId, store) {
+    if (!cascadeId) return false;
+    const ts = (store || findReduxStore())?.getState()?.trajectorySummaries;
+    const s = ts?.summaries?.[cascadeId] || ts?.externalSummaries?.[cascadeId];
+    return Boolean(s?.annotations?.archived);
+  }
+
+  // Extracts active parent cascade ID across legacy cascadeId and subagent-aware convoState
+  function resolveConvoSliceCascadeId(convoSlice) {
+    const cs = convoSlice?.convoState;
+    return (
+      convoSlice?.cascadeId ||
+      (cs?.type === 'subagent' ? cs.parentConversationId : cs?.cascadeId) ||
+      ''
+    );
+  }
+
+  // Follows recorded handoff redirects unless the requested ID is known to be open
+  function resolveOpenChatTargetId(cascadeId) {
+    if (!cascadeId || isKnownUnarchivedSummary(cascadeId)) return cascadeId;
+    const redirects = chainIndexCache?.redirects;
+    if (!redirects) return cascadeId;
+    let cur = cascadeId;
+    const seen = new Set([cur]);
+    // Bound redirect traversal to 64 hops to guarantee termination on malformed redirect graphs
+    for (let step = 0; step < 64; step++) {
+      const next = redirects[cur]?.to;
+      if (!next || seen.has(next)) break;
+      cur = next;
+      seen.add(cur);
+    }
+    return cur;
+  }
+
   async function postUpdateAnnotationsRpc(cascadeId, annotations) {
     if (typeof window.fetch !== 'function') return false;
+    const cascadeIds = (Array.isArray(cascadeId) ? cascadeId : [cascadeId]).filter(Boolean);
+    if (cascadeIds.length === 0) return false;
     try {
       const url = resolveApiUrl(
         '/exa.language_server_pb.LanguageServerService/UpdateConversationAnnotations'
@@ -1343,7 +1386,7 @@
             'x-codeium-csrf-token': getCsrfToken(),
           },
           body: JSON.stringify({
-            cascadeIds: [cascadeId],
+            cascadeIds,
             annotations,
             mergeAnnotations: true,
           }),
@@ -3743,7 +3786,7 @@
 
     if (!projectId) {
       const search = window.location?.search || '';
-      const m = /[?&]section=([a-zA-Z0-9_-]+)/.exec(search);
+      const m = /[?&](?:project|section)=([a-zA-Z0-9_-]+)/.exec(search);
       if (m) projectId = m[1];
     }
     if (!projectId) {
@@ -3782,7 +3825,7 @@
     if (cascadeId) return String(cascadeId);
     let projectId = '';
     const search = window.location?.search || '';
-    const m = /[?&]section=([a-zA-Z0-9_-]+)/.exec(search);
+    const m = /[?&](?:project|section)=([a-zA-Z0-9_-]+)/.exec(search);
     if (m) projectId = m[1];
     if (!projectId) {
       projectId = store?.getState()?.projects?.activeProjectId || '';
@@ -4276,8 +4319,7 @@
     if (focusedPaneId && state?.trajectorySummaries?.summaries?.[focusedPaneId]) {
       return focusedPaneId;
     }
-    const convCid =
-      state?.conversation?.cascadeId || state?.conversation?.convoState?.cascadeId || '';
+    const convCid = resolveConvoSliceCascadeId(state?.conversation);
     if (convCid) return convCid;
     const path = window.location?.pathname || '';
     const m = /\/(?:c|cascade|conversation)\/([a-zA-Z0-9_-]+)/.exec(path);
@@ -4382,10 +4424,7 @@
     const catalog = buildModelCatalogIndex(store);
     if (catalog.byEnum.size === 0) return;
 
-    let cascadeId =
-      state.conversation?.cascadeId ||
-      state.conversation?.convoState?.cascadeId ||
-      '';
+    let cascadeId = resolveConvoSliceCascadeId(state.conversation);
     if (!cascadeId) {
       const path = window.location?.pathname || '';
       const m = /\/(?:c|cascade|conversation)\/([a-zA-Z0-9_-]+)/.exec(path);
@@ -5135,11 +5174,7 @@
         // Record stepCount alongside the manual pick so older trajectory turns cannot revert it on F5
         const rawCid = action.payload.conversationId || '';
         // Fall back to active cascade ID if conversationId is omitted in draft state
-        const activeCid =
-          rawCid ||
-          store.getState()?.conversation?.cascadeId ||
-          store.getState()?.conversation?.convoState?.cascadeId ||
-          '';
+        const activeCid = rawCid || resolveConvoSliceCascadeId(store.getState()?.conversation);
         const pinKey = resolveDraftPinKey(store, rawCid);
         // Explicit user pick supersedes any pending step-0 bootstrap restoration or deferred toast
         if (rawCid) {
@@ -5275,10 +5310,7 @@
               actionId: 'keep-forever',
               onAction: () => {
                 // Resolve live key in case a draft pick was already seeded into a conversation
-                const seededCid =
-                  store.getState()?.conversation?.cascadeId ||
-                  store.getState()?.conversation?.convoState?.cascadeId ||
-                  '';
+                const seededCid = resolveConvoSliceCascadeId(store.getState()?.conversation);
                 const liveKey = manualPickedModels.has(pinKey)
                   ? pinKey
                   : seededCid && manualPickedModels.has(seededCid)
@@ -8457,15 +8489,11 @@
   // Restores an archived project when navigating to one of its conversations
   async function unarchiveProjectIfArchived(projectId, store) {
     if (!projectId || projectId === '__standalone__') return false;
-    const state = store?.getState();
-    const sidebarProjects = state?.sidebarProjects?.projects;
-    if (Array.isArray(sidebarProjects) && sidebarProjects.some((p) => p?.id === projectId)) {
+    const p = findProjectEntry(projectId, store);
+    if (p && p.archived === false) return false;
+    const sidebarProjects = store?.getState()?.sidebarProjects?.projects;
+    if (Array.isArray(sidebarProjects) && sidebarProjects.some((sp) => sp?.id === projectId)) {
       return false;
-    }
-    const projectsMap = state?.projects?.projects || state?.projects?.byId;
-    if (projectsMap && typeof projectsMap === 'object') {
-      const p = projectsMap[projectId];
-      if (p && p.archived === false) return false;
     }
     if (typeof window.fetch !== 'function') return false;
     try {
@@ -8499,8 +8527,8 @@
     const preserveFocus = Boolean(options?.preserveFocus);
     const path = window.location?.pathname || '';
     const m = /^(.*\/(?:c|cascade|conversation)\/)([^/?#]+)(.*)$/.exec(path);
-    const boxMatch = !m ? /^(\/box\/[^/]+)(?:\/|$)/.exec(path) : null;
-    const routePrefix = m ? m[1] : boxMatch ? `${boxMatch[1]}/c/` : '/c/';
+    const proxyPrefix = !m ? getBoxRoutePrefix() : '';
+    const routePrefix = m ? m[1] : proxyPrefix ? `${proxyPrefix}/c/` : '/c/';
     const routeSuffix = m ? m[3] : '';
     // Extract active conversation IDs from URL pathname, handling split-view '+' separators
     let rawIds = [];
@@ -8517,13 +8545,41 @@
 
     const store = findReduxStore();
     const layoutState = store?.getState()?.multiConvoLayout;
-    const convoCascadeId = store?.getState()?.conversation?.cascadeId || '';
-    // Target the clicked pane or active conversation so adjacent split panes remain unchanged
-    const replaceTarget = sourceCid || focusedParam || convoCascadeId;
+    const convoCascadeId = resolveConvoSliceCascadeId(store?.getState()?.conversation);
+    const leafPanes = [];
+    if (layoutState?.rootNode) {
+      const collectPanes = (node) => {
+        if (!node) return;
+        if (node.type === 'pane') {
+          leafPanes.push(node);
+          return;
+        }
+        if (Array.isArray(node.children)) {
+          for (const child of node.children) collectPanes(child);
+        }
+      };
+      collectPanes(layoutState.rootNode);
+    }
+    // Resolve the exact split pane once so URL slot replacement and Redux resetPane never diverge
+    const explicitTarget = sourceCid || focusedParam;
+    const targetPane =
+      (explicitTarget &&
+        leafPanes.find((n) => n.cascadeId === explicitTarget || n.id === explicitTarget)) ||
+      (layoutState?.focusedPaneId &&
+        leafPanes.find(
+          (n) => n.id === layoutState.focusedPaneId || n.cascadeId === layoutState.focusedPaneId
+        )) ||
+      (convoCascadeId && leafPanes.find((n) => n.cascadeId === convoCascadeId)) ||
+      leafPanes[0] ||
+      null;
+    const replaceTarget = targetPane ? targetPane.cascadeId : explicitTarget || convoCascadeId;
 
     let targetIdx = -1;
     if (replaceTarget) {
       targetIdx = rawIds.indexOf(replaceTarget);
+    }
+    if (targetIdx === -1 && targetPane && leafPanes.length === rawIds.length) {
+      targetIdx = leafPanes.indexOf(targetPane);
     }
     if (targetIdx === -1 && rawIds.length > 0) {
       targetIdx = 0;
@@ -8551,20 +8607,28 @@
       searchParams.set('focused', cascadeId);
     }
 
-    // Align active sidebar project section and unarchive project if archived
+    // Align active sidebar project/section query params and unarchive project if archived
     const summariesMap = store?.getState()?.trajectorySummaries?.summaries || {};
-    const targetProjectId =
-      summariesMap[cascadeId]?.trajectoryMetadata?.projectId ||
-      store?.getState()?.trajectorySummaries?.externalSummaries?.[cascadeId]?.trajectoryMetadata
-        ?.projectId;
+    const targetSummary =
+      summariesMap[cascadeId] ||
+      store?.getState()?.trajectorySummaries?.externalSummaries?.[cascadeId];
+    const targetProjectId = targetSummary?.trajectoryMetadata?.projectId;
+    const isRealProject = Boolean(targetProjectId && targetProjectId !== '__standalone__');
+    const isKnownStandalone = Boolean(targetSummary) && !isRealProject;
     const isNonConvoRoute = !m;
-    const shouldSyncSection =
-      Boolean(targetProjectId && targetProjectId !== '__standalone__') &&
-      (isNonConvoRoute || searchParams.has('section'));
-    if (shouldSyncSection) {
+    if (searchParams.has('project')) {
+      if (isRealProject) {
+        searchParams.set('project', targetProjectId);
+      } else if (isKnownStandalone) {
+        searchParams.delete('project');
+      }
+      searchParams.delete('section');
+    } else if (isRealProject && (isNonConvoRoute || searchParams.has('section'))) {
       searchParams.set('section', targetProjectId);
+    } else if (isKnownStandalone) {
+      searchParams.delete('section');
     }
-    if (targetProjectId && targetProjectId !== '__standalone__') {
+    if (isRealProject) {
       void unarchiveProjectIfArchived(targetProjectId, store);
     }
 
@@ -8586,40 +8650,17 @@
     // Reconcile Redux layout and active conversation slices to prevent router ping-pong
     if (store) {
       let takeFocus = !preserveFocus || rawIds.length <= 1 || convoCascadeId === replaceTarget;
-      if (layoutState?.rootNode) {
-        function findPane(node, matches) {
-          if (!node) return null;
-          if (node.type === 'pane') return matches(node) ? node : null;
-          if (Array.isArray(node.children)) {
-            for (const child of node.children) {
-              const found = findPane(child, matches);
-              if (found) return found;
-            }
-          }
-          return null;
-        }
-        // The pane showing replaceTarget wins over the focused pane, or a background
-        // auto-switch would replace whatever chat the user is focused on
-        const targetPane =
-          (replaceTarget &&
-            findPane(
-              layoutState.rootNode,
-              (n) => n.cascadeId === replaceTarget || n.id === replaceTarget
-            )) ||
-          findPane(layoutState.rootNode, (n) => n.id === layoutState.focusedPaneId) ||
-          findPane(layoutState.rootNode, () => true);
-        if (targetPane) {
-          takeFocus = !preserveFocus || targetPane.id === layoutState.focusedPaneId;
+      if (targetPane) {
+        takeFocus = !preserveFocus || targetPane.id === layoutState.focusedPaneId;
+        store.dispatch({
+          type: 'multiConvoLayout/resetPane',
+          payload: { paneId: targetPane.id, cascadeId },
+        });
+        if (takeFocus) {
           store.dispatch({
-            type: 'multiConvoLayout/resetPane',
-            payload: { paneId: targetPane.id, cascadeId },
+            type: 'multiConvoLayout/setFocusedPane',
+            payload: targetPane.id,
           });
-          if (takeFocus) {
-            store.dispatch({
-              type: 'multiConvoLayout/setFocusedPane',
-              payload: targetPane.id,
-            });
-          }
         }
       }
       if (takeFocus) {
@@ -9030,16 +9071,18 @@
       await nextFrame();
     }
 
-    // Unhide the conversation's attention bucket if currently filtered out
+    // Unhide the conversation's attention bucket only for eligible non-archived sidebar chats
     const summariesMap = store?.getState()?.trajectorySummaries?.summaries || {};
     const summary = summariesMap[targetId];
-    const rawTitle = summary?.annotations?.title || summary?.summary || '';
-    const bucket = classifyChatBucket(summary, rawTitle, targetId, summariesMap);
-    if (!visibleBuckets.has(bucket)) {
-      visibleBuckets.add(bucket);
-      saveVisibleBuckets(visibleBuckets);
-      runFullSync();
-      await nextFrame();
+    if (isEligibleTopLevelSummary(targetId, summary)) {
+      const rawTitle = summary?.annotations?.title || summary?.summary || '';
+      const bucket = classifyChatBucket(summary, rawTitle, targetId, summariesMap);
+      if (!visibleBuckets.has(bucket)) {
+        visibleBuckets.add(bucket);
+        saveVisibleBuckets(visibleBuckets);
+        runFullSync();
+        await nextFrame();
+      }
     }
 
     let ctrl = findSidebarListController();
@@ -9229,6 +9272,40 @@
   let openChatPollFailures = 0;
   let openChatPollNextAllowedAt = 0;
 
+  // Refreshes jetski-chains.json before resolving archived predecessors so cold/background tabs
+  // land on the active chain leaf without locking rawCid into manualVisitedCids
+  async function resolveAndOpenRequestedChat(rawCid) {
+    const needsChainCheck =
+      !isKnownUnarchivedSummary(rawCid) && !chainIndexCache?.redirects?.[rawCid];
+    if (needsChainCheck && isKnownArchivedSummary(rawCid)) {
+      chainIndexFetchedAt = 0;
+      await fetchChainIndex();
+    }
+    const targetCid = resolveOpenChatTargetId(rawCid);
+    if (!needsChainCheck || isKnownArchivedSummary(rawCid)) {
+      manualVisitedCids.add(targetCid);
+      const ackIds = targetCid !== rawCid ? [rawCid, targetCid] : [rawCid];
+      const ackPromise = postUpdateAnnotationsRpc(ackIds, {
+        lastUserViewTime: new Date().toISOString(),
+      });
+      openConversation(targetCid);
+      return ackPromise;
+    }
+    // Unloaded summaries route synchronously for responsiveness, then follow any discovered redirect
+    openConversation(targetCid);
+    chainIndexFetchedAt = 0;
+    await fetchChainIndex();
+    const redirectedCid = resolveOpenChatTargetId(rawCid);
+    manualVisitedCids.add(redirectedCid);
+    if (redirectedCid !== targetCid) {
+      openConversation(redirectedCid);
+    }
+    const ackIds = redirectedCid !== rawCid ? [rawCid, redirectedCid] : [rawCid];
+    return postUpdateAnnotationsRpc(ackIds, {
+      lastUserViewTime: new Date().toISOString(),
+    });
+  }
+
   // Polls /static/artifacts/jetski-open-chat.json so Flight Deck can navigate an existing tab
   async function pollOpenChatRequest(isBackgroundTick = false) {
     if (disposed || openChatPollingInFlight || typeof window.fetch !== 'function') return false;
@@ -9292,12 +9369,7 @@
         window.localStorage?.setItem('ag:activeJetskiTabId', OPEN_CHAT_TAB_ID);
       } catch {}
       lastOpenChatReqId = reqId;
-      manualVisitedCids.add(cid);
-      // Fire RPC acknowledgment immediately so Flight Deck detects the modified .pbtxt fast
-      const ackPromise = postUpdateAnnotationsRpc(cid, {
-        lastUserViewTime: new Date().toISOString(),
-      });
-      openConversation(cid);
+      const ackPromise = resolveAndOpenRequestedChat(cid);
       try {
         window.focus?.();
       } catch {
@@ -11275,13 +11347,36 @@
     const data = event?.data;
     if (!data || typeof data !== 'object') return;
     if (data.type === 'jetski-flight-deck-open-chat') {
-      const cid = String(data.cascadeId || '');
-      if (cid) {
-        manualVisitedCids.add(cid);
-        void postUpdateAnnotationsRpc(cid, {
-          lastUserViewTime: new Date().toISOString(),
-        });
-        openConversation(cid);
+      const rawCid = String(data.cascadeId || '').trim();
+      if (rawCid) {
+        const cid = resolveOpenChatTargetId(rawCid);
+        const isMacWrapper = Boolean(
+          window.__jetskiClosedChatsFilterMacVer || window.__jetskiClosedChatsFilterLoadingVer
+        );
+        const state = findReduxStore()?.getState();
+        const hasLocalSummary = Boolean(
+          state?.trajectorySummaries?.summaries?.[cid] ||
+            state?.trajectorySummaries?.externalSummaries?.[cid] ||
+            state?.trajectorySummaries?.summaries?.[rawCid] ||
+            state?.trajectorySummaries?.externalSummaries?.[rawCid]
+        );
+        // Cloudtop Flight Deck embedded in Mac Antigravity references remote Cloudtop chats
+        // absent from Mac's local Language Server, so open them in the Cloudtop Jetski Box URL
+        if (isMacWrapper && state?.trajectorySummaries && !hasLocalSummary) {
+          const rawChatUrl = typeof data.chatUrl === 'string' ? data.chatUrl.trim() : '';
+          const baseChatUrl =
+            cid !== rawCid && rawChatUrl.endsWith(`/${rawCid}`)
+              ? `${rawChatUrl.slice(0, -rawCid.length)}${encodeURIComponent(cid)}`
+              : rawChatUrl;
+          const remoteUrl = /^https?:\/\//i.test(baseChatUrl)
+            ? baseChatUrl
+            : `https://jetski.corp.google.com/box/jlavrova-for-jetski/c/${encodeURIComponent(cid)}`;
+          if (typeof window.open === 'function') {
+            window.open(remoteUrl, 'jetski-chat');
+          }
+          return;
+        }
+        void resolveAndOpenRequestedChat(rawCid);
       }
     } else if (data.type === 'jetski-flight-deck-close') {
       setFlightDeckOpen(false);
@@ -11368,18 +11463,7 @@
   // Resolves a human-readable project title from Redux slices or sidebar project headers
   function resolveProjectName(projectId, store) {
     if (!projectId || projectId === '__standalone__') return 'Standalone';
-    const state = store?.getState();
-    // The Workspaces sidebar keeps names in the sidebarProjects slice as an array of {id, name}
-    const sidebarProjects = state?.sidebarProjects?.projects;
-    const fromSidebar = Array.isArray(sidebarProjects)
-      ? sidebarProjects.find((p) => p?.id === projectId)?.name
-      : '';
-    const fromStore =
-      fromSidebar ||
-      state?.projects?.projects?.[projectId]?.name ||
-      state?.project?.projects?.[projectId]?.name ||
-      state?.projects?.byId?.[projectId]?.name ||
-      '';
+    const fromStore = findProjectEntry(projectId, store)?.name || '';
     if (typeof fromStore === 'string' && fromStore.trim()) {
       return fromStore.replace(PROJECT_ACTIVITY_SUFFIX_RE, '').trim();
     }
@@ -11479,10 +11563,7 @@
   // Opens archive-aware global search anchored to the focused conversation pane when present
   function openGlobalSearchFromActiveContext() {
     const store = findReduxStore();
-    const activeCid =
-      store?.getState()?.conversation?.cascadeId ||
-      store?.getState()?.multiConvoLayout?.focusedPaneId ||
-      '';
+    const activeCid = getFocusedConversationId(store);
     void openSearchPanel(activeCid, { mode: 'global' });
   }
 

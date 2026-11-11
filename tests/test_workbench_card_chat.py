@@ -1050,6 +1050,11 @@ global.fetch = async (url, opts) => {
   assert.strictEqual(parentMessages[0].type, 'jetski-flight-deck-open-chat');
   assert.strictEqual(parentMessages[0].cascadeId, 'eeee2222-3333-4444-8888-555566667777');
   assert(
+    typeof parentMessages[0].chatUrl === 'string'
+      && parentMessages[0].chatUrl.endsWith('/c/eeee2222-3333-4444-8888-555566667777'),
+    'Embedded sidecar postMessage must include chatUrl for remote Cloudtop fallback'
+  );
+  assert(
     fetchCalls.some((c) => c.url === '/api/chat/open' && c.body.timeout_sec === 0),
     'Embedded sidecar must pass timeout_sec=0'
   );

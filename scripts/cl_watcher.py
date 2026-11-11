@@ -20461,6 +20461,7 @@ async function openChat(convId, url, ev) {
       window.parent.postMessage({
         type: 'jetski-flight-deck-open-chat',
         cascadeId: convId,
+        chatUrl: url || '',
       }, '*');
       if (btn) {
         btn.textContent = '✓ Opened in Jetski';
@@ -20473,7 +20474,7 @@ async function openChat(convId, url, ev) {
       fetch('/api/open_chat', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({conversation_id: convId}),
+        body: JSON.stringify({conversation_id: convId, timeout_sec: 0.0}),
       }).catch(() => {});
       return false;
     } catch (e) {
@@ -20481,6 +20482,7 @@ async function openChat(convId, url, ev) {
     }
   }
 
+  let targetUrl = url || '';
   if (convId && typeof fetch === 'function') {
     try {
       const resp = await fetch('/api/open_chat', {
@@ -20489,6 +20491,9 @@ async function openChat(convId, url, ev) {
         body: JSON.stringify({conversation_id: convId}),
       });
       const res = await resp.json();
+      if (res && res.chat_url && !targetUrl) {
+        targetUrl = res.chat_url;
+      }
       if (res && res.ok && res.reused_tab) {
         if (btn) {
           btn.textContent = '✓ Opened in Jetski';
@@ -20504,8 +20509,13 @@ async function openChat(convId, url, ev) {
       // Fall back to named window navigation when local server is unreachable
     }
   }
-  if (url && typeof window !== 'undefined' && typeof window.open === 'function') {
-    window.open(url, 'jetski-chat');
+  if (targetUrl && typeof window !== 'undefined' && typeof window.open === 'function') {
+    // Browser popup blockers reject window.open after the 1.8s async IPC poll expires transient
+    // user activation, so navigate in-place when window.open returns null
+    const win = window.open(targetUrl, 'jetski-chat');
+    if (!win && window.location && typeof window.location.assign === 'function') {
+      window.location.assign(targetUrl);
+    }
   }
   return false;
 }
@@ -21053,7 +21063,14 @@ class FlightDeckHandler(http.server.BaseHTTPRequestHandler):
       bdict = body if isinstance(body, dict) else {}
       if parsed.path == "/api/open_chat":
         cid = str(bdict.get("conversation_id") or "")
-        res = open_chat_for_id(cid)
+        if "timeout_sec" in bdict and bdict["timeout_sec"] is not None:
+          try:
+            t_sec = max(0.0, min(float(bdict["timeout_sec"]), 5.0))
+          except (TypeError, ValueError):
+            t_sec = 1.8
+          res = open_chat_for_id(cid, timeout_sec=t_sec)
+        else:
+          res = open_chat_for_id(cid)
       elif parsed.path == "/api/start_chat":
         res = start_chat_for_item(str(bdict.get("item_key") or ""))
       elif parsed.path == "/api/ack_bug":
