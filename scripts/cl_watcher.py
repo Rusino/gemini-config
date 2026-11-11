@@ -137,6 +137,10 @@ IGNORED_CLS_FILE = os.path.expanduser(
 MANUAL_FIX_LINKS_FILE = os.path.expanduser(
     "~/.gemini/config/fix_for_links.json"
 )
+# External blocker CLs/PRs polled with zero LLM tokens until MERGED/ABANDONED/CLOSED
+DEFAULT_WATCHED_CLS_FILE = os.path.expanduser("~/.gemini/config/watched_cls.json")
+WATCHED_CLS_FILE = DEFAULT_WATCHED_CLS_FILE
+TERMINAL_WATCH_STATUSES = frozenset({"MERGED", "ABANDONED", "CLOSED"})
 # Headings and git-config lines in chat state files that identify follow-up fix CLs
 RE_STATE_FIX_SECTION = re.compile(
     r"^##+\s*(?:[^\n]*\b(?:fix|follow[\s\-]*up|reland)\s+(?:cl|pr|change)\b|"
@@ -884,6 +888,10 @@ def save_watcher_state(state: dict[str, Any]) -> None:
       _SERVING_PORT > 0 or not os.path.isfile(FLIGHT_DECK_INFO_FILE)
   ):
     export_flight_deck_info(_SERVING_PORT or DEFAULT_PORT)
+
+
+_DEFAULT_LOAD_WATCHER_STATE = load_watcher_state
+_DEFAULT_SAVE_WATCHER_STATE = save_watcher_state
 
 
 def get_pen_url(port: int) -> str:
@@ -13526,6 +13534,437 @@ def merge_concurrent_state_mutations(
             continue
           sitem[field] = ditem[field]
 
+  # 5. Preserve concurrent watched_cls terminal watermarks without resurrecting removed keys
+  disk_watched = disk_state.get("watched_cls")
+  state_watched = state.get("watched_cls")
+  base_watched = (
+      base.get("watched_cls") if isinstance(base.get("watched_cls"), dict) else {}
+  )
+  if isinstance(disk_watched, dict) and isinstance(state_watched, dict):
+    for wkey, dw in disk_watched.items():
+      sw = state_watched.get(wkey)
+      if not isinstance(dw, dict) or not isinstance(sw, dict):
+        continue
+      bw = base_watched.get(wkey) if isinstance(base_watched.get(wkey), dict) else {}
+      for wfield in ("alerted_status", "woken_status"):
+        dval = str(dw.get(wfield) or "")
+        if dval and dval != str(bw.get(wfield) or "") and not sw.get(wfield):
+          sw[wfield] = dval
+
+
+def _parse_watched_cl_entry(raw: Any) -> dict[str, str] | None:
+  if not isinstance(raw, dict) or raw.get("enabled", True) is False:
+    return None
+  raw_key = str(raw.get("key") or "").strip()
+  if not raw_key:
+    return None
+  if ":" in raw_key:
+    kind_part, _, rest = raw_key.partition(":")
+    kind = kind_part.strip().lower()
+    rest = rest.strip()
+  else:
+    kind = "gerrit"
+    rest = raw_key
+  if kind == "github":
+    repo_slug = str(raw.get("repo_slug") or "").strip()
+    if "#" in rest:
+      r_part, _, tid_part = rest.partition("#")
+      repo_slug = repo_slug or r_part.strip() or "flutter/flutter"
+      target_id = tid_part.strip()
+    else:
+      target_id = rest.lstrip("#").strip()
+      repo_slug = repo_slug or "flutter/flutter"
+    if not target_id:
+      return None
+    # Keep flutter/flutter keys aligned with fetched_cache while qualifying external repos
+    key = (
+        f"github:{repo_slug}#{target_id}"
+        if repo_slug != "flutter/flutter"
+        else f"github:{target_id}"
+    )
+    host = "github.com"
+  elif kind == "gerrit":
+    target_id = rest.strip()
+    if not target_id:
+      return None
+    host = str(raw.get("host") or GERRIT_SKIA_HOST).strip() or GERRIT_SKIA_HOST
+    repo_slug = ""
+    key = f"gerrit:{target_id}"
+  else:
+    return None
+  unblocks_raw = str(raw.get("unblocks") or "").strip()
+  unblocks = (
+      _normalize_item_key_ref(unblocks_raw, default_kind=kind)
+      if unblocks_raw
+      else ""
+  )
+  unblocks_repo_slug = ""
+  if unblocks.startswith("github:"):
+    u_rest = unblocks.partition(":")[2].strip()
+    if "#" in u_rest:
+      u_repo, _, u_tid = u_rest.partition("#")
+      unblocks_repo_slug = u_repo.strip()
+      unblocks = f"github:{u_tid.strip()}" if u_tid.strip() else ""
+    else:
+      u_tid = u_rest.lstrip("#").strip()
+      unblocks = f"github:{u_tid}" if u_tid else ""
+  return {
+      "key": key,
+      "kind": kind,
+      "target_id": target_id,
+      "host": host,
+      "repo_slug": repo_slug,
+      "unblocks": unblocks,
+      "unblocks_repo_slug": unblocks_repo_slug,
+      "fallback_chain_id": str(raw.get("fallback_chain_id") or "").strip(),
+      "note": str(raw.get("note") or "").strip(),
+  }
+
+
+# Isolate default watched_cls.json lookups when unit tests redirect or mock watcher state I/O
+def _resolve_watched_cls_path(path: str | None = None) -> str | None:
+  if path is not None:
+    return path
+  if os.path.abspath(WATCHED_CLS_FILE) != os.path.abspath(DEFAULT_WATCHED_CLS_FILE):
+    return WATCHED_CLS_FILE
+  if os.path.abspath(STATE_FILE) != os.path.abspath(DEFAULT_STATE_FILE):
+    return os.path.join(os.path.dirname(os.path.abspath(STATE_FILE)), "watched_cls.json")
+  if (
+      load_watcher_state is not _DEFAULT_LOAD_WATCHER_STATE
+      or save_watcher_state is not _DEFAULT_SAVE_WATCHER_STATE
+  ):
+    return None
+  return WATCHED_CLS_FILE
+
+
+def load_watched_cls(path: str | None = None) -> list[dict[str, str]]:
+  """Loads normalized external blocker-CL watch entries from JSON.
+
+  Inputs: optional path override (defaults to WATCHED_CLS_FILE isolated next to STATE_FILE).
+  Outputs: list of normalized watch dicts; returns [] on missing, isolated, or invalid JSON.
+  Side effects: reads disk only.
+  """
+  target_path = _resolve_watched_cls_path(path)
+  if not target_path or not os.path.isfile(target_path):
+    return []
+  try:
+    with open(target_path, "r", encoding="utf-8") as f:
+      data = json.load(f)
+  except (OSError, ValueError):
+    return []
+  raw_list = data.get("watches") if isinstance(data, dict) else data
+  if not isinstance(raw_list, list):
+    return []
+  out: list[dict[str, str]] = []
+  seen: set[str] = set()
+  for raw in raw_list:
+    parsed = _parse_watched_cl_entry(raw)
+    if parsed and parsed["key"] not in seen:
+      seen.add(parsed["key"])
+      out.append(parsed)
+  return out
+
+
+def _watched_cl_link_and_label(
+    kind: str, target_id: str, host: str, repo_slug: str, url: str = ""
+) -> tuple[str, str, str]:
+  if kind == "piper":
+    resolved = url or f"http://cl/{target_id}"
+    short_label = f"cl/{target_id}"
+    return short_label, f"[{short_label}]({resolved})", resolved
+  if kind == "github":
+    slug = repo_slug or "flutter/flutter"
+    resolved = url or f"https://github.com/{slug}/pull/{target_id}"
+    short_label = f"PR #{target_id}"
+    return short_label, f"[{short_label}]({resolved})", resolved
+  eff_host = host if (host and host != "github.com") else GERRIT_SKIA_HOST
+  resolved = url or f"https://{eff_host}/c/{target_id}"
+  repo_prefix = "Chromium" if "chromium" in eff_host else "Skia"
+  short_label = f"CL {target_id}"
+  return short_label, f"[{repo_prefix} CL {target_id}]({resolved})", resolved
+
+
+def _resolve_watch_wakeup_target(
+    entry: dict[str, str],
+    by_ikey: dict[str, list[dict[str, Any]]],
+) -> tuple[str, str]:
+  unblocks = entry.get("unblocks") or ""
+  recs = by_ikey.get(unblocks) or [] if unblocks else []
+  proj_name = (
+      str(recs[0].get("project_name") or "")
+      if recs and isinstance(recs[0], dict)
+      else ""
+  ) or ("Flutter" if entry.get("kind") == "github" else "Skia")
+  base_cid = ""
+  for rec in recs:
+    if isinstance(rec, dict) and rec.get("conversation_id") and not rec.get("chat_archived"):
+      base_cid = str(rec["conversation_id"]).strip()
+      break
+  if not base_cid:
+    for rec in recs:
+      if isinstance(rec, dict) and rec.get("conversation_id"):
+        base_cid = str(rec["conversation_id"]).strip()
+        break
+  if not base_cid:
+    base_cid = str(entry.get("fallback_chain_id") or "").strip()
+  if not base_cid:
+    return "", proj_name
+  # Follow handoff descendants so terminal alerts reach the active chain leaf
+  chain = cl.discover_conversation_chain(base_cid, include_descendants=True)
+  return (chain[-1] if chain else base_cid), proj_name
+
+
+def _format_watched_cl_transition_message(
+    entry: dict[str, str],
+    info: dict[str, Any],
+    cur_status: str,
+    by_ikey: dict[str, list[dict[str, Any]]],
+) -> str:
+  _, watched_md, _ = _watched_cl_link_and_label(
+      entry["kind"],
+      entry["target_id"],
+      str(info.get("host") or entry["host"]),
+      str(info.get("repo_slug") or entry["repo_slug"]),
+      str(info.get("url") or ""),
+  )
+  subj = str(info.get("subject") or "").strip()
+  owner = str(info.get("owner_name") or "").strip()
+  meta_parts = [f"'{subj}'" if subj else "", f"({owner})" if owner else ""]
+  meta_str = " ".join(p for p in meta_parts if p)
+  unblocks = entry.get("unblocks") or ""
+  unblock_clause = ""
+  u_status = ""
+  if unblocks:
+    u_kind, _, u_tid = unblocks.partition(":")
+    u_recs = by_ikey.get(unblocks) or []
+    u_first = u_recs[0] if u_recs and isinstance(u_recs[0], dict) else {}
+    u_status = str(u_first.get("status") or "").upper()
+    u_url = str(u_first.get("url") or "")
+    default_u_host = entry["host"] if u_kind == entry["kind"] else GERRIT_SKIA_HOST
+    u_host = str(u_first.get("host") or default_u_host)
+    u_slug = str(u_first.get("repo_slug") or entry.get("unblocks_repo_slug") or "")
+    _, u_md, _ = _watched_cl_link_and_label(u_kind, u_tid, u_host, u_slug, u_url)
+    unblock_clause = f", от которого зависит {u_md}"
+  note = entry.get("note") or ""
+  note_clause = f" Заметка: {note}." if note else ""
+  if cur_status != "MERGED":
+    action_clause = (
+        " Проверь, перенесена ли работа в другой CL/PR или зависимость снята."
+    )
+  elif u_status in TERMINAL_WATCH_STATUSES:
+    action_clause = (
+        " Зависимое изменение уже закрыто; при необходимости оформи продолжение "
+        "отдельным изменением поверх origin/main."
+    )
+  else:
+    action_clause = (
+        " Перебазируй зависимое изменение на свежий origin/main, прогони тесты и "
+        "amnesia-precommit и обнови патчсет без выставления CQ или Auto-Submit."
+    )
+  return (
+      f"[CL-WATCHER] 🔔 Внешний блокер {watched_md}"
+      f"{f' {meta_str}' if meta_str else ''}{unblock_clause} перешёл в статус "
+      f"{cur_status}.{note_clause}{action_clause}"
+  )
+
+
+def _fetch_watched_cl_info(
+    entry: dict[str, str],
+    fetched_cache: dict[str, dict[str, Any]],
+    rollers: dict[str, Any],
+    incidents: list[dict[str, Any]],
+    skia_dir: str,
+) -> dict[str, Any]:
+  key = entry["key"]
+  cached = fetched_cache.get(key)
+  if isinstance(cached, dict) and cached.get("ok"):
+    return cached
+  tid = entry["target_id"]
+  if entry["kind"] == "gerrit":
+    info = fetch_gerrit_cl_status(
+        tid, rollers, incidents, skia_dir=skia_dir, preferred_host=entry["host"]
+    )
+  else:
+    slug = entry["repo_slug"] or "flutter/flutter"
+    info = (
+        fetch_github_pr_status(tid)
+        if slug == "flutter/flutter"
+        else fetch_github_pr_status(tid, repo_slug=slug)
+    )
+  fetched_cache[key] = info
+  return info
+
+
+def _attach_watched_cl_badge(
+    by_ikey: dict[str, list[dict[str, Any]]],
+    unblocks: str,
+    badge: dict[str, Any],
+) -> None:
+  if not unblocks:
+    return
+  key = badge["key"]
+  for p_rec in by_ikey.get(unblocks) or []:
+    if not isinstance(p_rec, dict):
+      continue
+    b_list = p_rec.setdefault("blocked_by_watches", [])
+    if not any(isinstance(x, dict) and x.get("key") == key for x in b_list):
+      b_list.append(badge)
+
+
+def _dispatch_watched_cl_terminal(
+    *,
+    entry: dict[str, str],
+    info: dict[str, Any],
+    cur_status: str,
+    short_label: str,
+    resolved_url: str,
+    w_rec: dict[str, Any],
+    by_ikey: dict[str, list[dict[str, Any]]],
+    events: list[dict[str, Any]],
+    wake_chats: bool,
+) -> None:
+  # Skip chain graph scans once both terminal watermarks are already sealed
+  need_alert = w_rec["alerted_status"] != cur_status
+  need_wake = wake_chats and w_rec["woken_status"] != cur_status
+  if not need_alert and not need_wake:
+    return
+  target_cid, proj_name = _resolve_watch_wakeup_target(entry, by_ikey)
+  msg = _format_watched_cl_transition_message(entry, info, cur_status, by_ikey)
+  ev_ikey = entry["unblocks"] or entry["key"]
+  # Track alert and chat-wakeup watermarks separately so --no-wake runs never swallow wakeups
+  if need_alert:
+    w_rec["alerted_status"] = cur_status
+    events.insert(
+        0,
+        {
+            "id": f"ev-watch-{int(time.time() * 1000)}-{entry['target_id']}",
+            "time": now_et_str(),
+            "item_key": ev_ikey,
+            "target_id": entry["target_id"],
+            "conversation_id": target_cid,
+            "project_name": proj_name,
+            "critical": True,
+            "message": msg,
+        },
+    )
+    del events[50:]
+    send_desktop_alert(
+        f"Watched Blocker {short_label}: {cur_status}", msg, resolved_url
+    )
+  # Only seal woken_status once delivered or queued in quota_hold so transient RPC failures retry
+  if need_wake and target_cid:
+    woken = wake_conversation(target_cid, msg, item_key=ev_ikey)
+    if woken or f"conv:{target_cid}" in quota_hold.load_hold_queue():
+      w_rec["woken_status"] = cur_status
+
+
+def poll_watched_cls(
+    *,
+    state: dict[str, Any],
+    by_ikey: dict[str, list[dict[str, Any]]],
+    fetched_cache: dict[str, dict[str, Any]],
+    rollers: dict[str, Any],
+    incidents: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    wake_chats: bool = True,
+    skia_dir: str = DEFAULT_SKIA_DIR,
+) -> None:
+  """Polls external blocker CLs/PRs and fires one-shot terminal alerts and wakeups.
+
+  Inputs: watcher state dict, item index by_ikey, per-poll fetched_cache, Gardener
+  rollers/incidents, mutable events list, wake_chats gate, and skia_dir.
+  Outputs: None.
+  Side effects: updates state["watched_cls"], attaches timestamp-free
+  blocked_by_watches badges onto unblocked records, and on MERGED/ABANDONED/CLOSED
+  emits one desktop alert, one critical event, and one wake_conversation call.
+  """
+  entries = load_watched_cls()
+  watched_state: dict[str, Any] = state.setdefault("watched_cls", {})
+  active_keys = {e["key"] for e in entries}
+  for stale_key in [k for k in watched_state if k not in active_keys]:
+    watched_state.pop(stale_key, None)
+  for entry in entries:
+    key = entry["key"]
+    tid = entry["target_id"]
+    unblocks = entry["unblocks"]
+    info = _fetch_watched_cl_info(entry, fetched_cache, rollers, incidents, skia_dir)
+    prev_w = watched_state.get(key)
+    prev_dict = prev_w if isinstance(prev_w, dict) else {}
+    if not isinstance(info, dict) or not info.get("ok"):
+      # Keep prior watermarks and cached blocker badge intact across transient timeouts
+      if prev_dict:
+        prev_dict["last_error"] = str((info or {}).get("error") or "fetch failed")
+        prev_dict["checked_at"] = now_et_str()
+        if prev_dict.get("status"):
+          short_lbl, _, fb_url = _watched_cl_link_and_label(
+              entry["kind"], tid, entry["host"], entry["repo_slug"],
+              str(prev_dict.get("url") or ""),
+          )
+          _attach_watched_cl_badge(by_ikey, unblocks, {
+              "key": key,
+              "label": short_lbl,
+              "url": fb_url,
+              "status": str(prev_dict["status"]),
+              "patchset": int(prev_dict.get("patchset") or 1),
+              "owner_name": str(prev_dict.get("owner_name") or ""),
+              "subject": str(prev_dict.get("subject") or ""),
+              "note": entry["note"],
+          })
+      continue
+    cur_status = str(info.get("status") or "NEW").upper()
+    is_terminal = cur_status in TERMINAL_WATCH_STATUSES
+    patchset = int(info.get("patchset") or 1)
+    subject = str(info.get("subject") or "")
+    owner_name = str(info.get("owner_name") or "")
+    short_label, _, resolved_url = _watched_cl_link_and_label(
+        entry["kind"],
+        tid,
+        str(info.get("host") or entry["host"]),
+        str(info.get("repo_slug") or entry["repo_slug"]),
+        str(info.get("url") or ""),
+    )
+    # Omit checked_at on item badges so quiet polls produce zero DOM signature churn
+    _attach_watched_cl_badge(by_ikey, unblocks, {
+        "key": key,
+        "label": short_label,
+        "url": resolved_url,
+        "status": cur_status,
+        "patchset": patchset,
+        "owner_name": owner_name,
+        "subject": subject,
+        "note": entry["note"],
+    })
+    # Reset terminal watermarks when an ABANDONED/CLOSED change is restored/reopened
+    w_rec: dict[str, Any] = {
+        "key": key,
+        "kind": entry["kind"],
+        "target_id": tid,
+        "url": resolved_url,
+        "status": cur_status,
+        "patchset": patchset,
+        "subject": subject,
+        "owner_name": owner_name,
+        "unblocks": unblocks,
+        "fallback_chain_id": entry["fallback_chain_id"],
+        "note": entry["note"],
+        "checked_at": now_et_str(),
+        "alerted_status": str(prev_dict.get("alerted_status") or "") if is_terminal else "",
+        "woken_status": str(prev_dict.get("woken_status") or "") if is_terminal else "",
+    }
+    watched_state[key] = w_rec
+    if is_terminal:
+      _dispatch_watched_cl_terminal(
+          entry=entry,
+          info=info,
+          cur_status=cur_status,
+          short_label=short_label,
+          resolved_url=resolved_url,
+          w_rec=w_rec,
+          by_ikey=by_ikey,
+          events=events,
+          wake_chats=wake_chats,
+      )
+
 
 def sync_once(
     wake_chats: bool = True,
@@ -14861,6 +15300,17 @@ def _sync_once_locked(
       # Backfill broken_bots on the parent when bots came from the fix CL description
       if merged_bots and not p_rec.get("broken_bots"):
         p_rec["broken_bots"] = list(merged_bots)
+
+  poll_watched_cls(
+      state=state,
+      by_ikey=by_ikey,
+      fetched_cache=fetched_cache,
+      rollers=rollers,
+      incidents=incidents,
+      events=events,
+      wake_chats=wake_chats,
+      skia_dir=skia_dir,
+  )
 
   state["items"] = new_items
   state["review_claims"] = review_claims
@@ -16705,6 +17155,26 @@ function badgesHtml(it, opts) {
       out.push(f.url
         ? link(f.url, text, 'badge has-fix', f.subject || 'Open fix CL/PR')
         : `<span class="badge has-fix">${text}</span>`);
+    }
+  }
+  if (it.status !== 'MERGED' && it.status !== 'ABANDONED' && it.status !== 'CLOSED') {
+    const watches = Array.isArray(it.blocked_by_watches) ? it.blocked_by_watches : [];
+    for (const w of watches) {
+      if (!w || !w.label) continue;
+      const wst = String(w.status || 'NEW').toUpperCase();
+      const isMerged = wst === 'MERGED';
+      const isClosed = wst === 'ABANDONED' || wst === 'CLOSED';
+      const text = isMerged
+        ? `Unblocked: ${esc(w.label)} MERGED`
+        : (isClosed
+          ? `Blocker ${esc(w.label)} ${esc(wst)}`
+          : `Waiting on ${esc(w.label)}${w.patchset ? ` (PS${esc(w.patchset)})` : ''}`);
+      const cls = isMerged ? 'badge has-fix' : 'badge wip';
+      const tip = [w.subject, w.owner_name ? `by ${w.owner_name}` : '', w.note]
+        .filter(Boolean).join(' — ');
+      out.push(w.url
+        ? link(w.url, text, cls, tip || 'Open watched blocker CL/PR')
+        : `<span class="${cls}">${text}</span>`);
     }
   }
   return out.join('');

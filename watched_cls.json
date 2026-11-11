@@ -1,0 +1,9 @@
+[
+  {
+    "key": "gerrit:1422158",
+    "host": "skia-review.googlesource.com",
+    "unblocks": "gerrit:1423199",
+    "fallback_chain_id": "1401a6c3-2a60-491f-9f22-000b3f950317",
+    "note": "Wire ParagraphBench.cpp into Bazel //bench:nanobench in Skia CL 1423199"
+  }
+]
