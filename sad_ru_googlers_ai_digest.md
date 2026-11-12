@@ -612,3 +612,53 @@
   - Мы работаем в корпоративной среде Cloudtop, где доступ к моделям предоставляется через внутреннюю инфраструктуру Google.
 
 
+
+
+---
+
+## 2026-11-12
+
+### Sad RU Googlers (HISTORY OFF) (`spaces/AAAAn_HZbYs`)
+
+#### 1. Утилита персонального ИИ-коучинга `sparkly-agy`
+- **Авторы**: Vadim Ivanov (`vivanov@google.com`, 07:35 ET / 12:35 UTC, тред `spaces/AAAAn_HZbYs/threads/Uy70QwIhMbU`), Michael Golikov (`mgolikov@google.com`), Slava Guzanov (`sguzanov@google.com`).
+- **Ссылки**: [go/sparkly-agy](http://goto.google.com/sparkly-agy).
+- **Суть**:
+  - Анонсирована внутренняя Jetski-утилита для персонального коучинга и анализа навыков работы с ИИ-агентами («Jetski тулза с персональным коучингом как улучшить свои ai скиллы»).
+  - В настоящее время находится в закрытой бете (доступ ограничен, при открытии 403 Forbidden).
+- **Вердикт полезности**: `⚪ Не нужно (YAGNI) / закрытая бета`.
+- **Как предлагаем использовать**:
+  - Наш агентский стек уже оснащён специализированными ревьюерами и верификаторами (`amnesia-precommit`, `amnesia-doc-check`, `keeper_inquisitor`, `keeper_skeptic`), поэтому внешние коучинг-утилиты общего назначения не требуются.
+
+#### 2. Обсуждение лимитов сборки (1 month build horizon)
+- **Авторы**: Dennis Kormalev (`denk@google.com`, 19:41 ET 11 нояб. / 00:41 UTC 12 нояб., тред `spaces/AAAAn_HZbYs/threads/GxJkjQ9RGNw`), Anna Nachesa (`ashalynd@google.com`), Dmitry Vozzhaev (`dvozzhaev@google.com`), Eugene Krasichkov (`krasichkov@google.com`).
+- **Суть обсуждения**:
+  - Обсуждение корпоративных политик сборки и инфраструктурных сроков жизни артефактов («1 month build horizon, expected to be tightened in Q1»).
+- **Вердикт полезности**: `⚪ Не нужно (YAGNI) / инфраструктурный оффтоп`.
+
+---
+
+### Chrome AI Discuss (`spaces/AAQA45T8nC8`)
+
+#### 1. Доклад и слайды «JETSKI.EXE — How I actually use Jetski»
+- **Автор**: Ahmed Raslan (`rslan@google.com`, 11:08 ET / 16:08 UTC, тред `spaces/AAQA45T8nC8/threads/AQ-yZM_WiX0`).
+- **Ссылки и материалы**: Презентация [JETSKI.EXE — How I actually use Jetski (Arabs of Poland AI Coffee Chat #1)](https://docs.google.com/presentation/d/1Q9mrT55DQ-gZLPoJqvo7VYM7opxpnthoc2nFnFJVr6g/edit?slide=id.p&resourcekey=0-u0NotIwBQJQSqSmyEA8C0w#slide=id.p), плагин автора [`/google/src/files/head/depot/google3/experimental/users/rslan/plugins/print_watcher/`](file:///google/src/files/head/depot/google3/experimental/users/rslan/plugins/print_watcher/).
+- **Ключевые инварианты и практики доклада**:
+  1. *Четкое разграничение slash-команд*: слэш-команды в Jetski — это преимущественно текстовые промпт-обертки (`planPrompt` в `slash_command_prompts.go`), прикрепляемые к сообщению пользователя, за исключением `/goal`, имеющей собственный бэкенд-хук. При этом цепочки команд (например, `/plan /grill-me`) парсятся циклом в `step_string_converters.go`, но не гарантируют изолированную обработку.
+  2. *Механика плагинов*: плагин в Jetski представляет собой изолированную директорию с манифестом `plugin.json` и набором `skills/`.
+  3. *CDP-аутентификация без передачи паролей*: плагин `print_watcher` подключается по CDP (`--remote-debugging-port=9222`) к запущенному Chrome инженера и обращается к внутренним SSO-эндпоинтам (`3dprinteros.corp.goog`) без API-токенов.
+  4. *Инвариант «What did you NOT verify»*: обязательное требование честности и верификации фактов — перепроверять утверждения субагентов и моделей по первичным источникам.
+- **Вердикт полезности**: `🟡 Уже внедрено у нас`.
+- **Где это реализовано у нас**:
+  - Принцип строгой верификации и разделения фактов и домыслов зафиксирован в [`rules/reporting-integrity.md`](file:///usr/local/google/home/jlavrova/.gemini/config/rules/reporting-integrity.md) (*«Keep a clear line between what you observed in real tool output and what you inferred...»*).
+  - Работа с CDP и headless-браузером регламентирована в [`rules/browser_rules.md`](file:///usr/local/google/home/jlavrova/.gemini/config/plugins/browser/rules/browser_rules.md) и MCP-сервере `browser_browser`.
+  - Управление жизненным циклом плагинов и скиллов описано в скиллах `jetski-customizations` и `plugin`.
+
+#### 2. Демо генерации интерактивов с моделью Carbon
+- **Авторы**: Cheney Tsai (`cheneytsai@google.com`, 16:30 ET / 21:30 UTC, тред `spaces/AAQA45T8nC8/threads/8qN7TpTxmG0`), Andrew Grieve (`agrieve@google.com`).
+- **Ссылки**: [Zipline демо](https://serve-dot-zipline.googleplex.com/asset/72c66d2d-2946-5f64-8c88-db0798263362/).
+- **Суть**:
+  - Демонстрация интерактивной мини-игры (реинкарнация офлайн Chrome Dino) с использованием генерации кода моделью Carbon и хостингом артефактов на Zipline.
+- **Вердикт полезности**: `🟡 Уже внедрено у нас / демо`.
+- **Где это реализовано у нас**:
+  - Генерация интерактивных веб-виджетов, слайдов и отчётов у нас стандартизирована в скиллах `generative_ui` и `visual-html-reporting`.
