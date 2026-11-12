@@ -2963,6 +2963,462 @@ def subagent_model_routing_denial(tool_args: dict) -> str:
   return ""
 
 
+_QUOTA_HOLD_SOURCE_EXTS = SOURCE_EXTENSIONS | {".mm", ".m"}
+_QUOTA_HOLD_SOURCE_NAMES = SOURCE_FILENAMES | {"DEPS"}
+_GIT_MUTATING_SUBCMD_RE = re.compile(
+    r"^(?:env\s+\S+\s+)*git(?:\s+(?:-[Cc]\s+\S+|--[a-z-]+(?:=\S+)?))*\s+"
+    r"(add|stage|rm|mv|apply|am|cherry-pick|revert|stash\s+(?:pop|apply))\b"
+)
+_INLINE_PYTHON_RE = re.compile(
+    r"(?:^|[\s;&|(`])(?:\S*/)?python3?(?:\.\d+)?\s+(?:-c\b|-\s*<<|<<)"
+)
+_PYTHON_FILE_WRITE_RE = re.compile(
+    r"\bopen\s*\([^)]*['\"][wax+]|\.write_(?:text|bytes)\s*\("
+    r"|\bos\.replace\s*\(|\bshutil\.(?:copy\w*|move)\s*\("
+)
+_PYTHON_DIRECT_WRITE_TARGET_RE = re.compile(
+    r"\bopen\s*\(\s*(['\"])([^'\"]+)\1\s*,\s*(['\"])[wax+][^'\"]*\3"
+    r"|\bPath\s*\(\s*(['\"])([^'\"]+)\4\s*\)\s*\.\s*"
+    r"(?:open\s*\([^)]*['\"][wax+]|write_(?:text|bytes)\s*\()"
+    r"|\b(?:os\.replace|shutil\.(?:copy\w*|move))\s*\([^,]+,\s*(['\"])([^'\"]+)\6"
+)
+
+
+# Splits a shell command on top-level unquoted `;`, `\n`, `&&`, `||`, and optionally `|`
+def _split_unquoted_segments(s: str, *, split_pipes: bool = True) -> list[str]:
+  segs: list[str] = []
+  buf: list[str] = []
+  quote = ""
+  i, n = 0, len(s)
+  # Advances i by >= 1 on every iteration
+  while i < n:
+    ch = s[i]
+    if quote:
+      buf.append(ch)
+      if ch == "\\" and quote == '"' and i + 1 < n:
+        buf.append(s[i + 1])
+        i += 2
+        continue
+      if ch == quote:
+        quote = ""
+      i += 1
+      continue
+    if ch in ("'", '"'):
+      quote = ch
+      buf.append(ch)
+      i += 1
+      continue
+    if ch == "\\" and i + 1 < n:
+      buf.append(ch)
+      buf.append(s[i + 1])
+      i += 2
+      continue
+    if s[i : i + 2] in ("&&", "||"):
+      segs.append("".join(buf).strip())
+      buf = []
+      i += 2
+      continue
+    if ch in ("\n", ";") or (split_pipes and ch == "|"):
+      segs.append("".join(buf).strip())
+      buf = []
+      i += 1
+      continue
+    buf.append(ch)
+    i += 1
+  if buf:
+    segs.append("".join(buf).strip())
+  return [seg for seg in segs if seg]
+
+
+def _is_quota_hold_scratch_path(
+    raw_path: str, artifact_dir: str, workspace_paths: list[str]
+) -> bool:
+  cleaned_raw = (raw_path or "").strip().strip("'\"")
+  if not cleaned_raw:
+    return True
+  from context_guard import APP_DATA_DIR_CANDIDATES
+  import roadmap
+
+  clean = os.path.abspath(os.path.expanduser(cleaned_raw))
+  real = os.path.realpath(clean)
+  internal_roots = [roadmap.roadmaps_root()]
+  if artifact_dir:
+    internal_roots.append(artifact_dir)
+  for app_dir in APP_DATA_DIR_CANDIDATES:
+    expanded = os.path.expanduser(app_dir)
+    internal_roots.append(os.path.join(expanded, "brain"))
+    internal_roots.append(os.path.join(expanded, "roadmaps"))
+
+  for root in internal_roots:
+    if not root:
+      continue
+    abs_r = os.path.abspath(os.path.expanduser(root))
+    real_r = os.path.realpath(abs_r)
+    if (
+        clean == abs_r
+        or clean.startswith(abs_r + "/")
+        or real == real_r
+        or real.startswith(real_r + "/")
+    ):
+      return True
+
+  if not (clean.startswith("/tmp/") or real.startswith("/private/tmp/")):
+    return False
+  # Test fixtures and linked worktrees often live under /tmp and must still count as repo code
+  for wp in workspace_paths or []:
+    if not wp:
+      continue
+    abs_wp = os.path.abspath(os.path.expanduser(wp))
+    real_wp = os.path.realpath(abs_wp)
+    if (
+        clean == abs_wp
+        or clean.startswith(abs_wp + "/")
+        or real == real_wp
+        or real.startswith(real_wp + "/")
+    ):
+      return False
+
+  probe = os.path.dirname(clean)
+  while probe and not os.path.isdir(probe):
+    parent = os.path.dirname(probe)
+    if parent == probe:
+      break
+    probe = parent
+  if probe and _git_out(probe, "rev-parse", "--show-toplevel"):
+    return False
+  return True
+
+
+def _is_non_scratch_source_token(
+    tok: str, base_dir: str, artifact_dir: str, workspace_paths: list[str]
+) -> bool:
+  t = (tok or "").strip().strip("'\"(),;").lstrip(">")
+  if not t or t.startswith(("-", "&")) or t.startswith("/dev/"):
+    return False
+  name = os.path.basename(t)
+  _, ext = os.path.splitext(name)
+  if name not in _QUOTA_HOLD_SOURCE_NAMES and ext.lower() not in _QUOTA_HOLD_SOURCE_EXTS:
+    return False
+  cand = os.path.expanduser(t)
+  if not os.path.isabs(cand) and base_dir:
+    cand = os.path.join(base_dir, cand)
+  return not _is_quota_hold_scratch_path(cand, artifact_dir, workspace_paths)
+
+
+def _quota_hold_commit_denial_kind(
+    cmd_code: str, cmd_header_only: str, workspace_paths: list[str]
+) -> str:
+  if not GIT_COMMIT_AT_RE.search(cmd_code):
+    return ""
+  raw_segs = _split_unquoted_segments(cmd_header_only, split_pipes=False)
+  for idx, raw_seg in enumerate(raw_segs):
+    seg_code = _non_inspection_cmd_segments(QUOTED_RE.sub('""', raw_seg))
+    if not GIT_COMMIT_AT_RE.search(seg_code):
+      continue
+    if re.search(r"\bcommit-", seg_code) or re.search(
+        r"\s(?:-h|--help|--dry-run)(?=\s|$)", seg_code
+    ):
+      continue
+    if not re.search(r"(?:^|\s)--amend(?=\s|$)", seg_code):
+      return "creating a new `git commit`"
+    for prev_raw in raw_segs[:idx]:
+      prev_code = _non_inspection_cmd_segments(
+          QUOTED_RE.sub('""', prev_raw)
+      ).strip().lstrip("(").strip()
+      if not prev_code:
+        continue
+      # COMMIT_SAFE_PRE_RE permits `git add` for decision_guard, which would change the tree here
+      if not COMMIT_SAFE_PRE_RE.match(prev_code) or re.match(
+          r"git\s+(?:-C\s+\S+\s+)?add\b", prev_code
+      ):
+        return "staging or modifying files before `git commit --amend`"
+    # Strip heredoc/redirection operators while keeping quoted pathspecs and `-C` paths intact
+    clean_seg = re.sub(
+        r"<<-?\s*(?:['\"]?\w+['\"]?)|<<<\s*\S+", "", raw_seg
+    ).strip()
+    include_wt, paths = _commit_scope(clean_seg)
+    if include_wt or paths or re.search(
+        r"(?:^|\s)(?:-i|--include)(?=\s|$)", seg_code
+    ):
+      return "amending file-tree changes via `git commit --amend`"
+    # `--amend --only` with no pathspecs ignores staged index entries and updates only the message
+    if re.search(r"(?:^|\s)(?:--only|-[a-zA-Z]*o[a-zA-Z]*)(?=\s|$)", seg_code):
+      continue
+    c_path = ""
+    try:
+      toks = shlex.split(clean_seg, posix=True)
+      if "-C" in toks and toks.index("-C") + 1 < len(toks):
+        c_path = os.path.expanduser(toks[toks.index("-C") + 1])
+    except ValueError:
+      c_path = ""
+    if c_path and os.path.isdir(c_path):
+      root = _git_out(c_path, "rev-parse", "--show-toplevel")
+    else:
+      root = _upload_repo_root(cmd_header_only, workspace_paths)
+    if not root:
+      continue
+    try:
+      cached = subprocess.run(
+          ["git", "-C", root, "diff", "--cached", "--quiet", "HEAD"],
+          capture_output=True,
+          timeout=2.0,
+          check=False,
+      )
+      if cached.returncode != 0:
+        return "amending staged index changes via `git commit --amend`"
+    except Exception:  # lint: allow-broad-except (git check must never crash guard)
+      continue
+  return ""
+
+
+def _quota_hold_shell_mutation_kind(
+    cmd: str, artifact_dir: str, workspace_paths: list[str]
+) -> str:
+  if not cmd:
+    return ""
+  cmd_no_heredoc = strip_heredocs(cmd)
+  # Preserve trailing redirects on `cat <<'EOF' > file.cpp` while dropping heredoc body lines
+  cmd_header_only = re.sub(
+      r"(<<-?\s*(['\"]?)(\w+)\2[^\n]*)\n.*?^\t*\3[ \t]*$",
+      r"\1",
+      cmd,
+      flags=re.DOTALL | re.MULTILINE,
+  )
+  cmd_code = _non_inspection_cmd_segments(QUOTED_RE.sub('""', cmd_no_heredoc))
+  if re.search(r"\bquota_hold\.py\s+(?:exempt|unexempt|unblock)\b", cmd_code):
+    return "self-modifying quota-hold state via `quota_hold.py`"
+  if re.search(r"\bdecision_guard\.py\s+ack\b", cmd_code) and (
+      "--card" in cmd_no_heredoc or re.search(r"=\s*policy\s*:", cmd_no_heredoc)
+  ):
+    return "recording a `policy` decision"
+  if re.search(r"\bauto_ship\.py\s+ship\b", cmd_code):
+    return "committing worktree changes via `auto_ship.py ship`"
+  commit_kind = _quota_hold_commit_denial_kind(
+      cmd_code, cmd_header_only, workspace_paths
+  )
+  if commit_kind:
+    return commit_kind
+
+  for seg in re.split(r"&&|\|\||;|\||\n", cmd_code):
+    s = seg.strip().lstrip("(").strip()
+    gm = _GIT_MUTATING_SUBCMD_RE.match(s)
+    if gm and not re.search(r"\s(?:-h|--help|-n|--dry-run|--check)(?=\s|$)", s):
+      return f"modifying index or worktree via `git {gm.group(1)}`"
+
+  dirs = _extract_cmd_target_dirs(cmd_header_only, workspace_paths)
+  base_dir = dirs[-1] if dirs else next(
+      (os.path.expanduser(wp) for wp in (workspace_paths or []) if wp), ""
+  )
+  for raw_seg in _split_unquoted_segments(cmd_header_only):
+    seg_code = _non_inspection_cmd_segments(QUOTED_RE.sub('""', raw_seg))
+    if re.search(r"(?:^|[\s(`])(?:sed|perl)\b[^\n]*\s-[a-zA-Z]*i", seg_code):
+      for m_tok in re.finditer(r"[^\s;&|()`]+", raw_seg):
+        if _is_non_scratch_source_token(
+            m_tok.group(0), base_dir, artifact_dir, workspace_paths
+        ):
+          return "in-place shell editing of a source or test file"
+  if re.search(r"(?:^|[\s;&|(`])patch\b", cmd_code) and not re.search(
+      r"\s(?:--dry-run|--check|-h|--help)(?=\s|$)", cmd_code
+  ):
+    return "applying a patch to worktree files"
+
+  for rm in re.finditer(
+      r"(?:(?<![&\w<>\-])(?:\d+)?>>?(?!>)|(?:\|\s*tee\b(?:\s+-a)?))\s*([^\s;&|)`]+)",
+      cmd_header_only,
+  ):
+    if _is_non_scratch_source_token(
+        rm.group(1), base_dir, artifact_dir, workspace_paths
+    ):
+      bname = os.path.basename(rm.group(1).strip("'\""))
+      return f"redirecting output into `{bname}`"
+
+  for raw_seg in _split_unquoted_segments(cmd_header_only):
+    s = raw_seg.strip().lstrip("(").strip()
+    if not re.match(r"^(?:cp|mv)\b", s):
+      continue
+    try:
+      toks = shlex.split(s, posix=True)
+    except ValueError:
+      continue
+    pos_args = [t for t in toks[1:] if t and not t.startswith("-")]
+    if len(pos_args) >= 2 and _is_non_scratch_source_token(
+        pos_args[-1], base_dir, artifact_dir, workspace_paths
+    ):
+      return f"overwriting `{os.path.basename(pos_args[-1])}` via `{toks[0]}`"
+
+  if _INLINE_PYTHON_RE.search(cmd_header_only) and _PYTHON_FILE_WRITE_RE.search(cmd):
+    py_targets = [
+        m.group(2) or m.group(5) or m.group(7)
+        for m in _PYTHON_DIRECT_WRITE_TARGET_RE.finditer(cmd)
+        if m.group(2) or m.group(5) or m.group(7)
+    ]
+    if not py_targets:
+      cmd_without_write_args = re.sub(
+          r"\.write(?:_text|_bytes)?\s*\([^)]*\)", "", cmd
+      )
+      py_targets = [
+          m.group(2)
+          for m in re.finditer(r"(['\"])([A-Za-z0-9_./~\-]+)\1", cmd_without_write_args)
+      ]
+    for target_tok in py_targets:
+      if _is_non_scratch_source_token(
+          target_tok, base_dir, artifact_dir, workspace_paths
+      ):
+        return f"writing `{os.path.basename(target_tok)}` via inline Python"
+  return ""
+
+
+def _quota_hold_restricted_operation(
+    tool_name: str,
+    tool_args: dict,
+    artifact_dir: str,
+    workspace_paths: list[str],
+) -> str:
+  if not isinstance(tool_args, dict):
+    return ""
+  if tool_name in EDIT_TOOLS:
+    target = get_tool_target_file(tool_args)
+    if not target or _is_quota_hold_scratch_path(target, artifact_dir, workspace_paths):
+      return ""
+    bname = os.path.basename(target.strip().strip("'\""))
+    return f"editing `{bname}` via `{tool_name}`"
+  if tool_name == "invoke_subagent":
+    model = _unquote_arg_str(tool_args.get("Model")).lower() or "inherit"
+    if model in ("flash", "flash_lite"):
+      return ""
+    return f"launching non-flash subagent (`Model=\"{model}\"`)"
+  if tool_name == "swarm":
+    action = _unquote_arg_str(tool_args.get("action")).lower()
+    model = _unquote_arg_str(tool_args.get("model")).lower()
+    if action in ("add", "model") and "flash" not in model:
+      return f"spawning or switching non-flash swarm worker (`action=\"{action}\"`)"
+    return ""
+  if tool_name == "run_command":
+    eff_wps = _with_cwd(str(tool_args.get("Cwd") or ""), workspace_paths)
+    return _quota_hold_shell_mutation_kind(
+        str(tool_args.get("CommandLine") or ""), artifact_dir, eff_wps
+    )
+  return ""
+
+
+def quota_hold_tool_denial(
+    tool_name: str,
+    tool_args: dict,
+    conv_id: str,
+    parent_conv_id: str,
+    transcript_path: str,
+    artifact_dir: str,
+    workspace_paths: list[str],
+    current_step_idx: int = -1,
+) -> str:
+  """Blocks code/test mutations and policy decisions while senior profile quota is exhausted.
+
+  Inputs: tool_name, tool_args, conversation/parent IDs, transcript/artifact/workspace paths.
+  Outputs: empty string when allowed (mechanical step or override), or `[QUOTA HOLD GUARD]` reason.
+  Side effects: reads hold queue, transcript, and LS model quota; unqueues chat on user override.
+  """
+  top_conv = (parent_conv_id or conv_id or "").strip()
+  if not top_conv:
+    return ""
+  restricted = _quota_hold_restricted_operation(
+      tool_name, tool_args, artifact_dir, workspace_paths
+  )
+  if not restricted:
+    return ""
+
+  try:
+    import chat_lifecycle
+    from context_guard import APP_DATA_DIR_CANDIDATES
+    import quota_hold
+
+    queued = quota_hold.load_hold_queue()
+    is_queued = f"conv:{top_conv}" in queued
+    # Keep unit tests hermetic when running with synthetic IDs and no test queue file
+    if (
+        not os.environ.get(quota_hold.QUEUE_PATH_ENV)
+        and not is_queued
+        and not any(
+            os.path.isdir(os.path.join(os.path.expanduser(d), "brain", top_conv))
+            for d in APP_DATA_DIR_CANDIDATES
+        )
+    ):
+      return ""
+
+    if top_conv == conv_id:
+      top_transcript = transcript_path
+      top_step_idx = current_step_idx
+    else:
+      cand = (
+          transcript_path.replace(conv_id, top_conv)
+          if (conv_id and transcript_path and conv_id in transcript_path)
+          else ""
+      )
+      top_transcript = cand if (cand and os.path.isfile(cand)) else ""
+      top_step_idx = -1
+
+    profile = quota_hold.resolve_conversation_profile(conv_id=top_conv)
+    if profile == "triage":
+      return ""
+    if quota_hold.is_conversation_exempt(top_conv):
+      if is_queued:
+        quota_hold.unblock_conversation(top_conv)
+      return ""
+    if quota_hold.is_orchestrator_execution_turn(
+        top_transcript, conv_id=top_conv, current_step_idx=top_step_idx
+    ):
+      return ""
+
+    avail_models = (chat_lifecycle.get_available_models() or {}).get("models") or {}
+    qstate = quota_hold.get_profile_quota_state(avail_models, profile)
+    if not qstate.get("found_any"):
+      return ""
+
+    unreliable_label = ""
+    if artifact_dir and not parent_conv_id:
+      cg_state = os.path.join(artifact_dir, "scratch", ".context_guard_state.json")
+      if os.path.isfile(cg_state):
+        try:
+          with open(cg_state, "r", encoding="utf-8") as f:
+            unreliable_label = str((json.load(f) or {}).get("unreliable_model_label") or "")
+        except (OSError, ValueError):
+          unreliable_label = ""
+
+    should_hold = bool(
+        qstate.get("all_zero")
+        or (qstate.get("below_emergency_floor") and (is_queued or unreliable_label))
+    )
+    if not should_hold:
+      return ""
+    if quota_hold.has_user_quota_hold_override(
+        top_conv,
+        transcript_path=top_transcript,
+        models=avail_models,
+        current_step_idx=top_step_idx,
+    ):
+      if is_queued:
+        quota_hold.unblock_conversation(top_conv)
+      return ""
+
+    best = qstate.get("best_model") or {}
+    nominal_lbl = str(best.get("display") or best.get("id") or profile)
+    reset_disp = str(qstate.get("reset_display") or qstate.get("reset_time") or "")
+    reset_str = f" (reset at `{reset_disp}`)" if reset_disp else ""
+    max_pct = round(float(qstate.get("max_quota") or 0.0) * 100)
+    return (
+        f"[QUOTA HOLD GUARD] Blocked {restricted} because all senior models for profile "
+        f"`{profile}` are exhausted (max remaining quota `{max_pct}%`{reset_str}). "
+        "Mechanical completion steps remain allowed (reading files/logs, running test or "
+        "corpus orchestrators, launching `Model=\"flash\"` subagents, commit-message-only "
+        "`git commit --amend`, `git cl upload` / `git push` to `refs/for/*`, and "
+        "`canary_advisor.py`). Product source/test edits, tree-changing commits, non-flash "
+        f"subagents, and `policy` decisions must wait for `{nominal_lbl}` after quota "
+        "reset unless the user switches `Model Selection` in UI to a model with quota or "
+        "confirms junior-model execution in chat."
+    )
+  except Exception:  # lint: allow-broad-except (guard must never crash hook)
+    return ""
+
+
 def exploration_circuit_breaker_denial(
     tool_name: str,
     tool_args: dict,
@@ -5437,6 +5893,26 @@ def main() -> None:
       print(
           json.dumps(
               {"decision": "deny", "reason": xp_denial}, ensure_ascii=False
+          )
+      )
+      return
+
+  # Block code/test mutations, non-flash subagents, and policy acks while senior quota is 0%
+  if not (tool_name == "invoke_subagent" and subagent_model_routing_denial(tool_args)):
+    qh_denial = quota_hold_tool_denial(
+        tool_name,
+        tool_args,
+        conv_id,
+        parent_conv_id,
+        transcript_path,
+        artifact_dir,
+        workspace_paths,
+        step_idx_val,
+    )
+    if qh_denial:
+      print(
+          json.dumps(
+              {"decision": "deny", "reason": qh_denial}, ensure_ascii=False
           )
       )
       return

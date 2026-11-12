@@ -6719,7 +6719,11 @@ def wake_conversation(
     return False
   # Queue background item wakeups for post-reset resume when senior profile quota is below 5%
   should_hold = bool(item_key) if allow_hold is None else allow_hold
-  if should_hold:
+  if (
+      should_hold
+      and not quota_hold.is_conversation_exempt(conv_id)
+      and not quota_hold.has_user_quota_hold_override(conv_id)
+  ):
     profile = _resolve_record_profile(conv_id)
     is_held, qstate = _check_profile_quota_hold(profile)
     if is_held:

@@ -2022,7 +2022,9 @@ def resolve_unreliable_turn_warning(
 
 
 # Enqueues non-triage conversations when all allowed senior models are exhausted
-def resolve_quota_exhaustion_hold_notice(conv_id: str, m: dict, state: dict) -> str:
+def resolve_quota_exhaustion_hold_notice(
+    conv_id: str, m: dict, state: dict, transcript_path: str = ""
+) -> str:
   model_enum = str((m or {}).get("model_enum") or "").strip()
   # Skip SQLite and LS quota RPCs on the fast path when generatorMetadata has no model enum
   if not conv_id or not model_enum:
@@ -2033,6 +2035,13 @@ def resolve_quota_exhaustion_hold_notice(conv_id: str, m: dict, state: dict) -> 
 
     profile = quota_hold.resolve_conversation_profile(conv_id=conv_id)
     if profile == "triage":
+      return ""
+    if quota_hold.is_conversation_exempt(conv_id):
+      quota_hold.unblock_conversation(conv_id)
+      return ""
+    if quota_hold.is_orchestrator_execution_turn(
+        transcript_path, conv_id=conv_id
+    ):
       return ""
     avail_models = (chat_lifecycle.get_available_models() or {}).get("models") or {}
     qstate = quota_hold.get_profile_quota_state(avail_models, profile)
@@ -2045,6 +2054,11 @@ def resolve_quota_exhaustion_hold_notice(conv_id: str, m: dict, state: dict) -> 
         or (unreliable_label and qstate.get("below_emergency_floor"))
     )
     if not should_hold:
+      return ""
+    if quota_hold.has_user_quota_hold_override(
+        conv_id, transcript_path=transcript_path, models=avail_models
+    ):
+      quota_hold.unblock_conversation(conv_id)
       return ""
     best = qstate.get("best_model") or {}
     nominal_id = str(best.get("id") or "")
@@ -2066,11 +2080,18 @@ def resolve_quota_exhaustion_hold_notice(conv_id: str, m: dict, state: dict) -> 
     reset_str = f" (reset at `{reset_disp}`)" if reset_disp else ""
     return (
         f"[QUOTA HOLD GUARD] All allowed senior models for profile `{profile}` are"
-        f" exhausted (max remaining quota `{max_pct}%`{reset_str}). Do NOT execute"
-        " tools or continue work on a junior model. Output a short message"
-        " informing the user that this chat is paused in"
-        " `~/.gemini/jetski/quota_hold_queue.json` and will automatically resume"
-        f" on `{nominal_lbl}` after quota reset{reset_str}, then stop calling tools."
+        f" exhausted (max remaining quota `{max_pct}%`{reset_str}). Mechanical"
+        " completion steps that do NOT modify product source or test code ARE"
+        " allowed on the current model: reading files/logs, running test/corpus"
+        " orchestrators and audit scripts, launching `Model=\"flash\"` subagents,"
+        " commit-message-only `git commit --amend` (`Tested:` / `Assisted-by:`"
+        " with no file-tree changes), `git cl upload` / `git push` to"
+        " `refs/for/*`, and `canary_advisor.py`. Editing product source/test"
+        " files, tree-changing commits, non-flash subagents, and `policy`"
+        " decisions are hard-blocked by `pre_tool_guard.py`; if those are"
+        " required next, inform the user that this chat is queued in"
+        " `~/.gemini/jetski/quota_hold_queue.json` to auto-resume on"
+        f" `{nominal_lbl}` after quota reset{reset_str} and stop calling tools."
     )
   except Exception:  # lint: allow-broad-except (guard must never crash hook)
     return ""
@@ -2482,7 +2503,9 @@ def run(data: dict, log: dict) -> dict:
     if unreliable_notice and (is_turn_start or invocation_num == 0 or unreliable_changed):
       messages.append(unreliable_notice)
     # Enqueue and warn when all senior models in the chat's profile are at 0% quota
-    quota_hold_notice = resolve_quota_exhaustion_hold_notice(conv_id, m, state)
+    quota_hold_notice = resolve_quota_exhaustion_hold_notice(
+        conv_id, m, state, transcript_path=transcript_path
+    )
     if quota_hold_notice:
       messages.append(quota_hold_notice)
     soft_due = steps - int(

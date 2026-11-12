@@ -2774,6 +2774,539 @@ class TestChatLifecycle(unittest.TestCase):
         self.assertEqual(len(woken_calls), 2)
         self.assertEqual(quota_hold.load_hold_queue(qpath), {})
 
+  # Verifies per-chat exemptions, handoff chain inheritance, and UI/user quota-hold overrides
+  def test_quota_hold_exemptions_and_user_overrides(self):
+    scripts_dir = os.path.expanduser("~/.gemini/config/scripts")
+    if scripts_dir not in sys.path:
+      sys.path.insert(0, scripts_dir)
+    import cl_watcher
+    import context_guard
+    import quota_hold
+
+    models_catalog = {
+        "opus-5.5-medium": {
+            "model": "MODEL_PLACEHOLDER_M369",
+            "displayName": "Claude Opus 5.5 (Medium)",
+            "quotaInfo": {"remainingFraction": 0.0, "resetTime": "2026-11-07T13:00:00Z"},
+        },
+        "gemini-4-carbon-high": {
+            "model": "MODEL_PLACEHOLDER_M427",
+            "displayName": "Gemini 4 Carbon (High)",
+            "quotaInfo": {"remainingFraction": 0.0, "resetTime": "2026-11-07T12:00:00Z"},
+        },
+        "auto": {
+            "model": "MODEL_PLACEHOLDER_M900",
+            "displayName": "Gemini Pro Next",
+            "quotaInfo": {"remainingFraction": 0.85, "resetTime": "2026-11-07T15:00:00Z"},
+        },
+    }
+    now_ts = chat_lifecycle.parse_iso_reset_ts("2026-11-07T02:00:00Z")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      qpath = os.path.join(tmp_dir, "quota_hold_queue.json")
+      brain_dir = os.path.join(tmp_dir, "brain")
+
+      def write_tx(cid: str, steps: list[dict]) -> str:
+        tpath = os.path.join(brain_dir, cid, ".system_generated", "logs", "transcript.jsonl")
+        os.makedirs(os.path.dirname(tpath), exist_ok=True)
+        with open(tpath, "w", encoding="utf-8") as f:
+          for s in steps:
+            f.write(json.dumps(s, ensure_ascii=False) + "\n")
+        return tpath
+
+      with (
+          patch.dict(os.environ, {"JETSKI_QUOTA_HOLD_QUEUE_FILE": qpath}),
+          patch.object(
+              chat_lifecycle, "get_available_models", return_value={"models": models_catalog}
+          ),
+          patch.object(chat_lifecycle, "find_app_data_dirs", return_value=[tmp_dir]),
+          patch.object(quota_hold, "resolve_conversation_profile", return_value="cpp-core"),
+          patch.object(chat_lifecycle, "set_conversation_wait_state", return_value=True),
+          patch.object(chat_lifecycle, "_now_ts", return_value=now_ts),
+      ):
+        quota_hold.enqueue_quota_hold(
+            kind="pre_invocation_quota_hold",
+            profile="cpp-core",
+            conversation_id="conv-root",
+            queue_path=qpath,
+        )
+        self.assertIn("conv:conv-root", quota_hold.load_hold_queue(qpath))
+
+        models_catalog["gemini-3.8-flash-high"] = {
+            "model": "MODEL_PLACEHOLDER_M318",
+            "displayName": "Gemini 3.8 Flash (High)",
+            "quotaInfo": {"remainingFraction": 0.90, "resetTime": "2026-11-07T15:00:00Z"},
+        }
+        quota_hold.enqueue_quota_hold(
+            kind="pre_invocation_quota_hold",
+            profile="cpp-core",
+            conversation_id="conv-child",
+            queue_path=qpath,
+        )
+        with patch.object(
+            chat_lifecycle,
+            "discover_conversation_chain",
+            side_effect=lambda cid, include_descendants=True: (
+                ["conv-root", "conv-child"]
+                if (cid == "conv-child" or include_descendants)
+                else ["conv-root"]
+            ),
+        ):
+          quota_hold.exempt_conversation("conv-root", reason="incident_unblock", queue_path=qpath)
+          self.assertEqual(quota_hold.load_hold_queue(qpath), {})
+          self.assertTrue(quota_hold.is_conversation_exempt("conv-root", queue_path=qpath))
+          self.assertTrue(quota_hold.is_conversation_exempt("conv-child", queue_path=qpath))
+          self.assertEqual(
+              context_guard.resolve_quota_exhaustion_hold_notice(
+                  "conv-child", {"model_enum": "MODEL_PLACEHOLDER_M369"}, {}
+              ),
+              "",
+          )
+          self.assertEqual(
+              quota_hold.scan_and_enqueue_halted_chats(
+                  {"conv-child": {"status": "QUOTA_EXHAUSTED"}},
+                  models=models_catalog,
+                  queue_path=qpath,
+              ),
+              [],
+          )
+          with patch.object(chat_lifecycle, "ls_rpc", return_value={}) as rpc_mock:
+            self.assertTrue(
+                cl_watcher.wake_conversation(
+                    "conv-child", "[CL-WATCHER] Comment", item_key="skia:123"
+                )
+            )
+            rpc_mock.assert_called_once()
+          self.assertTrue(quota_hold.unexempt_conversation("conv-root", queue_path=qpath))
+          self.assertFalse(quota_hold.is_conversation_exempt("conv-root", queue_path=qpath))
+
+        # Initial UI hydration `from None to Gemini Pro Next` before any hold does not bypass hold
+        tx_ui = write_tx(
+            "conv-ui",
+            [
+                {
+                    "step_index": 0,
+                    "type": "USER_INPUT",
+                    "created_at": "2026-11-07T01:55:00Z",
+                    "content": (
+                        "<USER_REQUEST>Fix bug</USER_REQUEST>\n<USER_SETTINGS_CHANGE>\n"
+                        "The user changed setting `Model Selection` from None to Gemini Pro Next.\n"
+                        "</USER_SETTINGS_CHANGE>"
+                    ),
+                }
+            ],
+        )
+        self.assertFalse(
+            quota_hold.has_user_quota_hold_override(
+                "conv-ui", transcript_path=tx_ui, models=models_catalog, now_ts=now_ts
+            )
+        )
+        notice_ui = context_guard.resolve_quota_exhaustion_hold_notice(
+            "conv-ui", {"model_enum": "MODEL_PLACEHOLDER_M369"}, {}, transcript_path=tx_ui
+        )
+        self.assertIn("[QUOTA HOLD GUARD]", notice_ui)
+        self.assertIn("conv:conv-ui", quota_hold.load_hold_queue(qpath))
+
+        # Post-hold UI switch to available model unblocks conv-ui and survives unblock_conversation
+        write_tx(
+            "conv-ui",
+            [
+                {
+                    "step_index": 0,
+                    "type": "USER_INPUT",
+                    "created_at": "2026-11-07T01:55:00Z",
+                    "content": "<USER_REQUEST>Fix bug</USER_REQUEST>",
+                },
+                {
+                    "step_index": 1,
+                    "type": "EPHEMERAL_MESSAGE",
+                    "created_at": "2026-11-07T02:00:00Z",
+                    "content": notice_ui,
+                },
+                {
+                    "step_index": 2,
+                    "type": "USER_INPUT",
+                    "created_at": "2026-11-07T02:01:00Z",
+                    "content": (
+                        "<USER_REQUEST>Continue</USER_REQUEST>\n<USER_SETTINGS_CHANGE>\n"
+                        "The user changed setting `Model Selection` from Claude Opus 5.5 (Medium)"
+                        " to Gemini Pro Next.\n</USER_SETTINGS_CHANGE>"
+                    ),
+                },
+            ],
+        )
+        self.assertEqual(
+            context_guard.resolve_quota_exhaustion_hold_notice(
+                "conv-ui", {"model_enum": "MODEL_PLACEHOLDER_M900"}, {}, transcript_path=tx_ui
+            ),
+            "",
+        )
+        self.assertNotIn("conv:conv-ui", quota_hold.load_hold_queue(qpath))
+        self.assertEqual(
+            context_guard.resolve_quota_exhaustion_hold_notice(
+                "conv-ui", {"model_enum": "MODEL_PLACEHOLDER_M900"}, {}, transcript_path=tx_ui
+            ),
+            "",
+        )
+
+        # Handoff continuation piece inherits parent's post-hold UI override and explicit text
+        tx_cont = write_tx(
+            "conv-ui-p2",
+            [
+                {
+                    "step_index": 0,
+                    "type": "USER_INPUT",
+                    "created_at": "2026-11-07T02:05:00Z",
+                    "content": (
+                        "Continuing unfinished work from previous conversation "
+                        "(conversation://conv-ui)."
+                    ),
+                }
+            ],
+        )
+        self.assertTrue(
+            quota_hold.has_user_quota_hold_override(
+                "conv-ui-p2", transcript_path=tx_cont, models=models_catalog, now_ts=now_ts
+            )
+        )
+
+        tx_msg = write_tx(
+            "conv-jr-msg",
+            [
+                {
+                    "step_index": 0,
+                    "type": "USER_INPUT",
+                    "created_at": "2026-11-07T02:02:00Z",
+                    "content": (
+                        "<USER_REQUEST>Доделай механические шаги на младшей модели</USER_REQUEST>"
+                    ),
+                }
+            ],
+        )
+        self.assertTrue(
+            quota_hold.has_user_quota_hold_override(
+                "conv-jr-msg", transcript_path=tx_msg, models=models_catalog, now_ts=now_ts
+            )
+        )
+
+        # Versioned display names with dots (`Gemini 3.8 Flash (High)`) and GENERIC pre_tool_guard
+        # `[QUOTA HOLD GUARD] Blocked` denials recognize manual UI Model Selection switches
+        tx_ptg_dot = write_tx(
+            "conv-ptg-dot",
+            [
+                {
+                    "step_index": 0,
+                    "type": "USER_INPUT",
+                    "created_at": "2026-11-07T02:03:00Z",
+                    "content": "<USER_REQUEST>Edit code</USER_REQUEST>",
+                },
+                {
+                    "step_index": 1,
+                    "type": "GENERIC",
+                    "created_at": "2026-11-07T02:03:05Z",
+                    "content": (
+                        "Encountered error in step execution: tool call denied by pre-tool hook: "
+                        "[QUOTA HOLD GUARD] Blocked editing `ParagraphImpl.cpp` via `edit_file`"
+                    ),
+                },
+                {
+                    "step_index": 2,
+                    "type": "USER_INPUT",
+                    "created_at": "2026-11-07T02:04:00Z",
+                    "content": (
+                        "<USER_REQUEST>Continue</USER_REQUEST>\n<USER_SETTINGS_CHANGE>\n"
+                        "The user changed setting `Model Selection` from None to "
+                        "Claude Opus 5.5 (Medium).\n"
+                        "The user changed setting `Model Selection` from Claude Opus 5.5 (Medium)"
+                        " to Gemini 3.8 Flash (High).\n</USER_SETTINGS_CHANGE>"
+                    ),
+                },
+            ],
+        )
+        self.assertTrue(
+            quota_hold.has_user_quota_hold_override(
+                "conv-ptg-dot", transcript_path=tx_ptg_dot, models=models_catalog, now_ts=now_ts
+            )
+        )
+
+  # Verifies Orchestrator execution bypass and mechanical vs code/policy gates in pre_tool_guard
+  def test_quota_hold_orchestrator_exec_and_mechanical_tool_gate(self):
+    import subprocess
+    import context_guard
+    import pre_tool_guard
+    import quota_hold
+
+    exhausted_models = {
+        "opus-5.5-medium": {
+            "model": "MODEL_PLACEHOLDER_M369",
+            "displayName": "Claude Opus 5.5 (Medium)",
+            "quotaInfo": {"remainingFraction": 0.0, "resetTime": "2026-11-07T13:00:00Z"},
+        },
+        "gemini-4-carbon-high": {
+            "model": "MODEL_PLACEHOLDER_M427",
+            "displayName": "Gemini 4 Carbon (High)",
+            "quotaInfo": {"remainingFraction": 0.0, "resetTime": "2026-11-07T12:00:00Z"},
+        },
+    }
+    now_ts = chat_lifecycle.parse_iso_reset_ts("2026-11-07T02:00:00Z")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      qpath = os.path.join(tmp_dir, "quota_hold_queue.json")
+      repo_dir = os.path.join(tmp_dir, "skia_repo")
+      art_dir = os.path.join(tmp_dir, "brain", "conv-mech")
+      tx_path = os.path.join(art_dir, ".system_generated", "logs", "transcript.jsonl")
+      os.makedirs(repo_dir, exist_ok=True)
+      os.makedirs(os.path.join(art_dir, "scratch"), exist_ok=True)
+      os.makedirs(os.path.dirname(tx_path), exist_ok=True)
+
+      subprocess.run(["git", "-C", repo_dir, "init", "-q"], check=True)
+      subprocess.run(["git", "-C", repo_dir, "config", "user.email", "t@example.com"], check=True)
+      subprocess.run(["git", "-C", repo_dir, "config", "user.name", "Tester"], check=True)
+      src_cpp = os.path.join(repo_dir, "ParagraphImpl.cpp")
+      with open(src_cpp, "w", encoding="utf-8") as f:
+        f.write("int x = 1;\n")
+      subprocess.run(["git", "-C", repo_dir, "add", "ParagraphImpl.cpp"], check=True)
+      subprocess.run(["git", "-C", repo_dir, "commit", "-q", "-m", "Initial"], check=True)
+
+      def write_steps(steps: list[dict]) -> None:
+        with open(tx_path, "w", encoding="utf-8") as f:
+          for s in steps:
+            f.write(json.dumps(s, ensure_ascii=False) + "\n")
+
+      def call_ptg(tool_name: str, tool_args: dict, ws: list[str] | None = None) -> dict:
+        payload = {
+            "conversationId": "conv-mech",
+            "transcriptPath": tx_path,
+            "artifactDirectoryPath": art_dir,
+            "workspacePaths": [repo_dir] if ws is None else ws,
+            "stepIdx": 50,
+            "toolCall": {"name": tool_name, "args": tool_args},
+        }
+        out_buf = io.StringIO()
+        with (
+            patch.object(sys, "stdin", io.StringIO(json.dumps(payload))),
+            contextlib.redirect_stdout(out_buf),
+        ):
+          pre_tool_guard.main()
+        raw = out_buf.getvalue().strip()
+        return json.loads(raw) if raw else {"decision": "allow"}
+
+      write_steps(
+          [
+              {
+                  "step_index": 0,
+                  "type": "USER_INPUT",
+                  "content": "<USER_REQUEST>Plan</USER_REQUEST>",
+              },
+              {
+                  "step_index": 1,
+                  "type": "PLANNER_RESPONSE",
+                  "tool_calls": [{"name": "exit_plan_mode", "args": {}}],
+              },
+              {
+                  "step_index": 2,
+                  "type": "USER_INPUT",
+                  "content": "<SYSTEM_MESSAGE>bg_task finished</SYSTEM_MESSAGE>",
+              },
+              {
+                  "step_index": 3,
+                  "type": "PLANNER_RESPONSE",
+                  "tool_calls": [{"name": "read_file", "args": {"Path": src_cpp}}],
+              },
+          ]
+      )
+
+      with (
+          patch.dict(os.environ, {"JETSKI_QUOTA_HOLD_QUEUE_FILE": qpath}),
+          patch.object(
+              chat_lifecycle, "get_available_models", return_value={"models": exhausted_models}
+          ),
+          patch.object(quota_hold, "resolve_conversation_profile", return_value="cpp-core"),
+          patch.object(chat_lifecycle, "set_conversation_wait_state", return_value=True),
+          patch.object(chat_lifecycle, "_now_ts", return_value=now_ts),
+      ):
+        # Active Orchestrator execution phase bypasses both PreInvocation hold and edit block
+        self.assertTrue(quota_hold.is_orchestrator_execution_turn(tx_path))
+        self.assertEqual(
+            context_guard.resolve_quota_exhaustion_hold_notice(
+                "conv-mech", {"model_enum": "MODEL_PLACEHOLDER_M369"}, {}, transcript_path=tx_path
+            ),
+            "",
+        )
+        self.assertEqual(
+            call_ptg(
+                "edit_file",
+                {"Path": src_cpp, "Target": "int x = 1;", "Replacement": "int x = 2;"},
+            )["decision"],
+            "allow",
+        )
+
+        # Next real USER_INPUT exits Orchestrator execution phase and activates 0% cpp-core gate
+        write_steps(
+            [
+                {
+                    "step_index": 0,
+                    "type": "USER_INPUT",
+                    "content": "<USER_REQUEST>Finish gates</USER_REQUEST>",
+                },
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "tool_calls": [{"name": "read_file", "args": {"Path": src_cpp}}],
+                },
+            ]
+        )
+        self.assertFalse(quota_hold.is_orchestrator_execution_turn(tx_path))
+
+        # Allowed mechanical steps: read_file, scratch write, flash subagent, runners, msg-amend
+        self.assertEqual(call_ptg("read_file", {"Path": src_cpp})["decision"], "allow")
+        self.assertEqual(
+            call_ptg(
+                "write_file",
+                {"Path": os.path.join(art_dir, "scratch", "notes.md"), "Content": "ok"},
+            )["decision"],
+            "allow",
+        )
+        self.assertEqual(
+            call_ptg(
+                "invoke_subagent",
+                {
+                    "TypeName": "self",
+                    "Model": "flash",
+                    "Role": "Flutter Corpus Runner",
+                    "Prompt": "Run suite",
+                },
+            )["decision"],
+            "allow",
+        )
+        for ok_cmd in (
+            "python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/"
+            "run_flutter_paragraph_tests.py --targeted",
+            f'git -C {repo_dir} commit --amend -m "Subject\n\nTested: dm ok"',
+            f"git -C {repo_dir} commit --amend -F - <<'EOF'\nFix ParagraphImpl.cpp\n\nTested: ok\nEOF",
+            "python3 -c \"open('/tmp/qh_commit_msg.txt', 'w').write('Fix ParagraphImpl.cpp')\"",
+            "sed -i '' 's/a/b/' /tmp/qh_commit_msg.txt && "
+            "python3 ~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py 1411685",
+            f"git -C {repo_dir} push origin HEAD:refs/for/main",
+            "python3 ~/.gemini/config/skills/skia-canary-advisor/scripts/canary_advisor.py 1411685",
+        ):
+          res_ok = call_ptg("run_command", {"CommandLine": ok_cmd, "WaitMsBeforeAsync": 10000})
+          self.assertEqual(res_ok["decision"], "allow", f"Expected allow for {ok_cmd}: {res_ok}")
+
+        # Blocked under 0% cpp-core: source edits, non-flash subagent, tree commits, policy ack
+        for bad_tool, bad_args in (
+            ("edit_file", {"Path": src_cpp, "Target": "int x = 1;", "Replacement": "int x = 2;"}),
+            ("write_file", {"Path": os.path.join(repo_dir, "NewTest.cpp"), "Content": "// t\n"}),
+            (
+                "invoke_subagent",
+                {"TypeName": "self", "Model": "inherit", "Role": "Auditor", "Prompt": "Audit"},
+            ),
+            ("swarm", {"action": "add", "name": "w1", "brief": "Code"}),
+            (
+                "run_command",
+                {"CommandLine": f'git -C {repo_dir} commit -m "New"', "WaitMsBeforeAsync": 10000},
+            ),
+            (
+                "run_command",
+                {
+                    "CommandLine": f"git -C {repo_dir} add ParagraphImpl.cpp",
+                    "WaitMsBeforeAsync": 10000,
+                },
+            ),
+            (
+                "run_command",
+                {
+                    "CommandLine": f'git -C {repo_dir} commit --amend -a -m "Amend wt"',
+                    "WaitMsBeforeAsync": 10000,
+                },
+            ),
+            (
+                "run_command",
+                {
+                    "CommandLine": (
+                        f'git -C "{repo_dir}" commit --amend -m "Subject" "ParagraphImpl.cpp"'
+                    ),
+                    "WaitMsBeforeAsync": 10000,
+                },
+            ),
+            (
+                "run_command",
+                {
+                    "CommandLine": f"cat <<'EOF' > {src_cpp}\nint x = 3;\nEOF",
+                    "WaitMsBeforeAsync": 10000,
+                },
+            ),
+            (
+                "run_command",
+                {
+                    "CommandLine": f"sed -i '' 's/1/2/' {src_cpp}",
+                    "WaitMsBeforeAsync": 10000,
+                },
+            ),
+            (
+                "run_command",
+                {
+                    "CommandLine": f'python3 -c "open(\'{src_cpp}\', \'w\').write(\'x\')"',
+                    "WaitMsBeforeAsync": 10000,
+                },
+            ),
+            (
+                "run_command",
+                {
+                    "CommandLine": (
+                        "python3 ~/.gemini/config/hooks/decision_guard.py ack conv-mech "
+                        "--card /tmp/card.md T=policy:why"
+                    ),
+                    "WaitMsBeforeAsync": 10000,
+                },
+            ),
+            (
+                "run_command",
+                {
+                    "CommandLine": "python3 ~/.gemini/config/hooks/quota_hold.py exempt conv-mech",
+                    "WaitMsBeforeAsync": 10000,
+                },
+            ),
+        ):
+          res_bad = call_ptg(bad_tool, bad_args)
+          self.assertEqual(res_bad["decision"], "deny", f"Expected deny for {bad_tool} {bad_args}")
+          self.assertIn("[QUOTA HOLD GUARD]", res_bad.get("reason", ""))
+
+        # Staged index changes turn `git commit --amend` into a tree-changing commit -> blocked
+        with open(src_cpp, "w", encoding="utf-8") as f:
+          f.write("int x = 9;\n")
+        subprocess.run(["git", "-C", repo_dir, "add", "ParagraphImpl.cpp"], check=True)
+        staged_amend = call_ptg(
+            "run_command",
+            {
+                "CommandLine": f'git -C {repo_dir} commit --amend -m "Subject"',
+                "WaitMsBeforeAsync": 10000,
+            },
+        )
+        self.assertEqual(staged_amend["decision"], "deny")
+        self.assertIn("[QUOTA HOLD GUARD]", staged_amend.get("reason", ""))
+        cwd_staged_amend = call_ptg(
+            "run_command",
+            {
+                "CommandLine": 'git commit --amend -m "Subject"',
+                "Cwd": repo_dir,
+                "WaitMsBeforeAsync": 10000,
+            },
+            ws=[],
+        )
+        self.assertEqual(cwd_staged_amend["decision"], "deny")
+        self.assertIn("[QUOTA HOLD GUARD]", cwd_staged_amend.get("reason", ""))
+
+        # Explicit per-chat exemption immediately lifts the pre_tool_guard block
+        quota_hold.exempt_conversation("conv-mech", reason="user_approved", queue_path=qpath)
+        self.assertEqual(
+            call_ptg(
+                "edit_file",
+                {"Path": src_cpp, "Target": "int x = 9;", "Replacement": "int x = 10;"},
+            )["decision"],
+            "allow",
+        )
+
   # Verifies R85 archive guards across next-task, sweep, project retention, and archived audit
   def test_r85_live_work_and_open_gerrit_cl_archive_guards(self):
     import roadmap
