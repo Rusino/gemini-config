@@ -57,9 +57,9 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
        `CR+1` (or a Googler owner and author). A `CR+1` on the reviewed CL alone gives
        `MISSING_APPROVAL` after about a minute; `triage` lists the parents that block it. Never
        vote `CR+1` on unreviewed parents just to unblock `Canary-G3`.
-     - Other canaries (`Canary-Chromium`, `Canary-Android`) have no such restriction and are
-       triggered immediately. `Canary-Flutter` is disabled (see below): run the full local
-       Flutter corpus instead.
+     - Other canaries (`Canary-Chromium`, `Canary-Android`, `Canary-Flutter`) have no such
+       restriction and are triggered immediately. For `skparagraph`/`skunicode`/`skshaper`
+       paths the full local Flutter corpus runs alongside `Canary-Flutter` (see below).
    - **Internal Authors / Own CLs**: Show the printed `Canary Command` for canaries and run it
      ONLY after the user explicitly approves. (For ASAN, you still run it automatically).
 5. **Background Monitoring & Wakeup Protocol**:
@@ -71,8 +71,9 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
    - **On Red Canary (`UNRELATED_HEAD_BREAKAGE` across All Canaries)**: `watch --save-draft` and
      `triage --save-draft` verify the downstream roll CL for **all** Skia canaries (`Canary-G3`
      via `skia_gardener` `CheckTestsSkia` + `blaze query somepath`, `Canary-Chromium` via
-     Buildbucket CQ trybots on `https://crrev.com/c/<roll_cl>/<ps>`, and `Canary-Android` via
-     TreeHugger messages + AnTS build/test logs) before returning `UNRELATED_HEAD_BREAKAGE`, and
+     Buildbucket CQ trybots on `https://crrev.com/c/<roll_cl>/<ps>`, `Canary-Android` via
+     TreeHugger messages + AnTS build/test logs, and `Canary-Flutter` via the GitHub checks of
+     the `flutter/flutter` roll PR) before returning `UNRELATED_HEAD_BREAKAGE`, and
      save a strictly sanitized English `/PATCHSET_LEVEL` draft on the CL's **current** patchset
      (enforcing `PUBLIC_DRAFT_LEAK_RE` so zero `cl/`, `ag/`, `cr/`, `b/`, `go/`, `googleplex`,
      `//...` paths, or AnTS `I<15+>` IDs reach public Gerrit). When woken up, show the internal
@@ -153,6 +154,20 @@ python3 $S stats                     # RAN/skipped per logged recommendation + f
   - Evaluates the newest latest-revision TreeHugger message (failing closed on unparsed `FAIL:` lines) and marks `UNRELATED_HEAD_BREAKAGE` only when TreeHugger passed on automatic retry (`Verify-Pass` / `Presubmit-Verified+1`), when `build_error.log` fails strictly outside Skia/HWUI/consumers, or when failing test runs are TradeFed `*INFRA_ERROR` / AnTS failures with `0` Skia, HWUI, RenderEngine, Minikin, CtsText, PDFium, SurfaceFlinger, or touched-stem frames.
   - Public Gerrit drafts must never contain `ag/<N>`, `googleplex`, `*.corp.google.com` / `*.corp.goog`, internal device/lunch target names, or AnTS `I<15+>` invocation IDs.
 
+### `Canary-Flutter`
+- `canary_advisor.py triage` takes the newest `https://github.com/flutter/flutter/pull/<N>` from
+  Swarming stdout, reads the PR head SHA, every page of `check-runs` and the combined commit
+  `status` (`gh api`, anonymous REST fallback). `Presubmit` and `Dashboard Checks`
+  (`flutter-dashboard`) stand for the ~150 `flutter/try` LUCI builds.
+  - `UNRELATED_HEAD_BREAKAGE` only when every check run is `completed` with `success` /
+    `skipped` / `neutral`, every commit status except `tree-status` is `success`, and
+    `Dashboard Checks`, `Presubmit` (if present) and `flutter-gold` are `success`. Dry-run rolls
+    wait for no named check (`autoroll/go/codereview/roll.go`), so a closed tree
+    (`tree-status: failure`) alone turns the canary red.
+  - A red check (including `action_required`) gives `CL_SUSPECTED_REGRESSION`; running checks or
+    a missing gate give `CANNOT_TRIAGE`; `Canary roll could not be created` or no PR URL gives
+    `INFRA_NO_ROLL_CL`.
+
 ## ASAN Sanitizer & Font-Backend Trybot Selection
 
 The script automatically selects one ASAN bot based on the diff:
@@ -220,11 +235,17 @@ python3 ~/.gemini/config/skills/google3-test-paragraph/scripts/run_g3_paragraph_
   cand=cl:<change>/<ps>
 ```
 
-## Canary-Flutter is disabled
+## Canary-Flutter and the local Flutter corpus
 
-Never trigger `Canary-Flutter` (R38: it runs but gives no verdict, every run ends in
-`INFRA_FAILURE` at the 3h timeout). `canary_advisor.py` lists it in `DISABLED_CANARIES` and
-recommends the full local Flutter corpus instead:
+`Canary-Flutter` was disabled from 2026-08 to 2026-11-12 (R38): every run ended in
+`INFRA_FAILURE` at the 3h timeout because the autoroller treated GitHub `skipped` checks as still
+running. [buildbot CL 1409959](https://skia-review.googlesource.com/c/buildbot/+/1409959) fixed
+that and was deployed on 2026-11-03; runs give SUCCESS/FAILURE verdicts again (R58).
+
+`canary_advisor.py` recommends it like any other canary. For
+`modules/(skparagraph|skunicode|skshaper)/(src|include)/` it also prints the full local Flutter
+corpus as a LOCAL gate, because the canary does not run the ~2400 A/B text tests:
 `python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/run_flutter_paragraph_tests.py --full`
-(see `flutter-test-paragraph-engine`). Remove the entry only after the bot gives real
-SUCCESS/FAILURE results again.
+(see `flutter-test-paragraph-engine`). If `canary_health` finds no SUCCESS/FAILURE verdict in 45
+days, or a canary is listed in `DISABLED_CANARIES`, the advisor drops `Canary-Flutter` and keeps
+only the local corpus.

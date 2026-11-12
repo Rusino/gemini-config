@@ -60,11 +60,14 @@ HEALTH_WINDOW_DAYS = 45
 
 # Canaries that must never be triggered: they run but give no verdict. Remove an entry only after
 # the bot produces real SUCCESS/FAILURE results again
-DISABLED_CANARIES = {
-    "Canary-Flutter": "R38: every run since 2026-08 ends in INFRA_FAILURE at the 3h timeout",
-}
+# Canary-Flutter left this list on 2026-11-12 (R58): buildbot CL 1409959 (deployed 2026-11-03)
+# taught the autoroller that GitHub "skipped" checks are finished, so runs give verdicts again
+DISABLED_CANARIES = {}
 FLUTTER_FULL_CORPUS = ("python3 ~/.gemini/config/skills/flutter-test-paragraph-engine/scripts/"
                        "run_flutter_paragraph_tests.py --full")
+# Canary-Flutter runs flutter/try + flutter-gold but not the ~2400 text tests the local corpus
+# compares A/B, so these paths keep the local gate even when the canary is healthy
+FLUTTER_PARAGRAPH_PATH_RE = re.compile(r"^modules/(skparagraph|skunicode|skshaper)/(src|include)/")
 G3_PARAGRAPH_PATH_RE = re.compile(r"^modules/(skparagraph|skunicode)/")
 G3_PARAGRAPH_CORPUS_SCRIPT = (
     "~/.gemini/config/skills/google3-test-paragraph/scripts/run_g3_paragraph_tests.py"
@@ -648,6 +651,14 @@ def advise(args):
         recs["LOCAL flutter-test-paragraph-engine --full"] = {
             "tier": flutter["tier"], "reasons": {r: p for r, p in flutter["reasons"].items()}}
         if flutter["tier"] == "STRONG":
+            local_actions.append(("flutter-test-paragraph-engine", FLUTTER_FULL_CORPUS))
+    elif "Canary-Flutter" in recs:
+        para_paths = [p for p in effective if FLUTTER_PARAGRAPH_PATH_RE.search(p)]
+        if para_paths:
+            recs["LOCAL flutter-test-paragraph-engine --full"] = {
+                "tier": "STRONG",
+                "reasons": {"Flutter text corpus A/B: Canary-Flutter does not compare it":
+                            para_paths}}
             local_actions.append(("flutter-test-paragraph-engine", FLUTTER_FULL_CORPUS))
     for c, h in health.items():
         if c in recs and not h["healthy"] and c != "Canary-Flutter":
@@ -1262,6 +1273,9 @@ ANDROID_ROLL_URL_RE = re.compile(
     r"https://googleplex-android-review\.googlesource\.com/c/"
     r"(?:platform/external/skia/\+/)?(\d+)"
 )
+FLUTTER_ROLL_URL_RE = re.compile(r"https://github\.com/flutter/flutter/pull/(\d+)")
+GITHUB_API = "https://api.github.com"
+GITHUB_OK_CONCLUSIONS = ("success", "skipped", "neutral")
 TREEHUGGER_SUMMARY_RE = re.compile(
     r"^## Presubmit (?:finished|running):\s*([^\n]+)", re.MULTILINE
 )
@@ -2125,6 +2139,120 @@ def triage_canary_android_failure(cl, ps, bb_build, sw_tasks, touched_files):
     return _android_test_fails_unrelated(ag_cl, test_fails, stems, passed_count, count_note)
 
 
+def _github_json(path):
+    """GET a GitHub REST `path` as JSON.
+
+    Tries `gh api` first (authenticated, higher rate limit), then anonymous urllib against
+    api.github.com. Returns the decoded JSON, or None when both fail.
+    """
+    try:
+        out = subprocess.run(["gh", "api", path], capture_output=True, text=True, timeout=30)
+        if out.returncode == 0:
+            return json.loads(out.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    req = urllib.request.Request(f"{GITHUB_API}/{path}", headers={
+        "User-Agent": "canary-advisor", "Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def _flutter_pr_check_state(pr):
+    """Return (head_sha, check_runs, statuses) for flutter/flutter PR `pr`, or None on any fetch
+    failure. Walks every check-run page: a roll PR has ~150 check runs, over one 100-item page
+    """
+    sha = ((_github_json(f"repos/flutter/flutter/pulls/{pr}") or {}).get("head") or {}).get("sha")
+    if not sha:
+        return None
+    runs = []
+    for page in range(1, 21):
+        data = _github_json(f"repos/flutter/flutter/commits/{sha}/check-runs"
+                            f"?per_page=100&page={page}")
+        if not isinstance(data, dict):
+            return None
+        batch = data.get("check_runs") or []
+        runs.extend(batch)
+        if not batch or len(runs) >= int(data.get("total_count") or 0):
+            break
+    status = _github_json(f"repos/flutter/flutter/commits/{sha}/status?per_page=100")
+    if not isinstance(status, dict):
+        return None
+    return sha, runs, status.get("statuses") or []
+
+
+def triage_canary_flutter_failure(cl, ps, bb_build, sw_tasks, _touched_files):
+    """Verify a red Canary-Flutter build against the GitHub checks of its flutter/flutter roll PR.
+
+    Returns UNRELATED_HEAD_BREAKAGE only when every check run and commit status except
+    `tree-status` finished green and Dashboard Checks, Presubmit (if present) and flutter-gold
+    are `success`; dry-run rolls wait for no named check (autoroll codereview/roll.go), so a
+    closed tree alone turns the canary red
+    """
+    nm = _not_mergeable_verdict(bb_build)
+    if nm:
+        return {**nm, "builder": "Canary-Flutter"}
+    base = {"builder": "Canary-Flutter", "our_part_passed": False}
+    task = _find_builder_task(cl, ps, "Canary-Flutter", bb_build, sw_tasks)
+    if not task:
+        return {**base, "verdict": "INFRA_NO_TASK",
+                "summary": _build_summary_markdown(bb_build) or
+                "Canary-Flutter Swarming task not found"}
+    stdout = swarming_task_stdout(task.get("taskId"))
+    prs = FLUTTER_ROLL_URL_RE.findall(stdout)
+    if not prs:
+        return {**base, "verdict": "INFRA_NO_ROLL_CL",
+                "summary": ("Canary roll could not be created" if
+                            "Canary roll could not be created" in stdout else
+                            "Canary-Flutter did not produce a flutter/flutter roll PR")}
+    # A retried roll prints several PR URLs; the newest one carries the verdict
+    pr = int(prs[-1])
+    pr_url = f"https://github.com/flutter/flutter/pull/{pr}"
+    base.update({"pr": pr, "pr_url": pr_url})
+    state = _flutter_pr_check_state(pr)
+    if state is None:
+        return {**base, "verdict": "CANNOT_TRIAGE",
+                "summary": f"Could not read GitHub checks of {pr_url}"}
+    sha, runs, statuses = state
+    contexts = {s.get("context"): s.get("state") for s in statuses}
+    pending = ([r.get("name") for r in runs if r.get("status") != "completed"] +
+               [c for c, st in contexts.items() if c != "tree-status" and st == "pending"])
+    if pending:
+        return {**base, "verdict": "CANNOT_TRIAGE", "head_sha": sha,
+                "summary": f"{len(pending)} checks still running on {pr_url}: "
+                           + ", ".join(pending[:5])}
+    # flutter-dashboard marks Presubmit `action_required` while it auto-retries LUCI builds and
+    # resets it to success if they pass; until then it counts as red (fail closed)
+    bad = ([f"{r.get('name')}: {r.get('conclusion')}" for r in runs
+            if r.get("conclusion") not in GITHUB_OK_CONCLUSIONS] +
+           [f"{c}: {st}" for c, st in contexts.items() if c != "tree-status" and st != "success"])
+    if bad:
+        return {**base, "verdict": "CL_SUSPECTED_REGRESSION", "head_sha": sha, "failed": bad,
+                "summary": f"{len(bad)} red checks on {pr_url}: " + ", ".join(bad[:10])}
+    by_name = {r.get("name"): r.get("conclusion") for r in runs}
+    gates = ["Dashboard Checks"] + (["Presubmit"] if "Presubmit" in by_name else [])
+    missing = [g for g in gates if by_name.get(g) != "success"]
+    if contexts.get("flutter-gold") != "success":
+        missing.append("flutter-gold")
+    if missing:
+        return {**base, "verdict": "CANNOT_TRIAGE", "head_sha": sha,
+                "summary": f"Required gates not success on {pr_url}: " + ", ".join(missing)}
+    if contexts.get("tree-status") in ("failure", "error"):
+        cause = "the Flutter tree was closed (tree-status: failure)"
+    else:
+        cause = "the autoroller reported an error after all checks passed"
+    return {
+        **base, "verdict": "UNRELATED_HEAD_BREAKAGE", "our_part_passed": True, "head_sha": sha,
+        "summary": f"All {len(runs)} check runs green on {pr_url}; red because {cause}",
+        "sanitized_draft": (
+            f"Canary-Flutter went red only because {cause}; its roll PR {pr_url} passed all "
+            f"{len(runs)} check runs, including {', '.join(gates)} and flutter-gold."
+        ),
+    }
+
+
 def triage_other_canary_failure(cl, ps, builder, bb_build, sw_tasks, _touched_files):
     """Fail-closed fallback for unknown canary builders whose roll target has no verifier."""
     nm = _not_mergeable_verdict(bb_build)
@@ -2347,6 +2475,9 @@ def cmd_triage(args):
                 elif cb == "Canary-Android":
                     triage_res = triage_canary_android_failure(
                         cl, b_ps, b_info, sw_tasks, touched_files)
+                elif cb == "Canary-Flutter":
+                    triage_res = triage_canary_flutter_failure(
+                        cl, b_ps, b_info, sw_tasks, touched_files)
                 else:
                     triage_res = triage_other_canary_failure(
                         cl, b_ps, cb, b_info, sw_tasks, touched_files)
@@ -2368,6 +2499,10 @@ def cmd_triage(args):
                     print(f"- Roll CL: http://ag/{triage_res['ag_cl']}")
                     if triage_res.get("summary") and triage_res.get("sanitized_draft"):
                         print(f"- Internal Triage: {triage_res['summary']}")
+                elif cb == "Canary-Flutter" and triage_res.get("pr_url"):
+                    print(f"- Roll PR: {triage_res['pr_url']}")
+                    if triage_res.get("summary") and triage_res.get("sanitized_draft"):
+                        print(f"- Triage: {triage_res['summary']}")
                 if triage_res.get("sanitized_draft"):
                     print(f"- Sanitized Draft Message: \"{triage_res['sanitized_draft']}\"")
                     if triage_res.get("verdict") == "UNRELATED_HEAD_BREAKAGE":

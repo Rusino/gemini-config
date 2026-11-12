@@ -119,7 +119,7 @@ class TestCanaryAdvisor(unittest.TestCase):
 
     out = buf.getvalue()
     self.assertIn("AGENT ACTION (execute this command):", out)
-    self.assertIn("Canary-Flutter is disabled", out)
+    self.assertNotIn("Canary-Flutter is disabled", out)
     self.assertIn("NativeFonts_FreeType_ASAN_Upload", out)
     # Canary-G3 must NOT be in the immediate AGENT ACTION
     agent_action_line = [
@@ -128,7 +128,8 @@ class TestCanaryAdvisor(unittest.TestCase):
         if "canary_advisor.py try --cl" in line
     ][0]
     self.assertNotIn("Canary-G3", agent_action_line)
-    self.assertNotIn("Canary-Flutter", agent_action_line)
+    self.assertIn("Canary-Flutter", agent_action_line)
+    self.assertIn("run_flutter_paragraph_tests.py --full", out)
     self.assertIn("Canary-G3 requires a Googler author or Googler Code-Review+1", out)
     self.assertIn("Canary-G3 Command (run after Googler Code-Review+1 approval):", out)
     self.assertIn(
@@ -183,7 +184,7 @@ class TestCanaryAdvisor(unittest.TestCase):
         if "canary_advisor.py try --cl" in line
     ][0]
     self.assertIn("Canary-G3", agent_action_line)
-    self.assertNotIn("Canary-Flutter", agent_action_line)
+    self.assertIn("Canary-Flutter", agent_action_line)
     self.assertIn("run_flutter_paragraph_tests.py --full", out)
     self.assertIn("NativeFonts_FreeType_ASAN_Upload", agent_action_line)
     self.assertNotIn("deferred until a Googler votes Code-Review+1", out)
@@ -1862,6 +1863,110 @@ class TestCanaryAdvisor(unittest.TestCase):
     adv_out = buf_adv.getvalue()
     canary_section = adv_out.split("Canary Command (run only after user approval):")[-1]
     self.assertIn("watch --cl 1421656 --save-draft", canary_section)
+
+  def _advise_out(self, path, health=None):
+    diff = (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+            "@@ -1,2 +1,3 @@\n+// change\n")
+    meta = {"cl": 1408157, "patchset": 1, "subject": "x", "owner": "external@author.com",
+            "diff": diff, "googler_cr_plus_one": True}
+    args = type("Args", (), {"cl": "1408157", "repo": None, "base": "origin/main",
+                             "max_symbols": 6, "no_search": True, "no_health": health is None,
+                             "no_log": True, "strong_only": False})()
+    buf = io.StringIO()
+    with patch.object(canary_advisor, "load_cl", return_value=meta), \
+         patch.object(canary_advisor, "has_cloudtop_citc", return_value=False), \
+         patch.object(canary_advisor, "canary_health",
+                      side_effect=lambda c: (health or {}).get(c, {"healthy": True,
+                                                                   "counts": {}})), \
+         patch("sys.stdout", buf):
+      canary_advisor.advise(args)
+    out = buf.getvalue()
+    action = [ln for ln in out.splitlines() if "canary_advisor.py try --cl" in ln]
+    return out, (action[0] if action else "")
+
+  # R58: a healthy Canary-Flutter is triggered again, but SkParagraph-family paths keep the
+  # local Flutter text corpus because the canary does not run its ~2400 A/B tests
+  def test_healthy_canary_flutter_runs_and_paragraph_paths_keep_local_corpus(self):
+    out, action = self._advise_out("modules/skunicode/src/SkUnicode_icu.cpp")
+    self.assertIn("-b Canary-Flutter", action)
+    self.assertIn("AGENT ACTION (LOCAL gate flutter-test-paragraph-engine", out)
+    out, action = self._advise_out("src/ports/SkFontMgr_mac_ct.cpp")
+    self.assertIn("-b Canary-Flutter", action)
+    self.assertNotIn("flutter-test-paragraph-engine", out)
+
+  # The health fallback must still swap an unhealthy Canary-Flutter for the local corpus
+  def test_unhealthy_canary_flutter_falls_back_to_local_corpus(self):
+    out, action = self._advise_out(
+        "modules/skshaper/src/SkShaper.cpp",
+        health={"Canary-Flutter": {"healthy": False, "counts": {"INFRA_FAILURE": 5}}})
+    self.assertNotIn("Canary-Flutter", action)
+    self.assertIn("Canary-Flutter has produced no SUCCESS/FAILURE verdict", out)
+    self.assertIn("AGENT ACTION (LOCAL gate flutter-test-paragraph-engine", out)
+
+  # Canary-Flutter is red when only tree-status fails (dry runs wait for no named check);
+  # every other gate decides between unrelated, regression and not-yet-triageable
+  def test_triage_canary_flutter_reads_roll_pr_checks_and_fails_closed(self):
+    def run(name, conclusion="success", status="completed"):
+      return {"name": name, "status": status, "conclusion": conclusion}
+
+    green = [run("Presubmit"), run("Dashboard Checks"), run("Google testing", "skipped")]
+    gold_ok = [{"context": "flutter-gold", "state": "success"},
+               {"context": "tree-status", "state": "failure"}]
+    stdout = ("roll https://github.com/flutter/flutter/pull/196398\n"
+              "retry https://github.com/flutter/flutter/pull/196399\n")
+    cases = [
+        ("tree_closed", (green, gold_ok), "UNRELATED_HEAD_BREAKAGE", True),
+        ("red_luci", ([run("Presubmit", "failure"), run("Dashboard Checks")], gold_ok),
+         "CL_SUSPECTED_REGRESSION", False),
+        ("action_required", ([run("Presubmit", "action_required"), run("Dashboard Checks")],
+                             gold_ok), "CL_SUSPECTED_REGRESSION", False),
+        ("gold_red", (green, [{"context": "flutter-gold", "state": "failure"}]),
+         "CL_SUSPECTED_REGRESSION", False),
+        ("pending", (green + [run("Linux x", None, "in_progress")], gold_ok),
+         "CANNOT_TRIAGE", False),
+        ("no_gold", (green, [{"context": "tree-status", "state": "failure"}]),
+         "CANNOT_TRIAGE", False),
+        ("no_dashboard", ([run("Presubmit")], gold_ok), "CANNOT_TRIAGE", False),
+    ]
+    for name, (runs, statuses), verdict, passed in cases:
+      with self.subTest(name=name), \
+           patch.object(canary_advisor, "_find_builder_task", return_value={"taskId": "t"}), \
+           patch.object(canary_advisor, "swarming_task_stdout", return_value=stdout), \
+           patch.object(canary_advisor, "_flutter_pr_check_state",
+                        return_value=("abc", runs, statuses)) as state:
+        res = canary_advisor.triage_canary_flutter_failure(1, 1, {}, [], [])
+        state.assert_called_with(196399)
+        self.assertEqual(res["verdict"], verdict)
+        self.assertEqual(res["our_part_passed"], passed)
+        if passed:
+          self.assertIn("tree-status: failure", res["sanitized_draft"])
+          self.assertIn("https://github.com/flutter/flutter/pull/196399", res["sanitized_draft"])
+          self.assertEqual(canary_advisor.find_public_draft_leak(res["sanitized_draft"]), "")
+
+    with patch.object(canary_advisor, "_find_builder_task", return_value={"taskId": "t"}), \
+         patch.object(canary_advisor, "swarming_task_stdout",
+                      return_value="Canary roll could not be created"):
+      res = canary_advisor.triage_canary_flutter_failure(1, 1, {}, [], [])
+    self.assertEqual(res["verdict"], "INFRA_NO_ROLL_CL")
+    self.assertFalse(res["our_part_passed"])
+
+  # Roll PRs can exceed one 100-item check-run page; a missed page could hide a red check
+  def test_flutter_pr_check_state_walks_all_check_run_pages(self):
+    page1 = [{"name": f"c{i}"} for i in range(100)]
+    page2 = [{"name": "late", "conclusion": "failure"}]
+
+    def fake(path):
+      if path.startswith("repos/flutter/flutter/pulls/"):
+        return {"head": {"sha": "abc"}}
+      if "check-runs" in path:
+        return {"total_count": 101,
+                "check_runs": page1 if path.endswith("&page=1") else page2}
+      return {"statuses": [{"context": "flutter-gold", "state": "success"}]}
+
+    with patch.object(canary_advisor, "_github_json", side_effect=fake):
+      sha, runs, statuses = canary_advisor._flutter_pr_check_state(196399)
+    self.assertEqual((sha, len(runs), runs[-1]["name"]), ("abc", 101, "late"))
+    self.assertEqual(statuses[0]["context"], "flutter-gold")
 
 
 if __name__ == "__main__":

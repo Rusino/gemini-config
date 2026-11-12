@@ -175,12 +175,12 @@ For surviving Skia CLs in `🔴 SURGICAL AUDIT` or `🟠 PUSHBACK`, run
   (`run_g3_paragraph_tests.py --out /tmp/g3_cl_<N> --create-citc baseline=G3_HEAD cand=cl:<N>/<PS>`,
   1,139 fast targets including `skia_build_test`) **before** approving with `Code-Review+1` — never
   trigger `Canary-G3` or leave an unresolved submit-hold comment for `skparagraph`/`skunicode` CLs.
-- **External Authors**: Trigger non-G3 canaries (`Canary-Chromium`, `Canary-Android`)
-  automatically. Never trigger `Canary-Flutter` (disabled, R38); run the full local Flutter corpus
-  (`run_flutter_paragraph_tests.py --full`) instead. For non-paragraph Skia CLs that require
-  `Canary-G3`, `g3_canary.go:134` requires a Googler author or Googler `Code-Review+1` before
-  `Canary-G3` can start (report the deferred command if needed, without placing unresolved submit
-  holds).
+- **External Authors**: Trigger non-G3 canaries (`Canary-Chromium`, `Canary-Android`,
+  `Canary-Flutter`) automatically; for `skparagraph`/`skunicode`/`skshaper` paths also run the
+  full local Flutter corpus (`run_flutter_paragraph_tests.py --full`). For non-paragraph Skia
+  CLs that require `Canary-G3`, `g3_canary.go:134` requires a Googler author or Googler
+  `Code-Review+1` before `Canary-G3` can start (report the deferred command if needed, without
+  placing unresolved submit holds).
 - **Internal Authors**: Suggest recommended canaries in chat; do not ask them in Gerrit comments.
 - **Background Watcher & Wakeup Protocol**: Trigger tryjobs only with the
   `canary_advisor.py try --cl <N> -b <builder> ...` command printed under `AGENT ACTION` (it runs
