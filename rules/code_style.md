@@ -11,6 +11,11 @@ description: "When editing source code or tests, writing code comments, commit m
 - Comment non-obvious invariants, call-order constraints, negative invariants (why something must
   not happen here), and API quirks, even on 1-line edits; skip self-explanatory guards, renames,
   and phase extractions. Why, not what: never restate code or write `// Removed...` / `// Fixed...`
+- Inside a function body, also comment values with platform meaning (e.g. size `0`, a private
+  `CFSTR` key), a choice between two plausible calls, and deliberate fallbacks or degraded results
+  (e.g. null instead of the closest match); allocation-failure checks and object construction get
+  none. State what this code guarantees, not what a callee happens to do (e.g. how CoreText ranks
+  weights): pin inherited behavior with a test
 - Add a contract comment (Python docstring: behavior, inputs, outputs, side effects; name each
   responsibility if several) on new/changed `.h`/`.hpp` declarations, public Python functions, and
   helpers whose preconditions, ownership, index/unit domain, or side effects are not obvious from
