@@ -1117,7 +1117,19 @@ def _render_ssr_card(w: dict[str, Any]) -> str:
       f'<button class="wb-btn" data-start-chat="{wid}"{force_new_ssr} '
       f'title="{chat_tip_ssr}" type="button">+ Chat</button>'
   )
-  # Virtual cards materialize into persisted Works on + Chat before exposing persisted controls
+  accept_btn_ssr = (
+      f'<button class="wb-btn" data-work-accept="{wid}" '
+      f'title="Сделать своей работой" type="button">Принять</button>'
+      if w.get("owner") != "user"
+      else ""
+  )
+  refresh_btn_ssr = (
+      f'<button class="wb-btn wb-btn-icon wb-card-refresh" '
+      f'data-unit-key="eyebrow:refresh" data-work-refresh="{wid}" '
+      f'title="Обновить эту карточку" aria-label="Обновить эту карточку" '
+      f'type="button">↻</button>'
+  )
+  # Virtual cards materialize into persisted Works on + Chat or Принять
   persisted_btns_ssr = ""
   if not bool(w.get("is_virtual")):
     add_draft_ssr = (
@@ -1131,7 +1143,9 @@ def _render_ssr_card(w: dict[str, Any]) -> str:
         f'<button class="wb-btn" data-add-link="{wid}" type="button">+ Link</button>'
         f'<button class="wb-btn" data-work-done="{wid}" type="button">✓ Done</button>'
     )
-  actions_ssr = f'<div class="wb-actions">{start_chat_btn_ssr}{persisted_btns_ssr}</div>'
+  actions_ssr = (
+      f'<div class="wb-actions">{start_chat_btn_ssr}{accept_btn_ssr}{persisted_btns_ssr}</div>'
+  )
   util_wrap_ssr = f'<div class="re-utility-row">{mentions_ssr}{actions_ssr}</div>'
   footer_ssr = f'<div class="re-footer">{chats_ssr}{pills_wrap_ssr}{util_wrap_ssr}</div>'
   # Mirror renderCardHeader status pill tones so initial SSR paint has zero hydration flash
@@ -1153,7 +1167,7 @@ def _render_ssr_card(w: dict[str, Any]) -> str:
       f'data-collapsed="{collapsed_attr}">'
       f'<div class="wb-card-hdr" data-toggle-card="{wid}"><div class="wb-hdr-stack">'
       f'<div class="re-eyebrow">{status_pill_ssr}'
-      f"{cp_ssr}{origin_ssr}</div>"
+      f"{cp_ssr}{origin_ssr}{refresh_btn_ssr}</div>"
       f'<div class="re-headline-row">'
       f'<strong class="wb-card-title re-headline" title="{full_title}">{head_esc}</strong>'
       f"</div></div></div>"
@@ -1275,8 +1289,39 @@ def render_workbench_html(
     font-weight: 600;
     text-align: left;
   }}
-  .wb-drafts-toggle {{
-    cursor: pointer;
+  .wb-card-refresh {{
+    width: 22px;
+    height: 20px;
+    font-size: 12px;
+  }}
+  .wb-card.wb-refresh-stub {{
+    border-left: 3px solid var(--border);
+    background: #f5f5f7;
+    box-shadow: none;
+  }}
+  .wb-refresh-stub-row {{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    font-size: 11.5px;
+    color: var(--muted);
+    min-width: 0;
+  }}
+  .wb-refresh-stub-title {{
+    font-weight: 600;
+    color: #515154;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 48%;
+  }}
+  .wb-refresh-stub-reason {{
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }}
   .wb-sug-row {{
     display: flex;
@@ -2462,9 +2507,6 @@ def render_workbench_html(
   const SORT_STORAGE_KEY = 'wb_sort_v1';
   // Persist deliverable peer fold modes and per-peer overrides across 30s state refreshes
   const PEER_FOLD_STORAGE_KEY = 'wb_peer_fold_v1';
-  // Persist the Черновики fold separately; drafts start collapsed until she opens them
-  const DRAFTS_STORAGE_KEY = 'wb_drafts_v1';
-  let draftsOpen = false;
   let state = {initial_json};
 """ + _compact_workbench_tail(f"""  let activeFilter = 'all';
   let activeTypeFilter = 'all';
@@ -2480,10 +2522,21 @@ def render_workbench_html(
   let openDraftEditors = {{}};
   const openDetailsKeys = new Set();
   const startingChatButtons = new Set();
+  const refreshingButtons = new Set();
+  // Pin per-card sort positions and 1-line departure stubs so single-card ↻ never jumps siblings
+  const sortAnchors = new Map();
+  const refreshStubs = new Map();
+  let refreshAnchorEpoch = 0;
   let domMorphSupported = null;
   let lastSlotHtml = new WeakMap();
   let lastNodeHtml = new WeakMap();
   let lastInputDefault = new WeakMap();
+
+  function clearRefreshAnchors() {{
+    refreshAnchorEpoch += 1;
+    sortAnchors.clear();
+    refreshStubs.clear();
+  }}
 
   function resetDomReconcilerCache() {{
     lastSlotHtml = new WeakMap();
@@ -2607,17 +2660,6 @@ def render_workbench_html(
     }}
   }} catch {{}}
 
-  try {{
-    const rawDrafts = localStorage.getItem(DRAFTS_STORAGE_KEY);
-    if (rawDrafts) draftsOpen = JSON.parse(rawDrafts).open === true;
-  }} catch {{}}
-
-  function saveDraftsPrefs() {{
-    try {{
-      localStorage.setItem(DRAFTS_STORAGE_KEY, JSON.stringify({{ open: draftsOpen }}));
-    }} catch {{}}
-  }}
-
   // Persist active sort mode and direction to localStorage without failing in private contexts
   function saveSortPrefs() {{
     try {{
@@ -2738,10 +2780,24 @@ def render_workbench_html(
     return dir === 'asc' ? (ta - tb) : (tb - ta);
   }}
 
+  function captureSortAnchor(w) {{
+    return {{
+      owner: (w && w.owner === 'user') ? 'user' : 'draft',
+      lane: String((w && w.lane) || ''),
+      has_urgent_obligation: hasUrgentOb(w),
+      desk_tier: Number((w && w.desk_tier) ?? 1),
+      activity_at: getActivityTs(w),
+      origin_at: getOriginTs(w),
+      work_id: String((w && w.work_id) || ''),
+    }};
+  }}
+
   // Order a shallow copy of cards by Triage priority, pure Activity recency, or origin Age
   function sortWorks(items) {{
     const laneRank = {{ 'needs-you': 0, 'on-desk': 1, waiting: 2, blocked: 3, done: 4 }};
-    return items.slice().sort((a, b) => {{
+    return items.slice().sort((rawA, rawB) => {{
+      const a = sortAnchors.get(String((rawA && rawA.work_id) || '')) || rawA;
+      const b = sortAnchors.get(String((rawB && rawB.work_id) || '')) || rawB;
       if (sortMode === 'triage') {{
         const la = laneRank[a && a.lane] ?? 9;
         const lb = laneRank[b && b.lane] ?? 9;
@@ -2854,6 +2910,18 @@ def render_workbench_html(
     const filtered = ((state && state.works) || []).filter(
       (w) => cardMatchesSlice(w, activeFilter, activeTypeFilter, q)
     );
+    const presentIds = new Set(filtered.map((w) => String(w.work_id)));
+    for (const [swid, stub] of refreshStubs.entries()) {{
+      if (presentIds.has(swid)) {{
+        refreshStubs.delete(swid);
+        continue;
+      }}
+      if (q) {{
+        const sHay = `${{stub.title || ''}} ${{stub.reason || ''}} ${{swid}}`.toLowerCase();
+        if (!sHay.includes(q)) continue;
+      }}
+      filtered.push(stub);
+    }}
     return sortWorks(filtered);
   }}
 
@@ -2863,6 +2931,7 @@ def render_workbench_html(
     let expandedCount = 0;
     let collapsedCount = 0;
     for (const w of works) {{
+      if (w && w.is_refresh_stub) continue;
       if (isCardCollapsed(w)) {{
         collapsedCount += 1;
       }} else {{
@@ -2922,6 +2991,7 @@ def render_workbench_html(
       }} else if (laneAttr !== null) {{
         activeFilter = laneAttr || 'all';
       }}
+      clearRefreshAnchors();
       render();
     }});
   }}
@@ -2981,8 +3051,22 @@ def render_workbench_html(
         return false;
       }}
       state = await resp.json();
-      if (body && body.work_id && state && state.started_chat && state.started_chat.work_id) {{
-        migrateVirtualCardPrefs(String(body.work_id), String(state.started_chat.work_id));
+      if (url === '/api/sync') clearRefreshAnchors();
+      if (body && body.work_id) {{
+        const inWid = String(body.work_id);
+        if (state && state.started_chat && state.started_chat.work_id) {{
+          migrateVirtualCardPrefs(inWid, String(state.started_chat.work_id));
+        }}
+        if (state && state.accepted_work_id) {{
+          const accWid = String(state.accepted_work_id);
+          migrateVirtualCardPrefs(inWid, accWid);
+          sortAnchors.delete(accWid);
+          refreshStubs.delete(accWid);
+        }}
+        if (url === '/api/work/accept' || url === '/api/work/done') {{
+          sortAnchors.delete(inWid);
+          refreshStubs.delete(inWid);
+        }}
       }}
       render();
       lastRenderedSig = projectionRenderSignature(state);
@@ -2990,6 +3074,115 @@ def render_workbench_html(
     }} catch (err) {{
       window.alert(`Network error: ${{err && err.message ? err.message : err}}`);
       return false;
+    }}
+  }}
+
+  // Poll live trackers for one card and morph it in place (or leave a 1-line stub) without jumping
+  async function refreshSingleCard(wid, btnEl) {{
+    if (!wid || (btnEl && btnEl.disabled)) return;
+    const origText = btnEl ? btnEl.textContent : '↻';
+    if (btnEl) {{
+      refreshingButtons.add(btnEl);
+      btnEl.disabled = true;
+      btnEl.textContent = '↻…';
+    }}
+    let shouldRender = false;
+    try {{
+      const startEpoch = refreshAnchorEpoch;
+      const preWorks = Array.isArray(state && state.works) ? state.works : [];
+      const preCard = preWorks.find((w) => String(w && w.work_id) === wid) || null;
+      const prevAnchor = preCard
+        ? (sortAnchors.get(wid) || captureSortAnchor(preCard))
+        : null;
+      const prevTitle = preCard ? String(preCard.title || wid) : wid;
+
+      const resp = await fetch('/api/work/refresh', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ work_id: wid }}),
+      }});
+      if (!resp.ok) {{
+        let errMsg = `Refresh failed (HTTP ${{resp.status}})`;
+        try {{
+          const errData = await resp.json();
+          if (errData && errData.error) errMsg = String(errData.error);
+        }} catch (_) {{}}
+        window.alert(errMsg);
+        return;
+      }}
+      const data = await resp.json();
+      const resolvedWid = String((data && data.resolved_work_id) || wid);
+      if (resolvedWid !== wid) migrateVirtualCardPrefs(wid, resolvedWid);
+
+      // Reconcile against live post-await state.works so concurrent neighbor updates survive
+      const curWorks = Array.isArray(state && state.works) ? state.works : [];
+      const curIdx = curWorks.findIndex(
+        (w) => w && (String(w.work_id) === wid || String(w.work_id) === resolvedWid)
+      );
+      const nextWorks = curWorks.filter(
+        (w) => w && String(w.work_id) !== wid && String(w.work_id) !== resolvedWid
+      );
+      const freshCard = (data && data.card && typeof data.card === 'object') ? data.card : null;
+      if (freshCard) {{
+        if (curIdx >= 0 && curIdx <= nextWorks.length) {{
+          nextWorks.splice(curIdx, 0, freshCard);
+        }} else {{
+          nextWorks.push(freshCard);
+        }}
+      }}
+      const nextTray = (data && Array.isArray(data.unanswered_tray))
+        ? data.unanswered_tray
+        : ((state && state.unanswered_tray) || []);
+      state = {{
+        ...(state || {{}}),
+        works: nextWorks,
+        unanswered_tray: nextTray,
+        counts: (data && data.counts) || (state && state.counts) || {{}},
+        metrics: (data && data.metrics) || (state && state.metrics) || {{}},
+        synced_et: (data && data.synced_et) || (state && state.synced_et) || '',
+      }};
+
+      if (startEpoch === refreshAnchorEpoch) {{
+        const q = searchQuery ? searchQuery.trim().toLowerCase() : '';
+        if (freshCard && cardMatchesSlice(freshCard, activeFilter, activeTypeFilter, q)) {{
+          refreshStubs.delete(wid);
+          refreshStubs.delete(resolvedWid);
+          if (prevAnchor) {{
+            if (resolvedWid !== wid) sortAnchors.delete(wid);
+            sortAnchors.set(resolvedWid, {{ ...prevAnchor, work_id: resolvedWid }});
+          }}
+        }} else if (prevAnchor) {{
+          if (resolvedWid !== wid) {{
+            sortAnchors.delete(wid);
+            refreshStubs.delete(wid);
+          }}
+          sortAnchors.set(resolvedWid, {{ ...prevAnchor, work_id: resolvedWid }});
+          refreshStubs.set(resolvedWid, {{
+            work_id: resolvedWid,
+            is_refresh_stub: true,
+            title: prevTitle,
+            owner: prevAnchor.owner,
+            reason: String(
+              (data && (data.removed_reason || data.lane_moved_reason))
+              || 'Ушло из текущего списка'
+            ),
+          }});
+        }}
+      }}
+      shouldRender = true;
+    }} catch (err) {{
+      window.alert(`Network error: ${{err && err.message ? err.message : err}}`);
+    }} finally {{
+      if (btnEl) {{
+        refreshingButtons.delete(btnEl);
+        btnEl.disabled = false;
+        btnEl.textContent = origText;
+      }}
+      if (shouldRender) {{
+        render();
+        lastRenderedSig = projectionRenderSignature(state);
+        notifyParentRendered();
+      }}
     }}
   }}
 
@@ -3820,6 +4013,12 @@ def render_workbench_html(
             </div>
             <div class="re-eyebrow-right" data-unit-key="eyebrow:right">
               ${{timeMetaHtml}}
+              <button class="wb-btn wb-btn-icon wb-card-refresh"
+                      data-unit-key="eyebrow:refresh"
+                      data-work-refresh="${{esc(w.work_id)}}"
+                      title="Обновить эту карточку"
+                      aria-label="Обновить эту карточку"
+                      type="button">↻</button>
               <span class="re-chevron" aria-hidden="true"
                     title="Click to toggle · Alt-click to toggle all visible cards"
                     >${{SVG_CHEVRON}}</span>
@@ -4277,13 +4476,12 @@ def render_workbench_html(
                  type="button">+ Obligation</button>
          <button class="wb-btn" data-unit-key="act:link" data-add-link="${{esc(w.work_id)}}"
                  type="button">+ Link</button>
-         ${{acceptBtn}}
          <button class="wb-btn" data-unit-key="act:done" data-work-done="${{esc(w.work_id)}}"
                  type="button">✓ Done</button>`
       : '';
     const cardActions = (
       `<div class="wb-actions" data-unit-key="util:actions">`
-      + `${{startChatBtn}}${{persistedBtns}}</div>`
+      + `${{startChatBtn}}${{acceptBtn}}${{persistedBtns}}</div>`
     );
 
     const pillsBlock = pillsHtml
@@ -4348,8 +4546,25 @@ def render_workbench_html(
       + `<span class="wb-sug-hdr">Предложено (${{total}})</span>${{items}}${{more}}</div>`;
   }}
 
+  function renderRefreshStub(stub) {{
+    const wid = esc(stub.work_id);
+    return `
+      <article class="wb-card wb-refresh-stub" data-work-id="${{wid}}"
+               data-refresh-stub="true" data-collapsed="true">
+        <div class="wb-refresh-stub-row" data-unit-key="stub:row">
+          <span class="wb-refresh-stub-title">${{esc(stub.title)}}</span>
+          <span class="wb-refresh-stub-reason">— ${{esc(stub.reason)}}</span>
+          <button class="wb-btn wb-btn-dismiss" data-unit-key="stub:dismiss"
+                  data-dismiss-stub="${{wid}}" title="Скрыть строку"
+                  aria-label="Скрыть строку" type="button">✕</button>
+        </div>
+      </article>
+    `;
+  }}
+
   // Render a single editorial Work card across header, decision strip, loop, peers, and footer
   function renderWorkCard(w) {{
+    if (w && w.is_refresh_stub) return renderRefreshStub(w);
     const collapsed = isCardCollapsed(w);
     const openObs = (w.obligations || []).filter((o) => o.status !== 'done');
     const hasDraft = hasParkedDraft(w);
@@ -4382,23 +4597,27 @@ def render_workbench_html(
     `;
   }}
 
-  // Her works and every Needs-You card stay in the main group; quiet auto drafts fold away
+  // Triage shows her works above an open stream of unowned items without hidden folds
   function renderGroupedCards(works) {{
     // Activity and Age are flat chronological views; only Triage splits by ownership
     if (sortMode !== 'triage') return works.map(renderWorkCard).join('');
-    const isFoldedDraft = (w) => w.owner !== 'user' && w.lane !== 'needs-you';
-    const main = works.filter((w) => !isFoldedDraft(w));
-    const drafts = works.filter(isFoldedDraft);
-    if (!drafts.length) return main.map(renderWorkCard).join('');
-    const caret = draftsOpen ? '▾' : '▸';
-    return `<div class="wb-group-hdr" data-unit-key="wb-sec:main-hdr">`
-      + `Мои работы (${{main.length}})</div>`
-      + main.map(renderWorkCard).join('')
-      + `<button class="wb-group-hdr wb-drafts-toggle" data-unit-key="wb-sec:drafts-toggle"`
-      + ` data-drafts-toggle type="button"`
-      + ` aria-expanded="${{draftsOpen}}">${{caret}} Черновики (${{drafts.length}})</button>`
-      + `<div class="wb-drafts-body" data-unit-key="wb-sec:drafts-body"`
-      + `${{draftsOpen ? '' : ' hidden'}}>${{drafts.map(renderWorkCard).join('')}}</div>`;
+    const isMine = (w) => {{
+      const eff = sortAnchors.get(String((w && w.work_id) || '')) || w;
+      return Boolean(eff && eff.owner === 'user');
+    }};
+    const mine = works.filter(isMine);
+    const unowned = works.filter((w) => !isMine(w));
+    if (!unowned.length) return mine.map(renderWorkCard).join('');
+    const mineCnt = mine.filter((w) => !(w && w.is_refresh_stub)).length;
+    const unownedCnt = unowned.filter((w) => !(w && w.is_refresh_stub)).length;
+    const mineHtml = mine.length
+      ? `<div class="wb-group-hdr" data-unit-key="wb-sec:main-hdr">`
+        + `Мои работы (${{mineCnt}})</div>` + mine.map(renderWorkCard).join('')
+      : '';
+    return mineHtml
+      + `<div class="wb-group-hdr" data-unit-key="wb-sec:unowned-hdr">`
+      + `Вне моих работ (${{unownedCnt}})</div>`
+      + unowned.map(renderWorkCard).join('');
   }}
 
   // Snapshot mounted <details data-details-key> open states before DOM reconciliation
@@ -4490,21 +4709,21 @@ def render_workbench_html(
     }}
   }}
 
-  // Sync changed attributes while keeping open <details>, checkboxes, and in-flight + Chat intact
+  // Sync changed attributes while keeping open <details>, checkboxes, and in-flight buttons intact
   function morphAttributes(liveEl, targetEl) {{
-    const keepStartFlight = startingChatButtons.has(liveEl);
+    const keepBtnFlight = startingChatButtons.has(liveEl) || refreshingButtons.has(liveEl);
     const attrs = liveEl.attributes || [];
     for (let i = attrs.length - 1; i >= 0; i--) {{
       const name = attrs[i].name;
       if (name === 'open' && liveEl.hasAttribute('data-details-key')) continue;
-      if (name === 'disabled' && keepStartFlight) continue;
+      if (name === 'disabled' && keepBtnFlight) continue;
       if (!targetEl.hasAttribute(name)) liveEl.removeAttribute(name);
     }}
     const nextAttrs = targetEl.attributes || [];
     for (let i = 0; i < nextAttrs.length; i++) {{
       const {{ name, value }} = nextAttrs[i];
       if (name === 'open' && liveEl.hasAttribute('data-details-key')) continue;
-      if (name === 'disabled' && keepStartFlight) continue;
+      if (name === 'disabled' && keepBtnFlight) continue;
       if (liveEl.getAttribute(name) !== value) liveEl.setAttribute(name, value);
     }}
     if (liveEl.tagName === 'DETAILS' && liveEl.hasAttribute('data-details-key')) {{
@@ -4515,7 +4734,7 @@ def render_workbench_html(
       const wantChecked = targetEl.hasAttribute('checked');
       if (Boolean(liveEl.checked) !== wantChecked) liveEl.checked = wantChecked;
     }}
-    if ('disabled' in liveEl && !keepStartFlight) {{
+    if ('disabled' in liveEl && !keepBtnFlight) {{
       const wantDisabled = targetEl.hasAttribute('disabled');
       if (Boolean(liveEl.disabled) !== wantDisabled) liveEl.disabled = wantDisabled;
     }}
@@ -4630,7 +4849,7 @@ def render_workbench_html(
 
   function morphElement(liveEl, targetEl) {{
     morphAttributes(liveEl, targetEl);
-    if (startingChatButtons.has(liveEl)) return false;
+    if (startingChatButtons.has(liveEl) || refreshingButtons.has(liveEl)) return false;
     const tag = String(liveEl.tagName || '').toUpperCase();
     const isTextInput = tag === 'TEXTAREA'
       || (tag === 'INPUT' && liveEl.type !== 'checkbox' && liveEl.type !== 'button');
@@ -4672,7 +4891,9 @@ def render_workbench_html(
     temp.innerHTML = next;
     let ok = reconcileKeyedChildren(el, temp);
     if (!ok) ok = morphChildNodes(el, temp);
-    if (ok && startingChatButtons.size === 0) lastSlotHtml.set(el, next);
+    if (ok && startingChatButtons.size === 0 && refreshingButtons.size === 0) {{
+      lastSlotHtml.set(el, next);
+    }}
   }}
 
   // Refresh KPIs, unanswered tray, filter chips, and card list while preserving live draft typing
@@ -4754,7 +4975,7 @@ def render_workbench_html(
     if (works.length === 0) {{
       patchSlotHtml(
         container,
-        '<div data-unit-key="wb-empty" style="color:var(--muted);padding:16px 4px">'
+        '<div id="wb-empty" data-unit-key="wb-empty" style="color:var(--muted);padding:16px 4px">'
         + 'No works match the current filter.</div>'
       );
       return;
@@ -4804,6 +5025,7 @@ def render_workbench_html(
       if (['triage', 'activity', 'age'].includes(nextMode)) {{
         sortMode = nextMode;
         sortDir = nextMode === 'age' ? 'asc' : 'desc';
+        clearRefreshAnchors();
         saveSortPrefs();
         render();
       }}
@@ -4813,14 +5035,15 @@ def render_workbench_html(
   if (sortDirEl) {{
     sortDirEl.addEventListener('click', () => {{
       sortDir = sortDir === 'desc' ? 'asc' : 'desc';
+      clearRefreshAnchors();
       saveSortPrefs();
       render();
     }});
   }}
 
-  // Scope toolbar toggle to currently visible cards without touching hidden tabs
+  // Scope toolbar toggle to currently visible cards without touching hidden tabs or stubs
   document.getElementById('wb-toggle-collapse').addEventListener('click', () => {{
-    const works = getVisibleWorks();
+    const works = getVisibleWorks().filter((w) => w && !w.is_refresh_stub);
     const targetCollapsed = works.some((w) => !isCardCollapsed(w));
     for (const w of works) setCardCollapsed(w, targetCollapsed);
     if (!isSearchActive()) saveCollapsePrefs();
@@ -4883,7 +5106,9 @@ def render_workbench_html(
         if (e.altKey) {{
           e.preventDefault();
           const nextCollapsed = !cur;
-          for (const w of works) setCardCollapsed(w, nextCollapsed);
+          for (const w of works) {{
+            if (w && !w.is_refresh_stub) setCardCollapsed(w, nextCollapsed);
+          }}
         }} else {{
           const clicked = works.find((w) => String(w.work_id) === String(wid));
           if (clicked) {{
@@ -4984,10 +5209,18 @@ def render_workbench_html(
       }});
       return;
     }}
-    if (target.hasAttribute('data-drafts-toggle')) {{
-      draftsOpen = !draftsOpen;
-      saveDraftsPrefs();
-      render();
+    if (target.hasAttribute('data-work-refresh')) {{
+      const wid = target.getAttribute('data-work-refresh');
+      if (wid) await refreshSingleCard(wid, target);
+      return;
+    }}
+    if (target.hasAttribute('data-dismiss-stub')) {{
+      const swid = target.getAttribute('data-dismiss-stub');
+      if (swid) {{
+        refreshStubs.delete(swid);
+        sortAnchors.delete(swid);
+        render();
+      }}
       return;
     }}
     for (const [attr, path] of [
@@ -5491,10 +5724,67 @@ def create_server(
         return
 
       if parsed.path == "/api/work/accept":
-        wid = str(body.get("work_id") or "")
+        wid = str(body.get("work_id") or "").strip()
+        accepted_wid = ""
         if wid:
-          active_store.set_work_owner(wid, "user")
-        self._send_json(current_projection())
+          try:
+            accepted_wid = ingestor.accept_work_card(
+                active_store, wid, cl_state_path=cl_state_path
+            )
+          except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+        proj = dict(current_projection())
+        if accepted_wid:
+          proj["accepted_work_id"] = accepted_wid
+        self._send_json(proj)
+        return
+
+      if parsed.path == "/api/work/refresh":
+        wid = str(body.get("work_id") or "").strip()
+        if not wid:
+          self._send_json({"error": "work_id is required"}, status=400)
+          return
+        try:
+          res = ingestor.refresh_work_card(
+              active_store,
+              wid,
+              cl_state_path=cl_state_path,
+              watcher_state_path=watcher_state_path,
+          )
+        except ValueError as exc:
+          self._send_json({"error": str(exc)}, status=400)
+          return
+        except Exception as exc:
+          self._send_json({"error": str(exc)}, status=502)
+          return
+        snap_proj = current_projection()
+        resolved_wid = str(res.get("resolved_work_id") or wid)
+        slim_card = (
+            next(
+                (
+                    w
+                    for w in (snap_proj.get("works") or ())
+                    if str(w.get("work_id")) in (resolved_wid, wid)
+                ),
+                None,
+            )
+            if res.get("card") is not None
+            else None
+        )
+        self._send_json({
+            "ok": True,
+            "work_id": wid,
+            "resolved_work_id": str((slim_card or {}).get("work_id") or resolved_wid),
+            "previous_lane": str(res.get("previous_lane") or ""),
+            "card": slim_card,
+            "removed_reason": str(res.get("removed_reason") or ""),
+            "lane_moved_reason": str(res.get("lane_moved_reason") or ""),
+            "counts": snap_proj.get("counts") or {},
+            "unanswered_tray": snap_proj.get("unanswered_tray") or [],
+            "metrics": snap_proj.get("metrics") or {},
+            "synced_et": str(snap_proj.get("synced_et") or ""),
+        })
         return
 
       if parsed.path == "/api/work/hint/dismiss":

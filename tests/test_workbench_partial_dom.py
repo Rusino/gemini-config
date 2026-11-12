@@ -705,10 +705,10 @@ class WorkbenchPartialDomTest(unittest.TestCase):
       const container = document.getElementById('wb-cards-container');
       const card1Before = container.querySelector('[data-work-id="work-1"]');
       const card2Before = container.querySelector('[data-work-id="work-2"]');
-      const draftsBodyBefore = container.querySelector('.wb-drafts-body');
-      const cardDraftBefore = draftsBodyBefore.querySelector('[data-work-id="work-d"]');
+      const unownedHdrBefore = container.querySelector('[data-unit-key="wb-sec:unowned-hdr"]');
+      const cardDraftBefore = container.querySelector('[data-work-id="work-d"]');
       const dot1Before = card1Before.querySelector('.re-dot');
-      assert(card1Before && card2Before && cardDraftBefore && dot1Before);
+      assert(card1Before && card2Before && unownedHdrBefore && cardDraftBefore && dot1Before);
 
       // 1. Update only work-1 (PS1 -> PS2) on background poll
       global.window.scrollY = 220;
@@ -733,14 +733,14 @@ class WorkbenchPartialDomTest(unittest.TestCase):
         'Unchanged sibling card must stay untouched'
       );
       assert.strictEqual(
-        container.querySelector('.wb-drafts-body'),
-        draftsBodyBefore,
-        'Folded drafts container must stay mounted'
+        container.querySelector('[data-unit-key="wb-sec:unowned-hdr"]'),
+        unownedHdrBefore,
+        'Open unowned stream header must stay mounted'
       );
       assert.strictEqual(
-        draftsBodyBefore.querySelector('[data-work-id="work-d"]'),
+        container.querySelector('[data-work-id="work-d"]'),
         cardDraftBefore,
-        'Folded draft card must stay untouched'
+        'Open unowned card must stay untouched'
       );
       const singleCardInnerSets = domStats.innerHTMLSets;
       const singleCardScrollRestores = domStats.scrollRestores;
@@ -751,28 +751,22 @@ class WorkbenchPartialDomTest(unittest.TestCase):
       await env.getPollFn()();
 
       const mainCards = Array.from(container.children).filter(el => el.tagName === 'ARTICLE');
-      assert.strictEqual(mainCards.length, 3);
+      assert.strictEqual(mainCards.length, 4);
       assert.strictEqual(mainCards[0].getAttribute('data-work-id'), 'work-0');
       assert.strictEqual(mainCards[1], card1Before, 'Card 1 must shift down intact');
       assert.strictEqual(mainCards[2], card2Before, 'Card 2 must shift down intact');
+      assert.strictEqual(mainCards[3], cardDraftBefore, 'Unowned card must shift down intact');
       const topInsertRemovals = domStats.removals;
       const topInsertScrollRestores = domStats.scrollRestores;
 
-      // 3. Toggle Черновики open: main cards and draft card keep DOM identity
-      const toggleBtn = container.querySelector('[data-drafts-toggle]');
-      await clickElement(toggleBtn);
-      assert.strictEqual(draftsBodyBefore.hasAttribute('hidden'), false);
-      assert.strictEqual(
-        draftsBodyBefore.querySelector('[data-work-id="work-d"]'), cardDraftBefore
-      );
-
-      // 4. Switch to flat Activity mode: main cards survive without innerHTML wipe
+      // 3. Switch to flat Activity mode: all cards survive without innerHTML wipe
       const sortSel = document.getElementById('wb-sort-mode');
       sortSel.value = 'activity';
       resetDomStats();
       await sortSel.dispatch('change', {{target: sortSel}});
       assert.strictEqual(container.querySelector('[data-work-id="work-1"]'), card1Before);
       assert.strictEqual(container.querySelector('[data-work-id="work-2"]'), card2Before);
+      assert.strictEqual(container.querySelector('[data-work-id="work-d"]'), cardDraftBefore);
       console.log(JSON.stringify({{
         singleCardInnerSets,
         singleCardScrollRestores,

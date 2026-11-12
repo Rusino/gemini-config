@@ -921,6 +921,11 @@ def is_placeholder_title(title: str, artifact_key: str = "") -> bool:
     return True
   if re.match(r"^(?:\d+:\s*)?\[companion\s+(?:wip|draft)\]$", tl):
     return True
+  # Treat redacted or generic fallback bug labels as placeholders so stored unredacted titles win
+  if "[external title redacted" in tl or tl.endswith("[redacted]"):
+    return True
+  if re.match(r"^(?:(?:b|crbug)/\d+:\s*)?bug\s+(?:\d+|buganizer:|gh_issue:)", tl):
+    return True
   return False
 
 
@@ -2590,6 +2595,56 @@ def _is_adopt_signal(art: Mapping[str, Any], now: float) -> bool:
   return _parse_domain_ts(st.get("last_message_ts")) >= now - HINT_WINDOW_S
 
 
+def _adopt_member_family(art: Mapping[str, Any]) -> str:
+  """Maps substantive cross-source members to bug/cl/correspondence families for adopt hints.
+
+  Excludes internal chat chains, outgoing Gmail drafts, companion WIP probes, unhydrated Gmail
+  stubs, and GitHub notification mirror emails so single-bug+CL items stay banner-free.
+  """
+  if str(art.get("role") or "") == "context_only":
+    return ""
+  link_reason = str(art.get("link_reason") or "")
+  if link_reason in ("github_issue_thread", "github_pr_thread", "gmail_reviewlog"):
+    return ""
+  akey = str(art.get("artifact_key") or "")
+  kind = str(art.get("kind") or artifact_kind_from_key(akey))
+  st = art.get("state") if isinstance(art.get("state"), Mapping) else {}
+  if kind in ("chat_chain", "gmail_draft", "roadmap_item"):
+    return ""
+  if kind in _HINT_CL_KINDS:
+    if is_companion_artifact(akey, st, str(art.get("title") or ""), link_reason):
+      return ""
+    return "cl"
+  if _is_bug_key(akey):
+    return "bug"
+  if kind == "gmail_thread":
+    # Unhydrated thread placeholders have no provenance yet and may turn out to be automated bots
+    if not (st.get("last_message_ts") or st.get("origin_ts") or st.get("schema_ver")):
+      return ""
+    # GitHub notification threads mirror the linked PR/Issue, not an independent human channel
+    subj = str(st.get("root_subject") or art.get("title") or "")
+    if (
+        st.get("is_github_issue_thread")
+        or st.get("is_github_pr_thread")
+        or st.get("gh_target_key")
+        or extract_github_notif_target(subj)
+    ):
+      return ""
+  if kind == "gdoc" or is_active_correspondence_artifact(kind, st):
+    return "correspondence"
+  return ""
+
+
+def _adopt_item_dedup_key(art: Mapping[str, Any]) -> str:
+  """Collapses gdoc_thread:<doc_id>:* onto gdoc:<doc_id> so one doc counts as one source item."""
+  akey = str(art.get("artifact_key") or "")
+  if akey.startswith("gdoc_thread:"):
+    parts = akey.split(":")
+    if len(parts) >= 2 and parts[1]:
+      return f"gdoc:{parts[1]}"
+  return akey
+
+
 def _split_hint(members: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
   """Offers bug clusters to split out: 2+ clusters of 2+, or any cluster in an oversized work."""
   # A cluster that is the whole work has nothing to split away from
@@ -2660,8 +2715,16 @@ def compute_work_hints(
   recent = activity_ts >= now - HINT_WINDOW_S
   hints: list[dict[str, Any]] = []
   if owner != "user":
-    if len(members) >= 3 and recent and any(_is_adopt_signal(a, now) for a in members):
-      hints.append({"kind": "adopt", "label": "Сделать своей?", "detail": ""})
+    if recent and not _is_finished_work(w_arts, w_obs):
+      substantive = [(a, fam) for a in members if (fam := _adopt_member_family(a))]
+      distinct_items = {_adopt_item_dedup_key(a) for a, _ in substantive}
+      families = {fam for _, fam in substantive}
+      if (
+          len(distinct_items) >= 3
+          and len(families) >= 2
+          and any(_is_adopt_signal(a, now) for a, _ in substantive)
+      ):
+        hints.append({"kind": "adopt", "label": "Сделать своей?", "detail": ""})
   else:
     split = _split_hint(members)
     if split:

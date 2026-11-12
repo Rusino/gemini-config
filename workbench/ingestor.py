@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 from collections.abc import Mapping
 from datetime import datetime
 from email.utils import formataddr, getaddresses
@@ -19,6 +20,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Any
 import urllib.parse
@@ -1844,6 +1846,8 @@ def _fetch_gmail_thread_provenance(
     thread_id: str,
     thread_cache: dict[str, Any],
     now: float,
+    *,
+    force_refresh: bool = False,
 ) -> dict[str, Any]:
   """Fetches first-message date, sender/recipient, and full-body text for a Gmail thread."""
   tid = str(thread_id or "").strip()
@@ -1851,7 +1855,8 @@ def _fetch_gmail_thread_provenance(
     return {}
   cached = thread_cache.get(tid)
   if (
-      isinstance(cached, Mapping)
+      not force_refresh
+      and isinstance(cached, Mapping)
       and int(cached.get("schema_ver") or 0) == 6
       and (now - float(cached.get("fetched_at") or 0.0) < 600)
   ):
@@ -3367,43 +3372,70 @@ def _refresh_tracked_gmail_threads(
   for _, tid in candidates[:limit]:
     seen_tids.add(tid)
     t_prov = _fetch_gmail_thread_provenance(tid, thread_cache, cur_now)
-    if not t_prov.get("schema_ver"):
-      continue
-    t_key = f"gmail_thread:{tid}"
-    prev_art = store.get_artifact(t_key) or {}
-    prev_st = prev_art.get("state") if isinstance(prev_art.get("state"), Mapping) else {}
-    prev_msg_ts = float(prev_st.get("last_message_ts") or 0.0)
-    new_msg_ts = float(t_prov.get("last_message_ts") or 0.0)
-    gh_resolved = _is_gh_notif_resolved(store, t_prov, prev_st)
-    trashed_unjoined = bool(t_prov.get("in_trash_or_spam")) and not bool(t_prov.get("sent_by_me"))
-    if (
-        t_prov.get("last_from_me", True)
-        or t_prov.get("is_automated")
-        or trashed_unjoined
-        or gh_resolved
-        or _thread_covered_by_draft(tid, new_msg_ts, draft_ts_by_thread)
-    ):
-      t_prov["unanswered_human"] = False
-    elif new_msg_ts > prev_msg_ts and (cur_now - new_msg_ts) <= 14 * 86400:
-      t_prov["unanswered_human"] = True
-    else:
-      t_prov["unanswered_human"] = bool(prev_st.get("unanswered_human"))
+    if t_prov.get("schema_ver"):
+      _upsert_refreshed_gmail_thread(store, tid, t_prov, draft_ts_by_thread, cur_now)
 
-    cp = str(t_prov.get("counterparty") or "").strip()
-    root_subj = str(t_prov.get("root_subject") or "").strip()
-    t_title = (
-        f"{root_subj} ({cp})"
-        if (root_subj and cp and cp.lower() not in root_subj.lower())
-        else root_subj
-    )
-    store.upsert_artifact(
-        t_key,
-        kind="gmail_thread",
-        title=t_title,
-        url=f"https://mail.google.com/mail/u/0/#all/{tid}",
-        state=t_prov,
-        now=cur_now,
-    )
+
+def _upsert_refreshed_gmail_thread(
+    store: work_store.WorkStore,
+    tid: str,
+    t_prov: dict[str, Any],
+    draft_ts_by_thread: Mapping[str, float],
+    cur_now: float,
+) -> bool:
+  """Classifies fresh thread provenance against stored state, upserts it, returns unanswered.
+
+  Bot mail, her own last reply, trashed unjoined threads, resolved GitHub mirrors, and threads
+  covered by a newer draft never count as unanswered; only a new inbound message within 14
+  days raises the flag, otherwise the stored flag is kept.
+  """
+  t_key = f"gmail_thread:{tid}"
+  prev_art = store.get_artifact(t_key) or {}
+  prev_st = prev_art.get("state") if isinstance(prev_art.get("state"), Mapping) else {}
+  prev_msg_ts = float(prev_st.get("last_message_ts") or 0.0)
+  new_msg_ts = float(t_prov.get("last_message_ts") or 0.0)
+  gh_resolved = _is_gh_notif_resolved(store, t_prov, prev_st)
+  trashed_unjoined = bool(t_prov.get("in_trash_or_spam")) and not bool(t_prov.get("sent_by_me"))
+  if (
+      t_prov.get("last_from_me", True)
+      or t_prov.get("is_automated")
+      or trashed_unjoined
+      or gh_resolved
+      or _thread_covered_by_draft(tid, new_msg_ts, draft_ts_by_thread)
+  ):
+    t_prov["unanswered_human"] = False
+  elif new_msg_ts > prev_msg_ts and (cur_now - new_msg_ts) <= 14 * 86400:
+    t_prov["unanswered_human"] = True
+  else:
+    t_prov["unanswered_human"] = bool(prev_st.get("unanswered_human"))
+
+  cp = str(t_prov.get("counterparty") or "").strip()
+  root_subj = str(t_prov.get("root_subject") or "").strip()
+  t_title = (
+      f"{root_subj} ({cp})"
+      if (root_subj and cp and cp.lower() not in root_subj.lower())
+      else root_subj
+  )
+  store.upsert_artifact(
+      t_key,
+      kind="gmail_thread",
+      title=t_title,
+      url=f"https://mail.google.com/mail/u/0/#all/{tid}",
+      state=t_prov,
+      now=cur_now,
+  )
+  return bool(t_prov["unanswered_human"])
+
+
+def _parse_gh_key(akey: str) -> tuple[str, str, int] | None:
+  """Parses a canonical github_issue:<owner>/<repo>:<num> or github_pr key into its components."""
+  parts = akey.split(":")
+  if len(parts) != 3 or "/" not in parts[1] or not parts[2].isdigit():
+    return None
+  owner, repo = parts[1].split("/", 1)
+  if not re.match(r"^[A-Za-z0-9_.\-]+$", owner) or not re.match(r"^[A-Za-z0-9_.\-]+$", repo):
+    return None
+  return owner, repo, int(parts[2])
 
 
 def _collect_github_sync_targets(
@@ -3414,15 +3446,6 @@ def _collect_github_sync_targets(
   context_targets: list[tuple[str, str, str, int]] = []
   seen_targets: set[str] = set()
   target_to_gmail_keys: dict[str, set[str]] = {}
-
-  def _parse_gh_key(akey: str) -> tuple[str, str, int] | None:
-    parts = akey.split(":")
-    if len(parts) != 3 or "/" not in parts[1] or not parts[2].isdigit():
-      return None
-    owner, repo = parts[1].split("/", 1)
-    if not re.match(r"^[A-Za-z0-9_.\-]+$", owner) or not re.match(r"^[A-Za-z0-9_.\-]+$", repo):
-      return None
-    return owner, repo, int(parts[2])
 
   for w in store.list_works(include_archived=False):
     if str(w.get("status") or "") == "done":
@@ -3463,7 +3486,8 @@ def _build_github_graphql_query(owner: str, repo: str, chunk: list[tuple[str, in
         f"n{idx}: issueOrPullRequest(number: {num}) {{\n"
         "      __typename\n"
         "      ... on Issue {\n"
-        "        number title state locked closedAt updatedAt url\n"
+        "        number title state stateReason locked closedAt updatedAt url\n"
+        "        assignees(first: 10) { nodes { login } }\n"
         "        comments(last: 20) { nodes { createdAt viewerDidAuthor author { login } } }\n"
         "      }\n"
         "      ... on PullRequest {\n"
@@ -3560,6 +3584,17 @@ def _apply_github_node_to_store(
     if gh_title:
       art_state["short_id"] = short_b
       art_state["bug_title"] = gh_title
+    state_reason = str(node.get("stateReason") or "").strip().upper()
+    if state_reason:
+      art_state["state_reason"] = state_reason
+    if isinstance(node.get("assignees"), Mapping):
+      asg_nodes = node["assignees"].get("nodes") or []
+      logins = [
+          str(a.get("login") or "").strip()
+          for a in asg_nodes
+          if isinstance(a, Mapping) and str(a.get("login") or "").strip()
+      ]
+      art_state["assignee"] = ", ".join(logins)
     akind = "github_issue"
   else:
     num_str = akey.split(":")[-1]
@@ -3608,27 +3643,16 @@ def _apply_github_node_to_store(
     store.upsert_artifact(t_key, kind="gmail_thread", state=t_patch, now=cur_now)
 
 
-def sync_github_artifacts(
-    store: work_store.WorkStore,
-    watcher_state: dict[str, Any],
-    now: float | None = None,
-    force: bool = False,
-) -> int:
-  """Batches gh api graphql queries for non-done Works' GitHub Issues/PRs (300s throttle)."""
-  cur_now = time.time() if now is None else now
-  if not force and (cur_now - float(watcher_state.get("last_github_sync") or 0.0) < 300):
-    return 0
-  watcher_state["last_github_sync"] = cur_now
-
-  targets, target_to_gmail_keys = _collect_github_sync_targets(store)
-  if not targets:
-    return 0
-
+def _fetch_live_github_nodes(
+    gh_targets: list[tuple[str, str, str, int]],
+) -> dict[str, Mapping[str, Any]]:
+  """Queries live GitHub GraphQL nodes in 30-item repo chunks for Issue/PR card keys."""
+  if not gh_targets:
+    return {}
   by_repo: dict[tuple[str, str], list[tuple[str, int]]] = {}
-  for akey, owner, repo, num in targets:
+  for akey, owner, repo, num in gh_targets:
     by_repo.setdefault((owner, repo), []).append((akey, num))
-
-  updated = 0
+  found: dict[str, Mapping[str, Any]] = {}
   for (owner, repo), repo_items in by_repo.items():
     for start in range(0, len(repo_items), 30):
       chunk = repo_items[start : start + 30]
@@ -3663,13 +3687,33 @@ def sync_github_artifacts(
       }
       for idx, (akey, num) in enumerate(chunk):
         node = by_number.get(num) or repo_data.get(f"n{idx}")
-        if not isinstance(node, Mapping):
-          continue
-        _apply_github_node_to_store(
-            store, akey, node, target_to_gmail_keys.get(akey, set()), cur_now
-        )
-        updated += 1
-  return updated
+        if isinstance(node, Mapping):
+          found[akey] = node
+  return found
+
+
+def sync_github_artifacts(
+    store: work_store.WorkStore,
+    watcher_state: dict[str, Any],
+    now: float | None = None,
+    force: bool = False,
+) -> int:
+  """Batches gh api graphql queries for non-done Works' GitHub Issues/PRs (300s throttle)."""
+  cur_now = time.time() if now is None else now
+  if not force and (cur_now - float(watcher_state.get("last_github_sync") or 0.0) < 300):
+    return 0
+  watcher_state["last_github_sync"] = cur_now
+
+  targets, target_to_gmail_keys = _collect_github_sync_targets(store)
+  if not targets:
+    return 0
+
+  nodes_by_key = _fetch_live_github_nodes(targets)
+  for akey, node in nodes_by_key.items():
+    _apply_github_node_to_store(
+        store, akey, node, target_to_gmail_keys.get(akey, set()), cur_now
+    )
+  return len(nodes_by_key)
 
 
 def run_sync_cycle(
@@ -3767,10 +3811,16 @@ def run_sync_cycle(
   w_state["last_sync"] = cur_now
   try:
     os.makedirs(os.path.dirname(watcher_state_path), exist_ok=True)
-    tmp = f"{watcher_state_path}.tmp.{os.getpid()}"
-    with open(tmp, "w", encoding="utf-8") as f:
-      json.dump(w_state, f, indent=2)
-    os.replace(tmp, watcher_state_path)
+    lock_path = f"{watcher_state_path}.lock"
+    with open(lock_path, "a", encoding="utf-8") as lf:
+      fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+      try:
+        tmp = f"{watcher_state_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+          json.dump(w_state, f, indent=2)
+        os.replace(tmp, watcher_state_path)
+      finally:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
   except OSError:
     pass
 
@@ -4605,4 +4655,575 @@ def start_chat_for_work(
       "project_id": project_id,
       "project_name": project_name,
       "chat_url": f"{jetski_box_url()}/c/{new_cid}",
+  }
+
+
+_LANE_LABELS_RU = {
+    "needs-you": "Needs You",
+    "on-desk": "On Desk",
+    "waiting": "Waiting",
+    "blocked": "Blocked",
+    "done": "Done",
+}
+
+
+def _load_cl_watcher_module() -> Any:
+  """Lazily imports scripts/cl_watcher.py so normal Workbench startup stays lightweight."""
+  scripts_dir = os.path.join(
+      os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"
+  )
+  if scripts_dir not in sys.path:
+    sys.path.insert(0, scripts_dir)
+  import cl_watcher as cw  # pylint: disable=g-import-not-at-top
+
+  return cw
+
+
+def accept_work_card(
+    store: work_store.WorkStore,
+    work_id: str,
+    *,
+    cl_state_path: str = DEFAULT_CL_WATCHER_STATE,
+    projects_dir: str | None = None,
+    now: float | None = None,
+) -> str:
+  """Promotes an unowned persisted or virtual card to owner=user and returns its persisted ID."""
+  cur_now = time.time() if now is None else float(now)
+  raw_wid = str(work_id or "").strip()
+  if not raw_wid:
+    raise ValueError("work_id is required")
+  if raw_wid.startswith("virt-"):
+    card = _resolve_card_for_chat(store, raw_wid, cl_state_path, cur_now)
+    if str(card.get("work_id") or "").startswith("virt-") or bool(card.get("is_virtual")):
+      loaded_projects = _load_active_projects(projects_dir=projects_dir)
+      _, project_name = resolve_work_chat_project(card, loaded_projects=loaded_projects)
+      mat = _materialize_virtual_card(store, card, project_name, cur_now)
+      resolved_wid = str(mat["work_id"])
+    else:
+      resolved_wid = str(card["work_id"])
+    store.set_work_owner(resolved_wid, "user", now=cur_now)
+    return resolved_wid
+  # set_work_owner silently no-ops on unknown rows, so reject stale IDs before claiming success
+  if not any(str(w.get("work_id")) == raw_wid for w in store.list_works(include_archived=True)):
+    raise ValueError(f"Unknown work_id: {raw_wid}")
+  store.set_work_owner(raw_wid, "user", now=cur_now)
+  return raw_wid
+
+
+def _fetch_live_buganizer_records(bug_ids: list[str]) -> dict[str, dict[str, Any]]:
+  """Fetches live Buganizer records for numeric IDs via remote_mcp with batch-get CLI fallback."""
+  clean_ids = [bid for bid in dict.fromkeys(bug_ids) if bid.isdigit()]
+  if not clean_ids:
+    return {}
+  cw = _load_cl_watcher_module()
+  found: dict[str, dict[str, Any]] = {}
+  query = " OR ".join(f"id:{bid}" for bid in clean_ids)
+  mcp_args = {"query": query, "maxResults": max(20, len(clean_ids) * 2), "verbose": True}
+  outs = cw.call_buganizer_mcp_batch(
+      [("get_bugs_with_external", mcp_args)],
+      timeout_sec=12.0,
+  )
+  for rec in cw.parse_buganizer_blocks(outs[0] if outs else ""):
+    bid = str(rec.get("id") or "").strip()
+    if bid:
+      found[f"buganizer:{bid}"] = dict(rec)
+
+  missing = [bid for bid in clean_ids if f"buganizer:{bid}" not in found]
+  if missing and os.path.isfile(cw.ISSUES_CLI_BIN):
+    try:
+      res = subprocess.run(
+          [cw.ISSUES_CLI_BIN, "readonly", "batch-get", f"--issue_ids={','.join(missing)}"],
+          capture_output=True,
+          text=True,
+          timeout=12,
+          check=False,
+      )
+    except (OSError, subprocess.SubprocessError):
+      res = None
+    if res is not None and res.returncode == 0:
+      # batch-get prints '[DUPLICATE of N]' while the shared parser expects upper-case status
+      raw_out = re.sub(r"\[[^\]\n]*\]", lambda m: m.group(0).upper(), res.stdout or "")
+      for rec in cw.parse_buganizer_blocks(raw_out):
+        bid = str(rec.get("id") or "").strip()
+        if bid:
+          found[f"buganizer:{bid}"] = dict(rec)
+
+  # Live refresh must show the newest human comment, so render every fetched bug once
+  render_ids = [bid for bid in clean_ids if f"buganizer:{bid}" in found]
+  if render_ids:
+    rendered = cw.call_buganizer_mcp_batch(
+        [("render_issue_with_external", {"issueId": bid}) for bid in render_ids],
+        timeout_sec=12.0,
+    )
+    for bid, r_out in zip(render_ids, rendered or []):
+      if cw._is_valid_rendered_issue_output(r_out, bid):  # pylint: disable=protected-access
+        found[f"buganizer:{bid}"].update(cw.parse_rendered_issue_comments(r_out))
+  return found
+
+
+def _fetch_live_gerrit_records(gerrit_keys: list[str]) -> dict[str, dict[str, Any]]:
+  """Polls live Gerrit detail endpoints for canonical gerrit:<host>:<num> artifact keys."""
+  if not gerrit_keys:
+    return {}
+  cw = _load_cl_watcher_module()
+  host_map = {
+      "skia": cw.GERRIT_SKIA_HOST,
+      "chromium": cw.GERRIT_CHROMIUM_HOST,
+  }
+  out: dict[str, dict[str, Any]] = {}
+  for akey in dict.fromkeys(gerrit_keys):
+    parts = akey.split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+      continue
+    pref_host = host_map.get(parts[1], parts[1])
+    info = cw.fetch_gerrit_cl_status(parts[2], {}, [], preferred_host=pref_host)
+    if isinstance(info, dict) and (info.get("status") or info.get("subject")):
+      out[akey] = info
+  return out
+
+
+def _mutate_cl_watcher_state_file(
+    cl_state_path: str,
+    bug_updates: Mapping[str, dict[str, Any]],
+    bug_removals: set[str],
+    item_updates: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+  """Applies targeted bug/CL updates to cl_watcher_state.json under an exclusive file lock."""
+  if not os.path.isfile(cl_state_path):
+    return {"items": {}, "bugs": {}}
+  if not (bug_updates or bug_removals or item_updates):
+    return load_cl_watcher_snapshot(cl_state_path)
+
+  cw = _load_cl_watcher_module()
+  lock_path = f"{cl_state_path}.lock"
+  os.makedirs(os.path.dirname(cl_state_path), exist_ok=True)
+  with open(lock_path, "a", encoding="utf-8") as lf:
+    fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+    try:
+      try:
+        with open(cl_state_path, "r", encoding="utf-8") as f:
+          disk_state = json.load(f)
+      except Exception:
+        disk_state = {"items": {}, "bugs": {}}
+      if not isinstance(disk_state, dict):
+        disk_state = {"items": {}, "bugs": {}}
+      bugs = disk_state.setdefault("bugs", {})
+      items = disk_state.setdefault("items", {})
+      for bkey in bug_removals:
+        bugs.pop(bkey, None)
+      for bkey, brec in bug_updates.items():
+        if bkey not in bug_removals:
+          bugs[bkey] = dict(brec)
+      if item_updates and isinstance(items, dict):
+        for raw_k, cur_item in list(items.items()):
+          if not isinstance(cur_item, dict):
+            continue
+          ckey = work_store.canonicalize_artifact_key(
+              str(cur_item.get("kind") or "gerrit"),
+              str(cur_item.get("target_id") or raw_k),
+              host=str(cur_item.get("host") or ""),
+          )
+          if ckey in item_updates:
+            merged_item = {**cur_item, **dict(item_updates[ckey])}
+            items[raw_k] = merged_item
+      if isinstance(bugs, dict) and isinstance(items, dict):
+        cw.link_bugs_and_cls(bugs, items)
+      try:
+        import entity_state  # pylint: disable=g-import-not-at-top
+
+        entity_state.enrich_entity_states(disk_state)
+      except Exception:
+        pass
+      tmp = f"{cl_state_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+      with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(disk_state, f, indent=2, ensure_ascii=False)
+      os.replace(tmp, cl_state_path)
+      return disk_state
+    finally:
+      fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+
+def _describe_card_removal_reason(
+    target_keys: list[str],
+    store: work_store.WorkStore,
+    fresh_bugs: Mapping[str, Mapping[str, Any]],
+    fresh_cls: Mapping[str, Mapping[str, Any]],
+) -> str:
+  """Builds a short Russian explanation when a refreshed card leaves the active projection."""
+  for akey in target_keys:
+    b_st = fresh_bugs.get(akey) or ((store.get_artifact(akey) or {}).get("state") or {})
+    if akey.startswith(("buganizer:", "github_issue:")) and isinstance(b_st, Mapping):
+      status_u = str(b_st.get("status") or "").strip().upper()
+      if status_u in work_store.CLOSED_BUG_STATUSES:
+        return f"Баг закрыт ({status_u})"
+      assignee = str(b_st.get("assignee") or "").strip()
+      if assignee and not work_store.is_bug_assigned_to_me(b_st):
+        return f"Переведён на {assignee}"
+      if not assignee and not work_store.is_bug_assigned_to_me(b_st):
+        return "Снят с тебя"
+    c_st = fresh_cls.get(akey) or ((store.get_artifact(akey) or {}).get("state") or {})
+    if akey.startswith(("gerrit:", "github_pr:", "piper:")) and isinstance(c_st, Mapping):
+      c_status = str(c_st.get("status") or "").strip().upper()
+      if c_status == "MERGED":
+        return "СЛ замержен"
+      if c_status in ("ABANDONED", "CLOSED"):
+        return f"СЛ закрыт ({c_status})"
+  return "Ушло из текущего списка"
+
+
+def _resolve_refresh_targets(
+    store: work_store.WorkStore,
+    raw_wid: str,
+    works_before: list[dict[str, Any]],
+) -> tuple[str, dict[str, Any] | None, list[str]]:
+  """Returns (resolved_work_id, card_before, canonical non-context artifact keys) for refresh."""
+  card_before = next((w for w in works_before if str(w.get("work_id")) == raw_wid), None)
+  resolved_wid = raw_wid
+  prim_key = ""
+  if raw_wid.startswith("virt-"):
+    prim_key = work_store.canonicalize_artifact_key(raw_wid[len("virt-") :])
+    if not prim_key:
+      raise ValueError(f"Unknown work_id: {raw_wid}")
+    if card_before is None:
+      promoted = store.find_work_by_artifact(prim_key, roles=("primary", "channel"))
+      if promoted:
+        resolved_wid = promoted
+        card_before = next((w for w in works_before if str(w.get("work_id")) == promoted), None)
+  elif card_before is None:
+    if not any(str(w.get("work_id")) == raw_wid for w in store.list_works(include_archived=True)):
+      raise ValueError(f"Unknown work_id: {raw_wid}")
+
+  target_keys: list[str] = [prim_key] if prim_key else []
+  raw_keys: list[str] = []
+  if card_before is not None:
+    raw_keys += [
+        str(a.get("artifact_key") or "")
+        for a in card_before.get("artifacts") or []
+        if isinstance(a, Mapping) and a.get("role") != "context_only"
+    ]
+  if not resolved_wid.startswith("virt-"):
+    raw_keys += [
+        k for k, r in store.get_work_artifact_roles(resolved_wid).items() if r != "context_only"
+    ]
+  for raw_k in raw_keys:
+    ck = work_store.canonicalize_artifact_key(raw_k)
+    if ck and ck not in target_keys:
+      target_keys.append(ck)
+  return resolved_wid, card_before, target_keys
+
+
+def _seed_prev_bug(
+    store: work_store.WorkStore, bkey: str, prev_bugs: Mapping[str, Any]
+) -> dict[str, Any] | None:
+  """Returns the cached watcher bug or, for bugs absent from it, the stored SQLite bug state."""
+  prev_b = prev_bugs.get(bkey)
+  if isinstance(prev_b, dict):
+    return prev_b
+  art = store.get_artifact(bkey) or {}
+  st = art.get("state") if isinstance(art.get("state"), Mapping) else {}
+  if not st:
+    return None
+  seed = dict(st)
+  # merge_bug_record_with_prev reads the real title from prev["title"], kept as bug_title here
+  seed["title"] = str(st.get("bug_title") or st.get("title") or "")
+  return seed
+
+
+def _apply_refreshed_bugs(
+    store: work_store.WorkStore,
+    cw: Any,
+    cl_state: Mapping[str, Any],
+    fresh_bz_raw: Mapping[str, dict[str, Any]],
+    cur_now: float,
+) -> tuple[dict[str, dict[str, Any]], set[str], dict[str, dict[str, Any]]]:
+  """Merges live Buganizer records the same way sync_bugs_into_state does.
+
+  Returns (bug_updates, bug_removals, merged bugs by artifact key). Links CLs before status
+  classification so a bug with an open fix CL never reads as "without a CL".
+  """
+  prev_bugs = cl_state.get("bugs") if isinstance(cl_state.get("bugs"), Mapping) else {}
+  merged: dict[str, dict[str, Any]] = {}
+  for bkey, b_curr in fresh_bz_raw.items():
+    prev_b = _seed_prev_bug(store, bkey, prev_bugs)
+    merged_b = cw.merge_bug_record_with_prev(dict(b_curr), prev_b)
+    cw._update_bug_self_assignment_state(  # pylint: disable=protected-access
+        merged_b, prev_b, has_prev_source_snapshot=True, now_ts=cur_now
+    )
+    # Role flags come from sync query membership, which a single-bug lookup cannot recompute
+    for flag in ("is_collaborator", "from_self_query"):
+      if flag not in b_curr and prev_b and flag in prev_b:
+        merged_b[flag] = bool(prev_b[flag])
+    merged[bkey] = merged_b
+
+  items_view = copy.deepcopy(cl_state.get("items") or {})
+  if isinstance(items_view, dict):
+    cw.link_bugs_and_cls(merged, items_view)
+
+  bug_updates: dict[str, dict[str, Any]] = {}
+  bug_removals: set[str] = set()
+  for bkey, merged_b in merged.items():
+    cw.classify_bug_status(merged_b, now_ts=cur_now)
+    ckey, bkind, btitle, burl = work_store.canonicalize_watcher_bug(bkey, merged_b)
+    bstate = dict(merged_b)
+    bdesc = str(merged_b.get("title") or merged_b.get("summary") or "").strip()
+    # Never persist redaction fallbacks as the human title of the bug
+    if cw._is_placeholder_bug_title(bdesc):  # pylint: disable=protected-access
+      bstate.pop("bug_title", None)
+    elif not bstate.get("bug_title"):
+      bstate["bug_title"] = bdesc
+    store.upsert_artifact(
+        ckey or bkey, kind=bkind, title=btitle, url=burl, state=bstate, now=cur_now
+    )
+    if cw._should_retain_bug_in_view(merged_b):  # pylint: disable=protected-access
+      bug_updates[bkey] = merged_b
+    else:
+      bug_removals.add(bkey)
+  return bug_updates, bug_removals, merged
+
+
+def _apply_refreshed_cls(
+    store: work_store.WorkStore,
+    cw: Any,
+    gerrit_keys: list[str],
+    gh_pr_targets: list[tuple[str, str, str, int]],
+    cur_now: float,
+) -> dict[str, dict[str, Any]]:
+  """Polls Gerrit CLs and GitHub PRs, attaches fresh entity_state, upserts, returns item updates.
+
+  Live Gerrit/GitHub responses carry no entity_state, and a stale cached one would keep the
+  card in its old lane, so the lane is recomputed here before the artifact is stored.
+  """
+  import entity_state  # pylint: disable=g-import-not-at-top
+
+  fresh: dict[str, dict[str, Any]] = dict(_fetch_live_gerrit_records(gerrit_keys))
+  for akey, owner, repo, num in gh_pr_targets:
+    info = cw.fetch_github_pr_status(str(num), f"{owner}/{repo}")
+    if isinstance(info, dict) and (info.get("status") or info.get("subject")):
+      fresh[akey] = info
+  item_updates: dict[str, dict[str, Any]] = {}
+  for akey, raw_info in fresh.items():
+    info = dict(raw_info)
+    info["entity_state"] = entity_state.compute_item_entity_state(info, now_ts=cur_now)
+    num_s = akey.split(":")[-1]
+    subj = str(info.get("subject") or info.get("title") or akey)
+    default_url = work_store._default_artifact_url(akey)  # pylint: disable=protected-access
+    store.upsert_artifact(
+        akey,
+        kind="gerrit" if akey.startswith("gerrit:") else "github_pr",
+        title=f"{num_s}: {subj}",
+        url=str(info.get("url") or default_url),
+        state=info,
+        now=cur_now,
+    )
+    item_updates[akey] = info
+  return item_updates
+
+
+def _apply_refreshed_github_issue(
+    store: work_store.WorkStore,
+    akey: str,
+    cl_state: Mapping[str, Any],
+    bug_updates: dict[str, dict[str, Any]],
+    bug_removals: set[str],
+) -> None:
+  """Mirrors a refreshed github_issue artifact into its cl_watcher gh_issue:<repo>#<n> entry."""
+  parsed = _parse_gh_key(akey)
+  st = (store.get_artifact(akey) or {}).get("state") or {}
+  if not parsed or not isinstance(st, Mapping):
+    return
+  bkey = f"gh_issue:{parsed[0]}/{parsed[1]}#{parsed[2]}"
+  prev_bugs = cl_state.get("bugs") if isinstance(cl_state.get("bugs"), Mapping) else {}
+  prev_b = prev_bugs.get(bkey)
+  status_u = str(st.get("status") or "").upper()
+  if status_u in work_store.CLOSED_BUG_STATUSES:
+    bug_removals.add(bkey)
+  elif isinstance(prev_b, dict):
+    upd = {**prev_b, "status": status_u or prev_b.get("status")}
+    if "assignee" in st:
+      upd["assignee"] = st["assignee"]
+    if st.get("bug_title"):
+      upd["title"] = st["bug_title"]
+    bug_updates[bkey] = upd
+
+
+def _refresh_card_gmail(
+    store: work_store.WorkStore,
+    target_keys: list[str],
+    watcher_state_path: str,
+    cur_now: float,
+) -> list[Any]:
+  """Force-polls the card's Gmail threads and drafts and persists them to watcher_state.
+
+  RPCs run without the lock; afterwards the latest watcher_state is re-read under the lock and
+  only the touched thread, draft, and tray entries are merged, so concurrent sync writes such
+  as transcript_cursors survive. Returns the updated unanswered tray.
+  """
+  w_state = _read_watcher_state(watcher_state_path)
+  thread_cache = dict(w_state.get("gmail_threads") or {})
+  active_draft_ids = set(w_state.get("active_draft_ids") or [])
+  fresh_threads: dict[str, Any] = {}
+  answered_keys: set[str] = set()
+  gone_dids: set[str] = set()
+  for ak in target_keys:
+    kind, _, ident = ak.partition(":")
+    ident = ident.strip()
+    if not ident:
+      continue
+    if kind == "gmail_thread":
+      t_prov = _fetch_gmail_thread_provenance(ident, thread_cache, cur_now, force_refresh=True)
+      if not t_prov.get("schema_ver"):
+        continue
+      fresh_threads[ident] = t_prov
+      if not _upsert_refreshed_gmail_thread(store, ident, t_prov, {}, cur_now):
+        answered_keys.add(ak)
+    elif kind == "gmail_draft" and not _gmail_draft_still_exists(ident):
+      gone_dids.add(ident)
+      active_draft_ids.discard(ident)
+      _reconcile_disappeared_gmail_draft(
+          store, ident, False, thread_cache, {}, active_draft_ids, cur_now
+      )
+  if not (fresh_threads or gone_dids) or not watcher_state_path:
+    return list(w_state.get("unanswered_tray") or [])
+
+  os.makedirs(os.path.dirname(watcher_state_path), exist_ok=True)
+  with open(f"{watcher_state_path}.lock", "a", encoding="utf-8") as lf:
+    fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+    try:
+      disk = _read_watcher_state(watcher_state_path)
+      disk.setdefault("gmail_threads", {}).update(fresh_threads)
+      disk["active_draft_ids"] = sorted(
+          d for d in (disk.get("active_draft_ids") or []) if d not in gone_dids
+      )
+      disk["unanswered_tray"] = [
+          u
+          for u in disk.get("unanswered_tray") or []
+          if not (isinstance(u, Mapping) and str(u.get("artifact_key") or "") in answered_keys)
+      ]
+      tmp_w = f"{watcher_state_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+      with open(tmp_w, "w", encoding="utf-8") as wf:
+        json.dump(disk, wf, indent=2, ensure_ascii=False)
+      os.replace(tmp_w, watcher_state_path)
+    finally:
+      fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+  return list(disk["unanswered_tray"])
+
+
+def _read_watcher_state(watcher_state_path: str) -> dict[str, Any]:
+  """Reads watcher_state.json, returning {} when it is missing or unreadable."""
+  if not watcher_state_path or not os.path.isfile(watcher_state_path):
+    return {}
+  try:
+    with open(watcher_state_path, "r", encoding="utf-8") as f:
+      data = json.load(f)
+  except (OSError, ValueError):
+    return {}
+  return data if isinstance(data, dict) else {}
+
+
+def refresh_work_card(
+    store: work_store.WorkStore,
+    work_id: str,
+    *,
+    cl_state_path: str = DEFAULT_CL_WATCHER_STATE,
+    watcher_state_path: str = DEFAULT_WATCHER_STATE,
+    now: float | None = None,
+) -> dict[str, Any]:
+  """Polls live upstream trackers ONLY for work_id's artifacts and returns the updated card.
+
+  Phase order matters: Gmail threads refresh before GitHub nodes so a closed PR/Issue can
+  resolve its mirror thread, and bugs link to CLs before their lane is classified.
+  """
+  cur_now = time.time() if now is None else float(now)
+  raw_wid = str(work_id or "").strip()
+  if not raw_wid:
+    raise ValueError("work_id is required")
+
+  unanswered = _read_watcher_state(watcher_state_path).get("unanswered_tray") or []
+  cl_state = load_cl_watcher_snapshot(cl_state_path)
+  proj_before = store.build_dashboard_projection(
+      cl_watcher_state=cl_state, unanswered_threads=unanswered, now=cur_now
+  )
+  resolved_wid, card_before, target_keys = _resolve_refresh_targets(
+      store, raw_wid, proj_before.get("works") or []
+  )
+
+  bz_ids = [
+      ak.split(":", 1)[1]
+      for ak in target_keys
+      if ak.startswith("buganizer:") and ak.split(":", 1)[1].isdigit()
+  ]
+  gerrit_keys = [ak for ak in target_keys if ak.startswith("gerrit:")]
+  gh_targets = [
+      (ak, *parsed)
+      for ak in target_keys
+      if ak.startswith(("github_pr:", "github_issue:")) and (parsed := _parse_gh_key(ak))
+  ]
+  gh_pr_targets = [t for t in gh_targets if t[0].startswith("github_pr:")]
+  gh_gmail_keys: dict[str, set[str]] = {}
+  for ak in target_keys:
+    if ak.startswith("gmail_thread:"):
+      st = (store.get_artifact(ak) or {}).get("state") or {}
+      gh_t = str(st.get("gh_target_key") or "")
+      if gh_t.startswith(("github_pr:", "github_issue:")):
+        gh_gmail_keys.setdefault(gh_t, set()).add(ak)
+
+  fresh_bz_raw = _fetch_live_buganizer_records(bz_ids) if bz_ids else {}
+  fresh_gh_nodes = _fetch_live_github_nodes(gh_targets) if gh_targets else {}
+  cw = _load_cl_watcher_module() if (fresh_bz_raw or gerrit_keys or gh_pr_targets) else None
+
+  bug_updates: dict[str, dict[str, Any]] = {}
+  bug_removals: set[str] = set()
+  merged_bugs: dict[str, dict[str, Any]] = {}
+  if fresh_bz_raw:
+    bug_updates, bug_removals, merged_bugs = _apply_refreshed_bugs(
+        store, cw, cl_state, fresh_bz_raw, cur_now
+    )
+
+  unanswered = _refresh_card_gmail(store, target_keys, watcher_state_path, cur_now)
+
+  for akey, node in fresh_gh_nodes.items():
+    _apply_github_node_to_store(store, akey, node, gh_gmail_keys.get(akey, set()), cur_now)
+    if akey.startswith("github_issue:"):
+      _apply_refreshed_github_issue(store, akey, cl_state, bug_updates, bug_removals)
+  item_updates = (
+      _apply_refreshed_cls(store, cw, gerrit_keys, gh_pr_targets, cur_now) if cw else {}
+  )
+
+  updated_cl_state = _mutate_cl_watcher_state_file(
+      cl_state_path, bug_updates, bug_removals, item_updates
+  )
+  if not resolved_wid.startswith("virt-"):
+    store.reconcile_correspondence_obligations(resolved_wid, now=cur_now)
+
+  proj_after = store.build_dashboard_projection(
+      cl_watcher_state=updated_cl_state, unanswered_threads=unanswered, now=cur_now
+  )
+  card_after = next(
+      (
+          w
+          for w in proj_after.get("works") or []
+          if str(w.get("work_id")) in (raw_wid, resolved_wid)
+      ),
+      None,
+  )
+  prev_lane = str((card_before or {}).get("lane") or "")
+  removed_reason = ""
+  lane_moved_reason = ""
+  if card_after is None:
+    removed_reason = _describe_card_removal_reason(target_keys, store, merged_bugs, item_updates)
+  else:
+    next_lane = str(card_after.get("lane") or "")
+    if prev_lane and next_lane and next_lane != prev_lane:
+      lane_moved_reason = f"Перемещено в {_LANE_LABELS_RU.get(next_lane, next_lane)}"
+
+  return {
+      "ok": True,
+      "work_id": raw_wid,
+      "resolved_work_id": str((card_after or {}).get("work_id") or resolved_wid),
+      "previous_lane": prev_lane,
+      "card": card_after,
+      "removed_reason": removed_reason,
+      "lane_moved_reason": lane_moved_reason,
+      "refreshed_keys": target_keys,
+      "projection": proj_after,
   }

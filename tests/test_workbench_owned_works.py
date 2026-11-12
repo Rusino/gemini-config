@@ -280,9 +280,9 @@ def _ui_work(wid: str, lane: str, owner: str | None) -> dict:
 
 
 class OwnedWorksUiTest(unittest.TestCase):
-  """Verifies the Мои работы / Черновики split, Принять button, and persisted fold state."""
+  """Verifies open Мои работы / Вне моих работ streams and the Принять button."""
 
-  # Draft cards outside Needs You fold under Черновики; Needs-You drafts stay in the main group
+  # Triage renders Мои работы above open Вне моих работ without folding unowned cards
   def test_js_groups_drafts_and_accept_button(self) -> None:
     proj = card_ui._make_projection(  # pylint: disable=protected-access
         _ui_work("work-u", "waiting", "user"),
@@ -299,29 +299,28 @@ class OwnedWorksUiTest(unittest.TestCase):
         + r"""
 (async () => {
   const html = els['wb-cards-container'].innerHTML;
-  const iMine = html.indexOf('Мои работы');
-  const iDrafts = html.indexOf('Черновики');
-  assert(iMine >= 0 && iDrafts > iMine, 'Мои работы must render above Черновики');
-  const draftsPart = html.slice(iDrafts);
-  assert(draftsPart.includes('data-work-id="work-dw"'), 'waiting draft goes to Черновики');
-  assert(!draftsPart.includes('data-work-id="work-dn"'), 'Needs-You draft stays in main group');
-  assert(!draftsPart.includes('data-work-id="work-u"'), 'user work stays in main group');
-  assert(/wb-drafts-body"[^>]*hidden/.test(html), 'Черновики collapsed by default');
-  assert(html.includes('data-work-accept="work-dw"'), 'draft card gets Принять');
-  assert(html.includes('data-work-accept="work-dn"'), 'Needs-You draft card gets Принять');
+  assert(!html.includes('Черновики'), 'collapsed Черновики fold must be removed');
+  assert(!html.includes('wb-drafts-body'), 'no hidden drafts wrapper');
+  assert(!html.includes('data-drafts-toggle'), 'no drafts fold toggle');
+  const iMine = html.indexOf('Мои работы (1)');
+  const iOther = html.indexOf('Вне моих работ (2)');
+  assert(iMine >= 0 && iOther > iMine, 'Мои работы must render above open Вне моих работ');
+  const minePart = html.slice(iMine, iOther);
+  const otherPart = html.slice(iOther);
+  assert(minePart.includes('data-work-id="work-u"'), 'user work stays in Мои работы');
+  assert(
+    !minePart.includes('data-work-id="work-dn"'),
+    'unowned Needs-You work is in Вне моих работ'
+  );
+  assert(otherPart.includes('data-work-id="work-dn"'), 'Needs-You unowned card renders open');
+  assert(otherPart.includes('data-work-id="work-dw"'), 'waiting unowned card renders open');
+  assert(
+    otherPart.indexOf('data-work-id="work-dn"') < otherPart.indexOf('data-work-id="work-dw"'),
+    'Needs-You unowned card precedes waiting unowned card inside Вне моих работ'
+  );
+  assert(html.includes('data-work-accept="work-dw"'), 'waiting unowned card gets Принять');
+  assert(html.includes('data-work-accept="work-dn"'), 'Needs-You unowned card gets Принять');
   assert(!html.includes('data-work-accept="work-u"'), 'user card has no Принять');
-
-  const toggleBtn = {
-    hasAttribute: (k) => k === 'data-drafts-toggle',
-    getAttribute: () => null,
-  };
-  await document.body.dispatch('click', {
-    altKey: false,
-    preventDefault: () => {},
-    target: { closest: (sel) => (sel.includes('button') ? toggleBtn : null) },
-  });
-  assert(!/wb-drafts-body"[^>]*hidden/.test(els['wb-cards-container'].innerHTML));
-  assert.strictEqual(JSON.parse(storage.get('wb_drafts_v1')).open, true);
 
   const acceptBtn = {
     hasAttribute: (k) => k === 'data-work-accept',
@@ -358,7 +357,10 @@ class OwnedWorksUiTest(unittest.TestCase):
           + script_js
           + r"""
 const html = els['wb-cards-container'].innerHTML;
-assert(!html.includes('Черновики') && !html.includes('Мои работы'), 'flat list expected');
+assert(
+  !html.includes('Черновики') && !html.includes('Вне моих работ') && !html.includes('Мои работы'),
+  'flat list expected'
+);
 assert(html.includes('data-work-id="work-dw"') && html.includes('data-work-accept="work-dw"'));
 """
       )
